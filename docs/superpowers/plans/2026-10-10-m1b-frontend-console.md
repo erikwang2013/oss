@@ -638,11 +638,15 @@ function humanSize(n: number) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`
 }
 
+// 显式给出行类型：否则 antd Table 会从各列 render 的参数注解反推 RecordType，推出带 string 字面量的错误类型，rowKey 与 render 都编译不过
+type Row = { kind: 'dir'; key: string } | { kind: 'obj'; key: string; size: number; etag: string }
+
 export default function Objects() {
   const { bucket = '' } = useParams()
   const { message } = App.useApp()
   const qc = useQueryClient()
-  const [prefix, setPrefix] = useState('')
+  // 面包屑链接带 ?prefix= 整页跳转、组件重挂载，前缀状态即可由此初始化
+  const [prefix, setPrefix] = useState(() => new URLSearchParams(window.location.search).get('prefix') ?? '')
 
   const { data, isLoading } = useQuery({
     queryKey: ['objects', bucket, prefix],
@@ -706,7 +710,7 @@ export default function Objects() {
       <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
         上传入口在 Task 9 接；M1 上传面板就绪前可用 `aws s3 cp` / `rclone` 注入对象。
       </Typography.Text>
-      <Table
+      <Table<Row>
         rowKey={(r) => r.key}
         loading={isLoading}
         dataSource={rows}
@@ -748,15 +752,7 @@ export default function Objects() {
 }
 ```
 
-注意：`prefix` 初始值从 URL query（面包屑链接用 `?prefix=`）读取——在组件顶部补一行：
-
-```tsx
-const [prefix, setPrefix] = useState(() => new URLSearchParams(window.location.search).get('prefix') ?? '')
-```
-
-（覆盖上面 `useState('')`；面包屑链接切换时整页跳转、组件重挂载，状态自然重置。）
-
-实现注记：`<Table>` 改为显式泛型 `<Table<Row>>`（`Row` = dir/obj 联合类型，见 `web/src/pages/Objects.tsx`）——计划初稿写法下 antd 会从各列 `render` 的参数注解反推 `RecordType`，推出 `{ kind: string; size?: number }` 这类错误类型，`rowKey` 与三处 render 全部编译不过（`tsc` 报 TS2339/TS2322）；补泛型后计划代码其余部分逐字未动。
+实现注记：`<Table>` 加了显式泛型 `<Table<Row>>`（`Row` = dir/obj 联合类型）——计划初稿的无泛型写法下，antd 会从各列 `render` 的参数注解反推 `RecordType`，推出 `{ kind: string; size?: number }` 这类错误类型，`rowKey` 与三处 render 全部编译不过（`tsc` 报 TS2339/TS2322）；列定义本身未动。
 
 - [x] **Step 2: 验证**
 
