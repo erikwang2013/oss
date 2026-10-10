@@ -175,8 +175,9 @@ oss/
 ### 5.1 `xl.meta` v1（首字节即格式版本号，前向兼容解码）
 
 ```rust
-/// 每个对象目录一份。格式版本是前向兼容的锚点：
-/// v1 定死字段集，后续阶段只加 Option 字段，解码器遇到未知字段跳过而非报错。
+/// 编码：`[1 字节格式版本][msgpack named 载荷]`。版本字节是前向兼容的锚点：
+/// 后续阶段只往 `Version` 里加 `Option` 字段；用 named（字段名→值映射）而非位置数组，
+/// 老解码器才能靠 serde「跳过未知字段名」继续可读。
 struct XlMeta {
     format_version: u8,              // = 1
     object_key: String,

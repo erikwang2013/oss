@@ -551,7 +551,7 @@ mod tests {
             versions: Vec<Version>,
             brand_new_field: u64, // v1 不认识的字段
         }
-        let bytes = rmp_serde::to_vec(&Future {
+        let bytes = rmp_serde::to_vec_named(&Future {
             object_key: "a".into(),
             versions: vec![],
             brand_new_field: 7,
@@ -622,7 +622,8 @@ pub struct PartRef {
 
 impl XlMeta {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let body = rmp_serde::to_vec(self).map_err(|e| Error::Encode(e.to_string()))?;
+        // to_vec_named：struct 编成「字段名 → 值」映射；前向兼容靠它 —— 位置数组下未来版本多一个字段，老解码器必报长度错。
+        let body = rmp_serde::to_vec_named(self).map_err(|e| Error::Encode(e.to_string()))?;
         let mut out = Vec::with_capacity(body.len() + 1);
         out.push(FORMAT_VERSION);
         out.extend_from_slice(&body);
