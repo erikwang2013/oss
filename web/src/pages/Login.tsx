@@ -16,6 +16,9 @@ export default function Login() {
         body: JSON.stringify(v),
       })
       setToken(token)
+      // aetherupload-all.js 的分块 XHR 带 withCredentials，但不会加 Authorization 头；
+      // 后端 /aetherupload/* 的 JWT 覆盖层认 cookie `oss_token`——不种 cookie 浏览器上传 401
+      document.cookie = `oss_token=${token}; path=/; SameSite=Lax`
       nav('/buckets', { replace: true })
     } catch (e) {
       message.error(e instanceof Error && e.message ? e.message : '登录失败')

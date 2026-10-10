@@ -492,6 +492,12 @@ export default function Login() {
 
 注意：登录接口失败时后端返回纯文本（非 JSON），`api()` 抛出的 `ApiError.message` 就是「用户名或密码错误」——直接展示。
 
+> 补丁（Task 8 轮次并入）：`setToken(token)` 之后还要种 cookie
+> `document.cookie = \`oss_token=${token}; path=/; SameSite=Lax\``。
+> 原因：aetherupload-all.js 的分块 XHR 虽然 `withCredentials: true`，但它不经 `api()`、不会加
+> `Authorization` 头；后端 `/aetherupload/*` 的 JWT 覆盖层（`router.rs`）认 cookie `oss_token`。
+> 不种 cookie，浏览器上传首块就 401。
+
 - [x] **Step 2: 验证**
 
 ```bash
@@ -868,7 +874,7 @@ git add crates/oss-server/ && git commit -m "feat(server): GET /api/v1/groups（
 - Create: `web/src/upload/useUpload.ts`
 - Test: `web/src/__tests__/useUpload.test.ts`
 
-- [ ] **Step 1: 拷贝脚本**
+- [x] **Step 1: 拷贝脚本**
 
 ```bash
 cd /home/wwwroot/oss
@@ -881,7 +887,7 @@ ls -l web/public/aetherupload-assets/   # 应有 ~48KB 的 aetherupload-all.js
 若 `~/.cargo/registry` 里找不到（还没构建过），先在仓库根跑一次 `cargo fetch` 再重试。
 拷贝后**先读一遍 crate 内的 `assets/example.html`**（在 `~/.cargo/registry/src/*/aetherupload-rust-1.0.3/assets/`）——它是集成契约的权威示例，DOM 结构与本 hook 的用法都以它为准。
 
-- [ ] **Step 2: 写失败的测试**
+- [x] **Step 2: 写失败的测试**
 
 ```ts
 // web/src/__tests__/useUpload.test.ts
@@ -915,12 +921,12 @@ describe('countingUploadingPosts', () => {
 })
 ```
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `cd web && npm test`
 Expected: FAIL（`../upload/useUpload` 不存在）
 
-- [ ] **Step 4: 实现 `web/src/upload/useUpload.ts`**
+- [x] **Step 4: 实现 `web/src/upload/useUpload.ts`**
 
 ```ts
 import { useCallback } from 'react'
@@ -1001,17 +1007,26 @@ export function useUpload(opts: { onFinished?: (outcome: UploadOutcome) => void 
 }
 ```
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run: `cd web && npm test`
 Expected: PASS（含 Task 2 的 4 个用例）
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add web/public/aetherupload-assets/ web/src/upload/useUpload.ts web/src/__tests__/useUpload.test.ts
 git commit -m "feat(web): useUpload 驱动 aetherupload-all.js（含秒传判定）"
 ```
+
+> 执行注记：脚本 `cmp` 与 crate 内原件逐字节一致（48810 B）。本轮并入三项：
+> (1) `Login.tsx` 登录成功种 cookie `oss_token`（原因见 Task 4 补丁；后端 cookie 契约已由
+> `tests/aether_auth.rs` 覆盖，浏览器侧留给 Task 11 e2e）；
+> (2) `console_api.rs` groups 断言补全形（quality-m1b-7 Minor 1）；
+> (3) `api.ts` `max_size` 加「0 = 不限」注释（Minor 2）。
+> 浏览器手验（登录后看 cookie）同 Task 4，留给 Task 11 e2e。验证：`cargo test --workspace -j 2`
+> 98 全绿；`npm test` 8 用例（含本任务 2 个）、`npm run build`、`npm run lint` 通过
+> （lint 对 vendored 脚本报 92 条 warning，exit 0，未加 ignore 配置——待定夺）。
 
 ---
 

@@ -396,8 +396,10 @@ async fn list_groups_returns_configured_groups() {
         .await
         .unwrap();
 
-    assert_eq!(groups[0]["group"], "file");
-    assert_eq!(groups[0]["bucket"], "files");
+    assert_eq!(
+        groups,
+        serde_json::json!([{"group": "file", "bucket": "files", "max_size": 0, "extensions": []}])
+    );
 }
 
 /// M-4：自定 AK/SK 的最小校验（400 自己的文案）与 UNIQUE 冲突说人话（不泄 sqlite 原文）。

@@ -65,7 +65,7 @@ export interface ObjectList {
 export interface GroupInfo {
   group: string
   bucket: string
-  max_size: number
+  max_size: number // 0 = 不限（上游语义，Task 9 展示层按此处理）
   extensions: string[]
 }
 
