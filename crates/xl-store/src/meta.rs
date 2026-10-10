@@ -62,19 +62,40 @@ impl XlMeta {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        match bytes.split_first() {
+        let m: Self = match bytes.split_first() {
             Some((&FORMAT_VERSION, rest)) => {
-                rmp_serde::from_slice(rest).map_err(|e| Error::CorruptMeta(e.to_string()))
+                rmp_serde::from_slice(rest).map_err(|e| Error::CorruptMeta(e.to_string()))?
             }
-            Some((&v, _)) => Err(Error::CorruptMeta(format!("不支持的格式版本 {v}"))),
-            None => Err(Error::CorruptMeta("空文件".into())),
+            Some((&v, _)) => return Err(Error::CorruptMeta(format!("不支持的格式版本 {v}"))),
+            None => return Err(Error::CorruptMeta("空文件".into())),
+        };
+        // part.uuid 是版本目录名，读路径会把它拼进盘上路径：含 / \ .. 空或控制字符的 uuid
+        // 能把读路径指到对象目录之外，解码时（唯一的信任边界）一律拒绝。
+        // 宽松白名单：不按 UUID 格式收严，非 UUID 形态的历史数据仍可读。
+        for v in &m.versions {
+            if !part_uuid_is_safe(&v.part.uuid) {
+                return Err(Error::CorruptMeta(format!(
+                    "part.uuid 非法: {:?}",
+                    v.part.uuid
+                )));
+            }
         }
+        Ok(m)
     }
 
     /// M1：取唯一的一条。M4 起改为取 is_latest（格式已在 §5.1 预留该字段）。
     pub fn latest(&self) -> Option<&Version> {
         self.versions.last()
     }
+}
+
+/// 版本目录名的宽松白名单：非空、无路径分隔符、无 `..`、无控制字符。
+fn part_uuid_is_safe(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && !uuid.contains('/')
+        && !uuid.contains('\\')
+        && !uuid.contains("..")
+        && !uuid.chars().any(|c| c.is_control())
 }
 
 #[cfg(test)]
@@ -215,6 +236,26 @@ mod tests {
         let bytes = sample().encode().unwrap();
         let cut = &bytes[..bytes.len() - 3];
         assert!(matches!(XlMeta::decode(cut), Err(Error::CorruptMeta(_))));
+    }
+
+    #[test]
+    fn decode_rejects_unsafe_part_uuid() {
+        // part.uuid 是版本目录名（读路径会拼进盘上路径）：含 / \ .. 空或控制字符的 uuid
+        // 能把读路径指到对象目录之外，解码时一律拒绝。宽松白名单——不按 UUID 格式收严，
+        // 非 UUID 形态的历史数据（如 fixture "u"）仍必须可读。
+        for bad in ["a/../b", "../x", "a/b", "a\\b", "", "a\u{0}b"] {
+            let mut m = sample();
+            m.versions[0].part.uuid = bad.into();
+            let bytes = m.encode().unwrap();
+            assert!(
+                matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))),
+                "{bad:?} 应当被拒"
+            );
+        }
+        assert_eq!(
+            XlMeta::decode(&sample().encode().unwrap()).unwrap(),
+            sample()
+        );
     }
 
     #[test]

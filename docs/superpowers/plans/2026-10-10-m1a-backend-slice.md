@@ -1595,6 +1595,7 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
 
 **Files:**
 - Modify: `crates/xl-store/src/store.rs`
+- Modify: `crates/xl-store/src/meta.rs`（收尾轮 M-4：`decode` 增加 `part.uuid` 白名单校验）
 
 - [x] **Step 1: 写失败的测试**
 
@@ -1752,6 +1753,207 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
         let (_, bytes) = s.get_object("alpha", "dst").await.unwrap();
         assert_eq!(bytes, bytes::Bytes::from_static(b"copy me"));
     }
+
+    // ---- Task 6 收尾轮：delete 语义 / 列举边界 / 桶级竞态 ----
+
+    #[tokio::test]
+    async fn delete_then_get_and_head_are_no_such_key() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        s.delete_object("alpha", "k").await.unwrap();
+        assert!(matches!(
+            s.get_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
+        assert!(matches!(
+            s.head_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_key_is_ok_and_leaves_others() {
+        // S3 语义：删不存在的键返回成功；且不得误伤桶内其他键
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "keep", Bytes::from_static(b"keep"), None)
+            .await
+            .unwrap();
+        s.delete_object("alpha", "nope").await.unwrap();
+        let (_, bytes) = s.get_object("alpha", "keep").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"keep"));
+    }
+
+    #[tokio::test]
+    async fn delete_then_put_same_key_reads_back() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", Bytes::from_static(b"one"), None)
+            .await
+            .unwrap();
+        s.delete_object("alpha", "k").await.unwrap();
+        let info = s
+            .put_object("alpha", "k", Bytes::from_static(b"two"), None)
+            .await
+            .unwrap();
+        assert_eq!(info.size, 3);
+        let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"two"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_and_deletes_never_observe_torn_state() {
+        // put/delete 并发下读路径的不变式：每次读要么是某个写入者一次写入的完整 64 字节，
+        // 要么 NoSuchKey —— 不得出现其他 Err（IO 错误），也不得读出碎片内容。
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        let s = std::sync::Arc::new(s);
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let s = std::sync::Arc::clone(&s);
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    s.put_object("alpha", "same", Bytes::from(vec![i; 64]), None)
+                        .await
+                        .map(|_| ())
+                } else {
+                    s.delete_object("alpha", "same").await
+                }
+            }));
+        }
+        for _ in 0..200 {
+            match s.get_object("alpha", "same").await {
+                Ok((info, body)) => {
+                    assert_eq!(info.size, 64);
+                    assert_eq!(body.len(), 64);
+                    assert!(body.iter().all(|b| *b == body[0]), "碎片内容: {body:?}");
+                }
+                Err(Error::NoSuchKey(_)) => {}
+                Err(e) => panic!("读路径不应出现其他错误: {e}"),
+            }
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_delimiter_with_pagination_no_duplicate_prefix() {
+        // 复现（评审）：max=1 时，已发过的 common prefix 若仍计入容量会被再次截断，
+        // token 原地打转（下一页空页或重复 cp）。去重检查必须在容量判断之前。
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        for k in ["a", "b/x", "b/y"] {
+            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+        }
+        let req = |token: Option<String>| ListRequest {
+            max_keys: Some(1),
+            delimiter: Some("/".into()),
+            continuation_token: token,
+            ..Default::default()
+        };
+
+        let page1 = s.list_objects("alpha", &req(None)).await.unwrap();
+        assert_eq!(page1.objects.len(), 1);
+        assert!(page1.common_prefixes.is_empty());
+        assert!(page1.is_truncated);
+        let token = page1.next_token.clone().unwrap();
+
+        let page2 = s.list_objects("alpha", &req(Some(token))).await.unwrap();
+        assert!(page2.objects.is_empty());
+        assert_eq!(page2.common_prefixes, vec!["b/".to_string()]);
+        assert!(
+            !page2.is_truncated && page2.next_token.is_none(),
+            "已发过的 cp 不应再触发截断（否则客户端拿同一个 token 空转）"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_max_keys_zero_is_empty_page() {
+        // max-keys=0：空页且不截断（报截断会让客户端拿同一个 token 空转）
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        let r = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(r.objects.is_empty() && r.common_prefixes.is_empty());
+        assert!(!r.is_truncated);
+        assert!(r.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_empty_delimiter_is_ignored() {
+        // delimiter="" 视同未指定：否则 find("") 命中每个键的首字节，整份键都被当 common prefix
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        for k in ["a/b", "c"] {
+            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+        }
+        let r = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    delimiter: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.objects.len(), 2);
+        assert!(r.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_keys_on_vanished_bucket_is_no_such_bucket() {
+        // 桶被并发删除的窗口：read_dir 命中 NotFound 必须映射 NoSuchBucket，而不是裸 IO 错误
+        let (s, d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        std::fs::remove_dir(layout::bucket_dir(d.path(), "alpha")).unwrap();
+        assert!(matches!(
+            s.collect_keys("alpha").await,
+            Err(Error::NoSuchBucket(_))
+        ));
+    }
+```
+
+```rust
+// >>> 追加到 meta.rs 的 tests 模块末尾（Task 6 收尾轮 M-4，逐字取自最终实现）：
+    #[test]
+    fn decode_rejects_unsafe_part_uuid() {
+        // part.uuid 是版本目录名（读路径会拼进盘上路径）：含 / \ .. 空或控制字符的 uuid
+        // 能把读路径指到对象目录之外，解码时一律拒绝。宽松白名单——不按 UUID 格式收严，
+        // 非 UUID 形态的历史数据（如 fixture "u"）仍必须可读。
+        for bad in ["a/../b", "../x", "a/b", "a\\b", "", "a\u{0}b"] {
+            let mut m = sample();
+            m.versions[0].part.uuid = bad.into();
+            let bytes = m.encode().unwrap();
+            assert!(
+                matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))),
+                "{bad:?} 应当被拒"
+            );
+        }
+        assert_eq!(
+            XlMeta::decode(&sample().encode().unwrap()).unwrap(),
+            sample()
+        );
+    }
 ```
 
 注（可编译前提已就绪）：本块用到的 `put_object` / `head_object` 已随 Task 5 落地，可直接编译；本 Step 新引入的是 `get_object` / `list_objects` / `copy_object` / `ListRequest`。
@@ -1835,11 +2037,18 @@ const DEFAULT_MAX_KEYS: usize = 1000;
     /// M4 用 scrub 的命名空间索引优化（ponytail: 先对，再快）。
     pub async fn list_objects(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {
         self.ensure_bucket(bucket).await?;
+        let max = req.max_keys.unwrap_or(DEFAULT_MAX_KEYS).min(1000);
+        // max-keys=0：空页且不截断（报截断会让客户端拿同一个 token 空转）
+        if max == 0 {
+            return Ok(ListResult::default());
+        }
+        // 空 delimiter 视同未指定：find("") 命中每个键的首字节，会把整份键都当 common prefix
+        let delimiter = req.delimiter.as_deref().filter(|d| !d.is_empty());
+
         let mut keys = self.collect_keys(bucket).await?;
         keys.sort();
 
         let prefix = req.prefix.clone().unwrap_or_default();
-        let max = req.max_keys.unwrap_or(DEFAULT_MAX_KEYS).min(1000);
         let start_after = req.continuation_token.clone();
 
         let mut objects = Vec::new();
@@ -1857,16 +2066,18 @@ const DEFAULT_MAX_KEYS: usize = 1000;
                     continue;
                 }
             }
-            if let Some(d) = &req.delimiter {
+            if let Some(d) = delimiter {
                 let rest = &k[prefix.len()..];
-                if let Some(pos) = rest.find(d.as_str()) {
+                if let Some(pos) = rest.find(d) {
                     let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
-                    if objects.len() + common_prefixes.len() >= max {
-                        is_truncated = true;
-                        next_token = Some(k.clone());
-                        break;
-                    }
+                    // 去重检查在容量判断之前：已发过的 cp 不再占位、也不触发截断，
+                    // 否则下一页会拿同一个 token 原地打转（空页或重复 cp）
                     if !common_prefixes.contains(&cp) {
+                        if objects.len() + common_prefixes.len() >= max {
+                            is_truncated = true;
+                            next_token = Some(k.clone());
+                            break;
+                        }
                         common_prefixes.push(cp);
                     }
                     continue;
@@ -1892,7 +2103,15 @@ const DEFAULT_MAX_KEYS: usize = 1000;
 
     async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
-        let mut entries = tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await?;
+        let mut entries =
+            match tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await {
+                Ok(e) => e,
+                // 桶被并发删除的窗口：映射 NoSuchBucket，而不是把裸 IO 错误抛给上层
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::NoSuchBucket(bucket.to_string()));
+                }
+                Err(e) => return Err(e.into()),
+            };
         while let Some(entry) = entries.next_entry().await? {
             if !entry.file_type().await?.is_dir() {
                 continue;
@@ -1914,6 +2133,39 @@ const DEFAULT_MAX_KEYS: usize = 1000;
         self.put_object(dst_bucket, dst_key, bytes, info.content_type)
             .await
     }
+
+// >>> crates/xl-store/src/meta.rs（收尾轮 M-4）：`XlMeta::decode` 的改动（`impl` 内其余既有内容不动）：
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let m: Self = match bytes.split_first() {
+            Some((&FORMAT_VERSION, rest)) => {
+                rmp_serde::from_slice(rest).map_err(|e| Error::CorruptMeta(e.to_string()))?
+            }
+            Some((&v, _)) => return Err(Error::CorruptMeta(format!("不支持的格式版本 {v}"))),
+            None => return Err(Error::CorruptMeta("空文件".into())),
+        };
+        // part.uuid 是版本目录名，读路径会把它拼进盘上路径：含 / \ .. 空或控制字符的 uuid
+        // 能把读路径指到对象目录之外，解码时（唯一的信任边界）一律拒绝。
+        // 宽松白名单：不按 UUID 格式收严，非 UUID 形态的历史数据仍可读。
+        for v in &m.versions {
+            if !part_uuid_is_safe(&v.part.uuid) {
+                return Err(Error::CorruptMeta(format!(
+                    "part.uuid 非法: {:?}",
+                    v.part.uuid
+                )));
+            }
+        }
+        Ok(m)
+    }
+
+// >>> 同上，模块级新增（`impl XlMeta` 之外）：
+/// 版本目录名的宽松白名单：非空、无路径分隔符、无 `..`、无控制字符。
+fn part_uuid_is_safe(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && !uuid.contains('/')
+        && !uuid.contains('\\')
+        && !uuid.contains("..")
+        && !uuid.chars().any(|c| c.is_control())
+}
 ```
 
 注（与最初骨架的差异，已裁决；上方代码块已同步为最终实现形态）：
@@ -1921,13 +2173,21 @@ const DEFAULT_MAX_KEYS: usize = 1000;
 - 测试补 `get_dangling_meta_version_reports_no_such_key`：手工构造「xl.meta 指向已被移走的版本目录」，断言 `NoSuchKey`（不 panic）。
 - `concurrent_puts_to_same_key_serialize` 末尾补读回校验（挂载项）：`get_object` 读回的 size/长度与写入一致、且内容是某个写入者一次写入的完整 64 字节（单一重复值）。该测试的最终形态已同步进 Task 5 的 Step 1 块。
 - Task 5 留在 `load_object_info` 上的过渡注释（「get / delete / list / copy 仍留给 Task 6」）已随本 task 移除。
-- 文档挂载项：删除 Task 5 区两行孤立的裸 ` ``` `（原约 1253 / 1513 行，导致 Step 2/3 文字与实现块渲染破损；Task 16 验收区 3828 行同类问题在本次范围外，未动）。
+- 文档挂载项：删除两处孤立的裸 ` ``` `（原 1253 / 1513 行，导致 Step 2/3 文字与实现块渲染破损）；收尾轮再删 Task 16 验收区的第三处（原约 3943 / 3944 行）。
+
+注（质量评审收尾轮，I-1 / M-2/3/4 与两条观察，已并入；上方代码块已同步）：
+- **I-1 delete 测试**（补 4 条）：`delete_then_get_and_head_are_no_such_key`（put→delete→get/head 均 NoSuchKey）、`delete_missing_key_is_ok_and_leaves_others`（删不存在的键 → Ok 且不误伤其他键）、`delete_then_put_same_key_reads_back`（删后重写同键可读）、`concurrent_puts_and_deletes_never_observe_torn_state`（multi_thread 下 put/delete 与 200 次并发读：每次读要么单写者完整 64 字节、要么 NoSuchKey，绝无其他 Err/碎片）。
+- **M-2 delimiter 去重与容量的顺序**：`contains` 去重检查提到容量判断之前——已发过的 cp 不再占位、也不触发截断，否则下一页拿同一个 token 原地打转（复现用例 `list_delimiter_with_pagination_no_duplicate_prefix`：keys=[a, b/x, b/y]、delim=/、max=1）。
+- **M-3 列举边界**：`max_keys=Some(0)` → 空页且 `is_truncated=false`、无 token（防客户端空转，`list_max_keys_zero_is_empty_page`）；`delimiter=Some("")` 视同未指定（`list_empty_delimiter_is_ignored`，否则 `find("")` 命中首字节、整份键被当 cp）。
+- **M-4 `part.uuid` 白名单校验**（meta.rs，本 task 第二个被改的文件）：`XlMeta::decode` 末尾拒绝含 `/`、`\`、`..`、空或控制字符的 `part.uuid`（宽松形态，不按 UUID 格式收严；fixture `"u"` 与非 UUID 历史数据仍可读），测试 `decode_rejects_unsafe_part_uuid`。Task 3 的 Step 3 块保持骨架形态未回改，最终 decode 见上方 `// >>>` 片段。
+- **桶级竞态**（评审观察）：`collect_keys` 的 `read_dir` 遇 NotFound（桶被并发删除）映射 `NoSuchBucket` 而非裸 Io，测试 `collect_keys_on_vanished_bucket_is_no_such_bucket`。
+- 记账项：`delete_bucket` 的 ponytail 注释「Task 6/M2 处理」改为「M2 处理」；「已知风险与处置」表补「删除路径残留」一行。
 
 - [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store 2>&1 | tail -12`
 Expected: 全绿
-实际：`xl-store` 40 passed / 0 failed（Task 4 的 26 + Task 5 的 8 + 本 task 的 6：`get_reads_back_exact_bytes` / `get_missing_key` / `get_dangling_meta_version_reports_no_such_key` / `list_with_prefix_and_delimiter` / `list_pagination` / `copy_object_duplicates_content`；`concurrent_puts_to_same_key_serialize` 为原地增强，未新增用例）。四闸全绿（fmt / clippy 0 告警 / `-p xl-store` / `--workspace -j 2`）。
+实际：`xl-store` 49 passed / 0 failed。构成：Task 4/5 的 34 + 本 task 主轮 6（`get_reads_back_exact_bytes` / `get_missing_key` / `get_dangling_meta_version_reports_no_such_key` / `list_with_prefix_and_delimiter` / `list_pagination` / `copy_object_duplicates_content`；`concurrent_puts_to_same_key_serialize` 为原地增强，未新增用例）+ 收尾轮 9（store.rs 8：delete 4 条 / delimiter 分页 / max-keys=0 / 空 delimiter / 桶级竞态；meta.rs 1：坏 `part.uuid`）。四闸全绿（fmt / clippy 0 告警 / `-p xl-store` / `--workspace -j 2`）。
 
 - [x] **Step 5: 提交**
 
@@ -3905,7 +4165,7 @@ Expected: 脚本打印「M1 S3 验收全部通过」
 
 - [ ] **Step 3: 写 `README.md`** 的运行部分
 
-```markdown
+````markdown
 # OSS —— 自研分布式对象存储系统
 
 S3 兼容的自研对象存储（MinIO 的等价实现）。设计文档见
@@ -3941,7 +4201,7 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 ```bash
 tests/e2e_s3.sh
 ```
-```
+````
 
 - [ ] **Step 4: 提交**
 
@@ -3982,4 +4242,5 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 | `block_in_place` 需要 multi-thread runtime | `#[tokio::main]` 默认即是；测试必须用 `#[tokio::test(flavor = "multi_thread")]`（Task 14 已注明）。若将来有人改成 `current_thread`，秒传与 ingest 会 panic —— 这是**刻意的响亮失败**，不做静默降级 |
 | aetherupload 的分组目录必须先建 | `aether::build_runtime` 构造时调用 `aetherupload::console::list_groups` 自动创建（Task 14） |
 | 损坏的 `xl.meta` 让 PUT fail-closed（报错，不静默覆盖） | 有意为之（M-6 裁决）：解码失败/键不一致时不把旧 meta 当「无对象」继续写，避免毁掉盘上旧数据；处置靠人工修复或删该对象，**不做自动覆盖** |
-| `tmp` / `trash` 无回收器（规格评审观察 C） | M1 只保证不可见（读路径只信 `xl.meta`）；孤儿目录随 Task 6/M2 的启动自检与 GC 清理，当前仅占盘 |
+| `tmp` / `trash` 无回收器（规格评审观察 C） | M1 只保证不可见（读路径只信 `xl.meta`）；孤儿目录随 M2 的启动自检与 GC 清理，当前仅占盘 |
+| 删除路径残留（`remove_dir_all` 部分失败/崩溃，留下无 meta 的垃圾目录） | 不可见（读路径只信 `xl.meta`，列举跳过无 meta 的目录），但会让桶「非空」而删不掉（`BucketNotEmpty`）→ M2 的 fsck 清理垃圾目录 |

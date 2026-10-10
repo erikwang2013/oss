@@ -141,7 +141,7 @@ impl Store {
         if non_empty {
             return Err(Error::BucketNotEmpty(bucket.to_string()));
         }
-        // ponytail: 桶级互斥未实现——并发 delete_bucket + put 可让桶「复活」，Task 6/M2 处理
+        // ponytail: 桶级互斥未实现——并发 delete_bucket + put 可让桶「复活」，M2 处理
         match tokio::fs::remove_dir(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
@@ -420,11 +420,18 @@ impl Store {
     /// M4 用 scrub 的命名空间索引优化（ponytail: 先对，再快）。
     pub async fn list_objects(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {
         self.ensure_bucket(bucket).await?;
+        let max = req.max_keys.unwrap_or(DEFAULT_MAX_KEYS).min(1000);
+        // max-keys=0：空页且不截断（报截断会让客户端拿同一个 token 空转）
+        if max == 0 {
+            return Ok(ListResult::default());
+        }
+        // 空 delimiter 视同未指定：find("") 命中每个键的首字节，会把整份键都当 common prefix
+        let delimiter = req.delimiter.as_deref().filter(|d| !d.is_empty());
+
         let mut keys = self.collect_keys(bucket).await?;
         keys.sort();
 
         let prefix = req.prefix.clone().unwrap_or_default();
-        let max = req.max_keys.unwrap_or(DEFAULT_MAX_KEYS).min(1000);
         let start_after = req.continuation_token.clone();
 
         let mut objects = Vec::new();
@@ -442,16 +449,18 @@ impl Store {
                     continue;
                 }
             }
-            if let Some(d) = &req.delimiter {
+            if let Some(d) = delimiter {
                 let rest = &k[prefix.len()..];
-                if let Some(pos) = rest.find(d.as_str()) {
+                if let Some(pos) = rest.find(d) {
                     let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
-                    if objects.len() + common_prefixes.len() >= max {
-                        is_truncated = true;
-                        next_token = Some(k.clone());
-                        break;
-                    }
+                    // 去重检查在容量判断之前：已发过的 cp 不再占位、也不触发截断，
+                    // 否则下一页会拿同一个 token 原地打转（空页或重复 cp）
                     if !common_prefixes.contains(&cp) {
+                        if objects.len() + common_prefixes.len() >= max {
+                            is_truncated = true;
+                            next_token = Some(k.clone());
+                            break;
+                        }
                         common_prefixes.push(cp);
                     }
                     continue;
@@ -477,7 +486,15 @@ impl Store {
 
     async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
-        let mut entries = tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await?;
+        let mut entries =
+            match tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await {
+                Ok(e) => e,
+                // 桶被并发删除的窗口：映射 NoSuchBucket，而不是把裸 IO 错误抛给上层
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::NoSuchBucket(bucket.to_string()));
+                }
+                Err(e) => return Err(e.into()),
+            };
         while let Some(entry) = entries.next_entry().await? {
             if !entry.file_type().await?.is_dir() {
                 continue;
@@ -1011,5 +1028,183 @@ mod tests {
         assert_eq!(info.size, 7);
         let (_, bytes) = s.get_object("alpha", "dst").await.unwrap();
         assert_eq!(bytes, bytes::Bytes::from_static(b"copy me"));
+    }
+
+    // ---- Task 6 收尾轮：delete 语义 / 列举边界 / 桶级竞态 ----
+
+    #[tokio::test]
+    async fn delete_then_get_and_head_are_no_such_key() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        s.delete_object("alpha", "k").await.unwrap();
+        assert!(matches!(
+            s.get_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
+        assert!(matches!(
+            s.head_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_key_is_ok_and_leaves_others() {
+        // S3 语义：删不存在的键返回成功；且不得误伤桶内其他键
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "keep", Bytes::from_static(b"keep"), None)
+            .await
+            .unwrap();
+        s.delete_object("alpha", "nope").await.unwrap();
+        let (_, bytes) = s.get_object("alpha", "keep").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"keep"));
+    }
+
+    #[tokio::test]
+    async fn delete_then_put_same_key_reads_back() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", Bytes::from_static(b"one"), None)
+            .await
+            .unwrap();
+        s.delete_object("alpha", "k").await.unwrap();
+        let info = s
+            .put_object("alpha", "k", Bytes::from_static(b"two"), None)
+            .await
+            .unwrap();
+        assert_eq!(info.size, 3);
+        let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"two"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_and_deletes_never_observe_torn_state() {
+        // put/delete 并发下读路径的不变式：每次读要么是某个写入者一次写入的完整 64 字节，
+        // 要么 NoSuchKey —— 不得出现其他 Err（IO 错误），也不得读出碎片内容。
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        let s = std::sync::Arc::new(s);
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let s = std::sync::Arc::clone(&s);
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    s.put_object("alpha", "same", Bytes::from(vec![i; 64]), None)
+                        .await
+                        .map(|_| ())
+                } else {
+                    s.delete_object("alpha", "same").await
+                }
+            }));
+        }
+        for _ in 0..200 {
+            match s.get_object("alpha", "same").await {
+                Ok((info, body)) => {
+                    assert_eq!(info.size, 64);
+                    assert_eq!(body.len(), 64);
+                    assert!(body.iter().all(|b| *b == body[0]), "碎片内容: {body:?}");
+                }
+                Err(Error::NoSuchKey(_)) => {}
+                Err(e) => panic!("读路径不应出现其他错误: {e}"),
+            }
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_delimiter_with_pagination_no_duplicate_prefix() {
+        // 复现（评审）：max=1 时，已发过的 common prefix 若仍计入容量会被再次截断，
+        // token 原地打转（下一页空页或重复 cp）。去重检查必须在容量判断之前。
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        for k in ["a", "b/x", "b/y"] {
+            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+        }
+        let req = |token: Option<String>| ListRequest {
+            max_keys: Some(1),
+            delimiter: Some("/".into()),
+            continuation_token: token,
+            ..Default::default()
+        };
+
+        let page1 = s.list_objects("alpha", &req(None)).await.unwrap();
+        assert_eq!(page1.objects.len(), 1);
+        assert!(page1.common_prefixes.is_empty());
+        assert!(page1.is_truncated);
+        let token = page1.next_token.clone().unwrap();
+
+        let page2 = s.list_objects("alpha", &req(Some(token))).await.unwrap();
+        assert!(page2.objects.is_empty());
+        assert_eq!(page2.common_prefixes, vec!["b/".to_string()]);
+        assert!(
+            !page2.is_truncated && page2.next_token.is_none(),
+            "已发过的 cp 不应再触发截断（否则客户端拿同一个 token 空转）"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_max_keys_zero_is_empty_page() {
+        // max-keys=0：空页且不截断（报截断会让客户端拿同一个 token 空转）
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        let r = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(r.objects.is_empty() && r.common_prefixes.is_empty());
+        assert!(!r.is_truncated);
+        assert!(r.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_empty_delimiter_is_ignored() {
+        // delimiter="" 视同未指定：否则 find("") 命中每个键的首字节，整份键都被当 common prefix
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        for k in ["a/b", "c"] {
+            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+        }
+        let r = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    delimiter: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.objects.len(), 2);
+        assert!(r.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_keys_on_vanished_bucket_is_no_such_bucket() {
+        // 桶被并发删除的窗口：read_dir 命中 NotFound 必须映射 NoSuchBucket，而不是裸 IO 错误
+        let (s, d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        std::fs::remove_dir(layout::bucket_dir(d.path(), "alpha")).unwrap();
+        assert!(matches!(
+            s.collect_keys("alpha").await,
+            Err(Error::NoSuchBucket(_))
+        ));
     }
 }
