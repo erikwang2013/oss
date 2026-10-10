@@ -21,6 +21,17 @@ pub fn validate_bucket(name: &str) -> Result<()> {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
     let ok_edges = !name.starts_with(['-', '.']) && !name.ends_with(['-', '.']);
     let ok_no_dotdot = !name.contains("..");
+    // 不得形如 IPv4 地址（规格 §2.1；S3 的既有规则，见 aws 文档 "must not be formatted as an IP address"）
+    let parts: Vec<&str> = name.split('.').collect();
+    let looks_like_ipv4 = parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u16>().is_ok_and(|n| n <= 255)
+        });
+    if looks_like_ipv4 {
+        return Err(Error::InvalidBucketName(name.to_string()));
+    }
     if ok_len && ok_chars && ok_edges && ok_no_dotdot {
         Ok(())
     } else {
@@ -126,5 +137,8 @@ mod tests {
         for bad in ["ab", "My-Bucket", "-lead", "trail-", "a..b", "a_b", ""] {
             assert!(validate_bucket(bad).is_err(), "{bad} 应当被拒");
         }
+        // S3 规则：不得形如 IP 地址（规格 §2.1）
+        assert!(validate_bucket("192.168.1.1").is_err());
+        assert!(validate_bucket("1.2.3.4.5").is_ok()); // 五段不是 IPv4，合法
     }
 }
