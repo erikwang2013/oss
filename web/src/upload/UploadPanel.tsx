@@ -62,7 +62,7 @@ export default function UploadPanel({
   }
 
   return (
-    <Modal title={`上传到 ${bucket}`} open={open} onCancel={onClose} footer={null} width={640} destroyOnClose>
+    <Modal title={`上传到 ${bucket}`} open={open} onCancel={onClose} footer={null} width={640} destroyOnHidden>
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
         <Space>
           <Select

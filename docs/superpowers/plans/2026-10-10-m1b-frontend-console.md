@@ -1220,7 +1220,7 @@ export default function UploadPanel({
   }
 
   return (
-    <Modal title={`上传到 ${bucket}`} open={open} onCancel={onClose} footer={null} width={640} destroyOnClose>
+    <Modal title={`上传到 ${bucket}`} open={open} onCancel={onClose} footer={null} width={640} destroyOnHidden>
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
         <Space>
           <Select
@@ -1315,6 +1315,36 @@ git commit -m "feat(web): 上传面板（分组/进度/秒传提示/上传历史
 
 ---
 
+## 定稿记录（Task 9 收尾，commit `fix(web): preprocess 补丁（multipart）；zh_CN 与 React19 补丁；destroyOnHidden`）
+
+**A 补丁（跨任务 blocker，team-lead 裁决）**：浏览器实测上传 100% 失败 —— `POST /aetherupload/preprocess`
+返回 **400 `Invalid `boundary` for `multipart/form-data` request`**。根因：crate 自带
+`assets/aetherupload-all.js`（`core.js` 同）的 preprocess 用 zepto `data: {…}` 发
+**application/x-www-form-urlencoded**（PHP 时代写法），而 `aetherupload-rust` 全部 Rust 适配层
+（axum/ecat 走 `src/integrations/axum.rs:54` 的 `Multipart` 提取器）要 multipart；分块上传本就
+是 FormData，只有 preprocess 一处。M1a Task 14 用 `curl -F`（multipart）验证，故未暴露；Task 11 两个
+e2e 都会卡在此处。
+
+处置：`web/public/aetherupload-assets/aetherupload-all.js` 的 preprocess 改为
+FormData + `processData: false` + `contentType: false`（zepto 原生支持），文件头部加注释说明本地补丁
+与「升级脚本时重新评估」。**该文件不再与 crate 1.0.3 逐字节相同**（Task 8 的 `cmp` 结论自此失效）；
+上游 `aetherupload-rust` 修复此编码不一致后可撤补丁。
+
+补丁后浏览器全链实测（后端 + vite + Playwright）：preprocess 200 → uploading 200 → 输出「上传成功」、
+进度条 100%、savedPath 回填 → register 后历史表出现记录且「文件」列显示原始文件名（验证 carry-forward
+的 `originalNameRef` 留档时机）→ 对象列表自动刷新 → 同文件二传「上传成功（秒传）」+ 金色 Tag
+「秒传命中（0 分块传输）」且本轮 `/aetherupload/uploading` POST 数为 0。
+
+**同轮 front 修复三条**：
+1. `main.tsx` locale 改 `import zhCN from 'antd/es/locale/zh_CN'`（ESM 源）。原因：`antd/locale/zh_CN`
+   是 CJS 包，经 Vite 8 预打包后默认导出成为 `{ default: <真 locale> }` 双层，ConfigProvider 取不到
+   `Modal.okText`，Modal 按钮渲染成英文 OK/Cancel。
+2. `UploadPanel.tsx` `destroyOnClose` → `destroyOnHidden`（antd 5.29 起前者是弃用别名，运行时会打警告）。
+3. 装 `@ant-design/v5-patch-for-react-19` 并在 `main.tsx` 顶部 import（消 `[antd: compatible] antd v5
+   support React is 16 ~ 18` 警告、恢复静态 API 正常性）。
+
+---
+
 ## Task 10: 访问密钥页
 
 **Files:**
@@ -1393,6 +1423,18 @@ git commit -m "feat(web): 访问密钥页（列表 + 一次性展示 SK）"
 
 ## Task 11: Playwright e2e（关键路径）
 
+> **locator 约定（Task 9 浏览器实测所得，写用例前先读）**
+> 1. **两字 CJK 按钮名带空格**：antd 对恰好两个汉字的按钮自动插空格，实际渲染 `登 录` / `上 传` /
+>    `删 除` / `确 定`、`取 消`。整串匹配 `{ name: '登录' }`、`{ name: '上传' }` 必然超时；裸子串正则
+>    `/上传/` 在上传面板里会同时命中「选择文件并开始上传」→ strict mode violation（两个元素）。写法用
+>    `{ name: '上 传', exact: true }` 或 `/^上\s*传$/`；三字及以上（`新建桶`、`选择文件并开始上传`）无空格。
+> 2. **zh_CN 已生效**（Task 9 收尾修 `main.tsx` 的 locale import）：Modal 页脚按钮渲染 `确 定`/`取 消`，
+>    `{ name: /确\s*定/ }` 可用。若某天又见英文 OK/Cancel，先查 locale import 是否被改回 `antd/locale/zh_CN`。
+> 3. **Modal 关闭钮**：aria-label 固定 `Close`（antd 默认，不随 locale 变），`{ name: 'Close' }` 无需改动。
+>
+> 另：上游脚本的 preprocess 补丁见 Task 9 定稿记录（vendored JS 已不再与 crate 逐字节相同），
+> e2e 起服务前确认 `web/public/aetherupload-assets/` 是仓库内的已补丁版本。
+
 **Files:**
 - Create: `web/playwright.config.ts`、`web/e2e/console.spec.ts`、`web/e2e/instant.spec.ts`
 
@@ -1445,7 +1487,7 @@ test('登录 → 建桶 → 上传 → 列表 → 下载 → 删除', async ({ p
   await page.goto('/login')
   await page.getByLabel('用户名').fill('erik')
   await page.getByLabel('口令').fill('pw')
-  await page.getByRole('button', { name: '登录' }).click()
+  await page.getByRole('button', { name: '登 录', exact: true }).click()
   await expect(page).toHaveURL(/\/buckets/)
 
   await page.getByRole('button', { name: '新建桶' }).click()
@@ -1454,7 +1496,7 @@ test('登录 → 建桶 → 上传 → 列表 → 下载 → 删除', async ({ p
   await expect(page.getByRole('link', { name: bucket })).toBeVisible()
 
   await page.getByRole('link', { name: bucket }).click()
-  await page.getByRole('button', { name: '上传' }).click()
+  await page.getByRole('button', { name: '上 传', exact: true }).click()
   await page.locator('#aetherupload-resource').setInputFiles(file)
   await expect(page.locator('#aetherupload-output')).toContainText('上传成功', { timeout: 30_000 })
   await page.getByRole('button', { name: 'Close' }).click() // antd Modal 的关闭按钮 aria-label
@@ -1463,12 +1505,12 @@ test('登录 → 建桶 → 上传 → 列表 → 下载 → 删除', async ({ p
   await expect(row).toBeVisible()
 
   const downloadPromise = page.waitForEvent('download')
-  await row.getByRole('button', { name: '下载' }).click()
+  await row.getByRole('button', { name: '下 载', exact: true }).click()
   const download = await downloadPromise
   const saved = await download.path()
   expect(saved).toBeTruthy()
 
-  await row.getByRole('button', { name: '删除' }).click()
+  await row.getByRole('button', { name: '删 除', exact: true }).click()
   await page.getByRole('button', { name: /确\s*定/ }).click()
   await expect(page.getByRole('row', { name: /hello\.txt/ })).toHaveCount(0)
 })
@@ -1496,7 +1538,7 @@ test('同一文件二次上传命中秒传：不再产生 /aetherupload/uploadin
   await page.goto('/login')
   await page.getByLabel('用户名').fill('erik')
   await page.getByLabel('口令').fill('pw')
-  await page.getByRole('button', { name: '登录' }).click()
+  await page.getByRole('button', { name: '登 录', exact: true }).click()
 
   await page.getByRole('button', { name: '新建桶' }).click()
   await page.locator('#new-bucket-name').fill(bucket)
@@ -1504,7 +1546,7 @@ test('同一文件二次上传命中秒传：不再产生 /aetherupload/uploadin
   await page.getByRole('link', { name: bucket }).click()
 
   // 第一次：真分块
-  await page.getByRole('button', { name: '上传' }).click()
+  await page.getByRole('button', { name: '上 传', exact: true }).click()
   await page.locator('#aetherupload-resource').setInputFiles(file)
   await expect(page.locator('#aetherupload-output')).toContainText('上传成功', { timeout: 30_000 })
   expect(uploadingPosts.length).toBeGreaterThan(0)
@@ -1619,7 +1661,7 @@ git add README.md && git commit -m "docs: 控制台使用说明与 1GB 上传清
 | 风险 | 处置 |
 |---|---|
 | aetherupload-all.js 的实际行为与本文档描述不符 | Task 8 Step 1 要求先读 crate 自带 `assets/example.html`（权威集成示例）；DOM 契约（wrapper + 四个 id + success 回调）来自 1.0.3 源码逐行核对 |
-| zepto 直改 DOM 与 React 重渲染打架 | 四个 id 节点 React 只渲染一次空内容，此后交给脚本；Modal 用 `destroyOnClose` 保证每次打开是干净节点 |
+| zepto 直改 DOM 与 React 重渲染打架 | 四个 id 节点 React 只渲染一次空内容，此后交给脚本；Modal 用 `destroyOnHidden` 保证每次打开是干净节点（antd 5.29 起 `destroyOnClose` 为弃用别名） |
 | antd 双字按钮文案带空格（「确 定」） | e2e 用 `/确\s*定/` 正则匹配 |
 | 秒传用例在旧数据目录上误判 | 用例的文件内容带时间戳，第一次必然走真分块 |
 | `/aetherupload-assets` 被代理吞掉 | 代理键写成 `'/aetherupload/'`（带尾斜杠），Task 1 已注明 |

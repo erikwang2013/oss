@@ -5,6 +5,14 @@
     aetherupload-core.js
 */
 
+/*
+    本地补丁 vs crate 1.0.3：preprocess 原为 zepto urlencoded（PHP 时代写法），而
+    aetherupload-rust 的 Rust 适配层（axum/ecat 等）用 Multipart 提取器，要 multipart/form-data，
+    原样发送会 400（Invalid `boundary` for `multipart/form-data` request）。此处仅把 preprocess
+    的编码改为 FormData + processData:false + contentType:false（分块上传本就是 FormData）。
+    这是上游 aetherupload-rust 的修复候选：升级/重新拷贝脚本时重新评估本补丁是否仍必要。
+*/
+
 /* Zepto v1.2.0 - zepto event ajax form ie - zeptojs.com/license */
 //zepto begin
 if (typeof jQuery == 'undefined') {
@@ -178,19 +186,27 @@ var AetherUpload = {
 
             crossDomain: true,
 
-            data: {
+            processData: false,
 
-                resource_name: _this.resourceName,
+            contentType: false,
 
-                resource_size: _this.resourceSize,
+            data: (function () {
 
-                resource_hash: _this.resourceHash,
+                var form = new FormData();
 
-                locale: _this.locale,
+                form.append('resource_name', _this.resourceName);
 
-                group: _this.group
+                form.append('resource_size', _this.resourceSize);
 
-            },
+                form.append('resource_hash', _this.resourceHash);
+
+                form.append('locale', _this.locale);
+
+                form.append('group', _this.group);
+
+                return form;
+
+            })(),
 
             success: function (rst) {
 
