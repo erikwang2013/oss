@@ -4805,8 +4805,8 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
 
 ```bash
 #!/usr/bin/env bash
-# M1 验收：S3 兼容性（aws-cli + rclone）+ aetherupload 上传链路。
-# 前置：docker 可用（用于跑 minio/mc 作为对照）；本机装了 aws-cli 与 rclone。
+# M1 验收：S3 兼容性（aws-cli + rclone）。
+# 前置：本机装了 aws-cli 与 rclone。
 set -euo pipefail
 
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
@@ -4928,7 +4928,7 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 ## 验收
 
 ```bash
-tests/e2e_s3.sh
+AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 tests/e2e_s3.sh
 ```
 ````
 
