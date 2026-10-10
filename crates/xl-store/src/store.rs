@@ -97,8 +97,14 @@ impl Store {
         if non_empty {
             return Err(Error::BucketNotEmpty(bucket.to_string()));
         }
-        tokio::fs::remove_dir(&dir).await?;
-        Ok(())
+        // ponytail: check-then-remove 窗口在 Task 5 加锁后收窄；M1 单进程下仅 tokio 任务间竞态
+        match tokio::fs::remove_dir(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                Err(Error::BucketNotEmpty(bucket.to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -153,10 +159,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::open(StoreConfig::new(dir.path())).await.unwrap();
+        Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn create_and_list_buckets() {
         let (s, _d) = store().await;
-        s.create_bucket("alpha").await.unwrap();
+        // 倒序创建：断言要证明的是「按名字排序」，不是创建顺序
         s.create_bucket("beta").await.unwrap();
+        s.create_bucket("alpha").await.unwrap();
         let names: Vec<String> = s
             .list_buckets()
             .await
@@ -165,6 +179,14 @@ mod tests {
             .map(|b| b.name)
             .collect();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_missing_root_is_empty() {
+        // 盘根整个消失（挂载点没了/被带外清掉）：列举返回空，不报错
+        let (s, dir) = store().await;
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(s.list_buckets().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -784,10 +784,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::open(StoreConfig::new(dir.path())).await.unwrap();
+        Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn create_and_list_buckets() {
         let (s, _d) = store().await;
-        s.create_bucket("alpha").await.unwrap();
+        // 倒序创建：断言要证明的是「按名字排序」，不是创建顺序
         s.create_bucket("beta").await.unwrap();
+        s.create_bucket("alpha").await.unwrap();
         let names: Vec<String> = s
             .list_buckets()
             .await
@@ -796,6 +804,14 @@ mod tests {
             .map(|b| b.name)
             .collect();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_missing_root_is_empty() {
+        // 盘根整个消失（挂载点没了/被带外清掉）：列举返回空，不报错
+        let (s, dir) = store().await;
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(s.list_buckets().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -969,8 +985,14 @@ impl Store {
         if non_empty {
             return Err(Error::BucketNotEmpty(bucket.to_string()));
         }
-        tokio::fs::remove_dir(&dir).await?;
-        Ok(())
+        // ponytail: check-then-remove 窗口在 Task 5 加锁后收窄；M1 单进程下仅 tokio 任务间竞态
+        match tokio::fs::remove_dir(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                Err(Error::BucketNotEmpty(bucket.to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -1011,10 +1033,12 @@ impl Store {
 
 `Cargo.toml` 无需改动：`tempfile` 已在 `[dev-dependencies]`，`#[tokio::test]` 与 `tokio::fs` 由 `[dependencies]` 里 tokio 已有的 features（macros / rt / fs）覆盖。
 
+注（Minor 2，记录待 M2）：桶路径上是普通文件（非目录）时，`ensure_bucket` 会把它当作已存在的桶；M2 处理，本任务不动。
+
 - [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store store 2>&1 | tail -14`
-Expected: 全绿——`store` 模块 `test result: ok. 7 passed`（`cargo test -p xl-store` 合计 24 passed）。原预期「两个测试失败」在 Rust 里不可达：测试引用的 `put_object`/`delete_object` 在 Task 5/6 才实现，缺失时是整个测试模块编译不过；已适配为不依赖它们的形态（见 Step 1）。
+Expected: 全绿——`store` 模块 `test result: ok. 9 passed`（`cargo test -p xl-store` 合计 26 passed）。原预期「两个测试失败」在 Rust 里不可达：测试引用的 `put_object`/`delete_object` 在 Task 5/6 才实现，缺失时是整个测试模块编译不过；已适配为不依赖它们的形态（见 Step 1）。
 
 - [x] **Step 5: 提交**
 
