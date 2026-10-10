@@ -228,7 +228,6 @@ Expected: FAIL（`../api` 不存在）
 
 ```ts
 const TOKEN_KEY = 'oss.token'
-const TOKEN_KEY = 'oss.token'
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
@@ -324,15 +323,15 @@ git commit -m "feat(web): 控制台 API 客户端（token/401/错误体）"
 
 **Files:**
 - Create: `web/src/App.tsx`（覆盖模板）、`web/src/main.tsx`（覆盖模板）
-- Delete: 模板的 `web/src/App.css`、`web/src/assets/react.svg`
+- Delete: 模板孤儿资产（App.tsx/main.tsx 覆盖后全部失去引用）——`web/src/App.css`、`web/src/index.css`、`web/src/assets/`（整目录：hero.png、vite.svg、react.svg）、`web/public/icons.svg`
 
-- [ ] **Step 1: 实现 `web/src/App.tsx`**
+- [x] **Step 1: 实现 `web/src/App.tsx`**
 
 ```tsx
 import { Navigate, Outlet, createBrowserRouter } from 'react-router-dom'
 import { Layout, Menu } from 'antd'
 import { Link, useLocation } from 'react-router-dom'
-import { DatabaseOutlined, KeyOutlined, UploadOutlined } from '@ant-design/icons'
+import { DatabaseOutlined, KeyOutlined } from '@ant-design/icons'
 import { getToken } from './api'
 import Login from './pages/Login'
 import Buckets from './pages/Buckets'
@@ -380,9 +379,9 @@ export const router = createBrowserRouter([
 ])
 ```
 
-`@ant-design/icons` 需安装：`npm install @ant-design/icons`（并入 Step 4 的提交）。
+`@ant-design/icons` 需安装：`npm install @ant-design/icons`（并入 Step 5 的提交）。
 
-- [ ] **Step 2: 覆盖 `web/src/main.tsx`**
+- [x] **Step 2: 覆盖 `web/src/main.tsx`**
 
 ```tsx
 import React from 'react'
@@ -411,21 +410,21 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 )
 ```
 
-删掉模板的 `web/src/App.css`、`web/src/index.css` 里不需要的样式引用（`main.tsx` 不再 import 它们）；模板 `App.tsx` 其余内容整份替换。
+模板 `App.tsx` 其余内容整份替换；`App.css`、`index.css`、`src/assets/`、`public/icons.svg` 随之失去全部引用，一并删除（见 Files 的 Delete 行）。
 
-- [ ] **Step 3: 先建四个页面的空壳**（让编译成立，Task 4-6/10 逐个填）
+- [x] **Step 3: 先建四个页面的空壳**（让编译成立，Task 4-6/10 逐个填）
 
 ```tsx
 // web/src/pages/Login.tsx / Buckets.tsx / Objects.tsx / Keys.tsx 各一
 export default function Login() { return <div>登录</div> }
 ```
 
-- [ ] **Step 4: 跑构建验证**
+- [x] **Step 4: 跑构建验证**
 
 Run: `cd web && npm run build`
 Expected: 成功。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add web/package.json web/package-lock.json web/src/
