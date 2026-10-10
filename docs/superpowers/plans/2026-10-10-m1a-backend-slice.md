@@ -1058,13 +1058,20 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
 - [x] **Step 1: 写失败的测试**
 
 ```rust
-// 追加到 store.rs 的 tests 模块
+// >>> 追加到 store.rs 的 tests 模块末尾（Task 5 段落，逐字取自最终实现）：
+    // ---- Task 5: put_object 提交协议 ----
+
     #[tokio::test]
     async fn put_then_head() {
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
         let info = s
-            .put_object("alpha", "dir/hello.txt", bytes::Bytes::from_static(b"hello world"), Some("text/plain".into()))
+            .put_object(
+                "alpha",
+                "dir/hello.txt",
+                bytes::Bytes::from_static(b"hello world"),
+                Some("text/plain".into()),
+            )
             .await
             .unwrap();
         assert_eq!(info.size, 11);
@@ -1074,6 +1081,22 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
 
         let head = s.head_object("alpha", "dir/hello.txt").await.unwrap();
         assert_eq!(head.etag, info.etag);
+    }
+
+    #[tokio::test]
+    async fn put_with_fsync_disabled_still_commits() {
+        // cfg.fsync=false 是提交路径上的另一条分支（测试快、生产必须开），必须同样可提交可读
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let s = Store::open(cfg).await.unwrap();
+        s.create_bucket("alpha").await.unwrap();
+        let info = s
+            .put_object("alpha", "k", Bytes::from_static(b"no-fsync"), None)
+            .await
+            .unwrap();
+        assert_eq!(info.size, 8);
+        assert_eq!(s.head_object("alpha", "k").await.unwrap().size, 8);
     }
 
     #[tokio::test]
@@ -1087,7 +1110,10 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
             Ok(Bytes::from(vec![b'a'; 1024])),
         ];
         let stream = futures::stream::iter(chunks);
-        let info = s.put_object_stream("alpha", "big.bin", Box::pin(stream), None).await.unwrap();
+        let info = s
+            .put_object_stream("alpha", "big.bin", Box::pin(stream), None)
+            .await
+            .unwrap();
         assert_eq!(info.size, 3072);
     }
 
@@ -1095,8 +1121,12 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
     async fn overwrite_is_atomic_and_old_version_gone() {
         let (s, d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        s.put_object("alpha", "k", bytes::Bytes::from_static(b"one"), None).await.unwrap();
-        s.put_object("alpha", "k", bytes::Bytes::from_static(b"two"), None).await.unwrap();
+        s.put_object("alpha", "k", bytes::Bytes::from_static(b"one"), None)
+            .await
+            .unwrap();
+        s.put_object("alpha", "k", bytes::Bytes::from_static(b"two"), None)
+            .await
+            .unwrap();
 
         let info = s.head_object("alpha", "k").await.unwrap();
         assert_eq!(info.size, 3);
@@ -1109,7 +1139,11 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         names.sort();
-        assert_eq!(names.len(), 2, "对象目录下应只有 xl.meta 与一个新的版本目录: {names:?}");
+        assert_eq!(
+            names.len(),
+            2,
+            "对象目录下应只有 xl.meta 与一个新的版本目录: {names:?}"
+        );
         assert!(names.iter().any(|n| n == "xl.meta"));
     }
 
@@ -1120,8 +1154,16 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
         s.create_bucket("alpha").await.unwrap();
         let orphan = layout::sys_dir(d.path(), "tmp").join("orphan-uuid");
         tokio::fs::create_dir_all(&orphan).await.unwrap();
-        tokio::fs::write(orphan.join("part.1"), b"junk").await.unwrap();
-        assert_eq!(s.head_object("alpha", "ghost").await.unwrap_err().to_string(), "key not found: ghost");
+        tokio::fs::write(orphan.join("part.1"), b"junk")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.head_object("alpha", "ghost")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "key not found: ghost"
+        );
     }
 
     #[tokio::test]
@@ -1133,7 +1175,8 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
         for i in 0..8u8 {
             let s = std::sync::Arc::clone(&s);
             handles.push(tokio::spawn(async move {
-                s.put_object("alpha", "same", bytes::Bytes::from(vec![i; 64]), None).await
+                s.put_object("alpha", "same", bytes::Bytes::from(vec![i; 64]), None)
+                    .await
             }));
         }
         for h in handles {
@@ -1154,12 +1197,55 @@ Expected: 编译错误（`put_object` 未实现）
 - [x] **Step 3: 实现 `put_object`**
 
 ```rust
-// 追加到 impl Store
+// >>> 模块顶部 import 区最终形态（含既有行）：
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use futures::Stream;
 use md5::{Digest as _, Md5};
 use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 
-impl Store {
+use crate::error::{Error, Result};
+use crate::layout;
+use crate::meta::{self, PartRef, Version, XlMeta};
+
+// >>> `Store` 结构体新增字段：
+pub struct Store {
+    cfg: StoreConfig,
+    /// 进程内 per-object 互斥，`bucket/key` → 锁：同键的并发写必须串行，
+    /// 否则两个写者会把对方的版本目录当「老版本」扔进回收站。
+    /// ponytail: 单进程锁；跨进程用 `.oss.sys/locks/<sha1(key)>.lock` 的 flock（设计 §4.4，M2/M3）
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+// >>> `open` 初始化锁表：
+    pub async fn open(cfg: StoreConfig) -> Result<Self> {
+        for sub in ["tmp", "trash", "locks"] {
+            tokio::fs::create_dir_all(layout::sys_dir(&cfg.root, sub)).await?;
+        }
+        Ok(Self {
+            cfg,
+            locks: Mutex::new(HashMap::new()),
+        })
+    }
+
+// >>> `impl Store` 内 `root()` 之后：
+    fn lock_for(&self, bucket: &str, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let id = format!("{bucket}/{key}");
+        let mut locks = self.locks.lock().unwrap();
+        let lock = locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        // 回收无人持有的旧条目，锁表不随历史写过的键无限增长
+        locks.retain(|k, v| k == &id || Arc::strong_count(v) > 1);
+        lock
+    }
+
+// >>> `impl Store` 内 `list_buckets` 之后（提交协议 + 读探针；`now_nanos` 在模块级）：
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -1167,8 +1253,13 @@ impl Store {
         body: Bytes,
         content_type: Option<String>,
     ) -> Result<ObjectInfo> {
-        self.put_object_stream(bucket, key, Box::pin(futures::stream::once(async move { Ok(body) })) as ByteStream, content_type)
-            .await
+        self.put_object_stream(
+            bucket,
+            key,
+            Box::pin(futures::stream::once(async move { Ok(body) })) as ByteStream,
+            content_type,
+        )
+        .await
     }
 
     /// 提交协议（顺序不可变）：
@@ -1177,6 +1268,7 @@ impl Store {
     ///   3. **同盘 rename** tmp/<uuid> → <bucket>/<obj>/<uuid>     ← 数据就位
     ///   4. 写 `<obj>/xl.meta.new` 并 fsync，再 rename 覆盖 `xl.meta` ← **提交点**
     ///   5. 老版本目录 → `.oss.sys/trash/`（异步删）
+    ///
     /// 3 与 4 之间崩溃 = 留下一个孤儿版本目录（不可见，启动自检回收）；
     /// 4 之后崩溃 = 老版本目录残留（不可见，clean 回收）。读路径只信 xl.meta。
     pub async fn put_object_stream(
@@ -1230,7 +1322,10 @@ impl Store {
                 sha256: hex::encode(sha.finalize()),
             },
         };
-        let meta = XlMeta { object_key: key.to_string(), versions: vec![version] };
+        let meta = XlMeta {
+            object_key: key.to_string(),
+            versions: vec![version],
+        };
 
         // 2) 候选 meta 落 tmp
         tokio::fs::write(tmp.join(meta::META_FILE), meta.encode()?).await?;
@@ -1266,7 +1361,17 @@ impl Store {
     async fn read_meta(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         let path = layout::object_dir(&self.cfg.root, bucket, key)?.join(meta::META_FILE);
         match tokio::fs::read(&path).await {
-            Ok(bytes) => XlMeta::decode(&bytes).map(Some),
+            Ok(bytes) => {
+                let m = XlMeta::decode(&bytes)?;
+                // 键一致性：目录名与 xl.meta 记录的键不符 = 元数据错位，宁可报损坏也不服务错误内容
+                if m.object_key != key {
+                    return Err(Error::CorruptMeta(format!(
+                        "键不一致：请求 {key:?}，xl.meta 中为 {:?}",
+                        m.object_key
+                    )));
+                }
+                Ok(Some(m))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -1285,6 +1390,31 @@ impl Store {
         tokio::fs::rename(&new_path, dir.join(meta::META_FILE)).await?;
         Ok(())
     }
+
+    // Task 5 的测试要一个「提交后是否可见」的探针，head_object 与其组装函数随本 task 落地；
+    // get / delete / list / copy 仍留给 Task 6。
+    fn load_object_info(&self, bucket: &str, key: &str, m: &XlMeta) -> Result<ObjectInfo> {
+        let v = m
+            .latest()
+            .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+        Ok(ObjectInfo {
+            key: key.to_string(),
+            size: v.size,
+            etag: v.etag.clone(),
+            content_type: v.content_type.clone(),
+            last_modified_nanos: v.mod_time_nanos,
+            user_metadata: v.user_metadata.clone(),
+        })
+    }
+
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
+        self.ensure_bucket(bucket).await?;
+        let m = self
+            .read_meta(bucket, key)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        self.load_object_info(bucket, key, &m)
+    }
 }
 
 fn now_nanos() -> i64 {
@@ -1297,22 +1427,21 @@ fn now_nanos() -> i64 {
 
 `md-5` 的 crate 名是 `md-5`，导入路径是 `md5`（`use md5::{Digest as _, Md5}`）。
 
-注（与骨架的差异，实现时裁定）：
+注（与最初骨架的差异，已裁决；下方代码块已同步为最终实现形态）：
 - `locks` 字段 / `lock_for` 方法随本 task 落地（Task 4 推迟至此，首个调用者是 `put_object_stream`）。形态：`Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>`，加锁键为 `bucket/key`；`lock_for` 在取锁时 `retain` 回收无外部持有者的旧条目，锁表不随历史写过的键无限增长。
 - `head_object` 与 `load_object_info` 也随本 task 落地：Step 1 的 `put_then_head` / `crash_between_steps_leaves_no_visible_object` 需要一个「提交后是否可见」的探针，缺它们整个测试模块编译不过。**Task 6 的 Step 3 骨架里已含这两个函数，实现 Task 6 时不要重复添加**（get / delete / list / copy 仍留给 Task 6）。
 - `read_meta` 增加键一致性校验（Task 3 质量评审 Minor 3）：解码出的 `object_key` 与请求的 key 不符 → `Error::CorruptMeta`（信息含两个 key），测试 `read_meta_rejects_mismatched_object_key`。
 - 补 `put_with_fsync_disabled_still_commits`：`cfg.fsync=false` 是提交路径上的另一条分支，必须同样可提交可读。
-- Step 3 骨架的文档注释按 clippy `doc_lazy_continuation` 调整（列表后加空行），非语义改动。
 
 - [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store 2>&1 | tail -20`
-Expected: 全部通过（含 Task 4 里那两个此前失败的）
-实际：`xl-store` 34 passed（Task 4 的 26 + 本 task 的 8）；Step 2 的失败形态是编译错误（`put_object` / `put_object_stream` / `head_object` / `XlMeta` 未定义），与 Task 4 Step 4 注记的「模块级编译不过」同因。
+Expected（已更新为实际）：`xl-store` 34 passed / 0 failed（Task 4 的 26 + 本 task 的 8）；四闸全绿（fmt / clippy 0 告警 / `-p xl-store` / `--workspace -j 2`）。Step 2 的失败形态是编译错误（`put_object` / `put_object_stream` / `head_object` / `XlMeta` 未定义），与 Task 4 Step 4 注记的「模块级编译不过」同因。
 
 - [x] **Step 5: 加一个「断电」验证：在提交点之前中断**
 
 ```rust
+// >>> 追加到 tests 模块（Task 5 段落续）：「断电」与 read_meta 一致性测试：
     #[tokio::test]
     async fn part_written_but_not_committed_is_invisible() {
         // 直接把一个完整版本目录摆进对象目录、但不写 xl.meta，
@@ -1320,9 +1449,38 @@ Expected: 全部通过（含 Task 4 里那两个此前失败的）
         let (s, d) = store().await;
         s.create_bucket("alpha").await.unwrap();
         let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
-        tokio::fs::create_dir_all(obj_dir.join("dangling-uuid")).await.unwrap();
-        tokio::fs::write(obj_dir.join("dangling-uuid").join("part.1"), b"data").await.unwrap();
-        assert!(matches!(s.head_object("alpha", "k").await, Err(Error::NoSuchKey(_))));
+        tokio::fs::create_dir_all(obj_dir.join("dangling-uuid"))
+            .await
+            .unwrap();
+        tokio::fs::write(obj_dir.join("dangling-uuid").join("part.1"), b"data")
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.head_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_meta_rejects_mismatched_object_key() {
+        // 内容可解码、但 object_key 与目录名不符的 xl.meta：读路径必须报 CorruptMeta，
+        // 而不是把「张冠李戴」的元数据当成请求的键（错位会静默服务错误内容）
+        let (s, d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        let m = XlMeta {
+            object_key: "other".into(),
+            versions: vec![],
+        };
+        tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+            .await
+            .unwrap();
+
+        let err = s.head_object("alpha", "k").await.unwrap_err();
+        assert!(matches!(err, Error::CorruptMeta(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("\"k\"") && msg.contains("\"other\""), "{msg}");
     }
 ```
 
@@ -1419,12 +1577,16 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
     }
 ```
 
+注（可编译前提已就绪）：本块用到的 `put_object` / `head_object` 已随 Task 5 落地，可直接编译；本 Step 新引入的是 `get_object` / `list_objects` / `copy_object` / `ListRequest`。
+
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-store 2>&1 | tail -20`
 Expected: 编译错误（`get_object` / `list_objects` / `copy_object` / `ListRequest` 未定义）
 
 - [ ] **Step 3: 实现读 / 删 / 列举 / 复制**
+
+注（勿重复添加）：本块里的 `load_object_info` 与 `head_object` 已在 Task 5 落地（Task 5 的测试需要「提交后是否可见」的探针），实现 Task 6 时**跳过这两个函数**；其余（`ListRequest` / `ListResult` / `get_object` / `delete_object` / `list_objects` / `copy_object`）照常实现。
 
 ```rust
 #[derive(Debug, Clone, Default)]
