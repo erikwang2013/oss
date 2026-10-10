@@ -1,13 +1,16 @@
 import { expect, test } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 test('同一文件二次上传命中秒传：不再产生 /aetherupload/uploading 请求', async ({ page }) => {
-  const bucket = `e2e-${Date.now()}`
+  // 同 console.spec：`zzz-` 前缀让新桶恒排在桶列表最后一页
+  const bucket = `zzz-e2e-${Date.now()}`
   const dir = mkdtempSync(join(tmpdir(), 'oss-e2e-'))
   const file = join(dir, 'instant.txt')
-  writeFileSync(file, `instant-${Date.now()}`)
+  // 内容逐次唯一（理由同 console.spec：并行下同内容 = 同 md5 = 同一个对象键）
+  writeFileSync(file, `instant-${Date.now()}-${randomUUID()}`)
 
   const uploadingPosts: string[] = []
   page.on('request', (r) => {
@@ -22,7 +25,13 @@ test('同一文件二次上传命中秒传：不再产生 /aetherupload/uploadin
   await page.getByRole('button', { name: '新建桶' }).click()
   await page.locator('#new-bucket-name').fill(bucket)
   await page.getByRole('button', { name: /确\s*定/ }).click()
-  await page.getByRole('link', { name: bucket }).click()
+  // 同 console.spec：新桶在最后一页，且 refetch 与翻页有竞态 → 重试「点最后一页 → 找新桶」
+  const bucketLink = page.getByRole('link', { name: bucket })
+  await expect(async () => {
+    await page.locator('.ant-pagination-item').last().click()
+    await expect(bucketLink).toBeVisible({ timeout: 1_000 })
+  }).toPass({ timeout: 15_000 })
+  await bucketLink.click()
 
   // 第一次：真分块
   await page.getByRole('button', { name: '上 传', exact: true }).click()

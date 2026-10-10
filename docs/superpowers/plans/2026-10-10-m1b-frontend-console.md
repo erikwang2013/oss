@@ -1672,6 +1672,14 @@ git commit -m "test(web): Playwright 关键路径（闭环 + 秒传零分块）"
 并入 `console.spec.ts`；秒传用例二传走「按钮 → filechooser」真人路径（去掉 `onFinished` 里的
 `removeAttribute('disabled')` 反跑即红，已验）。
 
+**执行注记补（抗并发 / 分页，随压力实跑修正）**：断言不得依赖「新桶在第 1 页」——桶列表按名升序、10 行/页
+（xl-store `list_buckets` + antd 默认分页），共享 data 目录里历史桶只增不减，同前缀的新桶照样会被挤出第 1 页
+（`0-` 前缀一样会漂）。现用 `zzz-` 前缀（恒大于既有桶名 → 新桶恒在最后一页）并先「点最后一页 → 找新桶」再断言，
+整体用 `expect(...).toPass()` 重试：建桶后的 `invalidateQueries` refetch 与翻页点有竞态。`/keys` 同理由
+（`created_at` 升序 → 新键在最后一页）。文件内容加 `randomUUID()`：并行 worker 同毫秒起步时会写出同内容 → 同 md5
+→ **同一个对象键**，两个运行互相踩（一个删掉对象，另一个断言的行消失）——压力实跑复现，已从 DB 证实。
+验证：`npm run e2e` 3 passed；`--repeat-each=3 --workers=3` 9 passed、`--repeat-each=4 --workers=4` 12 passed。
+
 ---
 
 ## Task 12: 1 GB 断线续传手测清单 + README + CI 验收
