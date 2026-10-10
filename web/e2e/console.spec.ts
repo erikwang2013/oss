@@ -8,8 +8,8 @@ test('登录 → 建桶 → 上传 → 列表 → 下载 → 删除', async ({ p
   // 前缀 `zzz-`：桶列表按桶名升序且 10 行/页（xl-store list_buckets 排序 + antd 默认分页），
   // 共享 data 目录里历史桶会一直堆积——`zzz-` 恒大于既有桶名，新桶永远排在最后一页最后一行，
   // 断言先翻到最后一页即可，不随数据量/并发漂移（曾用 `0-` 前缀，但并用运行一多，
-  // 同前缀的新桶照样被挤出第 1 页）。
-  const bucket = `zzz-e2e-${Date.now()}`
+  // 同前缀的新桶照样被挤出第 1 页）。尾部 UUID 防同毫秒并发撞名：撞名 → 建桶 409 → 弹窗不关 → 假红。
+  const bucket = `zzz-e2e-${Date.now()}-${randomUUID().slice(0, 8)}`
   const dir = mkdtempSync(join(tmpdir(), 'oss-e2e-'))
   // 内容必须逐次唯一：只有时间戳时，并行 worker 可能同毫秒起步 → 同内容 → 同 md5 → **同一个对象键**，
   // 两个运行会互相踩（一个把对象删了，另一个断言时行就没了）。对象名即内容 md5，见下方。
@@ -90,14 +90,10 @@ test('新建访问密钥 → 弹窗展示 AK/SK → 复制裸 SK → 列表出�
   // 关窗用右上角关闭钮（aria-label 固定 Close；Esc 在 rc-dialog 里有焦点问题）
   await page.getByRole('button', { name: 'Close' }).click()
   // 密钥列表按 created_at 升序、10 行/页（db.rs list_access_keys + antd 默认分页），共享 data
-  // 目录里已 >10 条：新建的键在最后一页，别假设它在第 1 页。并发跑时恰好翻页会让它退一页，兜底再试。
-  const pages = page.locator('.ant-pagination-item')
+  // 目录里已 >10 条：新建的键在最后一页，别假设它在第 1 页。refetch 与翻页有竞态，同桶列表用重试。
   const cell = page.getByRole('cell', { name: ak, exact: true })
-  await pages.last().click()
-  try {
-    await expect(cell).toBeVisible({ timeout: 2_000 })
-  } catch {
-    await pages.nth((await pages.count()) - 2).click()
-  }
-  await expect(cell).toBeVisible()
+  await expect(async () => {
+    await page.locator('.ant-pagination-item').last().click()
+    await expect(cell).toBeVisible({ timeout: 1_000 })
+  }).toPass({ timeout: 15_000 })
 })

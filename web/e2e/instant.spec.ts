@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 test('同一文件二次上传命中秒传：不再产生 /aetherupload/uploading 请求', async ({ page }) => {
-  // 同 console.spec：`zzz-` 前缀让新桶恒排在桶列表最后一页
-  const bucket = `zzz-e2e-${Date.now()}`
+  // 同 console.spec：`zzz-` 前缀让新桶恒排在桶列表最后一页；尾部 UUID 防同毫秒并发撞名
+  const bucket = `zzz-e2e-${Date.now()}-${randomUUID().slice(0, 8)}`
   const dir = mkdtempSync(join(tmpdir(), 'oss-e2e-'))
   const file = join(dir, 'instant.txt')
   // 内容逐次唯一（理由同 console.spec：并行下同内容 = 同 md5 = 同一个对象键）

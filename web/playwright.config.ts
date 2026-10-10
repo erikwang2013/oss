@@ -8,7 +8,7 @@ export default defineConfig({
   // 「upload succeed」，中文断言必然超时。控制台本身也是 zh-CN（index.html + antd locale）。
   use: { baseURL: 'http://127.0.0.1:5173', locale: 'zh-CN' },
   // 两个 webServer：后端（cargo）与前端（vite）。后端数据目录沿用 oss.toml 默认；
-  // 用例用「时间戳桶名 + 时间戳文件内容」保证可重复跑。
+  // 用例用「时间戳 + UUID 的桶名 / 文件内容」保证可重复、可并发跑。
   webServer: [
     {
       command: 'cargo run -p oss-server',

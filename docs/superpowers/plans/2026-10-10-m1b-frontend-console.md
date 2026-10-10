@@ -1678,7 +1678,10 @@ git commit -m "test(web): Playwright 关键路径（闭环 + 秒传零分块）"
 整体用 `expect(...).toPass()` 重试：建桶后的 `invalidateQueries` refetch 与翻页点有竞态。`/keys` 同理由
 （`created_at` 升序 → 新键在最后一页）。文件内容加 `randomUUID()`：并行 worker 同毫秒起步时会写出同内容 → 同 md5
 → **同一个对象键**，两个运行互相踩（一个删掉对象，另一个断言的行消失）——压力实跑复现，已从 DB 证实。
-验证：`npm run e2e` 3 passed；`--repeat-each=3 --workers=3` 9 passed、`--repeat-each=4 --workers=4` 12 passed。
+桶名同样补唯一化后缀（`zzz-e2e-<时间戳>-<UUID 前 8 位>`）：同毫秒并发建桶会撞名 → 409 → Modal 不关 → 假红，
+内容侧已用 UUID、名字侧补齐。`/keys` 的翻页（原「退一页」特判兜底，在 refetch 窗口里反而会点错页）统一成与桶列表
+同款 `expect(...).toPass()`（点末页 → 断言可见，自纠）。`playwright.config.ts` 注释随动为「时间戳 + UUID」。
+验证：`npm run e2e` 3 passed；`--repeat-each=3 --workers=3` 9 passed、`--repeat-each=4 --workers=4` 12 passed（修正后再跑仍全绿）。
 
 ---
 
