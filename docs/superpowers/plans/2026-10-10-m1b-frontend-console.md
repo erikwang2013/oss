@@ -1483,6 +1483,10 @@ git add web/src/pages/Keys.tsx
 git commit -m "feat(web): 访问密钥页（列表 + 一次性展示 SK）"
 ```
 
+> 执行注记：/keys 的浏览器闭环（新建 → 弹窗显示 AK/SK → 点复制 → 关窗 → 列表出现新 AK）由 Task 11 的
+> Playwright e2e（`console.spec.ts` 第二条用例）覆盖，见下方 Minor 3 转记；本轮替代验证：`npm test`、
+> `npm run build`、`npm run lint`（复制内容与关窗行为另有定稿记录中的浏览器实测）。
+
 ---
 
 ## 定稿记录（Task 10 质量评审收尾，commit `fix(web): 密钥复制内容去前缀；关闭清 mutation 态；防误触遮罩`）
@@ -1520,7 +1524,7 @@ git commit -m "feat(web): 访问密钥页（列表 + 一次性展示 SK）"
 **Files:**
 - Create: `web/playwright.config.ts`、`web/e2e/console.spec.ts`、`web/e2e/instant.spec.ts`
 
-- [ ] **Step 1: 配置**
+- [x] **Step 1: 配置**
 
 ```ts
 // web/playwright.config.ts
@@ -1551,7 +1555,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 2: `e2e/console.spec.ts`——闭环**
+- [x] **Step 2: `e2e/console.spec.ts`——闭环**
 
 ```ts
 import { expect, test } from '@playwright/test'
@@ -1598,7 +1602,7 @@ test('登录 → 建桶 → 上传 → 列表 → 下载 → 删除', async ({ p
 })
 ```
 
-- [ ] **Step 3: `e2e/instant.spec.ts`——秒传零分块**
+- [x] **Step 3: `e2e/instant.spec.ts`——秒传零分块**
 
 ```ts
 import { expect, test } from '@playwright/test'
@@ -1642,7 +1646,7 @@ test('同一文件二次上传命中秒传：不再产生 /aetherupload/uploadin
 })
 ```
 
-- [ ] **Step 4: 跑 e2e**
+- [x] **Step 4: 跑 e2e**
 
 ```bash
 cd /home/wwwroot/oss/web
@@ -1652,12 +1656,21 @@ npm run e2e
 
 Expected: 2 passed。（若本机已有后端在跑，`reuseExistingServer` 会直接复用——注意它会用运行中实例的数据目录。）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add web/playwright.config.ts web/e2e/
 git commit -m "test(web): Playwright 关键路径（闭环 + 秒传零分块）"
 ```
+
+**执行注记（本轮实跑修正，3 用例全绿）**：Step 2 的上传落点假设与实现不符——上传按「分组 → 桶」映射落桶
+（`IngestSink::resolve`），group `file` → 桶 `files`，对象名是**内容 md5**（`get_file_name(md5, ext)`，非原文件名），
+子目录是 `SubdirRule::Month` 的 **UTC 年月**。故闭环用例上传后改去 `/buckets/files?prefix=<UTC 年月>/` 断言
+列表/下载/删除（下载加断言字节一致，兑现 Task 6 执行注记）；建桶仍留在用例里（Task 5 覆盖）。配置的 `use`
+补 `locale: 'zh-CN'`：aetherupload-all.js 按 `navigator.language` 选文案表，Playwright 默认 en-US 时
+`#aetherupload-output` 写英文「upload succeed」，中文断言必超时。另：`/keys` 一条（Task 10 Minor 3 转记）
+并入 `console.spec.ts`；秒传用例二传走「按钮 → filechooser」真人路径（去掉 `onFinished` 里的
+`removeAttribute('disabled')` 反跑即红，已验）。
 
 ---
 
