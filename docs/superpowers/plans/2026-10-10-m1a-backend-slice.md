@@ -2308,6 +2308,8 @@ mod tests {
         assert!(!db.register_upload("nope.txt", "my.txt", None).await.unwrap());
     }
 
+    // （已回撤：Task 9 收尾轮删除，生产路径由 xl-s3 接管）——本测试与下方的 rejects_inactive
+    // 均已随 `secret_for_access_key` 一并删除；`user_and_access_key_roundtrip` 改为直查断言。
     #[tokio::test]
     async fn secret_for_access_key_rejects_expired() {
         let db = db().await;
@@ -2435,6 +2437,7 @@ impl Db {
         Ok(())
     }
 
+    // （已回撤：Task 9 收尾轮删除，生产路径由 xl-s3 接管）
     /// SigV4 校验用：AK → SK。过期或非 active 一律当作不存在（返回 None）。
     pub async fn secret_for_access_key(&self, ak: &str) -> Result<Option<String>> {
         let row = sqlx::query(
@@ -3183,7 +3186,7 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): SigV4 凭据解析与错误
 **Files:**
 - Create: `crates/xl-s3/src/service.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 // crates/xl-s3/tests/bucket_ops.rs
@@ -3239,12 +3242,13 @@ async fn head_missing_bucket_is_no_such_bucket() {
 
 > `S3Request` 的 `trailing_headers` 字段名以 `protocol.rs` 为准；若构造不出来，改用 `S3Request::new(input)` 之类的构造器（若存在），或在本任务里加一个 `fn s3req()` 辅助函数集中处理。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-s3 --test bucket_ops 2>&1 | tail -20`
 Expected: 编译错误
+实际：`error: could not compile`（1 处 E0432：`no OssS3 in service` —— `service.rs` 此前为 1 字节占位）。
 
-- [ ] **Step 3: 实现 `service.rs` 的骨架与桶操作**
+- [x] **Step 3: 实现 `service.rs` 的骨架与桶操作**
 
 ```rust
 //! s3s 的 `S3` trait 实现。M1 覆盖：桶 CRUD、对象 CRUD、ListObjectsV2、CopyObject、批量删除。
@@ -3260,19 +3264,15 @@ use crate::convert::to_s3_error;
 
 pub struct OssS3 {
     store: Arc<Store>,
-    /// ponytail: 单个 PUT 的内存上限；M2 换流式后删除。
-    max_put_bytes: usize,
 }
 
 impl OssS3 {
-    pub fn new(store: Arc<Store>, max_put_bytes: usize) -> Self {
-        Self { store, max_put_bytes }
+    /// `max_put_bytes` 字段与 `last_modified` 的首个消费者都在 Task 11（put / head / get）——
+    /// 无读取者/无调用者的私有项会撞 dead_code 与 0 告警闸，随首个消费者一并落地
+    ///（Task 4→5 的 `locks` 同款裁决）。
+    pub fn new(store: Arc<Store>, _max_put_bytes: usize) -> Self {
+        Self { store }
     }
-}
-
-/// `xl.meta` 的 `mod_time_nanos` → S3 的 Last-Modified。不要用 now() 冒充。
-fn last_modified(nanos: i64) -> LastModified {
-    LastModified::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos.max(0) as u64))
 }
 
 #[async_trait::async_trait]
@@ -3314,13 +3314,17 @@ impl S3 for OssS3 {
 ```
 
 > `CreationDate` 的类型以 `generated.rs` 为准（可能是 `Timestamp` 别名）。若 `CreationDate::from(SystemTime)` 不成立，改用其实际构造方式。
+> 已核实（源码核对，无臆测）：`CreationDate = Timestamp`（`generated.rs:7525`），`impl From<SystemTime> for Timestamp` 成立（`dto/timestamp.rs:60`），计划代码原样编译。
 
-- [ ] **Step 4: 跑测试**
+注（Task 10 执行偏差，已裁决；上方 Step 3 代码块已同步为最终形态）：`max_put_bytes` 字段与 `last_modified` 函数推迟到 Task 11 首次有消费者时加入（put / head / get）——Task 10 两者均无读取者/调用者，dead_code 实测两条警告（`field max_put_bytes is never read` + `function last_modified is never used`），会撞 0 告警闸，与 Task 4→5 的 `locks` 同款裁决。构造函数签名不变（`new(store, _max_put_bytes)`，`bucket_ops.rs` 与 Task 11 的调用形状不动）；**Task 11 落地时把参数改回 `max_put_bytes` 并加回 `last_modified`**（其 Step 3 代码块已按此写）。`service.rs` 其余与计划逐字一致（rustfmt 仅换行）。
+
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-s3 --test bucket_ops 2>&1 | tail -12`
 Expected: 全绿
+实际：全绿——`--test bucket_ops` 2 passed；`-p xl-s3` 9 passed（7 单元 + 2 集成）。四闸全绿（fmt / clippy 0 告警 / `-p xl-s3` / `--workspace -j 2`；workspace 合计 65 = xl-store 50 + oss-server 6 + xl-s3 9）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/xl-s3/ && git commit -m "feat(xl-s3): 桶操作（create/head/delete/list）"
