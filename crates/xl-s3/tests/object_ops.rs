@@ -376,6 +376,19 @@ async fn list_objects_v2_prefix_delimiter_and_paging() {
         keys,
         vec!["docs/1.txt".to_string(), "docs/2.txt".to_string()]
     );
+    // 元数据字段取有区分力的值：size 与 ETag 都不是占位
+    let first = &out.contents.as_ref().unwrap()[0];
+    assert_eq!(first.size, Some(1));
+    let expected_md5 = {
+        use md5::{Digest as _, Md5};
+        let mut h = Md5::new();
+        h.update(b"x");
+        hex::encode(h.finalize())
+    };
+    assert_eq!(
+        first.e_tag.as_ref().map(ETag::value),
+        Some(expected_md5.as_str())
+    );
     assert_eq!(
         out.common_prefixes.unwrap()[0].prefix.as_deref(),
         Some("docs/deep/")
@@ -584,4 +597,29 @@ async fn copy_object_rejects_non_bucket_copy_source() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+}
+
+#[tokio::test]
+async fn copy_object_source_missing_is_no_such_key() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let err = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("alpha".to_string())
+            .key("dst".to_string())
+            .copy_source(CopySource::Bucket {
+                bucket: "alpha".into(),
+                key: "missing".into(),
+                version_id: None,
+            })
+            .build()
+            .unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
 }

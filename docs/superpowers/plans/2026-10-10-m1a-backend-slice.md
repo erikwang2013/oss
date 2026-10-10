@@ -3546,6 +3546,7 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): 对象 CRUD 与批量删除
 
 **Files:**
 - Modify: `crates/xl-s3/src/service.rs`
+- Modify: `crates/xl-store/src/store.rs`（仅 `copy_object` 加一行 `ponytail:` 标记；评审微项 3 并入）
 
 - [x] **Step 1: 写失败的测试**
 
@@ -3764,7 +3765,7 @@ Expected: 编译错误 / `NotImplemented`
 Run: `cargo test -p xl-s3 2>&1 | tail -12`
 Expected: 全绿
 
-实测：`object_ops` 11 passed（原 5 + 本轮 6：4 新用例 + 恰 1000 用例 + 非桶 CopySource 用例）；四闸全绿（fmt / clippy 0 告警 / `-p xl-s3` / `--workspace -j 2`）。
+实测：`object_ops` 12 passed（原 5 + 本轮 7：4 新用例 + 恰 1000 用例 + 非桶 CopySource 用例 + 源缺失用例）；四闸全绿（fmt / clippy 0 告警 / `-p xl-s3` / `--workspace -j 2`）。
 
 - [x] **Step 5: 提交**
 
@@ -3785,6 +3786,9 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): ListObjectsV2 与 CopyObjec
 - **非桶 `CopySource` 补用例（规格评审微项 2）**：`copy_object_rejects_non_bucket_copy_source` 用 `CopySource::AccessPoint` 钉住既有守卫的 `InvalidRequest` 路径（此前只有代码、无用例）。
 - 口径注：`max-keys` 上限 >1000 由 store 静默钳到 1000（Task 4 定稿），本轮只增负数拒绝，未动钳位语义。
 - **M2 备忘（评审微项 4，M1 不改）**：`key_count` 只数 objects，而 store 的 `max_keys` 预算把 common_prefixes 计入 —— 带 `delimiter` 的分页下 `KeyCount` 与 AWS 语义可能有差（AWS 的 KeyCount 计 Contents+CommonPrefixes），M2 对齐全量列举语义时一并核。另记：`encoding-type=url`、`start-after`、`fetch-owner` 三个 ListObjectsV2 参数 M1 均未处理（规格 §4.1 参数表列了），属计划层范围，M1 落账不做。
+- **copy 静默忽略面 M2 备忘（评审微项 1，与上条自 key_count 备忘并列）**：`CopySource::Bucket` 的 `versionId` 被吞（M1 无版本，真 S3 对不存在/不支持的 versionId 报 404）与 `x-amz-copy-source-if-*` 条件头被吞（真 S3 条件不满足报 412）——M1 均未处理，M4/M6 接版本与条件复制时一并补。
+- **测试补强（评审微项 2）**：`list_objects_v2_prefix_delimiter_and_paging` 的 Contents 断言补 `size == Some(1)`、`e_tag == md5("x")`（取有区分力的值，不钉占位）；新增 `copy_object_source_missing_is_no_such_key`（源对象不存在 → `NoSuchKey`）。
+- **`xl-store::store::copy_object` 加 `ponytail:` 标记（评审微项 3）**：注明 M1 读出整份字节再写回（内存中介，上限同 put），M2 换分片级服务端复制；与 `put_object` 的标记风格一致。`xl-store` 本轮仅此一行注释，行为未动（其测试不受影响）。
 
 ---
 

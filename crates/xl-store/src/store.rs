@@ -512,6 +512,7 @@ impl Store {
         dst_bucket: &str,
         dst_key: &str,
     ) -> Result<ObjectInfo> {
+        // ponytail: M1 读出整份字节再写回（内存中介，上限同 put）；M2 换分片级服务端复制，不过内存。
         let (info, bytes) = self.get_object(src_bucket, src_key).await?;
         self.put_object(dst_bucket, dst_key, bytes, info.content_type)
             .await
