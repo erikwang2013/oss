@@ -788,7 +788,13 @@ mod tests {
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
         s.create_bucket("beta").await.unwrap();
-        let names: Vec<String> = s.list_buckets().await.unwrap().into_iter().map(|b| b.name).collect();
+        let names: Vec<String> = s
+            .list_buckets()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
@@ -805,18 +811,27 @@ mod tests {
     #[tokio::test]
     async fn create_bucket_rejects_bad_name() {
         let (s, _d) = store().await;
-        assert!(matches!(s.create_bucket("A_B").await, Err(Error::InvalidBucketName(_))));
+        assert!(matches!(
+            s.create_bucket("A_B").await,
+            Err(Error::InvalidBucketName(_))
+        ));
     }
 
     #[tokio::test]
     async fn delete_bucket_requires_empty() {
-        let (s, _d) = store().await;
+        let (s, d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        s.put_object("alpha", "k.txt", bytes::Bytes::from_static(b"hi"), None)
+        // Task 5 前没有 put_object：直接摆一个对象目录（含内容）来制造「非空」。
+        let obj_dir = layout::object_dir(d.path(), "alpha", "k.txt").unwrap();
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        tokio::fs::write(obj_dir.join("part.1"), b"hi")
             .await
             .unwrap();
-        assert!(matches!(s.delete_bucket("alpha").await, Err(Error::BucketNotEmpty(_))));
-        s.delete_object("alpha", "k.txt").await.unwrap();
+        assert!(matches!(
+            s.delete_bucket("alpha").await,
+            Err(Error::BucketNotEmpty(_))
+        ));
+        tokio::fs::remove_dir_all(&obj_dir).await.unwrap();
         s.delete_bucket("alpha").await.unwrap();
         assert!(!s.bucket_exists("alpha").await.unwrap());
     }
@@ -824,9 +839,24 @@ mod tests {
     #[tokio::test]
     async fn missing_bucket_is_reported() {
         let (s, _d) = store().await;
+        // put_object 属 Task 5；ensure_bucket 是同一前置，先用 delete_bucket 验它。
         assert!(matches!(
-            s.put_object("nope", "k", bytes::Bytes::new(), None).await,
+            s.delete_bucket("nope").await,
             Err(Error::NoSuchBucket(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_bucket_rejects_traversal() {
+        // ensure_bucket 内的桶名校验是删桶/列举的收口点：`..` 若放行，delete_bucket 会去删盘根之外
+        let (s, _d) = store().await;
+        assert!(matches!(
+            s.delete_bucket("..").await,
+            Err(Error::InvalidBucketName(_))
+        ));
+        assert!(matches!(
+            s.delete_bucket("A_B").await,
+            Err(Error::InvalidBucketName(_))
         ));
     }
 }
@@ -843,17 +873,13 @@ Expected: 编译错误（`Store` 未定义）
 //! 存储内核。M1：单盘、无纠删码，但**提交协议与 xl.meta 格式按最终设计落**，
 //! M2 只是把「一个 part 一个文件」换成「一个 part 若干分片」。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::Stream;
-use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{self, PartRef, Version, XlMeta};
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
@@ -866,7 +892,10 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), fsync: true }
+        Self {
+            root: root.into(),
+            fsync: true,
+        }
     }
 }
 
@@ -888,31 +917,25 @@ pub struct ObjectInfo {
 
 pub struct Store {
     cfg: StoreConfig,
-    /// ponytail: 单进程对象锁。M3 换 flock（单机多进程）+ quorum 锁（多节点）。
-    locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Store {
     pub async fn open(cfg: StoreConfig) -> Result<Self> {
-        tokio::fs::create_dir_all(cfg.root.join(layout::SYS_DIR).join("tmp")).await?;
-        tokio::fs::create_dir_all(cfg.root.join(layout::SYS_DIR).join("trash")).await?;
-        tokio::fs::create_dir_all(cfg.root.join(layout::SYS_DIR).join("locks")).await?;
-        Ok(Self { cfg, locks: std::sync::Mutex::new(HashMap::new()) })
+        for sub in ["tmp", "trash", "locks"] {
+            tokio::fs::create_dir_all(layout::sys_dir(&cfg.root, sub)).await?;
+        }
+        Ok(Self { cfg })
     }
 
     pub fn root(&self) -> &Path {
         &self.cfg.root
     }
 
-    fn lock_for(&self, bucket: &str, key: &str) -> Arc<Mutex<()>> {
-        let id = format!("{bucket}/{key}");
-        let mut map = self.locks.lock().unwrap();
-        Arc::clone(map.entry(id).or_default())
-    }
-
+    /// 桶操作的统一前置。名字校验在此收口：桶目录是 `root.join(bucket)`，
+    /// 不过滤 `..`/绝对路径就会让删桶、列举跑到盘根之外。
     async fn ensure_bucket(&self, bucket: &str) -> Result<()> {
-        let dir = layout::bucket_dir(&self.cfg.root, bucket);
-        if tokio::fs::try_exists(&dir).await? {
+        layout::validate_bucket(bucket)?;
+        if tokio::fs::try_exists(layout::bucket_dir(&self.cfg.root, bucket)).await? {
             Ok(())
         } else {
             Err(Error::NoSuchBucket(bucket.to_string()))
@@ -938,12 +961,15 @@ impl Store {
 
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         self.ensure_bucket(bucket).await?;
-        let mut entries = tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            // 桶里只要还有对象目录就拒绝（S3 语义）
+        let dir = layout::bucket_dir(&self.cfg.root, bucket);
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        let non_empty = entries.next_entry().await?.is_some();
+        drop(entries);
+        // 桶里只要还有对象目录就拒绝（S3 语义）
+        if non_empty {
             return Err(Error::BucketNotEmpty(bucket.to_string()));
         }
-        tokio::fs::remove_dir(layout::bucket_dir(&self.cfg.root, bucket)).await?;
+        tokio::fs::remove_dir(&dir).await?;
         Ok(())
     }
 
@@ -970,7 +996,10 @@ impl Store {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
-            out.push(BucketInfo { name, creation_nanos: nanos });
+            out.push(BucketInfo {
+                name,
+                creation_nanos: nanos,
+            });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
@@ -978,12 +1007,14 @@ impl Store {
 }
 ```
 
-`Cargo.toml` 的 `[dev-dependencies]` 加 `tempfile = "3"` 与 `tokio = { workspace = true, features = ["full"] }`。
+注（与骨架的差异，已裁决）：`locks` 字段 / `lock_for` 方法推迟到 Task 5 首次有调用者（`put_object_stream`）时加入——Task 4 无调用者，dead_code 会与 0 告警闸冲突。
+
+`Cargo.toml` 无需改动：`tempfile` 已在 `[dev-dependencies]`，`#[tokio::test]` 与 `tokio::fs` 由 `[dependencies]` 里 tokio 已有的 features（macros / rt / fs）覆盖。
 
 - [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store store 2>&1 | tail -14`
-Expected: 部分通过，`delete_bucket_requires_empty` 与 `missing_bucket_is_reported` 失败（`put_object`/`delete_object` 还未实现）——这是预期的，Task 5/6 会补上。
+Expected: 全绿——`store` 模块 `test result: ok. 7 passed`（`cargo test -p xl-store` 合计 24 passed）。原预期「两个测试失败」在 Rust 里不可达：测试引用的 `put_object`/`delete_object` 在 Task 5/6 才实现，缺失时是整个测试模块编译不过；已适配为不依赖它们的形态（见 Step 1）。
 
 - [x] **Step 5: 提交**
 
