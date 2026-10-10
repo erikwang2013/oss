@@ -256,7 +256,7 @@ git add Cargo.toml crates/ && git commit -m "chore: workspace 骨架，锁定 ax
 - Create: `crates/xl-store/src/error.rs`
 - Create: `crates/xl-store/src/layout.rs`
 
-- [ ] **Step 1: 写失败的测试**（放在 `layout.rs` 底部 `#[cfg(test)]`）
+- [x] **Step 1: 写失败的测试**（放在 `layout.rs` 底部 `#[cfg(test)]`）
 
 ```rust
 #[cfg(test)]
@@ -299,12 +299,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-store layout 2>&1 | tail -20`
 Expected: 编译错误（`object_dir_name` 未定义）
 
-- [ ] **Step 3: 实现 `error.rs`**
+- [x] **Step 3: 实现 `error.rs`**
 
 ```rust
 use std::io;
@@ -334,7 +334,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 ```
 
-- [ ] **Step 4: 实现 `layout.rs`**
+- [x] **Step 4: 实现 `layout.rs`**
 
 ```rust
 //! 盘布局与寻址：对象名展平、桶名/键校验、盘上路径推导。
@@ -424,12 +424,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cargo test -p xl-store layout 2>&1 | tail -12`
 Expected: `test result: ok. 5 passed`
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/xl-store/src/error.rs crates/xl-store/src/layout.rs
