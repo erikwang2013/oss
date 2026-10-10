@@ -219,7 +219,7 @@
 
 ### 3.3 HeadObject —— `M1`
 
-同 GetObject 但不返回 body。**注意语义**：任何错误一律 404（不返回具体错误码），这是 S3 的既有行为，客户端（如 rclone）依赖它。
+同 GetObject 但不返回 body。**注意语义**：任何错误一律 404（指对象/桶不存在的读语义；键不合规仍按 §0.2 报 400；不返回具体错误码），这是 S3 的既有行为，客户端（如 rclone）依赖它。
 
 ### 3.4 DeleteObject / DeleteObjects —— `M1`
 

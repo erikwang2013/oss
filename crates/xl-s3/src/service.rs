@@ -6,6 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
+use xl_store::error::Error as StoreError;
 use xl_store::store::Store;
 
 use crate::convert::to_s3_error;
@@ -186,12 +187,44 @@ impl S3 for OssS3 {
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let bucket = req.input.bucket;
-        for obj in req.input.delete.objects {
-            self.store
-                .delete_object(&bucket, &obj.key)
-                .await
-                .map_err(to_s3_error)?;
+        // §3.4：一次最多 1000 个
+        if req.input.delete.objects.len() > 1000 {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "too many objects in a single delete request"
+            ));
         }
-        Ok(S3Response::new(DeleteObjectsOutput::default()))
+
+        // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
+        // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+        for obj in req.input.delete.objects {
+            match self.store.delete_object(&bucket, &obj.key).await {
+                Ok(()) => deleted.push(DeletedObject {
+                    key: Some(obj.key),
+                    ..Default::default()
+                }),
+                Err(e @ (StoreError::NoSuchBucket(_) | StoreError::InvalidBucketName(_))) => {
+                    return Err(to_s3_error(e));
+                }
+                Err(e) => {
+                    // 经 to_s3_error：4xx 保留原文，5xx 细节只进日志
+                    let s3err = to_s3_error(e);
+                    errors.push(Error {
+                        key: Some(obj.key),
+                        code: Some(s3err.code().as_str().to_string()),
+                        message: Some(s3err.message().unwrap_or_default().to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: (!deleted.is_empty()).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
     }
 }

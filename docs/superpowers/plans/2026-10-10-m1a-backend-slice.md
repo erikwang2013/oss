@@ -3484,10 +3484,39 @@ Expected: 编译错误（实测能编译：`S3` trait 自带默认方法体，�
 
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let bucket = req.input.bucket;
-        for obj in req.input.delete.objects {
-            self.store.delete_object(&bucket, &obj.key).await.map_err(to_s3_error)?;
+        // §3.4：一次最多 1000 个
+        if req.input.delete.objects.len() > 1000 {
+            return Err(s3s::s3_error!(InvalidRequest, "too many objects in a single delete request"));
         }
-        Ok(S3Response::new(DeleteObjectsOutput::default()))
+
+        // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
+        // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+        for obj in req.input.delete.objects {
+            match self.store.delete_object(&bucket, &obj.key).await {
+                Ok(()) => deleted.push(DeletedObject { key: Some(obj.key), ..Default::default() }),
+                Err(e @ (StoreError::NoSuchBucket(_) | StoreError::InvalidBucketName(_))) => {
+                    return Err(to_s3_error(e));
+                }
+                Err(e) => {
+                    // 经 to_s3_error：4xx 保留原文，5xx 细节只进日志
+                    let s3err = to_s3_error(e);
+                    errors.push(Error {
+                        key: Some(obj.key),
+                        code: Some(s3err.code().as_str().to_string()),
+                        message: Some(s3err.message().unwrap_or_default().to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: (!deleted.is_empty()).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
     }
 ```
 
@@ -3505,7 +3534,10 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): 对象 CRUD 与批量删除
 ### 定稿记录
 
 - `max_put_bytes` 按 Task 10 偏差注还原：字段加回 `OssS3` 结构体、构造参数去 `_` 前缀（`bucket_ops.rs` 调用形状不变）；Task 10 的 Step 3 代码块与偏差注已同步。
-- Step 3 实现与计划代码块逐字一致，仅另加 `use bytes::Bytes;`（块内只含方法体，未含 imports）与 rustfmt 换行。
+- Step 3 实现与计划代码块逐字一致（`delete_objects` 见下条），仅另加 `use bytes::Bytes;` 与 `use xl_store::error::Error as StoreError;`（块内只含方法体，未含 imports）与 rustfmt 换行。
+- **`delete_objects` 按规格 §3.4 修正（质量评审 I-1）**：原块只做「首个错误即整体 Err」的简化循环，与 §3.4 的「部分失败时 Errors 数组列出失败项，成功的仍在 Deleted 里，不做事务回滚」不符。定稿：入口 1000 上限（超出 → `InvalidRequest`）；逐键删，成功 push `DeletedObject{key}`、键级错误经 `to_s3_error` 收进 `errors`（`Error{key, code: s3err.code().as_str(), message}`——`S3ErrorCode` 无 `Display`，字符串形态走 `as_str()`）后继续；桶级错误（`NoSuchBucket` / `InvalidBucketName`）仍整体返回 Err。上方 Step 3 块已同步。
+- 测试补强（评审 M-1/M-2）：批量后逐键 head 确认已删；get_object 收 body 字节断言；删后 head 钉 `NoSuchKey`；混批（`ok1` + 非法键 `a//b`）钉 `deleted`/`errors`/互不影响；`>1000` 键钉 `InvalidRequest`；`max_put_bytes` 边界对（恰 1 MiB 通过、1 MiB+1 → `EntityTooLarge`）。
+- 口径注：规格 §3.3 的「任何错误一律 404」指对象/桶不存在的读语义；键不合规仍按 §0.2 报 400（`head_object` 的 `InvalidKey` → `InvalidArgument`）。规格 §3.3 已加同款括号，计划此处落账。
 - 测试 helper（`service()` / `req()`）与 `bucket_ops.rs` 有意重复一份：计划未要求共用模块（Task 12 继续往 `object_ops.rs` 追加）。
 
 ---
