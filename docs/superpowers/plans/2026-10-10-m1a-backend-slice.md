@@ -486,7 +486,7 @@ git commit -m "feat(xl-store): 盘布局与键编码，拒目录穿越与保留�
 **Files:**
 - Create: `crates/xl-store/src/meta.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 #[cfg(test)]
@@ -564,12 +564,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-store meta 2>&1 | tail -20`
 Expected: 编译错误（`XlMeta` 未定义）
 
-- [ ] **Step 3: 实现 `meta.rs`**
+- [x] **Step 3: 实现 `meta.rs`**
 
 ```rust
 //! xl.meta v1 —— 每个对象目录一份，是**唯一的提交点**。
@@ -650,12 +650,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p xl-store meta 2>&1 | tail -12`
 Expected: `test result: ok. 6 passed`
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/xl-store/src/meta.rs
