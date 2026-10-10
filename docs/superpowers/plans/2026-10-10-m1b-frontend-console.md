@@ -62,31 +62,31 @@ oss/
 - Create: `web/`（Vite 模板 + 手改配置）
 - Modify: `web/vite.config.ts`、`web/index.html`、`web/package.json`
 
-- [ ] **Step 1: 生成模板并装依赖**
+- [x] **Step 1: 生成模板并装依赖**
 
 ```bash
 cd /home/wwwroot/oss
 npm create vite@latest web -- --template react-ts
 cd web && npm install
-npm install antd @tanstack/react-query react-router-dom
+npm install antd@5 @tanstack/react-query react-router-dom   # 裸装 antd 已是 v6，按技术栈钉 v5
 npm install -D vitest jsdom @testing-library/react @playwright/test
 ```
 
 Expected: `web/` 目录生成，`package.json` 出现上述依赖。React 版本以模板为准（应为 19.x）。
 
-- [ ] **Step 2: `package.json` 的 scripts**
+- [x] **Step 2: `package.json` 的 scripts**
 
 ```json
 "scripts": {
   "dev": "vite",
   "build": "tsc -b && vite build",
   "preview": "vite preview",
-  "test": "vitest run",
+  "test": "vitest run --passWithNoTests",
   "e2e": "playwright test"
 }
 ```
 
-- [ ] **Step 3: `vite.config.ts`（代理 + vitest）**
+- [x] **Step 3: `vite.config.ts`（代理 + vitest）**
 
 ```ts
 /// <reference types="vitest/config" />
@@ -98,6 +98,9 @@ const backend = 'http://127.0.0.1:9000'
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Vite 8 默认 host 'localhost' 在本机只解析到 ::1，而计划里 Playwright/浏览器
+    // 用的都是 http://127.0.0.1:5173 —— 显式绑 IPv4 保证两边一致
+    host: '127.0.0.1',
     proxy: {
       // 注意尾斜杠：'/aetherupload/' 不能写成 '/aetherupload'，
       // 否则 /aetherupload-assets/（public 下的自带脚本）会被误转发到后端 404
@@ -113,7 +116,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 4: `index.html` 挂自带脚本**
+- [x] **Step 4: `index.html` 挂自带脚本**
 
 `web/index.html` 的 `<head>` 末尾加（放 head 里可避免 React 首屏后脚本未加载）：
 
@@ -123,7 +126,7 @@ export default defineConfig({
 
 （`public/aetherupload-assets/` 的内容在 Task 8 拷贝；此步先建空目录占位 `mkdir -p public/aetherupload-assets`。）
 
-- [ ] **Step 5: 验证 dev 起得来、构建通过**
+- [x] **Step 5: 验证 dev 起得来、构建通过**
 
 ```bash
 npm run dev &      # 浏览器打开 http://127.0.0.1:5173 看到模板页即成功（此时后端可不在）
@@ -131,7 +134,7 @@ sleep 3 && kill %1
 npm run build      # 须成功（tsc -b && vite build）
 ```
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd /home/wwwroot/oss
@@ -146,7 +149,7 @@ git add web/ && git commit -m "chore(web): Vite + React19 + antd5 脚手架，�
 - Create: `web/src/api.ts`
 - Test: `web/src/__tests__/api.test.ts`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```ts
 // web/src/__tests__/api.test.ts
@@ -184,14 +187,17 @@ describe('api()', () => {
 
   it('401 时清 token 且抛 ApiError', async () => {
     setToken('tok')
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 })))
-    await expect(api('/api/v1/buckets')).rejects.toBeInstanceOf(ApiError)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('用户名或密码错误', { status: 401 })))
+    const p = api('/api/v1/buckets')
+    await expect(p).rejects.toBeInstanceOf(ApiError)
+    await expect(p).rejects.toMatchObject({ status: 401, message: '用户名或密码错误' })
     expect(getToken()).toBeNull()
   })
 
   it('非 2xx 抛 ApiError 且带状态码与响应文本', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('桶非空', { status: 409 })))
-    const err = await api('/api/v1/buckets/a').catch((e) => e as ApiError)
+    // api<never>：不写类型参数时 T 推断为 unknown，catch 结果会塌成 unknown 而无法访问 .status
+    const err = await api<never>('/api/v1/buckets/a').catch((e) => e as ApiError)
     expect(err.status).toBe(409)
     expect(err.message).toBe('桶非空')
   })
@@ -200,15 +206,25 @@ describe('api()', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
     await expect(api('/api/v1/buckets/a', { method: 'DELETE' })).resolves.toBeUndefined()
   })
+
+  it('有 body 设 content-type: application/json，无 body 不设', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await api('/api/v1/buckets', { method: 'POST', body: JSON.stringify({ bucket: 'b' }) })
+    const withBody = fetchMock.mock.calls[0][1] as RequestInit
+    expect(new Headers(withBody.headers).get('content-type')).toBe('application/json')
+    await api('/api/v1/buckets')
+    const noBody = fetchMock.mock.calls[1][1] as RequestInit
+    expect(new Headers(noBody.headers).has('content-type')).toBe(false)
+  })
 })
 ```
-
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd web && npm test`
 Expected: FAIL（`../api` 不存在）
 
-- [ ] **Step 3: 实现 `web/src/api.ts`**
+- [x] **Step 3: 实现 `web/src/api.ts`**
 
 ```ts
 const TOKEN_KEY = 'oss.token'
@@ -222,8 +238,10 @@ export function setToken(t: string | null): void {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  status: number // 手写赋值：tsconfig 开了 erasableSyntaxOnly，参数属性（constructor(public x)）不可用
+  constructor(status: number, message: string) {
     super(message)
+    this.status = status
   }
 }
 
@@ -232,13 +250,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   const token = getToken()
   if (token) headers.set('authorization', `Bearer ${token}`)
-  if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json')
+  // FormData 让 fetch 自己带 multipart boundary，手设 content-type 会把 boundary 弄丢
+  if (init.body && !(init.body instanceof FormData) && !headers.has('content-type')) headers.set('content-type', 'application/json')
 
   const resp = await fetch(path, { ...init, headers })
   if (resp.status === 401) {
     setToken(null)
+    const msg = (await resp.text()) || '未登录'
     if (window.location.pathname !== '/login') window.location.href = '/login'
-    throw new ApiError(401, '未登录')
+    throw new ApiError(401, msg)
   }
   if (!resp.ok) throw new ApiError(resp.status, (await resp.text()) || resp.statusText)
   if (resp.status === 204) return undefined as T
@@ -283,13 +303,14 @@ export interface AccessKey {
   secret_key: string
 }
 ```
+> 注：`tsconfig.app.json` 开了 `erasableSyntaxOnly`（Vite 8 脚手架默认），TS 参数属性（`constructor(public status: number)`）会报 TS1294，故 `ApiError` 用显式字段。另开了 `verbatimModuleSyntax`：从本模块导入类型须写 `import { type ObjectList }` 形式，否则报 TS1484。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cd web && npm test`
-Expected: PASS（4 个用例）
+Expected: PASS（5 个用例）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add web/src/api.ts web/src/__tests__/api.test.ts
@@ -302,15 +323,16 @@ git commit -m "feat(web): 控制台 API 客户端（token/401/错误体）"
 
 **Files:**
 - Create: `web/src/App.tsx`（覆盖模板）、`web/src/main.tsx`（覆盖模板）
-- Delete: 模板的 `web/src/App.css`、`web/src/assets/react.svg`
+- Modify: `web/index.html`（`lang="zh-CN"`、`<title>OSS 控制台</title>`）、`web/.gitignore`（补 e2e 产物三行）
+- Delete: 模板孤儿资产（App.tsx/main.tsx 覆盖后全部失去引用）——`web/src/App.css`、`web/src/index.css`、`web/src/assets/`（整目录：hero.png、vite.svg、react.svg）、`web/public/icons.svg`
 
-- [ ] **Step 1: 实现 `web/src/App.tsx`**
+- [x] **Step 1: 实现 `web/src/App.tsx`**
 
 ```tsx
 import { Navigate, Outlet, createBrowserRouter } from 'react-router-dom'
 import { Layout, Menu } from 'antd'
 import { Link, useLocation } from 'react-router-dom'
-import { DatabaseOutlined, KeyOutlined, UploadOutlined } from '@ant-design/icons'
+import { DatabaseOutlined, KeyOutlined } from '@ant-design/icons'
 import { getToken } from './api'
 import Login from './pages/Login'
 import Buckets from './pages/Buckets'
@@ -358,9 +380,9 @@ export const router = createBrowserRouter([
 ])
 ```
 
-`@ant-design/icons` 需安装：`npm install @ant-design/icons`（并入 Step 4 的提交）。
+`@ant-design/icons` 需安装：`npm install @ant-design/icons@^5`（钉 v5：裸装是 v6、配套 antd v6，本项目 antd 5.29.x 与 icons v5 配对，且会与 antd 内部依赖去重）（并入 Step 5 的提交）。
 
-- [ ] **Step 2: 覆盖 `web/src/main.tsx`**
+- [x] **Step 2: 覆盖 `web/src/main.tsx`**
 
 ```tsx
 import React from 'react'
@@ -389,21 +411,23 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 )
 ```
 
-删掉模板的 `web/src/App.css`、`web/src/index.css` 里不需要的样式引用（`main.tsx` 不再 import 它们）；模板 `App.tsx` 其余内容整份替换。
+模板 `App.tsx` 其余内容整份替换；`App.css`、`index.css`、`src/assets/`、`public/icons.svg` 随之失去全部引用，一并删除（见 Files 的 Delete 行）。
 
-- [ ] **Step 3: 先建四个页面的空壳**（让编译成立，Task 4-6/10 逐个填）
+同一轮模板收尾：`web/index.html` 的 `lang="en"` → `lang="zh-CN"`、`<title>web</title>` → `<title>OSS 控制台</title>`；`web/.gitignore` 补 `coverage`、`playwright-report`、`test-results` 三行（Task 11 跑 e2e 会产生后两者）。
+
+- [x] **Step 3: 先建四个页面的空壳**（让编译成立，Task 4-6/10 逐个填）
 
 ```tsx
 // web/src/pages/Login.tsx / Buckets.tsx / Objects.tsx / Keys.tsx 各一
 export default function Login() { return <div>登录</div> }
 ```
 
-- [ ] **Step 4: 跑构建验证**
+- [x] **Step 4: 跑构建验证**
 
 Run: `cd web && npm run build`
 Expected: 成功。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add web/package.json web/package-lock.json web/src/
@@ -417,7 +441,7 @@ git commit -m "feat(web): 路由 + 鉴权壳 + antd 布局"
 **Files:**
 - Modify: `web/src/pages/Login.tsx`
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
 
 ```tsx
 import { useState } from 'react'
@@ -468,7 +492,7 @@ export default function Login() {
 
 注意：登录接口失败时后端返回纯文本（非 JSON），`api()` 抛出的 `ApiError.message` 就是「用户名或密码错误」——直接展示。
 
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 ```bash
 cd /home/wwwroot/oss
@@ -479,7 +503,9 @@ cd web && npm run dev &
 
 浏览器打开 `http://127.0.0.1:5173/login`：错密码提示「用户名或密码错误」；对密码跳转 `/buckets`（此时桶页还是壳）。验证完 `kill %1 %2`。
 
-- [ ] **Step 3: 提交**
+> 执行注记：后端控制台 API 在 M1a 完成后才能实跑手验，本轮（M1b worktree 内无 `oss-server`）跳过浏览器手验；真实登录流程由 Task 11 的 Playwright e2e 覆盖。本轮替代验证：`cd web && npm test`（6 用例不回归）、`npm run build`（tsc 通过）、`npm run lint`。
+
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Login.tsx
@@ -493,7 +519,7 @@ git commit -m "feat(web): 登录页"
 **Files:**
 - Modify: `web/src/pages/Buckets.tsx`
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
 
 ```tsx
 import { useState } from 'react'
@@ -506,6 +532,7 @@ export default function Buckets() {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [creating, setCreating] = useState(false)
+  const [newName, setNewName] = useState('')
 
   const { data: buckets = [], isLoading } = useQuery({
     queryKey: ['buckets'],
@@ -529,7 +556,7 @@ export default function Buckets() {
 
   return (
     <>
-      <Button type="primary" onClick={() => setCreating(true)} style={{ marginBottom: 16 }}>
+      <Button type="primary" onClick={() => { setNewName(''); setCreating(true) }} style={{ marginBottom: 16 }}>
         新建桶
       </Button>
       <Table
@@ -537,7 +564,8 @@ export default function Buckets() {
         loading={isLoading}
         dataSource={buckets}
         columns={[
-          { title: '桶名', dataIndex: 0, render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link> },
+          // 不用 dataIndex：antd 对 string[] 记录取 dataIndex:0 会拿到首字符（"alpha"→"a"）；无 dataIndex 时 render 第一参即整条记录
+          { title: '桶名', render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link> },
           {
             title: '操作',
             width: 120,
@@ -554,23 +582,33 @@ export default function Buckets() {
         open={creating}
         onCancel={() => setCreating(false)}
         onOk={() => {
-          const el = document.getElementById('new-bucket-name') as HTMLInputElement | null
-          if (el?.value) create.mutate(el.value)
+          if (!newName) { message.warning('请输入桶名'); return }
+          create.mutate(newName)
         }}
         confirmLoading={create.isPending}
       >
-        <Input id="new-bucket-name" placeholder="3-63 字符，小写字母数字与 - ." autoFocus />
+        <Input
+          id="new-bucket-name"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder="3-63 字符，小写字母数字与 - ."
+          autoFocus
+        />
       </Modal>
     </>
   )
 }
 ```
 
-- [ ] **Step 2: 验证**
+实现注记：桶名列去掉了计划初稿的 `dataIndex: 0`——antd 对 `string[]` 记录按 `get(record, [0])` 取值，`"alpha"` 会渲染成首字符 `"a"`；去掉后 `render` 第一参即是整条记录（已用 antd Table 实测两种写法的渲染结果）。
+
+- [x] **Step 2: 验证**
 
 浏览器 `/buckets`：建 `alpha` → 列表出现；点进去壳页；回列表删 `alpha`（空桶）成功；删非空桶报 `BucketNotEmpty`（错误文案来自后端纯文本）。
 
-- [ ] **Step 3: 提交**
+> 执行注记：同 Task 4——后端控制台 API（M1a Task 15 未落地）本轮无实跑条件，跳过浏览器手验；真实流程（建桶 / 进入 / 删空桶 / 删非空桶报 `BucketNotEmpty`）由 Task 11 的 Playwright e2e 覆盖。本轮替代验证：`cd web && npm test`（6 用例不回归）、`npm run build`、`npm run lint`。
+
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Buckets.tsx
@@ -584,14 +622,14 @@ git commit -m "feat(web): 桶列表页（建/删/进入）"
 **Files:**
 - Modify: `web/src/pages/Objects.tsx`
 
-- [ ] **Step 1: 实现**（前缀导航来自 `common_prefixes`，下载走 fetch→blob，避免给浏览器下载请求塞 JWT 头的难题）
+- [x] **Step 1: 实现**（前缀导航来自 `common_prefixes`，下载走 fetch→blob，避免给浏览器下载请求塞 JWT 头的难题）
 
 ```tsx
-import { useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useMemo } from 'react'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, ObjectList } from '../api'
+import { api, getToken, type ObjectList } from '../api'
 
 function humanSize(n: number) {
   if (n < 1024) return `${n} B`
@@ -600,11 +638,16 @@ function humanSize(n: number) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`
 }
 
+// 显式给出行类型：否则 antd Table 会从各列 render 的参数注解反推 RecordType，推出带 string 字面量的错误类型，rowKey 与 render 都编译不过
+type Row = { kind: 'dir'; key: string } | { kind: 'obj'; key: string; size: number; etag: string }
+
 export default function Objects() {
   const { bucket = '' } = useParams()
   const { message } = App.useApp()
   const qc = useQueryClient()
-  const [prefix, setPrefix] = useState('')
+  // prefix 的单一事实源是 URL query：Link 是 SPA 导航、同路由仅 query 变化不重挂载，useState 快照会让面包屑/手改 URL/返回键都失效
+  const [sp, setSp] = useSearchParams()
+  const prefix = sp.get('prefix') ?? ''
 
   const { data, isLoading } = useQuery({
     queryKey: ['objects', bucket, prefix],
@@ -617,9 +660,10 @@ export default function Objects() {
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['objects', bucket] })
 
+  // 对象键一律整键 encodeURIComponent（删除/下载同款）：axum 的 {*key} 通配段先按路径匹配再解码，%2F 不会被拆段，含空格/#/? 的键才能走对
   const remove = useMutation({
     mutationFn: (key: string) =>
-      api(`/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${key}`, { method: 'DELETE' }),
+      api(`/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`, { method: 'DELETE' }),
     onSuccess: () => { message.success('已删除'); invalidate() },
     onError: (e: Error) => message.error(e.message),
   })
@@ -627,17 +671,17 @@ export default function Objects() {
   const download = async (key: string) => {
     try {
       const resp = await fetch(
-        `/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${key}`,
-        { headers: { authorization: `Bearer ${localStorage.getItem('oss.token') ?? ''}` } },
+        `/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`,
+        { headers: { authorization: `Bearer ${getToken() ?? ''}` } },
       )
       if (!resp.ok) throw new Error(await resp.text())
-      const blob = await resp.blob()
+      const blob = await resp.blob() // M1 大对象全量进内存的上限，M2 流式
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = key.split('/').pop() ?? 'download'
+      a.download = key.split('/').pop() || 'download'
       a.click()
-      URL.revokeObjectURL(url)
+      setTimeout(() => URL.revokeObjectURL(url), 0)
     } catch (e) {
       message.error(e instanceof Error ? e.message : '下载失败')
     }
@@ -667,7 +711,7 @@ export default function Objects() {
       <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
         上传入口在 Task 9 接；M1 上传面板就绪前可用 `aws s3 cp` / `rclone` 注入对象。
       </Typography.Text>
-      <Table
+      <Table<Row>
         rowKey={(r) => r.key}
         loading={isLoading}
         dataSource={rows}
@@ -678,7 +722,9 @@ export default function Objects() {
             dataIndex: 'key',
             render: (key: string, r: { kind: 'dir' | 'obj' }) =>
               r.kind === 'dir' ? (
-                <a onClick={() => setPrefix(key)}>{key.slice(prefix.length)}</a>
+                <Button type="link" size="small" onClick={() => setSp(key ? { prefix: key } : {})}>
+                  {key.slice(prefix.length)}
+                </Button>
               ) : (
                 <Tooltip title={key}>{key.slice(prefix.length)}</Tooltip>
               ),
@@ -709,19 +755,17 @@ export default function Objects() {
 }
 ```
 
-注意：`prefix` 初始值从 URL query（面包屑链接用 `?prefix=`）读取——在组件顶部补一行：
+实现注记：`<Table>` 加了显式泛型 `<Table<Row>>`（`Row` = dir/obj 联合类型）——计划初稿的无泛型写法下，antd 会从各列 `render` 的参数注解反推 `RecordType`，推出 `{ kind: string; size?: number }` 这类错误类型，`rowKey` 与三处 render 全部编译不过（`tsc` 报 TS2339/TS2322）；列定义本身未动。
 
-```tsx
-const [prefix, setPrefix] = useState(() => new URLSearchParams(window.location.search).get('prefix') ?? '')
-```
+面包屑/前缀注记（裁决重开）：计划初稿假设「面包屑 `Link` 整页跳转、组件重挂载、状态自然重置」不成立——react-router `Link` 是 SPA 导航，同路由仅 query 变化不重挂载，`useState` 快照会让面包屑回退/手改 URL/返回键失效；经评审改为 `useSearchParams` 单一事实源（此前《注意》段的「URLSearchParams 初始化」写法作废，原段与「整页跳转」表述已删）。下载与可达性小修随本轮评审一并吸收：`getToken()` 取代直读 localStorage、`revokeObjectURL` 延迟到宏任务、`|| 'download'` 空串边界、blob 全量入内存上限注释、dir 点击改 `<Button type="link">` 键盘可达。
 
-（覆盖上面 `useState('')`；面包屑链接切换时整页跳转、组件重挂载，状态自然重置。）
-
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 用 `aws s3 cp` 往 `alpha` 放 `docs/a.txt`、`docs/b.txt`、`top.txt` → 控制台 `/buckets/alpha` 看到 `docs/` 与 `top.txt`；点 `docs/` 进前缀，面包屑回根；下载 `a.txt` 字节一致（`cmp`）；删 `top.txt` 后列表刷新。
 
-- [ ] **Step 3: 提交**
+> 执行注记：同 Task 4——后端控制台 API（M1a Task 15 未落地）本轮无实跑条件，跳过浏览器手验；真实流程（前缀导航 / 下载字节一致 / 删除刷新）由 Task 11 的 Playwright e2e 覆盖。本轮替代验证：`cd web && npm test`（6 用例不回归）、`npm run build`、`npm run lint`。另：下载/删除路径的整键 `encodeURIComponent` 与 axum `{*key}` 通配段的解码行为本轮无法本地复核，一并留给 Task 11 e2e 验证。
+
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Objects.tsx
@@ -997,7 +1041,7 @@ export function humanSize(n: number): string {
 import { useRef, useState } from 'react'
 import { App, Button, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, GroupInfo, UploadRecord } from '../api'
+import { api, type GroupInfo, type UploadRecord } from '../api'
 import { humanSize } from '../format'
 import { UploadOutcome, useUpload } from './useUpload'
 
@@ -1161,7 +1205,7 @@ git commit -m "feat(web): 上传面板（分组/进度/秒传提示/上传历史
 import { useState } from 'react'
 import { Alert, App, Button, Modal, Table, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, AccessKey } from '../api'
+import { api, type AccessKey } from '../api'
 
 export default function Keys() {
   const { message } = App.useApp()
@@ -1193,7 +1237,8 @@ export default function Keys() {
         loading={isLoading}
         dataSource={keys}
         columns={[
-          { title: 'Access Key', dataIndex: 0 },
+          // 不用 dataIndex：antd 对 string[] 记录取 dataIndex:0 会拿到首字符；无 dataIndex 时 render 第一参即整条记录
+          { title: 'Access Key', render: (ak: string) => ak },
           { title: '说明', render: () => '启用/禁用与过期在 M5；M1 只有创建与使用' },
         ]}
       />
