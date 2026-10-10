@@ -62,31 +62,31 @@ oss/
 - Create: `web/`（Vite 模板 + 手改配置）
 - Modify: `web/vite.config.ts`、`web/index.html`、`web/package.json`
 
-- [ ] **Step 1: 生成模板并装依赖**
+- [x] **Step 1: 生成模板并装依赖**
 
 ```bash
 cd /home/wwwroot/oss
 npm create vite@latest web -- --template react-ts
 cd web && npm install
-npm install antd @tanstack/react-query react-router-dom
+npm install antd@5 @tanstack/react-query react-router-dom   # 裸装 antd 已是 v6，按技术栈钉 v5
 npm install -D vitest jsdom @testing-library/react @playwright/test
 ```
 
 Expected: `web/` 目录生成，`package.json` 出现上述依赖。React 版本以模板为准（应为 19.x）。
 
-- [ ] **Step 2: `package.json` 的 scripts**
+- [x] **Step 2: `package.json` 的 scripts**
 
 ```json
 "scripts": {
   "dev": "vite",
   "build": "tsc -b && vite build",
   "preview": "vite preview",
-  "test": "vitest run",
+  "test": "vitest run --passWithNoTests",
   "e2e": "playwright test"
 }
 ```
 
-- [ ] **Step 3: `vite.config.ts`（代理 + vitest）**
+- [x] **Step 3: `vite.config.ts`（代理 + vitest）**
 
 ```ts
 /// <reference types="vitest/config" />
@@ -98,6 +98,9 @@ const backend = 'http://127.0.0.1:9000'
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Vite 8 默认 host 'localhost' 在本机只解析到 ::1，而计划里 Playwright/浏览器
+    // 用的都是 http://127.0.0.1:5173 —— 显式绑 IPv4 保证两边一致
+    host: '127.0.0.1',
     proxy: {
       // 注意尾斜杠：'/aetherupload/' 不能写成 '/aetherupload'，
       // 否则 /aetherupload-assets/（public 下的自带脚本）会被误转发到后端 404
@@ -113,7 +116,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 4: `index.html` 挂自带脚本**
+- [x] **Step 4: `index.html` 挂自带脚本**
 
 `web/index.html` 的 `<head>` 末尾加（放 head 里可避免 React 首屏后脚本未加载）：
 
@@ -123,7 +126,7 @@ export default defineConfig({
 
 （`public/aetherupload-assets/` 的内容在 Task 8 拷贝；此步先建空目录占位 `mkdir -p public/aetherupload-assets`。）
 
-- [ ] **Step 5: 验证 dev 起得来、构建通过**
+- [x] **Step 5: 验证 dev 起得来、构建通过**
 
 ```bash
 npm run dev &      # 浏览器打开 http://127.0.0.1:5173 看到模板页即成功（此时后端可不在）
@@ -131,7 +134,7 @@ sleep 3 && kill %1
 npm run build      # 须成功（tsc -b && vite build）
 ```
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd /home/wwwroot/oss
