@@ -762,7 +762,7 @@ git commit -m "feat(xl-store): xl.meta v1 格式，版本字节 + 前向兼容�
 **Files:**
 - Create: `crates/xl-store/src/store.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 #[cfg(test)]
@@ -832,12 +832,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-store store 2>&1 | tail -20`
 Expected: 编译错误（`Store` 未定义）
 
-- [ ] **Step 3: 实现 `store.rs` 的骨架与桶操作**
+- [x] **Step 3: 实现 `store.rs` 的骨架与桶操作**
 
 ```rust
 //! 存储内核。M1：单盘、无纠删码，但**提交协议与 xl.meta 格式按最终设计落**，
@@ -980,12 +980,12 @@ impl Store {
 
 `Cargo.toml` 的 `[dev-dependencies]` 加 `tempfile = "3"` 与 `tokio = { workspace = true, features = ["full"] }`。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store store 2>&1 | tail -14`
 Expected: 部分通过，`delete_bucket_requires_empty` 与 `missing_bucket_is_reported` 失败（`put_object`/`delete_object` 还未实现）——这是预期的，Task 5/6 会补上。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操作"
