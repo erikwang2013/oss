@@ -3798,7 +3798,7 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): ListObjectsV2 与 CopyObjec
 - Create: `crates/oss-server/tests/common/mod.rs`（测试共用的 `state()` 辅助，被 smoke / s3_over_http / aether_ingest / console_api 四个测试文件复用）
 - Modify: `crates/oss-server/src/router.rs`
 
-- [ ] **Step 0: 把 T8 里的 `state()` 抽成共用模块**
+- [x] **Step 0: 把 T8 里的 `state()` 抽成共用模块**
 
 `crates/oss-server/tests/common/mod.rs`：
 
@@ -3830,7 +3830,7 @@ pub async fn state(dir: &std::path::Path) -> AppState {
 
 之后每个测试文件顶部写 `mod common;` 并 `use common::state;`（T8 的 smoke.rs 里那份内联实现删掉，改为引用）。
 
-- [ ] **Step 1: 写失败的测试**（`crates/oss-server/tests/s3_over_http.rs`）
+- [x] **Step 1: 写失败的测试**（`crates/oss-server/tests/s3_over_http.rs`）
 
 ```rust
 // 起真服务，用 aws-sigv4 打的请求跑一个 PUT → HEAD → GET → LIST → DELETE 的闭环。
@@ -3856,12 +3856,13 @@ async fn s3_fallback_is_mounted() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p oss-server --test s3_over_http 2>&1 | tail -10`
 Expected: FAIL（当前 fallback 未挂，返回 404 而非 403）
+实际：FAIL，`left: 404, right: 403`，与预期一致。
 
-- [ ] **Step 3: 修改 `router.rs`**
+- [x] **Step 3: 修改 `router.rs`**
 
 ```rust
 use std::sync::Arc;
@@ -3897,12 +3898,13 @@ async fn handle_s3_error(err: s3s::HttpError) -> (axum::http::StatusCode, String
 > `s3s::HttpError` 只有 `from_std_error` / `into_std_error`（`src/protocol.rs`）；
 > 没有 `status_code()`，也不存在 `S3ServiceError` 这个类型。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p oss-server --test s3_over_http 2>&1 | tail -10`
 Expected: PASS（403）
+实际：PASS。四闸实测：`cargo fmt --all`（无 diff）· `cargo clippy --workspace --all-targets` 0 告警 · `cargo test -p oss-server` 5+1+1 全绿 · `cargo test --workspace -j 2` 78 passed / 0 failed。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/oss-server/ && git commit -m "feat(server): s3s 挂进 e-cat router 的 fallback"
