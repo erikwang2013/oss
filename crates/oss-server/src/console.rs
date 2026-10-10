@@ -64,7 +64,30 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
                 Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "token 签发失败").into_response(),
             }
         }
-        _ => (StatusCode::UNAUTHORIZED, "用户名或密码错误").into_response(),
+        Ok(None) => (StatusCode::UNAUTHORIZED, "用户名或密码错误").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "登录查询失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// store 错误分档：可纠正的保留原消息，服务端内部的记日志 + 通用文案（5xx 不泄漏内部细节）。
+fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
+    use xl_store::error::Error;
+    match &e {
+        Error::NoSuchBucket(_) | Error::NoSuchKey(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        Error::InvalidBucketName(_) | Error::InvalidKey(_) => {
+            (StatusCode::BAD_REQUEST, e.to_string())
+        }
+        // 这两个语义是「客户端可纠正的冲突」，S3 本身也用 409；不落 5xx
+        Error::BucketAlreadyExists(_) | Error::BucketNotEmpty(_) => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
+        _ => {
+            tracing::error!(error = %e, "控制台 store 操作失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        }
     }
 }
 
@@ -97,7 +120,7 @@ async fn list_buckets(State(state): State<AppState>, headers: HeaderMap) -> impl
     }
     match state.store.list_buckets().await {
         Ok(list) => Json(list.into_iter().map(|b| b.name).collect::<Vec<_>>()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }
 
@@ -116,9 +139,12 @@ async fn create_bucket(
         Err(s) => return s.into_response(),
     };
     if let Err(e) = state.store.create_bucket(&body.name).await {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        return store_error(e).into_response();
     }
-    let _ = state.db.insert_bucket(&body.name, Some(uid)).await;
+    if let Err(e) = state.db.insert_bucket(&body.name, Some(uid)).await {
+        // 桶已建成：控制面行缺失只影响列表展示，不失败请求
+        tracing::warn!(error = %e, "写入桶行失败");
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -132,10 +158,13 @@ async fn delete_bucket(
     }
     match state.store.delete_bucket(&bucket).await {
         Ok(()) => {
-            let _ = state.db.delete_bucket_row(&bucket).await;
+            if let Err(e) = state.db.delete_bucket_row(&bucket).await {
+                // 桶已删除：控制面行残留只影响列表展示，不失败请求
+                tracing::warn!(error = %e, "清理桶行失败");
+            }
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }
 
@@ -143,6 +172,9 @@ async fn delete_bucket(
 struct ListQuery {
     prefix: Option<String>,
     delimiter: Option<String>,
+    /// 翻页参数按 spec §0.3 命名，透传给 store 的 max_keys / continuation_token
+    limit: Option<usize>,
+    cursor: Option<String>,
 }
 
 async fn list_objects(
@@ -157,7 +189,8 @@ async fn list_objects(
     let req = xl_store::store::ListRequest {
         prefix: q.prefix,
         delimiter: q.delimiter,
-        ..Default::default()
+        max_keys: q.limit,
+        continuation_token: q.cursor,
     };
     match state.store.list_objects(&bucket, &req).await {
         Ok(r) => Json(serde_json::json!({
@@ -166,10 +199,12 @@ async fn list_objects(
             })).collect::<Vec<_>>(),
             "common_prefixes": r.common_prefixes,
             "is_truncated": r.is_truncated,
-            "next_token": r.next_token,
+            // next_cursor 是 spec §0.3 的契约名；next_token 为既有字段，保留不删
+            "next_token": r.next_token.clone(),
+            "next_cursor": r.next_token,
         }))
         .into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }
 
@@ -188,7 +223,7 @@ async fn get_object(
                 .unwrap_or_else(|| "application/octet-stream".into());
             ([(axum::http::header::CONTENT_TYPE, ct)], bytes).into_response()
         }
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }
 
@@ -202,7 +237,7 @@ async fn delete_object(
     }
     match state.store.delete_object(&bucket, &key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }
 
@@ -212,7 +247,10 @@ async fn list_uploads(State(state): State<AppState>, headers: HeaderMap) -> impl
     }
     match state.db.list_uploads(100).await {
         Ok(rows) => Json(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询上传记录失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -249,7 +287,10 @@ async fn list_access_keys(State(state): State<AppState>, headers: HeaderMap) -> 
     };
     match state.db.list_access_keys(uid).await {
         Ok(keys) => Json(keys).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询访问密钥失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -257,6 +298,14 @@ async fn list_access_keys(State(state): State<AppState>, headers: HeaderMap) -> 
 struct CreateKeyBody {
     access_key: Option<String>,
     secret_key: Option<String>,
+}
+
+/// 用户自定 AK/SK 的最小校验：≥16 字节、ASCII 字母数字与 `_-+/=`（覆盖 S3 形态的
+/// 字母数字 AK 与 base64 形态的 SK）；不满足直接 400，不落到 DB 层。
+fn valid_credential(s: &str) -> bool {
+    s.len() >= 16
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'/' | b'='))
 }
 
 async fn create_access_key(
@@ -268,6 +317,24 @@ async fn create_access_key(
         Ok(u) => u,
         Err(s) => return s.into_response(),
     };
+    if let Some(ak) = body.access_key.as_deref().filter(|s| !valid_credential(s)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("access key 非法：需 ≥16 位且仅限字母数字与 _-+/=（{ak}）"),
+        )
+            .into_response();
+    }
+    if body
+        .secret_key
+        .as_deref()
+        .is_some_and(|s| !valid_credential(s))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "secret key 非法：需 ≥16 位且仅限字母数字与 _-+/=".to_string(),
+        )
+            .into_response();
+    }
     let ak = body
         .access_key
         .unwrap_or_else(|| format!("OSS{}", uuid::Uuid::new_v4().simple()));
@@ -276,7 +343,14 @@ async fn create_access_key(
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     match state.db.create_access_key(&ak, &sk, uid).await {
         Ok(()) => Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // UNIQUE 冲突说人话；不落 sqlite 原文
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            (StatusCode::BAD_REQUEST, "access key 已存在").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "写入访问密钥失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
