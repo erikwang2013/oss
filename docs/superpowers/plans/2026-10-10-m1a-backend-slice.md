@@ -4283,7 +4283,10 @@ git add crates/oss-server/ && git commit -m "feat(server): aetherupload 接线 +
   失败一律 401 纯文本「unauthorized」，不区分缺/坏/过期。测试 `tests/aether_auth.rs`：四条路由匿名 401
   （POST 带合法 body，钉 auth 先于提取器）、cookie（含多 cookie 串）/ Bearer 两种来源登录 token 均 200
   且 `error:0`、伪造与过期 token 两种来源均 401；反证实测：临时短路 `aether_authorized` → 两个负例测试红
-  （匿名 preprocess 变 200），复原即绿。**M1b 衔接**：前端登录成功处需种
+  （匿名 preprocess 变 200），复原即绿。**微收尾（质量评审 1 Minor）**：空 cookie 值（`oss_token=`）不再遮蔽
+  Bearer —— `aether_token` 对 cookie 值过滤空串后回退（原先空值会占位、Bearer 形同虚设）；补边界测试三条
+  （空 Bearer → 401、空 cookie 值 + 有效 Bearer → 200、非法字符 cookie 值 → 401）；反证实测：去掉空值过滤 →
+  「空 cookie 值应回退到 Bearer」断言红（401 vs 200），复原即绿。**M1b 衔接**：前端登录成功处需种
   `document.cookie = "oss_token=<jwt>; path=/; SameSite=Lax"`——aetherupload 自带脚本已 `withCredentials: true`，
   cookie 会随分块请求自动带上，否则浏览器链路 401。
 - **四条路由的真机实测（收尾轮，覆盖 Task 16 脚本不碰的 aether 链路）**：起真服务后

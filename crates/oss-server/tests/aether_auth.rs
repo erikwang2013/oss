@@ -135,6 +135,55 @@ async fn cookie_or_bearer_token_passes() {
     assert_eq!(resp.status(), 200, "Bearer 形态");
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(json["error"], 0);
+
+    // 空 cookie 值（`oss_token=`）不遮蔽 Bearer 回退 —— 本轮微收尾的修复点
+    let resp = with_form(
+        client
+            .post(&url)
+            .header("cookie", "oss_token=")
+            .bearer_auth(&token),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "空 cookie 值应回退到 Bearer");
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["error"], 0);
+}
+
+/// 边界凭据一律 401：空 Bearer（`Authorization: Bearer `）、空 cookie 值且无 Bearer 可回退、
+/// 含非法字符的 cookie 值。
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_or_garbage_credential_is_401() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st)).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/aetherupload/preprocess");
+
+    let cases: Vec<(Option<&str>, Option<&str>)> = vec![
+        // 空 Bearer（尾随空格由 HTTP 层剥掉，等价于裸 "Bearer"：前缀不匹配）
+        (None, Some("Bearer ")),
+        (Some("oss_token="), None), // 空 cookie 值，无 Bearer 可回退
+        (Some("oss_token=%%% not.a.jwt @@"), None), // 非法字符
+    ];
+
+    for (cookie, authorization) in cases {
+        let mut req = client.post(&url);
+        if let Some(c) = cookie {
+            req = req.header("cookie", c);
+        }
+        if let Some(a) = authorization {
+            req = req.header("authorization", a);
+        }
+        let resp = with_form(req).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "cookie={cookie:?} authorization={authorization:?} 必须 401"
+        );
+    }
 }
 
 /// 伪造（换 secret 签名）与过期 token，两种来源都必须 401。

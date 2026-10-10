@@ -64,6 +64,7 @@ async fn handle_s3_error(err: s3s::HttpError) -> (axum::http::StatusCode, String
 
 /// aether 路由的凭据来源：cookie `oss_token` 优先，其次 `Authorization: Bearer <jwt>`
 /// （curl/工具便利）。cookie 手写分号切分 —— 只取一个字段，不引 cookie 库。
+/// 空值（`oss_token=`）等同于没有 cookie：不遮蔽 Bearer 回退。
 fn aether_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::COOKIE)
@@ -72,7 +73,7 @@ fn aether_token(headers: &HeaderMap) -> Option<&str> {
             cookies
                 .split(';')
                 .filter_map(|part| part.trim().strip_prefix("oss_token="))
-                .next()
+                .find(|v| !v.is_empty())
         })
         .or_else(|| {
             headers
