@@ -1791,6 +1791,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "uuid",
  "xl-s3",
  "xl-store",
 ]

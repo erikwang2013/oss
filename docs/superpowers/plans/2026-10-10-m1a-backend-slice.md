@@ -4286,7 +4286,7 @@ git add crates/oss-server/ && git commit -m "feat(server): aetherupload 接线 +
 - Create: `crates/oss-server/src/console.rs`
 - Modify: `crates/oss-server/src/router.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 // crates/oss-server/tests/console_api.rs
@@ -4339,12 +4339,13 @@ async fn wrong_password_is_401() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p oss-server --test console_api 2>&1 | tail -10`
-Expected: 404（路由未挂）
+Expected: 失败（控制台路由未挂 → 落 Task 13 的 s3s fallback：GET 形态 403、POST 形态 501。原稿「404（路由未挂）」是接线前的旧形态；见定稿记录并入项 1）
+实际：3 个测试全红 —— `login_then_list_buckets` 在未带 token 的 GET 上 `left: 403 / right: 401`，`wrong_password_is_401` 在 POST 上 `left: 501 / right: 401`。
 
-- [ ] **Step 3: 实现 `console.rs`**
+- [x] **Step 3: 实现 `console.rs`**
 
 ```rust
 //! 控制台 API。M1 只有：登录、桶列表、对象列表、下载、删除、上传记录、访问密钥。
@@ -4552,22 +4553,47 @@ fn now_secs() -> i64 {
 
 > `oss-server` 的 `[dependencies]` 需要加 `uuid = { workspace = true }`。
 
-- [ ] **Step 4: `router.rs` 挂控制台**
+- [x] **Step 4: `router.rs` 挂控制台**
 
 ```rust
         .nest("/api/v1", crate::console::routes())
 ```
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run: `cargo test -p oss-server 2>&1 | tail -15`
 Expected: 全绿
+实际：PASS。四闸实测：`cargo fmt --all`（无 diff）· `cargo clippy --workspace --all-targets` 0 告警 · `cargo test -p oss-server` 6+4+3+1+1 全绿 · `cargo test --workspace -j 2` 全绿（xl-store 51 / xl-s3 7+2+12 / oss-server 6+4+3+1+1）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登录/桶/对象/上传记录/密钥）"
 ```
+
+（实际一并带上计划文件——见定稿记录。）
+
+### 定稿记录
+
+- **Step 2 的 Expected 更正（并入项 1）**：原稿「404（路由未挂）」与 Task 13 接线后的实际失败形态不符——未注册路径落 s3s fallback：
+  **GET 形态 403**（s3s 鉴权拒绝，spec-task13 实测；本轮 `login_then_list_buckets` 在 `/api/v1/buckets` 上复现 `left: 403 / right: 401`）、
+  **POST 形态 501**（s3s 无对应 op → NotImplemented；本轮 `wrong_password_is_401` 在 `/api/v1/login` 上实测 `left: 501 / right: 401`）。
+  并入项只说 403，实测补全为两种形态，上方该行已按实测同步。
+- **`register_upload` 三分支（并入项 2）**：按 I-1 同步后的现文写——`Ok(true) → 204 / Ok(false) → 404 / Err(e) → 400`。
+  新增测试 `register_upload_hit_is_204_miss_is_404`（Step 1 块外，按 Task 11 先例记在这里）：`record_upload` 后 register → 204、
+  `GET /uploads` 能看到 `original_name`、无行 `saved_path` → 404。Err→400 分支需 DB 故障，HTTP 面不构造（db.rs 单测覆盖返回语义）。
+- **过期 AK 边界测试（并入项 3，挂账跳过并说明）**：quality-task7 ② 所指的原用例 `secret_for_access_key_rejects_expired`
+  （`now() - 1` 绑定）随 Task 9 收尾轮已删除（生产路径由 xl-s3 接管）。现存唯一的过期用例在
+  `crates/xl-s3/src/auth.rs::inactive_or_expired_access_key_is_rejected`，且用的是固定 `Some(1)` 而非 `now-1`——
+  **文件在 xl-s3，不在 Task 15 范围**（Files 只含 `console.rs` / `router.rs`），跳过不越界改动，留给 xl-s3 侧任务把边界钉到 `expires_at == now`（严格 `>`）。
+- **`aether.rs` 注释补前提（并入项 4，实现未动）**：`clear_instant_index` 的键构造注释补一行
+  「键重建成立的前提是 lax_mode 关闭（客户端声明 hash == 真 md5）；开启 lax_mode 后需同步改此处」（aetherupload 的 `Config::lax_mode` 默认 false）。
+- **与 Step 3 块的差异（以编译器/闸门为准）**：删掉块首 `use std::sync::Arc;`（console.rs 未用到，留着撞 clippy 未用导入闸）；
+  其余逐字一致（rustfmt 折行不算）。`oss-server/Cargo.toml` 按上方注记加 `uuid.workspace = true`（workspace 的 uuid 已带 `v4`，无需另配 feature）。
+- **测试文件与 Step 1 块的差异**：顶部补 `mod common; use common::state; use oss_server::router::build_router;`
+  （块内按 smoke.rs 惯例省略）；新增第三个测试见上。
+- **`LoginResponse` 保持为 pub 未在 handler 中使用（照块）**：login 响应用 `serde_json::json!` 构造，`LoginResponse` 是块内给出的公开类型、
+  未构造使用；pub 项不触发 dead_code 告警，按「严格照块」保留。
 
 ---
 

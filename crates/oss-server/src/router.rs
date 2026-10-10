@@ -27,6 +27,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
+        .nest("/api/v1", crate::console::routes())
         .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
         .with_state(state)

@@ -93,6 +93,7 @@ impl IngestSink {
     fn clear_instant_index(&self, resource: &Resource) {
         // 索引键 = `KEY_PREFIX + <group>_<整份 md5>`：md5 即成品名 `<md5>.<ext>` 的 file_stem
         // （控制器 `get_file_name(real_hash, ext)` → `InstantIndex::key(group, hash)`，upload.rs:390-398）。
+        // 键重建成立的前提是 lax_mode 关闭（客户端声明 hash == 真 md5）；开启 lax_mode 后需同步改此处。
         let Some(stem) = std::path::Path::new(&resource.name)
             .file_stem()
             .and_then(|s| s.to_str())
