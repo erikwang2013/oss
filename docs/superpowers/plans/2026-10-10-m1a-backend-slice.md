@@ -2219,7 +2219,7 @@ CREATE TABLE IF NOT EXISTS access_keys (
     access_key  TEXT PRIMARY KEY,
     secret_key  TEXT NOT NULL,           -- M1 明文存；M5 随 SSE 一起改为加密存
     user_id     INTEGER NOT NULL REFERENCES users(id),
-    status      TEXT NOT NULL DEFAULT 'active',  -- M1 只写 'active'；只有它通过 secret_for_access_key 的查询
+    status      TEXT NOT NULL DEFAULT 'active',  -- 只有 'active' 能通过 xl-s3/src/auth.rs 的 AK→SK 查询
     expires_at  INTEGER,                 -- NULL = 永不过期；M5 的 STS 会话用同一列
     created_at  INTEGER NOT NULL
 );
@@ -2877,6 +2877,7 @@ git add crates/oss-server/ oss.toml && git commit -m "feat(server): e-cat 起服
 **Files:**
 - Create: `crates/xl-s3/src/auth.rs`
 - Create: `crates/xl-s3/src/convert.rs`
+- 收尾轮另修（评审 5 条 Minor）：`crates/xl-store/src/layout.rs`、`crates/oss-server/src/db.rs`、`crates/oss-server/migrations/0001_init.sql`
 
 - [x] **Step 1: 写失败的测试**
 
@@ -2900,37 +2901,78 @@ mod tests {
         pool
     }
 
+    async fn insert_user(pool: &SqlitePool) {
+        sqlx::query("INSERT INTO users (id, username) VALUES (1, 'u')")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn insert_key(pool: &SqlitePool, ak: &str, sk: &str, expires_at: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, expires_at, created_at) \
+             VALUES (?, ?, 1, ?, 0)",
+        )
+        .bind(ak)
+        .bind(sk)
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// 负例锁死错误码：认证失败的对外形态只有 InvalidAccessKeyId。
+    #[track_caller]
+    fn assert_invalid_ak(err: &S3Error) {
+        assert!(
+            matches!(err.code(), S3ErrorCode::InvalidAccessKeyId),
+            "期望 InvalidAccessKeyId，实得 {:?}",
+            err.code()
+        );
+    }
+
     #[tokio::test]
     async fn known_access_key_resolves() {
         let pool = oss_test_db().await;
-        sqlx::query("INSERT INTO users (id, username) VALUES (1, 'u')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) \
-             VALUES ('AKIA_TEST', 'SK_TEST', 1, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        insert_user(&pool).await;
+        insert_key(&pool, "AKIA_TEST", "SK_TEST", None).await;
         let auth = SigV4Auth::new(pool);
-        assert_eq!(auth.get_secret_key("AKIA_TEST").await.unwrap().expose(), "SK_TEST");
+        assert_eq!(
+            auth.get_secret_key("AKIA_TEST").await.unwrap().expose(),
+            "SK_TEST"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_expiry_access_key_resolves() {
+        // 钉住秒单位与比较方向（expires_at > now 才通过）；M5 的 STS 会话用同一列
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        insert_key(&pool, "AKIA_TTL", "SK_TTL", Some(now() + 3600)).await;
+        let auth = SigV4Auth::new(pool);
+        assert_eq!(
+            auth.get_secret_key("AKIA_TTL").await.unwrap().expose(),
+            "SK_TTL"
+        );
     }
 
     #[tokio::test]
     async fn unknown_access_key_is_rejected() {
         let auth = SigV4Auth::new(oss_test_db().await);
-        assert!(auth.get_secret_key("NOPE").await.is_err());
+        assert_invalid_ak(&auth.get_secret_key("NOPE").await.unwrap_err());
     }
 
     #[tokio::test]
     async fn inactive_or_expired_access_key_is_rejected() {
         let pool = oss_test_db().await;
-        sqlx::query("INSERT INTO users (id, username) VALUES (1, 'u')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        insert_user(&pool).await;
         sqlx::query(
             "INSERT INTO access_keys (access_key, secret_key, user_id, status, created_at) \
              VALUES ('AKIA_OFF', 'SK_OFF', 1, 'inactive', 0)",
@@ -2938,26 +2980,33 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key, user_id, expires_at, created_at) \
-             VALUES ('AKIA_OLD', 'SK_OLD', 1, 1, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        insert_key(&pool, "AKIA_OLD", "SK_OLD", Some(1)).await;
         let auth = SigV4Auth::new(pool);
-        assert!(auth.get_secret_key("AKIA_OFF").await.is_err());
-        assert!(auth.get_secret_key("AKIA_OLD").await.is_err());
+        assert_invalid_ak(&auth.get_secret_key("AKIA_OFF").await.unwrap_err());
+        assert_invalid_ak(&auth.get_secret_key("AKIA_OLD").await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn db_error_maps_to_internal_error() {
+        let pool = oss_test_db().await;
+        sqlx::query("DROP TABLE access_keys")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let auth = SigV4Auth::new(pool);
+        let err = auth.get_secret_key("AKIA_TEST").await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("internal error"), "5xx 不泄漏内部细节");
     }
 }
 ```
 
-> **调和注记（实现时定稿）**：原稿的 `oss_test_db()` 返回 `db.create_user(...)/db.pool()` 形式的对象，但那等价于 `oss-server::db::SqlxClient`，而 `xl-s3` 不能反向依赖 `oss-server`。定稿：`oss_test_db()` 直接返回 `sqlx::SqlitePool`（内联最小 schema，见上），用户/密钥数据用 `sqlx::query` 直接 INSERT，列与 `oss-server/migrations/0001_init.sql` 一致（`status` 只用 `'active'`/`'inactive'`，见 `db.rs` 的 revoke）。`xl-s3` 的 dev-dependencies 需要 `tokio`、`tempfile`（已在 workspace 骨架里）。第三条测试覆盖查询里的 `status='active'`/`expires_at` 谓词 —— 原稿两条测试不覆盖它，撤销的密钥若能通过认证是认证绕过。
+> **调和注记（实现时定稿）**：原稿的 `oss_test_db()` 返回 `db.create_user(...)/db.pool()` 形式的对象，但那等价于 `oss-server::db::SqlxClient`，而 `xl-s3` 不能反向依赖 `oss-server`。定稿：`oss_test_db()` 直接返回 `sqlx::SqlitePool`（内联最小 schema，见上），用户/密钥数据用 `sqlx::query` 直接 INSERT，列与 `oss-server/migrations/0001_init.sql` 一致（`status` 只用 `'active'`/`'inactive'`，见 `db.rs` 的 revoke）。`xl-s3` 的 dev-dependencies 需要 `tokio`、`tempfile`（已在 workspace 骨架里）。收尾轮按评审补：`inactive_or_expired`（覆盖查询里的 `status='active'`/`expires_at` 谓词——撤销的密钥若能通过认证是认证绕过）、`future_expiry`（未来过期必须通过）、`db_error`（DB 故障 → InternalError），负例全部锁 `InvalidAccessKeyId`。
 
 - [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-s3 auth 2>&1 | tail -20`
-Expected: 编译错误
+Expected: 编译错误（`SigV4Auth` 未定义，实测 3 处 E0433）
 
 - [x] **Step 3: 实现 `auth.rs`**
 
@@ -2981,6 +3030,7 @@ impl SigV4Auth {
     }
 }
 
+// ponytail: 每请求查一次 AK、无缓存 —— SQLite 读不阻塞、撤销即时生效；量大再加缓存。
 #[async_trait::async_trait]
 impl S3Auth for SigV4Auth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
@@ -2997,10 +3047,15 @@ impl S3Auth for SigV4Auth {
         .bind(now)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = ?e, access_key, "access key lookup failed");
+            S3Error::with_message(S3ErrorCode::InternalError, "internal error")
+        })?;
 
         row.map(|r| SecretKey::from(sqlx::Row::get::<String, _>(&r, "secret_key")))
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidAccessKeyId, "unknown access key"))
+            .ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::InvalidAccessKeyId, "unknown access key")
+            })
     }
 }
 
@@ -3010,7 +3065,7 @@ mod tests {
 }
 ```
 
-> 若 `SecretKey::from(String)` 不存在，看 `src/auth/secret_key.rs` 的构造方法并改用之（`SecretKey::new` / `From<&str>`）。
+> 收尾轮改动：DB 错误细节（含 SQL 文案）只进 `tracing::error!`，响应体统一 `internal error`；`InvalidAccessKeyId` 文案保留。已核实 `SecretKey::from(String)`、`SecretKey::expose()`、`S3Error::with_message` 与全部 `S3ErrorCode` 变体均为 s3s 0.17.0 真实 API（源码核对，无臆测）。
 
 - [x] **Step 4: 实现 `convert.rs` 的错误映射**
 
@@ -3029,8 +3084,11 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         // s3s 没有 InvalidObjectName，键名不合法归 InvalidArgument
         StoreError::InvalidKey(_) => S3ErrorCode::InvalidArgument,
         StoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
-        StoreError::CorruptMeta(_) | StoreError::Encode(_) => S3ErrorCode::InternalError,
-        StoreError::Io(_) => S3ErrorCode::InternalError,
+        // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体
+        StoreError::CorruptMeta(_) | StoreError::Encode(_) | StoreError::Io(_) => {
+            tracing::error!(error = ?e, "store internal error");
+            return S3Error::with_message(S3ErrorCode::InternalError, "internal error");
+        }
     };
     S3Error::with_message(code, e.to_string())
 }
@@ -3039,25 +3097,58 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
 mod tests {
     use super::*;
 
+    /// 4xx 是可纠正错误：原消息对客户端有指导意义，保留。
     #[test]
-    fn maps_key_errors() {
-        assert_eq!(to_s3_error(StoreError::NoSuchKey("k".into())).code(), &S3ErrorCode::NoSuchKey);
-        assert_eq!(to_s3_error(StoreError::NoSuchBucket("b".into())).code(), &S3ErrorCode::NoSuchBucket);
+    fn client_errors_keep_original_message() {
+        let cases = [
+            (
+                StoreError::NoSuchBucket("b".into()),
+                S3ErrorCode::NoSuchBucket,
+                "bucket not found: b",
+            ),
+            (
+                StoreError::BucketAlreadyExists("b".into()),
+                S3ErrorCode::BucketAlreadyOwnedByYou,
+                "bucket already exists: b",
+            ),
+            (
+                StoreError::BucketNotEmpty("b".into()),
+                S3ErrorCode::BucketNotEmpty,
+                "bucket not empty: b",
+            ),
+            (
+                StoreError::NoSuchKey("k".into()),
+                S3ErrorCode::NoSuchKey,
+                "key not found: k",
+            ),
+            (
+                StoreError::InvalidKey("k".into()),
+                S3ErrorCode::InvalidArgument,
+                "invalid key: k",
+            ),
+            (
+                StoreError::InvalidBucketName("b".into()),
+                S3ErrorCode::InvalidBucketName,
+                "invalid bucket name: b",
+            ),
+        ];
+        for (e, code, msg) in cases {
+            let err = to_s3_error(e);
+            assert_eq!(err.code(), &code);
+            assert_eq!(err.message(), Some(msg));
+        }
     }
 
     #[test]
-    fn maps_remaining_variants() {
-        let cases = [
-            (StoreError::BucketAlreadyExists("b".into()), &S3ErrorCode::BucketAlreadyOwnedByYou),
-            (StoreError::BucketNotEmpty("b".into()), &S3ErrorCode::BucketNotEmpty),
-            (StoreError::InvalidKey("k".into()), &S3ErrorCode::InvalidArgument),
-            (StoreError::InvalidBucketName("b".into()), &S3ErrorCode::InvalidBucketName),
-            (StoreError::CorruptMeta("m".into()), &S3ErrorCode::InternalError),
-            (StoreError::Encode("e".into()), &S3ErrorCode::InternalError),
-            (StoreError::Io(std::io::Error::other("io")), &S3ErrorCode::InternalError),
-        ];
-        for (e, code) in cases {
-            assert_eq!(to_s3_error(e).code(), code);
+    fn internal_errors_are_generic() {
+        for e in [
+            StoreError::CorruptMeta("不支持的格式版本 9".into()),
+            StoreError::Encode("e".into()),
+            StoreError::Io(std::io::Error::other("io")),
+        ] {
+            let err = to_s3_error(e);
+            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+            assert_eq!(err.message(), Some("internal error"), "5xx 不泄漏内部细节");
         }
     }
 }
@@ -3066,13 +3157,24 @@ mod tests {
 - [x] **Step 5: 跑测试**
 
 Run: `cargo test -p xl-s3 2>&1 | tail -12`
-Expected: 全绿
+Expected: 全绿（收尾轮后 xl-s3 7 passed）
 
 - [x] **Step 6: 提交**
 
 ```bash
 git add crates/xl-s3/ && git commit -m "feat(xl-s3): SigV4 凭据解析与错误映射"
 ```
+
+### 收尾轮（评审 5 条 Minor）—— 定稿记录
+
+1. **4xx/5xx 分流**（错误面咽喉）：`convert.rs` 六个可纠正错误保留原消息；`CorruptMeta/Encode/Io` 走 `tracing::error!` + 通用消息 `internal error`。`auth.rs` 查询失败同型（`error = ?e, access_key` 进日志，响应体 `internal error`）。测试钉住两类消息形态。
+2. **控制字符不进 XML**：根因在 `xl-store/src/layout.rs::validate_key` 把原始 key 直拼进 `InvalidKey` 消息——改 `key.escape_debug()`（保留「哪段不合规」）；`meta.rs` 消息不含用户字节（版本号/字节数/空文件），已核对不动。新增测试 `invalid_key_message_escapes_user_bytes`。
+3. **断言收紧 + 边界**：`auth.rs` 负例改 `assert_invalid_ak`（`matches!` 锁 `InvalidAccessKeyId`）；新增 `future_expiry_access_key_resolves`、`db_error_maps_to_internal_error`。
+4. **去重复查询**：删 `oss-server/src/db.rs` 的 `secret_for_access_key` 及其两条测试（生产路径由 `xl-s3/src/auth.rs` 接管，防 M5 双改）；`user_and_access_key_roundtrip` 改为直查断言；migration 注释改指 `xl-s3/src/auth.rs`。本任务上方 Task 8 记录里的该函数/测试已被本轮回撤（保留为历史）。
+5. **ponytail 注释**：`auth.rs` 注明每请求一查无缓存及其理由。
+6. Minor 6（时钟 helper 合并）记账不动。
+
+收尾轮提交：`fix(xl-s3): 错误面收口（5xx 通用化+tracing）；auth 断言与边界；db 去重`（带计划文件）
 
 ---
 

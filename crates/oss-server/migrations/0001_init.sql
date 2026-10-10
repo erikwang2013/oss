@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS access_keys (
     access_key  TEXT PRIMARY KEY,
     secret_key  TEXT NOT NULL,           -- M1 明文存；M5 随 SSE 一起改为加密存
     user_id     INTEGER NOT NULL REFERENCES users(id),
-    status      TEXT NOT NULL DEFAULT 'active',  -- M1 只写 'active'；只有它通过 secret_for_access_key 的查询
+    status      TEXT NOT NULL DEFAULT 'active',  -- 只有 'active' 能通过 xl-s3/src/auth.rs 的 AK→SK 查询
     expires_at  INTEGER,                 -- NULL = 永不过期；M5 的 STS 会话用同一列
     created_at  INTEGER NOT NULL
 );

@@ -40,7 +40,9 @@ pub fn validate_bucket(name: &str) -> Result<()> {
 }
 
 pub fn validate_key(key: &str) -> Result<()> {
-    let reject = |why: &str| Err(Error::InvalidKey(format!("{key}: {why}")));
+    // 键是用户字节，会随错误消息进 S3 响应体；escape_debug 让控制字符不破坏 XML，
+    // 同时保留「哪段不合规」的指导性。
+    let reject = |why: &str| Err(Error::InvalidKey(format!("{}: {why}", key.escape_debug())));
 
     if key.is_empty() {
         return reject("空键");
@@ -141,6 +143,13 @@ mod tests {
     fn key_len_limit_is_bytes() {
         assert!(validate_key(&"汉".repeat(341)).is_ok());
         assert!(validate_key(&"汉".repeat(342)).is_err()); // 341×3=1023B ≤1024，342×3=1026B >1024
+    }
+
+    #[test]
+    fn invalid_key_message_escapes_user_bytes() {
+        let msg = validate_key("a\u{0}b").unwrap_err().to_string();
+        assert!(!msg.contains('\u{0}'), "原始控制字符不得进消息: {msg:?}");
+        assert!(msg.contains("\\0"), "转义形式保留「哪段不合规」: {msg:?}");
     }
 
     #[test]

@@ -96,18 +96,7 @@ impl Db {
         Ok(())
     }
 
-    /// SigV4 校验用：AK → SK。过期或非 active 一律当作不存在（返回 None）。
-    pub async fn secret_for_access_key(&self, ak: &str) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT secret_key FROM access_keys \
-             WHERE access_key = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > ?)",
-        )
-        .bind(ak)
-        .bind(now())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| r.get("secret_key")))
-    }
+    // SigV4 的 AK → SK 查询归 xl-s3/src/auth.rs（SigV4Auth）；这里不再保留第二份，防 M5 双改。
 
     pub async fn list_access_keys(&self, user_id: i64) -> Result<Vec<String>> {
         let rows = sqlx::query(
@@ -276,9 +265,13 @@ mod tests {
         db.create_access_key("AKIA_TEST", "SK_TEST", uid)
             .await
             .unwrap();
-        let sk = db.secret_for_access_key("AKIA_TEST").await.unwrap();
-        assert_eq!(sk.as_deref(), Some("SK_TEST"));
-        assert_eq!(db.secret_for_access_key("NOPE").await.unwrap(), None);
+        let sk: String =
+            sqlx::query_scalar("SELECT secret_key FROM access_keys WHERE access_key = ?")
+                .bind("AKIA_TEST")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(sk, "SK_TEST");
     }
 
     #[tokio::test]
@@ -314,39 +307,5 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn secret_for_access_key_rejects_expired() {
-        let db = db().await;
-        let uid = db.create_user("erik", "secret", true).await.unwrap();
-        db.create_access_key("AKIA_EXPIRED", "SK_TEST", uid)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE access_keys SET expires_at = ? WHERE access_key = ?")
-            .bind(now() - 1)
-            .bind("AKIA_EXPIRED")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(
-            db.secret_for_access_key("AKIA_EXPIRED").await.unwrap(),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn secret_for_access_key_rejects_inactive() {
-        let db = db().await;
-        let uid = db.create_user("erik", "secret", true).await.unwrap();
-        db.create_access_key("AKIA_OFF", "SK_TEST", uid)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE access_keys SET status = 'inactive' WHERE access_key = ?")
-            .bind("AKIA_OFF")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(db.secret_for_access_key("AKIA_OFF").await.unwrap(), None);
     }
 }

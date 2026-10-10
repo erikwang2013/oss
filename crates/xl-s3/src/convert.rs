@@ -12,8 +12,11 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         // s3s 没有 InvalidObjectName，键名不合法归 InvalidArgument
         StoreError::InvalidKey(_) => S3ErrorCode::InvalidArgument,
         StoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
-        StoreError::CorruptMeta(_) | StoreError::Encode(_) => S3ErrorCode::InternalError,
-        StoreError::Io(_) => S3ErrorCode::InternalError,
+        // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体
+        StoreError::CorruptMeta(_) | StoreError::Encode(_) | StoreError::Io(_) => {
+            tracing::error!(error = ?e, "store internal error");
+            return S3Error::with_message(S3ErrorCode::InternalError, "internal error");
+        }
     };
     S3Error::with_message(code, e.to_string())
 }
@@ -22,49 +25,58 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
 mod tests {
     use super::*;
 
+    /// 4xx 是可纠正错误：原消息对客户端有指导意义，保留。
     #[test]
-    fn maps_key_errors() {
-        assert_eq!(
-            to_s3_error(StoreError::NoSuchKey("k".into())).code(),
-            &S3ErrorCode::NoSuchKey
-        );
-        assert_eq!(
-            to_s3_error(StoreError::NoSuchBucket("b".into())).code(),
-            &S3ErrorCode::NoSuchBucket
-        );
-    }
-
-    #[test]
-    fn maps_remaining_variants() {
+    fn client_errors_keep_original_message() {
         let cases = [
             (
+                StoreError::NoSuchBucket("b".into()),
+                S3ErrorCode::NoSuchBucket,
+                "bucket not found: b",
+            ),
+            (
                 StoreError::BucketAlreadyExists("b".into()),
-                &S3ErrorCode::BucketAlreadyOwnedByYou,
+                S3ErrorCode::BucketAlreadyOwnedByYou,
+                "bucket already exists: b",
             ),
             (
                 StoreError::BucketNotEmpty("b".into()),
-                &S3ErrorCode::BucketNotEmpty,
+                S3ErrorCode::BucketNotEmpty,
+                "bucket not empty: b",
+            ),
+            (
+                StoreError::NoSuchKey("k".into()),
+                S3ErrorCode::NoSuchKey,
+                "key not found: k",
             ),
             (
                 StoreError::InvalidKey("k".into()),
-                &S3ErrorCode::InvalidArgument,
+                S3ErrorCode::InvalidArgument,
+                "invalid key: k",
             ),
             (
                 StoreError::InvalidBucketName("b".into()),
-                &S3ErrorCode::InvalidBucketName,
-            ),
-            (
-                StoreError::CorruptMeta("m".into()),
-                &S3ErrorCode::InternalError,
-            ),
-            (StoreError::Encode("e".into()), &S3ErrorCode::InternalError),
-            (
-                StoreError::Io(std::io::Error::other("io")),
-                &S3ErrorCode::InternalError,
+                S3ErrorCode::InvalidBucketName,
+                "invalid bucket name: b",
             ),
         ];
-        for (e, code) in cases {
-            assert_eq!(to_s3_error(e).code(), code);
+        for (e, code, msg) in cases {
+            let err = to_s3_error(e);
+            assert_eq!(err.code(), &code);
+            assert_eq!(err.message(), Some(msg));
+        }
+    }
+
+    #[test]
+    fn internal_errors_are_generic() {
+        for e in [
+            StoreError::CorruptMeta("不支持的格式版本 9".into()),
+            StoreError::Encode("e".into()),
+            StoreError::Io(std::io::Error::other("io")),
+        ] {
+            let err = to_s3_error(e);
+            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+            assert_eq!(err.message(), Some("internal error"), "5xx 不泄漏内部细节");
         }
     }
 }
