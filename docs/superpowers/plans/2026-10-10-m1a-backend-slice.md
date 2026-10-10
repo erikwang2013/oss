@@ -72,7 +72,7 @@ oss/
 - Create: `Cargo.toml`, `crates/xl-store/Cargo.toml`, `crates/xl-s3/Cargo.toml`, `crates/oss-server/Cargo.toml`
 - Create: `crates/*/src/lib.rs`（占位一行）
 
-- [ ] **Step 1: 写 workspace 根 `Cargo.toml`**
+- [x] **Step 1: 写 workspace 根 `Cargo.toml`**
 
 ```toml
 [workspace]
@@ -110,7 +110,7 @@ ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 ```
 
-- [ ] **Step 2: 写三个 crate 的 `Cargo.toml`**
+- [x] **Step 2: 写三个 crate 的 `Cargo.toml`**
 
 `crates/xl-store/Cargo.toml`：
 
@@ -202,7 +202,7 @@ tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 ```
 
-- [ ] **Step 3: 三个 `lib.rs` 各写一行**
+- [x] **Step 3: 三个 `lib.rs` 各写一行**
 
 `crates/xl-store/src/lib.rs`：
 ```rust
@@ -233,16 +233,16 @@ pub mod state;
 `crates/xl-store/src/{error,layout,meta,store}.rs`、`crates/xl-s3/src/{auth,convert,service}.rs`、
 `crates/oss-server/src/{aether,config,console,db,router,state}.rs`。
 
-- [ ] **Step 4: 验证编译 + axum 版本唯一**
+- [x] **Step 4: 验证编译 + axum 版本唯一**
 
 Run:
 ```bash
 cd /home/wwwroot/oss && cargo check --workspace 2>&1 | tail -5
 cargo tree -d -p oss-server 2>/dev/null | grep -i "^axum" || echo "OK: axum 只有一份"
 ```
-Expected: `cargo check` 成功；axum 只有一份（0.8.x）。**若出现两行 axum，停下来**——说明 `aetherupload-rust` 或 `ecat` 拉到了不同版本，必须先解决再继续。
+Expected: `cargo check` 成功；输出两行 axum——`axum v0.7.9`（来自 `ecat-errors → tonic 0.12` 的 gRPC 内部私有依赖，feature 关不掉，M1 用不到）与 `axum v0.8.9`（路由面：我们 + `ecat-transport-http` + aetherupload 统一）。**两份永不碰面，接受**；但若出现第三个 axum 版本、或 0.8.x 出现两份——停下来。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add Cargo.toml crates/ && git commit -m "chore: workspace 骨架，锁定 axum 0.8 单一版本"
@@ -3410,6 +3410,7 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 | 风险 | 处置 |
 |---|---|
 | s3s 0.17 的 DTO 字段名与计划不符 | 计划里已标注「以 `generated.rs` 为准」；Task 1 的编译关卡会第一时间暴露 |
+| 依赖树有两份 axum（0.7.9 / 0.8.9） | 已查明并接受：0.7.9 来自 `ecat-errors → tonic 0.12`（必选依赖，仅在 tonic 内部，M1 不经过）；路由面全部 0.8.9（我们 + `ecat-transport-http` + aetherupload），永不碰面。代价仅是编译时间 |
 | `Resource::new` 的签名 | 已按真实签名写死（`aetherupload-rust-1.0.3/src/resource.rs:25`，5 参） |
 | `block_in_place` 需要 multi-thread runtime | `#[tokio::main]` 默认即是；测试必须用 `#[tokio::test(flavor = "multi_thread")]`（Task 14 已注明）。若将来有人改成 `current_thread`，秒传与 ingest 会 panic —— 这是**刻意的响亮失败**，不做静默降级 |
 | aetherupload 的分组目录必须先建 | `aether::build_runtime` 构造时调用 `aetherupload::console::list_groups` 自动创建（Task 14） |

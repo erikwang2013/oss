@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/xl-store", "crates/xl-s3", "crates/oss-server"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+xl-store = { path = "crates/xl-store" }
+xl-s3 = { path = "crates/xl-s3" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+md-5 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["fs", "io-util", "sync", "rt", "rt-multi-thread", "macros", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+
+# 发布版依赖：绝不加 "0.8" 之外的 axum —— ecat 与 aetherupload 都锚定 axum 0.8
+axum = { version = "0.8", default-features = false }
+s3s = "0.17"
+aetherupload-rust = { version = "1.0.3", features = ["ecat"] }
+ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
