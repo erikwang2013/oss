@@ -34,7 +34,8 @@ fn default_put_limit() -> usize {
 
 impl AppConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let text = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
         Ok(toml::from_str(&text)?)
     }
 

@@ -26,6 +26,8 @@ services/gateway/target/
 services/k8s/target/
 # 运行产物（审计兜底等本地数据）
 data/
+staging/
+/oss.db*
 
 # Ruflo local secrets and runtime data
 .env.local

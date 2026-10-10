@@ -15,6 +15,7 @@ aetherupload-rust.workspace = true
 axum.workspace = true
 bytes.workspace = true
 ecat.workspace = true
+ecat-logging = "7.0.0"
 futures.workspace = true
 hex = { workspace = true }
 jsonwebtoken = "9"

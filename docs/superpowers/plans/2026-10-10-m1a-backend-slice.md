@@ -2638,7 +2638,8 @@ fn default_put_limit() -> usize {
 
 impl AppConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let text = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
         Ok(toml::from_str(&text)?)
     }
 
@@ -2769,29 +2770,52 @@ pub fn build_router(state: AppState) -> Router {
 - [x] **Step 7: 写 `main.rs`**
 
 ```rust
-use std::sync::Arc;
-
 use ecat::App;
 use ecat::transport_http::HttpServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "oss.toml".to_string());
+    // 先初始化日志：App::run() 里也有一次 init（has_been_set 守卫，不会重复），
+    // 但启动自举（管理员引导/建桶）发生在 run() 之前，不提前 init 这些日志会被静默丢弃。
+    ecat_logging::init();
+
+    let cfg_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "oss.toml".to_string());
     let cfg = oss_server::config::AppConfig::load(std::path::Path::new(&cfg_path))?;
 
     std::fs::create_dir_all(&cfg.data_dir)?;
     std::fs::create_dir_all(&cfg.staging_dir)?;
 
     let db = oss_server::db::Db::connect(&cfg.database_url).await?;
-    let store = xl_store::store::Store::open(xl_store::store::StoreConfig::new(&cfg.data_dir)).await?;
+    let store =
+        xl_store::store::Store::open(xl_store::store::StoreConfig::new(&cfg.data_dir)).await?;
 
     // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
     // OSS_ADMIN_USER / OSS_ADMIN_PASSWORD 未设置时不做任何事。
-    if let (Ok(user), Ok(pass)) = (std::env::var("OSS_ADMIN_USER"), std::env::var("OSS_ADMIN_PASSWORD")) {
-        if db.verify_user(&user, &pass).await?.is_none() && !db.user_exists(&user).await? {
-            db.create_user(&user, &pass, true).await?;
-            tracing::info!(user = %user, "创建管理员账号");
+    // 空凭据一律拒绝建号：空口令账号会被空口令登录命中（M1 的 verify_user 只做哈希比对，无口令强度校验）。
+    match (
+        std::env::var("OSS_ADMIN_USER"),
+        std::env::var("OSS_ADMIN_PASSWORD"),
+    ) {
+        (Ok(user), Ok(pass)) if !user.is_empty() && !pass.is_empty() => {
+            // 已存在的同名账号一律不覆盖（含口令不同的情况）
+            if !db.user_exists(&user).await? {
+                db.create_user(&user, &pass, true).await?;
+                tracing::info!(user = %user, "创建管理员账号");
+            }
         }
+        (Ok(user), Ok(pass)) => {
+            tracing::warn!(
+                user_empty = user.is_empty(),
+                pass_empty = pass.is_empty(),
+                "管理员凭据为空字符串，跳过引导（空口令账号会被空登录命中）"
+            );
+        }
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+            tracing::warn!("OSS_ADMIN_USER / OSS_ADMIN_PASSWORD 只设置了一个，跳过管理员引导");
+        }
+        (Err(_), Err(_)) => {}
     }
 
     // 每个上传分组对应的桶，启动时确保存在（内核 + 控制面各一份记录）
@@ -2836,7 +2860,15 @@ git add crates/oss-server/ oss.toml && git commit -m "feat(server): e-cat 起服
 
 注（Task 8 执行偏差，两处 + WAL 挂账项并入）：
 - **WAL（并入的挂账项）方案变更**：`database_url` 带 `?journal_mode=WAL` 在 sqlx 0.8.6 上不可行——URL 解析只认 4 个参数 `mode`/`cache`/`immutable`/`vfs`（源码 `sqlx-sqlite-0.8.6/src/options/parse.rs` 实证，其余 key 一律 `Error::Configuration`），实测起服务直接报 `Configuration("unknown query parameter \`journal_mode\` while parsing connection URL")`。**WAL 经连接选项而非 URL 参数**：`Db::connect` 用 `url.parse::<SqliteConnectOptions>()?.journal_mode(SqliteJournalMode::Wal)` + `SqlitePool::connect_with`（对池内每条新连接生效；`mode=rwc` 的 create_if_missing 语义由 from_str 保留）。`oss.toml` 维持 `sqlite://./oss.db?mode=rwc`（即上方代码块，最终形态已同步）。实测：起服务后 `PRAGMA journal_mode` → `wal`，`oss.db-wal` 落盘；既有 7 个 db 测试全绿（connect_with 路径无回归）。**以后不要再往 `database_url` 加 SQLite 参数**——sqlx 0.8 只认上述 4 个。`db.rs` 这两行属本 task 裁决范围，随 Task 8 提交并入（Task 7 的 Step 4 代码块已同步，见其注记）。
-- **`main.rs` 管理员引导收成 let-chain**：计划原文是 `if let (...) { if ... } }` 嵌套，clippy `collapsible_if` 告警（0 告警闸），按 clippy 建议合并为 `if let (Ok(user), Ok(pass)) = (...) && db.verify_user(...).await?.is_none() && !db.user_exists(...).await? { ... }`（edition 2024 let-chain）。逻辑不变。另按计划提示删掉了未使用的 `use std::sync::Arc;`；rustfmt 仅换行。
+- **`main.rs` 管理员引导两次调整（上方 Step 7 代码块已是最终形态）**：首轮因 clippy `collapsible_if`（0 告警闸）把计划原文的嵌套 `if let` 收成 edition 2024 let-chain；收尾轮再按质量评审 Minor 1/3 改为带空凭据守卫的 `match`（见下条）。另按计划提示删掉了未使用的 `use std::sync::Arc;`；rustfmt 仅换行。
+
+注（Task 8 质量评审收尾轮，Minor 1/3/5/7；上方 Step 1 / Step 7 代码块已同步为最终形态）：
+- **Minor 1（信任边界，必修）**：管理员引导加空凭据守卫——`OSS_ADMIN_USER` / `OSS_ADMIN_PASSWORD` 任一为空字符串时**不建号**并 `warn!`（记 `user_empty`/`pass_empty` 两个字段）；只设置了一个变量时同样 `warn!`，不静默。理由进了注释：空口令账号会被空口令登录命中（M1 的 `verify_user` 只做哈希比对，无口令强度校验）。
+- **Minor 3**：幂等条件删掉冗余的 `verify_user(&user, &pass).await?.is_none()`——与 `!user_exists(&user).await?` 合取时恒等价于后者；注释改为「已存在的同名账号一律不覆盖（含口令不同的情况）」。
+- **Minor 5**：`AppConfig::load` 的 io 错误 `map_err` 带上文件路径（`读取配置文件 {path} 失败: {e}`）；`toml::from_str` 的解析错误保持原样（自带行列号）。
+- **Minor 7**：根 `.gitignore` 在「运行产物」块补 `staging/` 与 `/oss.db*`（`oss.toml` 指向的运行产物，实测此前未被忽略；`data/` 原本已在）。`.gitignore` 不属计划代码块，未回填。
+- **记账（本轮不动）**：Minor 2（分组名下划线校验入 `config` load）与 6a（仓库根 `oss.toml` 的解析测试）并入 Task 14 派发清单；Minor 4（双启竞态）与 6b/6c 入收尾清单。
+- **追加（本轮验证发现的必修项，上方 Step 7 代码块已同步）**：引导阶段（`App::run()` 之前）的 `tracing::*` 事件原被静默丢弃——subscriber 由 `App::run()` 内部的 `ecat_logging::init()` 安装。实测证据：有效凭据场景用户确实建了（users=1）但「创建管理员账号」不出现在日志。修法：`main` 开头先 `ecat_logging::init()`（`App::run()` 有 `has_been_set()` 守卫，不会重复初始化、不 panic），`oss-server` 加直接依赖 `ecat-logging = "7.0.0"`（与 ecat 7.0.0 所用同版本，Cargo.lock 内唯一）。修后 Minor 1 的「应 warn」冒烟可观测（空凭据 → WARN 行 + users=0）。
 
 ---
 
