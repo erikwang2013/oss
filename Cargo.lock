@@ -1776,6 +1776,7 @@ dependencies = [
  "bytes",
  "ecat",
  "futures",
+ "hex",
  "jsonwebtoken",
  "md-5 0.10.6",
  "reqwest",

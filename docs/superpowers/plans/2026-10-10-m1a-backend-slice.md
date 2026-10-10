@@ -2173,7 +2173,7 @@ fn part_uuid_is_safe(uuid: &str) -> bool {
 - 测试补 `get_dangling_meta_version_reports_no_such_key`：手工构造「xl.meta 指向已被移走的版本目录」，断言 `NoSuchKey`（不 panic）。
 - `concurrent_puts_to_same_key_serialize` 末尾补读回校验（挂载项）：`get_object` 读回的 size/长度与写入一致、且内容是某个写入者一次写入的完整 64 字节（单一重复值）。该测试的最终形态已同步进 Task 5 的 Step 1 块。
 - Task 5 留在 `load_object_info` 上的过渡注释（「get / delete / list / copy 仍留给 Task 6」）已随本 task 移除。
-- 文档挂载项：删除两处孤立的裸 ` ``` `（原 1253 / 1513 行，导致 Step 2/3 文字与实现块渲染破损）；收尾轮再删 Task 16 验收区的第三处（原约 3943 / 3944 行）。
+- 文档挂载项：删除两处孤立的裸 ` ``` `（原 1253 / 1513 行，导致 Step 2/3 文字与实现块渲染破损）；收尾轮处置 Task 16 验收区的第三处（原约 3943 / 3944 行）：外层 README 块改用 4 反引号围栏、嵌套内嵌的 3 反引号 bash 块（未删任何行）。
 
 注（质量评审收尾轮，I-1 / M-2/3/4 与两条观察，已并入；上方代码块已同步）：
 - **I-1 delete 测试**（补 4 条）：`delete_then_get_and_head_are_no_such_key`（put→delete→get/head 均 NoSuchKey）、`delete_missing_key_is_ok_and_leaves_others`（删不存在的键 → Ok 且不误伤其他键）、`delete_then_put_same_key_reads_back`（删后重写同键可读）、`concurrent_puts_and_deletes_never_observe_torn_state`（multi_thread 下 put/delete 与 200 次并发读：每次读要么单写者完整 64 字节、要么 NoSuchKey，绝无其他 Err/碎片）。
@@ -2203,7 +2203,7 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): 读/删/列举（pref
 - Create: `crates/oss-server/migrations/0001_init.sql`
 - Create: `crates/oss-server/src/db.rs`
 
-- [ ] **Step 1: 写 schema**
+- [x] **Step 1: 写 schema**
 
 ```sql
 -- M1 五张表。对象数据永远不进 SQL —— 这里只有控制面状态。
@@ -2251,7 +2251,7 @@ CREATE TABLE IF NOT EXISTS instant_index (
 );
 ```
 
-- [ ] **Step 2: 写失败的测试**
+- [x] **Step 2: 写失败的测试**
 
 ```rust
 #[cfg(test)]
@@ -2301,12 +2301,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `cargo test -p oss-server db 2>&1 | tail -20`
 Expected: 编译错误（`Db` 未定义）
+实际：`error: could not compile`（2 处 E0425/E0433，均为 `Db` 未定义）。
 
-- [ ] **Step 4: 实现 `db.rs`**
+- [x] **Step 4: 实现 `db.rs`**
 
 ```rust
 //! 控制面数据访问。M1 只有五张表；对象数据永不进 SQL。
@@ -2523,18 +2524,21 @@ pub fn hash_password(password: &str) -> String {
 }
 ```
 
-- [ ] **Step 5: 补依赖并跑测试**
+- [x] **Step 5: 补依赖并跑测试**
 
 `crates/oss-server/Cargo.toml` 的 `[dependencies]` 加 `hex = { workspace = true }`；`[dev-dependencies]` 加 `sqlx = { workspace = true }`。
 
 Run: `cargo test -p oss-server db 2>&1 | tail -12`
 Expected: 全绿（4 个测试）
+实际：`oss-server` 4 passed / 0 failed（`init_creates_tables` / `user_and_access_key_roundtrip` / `instant_index_expires` / `upload_records`）。四闸全绿（fmt / clippy 0 告警 / `-p oss-server` / `--workspace -j 2`；workspace 合计 53 = xl-store 49 + oss-server 4）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/oss-server/ && git commit -m "feat(server): 控制面 5 张表与仓储"
 ```
+
+注（Task 7 执行偏差，仅此一处）：提交范围在 `git add crates/oss-server/` 之外连带根 `Cargo.lock` —— 新增 `hex` 依赖使 oss-server 的锁文件清单变化，单独 add crate 会把 `Cargo.lock` 留在脏区。实现代码与计划逐字一致（rustfmt 仅换行）；`sqlite::memory:` 的池内共享由 sqlx 0.8.6 保证（自动 `shared_cache` + 每池唯一库名），测试建库方式与计划相同。
 
 ---
 
