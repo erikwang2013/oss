@@ -3419,7 +3419,7 @@ async fn delete_objects_is_batch_and_idempotent() {
 - [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-s3 --test object_ops 2>&1 | tail -20`
-Expected: 编译错误
+Expected: 编译错误（实测能编译：`S3` trait 自带默认方法体，失败形态是运行时 `NotImplemented`，同 Task 12 Step 2）
 
 - [x] **Step 3: 实现对象操作**
 
