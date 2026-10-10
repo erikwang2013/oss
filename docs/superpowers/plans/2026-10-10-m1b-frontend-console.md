@@ -323,6 +323,7 @@ git commit -m "feat(web): 控制台 API 客户端（token/401/错误体）"
 
 **Files:**
 - Create: `web/src/App.tsx`（覆盖模板）、`web/src/main.tsx`（覆盖模板）
+- Modify: `web/index.html`（`lang="zh-CN"`、`<title>OSS 控制台</title>`）、`web/.gitignore`（补 e2e 产物三行）
 - Delete: 模板孤儿资产（App.tsx/main.tsx 覆盖后全部失去引用）——`web/src/App.css`、`web/src/index.css`、`web/src/assets/`（整目录：hero.png、vite.svg、react.svg）、`web/public/icons.svg`
 
 - [x] **Step 1: 实现 `web/src/App.tsx`**
@@ -379,7 +380,7 @@ export const router = createBrowserRouter([
 ])
 ```
 
-`@ant-design/icons` 需安装：`npm install @ant-design/icons`（并入 Step 5 的提交）。
+`@ant-design/icons` 需安装：`npm install @ant-design/icons@^5`（钉 v5：裸装是 v6、配套 antd v6，本项目 antd 5.29.x 与 icons v5 配对，且会与 antd 内部依赖去重）（并入 Step 5 的提交）。
 
 - [x] **Step 2: 覆盖 `web/src/main.tsx`**
 
@@ -411,6 +412,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 ```
 
 模板 `App.tsx` 其余内容整份替换；`App.css`、`index.css`、`src/assets/`、`public/icons.svg` 随之失去全部引用，一并删除（见 Files 的 Delete 行）。
+
+同一轮模板收尾：`web/index.html` 的 `lang="en"` → `lang="zh-CN"`、`<title>web</title>` → `<title>OSS 控制台</title>`；`web/.gitignore` 补 `coverage`、`playwright-report`、`test-results` 三行（Task 11 跑 e2e 会产生后两者）。
 
 - [x] **Step 3: 先建四个页面的空壳**（让编译成立，Task 4-6/10 逐个填）
 
