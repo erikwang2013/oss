@@ -519,7 +519,7 @@ git commit -m "feat(web): 登录页"
 **Files:**
 - Modify: `web/src/pages/Buckets.tsx`
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
 
 ```tsx
 import { useState } from 'react'
@@ -563,7 +563,7 @@ export default function Buckets() {
         loading={isLoading}
         dataSource={buckets}
         columns={[
-          { title: '桶名', dataIndex: 0, render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link> },
+          { title: '桶名', render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link> },
           {
             title: '操作',
             width: 120,
@@ -592,11 +592,15 @@ export default function Buckets() {
 }
 ```
 
-- [ ] **Step 2: 验证**
+实现注记：桶名列去掉了计划初稿的 `dataIndex: 0`——antd 对 `string[]` 记录按 `get(record, [0])` 取值，`"alpha"` 会渲染成首字符 `"a"`；去掉后 `render` 第一参即是整条记录（已用 antd Table 实测两种写法的渲染结果）。
+
+- [x] **Step 2: 验证**
 
 浏览器 `/buckets`：建 `alpha` → 列表出现；点进去壳页；回列表删 `alpha`（空桶）成功；删非空桶报 `BucketNotEmpty`（错误文案来自后端纯文本）。
 
-- [ ] **Step 3: 提交**
+> 执行注记：同 Task 4——后端控制台 API（M1a Task 15 未落地）本轮无实跑条件，跳过浏览器手验；真实流程（建桶 / 进入 / 删空桶 / 删非空桶报 `BucketNotEmpty`）由 Task 11 的 Playwright e2e 覆盖。本轮替代验证：`cd web && npm test`（6 用例不回归）、`npm run build`、`npm run lint`。
+
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Buckets.tsx
