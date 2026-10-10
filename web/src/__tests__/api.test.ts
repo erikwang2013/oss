@@ -32,8 +32,10 @@ describe('api()', () => {
 
   it('401 时清 token 且抛 ApiError', async () => {
     setToken('tok')
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 })))
-    await expect(api('/api/v1/buckets')).rejects.toBeInstanceOf(ApiError)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('用户名或密码错误', { status: 401 })))
+    const p = api('/api/v1/buckets')
+    await expect(p).rejects.toBeInstanceOf(ApiError)
+    await expect(p).rejects.toMatchObject({ status: 401, message: '用户名或密码错误' })
     expect(getToken()).toBeNull()
   })
 
@@ -48,5 +50,16 @@ describe('api()', () => {
   it('204 返回 undefined', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
     await expect(api('/api/v1/buckets/a', { method: 'DELETE' })).resolves.toBeUndefined()
+  })
+
+  it('有 body 设 content-type: application/json，无 body 不设', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await api('/api/v1/buckets', { method: 'POST', body: JSON.stringify({ bucket: 'b' }) })
+    const withBody = fetchMock.mock.calls[0][1] as RequestInit
+    expect(new Headers(withBody.headers).get('content-type')).toBe('application/json')
+    await api('/api/v1/buckets')
+    const noBody = fetchMock.mock.calls[1][1] as RequestInit
+    expect(new Headers(noBody.headers).has('content-type')).toBe(false)
   })
 })

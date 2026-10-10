@@ -187,8 +187,10 @@ describe('api()', () => {
 
   it('401 时清 token 且抛 ApiError', async () => {
     setToken('tok')
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 })))
-    await expect(api('/api/v1/buckets')).rejects.toBeInstanceOf(ApiError)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('用户名或密码错误', { status: 401 })))
+    const p = api('/api/v1/buckets')
+    await expect(p).rejects.toBeInstanceOf(ApiError)
+    await expect(p).rejects.toMatchObject({ status: 401, message: '用户名或密码错误' })
     expect(getToken()).toBeNull()
   })
 
@@ -204,9 +206,19 @@ describe('api()', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
     await expect(api('/api/v1/buckets/a', { method: 'DELETE' })).resolves.toBeUndefined()
   })
+
+  it('有 body 设 content-type: application/json，无 body 不设', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await api('/api/v1/buckets', { method: 'POST', body: JSON.stringify({ bucket: 'b' }) })
+    const withBody = fetchMock.mock.calls[0][1] as RequestInit
+    expect(new Headers(withBody.headers).get('content-type')).toBe('application/json')
+    await api('/api/v1/buckets')
+    const noBody = fetchMock.mock.calls[1][1] as RequestInit
+    expect(new Headers(noBody.headers).has('content-type')).toBe(false)
+  })
 })
 ```
-
 - [x] **Step 2: 跑测试确认失败**
 
 Run: `cd web && npm test`
@@ -215,6 +227,7 @@ Expected: FAIL（`../api` 不存在）
 - [x] **Step 3: 实现 `web/src/api.ts`**
 
 ```ts
+const TOKEN_KEY = 'oss.token'
 const TOKEN_KEY = 'oss.token'
 
 export function getToken(): string | null {
@@ -238,13 +251,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   const token = getToken()
   if (token) headers.set('authorization', `Bearer ${token}`)
-  if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json')
+  // FormData 让 fetch 自己带 multipart boundary，手设 content-type 会把 boundary 弄丢
+  if (init.body && !(init.body instanceof FormData) && !headers.has('content-type')) headers.set('content-type', 'application/json')
 
   const resp = await fetch(path, { ...init, headers })
   if (resp.status === 401) {
     setToken(null)
+    const msg = (await resp.text()) || '未登录'
     if (window.location.pathname !== '/login') window.location.href = '/login'
-    throw new ApiError(401, '未登录')
+    throw new ApiError(401, msg)
   }
   if (!resp.ok) throw new ApiError(resp.status, (await resp.text()) || resp.statusText)
   if (resp.status === 204) return undefined as T
@@ -289,8 +304,7 @@ export interface AccessKey {
   secret_key: string
 }
 ```
-
-> 注：`tsconfig.app.json` 开了 `erasableSyntaxOnly`（Vite 8 脚手架默认），TS 参数属性（`constructor(public status: number)`）会报 TS1294，故 `ApiError` 用显式字段。
+> 注：`tsconfig.app.json` 开了 `erasableSyntaxOnly`（Vite 8 脚手架默认），TS 参数属性（`constructor(public status: number)`）会报 TS1294，故 `ApiError` 用显式字段。另开了 `verbatimModuleSyntax`：从本模块导入类型须写 `import { type ObjectList }` 形式，否则报 TS1484。
 
 - [x] **Step 4: 跑测试**
 
@@ -599,7 +613,7 @@ import { useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, ObjectList } from '../api'
+import { api, type ObjectList } from '../api'
 
 function humanSize(n: number) {
   if (n < 1024) return `${n} B`
@@ -1005,7 +1019,7 @@ export function humanSize(n: number): string {
 import { useRef, useState } from 'react'
 import { App, Button, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, GroupInfo, UploadRecord } from '../api'
+import { api, type GroupInfo, type UploadRecord } from '../api'
 import { humanSize } from '../format'
 import { UploadOutcome, useUpload } from './useUpload'
 
@@ -1169,7 +1183,7 @@ git commit -m "feat(web): 上传面板（分组/进度/秒传提示/上传历史
 import { useState } from 'react'
 import { Alert, App, Button, Modal, Table, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, AccessKey } from '../api'
+import { api, type AccessKey } from '../api'
 
 export default function Keys() {
   const { message } = App.useApp()
