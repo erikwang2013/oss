@@ -149,7 +149,7 @@ git add web/ && git commit -m "chore(web): Vite + React19 + antd5 脚手架，�
 - Create: `web/src/api.ts`
 - Test: `web/src/__tests__/api.test.ts`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```ts
 // web/src/__tests__/api.test.ts
@@ -206,12 +206,12 @@ describe('api()', () => {
 })
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd web && npm test`
 Expected: FAIL（`../api` 不存在）
 
-- [ ] **Step 3: 实现 `web/src/api.ts`**
+- [x] **Step 3: 实现 `web/src/api.ts`**
 
 ```ts
 const TOKEN_KEY = 'oss.token'
@@ -287,12 +287,12 @@ export interface AccessKey {
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cd web && npm test`
 Expected: PASS（4 个用例）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add web/src/api.ts web/src/__tests__/api.test.ts
