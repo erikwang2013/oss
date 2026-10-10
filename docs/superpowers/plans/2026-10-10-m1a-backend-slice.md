@@ -1055,7 +1055,7 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
 **Files:**
 - Modify: `crates/xl-store/src/store.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 // 追加到 store.rs 的 tests 模块
@@ -1145,12 +1145,13 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-store put 2>&1 | tail -20`
 Expected: 编译错误（`put_object` 未实现）
+实际：`error: could not compile`（15 处 E0422/E0433/E0599：`put_object` / `put_object_stream` / `head_object` / `XlMeta` 均未定义）。
 
-- [ ] **Step 3: 实现 `put_object`**
+- [x] **Step 3: 实现 `put_object`**
 
 ```rust
 // 追加到 impl Store
@@ -1296,12 +1297,20 @@ fn now_nanos() -> i64 {
 
 `md-5` 的 crate 名是 `md-5`，导入路径是 `md5`（`use md5::{Digest as _, Md5}`）。
 
-- [ ] **Step 4: 跑测试**
+注（与骨架的差异，实现时裁定）：
+- `locks` 字段 / `lock_for` 方法随本 task 落地（Task 4 推迟至此，首个调用者是 `put_object_stream`）。形态：`Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>`，加锁键为 `bucket/key`；`lock_for` 在取锁时 `retain` 回收无外部持有者的旧条目，锁表不随历史写过的键无限增长。
+- `head_object` 与 `load_object_info` 也随本 task 落地：Step 1 的 `put_then_head` / `crash_between_steps_leaves_no_visible_object` 需要一个「提交后是否可见」的探针，缺它们整个测试模块编译不过。**Task 6 的 Step 3 骨架里已含这两个函数，实现 Task 6 时不要重复添加**（get / delete / list / copy 仍留给 Task 6）。
+- `read_meta` 增加键一致性校验（Task 3 质量评审 Minor 3）：解码出的 `object_key` 与请求的 key 不符 → `Error::CorruptMeta`（信息含两个 key），测试 `read_meta_rejects_mismatched_object_key`。
+- 补 `put_with_fsync_disabled_still_commits`：`cfg.fsync=false` 是提交路径上的另一条分支，必须同样可提交可读。
+- Step 3 骨架的文档注释按 clippy `doc_lazy_continuation` 调整（列表后加空行），非语义改动。
+
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store 2>&1 | tail -20`
 Expected: 全部通过（含 Task 4 里那两个此前失败的）
+实际：`xl-store` 34 passed（Task 4 的 26 + 本 task 的 8）；Step 2 的失败形态是编译错误（`put_object` / `put_object_stream` / `head_object` / `XlMeta` 未定义），与 Task 4 Step 4 注记的「模块级编译不过」同因。
 
-- [ ] **Step 5: 加一个「断电」验证：在提交点之前中断**
+- [x] **Step 5: 加一个「断电」验证：在提交点之前中断**
 
 ```rust
     #[tokio::test]
@@ -1319,8 +1328,9 @@ Expected: 全部通过（含 Task 4 里那两个此前失败的）
 
 Run: `cargo test -p xl-store 2>&1 | tail -6`
 Expected: 通过
+实际：通过。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协议（tmp → rename → xl.meta 覆盖）"
