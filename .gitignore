@@ -1,0 +1,40 @@
+/.idea
+/.vscode
+*.log
+.env
+/.cursor
+.claude
+.claude-flow
+.swarm
+.mcp.json
+ruvector.db
+.superpowers/state/target
+.agents
+skills-lock.json
+.php-cs-fixer.cache
+*.backup
+*.bak
+target
+.codex
+
+# SuperOps additions
+node_modules/
+dist/
+.superpowers/brainstorm/
+frontend/src-tauri/target/
+services/gateway/target/
+services/k8s/target/
+# 运行产物（审计兜底等本地数据）
+data/
+
+# Ruflo local secrets and runtime data
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Codex local configuration
+.codex/
+# Claude Flow runtime data
+# Environment variables

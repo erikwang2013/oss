@@ -12,13 +12,14 @@
 
 ---
 
-## 执行前必读：三件事
+## 执行前必读：四件事
 
 1. **s3s 的 DTO 是代码生成的**（`src/dto/generated.rs`，6.2 万行）。所有字段都是 `Option<T>`，一律用 `..Default::default()` 收尾。本计划给出的字段名来自 0.17.0 的实际源码；若某个字段名编译不过，**以编译器为准**去 `generated.rs` 里核对，不要改设计。
 2. **类型别名**：`BucketName = String`、`ObjectKey = String`、`ContentType = String`、`ContentLength = i64`、`ETag = String`、`LastModified = Timestamp`（`Timestamp: From<SystemTime>`）、`ObjectList = Vec<Object>`、`Buckets = Vec<Bucket>`。
 3. **M1 的两处刻意简化**，都在代码里带 `ponytail:` 注释，M2 补：
    - S3 的 `PutObject` 把请求体整份读进内存（上限可配）。M2 换流式。
    - 单进程内的对象锁（`tokio::sync::Mutex` 的 HashMap）。M3 换 flock / quorum 锁。
+4. **开工前的探针编译**：Task 1 完成后，把 Task 9–14 里的 s3s / aetherupload 代码片段先拼进一个临时 bin 做一次 `cargo check`（约 2 分钟），一次扫清剩余的 API 臆测。计划中已用 rustc 探针对 s3s 0.17.0 与 aetherupload 1.0.3 的真实签名核对过两批（builder 非链式、`HttpError` 无 `status_code()` 等），同类问题可能还有。
 
 **M1 明确的安全边界（不要误解为已实现）**：S3 面**只有认证、没有授权** —— 任何有效 AK/SK 可访问所有桶。授权（桶策略/IAM）在 M4。控制台面走 JWT，有鉴权。
 
@@ -132,6 +133,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 ```
 
 `crates/xl-s3/Cargo.toml`：
@@ -151,6 +155,13 @@ futures.workspace = true
 s3s.workspace = true
 sqlx = { workspace = true }
 tracing.workspace = true
+
+[dev-dependencies]
+md-5.workspace = true
+hex.workspace = true
+http = "1"
+tempfile = "3"
+tokio.workspace = true
 ```
 
 `crates/oss-server/Cargo.toml`：
@@ -177,6 +188,7 @@ futures.workspace = true
 jsonwebtoken = "9"
 serde.workspace = true
 serde_json.workspace = true
+s3s.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
@@ -184,6 +196,7 @@ toml = "0.9"
 tracing.workspace = true
 
 [dev-dependencies]
+md-5.workspace = true
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
@@ -441,7 +454,7 @@ mod tests {
         XlMeta {
             object_key: "a/b.txt".into(),
             versions: vec![Version {
-                version_id: "v1".into(),
+                version_id: uuid::Uuid::nil(),
                 mod_time_nanos: 1_700_000_000_000_000_000,
                 size: 11,
                 etag: "5eb63bbbe01eeed093cb22bb8f5acdc3".into(),
@@ -543,7 +556,8 @@ pub struct XlMeta {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Version {
-    pub version_id: String,
+    /// M1 无版本控制：`Uuid::nil()`（S3 协议层映射为字面量 `"null"`）；M4 起为每版本真实 uuid。
+    pub version_id: uuid::Uuid,
     pub mod_time_nanos: i64,
     pub size: u64,
     /// 单段 PUT = 整份 MD5（S3 的定义）；aetherupload 上传时白拿。
@@ -1011,7 +1025,7 @@ impl Store {
 
         let etag = hex::encode(md5.finalize());
         let version = Version {
-            version_id: uuid.clone(),
+            version_id: uuid::Uuid::nil(), // M1 无版本控制：nil = S3 的 "null" 版本
             mod_time_nanos: now_nanos(),
             size,
             etag: etag.clone(),
@@ -1290,7 +1304,8 @@ impl Store {
                 continue;
             }
             if let Some(after) = &start_after {
-                if &k <= after {
+                // token = 本页「未返回的第一个 key」，恢复时包含该 key 本身
+                if &k < after {
                     continue;
                 }
             }
@@ -1956,7 +1971,7 @@ mod tests {
         db.create_user("u", "p", true).await.unwrap();
         db.create_access_key("AKIA_TEST", "SK_TEST", 1).await.unwrap();
         let auth = SigV4Auth::new(db.pool().clone());
-        assert_eq!(auth.get_secret_key("AKIA_TEST").await.unwrap().to_string(), "SK_TEST");
+        assert_eq!(auth.get_secret_key("AKIA_TEST").await.unwrap().expose(), "SK_TEST");
     }
 
     #[tokio::test]
@@ -2058,7 +2073,7 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         StoreError::BucketAlreadyExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
         StoreError::BucketNotEmpty(_) => S3ErrorCode::BucketNotEmpty,
         StoreError::NoSuchKey(_) => S3ErrorCode::NoSuchKey,
-        StoreError::InvalidKey(_) => S3ErrorCode::InvalidObjectName,
+        StoreError::InvalidKey(_) => S3ErrorCode::InvalidArgument,
         StoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
         StoreError::CorruptMeta(_) | StoreError::Encode(_) => S3ErrorCode::InternalError,
         StoreError::Io(_) => S3ErrorCode::InternalError,
@@ -2183,6 +2198,11 @@ impl OssS3 {
     }
 }
 
+/// `xl.meta` 的 `mod_time_nanos` → S3 的 Last-Modified。不要用 now() 冒充。
+fn last_modified(nanos: i64) -> LastModified {
+    LastModified::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos.max(0) as u64))
+}
+
 #[async_trait::async_trait]
 impl S3 for OssS3 {
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
@@ -2270,7 +2290,7 @@ async fn put_head_get_delete() {
         h.update(b"hello s3");
         hex::encode(h.finalize())
     };
-    assert_eq!(head.e_tag.as_deref(), Some(expected_md5.as_str()));
+    assert_eq!(head.e_tag.as_ref().map(ETag::value), Some(expected_md5.as_str()));
 
     let got = s3.get_object(req(GetObjectInput { bucket: "alpha".into(), key: "a/b.txt".into(), ..Default::default() })).await.unwrap().output;
     assert_eq!(got.content_length, Some(8));
@@ -2289,20 +2309,21 @@ async fn delete_objects_is_batch_and_idempotent() {
             body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))), ..Default::default()
         })).await.unwrap();
     }
-    let out = s3.delete_objects(req(DeleteObjectsInput {
-        bucket: "alpha".into(),
-        delete: Delete { objects: vec![
+    // DeleteObjectsInput 没有 Default，用生成 builder 构造
+    let out = s3.delete_objects(req(DeleteObjectsInput::builder()
+        .bucket("alpha".to_string())
+        .delete(Delete { objects: vec![
             ObjectIdentifier { key: "k1".into(), ..Default::default() },
             ObjectIdentifier { key: "k2".into(), ..Default::default() },
             ObjectIdentifier { key: "never-existed".into(), ..Default::default() },
-        ], ..Default::default() },
-        ..Default::default()
-    })).await.unwrap().output;
+        ], ..Default::default() })
+        .build()
+        .unwrap())).await.unwrap().output;
     assert!(out.errors.is_none(), "删除不存在的键不应报错（S3 语义）");
 }
 ```
 
-> `crates/xl-s3/Cargo.toml` 的 `[dev-dependencies]` 需要 `md-5`、`hex`、`bytes`、`tokio`、`tempfile`、`http` 与 `s3s`（`s3s` 已在 `[dependencies]`，dev 里直接用即可）。
+> 测试所需依赖（`md-5` / `hex` / `http` / `tempfile` / `tokio`，以及 `s3s` 本体）已在 Task 1 的 `[dependencies]` / `[dev-dependencies]` 配齐。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -2335,7 +2356,7 @@ Expected: 编译错误
             .await
             .map_err(to_s3_error)?;
 
-        Ok(S3Response::new(PutObjectOutput { e_tag: Some(info.etag), ..Default::default() }))
+        Ok(S3Response::new(PutObjectOutput { e_tag: Some(ETag::Strong(info.etag)), ..Default::default() }))
     }
 
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
@@ -2348,8 +2369,8 @@ Expected: 编译错误
             body: Some(StreamingBlob::from_bytes(bytes)),
             content_length: Some(len),
             content_type: info.content_type,
-            e_tag: Some(info.etag),
-            last_modified: Some(LastModified::from(std::time::SystemTime::now())),
+            e_tag: Some(ETag::Strong(info.etag)),
+            last_modified: Some(last_modified(info.last_modified_nanos)),
             ..Default::default()
         }))
     }
@@ -2359,8 +2380,8 @@ Expected: 编译错误
         Ok(S3Response::new(HeadObjectOutput {
             content_length: Some(info.size as i64),
             content_type: info.content_type,
-            e_tag: Some(info.etag),
-            last_modified: Some(LastModified::from(std::time::SystemTime::now())),
+            e_tag: Some(ETag::Strong(info.etag)),
+            last_modified: Some(last_modified(info.last_modified_nanos)),
             ..Default::default()
         }))
     }
@@ -2435,11 +2456,13 @@ async fn copy_object_copies_bytes() {
         body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"copy"))), ..Default::default()
     })).await.unwrap();
 
-    s3.copy_object(req(CopyObjectInput {
-        bucket: "alpha".into(), key: "dst".into(),
-        copy_source: Some("/alpha/src".to_string()),
-        ..Default::default()
-    })).await.unwrap();
+    // CopyObjectInput 没有 Default；copy_source 是必填枚举（s3s 已解码并去掉前导 '/'）
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("alpha".to_string())
+        .key("dst".to_string())
+        .copy_source(CopySource::Bucket { bucket: "alpha".into(), key: "src".into(), version_id: None })
+        .build()
+        .unwrap())).await.unwrap();
 
     let got = s3.get_object(req(GetObjectInput { bucket: "alpha".into(), key: "dst".into(), ..Default::default() })).await.unwrap().output;
     assert_eq!(got.content_length, Some(4));
@@ -2474,8 +2497,8 @@ Expected: 编译错误 / `NotImplemented`
             .map(|o| Object {
                 key: Some(o.key.clone()),
                 size: Some(o.size as i64),
-                e_tag: Some(o.etag.clone()),
-                last_modified: Some(LastModified::from(std::time::SystemTime::now())),
+                e_tag: Some(ETag::Strong(o.etag.clone())),
+                last_modified: Some(last_modified(o.last_modified_nanos)),
                 storage_class: Some(ObjectStorageClass::from("STANDARD")),
                 ..Default::default()
             })
@@ -2495,47 +2518,25 @@ Expected: 编译错误 / `NotImplemented`
     }
 
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
-        // copy_source 形如 "/src-bucket/src-key"（可带 URL 编码）
-        let source = req.input.copy_source.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing copy source"))?;
-        let decoded = percent_decode(&source);
-        let trimmed = decoded.trim_start_matches('/');
-        let (src_bucket, src_key) = trimmed
-            .split_once('/')
-            .ok_or_else(|| s3s::s3_error!(InvalidRequest, "malformed copy source"))?;
+        // s3s 已将 x-amz-copy-source 解码、去掉前导 '/' 并解析成枚举；这里只接受桶形式
+        let CopySource::Bucket { ref bucket, ref key, .. } = req.input.copy_source else {
+            return Err(s3s::s3_error!(InvalidRequest, "unsupported copy source"));
+        };
 
         let info = self.store
-            .copy_object(src_bucket, src_key, &req.input.bucket, &req.input.key)
+            .copy_object(bucket, key, &req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
 
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(info.etag),
+                e_tag: Some(ETag::Strong(info.etag)),
                 last_modified: None,
                 ..Default::default()
             }),
             ..Default::default()
         }))
     }
-}
-
-/// 只处理 %XX（S3 的 copy_source 会对特殊字符做百分号编码）。
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 ```
 
@@ -2636,9 +2637,10 @@ use xl_s3::auth::SigV4Auth;
 use xl_s3::service::OssS3;
 
 pub fn build_router(state: AppState) -> Router {
-    let s3 = S3ServiceBuilder::new(OssS3::new(Arc::clone(&state.store), state.cfg.max_put_bytes))
-        .set_auth(SigV4Auth::new(state.db.pool().clone()))
-        .build();
+    // s3s 0.17 的 builder 是 `&mut self` 风格，不能链式调用
+    let mut s3_builder = S3ServiceBuilder::new(OssS3::new(Arc::clone(&state.store), state.cfg.max_put_bytes));
+    s3_builder.set_auth(SigV4Auth::new(state.db.pool().clone()));
+    let s3 = s3_builder.build();
 
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
@@ -2646,21 +2648,15 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// S3 应用错误（NoSuchBucket 等）已由 S3Service 转成响应，不会走到这里；
-/// 到这里的是 HTTP 层错误（body 过大、格式非法等）。
-async fn handle_s3_error(err: s3s::HttpError) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let status = err.status_code();
-    let body = match err.into_service_error() {
-        s3s::service::S3ServiceError::InvalidRequest(msg) => msg,
-        other => other.to_string(),
-    };
-    (status, body).into_response()
+/// S3 业务错误（NoSuchBucket 等）由 s3s 在 ops 层序列化成带正确状态码的 XML 响应，不会走到这里；
+/// 到这里的是 HTTP 层错误（body 过大、格式非法等）—— 兜底 500。
+async fn handle_s3_error(err: s3s::HttpError) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.into_std_error().to_string())
 }
 ```
 
-> `S3ServiceError` 的变体名以 `src/service.rs` 为准；若不同，改成对应的匹配分支，或直接
-> `(status, "s3 error").into_response()` 先跑通，M2 再把错误体做细。
+> `s3s::HttpError` 只有 `from_std_error` / `into_std_error`（`src/protocol.rs`）；
+> 没有 `status_code()`，也不存在 `S3ServiceError` 这个类型。
 
 - [ ] **Step 4: 跑测试**
 
@@ -2687,7 +2683,7 @@ git add crates/oss-server/ && git commit -m "feat(server): s3s 挂进 e-cat rout
 // crates/oss-server/tests/aether_ingest.rs
 // 直接测 sink 与 instant store，不经 HTTP（HTTP 链路交给 Task 16 的端到端脚本）。
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")] // block_on 用了 block_in_place，单线程 runtime 会 panic
 async fn ingest_sink_puts_finished_file_into_store() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
@@ -2708,7 +2704,7 @@ async fn ingest_sink_puts_finished_file_into_store() {
     std::fs::write(&path, body).unwrap();
 
     let resource = aetherupload::resource::Resource::new(
-        path, "file".into(), "file".into(), sub.into(), format!("{md5}.txt"),
+        &st.cfg.staging_dir, "file", "file", sub, &format!("{md5}.txt"),
     );
 
     st.ingest.upload_complete(&resource);
@@ -2724,7 +2720,7 @@ async fn ingest_sink_puts_finished_file_into_store() {
 }
 ```
 
-> `Resource::new` 的签名以 `crates/xl-store/.../src/resource.rs:25` 为准（4~5 个参数）。若字段顺序不同，按源码调整。
+> `Resource::new(upload_root: &Path, group, group_dir, group_sub_dir, name)` —— `aetherupload-rust-1.0.3/src/resource.rs:25`。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -2756,7 +2752,8 @@ use xl_store::store::Store;
 ///
 /// aetherupload 的 `EventSink` 与 `InstantStore` 都是**同步契约**（对齐 PHP 语义），
 /// 而我们的存取层是 async。`block_in_place` 需要 multi-thread runtime
-/// （`#[tokio::main]` 默认即是；current_thread 下会 panic）。
+/// （`#[tokio::main]` 默认即是；current_thread 下会 panic —— 测试里用
+/// `#[tokio::test(flavor = "multi_thread")]`）。
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
@@ -2872,6 +2869,10 @@ pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
             cfg: Arc::clone(&state.cfg),
         }));
 
+    // 分组目录（`_header/` 与各分组目录）必须先存在，否则预处理会报笼统的上传错误。
+    // aetherupload 自带 e2e 也是用 list_groups 建的。
+    let _ = aetherupload::console::list_groups(&runtime, &mut |_| {});
+
     Arc::new(runtime)
 }
 ```
@@ -2938,8 +2939,8 @@ echo
 kill %1
 ```
 Expected: 返回 JSON 且 `"error":"0"`，含 `chunkSize` / `resourceTempBaseName` / `groupSubDir` / `savedPath` 字段。
-若报错，先跑建目录（Task 16 的启动钩子会做这件事）：
-`cargo run -p aetherupload-rust 2>/dev/null || true`（或直接调 `aetherupload::console::list_groups`）。
+分组目录由 `aether::build_runtime` 构造时调用 `aetherupload::console::list_groups` 自动创建。
+（`cargo run -p aetherupload-rust` 不可用：它是 registry 依赖，不是 workspace 成员。）
 
 - [ ] **Step 8: 提交**
 
@@ -3294,7 +3295,9 @@ aws_s3 ls "s3://$BUCKET/copy.bin" | grep -q copy.bin
 echo "== 8. 批量删除 =="
 aws --endpoint-url "$ENDPOINT" s3api delete-objects --bucket "$BUCKET" \
   --delete "Objects=[{Key=one.bin},{Key=copy.bin}],Quiet=false" >/dev/null
-aws_s3 ls "s3://$BUCKET/" | grep -q "dir/" || true
+aws_s3 ls "s3://$BUCKET/" | tee "$WORK/ls2.txt"
+grep -q "dir/" "$WORK/ls2.txt"   # 未被删除的键仍在
+if grep -q -e one.bin -e copy.bin "$WORK/ls2.txt"; then echo "批量删除未生效"; exit 1; fi
 
 echo "== 9. rclone 对照 =="
 export RCLONE_CONFIG_OSS_TYPE=s3
@@ -3305,7 +3308,8 @@ export RCLONE_CONFIG_OSS_ENDPOINT="${ENDPOINT#http://}"
 export RCLONE_CONFIG_OSS_FORCE_PATH_STYLE=true
 rclone lsf oss:"$BUCKET"
 rclone copyto "$WORK/one.bin" oss:"$BUCKET/rclone.bin"
-rclone check "$WORK" oss:"$BUCKET" --one-way --include "one.bin" || true
+rclone cat oss:"$BUCKET/rclone.bin" | cmp - "$WORK/one.bin"   # rclone 读回内容与本地一致
+if rclone lsf oss:"$BUCKET" | grep -qx one.bin; then echo "删除未生效"; exit 1; fi
 
 echo "== 10. 删桶 =="
 aws_s3 rb "s3://$BUCKET" --force
@@ -3361,10 +3365,9 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
   -H 'content-type: application/json' -d '{}'
 ```
 
-> 注意：aetherupload 的分组目录（暂存盘下的 `_header/` 与各分组目录）必须存在，
-> 否则预处理会报一条笼统的上传错误、很难看出是目录问题。M1b 会把
-> `aetherupload::console::list_groups` 挂进 e-cat 的 `on_start` 钩子自动建；
-> 在那之前，手工跑一次 `aetherupload::console::list_groups(&runtime, &mut say)`。
+> 注意：aetherupload 的分组目录（暂存盘下的 `_header/` 与各分组目录）由
+> `aether::build_runtime` 在启动时调用 `aetherupload::console::list_groups` 自动创建；
+> 若预处理报笼统的上传错误，先检查暂存盘目录是否被清理。
 
 ## 验收
 
@@ -3407,6 +3410,6 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 | 风险 | 处置 |
 |---|---|
 | s3s 0.17 的 DTO 字段名与计划不符 | 计划里已标注「以 `generated.rs` 为准」；Task 1 的编译关卡会第一时间暴露 |
-| `Resource::new` 的签名 | Task 14 已注明以 `src/resource.rs:25` 为准 |
-| `block_in_place` 需要 multi-thread runtime | Task 14 已注明；`#[tokio::main]` 默认即是。若将来有人改成 `current_thread`，秒传与 ingest 会 panic —— 这是**刻意的响亮失败**，不做静默降级 |
-| aetherupload 的分组目录必须先建 | Task 8 的 main 里已经建桶；Task 16 的 README 写明了手工步骤。M1b 会在启动钩子里自动跑 `aetherupload::console::list_groups` |
+| `Resource::new` 的签名 | 已按真实签名写死（`aetherupload-rust-1.0.3/src/resource.rs:25`，5 参） |
+| `block_in_place` 需要 multi-thread runtime | `#[tokio::main]` 默认即是；测试必须用 `#[tokio::test(flavor = "multi_thread")]`（Task 14 已注明）。若将来有人改成 `current_thread`，秒传与 ingest 会 panic —— 这是**刻意的响亮失败**，不做静默降级 |
+| aetherupload 的分组目录必须先建 | `aether::build_runtime` 构造时调用 `aetherupload::console::list_groups` 自动创建（Task 14） |

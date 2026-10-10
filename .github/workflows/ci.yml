@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检测 workspace 是否就绪
+        id: detect
+        run: echo "ready=$([ -f Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: rustfmt
+        if: steps.detect.outputs.ready == 'true'
+        run: cargo fmt --all --check
+      - name: clippy
+        if: steps.detect.outputs.ready == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        if: steps.detect.outputs.ready == 'true'
+        run: cargo test --workspace
+      - name: 跳过提示
+        if: steps.detect.outputs.ready != 'true'
+        run: echo "Cargo.toml 尚未存在（规划阶段），跳过 Rust 检查"
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检测 web 是否就绪
+        id: detect
+        run: echo "ready=$([ -f web/package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: web 构建与单测
+        if: steps.detect.outputs.ready == 'true'
+        working-directory: web
+        run: npm ci && npm run build && npm test
+      - name: 跳过提示
+        if: steps.detect.outputs.ready != 'true'
+        run: echo "web/package.json 尚未存在（M1b 未开工），跳过 web 检查"

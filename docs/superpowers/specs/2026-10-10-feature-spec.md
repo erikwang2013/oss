@@ -41,7 +41,7 @@
 | `BucketNotEmpty` | 409 | 删除非空桶 |
 | `InvalidBucketName` | 400 | 桶名不合规（§2.1 规则） |
 | `KeyTooLongError` | 400 | 键 > 1024 字节 |
-| `InvalidObjectName` | 400 | 键含保留分隔符 / 路径穿越段 |
+| `InvalidArgument` | 400 | 键含保留分隔符 / 路径穿越段（message 说明原因） |
 | `EntityTooLarge` | 400 | 超过 `max_put_bytes`（M1）或 5 TiB 上限 |
 | `EntityTooSmall` | 400 | 多段上传的某个 part < 5 MiB（非末段） |
 | `AccessDenied` | 403 | 认证通过但策略拒绝 |
@@ -270,7 +270,7 @@
 **行为**
 - 键按 **UTF-8 字节序** 升序返回（不是字典序，中文会不同 —— 测试要覆盖）
 - `delimiter` 命中时，公共前缀聚合成 `CommonPrefixes`，不返回其中的对象
-- 截断时返回 `NextContinuationToken`（M1 实现为「最后返回的键」，是不透明的，客户端不该解析）
+- 截断时返回 `NextContinuationToken`（M1 实现为「本页未返回的第一个键」，恢复时包含该键本身；token 不透明，客户端不该解析）
 - `encoding-type=url` 时键做百分号编码（含 XML 非法字符的键必须编码）
 
 **响应字段**：`Contents[].{Key,LastModified,ETag,Size,StorageClass,Owner}`、`KeyCount`、`IsTruncated`、`CommonPrefixes[]`
@@ -526,7 +526,7 @@ SELECT <列表达式列表 | *> FROM S3Object [alias] [WHERE <布尔表达式>] 
 
 AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分片流式）、`Progress`（每约 1 MiB 一次）、`Stats`（`BytesScanned`/`BytesProcessed`/`BytesReturned`）、`End`。
 
-**边界**：`ScanRange` 支持（`Start`/`End` 字节区间）；不做 `RequestProgress` 的交互式查询；**不解压后随机寻址**（GZIP 必须顺序解压）。
+**边界**：`ScanRange` 支持（`Start`/`End` 字节区间）；支持 `RequestProgress.Enabled`（按 §12.4 的 ~1 MiB 节奏发 `Progress` 帧——设计文档 M6 验收依赖 `--request-progress` 的帧格式）；不做其他交互式查询；**不解压后随机寻址**（GZIP 必须顺序解压）。
 
 ---
 
@@ -672,7 +672,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 页面 | 功能 | 阶段 |
 |---|---|---|
 | 登录 | 用户名口令 → JWT | M1 |
-| 概览 | 容量/对象数/请求速率/集群健康摘要 | M1（简）/M4（全） |
+| 概览 | 容量/对象数/请求速率/集群健康摘要 | M4（依赖指标端点与集群面板，M1 无数据支撑） |
 | 桶列表 | 建/删桶、配额、用量条 | M1 |
 | 对象浏览器 | 面包屑前缀导航、虚拟滚动列表、上传（拖拽）、下载、删除、复制/重命名、标签、元数据面板、分享链接（预设 URL）、版本列表、对象锁状态、加密状态、存储类、恢复按钮 | M1（基础）/M4-M8（逐项） |
 | 上传面板 | 分组选择、进度条、断线续传提示、秒传命中提示、上传历史 | M1 |
@@ -688,7 +688,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 作业中心 | Batch 作业列表/进度/报告下载、重跑失败项 | M8 |
 | Inventory | 配置、历史清单、下载 | M8 |
 | 分层 | tier 后端配置、存储类映射 | M8 |
-| 设置 | 上传分组、限制、加密主密钥、KMS 连接 | M1（分组）/M5（加密） |
+| 设置 | 上传分组、限制、加密主密钥、KMS 连接 | M2（分组）/M5（加密） |
 
 **前端技术**：React 19 + Vite + TypeScript + antd v5 + `@tanstack/react-query`；上传复用 aetherupload 自带的 `aetherupload-all.js`（含 zepto + spark-md5），React 侧包一个 `useUpload` hook 驱动它 —— **不重写分片逻辑**。
 
@@ -728,7 +728,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 | 阶段 | 功能 |
 |---|---|
-| **M1** | SigV4 认证 · 控制台登录 · 桶 CRUD · 对象 PUT/GET/HEAD/DELETE/批量删 · CopyObject · ListObjectsV2/V1 · aetherupload 预处理/分块/秒传/原生 ingest/分组 · 控制台 API（认证/桶/对象/上传/密钥）· 登录与桶与对象三页 |
+| **M1** | SigV4 认证 · 控制台登录 · 桶 CRUD · 对象 PUT/GET/HEAD/DELETE/批量删 · CopyObject · ListObjectsV2/V1 · aetherupload 预处理/分块/秒传/原生 ingest/分组 · 控制台 API（认证/桶/对象/上传/密钥/分组）· 登录/桶/对象/访问密钥四页（上传面板并入对象页） |
 | **M2** | 多段上传全套 · Range 与条件请求 · 用户元数据 · 流式大对象 · 纠删码 · 小对象内联 · 多盘 · 断电一致性 · fsck |
 | **M3** | 多节点 mesh · 静态拓扑 · 对象→纠删组哈希 · quorum 读写 · 节点故障容忍 · 读修复 · 集群健康端点 |
 | **M4** | 版本控制 · 生命周期 · 策略求值与 IAM · 用户与策略页 · 审计 · scrub/heal/rebalance · 集群状态页 · 对象标签 |
@@ -738,4 +738,4 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页 |
 | **M9** | 控制面 `openraft` 跨站点强一致 · sync 桶 · stretch EC · 站点故障语义 |
 
-**与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 回答「M1 怎么写」（逐任务代码与测试）。
+**与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 与 `2026-10-10-m1b-frontend-console.md` 回答「M1 前后端怎么写」（逐任务代码与测试）。

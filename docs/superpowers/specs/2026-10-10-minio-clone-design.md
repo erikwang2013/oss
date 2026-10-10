@@ -35,9 +35,9 @@
 
 | 用途 | 选型 | 版本 | 说明 |
 |---|---|---|---|
-| 应用框架 | `ecat` | 7.0.0 | `App::builder()` + `HttpServer::new(addr).router(r)` + `LifecycleHook` |
+| 应用框架 | `ecat` | 7.0.0 | `App::builder()` + `HttpServer::new(addr).router(r)` + `LifecycleHook`（`HttpServer` 属 `ecat-transport-http`，经 `ecat::transport_http` 再导出） |
 | HTTP 传输 | `ecat-transport-http` | 7.0.0 | 底层即 **axum 0.8** —— 与 aetherupload 的 `ecat` feature 完全对齐 |
-| S3 协议 | `s3s` | 0.17.0 | `S3Service` 是 `tower::Service`，**113 个 S3 操作**，SigV4/XML/流式全包 |
+| S3 协议 | `s3s` | 0.17.0 | `S3Service` 是 `tower::Service`，**114 个 S3 操作**，SigV4/XML/流式全包 |
 | 上传 | `aetherupload-rust` | 1.0.3 | feature `ecat` → 返回 `axum::Router<()>`，直接挂载 |
 | 纠删码 | `reed-solomon-erasure` | 6.0.0 | GF(2^8)，已验证 620 万下载 |
 | 控制面 DB | `ecat-data-sqlx` | 7.0.0 | 开发 SQLite / 生产 PostgreSQL，同一 trait |
@@ -54,7 +54,7 @@
 | WASM 变换器（M8） | `wasmtime` | 最新 | **cargo feature 门控**，默认走 HTTP 变换器 |
 | 前端 | React 19 · Vite · TypeScript · antd v5 · `@tanstack/react-query` | — | 复用 `aetherupload-all.js`（含 zepto + spark-md5） |
 
-**关于 `s3s` 的边界**：113 个操作覆盖全部数据面与桶配置面，但 **Access Points 的 CRUD 不在其中** —— `CreateAccessPoint` 属于 S3 Control API（独立服务、独立端点、独立签名）。这部分由本项目的控制台 API 自建，Access Point 的**使用**（寻址 + 策略解析）走 s3s 的 `S3Route` 前置层。
+**关于 `s3s` 的边界**：114 个操作覆盖全部数据面与桶配置面，但 **Access Points 的 CRUD 不在其中** —— `CreateAccessPoint` 属于 S3 Control API（独立服务、独立端点、独立签名）。这部分由本项目的控制台 API 自建，Access Point 的**使用**（寻址 + 策略解析）走 s3s 的 `S3Route` 前置层。
 
 ---
 
@@ -74,7 +74,7 @@
 │   /api/v1/*         控制台 API        ← ecat-auth JWT 中间件         │
 │   /ap/<name>/*      Access Point 寻址 ← S3Route 前置改写层 (M8)      │
 │   /metrics          ecat-metrics (Prometheus)                       │
-│   fallback          s3s::S3Service    ← 113 个 S3 操作               │
+│   fallback          s3s::S3Service    ← 114 个 S3 操作               │
 │                                                                     │
 │  中间件链：ecat-middleware(超时/限流) + ecat-tracing + ecat-security │
 │  LifecycleHook：拓扑加载 · 启动自检(fsck) · 后台作业引擎 · 后台 heal │
@@ -104,7 +104,7 @@ oss/
 ├── crates/
 │   ├── xl-store/           存储内核：盘布局 · EC · xl.meta · 拓扑 · 锁 · 事件 · 作业 · 自愈
 │   ├── xl-s3/              s3s 的 S3 trait 实现 · S3Route 前置层 · SigV4 凭据 · 策略求值
-│   ├── xl-server/          e-cat 应用：router 组装 · 控制台 API · aetherupload 接线 · 钩子
+│   ├── oss-server/         e-cat 应用：router 组装 · 控制台 API · aetherupload 接线 · 钩子
 │   ├── xl-proto/           (M3) 节点间 gRPC 协议 (prost + tonic-build)
 │   └── xl-client/          (M3) 节点间客户端封装（用于测试与工具）
 ├── web/                    React 控制台
@@ -112,7 +112,7 @@ oss/
 └── docs/
 ```
 
-依赖方向：`xl-server` → `xl-s3` → `xl-store`；`xl-store` 不依赖任何框架。M1 只建三个 crate（`xl-proto` / `xl-client` 到 M3 才出现）。
+依赖方向：`oss-server` → `xl-s3` → `xl-store`；`xl-store` 不依赖任何框架。M1 只建三个 crate（`xl-proto` / `xl-client` 到 M3 才出现）。
 
 ---
 
@@ -184,7 +184,7 @@ struct XlMeta {
 }
 
 struct Version {
-    version_id: Uuid,                // 未启用版本控制时为固定 "null"
+    version_id: Uuid,                // 未启用版本控制时为 Uuid::nil()；S3 协议层映射为字面量 "null"（M4 起为每版本真实 uuid）
     is_delete_marker: bool,          // M4
     is_latest: bool,                 // M4
     mod_time: i64,                   // unix nanos —— meta 冲突时的裁决依据
@@ -269,11 +269,12 @@ set_index = crc32c(bucket + "/" + key) % sets.len()
 let store = Arc::new(xl_store::Store::open(Config::from_file("oss.toml")?).await?);
 
 // 2) S3 协议层：s3s 的 S3Service 挂 fallback
-let s3 = s3s::service::S3ServiceBuilder::new(S3Impl::new(store.clone()))
-    .set_auth(SigV4Auth::new(store.clone()))     // AK/SK 查库 + STS 会话校验
-    .set_access(PolicyAccess::new(store.clone())) // 策略求值（M4）
-    .set_route(AccessPointRoute::new(store.clone())) // AP / Object Lambda 改写层（M8）
-    .build();
+// s3s 0.17 的 builder 是 &mut self 风格，不能链式调用
+let mut s3_builder = s3s::service::S3ServiceBuilder::new(S3Impl::new(store.clone()));
+s3_builder.set_auth(SigV4Auth::new(store.clone()));         // AK/SK 查库 + STS 会话校验
+s3_builder.set_access(PolicyAccess::new(store.clone()));    // 策略求值（M4）
+s3_builder.set_route(AccessPointRoute::new(store.clone())); // AP / Object Lambda 改写层（M8）
+let s3 = s3_builder.build();
 
 // 3) e-cat 应用：一个 Router 三种入口
 let router = axum::Router::new()
@@ -379,7 +380,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
      → call：命中变换器 → 取对象 → 变换 → 返回；无变换器 → 直通 S3 服务
 ```
 
-- **Access Point CRUD 自建**（`/api/v1/accesspoints`），因为 `CreateAccessPoint` 属于 S3 Control API，不在 s3s 的 113 个操作里；而**使用**走 `S3Route`，与标准 S3 请求共用同一条解析路径
+- **Access Point CRUD 自建**（`/api/v1/access-points`），因为 `CreateAccessPoint` 属于 S3 Control API，不在 s3s 的 114 个操作里；而**使用**走 `S3Route`，与标准 S3 请求共用同一条解析路径
 - Object Lambda 的变换器两种形态：**HTTP 变换器**（默认，POST 对象字节+元数据到外部端点，收变换结果，无重依赖）与 **WASM 变换器**（`wasmtime`，cargo feature 门控，沙箱内执行，窄 ABI：读对象字节+meta → 写变换后字节/头）
 - AWS 的标准 Object Lambda 只做读变换；我们不做写路径变换（那需要自造协议，任何客户端都不认）
 
@@ -391,7 +392,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 ### M1 垂直切片（2-3 周）
 
-**范围**：workspace 骨架 · e-cat 起服务 · s3s 挂 fallback · 单盘直存（无 EC）· 桶/对象核心 API · SigV4 凭据 · JWT 控制台登录 · aetherupload 四条路由 + 原生 ingest · React 控制台（登录/桶列表/对象浏览/上传/下载）
+**范围**：workspace 骨架 · e-cat 起服务 · s3s 挂 fallback · 单盘直存（无 EC）· 桶/对象核心 API（含 CopyObject 与批量删除）· SigV4 凭据 · JWT 控制台登录 · aetherupload 四条路由 + 原生 ingest · React 控制台（登录/桶列表/对象浏览/上传/下载/访问密钥）
 
 **验收**
 1. `aws-cli s3 mb/ls/cp/rm` 与 `rclone` 增删查列全部通过
@@ -402,7 +403,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 ### M2 真·单机对象存储（3-4 周）
 
-**范围**：正式 `xl.meta` v1（含格式版本）· EC 8+4 · 小对象内联 · 单机多盘 · Multipart Upload · Range · CopyObject · 批量删除 · 断电一致性 · tmp/trash 孤儿回收
+**范围**：正式 `xl.meta` v1（含格式版本）· EC 8+4 · 小对象内联 · 单机多盘 · Multipart Upload · Range · 断电一致性 · tmp/trash 孤儿回收
 
 **验收**
 1. 拔掉 2 块盘（8+4 的 parity 预算内）读写照常，日志显示分片重建
@@ -531,3 +532,15 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | M9 同步强一致 | 6-10 周 | 收尾 |
 
 单人全职 **31-47 周（约 8-11 个月）**；三人并行 **约 5-6 个月**。
+
+---
+
+## 12. 部署、CI 与许可证（跨阶段）
+
+| 项 | 阶段 | 内容 |
+|---|---|---|
+| CI | 已就位（M1a Task 1 起生效） | `.github/workflows/ci.yml`：Rust（fmt / clippy / test）与 web（build / vitest）两个 job；对应文件（`Cargo.toml` / `web/package.json`）出现前自动跳过，规划阶段不红 |
+| 部署 | **M2** | `deploy/docker-compose.yml`（dev：oss + minio 对照）· `deploy/systemd/oss.service` · `deploy/nginx.conf`（TLS + X-Accel-Redirect 大文件下载；M1b 的 `web/` 构建产物由 nginx 静态服务）· `Dockerfile` |
+| 许可证 | 即刻 | Apache-2.0（根 `LICENSE` 已就位；workspace `Cargo.toml` 的 `license` 字段与之一致） |
+
+M1 期间的浏览器验收不依赖部署：前端跑 Vite dev server，经代理直连 `oss-server`（见 `plans/2026-10-10-m1b-frontend-console.md`）。
