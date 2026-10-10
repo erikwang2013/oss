@@ -1138,6 +1138,7 @@ Minor（同轮）：`restore` 仅在 `window.XMLHttpRequest === Counting` 时还
 **Files:**
 - Create: `web/src/format.ts`（从 Task 6 抽出 `humanSize` 共用）
 - Create: `web/src/upload/UploadPanel.tsx`
+- Create: `web/src/__tests__/assets.test.ts`（vendored 脚本补丁漂移守卫，收尾轮补）
 - Modify: `web/src/pages/Objects.tsx`（引用 format.ts、加「上传」按钮）
 
 - [x] **Step 1: `web/src/format.ts`**
@@ -1176,6 +1177,10 @@ export default function UploadPanel({
   const qc = useQueryClient()
   const [group, setGroup] = useState('file')
   const [last, setLast] = useState<UploadOutcome | null>(null)
+  // 上传中禁用再选。复位点：onFinished（成功）、start 同步抛错、面板关闭；
+  // 库对硬失败（如 preprocess 报错）不回调也不回调错误，只往 #aetherupload-output 写文案，
+  // 那种情况靠关闭面板复位（不解析中文文案）。
+  const [busy, setBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   // onFilePicked 会清空 input.value（让同一文件再选也触发 onChange），清空后 files 为空——
   // 原始文件名必须选文件当刻留档，onFinished（异步）里再读就已经是 '' 了
@@ -1191,18 +1196,26 @@ export default function UploadPanel({
     queryKey: ['uploads'],
     queryFn: () => api<UploadRecord[]>('/api/v1/uploads'),
     enabled: open,
-    refetchInterval: open ? 3000 : false,
+    refetchInterval: 3000,
   })
 
   const { start } = useUpload({
     onFinished: async (outcome) => {
+      setBusy(false) // 先复位：后面的 register 上报失败也不影响
+      // 脚本成功后会给 input 置 disabled（aetherupload-all.js 227/327 行）；不清掉的话
+      // 「选择文件」按钮的 click 落在 disabled input 上无任何反应——真人没法在同面板再选（秒传演示就断了）。
+      // useUpload.start 里那处清理只在 change 事件能触发时才轮得到，救不了这一手。
+      fileRef.current?.removeAttribute('disabled')
       setLast(outcome)
       message.success(outcome.instant ? '上传成功（秒传）' : '上传成功')
       if (outcome.savedPath) {
         await api('/api/v1/uploads/register', {
           method: 'POST',
           body: JSON.stringify({ saved_path: outcome.savedPath, original_name: originalNameRef.current }),
-        }).catch(() => message.warning('上传记录登记失败（对象本身已入库）'))
+        }).catch((e) => {
+          console.error(e)
+          message.warning('上传记录登记失败（对象本身已入库）')
+        })
       }
       qc.invalidateQueries({ queryKey: ['objects', bucket] })
       qc.invalidateQueries({ queryKey: ['uploads'] })
@@ -1215,12 +1228,23 @@ export default function UploadPanel({
     if (!input.files?.[0]) return
     originalNameRef.current = input.files[0].name
     setLast(null)
-    start(input, group)
+    setBusy(true)
+    try {
+      start(input, group)
+    } catch (err) {
+      setBusy(false) // 同步抛错（如脚本未加载）不能让按钮永久禁用
+      throw err
+    }
     input.value = ''
   }
 
+  const close = () => {
+    setBusy(false) // 硬失败没有回调，关闭面板兜底复位
+    onClose()
+  }
+
   return (
-    <Modal title={`上传到 ${bucket}`} open={open} onCancel={onClose} footer={null} width={640} destroyOnHidden>
+    <Modal title={`上传到 ${bucket}`} open={open} onCancel={close} footer={null} width={640} destroyOnHidden>
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
         <Space>
           <Select
@@ -1232,7 +1256,11 @@ export default function UploadPanel({
               label: `${g.group} → ${g.bucket}${g.max_size ? `（≤ ${humanSize(g.max_size)}）` : ''}`,
             }))}
           />
-          <Button onClick={() => fileRef.current?.click()} loading={!window.aetherupload ? true : undefined}>
+          <Button
+            onClick={() => fileRef.current?.click()}
+            disabled={busy || !window.aetherupload}
+            title={!window.aetherupload ? 'aetherupload-all.js 未加载' : undefined}
+          >
             选择文件并开始上传
           </Button>
         </Space>
@@ -1342,6 +1370,33 @@ FormData + `processData: false` + `contentType: false`（zepto 原生支持）�
 2. `UploadPanel.tsx` `destroyOnClose` → `destroyOnHidden`（antd 5.29 起前者是弃用别名，运行时会打警告）。
 3. 装 `@ant-design/v5-patch-for-react-19` 并在 `main.tsx` 顶部 import（消 `[antd: compatible] antd v5
    support React is 16 ~ 18` 警告、恢复静态 API 正常性）。
+
+---
+
+## 定稿记录（Task 9 质量评审收尾，commit `fix(web): 上传面板 busy 护栏与失败留痕；漂移守卫测试`）
+
+**I-1 busy 并发护栏**：`UploadPanel` 加 `busy` state——选文件置 true，`onFinished` 开头（在 register await
+之前）置 false；按钮 `disabled={busy || !window.aetherupload}`。复位点共三处，因为**库对硬失败没有任何回调**：
+`aetherupload-all.js` 只在成功分支调 `_this.callback()`（savedPath 非空那支），失败（preprocess 报错、
+分块服务端错误）只把文案写进 `#aetherupload-output` 就 return。故除 `onFinished`（成功）外，另加
+`start()` 同步抛错的 try/catch 复位、以及关闭面板时复位（`close()`），保证按钮不会永久禁用；不解析中文文案
+（计划「执行前必读」第 2 条）。文件名留档仍用共享 `originalNameRef`（按次闭包需改 `useUpload` 签名，
+而该 hook 已有 3 条承诺测试，不动更稳）。
+
+**另加一条自测发现的交互缺陷（同轮修复）**：脚本成功后会给自己那个 input 置 `disabled`
+（227/327 行），而「选择文件并开始上传」的 click 落在 disabled input 上**不派发任何事件**——真人第一次上传成功后，
+同面板再点按钮毫无反应，「同一文件再选一次看秒传」在真浏览器里不可达（Playwright 的 `setInputFiles`
+绕过可操作性检查，所以 e2e 照写也照样绿，只有人工点才发现）。修法：`onFinished` 里
+`fileRef.current?.removeAttribute('disabled')`，并用 `filechooser` 事件走了真人路径复验（首传后按钮 enabled
+→ 点按钮弹选择器 → 二传 `上传成功（秒传）`、`/aetherupload/uploading` POST 0）。
+
+**Minor 四条**：M1 register 失败 `.catch((e) => { console.error(e); message.warning(...) })` 留痕；
+M2 按钮 `loading={!window.aetherupload ? true : undefined}` 改为 `disabled={!window.aetherupload}` + `title`
+（原写法在脚本缺失时永久转圈且吞点击）；M3 新增 `web/src/__tests__/assets.test.ts` 漂移守卫——读 vendored
+脚本原文，断言 `processData: false`/`contentType: false` 各 ≥2 处、且含 `new FormData()` 与
+`form.append('resource_name'`（补丁特有；原版 preprocess 没有 FormData），防手滑 re-copy 覆盖补丁；
+（已实测：去掉补丁跑该测试 2 条全红。）M4 `refetchInterval: open ? 3000 : false` → `3000`（`enabled: open`
+已管门）。M5（历史表保留已删对象行）/ M6（bisect 中间态）记录不处理；extensions 展示（nit）不做。
 
 ---
 
