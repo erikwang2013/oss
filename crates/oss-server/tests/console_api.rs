@@ -87,8 +87,8 @@ async fn wrong_password_is_401() {
     assert_eq!(resp.status(), 401);
 }
 
-/// 钉 `register_upload` 的三分支口径（I-1 定稿）：命中 204、无行 404、错误 400。
-/// Err→400 分支需要 DB 故障，HTTP 面不构造（db.rs 单测已覆盖返回语义）。
+/// 钉 `register_upload` 的三分支口径（I-1，收尾轮修订）：命中 204、无行 404、DB 故障 500。
+/// 本用例覆盖前两支；Err→500 见下方 `register_upload_db_failure_is_500`。
 #[tokio::test]
 async fn register_upload_hit_is_204_miss_is_404() {
     let dir = tempfile::tempdir().unwrap();
@@ -153,6 +153,34 @@ async fn register_upload_hit_is_204_miss_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// register Err→500（微调轮裁决）：DB 故障在 HTTP 面可构造——经池 drop 掉 uploads 表。
+#[tokio::test]
+async fn register_upload_db_failure_is_500() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    sqlx::query("DROP TABLE uploads")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let base = serve(build_router(st)).await;
+    let token = login_token(&base).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/uploads/register"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"saved_path": "a.txt", "original_name": "b.txt"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "internal error",
+        "5xx 不泄内部细节"
+    );
 }
 
 // ---- Task 15 收尾轮（I-1 / M-2 / M-3 / M-4）新增 ----

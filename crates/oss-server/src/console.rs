@@ -276,7 +276,11 @@ async fn register_upload(
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // DB 故障是服务端故障（与 store_error 的 5xx 分档一致）
+        Err(e) => {
+            tracing::error!(error = %e, "登记上传记录失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 

@@ -2584,7 +2584,7 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制面 5 张表与
 注（Task 7 执行偏差，仅此一处）：提交范围在 `git add crates/oss-server/` 之外连带根 `Cargo.lock` —— 新增 `hex` 依赖使 oss-server 的锁文件清单变化，单独 add crate 会把 `Cargo.lock` 留在脏区。实现代码与计划逐字一致（rustfmt 仅换行）；`sqlite::memory:` 的池内共享由 sqlx 0.8.6 保证（自动 `shared_cache` + 每池唯一库名），测试建库方式与计划相同。
 
 注（Task 7 质量评审收尾轮，I-1 裁决 + Minor，已并入；上方代码块已同步）：
-- **I-1 `register_upload` 返回命中数**：签名改 `Result<bool>`（`execute()?.rows_affected() == 1`）。0 行命中 = `saved_path` 不存在，调用方按 404 处理（不允许静默吞掉 `original_name`，规格 §5.4）。测试补 `register_upload_without_record_is_false`；Task 15 的 register 路由片段同步改为 `Ok(true) → 204 / Ok(false) → 404 / Err(e) → 400`。
+- **I-1 `register_upload` 返回命中数**：签名改 `Result<bool>`（`execute()?.rows_affected() == 1`）。0 行命中 = `saved_path` 不存在，调用方按 404 处理（不允许静默吞掉 `original_name`，规格 §5.4）。测试补 `register_upload_without_record_is_false`；Task 15 的 register 路由片段同步改为 `Ok(true) → 204 / Ok(false) → 404 / Err(e) → 500`（收尾轮裁决修订 Err 分支：DB 故障是服务端故障，与错误分档口径一致；原「Err(e) → 400」措辞已改正，见 Task 15 收尾轮定稿记录）。
 - **M-1**：`secret_for_access_key` 补两条测试——`secret_for_access_key_rejects_expired`（`expires_at` 在过去 → None）/ `secret_for_access_key_rejects_inactive`（`status='inactive'` → None）。
 - **M-2**：`verify_user` 加 `ponytail:` 注释（非常量时间比较 + 用户存在性时序，M1 已接受；M4 换 Argon2 时随方案处置）。
 - **M-4**：`instant_index` 建表处加 `ponytail:` 注释（过期行只增不删、`expires_at` 无索引；升级：set 时顺手清过期行 / 加索引 + 周期清扫）。
@@ -4626,7 +4626,11 @@ async fn register_upload(
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // DB 故障是服务端故障（与 store_error 的 5xx 分档一致）
+        Err(e) => {
+            tracing::error!(error = %e, "登记上传记录失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -4740,7 +4744,8 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
   **GET 形态 403**（s3s 鉴权拒绝，spec-task13 实测；本轮 `login_then_list_buckets` 在 `/api/v1/buckets` 上复现 `left: 403 / right: 401`）、
   **POST 形态 501**（s3s 无对应 op → NotImplemented；本轮 `wrong_password_is_401` 在 `/api/v1/login` 上实测 `left: 501 / right: 401`）。
   并入项只说 403，实测补全为两种形态，上方该行已按实测同步。
-- **`register_upload` 三分支（并入项 2）**：按 I-1 同步后的现文写——`Ok(true) → 204 / Ok(false) → 404 / Err(e) → 400`。
+- **`register_upload` 三分支（并入项 2）**：按 I-1 同步后的现文写——`Ok(true) → 204 / Ok(false) → 404 / Err(e) → 500`
+  （Err 分支的 400→500 修订见下方收尾轮记录与 Task 7 顶部记录）。
   新增测试 `register_upload_hit_is_204_miss_is_404`（Step 1 块外，按 Task 11 先例记在这里）：`record_upload` 后 register → 204、
   `GET /uploads` 能看到 `original_name`、无行 `saved_path` → 404。Err→400 分支需 DB 故障，HTTP 面不构造（db.rs 单测覆盖返回语义）。
 - **过期 AK 边界测试（并入项 3，挂账跳过并说明）**：quality-task7 ② 所指的原用例 `secret_for_access_key_rejects_expired`
@@ -4769,8 +4774,10 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
   （并入项未列这两个变体，「其余 → 500」若把可纠正的冲突吞进 5xx 就违背了本条「说真话」，S3 自身对二者也用 409）。login 拆三态：
   `Ok(None)` → 401 原文案、`Err` → 500 通用 + 日志。`list_uploads`/`list_access_keys` 的 5xx 同样改通用文案 + 日志
   （原样 `e.to_string()` 会泄 sqlite 原文）。测试 `store_error_status_codes` 钉 404/400/409 三条。
-  **保留不动**：`register_upload` 的 `Err → 400` 是 Task 7 I-1 定稿的三分支口径（sqlx 错误非 `xl_store::Error`，M-2 机制上不适用）；
-  若要把 DB 故障改判 500，属三分支口径变更，需另裁。
+  **`register_upload` 的 Err 分支（微调轮裁决）**：该 Err 是 sqlx 错误、非 `xl_store::Error`，M-2 机制上不适用；
+  原先沿 Task 7 I-1 定稿返回 400，经裁决 **改判 500**（通用文案 + `tracing::error!`）——DB 故障是服务端故障，与本条 list_*/create 分档一致。
+  Task 7 的三分支口径就此修订为 **204 / 404 / 500**（Task 7 顶部记录与上方并入项 2 措辞已同步改正）。Err→500 分支在 HTTP 面
+  构造得到：`register_upload_db_failure_is_500`（经池 DROP TABLE uploads 制造 DB 故障，断言 500 + 通用文案不泄内部细节）。
 - **M-3（翻页参数）**：`ListQuery` 加 `limit`/`cursor`（spec §0.3 命名）→ `max_keys`/`continuation_token` 透传，store 零改动。
   **响应按 spec §0.3 补了 `next_cursor`**（与既有 `next_token` 同值；并入项「响应字段不动」按「不删不改既有字段」执行 —— 新增是加性的，
   且是 M1b 前端的契约名）。测试 `objects_pagination_follows_cursor`：2 键 `limit=1` → 第一页 1 键 + `is_truncated` +
