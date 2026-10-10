@@ -532,6 +532,7 @@ export default function Buckets() {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [creating, setCreating] = useState(false)
+  const [newName, setNewName] = useState('')
 
   const { data: buckets = [], isLoading } = useQuery({
     queryKey: ['buckets'],
@@ -555,7 +556,7 @@ export default function Buckets() {
 
   return (
     <>
-      <Button type="primary" onClick={() => setCreating(true)} style={{ marginBottom: 16 }}>
+      <Button type="primary" onClick={() => { setNewName(''); setCreating(true) }} style={{ marginBottom: 16 }}>
         新建桶
       </Button>
       <Table
@@ -563,6 +564,7 @@ export default function Buckets() {
         loading={isLoading}
         dataSource={buckets}
         columns={[
+          // 不用 dataIndex：antd 对 string[] 记录取 dataIndex:0 会拿到首字符（"alpha"→"a"）；无 dataIndex 时 render 第一参即整条记录
           { title: '桶名', render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link> },
           {
             title: '操作',
@@ -580,12 +582,18 @@ export default function Buckets() {
         open={creating}
         onCancel={() => setCreating(false)}
         onOk={() => {
-          const el = document.getElementById('new-bucket-name') as HTMLInputElement | null
-          if (el?.value) create.mutate(el.value)
+          if (!newName) { message.warning('请输入桶名'); return }
+          create.mutate(newName)
         }}
         confirmLoading={create.isPending}
       >
-        <Input id="new-bucket-name" placeholder="3-63 字符，小写字母数字与 - ." autoFocus />
+        <Input
+          id="new-bucket-name"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder="3-63 字符，小写字母数字与 - ."
+          autoFocus
+        />
       </Modal>
     </>
   )
@@ -647,9 +655,10 @@ export default function Objects() {
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['objects', bucket] })
 
+  // 对象键一律整键 encodeURIComponent（删除/下载同款）：axum 的 {*key} 通配段先按路径匹配再解码，%2F 不会被拆段，含空格/#/? 的键才能走对
   const remove = useMutation({
     mutationFn: (key: string) =>
-      api(`/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${key}`, { method: 'DELETE' }),
+      api(`/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`, { method: 'DELETE' }),
     onSuccess: () => { message.success('已删除'); invalidate() },
     onError: (e: Error) => message.error(e.message),
   })
@@ -657,7 +666,7 @@ export default function Objects() {
   const download = async (key: string) => {
     try {
       const resp = await fetch(
-        `/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${key}`,
+        `/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`,
         { headers: { authorization: `Bearer ${localStorage.getItem('oss.token') ?? ''}` } },
       )
       if (!resp.ok) throw new Error(await resp.text())
@@ -1223,7 +1232,8 @@ export default function Keys() {
         loading={isLoading}
         dataSource={keys}
         columns={[
-          { title: 'Access Key', dataIndex: 0 },
+          // 不用 dataIndex：antd 对 string[] 记录取 dataIndex:0 会拿到首字符；无 dataIndex 时 render 第一参即整条记录
+          { title: 'Access Key', render: (ak: string) => ak },
           { title: '说明', render: () => '启用/禁用与过期在 M5；M1 只有创建与使用' },
         ]}
       />

@@ -8,6 +8,7 @@ export default function Buckets() {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [creating, setCreating] = useState(false)
+  const [newName, setNewName] = useState('')
 
   const { data: buckets = [], isLoading } = useQuery({
     queryKey: ['buckets'],
@@ -31,7 +32,7 @@ export default function Buckets() {
 
   return (
     <>
-      <Button type="primary" onClick={() => setCreating(true)} style={{ marginBottom: 16 }}>
+      <Button type="primary" onClick={() => { setNewName(''); setCreating(true) }} style={{ marginBottom: 16 }}>
         新建桶
       </Button>
       <Table
@@ -57,12 +58,18 @@ export default function Buckets() {
         open={creating}
         onCancel={() => setCreating(false)}
         onOk={() => {
-          const el = document.getElementById('new-bucket-name') as HTMLInputElement | null
-          if (el?.value) create.mutate(el.value)
+          if (!newName) { message.warning('请输入桶名'); return }
+          create.mutate(newName)
         }}
         confirmLoading={create.isPending}
       >
-        <Input id="new-bucket-name" placeholder="3-63 字符，小写字母数字与 - ." autoFocus />
+        <Input
+          id="new-bucket-name"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder="3-63 字符，小写字母数字与 - ."
+          autoFocus
+        />
       </Modal>
     </>
   )
