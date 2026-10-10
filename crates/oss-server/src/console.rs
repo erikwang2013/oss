@@ -31,6 +31,7 @@ pub(crate) struct Claims {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/login", post(login))
+        .route("/groups", get(list_groups))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
         .route("/buckets/{bucket}/objects", get(list_objects))
@@ -116,6 +117,14 @@ fn auth(state: &AppState, headers: &HeaderMap) -> Result<i64, StatusCode> {
         .sub
         .parse::<i64>()
         .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+/// 上传分组（oss.toml 的 `[[groups]]`），供上传面板的分组下拉使用。
+async fn list_groups(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(s) = auth(&state, &headers) {
+        return s.into_response();
+    }
+    Json(state.cfg.groups.clone()).into_response()
 }
 
 async fn list_buckets(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

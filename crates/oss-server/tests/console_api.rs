@@ -224,8 +224,9 @@ async fn all_routes_reject_anonymous() {
             "/api/v1/access-keys",
             Some(serde_json::json!({})),
         ),
+        (reqwest::Method::GET, "/api/v1/groups", None),
     ];
-    assert_eq!(cases.len(), 10, "路由表变化时同步此表（11 条 - login）");
+    assert_eq!(cases.len(), 11, "路由表变化时同步此表（12 条 - login）");
 
     for (method, path, body) in cases {
         let mut req = client.request(method.clone(), format!("{base}{path}"));
@@ -374,6 +375,29 @@ async fn objects_pagination_follows_cursor() {
         .unwrap();
     assert_eq!(page2["objects"].as_array().unwrap().len(), 1);
     assert_eq!(page2["objects"][0]["key"], "b.txt");
+}
+
+/// Task 7（M1b）：上传面板分组下拉的数据源 —— `oss.toml` 的 `[[groups]]` 原样透出。
+#[tokio::test]
+async fn list_groups_returns_configured_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await; // common::state() 里已配 file → files
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st)).await;
+    let token = login_token(&base).await;
+
+    let groups: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/groups"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(groups[0]["group"], "file");
+    assert_eq!(groups[0]["bucket"], "files");
 }
 
 /// M-4：自定 AK/SK 的最小校验（400 自己的文案）与 UNIQUE 冲突说人话（不泄 sqlite 原文）。

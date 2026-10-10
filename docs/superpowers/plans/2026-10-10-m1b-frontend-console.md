@@ -783,7 +783,7 @@ git commit -m "feat(web): 对象浏览器（前缀导航/下载/删除）"
 - Modify: `crates/oss-server/src/console.rs`（新路由）
 - Test: `crates/oss-server/tests/console_api.rs`
 
-- [ ] **Step 1: 写失败的测试**（追加到 `console_api.rs`）
+- [x] **Step 1: 写失败的测试**（追加到 `console_api.rs`）
 
 ```rust
 #[tokio::test]
@@ -815,12 +815,12 @@ async fn list_groups_returns_configured_groups() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p oss-server --test console_api list_groups 2>&1 | tail -8`
 Expected: FAIL（404）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `config.rs`：`GroupTarget` 的 derive 加 `Serialize`（文件顶部 `use serde::{Deserialize, Serialize};` 或合并到现有 use）：
 
@@ -848,12 +848,12 @@ async fn list_groups(State(state): State<AppState>, headers: HeaderMap) -> impl 
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p oss-server 2>&1 | tail -8`
 Expected: 全绿
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/oss-server/ && git commit -m "feat(server): GET /api/v1/groups（上传分组）"
@@ -1502,4 +1502,5 @@ git add README.md && git commit -m "docs: 控制台使用说明与 1GB 上传清
 | antd 双字按钮文案带空格（「确 定」） | e2e 用 `/确\s*定/` 正则匹配 |
 | 秒传用例在旧数据目录上误判 | 用例的文件内容带时间戳，第一次必然走真分块 |
 | `/aetherupload-assets` 被代理吞掉 | 代理键写成 `'/aetherupload/'`（带尾斜杠），Task 1 已注明 |
+| 将来加 CORS 时预检被 401 吃掉 | `CorsLayer` 必须叠在 `/aetherupload` 的 auth 中间件**之外**，否则预检 OPTIONS 会被 401（质量评审结论） |
 

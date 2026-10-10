@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -19,7 +19,7 @@ pub struct AppConfig {
     pub groups: Vec<GroupTarget>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GroupTarget {
     /// aetherupload 的分组名（**不能含下划线**）
     pub group: String,
