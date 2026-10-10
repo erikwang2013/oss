@@ -3547,7 +3547,7 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): 对象 CRUD 与批量删除
 **Files:**
 - Modify: `crates/xl-s3/src/service.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 // 追加到 crates/xl-s3/tests/object_ops.rs
@@ -3596,27 +3596,92 @@ async fn copy_object_copies_bytes() {
     let got = s3.get_object(req(GetObjectInput { bucket: "alpha".into(), key: "dst".into(), ..Default::default() })).await.unwrap().output;
     assert_eq!(got.content_length, Some(4));
 }
+
+// 评审挂载项（并入本轮）：负数 max-keys 防护
+#[tokio::test]
+async fn list_objects_v2_rejects_negative_max_keys() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "alpha".into(), ..Default::default() })).await.unwrap();
+
+    // i32 → usize 的 `as` 对负数会回绕成巨值，再被 store 的 .min(1000) 钳成 1000 ——
+    // 非法参数被静默当默认值。口径：max-keys < 0 → InvalidRequest。
+    let err = s3.list_objects_v2(req(ListObjectsV2Input {
+        bucket: "alpha".into(), max_keys: Some(-1), ..Default::default()
+    })).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+}
+
+// 评审挂载项（并入本轮）：规格 §3.5 边界「源 = 目标 → InvalidRequest」
+#[tokio::test]
+async fn copy_object_rejects_same_source_and_destination() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "alpha".into(), ..Default::default() })).await.unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(), key: "src".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))), ..Default::default()
+    })).await.unwrap();
+
+    // M1 无 metadata-directive REPLACE / 存储类变更概念，同桶同键一律拒
+    let err = s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("alpha".to_string())
+        .key("src".to_string())
+        .copy_source(CopySource::Bucket { bucket: "alpha".into(), key: "src".into(), version_id: None })
+        .build()
+        .unwrap())).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+}
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-s3 --test object_ops 2>&1 | tail -20`
 Expected: 编译错误 / `NotImplemented`
 
-- [ ] **Step 3: 实现**
+实测：编译通过，4 个新用例失败形态均为运行时 `NotImplemented`（同 Task 11 Step 2 注记）；两个补强的 delete 用例当时实现已通过。
+
+- [x] **Step 3: 实现**
+
+> 上方块已按最终形态同步（含评审挂载项：负数 max-keys 防护、src == dst 拒绝；见下方定稿记录）。
+> 块内只含方法体：`use xl_store::store::{ListRequest, Store};` 由顶层 imports 提供。
 
 ```rust
 // 追加到 impl S3 for OssS3
-    async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let ListObjectsV2Input { bucket, prefix, delimiter, max_keys, continuation_token, .. } = req.input;
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let ListObjectsV2Input {
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            continuation_token,
+            ..
+        } = req.input;
 
-        let result = self.store
-            .list_objects(&bucket, &xl_store::store::ListRequest {
-                prefix,
-                delimiter,
-                max_keys: max_keys.map(|m| m as usize),
-                continuation_token,
-            })
+        // max-keys < 0：i32 → usize 的 `as` 会回绕成巨值、再被 store 的 .min(1000) 钳成 1000，
+        // 非法参数被静默当默认值。报 InvalidRequest，不猜客户端意图。
+        let max_keys = match max_keys {
+            Some(m) if m < 0 => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "max-keys must not be negative"
+                ));
+            }
+            other => other.map(|m| m as usize),
+        };
+
+        let result = self
+            .store
+            .list_objects(
+                &bucket,
+                &ListRequest {
+                    prefix,
+                    delimiter,
+                    max_keys,
+                    continuation_token,
+                },
+            )
             .await
             .map_err(to_s3_error)?;
 
@@ -3628,7 +3693,9 @@ Expected: 编译错误 / `NotImplemented`
                 size: Some(o.size as i64),
                 e_tag: Some(ETag::Strong(o.etag.clone())),
                 last_modified: Some(last_modified(o.last_modified_nanos)),
-                storage_class: Some(ObjectStorageClass::from("STANDARD")),
+                storage_class: Some(ObjectStorageClass::from_static(
+                    ObjectStorageClass::STANDARD,
+                )),
                 ..Default::default()
             })
             .collect();
@@ -3638,7 +3705,11 @@ Expected: 编译错误 / `NotImplemented`
             contents: Some(contents),
             key_count: Some(result.objects.len() as i32),
             common_prefixes: Some(
-                result.common_prefixes.into_iter().map(|p| CommonPrefix { prefix: Some(p) }).collect(),
+                result
+                    .common_prefixes
+                    .into_iter()
+                    .map(|p| CommonPrefix { prefix: Some(p) })
+                    .collect(),
             ),
             is_truncated: Some(result.is_truncated),
             next_continuation_token: result.next_token,
@@ -3646,13 +3717,31 @@ Expected: 编译错误 / `NotImplemented`
         }))
     }
 
-    async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
         // s3s 已将 x-amz-copy-source 解码、去掉前导 '/' 并解析成枚举；这里只接受桶形式
-        let CopySource::Bucket { ref bucket, ref key, .. } = req.input.copy_source else {
+        let CopySource::Bucket {
+            ref bucket,
+            ref key,
+            ..
+        } = req.input.copy_source
+        else {
             return Err(s3s::s3_error!(InvalidRequest, "unsupported copy source"));
         };
 
-        let info = self.store
+        // 规格 §3.5 边界：M1 无 metadata-directive REPLACE / 存储类变更概念，
+        // src == dst（同桶同键）一律拒（S3 语义：InvalidRequest）
+        if bucket.as_ref() == req.input.bucket.as_str() && key.as_ref() == req.input.key.as_str() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "copy source and destination are the same"
+            ));
+        }
+
+        let info = self
+            .store
             .copy_object(bucket, key, &req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
@@ -3669,16 +3758,30 @@ Expected: 编译错误 / `NotImplemented`
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-s3 2>&1 | tail -12`
 Expected: 全绿
 
-- [ ] **Step 5: 提交**
+实测：`object_ops` 10 passed（原 6 + 本轮 4）；四闸全绿（fmt / clippy 0 告警 / `-p xl-s3` / `--workspace -j 2`）。
+
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/xl-s3/ && git commit -m "feat(xl-s3): ListObjectsV2 与 CopyObject"
 ```
+
+### 定稿记录
+
+- Step 3 块已同步为最终形态（`cargo fmt` 展开 + 本轮挂载项）；另在顶层 imports 加 `use xl_store::store::{ListRequest, Store};`（块内只含方法体，未含 imports）。
+- `ObjectStorageClass::from("STANDARD")` 编译不过（s3s 只实现 `From<String>` / `from_static`，无 `From<&str>`），按「执行前必读」第 1 条以编译器为准改为 `ObjectStorageClass::from_static(ObjectStorageClass::STANDARD)`。
+- **负数 max-keys 防护（评审挂载）**：`max_keys.map(|m| m as usize)` 对负数会 `as` 回绕成巨值，再被 store 的 `.min(1000)` 钳成 1000 —— 非法参数静默变默认值。口径：`m < 0 → InvalidRequest`（与 `delete_objects` 超 1000 键同码）。测试 `list_objects_v2_rejects_negative_max_keys`。
+- **`copy_object` 源=目标检查（规格 §3.5；评审挂载）**：同桶同键在调 store 之前拒 `InvalidRequest`（M1 无 REPLACE / 存储类变更概念，凡 src == dst 即拒）；`CopySource` 非桶形式（AccessPoint / Outpost ARN）同样 `InvalidRequest`。测试 `copy_object_rejects_same_source_and_destination`。
+- **`delete_objects` 测试补强（上轮评审残余；挂载项 3）**：混批顺序改为 `ok1` / `a//b`（非法）/ `ok2`，断言 `deleted` 恰为 `[ok1, ok2]` 且两键删后 head 均 404 —— 钉「键级错误后继续且不回滚」；新增 `delete_objects_accepts_exactly_1000_keys`（恰 1000 通过，与既有 `>1000 → InvalidRequest` 成对）。实现未动。按本文件惯例，测试补强记在定稿记录、不重写 Task 11 Step 1 块。
+- 实际测试文件相对上方 Step 1 块另加断言（不改变块语义）：`list_objects_v2_prefix_delimiter_and_paging` 断言 contents 键序与 `key_count`、`is_truncated=false`，并跟随 `next_continuation_token` 取第二页、拼回全量 4 键（无重无漏）；`copy_object_copies_bytes` 收 body 字节断言 `== b"copy"`（不只长度）。与 Task 11 的「钉字节」评审口径一致。
+- 计划 Task 12 块内无 `percent_decode` 等作废代码（该批 API 臆测已在前几轮探针清理），无需删改；块内 `xl_store::store::ListRequest` 行内路径按上方同步改为顶层 import——语义不变。
+- 口径观察（留给评审裁决，本轮未改）：`CopyObjectResult.last_modified` 按计划保持 `None`；真实 S3 返回 LastModified，M1 规格未要求。若评审要求，改用 `info.last_modified_nanos`（与 `get/head_object` 同一翻译）。
+- 口径注：`max-keys` 上限 >1000 由 store 静默钳到 1000（Task 4 定稿），本轮只增负数拒绝，未动钳位语义。
 
 ---
 

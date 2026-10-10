@@ -7,7 +7,7 @@ use bytes::Bytes;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
-use xl_store::store::Store;
+use xl_store::store::{ListRequest, Store};
 
 use crate::convert::to_s3_error;
 
@@ -224,6 +224,116 @@ impl S3 for OssS3 {
         Ok(S3Response::new(DeleteObjectsOutput {
             deleted: (!deleted.is_empty()).then_some(deleted),
             errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
+    }
+
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let ListObjectsV2Input {
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            continuation_token,
+            ..
+        } = req.input;
+
+        // max-keys < 0：i32 → usize 的 `as` 会回绕成巨值、再被 store 的 .min(1000) 钳成 1000，
+        // 非法参数被静默当默认值。报 InvalidRequest，不猜客户端意图。
+        let max_keys = match max_keys {
+            Some(m) if m < 0 => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "max-keys must not be negative"
+                ));
+            }
+            other => other.map(|m| m as usize),
+        };
+
+        let result = self
+            .store
+            .list_objects(
+                &bucket,
+                &ListRequest {
+                    prefix,
+                    delimiter,
+                    max_keys,
+                    continuation_token,
+                },
+            )
+            .await
+            .map_err(to_s3_error)?;
+
+        let contents: ObjectList = result
+            .objects
+            .iter()
+            .map(|o| Object {
+                key: Some(o.key.clone()),
+                size: Some(o.size as i64),
+                e_tag: Some(ETag::Strong(o.etag.clone())),
+                last_modified: Some(last_modified(o.last_modified_nanos)),
+                storage_class: Some(ObjectStorageClass::from_static(
+                    ObjectStorageClass::STANDARD,
+                )),
+                ..Default::default()
+            })
+            .collect();
+
+        Ok(S3Response::new(ListObjectsV2Output {
+            name: Some(bucket),
+            contents: Some(contents),
+            key_count: Some(result.objects.len() as i32),
+            common_prefixes: Some(
+                result
+                    .common_prefixes
+                    .into_iter()
+                    .map(|p| CommonPrefix { prefix: Some(p) })
+                    .collect(),
+            ),
+            is_truncated: Some(result.is_truncated),
+            next_continuation_token: result.next_token,
+            ..Default::default()
+        }))
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        // s3s 已将 x-amz-copy-source 解码、去掉前导 '/' 并解析成枚举；这里只接受桶形式
+        let CopySource::Bucket {
+            ref bucket,
+            ref key,
+            ..
+        } = req.input.copy_source
+        else {
+            return Err(s3s::s3_error!(InvalidRequest, "unsupported copy source"));
+        };
+
+        // 规格 §3.5 边界：M1 无 metadata-directive REPLACE / 存储类变更概念，
+        // src == dst（同桶同键）一律拒（S3 语义：InvalidRequest）
+        if bucket.as_ref() == req.input.bucket.as_str() && key.as_ref() == req.input.key.as_str() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "copy source and destination are the same"
+            ));
+        }
+
+        let info = self
+            .store
+            .copy_object(bucket, key, &req.input.bucket, &req.input.key)
+            .await
+            .map_err(to_s3_error)?;
+
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(ETag::Strong(info.etag)),
+                last_modified: None,
+                ..Default::default()
+            }),
             ..Default::default()
         }))
     }
