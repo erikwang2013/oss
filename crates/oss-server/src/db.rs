@@ -167,6 +167,17 @@ impl Db {
         Ok(())
     }
 
+    /// 按前缀清空秒传索引（`InstantIndex::delete_all` 的落点）。
+    /// 前缀只来自 aetherupload 的 `KEY_PREFIX`（`aetherupload:resource:`，无 LIKE 通配符），
+    /// 故直接 LIKE 匹配，不做转义。
+    pub async fn instant_delete_prefix(&self, prefix: &str) -> Result<()> {
+        sqlx::query("DELETE FROM instant_index WHERE k LIKE ? || '%'")
+            .bind(prefix)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn record_upload(
         &self,
         saved_path: &str,
@@ -281,6 +292,39 @@ mod tests {
         assert_eq!(db.instant_get("k").await.unwrap().as_deref(), Some("v"));
         db.instant_set("expired", "v", 0).await.unwrap();
         assert_eq!(db.instant_get("expired").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn instant_delete_prefix_clears_only_that_prefix() {
+        let db = db().await;
+        db.instant_set("aetherupload:resource:file_a", "v1", 3600)
+            .await
+            .unwrap();
+        db.instant_set("aetherupload:resource:file_b", "v2", 3600)
+            .await
+            .unwrap();
+        db.instant_set("other", "keep", 3600).await.unwrap();
+
+        db.instant_delete_prefix("aetherupload:resource:")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.instant_get("aetherupload:resource:file_a")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.instant_get("aetherupload:resource:file_b")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.instant_get("other").await.unwrap().as_deref(),
+            Some("keep")
+        );
     }
 
     #[tokio::test]

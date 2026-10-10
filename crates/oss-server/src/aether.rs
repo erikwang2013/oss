@@ -8,8 +8,11 @@ use std::sync::Arc;
 use aetherupload::Runtime;
 use aetherupload::config::{Config, GroupConfig, StorageDriver, SubdirRule};
 use aetherupload::events::EventSink;
-use aetherupload::instant::InstantStore;
+use aetherupload::instant::{InstantIndex, InstantStore, KEY_PREFIX};
 use aetherupload::resource::Resource;
+use aetherupload::saved_path::SavedPath;
+use futures::StreamExt as _;
+use tokio_util::io::ReaderStream;
 
 use crate::config::AppConfig;
 use crate::db::Db;
@@ -38,20 +41,28 @@ impl SqlInstantStore {
     }
 }
 
+/// SQL 错误 → aetherupload 错误。这里有且只有这一处观测点：内核把索引访问的失败
+/// 一概当作「未命中」（`instant_lookup` 吞掉 Err），不 warn 就完全不可见。变体保持 Io 不换。
+fn store_err(e: sqlx::Error) -> aetherupload::Error {
+    tracing::warn!(error = %e, "秒传索引访问失败");
+    aetherupload::Error::Io(std::io::Error::other(e.to_string()))
+}
+
 impl InstantStore for SqlInstantStore {
     fn get(&self, key: &str) -> aetherupload::Result<Option<String>> {
-        block_on(self.db.instant_get(key))
-            .map_err(|e| aetherupload::Error::Io(std::io::Error::other(e.to_string())))
+        block_on(self.db.instant_get(key)).map_err(store_err)
     }
 
     fn set_ex(&self, key: &str, value: &str, ttl_seconds: u64) -> aetherupload::Result<()> {
-        block_on(self.db.instant_set(key, value, ttl_seconds))
-            .map_err(|e| aetherupload::Error::Io(std::io::Error::other(e.to_string())))
+        block_on(self.db.instant_set(key, value, ttl_seconds)).map_err(store_err)
     }
 
     fn del(&self, key: &str) -> aetherupload::Result<()> {
-        block_on(self.db.instant_del(key))
-            .map_err(|e| aetherupload::Error::Io(std::io::Error::other(e.to_string())))
+        block_on(self.db.instant_del(key)).map_err(store_err)
+    }
+
+    fn delete_prefix(&self, prefix: &str) -> aetherupload::Result<()> {
+        block_on(self.db.instant_delete_prefix(prefix)).map_err(store_err)
     }
 }
 
@@ -74,6 +85,27 @@ impl IngestSink {
         };
         Some((bucket, key))
     }
+
+    /// 把这份内容从秒传索引里摘掉（best-effort，失败只告警）。
+    ///
+    /// 不清的后果是「钉死」：ingest 失败后索引仍在，同内容重传会命中秒传、
+    /// 拿到一个根本没进桶的 savedPath（规格 §5.4：宁可让用户重传）。
+    fn clear_instant_index(&self, resource: &Resource) {
+        // 索引键 = `KEY_PREFIX + <group>_<整份 md5>`：md5 即成品名 `<md5>.<ext>` 的 file_stem
+        // （控制器 `get_file_name(real_hash, ext)` → `InstantIndex::key(group, hash)`，upload.rs:390-398）。
+        let Some(stem) = std::path::Path::new(&resource.name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        else {
+            return;
+        };
+        let Ok(key) = InstantIndex::key(&resource.group, stem) else {
+            return;
+        };
+        if let Err(e) = block_on(self.db.instant_del(&format!("{KEY_PREFIX}{key}"))) {
+            tracing::warn!(error = %e, "清秒传索引失败（该内容可能仍被钉死）");
+        }
+    }
 }
 
 impl EventSink for IngestSink {
@@ -83,23 +115,25 @@ impl EventSink for IngestSink {
             return;
         };
 
-        // 事件里抛错等同于上传失败 —— 这里必须把错误传播出去（panic 会被控制器接住并清理临时文件）
+        // aetherupload 的 ecat controller 以 catch_unwind 吞掉回调 panic、响应仍为成功
+        // （`emit_safely`，upload.rs:465）；本 sink 以 panic + tracing::error 保证服务端可见，
+        // 并清索引防钉死。
         let result = block_on(async {
-            let bytes = tokio::fs::read(&resource.path).await?;
-            let size = bytes.len() as u64;
+            // 流式进内核：大文件不再整份驻留内存（tokio-util 的 ReaderStream 直接套文件句柄）
+            let file = tokio::fs::File::open(&resource.path).await?;
+            let size = file.metadata().await?.len();
+            let stream = ReaderStream::new(file).map(|r| r.map_err(xl_store::error::Error::from));
             let info = self
                 .store
-                .put_object(&bucket, &key, bytes.into(), None)
+                .put_object_stream(&bucket, &key, Box::pin(stream), None)
                 .await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((size, info))
         });
 
         match result {
             Ok((size, info)) => {
-                let saved_path = format!(
-                    "{}_{}_{}",
-                    resource.group, resource.group_sub_dir, resource.name
-                );
+                let saved_path =
+                    SavedPath::encode(&resource.group, &resource.group_sub_dir, &resource.name);
                 if let Err(e) = block_on(self.db.record_upload(
                     &saved_path,
                     &bucket,
@@ -113,6 +147,7 @@ impl EventSink for IngestSink {
             }
             Err(e) => {
                 tracing::error!(error = %e, "ingest 失败");
+                self.clear_instant_index(resource);
                 panic!("ingest 失败: {e}");
             }
         }
@@ -147,14 +182,20 @@ pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
     let runtime = Runtime::new(cfg, "")
         .expect("aetherupload Runtime 构造失败")
         .with_instant(Arc::new(SqlInstantStore::new(Arc::clone(&state.db))))
-        .with_events(Arc::new(IngestSink {
-            store: Arc::clone(&state.store),
-            db: Arc::clone(&state.db),
-            cfg: Arc::clone(&state.cfg),
-        }));
+        // Arc<IngestSink> → Arc<dyn EventSink>：显式转换，否则 clone 的返回类型不做 unsize 推断
+        .with_events(Arc::clone(&state.ingest) as Arc<dyn EventSink>); // 与 AppState 是同一个实例（测试打到生产那个）
 
     // 分组目录必须先存在，否则预处理会报笼统的上传错误。aetherupload 自带 e2e 也是用 list_groups 建的。
-    let _ = aetherupload::console::list_groups(&runtime, &mut |_| {});
+    let code = aetherupload::console::list_groups(
+        &runtime,
+        &mut |m| tracing::debug!(msg = %m, "aetherupload 分组目录"),
+    );
+    if code != 0 {
+        tracing::error!(
+            code,
+            "aetherupload 分组目录准备失败（预处理会报笼统的上传错误）"
+        );
+    }
 
     // `_header/`（断点文件目录）单独补建：list_groups 只在它自己新建根目录时顺带建 `_header/`，
     // 而启动自举早已建好 staging_dir —— 不补这一下，预处理会以 "fail to write head resource" 失败。

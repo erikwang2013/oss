@@ -1788,6 +1788,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "xl-s3",
