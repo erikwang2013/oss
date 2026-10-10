@@ -43,7 +43,7 @@ export default function UploadPanel({
   const { start } = useUpload({
     onFinished: async (outcome) => {
       setBusy(false) // 先复位：后面的 register 上报失败也不影响
-      // 脚本成功后会给 input 置 disabled（aetherupload-all.js 227/327 行）；不清掉的话
+      // 脚本成功后会给 input 置 disabled（aetherupload-all.js 上游 227/327 行 / 本地 243/343 行）；不清掉的话
       // 「选择文件」按钮的 click 落在 disabled input 上无任何反应——真人没法在同面板再选（秒传演示就断了）。
       // useUpload.start 里那处清理只在 change 事件能触发时才轮得到，救不了这一手。
       fileRef.current?.removeAttribute('disabled')

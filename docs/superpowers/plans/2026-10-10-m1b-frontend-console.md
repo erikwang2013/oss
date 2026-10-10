@@ -1123,7 +1123,7 @@ git commit -m "feat(web): useUpload 驱动 aetherupload-all.js（含秒传判定
   原因：cookie 是同一凭据的第二份拷贝，必须与 localStorage 同生命周期；散在登录页写、却没有任何
   地方清，401 清 token 或将来加登出后都会留下一个带着废弃凭据的 cookie。
 - **I-2 input disabled 复位**：`useUpload.start` 开头 `fileInput.removeAttribute('disabled')`。
-  原因：vendored 脚本上传成功后会给 `#aetherupload-resource` 置 `disabled`（aetherupload-all.js 227/327 行），
+  原因：vendored 脚本上传成功后会给 `#aetherupload-resource` 置 `disabled`（aetherupload-all.js 上游 227/327 行 / 本地 243/343 行），
   而该节点由 React 渲染、重渲染不会复位——同面板二次上传必然卡死在这行上。
 
 Minor（同轮）：`restore` 仅在 `window.XMLHttpRequest === Counting` 时还原（后装先还原不踩更晚的包装）；
@@ -1202,7 +1202,7 @@ export default function UploadPanel({
   const { start } = useUpload({
     onFinished: async (outcome) => {
       setBusy(false) // 先复位：后面的 register 上报失败也不影响
-      // 脚本成功后会给 input 置 disabled（aetherupload-all.js 227/327 行）；不清掉的话
+      // 脚本成功后会给 input 置 disabled（aetherupload-all.js 上游 227/327 行 / 本地 243/343 行）；不清掉的话
       // 「选择文件」按钮的 click 落在 disabled input 上无任何反应——真人没法在同面板再选（秒传演示就断了）。
       // useUpload.start 里那处清理只在 change 事件能触发时才轮得到，救不了这一手。
       fileRef.current?.removeAttribute('disabled')
@@ -1383,8 +1383,11 @@ FormData + `processData: false` + `contentType: false`（zepto 原生支持）�
 （计划「执行前必读」第 2 条）。文件名留档仍用共享 `originalNameRef`（按次闭包需改 `useUpload` 签名，
 而该 hook 已有 3 条承诺测试，不动更稳）。
 
+**残留（共享 ref 决策的代价）**：上传进行中关闭面板→重开，会解除 busy 护栏（`close()` 复位）；
+该路径下并发选文件仍可致 `original_name` 错配（对象数据无损）。
+
 **另加一条自测发现的交互缺陷（同轮修复）**：脚本成功后会给自己那个 input 置 `disabled`
-（227/327 行），而「选择文件并开始上传」的 click 落在 disabled input 上**不派发任何事件**——真人第一次上传成功后，
+（上游 227/327 行 / 本地 243/343 行），而「选择文件并开始上传」的 click 落在 disabled input 上**不派发任何事件**——真人第一次上传成功后，
 同面板再点按钮毫无反应，「同一文件再选一次看秒传」在真浏览器里不可达（Playwright 的 `setInputFiles`
 绕过可操作性检查，所以 e2e 照写也照样绿，只有人工点才发现）。修法：`onFinished` 里
 `fileRef.current?.removeAttribute('disabled')`，并用 `filechooser` 事件走了真人路径复验（首传后按钮 enabled
@@ -1405,7 +1408,7 @@ M2 按钮 `loading={!window.aetherupload ? true : undefined}` 改为 `disabled={
 **Files:**
 - Modify: `web/src/pages/Keys.tsx`
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
 
 ```tsx
 import { useState } from 'react'
@@ -1463,11 +1466,11 @@ export default function Keys() {
 }
 ```
 
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 `/keys`：新建 → 弹窗显示 AK/SK（点复制可用）；列表出现新 AK；用该 AK 配 `aws-cli` 能 `aws s3 ls`（M1a 验收的无损回归）。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Keys.tsx
