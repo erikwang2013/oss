@@ -4274,6 +4274,18 @@ git add crates/oss-server/ && git commit -m "feat(server): aetherupload 接线 +
   `as Arc<dyn EventSink>`，`Arc::clone` 的返回值不做 unsize 推断，编译器要求写明），删掉第二处 IngestSink 构造
   —— 测试与生产是同一个实例。
 - **I-3**：风险表加「`/aetherupload/*` 无认证层、匿名可写」一行（见文末表）；README 一句话由 Task 16 补。
+- **`/aetherupload/*` 最小 JWT 鉴权层（终审不确定性 5 的用户裁决；M1a 终审通过后的唯一追加项）**：
+  规格 §0.1 的「会话 Cookie/JWT 覆盖层（M1 起）」此前两份计划均无落点（I-3）。定稿：`router.rs` 在
+  `aetherupload::integrations::ecat::routes(...)` 返回的 `Router<()>` 上 `.layer(middleware::from_fn(...))`，
+  闭包捕获 `jwt_secret`——不把 aether 路由挂 AppState，`with_state(())` 的 state 口径不变。凭据取
+  cookie `oss_token`（优先，手写分号切分、不引 cookie 库）或 `Authorization: Bearer`（curl/工具便利）；
+  校验与 console.rs 同款（`decode::<Claims>` + `Validation::default()`；`Claims` 提升 `pub(crate)` 两处共用）；
+  失败一律 401 纯文本「unauthorized」，不区分缺/坏/过期。测试 `tests/aether_auth.rs`：四条路由匿名 401
+  （POST 带合法 body，钉 auth 先于提取器）、cookie（含多 cookie 串）/ Bearer 两种来源登录 token 均 200
+  且 `error:0`、伪造与过期 token 两种来源均 401；反证实测：临时短路 `aether_authorized` → 两个负例测试红
+  （匿名 preprocess 变 200），复原即绿。**M1b 衔接**：前端登录成功处需种
+  `document.cookie = "oss_token=<jwt>; path=/; SameSite=Lax"`——aetherupload 自带脚本已 `withCredentials: true`，
+  cookie 会随分块请求自动带上，否则浏览器链路 401。
 - **四条路由的真机实测（收尾轮，覆盖 Task 16 脚本不碰的 aether 链路）**：起真服务后
   ① `preprocess` → `{"error":0,...}`；② `uploading`（单块，hello world / md5 `5eb63bbb…`）→
   `{"error":0,"savedPath":"file_202610_5eb63bbb….txt"}`，对象落盘 `data/files/202610__XLDIR__<md5>.txt/`
@@ -5013,7 +5025,7 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 | 损坏的 `xl.meta` 让 PUT fail-closed（报错，不静默覆盖） | 有意为之（M-6 裁决）：解码失败/键不一致时不把旧 meta 当「无对象」继续写，避免毁掉盘上旧数据；处置靠人工修复或删该对象，**不做自动覆盖** |
 | `tmp` / `trash` 无回收器（规格评审观察 C） | M1 只保证不可见（读路径只信 `xl.meta`）；孤儿目录随 M2 的启动自检与 GC 清理，当前仅占盘 |
 | 删除路径残留（`remove_dir_all` 部分失败/崩溃，留下无 meta 的垃圾目录） | 不可见（读路径只信 `xl.meta`，列举跳过无 meta 的目录），但会让桶「非空」而删不掉（`BucketNotEmpty`）→ M2 的 fsck 清理垃圾目录 |
-| **`/aetherupload/*` 四条路由无认证层，匿名可写**（质量评审 I-3） | 规格 §0.1 提的「会话 Cookie/JWT 覆盖层」在 M1a/M1b 计划里均无落点；四条路由当前匿名可达（预处理/分块/展示/下载）。处置：M1 收尾时向用户裁决是否补最小鉴权（如仅允许回环或加静态 token），否则随部署形态（M2）接。README 的已知限制由 Task 16 补一句 |
+| **`/aetherupload/*` 四条路由无认证层，匿名可写**（质量评审 I-3） | **已缓解**：终审不确定性 5 的用户裁决为补最小鉴权，四条路由现挂 JWT 覆盖层（cookie `oss_token` 或 Bearer；`router.rs`，见 Task 14 定稿记录追加条）。**衔接**：M1b 前端需在登录成功处种 cookie，否则浏览器链路 401。彻底的角色/策略模型仍随部署形态（M2/M4）接 |
 | **`record_upload` 失败：uploads 行缺失但秒传索引已写**（质量评审 Minor 4） | 索引里的 `savedPath` 指向已进桶的对象，但 `register_upload` 永远 404（无行可更新），且同内容**重传不补**（秒传命中即返回，不再触发 ingest/记录）→ 该内容在控制台不可见。M1 记录失败只 `tracing::error!`；处置：M2 把「写索引」挪到 ingest 成功之后，或让 register 支持 upsert |
 | 桶级互斥缺失（`store.rs` 的 `delete_bucket` ponytail 注释，终审 Minor 4） | 并发 `delete_bucket` + `put_object` 可让桶「复活」（删目录与写对象目录竞态）；M2 用桶级锁或原子删除语义处理 |
 | 单个损坏的 `xl.meta`（`CorruptMeta`）会让整桶列举 500（终审不确定性 2） | 列举逐对象 `read_meta`，遇损坏即整个请求失败（`list_objects` 用 `?` 传播，最终 500）。读路径 fail-closed 是有意的（不静默服务错位内容），但影响面从单对象扩到整桶列举（管理面）；M2 fsck 前需人工处理该对象 |

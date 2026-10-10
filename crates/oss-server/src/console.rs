@@ -21,8 +21,9 @@ pub struct LoginResponse {
     pub token: String,
 }
 
+/// 控制台与 aether 鉴权层（`router.rs`）共用的 token 载荷。
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Claims {
+pub(crate) struct Claims {
     sub: String,
     exp: usize,
 }

@@ -30,14 +30,15 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > 只在自建根目录时顺带建它）；若预处理报笼统的上传错误，先检查暂存盘目录是否被清理。
 
 > 已知限制：
-> - M1 的 `/aetherupload/*` 四条路由**无认证层（匿名可写）**，勿暴露公网；认证覆盖层随部署形态（M2）落地。
+> - `/aetherupload/*` 四条路由**需 JWT**：登录后带 cookie `oss_token` 或 `Authorization: Bearer <token>` 访问
+>   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M2/M4）。
 > - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
 > - 单段 PUT 上限 256 MiB（`max_put_bytes`）。
 > - Multipart 与 Range 未实现（M2）：≥8 MiB 的 `aws-cli s3 cp` 默认走 multipart → 501；Range 被忽略（200 + 全量）。
 >   变通：`aws configure set default.s3.multipart_threshold 268435456`。
 > - `x-amz-meta-*` 用户元数据**静默丢弃**（M2 接上）。
 > - `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须换成回环绑定与随机密钥
->   （与上面 `/aetherupload/*` 匿名可写合用即 LAN 风险面）。
+>   （占位密钥可被用来伪造控制台与 `/aetherupload/*` 的 token；与 0.0.0.0 绑定合用即 LAN 风险面）。
 
 ## 验收
 
