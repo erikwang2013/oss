@@ -1248,8 +1248,16 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): Store 打开与桶操
         // 必须能读出一份完整的、单一写入者的内容（不能是交错损坏）
         let info = s.head_object("alpha", "same").await.unwrap();
         assert_eq!(info.size, 64);
+
+        let (info, body) = s.get_object("alpha", "same").await.unwrap();
+        assert_eq!(info.size, 64);
+        assert_eq!(body.len(), 64);
+        // 读回内容必须是某个写入者一次写入的 64 字节（单一重复值），不能是拼接/交错/截断产生的碎片
+        assert!(
+            body.iter().all(|b| *b == body[0]),
+            "读回内容不是单次完整写入: {body:?}"
+        );
     }
-```
 ```
 
 - [x] **Step 2: 跑测试确认失败**
@@ -1510,7 +1518,6 @@ fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 ```
-```
 
 `md-5` 的 crate 名是 `md-5`，导入路径是 `md5`（`use md5::{Digest as _, Md5}`）。
 
@@ -1589,14 +1596,19 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
 **Files:**
 - Modify: `crates/xl-store/src/store.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
+// >>> 追加到 store.rs 的 tests 模块末尾（Task 6 段落，逐字取自最终实现）：
+    // ---- Task 6: 读 / 删 / 列举 / 复制 ----
+
     #[tokio::test]
     async fn get_reads_back_exact_bytes() {
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        s.put_object("alpha", "k", bytes::Bytes::from_static(b"payload"), None).await.unwrap();
+        s.put_object("alpha", "k", bytes::Bytes::from_static(b"payload"), None)
+            .await
+            .unwrap();
         let (info, bytes) = s.get_object("alpha", "k").await.unwrap();
         assert_eq!(bytes, bytes::Bytes::from_static(b"payload"));
         assert_eq!(info.etag, {
@@ -1610,24 +1622,71 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
     async fn get_missing_key() {
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        assert!(matches!(s.get_object("alpha", "nope").await, Err(Error::NoSuchKey(_))));
+        assert!(matches!(
+            s.get_object("alpha", "nope").await,
+            Err(Error::NoSuchKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_dangling_meta_version_reports_no_such_key() {
+        // 并发覆写窗口的现实形态：xl.meta 指向的版本目录已被移走（覆写者提交后把它扔进 trash）。
+        // 读路径重读 meta 重试一次后必须报 NoSuchKey —— 不得 panic，也不得把裸 IO 错误抛给上层。
+        let (s, d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+        let m = XlMeta::decode(
+            &tokio::fs::read(obj_dir.join(meta::META_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        tokio::fs::remove_dir_all(obj_dir.join(&m.latest().unwrap().part.uuid))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.get_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
     }
 
     #[tokio::test]
     async fn list_with_prefix_and_delimiter() {
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        for k in ["a.txt", "docs/1.txt", "docs/2.txt", "docs/deep/3.txt", "z.txt"] {
-            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None).await.unwrap();
+        for k in [
+            "a.txt",
+            "docs/1.txt",
+            "docs/2.txt",
+            "docs/deep/3.txt",
+            "z.txt",
+        ] {
+            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
         }
 
-        let all = s.list_objects("alpha", &ListRequest::default()).await.unwrap();
+        let all = s
+            .list_objects("alpha", &ListRequest::default())
+            .await
+            .unwrap();
         assert_eq!(all.objects.len(), 5);
         assert_eq!(all.objects[0].key, "a.txt"); // 字典序
         assert!(!all.is_truncated);
 
         let prefixed = s
-            .list_objects("alpha", &ListRequest { prefix: Some("docs/".into()), delimiter: Some("/".into()), ..Default::default() })
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    prefix: Some("docs/".into()),
+                    delimiter: Some("/".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(prefixed.objects.len(), 2);
@@ -1639,15 +1698,38 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
         for i in 0..5 {
-            s.put_object("alpha", &format!("k{i}"), bytes::Bytes::from_static(b"x"), None).await.unwrap();
+            s.put_object(
+                "alpha",
+                &format!("k{i}"),
+                bytes::Bytes::from_static(b"x"),
+                None,
+            )
+            .await
+            .unwrap();
         }
-        let page1 = s.list_objects("alpha", &ListRequest { max_keys: Some(2), ..Default::default() }).await.unwrap();
+        let page1 = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(page1.objects.len(), 2);
         assert!(page1.is_truncated);
         let token = page1.next_token.clone().unwrap();
 
         let page2 = s
-            .list_objects("alpha", &ListRequest { max_keys: Some(2), continuation_token: Some(token), ..Default::default() })
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(2),
+                    continuation_token: Some(token),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(page2.objects[0].key, "k2");
@@ -1657,7 +1739,14 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
     async fn copy_object_duplicates_content() {
         let (s, _d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        s.put_object("alpha", "src", bytes::Bytes::from_static(b"copy me"), Some("text/plain".into())).await.unwrap();
+        s.put_object(
+            "alpha",
+            "src",
+            bytes::Bytes::from_static(b"copy me"),
+            Some("text/plain".into()),
+        )
+        .await
+        .unwrap();
         let info = s.copy_object("alpha", "src", "alpha", "dst").await.unwrap();
         assert_eq!(info.size, 7);
         let (_, bytes) = s.get_object("alpha", "dst").await.unwrap();
@@ -1667,16 +1756,18 @@ git add crates/xl-store/ && git commit -m "feat(xl-store): put_object 提交协�
 
 注（可编译前提已就绪）：本块用到的 `put_object` / `head_object` 已随 Task 5 落地，可直接编译；本 Step 新引入的是 `get_object` / `list_objects` / `copy_object` / `ListRequest`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-store 2>&1 | tail -20`
 Expected: 编译错误（`get_object` / `list_objects` / `copy_object` / `ListRequest` 未定义）
+实际：`error: could not compile`（14 处 E0422/E0433/E0599：`get_object` / `list_objects` / `copy_object` / `ListRequest` 未定义）。
 
-- [ ] **Step 3: 实现读 / 删 / 列举 / 复制**
+- [x] **Step 3: 实现读 / 删 / 列举 / 复制**
 
 注（勿重复添加）：本块里的 `load_object_info` 与 `head_object` 已在 Task 5 落地（Task 5 的测试需要「提交后是否可见」的探针），实现 Task 6 时**跳过这两个函数**；其余（`ListRequest` / `ListResult` / `get_object` / `delete_object` / `list_objects` / `copy_object`）照常实现。
 
 ```rust
+// >>> 模块级新增（`ObjectInfo` 之后）：
 #[derive(Debug, Clone, Default)]
 pub struct ListRequest {
     pub prefix: Option<String>,
@@ -1695,36 +1786,42 @@ pub struct ListResult {
 
 const DEFAULT_MAX_KEYS: usize = 1000;
 
-impl Store {
-    fn load_object_info(&self, bucket: &str, key: &str, m: &XlMeta) -> Result<ObjectInfo> {
-        let v = m.latest().ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
-        Ok(ObjectInfo {
-            key: key.to_string(),
-            size: v.size,
-            etag: v.etag.clone(),
-            content_type: v.content_type.clone(),
-            last_modified_nanos: v.mod_time_nanos,
-            user_metadata: v.user_metadata.clone(),
-        })
-    }
-
-    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
-        self.ensure_bucket(bucket).await?;
-        let m = self.read_meta(bucket, key).await?.ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
-        self.load_object_info(bucket, key, &m)
-    }
-
+// >>> `impl Store` 内 `head_object` 之后（`load_object_info` / `head_object` 已在 Task 5 落地，此处不重复）：
+    /// 读对象：一次 meta 读取定 info 与数据文件位置。
+    ///
+    /// 读路径不加锁，meta 与数据文件之间隔着一次 open：覆写者在提交点之后才把老版本目录移进
+    /// trash，所以先读到的 meta 可能指向刚被移走的版本目录（数据文件 ENOENT）。此时重读一次
+    /// meta 拿新版本再试；两轮都读不到 = 对象确实不在（或被并发删除）→ NoSuchKey。
+    /// ponytail: 固定重试一次；持续覆写风暴下不保证收敛（M2 快照读解决）。
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectInfo, Bytes)> {
-        let info = self.head_object(bucket, key).await?;
-        // ponytail: M1 整份读进内存；M2 换流式（大对象与 Range 是 M2 的事）。
+        self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
-        let v = self.read_meta(bucket, key).await?.unwrap().latest().unwrap().clone();
-        let bytes = tokio::fs::read(dir.join(&v.part.uuid).join(format!("part.{}", v.part.part))).await?;
-        Ok((info, Bytes::from(bytes)))
+
+        for _ in 0..2 {
+            let m = self
+                .read_meta(bucket, key)
+                .await?
+                .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+            let v = m
+                .latest()
+                .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+            let info = self.load_object_info(bucket, key, &m)?;
+            let path = dir.join(&v.part.uuid).join(format!("part.{}", v.part.part));
+            // ponytail: M1 整份读进内存；M2 换流式（大对象与 Range 是 M2 的事）。
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => return Ok((info, Bytes::from(bytes))),
+                // 旧版本目录已被并发覆写者移走：下一轮重读 meta 拿新版本
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // 两轮 meta → 数据文件都 ENOENT：按 S3 语义报 NoSuchKey，而不是把裸 IO 错误抛给上层
+        Err(Error::NoSuchKey(key.to_string()))
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.ensure_bucket(bucket).await?;
+        // 与 put 同键串行：删除进行中不得有写者把新版本 rename 进来（否则版本目录会被连带删掉）
         let _guard = self.lock_for(bucket, key).lock_owned().await;
         let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
         match tokio::fs::remove_dir_all(&dir).await {
@@ -1785,7 +1882,12 @@ impl Store {
             }
         }
         common_prefixes.sort();
-        Ok(ListResult { objects, common_prefixes, is_truncated, next_token })
+        Ok(ListResult {
+            objects,
+            common_prefixes,
+            is_truncated,
+            next_token,
+        })
     }
 
     async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
@@ -1801,19 +1903,33 @@ impl Store {
         Ok(keys)
     }
 
-    pub async fn copy_object(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> Result<ObjectInfo> {
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<ObjectInfo> {
         let (info, bytes) = self.get_object(src_bucket, src_key).await?;
-        self.put_object(dst_bucket, dst_key, bytes, info.content_type).await
+        self.put_object(dst_bucket, dst_key, bytes, info.content_type)
+            .await
     }
-}
 ```
 
-- [ ] **Step 4: 跑测试**
+注（与最初骨架的差异，已裁决；上方代码块已同步为最终实现形态）：
+- `get_object` 的读路径并发防护（质量评审挂载项）：原骨架是 `head_object` + 再读一次 `read_meta().unwrap().latest().unwrap()`，既有 `unwrap` panic 路径，也在「meta 已换、旧版本目录被并发覆写者移进 trash」的窗口里把数据文件 ENOENT 原样抛给上层。最终形态：**一次 meta 读取定 info 与数据文件位置；数据文件 ENOENT 时重读 meta 重试一次，两轮都 ENOENT → `NoSuchKey`**（无 panic；其他 IO 错误照旧上抛）。`ponytail:` 注释标明固定一次重试，M2 快照读收口。
+- 测试补 `get_dangling_meta_version_reports_no_such_key`：手工构造「xl.meta 指向已被移走的版本目录」，断言 `NoSuchKey`（不 panic）。
+- `concurrent_puts_to_same_key_serialize` 末尾补读回校验（挂载项）：`get_object` 读回的 size/长度与写入一致、且内容是某个写入者一次写入的完整 64 字节（单一重复值）。该测试的最终形态已同步进 Task 5 的 Step 1 块。
+- Task 5 留在 `load_object_info` 上的过渡注释（「get / delete / list / copy 仍留给 Task 6」）已随本 task 移除。
+- 文档挂载项：删除 Task 5 区两行孤立的裸 ` ``` `（原约 1253 / 1513 行，导致 Step 2/3 文字与实现块渲染破损；Task 16 验收区 3828 行同类问题在本次范围外，未动）。
+
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-store 2>&1 | tail -12`
 Expected: 全绿
+实际：`xl-store` 40 passed / 0 failed（Task 4 的 26 + Task 5 的 8 + 本 task 的 6：`get_reads_back_exact_bytes` / `get_missing_key` / `get_dangling_meta_version_reports_no_such_key` / `list_with_prefix_and_delimiter` / `list_pagination` / `copy_object_duplicates_content`；`concurrent_puts_to_same_key_serialize` 为原地增强，未新增用例）。四闸全绿（fmt / clippy 0 告警 / `-p xl-store` / `--workspace -j 2`）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/xl-store/ && git commit -m "feat(xl-store): 读/删/列举（prefix+delimiter+分页）/复制"

@@ -49,6 +49,24 @@ pub struct ObjectInfo {
     pub user_metadata: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ListRequest {
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
+    pub max_keys: Option<usize>,
+    pub continuation_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListResult {
+    pub objects: Vec<ObjectInfo>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_token: Option<String>,
+}
+
+const DEFAULT_MAX_KEYS: usize = 1000;
+
 pub struct Store {
     cfg: StoreConfig,
     /// 进程内 per-object 互斥，`bucket/key` → 锁：同键的并发写必须串行，
@@ -331,8 +349,6 @@ impl Store {
         Ok(())
     }
 
-    // Task 5 的测试要一个「提交后是否可见」的探针，head_object 与其组装函数随本 task 落地；
-    // get / delete / list / copy 仍留给 Task 6。
     fn load_object_info(&self, bucket: &str, key: &str, m: &XlMeta) -> Result<ObjectInfo> {
         let v = m
             .latest()
@@ -354,6 +370,134 @@ impl Store {
             .await?
             .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
         self.load_object_info(bucket, key, &m)
+    }
+
+    /// 读对象：一次 meta 读取定 info 与数据文件位置。
+    ///
+    /// 读路径不加锁，meta 与数据文件之间隔着一次 open：覆写者在提交点之后才把老版本目录移进
+    /// trash，所以先读到的 meta 可能指向刚被移走的版本目录（数据文件 ENOENT）。此时重读一次
+    /// meta 拿新版本再试；两轮都读不到 = 对象确实不在（或被并发删除）→ NoSuchKey。
+    /// ponytail: 固定重试一次；持续覆写风暴下不保证收敛（M2 快照读解决）。
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectInfo, Bytes)> {
+        self.ensure_bucket(bucket).await?;
+        let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
+
+        for _ in 0..2 {
+            let m = self
+                .read_meta(bucket, key)
+                .await?
+                .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+            let v = m
+                .latest()
+                .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+            let info = self.load_object_info(bucket, key, &m)?;
+            let path = dir.join(&v.part.uuid).join(format!("part.{}", v.part.part));
+            // ponytail: M1 整份读进内存；M2 换流式（大对象与 Range 是 M2 的事）。
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => return Ok((info, Bytes::from(bytes))),
+                // 旧版本目录已被并发覆写者移走：下一轮重读 meta 拿新版本
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // 两轮 meta → 数据文件都 ENOENT：按 S3 语义报 NoSuchKey，而不是把裸 IO 错误抛给上层
+        Err(Error::NoSuchKey(key.to_string()))
+    }
+
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.ensure_bucket(bucket).await?;
+        // 与 put 同键串行：删除进行中不得有写者把新版本 rename 进来（否则版本目录会被连带删掉）
+        let _guard = self.lock_for(bucket, key).lock_owned().await;
+        let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // S3 语义：删不存在的键也返回成功
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 列举：直接走盘。M1 每个对象读一次 xl.meta（O(n) 次系统调用），
+    /// M4 用 scrub 的命名空间索引优化（ponytail: 先对，再快）。
+    pub async fn list_objects(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {
+        self.ensure_bucket(bucket).await?;
+        let mut keys = self.collect_keys(bucket).await?;
+        keys.sort();
+
+        let prefix = req.prefix.clone().unwrap_or_default();
+        let max = req.max_keys.unwrap_or(DEFAULT_MAX_KEYS).min(1000);
+        let start_after = req.continuation_token.clone();
+
+        let mut objects = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+        let mut is_truncated = false;
+        let mut next_token = None;
+
+        for k in keys {
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(after) = &start_after {
+                // token = 本页「未返回的第一个 key」，恢复时包含该 key 本身
+                if &k < after {
+                    continue;
+                }
+            }
+            if let Some(d) = &req.delimiter {
+                let rest = &k[prefix.len()..];
+                if let Some(pos) = rest.find(d.as_str()) {
+                    let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
+                    if objects.len() + common_prefixes.len() >= max {
+                        is_truncated = true;
+                        next_token = Some(k.clone());
+                        break;
+                    }
+                    if !common_prefixes.contains(&cp) {
+                        common_prefixes.push(cp);
+                    }
+                    continue;
+                }
+            }
+            if objects.len() + common_prefixes.len() >= max {
+                is_truncated = true;
+                next_token = Some(k.clone());
+                break;
+            }
+            if let Some(m) = self.read_meta(bucket, &k).await? {
+                objects.push(self.load_object_info(bucket, &k, &m)?);
+            }
+        }
+        common_prefixes.sort();
+        Ok(ListResult {
+            objects,
+            common_prefixes,
+            is_truncated,
+            next_token,
+        })
+    }
+
+    async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut entries = tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            keys.push(layout::key_from_dir_name(&name)?);
+        }
+        Ok(keys)
+    }
+
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<ObjectInfo> {
+        let (info, bytes) = self.get_object(src_bucket, src_key).await?;
+        self.put_object(dst_bucket, dst_key, bytes, info.content_type)
+            .await
     }
 }
 
@@ -664,6 +808,15 @@ mod tests {
         // 必须能读出一份完整的、单一写入者的内容（不能是交错损坏）
         let info = s.head_object("alpha", "same").await.unwrap();
         assert_eq!(info.size, 64);
+
+        let (info, body) = s.get_object("alpha", "same").await.unwrap();
+        assert_eq!(info.size, 64);
+        assert_eq!(body.len(), 64);
+        // 读回内容必须是某个写入者一次写入的 64 字节（单一重复值），不能是拼接/交错/截断产生的碎片
+        assert!(
+            body.iter().all(|b| *b == body[0]),
+            "读回内容不是单次完整写入: {body:?}"
+        );
     }
 
     #[tokio::test]
@@ -705,5 +858,158 @@ mod tests {
         assert!(matches!(err, Error::CorruptMeta(_)));
         let msg = err.to_string();
         assert!(msg.contains("\"k\"") && msg.contains("\"other\""), "{msg}");
+    }
+
+    // ---- Task 6: 读 / 删 / 列举 / 复制 ----
+
+    #[tokio::test]
+    async fn get_reads_back_exact_bytes() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", bytes::Bytes::from_static(b"payload"), None)
+            .await
+            .unwrap();
+        let (info, bytes) = s.get_object("alpha", "k").await.unwrap();
+        assert_eq!(bytes, bytes::Bytes::from_static(b"payload"));
+        assert_eq!(info.etag, {
+            let mut h = md5::Md5::new();
+            md5::Digest::update(&mut h, b"payload");
+            hex::encode(md5::Digest::finalize(h))
+        });
+    }
+
+    #[tokio::test]
+    async fn get_missing_key() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        assert!(matches!(
+            s.get_object("alpha", "nope").await,
+            Err(Error::NoSuchKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_dangling_meta_version_reports_no_such_key() {
+        // 并发覆写窗口的现实形态：xl.meta 指向的版本目录已被移走（覆写者提交后把它扔进 trash）。
+        // 读路径重读 meta 重试一次后必须报 NoSuchKey —— 不得 panic，也不得把裸 IO 错误抛给上层。
+        let (s, d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "k", Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+        let m = XlMeta::decode(
+            &tokio::fs::read(obj_dir.join(meta::META_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        tokio::fs::remove_dir_all(obj_dir.join(&m.latest().unwrap().part.uuid))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.get_object("alpha", "k").await,
+            Err(Error::NoSuchKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_with_prefix_and_delimiter() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        for k in [
+            "a.txt",
+            "docs/1.txt",
+            "docs/2.txt",
+            "docs/deep/3.txt",
+            "z.txt",
+        ] {
+            s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+        }
+
+        let all = s
+            .list_objects("alpha", &ListRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(all.objects.len(), 5);
+        assert_eq!(all.objects[0].key, "a.txt"); // 字典序
+        assert!(!all.is_truncated);
+
+        let prefixed = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    prefix: Some("docs/".into()),
+                    delimiter: Some("/".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefixed.objects.len(), 2);
+        assert_eq!(prefixed.common_prefixes, vec!["docs/deep/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_pagination() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        for i in 0..5 {
+            s.put_object(
+                "alpha",
+                &format!("k{i}"),
+                bytes::Bytes::from_static(b"x"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let page1 = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page1.objects.len(), 2);
+        assert!(page1.is_truncated);
+        let token = page1.next_token.clone().unwrap();
+
+        let page2 = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(2),
+                    continuation_token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.objects[0].key, "k2");
+    }
+
+    #[tokio::test]
+    async fn copy_object_duplicates_content() {
+        let (s, _d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object(
+            "alpha",
+            "src",
+            bytes::Bytes::from_static(b"copy me"),
+            Some("text/plain".into()),
+        )
+        .await
+        .unwrap();
+        let info = s.copy_object("alpha", "src", "alpha", "dst").await.unwrap();
+        assert_eq!(info.size, 7);
+        let (_, bytes) = s.get_object("alpha", "dst").await.unwrap();
+        assert_eq!(bytes, bytes::Bytes::from_static(b"copy me"));
     }
 }
