@@ -19,9 +19,10 @@ OSS_ADMIN_USER=erik OSS_ADMIN_PASSWORD=changeme cargo run -p oss-server
 TOKEN=$(curl -s -X POST localhost:9000/api/v1/login -H 'content-type: application/json' \
   -d '{"username":"erik","password":"changeme"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
 
-# 3. 建一对访问密钥给 S3 客户端用
+# 3. 建一对访问密钥给 S3 客户端用（显式指定，与下面验收段的 AK/SK 一致）
 curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{}'
+  -H 'content-type: application/json' \
+  -d '{"access_key":"AKIA_TEST_ACCESS_KEY","secret_key":"SK_TEST_SECRET_KEY_0001"}'
 ```
 
 > 注意：暂存盘下的 `_header/` 与各分组目录都由 `aether::build_runtime` 在启动时创建
