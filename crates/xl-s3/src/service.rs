@@ -331,7 +331,8 @@ impl S3 for OssS3 {
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(ETag::Strong(info.etag)),
-                last_modified: None,
+                // 与 get/head_object 同一翻译：返回 dst 对象的真实 mtime，不用 now() 冒充
+                last_modified: Some(last_modified(info.last_modified_nanos)),
                 ..Default::default()
             }),
             ..Default::default()

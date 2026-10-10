@@ -469,18 +469,25 @@ async fn copy_object_copies_bytes() {
     .unwrap();
 
     // CopyObjectInput 没有 Default；copy_source 是必填枚举（s3s 已解码并去掉前导 '/'）
-    s3.copy_object(req(CopyObjectInput::builder()
-        .bucket("alpha".to_string())
-        .key("dst".to_string())
-        .copy_source(CopySource::Bucket {
-            bucket: "alpha".into(),
-            key: "src".into(),
-            version_id: None,
-        })
-        .build()
-        .unwrap()))
+    let copy_out = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("alpha".to_string())
+            .key("dst".to_string())
+            .copy_source(CopySource::Bucket {
+                bucket: "alpha".into(),
+                key: "src".into(),
+                version_id: None,
+            })
+            .build()
+            .unwrap()))
         .await
-        .unwrap();
+        .unwrap()
+        .output;
+    let copied_lm = copy_out
+        .copy_object_result
+        .unwrap()
+        .last_modified
+        .expect("CopyObjectResult 必须带 LastModified");
 
     let got = s3
         .get_object(req(GetObjectInput {
@@ -499,6 +506,18 @@ async fn copy_object_copies_bytes() {
         buf.extend_from_slice(&chunk.unwrap());
     }
     assert_eq!(buf, b"copy");
+
+    // LastModified 必须是 dst 对象的真实 mtime（与 head 一致），不是 now() 冒充
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "dst".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.last_modified, Some(copied_lm));
 }
 
 #[tokio::test]
@@ -527,6 +546,36 @@ async fn copy_object_rejects_same_source_and_destination() {
             .key("src".to_string())
             .copy_source(CopySource::Bucket {
                 bucket: "alpha".into(),
+                key: "src".into(),
+                version_id: None,
+            })
+            .build()
+            .unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+}
+
+#[tokio::test]
+async fn copy_object_rejects_non_bucket_copy_source() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // M1 只支持桶形式的 x-amz-copy-source；Access Point ARN 形式一律 InvalidRequest
+    let err = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("alpha".to_string())
+            .key("dst".to_string())
+            .copy_source(CopySource::AccessPoint {
+                partition: "aws".into(),
+                region: "us-east-1".into(),
+                account_id: "123456789012".into(),
+                access_point_name: "ap".into(),
                 key: "src".into(),
                 version_id: None,
             })

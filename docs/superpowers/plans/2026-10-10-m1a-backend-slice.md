@@ -3749,7 +3749,8 @@ Expected: 编译错误 / `NotImplemented`
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(ETag::Strong(info.etag)),
-                last_modified: None,
+                // 与 get/head_object 同一翻译：返回 dst 对象的真实 mtime，不用 now() 冒充
+                last_modified: Some(last_modified(info.last_modified_nanos)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -3763,7 +3764,7 @@ Expected: 编译错误 / `NotImplemented`
 Run: `cargo test -p xl-s3 2>&1 | tail -12`
 Expected: 全绿
 
-实测：`object_ops` 10 passed（原 6 + 本轮 4）；四闸全绿（fmt / clippy 0 告警 / `-p xl-s3` / `--workspace -j 2`）。
+实测：`object_ops` 11 passed（原 5 + 本轮 6：4 新用例 + 恰 1000 用例 + 非桶 CopySource 用例）；四闸全绿（fmt / clippy 0 告警 / `-p xl-s3` / `--workspace -j 2`）。
 
 - [x] **Step 5: 提交**
 
@@ -3780,8 +3781,10 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): ListObjectsV2 与 CopyObjec
 - **`delete_objects` 测试补强（上轮评审残余；挂载项 3）**：混批顺序改为 `ok1` / `a//b`（非法）/ `ok2`，断言 `deleted` 恰为 `[ok1, ok2]` 且两键删后 head 均 404 —— 钉「键级错误后继续且不回滚」；新增 `delete_objects_accepts_exactly_1000_keys`（恰 1000 通过，与既有 `>1000 → InvalidRequest` 成对）。实现未动。按本文件惯例，测试补强记在定稿记录、不重写 Task 11 Step 1 块。
 - 实际测试文件相对上方 Step 1 块另加断言（不改变块语义）：`list_objects_v2_prefix_delimiter_and_paging` 断言 contents 键序与 `key_count`、`is_truncated=false`，并跟随 `next_continuation_token` 取第二页、拼回全量 4 键（无重无漏）；`copy_object_copies_bytes` 收 body 字节断言 `== b"copy"`（不只长度）。与 Task 11 的「钉字节」评审口径一致。
 - 计划 Task 12 块内无 `percent_decode` 等作废代码（该批 API 臆测已在前几轮探针清理），无需删改；块内 `xl_store::store::ListRequest` 行内路径按上方同步改为顶层 import——语义不变。
-- 口径观察（留给评审裁决，本轮未改）：`CopyObjectResult.last_modified` 按计划保持 `None`；真实 S3 返回 LastModified，M1 规格未要求。若评审要求，改用 `info.last_modified_nanos`（与 `get/head_object` 同一翻译）。
+- **`CopyObjectResult.last_modified` 补 `Some(...)`（规格评审微项 1）**：原计划块为 `None`（观察项），评审确认补齐——复用 `last_modified` helper 返回 dst 对象的真实 mtime（与 `get/head_object` 同一翻译）。测试断言 copy 响应里的 `last_modified` 与随后 `head_object(dst)` 的 `last_modified` 严格相等（钉真实 mtime，不是 `is_some()` 的弱断言）。
+- **非桶 `CopySource` 补用例（规格评审微项 2）**：`copy_object_rejects_non_bucket_copy_source` 用 `CopySource::AccessPoint` 钉住既有守卫的 `InvalidRequest` 路径（此前只有代码、无用例）。
 - 口径注：`max-keys` 上限 >1000 由 store 静默钳到 1000（Task 4 定稿），本轮只增负数拒绝，未动钳位语义。
+- **M2 备忘（评审微项 4，M1 不改）**：`key_count` 只数 objects，而 store 的 `max_keys` 预算把 common_prefixes 计入 —— 带 `delimiter` 的分页下 `KeyCount` 与 AWS 语义可能有差（AWS 的 KeyCount 计 Contents+CommonPrefixes），M2 对齐全量列举语义时一并核。另记：`encoding-type=url`、`start-after`、`fetch-owner` 三个 ListObjectsV2 参数 M1 均未处理（规格 §4.1 参数表列了），属计划层范围，M1 落账不做。
 
 ---
 
