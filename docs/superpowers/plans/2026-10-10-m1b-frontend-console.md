@@ -622,7 +622,7 @@ git commit -m "feat(web): 桶列表页（建/删/进入）"
 **Files:**
 - Modify: `web/src/pages/Objects.tsx`
 
-- [ ] **Step 1: 实现**（前缀导航来自 `common_prefixes`，下载走 fetch→blob，避免给浏览器下载请求塞 JWT 头的难题）
+- [x] **Step 1: 实现**（前缀导航来自 `common_prefixes`，下载走 fetch→blob，避免给浏览器下载请求塞 JWT 头的难题）
 
 ```tsx
 import { useMemo, useState } from 'react'
@@ -756,11 +756,15 @@ const [prefix, setPrefix] = useState(() => new URLSearchParams(window.location.s
 
 （覆盖上面 `useState('')`；面包屑链接切换时整页跳转、组件重挂载，状态自然重置。）
 
-- [ ] **Step 2: 验证**
+实现注记：`<Table>` 改为显式泛型 `<Table<Row>>`（`Row` = dir/obj 联合类型，见 `web/src/pages/Objects.tsx`）——计划初稿写法下 antd 会从各列 `render` 的参数注解反推 `RecordType`，推出 `{ kind: string; size?: number }` 这类错误类型，`rowKey` 与三处 render 全部编译不过（`tsc` 报 TS2339/TS2322）；补泛型后计划代码其余部分逐字未动。
+
+- [x] **Step 2: 验证**
 
 用 `aws s3 cp` 往 `alpha` 放 `docs/a.txt`、`docs/b.txt`、`top.txt` → 控制台 `/buckets/alpha` 看到 `docs/` 与 `top.txt`；点 `docs/` 进前缀，面包屑回根；下载 `a.txt` 字节一致（`cmp`）；删 `top.txt` 后列表刷新。
 
-- [ ] **Step 3: 提交**
+> 执行注记：同 Task 4——后端控制台 API（M1a Task 15 未落地）本轮无实跑条件，跳过浏览器手验；真实流程（前缀导航 / 下载字节一致 / 删除刷新）由 Task 11 的 Playwright e2e 覆盖。本轮替代验证：`cd web && npm test`（6 用例不回归）、`npm run build`、`npm run lint`。另：下载/删除路径的整键 `encodeURIComponent` 与 axum `{*key}` 通配段的解码行为本轮无法本地复核，一并留给 Task 11 e2e 验证。
+
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Objects.tsx
