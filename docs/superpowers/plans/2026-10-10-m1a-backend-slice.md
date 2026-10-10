@@ -229,7 +229,7 @@ pub mod router;
 pub mod state;
 ```
 
-对应地，创建后续任务要填充的空文件（空文件 `cargo check` 合法）：
+对应地，创建后续任务要填充的空文件（空文件 `cargo check` 合法）（注意：0 字节文件会被 `cargo fmt --all --check` 判 diff —— 本步已顺带跑过 `cargo fmt --all`，占位文件均为 1 字节换行）：
 `crates/xl-store/src/{error,layout,meta,store}.rs`、`crates/xl-s3/src/{auth,convert,service}.rs`、
 `crates/oss-server/src/{aether,config,console,db,router,state}.rs`。
 
