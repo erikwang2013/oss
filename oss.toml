@@ -1,0 +1,24 @@
+listen = "0.0.0.0:9000"
+data_dir = "./data"
+staging_dir = "./staging"
+database_url = "sqlite://./oss.db?mode=rwc"
+jwt_secret = "dev-only-change-me"
+max_put_bytes = 268435456
+
+[[groups]]
+group = "image"
+bucket = "images"
+max_size = 10485760
+extensions = ["jpg", "jpeg", "png", "gif", "webp", "svg"]
+
+[[groups]]
+group = "video"
+bucket = "videos"
+max_size = 0
+extensions = ["mp4", "mov", "mkv", "webm"]
+
+[[groups]]
+group = "file"
+bucket = "files"
+max_size = 0
+extensions = []

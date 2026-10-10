@@ -1,6 +1,7 @@
 //! 控制面数据访问。M1 只有五张表；对象数据永不进 SQL。
 
 use serde::Serialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
@@ -34,7 +35,12 @@ fn now() -> i64 {
 
 impl Db {
     pub async fn connect(url: &str) -> Result<Self> {
-        let pool = SqlitePool::connect(url).await?;
+        // WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
+        // `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
+        let opts = url
+            .parse::<SqliteConnectOptions>()?
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePool::connect_with(opts).await?;
         // sqlx::raw_sql 支持一个字符串里的多条语句，schema 文件原样执行
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })

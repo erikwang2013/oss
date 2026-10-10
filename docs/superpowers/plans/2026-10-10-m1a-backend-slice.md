@@ -2342,6 +2342,7 @@ Expected: 编译错误（`Db` 未定义）
 //! 控制面数据访问。M1 只有五张表；对象数据永不进 SQL。
 
 use serde::Serialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
@@ -2375,7 +2376,12 @@ fn now() -> i64 {
 
 impl Db {
     pub async fn connect(url: &str) -> Result<Self> {
-        let pool = SqlitePool::connect(url).await?;
+        // WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
+        // `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
+        let opts = url
+            .parse::<SqliteConnectOptions>()?
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePool::connect_with(opts).await?;
         // sqlx::raw_sql 支持一个字符串里的多条语句，schema 文件原样执行
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })
@@ -2584,6 +2590,8 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制面 5 张表与
 - **M-7**：`SCHEMA` 常量旁注明 `migrations/` 目录名与本实现（`include_str!` + `raw_sql`，无 `_sqlx_migrations`）的差异——将来加 0002 不会自动执行。
 - **M-8**（记账，未改）：`oss-server` 的 `sqlx` 同时列在 `[dependencies]` 与 `[dev-dependencies]`（本计划 Step 5 的产物，无行为影响——Cargo 特性并集）；留到收尾清理时删除 dev 侧重复行。
 
+注（Task 8 回填）：上方 Step 4 的 `Db::connect` 代码块已同步为最终形态——`SqlitePool::connect(url)` 换为 `SqliteConnectOptions` + `journal_mode(Wal)` + `connect_with`（WAL 挂账项的裁决落地，理由与实证见 Task 8 注记）；Task 7 实施时该两行尚未存在，其余逐字未动。
+
 ---
 
 ## Task 8: oss-server —— 配置、AppState、e-cat 起服务
@@ -2593,7 +2601,7 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制面 5 张表与
 - Create: `crates/oss-server/src/main.rs`
 - Create: `oss.toml`
 
-- [ ] **Step 1: 写 `config.rs`**
+- [x] **Step 1: 写 `config.rs`**
 
 ```rust
 use std::path::PathBuf;
@@ -2640,7 +2648,7 @@ impl AppConfig {
 }
 ```
 
-- [ ] **Step 2: 写 `oss.toml`**
+- [x] **Step 2: 写 `oss.toml`**
 
 ```toml
 listen = "0.0.0.0:9000"
@@ -2669,7 +2677,7 @@ max_size = 0
 extensions = []
 ```
 
-- [ ] **Step 3: 写 `state.rs`**
+- [x] **Step 3: 写 `state.rs`**
 
 ```rust
 use std::sync::Arc;
@@ -2692,7 +2700,7 @@ impl AppState {
 }
 ```
 
-- [ ] **Step 4: 写失败的冒烟测试**（`crates/oss-server/tests/smoke.rs`）
+- [x] **Step 4: 写失败的冒烟测试**（`crates/oss-server/tests/smoke.rs`）
 
 ```rust
 use std::sync::Arc;
@@ -2736,12 +2744,12 @@ async fn health_endpoint_is_up() {
 }
 ```
 
-- [ ] **Step 5: 跑测试确认失败**
+- [x] **Step 5: 跑测试确认失败**
 
 Run: `cargo test -p oss-server --test smoke 2>&1 | tail -20`
 Expected: 编译错误（`build_router` 未定义）
 
-- [ ] **Step 6: 实现 `router.rs` 的最小版本**（M1 后续任务往这里加）
+- [x] **Step 6: 实现 `router.rs` 的最小版本**（M1 后续任务往这里加）
 
 ```rust
 use axum::Router;
@@ -2758,7 +2766,7 @@ pub fn build_router(state: AppState) -> Router {
 
 `state.rs` 里给 `AppState` 加 `#[derive(Clone)]`（已有）。
 
-- [ ] **Step 7: 写 `main.rs`**
+- [x] **Step 7: 写 `main.rs`**
 
 ```rust
 use std::sync::Arc;
@@ -2809,7 +2817,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 `main.rs` 里 `use std::sync::Arc;` 用不到就删掉。
 
-- [ ] **Step 8: 跑测试 + 手动起服务**
+- [x] **Step 8: 跑测试 + 手动起服务**
 
 Run:
 ```bash
@@ -2818,12 +2826,17 @@ cargo run -p oss-server 2>&1 | head -5 &
 sleep 2 && curl -s localhost:9000/health/live && echo && kill %1
 ```
 Expected: 测试通过；`curl` 输出 `ok`
+实际：smoke 1 passed；主轮 `-p oss-server` 7 + 1 passed；`cargo test --workspace -j 2` 57 passed（xl-store 49 + oss-server 7 + smoke 1）。起服务改造为直接跑 `target/debug/oss-server`（与 `cargo run` 同一产物，避免 cargo 转发信号的不确定性），`curl -s -w " [http %{http_code}]\n" localhost:9000/health/live` → `ok [http 200]`；追加验证 SIGTERM 优雅停机（日志 `received SIGTERM` → `shutting down` → 退出，9000 端口释放）。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 git add crates/oss-server/ oss.toml && git commit -m "feat(server): e-cat 起服务 + /health/live 冒烟"
 ```
+
+注（Task 8 执行偏差，两处 + WAL 挂账项并入）：
+- **WAL（并入的挂账项）方案变更**：`database_url` 带 `?journal_mode=WAL` 在 sqlx 0.8.6 上不可行——URL 解析只认 4 个参数 `mode`/`cache`/`immutable`/`vfs`（源码 `sqlx-sqlite-0.8.6/src/options/parse.rs` 实证，其余 key 一律 `Error::Configuration`），实测起服务直接报 `Configuration("unknown query parameter \`journal_mode\` while parsing connection URL")`。**WAL 经连接选项而非 URL 参数**：`Db::connect` 用 `url.parse::<SqliteConnectOptions>()?.journal_mode(SqliteJournalMode::Wal)` + `SqlitePool::connect_with`（对池内每条新连接生效；`mode=rwc` 的 create_if_missing 语义由 from_str 保留）。`oss.toml` 维持 `sqlite://./oss.db?mode=rwc`（即上方代码块，最终形态已同步）。实测：起服务后 `PRAGMA journal_mode` → `wal`，`oss.db-wal` 落盘；既有 7 个 db 测试全绿（connect_with 路径无回归）。**以后不要再往 `database_url` 加 SQLite 参数**——sqlx 0.8 只认上述 4 个。`db.rs` 这两行属本 task 裁决范围，随 Task 8 提交并入（Task 7 的 Step 4 代码块已同步，见其注记）。
+- **`main.rs` 管理员引导收成 let-chain**：计划原文是 `if let (...) { if ... } }` 嵌套，clippy `collapsible_if` 告警（0 告警闸），按 clippy 建议合并为 `if let (Ok(user), Ok(pass)) = (...) && db.verify_user(...).await?.is_none() && !db.user_exists(...).await? { ... }`（edition 2024 let-chain）。逻辑不变。另按计划提示删掉了未使用的 `use std::sync::Arc;`；rustfmt 仅换行。
 
 ---
 
