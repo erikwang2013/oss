@@ -194,7 +194,8 @@ describe('api()', () => {
 
   it('非 2xx 抛 ApiError 且带状态码与响应文本', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('桶非空', { status: 409 })))
-    const err = await api('/api/v1/buckets/a').catch((e) => e as ApiError)
+    // api<never>：不写类型参数时 T 推断为 unknown，catch 结果会塌成 unknown 而无法访问 .status
+    const err = await api<never>('/api/v1/buckets/a').catch((e) => e as ApiError)
     expect(err.status).toBe(409)
     expect(err.message).toBe('桶非空')
   })
@@ -225,8 +226,10 @@ export function setToken(t: string | null): void {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  status: number // 手写赋值：tsconfig 开了 erasableSyntaxOnly，参数属性（constructor(public x)）不可用
+  constructor(status: number, message: string) {
     super(message)
+    this.status = status
   }
 }
 
@@ -287,10 +290,12 @@ export interface AccessKey {
 }
 ```
 
+> 注：`tsconfig.app.json` 开了 `erasableSyntaxOnly`（Vite 8 脚手架默认），TS 参数属性（`constructor(public status: number)`）会报 TS1294，故 `ApiError` 用显式字段。
+
 - [x] **Step 4: 跑测试**
 
 Run: `cd web && npm test`
-Expected: PASS（4 个用例）
+Expected: PASS（5 个用例）
 
 - [x] **Step 5: 提交**
 
