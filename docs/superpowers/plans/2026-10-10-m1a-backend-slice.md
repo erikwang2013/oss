@@ -4747,7 +4747,7 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
 - **`register_upload` 三分支（并入项 2）**：按 I-1 同步后的现文写——`Ok(true) → 204 / Ok(false) → 404 / Err(e) → 500`
   （Err 分支的 400→500 修订见下方收尾轮记录与 Task 7 顶部记录）。
   新增测试 `register_upload_hit_is_204_miss_is_404`（Step 1 块外，按 Task 11 先例记在这里）：`record_upload` 后 register → 204、
-  `GET /uploads` 能看到 `original_name`、无行 `saved_path` → 404。Err→400 分支需 DB 故障，HTTP 面不构造（db.rs 单测覆盖返回语义）。
+  `GET /uploads` 能看到 `original_name`、无行 `saved_path` → 404。Err→500 见 `register_upload_db_failure_is_500`。
 - **过期 AK 边界测试（并入项 3，挂账跳过并说明）**：quality-task7 ② 所指的原用例 `secret_for_access_key_rejects_expired`
   （`now() - 1` 绑定）随 Task 9 收尾轮已删除（生产路径由 xl-s3 接管）。现存唯一的过期用例在
   `crates/xl-s3/src/auth.rs::inactive_or_expired_access_key_is_rejected`，且用的是固定 `Some(1)` 而非 `now-1`——
@@ -4767,7 +4767,7 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
 - **I-1（安全回归保护）**：新增两个测试。① `forged_or_expired_token_is_401`：换 secret 签名的 token（签名不过）与
   `exp = now-3600`（越过 jsonwebtoken 默认 60s leeway）的 token 都必须 401 —— 测试内直接用 jsonwebtoken encode（已是普通依赖），
   自定 `TestClaims` 形状（`console::Claims` 是私有的）。② `all_routes_reject_anonymous`：11 条路由去掉 login = 10 条，
-  表驱动（method + path 数组）× 无 token → 401，钉「新增 handler 漏 `auth()` 立即变红」。注意 POST 路由的 `Json` 提取先于 handler，
+  表驱动（method + path 数组）× 无 token → 401，「新增 handler 时同步加表项，漏 auth 即红」（axum 不暴露路由枚举）。注意 POST 路由的 `Json` 提取先于 handler，
   表内必须带能解析的 body 才走得到鉴权分支。实现未动。
 - **M-2（状态码说真话）**：新增 `store_error()` 分档 —— `NoSuchBucket/NoSuchKey → 404`、`InvalidBucketName/InvalidKey → 400`、
   `Io/CorruptMeta/Encode → 500`（`tracing::error!` + 通用文案，5xx 不泄内部细节）；**`BucketAlreadyExists/BucketNotEmpty → 409`**
@@ -4801,7 +4801,7 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
 - Create: `tests/e2e_s3.sh`
 - Create: `README.md`
 
-- [ ] **Step 1: 写端到端脚本**
+- [x] **Step 1: 写端到端脚本**
 
 ```bash
 #!/usr/bin/env bash
@@ -4810,8 +4810,8 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
 set -euo pipefail
 
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
-AK="${AK:-AKIA_TEST}"
-SK="${SK:-SK_TEST}"
+AK="${AK:-AKIA_TEST_ACCESS_KEY}"
+SK="${SK:-SK_TEST_SECRET_KEY_0001}"
 BUCKET="e2e-$(date +%s)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -4859,8 +4859,9 @@ export RCLONE_CONFIG_OSS_TYPE=s3
 export RCLONE_CONFIG_OSS_PROVIDER=Other
 export RCLONE_CONFIG_OSS_ACCESS_KEY_ID="$AK"
 export RCLONE_CONFIG_OSS_SECRET_ACCESS_KEY="$SK"
-export RCLONE_CONFIG_OSS_ENDPOINT="${ENDPOINT#http://}"
+export RCLONE_CONFIG_OSS_ENDPOINT="$ENDPOINT"           # 必须带 scheme：不带时 rclone 默认 https
 export RCLONE_CONFIG_OSS_FORCE_PATH_STYLE=true
+export RCLONE_CONFIG_OSS_LIST_VERSION=2                 # provider=Other 默认发 v1；M1 只实现 ListObjectsV2
 rclone lsf oss:"$BUCKET"
 rclone copyto "$WORK/one.bin" oss:"$BUCKET/rclone.bin"
 rclone cat oss:"$BUCKET/rclone.bin" | cmp - "$WORK/one.bin"   # rclone 读回内容与本地一致
@@ -4872,7 +4873,7 @@ aws_s3 rb "s3://$BUCKET" --force
 echo "M1 S3 验收全部通过"
 ```
 
-- [ ] **Step 2: 跑脚本**
+- [x] **Step 2: 跑脚本**
 
 Run:
 ```bash
@@ -4883,15 +4884,15 @@ sleep 2
 TOKEN=$(curl -s -X POST localhost:9000/api/v1/login -H 'content-type: application/json' \
   -d '{"username":"erik","password":"pw"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
 curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"access_key":"AKIA_TEST","secret_key":"SK_TEST"}'
+  -H 'content-type: application/json' -d '{"access_key":"AKIA_TEST_ACCESS_KEY","secret_key":"SK_TEST_SECRET_KEY_0001"}'
 echo
 # 然后用这把密钥跑脚本
-ENDPOINT=http://127.0.0.1:9000 AK=AKIA_TEST SK=SK_TEST ./tests/e2e_s3.sh
+ENDPOINT=http://127.0.0.1:9000 AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ./tests/e2e_s3.sh
 kill %1
 ```
 Expected: 脚本打印「M1 S3 验收全部通过」
 
-- [ ] **Step 3: 写 `README.md`** 的运行部分
+- [x] **Step 3: 写 `README.md`** 的运行部分
 
 ````markdown
 # OSS —— 自研分布式对象存储系统
@@ -4931,11 +4932,25 @@ tests/e2e_s3.sh
 ```
 ````
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运行说明"
 ```
+
+### 定稿记录
+
+- **凭据并入（Task 15 的 ≥16 校验）**：脚本默认值与 Step 2 的 provisioning / 调用行统一换成
+  `AKIA_TEST_ACCESS_KEY` / `SK_TEST_SECRET_KEY_0001`（原 `AKIA_TEST`/`SK_TEST` 过不了 `valid_credential`，会被 400 拒掉）。
+- **实跑修订两处（原文本跑不通，实跑发现）**：① `RCLONE_CONFIG_OSS_ENDPOINT` 不能剥 `http://` —— rclone 对不带 scheme
+  的 endpoint 默认按 https 连，明文端口上 TLS 握手挂死；② 补 `RCLONE_CONFIG_OSS_LIST_VERSION=2` —— provider=Other
+  默认发 ListObjects **v1**，M1 只实现 V2，否则 501 NotImplemented（rclone 报 `ListObjects is not implemented yet`）。
+- **`console.rs` 一处统一（并入）**：login 的 token 签发失败分支改 `tracing::error!` + 通用文案「internal error」，
+  对齐 M-2 的 5xx 口径（该文件唯一漏网处）。
+- **README 两处（并入）**：`_header/` 措辞按 `aether.rs` 事实改写（分组目录走 `list_groups`，`_header/` 由
+  `build_runtime` 单独补建）；补一句「`/aetherupload/*` 无认证层（匿名可写），勿暴露公网；认证覆盖层随部署形态（M2）落地」。
+- **实跑（四道闸）**：fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（93 测）·
+  起真服务（`OSS_ADMIN_USER=erik OSS_ADMIN_PASSWORD=pw`）→ 建密钥 → `tests/e2e_s3.sh` 十步全过 → kill。
 
 ---
 

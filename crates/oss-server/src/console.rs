@@ -61,7 +61,10 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
                 Ok(token) => {
                     (StatusCode::OK, Json(serde_json::json!({ "token": token }))).into_response()
                 }
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "token 签发失败").into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, "token 签发失败");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+                }
             }
         }
         Ok(None) => (StatusCode::UNAUTHORIZED, "用户名或密码错误").into_response(),
