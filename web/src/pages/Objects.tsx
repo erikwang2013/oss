@@ -1,15 +1,10 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip, Typography } from 'antd'
+import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, getToken, type ObjectList } from '../api'
-
-function humanSize(n: number) {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`
-}
+import { humanSize } from '../format'
+import UploadPanel from '../upload/UploadPanel'
 
 // 显式给出行类型：否则 antd Table 会从各列 render 的参数注解反推 RecordType，推出带 string 字面量的错误类型，rowKey 与 render 都编译不过
 type Row = { kind: 'dir'; key: string } | { kind: 'obj'; key: string; size: number; etag: string }
@@ -21,6 +16,7 @@ export default function Objects() {
   // prefix 的单一事实源是 URL query：Link 是 SPA 导航、同路由仅 query 变化不重挂载，useState 快照会让面包屑/手改 URL/返回键都失效
   const [sp, setSp] = useSearchParams()
   const prefix = sp.get('prefix') ?? ''
+  const [uploading, setUploading] = useState(false)
 
   const { data, isLoading } = useQuery({
     queryKey: ['objects', bucket, prefix],
@@ -81,9 +77,7 @@ export default function Objects() {
   return (
     <>
       <Breadcrumb items={crumbs} style={{ marginBottom: 16 }} />
-      <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
-        上传入口在 Task 9 接；M1 上传面板就绪前可用 `aws s3 cp` / `rclone` 注入对象。
-      </Typography.Text>
+      <Button type="primary" onClick={() => setUploading(true)} style={{ marginBottom: 16 }}>上传</Button>
       <Table<Row>
         rowKey={(r) => r.key}
         loading={isLoading}
@@ -123,6 +117,7 @@ export default function Objects() {
           },
         ]}
       />
+      <UploadPanel open={uploading} bucket={bucket} onClose={() => setUploading(false)} />
     </>
   )
 }

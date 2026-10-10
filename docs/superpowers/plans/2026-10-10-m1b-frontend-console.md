@@ -1140,7 +1140,7 @@ Minor（同轮）：`restore` 仅在 `window.XMLHttpRequest === Counting` 时还
 - Create: `web/src/upload/UploadPanel.tsx`
 - Modify: `web/src/pages/Objects.tsx`（引用 format.ts、加「上传」按钮）
 
-- [ ] **Step 1: `web/src/format.ts`**
+- [x] **Step 1: `web/src/format.ts`**
 
 ```ts
 export function humanSize(n: number): string {
@@ -1153,7 +1153,7 @@ export function humanSize(n: number): string {
 
 `Objects.tsx`：删掉内联的 `humanSize`，改为 `import { humanSize } from '../format'`。
 
-- [ ] **Step 2: 实现 `web/src/upload/UploadPanel.tsx`**
+- [x] **Step 2: 实现 `web/src/upload/UploadPanel.tsx`**
 
 ```tsx
 import { useRef, useState } from 'react'
@@ -1161,7 +1161,7 @@ import { App, Button, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type GroupInfo, type UploadRecord } from '../api'
 import { humanSize } from '../format'
-import { UploadOutcome, useUpload } from './useUpload'
+import { useUpload, type UploadOutcome } from './useUpload'
 
 export default function UploadPanel({
   open,
@@ -1177,6 +1177,9 @@ export default function UploadPanel({
   const [group, setGroup] = useState('file')
   const [last, setLast] = useState<UploadOutcome | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  // onFilePicked 会清空 input.value（让同一文件再选也触发 onChange），清空后 files 为空——
+  // 原始文件名必须选文件当刻留档，onFinished（异步）里再读就已经是 '' 了
+  const originalNameRef = useRef('')
 
   const { data: groups = [] } = useQuery({
     queryKey: ['groups'],
@@ -1195,11 +1198,10 @@ export default function UploadPanel({
     onFinished: async (outcome) => {
       setLast(outcome)
       message.success(outcome.instant ? '上传成功（秒传）' : '上传成功')
-      const originalName = fileRef.current?.files?.[0]?.name
       if (outcome.savedPath) {
         await api('/api/v1/uploads/register', {
           method: 'POST',
-          body: JSON.stringify({ saved_path: outcome.savedPath, original_name: originalName ?? '' }),
+          body: JSON.stringify({ saved_path: outcome.savedPath, original_name: originalNameRef.current }),
         }).catch(() => message.warning('上传记录登记失败（对象本身已入库）'))
       }
       qc.invalidateQueries({ queryKey: ['objects', bucket] })
@@ -1211,6 +1213,7 @@ export default function UploadPanel({
   const onFilePicked = (e: React.ChangeEvent<HTMLInputElement>) => {
     const input = e.target
     if (!input.files?.[0]) return
+    originalNameRef.current = input.files[0].name
     setLast(null)
     start(input, group)
     input.value = ''
@@ -1285,7 +1288,7 @@ export default function UploadPanel({
 }
 ```
 
-- [ ] **Step 3: `Objects.tsx` 接入上传按钮**
+- [x] **Step 3: `Objects.tsx` 接入上传按钮**
 
 页头加状态与按钮，Modal 挂在页面底部：
 
@@ -1299,11 +1302,11 @@ const [uploading, setUploading] = useState(false)
 
 对应 import：`import UploadPanel from '../upload/UploadPanel'`。
 
-- [ ] **Step 4: 验证**
+- [x] **Step 4: 验证**
 
 后端 + `npm run dev`，打开 `/buckets/<桶>` → 点「上传」→ 选文件 → 进度条推进 → 「上传成功」，历史表出现记录；同一文件再传一次 → 「上传成功（秒传）」+ 金色 Tag。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add web/src/format.ts web/src/upload/UploadPanel.tsx web/src/pages/Objects.tsx
