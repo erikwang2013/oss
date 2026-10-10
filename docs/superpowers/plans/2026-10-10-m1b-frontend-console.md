@@ -492,11 +492,13 @@ export default function Login() {
 
 注意：登录接口失败时后端返回纯文本（非 JSON），`api()` 抛出的 `ApiError.message` 就是「用户名或密码错误」——直接展示。
 
-> 补丁（Task 8 轮次并入）：`setToken(token)` 之后还要种 cookie
-> `document.cookie = \`oss_token=${token}; path=/; SameSite=Lax\``。
+> 补丁（Task 8 轮次并入，后经质量评审收口）：种 cookie 的责任落在 `api.ts` 的 `setToken()` 里
+> （`document.cookie = \`oss_token=${t}; path=/; SameSite=Lax; max-age=43200\``；`setToken(null)` 时
+> `max-age=0` 清掉），本页无需改动。
 > 原因：aetherupload-all.js 的分块 XHR 虽然 `withCredentials: true`，但它不经 `api()`、不会加
 > `Authorization` 头；后端 `/aetherupload/*` 的 JWT 覆盖层（`router.rs`）认 cookie `oss_token`。
-> 不种 cookie，浏览器上传首块就 401。
+> 不种 cookie，浏览器上传首块就 401。放进 `setToken` 是因为 cookie 必须与 localStorage 里的 token
+> 同生命周期——否则 401 清 token / 将来登出后，残留 cookie 仍带着一个已被丢弃的凭据。
 
 - [x] **Step 2: 验证**
 
@@ -891,11 +893,13 @@ ls -l web/public/aetherupload-assets/   # 应有 ~48KB 的 aetherupload-all.js
 
 ```ts
 // web/src/__tests__/useUpload.test.ts
-import { afterEach, describe, expect, it } from 'vitest'
-import { countingUploadingPosts } from '../upload/useUpload'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { renderHook } from '@testing-library/react'
+import { countingUploadingPosts, useUpload, type AetherInstance } from '../upload/useUpload'
 
 afterEach(() => {
-  // 每个用例后若还有包装，靠 restore 恢复；这里兜底断言无泄漏
+  vi.unstubAllGlobals()
+  document.body.innerHTML = ''
 })
 
 describe('countingUploadingPosts', () => {
@@ -918,6 +922,78 @@ describe('countingUploadingPosts', () => {
     c.restore()
     expect(window.XMLHttpRequest).toBe(orig)
   })
+
+  it('后装先还原：restore 只摘自己那一层，不踩掉更晚的包装', () => {
+    const orig = window.XMLHttpRequest
+    const older = countingUploadingPosts()
+    const newer = countingUploadingPosts()
+    older.restore() // 内层先还原：是 no-op，外层仍在位
+    new XMLHttpRequest().open('POST', '/aetherupload/uploading')
+    expect(newer.count()).toBe(1)
+    newer.restore()
+    expect(window.XMLHttpRequest).not.toBe(orig) // 轮到内层包装回到栈顶
+    older.restore()
+    expect(window.XMLHttpRequest).toBe(orig)
+  })
+})
+
+/** 面板 DOM：库从 `parents('#aetherupload-wrapper')` 里找 #aetherupload-savedpath。 */
+function panelDom(savedPath: string): HTMLInputElement {
+  document.body.innerHTML = `
+    <div id="aetherupload-wrapper">
+      <input type="file" id="aetherupload-resource" />
+      <input type="text" id="aetherupload-savedpath" value="${savedPath}" />
+    </div>`
+  return document.querySelector<HTMLInputElement>('#aetherupload-resource')!
+}
+
+/** 假 window.aetherupload：upload() 时按用例安排的动作触发 success 回调。 */
+function stubAetherupload(upload: (fire: () => void) => void): void {
+  let fire: (() => void) | undefined
+  const inst: AetherInstance = {
+    setGroup: () => inst,
+    setSavedPathField: () => inst,
+    setPreprocessRoute: () => inst,
+    setUploadingRoute: () => inst,
+    setLaxMode: () => inst,
+    success: (cb) => ((fire = cb), inst),
+    upload: () => upload(fire!),
+  }
+  vi.stubGlobal('aetherupload', () => inst)
+}
+
+describe('useUpload', () => {
+  it('零 uploading POST ⇒ instant: true，savedPath 从面板读出，且清掉 input disabled', () => {
+    const input = panelDom('uploads/abc.txt')
+    input.setAttribute('disabled', '') // 上次上传后脚本留下的
+    stubAetherupload((fire) => fire())
+    const onFinished = vi.fn()
+    const { result } = renderHook(() => useUpload({ onFinished }))
+
+    result.current.start(input, 'file')
+
+    expect(input.hasAttribute('disabled')).toBe(false)
+    expect(onFinished).toHaveBeenCalledWith({ savedPath: 'uploads/abc.txt', instant: true })
+  })
+
+  it('有过 uploading POST ⇒ instant: false', () => {
+    const input = panelDom('uploads/def.txt')
+    stubAetherupload((fire) => {
+      new XMLHttpRequest().open('POST', '/aetherupload/uploading') // 模拟真分块传输
+      fire()
+    })
+    const onFinished = vi.fn()
+    const { result } = renderHook(() => useUpload({ onFinished }))
+
+    result.current.start(input, 'file')
+
+    expect(onFinished).toHaveBeenCalledWith({ savedPath: 'uploads/def.txt', instant: false })
+  })
+
+  it('window.aetherupload 缺失时报明确错误', () => {
+    const { result } = renderHook(() => useUpload({}))
+    expect(() => result.current.start(panelDom(''), 'file')).toThrow(/aetherupload-all\.js/)
+  })
 })
 ```
 
@@ -932,7 +1008,7 @@ Expected: FAIL（`../upload/useUpload` 不存在）
 import { useCallback } from 'react'
 
 /** aetherupload-all.js 暴露的全局工厂实例（无类型定义，按契约声明）。 */
-type AetherInstance = {
+export type AetherInstance = {
   setGroup(g: string): AetherInstance
   setSavedPathField(sel: string): AetherInstance
   setPreprocessRoute(r: string): AetherInstance
@@ -968,7 +1044,8 @@ export function countingUploadingPosts() {
   return {
     count: () => count,
     restore: () => {
-      window.XMLHttpRequest = Orig
+      // 只在顶层还是自己时才还原：后装先还原会踩掉更晚的包装
+      if ((window.XMLHttpRequest as unknown) === Counting) window.XMLHttpRequest = Orig
     },
   }
 }
@@ -981,22 +1058,31 @@ export interface UploadOutcome {
 /**
  * 驱动 aetherupload-all.js。调用前 `#aetherupload-wrapper` 下的四个 id 必须已在 DOM 里
  * （Task 9 的 UploadPanel 渲染），fileInput 内必须已有用户选好的文件。
+ * savedPath 不调 setSavedPathField：库默认就在 wrapper 内找 `#aetherupload-savedpath`。
  */
 export function useUpload(opts: { onFinished?: (outcome: UploadOutcome) => void }) {
   const start = useCallback(
     (fileInput: HTMLInputElement, group: string) => {
+      const factory = window.aetherupload
+      if (!factory)
+        throw new Error('aetherupload-all.js 未加载：检查 index.html 的 /aetherupload-assets/aetherupload-all.js')
+      // 脚本成功后会给 input 置 disabled，React 不会复位——同面板二次上传必须先清掉
+      fileInput.removeAttribute('disabled')
       const counter = countingUploadingPosts()
-      window
-        .aetherupload!(fileInput)
+      factory(fileInput)
         .setGroup(group)
-        .setSavedPathField('#aetherupload-savedpath')
         .setPreprocessRoute('/aetherupload/preprocess')
         .setUploadingRoute('/aetherupload/uploading')
         .setLaxMode(false)
         .success(() => {
           counter.restore()
+          // 库在 callback 之前已把 savedPath 写进该节点（aetherupload-all.js 225/325 行）
           const savedPath =
-            (document.querySelector('#aetherupload-savedpath') as HTMLInputElement | null)?.value ?? ''
+            (
+              fileInput.closest('#aetherupload-wrapper')?.querySelector('#aetherupload-savedpath') as
+                | HTMLInputElement
+                | null
+            )?.value ?? ''
           opts.onFinished?.({ savedPath, instant: counter.count() === 0 })
         })
         .upload()
@@ -1020,13 +1106,30 @@ git commit -m "feat(web): useUpload 驱动 aetherupload-all.js（含秒传判定
 ```
 
 > 执行注记：脚本 `cmp` 与 crate 内原件逐字节一致（48810 B）。本轮并入三项：
-> (1) `Login.tsx` 登录成功种 cookie `oss_token`（原因见 Task 4 补丁；后端 cookie 契约已由
+> (1) cookie 种在 `setToken()`（`api.ts`，原因见 Task 4 补丁；后端 cookie 契约已由
 > `tests/aether_auth.rs` 覆盖，浏览器侧留给 Task 11 e2e）；
 > (2) `console_api.rs` groups 断言补全形（quality-m1b-7 Minor 1）；
 > (3) `api.ts` `max_size` 加「0 = 不限」注释（Minor 2）。
 > 浏览器手验（登录后看 cookie）同 Task 4，留给 Task 11 e2e。验证：`cargo test --workspace -j 2`
-> 98 全绿；`npm test` 8 用例（含本任务 2 个）、`npm run build`、`npm run lint` 通过
-> （lint 对 vendored 脚本报 92 条 warning，exit 0，未加 ignore 配置——待定夺）。
+> 98 全绿；`npm test` 13 用例、`npm run build`、`npm run lint`（vendored 脚本已 ignore，余 2 条
+> App.tsx 既有 warning）。
+
+## 定稿记录（Task 8 质量评审收尾，commit `fix(web): cookie 入 setToken 同生命周期；input 复位与 hook 收口`）
+
+两条 Important（已落入代码与本计划代码块）：
+
+- **I-1 cookie 生命周期**：cookie 的写入/清除移进 `api.ts` 的 `setToken()`（`max-age=43200` 对齐服务端
+  12h，`setToken(null)` 用 `max-age=0` 清），`Login.tsx` 不再手写 cookie。
+  原因：cookie 是同一凭据的第二份拷贝，必须与 localStorage 同生命周期；散在登录页写、却没有任何
+  地方清，401 清 token 或将来加登出后都会留下一个带着废弃凭据的 cookie。
+- **I-2 input disabled 复位**：`useUpload.start` 开头 `fileInput.removeAttribute('disabled')`。
+  原因：vendored 脚本上传成功后会给 `#aetherupload-resource` 置 `disabled`（aetherupload-all.js 227/327 行），
+  而该节点由 React 渲染、重渲染不会复位——同面板二次上传必然卡死在这行上。
+
+Minor（同轮）：`restore` 仅在 `window.XMLHttpRequest === Counting` 时还原（后装先还原不踩更晚的包装）；
+删 `setSavedPathField` 调用（库默认就在 wrapper 内找），success 里改从 `fileInput.closest('#aetherupload-wrapper')`
+读 savedPath；补 `useUpload` 的三条承诺测试（假 `window.aetherupload`：`instant: true`/`false` 两态 +
+缺 factory 报错）；`.oxlintrc.json` 加 `ignorePatterns: ["public/aetherupload-assets/**"]`（vendored 脚本 92 条 warning）。
 
 ---
 

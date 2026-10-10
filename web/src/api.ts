@@ -1,11 +1,21 @@
 const TOKEN_KEY = 'oss.token'
+// aetherupload-all.js 的分块 XHR 带 withCredentials 但不会加 Authorization 头；
+// 后端 /aetherupload/* 的 JWT 覆盖层认 cookie `oss_token`。寿命对齐服务端 12h（console.rs）。
+const TOKEN_COOKIE = 'oss_token'
+const TOKEN_MAX_AGE = 12 * 3600
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
 }
+/** 写/清 token：localStorage 与 cookie 同生命周期（登出、401 清 token 时 cookie 一并清掉）。 */
 export function setToken(t: string | null): void {
-  if (t) localStorage.setItem(TOKEN_KEY, t)
-  else localStorage.removeItem(TOKEN_KEY)
+  if (t) {
+    localStorage.setItem(TOKEN_KEY, t)
+    document.cookie = `${TOKEN_COOKIE}=${t}; path=/; SameSite=Lax; max-age=${TOKEN_MAX_AGE}`
+  } else {
+    localStorage.removeItem(TOKEN_KEY)
+    document.cookie = `${TOKEN_COOKIE}=; path=/; max-age=0`
+  }
 }
 
 export class ApiError extends Error {

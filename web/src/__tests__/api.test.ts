@@ -4,6 +4,7 @@ import { ApiError, api, getToken, setToken } from '../api'
 afterEach(() => {
   vi.unstubAllGlobals()
   localStorage.clear()
+  document.cookie = 'oss_token=; path=/; max-age=0'
 })
 
 describe('token 存取', () => {
@@ -13,6 +14,13 @@ describe('token 存取', () => {
     expect(getToken()).toBe('t1')
     setToken(null)
     expect(getToken()).toBeNull()
+  })
+
+  it('setToken 同生命周期种/清 cookie oss_token（aetherupload 分块 XHR 只认 cookie）', () => {
+    setToken('c1')
+    expect(document.cookie).toContain('oss_token=c1')
+    setToken(null)
+    expect(document.cookie).not.toContain('oss_token')
   })
 })
 

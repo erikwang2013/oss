@@ -1,7 +1,7 @@
 import { useCallback } from 'react'
 
 /** aetherupload-all.js 暴露的全局工厂实例（无类型定义，按契约声明）。 */
-type AetherInstance = {
+export type AetherInstance = {
   setGroup(g: string): AetherInstance
   setSavedPathField(sel: string): AetherInstance
   setPreprocessRoute(r: string): AetherInstance
@@ -37,7 +37,8 @@ export function countingUploadingPosts() {
   return {
     count: () => count,
     restore: () => {
-      window.XMLHttpRequest = Orig
+      // 只在顶层还是自己时才还原：后装先还原会踩掉更晚的包装
+      if ((window.XMLHttpRequest as unknown) === Counting) window.XMLHttpRequest = Orig
     },
   }
 }
@@ -50,22 +51,31 @@ export interface UploadOutcome {
 /**
  * 驱动 aetherupload-all.js。调用前 `#aetherupload-wrapper` 下的四个 id 必须已在 DOM 里
  * （Task 9 的 UploadPanel 渲染），fileInput 内必须已有用户选好的文件。
+ * savedPath 不调 setSavedPathField：库默认就在 wrapper 内找 `#aetherupload-savedpath`。
  */
 export function useUpload(opts: { onFinished?: (outcome: UploadOutcome) => void }) {
   const start = useCallback(
     (fileInput: HTMLInputElement, group: string) => {
+      const factory = window.aetherupload
+      if (!factory)
+        throw new Error('aetherupload-all.js 未加载：检查 index.html 的 /aetherupload-assets/aetherupload-all.js')
+      // 脚本成功后会给 input 置 disabled，React 不会复位——同面板二次上传必须先清掉
+      fileInput.removeAttribute('disabled')
       const counter = countingUploadingPosts()
-      window
-        .aetherupload!(fileInput)
+      factory(fileInput)
         .setGroup(group)
-        .setSavedPathField('#aetherupload-savedpath')
         .setPreprocessRoute('/aetherupload/preprocess')
         .setUploadingRoute('/aetherupload/uploading')
         .setLaxMode(false)
         .success(() => {
           counter.restore()
+          // 库在 callback 之前已把 savedPath 写进该节点（aetherupload-all.js 225/325 行）
           const savedPath =
-            (document.querySelector('#aetherupload-savedpath') as HTMLInputElement | null)?.value ?? ''
+            (
+              fileInput.closest('#aetherupload-wrapper')?.querySelector('#aetherupload-savedpath') as
+                | HTMLInputElement
+                | null
+            )?.value ?? ''
           opts.onFinished?.({ savedPath, instant: counter.count() === 0 })
         })
         .upload()
