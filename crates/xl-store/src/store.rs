@@ -80,7 +80,8 @@ impl Store {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         // 回收无人持有的旧条目，锁表不随历史写过的键无限增长
-        locks.retain(|k, v| k == &id || Arc::strong_count(v) > 1);
+        //（本键刚 clone 出来，count ≥ 2 必留；其余条目只为 map 自己持有时删掉）
+        locks.retain(|_, v| Arc::strong_count(v) > 1);
         lock
     }
 
@@ -122,7 +123,7 @@ impl Store {
         if non_empty {
             return Err(Error::BucketNotEmpty(bucket.to_string()));
         }
-        // ponytail: check-then-remove 窗口在 Task 5 加锁后收窄；M1 单进程下仅 tokio 任务间竞态
+        // ponytail: 桶级互斥未实现——并发 delete_bucket + put 可让桶「复活」，Task 6/M2 处理
         match tokio::fs::remove_dir(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
@@ -185,10 +186,14 @@ impl Store {
     ///   2. 候选 `xl.meta` 写进同一个 tmp 目录
     ///   3. **同盘 rename** tmp/<uuid> → <bucket>/<obj>/<uuid>     ← 数据就位
     ///   4. 写 `<obj>/xl.meta.new` 并 fsync，再 rename 覆盖 `xl.meta` ← **提交点**
-    ///   5. 老版本目录 → `.oss.sys/trash/`（异步删）
+    ///   5. 老版本目录 → `.oss.sys/trash/`（移入 trash，由 GC 回收——M1 未实现回收器）
     ///
     /// 3 与 4 之间崩溃 = 留下一个孤儿版本目录（不可见，启动自检回收）；
     /// 4 之后崩溃 = 老版本目录残留（不可见，clean 回收）。读路径只信 xl.meta。
+    ///
+    /// M1 持久化假设：`fsync=true` 时数据文件与 `xl.meta.new` 都先做 file fsync；
+    /// ext4/XFS 隐含提交先前的 rename，故提交点一次 rename 即可。**没有目录 fsync**，
+    /// 换文件系统（或要求断电零丢失）需复核这两条假设。
     pub async fn put_object_stream(
         &self,
         bucket: &str,
@@ -201,52 +206,68 @@ impl Store {
 
         let _guard = self.lock_for(bucket, key).lock_owned().await;
 
+        // M-6 裁决：损坏的 meta 让 PUT fail-closed（报错），不静默当作空对象覆盖——盘上可能还有旧数据，宁可失败也不毁
         let old_meta = self.read_meta(bucket, key).await?;
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(&self.cfg.root, "tmp").join(&uuid);
-        tokio::fs::create_dir_all(&tmp).await?;
+        let now = now_nanos();
 
-        // 1) 流式写数据 + 增量哈希
-        let part_path = tmp.join("part.1");
-        let mut file = tokio::fs::File::create(&part_path).await?;
-        let mut md5 = Md5::new();
-        let mut sha = Sha256::new();
-        let mut size: u64 = 0;
-        while let Some(chunk) = futures::StreamExt::next(&mut body).await {
-            let chunk = chunk?;
-            md5.update(&chunk);
-            sha.update(&chunk);
-            size += chunk.len() as u64;
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        if self.cfg.fsync {
-            file.sync_all().await?;
-        }
-        drop(file);
+        // 1)+2) 数据与候选 meta 落 tmp；任何写失败/流错误都 best-effort 清掉本轮 tmp
+        //（未提交前 tmp 不被任何 meta 引用，失败即弃；残留也只占空间，由启动自检回收）
+        let staged: Result<(u64, String, XlMeta)> = async {
+            tokio::fs::create_dir_all(&tmp).await?;
 
-        let etag = hex::encode(md5.finalize());
-        let version = Version {
-            version_id: uuid::Uuid::nil(), // M1 无版本控制：nil = S3 的 "null" 版本
-            mod_time_nanos: now_nanos(),
-            size,
-            etag: etag.clone(),
-            content_type: content_type.clone(),
-            user_metadata: Default::default(),
-            part: PartRef {
-                uuid: uuid.clone(),
-                part: 1,
+            // 1) 流式写数据 + 增量哈希
+            let part_path = tmp.join("part.1");
+            let mut file = tokio::fs::File::create(&part_path).await?;
+            let mut md5 = Md5::new();
+            let mut sha = Sha256::new();
+            let mut size: u64 = 0;
+            while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+                let chunk = chunk?;
+                md5.update(&chunk);
+                sha.update(&chunk);
+                size += chunk.len() as u64;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            if self.cfg.fsync {
+                file.sync_all().await?;
+            }
+            drop(file);
+
+            let etag = hex::encode(md5.finalize());
+            let version = Version {
+                version_id: uuid::Uuid::nil(), // M1 无版本控制：nil = S3 的 "null" 版本
+                mod_time_nanos: now,
                 size,
-                sha256: hex::encode(sha.finalize()),
-            },
-        };
-        let meta = XlMeta {
-            object_key: key.to_string(),
-            versions: vec![version],
-        };
+                etag: etag.clone(),
+                content_type: content_type.clone(),
+                user_metadata: Default::default(),
+                part: PartRef {
+                    uuid: uuid.clone(),
+                    part: 1,
+                    size,
+                    sha256: hex::encode(sha.finalize()),
+                },
+            };
+            let meta = XlMeta {
+                object_key: key.to_string(),
+                versions: vec![version],
+            };
 
-        // 2) 候选 meta 落 tmp
-        tokio::fs::write(tmp.join(meta::META_FILE), meta.encode()?).await?;
+            // 2) 候选 meta 落 tmp
+            tokio::fs::write(tmp.join(meta::META_FILE), meta.encode()?).await?;
+            Ok((size, etag, meta))
+        }
+        .await;
+        let (size, etag, meta) = match staged {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+                return Err(e);
+            }
+        };
 
         // 3) 同盘 rename：数据就位（此时对读路径仍不可见）
         let obj_dir = layout::object_dir(&self.cfg.root, bucket, key)?;
@@ -260,7 +281,8 @@ impl Store {
         if let Some(old) = old_meta.as_ref().and_then(|m| m.latest()) {
             let old_dir = obj_dir.join(&old.part.uuid);
             let trash = layout::sys_dir(&self.cfg.root, "trash").join(&old.part.uuid);
-            if tokio::fs::try_exists(&trash).await? {
+            // best-effort：提交点已过，回收站的任何错误都不该让已提交的 PUT 报失败
+            if matches!(tokio::fs::try_exists(&trash).await, Ok(true)) {
                 let _ = tokio::fs::remove_dir_all(&trash).await;
             }
             let _ = tokio::fs::rename(&old_dir, &trash).await;
@@ -271,7 +293,7 @@ impl Store {
             size,
             etag,
             content_type,
-            last_modified_nanos: now_nanos(),
+            last_modified_nanos: now,
             user_metadata: Default::default(),
         })
     }
@@ -457,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_head() {
-        let (s, _d) = store().await;
+        let (s, d) = store().await;
         s.create_bucket("alpha").await.unwrap();
         let info = s
             .put_object(
@@ -475,6 +497,22 @@ mod tests {
 
         let head = s.head_object("alpha", "dir/hello.txt").await.unwrap();
         assert_eq!(head.etag, info.etag);
+
+        // 盘上数据校验：meta 记录的 part.uuid 目录里，part.1 必须就是写进去的字节
+        let obj_dir = layout::object_dir(d.path(), "alpha", "dir/hello.txt").unwrap();
+        let on_disk = XlMeta::decode(
+            &tokio::fs::read(obj_dir.join(meta::META_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let part = obj_dir
+            .join(&on_disk.latest().unwrap().part.uuid)
+            .join("part.1");
+        assert_eq!(
+            tokio::fs::read(&part).await.unwrap(),
+            b"hello world".to_vec()
+        );
     }
 
     #[tokio::test]
@@ -493,21 +531,58 @@ mod tests {
         assert_eq!(s.head_object("alpha", "k").await.unwrap().size, 8);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_streams_without_buffering_whole_body() {
-        // 3 个 1KB 的块，验证流式写与增量哈希
-        let (s, _d) = store().await;
+        // 握手式断言：第一块发出后，盘上 tmp/<uuid>/part.1 必须已含它的字节，之后才放行剩余块。
+        // 若实现把整份 body 缓冲到流结束再写，这里的轮询必然等不到而失败——这才是真流式的判别点。
+        let (s, d) = store().await;
         s.create_bucket("alpha").await.unwrap();
-        let chunks: Vec<Result<Bytes>> = vec![
-            Ok(Bytes::from(vec![b'a'; 1024])),
-            Ok(Bytes::from(vec![b'a'; 1024])),
-            Ok(Bytes::from(vec![b'a'; 1024])),
-        ];
-        let stream = futures::stream::iter(chunks);
-        let info = s
-            .put_object_stream("alpha", "big.bin", Box::pin(stream), None)
+        let s = std::sync::Arc::new(s);
+        let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes>>(1);
+        let put = tokio::spawn({
+            let s = std::sync::Arc::clone(&s);
+            async move {
+                s.put_object_stream("alpha", "big.bin", Box::pin(rx), None)
+                    .await
+            }
+        });
+
+        let first = Bytes::from(vec![b'a'; 1024]);
+        futures::SinkExt::send(&mut tx, Ok(first.clone()))
             .await
             .unwrap();
+        let tmp_root = layout::sys_dir(d.path(), "tmp");
+        let mut on_disk = false;
+        for _ in 0..200 {
+            if let Ok(mut entries) = tokio::fs::read_dir(&tmp_root).await {
+                while let Ok(Some(e)) = entries.next_entry().await {
+                    if let Ok(bytes) = tokio::fs::read(e.path().join("part.1")).await
+                        && bytes == first.as_ref()
+                    {
+                        on_disk = true;
+                        break;
+                    }
+                }
+            }
+            if on_disk {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            on_disk,
+            "第一块在 body 结束前没有落盘：实现把整份 body 缓冲了"
+        );
+
+        // 放行剩余块并收尾
+        futures::SinkExt::send(&mut tx, Ok(Bytes::from(vec![b'a'; 1024])))
+            .await
+            .unwrap();
+        futures::SinkExt::send(&mut tx, Ok(Bytes::from(vec![b'a'; 1024])))
+            .await
+            .unwrap();
+        drop(tx);
+        let info = put.await.unwrap().unwrap();
         assert_eq!(info.size, 3072);
     }
 
@@ -543,21 +618,31 @@ mod tests {
 
     #[tokio::test]
     async fn crash_between_steps_leaves_no_visible_object() {
-        // 模拟「tmp 里写了但没提交」：手造一个 tmp 孤儿，断言对象仍不可见
+        // 崩在 3/4 之间的现场：tmp 孤儿 + 一个已被 rename 进对象目录、但无 meta 引用的版本目录。
+        // 读者必须仍看到旧版本（这里 k 已有提交版本），绝不能看到未提交的数据。
         let (s, d) = store().await;
         s.create_bucket("alpha").await.unwrap();
+        let old = s
+            .put_object("alpha", "k", Bytes::from_static(b"one"), None)
+            .await
+            .unwrap();
+
         let orphan = layout::sys_dir(d.path(), "tmp").join("orphan-uuid");
         tokio::fs::create_dir_all(&orphan).await.unwrap();
         tokio::fs::write(orphan.join("part.1"), b"junk")
             .await
             .unwrap();
-        assert_eq!(
-            s.head_object("alpha", "ghost")
-                .await
-                .unwrap_err()
-                .to_string(),
-            "key not found: ghost"
-        );
+        let dangling = layout::object_dir(d.path(), "alpha", "k")
+            .unwrap()
+            .join("dangling-uuid");
+        tokio::fs::create_dir_all(&dangling).await.unwrap();
+        tokio::fs::write(dangling.join("part.1"), b"uncommitted")
+            .await
+            .unwrap();
+
+        let head = s.head_object("alpha", "k").await.unwrap();
+        assert_eq!(head.etag, old.etag);
+        assert_eq!(head.size, 3);
     }
 
     #[tokio::test]
