@@ -3434,7 +3434,10 @@ Expected: 编译错误（实测能编译：`S3` trait 自带默认方法体，�
         let mut buf = Vec::new();
         let mut total = 0usize;
         while let Some(chunk) = futures::StreamExt::next(&mut body).await {
-            let chunk = chunk.map_err(|e| s3s::s3_error!(InternalError, "{e}"))?;
+            let chunk = chunk.map_err(|e| {
+                tracing::warn!(error = ?e, "读取 PUT 请求体失败");
+                s3s::s3_error!(IncompleteBody, "failed to read request body")
+            })?;
             total += chunk.len();
             if total > self.max_put_bytes {
                 return Err(s3s::s3_error!(EntityTooLarge, "object exceeds max_put_bytes"));
@@ -3888,10 +3891,14 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// S3 业务错误（NoSuchBucket 等）由 s3s 在 ops 层序列化成带正确状态码的 XML 响应，不会走到这里；
-/// 到这里的是 HTTP 层错误（body 过大、格式非法等）—— 兜底 500。
+/// 只有 s3s 连错误响应都序列化失败时才到达，近乎不可达的兜底 —— 包括 body 超限、
+/// 格式非法在内的 HTTP 层错误都已在 s3s 的 `ops::call` 内 XML 化了。
 async fn handle_s3_error(err: s3s::HttpError) -> (axum::http::StatusCode, String) {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.into_std_error().to_string())
+    tracing::error!(error = ?err, "s3s 错误响应失败（兜底 500）");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error".to_string(),
+    )
 }
 ```
 
@@ -4930,7 +4937,11 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > - M1 的 `/aetherupload/*` 四条路由**无认证层（匿名可写）**，勿暴露公网；认证覆盖层随部署形态（M2）落地。
 > - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
 > - 单段 PUT 上限 256 MiB（`max_put_bytes`）。
+> - Multipart 与 Range 未实现（M2）：≥8 MiB 的 `aws-cli s3 cp` 默认走 multipart → 501；Range 被忽略（200 + 全量）。
+>   变通：`aws configure set default.s3.multipart_threshold 268435456`。
 > - `x-amz-meta-*` 用户元数据**静默丢弃**（M2 接上）。
+> - `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须换成回环绑定与随机密钥
+>   （与上面 `/aetherupload/*` 匿名可写合用即 LAN 风险面）。
 
 ## 验收
 
@@ -4961,6 +4972,11 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
   `build_runtime` 单独补建）；补一句「`/aetherupload/*` 无认证层（匿名可写），勿暴露公网；认证覆盖层随部署形态（M2）落地」。
 - **实跑（四道闸）**：fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（93 测）·
   起真服务（`OSS_ADMIN_USER=erik OSS_ADMIN_PASSWORD=pw`）→ 建密钥 → `tests/e2e_s3.sh` 十步全过 → kill。
+- **终审收口（6 条 Minor）**：M1 两处 5xx 口径（`service.rs` 的 body 流错误 → 4xx `IncompleteBody` + 通用文案，
+  原错误进 `tracing::warn!`；`router.rs` 兜底 500 → 通用文案 + `tracing::error!`，两处计划块已同步）；
+  M2/M6 README 已知限制补 Multipart/Range 与默认姿态两行（`oss.toml` 默认值不动）；
+  M3 本地 `-j 2` 系本机内存所限、CI 用默认并行度（两者均 93 测全绿），本分支未推送、CI 尚未实际跑过；
+  M4 风险表补三行 + 设计 §4.1 目录树补 `xl.meta（候选）` 注释；M5 接受现状（M4 接 ecat-auth 时结构性解决）。
 
 ---
 
@@ -4999,3 +5015,6 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 | 删除路径残留（`remove_dir_all` 部分失败/崩溃，留下无 meta 的垃圾目录） | 不可见（读路径只信 `xl.meta`，列举跳过无 meta 的目录），但会让桶「非空」而删不掉（`BucketNotEmpty`）→ M2 的 fsck 清理垃圾目录 |
 | **`/aetherupload/*` 四条路由无认证层，匿名可写**（质量评审 I-3） | 规格 §0.1 提的「会话 Cookie/JWT 覆盖层」在 M1a/M1b 计划里均无落点；四条路由当前匿名可达（预处理/分块/展示/下载）。处置：M1 收尾时向用户裁决是否补最小鉴权（如仅允许回环或加静态 token），否则随部署形态（M2）接。README 的已知限制由 Task 16 补一句 |
 | **`record_upload` 失败：uploads 行缺失但秒传索引已写**（质量评审 Minor 4） | 索引里的 `savedPath` 指向已进桶的对象，但 `register_upload` 永远 404（无行可更新），且同内容**重传不补**（秒传命中即返回，不再触发 ingest/记录）→ 该内容在控制台不可见。M1 记录失败只 `tracing::error!`；处置：M2 把「写索引」挪到 ingest 成功之后，或让 register 支持 upsert |
+| 桶级互斥缺失（`store.rs` 的 `delete_bucket` ponytail 注释，终审 Minor 4） | 并发 `delete_bucket` + `put_object` 可让桶「复活」（删目录与写对象目录竞态）；M2 用桶级锁或原子删除语义处理 |
+| 单个损坏的 `xl.meta`（`CorruptMeta`）会让整桶列举 500（终审不确定性 2） | 列举逐对象 `read_meta`，遇损坏即整个请求失败（`list_objects` 用 `?` 传播，最终 500）。读路径 fail-closed 是有意的（不静默服务错位内容），但影响面从单对象扩到整桶列举（管理面）；M2 fsck 前需人工处理该对象 |
+| 版本目录内含提交时的候选 `xl.meta` 副本（有意，MinIO 同构；终审不确定性 3） | 设计 §4.1 布局图原先只画 `part.N`（已在树中补 `xl.meta（候选）` 注释）；M2 写 GC 时若只按图理解会把副本当异常／漏处理 |

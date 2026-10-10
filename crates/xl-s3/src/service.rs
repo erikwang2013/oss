@@ -107,7 +107,10 @@ impl S3 for OssS3 {
         let mut buf = Vec::new();
         let mut total = 0usize;
         while let Some(chunk) = futures::StreamExt::next(&mut body).await {
-            let chunk = chunk.map_err(|e| s3s::s3_error!(InternalError, "{e}"))?;
+            let chunk = chunk.map_err(|e| {
+                tracing::warn!(error = ?e, "读取 PUT 请求体失败");
+                s3s::s3_error!(IncompleteBody, "failed to read request body")
+            })?;
             total += chunk.len();
             if total > self.max_put_bytes {
                 return Err(s3s::s3_error!(

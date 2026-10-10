@@ -131,6 +131,7 @@ oss/
     └── a__XLDIR__b__XLDIR__c.txt/     ← 对象名展平（MinIO 同款）
         ├── xl.meta                    元数据（唯一提交点）
         └── <uuid>/part.1 part.2 …     每次写入一个版本目录
+            └── xl.meta（候选）        提交时写入的元数据副本（rename 覆盖上层后仍保留在版本目录里）
 ```
 
 ### 4.2 五条铁律

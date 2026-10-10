@@ -36,8 +36,9 @@ pub fn build_router(state: AppState) -> Router {
 /// 只有 s3s 连错误响应都序列化失败时才到达，近乎不可达的兜底 —— 包括 body 超限、
 /// 格式非法在内的 HTTP 层错误都已在 s3s 的 `ops::call` 内 XML 化了。
 async fn handle_s3_error(err: s3s::HttpError) -> (axum::http::StatusCode, String) {
+    tracing::error!(error = ?err, "s3s 错误响应失败（兜底 500）");
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        err.into_std_error().to_string(),
+        "internal error".to_string(),
     )
 }
