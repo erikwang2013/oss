@@ -3918,7 +3918,7 @@ git add crates/oss-server/ && git commit -m "feat(server): s3s 挂进 e-cat rout
 - Create: `crates/oss-server/src/aether.rs`
 - Modify: `crates/oss-server/src/router.rs`, `state.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 // crates/oss-server/tests/aether_ingest.rs
@@ -3963,12 +3963,13 @@ async fn ingest_sink_puts_finished_file_into_store() {
 
 > `Resource::new(upload_root: &Path, group, group_dir, group_sub_dir, name)` —— `aetherupload-rust-1.0.3/src/resource.rs:25`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p oss-server --test aether_ingest 2>&1 | tail -15`
 Expected: 编译错误（`st.ingest` 未定义）
+实际：FAIL，`error[E0609]: no field 'ingest' on type 'AppState'`，与预期一致。
 
-- [ ] **Step 3: 实现 `aether.rs`**
+- [x] **Step 3: 实现 `aether.rs`**
 
 ```rust
 //! aetherupload 接线：四条路由 + 秒传索引（落 SQL，不引 Redis）+ 上传完成后原生 ingest。
@@ -4101,7 +4102,10 @@ pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
         );
     }
 
-    let runtime = Runtime::new(cfg, &state.cfg.staging_dir)
+    // Runtime 的上传根是 `base_path.join(root_dir)`；base_path 给空串，
+    // upload_root 便恰好等于 staging_dir —— 相对（oss.toml 的 `./staging`）与绝对
+    // （集成测试的 tempdir）两种配置下都成立。
+    let runtime = Runtime::new(cfg, "")
         .expect("aetherupload Runtime 构造失败")
         .with_instant(Arc::new(SqlInstantStore::new(Arc::clone(&state.db))))
         .with_events(Arc::new(IngestSink {
@@ -4110,15 +4114,19 @@ pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
             cfg: Arc::clone(&state.cfg),
         }));
 
-    // 分组目录（`_header/` 与各分组目录）必须先存在，否则预处理会报笼统的上传错误。
-    // aetherupload 自带 e2e 也是用 list_groups 建的。
+    // 分组目录必须先存在，否则预处理会报笼统的上传错误。aetherupload 自带 e2e 也是用 list_groups 建的。
     let _ = aetherupload::console::list_groups(&runtime, &mut |_| {});
+
+    // `_header/`（断点文件目录）单独补建：list_groups 只在它自己新建根目录时顺带建 `_header/`，
+    // 而启动自举早已建好 staging_dir —— 不补这一下，预处理会以 "fail to write head resource" 失败。
+    std::fs::create_dir_all(state.cfg.staging_dir.join(aetherupload::header::HEADER_DIR))
+        .expect("创建 aetherupload _header 目录失败");
 
     Arc::new(runtime)
 }
 ```
 
-- [ ] **Step 4: `state.rs` 加字段**
+- [x] **Step 4: `state.rs` 加字段**
 
 ```rust
 #[derive(Clone)]
@@ -4143,30 +4151,34 @@ impl AppState {
 }
 ```
 
-- [ ] **Step 5: `router.rs` 挂 aetherupload 的四条路由**
+- [x] **Step 5: `router.rs` 挂 aetherupload 的四条路由**
 
 ```rust
-    // aetherupload：四条路由（预处理 / 分块 / 展示 / 下载）
+    // aetherupload：四条路由（预处理 / 分块 / 展示 / 下载）。
+    // `routes` 返回的是 Router<()>（runtime 已 state 进各 handler）；`.with_state(())`
+    // 只是把 marker 参数转回本函数的 Router<AppState>，为后续 `.nest` 控制台 API 留位。
     let aether = aetherupload::integrations::ecat::routes(crate::aether::build_runtime(&state));
 
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
-        .merge(aether)
+        .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
         .with_state(state)
 ```
 
-注意：`aetherupload::integrations::ecat::routes` 返回的是 `Router`（不带 state），
-`merge` 进带 `AppState` 的 Router 之前要先 `.with_state(())` 转成 `Router<()>`——
-若编译报 `Router<S>` 不匹配，用 `Router::<()>::new().merge(aether)` 的写法把两者都降到 `Router<()>`，
-再把 `AppState` 用 `Extension` 层注入控制台 API（或干脆让控制台 API 自己 `with_state` 一个子 Router 再 merge）。
+注意（定稿）：`aetherupload::integrations::ecat::routes` 返回 `Router`（= `Router<()>`），
+axum 0.8 没有 `From<Router<()>> for Router<S>` 的转换，直接 `merge` 不过编译。
+但 `with_state<S2>` 的 `S2` 是自由的 marker 参数 —— `aether.with_state(())` 即可并入
+`Router<AppState>`，无需把两者降到 `Router<()>`（也就不需要 `Extension` 注入）。
+Task 15 的 `.nest("/api/v1", crate::console::routes())`（`Router<AppState>`）因此照旧成立。
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cargo test -p oss-server 2>&1 | tail -15`
 Expected: 全绿（含 ingest 测试）
+实际：PASS。四闸实测：`cargo fmt --all`（无 diff）· `cargo clippy --workspace --all-targets` 0 告警 · `cargo test -p oss-server` 5+2+1+1 全绿 · `cargo test --workspace -j 2` 全绿（xl-store 51 / xl-s3 7+2+12 / oss-server 5+2+1+1）。
 
-- [ ] **Step 7: 手动验证四条路由挂上了**
+- [x] **Step 7: 手动验证四条路由挂上了**
 
 Run:
 ```bash
@@ -4183,11 +4195,46 @@ Expected: 返回 JSON 且 `"error":"0"`，含 `chunkSize` / `resourceTempBaseNam
 分组目录由 `aether::build_runtime` 构造时调用 `aetherupload::console::list_groups` 自动创建。
 （`cargo run -p aetherupload-rust` 不可用：它是 registry 依赖，不是 workspace 成员。）
 
-- [ ] **Step 8: 提交**
+实际：PASS。响应 `{"error":0,"chunkSize":1000000,"groupSubDir":"202610","resourceTempBaseName":"69f87b216bd206c2","resourceExt":"txt","savedPath":""}`（`error` 是数字 0，非字符串 "0"）。
+首跑暴露真问题：`./staging` 已被启动自举建好，`list_groups` 便跳过 `_header/`（它只在自建根目录时顺带建），
+预处理以 `"fail to write head resource"` 失败 —— build_runtime 现已单独补建 `_header/`（见 Step 3 块），复跑即 0。
+（跑验证用的端口 9000 与 `./staging`、`./data`、`./oss.db*` 均在 .gitignore 内。）
+
+- [x] **Step 8: 提交**
 
 ```bash
 git add crates/oss-server/ && git commit -m "feat(server): aetherupload 接线 + 上传完成原生 ingest"
 ```
+
+（实际一并带上 `crates/xl-store/src/layout.rs` 与计划文件——见定稿记录并入项 4。）
+
+### 定稿记录
+
+- **`Runtime::new` 的 base_path 改为空串（偏离计划块原文）**：`Runtime::new(cfg, base_path)` 内部是
+  `base_path.join(cfg.root_dir)`。计划原文传 `&state.cfg.staging_dir` 且 `root_dir = staging_dir`：
+  staging_dir 为绝对路径（测试的 tempdir）时 `join` 按语义返回绝对路径、侥幸成立；但 oss.toml 写的是
+  相对路径 `./staging`，会拼出 `./staging/./staging`（多一层，落盘位置与暂存目录语义不符）。
+  改传空串后两种路径下 upload_root 都恰好等于 staging_dir。实测 `./staging/{file,video,image}` 建在预期位置。
+- **`_header/` 补建（计划遗漏的必需项，Step 7 首跑实证）**：`list_groups` 只在它自己新建根目录时
+  递归建 `_header/`；启动自举已先 `create_dir_all(staging_dir)`，于是预处理必报
+  `"fail to write head resource"`。build_runtime 末尾补
+  `create_dir_all(staging_dir.join(aetherupload::header::HEADER_DIR))`（HEADER_DIR 是公开常量，值 `_header`），
+  失败即 panic 快速失败。测试 `build_runtime_prepares_staging_dirs` 钉住（`_header/` + 分组目录）。
+- **`merge` 的 state 处理（计划「注意」段的定稿口径）**：见 Step 5 下方注记——用
+  `aether.with_state(())` 并入 `Router<AppState>`，未采用「降到 Router<()> + Extension」的备选方案；
+  Task 15 的 `.nest` 口径不受影响。`router.rs` 的 `handle_s3_error` 注释按并入项 1 修正为
+  「只有 s3s 连错误响应都序列化失败时才到达，近乎不可达的兜底」，**函数体未动**（Task 13 块内为旧注释，此处不追改）。
+- **并入项 2、3（`tests/s3_over_http.rs`）**：文件头注释重写为两行实话——本文件只验「挂载 + 鉴权接线」
+  （403 来自 default_check，排除 setAuth 漏接的半成品形态），签名闭环交 Task 16；
+  并删掉 `create_user` + `create_access_key` 两行死装置（请求不带凭据，对断言零贡献）。断言与行为未动。
+- **并入项 4（`xl-store/src/layout.rs`）**：`validate_bucket` 的 `InvalidBucketName` 消息改用
+  `name.escape_debug()`（与 `validate_key` 同款、与非 URL 来源对齐；控制字符不再原样进 S3 响应体），
+  三处 `Err(...)` 收口为一个 `reject()` 闭包；新增 `invalid_bucket_message_escapes_user_bytes`
+  （断言消息不含原始 `\0` 且含转义形式 `\\0`）。`xl-s3/src/convert.rs` 既有的
+  `"invalid bucket name: b"` 断言不受影响（该名字无控制字符）。
+- **测试文件与 Step 1 块的两处差异（按 Task 11 先例记在定稿记录，不重写 Step 1 块）**：顶部补
+  `use aetherupload::events::EventSink;`（调 trait 方法需要）；另加第二个测试
+  `build_runtime_prepares_staging_dirs`（对应上条 `_header/` 修复）。其余与块内逐字一致。
 
 ---
 

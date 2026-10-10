@@ -15,6 +15,10 @@ pub const SYS_DIR: &str = ".oss.sys";
 const MAX_KEY_LEN: usize = 1024;
 
 pub fn validate_bucket(name: &str) -> Result<()> {
+    // 与控制台/aether 上传等非 URL 来源对齐：错误消息会进 S3 响应体，escape_debug
+    // 让控制字符不破坏 XML（validate_key 同款）。
+    let reject = || Err(Error::InvalidBucketName(name.escape_debug().to_string()));
+
     let ok_len = (3..=63).contains(&name.len());
     let ok_chars = name
         .bytes()
@@ -30,12 +34,12 @@ pub fn validate_bucket(name: &str) -> Result<()> {
                 && p.parse::<u16>().is_ok_and(|n| n <= 255)
         });
     if looks_like_ipv4 {
-        return Err(Error::InvalidBucketName(name.to_string()));
+        return reject();
     }
     if ok_len && ok_chars && ok_edges && ok_no_dotdot {
         Ok(())
     } else {
-        Err(Error::InvalidBucketName(name.to_string()))
+        reject()
     }
 }
 
@@ -167,5 +171,15 @@ mod tests {
         // S3 规则：不得形如 IP 地址（规格 §2.1）
         assert!(validate_bucket("192.168.1.1").is_err());
         assert!(validate_bucket("1.2.3.4.5").is_ok()); // 五段不是 IPv4，合法
+    }
+
+    #[test]
+    fn invalid_bucket_message_escapes_user_bytes() {
+        let msg = validate_bucket("a\u{0}b").unwrap_err().to_string();
+        assert!(!msg.contains('\u{0}'), "原始控制字符不得进消息: {msg:?}");
+        assert!(
+            msg.contains("\\0"),
+            "转义形式保留「哪个名字不合规」: {msg:?}"
+        );
     }
 }

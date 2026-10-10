@@ -20,14 +20,20 @@ pub fn build_router(state: AppState) -> Router {
     s3_builder.set_auth(SigV4Auth::new(state.db.pool().clone()));
     let s3 = s3_builder.build();
 
+    // aetherupload：四条路由（预处理 / 分块 / 展示 / 下载）。
+    // `routes` 返回的是 Router<()>（runtime 已 state 进各 handler）；`.with_state(())`
+    // 只是把 marker 参数转回本函数的 Router<AppState>，为后续 `.nest` 控制台 API 留位。
+    let aether = aetherupload::integrations::ecat::routes(crate::aether::build_runtime(&state));
+
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
+        .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
         .with_state(state)
 }
 
-/// S3 业务错误（NoSuchBucket 等）由 s3s 在 ops 层序列化成带正确状态码的 XML 响应，不会走到这里；
-/// 到这里的是 HTTP 层错误（body 过大、格式非法等）—— 兜底 500。
+/// 只有 s3s 连错误响应都序列化失败时才到达，近乎不可达的兜底 —— 包括 body 超限、
+/// 格式非法在内的 HTTP 层错误都已在 s3s 的 `ops::call` 内 XML 化了。
 async fn handle_s3_error(err: s3s::HttpError) -> (axum::http::StatusCode, String) {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,

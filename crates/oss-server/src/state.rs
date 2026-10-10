@@ -11,14 +11,23 @@ pub struct AppState {
     pub cfg: Arc<AppConfig>,
     pub db: Arc<Db>,
     pub store: Arc<Store>,
+    pub ingest: Arc<crate::aether::IngestSink>,
 }
 
 impl AppState {
     pub fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
-        Self {
-            cfg: Arc::new(cfg),
-            db: Arc::new(db),
+        let cfg = Arc::new(cfg);
+        let db = Arc::new(db);
+        let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::new(store),
+            db: Arc::clone(&db),
+            cfg: Arc::clone(&cfg),
+        });
+        Self {
+            cfg,
+            db,
+            store: Arc::clone(&ingest.store),
+            ingest,
         }
     }
 }
