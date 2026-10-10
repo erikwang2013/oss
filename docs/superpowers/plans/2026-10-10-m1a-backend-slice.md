@@ -2878,55 +2878,88 @@ git add crates/oss-server/ oss.toml && git commit -m "feat(server): e-cat 起服
 - Create: `crates/xl-s3/src/auth.rs`
 - Create: `crates/xl-s3/src/convert.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 最小控制面 schema 的内联建库：`xl-s3` 不能反向依赖 `oss-server`，
+    /// 列与 `oss-server/migrations/0001_init.sql` 对齐（只取本任务用到的列）。
+    async fn oss_test_db() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);\
+             CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
+              status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     #[tokio::test]
     async fn known_access_key_resolves() {
-        let db = oss_test_db().await;
-        db.create_user("u", "p", true).await.unwrap();
-        db.create_access_key("AKIA_TEST", "SK_TEST", 1).await.unwrap();
-        let auth = SigV4Auth::new(db.pool().clone());
+        let pool = oss_test_db().await;
+        sqlx::query("INSERT INTO users (id, username) VALUES (1, 'u')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) \
+             VALUES ('AKIA_TEST', 'SK_TEST', 1, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth = SigV4Auth::new(pool);
         assert_eq!(auth.get_secret_key("AKIA_TEST").await.unwrap().expose(), "SK_TEST");
     }
 
     #[tokio::test]
     async fn unknown_access_key_is_rejected() {
-        let db = oss_test_db().await;
-        let auth = SigV4Auth::new(db.pool().clone());
+        let auth = SigV4Auth::new(oss_test_db().await);
         assert!(auth.get_secret_key("NOPE").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn inactive_or_expired_access_key_is_rejected() {
+        let pool = oss_test_db().await;
+        sqlx::query("INSERT INTO users (id, username) VALUES (1, 'u')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, status, created_at) \
+             VALUES ('AKIA_OFF', 'SK_OFF', 1, 'inactive', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, expires_at, created_at) \
+             VALUES ('AKIA_OLD', 'SK_OLD', 1, 1, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth = SigV4Auth::new(pool);
+        assert!(auth.get_secret_key("AKIA_OFF").await.is_err());
+        assert!(auth.get_secret_key("AKIA_OLD").await.is_err());
     }
 }
 ```
 
-> 为了让 `xl-s3` 的测试能建库，`xl-s3` 的 dev-dependencies 加 `tokio`、`tempfile`，并在 `crates/xl-s3/tests/` 或 `auth.rs` 的测试模块里提供 `oss_test_db()` 辅助：直接用 `sqlx::SqlitePool::connect("sqlite::memory:")` + `oss-server` 的 schema？——**不要**：`xl-s3` 不能反向依赖 `oss-server`。改为在 `xl-s3` 里内联最小 schema：
+> **调和注记（实现时定稿）**：原稿的 `oss_test_db()` 返回 `db.create_user(...)/db.pool()` 形式的对象，但那等价于 `oss-server::db::SqlxClient`，而 `xl-s3` 不能反向依赖 `oss-server`。定稿：`oss_test_db()` 直接返回 `sqlx::SqlitePool`（内联最小 schema，见上），用户/密钥数据用 `sqlx::query` 直接 INSERT，列与 `oss-server/migrations/0001_init.sql` 一致（`status` 只用 `'active'`/`'inactive'`，见 `db.rs` 的 revoke）。`xl-s3` 的 dev-dependencies 需要 `tokio`、`tempfile`（已在 workspace 骨架里）。第三条测试覆盖查询里的 `status='active'`/`expires_at` 谓词 —— 原稿两条测试不覆盖它，撤销的密钥若能通过认证是认证绕过。
 
-```rust
-#[cfg(test)]
-pub(crate) async fn oss_test_db() -> sqlx::SqlitePool {
-    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-    sqlx::raw_sql(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);\
-         CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
-          status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool
-}
-```
-
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-s3 auth 2>&1 | tail -20`
 Expected: 编译错误
 
-- [ ] **Step 3: 实现 `auth.rs`**
+- [x] **Step 3: 实现 `auth.rs`**
 
 ```rust
 //! SigV4 凭据解析：s3s 负责验签，我们只负责「AK 换 SK」。
@@ -2979,7 +3012,7 @@ mod tests {
 
 > 若 `SecretKey::from(String)` 不存在，看 `src/auth/secret_key.rs` 的构造方法并改用之（`SecretKey::new` / `From<&str>`）。
 
-- [ ] **Step 4: 实现 `convert.rs` 的错误映射**
+- [x] **Step 4: 实现 `convert.rs` 的错误映射**
 
 ```rust
 //! xl-store ↔ s3s 的错误与类型翻译。
@@ -2993,6 +3026,7 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         StoreError::BucketAlreadyExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
         StoreError::BucketNotEmpty(_) => S3ErrorCode::BucketNotEmpty,
         StoreError::NoSuchKey(_) => S3ErrorCode::NoSuchKey,
+        // s3s 没有 InvalidObjectName，键名不合法归 InvalidArgument
         StoreError::InvalidKey(_) => S3ErrorCode::InvalidArgument,
         StoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
         StoreError::CorruptMeta(_) | StoreError::Encode(_) => S3ErrorCode::InternalError,
@@ -3010,15 +3044,31 @@ mod tests {
         assert_eq!(to_s3_error(StoreError::NoSuchKey("k".into())).code(), &S3ErrorCode::NoSuchKey);
         assert_eq!(to_s3_error(StoreError::NoSuchBucket("b".into())).code(), &S3ErrorCode::NoSuchBucket);
     }
+
+    #[test]
+    fn maps_remaining_variants() {
+        let cases = [
+            (StoreError::BucketAlreadyExists("b".into()), &S3ErrorCode::BucketAlreadyOwnedByYou),
+            (StoreError::BucketNotEmpty("b".into()), &S3ErrorCode::BucketNotEmpty),
+            (StoreError::InvalidKey("k".into()), &S3ErrorCode::InvalidArgument),
+            (StoreError::InvalidBucketName("b".into()), &S3ErrorCode::InvalidBucketName),
+            (StoreError::CorruptMeta("m".into()), &S3ErrorCode::InternalError),
+            (StoreError::Encode("e".into()), &S3ErrorCode::InternalError),
+            (StoreError::Io(std::io::Error::other("io")), &S3ErrorCode::InternalError),
+        ];
+        for (e, code) in cases {
+            assert_eq!(to_s3_error(e).code(), code);
+        }
+    }
 }
 ```
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run: `cargo test -p xl-s3 2>&1 | tail -12`
 Expected: 全绿
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/xl-s3/ && git commit -m "feat(xl-s3): SigV4 凭据解析与错误映射"
