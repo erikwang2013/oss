@@ -3264,13 +3264,16 @@ use crate::convert::to_s3_error;
 
 pub struct OssS3 {
     store: Arc<Store>,
+    /// 单次 PUT 的整份读入上限，见 `put_object` 的 ponytail 取舍。
+    max_put_bytes: usize,
 }
 
 impl OssS3 {
-    /// `max_put_bytes` 的首个消费者在 Task 11 的 `put_object`——无读取者的字段会撞
-    /// dead_code 与 0 告警闸，随首个消费者落地（Task 4→5 的 `locks` 同款裁决）。
-    pub fn new(store: Arc<Store>, _max_put_bytes: usize) -> Self {
-        Self { store }
+    pub fn new(store: Arc<Store>, max_put_bytes: usize) -> Self {
+        Self {
+            store,
+            max_put_bytes,
+        }
     }
 }
 
@@ -3321,7 +3324,7 @@ impl S3 for OssS3 {
 > `CreationDate` 的类型以 `generated.rs` 为准（可能是 `Timestamp` 别名）。若 `CreationDate::from(SystemTime)` 不成立，改用其实际构造方式。
 > 已核实（源码核对，无臆测）：`CreationDate = Timestamp`（`generated.rs:7525`），`impl From<SystemTime> for Timestamp` 成立（`dto/timestamp.rs:60`），计划代码原样编译。
 
-注（Task 10 执行偏差，已裁决；上方 Step 3 代码块已同步为最终形态）：`max_put_bytes` 字段推迟到 Task 11 首次有消费者时加入（`put_object` 读取）——Task 10 无读取者，dead_code 实测 `field max_put_bytes is never read`，会撞 0 告警闸，与 Task 4→5 的 `locks` 同款裁决。构造函数签名不变（`new(store, _max_put_bytes)`，`bucket_ops.rs` 与 Task 11 的调用形状不动）；**Task 11 落地时需自行从本提交 diff 加回 `max_put_bytes` 字段（原 Task 4/5 历史），其 Step 3 块只消费不声明**。`list_buckets` 的 `creation_date` 取值与测试断言见文末收尾轮记录。
+注（Task 10 执行偏差，已裁决）：`max_put_bytes` 字段推迟到 Task 11 首次有消费者时加入（`put_object` 读取）——Task 10 无读取者，dead_code 实测 `field max_put_bytes is never read`，会撞 0 告警闸，与 Task 4→5 的 `locks` 同款裁决。构造函数签名不变（`new(store, _max_put_bytes)`，`bucket_ops.rs` 与 Task 11 的调用形状不动）。**Task 11 已落地还原**（见 Task 11 定稿记录）：字段加回结构体、参数去 `_` 前缀；上方 Step 3 代码块已按最终形态同步。`list_buckets` 的 `creation_date` 取值与测试断言见下方收尾轮记录。
 
 - [x] **Step 4: 跑测试**
 
@@ -3349,7 +3352,7 @@ git add crates/xl-s3/ && git commit -m "feat(xl-s3): 桶操作（create/head/del
 **Files:**
 - Modify: `crates/xl-s3/src/service.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 // crates/xl-s3/tests/object_ops.rs
@@ -3413,12 +3416,12 @@ async fn delete_objects_is_batch_and_idempotent() {
 
 > 测试所需依赖（`md-5` / `hex` / `http` / `tempfile` / `tokio`，以及 `s3s` 本体）已在 Task 1 的 `[dependencies]` / `[dev-dependencies]` 配齐。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p xl-s3 --test object_ops 2>&1 | tail -20`
 Expected: 编译错误
 
-- [ ] **Step 3: 实现对象操作**
+- [x] **Step 3: 实现对象操作**
 
 ```rust
 // 追加到 impl S3 for OssS3
@@ -3488,16 +3491,22 @@ Expected: 编译错误
     }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cargo test -p xl-s3 --test object_ops 2>&1 | tail -12`
 Expected: 全绿（ETag 断言用真实 md5）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/xl-s3/ && git commit -m "feat(xl-s3): 对象 CRUD 与批量删除"
 ```
+
+### 定稿记录
+
+- `max_put_bytes` 按 Task 10 偏差注还原：字段加回 `OssS3` 结构体、构造参数去 `_` 前缀（`bucket_ops.rs` 调用形状不变）；Task 10 的 Step 3 代码块与偏差注已同步。
+- Step 3 实现与计划代码块逐字一致，仅另加 `use bytes::Bytes;`（块内只含方法体，未含 imports）与 rustfmt 换行。
+- 测试 helper（`service()` / `req()`）与 `bucket_ops.rs` 有意重复一份：计划未要求共用模块（Task 12 继续往 `object_ops.rs` 追加）。
 
 ---
 
