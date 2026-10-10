@@ -8,7 +8,7 @@ AK="${AK:-AKIA_TEST_ACCESS_KEY}"
 SK="${SK:-SK_TEST_SECRET_KEY_0001}"
 BUCKET="e2e-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; aws --endpoint-url "$ENDPOINT" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }

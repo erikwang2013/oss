@@ -4814,7 +4814,7 @@ AK="${AK:-AKIA_TEST_ACCESS_KEY}"
 SK="${SK:-SK_TEST_SECRET_KEY_0001}"
 BUCKET="e2e-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; aws --endpoint-url "$ENDPOINT" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
@@ -4916,7 +4916,7 @@ OSS_ADMIN_USER=erik OSS_ADMIN_PASSWORD=changeme cargo run -p oss-server
 TOKEN=$(curl -s -X POST localhost:9000/api/v1/login -H 'content-type: application/json' \
   -d '{"username":"erik","password":"changeme"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
 
-# 3. 建一对访问密钥给 S3 客户端用（显式指定，与下面验收段的 AK/SK 一致）
+# 3. 建一对访问密钥给 S3 客户端用（显式指定，与下面验收段的 AK/SK 一致；重复执行会提示「access key 已存在」，幂等）
 curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"access_key":"AKIA_TEST_ACCESS_KEY","secret_key":"SK_TEST_SECRET_KEY_0001"}'
@@ -4926,10 +4926,16 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > （分组目录经 `aetherupload::console::list_groups`，`_header/` 单独补建——list_groups
 > 只在自建根目录时顺带建它）；若预处理报笼统的上传错误，先检查暂存盘目录是否被清理。
 
-> 已知限制：M1 的 `/aetherupload/*` 四条路由**无认证层（匿名可写）**，勿暴露公网；
-> 认证覆盖层随部署形态（M2）落地。
+> 已知限制：
+> - M1 的 `/aetherupload/*` 四条路由**无认证层（匿名可写）**，勿暴露公网；认证覆盖层随部署形态（M2）落地。
+> - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
+> - 单段 PUT 上限 256 MiB（`max_put_bytes`）。
+> - `x-amz-meta-*` 用户元数据**静默丢弃**（M2 接上）。
 
 ## 验收
+
+覆盖范围：仅 S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）；浏览器上传与控制台界面在 M1b。
+前置：本机装了 aws-cli 与 rclone。
 
 ```bash
 AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 tests/e2e_s3.sh
