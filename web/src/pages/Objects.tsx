@@ -1,8 +1,8 @@
-import { useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useMemo } from 'react'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type ObjectList } from '../api'
+import { api, getToken, type ObjectList } from '../api'
 
 function humanSize(n: number) {
   if (n < 1024) return `${n} B`
@@ -18,8 +18,9 @@ export default function Objects() {
   const { bucket = '' } = useParams()
   const { message } = App.useApp()
   const qc = useQueryClient()
-  // 面包屑链接带 ?prefix= 整页跳转、组件重挂载，前缀状态即可由此初始化
-  const [prefix, setPrefix] = useState(() => new URLSearchParams(window.location.search).get('prefix') ?? '')
+  // prefix 的单一事实源是 URL query：Link 是 SPA 导航、同路由仅 query 变化不重挂载，useState 快照会让面包屑/手改 URL/返回键都失效
+  const [sp, setSp] = useSearchParams()
+  const prefix = sp.get('prefix') ?? ''
 
   const { data, isLoading } = useQuery({
     queryKey: ['objects', bucket, prefix],
@@ -44,16 +45,16 @@ export default function Objects() {
     try {
       const resp = await fetch(
         `/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`,
-        { headers: { authorization: `Bearer ${localStorage.getItem('oss.token') ?? ''}` } },
+        { headers: { authorization: `Bearer ${getToken() ?? ''}` } },
       )
       if (!resp.ok) throw new Error(await resp.text())
-      const blob = await resp.blob()
+      const blob = await resp.blob() // M1 大对象全量进内存的上限，M2 流式
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = key.split('/').pop() ?? 'download'
+      a.download = key.split('/').pop() || 'download'
       a.click()
-      URL.revokeObjectURL(url)
+      setTimeout(() => URL.revokeObjectURL(url), 0)
     } catch (e) {
       message.error(e instanceof Error ? e.message : '下载失败')
     }
@@ -94,7 +95,9 @@ export default function Objects() {
             dataIndex: 'key',
             render: (key: string, r: { kind: 'dir' | 'obj' }) =>
               r.kind === 'dir' ? (
-                <a onClick={() => setPrefix(key)}>{key.slice(prefix.length)}</a>
+                <Button type="link" size="small" onClick={() => setSp(key ? { prefix: key } : {})}>
+                  {key.slice(prefix.length)}
+                </Button>
               ) : (
                 <Tooltip title={key}>{key.slice(prefix.length)}</Tooltip>
               ),
