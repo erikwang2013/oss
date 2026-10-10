@@ -273,20 +273,46 @@ mod tests {
 
     #[test]
     fn object_dir_flattens_slashes() {
-        assert_eq!(object_dir_name("a/b/c.txt").unwrap(), "a__XLDIR__b__XLDIR__c.txt");
+        assert_eq!(
+            object_dir_name("a/b/c.txt").unwrap(),
+            "a__XLDIR__b__XLDIR__c.txt"
+        );
     }
 
     #[test]
     fn rejects_path_traversal() {
-        for bad in ["../etc/passwd", "a/../../b", "/abs", "a//b", "a/", "", "a\u{0}b"] {
+        for bad in [
+            "../etc/passwd",
+            "a/../../b",
+            "/abs",
+            "a//b",
+            "a/",
+            "",
+            "a\u{0}b",
+        ] {
             assert!(object_dir_name(bad).is_err(), "{bad} 应当被拒");
         }
+        // 拼接路径时桶名参数同样收口校验
+        assert!(object_dir(Path::new("/tmp/root"), "..", "k").is_err());
+        assert!(object_dir(Path::new("/tmp/root"), "../../etc", "k").is_err());
     }
 
     #[test]
     fn rejects_keys_containing_separator() {
         // 键里出现 __XLDIR__ 会让往返编码错位，必须拒绝而不是静默损坏
         assert!(object_dir_name("a__XLDIR__b").is_err());
+    }
+
+    #[test]
+    fn key_len_limit_is_bytes() {
+        assert!(validate_key(&"汉".repeat(341)).is_ok());
+        assert!(validate_key(&"汉".repeat(342)).is_err()); // 341×3=1023B ≤1024，342×3=1026B >1024
+    }
+
+    #[test]
+    fn key_rejects_control_chars() {
+        assert!(validate_key("a\u{7f}b").is_err());
+        assert!(validate_key("a\u{80}b").is_err()); // DEL 与 C1
     }
 
     #[test]
@@ -424,7 +450,10 @@ pub fn bucket_dir(root: &Path, bucket: &str) -> PathBuf {
     root.join(bucket)
 }
 
+/// 所有对象读写路径都汇合到这里，桶名校验在此收口；S3 入口虽由 s3s 的默认 AwsNameValidation 先拦，但控制台/aether 上传直达内核，不能依赖上游。
 pub fn object_dir(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+    validate_bucket(bucket)?;
+    validate_key(key)?;
     Ok(bucket_dir(root, bucket).join(object_dir_name(key)?))
 }
 
