@@ -2211,7 +2211,7 @@ CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
-    is_admin      INTEGER NOT NULL DEFAULT 0,
+    is_admin      INTEGER NOT NULL DEFAULT 0,  -- M1 只写 0/1（创建时定）；不加 CHECK，M4 引角色时再演进
     created_at    INTEGER NOT NULL
 );
 
@@ -2219,7 +2219,7 @@ CREATE TABLE IF NOT EXISTS access_keys (
     access_key  TEXT PRIMARY KEY,
     secret_key  TEXT NOT NULL,           -- M1 明文存；M5 随 SSE 一起改为加密存
     user_id     INTEGER NOT NULL REFERENCES users(id),
-    status      TEXT NOT NULL DEFAULT 'active',
+    status      TEXT NOT NULL DEFAULT 'active',  -- M1 只写 'active'；只有它通过 secret_for_access_key 的查询
     expires_at  INTEGER,                 -- NULL = 永不过期；M5 的 STS 会话用同一列
     created_at  INTEGER NOT NULL
 );
@@ -2229,7 +2229,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     owner_id      INTEGER REFERENCES users(id),
     creation_date INTEGER NOT NULL,
     versioning    TEXT NOT NULL DEFAULT 'Off',  -- M4 用
-    object_lock   INTEGER NOT NULL DEFAULT 0    -- M5 用
+    object_lock   INTEGER NOT NULL DEFAULT 0    -- M1 只写 0；M5 用。不加 CHECK
 );
 
 CREATE TABLE IF NOT EXISTS uploads (
@@ -2244,6 +2244,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     created_at    INTEGER NOT NULL
 );
 
+-- ponytail: 过期行只增不删、expires_at 无索引；升级：set 时顺手清过期行，或加索引 + 周期清扫。
 CREATE TABLE IF NOT EXISTS instant_index (
     k          TEXT PRIMARY KEY,
     v          TEXT NOT NULL,
@@ -2293,10 +2294,38 @@ mod tests {
     async fn upload_records() {
         let db = db().await;
         db.record_upload("g_202610_abc.txt", "files", "abc.txt", "file", 7, "etag1").await.unwrap();
-        db.register_upload("g_202610_abc.txt", "my.txt", None).await.unwrap();
+        assert!(db.register_upload("g_202610_abc.txt", "my.txt", None).await.unwrap());
         let rows = db.list_uploads(10).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].original_name.as_deref(), Some("my.txt"));
+    }
+
+    // ---- Task 7 收尾轮（I-1 / M-1）新增 ----
+
+    #[tokio::test]
+    async fn register_upload_without_record_is_false() {
+        let db = db().await;
+        assert!(!db.register_upload("nope.txt", "my.txt", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn secret_for_access_key_rejects_expired() {
+        let db = db().await;
+        let uid = db.create_user("erik", "secret", true).await.unwrap();
+        db.create_access_key("AKIA_EXPIRED", "SK_TEST", uid).await.unwrap();
+        sqlx::query("UPDATE access_keys SET expires_at = ? WHERE access_key = ?")
+            .bind(now() - 1).bind("AKIA_EXPIRED").execute(db.pool()).await.unwrap();
+        assert_eq!(db.secret_for_access_key("AKIA_EXPIRED").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn secret_for_access_key_rejects_inactive() {
+        let db = db().await;
+        let uid = db.create_user("erik", "secret", true).await.unwrap();
+        db.create_access_key("AKIA_OFF", "SK_TEST", uid).await.unwrap();
+        sqlx::query("UPDATE access_keys SET status = 'inactive' WHERE access_key = ?")
+            .bind("AKIA_OFF").execute(db.pool()).await.unwrap();
+        assert_eq!(db.secret_for_access_key("AKIA_OFF").await.unwrap(), None);
     }
 }
 ```
@@ -2333,6 +2362,8 @@ pub struct UploadRecord {
     pub created_at: i64,
 }
 
+// migrations/ 只是目录命名习惯：本实现用 include_str! + raw_sql 原样执行整份 schema，
+// 不建 _sqlx_migrations —— 将来加 0002 不会自动执行（M2 起再引 sqlx migrate）。
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
 fn now() -> i64 {
@@ -2376,6 +2407,7 @@ impl Db {
     }
 
     pub async fn verify_user(&self, username: &str, password: &str) -> Result<Option<i64>> {
+        // ponytail: 非常量时间比较 + 用户存在性时序（未命中不比对）M1 已接受；M4 换 Argon2 时随方案处置。
         let row = sqlx::query("SELECT id, password_hash FROM users WHERE username = ?")
             .bind(username)
             .fetch_optional(&self.pool)
@@ -2411,7 +2443,7 @@ impl Db {
     }
 
     pub async fn list_access_keys(&self, user_id: i64) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT access_key FROM access_keys WHERE user_id = ? ORDER BY created_at")
+        let rows = sqlx::query("SELECT access_key FROM access_keys WHERE user_id = ? ORDER BY created_at, access_key")
             .bind(user_id)
             .fetch_all(&self.pool)
             .await?;
@@ -2482,18 +2514,20 @@ impl Db {
         Ok(())
     }
 
-    pub async fn register_upload(&self, saved_path: &str, original_name: &str, owner_id: Option<i64>) -> Result<()> {
-        sqlx::query("UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?")
+    /// 返回是否命中：0 行命中 = saved_path 不存在（调用方按 404 处理），不静默吞掉 original_name（规格 §5.4）。
+    pub async fn register_upload(&self, saved_path: &str, original_name: &str, owner_id: Option<i64>) -> Result<bool> {
+        let n = sqlx::query("UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?")
             .bind(original_name)
             .bind(owner_id)
             .bind(saved_path)
             .execute(&self.pool)
-            .await?;
-        Ok(())
+            .await?
+            .rows_affected();
+        Ok(n == 1)
     }
 
     pub async fn list_uploads(&self, limit: i64) -> Result<Vec<UploadRecord>> {
-        let rows = sqlx::query("SELECT * FROM uploads ORDER BY created_at DESC LIMIT ?")
+        let rows = sqlx::query("SELECT * FROM uploads ORDER BY created_at DESC, saved_path LIMIT ?")
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
@@ -2530,7 +2564,7 @@ pub fn hash_password(password: &str) -> String {
 
 Run: `cargo test -p oss-server db 2>&1 | tail -12`
 Expected: 全绿（4 个测试）
-实际：`oss-server` 4 passed / 0 failed（`init_creates_tables` / `user_and_access_key_roundtrip` / `instant_index_expires` / `upload_records`）。四闸全绿（fmt / clippy 0 告警 / `-p oss-server` / `--workspace -j 2`；workspace 合计 53 = xl-store 49 + oss-server 4）。
+实际：主轮 `oss-server` 4 passed；收尾轮补 3 条后 7 passed / 0 failed（`init_creates_tables` / `user_and_access_key_roundtrip` / `instant_index_expires` / `upload_records` / `register_upload_without_record_is_false` / `secret_for_access_key_rejects_expired` / `secret_for_access_key_rejects_inactive`）。四闸全绿（fmt / clippy 0 告警 / `-p oss-server` / `--workspace -j 2`；workspace 合计 56 = xl-store 49 + oss-server 7）。
 
 - [x] **Step 6: 提交**
 
@@ -2539,6 +2573,16 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制面 5 张表与
 ```
 
 注（Task 7 执行偏差，仅此一处）：提交范围在 `git add crates/oss-server/` 之外连带根 `Cargo.lock` —— 新增 `hex` 依赖使 oss-server 的锁文件清单变化，单独 add crate 会把 `Cargo.lock` 留在脏区。实现代码与计划逐字一致（rustfmt 仅换行）；`sqlite::memory:` 的池内共享由 sqlx 0.8.6 保证（自动 `shared_cache` + 每池唯一库名），测试建库方式与计划相同。
+
+注（Task 7 质量评审收尾轮，I-1 裁决 + Minor，已并入；上方代码块已同步）：
+- **I-1 `register_upload` 返回命中数**：签名改 `Result<bool>`（`execute()?.rows_affected() == 1`）。0 行命中 = `saved_path` 不存在，调用方按 404 处理（不允许静默吞掉 `original_name`，规格 §5.4）。测试补 `register_upload_without_record_is_false`；Task 15 的 register 路由片段同步改为 `Ok(true) → 204 / Ok(false) → 404 / Err(e) → 400`。
+- **M-1**：`secret_for_access_key` 补两条测试——`secret_for_access_key_rejects_expired`（`expires_at` 在过去 → None）/ `secret_for_access_key_rejects_inactive`（`status='inactive'` → None）。
+- **M-2**：`verify_user` 加 `ponytail:` 注释（非常量时间比较 + 用户存在性时序，M1 已接受；M4 换 Argon2 时随方案处置）。
+- **M-4**：`instant_index` 建表处加 `ponytail:` 注释（过期行只增不删、`expires_at` 无索引；升级：set 时顺手清过期行 / 加索引 + 周期清扫）。
+- **M-5**：`access_keys.status` / `users.is_admin` / `buckets.object_lock` 各加一行取值域注释，不加 CHECK，M4/M5 自然再演进。
+- **M-6**：两处 ORDER BY 加兜底列（`created_at, access_key` / `created_at DESC, saved_path`）保证同秒全序。
+- **M-7**：`SCHEMA` 常量旁注明 `migrations/` 目录名与本实现（`include_str!` + `raw_sql`，无 `_sqlx_migrations`）的差异——将来加 0002 不会自动执行。
+- **M-8**（记账，未改）：`oss-server` 的 `sqlx` 同时列在 `[dependencies]` 与 `[dev-dependencies]`（本计划 Step 5 的产物，无行为影响——Cargo 特性并集）；留到收尾清理时删除 dev 侧重复行。
 
 ---
 
@@ -4016,7 +4060,8 @@ struct RegisterBody { saved_path: String, original_name: String }
 async fn register_upload(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<RegisterBody>) -> impl IntoResponse {
     let uid = match auth(&state, &headers) { Ok(u) => u, Err(s) => return s.into_response() };
     match state.db.register_upload(&body.saved_path, &body.original_name, Some(uid)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }

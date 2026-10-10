@@ -21,6 +21,8 @@ pub struct UploadRecord {
     pub created_at: i64,
 }
 
+// migrations/ 只是目录命名习惯：本实现用 include_str! + raw_sql 原样执行整份 schema，
+// 不建 _sqlx_migrations —— 将来加 0002 不会自动执行（M2 起再引 sqlx migrate）。
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
 fn now() -> i64 {
@@ -66,6 +68,7 @@ impl Db {
     }
 
     pub async fn verify_user(&self, username: &str, password: &str) -> Result<Option<i64>> {
+        // ponytail: 非常量时间比较 + 用户存在性时序（未命中不比对）M1 已接受；M4 换 Argon2 时随方案处置。
         let row = sqlx::query("SELECT id, password_hash FROM users WHERE username = ?")
             .bind(username)
             .fetch_optional(&self.pool)
@@ -101,11 +104,12 @@ impl Db {
     }
 
     pub async fn list_access_keys(&self, user_id: i64) -> Result<Vec<String>> {
-        let rows =
-            sqlx::query("SELECT access_key FROM access_keys WHERE user_id = ? ORDER BY created_at")
-                .bind(user_id)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT access_key FROM access_keys WHERE user_id = ? ORDER BY created_at, access_key",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(|r| r.get("access_key")).collect())
     }
 
@@ -193,26 +197,30 @@ impl Db {
         Ok(())
     }
 
+    /// 返回是否命中：0 行命中 = saved_path 不存在（调用方按 404 处理），不静默吞掉 original_name（规格 §5.4）。
     pub async fn register_upload(
         &self,
         saved_path: &str,
         original_name: &str,
         owner_id: Option<i64>,
-    ) -> Result<()> {
-        sqlx::query("UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?")
-            .bind(original_name)
-            .bind(owner_id)
-            .bind(saved_path)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    ) -> Result<bool> {
+        let n =
+            sqlx::query("UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?")
+                .bind(original_name)
+                .bind(owner_id)
+                .bind(saved_path)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        Ok(n == 1)
     }
 
     pub async fn list_uploads(&self, limit: i64) -> Result<Vec<UploadRecord>> {
-        let rows = sqlx::query("SELECT * FROM uploads ORDER BY created_at DESC LIMIT ?")
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT * FROM uploads ORDER BY created_at DESC, saved_path LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows
             .into_iter()
             .map(|r| UploadRecord {
@@ -282,11 +290,57 @@ mod tests {
         db.record_upload("g_202610_abc.txt", "files", "abc.txt", "file", 7, "etag1")
             .await
             .unwrap();
-        db.register_upload("g_202610_abc.txt", "my.txt", None)
-            .await
-            .unwrap();
+        assert!(
+            db.register_upload("g_202610_abc.txt", "my.txt", None)
+                .await
+                .unwrap()
+        );
         let rows = db.list_uploads(10).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].original_name.as_deref(), Some("my.txt"));
+    }
+
+    #[tokio::test]
+    async fn register_upload_without_record_is_false() {
+        let db = db().await;
+        assert!(
+            !db.register_upload("nope.txt", "my.txt", None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_for_access_key_rejects_expired() {
+        let db = db().await;
+        let uid = db.create_user("erik", "secret", true).await.unwrap();
+        db.create_access_key("AKIA_EXPIRED", "SK_TEST", uid)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE access_keys SET expires_at = ? WHERE access_key = ?")
+            .bind(now() - 1)
+            .bind("AKIA_EXPIRED")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.secret_for_access_key("AKIA_EXPIRED").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_for_access_key_rejects_inactive() {
+        let db = db().await;
+        let uid = db.create_user("erik", "secret", true).await.unwrap();
+        db.create_access_key("AKIA_OFF", "SK_TEST", uid)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE access_keys SET status = 'inactive' WHERE access_key = ?")
+            .bind("AKIA_OFF")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(db.secret_for_access_key("AKIA_OFF").await.unwrap(), None);
     }
 }
