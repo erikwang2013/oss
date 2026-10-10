@@ -441,7 +441,7 @@ git commit -m "feat(web): 路由 + 鉴权壳 + antd 布局"
 **Files:**
 - Modify: `web/src/pages/Login.tsx`
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
 
 ```tsx
 import { useState } from 'react'
@@ -492,7 +492,7 @@ export default function Login() {
 
 注意：登录接口失败时后端返回纯文本（非 JSON），`api()` 抛出的 `ApiError.message` 就是「用户名或密码错误」——直接展示。
 
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 ```bash
 cd /home/wwwroot/oss
@@ -503,7 +503,9 @@ cd web && npm run dev &
 
 浏览器打开 `http://127.0.0.1:5173/login`：错密码提示「用户名或密码错误」；对密码跳转 `/buckets`（此时桶页还是壳）。验证完 `kill %1 %2`。
 
-- [ ] **Step 3: 提交**
+> 执行注记：后端控制台 API 在 M1a 完成后才能实跑手验，本轮（M1b worktree 内无 `oss-server`）跳过浏览器手验；真实登录流程由 Task 11 的 Playwright e2e 覆盖。本轮替代验证：`cd web && npm test`（6 用例不回归）、`npm run build`（tsc 通过）、`npm run lint`。
+
+- [x] **Step 3: 提交**
 
 ```bash
 git add web/src/pages/Login.tsx
