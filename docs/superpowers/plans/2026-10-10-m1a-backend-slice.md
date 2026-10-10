@@ -3267,12 +3267,17 @@ pub struct OssS3 {
 }
 
 impl OssS3 {
-    /// `max_put_bytes` 字段与 `last_modified` 的首个消费者都在 Task 11（put / head / get）——
-    /// 无读取者/无调用者的私有项会撞 dead_code 与 0 告警闸，随首个消费者一并落地
-    ///（Task 4→5 的 `locks` 同款裁决）。
+    /// `max_put_bytes` 的首个消费者在 Task 11 的 `put_object`——无读取者的字段会撞
+    /// dead_code 与 0 告警闸，随首个消费者落地（Task 4→5 的 `locks` 同款裁决）。
     pub fn new(store: Arc<Store>, _max_put_bytes: usize) -> Self {
         Self { store }
     }
+}
+
+/// nanos → S3 时间戳：`LastModified` 与 `CreationDate` 同为 `Timestamp` 别名，
+/// 对象用 `mod_time_nanos`、桶用 `creation_nanos`。不要用 now() 冒充。
+fn last_modified(nanos: i64) -> LastModified {
+    LastModified::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos.max(0) as u64))
 }
 
 #[async_trait::async_trait]
@@ -3304,7 +3309,7 @@ impl S3 for OssS3 {
             .into_iter()
             .map(|b| Bucket {
                 name: Some(b.name),
-                creation_date: Some(CreationDate::from(std::time::SystemTime::now())),
+                creation_date: Some(last_modified(b.creation_nanos)),
                 ..Default::default()
             })
             .collect();
@@ -3316,7 +3321,7 @@ impl S3 for OssS3 {
 > `CreationDate` 的类型以 `generated.rs` 为准（可能是 `Timestamp` 别名）。若 `CreationDate::from(SystemTime)` 不成立，改用其实际构造方式。
 > 已核实（源码核对，无臆测）：`CreationDate = Timestamp`（`generated.rs:7525`），`impl From<SystemTime> for Timestamp` 成立（`dto/timestamp.rs:60`），计划代码原样编译。
 
-注（Task 10 执行偏差，已裁决；上方 Step 3 代码块已同步为最终形态）：`max_put_bytes` 字段与 `last_modified` 函数推迟到 Task 11 首次有消费者时加入（put / head / get）——Task 10 两者均无读取者/调用者，dead_code 实测两条警告（`field max_put_bytes is never read` + `function last_modified is never used`），会撞 0 告警闸，与 Task 4→5 的 `locks` 同款裁决。构造函数签名不变（`new(store, _max_put_bytes)`，`bucket_ops.rs` 与 Task 11 的调用形状不动）；**Task 11 落地时把参数改回 `max_put_bytes` 并加回 `last_modified`**（其 Step 3 代码块已按此写）。`service.rs` 其余与计划逐字一致（rustfmt 仅换行）。
+注（Task 10 执行偏差，已裁决；上方 Step 3 代码块已同步为最终形态）：`max_put_bytes` 字段推迟到 Task 11 首次有消费者时加入（`put_object` 读取）——Task 10 无读取者，dead_code 实测 `field max_put_bytes is never read`，会撞 0 告警闸，与 Task 4→5 的 `locks` 同款裁决。构造函数签名不变（`new(store, _max_put_bytes)`，`bucket_ops.rs` 与 Task 11 的调用形状不动）；**Task 11 落地时需自行从本提交 diff 加回 `max_put_bytes` 字段（原 Task 4/5 历史），其 Step 3 块只消费不声明**。`list_buckets` 的 `creation_date` 取值与测试断言见文末收尾轮记录。
 
 - [x] **Step 4: 跑测试**
 
@@ -3329,6 +3334,13 @@ Expected: 全绿
 ```bash
 git add crates/xl-s3/ && git commit -m "feat(xl-s3): 桶操作（create/head/delete/list）"
 ```
+
+### 收尾轮（规格评审裁决 2 条）—— 定稿记录
+
+1. **`list_buckets` 的 `creation_date` 取真实值（必修）**：`CreationDate::from(SystemTime::now())` → `last_modified(b.creation_nanos)`（`BucketInfo.creation_nanos` 即真实建桶时间）。`last_modified` helper 由此获得首个消费者、不再 dead_code——推迟项只剩 `max_put_bytes` 一项。测试加断言钉住（`bucket_ops.rs::create_head_list_delete_bucket`）：**上界取 list 之前捕获的 `before_list`，为紧判别点**——实测 now() 冒充形态下 created 必晚于 before_list 而失败（已实证：贴回 fake 复跑，断言按预期红）；下界留 50ms 容差，依据：文件时间戳取自内核粗粒度时钟，python 实测 mkdir 的 mtime 比精确时钟滞后 0.9–1.06ms 且同 tick 内恒定（CLK_TCK=100 的机器上限 10ms），无容差会假阳性（首版无容差断言即因此红）。上方 Step 3 代码块已同步。
+2. **计划注记措辞修正**：「Task 11 的 Step 3 代码块已按此写」不准确（该块只消费不声明），已按评审改为上方偏差注中的措辞。
+
+四闸复跑全绿（fmt / clippy 0 告警 / `-p xl-s3` 9 passed / `--workspace -j 2` 65 passed）。收尾轮提交：`fix(xl-s3): list_buckets 取真实创建时间；计划注记更正`（带计划文件）。
 
 ---
 

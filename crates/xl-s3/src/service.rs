@@ -14,12 +14,17 @@ pub struct OssS3 {
 }
 
 impl OssS3 {
-    /// `max_put_bytes` 字段与 `last_modified` 的首个消费者都在 Task 11（put / head / get）——
-    /// 无读取者/无调用者的私有项会撞 dead_code 与 0 告警闸，随首个消费者一并落地
-    ///（Task 4→5 的 `locks` 同款裁决）。
+    /// `max_put_bytes` 的首个消费者在 Task 11 的 `put_object`——无读取者的字段会撞
+    /// dead_code 与 0 告警闸，随首个消费者落地（Task 4→5 的 `locks` 同款裁决）。
     pub fn new(store: Arc<Store>, _max_put_bytes: usize) -> Self {
         Self { store }
     }
+}
+
+/// nanos → S3 时间戳：`LastModified` 与 `CreationDate` 同为 `Timestamp` 别名，
+/// 对象用 `mod_time_nanos`、桶用 `creation_nanos`。不要用 now() 冒充。
+fn last_modified(nanos: i64) -> LastModified {
+    LastModified::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos.max(0) as u64))
 }
 
 #[async_trait::async_trait]
@@ -69,7 +74,7 @@ impl S3 for OssS3 {
             .into_iter()
             .map(|b| Bucket {
                 name: Some(b.name),
-                creation_date: Some(CreationDate::from(std::time::SystemTime::now())),
+                creation_date: Some(last_modified(b.creation_nanos)),
                 ..Default::default()
             })
             .collect();
