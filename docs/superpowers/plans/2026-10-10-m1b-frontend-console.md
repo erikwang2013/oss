@@ -1436,6 +1436,11 @@ export default function Keys() {
     onError: (e: Error) => message.error(e.message),
   })
 
+  const close = () => {
+    setFresh(null)
+    create.reset() // 关窗即清 MutationCache 里的 data：SK 只该活在弹窗这一个副本里
+  }
+
   return (
     <>
       <Button type="primary" loading={create.isPending} onClick={() => create.mutate()} style={{ marginBottom: 16 }}>
@@ -1451,13 +1456,14 @@ export default function Keys() {
           { title: '说明', render: () => '启用/禁用与过期在 M5；M1 只有创建与使用' },
         ]}
       />
-      <Modal title="密钥已创建" open={!!fresh} footer={null} onCancel={() => setFresh(null)}>
+      <Modal title="密钥已创建" open={!!fresh} footer={null} maskClosable={false} onCancel={close}>
         {fresh && (
           <>
             <Alert type="warning" showIcon style={{ marginBottom: 12 }}
               message="Secret Key 只显示这一次，请立即保存（M5 前它是明文存库的）。" />
-            <Typography.Paragraph copyable>Access Key：{fresh.access_key}</Typography.Paragraph>
-            <Typography.Paragraph copyable>Secret Key：{fresh.secret_key}</Typography.Paragraph>
+            {/* copyable={{ text }} 显式给裸值：裸 copyable 会连「Access Key：」前缀一起复制 */}
+            <Typography.Paragraph copyable={{ text: fresh.access_key }}>Access Key：{fresh.access_key}</Typography.Paragraph>
+            <Typography.Paragraph copyable={{ text: fresh.secret_key }}>Secret Key：{fresh.secret_key}</Typography.Paragraph>
           </>
         )}
       </Modal>
@@ -1476,6 +1482,24 @@ export default function Keys() {
 git add web/src/pages/Keys.tsx
 git commit -m "feat(web): 访问密钥页（列表 + 一次性展示 SK）"
 ```
+
+---
+
+## 定稿记录（Task 10 质量评审收尾，commit `fix(web): 密钥复制内容去前缀；关闭清 mutation 态；防误触遮罩`）
+
+**I-1 复制内容去前缀**：两处 `Typography.Paragraph` 的裸 `copyable` 改为 `copyable={{ text: … }}` 显式
+传裸值。原因：antd 裸 `copyable` 走 `copy-to-clipboard` 的节点取文本，复制的是**整个子节点文本**——
+即带「Access Key：」/「Secret Key：」前缀的整行；SK 只展示一次，用户粘到 aws-cli 配置里多一截前缀
+即废（且粘贴处不一定报错）。浏览器实测：点复制后剪贴板内容 `=== fresh.secret_key`（无前缀）。
+
+**Minor 2 关窗清 mutation 态**：关闭弹窗统一走 `close()`：`setFresh(null)` + `create.reset()`——
+组件渲染虽只读 `fresh`，但 `create.data` 仍把刚生成的 SK 留在 MutationCache 里，关窗后应一并清掉。
+
+**Minor 4 防误触丢 SK**：Modal 加 `maskClosable={false}`——`footer={null}` 时无「取消」抓手，
+误点遮罩即关窗，而 SK 只此一次展示；键盘 Esc 与右上角关闭钮仍可关（均走 `onCancel` → `close()`）。
+
+**Minor 3（转记）**：`/keys` 的自动化覆盖并入 Task 11：新建 → 弹窗显示 AK/SK → 复制内容等于裸 SK
+（clipboard 断言）→ 关弹窗 → 列表出现新 AK。
 
 ---
 

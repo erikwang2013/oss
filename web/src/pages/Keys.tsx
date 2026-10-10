@@ -23,6 +23,11 @@ export default function Keys() {
     onError: (e: Error) => message.error(e.message),
   })
 
+  const close = () => {
+    setFresh(null)
+    create.reset() // 关窗即清 MutationCache 里的 data：SK 只该活在弹窗这一个副本里
+  }
+
   return (
     <>
       <Button type="primary" loading={create.isPending} onClick={() => create.mutate()} style={{ marginBottom: 16 }}>
@@ -38,13 +43,14 @@ export default function Keys() {
           { title: '说明', render: () => '启用/禁用与过期在 M5；M1 只有创建与使用' },
         ]}
       />
-      <Modal title="密钥已创建" open={!!fresh} footer={null} onCancel={() => setFresh(null)}>
+      <Modal title="密钥已创建" open={!!fresh} footer={null} maskClosable={false} onCancel={close}>
         {fresh && (
           <>
             <Alert type="warning" showIcon style={{ marginBottom: 12 }}
               message="Secret Key 只显示这一次，请立即保存（M5 前它是明文存库的）。" />
-            <Typography.Paragraph copyable>Access Key：{fresh.access_key}</Typography.Paragraph>
-            <Typography.Paragraph copyable>Secret Key：{fresh.secret_key}</Typography.Paragraph>
+            {/* copyable={{ text }} 显式给裸值：裸 copyable 会连「Access Key：」前缀一起复制 */}
+            <Typography.Paragraph copyable={{ text: fresh.access_key }}>Access Key：{fresh.access_key}</Typography.Paragraph>
+            <Typography.Paragraph copyable={{ text: fresh.secret_key }}>Secret Key：{fresh.secret_key}</Typography.Paragraph>
           </>
         )}
       </Modal>
