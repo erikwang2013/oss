@@ -695,3 +695,60 @@ async fn collect_keys_on_vanished_bucket_is_no_such_bucket() {
         Err(Error::NoSuchBucket(_))
     ));
 }
+
+// ---- M2a Task 1: x-amz-meta-* 用户元数据往返 ----
+
+#[tokio::test]
+async fn put_and_read_back_user_metadata() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let mut md = std::collections::BTreeMap::new();
+    md.insert("foo".to_string(), "bar".to_string());
+    let info = s
+        .put_object_with_meta("alpha", "k", Bytes::from_static(b"x"), None, md.clone())
+        .await
+        .unwrap();
+    assert_eq!(info.user_metadata, md);
+    let head = s.head_object("alpha", "k").await.unwrap();
+    assert_eq!(head.user_metadata, md);
+    // 覆写不带元数据 = 清空（S3 PUT 语义：metadata 全量替换，不是合并）
+    let info2 = s
+        .put_object_with_meta(
+            "alpha",
+            "k",
+            Bytes::from_static(b"y"),
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(info2.user_metadata.is_empty());
+    assert!(
+        s.head_object("alpha", "k")
+            .await
+            .unwrap()
+            .user_metadata
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn copy_carries_user_metadata() {
+    // copy 默认 metadata-directive=COPY：元数据随对象走
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let mut md = std::collections::BTreeMap::new();
+    md.insert("k".to_string(), "v".to_string());
+    s.put_object_with_meta("alpha", "src", Bytes::from_static(b"x"), None, md)
+        .await
+        .unwrap();
+    s.copy_object("alpha", "src", "alpha", "dst").await.unwrap();
+    assert_eq!(
+        s.head_object("alpha", "dst")
+            .await
+            .unwrap()
+            .user_metadata
+            .get("k"),
+        Some(&"v".to_string())
+    );
+}

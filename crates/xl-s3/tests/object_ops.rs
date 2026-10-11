@@ -623,3 +623,79 @@ async fn copy_object_source_missing_is_no_such_key() {
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
 }
+
+#[tokio::test]
+async fn metadata_roundtrip_through_service() {
+    // M2a Task 1：x-amz-meta-* 经 PutObjectInput.metadata → 内核 → GET/HEAD 输出回写
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let mut md = std::collections::HashMap::new();
+    md.insert("foo".to_string(), "bar".to_string());
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        metadata: Some(md),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        head.metadata.as_ref().and_then(|m| m.get("foo")),
+        Some(&"bar".to_string())
+    );
+
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        got.metadata.as_ref().and_then(|m| m.get("foo")),
+        Some(&"bar".to_string())
+    );
+
+    // 覆写不带元数据 = 清空（全量替换语义）
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"y"))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let head2 = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(
+        head2.metadata.is_none() || head2.metadata.as_ref().is_some_and(|m| m.is_empty()),
+        "覆写后元数据应为空，实际: {:?}",
+        head2.metadata
+    );
+}

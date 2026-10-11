@@ -1,7 +1,7 @@
 //! 存储内核。M1：单盘、无纠删码，但**提交协议与 xl.meta 格式按最终设计落**，
 //! M2 只是把「一个 part 一个文件」换成「一个 part 若干分片」。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -190,11 +190,25 @@ impl Store {
         body: Bytes,
         content_type: Option<String>,
     ) -> Result<ObjectInfo> {
-        self.put_object_stream(
+        self.put_object_with_meta(bucket, key, body, content_type, Default::default())
+            .await
+    }
+
+    /// 带用户元数据的整份 PUT。metadata 是**全量替换**（S3 语义，不是合并）。
+    pub async fn put_object_with_meta(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        content_type: Option<String>,
+        user_metadata: BTreeMap<String, String>,
+    ) -> Result<ObjectInfo> {
+        self.put_object_stream_with_meta(
             bucket,
             key,
             Box::pin(futures::stream::once(async move { Ok(body) })) as ByteStream,
             content_type,
+            user_metadata,
         )
         .await
     }
@@ -216,8 +230,21 @@ impl Store {
         &self,
         bucket: &str,
         key: &str,
+        body: ByteStream,
+        content_type: Option<String>,
+    ) -> Result<ObjectInfo> {
+        self.put_object_stream_with_meta(bucket, key, body, content_type, Default::default())
+            .await
+    }
+
+    /// 流式 PUT 的完整形态（含用户元数据）；`put_object_stream` 是空元数据的薄壳。
+    pub async fn put_object_stream_with_meta(
+        &self,
+        bucket: &str,
+        key: &str,
         mut body: ByteStream,
         content_type: Option<String>,
+        user_metadata: BTreeMap<String, String>,
     ) -> Result<ObjectInfo> {
         self.ensure_bucket(bucket).await?;
         layout::validate_key(key)?;
@@ -261,7 +288,7 @@ impl Store {
                 size,
                 etag: etag.clone(),
                 content_type: content_type.clone(),
-                user_metadata: Default::default(),
+                user_metadata: user_metadata.clone(),
                 part: PartRef {
                     uuid: uuid.clone(),
                     part: 1,
@@ -312,7 +339,7 @@ impl Store {
             etag,
             content_type,
             last_modified_nanos: now,
-            user_metadata: Default::default(),
+            user_metadata,
         })
     }
 
@@ -425,8 +452,15 @@ impl Store {
     ) -> Result<ObjectInfo> {
         // ponytail: M1 读出整份字节再写回（内存中介，上限同 put）；M2 换分片级服务端复制，不过内存。
         let (info, bytes) = self.get_object(src_bucket, src_key).await?;
-        self.put_object(dst_bucket, dst_key, bytes, info.content_type)
-            .await
+        // 默认 metadata-directive=COPY：元数据随对象走（REPLACE 指令不在 M2a 切片）
+        self.put_object_with_meta(
+            dst_bucket,
+            dst_key,
+            bytes,
+            info.content_type,
+            info.user_metadata,
+        )
+        .await
     }
 }
 

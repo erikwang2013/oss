@@ -98,6 +98,7 @@ impl S3 for OssS3 {
             key,
             body,
             content_type,
+            metadata,
             ..
         } = req.input;
         let mut body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
@@ -123,7 +124,13 @@ impl S3 for OssS3 {
 
         let info = self
             .store
-            .put_object(&bucket, &key, Bytes::from(buf), content_type)
+            .put_object_with_meta(
+                &bucket,
+                &key,
+                Bytes::from(buf),
+                content_type,
+                metadata.unwrap_or_default().into_iter().collect(),
+            )
             .await
             .map_err(to_s3_error)?;
 
@@ -152,6 +159,8 @@ impl S3 for OssS3 {
             content_type: info.content_type,
             e_tag: Some(ETag::Strong(info.etag)),
             last_modified: Some(last_modified(info.last_modified_nanos)),
+            // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
+            metadata: Some(info.user_metadata.into_iter().collect()),
             ..Default::default()
         }))
     }
@@ -170,6 +179,7 @@ impl S3 for OssS3 {
             content_type: info.content_type,
             e_tag: Some(ETag::Strong(info.etag)),
             last_modified: Some(last_modified(info.last_modified_nanos)),
+            metadata: Some(info.user_metadata.into_iter().collect()),
             ..Default::default()
         }))
     }

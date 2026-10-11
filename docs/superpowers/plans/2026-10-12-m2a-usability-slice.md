@@ -67,7 +67,7 @@ README.md              [改] Task 6 收尾
 - Modify: `crates/xl-store/src/store/tests.rs`
 - Modify: `crates/xl-s3/src/service.rs`、`crates/oss-server/src/aether.rs`
 
-- [ ] **Step 1: 写失败的测试**（`store/tests.rs` 追加）
+- [x] **Step 1: 写失败的测试**（`store/tests.rs` 追加）
 
 ```rust
 #[tokio::test]
@@ -109,9 +109,9 @@ async fn copy_carries_user_metadata() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**——`cargo test -p xl-store user_metadata 2>&1 | tail`，预期编译错误（`put_object_with_meta` 未定义）。
+- [x] **Step 2: 跑测试确认失败**——`cargo test -p xl-store user_metadata 2>&1 | tail`，预期编译错误（`put_object_with_meta` 未定义）。
 
-- [ ] **Step 3: 实现**。裁决：**新增 `put_object_with_meta` / `put_object_stream_with_meta`，旧函数保留为取 `Default::default()` 的薄壳**——比改签名波及 15+ 调用点（含全部测试）小得多，`xl.meta` 的 `user_metadata` 字段与 `ObjectInfo` 均已有：
+- [x] **Step 3: 实现**。裁决：**新增 `put_object_with_meta` / `put_object_stream_with_meta`，旧函数保留为取 `Default::default()` 的薄壳**——比改签名波及 15+ 调用点（含全部测试）小得多，`xl.meta` 的 `user_metadata` 字段与 `ObjectInfo` 均已有：
 
 ```rust
 pub async fn put_object_with_meta(
@@ -153,9 +153,9 @@ let info = self.store.put_object_with_meta(&bucket, &key, Bytes::from(buf), cont
 `get_object` / `head_object` 输出补 `metadata: Some(info.user_metadata.clone().into_iter().collect())`（空 map → `Some(空)` 与 `None` 的取舍：给 `Some(空)`，AWS 语义下无差别，客户端按空处理）。
 `oss-server/src/aether.rs` 的 `IngestSink`：显式调 `put_object_stream`（旧壳）**不改**——aether 链路无元数据来源，旧壳意图更清晰。
 
-- [ ] **Step 4: 跑测试**——`cargo test -p xl-store meta 2>&1 | tail`；再 `cargo test -p xl-s3 2>&1 | tail`。
-- [ ] **Step 5: s3 面集成用例**（`crates/oss-server/tests/s3_over_http.rs` 内已有直连用例的骨架，沿用其模式）：PUT 带 `x-amz-meta-foo: bar` → HEAD 断言响应头 `x-amz-meta-foo: bar` 且 GET 同。s3s 对响应头的前缀回写方式以实测为准（断言用 `resp.headers().get("x-amz-meta-foo")`）。
-- [ ] **Step 6: 提交**——`git add -A && git commit -m "feat: x-amz-meta-* 元数据 PUT/GET/HEAD/Copy 全链路往返"`
+- [x] **Step 4: 跑测试**——`cargo test -p xl-store meta 2>&1 | tail`；再 `cargo test -p xl-s3 2>&1 | tail`。
+- [x] **Step 5: s3 面集成用例（改为 xl-s3 service 层直调，见定稿记录）**（`crates/oss-server/tests/s3_over_http.rs` 内已有直连用例的骨架，沿用其模式）：PUT 带 `x-amz-meta-foo: bar` → HEAD 断言响应头 `x-amz-meta-foo: bar` 且 GET 同。s3s 对响应头的前缀回写方式以实测为准（断言用 `resp.headers().get("x-amz-meta-foo")`）。
+- [x] **Step 6: 提交**——`git add -A && git commit -m "feat: x-amz-meta-* 元数据 PUT/GET/HEAD/Copy 全链路往返"`
 
 ---
 
@@ -513,3 +513,13 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
 ## 定稿记录
 
 （实现完成后补：每 Task 实际形态、四闸实跑、e2e 输出、与本文档的差异裁决。）
+
+### Task 1（x-amz-meta-* 往返）
+
+- 实际形态与本计划一致（`put_object_with_meta` / `put_object_stream_with_meta` + 旧壳；
+  `copy_object` 携带 `info.user_metadata`；service 层 GET/HEAD 输出补 `metadata`）。
+- **偏差**：Step 5 的「s3_over_http.rs 走真实 HTTP 断言响应头」**未做**——该文件现无 SigV4 签名 helper，
+  签名级验证按仓库既有分工属 `tests/e2e_s3.sh`（Task 6 新增 `aws s3 cp --metadata` + `head-object` 用例）。
+  本任务以 `xl-s3/tests/object_ops.rs::metadata_roundtrip_through_service`（service 层直调，含覆写清空语义）替代。
+- 实跑：`cargo test -p xl-store user_metadata` 2/2 ✓；`cargo test -p xl-s3 metadata_roundtrip` 1/1 ✓；
+  fmt/clippy 随提交前跑。
