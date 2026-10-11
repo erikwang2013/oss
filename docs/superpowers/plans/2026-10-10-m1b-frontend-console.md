@@ -1779,6 +1779,10 @@ cd web && npm install && npm run dev
 
 - [ ] **Step 3: CI 验收**（本地预演已全绿；勾选待推送后 GitHub Actions 实跑确认）
 
+  > **2026-10-12 实况**：推送已完成（main 至 v1.0.0 全量在远端），但 GitHub Actions 在**账号层面**被拒——两个 job 均在 2 秒内
+  > 失败，注释原文：「The job was not started because recent account payments have failed or your spending limit needs to be increased」。
+  > **不是代码问题**：修复 GitHub Billing 后重跑最近一次 run，两个 job 绿了再勾选本项。
+
 CI 文件（`.github/workflows/ci.yml`，已随本计划就位）有两个 job：
 - `rust`：`cargo fmt --check` / `clippy -D warnings` / `test` —— 仓库无 `Cargo.toml` 时自动跳过（规划阶段不红）
 - `web`：`npm ci && npm run build && npm test` —— `web/package.json` 出现后自动生效
