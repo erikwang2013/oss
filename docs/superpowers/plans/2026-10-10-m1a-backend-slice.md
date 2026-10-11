@@ -5068,6 +5068,13 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 - **新增测试**：`layout::key_from_dir_name_rejects_invalid_rebuilt_keys`（`..__XLDIR__..` / `__XLDIR__etc` /
   `a__XLDIR____XLDIR__b` / 空串必须 Err）、`store::list_skips_invalid_object_dir_names`
   （桶内手工造 `..__XLDIR__..`，列举仍返回真实对象、不报错）。按本文件惯例，测试块不逐字镜像。
+- **提交 2（拆分）**：`store.rs` 末尾的 `#[cfg(test)] mod tests` 搬到 `crates/xl-store/src/store/tests.rs`，
+  测试内容一行未改（仅 rustfmt 归一缩进；xl-store 计数 53 不变），`store.rs` 留 `#[cfg(test)] mod tests;`。
+- **列表机制独立成 `crates/xl-store/src/store/list.rs`**：`list_objects` / `collect_keys` / `DEFAULT_MAX_KEYS`
+  整段搬入第二个 `impl Store` 块（`pub` 面不变；Task 6 计划块中这两个函数的最终归宿即此文件，函数体与上方同步后的形态一致）。
+  `collect_keys` 可见性由「`crate::store` 内私有」改为等价形态 `pub(in crate::store)`
+  （`store::tests` 直接调它，store 子树外不可见），行为未动。最终行数：`store.rs` 1233 → 441（<500），
+  `list.rs` 106，`tests.rs` 697（单一测试文件，超出 500 行的通用建议——内容未拆以避免改动测试）。
 
 ---
 
