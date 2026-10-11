@@ -12,14 +12,17 @@ import 'antd/dist/reset.css'
 import { router } from './App'
 
 // QueryCache.onError 在 React 树外拿不到 antd 的 message 实例：挂载一个空组件把
-// message.error 注册到模块单例做桥接（全局仅挂一次，StrictMode 下重复赋值也无副作用）
+// message.error 注册到模块单例做桥接（全局仅挂一次，StrictMode 下重复赋值也无副作用）。
+// 不用 antd 的静态 message.*：静态 API 不消费 ConfigProvider/App 上下文（主题、locale 全丢），
+// 且与各页面 App.useApp() 的用法割裂；桥接值多 11 行换来同一条 message 通道。
 let notifyError: (msg: string) => void = () => {}
 // 入口文件无导出、不涉及 Fast Refresh；此组件只为把 message 注册进桥接单例
 // oxlint-disable-next-line react/only-export-components
 function GlobalNotifier() {
   const { message } = AntApp.useApp()
   React.useEffect(() => {
-    notifyError = (msg: string) => { message.error(msg) }
+    // key 固定：多 query 同时失败时收敛为一条，不再叠 toast
+    notifyError = (msg: string) => { message.error({ content: msg, key: 'query-error' }) }
     return () => { notifyError = () => {} }
   }, [message])
   return null

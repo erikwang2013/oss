@@ -38,13 +38,15 @@ export async function rawApi(path: string, init: RequestInit = {}): Promise<Resp
   if (init.body && !(init.body instanceof FormData) && !headers.has('content-type')) headers.set('content-type', 'application/json')
 
   const resp = await fetch(path, { ...init, headers })
+  // 错误文案一处收口：HTTP/2 下 statusText 常为空、body 也可能空，兜到 HTTP <status>，
+  // 保证 ApiError.message 永不为空串（否则 UI 出现空 toast）
+  const errText = async () => (await resp.text()).trim() || resp.statusText || `HTTP ${resp.status}`
   if (resp.status === 401) {
     setToken(null)
-    const msg = (await resp.text()) || '未登录'
     if (window.location.pathname !== '/login') window.location.href = '/login'
-    throw new ApiError(401, msg)
+    throw new ApiError(401, await errText())
   }
-  if (!resp.ok) throw new ApiError(resp.status, (await resp.text()) || resp.statusText)
+  if (!resp.ok) throw new ApiError(resp.status, await errText())
   return resp
 }
 

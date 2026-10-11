@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test": "vitest run --passWithNoTests",
     "typecheck:e2e": "tsc -p tsconfig.e2e.json --noEmit",
-    "e2e": "playwright test"
+    "e2e": "tsc -p tsconfig.e2e.json --noEmit && playwright test"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",

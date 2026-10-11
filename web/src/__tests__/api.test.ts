@@ -94,6 +94,13 @@ describe('rawApi()', () => {
     expect(getToken()).toBeNull()
   })
 
+  it('空 body 且空 statusText 时兜底为 HTTP <status>（空 toast 的根因）', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 502 })))
+    const p = rawApi('/x')
+    await expect(p).rejects.toBeInstanceOf(ApiError)
+    await expect(p).rejects.toMatchObject({ status: 502, message: 'HTTP 502' })
+  })
+
   it('非 ok（非 401）抛 ApiError，不给 Response', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('内部错误', { status: 500 })))
     const p = rawApi('/x')
