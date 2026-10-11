@@ -75,17 +75,32 @@ impl AppState {
         // except 只有 `/login`：console 路由经 nest 时 axum 的 StripPrefix 会先把
         // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
         // （`/aetherupload/display/login` 之类整段不匹配），照常校验。
-        // secret 短于 32 字节是配置错误（jwt-rust 的 256 位下限），启动即失败。
+        // secret 短于 32 字节（jwt-rust 的 256 位下限）、黑名单目录不可建，都启动即失败。
         let jwt = Arc::new(
             JwtAuth::from_config(JwtConfig {
                 secret_key: cfg.jwt_secret.clone(),
                 default_expire: 12 * 3600,
+                // 黑名单（M1 无 logout 调用；未来撤销用）落数据盘，不用默认 /tmp：
+                // /tmp 会被 tmpfiles 清理（静默丢撤销记录）、多实例不共享，且预建同名目录
+                // 的 0700 只在本进程创建时设。FileTokenStorage 会递归建目录。
+                // 挂 `.oss.sys/` 下：store 的 list_buckets 跳过 SYS_DIR，直接放 data_dir 根
+                // 会被当成一个桶列出来（撞过测试 `login_then_list_buckets`）。
+                storage: jwt_rust::config::StorageConfig {
+                    path: Some(
+                        cfg.data_dir
+                            .join(xl_store::layout::SYS_DIR)
+                            .join("jwt_blacklist")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    ..Default::default()
+                },
                 middleware: jwt_rust::config::MiddlewareConfig {
                     except: vec!["/login".into()],
                 },
                 ..Default::default()
             })
-            .expect("jwt_secret 非法：jwt-rust 要求至少 32 字符（256 位）"),
+            .unwrap_or_else(|e| panic!("jwt-rust 初始化失败: {e}")),
         );
         let cfg = Arc::new(cfg);
         let db = Arc::new(db);
