@@ -491,7 +491,7 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
 
 - [x] fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（128 测）
 - [x] `tests/e2e_s3.sh` 对真服务实跑全过（含新增 multipart/range/metadata 步；14 步、退出码 0）
-- [x] web 不变（本切片无前端改动）；Playwright e2e 未重跑（上传落点/文案未动，相关断言不受影响）
+- [x] 控制台 Playwright e2e × M2a 后端**补跑两轮 3/3 全绿**（29.0s / 12.8s，零重试；用 M2a 二进制直起，测毕即停；建桶/上传/列表/下载字节一致/删除/密钥/秒传全过——M2a 未回归控制台路径）
 
 ## 已知风险与处置
 
