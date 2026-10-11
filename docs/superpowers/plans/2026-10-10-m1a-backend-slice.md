@@ -5033,3 +5033,4 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 | 桶级互斥缺失（`store.rs` 的 `delete_bucket` ponytail 注释，终审 Minor 4） | 并发 `delete_bucket` + `put_object` 可让桶「复活」（删目录与写对象目录竞态）；M2 用桶级锁或原子删除语义处理 |
 | 单个损坏的 `xl.meta`（`CorruptMeta`）会让整桶列举 500（终审不确定性 2） | 列举逐对象 `read_meta`，遇损坏即整个请求失败（`list_objects` 用 `?` 传播，最终 500）。读路径 fail-closed 是有意的（不静默服务错位内容），但影响面从单对象扩到整桶列举（管理面）；M2 fsck 前需人工处理该对象 |
 | 版本目录内含提交时的候选 `xl.meta` 副本（有意，MinIO 同构；终审不确定性 3） | 设计 §4.1 布局图原先只画 `part.N`（已在树中补 `xl.meta（候选）` 注释）；M2 写 GC 时若只按图理解会把副本当异常／漏处理 |
+| **aetherupload-rust 上游两处修复候选的落地状态**（2026-10-11 升 1.0.4，非纯测试变更） | **urlencoded 已修**：`src/form.rs` 新增 `FormData::from_urlencoded`，`integrations/{axum,actix,poem,warp}` 的 `preprocess` 按 Content-Type 分流、urlencoded 与 multipart 都收（`assets/` 零差异——修复落在 Rust 侧；`ecat = ["axum"]`，本项目走的就是该路径）→ 本地 JS 补丁在 1.0.4 上冗余但无害（multipart 仍收），保留待独立移除。**catch_unwind 未修**：`src/controller/upload.rs` 逐字节未变，仅 `events.rs` 文档化为「与 PHP 一致」的有意行为 → `clear_instant_index` 补偿继续有效 |

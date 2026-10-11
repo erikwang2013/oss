@@ -118,7 +118,8 @@ impl EventSink for IngestSink {
 
         // aetherupload 的 ecat controller 以 catch_unwind 吞掉回调 panic、响应仍为成功
         // （`emit_safely`，upload.rs:465）；本 sink 以 panic + tracing::error 保证服务端可见，
-        // 并清索引防钉死。
+        // 并清索引防钉死。1.0.4 仍未修（`controller/upload.rs` 逐字节未变，events.rs 仅把该隔离
+        // 文档化为「与 PHP 一致」的有意行为），补偿继续有效。
         let result = block_on(async {
             // 流式进内核：大文件不再整份驻留内存（tokio-util 的 ReaderStream 直接套文件句柄）
             let file = tokio::fs::File::open(&resource.path).await?;

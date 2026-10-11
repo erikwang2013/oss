@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "aetherupload-rust"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12c9251f5511efacc9cef88315b0f52954dcde5fa20881137849be40211d9b2f"
+checksum = "dc0b272dab1e8792f7723c87ff499dba9abdfaf209201f57b2efc84af2ec1416"
 dependencies = [
  "axum 0.8.9",
  "tokio",

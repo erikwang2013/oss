@@ -28,6 +28,6 @@ tracing = "0.1"
 # 发布版依赖：绝不加 "0.8" 之外的 axum —— ecat 与 aetherupload 都锚定 axum 0.8
 axum = { version = "0.8", default-features = false }
 s3s = "0.17"
-aetherupload-rust = { version = "1.0.3", features = ["ecat"] }
+aetherupload-rust = { version = "1.0.4", features = ["ecat"] }
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
