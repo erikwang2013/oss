@@ -51,18 +51,22 @@ cd web && npm install && npm run dev
 ```
 
 - 上传复用 aetherupload 自带脚本（分块 / 断线续传 / 秒传），前端不含分片逻辑
+- **上传落点**：按上传分组落桶（`oss.toml` 的 `[[groups]]`，如 `file` → `files`）；对象名 = 内容的整份 MD5 +
+  扩展名，子目录 = UTC 年月（如 `202610/<md5>.bin`）。所以在对象浏览器里是根据内容哈希找文件，不是原始文件名
 - 秒传提示「上传成功（秒传）」表示 0 分块传输
 - e2e：`cd web && npx playwright install chromium && npm run e2e`。Playwright 自带双 webServer
   （`cargo run` + `vite`），后端按 `web/playwright.config.ts` 里的 `pw` 自启；**已有后端在跑时会被复用**
   （`reuseExistingServer`），此时运行中实例的管理员口令必须也是 `pw`，否则登录 401——口令不一致就先停掉
-  自起的服务，让 Playwright 用 `pw` 起自己的。上面「跑起来」的 `changeme` 只是示例占位，与 e2e 无关
-  （改不改都不影响 e2e）。
+  自起的服务，让 Playwright 用 `pw` 起自己的（「跑起来」段用的 `changeme` 只是示例占位）。
+- 1 GB 上传与断线续传为**人工验证项**（不在 e2e 里）：
+  `head -c 1073741824 /dev/urandom > /tmp/1g.bin` → 面板上传观察进度推进 → 中途 DevTools → Network → Offline
+  （或拔网线）→ 输出区出现「网络故障，正在重试……」→ 恢复网络 → 自动继续至成功；下载后 `cmp` 与本地一致。
 - 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
 
 ## 验收
 
-覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）；浏览器上传与控制台界面见
-「控制台（M1b）」的 Playwright e2e。
+覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）见下方脚本；控制台的登录/上传/秒传/密钥常规路径见
+「控制台（M1b）」的 Playwright e2e；**1 GB 上传与断线续传为人工验证项**（指引同 M1b 段）。
 前置：本机装了 aws-cli 与 rclone。
 
 ```bash

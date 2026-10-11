@@ -1733,6 +1733,8 @@ head -c 1073741824 /dev/urandom > /tmp/1g.bin
 
 **team-lead 独立复验**：收尾轮从控制台 API 重新拉取该 1 GiB 对象（1073741824 B）——`md5` = `86274962ca6e5229c52180e5fadfa42b`（与记录本地 md5 及服务端 ETag 三重一致）、`sha256` = `b0dfd66…bb0e`（与上文一致）。下载完整性无缺口。
 
+**留档补充说明**：`run.log` 中的两行 ERROR（首次点「下 载」30s 超时、`download.cjs` 的 `suggestedFileName` API 误用）均为临时脚本自身问题，各自重试/修复后成功；上文下载结论以最终成功次为准。
+
 - [x] **Step 2: README 增加「控制台（M1b）」段**
 
 ```markdown
@@ -1747,16 +1749,20 @@ cd web && npm install && npm run dev
 ```
 
 - 上传复用 aetherupload 自带脚本（分块 / 断线续传 / 秒传），前端不含分片逻辑
+- **上传落点**：按上传分组落桶（`oss.toml` 的 `[[groups]]`，如 `file` → `files`）；对象名 = 内容的整份 MD5 +
+  扩展名，子目录 = UTC 年月（如 `202610/<md5>.bin`）。所以在对象浏览器里是根据内容哈希找文件，不是原始文件名
 - 秒传提示「上传成功（秒传）」表示 0 分块传输
 - e2e：`cd web && npx playwright install chromium && npm run e2e`。Playwright 自带双 webServer
   （`cargo run` + `vite`），后端按 `web/playwright.config.ts` 里的 `pw` 自启；**已有后端在跑时会被复用**
   （`reuseExistingServer`），此时运行中实例的管理员口令必须也是 `pw`，否则登录 401——口令不一致就先停掉
-  自起的服务，让 Playwright 用 `pw` 起自己的。上面「跑起来」的 `changeme` 只是示例占位，与 e2e 无关
-  （改不改都不影响 e2e）。
+  自起的服务，让 Playwright 用 `pw` 起自己的（「跑起来」段用的 `changeme` 只是示例占位）。
+- 1 GB 上传与断线续传为**人工验证项**（不在 e2e 里）：
+  `head -c 1073741824 /dev/urandom > /tmp/1g.bin` → 面板上传观察进度推进 → 中途 DevTools → Network → Offline
+  （或拔网线）→ 输出区出现「网络故障，正在重试……」→ 恢复网络 → 自动继续至成功；下载后 `cmp` 与本地一致。
 - 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
 ```
 
-- [x] **Step 3: CI 验收**
+- [ ] **Step 3: CI 验收**（本地预演已全绿；勾选待推送后 GitHub Actions 实跑确认）
 
 CI 文件（`.github/workflows/ci.yml`，已随本计划就位）有两个 job：
 - `rust`：`cargo fmt --check` / `clippy -D warnings` / `test` —— 仓库无 `Cargo.toml` 时自动跳过（规划阶段不红）
@@ -1798,6 +1804,9 @@ git add README.md && git commit -m "docs: 控制台使用说明与 1GB 上传清
 > - 设置页（上传分组只读展示；分组编辑是 M2）
 > - 跨刷新断点续传（服务端进度查询 + Multipart，M2）
 > - 生产静态托管（构建产物由 nginx 服务、TLS、X-Accel-Redirect 下载——部署随 M2，见设计文档 §12）
+>
+> **本地卫生遗留（非功能项）**：e2e 使用共享 dev 数据目录（`data/`）、不建独立环境也不清桶——反复跑会在 dev 数据里累积
+> `*e2e*` 桶（写此注时 79 个，含 65 个 e2e 桶），需手工 `rm -rf data/*e2e*` 或将来给 e2e 配独立数据目录。
 
 ## 已知风险与处置
 
