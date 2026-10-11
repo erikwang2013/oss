@@ -442,8 +442,12 @@ pub fn object_dir_name(key: &str) -> Result<String> {
     Ok(key.replace('/', SEP))
 }
 
+/// 目录名 → 键。重建的键必须过同一套校验：桶目录里可能出现手工塞入或残留的杂物目录，
+/// 无校验时 `..__XLDIR__..` 这类名字会解出 `../..` 之类非法键。
 pub fn key_from_dir_name(dir: &str) -> Result<String> {
-    Ok(dir.replace(SEP, "/"))
+    let key = dir.replace(SEP, "/");
+    validate_key(&key)?;
+    Ok(key)
 }
 
 pub fn bucket_dir(root: &Path, bucket: &str) -> PathBuf {
@@ -2117,7 +2121,12 @@ const DEFAULT_MAX_KEYS: usize = 1000;
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            keys.push(layout::key_from_dir_name(&name)?);
+            // 杂物目录（手工塞入、崩溃残留）解出的键非法：跳过并告警，不能让一个目录名
+            // 把整桶列举打挂；真实对象的目录名由 object_dir_name 生成，必过同一套校验。
+            match layout::key_from_dir_name(&name) {
+                Ok(k) => keys.push(k),
+                Err(e) => tracing::warn!(dir = %name, error = %e, "跳过非法对象目录"),
+            }
         }
         Ok(keys)
     }
@@ -5040,6 +5049,25 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
   三条命令在临时 `oss.toml` 环境实跑（`groups` 列出分组、`build` 报 "2 items have been set" 且 SQLite 索引行可查、`clean 1` 删 1 断点 + 1 分块 + 1 tmp 孤儿）；
   `serve` 起服务 → login 签发 token 照常。
 - **README** 新增「运维命令」小节（三条用法 + cron 建议 + 配置路径变化）；规格 §18.1 表加「实现状态」列。
+
+---
+
+## xl-store 列表健壮性（质量评审遗留；M1 收尾后）—— 定稿记录
+
+**来源**：M1 收尾质量评审两条遗留 —— ① `key_from_dir_name` 只是 `dir.replace(SEP, "/")`，不校验重建键，
+桶目录里手工塞入的 `..__XLDIR__..`、`__XLDIR__etc` 会解出 `../..`、`/etc` 这类非法键；
+② `collect_keys` 对这类目录名直接 `?` 冒泡，一个杂物目录让整桶 ListObjects 失败。
+两处均改在源头，Task 2 Step 4 与 Task 6 的对应函数块已按最终形态同步（本节之外其余测试块保留改动前形态）。
+
+- **`key_from_dir_name` 解码后过 `validate_key`**：非法重建键返回 `Err`（`Error::InvalidKey`）。
+  合法对象目录名由 `object_dir_name` 生成、必过同一套校验，往返不受影响（`object_dir_roundtrip` 保持绿）。
+- **`collect_keys` 跳过 + `tracing::warn!`**（带目录名与错误）：单个杂物目录不再打挂整桶列举，
+  且不改变 `collect_keys` 对「桶被并发删除」的 `NoSuchBucket` 映射。与计划「已知风险」表
+  「列举跳过无 meta 的目录」同向；规格 §4.1 未规定坏目录行为，无冲突。
+  这是 xl-store 首次实际使用 `tracing`（依赖此前只声明未用），依赖面不变、无新增。
+- **新增测试**：`layout::key_from_dir_name_rejects_invalid_rebuilt_keys`（`..__XLDIR__..` / `__XLDIR__etc` /
+  `a__XLDIR____XLDIR__b` / 空串必须 Err）、`store::list_skips_invalid_object_dir_names`
+  （桶内手工造 `..__XLDIR__..`，列举仍返回真实对象、不报错）。按本文件惯例，测试块不逐字镜像。
 
 ---
 

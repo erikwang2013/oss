@@ -500,7 +500,12 @@ impl Store {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            keys.push(layout::key_from_dir_name(&name)?);
+            // 杂物目录（手工塞入、崩溃残留）解出的键非法：跳过并告警，不能让一个目录名
+            // 把整桶列举打挂；真实对象的目录名由 object_dir_name 生成，必过同一套校验。
+            match layout::key_from_dir_name(&name) {
+                Ok(k) => keys.push(k),
+                Err(e) => tracing::warn!(dir = %name, error = %e, "跳过非法对象目录"),
+            }
         }
         Ok(keys)
     }
@@ -1195,6 +1200,23 @@ mod tests {
             .unwrap();
         assert_eq!(r.objects.len(), 2);
         assert!(r.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_skips_invalid_object_dir_names() {
+        // 手工塞入桶目录的杂物目录（键重建为 `../..`）不得让整桶列举失败，只跳过该目录
+        let (s, d) = store().await;
+        s.create_bucket("alpha").await.unwrap();
+        s.put_object("alpha", "real.txt", bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+        std::fs::create_dir(layout::bucket_dir(d.path(), "alpha").join("..__XLDIR__..")).unwrap();
+        let r = s
+            .list_objects("alpha", &ListRequest::default())
+            .await
+            .unwrap();
+        let keys: Vec<&str> = r.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["real.txt"]);
     }
 
     #[tokio::test]

@@ -80,8 +80,12 @@ pub fn object_dir_name(key: &str) -> Result<String> {
     Ok(key.replace('/', SEP))
 }
 
+/// 目录名 → 键。重建的键必须过同一套校验：桶目录里可能出现手工塞入或残留的杂物目录，
+/// 无校验时 `..__XLDIR__..` 这类名字会解出 `../..` 之类非法键。
 pub fn key_from_dir_name(dir: &str) -> Result<String> {
-    Ok(dir.replace(SEP, "/"))
+    let key = dir.replace(SEP, "/");
+    validate_key(&key)?;
+    Ok(key)
 }
 
 pub fn bucket_dir(root: &Path, bucket: &str) -> PathBuf {
@@ -141,6 +145,15 @@ mod tests {
     fn rejects_keys_containing_separator() {
         // 键里出现 __XLDIR__ 会让往返编码错位，必须拒绝而不是静默损坏
         assert!(object_dir_name("a__XLDIR__b").is_err());
+    }
+
+    #[test]
+    fn key_from_dir_name_rejects_invalid_rebuilt_keys() {
+        // 桶目录里手工塞入的杂物目录名解出的键非法，重建时必须拒绝：
+        // `..__XLDIR__..` → `../..`、`__XLDIR__etc` → `/etc`、双分隔符 → `a//b`
+        for bad in ["..__XLDIR__..", "__XLDIR__etc", "a__XLDIR____XLDIR__b", ""] {
+            assert!(key_from_dir_name(bad).is_err(), "{bad} 应当被拒");
+        }
     }
 
     #[test]
