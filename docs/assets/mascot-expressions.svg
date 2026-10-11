@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 900 340" width="720" height="272"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
-  <title>OSS 项目吉祥物表情形态（动态）</title>
-  <desc>存储桶小家伙的五种动态表情：哭（落泪、抽泣）、笑（弹跳、腮红发亮）、沮丧（眼神下垂、褪色）、惊恐（颤抖、冷汗、泛白）、得意（金光闪烁、坏笑抽动）。</desc>
+  <title>吞吞（TunTun）的表情形态（动态）</title>
+  <desc>吞吞（TunTun）的五种动态表情：哭（落泪、抽泣）、笑（弹跳、腮红发亮）、沮丧（眼神下垂、褪色）、惊恐（颤抖、冷汗、泛白）、得意（金光闪烁、坏笑抽动）。</desc>
   <defs>
     <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#7ba3cc"/>

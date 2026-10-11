@@ -1,8 +1,12 @@
-![OSS 项目吉祥物：一只装着三块对象立方体的存储桶，戴着绿色状态灯](docs/assets/mascot.svg)
+![吞吞（OSS 项目宠物）：一只装着三块对象立方体的存储桶，戴着绿色状态灯](docs/assets/mascot.svg)
 
-![吉祥物表情形态：哭、笑、沮丧、惊恐、得意](docs/assets/mascot-expressions.svg)
+![吞吞的表情形态：哭、笑、沮丧、惊恐、得意](docs/assets/mascot-expressions.svg)
 
-# OSS —— 自研分布式对象存储系统
+# oss（吞吞）—— 自研分布式对象存储系统
+
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg) ![Rust](https://img.shields.io/badge/rust-2024%20edition-dea584.svg) ![Release](https://img.shields.io/github/v/release/erikwang2013/oss) ![S3](https://img.shields.io/badge/S3-compatible-blueviolet.svg)
+
+**项目中文名：吞吞　英文名：oss　项目宠物：吞吞（TunTun）**——一只把对象块吞进桶里的小家伙。
 
 S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分布式 + 纠删码；
 当前完成 **M1（单盘垂直切片）+ M2a（单盘可用性切片：Multipart Upload、Range GET、
