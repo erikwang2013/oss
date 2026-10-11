@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { App, Button, Card, Form, Input } from 'antd'
 import { api, setToken } from '../api'
+import Mascot from '../Mascot'
 
 export default function Login() {
   const nav = useNavigate()
@@ -18,15 +19,19 @@ export default function Login() {
       setToken(token)
       nav('/buckets', { replace: true })
     } catch (e) {
-      message.error(e instanceof Error && e.message ? e.message : '登录失败')
+      message.error({
+        content: e instanceof Error && e.message ? e.message : '登录失败',
+        icon: <Mascot mood="shocked" size={22} alt="" />,
+      })
     } finally {
       setLoading(false)
     }
   }
 
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 120 }}>
-      <Card title="OSS 控制台" style={{ width: 360 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 96 }}>
+      <Mascot mood="happy" size={112} alt="OSS 控制台吉祥物" />
+      <Card title="OSS 控制台" style={{ width: 360, marginTop: 8 }}>
         <Form onFinish={onFinish} layout="vertical">
           <Form.Item name="username" label="用户名" rules={[{ required: true }]}>
             <Input autoFocus />

@@ -10,6 +10,7 @@ import { ApiError } from './api'
 import zhCN from 'antd/es/locale/zh_CN'
 import 'antd/dist/reset.css'
 import { router } from './App'
+import Mascot from './Mascot'
 
 // QueryCache.onError 在 React 树外拿不到 antd 的 message 实例：挂载一个空组件把
 // message.error 注册到模块单例做桥接（全局仅挂一次，StrictMode 下重复赋值也无副作用）。
@@ -22,7 +23,9 @@ function GlobalNotifier() {
   const { message } = AntApp.useApp()
   React.useEffect(() => {
     // key 固定：多 query 同时失败时收敛为一条，不再叠 toast
-    notifyError = (msg: string) => { message.error({ content: msg, key: 'query-error' }) }
+    notifyError = (msg: string) => {
+      message.error({ content: msg, key: 'query-error', icon: <Mascot mood="cry" size={22} alt="" /> })
+    }
     return () => { notifyError = () => {} }
   }, [message])
   return null
@@ -41,7 +44,16 @@ const queryClient = new QueryClient({
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <ConfigProvider locale={zhCN}>
+    <ConfigProvider
+      locale={zhCN}
+      // 所有空状态（各表格、列表）统一换成吉祥物：桶里空空的，它就沮丧
+      renderEmpty={() => (
+        <div style={{ textAlign: 'center', padding: '24px 0' }}>
+          <Mascot mood="dejected" size={88} alt="暂无数据" />
+          <div style={{ color: '#94a3b8', marginTop: 4 }}>暂无数据</div>
+        </div>
+      )}
+    >
       <AntApp>
         <GlobalNotifier />
         <QueryClientProvider client={queryClient}>

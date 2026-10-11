@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { App, Button, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type GroupInfo, type UploadRecord } from '../api'
+import Mascot from '../Mascot'
 import { humanSize } from '../format'
 import { useUpload, type UploadOutcome } from './useUpload'
 
@@ -48,7 +49,10 @@ export default function UploadPanel({
       // useUpload.start 里那处清理只在 change 事件能触发时才轮得到，救不了这一手。
       fileRef.current?.removeAttribute('disabled')
       setLast(outcome)
-      message.success(outcome.instant ? '上传成功（秒传）' : '上传成功')
+      message.success({
+        content: outcome.instant ? '上传成功（秒传）' : '上传成功',
+        icon: <Mascot mood={outcome.instant ? 'smug' : 'happy'} size={22} alt="" />,
+      })
       if (outcome.savedPath) {
         await api('/api/v1/uploads/register', {
           method: 'POST',
@@ -130,9 +134,16 @@ export default function UploadPanel({
         </div>
 
         {last && (
-          <Tag color={last.instant ? 'gold' : 'green'}>
-            {last.instant ? '秒传命中（0 分块传输）' : '分块上传完成'}
-          </Tag>
+          <Space align="center">
+            <Mascot
+              mood={last.instant ? 'smug' : 'happy'}
+              size={56}
+              alt={last.instant ? '秒传命中' : '分块上传完成'}
+            />
+            <Tag color={last.instant ? 'gold' : 'green'}>
+              {last.instant ? '秒传命中（0 分块传输）' : '分块上传完成'}
+            </Tag>
+          </Space>
         )}
         <Typography.Text type="secondary">
           断网/弱网时脚本会自动重试当前分块（服务端对重发分块幂等），进度条会继续推进——这就是断线续传。

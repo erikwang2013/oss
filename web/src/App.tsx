@@ -3,6 +3,7 @@ import { Layout, Menu } from 'antd'
 import { Link, useLocation } from 'react-router-dom'
 import { DatabaseOutlined, KeyOutlined } from '@ant-design/icons'
 import { getToken } from './api'
+import Mascot from './Mascot'
 import Login from './pages/Login'
 import Buckets from './pages/Buckets'
 import Objects from './pages/Objects'
@@ -17,6 +18,11 @@ function Shell() {
   return (
     <Layout style={{ minHeight: '100vh' }}>
       <Layout.Sider theme="light">
+        {/* 侧栏品牌位：吉祥物当 logo（导航项本身保留语义图标——14px 的小脸认不出来） */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 16px 6px' }}>
+          <Mascot mood="happy" size={28} alt="OSS 控制台" />
+          <span style={{ fontWeight: 600, fontSize: 15 }}>OSS 控制台</span>
+        </div>
         <Menu
           mode="inline"
           selectedKeys={[selected]}
