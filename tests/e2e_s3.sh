@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M1 验收：S3 兼容性（aws-cli + rclone）。
+# 验收：S3 兼容性（aws-cli + rclone）。M1 基础 + M2a 的 multipart / Range / 元数据。
 # 前置：本机装了 aws-cli 与 rclone。
 set -euo pipefail
 
@@ -61,7 +61,32 @@ rclone copyto "$WORK/one.bin" oss:"$BUCKET/rclone.bin"
 rclone cat oss:"$BUCKET/rclone.bin" | cmp - "$WORK/one.bin"   # rclone 读回内容与本地一致
 if rclone lsf oss:"$BUCKET" | grep -qx one.bin; then echo "删除未生效"; exit 1; fi
 
-echo "== 10. 删桶 =="
+echo "== 10. Multipart 直传（≥8 MiB 自动分片；M2a）=="
+head -c 10485760 /dev/urandom > "$WORK/big.bin"     # 10 MiB > aws-cli 默认阈值 8 MiB
+aws_s3 cp "$WORK/big.bin" "s3://$BUCKET/big.bin"
+aws_s3 cp "s3://$BUCKET/big.bin" "$WORK/big.back"
+cmp "$WORK/big.bin" "$WORK/big.back"
+BIG_ETAG=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text | tr -d '"')
+[[ "$BIG_ETAG" =~ -[0-9]+$ ]] || { echo "multipart ETag 应带 -N 后缀: $BIG_ETAG"; exit 1; }
+
+echo "== 11. Range GET（206 + Content-Range + 字节比对）=="
+aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key big.bin \
+  --range bytes=1048576-2097151 "$WORK/range.bin" | grep -q '"ContentRange": "bytes 1048576-2097151/10485760"'
+dd if="$WORK/big.bin" of="$WORK/range.expect" bs=1048576 skip=1 count=1 status=none
+cmp "$WORK/range.bin" "$WORK/range.expect"
+
+echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
+aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key meta.bin --query 'Metadata.foo' --output text | grep -qx bar
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key meta.bin --query 'Metadata.lang' --output text | grep -qx zh
+
+echo "== 13. rclone 大文件（强制走 multipart）=="
+export RCLONE_CONFIG_OSS_UPLOAD_CUTOFF=5M            # rclone 默认 cutoff 200Mi 会走单 PUT，压低以强制分片
+export RCLONE_CONFIG_OSS_CHUNK_SIZE=5M
+rclone copyto "$WORK/big.bin" oss:"$BUCKET/rclone-big.bin"
+rclone cat oss:"$BUCKET/rclone-big.bin" | cmp - "$WORK/big.bin"
+
+echo "== 14. 删桶 =="
 aws_s3 rb "s3://$BUCKET" --force
 
-echo "M1 S3 验收全部通过"
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据）"

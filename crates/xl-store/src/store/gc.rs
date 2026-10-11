@@ -77,7 +77,13 @@ impl Store {
                     continue;
                 };
                 let referenced: HashSet<String> = match self.read_meta(&bucket_name, &key).await {
-                    Ok(Some(m)) => m.versions.iter().map(|v| v.part.uuid.clone()).collect(),
+                    // effective_parts：单段 → part；多段 → parts 全列表（各段 uuid 均不得回收）
+                    Ok(Some(m)) => m
+                        .versions
+                        .iter()
+                        .flat_map(|v| v.effective_parts())
+                        .map(|p| p.uuid)
+                        .collect(),
                     Ok(None) => HashSet::new(),
                     Err(e) => {
                         tracing::warn!(bucket = %bucket_name, key = %key, error = %e, "回收跳过：读取 xl.meta 失败");

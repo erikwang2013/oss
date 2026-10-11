@@ -16,6 +16,14 @@ pub enum Error {
     InvalidBucketName(String),
     #[error("corrupt metadata: {0}")]
     CorruptMeta(String),
+    #[error("no such multipart upload: {0}")]
+    NoSuchUpload(String),
+    #[error("invalid part: {0}")]
+    InvalidPart(String),
+    #[error("parts not in ascending order: {0}")]
+    InvalidPartOrder(String),
+    #[error("part too small: {0}")]
+    EntityTooSmall(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("encode error: {0}")]

@@ -39,6 +39,20 @@ pub struct Version {
     #[serde(default)]
     pub user_metadata: BTreeMap<String, String>,
     pub part: PartRef,
+    /// Multipart：`Some(parts)` 时以本列表为准（按 part 号升序），`part` 字段退为兼容位（首段副本）；
+    /// `None` = M1 单段语义（读 `part`）。只加 `Option` 字段 = 前向兼容契约（见文件头注释）。
+    #[serde(default)]
+    pub parts: Option<Vec<PartRef>>,
+}
+
+impl Version {
+    /// 统一的 parts 视图：单段 → `vec![part]`，多段 → 原列表（克隆）。
+    pub fn effective_parts(&self) -> Vec<PartRef> {
+        match &self.parts {
+            Some(parts) => parts.clone(),
+            None => vec![self.part.clone()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,6 +93,17 @@ impl XlMeta {
                     v.part.uuid
                 )));
             }
+            // 多段（Multipart）的 parts[].uuid 同样进读路径（dir.join(uuid)），同一套白名单收口
+            if let Some(parts) = &v.parts {
+                for p in parts {
+                    if !part_uuid_is_safe(&p.uuid) {
+                        return Err(Error::CorruptMeta(format!(
+                            "parts[].uuid 非法: {:?}",
+                            p.uuid
+                        )));
+                    }
+                }
+            }
         }
         Ok(m)
     }
@@ -118,6 +143,7 @@ mod tests {
                     size: 11,
                     sha256: "aa".into(),
                 },
+                parts: None,
             }],
         }
     }
@@ -268,12 +294,125 @@ mod tests {
         let bytes = sample().encode().unwrap();
         assert_eq!(bytes[0], FORMAT_VERSION);
         // 已人工核对：首字节 01；version_id 为 bin8（c4 10 + 16 字节全零）；
+        // M2a Task 5 起 Version 增加 parts 字段（单段写 nil），摘要已按「有意识更新」流程重算。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "da898c71e7d91dbc23826a6e84269cd2962a530ff364a9fc3c59eccc7ea2821f"
+            "e7f386e47c6918e5bb0b957441fd85927227f8c74174dc8c37a0db4ebf208901"
         );
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    fn version(parts: Option<Vec<PartRef>>) -> Version {
+        Version {
+            version_id: uuid::Uuid::nil(),
+            mod_time_nanos: 1,
+            size: 5,
+            etag: "e".into(),
+            content_type: None,
+            user_metadata: Default::default(),
+            part: PartRef {
+                uuid: "single".into(),
+                part: 1,
+                size: 5,
+                sha256: "s".into(),
+            },
+            parts,
+        }
+    }
+
+    #[test]
+    fn effective_parts_single_vs_multi() {
+        // None（M1 单段）→ 兼容位单条
+        let v = version(None);
+        let ps = v.effective_parts();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].uuid, "single");
+
+        // Some（MPU）→ 原列表为准
+        let v = version(Some(vec![
+            PartRef {
+                uuid: "u".into(),
+                part: 1,
+                size: 5,
+                sha256: "a".into(),
+            },
+            PartRef {
+                uuid: "u".into(),
+                part: 2,
+                size: 7,
+                sha256: "b".into(),
+            },
+        ]));
+        let ps = v.effective_parts();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[1].part, 2);
+    }
+
+    #[test]
+    fn decode_rejects_unsafe_parts_uuid() {
+        // 多段 parts[].uuid 同样进读路径：含 ../ 必须解码即拒
+        let mut v = version(Some(vec![PartRef {
+            uuid: "../x".into(),
+            part: 1,
+            size: 5,
+            sha256: "s".into(),
+        }]));
+        v.part.uuid = "ok".into();
+        let m = XlMeta {
+            object_key: "a".into(),
+            versions: vec![v],
+        };
+        let bytes = m.encode().unwrap();
+        assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
+    }
+
+    #[test]
+    fn decode_old_file_without_parts_field_is_none() {
+        // 前向兼容的另一半：旧文件（无 parts 字段）解码 → None
+        #[derive(serde::Serialize)]
+        struct OldVersion {
+            version_id: uuid::Uuid,
+            mod_time_nanos: i64,
+            size: u64,
+            etag: String,
+            content_type: Option<String>,
+            user_metadata: BTreeMap<String, String>,
+            part: PartRef,
+        }
+        #[derive(serde::Serialize)]
+        struct OldMeta {
+            object_key: String,
+            versions: Vec<OldVersion>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldMeta {
+            object_key: "a".into(),
+            versions: vec![OldVersion {
+                version_id: uuid::Uuid::nil(),
+                mod_time_nanos: 1,
+                size: 5,
+                etag: "e".into(),
+                content_type: None,
+                user_metadata: Default::default(),
+                part: PartRef {
+                    uuid: "u".into(),
+                    part: 1,
+                    size: 5,
+                    sha256: "s".into(),
+                },
+            }],
+        })
+        .unwrap();
+        let mut framed = vec![FORMAT_VERSION];
+        framed.extend(bytes);
+        let back = XlMeta::decode(&framed).unwrap();
+        assert!(back.versions[0].parts.is_none());
+        assert_eq!(back.versions[0].effective_parts()[0].uuid, "u");
     }
 }

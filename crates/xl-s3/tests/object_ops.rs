@@ -937,3 +937,106 @@ async fn put_object_body_error_is_incomplete_body() {
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::IncompleteBody);
 }
+
+#[tokio::test]
+async fn multipart_flow_through_service() {
+    // M2a Task 5：create → list_parts → upload_part → complete → GET → abort(NoSuchUpload)
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let created = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            content_type: Some("text/plain".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let upload_id = created.upload_id.unwrap();
+
+    // 单段小文件（末段 <5 MiB 允许）
+    let up = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"multipart-hello",
+            ))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let etag = up.e_tag.unwrap().value().to_string();
+
+    let listed = s3
+        .list_parts(req(ListPartsInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id: upload_id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let listed = listed.parts.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].size, Some(15));
+
+    let done = s3
+        .complete_multipart_upload(req(CompleteMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id: upload_id.clone(),
+            multipart_upload: Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(ETag::Strong(etag)),
+                    ..Default::default()
+                }]),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(done.e_tag.unwrap().value().ends_with("-1"));
+
+    // GET 回读内容
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let mut body = got.body.unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(buf, b"multipart-hello");
+
+    // complete 后 abort → NoSuchUpload（mpu.meta 已转正为 done）
+    let err = s3
+        .abort_multipart_upload(req(AbortMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchUpload);
+}

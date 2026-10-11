@@ -17,6 +17,7 @@ use crate::meta::{self, PartRef, Version, XlMeta};
 
 mod gc;
 mod list;
+mod mpu;
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
@@ -299,6 +300,8 @@ impl Store {
                     size,
                     sha256: hex::encode(sha.finalize()),
                 },
+                // 单段 PUT 保持与旧文件同形的 None（MPU complete 才写 Some）
+                parts: None,
             };
             let meta = XlMeta {
                 object_key: key.to_string(),
@@ -422,14 +425,26 @@ impl Store {
                 .latest()
                 .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
             let info = self.load_object_info(bucket, key, &m)?;
-            let path = dir.join(&v.part.uuid).join(format!("part.{}", v.part.part));
-            // ponytail: M1 整份读进内存；M2 换流式（大对象与 Range 是 M2 的事）。
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => return Ok((info, Bytes::from(bytes))),
-                // 旧版本目录已被并发覆写者移走：下一轮重读 meta 拿新版本
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
+            let parts = v.effective_parts();
+            // ponytail: M2a 整份读进内存（跨 part 拼接，与既有限制同口径）；M2b 换流式。
+            let mut buf = Vec::with_capacity(v.size as usize);
+            let mut missing = false;
+            for p in &parts {
+                let path = dir.join(&p.uuid).join(format!("part.{}", p.part));
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => buf.extend_from_slice(&bytes),
+                    // 旧版本目录已被并发覆写者移走：下一轮重读 meta 拿新版本
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        missing = true;
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
+            if missing {
+                continue;
+            }
+            return Ok((info, Bytes::from(buf)));
         }
         // 两轮 meta → 数据文件都 ENOENT：按 S3 语义报 NoSuchKey，而不是把裸 IO 错误抛给上层
         Err(Error::NoSuchKey(key.to_string()))
@@ -463,22 +478,49 @@ impl Store {
                 )));
             }
 
-            // ponytail: M2a 单 part（Task 5 起按 parts 序列跨 part 映射）；seek + 有界读，不整份进内存。
-            let path = dir.join(&v.part.uuid).join(format!("part.{}", v.part.part));
-            let mut file = match tokio::fs::File::open(&path).await {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            file.seek(std::io::SeekFrom::Start(range.start)).await?;
-            let mut buf = vec![0u8; (range.end - range.start) as usize];
-            match file.read_exact(&mut buf).await {
-                // tokio 的 read_exact 返回 io::Result<usize>（与 std 的 Result<()> 不同）
-                Ok(_) => return Ok(Bytes::from(buf)),
-                // 版本目录被并发覆写者移走/截断：下一轮重读 meta 拿新版本
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
-                Err(e) => return Err(e.into()),
+            // 跨 part 映射：按 parts 序列累计偏移，只读命中段（首尾 part 各读一段）。
+            // ponytail: M2a 单盘无分片；M2b 起 part 内部再映射到分片。
+            let parts = v.effective_parts();
+            let mut buf = Vec::with_capacity((range.end - range.start) as usize);
+            let mut offset: u64 = 0;
+            let mut missing = false;
+            for p in &parts {
+                let part_end = offset + p.size;
+                // 本 part 与请求区间的交集（半开）；空交集跳过
+                let s = range.start.max(offset);
+                let e = range.end.min(part_end);
+                if s < e {
+                    let path = dir.join(&p.uuid).join(format!("part.{}", p.part));
+                    let mut file = match tokio::fs::File::open(&path).await {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            missing = true;
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    file.seek(std::io::SeekFrom::Start(s - offset)).await?;
+                    let mut chunk = vec![0u8; (e - s) as usize];
+                    match file.read_exact(&mut chunk).await {
+                        // tokio 的 read_exact 返回 io::Result<usize>（与 std 的 Result<()> 不同）
+                        Ok(_) => buf.extend_from_slice(&chunk),
+                        // 版本目录被并发覆写者移走/截断：下一轮重读 meta 拿新版本
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            missing = true;
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                offset = part_end;
+                if offset >= range.end {
+                    break;
+                }
             }
+            if missing {
+                continue;
+            }
+            return Ok(Bytes::from(buf));
         }
         Err(Error::NoSuchKey(key.to_string()))
     }

@@ -867,3 +867,217 @@ async fn reap_stale_skips_object_with_corrupt_meta() {
         "读 meta 失败的对象应整体跳过（保守不删）"
     );
 }
+
+// ---- M2a Task 5: Multipart Upload ----
+
+fn bytes_stream(v: Vec<u8>) -> ByteStream {
+    Box::pin(futures::stream::once(async move { Ok(Bytes::from(v)) }))
+}
+
+#[tokio::test]
+async fn multipart_single_small_part_completes() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload(
+            "alpha",
+            "big",
+            Some("text/plain".into()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let etag = s
+        .upload_part("alpha", "big", &id, 1, bytes_stream(b"hello".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(etag, "5d41402abc4b2a76b9719d911017c592"); // md5("hello")
+    let info = s
+        .complete_multipart_upload("alpha", "big", &id, &[(1, etag)])
+        .await
+        .unwrap();
+    assert_eq!(info.size, 5);
+    // AWS multipart ETag = hex(md5(逐段原始 md5 字节拼接)) + "-N"——单段也是「组合」值，
+    // 不等于明文 md5（手算核对：md5(md5("hello").digest()) = 62109206...）
+    assert_eq!(info.etag, "62109206880d38a4010a98e11243924a-1");
+    assert_eq!(info.content_type.as_deref(), Some("text/plain"));
+
+    let (head, body) = s.get_object("alpha", "big").await.unwrap();
+    assert_eq!(head.size, 5);
+    assert_eq!(&body[..], b"hello");
+}
+
+#[tokio::test]
+async fn multipart_multi_part_etag_and_cross_part_range() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload("alpha", "multi", None, Default::default())
+        .await
+        .unwrap();
+
+    // 5 MiB + 5 MiB + 1 MiB：非末段 ≥5 MiB；三段内容取不同值以便验证跨段边界
+    let mib = 1024 * 1024;
+    let e1 = s
+        .upload_part("alpha", "multi", &id, 1, bytes_stream(vec![1u8; 5 * mib]))
+        .await
+        .unwrap();
+    let e2 = s
+        .upload_part("alpha", "multi", &id, 2, bytes_stream(vec![2u8; 5 * mib]))
+        .await
+        .unwrap();
+    let e3 = s
+        .upload_part("alpha", "multi", &id, 3, bytes_stream(vec![3u8; mib]))
+        .await
+        .unwrap();
+
+    let info = s
+        .complete_multipart_upload("alpha", "multi", &id, &[(1, e1), (2, e2), (3, e3)])
+        .await
+        .unwrap();
+    assert_eq!(info.size, (11 * mib) as u64);
+    assert!(info.etag.ends_with("-3"), "etag: {}", info.etag);
+
+    // 跨 part 边界 Range：[5MiB-2, 5MiB+3) = [1,1,2,2,2]
+    let r = s
+        .get_object_range(
+            "alpha",
+            "multi",
+            ((5 * mib - 2) as u64)..((5 * mib + 3) as u64),
+        )
+        .await
+        .unwrap();
+    assert_eq!(&r[..], &[1u8, 1, 2, 2, 2]);
+    // 末段整读
+    let last = s
+        .get_object_range("alpha", "multi", (10 * mib as u64)..(11 * mib as u64))
+        .await
+        .unwrap();
+    assert!(last.iter().all(|b| *b == 3), "末段应全来自 part3");
+
+    // complete 之后 abort 不得删掉已转正的版本目录（mpu.meta 生死门）
+    assert!(matches!(
+        s.abort_multipart_upload("alpha", "multi", &id).await,
+        Err(Error::NoSuchUpload(_))
+    ));
+    assert_eq!(
+        s.head_object("alpha", "multi").await.unwrap().size,
+        (11 * mib) as u64
+    );
+}
+
+#[tokio::test]
+async fn multipart_validation_errors() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    let mib = 1024 * 1024;
+    let e1 = s
+        .upload_part("alpha", "k", &id, 1, bytes_stream(vec![1u8; 5 * mib]))
+        .await
+        .unwrap();
+    let e2 = s
+        .upload_part("alpha", "k", &id, 2, bytes_stream(vec![2u8; 1024]))
+        .await
+        .unwrap();
+
+    // 乱序（非严格升序）
+    assert!(matches!(
+        s.complete_multipart_upload("alpha", "k", &id, &[(2, e2.clone()), (1, e1.clone())])
+            .await,
+        Err(Error::InvalidPartOrder(_))
+    ));
+    // ETag 不一致
+    assert!(matches!(
+        s.complete_multipart_upload("alpha", "k", &id, &[(1, "deadbeef".into())])
+            .await,
+        Err(Error::InvalidPart(_))
+    ));
+    // 中间段 <5 MiB（末段不受限：加第三段让 part2 成为「中间段」）
+    let e3 = s
+        .upload_part("alpha", "k", &id, 3, bytes_stream(vec![3u8; 1024]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.complete_multipart_upload(
+            "alpha",
+            "k",
+            &id,
+            &[(1, e1.clone()), (2, e2.clone()), (3, e3)]
+        )
+        .await,
+        Err(Error::EntityTooSmall(_))
+    ));
+    // 未上传的 part
+    assert!(matches!(
+        s.complete_multipart_upload("alpha", "k", &id, &[(9, "x".into())])
+            .await,
+        Err(Error::InvalidPart(_))
+    ));
+    // upload_id 含路径穿越 → 直接不让进目录（Uuid 解析拒）
+    assert!(matches!(
+        s.upload_part("alpha", "k", "../x", 1, bytes_stream(vec![]))
+            .await,
+        Err(Error::NoSuchUpload(_))
+    ));
+    // 不存在的 upload
+    let missing = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        s.complete_multipart_upload("alpha", "k", &missing, &[])
+            .await,
+        Err(Error::NoSuchUpload(_))
+    ));
+}
+
+#[tokio::test]
+async fn multipart_abort_removes_staging_and_is_idempotent_error() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    s.upload_part("alpha", "k", &id, 1, bytes_stream(vec![1u8; 16]))
+        .await
+        .unwrap();
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    assert!(obj_dir.join(&id).is_dir(), "暂存区应落在对象目录下");
+
+    s.abort_multipart_upload("alpha", "k", &id).await.unwrap();
+    assert!(!obj_dir.join(&id).exists(), "abort 应删掉整个暂存区");
+    assert!(matches!(
+        s.abort_multipart_upload("alpha", "k", &id).await,
+        Err(Error::NoSuchUpload(_))
+    ));
+    // 未 complete：对象不可见
+    assert!(matches!(
+        s.head_object("alpha", "k").await,
+        Err(Error::NoSuchKey(_))
+    ));
+}
+
+#[tokio::test]
+async fn multipart_list_parts_ascending() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    // 逆序上传 2、1：列举必须按 part 号升序
+    s.upload_part("alpha", "k", &id, 2, bytes_stream(vec![2u8; 7]))
+        .await
+        .unwrap();
+    s.upload_part("alpha", "k", &id, 1, bytes_stream(vec![1u8; 5]))
+        .await
+        .unwrap();
+    let ps = s.list_parts("alpha", "k", &id).await.unwrap();
+    assert_eq!(ps.len(), 2);
+    assert_eq!(ps[0].part_number, 1);
+    assert_eq!(ps[0].size, 5);
+    assert_eq!(ps[1].part_number, 2);
+    assert_eq!(ps[1].size, 7);
+}

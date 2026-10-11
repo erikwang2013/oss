@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use http::StatusCode;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
@@ -31,6 +32,54 @@ impl OssS3 {
 /// 对象用 `mod_time_nanos`、桶用 `creation_nanos`。不要用 now() 冒充。
 fn last_modified(nanos: i64) -> LastModified {
     LastModified::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos.max(0) as u64))
+}
+
+/// 流上限包装：累计超限置 `exceeded`、读取出错置 `body_err`——随后由 [`stream_err_to_s3`]
+/// 换成稳定错误码（不把 413 / IncompleteBody 的语义沉进内核错误类型）。
+type LimitedStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, xl_store::error::Error>> + Send>>;
+
+fn limit_stream(
+    body: StreamingBlob,
+    max: usize,
+) -> (LimitedStream, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let exceeded_in_stream = Arc::clone(&exceeded);
+    let body_err = Arc::new(AtomicBool::new(false));
+    let body_err_in_stream = Arc::clone(&body_err);
+    let mut seen = 0usize;
+    let stream = futures::StreamExt::map(body, move |chunk| {
+        let chunk = chunk.map_err(|e| {
+            tracing::warn!(error = ?e, "读取请求体失败");
+            body_err_in_stream.store(true, Ordering::Relaxed);
+            xl_store::error::Error::Io(std::io::Error::other(format!("request body: {e}")))
+        })?;
+        seen += chunk.len();
+        if seen > max {
+            exceeded_in_stream.store(true, Ordering::Relaxed);
+            return Err(xl_store::error::Error::Io(std::io::Error::other(
+                "request body exceeds max_put_bytes",
+            )));
+        }
+        Ok(chunk)
+    });
+    (Box::pin(stream), exceeded, body_err)
+}
+
+/// [`limit_stream`] 的标志位 → 稳定错误码；无标志时走通用映射。
+fn stream_err_to_s3(
+    e: xl_store::error::Error,
+    exceeded: &AtomicBool,
+    body_err: &AtomicBool,
+) -> s3s::S3Error {
+    if exceeded.load(Ordering::Relaxed) {
+        return s3s::s3_error!(EntityTooLarge, "object exceeds max_put_bytes");
+    }
+    if body_err.load(Ordering::Relaxed) {
+        // 与 M1 口径一致：请求体读取失败 = 客户端侧不完整（而不是 500）
+        return s3s::s3_error!(IncompleteBody, "failed to read request body");
+    }
+    to_s3_error(e)
 }
 
 #[async_trait::async_trait]
@@ -119,61 +168,179 @@ impl S3 for OssS3 {
         }
 
         // 流式直通内核（不再整份进内存）；content-length 可缺省/不可信，流上计数兜底。
-        // 超限不把 413 语义沉进内核：置标志位并给内核一个良性错误中止写盘，回到这里换成 413。
-        let max = self.max_put_bytes;
-        let exceeded = Arc::new(AtomicBool::new(false));
-        let exceeded_in_stream = Arc::clone(&exceeded);
-        let body_err = Arc::new(AtomicBool::new(false));
-        let body_err_in_stream = Arc::clone(&body_err);
-        let mut seen = 0usize;
-        let stream = futures::StreamExt::map(body, move |chunk| {
-            let chunk = chunk.map_err(|e| {
-                tracing::warn!(error = ?e, "读取 PUT 请求体失败");
-                body_err_in_stream.store(true, Ordering::Relaxed);
-                xl_store::error::Error::Io(std::io::Error::other(format!("request body: {e}")))
-            })?;
-            seen += chunk.len();
-            if seen > max {
-                exceeded_in_stream.store(true, Ordering::Relaxed);
-                return Err(xl_store::error::Error::Io(std::io::Error::other(
-                    "request body exceeds max_put_bytes",
-                )));
-            }
-            Ok(chunk)
-        });
+        let (stream, exceeded, body_err) = limit_stream(body, self.max_put_bytes);
 
         let result = self
             .store
             .put_object_stream_with_meta(
                 &bucket,
                 &key,
-                Box::pin(stream),
+                stream,
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
             )
             .await;
         let info = match result {
             Ok(info) => info,
-            Err(e) => {
-                if exceeded.load(Ordering::Relaxed) {
-                    return Err(s3s::s3_error!(
-                        EntityTooLarge,
-                        "object exceeds max_put_bytes"
-                    ));
-                }
-                if body_err.load(Ordering::Relaxed) {
-                    // 与 M1 口径一致：请求体读取失败 = 客户端侧不完整（而不是 500）
-                    return Err(s3s::s3_error!(
-                        IncompleteBody,
-                        "failed to read request body"
-                    ));
-                }
-                return Err(to_s3_error(e));
-            }
+            Err(e) => return Err(stream_err_to_s3(e, &exceeded, &body_err)),
         };
 
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(info.etag)),
+            ..Default::default()
+        }))
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let CreateMultipartUploadInput {
+            bucket,
+            key,
+            content_type,
+            metadata,
+            ..
+        } = req.input;
+        let upload_id = self
+            .store
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                content_type,
+                metadata.unwrap_or_default().into_iter().collect(),
+            )
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            ..Default::default()
+        }))
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let UploadPartInput {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            body,
+            content_length,
+            ..
+        } = req.input;
+        if !(1..=10_000).contains(&part_number) {
+            return Err(s3s::s3_error!(InvalidArgument, "part number out of range"));
+        }
+        let body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
+        // 单 part 上限沿用 max_put_bytes（multipart 大对象整体不受它约束、按 part 计）
+        if let Some(cl) = content_length {
+            if cl < 0 {
+                return Err(s3s::s3_error!(InvalidRequest, "negative content-length"));
+            }
+            if cl as usize > self.max_put_bytes {
+                return Err(s3s::s3_error!(EntityTooLarge, "part exceeds max_put_bytes"));
+            }
+        }
+        let (stream, exceeded, body_err) = limit_stream(body, self.max_put_bytes);
+        let etag = match self
+            .store
+            .upload_part(&bucket, &key, &upload_id, part_number as u16, stream)
+            .await
+        {
+            Ok(etag) => etag,
+            Err(e) => return Err(stream_err_to_s3(e, &exceeded, &body_err)),
+        };
+        Ok(S3Response::new(UploadPartOutput {
+            e_tag: Some(ETag::Strong(etag)),
+            ..Default::default()
+        }))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let CompleteMultipartUploadInput {
+            bucket,
+            key,
+            upload_id,
+            multipart_upload,
+            ..
+        } = req.input;
+        let Some(mu) = multipart_upload else {
+            return Err(s3s::s3_error!(InvalidRequest, "missing multipart_upload"));
+        };
+        let Some(parts) = mu.parts else {
+            return Err(s3s::s3_error!(InvalidRequest, "missing parts"));
+        };
+        let mut pairs = Vec::with_capacity(parts.len());
+        for p in &parts {
+            // 缺字段一并按 InvalidPart（规格只写了 ETag 不一致的情形，缺字段同属客户端报错）
+            let (Some(pn), Some(etag)) = (p.part_number, p.e_tag.as_ref()) else {
+                return Err(s3s::s3_error!(InvalidPart, "part missing number or etag"));
+            };
+            if !(1..=10_000).contains(&pn) {
+                return Err(s3s::s3_error!(InvalidPart, "part number out of range"));
+            }
+            pairs.push((pn as u16, etag.value().to_string()));
+        }
+        let info = self
+            .store
+            .complete_multipart_upload(&bucket, &key, &upload_id, &pairs)
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(CompleteMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            e_tag: Some(ETag::Strong(info.etag)),
+            ..Default::default()
+        }))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        self.store
+            .abort_multipart_upload(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let bucket = req.input.bucket;
+        let key = req.input.key;
+        let upload_id = req.input.upload_id;
+        let rows = self
+            .store
+            .list_parts(&bucket, &key, &upload_id)
+            .await
+            .map_err(to_s3_error)?;
+        let parts = rows
+            .into_iter()
+            .map(|p| Part {
+                part_number: Some(p.part_number as i32),
+                size: Some(p.size as i64),
+                e_tag: Some(ETag::Strong(p.etag)),
+                ..Default::default()
+            })
+            .collect();
+        Ok(S3Response::new(ListPartsOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            parts: Some(parts),
+            // 分页不做：≤10000 全量
+            is_truncated: Some(false),
             ..Default::default()
         }))
     }
