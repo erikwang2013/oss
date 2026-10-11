@@ -10,7 +10,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 但启动自举（管理员引导/建桶）发生在 run() 之前，不提前 init 这些日志会被静默丢弃。
     ecat_logging::init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // args_os：非 UTF-8 参数不该 panic（101），走与解析错误同一条用法 + exit 2
+    let args: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(args) => args,
+        Err(_) => {
+            eprint!("{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
     let cmd = match cli::parse_args(&args) {
         Ok(cmd) => cmd,
         Err(usage) => {

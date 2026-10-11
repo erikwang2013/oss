@@ -82,7 +82,8 @@ oss-server clean <days>  # 按 mtime 回收 days 天前的临时文件：
 47 4 * * * cd /path/to/oss && ./oss-server build
 ```
 
-- `clean` 按 mtime 判定：进行中的上传，其 `_header`/`*.part`/`tmp` 目录都是新的，不会被误删；`days` 须为正整数
+- `clean` 按 mtime 判定：上传持续时长在回收窗口内时不会被误删；超出窗口的长挂上传（仅 S3 直传可达，
+  aether 与本地上传是分钟级）可能在仍进行时被判过期——本次写入失败、无数据损失；`days` 限 1..=36525
 - `build` 先清空秒传索引再按盘重建：重建瞬间的并发上传会从「秒传命中」回退为正常上传，不丢数据
 - 未知子命令或非法参数打印用法并 exit 2；命令失败 exit 1
 - 配置文件路径固定为当前目录的 `oss.toml`（原先的 `oss-server <配置路径>` 用法已移除）

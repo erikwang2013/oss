@@ -77,6 +77,34 @@ async fn ops_commands_groups_build_clean() {
     assert!(finished.exists(), "成品不能被清");
 }
 
+/// 进程级契约（main 薄壳此前无自动化覆盖）：坏子命令与非 UTF-8 参数 → 用法 + exit 2。
+/// 解析先于自举，任意 cwd 可跑（不读 oss.toml、不启服务）。
+#[cfg(unix)]
+#[test]
+fn bad_args_usage_exit_2_on_stderr() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bin = env!("CARGO_BIN_EXE_oss-server");
+    let cases = [
+        std::ffi::OsStr::new("frobnicate"),
+        std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+    ];
+    for arg in cases {
+        let out = std::process::Command::new(bin).arg(arg).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "arg={arg:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("用法"),
+            "用法应在 stderr（arg={arg:?}）：{stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("用法"),
+            "用法不该混进 stdout（arg={arg:?}）"
+        );
+    }
+}
+
 /// 用 `touch` 造旧 mtime（与 src/cli.rs 的单测同款，避免为测试引第三方 crate）。
 fn set_mtime(path: &Path, when: SystemTime) {
     let secs = when

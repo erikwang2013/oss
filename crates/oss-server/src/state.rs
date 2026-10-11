@@ -27,8 +27,10 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cfg = AppConfig::load(cfg_path)?;
 
-        std::fs::create_dir_all(&cfg.data_dir)?;
-        std::fs::create_dir_all(&cfg.staging_dir)?;
+        std::fs::create_dir_all(&cfg.data_dir)
+            .map_err(|e| format!("创建数据目录 {} 失败: {e}", cfg.data_dir.display()))?;
+        std::fs::create_dir_all(&cfg.staging_dir)
+            .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
         let db = Db::connect(&cfg.database_url).await?;
         let store = Store::open(StoreConfig::new(&cfg.data_dir)).await?;

@@ -18,7 +18,7 @@ pub const USAGE: &str = "\
   serve          启动服务（默认，无参数时同此）
   groups         建分组目录（幂等；不建就一定上传失败）
   build          按磁盘现状重建秒传索引
-  clean <days>   按 mtime 回收超过 days 天的临时文件（_header 与 *.part，外加内核 tmp 孤儿目录）
+  clean <days>   按 mtime 回收超过 days 天的临时文件（_header 与 *.part，外加内核 tmp 孤儿目录；days 限 1..=36525）
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +52,16 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
     }
 }
 
+/// 内核（`aetherupload::console`）把错误也经同一回调报出（固定前缀 `Error: `）——
+/// 分流到 stderr，cron/监控只盯 stderr 时也能看到失败原因。
+fn say(m: &str) {
+    if m.starts_with("Error: ") {
+        eprintln!("{m}");
+    } else {
+        println!("{m}");
+    }
+}
+
 /// 跑一条命令，返回进程退出码（0 成功 / 1 失败 / serve 正常退出为 0）。
 pub async fn run(
     cmd: Command,
@@ -72,11 +82,11 @@ pub async fn run(
         // 所以这里再调时通常只输出「Group-Directory List:」——目录确已就位。
         Command::Groups => Ok(exit_code(aetherupload::console::list_groups(
             &crate::aether::build_runtime(&state),
-            &mut |m| println!("{m}"),
+            &mut say,
         ))),
         Command::Build => Ok(exit_code(aetherupload::console::build_redis_hashes(
             &crate::aether::build_runtime(&state),
-            &mut |m| println!("{m}"),
+            &mut say,
         ))),
         Command::Clean { days } => {
             let runtime = crate::aether::build_runtime(&state);

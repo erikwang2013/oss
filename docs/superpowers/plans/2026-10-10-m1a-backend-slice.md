@@ -2105,7 +2105,8 @@ const DEFAULT_MAX_KEYS: usize = 1000;
         })
     }
 
-    async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
+    // 可见性等价于原先在 crate::store 里的私有：store 子树（含 store::tests）可用，子树外不可见。
+    pub(in crate::store) async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
         let mut entries =
             match tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await {
@@ -5041,14 +5042,24 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
   （正整数 + 挡掉换算秒时的乘法溢出）。
 - **解析从严**：多余参数一律拒绝——`clean 1 --dry-run` 报用法并 exit 2，而不是忽略 `--dry-run` 当真去删。
 - **一处行为变化**：原 `oss-server <配置路径>`（首参即配置路径）作废，配置文件固定为当前目录的 `oss.toml`
-  （全仓唯一调用方是 `web/playwright.config.ts` 的 `cargo run -p oss-server`，不带路径参数）。
+  （现存调用——playwright 自动化与 README/计划里的手工 `cargo run -p oss-server`——都不带路径参数）。
 - **测试**：`cli.rs` 单测（arg 解析含拒绝集；`reap_stale_tmp` 用 `touch` 拨 mtime 造老/新文件，断言只删过期的）+
   `tests/ops_cli.rs` 集成冒烟（groups 幂等建目录；build 只索引成品、跳过 `*.part` 且索引值可查；clean 删过期的断点/分块/tmp 孤儿目录、
   留成品与新鲜文件）。
-- **实跑（四道闸）**：fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（104 测：oss-server 单测 10 + 集成 5/4/10/1/1/1）·
+- **实跑（四道闸）**：fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（105 测：oss-server 单测 10 + 集成 6/4/10/1/1/1；aether_auth 第 6 条是前一提交 962ed0f 的坏 Bearer 用例）·
   三条命令在临时 `oss.toml` 环境实跑（`groups` 列出分组、`build` 报 "2 items have been set" 且 SQLite 索引行可查、`clean 1` 删 1 断点 + 1 分块 + 1 tmp 孤儿）；
   `serve` 起服务 → login 签发 token 照常。
 - **README** 新增「运维命令」小节（三条用法 + cron 建议 + 配置路径变化）；规格 §18.1 表加「实现状态」列。
+- **评审轮收尾（spec ✅ / quality ✅，各 5 条 Minor，0 Important）**：① 归因更正——`result_large_err` 由前一提交 `962ed0f`
+  （uid_of 的 Err 从 `StatusCode` 换为统一 JSON 的 `Response<Body>`，恰越 128 字节阈值）引入，本提交的定向 allow 是必要收尾；
+  http 1.5.0 只是阈值背景（自骨架提交即在 Cargo.lock），本仓无「http 升级」事件。② 内核错误经回调原样进 stdout，
+  按内核固定前缀 `Error: ` 分流 stderr（cron/监控盯 stderr 可见失败原因）。③ `main.rs` 改 `args_os`：非 UTF-8 参数
+  由 panic(101) 改为用法 + exit 2。④ 自举建目录失败带路径上下文。⑤ 新增 `CARGO_BIN_EXE` 进程级用例（坏子命令 +
+  非 UTF-8 参数 → exit 2、用法在 stderr），补上 main 薄壳此前无自动化覆盖的进程契约。README/USAGE 落 `days` 上界
+  与 tmp 回收窗口的限定措辞。
+- **评审缓办（记录在案）**：`aether::build_runtime` 在 `_header` 目录建不出时 panic（exit 101）——serve 启动路径的
+  预存在行为（fail-fast），本提交把可达面扩到三条 cron 命令；改 `Result` 牵动 aether/state 多处，判 Minor 不阻塞，
+  随 M2（或下一个 aether 面改动）一并处理。
 
 ---
 
