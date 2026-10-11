@@ -4829,6 +4829,8 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
   ② 401 响应体从纯文本 `unauthorized` 变为 jwt-rust 自带 JSON `{"code":401,"msg":…,"data":null}`（login 的 401 不在层内，仍是纯文本「用户名或密码错误」——登录页直接展示 body）。测试断言改以状态码为主，JSON 形态在 `aether_routes_reject_anonymous` 钉一次。
 - **配置边界**：jwt-rust 要求 secret ≥32 字符（256 位），`oss.toml` 的 dev 占位 `dev-only-change-me`（18）→ `dev-only-change-me-0123456789abcdef`（35）；短 secret 在 `AppState::new` 启动即 panic（配置错不拖到首个请求）。测试共用 secret 提为 `tests/common/mod.rs` 的 `JWT_SECRET`。
 - **验证**：四道闸全绿（fmt / clippy 0 告警 / `cargo test -p oss-server` / `--workspace -j 2`；oss-server 计数 6+4+5+10+1+1，aether_auth 4→5 条）；`web` 的 `npm run e2e` 3 用例全过（浏览器链：登录种 cookie → aetherupload 分块 XHR 走垫片 → register 走 Bearer）；curl 冒烟：匿名两面 401 JSON、错口令 401 纯文本、Bearer 打 `/api/v1/groups` 200、cookie/Bearer 打 `/aetherupload/preprocess` 均 200、token 载荷 `sub=1` 且 `exp-iat=43200`。
+- **两处宽松度变化的评审落记（不本地硬化）**：① jwt-rust 1.0.1 `Jwt::decode_with` 硬编码清空 `required_spec_claims`（源码注释「PHP 允许无 exp 的令牌」），无 `exp` 的令牌也能通过 —— 相对旧手写实现（`Validation::default()` 强制 exp）是放宽；M1 唯一签发点 login 恒带 exp，且能签无 exp 者必持 secret，无实际放大。`AdvancedConfig` 无 claim 开关，不可一行硬化；留待上游配置项或日后在层内侧加断言。同处 `leeway=0`/`validate_nbf=true` 为 jwt-rust 显式设定（收紧方向，单机无时钟漂移，接受）。
+  ② 401 `msg` 不再统一：jwt-rust 鉴权类错误回显 `user_message()`（缺头 / 过期 / 坏签名各不相同），旧实现「一律同一文案」的说法作废；测试只钉 `code`/`data` 形态（`aether_auth.rs` 注释已同步）。
 - **Step 2/3 的代码块保留为改动前形态**（未按最终实现重写）：`console.rs` / `router.rs` 的现状以上面几条与本文件顶部 Task 14 追加条为准。
 
 ---

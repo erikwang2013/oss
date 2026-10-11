@@ -188,7 +188,7 @@ async fn register_upload_db_failure_is_500() {
 
 // ---- Task 15 收尾轮（I-1 / M-2 / M-3 / M-4）新增 ----
 
-/// I-1②：11 条路由去掉 login = 10 条，匿名一律 401 —— 鉴权是整面 `JwtLayer`（不是逐 handler
+/// I-1②：12 条 method-route 去掉 login = 11 条，匿名一律 401 —— 鉴权是整面 `JwtLayer`（不是逐 handler
 /// 的 `auth()`），路由表变化时本表跟着同步即可。POST 带可解析 body：401 现在来自层
 /// （先于提取器），但仍钉住「匿名不给任何 handler 机会」。
 #[tokio::test]

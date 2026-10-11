@@ -6,7 +6,7 @@
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use jwt_rust::JwtPayload;
@@ -22,11 +22,15 @@ pub struct LoginRequest {
 
 /// 取 JWT 载荷里的用户 id（登录签发时 `sub` = uid 十进制字符串）。
 /// 签名/过期已由 JwtLayer 校验；这里只剩形状兜底（理论上到不了）。
-fn uid_of(payload: &JwtPayload) -> Result<i64, StatusCode> {
-    payload
-        .sub()
-        .and_then(|s| s.parse().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)
+/// 兜底的 401 与 JwtLayer 用同一 JSON 形态，避免同面两种 401 body。
+fn uid_of(payload: &JwtPayload) -> Result<i64, Response> {
+    payload.sub().and_then(|s| s.parse().ok()).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"code": 401, "msg": "invalid token payload", "data": null})),
+        )
+            .into_response()
+    })
 }
 
 pub fn routes() -> Router<AppState> {
@@ -117,7 +121,7 @@ async fn create_bucket(
 ) -> impl IntoResponse {
     let uid = match uid_of(&payload) {
         Ok(u) => u,
-        Err(s) => return s.into_response(),
+        Err(r) => return r,
     };
     if let Err(e) = state.store.create_bucket(&body.name).await {
         return store_error(e).into_response();
@@ -229,7 +233,7 @@ async fn register_upload(
 ) -> impl IntoResponse {
     let uid = match uid_of(&payload) {
         Ok(u) => u,
-        Err(s) => return s.into_response(),
+        Err(r) => return r,
     };
     match state
         .db
@@ -252,7 +256,7 @@ async fn list_access_keys(
 ) -> impl IntoResponse {
     let uid = match uid_of(&payload) {
         Ok(u) => u,
-        Err(s) => return s.into_response(),
+        Err(r) => return r,
     };
     match state.db.list_access_keys(uid).await {
         Ok(keys) => Json(keys).into_response(),
@@ -284,7 +288,7 @@ async fn create_access_key(
 ) -> impl IntoResponse {
     let uid = match uid_of(&payload) {
         Ok(u) => u,
-        Err(s) => return s.into_response(),
+        Err(r) => return r,
     };
     if let Some(ak) = body.access_key.as_deref().filter(|s| !valid_credential(s)) {
         return (

@@ -66,7 +66,8 @@ fn unix_now() -> i64 {
 }
 
 /// 四条路由（预处理 / 分块 / 展示 / 下载）匿名一律 401；body 是 jwt-rust 的 JSON 形态
-/// （`{"code":401,"msg":…,"data":null}`，不区分缺/坏/过期、不泄细节）。
+/// （`{"code":401,"msg":…,"data":null}`）。`msg` 随错误类型变化（缺头/过期/坏签名各走
+/// `user_message()`，不再是旧实现统一的纯文本），故断言只钉 `code`/`data`、不钉 `msg`。
 /// （POST 两条带合法 body，钉「鉴权先于提取器」，路由漏挂 layer 即红。）
 #[tokio::test(flavor = "multi_thread")]
 async fn aether_routes_reject_anonymous() {
@@ -226,6 +227,39 @@ async fn empty_or_garbage_credential_is_401() {
             "cookie={cookie:?} authorization={authorization:?} 必须 401"
         );
     }
+}
+
+/// 垫片只在「无 Authorization 头」时注入 cookie：带不可用 Authorization（坏 Bearer）时，
+/// 即便 cookie 有效也 401 —— Bearer 优先于 cookie（与旧 cookie 优先实现相反，有意定稿）。
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_bearer_shadows_valid_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st)).await;
+    let client = reqwest::Client::new();
+
+    let login: serde_json::Value = client
+        .post(format!("{base}/api/v1/login"))
+        .json(&serde_json::json!({"username": "erik", "password": "pw"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+
+    let resp = with_form(
+        client
+            .post(format!("{base}/aetherupload/preprocess"))
+            .header("cookie", format!("oss_token={token}"))
+            .header("authorization", "Bearer not.a.real.token"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 401, "不可用 Bearer 存在时不回退 cookie");
 }
 
 /// 伪造（换 secret 签名）与过期 token，两种来源都必须 401。
