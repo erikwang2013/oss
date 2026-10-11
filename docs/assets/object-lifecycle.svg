@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <title>OSS 对象生命周期</title>
+  <desc>对象在磁盘上的状态流转：暂存 → 数据就位 → xl.meta 提交可见；崩溃残留由 M2 回收。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f59e0b"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="958" height="518" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 对象生命周期（盘上状态）</text>
+  <text x="40" y="70" font-size="12" fill="#64748b">读路径只信 xl.meta：提交之前的一切数据对客户端不可见；崩溃残留仅在盘上占空间，由 M2 自检 / GC 回收</text>
+
+  <!-- 状态行 -->
+  <rect x="60" y="120" width="250" height="110" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="185" y="148" font-size="13" font-weight="600" fill="#0f172a" text-anchor="middle">暂存（staged）</text>
+  <text x="185" y="172" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">.oss.sys/tmp/&lt;uuid&gt;/</text>
+  <text x="185" y="188" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">{part.1, 候选 xl.meta}</text>
+  <text x="185" y="212" font-size="10.5" fill="#64748b" text-anchor="middle">协议 ①② ｜ 读路径不可见</text>
+
+  <line x1="310" y1="175" x2="386" y2="175" stroke="#94a3b8" marker-end="url(#a)"/>
+  <text x="348" y="160" font-size="10" font-weight="600" fill="#0f172a" text-anchor="middle">③ 同盘 rename</text>
+
+  <rect x="390" y="120" width="250" height="110" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="515" y="148" font-size="13" font-weight="600" fill="#0f172a" text-anchor="middle">数据就位</text>
+  <text x="515" y="172" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">buckets/&lt;桶&gt;/&lt;对象&gt;/&lt;uuid&gt;/</text>
+  <text x="515" y="188" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">{part.1}</text>
+  <text x="515" y="212" font-size="10.5" fill="#64748b" text-anchor="middle">无 meta 引用，仍不可见</text>
+
+  <line x1="640" y1="175" x2="696" y2="175" stroke="#94a3b8" marker-end="url(#a)"/>
+  <text x="668" y="158" font-size="10" font-weight="600" fill="#b45309" text-anchor="middle">④ 提交点</text>
+  <text x="668" y="196" font-size="9.5" fill="#64748b" text-anchor="middle">xl.meta 覆盖</text>
+
+  <rect x="700" y="120" width="220" height="110" rx="10" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <text x="810" y="148" font-size="13" font-weight="600" fill="#166534" text-anchor="middle">已提交（可见）</text>
+  <text x="810" y="172" font-size="10.5" fill="#374151" text-anchor="middle">xl.meta 指向版本目录</text>
+  <text x="810" y="188" font-size="10.5" fill="#374151" text-anchor="middle">HEAD / GET / List 可见</text>
+  <text x="810" y="212" font-size="10.5" fill="#64748b" text-anchor="middle">S3 ETag = 整份 MD5</text>
+
+  <!-- 从「已提交」出发的流转 -->
+  <polyline points="760,230 760,258 245,258 245,282" fill="none" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="810" y1="230" x2="810" y2="282" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="100" y="286" width="290" height="64" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="245" y="310" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">DELETE 对象</text>
+  <text x="245" y="330" font-size="9.5" fill="#64748b" text-anchor="middle">对象目录整体移除（键不存在也返回成功）</text>
+
+  <rect x="660" y="286" width="240" height="64" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="780" y="308" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle">覆盖写（再次 PUT / Copy）</text>
+  <text x="780" y="326" font-size="9.5" fill="#64748b" text-anchor="middle">协议 ⑤：旧版本目录 → .oss.sys/trash/</text>
+  <text x="780" y="342" font-size="9.5" fill="#64748b" text-anchor="middle">不可见；M1 无 GC，仅占盘</text>
+
+  <!-- 崩溃残留 -->
+  <line x1="515" y1="230" x2="515" y2="282" stroke="#f59e0b" stroke-dasharray="5 4" marker-end="url(#w)"/>
+  <rect x="430" y="286" width="200" height="64" rx="10" fill="#fffbeb" stroke="#fcd34d" stroke-dasharray="5 4"/>
+  <text x="530" y="308" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">崩溃残留</text>
+  <text x="530" y="326" font-size="9.5" fill="#92400e" text-anchor="middle">③④ 之间崩 → 孤儿版本目录</text>
+  <text x="530" y="342" font-size="9.5" fill="#92400e" text-anchor="middle">不可见 · M2 启动自检回收</text>
+
+  <!-- 不变量 -->
+  <rect x="60" y="380" width="840" height="72" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="80" y="406" font-size="10.5" fill="#374151">不变量：无有效 xl.meta 的目录永不被服务 —— 列举跳过非法目录名（warn）；损坏 meta → PUT fail-closed（不静默覆盖）</text>
+  <text x="80" y="428" font-size="10.5" fill="#374151">M2：启动自检 + GC / fsck 回收 tmp 孤儿、trash 残留与无 meta 的垃圾目录（当前仅占盘，不影响正确性）</text>
+
+  <text x="930" y="500" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
+</svg>

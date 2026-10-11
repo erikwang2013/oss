@@ -1,13 +1,53 @@
+![OSS 项目吉祥物：一只装着三块对象立方体的存储桶，戴着绿色状态灯](docs/assets/mascot.svg)
+
+![吉祥物表情形态：哭、笑、沮丧、惊恐、得意](docs/assets/mascot-expressions.svg)
+
 # OSS —— 自研分布式对象存储系统
 
-S3 兼容的自研对象存储（MinIO 的等价实现）。设计文档见
-`docs/superpowers/specs/2026-10-10-minio-clone-design.md`。
+S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分布式 + 纠删码；
+当前完成 **M1：单进程、单盘的后端垂直切片**，`aws-cli`/`rclone` 能增删查列、浏览器能分块上传、控制台能看见。
+
+- **三个 crate 单向依赖 `oss-server → xl-s3 → xl-store`**：`xl-store` 是不依赖任何框架的存储内核
+  （提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把 s3s 的 S3 trait 实现到内核上；
+  `oss-server` 用 e-cat 组装一个 axum Router，同时承载控制台 API、aetherupload 分块上传与 S3 服务。
+- **两条客户端入口**：`aws-cli` / `rclone` 走 S3 面（SigV4 认证）；
+  浏览器控制台（React 19 + antd，M1b）走 `/api/v1` 与 aetherupload 自带脚本（分块 / 断线续传 / 秒传）。
+- **技术栈**：Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 1.0.4 · axum 0.8 · sqlx / SQLite · serde + rmp-serde。
 
 ## 当前进度：M1（后端垂直切片）
 
 已实现：单盘直存内核（无纠删码）· S3 桶/对象 CRUD · ListObjectsV2 · CopyObject ·
 批量删除 · SigV4 认证 · aetherupload 分块上传与原生 ingest · 控制台 API。
 未实现（见设计文档的阶段表）：纠删码 · 多盘 · 分布式 · 版本控制 · 加密 · 复制 · 权限。
+
+## 架构
+
+![系统架构](docs/assets/architecture.svg)
+
+| crate / 目录 | 职责 |
+|---|---|
+| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` v1 编解码、提交协议、per-object 锁 |
+| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`） |
+| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI |
+| `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
+| `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本 |
+
+磁盘布局速记：对象内容落在 `buckets/<桶>/<展平键>/{xl.meta, <uuid>/part.1}`，**提交永远是同盘 rename**；
+临时区在 `.oss.sys/{tmp, trash, locks}`。控制面元数据（用户/密钥/桶/上传记录/秒传索引）在 SQLite。
+
+## 请求周期
+
+![请求周期](docs/assets/request-flow.svg)
+
+两条入口（S3 直传、浏览器分块上传）在 xl-store 的**提交协议**处汇合：
+暂存 → 同盘 rename 数据就位 → `xl.meta` 覆盖即提交；提交之前的一切对客户端不可见。
+
+## 对象生命周期
+
+![对象生命周期](docs/assets/object-lifecycle.svg)
+
+读路径只信 `xl.meta`：无有效 meta 的目录永不被服务；崩溃只会留下不可见的残骸
+（孤儿版本目录 / trash 残留），由 M2 的启动自检与 GC 回收——M1 期间仅占盘，不影响正确性。
 
 ## 跑起来
 
@@ -98,3 +138,13 @@ oss-server clean <days>  # 按 mtime 回收 days 天前的临时文件：
 ```bash
 AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 tests/e2e_s3.sh
 ```
+
+## 参考文档
+
+- 设计文档：`docs/superpowers/specs/2026-10-10-minio-clone-design.md`
+- 功能规格：`docs/superpowers/specs/2026-10-10-feature-spec.md`
+- M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`
+
+---
+
+© 2026 erik.xyz · 以 Apache-2.0 许可发布
