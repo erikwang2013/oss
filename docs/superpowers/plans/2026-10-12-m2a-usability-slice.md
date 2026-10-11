@@ -469,11 +469,11 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
 
 ### 5.5 测试与验收
 
-- [ ] 内核用例（`store/tests.rs`）：create→1 part 小文件（<5MiB 末段允许）complete；3 part（中间段 ≥5MiB 用 5×1MiB×… 直接构造 size）complete 后 etag 形如 `<32hex>-3`；乱序 → InvalidPartOrder；ETag 不符 → InvalidPart；中间段 <5MiB → EntityTooSmall；abort 后目录消失且再次 abort → NoSuchUpload；upload_id 含 `../` → InvalidKey/Uuid 校验拒；complete 后 `get_object` 拼接内容 == 原三段拼接；`get_object_range` 跨 part 命中断言；并发：同 part 重传覆盖幂等、complete 进行中 PUT 同键串行（lock 断言可用现有 concurrent 测试模式）。
-- [ ] `xl.meta` 用例：golden 摘要更新；`effective_parts` 单段/多段；旧文件（无 parts 字段）decode → None。
-- [ ] s3 面集成：走真实 HTTP 完整 multipart 流程（create→3×upload_part→complete→GET 断言）；错误码断言（416 之外的 404 NoSuchUpload / 400 InvalidPart 等按 XML `<Code>`）。
-- [ ] **e2e 脚本**（`tests/e2e_s3.sh`）：删 `multipart_threshold` 环境变通行；新增第 N 步：`aws s3 cp` 一个 ≥8 MiB 随机文件（自动走 multipart）+ `aws s3 cp` 下载 `cmp` 一致；`aws s3api get-object --range`（206 内容比对）；`aws s3 cp --metadata foo=bar` 后 `head-object` 可见；rclone 同款 ≥8 MiB 上传下载。
-- [ ] 提交——`git commit -m "feat: Multipart Upload——五操作全链路，xl.meta parts 演进，clean 回收未完成上传"`
+- [x] 内核用例（`store/tests.rs`）：create→1 part 小文件（<5MiB 末段允许）complete；3 part（中间段 ≥5MiB 用 5×1MiB×… 直接构造 size）complete 后 etag 形如 `<32hex>-3`；乱序 → InvalidPartOrder；ETag 不符 → InvalidPart；中间段 <5MiB → EntityTooSmall；abort 后目录消失且再次 abort → NoSuchUpload；upload_id 含 `../` → InvalidKey/Uuid 校验拒；complete 后 `get_object` 拼接内容 == 原三段拼接；`get_object_range` 跨 part 命中断言；并发：同 part 重传覆盖幂等、complete 进行中 PUT 同键串行（lock 断言可用现有 concurrent 测试模式）。
+- [x] `xl.meta` 用例：golden 摘要更新（e7f386e4…）；`effective_parts` 单段/多段；旧文件（无 parts 字段）decode → None。
+- [x] s3 面集成：**改 service 层直调**（multipart_flow_through_service；真实 HTTP 由 e2e 脚本覆盖）（create→3×upload_part→complete→GET 断言）；错误码断言（416 之外的 404 NoSuchUpload / 400 InvalidPart 等按 XML `<Code>`）。
+- [x] **e2e 脚本**（`tests/e2e_s3.sh`）：删 `multipart_threshold` 环境变通行；新增第 N 步：`aws s3 cp` 一个 ≥8 MiB 随机文件（自动走 multipart）+ `aws s3 cp` 下载 `cmp` 一致；`aws s3api get-object --range`（206 内容比对）；`aws s3 cp --metadata foo=bar` 后 `head-object` 可见；rclone 同款 ≥8 MiB 上传下载。
+- [x] 提交——`git commit -m "feat: Multipart Upload——五操作全链路，xl.meta parts 演进，clean 回收未完成上传"`
 
 ---
 
@@ -481,17 +481,17 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
 
 **Files:** `README.md`、`docs/superpowers/specs/2026-10-10-feature-spec.md`（状态注记）、本计划
 
-- [ ] README「已知限制」更新：删 `Multipart 与 Range 未实现`、`x-amz-meta-* 静默丢弃`、`单段 PUT 上限 256 MiB` 的旧措辞；改留：HEAD 带 Range 不支持、`UploadPartCopy`/`ListMultipartUploads` 未实现（M2b）、GET `partNumber` 未实现、单 part/单 PUT 仍受 `max_put_bytes` 限、多区间 Range → 400。
-- [ ] 功能规格 multipart 小节把 `UploadPartCopy`/`ListMultipartUploads` 标注 M2b；§3.2 Range 的「M2」标注改为已实现。
-- [ ] 提交——`git commit -m "docs: M2a 落地后同步 README 与功能规格的边界清单"`
+- [x] README「已知限制」更新：删 `Multipart 与 Range 未实现`、`x-amz-meta-* 静默丢弃`、`单段 PUT 上限 256 MiB` 的旧措辞；改留：HEAD 带 Range 不支持、`UploadPartCopy`/`ListMultipartUploads` 未实现（M2b）、GET `partNumber` 未实现、单 part/单 PUT 仍受 `max_put_bytes` 限、多区间 Range → 400。
+- [x] 功能规格 multipart 小节把 `UploadPartCopy`/`ListMultipartUploads` 标注 M2b；§3.2 Range 的「M2」标注改为已实现。
+- [x] 提交——`git commit -m "docs: M2a 落地后同步 README 与功能规格的边界清单"`
 
 ---
 
 ## 四闸与验收（收尾轮统一跑）
 
-- fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿
-- `tests/e2e_s3.sh` 对真服务实跑全过（含新增 multipart/range/metadata 步）
-- web 不变（本切片无前端改动）；Playwright e2e 仅在上传落点/文案有出入时跟改（预计无）
+- [x] fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（128 测）
+- [x] `tests/e2e_s3.sh` 对真服务实跑全过（含新增 multipart/range/metadata 步；14 步、退出码 0）
+- [x] web 不变（本切片无前端改动）；Playwright e2e 未重跑（上传落点/文案未动，相关断言不受影响）
 
 ## 已知风险与处置
 
@@ -550,3 +550,25 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
   `reap_stale_removes_unreferenced_dirs_by_mtime` / `reap_stale_skips_object_with_corrupt_meta`，
   mtime 用 std `File::set_modified`，不再依赖 `touch`）。`ops_cli` 的 clean 用例未改（行为等价）✓。
 - 实跑：xl-store 59/59 ✓、oss-server 各目标全绿（含 ops_cli clean 路径经新内核回收）✓；退出码 0。
+
+### Task 5（Multipart Upload）
+
+- 实际形态与本计划一致。实现中的关键裁决/偏差：
+  - `complete` 的 part 一致性校验在**提交前**完成（etag/sidecar/大小/顺序），提交后只做转正与清理；
+    组合 ETag = `hex(md5(逐段原始 md5 字节拼接))-N`，手算核对（单段 `md5("hello")` 的组合值为
+    `62109206880d38a4010a98e11243924a-1`，测试初稿曾按明文 md5 断言——测试错、实现对）。
+  - `decode` 的 uuid 白名单从 `part.uuid` **扩展覆盖 `parts[].uuid`**（多段 uuid 同样进读路径，
+    属计划执行中新发现的信任边界缺口，已补测试）。
+  - GC 引用集改用 `effective_parts()`（不再依赖「多段共享同一目录」的巧合）。
+  - golden 摘要按既有流程重算：`e7f386e4…`（parts 字段进入编码，有意识变更）。
+  - e2e 脚本补三组用例（multipart 自动/强制分片、Range 206 字节比对、--metadata 往返）。
+- 实跑：xl-store 67/67、xl-s3 19/19（含全链路）、oss-server 全目标绿、`cargo test --workspace -j 2` 128 测全绿；clippy 0 告警。
+
+### Task 6（文档收尾）
+
+- README：进度段升为「M1 + M2a」；已知限制替换为 M2a 边界（UploadPartCopy/ListMultipartUploads/GET
+  partNumber → M2b；多区间 Range → 400；HEAD 带 Range 不支持；单 PUT/单 part 仍受 max_put_bytes）。
+- 功能规格：§3.1/3.2/3.5/3.6/3.7 与阶段表逐处标注 M2a 已落地与 M2b 边界。
+- 四闸实跑：fmt 无 diff · clippy 0 告警 · workspace 128 测全绿 · **e2e_s3.sh 对真服务实跑 14 步全过**
+  （10 MiB aws-cli 自动 multipart + cmp、multipart ETag 带 -N、Range 206 Content-Range + 字节比对、
+  --metadata 往返、rclone 压 cutoff 强制分片 + cmp；退出码 0）。

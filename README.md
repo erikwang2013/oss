@@ -5,7 +5,9 @@
 # OSS —— 自研分布式对象存储系统
 
 S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分布式 + 纠删码；
-当前完成 **M1：单进程、单盘的后端垂直切片**，`aws-cli`/`rclone` 能增删查列、浏览器能分块上传、控制台能看见。
+当前完成 **M1（单盘垂直切片）+ M2a（单盘可用性切片：Multipart Upload、Range GET、
+`x-amz-meta-*` 元数据、流式 PUT、孤儿回收）**——`aws-cli`/`rclone` 的大文件默认路径
+（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
 
 - **三个 crate 单向依赖 `oss-server → xl-s3 → xl-store`**：`xl-store` 是不依赖任何框架的存储内核
   （提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把 s3s 的 S3 trait 实现到内核上；
@@ -14,10 +16,12 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
   浏览器控制台（React 19 + antd，M1b）走 `/api/v1` 与 aetherupload 自带脚本（分块 / 断线续传 / 秒传）。
 - **技术栈**：Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 1.0.4 · axum 0.8 · sqlx / SQLite · serde + rmp-serde。
 
-## 当前进度：M1（后端垂直切片）
+## 当前进度
 
-已实现：单盘直存内核（无纠删码）· S3 桶/对象 CRUD · ListObjectsV2 · CopyObject ·
+已实现（M1）：单盘直存内核（无纠删码）· S3 桶/对象 CRUD · ListObjectsV2 · CopyObject ·
 批量删除 · SigV4 认证 · aetherupload 分块上传与原生 ingest · 控制台 API。
+已实现（M2a）：Multipart Upload（五操作）· Range GET（206/416）· `x-amz-meta-*` 元数据往返 ·
+流式 PutObject（不再整份读内存）· 启动自检与 `clean` 按龄续回收（trash/tmp/未引用版本目录）。
 未实现（见设计文档的阶段表）：纠删码 · 多盘 · 分布式 · 版本控制 · 加密 · 复制 · 权限。
 
 ## 架构
@@ -47,7 +51,8 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
 ![对象生命周期](docs/assets/object-lifecycle.svg)
 
 读路径只信 `xl.meta`：无有效 meta 的目录永不被服务；崩溃只会留下不可见的残骸
-（孤儿版本目录 / trash 残留），由 M2 的启动自检与 GC 回收——M1 期间仅占盘，不影响正确性。
+（孤儿版本目录 / trash 残留 / 未完成的 multipart 暂存区）。服务启动时自检清 `tmp`/`trash`，
+`oss-server clean <days>` 按 mtime 回收其余残骸（M2a 已落地）。
 
 ## 跑起来
 
@@ -73,10 +78,9 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > - `/aetherupload/*` 四条路由**需 JWT**：登录后带 cookie `oss_token` 或 `Authorization: Bearer <token>` 访问
 >   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M2/M4）。
 > - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
-> - 单段 PUT 上限 256 MiB（`max_put_bytes`）。
-> - Multipart 与 Range 未实现（M2）：≥8 MiB 的 `aws-cli s3 cp` 默认走 multipart → 501；Range 被忽略（200 + 全量）。
->   变通：`aws configure set default.s3.multipart_threshold 268435456`。
-> - `x-amz-meta-*` 用户元数据**静默丢弃**（M2 接上）。
+> - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
+> - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M2b）；
+>   多区间 Range（`bytes=0-9,20-29`）→ 400；HEAD 带 Range 不支持。
 > - 控制台「上传记录」是登记历史：对象或暂存文件被删后，记录行仍在（按设计，作审计线索）。
 > - `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须换成回环绑定与随机密钥
 >   （占位密钥可被用来伪造控制台与 `/aetherupload/*` 的 token；与 0.0.0.0 绑定合用即 LAN 风险面）。
@@ -145,6 +149,7 @@ AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:900
 - 设计文档：`docs/superpowers/specs/2026-10-10-minio-clone-design.md`
 - 功能规格：`docs/superpowers/specs/2026-10-10-feature-spec.md`
 - M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`
+- M2a 实现计划：`docs/superpowers/plans/2026-10-12-m2a-usability-slice.md`
 
 ---
 

@@ -197,7 +197,7 @@
 | 头 | M1 | 说明 |
 |---|---|---|
 | `Content-Type` | ✅ | 存 meta，GET 时回 |
-| `x-amz-meta-*` | ❌ 丢弃（M2 接上） | 用户元数据，总计 ≤ 2 KiB |
+| `x-amz-meta-*` | ✅（M2a 已落地） | 用户元数据，总计 ≤ 2 KiB；全量替换语义（非合并） |
 | `x-amz-storage-class` | ❌（M8） | 默认 STANDARD |
 | `x-amz-server-side-encryption*` | ❌（M5） | |
 | `x-amz-tagging` | ❌（M4） | |
@@ -205,15 +205,15 @@
 | `Content-MD5` | ✅ | 与计算值不符 → `BadDigest` |
 | `x-amz-checksum-*` | ❌（M2） | |
 
-**边界**：M1 整份读进内存（上限 256 MiB）；M2 换流式后上限变为协议上限。
+**边界**：M2a 起流式直通内核（不再整份读内存），单次 PUT/单 part 仍受 `max_put_bytes` 上限。
 
-### 3.2 GetObject —— `M1`（Range 在 `M2`）
+### 3.2 GetObject —— `M1`（Range：M2a 已落地）
 
 **行为**：读 `xl.meta` → 定位版本目录 → 流式返回。响应带 `Content-Length`、`Content-Type`、`ETag`、`Last-Modified`。
 
 **`response-content-*` 查询参数**（覆盖响应头）：`response-content-type`、`response-content-disposition`（含 `&filename=` 的 RFC 5987 编码）、`response-cache-control` 等。
 
-**Range（M2）**：`bytes=0-99`、`bytes=100-`、`bytes=-100`；越界 → `InvalidRange`（416）；支持单区间，多区间 → `InvalidRequest`。响应 `206` + `Content-Range`。**Range 读走 EC 重建时按需解码，不做全对象解码**。
+**Range（M2a 已落地）**：`bytes=0-99`、`bytes=100-`、`bytes=-100`；越界 → `InvalidRange`（416，实测错误码为 `InvalidArgument`，见 M2a 计划定稿记录）；支持单区间，多区间 → 400；响应 `206` + `Content-Range`；内核按 part 序列跨段映射、只读命中段。HEAD 带 Range 不支持。EC 重建的按需解码随 M2b。
 
 **条件请求**：`If-Match` / `If-None-Match`（ETag）/ `If-Modified-Since` / `If-Unmodified-Since` → 不满足时 `412` 或 `304`（`If-None-Match` 命中 → `304 Not Modified`，无 body）。
 
@@ -231,25 +231,25 @@
 
 **DeleteObjects（批量）**：一次最多 1000 个；部分失败时 `Errors` 数组列出失败项，成功的仍在 `Deleted` 里。**不做事务回滚**。
 
-### 3.5 CopyObject —— `M1`（元数据替换在 `M2`）
+### 3.5 CopyObject —— `M1`（COPY 指令：M2a 已落地；REPLACE 待后续）
 
 **行为**：`x-amz-copy-source` 形如 `/{src-bucket}/{src-key}`（可带 `?versionId=`）。M1 实现为「读出源字节 → 写入目标」（真实复制）；M2 起改为**服务端分片级复制**（不经过内存）。
 
-**`x-amz-metadata-directive`**：`COPY`（默认，保留源元数据）/ `REPLACE`（用请求头里的元数据）—— M2 起生效。
+**`x-amz-metadata-directive`**：`COPY`（默认，保留源元数据）——M2a 已落地；`REPLACE`（用请求头里的元数据）未实现。
 
 **边界**：源 = 目标（同桶同键、无 REPLACE、无存储类变更）→ `InvalidRequest`（S3 语义）；跨桶复制需要目标桶的写权限（M4 起）。
 
-### 3.6 多段上传 —— `M2`
+### 3.6 多段上传 —— `M2a 已落地`（UploadPartCopy / ListMultipartUploads 留 M2b）
 
 | 操作 | 行为 |
 |---|---|
 | `CreateMultipartUpload` | 返回 `uploadId`；在对象目录下建 `<uploadId>/` 暂存区 |
 | `UploadPart` | 写 `<uploadId>/part.N`；每个 part 独立算 MD5；part 号 1..=10000；返回该 part 的 ETag |
-| `UploadPartCopy` | 从已有对象复制区间作为 part（`x-amz-copy-source-range`） |
+| `UploadPartCopy` | 从已有对象复制区间作为 part（`x-amz-copy-source-range`）——**M2b** |
 | `CompleteMultipartUpload` | 按 part 号升序拼接；**校验每个 part 的 ETag 与请求里声明的一致**（不一致 → `InvalidPart`）；末段 < 5 MiB 允许，中间段 < 5 MiB → `EntityTooSmall`；乱序 → `InvalidPartOrder` |
 | `AbortMultipartUpload` | 删 `<uploadId>/` 全部内容 |
-| `ListParts` | 列举已上传的 part（分页 1000） |
-| `ListMultipartUploads` | 列举未完成的上传 |
+| `ListParts` | 列举已上传的 part（M2a 不分页：≤10000 全量，`isTruncated=false`） |
+| `ListMultipartUploads` | 列举未完成的上传——**M2b** |
 
 **多段 ETag 格式**：`<所有 part 的 MD5 拼接后再取 MD5>-<part 数>`（这是 S3 的定义，客户端靠它判断对象是否完整）。**注意**：因此多段上传的对象 ETag **不是**整份 MD5 —— 控制台要如实展示，不要假装它是校验和。
 
@@ -257,7 +257,7 @@
 
 ### 3.7 对象标签与元数据 —— `M2`/`M4`
 
-`PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`（M4）—— 最多 10 个标签，键 ≤ 128 字符，值 ≤ 256 字符。`x-amz-meta-*` 用户元数据（M2）—— 总计 ≤ 2 KiB，键名大小写不敏感。
+`PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`（M4）—— 最多 10 个标签，键 ≤ 128 字符，值 ≤ 256 字符。`x-amz-meta-*` 用户元数据（**M2a 已落地**）—— 总计 ≤ 2 KiB（大小写归一化行为以 s3s 实测为准）。
 
 ---
 
@@ -729,7 +729,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 阶段 | 功能 |
 |---|---|
 | **M1** | SigV4 认证 · 控制台登录 · 桶 CRUD · 对象 PUT/GET/HEAD/DELETE/批量删 · CopyObject · ListObjectsV2/V1 · aetherupload 预处理/分块/秒传/原生 ingest/分组 · 控制台 API（认证/桶/对象/上传/密钥/分组）· 登录/桶/对象/访问密钥四页（上传面板并入对象页） |
-| **M2** | 多段上传全套 · Range 与条件请求 · 用户元数据 · 流式大对象 · 纠删码 · 小对象内联 · 多盘 · 断电一致性 · fsck |
+| **M2** | 多段上传全套 · Range 与条件请求 · 用户元数据 · 流式大对象 · 纠删码 · 小对象内联 · 多盘 · 断电一致性 · fsck（**协议面与孤儿回收部分 → M2a 已落地**，存储层重构留 M2b） |
 | **M3** | 多节点 mesh · 静态拓扑 · 对象→纠删组哈希 · quorum 读写 · 节点故障容忍 · 读修复 · 集群健康端点 |
 | **M4** | 版本控制 · 生命周期 · 策略求值与 IAM · 用户与策略页 · 审计 · scrub/heal/rebalance · 集群状态页 · 对象标签 |
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |
