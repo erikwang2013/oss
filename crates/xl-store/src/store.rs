@@ -206,8 +206,8 @@ impl Store {
     ///   4. 写 `<obj>/xl.meta.new` 并 fsync，再 rename 覆盖 `xl.meta` ← **提交点**
     ///   5. 老版本目录 → `.oss.sys/trash/`（移入 trash，由 GC 回收——M1 未实现回收器）
     ///
-    /// 3 与 4 之间崩溃 = 留下一个孤儿版本目录（不可见，启动自检回收）；
-    /// 4 之后崩溃 = 老版本目录残留（不可见，clean 回收）。读路径只信 xl.meta。
+    /// 3 与 4 之间崩溃 = 留下一个孤儿版本目录（不可见，M1 无回收器，残留只占空间）；
+    /// 4 之后崩溃 = 老版本目录残留（不可见，同上）。读路径只信 xl.meta。
     ///
     /// M1 持久化假设：`fsync=true` 时数据文件与 `xl.meta.new` 都先做 file fsync；
     /// ext4/XFS 隐含提交先前的 rename，故提交点一次 rename 即可。**没有目录 fsync**，
@@ -231,7 +231,7 @@ impl Store {
         let now = now_nanos();
 
         // 1)+2) 数据与候选 meta 落 tmp；任何写失败/流错误都 best-effort 清掉本轮 tmp
-        //（未提交前 tmp 不被任何 meta 引用，失败即弃；残留也只占空间，由启动自检回收）
+        //（未提交前 tmp 不被任何 meta 引用，失败即弃；残留只占空间，由 `oss-server clean` 按 mtime 回收）
         let staged: Result<(u64, String, XlMeta)> = async {
             tokio::fs::create_dir_all(&tmp).await?;
 

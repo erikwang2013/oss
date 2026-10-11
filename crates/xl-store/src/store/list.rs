@@ -98,7 +98,7 @@ impl Store {
             // 把整桶列举打挂；真实对象的目录名由 object_dir_name 生成，必过同一套校验。
             match layout::key_from_dir_name(&name) {
                 Ok(k) => keys.push(k),
-                Err(e) => tracing::warn!(dir = %name, error = %e, "跳过非法对象目录"),
+                Err(e) => tracing::warn!(dir = ?name, error = %e, "跳过非法对象目录"),
             }
         }
         Ok(keys)
