@@ -40,9 +40,29 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > - `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须换成回环绑定与随机密钥
 >   （占位密钥可被用来伪造控制台与 `/aetherupload/*` 的 token；与 0.0.0.0 绑定合用即 LAN 风险面）。
 
+## 控制台（M1b）
+
+```bash
+# 1. 起后端（同 M1a）
+OSS_ADMIN_USER=erik OSS_ADMIN_PASSWORD=changeme cargo run -p oss-server
+# 2. 起前端（另开终端）
+cd web && npm install && npm run dev
+# 3. 打开 http://127.0.0.1:5173 ，用上面的账号登录
+```
+
+- 上传复用 aetherupload 自带脚本（分块 / 断线续传 / 秒传），前端不含分片逻辑
+- 秒传提示「上传成功（秒传）」表示 0 分块传输
+- e2e：`cd web && npx playwright install chromium && npm run e2e`。Playwright 自带双 webServer
+  （`cargo run` + `vite`），后端按 `web/playwright.config.ts` 里的 `pw` 自启；**已有后端在跑时会被复用**
+  （`reuseExistingServer`），此时运行中实例的管理员口令必须也是 `pw`，否则登录 401——口令不一致就先停掉
+  自起的服务，让 Playwright 用 `pw` 起自己的。上面「跑起来」的 `changeme` 只是示例占位，与 e2e 无关
+  （改不改都不影响 e2e）。
+- 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
+
 ## 验收
 
-覆盖范围：仅 S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）；浏览器上传与控制台界面在 M1b。
+覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）；浏览器上传与控制台界面见
+「控制台（M1b）」的 Playwright e2e。
 前置：本机装了 aws-cli 与 rclone。
 
 ```bash

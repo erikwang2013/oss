@@ -1683,6 +1683,12 @@ git commit -m "test(web): Playwright 关键路径（闭环 + 秒传零分块）"
 同款 `expect(...).toPass()`（点末页 → 断言可见，自纠）。`playwright.config.ts` 注释随动为「时间戳 + UUID」。
 验证：`npm run e2e` 3 passed；`--repeat-each=3 --workers=3` 9 passed、`--repeat-each=4 --workers=4` 12 passed（修正后再跑仍全绿）。
 
+**执行注记补（tsconfig，偏离④）**：新增 `web/playwright.config.ts` 后 `tsc -b`（`npm run build`）不会检查它——根
+`tsconfig.json` 是 solution-style（`files: []` + references），只管 `tsconfig.app.json`（src）与 `tsconfig.node.json`
+（原 include 仅 `vite.config.ts`）。故把 `playwright.config.ts` 补进 `tsconfig.node.json` 的 `include`（偏离计划 Task 11
+的 Files 清单，随本轮首笔提交带上）。**不改**：`e2e/*.spec.ts` 不在任何 project 的 include 里、`tsc -b` 不检查它们
+（由 Playwright 自己的 esbuild 转译；M3 记录，不处理）。
+
 ---
 
 ## Task 12: 1 GB 断线续传手测清单 + README + CI 验收
@@ -1690,7 +1696,7 @@ git commit -m "test(web): Playwright 关键路径（闭环 + 秒传零分块）"
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: 1 GB 上传 + 断线续传手测**（设计文档 M1 验收第 2 条，浏览器部分）
+- [x] **Step 1: 1 GB 上传 + 断线续传手测**（设计文档 M1 验收第 2 条，浏览器部分）
 
 ```bash
 head -c 1073741824 /dev/urandom > /tmp/1g.bin
@@ -1704,7 +1710,30 @@ head -c 1073741824 /dev/urandom > /tmp/1g.bin
 4. `uploads` 表可见记录（上传历史面板）；二次传同一文件命中秒传。
 5. 已知边界（写进 README）：**刷新页面后续传不了**——M1 的续传限于同一页面会话；跨刷新的断点续传要等服务端进度查询 + Multipart（M2）。
 
-- [ ] **Step 2: README 增加「控制台（M1b）」段**
+**执行注记（本轮真跑，不是纯文字清单；临时脚本 `/tmp/oss-1gb/*.cjs` 不提交）**：复用 e2e 的常驻后端（`OSS_ADMIN_PASSWORD=pw`）
++ vite（5173），用 playwright-core 走真人路径（登录 → `/buckets/files` →「上传」→ `setInputFiles` 一个
+`head -c 1073741824 /dev/urandom` 的 1 GiB 文件，本地 `md5sum 86274962ca6e5229c52180e5fadfa42b`）：
+
+1. **进度推进 → 成功**：`#aetherupload-output` 采样 98 次，`0% → 3% → 28% → 53% → 78% → 100%「上传成功」`；对象页出现
+   `202610/86274962ca6e5229c52180e5fadfa42b.bin`，大小列 `1.00 GiB`、ETag 列 = 本地 md5。客户端先算 1 GB SparkMD5
+   （~17s）再发 1074 × 1 MB 分块；从提交到成功 537.5s，其中约 7 分钟是最后一块在等服务端 merge（暂存盘 1 GiB .bin）
+   + 原生 ingest（store 写 part.1 并 fsync）——本机 io full≈75%、load≈13 的脏环境实测，非稳态基线。
+2. **断线续传（真断网，非文字）**：进度 3% 时 `browserContext.setOffline(true)`（CDP offline，等价 DevTools →
+   Network → Offline）持续 ~25s → 输出区出现「网络故障，正在重试……」（脚本 status===0 分支：busy-wait 5s 后重发同一分块）
+   → `setOffline(false)` → 同一页面自动继续 `3% → 28% → 53% → 78% → 100%` 直至成功（服务端对同序号重发分块幂等）。
+3. **下载比对**：对象页行内「下载」（真人路径：控制台 API → blob → 浏览器下载）落盘 1073741824 B，
+   `cmp` 逐字节一致，`md5sum`/`sha256sum` 双一致（sha256 `b0dfd66c7229edff710b5013782844da7323e977a88afabb3e106db56cf6bb0e`）。
+4. **uploads 记录 + 秒传**：`GET /api/v1/uploads` 有 `{saved_path: file_202610_86274962….bin, bucket: files,
+   key: 202610/86274962….bin, size: 1073741824, etag: 86274962…, original_name: 1g.bin}`；**二次传同一 1 GB 文件**
+   输出「上传成功（秒传）」+ 标签「秒传命中（0 分块传输）」，`/aetherupload/uploading` POST 计数 **0**（14s 全花在客户端算 hash）。
+5. 已知边界按计划写进 README（刷新后需重传；跨刷新续传在 M2）。
+
+实测后清理：`/tmp/oss-1gb/{1g.bin,downloaded.bin}`（2 GiB）已删；`/tmp/oss-1gb/run.log` 留档（不入库）。**未验（留给人工）**：
+真·拔网线/DevTools 手动操作路径（本轮用 CDP offline 等价替代，断的时机与恢复由脚本控）与刷新页面路径（已知边界，规格内不修）。
+
+**team-lead 独立复验**：收尾轮从控制台 API 重新拉取该 1 GiB 对象（1073741824 B）——`md5` = `86274962ca6e5229c52180e5fadfa42b`（与记录本地 md5 及服务端 ETag 三重一致）、`sha256` = `b0dfd66…bb0e`（与上文一致）。下载完整性无缺口。
+
+- [x] **Step 2: README 增加「控制台（M1b）」段**
 
 ```markdown
 ## 控制台（M1b）
@@ -1719,11 +1748,15 @@ cd web && npm install && npm run dev
 
 - 上传复用 aetherupload 自带脚本（分块 / 断线续传 / 秒传），前端不含分片逻辑
 - 秒传提示「上传成功（秒传）」表示 0 分块传输
-- e2e：`cd web && npx playwright install chromium && npm run e2e`
+- e2e：`cd web && npx playwright install chromium && npm run e2e`。Playwright 自带双 webServer
+  （`cargo run` + `vite`），后端按 `web/playwright.config.ts` 里的 `pw` 自启；**已有后端在跑时会被复用**
+  （`reuseExistingServer`），此时运行中实例的管理员口令必须也是 `pw`，否则登录 401——口令不一致就先停掉
+  自起的服务，让 Playwright 用 `pw` 起自己的。上面「跑起来」的 `changeme` 只是示例占位，与 e2e 无关
+  （改不改都不影响 e2e）。
 - 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
 ```
 
-- [ ] **Step 3: CI 验收**
+- [x] **Step 3: CI 验收**
 
 CI 文件（`.github/workflows/ci.yml`，已随本计划就位）有两个 job：
 - `rust`：`cargo fmt --check` / `clippy -D warnings` / `test` —— 仓库无 `Cargo.toml` 时自动跳过（规划阶段不红）
@@ -1737,7 +1770,11 @@ cd /home/wwwroot/oss/web && npm ci && npm run build && npm test
 
 推送后到 GitHub Actions 确认两个 job 均绿。
 
-- [ ] **Step 4: 提交**
+**执行注记（team-lead 收尾轮实测）**：本地预演 web job —— `npm ci && npm run build && npm test` 全绿（build 1.45s、15 tests）；另跑 `npm run lint` exit 0、`npm run e2e` **3 passed（21.6s，webServer 自启模式）**、`cargo test --workspace -j 2` 98 passed。**本分支尚未推送，CI 从未实际跑过**（`.github/workflows/ci.yml` 的触发是 push main / PR）；推送后回来看两个 job 即可。
+
+**CI 前提备忘（若将来把 e2e 接进 CI，质量评审给的五条）**：① 先 `cargo build -p oss-server` 预热（依赖含 s3s/ecat/sqlx/axum，GitHub runner 冷构建超过 webServer 的 180s 上限）；② vite 那条 webServer 补 `stdout: 'pipe'`（默认 ignore，起不来时是 60s 静默超时）；③ `reuseExistingServer: !process.env.CI`；④ `retries: process.env.CI ? 1 : 0`；⑤ 浏览器安装用 `--with-deps`。
+
+- [x] **Step 4: 提交**
 
 ```bash
 git add README.md && git commit -m "docs: 控制台使用说明与 1GB 上传清单"
@@ -1768,7 +1805,7 @@ git add README.md && git commit -m "docs: 控制台使用说明与 1GB 上传清
 |---|---|
 | aetherupload-all.js 的实际行为与本文档描述不符 | Task 8 Step 1 要求先读 crate 自带 `assets/example.html`（权威集成示例）；DOM 契约（wrapper + 四个 id + success 回调）来自 1.0.3 源码逐行核对 |
 | zepto 直改 DOM 与 React 重渲染打架 | 四个 id 节点 React 只渲染一次空内容，此后交给脚本；Modal 用 `destroyOnHidden` 保证每次打开是干净节点（antd 5.29 起 `destroyOnClose` 为弃用别名） |
-| antd 双字按钮文案带空格（「确 定」） | e2e 用 `/确\s*定/` 正则匹配 |
+| antd 双字按钮文案带空格（「确 定」） | e2e 统一用 `{ name: '确 定', exact: true }` 形态（含 登 录/上 传/下 载/删 除；勿用裸子串匹配——会撞「选择文件并开始上传」） |
 | 秒传用例在旧数据目录上误判 | 用例的文件内容带时间戳，第一次必然走真分块 |
 | `/aetherupload-assets` 被代理吞掉 | 代理键写成 `'/aetherupload/'`（带尾斜杠），Task 1 已注明 |
 | 将来加 CORS 时预检被 401 吃掉 | `CorsLayer` 必须叠在 `/aetherupload` 的 auth 中间件**之外**，否则预检 OPTIONS 会被 401（质量评审结论） |
