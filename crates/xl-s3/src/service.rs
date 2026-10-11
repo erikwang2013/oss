@@ -2,8 +2,9 @@
 //! Multipart / Range / 版本 / 加密 / 锁 / 复制分别是 M2/M5/M6 的事。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::Bytes;
+use http::StatusCode;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
@@ -98,41 +99,78 @@ impl S3 for OssS3 {
             key,
             body,
             content_type,
+            content_length,
             metadata,
             ..
         } = req.input;
-        let mut body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
+        let body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
 
-        // ponytail: M1 整份读进内存（带上限）。M2 换流式：直接把 StreamingBlob
-        // 包成 ByteStream 交给内核，内核本来就是流式写盘的。
-        let mut buf = Vec::new();
-        let mut total = 0usize;
-        while let Some(chunk) = futures::StreamExt::next(&mut body).await {
-            let chunk = chunk.map_err(|e| {
-                tracing::warn!(error = ?e, "读取 PUT 请求体失败");
-                s3s::s3_error!(IncompleteBody, "failed to read request body")
-            })?;
-            total += chunk.len();
-            if total > self.max_put_bytes {
+        // 声明长度已知且超限：不读体直接 413
+        if let Some(cl) = content_length {
+            if cl < 0 {
+                return Err(s3s::s3_error!(InvalidRequest, "negative content-length"));
+            }
+            if cl as usize > self.max_put_bytes {
                 return Err(s3s::s3_error!(
                     EntityTooLarge,
                     "object exceeds max_put_bytes"
                 ));
             }
-            buf.extend_from_slice(&chunk);
         }
 
-        let info = self
+        // 流式直通内核（不再整份进内存）；content-length 可缺省/不可信，流上计数兜底。
+        // 超限不把 413 语义沉进内核：置标志位并给内核一个良性错误中止写盘，回到这里换成 413。
+        let max = self.max_put_bytes;
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let exceeded_in_stream = Arc::clone(&exceeded);
+        let body_err = Arc::new(AtomicBool::new(false));
+        let body_err_in_stream = Arc::clone(&body_err);
+        let mut seen = 0usize;
+        let stream = futures::StreamExt::map(body, move |chunk| {
+            let chunk = chunk.map_err(|e| {
+                tracing::warn!(error = ?e, "读取 PUT 请求体失败");
+                body_err_in_stream.store(true, Ordering::Relaxed);
+                xl_store::error::Error::Io(std::io::Error::other(format!("request body: {e}")))
+            })?;
+            seen += chunk.len();
+            if seen > max {
+                exceeded_in_stream.store(true, Ordering::Relaxed);
+                return Err(xl_store::error::Error::Io(std::io::Error::other(
+                    "request body exceeds max_put_bytes",
+                )));
+            }
+            Ok(chunk)
+        });
+
+        let result = self
             .store
-            .put_object_with_meta(
+            .put_object_stream_with_meta(
                 &bucket,
                 &key,
-                Bytes::from(buf),
+                Box::pin(stream),
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
             )
-            .await
-            .map_err(to_s3_error)?;
+            .await;
+        let info = match result {
+            Ok(info) => info,
+            Err(e) => {
+                if exceeded.load(Ordering::Relaxed) {
+                    return Err(s3s::s3_error!(
+                        EntityTooLarge,
+                        "object exceeds max_put_bytes"
+                    ));
+                }
+                if body_err.load(Ordering::Relaxed) {
+                    // 与 M1 口径一致：请求体读取失败 = 客户端侧不完整（而不是 500）
+                    return Err(s3s::s3_error!(
+                        IncompleteBody,
+                        "failed to read request body"
+                    ));
+                }
+                return Err(to_s3_error(e));
+            }
+        };
 
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(info.etag)),
@@ -146,23 +184,62 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let bucket = req.input.bucket;
         let key = req.input.key;
-        let (info, bytes) = self
-            .store
-            .get_object(&bucket, &key)
-            .await
-            .map_err(to_s3_error)?;
+
+        // Range → 有界读 + 206/416；无 Range → 整读 + 200。两条路共用同一份响应组装。
+        let (info, bytes, content_range, status) = match req.input.range {
+            Some(range) => {
+                // check 需要对象大小：用 head 取 size，避免「为拿 size 整读一遍对象」
+                let info = self
+                    .store
+                    .head_object(&bucket, &key)
+                    .await
+                    .map_err(to_s3_error)?;
+                // 越界 → RangeNotSatisfiable → InvalidRange(416)
+                let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
+                let (start, end) = (rr.start, rr.end);
+                let bytes = if start == 0 && end == info.size {
+                    // 显式全段 Range：仍回 206（S3 语义），数据走整读
+                    self.store
+                        .get_object(&bucket, &key)
+                        .await
+                        .map_err(to_s3_error)?
+                        .1
+                } else {
+                    self.store
+                        .get_object_range(&bucket, &key, start..end)
+                        .await
+                        .map_err(to_s3_error)?
+                };
+                // check 保证 end >= 1（start <= last < full_length 且区间非空）
+                let cr = format!("bytes {}-{}/{}", start, end - 1, info.size);
+                (info, bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
+            }
+            None => {
+                let (info, bytes) = self
+                    .store
+                    .get_object(&bucket, &key)
+                    .await
+                    .map_err(to_s3_error)?;
+                (info, bytes, None, StatusCode::OK)
+            }
+        };
         let len = bytes.len() as i64;
 
-        Ok(S3Response::new(GetObjectOutput {
-            body: Some(StreamingBlob::from_bytes(bytes)),
-            content_length: Some(len),
-            content_type: info.content_type,
-            e_tag: Some(ETag::Strong(info.etag)),
-            last_modified: Some(last_modified(info.last_modified_nanos)),
-            // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
-            metadata: Some(info.user_metadata.into_iter().collect()),
-            ..Default::default()
-        }))
+        Ok(S3Response::with_status(
+            GetObjectOutput {
+                body: Some(StreamingBlob::from_bytes(bytes)),
+                content_length: Some(len),
+                content_type: info.content_type,
+                e_tag: Some(ETag::Strong(info.etag)),
+                last_modified: Some(last_modified(info.last_modified_nanos)),
+                accept_ranges: Some("bytes".to_string()),
+                content_range,
+                // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
+                metadata: Some(info.user_metadata.into_iter().collect()),
+                ..Default::default()
+            },
+            status,
+        ))
     }
 
     async fn head_object(

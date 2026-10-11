@@ -699,3 +699,241 @@ async fn metadata_roundtrip_through_service() {
         head2.metadata
     );
 }
+
+#[tokio::test]
+async fn get_object_range_returns_206_and_416() {
+    // M2a Task 2：Range → 206 + Content-Range；越界 → 416 InvalidRange
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let content: Vec<u8> = (0u8..100).collect();
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "r".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from(content.clone()))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let resp = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "r".into(),
+            range: Some(Range::Int {
+                first: 10,
+                last: Some(19),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, Some(http::StatusCode::PARTIAL_CONTENT));
+    assert_eq!(
+        resp.output.content_range.as_deref(),
+        Some("bytes 10-19/100")
+    );
+    assert_eq!(resp.output.content_length, Some(10));
+    let mut body = resp.output.body.unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(buf, &content[10..20]);
+
+    // 语缀区间 bytes=-5 → 最后 5 字节
+    let resp = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "r".into(),
+            range: Some(Range::Suffix { length: 5 }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.output.content_range.as_deref(),
+        Some("bytes 95-99/100")
+    );
+
+    // 越界 → 416 InvalidRange
+    let err = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "r".into(),
+            range: Some(Range::Int {
+                first: 1000,
+                last: None,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
+}
+
+/// 测试用可控分块流：先吐 `remaining` 个 `chunk`，再（可选）吐一个错误，然后结束。
+struct Chunks {
+    remaining: usize,
+    chunk: Bytes,
+    fail_at_end: bool,
+    sent_err: bool,
+}
+
+impl futures::Stream for Chunks {
+    type Item = Result<Bytes, s3s::StdError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            return Poll::Ready(Some(Ok(self.chunk.clone())));
+        }
+        if self.fail_at_end && !self.sent_err {
+            self.sent_err = true;
+            return Poll::Ready(Some(Err(std::io::Error::other("boom").into())));
+        }
+        Poll::Ready(None)
+    }
+}
+
+impl s3s::stream::ByteStream for Chunks {}
+
+fn blob_from_chunks(n: usize, size: usize, fail_at_end: bool) -> StreamingBlob {
+    StreamingBlob::from(Box::pin(Chunks {
+        remaining: n,
+        chunk: Bytes::from(vec![7u8; size]),
+        fail_at_end,
+        sent_err: false,
+    }) as s3s::stream::DynByteStream)
+}
+
+#[tokio::test]
+async fn put_object_streams_multi_chunk_body() {
+    // M2a Task 3：多分块流式 PUT 直通内核（不再整份读进内存）
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s3 = OssS3::new(store, 8 * 1024 * 1024);
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let chunk = 1024 * 1024; // 1 MiB × 3
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "big".into(),
+        body: Some(blob_from_chunks(3, chunk, false)),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let got = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "big".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(got.content_length, Some((3 * chunk) as i64));
+}
+
+#[tokio::test]
+async fn put_object_declared_oversize_is_413() {
+    // 声明长度超限：不读体直接 413 EntityTooLarge（service() 的 max = 1 MiB）
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let err = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            content_length: Some(2 * 1024 * 1024),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
+}
+
+#[tokio::test]
+async fn put_object_streaming_over_limit_is_413_and_leaves_no_residue() {
+    // 未声明 content-length 的超限流：流上计数兜底 → 413；tmp 无残留（内核失败清理路径）
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s3 = OssS3::new(Arc::clone(&store), 1024 * 1024);
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let err = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            body: Some(blob_from_chunks(3, 512 * 1024, false)), // 1.5 MiB > 1 MiB 上限
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
+    assert!(
+        s3.head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .is_err(),
+        "超限 PUT 不得留下已提交对象"
+    );
+    let mut tmp = tokio::fs::read_dir(dir.path().join(".oss.sys/tmp"))
+        .await
+        .unwrap();
+    assert!(
+        tmp.next_entry().await.unwrap().is_none(),
+        "失败 PUT 不得在 .oss.sys/tmp 留下残留"
+    );
+}
+
+#[tokio::test]
+async fn put_object_body_error_is_incomplete_body() {
+    // 请求体读取失败（客户端断连语义）→ 4xx IncompleteBody，不是 500
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let err = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            body: Some(blob_from_chunks(1, 16, true)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::IncompleteBody);
+}

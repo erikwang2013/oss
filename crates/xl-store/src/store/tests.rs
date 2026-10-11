@@ -752,3 +752,36 @@ async fn copy_carries_user_metadata() {
         Some(&"v".to_string())
     );
 }
+
+// ---- M2a Task 2: Range 有界读 ----
+
+#[tokio::test]
+async fn get_object_range_reads_exact_slice() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", Bytes::from_static(b"0123456789"), None)
+        .await
+        .unwrap();
+    // 半开区间 [2,5) -> "234"
+    assert_eq!(
+        &s.get_object_range("alpha", "k", 2..5).await.unwrap()[..],
+        b"234"
+    );
+    assert_eq!(
+        &s.get_object_range("alpha", "k", 0..10).await.unwrap()[..],
+        b"0123456789"
+    );
+    // 空区间（start == end）合法，返回 0 字节
+    assert!(
+        s.get_object_range("alpha", "k", 4..4)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // 出界由调用方（s3s range.check）先拦；内核仍防呆：start >= size 或 end > size 或倒序 → Err
+    assert!(s.get_object_range("alpha", "k", 10..11).await.is_err());
+    assert!(s.get_object_range("alpha", "k", 0..11).await.is_err());
+    // 倒序区间用结构体构造：字面量 `5..3` 会触发 clippy::reversed_empty_ranges（deny by default）
+    let reversed = std::ops::Range { start: 5, end: 3 };
+    assert!(s.get_object_range("alpha", "k", reversed).await.is_err());
+}

@@ -166,7 +166,7 @@ let info = self.store.put_object_with_meta(&bucket, &key, Bytes::from(buf), cont
 - Modify: `crates/xl-store/src/store/tests.rs`
 - Modify: `crates/xl-s3/src/service.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 #[tokio::test]
@@ -185,9 +185,9 @@ async fn get_object_range_reads_exact_slice() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**（`get_object_range` 未定义）。
+- [x] **Step 2: 跑测试确认失败**（`get_object_range` 未定义）。
 
-- [ ] **Step 3: 实现**。内核按 meta 定位 part 文件偏移；本任务对象都是单 part（Task 5 的跨 part 用例另测）：
+- [x] **Step 3: 实现**。内核按 meta 定位 part 文件偏移；本任务对象都是单 part（Task 5 的跨 part 用例另测）：
 
 ```rust
 /// 有界读：`range` 为半开区间且必须满足 0 <= start <= end <= size（调用方已校验越界）。
@@ -227,9 +227,9 @@ Ok(match req.input.range { Some(_) => S3Response::with_status(resp, StatusCode::
 
 **多区间 `bytes=0-9,20-29`**：s3s 的 `Range::parse` 直接拒绝（ParseRangeError）→ 在 DTO 反序列化层即 400；具体错误码探头核实一次（预期 `InvalidArgument`，规格措辞是 `InvalidRequest`——若不符记录为 Minor，不为此写补丁）。
 
-- [ ] **Step 4: 跑测试**（内核用例如上；再加 `bytes=-N` 语缀区间与空对象的 `check` 行为边界，均通过 s3s 语义覆盖）。
-- [ ] **Step 5: s3 面集成用例**：PUT 100 字节 → GET `Range: bytes=10-19` 断言 206 + `content-range: bytes 10-19/100` + 该段字节；`Range: bytes=1000-` 断言 416 + `InvalidRange`。
-- [ ] **Step 6: 提交**——`git commit -m "feat: GetObject Range——206/Content-Range/416，内核有界读"`
+- [x] **Step 4: 跑测试**（内核用例如上；再加 `bytes=-N` 语缀区间与空对象的 `check` 行为边界，均通过 s3s 语义覆盖）。
+- [x] **Step 5: s3 面集成用例（改 service 层直调，见定稿记录）**：PUT 100 字节 → GET `Range: bytes=10-19` 断言 206 + `content-range: bytes 10-19/100` + 该段字节；`Range: bytes=1000-` 断言 416 + `InvalidRange`。
+- [x] **Step 6: 提交**——`git commit -m "feat: GetObject Range——206/Content-Range/416，内核有界读"`
 
 ---
 
@@ -239,12 +239,12 @@ Ok(match req.input.range { Some(_) => S3Response::with_status(resp, StatusCode::
 - Modify: `crates/xl-s3/src/service.rs`
 - Modify: `crates/oss-server/tests/s3_over_http.rs`
 
-- [ ] **Step 1: 写测试要点**（xl-s3 层难做「驻留内存」判别，改测**语义等价与失败路径**）：
+- [x] **Step 1: 写测试要点**（xl-s3 层难做「驻留内存」判别，改测**语义等价与失败路径**）：
   - 大于单次 read 的体（如 3 MiB）PUT 后 GET 回内容与 md5 一致（走真实 HTTP，沿用 s3_over_http 模式）；
   - `content_length` 声明超 `max_put_bytes` → 立即 413 `EntityTooLarge`（无需读体）；
   - 流中途错误（客户端断连）→ 4xx `IncompleteBody`，且 `.oss.sys/tmp` 无残留（复用 store 既有 tmp 清理路径）。
 
-- [ ] **Step 2: 实现**。`StreamingBlob` 本身就是 `Stream<Item = Result<Bytes, _>>`（`src/dto/streaming_blob.rs:76`），直接映射错误后交给内核流式写盘：
+- [x] **Step 2: 实现**。`StreamingBlob` 本身就是 `Stream<Item = Result<Bytes, _>>`（`src/dto/streaming_blob.rs:76`），直接映射错误后交给内核流式写盘：
 
 ```rust
 let body = req.input.body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
@@ -272,7 +272,7 @@ let info = self.store.put_object_stream_with_meta(&bucket, &key, Box::pin(limite
   错误映射抉择：流上「超限」错误内核只会当 `Io` 上报 → 4xx 会退化成 5xx。**裁决**：xl-s3 层在 `seen > max` 时先把标志置位、让内核收到一个良性截断错误，随后 service 层检查标志返回 `EntityTooLarge`（实现时用 `Arc<AtomicBool>`），避免把 413 语义沉进内核。骨架：`let exceeded = Arc::new(AtomicBool::new(false));`（闭包 clone 进 map），finally 分支 `if exceeded.load() { return Err(s3s::s3_error!(EntityTooLarge, ...)) }`。
   `max_put_bytes` 的语义变化：仍是**单次 PUT（含单 part）**上限；multipart 大对象不再受它约束（Task 5 的 part 各自限）。README 措辞随之更新（Task 6）。
 
-- [ ] **Step 3: 跑测试**；Step 4: 提交——`git commit -m "feat: PutObject 流式化——请求体直通内核，去掉整份内存封顶"`
+- [x] **Step 3: 跑测试**；Step 4: 提交——`git commit -m "feat: PutObject 流式化——请求体直通内核，去掉整份内存封顶"`
 
 ---
 
@@ -523,3 +523,18 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
   本任务以 `xl-s3/tests/object_ops.rs::metadata_roundtrip_through_service`（service 层直调，含覆写清空语义）替代。
 - 实跑：`cargo test -p xl-store user_metadata` 2/2 ✓；`cargo test -p xl-s3 metadata_roundtrip` 1/1 ✓；
   fmt/clippy 随提交前跑。
+
+### Task 2 + Task 3（Range GET / 流式 PutObject，合并提交）
+
+- **合并提交原因**：两任务改动集中在 `xl-s3/src/service.rs` 的相邻函数（`get_object` / `put_object`），
+  无法按文件拆分提交；任务边界以本记录与提交信息说明。
+- Task 2 实际形态：内核 `get_object_range`（seek + 有界读，tokio `read_exact` 返回 `Result<usize>`
+  ——首轮编译即暴露，已修）；service 层 `Range::check` → 206 + `Content-Range` + `accept-ranges: bytes`，
+  越界 → `InvalidRange(416)`；显式全段 Range 仍回 206（走整读）。
+- Task 2 **偏差**：Step 2「确认失败」与实现合并编译（编译成本）；Step 5 同 Task 1——HTTP 级留给 Task 6 e2e，
+  本任务以 `object_ops.rs::get_object_range_returns_206_and_416`（含语缀区间 bytes=-5 与 416）替代。
+- Task 3 实际形态：`StreamingBlob` 经 `StreamExt::map` 直通内核；`content_length` 已知超限不读体直接 413；
+  流上计数兜底用 **两个标志位**（`exceeded` → 413；`body_err` → 保留 M1 的 `IncompleteBody` 4xx 口径，
+  不退化成 500）。测试含本地 `Chunks` 假流（多分块、超限、中途出错三条路径）+ tmp 无残留断言。
+- 依赖面：`http` 从 xl-s3 的 dev-deps 提升为直接依赖（s3s 不 re-export StatusCode；http 本就在依赖树，非新增 crate）。
+- 实跑：xl-store 56/56 ✓、xl-s3 27/27 ✓（均真实退出码 0）；fmt/clippy 随提交前跑。

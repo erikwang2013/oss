@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::Stream;
 use md5::{Digest as _, Md5};
 use sha2::Sha256;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 use crate::layout;
@@ -428,6 +428,54 @@ impl Store {
             }
         }
         // 两轮 meta → 数据文件都 ENOENT：按 S3 语义报 NoSuchKey，而不是把裸 IO 错误抛给上层
+        Err(Error::NoSuchKey(key.to_string()))
+    }
+
+    /// 有界读：`range` 为半开区间 `[start, end)`，须满足 `start <= end <= size`
+    ///（越界由调用方——s3s 的 `Range::check`——先拦；内核仍防呆，防呆错误是内部错误）。
+    /// 重试语义与 `get_object` 相同（并发覆写时重读 meta 一轮）。
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes> {
+        self.ensure_bucket(bucket).await?;
+        let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
+
+        for _ in 0..2 {
+            let m = self
+                .read_meta(bucket, key)
+                .await?
+                .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+            let v = m
+                .latest()
+                .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+
+            if range.start > range.end || range.end > v.size {
+                return Err(Error::InvalidKey(format!(
+                    "range {range:?} 越界（对象 {} 字节）",
+                    v.size
+                )));
+            }
+
+            // ponytail: M2a 单 part（Task 5 起按 parts 序列跨 part 映射）；seek + 有界读，不整份进内存。
+            let path = dir.join(&v.part.uuid).join(format!("part.{}", v.part.part));
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            file.seek(std::io::SeekFrom::Start(range.start)).await?;
+            let mut buf = vec![0u8; (range.end - range.start) as usize];
+            match file.read_exact(&mut buf).await {
+                // tokio 的 read_exact 返回 io::Result<usize>（与 std 的 Result<()> 不同）
+                Ok(_) => return Ok(Bytes::from(buf)),
+                // 版本目录被并发覆写者移走/截断：下一轮重读 meta 拿新版本
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
         Err(Error::NoSuchKey(key.to_string()))
     }
 

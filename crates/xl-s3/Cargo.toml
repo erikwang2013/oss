@@ -10,6 +10,8 @@ xl-store.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
 futures.workspace = true
+# Range 的 206 需要 http::StatusCode（s3s 不 re-export）；http 本就在依赖树里（s3s 直连），非新增 crate
+http = "1"
 s3s.workspace = true
 sqlx = { workspace = true }
 tracing.workspace = true
@@ -17,6 +19,5 @@ tracing.workspace = true
 [dev-dependencies]
 md-5.workspace = true
 hex.workspace = true
-http = "1"
 tempfile = "3"
 tokio.workspace = true
