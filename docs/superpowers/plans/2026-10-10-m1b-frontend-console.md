@@ -1403,6 +1403,19 @@ M2 按钮 `loading={!window.aetherupload ? true : undefined}` 改为 `disabled={
 
 ---
 
+## 定稿记录（Task 9 追加，commit `chore(web): 移除 JS 补丁（上游 1.0.4 已修 urlencoded）；守卫改 stock 哈希`）
+
+**补丁退役**：`aetherupload-rust` 1.0.4（2026-10-11）在 Rust 侧修掉编码不一致——`src/form.rs` 新增
+`FormData::from_urlencoded`，`integrations/{axum,actix,poem,warp}` 的 `preprocess` 按 Content-Type 分流、
+urlencoded 与 multipart 都收（`assets/` 零差异——上游没动 JS；`ecat = ["axum"]`，本项目走的就是这条路径）。
+本地 JS 补丁（补丁定稿见上方 Task 9 记录）随之移除：`web/public/aetherupload-assets/aetherupload-all.js`
+以二进制 `cp` 恢复为 crate 1.0.4 的 stock 资产（`cmp` 逐字节一致，sha256 `d639686a…`），补丁历史只留在 git。
+`web/src/__tests__/assets.test.ts` 守卫从「保护补丁」改为「保护 stock」：钉 vendored 文件的 sha256 常量
+（升级 crate 时随之更新），原 `processData/FormData` 断言删除。浏览器链路不变地走
+preprocess → uploading：preprocess 现在发 **urlencoded**，由服务端接受（e2e 覆盖真实路径）。
+
+---
+
 ## Task 10: 访问密钥页
 
 **Files:**
@@ -1518,8 +1531,10 @@ git commit -m "feat(web): 访问密钥页（列表 + 一次性展示 SK）"
 >    `{ name: /确\s*定/ }` 可用。若某天又见英文 OK/Cancel，先查 locale import 是否被改回 `antd/locale/zh_CN`。
 > 3. **Modal 关闭钮**：aria-label 固定 `Close`（antd 默认，不随 locale 变），`{ name: 'Close' }` 无需改动。
 >
-> 另：上游脚本的 preprocess 补丁见 Task 9 定稿记录（vendored JS 已不再与 crate 逐字节相同），
-> e2e 起服务前确认 `web/public/aetherupload-assets/` 是仓库内的已补丁版本。
+> 另：vendored `web/public/aetherupload-assets/aetherupload-all.js` 已回归 crate 1.0.4 stock
+> （JS 补丁退役见 Task 9 追加定稿记录）——preprocess 发 urlencoded，须由 **aetherupload-rust ≥ 1.0.4**
+> 的后端接受；e2e 起服务前确认 9000 上没有 1.0.3 时代的残留进程（`reuseExistingServer: true` 会直接复用它，
+> 表现为 preprocess 400）。
 
 **Files:**
 - Create: `web/playwright.config.ts`、`web/e2e/console.spec.ts`、`web/e2e/instant.spec.ts`
