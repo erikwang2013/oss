@@ -5013,6 +5013,35 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 
 ---
 
+## 运维 CLI（规格 §18.1 的漏安排补齐；M1 收尾后）—— 定稿记录
+
+**来源**：功能规格 §18.1 把 `groups` / `build` / `clean <days>` 三条标为 M1，但本计划从未给它们安排落点
+（`groups` 只是被 `aether::build_runtime` 的启动自举顺带覆盖）。本节记录补齐：新增 `crates/oss-server/src/cli.rs`
++ 从 `main.rs` 抽出 `AppState::load`。
+
+- **结构**：`main.rs` 收成薄壳（`std::env::args` → `cli::parse_args` → `AppState::load` → `cli::run`，失败 exit 1，
+  未知子命令/非法参数打印用法 exit 2）。`state.rs` 新增 `AppState::load(cfg_path)`：原 main.rs 的启动序列
+  （读配置/建目录/连库/开存储/管理员引导/确保桶）原样搬入，serve 与运维命令共用同一条，不再有两份自举。
+- **三个动作引内核现成实现**（`aetherupload::console`）：`list_groups` / `build_redis_hashes` / `clean_up_directory`，不自造。
+  `build` 的路径：`build_runtime` 造 Runtime（内含 `SqlInstantStore`）→ `build_redis_hashes` 先
+  `InstantIndex::delete_all()`（= `delete_prefix("aetherupload:resource:")` → Task 14 的 `instant_delete_prefix`）清旧索引，再按盘重建。
+- **`clean` 的补扫**（内核管不到的一半）：内核 clean 只扫 aether 暂存盘的 `_header/`（无扩展名者）与分组子目录下的 `*.part`；
+  数据盘内核 tmp 区（`.oss.sys/tmp/<uuid>/`，ingest 写盘中途失败的残留）由 `cli.rs::reap_stale_tmp` 按同一 mtime 口径回收，并输出删除计数。
+  进行中的上传其 tmp 目录/临时文件刚创建，mtime 必然新于 due，按 mtime 判定不会误伤；`days` 在解析层限定 `1..=36525`
+  （正整数 + 挡掉换算秒时的乘法溢出）。
+- **解析从严**：多余参数一律拒绝——`clean 1 --dry-run` 报用法并 exit 2，而不是忽略 `--dry-run` 当真去删。
+- **一处行为变化**：原 `oss-server <配置路径>`（首参即配置路径）作废，配置文件固定为当前目录的 `oss.toml`
+  （全仓唯一调用方是 `web/playwright.config.ts` 的 `cargo run -p oss-server`，不带路径参数）。
+- **测试**：`cli.rs` 单测（arg 解析含拒绝集；`reap_stale_tmp` 用 `touch` 拨 mtime 造老/新文件，断言只删过期的）+
+  `tests/ops_cli.rs` 集成冒烟（groups 幂等建目录；build 只索引成品、跳过 `*.part` 且索引值可查；clean 删过期的断点/分块/tmp 孤儿目录、
+  留成品与新鲜文件）。
+- **实跑（四道闸）**：fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（104 测：oss-server 单测 10 + 集成 5/4/10/1/1/1）·
+  三条命令在临时 `oss.toml` 环境实跑（`groups` 列出分组、`build` 报 "2 items have been set" 且 SQLite 索引行可查、`clean 1` 删 1 断点 + 1 分块 + 1 tmp 孤儿）；
+  `serve` 起服务 → login 签发 token 照常。
+- **README** 新增「运维命令」小节（三条用法 + cron 建议 + 配置路径变化）；规格 §18.1 表加「实现状态」列。
+
+---
+
 ## M1 完成标准（对照设计文档的 M1 验收）
 
 | 设计文档的验收项 | 本计划的覆盖 |

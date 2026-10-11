@@ -63,6 +63,30 @@ cd web && npm install && npm run dev
   （或拔网线）→ 输出区出现「网络故障，正在重试……」→ 恢复网络 → 自动继续至成功；下载后 `cmp` 与本地一致。
 - 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
 
+## 运维命令
+
+`oss-server [serve|groups|build|clean <days>]`（无参数 = `serve`）。三条运维命令读当前目录的
+`oss.toml`，并走与服务端相同的启动自举（建目录/连库/开存储；管理员与桶的引导是幂等的）：
+
+```bash
+oss-server groups        # 建分组目录（幂等；启动自举也会做，上传报笼统错误时先跑它确认）
+oss-server build         # 按磁盘现状重建秒传索引（先清旧索引，再全量扫描暂存盘）
+oss-server clean <days>  # 按 mtime 回收 days 天前的临时文件：
+                         #   暂存盘 `_header/` 与 `*.part`，外加数据盘 `.oss.sys/tmp/` 的孤儿上传目录
+```
+
+建议 cron（每日 `clean 1` 与 `build` 各一次；`scrub --repair` 每周一次——那是 M4 的命令，见功能规格 §18.1）：
+
+```cron
+17 4 * * * cd /path/to/oss && ./oss-server clean 1
+47 4 * * * cd /path/to/oss && ./oss-server build
+```
+
+- `clean` 按 mtime 判定：进行中的上传，其 `_header`/`*.part`/`tmp` 目录都是新的，不会被误删；`days` 须为正整数
+- `build` 先清空秒传索引再按盘重建：重建瞬间的并发上传会从「秒传命中」回退为正常上传，不丢数据
+- 未知子命令或非法参数打印用法并 exit 2；命令失败 exit 1
+- 配置文件路径固定为当前目录的 `oss.toml`（原先的 `oss-server <配置路径>` 用法已移除）
+
 ## 验收
 
 覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）见下方脚本；控制台的登录/上传/秒传/密钥常规路径见

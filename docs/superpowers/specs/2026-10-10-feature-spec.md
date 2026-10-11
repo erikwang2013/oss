@@ -698,15 +698,15 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 ### 18.1 运维命令
 
-| 命令 | 作用 | 阶段 |
-|---|---|---|
-| `groups` | 建分组目录（**不建就一定上传失败**） | M1 |
-| `build` | 按磁盘现状重建秒传索引 | M1 |
-| `clean <days>` | 按 mtime 回收临时文件（`_header` 与 `*.part`） | M1 |
-| `fsck` | 启动自检：孤儿版本目录、缺失分片、meta 不一致 | M2 |
-| `scrub [--repair]` | 逐分片校验和比对，可选修复 | M4 |
-| `rebalance` | 按新拓扑重新分布 | M4 |
-| `heal` | 补齐缺失分片（读到即修 + 主动扫描） | M4 |
+| 命令 | 作用 | 阶段 | 实现状态（M1 收尾） |
+|---|---|---|---|
+| `groups` | 建分组目录（**不建就一定上传失败**） | M1 | 已实现：启动自举（`aether::build_runtime`）+ `oss-server groups` 双入口 |
+| `build` | 按磁盘现状重建秒传索引 | M1 | 已实现：`oss-server build` |
+| `clean <days>` | 按 mtime 回收临时文件（`_header` 与 `*.part`） | M1 | 已实现：`oss-server clean <days>`；另回收内核 `.oss.sys/tmp/` 的孤儿上传目录 |
+| `fsck` | 启动自检：孤儿版本目录、缺失分片、meta 不一致 | M2 | 未实现 |
+| `scrub [--repair]` | 逐分片校验和比对，可选修复 | M4 | 未实现 |
+| `rebalance` | 按新拓扑重新分布 | M4 | 未实现 |
+| `heal` | 补齐缺失分片（读到即修 + 主动扫描） | M4 | 未实现 |
 
 建议 cron：`clean 1` 与 `build` 每日各一次；`scrub --repair` 每周一次。
 

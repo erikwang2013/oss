@@ -23,6 +23,10 @@ pub struct LoginRequest {
 /// 取 JWT 载荷里的用户 id（登录签发时 `sub` = uid 十进制字符串）。
 /// 签名/过期已由 JwtLayer 校验；这里只剩形状兜底（理论上到不了）。
 /// 兜底的 401 与 JwtLayer 用同一 JSON 形态，避免同面两种 401 body。
+// Err 是 axum 的 `Response`（handler 惯例，`?` 直接把它变成响应）；装箱只会把这点体量
+// 挪去别处并让调用点解箱。http 1.5 起 `Response<Body>` 越过 clippy 的 128 字节阈值，
+// 每请求至多构造一次，不值得为它改签名。
+#[allow(clippy::result_large_err)]
 fn uid_of(payload: &JwtPayload) -> Result<i64, Response> {
     payload.sub().and_then(|s| s.parse().ok()).ok_or_else(|| {
         (

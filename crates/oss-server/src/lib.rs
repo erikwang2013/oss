@@ -1,4 +1,5 @@
 pub mod aether;
+pub mod cli;
 pub mod config;
 pub mod console;
 pub mod db;
