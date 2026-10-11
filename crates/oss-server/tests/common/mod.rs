@@ -3,13 +3,16 @@ use oss_server::db::Db;
 use oss_server::state::AppState;
 use xl_store::store::{Store, StoreConfig};
 
+/// 测试共用 secret（jwt-rust 要求 ≥32 字符）；测试自己造令牌时也用它签名。
+pub const JWT_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
 pub async fn state(dir: &std::path::Path) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
         staging_dir: dir.join("staging"),
         database_url: "sqlite::memory:".into(),
-        jwt_secret: "test".into(),
+        jwt_secret: JWT_SECRET.into(),
         max_put_bytes: 1024 * 1024,
         groups: vec![GroupTarget {
             group: "file".into(),

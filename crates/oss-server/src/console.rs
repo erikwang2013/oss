@@ -1,12 +1,16 @@
 //! 控制台 API。M1 只有：登录、桶列表、对象列表、下载、删除、上传记录、访问密钥。
 //! 授权模型（谁能做什么）在 M4；M1 只区分「登录 / 未登录」。
+//!
+//! 鉴权由 `router.rs` 在 `/api/v1` 上挂的 `jwt-rust` `JwtLayer` 统一做（`/login` 在 except
+//! 名单内），handler 只从 extensions 里取 payload；除 `/login` 外无匿名可达路径。
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use jwt_rust::JwtPayload;
+use serde::Deserialize;
 
 use crate::state::AppState;
 
@@ -16,16 +20,13 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct LoginResponse {
-    pub token: String,
-}
-
-/// 控制台与 aether 鉴权层（`router.rs`）共用的 token 载荷。
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct Claims {
-    sub: String,
-    exp: usize,
+/// 取 JWT 载荷里的用户 id（登录签发时 `sub` = uid 十进制字符串）。
+/// 签名/过期已由 JwtLayer 校验；这里只剩形状兜底（理论上到不了）。
+fn uid_of(payload: &JwtPayload) -> Result<i64, StatusCode> {
+    payload
+        .sub()
+        .and_then(|s| s.parse().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -50,15 +51,11 @@ pub fn routes() -> Router<AppState> {
 async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
     match state.db.verify_user(&body.username, &body.password).await {
         Ok(Some(uid)) => {
-            let exp = now_secs() as usize + 12 * 3600;
-            let token = jsonwebtoken::encode(
-                &jsonwebtoken::Header::default(),
-                &Claims {
-                    sub: uid.to_string(),
-                    exp,
-                },
-                &jsonwebtoken::EncodingKey::from_secret(state.cfg.jwt_secret.as_bytes()),
-            );
+            // 12h 过期在 JwtConfig.default_expire（state.rs）；sub=uid 供各 handler 还原
+            let token = state
+                .jwt
+                .jwt()
+                .encode(&serde_json::json!({ "sub": uid.to_string() }), None);
             match token {
                 Ok(token) => {
                     (StatusCode::OK, Json(serde_json::json!({ "token": token }))).into_response()
@@ -96,41 +93,12 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
     }
 }
 
-/// 从 Authorization: Bearer 解出用户 id。M1 的最小鉴权。
-/// ponytail: 12 行自写中间件；M4 引入策略模型时换 ecat-auth 的 JwtAuthLayer。
-fn auth(state: &AppState, headers: &HeaderMap) -> Result<i64, StatusCode> {
-    let raw = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let decoded = jsonwebtoken::decode::<Claims>(
-        raw,
-        &jsonwebtoken::DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes()),
-        &jsonwebtoken::Validation::default(),
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    decoded
-        .claims
-        .sub
-        .parse::<i64>()
-        .map_err(|_| StatusCode::UNAUTHORIZED)
-}
-
 /// 上传分组（oss.toml 的 `[[groups]]`），供上传面板的分组下拉使用。
-async fn list_groups(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
+async fn list_groups(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.cfg.groups.clone()).into_response()
 }
 
-async fn list_buckets(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
+async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     match state.store.list_buckets().await {
         Ok(list) => Json(list.into_iter().map(|b| b.name).collect::<Vec<_>>()).into_response(),
         Err(e) => store_error(e).into_response(),
@@ -144,10 +112,10 @@ struct CreateBucketBody {
 
 async fn create_bucket(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateBucketBody>,
 ) -> impl IntoResponse {
-    let uid = match auth(&state, &headers) {
+    let uid = match uid_of(&payload) {
         Ok(u) => u,
         Err(s) => return s.into_response(),
     };
@@ -163,12 +131,8 @@ async fn create_bucket(
 
 async fn delete_bucket(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
     match state.store.delete_bucket(&bucket).await {
         Ok(()) => {
             if let Err(e) = state.db.delete_bucket_row(&bucket).await {
@@ -192,13 +156,9 @@ struct ListQuery {
 
 async fn list_objects(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(bucket): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
     let req = xl_store::store::ListRequest {
         prefix: q.prefix,
         delimiter: q.delimiter,
@@ -223,12 +183,8 @@ async fn list_objects(
 
 async fn get_object(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
     match state.store.get_object(&bucket, &key).await {
         Ok((info, bytes)) => {
             let ct = info
@@ -242,22 +198,15 @@ async fn get_object(
 
 async fn delete_object(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
     match state.store.delete_object(&bucket, &key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e).into_response(),
     }
 }
 
-async fn list_uploads(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(s) = auth(&state, &headers) {
-        return s.into_response();
-    }
+async fn list_uploads(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.list_uploads(100).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => {
@@ -275,10 +224,10 @@ struct RegisterBody {
 
 async fn register_upload(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(payload): Extension<JwtPayload>,
     Json(body): Json<RegisterBody>,
 ) -> impl IntoResponse {
-    let uid = match auth(&state, &headers) {
+    let uid = match uid_of(&payload) {
         Ok(u) => u,
         Err(s) => return s.into_response(),
     };
@@ -297,8 +246,11 @@ async fn register_upload(
     }
 }
 
-async fn list_access_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let uid = match auth(&state, &headers) {
+async fn list_access_keys(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> impl IntoResponse {
+    let uid = match uid_of(&payload) {
         Ok(u) => u,
         Err(s) => return s.into_response(),
     };
@@ -327,10 +279,10 @@ fn valid_credential(s: &str) -> bool {
 
 async fn create_access_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateKeyBody>,
 ) -> impl IntoResponse {
-    let uid = match auth(&state, &headers) {
+    let uid = match uid_of(&payload) {
         Ok(u) => u,
         Err(s) => return s.into_response(),
     };
@@ -369,11 +321,4 @@ async fn create_access_key(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

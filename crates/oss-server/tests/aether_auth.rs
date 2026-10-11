@@ -1,6 +1,7 @@
 // /aetherupload/* 的最小鉴权层（规格 §0.1「会话 Cookie/JWT 覆盖层」）：
 // cookie `oss_token` 或 `Authorization: Bearer` 二者皆可，缺/坏/过期一律 401。
-// 路由表变化时，本文件的「匿名 401 表」要跟着同步（四条路由全在同一层 middleware 之内）。
+// 实现在 router.rs：cookie→Authorization 垫片（最外层）+ jwt-rust JwtLayer（校验）。
+// 路由表变化时，本文件的「匿名 401 表」要跟着同步（四条路由全在两个层之内）。
 
 mod common;
 
@@ -64,8 +65,9 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// 四条路由（预处理 / 分块 / 展示 / 下载）匿名一律 401 纯文本。
-/// （POST 两条带合法 body，钉「auth 先于提取器」，路由漏挂 middleware 即红。）
+/// 四条路由（预处理 / 分块 / 展示 / 下载）匿名一律 401；body 是 jwt-rust 的 JSON 形态
+/// （`{"code":401,"msg":…,"data":null}`，不区分缺/坏/过期、不泄细节）。
+/// （POST 两条带合法 body，钉「鉴权先于提取器」，路由漏挂 layer 即红。）
 #[tokio::test(flavor = "multi_thread")]
 async fn aether_routes_reject_anonymous() {
     let dir = tempfile::tempdir().unwrap();
@@ -87,11 +89,9 @@ async fn aether_routes_reject_anonymous() {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401, "{method} {path} 未带 token 必须 401");
-        assert_eq!(
-            resp.text().await.unwrap(),
-            "unauthorized",
-            "纯文本、不泄细节"
-        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 401, "jwt-rust 401 形态");
+        assert_eq!(body["data"], serde_json::Value::Null);
     }
 }
 
@@ -151,6 +151,48 @@ async fn cookie_or_bearer_token_passes() {
     assert_eq!(json["error"], 0);
 }
 
+/// 跨面共用：同一次登录的 token，控制面（Bearer 打 /api/v1）与上传口（cookie 打
+/// /aetherupload）都要认 —— 两面是同一个 JwtAuth 实例、同一 secret。
+#[tokio::test(flavor = "multi_thread")]
+async fn login_token_works_on_both_surfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st)).await;
+    let client = reqwest::Client::new();
+
+    let login: serde_json::Value = client
+        .post(format!("{base}/api/v1/login"))
+        .json(&serde_json::json!({"username": "erik", "password": "pw"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+
+    let resp = client
+        .get(format!("{base}/api/v1/groups"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "控制面（Bearer）");
+
+    let resp = with_form(
+        client
+            .post(format!("{base}/aetherupload/preprocess"))
+            .header("cookie", format!("oss_token={token}")),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "上传口（同 token，cookie 形态）");
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["error"], 0);
+}
+
 /// 边界凭据一律 401：空 Bearer（`Authorization: Bearer `）、空 cookie 值且无 Bearer 可回退、
 /// 含非法字符的 cookie 值。
 #[tokio::test(flavor = "multi_thread")]
@@ -196,8 +238,8 @@ async fn forged_or_expired_token_is_401() {
     let client = reqwest::Client::new();
 
     let forged = sign_token("not-the-secret", unix_now() + 3600);
-    // exp 早于 now 3600s，越过 jsonwebtoken 默认 60s leeway
-    let expired = sign_token("test", unix_now() - 3600);
+    // exp 早于 now 3600s，越过 jwt-rust 的 leeway（0，源头是 JwtConfig 默认值）
+    let expired = sign_token(common::JWT_SECRET, unix_now() - 3600);
 
     for token in [&forged, &expired] {
         for as_cookie in [true, false] {

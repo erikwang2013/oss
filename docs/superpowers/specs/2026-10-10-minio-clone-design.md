@@ -43,7 +43,7 @@
 | 控制面 DB | `ecat-data-sqlx` | 7.0.0 | 开发 SQLite / 生产 PostgreSQL，同一 trait |
 | 缓存（可选） | `ecat-data-redis` | 7.0.0 | 仅当外部化秒传索引时才需要；默认不用 |
 | S3 客户端（复制/分层） | `ecat-data-s3` | 7.0.0（**需扩展**） | 现仅 put/get/delete/list，需补流式 multipart / copy / 版本头 |
-| 认证 | `ecat-auth` | 7.0.0 | 控制面 JWT / API Key；S3 面走 SigV4 |
+| 认证 | `jwt-rust` | 1.0.1 | 控制面 `/api/v1` 与上传口 `/aetherupload` 的 JWT 校验/签发（axum `JwtLayer` + `encode`，12h）；S3 面走 SigV4。`ecat-auth` 的定位不变，留 M4 策略层（桶策略/IAM） |
 | 分布式锁（M3+） | `ecat-lock` | 7.0.0 | 节点间命名空间锁；后端选型在 M3 定 |
 | 可观测 | `ecat-metrics` · `ecat-tracing` · `ecat-logging` | 7.0.0 | Prometheus + OTLP |
 | 中间件 | `ecat-middleware` · `ecat-security` | 7.0.0 | 超时/限流/攻击检测 |
@@ -71,7 +71,7 @@
 │  HttpServer::new(":9000").router(router)          ← axum 0.8 Router │
 │                                                                     │
 │   /aetherupload/*   aetherupload-rust (feature=ecat)                │
-│   /api/v1/*         控制台 API        ← ecat-auth JWT 中间件         │
+│   /api/v1/*         控制台 API        ← jwt-rust JwtLayer           │
 │   /ap/<name>/*      Access Point 寻址 ← S3Route 前置改写层 (M8)      │
 │   /metrics          ecat-metrics (Prometheus)                       │
 │   fallback          s3s::S3Service    ← 114 个 S3 操作               │

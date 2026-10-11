@@ -85,6 +85,9 @@ async fn wrong_password_is_401() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+    // /login 在 JwtLayer 的 except 名单外是反的：它在名单内，401 由 handler 自己给，
+    // 保持纯文本（登录页直接把 body 当错误文案展示）；不是 jwt-rust 的 JSON 401 形态。
+    assert_eq!(resp.text().await.unwrap(), "用户名或密码错误");
 }
 
 /// 钉 `register_upload` 的三分支口径（I-1，收尾轮修订）：命中 204、无行 404、DB 故障 500。
@@ -185,8 +188,9 @@ async fn register_upload_db_failure_is_500() {
 
 // ---- Task 15 收尾轮（I-1 / M-2 / M-3 / M-4）新增 ----
 
-/// I-1②：11 条路由去掉 login = 10 条，匿名一律 401 —— 新增 handler 漏 `auth()` 立即变红。
-/// POST 路由的 Json 提取先于 handler，故必须带能解析的 body 才走得到鉴权分支。
+/// I-1②：11 条路由去掉 login = 10 条，匿名一律 401 —— 鉴权是整面 `JwtLayer`（不是逐 handler
+/// 的 `auth()`），路由表变化时本表跟着同步即可。POST 带可解析 body：401 现在来自层
+/// （先于提取器），但仍钉住「匿名不给任何 handler 机会」。
 #[tokio::test]
 async fn all_routes_reject_anonymous() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,8 +275,8 @@ async fn forged_or_expired_token_is_401() {
     let client = reqwest::Client::new();
 
     let forged = sign_token("not-the-secret", unix_now() + 3600);
-    // exp 早于 now 3600s，越过 jsonwebtoken 默认 60s leeway
-    let expired = sign_token("test", unix_now() - 3600);
+    // exp 早于 now 3600s，越过 jwt-rust 的 leeway（0，源头是 JwtConfig 默认值）
+    let expired = sign_token(common::JWT_SECRET, unix_now() - 3600);
 
     for token in [forged, expired] {
         let resp = client

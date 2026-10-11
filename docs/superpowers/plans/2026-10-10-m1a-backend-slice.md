@@ -4289,6 +4289,10 @@ git add crates/oss-server/ && git commit -m "feat(server): aetherupload 接线 +
   「空 cookie 值应回退到 Bearer」断言红（401 vs 200），复原即绿。**M1b 衔接**：前端登录成功处需种
   `document.cookie = "oss_token=<jwt>; path=/; SameSite=Lax"`——aetherupload 自带脚本已 `withCredentials: true`，
   cookie 会随分块请求自动带上，否则浏览器链路 401。
+  **后续修订（用户指令，M1 收尾后）**：手写 `decode::<Claims>` 换成 `jwt-rust` 的 `JwtLayer`，
+  cookie 解析降级为最外层一个 `from_fn` 垫片（无 `Authorization` 头时把 `oss_token` 写成 Bearer）；
+  外部行为不变（cookie 优先仍是「只有 cookie 时」的表现，两者同带时改为 Bearer 优先——垫片只在头缺失时注入）。
+  详见 Task 15 的「改用 jwt-rust」定稿记录。
 - **四条路由的真机实测（收尾轮，覆盖 Task 16 脚本不碰的 aether 链路）**：起真服务后
   ① `preprocess` → `{"error":0,...}`；② `uploading`（单块，hello world / md5 `5eb63bbb…`）→
   `{"error":0,"savedPath":"file_202610_5eb63bbb….txt"}`，对象落盘 `data/files/202610__XLDIR__<md5>.txt/`
@@ -4814,6 +4818,18 @@ git add crates/oss-server/ && git commit -m "feat(server): 控制台 API（登�
 - **反证实测**：`git stash push -- crates/oss-server/src/console.rs`（回到本任务首笔提交的旧实现）→ 新用例恰 3 红
   （pagination / store_error / access_key），I-1 的两个认证用例照绿（auth 逻辑本就正确，新用例防的是将来回归）；pop 复原即全绿。
 - 四道闸（收尾轮）：fmt 无 diff · clippy 0 告警 · `cargo test -p oss-server` 6+4+8+1+1 全绿 · `--workspace -j 2` 全绿。
+
+### 改用 jwt-rust（用户指令；M1 收尾后）—— 定稿记录
+
+- **改动**：认证校验从手写 `auth()`（Bearer 解析 + `jsonwebtoken::decode::<Claims>`）换成 `jwt-rust 1.0.1`（feature `axum`，即同一作者的多框架 JWT 插件，内核仍基于 jsonwebtoken）。
+  同一份计划外的追加改动：`/api/v1` 整体叠 `jwt-rust` 的 `JwtLayer`（except 只有 `/login`）；`/aetherupload` 在 `JwtLayer` 外层加一个 `from_fn` 垫片，无 `Authorization` 头且 cookie `oss_token` 非空时把它写成 `Authorization: Bearer`，校验仍由 `JwtLayer` 做。
+  登录签发改 `JwtAuth::jwt().encode()`（同 secret，12h 走 `JwtConfig.default_expire`），`sub` = uid 十进制字符串，注册 `Claims` 结构体与手写 `auth()` 一并删除；`jsonwebtoken` 直接依赖降为 dev-dependency（只剩测试造伪签/过期令牌用）。
+  `AppState` 增 `jwt: Arc<JwtAuth>` —— 控制面与上传口同一个实例，token 两面通用（新用例 `login_token_works_on_both_surfaces` 钉住）。
+- **两处与「任务口径」的偏离（以源码为准）**：① `except` 写的是 `/login` 而非 `/api/v1/login` —— axum 的 `nest` 会先把前缀 `StripPrefix` 掉，`JwtLayer` 里 `req.uri().path()` 看到的是 `/login`（`route_layer` 在 `Route` 外层、`StripPrefix` 更外层）；
+  ② 401 响应体从纯文本 `unauthorized` 变为 jwt-rust 自带 JSON `{"code":401,"msg":…,"data":null}`（login 的 401 不在层内，仍是纯文本「用户名或密码错误」——登录页直接展示 body）。测试断言改以状态码为主，JSON 形态在 `aether_routes_reject_anonymous` 钉一次。
+- **配置边界**：jwt-rust 要求 secret ≥32 字符（256 位），`oss.toml` 的 dev 占位 `dev-only-change-me`（18）→ `dev-only-change-me-0123456789abcdef`（35）；短 secret 在 `AppState::new` 启动即 panic（配置错不拖到首个请求）。测试共用 secret 提为 `tests/common/mod.rs` 的 `JWT_SECRET`。
+- **验证**：四道闸全绿（fmt / clippy 0 告警 / `cargo test -p oss-server` / `--workspace -j 2`；oss-server 计数 6+4+5+10+1+1，aether_auth 4→5 条）；`web` 的 `npm run e2e` 3 用例全过（浏览器链：登录种 cookie → aetherupload 分块 XHR 走垫片 → register 走 Bearer）；curl 冒烟：匿名两面 401 JSON、错口令 401 纯文本、Bearer 打 `/api/v1/groups` 200、cookie/Bearer 打 `/aetherupload/preprocess` 均 200、token 载荷 `sub=1` 且 `exp-iat=43200`。
+- **Step 2/3 的代码块保留为改动前形态**（未按最终实现重写）：`console.rs` / `router.rs` 的现状以上面几条与本文件顶部 Task 14 追加条为准。
 
 ---
 
