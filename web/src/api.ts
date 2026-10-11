@@ -26,8 +26,11 @@ export class ApiError extends Error {
   }
 }
 
-/** 统一的控制台 API 客户端。401 时清 token 并跳登录页。 */
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * 裸 Response 版（下载等要原始 body 的场景）。401 处理（清 token + 跳登录）与
+ * 非 2xx 抛 ApiError 都在这里；api() 只是其上的 JSON 便捷层，两条路径行为一致。
+ */
+export async function rawApi(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers)
   const token = getToken()
   if (token) headers.set('authorization', `Bearer ${token}`)
@@ -42,6 +45,12 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError(401, msg)
   }
   if (!resp.ok) throw new ApiError(resp.status, (await resp.text()) || resp.statusText)
+  return resp
+}
+
+/** 统一的控制台 API 客户端。 */
+export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const resp = await rawApi(path, init)
   if (resp.status === 204) return undefined as T
   return (await resp.json()) as T
 }

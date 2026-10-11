@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.e2e.tsbuildinfo",
+    // e2e 里 page.evaluate 的回调引用 DOM 全局（navigator/clipboard 等），需要 DOM lib
+    "lib": ["ES2023", "DOM"]
+  },
+  "include": ["e2e/**/*.ts", "playwright.config.ts"]
+}

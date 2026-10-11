@@ -1,32 +1,18 @@
-# React + TypeScript + Vite
+# OSS 控制台（web）
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+「oss」对象存储的 Web 控制台：登录、桶与对象浏览（上传/下载/删除）、访问密钥管理。
+React 19 + antd 5 + TanStack Query + react-router，Vite 构建。项目总览与后端见根 [README](../README.md)。
 
-Currently, two official plugins are available:
+## 命令
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- `npm run dev` — 开发服务器（http://127.0.0.1:5173；`/api/`、`/aetherupload/` 代理到后端 9000）
+- `npm run build` — 类型检查（`tsc -b`）+ 产物输出到 `dist/`
+- `npm test` — 单元测试（vitest + jsdom）
+- `npm run e2e` — Playwright 关键路径；webServer 会自动拉起 vite 与后端 `cargo run -p oss-server`
+- `npm run lint` / `npm run typecheck:e2e` — oxlint 与 e2e 目录类型检查
 
-## React Compiler
+## 目录
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
-
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+- `src/api.ts` — API 客户端（`api`/`rawApi`，401 统一清 token 跳登录）与 token 存取（localStorage + cookie）
+- `src/pages/` — 登录 / 桶 / 对象 / 密钥页面；`src/upload/` — aetherupload 分块上传
+- `src/__tests__/`、`e2e/` — 单元测试与 Playwright 端到端用例

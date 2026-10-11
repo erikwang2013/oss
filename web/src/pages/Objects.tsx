@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, getToken, type ObjectList } from '../api'
+import { api, rawApi, type ObjectList } from '../api'
 import { humanSize } from '../format'
 import UploadPanel from '../upload/UploadPanel'
 
@@ -39,11 +39,7 @@ export default function Objects() {
 
   const download = async (key: string) => {
     try {
-      const resp = await fetch(
-        `/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`,
-        { headers: { authorization: `Bearer ${getToken() ?? ''}` } },
-      )
-      if (!resp.ok) throw new Error(await resp.text())
+      const resp = await rawApi(`/api/v1/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`)
       const blob = await resp.blob() // M1 大对象全量进内存的上限，M2 流式
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, api, getToken, setToken } from '../api'
+import { ApiError, api, getToken, rawApi, setToken } from '../api'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -69,5 +69,35 @@ describe('api()', () => {
     await api('/api/v1/buckets')
     const noBody = fetchMock.mock.calls[1][1] as RequestInit
     expect(new Headers(noBody.headers).has('content-type')).toBe(false)
+  })
+})
+
+describe('rawApi()', () => {
+  it('成功返回 Response 本体（不消费 body）且带 Authorization 头', async () => {
+    setToken('tok')
+    const fetchMock = vi.fn().mockResolvedValue(new Response('bytes', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const resp = await rawApi('/api/v1/buckets/b/objects/k')
+    expect(resp.status).toBe(200)
+    await expect(resp.text()).resolves.toBe('bytes')
+    const init = fetchMock.mock.calls[0][1] as RequestInit
+    expect(new Headers(init.headers).get('authorization')).toBe('Bearer tok')
+  })
+
+  it('401 时清 token 且抛 ApiError（与 api() 同一处理）', async () => {
+    setToken('tok')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('未登录', { status: 401 })))
+    const p = rawApi('/api/v1/buckets/b/objects/k')
+    await expect(p).rejects.toBeInstanceOf(ApiError)
+    await expect(p).rejects.toMatchObject({ status: 401, message: '未登录' })
+    expect(getToken()).toBeNull()
+  })
+
+  it('非 ok（非 401）抛 ApiError，不给 Response', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('内部错误', { status: 500 })))
+    const p = rawApi('/x')
+    await expect(p).rejects.toBeInstanceOf(ApiError)
+    await expect(p).rejects.toMatchObject({ status: 500, message: '内部错误' })
   })
 })

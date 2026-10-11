@@ -8,6 +8,9 @@ import Buckets from './pages/Buckets'
 import Objects from './pages/Objects'
 import Keys from './pages/Keys'
 
+// Shell/RequireAuth 与 router（本文件导出）同文件：Fast Refresh 对它只会整页刷新，
+// 拆文件只增样板，接受这一取舍
+// oxlint-disable-next-line react/only-export-components
 function Shell() {
   const loc = useLocation()
   const selected = loc.pathname.startsWith('/keys') ? '/keys' : '/buckets'
@@ -30,6 +33,7 @@ function Shell() {
   )
 }
 
+// oxlint-disable-next-line react/only-export-components
 function RequireAuth() {
   if (!getToken()) return <Navigate to="/login" replace />
   return <Shell />
