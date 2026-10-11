@@ -7,7 +7,7 @@ use oss_server::router::build_router;
 async fn health_endpoint_is_up() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
-    let app = build_router(st);
+    let app = build_router(st).unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -154,7 +154,7 @@
 
 **操作**：`CreateBucket`（PUT `/{bucket}`）、控制台 `POST /api/v1/buckets`
 
-**桶名规则**（不合规 → `InvalidBucketName`）：3–63 字节；仅小写字母、数字、`-`、`.`；首尾不得为 `-` 或 `.`；不含 `..`；不与已有桶重名；不同时形如 IP 地址。
+**桶名规则**（不合规 → `InvalidBucketName`）：3–63 字节；仅小写字母、数字、`-`、`.`；首尾不得为 `-` 或 `.`；不含 `..`；**不得以 `xn--` 开头**（S3 保留前缀）；不与已有桶重名；不同时形如 IP 地址。
 
 **行为**：内核建目录 + 控制面插 `buckets` 行（owner = 当前用户）。已存在 → `BucketAlreadyOwnedByYou`。
 

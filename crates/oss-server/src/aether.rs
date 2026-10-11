@@ -157,7 +157,11 @@ impl EventSink for IngestSink {
 }
 
 /// 组装 aetherupload 的运行时：暂存盘、分组、秒传索引、事件出口。
-pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
+/// 失败（Runtime 构造 / `_header` 目录建不出）返回 Err：serve 与运维命令统一走
+/// exit 1 + stderr，不再从启动路径 panic（101）。
+pub fn build_runtime(
+    state: &AppState,
+) -> Result<Arc<Runtime>, Box<dyn std::error::Error + Send + Sync>> {
     let mut cfg = Config::default();
     cfg.root_dir = state.cfg.staging_dir.to_string_lossy().into_owned();
     cfg.chunk_size = 1_000_000;
@@ -182,7 +186,7 @@ pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
     // upload_root 便恰好等于 staging_dir —— 相对（oss.toml 的 `./staging`）与绝对
     // （集成测试的 tempdir）两种配置下都成立。
     let runtime = Runtime::new(cfg, "")
-        .expect("aetherupload Runtime 构造失败")
+        .map_err(|e| format!("aetherupload Runtime 构造失败: {e}"))?
         .with_instant(Arc::new(SqlInstantStore::new(Arc::clone(&state.db))))
         // Arc<IngestSink> → Arc<dyn EventSink>：显式转换，否则 clone 的返回类型不做 unsize 推断
         .with_events(Arc::clone(&state.ingest) as Arc<dyn EventSink>); // 与 AppState 是同一个实例（测试打到生产那个）
@@ -201,8 +205,14 @@ pub fn build_runtime(state: &AppState) -> Arc<Runtime> {
 
     // `_header/`（断点文件目录）单独补建：list_groups 只在它自己新建根目录时顺带建 `_header/`，
     // 而启动自举早已建好 staging_dir —— 不补这一下，预处理会以 "fail to write head resource" 失败。
-    std::fs::create_dir_all(state.cfg.staging_dir.join(aetherupload::header::HEADER_DIR))
-        .expect("创建 aetherupload _header 目录失败");
+    std::fs::create_dir_all(state.cfg.staging_dir.join(aetherupload::header::HEADER_DIR)).map_err(
+        |e| {
+            format!(
+                "创建 aetherupload _header 目录（{}）失败: {e}",
+                state.cfg.staging_dir.display()
+            )
+        },
+    )?;
 
-    Arc::new(runtime)
+    Ok(Arc::new(runtime))
 }

@@ -5057,9 +5057,13 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
   由 panic(101) 改为用法 + exit 2。④ 自举建目录失败带路径上下文。⑤ 新增 `CARGO_BIN_EXE` 进程级用例（坏子命令 +
   非 UTF-8 参数 → exit 2、用法在 stderr），补上 main 薄壳此前无自动化覆盖的进程契约。README/USAGE 落 `days` 上界
   与 tmp 回收窗口的限定措辞。
-- **评审缓办（记录在案）**：`aether::build_runtime` 在 `_header` 目录建不出时 panic（exit 101）——serve 启动路径的
-  预存在行为（fail-fast），本提交把可达面扩到三条 cron 命令；改 `Result` 牵动 aether/state 多处，判 Minor 不阻塞，
-  随 M2（或下一个 aether 面改动）一并处理。
+- **评审缓办项已落地（遗留清理轮）**：`aether::build_runtime` 改返回 `Result`（Runtime 构造失败、`_header` 建目录失败
+  均 Err 带因），`router::build_router` 一并 Result 化——serve 与三条 cron 命令统一 exit 1 + stderr，不再 panic(101)；
+  测试调用点（19 处）同步 `.unwrap()`（含 `aether_ingest.rs` 的 `build_runtime` 调用）。`cli.rs` 两处内联
+  `&build_runtime(...)?` 会让 rustc 把 `&Runtime` 的期望类型透传进 `?` 而跳过 `&Arc<Runtime>` 的 deref 强转，
+  改为先 `let runtime` 再取引用（与 clean 分支同形）。
+- **实跑（四道闸）**：fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（108 测：oss-server 单测 10 +
+  集成 6/4/10/2/1/1；xl-s3 7+2+12；xl-store 53）。
 
 ---
 
@@ -5075,6 +5079,9 @@ git add tests/ README.md && git commit -m "test: M1 端到端验收脚本与运�
 - **`collect_keys` 跳过 + `tracing::warn!`**（带目录名与错误）：单个杂物目录不再打挂整桶列举，
   且不改变 `collect_keys` 对「桶被并发删除」的 `NoSuchBucket` 映射。与计划「已知风险」表
   「列举跳过无 meta 的目录」同向；规格 §4.1 未规定坏目录行为，无冲突。
+- **桶名保留前缀（遗留清理轮）**：`validate_bucket` 补 S3 规则「不得以 `xn--` 开头」（规格 §2.1 已同步增加该条）；
+  测试 `bucket_name_rules` 补两条（`xn--bucket` 拒、`a-xn--bucket` 过——只拦开头）。本文件 Task 1 的
+  `validate_bucket` 代码块按既有先例保留改动前形态（差异见上文「并入项 4」注记，本条再叠加一条）。
   这是 xl-store 首次实际使用 `tracing`（依赖此前只声明未用），依赖面不变、无新增。
 - **新增测试**：`layout::key_from_dir_name_rejects_invalid_rebuilt_keys`（`..__XLDIR__..` / `__XLDIR__etc` /
   `a__XLDIR____XLDIR__b` / 空串必须 Err）、`store::list_skips_invalid_object_dir_names`

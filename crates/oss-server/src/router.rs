@@ -16,7 +16,9 @@ use crate::state::AppState;
 use xl_s3::auth::SigV4Auth;
 use xl_s3::service::OssS3;
 
-pub fn build_router(state: AppState) -> Router {
+/// 组装全部路由。`build_runtime` 失败（暂存盘不可写等）向上传播：
+/// serve 与运维命令统一 exit 1 + stderr，不从启动路径 panic。
+pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     // s3s 0.17 的 builder 是 `&mut self` 风格，不能链式调用
     let mut s3_builder = S3ServiceBuilder::new(OssS3::new(
         Arc::clone(&state.store),
@@ -36,16 +38,17 @@ pub fn build_router(state: AppState) -> Router {
     // 鉴权层（规格 §0.1「会话 Cookie/JWT 覆盖层」）：cookie 垫片在最外层把 `oss_token`
     // 写成 Authorization，再交 JwtLayer 校验（与控制面同一个 JwtAuth 实例 → token 两面通用）。
     // 层序：后挂的 `.layer` 在更外层，先跑。
-    let aether = aetherupload::integrations::ecat::routes(crate::aether::build_runtime(&state))
+    let aether = aetherupload::integrations::ecat::routes(crate::aether::build_runtime(&state)?)
         .layer(JwtLayer::new(Arc::clone(&state.jwt)))
         .layer(middleware::from_fn(cookie_to_bearer));
 
-    Router::new()
+    let app = Router::new()
         .route("/health/live", get(|| async { "ok" }))
         .nest("/api/v1", console)
         .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
-        .with_state(state)
+        .with_state(state);
+    Ok(app)
 }
 
 /// cookie → Authorization 垫片：aetherupload 自带脚本的分块 XHR 只带 cookie（不开

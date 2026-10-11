@@ -37,6 +37,7 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > - Multipart 与 Range 未实现（M2）：≥8 MiB 的 `aws-cli s3 cp` 默认走 multipart → 501；Range 被忽略（200 + 全量）。
 >   变通：`aws configure set default.s3.multipart_threshold 268435456`。
 > - `x-amz-meta-*` 用户元数据**静默丢弃**（M2 接上）。
+> - 控制台「上传记录」是登记历史：对象或暂存文件被删后，记录行仍在（按设计，作审计线索）。
 > - `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须换成回环绑定与随机密钥
 >   （占位密钥可被用来伪造控制台与 `/aetherupload/*` 的 token；与 0.0.0.0 绑定合用即 LAN 风险面）。
 

@@ -31,7 +31,7 @@ async fn login_then_list_buckets() {
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
     st.store.create_bucket("alpha").await.unwrap();
-    let app = build_router(st);
+    let app = build_router(st).unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -73,7 +73,7 @@ async fn wrong_password_is_401() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let app = build_router(st);
+    let app = build_router(st).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -108,7 +108,7 @@ async fn register_upload_hit_is_204_miss_is_404() {
         )
         .await
         .unwrap();
-    let app = build_router(st);
+    let app = build_router(st).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -168,7 +168,7 @@ async fn register_upload_db_failure_is_500() {
         .execute(st.db.pool())
         .await
         .unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let token = login_token(&base).await;
 
     let resp = reqwest::Client::new()
@@ -194,7 +194,7 @@ async fn register_upload_db_failure_is_500() {
 #[tokio::test]
 async fn all_routes_reject_anonymous() {
     let dir = tempfile::tempdir().unwrap();
-    let base = serve(build_router(state(dir.path()).await)).await;
+    let base = serve(build_router(state(dir.path()).await).unwrap()).await;
     let client = reqwest::Client::new();
 
     let cases: Vec<(reqwest::Method, &str, Option<serde_json::Value>)> = vec![
@@ -271,7 +271,7 @@ fn unix_now() -> i64 {
 #[tokio::test]
 async fn forged_or_expired_token_is_401() {
     let dir = tempfile::tempdir().unwrap();
-    let base = serve(build_router(state(dir.path()).await)).await;
+    let base = serve(build_router(state(dir.path()).await).unwrap()).await;
     let client = reqwest::Client::new();
 
     let forged = sign_token("not-the-secret", unix_now() + 3600);
@@ -300,7 +300,7 @@ async fn store_error_status_codes() {
         .put_object("alpha", "keep.txt", bytes::Bytes::from_static(b"x"), None)
         .await
         .unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let token = login_token(&base).await;
     let client = reqwest::Client::new();
 
@@ -345,7 +345,7 @@ async fn objects_pagination_follows_cursor() {
         .put_object("alpha", "b.txt", bytes::Bytes::from_static(b"b"), None)
         .await
         .unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let token = login_token(&base).await;
     let client = reqwest::Client::new();
 
@@ -387,7 +387,7 @@ async fn list_groups_returns_configured_groups() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await; // common::state() 里已配 file → files
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let token = login_token(&base).await;
 
     let groups: serde_json::Value = reqwest::Client::new()
@@ -412,7 +412,7 @@ async fn access_key_validation_and_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let token = login_token(&base).await;
     let client = reqwest::Client::new();
     let url = format!("{base}/api/v1/access-keys");

@@ -74,7 +74,7 @@ async fn aether_routes_reject_anonymous() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let client = reqwest::Client::new();
 
     let cases: Vec<(reqwest::Method, &str)> = vec![
@@ -102,7 +102,7 @@ async fn cookie_or_bearer_token_passes() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let client = reqwest::Client::new();
 
     let login: serde_json::Value = client
@@ -159,7 +159,7 @@ async fn login_token_works_on_both_surfaces() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let client = reqwest::Client::new();
 
     let login: serde_json::Value = client
@@ -201,7 +201,7 @@ async fn empty_or_garbage_credential_is_401() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let client = reqwest::Client::new();
     let url = format!("{base}/aetherupload/preprocess");
 
@@ -236,7 +236,7 @@ async fn bad_bearer_shadows_valid_cookie() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let client = reqwest::Client::new();
 
     let login: serde_json::Value = client
@@ -268,7 +268,7 @@ async fn forged_or_expired_token_is_401() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st)).await;
+    let base = serve(build_router(st).unwrap()).await;
     let client = reqwest::Client::new();
 
     let forged = sign_token("not-the-secret", unix_now() + 3600);

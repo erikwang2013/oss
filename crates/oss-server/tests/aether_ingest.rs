@@ -154,7 +154,7 @@ async fn sink_without_bucket_skips_ingest() {
 async fn build_runtime_prepares_staging_dirs() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
-    let _rt = oss_server::aether::build_runtime(&st);
+    let _rt = oss_server::aether::build_runtime(&st).unwrap();
 
     assert!(
         st.cfg.staging_dir.join("_header").is_dir(),

@@ -70,7 +70,7 @@ pub async fn run(
     match cmd {
         Command::Serve => {
             let listen = state.cfg.listen.clone();
-            let router = crate::router::build_router(state);
+            let router = crate::router::build_router(state)?;
             let mut app = ecat::App::builder()
                 .name("oss")
                 .server(ecat::transport_http::HttpServer::new(listen).router(router))
@@ -80,16 +80,20 @@ pub async fn run(
         }
         // 注：`build_runtime` 自己已经跑过一次 `list_groups`（把分组目录建出来），
         // 所以这里再调时通常只输出「Group-Directory List:」——目录确已就位。
-        Command::Groups => Ok(exit_code(aetherupload::console::list_groups(
-            &crate::aether::build_runtime(&state),
-            &mut say,
-        ))),
-        Command::Build => Ok(exit_code(aetherupload::console::build_redis_hashes(
-            &crate::aether::build_runtime(&state),
-            &mut say,
-        ))),
+        Command::Groups => {
+            let runtime = crate::aether::build_runtime(&state)?;
+            Ok(exit_code(aetherupload::console::list_groups(
+                &runtime, &mut say,
+            )))
+        }
+        Command::Build => {
+            let runtime = crate::aether::build_runtime(&state)?;
+            Ok(exit_code(aetherupload::console::build_redis_hashes(
+                &runtime, &mut say,
+            )))
+        }
         Command::Clean { days } => {
-            let runtime = crate::aether::build_runtime(&state);
+            let runtime = crate::aether::build_runtime(&state)?;
             let code =
                 aetherupload::console::clean_up_directory(&runtime, &mut |m| println!("{m}"), days);
 

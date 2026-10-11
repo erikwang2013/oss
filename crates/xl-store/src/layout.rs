@@ -25,6 +25,8 @@ pub fn validate_bucket(name: &str) -> Result<()> {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
     let ok_edges = !name.starts_with(['-', '.']) && !name.ends_with(['-', '.']);
     let ok_no_dotdot = !name.contains("..");
+    // 不得以 `xn--` 开头（S3 的保留前缀规则，规格 §2.1）
+    let ok_no_xn = !name.starts_with("xn--");
     // 不得形如 IPv4 地址（规格 §2.1；S3 的既有规则，见 aws 文档 "must not be formatted as an IP address"）
     let parts: Vec<&str> = name.split('.').collect();
     let looks_like_ipv4 = parts.len() == 4
@@ -36,7 +38,7 @@ pub fn validate_bucket(name: &str) -> Result<()> {
     if looks_like_ipv4 {
         return reject();
     }
-    if ok_len && ok_chars && ok_edges && ok_no_dotdot {
+    if ok_len && ok_chars && ok_edges && ok_no_dotdot && ok_no_xn {
         Ok(())
     } else {
         reject()
@@ -184,6 +186,9 @@ mod tests {
         // S3 规则：不得形如 IP 地址（规格 §2.1）
         assert!(validate_bucket("192.168.1.1").is_err());
         assert!(validate_bucket("1.2.3.4.5").is_ok()); // 五段不是 IPv4，合法
+        // S3 规则：不得以 xn-- 开头（保留前缀，规格 §2.1）
+        assert!(validate_bucket("xn--bucket").is_err());
+        assert!(validate_bucket("a-xn--bucket").is_ok()); // 只拦开头
     }
 
     #[test]
