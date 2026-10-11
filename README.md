@@ -112,8 +112,9 @@ cd web && npm install && npm run dev
 ```bash
 oss-server groups        # 建分组目录（幂等；启动自举也会做，上传报笼统错误时先跑它确认）
 oss-server build         # 按磁盘现状重建秒传索引（先清旧索引，再全量扫描暂存盘）
-oss-server clean <days>  # 按 mtime 回收 days 天前的临时文件：
-                         #   暂存盘 `_header/` 与 `*.part`，外加数据盘 `.oss.sys/tmp/` 的孤儿上传目录
+oss-server clean <days>  # 按 mtime 回收 days 天前的残骸：
+                         #   暂存盘 `_header/` 与 `*.part`；数据盘 `.oss.sys/{tmp,trash}` 孤儿
+                         #   与各对象目录下未被引用的版本目录（含未完成的上传暂存区）
 ```
 
 建议 cron（每日 `clean 1` 与 `build` 各一次；`scrub --repair` 每周一次——那是 M4 的命令，见功能规格 §18.1）：

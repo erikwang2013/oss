@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, PartRef, Version, XlMeta};
 
+mod gc;
 mod list;
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
@@ -80,10 +81,13 @@ impl Store {
         for sub in ["tmp", "trash", "locks"] {
             tokio::fs::create_dir_all(layout::sys_dir(&cfg.root, sub)).await?;
         }
-        Ok(Self {
+        let store = Self {
             cfg,
             locks: Mutex::new(HashMap::new()),
-        })
+        };
+        // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
+        store.reap_transient().await?;
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {

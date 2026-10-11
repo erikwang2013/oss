@@ -785,3 +785,85 @@ async fn get_object_range_reads_exact_slice() {
     let reversed = std::ops::Range { start: 5, end: 3 };
     assert!(s.get_object_range("alpha", "k", reversed).await.is_err());
 }
+
+// ---- M2a Task 4: 孤儿 / 垃圾回收 ----
+
+use std::time::{Duration, SystemTime};
+
+fn set_mtime(path: &std::path::Path, t: SystemTime) {
+    std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+}
+
+#[tokio::test]
+async fn open_reaps_tmp_and_trash_transient() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", Bytes::from_static(b"one"), None)
+        .await
+        .unwrap();
+    // 摆 tmp 孤儿与 trash 残留（含一个「活引用」的对照：活版本目录在对象目录里，不受影响）
+    let tmp = layout::sys_dir(d.path(), "tmp").join("orphan");
+    let trash = layout::sys_dir(d.path(), "trash").join("old");
+    tokio::fs::create_dir_all(&tmp).await.unwrap();
+    tokio::fs::write(tmp.join("part.1"), b"junk").await.unwrap();
+    tokio::fs::create_dir_all(&trash).await.unwrap();
+
+    let s2 = Store::open(StoreConfig::new(d.path())).await.unwrap(); // 重开 = 重启
+    assert!(!tmp.exists() && !trash.exists(), "启动自检应清空 tmp/trash");
+    assert_eq!(s2.head_object("alpha", "k").await.unwrap().size, 3); // 活数据不动
+    drop(s);
+}
+
+#[tokio::test]
+async fn reap_stale_removes_unreferenced_dirs_by_mtime() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", Bytes::from_static(b"one"), None)
+        .await
+        .unwrap();
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+
+    // ① 无引用旧目录（mtime 拨老）→ 删 ② 无引用新目录（模拟在途 MPU 暂存区）→ 留
+    let stale = obj_dir.join("dangling-old");
+    let fresh = obj_dir.join("mpu-in-flight");
+    tokio::fs::create_dir_all(&stale).await.unwrap();
+    tokio::fs::write(stale.join("part.1"), b"junk")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&fresh).await.unwrap();
+    set_mtime(&stale, SystemTime::now() - Duration::from_secs(8 * 86_400));
+
+    let due = SystemTime::now() - Duration::from_secs(7 * 86_400);
+    assert_eq!(s.reap_stale(due).await.unwrap(), 1);
+    assert!(!stale.exists(), "过期的未引用目录应被删");
+    assert!(fresh.exists(), "新鲜目录（可能在途 MPU）不得删");
+    assert_eq!(
+        s.head_object("alpha", "k").await.unwrap().size,
+        3,
+        "活版本不受影响"
+    );
+}
+
+#[tokio::test]
+async fn reap_stale_skips_object_with_corrupt_meta() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    let dangling = obj_dir.join("dangling-old");
+    tokio::fs::create_dir_all(&dangling).await.unwrap();
+    // 损坏的 xl.meta：内容不可解码
+    tokio::fs::write(obj_dir.join(meta::META_FILE), b"\x01garbage")
+        .await
+        .unwrap();
+    set_mtime(
+        &dangling,
+        SystemTime::now() - Duration::from_secs(8 * 86_400),
+    );
+
+    let due = SystemTime::now() - Duration::from_secs(7 * 86_400);
+    assert_eq!(s.reap_stale(due).await.unwrap(), 0);
+    assert!(
+        dangling.exists(),
+        "读 meta 失败的对象应整体跳过（保守不删）"
+    );
+}

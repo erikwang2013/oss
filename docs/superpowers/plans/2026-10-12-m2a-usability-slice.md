@@ -288,7 +288,7 @@ let info = self.store.put_object_stream_with_meta(&bucket, &key, Box::pin(limite
 - **启动自检 → `reap_transient()`**：清空 `.oss.sys/tmp/` 与 `.oss.sys/trash/` 全部条目（启动时进程内无在途写入；tmp 里只有崩溃残留、trash 里都是无人引用的旧版本）。**不碰对象目录**——uuid 形状目录可能是客户端仍在续传的 MPU 暂存区（S3 客户端可跨服务重启续传），启动即删会造成在途上传失败；对象目录的垃圾交 mtime 判定（下一步）。
 - **`clean <days>` → `reap_stale(due)`**：按 mtime 回收 (a) trash/ 条目、(b) `.oss.sys/tmp/` 条目、(c) **每个对象目录下未被 xl.meta 引用的子目录**（含 MPU 暂存区——规格 §multipart「未完成上传占用磁盘，clean 按 mtime 回收（默认 7 天）」）。判定：读该对象 xl.meta（**读失败/损坏 → 跳过不删**，保守优先）；引用集 = 所有版本当前形态的 `v.part.uuid`（**Task 5 落地后改为 `effective_parts()`**——Task 4 先于 Task 5 提交，此处按当时代码形态写）；子目录名 ∈ 引用集 → 保留；否则看 mtime < due → 删除。mtime 用目录自身（MPU 每次 part 上传会更新目录 mtime——part 文件创建/覆盖会刷新父目录 mtime ✓；判定窗口外长挂上传被删则上传方收 NotFound/NoSuchUpload，与 S3 一致，文档化）。
 
-- [ ] **Step 1: 写失败的测试**（`store/tests.rs`）：
+- [x] **Step 1: 写失败的测试**（`store/tests.rs`）：
 
 ```rust
 #[tokio::test]
@@ -319,7 +319,7 @@ async fn reap_stale_skips_object_with_corrupt_meta() {
 }
 ```
 
-- [ ] **Step 2: 实现 `gc.rs`**：
+- [x] **Step 2: 实现 `gc.rs`**：
 
 ```rust
 //! 垃圾回收：启动瞬时回收（tmp/trash）与 clean 的按龄回收（trash/tmp/未引用子目录）。
@@ -338,8 +338,8 @@ impl Store {
 `store.rs::open`：建目录后调 `self.reap_transient().await?`，失败仅 warn 不阻启动？——**裁决：失败向上传播**（启动即异常应当可见；tmp 清不掉通常意味着盘坏了）。
 `lib.rs` re-export `SweepReport`。`cli.rs`：clean 分支改为 `staging 扫描（现状）+ state.store.reap_stale(due)`，输出两者计数；`reap_stale_tmp` 保留（staging 盘在 store 之外）但 `.oss.sys/tmp` 部分移除（并入内核，防两处口径漂移）。
 
-- [ ] **Step 3: 跑测试** + `ops_cli` 集成用例更新（clean 现在还应删 trash 与未引用子目录——补断言）。
-- [ ] **Step 4: 提交**——`git commit -m "feat: 孤儿回收——启动自检清 tmp/trash；clean 按 mtime 回收未引用版本目录与未完成 MPU 暂存区"`
+- [x] **Step 3: 跑测试** + `ops_cli` 集成用例更新（clean 现在还应删 trash 与未引用子目录——补断言）。
+- [x] **Step 4: 提交**——`git commit -m "feat: 孤儿回收——启动自检清 tmp/trash；clean 按 mtime 回收未引用版本目录与未完成 MPU 暂存区"`
 
 ---
 
@@ -538,3 +538,15 @@ async fn abort_multipart_upload / list_parts  // 直通；ListPartsOutput 填 bu
   不退化成 500）。测试含本地 `Chunks` 假流（多分块、超限、中途出错三条路径）+ tmp 无残留断言。
 - 依赖面：`http` 从 xl-s3 的 dev-deps 提升为直接依赖（s3s 不 re-export StatusCode；http 本就在依赖树，非新增 crate）。
 - 实跑：xl-store 56/56 ✓、xl-s3 27/27 ✓（均真实退出码 0）；fmt/clippy 随提交前跑。
+
+### Task 4（孤儿/垃圾回收）
+
+- 实际形态：新增 `store/gc.rs`——`reap_transient`（open 时清 tmp/trash，失败向上传播）+
+  `reap_stale(due)`（trash/tmp 按 mtime + 逐对象目录「未引用且过期」子目录；无 meta 按零引用、
+  损坏 meta 整对象跳过）。**偏差**：未引入 `SweepReport` 结构——两个 usize 直接返回，CLI 分开打印，
+  少一层没有第二实现的抽象。
+- `cli.rs`：clean 分支接 `store.reap_stale`；`reap_stale_tmp` 与其单测**退役**（职责并入内核，
+  防两处口径漂移）；等价用例已在 `xl-store` 侧（`open_reaps_tmp_and_trash_transient` /
+  `reap_stale_removes_unreferenced_dirs_by_mtime` / `reap_stale_skips_object_with_corrupt_meta`，
+  mtime 用 std `File::set_modified`，不再依赖 `touch`）。`ops_cli` 的 clean 用例未改（行为等价）✓。
+- 实跑：xl-store 59/59 ✓、oss-server 各目标全绿（含 ops_cli clean 路径经新内核回收）✓；退出码 0。
