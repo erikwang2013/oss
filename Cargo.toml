@@ -26,7 +26,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 
 # 发布版依赖：绝不加 "0.8" 之外的 axum —— ecat 与 aetherupload 都锚定 axum 0.8
-axum = { version = "0.8", default-features = false }
+# features 显式声明 oss-server 实际用到的（json=Json、query=Query、tokio=serve、http1=serve 的协议）；
+# 不依赖 ecat/aetherupload 的特性合并把 default-features=false 悄悄补齐。
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 s3s = "0.17"
 aetherupload-rust = { version = "1.0.4", features = ["ecat"] }
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
