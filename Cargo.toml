@@ -31,5 +31,7 @@ tracing = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 s3s = "0.17"
 aetherupload-rust = { version = "3.0.0", features = ["ecat"] }
+reed-solomon-erasure = "6.0.0"
+crc32c = "0.6"
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }

@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, ChecksumRecord, XlMeta};
 
+pub mod ec;
 mod gc;
 mod list;
 mod mpu;

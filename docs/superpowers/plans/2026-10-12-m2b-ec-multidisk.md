@@ -60,16 +60,16 @@ tests/e2e_s3.sh        [改] 拔盘/断电为人工长跑入口；既有 14 步�
 
 **Files:** Modify: `crates/xl-store/src/store.rs`；Create: `crates/xl-store/src/store/put.rs`、`store/read.rs`
 
-- [ ] **Step 1:** `put.rs`：迁入 `put_object` / `put_object_with_meta` / `put_object_stream` / `put_object_stream_with_meta` / `write_meta` / `read_meta`（`read_meta` 同时被 gc/mpu 用——迁走后需 `pub(in crate::store)` 或留在 store.rs；**裁决：read_meta/write_meta 留 store.rs**，其余迁 put.rs）。
-- [ ] **Step 2:** `read.rs`：迁入 `get_object` / `get_object_range` / `head_object` / `load_object_info`。
-- [ ] **Step 3:** store.rs 保留：`open`（自举/自检）、`root/lock_for/ensure_bucket`、桶操作、`delete/copy_object`、`now_nanos`。目标 store.rs ≤ 300 行。
-- [ ] **Step 4:** `cargo test -p xl-store` 全绿（**行为零变化**是本 task 唯一验收）；提交 `refactor(xl-store): store.rs 拆分——put/read 迁出，pub 面不变`。
+- [x] **Step 1:** `put.rs`：迁入 `put_object` / `put_object_with_meta` / `put_object_stream` / `put_object_stream_with_meta` / `write_meta` / `read_meta`（`read_meta` 同时被 gc/mpu 用——迁走后需 `pub(in crate::store)` 或留在 store.rs；**裁决：read_meta/write_meta 留 store.rs**，其余迁 put.rs）。
+- [x] **Step 2:** `read.rs`：迁入 `get_object` / `get_object_range` / `head_object` / `load_object_info`。
+- [x] **Step 3:** store.rs 保留：`open`（自举/自检）、`root/lock_for/ensure_bucket`、桶操作、`delete/copy_object`、`now_nanos`。目标 store.rs ≤ 300 行。
+- [x] **Step 4:** `cargo test -p xl-store` 全绿（7d64681；store.rs 576→267 行）（**行为零变化**是本 task 唯一验收）；提交 `refactor(xl-store): store.rs 拆分——put/read 迁出，pub 面不变`。
 
 ## Task 2: EC 编解码模块（`store/ec.rs`）
 
 **Files:** Modify: `Cargo.toml`（workspace）、`crates/xl-store/Cargo.toml`；Create: `crates/xl-store/src/store/ec.rs`；Modify: `store.rs`（`mod ec;`）
 
-- [ ] **Step 1: 写失败的测试**（`ec.rs` 内 `#[cfg(test)]`）：
+- [x] **Step 1: 写失败的测试**（`ec.rs` 内 `#[cfg(test)]`）：
 
 ```rust
 #[test]
@@ -100,8 +100,8 @@ fn flipped_shard_byte_is_detected_by_crc32c() {
 }
 ```
 
-- [ ] **Step 2: 确认失败**（`encode` 未定义）。
-- [ ] **Step 3: 实现**。形态：
+- [x] **Step 2: 确认失败**（`encode` 未定义）。
+- [x] **Step 3: 实现**。形态：
 
 ```rust
 //! EC 编解码与分片校验。M2b 先整份进内存（ponytail: 大对象内存峰值为 payload + 分片；
@@ -118,7 +118,7 @@ pub fn reconstruct(shards: &[Option<Vec<u8>>], cfg: EcConfig) -> Result<Vec<u8>>
 pub fn crc32c_of(shard: &[u8]) -> u32;
 ```
 
-- [ ] **Step 4:** `cargo test -p xl-store ec` 全绿；提交 `feat(xl-store): EC 8+4 编解码模块（reed-solomon-erasure 6.0.0 + crc32c）`。
+- [x] **Step 4:** `cargo test -p xl-store ec` 全绿；提交 `feat(xl-store): EC 8+4 编解码模块（reed-solomon-erasure 6.0.0 + crc32c）`。
 
 ## Task 3: `xl.meta` 演进（DataLayout / Inline）
 
@@ -310,7 +310,7 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 | 风险 | 处置 |
 |---|---|
-| rs-erasure 6.0.0 老依赖（parking_lot 0.11/lru 0.7 等）与现代树冲突或编译不过 | 已核实备选 `reed-solomon-simd 3.1.0`（MSRV 1.82）；切换判据：`cargo check` 出现其依赖树的 edition-2024/API 错误即切，改动集中在 ec.rs（顶层语义同类） |
+| rs-erasure 6.0.0 老依赖（parking_lot 0.11/lru 0.7 等）与现代树冲突或编译不过 | **已实测结案（Task 2）**：6.0.0 及其老树（ahash 0.7/parking_lot 0.11/lru 0.7/instant/libm）在本工作区 2024 edition 工具链下编译通过，**不切** simd 备选（备选与判据保留供将来参考） |
 | EC 全内存（写：payload+12 片；读：重建整份） | ponytail 注释明示；`inline_threshold` 与「单次 PUT ≤ max_put_bytes」共同限定峰值；M2b-3 之后（M2c/M3）用 `ShardByShard` 分块 encode/decode + range 按需重建 |
 | 写 quorum 语义（≥ data+1）在并发失败下的回滚复杂性 | 回滚 = 删已写片目录（未提交前不可见，天然安全）；用例覆盖 8 片成功回滚 |
 | 目录 fsync 在非 ext4/XFS 上语义不一（EINVAL 等） | 忽略并 warn；文档标注「断电零丢失需按文件系统复核」 |
