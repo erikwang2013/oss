@@ -246,8 +246,9 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 **e2e 实弹（e16f481）**：`tests/e2e_s3.sh` 17/17 步全绿（脚本实况 17 步头 = 编号 1–14 含 11b/11c/11d 子步；此前文档里的「14 步/19 步」为计数漂移，以脚本实况为准），脚本零改动；额外人工探针：1024 B/127680 B → 内联（目录仅 xl.meta），131072 B/1 MiB → 12 片 EC，四种形态读回/ETag/Range/CopyObject 全对，6 路并发覆写无撕裂。
 
 ### 切片一收尾
-- [x] 四闸：fmt · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · `tests/e2e_s3.sh` 17 步回归（S3 面行为不变；修复轮后复跑见下）
-- [ ] 提交切片总结（或并入 Task 6 提交），计划勾选与定稿记录同步
+- [x] 四闸：fmt · clippy 0 告警 · `cargo test --workspace -j 2` 全绿（151 测）· `tests/e2e_s3.sh` 17 步回归（S3 面行为不变；修复轮后复跑见下）
+- [x] 控制台 e2e（四闸之外的本项目惯例）：Playwright 4/4 ×2 轮全绿；另用浏览器实弹传 300 KiB → `part.1.0..11` 12 片（8×38400B=307200）+ xl.meta，下载 sha256 逐字节一致——aether ingest 的 EC 写路径端到端成立
+- [x] 提交切片总结（并入本文档定稿记录，见下）
 
 ---
 
@@ -351,7 +352,7 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 ### 切片一（M2b-1，单盘 EC + 内联）——2026-10-12
 
 - **提交序列**：Task 1 拆分（7d64681）→ Task 2 EC 模块（9bfd57e）→ Task 3 meta 扩展 + golden 第三次重算 f28d2848…（c70887c）→ Task 4+5 写读路径 + 内联（55a206d，合并提交理由见 Task 4 Step 4 注）→ Task 6 MPU 收口（e16f481）→ 评审修复轮（F1–F6）。
-- **四闸**：fmt 无 diff；clippy `-p xl-store --all-targets -- -D warnings` 0 告警；`cargo test --workspace -j 2` 全绿（146→148 测）；`tests/e2e_s3.sh` 17/17 步（e2e 子代理实弹，脚本零改动，四种形态人工探针 + 6 路并发覆写无撕裂）。
+- **四闸**：fmt 无 diff；clippy `-p xl-store --all-targets -- -D warnings` 0 告警；`cargo test --workspace -j 2` 全绿（151 测，含评审轮新增 3 例）；`tests/e2e_s3.sh` 17/17 步 ×2 轮（e16f481 与修复轮 be10706 各一轮，行为零差异；e2e 子代理实弹，脚本零改动，四种形态人工探针 + inline↔EC 12 轮覆写并发读 40 次无撕裂）；控制台 Playwright 4/4 ×2 轮 + 浏览器 300 KiB 上传 EC 探针（aether ingest 端到端）。
 - **与计划差异**（均有落地裁决段详述）：不收全再分叉（保流式语义）；不加 ShardsUnavailable；Task 4/5 合并编译轮；Task 6 改为「拼装 → 新目录」并加逐段字节核验；评审轮 F1/F2/F4/F5/F6 修复。
 - **遗留**：F7（upload_part 无锁窗口，M2a 已存在）；complete 的 P 级内存悬崖（随 ShardByShard）；README 存储形态说明待 M2b-2（多盘真冗余落地）后一并更新——单盘 EC 无冗余收益，提前宣传会误导。
 - **下一步**：切片二（M2b-2 多盘：Task 7–9，含 `[ec] enabled=false` 单盘兼容裁决的落地）。
