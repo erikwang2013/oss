@@ -1275,3 +1275,143 @@ async fn response_content_params_override_headers() {
     let exp = over.expires.expect("expires 应被设置");
     assert!(exp.ends_with("GMT"), "HttpDate 形态: {exp}");
 }
+
+#[tokio::test]
+async fn checksum_verified_before_commit_and_written_back() {
+    // S3 协议补全 Task 3：x-amz-checksum-* / Content-MD5 —— 提交前校验（fail-closed）+ GET/HEAD 回写。
+    // 期望值用 s3s 自己的 ChecksumHasher 现算（免引 base64 依赖，也顺带对拍线格式）。
+    use s3s::checksum::ChecksumHasher;
+
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let body = b"payload-123";
+    let mut h = ChecksumHasher {
+        sha256: Some(Default::default()),
+        md5: Some(Default::default()),
+        ..Default::default()
+    };
+    h.update(body);
+    let sums = h.finalize();
+    let sha256_b64 = sums.checksum_sha256.clone().unwrap();
+    let md5_b64 = sums.checksum_md5.clone().unwrap();
+
+    // ① 正确 SHA256 → 提交成功，GET/HEAD 回写同一 base64
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "ck".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+        checksum_sha256: Some(sha256_b64.clone()),
+        checksum_algorithm: Some("SHA256".to_string().into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "ck".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.checksum_sha256.as_deref(), Some(sha256_b64.as_str()));
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "ck".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(got.checksum_sha256.as_deref(), Some(sha256_b64.as_str()));
+
+    // ② 错值 → BadDigest，且对象**不存在**（提交点前 fail-closed）
+    let err = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "bad".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+            checksum_sha256: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::BadDigest);
+    assert!(
+        s3.head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "bad".into(),
+            ..Default::default()
+        }))
+        .await
+        .is_err(),
+        "校验失败不得留下对象"
+    );
+
+    // ③ Content-MD5：正确提交 + 回写 checksum_md5；错值 BadDigest
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "md5".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+        content_md5: Some(md5_b64.clone()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let head_md5 = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "md5".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head_md5.checksum_md5.as_deref(), Some(md5_b64.as_str()));
+    let err_md5 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "md5bad".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+            content_md5: Some("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err_md5.code(), &s3s::S3ErrorCode::BadDigest);
+
+    // ④ 多个校验和并存 → InvalidRequest（明确拒绝，不静默取一）
+    let err_conflict = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "conflict".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+            content_md5: Some(md5_b64.clone()),
+            checksum_sha256: Some(sha256_b64.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err_conflict.code(), &s3s::S3ErrorCode::InvalidRequest);
+
+    // ⑤ 只声明算法无值 → InvalidRequest
+    let err_algo_only = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "algonly".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+            checksum_algorithm: Some("SHA256".to_string().into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err_algo_only.code(), &s3s::S3ErrorCode::InvalidRequest);
+}

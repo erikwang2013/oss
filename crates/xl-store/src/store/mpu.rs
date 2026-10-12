@@ -258,6 +258,7 @@ impl Store {
             user_metadata: mpu.user_metadata.clone(),
             part: first, // 兼容位：首段副本
             parts: Some(refs),
+            checksum: None, // multipart 组合校验和留 M2b
         };
         let meta = XlMeta {
             object_key: key.to_string(),
@@ -290,6 +291,7 @@ impl Store {
             content_type: mpu.content_type,
             last_modified_nanos: now,
             user_metadata: mpu.user_metadata,
+            checksum: None,
         })
     }
 

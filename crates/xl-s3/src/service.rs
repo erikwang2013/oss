@@ -4,11 +4,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
 use http::StatusCode;
+use s3s::checksum::ChecksumHasher;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
+use xl_store::meta::ChecksumRecord;
 use xl_store::store::{ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
@@ -80,6 +85,190 @@ fn stream_err_to_s3(
         return s3s::s3_error!(IncompleteBody, "failed to read request body");
     }
     to_s3_error(e)
+}
+
+/// 校验和算法（本计划覆盖 s3s 输入里显式声明的那几种；组合语义留 M2b）。
+#[derive(Debug, Clone, Copy)]
+enum ChecksumAlgo {
+    Md5,
+    Crc32,
+    Crc32c,
+    Sha1,
+    Sha256,
+    Sha512,
+    Crc64Nvme,
+}
+
+impl ChecksumAlgo {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Md5 => "MD5",
+            Self::Crc32 => "CRC32",
+            Self::Crc32c => "CRC32C",
+            Self::Sha1 => "SHA1",
+            Self::Sha256 => "SHA256",
+            Self::Sha512 => "SHA512",
+            Self::Crc64Nvme => "CRC64NVME",
+        }
+    }
+
+    fn enable(self, h: &mut ChecksumHasher) {
+        match self {
+            Self::Md5 => h.md5 = Some(Default::default()),
+            Self::Crc32 => h.crc32 = Some(Default::default()),
+            Self::Crc32c => h.crc32c = Some(Default::default()),
+            Self::Sha1 => h.sha1 = Some(Default::default()),
+            Self::Sha256 => h.sha256 = Some(Default::default()),
+            Self::Sha512 => h.sha512 = Some(Default::default()),
+            Self::Crc64Nvme => h.crc64nvme = Some(Default::default()),
+        }
+    }
+
+    fn extract(self, c: &Checksum) -> Option<String> {
+        match self {
+            Self::Md5 => c.checksum_md5.clone(),
+            Self::Crc32 => c.checksum_crc32.clone(),
+            Self::Crc32c => c.checksum_crc32c.clone(),
+            Self::Sha1 => c.checksum_sha1.clone(),
+            Self::Sha256 => c.checksum_sha256.clone(),
+            Self::Sha512 => c.checksum_sha512.clone(),
+            Self::Crc64Nvme => c.checksum_crc64nvme.clone(),
+        }
+    }
+}
+
+/// 从请求里摘出「唯一」声明的校验和（Content-MD5 与 `x-amz-checksum-*` 家族）。
+/// 多值并存且不同 → InvalidRequest（S3 未定义交叉校验，明确拒绝优于静默取一）；
+/// 只声明算法而无值 → InvalidRequest（CLI 恒带值；无值无法校验，不猜）。
+fn declared_checksum(
+    input: &PutObjectInput,
+) -> Result<Option<(ChecksumAlgo, String)>, s3s::S3Error> {
+    let mut declared: Vec<(ChecksumAlgo, String)> = Vec::new();
+    let mut push = |algo: ChecksumAlgo, v: &Option<String>| {
+        if let Some(v) = v {
+            declared.push((algo, v.clone()));
+        }
+    };
+    push(ChecksumAlgo::Md5, &input.content_md5);
+    push(ChecksumAlgo::Md5, &input.checksum_md5);
+    push(ChecksumAlgo::Crc32, &input.checksum_crc32);
+    push(ChecksumAlgo::Crc32c, &input.checksum_crc32c);
+    push(ChecksumAlgo::Sha1, &input.checksum_sha1);
+    push(ChecksumAlgo::Sha256, &input.checksum_sha256);
+    push(ChecksumAlgo::Sha512, &input.checksum_sha512);
+    push(ChecksumAlgo::Crc64Nvme, &input.checksum_crc64nvme);
+
+    match declared.len() {
+        0 => {
+            if input.checksum_algorithm.is_some() {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "checksum algorithm declared without a value"
+                ));
+            }
+            Ok(None)
+        }
+        1 => Ok(Some(declared.remove(0))),
+        // 多值并存：S3 未定义交叉校验，明确拒绝优于静默取一（算法名进日志便于排查）
+        _ => {
+            tracing::warn!(
+                algorithms = ?declared.iter().map(|(a, _)| a.name()).collect::<Vec<_>>(),
+                "请求声明了多个校验和，拒绝"
+            );
+            Err(s3s::s3_error!(
+                InvalidRequest,
+                "multiple checksums declared"
+            ))
+        }
+    }
+}
+
+/// 校验和尾流：边转发边算声明算法的摘要；流结束后比对，不匹配在**流末尾注入错误**，
+/// 让内核在提交点之前 fail-closed（tmp 清理走既有失败路径，提交协议零改动）。
+struct ChecksumTailStream<S> {
+    inner: S,
+    algo: ChecksumAlgo,
+    hasher: ChecksumHasher,
+    expected_base64: String,
+    done: bool,
+}
+
+impl<S> ChecksumTailStream<S> {
+    fn new(inner: S, algo: ChecksumAlgo, expected_base64: String) -> Self {
+        let mut hasher = ChecksumHasher::default();
+        algo.enable(&mut hasher);
+        Self {
+            inner,
+            algo,
+            hasher,
+            expected_base64,
+            done: false,
+        }
+    }
+}
+
+impl<S> futures::Stream for ChecksumTailStream<S>
+where
+    S: futures::Stream<Item = Result<Bytes, xl_store::error::Error>> + Unpin,
+{
+    type Item = Result<Bytes, xl_store::error::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.hasher.update(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.done = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.done = true;
+                let hasher = std::mem::take(&mut this.hasher);
+                let got = this.algo.extract(&hasher.finalize()).unwrap_or_default();
+                if got != this.expected_base64 {
+                    return Poll::Ready(Some(Err(xl_store::error::Error::BadDigest(format!(
+                        "checksum mismatch: expected {}, got {}",
+                        this.expected_base64, got
+                    )))));
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// 校验和记录 → GET 输出字段（GET/HEAD 两条回写路径各一份，类型不同不强行抽象）。
+fn apply_checksum_get(out: &mut GetObjectOutput, rec: &xl_store::meta::ChecksumRecord) {
+    match rec.algorithm.as_str() {
+        "MD5" => out.checksum_md5 = Some(rec.value_base64.clone()),
+        "CRC32" => out.checksum_crc32 = Some(rec.value_base64.clone()),
+        "CRC32C" => out.checksum_crc32c = Some(rec.value_base64.clone()),
+        "SHA1" => out.checksum_sha1 = Some(rec.value_base64.clone()),
+        "SHA256" => out.checksum_sha256 = Some(rec.value_base64.clone()),
+        "SHA512" => out.checksum_sha512 = Some(rec.value_base64.clone()),
+        "CRC64NVME" => out.checksum_crc64nvme = Some(rec.value_base64.clone()),
+        other => tracing::warn!(algorithm = other, "落盘校验和算法未知，GET 不回写"),
+    }
+}
+
+fn apply_checksum_head(out: &mut HeadObjectOutput, rec: &xl_store::meta::ChecksumRecord) {
+    match rec.algorithm.as_str() {
+        "MD5" => out.checksum_md5 = Some(rec.value_base64.clone()),
+        "CRC32" => out.checksum_crc32 = Some(rec.value_base64.clone()),
+        "CRC32C" => out.checksum_crc32c = Some(rec.value_base64.clone()),
+        "SHA1" => out.checksum_sha1 = Some(rec.value_base64.clone()),
+        "SHA256" => out.checksum_sha256 = Some(rec.value_base64.clone()),
+        "SHA512" => out.checksum_sha512 = Some(rec.value_base64.clone()),
+        "CRC64NVME" => out.checksum_crc64nvme = Some(rec.value_base64.clone()),
+        other => tracing::warn!(algorithm = other, "落盘校验和算法未知，HEAD 不回写"),
+    }
 }
 
 /// 条件请求求值（RFC 9110 §13.2.2 顺序）：If-Match → If-Unmodified-Since →
@@ -185,6 +374,8 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        // 先于解构求值（只借 input）：解构会部分搬走 metadata 等字段
+        let declared = declared_checksum(&req.input)?;
         let PutObjectInput {
             bucket,
             key,
@@ -211,6 +402,21 @@ impl S3 for OssS3 {
 
         // 流式直通内核（不再整份进内存）；content-length 可缺省/不可信，流上计数兜底。
         let (stream, exceeded, body_err) = limit_stream(body, self.max_put_bytes);
+        // 校验和包装在限流之外：限流先标注 413/断流，校验和流再验证；
+        // 注入的 BadDigest 不会被限流标志吞掉（标志只由限流层的 map 置位）。
+        let (stream, checksum_record): (LimitedStream, Option<ChecksumRecord>) = match declared {
+            Some((algo, expected)) => {
+                let rec = ChecksumRecord {
+                    algorithm: algo.name().to_string(),
+                    value_base64: expected.clone(),
+                };
+                (
+                    Box::pin(ChecksumTailStream::new(stream, algo, expected)),
+                    Some(rec),
+                )
+            }
+            None => (stream, None),
+        };
 
         let result = self
             .store
@@ -220,6 +426,7 @@ impl S3 for OssS3 {
                 stream,
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
+                checksum_record,
             )
             .await;
         let info = match result {
@@ -489,6 +696,11 @@ impl S3 for OssS3 {
             out.expires = Some(String::from_utf8(buf).expect("HttpDate 只含 ASCII"));
         }
 
+        // 校验和回写（GET）
+        if let Some(rec) = &info.checksum {
+            apply_checksum_get(&mut out, rec);
+        }
+
         Ok(S3Response::with_status(out, status))
     }
 
@@ -517,14 +729,19 @@ impl S3 for OssS3 {
             }
             return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
         }
-        Ok(S3Response::new(HeadObjectOutput {
+        let mut out = HeadObjectOutput {
             content_length: Some(info.size as i64),
             content_type: info.content_type,
             e_tag: Some(ETag::Strong(info.etag)),
             last_modified: Some(last_modified(info.last_modified_nanos)),
             metadata: Some(info.user_metadata.into_iter().collect()),
             ..Default::default()
-        }))
+        };
+        // 校验和回写（HEAD）
+        if let Some(rec) = &info.checksum {
+            apply_checksum_head(&mut out, rec);
+        }
+        Ok(S3Response::new(out))
     }
 
     async fn delete_object(

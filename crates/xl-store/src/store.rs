@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{self, PartRef, Version, XlMeta};
+use crate::meta::{self, ChecksumRecord, PartRef, Version, XlMeta};
 
 mod gc;
 mod list;
@@ -51,6 +51,8 @@ pub struct ObjectInfo {
     pub content_type: Option<String>,
     pub last_modified_nanos: i64,
     pub user_metadata: std::collections::BTreeMap<String, String>,
+    /// 客户端声明的校验和（已通过；仅回写 GET/HEAD 用）
+    pub checksum: Option<ChecksumRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -214,6 +216,7 @@ impl Store {
             Box::pin(futures::stream::once(async move { Ok(body) })) as ByteStream,
             content_type,
             user_metadata,
+            None,
         )
         .await
     }
@@ -238,7 +241,7 @@ impl Store {
         body: ByteStream,
         content_type: Option<String>,
     ) -> Result<ObjectInfo> {
-        self.put_object_stream_with_meta(bucket, key, body, content_type, Default::default())
+        self.put_object_stream_with_meta(bucket, key, body, content_type, Default::default(), None)
             .await
     }
 
@@ -250,6 +253,7 @@ impl Store {
         mut body: ByteStream,
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
+        checksum: Option<ChecksumRecord>,
     ) -> Result<ObjectInfo> {
         self.ensure_bucket(bucket).await?;
         layout::validate_key(key)?;
@@ -302,6 +306,7 @@ impl Store {
                 },
                 // 单段 PUT 保持与旧文件同形的 None（MPU complete 才写 Some）
                 parts: None,
+                checksum: checksum.clone(),
             };
             let meta = XlMeta {
                 object_key: key.to_string(),
@@ -347,6 +352,7 @@ impl Store {
             content_type,
             last_modified_nanos: now,
             user_metadata,
+            checksum,
         })
     }
 
@@ -394,6 +400,7 @@ impl Store {
             content_type: v.content_type.clone(),
             last_modified_nanos: v.mod_time_nanos,
             user_metadata: v.user_metadata.clone(),
+            checksum: v.checksum.clone(),
         })
     }
 

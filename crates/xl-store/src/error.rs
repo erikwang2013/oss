@@ -24,6 +24,8 @@ pub enum Error {
     InvalidPartOrder(String),
     #[error("part too small: {0}")]
     EntityTooSmall(String),
+    #[error("bad digest: {0}")]
+    BadDigest(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("encode error: {0}")]

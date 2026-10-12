@@ -1081,3 +1081,31 @@ async fn multipart_list_parts_ascending() {
     assert_eq!(ps[1].part_number, 2);
     assert_eq!(ps[1].size, 7);
 }
+
+// ---- 协议补全 Task 3: ChecksumRecord 往返 ----
+
+#[tokio::test]
+async fn meta_roundtrips_checksum_record() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let rec = meta::ChecksumRecord {
+        algorithm: "SHA256".into(),
+        value_base64: "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=".into(),
+    };
+    s.put_object_stream_with_meta(
+        "alpha",
+        "k",
+        Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"payload-123"))
+        })),
+        None,
+        Default::default(),
+        Some(rec.clone()),
+    )
+    .await
+    .unwrap();
+    let head = s.head_object("alpha", "k").await.unwrap();
+    assert_eq!(head.checksum, Some(rec.clone()));
+    let (get, _body) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(get.checksum, Some(rec));
+}

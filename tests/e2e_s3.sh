@@ -93,6 +93,21 @@ echo "$OUT" | grep -q '412' || { echo "未回 412: $OUT"; exit 1; }
 OUT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-match "\"$COND_ETAG\"" --query ContentLength --output text 2>&1)
 echo "$OUT" | grep -qx '10485760' || { echo "If-Match 命中的 200 输出异常: ContentLength=$OUT"; exit 1; }
 
+echo "== 11c. 校验和（x-amz-checksum-*）=="
+# 正确值：aws-cli 自动计算 SHA256 并随请求头发送 → 提交成功，head-object 回写
+aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key ck.bin --body "$WORK/one.bin" \
+  --checksum-algorithm SHA256 >/dev/null
+CK_SHA=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key ck.bin --query ChecksumSHA256 --output text)
+[ -n "$CK_SHA" ] && [ "$CK_SHA" != "None" ] || { echo "head-object 应回写 ChecksumSHA256"; exit 1; }
+# 错值：伪造 base64 → BadDigest，且对象不得落盘（提交点前 fail-closed）
+OUT=$(aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key ck-bad.bin --body "$WORK/one.bin" \
+  --checksum-sha256 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" 2>&1) \
+  && { echo "错校验和应被拒，却成功: $OUT"; exit 1; }
+echo "$OUT" | grep -qi "BadDigest" || { echo "应报 BadDigest: $OUT"; exit 1; }
+if aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key ck-bad.bin >/dev/null 2>&1; then
+  echo "校验失败不得留下对象"; exit 1
+fi
+
 echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh
 aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key meta.bin --query 'Metadata.foo' --output text | grep -qx bar

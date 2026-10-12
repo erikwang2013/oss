@@ -43,6 +43,10 @@ pub struct Version {
     /// `None` = M1 单段语义（读 `part`）。只加 `Option` 字段 = 前向兼容契约（见文件头注释）。
     #[serde(default)]
     pub parts: Option<Vec<PartRef>>,
+    /// 客户端声明的校验和（Content-MD5 / `x-amz-checksum-*`；服务端在提交点前已验证）。
+    /// multipart 的组合校验和语义留 M2b。
+    #[serde(default)]
+    pub checksum: Option<ChecksumRecord>,
 }
 
 impl Version {
@@ -53,6 +57,15 @@ impl Version {
             None => vec![self.part.clone()],
         }
     }
+}
+
+/// 客户端声明的校验和记录（落盘仅作数据；**校验发生在提交点之前**，由 xl-s3 层完成）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChecksumRecord {
+    /// s3s 的算法名（`"CRC32C"` / `"SHA256"` / `"MD5"`（Content-MD5）等）
+    pub algorithm: String,
+    /// base64 编码的摘要（S3 线格式）
+    pub value_base64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +157,7 @@ mod tests {
                     sha256: "aa".into(),
                 },
                 parts: None,
+                checksum: None,
             }],
         }
     }
@@ -294,13 +308,14 @@ mod tests {
         let bytes = sample().encode().unwrap();
         assert_eq!(bytes[0], FORMAT_VERSION);
         // 已人工核对：首字节 01；version_id 为 bin8（c4 10 + 16 字节全零）；
-        // M2a Task 5 起 Version 增加 parts 字段（单段写 nil），摘要已按「有意识更新」流程重算。
+        // M2a Task 5 起 Version 增加 parts 字段（单段写 nil）、协议补全 Task 3 起增加 checksum 字段
+        //（默认 nil），摘要均按「有意识更新」流程重算。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "e7f386e47c6918e5bb0b957441fd85927227f8c74174dc8c37a0db4ebf208901"
+            "2af7eeed9ca496bfae3054dbcb8362286564abab151cd277f00b0ffc5ac50257"
         );
     }
 }
@@ -324,6 +339,7 @@ mod parts_tests {
                 sha256: "s".into(),
             },
             parts,
+            checksum: None,
         }
     }
 
