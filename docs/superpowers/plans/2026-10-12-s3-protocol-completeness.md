@@ -298,6 +298,17 @@ impl Stream for ChecksumTailStream {
 | 304 响应的 header 细节（无 body、Content-Length 处理） | 用 `GetObjectOutput::default()` + `with_status(304)`；e2e 断言状态行与空 body |
 | 条件请求对 aetherupload 上传面（2.0 协议）无影响 | 上传面不经 s3s 的 Get/Head——无需改动，e2e 顺带回归 |
 
+## 评审收尾轮（reviewer 代理，区间 d055dd1..HEAD）
+
+- **I-1（已修）**：206 分段响应原会回写整对象校验和（SDK 响应校验拿片段验整对象必失败）——
+  改 `status != PARTIAL_CONTENT` 门控回写 + 用例；**M-1（已修）**：同值双声明去重放行、异值仍拒；
+  **M-3（已修）**：ChecksumRecord 解码白名单（algorithm ≤32 / value_base64 ≤128 / 可见 ASCII）；
+  **M-2（已标注）**：part 级校验和「未校验」进 README/规格；**O-3（留痕）**：时间条件秒/纳秒精度。
+- 未采（记录在案）：O-1 GET/HEAD 状态码口径两套（等价且有用例注释）；O-2 GET 净增一次 meta 读
+  （M2b 流式读时合并）。
+- 无问题的项（评审核对）：求值序/短路/`*` 语义、校验和包装序与全部流边界分支、golden 记录、
+  11b/11c 断言形态。
+
 ## 定稿记录
 
 （实现完成后补：每 Task 实际形态、四闸实跑、e2e 输出、与本文档的差异裁决。）
