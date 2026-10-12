@@ -108,6 +108,12 @@ if aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key ck-
   echo "校验失败不得留下对象"; exit 1
 fi
 
+echo "== 11d. 多区间 Range → 400 InvalidArgument（s3s 解析层拦截）=="
+# 多区间在 s3s 的头部解析层即拒（http/de.rs 统一映射 InvalidArgument）——先于鉴权，
+# 故未签名 curl 也回 400（若实测为先 403，说明该版 s3s 是鉴权先行，届时按实测调整本条）
+MKOUT=$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-1,3-4' "$ENDPOINT/$BUCKET/big.bin")
+[ "$MKOUT" = "400" ] || { echo "多区间 Range 应 400，实际 $MKOUT"; exit 1; }
+
 echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh
 aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key meta.bin --query 'Metadata.foo' --output text | grep -qx bar

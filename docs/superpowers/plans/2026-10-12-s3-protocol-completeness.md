@@ -330,5 +330,9 @@ impl Stream for ChecksumTailStream {
   - `ChecksumAlgorithm` 是枚举（含 const 字符串与 From<String>），测试里用 `.to_string().into()`。
   - 「只声明算法无值 → InvalidRequest」写进用例与注释（CLI 恒带值；无值不猜）。
   - golden 第二次重算：`2af7eeed…`。
-- 实跑：xl-store 68/68、xl-s3 22/22、workspace 全绿、clippy 0 告警；e2e 11c（含 aws-chunked
-  trailer 的实跑核验）随 e2e 报告补记。
+- 实跑：xl-store 68/68、xl-s3 22/22、workspace 全绿、clippy 0 告警；**e2e 18 步全绿 rc=0**（11c 一次通过）。
+- **最大不确定性结案（e2e 代理实抓 --debug 请求原文 + botocore 元数据）**：aws-cli 2.37 的
+  `--checksum-algorithm SHA256` **走请求头**（`x-amz-checksum-sha256` + `x-amz-sdk-checksum-algorithm`，
+  均在 SigV4 签名头清单），**不走 aws-chunked/trailer**——「trailer 值不进 `PutObjectInput.checksum_*`」
+  的情形在当前 CLI 下不发生。实跑输出：正确值 head `ChecksumSHA256` 回写一致；错值 →
+  `(BadDigest) … checksum mismatch: expected …, got …`；ck-bad.bin 事后 404（fail-closed 落盘验证）。
