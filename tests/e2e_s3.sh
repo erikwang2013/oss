@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 验收：S3 兼容性（aws-cli + rclone）。M1 基础 + M2a 的 multipart / Range / 元数据。
 # 前置：本机装了 aws-cli 与 rclone。
+# 可选长跑（13b，默认跳过）：E2E_LONG=1 启用设计验收 #3（rclone 并发 + 中断重试），
+# E2E_LONG_N / E2E_LONG_MB 调规模（默认 100 × 100 MB，分钟级，人工触发）。
 set -euo pipefail
 
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
@@ -136,6 +138,49 @@ export RCLONE_CONFIG_OSS_UPLOAD_CUTOFF=5M            # rclone 默认 cutoff 200M
 export RCLONE_CONFIG_OSS_CHUNK_SIZE=5M
 rclone copyto "$WORK/big.bin" oss:"$BUCKET/rclone-big.bin"
 rclone cat oss:"$BUCKET/rclone-big.bin" | cmp - "$WORK/big.bin"
+
+echo "== 13b. E2E_LONG 长跑：并发上传 + 中断重试（设计验收 #3；默认跳过）=="
+if [ "${E2E_LONG:-0}" != "1" ]; then
+  echo "   跳过（分钟级，人工触发）：E2E_LONG=1 启用，E2E_LONG_N/E2E_LONG_MB 调规模（默认 100×100 MB）"
+else
+  N="${E2E_LONG_N:-100}"; MB="${E2E_LONG_MB:-100}"
+  [ "$N" -ge 3 ] || { echo "   需要 E2E_LONG_N >= 3（中断重试要有可观测的中间态）"; exit 1; }
+  LONG="$WORK/long"; mkdir -p "$LONG"
+  echo "   生成 $N × ${MB} MB（/dev/urandom）"
+  for i in $(seq 1 "$N"); do dd if=/dev/urandom of="$LONG/f$i.bin" bs=1M count="$MB" status=none; done
+  ( cd "$LONG" && md5sum ./*.bin > "$WORK/long.md5" )   # 本地基准清单（末尾逐对象读回比对）
+
+  # 中断重试：先 transfers=1 + bwlimit 慢传（逐个对象出现，中断窗口足够大），
+  # 看到第一个对象落地即 kill -9；再 transfers=8 并发续跑（rclone copy 跳过已传完的对象）。
+  # 注：被 kill 的在途分片上传留在服务端，续跑会重新上传该对象——正是「中断重试」要覆盖的形态。
+  echo "   中断重试：慢传至中途 kill -9 rclone，再并发续跑"
+  rclone copy "$LONG" "oss:$BUCKET/long/" --transfers 1 --bwlimit 10M >/dev/null 2>&1 &
+  RPID=$!
+  for _ in $(seq 1 600); do
+    C=$( { rclone lsf "oss:$BUCKET/long/" 2>/dev/null || true; } | wc -l )
+    { [ "$C" -gt 0 ] && [ "$C" -lt "$N" ]; } && break
+    kill -0 "$RPID" 2>/dev/null || break
+    sleep 0.2
+  done
+  kill -9 "$RPID" 2>/dev/null || true
+  wait "$RPID" 2>/dev/null || true
+  PARTIAL=$( { rclone lsf "oss:$BUCKET/long/" || true; } | wc -l )
+  echo "   中断时远端已有 $PARTIAL/$N 个对象"
+  [ "$PARTIAL" -lt "$N" ] || echo "   注意：链路太快未能在中途中断（续跑语义仍由下方全量断言覆盖）"
+
+  rclone copy "$LONG" "oss:$BUCKET/long/" --transfers 8 --checkers 8
+  CNT=$( { rclone lsf "oss:$BUCKET/long/" || true; } | wc -l )
+  [ "$CNT" -eq "$N" ] || { echo "   长跑：远端对象数 $CNT != $N"; exit 1; }
+
+  # 全部校验和一致：逐对象 cat 读回，与本地 md5 比对
+  BAD=0
+  while read -r H F; do
+    R=$(rclone cat "oss:$BUCKET/long/${F##*/}" | md5sum | cut -d' ' -f1)
+    [ "$R" = "$H" ] || { echo "   校验失败: $F 本地 $H 远端 $R"; BAD=1; }
+  done < "$WORK/long.md5"
+  [ "$BAD" -eq 0 ] || exit 1
+  echo "   长跑通过：$N×${MB}MB 全部读回校验和一致（含中断重试）"
+fi
 
 echo "== 14. 删桶 =="
 aws_s3 rb "s3://$BUCKET" --force

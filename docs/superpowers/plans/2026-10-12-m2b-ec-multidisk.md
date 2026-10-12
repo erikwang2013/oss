@@ -307,12 +307,23 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 ## Task 10: fsck/scrub 起步 + 锁收口
 
-**Files:** Modify: `store/gc.rs`、Create: `store/fsck.rs`（或 gc.rs 内扩展）、`cli.rs`、`store.rs`（锁）
+- [x] **Step 1: fsck**：`oss-server fsck [--repair]` 与启动自检共用口径：扫全盘（每 drives[i]）——(a) tmp/trash 条目计数（清理由 clean 负责，fsck 只报数）；(b) 孤儿版本目录（未被任何版本引用）；(c) EC 分片 CRC32C 全检（缺/坏计数）。`--repair`：删孤儿 + 对缺/坏对象走一次 get_object（触发读时修）。报告 JSON 落 `.oss.sys/fsck/<时间戳>.json`（xl-store 出结构体，serde_json 序列化在 oss-server cli——内核不引新依赖）。**裁决**：独立 `scrub` 仍归 M4。
+- [x] **Step 2: 桶级互斥**：写者「桶窗口」（桶锁内 ensure + 对象目录先落）与 `delete_bucket`/`create_bucket`（全程桶锁）互斥——删桶见非空必拒、窗口外的迟到写者撞 NoSuchBucket，「桶复活」窗口关闭；回归（删除）为竞态用例（30 轮断言 put 与 delete_bucket 不可能同时成功）。
+- [x] **Step 3: flock 跨进程锁**：`lock_object` = 进程内 tokio 互斥 → `<drive0>/.oss.sys/locks/<sha256(bucket/key)[..16]>.lock` 的 `File::lock()`。**落地修正**：flock 是阻塞调用，放进 `spawn_blocking`——直接在内联 await 里调用会 parked 执行器线程，多任务争用时可饿死持锁任务（实测挂死，用例 1.68s 转绿即为证）。用例：两个 Store 实例并发写/删同键，读只见完整写或 NoSuchKey。
+- [x] **Step 4:** 提交 `feat(xl-store): fsck --repair 起步、桶级互斥、flock 跨进程锁`。（与 M2b-2 评审修复轮合并提交。）
 
-- [ ] **Step 1: fsck**：`oss-server fsck`（新子命令）与启动自检共用：扫全盘（每 drives[i]）——(a) 孤儿版本目录/tmp/trash（M2a 的 reap_stale 升级为多盘遍历）；(b) **逐对象分片巡检**：CRC32C 全检（scrub 的起步版），坏片计数报出、`--repair` 用重建回写（M4 的 heal 前置）；报告落 `.oss.sys/fsck/<时间戳>.json`（设计 §4.1 已预留目录）。**裁决**：`scrub` 独立命令仍是 M4；M2b 提供 `fsck [--repair]`，设计文档的 §M4 验收按此顺延。
-- [ ] **Step 2: 桶级互斥**：既有 `ponytail: 桶级互斥未实现——并发 delete_bucket + put 可让桶「复活」`（store.rs）收口——`delete_bucket` 与 `create/put` 经桶级 `tokio::sync::Mutex`（与 per-object 锁同构的锁表，键 = `bucket:` 前缀区分）；并发用例复刻 `concurrent_puts_to_same_key_serialize` 的形态。
-- [ ] **Step 3: flock 跨进程锁**（设计 §4.4 的 M1–M2 承诺）：`lock_for` 在取进程内锁**同时**取 `<drive0>/.oss.sys/locks/<sha1(bucket/key)>.lock` 的 `flock(LOCK_EX)`（`std::fs::File::lock()`——aetherupload 已用同款）；进程内锁保留（快速路径），flock 是跨进程兜底。**裁决**：只锁 drive0 的锁文件（锁是互斥信号不是数据，无需 12 份）；进程级用例：两个 `Store` 实例（同进程不同实例已够触发 flock 语义）并发写同键，断言串行化。
-- [ ] **Step 4:** 提交 `feat(xl-store): fsck --repair 起步、桶级互斥、flock 跨进程锁`。
+**评审二轮（M2b-2，评审者只读，8 项发现 → 6 修 2 记录）——全部落地：**
+
+1. **R1（高）盘身份/初始化**：原 open 无条件自建 `.oss.sys`，把「挂载点掉线的空目录」自证为在册盘（写入落父 fs、假 quorum）。修：首启（全盘无 sys）才初始化并盖部署标识 `.oss.sys/drive-id`；已有在册盘时缺席盘**不创建**、按不在册处理（插回自动重新在册，无需重启）；标识不一致（插错盘）→ 大声失败。盲区如实记录：首启时全盘同时掉线不可与全新盘区分（部署文档要求首启确认挂载）。
+2. **R2（高）删除无 tombstone**：拔盘时 delete 静默成功 → 插回复活（内联对象 200 已删字节、EC 对象永久 500）。修（tombstone-lite）：delete 前逐盘探测，缺席即 `QuorumUnmet` fail-closed。另把 delete 改为**meta 先行**（删 xl.meta = 可见性提交点，数据清理随后 best-effort）——与写协议对偶，同时关闭「并发删/写时读到 CorruptMeta」的裂口（并发撕裂用例在 EC 载荷下暴露后收敛）。
+3. **R3（中）列举只看 drive0**：拔 d0 时 List 误报 NoSuchBucket/空。修：collect_keys/list_buckets 各盘取并集。
+4. **R4（中）配置面无校验**：重复 data_dirs（quorum 按条目假达成）、空数组越界 panic、ec 0 值、u8 相加溢出。修：state.rs 去重+非空；open 校验 data/parity ≥1 且和 ≤255（u16 运算）。
+5. **R6（低）read_meta 单盘 IO 错误上抛**：降级为跳过该盘（仍保留「全盘无副本且见过错误 → fail-closed」）。
+6. **R7（低）.new 残骸**：翻转全失败/半途遗留的 `xl.meta.new` 无人清。修：flipped==0 分支 clear_meta_new + reap_stale 按 mtime 回收对象目录内的 .new。
+7. **R5（记录）**：读时修可能把已删/已覆写版本的缺片写回（uuid 不复用 → 不会污染新版本；残骸由 GC 回收）。接受，M4 heal 收口。
+8. **R8（记录）**：「mod_time 最新者胜」依赖墙钟单调（NTP 回拨 + 翻转失败组合可让旧副本胜出，表现为已提交对象 404；读不核 quorum 的边界同条）。**写入设计文档为已知边界**；正解 = per-key 单调代数（M3 heal/epoch 顺延）。
+9. **kill9 加固**（评审专节）：注入点扩为四处——分片半写（段 2）、meta 准备完成未翻转（段 3）、翻转中途（段 4）——覆盖两阶段提交的两个核心崩溃窗口；补显式证据断言（v2 版本目录存在、.new 存在、翻转中途崩后 v2 必须胜出）。
+10. **实测挂死修复**：flock 内联阻塞调用 parked 执行器线程（并发用例挂死 15 分钟+）→ 挪入 `spawn_blocking`；相关竞态用例关 fsync（与锁语义无关的提速）。
 
 ## Task 11: 文档与收尾
 

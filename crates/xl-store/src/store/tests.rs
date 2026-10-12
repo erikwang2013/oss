@@ -1620,6 +1620,326 @@ async fn ec_disabled_single_drive_writes_legacy_form() {
     assert_eq!(&bytes[..], &data[..]);
 }
 
+// ---- M2b-2 Task 10：桶级互斥 / flock / fsck ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bucket_delete_race_never_revives_bucket() {
+    // 并发 delete_bucket + put 的不变式：二者不可能同时成功（桶锁窗口收口）。
+    // 可能结局只有两种：put 先（桶非空 → 删被拒）或 delete 先（put 撞 NoSuchBucket）。
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.fsync = false; // 30 轮竞态下的提速，与锁语义无关
+    let s = Store::open(cfg).await.unwrap();
+    let s = std::sync::Arc::new(s);
+    for round in 0..30 {
+        let bucket = format!("race-{round}");
+        s.create_bucket(&bucket).await.unwrap();
+        let (put_res, del_res) = tokio::join!(
+            {
+                let s = std::sync::Arc::clone(&s);
+                let b = bucket.clone();
+                async move { s.put_object(&b, "k", payload(1024), None).await }
+            },
+            {
+                let s = std::sync::Arc::clone(&s);
+                let b = bucket.clone();
+                async move { s.delete_bucket(&b).await }
+            }
+        );
+        assert!(
+            !(put_res.is_ok() && del_res.is_ok()),
+            "round {round}: put 与 delete_bucket 不得同时成功（桶复活）"
+        );
+        if del_res.is_ok() {
+            assert!(
+                !s.bucket_exists(&bucket).await.unwrap(),
+                "round {round}: 删桶成功后桶必须消失"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flock_serializes_across_store_instances() {
+    // 两个 Store 实例 = 跨进程语义的代表：进程内锁表各自独立，只剩 flock 兜底。
+    // 不变式：并发写/删交错下，读只允许「某个写者的完整字节」或 NoSuchKey。
+    let dirs: Vec<_> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mk_cfg = || {
+        let mut cfg = StoreConfig::new(dirs[0].path());
+        cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+        cfg.fsync = false; // 并发语义与 fsync 无关；高负载机器上 30 写 × 48 次 fsync 会拖成分钟级
+        cfg
+    };
+    let s1 = std::sync::Arc::new(Store::open(mk_cfg()).await.unwrap());
+    let s2 = std::sync::Arc::new(Store::open(mk_cfg()).await.unwrap());
+    s1.create_bucket("alpha").await.unwrap();
+
+    let n = 129 * 1024;
+    let put_task = |s: std::sync::Arc<Store>, byte: u8| async move {
+        for _ in 0..15 {
+            s.put_object("alpha", "k", Bytes::from(vec![byte; n]), None)
+                .await
+                .unwrap();
+        }
+    };
+    let del_task = {
+        let s = std::sync::Arc::clone(&s2);
+        async move {
+            for _ in 0..15 {
+                let _ = s.delete_object("alpha", "k").await;
+            }
+        }
+    };
+    let read_task = {
+        let s = std::sync::Arc::clone(&s1);
+        async move {
+            for _ in 0..120 {
+                match s.get_object("alpha", "k").await {
+                    Ok((info, body)) => {
+                        assert_eq!(info.size, n as u64);
+                        assert_eq!(body.len(), n);
+                        assert!(body.iter().all(|b| *b == body[0]), "撕裂内容");
+                    }
+                    Err(Error::NoSuchKey(_)) => {}
+                    Err(e) => panic!("读路径不应出现其他错误: {e}"),
+                }
+            }
+        }
+    };
+    let (r1, r2, r3) = tokio::join!(
+        put_task(std::sync::Arc::clone(&s1), 1),
+        put_task(std::sync::Arc::clone(&s2), 2),
+        async { tokio::join!(del_task, read_task) }
+    );
+    let _ = (r1, r2, r3);
+}
+
+#[tokio::test]
+async fn fsck_reports_and_repairs() {
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(200_000), None)
+        .await
+        .unwrap();
+    s.put_object("alpha", "small", payload(64), None)
+        .await
+        .unwrap();
+
+    // 植放：drive 3 上一个孤儿版本目录 + drive 0 的 tmp 一个残骸
+    let obj_dir = layout::object_dir(dirs[3].path(), "alpha", "k").unwrap();
+    let orphan = obj_dir.join("orphan-uuid");
+    tokio::fs::create_dir_all(&orphan).await.unwrap();
+    tokio::fs::write(orphan.join("part.1.3"), b"junk")
+        .await
+        .unwrap();
+    let tmp = layout::sys_dir(dirs[0].path(), "tmp");
+    tokio::fs::write(tmp.join("junk"), b"x").await.unwrap();
+    // 植坏：drive 2 上删掉 k 的分片
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let v = m.latest().unwrap();
+    let shard2 = layout::object_dir(dirs[2].path(), "alpha", "k")
+        .unwrap()
+        .join(&v.part.uuid)
+        .join("part.1.2");
+    std::fs::remove_file(&shard2).unwrap();
+
+    // 只读巡检：孤儿/缺片/tmp 都被报出
+    let r = s.fsck(false).await.unwrap();
+    assert_eq!(r.drives, 12);
+    assert!(r.objects_scanned >= 2);
+    assert_eq!(r.orphan_dirs.len(), 1, "{:?}", r.orphan_dirs);
+    assert!(r.orphan_dirs[0].starts_with("3#alpha/k/orphan-uuid"));
+    assert_eq!(r.missing_shards, 1);
+    assert_eq!(r.bad_shards, 0);
+    assert!(r.tmp_entries >= 1);
+    assert!(!r.repaired);
+    // 只读：孤儿仍在（报告不等于修复）
+    assert!(tokio::fs::try_exists(&orphan).await.unwrap());
+
+    // --repair：删孤儿 + 读时修分片
+    let r = s.fsck(true).await.unwrap();
+    assert!(r.repaired);
+    assert!(!tokio::fs::try_exists(&orphan).await.unwrap(), "孤儿应被删");
+    assert!(
+        tokio::fs::try_exists(&shard2).await.unwrap(),
+        "缺片应被读时修回写"
+    );
+
+    // 复检：缺片与孤儿清零，对象仍可读
+    let r = s.fsck(false).await.unwrap();
+    assert_eq!(r.missing_shards, 0);
+    assert_eq!(r.orphan_dirs.len(), 0);
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(bytes.len(), 200_000);
+}
+
+// ---- M2b-2 评审修复轮（R1/R2/R3/R4）----
+
+fn id_path(d: &tempfile::TempDir) -> std::path::PathBuf {
+    d.path().join(layout::SYS_DIR).join("drive-id")
+}
+
+fn drive_cfg(dirs: &[tempfile::TempDir]) -> StoreConfig {
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    cfg
+}
+
+#[tokio::test]
+async fn open_stamps_and_verifies_drive_identity() {
+    // R1：首启全盘盖同一部署标识；插错盘（标识不一致）大声失败
+    let (_, dirs) = store_12().await;
+    let first = tokio::fs::read_to_string(id_path(&dirs[0])).await.unwrap();
+    assert!(!first.trim().is_empty());
+    for d in &dirs {
+        assert_eq!(
+            tokio::fs::read_to_string(id_path(d)).await.unwrap(),
+            first,
+            "全盘标识必须一致"
+        );
+    }
+    tokio::fs::write(id_path(&dirs[3]), "foreign-deployment")
+        .await
+        .unwrap();
+    assert!(matches!(
+        Store::open(drive_cfg(&dirs)).await,
+        Err(Error::Encode(_))
+    ));
+    // 还原后可开
+    tokio::fs::write(id_path(&dirs[3]), &first).await.unwrap();
+    Store::open(drive_cfg(&dirs)).await.unwrap();
+}
+
+#[tokio::test]
+async fn open_treats_uninitialized_drive_as_offline_and_adopts_on_return() {
+    // R1 核心：掉线盘的 `.oss.sys` 不可见时，open 不得替它重建（impostor 防线的本体）；
+    // 恢复后凭 sys 目录自动重新在册，无需重启
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(300_000), None)
+        .await
+        .unwrap();
+    drop(s);
+
+    // 模拟掉线：drive5 的 .oss.sys 整体挪走（挂载点掉线 = 该路径看不到真盘内容）
+    let sys5 = dirs[5].path().join(layout::SYS_DIR);
+    let stash = tempfile::tempdir().unwrap();
+    std::fs::rename(&sys5, stash.path().join("sys5")).unwrap();
+
+    let s = Store::open(drive_cfg(&dirs)).await.unwrap();
+    assert!(
+        !tokio::fs::try_exists(&sys5).await.unwrap(),
+        "open 不得为掉线盘重建 .oss.sys（impostor 防线）"
+    );
+    // 11 盘在册：写照常（≥ quorum），且新对象不在 drive5 落片
+    let data = payload(200_000);
+    s.put_object("alpha", "k2", data.clone(), None)
+        .await
+        .unwrap();
+    let (_, bytes) = s.get_object("alpha", "k2").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+    let m = read_disk_meta(&s, "alpha", "k2").await;
+    let v = m.latest().unwrap();
+    let v5 = layout::object_dir(dirs[5].path(), "alpha", "k2")
+        .unwrap()
+        .join(&v.part.uuid);
+    assert!(
+        !tokio::fs::try_exists(&v5).await.unwrap(),
+        "掉线盘不应有新对象的版本目录"
+    );
+
+    // 插回：恢复 .oss.sys → 无需重开即在册
+    std::fs::rename(stash.path().join("sys5"), &sys5).unwrap();
+    s.put_object("alpha", "k3", payload(200_000), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "k3").await;
+    let v = m.latest().unwrap();
+    let v5 = layout::object_dir(dirs[5].path(), "alpha", "k3")
+        .unwrap()
+        .join(&v.part.uuid);
+    assert_eq!(shard_files(&v5), 1, "插回后新写入应重新用满 12 盘");
+    s.get_object("alpha", "k").await.unwrap(); // 旧对象照常可读
+}
+
+#[tokio::test]
+async fn delete_fails_closed_when_drive_absent() {
+    // R2：拔盘时删除不得静默成功（插回即复活）；插回后可删
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(200_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    let stash = tempfile::tempdir().unwrap();
+    std::fs::rename(dirs[3].path(), stash.path().join("d3")).unwrap();
+
+    assert!(
+        matches!(
+            s.delete_object("alpha", "k").await,
+            Err(Error::QuorumUnmet(_))
+        ),
+        "拔盘时删除必须 fail-closed"
+    );
+    // 对象完好
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+    assert!(matches!(
+        s.delete_bucket("alpha").await,
+        Err(Error::QuorumUnmet(_))
+    ));
+
+    // 插回 → 可删
+    std::fs::rename(stash.path().join("d3"), dirs[3].path()).unwrap();
+    s.delete_object("alpha", "k").await.unwrap();
+    assert!(matches!(
+        s.head_object("alpha", "k").await,
+        Err(Error::NoSuchKey(_))
+    ));
+}
+
+#[tokio::test]
+async fn list_union_survives_drive0_pull() {
+    // R3：拔 drive0 后列举不得误报 NoSuchBucket/空
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    for k in ["a", "b"] {
+        s.put_object("alpha", k, payload(64), None).await.unwrap();
+    }
+    let stash = tempfile::tempdir().unwrap();
+    std::fs::rename(dirs[0].path(), stash.path().join("d0")).unwrap();
+
+    let r = s
+        .list_objects("alpha", &ListRequest::default())
+        .await
+        .unwrap();
+    let keys: Vec<String> = r.objects.iter().map(|o| o.key.clone()).collect();
+    assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
+    let buckets = s.list_buckets().await.unwrap();
+    assert!(buckets.iter().any(|b| b.name == "alpha"));
+    s.get_object("alpha", "a").await.unwrap();
+}
+
+#[tokio::test]
+async fn open_rejects_degenerate_ec_numbers() {
+    // R4：data/parity 的 0 值与 u8 相加溢出在 open 收口（不得 panic）
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.ec.data = 0;
+    assert!(matches!(Store::open(cfg).await, Err(Error::Encode(_))));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.ec.parity = 0;
+    assert!(matches!(Store::open(cfg).await, Err(Error::Encode(_))));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.ec.data = 200;
+    cfg.ec.parity = 100; // 相加 300 > 255：u16 运算不得溢出 panic
+    assert!(matches!(Store::open(cfg).await, Err(Error::Encode(_))));
+}
+
 #[tokio::test]
 async fn legacy_parts_form_still_readable() {
     // M2a 旧对象回归：parts: Some + 多段 part.N 文件的旧形态读路径必须继续可读

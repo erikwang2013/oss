@@ -33,6 +33,18 @@ impl AppState {
             .data_dirs
             .clone()
             .unwrap_or_else(|| vec![cfg.data_dir.clone()]);
+        // 信任边界（评审 R4）：空数组/重复路径在此收口——空数组后续会越界、重复路径会让
+        // quorum 按条目假达成（12 条指同一物理盘 = 零冗余且无告警）
+        if drives.is_empty() {
+            return Err("data_dirs 不能为空（不配 data_dirs 即用 data_dir 单盘）".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for d in &drives {
+            let canon = d.canonicalize().unwrap_or_else(|_| d.clone());
+            if !seen.insert(canon.clone()) {
+                return Err(format!("data_dirs 含重复路径: {}", canon.display()).into());
+            }
+        }
         for d in &drives {
             std::fs::create_dir_all(d)
                 .map_err(|e| format!("创建数据目录 {} 失败: {e}", d.display()))?;

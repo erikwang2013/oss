@@ -346,10 +346,17 @@ impl Store {
         user_metadata: BTreeMap<String, String>,
         checksum: Option<ChecksumRecord>,
     ) -> Result<ObjectInfo> {
-        self.ensure_bucket(bucket).await?;
         layout::validate_key(key)?;
-
-        let _guard = self.lock_for(bucket, key).lock_owned().await;
+        // 桶窗口（桶锁内，M2b-2 Task 10）：ensure + 对象目录先落盘——此后 delete_bucket
+        // 见到非空必拒，桶「复活」窗口关闭。失败清理时清掉可能新建的空目录（空目录会卡住删桶）
+        let obj_dir = {
+            let _bguard = self.lock_bucket_owned(bucket).await;
+            self.ensure_bucket(bucket).await?;
+            let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
+            tokio::fs::create_dir_all(&dir).await?;
+            dir
+        };
+        let _guard = self.lock_object(bucket, key).await?;
 
         // M-6 裁决：损坏的 meta 让 PUT fail-closed（报错），不静默当作空对象覆盖——盘上可能还有旧数据，宁可失败也不毁
         let old_meta = self.read_meta(bucket, key).await?;
@@ -410,6 +417,7 @@ impl Store {
                     self.rollback_versions(bucket, key, &uuid).await;
                 }
                 let _ = tokio::fs::remove_dir_all(&tmp).await;
+                let _ = tokio::fs::remove_dir(&obj_dir).await; // 仅当空（窗口新建的）才删得掉
                 return Err(e);
             }
         };
@@ -424,13 +432,16 @@ impl Store {
                     // 阶段一失败 = 一盘未翻转：数据目录干净回滚
                     self.rollback_versions(bucket, key, &uuid).await;
                     let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    let _ = tokio::fs::remove_dir(&obj_dir).await;
                     return Err(e);
                 }
             };
             if flipped == 0 {
                 // 已准备 ≥quorum 但翻转全失败（病态 IO）：仍属未提交，回滚
                 self.rollback_versions(bucket, key, &uuid).await;
+                self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
                 let _ = tokio::fs::remove_dir_all(&tmp).await;
+                let _ = tokio::fs::remove_dir(&obj_dir).await;
                 return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
             }
             if flipped < quorum {
@@ -443,8 +454,9 @@ impl Store {
             let _ = tokio::fs::remove_dir_all(&tmp).await; // tmp 仅用于流式收全与哈希
             self.recycle_old(bucket, key, old_meta.as_ref()).await;
         } else {
-            // 3) 同盘 rename：数据就位（此时对读路径仍不可见）；目录 fsync 是 rename 的持久化屏障
-            let obj_dir = layout::object_dir(self.cfg.root(), bucket, key)?;
+            // 3) 同盘 rename：数据就位（此时对读路径仍不可见）；目录 fsync 是 rename 的持久化屏障。
+            // 对象目录在桶窗口已建，但「窗口 → 取到对象锁」之间可能被删（delete 抢先），
+            // 此处幂等重建（delete 走对象锁，此后不会再拆）
             tokio::fs::create_dir_all(&obj_dir).await?;
             tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
             if self.cfg.fsync {

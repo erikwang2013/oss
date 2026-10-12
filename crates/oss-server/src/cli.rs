@@ -1,8 +1,9 @@
-//! 命令行入口：`oss-server [serve|groups|build|clean <days>]`。
+//! 命令行入口：`oss-server [serve|groups|build|clean <days>|fsck [--repair]]`。
 //!
 //! 功能规格 §18.1 的 M1 三条运维命令；三条动作本身在 aetherupload 内核里已有实现
 //! （crate 的 `console.rs`），本模块只做「解析参数 → 走同一条启动自举 → 引出 → 退出码」，
-//! 外加一处内核管不到的补充：`.oss.sys/tmp/` 的孤儿上传目录（见 [`run`] 的 clean 分支）。
+//! 外加内核管不到的部分：`.oss.sys/tmp/` 的孤儿上传目录（[`run`] 的 clean 分支）与
+//! xl-store 的盘上巡检（fsck 分支，M2b-2 Task 10）。
 
 use std::time::{Duration, SystemTime};
 
@@ -12,12 +13,13 @@ use crate::state::AppState;
 pub const CONFIG_PATH: &str = "oss.toml";
 
 pub const USAGE: &str = "\
-用法：oss-server [serve|groups|build|clean <days>]
+用法：oss-server [serve|groups|build|clean <days>|fsck [--repair]]
 
   serve          启动服务（默认，无参数时同此）
   groups         建分组目录（幂等；不建就一定上传失败）
   build          按磁盘现状重建秒传索引
   clean <days>   按 mtime 回收超过 days 天的残骸（暂存盘 _header 与 *.part；数据盘 trash/tmp 孤儿与未引用的版本目录；days 限 1..=36525）
+  fsck [--repair] 全盘巡检（孤儿版本目录、EC 分片缺/坏、tmp/trash 计数）；--repair 执行最小修复（删孤儿 + 读时修分片）；报告落 .oss.sys/fsck/<时间戳>.json
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +28,7 @@ pub enum Command {
     Groups,
     Build,
     Clean { days: i64 },
+    Fsck { repair: bool },
 }
 
 /// 解析子命令（入参为去掉 argv[0] 后的参数）。未知子命令或多余参数 → `Err(用法)`（调用方 exit 2）。
@@ -47,6 +50,8 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
             Ok(days) if (1..=36_525).contains(&days) => Ok(Command::Clean { days }),
             _ => Err(USAGE),
         },
+        ("fsck", []) => Ok(Command::Fsck { repair: false }),
+        ("fsck", [flag]) if flag == "--repair" => Ok(Command::Fsck { repair: true }),
         _ => Err(USAGE),
     }
 }
@@ -111,6 +116,53 @@ pub async fn run(
                 }
             }
         }
+        Command::Fsck { repair } => {
+            let report = match state.store.fsck(repair).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: fsck 巡检失败: {e}");
+                    return Ok(1);
+                }
+            };
+            // 报告落盘：`.oss.sys/fsck/<时间戳>.json`（设计 §4.1 预留目录；写失败不掩结论）
+            let dir = state
+                .store
+                .root()
+                .join(xl_store::layout::SYS_DIR)
+                .join("fsck");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("警告: 无法创建 fsck 报告目录 {}: {e}", dir.display());
+            } else {
+                let ts = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = dir.join(format!("{ts}.json"));
+                match serde_json::to_string_pretty(&report) {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&path, json) {
+                            eprintln!("警告: fsck 报告写入失败 {}: {e}", path.display());
+                        } else {
+                            println!("fsck 报告: {}", path.display());
+                        }
+                    }
+                    Err(e) => eprintln!("警告: fsck 报告序列化失败: {e}"),
+                }
+            }
+            println!(
+                "fsck: {} 盘 / {} 对象 / meta 损坏 {} / 孤儿目录 {} / 分片缺 {} 坏 {} / tmp {} trash {}{}",
+                report.drives,
+                report.objects_scanned,
+                report.corrupt_meta,
+                report.orphan_dirs.len(),
+                report.missing_shards,
+                report.bad_shards,
+                report.tmp_entries,
+                report.trash_entries,
+                if repair { "（已修复）" } else { "" }
+            );
+            Ok(0)
+        }
     }
 }
 
@@ -141,6 +193,14 @@ mod tests {
             parse_args(&args(&["clean", "3"])),
             Ok(Command::Clean { days: 3 })
         );
+        assert_eq!(
+            parse_args(&args(&["fsck"])),
+            Ok(Command::Fsck { repair: false })
+        );
+        assert_eq!(
+            parse_args(&args(&["fsck", "--repair"])),
+            Ok(Command::Fsck { repair: true })
+        );
     }
 
     #[test]
@@ -154,7 +214,9 @@ mod tests {
             &["clean", "abc"][..],
             &["clean", "1", "x"][..], // 多余参数不算 clean 的 days
             &["clean", "999999999999999999999"][..], // 超出 i64
-            &["/etc/oss.toml"][..],   // 旧的「首参=配置路径」不再是合法用法
+            &["fsck", "--dry-run"][..], // fsck 只认 --repair
+            &["fsck", "--repair", "x"][..],
+            &["/etc/oss.toml"][..], // 旧的「首参=配置路径」不再是合法用法
         ] {
             assert_eq!(parse_args(&args(bad)), Err(USAGE), "应拒绝: {bad:?}");
         }

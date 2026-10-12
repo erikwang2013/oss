@@ -104,6 +104,19 @@ impl Store {
                     let mut subs = tokio::fs::read_dir(object.path()).await?;
                     while let Some(sub) = subs.next_entry().await? {
                         if !sub.file_type().await?.is_dir() {
+                            // R7：对象目录内的 `xl.meta.new` 残骸（翻转失败遗留）按同 mtime 窗口回收
+                            if sub.file_name().to_string_lossy() == crate::meta::META_NEW_FILE {
+                                let stale = sub
+                                    .metadata()
+                                    .await
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .is_some_and(|t| t < due);
+                                if stale {
+                                    let _ = tokio::fs::remove_file(sub.path()).await;
+                                    removed += 1;
+                                }
+                            }
                             continue;
                         }
                         let sub_name = sub.file_name().to_string_lossy().into_owned();

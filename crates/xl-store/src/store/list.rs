@@ -78,29 +78,36 @@ impl Store {
     }
 
     // 可见性等价于原先在 crate::store 里的私有：store 子树（含 store::tests）可用，子树外不可见。
+    /// 评审 R3：各盘取并集（drive0 掉线不得让列举报 NoSuchBucket/空）。任一盘读到桶目录即算
+    /// 「见过」；全盘 NotFound = 桶被并发删除的窗口 → NoSuchBucket（而不是把裸 IO 错误抛给上层）。
     pub(in crate::store) async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        let mut entries =
-            match tokio::fs::read_dir(layout::bucket_dir(self.cfg.root(), bucket)).await {
+        let mut keys = std::collections::BTreeSet::new();
+        let mut seen = false;
+        for drive in &self.cfg.drives {
+            let mut entries = match tokio::fs::read_dir(layout::bucket_dir(drive, bucket)).await {
                 Ok(e) => e,
-                // 桶被并发删除的窗口：映射 NoSuchBucket，而不是把裸 IO 错误抛给上层
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(Error::NoSuchBucket(bucket.to_string()));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
-        while let Some(entry) = entries.next_entry().await? {
-            if !entry.file_type().await?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // 杂物目录（手工塞入、崩溃残留）解出的键非法：跳过并告警，不能让一个目录名
-            // 把整桶列举打挂；真实对象的目录名由 object_dir_name 生成，必过同一套校验。
-            match layout::key_from_dir_name(&name) {
-                Ok(k) => keys.push(k),
-                Err(e) => tracing::warn!(dir = ?name, error = %e, "跳过非法对象目录"),
+            seen = true;
+            while let Some(entry) = entries.next_entry().await? {
+                if !entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // 杂物目录（手工塞入、崩溃残留）解出的键非法：跳过并告警，不能让一个目录名
+                // 把整桶列举打挂；真实对象的目录名由 object_dir_name 生成，必过同一套校验。
+                match layout::key_from_dir_name(&name) {
+                    Ok(k) => {
+                        keys.insert(k);
+                    }
+                    Err(e) => tracing::warn!(dir = ?name, error = %e, "跳过非法对象目录"),
+                }
             }
         }
-        Ok(keys)
+        if !seen {
+            return Err(Error::NoSuchBucket(bucket.to_string()));
+        }
+        Ok(keys.into_iter().collect())
     }
 }

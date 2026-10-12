@@ -68,20 +68,32 @@ impl Store {
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
     ) -> Result<String> {
-        self.ensure_bucket(bucket).await?;
         layout::validate_key(key)?;
-        let _guard = self.lock_for(bucket, key).lock_owned().await;
+        // 桶窗口（M2b-2 Task 10，同单段 PUT）：ensure + 对象目录先落
+        let obj_dir = {
+            let _bguard = self.lock_bucket_owned(bucket).await;
+            self.ensure_bucket(bucket).await?;
+            let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
+            tokio::fs::create_dir_all(&dir).await?;
+            dir
+        };
+        let _guard = self.lock_object(bucket, key).await?;
 
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let dir = layout::object_dir(self.cfg.root(), bucket, key)?.join(&upload_id);
-        tokio::fs::create_dir_all(&dir).await?;
+        let dir = obj_dir.join(&upload_id);
         let meta = MpuMeta {
             content_type,
             user_metadata,
             created_nanos: now_nanos(),
         };
         let bytes = rmp_serde::to_vec_named(&meta).map_err(|e| Error::Encode(e.to_string()))?;
-        tokio::fs::write(dir.join(MPU_META_FILE), bytes).await?;
+        tokio::fs::create_dir_all(&dir).await?;
+        if let Err(e) = tokio::fs::write(dir.join(MPU_META_FILE), bytes).await {
+            // 失败清理：暂存区 + 可能新建的空对象目录（空目录会卡住删桶）
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            let _ = tokio::fs::remove_dir(&obj_dir).await;
+            return Err(e.into());
+        }
         Ok(upload_id)
     }
 
@@ -166,11 +178,17 @@ impl Store {
         upload_id: &str,
         parts: &[(u16, String)],
     ) -> Result<ObjectInfo> {
-        self.ensure_bucket(bucket).await?;
         layout::validate_key(key)?;
-        let _guard = self.lock_for(bucket, key).lock_owned().await;
+        // 桶窗口（同单段 PUT）
+        let obj_dir = {
+            let _bguard = self.lock_bucket_owned(bucket).await;
+            self.ensure_bucket(bucket).await?;
+            let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
+            tokio::fs::create_dir_all(&dir).await?;
+            dir
+        };
+        let _guard = self.lock_object(bucket, key).await?;
 
-        let obj_dir = layout::object_dir(self.cfg.root(), bucket, key)?;
         let dir = self.mpu_dir(bucket, key, upload_id)?;
         if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
@@ -319,6 +337,7 @@ impl Store {
             };
             if flipped == 0 {
                 self.rollback_versions(bucket, key, &uuid).await;
+                self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
                 let _ = tokio::fs::remove_dir_all(&tmp).await;
                 return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
             }
@@ -365,7 +384,7 @@ impl Store {
     ) -> Result<()> {
         self.ensure_bucket(bucket).await?;
         layout::validate_key(key)?;
-        let _guard = self.lock_for(bucket, key).lock_owned().await;
+        let _guard = self.lock_object(bucket, key).await?;
         let dir = self.mpu_dir(bucket, key, upload_id)?;
         if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
