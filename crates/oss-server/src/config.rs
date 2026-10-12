@@ -7,7 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub listen: String,
+    /// 单盘形态的数据目录（`data_dirs` 未配置时使用）。M2b-2 起多盘用 `data_dirs`。
     pub data_dir: PathBuf,
+    /// 多盘形态的数据盘数组（M2b-2）；配置了它则忽略 `data_dir`。
+    /// EC 8+4 需 ≥ 12 盘；单盘 = 无冗余（仍有 EC 形态，见 xl-store `open` 的盘数裁决）。
+    #[serde(default)]
+    pub data_dirs: Option<Vec<PathBuf>>,
+    /// EC 配置节 `[ec]`：enabled（默认 true）/ data（8）/ parity（4）/ inline_threshold（128 KiB）。
+    #[serde(default)]
+    pub ec: EcToml,
     pub staging_dir: PathBuf,
     pub database_url: String,
     pub jwt_secret: String,
@@ -17,6 +25,44 @@ pub struct AppConfig {
     pub max_put_bytes: usize,
     #[serde(default)]
     pub groups: Vec<GroupTarget>,
+}
+
+/// `[ec]` 配置节（映射到 xl-store 的 `EcConfig` + `inline_threshold`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EcToml {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_ec_data")]
+    pub data: u8,
+    #[serde(default = "default_ec_parity")]
+    pub parity: u8,
+    #[serde(default = "default_inline_threshold")]
+    pub inline_threshold: u64,
+}
+
+impl Default for EcToml {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            data: default_ec_data(),
+            parity: default_ec_parity(),
+            inline_threshold: default_inline_threshold(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_ec_data() -> u8 {
+    8
+}
+fn default_ec_parity() -> u8 {
+    4
+}
+fn default_inline_threshold() -> u64 {
+    // 与 xl-store meta::MAX_INLINE 一致（128 KiB）；超出会被 Store::open 拒绝
+    128 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

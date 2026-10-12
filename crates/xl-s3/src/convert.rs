@@ -18,7 +18,10 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         StoreError::EntityTooSmall(_) => S3ErrorCode::EntityTooSmall,
         StoreError::BadDigest(_) => S3ErrorCode::BadDigest,
         // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体
-        StoreError::CorruptMeta(_) | StoreError::Encode(_) | StoreError::Io(_) => {
+        StoreError::QuorumUnmet(_)
+        | StoreError::CorruptMeta(_)
+        | StoreError::Encode(_)
+        | StoreError::Io(_) => {
             tracing::error!(error = ?e, "store internal error");
             return S3Error::with_message(S3ErrorCode::InternalError, "internal error");
         }

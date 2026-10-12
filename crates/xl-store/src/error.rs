@@ -26,6 +26,9 @@ pub enum Error {
     EntityTooSmall(String),
     #[error("bad digest: {0}")]
     BadDigest(String),
+    /// M2b-2：多盘写入未达 quorum（存活分片 < data+1）。可重试（客户端层面）。
+    #[error("write quorum unmet: {0}")]
+    QuorumUnmet(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("encode error: {0}")]

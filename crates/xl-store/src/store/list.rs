@@ -81,7 +81,7 @@ impl Store {
     pub(in crate::store) async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
         let mut entries =
-            match tokio::fs::read_dir(layout::bucket_dir(&self.cfg.root, bucket)).await {
+            match tokio::fs::read_dir(layout::bucket_dir(self.cfg.root(), bucket)).await {
                 Ok(e) => e,
                 // 桶被并发删除的窗口：映射 NoSuchBucket，而不是把裸 IO 错误抛给上层
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

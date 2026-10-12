@@ -1347,6 +1347,279 @@ async fn multipart_complete_over_threshold_writes_ec() {
     assert_eq!(&bytes[..], &data[..]);
 }
 
+// ---- M2b-2：多盘（Task 7/8） ----
+
+/// 12 盘 Store（每盘一个 tempdir；EC 8+4 的最小全冗余形态）。
+async fn store_12() -> (Store, Vec<tempfile::TempDir>) {
+    let dirs: Vec<_> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    let s = Store::open(cfg).await.unwrap();
+    (s, dirs)
+}
+
+#[tokio::test]
+async fn multi_drive_ec_spreads_one_shard_per_drive_and_roundtrips() {
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(300_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let v = m.latest().unwrap();
+    let l = v.data_layout.as_ref().unwrap();
+    assert_eq!(l.shards.len(), 12);
+    // 12 盘 × 每盘恰 1 片；每盘都有 meta 副本
+    for (d, dir) in dirs.iter().enumerate() {
+        let obj_dir = layout::object_dir(dir.path(), "alpha", "k").unwrap();
+        assert!(
+            tokio::fs::try_exists(obj_dir.join(meta::META_FILE))
+                .await
+                .unwrap(),
+            "盘 {d} 应有 meta 副本"
+        );
+        let vdir = obj_dir.join(&v.part.uuid);
+        assert_eq!(shard_files(&vdir), 1, "盘 {d} 应恰有 1 片");
+        assert_eq!(l.shards[d].drive as usize, d, "分片 {d} 应落盘 {d}");
+    }
+    // 读回 + Range
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+    let r = s
+        .get_object_range("alpha", "k", 100_000..100_010)
+        .await
+        .unwrap();
+    assert_eq!(&r[..], &data[100_000..100_010]);
+}
+
+#[tokio::test]
+async fn multi_drive_pull_two_then_five_drives() {
+    // 设计验收 #1 的本地版：拔盘（整目录 rename 走）后读写行为
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let stash = tempfile::tempdir().unwrap();
+
+    let pull = |i: usize| {
+        let from = dirs[i].path().to_path_buf();
+        let to = stash.path().join(format!("pulled-{i}"));
+        std::fs::rename(&from, &to).unwrap();
+    };
+
+    let data = payload(300_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    pull(2);
+    pull(5);
+    // 拔 2 盘：读成功（重建 2 片）；再写成功（健康盘 10 ≥ 9 quorum）
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..], "拔 2 盘读必须成功");
+    let data2 = payload(200_000);
+    s.put_object("alpha", "k2", data2.clone(), None)
+        .await
+        .unwrap();
+    let (_, bytes) = s.get_object("alpha", "k2").await.unwrap();
+    assert_eq!(&bytes[..], &data2[..], "拔 2 盘写必须成功");
+
+    // 再拔 2 盘（共 4 拔）：读 k 仍成功（8 片在 = data 边界）；写必须 QuorumUnmet 且无残留
+    pull(7);
+    pull(9);
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..], "拔 4 盘读必须成功（8 = data）");
+    let err = s.put_object("alpha", "k3", payload(200_000), None).await;
+    assert!(
+        matches!(err, Err(Error::QuorumUnmet(_))),
+        "8 < 9 必须 QuorumUnmet: {err:?}"
+    );
+    // 回滚：k3 未提交（head 报 NoSuchKey），健康盘上无 k3 的版本目录残留
+    assert!(matches!(
+        s.head_object("alpha", "k3").await,
+        Err(Error::NoSuchKey(_))
+    ));
+    for i in [0, 1, 3, 4] {
+        let obj_dir = layout::object_dir(dirs[i].path(), "alpha", "k3").unwrap();
+        if tokio::fs::try_exists(&obj_dir).await.unwrap() {
+            let mut entries = tokio::fs::read_dir(&obj_dir).await.unwrap();
+            assert!(
+                entries.next_entry().await.unwrap().is_none(),
+                "盘 {i} 上 k3 目录应无残留版本"
+            );
+        }
+    }
+
+    // 拔第 5 盘：7 < 8 → 读 fail-closed
+    pull(11);
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::CorruptMeta(_))
+    ));
+}
+
+#[tokio::test]
+async fn multi_drive_read_repairs_missing_shard() {
+    // 读时修（M2b-2 最小版）：缺 1 片 → 重建成功 + best-effort 回写
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(300_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let v = m.latest().unwrap();
+    let shard2 = layout::object_dir(dirs[2].path(), "alpha", "k")
+        .unwrap()
+        .join(&v.part.uuid)
+        .join("part.1.2");
+    std::fs::remove_file(&shard2).unwrap();
+
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+    assert!(
+        tokio::fs::try_exists(&shard2).await.unwrap(),
+        "读时修应把缺失分片写回"
+    );
+    // 回写的片内容与 CRC 与原片一致（再次读不再依赖重建）
+    let sref = &m.latest().unwrap().data_layout.as_ref().unwrap().shards[2];
+    let repaired = std::fs::read(&shard2).unwrap();
+    assert_eq!(ec::crc32c_of(&repaired), sref.crc32c);
+}
+
+#[tokio::test]
+async fn multi_drive_inline_replication_survives_all_but_one_drive() {
+    // 内联对象：数据在 meta 里，12 盘各一份副本——只剩 1 盘也能读（M2b-1 记录的「内联无冗余」边界在此收口）
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let stash = tempfile::tempdir().unwrap();
+    let data = payload(4096);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let v = m.latest().unwrap();
+    assert!(v.inline.is_some());
+    for (d, dir) in dirs.iter().enumerate() {
+        // 内联多盘：数据只在 meta 里——连版本目录都不建，没有任何数据文件
+        let vdir = layout::object_dir(dir.path(), "alpha", "k")
+            .unwrap()
+            .join(&v.part.uuid);
+        assert!(
+            !tokio::fs::try_exists(&vdir).await.unwrap(),
+            "内联不应建版本目录（盘 {d}）"
+        );
+    }
+    for (i, dir) in dirs.iter().enumerate().take(11) {
+        std::fs::rename(dir.path(), stash.path().join(format!("pulled-{i}"))).unwrap();
+    }
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(
+        &bytes[..],
+        &data[..],
+        "11 盘拔掉，最后 1 盘的 meta 副本仍可服务"
+    );
+}
+
+#[tokio::test]
+async fn multi_drive_meta_latest_wins_on_torn_replicas() {
+    // 撕裂缝中的读侧契约（铁律②读侧）：各盘 meta 不一致时 latest.mod_time 最新者胜
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let mk = |t: i64, content: &[u8]| {
+        let bytes = content.to_vec();
+        XlMeta {
+            object_key: "torn".into(),
+            versions: vec![meta::Version {
+                version_id: uuid::Uuid::nil(),
+                mod_time_nanos: t,
+                size: bytes.len() as u64,
+                etag: "e".into(),
+                content_type: None,
+                user_metadata: Default::default(),
+                part: meta::PartRef {
+                    uuid: format!("uuid-t{t}"),
+                    part: 1,
+                    size: bytes.len() as u64,
+                    sha256: String::new(),
+                },
+                parts: None,
+                checksum: None,
+                data_layout: None,
+                inline: Some(meta::InlineData { bytes }),
+            }],
+        }
+    };
+    for (i, dir) in dirs.iter().enumerate() {
+        let obj_dir = layout::object_dir(dir.path(), "alpha", "torn").unwrap();
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        let m = if i < 6 {
+            mk(100, b"old")
+        } else {
+            mk(200, b"new")
+        };
+        tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    let (_, bytes) = s.get_object("alpha", "torn").await.unwrap();
+    assert_eq!(&bytes[..], b"new", "mod_time 最新者胜");
+}
+
+#[tokio::test]
+async fn multi_drive_delete_removes_all_replicas() {
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(200_000), None)
+        .await
+        .unwrap();
+    s.delete_object("alpha", "k").await.unwrap();
+    for (i, dir) in dirs.iter().enumerate() {
+        let obj_dir = layout::object_dir(dir.path(), "alpha", "k").unwrap();
+        assert!(
+            !tokio::fs::try_exists(&obj_dir).await.unwrap(),
+            "盘 {i} 上对象目录应被删除"
+        );
+    }
+}
+
+#[tokio::test]
+async fn open_rejects_misconfigured_drive_counts() {
+    // 2..11 盘（半冗余误配）→ Err；enabled=false + 多盘 → Err
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    assert!(matches!(Store::open(cfg).await, Err(Error::Encode(_))));
+
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    cfg.ec.enabled = false;
+    assert!(matches!(Store::open(cfg).await, Err(Error::Encode(_))));
+}
+
+#[tokio::test]
+async fn ec_disabled_single_drive_writes_legacy_form() {
+    // enabled=false：M1 旧形态（单文件 part.1、无内联、无分片），读路径走旧分支
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.ec.enabled = false;
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(300_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let v = m.latest().unwrap();
+    assert!(v.data_layout.is_none() && v.inline.is_none());
+    let vdir = layout::object_dir(dir.path(), "alpha", "k")
+        .unwrap()
+        .join(&v.part.uuid);
+    assert_eq!(shard_files(&vdir), 1, "旧形态：恰一个 part.1");
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+}
+
 #[tokio::test]
 async fn legacy_parts_form_still_readable() {
     // M2a 旧对象回归：parts: Some + 多段 part.N 文件的旧形态读路径必须继续可读

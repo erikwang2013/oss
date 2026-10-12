@@ -56,7 +56,7 @@ impl Store {
     fn mpu_dir(&self, bucket: &str, key: &str, upload_id: &str) -> Result<PathBuf> {
         let id = uuid::Uuid::parse_str(upload_id)
             .map_err(|_| Error::NoSuchUpload(upload_id.to_string()))?;
-        Ok(layout::object_dir(&self.cfg.root, bucket, key)?.join(id.to_string()))
+        Ok(layout::object_dir(self.cfg.root(), bucket, key)?.join(id.to_string()))
     }
 
     /// 创建 MPU：对象目录下建 `<upload_id>/` 暂存区并写 `mpu.meta`。
@@ -73,7 +73,7 @@ impl Store {
         let _guard = self.lock_for(bucket, key).lock_owned().await;
 
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let dir = layout::object_dir(&self.cfg.root, bucket, key)?.join(&upload_id);
+        let dir = layout::object_dir(self.cfg.root(), bucket, key)?.join(&upload_id);
         tokio::fs::create_dir_all(&dir).await?;
         let meta = MpuMeta {
             content_type,
@@ -170,7 +170,7 @@ impl Store {
         layout::validate_key(key)?;
         let _guard = self.lock_for(bucket, key).lock_owned().await;
 
-        let obj_dir = layout::object_dir(&self.cfg.root, bucket, key)?;
+        let obj_dir = layout::object_dir(self.cfg.root(), bucket, key)?;
         let dir = self.mpu_dir(bucket, key, upload_id)?;
         if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
@@ -245,14 +245,27 @@ impl Store {
 
         // 装进新版本目录（内联 / EC 形态）——与单段 PUT 同一形态核心
         let uuid = uuid::Uuid::new_v4().to_string();
-        let tmp = layout::sys_dir(&self.cfg.root, "tmp").join(&uuid);
+        let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
+        let multi = self.cfg.multi_drive();
         let staged: Result<(u64, XlMeta)> = async {
             // concat_stream_verified 逐段核验 bytes == sidecar 快照，通过则 size 恒等于各段总和。
             // upload_part 不持对象锁（允许并发传不同 part）：complete 期间零件被并发重传
             // = 快照与实际字节不一致 → InvalidPart（fail-closed，让客户端重试 complete）
-            let (size, _md5, sha256, data_layout, inline) = self
-                .stage_payload(&tmp, concat_stream_verified(snapshots))
-                .await?;
+            let (size, _md5, sha256, data_layout, inline) = if multi {
+                let (s, e, sh, l, i, _touched) = self
+                    .stage_payload_multi(
+                        bucket,
+                        key,
+                        &uuid,
+                        &tmp,
+                        concat_stream_verified(snapshots),
+                    )
+                    .await?;
+                (s, e, sh, l, i)
+            } else {
+                self.stage_payload(&tmp, concat_stream_verified(snapshots))
+                    .await?
+            };
             let version = Version {
                 version_id: uuid::Uuid::nil(),
                 mod_time_nanos: now,
@@ -276,37 +289,61 @@ impl Store {
                 object_key: key.to_string(),
                 versions: vec![version],
             };
-            tokio::fs::write(tmp.join(crate::meta::META_FILE), meta.encode()?).await?;
+            if !multi {
+                tokio::fs::write(tmp.join(crate::meta::META_FILE), meta.encode()?).await?;
+            }
             Ok((size, meta))
         }
         .await;
         let (size, meta) = match staged {
             Ok(v) => v,
             Err(e) => {
+                if multi {
+                    self.rollback_versions(bucket, key, &uuid).await;
+                }
                 let _ = tokio::fs::remove_dir_all(&tmp).await;
                 return Err(e);
             }
         };
 
-        // 数据就位（同盘 rename）→ 唯一提交点
-        tokio::fs::create_dir_all(&obj_dir).await?;
-        tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
-        self.write_meta(bucket, key, &meta).await?;
+        if multi {
+            // 多盘：两阶段 meta 提交（数据已在各盘版本目录就位；见 put.rs 同款流程）
+            let quorum = self.cfg.ec.data as usize + 1;
+            let flipped = match self.write_meta(bucket, key, &meta).await {
+                Ok(n) => n,
+                Err(e) => {
+                    self.rollback_versions(bucket, key, &uuid).await;
+                    let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    return Err(e);
+                }
+            };
+            if flipped == 0 {
+                self.rollback_versions(bucket, key, &uuid).await;
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+                return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
+            }
+            if flipped < quorum {
+                tracing::warn!(
+                    flipped,
+                    quorum,
+                    "meta 翻转不足 quorum（已提交，M3 heal 补副本）"
+                );
+            }
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
+        } else {
+            // 数据就位（同盘 rename）→ 唯一提交点
+            tokio::fs::create_dir_all(&obj_dir).await?;
+            tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
+            self.write_meta(bucket, key, &meta).await?;
+        }
 
         // 暂存区收尾（best-effort：提交点已过）：mpu.meta 生死门先改名，再整目录删。
         // 若删到一半崩溃，残骸无 meta 引用，由 `reap_stale` 按 mtime 回收
         let _ = tokio::fs::rename(dir.join(MPU_META_FILE), dir.join(MPU_DONE_FILE)).await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
 
-        // 老版本进回收站（与单段 PUT 相同）
-        if let Some(old) = old_meta.as_ref().and_then(|m| m.latest()) {
-            let old_dir = obj_dir.join(&old.part.uuid);
-            let trash = layout::sys_dir(&self.cfg.root, "trash").join(&old.part.uuid);
-            if matches!(tokio::fs::try_exists(&trash).await, Ok(true)) {
-                let _ = tokio::fs::remove_dir_all(&trash).await;
-            }
-            let _ = tokio::fs::rename(&old_dir, &trash).await;
-        }
+        // 老版本进回收站（跨盘遍历，与单段 PUT 相同）
+        self.recycle_old(bucket, key, old_meta.as_ref()).await;
 
         Ok(ObjectInfo {
             key: key.to_string(),

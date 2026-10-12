@@ -1,17 +1,15 @@
 //! 读路径：HEAD / 整读 / Range 有界读（含并发覆写时的 meta 重读重试）。
 //! M2b 形态分派：`inline` → meta 内嵌字节；`data_layout` → EC 分片重建；否则旧 part 文件。
 
-use std::path::Path;
-
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, Version, XlMeta};
 
-use super::{ObjectInfo, Store, ec};
+use super::{ObjectInfo, Store, drives, ec};
 
 impl Store {
     pub(in crate::store) fn load_object_info(
@@ -51,7 +49,7 @@ impl Store {
     /// ponytail: 固定重试一次；持续覆写风暴下不保证收敛（M2 快照读解决）。
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectInfo, Bytes)> {
         self.ensure_bucket(bucket).await?;
-        let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
+        let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
         for round in 0..2 {
             let m = self
@@ -75,7 +73,7 @@ impl Store {
                 return Ok((info, Bytes::from(inline.bytes.clone())));
             }
             if let Some(l) = &v.data_layout {
-                match self.read_ec(&dir, v, l, round > 0).await? {
+                match self.read_ec(bucket, key, v, l, round > 0).await? {
                     Some(bytes) => return Ok((info, bytes)),
                     // 版本目录被并发覆写者移走/清除：重读 meta 拿新版本
                     None => continue,
@@ -117,7 +115,7 @@ impl Store {
         range: std::ops::Range<u64>,
     ) -> Result<Bytes> {
         self.ensure_bucket(bucket).await?;
-        let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
+        let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
         for round in 0..2 {
             let m = self
@@ -149,7 +147,7 @@ impl Store {
                 ));
             }
             if let Some(l) = &v.data_layout {
-                match self.read_ec(&dir, v, l, round > 0).await? {
+                match self.read_ec(bucket, key, v, l, round > 0).await? {
                     Some(bytes) => {
                         return Ok(bytes.slice(range.start as usize..range.end as usize));
                     }
@@ -206,6 +204,7 @@ impl Store {
 
     /// EC 读：逐片读取 + CRC32C/长度校验（坏片视同缺失）→ 重建 → 截断到对象长度 → SHA256 终验。
     ///
+    /// 分片位置按拓扑下标解引用：`drives[s.drive] /<bucket>/<展键>/<uuid>/part.<part>.<shard>`。
     /// 分片是逐个读的，并发删除/覆写的中间态会让读者看到「前缀片在、后缀片没了」的半截视图，
     /// 与真实损坏（盘丢片）不可在单轮内区分——因此 `strict`（末轮）之前，「存活不足」返回
     /// `Ok(None)` 让调用方重读 meta 一轮：
@@ -214,10 +213,12 @@ impl Store {
     ///     只要读到过坏片字节（CRC/长度不符）或存活片不全但不为空 → `Err(CorruptMeta)`
     ///     （有字节落盘的损坏不得伪装成 404——fail-closed，不吐坏数据）。
     ///
-    /// 重建后 SHA256 与提交记录不符同样 `Err`。
+    /// 重建后 SHA256 与提交记录不符同样 `Err`。重建成功且存在缺失/坏片时做**读时修**
+    /// （best-effort 回写，ponytail: 无后台 heal；M4 的 heal 任务补全）。
     async fn read_ec(
         &self,
-        dir: &Path,
+        bucket: &str,
+        key: &str,
         v: &Version,
         l: &meta::DataLayout,
         strict: bool,
@@ -225,14 +226,22 @@ impl Store {
         let cfg = ec::EcConfig {
             data: l.data,
             parity: l.parity,
+            ..Default::default()
         };
         let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(l.shards.len());
+        // 缺失/坏片的下标（读时修的输入）
+        let mut missing: Vec<usize> = Vec::new();
         // 读到过 CRC32C/长度不符的字节：区分「全片消失」（可能并发窗口/真删）与「片坏掉」（真损坏）
         let mut bad_bytes = false;
-        for s in &l.shards {
-            let path = dir
-                .join(&v.part.uuid)
-                .join(format!("part.{}.{}", s.part, s.shard));
+        for (i, s) in l.shards.iter().enumerate() {
+            // 盘下标是 meta 里的外部输入：越界视同该片缺失（防呆，不 panic）
+            let Some(drive) = drives::drive_root(&self.cfg.drives, s.drive) else {
+                tracing::warn!(drive = s.drive, "EC 分片盘下标越界，视同缺失");
+                missing.push(i);
+                shards.push(None);
+                continue;
+            };
+            let path = drives::shard_path(drive, bucket, key, &v.part.uuid, s)?;
             match tokio::fs::read(&path).await {
                 Ok(bytes) => {
                     if ec::crc32c_of(&bytes) == s.crc32c && bytes.len() as u64 == s.size {
@@ -240,10 +249,14 @@ impl Store {
                     } else {
                         tracing::warn!(path = %path.display(), "EC 分片校验不符（CRC32C/长度），视同缺失");
                         bad_bytes = true;
+                        missing.push(i);
                         shards.push(None);
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => shards.push(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(i);
+                    shards.push(None);
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -277,6 +290,62 @@ impl Store {
                 v.size
             )));
         }
+        if !missing.is_empty() {
+            self.repair_shards(bucket, key, v, l, &payload, &missing)
+                .await;
+        }
         Ok(Some(Bytes::from(payload)))
+    }
+
+    /// 读时修（M2b-2 最小版）：把重建出的数据重新编码，回写缺失/坏片的那个分片文件。
+    /// best-effort——修复失败只 warn（读已成功，绝不因修复失败把读变成错误）。
+    /// ponytail: 无后台 heal / 无 quorum 校验（盘全掉时修复静默失败）；M4 的 heal 任务补全。
+    async fn repair_shards(
+        &self,
+        bucket: &str,
+        key: &str,
+        v: &Version,
+        l: &meta::DataLayout,
+        payload: &[u8],
+        missing: &[usize],
+    ) {
+        let cfg = ec::EcConfig {
+            data: l.data,
+            parity: l.parity,
+            ..Default::default()
+        };
+        let Ok(shards) = ec::encode(payload, cfg) else {
+            return;
+        };
+        for &i in missing {
+            let Some(s) = l.shards.get(i) else { continue };
+            let Some(drive) = drives::drive_root(&self.cfg.drives, s.drive) else {
+                continue;
+            };
+            // 存活探测：不得对掉线盘「修复」——挂载点目录仍在父 fs 上，盲写会填满根盘，
+            // 测试里更会直接把「拔走」的盘原地重建（探针语义见 drives::drive_up）
+            if !drives::drive_up(drive).await {
+                continue;
+            }
+            let Ok(path) = drives::shard_path(drive, bucket, key, &v.part.uuid, s) else {
+                continue;
+            };
+            let res: Result<()> = async {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let mut f = tokio::fs::File::create(&path).await?;
+                f.write_all(&shards[i]).await?;
+                f.flush().await?;
+                if self.cfg.fsync {
+                    f.sync_all().await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = res {
+                tracing::warn!(path = %path.display(), error = %e, "读时修回写失败");
+            }
+        }
     }
 }

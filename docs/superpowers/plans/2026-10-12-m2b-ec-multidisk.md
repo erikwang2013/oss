@@ -264,34 +264,42 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
   - 每盘持有完整命名空间（对象目录 + meta 副本）；EC 分片按 `ShardRef.drive` 分发到 `drives[i]` 下**同构路径**：`<drive>/<bucket>/<展平键>/<uuid>/part.1.<shard>`——换挂载点/换盘不影响寻址（铁律 ⑤）。
   - **启动校验（含单盘向上兼容裁决——评审补）**：`drives.len() < data + parity` 时不得无条件 Err——单盘/少盘是 M1/M2a 的既有部署形态，升级即破不可接受。裁决：`[ec] enabled` 可配（默认 true）——**enabled=true 且盘数不足 → 构造期 Err**（大声失败，设计 §4.3 的 8+4 需要 ≥12 盘位，测试用 12 个 tempdir）；**enabled=false → 单文件旧形态继续（新写仍走 `data_layout: None`），并 warn 提示无冗余**。README/迁移说明必须写清这条开关。
 - [ ] **Step 2:** 实现 `drives.rs`：`enum DriveState { Up, Missing }`、存活探测（写探针文件）、`shard_path(drives, &ShardRef, bucket, key, uuid)`、quorum 判定。
-- [ ] **Step 3:** `oss-server/config.rs`：`data_dirs: Option<Vec<PathBuf>>`（有它用数组；否则 `data_dir` 单盘兼容）；`[ec] data/parity`、`inline_threshold` 可配；`state.rs` 构造点同步。
-- [ ] **Step 4:** gc/clean 多盘遍历（每盘各自的 `.oss.sys`）；提交 `feat(xl-store): 多盘——drives[]、对象→set 映射（单 set）、分片按拓扑下标分发`。
+- [x] **Step 3:** `oss-server/config.rs`：`data_dirs: Option<Vec<PathBuf>>`（有它用数组；否则 `data_dir` 单盘兼容）；`[ec] data/parity`、`inline_threshold` 可配；`state.rs` 构造点同步。（`[ec] enabled` 一并可配，见落地裁决。）
+- [x] **Step 4:** gc/clean 多盘遍历（每盘各自的 `.oss.sys`）。（与 Task 8 合并为一次提交。）提交 `feat(xl-store): 多盘——drives[]、对象→set 映射（单 set）、分片按拓扑下标分发`。
+
+**落地裁决（Task 7 轮）：**
+1. **盘数校验的「升级不破」细化**（任务书原文「enabled=true 且盘数不足 → Err」会打断 M2b-1 已发布的单盘 EC 默认配置）：落为——单盘恒合法（enabled=true 时即 M2b-1 形态，warn「无冗余」；enabled=false 时即 M1 旧形态）；**多盘（≥2）且 < data+parity → Err**（半冗余误配大声失败）；enabled=false + 多盘 → Err（旧形态无多盘语义）。
+2. **盘存活探测是真需求不是仪式**（测试暴露）：挂载点掉线后挂载点**目录**仍在父文件系统上，`create_dir_all` 会把数据盲写进根盘且误报成功。`drives::drive_up` = 检查该盘 `.oss.sys` 存在（`open` 时建的探针信标，不再写额外探针文件）；多盘落盘、meta 准备、读时修三处落盘前必探。
+3. **桶命名空间镜像**（测试暴露）：`create/delete_bucket` 在各盘同建同删（半途失败回滚已建）；`ensure_bucket/bucket_exists` 任一在册盘在即视为存在。列举仍以 drive0 为枚举源（ponytail: drive0 掉线时列举降级；M3 多 set 时升级）。
+4. **`set_index` 留形不留行为**：公式与测试落地，实现中未接（单 set 恒 0）；`#[allow(dead_code)]` 标注。
 
 ## Task 8: quorum 写与拔盘容忍
 
 **Files:** Modify: `store/put.rs`、`store/read.rs`、`store/drives.rs`
 
-- [ ] **Step 1: quorum 裁决（写进注释）**：写成功条件 = **成功落盘分片数 ≥ data + 1**（即至少 9/12；可容忍 parity−1=3 片并发失败；已成功片数在 [9,12] 之间即提交）。低于阈值 → 回滚（删已写片）→ `Err(Error::QuorumUnmet)`。读侧容忍 `≤ parity` 片缺失并重建。
-- [ ] **Step 2:** 测试（拔盘模拟 = 把某 drive 目录替换为不可写/移走）：
-  - 12 盘全在：PUT → 12 片齐全；
-  - 移走 2 盘：PUT 成功（10 片）+ GET 成功（重建 2 片）——**设计验收 #1 的本地版**；
-  - 移走 4 盘：GET 成功（边界）、移走 5 盘：GET `Err`；
-  - 移走 4 盘时 PUT：成功片 8 < 9 → `QuorumUnmet` 且已写片被回滚（盘上无残留）；
-  - 回插（移回的目录恢复）：`oss-server scrub`（Task 10）或读重建把缺片补回——**M2b 的写修复最小版**只在读成功后 best-effort 回写坏/缺片（`ponytail: 读时修，无后台 heal；M4 的 heal 任务补全`）。
-- [ ] **Step 3:** meta 复制：每盘的 `<uuid>` 候选 meta 与提交后 meta 在各盘对象目录 **各自写一份**（meta quorum = 全部在册盘；单盘失败不阻提交——与分片 quorum 同阈值）；读 meta 取任意可用盘，**多盘不一致时以 `mod_time_nanos` 最新者胜**（设计铁律 ② 的读侧，M3 的 heal 前置形态）。
-- [ ] **Step 4:** 提交 `feat(xl-store): 写 quorum（≥ data+1）与拔盘容忍——读重建 + 读时修`。
+- [x] **Step 1: quorum 裁决（写进注释）**：写成功条件 = **成功落盘分片数 ≥ data + 1**（即至少 9/12；可容忍 parity−1=3 片并发失败；已成功片数在 [9,12] 之间即提交）。低于阈值 → 回滚（删已写片）→ `Err(Error::QuorumUnmet)`。读侧容忍 `≤ parity` 片缺失并重建。
+- [x] **Step 2:** 测试（拔盘模拟 = 把某 drive 目录替换为不可写/移走）：全部落地于 `multi_drive_pull_two_then_five_drives` 与 `multi_drive_read_repairs_missing_shard`。
+- [x] **Step 3:** meta 复制：每盘的 `<uuid>` 候选 meta 与提交后 meta 在各盘对象目录 **各自写一份**；读 meta 取任意可用盘，**多盘不一致时以 `mod_time_nanos` 最新者胜**（设计铁律 ② 的读侧，M3 的 heal 前置形态）。落地为**两阶段提交**（见下述裁决 1），非「尽力而为计数」。
+- [x] **Step 4:** 提交 `feat(xl-store): 写 quorum（≥ data+1）与拔盘容忍——读重建 + 读时修`。（与 Task 7 合并为一次提交。）
+
+**落地裁决（Task 8 轮）：**
+1. **meta 提交 = 两阶段**（任务书「meta quorum = 全部在册盘；单盘失败不阻提交——与分片 quorum 同阈值」在「部分翻转后回滚」上语义自相矛盾——commit point 翻转不可逆。两阶段消解）：阶段一全盘写 `xl.meta.new`+fsync，**准备数 ≥ data+1 才进入翻转**；不足 → 清 `.new`（一盘未翻转）→ `QuorumUnmet` → 数据安全回滚。阶段二 rename 近乎瞬时，失败仅 warn（≥1 翻转即已提交；全失败仍属未提交，调用方回滚）。
+2. **多盘写协议没有跨盘 rename**：数据分片直写各盘版本目录（`<drive>/…/<uuid>/part.1.<i>`），meta 翻转即各盘提交点；单盘流程（tmp→rename→write_meta）逐字节不变。
+3. **读时修**：重建成功后 best-effort 回写缺失/坏片（含存活探测；不做 quorum 校验、无后台 heal——M4 补）。
+4. **内联多盘 = meta 复制即数据复制**：连版本目录都不落（数据纯在 meta 里）——`multi_drive_inline_replication_survives_all_but_one_drive` 钉死「只剩 1 盘仍可读」，收口 M2b-1 记录的「单盘内联无冗余」边界。
+5. **拔盘即探测**：见 Task 7 裁决 2——读时修同样先探（否则会把「拔走」的盘原地重建，测试曾实际复现）。
 
 ## Task 9: 断电一致性（目录 fsync 复核 + kill -9）
 
 **Files:** Modify: `store/put.rs`（fsync 序）、`store/tests.rs`、`tests/`（进程级用例）
 
-- [ ] **Step 1: 复核现有假设（代码注释已明确挂着）**：「ext4/XFS 隐含提交先前的 rename，故提交点一次 rename 即可；**没有目录 fsync**」。M2b 处置：`fsync=true` 时在**两处 rename 之后**补目录 fsync（封装 `sync_dir(path)`：`File::open(dir)?.sync_all()`，两处 = tmp→对象目录、meta.new→meta）；并在文档标注：目录 fsync 在部分文件系统上返回 EINVAL（忽略并 warn）——物理保证需按盘上文件系统复核。
-- [ ] **Step 2: kill -9 用例**（集成测试形态）：spawn `oss-server` 子进程写入大对象 → 在提交点前 kill -9（用环境变量注入测试钩子：写第 8 片后 `std::process::abort()`——**测试专用 feature/环境变量门控**，不进生产路径）→ 重启 `Store::open` → 断言：对象不可见（或旧版本可见）、自检清掉 tmp 孤儿、`find` 无泄漏半提交数据。
-- [ ] **Step 3:** 把设计验收 #3（rclone 并发 100×100 MB + 中断重试）写为 `tests/e2e_s3.sh` 的可选长跑段（`E2E_LONG=1` 门控，默认跳过——高负载机器上分钟级）。
-- [ ] **Step 4:** 提交 `feat(xl-store): 目录 fsync 复核 + kill -9 断电用例；长跑并发验收入 e2e 门控段`。
+- [x] **Step 1: 复核现有假设（代码注释已明确挂着）**：「ext4/XFS 隐含提交先前的 rename，故提交点一次 rename 即可；**没有目录 fsync**」。M2b 处置：`fsync=true` 时在**两处 rename 之后**补目录 fsync（封装 `sync_dir(path)`：`File::open(dir)?.sync_all()`，两处 = tmp→对象目录、meta.new→meta）；并在文档标注：目录 fsync 在部分文件系统上返回 EINVAL（忽略并 warn）——物理保证需按盘上文件系统复核。（**落地扩展**：多盘直写路径在每片 fsync 后补版本目录 fsync——分片目录项须先于 meta 翻转持久；`stage_payload` 收尾补 tmp 目录 fsync。）
+- [x] **Step 2: kill -9 用例**（集成测试形态）：`crates/xl-store/tests/kill9.rs`——同一测试二进制两段子进程重入：段 1 写 v1 正常退出；段 2 以 `OSS_TEST_ABORT_AFTER_SHARD=8` 写 v2、第 8 片落盘后 `std::process::abort()`（SIGABRT）。父进程断言：子进程死于信号 6、重启后 **v1 可见 / v2 无影**、`reap_transient` 清空 tmp、半提交分片被 `reap_stale` 回收且回收后 v1 仍可读。（比任务书的 oss-server 子进程版更直接：绕开 HTTP 层，注入点即提交点前的最后一步。）
+- [ ] **Step 3:** 把设计验收 #3（rclone 并发 100×100 MB + 中断重试）写为 `tests/e2e_s3.sh` 的可选长跑段（`E2E_LONG=1` 门控，默认跳过——高负载机器上分钟级）。**委派 e2e 子代理在切片二收尾时落地**（脚本是它的守备范围；本机高负载下 E2E_LONG 实跑人工触发）。
+- [x] **Step 4:** 提交 `feat(xl-store): 目录 fsync 复核 + kill -9 断电用例；长跑并发验收入 e2e 门控段`。（与 Task 7/8 合并为一次提交；Step 3 见上。）
 
 ### 切片二收尾
-- [ ] 四闸 + e2e（含 12 盘 tempdir 配置的真服务冒烟：`data_dirs` 12 目录起服务，S3 脚本 14 步回归）
+- [ ] 四闸 + e2e（含 12 盘 tempdir 配置的真服务冒烟：`data_dirs` 12 目录起服务，S3 脚本 17 步回归 + E2E_LONG 段落地）
 
 ---
 

@@ -1,5 +1,6 @@
 //! 请求间共享的应用状态。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
@@ -27,13 +28,28 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cfg = AppConfig::load(cfg_path)?;
 
-        std::fs::create_dir_all(&cfg.data_dir)
-            .map_err(|e| format!("创建数据目录 {} 失败: {e}", cfg.data_dir.display()))?;
+        // 盘数组：data_dirs 优先（多盘），否则 data_dir 单盘兼容
+        let drives: Vec<PathBuf> = cfg
+            .data_dirs
+            .clone()
+            .unwrap_or_else(|| vec![cfg.data_dir.clone()]);
+        for d in &drives {
+            std::fs::create_dir_all(d)
+                .map_err(|e| format!("创建数据目录 {} 失败: {e}", d.display()))?;
+        }
         std::fs::create_dir_all(&cfg.staging_dir)
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
         let db = Db::connect(&cfg.database_url).await?;
-        let store = Store::open(StoreConfig::new(&cfg.data_dir)).await?;
+        let mut store_cfg = StoreConfig::new(&drives[0]);
+        store_cfg.drives = drives;
+        store_cfg.ec = xl_store::store::ec::EcConfig {
+            data: cfg.ec.data,
+            parity: cfg.ec.parity,
+            enabled: cfg.ec.enabled,
+        };
+        store_cfg.inline_threshold = cfg.ec.inline_threshold;
+        let store = Store::open(store_cfg).await?;
 
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
         // OSS_ADMIN_USER / OSS_ADMIN_PASSWORD 未设置时不做任何事。

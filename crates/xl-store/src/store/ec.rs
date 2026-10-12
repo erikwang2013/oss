@@ -10,16 +10,27 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::error::{Error, Result};
 
-/// EC 配置：data + parity 片数（默认 8+4；可配 4+2 / 6+3 / 12+4 等）。
+/// EC 配置：data + parity 片数（默认 8+4；可配 4+2 / 6+3 / 12+4 等）+ 总开关。
+/// `enabled=false` = M1 旧形态（单文件 part.1、无内联、无分片）——只支持单盘（`open` 校验）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EcConfig {
     pub data: u8,
     pub parity: u8,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for EcConfig {
     fn default() -> Self {
-        Self { data: 8, parity: 4 }
+        Self {
+            data: 8,
+            parity: 4,
+            enabled: true,
+        }
     }
 }
 
@@ -111,7 +122,11 @@ mod tests {
     use super::*;
 
     fn cfg() -> EcConfig {
-        EcConfig { data: 8, parity: 4 }
+        EcConfig {
+            data: 8,
+            parity: 4,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -178,7 +193,8 @@ mod tests {
                 &payload,
                 EcConfig {
                     data: 200,
-                    parity: 100
+                    parity: 100,
+                    ..Default::default()
                 }
             )
             .is_err()

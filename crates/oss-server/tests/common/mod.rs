@@ -10,6 +10,8 @@ pub async fn state(dir: &std::path::Path) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
+        data_dirs: None,
+        ec: Default::default(),
         staging_dir: dir.join("staging"),
         database_url: "sqlite::memory:".into(),
         jwt_secret: JWT_SECRET.into(),
