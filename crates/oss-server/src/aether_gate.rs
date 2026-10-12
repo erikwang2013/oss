@@ -19,11 +19,11 @@ use aetherupload::{
     ChunkBody, Problem, ResourceController, Runtime, SavedPath, UploadController,
     save_chunk_ok_to_json, upload_ok_to_json,
 };
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, FromRequest, Multipart, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use jwt_rust::JwtPayload;
 use xl_s3::access::{Acl, Action, AuthedUser};
 
@@ -171,7 +171,8 @@ async fn display(
     {
         return r;
     }
-    integrations::axum::serve(ResourceController::new(st.runtime.clone()).display(&saved_path)).await
+    integrations::axum::serve(ResourceController::new(st.runtime.clone()).display(&saved_path))
+        .await
 }
 
 async fn download(
@@ -184,8 +185,10 @@ async fn download(
     {
         return r;
     }
-    integrations::axum::serve(ResourceController::new(st.runtime.clone()).download(&saved_path, &new_name))
-        .await
+    integrations::axum::serve(
+        ResourceController::new(st.runtime.clone()).download(&saved_path, &new_name),
+    )
+    .await
 }
 
 // ---- 表单解析（照抄 crate `integrations/axum.rs` 的私有 parse_form/parse_multipart：
@@ -213,8 +216,11 @@ async fn parse_form(request: Request) -> Result<FormData, (u16, &'static str, St
     let bytes = match axum::body::Bytes::from_request(request, &()).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return Err(ParseFailure::new(FormData::new(), err.status() == StatusCode::PAYLOAD_TOO_LARGE)
-                .response());
+            return Err(ParseFailure::new(
+                FormData::new(),
+                err.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            )
+            .response());
         }
     };
     Ok(FormData::from_urlencoded(&String::from_utf8_lossy(&bytes)))

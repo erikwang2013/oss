@@ -9,8 +9,11 @@ ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
 AK="${AK:-AKIA_TEST_ACCESS_KEY}"
 SK="${SK:-SK_TEST_SECRET_KEY_0001}"
 BUCKET="e2e-$(date +%s)"
+# 权限段（步骤 15）的两个桶：授权桶与未授权桶；在 EXIT trap 里一并兜底清理
+PERM_BUCKET="zzz-perm-read-$(date +%s)"
+OTHER_BUCKET="zzz-perm-other-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; aws --endpoint-url "$ENDPOINT" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true' EXIT
+trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
@@ -185,4 +188,82 @@ fi
 echo "== 14. 删桶 =="
 aws_s3 rb "s3://$BUCKET" --force
 
-echo "S3 验收全部通过（含 M2a multipart / Range / 元数据）"
+echo "== 15. 子账户权限（三档读/写/删在 S3 面的执行）=="
+# 控制台 API（curl）：管理员登录 → POST /users 建子账户 → PUT /users/{id}/permissions
+# 全量替换权限行（先只授「读」）；子账户自签第二把 AK/SK（POST /access-keys）后走 aws-cli：
+#   授权桶 ls/get 放行；只授读时上传 403；未授权桶 ls 403 AccessDenied；匿名 403；
+#   补授写后上传放行；ListBuckets 只见授权桶（服务端按可见集过滤）。
+# 管理员账号默认 erik/changeme（README 引导段），可用 ADMIN_USER/ADMIN_PASSWORD 覆盖。
+ADMIN_USER="${ADMIN_USER:-erik}"; ADMIN_PASSWORD="${ADMIN_PASSWORD:-changeme}"
+ADMIN_TOKEN=$(curl -s -X POST "$ENDPOINT/api/v1/login" -H 'content-type: application/json' \
+  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASSWORD\"}" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+[ -n "$ADMIN_TOKEN" ] || { echo "管理员登录失败"; exit 1; }
+
+aws_s3 mb "s3://$PERM_BUCKET" >/dev/null
+aws_s3 mb "s3://$OTHER_BUCKET" >/dev/null
+printf 'perm-read\n' > "$WORK/perm.bin"
+aws_s3 cp "$WORK/perm.bin" "s3://$PERM_BUCKET/perm.bin" >/dev/null
+
+SUB="sub-$(date +%s)"; SUB_PW="$SUB-pw-1234"
+SUB_ID=$(curl -s -X POST "$ENDPOINT/api/v1/users" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d "{\"username\":\"$SUB\",\"password\":\"$SUB_PW\"}" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+[ -n "$SUB_ID" ] || { echo "建子账户失败"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB_ID/permissions" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d "[{\"bucket\":\"$PERM_BUCKET\",\"read\":true}]")
+[ "$CODE" = "204" ] || { echo "授「读」应 204，实际 $CODE"; exit 1; }
+
+SUB_TOKEN=$(curl -s -X POST "$ENDPOINT/api/v1/login" -H 'content-type: application/json' \
+  -d "{\"username\":\"$SUB\",\"password\":\"$SUB_PW\"}" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+SUB_AK="SUB$(date +%s)ACCESSKEY"; SUB_SK="subsecret$(date +%s)0123456789"
+KOUT=$(curl -s -X POST "$ENDPOINT/api/v1/access-keys" -H "authorization: Bearer $SUB_TOKEN" \
+  -H 'content-type: application/json' -d "{\"access_key\":\"$SUB_AK\",\"secret_key\":\"$SUB_SK\"}")
+echo "$KOUT" | grep -q "$SUB_AK" || { echo "子账户签发 AK 失败: $KOUT"; exit 1; }
+
+# 子账户的 S3 客户端：逐调用覆盖 AK/SK（脚本顶部 export 的是管理员的）
+sub_aws() { AWS_ACCESS_KEY_ID="$SUB_AK" AWS_SECRET_ACCESS_KEY="$SUB_SK" aws --endpoint-url "$ENDPOINT" "$@"; }
+
+echo "--- 15a. 授权桶：ls / get 放行 ---"
+sub_aws s3 ls "s3://$PERM_BUCKET/" | tee "$WORK/sub-ls.txt"
+grep -q perm.bin "$WORK/sub-ls.txt"
+sub_aws s3 cp "s3://$PERM_BUCKET/perm.bin" "$WORK/perm.back"
+cmp "$WORK/perm.bin" "$WORK/perm.back"
+
+echo "--- 15b. 只授读：上传必须 403（aws-cli 报 (AccessDenied) 且退出非 0）---"
+OUT=$(sub_aws s3 cp "$WORK/perm.bin" "s3://$PERM_BUCKET/denied.bin" 2>&1) \
+  && { echo "只授读仍可上传: $OUT"; exit 1; }
+echo "$OUT" | grep -q '(AccessDenied)' || { echo "上传应报 AccessDenied: $OUT"; exit 1; }
+
+echo "--- 15c. 未授权桶：ls 必须 403 AccessDenied ---"
+OUT=$(sub_aws s3 ls "s3://$OTHER_BUCKET/" 2>&1) \
+  && { echo "未授权桶仍可列举: $OUT"; exit 1; }
+echo "$OUT" | grep -q '(AccessDenied)' || { echo "未授权桶应报 AccessDenied: $OUT"; exit 1; }
+
+echo "--- 15d. 匿名（无 AK）仍 403 ---"
+ANON=$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/$PERM_BUCKET/perm.bin")
+[ "$ANON" = "403" ] || { echo "匿名应 403，实际 $ANON"; exit 1; }
+
+echo "--- 15e. 管理员补授「写」→ 上传放行 ---"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB_ID/permissions" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d "[{\"bucket\":\"$PERM_BUCKET\",\"read\":true,\"write\":true}]")
+[ "$CODE" = "204" ] || { echo "补授写应 204，实际 $CODE"; exit 1; }
+sub_aws s3 cp "$WORK/perm.bin" "s3://$PERM_BUCKET/sub-up.bin"
+sub_aws s3 ls "s3://$PERM_BUCKET/" | grep -q sub-up.bin
+
+echo "--- 15f. ListBuckets 过滤：只见授权桶 ---"
+sub_aws s3 ls | tee "$WORK/sub-buckets.txt"
+grep -q "$PERM_BUCKET" "$WORK/sub-buckets.txt"
+if grep -q "$OTHER_BUCKET" "$WORK/sub-buckets.txt"; then echo "ListBuckets 泄漏未授权桶"; exit 1; fi
+
+echo "--- 15g. 清理：删两个桶 + 删子账户 ---"
+aws_s3 rb "s3://$PERM_BUCKET" --force >/dev/null
+aws_s3 rb "s3://$OTHER_BUCKET" --force >/dev/null
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/api/v1/users/$SUB_ID" \
+  -H "authorization: Bearer $ADMIN_TOKEN")
+[ "$CODE" = "204" ] || { echo "删子账户应 204，实际 $CODE"; exit 1; }
+
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限）"

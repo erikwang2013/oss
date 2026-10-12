@@ -347,7 +347,10 @@ async fn aether_gate_enforces_bucket_permission() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    assert!(ct.contains("application/problem+json"), "content-type: {ct}");
+    assert!(
+        ct.contains("application/problem+json"),
+        "content-type: {ct}"
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["code"], "access_denied");
     assert!(
@@ -396,5 +399,9 @@ async fn aether_gate_enforces_bucket_permission() {
         .send()
         .await
         .unwrap();
-    assert_ne!(resp.status(), 403, "授权读后 display 不再 403（资源缺失由内核报）");
+    assert_ne!(
+        resp.status(),
+        403,
+        "授权读后 display 不再 403（资源缺失由内核报）"
+    );
 }

@@ -53,7 +53,9 @@ test('管理员建子账户并授权 → 子账户登录只见授权桶、可上
   await expect(page.getByText('权限已保存')).toBeVisible()
 
   // 4) 子账户登录：菜单无「子账户」；桶列表只有该桶；可进对象页且「上传」按钮在（有写权限）
-  await page.getByText('退出登录').click().catch(() => {})
+  // 清登录态（若有退出入口先点它；没有就直接清存储——UI 无退出按钮时不空等）
+  const logout = page.getByText('退出登录')
+  if (await logout.count()) await logout.click()
   await page.context().clearCookies()
   await page.evaluate(() => localStorage.clear())
   await login(page, subUser, subPass)
