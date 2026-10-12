@@ -107,12 +107,24 @@ echo "$OUT" | grep -qi "BadDigest" || { echo "应报 BadDigest: $OUT"; exit 1; }
 if aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key ck-bad.bin >/dev/null 2>&1; then
   echo "校验失败不得留下对象"; exit 1
 fi
+# 带存储校验和的对象做 range GET：aws-cli 默认响应校验（when_supported）必须通过——
+# 206 若回写整对象校验和，客户端会拿 2 字节局部内容对整对象校验而失败
+# （实测故障原文："Expected checksum … did not match calculated checksum"；修复后此断言钉住 206 不回写）。
+aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key ck.bin \
+  --range bytes=0-1 "$WORK/ck-range.bin" >/dev/null
 
-echo "== 11d. 多区间 Range → 400 InvalidArgument（s3s 解析层拦截）=="
-# 多区间在 s3s 的头部解析层即拒（http/de.rs 统一映射 InvalidArgument）——先于鉴权，
-# 故未签名 curl 也回 400（若实测为先 403，说明该版 s3s 是鉴权先行，届时按实测调整本条）
-MKOUT=$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-1,3-4' "$ENDPOINT/$BUCKET/big.bin")
-[ "$MKOUT" = "400" ] || { echo "多区间 Range 应 400，实际 $MKOUT"; exit 1; }
+echo "== 11d. 多区间 Range → 400 InvalidArgument（鉴权后 s3s 解析层拦截）=="
+# 实测（aws-cli 2.37 + 本服务）：鉴权**先于**头部解析——未签名请求被鉴权层拦为 403
+# （XML body <Code>AccessDenied</Code><Message>Signature is required</Message>）；
+# 带鉴权后 s3s 解析层拒多区间 → 400 InvalidArgument（"invalid header: range"）。
+# 原「解析层先于鉴权、未签名 curl 也回 400」的推断不成立，两条契约分别钉住。
+UNAUTH_BODY=$(curl -s -H 'Range: bytes=0-1,3-4' "$ENDPOINT/$BUCKET/big.bin")
+echo "$UNAUTH_BODY" | grep -q 'AccessDenied' || { echo "未签名请求应被鉴权层拦为 AccessDenied: $UNAUTH_BODY"; exit 1; }
+UNAUTH=$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-1,3-4' "$ENDPOINT/$BUCKET/big.bin")
+[ "$UNAUTH" = "403" ] || { echo "未签名请求应 403，实际 $UNAUTH"; exit 1; }
+OUT=$(aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key big.bin --range 'bytes=0-1,3-4' "$WORK/multi-range.out" 2>&1) \
+  && { echo "多区间 Range 应 400，却成功: $OUT"; exit 1; }
+echo "$OUT" | grep -q 'InvalidArgument' || { echo "应报 InvalidArgument: $OUT"; exit 1; }
 
 echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh
