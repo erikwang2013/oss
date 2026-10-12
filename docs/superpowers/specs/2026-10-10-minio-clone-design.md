@@ -417,6 +417,12 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 **实现边界（M2b 定稿记录）**：EC 读写整份进内存（ShardByShard 流式化顺延）；meta「最新副本胜」依赖墙钟单调（M3 epoch/heal 收口）；读时修为最小版、无后台 heal；rclone 长跑默认参数人工触发。
 
+**授权模型提前落地（2026-10-13，原计划 M4 的「角色/策略」最小版）**：子账户 × 桶 三档
+（读/写/删）+ 桶主全权 + 管理员全量；S3 面（s3s `S3Access::check`）、控制台、aetherupload
+上传面执行同一份判定（`xl-s3/src/access.rs::Acl`）。细粒度策略（桶策略 JSON、预设模板、
+STS/AssumeRole）与对象锁仍随 M4/M5；实施记录见
+`plans/2026-10-13-subaccounts-permissions.md`。
+
 ### M3 分布式（4-6 周）
 
 **范围**：节点间 gRPC mesh（`xl-proto`）· 静态拓扑 · 对象→纠删组哈希 · 跨节点 quorum 读写 · 节点故障容忍 · 读修复 · 节点间命名空间锁

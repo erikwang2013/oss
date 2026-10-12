@@ -31,7 +31,11 @@ quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性�
 ≥ data+1、拔盘重建、读时修）· 小对象内联（< 128 KiB 进 `xl.meta`）· meta 两阶段多盘提交
 （最新副本胜）· `fsck [--repair]` 巡检 · 桶级互斥与 flock 跨进程锁 · 目录 fsync 与
 kill -9 断电用例（SIGABRT 四注入点）。
-未实现（见设计文档的阶段表）：分布式（多节点）· 版本控制 · 加密 · 复制 · 权限。
+已实现（权限体系）：子账户与桶级**读/写/删**三档授权（管理员在控制台「子账户」页创建、
+管理、授权）· 三面统一执行（S3 的 AK/SK、控制台 JWT、aetherupload 上传认证）· 子账户可建
+自有桶（桶主全权）· 上传/下载/删除均按权限门。
+未实现（见设计文档的阶段表）：分布式（多节点）· 版本控制 · 加密 · 复制 · 对象锁/STS 等
+完整 IAM（细粒度策略、预设模板留 M4+）。
 
 ## 架构
 
@@ -110,6 +114,14 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   - 目录 fsync 的断电零丢失保证按 ext4/XFS 假设；其它文件系统上目录 fsync 失败仅 warn，需自行复核。
 > - 长跑验收（rclone 并发 100×100 MB + 中断重试，设计验收 #3）在 `tests/e2e_s3.sh` 的
 >   `E2E_LONG=1` 门控段（默认跳过，人工触发；`E2E_LONG_N`/`E2E_LONG_MB` 调规模）。
+> - **权限体系边界**：
+>   - 授权模型 = 每（子账户 × 桶）三档（读/写/删）+ 桶主全权 + 管理员全量；**无行 = 无权限**。
+>     S3 面（AK/SK）、控制台、aetherupload 上传三个入口执行同一份判定。
+>   - 子账户可在控制台/ S3 建**自有桶**（自动全权）；删桶限桶主或管理员；历史遗留桶
+>     （无归属记录）仅管理员可见。
+>   - 控制台上传只能进「`[[groups]]` 分组映射的目标桶」——子账户要往自有桶传，走 S3 面。
+>   - 撤回授权对**在途分块上传**不追溯（preprocess 已放行的会传完）；新请求即时生效。
+>   - 建子账户 API 固定为非管理员（防提权）；口令至少 8 位；删除用户级联清其密钥与授权。
 
 ## 控制台（M1b）
 
@@ -122,6 +134,8 @@ cd web && npm install && npm run dev
 ```
 
 - 上传复用 aetherupload 自带脚本（分块 / 断线续传 / 秒传），前端不含分片逻辑
+- **子账户**（管理员菜单）：创建/删除子账户、逐桶勾选 读/写/删 授权；子账户登录后只见
+  授权桶（菜单无「子账户」页），上传与删除按钮按权限显隐（后端 403 兜底）
 - **上传落点**：按上传分组落桶（`oss.toml` 的 `[[groups]]`，如 `file` → `files`）；对象名 = 内容的整份 MD5 +
   扩展名，子目录 = UTC 年月（如 `202610/<md5>.bin`）。所以在对象浏览器里是根据内容哈希找文件，不是原始文件名
 - 秒传提示「上传成功（秒传）」表示 0 分块传输
@@ -181,6 +195,7 @@ AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:900
 - M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`
 - M2a 实现计划：`docs/superpowers/plans/2026-10-12-m2a-usability-slice.md`
 - M2b 实现计划（多盘 / EC / 断电一致性）：`docs/superpowers/plans/2026-10-12-m2b-ec-multidisk.md`
+- 子账户与权限体系实施记录：`docs/superpowers/plans/2026-10-13-subaccounts-permissions.md`
 
 ---
 
