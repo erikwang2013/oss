@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, rawApi, type ObjectList } from '../api'
+import { api, rawApi, type BucketInfo, type ObjectList } from '../api'
 import { humanSize } from '../format'
 import UploadPanel from '../upload/UploadPanel'
 
@@ -26,6 +26,15 @@ export default function Objects() {
       ),
     enabled: !!bucket,
   })
+
+  // 能力位（与 Buckets 页共用同一缓存）：按位显隐上传/删除；后端另有 403 兜底
+  const { data: buckets = [] } = useQuery({
+    queryKey: ['buckets'],
+    queryFn: () => api<BucketInfo[]>('/api/v1/buckets'),
+  })
+  const ability = buckets.find((b) => b.name === bucket)
+  const canWrite = ability?.can_write ?? false
+  const canDelete = ability?.can_delete ?? false
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['objects', bucket] })
 
@@ -73,7 +82,9 @@ export default function Objects() {
   return (
     <>
       <Breadcrumb items={crumbs} style={{ marginBottom: 16 }} />
-      <Button type="primary" onClick={() => setUploading(true)} style={{ marginBottom: 16 }}>上传</Button>
+      {canWrite && (
+        <Button type="primary" onClick={() => setUploading(true)} style={{ marginBottom: 16 }}>上传</Button>
+      )}
       <Table<Row>
         rowKey={(r) => r.key}
         loading={isLoading}
@@ -105,9 +116,11 @@ export default function Objects() {
               r.kind === 'obj' && (
                 <>
                   <Button size="small" onClick={() => download(r.key)} style={{ marginRight: 8 }}>下载</Button>
-                  <Popconfirm title={`删除 ${r.key}？`} onConfirm={() => remove.mutate(r.key)}>
-                    <Button size="small" danger>删除</Button>
-                  </Popconfirm>
+                  {canDelete && (
+                    <Popconfirm title={`删除 ${r.key}？`} onConfirm={() => remove.mutate(r.key)}>
+                      <Button size="small" danger>删除</Button>
+                    </Popconfirm>
+                  )}
                 </>
               ),
           },

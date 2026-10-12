@@ -94,3 +94,36 @@ export interface AccessKey {
   access_key: string
   secret_key: string
 }
+
+// ——— 子账户与权限（console.rs 权限体系）———
+
+export interface Me {
+  id: number
+  username: string
+  is_admin: boolean
+}
+
+/** 桶列表项（带能力位；管理员全 true；子账户按自有/授权计算） */
+export interface BucketInfo {
+  name: string
+  is_owner: boolean
+  can_read: boolean
+  can_write: boolean
+  can_delete: boolean
+}
+
+/** 子账户 × 桶 的三档权限 */
+export interface Permission {
+  bucket: string
+  read: boolean
+  write: boolean
+  delete: boolean
+}
+
+export interface UserRow {
+  id: number
+  username: string
+  is_admin: boolean
+  created_at: number
+  permissions: Permission[]
+}

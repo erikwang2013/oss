@@ -301,3 +301,100 @@ async fn forged_or_expired_token_is_401() {
         }
     }
 }
+
+/// 按任意 uid 签 token（权限门用例需要非 1 号子账户）；
+/// 上面既有用例的 `sign_token` 恒 sub="1"，保持原样不动。
+fn sign_for(secret: &str, uid: i64, exp_secs: i64) -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &TestClaims {
+            sub: uid.to_string(),
+            exp: exp_secs as usize,
+        },
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+/// 上传面权限门（权限体系 Step 4）：写路径按「分组 → 桶」判权。
+/// - 子账户对未授权分组（file → files）preprocess → 403 problem+json（code=access_denied、
+///   title 含「无权」——前端 JS 直接渲染 title）；
+/// - 管理员令牌不受影响（既有用例已覆盖）；
+/// - 授权 write 后同一请求 → 200 协议成功体；display 另按 read 门槛。
+#[tokio::test(flavor = "multi_thread")]
+async fn aether_gate_enforces_bucket_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let sub = st.db.create_user("sub", "pw12345678", false).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let client = reqwest::Client::new();
+    let sub_token = sign_for(common::JWT_SECRET, sub, unix_now() + 3600);
+
+    // 未授权：403 problem+json
+    let resp = with_form(
+        client
+            .post(format!("{base}/aetherupload/preprocess"))
+            .bearer_auth(&sub_token),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403, "无写权限的分组必须 403");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(ct.contains("application/problem+json"), "content-type: {ct}");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "access_denied");
+    assert!(
+        body["title"].as_str().unwrap_or_default().contains("无权"),
+        "title 应含「无权」（JS 直接渲染 title）: {body}"
+    );
+
+    // display 同样按读门槛：未授权 → 403
+    let saved_path = aetherupload::SavedPath::encode("file", "202610", "x.txt");
+    let resp = client
+        .get(format!("{base}/aetherupload/display/{saved_path}"))
+        .bearer_auth(&sub_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "display 无读权限必须 403");
+
+    // 授权 files 读+写 → preprocess 200、display 不再 403（资源不存在交给内核报）
+    st.db
+        .set_permissions(
+            sub,
+            &[oss_server::db::PermissionRow {
+                bucket: "files".into(),
+                read: true,
+                write: true,
+                delete: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let resp = with_form(
+        client
+            .post(format!("{base}/aetherupload/preprocess"))
+            .bearer_auth(&sub_token),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "授权后 preprocess 应 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["chunk_size"].is_number(), "协议成功体: {body}");
+
+    let resp = client
+        .get(format!("{base}/aetherupload/display/{saved_path}"))
+        .bearer_auth(&sub_token)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 403, "授权读后 display 不再 403（资源缺失由内核报）");
+}

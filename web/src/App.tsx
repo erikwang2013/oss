@@ -1,20 +1,25 @@
 import { Navigate, Outlet, createBrowserRouter } from 'react-router-dom'
 import { Layout, Menu } from 'antd'
 import { Link, useLocation } from 'react-router-dom'
-import { DatabaseOutlined, KeyOutlined } from '@ant-design/icons'
-import { getToken } from './api'
+import { DatabaseOutlined, KeyOutlined, TeamOutlined } from '@ant-design/icons'
+import { useQuery } from '@tanstack/react-query'
+import { api, getToken, type Me } from './api'
 import Mascot from './Mascot'
 import Login from './pages/Login'
 import Buckets from './pages/Buckets'
 import Objects from './pages/Objects'
 import Keys from './pages/Keys'
+import Users from './pages/Users'
 
 // Shell/RequireAuth 与 router（本文件导出）同文件：Fast Refresh 对它只会整页刷新，
 // 拆文件只增样板，接受这一取舍
 // oxlint-disable-next-line react/only-export-components
 function Shell() {
   const loc = useLocation()
-  const selected = loc.pathname.startsWith('/keys') ? '/keys' : '/buckets'
+  // 角色唯一来源：/me（JWT 里只有 sub；401 由 api.ts 全局处理，其余错误由 QueryCache 桥接）
+  const { data: me } = useQuery({ queryKey: ['me'], queryFn: () => api<Me>('/api/v1/me') })
+  // 选中态：按前缀匹配——三分支起手写三元会在新路由上误亮 /buckets
+  const selected = ['/keys', '/users'].find((p) => loc.pathname.startsWith(p)) ?? '/buckets'
   return (
     <Layout style={{ minHeight: '100vh' }}>
       <Layout.Sider theme="light">
@@ -29,6 +34,10 @@ function Shell() {
           items={[
             { key: '/buckets', icon: <DatabaseOutlined />, label: <Link to="/buckets">桶与对象</Link> },
             { key: '/keys', icon: <KeyOutlined />, label: <Link to="/keys">访问密钥</Link> },
+            // 子账户管理仅管理员可见（后端另有 403 兜底）
+            ...(me?.is_admin
+              ? [{ key: '/users', icon: <TeamOutlined />, label: <Link to="/users">子账户</Link> }]
+              : []),
           ]}
         />
       </Layout.Sider>
@@ -54,6 +63,7 @@ export const router = createBrowserRouter([
       { path: '/buckets', element: <Buckets /> },
       { path: '/buckets/:bucket', element: <Objects /> },
       { path: '/keys', element: <Keys /> },
+      { path: '/users', element: <Users /> },
     ],
   },
 ])

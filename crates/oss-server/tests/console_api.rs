@@ -56,7 +56,7 @@ async fn login_then_list_buckets() {
         .unwrap();
     let token = login["token"].as_str().unwrap();
 
-    let buckets: Vec<String> = client
+    let buckets: Vec<serde_json::Value> = client
         .get(format!("{base}/api/v1/buckets"))
         .bearer_auth(token)
         .send()
@@ -65,7 +65,11 @@ async fn login_then_list_buckets() {
         .json()
         .await
         .unwrap();
-    assert_eq!(buckets, vec!["alpha".to_string()]);
+    // 权限体系起形状带能力位（管理员全 true）
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["name"], "alpha");
+    assert_eq!(buckets[0]["can_write"], true);
+    assert_eq!(buckets[0]["can_delete"], true);
 }
 
 #[tokio::test]
@@ -229,8 +233,28 @@ async fn all_routes_reject_anonymous() {
             Some(serde_json::json!({})),
         ),
         (reqwest::Method::GET, "/api/v1/groups", None),
+        // 子账户与权限（管理员面；这里只验「无 token 一律 401」）
+        (reqwest::Method::GET, "/api/v1/me", None),
+        (reqwest::Method::GET, "/api/v1/users", None),
+        (
+            reqwest::Method::POST,
+            "/api/v1/users",
+            Some(serde_json::json!({"username": "sub", "password": "pw12345678"})),
+        ),
+        (reqwest::Method::DELETE, "/api/v1/users/999", None),
+        (
+            reqwest::Method::POST,
+            "/api/v1/users/999/password",
+            Some(serde_json::json!({"password": "pw12345678"})),
+        ),
+        (reqwest::Method::GET, "/api/v1/users/999/permissions", None),
+        (
+            reqwest::Method::PUT,
+            "/api/v1/users/999/permissions",
+            Some(serde_json::json!([])),
+        ),
     ];
-    assert_eq!(cases.len(), 11, "路由表变化时同步此表（12 条 - login）");
+    assert_eq!(cases.len(), 18, "路由表变化时同步此表（19 条 - login）");
 
     for (method, path, body) in cases {
         let mut req = client.request(method.clone(), format!("{base}{path}"));

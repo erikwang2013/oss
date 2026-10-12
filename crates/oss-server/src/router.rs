@@ -20,11 +20,15 @@ use xl_s3::service::OssS3;
 /// serve 与运维命令统一 exit 1 + stderr，不从启动路径 panic。
 pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     // s3s 0.17 的 builder 是 `&mut self` 风格，不能链式调用
+    // 授权门：Acl 同时给 service（ListBuckets 过滤/建桶记账）与 access 层（set_access）
+    let acl = xl_s3::access::Acl::new(state.db.pool().clone());
     let mut s3_builder = S3ServiceBuilder::new(OssS3::new(
         Arc::clone(&state.store),
+        acl.clone(),
         state.cfg.max_put_bytes,
     ));
     s3_builder.set_auth(SigV4Auth::new(state.db.pool().clone()));
+    s3_builder.set_access(acl);
     let s3 = s3_builder.build();
 
     // 控制面：`/api/v1` 整体走 jwt-rust 的 JwtLayer，`/login` 在 except 名单里
@@ -32,13 +36,14 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     let console = JwtLayer::new(Arc::clone(&state.jwt)).attach(crate::console::routes());
 
     // aetherupload：四条路由（预处理 / 分块 / 展示 / 下载）。
-    // `routes` 返回的是 Router<()>（runtime 已 state 进各 handler）；`.with_state(())`
-    // 只是把 marker 参数转回本函数的 Router<AppState>，为后续 `.nest` 控制台 API 留位。
+    // 不用 crate 自带的 `integrations::ecat::routes`——它的 handler 读不到身份，
+    // 无法按子账户权限执行「分组 → 桶」的门；改用 `aether_gate`（同一内核，形态逐字对齐）。
     //
     // 鉴权层（规格 §0.1「会话 Cookie/JWT 覆盖层」）：cookie 垫片在最外层把 `oss_token`
     // 写成 Authorization，再交 JwtLayer 校验（与控制面同一个 JwtAuth 实例 → token 两面通用）。
-    // 层序：后挂的 `.layer` 在更外层，先跑。
-    let aether = aetherupload::integrations::ecat::routes(crate::aether::build_runtime(&state)?)
+    // 层序：后挂的 `.layer` 在更外层，先跑；JwtLayer 把 payload 放进类型化 extension，
+    // aether_gate 的 handler 用 `Extension<JwtPayload>` 取。
+    let aether = crate::aether_gate::routes(crate::aether::build_runtime(&state)?, state.clone())
         .layer(JwtLayer::new(Arc::clone(&state.jwt)))
         .layer(middleware::from_fn(cookie_to_bearer));
 

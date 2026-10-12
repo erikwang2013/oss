@@ -1,6 +1,7 @@
-/// <reference types="vitest/config" />
 import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
+// 从 vitest/config 取 defineConfig：`test` 字段（含 poolOptions）的类型只有这个入口认；
+// 用 vite 的 defineConfig + 三斜线引用在 tsc -b 下会报 TS2769（poolOptions 不存在）
+import { defineConfig } from 'vitest/config'
 
 const backend = 'http://127.0.0.1:9000'
 
@@ -22,8 +23,9 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
-    // 高负载机器上 worker 启动可能远超默认 60s（本机实测 ~80s）——放宽避免整体假失败。
-    // 注意键名是 startupTimeout（写成 startTimeout 会静默无效）。
-    poolOptions: { forks: { startupTimeout: 120_000 } },
+    // 注意：vitest 5 起 worker 启动超时是硬编码常量（START_TIMEOUT=60s，无配置旋钮；
+    // v3 的 poolOptions.forks.startupTimeout 已删除）。本机高负载下若撞
+    // 「Timeout waiting for worker to respond」，用 `vitest run --no-file-parallelism`
+    // 减少并发启动，或错峰跑——不要再往这里加 poolOptions（会被判 removed 并忽略）。
   },
 })

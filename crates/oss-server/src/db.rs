@@ -142,14 +142,6 @@ impl Db {
         Ok(())
     }
 
-    pub async fn delete_bucket_row(&self, name: &str) -> Result<()> {
-        sqlx::query("DELETE FROM buckets WHERE name = ?")
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     pub async fn list_bucket_rows(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT name FROM buckets ORDER BY name")
             .fetch_all(&self.pool)
@@ -225,22 +217,59 @@ impl Db {
         Ok(())
     }
 
-    /// 返回是否命中：0 行命中 = saved_path 不存在（调用方按 404 处理），不静默吞掉 original_name（规格 §5.4）。
+    /// 登记上传的 `original_name` 与归属（规格 §5.4）。
+    ///
+    /// 归属防挂名：非管理员只能认领**无归属**的记录（`owner_id IS NULL`）或自己的
+    /// （原实现无条件覆盖 owner 的洞在此收口）。返回是否命中（0 行 = 记录不存在 → 404）。
     pub async fn register_upload(
         &self,
         saved_path: &str,
         original_name: &str,
-        owner_id: Option<i64>,
+        owner_id: i64,
+        is_admin: bool,
     ) -> Result<bool> {
-        let n =
-            sqlx::query("UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?")
-                .bind(original_name)
-                .bind(owner_id)
-                .bind(saved_path)
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
+        if is_admin {
+            let n = sqlx::query(
+                "UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?",
+            )
+            .bind(original_name)
+            .bind(owner_id)
+            .bind(saved_path)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            return Ok(n == 1);
+        }
+        let n = sqlx::query(
+            "UPDATE uploads SET original_name = ?, owner_id = ? \
+             WHERE saved_path = ? AND (owner_id IS NULL OR owner_id = ?)",
+        )
+        .bind(original_name)
+        .bind(owner_id)
+        .bind(saved_path)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(n == 1)
+    }
+
+    /// 记录对应的桶（登记前判权用；记录不存在 → None）。
+    pub async fn upload_bucket(&self, saved_path: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT bucket FROM uploads WHERE saved_path = ?")
+            .bind(saved_path)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("bucket")))
+    }
+
+    /// 某用户拥有的桶（控制台桶列表能力位计算用）。
+    pub async fn owned_buckets(&self, uid: i64) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT name FROM buckets WHERE owner_id = ? ORDER BY name")
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
     }
 
     pub async fn list_uploads(&self, limit: i64) -> Result<Vec<UploadRecord>> {
@@ -382,15 +411,6 @@ impl Db {
         Ok(())
     }
 
-    /// 删桶时顺手清该桶的授权行（防「重建同名桶继承旧授权」）。
-    pub async fn delete_bucket_permissions(&self, bucket: &str) -> Result<()> {
-        sqlx::query("DELETE FROM permissions WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     /// 上传归属登记：仅当该记录尚无归属时写入（`AND owner_id IS NULL`）。
     /// 返回是否写入（已归属/记录不存在 → false，调用方 best-effort 忽略）。
     pub async fn set_upload_owner(&self, saved_path: &str, uid: i64) -> Result<bool> {
@@ -523,8 +543,11 @@ mod tests {
         assert!(users[0].is_admin);
         assert_eq!(users[1].permissions[0].bucket, "z");
 
-        // 删桶清授权
-        db.delete_bucket_permissions("z").await.unwrap();
+        // 删桶清授权（Acl::forget_bucket 是两处删桶路径的共用实现）
+        xl_s3::access::Acl::new(db.pool().clone())
+            .forget_bucket("z")
+            .await
+            .unwrap();
         assert!(db.get_permissions(sub).await.unwrap().is_empty());
 
         // 上传归属：仅在无归属时写入
@@ -638,11 +661,12 @@ mod tests {
     #[tokio::test]
     async fn upload_records() {
         let db = db().await;
+        let uid = db.create_user("u", "pw", false).await.unwrap();
         db.record_upload("g_202610_abc.txt", "files", "abc.txt", "file", 7, "etag1")
             .await
             .unwrap();
         assert!(
-            db.register_upload("g_202610_abc.txt", "my.txt", None)
+            db.register_upload("g_202610_abc.txt", "my.txt", uid, false)
                 .await
                 .unwrap()
         );
@@ -654,10 +678,48 @@ mod tests {
     #[tokio::test]
     async fn register_upload_without_record_is_false() {
         let db = db().await;
+        let uid = db.create_user("u", "pw", false).await.unwrap();
         assert!(
-            !db.register_upload("nope.txt", "my.txt", None)
+            !db.register_upload("nope.txt", "my.txt", uid, false)
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn register_upload_ownership_guard() {
+        // 防挂名：非管理员不能改别人已归属的记录；管理员可
+        let db = db().await;
+        let a = db.create_user("a", "pw", false).await.unwrap();
+        let b = db.create_user("b", "pw", false).await.unwrap();
+        let root = db.create_user("root", "pw", true).await.unwrap();
+        db.record_upload("p", "files", "k", "file", 1, "e")
+            .await
+            .unwrap();
+
+        assert!(
+            db.register_upload("p", "n1", a, false).await.unwrap(),
+            "无归属可认领"
+        );
+        assert!(
+            !db.register_upload("p", "n2", b, false).await.unwrap(),
+            "已归属他人：拒"
+        );
+        assert!(
+            db.register_upload("p", "n3", root, true).await.unwrap(),
+            "管理员可改"
+        );
+        let owner: Option<i64> =
+            sqlx::query_scalar("SELECT owner_id FROM uploads WHERE saved_path = 'p'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(owner, Some(root));
+        let name: String =
+            sqlx::query_scalar("SELECT original_name FROM uploads WHERE saved_path = 'p'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(name, "n3");
     }
 }

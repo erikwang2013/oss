@@ -6,10 +6,26 @@ use s3s::{S3, S3Request};
 use xl_s3::service::OssS3;
 use xl_store::store::{Store, StoreConfig};
 
+/// 最小判权库（这些用例直调 service 方法、不走 s3s 授权链；Acl 只被
+/// create/delete_bucket 的记账路径用到）。
+async fn acl() -> xl_s3::access::Acl {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL);\
+         CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
+          can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
+          PRIMARY KEY (user_id, bucket));",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    xl_s3::access::Acl::new(pool)
+}
+
 async fn service() -> (OssS3, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
-    (OssS3::new(store, 1024 * 1024), dir)
+    (OssS3::new(store, acl().await, 1024 * 1024), dir)
 }
 
 fn req<T>(input: T) -> S3Request<T> {

@@ -11,6 +11,11 @@
 
 use sqlx::{Row, SqlitePool};
 
+use s3s::access::{S3Access, S3AccessContext};
+use s3s::dto::CopySource;
+use s3s::header::X_AMZ_COPY_SOURCE;
+use s3s::{S3Error, S3ErrorCode, S3Result};
+
 /// 已认证用户身份：`check` 里解析 AK 后塞进请求扩展（s3s 官方机制
 /// `S3AccessContext::extensions_mut`），后续 handler 用 `req.extensions.get::<AuthedUser>()` 读取。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +138,114 @@ impl Acl {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 删桶后的记账清理（S3 与控制台两条删桶路径共用同一实现）：
+    /// 清该桶的授权行（防重建同名桶继承旧授权）+ 清桶行。
+    pub async fn forget_bucket(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM permissions WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 带 `Option<bucket>` 判权的便捷形态（Root 路径的 op 直接拒）。
+    async fn can_opt(
+        &self,
+        user: AuthedUser,
+        action: Action,
+        bucket: &Option<String>,
+    ) -> Result<bool, S3Error> {
+        match bucket {
+            Some(b) => self.can(user, action, b).await.map_err(acl_err),
+            None => Ok(false),
+        }
+    }
+}
+
+/// 判权查询失败的统一映射（详情进日志，客户端只见 500 泛化文案）。
+pub(crate) fn acl_err(e: sqlx::Error) -> S3Error {
+    tracing::error!(error = ?e, "acl lookup failed");
+    S3Error::with_message(S3ErrorCode::InternalError, "internal error")
+}
+
+/// s3s 的授权入口：`check` 在反序列化**前**对每个请求执行（我们已 `set_auth` → 恒走；
+/// per-op 方法默认 Ok 是叠加非替代，无需实现）。判据与三面共用的 [`Acl::can`] 同源；匿名一律拒。
+#[async_trait::async_trait]
+impl S3Access for Acl {
+    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // 先克隆 AK（credentials() 借自 cx，与随后的 extensions_mut 冲突）
+        let Some(ak) = cx.credentials().map(|c| c.access_key.clone()) else {
+            return Err(s3s::s3_error!(AccessDenied, "Authentication required"));
+        };
+        let user = self
+            .user_of_key(&ak)
+            .await
+            .map_err(acl_err)?
+            .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
+        // handler 读取：ListBuckets 过滤 / CreateBucket 记账（随请求搬进 S3Request.extensions）
+        cx.extensions_mut().insert(user);
+        if user.is_admin {
+            return Ok(());
+        }
+
+        let op = cx.s3_op().name();
+        let bucket: Option<String> = cx.s3_path().as_bucket().map(str::to_owned);
+        let allow = match op {
+            // 桶级管理：列表由 handler 过滤；建桶任何已认证用户（建后记账 owner）；删桶限桶主
+            "ListBuckets" | "CreateBucket" => true,
+            "DeleteBucket" => match &bucket {
+                Some(b) => self.is_owner(b, user.uid).await.map_err(acl_err)?,
+                None => false,
+            },
+            "CopyObject" => {
+                // 目标写 + 源读（源在 header；用 s3s 的解析器——header 是 URL 编码且有
+                // / 前导与 ?versionId 形态，解析失败与反序列化同判，直接拒绝不误伤）
+                let dst = self.can_opt(user, Action::Write, &bucket).await?;
+                let src = match cx
+                    .headers()
+                    .get(X_AMZ_COPY_SOURCE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(CopySource::parse)
+                {
+                    Some(Ok(CopySource::Bucket { bucket, .. })) => self
+                        .can(user, Action::Read, &bucket)
+                        .await
+                        .map_err(acl_err)?,
+                    _ => false,
+                };
+                dst && src
+            }
+            // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
+            "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject" => {
+                self.can_opt(user, Action::Read, &bucket).await?
+            }
+            // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
+            // put_object，op 名看到的是 "PostObject"，不映射它就是浏览器表单直传的漏检点）
+            "PutObject"
+            | "PostObject"
+            | "CreateMultipartUpload"
+            | "UploadPart"
+            | "CompleteMultipartUpload"
+            | "AbortMultipartUpload" => self.can_opt(user, Action::Write, &bucket).await?,
+            // 删
+            "DeleteObject" | "DeleteObjects" => self.can_opt(user, Action::Delete, &bucket).await?,
+            // 未实现/未知 op：fail-closed（下游本来也是 501；这里统一 403）
+            _ => false,
+        };
+        if allow {
+            Ok(())
+        } else {
+            tracing::warn!(uid = user.uid, op, bucket = ?bucket, "授权拒绝");
+            Err(s3s::s3_error!(AccessDenied, "access denied"))
+        }
     }
 }
 

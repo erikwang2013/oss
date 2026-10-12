@@ -1,8 +1,9 @@
-//! 控制台 API。M1 只有：登录、桶列表、对象列表、下载、删除、上传记录、访问密钥。
-//! 授权模型（谁能做什么）在 M4；M1 只区分「登录 / 未登录」。
+//! 控制台 API：登录、`/me`、桶/对象、上传记录、访问密钥，以及**子账户与权限管理**（管理员）。
 //!
 //! 鉴权由 `router.rs` 在 `/api/v1` 上挂的 `jwt-rust` `JwtLayer` 统一做（`/login` 在 except
-//! 名单内），handler 只从 extensions 里取 payload；除 `/login` 外无匿名可达路径。
+//! 名单内），handler 从 extensions 取 payload；除 `/login` 外无匿名可达路径。
+//! 授权（谁能做什么）走三面共用的 `xl_s3::access::Acl`：管理员全量；子账户按
+//! permissions 三档（读/写/删）+ 自有桶全权；403 用纯文本（前端 `rawApi` 直接展示 resp.text）。
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -11,6 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
+use xl_s3::access::{Acl, Action, AuthedUser};
 
 use crate::state::AppState;
 
@@ -37,9 +39,73 @@ fn uid_of(payload: &JwtPayload) -> Result<i64, Response> {
     })
 }
 
+/// 403（纯文本——前端 `rawApi` 直接把 resp.text() 当错误消息展示，零解析）。
+fn forbidden(msg: &str) -> Response {
+    (StatusCode::FORBIDDEN, msg.to_string()).into_response()
+}
+
+fn internal_error() -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+/// JWT 有效但用户在库里没了（被删）：401 与 JwtLayer 同形，前端会清 token 回登录页。
+fn stale_user() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"code": 401, "msg": "用户不存在或已失效", "data": null})),
+    )
+        .into_response()
+}
+
+/// uid + is_admin 一次取出（普通登录路由用）。
+#[allow(clippy::result_large_err)]
+async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Response> {
+    let uid = uid_of(payload)?;
+    match state.db.get_user(uid).await {
+        Ok(Some((_, is_admin))) => Ok((uid, is_admin)),
+        Ok(None) => Err(stale_user()),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户失败");
+            Err(internal_error())
+        }
+    }
+}
+
+/// 管理员专属路由的收口（返回 uid）。
+#[allow(clippy::result_large_err)]
+async fn admin_of(state: &AppState, payload: &JwtPayload) -> Result<i64, Response> {
+    let (uid, is_admin) = who(state, payload).await?;
+    if is_admin {
+        Ok(uid)
+    } else {
+        Err(forbidden("需要管理员权限"))
+    }
+}
+
+/// 桶级权限门（与 S3 面、aether 面共用同一 Acl）。
+#[allow(clippy::result_large_err)]
+async fn require_perm(
+    state: &AppState,
+    uid: i64,
+    is_admin: bool,
+    bucket: &str,
+    action: Action,
+) -> Result<(), Response> {
+    let acl = Acl::new(state.db.pool().clone());
+    match acl.can(AuthedUser { uid, is_admin }, action, bucket).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(forbidden("无权访问该桶")),
+        Err(e) => {
+            tracing::error!(error = %e, "判权失败");
+            Err(internal_error())
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/login", post(login))
+        .route("/me", get(me))
         .route("/groups", get(list_groups))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
@@ -53,6 +119,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/access-keys",
             get(list_access_keys).post(create_access_key),
+        )
+        // 子账户管理（管理员）
+        .route("/users", get(list_users).post(create_user))
+        .route("/users/{id}", delete(delete_user))
+        .route("/users/{id}/password", post(reset_password))
+        .route(
+            "/users/{id}/permissions",
+            get(get_user_permissions).put(set_user_permissions),
         )
 }
 
@@ -101,16 +175,84 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
     }
 }
 
+/// 当前登录者（前端角色/菜单的唯一依据）。
+async fn me(State(state): State<AppState>, Extension(payload): Extension<JwtPayload>) -> Response {
+    let uid = match uid_of(&payload) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match state.db.get_user(uid).await {
+        Ok(Some((username, is_admin))) => Json(serde_json::json!({
+            "id": uid, "username": username, "is_admin": is_admin
+        }))
+        .into_response(),
+        Ok(None) => stale_user(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户失败");
+            internal_error()
+        }
+    }
+}
+
 /// 上传分组（oss.toml 的 `[[groups]]`），供上传面板的分组下拉使用。
 async fn list_groups(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.cfg.groups.clone()).into_response()
 }
 
-async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
-    match state.store.list_buckets().await {
-        Ok(list) => Json(list.into_iter().map(|b| b.name).collect::<Vec<_>>()).into_response(),
-        Err(e) => store_error(e).into_response(),
-    }
+/// 桶列表（带能力位，前端按位显隐按钮）：管理员全量；子账户 = 可见集（自有 ∪ 任一授权位）
+/// 与磁盘列表求交。**磁盘是权威**——历史桶可能没有 DB 行（owner NULL ⇒ 仅管理员可见）。
+async fn list_buckets(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let buckets = match state.store.list_buckets().await {
+        Ok(l) => l,
+        Err(e) => return store_error(e).into_response(),
+    };
+    let owned: std::collections::HashSet<String> = match state.db.owned_buckets(uid).await {
+        Ok(v) => v.into_iter().collect(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询桶归属失败");
+            return internal_error();
+        }
+    };
+    let perms: std::collections::HashMap<String, (bool, bool, bool)> =
+        match state.db.get_permissions(uid).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|p| (p.bucket, (p.read, p.write, p.delete)))
+                .collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "查询权限失败");
+                return internal_error();
+            }
+        };
+    let out: Vec<serde_json::Value> = buckets
+        .into_iter()
+        .filter_map(|b| {
+            let own = owned.contains(&b.name);
+            let (r, w, d) = perms.get(&b.name).copied().unwrap_or((false, false, false));
+            let can_read = is_admin || own || r;
+            let can_write = is_admin || own || w;
+            let can_delete = is_admin || own || d;
+            // 可见性：管理员全部；子账户 = 自有 ∪ 任一能力位（与可见集口径一致）
+            if !(is_admin || own || r || w || d) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "name": b.name,
+                "is_owner": own,
+                "can_read": can_read,
+                "can_write": can_write,
+                "can_delete": can_delete,
+            }))
+        })
+        .collect();
+    Json(out).into_response()
 }
 
 #[derive(Deserialize)]
@@ -118,6 +260,7 @@ struct CreateBucketBody {
     name: String,
 }
 
+/// 任何登录用户可建桶（建桶者即桶主，自动全权）。
 async fn create_bucket(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -137,15 +280,37 @@ async fn create_bucket(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// 删桶限桶主或管理员；删后清记账（授权行 + 桶行，防重建同名桶继承旧授权）。
 async fn delete_bucket(
     State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !is_admin {
+        match Acl::new(state.db.pool().clone())
+            .is_owner(&bucket, uid)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return forbidden("只有桶主或管理员可以删除桶"),
+            Err(e) => {
+                tracing::error!(error = %e, "查询桶主失败");
+                return internal_error();
+            }
+        }
+    }
     match state.store.delete_bucket(&bucket).await {
         Ok(()) => {
-            if let Err(e) = state.db.delete_bucket_row(&bucket).await {
-                // 桶已删除：控制面行残留只影响列表展示，不失败请求
-                tracing::warn!(error = %e, "清理桶行失败");
+            if let Err(e) = Acl::new(state.db.pool().clone())
+                .forget_bucket(&bucket)
+                .await
+            {
+                // 桶已删除：记账行残留只影响列表展示，不失败请求
+                tracing::warn!(error = ?e, "清理桶记账失败");
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -164,9 +329,17 @@ struct ListQuery {
 
 async fn list_objects(
     State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
     Path(bucket): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
+        return r;
+    }
     let req = xl_store::store::ListRequest {
         prefix: q.prefix,
         delimiter: q.delimiter,
@@ -191,8 +364,16 @@ async fn list_objects(
 
 async fn get_object(
     State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
+        return r;
+    }
     match state.store.get_object(&bucket, &key).await {
         Ok((info, bytes)) => {
             let ct = info
@@ -206,20 +387,41 @@ async fn get_object(
 
 async fn delete_object(
     State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Delete).await {
+        return r;
+    }
     match state.store.delete_object(&bucket, &key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e).into_response(),
     }
 }
 
-async fn list_uploads(State(state): State<AppState>) -> impl IntoResponse {
-    match state.db.list_uploads(100).await {
+/// 上传记录：管理员全部；子账户仅自己的（owner_id = uid）。
+async fn list_uploads(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let rows = if is_admin {
+        state.db.list_uploads(100).await
+    } else {
+        state.db.list_uploads_for(uid, 100).await
+    };
+    match rows {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询上传记录失败");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            internal_error()
         }
     }
 }
@@ -235,13 +437,26 @@ async fn register_upload(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<RegisterBody>,
 ) -> impl IntoResponse {
-    let uid = match uid_of(&payload) {
-        Ok(u) => u,
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
         Err(r) => return r,
     };
+    // 登记前判权：必须对被登记记录的目标桶有写权限（修「任意挂名」洞的前半；
+    // 后半 = 非管理员只能认领无归属/自己的记录，见 db.register_upload）
+    let bucket = match state.db.upload_bucket(&body.saved_path).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询上传记录失败");
+            return internal_error();
+        }
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Write).await {
+        return r;
+    }
     match state
         .db
-        .register_upload(&body.saved_path, &body.original_name, Some(uid))
+        .register_upload(&body.saved_path, &body.original_name, uid, is_admin)
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -249,7 +464,7 @@ async fn register_upload(
         // DB 故障是服务端故障（与 store_error 的 5xx 分档一致）
         Err(e) => {
             tracing::error!(error = %e, "登记上传记录失败");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            internal_error()
         }
     }
 }
@@ -326,7 +541,194 @@ async fn create_access_key(
         }
         Err(e) => {
             tracing::error!(error = %e, "写入访问密钥失败");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            internal_error()
+        }
+    }
+}
+
+// ---- 子账户管理（仅管理员）----
+
+/// 用户列表（含各自权限摘要）。
+async fn list_users(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    match state.db.list_users().await {
+        Ok(users) => Json(users).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户列表失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateUserBody {
+    username: String,
+    password: String,
+}
+
+/// 建子账户。**API 恒 is_admin=false**（禁经 API 造管理员，防提权）；
+/// 口令 ≥8 位（空/短口令会被登录路径命中——引导段已有教训）。
+async fn create_user(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Json(body): Json<CreateUserBody>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let username = body.username.trim();
+    if username.is_empty() {
+        return (StatusCode::BAD_REQUEST, "用户名不能为空").into_response();
+    }
+    if body.password.len() < 8 {
+        return (StatusCode::BAD_REQUEST, "口令过短（至少 8 位）").into_response();
+    }
+    match state.db.create_user(username, &body.password, false).await {
+        Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            (StatusCode::BAD_REQUEST, "用户名已存在").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "创建用户失败");
+            internal_error()
+        }
+    }
+}
+
+/// 删子账户：不能删自己、不能删最后一个管理员；级联清 keys/permissions（owner 置 NULL）。
+async fn delete_user(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+) -> Response {
+    let me = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if id == me {
+        return (StatusCode::BAD_REQUEST, "不能删除自己").into_response();
+    }
+    match state.db.get_user(id).await {
+        Ok(Some((_, true))) => match state.db.count_admins().await {
+            Ok(n) if n <= 1 => {
+                return (StatusCode::BAD_REQUEST, "不能删除最后一个管理员").into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "统计管理员失败");
+                return internal_error();
+            }
+        },
+        Ok(Some((_, false))) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户失败");
+            return internal_error();
+        }
+    }
+    match state.db.delete_user(id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "删除用户失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordBody {
+    password: String,
+}
+
+/// 重置子账户口令。
+async fn reset_password(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+    Json(body): Json<ResetPasswordBody>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    if body.password.len() < 8 {
+        return (StatusCode::BAD_REQUEST, "口令过短（至少 8 位）").into_response();
+    }
+    match state.db.set_password(id, &body.password).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "重置口令失败");
+            internal_error()
+        }
+    }
+}
+
+/// 某子账户的权限行（全量）。
+async fn get_user_permissions(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    match state.db.get_permissions(id).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询权限失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PermBody {
+    bucket: String,
+    #[serde(default)]
+    read: bool,
+    #[serde(default)]
+    write: bool,
+    #[serde(default)]
+    delete: bool,
+}
+
+/// 全量替换某子账户的权限行（管理员的 PUT 语义）。
+async fn set_user_permissions(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+    Json(body): Json<Vec<PermBody>>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    match state.db.get_user(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户失败");
+            return internal_error();
+        }
+    }
+    let rows: Vec<crate::db::PermissionRow> = body
+        .into_iter()
+        .map(|p| crate::db::PermissionRow {
+            bucket: p.bucket,
+            read: p.read,
+            write: p.write,
+            delete: p.delete,
+        })
+        .collect();
+    match state.db.set_permissions(id, &rows).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "写入权限失败");
+            internal_error()
         }
     }
 }

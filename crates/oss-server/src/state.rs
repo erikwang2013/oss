@@ -63,6 +63,19 @@ impl AppState {
         store_cfg.inline_threshold = cfg.ec.inline_threshold;
         let store = Store::open(store_cfg).await?;
 
+        // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒
+        // 仅管理员可见/可管）。INSERT OR IGNORE 幂等，已存在（含已有 owner）不覆盖。
+        match store.list_buckets().await {
+            Ok(buckets) => {
+                for b in buckets {
+                    if let Err(e) = db.insert_bucket(&b.name, None).await {
+                        tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "启动回填：列举桶失败"),
+        }
+
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
         // OSS_ADMIN_USER / OSS_ADMIN_PASSWORD 未设置时不做任何事。
         // 空凭据一律拒绝建号：空口令账号会被空口令登录命中（M1 的 verify_user 只做哈希比对，无口令强度校验）。

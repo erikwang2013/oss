@@ -20,14 +20,18 @@ use crate::convert::to_s3_error;
 
 pub struct OssS3 {
     store: Arc<Store>,
+    /// 判权/记账（桶归属、可见性过滤）；授权门本体在 `S3ServiceBuilder::set_access`
+    /// （同一个 [`Acl`] 实例的克隆）。
+    acl: crate::access::Acl,
     /// 单次 PUT 的整份读入上限，见 `put_object` 的 ponytail 取舍。
     max_put_bytes: usize,
 }
 
 impl OssS3 {
-    pub fn new(store: Arc<Store>, max_put_bytes: usize) -> Self {
+    pub fn new(store: Arc<Store>, acl: crate::access::Acl, max_put_bytes: usize) -> Self {
         Self {
             store,
+            acl,
             max_put_bytes,
         }
     }
@@ -331,6 +335,13 @@ impl S3 for OssS3 {
             .create_bucket(&bucket)
             .await
             .map_err(to_s3_error)?;
+        // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
+        // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）
+        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().copied()
+            && let Err(e) = self.acl.record_bucket_owner(&bucket, user.uid).await
+        {
+            tracing::warn!(error = ?e, bucket, "桶归属记账失败");
+        }
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
@@ -355,16 +366,34 @@ impl S3 for OssS3 {
             .delete_bucket(&bucket)
             .await
             .map_err(to_s3_error)?;
+        // 记账清理（授权门已确认桶主/管理员）：清授权行 + 桶行
+        if let Err(e) = self.acl.forget_bucket(&bucket).await {
+            tracing::warn!(error = ?e, bucket, "删桶记账清理失败");
+        }
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 
     async fn list_buckets(
         &self,
-        _req: S3Request<ListBucketsInput>,
+        req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
         let buckets = self.store.list_buckets().await.map_err(to_s3_error)?;
+        // 磁盘列表是权威（历史桶可能没有 DB 行）；非管理员与可见集求交
+        let visible: Option<std::collections::HashSet<String>> =
+            match req.extensions.get::<crate::access::AuthedUser>().copied() {
+                Some(u) if !u.is_admin => Some(
+                    self.acl
+                        .visible(u.uid)
+                        .await
+                        .map_err(crate::access::acl_err)?
+                        .into_iter()
+                        .collect(),
+                ),
+                _ => None,
+            };
         let list = buckets
             .into_iter()
+            .filter(|b| visible.as_ref().is_none_or(|v| v.contains(&b.name)))
             .map(|b| Bucket {
                 name: Some(b.name),
                 creation_date: Some(last_modified(b.creation_nanos)),
