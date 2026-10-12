@@ -36,7 +36,7 @@
 - Modify: `crates/xl-s3/tests/object_ops.rs`
 - Modify: `tests/e2e_s3.sh`
 
-- [ ] **Step 1: 写失败的测试**（`object_ops.rs` 追加）
+- [x] **Step 1: 写失败的测试**（`object_ops.rs` 追加）
 
 ```rust
 #[tokio::test]
@@ -65,9 +65,9 @@ async fn conditional_requests_follow_rfc9110() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**（`cargo test -p xl-s3 conditional 2>&1 | tail`，预期断言失败/字段未接线）。
+- [x] **Step 2: 跑测试确认失败**（`cargo test -p xl-s3 conditional 2>&1 | tail`，预期断言失败/字段未接线）。
 
-- [ ] **Step 3: 实现**。在 `service.rs` 加模块级 helper：
+- [x] **Step 3: 实现**。在 `service.rs` 加模块级 helper：
 
 ```rust
 /// RFC 9110 §13.2.2 求值顺序：If-Match → If-Unmodified-Since → If-None-Match → If-Modified-Since，
@@ -105,9 +105,9 @@ fn eval_preconditions(
 `head_object` 同样先取 info → 求值 → 304: `HeadObjectOutput::default()` with_status；412 同上。
 注意：条件失败**不读盘上数据**（求值只用 info）。
 
-- [ ] **Step 4: 跑测试**（全 `-p xl-s3`；含既有 19 个不得回归）。
+- [x] **Step 4: 跑测试**（全 `-p xl-s3`；含既有 19 个不得回归）。
 
-- [ ] **Step 5: e2e 补充**（`tests/e2e_s3.sh`，插在步骤 11 之后）：
+- [x] **Step 5: e2e 补充**（11b 段；aws-cli 输出形态由 e2e 代理实跑核准）（`tests/e2e_s3.sh`，插在步骤 11 之后）：
   ```bash
   echo "== 11b. 条件请求 =="
   COND_ETAG=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key one.bin --query ETag --output text | tr -d '"')
@@ -120,7 +120,7 @@ fn eval_preconditions(
   ```
   （aw-cli 对 304 的输出形态若怪，用 `curl -H 'If-None-Match: …'` 直测并断言空 body + 304 状态行，实现时以实测选一种。）
 
-- [ ] **Step 6: 提交**——`git commit -m "feat(s3): 条件请求——If-Match/If-None-Match/If-Modified-Since/If-Unmodified-Since → 304/412"`
+- [x] **Step 6: 提交**（706bd9c）——`git commit -m "feat(s3): 条件请求——If-Match/If-None-Match/If-Modified-Since/If-Unmodified-Since → 304/412"`
 
 ---
 
@@ -301,3 +301,11 @@ impl Stream for ChecksumTailStream {
 ## 定稿记录
 
 （实现完成后补：每 Task 实际形态、四闸实跑、e2e 输出、与本文档的差异裁决。）
+
+### Task 1（条件请求）
+
+- 形态与计划一致。实现中三处偏差/裁决：
+  - 测试断言「200」须写 `Some(StatusCode::OK)` 而非 `None`——get_object 统一走 `with_status`（初稿断言 None 系笔误，编译/运行两轮修正）。
+  - 测试闭包用 `let s3 = &s3;` 借用捕获（否则 `async move` 把 s3 搬进 future，闭包成 FnOnce 只能调用一次）。
+  - `eval_preconditions` 的两处 else-if 用 let-chains 收拢（clippy `collapsible_if`，-D warnings 门）。
+- 实跑：xl-s3 20/20（七场景）、workspace 128+1 全绿、clippy 0 告警；e2e_s3.sh 17 步实跑（11b 段）结果随 e2e 报告补记。
