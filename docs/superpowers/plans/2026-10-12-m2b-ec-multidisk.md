@@ -223,10 +223,15 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 **Files:** Modify: `store/put.rs`、`store/read.rs`
 
-- [ ] **Step 1: 测试先行**（设计验收 #4 的本地版）：2 KB 对象 PUT 后，对象目录内 `find` 计数 == 1（只有 `xl.meta`）；读回一致；覆写为 EC 尺寸再读（形态切换）；mpu 小对象同样内联（complete 分支）。
-- [ ] **Step 2: 实现**：内联字节直接进 `Version.inline`；读路径 `inline.is_some()` 优先于 `data_layout`/parts。**注意**：内联不经 EC——单盘形态（M2b-1）下即单份，冗余由 M2b-2 的 meta 多盘复制提供（风险表记录此边界）。
-- [ ] **Step 3:** MPU `complete_multipart_upload` 收口：**统一裁决**——complete 时按顺序流读暂存 `part.N` 拼成整对象 → 走与单段 PUT 相同的「内联或 EC」落盘 → 暂存文件清理；`Version.parts` 字段保留供 M2a 旧对象读取，新写入不再使用（裁决记入定稿记录）。
-- [ ] **Step 4:** 提交 `feat(xl-store): 小对象内联（< 128 KiB 进 xl.meta）；MPU complete 统一走 EC/内联`。
+- [x] **Step 1: 测试先行**（设计验收 #4 的本地版）：2 KB 对象 PUT 后，对象目录内 `find` 计数 == 1（只有 `xl.meta`）；读回一致；覆写为 EC 尺寸再读（形态切换）；mpu 小对象同样内联（complete 分支）。（落地：内联 find 计数用例 = `put_then_head`（11 B）+ `inline_threshold_boundary`（127 KiB）+ `multipart_single_small_part_completes`（5 B，MPU 分支）；形态切换 = `inline_threshold_boundary` 尾段（同键 内联→EC→内联 覆写）；设计验收 #4 的「13 小文件」在 EC 侧 = 12 片（parity 计入）。）
+- [x] **Step 2: 实现**：内联字节直接进 `Version.inline`；读路径 `inline.is_some()` 优先于 `data_layout`/parts。（已于 Task 4/5 轮随写读分派落地。）**注意**：内联不经 EC——单盘形态（M2b-1）下即单份，冗余由 M2b-2 的 meta 多盘复制提供（风险表记录此边界）。
+- [x] **Step 3:** MPU `complete_multipart_upload` 收口：**统一裁决**——complete 时按顺序流读暂存 `part.N` 拼成整对象 → 走与单段 PUT 相同的「内联或 EC」落盘 → 暂存文件清理；`Version.parts` 字段保留供 M2a 旧对象读取，新写入不再使用（裁决记入定稿记录）。（落地：形态核心提取为 `put.rs::stage_payload`（单段 PUT 与 MPU complete 共用）；MPU 装对象 = `mpu.rs::concat_stream` 按声明顺序 64 KiB 块流式拼 `part.N`；完成提交后暂存区**整目录清理**（`mpu.meta` 生死门先改名 `mpu.meta.done`，删到一半崩溃的残骸由 `reap_stale` 按 mtime 回收）；`abort`/`list_parts` 在 complete 后仍报 `NoSuchUpload`（断言在测试里）。）
+- [x] **Step 4:** 提交 `feat(xl-store): 小对象内联（< 128 KiB 进 xl.meta）；MPU complete 统一走 EC/内联`。
+
+**落地裁决（Task 6 轮）：**
+1. **complete 期间并发重传防护**：`upload_part` 不持对象锁（允许并发传不同 part——M2a 裁决不变），因此 complete 拼装出的字节数与声明的各段总和可能不一致（同一 part 被并发重传）。fail-closed：不一致 → `InvalidPart`（可重试语义），不提交不一致的 etag/长度。
+2. **暂存区不再原地转正**：旧设计（staging 目录 rename 成版本目录）与「统一 EC/内联形态」不兼容；新流程 = 拼装进 `tmp/<新 uuid>` → rename → 提交点 → 清理暂存区。代价 = 一次全量数据双写（暂存 + 转换产物并存到提交点之后），换来形态统一；暂存区在 complete 成功后立即释放。
+3. **旧 parts 形态回归用例**：`legacy_parts_form_still_readable`（手工构造 M2a meta + 多段 part 文件）钉死「升级不失读」。
 
 ### 切片一收尾
 - [ ] 四闸：fmt · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · `tests/e2e_s3.sh` 14 步回归（S3 面行为不应变化）
@@ -326,7 +331,7 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 | 旧代码读 M2b 新对象会找不到 part.N | 方向契约明确：只保证「新解旧」；发布/部署锁步（升级即全量新写） |
 | 单盘形态的 inline 无冗余（meta 只有一份） | 声明为 M2b-1 边界；M2b-2 的 meta 多盘复制落地后冗余成立 |
 | 12 盘起步的测试环境成本（tempdir × 12/用例） | 用例用 12 个 `tempfile::tempdir()`（轻量）；真服务 e2e 用 12 个子目录 |
-| MPU 与新布局的兼容（parts 字段的存废） | Task 6 裁决：新写入统一 EC/内联，`parts` 降为只读兼容位；旧对象读路径回归用例钉死 |
+| MPU 与新布局的兼容（parts 字段的存废） | **已结案（Task 6）**：新写入统一 EC/内联，`parts` 降为只读兼容位；`legacy_parts_form_still_readable` 回归用例钉死；complete 并发重传 fail-closed |
 | `set_index` 公式在单 set 下恒 0（为 M3 留形） | 注释明示「留形不留行为」；M3 引入多 set 时公式行为随拓扑生效 |
 
 ## 定稿记录

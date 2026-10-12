@@ -242,6 +242,31 @@ async fn inline_threshold_boundary() {
     assert_eq!(v.data_layout.as_ref().unwrap().shards.len(), 12);
     let (_, bytes) = s.get_object("alpha", "big").await.unwrap();
     assert_eq!(&bytes[..], &big[..]);
+
+    // 形态切换：同键覆写内联 → EC → 内联，读到的始终是最新形态，旧版本进 trash
+    let mid = payload(200 * 1024);
+    s.put_object("alpha", "small", mid.clone(), None)
+        .await
+        .unwrap();
+    let (_, bytes) = s.get_object("alpha", "small").await.unwrap();
+    assert_eq!(&bytes[..], &mid[..]);
+    s.put_object("alpha", "small", small.clone(), None)
+        .await
+        .unwrap();
+    let (_, bytes) = s.get_object("alpha", "small").await.unwrap();
+    assert_eq!(&bytes[..], &small[..]);
+    assert_eq!(
+        read_disk_meta(&s, "alpha", "small")
+            .await
+            .latest()
+            .unwrap()
+            .inline
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_slice(),
+        &small[..]
+    );
 }
 
 #[tokio::test]
@@ -1114,7 +1139,7 @@ fn bytes_stream(v: Vec<u8>) -> ByteStream {
 
 #[tokio::test]
 async fn multipart_single_small_part_completes() {
-    let (s, _d) = store().await;
+    let (s, d) = store().await;
     s.create_bucket("alpha").await.unwrap();
     let id = s
         .create_multipart_upload(
@@ -1143,6 +1168,108 @@ async fn multipart_single_small_part_completes() {
     let (head, body) = s.get_object("alpha", "big").await.unwrap();
     assert_eq!(head.size, 5);
     assert_eq!(&body[..], b"hello");
+
+    // Task 6：小对象 complete 后走内联（版本目录只有 xl.meta），暂存区整目录清理
+    let obj_dir = layout::object_dir(d.path(), "alpha", "big").unwrap();
+    let m = read_disk_meta(&s, "alpha", "big").await;
+    let v = m.latest().unwrap();
+    assert_eq!(v.inline.as_ref().unwrap().bytes.as_slice(), b"hello");
+    assert!(v.parts.is_none(), "新写入不再使用 parts");
+    assert_eq!(shard_files(&obj_dir.join(&v.part.uuid)), 0);
+    assert!(
+        !tokio::fs::try_exists(obj_dir.join(&id)).await.unwrap(),
+        "complete 后暂存区应被清理"
+    );
+}
+
+#[tokio::test]
+async fn multipart_complete_over_threshold_writes_ec() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload("alpha", "ec", None, Default::default())
+        .await
+        .unwrap();
+    let data = payload(200 * 1024);
+    let etag = s
+        .upload_part("alpha", "ec", &id, 1, bytes_stream(data.to_vec()))
+        .await
+        .unwrap();
+    let info = s
+        .complete_multipart_upload("alpha", "ec", &id, &[(1, etag)])
+        .await
+        .unwrap();
+    assert_eq!(info.size, (200 * 1024) as u64);
+    assert!(info.etag.ends_with("-1"));
+
+    let obj_dir = layout::object_dir(d.path(), "alpha", "ec").unwrap();
+    let m = read_disk_meta(&s, "alpha", "ec").await;
+    let v = m.latest().unwrap();
+    assert!(v.inline.is_none());
+    assert!(v.parts.is_none(), "新写入不再使用 parts");
+    assert_eq!(v.data_layout.as_ref().unwrap().shards.len(), 12);
+    assert_eq!(shard_files(&obj_dir.join(&v.part.uuid)), 12);
+    assert!(
+        !tokio::fs::try_exists(obj_dir.join(&id)).await.unwrap(),
+        "complete 后暂存区应被清理"
+    );
+
+    let (_, bytes) = s.get_object("alpha", "ec").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+    // EC 形态在 MPU 路径同样成立：丢 4 片仍可重建
+    let vdir = obj_dir.join(&v.part.uuid);
+    for i in [0, 3, 7, 11] {
+        std::fs::remove_file(vdir.join(format!("part.1.{i}"))).unwrap();
+    }
+    let (_, bytes) = s.get_object("alpha", "ec").await.unwrap();
+    assert_eq!(&bytes[..], &data[..]);
+}
+
+#[tokio::test]
+async fn legacy_parts_form_still_readable() {
+    // M2a 旧对象回归：parts: Some + 多段 part.N 文件的旧形态读路径必须继续可读
+    //（Task 6 裁决后新写入不再产生此形态，但升级不得让旧对象失读）
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let obj_dir = layout::object_dir(d.path(), "alpha", "legacy").unwrap();
+    let vdir = obj_dir.join("legacy-uuid");
+    tokio::fs::create_dir_all(&vdir).await.unwrap();
+    tokio::fs::write(vdir.join("part.1"), b"AAA").await.unwrap();
+    tokio::fs::write(vdir.join("part.2"), b"BBBB")
+        .await
+        .unwrap();
+    let mk = |part: u16, size: u64| meta::PartRef {
+        uuid: "legacy-uuid".into(),
+        part,
+        size,
+        sha256: String::new(),
+    };
+    let version = meta::Version {
+        version_id: uuid::Uuid::nil(),
+        mod_time_nanos: 1,
+        size: 7,
+        etag: "legacy".into(),
+        content_type: None,
+        user_metadata: Default::default(),
+        part: mk(1, 3),
+        parts: Some(vec![mk(1, 3), mk(2, 4)]),
+        checksum: None,
+        data_layout: None,
+        inline: None,
+    };
+    let m = XlMeta {
+        object_key: "legacy".into(),
+        versions: vec![version],
+    };
+    tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+        .await
+        .unwrap();
+
+    let (info, bytes) = s.get_object("alpha", "legacy").await.unwrap();
+    assert_eq!(info.size, 7);
+    assert_eq!(&bytes[..], b"AAABBBB");
+    let r = s.get_object_range("alpha", "legacy", 2..6).await.unwrap();
+    assert_eq!(&r[..], b"ABBB");
 }
 
 #[tokio::test]

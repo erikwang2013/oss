@@ -72,12 +72,98 @@ impl Store {
             .await
     }
 
+    /// 写形态核心（单段 PUT 与 MPU complete 共用）：流式收 `body` 到 `tmp/part.1`，
+    /// 收全后按 `inline_threshold` 转形态，返回
+    /// `(size, 整份 MD5 etag, 整份 SHA256, data_layout, inline)`。
+    /// 调用方负责候选 meta 与提交协议（rename → write_meta）。
+    pub(in crate::store) async fn stage_payload(
+        &self,
+        tmp: &std::path::Path,
+        mut body: ByteStream,
+    ) -> Result<(
+        u64,
+        String,
+        String,
+        Option<meta::DataLayout>,
+        Option<meta::InlineData>,
+    )> {
+        tokio::fs::create_dir_all(tmp).await?;
+
+        // 1) 流式写数据 + 增量哈希
+        let part_path = tmp.join("part.1");
+        let mut file = tokio::fs::File::create(&part_path).await?;
+        let mut md5 = Md5::new();
+        let mut sha = Sha256::new();
+        let mut size: u64 = 0;
+        while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+            let chunk = chunk?;
+            md5.update(&chunk);
+            sha.update(&chunk);
+            size += chunk.len() as u64;
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        if self.cfg.fsync {
+            file.sync_all().await?;
+        }
+        drop(file);
+
+        let etag = hex::encode(md5.finalize());
+        let sha256 = hex::encode(sha.finalize());
+
+        // 2) 收尾转形态。为什么不像任务书最初设想的「收全再分叉」：那会失去流式落盘
+        // 语义（M2a 的握手测试与 README 承诺）。保持「流式写 part.1 → 收全后转」，
+        // 峰值只在 encode 一步（payload + 12 片），S3 路径受 max_put_bytes 约束；
+        // ponytail: aether ingest 大文件同受此峰值，ShardByShard 流式编/解是 M2b-3 之后的升级路径。
+        let (data_layout, inline) = if size < self.cfg.inline_threshold {
+            // 内联：小文件读回进 meta，删 part.1（版本目录只剩 xl.meta）
+            let bytes = tokio::fs::read(&part_path).await?;
+            tokio::fs::remove_file(&part_path).await?;
+            (None, Some(meta::InlineData { bytes }))
+        } else {
+            // EC：读回整份 → 编码 → 逐片写 part.1.<shard>（每片 fsync），删 part.1
+            let payload = tokio::fs::read(&part_path).await?;
+            let shards = ec::encode(&payload, self.cfg.ec)?;
+            drop(payload);
+            let mut shard_refs = Vec::with_capacity(shards.len());
+            for (i, s) in shards.iter().enumerate() {
+                let path = tmp.join(format!("part.1.{i}"));
+                let mut f = tokio::fs::File::create(&path).await?;
+                f.write_all(s).await?;
+                f.flush().await?;
+                if self.cfg.fsync {
+                    f.sync_all().await?;
+                }
+                drop(f);
+                shard_refs.push(meta::ShardRef {
+                    drive: 0,
+                    part: 1,
+                    shard: i as u8,
+                    size: s.len() as u64,
+                    crc32c: ec::crc32c_of(s),
+                });
+            }
+            tokio::fs::remove_file(&part_path).await?;
+            let shard_size = shards.first().map_or(0, Vec::len) as u64;
+            (
+                Some(meta::DataLayout {
+                    data: self.cfg.ec.data,
+                    parity: self.cfg.ec.parity,
+                    shard_size,
+                    shards: shard_refs,
+                }),
+                None,
+            )
+        };
+        Ok((size, etag, sha256, data_layout, inline))
+    }
+
     /// 流式 PUT 的完整形态（含用户元数据）；`put_object_stream` 是空元数据的薄壳。
     pub async fn put_object_stream_with_meta(
         &self,
         bucket: &str,
         key: &str,
-        mut body: ByteStream,
+        body: ByteStream,
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
         checksum: Option<ChecksumRecord>,
@@ -96,74 +182,7 @@ impl Store {
         // 1)+2) 数据与候选 meta 落 tmp；任何写失败/流错误都 best-effort 清掉本轮 tmp
         //（未提交前 tmp 不被任何 meta 引用，失败即弃；残留只占空间，由 `oss-server clean` 按 mtime 回收）
         let staged: Result<(u64, String, XlMeta)> = async {
-            tokio::fs::create_dir_all(&tmp).await?;
-
-            // 1) 流式写数据 + 增量哈希
-            let part_path = tmp.join("part.1");
-            let mut file = tokio::fs::File::create(&part_path).await?;
-            let mut md5 = Md5::new();
-            let mut sha = Sha256::new();
-            let mut size: u64 = 0;
-            while let Some(chunk) = futures::StreamExt::next(&mut body).await {
-                let chunk = chunk?;
-                md5.update(&chunk);
-                sha.update(&chunk);
-                size += chunk.len() as u64;
-                file.write_all(&chunk).await?;
-            }
-            file.flush().await?;
-            if self.cfg.fsync {
-                file.sync_all().await?;
-            }
-            drop(file);
-
-            let etag = hex::encode(md5.finalize());
-            let sha256 = hex::encode(sha.finalize());
-
-            // 1b) 收尾转形态。为什么不像任务书最初设想的「收全再分叉」：那会失去流式落盘
-            // 语义（M2a 的握手测试与 README 承诺）。保持「流式写 part.1 → 收全后转」，
-            // 峰值只在 encode 一步（payload + 12 片），S3 路径受 max_put_bytes 约束；
-            // ponytail: aether ingest 大文件同受此峰值，ShardByShard 流式编/解是 M2b-3 之后的升级路径。
-            let (data_layout, inline) = if size < self.cfg.inline_threshold {
-                // 内联：小文件读回进 meta，删 part.1（版本目录只剩 xl.meta）
-                let bytes = tokio::fs::read(&part_path).await?;
-                tokio::fs::remove_file(&part_path).await?;
-                (None, Some(meta::InlineData { bytes }))
-            } else {
-                // EC：读回整份 → 编码 → 逐片写 part.1.<shard>（每片 fsync），删 part.1
-                let payload = tokio::fs::read(&part_path).await?;
-                let shards = ec::encode(&payload, self.cfg.ec)?;
-                drop(payload);
-                let mut shard_refs = Vec::with_capacity(shards.len());
-                for (i, s) in shards.iter().enumerate() {
-                    let path = tmp.join(format!("part.1.{i}"));
-                    let mut f = tokio::fs::File::create(&path).await?;
-                    f.write_all(s).await?;
-                    f.flush().await?;
-                    if self.cfg.fsync {
-                        f.sync_all().await?;
-                    }
-                    drop(f);
-                    shard_refs.push(meta::ShardRef {
-                        drive: 0,
-                        part: 1,
-                        shard: i as u8,
-                        size: s.len() as u64,
-                        crc32c: ec::crc32c_of(s),
-                    });
-                }
-                tokio::fs::remove_file(&part_path).await?;
-                let shard_size = shards.first().map_or(0, Vec::len) as u64;
-                (
-                    Some(meta::DataLayout {
-                        data: self.cfg.ec.data,
-                        parity: self.cfg.ec.parity,
-                        shard_size,
-                        shards: shard_refs,
-                    }),
-                    None,
-                )
-            };
+            let (size, etag, sha256, data_layout, inline) = self.stage_payload(&tmp, body).await?;
 
             let version = Version {
                 version_id: uuid::Uuid::nil(), // M1 无版本控制：nil = S3 的 "null" 版本
@@ -179,7 +198,7 @@ impl Store {
                     size,
                     sha256,
                 },
-                // 单段 PUT 保持与旧文件同形的 None（MPU complete 才写 Some）
+                // 单段 PUT 的 parts 恒 None（多段只出现在 M2a 旧对象的只读兼容位）
                 parts: None,
                 checksum: checksum.clone(),
                 data_layout,

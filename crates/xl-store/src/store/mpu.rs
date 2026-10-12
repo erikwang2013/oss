@@ -1,5 +1,6 @@
-//! Multipart Upload：暂存区在**对象目录下的** `<upload_id>/`（规格布局），
-//! complete 时该目录原地转正为零拷贝的版本目录。
+//! Multipart Upload：暂存区在**对象目录下的** `<upload_id>/`（规格布局）。
+//! complete 时按声明顺序拼装零件 → 走与单段 PUT 相同的「内联 / EC」落盘为新版本目录，
+//! 暂存区整目录清理（M2b-1 Task 6 裁决：旧 parts 形态只留给 M2a 旧对象读取，新写入不再使用）。
 //!
 //! 提交语义与单段 PUT 完全一致：part 上传只把数据放进对象目录（**无 meta 引用 → 不可见**），
 //! complete 写 `xl.meta` 才是唯一可见性翻转。
@@ -7,10 +8,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use bytes::Bytes;
 use futures::StreamExt as _;
 use md5::{Digest as _, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 use crate::layout;
@@ -151,7 +153,8 @@ impl Store {
         Ok(etag)
     }
 
-    /// 完成 MPU：校验（对齐规格）→ 写 `xl.meta`（唯一提交点）→ 暂存区原地转正 → 旧版本进 trash。
+    /// 完成 MPU：校验（对齐规格）→ 按声明顺序拼装零件为**内联/EC 形态**的新版本目录
+    /// → 写 `xl.meta`（唯一提交点）→ 暂存区清理 → 旧版本进 trash。
     ///
     /// `parts` 为客户端声明的 `(part_number, etag)` 列表，须严格升序。校验链：
     /// 空/超量 → InvalidPart；非升序 → InvalidPartOrder；part 缺失/ETag 不一致 → InvalidPart；
@@ -193,12 +196,9 @@ impl Store {
             }
         }
 
-        let canonical_id = uuid::Uuid::parse_str(upload_id)
-            .map_err(|_| Error::NoSuchUpload(upload_id.to_string()))?
-            .to_string();
-        let mut refs = Vec::with_capacity(parts.len());
         let mut raw_md5s: Vec<Vec<u8>> = Vec::with_capacity(parts.len());
         let mut total: u64 = 0;
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(parts.len());
         for (i, (pn, etag)) in parts.iter().enumerate() {
             let sidecar = dir.join(format!("part.{pn}.meta"));
             let pm: PartMeta = match tokio::fs::read(&sidecar).await {
@@ -230,12 +230,7 @@ impl Store {
                     .map_err(|e| Error::CorruptMeta(format!("part.{pn} etag 非法: {e}")))?,
             );
             total += pm.size;
-            refs.push(PartRef {
-                uuid: canonical_id.clone(),
-                part: *pn,
-                size: pm.size,
-                sha256: pm.sha256,
-            });
+            paths.push(dir.join(format!("part.{pn}")));
         }
 
         // multipart ETag = hex(md5(逐段原始 md5 字节拼接)) + "-N"（S3 定义）
@@ -248,33 +243,64 @@ impl Store {
         // M-6 同口径：损坏旧 meta 让 complete fail-closed
         let old_meta = self.read_meta(bucket, key).await?;
         let now = now_nanos();
-        let first = refs[0].clone();
-        let version = Version {
-            version_id: uuid::Uuid::nil(),
-            mod_time_nanos: now,
-            size: total,
-            etag: etag.clone(),
-            content_type: mpu.content_type.clone(),
-            user_metadata: mpu.user_metadata.clone(),
-            part: first, // 兼容位：首段副本
-            parts: Some(refs),
-            checksum: None,    // multipart 组合校验和留 M2b
-            data_layout: None, // 暂存零件仍是旧形态；Task 6 起 complete 统一走 EC/内联
-            inline: None,
-        };
-        let meta = XlMeta {
-            object_key: key.to_string(),
-            versions: vec![version],
+
+        // 装进新版本目录（内联 / EC 形态）——与单段 PUT 同一形态核心
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let tmp = layout::sys_dir(&self.cfg.root, "tmp").join(&uuid);
+        let staged: Result<XlMeta> = async {
+            let (size, _md5, sha256, data_layout, inline) =
+                self.stage_payload(&tmp, concat_stream(paths)).await?;
+            if size != total {
+                // upload_part 不持对象锁（允许并发传不同 part）：complete 期间零件被并发重传
+                // = 声明 etag/长度与盘上字节不一致。fail-closed，让客户端重试 complete
+                return Err(Error::InvalidPart(format!(
+                    "part 数据在 complete 期间被并发修改（声明 {total} 字节，盘上 {size}）"
+                )));
+            }
+            let version = Version {
+                version_id: uuid::Uuid::nil(),
+                mod_time_nanos: now,
+                size,
+                etag: etag.clone(),
+                content_type: mpu.content_type.clone(),
+                user_metadata: mpu.user_metadata.clone(),
+                // 兼容位：整对象引用（sha256 = 整份 SHA256，读路径 EC 终验用）
+                part: PartRef {
+                    uuid: uuid.clone(),
+                    part: 1,
+                    size,
+                    sha256,
+                },
+                parts: None,    // 裁决：新写入不再使用 parts（降为 M2a 旧对象只读兼容位）
+                checksum: None, // multipart 组合校验和留 M2b
+                data_layout,
+                inline,
+            };
+            let meta = XlMeta {
+                object_key: key.to_string(),
+                versions: vec![version],
+            };
+            tokio::fs::write(tmp.join(crate::meta::META_FILE), meta.encode()?).await?;
+            Ok(meta)
+        }
+        .await;
+        let meta = match staged {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+                return Err(e);
+            }
         };
 
-        // 唯一提交点
+        // 数据就位（同盘 rename）→ 唯一提交点
+        tokio::fs::create_dir_all(&obj_dir).await?;
+        tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
         self.write_meta(bucket, key, &meta).await?;
 
-        // 转正标记 + sidecar 清理（best-effort：提交点已过）
+        // 暂存区收尾（best-effort：提交点已过）：mpu.meta 生死门先改名，再整目录删。
+        // 若删到一半崩溃，残骸无 meta 引用，由 `reap_stale` 按 mtime 回收
         let _ = tokio::fs::rename(dir.join(MPU_META_FILE), dir.join(MPU_DONE_FILE)).await;
-        for (pn, _) in parts {
-            let _ = tokio::fs::remove_file(dir.join(format!("part.{pn}.meta"))).await;
-        }
+        let _ = tokio::fs::remove_dir_all(&dir).await;
 
         // 老版本进回收站（与单段 PUT 相同）
         if let Some(old) = old_meta.as_ref().and_then(|m| m.latest()) {
@@ -355,4 +381,34 @@ impl Store {
         out.sort_by_key(|p| p.part_number);
         Ok(out)
     }
+}
+
+/// 按声明顺序把暂存的 `part.N` 文件拼成一个 64 KiB 块的 `ByteStream`（complete 装对象用）。
+/// 逐块读、不整份进内存——内存峰值留给 `stage_payload` 的 encode 一步（与单段 PUT 同口径）。
+fn concat_stream(paths: Vec<PathBuf>) -> ByteStream {
+    type St = (std::vec::IntoIter<PathBuf>, Option<tokio::fs::File>);
+    let state: St = (paths.into_iter(), None);
+    Box::pin(futures::stream::try_unfold(
+        state,
+        |(mut files, mut cur): St| async move {
+            loop {
+                // 不用 `match &mut cur`（Polonius 未落地：在另一分支里给 cur 赋值会被借用检查拒绝）
+                if cur.is_none() {
+                    match files.next() {
+                        Some(p) => cur = Some(tokio::fs::File::open(&p).await?),
+                        None => return Ok(None),
+                    }
+                }
+                let f = cur.as_mut().expect("刚填过");
+                let mut buf = vec![0u8; 64 * 1024];
+                let n = f.read(&mut buf).await?;
+                if n == 0 {
+                    cur = None; // 本段读完，切下一段
+                    continue;
+                }
+                buf.truncate(n);
+                return Ok(Some((Bytes::from(buf), (files, cur))));
+            }
+        },
+    ))
 }
