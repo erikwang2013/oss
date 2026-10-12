@@ -329,13 +329,13 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 **Files:** `README.md`、`docs/superpowers/specs/2026-10-10-minio-clone-design.md`（状态注记）、`docs/superpowers/specs/2026-10-10-feature-spec.md`（§3.2 EC 重建措辞、阶段表）、本计划
 
-- [ ] README：架构段加「单机多盘 + EC 8+4」；已知限制更新（内联阈值、`fsck` 用法、目录 fsync 的物理假设）；`oss.toml` 示例补 `data_dirs`/`[ec]`。
-- [ ] 设计文档：M2 行的「已落地」标记（M2b 部分）；§4.4 锁表更新为「已实现」。
-- [ ] 提交 `docs: M2b 落地后同步 README/设计文档边界清单`。
+- [x] README：架构段加「单机多盘 + EC 8+4」；已知限制更新（多盘运维边界、首启确认挂载、拔盘删除 fail-closed、mod_time 边界、目录 fsync 物理假设、`E2E_LONG` 门控）；`oss.toml` 示例补 `data_dirs`/`[ec]`；运维命令加 `fsck`。
+- [x] 设计文档：M2 行的「已落地」标记（验收 5 条逐条映射 + 实现边界）；§4.4 锁表更新为「已实现」（flock + 桶级互斥）；盘布局注释同步（locks/drive-id/fsck）。功能规格：`fsck` 行与阶段总对照同步。
+- [x] 提交 `docs: M2b 落地后同步 README/设计文档边界清单`。（23563a1。）
 
 ### 切片三收尾
-- [ ] 四闸 + 全量 e2e（含多盘配置冒烟 + `fsck` 实跑输出报告）
-- [ ] 定稿记录：三个切片的四闸实跑、设计 §M2 验收映射、所有裁决与偏差
+- [x] 四闸 + 全量 e2e：Task 10 已并入切片二终版（5e91fe4）并过全部闸（172 测 + clippy 0 + 12 盘 e2e 17/17 + fsck 实跑 + 拔盘加验）；切片三本体为纯文档（23563a1），fmt 无 diff、workspace clippy 0 复跑通过，代码未动故 e2e 结论沿用 5e91fe4 轮
+- [x] 定稿记录：见下（三个切片的四闸实跑、设计 §M2 验收映射、全部裁决与偏差）
 
 ---
 
@@ -388,3 +388,10 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 - **实测修复**（测试/评审暴露）：读时修缺存活探测、桶操作只看 drive0、flock 执行器饿死挂死、put 桶窗口间隙被 delete 抢先、kill9 目录计数含 meta 文件。
 - **遗留**：R5/R8/首启盲区入风险表；E2E_LONG 默认参数（100×100 MB）人工触发；README/设计文档同步归 Task 11。
 - **下一步**：切片三（Task 11 文档收尾；Task 10 已完成并入 5e91fe4）。
+
+### 切片三（Task 10 并入切片二；Task 11 文档）——2026-10-13
+
+- **提交**：23563a1（docs：README / 设计文档 / 功能规格 / oss.toml 四件套同步）。
+- **四闸**：纯文档变更——fmt 无 diff、workspace clippy 与测试在 5e91fe4 上已全绿且代码未动，e2e 结论沿用（12 盘 17/17 + fsck 实跑 + 拔盘加验）。
+- **设计 §M2 验收五条全部闭合**（映射见设计文档 M2 节；#3 的长跑段已落 `E2E_LONG` 门控、微缩版实跑通过、默认参数人工触发）。
+- **M2b 整体收束**：单盘（M2b-1：EC 8+4 落盘/重建 + 小对象内联）→ 多盘（M2b-2：drives[]/quorum/两阶段 meta 提交/拔盘容忍/读时修/断电用例/fsck/锁）→ 文档。全部裁决、偏差、评审两轮（M2b-1 F1-F7、M2b-2 R1-R8）与遗留均已入档。**M2 阶段（M2a + M2b）完成**；后续按设计阶段表进入 M3（分布式）。
