@@ -1,9 +1,9 @@
 name: CI
 
+# 仅手动触发（用户要求：不要自动跑 CI——push/PR 不再自动起任务；
+# 需要时在 GitHub Actions 页面对本 workflow 点「Run workflow」）。
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   rust:
