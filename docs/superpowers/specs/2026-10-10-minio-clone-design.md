@@ -125,8 +125,9 @@ oss/
 ├── .oss.sys/
 │   ├── tmp/            未提交数据（同盘 rename 的源）
 │   ├── trash/          待异步清理的版本目录
-│   ├── locks/          <sha1(key)>.lock —— 命名空间锁
-│   └── fsck/           启动自检报告
+│   ├── locks/          <sha256(key)[..16]>.lock —— 命名空间锁（M2b 已实现）
+│   ├── drive-id        盘部署标识（M2b：防插错盘 / 掉线盘识别）
+│   └── fsck/           fsck 巡检报告（M2b 已启用）
 └── <bucket>/
     └── a__XLDIR__b__XLDIR__c.txt/     ← 对象名展平（MinIO 同款）
         ├── xl.meta                    元数据（唯一提交点）
@@ -166,7 +167,7 @@ oss/
 
 | 阶段 | 机制 |
 |---|---|
-| M1–M2（单机） | `.oss.sys/locks/<sha1(key)>.lock` 上的 `flock`（跨进程）+ 进程内 per-object 互斥（`DashMap<Key, Arc<Mutex>>`） |
+| M1–M2（单机） | `.oss.sys/locks/<sha256(key)[..16]>.lock` 上的 `flock`（跨进程，**M2b 已实现**，阻塞等待入 spawn_blocking 池）+ 进程内 per-object 互斥（`HashMap<Key, Arc<Mutex>>`，M1 已实现）；M2b 另加**桶级互斥**（写者「桶窗口」与删桶/建桶互斥，防桶复活） |
 | M3+（分布式） | 节点间 quorum 锁（类 MinIO dsync）。跨节点 rename 不原子，锁是唯一保证。优先评估 `ecat-lock` 的后端能力 |
 
 ---
@@ -403,16 +404,18 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 4. 控制台里能看到、下载、删除该文件
 5. `curl` 直接打 `/aetherupload/preprocess` 返回协议一致的 JSON
 
-### M2 真·单机对象存储（3-4 周）
+### M2 真·单机对象存储（3-4 周）——**已落地（M2a 协议/回收面 + M2b 存储面，2026-10-13）**
 
 **范围**：正式 `xl.meta` v1（含格式版本）· EC 8+4 · 小对象内联 · 单机多盘 · Multipart Upload · Range · 断电一致性 · tmp/trash 孤儿回收
 
-**验收**
-1. 拔掉 2 块盘（8+4 的 parity 预算内）读写照常，日志显示分片重建
-2. 在任意提交点 `kill -9` 后重启：自检无脏数据、无孤儿外泄；`rclone check` 通过
-3. `rclone` 并发上传 100 个 100 MB 文件 + 中断重试，全部校验和一致
-4. 2 KB 对象不产生 13 个小文件（内联生效，`find` 计数验证）
-5. 分片 CRC32C / 整对象 SHA256 校验：手工翻转一个分片字节，读返回错误而非静默脏数据
+**验收**（M2b 收尾时的自动化映射见实现计划 `plans/2026-10-12-m2b-ec-multidisk.md` 定稿记录）
+1. 拔掉 2 块盘（8+4 的 parity 预算内）读写照常，日志显示分片重建 —— ✅ 单测（12 盘 tempdir 移盘）+ 真服务 e2e 加验；拔 4 盘读边界、拔 5 盘 fail-closed、拔盘写入 quorum = data+1
+2. 在任意提交点 `kill -9` 后重启：自检无脏数据、无孤儿外泄 —— ✅ `tests/kill9.rs` 四注入点（分片半写 / meta 准备后 / 翻转中途，SIGABRT）+ 启动自检；`rclone check` 于 e2e 覆盖
+3. `rclone` 并发上传 100 个 100 MB 文件 + 中断重试，全部校验和一致 —— ✅ `tests/e2e_s3.sh` 的 `E2E_LONG=1` 门控段（微缩版实跑通过；默认参数人工触发）
+4. 2 KB 对象不产生 13 个小文件（内联生效，`find` 计数验证）—— ✅ 内联阈值用例（find 计数 0）
+5. 分片 CRC32C / 整对象 SHA256 校验：手工翻转一个分片字节，读返回错误而非静默脏数据 —— ✅ CRC 层坏片视同缺失进重建（自愈）；能过 CRC 的错配由 SHA256 终验 fail-closed（专测）
+
+**实现边界（M2b 定稿记录）**：EC 读写整份进内存（ShardByShard 流式化顺延）；meta「最新副本胜」依赖墙钟单调（M3 epoch/heal 收口）；读时修为最小版、无后台 heal；rclone 长跑默认参数人工触发。
 
 ### M3 分布式（4-6 周）
 

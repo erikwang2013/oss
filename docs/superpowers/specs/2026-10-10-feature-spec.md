@@ -703,7 +703,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | `groups` | 建分组目录（**不建就一定上传失败**） | M1 | 已实现：启动自举（`aether::build_runtime`）+ `oss-server groups` 双入口 |
 | `build` | 按磁盘现状重建秒传索引 | M1 | 已实现：`oss-server build` |
 | `clean <days>` | 按 mtime 回收临时文件（`_header` 与 `*.part`） | M1 | 已实现：`oss-server clean <days>`；另回收内核 `.oss.sys/tmp/` 的孤儿上传目录 |
-| `fsck` | 启动自检：孤儿版本目录、缺失分片、meta 不一致 | M2 | 未实现 |
+| `fsck` | 启动自检：孤儿版本目录、缺失分片、meta 不一致 | M2 | **M2b 已落地**：`oss-server fsck [--repair]`——孤儿版本目录 / EC 分片 CRC32C 缺坏 / tmp-trash 计数；`--repair` 删孤儿 + 读时修分片；报告落 `.oss.sys/fsck/<时间戳>.json`。独立深度 `scrub` 仍归 M4 |
 | `scrub [--repair]` | 逐分片校验和比对，可选修复 | M4 | 未实现 |
 | `rebalance` | 按新拓扑重新分布 | M4 | 未实现 |
 | `heal` | 补齐缺失分片（读到即修 + 主动扫描） | M4 | 未实现 |
@@ -729,7 +729,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 阶段 | 功能 |
 |---|---|
 | **M1** | SigV4 认证 · 控制台登录 · 桶 CRUD · 对象 PUT/GET/HEAD/DELETE/批量删 · CopyObject · ListObjectsV2/V1 · aetherupload 预处理/分块/秒传/原生 ingest/分组 · 控制台 API（认证/桶/对象/上传/密钥/分组）· 登录/桶/对象/访问密钥四页（上传面板并入对象页） |
-| **M2** | 多段上传全套 · Range 与条件请求 · 用户元数据 · 流式大对象 · 纠删码 · 小对象内联 · 多盘 · 断电一致性 · fsck（**协议面与孤儿回收部分 → M2a 已落地**，存储层重构留 M2b） |
+| **M2** | 多段上传全套 · Range 与条件请求 · 用户元数据 · 流式大对象 · 纠删码 · 小对象内联 · 多盘 · 断电一致性 · fsck（**协议面与孤儿回收部分 → M2a 已落地；存储层（EC 8+4、内联、多盘 quorum、拔盘容忍、读时修、fsck、kill -9 用例）→ M2b 已落地**） |
 | **M3** | 多节点 mesh · 静态拓扑 · 对象→纠删组哈希 · quorum 读写 · 节点故障容忍 · 读修复 · 集群健康端点 |
 | **M4** | 版本控制 · 生命周期 · 策略求值与 IAM · 用户与策略页 · 审计 · scrub/heal/rebalance · 集群状态页 · 对象标签 |
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |

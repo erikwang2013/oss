@@ -6,6 +6,18 @@ database_url = "sqlite://./oss.db?mode=rwc"
 jwt_secret = "dev-only-change-me-0123456789abcdef"
 max_put_bytes = 268435456
 
+# 多盘（M2b）：配了 data_dirs 则忽略 data_dir。EC 8+4 冗余需 ≥ 12 盘；
+# 单盘可运行（分片同盘、无冗余，启动会 warn）。**首启前确认各盘挂载点已挂载**
+#（首启时「未挂载的挂载点目录」与全新盘不可区分，会被当作新盘初始化）。
+# data_dirs = ["./disk0", "./disk1", "./disk2", "./disk3", "./disk4", "./disk5",
+#              "./disk6", "./disk7", "./disk8", "./disk9", "./disk10", "./disk11"]
+
+[ec]
+# enabled = true   # false = M1 旧形态（单文件、无内联、无分片），只允许单盘
+# data = 8         # 数据片；parity = 4 校验片（默认 8+4）
+# parity = 4
+# inline_threshold = 131072  # 小于该长度的对象内联进 xl.meta（默认 128 KiB，上限同值）
+
 [[groups]]
 group = "image"
 bucket = "images"

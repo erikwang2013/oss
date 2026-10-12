@@ -9,9 +9,10 @@
 **项目中文名：吞吞　英文名：oss　项目宠物：吞吞（TunTun）**——一只把对象块吞进桶里的小家伙。
 
 S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分布式 + 纠删码；
-当前完成 **M1（单盘垂直切片）+ M2a（单盘可用性切片：Multipart Upload、Range GET、
-`x-amz-meta-*` 元数据、流式 PUT、孤儿回收）**——`aws-cli`/`rclone` 的大文件默认路径
-（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
+当前完成 **M1（单盘垂直切片）+ M2a（可用性切片：Multipart Upload、Range GET、
+`x-amz-meta-*` 元数据、流式 PUT、孤儿回收）+ M2b（存储切片：单机多盘 + 纠删码 8+4、
+quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）**——`aws-cli`/`rclone`
+的大文件默认路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
 
 - **三个 crate 单向依赖 `oss-server → xl-s3 → xl-store`**：`xl-store` 是不依赖任何框架的存储内核
   （提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把 s3s 的 S3 trait 实现到内核上；
@@ -26,7 +27,11 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
 批量删除 · SigV4 认证 · aetherupload 分块上传与原生 ingest · 控制台 API。
 已实现（M2a）：Multipart Upload（五操作）· Range GET（206/416）· `x-amz-meta-*` 元数据往返 ·
 流式 PutObject（不再整份读内存）· 启动自检与 `clean` 按龄续回收（trash/tmp/未引用版本目录）。
-未实现（见设计文档的阶段表）：纠删码 · 多盘 · 分布式 · 版本控制 · 加密 · 复制 · 权限。
+已实现（M2b）：多盘存储（`data_dirs`，每盘一份命名空间镜像）· EC 8+4 分片（quorum 写
+≥ data+1、拔盘重建、读时修）· 小对象内联（< 128 KiB 进 `xl.meta`）· meta 两阶段多盘提交
+（最新副本胜）· `fsck [--repair]` 巡检 · 桶级互斥与 flock 跨进程锁 · 目录 fsync 与
+kill -9 断电用例（SIGABRT 四注入点）。
+未实现（见设计文档的阶段表）：分布式（多节点）· 版本控制 · 加密 · 复制 · 权限。
 
 ## 架构
 
@@ -34,14 +39,18 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
 
 | crate / 目录 | 职责 |
 |---|---|
-| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` v1 编解码、提交协议、per-object 锁 |
+| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` v1 编解码、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock |
 | `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`） |
 | `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI |
 | `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
-| `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本 |
+| `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（17 步 + `E2E_LONG=1` 门控长跑） |
 
-磁盘布局速记：对象内容落在 `buckets/<桶>/<展平键>/{xl.meta, <uuid>/part.1}`，**提交永远是同盘 rename**；
-临时区在 `.oss.sys/{tmp, trash, locks}`。控制面元数据（用户/密钥/桶/上传记录/秒传索引）在 SQLite。
+磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
+`xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。
+**提交永远是「数据先到位 → meta 翻转」**：单盘 = 同盘 rename；多盘 = 各盘 meta 两阶段提交
+（全盘 `xl.meta.new` 准备 ≥ quorum 才逐盘转正；读取**最新副本**胜）。小对象（< 128 KiB）内联进
+`xl.meta`、不落数据文件。临时区在每盘 `.oss.sys/{tmp, trash, locks}`，盘身份标识 `drive-id` 防插错盘。
+控制面元数据（用户/密钥/桶/上传记录/秒传索引）在 SQLite。
 
 ## 请求周期
 
@@ -83,13 +92,24 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M2/M4）。
 > - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
 > - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
-> - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M2b）；
+> - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M3+）；
 >   多区间 Range（`bytes=0-9,20-29`）→ 400 `InvalidArgument`（s3s 解析层拦截）；HEAD 带 Range 不支持。
 > - Multipart **part 级** `x-amz-checksum-*` 不校验（静默忽略，M2b 接组合语义）；单段 PUT 的
 >   Content-MD5 / `x-amz-checksum-*` 已在提交点前校验（不符 → `BadDigest`，对象不落盘）。
 > - 控制台「上传记录」是登记历史：对象或暂存文件被删后，记录行仍在（按设计，作审计线索）。
 > - `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须换成回环绑定与随机密钥
 >   （占位密钥可被用来伪造控制台与 `/aetherupload/*` 的 token；与 0.0.0.0 绑定合用即 LAN 风险面）。
+> - **多盘（M2b）运维边界**：
+>   - `data_dirs` 配 2..11 个盘会在启动时**报错**（EC 8+4 的冗余需要 ≥ 12；单盘可运行但无冗余，启动 warn）。
+>     `[ec] enabled=false` 恢复 M1 旧形态（只允许单盘）。
+>   - **首启前确认各盘挂载点已挂载**：首启时「未挂载的挂载点目录」与全新盘不可区分，会被当作新盘初始化。
+>     运行时掉线的盘会被自动判为不在册（写按 quorum 绕行、删对象 fail-closed、插回自动恢复），
+>     但它**必须曾在挂载状态下启动过**（盘上有 `.oss.sys` 与 `drive-id`）。
+>   - 掉线盘在场时 **删对象/删桶返回 500**（防「插回即复活」）；这是有意为之的 fail-closed，插回后重试即可。
+>   - 读 meta 取**最新副本**（`mod_time` 墙钟）：多盘间该值正常单调；NTP 大步回拨叠加写盘故障属已知边界（M3 的 heal/epoch 收口）。
+>   - 目录 fsync 的断电零丢失保证按 ext4/XFS 假设；其它文件系统上目录 fsync 失败仅 warn，需自行复核。
+> - 长跑验收（rclone 并发 100×100 MB + 中断重试，设计验收 #3）在 `tests/e2e_s3.sh` 的
+>   `E2E_LONG=1` 门控段（默认跳过，人工触发；`E2E_LONG_N`/`E2E_LONG_MB` 调规模）。
 
 ## 控制台（M1b）
 
@@ -116,7 +136,7 @@ cd web && npm install && npm run dev
 
 ## 运维命令
 
-`oss-server [serve|groups|build|clean <days>]`（无参数 = `serve`）。三条运维命令读当前目录的
+`oss-server [serve|groups|build|clean <days>|fsck [--repair]]`（无参数 = `serve`）。运维命令读当前目录的
 `oss.toml`，并走与服务端相同的启动自举（建目录/连库/开存储；管理员与桶的引导是幂等的）：
 
 ```bash
@@ -125,13 +145,17 @@ oss-server build         # 按磁盘现状重建秒传索引（先清旧索引�
 oss-server clean <days>  # 按 mtime 回收 days 天前的残骸：
                          #   暂存盘 `_header/` 与 `*.part`；数据盘 `.oss.sys/{tmp,trash}` 孤儿
                          #   与各对象目录下未被引用的版本目录（含未完成的上传暂存区）
+oss-server fsck          # 全盘巡检：孤儿版本目录 / EC 分片缺坏（CRC32C）/ tmp-trash 计数；
+oss-server fsck --repair #   同上 + 最小修复（删孤儿 + 读时修分片）。报告落
+                         #   `.oss.sys/fsck/<时间戳>.json`（独立 scrub 深度巡检是 M4）
 ```
 
-建议 cron（每日 `clean 1` 与 `build` 各一次；`scrub --repair` 每周一次——那是 M4 的命令，见功能规格 §18.1）：
+建议 cron（每日 `clean 1` 与 `build` 各一次，每周 `fsck --repair` 一次）：
 
 ```cron
 17 4 * * * cd /path/to/oss && ./oss-server clean 1
 47 4 * * * cd /path/to/oss && ./oss-server build
+23 4 * * 0 cd /path/to/oss && ./oss-server fsck --repair
 ```
 
 - `clean` 按 mtime 判定：上传持续时长在回收窗口内时不会被误删；超出窗口的长挂上传（仅 S3 直传可达，
@@ -156,6 +180,7 @@ AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:900
 - 功能规格：`docs/superpowers/specs/2026-10-10-feature-spec.md`
 - M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`
 - M2a 实现计划：`docs/superpowers/plans/2026-10-12-m2a-usability-slice.md`
+- M2b 实现计划（多盘 / EC / 断电一致性）：`docs/superpowers/plans/2026-10-12-m2b-ec-multidisk.md`
 
 ---
 
