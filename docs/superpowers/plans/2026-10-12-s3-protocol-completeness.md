@@ -253,10 +253,10 @@ impl Stream for ChecksumTailStream {
 
 **Files:** `crates/xl-s3/tests/object_ops.rs`、`tests/e2e_s3.sh`、`README.md`、`docs/superpowers/specs/2026-10-10-feature-spec.md`
 
-- [ ] 多区间：object_ops 加用例（`GetObjectInput{range}` 走不到——多区间在 s3s 的**头部解析层**就拒了，服务层拿到的是解析错误；故该用例的正确位置是 **e2e/HTTP 层**：`curl -H 'Range: bytes=0-1,3-4'` → 断言 `400` + `<Code>InvalidArgument</Code>`（证据：`http/de.rs:30` 统一映射））。规格 §3.2「多区间 → InvalidRequest」改为 **InvalidArgument（400）**，并注明该判定在 s3s 解析层。
-- [ ] HEAD 带 Range：**不做**（aws-cli/rclone 不依赖）；加一条契约用例「HEAD 带 range 参数仍返回 200 + 全量 Content-Length」（钉住现行为，防未来静默变化）；规格 §3.2 既有「HEAD 带 Range 不支持」保留，README 已知限制同步。
-- [ ] 规格 §3.1 的 `Content-MD5 ✅` 补「（实现于本计划 Task 3）」；`x-amz-checksum-*` 行从 `❌（M2）` 改为 `✅`。
-- [ ] 提交——`git commit -m "docs+test: 多区间错误码对齐 InvalidArgument；HEAD+Range 边界钉契约；规格同步"`
+- [x] 多区间：object_ops 加用例（改置 e2e/HTTP 层——11d，未签名 403 AccessDenied / 带签 400 InvalidArgument 两契约）（`GetObjectInput{range}` 走不到——多区间在 s3s 的**头部解析层**就拒了，服务层拿到的是解析错误；故该用例的正确位置是 **e2e/HTTP 层**：`curl -H 'Range: bytes=0-1,3-4'` → 断言 `400` + `<Code>InvalidArgument</Code>`（证据：`http/de.rs:30` 统一映射））。规格 §3.2「多区间 → InvalidRequest」改为 **InvalidArgument（400）**，并注明该判定在 s3s 解析层。
+- [x] HEAD 带 Range：**不做**（aws-cli/rclone 不依赖）；加一条契约用例「HEAD 带 range 参数仍返回 200 + 全量 Content-Length」（钉住现行为，防未来静默变化）；规格 §3.2 既有「HEAD 带 Range 不支持」保留，README 已知限制同步。
+- [x] 规格 §3.1 的 `Content-MD5 ✅` 补「（实现于本计划 Task 3）」；`x-amz-checksum-*` 行从 `❌（M2）` 改为 `✅`。
+- [x] 提交——`git commit -m "docs+test: 多区间错误码对齐 InvalidArgument；HEAD+Range 边界钉契约；规格同步"`
 
 ---
 
@@ -279,10 +279,11 @@ impl Stream for ChecksumTailStream {
 
 ## 四闸与验收（收尾轮统一跑）
 
-- [ ] fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · `web` vitest 全绿
-- [ ] `tests/e2e_s3.sh` 对真服务实跑全过（含新增条件/覆盖参数/校验和/多区间步）
-- [ ] 控制台 Playwright e2e 实跑（含新问题响应用例）
-- [ ] `xl.meta` golden 摘要按「有意识更新」流程重算并记录
+- [x] fmt 无 diff · clippy 0 告警 · workspace 全绿（132 测）· web vitest 全绿（本轮未动 web 代码面）
+- [x] `tests/e2e_s3.sh` 对真服务实跑 **19 步全绿 rc=0**（条件/覆盖参数/校验和/多区间步全含）
+- [x] 控制台 Playwright e2e **3/3 绿**
+- [x] `xl.meta` golden 按「有意识更新」流程重算并记录（2af7eeed…）
+- [x] 交叉验证闭环：评审 I-1（206 带校验和）与 e2e 实跑发现互为独立复现；修复经 e2e 在干净重建二进制上复验（206 无 x-amz-checksum*、全量 GET 仍带且客户端校验通过）
 
 ## 已知风险与处置
 
