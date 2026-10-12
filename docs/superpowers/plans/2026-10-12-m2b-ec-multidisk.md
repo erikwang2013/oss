@@ -299,7 +299,7 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 - [x] **Step 4:** 提交 `feat(xl-store): 目录 fsync 复核 + kill -9 断电用例；长跑并发验收入 e2e 门控段`。（与 Task 7/8 合并为一次提交；Step 3 见上。）
 
 ### 切片二收尾
-- [ ] 四闸 + e2e（含 12 盘 tempdir 配置的真服务冒烟：`data_dirs` 12 目录起服务，S3 脚本 17 步回归 + E2E_LONG 段落地）
+- [x] 四闸 + e2e（12 盘 tempdir 真服务冒烟 ×2 轮：9dc7070 与终版 5e91fe4 各一次，17 步全绿、零行为差异、脚本零改动；E2E_LONG 段落地（13b，微缩版实跑通过，默认跳过）；终版加验三项：`fsck`/`fsck --repair` 实跑（报告 JSON + 盘上回写证据）、拔盘 rm fail-closed（3×500 QuorumUnmet + 插回即通）、拔盘 ListObjects 完整）
 
 ---
 
@@ -365,6 +365,10 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 | 12 盘起步的测试环境成本（tempdir × 12/用例） | 用例用 12 个 `tempfile::tempdir()`（轻量）；真服务 e2e 用 12 个子目录 |
 | MPU 与新布局的兼容（parts 字段的存废） | **已结案（Task 6）**：新写入统一 EC/内联，`parts` 降为只读兼容位；`legacy_parts_form_still_readable` 回归用例钉死；complete 并发重传 fail-closed |
 | `set_index` 公式在单 set 下恒 0（为 M3 留形） | 注释明示「留形不留行为」；M3 引入多 set 时公式行为随拓扑生效 |
+| **R8：meta「最新 mod_time 者胜」依赖墙钟单调**（NTP 大步回拨 + 翻转失败的组合可让旧副本胜出；读不核 quorum，只采纳达副本） | 已知边界，写入设计文档（Task 11）；正解 = per-key 单调代数（与 M3 heal/epoch 一并） |
+| **R5：读时修可能把已删/已覆写版本的缺片写回**（uuid 每版本全新、不复用 → 不污染新版本；残骸由 GC 按 mtime 回收） | 接受为 M2b-2 边界；M4 heal 任务收口 |
+| **首启盲区：全盘同时掉线不可与全新盘区分**（R1 初始化路径） | 部署文档要求首启确认各挂载点已挂载（Task 11 README） |
+| flock 阻塞调用的执行器风险 | 已验证：入 spawn_blocking（内联实测挂死）；跨进程争用等待发生在阻塞池 |
 
 ## 定稿记录
 
@@ -375,3 +379,12 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 - **与计划差异**（均有落地裁决段详述）：不收全再分叉（保流式语义）；不加 ShardsUnavailable；Task 4/5 合并编译轮；Task 6 改为「拼装 → 新目录」并加逐段字节核验；评审轮 F1/F2/F4/F5/F6 修复。
 - **遗留**：F7（upload_part 无锁窗口，M2a 已存在）；complete 的 P 级内存悬崖（随 ShardByShard）；README 存储形态说明待 M2b-2（多盘真冗余落地）后一并更新——单盘 EC 无冗余收益，提前宣传会误导。
 - **下一步**：切片二（M2b-2 多盘：Task 7–9，含 `[ec] enabled=false` 单盘兼容裁决的落地）。
+
+### 切片二（M2b-2，多盘 + quorum + 断电 + 运维锁）——2026-10-13
+
+- **提交序列**：Task 7+8+9 核心（9dc7070：drives[]/直写 quorum/两阶段 meta 提交/读重建+读时修/目录 fsync/kill9）→ Task 10 + 评审二轮 R1-R7（5e91fe4：fsck、桶锁、flock、盘身份、删除 fail-closed+meta 先行、列举并集、配置校验、挂死修复、kill9 扩四注入点）。
+- **四闸**：fmt 无 diff；clippy `--workspace --all-targets -D warnings` 0 告警；`cargo test --workspace -j 2` 全绿（172 测）；12 盘真服务 e2e 17/17 ×2 轮 + 三项加验（fsck 实跑、拔盘删除 fail-closed、拔盘列举完整）+ E2E_LONG 段落地（微缩实跑通过）。
+- **关键裁决**（均有专节详述）：盘数校验「单盘恒合法、多盘须 ≥ data+parity、enabled=false 仅单盘」；meta 两阶段提交取代计数式；quorum = data+1；读侧最新 mod_time 者胜；内联多盘 = meta 复制；delete meta 先行（可见性提交点）；盘身份 = `.oss.sys/drive-id` 部署标识；flock 入阻塞池。
+- **实测修复**（测试/评审暴露）：读时修缺存活探测、桶操作只看 drive0、flock 执行器饿死挂死、put 桶窗口间隙被 delete 抢先、kill9 目录计数含 meta 文件。
+- **遗留**：R5/R8/首启盲区入风险表；E2E_LONG 默认参数（100×100 MB）人工触发；README/设计文档同步归 Task 11。
+- **下一步**：切片三（Task 11 文档收尾；Task 10 已完成并入 5e91fe4）。
