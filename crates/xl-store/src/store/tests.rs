@@ -132,7 +132,7 @@ async fn put_then_head() {
     let head = s.head_object("alpha", "dir/hello.txt").await.unwrap();
     assert_eq!(head.etag, info.etag);
 
-    // 盘上数据校验：meta 记录的 part.uuid 目录里，part.1 必须就是写进去的字节
+    // 盘上形态校验：11 字节 < inline_threshold → 内联进 meta，版本目录只有 xl.meta，无 part 文件
     let obj_dir = layout::object_dir(d.path(), "alpha", "dir/hello.txt").unwrap();
     let on_disk = XlMeta::decode(
         &tokio::fs::read(obj_dir.join(meta::META_FILE))
@@ -140,13 +140,236 @@ async fn put_then_head() {
             .unwrap(),
     )
     .unwrap();
-    let part = obj_dir
-        .join(&on_disk.latest().unwrap().part.uuid)
-        .join("part.1");
-    assert_eq!(
-        tokio::fs::read(&part).await.unwrap(),
-        b"hello world".to_vec()
+    let v = on_disk.latest().unwrap();
+    assert_eq!(v.inline.as_ref().unwrap().bytes.as_slice(), b"hello world");
+    let vdir = obj_dir.join(&v.part.uuid);
+    assert_eq!(shard_files(&vdir), 0);
+    assert!(!vdir.join("part.1").exists());
+}
+
+// ---- M2b：EC 与内联形态（Task 4/5） ----
+
+/// 版本目录下 `part.*` 数据文件计数（内联 = 0，EC = data+parity，旧形态 = 1）
+fn shard_files(version_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(version_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("part."))
+        .count()
+}
+
+/// 低可压缩性的确定性伪随机字节（全零数据会掩盖编码错位）
+fn payload(n: usize) -> Bytes {
+    Bytes::from(
+        (0..n)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8)
+            .collect::<Vec<u8>>(),
+    )
+}
+
+async fn read_disk_meta(s: &Store, bucket: &str, key: &str) -> XlMeta {
+    s.read_meta(bucket, key).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn ec_large_object_writes_twelve_shards_and_roundtrips() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(1 << 20);
+    let info = s
+        .put_object("alpha", "big", data.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(info.size, 1 << 20);
+
+    let m = read_disk_meta(&s, "alpha", "big").await;
+    let v = m.latest().unwrap();
+    assert!(v.inline.is_none());
+    let l = v.data_layout.as_ref().unwrap();
+    assert_eq!((l.data, l.parity), (8, 4));
+    assert_eq!(l.shards.len(), 12);
+    let vdir = layout::object_dir(d.path(), "alpha", "big")
+        .unwrap()
+        .join(&v.part.uuid);
+    assert_eq!(shard_files(&vdir), 12);
+    assert!(!vdir.join("part.1").exists(), "转化后不得残留 part.1");
+
+    // 读回一致 + EC 对象上的 Range（整份重建后切片）
+    let (got, bytes) = s.get_object("alpha", "big").await.unwrap();
+    assert_eq!(got.size, 1 << 20);
+    assert_eq!(&bytes[..], &data[..]);
+    let r = s
+        .get_object_range("alpha", "big", 1_048_000..1_048_500)
+        .await
+        .unwrap();
+    assert_eq!(&r[..], &data[1_048_000..1_048_500]);
+}
+
+#[tokio::test]
+async fn inline_threshold_boundary() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+
+    // 127 KiB < 128 KiB 阈值 → 内联：版本目录零数据文件
+    let small = payload(127 * 1024);
+    s.put_object("alpha", "small", small.clone(), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "small").await;
+    let v = m.latest().unwrap();
+    assert_eq!(v.inline.as_ref().unwrap().bytes.as_slice(), &small[..]);
+    assert!(v.data_layout.is_none());
+    let vdir = layout::object_dir(d.path(), "alpha", "small")
+        .unwrap()
+        .join(&v.part.uuid);
+    assert_eq!(shard_files(&vdir), 0);
+    let (_, bytes) = s.get_object("alpha", "small").await.unwrap();
+    assert_eq!(&bytes[..], &small[..]);
+    let r = s
+        .get_object_range("alpha", "small", 100..200)
+        .await
+        .unwrap();
+    assert_eq!(&r[..], &small[100..200]);
+
+    // 129 KiB > 阈值 → EC
+    let big = payload(129 * 1024);
+    s.put_object("alpha", "big", big.clone(), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "big").await;
+    let v = m.latest().unwrap();
+    assert!(v.inline.is_none());
+    assert_eq!(v.data_layout.as_ref().unwrap().shards.len(), 12);
+    let (_, bytes) = s.get_object("alpha", "big").await.unwrap();
+    assert_eq!(&bytes[..], &big[..]);
+}
+
+#[tokio::test]
+async fn ec_read_survives_shard_loss_and_corruption() {
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+
+    // 丢 4 片（= parity 上限）仍可重建
+    let data = payload(300_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    let vdir = layout::object_dir(d.path(), "alpha", "k").unwrap().join(
+        &read_disk_meta(&s, "alpha", "k")
+            .await
+            .latest()
+            .unwrap()
+            .part
+            .uuid,
     );
+    for i in [0, 3, 7, 11] {
+        std::fs::remove_file(vdir.join(format!("part.1.{i}"))).unwrap();
+    }
+    let (_, bytes) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&bytes[..], &data[..], "丢 4 片必须能原样重建");
+
+    // 坏片（翻转一字节）被 CRC32C 抓到 → 视同缺失，同样可重建
+    let data2 = payload(200_000);
+    s.put_object("alpha", "flip", data2.clone(), None)
+        .await
+        .unwrap();
+    let vdir2 = layout::object_dir(d.path(), "alpha", "flip").unwrap().join(
+        &read_disk_meta(&s, "alpha", "flip")
+            .await
+            .latest()
+            .unwrap()
+            .part
+            .uuid,
+    );
+    let spath = vdir2.join("part.1.2");
+    let mut shard = std::fs::read(&spath).unwrap();
+    shard[0] ^= 0x01;
+    std::fs::write(&spath, &shard).unwrap();
+    let (_, bytes) = s.get_object("alpha", "flip").await.unwrap();
+    assert_eq!(&bytes[..], &data2[..], "坏片必须被 CRC 拦下并重建");
+
+    // 丢 5 片（> parity）：fail-closed 报损坏，不吐坏数据
+    let data3 = payload(200_000);
+    s.put_object("alpha", "gone", data3, None).await.unwrap();
+    let vdir3 = layout::object_dir(d.path(), "alpha", "gone").unwrap().join(
+        &read_disk_meta(&s, "alpha", "gone")
+            .await
+            .latest()
+            .unwrap()
+            .part
+            .uuid,
+    );
+    for i in 0..5 {
+        std::fs::remove_file(vdir3.join(format!("part.1.{i}"))).unwrap();
+    }
+    assert!(matches!(
+        s.get_object("alpha", "gone").await,
+        Err(Error::CorruptMeta(_))
+    ));
+}
+
+#[tokio::test]
+async fn ec_sha_mismatch_fails_closed() {
+    // 能过 CRC（坏片字节被改 + meta 里 CRC 被同步改掉）但整份数据错：SHA256 终验必须拦下
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(200_000), None)
+        .await
+        .unwrap();
+
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    let mut m = XlMeta::decode(
+        &tokio::fs::read(obj_dir.join(meta::META_FILE))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let v = m.versions.last_mut().unwrap();
+    let spath = obj_dir.join(&v.part.uuid).join("part.1.2");
+    let mut shard = tokio::fs::read(&spath).await.unwrap();
+    shard[0] ^= 0xff;
+    tokio::fs::write(&spath, &shard).await.unwrap();
+    v.data_layout.as_mut().unwrap().shards[2].crc32c = ec::crc32c_of(&shard);
+    tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::CorruptMeta(_))
+    ));
+}
+
+#[tokio::test]
+async fn inline_length_mismatch_fails_closed() {
+    // 信任边界：手工改坏的 meta（内联长度 ≠ 对象长度）不得 panic，宁可报损坏
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(100), None)
+        .await
+        .unwrap();
+
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    let mut m = XlMeta::decode(
+        &tokio::fs::read(obj_dir.join(meta::META_FILE))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let inline = m.versions.last_mut().unwrap().inline.as_mut().unwrap();
+    inline.bytes.truncate(5);
+    tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::CorruptMeta(_))
+    ));
+    assert!(matches!(
+        s.get_object_range("alpha", "k", 0..5).await,
+        Err(Error::CorruptMeta(_))
+    ));
 }
 
 #[tokio::test]
@@ -384,9 +607,9 @@ async fn get_dangling_meta_version_reports_no_such_key() {
     // 读路径重读 meta 重试一次后必须报 NoSuchKey —— 不得 panic，也不得把裸 IO 错误抛给上层。
     let (s, d) = store().await;
     s.create_bucket("alpha").await.unwrap();
-    s.put_object("alpha", "k", Bytes::from_static(b"x"), None)
-        .await
-        .unwrap();
+    // 数据形态须依赖版本目录：EC 对象（≥ 阈值）。内联对象数据在 meta 里，与目录无关
+    let data = payload(129 * 1024);
+    s.put_object("alpha", "k", data, None).await.unwrap();
     let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
     let m = XlMeta::decode(
         &tokio::fs::read(obj_dir.join(meta::META_FILE))
@@ -402,6 +625,19 @@ async fn get_dangling_meta_version_reports_no_such_key() {
         s.get_object("alpha", "k").await,
         Err(Error::NoSuchKey(_))
     ));
+
+    // 内联的镜像性质：数据在 meta 里，版本目录被移走也照读（无跨文件竞态窗口）
+    let inline_data = payload(64);
+    s.put_object("alpha", "i", inline_data.clone(), None)
+        .await
+        .unwrap();
+    let vi = read_disk_meta(&s, "alpha", "i").await;
+    let idir = layout::object_dir(d.path(), "alpha", "i")
+        .unwrap()
+        .join(&vi.latest().unwrap().part.uuid);
+    tokio::fs::remove_dir_all(idir).await.unwrap();
+    let (_, bytes) = s.get_object("alpha", "i").await.unwrap();
+    assert_eq!(&bytes[..], &inline_data[..]);
 }
 
 #[tokio::test]

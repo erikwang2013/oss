@@ -1,13 +1,17 @@
 //! 读路径：HEAD / 整读 / Range 有界读（含并发覆写时的 meta 重读重试）。
+//! M2b 形态分派：`inline` → meta 内嵌字节；`data_layout` → EC 分片重建；否则旧 part 文件。
+
+use std::path::Path;
 
 use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::XlMeta;
+use crate::meta::{self, Version, XlMeta};
 
-use super::{ObjectInfo, Store};
+use super::{ObjectInfo, Store, ec};
 
 impl Store {
     pub(in crate::store) fn load_object_info(
@@ -58,6 +62,26 @@ impl Store {
                 .latest()
                 .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
             let info = self.load_object_info(bucket, key, &m)?;
+
+            // 形态分派：内联 → EC 布局 → 旧 parts/part
+            if let Some(inline) = &v.inline {
+                if inline.bytes.len() as u64 != v.size {
+                    return Err(Error::CorruptMeta(format!(
+                        "{bucket}/{key}: 内联长度 {} ≠ 对象长度 {}",
+                        inline.bytes.len(),
+                        v.size
+                    )));
+                }
+                return Ok((info, Bytes::from(inline.bytes.clone())));
+            }
+            if let Some(l) = &v.data_layout {
+                match self.read_ec(&dir, v, l).await? {
+                    Some(bytes) => return Ok((info, bytes)),
+                    // 版本目录被并发覆写者移走：重读 meta 拿新版本
+                    None => continue,
+                }
+            }
+
             let parts = v.effective_parts();
             // ponytail: M2a 整份读进内存（跨 part 拼接，与既有限制同口径）；M2b 换流式。
             let mut buf = Vec::with_capacity(v.size as usize);
@@ -111,6 +135,28 @@ impl Store {
                 )));
             }
 
+            // 形态分派（同 get_object；EC 按整份重建后切片——ponytail: 分片级按需重建是 M2b-3 之后的升级路径）
+            if let Some(inline) = &v.inline {
+                if inline.bytes.len() as u64 != v.size {
+                    return Err(Error::CorruptMeta(format!(
+                        "{bucket}/{key}: 内联长度 {} ≠ 对象长度 {}",
+                        inline.bytes.len(),
+                        v.size
+                    )));
+                }
+                return Ok(Bytes::copy_from_slice(
+                    &inline.bytes[range.start as usize..range.end as usize],
+                ));
+            }
+            if let Some(l) = &v.data_layout {
+                match self.read_ec(&dir, v, l).await? {
+                    Some(bytes) => {
+                        return Ok(bytes.slice(range.start as usize..range.end as usize));
+                    }
+                    None => continue,
+                }
+            }
+
             // 跨 part 映射：按 parts 序列累计偏移，只读命中段（首尾 part 各读一段）。
             // ponytail: M2a 单盘无分片；M2b 起 part 内部再映射到分片。
             let parts = v.effective_parts();
@@ -156,5 +202,59 @@ impl Store {
             return Ok(Bytes::from(buf));
         }
         Err(Error::NoSuchKey(key.to_string()))
+    }
+
+    /// EC 读：逐片读取 + CRC32C 校验（坏片视同缺失）→ 重建 → 截断到对象长度 → SHA256 终验。
+    ///
+    /// 返回 `Ok(None)` = 全部分片缺失（版本目录被并发覆写者移走，调用方重读 meta）；
+    /// 存活片不足以重建、或重建后 SHA256 与提交时记录不符 = 数据不可信 → Err（fail-closed，
+    /// 不吐坏数据）。
+    async fn read_ec(
+        &self,
+        dir: &Path,
+        v: &Version,
+        l: &meta::DataLayout,
+    ) -> Result<Option<Bytes>> {
+        let cfg = ec::EcConfig {
+            data: l.data,
+            parity: l.parity,
+        };
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(l.shards.len());
+        for s in &l.shards {
+            let path = dir
+                .join(&v.part.uuid)
+                .join(format!("part.{}.{}", s.part, s.shard));
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => {
+                    if ec::crc32c_of(&bytes) == s.crc32c {
+                        shards.push(Some(bytes));
+                    } else {
+                        tracing::warn!(path = %path.display(), "EC 分片 CRC32C 不符，视同缺失");
+                        shards.push(None);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => shards.push(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if shards.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let padded = ec::reconstruct(&shards, cfg)?;
+        if (padded.len() as u64) < v.size {
+            return Err(Error::CorruptMeta(format!(
+                "EC 重建长度 {} < 对象长度 {}",
+                padded.len(),
+                v.size
+            )));
+        }
+        let bytes = padded[..v.size as usize].to_vec();
+        if hex::encode(Sha256::digest(&bytes)) != v.part.sha256 {
+            return Err(Error::CorruptMeta(format!(
+                "EC 重建后 SHA256 与提交记录不符（对象 {} 字节）",
+                v.size
+            )));
+        }
+        Ok(Some(Bytes::from(bytes)))
     }
 }

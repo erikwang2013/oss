@@ -27,6 +27,11 @@ pub struct StoreConfig {
     pub root: PathBuf,
     /// 提交点是否 fsync。测试可关（快），生产必须开。
     pub fsync: bool,
+    /// M2b 写路径 EC 配置（默认 8+4）。读路径按 meta 里的 `DataLayout` 重建，不读这里。
+    pub ec: ec::EcConfig,
+    /// 小于此长度的对象内联进 meta（不落 part 文件）。默认 128 KiB。
+    /// 不得越过 [`meta::MAX_INLINE`]（meta 解码信任边界），`open` 会拒绝。
+    pub inline_threshold: u64,
 }
 
 impl StoreConfig {
@@ -34,6 +39,8 @@ impl StoreConfig {
         Self {
             root: root.into(),
             fsync: true,
+            ec: ec::EcConfig::default(),
+            inline_threshold: meta::MAX_INLINE,
         }
     }
 }
@@ -82,6 +89,14 @@ pub struct Store {
 
 impl Store {
     pub async fn open(cfg: StoreConfig) -> Result<Self> {
+        // 信任边界：内联阈值不得超过 meta 解码上限，否则写出的 meta 重启后会被自己拒收
+        if cfg.inline_threshold > meta::MAX_INLINE {
+            return Err(Error::Encode(format!(
+                "inline_threshold {} 超过 MAX_INLINE {}",
+                cfg.inline_threshold,
+                meta::MAX_INLINE
+            )));
+        }
         for sub in ["tmp", "trash", "locks"] {
             tokio::fs::create_dir_all(layout::sys_dir(&cfg.root, sub)).await?;
         }

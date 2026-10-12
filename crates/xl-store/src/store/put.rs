@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::layout;
 use crate::meta::{self, ChecksumRecord, PartRef, Version, XlMeta};
 
-use super::{ByteStream, ObjectInfo, Store, now_nanos};
+use super::{ByteStream, ObjectInfo, Store, ec, now_nanos};
 
 impl Store {
     pub async fn put_object(
@@ -47,7 +47,9 @@ impl Store {
     }
 
     /// 提交协议（顺序不可变）：
-    ///   1. 分片/数据写 `.oss.sys/tmp/<uuid>/part.1`，边写边算 MD5+SHA256+size
+    ///   1. 数据**流式**写 `.oss.sys/tmp/<uuid>/part.1`，边写边算 MD5+SHA256+size；
+    ///      收全后转形态——`< inline_threshold`：读回内联进 meta；否则：EC 编码为
+    ///      `part.1.<shard>`（每片 fsync）。两种形态都删掉 part.1
     ///   2. 候选 `xl.meta` 写进同一个 tmp 目录
     ///   3. **同盘 rename** tmp/<uuid> → <bucket>/<obj>/<uuid>     ← 数据就位
     ///   4. 写 `<obj>/xl.meta.new` 并 fsync，再 rename 覆盖 `xl.meta` ← **提交点**
@@ -116,6 +118,53 @@ impl Store {
             drop(file);
 
             let etag = hex::encode(md5.finalize());
+            let sha256 = hex::encode(sha.finalize());
+
+            // 1b) 收尾转形态。为什么不像任务书最初设想的「收全再分叉」：那会失去流式落盘
+            // 语义（M2a 的握手测试与 README 承诺）。保持「流式写 part.1 → 收全后转」，
+            // 峰值只在 encode 一步（payload + 12 片），S3 路径受 max_put_bytes 约束；
+            // ponytail: aether ingest 大文件同受此峰值，ShardByShard 流式编/解是 M2b-3 之后的升级路径。
+            let (data_layout, inline) = if size < self.cfg.inline_threshold {
+                // 内联：小文件读回进 meta，删 part.1（版本目录只剩 xl.meta）
+                let bytes = tokio::fs::read(&part_path).await?;
+                tokio::fs::remove_file(&part_path).await?;
+                (None, Some(meta::InlineData { bytes }))
+            } else {
+                // EC：读回整份 → 编码 → 逐片写 part.1.<shard>（每片 fsync），删 part.1
+                let payload = tokio::fs::read(&part_path).await?;
+                let shards = ec::encode(&payload, self.cfg.ec)?;
+                drop(payload);
+                let mut shard_refs = Vec::with_capacity(shards.len());
+                for (i, s) in shards.iter().enumerate() {
+                    let path = tmp.join(format!("part.1.{i}"));
+                    let mut f = tokio::fs::File::create(&path).await?;
+                    f.write_all(s).await?;
+                    f.flush().await?;
+                    if self.cfg.fsync {
+                        f.sync_all().await?;
+                    }
+                    drop(f);
+                    shard_refs.push(meta::ShardRef {
+                        drive: 0,
+                        part: 1,
+                        shard: i as u8,
+                        size: s.len() as u64,
+                        crc32c: ec::crc32c_of(s),
+                    });
+                }
+                tokio::fs::remove_file(&part_path).await?;
+                let shard_size = shards.first().map_or(0, Vec::len) as u64;
+                (
+                    Some(meta::DataLayout {
+                        data: self.cfg.ec.data,
+                        parity: self.cfg.ec.parity,
+                        shard_size,
+                        shards: shard_refs,
+                    }),
+                    None,
+                )
+            };
+
             let version = Version {
                 version_id: uuid::Uuid::nil(), // M1 无版本控制：nil = S3 的 "null" 版本
                 mod_time_nanos: now,
@@ -123,18 +172,18 @@ impl Store {
                 etag: etag.clone(),
                 content_type: content_type.clone(),
                 user_metadata: user_metadata.clone(),
+                // 兼容位（旧读方依赖；EC 版的真实文件是 part.1.<shard>，旧读方读不到——「新解旧 ✓ 旧解新 ✗」已受裁定）
                 part: PartRef {
                     uuid: uuid.clone(),
                     part: 1,
                     size,
-                    sha256: hex::encode(sha.finalize()),
+                    sha256,
                 },
                 // 单段 PUT 保持与旧文件同形的 None（MPU complete 才写 Some）
                 parts: None,
                 checksum: checksum.clone(),
-                // M2b 起写路径分叉（Task 4/6 落地）；本任务先保持旧形态
-                data_layout: None,
-                inline: None,
+                data_layout,
+                inline,
             };
             let meta = XlMeta {
                 object_key: key.to_string(),

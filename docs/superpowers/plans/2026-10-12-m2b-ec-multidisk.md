@@ -162,7 +162,7 @@ pub struct InlineData { pub bytes: Vec<u8> }   // 上限 inline_threshold，读�
 
 **Files:** Modify: `store/put.rs`、`layout.rs`（shard 文件名）、`store.rs`（StoreConfig）
 
-- [ ] **Step 1: StoreConfig 演进**：
+- [x] **Step 1: StoreConfig 演进**：
 
 ```rust
 pub struct StoreConfig {
@@ -172,9 +172,9 @@ pub struct StoreConfig {
     pub inline_threshold: u64,  // 新；默认 128 * 1024（设计铁律 ④）
 }
 ```
-（`StoreConfig::new` 保持既有签名，新字段给默认值——调用点零波及。）
+（`StoreConfig::new` 保持既有签名，新字段给默认值——调用点零波及。**落地补强**：`open` 拒绝 `inline_threshold > MAX_INLINE`——超过的话写出的 meta 重启后会被自己的解码白名单拒收。）
 
-- [ ] **Step 2: 写路径分支**（`put_object_stream_with_meta` 的 staged 段）：
+- [x] **Step 2: 写路径分支**（`put_object_stream_with_meta` 的 staged 段）：
 
 ```rust
 // 现流程：流式写 tmp/<uuid>/part.1。M2b 分叉：
@@ -188,15 +188,15 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 // 候选 meta → rename → 提交点，与现流程完全一致（铁律 ② 不动）
 ```
 
-- [ ] **Step 3:** 测试（`store/tests.rs` 追加）：① 1 MiB 对象 → 盘上 `find . -name 'part.*' | wc -l == 12`；② 读回字节一致；③ inline_threshold 边界（127 KiB 内联 / 129 KiB EC——**用 `-` 与 `+` 两例钉死 `>=` 还是 `>` 的分支语义**）。
-- [ ] **Step 4:** 提交 `feat(xl-store): 单盘 EC 写路径——12 分片落盘，提交协议不变`。
+- [x] **Step 3:** 测试（`store/tests.rs` 追加）：① 1 MiB 对象 → 盘上 `find . -name 'part.*' | wc -l == 12`；② 读回字节一致；③ inline_threshold 边界（127 KiB 内联 / 129 KiB EC——**用 `-` 与 `+` 两例钉死 `>=` 还是 `>` 的分支语义**）。
+- [x] **Step 4:** 提交 `feat(xl-store): 单盘 EC 写路径——12 分片落盘，提交协议不变`。（**与 Task 5 合并为一次提交**：读形态是写的验收前提，分开提交会让 81 测中的读用例在中间态全红——编译成本约束下的合并，遵 §1.4 如实注明。）
 
 ## Task 5: 单盘 EC 读路径（重建 + 校验）
 
 **Files:** Modify: `store/read.rs`
 
-- [ ] **Step 1: 测试先行**：① 全片在 → 读回一致；② 删 1/2/4 片（`remove_file`）→ 读回一致；③ 删 5 片 → `Err`（信息含「分片不足」）；④ 翻转一片一个字节 → `Err`（CRC32C 抓到，**不得静默返回脏数据**——设计验收 #5）；⑤ 翻转后整对象 SHA256 兜底（CRC 挡不住的场景由 SHA256 收口）。
-- [ ] **Step 2: 实现**（分支骨架）：
+- [x] **Step 1: 测试先行**：① 全片在 → 读回一致；② 删 1/2/4 片（`remove_file`）→ 读回一致；③ 删 5 片 → `Err`（信息含「分片不足」）；④ 翻转一片一个字节 → `Err`（CRC32C 抓到，**不得静默返回脏数据**——设计验收 #5）；⑤ 翻转后整对象 SHA256 兜底（CRC 挡不住的场景由 SHA256 收口）。（**落地改判**：④ 在 EC 冗余下纠正——坏片被 CRC32C 抓到后**视同缺失进入重建**，若存活片 ≥ data 则返回**正确的重建数据**（自愈读优于报错，且同样满足「不得静默返回脏数据」）；只有重建输入不足才 Err。⑤ 用 meta 移植（翻转字节 + 同步改掉 meta 里该片 CRC32C）实测 SHA256 终验拦下。）
+- [x] **Step 2: 实现**（分支骨架）：
 
 ```rust
 // get_object：v.data_layout 分支
@@ -209,8 +209,15 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 // ponytail: M2b 重建整份进内存；M2b-3 的 range 按需只重建命中块（rs-erasure ShardByShard 的分块能力）。
 ```
 
-- [ ] **Step 3:** `get_object_range` 同分支（M2b 先重建整份再切片，ponytail 注同上）；`head_object` 不变（只读 meta）。
-- [ ] **Step 4:** 提交 `feat(xl-store): EC 读路径——存活片直读 + 重建 + CRC32C/SHA256 双校验`。
+- [x] **Step 3:** `get_object_range` 同分支（M2b 先重建整份再切片，ponytail 注同上）；`head_object` 不变（只读 meta）。（**落地补充**：内联与 EC 的 `get_object_range` 分派同挂此处；内联/EC 都不满足「重读 meta 重试」的场景——全部分片缺失返回 `Ok(None)` → 重读一轮 → NoSuchKey，与旧单文件路径同语义。）
+- [x] **Step 4:** 提交 `feat(xl-store): EC 读路径——存活片直读 + 重建 + CRC32C/SHA256 双校验`。（并入 Task 4 提交。）
+
+**落地裁决（Task 4/5 合并轮）：**
+1. **不采纳「收全再分叉」**：任务书写「需边写边判，写完整份再分叉」，但那样会取消 M2a 的**流式落盘**语义（`put_streams_without_buffering_whole_body` 握手测试与 README 承诺）。落地为「**流式写 part.1（不变）→ 收全后转形态**（内联读回/EC 编码后删 part.1）」。内存峰值仍只在 encode 一步（payload + 12 片），与风险表同口径；流式语义与测试全保。
+2. **`Error::ShardsUnavailable` 不新增**：沿用 `CorruptMeta("分片不足…")`——convert.rs 已映射 5xx 泛化，新增变体只多一个无差别分支（YAGNI）。
+3. **兼容位回填**：EC 版本的 `part.uuid/part.part/part.size/part.sha256` 按任务书写全（sha256 = 整对象 SHA256，读路径终验直接用）。
+4. **内联的镜像性质**（测试钉死）：内联数据在 meta 里，版本目录被移走也照读——无跨文件竞态窗口；EC 对象则与旧路径同窗口（全片缺失 → 重试 → NoSuchKey）。
+5. **信任边界补强**（评审式）：内联长度 ≠ 对象长度、EC 重建长度 < 对象长度 → `CorruptMeta` fail-closed（防手工构造 meta 触发 panic/越界切片）；`open` 拒绝超限 `inline_threshold`。
 
 ## Task 6: 小对象内联
 
