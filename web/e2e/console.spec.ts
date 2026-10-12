@@ -97,3 +97,31 @@ test('新建访问密钥 → 弹窗展示 AK/SK → 复制裸 SK → 列表出�
     await expect(cell).toBeVisible({ timeout: 1_000 })
   }).toPass({ timeout: 15_000 })
 })
+
+// 2.0 协议的问题响应消费：上传超限文件（image 组 ≤10 MB，传 11 MB）→ 413 problem →
+// 脚本把 title 写进输出区。断言钉住 i18n 文案「错误：无效的文件大小」（3.0.0 起全角冒号，
+// 同时是对该清理版变更的实测回归）；若走上泛化兜底文案（error_upload_fail）本断言必红。
+test('上传超限 → 问题响应 title 显示在输出区（2.0 协议）', async ({ page }) => {
+  await page.goto('/login')
+  await page.getByLabel('用户名').fill('erik')
+  await page.getByLabel('口令').fill('pw')
+  await page.getByRole('button', { name: '登 录', exact: true }).click()
+  await expect(page).toHaveURL(/\/buckets/)
+
+  // 上传落点由分组决定，浏览哪个桶无所谓；用自举建好的 files 桶进对象页开上传面板。
+  await page.goto('/buckets/files')
+  await page.getByRole('button', { name: '上 传', exact: true }).click()
+
+  // 切到 image 组（带 10 MB 上限）
+  await page.locator('.ant-modal .ant-select-selector').click()
+  await page.getByText(/^image →/).click()
+
+  await page.locator('#aetherupload-resource').setInputFiles({
+    name: 'too-big.png', // 扩展名在 image 组白名单内 → 触发的是「大小」而非「类型」错误
+    mimeType: 'image/png',
+    buffer: Buffer.alloc(11 * 1024 * 1024),
+  })
+  await expect(page.locator('#aetherupload-output')).toContainText('错误：无效的文件大小', {
+    timeout: 30_000,
+  })
+})

@@ -22,5 +22,8 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    // 高负载机器上 worker 启动可能远超默认 60s（本机实测 ~80s）——放宽避免整体假失败。
+    // 注意键名是 startupTimeout（写成 startTimeout 会静默无效）。
+    poolOptions: { forks: { startupTimeout: 120_000 } },
   },
 })
