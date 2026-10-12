@@ -366,6 +366,125 @@ async fn ec_sha_mismatch_fails_closed() {
 }
 
 #[tokio::test]
+async fn zero_byte_object_inlines_even_with_zero_threshold() {
+    // 评审 F4：inline_threshold=0（「永不内联」的意图）时，0 字节对象不得进 EC
+    //（rs 拒收空片 → 500）；0 字节恒内联。非空对象仍按阈值走 EC。
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.inline_threshold = 0;
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+
+    let info = s
+        .put_object("alpha", "empty", Bytes::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(info.size, 0);
+    assert!(
+        read_disk_meta(&s, "alpha", "empty")
+            .await
+            .latest()
+            .unwrap()
+            .inline
+            .is_some()
+    );
+    let (_, body) = s.get_object("alpha", "empty").await.unwrap();
+    assert!(body.is_empty());
+
+    s.put_object("alpha", "one", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "one").await;
+    assert_eq!(
+        m.latest()
+            .unwrap()
+            .data_layout
+            .as_ref()
+            .unwrap()
+            .shards
+            .len(),
+        12
+    );
+    let (_, body) = s.get_object("alpha", "one").await.unwrap();
+    assert_eq!(&body[..], b"x");
+}
+
+#[tokio::test]
+async fn all_shards_corrupt_is_reported_as_corruption_not_404() {
+    // 评审 F5：12 片全读得到但 CRC 全不符 = 真实损坏，必须走 500 谱系（CorruptMeta），
+    // 不得与「全片消失」混同伪装成 404
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(200_000), None)
+        .await
+        .unwrap();
+    let vdir = layout::object_dir(d.path(), "alpha", "k").unwrap().join(
+        &read_disk_meta(&s, "alpha", "k")
+            .await
+            .latest()
+            .unwrap()
+            .part
+            .uuid,
+    );
+    for i in 0..12 {
+        let p = vdir.join(format!("part.1.{i}"));
+        let mut b = std::fs::read(&p).unwrap();
+        b[0] ^= 0xff;
+        std::fs::write(&p, &b).unwrap();
+    }
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::CorruptMeta(_))
+    ));
+}
+
+#[tokio::test]
+async fn multipart_complete_rejects_tampered_part_bytes() {
+    // 评审 F2：upload_part 不持锁，complete 拼装期间同号 part 可能被并发重传。
+    // 直接复现「sidecar 快照之后、字节被同长度改写」→ complete 必须 InvalidPart（fail-closed），
+    // 且可重试：重传正确数据后 complete 成功
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let id = s
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    let etag = s
+        .upload_part("alpha", "k", &id, 1, bytes_stream(vec![7u8; 2048]))
+        .await
+        .unwrap();
+
+    let staging = layout::object_dir(d.path(), "alpha", "k")
+        .unwrap()
+        .join(&id);
+    tokio::fs::write(staging.join("part.1"), vec![9u8; 2048])
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        s.complete_multipart_upload("alpha", "k", &id, &[(1, etag.clone())])
+            .await,
+        Err(Error::InvalidPart(_))
+    ));
+    assert!(matches!(
+        s.head_object("alpha", "k").await,
+        Err(Error::NoSuchKey(_))
+    ));
+
+    // 重传正确数据（同号覆盖）→ complete 可成功
+    let etag = s
+        .upload_part("alpha", "k", &id, 1, bytes_stream(vec![7u8; 2048]))
+        .await
+        .unwrap();
+    s.complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
+        .await
+        .unwrap();
+    let (_, body) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(body.len(), 2048);
+    assert!(body.iter().all(|b| *b == 7));
+}
+
+#[tokio::test]
 async fn inline_length_mismatch_fails_closed() {
     // 信任边界：手工改坏的 meta（内联长度 ≠ 对象长度）不得 panic，宁可报损坏
     let (s, d) = store().await;
@@ -816,8 +935,11 @@ async fn delete_then_put_same_key_reads_back() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_puts_and_deletes_never_observe_torn_state() {
-    // put/delete 并发下读路径的不变式：每次读要么是某个写入者一次写入的完整 64 字节，
+    // put/delete 并发下读路径的不变式：每次读要么是某个写入者一次写入的完整对象，
     // 要么 NoSuchKey —— 不得出现其他 Err（IO 错误），也不得读出碎片内容。
+    // 对象取 ≥ 128 KiB（EC 形态）：数据跨 12 个分片文件，才真正压到「删除/覆写的中间态」
+    // 这个跨文件竞态（评审 F1；64 B 会走内联、数据在 meta 里，该用例会退化为空转）。
+    let n = 129 * 1024;
     let (s, _d) = store().await;
     s.create_bucket("alpha").await.unwrap();
     let s = std::sync::Arc::new(s);
@@ -826,7 +948,7 @@ async fn concurrent_puts_and_deletes_never_observe_torn_state() {
         let s = std::sync::Arc::clone(&s);
         handles.push(tokio::spawn(async move {
             if i % 2 == 0 {
-                s.put_object("alpha", "same", Bytes::from(vec![i; 64]), None)
+                s.put_object("alpha", "same", Bytes::from(vec![i; n]), None)
                     .await
                     .map(|_| ())
             } else {
@@ -837,9 +959,9 @@ async fn concurrent_puts_and_deletes_never_observe_torn_state() {
     for _ in 0..200 {
         match s.get_object("alpha", "same").await {
             Ok((info, body)) => {
-                assert_eq!(info.size, 64);
-                assert_eq!(body.len(), 64);
-                assert!(body.iter().all(|b| *b == body[0]), "碎片内容: {body:?}");
+                assert_eq!(info.size, n as u64);
+                assert_eq!(body.len(), n);
+                assert!(body.iter().all(|b| *b == body[0]), "碎片内容");
             }
             Err(Error::NoSuchKey(_)) => {}
             Err(e) => panic!("读路径不应出现其他错误: {e}"),

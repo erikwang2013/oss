@@ -197,8 +197,8 @@ impl Store {
         }
 
         let mut raw_md5s: Vec<Vec<u8>> = Vec::with_capacity(parts.len());
-        let mut total: u64 = 0;
-        let mut paths: Vec<PathBuf> = Vec::with_capacity(parts.len());
+        // 拼装快照（part 号、数据文件、sidecar 记录）：concat 时对每段做字节级核验
+        let mut snapshots: Vec<(u16, PathBuf, PartMeta)> = Vec::with_capacity(parts.len());
         for (i, (pn, etag)) in parts.iter().enumerate() {
             let sidecar = dir.join(format!("part.{pn}.meta"));
             let pm: PartMeta = match tokio::fs::read(&sidecar).await {
@@ -229,8 +229,7 @@ impl Store {
                 hex::decode(&pm.etag)
                     .map_err(|e| Error::CorruptMeta(format!("part.{pn} etag 非法: {e}")))?,
             );
-            total += pm.size;
-            paths.push(dir.join(format!("part.{pn}")));
+            snapshots.push((*pn, dir.join(format!("part.{pn}")), pm));
         }
 
         // multipart ETag = hex(md5(逐段原始 md5 字节拼接)) + "-N"（S3 定义）
@@ -247,16 +246,13 @@ impl Store {
         // 装进新版本目录（内联 / EC 形态）——与单段 PUT 同一形态核心
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(&self.cfg.root, "tmp").join(&uuid);
-        let staged: Result<XlMeta> = async {
-            let (size, _md5, sha256, data_layout, inline) =
-                self.stage_payload(&tmp, concat_stream(paths)).await?;
-            if size != total {
-                // upload_part 不持对象锁（允许并发传不同 part）：complete 期间零件被并发重传
-                // = 声明 etag/长度与盘上字节不一致。fail-closed，让客户端重试 complete
-                return Err(Error::InvalidPart(format!(
-                    "part 数据在 complete 期间被并发修改（声明 {total} 字节，盘上 {size}）"
-                )));
-            }
+        let staged: Result<(u64, XlMeta)> = async {
+            // concat_stream_verified 逐段核验 bytes == sidecar 快照，通过则 size 恒等于各段总和。
+            // upload_part 不持对象锁（允许并发传不同 part）：complete 期间零件被并发重传
+            // = 快照与实际字节不一致 → InvalidPart（fail-closed，让客户端重试 complete）
+            let (size, _md5, sha256, data_layout, inline) = self
+                .stage_payload(&tmp, concat_stream_verified(snapshots))
+                .await?;
             let version = Version {
                 version_id: uuid::Uuid::nil(),
                 mod_time_nanos: now,
@@ -281,11 +277,11 @@ impl Store {
                 versions: vec![version],
             };
             tokio::fs::write(tmp.join(crate::meta::META_FILE), meta.encode()?).await?;
-            Ok(meta)
+            Ok((size, meta))
         }
         .await;
-        let meta = match staged {
-            Ok(m) => m,
+        let (size, meta) = match staged {
+            Ok(v) => v,
             Err(e) => {
                 let _ = tokio::fs::remove_dir_all(&tmp).await;
                 return Err(e);
@@ -314,7 +310,7 @@ impl Store {
 
         Ok(ObjectInfo {
             key: key.to_string(),
-            size: total,
+            size,
             etag,
             content_type: mpu.content_type,
             last_modified_nanos: now,
@@ -383,31 +379,62 @@ impl Store {
     }
 }
 
-/// 按声明顺序把暂存的 `part.N` 文件拼成一个 64 KiB 块的 `ByteStream`（complete 装对象用）。
-/// 逐块读、不整份进内存——内存峰值留给 `stage_payload` 的 encode 一步（与单段 PUT 同口径）。
-fn concat_stream(paths: Vec<PathBuf>) -> ByteStream {
-    type St = (std::vec::IntoIter<PathBuf>, Option<tokio::fs::File>);
-    let state: St = (paths.into_iter(), None);
+/// 按声明顺序把暂存的 `part.N` 拼成 64 KiB 块的 `ByteStream`（complete 装对象用），
+/// 并对每段做**字节级核验**：段内容与 sidecar 快照（etag/sha256/长度）不符 →
+/// `InvalidPart`（complete 期间被并发重传；核验对象正是即将提交的字节，竞态在核验点收口）。
+///
+/// 逐块读、不整份进内存——内存峰值留给 `stage_payload` 的 encode 一步（与单段 PUT 同口径；
+/// ponytail: complete 的整体峰值 ≈ 2.5× 对象，P 级大对象受此限制，ShardByShard 流式编码是
+/// M2b-3 之后的升级路径）。
+fn concat_stream_verified(snapshots: Vec<(u16, PathBuf, PartMeta)>) -> ByteStream {
+    type Cur = (tokio::fs::File, Md5, sha2::Sha256, u64);
+    type St = (
+        std::vec::IntoIter<(u16, PathBuf, PartMeta)>,
+        Option<Cur>,
+        Option<(u16, PartMeta)>,
+    );
+    let state: St = (snapshots.into_iter(), None, None);
     Box::pin(futures::stream::try_unfold(
         state,
-        |(mut files, mut cur): St| async move {
+        |(mut files, mut cur, mut cur_meta): St| async move {
             loop {
                 // 不用 `match &mut cur`（Polonius 未落地：在另一分支里给 cur 赋值会被借用检查拒绝）
                 if cur.is_none() {
                     match files.next() {
-                        Some(p) => cur = Some(tokio::fs::File::open(&p).await?),
+                        Some((pn, p, pm)) => {
+                            cur = Some((
+                                tokio::fs::File::open(&p).await?,
+                                Md5::new(),
+                                sha2::Sha256::new(),
+                                0,
+                            ));
+                            cur_meta = Some((pn, pm));
+                        }
                         None => return Ok(None),
                     }
                 }
-                let f = cur.as_mut().expect("刚填过");
+                let (f, md5, sha, n) = cur.as_mut().expect("刚填过");
                 let mut buf = vec![0u8; 64 * 1024];
-                let n = f.read(&mut buf).await?;
-                if n == 0 {
-                    cur = None; // 本段读完，切下一段
-                    continue;
+                let nread = f.read(&mut buf).await?;
+                md5.update(&buf[..nread]); // nread=0 时 no-op
+                sha.update(&buf[..nread]);
+                *n += nread as u64;
+                if nread == 0 {
+                    // 段末：核验快照（md5/sha256/长度三者全等才算同一份字节）
+                    let (_, md5, sha, n) = cur.take().expect("刚填过");
+                    let (pn, pm) = cur_meta.take().expect("刚填过");
+                    if n != pm.size
+                        || hex::encode(md5.finalize()) != pm.etag
+                        || hex::encode(sha.finalize()) != pm.sha256
+                    {
+                        return Err(Error::InvalidPart(format!(
+                            "part {pn} 数据与上传记录不符（complete 期间被并发修改，请重试 complete）"
+                        )));
+                    }
+                    continue; // 切下一段
                 }
-                buf.truncate(n);
-                return Ok(Some((Bytes::from(buf), (files, cur))));
+                buf.truncate(nread);
+                return Ok(Some((Bytes::from(buf), (files, cur, cur_meta))));
             }
         },
     ))

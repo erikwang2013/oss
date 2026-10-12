@@ -53,7 +53,7 @@ impl Store {
         self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
 
-        for _ in 0..2 {
+        for round in 0..2 {
             let m = self
                 .read_meta(bucket, key)
                 .await?
@@ -75,9 +75,9 @@ impl Store {
                 return Ok((info, Bytes::from(inline.bytes.clone())));
             }
             if let Some(l) = &v.data_layout {
-                match self.read_ec(&dir, v, l).await? {
+                match self.read_ec(&dir, v, l, round > 0).await? {
                     Some(bytes) => return Ok((info, bytes)),
-                    // 版本目录被并发覆写者移走：重读 meta 拿新版本
+                    // 版本目录被并发覆写者移走/清除：重读 meta 拿新版本
                     None => continue,
                 }
             }
@@ -119,7 +119,7 @@ impl Store {
         self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(&self.cfg.root, bucket, key)?;
 
-        for _ in 0..2 {
+        for round in 0..2 {
             let m = self
                 .read_meta(bucket, key)
                 .await?
@@ -149,7 +149,7 @@ impl Store {
                 ));
             }
             if let Some(l) = &v.data_layout {
-                match self.read_ec(&dir, v, l).await? {
+                match self.read_ec(&dir, v, l, round > 0).await? {
                     Some(bytes) => {
                         return Ok(bytes.slice(range.start as usize..range.end as usize));
                     }
@@ -204,32 +204,42 @@ impl Store {
         Err(Error::NoSuchKey(key.to_string()))
     }
 
-    /// EC 读：逐片读取 + CRC32C 校验（坏片视同缺失）→ 重建 → 截断到对象长度 → SHA256 终验。
+    /// EC 读：逐片读取 + CRC32C/长度校验（坏片视同缺失）→ 重建 → 截断到对象长度 → SHA256 终验。
     ///
-    /// 返回 `Ok(None)` = 全部分片缺失（版本目录被并发覆写者移走，调用方重读 meta）；
-    /// 存活片不足以重建、或重建后 SHA256 与提交时记录不符 = 数据不可信 → Err（fail-closed，
-    /// 不吐坏数据）。
+    /// 分片是逐个读的，并发删除/覆写的中间态会让读者看到「前缀片在、后缀片没了」的半截视图，
+    /// 与真实损坏（盘丢片）不可在单轮内区分——因此 `strict`（末轮）之前，「存活不足」返回
+    /// `Ok(None)` 让调用方重读 meta 一轮：
+    ///   - 非末轮：任何拿不到数据的视图都 `Ok(None)`（可能是并发窗口）；
+    ///   - 末轮：全片 ENOENT 且未读到任何字节 = 目录确实不在 → `Ok(None)`（调用方报 NoSuchKey）；
+    ///     只要读到过坏片字节（CRC/长度不符）或存活片不全但不为空 → `Err(CorruptMeta)`
+    ///     （有字节落盘的损坏不得伪装成 404——fail-closed，不吐坏数据）。
+    ///
+    /// 重建后 SHA256 与提交记录不符同样 `Err`。
     async fn read_ec(
         &self,
         dir: &Path,
         v: &Version,
         l: &meta::DataLayout,
+        strict: bool,
     ) -> Result<Option<Bytes>> {
         let cfg = ec::EcConfig {
             data: l.data,
             parity: l.parity,
         };
         let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(l.shards.len());
+        // 读到过 CRC32C/长度不符的字节：区分「全片消失」（可能并发窗口/真删）与「片坏掉」（真损坏）
+        let mut bad_bytes = false;
         for s in &l.shards {
             let path = dir
                 .join(&v.part.uuid)
                 .join(format!("part.{}.{}", s.part, s.shard));
             match tokio::fs::read(&path).await {
                 Ok(bytes) => {
-                    if ec::crc32c_of(&bytes) == s.crc32c {
+                    if ec::crc32c_of(&bytes) == s.crc32c && bytes.len() as u64 == s.size {
                         shards.push(Some(bytes));
                     } else {
-                        tracing::warn!(path = %path.display(), "EC 分片 CRC32C 不符，视同缺失");
+                        tracing::warn!(path = %path.display(), "EC 分片校验不符（CRC32C/长度），视同缺失");
+                        bad_bytes = true;
                         shards.push(None);
                     }
                 }
@@ -237,8 +247,18 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
-        if shards.iter().all(Option::is_none) {
-            return Ok(None);
+        let present = shards.iter().filter(|s| s.is_some()).count();
+        if present < cfg.data as usize {
+            if !strict {
+                return Ok(None);
+            }
+            if present == 0 && !bad_bytes {
+                return Ok(None);
+            }
+            return Err(Error::CorruptMeta(format!(
+                "分片不足：存活 {present} < data {}（读到过坏片字节：{bad_bytes}）",
+                cfg.data
+            )));
         }
         let padded = ec::reconstruct(&shards, cfg)?;
         if (padded.len() as u64) < v.size {
@@ -248,13 +268,15 @@ impl Store {
                 v.size
             )));
         }
-        let bytes = padded[..v.size as usize].to_vec();
-        if hex::encode(Sha256::digest(&bytes)) != v.part.sha256 {
+        // 截断到对象长度（move 复用缓冲，不再整份复制）
+        let mut payload = padded;
+        payload.truncate(v.size as usize);
+        if hex::encode(Sha256::digest(&payload)) != v.part.sha256 {
             return Err(Error::CorruptMeta(format!(
                 "EC 重建后 SHA256 与提交记录不符（对象 {} 字节）",
                 v.size
             )));
         }
-        Ok(Some(Bytes::from(bytes)))
+        Ok(Some(Bytes::from(payload)))
     }
 }

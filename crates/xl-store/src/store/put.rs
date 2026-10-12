@@ -115,7 +115,8 @@ impl Store {
         // 语义（M2a 的握手测试与 README 承诺）。保持「流式写 part.1 → 收全后转」，
         // 峰值只在 encode 一步（payload + 12 片），S3 路径受 max_put_bytes 约束；
         // ponytail: aether ingest 大文件同受此峰值，ShardByShard 流式编/解是 M2b-3 之后的升级路径。
-        let (data_layout, inline) = if size < self.cfg.inline_threshold {
+        // 0 字节恒内联：EC 对空对象无意义（rs 拒收空片），阈值配成 0 时也不能把空对象送进 EC
+        let (data_layout, inline) = if size == 0 || size < self.cfg.inline_threshold {
             // 内联：小文件读回进 meta，删 part.1（版本目录只剩 xl.meta）
             let bytes = tokio::fs::read(&part_path).await?;
             tokio::fs::remove_file(&part_path).await?;

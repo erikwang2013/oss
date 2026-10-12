@@ -47,7 +47,7 @@ crates/oss-server/src/
 ├── config.rs          [改] oss.toml：data_dirs（数组，data_dir 兼容单盘）；ec.data/parity；inline_threshold
 ├── cli.rs             [改] clean/groups 适配多盘
 └── state.rs / aether.rs [改] StoreConfig 构造点
-tests/e2e_s3.sh        [改] 拔盘/断电为人工长跑入口；既有 14 步回归不变
+tests/e2e_s3.sh        [改] 拔盘/断电为人工长跑入口；既有 17 步回归不变（实况计数，含 11b/11c/11d 子步）
 ```
 
 依赖：`reed-solomon-erasure = "6.0.0"`、`crc32c = "0.6"`（workspace 根声明；xl-store 引用）。
@@ -229,12 +229,24 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 - [x] **Step 4:** 提交 `feat(xl-store): 小对象内联（< 128 KiB 进 xl.meta）；MPU complete 统一走 EC/内联`。
 
 **落地裁决（Task 6 轮）：**
-1. **complete 期间并发重传防护**：`upload_part` 不持对象锁（允许并发传不同 part——M2a 裁决不变），因此 complete 拼装出的字节数与声明的各段总和可能不一致（同一 part 被并发重传）。fail-closed：不一致 → `InvalidPart`（可重试语义），不提交不一致的 etag/长度。
+1. **complete 期间并发重传防护**：`upload_part` 不持对象锁（允许并发传不同 part——M2a 裁决不变），因此 complete 拼装出的字节数与声明的各段总和可能不一致（同一 part 被并发重传）。fail-closed：不一致 → `InvalidPart`（可重试语义），不提交不一致的 etag/长度。**评审补强（F2）**：仅比总长度不够——同长度不同内容会静默提交「数据≠etag」。改为 `concat_stream_verified` 在拼装中对每段做字节级核验（md5+sha256+长度 与 sidecar 快照全等），核验对象正是即将提交的字节，竞态在核验点收口；`multipart_complete_rejects_tampered_part_bytes` 用例钉死（含可重试性）。
 2. **暂存区不再原地转正**：旧设计（staging 目录 rename 成版本目录）与「统一 EC/内联形态」不兼容；新流程 = 拼装进 `tmp/<新 uuid>` → rename → 提交点 → 清理暂存区。代价 = 一次全量数据双写（暂存 + 转换产物并存到提交点之后），换来形态统一；暂存区在 complete 成功后立即释放。
 3. **旧 parts 形态回归用例**：`legacy_parts_form_still_readable`（手工构造 M2a meta + 多段 part 文件）钉死「升级不失读」。
 
+### 评审一轮（切片一收尾前，评审者只读，7 项发现 → 4 修 1 记录）
+
+- **F1（高）修**：EC 读的「半截视图」误报 500——分片逐个读，并发删除/覆写的中间态会呈现「前缀片在、后缀片没」，与真实损坏单轮内不可区分。修法：`read_ec(strict)`——非末轮「存活不足」返回 `Ok(None)` 走既有「重读 meta 一轮」；末轮：全片 ENOENT 且未读到坏片字节 → NoSuchKey；读到过任何坏片字节或存活不全但不空 → `CorruptMeta`（fail-closed）。附带：并发撕裂用例（`concurrent_puts_and_deletes…`）载荷 64 B→129 KiB——64 B 现在走内联、数据在 meta 里，该用例已退化为空转。
+- **F2（中）修**：见裁决 1（逐段字节核验）。
+- **F3（中）部分修 + 如实记档**：EC 读峰值 ≈ 4× 对象（shards 1.5× + reconstruct 克隆 1.5× + 拼接 1×）；已把「截断拷贝」改为 `truncate` + move（省 1×）；完整流式化（ShardByShard）维持「M2b-3 之后」。complete 峰值 ≈ 2.5× 对象，**单段 PUT 的 `max_put_bytes` 约束对 complete 不成立**（xl-s3 只限单 part），此边界补记入风险表。
+- **F4（低）修**：`inline_threshold=0` 时 0 字节对象落入 EC → rs 拒收空片 500；修为 `size == 0` 恒内联 + 用例。
+- **F5（低）修**：12 片全坏与全缺不可区分（全坏会 404）；随 F1 的 `bad_bytes` 信号一并修 + 用例钉死「全坏 = 损坏（500 谱系）」。
+- **F6（低）修**：读路径核验 `bytes.len() == ShardRef.size`（不符视同坏片），片长字段不再形同虚设。
+- **F7（低，M2a 遗留，本切片未加宽）**：`upload_part` 不持锁 vs abort/complete 的 `remove_dir_all` 窗口 → 裸 IO 500 而非 NoSuchUpload。记入遗留清单（M2b-2/3 或独立小修）。
+
+**e2e 实弹（e16f481）**：`tests/e2e_s3.sh` 17/17 步全绿（脚本实况 17 步头 = 编号 1–14 含 11b/11c/11d 子步；此前文档里的「14 步/19 步」为计数漂移，以脚本实况为准），脚本零改动；额外人工探针：1024 B/127680 B → 内联（目录仅 xl.meta），131072 B/1 MiB → 12 片 EC，四种形态读回/ETag/Range/CopyObject 全对，6 路并发覆写无撕裂。
+
 ### 切片一收尾
-- [ ] 四闸：fmt · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · `tests/e2e_s3.sh` 14 步回归（S3 面行为不应变化）
+- [x] 四闸：fmt · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · `tests/e2e_s3.sh` 17 步回归（S3 面行为不变；修复轮后复跑见下）
 - [ ] 提交切片总结（或并入 Task 6 提交），计划勾选与定稿记录同步
 
 ---
@@ -324,7 +336,7 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 | 风险 | 处置 |
 |---|---|
 | rs-erasure 6.0.0 老依赖（parking_lot 0.11/lru 0.7 等）与现代树冲突或编译不过 | **已实测结案（Task 2）**：6.0.0 及其老树（ahash 0.7/parking_lot 0.11/lru 0.7/instant/libm）在本工作区 2024 edition 工具链下编译通过，**不切** simd 备选（备选与判据保留供将来参考） |
-| EC 全内存（写：payload+12 片；读：重建整份） | ponytail 注释明示；`inline_threshold` 与「单次 PUT ≤ max_put_bytes」共同限定峰值；M2b-3 之后（M2c/M3）用 `ShardByShard` 分块 encode/decode + range 按需重建 |
+| EC 全内存（写：payload+12 片；读：重建整份） | ponytail 注释明示；`inline_threshold` 与「单次 PUT ≤ max_put_bytes」共同限定峰值；M2b-3 之后（M2c/M3）用 `ShardByShard` 分块 encode/decode + range 按需重建。**评审量化（F3）**：读峰值 ≈ 4× 对象（已用 truncate+move 省 1×）；**MPU complete 峰值 ≈ 2.5× 对象且不受 `max_put_bytes` 约束**（xl-s3 只限单 part）——P 级大对象的 complete 是已知悬崖，优先随 ShardByShard 收口 |
 | 写 quorum 语义（≥ data+1）在并发失败下的回滚复杂性 | 回滚 = 删已写片目录（未提交前不可见，天然安全）；用例覆盖 8 片成功回滚 |
 | 目录 fsync 在非 ext4/XFS 上语义不一（EINVAL 等） | 忽略并 warn；文档标注「断电零丢失需按文件系统复核」 |
 | golden 字节第二次变更（data_layout/inline 入编码） | meta.rs 既有「有意识更新」流程；摘要常量 + 注记 |
@@ -336,4 +348,10 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 ## 定稿记录
 
-（实现完成后补：每切片实际形态、四闸实跑、e2e 输出、与本文档的差异裁决。）
+### 切片一（M2b-1，单盘 EC + 内联）——2026-10-12
+
+- **提交序列**：Task 1 拆分（7d64681）→ Task 2 EC 模块（9bfd57e）→ Task 3 meta 扩展 + golden 第三次重算 f28d2848…（c70887c）→ Task 4+5 写读路径 + 内联（55a206d，合并提交理由见 Task 4 Step 4 注）→ Task 6 MPU 收口（e16f481）→ 评审修复轮（F1–F6）。
+- **四闸**：fmt 无 diff；clippy `-p xl-store --all-targets -- -D warnings` 0 告警；`cargo test --workspace -j 2` 全绿（146→148 测）；`tests/e2e_s3.sh` 17/17 步（e2e 子代理实弹，脚本零改动，四种形态人工探针 + 6 路并发覆写无撕裂）。
+- **与计划差异**（均有落地裁决段详述）：不收全再分叉（保流式语义）；不加 ShardsUnavailable；Task 4/5 合并编译轮；Task 6 改为「拼装 → 新目录」并加逐段字节核验；评审轮 F1/F2/F4/F5/F6 修复。
+- **遗留**：F7（upload_part 无锁窗口，M2a 已存在）；complete 的 P 级内存悬崖（随 ShardByShard）；README 存储形态说明待 M2b-2（多盘真冗余落地）后一并更新——单盘 EC 无冗余收益，提前宣传会误导。
+- **下一步**：切片二（M2b-2 多盘：Task 7–9，含 `[ec] enabled=false` 单盘兼容裁决的落地）。
