@@ -197,15 +197,23 @@ impl S3Access for Acl {
         }
 
         let op = cx.s3_op().name();
-        let bucket: Option<String> = cx.s3_path().as_bucket().map(str::to_owned);
-        let allow = match op {
-            // 桶级管理：列表由 handler 过滤；建桶任何已认证用户（建后记账 owner）；删桶限桶主
-            "ListBuckets" | "CreateBucket" => true,
-            "DeleteBucket" => match &bucket {
+        // 桶名必须用 `get_bucket_name()`：`as_bucket()` 只匹配 `S3Path::Bucket` 变体，
+        // 对象路径（`Object{bucket,key}`）会返回 None——用它会把一切对象级 op 误判成
+        // 「无桶」而全拒（子账户实弹 403 的根因，管理员旁路曾掩盖）。
+        let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
+        let Some(gate) = classify(op) else {
+            tracing::warn!(uid = user.uid, op, "授权拒绝（未映射 op，fail-closed）");
+            return Err(s3s::s3_error!(AccessDenied, "access denied"));
+        };
+        let allow = match gate {
+            // 列表由 handler 过滤；建桶任何已认证用户（建后记账 owner）
+            Gate::Open => true,
+            Gate::OwnerBucket => match &bucket {
                 Some(b) => self.is_owner(b, user.uid).await.map_err(acl_err)?,
                 None => false,
             },
-            "CopyObject" => {
+            Gate::Need(action) => self.can_opt(user, action, &bucket).await?,
+            Gate::Copy => {
                 // 目标写 + 源读（源在 header；用 s3s 的解析器——header 是 URL 编码且有
                 // / 前导与 ?versionId 形态，解析失败与反序列化同判，直接拒绝不误伤）
                 let dst = self.can_opt(user, Action::Write, &bucket).await?;
@@ -223,22 +231,6 @@ impl S3Access for Acl {
                 };
                 dst && src
             }
-            // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
-            "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject" => {
-                self.can_opt(user, Action::Read, &bucket).await?
-            }
-            // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
-            // put_object，op 名看到的是 "PostObject"，不映射它就是浏览器表单直传的漏检点）
-            "PutObject"
-            | "PostObject"
-            | "CreateMultipartUpload"
-            | "UploadPart"
-            | "CompleteMultipartUpload"
-            | "AbortMultipartUpload" => self.can_opt(user, Action::Write, &bucket).await?,
-            // 删
-            "DeleteObject" | "DeleteObjects" => self.can_opt(user, Action::Delete, &bucket).await?,
-            // 未实现/未知 op：fail-closed（下游本来也是 501；这里统一 403）
-            _ => false,
         };
         if allow {
             Ok(())
@@ -247,6 +239,43 @@ impl S3Access for Acl {
             Err(s3s::s3_error!(AccessDenied, "access denied"))
         }
     }
+}
+
+/// op → 门槛类型的纯映射（独立成函数以便表驱动单测；`None` = 未映射 op，fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// 已认证即可（ListBuckets 由 handler 过滤；CreateBucket 建后记账 owner）
+    Open,
+    /// 桶主或管理员
+    OwnerBucket,
+    /// 桶级 读/写/删 三档
+    Need(Action),
+    /// 目标写 + 源读
+    Copy,
+}
+
+fn classify(op: &str) -> Option<Gate> {
+    Some(match op {
+        "ListBuckets" | "CreateBucket" => Gate::Open,
+        "DeleteBucket" => Gate::OwnerBucket,
+        // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
+        "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject" => {
+            Gate::Need(Action::Read)
+        }
+        // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
+        // put_object，op 名看到的是 "PostObject"，不映射它就是浏览器表单直传的漏检点）
+        "PutObject"
+        | "PostObject"
+        | "CreateMultipartUpload"
+        | "UploadPart"
+        | "CompleteMultipartUpload"
+        | "AbortMultipartUpload" => Gate::Need(Action::Write),
+        // 删
+        "DeleteObject" | "DeleteObjects" => Gate::Need(Action::Delete),
+        "CopyObject" => Gate::Copy,
+        // 未实现/未知 op：fail-closed（下游本来也是 501；这里统一 403）
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -325,6 +354,44 @@ mod tests {
         uid: 1,
         is_admin: true,
     };
+
+    #[test]
+    fn op_classification_table() {
+        // 全量映射 + 三个易错点（PostObject 漏检、Abort 归写、HeadBucket 归读）
+        // + fail-closed 默认臂。**S3 面 403 事故的回归**：对象级 op 必须命中这张表——
+        // 曾经的 bug 在 check 的桶名解析（as_bucket 对 Object 路径返回 None），
+        // 该段依赖 s3s 上下文、无法在此构造，由 e2e_s3.sh 的 15a 实弹钉住。
+        assert_eq!(classify("ListBuckets"), Some(Gate::Open));
+        assert_eq!(classify("CreateBucket"), Some(Gate::Open));
+        assert_eq!(classify("DeleteBucket"), Some(Gate::OwnerBucket));
+        for op in [
+            "HeadBucket",
+            "ListObjectsV2",
+            "ListParts",
+            "GetObject",
+            "HeadObject",
+        ] {
+            assert_eq!(classify(op), Some(Gate::Need(Action::Read)), "{op}");
+        }
+        for op in [
+            "PutObject",
+            "PostObject",
+            "CreateMultipartUpload",
+            "UploadPart",
+            "CompleteMultipartUpload",
+            "AbortMultipartUpload",
+        ] {
+            assert_eq!(classify(op), Some(Gate::Need(Action::Write)), "{op}");
+        }
+        for op in ["DeleteObject", "DeleteObjects"] {
+            assert_eq!(classify(op), Some(Gate::Need(Action::Delete)), "{op}");
+        }
+        assert_eq!(classify("CopyObject"), Some(Gate::Copy));
+        // 未映射（含 s3s 存在但本服务未实现的桶策略/版本类 op）→ fail-closed
+        for op in ["GetBucketVersioning", "PutBucketPolicy", "Frobnicate"] {
+            assert_eq!(classify(op), None, "{op}");
+        }
+    }
 
     #[tokio::test]
     async fn admin_and_owner_allow_everything() {
