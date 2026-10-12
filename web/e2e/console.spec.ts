@@ -5,11 +5,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 test('登录 → 建桶 → 上传 → 列表 → 下载 → 删除', async ({ page }) => {
-  // 前缀 `zzz-`：桶列表按桶名升序且 10 行/页（xl-store list_buckets 排序 + antd 默认分页），
-  // 共享 data 目录里历史桶会一直堆积——`zzz-` 恒大于既有桶名，新桶永远排在最后一页最后一行，
-  // 断言先翻到最后一页即可，不随数据量/并发漂移（曾用 `0-` 前缀，但并用运行一多，
-  // 同前缀的新桶照样被挤出第 1 页）。尾部 UUID 防同毫秒并发撞名：撞名 → 建桶 409 → 弹窗不关 → 假红。
-  const bucket = `zzz-e2e-${Date.now()}-${randomUUID().slice(0, 8)}`
+  // 前缀 `zzz-e2e-z-`：桶列表按桶名升序且 10 行/页（xl-store list_buckets 排序 + antd 默认分页），
+  // 共享 data 目录里历史桶会一直堆积——新桶必须恒大于既有桶名才排在最后一页最后一行。
+  // 中间的 `z-` 是实弹教训：subaccount.spec 造 `zzz-e2e-sub-*`（'s' > 数字），会永远排在本 spec
+  // 的 `zzz-e2e-<ts>` 之后——桶总数一旦越过 10 行边界，新桶就掉到第 1 页，翻最后一页必找不到。
+  // `zzz-e2e-z-` > `zzz-e2e-sub-`（'z' > 's'）> `zzz-e2e-<数字>`，恢复「新桶=全局最后一行」。
+  // 尾部 UUID 防同毫秒并发撞名：撞名 → 建桶 409 → 弹窗不关 → 假红。
+  const bucket = `zzz-e2e-z-${Date.now()}-${randomUUID().slice(0, 8)}`
   const dir = mkdtempSync(join(tmpdir(), 'oss-e2e-'))
   // 内容必须逐次唯一：只有时间戳时，并行 worker 可能同毫秒起步 → 同内容 → 同 md5 → **同一个对象键**，
   // 两个运行会互相踩（一个把对象删了，另一个断言时行就没了）。对象名即内容 md5，见下方。

@@ -19,7 +19,9 @@ test('管理员建子账户并授权 → 子账户登录只见授权桶、可上
   const stamp = `${Date.now()}-${randomUUID().slice(0, 8)}`
   const subUser = `sub-${stamp}`
   const subPass = `pw-${stamp}-1234`
-  const bucket = `zzz-e2e-sub-${stamp}`
+  // 桶名与 console/instant 统一用 `zzz-e2e-z-<ts>…` 单一时间戳序：原先的 `zzz-e2e-sub-`
+  // 会被 z- 桶（'z' > 's'）压到底下——桶越过 10 行边界后本 spec 的新桶掉页，翻最后一页必找不到（实跑翻车）。
+  const bucket = `zzz-e2e-z-${stamp}`
 
   // 1) 管理员登录，建桶
   await login(page, 'erik', 'pw')
@@ -44,7 +46,9 @@ test('管理员建子账户并授权 → 子账户登录只见授权桶、可上
 
   // 3) 授权：读+写+删 勾在目标桶上
   const row = page.locator('tr', { hasText: subUser })
-  await row.getByRole('button', { name: '权限' }).click()
+  // antd 两个汉字按钮自动加空格 → 无障碍名是「权 限」（实测快照 button "权 限"）；
+  // 与 console.spec 的 /确\s*确定/ 同款正则，字面 '权限' 全串匹配永远打不中
+  await row.getByRole('button', { name: /权\s*限/ }).click()
   const permRow = page.locator('.ant-modal tr', { hasText: bucket })
   for (const title of ['读', '写', '删']) {
     await permRow.locator(`td:nth-child(${title === '读' ? 2 : title === '写' ? 3 : 4}) input[type=checkbox]`).check()
@@ -65,13 +69,14 @@ test('管理员建子账户并授权 → 子账户登录只见授权桶、可上
     await expect(page.getByText(bucket, { exact: true })).toBeVisible()
   }).toPass()
   await page.getByRole('link', { name: bucket }).click()
-  await expect(page.getByRole('button', { name: '上传' })).toBeVisible()
+  // 同「权 限」：antd 两个汉字自动加空格，实测快照为 button "上 传"
+  await expect(page.getByRole('button', { name: /上\s*传/ })).toBeVisible()
 
   // 5) 子账户上传一发（aetherupload 走子账户 JWT；目标桶由分组映射决定——用 files 之外的分组会 403，
   //    这里断言语义是「有写权限的桶映射到分组 file→files 才可传；无权限分组被拒」）。
   //    传小文件到默认面板；若后端上传面权限门生效而 files 未授权，则输出区出现 403 文案。
   //    先给子账户补授 files 写权限（管理员令牌已清，改用 UI 重登管理员太绕——此处直接断言拒绝路径）：
-  await page.getByRole('button', { name: '上传' }).click()
+  await page.getByRole('button', { name: /上\s*传/ }).click()
   await page.locator('#aetherupload-resource').setInputFiles({
     name: 'sub.txt',
     mimeType: 'text/plain',
