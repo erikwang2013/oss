@@ -9,7 +9,7 @@ use http::StatusCode;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
-use xl_store::store::{ListRequest, Store};
+use xl_store::store::{ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
 
@@ -80,6 +80,48 @@ fn stream_err_to_s3(
         return s3s::s3_error!(IncompleteBody, "failed to read request body");
     }
     to_s3_error(e)
+}
+
+/// 条件请求求值（RFC 9110 §13.2.2 顺序）：If-Match → If-Unmodified-Since →
+/// If-None-Match → If-Modified-Since，任一有决定即短路。
+/// 返回 `Err(NOT_MODIFIED)`（304，调用方回空 body）或 `Err(PRECONDITION_FAILED)`（412）。
+///
+/// ponytail: 求值基于 head 快照——与随后读盘之间是 TOCTOU 窗（并发覆写时条件可能对着
+/// 旧版本判、数据读到新版本）；无版本控制语义下接受，M4 版本控制落地时改为对版本求值。
+fn eval_preconditions(
+    info: &ObjectInfo,
+    if_match: Option<&ETagCondition>,
+    if_unmodified_since: Option<&Timestamp>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+) -> Result<(), StatusCode> {
+    let etag_matches = |c: &ETagCondition| match c {
+        // 能走到求值处，实体必存在 → `*` 恒真
+        ETagCondition::Any => true,
+        // 值比较、不区分强弱：我们的 ETag 恒为 Strong 无引号 hex，客户端回传任意强弱按值比。
+        // ponytail: 弱校验语义（W/ 差异）不细分；有真实互操作诉求时按 RFC 9110 §8.8.3 收严
+        ETagCondition::ETag(e) => e.value() == info.etag,
+    };
+    let last = last_modified(info.last_modified_nanos);
+    if let Some(c) = if_match {
+        if !etag_matches(c) {
+            return Err(StatusCode::PRECONDITION_FAILED);
+        }
+    } else if let Some(t) = if_unmodified_since
+        && last > *t
+    {
+        return Err(StatusCode::PRECONDITION_FAILED);
+    }
+    if let Some(c) = if_none_match {
+        if etag_matches(c) {
+            return Err(StatusCode::NOT_MODIFIED);
+        }
+    } else if let Some(t) = if_modified_since
+        && last <= *t
+    {
+        return Err(StatusCode::NOT_MODIFIED);
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -352,15 +394,32 @@ impl S3 for OssS3 {
         let bucket = req.input.bucket;
         let key = req.input.key;
 
+        // 条件求值需要 info：统一先取一次 head（Range 分支本来也要 size）；条件失败不读盘上数据。
+        let info = self
+            .store
+            .head_object(&bucket, &key)
+            .await
+            .map_err(to_s3_error)?;
+        if let Err(status) = eval_preconditions(
+            &info,
+            req.input.if_match.as_ref(),
+            req.input.if_unmodified_since.as_ref(),
+            req.input.if_none_match.as_ref(),
+            req.input.if_modified_since.as_ref(),
+        ) {
+            if status == StatusCode::NOT_MODIFIED {
+                // 304 无 body（空 output 即可）
+                return Ok(S3Response::with_status(
+                    GetObjectOutput::default(),
+                    StatusCode::NOT_MODIFIED,
+                ));
+            }
+            return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
+        }
+
         // Range → 有界读 + 206/416；无 Range → 整读 + 200。两条路共用同一份响应组装。
-        let (info, bytes, content_range, status) = match req.input.range {
+        let (bytes, content_range, status) = match req.input.range {
             Some(range) => {
-                // check 需要对象大小：用 head 取 size，避免「为拿 size 整读一遍对象」
-                let info = self
-                    .store
-                    .head_object(&bucket, &key)
-                    .await
-                    .map_err(to_s3_error)?;
                 // 越界 → RangeNotSatisfiable → InvalidRange(416)
                 let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
                 let (start, end) = (rr.start, rr.end);
@@ -379,15 +438,16 @@ impl S3 for OssS3 {
                 };
                 // check 保证 end >= 1（start <= last < full_length 且区间非空）
                 let cr = format!("bytes {}-{}/{}", start, end - 1, info.size);
-                (info, bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
+                (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
             }
             None => {
-                let (info, bytes) = self
+                let bytes = self
                     .store
                     .get_object(&bucket, &key)
                     .await
-                    .map_err(to_s3_error)?;
-                (info, bytes, None, StatusCode::OK)
+                    .map_err(to_s3_error)?
+                    .1;
+                (bytes, None, StatusCode::OK)
             }
         };
         let len = bytes.len() as i64;
@@ -418,6 +478,22 @@ impl S3 for OssS3 {
             .head_object(&req.input.bucket, &req.input.key)
             .await
             .map_err(to_s3_error)?;
+        // 条件与 GET 同口径（§3.3 的「错误一律 404」只罩读错误；304/412 是条件结果，照常返回）
+        if let Err(status) = eval_preconditions(
+            &info,
+            req.input.if_match.as_ref(),
+            req.input.if_unmodified_since.as_ref(),
+            req.input.if_none_match.as_ref(),
+            req.input.if_modified_since.as_ref(),
+        ) {
+            if status == StatusCode::NOT_MODIFIED {
+                return Ok(S3Response::with_status(
+                    HeadObjectOutput::default(),
+                    StatusCode::NOT_MODIFIED,
+                ));
+            }
+            return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
+        }
         Ok(S3Response::new(HeadObjectOutput {
             content_length: Some(info.size as i64),
             content_type: info.content_type,

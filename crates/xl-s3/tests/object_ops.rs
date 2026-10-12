@@ -1040,3 +1040,173 @@ async fn multipart_flow_through_service() {
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchUpload);
 }
+
+#[tokio::test]
+async fn conditional_requests_follow_rfc9110() {
+    // S3 协议补全 Task 1：If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since。
+    // 条件对同一份 GET/HEAD 生效；304 无 body；412 = PreconditionFailed。
+    use s3s::dto::{ETagCondition, IfMatch, IfModifiedSince, IfNoneMatch, IfUnmodifiedSince};
+
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let put = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "cond".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"payload"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let etag = put.e_tag.unwrap().value().to_string();
+    let info = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "cond".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let mtime = info.last_modified.unwrap();
+
+    let get_with = |if_match: Option<IfMatch>,
+                    if_none: Option<IfNoneMatch>,
+                    if_modified: Option<IfModifiedSince>,
+                    if_unmodified: Option<IfUnmodifiedSince>| {
+        let input = GetObjectInput {
+            bucket: "alpha".into(),
+            key: "cond".into(),
+            if_match,
+            if_none_match: if_none,
+            if_modified_since: if_modified,
+            if_unmodified_since: if_unmodified,
+            ..Default::default()
+        };
+        // 借用捕获：否则 async move 把 s3 搬进 future，闭包成 FnOnce（只能调用一次）
+        let s3 = &s3;
+        async move { s3.get_object(req(input)).await }
+    };
+
+    // ① If-Match 命中 → 200；错值 → 412
+    let ok = get_with(
+        Some(ETagCondition::ETag(ETag::Strong(etag.clone()))),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.status, Some(http::StatusCode::OK), "命中 → 200");
+    let err = get_with(
+        Some(ETagCondition::ETag(ETag::Strong("deadbeef".into()))),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+
+    // ② If-None-Match 命中 → 304、无 body
+    let not_modified = get_with(
+        None,
+        Some(ETagCondition::ETag(ETag::Strong(etag.clone()))),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(not_modified.status, Some(http::StatusCode::NOT_MODIFIED));
+    assert!(not_modified.output.body.is_none(), "304 不得带 body");
+
+    // ③ If-None-Match: * 对已存在对象 → 304；④ If-Match: * → 200
+    let star_304 = get_with(None, Some(ETagCondition::Any), None, None)
+        .await
+        .unwrap();
+    assert_eq!(star_304.status, Some(http::StatusCode::NOT_MODIFIED));
+    let star_200 = get_with(Some(ETagCondition::Any), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(star_200.status, Some(http::StatusCode::OK));
+
+    // ⑤ If-Modified-Since 拨到未来 → 304；If-Unmodified-Since 拨到过去 → 412
+    let future =
+        IfModifiedSince::from(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+    let past = IfUnmodifiedSince::from(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    assert_eq!(
+        get_with(None, None, Some(future), None)
+            .await
+            .unwrap()
+            .status,
+        Some(http::StatusCode::NOT_MODIFIED)
+    );
+    assert_eq!(
+        get_with(None, None, None, Some(past))
+            .await
+            .unwrap_err()
+            .code(),
+        &s3s::S3ErrorCode::PreconditionFailed
+    );
+    // 反对照：If-Modified-Since 拨到过去 → 200（正常服务）
+    let old = IfModifiedSince::from(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600 * 24 * 365),
+    );
+    assert_eq!(
+        get_with(None, None, Some(old), None).await.unwrap().status,
+        Some(http::StatusCode::OK)
+    );
+    // 对象 mtime 必然 ≤ 现在：If-Unmodified-Since = mtime 本身 → 条件成立（<= 语义）
+    // (mtime 即 Timestamp；IfUnmodifiedSince 是同类型别名，直接传)
+    assert_eq!(
+        get_with(None, None, None, Some(mtime))
+            .await
+            .unwrap()
+            .status,
+        Some(http::StatusCode::OK)
+    );
+
+    // ⑥ 条件先于 Range：If-None-Match 命中 + Range → 304（不是 206）
+    let with_range = GetObjectInput {
+        bucket: "alpha".into(),
+        key: "cond".into(),
+        if_none_match: Some(ETagCondition::ETag(ETag::Strong(etag.clone()))),
+        range: Some(Range::Int {
+            first: 0,
+            last: Some(2),
+        }),
+        ..Default::default()
+    };
+    let resp = s3.get_object(req(with_range)).await.unwrap();
+    assert_eq!(resp.status, Some(http::StatusCode::NOT_MODIFIED));
+
+    // ⑦ HEAD 同口径：If-Match 错值 → 412；If-None-Match 命中 → 304
+    let head_err = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "cond".into(),
+            if_match: Some(ETagCondition::ETag(ETag::Strong("deadbeef".into()))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(head_err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    let head_304 = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "cond".into(),
+            if_none_match: Some(ETagCondition::ETag(ETag::Strong(etag))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(head_304.status, Some(http::StatusCode::NOT_MODIFIED));
+}

@@ -75,6 +75,19 @@ aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key big.bin
 dd if="$WORK/big.bin" of="$WORK/range.expect" bs=1048576 skip=1 count=1 status=none
 cmp "$WORK/range.bin" "$WORK/range.expect"
 
+echo "== 11b. 条件请求（304 / 412）=="
+COND_ETAG=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text | tr -d '"')
+# 304：If-None-Match 命中（aws-cli 把 304/412 当异常退出——抓其输出/报错里的状态码，形态以实测为准）
+OUT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-none-match "\"$COND_ETAG\"" 2>&1) \
+  && { echo "If-None-Match 命中应 304，却成功: $OUT"; exit 1; }
+echo "$OUT" | grep -q '304' || { echo "未回 304: $OUT"; exit 1; }
+# 412：If-Match 错值
+OUT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-match '"deadbeef"' 2>&1) \
+  && { echo "If-Match 错值应 412，却成功: $OUT"; exit 1; }
+echo "$OUT" | grep -q '412' || { echo "未回 412: $OUT"; exit 1; }
+# 对照：If-Match 命中 → 200 正常
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-match "\"$COND_ETAG\"" >/dev/null
+
 echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh
 aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key meta.bin --query 'Metadata.foo' --output text | grep -qx bar
