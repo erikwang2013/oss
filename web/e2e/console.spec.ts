@@ -98,9 +98,13 @@ test('新建访问密钥 → 弹窗展示 AK/SK → 复制裸 SK → 列表出�
   }).toPass({ timeout: 15_000 })
 })
 
-// 2.0 协议的问题响应消费：上传超限文件（image 组 ≤10 MB，传 11 MB）→ 413 problem →
-// 脚本把 title 写进输出区。断言钉住 i18n 文案「错误：无效的文件大小」（3.0.0 起全角冒号，
-// 同时是对该清理版变更的实测回归）；若走上泛化兜底文案（error_upload_fail）本断言必红。
+// 2.0 协议的问题响应消费：上传超限文件（image 组 ≤10 MB，传 11 MB）。
+// 实跑钉死（e2e 代理，root 因见 log /tmp/e2e-console3-run.log）：声明大小超组上限在
+// **preprocess 参数层**就被拒——(400, invalid_parameter) → title「错误：请求参数非法」
+// （crate 3.0.0 controller/upload.rs 的 resource_maxsize 检查；413 invalid_resource_size
+// 只在分块阶段对「少报大小、多传字节」的客户端可达，控制台走自带 JS 声明真实大小，到不了那 branch）。
+// 断言钉住该 title（3.0.0 起全角冒号；同时覆盖 2.0 问题响应链路与 i18n 回归）；
+// 若走上泛化兜底文案（error_upload_fail）本断言必红。
 test('上传超限 → 问题响应 title 显示在输出区（2.0 协议）', async ({ page }) => {
   await page.goto('/login')
   await page.getByLabel('用户名').fill('erik')
@@ -121,7 +125,7 @@ test('上传超限 → 问题响应 title 显示在输出区（2.0 协议）', a
     mimeType: 'image/png',
     buffer: Buffer.alloc(11 * 1024 * 1024),
   })
-  await expect(page.locator('#aetherupload-output')).toContainText('错误：无效的文件大小', {
+  await expect(page.locator('#aetherupload-output')).toContainText('错误：请求参数非法', {
     timeout: 30_000,
   })
 })

@@ -263,8 +263,9 @@ impl Stream for ChecksumTailStream {
 ## Task 5: 控制台问题响应 e2e（web）
 
 > **已落地（评审注记，2026-10-12）**：本 Task 由主线程随「小口子收口」提交 `5ec7e11` 完成——
-> `web/e2e/console.spec.ts` 已加「上传超限 → 问题响应 title」用例（断言钉「错误：无效的文件大小」
-> 全角冒号版，兼作 3.0.0 i18n 变更的实测回归）；e2e 代理实跑验证中。本 Task 若仍有出入
+> `web/e2e/console.spec.ts` 已加「上传超限 → 问题响应 title」用例（实跑修正：声明超限在
+> preprocess 即被 400 invalid_parameter 拒 → 断言钉「错误：请求参数非法」全角冒号版，兼作 3.0.0
+> i18n 变更的实测回归；413 invalid_resource_size 仅对少报大小可达，不在此路径）；e2e 实跑验证中。本 Task 若仍有出入
 > （如用例措辞与规格对齐），只做微调，不重复建设。
 
 **Files:** `web/e2e/console.spec.ts`（追加用例）
