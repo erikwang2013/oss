@@ -181,7 +181,7 @@ if let Some(ts) = over.response_expires {
 
 **设计裁决（必须照做）**：校验在 **xl-s3 的流包装层**完成、以「**流末尾注入错误**」让内核在提交点前 fail-closed——现有 `put_object_stream_with_meta` 的失败路径本就清 tmp、不写 meta，故**无需改提交协议**。校验和落盘仅在 store 侧作为**数据**（不做校验逻辑）。
 
-- [ ] **Step 1: 写失败的测试**（store 层：meta 往返含 checksum；service 层：见 Step 4）
+- [x] **Step 1: 写失败的测试**（store 层：meta 往返含 checksum；service 层：见 Step 4）
 
 ```rust
 // store/tests.rs
@@ -192,7 +192,7 @@ async fn meta_roundtrips_checksum_record() {
 }
 ```
 
-- [ ] **Step 2: 实现 store 侧**：
+- [x] **Step 2: 实现 store 侧**：
 
 ```rust
 // meta.rs
@@ -209,7 +209,7 @@ pub struct ChecksumRecord {
 
 `put_object_stream_with_meta` 增尾参 `checksum: Option<ChecksumRecord>`，写进 `Version` 与返回的 `ObjectInfo`（`ObjectInfo` 亦加 `checksum` 字段）；旧壳传 `None`；aether 调用点传 `None`。**golden 摘要破**→ 按 meta.rs 既有更新流程重算。
 
-- [ ] **Step 3: 实现 xl-s3 侧**：
+- [x] **Step 3: 实现 xl-s3 侧**：
 
 ```rust
 /// 校验和尾流：边转发边算声明算法的摘要；inner 结束后比对，不匹配则**在流末尾注入错误**
@@ -241,11 +241,11 @@ impl Stream for ChecksumTailStream {
 `GET/HEAD` 回写：`info.checksum` 按 `algorithm` 映射到 `checksum_crc32c/…/checksum_md5/checksum_sha256` 输出字段。
 `convert.rs`：`StoreError::BadDigest(_) => S3ErrorCode::BadDigest`（400 保留原文）。
 
-- [ ] **Step 4: 测试**：object_ops（正确 crc32c 通过并落盘；**错值 → BadDigest 且对象不存在**（fail-closed 断言：随后 head 应 404）；Content-MD5 正确/错误两态；GET 回读字段）。
+- [x] **Step 4: 测试**：object_ops（正确 crc32c 通过并落盘；**错值 → BadDigest 且对象不存在**（fail-closed 断言：随后 head 应 404）；Content-MD5 正确/错误两态；GET 回读字段）。
 
-- [ ] **Step 5: e2e**：`aws s3api put-object --checksum-algorithm SHA256 --body …` → `get-object` 输出含 `ChecksumSHA256`；改一字节故意不匹配（用 `--checksum-sha256` 伪造）→ `BadDigest` 原文断言。
+- [x] **Step 5: e2e**（11c 段；aws-chunked trailer 形态由 e2e 代理实跑核验）：`aws s3api put-object --checksum-algorithm SHA256 --body …` → `get-object` 输出含 `ChecksumSHA256`；改一字节故意不匹配（用 `--checksum-sha256` 伪造）→ `BadDigest` 原文断言。
 
-- [ ] **Step 6: 提交**——`git commit -m "feat: Content-MD5 与 x-amz-checksum-*——流尾校验（提交前 fail-closed）、xl.meta 落盘、GET/HEAD 回写"`
+- [x] **Step 6: 提交**（ec20d8d）——`git commit -m "feat: Content-MD5 与 x-amz-checksum-*——流尾校验（提交前 fail-closed）、xl.meta 落盘、GET/HEAD 回写"`
 
 ---
 
@@ -319,3 +319,16 @@ impl Stream for ChecksumTailStream {
 - 形态与计划一致（可变 out + 六字段覆盖）。**计划勘误**：`Timestamp::format` 吃 `io::Write`，
   `String` 只实现 `fmt::Write`——计划里「对 String 用 &mut w」写错，实现改 `Vec<u8>` 缓冲再转 String。
 - 实跑：xl-s3 21/21、workspace 全绿、clippy 0 告警；e2e 覆盖并入收尾轮统一跑。
+
+### Task 3（Content-MD5 与 x-amz-checksum-*）
+
+- 形态与计划一致。实现中的裁决与勘误：
+  - 包装序定为 **limit_stream 内、ChecksumTailStream 外**——否则限流层的 `body_err` 会把注入的
+    BadDigest 吞成 IncompleteBody（计划未写明次序，为本次实现裁决）。
+  - `declared_checksum` 在解构 `req.input` **之前**求值（解构会部分搬走 metadata 等字段，
+    之后借用 req.input 会 E0382）。
+  - `ChecksumAlgorithm` 是枚举（含 const 字符串与 From<String>），测试里用 `.to_string().into()`。
+  - 「只声明算法无值 → InvalidRequest」写进用例与注释（CLI 恒带值；无值不猜）。
+  - golden 第二次重算：`2af7eeed…`。
+- 实跑：xl-store 68/68、xl-s3 22/22、workspace 全绿、clippy 0 告警；e2e 11c（含 aws-chunked
+  trailer 的实跑核验）随 e2e 报告补记。
