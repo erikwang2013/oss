@@ -42,3 +42,15 @@ CREATE TABLE IF NOT EXISTS instant_index (
     v          TEXT NOT NULL,
     expires_at INTEGER NOT NULL
 );
+
+-- 子账户 × 桶 的三档权限（读/写/删）。求值规则见 crates/xl-s3/src/access.rs：
+-- 管理员全允许；桶主（buckets.owner_id）全允许；否则查本表，无行 = 无权限（fail-closed）。
+-- 用桶名而非 FK：删桶时由 delete_bucket 顺手清行（防重建同名桶继承旧授权）。
+CREATE TABLE IF NOT EXISTS permissions (
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    bucket     TEXT NOT NULL,
+    can_read   INTEGER NOT NULL DEFAULT 0,
+    can_write  INTEGER NOT NULL DEFAULT 0,
+    can_delete INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, bucket)
+);
