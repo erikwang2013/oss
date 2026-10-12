@@ -1415,3 +1415,43 @@ async fn checksum_verified_before_commit_and_written_back() {
         .unwrap_err();
     assert_eq!(err_algo_only.code(), &s3s::S3ErrorCode::InvalidRequest);
 }
+
+#[tokio::test]
+async fn head_with_range_still_returns_full_length() {
+    // 协议补全 Task 4：HEAD 带 Range **不支持**（钉契约防未来静默变化）——
+    // 仍回 200 + 全量 Content-Length（aws-cli/rclone 均不依赖 HEAD+Range 的 206 语义）。
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "hr".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from(vec![b'x'; 100]))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let resp = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "hr".into(),
+            range: Some(Range::Int {
+                first: 0,
+                last: Some(9),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    // HEAD 路径用 S3Response::new（status None = 隐式 200；GET 才统一 with_status）
+    assert_eq!(resp.status, None);
+    assert_eq!(
+        resp.output.content_length,
+        Some(100),
+        "HEAD+Range 仍回全量长度"
+    );
+}

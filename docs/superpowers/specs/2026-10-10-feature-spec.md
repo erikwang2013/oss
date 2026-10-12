@@ -202,8 +202,8 @@
 | `x-amz-server-side-encryption*` | ❌（M5） | |
 | `x-amz-tagging` | ❌（M4） | |
 | `x-amz-object-lock-*` | ❌（M5） | |
-| `Content-MD5` | ✅ | 与计算值不符 → `BadDigest` |
-| `x-amz-checksum-*` | ❌（M2） | |
+| `Content-MD5` | ✅（协议补全计划 Task 3 落地） | 与计算值不符 → `BadDigest`（提交点前 fail-closed，对象不落盘） |
+| `x-amz-checksum-*` | ✅（协议补全计划 Task 3 落地；CRC32C/SHA1/SHA256/SHA512/CRC64NVME 校验并回写，组合语义留 M2b） | |
 
 **边界**：M2a 起流式直通内核（不再整份读内存），单次 PUT/单 part 仍受 `max_put_bytes` 上限。
 
@@ -211,11 +211,11 @@
 
 **行为**：读 `xl.meta` → 定位版本目录 → 流式返回。响应带 `Content-Length`、`Content-Type`、`ETag`、`Last-Modified`。
 
-**`response-content-*` 查询参数**（覆盖响应头）：`response-content-type`、`response-content-disposition`（含 `&filename=` 的 RFC 5987 编码）、`response-cache-control` 等。
+**`response-content-*` 查询参数**（覆盖响应头；协议补全计划 Task 2 已落地）：`response-content-type`、`response-content-disposition`（含 `&filename=` 的 RFC 5987 编码）、`response-cache-control` 等。
 
-**Range（M2a 已落地）**：`bytes=0-99`、`bytes=100-`、`bytes=-100`；越界 → `InvalidRange`（416，实测错误码为 `InvalidArgument`，见 M2a 计划定稿记录）；支持单区间，多区间 → 400；响应 `206` + `Content-Range`；内核按 part 序列跨段映射、只读命中段。HEAD 带 Range 不支持。EC 重建的按需解码随 M2b。
+**Range（M2a 已落地）**：`bytes=0-99`、`bytes=100-`、`bytes=-100`；越界 → `InvalidRange`（416）；**多区间（`bytes=0-9,20-29`）在 s3s 头部解析层即拒 → 400 `InvalidArgument`**（实测，协议补全计划 Task 4 对齐）；响应 `206` + `Content-Range`；内核按 part 序列跨段映射、只读命中段。HEAD 带 Range 不支持（仍回 200 + 全量长度，契约有用例钉住）。EC 重建的按需解码随 M2b。
 
-**条件请求**：`If-Match` / `If-None-Match`（ETag）/ `If-Modified-Since` / `If-Unmodified-Since` → 不满足时 `412` 或 `304`（`If-None-Match` 命中 → `304 Not Modified`，无 body）。
+**条件请求（协议补全计划 Task 1 已落地）**：`If-Match` / `If-None-Match`（ETag）/ `If-Modified-Since` / `If-Unmodified-Since` → 不满足时 `412` 或 `304`（`If-None-Match` 命中 → `304 Not Modified`，无 body；RFC 9110 §13.2.2 求值序短路；ETag 按值比较不分强弱）。
 
 ### 3.3 HeadObject —— `M1`
 
