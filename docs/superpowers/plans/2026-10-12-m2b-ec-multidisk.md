@@ -1,0 +1,326 @@
+# M2b 存储层重构 实现计划（EC · 多盘 · 内联 · 断电一致性）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 落地设计文档 M2 的**存储层**部分——EC 8+4 纠删码 · 单机多盘 · 小对象内联（< 128 KiB 进 `xl.meta`）· 断电一致性复核 · fsck/scrub 起步——把「单盘直存」升级为「单机真·对象存储」。协议面（Multipart/Range/元数据/GC）已由 M2a 完成，本计划不碰。
+
+**范围切分（三个可独立交付的切片，各自四闸）**：
+
+| 切片 | 内容 | 关键验收 |
+|---|---|---|
+| **M2b-1 EC 单盘** | store.rs 拆分 → EC 编解码 → `xl.meta` 演进 → 单盘 EC 写/读 → 小对象内联 | 设计 §M2 验收 #4（2 KB 不产生 13 文件）、#5（翻转分片字节读报错） |
+| **M2b-2 多盘** | `drives[]` + crc32c 对象→组映射 + quorum 写 + 拔盘容忍 + 断电一致性 | 设计 §M2 验收 #1（拔 2 盘读写照常）、#2（kill -9 无脏数据） |
+| **M2b-3 运维面** | fsck/scrub 起步 + 桶级互斥 + flock 跨进程锁 + 收尾 | 设计 §4.4 锁承诺（M1–M2 flock）、既有 ponytail 注释收口 |
+
+**明确不做（M3+ 边界）**：跨节点 gRPC mesh / 网络 quorum / 节点间锁 / rebalance / 读修复的网络侧 / 分层 / 事件总线。单机内的「拔盘→回插→scrub 重建」是 M2b-2 的范围；**跨节点**的同类能力是 M3。
+
+---
+
+## 执行前必读：四件事
+
+1. **依赖已逐条核实（crates.io 现状，2026-10-12）**：
+   - `reed-solomon-erasure = "6.0.0"`（设计 §2 指定；MIT）。已读源码核实 API：`galois_8::ReedSolomon::new(data, parity) -> Result<Self, Error>`（core.rs:445）、`encode(&self, shards: T) where T: AsRef<[U]> + AsMut<[U]>, U: AsRef/Elem`（core.rs:597，吃 `&mut Vec<Vec<u8>>` 与 `Vec<&mut [u8]>`）、`reconstruct(&self, slices: &mut [T]) where T: ReconstructShard<F>`（core.rs:680，缺失片以容器内 `None`/空表示——**容器形态以编译器为准**）。
+   - `crc32c = "0.6.8"`（硬件加速 CRC32C + 软件回退；设计 §4.3 要求的分片校验和）。
+   - **备选**：`reed-solomon-simd 3.1.0`（O(n log n) + SIMD，MSRV 1.82，维护中）——rs-erasure 6.0.0 树里带 parking_lot 0.11 / lru 0.7 等老依赖，若与现代树冲突或编译不过，切它，API 形态不同但顶层用法（encode/reconstruct）同类。判据写进风险表。
+2. **五条铁律（设计 §4.2）本切片不得破坏**：① 元数据跟对象走盘（无中心库）；② `xl.meta` 唯一提交点，写序不可变（分片→候选 meta→rename→meta 覆盖→trash）；③ 展平 + 整对象一个目录（转正永远同盘 rename）；④ 小对象内联不经 EC（持久性由 meta 复制承担）；⑤ **分片位置只存拓扑下标 `(drive_idx, part, shard_idx)`，绝不存绝对路径**——rebalance 与换盘的前提。
+3. **M1/M2a 数据兼容裁决：就地兼容，不迁移**。`Version.data_layout: Option<DataLayout>`——`None` = M1/M2a 旧形态（`part`/`parts` 单文件路径），`Some` = M2b EC 形态；读路径按字段分发，写路径 M2b 起一律新形态。**升级方向只保证「新解旧」**（旧代码读新对象会在 `part.N` 找不到文件——接受，发布与部署锁步）。golden 字节将再次变更（有新字段），按 meta.rs 既有「有意识更新」流程走。
+4. **本机编译成本**：编译一次 ≈ 5–20 分钟（高负载时更久）。所有需要编译验证的臆测合并；每个 Task 的「确认失败」步骤在编译成本不可承受时可与实现合并为一次编译，但**必须在定稿记录中如实注明**（M2a 已有先例）。
+
+---
+
+## 文件结构（改动面）
+
+```
+crates/xl-store/src/
+├── meta.rs            [改] Version 加 data_layout/inline（Option，前向兼容契约）；golden 更新
+├── layout.rs          [改] shard 文件名编码（part.<part>.<shard>）；drives 感知的路径推导
+├── store.rs           [拆+改] 569 行已超 500 上限：拆出 put.rs / read.rs；StoreConfig 加 drives/ec/inline 阈值
+├── store/
+│   ├── ec.rs          [新] EC 编解码（encode/reconstruct + CRC32C/SHA256 校验）
+│   ├── drives.rs      [新] 盘集合、set 映射（§5.3）、quorum 判定、存活探测
+│   ├── put.rs         [新] 提交协议（自 store.rs 迁入并加 EC/内联分支）
+│   ├── read.rs        [新] get/range/head（EC 重建 + 校验）
+│   ├── mpu.rs         [改] complete 走统一 EC 路径（暂存零件流读 → 编码 → 分片转正）
+│   ├── gc.rs          [改] 多盘遍历；fsck 报告钩子
+│   └── list.rs        [改] 多盘遍历（每 set 一份命名空间副本，枚举 set 0 即可——裁决见 Task 7）
+crates/oss-server/src/
+├── config.rs          [改] oss.toml：data_dirs（数组，data_dir 兼容单盘）；ec.data/parity；inline_threshold
+├── cli.rs             [改] clean/groups 适配多盘
+└── state.rs / aether.rs [改] StoreConfig 构造点
+tests/e2e_s3.sh        [改] 拔盘/断电为人工长跑入口；既有 14 步回归不变
+```
+
+依赖：`reed-solomon-erasure = "6.0.0"`、`crc32c = "0.6"`（workspace 根声明；xl-store 引用）。
+
+---
+
+# 切片一：M2b-1（EC 单盘）
+
+## Task 1: store.rs 拆分（纯搬家，零行为变化）
+
+**Files:** Modify: `crates/xl-store/src/store.rs`；Create: `crates/xl-store/src/store/put.rs`、`store/read.rs`
+
+- [ ] **Step 1:** `put.rs`：迁入 `put_object` / `put_object_with_meta` / `put_object_stream` / `put_object_stream_with_meta` / `write_meta` / `read_meta`（`read_meta` 同时被 gc/mpu 用——迁走后需 `pub(in crate::store)` 或留在 store.rs；**裁决：read_meta/write_meta 留 store.rs**，其余迁 put.rs）。
+- [ ] **Step 2:** `read.rs`：迁入 `get_object` / `get_object_range` / `head_object` / `load_object_info`。
+- [ ] **Step 3:** store.rs 保留：`open`（自举/自检）、`root/lock_for/ensure_bucket`、桶操作、`delete/copy_object`、`now_nanos`。目标 store.rs ≤ 300 行。
+- [ ] **Step 4:** `cargo test -p xl-store` 全绿（**行为零变化**是本 task 唯一验收）；提交 `refactor(xl-store): store.rs 拆分——put/read 迁出，pub 面不变`。
+
+## Task 2: EC 编解码模块（`store/ec.rs`）
+
+**Files:** Modify: `Cargo.toml`（workspace）、`crates/xl-store/Cargo.toml`；Create: `crates/xl-store/src/store/ec.rs`；Modify: `store.rs`（`mod ec;`）
+
+- [ ] **Step 1: 写失败的测试**（`ec.rs` 内 `#[cfg(test)]`）：
+
+```rust
+#[test]
+fn ec_roundtrip_8_4_survives_up_to_4_losses() {
+    let cfg = EcConfig { data: 8, parity: 4 };
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let shards = encode(&payload, cfg).unwrap();
+    assert_eq!(shards.len(), 12);
+    // 丢任意 ≤4 片可重建
+    for lost in [[0usize, 3, 7, 11], [1, 2, 9, 10]] {
+        let mut view: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
+        for &i in &lost { view[i] = None; }
+        assert_eq!(reconstruct(&view, cfg).unwrap(), payload, "丢 {lost:?}");
+    }
+    // 丢 5 片必败
+    let mut view: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
+    for i in [0, 1, 2, 3, 4] { view[i] = None; }
+    assert!(reconstruct(&view, cfg).is_err());
+}
+
+#[test]
+fn flipped_shard_byte_is_detected_by_crc32c() {
+    let cfg = EcConfig { data: 8, parity: 4 };
+    let payload = vec![7u8; 1024];
+    let mut shards = encode(&payload, cfg).unwrap();
+    shards[2][0] ^= 0x01; // 手工翻转
+    assert!(shards_valid(&shards, cfg).is_err(), "翻转字节必须被 CRC32C 抓到");
+}
+```
+
+- [ ] **Step 2: 确认失败**（`encode` 未定义）。
+- [ ] **Step 3: 实现**。形态：
+
+```rust
+//! EC 编解码与分片校验。M2b 先整份进内存（ponytail: 大对象内存峰值为 payload + 分片；
+//! M2b-3 换分块 encode —— rs-erasure 支持 ShardByShard 增量编码，升级路径已留）。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EcConfig { pub data: u8, pub parity: u8 }   // 默认 8/4；可配 4+2 / 6+3 / 12+4
+
+/// 返回 12 片（前 data 片为数据片），每片长度 = ceil(len/data) 对齐。
+pub fn encode(payload: &[u8], cfg: EcConfig) -> Result<Vec<Vec<u8>>>;
+/// 缺失片（None/空）用 EC 重建；片数与配置不符 → Err。
+pub fn reconstruct(shards: &[Option<Vec<u8>>], cfg: EcConfig) -> Result<Vec<u8>>;
+/// 逐片 CRC32C 校验（crate crc32c；存 meta 的值与实读比对由调用方传入）。
+pub fn crc32c_of(shard: &[u8]) -> u32;
+```
+
+- [ ] **Step 4:** `cargo test -p xl-store ec` 全绿；提交 `feat(xl-store): EC 8+4 编解码模块（reed-solomon-erasure 6.0.0 + crc32c）`。
+
+## Task 3: `xl.meta` 演进（DataLayout / Inline）
+
+**Files:** Modify: `crates/xl-store/src/meta.rs`
+
+- [ ] **Step 1:** 新字段（**只加 Option，前向兼容契约**；`sample()` 补 `data_layout: None, inline: None`）：
+
+```rust
+pub struct Version {
+    …现状全保留（part/parts 成为旧形态的兼容位）…
+    /// M2b：Some = EC 布局（本版本以分片为准）；None = M1/M2a 旧形态（读 part/parts）。
+    #[serde(default)]
+    pub data_layout: Option<DataLayout>,
+    /// M2b：小对象内联字节（< inline_threshold 时数据就在 meta 里，不经 EC）。
+    #[serde(default)]
+    pub inline: Option<InlineData>,
+}
+
+pub struct DataLayout {
+    pub data: u8,
+    pub parity: u8,
+    pub shard_size: u64,              // 每片定长（含末片补零对齐）
+    pub shards: Vec<ShardRef>,
+}
+pub struct ShardRef {
+    pub drive: u8,                    // 拓扑下标（铁律 ⑤；单盘恒 0）
+    pub part: u16,                    // M2b 恒 1（多 part 分片的升级位与 parts 对齐）
+    pub shard: u8,                    // 0..data+parity
+    pub size: u64,
+    pub crc32c: u32,
+}
+pub struct InlineData { pub bytes: Vec<u8> }   // 上限 inline_threshold，读取端复核
+```
+
+- [ ] **Step 2:** decode 白名单扩展：`data_layout.shards` 无 uuid 字段（纯下标），但 `inline.bytes` 长度必须 `<= MAX_INLINE`（防解码端被超大分配打爆——**信任边界**）。
+- [ ] **Step 3:** golden 摘要按流程重算（连续第二个有意识变更）；补用例：旧文件（无新字段）解码 → None；新文件 + 旧解码器（FutureVersion 模式）→ 跳过。
+- [ ] **Step 4:** 提交 `feat(xl-store): xl.meta 增 DataLayout/Inline——EC 布局与内联的前向兼容字段`。
+
+## Task 4: 单盘 EC 写路径
+
+**Files:** Modify: `store/put.rs`、`layout.rs`（shard 文件名）、`store.rs`（StoreConfig）
+
+- [ ] **Step 1: StoreConfig 演进**：
+
+```rust
+pub struct StoreConfig {
+    pub root: PathBuf,          // 单盘形态（drives 长度 1 时二者等价；M2b-2 引入 drives 后 root() = drives[0]）
+    pub fsync: bool,
+    pub ec: EcConfig,           // 新；默认 EcConfig { data: 8, parity: 4 }
+    pub inline_threshold: u64,  // 新；默认 128 * 1024（设计铁律 ④）
+}
+```
+（`StoreConfig::new` 保持既有签名，新字段给默认值——调用点零波及。）
+
+- [ ] **Step 2: 写路径分支**（`put_object_stream_with_meta` 的 staged 段）：
+
+```rust
+// 现流程：流式写 tmp/<uuid>/part.1。M2b 分叉：
+if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再分叉） {
+    // 内联：不写 part 文件；Version.inline = Some(bytes)
+} else {
+    // EC：payload → ec::encode(cfg) → 逐片写 tmp/<uuid>/part.1.<shard>（每片 fsync）→
+    //      Version.data_layout = Some(DataLayout{ …, shards: [ShardRef{ drive:0, part:1, shard:i, size, crc32c }] })
+    // part 兼容位：part.uuid = uuid、part.part = 1、part.size = 总长、part.sha256 = 整对象 SHA256（其余读方依赖）
+}
+// 候选 meta → rename → 提交点，与现流程完全一致（铁律 ② 不动）
+```
+
+- [ ] **Step 3:** 测试（`store/tests.rs` 追加）：① 1 MiB 对象 → 盘上 `find . -name 'part.*' | wc -l == 12`；② 读回字节一致；③ inline_threshold 边界（127 KiB 内联 / 129 KiB EC——**用 `-` 与 `+` 两例钉死 `>=` 还是 `>` 的分支语义**）。
+- [ ] **Step 4:** 提交 `feat(xl-store): 单盘 EC 写路径——12 分片落盘，提交协议不变`。
+
+## Task 5: 单盘 EC 读路径（重建 + 校验）
+
+**Files:** Modify: `store/read.rs`
+
+- [ ] **Step 1: 测试先行**：① 全片在 → 读回一致；② 删 1/2/4 片（`remove_file`）→ 读回一致；③ 删 5 片 → `Err`（信息含「分片不足」）；④ 翻转一片一个字节 → `Err`（CRC32C 抓到，**不得静默返回脏数据**——设计验收 #5）；⑤ 翻转后整对象 SHA256 兜底（CRC 挡不住的场景由 SHA256 收口）。
+- [ ] **Step 2: 实现**（分支骨架）：
+
+```rust
+// get_object：v.data_layout 分支
+//   Some(l) => {
+//      读每片（drive 暂恒 0）：Ok(bytes) => crc32c 校验存 ShardRef 比对 → 不符 = 坏片（视同丢失，进 reconstruct 输入 None）
+//      存活片 < data → reconstruct 必败 → Err(CorruptMeta 语义的「分片不足」变体，新增 Error::ShardsUnavailable)
+//      重建 → 整对象 SHA256（PartRef.sha256）校验 → 不符 Err(CorruptMeta「校验和不符」)
+//   }
+//   None => 现路径（effective_parts 单文件/多段）
+// ponytail: M2b 重建整份进内存；M2b-3 的 range 按需只重建命中块（rs-erasure ShardByShard 的分块能力）。
+```
+
+- [ ] **Step 3:** `get_object_range` 同分支（M2b 先重建整份再切片，ponytail 注同上）；`head_object` 不变（只读 meta）。
+- [ ] **Step 4:** 提交 `feat(xl-store): EC 读路径——存活片直读 + 重建 + CRC32C/SHA256 双校验`。
+
+## Task 6: 小对象内联
+
+**Files:** Modify: `store/put.rs`、`store/read.rs`
+
+- [ ] **Step 1: 测试先行**（设计验收 #4 的本地版）：2 KB 对象 PUT 后，对象目录内 `find` 计数 == 1（只有 `xl.meta`）；读回一致；覆写为 EC 尺寸再读（形态切换）；mpu 小对象同样内联（complete 分支）。
+- [ ] **Step 2: 实现**：内联字节直接进 `Version.inline`；读路径 `inline.is_some()` 优先于 `data_layout`/parts。**注意**：内联不经 EC——单盘形态（M2b-1）下即单份，冗余由 M2b-2 的 meta 多盘复制提供（风险表记录此边界）。
+- [ ] **Step 3:** MPU `complete_multipart_upload` 收口：**统一裁决**——complete 时按顺序流读暂存 `part.N` 拼成整对象 → 走与单段 PUT 相同的「内联或 EC」落盘 → 暂存文件清理；`Version.parts` 字段保留供 M2a 旧对象读取，新写入不再使用（裁决记入定稿记录）。
+- [ ] **Step 4:** 提交 `feat(xl-store): 小对象内联（< 128 KiB 进 xl.meta）；MPU complete 统一走 EC/内联`。
+
+### 切片一收尾
+- [ ] 四闸：fmt · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · `tests/e2e_s3.sh` 14 步回归（S3 面行为不应变化）
+- [ ] 提交切片总结（或并入 Task 6 提交），计划勾选与定稿记录同步
+
+---
+
+# 切片二：M2b-2（多盘）
+
+## Task 7: `drives[]` 与对象→组映射
+
+**Files:** Modify: `store.rs`（StoreConfig/Store/root/open）、Create: `store/drives.rs`、`layout.rs`、`config.rs`（oss-server）
+
+- [ ] **Step 1: 设计裁决（写进代码注释）**：
+  - `StoreConfig { drives: Vec<PathBuf>, … }`；单盘形态 = `vec![root]`；`root()` 返回 `drives[0]`（既有调用点零波及）。
+  - **set 划分**：M2b 单机单 set = 全部盘（`sets.len() == 1`）；`set_index = crc32c(bucket + "/" + key) % sets.len()` 先落公式但取模恒 0——**为 M3 的多 set 留形不留行为**（设计 §5.3 的确定性哈希从第一天就在，rebalance 才需要 >1 set）。
+  - 每盘持有完整命名空间（对象目录 + meta 副本）；EC 分片按 `ShardRef.drive` 分发到 `drives[i]` 下**同构路径**：`<drive>/<bucket>/<展平键>/<uuid>/part.1.<shard>`——换挂载点/换盘不影响寻址（铁律 ⑤）。
+  - **启动校验（含单盘向上兼容裁决——评审补）**：`drives.len() < data + parity` 时不得无条件 Err——单盘/少盘是 M1/M2a 的既有部署形态，升级即破不可接受。裁决：`[ec] enabled` 可配（默认 true）——**enabled=true 且盘数不足 → 构造期 Err**（大声失败，设计 §4.3 的 8+4 需要 ≥12 盘位，测试用 12 个 tempdir）；**enabled=false → 单文件旧形态继续（新写仍走 `data_layout: None`），并 warn 提示无冗余**。README/迁移说明必须写清这条开关。
+- [ ] **Step 2:** 实现 `drives.rs`：`enum DriveState { Up, Missing }`、存活探测（写探针文件）、`shard_path(drives, &ShardRef, bucket, key, uuid)`、quorum 判定。
+- [ ] **Step 3:** `oss-server/config.rs`：`data_dirs: Option<Vec<PathBuf>>`（有它用数组；否则 `data_dir` 单盘兼容）；`[ec] data/parity`、`inline_threshold` 可配；`state.rs` 构造点同步。
+- [ ] **Step 4:** gc/clean 多盘遍历（每盘各自的 `.oss.sys`）；提交 `feat(xl-store): 多盘——drives[]、对象→set 映射（单 set）、分片按拓扑下标分发`。
+
+## Task 8: quorum 写与拔盘容忍
+
+**Files:** Modify: `store/put.rs`、`store/read.rs`、`store/drives.rs`
+
+- [ ] **Step 1: quorum 裁决（写进注释）**：写成功条件 = **成功落盘分片数 ≥ data + 1**（即至少 9/12；可容忍 parity−1=3 片并发失败；已成功片数在 [9,12] 之间即提交）。低于阈值 → 回滚（删已写片）→ `Err(Error::QuorumUnmet)`。读侧容忍 `≤ parity` 片缺失并重建。
+- [ ] **Step 2:** 测试（拔盘模拟 = 把某 drive 目录替换为不可写/移走）：
+  - 12 盘全在：PUT → 12 片齐全；
+  - 移走 2 盘：PUT 成功（10 片）+ GET 成功（重建 2 片）——**设计验收 #1 的本地版**；
+  - 移走 4 盘：GET 成功（边界）、移走 5 盘：GET `Err`；
+  - 移走 4 盘时 PUT：成功片 8 < 9 → `QuorumUnmet` 且已写片被回滚（盘上无残留）；
+  - 回插（移回的目录恢复）：`oss-server scrub`（Task 10）或读重建把缺片补回——**M2b 的写修复最小版**只在读成功后 best-effort 回写坏/缺片（`ponytail: 读时修，无后台 heal；M4 的 heal 任务补全`）。
+- [ ] **Step 3:** meta 复制：每盘的 `<uuid>` 候选 meta 与提交后 meta 在各盘对象目录 **各自写一份**（meta quorum = 全部在册盘；单盘失败不阻提交——与分片 quorum 同阈值）；读 meta 取任意可用盘，**多盘不一致时以 `mod_time_nanos` 最新者胜**（设计铁律 ② 的读侧，M3 的 heal 前置形态）。
+- [ ] **Step 4:** 提交 `feat(xl-store): 写 quorum（≥ data+1）与拔盘容忍——读重建 + 读时修`。
+
+## Task 9: 断电一致性（目录 fsync 复核 + kill -9）
+
+**Files:** Modify: `store/put.rs`（fsync 序）、`store/tests.rs`、`tests/`（进程级用例）
+
+- [ ] **Step 1: 复核现有假设（代码注释已明确挂着）**：「ext4/XFS 隐含提交先前的 rename，故提交点一次 rename 即可；**没有目录 fsync**」。M2b 处置：`fsync=true` 时在**两处 rename 之后**补目录 fsync（封装 `sync_dir(path)`：`File::open(dir)?.sync_all()`，两处 = tmp→对象目录、meta.new→meta）；并在文档标注：目录 fsync 在部分文件系统上返回 EINVAL（忽略并 warn）——物理保证需按盘上文件系统复核。
+- [ ] **Step 2: kill -9 用例**（集成测试形态）：spawn `oss-server` 子进程写入大对象 → 在提交点前 kill -9（用环境变量注入测试钩子：写第 8 片后 `std::process::abort()`——**测试专用 feature/环境变量门控**，不进生产路径）→ 重启 `Store::open` → 断言：对象不可见（或旧版本可见）、自检清掉 tmp 孤儿、`find` 无泄漏半提交数据。
+- [ ] **Step 3:** 把设计验收 #3（rclone 并发 100×100 MB + 中断重试）写为 `tests/e2e_s3.sh` 的可选长跑段（`E2E_LONG=1` 门控，默认跳过——高负载机器上分钟级）。
+- [ ] **Step 4:** 提交 `feat(xl-store): 目录 fsync 复核 + kill -9 断电用例；长跑并发验收入 e2e 门控段`。
+
+### 切片二收尾
+- [ ] 四闸 + e2e（含 12 盘 tempdir 配置的真服务冒烟：`data_dirs` 12 目录起服务，S3 脚本 14 步回归）
+
+---
+
+# 切片三：M2b-3（运维面）
+
+## Task 10: fsck/scrub 起步 + 锁收口
+
+**Files:** Modify: `store/gc.rs`、Create: `store/fsck.rs`（或 gc.rs 内扩展）、`cli.rs`、`store.rs`（锁）
+
+- [ ] **Step 1: fsck**：`oss-server fsck`（新子命令）与启动自检共用：扫全盘（每 drives[i]）——(a) 孤儿版本目录/tmp/trash（M2a 的 reap_stale 升级为多盘遍历）；(b) **逐对象分片巡检**：CRC32C 全检（scrub 的起步版），坏片计数报出、`--repair` 用重建回写（M4 的 heal 前置）；报告落 `.oss.sys/fsck/<时间戳>.json`（设计 §4.1 已预留目录）。**裁决**：`scrub` 独立命令仍是 M4；M2b 提供 `fsck [--repair]`，设计文档的 §M4 验收按此顺延。
+- [ ] **Step 2: 桶级互斥**：既有 `ponytail: 桶级互斥未实现——并发 delete_bucket + put 可让桶「复活」`（store.rs）收口——`delete_bucket` 与 `create/put` 经桶级 `tokio::sync::Mutex`（与 per-object 锁同构的锁表，键 = `bucket:` 前缀区分）；并发用例复刻 `concurrent_puts_to_same_key_serialize` 的形态。
+- [ ] **Step 3: flock 跨进程锁**（设计 §4.4 的 M1–M2 承诺）：`lock_for` 在取进程内锁**同时**取 `<drive0>/.oss.sys/locks/<sha1(bucket/key)>.lock` 的 `flock(LOCK_EX)`（`std::fs::File::lock()`——aetherupload 已用同款）；进程内锁保留（快速路径），flock 是跨进程兜底。**裁决**：只锁 drive0 的锁文件（锁是互斥信号不是数据，无需 12 份）；进程级用例：两个 `Store` 实例（同进程不同实例已够触发 flock 语义）并发写同键，断言串行化。
+- [ ] **Step 4:** 提交 `feat(xl-store): fsck --repair 起步、桶级互斥、flock 跨进程锁`。
+
+## Task 11: 文档与收尾
+
+**Files:** `README.md`、`docs/superpowers/specs/2026-10-10-minio-clone-design.md`（状态注记）、`docs/superpowers/specs/2026-10-10-feature-spec.md`（§3.2 EC 重建措辞、阶段表）、本计划
+
+- [ ] README：架构段加「单机多盘 + EC 8+4」；已知限制更新（内联阈值、`fsck` 用法、目录 fsync 的物理假设）；`oss.toml` 示例补 `data_dirs`/`[ec]`。
+- [ ] 设计文档：M2 行的「已落地」标记（M2b 部分）；§4.4 锁表更新为「已实现」。
+- [ ] 提交 `docs: M2b 落地后同步 README/设计文档边界清单`。
+
+### 切片三收尾
+- [ ] 四闸 + 全量 e2e（含多盘配置冒烟 + `fsck` 实跑输出报告）
+- [ ] 定稿记录：三个切片的四闸实跑、设计 §M2 验收映射、所有裁决与偏差
+
+---
+
+## 四闸与验收（各切片收尾统一跑）
+
+- fmt 无 diff · clippy 0 告警 · `cargo test --workspace -j 2` 全绿 · 相关 e2e（控制台 Playwright + `tests/e2e_s3.sh`）
+- 设计 §M2 验收的自动化映射：
+  | 设计验收 | 本计划覆盖 |
+  |---|---|
+  | #1 拔 2 盘读写照常 | Task 8 的移盘用例（本地版；e2e 长跑可加真挂载点） |
+  | #2 kill -9 无脏数据/无孤儿 | Task 9 的提交点注入用例 + 启动自检 |
+  | #3 rclone 并发 100×100 MB | `E2E_LONG=1` 门控长跑（人工触发） |
+  | #4 2 KB 不产生 13 小文件 | Task 6 的 find 计数用例 |
+  | #5 翻转分片字节读报错 | Task 5 的 CRC32C/SHA256 用例（含翻转走 CRC 与走 SHA256 两条路） |
+
+## 已知风险与处置
+
+| 风险 | 处置 |
+|---|---|
+| rs-erasure 6.0.0 老依赖（parking_lot 0.11/lru 0.7 等）与现代树冲突或编译不过 | 已核实备选 `reed-solomon-simd 3.1.0`（MSRV 1.82）；切换判据：`cargo check` 出现其依赖树的 edition-2024/API 错误即切，改动集中在 ec.rs（顶层语义同类） |
+| EC 全内存（写：payload+12 片；读：重建整份） | ponytail 注释明示；`inline_threshold` 与「单次 PUT ≤ max_put_bytes」共同限定峰值；M2b-3 之后（M2c/M3）用 `ShardByShard` 分块 encode/decode + range 按需重建 |
+| 写 quorum 语义（≥ data+1）在并发失败下的回滚复杂性 | 回滚 = 删已写片目录（未提交前不可见，天然安全）；用例覆盖 8 片成功回滚 |
+| 目录 fsync 在非 ext4/XFS 上语义不一（EINVAL 等） | 忽略并 warn；文档标注「断电零丢失需按文件系统复核」 |
+| golden 字节第二次变更（data_layout/inline 入编码） | meta.rs 既有「有意识更新」流程；摘要常量 + 注记 |
+| 旧代码读 M2b 新对象会找不到 part.N | 方向契约明确：只保证「新解旧」；发布/部署锁步（升级即全量新写） |
+| 单盘形态的 inline 无冗余（meta 只有一份） | 声明为 M2b-1 边界；M2b-2 的 meta 多盘复制落地后冗余成立 |
+| 12 盘起步的测试环境成本（tempdir × 12/用例） | 用例用 12 个 `tempfile::tempdir()`（轻量）；真服务 e2e 用 12 个子目录 |
+| MPU 与新布局的兼容（parts 字段的存废） | Task 6 裁决：新写入统一 EC/内联，`parts` 降为只读兼容位；旧对象读路径回归用例钉死 |
+| `set_index` 公式在单 set 下恒 0（为 M3 留形） | 注释明示「留形不留行为」；M3 引入多 set 时公式行为随拓扑生效 |
+
+## 定稿记录
+
+（实现完成后补：每切片实际形态、四闸实跑、e2e 输出、与本文档的差异裁决。）
