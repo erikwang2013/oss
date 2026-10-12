@@ -128,7 +128,7 @@ fn eval_preconditions(
 
 **Files:** Modify: `crates/xl-s3/src/service.rs`（`get_object`）、`crates/xl-s3/tests/object_ops.rs`、`tests/e2e_s3.sh`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```rust
 #[tokio::test]
@@ -139,9 +139,9 @@ async fn response_content_params_override_headers() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**（`cargo test -p xl-s3 response_content 2>&1 | tail`，预期字段未被覆盖而断言失败）。
+- [x] **Step 2: 跑测试确认失败**（`cargo test -p xl-s3 response_content 2>&1 | tail`，预期字段未被覆盖而断言失败）。
 
-- [ ] **Step 3: 实现**（`get_object` 组装 output 处，最省一档）：
+- [x] **Step 3: 实现**（`get_object` 组装 output 处，最省一档）：
 
 ```rust
 // response-content-* 是响应头覆盖：客户端给什么值就原样下发（含 &filename= 的 RFC 5987
@@ -160,9 +160,9 @@ if let Some(ts) = over.response_expires {
 }
 ```
 
-- [ ] **Step 4: 跑测试** + e2e 补一步：`aws s3api get-object --response-content-disposition 'attachment; filename="dl.txt"' --response-content-type 'text/x-custom'` 后比对输出 JSON 的 `ContentType`/`ContentDisposition` 字段。
+- [x] **Step 4: 跑测试** + e2e 补一步：`aws s3api get-object --response-content-disposition 'attachment; filename="dl.txt"' --response-content-type 'text/x-custom'` 后比对输出 JSON 的 `ContentType`/`ContentDisposition` 字段。
 
-- [ ] **Step 5: 提交**——`git commit -m "feat(s3): response-content-* 查询参数覆盖响应头（含 response-expires 的 HttpDate 格式化）"`
+- [x] **Step 5: 提交**（e2e 覆盖并入收尾轮）——`git commit -m "feat(s3): response-content-* 查询参数覆盖响应头（含 response-expires 的 HttpDate 格式化）"`
 
 ---
 
@@ -308,4 +308,14 @@ impl Stream for ChecksumTailStream {
   - 测试断言「200」须写 `Some(StatusCode::OK)` 而非 `None`——get_object 统一走 `with_status`（初稿断言 None 系笔误，编译/运行两轮修正）。
   - 测试闭包用 `let s3 = &s3;` 借用捕获（否则 `async move` 把 s3 搬进 future，闭包成 FnOnce 只能调用一次）。
   - `eval_preconditions` 的两处 else-if 用 let-chains 收拢（clippy `collapsible_if`，-D warnings 门）。
-- 实跑：xl-s3 20/20（七场景）、workspace 128+1 全绿、clippy 0 告警；e2e_s3.sh 17 步实跑（11b 段）结果随 e2e 报告补记。
+- e2e 实跑（e2e 代理）：**e2e_s3.sh 17 步全绿 rc=0**（含 11b）。两处实跑裁决：
+  ① aws-cli 2.37 对 HEAD 的 304 **不当错误**（退出 0、输出空壳仅 `"Metadata":{}`）——
+  11b 的 304 判别按「成功且无 ContentLength/ETag」写（首版按「非零退出+grep」是假红，已修 471f381）；
+  ② 412 实测报错退出、stderr 含 `(412) … Precondition Failed`；GET 路径同验（304 空壳 / 412 报错）。
+- 实跑：xl-s3 20/20（七场景）、workspace 全绿、clippy 0 告警。
+
+### Task 2（response-content-*）
+
+- 形态与计划一致（可变 out + 六字段覆盖）。**计划勘误**：`Timestamp::format` 吃 `io::Write`，
+  `String` 只实现 `fmt::Write`——计划里「对 String 用 &mut w」写错，实现改 `Vec<u8>` 缓冲再转 String。
+- 实跑：xl-s3 21/21、workspace 全绿、clippy 0 告警；e2e 覆盖并入收尾轮统一跑。
