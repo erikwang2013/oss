@@ -301,7 +301,9 @@ impl Stream for ChecksumTailStream {
 ## 评审收尾轮（reviewer 代理，区间 d055dd1..HEAD）
 
 - **I-1（已修）**：206 分段响应原会回写整对象校验和（SDK 响应校验拿片段验整对象必失败）——
-  改 `status != PARTIAL_CONTENT` 门控回写 + 用例；**M-1（已修）**：同值双声明去重放行、异值仍拒；
+  改 `status != PARTIAL_CONTENT` 门控回写 + 用例；**e2e 代理在修复前的二进制上独立复现了同一缺陷**
+  （aws-cli 实测 `Expected checksum … did not match calculated checksum`），其复现路径已转为 11c 的
+  回归断言（eb55457，带校验和对象做 range GET 须通过客户端默认校验）；**M-1（已修）**：同值双声明去重放行、异值仍拒；
   **M-3（已修）**：ChecksumRecord 解码白名单（algorithm ≤32 / value_base64 ≤128 / 可见 ASCII）；
   **M-2（已标注）**：part 级校验和「未校验」进 README/规格；**O-3（留痕）**：时间条件秒/纳秒精度。
 - 未采（记录在案）：O-1 GET/HEAD 状态码口径两套（等价且有用例注释）；O-2 GET 净增一次 meta 读
