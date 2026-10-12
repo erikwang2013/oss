@@ -77,16 +77,21 @@ cmp "$WORK/range.bin" "$WORK/range.expect"
 
 echo "== 11b. 条件请求（304 / 412）=="
 COND_ETAG=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text | tr -d '"')
-# 304：If-None-Match 命中（aws-cli 把 304/412 当异常退出——抓其输出/报错里的状态码，形态以实测为准）
+# 304：aws-cli 2.37 实测对 HEAD 的 304 **不当错误**——退出 0、输出是空壳（无 ContentLength/ETag/
+# LastModified，仅 "Metadata":{}）；正常 200 的 head-object 必带 ContentLength/ETag。故判别
+# 「成功且输出无 ContentLength/ETag」，不能按「非零退出 + grep 状态码」写（会假红）。
 OUT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-none-match "\"$COND_ETAG\"" 2>&1) \
-  && { echo "If-None-Match 命中应 304，却成功: $OUT"; exit 1; }
-echo "$OUT" | grep -q '304' || { echo "未回 304: $OUT"; exit 1; }
-# 412：If-Match 错值
+  || { echo "If-None-Match 命中应 304（空输出），却报错: $OUT"; exit 1; }
+if echo "$OUT" | grep -qE 'ContentLength|ETag'; then
+  echo "If-None-Match 命中应 304，却返回了 200 的完整输出: $OUT"; exit 1
+fi
+# 412：If-Match 错值（aws-cli 对 412 报错退出，stderr 含 "(412) ... Precondition Failed"，实测）
 OUT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-match '"deadbeef"' 2>&1) \
   && { echo "If-Match 错值应 412，却成功: $OUT"; exit 1; }
 echo "$OUT" | grep -q '412' || { echo "未回 412: $OUT"; exit 1; }
-# 对照：If-Match 命中 → 200 正常
-aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-match "\"$COND_ETAG\"" >/dev/null
+# 对照：If-Match 命中 → 200 完整输出（ContentLength = big.bin 的 10485760）
+OUT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --if-match "\"$COND_ETAG\"" --query ContentLength --output text 2>&1)
+echo "$OUT" | grep -qx '10485760' || { echo "If-Match 命中的 200 输出异常: ContentLength=$OUT"; exit 1; }
 
 echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh
