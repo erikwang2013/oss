@@ -22,7 +22,8 @@ async fn ingest_sink_puts_finished_file_into_store() {
     let group_dir = st.cfg.staging_dir.join("file").join(sub);
     std::fs::create_dir_all(&group_dir).unwrap();
     let body = b"finished upload";
-    let md5 = format!("{:x}", {
+    // digest 0.11 起输出 Array 不再实现 LowerHex，改用 hex::encode
+    let md5 = hex::encode({
         use md5::Digest as _;
         let mut h = md5::Md5::new();
         h.update(body);
@@ -77,7 +78,8 @@ async fn ingest_failure_clears_instant_index() {
     let group_dir = st.cfg.staging_dir.join("file").join(sub);
     std::fs::create_dir_all(&group_dir).unwrap();
     let body = b"doomed upload";
-    let md5 = format!("{:x}", {
+    // digest 0.11 起输出 Array 不再实现 LowerHex，改用 hex::encode
+    let md5 = hex::encode({
         use md5::Digest as _;
         let mut h = md5::Md5::new();
         h.update(body);
@@ -127,7 +129,8 @@ async fn sink_without_bucket_skips_ingest() {
     let group_dir = st.cfg.staging_dir.join("file").join(sub);
     std::fs::create_dir_all(&group_dir).unwrap();
     let body = b"no bucket for this group";
-    let md5 = format!("{:x}", {
+    // digest 0.11 起输出 Array 不再实现 LowerHex，改用 hex::encode
+    let md5 = hex::encode({
         use md5::Digest as _;
         let mut h = md5::Md5::new();
         h.update(body);

@@ -127,7 +127,15 @@ async fn cookie_or_bearer_token_passes() {
     .unwrap();
     assert_eq!(resp.status(), 200, "cookie 形态");
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(json["error"], 0, "预处理应成功（error 为数字 0）");
+    // 2.0 协议：成功响应是 snake_case 的上传结果、没有 error 字段
+    assert!(
+        json["chunk_size"].is_number(),
+        "预处理应成功（拿到 chunk_size）: {json}"
+    );
+    assert!(
+        json.get("error").is_none(),
+        "2.0 成功体不应带 error 字段: {json}"
+    );
 
     let resp = with_form(client.post(&url).bearer_auth(&token))
         .send()
@@ -135,7 +143,7 @@ async fn cookie_or_bearer_token_passes() {
         .unwrap();
     assert_eq!(resp.status(), 200, "Bearer 形态");
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(json["error"], 0);
+    assert!(json["chunk_size"].is_number(), "预处理应成功: {json}");
 
     // 空 cookie 值（`oss_token=`）不遮蔽 Bearer 回退 —— 本轮微收尾的修复点
     let resp = with_form(
@@ -149,7 +157,7 @@ async fn cookie_or_bearer_token_passes() {
     .unwrap();
     assert_eq!(resp.status(), 200, "空 cookie 值应回退到 Bearer");
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(json["error"], 0);
+    assert!(json["chunk_size"].is_number(), "预处理应成功: {json}");
 }
 
 /// 跨面共用：同一次登录的 token，控制面（Bearer 打 /api/v1）与上传口（cookie 打
@@ -191,7 +199,8 @@ async fn login_token_works_on_both_surfaces() {
     .unwrap();
     assert_eq!(resp.status(), 200, "上传口（同 token，cookie 形态）");
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(json["error"], 0);
+    // 2.0 协议：成功体没有 error 字段（同一 token 两面通用）
+    assert!(json["chunk_size"].is_number(), "预处理应成功: {json}");
 }
 
 /// 边界凭据一律 401：空 Bearer（`Authorization: Bearer `）、空 cookie 值且无 Bearer 可回退、

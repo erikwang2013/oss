@@ -28,16 +28,16 @@ sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-toml = "0.9"
+toml = "1.1"
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 # 测试用独立签发器造边界令牌（换 secret 的伪签、绝对 exp 的过期）：jsonwebtoken 只在测试里被引用。
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 md-5.workspace = true
 # bytes 只在集成测试里用（put_object 造体）；sqlx 是 [dependencies] 的重复声明，删
 bytes.workspace = true
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
