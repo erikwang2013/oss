@@ -132,6 +132,9 @@ impl Store {
                 // 单段 PUT 保持与旧文件同形的 None（MPU complete 才写 Some）
                 parts: None,
                 checksum: checksum.clone(),
+                // M2b 起写路径分叉（Task 4/6 落地）；本任务先保持旧形态
+                data_layout: None,
+                inline: None,
             };
             let meta = XlMeta {
                 object_key: key.to_string(),

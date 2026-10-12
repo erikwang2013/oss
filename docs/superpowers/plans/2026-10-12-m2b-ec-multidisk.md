@@ -124,7 +124,7 @@ pub fn crc32c_of(shard: &[u8]) -> u32;
 
 **Files:** Modify: `crates/xl-store/src/meta.rs`
 
-- [ ] **Step 1:** 新字段（**只加 Option，前向兼容契约**；`sample()` 补 `data_layout: None, inline: None`）：
+- [x] **Step 1:** 新字段（**只加 Option，前向兼容契约**；`sample()` 补 `data_layout: None, inline: None`）：
 
 ```rust
 pub struct Version {
@@ -153,9 +153,10 @@ pub struct ShardRef {
 pub struct InlineData { pub bytes: Vec<u8> }   // 上限 inline_threshold，读取端复核
 ```
 
-- [ ] **Step 2:** decode 白名单扩展：`data_layout.shards` 无 uuid 字段（纯下标），但 `inline.bytes` 长度必须 `<= MAX_INLINE`（防解码端被超大分配打爆——**信任边界**）。
-- [ ] **Step 3:** golden 摘要按流程重算（连续第二个有意识变更）；补用例：旧文件（无新字段）解码 → None；新文件 + 旧解码器（FutureVersion 模式）→ 跳过。
-- [ ] **Step 4:** 提交 `feat(xl-store): xl.meta 增 DataLayout/Inline——EC 布局与内联的前向兼容字段`。
+- [x] **Step 2:** decode 白名单扩展（inline ≤ MAX_INLINE=128KiB；
+  data_layout 分片数须等于 data+parity——后者为评审式补强）：`data_layout.shards` 无 uuid 字段（纯下标），但 `inline.bytes` 长度必须 `<= MAX_INLINE`（防解码端被超大分配打爆——**信任边界**）。
+- [x] **Step 3:** golden 摘要按流程重算（第三次：f28d2848…）；旧文件→None、超限/不自洽拒绝用例（连续第二个有意识变更）；补用例：旧文件（无新字段）解码 → None；新文件 + 旧解码器（FutureVersion 模式）→ 跳过。
+- [x] **Step 4:** 提交 `feat(xl-store): xl.meta 增 DataLayout/Inline——EC 布局与内联的前向兼容字段`。
 
 ## Task 4: 单盘 EC 写路径
 

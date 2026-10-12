@@ -258,7 +258,9 @@ impl Store {
             user_metadata: mpu.user_metadata.clone(),
             part: first, // 兼容位：首段副本
             parts: Some(refs),
-            checksum: None, // multipart 组合校验和留 M2b
+            checksum: None,    // multipart 组合校验和留 M2b
+            data_layout: None, // 暂存零件仍是旧形态；Task 6 起 complete 统一走 EC/内联
+            inline: None,
         };
         let meta = XlMeta {
             object_key: key.to_string(),

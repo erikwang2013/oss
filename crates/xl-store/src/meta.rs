@@ -47,6 +47,12 @@ pub struct Version {
     /// multipart 的组合校验和语义留 M2b。
     #[serde(default)]
     pub checksum: Option<ChecksumRecord>,
+    /// M2b：Some = EC 布局（内容以分片为准）；None = M1/M2a 旧形态（读 part/parts）。
+    #[serde(default)]
+    pub data_layout: Option<DataLayout>,
+    /// M2b：小对象内联（读取端按 `MAX_INLINE` 复核）。
+    #[serde(default)]
+    pub inline: Option<InlineData>,
 }
 
 impl Version {
@@ -59,6 +65,9 @@ impl Version {
     }
 }
 
+/// 内联字节上限（解码信任边界：防手工构造/损坏的 meta 触发超大分配）。
+pub const MAX_INLINE: u64 = 128 * 1024;
+
 /// 客户端声明的校验和记录（落盘仅作数据；**校验发生在提交点之前**，由 xl-s3 层完成）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChecksumRecord {
@@ -66,6 +75,37 @@ pub struct ChecksumRecord {
     pub algorithm: String,
     /// base64 编码的摘要（S3 线格式）
     pub value_base64: String,
+}
+
+/// M2b：EC 布局（`Version.data_layout` 为 Some 时，本版本内容以分片为准）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DataLayout {
+    pub data: u8,
+    pub parity: u8,
+    /// 每片定长（含末片补零对齐）
+    pub shard_size: u64,
+    /// 分片引用表（按 shard 下标排列；只存拓扑下标，绝不存绝对路径——铁律 ⑤）
+    pub shards: Vec<ShardRef>,
+}
+
+/// 单片引用：位置 = （盘下标, part 号, 分片下标）三元组。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardRef {
+    /// 拓扑盘下标（单盘恒 0）
+    pub drive: u8,
+    /// M2b 恒 1（与 parts 的多 part 升级位对齐）
+    pub part: u16,
+    /// 0..data+parity
+    pub shard: u8,
+    pub size: u64,
+    /// 单片 CRC32C（读路径坏片检测）
+    pub crc32c: u32,
+}
+
+/// M2b：小对象内联（< inline_threshold 时数据就在 meta 里，不经 EC）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InlineData {
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +144,26 @@ impl XlMeta {
                 return Err(Error::CorruptMeta(format!(
                     "part.uuid 非法: {:?}",
                     v.part.uuid
+                )));
+            }
+            // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）
+            if let Some(inline) = &v.inline
+                && inline.bytes.len() as u64 > MAX_INLINE
+            {
+                return Err(Error::CorruptMeta(format!(
+                    "inline 超上限：{} > {MAX_INLINE}",
+                    inline.bytes.len()
+                )));
+            }
+            // EC 布局基本自洽：分片数必须等于 data+parity（下标型字段，无路径穿越面）
+            if let Some(l) = &v.data_layout
+                && l.shards.len() != (l.data as usize + l.parity as usize)
+            {
+                return Err(Error::CorruptMeta(format!(
+                    "data_layout 分片数不符：{} ≠ {} + {}",
+                    l.shards.len(),
+                    l.data,
+                    l.parity
                 )));
             }
             // checksum 会作为响应头原样回显：磁盘上的 meta 也要天然安全（防御纵深——
@@ -172,6 +232,8 @@ mod tests {
                 },
                 parts: None,
                 checksum: None,
+                data_layout: None,
+                inline: None,
             }],
         }
     }
@@ -323,13 +385,14 @@ mod tests {
         assert_eq!(bytes[0], FORMAT_VERSION);
         // 已人工核对：首字节 01；version_id 为 bin8（c4 10 + 16 字节全零）；
         // M2a Task 5 起 Version 增加 parts 字段（单段写 nil）、协议补全 Task 3 起增加 checksum 字段
-        //（默认 nil），摘要均按「有意识更新」流程重算。
+        //（默认 nil）、M2b Task 3 起增加 data_layout/inline 字段（默认 nil），摘要均按
+        //「有意识更新」流程重算（本次为第三次）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "2af7eeed9ca496bfae3054dbcb8362286564abab151cd277f00b0ffc5ac50257"
+            "f28d2848491af2ee87fad0a6629bc767c52644bc07617f860cbf0af234503ffe"
         );
     }
 }
@@ -354,6 +417,8 @@ mod parts_tests {
             },
             parts,
             checksum: None,
+            data_layout: None,
+            inline: None,
         }
     }
 
@@ -430,6 +495,74 @@ mod parts_tests {
             object_key: "a".into(),
             versions: vec![v],
         }
+    }
+
+    #[test]
+    fn decode_old_file_without_layout_fields_is_none() {
+        // 前向兼容另一半：旧文件（无 data_layout/inline 字段）解码 → None（有意识降级为旧形态读）
+        let m = version(None);
+        let bytes = XlMeta {
+            object_key: "a".into(),
+            versions: vec![m],
+        }
+        .encode()
+        .unwrap();
+        let back = XlMeta::decode(&bytes).unwrap();
+        assert!(back.versions[0].data_layout.is_none());
+        assert!(back.versions[0].inline.is_none());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_inline() {
+        // 信任边界：inline 超 MAX_INLINE 一律拒（防损坏 meta 触发超大分配）
+        let mut v = version(None);
+        v.inline = Some(InlineData {
+            bytes: vec![0u8; MAX_INLINE as usize + 1],
+        });
+        let bytes = XlMeta {
+            object_key: "a".into(),
+            versions: vec![v],
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
+
+        // 上限之内照常
+        let mut ok = version(None);
+        ok.inline = Some(InlineData {
+            bytes: vec![7u8; 32],
+        });
+        let bytes = XlMeta {
+            object_key: "a".into(),
+            versions: vec![ok],
+        }
+        .encode()
+        .unwrap();
+        assert!(XlMeta::decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn decode_rejects_inconsistent_shard_count() {
+        let mut v = version(None);
+        v.data_layout = Some(DataLayout {
+            data: 8,
+            parity: 4,
+            shard_size: 4,
+            shards: vec![ShardRef {
+                drive: 0,
+                part: 1,
+                shard: 0,
+                size: 4,
+                crc32c: 1,
+            }], // 1 片 ≠ 8+4
+        });
+        let bytes = XlMeta {
+            object_key: "a".into(),
+            versions: vec![v],
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
     }
 
     #[test]
