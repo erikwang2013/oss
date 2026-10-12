@@ -106,6 +106,20 @@ impl XlMeta {
                     v.part.uuid
                 )));
             }
+            // checksum 会作为响应头原样回显：磁盘上的 meta 也要天然安全（防御纵深——
+            // 入网侧值必须等于实算摘要才可能落盘，此为手工构造/损坏文件的兜底）。
+            if let Some(c) = &v.checksum {
+                let ok = |s: &str, max: usize| {
+                    !s.is_empty() && s.len() <= max && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                };
+                if !ok(&c.algorithm, 32) || !ok(&c.value_base64, 128) {
+                    return Err(Error::CorruptMeta(format!(
+                        "checksum 字段非法: algorithm={:?} value_len={}",
+                        c.algorithm,
+                        c.value_base64.len()
+                    )));
+                }
+            }
             // 多段（Multipart）的 parts[].uuid 同样进读路径（dir.join(uuid)），同一套白名单收口
             if let Some(parts) = &v.parts {
                 for p in parts {
@@ -387,6 +401,35 @@ mod parts_tests {
         };
         let bytes = m.encode().unwrap();
         assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
+    }
+
+    #[test]
+    fn decode_rejects_unsafe_checksum_record() {
+        // checksum 会作为响应头回显：非法字符/超长在解码即拒（磁盘侧防御纵深）
+        for bad in [
+            meta_checksum("SHA256", "AA\nBB"),
+            meta_checksum("SHA256", &"A".repeat(200)),
+            meta_checksum("坏算法", "AAAA"),
+            meta_checksum("", "AAAA"),
+        ] {
+            let bytes = bad.encode().unwrap();
+            assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
+        }
+        // 合法值照常解码
+        let ok = meta_checksum("SHA256", "uiDrfZrla2mExtJI5U9Pqm9eMzAbCJ3tgpddwnU6cLg=");
+        assert!(XlMeta::decode(&ok.encode().unwrap()).is_ok());
+    }
+
+    fn meta_checksum(algorithm: &str, value: &str) -> XlMeta {
+        let mut v = version(None);
+        v.checksum = Some(ChecksumRecord {
+            algorithm: algorithm.into(),
+            value_base64: value.into(),
+        });
+        XlMeta {
+            object_key: "a".into(),
+            versions: vec![v],
+        }
     }
 
     #[test]

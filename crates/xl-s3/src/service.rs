@@ -88,7 +88,7 @@ fn stream_err_to_s3(
 }
 
 /// 校验和算法（本计划覆盖 s3s 输入里显式声明的那几种；组合语义留 M2b）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChecksumAlgo {
     Md5,
     Crc32,
@@ -169,15 +169,20 @@ fn declared_checksum(
             Ok(None)
         }
         1 => Ok(Some(declared.remove(0))),
-        // 多值并存：S3 未定义交叉校验，明确拒绝优于静默取一（算法名进日志便于排查）
+        // 多个声明：**完全同值**（如 content_md5 与 x-amz-checksum-md5 同值）视为一份；
+        // 任一不同 → 拒绝（S3 未定义交叉校验，明确拒绝优于静默取一；算法名进日志便于排查）
         _ => {
+            let first = declared[0].clone();
+            if declared.iter().all(|d| *d == first) {
+                return Ok(Some(first));
+            }
             tracing::warn!(
                 algorithms = ?declared.iter().map(|(a, _)| a.name()).collect::<Vec<_>>(),
-                "请求声明了多个校验和，拒绝"
+                "请求声明了多个不一致的校验和，拒绝"
             );
             Err(s3s::s3_error!(
                 InvalidRequest,
-                "multiple checksums declared"
+                "conflicting checksums declared"
             ))
         }
     }
@@ -291,6 +296,8 @@ fn eval_preconditions(
         // ponytail: 弱校验语义（W/ 差异）不细分；有真实互操作诉求时按 RFC 9110 §8.8.3 收严
         ETagCondition::ETag(e) => e.value() == info.etag,
     };
+    // ponytail: 时间条件按存盘纳秒与客户端时间直比——客户端回显的 Last-Modified 是秒精度，
+    // 毫秒级零头会让 If-Modified-Since 偶发多回一次 200；RFC 按秒比，行为无害，留痕即可
     let last = last_modified(info.last_modified_nanos);
     if let Some(c) = if_match {
         if !etag_matches(c) {
@@ -696,8 +703,11 @@ impl S3 for OssS3 {
             out.expires = Some(String::from_utf8(buf).expect("HttpDate 只含 ASCII"));
         }
 
-        // 校验和回写（GET）
-        if let Some(rec) = &info.checksum {
+        // 校验和回写（GET）：仅整读（200）——206 的 body 只是片段，回整对象校验和会让
+        // 客户端的响应校验（新版 AWS SDK 默认开启）必然失败；S3 对分段响应也不返回整对象校验和。
+        if status != StatusCode::PARTIAL_CONTENT
+            && let Some(rec) = &info.checksum
+        {
             apply_checksum_get(&mut out, rec);
         }
 

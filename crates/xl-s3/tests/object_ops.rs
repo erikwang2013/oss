@@ -1414,6 +1414,38 @@ async fn checksum_verified_before_commit_and_written_back() {
         .await
         .unwrap_err();
     assert_eq!(err_algo_only.code(), &s3s::S3ErrorCode::InvalidRequest);
+
+    // ⑥ 同值双声明（content_md5 与 x-amz-checksum-md5 同值）→ 视为一份，放行
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "dup".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+        content_md5: Some(md5_b64.clone()),
+        checksum_md5: Some(md5_b64.clone()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // ⑦ 206 分段响应**不得**回整对象校验和（SDK 响应校验会拿片段验整对象而失败）
+    let ranged = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "ck".into(),
+            range: Some(Range::Int {
+                first: 0,
+                last: Some(3),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(ranged.status, Some(http::StatusCode::PARTIAL_CONTENT));
+    assert!(
+        ranged.output.checksum_sha256.is_none(),
+        "206 不得回写整对象校验和: {:?}",
+        ranged.output.checksum_sha256
+    );
 }
 
 #[tokio::test]

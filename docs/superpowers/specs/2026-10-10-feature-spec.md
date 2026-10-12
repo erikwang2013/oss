@@ -203,7 +203,7 @@
 | `x-amz-tagging` | ❌（M4） | |
 | `x-amz-object-lock-*` | ❌（M5） | |
 | `Content-MD5` | ✅（协议补全计划 Task 3 落地） | 与计算值不符 → `BadDigest`（提交点前 fail-closed，对象不落盘） |
-| `x-amz-checksum-*` | ✅（协议补全计划 Task 3 落地；CRC32C/SHA1/SHA256/SHA512/CRC64NVME 校验并回写，组合语义留 M2b） | |
+| `x-amz-checksum-*` | ✅（协议补全计划 Task 3 落地；单段 PUT 校验并回写，CRC32C/SHA1/SHA256/SHA512/CRC64NVME，206 不回写；**part 级校验和未校验、组合语义留 M2b**） | |
 
 **边界**：M2a 起流式直通内核（不再整份读内存），单次 PUT/单 part 仍受 `max_put_bytes` 上限。
 
