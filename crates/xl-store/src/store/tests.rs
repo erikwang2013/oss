@@ -1,4 +1,6 @@
 use super::*;
+// 拆分后 tests 不再经 store.rs 蹭到 Digest trait（md5/sha2 的 new/finalize 需要）
+use md5::Digest as _;
 
 async fn store() -> (Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
