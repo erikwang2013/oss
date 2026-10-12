@@ -1210,3 +1210,68 @@ async fn conditional_requests_follow_rfc9110() {
         .unwrap();
     assert_eq!(head_304.status, Some(http::StatusCode::NOT_MODIFIED));
 }
+
+#[tokio::test]
+async fn response_content_params_override_headers() {
+    // S3 协议补全 Task 2：response-content-* 查询参数覆盖响应头（含 response-expires 的 HttpDate）
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "rc".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        content_type: Some("text/plain".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // 未带参数：对象自有 content_type 原样，覆盖字段为 None
+    let plain = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "rc".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(plain.content_type.as_deref(), Some("text/plain"));
+    assert!(plain.content_disposition.is_none());
+
+    // 全带：逐字段覆盖（filename 的 RFC 5987 编码由客户端负责，服务端原样透传）
+    let expires = s3s::dto::Timestamp::from(
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+    );
+    let over = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "rc".into(),
+            response_content_type: Some("text/x-custom".into()),
+            response_content_disposition: Some("attachment; filename*=UTF-8''%E6%B5%8B.txt".into()),
+            response_cache_control: Some("no-store".into()),
+            response_content_language: Some("zh-CN".into()),
+            response_content_encoding: Some("identity".into()),
+            response_expires: Some(expires),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(over.content_type.as_deref(), Some("text/x-custom"));
+    assert_eq!(
+        over.content_disposition.as_deref(),
+        Some("attachment; filename*=UTF-8''%E6%B5%8B.txt")
+    );
+    assert_eq!(over.cache_control.as_deref(), Some("no-store"));
+    assert_eq!(over.content_language.as_deref(), Some("zh-CN"));
+    assert_eq!(over.content_encoding.as_deref(), Some("identity"));
+    // HttpDate 形态：形如 "Sun, 12 Oct 2026 05:00:00 GMT"
+    let exp = over.expires.expect("expires 应被设置");
+    assert!(exp.ends_with("GMT"), "HttpDate 形态: {exp}");
+}

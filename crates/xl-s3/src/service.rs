@@ -452,21 +452,44 @@ impl S3 for OssS3 {
         };
         let len = bytes.len() as i64;
 
-        Ok(S3Response::with_status(
-            GetObjectOutput {
-                body: Some(StreamingBlob::from_bytes(bytes)),
-                content_length: Some(len),
-                content_type: info.content_type,
-                e_tag: Some(ETag::Strong(info.etag)),
-                last_modified: Some(last_modified(info.last_modified_nanos)),
-                accept_ranges: Some("bytes".to_string()),
-                content_range,
-                // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
-                metadata: Some(info.user_metadata.into_iter().collect()),
-                ..Default::default()
-            },
-            status,
-        ))
+        let mut out = GetObjectOutput {
+            body: Some(StreamingBlob::from_bytes(bytes)),
+            content_length: Some(len),
+            content_type: info.content_type,
+            e_tag: Some(ETag::Strong(info.etag)),
+            last_modified: Some(last_modified(info.last_modified_nanos)),
+            accept_ranges: Some("bytes".to_string()),
+            content_range,
+            // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
+            metadata: Some(info.user_metadata.into_iter().collect()),
+            ..Default::default()
+        };
+        // response-content-* 是响应头覆盖：客户端给什么值就原样下发（含 &filename= 的 RFC 5987
+        // 编码由客户端负责——服务端无编码逻辑，见规格 §3.2）。
+        if let Some(v) = req.input.response_content_type {
+            out.content_type = Some(v);
+        }
+        if let Some(v) = req.input.response_content_disposition {
+            out.content_disposition = Some(v);
+        }
+        if let Some(v) = req.input.response_cache_control {
+            out.cache_control = Some(v);
+        }
+        if let Some(v) = req.input.response_content_language {
+            out.content_language = Some(v);
+        }
+        if let Some(v) = req.input.response_content_encoding {
+            out.content_encoding = Some(v);
+        }
+        if let Some(ts) = req.input.response_expires {
+            // Timestamp::format 吃 io::Write；String 只有 fmt::Write——用 Vec<u8> 缓冲再转
+            let mut buf = Vec::new();
+            ts.format(TimestampFormat::HttpDate, &mut buf)
+                .expect("HttpDate 格式化到 Vec 不会失败");
+            out.expires = Some(String::from_utf8(buf).expect("HttpDate 只含 ASCII"));
+        }
+
+        Ok(S3Response::with_status(out, status))
     }
 
     async fn head_object(
