@@ -359,9 +359,12 @@ impl Db {
                 .await?
                 .rows_affected()
         } else {
+            // 评审 nit①：守卫只对「把**在册**管理员停掉」生效；对已停用者重复停用是幂等
+            // no-op（不触碰计数），否则会误报「不能停用最后一个在册管理员」。
             sqlx::query(
                 "UPDATE users SET status = 'disabled' WHERE id = ? AND \
-                 (is_admin = 0 OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
+                 (NOT (is_admin = 1 AND status = 'active') \
+                  OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
             )
             .bind(uid)
             .execute(&self.pool)
@@ -854,6 +857,16 @@ mod tests {
         assert!(db.get_user(admin).await.unwrap().is_some());
         assert!(db.delete_user(sub).await.unwrap(), "非管理员恒可删");
         assert!(!db.set_user_status(999, true).await.unwrap());
+
+        // 评审 nit①：对「已停用」的管理员停用是幂等 no-op——不得被计数守卫误杀
+        //（守卫只拦「把在册管理员停掉且会留下 0 在册」）。此处 admin2 已被删除，
+        // 先造一个已停用的管理员：admin 在册，把另一名管理员停用后重复停用。
+        let admin3 = db.create_user("root3", "pw", true).await.unwrap();
+        assert!(db.set_user_status(admin3, false).await.unwrap());
+        assert!(
+            db.set_user_status(admin3, false).await.unwrap(),
+            "对已停用管理员重复停用：幂等 no-op，不得被守卫误杀"
+        );
     }
 
     /// ensure_columns 幂等：老库（无 status 列）升级补列；再开一次不得重复 ALTER 报错。

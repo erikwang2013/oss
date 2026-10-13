@@ -193,7 +193,8 @@ echo "== 15. 子账户权限（三档读/写/删在 S3 面的执行）=="
 # 全量替换权限行（先只授「读」）；子账户自签第二把 AK/SK（POST /access-keys）后走 aws-cli：
 #   授权桶 ls/get 放行；只授读时上传 403；未授权桶 ls 403 AccessDenied；匿名 403；
 #   补授写后上传放行；ListBuckets 只见授权桶（服务端按可见集过滤）；
-#   停用账号 → 同一 AK 立即 403（InvalidAccessKeyId，认证层拦截）→ 启用恢复（15h，排在清理前）。
+#   停用账号 → 同一 AK 立即 403（InvalidAccessKeyId，认证层拦截）→ 旧 JWT 打控制台端点 401
+#   （含 POST /buckets、POST /access-keys 两条副作用口）→ 启用恢复（15h，排在清理前）。
 # 管理员账号默认 erik/changeme（README 引导段），可用 ADMIN_USER/ADMIN_PASSWORD 覆盖。
 ADMIN_USER="${ADMIN_USER:-erik}"; ADMIN_PASSWORD="${ADMIN_PASSWORD:-changeme}"
 ADMIN_TOKEN=$(curl -s -X POST "$ENDPOINT/api/v1/login" -H 'content-type: application/json' \
@@ -266,10 +267,21 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SU
 [ "$CODE" = "204" ] || { echo "停用应 204，实际 $CODE"; exit 1; }
 OUT=$(sub_aws s3 ls 2>&1) && { echo "停用后 AK 仍可用: $OUT"; exit 1; }
 echo "$OUT" | grep -q '(InvalidAccessKeyId)' || { echo "停用后应报 InvalidAccessKeyId: $OUT"; exit 1; }
+# 停用期间：旧 JWT 打控制台「遮面端点」也必须 401（评审 P1 回归）——挑两条带副作用的：
+# POST /buckets（防「拒绝但已建出桶」，启用后复查）与 POST /access-keys（防停用期铸新 AK）
+DIS_B="zzz-dis-sub-$SUB_ID"
+CJ=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ENDPOINT/api/v1/buckets" \
+  -H "authorization: Bearer $SUB_TOKEN" -H 'content-type: application/json' -d "{\"name\":\"$DIS_B\"}")
+[ "$CJ" = "401" ] || { echo "停用后旧 JWT 建桶应 401，实际 $CJ"; exit 1; }
+CJ=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ENDPOINT/api/v1/access-keys" \
+  -H "authorization: Bearer $SUB_TOKEN" -H 'content-type: application/json' \
+  -d "{\"access_key\":\"DISABLED${SUB_ID}ACCESSKEY\",\"secret_key\":\"disabled-secret-0123456789\"}")
+[ "$CJ" = "401" ] || { echo "停用后旧 JWT 铸 AK 应 401，实际 $CJ"; exit 1; }
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB_ID/status" \
   -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"active":true}')
 [ "$CODE" = "204" ] || { echo "启用应 204，实际 $CODE"; exit 1; }
 sub_aws s3 ls | grep -q "$PERM_BUCKET" || { echo "启用后 AK 未恢复"; exit 1; }
+if aws_s3 ls | grep -q "$DIS_B"; then echo "停用期拒绝却建出了桶"; exit 1; fi
 
 echo "--- 15g. 清理：删两个桶 + 删子账户 ---"
 aws_s3 rb "s3://$PERM_BUCKET" --force >/dev/null

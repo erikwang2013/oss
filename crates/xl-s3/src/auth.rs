@@ -165,4 +165,18 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(err.message(), Some("internal error"), "5xx 不泄漏内部细节");
     }
+
+    /// 账号停用（users.status）→ AK 在**认证层**即失效（评审补测；e2e_s3.sh 15h 有端到端版）。
+    #[tokio::test]
+    async fn disabled_user_key_is_rejected_at_auth_layer() {
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        sqlx::query("UPDATE users SET status = 'disabled' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_key(&pool, "AKIA_DISABLED", "SK", None).await;
+        let auth = SigV4Auth::new(pool);
+        assert_invalid_ak(&auth.get_secret_key("AKIA_DISABLED").await.unwrap_err());
+    }
 }
