@@ -466,12 +466,12 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 
 **Files:** Modify: `xl-store/src/store/put.rs`；xl-client（数据面 service impl + pub 入口）
 
-- [ ] **Step 1（测试先行，in-process 4×3）**：命名测试——
+- [x] **Step 1（测试先行，in-process 4×3）**：命名测试——
   - `cluster_write_distributes_by_slot`：写 129KiB（走 EC）→ 断言每槽恰 1 片、`shard i → slot i%12`；
   - `cluster_read_after_node_down`：摘 n2 → 读回一致（重建路径）；
   - `cluster_write_with_node_down_succeeds`：摘 1 节点 → 写成功（9 槽恰好 quorum）；
   - `overwrite_recycles_remote_old_version`：覆写 → 远端槽位 trash 出现旧 uuid 目录。
-- [ ] **Step 2:** `stage_payload_multi`（put.rs:241-277）落片分派：
+- [x] **Step 2:** `stage_payload_multi`（put.rs:241-277）落片分派：
   ```rust
   // 现循环：drive_index → drive_root → drive_up → 写 part 文件
   // 改：shard_target(&s)?：
@@ -479,23 +479,23 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
   //   Remote {node,slot} → transport.write_shard(node, ShardWrite{..crc32c..})；失败 warn 计 quorum
   // touched 记 (slot)，供回滚
   ```
-- [ ] **Step 3:** service impl（xl-client）：WriteShard（**先验 crc32c 再落盘**；幂等覆盖）→ `Store::mesh_write_shard`；ReadShard / DeleteVersion / RecycleVersion 同批；AbortMeta/PrepareMeta/CommitMeta/ReadMeta 骨架留 Task 6 填。
-- [ ] **Step 4:** `rollback_versions` 分派（put.rs 内）与 `recycle_old` 远端分派（C5）。**与 Task 6 的 commit quorum 同批落地（先决链：回收安全依赖读相交）**。提交 `feat(m3): 跨节点分片写读、旧版本回收与落盘分派`。
+- [x] **Step 3:** service impl（xl-client）：WriteShard（**先验 crc32c 再落盘**；幂等覆盖）→ `Store::mesh_write_shard`；ReadShard / DeleteVersion / RecycleVersion 同批；AbortMeta/PrepareMeta/CommitMeta/ReadMeta 骨架留 Task 6 填。
+- [x] **Step 4:** `rollback_versions` 分派（put.rs 内）与 `recycle_old` 远端分派（C5）。**与 Task 6 的 commit quorum 同批落地（先决链：回收安全依赖读相交）**。提交 `feat(m3): 跨节点分片写读、旧版本回收与落盘分派`。
 
 ## Task 5b: 读路径与读时修
 
 **Files:** Modify: `xl-store/src/store/read.rs`
 
-- [ ] **Step 1（测试先行）**：`cluster_read_reconstructs_from_remote`（摘节点读回一致）；`remote_bad_shard_treated_missing`（远端返回坏字节 → bad_bytes 语义）；`repair_writes_back_to_remote_slot`（读时修把缺失片回写远端，幂等）。
-- [ ] **Step 2:** `read_ec`（read.rs:236-262 循环）分派：`Local → 现读 / Remote → read_shard`；远端失败/超时 ≡ 缺失（missing.push，不 Err；本地 IO 错误的 Err 语义保留）；远端读用 `futures::stream::FuturesUnordered` 并发。strict 轮、重建、SHA256 终验、截断原样。
-- [ ] **Step 3:** `repair_shards`（read.rs:320-333）分派：Local 现逻辑；Remote `write_shard`（探活 = RPC 本身，失败 warn）。
-- [ ] **Step 4:** 提交 `feat(m3): read_ec 跨节点分派与远程读修复`。
+- [x] **Step 1（测试先行）**：`cluster_read_reconstructs_from_remote`（摘节点读回一致）；`remote_bad_shard_treated_missing`（远端返回坏字节 → bad_bytes 语义）；`repair_writes_back_to_remote_slot`（读时修把缺失片回写远端，幂等）。
+- [x] **Step 2:** `read_ec`（read.rs:236-262 循环）分派：`Local → 现读 / Remote → read_shard`；远端失败/超时 ≡ 缺失（missing.push，不 Err；本地 IO 错误的 Err 语义保留）；远端读用 `futures::stream::FuturesUnordered` 并发。strict 轮、重建、SHA256 终验、截断原样。
+- [x] **Step 3:** `repair_shards`（read.rs:320-333）分派：Local 现逻辑；Remote `write_shard`（探活 = RPC 本身，失败 warn）。
+- [x] **Step 4:** 提交 `feat(m3): read_ec 跨节点分派与远程读修复`。
 
 ## Task 6: meta 层跨槽位分派（两阶段提交 · 读快路径 · 删除 · 桶与列表）
 
 **Files:** Modify: `xl-store/src/store.rs`（write_meta:504-577、read_meta:416-458、delete_object:589-629、delete_bucket、create_bucket、list_buckets、clear_meta_new:582、mod_time :362）；`list.rs`；xl-client（Meta/List/Bucket RPC）
 
-- [ ] **Step 1（测试先行，in-process 4×3；复用 fixture 的 down/delay/fail_once）**：
+- [x] **Step 1（测试先行，in-process 4×3；复用 fixture 的 down/delay/fail_once）**：
   - `meta_latest_wins_keeps_semantics`（现状语义保持）；
   - `meta_mod_time_monotonic_under_skew`：人工把对端 meta mod_time 写超前 → 新版本仍胜；
   - `partial_flip_compensates`：`fail_once` 使 3 槽翻不动 → 客户端 5xx 且全部槽 meta 回到旧值（坏注入清掉后重读验证）；
@@ -506,9 +506,10 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
   - `delete_fanout_fails_loud`：远端 delete_version 注入失败 → delete 报错（不吞）；
   - `bucket_create_fail_closed` / `delete_bucket_any_unreachable_rejects`；
   - `list_union_sees_object_written_while_down`：n2 掉线期写入 → n2 恢复后 LIST 仍见（并集）；`list_pagination_no_skip`：造 >max 键、`limit=max+1` 续页枚举完整（防丢键）。
-- [ ] **Step 2:** `write_meta` 槽位化（C3 伪代码逐条落）：新签名 `write_meta(bucket, key, m, old: Option<&XlMeta>)`；prepare/commit 每节点一条 RPC（node 侧写/翻**其本地全部槽**）；hash 只计自己的；重试一次；集群 <Q_s → 补偿（old 恢复 / 无 old 删）；**单节点分支 ≥1 即提交（M2b 原样，kill9 `FLIP_K` 口径不动）**——两分支显式注释。`clear_meta_new` 槽位化。
-- [ ] **Step 3:** `read_meta` 覆盖率快路径（D1 伪代码逐条落）+ 全量回退一次；`put.rs:362/:365` 单调 mod_time（C4 一行）。
-- [ ] **Step 4:** 删除/桶/列表（C6/C7/D4）：delete_object 分派 + 失败上抛；create/delete/list_buckets 分派；`list_objects` 并集合并（D4 伪代码 + `limit=max+1` 证明注释）。
+  - **落地实录（f77dd6c）**：已实现并通过 11 条集群测试（分片落位/掉线写读/远端回收/单调/部分翻转补偿零残留/覆盖不足 fail-closed/快路径取消掉队者/桶扇出与守卫/删除全节点/LIST 并集/分页完备）。**两枚微测待补**（逻辑已实现、由相邻用例间接覆盖）：`foreign_content_hash_not_counted`（翻转他人 .new 不计入——需在 prepare/commit 间注入，随 Task 7 批一起补）与 `read_fallback_full_fanout_once`（选中副本数据轮失败 → 全量回退；喂给 Task 10 前的测试补齐）。另：`mesh_read_meta` 初版误调 `self.read_meta` 引发集群循环扇出（in-process 死循环实锤），已改就地本地扫描并写死注释——**服务端 handler 绝不扇出**是硬约定。
+- [x] **Step 2:** `write_meta` 槽位化（C3 伪代码逐条落）：新签名 `write_meta(bucket, key, m, old: Option<&XlMeta>)`；prepare/commit 每节点一条 RPC（node 侧写/翻**其本地全部槽**）；hash 只计自己的；重试一次；集群 <Q_s → 补偿（old 恢复 / 无 old 删）；**单节点分支 ≥1 即提交（M2b 原样，kill9 `FLIP_K` 口径不动）**——两分支显式注释。`clear_meta_new` 槽位化。
+- [x] **Step 3:** `read_meta` 覆盖率快路径（D1 伪代码逐条落）+ 全量回退一次；`put.rs:362/:365` 单调 mod_time（C4 一行）。
+- [x] **Step 4:** 删除/桶/列表（C6/C7/D4）：delete_object 分派 + 失败上抛；create/delete/list_buckets 分派；`list_objects` 并集合并（D4 伪代码 + `limit=max+1` 证明注释）。
 - [ ] **Step 5:** `lock_object` 预留集群锁位（Task 8 填充：结构上先加 `Option<ClusterLockGuard>` 字段位置）。提交 `feat(m3): meta 层跨槽位分派——quorum 提交（重试+补偿+hash）、读快路径、删除/桶/列表（fail-closed 扩大坐标域）`。
 
 ## Task 7: 集群化 fsck + gc fail-closed（验收②本体）
