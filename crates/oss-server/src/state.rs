@@ -142,9 +142,25 @@ impl AppState {
             (Err(_), Err(_)) => {}
         }
 
-        // 每个上传分组对应的桶，启动时确保存在（内核 + 控制面各一份记录）
+        // 每个上传分组对应的桶，启动时确保存在（内核 + 控制面各一份记录）。
+        // 集群：滚动启动时对端可能尚未就绪——**本地确保 + 广播尽力**（严格 fail-closed
+        // 留给运行时的用户请求；缺口由写路径懒自愈与 fsck 差集补齐兜底）。
+        // 实弹教训：docker 集群栈里 n1 先于对端启动，严格扇出会让启动即退。
         for g in &cfg.groups {
-            if !store.bucket_exists(&g.bucket).await? {
+            if cfg.cluster.is_some() {
+                store.mesh_ensure_bucket(&g.bucket).await?;
+                if let Some(cl) = store.cluster() {
+                    let self_id = cl.topo.self_node().id.clone();
+                    for n in &cl.topo.nodes {
+                        if n.id == self_id {
+                            continue;
+                        }
+                        if let Err(e) = cl.transport.ensure_bucket(&n.id, &g.bucket).await {
+                            tracing::warn!(node = %n.id, bucket = %g.bucket, error = %e, "启动建桶广播未达（滚动启动正常；懒自愈/fsck 兜底）");
+                        }
+                    }
+                }
+            } else if !store.bucket_exists(&g.bucket).await? {
                 store.create_bucket(&g.bucket).await?;
             }
             db.insert_bucket(&g.bucket, None).await?;

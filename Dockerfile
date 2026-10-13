@@ -7,7 +7,12 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p oss-server
+# BuildKit 缓存挂载：registry 与 target 复用，迭代重编从「全量 ~10 分钟」降到分钟级；
+# 二进制在同一 RUN 内拷出挂载（挂载不跨层持久）
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p oss-server \
+    && cp target/release/oss-server /oss-server-bin
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -15,7 +20,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 10001 oss
 WORKDIR /app
-COPY --from=build /src/target/release/oss-server /usr/local/bin/oss-server
+COPY --from=build /oss-server-bin /usr/local/bin/oss-server
 # 默认单机配置（compose 可只读挂载覆盖：docker/oss.toml 或 docker/cluster/n*/oss.toml）
 COPY docker/oss.toml /app/oss.toml
 RUN mkdir -p /data /staging && chown -R oss:oss /data /staging /app

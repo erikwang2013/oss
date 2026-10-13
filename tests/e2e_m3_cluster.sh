@@ -70,6 +70,13 @@ drive_count = 3
 id = "n4"
 addr = "127.0.0.1:${GRPCP[3]}"
 drive_count = 3
+
+# 组桶引导 + 滚动启动的回归钉（实弹：严格扇出曾让先启节点启动即退——引导路径已容错）
+[[groups]]
+group = "file"
+bucket = "files"
+max_size = 0
+extensions = []
 EOF
 done
 
