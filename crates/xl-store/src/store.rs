@@ -48,6 +48,8 @@ pub struct StoreConfig {
     /// 获取重试次数与退避抖动区间 `(lo, hi)` ms（生产默认 10 次 / 50–200ms）。
     pub cluster_lock_retries: u32,
     pub cluster_lock_backoff_ms: (u64, u64),
+    /// M3 控制面读扇出的服务端执行器（Task 9；oss-server 注入 sqlx 实现）。
+    pub control: Option<Arc<dyn crate::mesh::ControlBackend>>,
 }
 
 impl StoreConfig {
@@ -61,6 +63,7 @@ impl StoreConfig {
             cluster_lock_ttl_ms: 10_000,
             cluster_lock_retries: 10,
             cluster_lock_backoff_ms: (50, 200),
+            control: None,
         }
     }
 

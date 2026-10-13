@@ -23,13 +23,17 @@ use xl_s3::service::OssS3;
 pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     // s3s 0.17 的 builder 是 `&mut self` 风格，不能链式调用
     // 授权门：Acl 同时给 service（ListBuckets 过滤/建桶记账）与 access 层（set_access）
-    let acl = xl_s3::access::Acl::new(state.db.pool().clone());
+    // Task 9：集群时 Acl/SigV4Auth 接控制面读扇出（本地 miss → peers；写仍本地，M9 收口）
+    let acl = state.acl();
     let mut s3_builder = S3ServiceBuilder::new(OssS3::new(
         Arc::clone(&state.store),
         acl.clone(),
         state.cfg.max_put_bytes,
     ));
-    s3_builder.set_auth(SigV4Auth::new(state.db.pool().clone()));
+    s3_builder.set_auth(SigV4Auth::with_mesh(
+        state.db.pool().clone(),
+        state.control_mesh(),
+    ));
     s3_builder.set_access(acl);
     let s3 = s3_builder.build();
 

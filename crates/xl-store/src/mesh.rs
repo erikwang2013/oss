@@ -164,7 +164,7 @@ pub enum ControlQuery {
     BucketOwner(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ControlRow {
     pub uid: Option<i64>,
     pub is_admin: Option<bool>,
@@ -172,6 +172,15 @@ pub struct ControlRow {
     pub secret: Option<String>,
     pub flag: Option<bool>,
     pub names: Option<Vec<String>>,
+}
+
+/// 控制面后端（Task 9）：服务端**本地**查询执行器。oss-server 注入 sqlx 实现
+/// （复用 xl-s3 的 Acl，判权 SQL 唯一事实源）；in-process / xl-client 的服务端
+/// handler 统一经 `Store::mesh_control_query` 调它。**只查本节点 DB，不扇出**。
+#[async_trait::async_trait]
+pub trait ControlBackend: Send + Sync + std::fmt::Debug {
+    /// 白名单查询（安全边界在实现侧）；None = 本节点查无。
+    async fn control_query(&self, q: ControlQuery) -> Result<Option<ControlRow>>;
 }
 
 /// 节点间传输。实现必须：幂等（write_shard/delete_version）、超时即错（调用方按

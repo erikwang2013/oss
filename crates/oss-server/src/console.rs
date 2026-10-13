@@ -12,7 +12,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
-use xl_s3::access::{Acl, Action, AuthedUser};
+use xl_s3::access::{Action, AuthedUser};
 
 use crate::state::AppState;
 
@@ -92,7 +92,7 @@ async fn require_perm(
     bucket: &str,
     action: Action,
 ) -> Result<(), Response> {
-    let acl = Acl::new(state.db.pool().clone());
+    let acl = state.acl();
     match acl.can(AuthedUser { uid, is_admin }, action, bucket).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(forbidden("无权访问该桶")),
@@ -302,10 +302,7 @@ async fn delete_bucket(
         Err(r) => return r,
     };
     if !is_admin {
-        match Acl::new(state.db.pool().clone())
-            .is_owner(&bucket, uid)
-            .await
-        {
+        match state.acl().is_owner(&bucket, uid).await {
             Ok(true) => {}
             Ok(false) => return forbidden("只有桶主或管理员可以删除桶"),
             Err(e) => {
@@ -316,10 +313,7 @@ async fn delete_bucket(
     }
     match state.store.delete_bucket(&bucket).await {
         Ok(()) => {
-            if let Err(e) = Acl::new(state.db.pool().clone())
-                .forget_bucket(&bucket)
-                .await
-            {
+            if let Err(e) = state.acl().forget_bucket(&bucket).await {
                 // 桶已删除：记账行残留只影响列表展示，不失败请求
                 tracing::warn!(error = ?e, "清理桶记账失败");
             }

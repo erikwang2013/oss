@@ -1797,6 +1797,7 @@ name = "oss-server"
 version = "1.4.0"
 dependencies = [
  "aetherupload-rust",
+ "async-trait",
  "axum 0.8.9",
  "bytes",
  "ecat",
@@ -3954,6 +3955,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
+ "uuid",
  "xl-proto",
  "xl-store",
 ]

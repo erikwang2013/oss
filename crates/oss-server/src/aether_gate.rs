@@ -25,7 +25,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jwt_rust::JwtPayload;
-use xl_s3::access::{Acl, Action, AuthedUser};
+use xl_s3::access::{Action, AuthedUser};
 
 use crate::state::AppState;
 
@@ -88,7 +88,9 @@ async fn gate(
         // 被停用的账号：旧 JWT 立即作废（与控制台 who() 同口径）
         return Some(problem(401, "invalid_token", "登录态无效，请重新登录"));
     }
-    match Acl::new(st.app.db.pool().clone())
+    match st
+        .app
+        .acl()
         .can(AuthedUser { uid, is_admin }, action, bucket)
         .await
     {

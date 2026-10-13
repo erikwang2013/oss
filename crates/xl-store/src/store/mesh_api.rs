@@ -426,6 +426,19 @@ impl Store {
         Ok(())
     }
 
+    /// 服务端控制面查询（Task 9）：本地后端执行（未注入 → 显式错误，不静默）。
+    pub async fn mesh_control_query(
+        &self,
+        q: crate::mesh::ControlQuery,
+    ) -> Result<Option<crate::mesh::ControlRow>> {
+        match &self.cfg.control {
+            Some(b) => b.control_query(q).await,
+            None => Err(Error::Encode(
+                "未注入控制面后端（StoreConfig.control）".into(),
+            )),
+        }
+    }
+
     /// 服务端租约锁（Task 8 / 节点域）：本机锁表按授予规则处理（见 lock.rs 头注）——
     /// 仅空闲/过期可授、活租约不抢占、仅持有者 Renew/Release 有效。
     pub async fn mesh_lock(&self, req: crate::mesh::LockReq) -> Result<crate::mesh::LockResp> {

@@ -95,6 +95,10 @@ impl AppState {
                 topo,
                 transport: mesh,
             }));
+            // Task 9：控制面读扇出的本节点执行器（判权复用 xl-s3::Acl；只查本地 DB）
+            store_cfg.control = Some(Arc::new(crate::cluster_control::SqliteControlBackend::new(
+                db.pool().clone(),
+            )));
         }
         let store = Store::open(store_cfg).await?;
 
@@ -147,6 +151,29 @@ impl AppState {
         }
 
         Ok(Self::new(cfg, db, store))
+    }
+
+    /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
+    pub fn control_mesh(&self) -> Option<xl_s3::access::ControlMesh> {
+        self.store.cluster().map(|c| {
+            let self_id = c.topo.self_node().id.clone();
+            xl_s3::access::ControlMesh {
+                transport: c.transport.clone(),
+                peers: c
+                    .topo
+                    .nodes
+                    .iter()
+                    .filter(|n| n.id != self_id)
+                    .map(|n| n.id.clone())
+                    .collect(),
+                self_id,
+            }
+        })
+    }
+
+    /// 三面共用的判权实例（Task 9：集群时自动带读扇出；SQL 唯一事实源在 xl-s3::Acl）。
+    pub fn acl(&self) -> xl_s3::access::Acl {
+        xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
     }
 
     pub fn new(cfg: AppConfig, db: Db, store: Store) -> Self {

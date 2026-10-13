@@ -9,7 +9,12 @@
 //!   否则查 `permissions` 行，**无行 = 无权限**。
 //! CreateBucket：任何已认证用户（建后 `record_bucket_owner` 记账）；DeleteBucket：桶主或管理员。
 
+use std::sync::Arc;
+
+use futures::StreamExt as _;
 use sqlx::{Row, SqlitePool};
+
+use xl_store::mesh::{ControlQuery, ControlRow, MeshTransport};
 
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::dto::CopySource;
@@ -32,9 +37,41 @@ pub enum Action {
     Delete,
 }
 
+/// 控制面读扇出（Task 9）：本地未命中时向 peers 尽力扇出、**首答胜**（不缓存起步，
+/// ponytail：加 5s TTL 缓存的升级点与撤销延迟权衡记档于计划）。
+#[derive(Clone)]
+pub struct ControlMesh {
+    pub transport: Arc<dyn MeshTransport>,
+    /// 本节点 id（仅日志/防呆用）
+    pub self_id: String,
+    /// 除本机外的节点 id
+    pub peers: Vec<String>,
+}
+
+impl ControlMesh {
+    /// 并发扇出，首个 Some 胜；全 miss / 全错 → None（调用方 fail-closed）。
+    pub async fn ask(&self, q: ControlQuery) -> Option<ControlRow> {
+        let mut futs = futures::stream::FuturesUnordered::new();
+        for p in &self.peers {
+            let t = self.transport.clone();
+            let n = p.clone();
+            let q = q.clone();
+            futs.push(async move { t.control_query(&n, q).await.ok().flatten() });
+        }
+        while let Some(r) = futs.next().await {
+            if let Some(row) = r {
+                return Some(row);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct Acl {
     pool: SqlitePool,
+    /// 集群控制面扇出（None = 单节点：本地查无即拒，fail-closed 语义不变）
+    mesh: Option<ControlMesh>,
 }
 
 fn now() -> i64 {
@@ -46,7 +83,12 @@ fn now() -> i64 {
 
 impl Acl {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, mesh: None }
+    }
+
+    /// 集群形态（Task 9）：读路径本地 miss → peers 扇出（写入仍只落本节点；强一致归 M9）。
+    pub fn with_mesh(pool: SqlitePool, mesh: Option<ControlMesh>) -> Self {
+        Self { pool, mesh }
     }
 
     /// AK → (uid, is_admin)。status/expires 条件与 `SigV4Auth::get_secret_key` 同口径
@@ -63,10 +105,22 @@ impl Acl {
         .bind(now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| AuthedUser {
-            uid: r.get("user_id"),
-            is_admin: r.get::<i64, _>("is_admin") != 0,
-        }))
+        if let Some(r) = row {
+            return Ok(Some(AuthedUser {
+                uid: r.get("user_id"),
+                is_admin: r.get::<i64, _>("is_admin") != 0,
+            }));
+        }
+        // 集群（Task 9）：本地查无 → 扇出（节点 B 建的号/签的 AK，节点 A 也认）
+        if let Some(m) = &self.mesh
+            && let Some(row) = m.ask(ControlQuery::AccessKey(access_key.to_string())).await
+        {
+            return Ok(Some(AuthedUser {
+                uid: row.uid.unwrap_or(0),
+                is_admin: row.is_admin.unwrap_or(false),
+            }));
+        }
+        Ok(None)
     }
 
     /// 桶主？（`buckets.owner_id == uid`）
@@ -76,7 +130,16 @@ impl Acl {
             .bind(uid)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.is_some())
+        if row.is_some() {
+            return Ok(true);
+        }
+        // 集群：归属记账可能在对端（本地无行）→ 扇出比对
+        if let Some(m) = &self.mesh
+            && let Some(row) = m.ask(ControlQuery::BucketOwner(bucket.to_string())).await
+        {
+            return Ok(row.uid == Some(uid));
+        }
+        Ok(false)
     }
 
     /// 主判权：admin / 桶主 全允许；否则查对应能力位（无行 = 拒）。
@@ -109,7 +172,23 @@ impl Acl {
             .bind(bucket)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.is_some())
+        if row.is_some() {
+            return Ok(true);
+        }
+        // 集群（Task 9）：本地无行 → 扇出（对端本地语义 = owner ∨ permission 位；
+        // admin 已在发起端判定，对端无需重判）
+        if let Some(m) = &self.mesh
+            && let Some(r) = m
+                .ask(ControlQuery::Permission {
+                    uid: user.uid,
+                    bucket: bucket.to_string(),
+                    action: action as u8,
+                })
+                .await
+        {
+            return Ok(r.flag.unwrap_or(false));
+        }
+        Ok(false)
     }
 
     /// 可见桶集合（列举过滤）：自有桶 ∪ 在 `permissions` 任一能力位为 1 的桶。
@@ -125,7 +204,19 @@ impl Acl {
         .bind(uid)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| r.get("b")).collect())
+        let mut names: Vec<String> = rows.into_iter().map(|r| r.get("b")).collect();
+        // 集群：并集对端可见集（去重）
+        if let Some(m) = &self.mesh
+            && let Some(r) = m.ask(ControlQuery::VisibleBuckets(uid)).await
+            && let Some(peers) = r.names
+        {
+            for n in peers {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        Ok(names)
     }
 
     /// 桶归属登记（S3 面 CreateBucket 用；幂等——已存在（含历史 NULL owner）不覆盖）。
@@ -277,6 +368,114 @@ fn classify(op: &str) -> Option<Gate> {
         // 未实现/未知 op：fail-closed（下游本来也是 501；这里统一 403）
         _ => return None,
     })
+}
+
+/// Task 9 测试支撑：假传输（只答 `control_query`；其余方法显式未实现）。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use xl_store::error::{Error, Result};
+    use xl_store::mesh::{ControlQuery, ControlRow, MeshTransport};
+
+    /// 节点 → 应答（`None` = 该节点查无；不在表内 = RPC 失败——模拟不可达）。
+    #[derive(Debug, Default)]
+    pub struct FakeMesh {
+        pub answers: Mutex<HashMap<String, Option<ControlRow>>>,
+    }
+
+    impl FakeMesh {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        pub fn answer(&self, node: &str, row: Option<ControlRow>) {
+            self.answers.lock().unwrap().insert(node.to_string(), row);
+        }
+    }
+
+    fn unimpl(op: &str) -> Error {
+        Error::Encode(format!("FakeMesh 未实现：{op}"))
+    }
+
+    #[async_trait::async_trait]
+    impl MeshTransport for FakeMesh {
+        async fn control_query(&self, node: &str, _q: ControlQuery) -> Result<Option<ControlRow>> {
+            match self.answers.lock().unwrap().get(node) {
+                Some(row) => Ok(row.clone()),
+                None => Err(unimpl("control_query（该节点不可达）")),
+            }
+        }
+        async fn write_shard(&self, _n: &str, _w: xl_store::mesh::ShardWrite) -> Result<()> {
+            Err(unimpl("write_shard"))
+        }
+        async fn read_shard(
+            &self,
+            _n: &str,
+            _r: xl_store::mesh::ShardRead,
+        ) -> Result<Option<bytes::Bytes>> {
+            Err(unimpl("read_shard"))
+        }
+        async fn delete_version(&self, _n: &str, _d: xl_store::mesh::VersionDirRef) -> Result<()> {
+            Err(unimpl("delete_version"))
+        }
+        async fn recycle_version(&self, _n: &str, _d: xl_store::mesh::VersionDirRef) -> Result<()> {
+            Err(unimpl("recycle_version"))
+        }
+        async fn prepare_meta(
+            &self,
+            _n: &str,
+            _m: xl_store::mesh::MetaWrite,
+        ) -> Result<xl_store::mesh::MetaAck> {
+            Err(unimpl("prepare_meta"))
+        }
+        async fn commit_meta(
+            &self,
+            _n: &str,
+            _m: xl_store::mesh::MetaWrite,
+        ) -> Result<xl_store::mesh::MetaAck> {
+            Err(unimpl("commit_meta"))
+        }
+        async fn abort_meta(&self, _n: &str, _m: xl_store::mesh::MetaWrite) -> Result<()> {
+            Err(unimpl("abort_meta"))
+        }
+        async fn read_meta(
+            &self,
+            _n: &str,
+            _r: xl_store::mesh::MetaRead,
+        ) -> Result<xl_store::mesh::MetaSnapshot> {
+            Err(unimpl("read_meta"))
+        }
+        async fn delete_meta(&self, _n: &str, _r: xl_store::mesh::MetaRead) -> Result<()> {
+            Err(unimpl("delete_meta"))
+        }
+        async fn ensure_bucket(&self, _n: &str, _b: &str) -> Result<()> {
+            Err(unimpl("ensure_bucket"))
+        }
+        async fn delete_bucket_dir(&self, _n: &str, _b: &str) -> Result<()> {
+            Err(unimpl("delete_bucket_dir"))
+        }
+        async fn list_bucket_dirs(&self, _n: &str) -> Result<Vec<String>> {
+            Err(unimpl("list_bucket_dirs"))
+        }
+        async fn list_local(
+            &self,
+            _n: &str,
+            _l: xl_store::mesh::ListLocal,
+        ) -> Result<xl_store::mesh::ListLocalResp> {
+            Err(unimpl("list_local"))
+        }
+        async fn health(&self, _n: &str) -> Result<xl_store::mesh::NodeHealth> {
+            Err(unimpl("health"))
+        }
+        async fn lock(
+            &self,
+            _n: &str,
+            _r: xl_store::mesh::LockReq,
+        ) -> Result<xl_store::mesh::LockResp> {
+            Err(unimpl("lock"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,5 +683,92 @@ mod tests {
         a.record_bucket_owner("b", 3).await.unwrap(); // 二次不覆盖
         assert!(a.is_owner("b", 2).await.unwrap());
         assert!(!a.is_owner("b", 3).await.unwrap());
+    }
+
+    // ---------- Task 9：控制面读扇出 ----------
+
+    fn mesh_with(peer_row: Option<ControlRow>) -> ControlMesh {
+        let mesh = test_support::FakeMesh::new();
+        mesh.answer("peer1", peer_row);
+        ControlMesh {
+            transport: mesh,
+            self_id: "n1".into(),
+            peers: vec!["peer1".into()],
+        }
+    }
+
+    /// 权限位在对端：本地无行 → 扇出 granted。
+    #[tokio::test]
+    async fn permission_fanout_grants_from_peer() {
+        let base = acl().await;
+        add_user(&base, 7, false).await;
+        let a = Acl::with_mesh(
+            base.pool.clone(),
+            Some(mesh_with(Some(ControlRow {
+                uid: Some(7),
+                is_admin: Some(false),
+                active: Some(true),
+                secret: None,
+                flag: Some(true),
+                names: None,
+            }))),
+        );
+        let u = AuthedUser {
+            uid: 7,
+            is_admin: false,
+        };
+        assert!(a.can(u, Action::Read, "bkt").await.unwrap());
+    }
+
+    /// 对端不可达/查无 → fail-closed（拒），与单机同口径。
+    #[tokio::test]
+    async fn fanout_miss_or_peer_down_denies() {
+        let base = acl().await;
+        add_user(&base, 7, false).await;
+        let a = Acl::with_mesh(base.pool.clone(), Some(mesh_with(None)));
+        let u = AuthedUser {
+            uid: 7,
+            is_admin: false,
+        };
+        assert!(!a.can(u, Action::Read, "bkt").await.unwrap());
+        assert_eq!(a.user_of_key("AK_PEER").await.unwrap(), None);
+        assert!(!a.is_owner("bkt", 7).await.unwrap());
+    }
+
+    /// 归属与可见集的扇出：owner 比对 + 并集去重。
+    #[tokio::test]
+    async fn owner_and_visible_fanout() {
+        let base = acl().await;
+        add_user(&base, 7, false).await;
+        // 同一 FakeMesh 同一应答：owner=7。先测 owner。
+        let a = Acl::with_mesh(
+            base.pool.clone(),
+            Some(mesh_with(Some(ControlRow {
+                uid: Some(7),
+                is_admin: None,
+                active: None,
+                secret: None,
+                flag: None,
+                names: None,
+            }))),
+        );
+        assert!(a.is_owner("bkt", 7).await.unwrap());
+        assert!(!a.is_owner("bkt", 8).await.unwrap());
+        // 可见集：远端应答复用 names 字段（换 mesh）
+        let base2 = acl().await;
+        add_user(&base2, 7, false).await;
+        let a2 = Acl::with_mesh(
+            base2.pool.clone(),
+            Some(mesh_with(Some(ControlRow {
+                uid: None,
+                is_admin: None,
+                active: None,
+                secret: None,
+                flag: None,
+                names: Some(vec!["beta".into(), "gamma".into()]),
+            }))),
+        );
+        let v = a2.visible(7).await.unwrap();
+        assert!(v.contains(&"beta".to_string()) && v.contains(&"gamma".to_string()));
     }
 }

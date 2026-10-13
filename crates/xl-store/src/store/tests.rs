@@ -2289,9 +2289,7 @@ impl InProcessMesh {
     }
 }
 
-fn unimpl(op: &str) -> crate::error::Error {
-    crate::error::Error::Encode(format!("in-process 未实现：{op}（随所属 Task 落地）"))
-}
+// （in-process 传输的 14 个方法已全部落地——此前的 `unimpl` 占位助手已删）
 
 #[async_trait::async_trait]
 impl crate::mesh::MeshTransport for InProcessMesh {
@@ -2400,10 +2398,10 @@ impl crate::mesh::MeshTransport for InProcessMesh {
     }
     async fn control_query(
         &self,
-        _n: &str,
-        _q: crate::mesh::ControlQuery,
+        n: &str,
+        q: crate::mesh::ControlQuery,
     ) -> crate::error::Result<Option<crate::mesh::ControlRow>> {
-        Err(unimpl("control_query"))
+        self.peer(n).await?.mesh_control_query(q).await
     }
 }
 

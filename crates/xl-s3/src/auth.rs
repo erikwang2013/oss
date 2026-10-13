@@ -9,11 +9,18 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 #[derive(Clone)]
 pub struct SigV4Auth {
     pool: SqlitePool,
+    /// 集群控制面扇出（Task 9；None = 单节点：本地查无即拒）
+    mesh: Option<crate::access::ControlMesh>,
 }
 
 impl SigV4Auth {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, mesh: None }
+    }
+
+    /// 集群形态（Task 9）：本地查无此 AK → 扇出 peers（节点 B 签的 AK，节点 A 也认）。
+    pub fn with_mesh(pool: SqlitePool, mesh: Option<crate::access::ControlMesh>) -> Self {
+        Self { pool, mesh }
     }
 }
 
@@ -42,10 +49,28 @@ impl S3Auth for SigV4Auth {
             S3Error::with_message(S3ErrorCode::InternalError, "internal error")
         })?;
 
-        row.map(|r| SecretKey::from(sqlx::Row::get::<String, _>(&r, "secret_key")))
-            .ok_or_else(|| {
-                S3Error::with_message(S3ErrorCode::InvalidAccessKeyId, "unknown access key")
-            })
+        if let Some(r) = row {
+            return Ok(SecretKey::from(sqlx::Row::get::<String, _>(
+                &r,
+                "secret_key",
+            )));
+        }
+        // 集群（Task 9）：本地查无 → 扇出（对端查询自带 status/expires 同口径条件；
+        // 找到即有效）。全 miss/不可达 → 仍然拒绝（fail-closed）。
+        if let Some(m) = &self.mesh
+            && let Some(row) = m
+                .ask(xl_store::mesh::ControlQuery::AccessKey(
+                    access_key.to_string(),
+                ))
+                .await
+            && let Some(sk) = row.secret
+        {
+            return Ok(SecretKey::from(sk));
+        }
+        Err(S3Error::with_message(
+            S3ErrorCode::InvalidAccessKeyId,
+            "unknown access key",
+        ))
     }
 }
 
@@ -178,5 +203,52 @@ mod tests {
         insert_key(&pool, "AKIA_DISABLED", "SK", None).await;
         let auth = SigV4Auth::new(pool);
         assert_invalid_ak(&auth.get_secret_key("AKIA_DISABLED").await.unwrap_err());
+    }
+
+    // ---------- Task 9：控制面读扇出 ----------
+
+    fn mesh_with(peer_row: Option<xl_store::mesh::ControlRow>) -> crate::access::ControlMesh {
+        let mesh = crate::access::test_support::FakeMesh::new();
+        mesh.answer("peer1", peer_row);
+        crate::access::ControlMesh {
+            transport: mesh,
+            self_id: "n1".into(),
+            peers: vec!["peer1".into()],
+        }
+    }
+
+    /// 节点 B 签的 AK：本地查无 → 扇出解得 SK。
+    #[tokio::test]
+    async fn ak_resolves_via_peer_fanout() {
+        let pool = oss_test_db().await; // 本地为空
+        let auth = SigV4Auth::with_mesh(
+            pool,
+            Some(mesh_with(Some(xl_store::mesh::ControlRow {
+                uid: Some(7),
+                is_admin: Some(false),
+                active: Some(true),
+                secret: Some("SK_PEER".into()),
+                flag: None,
+                names: None,
+            }))),
+        );
+        assert_eq!(
+            auth.get_secret_key("AK_PEER").await.unwrap().expose(),
+            "SK_PEER"
+        );
+    }
+
+    /// 本地命中的 AK 不依赖扇出；对端不可达时未知 AK 仍拒（fail-closed）。
+    #[tokio::test]
+    async fn local_hit_ok_and_peer_down_rejects() {
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        insert_key(&pool, "AKIA_TEST", "SK_TEST", None).await;
+        let auth = SigV4Auth::with_mesh(pool, Some(mesh_with(None))); // 对端"查无"（等价不可达后的 None）
+        assert_eq!(
+            auth.get_secret_key("AKIA_TEST").await.unwrap().expose(),
+            "SK_TEST"
+        );
+        assert_invalid_ak(&auth.get_secret_key("NOPE").await.unwrap_err());
     }
 }

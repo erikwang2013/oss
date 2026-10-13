@@ -39,7 +39,7 @@ message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epo
                   string holder=5; uint64 ttl_ms=6; LockOp op=7; }
 enum LockOp { ACQUIRE=0; RENEW=1; RELEASE=2; }
 message LockResp { bool granted=1; }
-message ControlReq { ControlKind kind=1; string a=2; string b=3; uint32 c=4; }
+message ControlReq { ControlKind kind=1; string a=2; string b=3; uint32 c=4; int64 uid=5; }
 enum ControlKind { ACCESS_KEY=0; PERMISSION=1; OWNED_BUCKETS=2; VISIBLE_BUCKETS=3; BUCKET_OWNER=4; }
 message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
                       string secret=5; bool flag=6; repeated string names=7; }

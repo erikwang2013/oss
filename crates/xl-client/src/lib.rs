@@ -25,13 +25,12 @@ use xl_store::store::{Store, ec};
 
 /// 集群内共享令牌的 metadata 键。
 const TOKEN_KEY: &str = "x-oss-cluster-token";
+/// W3C traceparent（M3 轻量传播：无 OTLP 接入前，客户端注入、服务端记入日志——
+/// 双节点可按同一 trace id 抽查，设计 D:362 的最小兑现）。
+const TRACEPARENT_KEY: &str = "traceparent";
 
 fn rpc_err(node: &str, e: Status) -> Error {
     Error::Encode(format!("mesh RPC 失败（node {node}）：{e}"))
-}
-
-fn unimpl(op: &str) -> Error {
-    Error::Encode(format!("tonic mesh 未实现：{op}（随所属 Task 落地）"))
 }
 
 /// 对端 `WriteResp{ok:false}` → 显式错误（不得吞成成功）。
@@ -160,6 +159,15 @@ impl TokenInterceptor {
 impl Interceptor for TokenInterceptor {
     fn call(&mut self, mut req: Request<()>) -> std::result::Result<Request<()>, Status> {
         req.metadata_mut().insert(TOKEN_KEY, self.token.clone());
+        // traceparent 注入：`00-<32hex trace id>-<16hex span id>-01`（uuid 派生，零新依赖）
+        let tp = format!(
+            "00-{}-{}-01",
+            uuid::Uuid::new_v4().simple(),
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
+        );
+        if let Ok(v) = MetadataValue::try_from(tp) {
+            req.metadata_mut().insert(TRACEPARENT_KEY, v);
+        }
         Ok(req)
     }
 }
@@ -178,6 +186,14 @@ impl Interceptor for SecretInterceptor {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v == self.secret);
         if ok {
+            // 提取 traceparent（debug 级：默认日志级别下不刷屏；抽查用 RUST_LOG=debug）
+            if let Some(tp) = req
+                .metadata()
+                .get(TRACEPARENT_KEY)
+                .and_then(|v| v.to_str().ok())
+            {
+                tracing::debug!(traceparent = tp, "mesh 入站（trace 传播）");
+            }
             Ok(req)
         } else {
             Err(Status::unauthenticated("集群令牌校验失败"))
@@ -450,10 +466,67 @@ impl MeshTransport for TonicMesh {
     }
     async fn control_query(
         &self,
-        _n: &str,
-        _q: mesh::ControlQuery,
+        n: &str,
+        q: mesh::ControlQuery,
     ) -> Result<Option<mesh::ControlRow>> {
-        Err(unimpl("control_query"))
+        // kind 编码（两侧一致）：0=AccessKey(ak→a) 1=Permission(uid,a=bucket,c=action)
+        // 2=OwnedBuckets(uid) 3=VisibleBuckets(uid) 4=BucketOwner(a=bucket)
+        let req = match q {
+            mesh::ControlQuery::AccessKey(ak) => xl_proto::ControlReq {
+                kind: xl_proto::ControlKind::AccessKey as i32,
+                a: ak,
+                b: String::new(),
+                c: 0,
+                uid: 0,
+            },
+            mesh::ControlQuery::Permission {
+                uid,
+                bucket,
+                action,
+            } => xl_proto::ControlReq {
+                kind: xl_proto::ControlKind::Permission as i32,
+                a: bucket,
+                b: String::new(),
+                c: action as u32,
+                uid,
+            },
+            mesh::ControlQuery::OwnedBuckets(uid) => xl_proto::ControlReq {
+                kind: xl_proto::ControlKind::OwnedBuckets as i32,
+                a: String::new(),
+                b: String::new(),
+                c: 0,
+                uid,
+            },
+            mesh::ControlQuery::VisibleBuckets(uid) => xl_proto::ControlReq {
+                kind: xl_proto::ControlKind::VisibleBuckets as i32,
+                a: String::new(),
+                b: String::new(),
+                c: 0,
+                uid,
+            },
+            mesh::ControlQuery::BucketOwner(bucket) => xl_proto::ControlReq {
+                kind: xl_proto::ControlKind::BucketOwner as i32,
+                a: bucket,
+                b: String::new(),
+                c: 0,
+                uid: 0,
+            },
+        };
+        let resp = self
+            .client(n)?
+            .clone()
+            .control_query(req)
+            .await
+            .map_err(|e| rpc_err(n, e))?
+            .into_inner();
+        Ok(resp.found.then(|| mesh::ControlRow {
+            uid: Some(resp.uid),
+            is_admin: Some(resp.is_admin),
+            active: Some(resp.active),
+            secret: (!resp.secret.is_empty()).then_some(resp.secret),
+            flag: Some(resp.flag),
+            names: Some(resp.names),
+        }))
     }
 }
 
@@ -698,9 +771,38 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
     }
     async fn control_query(
         &self,
-        _r: Request<xl_proto::ControlReq>,
+        r: Request<xl_proto::ControlReq>,
     ) -> std::result::Result<tonic::Response<xl_proto::ControlResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let l = r.into_inner();
+        let kind = xl_proto::ControlKind::try_from(l.kind)
+            .map_err(|_| Status::invalid_argument("未知控制面查询类型"))?;
+        let q = match kind {
+            xl_proto::ControlKind::AccessKey => mesh::ControlQuery::AccessKey(l.a),
+            xl_proto::ControlKind::Permission => mesh::ControlQuery::Permission {
+                uid: l.uid,
+                bucket: l.a,
+                action: l.c as u8,
+            },
+            xl_proto::ControlKind::OwnedBuckets => mesh::ControlQuery::OwnedBuckets(l.uid),
+            xl_proto::ControlKind::VisibleBuckets => mesh::ControlQuery::VisibleBuckets(l.uid),
+            xl_proto::ControlKind::BucketOwner => mesh::ControlQuery::BucketOwner(l.a),
+        };
+        let row = self.store.mesh_control_query(q).await.map_err(internal)?;
+        Ok(tonic::Response::new(match row {
+            Some(r) => xl_proto::ControlResp {
+                found: true,
+                uid: r.uid.unwrap_or(0),
+                is_admin: r.is_admin.unwrap_or(false),
+                active: r.active.unwrap_or(false),
+                secret: r.secret.unwrap_or_default(),
+                flag: r.flag.unwrap_or(false),
+                names: r.names.unwrap_or_default(),
+            },
+            None => xl_proto::ControlResp {
+                found: false,
+                ..Default::default()
+            },
+        }))
     }
 }
 
@@ -920,5 +1022,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("bucket not empty"), "实得：{e}");
+    }
+
+    /// Task 10：拦截器注入令牌 + traceparent；服务端拦截器拒无令牌请求。
+    #[test]
+    fn interceptors_inject_token_and_traceparent() {
+        use tonic::service::Interceptor as _;
+        let mut ti = TokenInterceptor::new("s").unwrap();
+        let req = ti.call(Request::new(())).unwrap();
+        assert!(req.metadata().get(TOKEN_KEY).is_some());
+        let tp = req
+            .metadata()
+            .get(TRACEPARENT_KEY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(tp.starts_with("00-") && tp.ends_with("-01"), "{tp}");
+        assert_eq!(tp.len(), 3 + 32 + 1 + 16 + 3, "W3C 形态：{tp}");
+        // 服务端：无令牌 → 拒
+        let mut si = SecretInterceptor { secret: "s".into() };
+        assert!(si.call(Request::new(())).is_err());
     }
 }

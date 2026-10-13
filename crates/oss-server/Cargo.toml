@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 xl-store.workspace = true
 xl-client.workspace = true
+async-trait = "0.1"
 xl-s3.workspace = true
 aetherupload-rust.workspace = true
 axum.workspace = true
