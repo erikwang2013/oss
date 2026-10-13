@@ -371,14 +371,57 @@ impl MeshTransport for TonicMesh {
             .into_inner();
         check_write(node, resp)
     }
-    async fn ensure_bucket(&self, _n: &str, _b: &str) -> Result<()> {
-        Err(unimpl("ensure_bucket"))
+    async fn ensure_bucket(&self, n: &str, b: &str) -> Result<()> {
+        let resp = self
+            .client(n)?
+            .clone()
+            .ensure_bucket(xl_proto::BucketRef {
+                bucket: b.to_string(),
+            })
+            .await
+            .map_err(|e| rpc_err(n, e))?
+            .into_inner();
+        check_write(n, resp)
     }
-    async fn list_bucket_dirs(&self, _n: &str) -> Result<Vec<String>> {
-        Err(unimpl("list_bucket_dirs"))
+    async fn list_bucket_dirs(&self, n: &str) -> Result<Vec<String>> {
+        let resp = self
+            .client(n)?
+            .clone()
+            .list_buckets(xl_proto::Empty {})
+            .await
+            .map_err(|e| rpc_err(n, e))?
+            .into_inner();
+        Ok(resp.names)
     }
-    async fn list_local(&self, _n: &str, _l: mesh::ListLocal) -> Result<mesh::ListLocalResp> {
-        Err(unimpl("list_local"))
+    async fn list_local(&self, n: &str, l: mesh::ListLocal) -> Result<mesh::ListLocalResp> {
+        let req = xl_proto::ListReq {
+            bucket: l.bucket,
+            prefix: l.prefix,
+            delimiter: l.delimiter.unwrap_or_default(),
+            marker: l.marker.unwrap_or_default(),
+            limit: l.limit as u32,
+        };
+        let resp = self
+            .client(n)?
+            .clone()
+            .list_local(req)
+            .await
+            .map_err(|e| rpc_err(n, e))?
+            .into_inner();
+        Ok(mesh::ListLocalResp {
+            entries: resp
+                .entries
+                .into_iter()
+                .map(|e| mesh::ListEntry {
+                    key: e.key,
+                    size: e.size,
+                    etag: e.etag,
+                    max_mod_time_nanos: e.max_mod_time_nanos,
+                })
+                .collect(),
+            prefixes: resp.prefixes,
+            slots_ok: resp.slots_ok,
+        })
     }
     async fn lock(&self, _n: &str, _req: mesh::LockReq) -> Result<mesh::LockResp> {
         Err(unimpl("lock"))
@@ -556,21 +599,52 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
     }
     async fn ensure_bucket(
         &self,
-        _r: Request<xl_proto::BucketRef>,
+        r: Request<xl_proto::BucketRef>,
     ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        self.store
+            .mesh_ensure_bucket(&r.into_inner().bucket)
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn list_buckets(
         &self,
         _r: Request<xl_proto::Empty>,
     ) -> std::result::Result<tonic::Response<xl_proto::BucketsResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let names = self.store.mesh_list_buckets().await.map_err(internal)?;
+        Ok(tonic::Response::new(xl_proto::BucketsResp { names }))
     }
     async fn list_local(
         &self,
-        _r: Request<xl_proto::ListReq>,
+        r: Request<xl_proto::ListReq>,
     ) -> std::result::Result<tonic::Response<xl_proto::ListLocalResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let l = r.into_inner();
+        let resp = self
+            .store
+            .mesh_list_local(mesh::ListLocal {
+                bucket: l.bucket,
+                prefix: l.prefix,
+                // 线上空串 ↔ None（客户端同款映射）
+                delimiter: (!l.delimiter.is_empty()).then_some(l.delimiter),
+                marker: (!l.marker.is_empty()).then_some(l.marker),
+                limit: l.limit as usize,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(xl_proto::ListLocalResp {
+            entries: resp
+                .entries
+                .into_iter()
+                .map(|e| xl_proto::ListEntry {
+                    key: e.key,
+                    size: e.size,
+                    etag: e.etag,
+                    max_mod_time_nanos: e.max_mod_time_nanos,
+                })
+                .collect(),
+            prefixes: resp.prefixes,
+            slots_ok: resp.slots_ok,
+        }))
     }
     async fn lock(
         &self,
