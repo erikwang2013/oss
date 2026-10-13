@@ -11,12 +11,16 @@
 S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分布式 + 纠删码；
 当前完成 **M1（单盘垂直切片）+ M2a（可用性切片：Multipart Upload、Range GET、
 `x-amz-meta-*` 元数据、流式 PUT、孤儿回收）+ M2b（存储切片：单机多盘 + 纠删码 8+4、
-quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）**——`aws-cli`/`rclone`
+quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）+ M3（分布式切片：
+节点间 gRPC mesh、静态槽位拓扑、跨节点 quorum 读写、节点故障容忍与读修复、quorum 租约锁、
+混沌 e2e）**——`aws-cli`/`rclone`
 的大文件默认路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
 
-- **三个 crate 单向依赖 `oss-server → xl-s3 → xl-store`**：`xl-store` 是不依赖任何框架的存储内核
-  （提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把 s3s 的 S3 trait 实现到内核上；
-  `oss-server` 用 e-cat 组装一个 axum Router，同时承载控制台 API、aetherupload 分块上传与 S3 服务。
+- **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
+  `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
+  s3s 的 S3 trait 实现到内核上；`xl-proto` 是节点间 gRPC 协议消息与 service（prost + tonic-build
+  生成）；`xl-client` 是 mesh 的 tonic 实现（`TonicMesh` 客户端 + 服务端 handler）；`oss-server`
+  用 e-cat 组装一个 axum Router，同时承载控制台 API、aetherupload 分块上传与 S3 服务。
 - **两条客户端入口**：`aws-cli` / `rclone` 走 S3 面（SigV4 认证）；
   浏览器控制台（React 19 + antd，M1b）走 `/api/v1` 与 aetherupload 自带脚本（分块 / 断线续传 / 秒传）。
 - **技术栈**：Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 1.0.4 · axum 0.8 · sqlx / SQLite · serde + rmp-serde。
@@ -34,7 +38,11 @@ kill -9 断电用例（SIGABRT 四注入点）。
 已实现（权限体系）：子账户与桶级**读/写/删**三档授权（管理员在控制台「子账户」页创建、
 管理、授权）· 三面统一执行（S3 的 AK/SK、控制台 JWT、aetherupload 上传认证）· 子账户可建
 自有桶（桶主全权）· 上传/下载/删除均按权限门。
-未实现（见设计文档的阶段表）：分布式（多节点）· 版本控制 · 加密 · 复制 · 对象锁/STS 等
+已实现（M3）：分布式切片——节点间 gRPC mesh（`xl-proto`/`xl-client`）· 静态扁平拓扑（全局
+槽位表 + 拓扑指纹）· 跨节点 quorum 读写（提交 quorum + 补偿、读覆盖率快路径）· 节点故障容忍
+（kill -9 / SIGSTOP 混沌 e2e 实证）· 读修复（read-repair + fsck 集群化差集补齐）· 节点间
+quorum 租约锁（节点域 Q_n）· `/health/cluster` 集群健康端点。
+未实现（见设计文档的阶段表）：版本控制 · 加密 · 复制 · 对象锁/STS 等
 完整 IAM（细粒度策略、预设模板留 M4+）。
 
 ## 架构
@@ -45,6 +53,8 @@ kill -9 断电用例（SIGABRT 四注入点）。
 |---|---|
 | `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` v1 编解码、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock |
 | `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`） |
+| `crates/xl-proto` | 节点间 gRPC 协议：`oss.proto` 消息与 service 定义（prost + tonic-build 全量生成） |
+| `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
 | `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI |
 | `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
 | `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（17 步 + `E2E_LONG=1` 门控长跑） |
@@ -93,10 +103,10 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 
 > 已知限制：
 > - `/aetherupload/*` 四条路由**需 JWT**：登录后带 cookie `oss_token` 或 `Authorization: Bearer <token>` 访问
->   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M2/M4）。
+>   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M4+）。
 > - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
 > - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
-> - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M3+）；
+> - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M4+）；
 >   多区间 Range（`bytes=0-9,20-29`）→ 400 `InvalidArgument`（s3s 解析层拦截）；HEAD 带 Range 不支持。
 > - Multipart **part 级** `x-amz-checksum-*` 不校验（静默忽略，M2b 接组合语义）；单段 PUT 的
 >   Content-MD5 / `x-amz-checksum-*` 已在提交点前校验（不符 → `BadDigest`，对象不落盘）。
@@ -110,7 +120,7 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >     运行时掉线的盘会被自动判为不在册（写按 quorum 绕行、删对象 fail-closed、插回自动恢复），
 >     但它**必须曾在挂载状态下启动过**（盘上有 `.oss.sys` 与 `drive-id`）。
 >   - 掉线盘在场时 **删对象/删桶返回 500**（防「插回即复活」）；这是有意为之的 fail-closed，插回后重试即可。
->   - 读 meta 取**最新副本**（`mod_time` 墙钟）：多盘间该值正常单调；NTP 大步回拨叠加写盘故障属已知边界（M3 的 heal/epoch 收口）。
+>   - 读 meta 取**最新副本**（`mod_time` 墙钟）：多盘间该值正常单调；NTP 大步回拨叠加写盘故障属已知边界（M4 的 heal/epoch 收口）。
 >   - 目录 fsync 的断电零丢失保证按 ext4/XFS 假设；其它文件系统上目录 fsync 失败仅 warn，需自行复核。
 > - 长跑验收（rclone 并发 100×100 MB + 中断重试，设计验收 #3）在 `tests/e2e_s3.sh` 的
 >   `E2E_LONG=1` 门控段（默认跳过，人工触发；`E2E_LONG_N`/`E2E_LONG_MB` 调规模）。
@@ -171,7 +181,7 @@ cd web && npm install && npm run dev
 - 1 GB 上传与断线续传为**人工验证项**（不在 e2e 里）：
   `head -c 1073741824 /dev/urandom > /tmp/1g.bin` → 面板上传观察进度推进 → 中途 DevTools → Network → Offline
   （或拔网线）→ 输出区出现「网络故障，正在重试……」→ 恢复网络 → 自动继续至成功；下载后 `cmp` 与本地一致。
-- 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
+- 断线续传限于同一页面会话；刷新后需重传（跨刷新续传未排期；当前限同一页面会话）
 
 ## 运维命令
 

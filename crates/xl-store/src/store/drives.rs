@@ -17,13 +17,13 @@ use crate::meta::ShardRef;
 
 use super::Store;
 
-/// 分片 → 盘下标（确定性；单盘恒 0）。M2b 单 set = 全部盘；多 set 是 M3 的事。
+/// 分片 → 盘下标（确定性；单盘恒 0）。M2b 单 set = 全部盘；多 set 是 M4 的事。
 pub fn drive_index(shard: u8, n_drives: usize) -> usize {
     (shard as usize) % n_drives.max(1)
 }
 
 /// 对象 → set 映射（设计 §5.3 的确定性哈希）。
-/// **留形不留行为**：M2b 单 set（sets == 1）取模恒 0；M3 引入多 set / rebalance 时本公式直接生效。
+/// **留形不留行为**：M2b 单 set（sets == 1）取模恒 0；M4 引入多 set / rebalance 时本公式直接生效。
 #[allow(dead_code)]
 pub fn set_index(bucket: &str, key: &str, sets: usize) -> usize {
     let h = crc32c::crc32c(format!("{bucket}/{key}").as_bytes());

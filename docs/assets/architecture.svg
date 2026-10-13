@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 720" width="960" height="720"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS 系统架构</title>
-  <desc>三个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 → xl-store，以及客户端与存储介质。</desc>
+  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
@@ -11,7 +11,7 @@
   <rect x="1" y="1" width="958" height="718" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
   <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 系统架构</text>
-  <text x="40" y="70" font-size="12" fill="#64748b">Rust 2024 · 三 crate 单向依赖 oss-server → xl-s3 → xl-store · M1：单进程、单盘（无纠删码）</text>
+  <text x="40" y="70" font-size="12" fill="#64748b">Rust 2024 · 五 crate 单向依赖 oss-server → xl-s3 / xl-client → xl-store（节点间 mesh 走 xl-proto）· M1：单进程、单盘（无纠删码）</text>
 
   <!-- 客户端 -->
   <rect x="690" y="94" width="250" height="56" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
@@ -54,9 +54,9 @@
   <line x1="765" y1="310" x2="765" y2="326" stroke="#94a3b8" marker-end="url(#a)"/>
   <rect x="646" y="330" width="238" height="36" rx="6" fill="#f8fafc" stroke="#dbe3ec"/>
   <text x="765" y="346" font-size="10.5" fill="#374151" text-anchor="middle">OssS3（xl-s3）</text>
-  <text x="765" y="360" font-size="10" fill="#64748b" text-anchor="middle">S3 trait → 内核（M1 无授权）</text>
+  <text x="765" y="360" font-size="10" fill="#64748b" text-anchor="middle">S3 trait → 内核（子账户 × 桶 三档授权）</text>
   <text x="646" y="392" font-size="11" fill="#374151">桶/对象 CRUD · ListObjectsV2 · Copy</text>
-  <text x="646" y="412" font-size="11" fill="#94a3b8">Multipart / Range 未实现（M2）</text>
+  <text x="646" y="412" font-size="11" fill="#94a3b8">Multipart / Range 已落地（M2a）</text>
 
   <!-- 面板脚注条 -->
   <line x1="40" y1="440" x2="920" y2="440" stroke="#e5e7eb"/>

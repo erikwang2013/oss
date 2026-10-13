@@ -44,7 +44,7 @@
 | 缓存（可选） | `ecat-data-redis` | 7.0.0 | 仅当外部化秒传索引时才需要；默认不用 |
 | S3 客户端（复制/分层） | `ecat-data-s3` | 7.0.0（**需扩展**） | 现仅 put/get/delete/list，需补流式 multipart / copy / 版本头 |
 | 认证 | `jwt-rust` | 1.0.1 | 控制面 `/api/v1` 与上传口 `/aetherupload` 的 JWT 校验/签发（axum `JwtLayer` + `encode`，12h）；S3 面走 SigV4。`ecat-auth` 的定位不变，留 M4 策略层（桶策略/IAM） |
-| 分布式锁（M3+） | `ecat-lock` | 7.0.0 | 节点间命名空间锁；后端选型在 M3 定 |
+| 分布式锁（M3） | `ecat-lock` | 7.0.0 | 节点间命名空间锁；**M3 定稿：未采用**——落地为自研 quorum 租约锁（`xl-store/src/store/lock.rs`，节点域 Q_n，见「M3 落地状态」） |
 | 可观测 | `ecat-metrics` · `ecat-tracing` · `ecat-logging` | 7.0.0 | Prometheus + OTLP |
 | 中间件 | `ecat-middleware` · `ecat-security` | 7.0.0 | 超时/限流/攻击检测 |
 | 加密（M5） | `aes-gcm` · `chacha20poly1305` | 最新 | RustCrypto |
@@ -106,13 +106,13 @@ oss/
 │   ├── xl-s3/              s3s 的 S3 trait 实现 · S3Route 前置层 · SigV4 凭据 · 策略求值
 │   ├── oss-server/         e-cat 应用：router 组装 · 控制台 API · aetherupload 接线 · 钩子
 │   ├── xl-proto/           (M3) 节点间 gRPC 协议 (prost + tonic-build)
-│   └── xl-client/          (M3) 节点间客户端封装（用于测试与工具）
+│   └── xl-client/          (M3) mesh 的 tonic 实现：TonicMesh 客户端 + 服务端 handler
 ├── web/                    React 控制台
 ├── deploy/                 docker-compose(dev) · systemd(prod) · nginx(TLS + X-Accel-Redirect)
 └── docs/
 ```
 
-依赖方向：`oss-server` → `xl-s3` → `xl-store`；`xl-store` 不依赖任何框架。M1 只建三个 crate（`xl-proto` / `xl-client` 到 M3 才出现）。
+依赖方向：`oss-server` → `xl-s3` → `xl-store`（另 `xl-client` → `xl-proto`）；`xl-store` 不依赖任何框架。M1 只建三个 crate；`xl-proto` / `xl-client` 随 M3 落地（见「M3 落地状态（2026-10-14）」）。
 
 ---
 
@@ -168,7 +168,7 @@ oss/
 | 阶段 | 机制 |
 |---|---|
 | M1–M2（单机） | `.oss.sys/locks/<sha256(key)[..16]>.lock` 上的 `flock`（跨进程，**M2b 已实现**，阻塞等待入 spawn_blocking 池）+ 进程内 per-object 互斥（`HashMap<Key, Arc<Mutex>>`，M1 已实现）；M2b 另加**桶级互斥**（写者「桶窗口」与删桶/建桶互斥，防桶复活） |
-| M3+（分布式） | 节点间 quorum 锁（类 MinIO dsync）。跨节点 rename 不原子，锁是唯一保证。优先评估 `ecat-lock` 的后端能力 |
+| M3+（分布式，**M3 已落地**） | 节点间 quorum 锁（类 MinIO dsync）。跨节点 rename 不原子，锁是唯一保证。**定稿：未采用 `ecat-lock` 后端——自研 quorum 租约锁（节点域 Q_n，`xl-store/src/store/lock.rs`）** |
 
 ---
 
@@ -420,7 +420,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 4. 2 KB 对象不产生 13 个小文件（内联生效，`find` 计数验证）—— ✅ 内联阈值用例（find 计数 0）
 5. 分片 CRC32C / 整对象 SHA256 校验：手工翻转一个分片字节，读返回错误而非静默脏数据 —— ✅ CRC 层坏片视同缺失进重建（自愈）；能过 CRC 的错配由 SHA256 终验 fail-closed（专测）
 
-**实现边界（M2b 定稿记录）**：EC 读写整份进内存（ShardByShard 流式化顺延）；meta「最新副本胜」依赖墙钟单调（M3 epoch/heal 收口）；读时修为最小版、无后台 heal；rclone 长跑默认参数人工触发。
+**实现边界（M2b 定稿记录）**：EC 读写整份进内存（ShardByShard 流式化顺延）；meta「最新副本胜」依赖墙钟单调（M4 的 heal/epoch 收口）；读时修为最小版、无后台 heal；rclone 长跑默认参数人工触发。
 
 **授权模型提前落地（2026-10-13，原计划 M4 的「角色/策略」最小版）**：子账户 × 桶 三档
 （读/写/删）+ 桶主全权 + 管理员全量；S3 面（s3s `S3Access::check`）、控制台、aetherupload
@@ -438,6 +438,12 @@ STS/AssumeRole）与对象锁仍随 M4/M5；实施记录见
 3. 从任意节点读同一对象结果一致（哈希对拍）
 4. 并发写同一 key 无交错损坏
 5. 脑裂场景（人为网络分区）下，quorum 不足的一侧拒绝写而非产生分叉
+
+**M3 落地状态（2026-10-14）**：节点间 gRPC mesh（`xl-proto` / `xl-client`）· 静态扁平拓扑
+（槽位模型：全局槽位表 + 拓扑指纹）· 跨节点 quorum 读写（提交 quorum + 补偿、读覆盖率快路径）·
+节点故障容忍（kill -9 / SIGSTOP 混沌 e2e 实证，验收①–⑤实弹全绿，`tests/e2e_m3_cluster.sh`）·
+读修复（read-repair + fsck 集群化差集补齐）· 节点间 quorum 租约锁（节点域 Q_n）——均已落地；
+rebalance / heal 独立命令 / 多 set / 控制面强一致顺延 M4 / M9。
 
 ### M4 运维与 IAM（3-4 周）
 

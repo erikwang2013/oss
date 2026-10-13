@@ -356,7 +356,7 @@ impl Store {
                 tracing::warn!(
                     flipped,
                     quorum,
-                    "meta 翻转不足 quorum（已提交，M3 heal 补副本）"
+                    "meta 翻转不足 quorum（已提交，M4 heal 补副本）"
                 );
             }
             let _ = tokio::fs::remove_dir_all(&tmp).await;
