@@ -50,13 +50,22 @@ pub struct ControlMesh {
 
 impl ControlMesh {
     /// 并发扇出，首个 Some 胜；全 miss / 全错 → None（调用方 fail-closed）。
+    /// 失败落 warn（不许静默——排查现场全靠它）。
     pub async fn ask(&self, q: ControlQuery) -> Option<ControlRow> {
         let mut futs = futures::stream::FuturesUnordered::new();
         for p in &self.peers {
             let t = self.transport.clone();
             let n = p.clone();
             let q = q.clone();
-            futs.push(async move { t.control_query(&n, q).await.ok().flatten() });
+            futs.push(async move {
+                match t.control_query(&n, q).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(node = %n, error = %e, "控制面扇出失败");
+                        None
+                    }
+                }
+            });
         }
         while let Some(r) = futs.next().await {
             if let Some(row) = r {
