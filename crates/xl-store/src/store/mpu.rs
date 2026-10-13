@@ -259,12 +259,17 @@ impl Store {
 
         // M-6 同口径：损坏旧 meta 让 complete fail-closed
         let old_meta = self.read_meta(bucket, key).await?;
-        let now = now_nanos();
+        // per-key 单调 mod_time（C4）：与单段 PUT 同口径
+        let now = match old_meta.as_ref().and_then(|m| m.latest()) {
+            Some(v) => now_nanos().max(v.mod_time_nanos + 1),
+            None => now_nanos(),
+        };
 
         // 装进新版本目录（内联 / EC 形态）——与单段 PUT 同一形态核心
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
-        let multi = self.cfg.multi_drive();
+        // 集群 + 单盘节点也必须走槽位路径（与 put.rs 同口径）
+        let multi = self.cfg.cluster.is_some() || self.cfg.multi_drive();
         let staged: Result<(u64, XlMeta)> = async {
             // concat_stream_verified 逐段核验 bytes == sidecar 快照，通过则 size 恒等于各段总和。
             // upload_part 不持对象锁（允许并发传不同 part）：complete 期间零件被并发重传
@@ -327,7 +332,7 @@ impl Store {
         if multi {
             // 多盘：两阶段 meta 提交（数据已在各盘版本目录就位；见 put.rs 同款流程）
             let quorum = self.cfg.ec.data as usize + 1;
-            let flipped = match self.write_meta(bucket, key, &meta).await {
+            let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
                 Ok(n) => n,
                 Err(e) => {
                     self.rollback_versions(bucket, key, &uuid).await;
@@ -353,7 +358,8 @@ impl Store {
             // 数据就位（同盘 rename）→ 唯一提交点
             tokio::fs::create_dir_all(&obj_dir).await?;
             tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
-            self.write_meta(bucket, key, &meta).await?;
+            self.write_meta(bucket, key, &meta, old_meta.as_ref())
+                .await?;
         }
 
         // 暂存区收尾（best-effort：提交点已过）：mpu.meta 生死门先改名，再整目录删。

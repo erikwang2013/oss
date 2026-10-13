@@ -9,7 +9,9 @@ service Mesh {
   rpc CommitMeta(MetaWrite) returns (MetaAck);
   rpc AbortMeta(MetaWrite) returns (WriteResp);
   rpc ReadMeta(MetaRead) returns (MetaResp);
+  rpc DeleteMeta(MetaRead) returns (WriteResp);
   rpc EnsureBucket(BucketRef) returns (WriteResp);
+  rpc DeleteBucket(BucketRef) returns (WriteResp);
   rpc ListBuckets(Empty) returns (BucketsResp);
   rpc ListLocal(ListReq) returns (ListLocalResp);
   rpc Health(Empty) returns (NodeHealth);

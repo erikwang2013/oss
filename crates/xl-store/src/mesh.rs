@@ -78,9 +78,11 @@ pub struct MetaAck {
 }
 
 /// 读 meta 的一次快照：node 侧返回它本地最优副本 + 成功读到的盘数。
+/// `meta: None` = 该节点没有此键（**仍携带 slots_ok**——覆盖率快路径靠它对「缺席」
+/// 计数，Option 化的返回会把覆盖数丢掉，故此结构恒存在）。
 #[derive(Clone, Debug)]
 pub struct MetaSnapshot {
-    pub meta: Bytes,
+    pub meta: Option<Bytes>,
     pub mod_time_nanos: i64,
     pub slots_ok: u32,
 }
@@ -184,8 +186,12 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
     async fn prepare_meta(&self, node: &str, m: MetaWrite) -> Result<MetaAck>;
     async fn commit_meta(&self, node: &str, m: MetaWrite) -> Result<MetaAck>;
     async fn abort_meta(&self, node: &str, m: MetaWrite) -> Result<()>;
-    async fn read_meta(&self, node: &str, r: MetaRead) -> Result<Option<MetaSnapshot>>;
+    async fn read_meta(&self, node: &str, r: MetaRead) -> Result<MetaSnapshot>;
+    /// 删除本机 meta（可见性提交点的远端分派；失败必须上抛，不得吞）
+    async fn delete_meta(&self, node: &str, r: MetaRead) -> Result<()>;
     async fn ensure_bucket(&self, node: &str, bucket: &str) -> Result<()>;
+    /// 删除本机桶目录（服务端空检查 + 幂等；非空 → Err）
+    async fn delete_bucket_dir(&self, node: &str, bucket: &str) -> Result<()>;
     async fn list_bucket_dirs(&self, node: &str) -> Result<Vec<String>>;
     async fn list_local(&self, node: &str, l: ListLocal) -> Result<ListLocalResp>;
     async fn health(&self, node: &str) -> Result<NodeHealth>;

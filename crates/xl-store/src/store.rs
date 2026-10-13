@@ -347,6 +347,20 @@ impl Store {
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         layout::validate_bucket(bucket)?;
         let _bguard = self.lock_bucket_owned(bucket).await;
+        // 集群：先查全节点（评审：静默部分建会让缺桶节点 404——分片分布确定（shard % slot_count），
+        // 落不到该节点的桶永不靠懒自愈修复；任一节点不可达 → 上抛 fail-closed）
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                let names = cl.transport.list_bucket_dirs(&n.id).await?;
+                if names.iter().any(|b| b == bucket) {
+                    return Err(Error::BucketAlreadyExists(bucket.to_string()));
+                }
+            }
+        }
         // 多盘：命名空间镜像——每盘各建一份；已存在（任一盘）= BucketAlreadyExists
         let mut created: Vec<&PathBuf> = Vec::new();
         for drive in &self.cfg.drives {
@@ -365,6 +379,17 @@ impl Store {
                 }
             }
         }
+        // 集群：广播建目录（幂等）；失败上抛（fail-closed——部分建会让缺桶节点 404，
+        // 运维出路：删空桶重试或让写路径懒自愈补齐）
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                cl.transport.ensure_bucket(&n.id, bucket).await?;
+            }
+        }
         Ok(())
     }
 
@@ -373,6 +398,19 @@ impl Store {
         for drive in &self.cfg.drives {
             if tokio::fs::try_exists(layout::bucket_dir(drive, bucket)).await? {
                 return Ok(true);
+            }
+        }
+        // 集群：任一节点有即存在；不可达 → 上抛（fail-closed，不把「查不到」伪装成「不存在」）
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                let names = cl.transport.list_bucket_dirs(&n.id).await?;
+                if names.iter().any(|b| b == bucket) {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -405,6 +443,18 @@ impl Store {
             drop(entries);
             if non_empty {
                 return Err(Error::BucketNotEmpty(bucket.to_string()));
+            }
+        }
+        // 集群：逐节点「空检查 + 删」（服务端原子做）；任一节点不可达/非空 → 中止。
+        // 部分节点已删是自洽的：全局存在性 = 任一节点有（本函数上方的 bucket_exists 同口径）；
+        // 缺桶节点的目录随对象写入懒自愈，重试删桶幂等。
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                cl.transport.delete_bucket_dir(&n.id, bucket).await?;
             }
         }
         for drive in &self.cfg.drives {
@@ -451,6 +501,32 @@ impl Store {
                 });
             }
         }
+        // 集群：并集各节点桶目录（桶是广播镜像，掉线节点少一路并集不丢项；不可达 warn 跳过）。
+        // 远端独有名字的 creation_nanos 记 0（「首个见到」口径：本机没有它的 mtime）。
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                match cl.transport.list_bucket_dirs(&n.id).await {
+                    Ok(names) => {
+                        for name in names {
+                            if name == layout::SYS_DIR || out.iter().any(|b| b.name == name) {
+                                continue;
+                            }
+                            out.push(BucketInfo {
+                                name,
+                                creation_nanos: 0,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(node = %n.id, error = %e, "远端桶列表不可达（少一路并集）")
+                    }
+                }
+            }
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -462,6 +538,9 @@ impl Store {
     /// 单盘 meta 损坏/键不一致 → warn 跳过（其余盘可服务）；**一个可用副本都没有但见过损坏
     /// 副本** → `Err(CorruptMeta)`（fail-closed，不把「盘上有坏 meta」伪装成 404）。
     async fn read_meta(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
+        if self.cfg.cluster.is_some() {
+            return self.read_meta_cluster(bucket, key).await;
+        }
         let mut best: Option<(i64, XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         for drive in &self.cfg.drives {
@@ -495,6 +574,113 @@ impl Store {
                     tracing::warn!(path = %path.display(), error = %e, "meta 读取失败，跳过该盘");
                 }
             }
+        }
+        match best {
+            Some((_, m)) => Ok(Some(m)),
+            None => match corrupt {
+                Some(why) => Err(Error::CorruptMeta(why)),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// 集群 meta 读 = 覆盖率快路径（Task 6 / 计划 D1）：并发问本机各盘 + 全 peer，
+    /// **覆盖 ≥ Q_s 即取最新并停**（取消掉队者——SIGSTOP 节点不再拖尾延迟）；
+    /// **收完全部仍覆盖 < Q_s → Err(CorruptMeta)**（fail-closed；内联对象的数据也在 meta
+    /// 里，覆盖不足时返回旧副本等于破坏 quorum 读语义——验收⑤的 500 口径同此）。
+    /// 相交证明：提交 ≥Q_s 与读覆盖 ≥Q_s 在槽位域必相交 → 最新已提交版本必在覆盖内；
+    /// 覆盖 ≥Q_s 且无副本 → 缺席可证明（任何已提交副本都落在覆盖交集里）。
+    async fn read_meta_cluster(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
+        use futures::StreamExt as _;
+        let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
+        let q_s = self.cfg.ec.data as usize + 1;
+        let self_id = cl.topo.self_node().id.clone();
+
+        let mut best: Option<(i64, XlMeta)> = None;
+        let mut corrupt: Option<String> = None;
+        let mut covered = 0usize;
+
+        // 本机各盘扫描（就地计数：NotFound 也是确定性观察；IO/解码错误不计）
+        for drive in &self.cfg.drives {
+            if !drives::drive_up(drive).await {
+                continue;
+            }
+            let path = layout::object_dir(drive, bucket, key)?.join(meta::META_FILE);
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => match XlMeta::decode(&bytes) {
+                    Ok(m) if m.object_key == key => {
+                        covered += 1;
+                        let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                            best = Some((t, m));
+                        }
+                    }
+                    Ok(m) => {
+                        corrupt = Some(format!(
+                            "键不一致：请求 {key:?}，xl.meta 中为 {:?}",
+                            m.object_key
+                        ));
+                    }
+                    Err(e) => corrupt = Some(e.to_string()),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => covered += 1,
+                Err(e) => corrupt = Some(e.to_string()),
+            }
+        }
+
+        // 远端并发；每到一个响应即累计覆盖，够数立刻出循环（未完成的 future 直接丢弃）
+        if covered < q_s {
+            let mut futs = futures::stream::FuturesUnordered::new();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                let r = crate::mesh::MetaRead {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                };
+                let node = n.id.clone();
+                futs.push(async move {
+                    let res = cl.transport.read_meta(&node, r).await;
+                    (node, res)
+                });
+            }
+            while let Some((node, res)) = futs.next().await {
+                match res {
+                    Ok(snap) => {
+                        covered += snap.slots_ok as usize;
+                        if let Some(meta_bytes) = snap.meta {
+                            match XlMeta::decode(&meta_bytes) {
+                                Ok(m) if m.object_key == key => {
+                                    let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                                    if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                        best = Some((t, m));
+                                    }
+                                }
+                                Ok(m) => {
+                                    corrupt = Some(format!(
+                                        "远端 {node} 键不一致：xl.meta 中为 {:?}",
+                                        m.object_key
+                                    ));
+                                }
+                                Err(e) => corrupt = Some(format!("远端 {node} 解码失败: {e}")),
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(node = %node, error = %e, "远端 meta 读取失败（覆盖不计）")
+                    }
+                }
+                if covered >= q_s {
+                    break; // 取消掉队者
+                }
+            }
+        }
+
+        if covered < q_s {
+            return Err(Error::CorruptMeta(format!(
+                "meta 覆盖不足 quorum：{covered}/{q_s}（分区/节点不可达时拒绝读，fail-closed）"
+            )));
         }
         match best {
             Some((_, m)) => Ok(Some(m)),
@@ -540,21 +726,25 @@ impl Store {
         }
     }
 
-    /// 写 meta（提交点），返回成功翻转的盘数。
+    /// 写 meta（提交点），返回成功翻转的槽位数。
     ///
-    /// 单盘形态：唯一一份 meta 就是提交点，失败直接上抛（与 M2b-1 行为逐字节一致）。
-    /// 多盘形态 = **两阶段提交**（M2b-2 裁决，取代「尽力而为计数」——那会让 quorum 不足时
-    /// 出现「已翻转的 meta 不可回滚」的死角）：
-    ///   阶段一（准备）：全盘写 `xl.meta.new` + fsync；准备数 < data+1 → 清 .new →
-    ///     `Err(QuorumUnmet)`——**此时一盘未翻转**，调用方回滚数据目录即回到干净态。
-    ///   阶段二（翻转）：对已准备的盘 rename `.new` → `xl.meta`；rename 近乎瞬时，
-    ///     失败仅 warn（≥1 翻转即已提交，不可逆；全失败视同未提交，由调用方回滚）。
+    /// 三分支（Task 6）：
+    /// - **集群**（cluster Some）：两阶段 + **翻转 ≥ Q_s 才提交**（评审 P1：对端 RPC
+    ///   超时/崩溃是常态——「≥1 翻转即提交」会让已 ack 的写从读视角消失）+ 失败重试
+    ///   一次 + 不足**补偿回滚**（写者持 `old`）。见 [`Self::write_meta_cluster`]。
+    /// - 单盘（drives.len()==1，未配集群）：唯一一份 meta 就是提交点（M2b-1 原样）。
+    /// - 单节点多盘：M2b-2 两阶段（prepare 全盘 ≥ data+1 → flip；**≥1 翻转即已提交**，
+    ///   本机读扫全部副本因此可见；kill9 的 `FLIP_K` 测试口径依赖此语义，勿动）。
     pub(in crate::store) async fn write_meta(
         &self,
         bucket: &str,
         key: &str,
         m: &XlMeta,
+        old: Option<&XlMeta>,
     ) -> Result<usize> {
+        if self.cfg.cluster.is_some() {
+            return self.write_meta_cluster(bucket, key, m, old).await;
+        }
         if self.cfg.drives.len() == 1 {
             self.write_meta_on(&self.cfg.drives[0], bucket, key, m)
                 .await?;
@@ -625,6 +815,200 @@ impl Store {
         Ok(flipped)
     }
 
+    /// 集群 meta 两阶段（Task 6，计划 C3 伪代码逐条落）：
+    /// prepare 全可达槽位 ≥ Q_s → commit（失败重试一次）→ **翻转 ≥ Q_s 即已提交**；
+    /// 仍不足 → **补偿回滚**（写者持 old：有 → 恢复旧 meta；无 → 删 meta）。
+    /// hash 只计「内容是自己的」的翻转（无 fencing 交错写下 .new 可能被他人覆盖）。
+    async fn write_meta_cluster(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+    ) -> Result<usize> {
+        let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
+        let self_id = cl.topo.self_node().id.clone();
+        let q_s = self.cfg.ec.data as usize + 1;
+        let bytes = bytes::Bytes::from(m.encode()?);
+        let self_hash = crate::mesh::content_hash(&bytes);
+        let base = self.slot_base();
+
+        // ---- 阶段一：prepare ----
+        let mut prepared_local: Vec<u16> = Vec::new();
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
+            if !drives::drive_up(drive).await {
+                tracing::warn!(drive = %drive.display(), "盘不在册，跳过 meta 准备");
+                continue;
+            }
+            match self.write_meta_new_on(drive, bucket, key, &bytes).await {
+                Ok(()) => prepared_local.push(base + d as u16),
+                Err(e) => tracing::warn!(drive = %drive.display(), error = %e, "meta 准备失败"),
+            }
+        }
+        let mw = crate::mesh::MetaWrite {
+            bucket: bucket.into(),
+            key: key.into(),
+            meta: bytes.clone(),
+        };
+        let mut prepared_remote = 0usize;
+        for n in &cl.topo.nodes {
+            if n.id == self_id {
+                continue;
+            }
+            match cl.transport.prepare_meta(&n.id, mw.clone()).await {
+                Ok(ack) => prepared_remote += ack.slots.iter().filter(|s| s.ok).count(),
+                Err(e) => tracing::warn!(node = %n.id, error = %e, "meta 准备 RPC 失败"),
+            }
+        }
+        let prepared = prepared_local.len() + prepared_remote;
+        if prepared < q_s {
+            // 一盘未翻转：清 .new（best-effort）→ QuorumUnmet，调用方回滚数据目录
+            for drive in &self.cfg.drives {
+                if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+                    let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                }
+            }
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                let _ = cl.transport.abort_meta(&n.id, mw.clone()).await;
+            }
+            self.bump_quorum_unmet_write();
+            return Err(Error::QuorumUnmet(format!(
+                "meta 集群准备 {prepared}/{q_s}，未提交"
+            )));
+        }
+
+        // ---- 阶段二：commit（本机单次；远端每节点至多两次机会——rename 幂等，.new 仍在） ----
+        let mut flipped_local: Vec<u16> = Vec::new();
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
+            let slot = base + d as u16;
+            if !prepared_local.contains(&slot) {
+                continue;
+            }
+            match self.commit_meta_on(drive, bucket, key).await {
+                Ok((true, h)) if h == self_hash => flipped_local.push(slot),
+                Ok((true, _)) => {
+                    tracing::warn!(slot, "meta 翻转内容是他人写入（hash 不符），不计入")
+                }
+                Ok((false, _)) => tracing::warn!(slot, "meta 翻转失败（无 .new）"),
+                Err(e) => tracing::warn!(slot, error = %e, "meta 翻转失败"),
+            }
+        }
+        let mut flipped_remote: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        for n in &cl.topo.nodes {
+            if n.id == self_id {
+                continue;
+            }
+            for attempt in 0..2 {
+                match cl.transport.commit_meta(&n.id, mw.clone()).await {
+                    Ok(ack) => {
+                        let mut got = false;
+                        for s in ack.slots.iter().filter(|s| s.ok) {
+                            if s.hash == self_hash {
+                                flipped_remote.insert(s.slot);
+                                got = true;
+                            } else {
+                                tracing::warn!(slot = s.slot, node = %n.id, "meta 翻转内容是他人写入（hash 不符），不计入");
+                            }
+                        }
+                        if got || attempt == 1 {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(node = %n.id, error = %e, "meta commit RPC 失败");
+                        if attempt == 1 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let flipped = flipped_local.len() + flipped_remote.len();
+        if flipped >= q_s {
+            if flipped < prepared {
+                tracing::warn!(
+                    flipped,
+                    prepared,
+                    "meta 集群翻转 < 已准备（已提交，M4 heal 补副本）"
+                );
+            }
+            return Ok(flipped);
+        }
+
+        // ---- 补偿回滚：**必须做**——已翻 ≥1 时任一 ≥Q_s 读集必含已翻副本，
+        // 不补偿会让「已返回失败」的写被读到（评审 P1）
+        // 先清全节点的 .new 残骸（未翻槽位的暂存；翻过的槽位 .new 已被 rename 消费）
+        for drive in &self.cfg.drives {
+            if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+                let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+            }
+        }
+        for n in &cl.topo.nodes {
+            if n.id == self_id {
+                continue;
+            }
+            let _ = cl.transport.abort_meta(&n.id, mw.clone()).await;
+        }
+        for slot in &flipped_local {
+            let d = (slot - base) as usize;
+            let Some(drive) = self.cfg.drives.get(d) else {
+                continue;
+            };
+            let restored = match old {
+                Some(om) => self.write_meta_on(drive, bucket, key, om).await,
+                None => {
+                    let dir = layout::object_dir(drive, bucket, key)?;
+                    let _ = tokio::fs::remove_file(dir.join(meta::META_FILE)).await;
+                    Ok(())
+                }
+            };
+            if let Err(e) = restored {
+                tracing::error!(slot, error = %e, "meta 补偿恢复失败（留痕待 fsck）");
+            }
+        }
+        for slot in &flipped_remote {
+            let node_idx = cl.topo.node_of_slot(*slot);
+            let Some(node) = cl.topo.nodes.get(node_idx) else {
+                continue;
+            };
+            let restored: Result<()> = match old {
+                Some(om) => {
+                    // 用旧内容重跑 prepare+commit（rename 幂等；已翻槽位被恢复，未翻槽位 no-op）
+                    let ow = crate::mesh::MetaWrite {
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        meta: bytes::Bytes::from(om.encode()?),
+                    };
+                    match cl.transport.prepare_meta(&node.id, ow.clone()).await {
+                        Ok(_) => cl.transport.commit_meta(&node.id, ow).await.map(|_| ()),
+                        Err(e) => Err(e),
+                    }
+                }
+                None => {
+                    cl.transport
+                        .delete_meta(
+                            &node.id,
+                            crate::mesh::MetaRead {
+                                bucket: bucket.into(),
+                                key: key.into(),
+                            },
+                        )
+                        .await
+                }
+            };
+            if let Err(e) = restored {
+                tracing::error!(node = %node.id, slot, error = %e, "meta 补偿恢复失败（留痕待 fsck）");
+            }
+        }
+        self.bump_quorum_unmet_write();
+        Err(Error::QuorumUnmet(format!(
+            "meta 集群翻转 {flipped}/{q_s}，已补偿回滚"
+        )))
+    }
+
     /// 清掉各盘对象目录里的 `xl.meta.new` 残骸（评审 R7：翻转全失败/半途遗留的暂存 meta）。
     /// best-effort——残骸无害（永不被读为 meta），这里只是顺手收干净。
     pub(in crate::store) async fn clear_meta_new(&self, bucket: &str, key: &str) {
@@ -663,6 +1047,25 @@ impl Store {
                 }
             }
         }
+        // ①' 集群：远端 meta 删除是可见性提交点的远端分派——**失败即上抛**（评审：
+        //     best-effort 吞掉会让对象在部分节点「复活」而删除已报成功；不可达同样上抛=fail-closed）
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                cl.transport
+                    .delete_meta(
+                        &n.id,
+                        crate::mesh::MetaRead {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                        },
+                    )
+                    .await?;
+            }
+        }
         // ② 数据清理：删各盘对象目录（meta 已除，失败只留不可见残骸，由 GC 按 mtime 回收）
         for drive in &self.cfg.drives {
             let dir = layout::object_dir(drive, bucket, key)?;
@@ -671,6 +1074,23 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     tracing::warn!(dir = %dir.display(), error = %e, "删除数据目录失败（对象已不可见，残骸由 GC 回收）");
+                }
+            }
+        }
+        // ②' 集群：远端对象目录清理（幂等；失败 warn——对象已不可见，残骸由该节点 GC 按龄回收）
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                let d = crate::mesh::VersionDirRef {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    uuid: String::new(), // 空 = 整对象目录
+                };
+                if let Err(e) = cl.transport.delete_version(&n.id, d).await {
+                    tracing::warn!(node = %n.id, error = %e, "远端对象目录清理失败（残骸由该节点 GC 回收）");
                 }
             }
         }

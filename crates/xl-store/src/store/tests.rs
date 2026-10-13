@@ -2204,7 +2204,7 @@ pub struct InProcessMesh {
     peers: std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Store>>>,
     down: std::sync::Mutex<std::collections::HashSet<String>>,
     delays: std::sync::Mutex<std::collections::HashMap<String, std::time::Duration>>,
-    fail_once: std::sync::Mutex<std::collections::HashSet<String>>,
+    fail_once: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl std::fmt::Debug for InProcessMesh {
@@ -2242,13 +2242,15 @@ impl InProcessMesh {
     pub fn delay(&self, node: &str, d: std::time::Duration) {
         self.delays.lock().unwrap().insert(node.to_string(), d);
     }
-    /// 一次性失败注入（"node:op"，op ∈ prepare_meta/commit_meta/delete_version/…）。
-    #[allow(dead_code)] // Task 6 补偿测试的注入面
+    /// 计数式失败注入（"node:op"，op ∈ prepare_meta/commit_meta/delete_version/…）：
+    /// 调 N 次挡 N 发（重试两发都要挡时注册 2 次）。
     pub fn fail_once(&self, node: &str, op: &str) {
-        self.fail_once
+        *self
+            .fail_once
             .lock()
             .unwrap()
-            .insert(format!("{node}:{op}"));
+            .entry(format!("{node}:{op}"))
+            .or_insert(0) += 1;
     }
 
     async fn peer(&self, node: &str) -> crate::error::Result<Arc<Store>> {
@@ -2270,12 +2272,20 @@ impl InProcessMesh {
             .ok_or_else(|| crate::error::Error::Encode(format!("in-process：未知节点 {node}")))
     }
 
-    #[allow(dead_code)] // Task 6 起由各 RPC 消费
+    #[allow(dead_code)] // Task 8/9 的注入面
     fn take_fail(&self, node: &str, op: &str) -> bool {
-        self.fail_once
-            .lock()
-            .unwrap()
-            .remove(&format!("{node}:{op}"))
+        let mut m = self.fail_once.lock().unwrap();
+        let k = format!("{node}:{op}");
+        match m.get_mut(&k) {
+            Some(c) if *c > 0 => {
+                *c -= 1;
+                if *c == 0 {
+                    m.remove(&k);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -2289,66 +2299,92 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         Ok(self.peer(node).await?.mesh_health().await)
     }
     // 以下 RPC 随所属 Task 落地（5a/5b/6/8/9）；在此之前显式报未实现，不静默成功。
-    async fn write_shard(&self, _n: &str, _w: crate::mesh::ShardWrite) -> crate::error::Result<()> {
-        Err(unimpl("write_shard"))
+    async fn write_shard(&self, n: &str, w: crate::mesh::ShardWrite) -> crate::error::Result<()> {
+        if self.take_fail(n, "write_shard") {
+            return Err(crate::error::Error::Encode(format!(
+                "in-process 注入：{n} write_shard 失败"
+            )));
+        }
+        self.peer(n).await?.mesh_write_shard(w).await
     }
     async fn read_shard(
         &self,
-        _n: &str,
-        _r: crate::mesh::ShardRead,
+        n: &str,
+        r: crate::mesh::ShardRead,
     ) -> crate::error::Result<Option<Bytes>> {
-        Err(unimpl("read_shard"))
+        self.peer(n).await?.mesh_read_shard(r).await
     }
     async fn delete_version(
         &self,
-        _n: &str,
-        _d: crate::mesh::VersionDirRef,
+        n: &str,
+        d: crate::mesh::VersionDirRef,
     ) -> crate::error::Result<()> {
-        Err(unimpl("delete_version"))
+        if self.take_fail(n, "delete_version") {
+            return Err(crate::error::Error::Encode(format!(
+                "in-process 注入：{n} delete_version 失败"
+            )));
+        }
+        self.peer(n).await?.mesh_delete_version(d).await
     }
     async fn recycle_version(
         &self,
-        _n: &str,
-        _d: crate::mesh::VersionDirRef,
+        n: &str,
+        d: crate::mesh::VersionDirRef,
     ) -> crate::error::Result<()> {
-        Err(unimpl("recycle_version"))
+        self.peer(n).await?.mesh_recycle_version(d).await
     }
     async fn prepare_meta(
         &self,
-        _n: &str,
-        _m: crate::mesh::MetaWrite,
+        n: &str,
+        m: crate::mesh::MetaWrite,
     ) -> crate::error::Result<crate::mesh::MetaAck> {
-        Err(unimpl("prepare_meta"))
+        if self.take_fail(n, "prepare_meta") {
+            return Err(crate::error::Error::Encode(format!(
+                "in-process 注入：{n} prepare_meta 失败"
+            )));
+        }
+        self.peer(n).await?.mesh_prepare_meta(m).await
     }
     async fn commit_meta(
         &self,
-        _n: &str,
-        _m: crate::mesh::MetaWrite,
+        n: &str,
+        m: crate::mesh::MetaWrite,
     ) -> crate::error::Result<crate::mesh::MetaAck> {
-        Err(unimpl("commit_meta"))
+        if self.take_fail(n, "commit_meta") {
+            return Err(crate::error::Error::Encode(format!(
+                "in-process 注入：{n} commit_meta 失败"
+            )));
+        }
+        self.peer(n).await?.mesh_commit_meta(m).await
     }
-    async fn abort_meta(&self, _n: &str, _m: crate::mesh::MetaWrite) -> crate::error::Result<()> {
-        Err(unimpl("abort_meta"))
+    async fn abort_meta(&self, n: &str, m: crate::mesh::MetaWrite) -> crate::error::Result<()> {
+        self.peer(n).await?.mesh_abort_meta(m).await
     }
     async fn read_meta(
         &self,
-        _n: &str,
-        _r: crate::mesh::MetaRead,
-    ) -> crate::error::Result<Option<crate::mesh::MetaSnapshot>> {
-        Err(unimpl("read_meta"))
+        n: &str,
+        r: crate::mesh::MetaRead,
+    ) -> crate::error::Result<crate::mesh::MetaSnapshot> {
+        self.peer(n).await?.mesh_read_meta(r).await
     }
-    async fn ensure_bucket(&self, _n: &str, _b: &str) -> crate::error::Result<()> {
-        Err(unimpl("ensure_bucket"))
+    async fn delete_meta(&self, n: &str, r: crate::mesh::MetaRead) -> crate::error::Result<()> {
+        self.peer(n).await?.mesh_delete_meta(r).await
     }
-    async fn list_bucket_dirs(&self, _n: &str) -> crate::error::Result<Vec<String>> {
-        Err(unimpl("list_bucket_dirs"))
+    async fn ensure_bucket(&self, n: &str, b: &str) -> crate::error::Result<()> {
+        self.peer(n).await?.mesh_ensure_bucket(b).await
+    }
+    async fn delete_bucket_dir(&self, n: &str, b: &str) -> crate::error::Result<()> {
+        self.peer(n).await?.mesh_delete_bucket(b).await
+    }
+    async fn list_bucket_dirs(&self, n: &str) -> crate::error::Result<Vec<String>> {
+        self.peer(n).await?.mesh_list_buckets().await
     }
     async fn list_local(
         &self,
-        _n: &str,
-        _l: crate::mesh::ListLocal,
+        n: &str,
+        l: crate::mesh::ListLocal,
     ) -> crate::error::Result<crate::mesh::ListLocalResp> {
-        Err(unimpl("list_local"))
+        self.peer(n).await?.mesh_list_local(l).await
     }
     async fn lock(
         &self,
@@ -2371,6 +2407,8 @@ pub struct Cluster {
     pub stores: Vec<Arc<Store>>,
     pub mesh: Arc<InProcessMesh>,
     pub ids: Vec<String>,
+    /// 每节点的盘路径（分片落位断言用）
+    pub dirs: Vec<Vec<std::path::PathBuf>>,
     _tmpdirs: Vec<tempfile::TempDir>, // 保活：drop 即删目录
 }
 
@@ -2399,6 +2437,7 @@ impl Cluster {
         let mesh = InProcessMesh::new();
         let mut stores = Vec::new();
         let mut tmpdirs = Vec::new();
+        let mut node_dirs = Vec::new();
         for (i, _id) in ids.iter().enumerate() {
             let mut dirs = Vec::new();
             for _ in 0..drives_per_node {
@@ -2408,7 +2447,7 @@ impl Cluster {
             }
             let topo = drives::ClusterTopology::new(i, specs.clone(), &ec).unwrap();
             let mut cfg = StoreConfig::new(&dirs[0]);
-            cfg.drives = dirs;
+            cfg.drives = dirs.clone();
             cfg.ec = ec;
             cfg.fsync = false; // 测试提速（既有测试同款）
             cfg.cluster = Some(Arc::new(drives::ClusterConfig {
@@ -2416,6 +2455,7 @@ impl Cluster {
                 transport: mesh.clone(),
             }));
             stores.push(Arc::new(Store::open(cfg).await.unwrap()));
+            node_dirs.push(dirs);
         }
         for (id, s) in ids.iter().zip(&stores) {
             mesh.register(id, s);
@@ -2424,6 +2464,7 @@ impl Cluster {
             stores,
             mesh,
             ids,
+            dirs: node_dirs,
             _tmpdirs: tmpdirs,
         }
     }
@@ -2461,4 +2502,357 @@ async fn cluster_fixture_health_and_injections() {
     let t0 = std::time::Instant::now();
     c.mesh.health("n3").await.unwrap();
     assert!(t0.elapsed() >= std::time::Duration::from_millis(60));
+}
+
+/// 对象目录下版本目录里的全部文件名（分片落位断言用）。
+async fn version_files(obj_dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut rd) = tokio::fs::read_dir(obj_dir).await else {
+        return out;
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == crate::meta::META_FILE || name == crate::meta::META_NEW_FILE {
+            continue;
+        }
+        if let Ok(mut inner) = tokio::fs::read_dir(e.path()).await {
+            while let Ok(Some(f)) = inner.next_entry().await {
+                out.push(f.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 对象目录下的第一个版本目录名（uuid）。
+async fn first_version_dir(obj_dir: &std::path::Path) -> String {
+    let mut rd = tokio::fs::read_dir(obj_dir).await.unwrap();
+    while let Some(e) = rd.next_entry().await.unwrap() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name != crate::meta::META_FILE
+            && name != crate::meta::META_NEW_FILE
+            && e.file_type().await.unwrap().is_dir()
+        {
+            return name;
+        }
+    }
+    panic!("无版本目录");
+}
+
+/// Task 5a：4×3 下 shard i → 槽 i（恰 1 片/槽），落位到对应节点的对应盘；读回一致。
+#[tokio::test]
+async fn cluster_write_distributes_by_slot() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    let body = vec![7u8; 200 * 1024]; // > inline 阈值 → EC 分片
+    s1.put_object("bkt", "k", Bytes::from(body.clone()), None)
+        .await
+        .unwrap();
+
+    for (ni, dirs) in c.dirs.iter().enumerate() {
+        for (di, d) in dirs.iter().enumerate() {
+            let slot = ni * 3 + di;
+            let obj = crate::layout::object_dir(d, "bkt", "k").unwrap();
+            let files = version_files(&obj).await;
+            assert!(
+                files.contains(&format!("part.1.{slot}")),
+                "节点 n{} 盘 {di} 应有 part.1.{slot}，实得 {files:?}",
+                ni + 1
+            );
+            assert_eq!(files.len(), 1, "每槽恰 1 片（实得 {files:?}）");
+        }
+    }
+    let (info, got) = s1.get_object("bkt", "k").await.unwrap();
+    assert_eq!(info.size, body.len() as u64);
+    assert_eq!(got.to_vec(), body);
+}
+
+/// Task 5a/5b：摘 1 节点（剩 9 槽=恰好 quorum）→ 写成功；读经重建成功。
+#[tokio::test]
+async fn cluster_write_with_node_down_and_read_reconstructs() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    c.mesh.down("n2"); // 槽 3,4,5 离线
+    let body = vec![9u8; 150 * 1024];
+    s1.put_object("bkt", "k", Bytes::from(body.clone()), None)
+        .await
+        .unwrap();
+    let (_, got) = s1.get_object("bkt", "k").await.unwrap();
+    assert_eq!(got.to_vec(), body);
+    for (ni, dirs) in c.dirs.iter().enumerate() {
+        for d in dirs {
+            let files = version_files(&crate::layout::object_dir(d, "bkt", "k").unwrap()).await;
+            if ni == 1 {
+                assert!(files.is_empty(), "n2 离线不应有分片");
+            } else {
+                assert_eq!(files.len(), 1);
+            }
+        }
+    }
+}
+
+/// Task 5a：覆盖写后远端旧版本进该节点 trash（先决链：提交 quorum 成立回收才安全）。
+#[tokio::test]
+async fn overwrite_recycles_remote_old_version() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from(vec![1u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    let obj = crate::layout::object_dir(&c.dirs[0][0], "bkt", "k").unwrap();
+    let v1 = first_version_dir(&obj).await;
+    s1.put_object("bkt", "k", Bytes::from(vec![2u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    for d in &c.dirs[1] {
+        let trash = crate::layout::sys_dir(d, "trash").join(&v1);
+        assert!(
+            tokio::fs::try_exists(&trash).await.unwrap(),
+            "远端旧版本未进 trash: {}",
+            trash.display()
+        );
+    }
+    // 读回的是新版本
+    let (_, got) = s1.get_object("bkt", "k").await.unwrap();
+    assert_eq!(got.to_vec(), vec![2u8; 200 * 1024]);
+}
+
+/// Task 6（C4）：连续覆盖写，mod_time 严格递增（与墙钟解耦）。
+#[tokio::test]
+async fn cluster_mod_time_is_monotonic() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from_static(b"v1"), None)
+        .await
+        .unwrap();
+    let (i1, _) = s1.get_object("bkt", "k").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from_static(b"v2"), None)
+        .await
+        .unwrap();
+    let (i2, _) = s1.get_object("bkt", "k").await.unwrap();
+    assert!(
+        i2.last_modified_nanos > i1.last_modified_nanos,
+        "mod_time 必须严格递增：{} -> {}",
+        i1.last_modified_nanos,
+        i2.last_modified_nanos
+    );
+}
+
+/// Task 6（评审 P1）：部分翻转（3 远端两发全挡 → flipped=3 < Q_s=9）→ 5xx 且全节点零残留。
+#[tokio::test]
+async fn partial_flip_compensates_and_leaves_no_residue() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    for n in ["n2", "n3", "n4"] {
+        c.mesh.fail_once(n, "commit_meta");
+        c.mesh.fail_once(n, "commit_meta"); // 重试的一发也要挡
+    }
+    let err = s1
+        .put_object("bkt", "k", Bytes::from(vec![5u8; 128 * 1024]), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::QuorumUnmet(_)),
+        "应 QuorumUnmet：{err:?}"
+    );
+    // 任何节点都不该见到这次失败的写（补偿 + 数据回滚干净）
+    for s in &c.stores {
+        let r = s.get_object("bkt", "k").await;
+        assert!(
+            matches!(r, Err(crate::error::Error::NoSuchKey(_))),
+            "失败写泄漏可见：{r:?}"
+        );
+    }
+    for dirs in &c.dirs {
+        for d in dirs {
+            let files = version_files(&crate::layout::object_dir(d, "bkt", "k").unwrap()).await;
+            assert!(files.is_empty(), "残留：{files:?}");
+        }
+    }
+}
+
+/// Task 6（D1）：覆盖不足 quorum → fail-closed（Err(CorruptMeta)，验收⑤的 500 口径）。
+#[tokio::test]
+async fn read_coverage_below_quorum_fails_closed() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from(vec![3u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    c.mesh.down("n3");
+    c.mesh.down("n4"); // 覆盖 6 < 9
+    let err = s1.get_object("bkt", "k").await.unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::CorruptMeta(_)),
+        "应 CorruptMeta（fail-closed，非 404）：{err:?}"
+    );
+}
+
+/// Task 6（D1）：meta 读快路径取消掉队者（慢节点不拖读延迟）。
+#[tokio::test]
+async fn read_meta_fast_path_cancels_straggler() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from(vec![4u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    c.mesh.delay("n4", std::time::Duration::from_millis(800));
+    let t0 = std::time::Instant::now();
+    let m = s1.read_meta("bkt", "k").await.unwrap();
+    let dt = t0.elapsed();
+    assert!(m.is_some());
+    // 覆盖 3+3+3=9 即停，不等 n4（否则 ≥800ms）
+    assert!(
+        dt < std::time::Duration::from_millis(500),
+        "快路径被掉队者拖累：{dt:?}"
+    );
+}
+
+/// Task 6：建桶广播全节点 + 全局存在性（任一节点视角一致）+ fail-closed（不可达即拒）。
+#[tokio::test]
+async fn cluster_bucket_create_fanout_exists_and_fail_closed() {
+    let c = Cluster::new(4, 3).await;
+    c.stores[0].create_bucket("bkt").await.unwrap();
+    // 每个节点的每块盘上都有桶目录
+    for dirs in &c.dirs {
+        for d in dirs {
+            assert!(
+                tokio::fs::try_exists(crate::layout::bucket_dir(d, "bkt"))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+    // 全局存在性：任一节点视角都为 true
+    for s in &c.stores {
+        assert!(s.bucket_exists("bkt").await.unwrap());
+    }
+    // 重复建桶（从另一节点视角）→ BucketAlreadyExists
+    let err = c.stores[2].create_bucket("bkt").await.unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::BucketAlreadyExists(_)),
+        "{err:?}"
+    );
+    // 不可达 → fail-closed（静默部分建会让缺桶节点 404）
+    c.mesh.down("n3");
+    let err = c.stores[0].create_bucket("bkt2").await.unwrap_err();
+    assert!(
+        format!("{err}").contains("不可达") || format!("{err}").contains("in-process"),
+        "{err:?}"
+    );
+}
+
+/// Task 6：删桶全节点空检 + 全局删除；非空/不可达都拒。
+#[tokio::test]
+async fn cluster_delete_bucket_all_nodes_and_guards() {
+    let c = Cluster::new(4, 3).await;
+    c.stores[0].create_bucket("bkt").await.unwrap();
+    // 非空 → BucketNotEmpty
+    c.stores[0]
+        .put_object("bkt", "k", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    let err = c.stores[1].delete_bucket("bkt").await.unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::BucketNotEmpty(_)),
+        "{err:?}"
+    );
+    c.stores[0].delete_object("bkt", "k").await.unwrap();
+    // 不可达 → 拒
+    c.mesh.down("n4");
+    let err = c.stores[0].delete_bucket("bkt").await.unwrap_err();
+    assert!(
+        format!("{err}").contains("in-process") || format!("{err}").contains("不可达"),
+        "{err:?}"
+    );
+    c.mesh.up("n4");
+    // 全上 → 空桶删成功，全节点消失
+    c.stores[0].delete_bucket("bkt").await.unwrap();
+    for s in &c.stores {
+        assert!(!s.bucket_exists("bkt").await.unwrap());
+    }
+}
+
+/// Task 6：删对象跨节点清 meta 与目录（全部节点不可见）。
+#[tokio::test]
+async fn cluster_delete_object_clears_all_nodes() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from(vec![6u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    s1.delete_object("bkt", "k").await.unwrap();
+    for s in &c.stores {
+        let r = s.get_object("bkt", "k").await;
+        assert!(
+            matches!(r, Err(crate::error::Error::NoSuchKey(_))),
+            "未全清：{r:?}"
+        );
+    }
+    for dirs in &c.dirs {
+        for d in dirs {
+            let files = version_files(&crate::layout::object_dir(d, "bkt", "k").unwrap()).await;
+            assert!(files.is_empty(), "残留：{files:?}");
+        }
+    }
+}
+
+/// Task 6（D4）：掉线期写入的对象，回归节点 LIST 仍见（并集）；分页不丢键。
+#[tokio::test]
+async fn cluster_list_union_and_pagination() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    // n2 掉线期写入：n2 本地无任何痕迹
+    c.mesh.down("n2");
+    s1.put_object("bkt", "missed", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    c.mesh.up("n2");
+    // n2 视角 LIST 也能见到（并集；本机页为空 → 远端条目）
+    let from_n2 = c.stores[1]
+        .list_objects("bkt", &Default::default())
+        .await
+        .unwrap();
+    assert!(
+        from_n2.objects.iter().any(|o| o.key == "missed"),
+        "并集应见掉线期写入：{:?}",
+        from_n2.objects.iter().map(|o| &o.key).collect::<Vec<_>>()
+    );
+    // 分页完备性：5 个键、max_keys=2 逐页枚举，恰好一次、无丢失
+    for i in 0..5 {
+        s1.put_object("bkt", &format!("k{i}"), Bytes::from_static(b"y"), None)
+            .await
+            .unwrap();
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for _page in 0..10 {
+        let req = crate::store::ListRequest {
+            max_keys: Some(2),
+            continuation_token: token.clone(),
+            ..Default::default()
+        };
+        let page = s1.list_objects("bkt", &req).await.unwrap();
+        seen.extend(page.objects.iter().map(|o| o.key.clone()));
+        if !page.is_truncated {
+            break;
+        }
+        token = page.next_token.clone();
+        assert!(token.is_some(), "截断必须有续页 token");
+    }
+    seen.sort();
+    let mut expect: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+    expect.push("missed".into());
+    expect.sort();
+    assert_eq!(seen, expect, "分页枚举应恰好一次全覆盖");
 }

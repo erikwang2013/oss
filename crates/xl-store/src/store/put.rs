@@ -234,6 +234,7 @@ impl Store {
         let mut landed = 0usize;
         for (i, s) in shards.iter().enumerate() {
             let slot = self.slot_of_shard(i as u8);
+            let crc = ec::crc32c_of(s);
             let res: Result<()> = async {
                 match self.slot_target(slot) {
                     Some(drives::ShardTarget::Local { drive, .. }) => {
@@ -256,10 +257,26 @@ impl Store {
                         Ok(())
                     }
                     Some(drives::ShardTarget::Remote { node, .. }) => {
-                        // M3 Task 5a：远程落片（write_shard RPC，幂等）
-                        Err(Error::Encode(format!(
-                            "远程落片未实现（node {node}，M3 Task 5a）"
-                        )))
+                        // 远程落片（幂等）：服务端先验 CRC32C 再落盘；失败按 quorum 计数消化
+                        match self.mesh_transport() {
+                            Some(t) => {
+                                touched.push(slot);
+                                t.write_shard(
+                                    node,
+                                    crate::mesh::ShardWrite {
+                                        bucket: bucket.into(),
+                                        key: key.into(),
+                                        uuid: uuid.into(),
+                                        part: 1,
+                                        shard: i as u32,
+                                        crc32c: crc,
+                                        data: bytes::Bytes::copy_from_slice(s),
+                                    },
+                                )
+                                .await
+                            }
+                            None => Err(Error::Encode("集群模式未注入 transport".into())),
+                        }
                     }
                     None => Err(Error::Encode(format!("槽位 {slot} 越界"))),
                 }
@@ -276,7 +293,7 @@ impl Store {
                 part: 1,
                 shard: i as u8,
                 size: s.len() as u64,
-                crc32c: ec::crc32c_of(s),
+                crc32c: crc,
             });
             if abort_after == Some(i) {
                 std::process::abort();
@@ -290,13 +307,12 @@ impl Store {
                             let _ = tokio::fs::remove_dir_all(dir.join(uuid)).await;
                         }
                     }
-                    Some(drives::ShardTarget::Remote { node, .. }) => {
-                        // M3 Task 5a：delete_version RPC（幂等）
-                        tracing::warn!(node, slot, "远程回滚未实现（M3 Task 5a）");
-                    }
+                    // 远端统一走 mesh_rollback_remote（幂等广播，含 1s 短超时）
+                    Some(drives::ShardTarget::Remote { .. }) => {}
                     None => {}
                 }
             }
+            self.mesh_rollback_remote(bucket, key, uuid).await;
             self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
                 "分片存活 {landed} < {}（已回滚 {touched:?}）",
@@ -326,6 +342,8 @@ impl Store {
                 let _ = tokio::fs::remove_dir_all(dir.join(uuid)).await;
             }
         }
+        // 集群：远端槽位的半截目录（幂等广播；失败 warn，孤儿由该节点 clean 按龄回收）
+        self.mesh_rollback_remote(bucket, key, uuid).await;
     }
 
     /// 老版本回收（跨盘）：每盘的 `<old_uuid>` 目录 → 该盘 trash（best-effort：提交点已过，
@@ -349,6 +367,35 @@ impl Store {
                 let _ = tokio::fs::remove_dir_all(&trash).await;
             }
             let _ = tokio::fs::rename(&old_dir, &trash).await;
+        }
+        // 集群：远端槽位的旧版本 → 该节点 trash（best-effort；先决链=提交 quorum 成立后
+        // 旧版本才无读者，回收才安全——Task 6 的集群提交同批落地）
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                let d = crate::mesh::VersionDirRef {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    uuid: old.part.uuid.clone(),
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    cl.transport.recycle_version(&n.id, d),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(node = %n.id, error = %e, "远程旧版本回收失败（孤儿由该节点 clean 回收）")
+                    }
+                    Err(_) => {
+                        tracing::warn!(node = %n.id, "远程旧版本回收超时（孤儿由该节点 clean 回收）")
+                    }
+                }
+            }
         }
     }
 
@@ -378,7 +425,11 @@ impl Store {
         let old_meta = self.read_meta(bucket, key).await?;
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
-        let now = now_nanos();
+        // per-key 单调 mod_time（C4）：latest-wins 裁决与墙钟脱钩（M2b R8 的正解在 M3 兑现）
+        let now = match old_meta.as_ref().and_then(|m| m.latest()) {
+            Some(v) => now_nanos().max(v.mod_time_nanos + 1),
+            None => now_nanos(),
+        };
         // 集群 + 单盘节点也必须走槽位路径（否则分片全落本地 tmp，槽位模型失效）
         let multi = self.cfg.cluster.is_some() || self.cfg.multi_drive();
 
@@ -443,7 +494,7 @@ impl Store {
             // 多盘：两阶段 meta 提交（单盘协议是 tmp→rename→write_meta，多盘没有跨盘 rename，
             // 数据已在各盘版本目录就位，meta 翻转即各盘提交点）
             let quorum = self.cfg.ec.data as usize + 1;
-            let flipped = match self.write_meta(bucket, key, &meta).await {
+            let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
                 Ok(n) => n,
                 Err(e) => {
                     // 阶段一失败 = 一盘未翻转：数据目录干净回滚
@@ -482,7 +533,8 @@ impl Store {
             }
 
             // 4) 提交点：写 xl.meta.new 再原子覆盖
-            self.write_meta(bucket, key, &meta).await?;
+            self.write_meta(bucket, key, &meta, old_meta.as_ref())
+                .await?;
 
             // 5) 老版本进回收站
             self.recycle_old(bucket, key, old_meta.as_ref()).await;

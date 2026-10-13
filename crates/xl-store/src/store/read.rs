@@ -238,14 +238,50 @@ impl Store {
             let drive = match self.shard_target(s) {
                 Some(drives::ShardTarget::Local { drive, .. }) => drive,
                 Some(drives::ShardTarget::Remote { node, .. }) => {
-                    // M3 Task 5b：read_shard RPC（对端不可达 ≡ 该片缺失）
-                    tracing::warn!(
-                        node,
-                        shard = i,
-                        "远程分片读取未实现（M3 Task 5b），视同缺失"
-                    );
-                    missing.push(i);
-                    shards.push(None);
+                    // read_shard RPC：对端不可达/超时 ≡ 该片缺失（EC 重建兜底）
+                    let got = match self.mesh_transport() {
+                        Some(t) => {
+                            let r = crate::mesh::ShardRead {
+                                bucket: bucket.into(),
+                                key: key.into(),
+                                uuid: v.part.uuid.clone(),
+                                part: s.part as u32,
+                                shard: i as u32,
+                            };
+                            match t.read_shard(node, r).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        node,
+                                        shard = i,
+                                        error = %e,
+                                        "远端分片读取失败，视同缺失"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    match got {
+                        Some(b) if ec::crc32c_of(&b) == s.crc32c && b.len() as u64 == s.size => {
+                            shards.push(Some(b.to_vec()));
+                        }
+                        Some(_) => {
+                            tracing::warn!(
+                                node,
+                                shard = i,
+                                "远端分片校验不符（CRC32C/长度），视同缺失"
+                            );
+                            bad_bytes = true;
+                            missing.push(i);
+                            shards.push(None);
+                        }
+                        None => {
+                            missing.push(i);
+                            shards.push(None);
+                        }
+                    }
                     continue;
                 }
                 None => {
@@ -336,8 +372,21 @@ impl Store {
             let drive = match self.shard_target(s) {
                 Some(drives::ShardTarget::Local { drive, .. }) => drive,
                 Some(drives::ShardTarget::Remote { node, .. }) => {
-                    // M3 Task 5b：write_shard RPC 回写（探活 = RPC 本身，失败 warn）
-                    tracing::warn!(node, shard = i, "远程读时修未实现（M3 Task 5b）");
+                    // write_shard RPC 回写（探活 = RPC 本身；读已成功，绝不因修复失败报错）
+                    if let Some(t) = self.mesh_transport() {
+                        let w = crate::mesh::ShardWrite {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            uuid: v.part.uuid.clone(),
+                            part: s.part as u32,
+                            shard: s.shard as u32,
+                            crc32c: s.crc32c,
+                            data: bytes::Bytes::copy_from_slice(&shards[i]),
+                        };
+                        if let Err(e) = t.write_shard(node, w).await {
+                            tracing::warn!(node, shard = i, error = %e, "远端读时修回写失败");
+                        }
+                    }
                     continue;
                 }
                 None => continue,

@@ -21,7 +21,7 @@ use tonic::{Request, Status};
 
 use xl_store::error::{Error, Result};
 use xl_store::mesh::{self, MeshTransport};
-use xl_store::store::Store;
+use xl_store::store::{Store, ec};
 
 /// 集群内共享令牌的 metadata 键。
 const TOKEN_KEY: &str = "x-oss-cluster-token";
@@ -32,6 +32,113 @@ fn rpc_err(node: &str, e: Status) -> Error {
 
 fn unimpl(op: &str) -> Error {
     Error::Encode(format!("tonic mesh 未实现：{op}（随所属 Task 落地）"))
+}
+
+/// 对端 `WriteResp{ok:false}` → 显式错误（不得吞成成功）。
+fn check_write(node: &str, r: xl_proto::WriteResp) -> Result<()> {
+    if r.ok {
+        Ok(())
+    } else {
+        Err(Error::Encode(format!("对端 {node} 拒收：{}", r.msg)))
+    }
+}
+
+/// 服务端错误 → `internal`（5xx 语义透传消息）。
+fn internal(e: Error) -> Status {
+    Status::internal(e.to_string())
+}
+
+fn write_ok() -> xl_proto::WriteResp {
+    xl_proto::WriteResp {
+        ok: true,
+        msg: String::new(),
+    }
+}
+
+fn meta_write_to_proto(m: mesh::MetaWrite) -> xl_proto::MetaWrite {
+    xl_proto::MetaWrite {
+        bucket: m.bucket,
+        key: m.key,
+        meta: m.meta.to_vec(),
+    }
+}
+
+fn meta_read_to_proto(r: mesh::MetaRead) -> xl_proto::MetaRead {
+    xl_proto::MetaRead {
+        bucket: r.bucket,
+        key: r.key,
+    }
+}
+
+fn dir_ref_to_proto(d: mesh::VersionDirRef) -> xl_proto::VersionDirRef {
+    xl_proto::VersionDirRef {
+        bucket: d.bucket,
+        key: d.key,
+        uuid: d.uuid,
+    }
+}
+
+fn dir_ref_from_proto(d: xl_proto::VersionDirRef) -> mesh::VersionDirRef {
+    mesh::VersionDirRef {
+        bucket: d.bucket,
+        key: d.key,
+        uuid: d.uuid,
+    }
+}
+
+fn meta_write_from_proto(m: xl_proto::MetaWrite) -> mesh::MetaWrite {
+    mesh::MetaWrite {
+        bucket: m.bucket,
+        key: m.key,
+        meta: m.meta.into(),
+    }
+}
+
+fn meta_read_from_proto(r: xl_proto::MetaRead) -> mesh::MetaRead {
+    mesh::MetaRead {
+        bucket: r.bucket,
+        key: r.key,
+    }
+}
+
+fn meta_ack_to_proto(a: mesh::MetaAck) -> xl_proto::MetaAck {
+    xl_proto::MetaAck {
+        ok: a.ok,
+        msg: a.msg,
+        slots: a
+            .slots
+            .into_iter()
+            .map(|s| xl_proto::SlotAck {
+                slot: s.slot as u32,
+                ok: s.ok,
+                hash: s.hash.to_vec(),
+            })
+            .collect(),
+        slots_ok: a.slots_ok,
+    }
+}
+
+fn meta_ack_from_proto(a: xl_proto::MetaAck) -> mesh::MetaAck {
+    mesh::MetaAck {
+        ok: a.ok,
+        msg: a.msg,
+        slots: a
+            .slots
+            .into_iter()
+            .map(|s| {
+                // 防御式：hash 不足 32 字节补零、超长截断（proto bytes 不限长）。
+                let mut hash = [0u8; 32];
+                let n = hash.len().min(s.hash.len());
+                hash[..n].copy_from_slice(&s.hash[..n]);
+                mesh::SlotAck {
+                    slot: s.slot as u16,
+                    ok: s.ok,
+                    hash,
+                }
+            })
+            .collect(),
+        slots_ok: a.slots_ok,
+    }
 }
 
 // ---------- 拦截器 ----------
@@ -142,30 +249,127 @@ impl MeshTransport for TonicMesh {
             buckets: resp.buckets,
         })
     }
-    // 以下 RPC 随所属 Task 落地（5a/5b/6/8/9）；在此之前显式报未实现，不静默成功。
-    async fn write_shard(&self, _n: &str, _w: mesh::ShardWrite) -> Result<()> {
-        Err(unimpl("write_shard"))
+    // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
+    async fn write_shard(&self, node: &str, w: mesh::ShardWrite) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .write_shard(xl_proto::ShardWrite {
+                bucket: w.bucket,
+                key: w.key,
+                uuid: w.uuid,
+                part: w.part,
+                shard: w.shard,
+                crc32c: w.crc32c,
+                data: w.data.to_vec(),
+            })
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
     }
-    async fn read_shard(&self, _n: &str, _r: mesh::ShardRead) -> Result<Option<bytes::Bytes>> {
-        Err(unimpl("read_shard"))
+    async fn read_shard(&self, node: &str, r: mesh::ShardRead) -> Result<Option<bytes::Bytes>> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .read_shard(xl_proto::ShardRead {
+                bucket: r.bucket,
+                key: r.key,
+                uuid: r.uuid,
+                part: r.part,
+                shard: r.shard,
+            })
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        Ok(resp.found.then(|| bytes::Bytes::from(resp.data)))
     }
-    async fn delete_version(&self, _n: &str, _d: mesh::VersionDirRef) -> Result<()> {
-        Err(unimpl("delete_version"))
+    async fn delete_version(&self, node: &str, d: mesh::VersionDirRef) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .delete_version(dir_ref_to_proto(d))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
     }
-    async fn recycle_version(&self, _n: &str, _d: mesh::VersionDirRef) -> Result<()> {
-        Err(unimpl("recycle_version"))
+    async fn recycle_version(&self, node: &str, d: mesh::VersionDirRef) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .recycle_version(dir_ref_to_proto(d))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
     }
-    async fn prepare_meta(&self, _n: &str, _m: mesh::MetaWrite) -> Result<mesh::MetaAck> {
-        Err(unimpl("prepare_meta"))
+    async fn prepare_meta(&self, node: &str, m: mesh::MetaWrite) -> Result<mesh::MetaAck> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .prepare_meta(meta_write_to_proto(m))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        Ok(meta_ack_from_proto(resp))
     }
-    async fn commit_meta(&self, _n: &str, _m: mesh::MetaWrite) -> Result<mesh::MetaAck> {
-        Err(unimpl("commit_meta"))
+    async fn commit_meta(&self, node: &str, m: mesh::MetaWrite) -> Result<mesh::MetaAck> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .commit_meta(meta_write_to_proto(m))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        Ok(meta_ack_from_proto(resp))
     }
-    async fn abort_meta(&self, _n: &str, _m: mesh::MetaWrite) -> Result<()> {
-        Err(unimpl("abort_meta"))
+    async fn abort_meta(&self, node: &str, m: mesh::MetaWrite) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .abort_meta(meta_write_to_proto(m))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
     }
-    async fn read_meta(&self, _n: &str, _r: mesh::MetaRead) -> Result<Option<mesh::MetaSnapshot>> {
-        Err(unimpl("read_meta"))
+    async fn read_meta(&self, node: &str, r: mesh::MetaRead) -> Result<mesh::MetaSnapshot> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .read_meta(meta_read_to_proto(r))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        // 未命中恒返回快照（meta=None，覆盖率快路径需要「缺席也计数」）。
+        Ok(mesh::MetaSnapshot {
+            meta: resp.found.then(|| bytes::Bytes::from(resp.meta)),
+            mod_time_nanos: resp.mod_time_nanos,
+            slots_ok: resp.slots_ok,
+        })
+    }
+    async fn delete_meta(&self, node: &str, r: mesh::MetaRead) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .delete_meta(meta_read_to_proto(r))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
+    }
+    async fn delete_bucket_dir(&self, node: &str, bucket: &str) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .delete_bucket(xl_proto::BucketRef {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
     }
     async fn ensure_bucket(&self, _n: &str, _b: &str) -> Result<()> {
         Err(unimpl("ensure_bucket"))
@@ -217,54 +421,138 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
         }))
     }
 
-    // 其余 RPC 随所属 Task 落地（5a/5b/6/8/9）
+    // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）
     async fn write_shard(
         &self,
-        _r: Request<xl_proto::ShardWrite>,
+        r: Request<xl_proto::ShardWrite>,
     ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let w = r.into_inner();
+        self.store
+            .mesh_write_shard(mesh::ShardWrite {
+                bucket: w.bucket,
+                key: w.key,
+                uuid: w.uuid,
+                part: w.part,
+                shard: w.shard,
+                crc32c: w.crc32c,
+                data: w.data.into(),
+            })
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn read_shard(
         &self,
-        _r: Request<xl_proto::ShardRead>,
+        r: Request<xl_proto::ShardRead>,
     ) -> std::result::Result<tonic::Response<xl_proto::ShardResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let s = r.into_inner();
+        let data = self
+            .store
+            .mesh_read_shard(mesh::ShardRead {
+                bucket: s.bucket,
+                key: s.key,
+                uuid: s.uuid,
+                part: s.part,
+                shard: s.shard,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(match data {
+            Some(d) => xl_proto::ShardResp {
+                found: true,
+                crc32c: ec::crc32c_of(&d),
+                data: d.to_vec(),
+            },
+            None => xl_proto::ShardResp::default(),
+        }))
     }
     async fn delete_version(
         &self,
-        _r: Request<xl_proto::VersionDirRef>,
+        r: Request<xl_proto::VersionDirRef>,
     ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        self.store
+            .mesh_delete_version(dir_ref_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn recycle_version(
         &self,
-        _r: Request<xl_proto::VersionDirRef>,
+        r: Request<xl_proto::VersionDirRef>,
     ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        self.store
+            .mesh_recycle_version(dir_ref_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn prepare_meta(
         &self,
-        _r: Request<xl_proto::MetaWrite>,
+        r: Request<xl_proto::MetaWrite>,
     ) -> std::result::Result<tonic::Response<xl_proto::MetaAck>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let ack = self
+            .store
+            .mesh_prepare_meta(meta_write_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(meta_ack_to_proto(ack)))
     }
     async fn commit_meta(
         &self,
-        _r: Request<xl_proto::MetaWrite>,
+        r: Request<xl_proto::MetaWrite>,
     ) -> std::result::Result<tonic::Response<xl_proto::MetaAck>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let ack = self
+            .store
+            .mesh_commit_meta(meta_write_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(meta_ack_to_proto(ack)))
     }
     async fn abort_meta(
         &self,
-        _r: Request<xl_proto::MetaWrite>,
+        r: Request<xl_proto::MetaWrite>,
     ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        self.store
+            .mesh_abort_meta(meta_write_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn read_meta(
         &self,
-        _r: Request<xl_proto::MetaRead>,
+        r: Request<xl_proto::MetaRead>,
     ) -> std::result::Result<tonic::Response<xl_proto::MetaResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let snap = self
+            .store
+            .mesh_read_meta(meta_read_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(xl_proto::MetaResp {
+            found: snap.meta.is_some(),
+            meta: snap.meta.map(|b| b.to_vec()).unwrap_or_default(),
+            mod_time_nanos: snap.mod_time_nanos,
+            slots_ok: snap.slots_ok,
+        }))
+    }
+    async fn delete_meta(
+        &self,
+        r: Request<xl_proto::MetaRead>,
+    ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
+        self.store
+            .mesh_delete_meta(meta_read_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
+    }
+    async fn delete_bucket(
+        &self,
+        r: Request<xl_proto::BucketRef>,
+    ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
+        self.store
+            .mesh_delete_bucket(&r.into_inner().bucket)
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn ensure_bucket(
         &self,
@@ -313,7 +601,7 @@ pub async fn serve(store: Arc<Store>, addr: SocketAddr, secret: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xl_store::store::StoreConfig;
+    use xl_store::store::{ClusterConfig, ClusterTopology, NodeSpec, StoreConfig};
 
     async fn free_addr() -> SocketAddr {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -369,5 +657,150 @@ mod tests {
         let mesh = TonicMesh::new("n1", "s", &nodes).unwrap();
         let e = mesh.health("n9").await.unwrap_err().to_string();
         assert!(e.contains("未知节点 n9"), "实得：{e}");
+    }
+
+    /// 切片二 RPC 往返：proto ↔ DTO 映射逐字段实证（分片 / meta / 版本目录 / 删桶）。
+    #[tokio::test]
+    async fn data_and_meta_rpcs_roundtrip() {
+        // mesh 面要求 cluster 配置（非集群模式无入口）；1 节点 × 2 盘、ec 1+1 →
+        // q_s = data+1 = 2 全由本机覆盖，写/读都不触发远端扇出（本测无 peer）。
+        let tmp: Vec<tempfile::TempDir> =
+            (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
+        let dirs: Vec<std::path::PathBuf> = tmp.iter().map(|d| d.path().to_path_buf()).collect();
+        let addr = free_addr().await;
+        let nodes = vec![("n1".to_string(), addr.to_string())];
+        // 同一个 TonicMesh 兼作 cluster transport 与测试客户端（1 节点拓扑下不会真连）。
+        let mesh = Arc::new(TonicMesh::new("n1", "tok", &nodes).unwrap());
+
+        let ec = ec::EcConfig {
+            data: 1,
+            parity: 1,
+            enabled: true,
+        };
+        let topo = ClusterTopology::new(
+            0,
+            vec![NodeSpec {
+                id: "n1".into(),
+                addr: addr.to_string(),
+                drive_count: 2,
+            }],
+            &ec,
+        )
+        .unwrap();
+        let mut cfg = StoreConfig::new(&dirs[0]);
+        cfg.drives = dirs;
+        cfg.ec = ec;
+        cfg.fsync = false; // 测试提速
+        cfg.cluster = Some(Arc::new(ClusterConfig {
+            topo,
+            transport: mesh.clone(),
+        }));
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let s2 = store.clone();
+        tokio::spawn(async move {
+            let _ = serve(s2, addr, "tok".into()).await;
+        });
+
+        // server 启动异步：重试直到 health 通
+        let mut up = false;
+        for _ in 0..40 {
+            if mesh.health("n1").await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(up, "server 未就绪");
+
+        // 真对象（meta 读回要求真实编码的 XlMeta——集群读路径会解码）
+        store.create_bucket("buck").await.unwrap();
+        store
+            .put_object("buck", "k", bytes::Bytes::from_static(b"hello"), None)
+            .await
+            .unwrap();
+        let mr = mesh::MetaRead {
+            bucket: "buck".into(),
+            key: "k".into(),
+        };
+        let snap = mesh.read_meta("n1", mr.clone()).await.unwrap();
+        let meta = snap.meta.expect("已提交对象必须读回 meta");
+        assert_eq!(snap.slots_ok, 2); // 覆盖率 = 在册本地盘数（1 节点 × 2 盘）
+
+        // prepare（逐槽 hash）→ commit（内容不变，幂等重演）
+        let mw = mesh::MetaWrite {
+            bucket: "buck".into(),
+            key: "k".into(),
+            meta: meta.clone(),
+        };
+        let ack = mesh.prepare_meta("n1", mw.clone()).await.unwrap();
+        assert!(ack.ok && ack.slots_ok == 2, "{ack:?}");
+        assert_eq!(ack.slots[0].slot, 0);
+        assert_eq!(ack.slots[0].hash, mesh::content_hash(&meta));
+        assert!(mesh.commit_meta("n1", mw.clone()).await.unwrap().ok);
+
+        // 未命中恒返回快照（meta=None），不报错
+        let miss = mesh
+            .read_meta(
+                "n1",
+                mesh::MetaRead {
+                    bucket: "buck".into(),
+                    key: "ghost".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(miss.meta.is_none());
+
+        // 分片：写 → 读回 → 换 part 即缺失（part/shard 映射真的落在查找路径上）
+        let data = bytes::Bytes::from_static(b"hello shard");
+        let sw = |part| mesh::ShardWrite {
+            bucket: "buck".into(),
+            key: "k2".into(),
+            uuid: "u1".into(),
+            part,
+            shard: 0,
+            crc32c: ec::crc32c_of(&data),
+            data: data.clone(),
+        };
+        mesh.write_shard("n1", sw(3)).await.unwrap();
+        let sr = |part| mesh::ShardRead {
+            bucket: "buck".into(),
+            key: "k2".into(),
+            uuid: "u1".into(),
+            part,
+            shard: 0,
+        };
+        assert_eq!(
+            mesh.read_shard("n1", sr(3)).await.unwrap().as_deref(),
+            Some(&data[..])
+        );
+        assert!(mesh.read_shard("n1", sr(4)).await.unwrap().is_none());
+
+        // CRC 不符 → 对端拒收（5xx 上抛，不静默成功）
+        let mut bad = sw(3);
+        bad.crc32c ^= 1;
+        assert!(mesh.write_shard("n1", bad).await.is_err());
+
+        // 版本目录：回收 → 删除（均幂等：不存在也成功）
+        let dirref = mesh::VersionDirRef {
+            bucket: "buck".into(),
+            key: "k".into(),
+            uuid: "ghost".into(),
+        };
+        mesh.recycle_version("n1", dirref.clone()).await.unwrap();
+        mesh.delete_version("n1", dirref).await.unwrap();
+
+        // 删 meta（可见性提交点）→ 再读即缺席
+        mesh.abort_meta("n1", mw).await.unwrap();
+        mesh.delete_meta("n1", mr.clone()).await.unwrap();
+        assert!(mesh.read_meta("n1", mr).await.unwrap().meta.is_none());
+
+        // 删桶：对象目录仍在 → BucketNotEmpty 经 5xx 上抛（对端消息可达，不静默成功）
+        let e = mesh
+            .delete_bucket_dir("n1", "buck")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("bucket not empty"), "实得：{e}");
     }
 }
