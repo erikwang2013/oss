@@ -516,14 +516,14 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 
 **Files:** Modify: `xl-store/src/store/fsck.rs`、`gc.rs`、`cli.rs` 面（命令落点不变）
 
-- [ ] **Step 1:** `fsck`：本机全量 + 对每 peer 先 health（down → 报告 `unreachable` 计项）再扇出分片巡检（v1 用 `read_shard` 逐片；批量 Scrub RPC 留 M4）→ 合并报告。**键集来源（评审）**：缺失检测 = 「本机键集 vs 各 peer `ListLocal` 键并集」**差集**（fsck 本机扫描发现不了缺键）。巡检项：桶目录跨节点比对、meta 缺失（差集）。
-- [ ] **Step 1b（M3 做掉闭环，~30 行）:** `--repair` 对每个缺键 quorum `read_meta` 取最新 meta **写回本机各槽**（复用 write_meta_on）；分片补建：读时修兜底（Task 5b）、批量 heal → M4。报告 JSON 增 `missing_meta_keys` 字段。
-- [ ] **Step 2:** `reap_stale`（gc.rs:56-108）集群 fail-closed（D5）：对象目录清扫前任一节点不可达 → 跳过该对象；trash/tmp 按龄回收照旧。
-- [ ] **Step 3（测试先行）**：
+- [x] **Step 1:** `fsck`：本机全量 + 对每 peer 先 health（down → 报告 `unreachable` 计项）再扇出分片巡检（v1 用 `read_shard` 逐片；批量 Scrub RPC 留 M4）→ 合并报告。**键集来源（评审）**：缺失检测 = 「本机键集 vs 各 peer `ListLocal` 键并集」**差集**（fsck 本机扫描发现不了缺键）。巡检项：桶目录跨节点比对、meta 缺失（差集）。
+- [x] **Step 1b（M3 做掉闭环，~30 行）:** `--repair` 对每个缺键 quorum `read_meta` 取最新 meta **写回本机各槽**（复用 write_meta_on）；分片补建：读时修兜底（Task 5b）、批量 heal → M4。报告 JSON 增 `missing_meta_keys` 字段。
+- [x] **Step 2:** `reap_stale`（gc.rs:56-108）集群 fail-closed（D5）：对象目录清扫前任一节点不可达 → 跳过该对象；trash/tmp 按龄回收照旧。
+- [x] **Step 3（测试先行）**：
   - `fsck_repairs_node_returned`：摘 n2 写入 → 恢复 → `fsck --repair`（in-process 直调）→ n2 槽位分片 CRC 全一致、缺键 meta 已补；
   - `gc_skips_when_any_node_down`：注入不可达 → 断言 reap_stale 对已提交版本目录零删除；
   - `gc_reclaims_orphan_when_all_up`：全上 → 孤儿按龄回收照旧。
-- [ ] **Step 4:** 提交 `feat(m3): 集群化 fsck（验收②）与 gc fail-closed——分区期不误删活数据`。
+- [x] **Step 4:** 提交 `feat(m3): 集群化 fsck（验收②）与 gc fail-closed——分区期不误删活数据`。
 
 **切片二四闸** + e2e 冒烟：4 节点真进程（写→任意节点读一致→kill 一节点→读写继续→拉回→fsck 补齐）。
 
@@ -632,7 +632,20 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 - **双进程冒烟**（2 节点 × 6 盘 = 12 槽）：双方 `/health/cluster` 互认（slots:6）且 ready 200；`kill` n2 → n1 立即标 down + `/health/ready` **503**「可达节点 1/2 < 节点多数 2」；滚动启动探活只 warn（不拒启）。
 - **偏差与笔记**：① `e2e_s3.sh` 需 `ADMIN_PASSWORD=pw`（库中 erik 口令由 Playwright 引导轮设定；脚本默认 `changeme` 是 README 首启口径——环境使然，非回归）；② 本机 9001 端口被**外部服务**占用，冒烟改 9051/9052（与代码无关）；③ 实现顺序微调：mesh.rs trait 随 Task 2 先落（ClusterConfig.transport 需要），tonic server + Health 落在 Task 3 Step 3 一次完成。
 
-### 切片二 / 切片三定稿
+### 切片二（M3-2 数据面）定稿（2026-10-13）
+
+- **提交**：`f77dd6c`（跨节点数据面与 meta 层，Task 5a/5b/6 核心）→ `273a7a7`（xl-client 补齐 ensure_bucket/list_bucket_dirs/list_local 接线）→ `e86a8ef`（Task 7：集群化 fsck + gc 保守门 + 读回退 + 拓扑指纹）→ 本记录。
+- **四闸实跑**：fmt --all 净 · clippy --workspace `-D warnings` 0 · workspace 全绿（xl-store 125+kill9；xl-client 3 测含真 gRPC 往返映射覆盖）· 单机 `e2e_s3.sh` 27 步零差异。
+- **4 节点真进程冒烟（切片二验收门）**：写 2MiB → 4 节点下载 `cmp` 逐字节一致；`kill -9` n4 → 写（1MiB）+ 读继续（9 槽=恰好 quorum）；拉回 n4 → `fsck --repair`（n4 视角差集检出缺键并补建）→ n4 读新旧两对象均一致；`/health/cluster` 四节点全 up。
+- **实现要点与新教训**：
+  - `write_meta_cluster` 三分支（集群 ≥Q_s+补偿 / 单盘 / 多盘 ≥1）落地；补偿含 DeleteMeta（无旧版本）与 prepare+commit 旧内容（有旧）两式。
+  - read_meta 覆盖率快路径 + `read_meta_full` 回退一次（get_object/get_object_range 第 2 轮）。
+  - **循环扇出教训（实锤）**：`mesh_read_meta` 初版调 `self.read_meta` → 集群下服务端再扇出 → in-process 测试死循环挂起。修复=就地本地扫描；「服务端 handler 绝不扇出」为硬约定（头注+测试注释多处写死）。
+  - **冒烟逮住陈旧二进制**：tonic 侧三条接线晚于上次 build，真进程立刻报 `tonic mesh 未实现：list_bucket_dirs` → 500——**in-process 测试盖不到的 proto↔DTO 映射层缺口，只有真进程 e2e 能逮**（Task 10 的存在理由实证）。
+  - 两枚延期微测已补齐（foreign .new 不计翻转 / full 收满全部源）。
+- **偏差**：控制面读扇出（Task 9）未落地前，4 节点冒烟用「同 AK/SK 逐节点种入」过渡；Task 9 完成后此过渡即多余。
+
+### 切片三定稿
 
 （实现后补：四闸实跑、验收①–⑤实弹输出、裁决与偏差。）
 
