@@ -234,12 +234,26 @@ impl Store {
         // 读到过 CRC32C/长度不符的字节：区分「全片消失」（可能并发窗口/真删）与「片坏掉」（真损坏）
         let mut bad_bytes = false;
         for (i, s) in l.shards.iter().enumerate() {
-            // 盘下标是 meta 里的外部输入：越界视同该片缺失（防呆，不 panic）
-            let Some(drive) = drives::drive_root(&self.cfg.drives, s.drive) else {
-                tracing::warn!(drive = s.drive, "EC 分片盘下标越界，视同缺失");
-                missing.push(i);
-                shards.push(None);
-                continue;
+            // 落点解析：单机 = 本机盘下标（越界视同缺失，防呆）；集群 = 本机盘 / 远端槽位
+            let drive = match self.shard_target(s) {
+                Some(drives::ShardTarget::Local { drive, .. }) => drive,
+                Some(drives::ShardTarget::Remote { node, .. }) => {
+                    // M3 Task 5b：read_shard RPC（对端不可达 ≡ 该片缺失）
+                    tracing::warn!(
+                        node,
+                        shard = i,
+                        "远程分片读取未实现（M3 Task 5b），视同缺失"
+                    );
+                    missing.push(i);
+                    shards.push(None);
+                    continue;
+                }
+                None => {
+                    tracing::warn!(drive = s.drive, "EC 分片槽位越界，视同缺失");
+                    missing.push(i);
+                    shards.push(None);
+                    continue;
+                }
             };
             let path = drives::shard_path(drive, bucket, key, &v.part.uuid, s)?;
             match tokio::fs::read(&path).await {
@@ -319,8 +333,14 @@ impl Store {
         };
         for &i in missing {
             let Some(s) = l.shards.get(i) else { continue };
-            let Some(drive) = drives::drive_root(&self.cfg.drives, s.drive) else {
-                continue;
+            let drive = match self.shard_target(s) {
+                Some(drives::ShardTarget::Local { drive, .. }) => drive,
+                Some(drives::ShardTarget::Remote { node, .. }) => {
+                    // M3 Task 5b：write_shard RPC 回写（探活 = RPC 本身，失败 warn）
+                    tracing::warn!(node, shard = i, "远程读时修未实现（M3 Task 5b）");
+                    continue;
+                }
+                None => continue,
             };
             // 存活探测：不得对掉线盘「修复」——挂载点目录仍在父 fs 上，盲写会填满根盘，
             // 测试里更会直接把「拔走」的盘原地重建（探针语义见 drives::drive_up）

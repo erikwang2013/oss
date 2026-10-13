@@ -187,7 +187,7 @@ impl Store {
     /// shards 表须按 shard 下标 12 项齐全，读路径把无文件视同缺失并用 EC 重建。
     /// 内联（< 阈值）不落数据文件：数据进 meta，冗余由 meta 多盘复制提供（M2b-1 记录的边界在此收口）。
     ///
-    /// 返回 `(size, etag, sha256, data_layout, inline, 已触碰盘下标)`；`touched` 供调用方回滚。
+    /// 返回 `(size, etag, sha256, data_layout, inline, 已触碰槽位)`；`touched` 供调用方回滚。
     pub(in crate::store) async fn stage_payload_multi(
         &self,
         bucket: &str,
@@ -201,7 +201,7 @@ impl Store {
         String,
         Option<meta::DataLayout>,
         Option<meta::InlineData>,
-        Vec<usize>,
+        Vec<u16>,
     )> {
         let (size, etag, sha256, part_path) = self.harvest_body(tmp, body).await?;
 
@@ -223,49 +223,56 @@ impl Store {
         drop(payload);
         tokio::fs::remove_file(&part_path).await?;
 
-        let n = self.cfg.drives.len();
         let quorum = self.cfg.ec.data as usize + 1;
-        // 存活探测先行（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
-        let mut up = Vec::with_capacity(n);
-        for drive in &self.cfg.drives {
-            up.push(drives::drive_up(drive).await);
-        }
         // 测试专用断电注入（Task 9）：写到第 N 片后 abort()（SIGABRT），复现「提交点前猝死」。
         // 仅环境变量在场时生效；生产部署不设此变量 = 每次循环多一次 Option 比较，零行为影响。
         let abort_after: Option<usize> = std::env::var("OSS_TEST_ABORT_AFTER_SHARD")
             .ok()
             .and_then(|v| v.parse().ok());
         let mut shard_refs = Vec::with_capacity(shards.len());
-        let mut touched: Vec<usize> = Vec::new();
+        let mut touched: Vec<u16> = Vec::new();
         let mut landed = 0usize;
         for (i, s) in shards.iter().enumerate() {
-            let d = drives::drive_index(i as u8, n);
+            let slot = self.slot_of_shard(i as u8);
             let res: Result<()> = async {
-                if !up[d] {
-                    return Err(Error::QuorumUnmet(format!("盘 {d} 不在册（跳过）")));
+                match self.slot_target(slot) {
+                    Some(drives::ShardTarget::Local { drive, .. }) => {
+                        // 存活探测（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
+                        if !drives::drive_up(drive).await {
+                            return Err(Error::QuorumUnmet(format!("槽位 {slot} 不在册（跳过）")));
+                        }
+                        touched.push(slot);
+                        let dir = layout::object_dir(drive, bucket, key)?.join(uuid);
+                        tokio::fs::create_dir_all(&dir).await?;
+                        let mut f =
+                            tokio::fs::File::create(dir.join(format!("part.1.{i}"))).await?;
+                        f.write_all(s).await?;
+                        f.flush().await?;
+                        if self.cfg.fsync {
+                            f.sync_all().await?;
+                            // 版本目录 fsync：分片目录项先于 meta 翻转持久（否则断电后 meta 存在而目录项丢失）
+                            Store::sync_dir(&dir).await;
+                        }
+                        Ok(())
+                    }
+                    Some(drives::ShardTarget::Remote { node, .. }) => {
+                        // M3 Task 5a：远程落片（write_shard RPC，幂等）
+                        Err(Error::Encode(format!(
+                            "远程落片未实现（node {node}，M3 Task 5a）"
+                        )))
+                    }
+                    None => Err(Error::Encode(format!("槽位 {slot} 越界"))),
                 }
-                touched.push(d);
-                let dir = layout::object_dir(&self.cfg.drives[d], bucket, key)?.join(uuid);
-                tokio::fs::create_dir_all(&dir).await?;
-                let mut f = tokio::fs::File::create(dir.join(format!("part.1.{i}"))).await?;
-                f.write_all(s).await?;
-                f.flush().await?;
-                if self.cfg.fsync {
-                    f.sync_all().await?;
-                    // 版本目录 fsync：分片目录项先于 meta 翻转持久（否则断电后 meta 存在而目录项丢失）
-                    Store::sync_dir(&dir).await;
-                }
-                Ok(())
             }
             .await;
             match res {
                 Ok(()) => landed += 1,
                 Err(e) => {
-                    tracing::warn!(drive = d, shard = i, error = %e, "分片落盘失败（quorum 计数中）");
+                    tracing::warn!(slot, shard = i, error = %e, "分片落盘失败（quorum 计数中）");
                 }
             }
             shard_refs.push(meta::ShardRef {
-                drive: d as u8,
+                drive: slot as u8,
                 part: 1,
                 shard: i as u8,
                 size: s.len() as u64,
@@ -276,11 +283,19 @@ impl Store {
             }
         }
         if landed < quorum {
-            for &d in &touched {
-                let _ = tokio::fs::remove_dir_all(
-                    layout::object_dir(&self.cfg.drives[d], bucket, key)?.join(uuid),
-                )
-                .await;
+            for &slot in &touched {
+                match self.slot_target(slot) {
+                    Some(drives::ShardTarget::Local { drive, .. }) => {
+                        if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+                            let _ = tokio::fs::remove_dir_all(dir.join(uuid)).await;
+                        }
+                    }
+                    Some(drives::ShardTarget::Remote { node, .. }) => {
+                        // M3 Task 5a：delete_version RPC（幂等）
+                        tracing::warn!(node, slot, "远程回滚未实现（M3 Task 5a）");
+                    }
+                    None => {}
+                }
             }
             return Err(Error::QuorumUnmet(format!(
                 "分片存活 {landed} < {}（已回滚 {touched:?}）",
@@ -363,7 +378,8 @@ impl Store {
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
         let now = now_nanos();
-        let multi = self.cfg.multi_drive();
+        // 集群 + 单盘节点也必须走槽位路径（否则分片全落本地 tmp，槽位模型失效）
+        let multi = self.cfg.cluster.is_some() || self.cfg.multi_drive();
 
         // 1)+2) 数据与候选 meta 落位；任何写失败/流错误都回滚本轮
         //（未提交前无任何 meta 引用，失败即弃；残留只占空间，由 `oss-server clean` 按 mtime 回收）

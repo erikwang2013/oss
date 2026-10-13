@@ -35,6 +35,8 @@ pub struct StoreConfig {
     /// 小于此长度的对象内联进 meta（不落 part 文件）。默认 128 KiB。
     /// 不得越过 [`meta::MAX_INLINE`]（meta 解码信任边界），`open` 会拒绝。
     pub inline_threshold: u64,
+    /// M3 集群：静态拓扑 + 节点间传输。**None = 单节点**（v1.4.0 行为逐字节一致）。
+    pub cluster: Option<Arc<drives::ClusterConfig>>,
 }
 
 impl StoreConfig {
@@ -44,6 +46,7 @@ impl StoreConfig {
             fsync: true,
             ec: ec::EcConfig::default(),
             inline_threshold: meta::MAX_INLINE,
+            cluster: None,
         }
     }
 
@@ -141,6 +144,16 @@ impl Store {
                 )));
             }
             tracing::warn!("ec.enabled=false：单文件旧形态，无冗余、无内联");
+        } else if cfg.cluster.is_some() {
+            // M3 集群：本节点盘数只做 self 一致性（本地 3 盘 < 12 是合法节点形态）；
+            // data+parity 的全局校验在 ClusterTopology::new（槽位数 ≥ 12）。
+            let n_self = cfg.cluster.as_ref().unwrap().topo.self_node();
+            if n_self.drive_count as usize != n {
+                return Err(Error::Encode(format!(
+                    "cluster：本节点 {} 声明 {} 盘，实际 {n} 盘",
+                    n_self.id, n_self.drive_count
+                )));
+            }
         } else if n == 1 {
             tracing::warn!("单盘 EC：所有分片同盘，无冗余（多盘冗余需 data_dirs ≥ 12）");
         } else if n < (cfg.ec.data as usize + cfg.ec.parity as usize) {

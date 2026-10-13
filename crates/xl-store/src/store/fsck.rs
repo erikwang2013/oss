@@ -144,9 +144,17 @@ impl Store {
                 let mut miss = 0usize;
                 let mut bad = 0usize;
                 for s in &l.shards {
-                    let Some(drive) = drives::drive_root(&self.cfg.drives, s.drive) else {
-                        miss += 1;
-                        continue;
+                    let drive = match self.shard_target(s) {
+                        Some(drives::ShardTarget::Local { drive, .. }) => drive,
+                        Some(drives::ShardTarget::Remote { .. }) => {
+                            // M3 Task 7：远程巡检（read_shard 逐片）；当前记缺失
+                            miss += 1;
+                            continue;
+                        }
+                        None => {
+                            miss += 1;
+                            continue;
+                        }
                     };
                     let Ok(path) = drives::shard_path(drive, &bucket, &key, &uuid, s) else {
                         miss += 1;
