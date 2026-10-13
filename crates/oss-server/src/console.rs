@@ -8,7 +8,7 @@
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
@@ -57,12 +57,13 @@ fn stale_user() -> Response {
         .into_response()
 }
 
-/// uid + is_admin 一次取出（普通登录路由用）。
+/// uid + is_admin 一次取出（普通登录路由用）。**被停用的账号视同失效**（旧 token 立即作废）。
 #[allow(clippy::result_large_err)]
 async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Response> {
     let uid = uid_of(payload)?;
     match state.db.get_user(uid).await {
-        Ok(Some((_, is_admin))) => Ok((uid, is_admin)),
+        Ok(Some((_, is_admin, true))) => Ok((uid, is_admin)),
+        Ok(Some((_, _, false))) => Err(stale_user()),
         Ok(None) => Err(stale_user()),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
@@ -106,6 +107,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/login", post(login))
         .route("/me", get(me))
+        .route("/me/password", post(change_my_password))
         .route("/groups", get(list_groups))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
@@ -124,6 +126,7 @@ pub fn routes() -> Router<AppState> {
         .route("/users", get(list_users).post(create_user))
         .route("/users/{id}", delete(delete_user))
         .route("/users/{id}/password", post(reset_password))
+        .route("/users/{id}/status", put(set_user_status))
         .route(
             "/users/{id}/permissions",
             get(get_user_permissions).put(set_user_permissions),
@@ -182,10 +185,11 @@ async fn me(State(state): State<AppState>, Extension(payload): Extension<JwtPayl
         Err(r) => return r,
     };
     match state.db.get_user(uid).await {
-        Ok(Some((username, is_admin))) => Json(serde_json::json!({
+        Ok(Some((username, is_admin, true))) => Json(serde_json::json!({
             "id": uid, "username": username, "is_admin": is_admin
         }))
         .into_response(),
+        Ok(Some((_, _, false))) => stale_user(),
         Ok(None) => stale_user(),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
@@ -614,7 +618,7 @@ async fn delete_user(
         return (StatusCode::BAD_REQUEST, "不能删除自己").into_response();
     }
     match state.db.get_user(id).await {
-        Ok(Some((_, true))) => match state.db.count_admins().await {
+        Ok(Some((_, true, _))) => match state.db.count_admins().await {
             Ok(n) if n <= 1 => {
                 return (StatusCode::BAD_REQUEST, "不能删除最后一个管理员").into_response();
             }
@@ -624,7 +628,7 @@ async fn delete_user(
                 return internal_error();
             }
         },
-        Ok(Some((_, false))) => {}
+        Ok(Some((_, false, _))) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
@@ -728,6 +732,97 @@ async fn set_user_permissions(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "写入权限失败");
+            internal_error()
+        }
+    }
+}
+
+// ---- 自助改密与账号启停（遗留清单清理）----
+
+#[derive(Deserialize)]
+struct ChangePasswordBody {
+    old_password: String,
+    new_password: String,
+}
+
+/// 自助改密（任何登录者，需验旧口令）。改密后旧 JWT 不失效（sub 未变）——接受，
+/// 必要时可由管理员停用账号强制全员重登。
+async fn change_my_password(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Json(body): Json<ChangePasswordBody>,
+) -> Response {
+    let (uid, _) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if body.new_password.len() < 8 {
+        return (StatusCode::BAD_REQUEST, "新口令过短（至少 8 位）").into_response();
+    }
+    let username = match state.db.get_user(uid).await {
+        Ok(Some((name, _, _))) => name,
+        _ => return stale_user(),
+    };
+    match state.db.verify_user(&username, &body.old_password).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::BAD_REQUEST, "旧口令不正确").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "校验旧口令失败");
+            return internal_error();
+        }
+    }
+    match state.db.set_password(uid, &body.new_password).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "改密失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UserStatusBody {
+    active: bool,
+}
+
+/// 启停用账号（管理员）。停用即全链路失效：登录 401、既有 JWT 下一请求 401、
+/// S3 的 AK 403、上传面 401。防呆：不能停用自己、不能停用最后一个在册管理员。
+async fn set_user_status(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+    Json(body): Json<UserStatusBody>,
+) -> Response {
+    let me = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if id == me && !body.active {
+        return (StatusCode::BAD_REQUEST, "不能停用自己").into_response();
+    }
+    match state.db.get_user(id).await {
+        Ok(Some((_, true, _))) if !body.active => match state.db.count_active_admins().await {
+            Ok(n) if n <= 1 => {
+                return (StatusCode::BAD_REQUEST, "不能停用最后一个在册管理员").into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "统计管理员失败");
+                return internal_error();
+            }
+        },
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户失败");
+            return internal_error();
+        }
+    }
+    match state.db.set_user_status(id, body.active).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "更新用户状态失败");
             internal_error()
         }
     }

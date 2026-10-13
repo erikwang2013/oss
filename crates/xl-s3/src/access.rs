@@ -50,12 +50,13 @@ impl Acl {
     }
 
     /// AK → (uid, is_admin)。status/expires 条件与 `SigV4Auth::get_secret_key` 同口径
-    ///（认证面与授权面查的是同一行，任一处撤销即同时失效）。
+    ///（认证面与授权面查的是同一行，任一处撤销即同时失效）；**账号停用（users.status）
+    /// 同样使 AK 失效**——停用即全链路出局。
     pub async fn user_of_key(&self, access_key: &str) -> Result<Option<AuthedUser>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT ak.user_id AS user_id, u.is_admin AS is_admin \
              FROM access_keys ak JOIN users u ON u.id = ak.user_id \
-             WHERE ak.access_key = ? AND ak.status = 'active' \
+             WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
                AND (ak.expires_at IS NULL OR ak.expires_at > ?)",
         )
         .bind(access_key)
@@ -287,7 +288,8 @@ mod tests {
     async fn acl() -> Acl {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER NOT NULL DEFAULT 0);\
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER NOT NULL DEFAULT 0, \
+              status TEXT NOT NULL DEFAULT 'active');\
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);\
              CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL);\
@@ -464,6 +466,13 @@ mod tests {
             })
         );
         assert_eq!(a.user_of_key("AK_UNKNOWN").await.unwrap(), None);
+
+        // 账号停用 → AK 立即失效（全链路出局）
+        sqlx::query("UPDATE users SET status = 'disabled' WHERE id = 2")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(a.user_of_key("AK_OK").await.unwrap(), None);
     }
 
     #[tokio::test]

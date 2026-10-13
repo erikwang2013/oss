@@ -80,7 +80,14 @@ async fn gate(
     let Some(uid) = payload.sub().and_then(|s| s.parse::<i64>().ok()) else {
         return Some(problem(401, "invalid_token", "登录态无效，请重新登录"));
     };
-    let is_admin = matches!(st.app.db.get_user(uid).await, Ok(Some((_, true))));
+    let (is_admin, active) = match st.app.db.get_user(uid).await {
+        Ok(Some((_, admin, active))) => (admin, active),
+        _ => (false, false),
+    };
+    if !active {
+        // 被停用的账号：旧 JWT 立即作废（与控制台 who() 同口径）
+        return Some(problem(401, "invalid_token", "登录态无效，请重新登录"));
+    }
     match Acl::new(st.app.db.pool().clone())
         .can(AuthedUser { uid, is_admin }, action, bucket)
         .await

@@ -44,6 +44,16 @@ export default function Users() {
     onError: (e: Error) => message.error(e.message),
   })
 
+  const setStatus = useMutation({
+    mutationFn: (payload: { id: number; active: boolean }) =>
+      api(`/api/v1/users/${payload.id}/status`, {
+        method: 'PUT',
+        body: JSON.stringify({ active: payload.active }),
+      }),
+    onSuccess: (_r, v) => { message.success(v.active ? '已启用' : '已停用'); invalidate() },
+    onError: (e: Error) => message.error(e.message),
+  })
+
   const savePerms = useMutation({
     mutationFn: (payload: { id: number; rows: Permission[] }) =>
       api(`/api/v1/users/${payload.id}/permissions`, {
@@ -85,8 +95,13 @@ export default function Users() {
           { title: '用户名', dataIndex: 'username' },
           {
             title: '角色',
-            width: 100,
-            render: (_: unknown, u: UserRow) => (u.is_admin ? <Tag color="gold">管理员</Tag> : <Tag>子账户</Tag>),
+            width: 140,
+            render: (_: unknown, u: UserRow) => (
+              <>
+                {u.is_admin ? <Tag color="gold">管理员</Tag> : <Tag>子账户</Tag>}
+                {u.status !== 'active' && <Tag color="red">已停用</Tag>}
+              </>
+            ),
           },
           {
             title: '权限',
@@ -94,12 +109,22 @@ export default function Users() {
           },
           {
             title: '操作',
-            width: 180,
+            width: 260,
             render: (_: unknown, u: UserRow) => (
               <>
                 <Button size="small" onClick={() => openPerms(u)} disabled={u.is_admin} style={{ marginRight: 8 }}>
                   权限
                 </Button>
+                {/* 启停用：停用即全链路失效（登录/S3/上传面），旧 JWT 下一请求 401 */}
+                {u.status === 'active' ? (
+                  <Popconfirm title={`停用 ${u.username}？其 AK 与登录将立即失效`} onConfirm={() => setStatus.mutate({ id: u.id, active: false })}>
+                    <Button size="small" style={{ marginRight: 8 }}>停用</Button>
+                  </Popconfirm>
+                ) : (
+                  <Button size="small" onClick={() => setStatus.mutate({ id: u.id, active: true })} style={{ marginRight: 8 }}>
+                    启用
+                  </Button>
+                )}
                 {!u.is_admin && (
                   <Popconfirm title={`删除子账户 ${u.username}？`} onConfirm={() => remove.mutate(u.id)}>
                     <Button danger size="small">删除</Button>

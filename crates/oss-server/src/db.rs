@@ -28,6 +28,8 @@ pub struct UserRow {
     pub id: i64,
     pub username: String,
     pub is_admin: bool,
+    /// `"active"` / `"disabled"`（停用即全链路失效）
+    pub status: String,
     pub created_at: i64,
     pub permissions: Vec<PermissionRow>,
 }
@@ -65,7 +67,25 @@ impl Db {
         let pool = SqlitePool::connect_with(opts).await?;
         // sqlx::raw_sql 支持一个字符串里的多条语句，schema 文件原样执行
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        Ok(Self { pool })
+        let db = Self { pool };
+        db.ensure_columns().await?;
+        Ok(db)
+    }
+
+    /// 极小增量迁移：0001 是**整份重放**（全部 IF NOT EXISTS），而 `ALTER ADD COLUMN`
+    /// 不幂等，放不进重放——增量列在这里探测后补齐。新库由 0001 直接带列，两个路径收敛。
+    /// 字面量 SQL（sqlx 0.9 拒动态串）；目前只有一个增量列（users.status）。
+    async fn ensure_columns(&self) -> Result<()> {
+        let cols = sqlx::query("SELECT name FROM pragma_table_info('users')")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_status = cols.iter().any(|r| r.get::<String, _>("name") == "status");
+        if !has_status {
+            sqlx::query("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -97,10 +117,13 @@ impl Db {
 
     pub async fn verify_user(&self, username: &str, password: &str) -> Result<Option<i64>> {
         // ponytail: 非常量时间比较 + 用户存在性时序（未命中不比对）M1 已接受；M4 换 Argon2 时随方案处置。
-        let row = sqlx::query("SELECT id, password_hash FROM users WHERE username = ?")
-            .bind(username)
-            .fetch_optional(&self.pool)
-            .await?;
+        // status='active'：被停用的账号登录直接按「用户名或密码错误」处理（不问不答）。
+        let row = sqlx::query(
+            "SELECT id, password_hash FROM users WHERE username = ? AND status = 'active'",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.and_then(|r| {
             let hash: String = r.get("password_hash");
             (crate::db::hash_password(password) == hash).then(|| r.get::<i64, _>("id"))
@@ -295,9 +318,9 @@ impl Db {
 
     // ---- 子账户与权限（M-权限体系）----
 
-    /// 取用户（`/me`、admin 判定用）：(username, is_admin)。
-    pub async fn get_user(&self, uid: i64) -> Result<Option<(String, bool)>> {
-        let row = sqlx::query("SELECT username, is_admin FROM users WHERE id = ?")
+    /// 取用户（`/me`、admin 判定、停用拦截用）：(username, is_admin, is_active)。
+    pub async fn get_user(&self, uid: i64) -> Result<Option<(String, bool, bool)>> {
+        let row = sqlx::query("SELECT username, is_admin, status FROM users WHERE id = ?")
             .bind(uid)
             .fetch_optional(&self.pool)
             .await?;
@@ -305,15 +328,35 @@ impl Db {
             (
                 r.get::<String, _>("username"),
                 r.get::<i64, _>("is_admin") != 0,
+                r.get::<String, _>("status") == "active",
             )
         }))
     }
 
+    /// 启停用用户。返回是否有该用户。
+    pub async fn set_user_status(&self, uid: i64, active: bool) -> Result<bool> {
+        let n = sqlx::query("UPDATE users SET status = ? WHERE id = ?")
+            .bind(if active { "active" } else { "disabled" })
+            .bind(uid)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// 在册（active）管理员数：保护「不能停用最后一个可用管理员」。
+    pub async fn count_active_admins(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active'")
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// 全部用户 + 各自权限行（子账户管理页；数量级 = 人手，两步查询足够）。
     pub async fn list_users(&self) -> Result<Vec<UserRow>> {
-        let users = sqlx::query("SELECT id, username, is_admin, created_at FROM users ORDER BY id")
-            .fetch_all(&self.pool)
-            .await?;
+        let users =
+            sqlx::query("SELECT id, username, is_admin, status, created_at FROM users ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?;
         let mut out = Vec::with_capacity(users.len());
         for r in users {
             let id: i64 = r.get("id");
@@ -321,6 +364,7 @@ impl Db {
                 id,
                 username: r.get("username"),
                 is_admin: r.get::<i64, _>("is_admin") != 0,
+                status: r.get("status"),
                 created_at: r.get("created_at"),
                 permissions: self.get_permissions(id).await?,
             });
@@ -485,7 +529,7 @@ mod tests {
         // get_user / count_admins / set_password
         assert_eq!(
             db.get_user(sub).await.unwrap(),
-            Some(("sub".to_string(), false))
+            Some(("sub".to_string(), false, true))
         );
         assert_eq!(db.get_user(999).await.unwrap(), None);
         assert_eq!(db.count_admins().await.unwrap(), 1);
@@ -721,5 +765,70 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(name, "n3");
+    }
+
+    #[tokio::test]
+    async fn user_status_disable_flow() {
+        let db = db().await;
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let sub = db.create_user("sub", "pw12345678", false).await.unwrap();
+
+        // 停用：登录与 get_user 的 active 位立即反映
+        assert!(db.set_user_status(sub, false).await.unwrap());
+        assert_eq!(
+            db.get_user(sub).await.unwrap(),
+            Some(("sub".to_string(), false, false))
+        );
+        assert!(db.verify_user("sub", "pw12345678").await.unwrap().is_none());
+        // 在册管理员计数：停用的管理员不计入
+        assert_eq!(db.count_active_admins().await.unwrap(), 1);
+        assert!(db.set_user_status(admin, false).await.unwrap());
+        assert_eq!(db.count_active_admins().await.unwrap(), 0);
+        // 重新启用恢复
+        assert!(db.set_user_status(admin, true).await.unwrap());
+        assert_eq!(db.count_active_admins().await.unwrap(), 1);
+        assert!(
+            db.verify_user("sub", "pw12345678").await.unwrap().is_none(),
+            "停用者仍登录不了"
+        );
+        assert!(!db.set_user_status(999, true).await.unwrap());
+    }
+
+    /// ensure_columns 幂等：老库（无 status 列）升级补列；再开一次不得重复 ALTER 报错。
+    #[tokio::test]
+    async fn ensure_columns_migrates_legacy_db_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+
+        // 手工造一个「老库」：0001 的老形态（users 无 status）+ 必要表
+        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, \
+              password_hash TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, is_admin, created_at) VALUES ('old', 'h', 1, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        // 首次 connect：重放 0001（IF NOT EXISTS 不动老表）+ ensure_columns 补 status
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let db = Db::connect(&url).await.unwrap();
+        assert_eq!(
+            db.get_user(1).await.unwrap(),
+            Some(("old".to_string(), true, true)),
+            "老行应补出 status='active'"
+        );
+        drop(db);
+
+        // 二次 connect：列已存在，不得因重复 ALTER 失败
+        let db = Db::connect(&url).await.unwrap();
+        assert!(db.get_user(1).await.unwrap().is_some());
     }
 }

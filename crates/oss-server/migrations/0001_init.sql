@@ -4,6 +4,9 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     is_admin      INTEGER NOT NULL DEFAULT 0,  -- M1 只写 0/1（创建时定）；不加 CHECK，M4 引角色时再演进
+    -- 'active' / 'disabled'：停用即全链路失效（登录 401、S3 的 AK 403、控制台与上传面 401）。
+    -- 旧库由 db.rs 的 ensure_columns 探测补齐（ALTER 不幂等，不能放这整份重放里）。
+    status        TEXT NOT NULL DEFAULT 'active',
     created_at    INTEGER NOT NULL
 );
 

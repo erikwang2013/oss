@@ -74,6 +74,17 @@ pub async fn run(
     match cmd {
         Command::Serve => {
             let listen = state.cfg.listen.clone();
+            // 绑定期检（遗留清单修复）：ecat 把 server 丢进 tokio::spawn，start() 失败
+            // （如 EADDRINUSE）只记一条 error 日志，而 run() 继续 wait_for_shutdown 等信号
+            // → 端口被占时进程「假活」（活着但无监听，systemd 视作健康）。这里先探测绑定
+            // 一次：失败直接上抛 → main 非零退出；成功立即释放，随后 ecat 复绑。
+            // 释放与复绑之间有毫秒级竞态窗口（他人恰好抢到）——命中时退化为原假活行为，
+            // 由 ecat 的 error 日志暴露；根治需 transport 支持外部 listener（上游增强项）。
+            let probe = tokio::net::TcpListener::bind(&listen)
+                .await
+                .map_err(|e| format!("监听地址 {listen} 绑定失败: {e}"))?;
+            drop(probe);
+
             let router = crate::router::build_router(state)?;
             let mut app = ecat::App::builder()
                 .name("oss")

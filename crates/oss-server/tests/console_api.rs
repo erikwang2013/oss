@@ -235,6 +235,11 @@ async fn all_routes_reject_anonymous() {
         (reqwest::Method::GET, "/api/v1/groups", None),
         // 子账户与权限（管理员面；这里只验「无 token 一律 401」）
         (reqwest::Method::GET, "/api/v1/me", None),
+        (
+            reqwest::Method::POST,
+            "/api/v1/me/password",
+            Some(serde_json::json!({"old_password": "x", "new_password": "pw12345678"})),
+        ),
         (reqwest::Method::GET, "/api/v1/users", None),
         (
             reqwest::Method::POST,
@@ -247,6 +252,11 @@ async fn all_routes_reject_anonymous() {
             "/api/v1/users/999/password",
             Some(serde_json::json!({"password": "pw12345678"})),
         ),
+        (
+            reqwest::Method::PUT,
+            "/api/v1/users/999/status",
+            Some(serde_json::json!({"active": false})),
+        ),
         (reqwest::Method::GET, "/api/v1/users/999/permissions", None),
         (
             reqwest::Method::PUT,
@@ -254,7 +264,7 @@ async fn all_routes_reject_anonymous() {
             Some(serde_json::json!([])),
         ),
     ];
-    assert_eq!(cases.len(), 18, "路由表变化时同步此表（19 条 - login）");
+    assert_eq!(cases.len(), 20, "路由表变化时同步此表（21 条 - login）");
 
     for (method, path, body) in cases {
         let mut req = client.request(method.clone(), format!("{base}{path}"));

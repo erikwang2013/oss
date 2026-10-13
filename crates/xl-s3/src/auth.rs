@@ -26,9 +26,12 @@ impl S3Auth for SigV4Auth {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // JOIN users：账号停用（users.status）同样让 AK 失效——认证面与授权面同口径，
+        // 停用即全链路出局（授权层 Acl::user_of_key 有一份同样的 JOIN，防单点遗漏）。
         let row = sqlx::query(
-            "SELECT secret_key FROM access_keys \
-             WHERE access_key = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > ?)",
+            "SELECT ak.secret_key FROM access_keys ak JOIN users u ON u.id = ak.user_id \
+             WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
+               AND (ak.expires_at IS NULL OR ak.expires_at > ?)",
         )
         .bind(access_key)
         .bind(now)
@@ -55,7 +58,7 @@ mod tests {
     async fn oss_test_db() -> sqlx::SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);\
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, status TEXT NOT NULL DEFAULT 'active');\
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);",
         )

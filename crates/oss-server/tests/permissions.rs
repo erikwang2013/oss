@@ -480,3 +480,135 @@ async fn register_upload_is_guarded_and_claims_once() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn self_password_change_and_disable_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _st) = boot(&dir).await;
+    let root = login(&base, "erik", "pw").await.unwrap();
+    let sub_id = create_sub(&base, &root, "sub").await;
+    let sub = login(&base, "sub", "pw12345678").await.unwrap();
+
+    // --- 自助改密 ---
+    // 旧口令错 → 400；新口令过短 → 400
+    let r = client()
+        .post(format!("{base}/api/v1/me/password"))
+        .bearer_auth(&sub)
+        .json(&serde_json::json!({"old_password": "wrong", "new_password": "newpw-1234"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = client()
+        .post(format!("{base}/api/v1/me/password"))
+        .bearer_auth(&sub)
+        .json(&serde_json::json!({"old_password": "pw12345678", "new_password": "short"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // 正确改密 → 204；旧口令失效、新口令可登录
+    let r = client()
+        .post(format!("{base}/api/v1/me/password"))
+        .bearer_auth(&sub)
+        .json(&serde_json::json!({"old_password": "pw12345678", "new_password": "newpw-1234"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(login(&base, "sub", "pw12345678").await.is_none());
+    let sub = login(&base, "sub", "newpw-1234").await.unwrap();
+
+    // --- 启停用 ---
+    // 管理员凭停用前的旧 token 拉列表：body 里带 status
+    let users: Vec<serde_json::Value> = client()
+        .get(format!("{base}/api/v1/users"))
+        .bearer_auth(&root)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sub_row = users.iter().find(|u| u["username"] == "sub").unwrap();
+    assert_eq!(sub_row["status"], "active");
+
+    // 停用：不能停用自己；停用 sub 后——登录 401、旧 JWT 的 /me 401、/buckets 401
+    let root_id: i64 = {
+        let me: serde_json::Value = client()
+            .get(format!("{base}/api/v1/me"))
+            .bearer_auth(&root)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        me["id"].as_i64().unwrap()
+    };
+    let r = client()
+        .put(format!("{base}/api/v1/users/{root_id}/status"))
+        .bearer_auth(&root)
+        .json(&serde_json::json!({"active": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "不能停用自己");
+
+    let r = client()
+        .put(format!("{base}/api/v1/users/{sub_id}/status"))
+        .bearer_auth(&root)
+        .json(&serde_json::json!({"active": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(
+        login(&base, "sub", "newpw-1234").await.is_none(),
+        "停用后登录 401"
+    );
+    let r = client()
+        .get(format!("{base}/api/v1/me"))
+        .bearer_auth(&sub)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "停用后旧 JWT 立即失效"
+    );
+
+    // 列表里状态可见；重新启用恢复
+    let users: Vec<serde_json::Value> = client()
+        .get(format!("{base}/api/v1/users"))
+        .bearer_auth(&root)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sub_row = users.iter().find(|u| u["username"] == "sub").unwrap();
+    assert_eq!(sub_row["status"], "disabled");
+    let r = client()
+        .put(format!("{base}/api/v1/users/{sub_id}/status"))
+        .bearer_auth(&root)
+        .json(&serde_json::json!({"active": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(login(&base, "sub", "newpw-1234").await.is_some());
+
+    // 最后一个在册管理员不可停用（把 erik 降为唯一管理员的情形不在此构造——
+    // 这里是「只读管理员自己」的守卫：停用自己已被上一条 400 拦住）
+    let r = client()
+        .put(format!("{base}/api/v1/users/999/status"))
+        .bearer_auth(&root)
+        .json(&serde_json::json!({"active": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND, "不存在的用户 404");
+}
