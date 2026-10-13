@@ -270,10 +270,10 @@ impl Stream for ChecksumTailStream {
 
 **Files:** `web/e2e/console.spec.ts`（追加用例）
 
-- [ ] 现状（已核对源码，无需改前端）：vendored 脚本自带 `parseProblem`——失败响应把本地化 `title` 写进 `#aetherupload-output`（`aetherupload-all.js` 229/334/368 行），409 `chunk_out_of_order` 还带 `expected_index` 续传特判。
-- [ ] 用例：选超过目标分组 `max_size` 的文件上传 → 断言 `#aetherupload-output` 出现 `「错误：」` 前缀的本地化 title（413 payload_too_large）；这是问题响应链路的第一个端到端断言（e2e 代理标注的覆盖缺口）。
-- [ ] 跑 `npm run e2e`（高负载用 `--workers=1`；vitest 的 `startupTimeout` 已在配置里）。
-- [ ] 提交——`git commit -m "test(web): 控制台 e2e 覆盖 2.0 问题响应——超限上传的本地化 title 显示"`
+- [x] 现状（已核对源码，无需改前端）：vendored 脚本自带 `parseProblem`——失败响应把本地化 `title` 写进 `#aetherupload-output`（`aetherupload-all.js` 229/334/368 行），409 `chunk_out_of_order` 还带 `expected_index` 续传特判。
+- [x] 用例：选超过目标分组 `max_size` 的文件上传 → 断言 `#aetherupload-output` 出现 `「错误：」` 前缀的本地化 title（413 payload_too_large）；这是问题响应链路的第一个端到端断言（e2e 代理标注的覆盖缺口）。（**实跑改判**：preprocess 参数层先拒 → 实测为 400 `invalid_parameter`「错误：请求参数非法」（413 仅对少报大小可达）；用例按实测措辞落成，已在 console.spec.ts 用例 3 并经多轮 e2e 实弹。）
+- [x] 跑 `npm run e2e`（高负载用 `--workers=1`；vitest 的 `startupTimeout` 已在配置里）。（已跑；后随权限特性复跑 5/5 ×2 轮。）
+- [x] 提交——`git commit -m "test(web): 控制台 e2e 覆盖 2.0 问题响应——超限上传的本地化 title 显示"`（d785f75。）
 
 ---
 

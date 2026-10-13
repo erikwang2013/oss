@@ -258,12 +258,12 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 **Files:** Modify: `store.rs`（StoreConfig/Store/root/open）、Create: `store/drives.rs`、`layout.rs`、`config.rs`（oss-server）
 
-- [ ] **Step 1: 设计裁决（写进代码注释）**：
+- [x] **Step 1: 设计裁决（写进代码注释）**：（已落地：`StoreConfig.drives`/`root()=drives[0]`；`set_index` 公式+测试留形不留行为；每盘完整命名空间+拓扑下标寻址；盘数裁决见 open——「enabled=false 仅单盘 / 单盘 EC 合法 warn / 2..11 盘 Err」，与原文的差异见 Task 7 落地裁决。）
   - `StoreConfig { drives: Vec<PathBuf>, … }`；单盘形态 = `vec![root]`；`root()` 返回 `drives[0]`（既有调用点零波及）。
   - **set 划分**：M2b 单机单 set = 全部盘（`sets.len() == 1`）；`set_index = crc32c(bucket + "/" + key) % sets.len()` 先落公式但取模恒 0——**为 M3 的多 set 留形不留行为**（设计 §5.3 的确定性哈希从第一天就在，rebalance 才需要 >1 set）。
   - 每盘持有完整命名空间（对象目录 + meta 副本）；EC 分片按 `ShardRef.drive` 分发到 `drives[i]` 下**同构路径**：`<drive>/<bucket>/<展平键>/<uuid>/part.1.<shard>`——换挂载点/换盘不影响寻址（铁律 ⑤）。
   - **启动校验（含单盘向上兼容裁决——评审补）**：`drives.len() < data + parity` 时不得无条件 Err——单盘/少盘是 M1/M2a 的既有部署形态，升级即破不可接受。裁决：`[ec] enabled` 可配（默认 true）——**enabled=true 且盘数不足 → 构造期 Err**（大声失败，设计 §4.3 的 8+4 需要 ≥12 盘位，测试用 12 个 tempdir）；**enabled=false → 单文件旧形态继续（新写仍走 `data_layout: None`），并 warn 提示无冗余**。README/迁移说明必须写清这条开关。
-- [ ] **Step 2:** 实现 `drives.rs`：`enum DriveState { Up, Missing }`、存活探测（写探针文件）、`shard_path(drives, &ShardRef, bucket, key, uuid)`、quorum 判定。
+- [x] **Step 2:** 实现 `drives.rs`：`enum DriveState { Up, Missing }`、存活探测（写探针文件）、`shard_path(drives, &ShardRef, bucket, key, uuid)`、quorum 判定。（已落地为 `drives.rs`（`drive_index`/`drive_up`/`shard_path`/`drive_root`）+ put.rs 的 landed/prepared/flipped quorum；差异：存活探测未写独立探针文件，复用 open 建的 `.oss.sys` 信标——见落地裁决 2。）
 - [x] **Step 3:** `oss-server/config.rs`：`data_dirs: Option<Vec<PathBuf>>`（有它用数组；否则 `data_dir` 单盘兼容）；`[ec] data/parity`、`inline_threshold` 可配；`state.rs` 构造点同步。（`[ec] enabled` 一并可配，见落地裁决。）
 - [x] **Step 4:** gc/clean 多盘遍历（每盘各自的 `.oss.sys`）。（与 Task 8 合并为一次提交。）提交 `feat(xl-store): 多盘——drives[]、对象→set 映射（单 set）、分片按拓扑下标分发`。
 
@@ -295,7 +295,7 @@ if size < self.cfg.inline_threshold（实际上需边写边判，写完整份再
 
 - [x] **Step 1: 复核现有假设（代码注释已明确挂着）**：「ext4/XFS 隐含提交先前的 rename，故提交点一次 rename 即可；**没有目录 fsync**」。M2b 处置：`fsync=true` 时在**两处 rename 之后**补目录 fsync（封装 `sync_dir(path)`：`File::open(dir)?.sync_all()`，两处 = tmp→对象目录、meta.new→meta）；并在文档标注：目录 fsync 在部分文件系统上返回 EINVAL（忽略并 warn）——物理保证需按盘上文件系统复核。（**落地扩展**：多盘直写路径在每片 fsync 后补版本目录 fsync——分片目录项须先于 meta 翻转持久；`stage_payload` 收尾补 tmp 目录 fsync。）
 - [x] **Step 2: kill -9 用例**（集成测试形态）：`crates/xl-store/tests/kill9.rs`——同一测试二进制两段子进程重入：段 1 写 v1 正常退出；段 2 以 `OSS_TEST_ABORT_AFTER_SHARD=8` 写 v2、第 8 片落盘后 `std::process::abort()`（SIGABRT）。父进程断言：子进程死于信号 6、重启后 **v1 可见 / v2 无影**、`reap_transient` 清空 tmp、半提交分片被 `reap_stale` 回收且回收后 v1 仍可读。（比任务书的 oss-server 子进程版更直接：绕开 HTTP 层，注入点即提交点前的最后一步。）
-- [ ] **Step 3:** 把设计验收 #3（rclone 并发 100×100 MB + 中断重试）写为 `tests/e2e_s3.sh` 的可选长跑段（`E2E_LONG=1` 门控，默认跳过——高负载机器上分钟级）。**委派 e2e 子代理在切片二收尾时落地**（脚本是它的守备范围；本机高负载下 E2E_LONG 实跑人工触发）。
+- [x] **Step 3:** 把设计验收 #3（rclone 并发 100×100 MB + 中断重试）写为 `tests/e2e_s3.sh` 的可选长跑段（`E2E_LONG=1` 门控，默认跳过——高负载机器上分钟级）。**已由 e2e 子代理落地**（13b 段：生成 N×MB → 慢传中断 kill -9 → 并发续跑 → 逐对象 md5 比对；微缩版 8×8MB 实跑通过，默认 100×100 MB 人工触发）。
 - [x] **Step 4:** 提交 `feat(xl-store): 目录 fsync 复核 + kill -9 断电用例；长跑并发验收入 e2e 门控段`。（与 Task 7/8 合并为一次提交；Step 3 见上。）
 
 ### 切片二收尾
