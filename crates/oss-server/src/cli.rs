@@ -93,10 +93,20 @@ pub async fn run(
                     .iter()
                     .find(|n| n.id == cl.node_id)
                     .ok_or_else(|| format!("cluster.node_id «{}» 不在节点表内", cl.node_id))?;
-                let addr: std::net::SocketAddr = self_node
-                    .addr
-                    .parse()
-                    .map_err(|e| format!("cluster 节点地址非法（{}）: {e}", self_node.addr))?;
+                // 地址支持主机名（docker compose 服务名 / DNS 名）：先按 IP:port 解析，
+                // 失败走一次解析取首个结果绑定；对端拨号仍用配置原串（tonic 自带 DNS）。
+                let addr: std::net::SocketAddr = match self_node.addr.parse() {
+                    Ok(a) => a,
+                    Err(_) => tokio::net::lookup_host(&self_node.addr)
+                        .await
+                        .map_err(|e| {
+                            format!("cluster 节点地址解析失败（{}）: {e}", self_node.addr)
+                        })?
+                        .next()
+                        .ok_or_else(|| {
+                            format!("cluster 节点地址无解析结果（{}）", self_node.addr)
+                        })?,
+                };
                 let probe = tokio::net::TcpListener::bind(addr)
                     .await
                     .map_err(|e| format!("mesh 监听 {addr} 绑定失败: {e}"))?;

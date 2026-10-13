@@ -1,0 +1,13 @@
+# 构建上下文瘦身：只保留 Cargo workspace + crates/ + web/ + docker/ 配置
+target
+web/node_modules
+web/dist
+web/test-results
+.git
+docs
+data
+staging
+disk*
+*.log
+test-results
+node_modules

@@ -126,6 +126,28 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   - 撤回授权对**在途分块上传**不追溯（preprocess 已放行的会传完）；新请求即时生效。
 >   - 建子账户 API 固定为非管理员（防提权）；口令至少 8 位；删除用户级联清其密钥与授权。
 
+## Docker（compose）
+
+**单机**（oss-server + 控制台 nginx）：
+
+```bash
+docker compose up --build        # 控制台 http://localhost:8080 · S3/API http://localhost:9000
+```
+
+**M3 集群**（4 节点 × 3 盘 = 12 槽；服务名即节点地址）：
+
+```bash
+docker compose -f docker-compose.cluster.yml up --build
+# S3/控制面入口：n1:9000 · n2:9001 · n3:9002 · n4:9003（任意节点等价）；控制台 :8080 反代 n1
+```
+
+- 配置：单机 `docker/oss.toml`；集群 `docker/cluster/n{1..4}/oss.toml`（静态拓扑，注释在文件里）。
+  **生产必改** `jwt_secret` 与集群 `secret`（以及默认管理员口令）。
+- 数据/暂存在具名卷（`docker compose down -v` 才清）；集群每节点独立卷。
+- S3 客户端**直连节点端口**（SigV4/流式不经 nginx）；控制台走 :8080 的反代。
+- 镜像：`Dockerfile`（oss-server release 构建，含 protoc）与 `docker/Dockerfile.web`（vite 构建 + nginx）。
+- 集群 compose 的节点 `addr` 用服务名（主机名）——引导解析绑定 + 对端按名拨号（同一份配置两用）。
+
 ## 控制台（M1b）
 
 ```bash

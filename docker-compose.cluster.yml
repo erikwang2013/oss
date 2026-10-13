@@ -1,0 +1,75 @@
+# M3 集群版：4 节点 × 3 盘 = 12 槽（EC 8+4）+ 控制台。
+#   docker compose -f docker-compose.cluster.yml up --build
+# S3/控制面入口：n1 :9000、n2 :9001、n3 :9002、n4 :9003（任意节点等价——AK 读扇出、
+# 数据面 quorum 读写）；控制台 :8080 反代 n1。
+# 临界口径（README「集群模式」）：停 1 节点=写零余量（客户端重试收敛）；停 2 节点=写拒
+# 且读不可达（GET 500，非 404）。每个节点独立的具名卷（各自命名空间 + 元数据）。
+x-oss-common: &oss-common
+  build: .
+  image: oss-server:dev
+  environment:
+    OSS_ADMIN_USER: erik
+    OSS_ADMIN_PASSWORD: pw   # 生产必改
+  restart: unless-stopped
+
+services:
+  n1:
+    <<: *oss-common
+    ports:
+      - "9000:9000"
+    volumes:
+      - n1-data:/data
+      - n1-staging:/staging
+      - ./docker/cluster/n1/oss.toml:/app/oss.toml:ro
+    networks:
+      default:
+        aliases:
+          - oss   # 控制台 nginx 的固定上游名（与单机共用一份 nginx.conf）
+
+  n2:
+    <<: *oss-common
+    ports:
+      - "9001:9000"
+    volumes:
+      - n2-data:/data
+      - n2-staging:/staging
+      - ./docker/cluster/n2/oss.toml:/app/oss.toml:ro
+
+  n3:
+    <<: *oss-common
+    ports:
+      - "9002:9000"
+    volumes:
+      - n3-data:/data
+      - n3-staging:/staging
+      - ./docker/cluster/n3/oss.toml:/app/oss.toml:ro
+
+  n4:
+    <<: *oss-common
+    ports:
+      - "9003:9000"
+    volumes:
+      - n4-data:/data
+      - n4-staging:/staging
+      - ./docker/cluster/n4/oss.toml:/app/oss.toml:ro
+
+  console:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    image: oss-console:dev
+    ports:
+      - "8080:80"
+    depends_on:
+      - n1
+    restart: unless-stopped
+
+volumes:
+  n1-data:
+  n1-staging:
+  n2-data:
+  n2-staging:
+  n3-data:
+  n3-staging:
+  n4-data:
+  n4-staging:

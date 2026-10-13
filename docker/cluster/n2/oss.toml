@@ -1,0 +1,52 @@
+# M3 集群 · 节点 n2（静态拓扑：4 节点 × 3 盘 = 12 槽，EC 8+4）。
+# 临界口径见 README「集群模式」：停 1 节点=写零余量；停 2 节点=写拒且读不可达（500）。
+# addr 用 compose 服务名（主机名）：本节点按它解析绑定，对端按它拨号。
+listen = "0.0.0.0:9000"
+data_dir = "/data/d0"
+data_dirs = ["/data/d0", "/data/d1", "/data/d2"]
+staging_dir = "/staging"
+database_url = "sqlite:///data/oss.db?mode=rwc"
+jwt_secret = "docker-dev-change-me-0123456789abcdef"
+max_put_bytes = 268435456
+
+[cluster]
+node_id = "n2"
+secret = "docker-dev-cluster-secret"
+
+[[cluster.nodes]]
+id = "n1"
+addr = "n1:19101"
+drive_count = 3
+
+[[cluster.nodes]]
+id = "n2"
+addr = "n2:19101"
+drive_count = 3
+
+[[cluster.nodes]]
+id = "n3"
+addr = "n3:19101"
+drive_count = 3
+
+[[cluster.nodes]]
+id = "n4"
+addr = "n4:19101"
+drive_count = 3
+
+[[groups]]
+group = "image"
+bucket = "images"
+max_size = 10485760
+extensions = ["jpg", "jpeg", "png", "gif", "webp", "svg"]
+
+[[groups]]
+group = "video"
+bucket = "videos"
+max_size = 0
+extensions = ["mp4", "mov", "mkv", "webm"]
+
+[[groups]]
+group = "file"
+bucket = "files"
+max_size = 0
+extensions = []

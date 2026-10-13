@@ -1,0 +1,33 @@
+# 单机版：oss-server（S3 + 控制面 API，:9000）+ 控制台（nginx，:8080）。
+#   docker compose up --build
+# 数据与暂存在具名卷里（down 不丢；docker compose down -v 才清）。
+services:
+  oss:
+    build: .
+    image: oss-server:dev
+    environment:
+      OSS_ADMIN_USER: erik
+      OSS_ADMIN_PASSWORD: pw   # 首启引导管理员；已存在则忽略。生产必改（连同 jwt_secret）
+    ports:
+      - "9000:9000"
+    volumes:
+      - oss-data:/data
+      - oss-staging:/staging
+      # 改配置改这里（只读挂载覆盖镜像内默认 /app/oss.toml）
+      - ./docker/oss.toml:/app/oss.toml:ro
+    restart: unless-stopped
+
+  console:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    image: oss-console:dev
+    ports:
+      - "8080:80"
+    depends_on:
+      - oss
+    restart: unless-stopped
+
+volumes:
+  oss-data:
+  oss-staging:
