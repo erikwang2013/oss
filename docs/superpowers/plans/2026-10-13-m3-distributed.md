@@ -510,7 +510,7 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 - [x] **Step 2:** `write_meta` 槽位化（C3 伪代码逐条落）：新签名 `write_meta(bucket, key, m, old: Option<&XlMeta>)`；prepare/commit 每节点一条 RPC（node 侧写/翻**其本地全部槽**）；hash 只计自己的；重试一次；集群 <Q_s → 补偿（old 恢复 / 无 old 删）；**单节点分支 ≥1 即提交（M2b 原样，kill9 `FLIP_K` 口径不动）**——两分支显式注释。`clear_meta_new` 槽位化。
 - [x] **Step 3:** `read_meta` 覆盖率快路径（D1 伪代码逐条落）+ 全量回退一次；`put.rs:362/:365` 单调 mod_time（C4 一行）。
 - [x] **Step 4:** 删除/桶/列表（C6/C7/D4）：delete_object 分派 + 失败上抛；create/delete/list_buckets 分派；`list_objects` 并集合并（D4 伪代码 + `limit=max+1` 证明注释）。
-- [ ] **Step 5:** `lock_object` 预留集群锁位（Task 8 填充：结构上先加 `Option<ClusterLockGuard>` 字段位置）。提交 `feat(m3): meta 层跨槽位分派——quorum 提交（重试+补偿+hash）、读快路径、删除/桶/列表（fail-closed 扩大坐标域）`。
+- [x] **Step 5:** `lock_object` 预留集群锁位（Task 8 填充：结构上先加 `Option<ClusterLockGuard>` 字段位置）。提交 `feat(m3): meta 层跨槽位分派——quorum 提交（重试+补偿+hash）、读快路径、删除/桶/列表（fail-closed 扩大坐标域）`。
 
 ## Task 7: 集群化 fsck + gc fail-closed（验收②本体）
 
@@ -586,9 +586,9 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 
 ## Task 11: 收尾
 
-- [ ] **口径注释对齐**：put.rs:448「已提交，M3 heal 补副本」、drives.rs:22-23「多 set 是 M3 的事」与计划口径统一（heal 命令→M4；验收②由 fsck 集群化承担；多 set→M4）。
-- [ ] 设计文档状态注记；feature-spec §19 对照更新；README.md:17 与 docs/assets/architecture.svg:4/:14 的「三 crate」文案 + README.md:44-48 crate 职责表补 xl-proto/xl-client 两行。
-- [ ] 提交 `docs: M3 落地后同步边界清单` + 本计划定稿记录。
+- [x] **口径注释对齐**：put.rs:448「已提交，M3 heal 补副本」、drives.rs:22-23「多 set 是 M3 的事」与计划口径统一（heal 命令→M4；验收②由 fsck 集群化承担；多 set→M4）。
+- [x] 设计文档状态注记；feature-spec §19 对照更新；README.md:17 与 docs/assets/architecture.svg:4/:14 的「三 crate」文案 + README.md:44-48 crate 职责表补 xl-proto/xl-client 两行。
+- [x] 提交 `docs: M3 落地后同步边界清单` + 本计划定稿记录。
 
 ---
 
@@ -653,7 +653,7 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 - **实现要点**：lock.rs 授予规则（仅空闲/过期可授、活锁不抢、旧 epoch 不抢回、Renew 同口径 Q_n）+ 后台续租 + 写入口提交点前复查；ControlBackend 注入（判权复用 Acl）+ ControlMesh（并发、首答胜、失败落 warn）；traceparent W3C 注入/提取。
 - **实弹教训**：① AK/SK 手拼连踩两发「≥16 位」400（AK 15 位、SK 15 位均为静默失败）——e2e 改服务端自动生成 + 铸造断言；② 裸 `wait` 把四个常驻 server 也等上（④ 挂死实锤）——只等 aws 子进程数组；③ `pkill -f` 自匹配自杀两次（模式串出现在自己命令行里）——改 `pkill -x`。
 - **验收①–⑤映射**：全部 in-process 单测 + 本脚本实弹**双覆盖**（对应表见「四闸与验收」节；⑤ 含多数派正测）。
-- **Task 11 收尾未竟项**（下一批）：口径注释统一（put.rs:448 / drives.rs:22-23）、README「三 crate」文案与职责表、feature-spec §19 对照更新、设计文档注记。
+- **Task 11 收尾**：已随 `251a2b0`（扇出失败落 warn）与 `2ac9670`（全仓口径统一：注释两处+同款、README 五-crate 与 M3 进度、architecture.svg、设计文档 M3 落地注记与 ecat-lock 定稿、feature-spec §3.6/§19）完成——M3 计划闭环。
 
 ## 评审修订记录（2026-10-13，二轮）
 
