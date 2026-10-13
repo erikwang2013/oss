@@ -1,0 +1,43 @@
+syntax = "proto3";
+package oss.v1;
+service Mesh {
+  rpc WriteShard(ShardWrite) returns (WriteResp);
+  rpc ReadShard(ShardRead) returns (ShardResp);
+  rpc DeleteVersion(VersionDirRef) returns (WriteResp);
+  rpc RecycleVersion(VersionDirRef) returns (WriteResp);
+  rpc PrepareMeta(MetaWrite) returns (MetaAck);
+  rpc CommitMeta(MetaWrite) returns (MetaAck);
+  rpc AbortMeta(MetaWrite) returns (WriteResp);
+  rpc ReadMeta(MetaRead) returns (MetaResp);
+  rpc EnsureBucket(BucketRef) returns (WriteResp);
+  rpc ListBuckets(Empty) returns (BucketsResp);
+  rpc ListLocal(ListReq) returns (ListLocalResp);
+  rpc Health(Empty) returns (NodeHealth);
+  rpc Lock(LockReq) returns (LockResp);
+  rpc ControlQuery(ControlReq) returns (ControlResp);
+}
+message Empty {}  message WriteResp { bool ok = 1; string msg = 2; }
+message ShardWrite { string bucket=1; string key=2; string uuid=3; uint32 part=4;
+                     uint32 shard=5; uint32 crc32c=6; bytes data=7; }
+message ShardRead  { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5; }
+message ShardResp  { bool found=1; uint32 crc32c=2; bytes data=3; }
+message VersionDirRef { string bucket=1; string key=2; string uuid=3; }
+message MetaWrite { string bucket=1; string key=2; bytes meta=3; }
+message SlotAck { uint32 slot=1; bool ok=2; bytes hash=3; }
+message MetaAck { bool ok=1; string msg=2; repeated SlotAck slots=3; uint32 slots_ok=4; }
+message MetaRead  { string bucket=1; string key=2; }
+message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4; }
+message BucketRef { string bucket=1; }  message BucketsResp { repeated string names=1; }
+message ListReq { string bucket=1; string prefix=2; string delimiter=3; string marker=4; uint32 limit=5; }
+message ListEntry { string key=1; uint64 size=2; string etag=3; int64 max_mod_time_nanos=4; }
+message ListLocalResp { repeated ListEntry entries=1; repeated string prefixes=2; uint32 slots_ok=3; }
+message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4; }
+message SlotState { uint32 slot=1; bool up=2; }
+message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;
+                  string holder=5; uint64 ttl_ms=6; LockOp op=7; }
+enum LockOp { ACQUIRE=0; RENEW=1; RELEASE=2; }
+message LockResp { bool granted=1; }
+message ControlReq { ControlKind kind=1; string a=2; string b=3; uint32 c=4; }
+enum ControlKind { ACCESS_KEY=0; PERMISSION=1; OWNED_BUCKETS=2; VISIBLE_BUCKETS=3; BUCKET_OWNER=4; }
+message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
+                      string secret=5; bool flag=6; repeated string names=7; }
