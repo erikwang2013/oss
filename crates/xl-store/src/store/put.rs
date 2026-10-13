@@ -419,7 +419,11 @@ impl Store {
             tokio::fs::create_dir_all(&dir).await?;
             dir
         };
-        let _guard = self.lock_object(bucket, key).await?;
+        let guard = self.lock_object(bucket, key).await?;
+        // 集群锁（Task 8）：获取后即时自检（acquire 已会在分区下失败；此处收窄残余窗口）
+        if guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
+        }
 
         // M-6 裁决：损坏的 meta 让 PUT fail-closed（报错），不静默当作空对象覆盖——盘上可能还有旧数据，宁可失败也不毁
         let old_meta = self.read_meta(bucket, key).await?;
@@ -493,6 +497,12 @@ impl Store {
         if multi {
             // 多盘：两阶段 meta 提交（单盘协议是 tmp→rename→write_meta，多盘没有跨盘 rename，
             // 数据已在各盘版本目录就位，meta 翻转即各盘提交点）
+            // 提交点前复查租约（Task 8：无 fencing 窗口收窄到两次检查之间）
+            if guard.lease_lost() {
+                self.rollback_versions(bucket, key, &uuid).await;
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+                return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
+            }
             let quorum = self.cfg.ec.data as usize + 1;
             let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
                 Ok(n) => n,

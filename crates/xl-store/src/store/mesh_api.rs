@@ -426,6 +426,16 @@ impl Store {
         Ok(())
     }
 
+    /// 服务端租约锁（Task 8 / 节点域）：本机锁表按授予规则处理（见 lock.rs 头注）——
+    /// 仅空闲/过期可授、活租约不抢占、仅持有者 Renew/Release 有效。
+    pub async fn mesh_lock(&self, req: crate::mesh::LockReq) -> Result<crate::mesh::LockResp> {
+        let key = format!("{}/{}", req.bucket, req.key);
+        let ttl = std::time::Duration::from_millis(req.ttl_ms.max(1));
+        Ok(crate::mesh::LockResp {
+            granted: self.lock_table().apply(&key, &req, ttl),
+        })
+    }
+
     /// 服务端读 meta：**就地本地扫描**（latest 胜；**绝不调 self.read_meta**——集群下
     /// 那是扇出入口，服务端再扇出会无限递归）。`slots_ok` = 本机确定性读到结论的槽数
     /// （命中或 NotFound；IO/解码错误不计——覆盖不足由协调者 fail-closed）。

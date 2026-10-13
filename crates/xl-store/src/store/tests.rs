@@ -2388,10 +2388,15 @@ impl crate::mesh::MeshTransport for InProcessMesh {
     }
     async fn lock(
         &self,
-        _n: &str,
-        _r: crate::mesh::LockReq,
+        n: &str,
+        r: crate::mesh::LockReq,
     ) -> crate::error::Result<crate::mesh::LockResp> {
-        Err(unimpl("lock"))
+        if self.take_fail(n, "lock") {
+            return Err(crate::error::Error::Encode(format!(
+                "in-process 注入：{n} lock 失败"
+            )));
+        }
+        self.peer(n).await?.mesh_lock(r).await
     }
     async fn control_query(
         &self,
@@ -2450,6 +2455,10 @@ impl Cluster {
             cfg.drives = dirs.clone();
             cfg.ec = ec;
             cfg.fsync = false; // 测试提速（既有测试同款）
+            // 集群锁参数注小值（Task 8）：TTL 400ms、3 次重试、5–10ms 抖动——速度与语义两全
+            cfg.cluster_lock_ttl_ms = 400;
+            cfg.cluster_lock_retries = 3;
+            cfg.cluster_lock_backoff_ms = (5, 10);
             cfg.cluster = Some(Arc::new(drives::ClusterConfig {
                 topo,
                 transport: mesh.clone(),
@@ -3065,4 +3074,118 @@ async fn cluster_topology_fingerprint_detects_reorder() {
         Err(e) => e.to_string(),
     };
     assert!(err.contains("拓扑指纹"), "实得：{err}");
+}
+
+/// Task 8：两方抢同一键——恰一方持有（节点域 Q_n），另一方重试耗尽；释放后可取得。
+#[tokio::test]
+async fn cluster_lock_single_winner_then_takeover() {
+    let c = Cluster::new(4, 3).await;
+    let a = c.stores[0].clone();
+    let b = c.stores[1].clone();
+    let ha = a.acquire_cluster_lock("bkt", "k").await.unwrap();
+    // 竞争者重试耗尽 → QuorumUnmet（互斥：a 持 3 票，剩 1 票拿不到 Q_n）
+    let err = match b.acquire_cluster_lock("bkt", "k").await {
+        Ok(_) => panic!("竞争者不应拿到锁"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, crate::error::Error::QuorumUnmet(_)),
+        "{err:?}"
+    );
+    let (_, lock_unmet) = b.quorum_unmet_counts();
+    assert!(lock_unmet >= 1);
+    drop(ha); // 释放：本机表同步清 + 广播
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let hb = b.acquire_cluster_lock("bkt", "k").await.unwrap();
+    drop(hb);
+}
+
+/// Task 8：授予规则原语——活租约不可被更大 epoch 抢占；过期按 epoch 定序；迟到旧 epoch 不抢回。
+#[tokio::test]
+async fn lock_grant_rules_primitive() {
+    use crate::mesh::LockOp;
+    let t = crate::store::lock::LockTable::default();
+    let mk = |holder: &str, epoch: i64, op: LockOp| crate::mesh::LockReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        epoch_nanos: epoch,
+        epoch_node: holder.into(),
+        holder: holder.into(),
+        ttl_ms: 1000,
+        op,
+    };
+    let ttl = std::time::Duration::from_millis(1000);
+    let zero = std::time::Duration::ZERO;
+    // 首授 → 活租约 + 更大 epoch 竞争 → 拒（绝不抢活锁）
+    assert!(t.apply("b/k", &mk("A", 100, LockOp::Acquire), ttl));
+    assert!(!t.apply("b/k", &mk("B", 10_000, LockOp::Acquire), ttl));
+    // 持有者续期 → 过期（zero ttl）→ 更大 epoch 替换
+    assert!(t.apply("b/k", &mk("A", 100, LockOp::Renew), ttl));
+    assert!(t.apply("b/k", &mk("A", 100, LockOp::Renew), zero)); // 续成但即刻过期
+    assert!(t.apply("b/k", &mk("C", 200, LockOp::Acquire), zero));
+    // 过期态下迟到的旧 epoch（150 < 200）不得抢回；更大 epoch（300）可替换
+    assert!(t.apply("b/k", &mk("C", 200, LockOp::Renew), zero));
+    assert!(!t.apply("b/k", &mk("D", 150, LockOp::Acquire), zero));
+    assert!(t.apply("b/k", &mk("D", 300, LockOp::Acquire), zero));
+    // 非持有者 Release 忽略；持有者 Release 释放
+    assert!(!t.apply("b/k", &mk("E", 400, LockOp::Release), zero));
+    assert!(t.apply("b/k", &mk("D", 300, LockOp::Release), zero));
+    assert_eq!(t.holder("b/k"), None);
+}
+
+/// Task 8：续租保锁——持有者慢写（超 TTL）期间租约被续住，竞争者拿不到。
+#[tokio::test]
+async fn slow_holder_keeps_lease_via_renew() {
+    let c = Cluster::new(4, 3).await;
+    let a = c.stores[0].clone();
+    let b = c.stores[2].clone();
+    let ha = a.acquire_cluster_lock("bkt", "k").await.unwrap();
+    // TTL=400ms（fixture），睡 700ms（跨多个续租周期 133ms）——续租任务应保锁
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(!ha.lease_lost(), "续租应成功（慢写持锁）");
+    let err = match b.acquire_cluster_lock("bkt", "k").await {
+        Ok(_) => panic!("租约被续住时竞争者不应拿到锁"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, crate::error::Error::QuorumUnmet(_)));
+    drop(ha);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    drop(b.acquire_cluster_lock("bkt", "k").await.unwrap());
+}
+
+/// Task 8：脑裂——多数不可达时 acquire 重试耗尽拒绝写（验收⑤ in-process 版）。
+#[tokio::test]
+async fn split_brain_rejects_writes() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    c.mesh.down("n3");
+    c.mesh.down("n4"); // 只剩 n1+n2 = 2 < Q_n=3
+    let err = s1
+        .put_object("bkt", "k", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::QuorumUnmet(_)),
+        "分区下写必须被拒：{err:?}"
+    );
+    let (_, lock_unmet) = s1.quorum_unmet_counts();
+    assert!(lock_unmet >= 1);
+    // 恢复多数 → 写恢复
+    c.mesh.up("n3");
+    c.mesh.up("n4");
+    s1.put_object("bkt", "k", Bytes::from_static(b"y"), None)
+        .await
+        .unwrap();
+}
+
+/// Task 8：Q_n 数学——严格多数（任意两个 quorum 集必相交，评审「Renew 同口径」的依据）。
+#[tokio::test]
+async fn qn_is_strict_majority() {
+    let c = Cluster::new(4, 3).await;
+    assert_eq!(c.stores[0].q_n(), 3); // 4 → 4/2+1 = 3
+    for n in 4..=7usize {
+        let q = n / 2 + 1;
+        assert!(2 * q > n, "n={n} q={q} 必须严格多数（交集非空）");
+    }
 }

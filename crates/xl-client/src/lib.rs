@@ -423,8 +423,30 @@ impl MeshTransport for TonicMesh {
             slots_ok: resp.slots_ok,
         })
     }
-    async fn lock(&self, _n: &str, _req: mesh::LockReq) -> Result<mesh::LockResp> {
-        Err(unimpl("lock"))
+    async fn lock(&self, n: &str, req: mesh::LockReq) -> Result<mesh::LockResp> {
+        let op = match req.op {
+            mesh::LockOp::Acquire => xl_proto::LockOp::Acquire,
+            mesh::LockOp::Renew => xl_proto::LockOp::Renew,
+            mesh::LockOp::Release => xl_proto::LockOp::Release,
+        };
+        let resp = self
+            .client(n)?
+            .clone()
+            .lock(xl_proto::LockReq {
+                bucket: req.bucket,
+                key: req.key,
+                epoch_nanos: req.epoch_nanos,
+                epoch_node: req.epoch_node,
+                holder: req.holder,
+                ttl_ms: req.ttl_ms,
+                op: op as i32,
+            })
+            .await
+            .map_err(|e| rpc_err(n, e))?
+            .into_inner();
+        Ok(mesh::LockResp {
+            granted: resp.granted,
+        })
     }
     async fn control_query(
         &self,
@@ -648,9 +670,31 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
     }
     async fn lock(
         &self,
-        _r: Request<xl_proto::LockReq>,
+        r: Request<xl_proto::LockReq>,
     ) -> std::result::Result<tonic::Response<xl_proto::LockResp>, Status> {
-        Err(Status::unimplemented("随所属 Task 落地"))
+        let l = r.into_inner();
+        let op = match xl_proto::LockOp::try_from(l.op) {
+            Ok(xl_proto::LockOp::Acquire) => mesh::LockOp::Acquire,
+            Ok(xl_proto::LockOp::Renew) => mesh::LockOp::Renew,
+            Ok(xl_proto::LockOp::Release) => mesh::LockOp::Release,
+            _ => return Err(Status::invalid_argument("未知锁操作")),
+        };
+        let resp = self
+            .store
+            .mesh_lock(mesh::LockReq {
+                bucket: l.bucket,
+                key: l.key,
+                epoch_nanos: l.epoch_nanos,
+                epoch_node: l.epoch_node,
+                holder: l.holder,
+                ttl_ms: l.ttl_ms,
+                op,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(xl_proto::LockResp {
+            granted: resp.granted,
+        }))
     }
     async fn control_query(
         &self,

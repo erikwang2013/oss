@@ -331,6 +331,12 @@ impl Store {
 
         if multi {
             // 多盘：两阶段 meta 提交（数据已在各盘版本目录就位；见 put.rs 同款流程）
+            // 提交点前复查租约（Task 8）
+            if _guard.lease_lost() {
+                self.rollback_versions(bucket, key, &uuid).await;
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+                return Err(Error::QuorumUnmet("集群锁租约丢失，MPU 提交中止".into()));
+            }
             let quorum = self.cfg.ec.data as usize + 1;
             let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
                 Ok(n) => n,

@@ -19,6 +19,7 @@ pub mod ec;
 mod fsck;
 mod gc;
 mod list;
+mod lock;
 mod mesh_api;
 mod mpu;
 mod put;
@@ -42,6 +43,11 @@ pub struct StoreConfig {
     pub inline_threshold: u64,
     /// M3 集群：静态拓扑 + 节点间传输。**None = 单节点**（v1.4.0 行为逐字节一致）。
     pub cluster: Option<Arc<drives::ClusterConfig>>,
+    /// M3 集群锁（Task 8）：租约 TTL（生产默认 10s；测试注小值跑快）。
+    pub cluster_lock_ttl_ms: u64,
+    /// 获取重试次数与退避抖动区间 `(lo, hi)` ms（生产默认 10 次 / 50–200ms）。
+    pub cluster_lock_retries: u32,
+    pub cluster_lock_backoff_ms: (u64, u64),
 }
 
 impl StoreConfig {
@@ -52,6 +58,9 @@ impl StoreConfig {
             ec: ec::EcConfig::default(),
             inline_threshold: meta::MAX_INLINE,
             cluster: None,
+            cluster_lock_ttl_ms: 10_000,
+            cluster_lock_retries: 10,
+            cluster_lock_backoff_ms: (50, 200),
         }
     }
 
@@ -110,12 +119,23 @@ pub struct Store {
     /// 分区故障必须线上有信号源（完整 Prometheus 面归 M4）。
     quorum_unmet_write: AtomicU64,
     quorum_unmet_lock: AtomicU64,
+    /// M3 集群锁表（节点侧；`mesh_lock` 与协调者本地授予共用）。
+    cluster_locks: Arc<lock::LockTable>,
 }
 
-/// 对象锁守卫：进程内 tokio 互斥 + 跨进程 flock（`File` drop 即释放 flock）。
+/// 对象锁守卫：进程内 tokio 互斥 + 跨进程 flock（`File` drop 即释放 flock）
+/// + 集群 quorum 租约锁（M3 Task 8；仅 cluster 配置时第三层，顺序恒定防死锁）。
 pub(in crate::store) struct LockGuard {
     _mem: tokio::sync::OwnedMutexGuard<()>,
     _file: std::fs::File,
+    _cluster: Option<lock::ClusterLockGuard>,
+}
+
+impl LockGuard {
+    /// 集群租约是否丢失（单机恒 false）——写入口在提交点前检查（无 fencing 窗口收窄）。
+    pub(in crate::store) fn lease_lost(&self) -> bool {
+        self._cluster.as_ref().is_some_and(|c| c.lease_lost())
+    }
 }
 
 impl Store {
@@ -265,6 +285,7 @@ impl Store {
             locks: Mutex::new(HashMap::new()),
             quorum_unmet_write: AtomicU64::new(0),
             quorum_unmet_lock: AtomicU64::new(0),
+            cluster_locks: Arc::new(lock::LockTable::default()),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;
@@ -341,9 +362,16 @@ impl Store {
         })
         .await
         .map_err(|e| Error::Encode(format!("锁等待任务异常: {e}")))??;
+        // M3 集群（Task 8）：第三层 quorum 租约锁（顺序恒定防死锁：进程内 → flock → 集群）
+        let cluster = if self.cfg.cluster.is_some() {
+            Some(self.acquire_cluster_lock(bucket, key).await?)
+        } else {
+            None
+        };
         Ok(LockGuard {
             _mem: mem,
             _file: file,
+            _cluster: cluster,
         })
     }
 
