@@ -18,6 +18,7 @@ pub mod ec;
 mod fsck;
 mod gc;
 mod list;
+mod mesh_api;
 mod mpu;
 mod put;
 mod read;

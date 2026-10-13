@@ -2189,3 +2189,276 @@ async fn meta_roundtrips_checksum_record() {
     let (get, _body) = s.get_object("alpha", "k").await.unwrap();
     assert_eq!(get.checksum, Some(rec));
 }
+
+// ---------- M3 in-process 集群基座（Task 3） ----------
+//
+// 两条写死约定：
+// 1) **in-process handler 不得再向外扇出**——真 RPC 只是超时，in-process 是循环 await 死锁；
+//    对端 Store 的 mesh_* 一律只碰本地槽。
+// 2) fixture 不变量：`slot_count == data + parity`（parity 恒 4、data 由槽位数推导）——
+//    后人把配置调成 3×2/4×4 会把算术静默搞坏（4×4 + 硬编码 8+4 尤其坑：`shard % 16`
+//    只落槽 0..11，第 4 节点零分片、容错反更差——见 drives.rs 的否决反例测试）。
+
+/// in-process 传输：直调对端 `Store::mesh_*`（测试专用；真网络走 xl-client 的 tonic 实现）。
+pub struct InProcessMesh {
+    peers: std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Store>>>,
+    down: std::sync::Mutex<std::collections::HashSet<String>>,
+    delays: std::sync::Mutex<std::collections::HashMap<String, std::time::Duration>>,
+    fail_once: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl std::fmt::Debug for InProcessMesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InProcessMesh").finish_non_exhaustive()
+    }
+}
+
+impl InProcessMesh {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            peers: Default::default(),
+            down: Default::default(),
+            delays: Default::default(),
+            fail_once: Default::default(),
+        })
+    }
+
+    /// 构建后回填（Store↔transport 循环：Store 构造需要 transport，transport 又指回 Store）。
+    pub fn register(&self, id: &str, store: &Arc<Store>) {
+        self.peers
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Arc::downgrade(store));
+    }
+
+    /// 摘除/恢复节点（模拟宕机/回线；多个 down = 分区）。
+    pub fn down(&self, node: &str) {
+        self.down.lock().unwrap().insert(node.to_string());
+    }
+    pub fn up(&self, node: &str) {
+        self.down.lock().unwrap().remove(node);
+    }
+    /// 慢节点注入：该节点所有 RPC 先睡 d（读快路径/取消掉队者测试用）。
+    pub fn delay(&self, node: &str, d: std::time::Duration) {
+        self.delays.lock().unwrap().insert(node.to_string(), d);
+    }
+    /// 一次性失败注入（"node:op"，op ∈ prepare_meta/commit_meta/delete_version/…）。
+    #[allow(dead_code)] // Task 6 补偿测试的注入面
+    pub fn fail_once(&self, node: &str, op: &str) {
+        self.fail_once
+            .lock()
+            .unwrap()
+            .insert(format!("{node}:{op}"));
+    }
+
+    async fn peer(&self, node: &str) -> crate::error::Result<Arc<Store>> {
+        // 先落值再判：if-let 的临时 MutexGuard 会活到语句尾，跨 await 就不是 Send
+        let delay = self.delays.lock().unwrap().get(node).copied();
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
+        if self.down.lock().unwrap().contains(node) {
+            return Err(crate::error::Error::Encode(format!(
+                "in-process：节点 {node} 不可达（模拟宕机）"
+            )));
+        }
+        self.peers
+            .lock()
+            .unwrap()
+            .get(node)
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| crate::error::Error::Encode(format!("in-process：未知节点 {node}")))
+    }
+
+    #[allow(dead_code)] // Task 6 起由各 RPC 消费
+    fn take_fail(&self, node: &str, op: &str) -> bool {
+        self.fail_once
+            .lock()
+            .unwrap()
+            .remove(&format!("{node}:{op}"))
+    }
+}
+
+fn unimpl(op: &str) -> crate::error::Error {
+    crate::error::Error::Encode(format!("in-process 未实现：{op}（随所属 Task 落地）"))
+}
+
+#[async_trait::async_trait]
+impl crate::mesh::MeshTransport for InProcessMesh {
+    async fn health(&self, node: &str) -> crate::error::Result<crate::mesh::NodeHealth> {
+        Ok(self.peer(node).await?.mesh_health().await)
+    }
+    // 以下 RPC 随所属 Task 落地（5a/5b/6/8/9）；在此之前显式报未实现，不静默成功。
+    async fn write_shard(&self, _n: &str, _w: crate::mesh::ShardWrite) -> crate::error::Result<()> {
+        Err(unimpl("write_shard"))
+    }
+    async fn read_shard(
+        &self,
+        _n: &str,
+        _r: crate::mesh::ShardRead,
+    ) -> crate::error::Result<Option<Bytes>> {
+        Err(unimpl("read_shard"))
+    }
+    async fn delete_version(
+        &self,
+        _n: &str,
+        _d: crate::mesh::VersionDirRef,
+    ) -> crate::error::Result<()> {
+        Err(unimpl("delete_version"))
+    }
+    async fn recycle_version(
+        &self,
+        _n: &str,
+        _d: crate::mesh::VersionDirRef,
+    ) -> crate::error::Result<()> {
+        Err(unimpl("recycle_version"))
+    }
+    async fn prepare_meta(
+        &self,
+        _n: &str,
+        _m: crate::mesh::MetaWrite,
+    ) -> crate::error::Result<crate::mesh::MetaAck> {
+        Err(unimpl("prepare_meta"))
+    }
+    async fn commit_meta(
+        &self,
+        _n: &str,
+        _m: crate::mesh::MetaWrite,
+    ) -> crate::error::Result<crate::mesh::MetaAck> {
+        Err(unimpl("commit_meta"))
+    }
+    async fn abort_meta(&self, _n: &str, _m: crate::mesh::MetaWrite) -> crate::error::Result<()> {
+        Err(unimpl("abort_meta"))
+    }
+    async fn read_meta(
+        &self,
+        _n: &str,
+        _r: crate::mesh::MetaRead,
+    ) -> crate::error::Result<Option<crate::mesh::MetaSnapshot>> {
+        Err(unimpl("read_meta"))
+    }
+    async fn ensure_bucket(&self, _n: &str, _b: &str) -> crate::error::Result<()> {
+        Err(unimpl("ensure_bucket"))
+    }
+    async fn list_bucket_dirs(&self, _n: &str) -> crate::error::Result<Vec<String>> {
+        Err(unimpl("list_bucket_dirs"))
+    }
+    async fn list_local(
+        &self,
+        _n: &str,
+        _l: crate::mesh::ListLocal,
+    ) -> crate::error::Result<crate::mesh::ListLocalResp> {
+        Err(unimpl("list_local"))
+    }
+    async fn lock(
+        &self,
+        _n: &str,
+        _r: crate::mesh::LockReq,
+    ) -> crate::error::Result<crate::mesh::LockResp> {
+        Err(unimpl("lock"))
+    }
+    async fn control_query(
+        &self,
+        _n: &str,
+        _q: crate::mesh::ControlQuery,
+    ) -> crate::error::Result<Option<crate::mesh::ControlRow>> {
+        Err(unimpl("control_query"))
+    }
+}
+
+/// 4×3 = 12 槽 in-process 集群（与 e2e 统一）。EC 由槽位数推导：parity 恒 4、data = 槽数 − 4。
+pub struct Cluster {
+    pub stores: Vec<Arc<Store>>,
+    pub mesh: Arc<InProcessMesh>,
+    pub ids: Vec<String>,
+    _tmpdirs: Vec<tempfile::TempDir>, // 保活：drop 即删目录
+}
+
+impl Cluster {
+    pub async fn new(nodes: usize, drives_per_node: usize) -> Cluster {
+        let slot_count = nodes * drives_per_node;
+        // 不变量：parity 恒 4（12 槽 → 8+4，与生产默认一致）；EC 由槽位数推导，勿硬编码
+        let data = (slot_count - 4) as u8;
+        assert!((1..=251).contains(&data), "槽位数 {slot_count} 非法");
+        let ec = ec::EcConfig {
+            data,
+            parity: 4,
+            ..Default::default()
+        };
+
+        let ids: Vec<String> = (0..nodes).map(|i| format!("n{}", i + 1)).collect();
+        let specs: Vec<drives::NodeSpec> = ids
+            .iter()
+            .map(|id| drives::NodeSpec {
+                id: id.clone(),
+                addr: format!("127.0.0.1:1910{}", &id[1..]),
+                drive_count: drives_per_node as u16,
+            })
+            .collect();
+
+        let mesh = InProcessMesh::new();
+        let mut stores = Vec::new();
+        let mut tmpdirs = Vec::new();
+        for (i, _id) in ids.iter().enumerate() {
+            let mut dirs = Vec::new();
+            for _ in 0..drives_per_node {
+                let td = tempfile::TempDir::new().unwrap();
+                dirs.push(td.path().to_path_buf());
+                tmpdirs.push(td);
+            }
+            let topo = drives::ClusterTopology::new(i, specs.clone(), &ec).unwrap();
+            let mut cfg = StoreConfig::new(&dirs[0]);
+            cfg.drives = dirs;
+            cfg.ec = ec;
+            cfg.fsync = false; // 测试提速（既有测试同款）
+            cfg.cluster = Some(Arc::new(drives::ClusterConfig {
+                topo,
+                transport: mesh.clone(),
+            }));
+            stores.push(Arc::new(Store::open(cfg).await.unwrap()));
+        }
+        for (id, s) in ids.iter().zip(&stores) {
+            mesh.register(id, s);
+        }
+        Cluster {
+            stores,
+            mesh,
+            ids,
+            _tmpdirs: tmpdirs,
+        }
+    }
+}
+
+#[tokio::test]
+async fn cluster_fixture_health_and_injections() {
+    use crate::mesh::MeshTransport as _; // 方法调用需要 trait 在作用域
+
+    let c = Cluster::new(4, 3).await;
+    assert_eq!(c.ids, vec!["n1", "n2", "n3", "n4"]);
+    assert_eq!(c.stores.len(), 4);
+
+    // 健康面：本机槽位窗口 + 节点 id + 桶计数
+    let h1 = c.stores[0].mesh_health().await;
+    assert_eq!(h1.node_id, "n1");
+    assert_eq!(h1.slots, vec![(0, true), (1, true), (2, true)]);
+    assert_eq!(h1.buckets, 0);
+    let h2 = c.stores[1].mesh_health().await;
+    assert_eq!(h2.node_id, "n2");
+    assert_eq!(h2.slots, vec![(3, true), (4, true), (5, true)]);
+
+    // RPC 往返（经 in-process 传输）
+    let peer = c.mesh.health("n2").await.unwrap();
+    assert_eq!(peer.node_id, "n2");
+
+    // 摘除 → 不可达；恢复 → 通
+    c.mesh.down("n2");
+    assert!(c.mesh.health("n2").await.is_err());
+    c.mesh.up("n2");
+    assert!(c.mesh.health("n2").await.is_ok());
+
+    // 慢节点注入（Task 6 读快路径测试的注入面）
+    c.mesh.delay("n3", std::time::Duration::from_millis(60));
+    let t0 = std::time::Instant::now();
+    c.mesh.health("n3").await.unwrap();
+    assert!(t0.elapsed() >= std::time::Duration::from_millis(60));
+}
