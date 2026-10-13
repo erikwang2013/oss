@@ -2856,3 +2856,213 @@ async fn cluster_list_union_and_pagination() {
     expect.sort();
     assert_eq!(seen, expect, "分页枚举应恰好一次全覆盖");
 }
+
+/// Task 7：fsck 差集检测 + 缺键补建闭环（验收② in-process 版）。
+#[tokio::test]
+async fn cluster_fsck_detects_and_repairs_missing_meta() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    // n2 掉线期写入：n2 本地无任何痕迹
+    c.mesh.down("n2");
+    s1.put_object("bkt", "missed", Bytes::from(vec![8u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    c.mesh.up("n2");
+
+    // 巡检（不修）：从**缺键的一方（n2）**跑——差集应报出缺键；n2 的盘上确实没有 meta
+    let rep = c.stores[1].fsck(false).await.unwrap();
+    assert_eq!(rep.unreachable_nodes, Vec::<String>::new());
+    assert_eq!(rep.missing_meta_keys, vec!["bkt/missed".to_string()]);
+    assert_eq!(rep.repaired_meta_keys, 0);
+    for d in &c.dirs[1] {
+        let meta_path = crate::layout::object_dir(d, "bkt", "missed")
+            .unwrap()
+            .join("xl.meta");
+        assert!(
+            !tokio::fs::try_exists(&meta_path).await.unwrap(),
+            "修复前不该有 meta"
+        );
+    }
+
+    // --repair：补建 meta 到本机各槽；随后 n2 的读路径自持（分片补建靠读时修）
+    let rep = c.stores[1].fsck(true).await.unwrap();
+    assert_eq!(rep.repaired_meta_keys, 1);
+    for d in &c.dirs[1] {
+        let meta_path = crate::layout::object_dir(d, "bkt", "missed")
+            .unwrap()
+            .join("xl.meta");
+        assert!(
+            tokio::fs::try_exists(&meta_path).await.unwrap(),
+            "修复后应有 meta"
+        );
+    }
+    // 再巡检：差集归零
+    let rep = c.stores[1].fsck(false).await.unwrap();
+    assert_eq!(rep.missing_meta_keys, Vec::<String>::new());
+    // 从 n2 读也通（触发其读时修分片）
+    let (_, got) = c.stores[1].get_object("bkt", "missed").await.unwrap();
+    assert_eq!(got.len(), 200 * 1024);
+}
+
+/// Task 7：gc 保守门——任一节点不可达，对象目录回收整体跳过（trash/tmp 照常）。
+#[tokio::test]
+async fn cluster_gc_skips_object_sweep_when_node_down() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from(vec![1u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    // 造一个孤儿版本目录（mtime 新鲜 → due 取未来即可回收）
+    let obj = crate::layout::object_dir(&c.dirs[0][0], "bkt", "k").unwrap();
+    let orphan = obj.join("deadbeef-orphan");
+    tokio::fs::create_dir_all(&orphan).await.unwrap();
+    let due = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+
+    c.mesh.down("n3");
+    let n = s1.reap_stale(due).await.unwrap();
+    assert!(
+        tokio::fs::try_exists(&orphan).await.unwrap(),
+        "节点不可达时不得删孤儿"
+    );
+    let _ = n;
+
+    c.mesh.up("n3");
+    s1.reap_stale(due).await.unwrap();
+    assert!(
+        !tokio::fs::try_exists(&orphan).await.unwrap(),
+        "全上后孤儿应被回收"
+    );
+}
+
+/// Task 6 微测（延期补齐）：`.new` 被他人内容覆盖 → commit 回报的 hash 不是我们的。
+#[tokio::test]
+async fn foreign_new_content_hash_not_counted() {
+    use crate::mesh::MeshTransport as _;
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from_static(b"v1"), None)
+        .await
+        .unwrap();
+    // 取一份合法 meta 字节当「我们的新内容」
+    let meta_bytes = tokio::fs::read(
+        crate::layout::object_dir(&c.dirs[1][0], "bkt", "k")
+            .unwrap()
+            .join("xl.meta"),
+    )
+    .await
+    .unwrap();
+    let mw = crate::mesh::MetaWrite {
+        bucket: "bkt".into(),
+        key: "k".into(),
+        meta: Bytes::from(meta_bytes),
+    };
+    // prepare 到 n2（写 .new = 我们的内容）
+    let ack = c.mesh.prepare_meta("n2", mw.clone()).await.unwrap();
+    assert!(ack.slots.iter().any(|s| s.ok));
+    // 篡改：把 n2 各盘 .new 换成他人内容（无 fencing 交错写的模拟）
+    for d in &c.dirs[1] {
+        let p = crate::layout::object_dir(d, "bkt", "k")
+            .unwrap()
+            .join("xl.meta.new");
+        if tokio::fs::try_exists(&p).await.unwrap() {
+            tokio::fs::write(&p, b"foreign-content").await.unwrap();
+        }
+    }
+    // commit：翻成功但内容是他人写入 → hash 不符（协调者不计入 quorum）
+    let ack = c.mesh.commit_meta("n2", mw.clone()).await.unwrap();
+    let ours = crate::mesh::content_hash(&mw.meta);
+    assert!(
+        ack.slots.iter().any(|s| s.ok),
+        "翻转本身应成功（翻的是他人内容）"
+    );
+    assert!(
+        ack.slots.iter().all(|s| !s.ok || s.hash != ours),
+        "他人内容不得计为我们的翻转"
+    );
+}
+
+/// Task 6 微测（延期补齐）：full 模式收满全部源（回退一次的机制面）。
+#[tokio::test]
+async fn read_meta_full_waits_all_sources() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    s1.put_object("bkt", "k", Bytes::from(vec![2u8; 200 * 1024]), None)
+        .await
+        .unwrap();
+    c.mesh.delay("n4", std::time::Duration::from_millis(300));
+    let t0 = std::time::Instant::now();
+    let fast = s1.read_meta("bkt", "k").await.unwrap();
+    assert!(fast.is_some());
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(200),
+        "快路径不等 n4"
+    );
+    let t0 = std::time::Instant::now();
+    let full = s1.read_meta_full("bkt", "k").await.unwrap();
+    assert!(full.is_some());
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(300),
+        "full 应收满全部源"
+    );
+}
+
+/// Task 2 回补：拓扑指纹——data_dirs 顺序变化 = 槽位静默错位 → 拒开。
+#[tokio::test]
+async fn cluster_topology_fingerprint_detects_reorder() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for i in 0..3 {
+        let d = tmp.path().join(format!("d{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        dirs.push(d);
+    }
+    let specs = vec![
+        drives::NodeSpec {
+            id: "n1".into(),
+            addr: "a".into(),
+            drive_count: 3,
+        },
+        drives::NodeSpec {
+            id: "n2".into(),
+            addr: "b".into(),
+            drive_count: 3,
+        },
+        drives::NodeSpec {
+            id: "n3".into(),
+            addr: "c".into(),
+            drive_count: 3,
+        },
+        drives::NodeSpec {
+            id: "n4".into(),
+            addr: "d".into(),
+            drive_count: 3,
+        },
+    ];
+    let mk_cfg = |order: Vec<std::path::PathBuf>| {
+        let topo =
+            drives::ClusterTopology::new(0, specs.clone(), &ec::EcConfig::default()).unwrap();
+        let mesh = InProcessMesh::new();
+        let mut cfg = StoreConfig::new(&order[0]);
+        cfg.drives = order;
+        cfg.fsync = false;
+        cfg.cluster = Some(Arc::new(drives::ClusterConfig {
+            topo,
+            transport: mesh,
+        }));
+        cfg
+    };
+    // 首开：写指纹
+    Store::open(mk_cfg(dirs.clone())).await.unwrap();
+    // 顺序交换 → 大声失败
+    let mut swapped = dirs.clone();
+    swapped.swap(0, 1);
+    let err = match Store::open(mk_cfg(swapped)).await {
+        Ok(_) => panic!("顺序交换后不应打开成功"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("拓扑指纹"), "实得：{err}");
+}

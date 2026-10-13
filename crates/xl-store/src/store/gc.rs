@@ -61,6 +61,26 @@ impl Store {
                 + self.reap_stale_sys_dir(drive, "tmp", due).await?;
         }
 
+        // 集群（Task 7）：对象目录回收是**不可逆删数据**——先全节点探活，任一不可达 →
+        // 整段跳过（trash/tmp 按龄回收不受影响）。防御纵深：引用集取自 quorum 读
+        // （read_meta_cluster 覆盖不足会 Err → 下方既有 Err 分支逐对象跳过），本探活把
+        // 「拓扑不完整时仍在删」整段关掉。README 口径：节点掉线期间 clean 保守空转。
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.topo.self_node().id.clone();
+            for n in &cl.topo.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                match cl.transport.health(&n.id).await {
+                    Ok(h) if h.node_id == n.id => {}
+                    _ => {
+                        tracing::warn!(node = %n.id, "节点不可达——对象目录回收整体跳过（trash/tmp 已照常回收）");
+                        return Ok(removed);
+                    }
+                }
+            }
+        }
+
         for drive in &self.cfg.drives {
             let mut buckets = match tokio::fs::read_dir(drive).await {
                 Ok(e) => e,

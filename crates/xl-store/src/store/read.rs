@@ -52,10 +52,13 @@ impl Store {
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
         for round in 0..2 {
-            let m = self
-                .read_meta(bucket, key)
-                .await?
-                .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+            // 回退一次（Task 6/D1）：快路径集合的数据轮失败 → 全量扇出取最新再试
+            let m = if round == 0 {
+                self.read_meta(bucket, key).await?
+            } else {
+                self.read_meta_full(bucket, key).await?
+            }
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
             let v = m
                 .latest()
                 .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
@@ -118,10 +121,13 @@ impl Store {
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
         for round in 0..2 {
-            let m = self
-                .read_meta(bucket, key)
-                .await?
-                .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+            // 回退一次（Task 6/D1）：快路径集合的数据轮失败 → 全量扇出取最新再试
+            let m = if round == 0 {
+                self.read_meta(bucket, key).await?
+            } else {
+                self.read_meta_full(bucket, key).await?
+            }
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
             let v = m
                 .latest()
                 .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;

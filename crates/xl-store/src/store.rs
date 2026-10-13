@@ -212,7 +212,7 @@ impl Store {
         if initialized == 0 {
             tracing::warn!("全盘无 .oss.sys：按真首启初始化（新部署标识 {deployment_id}）");
         }
-        for drive in &cfg.drives {
+        for (di, drive) in cfg.drives.iter().enumerate() {
             let sys = layout::sys_dir(drive, "");
             let has_sys = matches!(tokio::fs::try_exists(&sys).await, Ok(true));
             if !has_sys {
@@ -233,6 +233,30 @@ impl Store {
             let id_path = layout::sys_dir(drive, "drive-id");
             if !matches!(tokio::fs::try_exists(&id_path).await, Ok(true)) {
                 tokio::fs::write(&id_path, &deployment_id).await?;
+            }
+            // M3 集群：拓扑指纹（data_dirs 顺序 = 拓扑的一部分；错位 = 分片静默错位 → 大声失败）
+            if let Some(cl) = cfg.cluster.as_deref() {
+                let topo_path = layout::sys_dir(drive, "topo");
+                let want = format!(
+                    "v1 slots={} node={} slot={}",
+                    cl.topo.slot_count(),
+                    cl.topo.self_node().id,
+                    cl.topo.local_slot_base() + di as u16
+                );
+                match tokio::fs::read_to_string(&topo_path).await {
+                    Ok(have) if have.trim() == want => {}
+                    Ok(have) => {
+                        return Err(Error::Encode(format!(
+                            "拓扑指纹不符（data_dirs 顺序变化？）：盘 {} 记录 «{}»，当前 «{want}»",
+                            drive.display(),
+                            have.trim()
+                        )));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::fs::write(&topo_path, &want).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
 
@@ -539,7 +563,7 @@ impl Store {
     /// 副本** → `Err(CorruptMeta)`（fail-closed，不把「盘上有坏 meta」伪装成 404）。
     async fn read_meta(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return self.read_meta_cluster(bucket, key).await;
+            return self.read_meta_cluster(bucket, key, false).await;
         }
         let mut best: Option<(i64, XlMeta)> = None;
         let mut corrupt: Option<String> = None;
@@ -590,7 +614,13 @@ impl Store {
     /// 里，覆盖不足时返回旧副本等于破坏 quorum 读语义——验收⑤的 500 口径同此）。
     /// 相交证明：提交 ≥Q_s 与读覆盖 ≥Q_s 在槽位域必相交 → 最新已提交版本必在覆盖内；
     /// 覆盖 ≥Q_s 且无副本 → 缺席可证明（任何已提交副本都落在覆盖交集里）。
-    async fn read_meta_cluster(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
+    /// `full=false` 快路径提前停；`full=true` 收满全部响应（get_object 的回退一次）。
+    async fn read_meta_cluster(
+        &self,
+        bucket: &str,
+        key: &str,
+        full: bool,
+    ) -> Result<Option<XlMeta>> {
         use futures::StreamExt as _;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let q_s = self.cfg.ec.data as usize + 1;
@@ -671,8 +701,8 @@ impl Store {
                         tracing::warn!(node = %node, error = %e, "远端 meta 读取失败（覆盖不计）")
                     }
                 }
-                if covered >= q_s {
-                    break; // 取消掉队者
+                if covered >= q_s && !full {
+                    break; // 取消掉队者（回退模式收满全部）
                 }
             }
         }
@@ -689,6 +719,16 @@ impl Store {
                 None => Ok(None),
             },
         }
+    }
+
+    /// 全量扇出版（不提前停）：get_object 在快路径集合的数据轮失败后的**回退一次**——
+    /// 防「提前停时恰有掉队者持最新已提交版本」的小窗口（Task 6 末位评审项）。
+    /// 单节点退化为普通 read_meta。
+    async fn read_meta_full(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
+        if self.cfg.cluster.is_some() {
+            return self.read_meta_cluster(bucket, key, true).await;
+        }
+        self.read_meta(bucket, key).await
     }
 
     /// 单盘写 meta：`xl.meta.new` 写 + fsync，再 rename 覆盖 `xl.meta`（该盘的提交点）。
