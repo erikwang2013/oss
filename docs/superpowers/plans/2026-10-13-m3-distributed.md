@@ -301,7 +301,7 @@ tests/e2e_m3_cluster.sh            [新] 4 节点 × 3 盘 = 12 槽（Task 10）
 
 **Files:** Create: `crates/xl-proto/{Cargo.toml, build.rs, proto/oss.proto, src/lib.rs}`；Modify: workspace `Cargo.toml`（members 加两项）
 
-- [ ] **Step 1:** `proto/oss.proto` 全文：
+- [x] **Step 1:** `proto/oss.proto` 全文：
 
 ```proto
 syntax = "proto3";
@@ -349,9 +349,9 @@ message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
                       string secret=5; bool flag=6; repeated string names=7; }
 ```
 
-- [ ] **Step 2:** `build.rs`：`tonic_build::compile_protos("proto/oss.proto")`；`src/lib.rs`：`tonic::include_proto!("oss.v1");` + `pub const SERVICE: &str` 版本常量供 Health.version。
-- [ ] **Step 3:** Cargo.toml（`tonic = "0.12"`, `prost = "0.13"`, build-dep `tonic-build = "0.12"`, workspace 声明共享版本）；`cargo test -p xl-proto` 编译通过。
-- [ ] **Step 4:** 提交 `feat(xl-proto): 节点间 gRPC 协议骨架——分片/meta/版本目录/回收/桶/列表/健康/锁/控制面`。
+- [x] **Step 2:** `build.rs`：`tonic_build::compile_protos("proto/oss.proto")`；`src/lib.rs`：`tonic::include_proto!("oss.v1");` + `pub const SERVICE: &str` 版本常量供 Health.version。
+- [x] **Step 3:** Cargo.toml（`tonic = "0.12"`, `prost = "0.13"`, build-dep `tonic-build = "0.12"`, workspace 声明共享版本）；`cargo test -p xl-proto` 编译通过。
+- [x] **Step 4:** 提交 `feat(xl-proto): 节点间 gRPC 协议骨架——分片/meta/版本目录/回收/桶/列表/健康/锁/控制面`。
 
 **验收**：`cargo build -p xl-proto` 通过；`grep -c "rpc " proto/oss.proto` = 14。
 
@@ -359,7 +359,7 @@ message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
 
 **Files:** Modify: `crates/xl-store/src/store/drives.rs`、`store.rs`、`store/put.rs`（分叉）
 
-- [ ] **Step 1:** `drives.rs` 增（保留现有 `drive_index` 单机语义）：
+- [x] **Step 1:** `drives.rs` 增（保留现有 `drive_index` 单机语义）：
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,20 +392,20 @@ impl Store {
 }
 ```
 
-- [ ] **Step 2:** `StoreConfig` 增 `pub cluster: Option<Arc<ClusterConfig>>`（`ClusterConfig { pub topo: ClusterTopology, pub transport: Arc<dyn MeshTransport> }`，mesh.rs 先落 trait 空壳亦可）；`Store::open`：`cluster: Some` 时校验 `topo.nodes[self_idx].drive_count == cfg.drives.len()`（self 一致性），**跳过 data+parity 的本地盘数校验**（移到 Topology::new）；`cluster: None` 现校验与行为不动。
-- [ ] **Step 3:** 盘引用重构 = **六处解引用 + N 处逐盘循环**（后者在后续 Task 添集群语义，此处登记不漏改）。解引用：read.rs:238/244、read.rs:322/330、fsck.rs:147/151 改为 `shard_target`；逐盘循环点：store.rs 304 / 341 / 349-371 / 378 / 521 / 582 / 596、put.rs:229-232、gc.rs:59/64、fsck 逐盘扫描。**`multi_drive()` 分叉（put.rs:366）条件改 `cluster.is_some() || multi_drive()`**。`put.rs:242`（drive_index 调用）与 `:248`（object_dir(drives[d])）同改——单节点下 `shard_target` 恒 Local、路径逐字节一致。
-- [ ] **Step 4:** 测试（drives.rs 内联）：
+- [x] **Step 2:** `StoreConfig` 增 `pub cluster: Option<Arc<ClusterConfig>>`（`ClusterConfig { pub topo: ClusterTopology, pub transport: Arc<dyn MeshTransport> }`，mesh.rs 先落 trait 空壳亦可）；`Store::open`：`cluster: Some` 时校验 `topo.nodes[self_idx].drive_count == cfg.drives.len()`（self 一致性），**跳过 data+parity 的本地盘数校验**（移到 Topology::new）；`cluster: None` 现校验与行为不动。
+- [x] **Step 3:** 盘引用重构 = **六处解引用 + N 处逐盘循环**（后者在后续 Task 添集群语义，此处登记不漏改）。解引用：read.rs:238/244、read.rs:322/330、fsck.rs:147/151 改为 `shard_target`；逐盘循环点：store.rs 304 / 341 / 349-371 / 378 / 521 / 582 / 596、put.rs:229-232、gc.rs:59/64、fsck 逐盘扫描。**`multi_drive()` 分叉（put.rs:366）条件改 `cluster.is_some() || multi_drive()`**。`put.rs:242`（drive_index 调用）与 `:248`（object_dir(drives[d])）同改——单节点下 `shard_target` 恒 Local、路径逐字节一致。
+- [x] **Step 4:** 测试（drives.rs 内联）：
   - `topology_slot_math_truth_table`：4×3 → slot_of 真值表（14%12=2 → n1 本地盘 2；16%12=4 → n2 盘 1 …）、local/remote 判定；
   - `topology_rejects_bad_config`：self_idx 越界 / id 重复 / slot_count 11（<12）/ drive_count 0 → Err 且消息含数值；
   - 现有 188 测全绿（**单节点路径零变化是本 Task 唯一验收**）。
-- [ ] **Step 5:** 提交 `feat(xl-store): 槽位模型——ShardRef.drive 升级为全局槽位（单节点零行为变化）`。
+- [x] **Step 5:** 提交 `feat(xl-store): 槽位模型——ShardRef.drive 升级为全局槽位（单节点零行为变化）`。
 
 ## Task 3: Mesh 骨架（tonic server + Health + pub mesh 面）与 in-process 基座
 
 **Files:** Create: `crates/xl-store/src/mesh.rs`（trait+DTO 全文，见 B 节）；Create: `crates/xl-client/src/lib.rs`；Modify: `store.rs`（`pub mod mesh` 导出）、`store/tests.rs`
 
-- [ ] **Step 1:** `mesh.rs` 按 B 节落 trait + DTO；`xl-store/Cargo.toml` 增 `async-trait`、`bytes`（已有）、`futures`（已有）。
-- [ ] **Step 2:** `Store::mesh_*` pub 面骨架（可见性约定，health 先行）：
+- [x] **Step 1:** `mesh.rs` 按 B 节落 trait + DTO；`xl-store/Cargo.toml` 增 `async-trait`、`bytes`（已有）、`futures`（已有）。
+- [x] **Step 2:** `Store::mesh_*` pub 面骨架（可见性约定，health 先行）：
   ```rust
   impl Store {
       pub async fn mesh_health(&self) -> mesh::NodeHealth;                 // node_id 来自 cluster.topo
@@ -414,8 +414,8 @@ impl Store {
       // mesh_recycle_version/mesh_ensure_bucket/mesh_list_local/mesh_list_buckets/mesh_lock/mesh_control_query
   }
   ```
-- [ ] **Step 3:** **tonic server 骨架 + Health RPC service impl**（切片一必需——Task 4 双节点 `/health/cluster` 自验收依赖 peer 服务端；数据面 RPC 留 Task 5a）：xl-client `TonicMesh { nodes: HashMap<String, (String, Channel)>, secret: String, self_id: String }`；`pub async fn serve(store: Arc<Store>, addr: SocketAddr, secret: String) -> Result<()>`——interceptor 校验 metadata `x-oss-cluster-token`；lazy connect（首用建 channel）、连接超时 1s / 请求超时 5s。
-- [ ] **Step 4:** in-process 实现 + fixture（tests.rs）：
+- [x] **Step 3:** **tonic server 骨架 + Health RPC service impl**（切片一必需——Task 4 双节点 `/health/cluster` 自验收依赖 peer 服务端；数据面 RPC 留 Task 5a）：xl-client `TonicMesh { nodes: HashMap<String, (String, Channel)>, secret: String, self_id: String }`；`pub async fn serve(store: Arc<Store>, addr: SocketAddr, secret: String) -> Result<()>`——interceptor 校验 metadata `x-oss-cluster-token`；lazy connect（首用建 channel）、连接超时 1s / 请求超时 5s。
+- [x] **Step 4:** in-process 实现 + fixture（tests.rs）：
   ```rust
   pub struct InProcessMesh { peers: Mutex<HashMap<String, Weak<Store>>> }   // 构建后回填破循环
   impl MeshTransport for InProcessMesh { /* 直调对端 Store::mesh_* */ }
@@ -428,14 +428,14 @@ impl Store {
   }
   ```
   **fixture 注释写死两条**：(a) in-process handler 不得再向外扇出（真 RPC 只是超时，in-process 是循环 await 死锁）；(b) 不变量断言 `slot_count == data + parity`、EC 参数由 slot_count 推导勿硬编码 8+4（3×2/4×4 会让算术静默坏——4×4 尤坑：16 槽下 `shard % 16` 只落 0..11，第 4 节点零分片、容错反更差）。
-- [ ] **Step 5:** 测试：Topology↔fixture 真值表；health 双节点往返；`down/up/delay` 注入生效。
-- [ ] **Step 6:** 提交 `feat(xl-store+xl-client): Mesh 骨架——pub mesh 面、tonic server + Health、in-process 4×3 基座`。
+- [x] **Step 5:** 测试：Topology↔fixture 真值表；health 双节点往返；`down/up/delay` 注入生效。
+- [x] **Step 6:** 提交 `feat(xl-store+xl-client): Mesh 骨架——pub mesh 面、tonic server + Health、in-process 4×3 基座`。
 
 ## Task 4: oss-server 配置面与 /health/cluster
 
 **Files:** Modify: `crates/oss-server/src/{config.rs, state.rs, router.rs}`
 
-- [ ] **Step 1:** config.rs（`AppConfig` :8，load :82）增：
+- [x] **Step 1:** config.rs（`AppConfig` :8，load :82）增：
 
 ```rust
 #[derive(Deserialize)] pub struct ClusterToml { pub node_id: Option<String>, pub secret: Option<String>,
@@ -452,9 +452,9 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 # n2/n3/n4 同构 → 4 节点 × 3 盘 = 12 槽（单节点故障 = 写零余量，临界口径见 README）
 ```
 
-- [ ] **Step 2:** state.rs（StoreConfig 构造 :56-63）：配置了 cluster 时——校验 `node_id` 在 nodes 中、`data_dirs.len() == 本节点 drive_count`；构造 `ClusterTopology` + `TonicMesh` → `StoreConfig.cluster` 注入；`serve` 起 tonic server（Task 3 Step 3）。
-- [ ] **Step 3:** router.rs：`/health/cluster`（G 节 JSON）+ `/health/ready`（槽 0 可用 + 可达 ≥ Q_n；G 节）；**启动校验：逐 peer 拉一次 Health，node_id 必须 == 配置 id（不一致拒启）**。
-- [ ] **Step 4:** 双进程冒烟（依赖 Task 3 Step 3 的 server 骨架）：两节点各起 oss-server（不同端口/data_dirs/DB），`curl /health/cluster` 双方都见 2 节点；`kill` 其一 → `up:false` + ready 语义（2 节点时自身可写无需多数——冒烟只查 JSON 形状）。提交 `feat(m3): cluster 配置面与 /health/cluster（M3-1 收尾）`。
+- [x] **Step 2:** state.rs（StoreConfig 构造 :56-63）：配置了 cluster 时——校验 `node_id` 在 nodes 中、`data_dirs.len() == 本节点 drive_count`；构造 `ClusterTopology` + `TonicMesh` → `StoreConfig.cluster` 注入；`serve` 起 tonic server（Task 3 Step 3）。
+- [x] **Step 3:** router.rs：`/health/cluster`（G 节 JSON）+ `/health/ready`（槽 0 可用 + 可达 ≥ Q_n；G 节）；**启动校验：逐 peer 拉一次 Health，node_id 必须 == 配置 id（不一致拒启）**。
+- [x] **Step 4:** 双进程冒烟（依赖 Task 3 Step 3 的 server 骨架）：两节点各起 oss-server（不同端口/data_dirs/DB），`curl /health/cluster` 双方都见 2 节点；`kill` 其一 → `up:false` + ready 语义（2 节点时自身可写无需多数——冒烟只查 JSON 形状）。提交 `feat(m3): cluster 配置面与 /health/cluster（M3-1 收尾）`。
 
 **切片一四闸**：fmt · clippy 0 · `cargo test --workspace` 全绿（单节点 188 测 + 新拓扑/health/in-process 测） · 单机 `tests/e2e_s3.sh` 27 步零差异（cluster 未配置路径）。
 
@@ -624,7 +624,16 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 
 ## 定稿记录
 
-（实现后补：三切片四闸实跑、验收①–⑤实弹输出、裁决与偏差。）
+### 切片一（M3-1 干线）定稿（2026-10-13）
+
+- **提交**：`839a663`（槽位模型）→ `8144fa5`（xl-proto）→ `a11d7aa`（mesh 基座）→ `f2b8327`（xl-client）→ `cf774ac`（配置面与健康端点）。
+- **四闸实跑**：`fmt --all` 净 · `clippy --workspace --all-targets -D warnings` **0** · `cargo test --workspace` 全绿（22 个测试二进制：xl-store 109+kill9、xl-client 2、oss-server 全套） · 单机 `e2e_s3.sh` **27 步零差异**（1–15h 全过，脚本零改动）。
+- **双进程冒烟**（2 节点 × 6 盘 = 12 槽）：双方 `/health/cluster` 互认（slots:6）且 ready 200；`kill` n2 → n1 立即标 down + `/health/ready` **503**「可达节点 1/2 < 节点多数 2」；滚动启动探活只 warn（不拒启）。
+- **偏差与笔记**：① `e2e_s3.sh` 需 `ADMIN_PASSWORD=pw`（库中 erik 口令由 Playwright 引导轮设定；脚本默认 `changeme` 是 README 首启口径——环境使然，非回归）；② 本机 9001 端口被**外部服务**占用，冒烟改 9051/9052（与代码无关）；③ 实现顺序微调：mesh.rs trait 随 Task 2 先落（ClusterConfig.transport 需要），tonic server + Health 落在 Task 3 Step 3 一次完成。
+
+### 切片二 / 切片三定稿
+
+（实现后补：四闸实跑、验收①–⑤实弹输出、裁决与偏差。）
 
 ## 评审修订记录（2026-10-13，二轮）
 
