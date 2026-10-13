@@ -535,7 +535,7 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 
 **Files:** Create: `crates/xl-store/src/store/lock.rs`；Modify: `store.rs`（lock_object:258-276）、put.rs/mpu.rs 写入口检查点
 
-- [ ] **Step 1（测试先行，in-process）**：
+- [x] **Step 1（测试先行，in-process）**：
   - `lock_single_winner`：4 节点两写者抢同 key → 恰一方持有（Q_n=3）；
   - `live_lease_not_stolen_by_higher_epoch`：活租约 + 更大 epoch 竞争 → 拒；
   - `expired_lease_epoch_ordered`：过期后晚 epoch 胜、迟到的旧 epoch 不抢回；
@@ -543,28 +543,28 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
   - `holder_paused_ttl_expiry_takeover`：持有者不续租 → TTL 后可取得；
   - `split_brain_rejects_writes`：仅 2 可达（<Q_n）→ acquire 重试耗尽 `QuorumUnmet`，**写被拒**；
   - `slow_write_keeps_lease`：注入超 TTL 的慢写 → 后台续租保锁、写成功。
-- [ ] **Step 2:** `lock.rs` 状态机（E 节：LockTable/try_grant/Renew/Release + 退避重试）；TTL 10s 可配。
-- [ ] **Step 3:** `lock_object` 接入：进程内 → flock → 集群锁；`LockGuard` 增 `lease_lost: Arc<AtomicBool>` 与续租任务句柄（Drop abort + Release 广播）；put/mpu 写入口 prepare 前 / commit 前各查一次。
-- [ ] **Step 4:** 提交 `feat(m3): quorum 租约锁（节点域、后台续租、脑裂拒写）——验收④⑤`。
+- [x] **Step 2:** `lock.rs` 状态机（E 节：LockTable/try_grant/Renew/Release + 退避重试）；TTL 10s 可配。
+- [x] **Step 3:** `lock_object` 接入：进程内 → flock → 集群锁；`LockGuard` 增 `lease_lost: Arc<AtomicBool>` 与续租任务句柄（Drop abort + Release 广播）；put/mpu 写入口 prepare 前 / commit 前各查一次。
+- [x] **Step 4:** 提交 `feat(m3): quorum 租约锁（节点域、后台续租、脑裂拒写）——验收④⑤`。
 
 ## Task 9: 控制面读扇出
 
 **Files:** Modify: `xl-s3/src/{auth.rs, access.rs}`、`oss-server/src/{router.rs, state.rs}`
 
-- [ ] **Step 1（测试先行）**：`ak_resolves_via_peer`（节点 B 建号/签 AK → 打节点 A 的 S3 → 200）；`permission_fanout`（权限行同样）；`peer_down_local_ok_remote_403`（B 掉线：A 本地凭据不受影响、纯远程凭据 403 fail-closed）。
-- [ ] **Step 2:** `SigV4Auth`/`Acl` 构造点加 `Option<(Arc<dyn MeshTransport>, String /*self_id*/)>`；miss 时：
+- [x] **Step 1（测试先行）**：`ak_resolves_via_peer`（节点 B 建号/签 AK → 打节点 A 的 S3 → 200）；`permission_fanout`（权限行同样）；`peer_down_local_ok_remote_403`（B 掉线：A 本地凭据不受影响、纯远程凭据 403 fail-closed）。
+- [x] **Step 2:** `SigV4Auth`/`Acl` 构造点加 `Option<(Arc<dyn MeshTransport>, String /*self_id*/)>`；miss 时：
   ```rust
   // 并发扇出全部 peers（futures 并集），首 Some 胜；全 miss → 按现状报错/拒
   // ControlQuery::AccessKey(ak) / Permission{uid,bucket,action} / ...
   ```
   服务端 `mesh_control_query` 实现（字面量 SQL，白名单 match）。
-- [ ] **Step 3:** 提交 `feat(m3): 控制面读扇出——同一 AK 任意节点可用（写仍本地，M9 收口）`。
+- [x] **Step 3:** 提交 `feat(m3): 控制面读扇出——同一 AK 任意节点可用（写仍本地，M9 收口）`。
 
 ## Task 10: 4 节点真进程 e2e 与混沌
 
 **Files:** Create: `tests/e2e_m3_cluster.sh`；Modify: `README`、tracing 传播
 
-- [ ] **Step 1:** 脚本骨架（bash，与 e2e_s3.sh 同风格：彩色步标 + `set -euo pipefail`）：
+- [x] **Step 1:** 脚本骨架（bash，与 e2e_s3.sh 同风格：彩色步标 + `set -euo pipefail`）：
 
 ```text
 布局：RUN=$(mktemp -d)；每节点 $RUN/n{i}/{data0,data1,data2,oss.db,oss.toml}
@@ -575,14 +575,14 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
 清理：trap EXIT kill 全部 pid + rm -rf $RUN
 ```
 
-- [ ] **Step 2:** 验收映射脚本段（断言与口径逐条写死）：
+- [x] **Step 2:** 验收映射脚本段（断言与口径逐条写死）：
   - **①+③**：写 10MiB（任意节点）→ 4 节点各读 `cmp` 一致 → `kill -9` n4（剩 9 槽=恰好 quorum；**写零余量 = 临界**，README 注明）→ 写+读继续 → 拉回重启 → 读仍一致；
   - **②**：掉节点期间写入若干 → 拉回 → `oss-server fsck --repair`（打任一节点）→ 报告 `missing=0` 且缺键 meta 已补、抽查分片 CRC；
   - **④**：10 进程并发写同一 key ×100 轮 → 读回必为某次完整写（SHA 命中某轮内容）、无交错；覆写旧版本回收：远端槽位 trash 出现或经 clean 回收（留一断言）；
   - **⑤（三口径）**：`kill -STOP` n3+n4（剩 6 槽 <9、节点 2<3）→ ①写必须失败（**5xx**）；②同期 GET **亦不可达**——500 `CorruptMeta`（present=6≠0，**不是 404**，脚本注明「读同败为预期」）；③**时间预算**：SIGSTOP 进程不响应、每失败请求等满 RPC 超时，并发/重试轮次配预算防脚本假死。`kill -CONT` → 断言「写恢复 + 之前已提交对象读回一致 + fsck missing=0」；游荡 RPC 残骸孤儿=预期由 fsck/clean 收；
   - **⑤-positive**：`kill -STOP` **1** 节点（3/4 ≥ Q_n）→ **写必须成功**（多数派正测）。
-- [ ] **Step 3:** tracing：mesh 注入 `traceparent`、服务端提取（双节点日志同一 trace_id 抽查）。
-- [ ] **Step 4:** README 集群运行手册：配置样例、启动顺序、fsck 用法、**临界口径（停 1：写 9/9 全须成功、读 9≥8 余 1；停 2：GET=500 CorruptMeta 非 404）**、备选 6×2、**运维：每节点定期 `clean` + `fsck --repair`（远端孤儿只由该节点自己回收）**、**`fsck --repair` 不得与在途 MPU 并跑**、**M3 不支持单机原地升级为多节点**、配置反例 **4×4**（`shard % 16` 只落 0..11）、已知边界：MPU 粘节点、无 fencing、控制面读扇出、节点间无 TLS（内网假设）、**命名勿混淆**：oss-server 的 aetherupload `staging_dir`（config.rs:19）≠ store 的 `.oss.sys/tmp`。提交 `test(m3): 4 节点集群 e2e 与混沌段（验收①–⑤全覆盖）`。
+- [x] **Step 3:** tracing：mesh 注入 `traceparent`、服务端提取（双节点日志同一 trace_id 抽查）。
+- [x] **Step 4:** README 集群运行手册：配置样例、启动顺序、fsck 用法、**临界口径（停 1：写 9/9 全须成功、读 9≥8 余 1；停 2：GET=500 CorruptMeta 非 404）**、备选 6×2、**运维：每节点定期 `clean` + `fsck --repair`（远端孤儿只由该节点自己回收）**、**`fsck --repair` 不得与在途 MPU 并跑**、**M3 不支持单机原地升级为多节点**、配置反例 **4×4**（`shard % 16` 只落 0..11）、已知边界：MPU 粘节点、无 fencing、控制面读扇出、节点间无 TLS（内网假设）、**命名勿混淆**：oss-server 的 aetherupload `staging_dir`（config.rs:19）≠ store 的 `.oss.sys/tmp`。提交 `test(m3): 4 节点集群 e2e 与混沌段（验收①–⑤全覆盖）`。
 
 ## Task 11: 收尾
 
@@ -645,9 +645,15 @@ id = "n1"; addr = "127.0.0.1:19101"; drive_count = 3
   - 两枚延期微测已补齐（foreign .new 不计翻转 / full 收满全部源）。
 - **偏差**：控制面读扇出（Task 9）未落地前，4 节点冒烟用「同 AK/SK 逐节点种入」过渡；Task 9 完成后此过渡即多余。
 
-### 切片三定稿
+### 切片三（M3-3 锁与一致性收尾）定稿（2026-10-14）
 
-（实现后补：四闸实跑、验收①–⑤实弹输出、裁决与偏差。）
+- **提交**：`05c351b`（Task 8 quorum 租约锁）→ `b88f4d1`（Task 9 控制面读扇出 + traceparent）→ 本记录（含 `tests/e2e_m3_cluster.sh`）。
+- **四闸实跑**（高负载下分 crate 串行）：clippy `-D warnings` 0（四 crate）· xl-store 130+kill9 · xl-s3 19/2/23 · xl-client 4 · oss-server 全套 · fmt 净 · 单机 `e2e_s3.sh` 27 步零差异。
+- **4 节点真进程混沌 e2e 全绿**（`tests/e2e_m3_cluster.sh`，端口动态分配、各段带时间预算）：控制面扇出（AK 只在 n1 铸造 → n4 直用）→ ①③ 10MiB 四节点 `cmp` 一致 → ① `kill -9` n4 读写续跑（9 槽=恰好 quorum，临界口径）→ ② 拉回 `fsck --repair` 差集检出+补建+复检清零 → ④ 同键 10 并发 ×100 轮无交错 → ⑤ SIGSTOP 双节点：写 5xx、**读同败（500 CorruptMeta 非 404）**、`/health/ready` 503 → ⑤-positive 单停（3/4 多数）写必成 → 恢复读写一致。
+- **实现要点**：lock.rs 授予规则（仅空闲/过期可授、活锁不抢、旧 epoch 不抢回、Renew 同口径 Q_n）+ 后台续租 + 写入口提交点前复查；ControlBackend 注入（判权复用 Acl）+ ControlMesh（并发、首答胜、失败落 warn）；traceparent W3C 注入/提取。
+- **实弹教训**：① AK/SK 手拼连踩两发「≥16 位」400（AK 15 位、SK 15 位均为静默失败）——e2e 改服务端自动生成 + 铸造断言；② 裸 `wait` 把四个常驻 server 也等上（④ 挂死实锤）——只等 aws 子进程数组；③ `pkill -f` 自匹配自杀两次（模式串出现在自己命令行里）——改 `pkill -x`。
+- **验收①–⑤映射**：全部 in-process 单测 + 本脚本实弹**双覆盖**（对应表见「四闸与验收」节；⑤ 含多数派正测）。
+- **Task 11 收尾未竟项**（下一批）：口径注释统一（put.rs:448 / drives.rs:22-23）、README「三 crate」文案与职责表、feature-spec §19 对照更新、设计文档注记。
 
 ## 评审修订记录（2026-10-13，二轮）
 

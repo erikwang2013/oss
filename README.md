@@ -181,6 +181,54 @@ oss-server fsck --repair #   同上 + 最小修复（删孤儿 + 读时修分片
 - 未知子命令或非法参数打印用法并 exit 2；命令失败 exit 1
 - 配置文件路径固定为当前目录的 `oss.toml`（原先的 `oss-server <配置路径>` 用法已移除）
 
+## 集群模式（M3）
+
+**静态拓扑**：扁平 node × drive，配置即拓扑（无 DC/区域层级）。未配 `[cluster]` = 单机（本机行为与 v1.4.0
+逐字节一致）；配置要求 **槽位数 ≥ data+parity（12）**。
+
+```toml
+[cluster]
+node_id = "n1"
+secret  = "cluster-internal-token-change-me"   # 节点间 gRPC 共享令牌（明文，内网假设）
+
+[[cluster.nodes]]
+id = "n1"
+addr = "127.0.0.1:19101"   # 该节点 gRPC 监听（HTTP 端口另配）
+drive_count = 3
+# …n2/n3/n4 同构
+```
+
+启动：各节点在自己的目录放好 `oss.toml`（`data_dirs` 三条 = drive_count 3）后 `oss-server serve`；
+顺序无所谓（滚动启动探活只告警；可达对端 node_id 与配置不符会拒启，防错接线）。
+
+**临界口径（4 节点 × 3 盘 = 12 槽，EC 8+4）**：
+- 停 1 节点（剩 9 槽 = 恰好 Q_s）：**写零余量**（9 片全须成功，客户端重试收敛）、读 9≥8 有余；
+  本配置**单节点故障即临界**——要余量用 6×2（12 槽，停 1 余 1）。
+- 停 2 节点（剩 6 槽 <9）：写被拒（锁/meta quorum 未达 → 5xx）；**读同不可达**——
+  GET 报 `500 CorruptMeta`（**不是 404**，不许把「quorum 覆盖不足」伪装成「不存在」）。
+
+**配置反例**：4×4 = 16 槽**勿用**——EC 只有 12 分片，`shard % 16` 只落槽 0..11，第 4 节点零分片，
+停任一持片节点剩 8<9 反而更容易不可写。
+
+**运维口径**：
+- 每节点定期 `clean` + `fsck --repair`（同前 cron）；**远端孤儿只由该节点自己回收**——
+  掉线期间其他节点删不掉它的残骸。分片缺失靠读时修兜底 + fsck 巡检；缺键 meta 由
+  `fsck --repair` 从对端差集检出并补建（「加回节点后补齐」）。
+- 节点掉线期间 `clean` 的对象目录回收会**保守空转**（不可逆删数据前全节点探活）；`trash/tmp` 照常。
+- **`fsck --repair` 不得与在途分块上传并跑**（无龄期删孤儿会清掉暂存区）。
+- **M3 不支持单机原地升级为多节点**（无 rebalance/搬迁，归 M4）：单机数据要进集群请重新灌入。
+- `data_dirs` 顺序是拓扑的一部分：错位会在启动时被 `.oss.sys/topo` 指纹拒绝（大声失败）。
+
+**已知边界（M3）**：
+- 分块上传（MPU）会话**粘节点**：同一 upload 的后续请求须回到发起节点。
+- 节点间锁无写入侧 fencing：租约 TTL 远大于单写操作；兜底是版本 uuid 隔离（交错写最多留孤儿目录，
+  由各节点 clean 回收，已提交数据不损坏）。
+- 控制面（账号/权限）**读扇出**：任一节点铸造的 AK 全集群可用；写入仍只落本节点
+  （跨节点强一致归 M9）。
+- 节点间 gRPC **无 TLS**（内网假设）；traceparent 轻量传播（`RUST_LOG=debug` 下可按同一 trace id
+  在双节点日志抽样；完整 OTLP 归 M4）。
+- 命名勿混淆：oss-server 的 aetherupload `staging_dir` ≠ 存储内核的 `.oss.sys/tmp`。
+
 ## 验收
 
 覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）见下方脚本；控制台的登录/上传/秒传/密钥常规路径见
@@ -189,6 +237,12 @@ oss-server fsck --repair #   同上 + 最小修复（删孤儿 + 读时修分片
 
 ```bash
 AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 tests/e2e_s3.sh
+```
+
+集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：
+
+```bash
+cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空闲；约 8–15 分钟（含 §⑤ 超时预算）
 ```
 
 ## 参考文档
