@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xl-store", "crates/xl-s3", "crates/oss-server", "crates/xl-proto"]
+members = ["crates/xl-store", "crates/xl-s3", "crates/oss-server", "crates/xl-proto", "crates/xl-client"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 xl-store = { path = "crates/xl-store" }
 xl-s3 = { path = "crates/xl-s3" }
+xl-client = { path = "crates/xl-client" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
