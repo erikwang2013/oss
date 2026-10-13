@@ -46,6 +46,15 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider
       locale={zhCN}
+      // 主题 token：主色对齐吉祥物的蓝色盒子（#3b82f6）；外壳白底、内容区浅灰底、
+      // 标注 8px 圆角——全站观感由此一处控制，避免每页散装内联色值
+      theme={{
+        token: { colorPrimary: '#3b82f6', borderRadius: 8 },
+        components: {
+          Layout: { headerBg: '#ffffff', siderBg: '#ffffff', headerHeight: 56, bodyBg: '#f5f7fa' },
+          Menu: { itemBorderRadius: 8, itemMarginInline: 12 },
+        },
+      }}
       // 所有空状态（各表格、列表）统一换成吉祥物：桶里空空的，它就沮丧
       renderEmpty={() => (
         <div style={{ textAlign: 'center', padding: '24px 0' }}>

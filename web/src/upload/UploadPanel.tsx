@@ -123,10 +123,11 @@ export default function UploadPanel({
             style={{ display: 'none' }}
             onChange={onFilePicked}
           />
-          <div style={{ height: 8, background: '#f0f0f0', borderRadius: 4, overflow: 'hidden' }}>
+          {/* 进度条底色/前景色对齐主题（main.tsx 的 colorPrimary #3b82f6；脚本只写 width，颜色归我们） */}
+          <div style={{ height: 8, background: '#eef2f7', borderRadius: 4, overflow: 'hidden' }}>
             <div
               id="aetherupload-progressbar"
-              style={{ height: '100%', width: '0%', background: '#1677ff', transition: 'width .2s' }}
+              style={{ height: '100%', width: '0%', background: '#3b82f6', transition: 'width .2s' }}
             />
           </div>
           <div id="aetherupload-output" style={{ minHeight: 22, color: '#666', marginTop: 8 }} />

@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { App, Button, Input, Modal, Popconfirm, Table, Tag } from 'antd'
+import { App, Button, Card, Input, Modal, Popconfirm, Space, Table, Tag, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type BucketInfo } from '../api'
+import PageHeader from '../PageHeader'
 
 export default function Buckets() {
   const { message } = App.useApp()
@@ -32,44 +33,58 @@ export default function Buckets() {
 
   return (
     <>
-      {/* 任何登录用户都可建桶（建桶者即桶主，自动全权） */}
-      <Button type="primary" onClick={() => { setNewName(''); setCreating(true) }} style={{ marginBottom: 16 }}>
-        新建桶
-      </Button>
-      <Table<BucketInfo>
-        rowKey="name"
-        loading={isLoading}
-        dataSource={buckets}
-        columns={[
-          {
-            title: '桶名',
-            dataIndex: 'name',
-            render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link>,
-          },
-          {
-            title: '归属',
-            width: 100,
-            render: (_: unknown, b: BucketInfo) => (b.is_owner ? <Tag color="blue">自有</Tag> : <Tag>授权</Tag>),
-          },
-          {
-            title: '权限',
-            width: 180,
-            render: (_: unknown, b: BucketInfo) =>
-              [b.can_read && '读', b.can_write && '写', b.can_delete && '删'].filter(Boolean).join(' / ') || '-',
-          },
-          {
-            title: '操作',
-            width: 120,
-            // 删除按钮按 can_delete 显隐（后端另有「桶主或管理员」403 兜底）
-            render: (_: unknown, b: BucketInfo) =>
-              b.can_delete && (
-                <Popconfirm title={`删除桶 ${b.name}？（须为空桶）`} onConfirm={() => remove.mutate(b.name)}>
-                  <Button danger size="small">删除</Button>
-                </Popconfirm>
-              ),
-          },
-        ]}
+      <PageHeader
+        title="桶与对象"
+        sub="点击桶名进入浏览；任何登录用户都可建桶（建桶者即桶主，自动全权）"
+        extra={
+          // 任何登录用户都可建桶（建桶者即桶主，自动全权）
+          <Button type="primary" onClick={() => { setNewName(''); setCreating(true) }}>
+            新建桶
+          </Button>
+        }
       />
+      <Card styles={{ body: { padding: 0 } }}>
+        <Table<BucketInfo>
+          rowKey="name"
+          loading={isLoading}
+          dataSource={buckets}
+          columns={[
+            {
+              title: '桶名',
+              dataIndex: 'name',
+              render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link>,
+            },
+            {
+              title: '归属',
+              width: 100,
+              render: (_: unknown, b: BucketInfo) => (b.is_owner ? <Tag color="geekblue">自有</Tag> : <Tag>授权</Tag>),
+            },
+            {
+              title: '权限',
+              width: 180,
+              render: (_: unknown, b: BucketInfo) => {
+                const bits = [
+                  b.can_read && <Tag key="r" color="blue">读</Tag>,
+                  b.can_write && <Tag key="w" color="green">写</Tag>,
+                  b.can_delete && <Tag key="d" color="red">删</Tag>,
+                ].filter(Boolean)
+                return bits.length ? <Space size={4}>{bits}</Space> : <Typography.Text type="secondary">-</Typography.Text>
+              },
+            },
+            {
+              title: '操作',
+              width: 120,
+              // 删除按钮按 can_delete 显隐（后端另有「桶主或管理员」403 兜底）
+              render: (_: unknown, b: BucketInfo) =>
+                b.can_delete && (
+                  <Popconfirm title={`删除桶 ${b.name}？（须为空桶）`} onConfirm={() => remove.mutate(b.name)}>
+                    <Button danger size="small">删除</Button>
+                  </Popconfirm>
+                ),
+            },
+          ]}
+        />
+      </Card>
       <Modal
         title="新建桶"
         open={creating}

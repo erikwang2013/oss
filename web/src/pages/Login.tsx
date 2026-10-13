@@ -29,9 +29,23 @@ export default function Login() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 96 }}>
+    <div
+      style={{
+        minHeight: '100vh',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingBottom: 64,
+        // 与主题同源的浅钢蓝渐变，登录页独立于控制台外壳
+        background: 'linear-gradient(180deg, #eef4fb 0%, #f8fafc 55%, #f1f5f9 100%)',
+      }}
+    >
       <Mascot mood="happy" size={112} alt="OSS 控制台吉祥物" />
-      <Card title="OSS 控制台" style={{ width: 360, marginTop: 8 }}>
+      <Card
+        title="OSS 控制台"
+        style={{ width: 360, marginTop: 8, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.08)' }}
+      >
         <Form onFinish={onFinish} layout="vertical">
           <Form.Item name="username" label="用户名" rules={[{ required: true }]}>
             <Input autoFocus />

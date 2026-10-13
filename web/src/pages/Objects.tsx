@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { App, Breadcrumb, Button, Popconfirm, Table, Tooltip } from 'antd'
+import { App, Breadcrumb, Button, Card, Popconfirm, Space, Table, Tooltip } from 'antd'
+import { FileOutlined, FolderOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, rawApi, type BucketInfo, type ObjectList } from '../api'
 import { humanSize } from '../format'
+import PageHeader from '../PageHeader'
 import UploadPanel from '../upload/UploadPanel'
 
 // 显式给出行类型：否则 antd Table 会从各列 render 的参数注解反推 RecordType，推出带 string 字面量的错误类型，rowKey 与 render 都编译不过
@@ -18,7 +20,7 @@ export default function Objects() {
   const prefix = sp.get('prefix') ?? ''
   const [uploading, setUploading] = useState(false)
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ['objects', bucket, prefix],
     queryFn: () =>
       api<ObjectList>(
@@ -81,51 +83,66 @@ export default function Objects() {
 
   return (
     <>
-      <Breadcrumb items={crumbs} style={{ marginBottom: 16 }} />
-      {canWrite && (
-        <Button type="primary" onClick={() => setUploading(true)} style={{ marginBottom: 16 }}>上传</Button>
-      )}
-      <Table<Row>
-        rowKey={(r) => r.key}
-        loading={isLoading}
-        dataSource={rows}
-        pagination={false}
-        columns={[
-          {
-            title: '名称',
-            dataIndex: 'key',
-            render: (key: string, r: { kind: 'dir' | 'obj' }) =>
-              r.kind === 'dir' ? (
-                <Button type="link" size="small" onClick={() => setSp(key ? { prefix: key } : {})}>
-                  {key.slice(prefix.length)}
-                </Button>
-              ) : (
-                <Tooltip title={key}>{key.slice(prefix.length)}</Tooltip>
-              ),
-          },
-          {
-            title: '大小',
-            width: 120,
-            render: (_: unknown, r: { kind: string; size?: number }) => (r.kind === 'dir' ? '-' : humanSize(r.size ?? 0)),
-          },
-          { title: 'ETag', dataIndex: 'etag', width: 320, render: (v?: string) => v ?? '-' },
-          {
-            title: '操作',
-            width: 160,
-            render: (_: unknown, r: { kind: 'dir' | 'obj'; key: string }) =>
-              r.kind === 'obj' && (
-                <>
-                  <Button size="small" onClick={() => download(r.key)} style={{ marginRight: 8 }}>下载</Button>
-                  {canDelete && (
-                    <Popconfirm title={`删除 ${r.key}？`} onConfirm={() => remove.mutate(r.key)}>
-                      <Button size="small" danger>删除</Button>
-                    </Popconfirm>
-                  )}
-                </>
-              ),
-          },
-        ]}
+      <Breadcrumb items={crumbs} style={{ marginBottom: 12 }} />
+      <PageHeader
+        title={bucket}
+        sub={prefix ? `前缀 ${prefix}` : '对象浏览'}
+        extra={
+          <>
+            <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isFetching} aria-label="刷新" />
+            {canWrite && (
+              <Button type="primary" onClick={() => setUploading(true)}>上传</Button>
+            )}
+          </>
+        }
       />
+      <Card styles={{ body: { padding: 0 } }}>
+        <Table<Row>
+          rowKey={(r) => r.key}
+          loading={isLoading}
+          dataSource={rows}
+          pagination={false}
+          columns={[
+            {
+              title: '名称',
+              dataIndex: 'key',
+              render: (key: string, r: { kind: 'dir' | 'obj' }) =>
+                r.kind === 'dir' ? (
+                  <Button type="link" size="small" style={{ paddingInline: 0 }} onClick={() => setSp(key ? { prefix: key } : {})}>
+                    <FolderOutlined style={{ color: '#f59e0b', marginRight: 6 }} />
+                    {key.slice(prefix.length)}
+                  </Button>
+                ) : (
+                  <Space size={6}>
+                    <FileOutlined style={{ color: '#94a3b8' }} />
+                    <Tooltip title={key}>{key.slice(prefix.length)}</Tooltip>
+                  </Space>
+                ),
+            },
+            {
+              title: '大小',
+              width: 120,
+              render: (_: unknown, r: { kind: string; size?: number }) => (r.kind === 'dir' ? '-' : humanSize(r.size ?? 0)),
+            },
+            { title: 'ETag', dataIndex: 'etag', width: 320, render: (v?: string) => v ?? '-' },
+            {
+              title: '操作',
+              width: 160,
+              render: (_: unknown, r: { kind: 'dir' | 'obj'; key: string }) =>
+                r.kind === 'obj' && (
+                  <>
+                    <Button size="small" onClick={() => download(r.key)} style={{ marginRight: 8 }}>下载</Button>
+                    {canDelete && (
+                      <Popconfirm title={`删除 ${r.key}？`} onConfirm={() => remove.mutate(r.key)}>
+                        <Button size="small" danger>删除</Button>
+                      </Popconfirm>
+                    )}
+                  </>
+                ),
+            },
+          ]}
+        />
+      </Card>
       <UploadPanel open={uploading} bucket={bucket} onClose={() => setUploading(false)} />
     </>
   )

@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import { Alert, App, Button, Input, Modal, Table, Typography } from 'antd'
+import { Alert, App, Button, Card, Input, Modal, Table, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type AccessKey } from '../api'
+import PageHeader from '../PageHeader'
 
 export default function Keys() {
   const { message } = App.useApp()
@@ -39,22 +40,32 @@ export default function Keys() {
 
   return (
     <>
-      <Button type="primary" loading={create.isPending} onClick={() => create.mutate()} style={{ marginBottom: 16 }}>
-        新建访问密钥
-      </Button>
-      <Button onClick={() => { setPw({ old: '', new1: '', new2: '' }); setChanging(true) }} style={{ marginLeft: 8, marginBottom: 16 }}>
-        修改口令
-      </Button>
-      <Table
-        rowKey={(r) => r}
-        loading={isLoading}
-        dataSource={keys}
-        columns={[
-          // 不用 dataIndex：antd 对 string[] 记录取 dataIndex:0 会拿到首字符；无 dataIndex 时 render 第一参即整条记录
-          { title: 'Access Key', render: (ak: string) => ak },
-          { title: '说明', render: () => '启用/禁用与过期在 M5；M1 只有创建与使用' },
-        ]}
+      <PageHeader
+        title="访问密钥"
+        sub="密钥用于 S3 客户端（SigV4）访问；Secret Key 仅在创建时显示一次"
+        extra={
+          <>
+            <Button type="primary" loading={create.isPending} onClick={() => create.mutate()}>
+              新建访问密钥
+            </Button>
+            <Button onClick={() => { setPw({ old: '', new1: '', new2: '' }); setChanging(true) }}>
+              修改口令
+            </Button>
+          </>
+        }
       />
+      <Card styles={{ body: { padding: 0 } }}>
+        <Table
+          rowKey={(r) => r}
+          loading={isLoading}
+          dataSource={keys}
+          columns={[
+            // 不用 dataIndex：antd 对 string[] 记录取 dataIndex:0 会拿到首字符；无 dataIndex 时 render 第一参即整条记录
+            { title: 'Access Key', render: (ak: string) => <Typography.Text code>{ak}</Typography.Text> },
+            { title: '说明', render: () => '启用/禁用与过期在 M5；M1 只有创建与使用' },
+          ]}
+        />
+      </Card>
       <Modal title="密钥已创建" open={!!fresh} footer={null} maskClosable={false} onCancel={close}>
         {fresh && (
           <>

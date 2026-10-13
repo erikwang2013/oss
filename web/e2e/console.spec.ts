@@ -118,8 +118,9 @@ test('上传超限 → 问题响应 title 显示在输出区（2.0 协议）', a
   await page.goto('/buckets/files')
   await page.getByRole('button', { name: '上 传', exact: true }).click()
 
-  // 切到 image 组（带 10 MB 上限）
-  await page.locator('.ant-modal .ant-select-selector').click()
+  // 切到 image 组（带 10 MB 上限）。first()：共享 data 目录里上传历史超过 5 条后，
+  // 历史表的分页会多渲染一个「N 条/页」选择器——它是第二个 .ant-select-selector（实弹红过）。
+  await page.locator('.ant-modal .ant-select-selector').first().click()
   await page.getByText(/^image →/).click()
 
   await page.locator('#aetherupload-resource').setInputFiles({
