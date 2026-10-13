@@ -25,6 +25,28 @@ pub struct AppConfig {
     pub max_put_bytes: usize,
     #[serde(default)]
     pub groups: Vec<GroupTarget>,
+    /// M3 集群节 `[cluster]`；未配置 = 单节点（v1.4.0 行为）。
+    #[serde(default)]
+    pub cluster: Option<ClusterToml>,
+}
+
+/// `[cluster]`：扁平静态拓扑（设计 §5.3——无 DC/Region/AZ，M3+ 同样适用）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterToml {
+    /// 本节点 id（必须在 `nodes` 表内）。
+    pub node_id: String,
+    /// 集群内共享令牌（节点间 gRPC 的 metadata 校验；明文传输，内网假设）。
+    pub secret: String,
+    #[serde(default)]
+    pub nodes: Vec<NodeToml>,
+}
+
+/// 拓扑表中的一个节点。`addr` = 该节点 gRPC 监听地址（HTTP 端口另配）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeToml {
+    pub id: String,
+    pub addr: String,
+    pub drive_count: u16,
 }
 
 /// `[ec]` 配置节（映射到 xl-store 的 `EcConfig` + `inline_threshold`）。

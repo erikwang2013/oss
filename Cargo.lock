@@ -1818,6 +1818,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "xl-client",
  "xl-s3",
  "xl-store",
 ]

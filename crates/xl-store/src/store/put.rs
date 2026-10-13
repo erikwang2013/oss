@@ -297,6 +297,7 @@ impl Store {
                     None => {}
                 }
             }
+            self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
                 "分片存活 {landed} < {}（已回滚 {touched:?}）",
                 quorum
@@ -458,6 +459,7 @@ impl Store {
                 self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
                 let _ = tokio::fs::remove_dir_all(&tmp).await;
                 let _ = tokio::fs::remove_dir(&obj_dir).await;
+                self.bump_quorum_unmet_write();
                 return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
             }
             if flipped < quorum {

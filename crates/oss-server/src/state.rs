@@ -61,6 +61,41 @@ impl AppState {
             enabled: cfg.ec.enabled,
         };
         store_cfg.inline_threshold = cfg.ec.inline_threshold;
+        // M3 集群（配了 [cluster] 才走）：静态拓扑 + 节点间传输注入存储内核。
+        // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
+        // ClusterTopology::new 与 Store::open（self 一致性）。
+        if let Some(cl) = cfg.cluster.as_ref() {
+            let self_idx = cl
+                .nodes
+                .iter()
+                .position(|n| n.id == cl.node_id)
+                .ok_or_else(|| {
+                    format!(
+                        "cluster.node_id «{}» 不在 [[cluster.nodes]] 表内",
+                        cl.node_id
+                    )
+                })?;
+            let specs: Vec<xl_store::store::NodeSpec> = cl
+                .nodes
+                .iter()
+                .map(|n| xl_store::store::NodeSpec {
+                    id: n.id.clone(),
+                    addr: n.addr.clone(),
+                    drive_count: n.drive_count,
+                })
+                .collect();
+            let topo = xl_store::store::ClusterTopology::new(self_idx, specs, &store_cfg.ec)?;
+            let pairs: Vec<(String, String)> = cl
+                .nodes
+                .iter()
+                .map(|n| (n.id.clone(), n.addr.clone()))
+                .collect();
+            let mesh = Arc::new(xl_client::TonicMesh::new(&cl.node_id, &cl.secret, &pairs)?);
+            store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
+                topo,
+                transport: mesh,
+            }));
+        }
         let store = Store::open(store_cfg).await?;
 
         // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒

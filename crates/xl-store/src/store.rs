@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -22,6 +23,9 @@ mod mesh_api;
 mod mpu;
 mod put;
 mod read;
+
+// M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
+pub use drives::{ClusterConfig, ClusterTopology, NodeSpec};
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
@@ -102,6 +106,10 @@ pub struct Store {
     /// 否则两个写者会把对方的版本目录当「老版本」扔进回收站。键前缀 `bucket:` 承载桶级锁
     /// （M2b-2 Task 10，见 `lock_bucket`）。
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// quorum 未达计数（M3 最小信号，写/锁分列）：`/health/cluster` 暴露——
+    /// 分区故障必须线上有信号源（完整 Prometheus 面归 M4）。
+    quorum_unmet_write: AtomicU64,
+    quorum_unmet_lock: AtomicU64,
 }
 
 /// 对象锁守卫：进程内 tokio 互斥 + 跨进程 flock（`File` drop 即释放 flock）。
@@ -231,6 +239,8 @@ impl Store {
         let store = Self {
             cfg,
             locks: Mutex::new(HashMap::new()),
+            quorum_unmet_write: AtomicU64::new(0),
+            quorum_unmet_lock: AtomicU64::new(0),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;
@@ -239,6 +249,30 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         self.cfg.root()
+    }
+
+    /// 集群面访问（None = 单节点，v1.4.0 行为）。oss-server 用它取拓扑与传输。
+    pub fn cluster(&self) -> Option<&drives::ClusterConfig> {
+        self.cfg.cluster.as_deref()
+    }
+
+    /// quorum 未达计数快照（写/锁分列；`/health/cluster` 的最小信号）。
+    pub fn quorum_unmet_counts(&self) -> (u64, u64) {
+        (
+            self.quorum_unmet_write.load(Ordering::Relaxed),
+            self.quorum_unmet_lock.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 写路径 quorum 未达（客户端可见的写失败）时递增；Task 6 的集群提交路径同口径。
+    pub(crate) fn bump_quorum_unmet_write(&self) {
+        self.quorum_unmet_write.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 锁 quorum 未达时递增（Task 8 接入）。
+    #[allow(dead_code)] // Task 8 消费
+    pub(crate) fn bump_quorum_unmet_lock(&self) {
+        self.quorum_unmet_lock.fetch_add(1, Ordering::Relaxed);
     }
 
     fn lock_for(&self, bucket: &str, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -559,6 +593,7 @@ impl Store {
                     let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
                 }
             }
+            self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
                 "meta 准备 {}/{quorum}，未提交",
                 prepared.len()

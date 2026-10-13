@@ -5,6 +5,7 @@
 //! 外加内核管不到的部分：`.oss.sys/tmp/` 的孤儿上传目录（[`run`] 的 clean 分支）与
 //! xl-store 的盘上巡检（fsck 分支，M2b-2 Task 10）。
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::state::AppState;
@@ -84,6 +85,64 @@ pub async fn run(
                 .await
                 .map_err(|e| format!("监听地址 {listen} 绑定失败: {e}"))?;
             drop(probe);
+
+            // M3 集群：起节点间 gRPC（独立端口）。绑定期检同 HTTP——失败即退出，不假活。
+            if let Some(cl) = state.cfg.cluster.as_ref() {
+                let self_node = cl
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == cl.node_id)
+                    .ok_or_else(|| format!("cluster.node_id «{}» 不在节点表内", cl.node_id))?;
+                let addr: std::net::SocketAddr = self_node
+                    .addr
+                    .parse()
+                    .map_err(|e| format!("cluster 节点地址非法（{}）: {e}", self_node.addr))?;
+                let probe = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| format!("mesh 监听 {addr} 绑定失败: {e}"))?;
+                drop(probe);
+
+                // 启动探活（防错接线）：可达且 node_id 不符 → 拒启；不可达只 warn——
+                // 滚动启动时对端可能尚未就绪，RPC 时由 health 面持续暴露。
+                if let Some(c) = state.store.cluster() {
+                    for n in &cl.nodes {
+                        if n.id == cl.node_id {
+                            continue;
+                        }
+                        match tokio::time::timeout(
+                            Duration::from_millis(800),
+                            c.transport.health(&n.id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(h)) if h.node_id == n.id => {}
+                            Ok(Ok(h)) => {
+                                return Err(format!(
+                                    "对端 {} 实报 node_id «{}»（错接线？）",
+                                    n.id, h.node_id
+                                )
+                                .into());
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(node = %n.id, error = %e, "启动探活失败（滚动启动时正常）")
+                            }
+                            Err(_) => {
+                                tracing::warn!(node = %n.id, "启动探活超时（滚动启动时正常）")
+                            }
+                        }
+                    }
+                }
+
+                let store = Arc::clone(&state.store);
+                let secret = cl.secret.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = xl_client::serve(store, addr, secret).await {
+                        // 进程不随 gRPC 退（HTTP 面继续）：对端会将其标 down、quorum 收窄；
+                        // 监督/自动重启归 M4 运维面。
+                        tracing::error!(error = %e, "mesh gRPC server 退出");
+                    }
+                });
+            }
 
             let router = crate::router::build_router(state)?;
             let mut app = ecat::App::builder()

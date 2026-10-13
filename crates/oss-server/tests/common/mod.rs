@@ -22,6 +22,7 @@ pub async fn state(dir: &std::path::Path) -> AppState {
             max_size: 0,
             extensions: vec![],
         }],
+        cluster: None, // 单节点测试形态；集群 fixture 走 in-process 基座（xl-store::store::tests）
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
