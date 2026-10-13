@@ -578,6 +578,50 @@ async fn self_password_change_and_disable_flow() {
         StatusCode::UNAUTHORIZED,
         "停用后旧 JWT 立即失效"
     );
+    // 评审 P1 回归：曾绕过 who() 的遮面端点也必须拦下（建桶/密钥、分组只读）
+    for (method, path, body) in [
+        (
+            reqwest::Method::POST,
+            "/api/v1/buckets",
+            Some(serde_json::json!({"name": "should-not-exist"})),
+        ),
+        (reqwest::Method::GET, "/api/v1/access-keys", None),
+        (
+            reqwest::Method::POST,
+            "/api/v1/access-keys",
+            Some(serde_json::json!({})),
+        ),
+        (reqwest::Method::GET, "/api/v1/groups", None),
+    ] {
+        let mut req = client()
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(&sub);
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let r = req.send().await.unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "停用后 {method} {path} 必须 401"
+        );
+    }
+    // 停用期间没铸出任何桶
+    let buckets_admin: Vec<serde_json::Value> = client()
+        .get(format!("{base}/api/v1/buckets"))
+        .bearer_auth(&root)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !buckets_admin
+            .iter()
+            .any(|b| b["name"] == "should-not-exist"),
+        "停用账号不得建出桶"
+    );
 
     // 列表里状态可见；重新启用恢复
     let users: Vec<serde_json::Value> = client()

@@ -199,7 +199,14 @@ async fn me(State(state): State<AppState>, Extension(payload): Extension<JwtPayl
 }
 
 /// 上传分组（oss.toml 的 `[[groups]]`），供上传面板的分组下拉使用。
-async fn list_groups(State(state): State<AppState>) -> impl IntoResponse {
+/// 登录即可读，但被停用账号的旧 JWT 同样失效（过 who()）。
+async fn list_groups(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> impl IntoResponse {
+    if let Err(r) = who(&state, &payload).await {
+        return r;
+    }
     Json(state.cfg.groups.clone()).into_response()
 }
 
@@ -264,14 +271,14 @@ struct CreateBucketBody {
     name: String,
 }
 
-/// 任何登录用户可建桶（建桶者即桶主，自动全权）。
+/// 任何**在册**用户可建桶（建桶者即桶主，自动全权；被停用账号的旧 JWT 在此同样失效）。
 async fn create_bucket(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateBucketBody>,
 ) -> impl IntoResponse {
-    let uid = match uid_of(&payload) {
-        Ok(u) => u,
+    let (uid, _) = match who(&state, &payload).await {
+        Ok(v) => v,
         Err(r) => return r,
     };
     if let Err(e) = state.store.create_bucket(&body.name).await {
@@ -477,8 +484,8 @@ async fn list_access_keys(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
 ) -> impl IntoResponse {
-    let uid = match uid_of(&payload) {
-        Ok(u) => u,
+    let (uid, _) = match who(&state, &payload).await {
+        Ok(v) => v,
         Err(r) => return r,
     };
     match state.db.list_access_keys(uid).await {
@@ -509,8 +516,8 @@ async fn create_access_key(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateKeyBody>,
 ) -> impl IntoResponse {
-    let uid = match uid_of(&payload) {
-        Ok(u) => u,
+    let (uid, _) = match who(&state, &payload).await {
+        Ok(v) => v,
         Err(r) => return r,
     };
     if let Some(ak) = body.access_key.as_deref().filter(|s| !valid_credential(s)) {
@@ -636,7 +643,15 @@ async fn delete_user(
         }
     }
     match state.db.delete_user(id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        // 上面的预检给友好文案；false 且用户仍在 = 并发下守卫触发（评审 P2 的原子兜底）
+        Ok(false) => {
+            if matches!(state.db.get_user(id).await, Ok(Some(_))) {
+                (StatusCode::BAD_REQUEST, "不能删除最后一个在册管理员").into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
         Err(e) => {
             tracing::error!(error = %e, "删除用户失败");
             internal_error()
@@ -820,7 +835,14 @@ async fn set_user_status(
     }
     match state.db.set_user_status(id, body.active).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        // 上面的预检给友好文案；false 且用户仍在 = 并发下守卫触发（评审 P2 的原子兜底）
+        Ok(false) => {
+            if matches!(state.db.get_user(id).await, Ok(Some(_))) {
+                (StatusCode::BAD_REQUEST, "不能停用最后一个在册管理员").into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
         Err(e) => {
             tracing::error!(error = %e, "更新用户状态失败");
             internal_error()

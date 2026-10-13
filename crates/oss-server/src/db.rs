@@ -81,9 +81,21 @@ impl Db {
             .await?;
         let has_status = cols.iter().any(|r| r.get::<String, _>("name") == "status");
         if !has_status {
-            sqlx::query("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-                .execute(&self.pool)
-                .await?;
+            // 多进程同时首开老库时，双方都可能走到这里 → 后到者会吃 duplicate column；
+            // 此时列已被对方补上，重查确认后视同成功（评审 P3）。
+            if let Err(e) =
+                sqlx::query("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                    .execute(&self.pool)
+                    .await
+            {
+                let cols = sqlx::query("SELECT name FROM pragma_table_info('users')")
+                    .fetch_all(&self.pool)
+                    .await?;
+                let now_has = cols.iter().any(|r| r.get::<String, _>("name") == "status");
+                if !now_has {
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -333,14 +345,29 @@ impl Db {
         }))
     }
 
-    /// 启停用用户。返回是否有该用户。
+    /// 启停用用户。返回是否生效（false = 用户不存在，或停用会留下 0 个在册管理员）。
+    ///
+    /// **防呆是原子条件**（评审 P2：先读 count 再 UPDATE 的 check-then-act 在并发互停
+    /// 两个管理员时会双双放行 → 0 在册管理员锁死）。停用走单条条件 UPDATE：
+    /// 非管理员恒可停；管理员仅在「当前在册管理员 > 1」时可停——子查询与写入同语句，
+    /// SQLite 写锁串行化下天然防 TOCTOU。启用无锁死风险，走普通 UPDATE。
     pub async fn set_user_status(&self, uid: i64, active: bool) -> Result<bool> {
-        let n = sqlx::query("UPDATE users SET status = ? WHERE id = ?")
-            .bind(if active { "active" } else { "disabled" })
+        let n = if active {
+            sqlx::query("UPDATE users SET status = 'active' WHERE id = ?")
+                .bind(uid)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE users SET status = 'disabled' WHERE id = ? AND \
+                 (is_admin = 0 OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
+            )
             .bind(uid)
             .execute(&self.pool)
             .await?
-            .rows_affected();
+            .rows_affected()
+        };
         Ok(n == 1)
     }
 
@@ -392,8 +419,25 @@ impl Db {
 
     /// 删除用户（一个事务内处理全部外键：sqlx 默认 FK ON，裸删 users 会报错）：
     /// 级联删 access_keys 与 permissions；buckets/uploads 的 owner 置 NULL（记录保留作审计）。
-    pub async fn delete_user(&self, uid: i64) -> Result<()> {
+    /// 返回是否删除（false = 用户不存在，或会留下 0 个在册管理员）。
+    ///
+    /// **防呆原子化**（评审 P2，同 set_user_status）：事务第一条是无副作用的守卫写
+    /// （`UPDATE users SET id=id WHERE …`），既取写锁串行化并发删除/停用，又在同一语句里
+    /// 完成判定——通过才继续级联；不通过直接返回 false，一个字节都不改。
+    pub async fn delete_user(&self, uid: i64) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
+        let gate = sqlx::query(
+            "UPDATE users SET id = id WHERE id = ? AND \
+             (NOT (is_admin = 1 AND status = 'active') \
+              OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
+        )
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if gate == 0 {
+            return Ok(false);
+        }
         sqlx::query("DELETE FROM access_keys WHERE user_id = ?")
             .bind(uid)
             .execute(&mut *tx)
@@ -415,7 +459,7 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// 某用户的权限行（全量）。
@@ -627,7 +671,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.delete_user(sub).await.unwrap();
+        assert!(db.delete_user(sub).await.unwrap());
         assert_eq!(db.get_user(sub).await.unwrap(), None);
         assert!(db.get_permissions(sub).await.unwrap().is_empty());
         let owner: Option<i64> =
@@ -771,6 +815,7 @@ mod tests {
     async fn user_status_disable_flow() {
         let db = db().await;
         let admin = db.create_user("root", "pw", true).await.unwrap();
+        let admin2 = db.create_user("root2", "pw", true).await.unwrap();
         let sub = db.create_user("sub", "pw12345678", false).await.unwrap();
 
         // 停用：登录与 get_user 的 active 位立即反映
@@ -780,17 +825,34 @@ mod tests {
             Some(("sub".to_string(), false, false))
         );
         assert!(db.verify_user("sub", "pw12345678").await.unwrap().is_none());
-        // 在册管理员计数：停用的管理员不计入
+        // 在册管理员：两人在册 → 可停其一；剩最后一人 → 原子守卫拦下（评审 P2）
+        assert_eq!(db.count_active_admins().await.unwrap(), 2);
+        assert!(db.set_user_status(admin2, false).await.unwrap());
         assert_eq!(db.count_active_admins().await.unwrap(), 1);
-        assert!(db.set_user_status(admin, false).await.unwrap());
-        assert_eq!(db.count_active_admins().await.unwrap(), 0);
+        assert!(
+            !db.set_user_status(admin, false).await.unwrap(),
+            "最后一个在册管理员不可停用（单条条件 UPDATE 原子守卫）"
+        );
+        assert_eq!(db.count_active_admins().await.unwrap(), 1);
         // 重新启用恢复
-        assert!(db.set_user_status(admin, true).await.unwrap());
-        assert_eq!(db.count_active_admins().await.unwrap(), 1);
+        assert!(db.set_user_status(admin2, true).await.unwrap());
+        assert_eq!(db.count_active_admins().await.unwrap(), 2);
         assert!(
             db.verify_user("sub", "pw12345678").await.unwrap().is_none(),
             "停用者仍登录不了"
         );
+
+        // 删除的原子守卫：非管理员恒可删；最后一个在册管理员不可删
+        assert!(
+            db.delete_user(admin2).await.unwrap(),
+            "两名在册管理员时可删其一"
+        );
+        assert!(
+            !db.delete_user(admin).await.unwrap(),
+            "最后一个在册管理员不可删"
+        );
+        assert!(db.get_user(admin).await.unwrap().is_some());
+        assert!(db.delete_user(sub).await.unwrap(), "非管理员恒可删");
         assert!(!db.set_user_status(999, true).await.unwrap());
     }
 

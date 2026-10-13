@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { App, Button, Checkbox, Input, Modal, Popconfirm, Table, Tag } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type BucketInfo, type Permission, type UserRow } from '../api'
+import { api, type BucketInfo, type Me, type Permission, type UserRow } from '../api'
 
 /** 权限摘要文案：`alpha: 读/写；beta: 删` */
 function summary(perms: Permission[]): string {
@@ -24,6 +24,8 @@ export default function Users() {
     queryKey: ['users'],
     queryFn: () => api<UserRow[]>('/api/v1/users'),
   })
+  // 自己那行的「停用」必吃 400（后端防呆）——前端直接禁用，别让用户白点
+  const { data: me } = useQuery({ queryKey: ['me'], queryFn: () => api<Me>('/api/v1/me') })
   const { data: buckets = [] } = useQuery({
     queryKey: ['buckets'],
     queryFn: () => api<BucketInfo[]>('/api/v1/buckets'),
@@ -99,7 +101,8 @@ export default function Users() {
             render: (_: unknown, u: UserRow) => (
               <>
                 {u.is_admin ? <Tag color="gold">管理员</Tag> : <Tag>子账户</Tag>}
-                {u.status !== 'active' && <Tag color="red">已停用</Tag>}
+                {/* 显式判 disabled：字段缺失（旧后端/缓存）时不误报停用 */}
+                {u.status === 'disabled' && <Tag color="red">已停用</Tag>}
               </>
             ),
           },
@@ -115,10 +118,10 @@ export default function Users() {
                 <Button size="small" onClick={() => openPerms(u)} disabled={u.is_admin} style={{ marginRight: 8 }}>
                   权限
                 </Button>
-                {/* 启停用：停用即全链路失效（登录/S3/上传面），旧 JWT 下一请求 401 */}
-                {u.status === 'active' ? (
+                {/* 启停用：停用即全链路失效（登录/S3/上传面），旧 JWT 下一请求 401；自己那行禁用 */}
+                {u.status !== 'disabled' ? (
                   <Popconfirm title={`停用 ${u.username}？其 AK 与登录将立即失效`} onConfirm={() => setStatus.mutate({ id: u.id, active: false })}>
-                    <Button size="small" style={{ marginRight: 8 }}>停用</Button>
+                    <Button size="small" disabled={u.id === me?.id} style={{ marginRight: 8 }}>停用</Button>
                   </Popconfirm>
                 ) : (
                   <Button size="small" onClick={() => setStatus.mutate({ id: u.id, active: true })} style={{ marginRight: 8 }}>

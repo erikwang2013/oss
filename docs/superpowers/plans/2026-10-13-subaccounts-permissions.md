@@ -51,14 +51,43 @@ CopyObject = 源桶 read + 目标桶 write；CreateBucket 任何已认证用户�
 
 ## 已知问题（遗留清单）
 
-- `oss-server` 在 `listen` 端口被占用时 **bind 失败不退出**（进程活着但无监听，systemd 视作
-  假活）。e2e 期间顺带观察（9001 被占时发生）；按 service 化之前需改成启动失败退出。
+- ~~`oss-server` 在 `listen` 端口被占用时 bind 失败不退出~~（**已修**，见「清遗留轮」；
+  残余毫秒级竞态窗口已记档）。
 - 权限撤销对已过 preprocess 的在途上传不追溯；控制台上传受 `[[groups]]` 映射约束（见边界节）。
+- 停用账号的既有 JWT 在**下一请求**才失效（无主动吊销名单）——接受，token 12h 自然过期。
 
 ## 明确不做（本期）
 
-子账户自助改密码（API 归管理员）；用户启用/禁用（需 ALTER TABLE）；桶策略 JSON / 预设模板；
-permissions 缓存（每请求 1-2 次 SQLite 读，与既有 ponytail 同口径）。
+桶策略 JSON / 预设模板（属新特性，随 M4 细粒度 IAM）；permissions 缓存（每请求 1-2 次
+SQLite 读，与既有 ponytail 同口径，无实测瓶颈不加）。
+
+## 清遗留轮（2026-10-13 追加，commit 43c4bbd）
+
+- **自助改密**：`POST /api/v1/me/password`（验旧口令、新口令 ≥8）；前端 Keys 页「修改口令」弹窗。
+  已从「本期不做」清单移出。
+- **账号启停用**：`users.status`（0001 带列 + `ensure_columns` 对老库幂等补列——SQLite 版极小迁移
+  助手：PRAGMA 探测 + ALTER，字面量 SQL）；`PUT /users/{id}/status`（防呆：不能停用自己/最后一个
+  在册管理员）。**停用即全链路失效**：登录 401、既有 JWT 下一请求 401（console who()/me）、
+  S3 的 AK 403（SigV4Auth 与 Acl::user_of_key 双层 JOIN `users.status='active'`）、上传面 401
+  （aether_gate）。前端 Users 页「停用/启用」按钮 + 「已停用」标签。已从「本期不做」清单移出。
+- **bind 假活修复**：ecat 把 server 丢 `tokio::spawn`、`start()` 失败只记日志而 `run()` 继续等
+  信号 → 端口被占时进程活着无监听（上轮 e2e 观察）。`cli.rs` serve 分支加**绑定期检**：失败即
+  非零退出。残余：探测释放与 ecat 复绑之间有毫秒级竞态窗口（命中的概率极低且届时退化为原假活
+  行为，由 ecat 日志暴露）；根治需 transport 支持外部 listener（上游增强项）。
+
+### 清遗留轮评审修复（leftover-reviewer，P1–P5）
+
+- **P1（高）**：`create_bucket`/`list_access_keys`/`create_access_key` 三端点只过 `uid_of()`
+  （不查库）→ 被停用/已删账号的旧 JWT 仍可建桶、铸新 AK。修：三处改走 `who()`；`/groups`
+  同补（P4）。集成回归：停用后四个端点必须 401 且未铸出任何桶。
+- **P2（中）**：启停用/删除的「先读计数再写」并发互停可锁死到 0 在册管理员。修：守卫与写入
+  合并为**单条条件语句**（`set_user_status` 的停用分支；`delete_user` 的事务首条无副作用守卫写
+  `UPDATE users SET id=id WHERE …`，既取写锁串行化又原子判定，不通过则一字节不改）。
+- **P3（低）**：`ensure_columns` 多进程首开老库可撞 duplicate column。修：ALTER 失败后重查列，
+  已补上则视同成功。
+- **P5（低）**：前端 `status === 'disabled'` 显式判定（缺字段不误报）；api 类型改可选；自己那行
+  「停用」按钮禁用（后端防呆之外的前端 UX）。
+- P6（bind 期检）经评审确认成立；注释中「毫秒级窗口」含建 router 与调度、略宽于字面，量级不变。
 
 ## 已知边界
 

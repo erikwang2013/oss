@@ -192,7 +192,8 @@ echo "== 15. 子账户权限（三档读/写/删在 S3 面的执行）=="
 # 控制台 API（curl）：管理员登录 → POST /users 建子账户 → PUT /users/{id}/permissions
 # 全量替换权限行（先只授「读」）；子账户自签第二把 AK/SK（POST /access-keys）后走 aws-cli：
 #   授权桶 ls/get 放行；只授读时上传 403；未授权桶 ls 403 AccessDenied；匿名 403；
-#   补授写后上传放行；ListBuckets 只见授权桶（服务端按可见集过滤）。
+#   补授写后上传放行；ListBuckets 只见授权桶（服务端按可见集过滤）；
+#   停用账号 → 同一 AK 立即 403（InvalidAccessKeyId，认证层拦截）→ 启用恢复（15h，排在清理前）。
 # 管理员账号默认 erik/changeme（README 引导段），可用 ADMIN_USER/ADMIN_PASSWORD 覆盖。
 ADMIN_USER="${ADMIN_USER:-erik}"; ADMIN_PASSWORD="${ADMIN_PASSWORD:-changeme}"
 ADMIN_TOKEN=$(curl -s -X POST "$ENDPOINT/api/v1/login" -H 'content-type: application/json' \
@@ -258,6 +259,17 @@ echo "--- 15f. ListBuckets 过滤：只见授权桶 ---"
 sub_aws s3 ls | tee "$WORK/sub-buckets.txt"
 grep -q "$PERM_BUCKET" "$WORK/sub-buckets.txt"
 if grep -q "$OTHER_BUCKET" "$WORK/sub-buckets.txt"; then echo "ListBuckets 泄漏未授权桶"; exit 1; fi
+
+echo "--- 15h. 停用账号：同一 AK 立即 403（InvalidAccessKeyId），启用后恢复 ---"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB_ID/status" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"active":false}')
+[ "$CODE" = "204" ] || { echo "停用应 204，实际 $CODE"; exit 1; }
+OUT=$(sub_aws s3 ls 2>&1) && { echo "停用后 AK 仍可用: $OUT"; exit 1; }
+echo "$OUT" | grep -q '(InvalidAccessKeyId)' || { echo "停用后应报 InvalidAccessKeyId: $OUT"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB_ID/status" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"active":true}')
+[ "$CODE" = "204" ] || { echo "启用应 204，实际 $CODE"; exit 1; }
+sub_aws s3 ls | grep -q "$PERM_BUCKET" || { echo "启用后 AK 未恢复"; exit 1; }
 
 echo "--- 15g. 清理：删两个桶 + 删子账户 ---"
 aws_s3 rb "s3://$PERM_BUCKET" --force >/dev/null

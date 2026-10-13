@@ -124,8 +124,8 @@ export interface UserRow {
   id: number
   username: string
   is_admin: boolean
-  /** "active" / "disabled"（停用即全链路失效） */
-  status: string
+  /** "active" / "disabled"（停用即全链路失效）；可选：旧后端/缓存响应可能缺字段 */
+  status?: string
   created_at: number
   permissions: Permission[]
 }
