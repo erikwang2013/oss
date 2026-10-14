@@ -122,7 +122,8 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >     运行时掉线的盘会被自动判为不在册（写按 quorum 绕行、删对象 fail-closed、插回自动恢复），
 >     但它**必须曾在挂载状态下启动过**（盘上有 `.oss.sys` 与 `drive-id`）。
 >   - 掉线盘在场时 **删对象/删桶返回 500**（防「插回即复活」）；这是有意为之的 fail-closed，插回后重试即可。
->   - 读 meta 取**最新副本**（`mod_time` 墙钟）：多盘间该值正常单调；NTP 大步回拨叠加写盘故障属已知边界（M4 的 heal/epoch 收口）。
+>   - 读 meta 副本择新自 M4 起按 `(epoch, mod_time)` 排秩——写端 epoch 单调 +1，NTP 回拨不再产生「旧副本凭大钟胜出」；
+>     epoch 随 `xl.meta` 前向兼容（老文件按 0 参与排秩）。
 >   - 目录 fsync 的断电零丢失保证按 ext4/XFS 假设；其它文件系统上目录 fsync 失败仅 warn，需自行复核。
 > - 长跑验收（rclone 并发 100×100 MB + 中断重试，设计验收 #3）在 `tests/e2e_s3.sh` 的
 >   `E2E_LONG=1` 门控段（默认跳过，人工触发；`E2E_LONG_N`/`E2E_LONG_MB` 调规模）。
@@ -191,7 +192,7 @@ cd web && npm install && npm run dev
 
 ## 运维命令
 
-`oss-server [serve|groups|build|clean <days>|fsck [--repair]]`（无参数 = `serve`）。运维命令读当前目录的
+`oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub]`（无参数 = `serve`）。运维命令读当前目录的
 `oss.toml`，并走与服务端相同的启动自举（建目录/连库/开存储；管理员与桶的引导是幂等的）：
 
 ```bash
@@ -202,8 +203,19 @@ oss-server clean <days>  # 按 mtime 回收 days 天前的残骸：
                          #   与各对象目录下未被引用的版本目录（含未完成的上传暂存区）
 oss-server fsck          # 全盘巡检：孤儿版本目录 / EC 分片缺坏（CRC32C）/ tmp-trash 计数；
 oss-server fsck --repair #   同上 + 最小修复（删孤儿 + 读时修分片）。报告落
-                         #   `.oss.sys/fsck/<时间戳>.json`（独立 scrub 深度巡检是 M4）
+                         #   `.oss.sys/fsck/<时间戳>-<kind>.json`
+oss-server heal          # fsck --repair 全量 + 缺失桶目录补建（集群差集）+ 逐版本修复
+                         #   （历史版本同样点名读触发回写）；每节点各自执行——本地语义：
+                         #   补的是本机盘上的缺口，集群收敛 = 各节点各跑一次
+                         #   禁忌同 fsck --repair：不得与在途上传/写入并跑（读时修/孤儿
+                         #   清理与在途版本目录竞争）
+oss-server scrub         # 全量深度巡检（只读）：每个 EC 版本逐块读取 + 逐块 12×W 对偶校验
+                         #   （可定位坏片；常量内存不组装整份对象）；历史版本全覆盖；
+                         #   健康对象计 ok_versions；可重建的坏/缺块不退出非零（数据仍在
+                         #   EC 冗余内、读路径自愈），仅深度失败（存活不足/对偶不过）exit 1（cron 可盯）
 ```
+
+分工：`fsck` = 整片 CRC32C 快检（轻）；`scrub` = 块级深度验证（慢、可定位坏片）。
 
 建议 cron（每日 `clean 1` 与 `build` 各一次，每周 `fsck --repair` 一次）：
 
@@ -251,7 +263,7 @@ drive_count = 3
 **运维口径**：
 - 每节点定期 `clean` + `fsck --repair`（同前 cron）；**远端孤儿只由该节点自己回收**——
   掉线期间其他节点删不掉它的残骸。分片缺失靠读时修兜底 + fsck 巡检；缺键 meta 由
-  `fsck --repair` 从对端差集检出并补建（「加回节点后补齐」）。
+  `fsck --repair` 从对端差集检出并补建（「加回节点后补齐」；批量口径用 `heal`——差集补建 + 桶目录补建 + 逐版本修复）。
 - 节点掉线期间 `clean` 的对象目录回收会**保守空转**（不可逆删数据前全节点探活）；`trash/tmp` 照常。
 - **`fsck --repair` 不得与在途分块上传并跑**（无龄期删孤儿会清掉暂存区）。
 - **M3 不支持单机原地升级为多节点**（无 rebalance/搬迁，归 M4）：单机数据要进集群请重新灌入。
