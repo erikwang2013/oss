@@ -330,6 +330,8 @@ impl Store {
                 inline,
                 is_delete_marker: None,
                 is_latest: None,
+                // NTP 回拨收口：epoch = 旧链 max+1（与单段 PUT 同口径）
+                epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
             };
             let mut meta = match (versioned, old_meta.as_ref()) {
                 (true, Some(old)) => {

@@ -232,7 +232,7 @@ impl Store {
     /// 位置按拓扑下标解引用：`drives[s.drive] /<bucket>/<展键>/<uuid>/part.<part>.<shard>`。
     /// 缺失/短读/对端不可达 ≡ `None`（EC 重建兜底）；本机 IO 错误 → `Err`。
     #[allow(clippy::too_many_arguments)]
-    async fn read_shard_block(
+    pub(in crate::store) async fn read_shard_block(
         &self,
         bucket: &str,
         key: &str,
@@ -524,7 +524,8 @@ impl Store {
     /// 重建的 payload，逐块重编）。best-effort——修复失败只 warn（读已成功，绝不因修复
     /// 失败把读变成错误）。本地先探活再写（不得对掉线盘「修复」：挂载点目录仍在父 fs 上，
     /// 盲写会填满根盘）；远端走 write_shard 分块 RPC。
-    /// ponytail: 无后台 heal / 无 quorum 校验（盘全掉时修复静默失败）；M4 切片 4 的 heal 批量补全。
+    /// M4 切片 4 已落地批量面：`heal`（fsck --repair + 桶目录补建）与 `scrub`（逐块深度
+    /// 对偶校验）；本函数仍是**读时兜底**（盘全掉时修复静默失败，报告由 scrub 承担）。
     async fn repair_shards_chunked(
         &self,
         bucket: &str,

@@ -513,7 +513,7 @@ impl Store {
         r: crate::mesh::MetaRead,
     ) -> Result<crate::mesh::MetaSnapshot> {
         use crate::meta::XlMeta;
-        let mut best: Option<(i64, XlMeta)> = None;
+        let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0u32;
         for drive in &self.cfg.drives {
@@ -525,7 +525,9 @@ impl Store {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == r.key => {
                         covered += 1;
-                        let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                        // 与 store.rs 的 read_meta 选举同口径（rank = (epoch, 链尾 mod_time)）：
+                        // 服务端 RPC 是独立选举点，回拨场景漏改会把低 epoch 旧链当最优返回
+                        let t = m.rank();
                         if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                             best = Some((t, m));
                         }
@@ -545,7 +547,9 @@ impl Store {
         match best {
             Some((t, m)) => Ok(crate::mesh::MetaSnapshot {
                 meta: Some(bytes::Bytes::from(m.encode()?)),
-                mod_time_nanos: t,
+                // 协调者对解码后的 meta 自行算 rank()（选举口径的唯一出处）；
+                // 此字段只带墙钟分量供诊断，不参与判定
+                mod_time_nanos: t.1,
                 slots_ok: covered,
             }),
             None => {

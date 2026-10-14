@@ -1769,6 +1769,7 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
                 inline: Some(meta::InlineData { bytes }),
                 is_delete_marker: None,
                 is_latest: None,
+                epoch: None,
             }],
         }
     };
@@ -2196,6 +2197,7 @@ async fn legacy_parts_form_still_readable() {
         inline: None,
         is_delete_marker: None,
         is_latest: None,
+        epoch: None,
     };
     let m = XlMeta {
         object_key: "legacy".into(),
@@ -3505,10 +3507,17 @@ async fn versioning_chain_full_flow() {
         Err(Error::DeleteMarker(_))
     ));
 
-    // 删 marker → 恢复可见（读回 c）
+    // 删 marker → 恢复可见（读回 c）；同时验证 rank 防倒退（verifier #2）：
+    // 链重写必须把修订序号抬到旧链 max+1——否则掉线盘的旧链会凭平/高秩在选举中翻盘
+    let pre_dm = read_disk_meta(&s, "alpha", "k").await.max_epoch();
     s.delete_object_versioned("alpha", "k", Some(&marker_id), true)
         .await
         .unwrap();
+    let post_dm = read_disk_meta(&s, "alpha", "k").await.max_epoch();
+    assert!(
+        post_dm > pre_dm,
+        "删 marker 的链重写不得让修订序号倒退：{pre_dm} → {post_dm}"
+    );
     let (_, got) = s.get_object("alpha", "k").await.unwrap();
     assert_eq!(&got[..], &c[..]);
 
@@ -3619,4 +3628,106 @@ async fn versioning_chain_full_flow() {
         s.get_object("alpha", "plain").await,
         Err(Error::NoSuchKey(_))
     ));
+}
+
+/// 切片 4：heal 批量补建——掉线期欠账（缺片）与 fsck 差集闭环；修复后复检清零。
+#[tokio::test]
+async fn heal_repairs_missing_shards_and_reports_clean() {
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(600_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let uuid = m.latest().unwrap().part.uuid.clone();
+    // 模拟掉线期欠账：删两片本地文件（12 盘各持一片：shard i 落 dirs[i]）
+    for i in [2usize, 5] {
+        let p = layout::object_dir(dirs[i].path(), "alpha", "k")
+            .unwrap()
+            .join(&uuid)
+            .join(format!("part.1.{i}"));
+        std::fs::remove_file(&p).unwrap();
+    }
+    let pre = s.fsck(false).await.unwrap();
+    assert!(pre.missing_shards >= 2, "{pre:?}");
+    let healed = s.heal().await.unwrap();
+    assert_eq!(healed.repaired_bucket_dirs, 0, "单机无桶目录差集");
+    let post = s.fsck(false).await.unwrap();
+    assert_eq!(post.missing_shards, 0, "heal 后应清账：{post:?}");
+    assert_eq!(post.bad_shards, 0);
+    let (_, back) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&back[..], &data[..]);
+}
+
+/// 切片 4：scrub 深度巡检——健康全绿；坏片定位计数；缺块计数；**全链覆盖**（历史版本也巡）。
+#[tokio::test]
+async fn scrub_detects_bad_and_missing_shards_full_chain() {
+    fn stream_of(b: Bytes) -> ByteStream {
+        Box::pin(futures::stream::once(async move { Ok(b) }))
+    }
+    let (s, dirs) = store_12().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(600_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+
+    let r = s.scrub().await.unwrap();
+    assert_eq!(r.versions_scanned, 1);
+    assert_eq!(r.ok_versions, 1, "{r:?}");
+    assert!(r.failed_versions.is_empty(), "{r:?}");
+
+    // 坏一字节：块级对偶可定位 → 计 bad_shards，版本仍 ok（读路径会自愈）
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let uuid = m.latest().unwrap().part.uuid.clone();
+    let p = layout::object_dir(dirs[3].path(), "alpha", "k")
+        .unwrap()
+        .join(&uuid)
+        .join("part.1.3");
+    let mut sh = std::fs::read(&p).unwrap();
+    sh[10] ^= 0xff;
+    std::fs::write(&p, &sh).unwrap();
+    let r = s.scrub().await.unwrap();
+    assert!(r.bad_shards >= 1, "{r:?}");
+    assert!(
+        r.failed_versions.is_empty(),
+        "单片坏应定位为 bad 而非失败：{r:?}"
+    );
+
+    // 删一片：缺块计数（存活 11 ≥ data，仍可重建 → 不算失败）
+    std::fs::remove_file(&p).unwrap();
+    let r = s.scrub().await.unwrap();
+    assert!(r.missing_shards >= 1, "{r:?}");
+    assert!(r.failed_versions.is_empty(), "{r:?}");
+
+    // 全链覆盖：版本桶两版 → versions_scanned = 2（旧版本坏片同样被巡到）
+    s.delete_object("alpha", "k").await.unwrap();
+    let a = payload(300_000);
+    let b = payload(310_000);
+    for body in [a.clone(), b.clone()] {
+        s.put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(body),
+            None,
+            Default::default(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let m = read_disk_meta(&s, "alpha", "k").await;
+    let v1 = m.versions.first().unwrap();
+    let p1 = layout::object_dir(dirs[1].path(), "alpha", "k")
+        .unwrap()
+        .join(&v1.part.uuid)
+        .join("part.1.1");
+    let mut sh = std::fs::read(&p1).unwrap();
+    sh[0] ^= 0xff;
+    std::fs::write(&p1, &sh).unwrap();
+    let r = s.scrub().await.unwrap();
+    assert_eq!(r.versions_scanned, 2, "{r:?}");
+    assert!(r.bad_shards >= 1, "历史版本的坏片必须被巡到：{r:?}");
 }

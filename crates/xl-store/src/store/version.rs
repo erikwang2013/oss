@@ -100,6 +100,8 @@ impl Store {
                 inline: None,
                 is_delete_marker: Some(true),
                 is_latest: None,
+                // NTP 回拨收口：marker 也是新写版本，epoch 同样单调 +1
+                epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
             };
             let marker_vid = marker.version_id_str();
             let mut m = match old.as_ref() {
@@ -133,6 +135,13 @@ impl Store {
             return Ok(DeleteOutcome::Version { version_id: vid });
         }
         m.refresh_latest_flags();
+        // rank 防倒退（verifier #2）：链重写不得让 max_epoch 下降——否则掉线盘/半翻盘的旧链
+        // 会凭更高或平秩在 read_meta 选举中胜出（已 204 的删除在掉线盘回来时复活）。
+        // 把链尾 revision epoch 抬到旧链 max+1：epoch 语义 = 该 meta 的修订序号，
+        // 追加与删除统一单调（链非空：空链已走 purge_key 分支）。
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
         self.write_meta(bucket, key, &m, Some(&old)).await?;
         // 数据目录 → trash（提交点已过；best-effort——残骸由 clean 按龄回收）
         if !removed.delete_marker() {

@@ -590,6 +590,8 @@ impl Store {
                 inline,
                 is_delete_marker: None,
                 is_latest: None,
+                // NTP 回拨收口：epoch = 旧链 max+1（单调写序号，副本择新优先用它）
+                epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
             };
             // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
             let mut meta = match (versioned, old_meta.as_ref()) {

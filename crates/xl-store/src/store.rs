@@ -590,7 +590,8 @@ impl Store {
         Ok(out)
     }
 
-    /// 读 meta：逐盘读取，**最新（latest().mod_time_nanos 最大）者胜**。
+    /// 读 meta：逐盘读取，**秩最大者胜**（`XlMeta::rank() = (max_epoch, 链尾 mod_time)`——
+    /// epoch 单调优先，墙钟回拨不再让旧副本翻盘；老 meta 无 epoch 按 0 参与排秩）。
     ///
     /// 多盘契约（铁律②读侧）：meta 在每盘各一份，多数情况内容相同；跨盘不一致 = 撕裂写
     /// 的中间态（某盘已翻转、某盘未翻转）——旧的那份必然指向旧版本，取最新即取已提交版本。
@@ -600,14 +601,14 @@ impl Store {
         if self.cfg.cluster.is_some() {
             return self.read_meta_cluster(bucket, key, false).await;
         }
-        let mut best: Option<(i64, XlMeta)> = None;
+        let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         for drive in &self.cfg.drives {
             let path = layout::object_dir(drive, bucket, key)?.join(meta::META_FILE);
             match tokio::fs::read(&path).await {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
-                        let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                        let t = m.rank();
                         if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                             best = Some((t, m));
                         }
@@ -661,7 +662,7 @@ impl Store {
         let q_s = self.cfg.ec.data as usize + 1;
         let self_id = cl.topo.self_node().id.clone();
 
-        let mut best: Option<(i64, XlMeta)> = None;
+        let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0usize;
 
@@ -675,7 +676,7 @@ impl Store {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
                         covered += 1;
-                        let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                        let t = m.rank();
                         if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                             best = Some((t, m));
                         }
@@ -717,7 +718,7 @@ impl Store {
                         if let Some(meta_bytes) = snap.meta {
                             match XlMeta::decode(&meta_bytes) {
                                 Ok(m) if m.object_key == key => {
-                                    let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                                    let t = m.rank();
                                     if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                                         best = Some((t, m));
                                     }

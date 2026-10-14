@@ -14,13 +14,15 @@ use crate::state::AppState;
 pub const CONFIG_PATH: &str = "oss.toml";
 
 pub const USAGE: &str = "\
-用法：oss-server [serve|groups|build|clean <days>|fsck [--repair]]
+用法：oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub]
 
   serve          启动服务（默认，无参数时同此）
   groups         建分组目录（幂等；不建就一定上传失败）
   build          按磁盘现状重建秒传索引
   clean <days>   按 mtime 回收超过 days 天的残骸（暂存盘 _header 与 *.part；数据盘 trash/tmp 孤儿与未引用的版本目录；days 限 1..=36525）
-  fsck [--repair] 全盘巡检（孤儿版本目录、EC 分片缺/坏、tmp/trash 计数）；--repair 执行最小修复（删孤儿 + 读时修分片）；报告落 .oss.sys/fsck/<时间戳>.json
+  fsck [--repair] 全盘巡检（全版本链：孤儿版本目录、EC 分片缺/坏、tmp/trash 计数）；--repair 执行最小修复（删孤儿 + 逐版本读时修）；报告落 .oss.sys/fsck/<时间戳>-fsck.json
+  heal           fsck --repair 全量 + 缺失桶目录补建（集群差集；每节点各自执行）；报告 <时间戳>-heal.json
+  scrub          全量深度巡检（只读）：逐块 12×W 对偶校验可定位坏片、历史版本全覆盖；深度失败 exit 1（可重建的坏/缺块不退出非零——口径见 README）；报告 <时间戳>-scrub.json
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28,8 +30,16 @@ pub enum Command {
     Serve,
     Groups,
     Build,
-    Clean { days: i64 },
-    Fsck { repair: bool },
+    Clean {
+        days: i64,
+    },
+    Fsck {
+        repair: bool,
+    },
+    /// M4 切片 4：fsck --repair 的强化（额外补建集群差集报出的缺失桶目录）
+    Heal,
+    /// M4 切片 4：全量深度巡检（逐块对偶校验，只读不修）
+    Scrub,
 }
 
 /// 解析子命令（入参为去掉 argv[0] 后的参数）。未知子命令或多余参数 → `Err(用法)`（调用方 exit 2）。
@@ -53,6 +63,8 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
         },
         ("fsck", []) => Ok(Command::Fsck { repair: false }),
         ("fsck", [flag]) if flag == "--repair" => Ok(Command::Fsck { repair: true }),
+        ("heal", []) => Ok(Command::Heal),
+        ("scrub", []) => Ok(Command::Scrub),
         _ => Err(USAGE),
     }
 }
@@ -204,31 +216,8 @@ pub async fn run(
                     return Ok(1);
                 }
             };
-            // 报告落盘：`.oss.sys/fsck/<时间戳>.json`（设计 §4.1 预留目录；写失败不掩结论）
-            let dir = state
-                .store
-                .root()
-                .join(xl_store::layout::SYS_DIR)
-                .join("fsck");
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                eprintln!("警告: 无法创建 fsck 报告目录 {}: {e}", dir.display());
-            } else {
-                let ts = SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let path = dir.join(format!("{ts}.json"));
-                match serde_json::to_string_pretty(&report) {
-                    Ok(json) => {
-                        if let Err(e) = std::fs::write(&path, json) {
-                            eprintln!("警告: fsck 报告写入失败 {}: {e}", path.display());
-                        } else {
-                            println!("fsck 报告: {}", path.display());
-                        }
-                    }
-                    Err(e) => eprintln!("警告: fsck 报告序列化失败: {e}"),
-                }
-            }
+            // 报告落盘：`.oss.sys/fsck/<时间戳>-<kind>.json`（设计 §4.1 预留目录；写失败不掩结论）
+            dump_report(&state, "fsck", &report);
             println!(
                 "fsck: {} 盘 / {} 对象 / meta 损坏 {} / 孤儿目录 {} / 分片缺 {} 坏 {} / tmp {} trash {}{}",
                 report.drives,
@@ -243,6 +232,90 @@ pub async fn run(
             );
             Ok(0)
         }
+        Command::Heal => {
+            let report = match state.store.heal().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: heal 失败: {e}");
+                    return Ok(1);
+                }
+            };
+            dump_report(&state, "heal", &report);
+            println!(
+                "heal: 缺键补建 {} / 桶目录补建 {} / 孤儿目录 {}（已删）/ 分片缺 {} 坏 {}{}",
+                report.repaired_meta_keys,
+                report.repaired_bucket_dirs,
+                report.orphan_dirs.len(),
+                report.missing_shards,
+                report.bad_shards,
+                if report.unreachable_nodes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" / 不可达节点 {:?}", report.unreachable_nodes)
+                }
+            );
+            Ok(0)
+        }
+        Command::Scrub => {
+            let report = match state.store.scrub().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: scrub 失败: {e}");
+                    return Ok(1);
+                }
+            };
+            dump_report(&state, "scrub", &report);
+            println!(
+                "scrub: {} 盘 / {} 键 / {} 版本（健康 {}）/ 深度失败 {} / 缺块 {} 坏块 {}{}",
+                report.drives,
+                report.keys_scanned,
+                report.versions_scanned,
+                report.ok_versions,
+                report.failed_versions.len(),
+                report.missing_shards,
+                report.bad_shards,
+                if report.unreachable_nodes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" / 不可达节点 {:?}", report.unreachable_nodes)
+                }
+            );
+            for f in report.failed_versions.iter().take(20) {
+                println!("  失败: {f}");
+            }
+            // 深度失败 = 非零退出（cron/监控可盯）
+            Ok(if report.failed_versions.is_empty() {
+                0
+            } else {
+                1
+            })
+        }
+    }
+}
+
+/// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；
+/// 写失败只警告，不掩命令结论。
+fn dump_report(state: &AppState, kind: &str, report: &impl serde::Serialize) {
+    let dir = state
+        .store
+        .root()
+        .join(xl_store::layout::SYS_DIR)
+        .join("fsck");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("警告: 无法创建报告目录 {}: {e}", dir.display());
+        return;
+    }
+    let ts = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("{ts}-{kind}.json"));
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => match std::fs::write(&path, json) {
+            Ok(()) => println!("{kind} 报告: {}", path.display()),
+            Err(e) => eprintln!("警告: {kind} 报告写入失败 {}: {e}", path.display()),
+        },
+        Err(e) => eprintln!("警告: {kind} 报告序列化失败: {e}"),
     }
 }
 
@@ -296,6 +369,8 @@ mod tests {
             &["clean", "999999999999999999999"][..], // 超出 i64
             &["fsck", "--dry-run"][..], // fsck 只认 --repair
             &["fsck", "--repair", "x"][..],
+            &["heal", "x"][..], // heal/scrub 不收参数
+            &["scrub", "--deep"][..],
             &["/etc/oss.toml"][..], // 旧的「首参=配置路径」不再是合法用法
         ] {
             assert_eq!(parse_args(&args(bad)), Err(USAGE), "应拒绝: {bad:?}");

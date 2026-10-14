@@ -61,6 +61,11 @@ pub struct Version {
     /// 该字段是给 S3 协议响应/未来集群合并用的冗余信息，不参与内部读逻辑）。
     #[serde(default)]
     pub is_latest: Option<bool>,
+    /// M4 切片 4：单调写序号（NTP 回拨收口）。写端取旧链 `max_epoch()+1`；副本择新与集群
+    /// 读按 `(epoch, mod_time)` 排秩——墙钟回拨时 epoch 仍单调，不再有「旧副本凭大钟胜出」。
+    /// 老 meta 无此字段 → None（按 0 参与排秩）。
+    #[serde(default)]
+    pub epoch: Option<u64>,
 }
 
 impl Version {
@@ -234,6 +239,24 @@ impl XlMeta {
             .find(|v| v.version_id_str() == version_id)
     }
 
+    /// 链内最大 epoch（老条目按 0）。写路径用它 +1 生成新版本 epoch。
+    pub fn max_epoch(&self) -> u64 {
+        self.versions
+            .iter()
+            .filter_map(|v| v.epoch)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 元数据择新秩 `(max_epoch, 链尾 mod_time)`：多盘副本选举与集群读共用一个口径。
+    /// epoch 优先（单调写序号），回拨/同钟场景再比墙钟。
+    pub fn rank(&self) -> (u64, i64) {
+        (
+            self.max_epoch(),
+            self.latest().map_or(i64::MIN, |v| v.mod_time_nanos),
+        )
+    }
+
     /// 全链重算 `is_latest`（每次 meta 改动后、落盘前调用；链尾为 true）。
     pub fn refresh_latest_flags(&mut self) {
         let n = self.versions.len();
@@ -278,6 +301,7 @@ mod tests {
                 inline: None,
                 is_delete_marker: None,
                 is_latest: None,
+                epoch: None,
             }],
         }
     }
@@ -418,6 +442,29 @@ mod tests {
         );
     }
 
+    /// epoch 排秩（切片 4）：墙钟回拨时 epoch 单调者胜——老副本不得凭大钟翻盘。
+    #[test]
+    fn rank_prefers_epoch_over_wall_clock() {
+        let with = |epoch: Option<u64>, t: i64| {
+            let mut m = sample();
+            for v in &mut m.versions {
+                v.epoch = epoch;
+                v.mod_time_nanos = t;
+            }
+            m
+        };
+        let new = with(Some(5), 100); // 回拨后写入的副本：小钟、大 epoch
+        let old = with(Some(4), 1_000_000); // 回拨前副本：大钟
+        assert!(new.rank() > old.rank(), "epoch 优先于墙钟");
+        // 老格式（无 epoch → 0）：不得凭大钟压过带 epoch 的副本
+        let legacy = with(None, 9_000_000);
+        assert_eq!(legacy.rank().0, 0);
+        assert!(old.rank() > legacy.rank(), "带 epoch 的副本胜老格式副本");
+        // 同为老格式：墙钟照常区分
+        let legacy2 = with(None, 1);
+        assert!(legacy.rank() > legacy2.rank());
+    }
+
     #[test]
     fn golden_bytes_stable() {
         // 字段名与表示在 named 编码下就是磁盘契约：自读自写的 roundtrip 抓不到
@@ -431,13 +478,13 @@ mod tests {
         // M2a Task 5 起 Version 增加 parts 字段（单段写 nil）、协议补全 Task 3 起增加 checksum 字段
         //（默认 nil）、M2b Task 3 起增加 data_layout/inline 字段（默认 nil）、M4 切片 3 起增加
         // is_delete_marker/is_latest（无版本写 nil——老解码器跳过未知字段 = 前向兼容契约），
-        // 摘要均按「有意识更新」流程重算（本次为第四次）。
+        // 摘要均按「有意识更新」流程重算（本次为第四次；**第五次**：M4 切片 4 增 epoch 字段）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "93f1e1f5326b3198dca9740f9bc74a2c8344d040c886303a445c0277d0c2aa6e"
+            "05b141826a5be4a2b45936467c283fae70368fe4e25d059d9416978baf4173ff"
         );
     }
 }
@@ -466,6 +513,7 @@ mod parts_tests {
             inline: None,
             is_delete_marker: None,
             is_latest: None,
+            epoch: None,
         }
     }
 
