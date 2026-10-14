@@ -285,12 +285,14 @@ impl Store {
         let abort_after: Option<usize> = std::env::var("OSS_TEST_ABORT_AFTER_SHARD")
             .ok()
             .and_then(|v| v.parse().ok());
+        // M4 切片 5：放置哈希（sha256(bucket/key) 前 8B）——v2 开关下全域分散
+        let place_hash = Store::placement_hash(bucket, key);
         let mut sinks: Vec<Sink> = Vec::with_capacity(total);
         let mut touched: Vec<u16> = Vec::new();
         // ok[i] = 该片当前仍完整（任一块失败即 false）
         let mut ok: Vec<bool> = Vec::with_capacity(total);
         for i in 0..total {
-            let slot = self.slot_of_shard(i as u8);
+            let slot = self.slot_of_shard(place_hash, i as u8);
             let alive = match self.slot_target(slot) {
                 Some(drives::ShardTarget::Local { drive, .. }) => {
                     // 存活探测（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
@@ -379,6 +381,8 @@ impl Store {
                                         offset: t * ec::CHUNK_W as u64,
                                         chunk_crc32c: ec::crc32c_of(chunk),
                                         is_final,
+                                        // M4 切片 5：携带槽位（服务端只校验归属，不重算放置）
+                                        slot: self.slot_of_shard(place_hash, i as u8) as u32,
                                     },
                                 )
                                 .await
@@ -388,7 +392,7 @@ impl Store {
                     }
                 };
                 if let Err(e) = res {
-                    tracing::warn!(slot = self.slot_of_shard(i as u8), shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
+                    tracing::warn!(slot = self.slot_of_shard(place_hash, i as u8), shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
                     ok[i] = false;
                 }
                 if abort_after == Some(i) && is_final {
@@ -420,7 +424,7 @@ impl Store {
         }
         let shard_refs = (0..total)
             .map(|i| meta::ShardRef {
-                drive: self.slot_of_shard(i as u8) as u8,
+                drive: self.slot_of_shard(place_hash, i as u8) as u8,
                 part: 1,
                 shard: i as u8,
                 size: ss,

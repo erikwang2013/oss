@@ -24,7 +24,9 @@ mod mesh_api;
 mod mpu;
 mod put;
 mod read;
+mod rebalance;
 mod version;
+pub use rebalance::RebalanceReport;
 pub use version::{DeleteOutcome, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
@@ -163,6 +165,11 @@ impl Store {
         if n == 0 {
             return Err(Error::Encode("drives 为空".into()));
         }
+        if n > 255 {
+            return Err(Error::Encode(format!(
+                "盘数 {n} 超过 255（ShardRef.drive 为 u8）"
+            )));
+        }
         // EC 数字域校验（评审 R4：配置是信任边界；u8 相加在 debug 会溢出 panic）
         if cfg.ec.data == 0 || cfg.ec.parity == 0 {
             return Err(Error::Encode("EC data/parity 必须 ≥ 1".into()));
@@ -261,23 +268,28 @@ impl Store {
             if !matches!(tokio::fs::try_exists(&id_path).await, Ok(true)) {
                 tokio::fs::write(&id_path, &deployment_id).await?;
             }
-            // M3 集群：拓扑指纹（data_dirs 顺序 = 拓扑的一部分；错位 = 分片静默错位 → 大声失败）
+            // M3/M4 拓扑指纹（data_dirs 顺序 = 拓扑的一部分；错位 = 分片静默错位 → 大声失败）。
+            // 切片 5：记录格式 v2 = `v2 node=X slot=Y`（**去掉全局 slot_count**——追加式扩容
+            // 后旧盘 (node,slot) 不变）；读时兼容 v1（忽略 `slots=` 段，按 (node,slot) 全等）。
+            // 中间节点加盘会位移其后节点 bases → 记录与现算不符 → 在此拒启（设计 G）。
             if let Some(cl) = cfg.cluster.as_deref() {
                 let topo_path = layout::sys_dir(drive, "topo");
-                let want = format!(
-                    "v1 slots={} node={} slot={}",
-                    cl.topo.slot_count(),
-                    cl.topo.self_node().id,
-                    cl.topo.local_slot_base() + di as u16
-                );
+                let cur_node = cl.topo.self_node().id.clone();
+                let cur_slot = cl.topo.local_slot_base() + di as u16;
+                let want = topo_record(&cur_node, cur_slot);
                 match tokio::fs::read_to_string(&topo_path).await {
-                    Ok(have) if have.trim() == want => {}
                     Ok(have) => {
-                        return Err(Error::Encode(format!(
-                            "拓扑指纹不符（data_dirs 顺序变化？）：盘 {} 记录 «{}»，当前 «{want}»",
-                            drive.display(),
-                            have.trim()
-                        )));
+                        let ok = parse_topo_record(have.trim())
+                            .is_some_and(|(n, s)| n == cur_node && s == cur_slot);
+                        if !ok {
+                            return Err(Error::Encode(format!(
+                                "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{}»，当前 node={} slot={}",
+                                drive.display(),
+                                have.trim(),
+                                cur_node,
+                                cur_slot
+                            )));
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         tokio::fs::write(&topo_path, &want).await?;
@@ -1202,6 +1214,29 @@ impl Store {
         )
         .await
     }
+}
+
+/// 拓扑记录的唯一构造器（M4 切片 5）：写盘（`Store::open`）与控制台展示
+/// （`/api/v1/cluster/status` 的 topo_fingerprint）共用——两处再漂移即回归（verifier F9）。
+/// 读侧 `parse_topo_record` 兼容 v1 旧记录（`v1 slots=.. node=X slot=Y`，忽略 slots=）。
+pub fn topo_record(node: &str, slot: u16) -> String {
+    format!("v2 node={node} slot={slot}")
+}
+
+/// 拓扑记录解析（v1/v2 兼容）：返回 `(node, slot)`。
+/// v1 形如 `v1 slots=12 node=n1 slot=0`（slots 段被忽略）；v2 形如 `v2 node=n1 slot=0`。
+fn parse_topo_record(s: &str) -> Option<(String, u16)> {
+    let mut node = None;
+    let mut slot = None;
+    for part in s.split_whitespace() {
+        if let Some(v) = part.strip_prefix("node=") {
+            node = Some(v.to_string());
+        }
+        if let Some(v) = part.strip_prefix("slot=") {
+            slot = v.parse::<u16>().ok();
+        }
+    }
+    node.zip(slot)
 }
 
 fn now_nanos() -> i64 {

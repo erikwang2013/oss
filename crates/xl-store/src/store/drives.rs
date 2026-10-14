@@ -88,6 +88,29 @@ impl ClusterTopology {
         if nodes.is_empty() {
             return Err(Error::Encode("集群节点列表为空".into()));
         }
+        // M4 切片 5 校验：槽位总数 ≤ 255（`ShardRef.drive: u8` 的硬约束——超了会静默截断）；
+        // node id 禁空白（拓扑记录 `node=X` 的解析边界）；drive_count ≤ parity（放置 v2 下
+        // 保证「单节点丢失 ≤ parity 片」——>4 盘/节点时单节点可承载 5+ 片，丢节点即不可重建）
+        let total_slots: u32 = nodes.iter().map(|n| n.drive_count as u32).sum();
+        if total_slots > 255 {
+            return Err(Error::Encode(format!(
+                "槽位总数 {total_slots} 超过 255（ShardRef.drive 为 u8）"
+            )));
+        }
+        for n in &nodes {
+            if n.id.is_empty() || n.id.chars().any(char::is_whitespace) {
+                return Err(Error::Encode(format!(
+                    "节点 id 非法（含空白/空串）: {:?}",
+                    n.id
+                )));
+            }
+            if n.drive_count > ec.parity as u16 {
+                return Err(Error::Encode(format!(
+                    "节点 {} 盘数 {} 超过 parity {}（单节点可承载分片数须 ≤ parity）",
+                    n.id, n.drive_count, ec.parity
+                )));
+            }
+        }
         if self_idx >= nodes.len() {
             return Err(Error::Encode(format!(
                 "self_idx {self_idx} 越界（共 {} 节点）",
@@ -158,8 +181,15 @@ impl ClusterTopology {
     }
 
     /// 分片 → 全局槽位（`shard % slot_count`；单 set 内的确定性哈希）。
-    pub fn slot_of(&self, shard: u8) -> u16 {
-        (shard as u16) % self.slot_count
+    /// 分片放置（M4 切片 5）：`v2` 时 `(hash + shard) % slot_count` 全域分散（i 两两互异）；
+    /// 否则 v1 恒等（`shard % slot_count`——≤12 槽逐字节零变化）。hash 见
+    /// [`Store::placement_hash`]（sha256 前 8 字节：crc32c 线性，恶意 key 可定向聚集）。
+    pub fn place(&self, hash: u64, shard: u8, v2: bool) -> u16 {
+        if v2 {
+            ((hash.wrapping_add(shard as u64)) % self.slot_count as u64) as u16
+        } else {
+            (shard as u16) % self.slot_count
+        }
     }
 }
 
@@ -167,6 +197,9 @@ impl ClusterTopology {
 pub struct ClusterConfig {
     pub topo: ClusterTopology,
     pub transport: Arc<dyn MeshTransport>,
+    /// M4 切片 5 放置开关（显式；混版集群里未开的旧节点会按恒等公式服务 → fail-closed
+    /// 可诊断——滚动升级需「全节点升级（仍 v1）→ 全节点开启 → rebalance」）。
+    pub placement_v2: bool,
 }
 
 impl std::fmt::Debug for ClusterConfig {
@@ -185,12 +218,52 @@ pub enum ShardTarget<'a> {
 }
 
 impl Store {
-    /// 分片下标（0..data+parity）→ 槽位。写路径在生成 ShardRef 前用它；
-    /// 单机 = 本机盘下标（drive_index，与 M2b 逐字节一致），集群 = 全局槽位。
-    pub(in crate::store) fn slot_of_shard(&self, shard: u8) -> u16 {
+    /// 对象放置哈希（M4 切片 5）：sha256(bucket ‖ '/' ‖ key) 前 8 字节。
+    /// 不用 crc32c——它是线性函数，恶意 key 能定向把对象聚集到指定节点/盘。
+    pub(in crate::store) fn placement_hash(bucket: &str, key: &str) -> u64 {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(bucket.as_bytes());
+        h.update(b"/");
+        h.update(key.as_bytes());
+        let d = h.finalize();
+        // 大端取值是**跨节点/跨版本的放置约定**（rebalance 目标槽由任一节点算，必须同式）——勿改
+        u64::from_be_bytes(d[..8].try_into().expect("sha256 ≥ 8 字节"))
+    }
+
+    /// 放置 v2 是否启用：集群 = 显式开关（混版 fail-closed）；单机多盘 = 槽位超分片数即
+    /// 自动（全本地，无混版问题：13 盘起步即分散）。
+    pub(in crate::store) fn placement_v2(&self) -> bool {
         match self.cfg.cluster.as_deref() {
-            None => drive_index(shard, self.cfg.drives.len()) as u16,
-            Some(cl) => cl.topo.slot_of(shard),
+            Some(cl) => cl.placement_v2,
+            None => {
+                self.cfg.drives.len() > (self.cfg.ec.data as usize + self.cfg.ec.parity as usize)
+            }
+        }
+    }
+
+    /// 槽位 → 本机盘下标（None = 不在本机）。单机：槽位即盘下标（v1 恒等/放置语义一致）。
+    pub(in crate::store) fn local_drive_idx_of_slot(&self, slot: u16) -> Option<usize> {
+        match self.cfg.cluster.as_deref() {
+            None => (slot as usize)
+                .lt(&self.cfg.drives.len())
+                .then_some(slot as usize),
+            Some(cl) => cl.topo.local_drive_of_slot(slot),
+        }
+    }
+
+    /// 分片放置（v1/v2 分派，见 [`ClusterTopology::place`] 与 [`Self::placement_hash`]）。
+    pub(in crate::store) fn slot_of_shard(&self, hash: u64, shard: u8) -> u16 {
+        match self.cfg.cluster.as_deref() {
+            None => {
+                let n = self.cfg.drives.len();
+                if self.placement_v2() {
+                    ((hash.wrapping_add(shard as u64)) % n as u64) as u16
+                } else {
+                    drive_index(shard, n) as u16
+                }
+            }
+            Some(cl) => cl.topo.place(hash, shard, cl.placement_v2),
         }
     }
 
@@ -295,10 +368,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.slot_count(), 12);
-        // 4×3 = 12 槽：shard % 12 恰 1 片/槽（分布均匀、无空转节点）
+        // 4×3 = 12 槽：v1 恒等（shard % 12 恰 1 片/槽）；v2 对任意 hash 也两两互异
         for i in 0..12u8 {
-            assert_eq!(t.slot_of(i), i as u16);
+            assert_eq!(t.place(0, i, false), i as u16);
         }
+        // v2 互异性（切片 5 放置不变量）：12 分片落 12 个不同槽位
+        let mut slots: Vec<u16> = (0..12u8)
+            .map(|i| t.place(0x1234_5678_9abc_def0, i, true))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 12, "v2 放置必须两两互异");
         // 槽位 → 节点归属（此配置下 slot 单调递增铺满）
         assert_eq!(t.node_of_slot(0), 0);
         assert_eq!(t.node_of_slot(2), 0);
@@ -318,10 +398,14 @@ mod tests {
         let t = ClusterTopology::new(0, vec![n("a", 4), n("b", 4), n("c", 4), n("d", 4)], &ec84())
             .unwrap();
         assert_eq!(t.slot_count(), 16);
-        assert_eq!(t.slot_of(11), 11);
+        assert_eq!(t.place(0, 11, false), 11);
         assert!(
-            (0..12u8).all(|i| t.slot_of(i) < 12),
-            "12 个分片永远落不进槽 12..15"
+            (0..12u8).all(|i| t.place(0, i, false) < 12),
+            "v1：12 个分片永远落不进槽 12..15"
+        );
+        assert!(
+            (0..12u8).any(|i| t.place(0xabc, i, true) >= 12),
+            "v2：分片必须能落进槽 12..15（扩容的意义）"
         );
         assert_eq!(
             t.local_drive_of_slot(12),

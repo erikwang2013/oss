@@ -2552,6 +2552,9 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         }
         self.peer(n).await?.mesh_delete_version(d).await
     }
+    async fn delete_shard(&self, n: &str, d: crate::mesh::ShardDelete) -> crate::error::Result<()> {
+        self.peer(n).await?.mesh_delete_shard(d).await
+    }
     async fn recycle_version(
         &self,
         n: &str,
@@ -2645,6 +2648,40 @@ pub struct Cluster {
 
 impl Cluster {
     pub async fn new(nodes: usize, drives_per_node: usize) -> Cluster {
+        Self::new_with_placement(nodes, drives_per_node, false).await
+    }
+
+    pub async fn new_with_placement(
+        nodes: usize,
+        drives_per_node: usize,
+        placement_v2: bool,
+    ) -> Cluster {
+        let mut tmpdirs = Vec::new();
+        let mut node_dirs = Vec::new();
+        for _ in 0..nodes {
+            let mut dirs = Vec::new();
+            for _ in 0..drives_per_node {
+                let td = tempfile::TempDir::new().unwrap();
+                dirs.push(td.path().to_path_buf());
+                tmpdirs.push(td);
+            }
+            node_dirs.push(dirs);
+        }
+        Self::open_over(node_dirs, tmpdirs, placement_v2).await
+    }
+
+    /// 在同一组盘上重开（扩容/换放置旗测试）：`dirs` 的保活由调用方（原 Cluster）负责。
+    pub async fn reopen_over(dirs: Vec<Vec<std::path::PathBuf>>, placement_v2: bool) -> Cluster {
+        Self::open_over(dirs, Vec::new(), placement_v2).await
+    }
+
+    async fn open_over(
+        node_dirs: Vec<Vec<std::path::PathBuf>>,
+        tmpdirs: Vec<tempfile::TempDir>,
+        placement_v2: bool,
+    ) -> Cluster {
+        let nodes = node_dirs.len();
+        let drives_per_node = node_dirs[0].len();
         let slot_count = nodes * drives_per_node;
         // 不变量：parity 恒 4（12 槽 → 8+4，与生产默认一致）；EC 由槽位数推导，勿硬编码
         let data = (slot_count - 4) as u8;
@@ -2667,15 +2704,9 @@ impl Cluster {
 
         let mesh = InProcessMesh::new();
         let mut stores = Vec::new();
-        let mut tmpdirs = Vec::new();
-        let mut node_dirs = Vec::new();
         for (i, _id) in ids.iter().enumerate() {
-            let mut dirs = Vec::new();
-            for _ in 0..drives_per_node {
-                let td = tempfile::TempDir::new().unwrap();
-                dirs.push(td.path().to_path_buf());
-                tmpdirs.push(td);
-            }
+            let dirs = node_dirs[i].clone();
+            std::fs::create_dir_all(&dirs[0]).unwrap();
             let topo = drives::ClusterTopology::new(i, specs.clone(), &ec).unwrap();
             let mut cfg = StoreConfig::new(&dirs[0]);
             cfg.drives = dirs.clone();
@@ -2688,9 +2719,9 @@ impl Cluster {
             cfg.cluster = Some(Arc::new(drives::ClusterConfig {
                 topo,
                 transport: mesh.clone(),
+                placement_v2,
             }));
             stores.push(Arc::new(Store::open(cfg).await.unwrap()));
-            node_dirs.push(dirs);
         }
         for (id, s) in ids.iter().zip(&stores) {
             mesh.register(id, s);
@@ -3287,6 +3318,7 @@ async fn cluster_topology_fingerprint_detects_reorder() {
         cfg.cluster = Some(Arc::new(drives::ClusterConfig {
             topo,
             transport: mesh,
+            placement_v2: false,
         }));
         cfg
     };
@@ -3730,4 +3762,234 @@ async fn scrub_detects_bad_and_missing_shards_full_chain() {
     let r = s.scrub().await.unwrap();
     assert_eq!(r.versions_scanned, 2, "{r:?}");
     assert!(r.bad_shards >= 1, "历史版本的坏片必须被巡到：{r:?}");
+}
+
+/// 切片 5：追加式扩容（12→13 盘）+ rebalance——展开放置、搬迁闭环、幂等、fsck/stray 清。
+#[tokio::test]
+async fn rebalance_expands_from_12_to_13_disks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dirs: Vec<std::path::PathBuf> =
+        (0..12).map(|i| dir.path().join(format!("d{i}"))).collect();
+    for d in &dirs {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let data = payload(600_000);
+
+    // 1) 12 盘（v1 恒等放置）落两个对象
+    let mut cfg = StoreConfig::new(&dirs[0]);
+    cfg.drives = dirs.clone();
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k1", data.clone(), None)
+        .await
+        .unwrap();
+    s.put_object("alpha", "inline-small", payload(1000), None)
+        .await
+        .unwrap();
+    let m = read_disk_meta(&s, "alpha", "k1").await;
+    let l = m.latest().unwrap().data_layout.clone().unwrap();
+    assert!(
+        l.shards
+            .iter()
+            .enumerate()
+            .all(|(i, sh)| sh.drive as usize == i),
+        "12 盘 v1 恒等：片 i 落盘 i"
+    );
+    drop(s);
+
+    // 2) 追加第 13 盘重开 → 放置 v2 自动启用（13 > 12）；旧对象自描述可读。
+    //    新盘须先「入册」（真实运维步骤：在**已挂载**的新盘上建 .oss.sys 并盖部署标识——
+    //    防「遮挂载点 impostor」的既有策略不允许 open 自动初始化非首启盘，README 记档）
+    dirs.push(dir.path().join("d12"));
+    let new_sys = dirs[12].join(layout::SYS_DIR);
+    std::fs::create_dir_all(&new_sys).unwrap();
+    std::fs::copy(
+        dirs[0].join(layout::SYS_DIR).join("drive-id"),
+        new_sys.join("drive-id"),
+    )
+    .unwrap();
+    let mut cfg = StoreConfig::new(&dirs[0]);
+    cfg.drives = dirs.clone();
+    let s = Store::open(cfg).await.unwrap();
+    let (_, got) = s.get_object("alpha", "k1").await.unwrap();
+    assert_eq!(&got[..], &data[..], "扩容后旧对象仍可读");
+
+    // dry-run 只报告
+    let rep = s.rebalance(true).await.unwrap();
+    assert!(rep.placement_v2);
+    assert_eq!(
+        rep.objects_moved, 1,
+        "EC 对象需搬；inline 不在范围：{rep:?}"
+    );
+    assert!(rep.shards_moved >= 1);
+
+    // apply
+    let rep = s.rebalance(false).await.unwrap();
+    assert_eq!(rep.objects_moved, 1, "{rep:?}");
+    assert!(rep.skipped.is_empty(), "{rep:?}");
+
+    // 分布达标：片 i → (hash + i) % 13
+    let hash = Store::placement_hash("alpha", "k1");
+    let m = read_disk_meta(&s, "alpha", "k1").await;
+    let l = m.latest().unwrap().data_layout.as_ref().unwrap();
+    for (i, sh) in l.shards.iter().enumerate() {
+        assert_eq!(
+            sh.drive as u16,
+            ((hash.wrapping_add(i as u64)) % 13) as u16,
+            "片 {i} 目标槽"
+        );
+    }
+    // 读全绿 + fsck 零（老片已清、无 stray）
+    let (_, got) = s.get_object("alpha", "k1").await.unwrap();
+    assert_eq!(&got[..], &data[..], "搬迁后读一致");
+    let r = s.fsck(false).await.unwrap();
+    assert_eq!(r.missing_shards, 0, "{r:?}");
+    assert_eq!(r.stray_files.len(), 0, "老片应已清理：{r:?}");
+
+    // 幂等：二次 apply 0 移动
+    let rep = s.rebalance(false).await.unwrap();
+    assert_eq!(rep.objects_moved, 0, "{rep:?}");
+
+    // stray 检测与修复：手工放一个多余分片文件
+    let m = read_disk_meta(&s, "alpha", "k1").await;
+    let uuid = m.latest().unwrap().part.uuid.clone();
+    let stray = layout::object_dir(&dirs[0], "alpha", "k1")
+        .unwrap()
+        .join(&uuid)
+        .join("part.1.99");
+    std::fs::write(&stray, b"x").unwrap();
+    let r = s.fsck(false).await.unwrap();
+    assert!(
+        r.stray_files.iter().any(|f| f.contains("part.1.99")),
+        "stray 应被检出：{r:?}"
+    );
+    let r = s.fsck(true).await.unwrap();
+    assert!(!r.stray_files.is_empty());
+    assert!(
+        !tokio::fs::try_exists(&stray).await.unwrap(),
+        "--repair 应删除 stray"
+    );
+}
+
+/// 切片 5：集群跨节点 rebalance——v1 写入（片 i → 节点 i/3）→ 同一组盘重开 v2 →
+/// 搬迁跨节点搬片 → 每节点读一致 + fsck 零 + 幂等。
+#[tokio::test]
+async fn rebalance_moves_shards_across_nodes_in_cluster() {
+    let c1 = Cluster::new(4, 3).await;
+    c1.stores[0].create_bucket("alpha").await.unwrap();
+    let data = payload(600_000);
+    c1.stores[0]
+        .put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+    // v1 恒等：片 i → 槽 i（节点 i/3）
+    let m = read_disk_meta(&c1.stores[0], "alpha", "k").await;
+    let l = m.latest().unwrap().data_layout.clone().unwrap();
+    assert!(
+        l.shards
+            .iter()
+            .enumerate()
+            .all(|(i, sh)| sh.drive as usize == i),
+        "v1 恒等落位"
+    );
+
+    // 同一组盘重开 v2（c1 保活 TempDir——勿 drop，目录在其 _tmpdirs 里）
+    let c2 = Cluster::reopen_over(c1.dirs.clone(), true).await;
+
+    let rep = c2.stores[0].rebalance(true).await.unwrap();
+    assert!(rep.placement_v2);
+    assert_eq!(rep.objects_moved, 1, "{rep:?}");
+    let rep = c2.stores[0].rebalance(false).await.unwrap();
+    assert_eq!(rep.objects_moved, 1, "{rep:?}");
+    assert!(rep.skipped.is_empty(), "{rep:?}");
+
+    // 目标槽逐片断言（(hash+i)%12 会跨节点）
+    let hash = Store::placement_hash("alpha", "k");
+    let m = read_disk_meta(&c2.stores[0], "alpha", "k").await;
+    let l = m.latest().unwrap().data_layout.as_ref().unwrap();
+    for (i, sh) in l.shards.iter().enumerate() {
+        assert_eq!(
+            sh.drive as u16,
+            ((hash.wrapping_add(i as u64)) % 12) as u16,
+            "片 {i} 目标槽"
+        );
+    }
+    // 每节点读一致 + fsck 零
+    for s in &c2.stores {
+        let (_, got) = s.get_object("alpha", "k").await.unwrap();
+        assert_eq!(&got[..], &data[..], "搬迁后跨节点读一致");
+        let r = s.fsck(false).await.unwrap();
+        assert_eq!(r.missing_shards, 0, "{r:?}");
+        assert_eq!(r.stray_files.len(), 0, "老片应已清：{r:?}");
+    }
+    // 幂等：二次 apply 0 移动
+    let rep = c2.stores[0].rebalance(false).await.unwrap();
+    assert_eq!(rep.objects_moved, 0, "{rep:?}");
+}
+
+/// 切片 5（verifier F5-a）：拓扑记录 v1→v2 兼容解析与畸形 fail-closed。
+#[test]
+fn topo_record_parses_v1_and_v2_and_rejects_garbage() {
+    assert_eq!(
+        super::parse_topo_record("v2 node=n1 slot=0"),
+        Some(("n1".to_string(), 0))
+    );
+    // v1 旧记录：slots= 段被忽略，按 (node,slot) 取出
+    assert_eq!(
+        super::parse_topo_record("v1 slots=12 node=n2 slot=5"),
+        Some(("n2".to_string(), 5))
+    );
+    assert_eq!(super::parse_topo_record("garbage"), None);
+    assert_eq!(super::parse_topo_record("v2 node=n1"), None, "缺 slot 段");
+    assert_eq!(
+        super::parse_topo_record("v2 node=n1 slot=abc"),
+        None,
+        "slot 非数字"
+    );
+    // 构造器与解析器互逆（写盘与 console 共用的唯一出处）
+    assert_eq!(
+        super::parse_topo_record(&super::topo_record("n3", 7)),
+        Some(("n3".to_string(), 7))
+    );
+}
+
+/// 切片 5（verifier F5-b）：追加式扩容不改变既有节点的槽位基址（H 面的不变量）。
+#[test]
+fn appending_nodes_keeps_existing_bases() {
+    let ec = ec::EcConfig {
+        data: 8,
+        parity: 4,
+        ..Default::default()
+    };
+    let mk = |n: &str| drives::NodeSpec {
+        id: n.into(),
+        addr: "127.0.0.1:1".into(),
+        drive_count: 3,
+    };
+    let n4 = vec![mk("n1"), mk("n2"), mk("n3"), mk("n4")];
+    let mut n5 = n4.clone();
+    n5.push(mk("n5"));
+    for i in 0..4 {
+        let t4 = drives::ClusterTopology::new(i, n4.clone(), &ec).unwrap();
+        let t5 = drives::ClusterTopology::new(i, n5.clone(), &ec).unwrap();
+        assert_eq!(
+            t4.local_slot_base(),
+            t5.local_slot_base(),
+            "节点 {} 的前缀基址在尾部追加下不变",
+            i
+        );
+        let r4 = super::topo_record(&t4.self_node().id, t4.local_slot_base());
+        let r5 = super::topo_record(&t5.self_node().id, t5.local_slot_base());
+        assert_eq!(
+            r4, r5,
+            "既有盘的 (node,slot) 记录在追加下不变（指纹兼容的根）"
+        );
+    }
+    assert_eq!(
+        drives::ClusterTopology::new(4, n5.clone(), &ec)
+            .unwrap()
+            .local_slot_base(),
+        12,
+        "新节点接在末尾"
+    );
 }

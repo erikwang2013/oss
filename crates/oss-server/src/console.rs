@@ -234,13 +234,12 @@ async fn cluster_status(
                 "mode": "cluster",
                 "node_id": me.id,
                 "slot_count": c.topo.slot_count(),
-                // 本节点首盘（slot=base）在 `.oss.sys/topo` 里的完整记录串——可直接与盘上文件等值比对
-                // （盘上逐盘记录 = 本串，slot 段逐盘 +1；Store::open 按全等校验）
-                "topo_fingerprint": format!(
-                    "v1 slots={} node={} slot={}",
-                    c.topo.slot_count(),
-                    me.id,
-                    c.topo.local_slot_base()
+                // 本节点首盘（slot=base）在 `.oss.sys/topo` 的完整记录串——与写盘共用同一
+                // 构造器（xl_store::store::topo_record），可直接与盘上文件等值比对；
+                // 切片 5 前的旧盘保留 v1 记录（读侧兼容，字段一致即接受）
+                "topo_fingerprint": xl_store::store::topo_record(
+                    &me.id,
+                    c.topo.local_slot_base(),
                 ),
                 "nodes": nodes,
                 "quorum_unmet": quorum_unmet,

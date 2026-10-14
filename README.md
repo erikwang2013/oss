@@ -192,7 +192,7 @@ cd web && npm install && npm run dev
 
 ## 运维命令
 
-`oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub]`（无参数 = `serve`）。运维命令读当前目录的
+`oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub|rebalance [--dry-run|--apply]]`（无参数 = `serve`）。运维命令读当前目录的
 `oss.toml`，并走与服务端相同的启动自举（建目录/连库/开存储；管理员与桶的引导是幂等的）：
 
 ```bash
@@ -201,7 +201,8 @@ oss-server build         # 按磁盘现状重建秒传索引（先清旧索引�
 oss-server clean <days>  # 按 mtime 回收 days 天前的残骸：
                          #   暂存盘 `_header/` 与 `*.part`；数据盘 `.oss.sys/{tmp,trash}` 孤儿
                          #   与各对象目录下未被引用的版本目录（含未完成的上传暂存区）
-oss-server fsck          # 全盘巡检：孤儿版本目录 / EC 分片缺坏（CRC32C）/ tmp-trash 计数；
+oss-server fsck          # 全盘巡检：孤儿版本目录 / EC 分片缺坏（CRC32C）/ tmp-trash 计数 /
+                         #   stray 分片文件（rebalance/崩溃残留；--repair 删除）；
 oss-server fsck --repair #   同上 + 最小修复（删孤儿 + 读时修分片）。报告落
                          #   `.oss.sys/fsck/<时间戳>-<kind>.json`
 oss-server heal          # fsck --repair 全量 + 缺失桶目录补建（集群差集）+ 逐版本修复
@@ -213,6 +214,9 @@ oss-server scrub         # 全量深度巡检（只读）：每个 EC 版本逐�
                          #   （可定位坏片；常量内存不组装整份对象）；历史版本全覆盖；
                          #   健康对象计 ok_versions；可重建的坏/缺块不退出非零（数据仍在
                          #   EC 冗余内、读路径自愈），仅深度失败（存活不足/对偶不过）exit 1（cron 可盯）
+oss-server rebalance     # 扩容搬迁（默认 dry-run）：存量对象迁到展开放置（placement=v2；
+                         #   未开则空跑）；逐对象 copy→锁内翻转→清老片，幂等可重跑；
+                         #   报告 `<时间戳>-rebalance[-dry].json`（操作序见「扩容」节）
 ```
 
 分工：`fsck` = 整片 CRC32C 快检（轻）；`scrub` = 块级深度验证（慢、可定位坏片）。
@@ -292,6 +296,34 @@ scrape_configs:
   该片失联、可能 quorum 不过导致写失败），跨界读按缺失降级（EC 兜底但白读）。**不要滚动升级**：先停后换或按整栈重建。
 - **EC 区间读语义**（M4 切片 2）：Range 读不再做整片 CRC32C / 对象级 SHA256（改逐块 12×W 对偶校验，坏片可定位自愈）；
   **范围外的损坏不再触发读时修**（整读仍会），批量修复归 `heal`（M4 切片 4）。
+
+## 扩容（rebalance，M4）
+
+追加式扩容：放置开关（`placement = "v2"`）+ 尾部追加拓扑 + 逐对象搬迁。**操作序**（顺序不可乱）：
+
+1. **全节点升级二进制**（placement 仍默认 v1，行为不变）。
+2. 各节点 `oss.toml` 加 `placement = "v2"`——**全节点同步**。混版窗口内**部分写入会降级/失败**（可诊断）：
+   旧节点发出/转发的分片请求没有 slot（proto 未知字段 → 0），新服务端按「slot 0 属主」校验而拒（除 slot 0
+   属主那台）；反向（新→旧）旧服务端忽略未知字段按 v1 重算 = v1 下结果正确。**升级窗口只做升级、不承载业务写；
+   全节点升级完再开 `placement="v2"`。**
+3. 追加拓扑（加盘/加节点，见下）。
+4. 逐节点 `oss-server rebalance --dry-run` 看计划。
+5. `oss-server rebalance --apply`（幂等，可重跑续搬）。
+
+**加盘**：只能往**最后一个节点**追加 `data_dirs`（中间节点加盘会位移其后节点槽位，启动时指纹拒启）。
+新盘必须先「入册」——在已挂载的新盘上
+`mkdir -p <盘>/.oss.sys && cp <任一旧盘>/.oss.sys/drive-id <盘>/.oss.sys/`
+（防遮挂载点 impostor 的既有策略不允许自动初始化非首启盘）。
+
+**加节点**：`cluster.nodes` 尾部追加 + 该节点自备配置启动。**加节点后也要全节点 placement=v2 + rebalance**
+（v1 恒等放置永不使用新槽）。
+
+**单机多盘**：超过 12 盘时自动 v2（无需配置）；旧对象用 `rebalance` 搬迁。
+
+**边界**：不支持缩容（删节点/盘）；**配置回退也不可行**（旧槽位引用 fail-closed 500），只能前滚；
+同刻只跑一个 rebalance；`rebalance` 与 `fsck`/`heal` **不得并跑**——fsck 的 stray 扫描会把搬迁中
+「已 copy 未 flip」的半成品新片当作残骸删除（对象级自愈可重跑，但白搬一轮）；搬迁残窗与老片清理
+兜底归 `fsck`（stray 分片扫描，跑在 rebalance 停后）。
 
 ## 版本控制（M4）
 

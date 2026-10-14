@@ -282,6 +282,7 @@ impl MeshTransport for TonicMesh {
                 offset: w.offset,
                 chunk_crc32c: w.chunk_crc32c,
                 is_final: w.is_final,
+                slot: w.slot,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -300,6 +301,7 @@ impl MeshTransport for TonicMesh {
                 shard: r.shard,
                 offset: r.offset,
                 length: r.length,
+                slot: r.slot,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -311,6 +313,23 @@ impl MeshTransport for TonicMesh {
             .client(node)?
             .clone()
             .delete_version(dir_ref_to_proto(d))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
+    }
+    async fn delete_shard(&self, node: &str, d: mesh::ShardDelete) -> Result<()> {
+        let resp = self
+            .client(node)?
+            .clone()
+            .delete_shard(xl_proto::ShardDelete {
+                bucket: d.bucket,
+                key: d.key,
+                uuid: d.uuid,
+                part: d.part,
+                shard: d.shard,
+                slot: d.slot,
+            })
             .await
             .map_err(|e| rpc_err(node, e))?
             .into_inner();
@@ -584,6 +603,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 offset: w.offset,
                 chunk_crc32c: w.chunk_crc32c,
                 is_final: w.is_final,
+                slot: w.slot,
             })
             .await
             .map_err(internal)?;
@@ -604,6 +624,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 shard: s.shard,
                 offset: s.offset,
                 length: s.length,
+                slot: s.slot,
             })
             .await
             .map_err(internal)?;
@@ -615,6 +636,24 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             },
             None => xl_proto::ShardResp::default(),
         }))
+    }
+    async fn delete_shard(
+        &self,
+        r: Request<xl_proto::ShardDelete>,
+    ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
+        let d = r.into_inner();
+        self.store
+            .mesh_delete_shard(mesh::ShardDelete {
+                bucket: d.bucket,
+                key: d.key,
+                uuid: d.uuid,
+                part: d.part,
+                shard: d.shard,
+                slot: d.slot,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
     }
     async fn delete_version(
         &self,
@@ -924,6 +963,7 @@ mod tests {
         cfg.ec = ec;
         cfg.fsync = false; // 测试提速
         cfg.cluster = Some(Arc::new(ClusterConfig {
+            placement_v2: false,
             topo,
             transport: mesh.clone(),
         }));
@@ -997,6 +1037,7 @@ mod tests {
             offset: 0,
             chunk_crc32c: 0,
             is_final: false,
+            slot: 0,
         };
         mesh.write_shard("n1", sw(3)).await.unwrap();
         let sr = |part| mesh::ShardRead {
@@ -1007,6 +1048,7 @@ mod tests {
             shard: 0,
             offset: 0,
             length: 0,
+            slot: 0,
         };
         assert_eq!(
             mesh.read_shard("n1", sr(3)).await.unwrap().as_deref(),

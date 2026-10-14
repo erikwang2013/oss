@@ -40,6 +40,9 @@ pub struct ClusterToml {
     pub secret: String,
     #[serde(default)]
     pub nodes: Vec<NodeToml>,
+    /// M4 切片 5 放置开关：`"v2"` = 展开放置（扩容前全节点同步开启；混版会写失败可诊断）。
+    #[serde(default)]
+    pub placement: Option<String>,
 }
 
 /// 拓扑表中的一个节点。`addr` = 该节点 gRPC 监听地址（HTTP 端口另配）。
@@ -294,6 +297,7 @@ mod tests {
             node_id: "n1".into(),
             secret: String::new(),
             nodes: vec![],
+            placement: None,
         });
         c
     }

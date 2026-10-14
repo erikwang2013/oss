@@ -56,6 +56,9 @@ pub struct FsckReport {
     pub repaired_meta_keys: usize,
     /// heal：补建（本地）的桶目录数
     pub repaired_bucket_dirs: usize,
+    /// 版本目录内的 stray 分片文件（切片 5/设计 D：copy 后 flip 前崩=新盘多文件；
+    /// flip 后删老片崩/rebalance 清理失败=老盘多文件）。--repair 删除。
+    pub stray_files: Vec<String>,
 }
 
 impl Store {
@@ -162,23 +165,57 @@ impl Store {
 
         for (bucket, key) in keys {
             r.objects_scanned += 1;
-            // 引用集：所有版本（含旧 parts 兼容位）的 uuid
-            let referenced: HashSet<String> = match self.read_meta(&bucket, &key).await {
-                Ok(Some(m)) => m
-                    .versions
-                    .iter()
-                    .flat_map(|v| v.effective_parts())
-                    .map(|p| p.uuid)
-                    .collect(),
-                Ok(None) => HashSet::new(), // 无 meta = 崩在提交点前：全部子目录都是孤儿
+            // 单次 read_meta 快照同时构建「引用集」与「期望文件集」——**不得二次读取**：
+            // 第二次 Err 会让 expected 为空而 referenced 非空 → --repair 把活对象分片
+            // 全当 stray 删光（数据丢失级 TOCTOU，verifier 抓）
+            let meta_snapshot = match self.read_meta(&bucket, &key).await {
+                Ok(Some(m)) => Some(m),
+                Ok(None) => None, // 无 meta = 崩在提交点前：全部子目录都是孤儿
                 Err(e) => {
                     r.corrupt_meta += 1;
                     tracing::warn!(bucket = %bucket, key = %key, error = %e, "fsck：meta 读取失败");
                     continue; // 保守：损坏 meta 的对象整体跳过（与 reap_stale 同口径）
                 }
             };
+            // 引用集：所有版本（含旧 parts 兼容位）的 uuid
+            let referenced: HashSet<String> = meta_snapshot
+                .as_ref()
+                .map(|m| {
+                    m.versions
+                        .iter()
+                        .flat_map(|v| v.effective_parts())
+                        .map(|p| p.uuid)
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            // 孤儿扫描（逐盘）+ 分片巡检（按 meta 里的 DataLayout）
+            // 期望文件集（stray 判定基准）：全链各版本「槽属本盘」的 (drive_idx, uuid, 文件名)
+            // ——与 referenced 同一快照
+            let mut expected_files: std::collections::HashSet<(usize, String, String)> =
+                std::collections::HashSet::new();
+            if let Some(m) = &meta_snapshot {
+                for v in &m.versions {
+                    if let Some(l) = &v.data_layout {
+                        for s in &l.shards {
+                            if let Some(di) = self.local_drive_idx_of_slot(s.drive as u16) {
+                                expected_files.insert((
+                                    di,
+                                    v.part.uuid.clone(),
+                                    format!("part.{}.{}", s.part, s.shard),
+                                ));
+                            }
+                        }
+                    }
+                    for p in v.effective_parts() {
+                        for (di, _) in self.cfg.drives.iter().enumerate() {
+                            // 旧 parts 在每盘各一份（读路径逐盘找）
+                            expected_files.insert((di, p.uuid.clone(), format!("part.{}", p.part)));
+                        }
+                    }
+                }
+            }
+
+            // 孤儿扫描（逐盘）+ stray 文件扫描（切片 5/设计 D）+ 分片巡检（按 meta 里的 DataLayout）
             for (d, drive) in self.cfg.drives.iter().enumerate() {
                 let Ok(obj_dir) = layout::object_dir(drive, &bucket, &key) else {
                     continue;
@@ -197,6 +234,21 @@ impl Store {
                         r.orphan_dirs.push(format!("{d}#{bucket}/{key}/{name}"));
                         if repair {
                             let _ = tokio::fs::remove_dir_all(sub.path()).await;
+                        }
+                    } else if let Ok(mut files) = tokio::fs::read_dir(sub.path()).await {
+                        // stray：版本目录内 meta 不期望的 part.* 文件
+                        while let Some(f) = files.next_entry().await? {
+                            let fname = f.file_name().to_string_lossy().into_owned();
+                            if !fname.starts_with("part.") || fname.ends_with(".new") {
+                                continue; // part.N.new 为 MPU 半截件、xl.meta 等不动
+                            }
+                            if !expected_files.contains(&(d, name.clone(), fname.clone())) {
+                                r.stray_files
+                                    .push(format!("{d}#{bucket}/{key}/{name}/{fname}"));
+                                if repair {
+                                    let _ = tokio::fs::remove_file(f.path()).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -247,6 +299,7 @@ impl Store {
                                     shard: s.shard as u32,
                                     offset: 0,
                                     length: 0, // 整片（fsck 全量校验语义）
+                                    slot: s.drive as u32,
                                 };
                                 match t.read_shard(node, req).await {
                                     Ok(Some(bytes)) => {

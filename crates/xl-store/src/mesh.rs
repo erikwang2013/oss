@@ -34,6 +34,8 @@ pub struct ShardWrite {
     pub offset: u64,
     pub chunk_crc32c: u32,
     pub is_final: bool,
+    /// M4 切片 5：请求方携带的槽位（写路径 = 放置结果；服务端只校验归属，不重算公式）。
+    pub slot: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,19 @@ pub struct ShardRead {
     /// 短读视同缺失（崩溃半截件由 EC 重建兜底）。
     pub offset: u64,
     pub length: u64,
+    /// M4 切片 5：请求方携带的槽位（= meta 的 ShardRef.drive；老槽在 flip 后不再有记录）。
+    pub slot: u32,
+}
+
+/// 单片删除（M4 切片 5：rebalance 翻转后的老片清理；槽位显式携带）。
+#[derive(Clone, Debug)]
+pub struct ShardDelete {
+    pub bucket: String,
+    pub key: String,
+    pub uuid: String,
+    pub part: u32,
+    pub shard: u32,
+    pub slot: u32,
 }
 
 /// 版本目录引用（删除 / 回收两用；UUID 是版本目录名，天然幂等）。
@@ -203,6 +218,8 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
     async fn delete_version(&self, node: &str, d: VersionDirRef) -> Result<()>;
     /// 旧版本 → 该盘 `.oss.sys/trash/`（先决链：提交 quorum 成立后回收才安全）
     async fn recycle_version(&self, node: &str, d: VersionDirRef) -> Result<()>;
+    /// 单片删除（幂等）——rebalance 老片清理用。
+    async fn delete_shard(&self, node: &str, d: ShardDelete) -> Result<()>;
     async fn prepare_meta(&self, node: &str, m: MetaWrite) -> Result<MetaAck>;
     async fn commit_meta(&self, node: &str, m: MetaWrite) -> Result<MetaAck>;
     async fn abort_meta(&self, node: &str, m: MetaWrite) -> Result<()>;

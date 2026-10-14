@@ -5,6 +5,7 @@ service Mesh {
   rpc ReadShard(ShardRead) returns (ShardResp);
   rpc DeleteVersion(VersionDirRef) returns (WriteResp);
   rpc RecycleVersion(VersionDirRef) returns (WriteResp);
+  rpc DeleteShard(ShardDelete) returns (WriteResp);
   rpc PrepareMeta(MetaWrite) returns (MetaAck);
   rpc CommitMeta(MetaWrite) returns (MetaAck);
   rpc AbortMeta(MetaWrite) returns (WriteResp);
@@ -24,11 +25,18 @@ message ShardWrite { string bucket=1; string key=2; string uuid=3; uint32 part=4
                      // M4 切片 2 分块写：chunked=true 时忽略 crc32c、校验 chunk_crc32c 并把
                      // data 写到分片文件 offset 处（offset=0 先截断）；is_final=true 时 fsync。
                      // chunked=false = 旧整片语义（crc32c 校验全体，行为不变）。
-                     bool chunked=8; uint64 offset=9; uint32 chunk_crc32c=10; bool is_final=11; }
+                     bool chunked=8; uint64 offset=9; uint32 chunk_crc32c=10; bool is_final=11;
+                     // M4 切片 5：请求方携带槽位（meta 的 ShardRef.drive / 搬迁前老槽）；
+                     // 服务端只校验归属并按槽拼路径，**不再重算放置公式**（新旧公式并存会
+                     // 让存量对象远端面全错——设计评审 A）。
+                     uint32 slot=12; }
 message ShardRead  { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5;
                      // M4 切片 2：length=0 = 整片（旧语义）；否则读 [offset, offset+length)
                      //（短读视同缺失——崩溃半截件由 EC 重建兜底）。
-                     uint64 offset=6; uint64 length=7; }
+                     uint64 offset=6; uint64 length=7;
+                     uint32 slot=8; }
+message ShardDelete { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5;
+                      uint32 slot=6; }
 message ShardResp  { bool found=1; uint32 crc32c=2; bytes data=3; }
 message VersionDirRef { string bucket=1; string key=2; string uuid=3; }
 message MetaWrite { string bucket=1; string key=2; bytes meta=3; }

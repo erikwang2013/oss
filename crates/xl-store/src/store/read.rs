@@ -277,6 +277,8 @@ impl Store {
                     shard: i as u32,
                     offset: off,
                     length: len as u64,
+                    // M4 切片 5：槽位 = meta 的 ShardRef.drive（服务端只校验归属）
+                    slot: s.drive as u32,
                 };
                 match tp.read_shard(node, r).await {
                     Ok(Some(b)) if b.len() == len => Ok(Some(b.to_vec())),
@@ -660,6 +662,7 @@ impl Store {
                                 offset: t * ec::CHUNK_W as u64,
                                 chunk_crc32c: ec::crc32c_of(chunk),
                                 is_final,
+                                slot: l.shards[*i].drive as u32,
                             };
                             if let Err(e) = tp.write_shard(node, req).await {
                                 failed = Some(e);

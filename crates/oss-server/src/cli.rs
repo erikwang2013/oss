@@ -14,7 +14,7 @@ use crate::state::AppState;
 pub const CONFIG_PATH: &str = "oss.toml";
 
 pub const USAGE: &str = "\
-用法：oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub]
+用法：oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub|rebalance [--dry-run|--apply]]
 
   serve          启动服务（默认，无参数时同此）
   groups         建分组目录（幂等；不建就一定上传失败）
@@ -23,6 +23,9 @@ pub const USAGE: &str = "\
   fsck [--repair] 全盘巡检（全版本链：孤儿版本目录、EC 分片缺/坏、tmp/trash 计数）；--repair 执行最小修复（删孤儿 + 逐版本读时修）；报告落 .oss.sys/fsck/<时间戳>-fsck.json
   heal           fsck --repair 全量 + 缺失桶目录补建（集群差集；每节点各自执行）；报告 <时间戳>-heal.json
   scrub          全量深度巡检（只读）：逐块 12×W 对偶校验可定位坏片、历史版本全覆盖；深度失败 exit 1（可重建的坏/缺块不退出非零——口径见 README）；报告 <时间戳>-scrub.json
+  rebalance [--dry-run|--apply]
+                 扩容搬迁（默认 dry-run）：把存量对象迁到展开放置（placement=v2；未开则空跑）；
+                 逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +43,10 @@ pub enum Command {
     Heal,
     /// M4 切片 4：全量深度巡检（逐块对偶校验，只读不修）
     Scrub,
+    /// M4 切片 5：扩容后搬迁（dry_run 只报告）
+    Rebalance {
+        dry_run: bool,
+    },
 }
 
 /// 解析子命令（入参为去掉 argv[0] 后的参数）。未知子命令或多余参数 → `Err(用法)`（调用方 exit 2）。
@@ -65,6 +72,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
         ("fsck", [flag]) if flag == "--repair" => Ok(Command::Fsck { repair: true }),
         ("heal", []) => Ok(Command::Heal),
         ("scrub", []) => Ok(Command::Scrub),
+        ("rebalance", []) => Ok(Command::Rebalance { dry_run: true }),
+        ("rebalance", [flag]) if flag == "--dry-run" => Ok(Command::Rebalance { dry_run: true }),
+        ("rebalance", [flag]) if flag == "--apply" => Ok(Command::Rebalance { dry_run: false }),
         _ => Err(USAGE),
     }
 }
@@ -256,6 +266,43 @@ pub async fn run(
             );
             Ok(0)
         }
+        Command::Rebalance { dry_run } => {
+            let report = match state.store.rebalance(dry_run).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: rebalance 失败: {e}");
+                    return Ok(1);
+                }
+            };
+            dump_report(
+                &state,
+                if dry_run {
+                    "rebalance-dry"
+                } else {
+                    "rebalance"
+                },
+                &report,
+            );
+            println!(
+                "rebalance{}: v2={} / 扫描 {} 对象 / 搬迁 {} 对象 {} 片 {:.1} MiB / 跳过 {}{}",
+                if dry_run { "（dry-run）" } else { "" },
+                report.placement_v2,
+                report.objects_scanned,
+                report.objects_moved,
+                report.shards_moved,
+                report.bytes_moved as f64 / 1048576.0,
+                report.skipped.len(),
+                if report.skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "（下一轮重跑可续）：{:?}",
+                        &report.skipped[..report.skipped.len().min(5)]
+                    )
+                }
+            );
+            Ok(0)
+        }
         Command::Scrub => {
             let report = match state.store.scrub().await {
                 Ok(r) => r,
@@ -371,6 +418,8 @@ mod tests {
             &["fsck", "--repair", "x"][..],
             &["heal", "x"][..], // heal/scrub 不收参数
             &["scrub", "--deep"][..],
+            &["rebalance", "--go"][..], // rebalance 只认 --dry-run/--apply
+            &["rebalance", "x", "y"][..],
             &["/etc/oss.toml"][..], // 旧的「首参=配置路径」不再是合法用法
         ] {
             assert_eq!(parse_args(&args(bad)), Err(USAGE), "应拒绝: {bad:?}");

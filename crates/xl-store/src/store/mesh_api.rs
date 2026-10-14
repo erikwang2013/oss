@@ -62,20 +62,21 @@ impl Store {
         self.cfg.cluster.as_deref().map(|c| &c.transport)
     }
 
-    /// 分片下标 → 本机槽位（收请求时校验落点确在本节点，防误导请求）。
-    fn local_slot_of_shard(&self, shard: u8) -> Result<u16> {
+    /// 槽位归属校验（M4 切片 5）：槽位由请求方携带，服务端**只校验归属并按槽拼路径**——
+    /// 不再重算放置公式（新旧公式并存会让存量对象远端面全错，设计评审 A）。
+    fn local_drive_of_request_slot(&self, slot: u32) -> Result<&std::path::Path> {
         let cl = self
             .cfg
             .cluster
             .as_deref()
             .ok_or_else(|| Error::Encode("非集群模式没有 mesh 面".into()))?;
-        let slot = cl.topo.slot_of(shard);
+        let slot = u16::try_from(slot).map_err(|_| Error::Encode(format!("槽位越界: {slot}")))?;
         if cl.topo.local_drive_of_slot(slot).is_none() {
             return Err(Error::Encode(format!(
-                "分片 {shard} 槽位 {slot} 不属本节点（请求误导？）"
+                "槽位 {slot} 不属本节点（请求误导？）"
             )));
         }
-        Ok(slot)
+        self.local_drive_of_slot(slot)
     }
 
     fn local_drive_of_slot(&self, slot: u16) -> Result<&std::path::Path> {
@@ -99,8 +100,7 @@ impl Store {
     /// 整片语义（`chunked=false`）行为与 M3 完全一致；分块语义（`chunked=true`）按
     /// `(offset, chunk_crc32c, is_final)` 定位写、逐块校验、末块 fsync。
     pub async fn mesh_write_shard(&self, w: crate::mesh::ShardWrite) -> Result<()> {
-        let slot = self.local_slot_of_shard(w.shard as u8)?;
-        let drive = self.local_drive_of_slot(slot)?;
+        let drive = self.local_drive_of_request_slot(w.slot)?;
         let dir = layout::object_dir(drive, &w.bucket, &w.key)?.join(&w.uuid);
         tokio::fs::create_dir_all(&dir).await?;
         // 与 drives::shard_path 同式（part.<part>.<shard>）
@@ -152,8 +152,7 @@ impl Store {
     /// 分片读（服务端）：缺失 → Ok(None)（调用方视同该片缺失）；本机 IO 错误 → Err。
     /// `length=0` = 整片（旧语义）；分块读 `[offset, offset+length)`，短读（半截件）视同缺失。
     pub async fn mesh_read_shard(&self, r: crate::mesh::ShardRead) -> Result<Option<bytes::Bytes>> {
-        let slot = self.local_slot_of_shard(r.shard as u8)?;
-        let drive = self.local_drive_of_slot(slot)?;
+        let drive = self.local_drive_of_request_slot(r.slot)?;
         let path = layout::object_dir(drive, &r.bucket, &r.key)?
             .join(&r.uuid)
             .join(format!("part.{}.{}", r.part, r.shard));
@@ -185,6 +184,19 @@ impl Store {
             Ok(_) => Ok(Some(bytes::Bytes::from(buf))),
             // 短读：文件比预期短（崩溃半截/并发回收）——视同该块缺失，交 EC 重建
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 单片删除（M4 切片 5 rebalance  cleanup；幂等）：槽位显式携带（flip 后 meta 已不记老槽）。
+    pub async fn mesh_delete_shard(&self, d: crate::mesh::ShardDelete) -> Result<()> {
+        let drive = self.local_drive_of_request_slot(d.slot)?;
+        let path = layout::object_dir(drive, &d.bucket, &d.key)?
+            .join(&d.uuid)
+            .join(format!("part.{}.{}", d.part, d.shard));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

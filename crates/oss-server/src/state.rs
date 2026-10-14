@@ -93,9 +93,19 @@ impl AppState {
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
             let mesh = Arc::new(xl_client::TonicMesh::new(&cl.node_id, &cl.secret, &pairs)?);
+            // 放置开关：只认 None/"v1"/"v2"——未知值 fail-closed（静默降级为 v1 会让
+            // 「以为开了 v2」的运维在 rebalance 里得到空跑报告）
+            let placement_v2 = match cl.placement.as_deref() {
+                None | Some("v1") => false,
+                Some("v2") => true,
+                Some(other) => {
+                    return Err(format!("cluster.placement 非法值 «{other}»（只认 v1/v2）").into());
+                }
+            };
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
                 topo,
                 transport: mesh,
+                placement_v2,
             }));
             // Task 9：控制面读扇出的本节点执行器（判权复用 xl-s3::Acl；只查本地 DB）
             store_cfg.control = Some(Arc::new(crate::cluster_control::SqliteControlBackend::new(

@@ -459,6 +459,9 @@ pub(crate) mod test_support {
         async fn recycle_version(&self, _n: &str, _d: xl_store::mesh::VersionDirRef) -> Result<()> {
             Err(unimpl("recycle_version"))
         }
+        async fn delete_shard(&self, _n: &str, _d: xl_store::mesh::ShardDelete) -> Result<()> {
+            Err(unimpl("delete_shard"))
+        }
         async fn prepare_meta(
             &self,
             _n: &str,
