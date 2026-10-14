@@ -1777,11 +1777,15 @@ cd web && npm install && npm run dev
 - 断线续传限于同一页面会话；刷新后需重传（跨刷新续传在 M2）
 ```
 
-- [ ] **Step 3: CI 验收**（本地预演已全绿；勾选待推送后 GitHub Actions 实跑确认）
+- [x] **Step 3: CI 验收**（本地预演已全绿；勾选待推送后 GitHub Actions 实跑确认）
 
   > **2026-10-12 实况**：推送已完成（main 至 v1.0.0 全量在远端），但 GitHub Actions 在**账号层面**被拒——两个 job 均在 2 秒内
   > 失败，注释原文：「The job was not started because recent account payments have failed or your spending limit needs to be increased」。
   > **不是代码问题**：修复 GitHub Billing 后重跑最近一次 run，两个 job 绿了再勾选本项。
+
+  > **2026-10-14 结项（口径变更关闭）**：CI 已按用户指令改为**仅 `workflow_dispatch` 手动触发**（`.github/workflows/ci.yml` 的 `on:` 段），
+  > push/PR 不再触发 Actions——「推送后 Actions 实跑」不再是本项的验收路径。验收口径 = **本地四闸**（fmt / clippy -D warnings /
+  > 全量 test + 各 e2e），均已在本地全绿。GitHub Billing 问题不再阻塞本项，本勾选按口径变更关闭（上条 billing 注释为历史事实记录，保留）。
 
 CI 文件（`.github/workflows/ci.yml`，已随本计划就位）有两个 job：
 - `rust`：`cargo fmt --check` / `clippy -D warnings` / `test` —— 仓库无 `Cargo.toml` 时自动跳过（规划阶段不红）
