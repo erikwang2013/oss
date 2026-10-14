@@ -281,6 +281,23 @@ scrape_configs:
 - **EC 区间读语义**（M4 切片 2）：Range 读不再做整片 CRC32C / 对象级 SHA256（改逐块 12×W 对偶校验，坏片可定位自愈）；
   **范围外的损坏不再触发读时修**（整读仍会），批量修复归 `heal`（M4 切片 4）。
 
+## 版本控制（M4）
+
+`aws s3api put-bucket-versioning --versioning-configuration Status=Enabled` 开启；`list-object-versions` 枚举；
+GET / HEAD / DeleteObject 带 `--version-id` 点名版本；`copy-object --copy-source 'bucket/key?versionId=<旧>'` 即**回滚**
+（旧版本 → 新版本）；无版本号 DELETE = delete marker（GET 404、对象列表隐身、版本列表可见）。`tests/e2e_s3.sh` 第 16 节实弹覆盖。
+
+**v1 边界（诚实记档）**：
+- 版本控制状态**单向**：只能 Off→Enabled；已启用的桶拒绝改回 Off（501，防整链替换丢历史），Suspended 亦 501（未实现）；
+  未开过版本的桶 `get-bucket-versioning` 回 `Off`（AWS 留空）。
+- 所有写响应透出 `x-amz-version-id`（PUT / Complete / Copy / DeleteObject；DeleteObject 另带 `x-amz-delete-marker: true`）；
+  GET / HEAD 也回实际版本号。点名 GET / HEAD marker 版本 → 405。
+- 对象列表（ListObjectsV2）只见「链尾非 marker」的键；区间读对历史版本同 S3 语义。
+- `ListObjectVersions` v1 **忽略 delimiter**（不产 CommonPrefixes）；续点（key-marker / version-id-marker）不匹配链时
+  返回 400 InvalidArgument（fail-loud）。
+- 集群：版本追加仍走 write_meta quorum（整份 meta 重写）；`list-object-versions` 集群路径为逐键 quorum 读
+  （低频运维面，量级上去再做分页 RPC——记档）。
+
 ## 验收
 
 覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）见下方脚本；控制台的登录/上传/秒传/密钥常规路径见
