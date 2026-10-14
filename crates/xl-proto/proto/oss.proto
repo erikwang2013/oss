@@ -20,8 +20,15 @@ service Mesh {
 }
 message Empty {}  message WriteResp { bool ok = 1; string msg = 2; }
 message ShardWrite { string bucket=1; string key=2; string uuid=3; uint32 part=4;
-                     uint32 shard=5; uint32 crc32c=6; bytes data=7; }
-message ShardRead  { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5; }
+                     uint32 shard=5; uint32 crc32c=6; bytes data=7;
+                     // M4 切片 2 分块写：chunked=true 时忽略 crc32c、校验 chunk_crc32c 并把
+                     // data 写到分片文件 offset 处（offset=0 先截断）；is_final=true 时 fsync。
+                     // chunked=false = 旧整片语义（crc32c 校验全体，行为不变）。
+                     bool chunked=8; uint64 offset=9; uint32 chunk_crc32c=10; bool is_final=11; }
+message ShardRead  { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5;
+                     // M4 切片 2：length=0 = 整片（旧语义）；否则读 [offset, offset+length)
+                     //（短读视同缺失——崩溃半截件由 EC 重建兜底）。
+                     uint64 offset=6; uint64 length=7; }
 message ShardResp  { bool found=1; uint32 crc32c=2; bytes data=3; }
 message VersionDirRef { string bucket=1; string key=2; string uuid=3; }
 message MetaWrite { string bucket=1; string key=2; bytes meta=3; }

@@ -334,15 +334,19 @@ async fn ec_read_survives_shard_loss_and_corruption() {
 }
 
 #[tokio::test]
-async fn ec_sha_mismatch_fails_closed() {
-    // 能过 CRC（坏片字节被改 + meta 里 CRC 被同步改掉）但整份数据错：SHA256 终验必须拦下
+async fn ec_old_segment_layout_reads_chunked() {
+    // 「旧写新读」兼容：手工按旧格式落盘（整份 ec::encode 的段式布局、shard_size =
+    // ceil(len/data)、**非 W 对齐**），新分块读路径必须原样读出（读端不假设 W 对齐）。
+    // 「新写旧读」在编解码层已证：分块产物经整份 `reconstruct` 直读（ec.rs 测试），
+    // 且 meta 的 ShardRef.crc32c 与整片重算一致（旧读端的整片 CRC 闸可过）。
     let (s, d) = store().await;
     s.create_bucket("alpha").await.unwrap();
-    s.put_object("alpha", "k", payload(200_000), None)
+    let data = payload(300_001);
+    s.put_object("alpha", "old", data.clone(), None)
         .await
         .unwrap();
 
-    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    let obj_dir = layout::object_dir(d.path(), "alpha", "old").unwrap();
     let mut m = XlMeta::decode(
         &tokio::fs::read(obj_dir.join(meta::META_FILE))
             .await
@@ -350,19 +354,236 @@ async fn ec_sha_mismatch_fails_closed() {
     )
     .unwrap();
     let v = m.versions.last_mut().unwrap();
-    let spath = obj_dir.join(&v.part.uuid).join("part.1.2");
-    let mut shard = tokio::fs::read(&spath).await.unwrap();
-    shard[0] ^= 0xff;
-    tokio::fs::write(&spath, &shard).await.unwrap();
-    v.data_layout.as_mut().unwrap().shards[2].crc32c = ec::crc32c_of(&shard);
-    tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+    let uuid = v.part.uuid.clone();
+    let ss_old = (data.len() as u64).div_ceil(8);
+    assert_ne!(
+        ss_old % ec::CHUNK_W as u64,
+        0,
+        "前置：旧布局须非 W 对齐（否则测不到边界）"
+    );
+    let cfg84 = ec::EcConfig {
+        data: 8,
+        parity: 4,
+        ..Default::default()
+    };
+    let shards = ec::encode(&data, cfg84).unwrap();
+    let vdir = obj_dir.join(&uuid);
+    for (i, sh) in shards.iter().enumerate() {
+        std::fs::write(vdir.join(format!("part.1.{i}")), sh).unwrap();
+        v.data_layout.as_mut().unwrap().shards[i] = meta::ShardRef {
+            drive: 0,
+            part: 1,
+            shard: i as u8,
+            size: ss_old,
+            crc32c: ec::crc32c_of(sh),
+        };
+    }
+    v.data_layout.as_mut().unwrap().shard_size = ss_old;
+    std::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap()).unwrap();
+
+    let (_, got) = s.get_object("alpha", "old").await.unwrap();
+    assert_eq!(&got[..], &data[..], "旧布局整读");
+    // 跨块边界区间（末块短于 W 的读点）
+    let w = ec::CHUNK_W;
+    let r = s
+        .get_object_range("alpha", "old", (w - 3) as u64..(w + 5) as u64)
         .await
         .unwrap();
+    assert_eq!(&r[..], &data[w - 3..w + 5], "旧布局跨块区间");
 
+    // 第二例：ss_old > W 且多块（ss=75000、blocks=2、末块短 9464）——覆盖段内跨块对与
+    // **跨片段**区间（s1>s0 的 (s,t) 迭代分支；第一例 ss<W 走不到）
+    let data2 = payload(600_000);
+    s.put_object("alpha", "old2", data2.clone(), None)
+        .await
+        .unwrap();
+    let obj_dir2 = layout::object_dir(d.path(), "alpha", "old2").unwrap();
+    let mut m2 = XlMeta::decode(
+        &tokio::fs::read(obj_dir2.join(meta::META_FILE))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let v2 = m2.versions.last_mut().unwrap();
+    let uuid2 = v2.part.uuid.clone();
+    let ss2 = (data2.len() as u64).div_ceil(8);
+    assert!(ss2 > ec::CHUNK_W as u64, "前置：第二例须 ss>W（ss2={ss2}）");
+    let shards2 = ec::encode(&data2, cfg84).unwrap();
+    let vdir2 = obj_dir2.join(&uuid2);
+    for (i, sh) in shards2.iter().enumerate() {
+        std::fs::write(vdir2.join(format!("part.1.{i}")), sh).unwrap();
+        v2.data_layout.as_mut().unwrap().shards[i] = meta::ShardRef {
+            drive: 0,
+            part: 1,
+            shard: i as u8,
+            size: ss2,
+            crc32c: ec::crc32c_of(sh),
+        };
+    }
+    v2.data_layout.as_mut().unwrap().shard_size = ss2;
+    std::fs::write(obj_dir2.join(meta::META_FILE), m2.encode().unwrap()).unwrap();
+
+    let (_, got2) = s.get_object("alpha", "old2").await.unwrap();
+    assert_eq!(&got2[..], &data2[..], "旧布局多块整读");
+    let wu = ec::CHUNK_W as u64;
+    let r2 = s
+        .get_object_range("alpha", "old2", (wu - 3)..(wu + 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        &r2[..],
+        &data2[(wu - 3) as usize..(wu + 5) as usize],
+        "段内跨块区间"
+    );
+    let r3 = s
+        .get_object_range("alpha", "old2", (ss2 - 2)..(ss2 + 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        &r3[..],
+        &data2[(ss2 - 2) as usize..(ss2 + 2) as usize],
+        "跨片段区间（s1>s0）"
+    );
+}
+
+/// 流式内存峰值锚（96 MiB 对象）：分块路径的内核额外峰值应为 MB 级。
+/// **必须单独跑**（VmHWM 是进程峰值）：`cargo test -p xl-store --lib
+/// ec_streaming_memory_peak -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn ec_streaming_memory_peak_stays_flat() {
+    fn vmhwm_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("VmHWM:"))
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let mib = 1024 * 1024usize;
+    let chunk = vec![0xABu8; mib];
+    let stream = futures::stream::iter((0..96).map(move |_| Ok(bytes::Bytes::from(chunk.clone()))));
+    let info = s
+        .put_object_stream("alpha", "huge", Box::pin(stream), None)
+        .await
+        .unwrap();
+    assert_eq!(info.size, 96 * mib as u64);
+    let (_, back) = s.get_object("alpha", "huge").await.unwrap();
+    assert_eq!(back.len(), 96 * mib);
+    assert!(back[..].iter().all(|b| *b == 0xAB));
+    let peak = vmhwm_kb();
+    // 阈值 200 MiB（verifier 校准）：delta 含读回缓冲 96 MiB（Bytes API 固有）；分块路径
+    // 实测 ≈107 MiB。旧整份路径 ≈96(payload)+144(12 片)+96(读回) ≈ 240 MiB 以上——
+    // 320 阈值放它过，200 才能真的拦回归。
+    eprintln!("VmHWM peak={peak} KiB");
+    assert!(
+        peak < 200 * 1024,
+        "峰值 {peak} KiB 超过 200 MiB（分块路径回归？）"
+    );
+}
+
+#[tokio::test]
+async fn ec_sha_mismatch_fails_closed() {
+    // 数据完好但**提交记录被篡改**（meta 的 part.sha256 改掉）：SHA256 终验必须拦下——
+    // 分块路径的最后一闸（逐块对偶管不到「记录本身是假的」）。
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "k", payload(200_000), None)
+        .await
+        .unwrap();
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    let mut m = XlMeta::decode(
+        &tokio::fs::read(obj_dir.join(meta::META_FILE))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    m.versions.last_mut().unwrap().part.sha256 = "00".repeat(32);
+    std::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap()).unwrap();
     assert!(matches!(
         s.get_object("alpha", "k").await,
         Err(Error::CorruptMeta(_))
     ));
+}
+
+#[tokio::test]
+async fn ec_forged_crc_heals_one_shard_and_fails_closed_at_two() {
+    // 能过旧整片 CRC 的伪造（坏片字节被改 + meta 里 CRC 被同步改掉）在 M4 分块路径下
+    // 由 12×W 对偶校验接管：**单片**可唯一定位 → 剔除 + parity 重建（EC 自愈，读到正确
+    // 数据）；**两片同时**无法唯一定位 → fail-closed。
+    // 备注：自愈会以正确字节重写坏片文件，而 meta 里的 CRC 是被伪造的——fsck 的全片
+    // CRC 比对会把这个（对抗性）残局标为坏片，属已知 fail-safe 方向（绝不吐坏数据）。
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let data = payload(200_000);
+    s.put_object("alpha", "k", data.clone(), None)
+        .await
+        .unwrap();
+
+    let obj_dir = layout::object_dir(d.path(), "alpha", "k").unwrap();
+    async fn read_meta(dir: &std::path::Path) -> XlMeta {
+        XlMeta::decode(&tokio::fs::read(dir.join(meta::META_FILE)).await.unwrap()).unwrap()
+    }
+    let mut m = read_meta(&obj_dir).await;
+    let uuid = m.versions.last().unwrap().part.uuid.clone();
+    let spath = |i: usize| obj_dir.join(&uuid).join(format!("part.1.{i}"));
+    // 先伪造一片：应自愈
+    {
+        let mut shard = tokio::fs::read(spath(2)).await.unwrap();
+        shard[0] ^= 0xff;
+        tokio::fs::write(spath(2), &shard).await.unwrap();
+        let v = m.versions.last_mut().unwrap();
+        v.data_layout.as_mut().unwrap().shards[2].crc32c = ec::crc32c_of(&shard);
+        tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    let (_, got) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&got[..], &data[..], "单片伪造应由 parity 自愈出正确数据");
+    // 读时修已把 part.1.2 重写回正确内容（与提交的 sha 一致，见上方备注）
+    let healed = tokio::fs::read(spath(2)).await.unwrap();
+    assert_eq!(healed, {
+        let mut m2 = read_meta(&obj_dir).await;
+        let v = m2.versions.last_mut().unwrap();
+        let ss = v.data_layout.as_ref().unwrap().shard_size as usize;
+        let start = 2 * ss;
+        // 片 2 = payload 第 2 段 + 补零
+        let end = (start + ss).min(data.len());
+        let mut seg = data[start..end].to_vec();
+        seg.resize(ss, 0);
+        seg
+    });
+
+    // 两片**同时**伪造（片 2 前一轮已被自愈重写，需重新伪造）：无法唯一定位 → CorruptMeta
+    {
+        let mut m2 = read_meta(&obj_dir).await;
+        for i in [2usize, 5] {
+            let mut shard = tokio::fs::read(spath(i)).await.unwrap();
+            shard[0] ^= 0xff;
+            tokio::fs::write(spath(i), &shard).await.unwrap();
+            m2.versions
+                .last_mut()
+                .unwrap()
+                .data_layout
+                .as_mut()
+                .unwrap()
+                .shards[i]
+                .crc32c = ec::crc32c_of(&shard);
+        }
+        tokio::fs::write(obj_dir.join(meta::META_FILE), m2.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    assert!(
+        matches!(s.get_object("alpha", "k").await, Err(Error::CorruptMeta(_))),
+        "两片同时伪造必须 fail-closed"
+    );
 }
 
 #[tokio::test]

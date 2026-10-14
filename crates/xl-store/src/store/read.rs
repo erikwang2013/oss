@@ -76,7 +76,10 @@ impl Store {
                 return Ok((info, Bytes::from(inline.bytes.clone())));
             }
             if let Some(l) = &v.data_layout {
-                match self.read_ec(bucket, key, v, l, round > 0).await? {
+                match self
+                    .read_ec_range(bucket, key, v, l, None, round > 0)
+                    .await?
+                {
                     Some(bytes) => return Ok((info, bytes)),
                     // 版本目录被并发覆写者移走/清除：重读 meta 拿新版本
                     None => continue,
@@ -84,7 +87,8 @@ impl Store {
             }
 
             let parts = v.effective_parts();
-            // ponytail: M2a 整份读进内存（跨 part 拼接，与既有限制同口径）；M2b 换流式。
+            // 旧形态（ec.enabled=false）parts 路径：整份读进内存——遗留形态按设计保留（非 EC
+            // 对象本就无分片可流式）；EC 形态走上方 read_ec_range 分块路径。
             let mut buf = Vec::with_capacity(v.size as usize);
             let mut missing = false;
             for p in &parts {
@@ -139,7 +143,7 @@ impl Store {
                 )));
             }
 
-            // 形态分派（同 get_object；EC 按整份重建后切片——ponytail: 分片级按需重建是 M2b-3 之后的升级路径）
+            // 形态分派（同 get_object；M4 切片 2 起 EC 区间读只取命中块 + 逐块重建）
             if let Some(inline) = &v.inline {
                 if inline.bytes.len() as u64 != v.size {
                     return Err(Error::CorruptMeta(format!(
@@ -153,10 +157,11 @@ impl Store {
                 ));
             }
             if let Some(l) = &v.data_layout {
-                match self.read_ec(bucket, key, v, l, round > 0).await? {
-                    Some(bytes) => {
-                        return Ok(bytes.slice(range.start as usize..range.end as usize));
-                    }
+                match self
+                    .read_ec_range(bucket, key, v, l, Some(range.clone()), round > 0)
+                    .await?
+                {
+                    Some(bytes) => return Ok(bytes),
                     None => continue,
                 }
             }
@@ -208,25 +213,155 @@ impl Store {
         Err(Error::NoSuchKey(key.to_string()))
     }
 
-    /// EC 读：逐片读取 + CRC32C/长度校验（坏片视同缺失）→ 重建 → 截断到对象长度 → SHA256 终验。
-    ///
-    /// 分片位置按拓扑下标解引用：`drives[s.drive] /<bucket>/<展键>/<uuid>/part.<part>.<shard>`。
-    /// 分片是逐个读的，并发删除/覆写的中间态会让读者看到「前缀片在、后缀片没了」的半截视图，
-    /// 与真实损坏（盘丢片）不可在单轮内区分——因此 `strict`（末轮）之前，「存活不足」返回
-    /// `Ok(None)` 让调用方重读 meta 一轮：
-    ///   - 非末轮：任何拿不到数据的视图都 `Ok(None)`（可能是并发窗口）；
-    ///   - 末轮：全片 ENOENT 且未读到任何字节 = 目录确实不在 → `Ok(None)`（调用方报 NoSuchKey）；
-    ///     只要读到过坏片字节（CRC/长度不符）或存活片不全但不为空 → `Err(CorruptMeta)`
-    ///     （有字节落盘的损坏不得伪装成 404——fail-closed，不吐坏数据）。
-    ///
-    /// 重建后 SHA256 与提交记录不符同样 `Err`。重建成功且存在缺失/坏片时做**读时修**
-    /// （best-effort 回写，ponytail: 无后台 heal；M4 的 heal 任务补全）。
-    async fn read_ec(
+    /// 单块读取（M4 切片 2 分块路径）：第 i 片第 t 块，长度 = `min(W, ss − t·W)`
+    /// （兼容非整块宽的旧对象——整片长度从 meta 的 `shard_size` 取，不假设 W 对齐）。
+    /// 位置按拓扑下标解引用：`drives[s.drive] /<bucket>/<展键>/<uuid>/part.<part>.<shard>`。
+    /// 缺失/短读/对端不可达 ≡ `None`（EC 重建兜底）；本机 IO 错误 → `Err`。
+    #[allow(clippy::too_many_arguments)]
+    async fn read_shard_block(
+        &self,
+        bucket: &str,
+        key: &str,
+        v: &Version,
+        s: &meta::ShardRef,
+        i: usize,
+        t: u64,
+        ss: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let off = t * ec::CHUNK_W as u64;
+        if off >= ss {
+            return Ok(None);
+        }
+        let len = (ss - off).min(ec::CHUNK_W as u64) as usize;
+        match self.shard_target(s) {
+            Some(drives::ShardTarget::Local { drive, .. }) => {
+                let path = drives::shard_path(drive, bucket, key, &v.part.uuid, s)?;
+                let mut f = match tokio::fs::File::open(&path).await {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
+                f.seek(std::io::SeekFrom::Start(off)).await?;
+                let mut buf = vec![0u8; len];
+                match f.read_exact(&mut buf).await {
+                    Ok(_) => Ok(Some(buf)),
+                    // 短读：文件比 meta 记录短（崩溃半截件）——视同缺失，交 EC 重建
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Some(drives::ShardTarget::Remote { node, .. }) => {
+                // read_shard RPC（offset/length 定位读）：对端不可达/超时 ≡ 该块缺失
+                let Some(tp) = self.mesh_transport() else {
+                    return Ok(None);
+                };
+                let r = crate::mesh::ShardRead {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    uuid: v.part.uuid.clone(),
+                    part: s.part as u32,
+                    shard: i as u32,
+                    offset: off,
+                    length: len as u64,
+                };
+                match tp.read_shard(node, r).await {
+                    Ok(Some(b)) if b.len() == len => Ok(Some(b.to_vec())),
+                    Ok(Some(b)) => {
+                        tracing::warn!(
+                            node,
+                            shard = i,
+                            got = b.len(),
+                            want = len,
+                            "远端分块长度不符，视同缺失"
+                        );
+                        Ok(None)
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => {
+                        tracing::warn!(node, shard = i, error = %e, "远端分块读取失败，视同缺失");
+                        Ok(None)
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(drive = s.drive, "EC 分片槽位越界，视同缺失");
+                Ok(None)
+            }
+        }
+    }
+
+    /// 读齐一块（12 片）并解码：返回补齐后的 12 个块；`Ok(None)` = 本块按轮次语义
+    /// 应重试/判缺（存活 < data 且非末轮；或末轮但全对象无任何分块可读）。
+    /// 副作用：`any_bytes` 置位（见到过任何块字节）、`missing` 记录缺失（片,块）。
+    #[allow(clippy::too_many_arguments)]
+    async fn read_decode_block(
         &self,
         bucket: &str,
         key: &str,
         v: &Version,
         l: &meta::DataLayout,
+        reader: &mut ec::ChunkReader,
+        t: u64,
+        ss: u64,
+        strict: bool,
+        any_bytes: &mut bool,
+        missing: &mut Vec<(usize, u64)>,
+    ) -> Result<Option<Vec<Option<Vec<u8>>>>> {
+        let total = l.shards.len();
+        let data = l.data as usize;
+        let mut chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
+        for (i, s) in l.shards.iter().enumerate() {
+            match self.read_shard_block(bucket, key, v, s, i, t, ss).await? {
+                Some(b) => {
+                    *any_bytes = true;
+                    chunks.push(Some(b));
+                }
+                None => {
+                    missing.push((i, t));
+                    chunks.push(None);
+                }
+            }
+        }
+        let present = chunks.iter().filter(|c| c.is_some()).count();
+        if present < data {
+            if !strict || !*any_bytes {
+                return Ok(None);
+            }
+            return Err(Error::CorruptMeta(format!(
+                "分块存活不足：块 {t} 存活 {present} < data {data}"
+            )));
+        }
+        match reader.decode_block(&mut chunks) {
+            // 定位到的坏片也进读时修：读到了正确数据，盘上也要重写回正确内容
+            Ok(Some(j)) => missing.push((j, t)),
+            Ok(None) => {}
+            Err(e) => {
+                // 坏片定位失败（多片同时损坏）：非末轮按并发窗口重试，末轮 fail-closed
+                if !strict {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        }
+        Ok(Some(chunks))
+    }
+
+    /// EC 分块读（M4 切片 2）：`range=None` 整读、`Some` 只读命中块（常量内存 O(块)），
+    /// 逐块重建 + 12×W 对偶校验（坏片由 ChunkReader 留一定位后剔除重建）。
+    /// 单轮语义与旧整片路径对齐——分块读的中间态与真损坏不可区分，故：
+    ///   - 非末轮（`strict=false`）：任何取数失败 → `Ok(None)`（并发覆写窗口，调用方重读 meta）；
+    ///   - 末轮：全对象无任何分块可读 → `Ok(None)`（目录确实不在 → 调用方报 NoSuchKey）；
+    ///     有字节落盘的不足/损坏（含多片同时损坏、定位失败）→ `Err(CorruptMeta)` fail-closed。
+    ///
+    /// 整读做 SHA256 终验 + 读时修（按「片」整片回写，见 `repair_shards_chunked`）；
+    /// 区间读只经逐块对偶校验、不做修复（修复归整读/`heal`）。
+    async fn read_ec_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        v: &Version,
+        l: &meta::DataLayout,
+        range: Option<std::ops::Range<u64>>,
         strict: bool,
     ) -> Result<Option<Bytes>> {
         let cfg = ec::EcConfig {
@@ -234,192 +369,293 @@ impl Store {
             parity: l.parity,
             ..Default::default()
         };
-        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(l.shards.len());
-        // 缺失/坏片的下标（读时修的输入）
-        let mut missing: Vec<usize> = Vec::new();
-        // 读到过 CRC32C/长度不符的字节：区分「全片消失」（可能并发窗口/真删）与「片坏掉」（真损坏）
-        let mut bad_bytes = false;
-        for (i, s) in l.shards.iter().enumerate() {
-            // 落点解析：单机 = 本机盘下标（越界视同缺失，防呆）；集群 = 本机盘 / 远端槽位
-            let drive = match self.shard_target(s) {
-                Some(drives::ShardTarget::Local { drive, .. }) => drive,
-                Some(drives::ShardTarget::Remote { node, .. }) => {
-                    // read_shard RPC：对端不可达/超时 ≡ 该片缺失（EC 重建兜底）
-                    let got = match self.mesh_transport() {
-                        Some(t) => {
-                            let r = crate::mesh::ShardRead {
-                                bucket: bucket.into(),
-                                key: key.into(),
-                                uuid: v.part.uuid.clone(),
-                                part: s.part as u32,
-                                shard: i as u32,
-                            };
-                            match t.read_shard(node, r).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        node,
-                                        shard = i,
-                                        error = %e,
-                                        "远端分片读取失败，视同缺失"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        None => None,
+        let data = cfg.data as usize;
+        let total = (cfg.data + cfg.parity) as usize;
+        let ss = l.shard_size;
+        if ss == 0 || l.shards.len() != total {
+            return Err(Error::CorruptMeta(format!(
+                "EC 布局非法：shard_size={ss} 片数={}（期望 {total}）",
+                l.shards.len()
+            )));
+        }
+        let blocks = ss.div_ceil(ec::CHUNK_W as u64);
+        let out_len = match &range {
+            Some(r) => (r.end - r.start) as usize,
+            None => v.size as usize,
+        };
+        let mut out = vec![0u8; out_len];
+        let mut reader = ec::ChunkReader::new(cfg)?;
+        // 缺失的（片,块）——整读完成后按片整片回写
+        let mut missing: Vec<(usize, u64)> = Vec::new();
+        let mut any_bytes = false;
+
+        match &range {
+            None => {
+                // 整读：逐块解码，数据片全部落位
+                for t in 0..blocks {
+                    let Some(chunks) = self
+                        .read_decode_block(
+                            bucket,
+                            key,
+                            v,
+                            l,
+                            &mut reader,
+                            t,
+                            ss,
+                            strict,
+                            &mut any_bytes,
+                            &mut missing,
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
                     };
-                    match got {
-                        Some(b) if ec::crc32c_of(&b) == s.crc32c && b.len() as u64 == s.size => {
-                            shards.push(Some(b.to_vec()));
+                    for (i, c) in chunks.iter().enumerate().take(data) {
+                        let Some(c) = c else {
+                            return Err(Error::CorruptMeta("分块解码未补齐数据片".into()));
+                        };
+                        let obj_start = i as u64 * ss + t * ec::CHUNK_W as u64;
+                        if obj_start >= v.size {
+                            continue;
                         }
-                        Some(_) => {
-                            tracing::warn!(
-                                node,
-                                shard = i,
-                                "远端分片校验不符（CRC32C/长度），视同缺失"
+                        // 该片该块的**真实长度**（旧布局末块短于 W；新布局恒为 W）——
+                        // 不裁剪会把补零尾巴覆盖到相邻片段的数据上（旧布局多块实测踩过）
+                        let real_len = (ss - t * ec::CHUNK_W as u64).min(ec::CHUNK_W as u64);
+                        let obj_end = (obj_start + real_len).min(v.size);
+                        out[obj_start as usize..obj_end as usize]
+                            .copy_from_slice(&c[..(obj_end - obj_start) as usize]);
+                    }
+                }
+            }
+            Some(r) => {
+                // 区间读：「(片段 s, 块 t) 对」迭代——对象偏移 o 的落位 = (o/ss, (o%ss)/W)。
+                // s0..s1 为区间覆盖的片段；块解码按 t 去重（一块 12 片读一次，服务所有片段）。
+                // 代价注记：**跨片段大区间**会解码 [0, blocks) 全部块（IO ≈ 整对象，内存仍
+                // O(块)）；单片段区间是精确命中读——常见 Range 都在单片段内。
+                let s0 = r.start / ss;
+                let s1 = r.end.saturating_sub(1) / ss;
+                let w = ec::CHUNK_W as u64;
+                let ta0 = (r.start - s0 * ss) / w;
+                let tb1 = (r.end.saturating_sub(1) - s1 * ss) / w;
+                let (t_min, t_max) = if s1 > s0 {
+                    (0, blocks.saturating_sub(1))
+                } else {
+                    (ta0, tb1)
+                };
+                for t in t_min..=t_max {
+                    let Some(chunks) = self
+                        .read_decode_block(
+                            bucket,
+                            key,
+                            v,
+                            l,
+                            &mut reader,
+                            t,
+                            ss,
+                            strict,
+                            &mut any_bytes,
+                            &mut missing,
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    for s in s0..=s1 {
+                        // 首段从 ta0 起、末段到 tb1 止；中间段全覆
+                        if !(s > s0 || t >= ta0) || !(s < s1 || t <= tb1) {
+                            continue;
+                        }
+                        if s as usize >= data {
+                            continue; // 区间在补零尾段（r.end ≤ size 时不会发生，防呆）
+                        }
+                        let obj_start = s * ss + t * w;
+                        if obj_start >= v.size {
+                            continue;
+                        }
+                        // 同整读分支：该片该块真实长度（旧布局末块可短于 W）
+                        let real_len = (ss - t * w).min(w);
+                        let obj_end = (obj_start + real_len).min(v.size);
+                        let a = r.start.max(obj_start);
+                        let b = r.end.min(obj_end);
+                        if a < b {
+                            let c = chunks[s as usize]
+                                .as_ref()
+                                .ok_or_else(|| Error::CorruptMeta("分块解码未补齐数据片".into()))?;
+                            out[(a - r.start) as usize..(b - r.start) as usize].copy_from_slice(
+                                &c[(a - obj_start) as usize..(b - obj_start) as usize],
                             );
-                            bad_bytes = true;
-                            missing.push(i);
-                            shards.push(None);
-                        }
-                        None => {
-                            missing.push(i);
-                            shards.push(None);
                         }
                     }
-                    continue;
                 }
-                None => {
-                    tracing::warn!(drive = s.drive, "EC 分片槽位越界，视同缺失");
-                    missing.push(i);
-                    shards.push(None);
-                    continue;
-                }
-            };
-            let path = drives::shard_path(drive, bucket, key, &v.part.uuid, s)?;
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => {
-                    if ec::crc32c_of(&bytes) == s.crc32c && bytes.len() as u64 == s.size {
-                        shards.push(Some(bytes));
-                    } else {
-                        tracing::warn!(path = %path.display(), "EC 分片校验不符（CRC32C/长度），视同缺失");
-                        bad_bytes = true;
-                        missing.push(i);
-                        shards.push(None);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    missing.push(i);
-                    shards.push(None);
-                }
-                Err(e) => return Err(e.into()),
             }
         }
-        let present = shards.iter().filter(|s| s.is_some()).count();
-        if present < cfg.data as usize {
-            if !strict {
-                return Ok(None);
+
+        if range.is_none() {
+            // 整读：SHA256 终验（区间读没有整份可校验——逐块对偶已在 decode_block 里承担）
+            if hex::encode(Sha256::digest(&out)) != v.part.sha256 {
+                return Err(Error::CorruptMeta(format!(
+                    "EC 重建后 SHA256 与提交记录不符（对象 {} 字节）",
+                    v.size
+                )));
             }
-            if present == 0 && !bad_bytes {
-                return Ok(None);
+            if !missing.is_empty() {
+                self.repair_shards_chunked(bucket, key, v, l, &out, &missing)
+                    .await;
             }
-            return Err(Error::CorruptMeta(format!(
-                "分片不足：存活 {present} < data {}（读到过坏片字节：{bad_bytes}）",
-                cfg.data
-            )));
         }
-        let padded = ec::reconstruct(&shards, cfg)?;
-        if (padded.len() as u64) < v.size {
-            return Err(Error::CorruptMeta(format!(
-                "EC 重建长度 {} < 对象长度 {}",
-                padded.len(),
-                v.size
-            )));
-        }
-        // 截断到对象长度（move 复用缓冲，不再整份复制）
-        let mut payload = padded;
-        payload.truncate(v.size as usize);
-        if hex::encode(Sha256::digest(&payload)) != v.part.sha256 {
-            return Err(Error::CorruptMeta(format!(
-                "EC 重建后 SHA256 与提交记录不符（对象 {} 字节）",
-                v.size
-            )));
-        }
-        if !missing.is_empty() {
-            self.repair_shards(bucket, key, v, l, &payload, &missing)
-                .await;
-        }
-        Ok(Some(Bytes::from(payload)))
+        Ok(Some(Bytes::from(out)))
     }
 
-    /// 读时修（M2b-2 最小版）：把重建出的数据重新编码，回写缺失/坏片的那个分片文件。
-    /// best-effort——修复失败只 warn（读已成功，绝不因修复失败把读变成错误）。
-    /// ponytail: 无后台 heal / 无 quorum 校验（盘全掉时修复静默失败）；M4 的 heal 任务补全。
-    async fn repair_shards(
+    /// 读时修（M4 切片 2 分块版）：对这次整读里缺失过的片**整片重写**（数据来自本次
+    /// 重建的 payload，逐块重编）。best-effort——修复失败只 warn（读已成功，绝不因修复
+    /// 失败把读变成错误）。本地先探活再写（不得对掉线盘「修复」：挂载点目录仍在父 fs 上，
+    /// 盲写会填满根盘）；远端走 write_shard 分块 RPC。
+    /// ponytail: 无后台 heal / 无 quorum 校验（盘全掉时修复静默失败）；M4 切片 4 的 heal 批量补全。
+    async fn repair_shards_chunked(
         &self,
         bucket: &str,
         key: &str,
         v: &Version,
         l: &meta::DataLayout,
         payload: &[u8],
-        missing: &[usize],
+        missing: &[(usize, u64)],
     ) {
         let cfg = ec::EcConfig {
             data: l.data,
             parity: l.parity,
             ..Default::default()
         };
-        let Ok(shards) = ec::encode(payload, cfg) else {
+        let data = cfg.data as usize;
+        let ss = l.shard_size;
+        let blocks = ss.div_ceil(ec::CHUNK_W as u64);
+        let mut bad: Vec<usize> = missing.iter().map(|(i, _)| *i).collect();
+        bad.sort_unstable();
+        bad.dedup();
+        if bad.is_empty() {
             return;
-        };
-        for &i in missing {
+        }
+        enum Sink {
+            Local {
+                f: tokio::fs::File,
+                path: std::path::PathBuf,
+            },
+            Remote(String),
+            Skip,
+        }
+        let transport = self.mesh_transport();
+        let mut sinks: Vec<(usize, Sink)> = Vec::new();
+        for &i in &bad {
             let Some(s) = l.shards.get(i) else { continue };
-            let drive = match self.shard_target(s) {
-                Some(drives::ShardTarget::Local { drive, .. }) => drive,
-                Some(drives::ShardTarget::Remote { node, .. }) => {
-                    // write_shard RPC 回写（探活 = RPC 本身；读已成功，绝不因修复失败报错）
-                    if let Some(t) = self.mesh_transport() {
-                        let w = crate::mesh::ShardWrite {
-                            bucket: bucket.into(),
-                            key: key.into(),
-                            uuid: v.part.uuid.clone(),
-                            part: s.part as u32,
-                            shard: s.shard as u32,
-                            crc32c: s.crc32c,
-                            data: bytes::Bytes::copy_from_slice(&shards[i]),
+            let sink = match self.shard_target(s) {
+                Some(drives::ShardTarget::Local { drive, .. }) => {
+                    if !drives::drive_up(drive).await {
+                        Sink::Skip
+                    } else {
+                        let path = match drives::shard_path(drive, bucket, key, &v.part.uuid, s) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                sinks.push((i, Sink::Skip));
+                                continue;
+                            }
                         };
-                        if let Err(e) = t.write_shard(node, w).await {
-                            tracing::warn!(node, shard = i, error = %e, "远端读时修回写失败");
+                        let res: Result<tokio::fs::File> = async {
+                            if let Some(parent) = path.parent() {
+                                tokio::fs::create_dir_all(parent).await?;
+                            }
+                            Ok(tokio::fs::File::create(&path).await?)
+                        }
+                        .await;
+                        match res {
+                            Ok(f) => Sink::Local { f, path },
+                            Err(e) => {
+                                tracing::warn!(path = %path.display(), error = %e, "读时修打开失败");
+                                Sink::Skip
+                            }
                         }
                     }
-                    continue;
                 }
-                None => continue,
+                Some(drives::ShardTarget::Remote { node, .. }) => {
+                    if transport.is_some() {
+                        Sink::Remote(node.to_string())
+                    } else {
+                        Sink::Skip
+                    }
+                }
+                None => Sink::Skip,
             };
-            // 存活探测：不得对掉线盘「修复」——挂载点目录仍在父 fs 上，盲写会填满根盘，
-            // 测试里更会直接把「拔走」的盘原地重建（探针语义见 drives::drive_up）
-            if !drives::drive_up(drive).await {
-                continue;
+            sinks.push((i, sink));
+        }
+        let Ok(mut w) = ec::ChunkWriter::new(cfg) else {
+            return;
+        };
+        for t in 0..blocks {
+            // 从内存 payload 散读一块（越界补零——片尾补零即真实片尾内容）
+            let mut ins: Vec<Vec<u8>> = Vec::with_capacity(data);
+            for i in 0..data {
+                let mut c = vec![0u8; ec::CHUNK_W];
+                let start = i as u64 * ss + t * ec::CHUNK_W as u64;
+                if start < payload.len() as u64 {
+                    let take = ((payload.len() as u64 - start).min(ec::CHUNK_W as u64)) as usize;
+                    c[..take].copy_from_slice(&payload[start as usize..start as usize + take]);
+                }
+                ins.push(c);
             }
-            let Ok(path) = drives::shard_path(drive, bucket, key, &v.part.uuid, s) else {
-                continue;
+            let Ok(out) = w.encode_block(&ins) else {
+                return;
             };
-            let res: Result<()> = async {
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+            let is_final = t + 1 == blocks;
+            // 块的真实长度（旧对象末块可短于 W；新对象恒为 W）
+            let real_len = (ss - t * ec::CHUNK_W as u64).min(ec::CHUNK_W as u64) as usize;
+            for (i, sink) in sinks.iter_mut() {
+                let chunk = match out.get(*i) {
+                    Some(c) => &c[..real_len],
+                    None => continue,
+                };
+                match sink {
+                    Sink::Skip => {}
+                    Sink::Local { f, path } => {
+                        let res: Result<()> = async {
+                            f.write_all(chunk).await?;
+                            if is_final {
+                                f.flush().await?;
+                                if self.cfg.fsync {
+                                    f.sync_all().await?;
+                                }
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(e) = res {
+                            tracing::warn!(path = %path.display(), error = %e, "读时修回写失败");
+                            *sink = Sink::Skip;
+                        }
+                    }
+                    Sink::Remote(node) => {
+                        let mut failed = None;
+                        if let Some(tp) = self.mesh_transport() {
+                            let req = crate::mesh::ShardWrite {
+                                bucket: bucket.into(),
+                                key: key.into(),
+                                uuid: v.part.uuid.clone(),
+                                part: l.shards[*i].part as u32,
+                                shard: *i as u32,
+                                crc32c: 0,
+                                data: bytes::Bytes::copy_from_slice(chunk),
+                                chunked: true,
+                                offset: t * ec::CHUNK_W as u64,
+                                chunk_crc32c: ec::crc32c_of(chunk),
+                                is_final,
+                            };
+                            if let Err(e) = tp.write_shard(node, req).await {
+                                failed = Some(e);
+                            }
+                        }
+                        if let Some(e) = failed {
+                            tracing::warn!(node, shard = *i, error = %e, "远端读时修回写失败");
+                            *sink = Sink::Skip;
+                        }
+                    }
                 }
-                let mut f = tokio::fs::File::create(&path).await?;
-                f.write_all(&shards[i]).await?;
-                f.flush().await?;
-                if self.cfg.fsync {
-                    f.sync_all().await?;
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(e) = res {
-                tracing::warn!(path = %path.display(), error = %e, "读时修回写失败");
             }
         }
     }

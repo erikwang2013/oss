@@ -451,9 +451,8 @@ impl Store {
 /// 并对每段做**字节级核验**：段内容与 sidecar 快照（etag/sha256/长度）不符 →
 /// `InvalidPart`（complete 期间被并发重传；核验对象正是即将提交的字节，竞态在核验点收口）。
 ///
-/// 逐块读、不整份进内存——内存峰值留给 `stage_payload` 的 encode 一步（与单段 PUT 同口径；
-/// ponytail: complete 的整体峰值 ≈ 2.5× 对象，P 级大对象受此限制，ShardByShard 流式编码是
-/// M2b-3 之后的升级路径）。
+/// 逐块读、不整份进内存；`stage_payload` 的 encode 一步自 M4 切片 2 起也是逐块流式——
+/// complete 全链路常量内存（块缓冲 ≈1.3 MiB，与对象大小无关）。
 fn concat_stream_verified(snapshots: Vec<(u16, PathBuf, PartMeta)>) -> ByteStream {
     type Cur = (tokio::fs::File, Md5, sha2::Sha256, u64);
     type St = (

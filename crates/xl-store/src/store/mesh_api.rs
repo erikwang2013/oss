@@ -96,19 +96,48 @@ impl Store {
     }
 
     /// 幂等分片写（服务端）：**先验 CRC32C 再落盘**（等同本地落盘强度，防腐坏入库）。
+    /// 整片语义（`chunked=false`）行为与 M3 完全一致；分块语义（`chunked=true`）按
+    /// `(offset, chunk_crc32c, is_final)` 定位写、逐块校验、末块 fsync。
     pub async fn mesh_write_shard(&self, w: crate::mesh::ShardWrite) -> Result<()> {
-        if ec::crc32c_of(&w.data) != w.crc32c {
-            return Err(Error::Encode(format!(
-                "分片 CRC32C 不符（{}:{} shard {}）——拒收",
-                w.bucket, w.key, w.shard
-            )));
-        }
         let slot = self.local_slot_of_shard(w.shard as u8)?;
         let drive = self.local_drive_of_slot(slot)?;
         let dir = layout::object_dir(drive, &w.bucket, &w.key)?.join(&w.uuid);
         tokio::fs::create_dir_all(&dir).await?;
         // 与 drives::shard_path 同式（part.<part>.<shard>）
         let path = dir.join(format!("part.{}.{}", w.part, w.shard));
+        if w.chunked {
+            if ec::crc32c_of(&w.data) != w.chunk_crc32c {
+                return Err(Error::Encode(format!(
+                    "分块 CRC32C 不符（{}:{} shard {} @{}）——拒收",
+                    w.bucket, w.key, w.shard, w.offset
+                )));
+            }
+            // 定位写（重试从头幂等：offset=0 先截断，避免旧尾巴残留）
+            let mut f = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .await?;
+            if w.offset == 0 {
+                f.set_len(0).await?;
+            }
+            tokio::io::AsyncSeekExt::seek(&mut f, std::io::SeekFrom::Start(w.offset)).await?;
+            f.write_all(&w.data).await?;
+            f.flush().await?;
+            if w.is_final && self.cfg.fsync {
+                f.sync_all().await?;
+                // 版本目录 fsync：分片目录项先于 meta 翻转持久（与本机落片同序）
+                Store::sync_dir(&dir).await;
+            }
+            return Ok(());
+        }
+        if ec::crc32c_of(&w.data) != w.crc32c {
+            return Err(Error::Encode(format!(
+                "分片 CRC32C 不符（{}:{} shard {}）——拒收",
+                w.bucket, w.key, w.shard
+            )));
+        }
         let mut f = tokio::fs::File::create(&path).await?;
         f.write_all(&w.data).await?;
         f.flush().await?;
@@ -121,15 +150,41 @@ impl Store {
     }
 
     /// 分片读（服务端）：缺失 → Ok(None)（调用方视同该片缺失）；本机 IO 错误 → Err。
+    /// `length=0` = 整片（旧语义）；分块读 `[offset, offset+length)`，短读（半截件）视同缺失。
     pub async fn mesh_read_shard(&self, r: crate::mesh::ShardRead) -> Result<Option<bytes::Bytes>> {
         let slot = self.local_slot_of_shard(r.shard as u8)?;
         let drive = self.local_drive_of_slot(slot)?;
         let path = layout::object_dir(drive, &r.bucket, &r.key)?
             .join(&r.uuid)
             .join(format!("part.{}.{}", r.part, r.shard));
-        match tokio::fs::read(&path).await {
-            Ok(b) => Ok(Some(bytes::Bytes::from(b))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        if r.length == 0 {
+            return match tokio::fs::read(&path).await {
+                Ok(b) => Ok(Some(bytes::Bytes::from(b))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            };
+        }
+        // 分块读上限防呆（信任边界收口）：length 是调用方字段，无界分配 = 1 字节文件 + 巨
+        // length 即可 OOM abort——正常客户端只请求 CHUNK_W，上限给 16 MiB 留未来放宽余地
+        const MAX_BLOCK_READ: u64 = 16 * 1024 * 1024;
+        if r.length > MAX_BLOCK_READ {
+            return Err(Error::Encode(format!(
+                "分块读长度越界：{} > {MAX_BLOCK_READ}",
+                r.length
+            )));
+        }
+        let mut f = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        tokio::io::AsyncSeekExt::seek(&mut f, std::io::SeekFrom::Start(r.offset)).await?;
+        let mut buf = vec![0u8; r.length as usize];
+        use tokio::io::AsyncReadExt as _;
+        match f.read_exact(&mut buf).await {
+            Ok(_) => Ok(Some(bytes::Bytes::from(buf))),
+            // 短读：文件比预期短（崩溃半截/并发回收）——视同该块缺失，交 EC 重建
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e.into()),
         }
     }

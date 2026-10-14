@@ -1175,7 +1175,8 @@ impl Store {
         dst_bucket: &str,
         dst_key: &str,
     ) -> Result<ObjectInfo> {
-        // ponytail: M1 读出整份字节再写回（内存中介，上限同 put）；M2 换分片级服务端复制，不过内存。
+        // ponytail: 读出整份字节再写回（内存中介）。EC 读已分块流式，但 copy 的 Bytes API
+        // 仍物化整份；分片级服务端复制（不过内存）是后续独立项。
         let (info, bytes) = self.get_object(src_bucket, src_key).await?;
         // 默认 metadata-directive=COPY：元数据随对象走（REPLACE 指令不在 M2a 切片）
         self.put_object_with_meta(

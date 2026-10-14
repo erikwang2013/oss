@@ -27,6 +27,13 @@ pub struct ShardWrite {
     pub shard: u32,
     pub crc32c: u32,
     pub data: Bytes,
+    /// M4 切片 2 分块写：true 时忽略 `crc32c`、校验 `chunk_crc32c` 并把 `data` 写到分片
+    /// 文件 `offset` 处（`offset=0` 先截断——重试从头幂等）；`is_final` 时 fsync（含目录）。
+    /// false = 旧整片语义（整片 CRC 校验 + 整写，行为不变）。
+    pub chunked: bool,
+    pub offset: u64,
+    pub chunk_crc32c: u32,
+    pub is_final: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +43,10 @@ pub struct ShardRead {
     pub uuid: String,
     pub part: u32,
     pub shard: u32,
+    /// M4 切片 2：`length=0` = 整片（旧语义）；否则读 `[offset, offset+length)`，
+    /// 短读视同缺失（崩溃半截件由 EC 重建兜底）。
+    pub offset: u64,
+    pub length: u64,
 }
 
 /// 版本目录引用（删除 / 回收两用；UUID 是版本目录名，天然幂等）。

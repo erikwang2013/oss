@@ -278,6 +278,10 @@ impl MeshTransport for TonicMesh {
                 shard: w.shard,
                 crc32c: w.crc32c,
                 data: w.data.to_vec(),
+                chunked: w.chunked,
+                offset: w.offset,
+                chunk_crc32c: w.chunk_crc32c,
+                is_final: w.is_final,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -294,6 +298,8 @@ impl MeshTransport for TonicMesh {
                 uuid: r.uuid,
                 part: r.part,
                 shard: r.shard,
+                offset: r.offset,
+                length: r.length,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -574,6 +580,10 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 shard: w.shard,
                 crc32c: w.crc32c,
                 data: w.data.into(),
+                chunked: w.chunked,
+                offset: w.offset,
+                chunk_crc32c: w.chunk_crc32c,
+                is_final: w.is_final,
             })
             .await
             .map_err(internal)?;
@@ -592,6 +602,8 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 uuid: s.uuid,
                 part: s.part,
                 shard: s.shard,
+                offset: s.offset,
+                length: s.length,
             })
             .await
             .map_err(internal)?;
@@ -981,6 +993,10 @@ mod tests {
             shard: 0,
             crc32c: ec::crc32c_of(&data),
             data: data.clone(),
+            chunked: false,
+            offset: 0,
+            chunk_crc32c: 0,
+            is_final: false,
         };
         mesh.write_shard("n1", sw(3)).await.unwrap();
         let sr = |part| mesh::ShardRead {
@@ -989,6 +1005,8 @@ mod tests {
             uuid: "u1".into(),
             part,
             shard: 0,
+            offset: 0,
+            length: 0,
         };
         assert_eq!(
             mesh.read_shard("n1", sr(3)).await.unwrap().as_deref(),

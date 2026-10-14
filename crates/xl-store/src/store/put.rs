@@ -6,13 +6,36 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
 use sha2::Sha256;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, ChecksumRecord, PartRef, Version, XlMeta};
 
 use super::{ByteStream, ObjectInfo, Store, drives, ec, now_nanos};
+
+/// 散读一块（M4 切片 2）：段式布局下第 i 片第 t 块的输入 = payload `[i·ss + t·W, +W)`
+/// （越界补零）。单盘/多盘两条分块写路径共用；内存 = data×W。
+async fn gather_block(
+    src: &mut tokio::fs::File,
+    size: u64,
+    ss: u64,
+    t: u64,
+    data: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut ins = Vec::with_capacity(data);
+    for i in 0..data {
+        let mut c = vec![0u8; ec::CHUNK_W];
+        let start = i as u64 * ss + t * ec::CHUNK_W as u64;
+        if start < size {
+            let take = (size - start).min(ec::CHUNK_W as u64) as usize;
+            src.seek(std::io::SeekFrom::Start(start)).await?;
+            src.read_exact(&mut c[..take]).await?;
+        }
+        ins.push(c);
+    }
+    Ok(ins)
+}
 
 impl Store {
     pub async fn put_object(
@@ -124,9 +147,9 @@ impl Store {
         let (size, etag, sha256, part_path) = self.harvest_body(tmp, body).await?;
 
         // 2) 收尾转形态。为什么不像任务书最初设想的「收全再分叉」：那会失去流式落盘
-        // 语义（M2a 的握手测试与 README 承诺）。保持「流式写 part.1 → 收全后转」，
-        // 峰值只在 encode 一步（payload + 12 片），S3 路径受 max_put_bytes 约束；
-        // ponytail: aether ingest 大文件同受此峰值，ShardByShard 流式编/解是 M2b-3 之后的升级路径。
+        // 语义（M2a 的握手测试与 README 承诺）。M4 切片 2 起转形态本身也流式：
+        // part.1 散读逐块编（块缓冲 ≈1.3 MiB，**与对象大小无关**），aether ingest 大文件
+        // 同路径同收益。单段 PUT / MPU complete 共用本函数。
         // 0 字节恒内联：EC 对空对象无意义（rs 拒收空片），阈值配成 0 时也不能把空对象送进 EC
         let (data_layout, inline) = if !self.cfg.ec.enabled {
             // enabled=false：M1 旧形态——part.1 原样保留（随 tmp rename 一起就位），无内联无分片
@@ -137,35 +160,47 @@ impl Store {
             tokio::fs::remove_file(&part_path).await?;
             (None, Some(meta::InlineData { bytes }))
         } else {
-            // EC：读回整份 → 编码 → 逐片写 part.1.<shard>（每片 fsync），删 part.1
-            let payload = tokio::fs::read(&part_path).await?;
-            let shards = ec::encode(&payload, self.cfg.ec)?;
-            drop(payload);
-            let mut shard_refs = Vec::with_capacity(shards.len());
-            for (i, s) in shards.iter().enumerate() {
-                let path = tmp.join(format!("part.1.{i}"));
-                let mut f = tokio::fs::File::create(&path).await?;
-                f.write_all(s).await?;
+            // EC 分块编码（M4 切片 2）：常量内存（块缓冲 ≈1.3 MiB，与对象大小无关）——
+            // part.1 散读逐块编 → 逐片写 part.1.<shard>（整片 fsync 在末块后一次），删 part.1
+            let data = self.cfg.ec.data as usize;
+            let total = data + self.cfg.ec.parity as usize;
+            let blocks = size.div_ceil((data * ec::CHUNK_W) as u64);
+            let ss = blocks * ec::CHUNK_W as u64;
+            let mut w = ec::ChunkWriter::new(self.cfg.ec)?;
+            let mut src = tokio::fs::File::open(&part_path).await?;
+            let mut files = Vec::with_capacity(total);
+            for i in 0..total {
+                files.push(tokio::fs::File::create(tmp.join(format!("part.1.{i}"))).await?);
+            }
+            for t in 0..blocks {
+                let ins = gather_block(&mut src, size, ss, t, data).await?;
+                let out = w.encode_block(&ins)?;
+                for (i, chunk) in out.iter().enumerate() {
+                    files[i].write_all(chunk).await?;
+                }
+            }
+            for f in &mut files {
                 f.flush().await?;
                 if self.cfg.fsync {
                     f.sync_all().await?;
                 }
-                drop(f);
-                shard_refs.push(meta::ShardRef {
+            }
+            drop(files);
+            tokio::fs::remove_file(&part_path).await?;
+            let shard_refs = (0..total)
+                .map(|i| meta::ShardRef {
                     drive: 0,
                     part: 1,
                     shard: i as u8,
-                    size: s.len() as u64,
-                    crc32c: ec::crc32c_of(s),
-                });
-            }
-            tokio::fs::remove_file(&part_path).await?;
-            let shard_size = shards.first().map_or(0, Vec::len) as u64;
+                    size: ss,
+                    crc32c: w.shard_crc(i),
+                })
+                .collect();
             (
                 Some(meta::DataLayout {
                     data: self.cfg.ec.data,
                     parity: self.cfg.ec.parity,
-                    shard_size,
+                    shard_size: ss,
                     shards: shard_refs,
                 }),
                 None,
@@ -218,50 +253,110 @@ impl Store {
             ));
         }
 
-        let payload = tokio::fs::read(&part_path).await?;
-        let shards = ec::encode(&payload, self.cfg.ec)?;
-        drop(payload);
-        tokio::fs::remove_file(&part_path).await?;
+        // M4 切片 2：分块编码（常量内存），分片直写目标槽位。
+        // 每片一条落盘通道；某片任一块失败即该片作废（ok[i]=false），quorum 按「完整片数」计。
+        let data = self.cfg.ec.data as usize;
+        let total = data + self.cfg.ec.parity as usize;
+        let blocks = size.div_ceil((data * ec::CHUNK_W) as u64);
+        let ss = blocks * ec::CHUNK_W as u64;
+        let mut w = ec::ChunkWriter::new(self.cfg.ec)?;
+        let mut src = tokio::fs::File::open(&part_path).await?;
 
+        enum Sink {
+            Local {
+                f: tokio::fs::File,
+                dir: std::path::PathBuf,
+            },
+            Remote(String),
+            Dead,
+        }
         let quorum = self.cfg.ec.data as usize + 1;
-        // 测试专用断电注入（Task 9）：写到第 N 片后 abort()（SIGABRT），复现「提交点前猝死」。
-        // 仅环境变量在场时生效；生产部署不设此变量 = 每次循环多一次 Option 比较，零行为影响。
+        // 测试专用断电注入（Task 9）：第 N 片写完最后一块后 abort()（SIGABRT），复现「提交点前猝死」。
+        // 仅环境变量在场时生效；生产部署不设此变量 = 每块多一次 Option 比较，零行为影响。
         let abort_after: Option<usize> = std::env::var("OSS_TEST_ABORT_AFTER_SHARD")
             .ok()
             .and_then(|v| v.parse().ok());
-        let mut shard_refs = Vec::with_capacity(shards.len());
+        let mut sinks: Vec<Sink> = Vec::with_capacity(total);
         let mut touched: Vec<u16> = Vec::new();
-        let mut landed = 0usize;
-        for (i, s) in shards.iter().enumerate() {
+        // ok[i] = 该片当前仍完整（任一块失败即 false）
+        let mut ok: Vec<bool> = Vec::with_capacity(total);
+        for i in 0..total {
             let slot = self.slot_of_shard(i as u8);
-            let crc = ec::crc32c_of(s);
-            let res: Result<()> = async {
-                match self.slot_target(slot) {
-                    Some(drives::ShardTarget::Local { drive, .. }) => {
-                        // 存活探测（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
-                        if !drives::drive_up(drive).await {
-                            return Err(Error::QuorumUnmet(format!("槽位 {slot} 不在册（跳过）")));
-                        }
+            let alive = match self.slot_target(slot) {
+                Some(drives::ShardTarget::Local { drive, .. }) => {
+                    // 存活探测（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
+                    if !drives::drive_up(drive).await {
+                        tracing::warn!(slot, shard = i, "槽位不在册（跳过）");
+                        sinks.push(Sink::Dead);
+                        false
+                    } else {
                         touched.push(slot);
                         let dir = layout::object_dir(drive, bucket, key)?.join(uuid);
-                        tokio::fs::create_dir_all(&dir).await?;
-                        let mut f =
-                            tokio::fs::File::create(dir.join(format!("part.1.{i}"))).await?;
-                        f.write_all(s).await?;
-                        f.flush().await?;
-                        if self.cfg.fsync {
-                            f.sync_all().await?;
-                            // 版本目录 fsync：分片目录项先于 meta 翻转持久（否则断电后 meta 存在而目录项丢失）
-                            Store::sync_dir(&dir).await;
+                        let opened: Result<tokio::fs::File> = async {
+                            tokio::fs::create_dir_all(&dir).await?;
+                            Ok(tokio::fs::File::create(dir.join(format!("part.1.{i}"))).await?)
                         }
-                        Ok(())
+                        .await;
+                        match opened {
+                            Ok(f) => {
+                                sinks.push(Sink::Local { f, dir });
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(slot, shard = i, error = %e, "本地分片文件打开失败（该片作废）");
+                                sinks.push(Sink::Dead);
+                                false
+                            }
+                        }
                     }
-                    Some(drives::ShardTarget::Remote { node, .. }) => {
-                        // 远程落片（幂等）：服务端先验 CRC32C 再落盘；失败按 quorum 计数消化
+                }
+                Some(drives::ShardTarget::Remote { node, .. }) => {
+                    if self.mesh_transport().is_none() {
+                        return Err(Error::Encode("集群模式未注入 transport".into()));
+                    }
+                    touched.push(slot);
+                    sinks.push(Sink::Remote(node.to_string()));
+                    true
+                }
+                None => {
+                    tracing::warn!(slot, "槽位越界（跳过）");
+                    sinks.push(Sink::Dead);
+                    false
+                }
+            };
+            ok.push(alive);
+        }
+
+        for t in 0..blocks {
+            let ins = gather_block(&mut src, size, ss, t, data).await?;
+            let out = w.encode_block(&ins)?;
+            let is_final = t + 1 == blocks;
+            for (i, chunk) in out.iter().enumerate() {
+                if !ok[i] {
+                    continue;
+                }
+                let res: Result<()> = match &mut sinks[i] {
+                    Sink::Dead => Err(Error::QuorumUnmet("槽位不在册（跳过）".into())),
+                    Sink::Local { f, dir } => {
+                        async {
+                            f.write_all(chunk).await?;
+                            if is_final {
+                                f.flush().await?;
+                                if self.cfg.fsync {
+                                    f.sync_all().await?;
+                                    // 版本目录 fsync：分片目录项先于 meta 翻转持久（否则断电后 meta 存在而目录项丢失）
+                                    Store::sync_dir(dir).await;
+                                }
+                            }
+                            Ok(())
+                        }
+                        .await
+                    }
+                    Sink::Remote(node) => {
+                        // 远程落块（幂等）：服务端逐块验 CRC 再定位写；失败按 quorum 计数消化
                         match self.mesh_transport() {
-                            Some(t) => {
-                                touched.push(slot);
-                                t.write_shard(
+                            Some(tp) => {
+                                tp.write_shard(
                                     node,
                                     crate::mesh::ShardWrite {
                                         bucket: bucket.into(),
@@ -269,8 +364,12 @@ impl Store {
                                         uuid: uuid.into(),
                                         part: 1,
                                         shard: i as u32,
-                                        crc32c: crc,
-                                        data: bytes::Bytes::copy_from_slice(s),
+                                        crc32c: 0,
+                                        data: bytes::Bytes::copy_from_slice(chunk),
+                                        chunked: true,
+                                        offset: t * ec::CHUNK_W as u64,
+                                        chunk_crc32c: ec::crc32c_of(chunk),
+                                        is_final,
                                     },
                                 )
                                 .await
@@ -278,27 +377,19 @@ impl Store {
                             None => Err(Error::Encode("集群模式未注入 transport".into())),
                         }
                     }
-                    None => Err(Error::Encode(format!("槽位 {slot} 越界"))),
+                };
+                if let Err(e) = res {
+                    tracing::warn!(slot = self.slot_of_shard(i as u8), shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
+                    ok[i] = false;
                 }
-            }
-            .await;
-            match res {
-                Ok(()) => landed += 1,
-                Err(e) => {
-                    tracing::warn!(slot, shard = i, error = %e, "分片落盘失败（quorum 计数中）");
+                if abort_after == Some(i) && is_final {
+                    std::process::abort();
                 }
-            }
-            shard_refs.push(meta::ShardRef {
-                drive: slot as u8,
-                part: 1,
-                shard: i as u8,
-                size: s.len() as u64,
-                crc32c: crc,
-            });
-            if abort_after == Some(i) {
-                std::process::abort();
             }
         }
+        tokio::fs::remove_file(&part_path).await?;
+
+        let landed = ok.iter().filter(|v| **v).count();
         if landed < quorum {
             for &slot in &touched {
                 match self.slot_target(slot) {
@@ -315,11 +406,18 @@ impl Store {
             self.mesh_rollback_remote(bucket, key, uuid).await;
             self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
-                "分片存活 {landed} < {}（已回滚 {touched:?}）",
-                quorum
+                "分片存活 {landed} < {quorum}（已回滚 {touched:?}）"
             )));
         }
-        let shard_size = shards.first().map_or(0, Vec::len) as u64;
+        let shard_refs = (0..total)
+            .map(|i| meta::ShardRef {
+                drive: self.slot_of_shard(i as u8) as u8,
+                part: 1,
+                shard: i as u8,
+                size: ss,
+                crc32c: w.shard_crc(i),
+            })
+            .collect();
         Ok((
             size,
             etag,
@@ -327,7 +425,7 @@ impl Store {
             Some(meta::DataLayout {
                 data: self.cfg.ec.data,
                 parity: self.cfg.ec.parity,
-                shard_size,
+                shard_size: ss,
                 shards: shard_refs,
             }),
             None,

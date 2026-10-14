@@ -2,8 +2,8 @@
 //!
 //! 四个注入点（评审扩充：覆盖两阶段 meta 提交的两个核心窗口），全部走同一测试二进制重入：
 //!   PHASE=1：建桶 + 写 v1（k / k3 / k4 三个对象），正常退出；
-//!   PHASE=2：写 k 的 v2，`OSS_TEST_ABORT_AFTER_SHARD=8` → 第 8 片落盘后 abort
-//!            （分片阶段窗口：数据半写、meta 未碰）；
+//!   PHASE=2：写 k 的 v2，`OSS_TEST_ABORT_AFTER_SHARD=8` → 第 8 片**全部块**落盘后 abort
+//!            （M4 分块化后注入点=该片末块；窗口：其余片半写/未写、meta 未碰）；
 //!   PHASE=3：写 k3 的 v2，`OSS_TEST_ABORT_META_PREPARE=1` → 两阶段提交「准备完成、一盘未翻」时 abort；
 //!   PHASE=4：写 k4 的 v2，`OSS_TEST_ABORT_META_FLIP_K=3` → 翻到第 3 盘时 abort（部分盘已提交）。
 //! 父进程断言见各段注释。

@@ -269,6 +269,8 @@ impl Store {
                                 uuid: uuid.clone(),
                                 part: s.part as u32,
                                 shard: s.shard as u32,
+                                offset: 0,
+                                length: 0, // 整片（fsck 全量校验语义）
                             };
                             match t.read_shard(node, req).await {
                                 Ok(Some(bytes)) => {

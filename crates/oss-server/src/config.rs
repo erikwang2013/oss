@@ -20,7 +20,8 @@ pub struct AppConfig {
     pub database_url: String,
     pub jwt_secret: String,
     /// 单个 S3 PutObject 允许的最大字节数（内存上限）。
-    /// ponytail: M1 整份读进内存；M2 换流式后可删掉这个上限。
+    /// ponytail: 存储内核自 M4 切片 2 起分块流式，此值更多是**防护上限**（挡异常客户端
+    /// 的超大单请求），不再是内存必要约束；要放宽时按业务调整。
     #[serde(default = "default_put_limit")]
     pub max_put_bytes: usize,
     #[serde(default)]
