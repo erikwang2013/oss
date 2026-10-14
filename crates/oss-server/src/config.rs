@@ -113,4 +113,252 @@ impl AppConfig {
             .find(|g| g.group == group)
             .map(|g| g.bucket.as_str())
     }
+
+    /// 密钥兜底解析（容器/无人值守部署；**显式填写优先，绝不覆盖**）：
+    /// - 空 `jwt_secret` / 空集群 `secret` / 缺管理员口令 → 优先复用 `OSS_SECRETS_FILE`
+    ///   已有值，缺失才生成（64 hex = 32 字节）；文件用 flock 串行化——
+    ///   集群多节点并发首启共享同一份（后到者阻塞后重读，不会各生成一套）。
+    /// - 未设文件：单机允许进程内生成（warn，重启即换）；**集群一律报错**——
+    ///   各节点随机值 mesh 鉴权互不相认，属静默致命。
+    /// - 管理员口令：`OSS_ADMIN_PASSWORD` 非空优先；空/缺**且配了文件**才生成（单机裸跑
+    ///   行为不变：无口令就不引导管理员）。
+    pub fn resolve_secrets(&mut self) -> Result<ResolvedSecrets, String> {
+        let file = std::env::var("OSS_SECRETS_FILE")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
+        let admin_env = std::env::var("OSS_ADMIN_PASSWORD").ok();
+        self.resolve_secrets_with(
+            file.as_deref().map(std::path::Path::new),
+            admin_env.as_deref(),
+        )
+    }
+
+    /// 与 [`Self::resolve_secrets`] 同逻辑，但文件/环境显式传入（可单测，不碰进程环境）。
+    pub(crate) fn resolve_secrets_with(
+        &mut self,
+        file: Option<&std::path::Path>,
+        admin_env: Option<&str>,
+    ) -> Result<ResolvedSecrets, String> {
+        let need_jwt = self.jwt_secret.is_empty();
+        let need_cluster = self.cluster.as_ref().is_some_and(|c| c.secret.is_empty());
+        let need_admin = admin_env.map(|s| s.is_empty()).unwrap_or(true) && file.is_some();
+
+        let mut out = ResolvedSecrets {
+            admin_password: admin_env.filter(|s| !s.is_empty()).map(str::to_string),
+            generated: false,
+            secrets_file: file.map(std::path::Path::to_path_buf),
+        };
+        if !(need_jwt || need_cluster || need_admin) {
+            return Ok(out);
+        }
+        if file.is_none() && (need_jwt || need_cluster) && self.cluster.is_some() {
+            return Err(
+                "集群的 jwt_secret/secret 未填写且未设 OSS_SECRETS_FILE——各节点必须共享同一份密钥（docker 栈已自动配置该文件）".into(),
+            );
+        }
+
+        let mut have = std::collections::BTreeMap::<String, String>::new();
+        let mut lock_file: Option<std::fs::File> = None;
+        if let Some(f) = file {
+            if let Some(dir) = f.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let fh = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false) // 只复用不截断：已有值要重读；覆盖写发生在取得锁之后
+                .open(f)
+                .map_err(|e| format!("打开密钥文件 {} 失败: {e}", f.display()))?;
+            // 跨进程串行：并发首启时后到者在锁上阻塞，重读拿到先到者已写入的同一份
+            fh.lock()
+                .map_err(|e| format!("锁密钥文件 {} 失败: {e}", f.display()))?;
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    let v = v.trim().trim_matches('"');
+                    if !v.is_empty() {
+                        have.insert(k.trim().to_string(), v.to_string());
+                    }
+                }
+            }
+            lock_file = Some(fh);
+        }
+
+        if need_jwt {
+            self.jwt_secret = get_or_gen(&mut have, "JWT_SECRET", &mut out.generated);
+        }
+        if need_cluster && let Some(c) = self.cluster.as_mut() {
+            c.secret = get_or_gen(&mut have, "CLUSTER_SECRET", &mut out.generated);
+        }
+        if need_admin {
+            out.admin_password = Some(get_or_gen(&mut have, "ADMIN_PASSWORD", &mut out.generated));
+        }
+
+        match (file, out.generated) {
+            (Some(f), true) => {
+                std::fs::write(f, render_secrets(&have))
+                    .map_err(|e| format!("写密钥文件 {} 失败: {e}", f.display()))?;
+                #[cfg(unix)]
+                {
+                    // 0644：容器内 oss(10001) 落盘、宿主用户（UID 多半不同）需直读口令——
+                    // 0600 会让「本地保存一份」变成只有 docker exec 才看得到。
+                    // 文件在 gitignore 的宿主目录内，能碰它的用户本就握有 docker（root 等价）。
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644));
+                }
+                drop(lock_file);
+            }
+            (Some(_), false) => drop(lock_file),
+            (None, true) => tracing::warn!(
+                "密钥未填且未设 OSS_SECRETS_FILE——本次进程内随机生成，重启即更换（生产请设置该环境变量）"
+            ),
+            (None, false) => {}
+        }
+        Ok(out)
+    }
+}
+
+/// [`AppConfig::resolve_secrets`] 的返回值。
+#[derive(Debug)]
+pub struct ResolvedSecrets {
+    /// 管理员引导口令（环境变量优先；配了密钥文件时可能是生成值）。None = 不引导。
+    pub admin_password: Option<String>,
+    /// 本次是否发生生成（调用方可据此提示「口令见文件」）。
+    pub generated: bool,
+    pub secrets_file: Option<std::path::PathBuf>,
+}
+
+/// 复用已有值；缺失则生成（64 hex = 32 字节，满足 jwt ≥32B 与集群令牌要求）。
+fn get_or_gen(
+    have: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+    generated: &mut bool,
+) -> String {
+    if let Some(v) = have.get(key) {
+        return v.clone();
+    }
+    *generated = true;
+    let v = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    have.insert(key.to_string(), v.clone());
+    v
+}
+
+fn render_secrets(have: &std::collections::BTreeMap<String, String>) -> String {
+    let mut s = String::from(
+        "# oss 自动生成的密钥（首次启动生成并保存；删除本文件可整体轮换，集群各节点共享同一份）\n\
+         # 想用自有值：直接改这里，或在 oss.toml / 环境变量里显式填写（显式值优先）\n",
+    );
+    for k in ["JWT_SECRET", "CLUSTER_SECRET", "ADMIN_PASSWORD"] {
+        if let Some(v) = have.get(k) {
+            s.push_str(k);
+            s.push('=');
+            s.push_str(v);
+            s.push('\n');
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cfg() -> AppConfig {
+        AppConfig {
+            listen: "127.0.0.1:0".into(),
+            data_dir: "d".into(),
+            data_dirs: None,
+            ec: Default::default(),
+            staging_dir: "s".into(),
+            database_url: "sqlite::memory:".into(),
+            jwt_secret: String::new(),
+            max_put_bytes: 1024,
+            groups: vec![],
+            cluster: None,
+        }
+    }
+
+    fn cluster_cfg() -> AppConfig {
+        let mut c = base_cfg();
+        c.cluster = Some(ClusterToml {
+            node_id: "n1".into(),
+            secret: String::new(),
+            nodes: vec![],
+        });
+        c
+    }
+
+    /// 显式填写优先：已有值一律不动，管理员口令走环境。
+    #[test]
+    fn resolve_keeps_explicit_values_untouched() {
+        let mut c = base_cfg();
+        c.jwt_secret = "explicit-32-bytes-secret-value-abcdef".into();
+        let r = c.resolve_secrets_with(None, Some("pw")).unwrap();
+        assert!(!r.generated);
+        assert_eq!(c.jwt_secret, "explicit-32-bytes-secret-value-abcdef");
+        assert_eq!(r.admin_password.as_deref(), Some("pw"));
+    }
+
+    /// 首启生成并落盘；二启（模拟重启/集群另一节点）复用同一份（flock 串行化的同进程面）。
+    #[test]
+    fn resolve_generates_persists_and_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secrets.env");
+
+        let mut c1 = cluster_cfg();
+        let r1 = c1.resolve_secrets_with(Some(&f), None).unwrap();
+        assert!(r1.generated);
+        assert_eq!(c1.jwt_secret.len(), 64, "32 字节 hex");
+        assert_eq!(c1.cluster.as_ref().unwrap().secret.len(), 64);
+        assert!(f.exists(), "应落盘到本地");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "宿主用户需可直读（权限=0644）"
+            );
+        }
+        let jwt1 = c1.jwt_secret.clone();
+        let cluster1 = c1.cluster.as_ref().unwrap().secret.clone();
+        let admin1 = r1.admin_password.clone().unwrap();
+
+        let mut c2 = cluster_cfg();
+        let r2 = c2.resolve_secrets_with(Some(&f), None).unwrap();
+        assert!(!r2.generated, "已有值不应触发再生成");
+        assert_eq!(c2.jwt_secret, jwt1);
+        assert_eq!(c2.cluster.as_ref().unwrap().secret, cluster1);
+        assert_eq!(r2.admin_password.unwrap(), admin1);
+    }
+
+    /// 集群密钥缺失且未配文件 → 报错（各节点随机值会静默破坏 mesh 鉴权）。
+    #[test]
+    fn resolve_cluster_without_file_errors() {
+        let mut c = cluster_cfg();
+        let e = c.resolve_secrets_with(None, None).unwrap_err();
+        assert!(e.contains("OSS_SECRETS_FILE"), "{e}");
+    }
+
+    /// 单机无文件：进程内生成 jwt（warn），但不生成管理员口令（保持裸跑不引导语义）。
+    #[test]
+    fn resolve_single_without_file_generates_in_memory_only() {
+        let mut c = base_cfg();
+        let r = c.resolve_secrets_with(None, None).unwrap();
+        assert!(r.generated);
+        assert_eq!(c.jwt_secret.len(), 64);
+        assert!(
+            r.admin_password.is_none(),
+            "无文件时不生成管理员口令（裸跑无口令即不引导）"
+        );
+    }
 }

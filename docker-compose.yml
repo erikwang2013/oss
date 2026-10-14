@@ -7,12 +7,16 @@ services:
     image: oss-server:dev
     environment:
       OSS_ADMIN_USER: erik
-      OSS_ADMIN_PASSWORD: pw   # 首启引导管理员；已存在则忽略。生产必改（连同 jwt_secret）
+      # 密钥没填（oss.toml 留空）就自动生成并落盘 ./docker/secrets/generated.env：
+      # 宿主可直读（cat 看管理员口令），重启复用；删文件=整体轮换。
+      OSS_SECRETS_FILE: /secrets/generated.env
     ports:
       - "9000:9000"
     volumes:
       - oss-data:/data
       - oss-staging:/staging
+      # 自动生成的密钥落这里（宿主可见；已 gitignore）
+      - ./docker/secrets:/secrets
       # 改配置改这里（只读挂载覆盖镜像内默认 /app/oss.toml）
       - ./docker/oss.toml:/app/oss.toml:ro
     restart: unless-stopped

@@ -16,19 +16,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 10001 oss
 WORKDIR /app
 COPY --from=build /oss-server-bin /usr/local/bin/oss-server
+COPY docker/entrypoint.sh /usr/local/bin/oss-entrypoint
 # 默认单机配置（compose 可只读挂载覆盖：docker/oss.toml 或 docker/cluster/n*/oss.toml）
 COPY docker/oss.toml /app/oss.toml
-RUN mkdir -p /data /staging && chown -R oss:oss /data /staging /app
-USER oss
+RUN chmod +x /usr/local/bin/oss-entrypoint \
+    && mkdir -p /data /staging && chown -R oss:oss /data /staging /app
 EXPOSE 9000
-# 首启引导管理员（已存在则忽略）；生产请改口令与 jwt_secret（见 README）
-ENV OSS_ADMIN_USER=erik \
-    OSS_ADMIN_PASSWORD=pw
+# 首启引导管理员（已存在则忽略）。口令来源：OSS_ADMIN_PASSWORD，或在配了
+# OSS_SECRETS_FILE 时自动生成并落盘（docker 栈即此路径；见 README「Docker」）。
+ENV OSS_ADMIN_USER=erik
 VOLUME ["/data", "/staging"]
-ENTRYPOINT ["oss-server"]
+# root 起步：入口脚本修正 /secrets 属主后 gosu 降权到 oss 运行（服务进程不以 root 跑）
+ENTRYPOINT ["oss-entrypoint"]
 CMD ["serve"]

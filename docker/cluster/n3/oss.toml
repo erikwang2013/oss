@@ -6,12 +6,12 @@ data_dir = "/data/d0"
 data_dirs = ["/data/d0", "/data/d1", "/data/d2"]
 staging_dir = "/staging"
 database_url = "sqlite:///data/oss.db?mode=rwc"
-jwt_secret = "docker-dev-change-me-0123456789abcdef"
+jwt_secret = ""
 max_put_bytes = 268435456
 
 [cluster]
 node_id = "n3"
-secret = "docker-dev-cluster-secret"
+secret = ""
 
 [[cluster.nodes]]
 id = "n1"

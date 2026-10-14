@@ -152,7 +152,10 @@ docker compose -f docker-compose.cluster.yml up --build
 ```
 
 - 配置：单机 `docker/oss.toml`；集群 `docker/cluster/n{1..4}/oss.toml`（静态拓扑，注释在文件里）。
-  **生产必改** `jwt_secret` 与集群 `secret`（以及默认管理员口令）。
+- **密钥自动生成**：`jwt_secret` / 集群 `secret` / 管理员口令**没填**就首次启动自动生成（64 hex），
+  落盘宿主 `./docker/secrets/generated.env`——0644 直接 `cat` 看管理员口令，已 gitignore；
+  集群四节点共享同一份（flock 串行化，并发首启收敛到同一份）。**轮换 = 删掉该文件重启**；
+  想用自有值：在 `oss.toml` / `OSS_ADMIN_PASSWORD` 里显式填写（显式值优先，绝不覆盖）。
 - 数据/暂存在具名卷（`docker compose down -v` 才清）；集群每节点独立卷。
 - S3 客户端**直连节点端口**（SigV4/流式不经 nginx）；控制台走 :8080 的反代。
 - 镜像：`Dockerfile`（oss-server release 构建，含 protoc）与 `docker/Dockerfile.web`（vite 构建 + nginx）。

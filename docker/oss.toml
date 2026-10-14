@@ -1,9 +1,9 @@
-# 单机（compose 默认）容器配置。生产必须修改 jwt_secret（≥32 字节）。
+# 单机（compose 默认）容器配置。jwt_secret 留空=首启自动生成并落盘（宿主 ./docker/secrets/generated.env，重启复用；显式值优先）。
 listen = "0.0.0.0:9000"
 data_dir = "/data"
 staging_dir = "/staging"
 database_url = "sqlite:///data/oss.db?mode=rwc"
-jwt_secret = "docker-dev-change-me-0123456789abcdef"
+jwt_secret = ""
 max_put_bytes = 268435456
 
 [[groups]]

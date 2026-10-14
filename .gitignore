@@ -29,6 +29,9 @@ data/
 staging/
 /oss.db*
 
+# docker 栈自动生成的密钥（宿主可直读，明文禁止入库）
+docker/secrets/
+
 # Ruflo local secrets and runtime data
 .env.local
 .env.*.local

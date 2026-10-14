@@ -26,7 +26,9 @@ impl AppState {
     pub async fn load(
         cfg_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let cfg = AppConfig::load(cfg_path)?;
+        let mut cfg = AppConfig::load(cfg_path)?;
+        // 密钥兜底解析（docker/无人值守）：空值 → OSS_SECRETS_FILE 复用/生成落盘（见 config.rs）
+        let secrets = cfg.resolve_secrets()?;
 
         // 盘数组：data_dirs 优先（多盘），否则 data_dir 单盘兼容
         let drives: Vec<PathBuf> = cfg
@@ -116,30 +118,35 @@ impl AppState {
         }
 
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
-        // OSS_ADMIN_USER / OSS_ADMIN_PASSWORD 未设置时不做任何事。
-        // 空凭据一律拒绝建号：空口令账号会被空口令登录命中（M1 的 verify_user 只做哈希比对，无口令强度校验）。
+        // 口令来源：OSS_ADMIN_PASSWORD 非空优先；空/缺时用密钥文件解析值（配了
+        // OSS_SECRETS_FILE 才可能有——docker 栈即此路径，口令随文件落盘）。
+        // 空凭据一律拒绝建号：空口令账号会被空口令登录命中。
         match (
-            std::env::var("OSS_ADMIN_USER"),
-            std::env::var("OSS_ADMIN_PASSWORD"),
+            std::env::var("OSS_ADMIN_USER")
+                .ok()
+                .filter(|u| !u.is_empty()),
+            std::env::var("OSS_ADMIN_PASSWORD")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .or_else(|| secrets.admin_password.clone()),
         ) {
-            (Ok(user), Ok(pass)) if !user.is_empty() && !pass.is_empty() => {
+            (Some(user), Some(pass)) => {
                 // 已存在的同名账号一律不覆盖（含口令不同的情况）
                 if !db.user_exists(&user).await? {
                     db.create_user(&user, &pass, true).await?;
-                    tracing::info!(user = %user, "创建管理员账号");
+                    tracing::info!(
+                        user = %user,
+                        secrets_file = ?secrets.secrets_file,
+                        "创建管理员账号（口令取自环境变量或密钥文件）"
+                    );
                 }
             }
-            (Ok(user), Ok(pass)) => {
+            (Some(_), None) => {
                 tracing::warn!(
-                    user_empty = user.is_empty(),
-                    pass_empty = pass.is_empty(),
-                    "管理员凭据为空字符串，跳过引导（空口令账号会被空登录命中）"
+                    "OSS_ADMIN_USER 已设但无可用口令（环境与密钥文件都没有），跳过管理员引导"
                 );
             }
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-                tracing::warn!("OSS_ADMIN_USER / OSS_ADMIN_PASSWORD 只设置了一个，跳过管理员引导");
-            }
-            (Err(_), Err(_)) => {}
+            _ => {}
         }
 
         // 每个上传分组对应的桶，启动时确保存在（内核 + 控制面各一份记录）。

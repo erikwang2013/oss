@@ -13,6 +13,7 @@ path = "src/main.rs"
 xl-store.workspace = true
 xl-client.workspace = true
 async-trait = "0.1"
+uuid.workspace = true
 xl-s3.workspace = true
 aetherupload-rust.workspace = true
 axum.workspace = true
@@ -32,7 +33,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 toml = "1.1"
 tracing.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 # 测试用独立签发器造边界令牌（换 secret 的伪签、绝对 exp 的过期）：jsonwebtoken 只在测试里被引用。
