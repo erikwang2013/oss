@@ -174,6 +174,7 @@ cd web && npm install && npm run dev
 - 上传复用 aetherupload 自带脚本（分块 / 断线续传 / 秒传），前端不含分片逻辑
 - **子账户**（管理员菜单）：创建/删除子账户、逐桶勾选 读/写/删 授权；子账户登录后只见
   授权桶（菜单无「子账户」页），上传与删除按钮按权限显隐（后端 403 兜底）
+- **集群**（管理员菜单）：模式 / 槽位 / quorum 未达计数 + 节点表 + 拓扑指纹（15s 自刷新）；单机显示单机模式提示
 - **上传落点**：按上传分组落桶（`oss.toml` 的 `[[groups]]`，如 `file` → `files`）；对象名 = 内容的整份 MD5 +
   扩展名，子目录 = UTC 年月（如 `202610/<md5>.bin`）。所以在对象浏览器里是根据内容哈希找文件，不是原始文件名
 - 秒传提示「上传成功（秒传）」表示 0 分块传输
@@ -253,6 +254,16 @@ drive_count = 3
 - **`fsck --repair` 不得与在途分块上传并跑**（无龄期删孤儿会清掉暂存区）。
 - **M3 不支持单机原地升级为多节点**（无 rebalance/搬迁，归 M4）：单机数据要进集群请重新灌入。
 - `data_dirs` 顺序是拓扑的一部分：错位会在启动时被 `.oss.sys/topo` 指纹拒绝（大声失败）。
+
+**观测**：`GET /metrics`（Prometheus 文本；**公开**，注释已写明与 `/health/cluster` 同量级信息）——`oss_quorum_unmet_total{op="write"|"lock"}` ·
+`oss_node_up{node=…}` · `oss_drive_count` · `oss_slot_count`。控制台「集群」页（管理员菜单：模式 / 槽位 / quorum 未达计数 +
+节点表 + 拓扑指纹，15s 自刷新；单机显示单机模式提示）与 `GET /api/v1/cluster/status`（admin；单机优雅降级 `mode:"single"`）同源。
+
+```yaml
+scrape_configs:
+  - job_name: oss
+    static_configs: [{ targets: ['oss:9000'] }]
+```
 
 **已知边界（M3）**：
 - 分块上传（MPU）会话**粘节点**：同一 upload 的后续请求须回到发起节点。

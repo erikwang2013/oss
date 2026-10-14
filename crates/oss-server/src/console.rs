@@ -109,6 +109,8 @@ pub fn routes() -> Router<AppState> {
         .route("/me", get(me))
         .route("/me/password", post(change_my_password))
         .route("/groups", get(list_groups))
+        // 集群状态（管理员；单机优雅降级为 mode:"single"）
+        .route("/cluster/status", get(cluster_status))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
         .route("/buckets/{bucket}/objects", get(list_objects))
@@ -194,6 +196,73 @@ async fn me(State(state): State<AppState>, Extension(payload): Extension<JwtPayl
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
             internal_error()
+        }
+    }
+}
+
+/// 集群状态（admin）：本节点视角的拓扑快照 + 可达性 + quorum 计数。
+/// 单机（无 `[cluster]`）优雅降级：`mode:"single"`，节点表只列本机（不走 mesh 探测）。
+async fn cluster_status(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let (unmet_write, unmet_lock) = state.store.quorum_unmet_counts();
+    let quorum_unmet = serde_json::json!({ "write": unmet_write, "lock": unmet_lock });
+    match state.store.cluster() {
+        Some(c) => {
+            let peers = crate::router::probe_peers(&state).await;
+            let me = c.topo.self_node();
+            let mut nodes = vec![serde_json::json!({
+                "id": me.id, "addr": me.addr, "drive_count": me.drive_count, "up": true,
+            })];
+            for n in &c.topo.nodes {
+                if n.id == me.id {
+                    continue;
+                }
+                let up = peers
+                    .iter()
+                    .find(|(id, _, _)| id == &n.id)
+                    .is_some_and(|(_, up, _)| *up);
+                nodes.push(serde_json::json!({
+                    "id": n.id, "addr": n.addr, "drive_count": n.drive_count, "up": up,
+                }));
+            }
+            Json(serde_json::json!({
+                "mode": "cluster",
+                "node_id": me.id,
+                "slot_count": c.topo.slot_count(),
+                // 本节点首盘（slot=base）在 `.oss.sys/topo` 里的完整记录串——可直接与盘上文件等值比对
+                // （盘上逐盘记录 = 本串，slot 段逐盘 +1；Store::open 按全等校验）
+                "topo_fingerprint": format!(
+                    "v1 slots={} node={} slot={}",
+                    c.topo.slot_count(),
+                    me.id,
+                    c.topo.local_slot_base()
+                ),
+                "nodes": nodes,
+                "quorum_unmet": quorum_unmet,
+            }))
+            .into_response()
+        }
+        None => {
+            let drive_count = state.cfg.data_dirs.as_ref().map(Vec::len).unwrap_or(1);
+            Json(serde_json::json!({
+                "mode": "single",
+                "node_id": serde_json::Value::Null,
+                "slot_count": drive_count,
+                "topo_fingerprint": serde_json::Value::Null,
+                "nodes": [{
+                    "id": "local",
+                    "addr": state.cfg.listen.clone(),
+                    "drive_count": drive_count,
+                    "up": true,
+                }],
+                "quorum_unmet": quorum_unmet,
+            }))
+            .into_response()
         }
     }
 }

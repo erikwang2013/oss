@@ -1,7 +1,7 @@
 import { Navigate, Outlet, createBrowserRouter } from 'react-router-dom'
 import { Avatar, Dropdown, Flex, Layout, Menu, Tag, Typography } from 'antd'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { DatabaseOutlined, KeyOutlined, LogoutOutlined, TeamOutlined, UserOutlined } from '@ant-design/icons'
+import { ClusterOutlined, DatabaseOutlined, KeyOutlined, LogoutOutlined, TeamOutlined, UserOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 import { api, getToken, setToken, type Me } from './api'
 import Mascot from './Mascot'
@@ -10,6 +10,7 @@ import Buckets from './pages/Buckets'
 import Objects from './pages/Objects'
 import Keys from './pages/Keys'
 import Users from './pages/Users'
+import Cluster from './pages/Cluster'
 
 // Shell/RequireAuth 与 router（本文件导出）同文件：Fast Refresh 对它只会整页刷新，
 // 拆文件只增样板，接受这一取舍
@@ -20,7 +21,7 @@ function Shell() {
   // 角色唯一来源：/me（JWT 里只有 sub；401 由 api.ts 全局处理，其余错误由 QueryCache 桥接）
   const { data: me } = useQuery({ queryKey: ['me'], queryFn: () => api<Me>('/api/v1/me') })
   // 选中态：按前缀匹配——三分支起手写三元会在新路由上误亮 /buckets
-  const selected = ['/keys', '/users'].find((p) => loc.pathname.startsWith(p)) ?? '/buckets'
+  const selected = ['/keys', '/users', '/cluster'].find((p) => loc.pathname.startsWith(p)) ?? '/buckets'
 
   const logout = () => {
     setToken(null) // localStorage 与 cookie 同清（api.ts 的 setToken 契约）
@@ -42,9 +43,12 @@ function Shell() {
           items={[
             { key: '/buckets', icon: <DatabaseOutlined />, label: <Link to="/buckets">桶与对象</Link> },
             { key: '/keys', icon: <KeyOutlined />, label: <Link to="/keys">访问密钥</Link> },
-            // 子账户管理仅管理员可见（后端另有 403 兜底）
+            // 子账户管理与集群面板仅管理员可见（后端另有 403 兜底）
             ...(me?.is_admin
-              ? [{ key: '/users', icon: <TeamOutlined />, label: <Link to="/users">子账户</Link> }]
+              ? [
+                  { key: '/users', icon: <TeamOutlined />, label: <Link to="/users">子账户</Link> },
+                  { key: '/cluster', icon: <ClusterOutlined />, label: <Link to="/cluster">集群</Link> },
+                ]
               : []),
           ]}
         />
@@ -114,6 +118,7 @@ export const router = createBrowserRouter([
       { path: '/buckets/:bucket', element: <Objects /> },
       { path: '/keys', element: <Keys /> },
       { path: '/users', element: <Users /> },
+      { path: '/cluster', element: <Cluster /> },
     ],
   },
 ])

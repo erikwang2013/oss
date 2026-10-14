@@ -129,3 +129,21 @@ export interface UserRow {
   created_at: number
   permissions: Permission[]
 }
+
+// ——— 集群状态（console.rs /cluster/status；M4 观测面）———
+
+export interface ClusterNode {
+  id: string
+  addr: string
+  drive_count: number
+  up: boolean
+}
+
+export interface ClusterStatus {
+  mode: 'single' | 'cluster'
+  node_id: string | null
+  slot_count: number
+  topo_fingerprint: string | null
+  nodes: ClusterNode[]
+  quorum_unmet: { write: number; lock: number }
+}

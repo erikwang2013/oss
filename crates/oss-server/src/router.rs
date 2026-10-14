@@ -57,11 +57,101 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         .route("/health/live", get(|| async { "ok" }))
         .route("/health/cluster", get(health_cluster))
         .route("/health/ready", get(health_ready))
+        // Prometheus 文本面（M4 观测面）。公开口径与 /health/* 相同：只暴露节点 id 与
+        // 计数（/health/cluster 本就公开同量级信息）；要收严时在外层套鉴权即可。
+        .route("/metrics", get(metrics))
         .nest("/api/v1", console)
         .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
         .with_state(state);
     Ok(app)
+}
+
+/// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
+/// `/health/cluster`、`/metrics`、`/api/v1/cluster/status` 三处共用一份探测逻辑。
+/// 返回每 peer `(id, up, 在册槽数)`；顺序 = 拓扑顺序（不含本节点；单机为空表）。
+pub(crate) async fn probe_peers(state: &AppState) -> Vec<(String, bool, usize)> {
+    let mut out = Vec::new();
+    let Some(c) = state.store.cluster() else {
+        return out;
+    };
+    let self_node_id = c.topo.self_node().id.clone();
+    for n in &c.topo.nodes {
+        if n.id == self_node_id {
+            continue;
+        }
+        // 单点探测 800ms：就绪探针会被 LB 轮询，要短平快；掉队节点标 down 即可
+        match tokio::time::timeout(Duration::from_millis(800), c.transport.health(&n.id)).await {
+            Ok(Ok(h)) if h.node_id == n.id => out.push((
+                n.id.clone(),
+                true,
+                h.slots.iter().filter(|(_, up)| *up).count(),
+            )),
+            Ok(Ok(h)) => {
+                // 错接线：地址通了但不是声明的节点——按 down 处理并留下显性日志
+                tracing::error!(node = %n.id, reported = %h.node_id, "mesh 节点身份不符（错接线？）");
+                out.push((n.id.clone(), false, 0));
+            }
+            _ => out.push((n.id.clone(), false, 0)),
+        }
+    }
+    out
+}
+
+/// Prometheus 文本面（手写 exposition——十来个指标不值一个依赖树）。
+/// 指标：quorum 未达计数（写/锁）、各节点可达性、本机盘数、全局槽位数。
+async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let local = state.store.mesh_health().await;
+    let (unmet_write, unmet_lock) = state.store.quorum_unmet_counts();
+    let drive_count = local.slots.len();
+    let slot_count = state
+        .store
+        .cluster()
+        .map(|c| c.topo.slot_count())
+        .unwrap_or(drive_count as u16);
+
+    let mut out = String::with_capacity(512);
+    out.push_str("# HELP oss_quorum_unmet_total quorum 未达成次数（写 quorum / 租约锁分列）\n");
+    out.push_str("# TYPE oss_quorum_unmet_total counter\n");
+    out.push_str(&format!(
+        "oss_quorum_unmet_total{{op=\"write\"}} {unmet_write}\n"
+    ));
+    out.push_str(&format!(
+        "oss_quorum_unmet_total{{op=\"lock\"}} {unmet_lock}\n"
+    ));
+    out.push_str("# HELP oss_node_up 本节点视角各节点可达性（自身恒 1）\n");
+    out.push_str("# TYPE oss_node_up gauge\n");
+    out.push_str(&format!(
+        "oss_node_up{{node=\"{}\"}} 1\n",
+        label_escape(&local.node_id)
+    ));
+    for (id, up, _) in probe_peers(&state).await {
+        out.push_str(&format!(
+            "oss_node_up{{node=\"{}\"}} {}\n",
+            label_escape(&id),
+            u8::from(up)
+        ));
+    }
+    out.push_str("# HELP oss_drive_count 本机盘数\n# TYPE oss_drive_count gauge\n");
+    out.push_str(&format!("oss_drive_count {drive_count}\n"));
+    out.push_str(
+        "# HELP oss_slot_count 全局槽位数（单机 = 本机盘数）\n# TYPE oss_slot_count gauge\n",
+    );
+    out.push_str(&format!("oss_slot_count {slot_count}\n"));
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+}
+
+/// Prometheus 标签值转义（配置里的 node id 属半信任输入；坏配置不该产出坏样本行）。
+fn label_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// 集群健康视图：`/health/cluster` 的结构化体与 `/health/ready` 的判定共用一个实现。
@@ -76,30 +166,15 @@ async fn cluster_view(state: &AppState) -> (serde_json::Value, bool, String) {
         "up": true,
         "slots": up_slots(&local),
     })];
+    let peers = probe_peers(state).await;
+    // 单机 = 1（自身即多数）；集群 = 1 + peers
+    let expected = 1 + peers.len();
     let mut reachable = 1usize;
-    let mut expected = 1usize; // 无 cluster = 单节点域（自身即多数）
-    if let Some(c) = state.store.cluster() {
-        expected = c.topo.nodes.len();
-        for n in &c.topo.nodes {
-            if n.id == self_node_id {
-                continue;
-            }
-            // 单点探测 800ms：就绪探针会被 LB 轮询，要短平快；掉队节点标 down 即可
-            match tokio::time::timeout(Duration::from_millis(800), c.transport.health(&n.id)).await
-            {
-                Ok(Ok(h)) if h.node_id == n.id => {
-                    reachable += 1;
-                    nodes
-                        .push(serde_json::json!({ "id": n.id, "up": true, "slots": up_slots(&h) }));
-                }
-                Ok(Ok(h)) => {
-                    // 错接线：地址通了但不是声明的节点——按 down 处理并留下显性日志
-                    tracing::error!(node = %n.id, reported = %h.node_id, "mesh 节点身份不符（错接线？）");
-                    nodes.push(serde_json::json!({ "id": n.id, "up": false, "slots": 0 }));
-                }
-                _ => nodes.push(serde_json::json!({ "id": n.id, "up": false, "slots": 0 })),
-            }
+    for (id, up, slots) in &peers {
+        if *up {
+            reachable += 1;
         }
+        nodes.push(serde_json::json!({ "id": id, "up": up, "slots": slots }));
     }
     let qn = expected / 2 + 1;
     let slot0_up = local.slots.first().is_some_and(|(_, up)| *up);
@@ -178,4 +253,20 @@ async fn handle_s3_error(err: s3s::HttpError) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal error".to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::label_escape;
+
+    /// 标签值转义：坏配置（node id 带引号/反斜杠/换行）不得产出坏样本行。
+    /// 反斜杠必须先转义（先换引号会把 `\"` 里的反斜杠二次转义错）。
+    #[test]
+    fn label_escape_covers_prometheus_metacharacters() {
+        assert_eq!(label_escape("plain"), "plain");
+        assert_eq!(label_escape("a\"b"), "a\\\"b");
+        assert_eq!(label_escape("a\\b"), "a\\\\b");
+        assert_eq!(label_escape("a\nb"), "a\\nb");
+        assert_eq!(label_escape("\\\""), "\\\\\\\"");
+    }
 }
