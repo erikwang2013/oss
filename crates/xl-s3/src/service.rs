@@ -14,7 +14,7 @@ use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
 use xl_store::meta::ChecksumRecord;
-use xl_store::store::{ListRequest, ObjectInfo, Store};
+use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
 
@@ -28,6 +28,17 @@ pub struct OssS3 {
 }
 
 impl OssS3 {
+    /// 桶版本控制是否 Enabled（读 DB；查库失败上抛 500——状态不可知时不写数据）。
+    async fn versioned(&self, bucket: &str) -> S3Result<bool> {
+        match self.acl.bucket_versioning(bucket).await {
+            Ok(s) => Ok(s == "Enabled"),
+            Err(e) => {
+                tracing::error!(error = %e, "读取桶版本控制状态失败");
+                Err(s3s::s3_error!(InternalError, "internal error"))
+            }
+        }
+    }
+
     pub fn new(store: Arc<Store>, acl: crate::access::Acl, max_put_bytes: usize) -> Self {
         Self {
             store,
@@ -454,6 +465,7 @@ impl S3 for OssS3 {
             None => (stream, None),
         };
 
+        let versioned = self.versioned(&bucket).await?;
         let result = self
             .store
             .put_object_stream_with_meta(
@@ -463,6 +475,7 @@ impl S3 for OssS3 {
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
                 checksum_record,
+                versioned,
             )
             .await;
         let info = match result {
@@ -472,6 +485,7 @@ impl S3 for OssS3 {
 
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(info.etag)),
+            version_id: info.version_id.clone(),
             ..Default::default()
         }))
     }
@@ -574,15 +588,17 @@ impl S3 for OssS3 {
             }
             pairs.push((pn as u16, etag.value().to_string()));
         }
+        let versioned = self.versioned(&bucket).await?;
         let info = self
             .store
-            .complete_multipart_upload(&bucket, &key, &upload_id, &pairs)
+            .complete_multipart_upload_versioned(&bucket, &key, &upload_id, &pairs, versioned)
             .await
             .map_err(to_s3_error)?;
         Ok(S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
             e_tag: Some(ETag::Strong(info.etag)),
+            version_id: info.version_id.clone(),
             ..Default::default()
         }))
     }
@@ -636,13 +652,15 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let bucket = req.input.bucket;
         let key = req.input.key;
+        let version_id = req.input.version_id.clone();
 
         // 条件求值需要 info：统一先取一次 head（Range 分支本来也要 size）；条件失败不读盘上数据。
-        let info = self
-            .store
-            .head_object(&bucket, &key)
-            .await
-            .map_err(to_s3_error)?;
+        // M4：带 versionId 时点读该版本（marker 版本 → 405 DeleteMarker，经 to_s3_error）。
+        let info = match &version_id {
+            Some(v) => self.store.head_object_version(&bucket, &key, v).await,
+            None => self.store.head_object(&bucket, &key).await,
+        }
+        .map_err(to_s3_error)?;
         if let Err(status) = eval_preconditions(
             &info,
             req.input.if_match.as_ref(),
@@ -668,28 +686,34 @@ impl S3 for OssS3 {
                 let (start, end) = (rr.start, rr.end);
                 let bytes = if start == 0 && end == info.size {
                     // 显式全段 Range：仍回 206（S3 语义），数据走整读
-                    self.store
-                        .get_object(&bucket, &key)
-                        .await
-                        .map_err(to_s3_error)?
-                        .1
+                    match &version_id {
+                        Some(v) => self.store.get_object_version(&bucket, &key, v).await,
+                        None => self.store.get_object(&bucket, &key).await,
+                    }
+                    .map_err(to_s3_error)?
+                    .1
                 } else {
-                    self.store
-                        .get_object_range(&bucket, &key, start..end)
-                        .await
-                        .map_err(to_s3_error)?
+                    match &version_id {
+                        Some(v) => {
+                            self.store
+                                .get_object_range_version(&bucket, &key, v, start..end)
+                                .await
+                        }
+                        None => self.store.get_object_range(&bucket, &key, start..end).await,
+                    }
+                    .map_err(to_s3_error)?
                 };
                 // check 保证 end >= 1（start <= last < full_length 且区间非空）
                 let cr = format!("bytes {}-{}/{}", start, end - 1, info.size);
                 (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
             }
             None => {
-                let bytes = self
-                    .store
-                    .get_object(&bucket, &key)
-                    .await
-                    .map_err(to_s3_error)?
-                    .1;
+                let bytes = match &version_id {
+                    Some(v) => self.store.get_object_version(&bucket, &key, v).await,
+                    None => self.store.get_object(&bucket, &key).await,
+                }
+                .map_err(to_s3_error)?
+                .1;
                 (bytes, None, StatusCode::OK)
             }
         };
@@ -705,6 +729,8 @@ impl S3 for OssS3 {
             content_range,
             // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
             metadata: Some(info.user_metadata.into_iter().collect()),
+            // 透出实际读到的版本号（点名版本 = 该版本；未点名 = 当前最新）
+            version_id: info.version_id.clone(),
             ..Default::default()
         };
         // response-content-* 是响应头覆盖：客户端给什么值就原样下发（含 &filename= 的 RFC 5987
@@ -747,11 +773,20 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let info = self
-            .store
-            .head_object(&req.input.bucket, &req.input.key)
-            .await
-            .map_err(to_s3_error)?;
+        let version_id = req.input.version_id.clone();
+        let info = match &version_id {
+            Some(v) => {
+                self.store
+                    .head_object_version(&req.input.bucket, &req.input.key, v)
+                    .await
+            }
+            None => {
+                self.store
+                    .head_object(&req.input.bucket, &req.input.key)
+                    .await
+            }
+        }
+        .map_err(to_s3_error)?;
         // 条件与 GET 同口径（§3.3 的「错误一律 404」只罩读错误；304/412 是条件结果，照常返回）
         if let Err(status) = eval_preconditions(
             &info,
@@ -774,6 +809,7 @@ impl S3 for OssS3 {
             e_tag: Some(ETag::Strong(info.etag)),
             last_modified: Some(last_modified(info.last_modified_nanos)),
             metadata: Some(info.user_metadata.into_iter().collect()),
+            version_id: info.version_id.clone(),
             ..Default::default()
         };
         // 校验和回写（HEAD）
@@ -787,11 +823,27 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        self.store
-            .delete_object(&req.input.bucket, &req.input.key)
+        let bucket = req.input.bucket;
+        let key = req.input.key;
+        let vid = req.input.version_id.clone();
+        let versioned = self.versioned(&bucket).await?;
+        let outcome = self
+            .store
+            .delete_object_versioned(&bucket, &key, vid.as_deref(), versioned)
             .await
             .map_err(to_s3_error)?;
-        Ok(S3Response::new(DeleteObjectOutput::default()))
+        // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
+        // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
+        let (dm, vid) = match outcome {
+            DeleteOutcome::Marker { version_id } => (Some(true), Some(version_id)),
+            DeleteOutcome::Version { version_id } => (None, Some(version_id)),
+            DeleteOutcome::Object => (None, None),
+        };
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: dm,
+            version_id: vid,
+            ..Default::default()
+        }))
     }
 
     async fn delete_objects(
@@ -809,14 +861,30 @@ impl S3 for OssS3 {
 
         // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
         // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
+        let versioned = self.versioned(&bucket).await?;
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for obj in req.input.delete.objects {
-            match self.store.delete_object(&bucket, &obj.key).await {
-                Ok(()) => deleted.push(DeletedObject {
-                    key: Some(obj.key),
-                    ..Default::default()
-                }),
+            match self
+                .store
+                .delete_object_versioned(&bucket, &obj.key, obj.version_id.as_deref(), versioned)
+                .await
+            {
+                Ok(outcome) => {
+                    let (dm, dmv, vid) = match outcome {
+                        DeleteOutcome::Marker { version_id } => {
+                            (Some(true), Some(version_id), None)
+                        }
+                        DeleteOutcome::Version { version_id } => (None, None, Some(version_id)),
+                        DeleteOutcome::Object => (None, None, None),
+                    };
+                    deleted.push(DeletedObject {
+                        key: Some(obj.key),
+                        delete_marker: dm,
+                        delete_marker_version_id: dmv,
+                        version_id: vid,
+                    })
+                }
                 Err(e @ (StoreError::NoSuchBucket(_) | StoreError::InvalidBucketName(_))) => {
                     return Err(to_s3_error(e));
                 }
@@ -836,6 +904,154 @@ impl S3 for OssS3 {
         Ok(S3Response::new(DeleteObjectsOutput {
             deleted: (!deleted.is_empty()).then_some(deleted),
             errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let bucket = req.input.bucket;
+        let cfg = req.input.versioning_configuration;
+        // v1：只收 Enabled/Off；Suspended 语义未实现——明确拒绝，不静默接受
+        let current = match self.acl.bucket_versioning(&bucket).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "读桶版本控制状态失败");
+                return Err(s3s::s3_error!(InternalError, "internal error"));
+            }
+        };
+        let stored = match cfg.status.map(|s| s.as_str().to_string()).as_deref() {
+            Some("Enabled") => "Enabled",
+            Some("Off") => {
+                // 单向：已启用的桶不接受改回 Off——写路径会把整链替换成单版本 → 旧版本目录
+                // 成孤儿被 GC 按龄删除（静默丢历史）。停用语义（Suspended）未实现，明确拒绝。
+                if current == "Enabled" {
+                    return Err(s3s::s3_error!(
+                        NotImplemented,
+                        "disabling versioning is not supported"
+                    ));
+                }
+                "Off"
+            }
+            Some("Suspended") => {
+                return Err(s3s::s3_error!(
+                    NotImplemented,
+                    "versioning suspension is not supported"
+                ));
+            }
+            _ => {
+                return Err(s3s::s3_error!(InvalidArgument, "invalid versioning status"));
+            }
+        };
+        match self.acl.set_bucket_versioning(&bucket, stored).await {
+            Ok(true) => Ok(S3Response::new(PutBucketVersioningOutput::default())),
+            Ok(false) => Err(s3s::s3_error!(NoSuchBucket)),
+            Err(e) => {
+                tracing::error!(error = %e, "写桶版本控制状态失败");
+                Err(s3s::s3_error!(InternalError, "internal error"))
+            }
+        }
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        match self.acl.bucket_versioning(&req.input.bucket).await {
+            // 口径注记：未开过版本的桶本系统回 "Off"（AWS 留空）——值域收敛为 Off/Enabled，
+            // aws-cli 展示不受影响（记档边界）
+            Ok(s) => {
+                let status = if s == "Enabled" {
+                    BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)
+                } else {
+                    BucketVersioningStatus::from_static("Off")
+                };
+                Ok(S3Response::new(GetBucketVersioningOutput {
+                    status: Some(status),
+                    ..Default::default()
+                }))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "读桶版本控制状态失败");
+                Err(s3s::s3_error!(InternalError, "internal error"))
+            }
+        }
+    }
+
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let ListObjectVersionsInput {
+            bucket,
+            prefix,
+            max_keys,
+            key_marker,
+            version_id_marker,
+            ..
+        } = req.input;
+        // max-keys<0 同 list_objects_v2 口径（i32 → usize 的 as 会回绕，不猜客户端意图）
+        let max_keys = match max_keys {
+            Some(m) if m < 0 => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "max-keys must not be negative"
+                ));
+            }
+            other => other.map(|m| m as usize),
+        };
+        let vl = self
+            .store
+            .list_object_versions(
+                &bucket,
+                prefix.as_deref().unwrap_or(""),
+                max_keys.unwrap_or(1000),
+                key_marker.as_deref(),
+                version_id_marker.as_deref(),
+            )
+            .await
+            .map_err(to_s3_error)?;
+
+        let versions: Vec<ObjectVersion> = vl
+            .entries
+            .iter()
+            .filter(|e| !e.is_marker)
+            .map(|e| ObjectVersion {
+                key: Some(e.key.clone()),
+                version_id: Some(e.version_id.clone()),
+                is_latest: Some(e.is_latest),
+                e_tag: Some(ETag::Strong(e.etag.clone())),
+                size: Some(e.size as i64),
+                last_modified: Some(last_modified(e.mod_time_nanos)),
+                storage_class: Some(ObjectVersionStorageClass::from_static(
+                    ObjectVersionStorageClass::STANDARD,
+                )),
+                ..Default::default()
+            })
+            .collect();
+        let markers: Vec<DeleteMarkerEntry> = vl
+            .entries
+            .iter()
+            .filter(|e| e.is_marker)
+            .map(|e| DeleteMarkerEntry {
+                key: Some(e.key.clone()),
+                version_id: Some(e.version_id.clone()),
+                is_latest: Some(e.is_latest),
+                last_modified: Some(last_modified(e.mod_time_nanos)),
+                ..Default::default()
+            })
+            .collect();
+
+        Ok(S3Response::new(ListObjectVersionsOutput {
+            name: Some(bucket),
+            prefix,
+            is_truncated: Some(vl.is_truncated),
+            next_key_marker: vl.next_key_marker,
+            next_version_id_marker: vl.next_version_id_marker,
+            versions: (!versions.is_empty()).then_some(versions),
+            delete_markers: (!markers.is_empty()).then_some(markers),
             ..Default::default()
         }))
     }
@@ -919,28 +1135,56 @@ impl S3 for OssS3 {
         let CopySource::Bucket {
             ref bucket,
             ref key,
+            ref version_id,
             ..
         } = req.input.copy_source
         else {
             return Err(s3s::s3_error!(InvalidRequest, "unsupported copy source"));
         };
 
-        // 规格 §3.5 边界：M1 无 metadata-directive REPLACE / 存储类变更概念，
-        // src == dst（同桶同键）一律拒（S3 语义：InvalidRequest）
-        if bucket.as_ref() == req.input.bucket.as_str() && key.as_ref() == req.input.key.as_str() {
+        // 规格 §3.5 边界：同桶同键且**无源版本号**一律拒（S3 语义：InvalidRequest）。
+        // M4 版本控制：`?versionId=` 的同键 copy 是标准回滚惯用法（旧版本 → 新版本），放行。
+        if version_id.is_none()
+            && bucket.as_ref() == req.input.bucket.as_str()
+            && key.as_ref() == req.input.key.as_str()
+        {
             return Err(s3s::s3_error!(
                 InvalidRequest,
                 "copy source and destination are the same"
             ));
         }
 
+        // 源：点名版本（回滚路径）或最新
+        let (src_info, bytes) = match version_id.as_deref() {
+            Some(vid) => self
+                .store
+                .get_object_version(bucket, key, vid)
+                .await
+                .map_err(to_s3_error)?,
+            None => self
+                .store
+                .get_object(bucket, key)
+                .await
+                .map_err(to_s3_error)?,
+        };
+        // 目标桶版本策略随 copy 生效（版本桶 copy 出的是新版本）
+        let dst_versioned = self.versioned(&req.input.bucket).await?;
         let info = self
             .store
-            .copy_object(bucket, key, &req.input.bucket, &req.input.key)
+            .put_object_stream_with_meta(
+                &req.input.bucket,
+                &req.input.key,
+                Box::pin(futures::stream::once(async move { Ok(bytes) })),
+                src_info.content_type,
+                src_info.user_metadata,
+                None,
+                dst_versioned,
+            )
             .await
             .map_err(to_s3_error)?;
 
         Ok(S3Response::new(CopyObjectOutput {
+            version_id: info.version_id.clone(),
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(ETag::Strong(info.etag)),
                 // 与 get/head_object 同一翻译：返回 dst 对象的真实 mtime，不用 now() 冒充

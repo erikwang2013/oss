@@ -125,9 +125,20 @@ impl EventSink for IngestSink {
             let file = tokio::fs::File::open(&resource.path).await?;
             let size = file.metadata().await?.len();
             let stream = ReaderStream::new(file).map(|r| r.map_err(xl_store::error::Error::from));
+            // 版本控制（M4 切片 3）：目标桶 Enabled 时上传也按版本追加（与 S3 面同口径）。
+            // 查库失败上抛（fail-closed：状态不可知时不写数据——不得按非版本桶静默覆写链）
+            let versioned = self.db.get_bucket_versioning(&bucket).await? == "Enabled";
             let info = self
                 .store
-                .put_object_stream(&bucket, &key, Box::pin(stream), None)
+                .put_object_stream_with_meta(
+                    &bucket,
+                    &key,
+                    Box::pin(stream),
+                    None,
+                    Default::default(),
+                    None,
+                    versioned,
+                )
                 .await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((size, info))
         });

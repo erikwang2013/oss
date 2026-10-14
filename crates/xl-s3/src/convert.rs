@@ -17,6 +17,9 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         StoreError::InvalidPartOrder(_) => S3ErrorCode::InvalidPartOrder,
         StoreError::EntityTooSmall(_) => S3ErrorCode::EntityTooSmall,
         StoreError::BadDigest(_) => S3ErrorCode::BadDigest,
+        // 对 delete marker 版本点名 GET/HEAD：405（S3 语义）
+        StoreError::DeleteMarker(_) => S3ErrorCode::MethodNotAllowed,
+        StoreError::InvalidArgument(_) => S3ErrorCode::InvalidArgument,
         // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体
         StoreError::QuorumUnmet(_)
         | StoreError::CorruptMeta(_)

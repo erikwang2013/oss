@@ -25,7 +25,7 @@ pub struct XlMeta {
     pub versions: Vec<Version>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Version {
     /// M1 无版本控制：`Uuid::nil()`（S3 协议层映射为字面量 `"null"`）；M4 起为每版本真实 uuid。
     pub version_id: uuid::Uuid,
@@ -53,6 +53,14 @@ pub struct Version {
     /// M2b：小对象内联（读取端按 `MAX_INLINE` 复核）。
     #[serde(default)]
     pub inline: Option<InlineData>,
+    /// M4 版本控制：delete marker（标记版本无数据；GET 最新见标记 → 404 带 marker 语义）。
+    /// 文件头契约：只加 `Option` 字段，老解码器跳过未知字段、新解码器靠 `serde(default)` 读旧文件。
+    #[serde(default)]
+    pub is_delete_marker: Option<bool>,
+    /// M4 版本控制：是否当前最新（写端每次重写 meta 时全链重算；**读判以链尾为准**——
+    /// 该字段是给 S3 协议响应/未来集群合并用的冗余信息，不参与内部读逻辑）。
+    #[serde(default)]
+    pub is_latest: Option<bool>,
 }
 
 impl Version {
@@ -61,6 +69,20 @@ impl Version {
         match &self.parts {
             Some(parts) => parts.clone(),
             None => vec![self.part.clone()],
+        }
+    }
+
+    /// 是否 delete marker（版本控制）。
+    pub fn delete_marker(&self) -> bool {
+        self.is_delete_marker == Some(true)
+    }
+
+    /// S3 线格式版本号：nil（无版本控制的"null 版本"）→ 字面量 `"null"`。
+    pub fn version_id_str(&self) -> String {
+        if self.version_id.is_nil() {
+            "null".to_string()
+        } else {
+            self.version_id.to_string()
         }
     }
 }
@@ -108,7 +130,7 @@ pub struct InlineData {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PartRef {
     /// 版本目录名（`<对象目录>/<uuid>/`）。
     pub uuid: String,
@@ -195,9 +217,29 @@ impl XlMeta {
         Ok(m)
     }
 
-    /// M1：取唯一的一条。M4 起改为取 is_latest（格式已在 §5.1 预留该字段）。
+    /// 链尾 = 最新（写端追加序不变量；`is_latest` 是重算的冗余位，不参与判定）。
     pub fn latest(&self) -> Option<&Version> {
         self.versions.last()
+    }
+
+    /// 链尾是最新版本且为 delete marker（版本控制桶的对象「已删除」态）。
+    pub fn latest_is_marker(&self) -> bool {
+        self.latest().is_some_and(|v| v.delete_marker())
+    }
+
+    /// 按 S3 线格式版本号找链内版本（`"null"` = nil uuid 的无版本条目）。
+    pub fn find_version(&self, version_id: &str) -> Option<&Version> {
+        self.versions
+            .iter()
+            .find(|v| v.version_id_str() == version_id)
+    }
+
+    /// 全链重算 `is_latest`（每次 meta 改动后、落盘前调用；链尾为 true）。
+    pub fn refresh_latest_flags(&mut self) {
+        let n = self.versions.len();
+        for (i, v) in self.versions.iter_mut().enumerate() {
+            v.is_latest = Some(i + 1 == n);
+        }
     }
 }
 
@@ -234,6 +276,8 @@ mod tests {
                 checksum: None,
                 data_layout: None,
                 inline: None,
+                is_delete_marker: None,
+                is_latest: None,
             }],
         }
     }
@@ -385,14 +429,15 @@ mod tests {
         assert_eq!(bytes[0], FORMAT_VERSION);
         // 已人工核对：首字节 01；version_id 为 bin8（c4 10 + 16 字节全零）；
         // M2a Task 5 起 Version 增加 parts 字段（单段写 nil）、协议补全 Task 3 起增加 checksum 字段
-        //（默认 nil）、M2b Task 3 起增加 data_layout/inline 字段（默认 nil），摘要均按
-        //「有意识更新」流程重算（本次为第三次）。
+        //（默认 nil）、M2b Task 3 起增加 data_layout/inline 字段（默认 nil）、M4 切片 3 起增加
+        // is_delete_marker/is_latest（无版本写 nil——老解码器跳过未知字段 = 前向兼容契约），
+        // 摘要均按「有意识更新」流程重算（本次为第四次）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "f28d2848491af2ee87fad0a6629bc767c52644bc07617f860cbf0af234503ffe"
+            "93f1e1f5326b3198dca9740f9bc74a2c8344d040c886303a445c0277d0c2aa6e"
         );
     }
 }
@@ -419,6 +464,8 @@ mod parts_tests {
             checksum: None,
             data_layout: None,
             inline: None,
+            is_delete_marker: None,
+            is_latest: None,
         }
     }
 

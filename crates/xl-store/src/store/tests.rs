@@ -1767,6 +1767,8 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
                 checksum: None,
                 data_layout: None,
                 inline: Some(meta::InlineData { bytes }),
+                is_delete_marker: None,
+                is_latest: None,
             }],
         }
     };
@@ -2192,6 +2194,8 @@ async fn legacy_parts_form_still_readable() {
         checksum: None,
         data_layout: None,
         inline: None,
+        is_delete_marker: None,
+        is_latest: None,
     };
     let m = XlMeta {
         object_key: "legacy".into(),
@@ -2402,6 +2406,7 @@ async fn meta_roundtrips_checksum_record() {
         None,
         Default::default(),
         Some(rec.clone()),
+        false,
     )
     .await
     .unwrap();
@@ -3407,4 +3412,211 @@ async fn qn_is_strict_majority() {
         let q = n / 2 + 1;
         assert!(2 * q > n, "n={n} q={q} 必须严格多数（交集非空）");
     }
+}
+
+/// 版本控制链全流程（M4 切片 3）：PUT×3 → 点名读/区间读 → delete marker →
+/// 删 marker 恢复 → 点名删版本（目录进 trash）→ 分页 → 链清空整键清理 → 幂等。
+#[tokio::test]
+async fn versioning_chain_full_flow() {
+    use super::version::DeleteOutcome;
+    fn stream_of(b: Bytes) -> ByteStream {
+        Box::pin(futures::stream::once(async move { Ok(b) }))
+    }
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let a = payload(300_000);
+    let b = payload(310_001);
+    let c = payload(320_002);
+    for body in [a.clone(), b.clone(), c.clone()] {
+        s.put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(body),
+            None,
+            Default::default(),
+            None,
+            true, // versioned
+        )
+        .await
+        .unwrap();
+    }
+    let (_, got) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&got[..], &c[..], "普通读 = 最新版本");
+
+    let vl = s
+        .list_object_versions("alpha", "", 1000, None, None)
+        .await
+        .unwrap();
+    assert_eq!(vl.entries.len(), 3);
+    assert_eq!(
+        vl.entries.iter().map(|e| e.size).collect::<Vec<_>>(),
+        vec![c.len() as u64, b.len() as u64, a.len() as u64],
+        "新→旧"
+    );
+    assert!(vl.entries[0].is_latest && !vl.entries[1].is_latest);
+    let v_ids: Vec<String> = vl.entries.iter().map(|e| e.version_id.clone()).collect();
+    assert!(
+        v_ids.iter().all(|v| v != "null" && v.len() == 36),
+        "版本控制版本号应为真 uuid：{v_ids:?}"
+    );
+
+    // 点名读 v2（整读 + 区间）
+    let (info2, got2) = s.get_object_version("alpha", "k", &v_ids[1]).await.unwrap();
+    assert_eq!(info2.size, b.len() as u64);
+    assert_eq!(&got2[..], &b[..]);
+    let r = s
+        .get_object_range_version("alpha", "k", &v_ids[1], 5..25)
+        .await
+        .unwrap();
+    assert_eq!(&r[..], &b[5..25]);
+    // head 指定版本
+    let h1 = s
+        .head_object_version("alpha", "k", &v_ids[2])
+        .await
+        .unwrap();
+    assert_eq!(h1.size, a.len() as u64);
+
+    // delete marker：普通读 404、对象列表不见、版本列表见 marker 为 latest
+    let out = s
+        .delete_object_versioned("alpha", "k", None, true)
+        .await
+        .unwrap();
+    let marker_id = match out {
+        DeleteOutcome::Marker { version_id } => version_id,
+        other => panic!("应得 Marker，实得 {other:?}"),
+    };
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::NoSuchKey(_))
+    ));
+    let ol = s
+        .list_objects("alpha", &ListRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(ol.objects.len(), 0, "marker 遮住整键");
+    let vl = s
+        .list_object_versions("alpha", "", 1000, None, None)
+        .await
+        .unwrap();
+    assert_eq!(vl.entries.len(), 4);
+    assert!(vl.entries[0].is_marker && vl.entries[0].is_latest);
+    assert!(matches!(
+        s.get_object_version("alpha", "k", &marker_id).await,
+        Err(Error::DeleteMarker(_))
+    ));
+
+    // 删 marker → 恢复可见（读回 c）
+    s.delete_object_versioned("alpha", "k", Some(&marker_id), true)
+        .await
+        .unwrap();
+    let (_, got) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&got[..], &c[..]);
+
+    // 分页：max=2 截断 + 续点重放
+    let p1 = s
+        .list_object_versions("alpha", "", 2, None, None)
+        .await
+        .unwrap();
+    assert_eq!(p1.entries.len(), 2);
+    assert!(p1.is_truncated);
+    let p2 = s
+        .list_object_versions(
+            "alpha",
+            "",
+            2,
+            p1.next_key_marker.as_deref(),
+            p1.next_version_id_marker.as_deref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p2.entries.len(), 1);
+    assert!(!p2.is_truncated);
+    assert_eq!(p2.entries[0].version_id, v_ids[2], "续页无重叠无遗漏");
+
+    // 点名删 v1：读 404、目录进 trash
+    s.delete_object_versioned("alpha", "k", Some(&v_ids[2]), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.get_object_version("alpha", "k", &v_ids[2]).await,
+        Err(Error::NoSuchKey(_))
+    ));
+    let trash = layout::sys_dir(d.path(), "trash").join(&v_ids[2]);
+    assert!(
+        tokio::fs::try_exists(&trash).await.unwrap(),
+        "被删版本目录应进 trash"
+    );
+
+    // 幂等：删不存在的版本 → Ok（S3 语义）
+    let out = s
+        .delete_object_versioned(
+            "alpha",
+            "k",
+            Some("00000000-0000-0000-0000-000000000000"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out, DeleteOutcome::Version { .. }));
+
+    // 删光 → 整键清理
+    s.delete_object_versioned("alpha", "k", Some(&v_ids[0]), true)
+        .await
+        .unwrap();
+    s.delete_object_versioned("alpha", "k", Some(&v_ids[1]), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::NoSuchKey(_))
+    ));
+    let vl = s
+        .list_object_versions("alpha", "", 1000, None, None)
+        .await
+        .unwrap();
+    assert_eq!(vl.entries.len(), 0);
+    assert!(
+        !tokio::fs::try_exists(layout::object_dir(d.path(), "alpha", "k").unwrap())
+            .await
+            .unwrap(),
+        "链清空后整键目录应清理"
+    );
+
+    // 不存在的键：版本桶 delete 也创建 marker（S3 语义）——单盘 write_meta_on 需自建目录
+    // （verifier 抓的回归：曾因对象目录缺失 500）
+    let out = s
+        .delete_object_versioned("alpha", "fresh", None, true)
+        .await
+        .unwrap();
+    assert!(matches!(out, DeleteOutcome::Marker { .. }));
+    assert!(matches!(
+        s.get_object("alpha", "fresh").await,
+        Err(Error::NoSuchKey(_))
+    ));
+    // 续点不在链内 → InvalidArgument（fail-loud，不静默跳键）
+    let e = s
+        .list_object_versions("alpha", "fresh", 10, Some("fresh"), Some("deadbeef"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e}");
+    // 只给 version-id-marker（无 key-marker）→ InvalidArgument
+    let e = s
+        .list_object_versions("alpha", "", 10, None, Some("x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e}");
+
+    // 非版本桶回归：delete_object_versioned(None, false) = M2b 整键删除
+    s.put_object("alpha", "plain", payload(200_000), None)
+        .await
+        .unwrap();
+    let out = s
+        .delete_object_versioned("alpha", "plain", None, false)
+        .await
+        .unwrap();
+    assert_eq!(out, DeleteOutcome::Object);
+    assert!(matches!(
+        s.get_object("alpha", "plain").await,
+        Err(Error::NoSuchKey(_))
+    ));
 }

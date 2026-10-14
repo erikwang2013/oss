@@ -94,6 +94,10 @@ impl Store {
                 break;
             }
             if let Some(m) = self.read_meta(bucket, &k).await? {
+                // 版本控制：链尾为 delete marker 的键在对象列表不可见（版本列表仍可见）
+                if m.latest_is_marker() {
+                    continue;
+                }
                 let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
                 let info = self.load_object_info(bucket, &k, &m)?;
                 objects.push((
@@ -256,6 +260,7 @@ fn merge_page(
                         last_modified_nanos: e.max_mod_time_nanos,
                         user_metadata: Default::default(),
                         checksum: None,
+                        version_id: None,
                     },
                 };
                 result.objects.push(info);

@@ -298,6 +298,17 @@ impl Db {
         Ok(row.map(|r| r.get("bucket")))
     }
 
+    /// 桶版本控制状态（M4 切片 3；aether 上传面按此传 versioned；无行 → "Off"）。
+    pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<String> {
+        let row = sqlx::query("SELECT versioning FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("versioning"))
+            .unwrap_or_else(|| "Off".to_string()))
+    }
+
     /// 某用户拥有的桶（控制台桶列表能力位计算用）。
     pub async fn owned_buckets(&self, uid: i64) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT name FROM buckets WHERE owner_id = ? ORDER BY name")

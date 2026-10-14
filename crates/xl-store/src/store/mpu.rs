@@ -171,12 +171,27 @@ impl Store {
     /// `parts` 为客户端声明的 `(part_number, etag)` 列表，须严格升序。校验链：
     /// 空/超量 → InvalidPart；非升序 → InvalidPartOrder；part 缺失/ETag 不一致 → InvalidPart；
     /// 非末段 < 5 MiB → EntityTooSmall。
+    /// 兼容壳（无版本控制）：S3 层显式带桶状态走 [`Self::complete_multipart_upload_versioned`]。
     pub async fn complete_multipart_upload(
         &self,
         bucket: &str,
         key: &str,
         upload_id: &str,
         parts: &[(u16, String)],
+    ) -> Result<ObjectInfo> {
+        self.complete_multipart_upload_versioned(bucket, key, upload_id, parts, false)
+            .await
+    }
+
+    /// 版本控制感知的 complete（M4 切片 3）：`versioned` 时追加版本（保留旧目录），
+    /// 否则维持单版本 + 回收的 M2b 语义（与单段 PUT 同口径）。
+    pub async fn complete_multipart_upload_versioned(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u16, String)],
+        versioned: bool,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // 桶窗口（同单段 PUT）
@@ -290,7 +305,13 @@ impl Store {
                     .await?
             };
             let version = Version {
-                version_id: uuid::Uuid::nil(),
+                version_id: if versioned {
+                    uuid::Uuid::parse_str(&uuid).map_err(|e| {
+                        Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}"))
+                    })?
+                } else {
+                    uuid::Uuid::nil()
+                },
                 mod_time_nanos: now,
                 size,
                 etag: etag.clone(),
@@ -307,11 +328,21 @@ impl Store {
                 checksum: None, // multipart 组合校验和留 M2b
                 data_layout,
                 inline,
+                is_delete_marker: None,
+                is_latest: None,
             };
-            let meta = XlMeta {
-                object_key: key.to_string(),
-                versions: vec![version],
+            let mut meta = match (versioned, old_meta.as_ref()) {
+                (true, Some(old)) => {
+                    let mut m = old.clone();
+                    m.versions.push(version);
+                    m
+                }
+                _ => XlMeta {
+                    object_key: key.to_string(),
+                    versions: vec![version],
+                },
             };
+            meta.refresh_latest_flags();
             if !multi {
                 tokio::fs::write(tmp.join(crate::meta::META_FILE), meta.encode()?).await?;
             }
@@ -373,8 +404,10 @@ impl Store {
         let _ = tokio::fs::rename(dir.join(MPU_META_FILE), dir.join(MPU_DONE_FILE)).await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
 
-        // 老版本进回收站（跨盘遍历，与单段 PUT 相同）
-        self.recycle_old(bucket, key, old_meta.as_ref()).await;
+        // 老版本进回收站（跨盘遍历，与单段 PUT 相同；版本控制桶跳过——旧版本仍被链引用）
+        if !versioned {
+            self.recycle_old(bucket, key, old_meta.as_ref()).await;
+        }
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -384,6 +417,12 @@ impl Store {
             last_modified_nanos: now,
             user_metadata: mpu.user_metadata,
             checksum: None,
+            // 与 version_id_str() 同式：versioned 用目录 uuid，否则 S3 的 "null"
+            version_id: Some(if versioned {
+                uuid.clone()
+            } else {
+                "null".to_string()
+            }),
         })
     }
 

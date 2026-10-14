@@ -100,6 +100,32 @@ impl Acl {
         Self { pool, mesh }
     }
 
+    /// 桶版本控制状态（M4 切片 3；`buckets.versioning`）：无行/旧库缺列值 → "Off"（fail-closed 兼容）。
+    pub async fn bucket_versioning(&self, bucket: &str) -> Result<String, sqlx::Error> {
+        let row = sqlx::query("SELECT versioning FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("versioning"))
+            .unwrap_or_else(|| "Off".to_string()))
+    }
+
+    /// 写桶版本控制状态（PutBucketVersioning；授权门已确认桶主/管理员）。
+    /// 返回 false = 桶无 DB 行（S3 层按 NoSuchBucket 处置）。
+    pub async fn set_bucket_versioning(
+        &self,
+        bucket: &str,
+        status: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE buckets SET versioning = ? WHERE name = ?")
+            .bind(status)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// AK → (uid, is_admin)。status/expires 条件与 `SigV4Auth::get_secret_key` 同口径
     ///（认证面与授权面查的是同一行，任一处撤销即同时失效）；**账号停用（users.status）
     /// 同样使 AK 失效**——停用即全链路出局。
@@ -359,10 +385,12 @@ fn classify(op: &str) -> Option<Gate> {
     Some(match op {
         "ListBuckets" | "CreateBucket" => Gate::Open,
         "DeleteBucket" => Gate::OwnerBucket,
+        // M4 版本控制：桶级状态改成开版本控制 = 桶主/管理员；读状态与列版本归读
+        "PutBucketVersioning" => Gate::OwnerBucket,
+        "GetBucketVersioning" => Gate::Need(Action::Read),
         // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
-        "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject" => {
-            Gate::Need(Action::Read)
-        }
+        "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject"
+        | "ListObjectVersions" => Gate::Need(Action::Read),
         // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
         // put_object，op 名看到的是 "PostObject"，不映射它就是浏览器表单直传的漏检点）
         "PutObject"
@@ -500,7 +528,8 @@ mod tests {
               status TEXT NOT NULL DEFAULT 'active');\
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);\
-             CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL);\
+             CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, \
+              versioning TEXT NOT NULL DEFAULT 'Off');\
              CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
               can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
               PRIMARY KEY (user_id, bucket));",
@@ -574,10 +603,17 @@ mod tests {
         assert_eq!(classify("ListBuckets"), Some(Gate::Open));
         assert_eq!(classify("CreateBucket"), Some(Gate::Open));
         assert_eq!(classify("DeleteBucket"), Some(Gate::OwnerBucket));
+        // M4 切片 3：开版本控制 = 桶主/管理员；查状态归读
+        assert_eq!(classify("PutBucketVersioning"), Some(Gate::OwnerBucket));
+        assert_eq!(
+            classify("GetBucketVersioning"),
+            Some(Gate::Need(Action::Read))
+        );
         for op in [
             "HeadBucket",
             "ListObjectsV2",
             "ListParts",
+            "ListObjectVersions",
             "GetObject",
             "HeadObject",
         ] {
@@ -597,8 +633,8 @@ mod tests {
             assert_eq!(classify(op), Some(Gate::Need(Action::Delete)), "{op}");
         }
         assert_eq!(classify("CopyObject"), Some(Gate::Copy));
-        // 未映射（含 s3s 存在但本服务未实现的桶策略/版本类 op）→ fail-closed
-        for op in ["GetBucketVersioning", "PutBucketPolicy", "Frobnicate"] {
+        // 未映射（含 s3s 存在但本服务未实现的桶策略类 op）→ fail-closed
+        for op in ["PutBucketPolicy", "Frobnicate"] {
             assert_eq!(classify(op), None, "{op}");
         }
     }

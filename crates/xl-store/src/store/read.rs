@@ -29,6 +29,7 @@ impl Store {
             last_modified_nanos: v.mod_time_nanos,
             user_metadata: v.user_metadata.clone(),
             checksum: v.checksum.clone(),
+            version_id: Some(v.version_id_str()),
         })
     }
 
@@ -38,6 +39,11 @@ impl Store {
             .read_meta(bucket, key)
             .await?
             .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        // 版本控制：链尾为 delete marker = 对象「已删除」（S3 404；marker 头在 S3 层按需补，
+        // v1 从简只回状态码——记档边界）
+        if m.latest_is_marker() {
+            return Err(Error::NoSuchKey(key.to_string()));
+        }
         self.load_object_info(bucket, key, &m)
     }
 
@@ -62,6 +68,10 @@ impl Store {
             let v = m
                 .latest()
                 .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+            // 版本控制：链尾为 delete marker = 对象「已删除」（S3 404，不带内容）
+            if v.delete_marker() {
+                return Err(Error::NoSuchKey(key.to_string()));
+            }
             let info = self.load_object_info(bucket, key, &m)?;
 
             // 形态分派：内联 → EC 布局 → 旧 parts/part
@@ -135,6 +145,10 @@ impl Store {
             let v = m
                 .latest()
                 .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+            // 版本控制：链尾为 delete marker = 对象「已删除」
+            if v.delete_marker() {
+                return Err(Error::NoSuchKey(key.to_string()));
+            }
 
             if range.start > range.end || range.end > v.size {
                 return Err(Error::InvalidKey(format!(
@@ -355,7 +369,7 @@ impl Store {
     ///
     /// 整读做 SHA256 终验 + 读时修（按「片」整片回写，见 `repair_shards_chunked`）；
     /// 区间读只经逐块对偶校验、不做修复（修复归整读/`heal`）。
-    async fn read_ec_range(
+    pub(in crate::store) async fn read_ec_range(
         &self,
         bucket: &str,
         key: &str,

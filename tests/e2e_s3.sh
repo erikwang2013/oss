@@ -290,4 +290,65 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/api/v1/users/
   -H "authorization: Bearer $ADMIN_TOKEN")
 [ "$CODE" = "204" ] || { echo "删子账户应 204，实际 $CODE"; exit 1; }
 
-echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限）"
+echo "== 16. 版本控制（M4 切片 3：开启/三版本/点名读/delete marker/回滚/删版本）=="
+VB="ver-$(date +%s)"
+aws_s3 mb "s3://$VB"
+S3API="aws --endpoint-url $ENDPOINT s3api"
+# 16a. 开启 + 回读
+aws --endpoint-url "$ENDPOINT" s3api put-bucket-versioning --bucket "$VB" \
+  --versioning-configuration Status=Enabled || { echo "开版本控制失败"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning --bucket "$VB" | grep -q Enabled \
+  || { echo "get-bucket-versioning 非 Enabled"; exit 1; }
+# 16b. PUT ×3 = 3 版本；普通 GET = 最新
+echo v1 > "$WORK/v1.txt"; echo v2v2 > "$WORK/v2.txt"; echo v3v3v3 > "$WORK/v3.txt"
+aws_s3 cp "$WORK/v1.txt" "s3://$VB/k.txt" >/dev/null
+aws_s3 cp "$WORK/v2.txt" "s3://$VB/k.txt" >/dev/null
+aws_s3 cp "$WORK/v3.txt" "s3://$VB/k.txt" >/dev/null
+count_versions() {
+  aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$VB" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(len(d.get("Versions") or []) + len(d.get("DeleteMarkers") or []))'
+}
+N=$(count_versions)
+[ "$N" = "3" ] || { echo "应有 3 版本，实际 $N"; exit 1; }
+aws_s3 cp "s3://$VB/k.txt" "$WORK/k.back" >/dev/null
+cmp "$WORK/k.back" "$WORK/v3.txt" || { echo "普通 GET 应回最新版本"; exit 1; }
+# 16c. 点名读中间版本（列表新→旧；[1] = v2）
+V2ID=$(aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$VB" \
+  --query 'Versions[1].VersionId' --output text)
+[ -n "$V2ID" ] && [ "$V2ID" != "None" ] || { echo "取 v2 版本号失败"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$VB" --key k.txt \
+  --version-id "$V2ID" "$WORK/v2.back" >/dev/null
+cmp "$WORK/v2.back" "$WORK/v2.txt" || { echo "点名读 v2 不符"; exit 1; }
+# 16d. 无版本号删除 → delete marker：GET 失败、对象列表空、版本列表见 DeleteMarkers
+aws_s3 rm "s3://$VB/k.txt" >/dev/null
+if aws_s3 cp "s3://$VB/k.txt" "$WORK/gone" >/dev/null 2>&1; then echo "marker 后 GET 应失败"; exit 1; fi
+aws_s3 ls "s3://$VB/" | grep -q 'k.txt' && { echo "marker 后对象列表不应见 k.txt"; exit 1; }
+DMID=$(aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$VB" \
+  --query 'DeleteMarkers[0].VersionId' --output text)
+[ -n "$DMID" ] && [ "$DMID" != "None" ] || { echo "未见 DeleteMarkers"; exit 1; }
+N=$(count_versions); [ "$N" = "4" ] || { echo "marker 后应 4 条（3 版本+1 marker），实际 $N"; exit 1; }
+# 16e. 点名删 marker → 恢复（读回 v3）
+aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$VB" --key k.txt --version-id "$DMID" >/dev/null
+aws_s3 cp "s3://$VB/k.txt" "$WORK/back2" >/dev/null
+cmp "$WORK/back2" "$WORK/v3.txt" || { echo "删 marker 后应恢复 v3"; exit 1; }
+# 16f. 回滚：把 v2 复制成新版本（?versionId 旧版本 → copy 出新版本）
+aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$VB" --key k.txt \
+  --copy-source "$VB/k.txt?versionId=$V2ID" >/dev/null
+aws_s3 cp "s3://$VB/k.txt" "$WORK/rolled" >/dev/null
+cmp "$WORK/rolled" "$WORK/v2.txt" || { echo "回滚 copy 后应见 v2 内容"; exit 1; }
+N=$(count_versions); [ "$N" = "4" ] || { echo "回滚后应 4 版本（v3+v2+v1+回滚版），实际 $N"; exit 1; }
+# 16g. 点名删光所有版本 → 键彻底消失
+VIDS=$(aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$VB" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(" ".join([v["VersionId"] for v in (d.get("Versions") or [])] + [m["VersionId"] for m in (d.get("DeleteMarkers") or [])]))')
+for vid in $VIDS; do
+  aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$VB" --key k.txt --version-id "$vid" >/dev/null
+done
+N=$(count_versions); [ "$N" = "0" ] || { echo "版本全删后应 0，实际 $N"; exit 1; }
+aws_s3 rb "s3://$VB" --force >/dev/null
+echo "   版本控制段通过（3 版本/点名读/marker/回滚/删版本）"
+
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制）"

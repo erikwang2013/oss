@@ -24,6 +24,8 @@ mod mesh_api;
 mod mpu;
 mod put;
 mod read;
+mod version;
+pub use version::{DeleteOutcome, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
 pub use drives::{ClusterConfig, ClusterTopology, NodeSpec};
@@ -94,6 +96,8 @@ pub struct ObjectInfo {
     pub user_metadata: std::collections::BTreeMap<String, String>,
     /// 客户端声明的校验和（已通过；仅回写 GET/HEAD 用）
     pub checksum: Option<ChecksumRecord>,
+    /// S3 线格式版本号（"null" = 无版本控制条目）；列表并集的降级条目为 None
+    pub version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -772,6 +776,9 @@ impl Store {
         m: &XlMeta,
     ) -> Result<()> {
         let dir = layout::object_dir(drive, bucket, key)?;
+        // 目录可能不存在：版本控制 delete marker 可在「键从未有过数据目录」时落 meta
+        // （put/mpu 都在桶窗口预建目录；marker 路径没有）——与多盘/集群分支对齐
+        tokio::fs::create_dir_all(&dir).await?;
         let new_path = dir.join(meta::META_NEW_FILE);
         let mut f = tokio::fs::File::create(&new_path).await?;
         f.write_all(&m.encode()?).await?;
@@ -1094,6 +1101,12 @@ impl Store {
         self.ensure_bucket(bucket).await?;
         // 与 put 同键串行：删除进行中不得有写者把新版本 rename 进来（否则版本目录会被连带删掉）
         let _guard = self.lock_object(bucket, key).await?;
+        self.purge_key(bucket, key).await
+    }
+
+    /// 整键清理（meta 可见性提交 + 数据目录）：[`Self::delete_object`] 与版本链清空
+    /// （M4 切片 3 的「删最后一个版本」）共用。**调用方须已持对象锁**。
+    pub(in crate::store) async fn purge_key(&self, bucket: &str, key: &str) -> Result<()> {
         // 评审 R2：不在册盘上的副本删不到——静默成功会让「插回后对象复活」（内联对象直接
         // 200 返回已删字节，EC 对象转永久 500）。fail-closed：任一配置盘不在册 → 拒绝删除。
         for drive in &self.cfg.drives {

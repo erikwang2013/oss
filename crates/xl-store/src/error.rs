@@ -33,6 +33,12 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("encode error: {0}")]
     Encode(String),
+    /// M4 版本控制：对 delete marker 版本点名操作（GET/HEAD 具体 marker）→ S3 405。
+    #[error("delete marker: {0}")]
+    DeleteMarker(String),
+    /// M4 版本控制：非法参数（如 version-id-marker 不在链内）→ S3 400。
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

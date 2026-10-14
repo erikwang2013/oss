@@ -65,6 +65,7 @@ impl Store {
             content_type,
             user_metadata,
             None,
+            false, // 兼容壳：无版本控制（S3 层显式传 state）
         )
         .await
     }
@@ -91,8 +92,16 @@ impl Store {
         body: ByteStream,
         content_type: Option<String>,
     ) -> Result<ObjectInfo> {
-        self.put_object_stream_with_meta(bucket, key, body, content_type, Default::default(), None)
-            .await
+        self.put_object_stream_with_meta(
+            bucket,
+            key,
+            body,
+            content_type,
+            Default::default(),
+            None,
+            false,
+        )
+        .await
     }
 
     /// 前段（单段 PUT / MPU complete / 多盘分发共用）：流式收 `body` 到 `tmp/part.1`
@@ -498,6 +507,10 @@ impl Store {
     }
 
     /// 流式 PUT 的完整形态（含用户元数据）；`put_object_stream` 是空元数据的薄壳。
+    /// `versioned`（M4 切片 3）：桶版本控制 Enabled 时**追加**新版本（保留旧版本目录，
+    /// 新版本 version_id = 版本目录 uuid）；否则维持单版本 + 老版本回收的 M2b 语义。
+    /// 状态由 S3 层从 `buckets.versioning` 读出后传入（store 不查库）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_object_stream_with_meta(
         &self,
         bucket: &str,
@@ -506,6 +519,7 @@ impl Store {
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
         checksum: Option<ChecksumRecord>,
+        versioned: bool,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // 桶窗口（桶锁内，M2b-2 Task 10）：ensure + 对象目录先落盘——此后 delete_bucket
@@ -549,7 +563,14 @@ impl Store {
             };
 
             let version = Version {
-                version_id: uuid::Uuid::nil(), // M1 无版本控制：nil = S3 的 "null" 版本
+                // 版本控制 Enabled：真实版本号（= 版本目录 uuid）；否则 nil（S3 的 "null" 版本）
+                version_id: if versioned {
+                    uuid::Uuid::parse_str(&uuid).map_err(|e| {
+                        Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}"))
+                    })?
+                } else {
+                    uuid::Uuid::nil()
+                },
                 mod_time_nanos: now,
                 size,
                 etag: etag.clone(),
@@ -567,11 +588,22 @@ impl Store {
                 checksum: checksum.clone(),
                 data_layout,
                 inline,
+                is_delete_marker: None,
+                is_latest: None,
             };
-            let meta = XlMeta {
-                object_key: key.to_string(),
-                versions: vec![version],
+            // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
+            let mut meta = match (versioned, old_meta.as_ref()) {
+                (true, Some(old)) => {
+                    let mut m = old.clone();
+                    m.versions.push(version);
+                    m
+                }
+                _ => XlMeta {
+                    object_key: key.to_string(),
+                    versions: vec![version],
+                },
             };
+            meta.refresh_latest_flags();
 
             // 单盘：候选 meta 落 tmp（与数据同目录，随 rename 一起就位）
             if !multi {
@@ -629,7 +661,10 @@ impl Store {
                 );
             }
             let _ = tokio::fs::remove_dir_all(&tmp).await; // tmp 仅用于流式收全与哈希
-            self.recycle_old(bucket, key, old_meta.as_ref()).await;
+            if !versioned {
+                // 版本控制桶：旧版本目录**保留**（链上仍有引用）；非版本桶进回收站
+                self.recycle_old(bucket, key, old_meta.as_ref()).await;
+            }
         } else {
             // 3) 同盘 rename：数据就位（此时对读路径仍不可见）；目录 fsync 是 rename 的持久化屏障。
             // 对象目录在桶窗口已建，但「窗口 → 取到对象锁」之间可能被删（delete 抢先），
@@ -644,8 +679,10 @@ impl Store {
             self.write_meta(bucket, key, &meta, old_meta.as_ref())
                 .await?;
 
-            // 5) 老版本进回收站
-            self.recycle_old(bucket, key, old_meta.as_ref()).await;
+            // 5) 老版本进回收站（版本控制桶跳过：旧版本目录仍被链引用）
+            if !versioned {
+                self.recycle_old(bucket, key, old_meta.as_ref()).await;
+            }
         }
 
         Ok(ObjectInfo {
@@ -656,6 +693,12 @@ impl Store {
             last_modified_nanos: now,
             user_metadata,
             checksum,
+            // 与 version_id_str() 同式：versioned 用目录 uuid，否则 S3 的 "null"
+            version_id: Some(if versioned {
+                uuid.clone()
+            } else {
+                "null".to_string()
+            }),
         })
     }
 }
