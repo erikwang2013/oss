@@ -142,6 +142,12 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   - **登录无速率限制**（Argon2 每次校验 ~19 MiB 内存）——暴力尝试面未封，后续补限速。
 >   - **桶策略只在 S3 面生效**：控制台与 aetherupload 上传面仍走三档 permissions。
 >   - **删桶连带清空该桶策略与生命周期规则**（S3 面与控制面删桶都清）——同名重建不继承，防旧规则误删。
+> - **多 set（M4）边界**：
+>   - 多 set 下**数据面每 op +1 次本地 DB 查询**（桶 → set；本地 miss 才扇出对端；单 set 零新增）。
+>     解析 fail-closed：传输错 / set 越界 / 对端答复不一致一律上抛，**绝不静默回落 set0**。
+>   - **跨 set 桶名唯一性在并发建桶下是 best-effort**（既有跨节点查重 TOCTOU 同款）。
+>   - **`[[groups]]` 分组的目标桶钉 set0**（控制台上传面不参与新 set）。
+>   - **加盘只能加在最后一个 set**（前滚约束）：往中间 set 加盘 → 启动指纹拒启，不可行。
 
 ## Docker（compose）
 
@@ -392,6 +398,52 @@ Principal 的 ARN 形态 / **匿名（无凭据）放行**——`Principal:"*"` 
 （仅管理员；limit 默认 100、钳 1..=1000；`decision` 只认 allow/deny，其它值视为不过滤，最新在前）。
 `tests/e2e_s3.sh` 第 17 节实弹覆盖（Deny 优先 / 校验 400 / 审计查询 / 清策略恢复 / 删桶清策略 /
 批量删逐键授权）。
+
+## 多 set（M4）
+
+单部署多 EC 组（set）的横向扩容形态：新 set 加容量，**老 set 零重排**；单 set（k=1）与既有部署
+逐字节一致（RPC 缺省字段、指纹、放置全等价；原地升级 = 末尾追加 `set=1` 条目，老段不动）。
+
+**配置**：`[[cluster.nodes]]` 新增可选 `set`（缺省 0）。同一物理节点可在多个 set 各出一条
+（同 `id`、**`addr` 必须一致**——节点间 RPC 只按 id 路由，不一致拒启）；set 号必须从 0 连续
+（缺号 fail-closed）。**`data_dirs` 顺序契约（硬）**：按 set 升序、set 内按节点声明序拼接；
+本节点各 set 的 `drive_count` 之和 == `data_dirs.len()`（open 自校验）。每个 set 独立走全套拓扑
+校验（槽 ≤255、≥ data+parity、多节点时每节点盘数 ≤ parity；flat 并集另受单节点总盘数 ≤255 约束）。
+
+```toml
+[[cluster.nodes]]          # set0 段（缺省，可不写 set）：n1..n3 各一条
+id = "n1"
+addr = "127.0.0.1:19101"
+drive_count = 3
+# n2 / n3 同构…
+
+[[cluster.nodes]]          # set1 段：同物理节点再出一条（原地升级 = 末尾追加，老段在前不动）
+id = "n1"
+addr = "127.0.0.1:19101"   # 同 id 多 set 的 addr 必须一致
+drive_count = 3
+set = 1
+# n2 / n3 同构…
+```
+
+**桶钉 set**：控制台建桶（`POST /api/v1/buckets`）可选 `set`（校验 < 组数；缺省 0）；S3 面
+CreateBucket 缺省 set0（S3 指名 set 归后续）。归属存 `buckets.set_id` 列（老库启动幂等补列，
+存量 = 0）。**set 一经创建不可变**——没有改 set 的 API，已有桶不跨 set 搬迁。
+
+**隔离口径**：set 只约束**数据分片**（放置公式与分片 RPC 写/读/删）；**桶目录与 `xl.meta`
+跨全部 set 镜像**（命名空间面：每盘一份完整命名空间副本，全盘迭代）——空桶目录与元数据副本
+出现在非属主 set 的盘上属预期，不是串组。
+
+**拓扑指纹**：每盘一条。set0 段盘写 `v2 node=… slot=…`（与单 set 部署逐字节一致、不重写），
+set>0 段盘写 `v3 set=… node=… slot=…`（slot 为**组内槽**）；`v3` 且 `set=0` = 拒启（写路径永不
+产出该形态）。
+
+**扩容约束**：加盘只允许加在**最后一个 set**（往中间 set 加盘会位移其后段 → 启动指纹拒启）；
+跨 set 不搬迁已有桶——多 set 是给新桶加容量，不是对存量重分布。
+
+**观测**：`GET /api/v1/cluster/status`（admin）新增 `sets` 数组（每 set 一条：组内槽数、节点表、
+本节点是否属该组）；顶层 `nodes` / `slot_count` 为按 id 去重的节点并集（命名空间面口径）。
+**各 set 的槽号是独立槽域，跨 set 会重号——按 set 分组读**（控制台「集群」页表格当前仍是顶层
+去重视图）。
 
 ## 验收
 
