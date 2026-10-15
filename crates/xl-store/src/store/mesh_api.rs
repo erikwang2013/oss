@@ -94,6 +94,37 @@ impl Store {
             .ok_or_else(|| Error::Encode(format!("set {set} 槽 {slot} 的扁平盘下标 {flat} 越界")))
     }
 
+    /// 控制面白名单写的服务端执行（M5 切片 0）：调本节点注入的 ControlBackend。
+    pub async fn mesh_control_write(&self, w: crate::mesh::ControlWrite) -> Result<()> {
+        match self.cfg.control.as_deref() {
+            Some(b) => b.control_write(w).await,
+            None => Err(Error::Encode("本节点未注入控制面后端".into())),
+        }
+    }
+
+    /// 桶行变更广播（M5 切片 0 / P4-1）：向全部 peer best-effort 发 `ControlWrite`。
+    /// 失败只 warn——广播是**第一**收敛机制（关删桶重建的陈旧行窗口）；重启时的权威扇出
+    /// 对账（state.rs 双对账面）兜底。**未重启的漏播节点在重启前仍按本地陈旧行路由**（数据
+    /// 面本地先行短路），这是 best-effort 设计的固有残窗。
+    pub async fn broadcast_bucket_row(&self, bucket: &str, set: Option<u16>) {
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return;
+        };
+        let self_id = cl.sets.flat.self_node().id.clone();
+        let w = crate::mesh::ControlWrite::BucketRowSet {
+            bucket: bucket.to_string(),
+            set,
+        };
+        for n in &cl.sets.flat.nodes {
+            if n.id == self_id {
+                continue;
+            }
+            if let Err(e) = cl.transport.control_write(&n.id, w.clone()).await {
+                tracing::warn!(node = %n.id, bucket, error = %e, "桶行广播未达（回填对账兜底）");
+            }
+        }
+    }
+
     /// 幂等分片写（服务端）：**先验 CRC32C 再落盘**（等同本地落盘强度，防腐坏入库）。
     /// 整片语义（`chunked=false`）行为与 M3 完全一致；分块语义（`chunked=true`）按
     /// `(offset, chunk_crc32c, is_final)` 定位写、逐块校验、末块 fsync。

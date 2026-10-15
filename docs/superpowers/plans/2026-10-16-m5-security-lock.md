@@ -34,12 +34,30 @@
 
 ## 切片 0：集群行一致性（P4-1）
 
-- [ ] proto：`BucketRef` 复用或新消息承载「桶行 set 变更」——控制面**写** RPC（现 ControlBackend 只读；
-      新增 `ControlOp` 面或走既有 mesh 服务新方法；方案随实现定，评审过为准）
-- [ ] `create_bucket`/`delete_bucket`（S3 面 + 控制面四条路径）**广播**行变更（best-effort + warn，
-      镜像面同款口径）；接收端仅写本地 DB
-- [ ] 启动回填对账保持（双保险）；测试：3 节点内存集群——A 建桶 set1 → B 立即 resolve 即 set1（无需重启）
-- **定稿**：§
+- [x] proto：`ControlWrite` RPC + `ControlWriteReq`（kind 白名单，目前唯一 BUCKET_ROW_SET；服务端
+      `u16::try_from` fail-closed，不静默截断；加法兼容，旧节点回 Unimplemented → 广播 warn 不炸）
+- [x] `create_bucket`/`delete_bucket`（S3 面 + 控制面四条路径）**广播**行变更（best-effort + warn，
+      镜像面同款口径）；接收端仅写本地 DB（set 覆盖、owner 不碰）；发起端两条建桶行写改**覆盖**语义
+      （与接收端同文——verifier 阻断 1：原 INSERT OR IGNORE 在陈旧行上整条 no-op，容忍失败路径下
+      本节点按旧 set 路由、旧 owner 判权，与已收广播的 peer 静默分叉）
+- [x] 启动回填对账保持（**双保险为真**：磁盘面 + 表行面，均走**权威**扇出解析——verifier 高 2：
+      原回填走数据面本地先行解析，把本地陈旧值原样写回，对「行存在且 set 已变」收敛不成立）
+- **定稿（2026-10-16）**：七闸全绿（xl-store 143+1ignored / kill9 / oss-server 全套含新增 3 枚
+  [`control_write_bucket_row_reconverges_stale_row`、`authoritative_resolve_overrides_stale_local_row`、
+  `upsert_bucket_owner_set_overrides_stale_row`] / xl-s3 45+2 枚 owner 覆盖语义 / xl-client+xl-proto /
+  clippy --workspace --all-targets -D warnings / fmt；最终树 `git diff | md5sum` = `6a650fbd`，相对
+  全闸树 `c4d60f92` 仅 mesh_api.rs 三行注释、xl-store lib 复跑于终树）。verifier **两轮对抗**：
+  第 1 轮 阻断 1（发起端 IGNORE 不对称分叉）+ 高 2（回填假兜底）→ 全修；第 2 轮复验 **可收口**
+  （证据 /tmp/m5s0-verifier-report.md + /tmp/m5s0-verifier-recheck.md，其对 c4d60f92 逐处重核对并
+  定点重跑三枚新测试）。工作令「B 立即 resolve 即 set1」以三段钉：①传输分发（xl-store 3 节点内存：
+  广播达全部 peer 后端、宕机 peer 不扰其余、本机不自发）；②接收端语义（oss-server：陈旧行覆盖 +
+  owner 不碰 + 缺行补插 + 删行）；③四条调用点读码（AuthedUser 恒插入前提核）+ 权威解析四态单测。
+  **记档（非阻断）**：①方向性角落——「容忍失败/漏播 + 漏收建桶广播 + 创建者重启」双故障下对端
+  共识可覆盖更新行（行无定序元数据；修「本地异议即 Err」会复现主 bug）→ M9 行 epoch/时间戳收口；
+  ②接线层（四条广播调用点 + 两回填接线）零测试覆盖（突变存活）→ 切片 7 e2e 断言补；③启动开销
+  多 set 两对账面 2×桶数×(N-1) 逐桶扇出（桶内并发；行面去重磁盘面名字可减半，未做）；
+  ④接收端广播不覆盖 owner（陈旧节点「上一世 owner」本地 is_owner 仍真——HEAD 即存在，未恶化）；
+  ⑤「对端全 None 保守不动」正确（本节点建桶若对端全漏播，删行会把活桶 404）。提交 `<回填>`。
 
 ## 切片 1：密钥库（KeyProvider）
 
@@ -115,7 +133,8 @@
 - [ ] AssumeRoleWithWebIdentity：验 RS256 JWT（jsonwebtoken）+ JWKS 拉取缓存（`OSS_OIDC_ISSUER` 配置）
       ——**成本评估后决策**：做则全链测试；不做则计划记档裁剪（设计文档范围项，需用户知悉）
 - [ ] e2e_s3.sh 新 §18：SSE 三模式写入→head 头断言→盘上 grep 明文特征串（验收 ①②）；锁头部；
-      STS 临时凭据调用（验收 ③④）
+      STS 临时凭据调用（验收 ③④）；**并补切片 0 遗留的接线断言**（建/删桶后各节点解析立即一致，
+      免重启——广播四条调用点 + 回填接线的 e2e 覆盖）
 - [ ] README：加密/锁/STS 章节 + 主密钥运维（分发/轮换口径）+ 已知边界
 - [ ] 计划定稿（逐片勾选 + 证据链）；发布待用户口令
 

@@ -360,12 +360,23 @@ impl Acl {
         Ok(names)
     }
 
-    /// 桶归属登记（S3 面 CreateBucket 用；幂等——已存在（含历史 NULL owner）不覆盖）。
+    /// 桶归属登记（历史形态，无 set；幂等——已存在不覆盖，测试钉）。
     pub async fn record_bucket_owner(&self, bucket: &str, uid: i64) -> Result<(), sqlx::Error> {
-        self.record_bucket_owner_set(bucket, uid, 0).await
+        sqlx::query(
+            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, 0)",
+        )
+        .bind(bucket)
+        .bind(uid)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 带 set 的归属登记（C3：S3 面建桶缺省走自动指派；单 set 恒 0）。
+    /// M5 切片 0：**覆盖**语义（原 INSERT OR IGNORE）——删桶记账曾被容忍失败留下的陈旧行
+    /// 必须在重建时收敛 set 与 owner，否则本节点按旧 set 路由、按旧 owner 判权，与已收广播
+    /// 的 peer 静默分叉（verifier 阻断 1）。
     pub async fn record_bucket_owner_set(
         &self,
         bucket: &str,
@@ -373,7 +384,8 @@ impl Acl {
         set: u16,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?)",
+            "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET owner_id = excluded.owner_id, set_id = excluded.set_id",
         )
         .bind(bucket)
         .bind(uid)
@@ -1063,6 +1075,24 @@ mod tests {
         a.record_bucket_owner("b", 3).await.unwrap(); // 二次不覆盖
         assert!(a.is_owner("b", 2).await.unwrap());
         assert!(!a.is_owner("b", 3).await.unwrap());
+    }
+
+    /// M5 切片 0（verifier 阻断 1 修复）：带 set 的建桶记账**覆盖**语义——删桶记账容忍失败
+    /// 留下的陈旧行随重建收敛 owner/set（旧 INSERT OR IGNORE 整条 no-op → 旧 owner/set 分叉）。
+    #[tokio::test]
+    async fn record_bucket_owner_set_overrides_stale_row() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_user(&a, 3, false).await;
+        a.record_bucket_owner_set("b", 2, 0).await.unwrap();
+        a.record_bucket_owner_set("b", 3, 1).await.unwrap(); // 重建：覆盖
+        assert!(!a.is_owner("b", 2).await.unwrap(), "旧 owner 不得继承");
+        assert!(a.is_owner("b", 3).await.unwrap());
+        let row = sqlx::query("SELECT set_id FROM buckets WHERE name = 'b'")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("set_id"), 1, "set 应收敛到重建值");
     }
 
     // ---------- Task 9：控制面读扇出 ----------

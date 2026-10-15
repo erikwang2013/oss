@@ -383,6 +383,16 @@ impl Store {
     /// 单机/单 set → `Some(0)`（零查询短路）；多 set → resolver（`Ok(None)` = 全部可达且确无
     /// 行——回填只在此态插 set=0，**任一传输错是不插行**，verifier 终审洞 2）。
     pub async fn resolve_bucket_set(&self, bucket: &str) -> Result<Option<u16>> {
+        self.resolve_set(bucket, false).await
+    }
+
+    /// M5 切片 0：**权威**解析（启动对账用）——多 set 下跳过本地短路、以对端共识为准，
+    /// 收敛「删桶重建后本节点残留陈旧行」；单机/单 set 口径同 resolve_bucket_set（恒 0）。
+    pub async fn resolve_bucket_set_authoritative(&self, bucket: &str) -> Result<Option<u16>> {
+        self.resolve_set(bucket, true).await
+    }
+
+    async fn resolve_set(&self, bucket: &str, authoritative: bool) -> Result<Option<u16>> {
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return Ok(Some(0));
         };
@@ -393,7 +403,12 @@ impl Store {
             .resolver
             .as_ref()
             .ok_or_else(|| Error::Encode("多 set 集群未注入 SetResolver".into()))?;
-        match resolver.resolve_bucket_set(bucket).await? {
+        let got = if authoritative {
+            resolver.resolve_bucket_set_authoritative(bucket).await?
+        } else {
+            resolver.resolve_bucket_set(bucket).await?
+        };
+        match got {
             Some(s) => {
                 let s = u16::try_from(s).map_err(|_| Error::Encode(format!("set {s} 越界")))?;
                 if cl.sets.set_topo(s).is_none() {

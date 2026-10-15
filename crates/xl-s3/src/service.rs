@@ -365,6 +365,8 @@ impl S3 for OssS3 {
             {
                 tracing::warn!(error = ?e, bucket, "桶归属记账失败");
             }
+            // M5 切片 0（P4-1）：行变更广播（best-effort；关「别节点陈旧行」窗口）
+            self.store.broadcast_bucket_row(&bucket, Some(set)).await;
         }
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
@@ -400,6 +402,8 @@ impl S3 for OssS3 {
         if let Err(e) = self.acl.clear_bucket_policy(&bucket).await {
             tracing::warn!(error = ?e, bucket, "删桶策略清理失败");
         }
+        // M5 切片 0（P4-1）：删行广播（best-effort）
+        self.store.broadcast_bucket_row(&bucket, None).await;
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 

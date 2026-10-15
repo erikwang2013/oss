@@ -239,8 +239,9 @@ impl AppState {
                     // 无行者先扇出问 set：有答按答插；「全部可达且全无」→ set0+warn（存量语义）；
                     // **任一传输错 → 不插行**（下次启动重试；「不可达」不得写死 set0——
                     // verifier 终审洞 2：升级后 set=1 桶的行在不可达窗口被写死 0 即分片错组）
-                    match store.resolve_bucket_set(&b.name).await {
-                        // P3-3：权威 set **对账**（不止补缺）——陈旧行（删桶重建后别节点残留）在此收敛
+                    match store.resolve_bucket_set_authoritative(&b.name).await {
+                        // P3-3：权威 set **对账**（不止补缺）——陈旧行（删桶重建后别节点残留）在此收敛；
+                        // M5 切片 0：改走**权威**解析（跳过本地短路——原实现把本地陈旧值原样写回，收敛不成立）
                         Ok(Some(s)) => {
                             if let Err(e) = db.upsert_bucket_set(&b.name, s).await {
                                 tracing::warn!(error = %e, bucket = %b.name, "回填对账失败");
@@ -260,6 +261,29 @@ impl AppState {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "启动回填：列举桶失败"),
+        }
+
+        // M5 切片 0（P4-1）第二对账面：表行全量——上面的磁盘循环看不见「行在而目录不在」的
+        // 陈旧行（删桶广播未达该节点 + 目录删除已生效）。对端有行 → 权威值收敛；对端全无行
+        // → 保守不动（可能是本节点建的桶而对端漏收广播——删行会把本节点的活桶 404 掉；
+        // 该残窗随重建广播/下轮重启收敛，彻底强一致归 M9）。
+        match db.list_bucket_rows().await {
+            Ok(names) => {
+                for name in names {
+                    match store.resolve_bucket_set_authoritative(&name).await {
+                        Ok(Some(s)) => {
+                            if let Err(e) = db.upsert_bucket_set(&name, s).await {
+                                tracing::warn!(error = %e, bucket = %name, "行对账收敛失败");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, bucket = %name, "行对账：权威解析不可达，本轮跳过");
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "启动对账：列举桶行失败"),
         }
 
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。

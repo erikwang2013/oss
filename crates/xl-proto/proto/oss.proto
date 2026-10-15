@@ -18,6 +18,8 @@ service Mesh {
   rpc Health(Empty) returns (NodeHealth);
   rpc Lock(LockReq) returns (LockResp);
   rpc ControlQuery(ControlReq) returns (ControlResp);
+  // M5 切片 0（P4-1）：控制面**白名单写**（桶行变更广播；接收端只写本地 DB）
+  rpc ControlWrite(ControlWriteReq) returns (WriteResp);
 }
 message Empty {}  message WriteResp { bool ok = 1; string msg = 2; }
 message ShardWrite { string bucket=1; string key=2; string uuid=3; uint32 part=4;
@@ -66,3 +68,7 @@ message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
                       string secret=5; bool flag=6; repeated string names=7;
                       // M4 切片 8：BUCKET_SET 应答（found=true 时有效）
                       uint32 set=8; }
+message ControlWriteReq {
+  // 目前唯一 kind：BUCKET_ROW_SET（a=bucket；has_set=true → set=值；false → 删行）
+  uint32 kind=1; string a=2; bool has_set=3; uint32 set=4;
+}

@@ -659,10 +659,20 @@ async fn create_bucket(
     if let Err(e) = state.store.create_bucket(&body.name).await {
         return store_error(e).into_response();
     }
-    if let Err(e) = state.db.insert_bucket_set(&body.name, Some(uid), set).await {
+    // M5 切片 0：覆盖语义——陈旧行（删桶记账容忍失败残留）随重建收敛 set 与 owner
+    if let Err(e) = state
+        .db
+        .upsert_bucket_owner_set(&body.name, Some(uid), set)
+        .await
+    {
         // 桶已建成：控制面行缺失只影响列表展示，不失败请求
         tracing::warn!(error = %e, "写入桶行失败");
     }
+    // M5 切片 0（P4-1）：行变更广播（best-effort）
+    state
+        .store
+        .broadcast_bucket_row(&body.name, Some(set))
+        .await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -699,6 +709,8 @@ async fn delete_bucket(
             if let Err(e) = state.acl().clear_bucket_policy(&bucket).await {
                 tracing::warn!(error = ?e, "清理桶策略失败");
             }
+            // M5 切片 0（P4-1）：删行广播（best-effort）
+            state.store.broadcast_bucket_row(&bucket, None).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => store_error(e).into_response(),

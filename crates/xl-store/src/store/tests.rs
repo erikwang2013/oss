@@ -2627,6 +2627,15 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         }
         self.peer(n).await?.mesh_lock(r).await
     }
+    async fn control_write(
+        &self,
+        node: &str,
+        w: crate::mesh::ControlWrite,
+    ) -> crate::error::Result<()> {
+        let st = self.peer(node).await?;
+        st.mesh_control_write(w).await
+    }
+
     async fn control_query(
         &self,
         n: &str,
@@ -2998,6 +3007,109 @@ async fn multiset_isolation_flat_mapping_and_mirror() {
     assert!(
         matches!(err, crate::error::Error::NoSuchBucket(_)),
         "无行桶应 NoSuchBucket（实得 {err:?}）"
+    );
+}
+
+/// M5 切片 0（P4-1）：桶行广播——create/delete 后各 peer 的控制面后端立即收到写（免重启收敛）。
+#[tokio::test]
+async fn bucket_row_broadcast_reaches_all_peers() {
+    #[derive(Debug, Default)]
+    struct CollectBackend {
+        log: std::sync::Mutex<Vec<(String, Option<u16>)>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::mesh::ControlBackend for CollectBackend {
+        async fn control_query(
+            &self,
+            _q: crate::mesh::ControlQuery,
+        ) -> crate::error::Result<Option<crate::mesh::ControlRow>> {
+            Ok(None)
+        }
+        async fn control_write(&self, w: crate::mesh::ControlWrite) -> crate::error::Result<()> {
+            // 单变体枚举：直接解构；加新变体时编译器会强制此桩更新（白名单语义）
+            let crate::mesh::ControlWrite::BucketRowSet { bucket, set } = w;
+            self.log.lock().unwrap().push((bucket, set));
+            Ok(())
+        }
+    }
+
+    let ec = ec::EcConfig {
+        data: 1,
+        parity: 1,
+        enabled: true,
+    };
+    let ids: Vec<String> = (1..=3).map(|i| format!("n{i}")).collect();
+    let specs: Vec<drives::NodeSpec> = ids
+        .iter()
+        .map(|id| drives::NodeSpec {
+            id: id.clone(),
+            addr: format!("127.0.0.1:2710{}", &id[1..]),
+            drive_count: 1,
+        })
+        .collect();
+    let mesh = InProcessMesh::new();
+    let mut stores = Vec::new();
+    let mut backends: Vec<std::sync::Arc<CollectBackend>> = Vec::new();
+    let mut tmpdirs = Vec::new();
+    for id in &ids {
+        let td = tempfile::TempDir::new().unwrap();
+        let dir = td.path().to_path_buf();
+        tmpdirs.push(td);
+        std::fs::create_dir_all(&dir).unwrap();
+        let back = std::sync::Arc::new(CollectBackend::default());
+        let sets = drives::ClusterSets::single(id, specs.clone(), &ec).unwrap();
+        let mut cfg = StoreConfig::new(&dir);
+        cfg.ec = ec;
+        cfg.fsync = false;
+        cfg.cluster_lock_ttl_ms = 400;
+        cfg.cluster_lock_retries = 3;
+        cfg.cluster_lock_backoff_ms = (5, 10);
+        cfg.control = Some(back.clone());
+        cfg.cluster = Some(Arc::new(drives::ClusterConfig {
+            sets,
+            placement_v2: false,
+            transport: mesh.clone(),
+            resolver: None,
+        }));
+        let st = Arc::new(Store::open(cfg).await.unwrap());
+        mesh.register(id, &st);
+        stores.push(st);
+        backends.push(back);
+    }
+
+    // 机制本体：broadcast_bucket_row 应把写投到全部 peer 的后端（best-effort 面）。
+    // 注：S3 面/控制面的 4 个调用点（create/delete × 两面）是薄封装，归 verifier 读码 +
+    // 后续 e2e 断言；本测钉传输与分发机制。
+    stores[0].broadcast_bucket_row("bkt-row", Some(0)).await;
+    for b in &backends[1..] {
+        let log = b.log.lock().unwrap();
+        assert!(
+            log.iter().any(|(n, s)| n == "bkt-row" && *s == Some(0)),
+            "peer 应立即收到建桶行（单 set → set0）：{log:?}"
+        );
+    }
+    // 本节点不发给自己（发起端直写本地 DB）
+    assert!(backends[0].log.lock().unwrap().is_empty());
+
+    stores[0].broadcast_bucket_row("bkt-row", None).await;
+    for b in &backends[1..] {
+        let log = b.log.lock().unwrap();
+        assert!(
+            log.iter().any(|(n, s)| n == "bkt-row" && s.is_none()),
+            "peer 应立即收到删行：{log:?}"
+        );
+    }
+    // 宕机 peer：广播 best-effort，不 panic 不上抛（回填对账兜底）
+    mesh.down("n2");
+    stores[0].broadcast_bucket_row("bkt-dead", Some(1)).await;
+    assert!(
+        backends[2]
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(n, s)| n == "bkt-dead" && *s == Some(1)),
+        "其余 peer 不受单点不可达影响"
     );
 }
 

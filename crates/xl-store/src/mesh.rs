@@ -217,6 +217,20 @@ pub struct ControlRow {
 pub trait ControlBackend: Send + Sync + std::fmt::Debug {
     /// 白名单查询（安全边界在实现侧）；None = 本节点查无。
     async fn control_query(&self, q: ControlQuery) -> Result<Option<ControlRow>>;
+    /// M5 切片 0：白名单**写**（接收端只写本地 DB；调用方 best-effort 广播）。
+    /// 默认 NotImplemented 桩——旧实现不被迫改动，写面未接者显式失败。
+    async fn control_write(&self, w: ControlWrite) -> Result<()> {
+        Err(crate::error::Error::Encode(format!(
+            "控制面写未实现: {w:?}"
+        )))
+    }
+}
+
+/// 控制面写白名单（M5 切片 0 / P4-1）：桶行变更广播的载荷。
+#[derive(Clone, Debug)]
+pub enum ControlWrite {
+    /// 设桶行 set（upsert；owner/versioning 不动）；`None` = 删行（随删桶清理）。
+    BucketRowSet { bucket: String, set: Option<u16> },
 }
 
 /// 桶 → set 解析（M4 切片 8）。**独立于 MeshTransport 的扇出面**（verifier M2）：
@@ -225,7 +239,13 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
 pub trait SetResolver: Send + Sync + std::fmt::Debug {
     /// `Ok(Some(set))` = 有行（含一致性合并）；`Ok(None)` = **全部可达且都答无**；
     /// `Err` = 任一传输错 / 行分叉（多节点答案不一致）/ 无任何可达节点。
+    /// 数据面热路径语义：本地先行（本地命中不扇出）。
     async fn resolve_bucket_set(&self, bucket: &str) -> Result<Option<u32>>;
+    /// M5 切片 0：**权威**解析（启动对账用）——跳过本地短路，以对端共识为准，收敛
+    /// 本地陈旧行。默认回落数据面语义（旧实现不被迫改动）。
+    async fn resolve_bucket_set_authoritative(&self, bucket: &str) -> Result<Option<u32>> {
+        self.resolve_bucket_set(bucket).await
+    }
 }
 
 /// 节点间传输。实现必须：幂等（write_shard/delete_version）、超时即错（调用方按
@@ -237,6 +257,12 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
     async fn delete_version(&self, node: &str, d: VersionDirRef) -> Result<()>;
     /// 旧版本 → 该盘 `.oss.sys/trash/`（先决链：提交 quorum 成立后回收才安全）
     async fn recycle_version(&self, node: &str, d: VersionDirRef) -> Result<()>;
+    /// M5 切片 0：控制面白名单写转发（桶行广播；best-effort 由调用方 warn）。
+    /// 默认 NotImplemented——测试替身免被迫实现；生产实现（TonicMesh/InProcessMesh）必须覆盖。
+    async fn control_write(&self, node: &str, w: ControlWrite) -> Result<()> {
+        let _ = (node, w);
+        Err(crate::error::Error::Encode("control_write 未实现".into()))
+    }
     /// 单片删除（幂等）——rebalance 老片清理用。
     async fn delete_shard(&self, node: &str, d: ShardDelete) -> Result<()>;
     async fn prepare_meta(&self, node: &str, m: MetaWrite) -> Result<MetaAck>;

@@ -50,7 +50,7 @@ pub struct PermissionRow {
 // 不建 _sqlx_migrations —— 将来加 0002 不会自动执行（M2 起再引 sqlx migrate）。
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -227,9 +227,33 @@ impl Db {
         Ok(())
     }
 
-    /// P3-3：回填对账——把权威解析到的 set 覆盖到已有行（仅 set_id 列；owner/versioning 不动）。
-    /// 场景：桶删除后在别节点重建为另一 set，本节点陈旧行（INSERT OR IGNORE 不会更新）会在
-    /// 下次启动被此处收敛；行不存在则插入（owner NULL，与历史桶回填同权）。
+    /// M5 切片 0：建桶行**覆盖**语义（console CreateBucket 用）——删桶记账容忍失败留下的
+    /// 陈旧行（旧 owner/旧 set）必须在重建时收敛，否则本节点按旧 set 路由、按旧 owner 判权，
+    /// 与已收广播的 peer 静默分叉（verifier 阻断 1）。
+    pub async fn upsert_bucket_owner_set(
+        &self,
+        name: &str,
+        owner_id: Option<i64>,
+        set: u16,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET owner_id = excluded.owner_id, set_id = excluded.set_id",
+        )
+        .bind(name)
+        .bind(owner_id)
+        .bind(now())
+        .bind(set as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// P3-3：回填对账——把**权威**解析到的 set 覆盖到已有行（仅 set_id 列；owner/versioning
+    /// 不动）。场景：桶删除后在别节点重建为另一 set，本节点陈旧行（INSERT OR IGNORE 不会更新）
+    /// 会在下次启动被此处收敛；行不存在则插入（owner NULL，与历史桶回填同权）。
+    /// M5 切片 0：权威值须来自 `resolve_bucket_set_authoritative`（数据面本地先行解析对本地
+    /// 陈旧行会把旧值原样写回，收敛不成立——verifier 高 2）。
     pub async fn upsert_bucket_set(&self, name: &str, set: u16) -> Result<()> {
         sqlx::query(
             "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, NULL, ?, ?) \
@@ -1302,6 +1326,39 @@ mod bucket_set_tests {
             .await
             .unwrap();
         assert_eq!(row.get::<Option<i64>, _>("owner_id"), None);
+        assert_eq!(row.get::<i64, _>("set_id"), 2);
+    }
+
+    /// M5 切片 0（verifier 阻断 1 修复）：重建覆盖——陈旧行（旧 owner/旧 set）被新 owner/set
+    /// 覆盖；缺行则插入。旧实现 INSERT OR IGNORE 在陈旧行上整条 no-op，本节点会按旧 set 路由、
+    /// 按旧 owner 判权，与已收广播的 peer 静默分叉。
+    #[tokio::test]
+    async fn upsert_bucket_owner_set_overrides_stale_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let o1 = db.create_user("o1", "pw-123456", false).await.unwrap();
+        let o2 = db.create_user("o2", "pw-123456", false).await.unwrap();
+        // 删桶记账曾被容忍失败：行残留（旧 owner o1、旧 set0）
+        db.insert_bucket_set("bk", Some(o1), 0).await.unwrap();
+        db.upsert_bucket_owner_set("bk", Some(o2), 1).await.unwrap();
+        let row = sqlx::query("SELECT owner_id, set_id FROM buckets WHERE name = 'bk'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<i64>, _>("owner_id"),
+            Some(o2),
+            "owner 应换新"
+        );
+        assert_eq!(row.get::<i64, _>("set_id"), 1, "set 应收敛");
+        // 缺行：插入
+        db.upsert_bucket_owner_set("bk2", Some(o1), 2)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT owner_id, set_id FROM buckets WHERE name = 'bk2'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<i64>, _>("owner_id"), Some(o1));
         assert_eq!(row.get::<i64, _>("set_id"), 2);
     }
 

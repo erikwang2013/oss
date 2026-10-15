@@ -492,6 +492,23 @@ impl MeshTransport for TonicMesh {
             granted: resp.granted,
         })
     }
+    async fn control_write(&self, node: &str, w: mesh::ControlWrite) -> Result<()> {
+        let mesh::ControlWrite::BucketRowSet { bucket, set } = w;
+        let resp = self
+            .client(node)?
+            .clone()
+            .control_write(xl_proto::ControlWriteReq {
+                kind: 0, // BUCKET_ROW_SET
+                a: bucket,
+                has_set: set.is_some(),
+                set: set.unwrap_or(0) as u32,
+            })
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        check_write(node, resp)
+    }
+
     async fn control_query(
         &self,
         n: &str,
@@ -834,6 +851,28 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             granted: resp.granted,
         }))
     }
+    async fn control_write(
+        &self,
+        r: Request<xl_proto::ControlWriteReq>,
+    ) -> std::result::Result<tonic::Response<xl_proto::WriteResp>, Status> {
+        let l = r.into_inner();
+        if l.kind != 0 {
+            return Err(Status::invalid_argument("未知控制面写类型"));
+        }
+        // fail-closed：u32 越界不得静默截断成合法 set（与存储侧 try_from 口径一致）
+        let set = if l.has_set {
+            Some(
+                u16::try_from(l.set)
+                    .map_err(|_| Status::invalid_argument("set 越界（>= 65536）"))?,
+            )
+        } else {
+            None
+        };
+        let w = mesh::ControlWrite::BucketRowSet { bucket: l.a, set };
+        self.store.mesh_control_write(w).await.map_err(internal)?;
+        Ok(tonic::Response::new(write_ok()))
+    }
+
     async fn control_query(
         &self,
         r: Request<xl_proto::ControlReq>,
