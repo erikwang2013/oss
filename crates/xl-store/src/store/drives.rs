@@ -120,9 +120,7 @@ impl ClusterTopology {
         let mut bases = Vec::with_capacity(nodes.len());
         let mut total: u16 = 0;
         for (i, n) in nodes.iter().enumerate() {
-            if n.id.is_empty() {
-                return Err(Error::Encode(format!("节点 #{i} id 为空")));
-            }
+            // id 空/空白已在前段统一校验（含空串）；此处只查重复与盘数
             if nodes[..i].iter().any(|m| m.id == n.id) {
                 return Err(Error::Encode(format!("集群节点 id 重复：{}", n.id)));
             }
@@ -135,11 +133,7 @@ impl ClusterTopology {
                 .ok_or_else(|| Error::Encode("槽位数溢出 u16".into()))?;
         }
         let min = ec.data as u16 + ec.parity as u16;
-        if total > 255 {
-            return Err(Error::Encode(format!(
-                "槽位数 {total} 超过 255（ShardRef.drive 为 u8）"
-            )));
-        }
+        // （total>255 已在前段 u32 求和处校验；此处只需 checked_add 的溢出下不变量）
         if total < min {
             return Err(Error::Encode(format!(
                 "槽位数 {total} 不足 EC {}+{}（集群须 ≥ {min}）",

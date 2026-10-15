@@ -111,6 +111,16 @@ impl Acl {
             .unwrap_or_else(|| "Off".to_string()))
     }
 
+    /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶
+    /// 对象；verifier S6-1）。表在共享 DB（migrations 0001），S3 面与控制面同口径。
+    pub async fn clear_lifecycle_rules(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 写桶版本控制状态（PutBucketVersioning；授权门已确认桶主/管理员）。
     /// 返回 false = 桶无 DB 行（S3 层按 NoSuchBucket 处置）。
     pub async fn set_bucket_versioning(

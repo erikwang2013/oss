@@ -111,6 +111,12 @@ pub fn routes() -> Router<AppState> {
         .route("/groups", get(list_groups))
         // 集群状态（管理员；单机优雅降级为 mode:"single"）
         .route("/cluster/status", get(cluster_status))
+        // M4 切片 6：作业记录（管理员）与桶生命周期规则（桶主或管理员）
+        .route("/jobs", get(list_jobs))
+        .route(
+            "/buckets/{bucket}/lifecycle",
+            get(get_lifecycle).put(put_lifecycle),
+        )
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
         .route("/buckets/{bucket}/objects", get(list_objects))
@@ -278,6 +284,129 @@ async fn list_groups(
     Json(state.cfg.groups.clone()).into_response()
 }
 
+/// 作业记录（M4 切片 6；管理员）：最近 100 条，最新在前。
+async fn list_jobs(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    match state.db.list_jobs(100).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询 jobs 失败");
+            internal_error()
+        }
+    }
+}
+
+/// 桶生命周期规则（M4 切片 6）：读 —— 桶主或管理员。
+async fn get_lifecycle(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+) -> Response {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match state.acl().is_owner(&bucket, uid).await {
+        Ok(true) => {}
+        Ok(false) if is_admin => {}
+        Ok(false) => return forbidden("需要桶主或管理员"),
+        Err(e) => {
+            tracing::error!(error = %e, "归属查询失败");
+            return internal_error();
+        }
+    }
+    match state.db.list_lifecycle_rules(&bucket).await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "prefix": r.prefix, "expire_days": r.expire_days, "enabled": r.enabled,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询生命周期规则失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LifecycleRuleIn {
+    #[serde(default)]
+    prefix: String,
+    expire_days: i64,
+    #[serde(default = "default_true_bool")]
+    enabled: bool,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+/// 桶生命周期规则全量替换（M4 切片 6）：写 —— 桶主或管理员。
+/// 校验：prefix 无控制字符且 ≤1024；expire_days ∈ 0..=36500（0 = 立即到期，测试/激进清理）。
+async fn put_lifecycle(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    Json(rules): Json<Vec<LifecycleRuleIn>>,
+) -> Response {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match state.acl().is_owner(&bucket, uid).await {
+        Ok(true) => {}
+        Ok(false) if is_admin => {}
+        Ok(false) => return forbidden("需要桶主或管理员"),
+        Err(e) => {
+            tracing::error!(error = %e, "归属查询失败");
+            return internal_error();
+        }
+    }
+    if rules.len() > 100 {
+        return (StatusCode::BAD_REQUEST, "规则过多（≤100）").into_response();
+    }
+    let mut rows = Vec::with_capacity(rules.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in rules {
+        if r.prefix.len() > 1024 || r.prefix.chars().any(char::is_control) {
+            return (StatusCode::BAD_REQUEST, "prefix 非法").into_response();
+        }
+        if !seen.insert(r.prefix.clone()) {
+            return (StatusCode::BAD_REQUEST, "prefix 重复").into_response();
+        }
+        if !(0..=36_500).contains(&r.expire_days) {
+            return (StatusCode::BAD_REQUEST, "expire_days 须在 0..=36500").into_response();
+        }
+        rows.push(crate::db::LifecycleRuleRow {
+            bucket: bucket.clone(),
+            prefix: r.prefix,
+            expire_days: r.expire_days,
+            enabled: r.enabled,
+        });
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match state.db.set_lifecycle_rules(&bucket, &rows, now).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "写生命周期规则失败");
+            internal_error()
+        }
+    }
+}
+
 /// 桶列表（带能力位，前端按位显隐按钮）：管理员全量；子账户 = 可见集（自有 ∪ 任一授权位）
 /// 与磁盘列表求交。**磁盘是权威**——历史桶可能没有 DB 行（owner NULL ⇒ 仅管理员可见）。
 async fn list_buckets(
@@ -384,6 +513,10 @@ async fn delete_bucket(
             if let Err(e) = state.acl().forget_bucket(&bucket).await {
                 // 桶已删除：记账行残留只影响列表展示，不失败请求
                 tracing::warn!(error = ?e, "清理桶记账失败");
+            }
+            // S6-1：生命周期规则一并清——桶名可复用，旧规则复活会误删新桶对象
+            if let Err(e) = state.acl().clear_lifecycle_rules(&bucket).await {
+                tracing::warn!(error = ?e, "清理桶生命周期规则失败");
             }
             StatusCode::NO_CONTENT.into_response()
         }

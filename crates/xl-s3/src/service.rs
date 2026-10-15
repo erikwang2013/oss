@@ -377,9 +377,12 @@ impl S3 for OssS3 {
             .delete_bucket(&bucket)
             .await
             .map_err(to_s3_error)?;
-        // 记账清理（授权门已确认桶主/管理员）：清授权行 + 桶行
+        // 记账清理（授权门已确认桶主/管理员）：清授权行 + 桶行 + 生命周期规则
         if let Err(e) = self.acl.forget_bucket(&bucket).await {
             tracing::warn!(error = ?e, bucket, "删桶记账清理失败");
+        }
+        if let Err(e) = self.acl.clear_lifecycle_rules(&bucket).await {
+            tracing::warn!(error = ?e, bucket, "删桶生命周期规则清理失败");
         }
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }

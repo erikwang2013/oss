@@ -918,3 +918,157 @@ mod tests {
         assert!(db.get_user(1).await.unwrap().is_some());
     }
 }
+
+// ——— M4 切片 6：生命周期规则与作业（jobs 表进度） ———
+
+/// 生命周期规则行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LifecycleRuleRow {
+    pub bucket: String,
+    pub prefix: String,
+    pub expire_days: i64,
+    pub enabled: bool,
+}
+
+impl Db {
+    /// 某桶的全部规则（控制台 GET 用）。
+    pub async fn list_lifecycle_rules(&self, bucket: &str) -> Result<Vec<LifecycleRuleRow>> {
+        let rows = sqlx::query(
+            "SELECT bucket, prefix, expire_days, enabled FROM lifecycle_rules \
+             WHERE bucket = ? ORDER BY prefix",
+        )
+        .bind(bucket)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| LifecycleRuleRow {
+                bucket: r.get("bucket"),
+                prefix: r.get("prefix"),
+                expire_days: r.get("expire_days"),
+                enabled: r.get::<i64, _>("enabled") != 0,
+            })
+            .collect())
+    }
+
+    /// 全量替换某桶规则（PUT 语义：先删后插，一个事务）。`now` 由调用方给（可测）。
+    pub async fn set_lifecycle_rules(
+        &self,
+        bucket: &str,
+        rules: &[LifecycleRuleRow],
+        now: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await?;
+        for r in rules {
+            sqlx::query(
+                "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(bucket)
+            .bind(&r.prefix)
+            .bind(r.expire_days)
+            .bind(if r.enabled { 1 } else { 0 })
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 全部启用规则（worker 扫描用）。
+    pub async fn enabled_lifecycle_rules(&self) -> Result<Vec<LifecycleRuleRow>> {
+        let rows = sqlx::query(
+            "SELECT bucket, prefix, expire_days, enabled FROM lifecycle_rules WHERE enabled = 1",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| LifecycleRuleRow {
+                bucket: r.get("bucket"),
+                prefix: r.get("prefix"),
+                expire_days: r.get("expire_days"),
+                enabled: true,
+            })
+            .collect())
+    }
+
+    /// 开一条作业（worker 每次执行一条）。
+    pub async fn job_start(&self, kind: &str, bucket: &str, prefix: &str, now: i64) -> Result<i64> {
+        let id = sqlx::query(
+            "INSERT INTO jobs (kind, bucket, prefix, state, created_at, updated_at) \
+             VALUES (?, ?, ?, 'running', ?, ?)",
+        )
+        .bind(kind)
+        .bind(bucket)
+        .bind(prefix)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+        Ok(id)
+    }
+
+    /// 收尾一条作业（done/error + 计数 + 可选错误）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn job_finish(
+        &self,
+        id: i64,
+        state: &str,
+        scanned: i64,
+        deleted: i64,
+        skipped: i64,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET state = ?, scanned = ?, deleted = ?, skipped = ?, error = ?, \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(state)
+        .bind(scanned)
+        .bind(deleted)
+        .bind(skipped)
+        .bind(error)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 最近作业（控制台 GET /jobs；最新在前）。
+    pub async fn list_jobs(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, bucket, prefix, state, scanned, deleted, skipped, error, \
+             created_at, updated_at FROM jobs ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<i64, _>("id"),
+                    "kind": r.get::<String, _>("kind"),
+                    "bucket": r.get::<String, _>("bucket"),
+                    "prefix": r.get::<String, _>("prefix"),
+                    "state": r.get::<String, _>("state"),
+                    "scanned": r.get::<i64, _>("scanned"),
+                    "deleted": r.get::<i64, _>("deleted"),
+                    "skipped": r.get::<i64, _>("skipped"),
+                    "error": r.get::<Option<String>, _>("error"),
+                    "created_at": r.get::<i64, _>("created_at"),
+                    "updated_at": r.get::<i64, _>("updated_at"),
+                })
+            })
+            .collect())
+    }
+}

@@ -314,6 +314,8 @@ scrape_configs:
 新盘必须先「入册」——在已挂载的新盘上
 `mkdir -p <盘>/.oss.sys && cp <任一旧盘>/.oss.sys/drive-id <盘>/.oss.sys/`
 （防遮挂载点 impostor 的既有策略不允许自动初始化非首启盘）。
+注意：**单节点盘数不得超过 parity**（默认 8+4 即每节点 ≤4 盘，超过启动拒启）——加盘是 3→4 而非 3→5；
+更大容量走**加节点**（新节点同样 ≤4 盘）。
 
 **加节点**：`cluster.nodes` 尾部追加 + 该节点自备配置启动。**加节点后也要全节点 placement=v2 + rebalance**
 （v1 恒等放置永不使用新槽）。
@@ -341,6 +343,23 @@ GET / HEAD / DeleteObject 带 `--version-id` 点名版本；`copy-object --copy-
   返回 400 InvalidArgument（fail-loud）。
 - 集群：版本追加仍走 write_meta quorum（整份 meta 重写）；`list-object-versions` 集群路径为逐键 quorum 读
   （低频运维面，量级上去再做分页 RPC——记档）。
+
+## 生命周期（M4）
+
+控制台 API `PUT /api/v1/buckets/{bucket}/lifecycle`（body `[{prefix, expire_days, enabled}]`，**全量替换**；
+桶主或管理员）配置，`GET` 同路径回读。后台 worker 按 `OSS_LIFECYCLE_INTERVAL_SECS`（默认 60s；显式 `0`
+关 worker）扫描，到期判定 `now - last_modified ≥ expire_days×24h`（**0 = 立即到期**，测试/激进清理用）
+自动删除：版本控制桶 = 打 **delete marker**（不物理删；noncurrent 版本过期未实现，记档），非版本桶 = 整键删除。
+
+进度：`GET /api/v1/jobs`（admin）看最近作业（scanned / deleted / skipped / state / error，逐规则一条）。
+
+**边界**：
+- 转换/分层归 M8。
+- **同刻建议只跑一个 serve 实例**：每实例各挂 worker（多实例会重复执行；幂等但白跑）。
+- **大桶性能**：worker 每周期对该桶全前缀列举一次——前缀很大时建议调大 `OSS_LIFECYCLE_INTERVAL_SECS`。
+- **饥饿边界**：单轮单规则 ≤10 万键（100 页 × 1000）；超出即**截停记 jobs.error**（`state=error`，不静默）——
+  但**扫描位点不跨轮持久化**，前缀下若长期 >10 万「未到期」键，尾部的到期键可能长期扫不到（调小 prefix 拆规则可解）。
+- **陈旧作业行**：进程崩溃可能留下 `state='running'` 的 jobs 行（无自动回收，展示层可按 updated_at 过旧识别）。
 
 ## 验收
 

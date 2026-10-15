@@ -57,3 +57,27 @@ CREATE TABLE IF NOT EXISTS permissions (
     can_delete INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, bucket)
 );
+
+-- M4 切片 6：生命周期规则与作业记录（0001 整份重放，增量表对新老库都幂等）
+CREATE TABLE IF NOT EXISTS lifecycle_rules (
+    bucket      TEXT NOT NULL,
+    prefix      TEXT NOT NULL DEFAULT '',   -- 对象键前缀（'' = 全桶）
+    expire_days INTEGER NOT NULL,           -- 0 = 立即到期（测试/激进清理）；负值拒绝（应用层校验）
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (bucket, prefix)
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,              -- 目前仅 'lifecycle'
+    bucket      TEXT NOT NULL DEFAULT '',
+    prefix      TEXT NOT NULL DEFAULT '',
+    state       TEXT NOT NULL DEFAULT 'running', -- running | done | error
+    scanned     INTEGER NOT NULL DEFAULT 0,
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    skipped     INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
