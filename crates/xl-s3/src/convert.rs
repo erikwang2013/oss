@@ -20,10 +20,13 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         // 对 delete marker 版本点名 GET/HEAD：405（S3 语义）
         StoreError::DeleteMarker(_) => S3ErrorCode::MethodNotAllowed,
         StoreError::InvalidArgument(_) => S3ErrorCode::InvalidArgument,
-        // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体
+        // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体。
+        // M5：Crypto（wrap 解不开/主密钥缺失）暂同归 500 泛化——对客户端可纠正的形态
+        // （SSE-C 错钥 → 4xx）在切片 3 接线时再细分，此处不提前放宽。
         StoreError::QuorumUnmet(_)
         | StoreError::CorruptMeta(_)
         | StoreError::Encode(_)
+        | StoreError::Crypto(_)
         | StoreError::Io(_) => {
             tracing::error!(error = ?e, "store internal error");
             return S3Error::with_message(S3ErrorCode::InternalError, "internal error");
@@ -83,6 +86,7 @@ mod tests {
         for e in [
             StoreError::CorruptMeta("不支持的格式版本 9".into()),
             StoreError::Encode("e".into()),
+            StoreError::Crypto("unwrap 解密失败".into()),
             StoreError::Io(std::io::Error::other("io")),
         ] {
             let err = to_s3_error(e);

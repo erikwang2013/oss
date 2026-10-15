@@ -34,5 +34,7 @@ s3s = "0.17"
 aetherupload-rust = { version = "3.0.0", features = ["ecat"] }
 reed-solomon-erasure = "6.0.0"
 crc32c = "0.6"
+# M5 钦定（设计 §依赖表）：DEK wrap = AES-256-GCM（RustCrypto；默认 features 带 getrandom → OsRng）
+aes-gcm = "0.10"
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }

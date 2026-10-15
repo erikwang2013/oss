@@ -39,6 +39,10 @@ pub enum Error {
     /// M4 版本控制：非法参数（如 version-id-marker 不在链内）→ S3 400。
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// M5 密钥库/加解密：wrap 解密失败（篡改/错钥）、主密钥文件损坏等——独立变体供上层
+    /// 精确映射（如 SSE-C 错钥 → 4xx，而非 500 泛化）。
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

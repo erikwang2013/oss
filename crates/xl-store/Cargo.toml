@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
 futures.workspace = true
