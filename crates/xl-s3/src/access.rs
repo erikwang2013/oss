@@ -1010,6 +1010,7 @@ mod tests {
                 secret: None,
                 flag: Some(true),
                 names: None,
+                set: None,
             }))),
         );
         let u = AuthedUser {
@@ -1051,6 +1052,7 @@ mod tests {
                 secret: None,
                 flag: None,
                 names: None,
+                set: None,
             }))),
         );
         assert!(a.is_owner("bkt", 7).await.unwrap());
@@ -1067,6 +1069,7 @@ mod tests {
                 secret: None,
                 flag: None,
                 names: Some(vec!["beta".into(), "gamma".into()]),
+                set: None,
             }))),
         );
         let v = a2.visible(7).await.unwrap();

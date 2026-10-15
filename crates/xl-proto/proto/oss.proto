@@ -29,14 +29,18 @@ message ShardWrite { string bucket=1; string key=2; string uuid=3; uint32 part=4
                      // M4 切片 5：请求方携带槽位（meta 的 ShardRef.drive / 搬迁前老槽）；
                      // 服务端只校验归属并按槽拼路径，**不再重算放置公式**（新旧公式并存会
                      // 让存量对象远端面全错——设计评审 A）。
-                     uint32 slot=12; }
+                     uint32 slot=12;
+                     // M4 切片 8（多 set）：桶钉定的 EC 组号（缺省 0 = 单 set 兼容）；
+                     // 槽为**组内**槽，服务端按 sets[set] 校验归属并按 (set, 槽) 拼路径。
+                     uint32 set=13; }
 message ShardRead  { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5;
                      // M4 切片 2：length=0 = 整片（旧语义）；否则读 [offset, offset+length)
                      //（短读视同缺失——崩溃半截件由 EC 重建兜底）。
                      uint64 offset=6; uint64 length=7;
-                     uint32 slot=8; }
+                     uint32 slot=8;
+                     uint32 set=9; }
 message ShardDelete { string bucket=1; string key=2; string uuid=3; uint32 part=4; uint32 shard=5;
-                      uint32 slot=6; }
+                      uint32 slot=6; uint32 set=7; }
 message ShardResp  { bool found=1; uint32 crc32c=2; bytes data=3; }
 message VersionDirRef { string bucket=1; string key=2; string uuid=3; }
 message MetaWrite { string bucket=1; string key=2; bytes meta=3; }
@@ -55,6 +59,10 @@ message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epo
 enum LockOp { ACQUIRE=0; RENEW=1; RELEASE=2; }
 message LockResp { bool granted=1; }
 message ControlReq { ControlKind kind=1; string a=2; string b=3; uint32 c=4; int64 uid=5; }
-enum ControlKind { ACCESS_KEY=0; PERMISSION=1; OWNED_BUCKETS=2; VISIBLE_BUCKETS=3; BUCKET_OWNER=4; }
+enum ControlKind { ACCESS_KEY=0; PERMISSION=1; OWNED_BUCKETS=2; VISIBLE_BUCKETS=3; BUCKET_OWNER=4;
+                   // M4 切片 8：桶 → set（a = bucket）；found=false = 无行（set 字段仅在 found=true 有效）
+                   BUCKET_SET=5; }
 message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
-                      string secret=5; bool flag=6; repeated string names=7; }
+                      string secret=5; bool flag=6; repeated string names=7;
+                      // M4 切片 8：BUCKET_SET 应答（found=true 时有效）
+                      uint32 set=8; }

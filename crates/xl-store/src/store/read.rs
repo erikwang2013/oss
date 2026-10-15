@@ -234,6 +234,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::store) async fn read_shard_block(
         &self,
+        set: u16,
         bucket: &str,
         key: &str,
         v: &Version,
@@ -247,7 +248,7 @@ impl Store {
             return Ok(None);
         }
         let len = (ss - off).min(ec::CHUNK_W as u64) as usize;
-        match self.shard_target(s) {
+        match self.shard_target(set, s) {
             Some(drives::ShardTarget::Local { drive, .. }) => {
                 let path = drives::shard_path(drive, bucket, key, &v.part.uuid, s)?;
                 let mut f = match tokio::fs::File::open(&path).await {
@@ -279,6 +280,8 @@ impl Store {
                     length: len as u64,
                     // M4 切片 5：槽位 = meta 的 ShardRef.drive（服务端只校验归属）
                     slot: s.drive as u32,
+                    // M4 切片 8：桶所属 set
+                    set: set as u32,
                 };
                 match tp.read_shard(node, r).await {
                     Ok(Some(b)) if b.len() == len => Ok(Some(b.to_vec())),
@@ -312,6 +315,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     async fn read_decode_block(
         &self,
+        set: u16,
         bucket: &str,
         key: &str,
         v: &Version,
@@ -327,7 +331,10 @@ impl Store {
         let data = l.data as usize;
         let mut chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
         for (i, s) in l.shards.iter().enumerate() {
-            match self.read_shard_block(bucket, key, v, s, i, t, ss).await? {
+            match self
+                .read_shard_block(set, bucket, key, v, s, i, t, ss)
+                .await?
+            {
                 Some(b) => {
                     *any_bytes = true;
                     chunks.push(Some(b));
@@ -380,6 +387,8 @@ impl Store {
         range: Option<std::ops::Range<u64>>,
         strict: bool,
     ) -> Result<Option<Bytes>> {
+        // M4 切片 8：桶所属 set（一次解析、本对象读全线透传）
+        let set = self.set_of_bucket(bucket).await?;
         let cfg = ec::EcConfig {
             data: l.data,
             parity: l.parity,
@@ -411,6 +420,7 @@ impl Store {
                 for t in 0..blocks {
                     let Some(chunks) = self
                         .read_decode_block(
+                            set,
                             bucket,
                             key,
                             v,
@@ -461,6 +471,7 @@ impl Store {
                 for t in t_min..=t_max {
                     let Some(chunks) = self
                         .read_decode_block(
+                            set,
                             bucket,
                             key,
                             v,
@@ -515,7 +526,7 @@ impl Store {
                 )));
             }
             if !missing.is_empty() {
-                self.repair_shards_chunked(bucket, key, v, l, &out, &missing)
+                self.repair_shards_chunked(set, bucket, key, v, l, &out, &missing)
                     .await;
             }
         }
@@ -528,8 +539,10 @@ impl Store {
     /// 盲写会填满根盘）；远端走 write_shard 分块 RPC。
     /// M4 切片 4 已落地批量面：`heal`（fsck --repair + 桶目录补建）与 `scrub`（逐块深度
     /// 对偶校验）；本函数仍是**读时兜底**（盘全掉时修复静默失败，报告由 scrub 承担）。
+    #[allow(clippy::too_many_arguments)]
     async fn repair_shards_chunked(
         &self,
+        set: u16,
         bucket: &str,
         key: &str,
         v: &Version,
@@ -563,7 +576,7 @@ impl Store {
         let mut sinks: Vec<(usize, Sink)> = Vec::new();
         for &i in &bad {
             let Some(s) = l.shards.get(i) else { continue };
-            let sink = match self.shard_target(s) {
+            let sink = match self.shard_target(set, s) {
                 Some(drives::ShardTarget::Local { drive, .. }) => {
                     if !drives::drive_up(drive).await {
                         Sink::Skip
@@ -663,6 +676,7 @@ impl Store {
                                 chunk_crc32c: ec::crc32c_of(chunk),
                                 is_final,
                                 slot: l.shards[*i].drive as u32,
+                                set: set as u32,
                             };
                             if let Err(e) = tp.write_shard(node, req).await {
                                 failed = Some(e);

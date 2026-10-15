@@ -22,7 +22,10 @@ impl Store {
     pub async fn mesh_health(&self) -> NodeHealth {
         let (node_id, base) = match self.cfg.cluster.as_deref() {
             None => ("single".to_string(), 0u16),
-            Some(cl) => (cl.topo.self_node().id.clone(), cl.topo.local_slot_base()),
+            Some(cl) => (
+                cl.sets.flat.self_node().id.clone(),
+                cl.sets.flat.local_slot_base(),
+            ),
         };
         let mut slots = Vec::with_capacity(self.cfg.drives.len());
         for (i, drive) in self.cfg.drives.iter().enumerate() {
@@ -62,45 +65,40 @@ impl Store {
         self.cfg.cluster.as_deref().map(|c| &c.transport)
     }
 
-    /// 槽位归属校验（M4 切片 5）：槽位由请求方携带，服务端**只校验归属并按槽拼路径**——
-    /// 不再重算放置公式（新旧公式并存会让存量对象远端面全错，设计评审 A）。
-    fn local_drive_of_request_slot(&self, slot: u32) -> Result<&std::path::Path> {
+    /// 槽位归属校验（M4 切片 5；切片 8 加 set）：槽位由请求方携带，服务端**只校验归属并按
+    /// (set, 槽) 拼路径**——不再重算放置公式（新旧公式并存会让存量对象远端面全错，评审 A）。
+    /// 洞 1 修法 (a)：组内序经 `flat_of` 映射到 cfg.drives 扁平下标（不可直接当盘下标用）。
+    fn local_drive_of_request_slot(&self, set: u32, slot: u32) -> Result<&std::path::Path> {
         let cl = self
             .cfg
             .cluster
             .as_deref()
             .ok_or_else(|| Error::Encode("非集群模式没有 mesh 面".into()))?;
+        let set = u16::try_from(set).map_err(|_| Error::Encode(format!("set 越界: {set}")))?;
         let slot = u16::try_from(slot).map_err(|_| Error::Encode(format!("槽位越界: {slot}")))?;
-        if cl.topo.local_drive_of_slot(slot).is_none() {
-            return Err(Error::Encode(format!(
-                "槽位 {slot} 不属本节点（请求误导？）"
-            )));
-        }
-        self.local_drive_of_slot(slot)
-    }
-
-    fn local_drive_of_slot(&self, slot: u16) -> Result<&std::path::Path> {
-        let cl = self
-            .cfg
-            .cluster
-            .as_deref()
-            .ok_or_else(|| Error::Encode("非集群模式没有 mesh 面".into()))?;
-        let d = cl
-            .topo
-            .local_drive_of_slot(slot)
-            .ok_or_else(|| Error::Encode(format!("槽位 {slot} 不属本节点")))?;
+        let topo = cl
+            .sets
+            .set_topo(set)
+            .ok_or_else(|| Error::Encode(format!("set {set} 不在拓扑内")))?;
+        let ord = topo.local_drive_of_slot(slot).ok_or_else(|| {
+            Error::Encode(format!("槽位 {slot} 不属本节点 set {set}（请求误导？）"))
+        })?;
+        let flat = cl
+            .sets
+            .flat_of(set, ord)
+            .ok_or_else(|| Error::Encode(format!("set {set} 组内序 {ord} 无物理盘映射")))?;
         self.cfg
             .drives
-            .get(d)
+            .get(flat)
             .map(std::path::PathBuf::as_path)
-            .ok_or_else(|| Error::Encode(format!("槽位 {slot} 的本地盘下标 {d} 越界")))
+            .ok_or_else(|| Error::Encode(format!("set {set} 槽 {slot} 的扁平盘下标 {flat} 越界")))
     }
 
     /// 幂等分片写（服务端）：**先验 CRC32C 再落盘**（等同本地落盘强度，防腐坏入库）。
     /// 整片语义（`chunked=false`）行为与 M3 完全一致；分块语义（`chunked=true`）按
     /// `(offset, chunk_crc32c, is_final)` 定位写、逐块校验、末块 fsync。
     pub async fn mesh_write_shard(&self, w: crate::mesh::ShardWrite) -> Result<()> {
-        let drive = self.local_drive_of_request_slot(w.slot)?;
+        let drive = self.local_drive_of_request_slot(w.set, w.slot)?;
         let dir = layout::object_dir(drive, &w.bucket, &w.key)?.join(&w.uuid);
         tokio::fs::create_dir_all(&dir).await?;
         // 与 drives::shard_path 同式（part.<part>.<shard>）
@@ -152,7 +150,7 @@ impl Store {
     /// 分片读（服务端）：缺失 → Ok(None)（调用方视同该片缺失）；本机 IO 错误 → Err。
     /// `length=0` = 整片（旧语义）；分块读 `[offset, offset+length)`，短读（半截件）视同缺失。
     pub async fn mesh_read_shard(&self, r: crate::mesh::ShardRead) -> Result<Option<bytes::Bytes>> {
-        let drive = self.local_drive_of_request_slot(r.slot)?;
+        let drive = self.local_drive_of_request_slot(r.set, r.slot)?;
         let path = layout::object_dir(drive, &r.bucket, &r.key)?
             .join(&r.uuid)
             .join(format!("part.{}.{}", r.part, r.shard));
@@ -190,7 +188,7 @@ impl Store {
 
     /// 单片删除（M4 切片 5 rebalance  cleanup；幂等）：槽位显式携带（flip 后 meta 已不记老槽）。
     pub async fn mesh_delete_shard(&self, d: crate::mesh::ShardDelete) -> Result<()> {
-        let drive = self.local_drive_of_request_slot(d.slot)?;
+        let drive = self.local_drive_of_request_slot(d.set, d.slot)?;
         let path = layout::object_dir(drive, &d.bucket, &d.key)?
             .join(&d.uuid)
             .join(format!("part.{}.{}", d.part, d.shard));
@@ -244,7 +242,7 @@ impl Store {
     pub(in crate::store) fn slot_base(&self) -> u16 {
         match self.cfg.cluster.as_deref() {
             None => 0,
-            Some(cl) => cl.topo.local_slot_base(),
+            Some(cl) => cl.sets.flat.local_slot_base(),
         }
     }
 
@@ -328,8 +326,8 @@ impl Store {
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return;
         };
-        let self_id = cl.topo.self_node().id.clone();
-        for n in &cl.topo.nodes {
+        let self_id = cl.sets.flat.self_node().id.clone();
+        for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
             }

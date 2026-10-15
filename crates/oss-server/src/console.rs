@@ -234,11 +234,11 @@ async fn cluster_status(
     match state.store.cluster() {
         Some(c) => {
             let peers = crate::router::probe_peers(&state).await;
-            let me = c.topo.self_node();
+            let me = c.sets.flat.self_node();
             let mut nodes = vec![serde_json::json!({
                 "id": me.id, "addr": me.addr, "drive_count": me.drive_count, "up": true,
             })];
-            for n in &c.topo.nodes {
+            for n in &c.sets.flat.nodes {
                 if n.id == me.id {
                     continue;
                 }
@@ -250,17 +250,35 @@ async fn cluster_status(
                     "id": n.id, "addr": n.addr, "drive_count": n.drive_count, "up": up,
                 }));
             }
+            // M4 切片 8：多 set 视图——每 set 独立槽域（R3：跨 set 槽号会重号，必须分组呈现）；
+            // topo_fingerprint = 本节点**首盘**（data_dirs[0] = set0 段首）的记录串，与写盘共用
+            // 同一构造器（xl_store::store::topo_record），可直接与盘上文件等值比对；
+            // set0 恒 v2、set>0 恒 v3（切片 8 口径）；切片 5 前的旧盘保留 v1 记录（读侧兼容）
+            let sets_view: Vec<serde_json::Value> = c
+                .sets
+                .sets
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    serde_json::json!({
+                        "set": i,
+                        "slot_count": t.slot_count(),
+                        "self": c.sets.self_ranges.iter().any(|(s, _, _)| *s as usize == i),
+                        "nodes": t.nodes.iter().map(|n| serde_json::json!({
+                            "id": n.id, "addr": n.addr, "drive_count": n.drive_count,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            let (first_set, first_off, _) = c.sets.self_ranges[0];
+            let topo_fingerprint =
+                xl_store::store::topo_record(first_set, &me.id, first_off as u16);
             Json(serde_json::json!({
                 "mode": "cluster",
                 "node_id": me.id,
-                "slot_count": c.topo.slot_count(),
-                // 本节点首盘（slot=base）在 `.oss.sys/topo` 的完整记录串——与写盘共用同一
-                // 构造器（xl_store::store::topo_record），可直接与盘上文件等值比对；
-                // 切片 5 前的旧盘保留 v1 记录（读侧兼容，字段一致即接受）
-                "topo_fingerprint": xl_store::store::topo_record(
-                    &me.id,
-                    c.topo.local_slot_base(),
-                ),
+                "slot_count": c.sets.flat.slot_count(),
+                "topo_fingerprint": topo_fingerprint,
+                "sets": sets_view,
                 "nodes": nodes,
                 "quorum_unmet": quorum_unmet,
             }))
@@ -589,6 +607,9 @@ async fn list_buckets(
 #[derive(Deserialize)]
 struct CreateBucketBody {
     name: String,
+    /// M4 切片 8：目标 set（缺省 0；校验 < 组数——单 set 下非 0 一律 400）
+    #[serde(default)]
+    set: Option<u16>,
 }
 
 /// 任何**在册**用户可建桶（建桶者即桶主，自动全权；被停用账号的旧 JWT 在此同样失效）。
@@ -601,10 +622,18 @@ async fn create_bucket(
         Ok(v) => v,
         Err(r) => return r,
     };
+    let set = body.set.unwrap_or(0);
+    let set_count = state
+        .store
+        .cluster()
+        .map_or(1, |c| c.sets.sets.len() as u16);
+    if set >= set_count {
+        return (StatusCode::BAD_REQUEST, "set 越界").into_response();
+    }
     if let Err(e) = state.store.create_bucket(&body.name).await {
         return store_error(e).into_response();
     }
-    if let Err(e) = state.db.insert_bucket(&body.name, Some(uid)).await {
+    if let Err(e) = state.db.insert_bucket_set(&body.name, Some(uid), set).await {
         // 桶已建成：控制面行缺失只影响列表展示，不失败请求
         tracing::warn!(error = %e, "写入桶行失败");
     }

@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     owner_id      INTEGER REFERENCES users(id),
     creation_date INTEGER NOT NULL,
     versioning    TEXT NOT NULL DEFAULT 'Off',  -- M4 用
-    object_lock   INTEGER NOT NULL DEFAULT 0    -- M1 只写 0；M5 用。不加 CHECK
+    object_lock   INTEGER NOT NULL DEFAULT 0,   -- M1 只写 0；M5 用。不加 CHECK
+    set_id        INTEGER NOT NULL DEFAULT 0    -- M4 切片 8：桶→set 归属（ensure_columns 给老库补列）
 );
 
 CREATE TABLE IF NOT EXISTS uploads (

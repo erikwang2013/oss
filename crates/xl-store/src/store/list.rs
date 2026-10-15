@@ -117,7 +117,7 @@ impl Store {
     /// 集群列举（D4）：本机页 ∪ 各节点 ListLocal 页；远端不可达 warn 跳过（少一路并集）。
     async fn list_objects_cluster(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
-        let self_id = cl.topo.self_node().id.clone();
+        let self_id = cl.sets.flat.self_node().id.clone();
 
         // 桶存在性走扇出口径（本机可能曾掉线错过桶目录——懒自愈前先别 404）
         if !self.bucket_exists(bucket).await? {
@@ -149,7 +149,7 @@ impl Store {
         }
         let mut cps: Vec<String> = local_cps;
 
-        for n in &cl.topo.nodes {
+        for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
             }

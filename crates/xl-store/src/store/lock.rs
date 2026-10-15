@@ -175,7 +175,7 @@ impl Store {
             .cfg
             .cluster
             .as_deref()
-            .map_or(1, |c| c.topo.nodes.len());
+            .map_or(1, |c| c.sets.flat.nodes.len());
         n / 2 + 1
     }
 
@@ -186,13 +186,14 @@ impl Store {
         key: &str,
     ) -> Result<ClusterLockGuard> {
         let cl = self.cfg.cluster.as_deref().expect("集群分支调用");
-        let self_id = cl.topo.self_node().id.clone();
+        let self_id = cl.sets.flat.self_node().id.clone();
         let lock_key = format!("{bucket}/{key}");
         let q_n = self.q_n();
         let ttl_ms = self.cfg.cluster_lock_ttl_ms;
         let ttl = Duration::from_millis(ttl_ms);
         let others: Vec<String> = cl
-            .topo
+            .sets
+            .flat
             .nodes
             .iter()
             .filter(|n| n.id != self_id)
@@ -284,9 +285,10 @@ impl Store {
     ) -> tokio::task::JoinHandle<()> {
         let cl = self.cfg.cluster.as_deref().expect("集群分支");
         let transport = cl.transport.clone();
-        let self_id = cl.topo.self_node().id.clone();
+        let self_id = cl.sets.flat.self_node().id.clone();
         let others: Vec<String> = cl
-            .topo
+            .sets
+            .flat
             .nodes
             .iter()
             .filter(|n| n.id != self_id)

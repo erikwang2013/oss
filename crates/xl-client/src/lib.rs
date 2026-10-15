@@ -283,6 +283,7 @@ impl MeshTransport for TonicMesh {
                 chunk_crc32c: w.chunk_crc32c,
                 is_final: w.is_final,
                 slot: w.slot,
+                set: w.set,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -302,6 +303,7 @@ impl MeshTransport for TonicMesh {
                 offset: r.offset,
                 length: r.length,
                 slot: r.slot,
+                set: r.set,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -329,6 +331,7 @@ impl MeshTransport for TonicMesh {
                 part: d.part,
                 shard: d.shard,
                 slot: d.slot,
+                set: d.set,
             })
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -536,6 +539,13 @@ impl MeshTransport for TonicMesh {
                 c: 0,
                 uid: 0,
             },
+            mesh::ControlQuery::BucketSet(bucket) => xl_proto::ControlReq {
+                kind: xl_proto::ControlKind::BucketSet as i32,
+                a: bucket,
+                b: String::new(),
+                c: 0,
+                uid: 0,
+            },
         };
         let resp = self
             .client(n)?
@@ -551,6 +561,7 @@ impl MeshTransport for TonicMesh {
             secret: (!resp.secret.is_empty()).then_some(resp.secret),
             flag: Some(resp.flag),
             names: Some(resp.names),
+            set: Some(resp.set),
         }))
     }
 }
@@ -604,6 +615,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 chunk_crc32c: w.chunk_crc32c,
                 is_final: w.is_final,
                 slot: w.slot,
+                set: w.set,
             })
             .await
             .map_err(internal)?;
@@ -625,6 +637,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 offset: s.offset,
                 length: s.length,
                 slot: s.slot,
+                set: s.set,
             })
             .await
             .map_err(internal)?;
@@ -650,6 +663,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 part: d.part,
                 shard: d.shard,
                 slot: d.slot,
+                set: d.set,
             })
             .await
             .map_err(internal)?;
@@ -837,6 +851,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             xl_proto::ControlKind::OwnedBuckets => mesh::ControlQuery::OwnedBuckets(l.uid),
             xl_proto::ControlKind::VisibleBuckets => mesh::ControlQuery::VisibleBuckets(l.uid),
             xl_proto::ControlKind::BucketOwner => mesh::ControlQuery::BucketOwner(l.a),
+            xl_proto::ControlKind::BucketSet => mesh::ControlQuery::BucketSet(l.a),
         };
         let row = self.store.mesh_control_query(q).await.map_err(internal)?;
         Ok(tonic::Response::new(match row {
@@ -848,6 +863,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 secret: r.secret.unwrap_or_default(),
                 flag: r.flag.unwrap_or(false),
                 names: r.names.unwrap_or_default(),
+                set: r.set.unwrap_or(0),
             },
             None => xl_proto::ControlResp {
                 found: false,
@@ -872,7 +888,7 @@ pub async fn serve(store: Arc<Store>, addr: SocketAddr, secret: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xl_store::store::{ClusterConfig, ClusterTopology, NodeSpec, StoreConfig};
+    use xl_store::store::{ClusterConfig, ClusterSets, NodeSpec, StoreConfig};
 
     async fn free_addr() -> SocketAddr {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -948,24 +964,21 @@ mod tests {
             parity: 1,
             enabled: true,
         };
-        let topo = ClusterTopology::new(
-            0,
-            vec![NodeSpec {
-                id: "n1".into(),
-                addr: addr.to_string(),
-                drive_count: 2,
-            }],
-            &ec,
-        )
-        .unwrap();
+        let topo_nodes = vec![NodeSpec {
+            id: "n1".into(),
+            addr: addr.to_string(),
+            drive_count: 2,
+        }];
+        let sets = ClusterSets::single("n1", topo_nodes, &ec).unwrap();
         let mut cfg = StoreConfig::new(&dirs[0]);
         cfg.drives = dirs;
         cfg.ec = ec;
         cfg.fsync = false; // 测试提速
         cfg.cluster = Some(Arc::new(ClusterConfig {
             placement_v2: false,
-            topo,
+            sets,
             transport: mesh.clone(),
+            resolver: None,
         }));
         let store = Arc::new(Store::open(cfg).await.unwrap());
         let s2 = store.clone();
@@ -1026,6 +1039,7 @@ mod tests {
         // 分片：写 → 读回 → 换 part 即缺失（part/shard 映射真的落在查找路径上）
         let data = bytes::Bytes::from_static(b"hello shard");
         let sw = |part| mesh::ShardWrite {
+            set: 0,
             bucket: "buck".into(),
             key: "k2".into(),
             uuid: "u1".into(),
@@ -1041,6 +1055,7 @@ mod tests {
         };
         mesh.write_shard("n1", sw(3)).await.unwrap();
         let sr = |part| mesh::ShardRead {
+            set: 0,
             bucket: "buck".into(),
             key: "k2".into(),
             uuid: "u1".into(),

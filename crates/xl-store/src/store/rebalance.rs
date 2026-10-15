@@ -42,7 +42,20 @@ impl Store {
             return Ok(rep);
         }
         let (keys, _buckets) = self.collect_namespace().await?;
+        // M4 切片 8：per-bucket set 缓存（未扩容的 set 新旧组内槽相等 → need 空 → 天然 0 移动）
+        let mut cur_bucket: Option<String> = None;
+        let mut cur_set: u16 = 0;
         for (bucket, key) in keys {
+            if cur_bucket.as_deref() != Some(bucket.as_str()) {
+                match self.set_of_bucket(&bucket).await {
+                    Ok(s) => cur_set = s,
+                    Err(e) => {
+                        rep.skipped.push(format!("{bucket}: set 解析失败 {e}"));
+                        continue;
+                    }
+                }
+                cur_bucket = Some(bucket.clone());
+            }
             rep.objects_scanned += 1;
             // 锁外粗读：定位「链尾向前第一个非 marker 数据版本」
             let m0 = match self.read_meta(&bucket, &key).await {
@@ -63,9 +76,15 @@ impl Store {
             let v = m0.versions[idx].clone();
             let l = v.data_layout.clone().expect("rposition 已过滤");
             let hash = Store::placement_hash(&bucket, &key);
-            let need: Vec<usize> = (0..shard_count)
-                .filter(|&i| l.shards[i].drive != self.slot_of_shard(hash, i as u8) as u8)
-                .collect();
+            let need: Vec<usize> = {
+                let mut n = Vec::new();
+                for i in 0..shard_count {
+                    if l.shards[i].drive != self.slot_of_shard(cur_set, hash, i as u8)? as u8 {
+                        n.push(i);
+                    }
+                }
+                n
+            };
             if need.is_empty() {
                 continue;
             }
@@ -75,7 +94,10 @@ impl Store {
                 rep.bytes_moved += need.len() as u64 * l.shard_size;
                 continue;
             }
-            match self.rebalance_one(&bucket, &key, &v, &l, &need, hash).await {
+            match self
+                .rebalance_one(cur_set, &bucket, &key, &v, &l, &need, hash)
+                .await
+            {
                 Ok(n) => {
                     rep.objects_moved += 1;
                     rep.shards_moved += n;
@@ -88,8 +110,10 @@ impl Store {
     }
 
     /// 单对象搬迁：copy → 锁内翻转（提交点）→ 清老片。
+    #[allow(clippy::too_many_arguments)]
     async fn rebalance_one(
         &self,
+        set: u16,
         bucket: &str,
         key: &str,
         v: &Version,
@@ -103,9 +127,12 @@ impl Store {
         // 1) copy：逐需搬片、逐块（常量内存；源缺失 → 放弃该对象下轮重试）
         for &i in need {
             let s = &l.shards[i];
-            let new_slot = self.slot_of_shard(hash, i as u8);
+            let new_slot = self.slot_of_shard(set, hash, i as u8)?;
             for t in 0..blocks {
-                let Some(chunk) = self.read_shard_block(bucket, key, v, s, i, t, ss).await? else {
+                let Some(chunk) = self
+                    .read_shard_block(set, bucket, key, v, s, i, t, ss)
+                    .await?
+                else {
                     return Err(Error::Encode(format!(
                         "源片 {} 块 {t} 缺失（下轮重试）",
                         s.shard
@@ -113,6 +140,7 @@ impl Store {
                 };
                 let is_final = t + 1 == blocks;
                 self.write_shard_chunk(
+                    set,
                     bucket,
                     key,
                     uuid,
@@ -143,7 +171,7 @@ impl Store {
                 return Err(Error::Encode("并发形态变更（下轮重试）".into()));
             };
             for &i in need {
-                l_now.shards[i].drive = self.slot_of_shard(hash, i as u8) as u8;
+                l_now.shards[i].drive = self.slot_of_shard(set, hash, i as u8)? as u8;
             }
             // 链重写不变量（切片 4）：链尾 revision epoch 严格 +1
             let pre_max = m_now.max_epoch();
@@ -158,7 +186,7 @@ impl Store {
         for &i in need {
             let old_slot = l.shards[i].drive as u16;
             if let Err(e) = self
-                .delete_shard_at(bucket, key, uuid, l.shards[i].part, i, old_slot)
+                .delete_shard_at(set, bucket, key, uuid, l.shards[i].part, i, old_slot)
                 .await
             {
                 tracing::warn!(bucket, key, shard = i, error = %e, "rebalance：老片清理失败（fsck stray 兜底）");
@@ -171,6 +199,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     async fn write_shard_chunk(
         &self,
+        set: u16,
         bucket: &str,
         key: &str,
         uuid: &str,
@@ -182,7 +211,7 @@ impl Store {
         is_final: bool,
     ) -> Result<()> {
         let crc = ec::crc32c_of(chunk);
-        match self.slot_target(slot) {
+        match self.slot_target(set, slot) {
             Some(drives::ShardTarget::Local { drive, .. }) => {
                 if !drives::drive_up(drive).await {
                     return Err(Error::QuorumUnmet(format!("目标槽 {slot} 不在册")));
@@ -226,6 +255,7 @@ impl Store {
                             chunk_crc32c: crc,
                             is_final,
                             slot: slot as u32,
+                            set: set as u32,
                         },
                     )
                     .await
@@ -237,8 +267,10 @@ impl Store {
     }
 
     /// 删指定槽上的单片（本地 remove / 远端 delete_shard RPC）。
+    #[allow(clippy::too_many_arguments)]
     async fn delete_shard_at(
         &self,
+        set: u16,
         bucket: &str,
         key: &str,
         uuid: &str,
@@ -246,7 +278,7 @@ impl Store {
         shard: usize,
         slot: u16,
     ) -> Result<()> {
-        match self.slot_target(slot) {
+        match self.slot_target(set, slot) {
             Some(drives::ShardTarget::Local { drive, .. }) => {
                 let path = layout::object_dir(drive, bucket, key)?
                     .join(uuid)
@@ -268,6 +300,7 @@ impl Store {
                             part: part as u32,
                             shard: shard as u32,
                             slot: slot as u32,
+                            set: set as u32,
                         },
                     )
                     .await

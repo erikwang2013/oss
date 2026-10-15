@@ -67,27 +67,11 @@ impl AppState {
         // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
         // ClusterTopology::new 与 Store::open（self 一致性）。
         if let Some(cl) = cfg.cluster.as_ref() {
-            let self_idx = cl
-                .nodes
-                .iter()
-                .position(|n| n.id == cl.node_id)
-                .ok_or_else(|| {
-                    format!(
-                        "cluster.node_id «{}» 不在 [[cluster.nodes]] 表内",
-                        cl.node_id
-                    )
-                })?;
-            let specs: Vec<xl_store::store::NodeSpec> = cl
-                .nodes
-                .iter()
-                .map(|n| xl_store::store::NodeSpec {
-                    id: n.id.clone(),
-                    addr: n.addr.clone(),
-                    drive_count: n.drive_count,
-                })
-                .collect();
-            let topo = xl_store::store::ClusterTopology::new(self_idx, specs, &store_cfg.ec)?;
-            let pairs: Vec<(String, String)> = cl
+            let sets_nodes = sets_nodes_by_set(&cl.nodes)?;
+            let sets = xl_store::store::ClusterSets::new(&cl.node_id, sets_nodes, &store_cfg.ec)?;
+            // 路由表用 flat 去重节点集（同 id 多 set 各出一条时不得重复注册）
+            let pairs: Vec<(String, String)> = sets
+                .flat
                 .nodes
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
@@ -102,10 +86,29 @@ impl AppState {
                     return Err(format!("cluster.placement 非法值 «{other}»（只认 v1/v2）").into());
                 }
             };
+            // M4 切片 8：多 set 注入 SetResolver（单 set 由 Store 侧短路——零新增查询）；
+            // 扇出面 = 除本机外的去重节点并集（verifier 口径 b）
+            let resolver: Option<Arc<dyn xl_store::mesh::SetResolver>> = (sets.sets.len() > 1)
+                .then(|| {
+                    let peers: Vec<String> = sets
+                        .flat
+                        .nodes
+                        .iter()
+                        .filter(|n| n.id != cl.node_id)
+                        .map(|n| n.id.clone())
+                        .collect();
+                    let transport: Arc<dyn xl_store::mesh::MeshTransport> = mesh.clone();
+                    Arc::new(crate::cluster_control::DbSetResolver::new(
+                        db.pool().clone(),
+                        peers,
+                        transport,
+                    )) as Arc<dyn xl_store::mesh::SetResolver>
+                });
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
-                topo,
+                sets,
                 transport: mesh,
                 placement_v2,
+                resolver,
             }));
             // Task 9：控制面读扇出的本节点执行器（判权复用 xl-s3::Acl；只查本地 DB）
             store_cfg.control = Some(Arc::new(crate::cluster_control::SqliteControlBackend::new(
@@ -119,7 +122,22 @@ impl AppState {
         match store.list_buckets().await {
             Ok(buckets) => {
                 for b in buckets {
-                    if let Err(e) = db.insert_bucket(&b.name, None).await {
+                    // M4 切片 8：INSERT OR IGNORE 不覆盖已有行（新桶在创建时已带 owner/set）；
+                    // 无行者先扇出问 set：有答按答插；「全部可达且全无」→ set0+warn（存量语义）；
+                    // **任一传输错 → 不插行**（下次启动重试；「不可达」不得写死 set0——
+                    // verifier 终审洞 2：升级后 set=1 桶的行在不可达窗口被写死 0 即分片错组）
+                    let set = match store.resolve_bucket_set(&b.name).await {
+                        Ok(Some(s)) => s,
+                        Ok(None) => {
+                            tracing::warn!(bucket = %b.name, "回填：全集群确无该桶行，按 set=0（存量语义）");
+                            0
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, bucket = %b.name, "回填：set 解析不可达，本轮跳过（下次启动重试）");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = db.insert_bucket_set(&b.name, None, set).await {
                         tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
                     }
                 }
@@ -167,8 +185,8 @@ impl AppState {
             if cfg.cluster.is_some() {
                 store.mesh_ensure_bucket(&g.bucket).await?;
                 if let Some(cl) = store.cluster() {
-                    let self_id = cl.topo.self_node().id.clone();
-                    for n in &cl.topo.nodes {
+                    let self_id = cl.sets.flat.self_node().id.clone();
+                    for n in &cl.sets.flat.nodes {
                         if n.id == self_id {
                             continue;
                         }
@@ -180,6 +198,7 @@ impl AppState {
             } else if !store.bucket_exists(&g.bucket).await? {
                 store.create_bucket(&g.bucket).await?;
             }
+            // M4 切片 8：groups 桶钉 set 0（多 set 下不参与新组——目录/行按 set0 口径收口，C3）
             db.insert_bucket(&g.bucket, None).await?;
         }
 
@@ -189,11 +208,12 @@ impl AppState {
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
     pub fn control_mesh(&self) -> Option<xl_s3::access::ControlMesh> {
         self.store.cluster().map(|c| {
-            let self_id = c.topo.self_node().id.clone();
+            let self_id = c.sets.flat.self_node().id.clone();
             xl_s3::access::ControlMesh {
                 transport: c.transport.clone(),
                 peers: c
-                    .topo
+                    .sets
+                    .flat
                     .nodes
                     .iter()
                     .filter(|n| n.id != self_id)
@@ -254,5 +274,71 @@ impl AppState {
             ingest,
             jwt,
         }
+    }
+}
+
+/// M4 切片 8：节点按 set 分组（`set` 缺省 0；set 号须从 0 连续——缺号会让拓扑数组下标错位）。
+/// 独立成函数以便单测（配置是信任边界，fail-closed）。
+fn sets_nodes_by_set(
+    nodes: &[crate::config::NodeToml],
+) -> Result<Vec<Vec<xl_store::store::NodeSpec>>, String> {
+    let mut by_set: std::collections::BTreeMap<u16, Vec<xl_store::store::NodeSpec>> =
+        std::collections::BTreeMap::new();
+    for n in nodes {
+        by_set
+            .entry(n.set.unwrap_or(0))
+            .or_default()
+            .push(xl_store::store::NodeSpec {
+                id: n.id.clone(),
+                addr: n.addr.clone(),
+                drive_count: n.drive_count,
+            });
+    }
+    let k = by_set.len() as u16;
+    if by_set.keys().copied().ne(0..k) {
+        return Err(format!(
+            "cluster.nodes 的 set 号必须从 0 连续（现有 {:?}）",
+            by_set.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(by_set.into_values().collect())
+}
+
+#[cfg(test)]
+mod set_group_tests {
+    use super::*;
+
+    fn node(id: &str, set: Option<u16>) -> crate::config::NodeToml {
+        crate::config::NodeToml {
+            id: id.into(),
+            addr: "127.0.0.1:1".into(),
+            drive_count: 4,
+            set,
+        }
+    }
+
+    #[test]
+    fn groups_by_set_with_default_zero() {
+        let groups = sets_nodes_by_set(&[
+            node("n1", None),
+            node("n2", None),
+            node("n1", Some(1)),
+            node("n2", Some(1)),
+        ])
+        .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 2);
+        assert_eq!(groups[0][0].id, "n1");
+        assert_eq!(groups[1][0].id, "n1", "同 id 跨 set 各一条");
+    }
+
+    #[test]
+    fn non_contiguous_sets_rejected() {
+        // 只有 set=1：缺 set0 → fail-closed（拓扑数组下标会错位）
+        let err = sets_nodes_by_set(&[node("n1", Some(1))]).unwrap_err();
+        assert!(err.contains("连续"), "{err}");
+        let err = sets_nodes_by_set(&[node("n1", None), node("n2", Some(2))]).unwrap_err();
+        assert!(err.contains("连续"), "{err}");
     }
 }

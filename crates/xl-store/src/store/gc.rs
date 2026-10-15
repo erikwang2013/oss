@@ -66,8 +66,8 @@ impl Store {
         // （read_meta_cluster 覆盖不足会 Err → 下方既有 Err 分支逐对象跳过），本探活把
         // 「拓扑不完整时仍在删」整段关掉。README 口径：节点掉线期间 clean 保守空转。
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }

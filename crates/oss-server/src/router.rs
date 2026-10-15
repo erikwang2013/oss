@@ -75,8 +75,8 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<(String, bool, usize)> 
     let Some(c) = state.store.cluster() else {
         return out;
     };
-    let self_node_id = c.topo.self_node().id.clone();
-    for n in &c.topo.nodes {
+    let self_node_id = c.sets.flat.self_node().id.clone();
+    for n in &c.sets.flat.nodes {
         if n.id == self_node_id {
             continue;
         }
@@ -107,7 +107,7 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
     let slot_count = state
         .store
         .cluster()
-        .map(|c| c.topo.slot_count())
+        .map(|c| c.sets.flat.slot_count())
         .unwrap_or(drive_count as u16);
 
     let mut out = String::with_capacity(512);

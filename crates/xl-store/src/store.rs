@@ -30,7 +30,7 @@ pub use rebalance::RebalanceReport;
 pub use version::{DeleteOutcome, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
-pub use drives::{ClusterConfig, ClusterTopology, NodeSpec};
+pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec};
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
@@ -190,11 +190,14 @@ impl Store {
         } else if cfg.cluster.is_some() {
             // M3 集群：本节点盘数只做 self 一致性（本地 3 盘 < 12 是合法节点形态）；
             // data+parity 的全局校验在 ClusterTopology::new（槽位数 ≥ 12）。
-            let n_self = cfg.cluster.as_ref().unwrap().topo.self_node();
-            if n_self.drive_count as usize != n {
+            // M4 切片 8：多 set 下自节点盘数 = 各 set 段之和（顺序契约见 ClusterSets::new）。
+            let cl = cfg.cluster.as_ref().unwrap();
+            let declared: usize = cl.sets.self_ranges.iter().map(|(_, _, len)| len).sum();
+            let flat_self = cl.sets.flat.self_node();
+            if declared != n || flat_self.drive_count as usize != n {
                 return Err(Error::Encode(format!(
-                    "cluster：本节点 {} 声明 {} 盘，实际 {n} 盘",
-                    n_self.id, n_self.drive_count
+                    "cluster：本节点 {} 声明 {} 盘（各 set 段合计 {declared}），实际 {n} 盘",
+                    flat_self.id, flat_self.drive_count
                 )));
             }
         } else if n == 1 {
@@ -270,22 +273,34 @@ impl Store {
             }
             // M3/M4 拓扑指纹（data_dirs 顺序 = 拓扑的一部分；错位 = 分片静默错位 → 大声失败）。
             // 切片 5：记录格式 v2 = `v2 node=X slot=Y`（**去掉全局 slot_count**——追加式扩容
-            // 后旧盘 (node,slot) 不变）；读时兼容 v1（忽略 `slots=` 段，按 (node,slot) 全等）。
-            // 中间节点加盘会位移其后节点 bases → 记录与现算不符 → 在此拒启（设计 G）。
+            // 后旧盘 (node,slot) 不变）；读时兼容 v1（忽略 `slots=` 段）。
+            // 切片 8：set==0 恒写 v2（单 set 与多 set 的 set0 段逐字节不变）；set>0 写
+            // `v3 set=Z node=X slot=Y`（slot=组内槽）；v3+set=0 = 拒启（写路径永不产出）。
+            // 中间节点/中间 set 加盘会位移其后段 → 记录与现算不符 → 在此拒启（设计 G）。
             if let Some(cl) = cfg.cluster.as_deref() {
                 let topo_path = layout::sys_dir(drive, "topo");
-                let cur_node = cl.topo.self_node().id.clone();
-                let cur_slot = cl.topo.local_slot_base() + di as u16;
-                let want = topo_record(&cur_node, cur_slot);
+                let cur_node = cl.sets.flat.self_node().id.clone();
+                // 该盘属于哪个 set 段：di 落在 self_ranges 的哪一段
+                let (cur_set, off, _) = cl
+                    .sets
+                    .self_ranges
+                    .iter()
+                    .find(|&(_, off, len)| di >= *off && di < off + len)
+                    .copied()
+                    .ok_or_else(|| Error::Encode("盘下标不在任何 set 段（内部不一致）".into()))?;
+                let cur_slot = (di - off) as u16;
+                let want = topo_record(cur_set, &cur_node, cur_slot);
                 match tokio::fs::read_to_string(&topo_path).await {
                     Ok(have) => {
-                        let ok = parse_topo_record(have.trim())
-                            .is_some_and(|(n, s)| n == cur_node && s == cur_slot);
+                        let ok = parse_topo_record(have.trim()).is_some_and(|(set, n, s)| {
+                            n == cur_node && s == cur_slot && set == cur_set
+                        });
                         if !ok {
                             return Err(Error::Encode(format!(
-                                "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{}»，当前 node={} slot={}",
+                                "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{}»，当前 set={} node={} slot={}",
                                 drive.display(),
                                 have.trim(),
+                                cur_set,
                                 cur_node,
                                 cur_slot
                             )));
@@ -421,8 +436,8 @@ impl Store {
         // 集群：先查全节点（评审：静默部分建会让缺桶节点 404——分片分布确定（shard % slot_count），
         // 落不到该节点的桶永不靠懒自愈修复；任一节点不可达 → 上抛 fail-closed）
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -453,8 +468,8 @@ impl Store {
         // 集群：广播建目录（幂等）；失败上抛（fail-closed——部分建会让缺桶节点 404，
         // 运维出路：删空桶重试或让写路径懒自愈补齐）
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -473,8 +488,8 @@ impl Store {
         }
         // 集群：任一节点有即存在；不可达 → 上抛（fail-closed，不把「查不到」伪装成「不存在」）
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -520,8 +535,8 @@ impl Store {
         // 部分节点已删是自洽的：全局存在性 = 任一节点有（本函数上方的 bucket_exists 同口径）；
         // 缺桶节点的目录随对象写入懒自愈，重试删桶幂等。
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -575,8 +590,8 @@ impl Store {
         // 集群：并集各节点桶目录（桶是广播镜像，掉线节点少一路并集不丢项；不可达 warn 跳过）。
         // 远端独有名字的 creation_nanos 记 0（「首个见到」口径：本机没有它的 mtime）。
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -672,7 +687,7 @@ impl Store {
         use futures::StreamExt as _;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let q_s = self.cfg.ec.data as usize + 1;
-        let self_id = cl.topo.self_node().id.clone();
+        let self_id = cl.sets.flat.self_node().id.clone();
 
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
@@ -709,7 +724,7 @@ impl Store {
         // 远端并发；每到一个响应即累计覆盖，够数立刻出循环（未完成的 future 直接丢弃）
         if covered < q_s {
             let mut futs = futures::stream::FuturesUnordered::new();
-            for n in &cl.topo.nodes {
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -918,7 +933,7 @@ impl Store {
         old: Option<&XlMeta>,
     ) -> Result<usize> {
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
-        let self_id = cl.topo.self_node().id.clone();
+        let self_id = cl.sets.flat.self_node().id.clone();
         let q_s = self.cfg.ec.data as usize + 1;
         let bytes = bytes::Bytes::from(m.encode()?);
         let self_hash = crate::mesh::content_hash(&bytes);
@@ -942,7 +957,7 @@ impl Store {
             meta: bytes.clone(),
         };
         let mut prepared_remote = 0usize;
-        for n in &cl.topo.nodes {
+        for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
             }
@@ -959,7 +974,7 @@ impl Store {
                     let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
                 }
             }
-            for n in &cl.topo.nodes {
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -988,7 +1003,7 @@ impl Store {
             }
         }
         let mut flipped_remote: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-        for n in &cl.topo.nodes {
+        for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
             }
@@ -1037,7 +1052,7 @@ impl Store {
                 let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
             }
         }
-        for n in &cl.topo.nodes {
+        for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
             }
@@ -1061,8 +1076,8 @@ impl Store {
             }
         }
         for slot in &flipped_remote {
-            let node_idx = cl.topo.node_of_slot(*slot);
-            let Some(node) = cl.topo.nodes.get(node_idx) else {
+            let node_idx = cl.sets.flat.node_of_slot(*slot);
+            let Some(node) = cl.sets.flat.nodes.get(node_idx) else {
                 continue;
             };
             let restored: Result<()> = match old {
@@ -1147,8 +1162,8 @@ impl Store {
         // ①' 集群：远端 meta 删除是可见性提交点的远端分派——**失败即上抛**（评审：
         //     best-effort 吞掉会让对象在部分节点「复活」而删除已报成功；不可达同样上抛=fail-closed）
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -1176,8 +1191,8 @@ impl Store {
         }
         // ②' 集群：远端对象目录清理（幂等；失败 warn——对象已不可见，残骸由该节点 GC 按龄回收）
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -1216,27 +1231,46 @@ impl Store {
     }
 }
 
-/// 拓扑记录的唯一构造器（M4 切片 5）：写盘（`Store::open`）与控制台展示
+/// 拓扑记录的唯一构造器（M4 切片 5；切片 8 加 set）：写盘（`Store::open`）与控制台展示
 /// （`/api/v1/cluster/status` 的 topo_fingerprint）共用——两处再漂移即回归（verifier F9）。
-/// 读侧 `parse_topo_record` 兼容 v1 旧记录（`v1 slots=.. node=X slot=Y`，忽略 slots=）。
-pub fn topo_record(node: &str, slot: u16) -> String {
-    format!("v2 node={node} slot={slot}")
+/// **set==0 恒写 v2（逐字节兼容）；set>0 写 v3**（slot = **组内槽**）。
+/// 读侧 `parse_topo_record` 兼容 v1/v2（均视为 set 0）。
+pub fn topo_record(set: u16, node: &str, slot: u16) -> String {
+    if set == 0 {
+        format!("v2 node={node} slot={slot}")
+    } else {
+        format!("v3 set={set} node={node} slot={slot}")
+    }
 }
 
-/// 拓扑记录解析（v1/v2 兼容）：返回 `(node, slot)`。
-/// v1 形如 `v1 slots=12 node=n1 slot=0`（slots 段被忽略）；v2 形如 `v2 node=n1 slot=0`。
-fn parse_topo_record(s: &str) -> Option<(String, u16)> {
+/// 拓扑记录解析（v1/v2/v3 兼容）：返回 `(set, node, slot)`；v1/v2 均视为 set 0。
+/// v1 形如 `v1 slots=12 node=n1 slot=0`（slots 段被忽略）；v2 = set0；v3 形如
+/// `v3 set=1 node=n1 slot=0`。**`v3` 且 set=0 = 拒启**（写路径永不产出该形态）。
+/// 不把版本前缀当防线（R2）：全等比对按解析出的三元组。
+fn parse_topo_record(s: &str) -> Option<(u16, String, u16)> {
     let mut node = None;
     let mut slot = None;
+    let mut set: Option<u16> = None;
+    let mut is_v3 = false;
     for part in s.split_whitespace() {
+        if part == "v3" {
+            is_v3 = true;
+        }
         if let Some(v) = part.strip_prefix("node=") {
             node = Some(v.to_string());
         }
         if let Some(v) = part.strip_prefix("slot=") {
             slot = v.parse::<u16>().ok();
         }
+        if let Some(v) = part.strip_prefix("set=") {
+            set = v.parse::<u16>().ok();
+        }
     }
-    node.zip(slot)
+    let set = set.unwrap_or(0);
+    if is_v3 && set == 0 {
+        return None; // 拒启：v3+set0 是人为错改的形态
+    }
+    Some((set, node?, slot?))
 }
 
 fn now_nanos() -> i64 {

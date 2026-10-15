@@ -76,6 +76,23 @@ impl Db {
     /// 不幂等，放不进重放——增量列在这里探测后补齐。新库由 0001 直接带列，两个路径收敛。
     /// 字面量 SQL（sqlx 0.9 拒动态串）；目前只有一个增量列（users.status）。
     async fn ensure_columns(&self) -> Result<()> {
+        // M4 切片 8：buckets.set（多 set 归属；老库补列，幂等——与 status 同款竞态容忍）
+        let bcols = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
+            .fetch_all(&self.pool)
+            .await?;
+        if !bcols.iter().any(|r| r.get::<String, _>("name") == "set_id")
+            && let Err(e) =
+                sqlx::query("ALTER TABLE buckets ADD COLUMN set_id INTEGER NOT NULL DEFAULT 0")
+                    .execute(&self.pool)
+                    .await
+        {
+            let bcols = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
+                .fetch_all(&self.pool)
+                .await?;
+            if !bcols.iter().any(|r| r.get::<String, _>("name") == "set_id") {
+                return Err(e);
+            }
+        }
         let cols = sqlx::query("SELECT name FROM pragma_table_info('users')")
             .fetch_all(&self.pool)
             .await?;
@@ -188,12 +205,23 @@ impl Db {
     }
 
     pub async fn insert_bucket(&self, name: &str, owner_id: Option<i64>) -> Result<()> {
+        self.insert_bucket_set(name, owner_id, 0).await
+    }
+
+    /// M4 切片 8：带 set 的建桶行（单 set 缺省 0 走上面）。
+    pub async fn insert_bucket_set(
+        &self,
+        name: &str,
+        owner_id: Option<i64>,
+        set: u16,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?)",
         )
         .bind(name)
         .bind(owner_id)
         .bind(now())
+        .bind(set as i64)
         .execute(&self.pool)
         .await?;
         Ok(())

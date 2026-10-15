@@ -230,6 +230,7 @@ mod tests {
                 secret: Some("SK_PEER".into()),
                 flag: None,
                 names: None,
+                set: None,
             }))),
         );
         assert_eq!(

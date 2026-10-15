@@ -287,13 +287,17 @@ impl Store {
             .and_then(|v| v.parse().ok());
         // M4 切片 5：放置哈希（sha256(bucket/key) 前 8B）——v2 开关下全域分散
         let place_hash = Store::placement_hash(bucket, key);
+        // M4 切片 8：桶所属 set（多 set 一次解析、全线透传；fail-closed 见 Store::set_of_bucket）
+        let set = self.set_of_bucket(bucket).await?;
         let mut sinks: Vec<Sink> = Vec::with_capacity(total);
         let mut touched: Vec<u16> = Vec::new();
+        let mut slots: Vec<u16> = Vec::with_capacity(total);
         // ok[i] = 该片当前仍完整（任一块失败即 false）
         let mut ok: Vec<bool> = Vec::with_capacity(total);
         for i in 0..total {
-            let slot = self.slot_of_shard(place_hash, i as u8);
-            let alive = match self.slot_target(slot) {
+            let slot = self.slot_of_shard(set, place_hash, i as u8)?;
+            slots.push(slot);
+            let alive = match self.slot_target(set, slot) {
                 Some(drives::ShardTarget::Local { drive, .. }) => {
                     // 存活探测（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
                     if !drives::drive_up(drive).await {
@@ -382,7 +386,9 @@ impl Store {
                                         chunk_crc32c: ec::crc32c_of(chunk),
                                         is_final,
                                         // M4 切片 5：携带槽位（服务端只校验归属，不重算放置）
-                                        slot: self.slot_of_shard(place_hash, i as u8) as u32,
+                                        slot: slots[i] as u32,
+                                        // M4 切片 8：携带 set（服务端按 sets[set] 校验 + flat_of 拼路径）
+                                        set: set as u32,
                                     },
                                 )
                                 .await
@@ -392,7 +398,7 @@ impl Store {
                     }
                 };
                 if let Err(e) = res {
-                    tracing::warn!(slot = self.slot_of_shard(place_hash, i as u8), shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
+                    tracing::warn!(slot = slots[i], shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
                     ok[i] = false;
                 }
                 if abort_after == Some(i) && is_final {
@@ -405,7 +411,7 @@ impl Store {
         let landed = ok.iter().filter(|v| **v).count();
         if landed < quorum {
             for &slot in &touched {
-                match self.slot_target(slot) {
+                match self.slot_target(set, slot) {
                     Some(drives::ShardTarget::Local { drive, .. }) => {
                         if let Ok(dir) = layout::object_dir(drive, bucket, key) {
                             let _ = tokio::fs::remove_dir_all(dir.join(uuid)).await;
@@ -424,7 +430,7 @@ impl Store {
         }
         let shard_refs = (0..total)
             .map(|i| meta::ShardRef {
-                drive: self.slot_of_shard(place_hash, i as u8) as u8,
+                drive: slots[i] as u8,
                 part: 1,
                 shard: i as u8,
                 size: ss,
@@ -482,8 +488,8 @@ impl Store {
         // 集群：远端槽位的旧版本 → 该节点 trash（best-effort；先决链=提交 quorum 成立后
         // 旧版本才无读者，回收才安全——Task 6 的集群提交同批落地）
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }

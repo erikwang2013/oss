@@ -2707,7 +2707,7 @@ impl Cluster {
         for (i, _id) in ids.iter().enumerate() {
             let dirs = node_dirs[i].clone();
             std::fs::create_dir_all(&dirs[0]).unwrap();
-            let topo = drives::ClusterTopology::new(i, specs.clone(), &ec).unwrap();
+            let sets = drives::ClusterSets::single(&ids[i], specs.clone(), &ec).unwrap();
             let mut cfg = StoreConfig::new(&dirs[0]);
             cfg.drives = dirs.clone();
             cfg.ec = ec;
@@ -2717,9 +2717,10 @@ impl Cluster {
             cfg.cluster_lock_retries = 3;
             cfg.cluster_lock_backoff_ms = (5, 10);
             cfg.cluster = Some(Arc::new(drives::ClusterConfig {
-                topo,
+                sets,
                 transport: mesh.clone(),
                 placement_v2,
+                resolver: None,
             }));
             stores.push(Arc::new(Store::open(cfg).await.unwrap()));
         }
@@ -2833,6 +2834,171 @@ async fn cluster_write_distributes_by_slot() {
     let (info, got) = s1.get_object("bkt", "k").await.unwrap();
     assert_eq!(info.size, body.len() as u64);
     assert_eq!(got.to_vec(), body);
+}
+
+/// M4 切片 8 核心验收：2 set（**同 id 跨 set**——直接压 flat_of 组内序→扁平盘映射，洞 1）。
+/// ec 8+4：每 set 12 槽（3 节点 × 4 盘 ≤ parity 4）；节点 n1..n3 在两 set 各 4 盘（共 8 盘/节点，
+/// data_dirs = set0 段[0..4] + set1 段[4..8]）。断言：
+/// ① set1 桶（b1）分片只落 set1 段（含逐槽号）；② set0 桶（b0）反之；
+/// ③ 跨节点读一致（含从同物理节点的另一段读）；④ 命名空间镜像：meta 落全部 8 盘（S-L 口径）。
+#[tokio::test]
+async fn multiset_isolation_flat_mapping_and_mirror() {
+    #[derive(Debug)]
+    struct FixedResolver;
+    #[async_trait::async_trait]
+    impl crate::mesh::SetResolver for FixedResolver {
+        async fn resolve_bucket_set(&self, bucket: &str) -> crate::error::Result<Option<u32>> {
+            // bkt1 → set1；bkt0 → set0；其余 → 「全可达且确无行」
+            Ok(match bucket {
+                "bkt1" => Some(1),
+                "bkt0" => Some(0),
+                _ => None,
+            })
+        }
+    }
+
+    let ec = ec::EcConfig {
+        data: 8,
+        parity: 4,
+        enabled: true,
+    };
+    let n_nodes = 3usize;
+    let ids: Vec<String> = (1..=n_nodes).map(|i| format!("n{i}")).collect();
+    let mut tmpdirs = Vec::new();
+    let mut node_dirs: Vec<Vec<std::path::PathBuf>> = Vec::new();
+    for _ in 0..n_nodes {
+        let mut dirs = Vec::new();
+        for _ in 0..8 {
+            let td = tempfile::TempDir::new().unwrap();
+            dirs.push(td.path().to_path_buf());
+            tmpdirs.push(td);
+        }
+        node_dirs.push(dirs);
+    }
+    let mk = |i: usize| drives::NodeSpec {
+        id: ids[i].clone(),
+        addr: format!("127.0.0.1:{}", 26000 + i),
+        drive_count: 4,
+    };
+    let sets_nodes = vec![vec![mk(0), mk(1), mk(2)], vec![mk(0), mk(1), mk(2)]];
+
+    let mesh = InProcessMesh::new();
+    let mut stores = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        std::fs::create_dir_all(&node_dirs[i][0]).unwrap();
+        let sets = drives::ClusterSets::new(id, sets_nodes.clone(), &ec).unwrap();
+        let mut cfg = StoreConfig::new(&node_dirs[i][0]);
+        cfg.drives = node_dirs[i].clone();
+        cfg.ec = ec;
+        cfg.fsync = false;
+        cfg.cluster_lock_ttl_ms = 400;
+        cfg.cluster_lock_retries = 3;
+        cfg.cluster_lock_backoff_ms = (5, 10);
+        cfg.cluster = Some(Arc::new(drives::ClusterConfig {
+            sets,
+            // v1 恒等放置：slot = shard % 12 —— 每片 shard i 落槽 i，断言可逐步推导
+            placement_v2: false,
+            transport: mesh.clone(),
+            resolver: Some(Arc::new(FixedResolver)),
+        }));
+        let st = Arc::new(Store::open(cfg).await.unwrap());
+        mesh.register(id, &st);
+        stores.push(st);
+    }
+    // 建两桶（命名空间面：目录镜像全盘全节点）
+    stores[0].create_bucket("bkt0").await.unwrap();
+    stores[0].create_bucket("bkt1").await.unwrap();
+    let body = vec![5u8; 200 * 1024]; // > 内联阈值 → EC 分片
+    stores[0]
+        .put_object("bkt1", "k1", Bytes::from(body.clone()), None)
+        .await
+        .unwrap();
+    stores[1]
+        .put_object("bkt0", "k0", Bytes::from(body.clone()), None)
+        .await
+        .unwrap();
+
+    for (ni, dirs) in node_dirs.iter().enumerate() {
+        for (di, d) in dirs.iter().enumerate() {
+            let seg_is_set1 = di >= 4;
+            let obj1 = crate::layout::object_dir(d, "bkt1", "k1").unwrap();
+            let obj0 = crate::layout::object_dir(d, "bkt0", "k0").unwrap();
+            let f1 = version_files(&obj1).await;
+            let f0 = version_files(&obj0).await;
+            let meta1 = tokio::fs::try_exists(obj1.join("xl.meta")).await.unwrap();
+            let meta0 = tokio::fs::try_exists(obj0.join("xl.meta")).await.unwrap();
+            if seg_is_set1 {
+                // b1 属 set1：本段应持有槽 ni*4+ord 的那片
+                let slot = ni * 4 + (di - 4);
+                assert!(
+                    f1.contains(&format!("part.1.{slot}")),
+                    "bkt1：n{} set1 段盘 {di} 应有 part.1.{slot}，实得 {f1:?}",
+                    ni + 1
+                );
+                assert_eq!(
+                    f1.len(),
+                    1,
+                    "bkt1：每槽恰 1 片（n{} 盘 {di}：{f1:?}）",
+                    ni + 1
+                );
+                assert!(
+                    f0.is_empty(),
+                    "bkt0(属 set0)：set1 段盘 {di} 不应有分片：{f0:?}"
+                );
+            } else {
+                let slot = ni * 4 + di;
+                assert!(
+                    f0.contains(&format!("part.1.{slot}")),
+                    "bkt0：n{} set0 段盘 {di} 应有 part.1.{slot}，实得 {f0:?}",
+                    ni + 1
+                );
+                assert_eq!(
+                    f0.len(),
+                    1,
+                    "bkt0：每槽恰 1 片（n{} 盘 {di}：{f0:?}）",
+                    ni + 1
+                );
+                assert!(
+                    f1.is_empty(),
+                    "bkt1(属 set1)：set0 段盘 {di} 不应有分片：{f1:?}"
+                );
+            }
+            // ④ 命名空间镜像：meta 应落全部 8 盘（S-L：目录/meta 镜像，隔离 = 分片不落别 set）
+            assert!(meta1 && meta0, "meta 应镜像到 n{} 盘 {di}", ni + 1);
+        }
+    }
+
+    // ③ 跨节点读一致（从 n3 读两桶：b1 的分片散在 set1 段，含 n3 本机 set1 段 flat_of 命中）
+    let (_, got1) = stores[2].get_object("bkt1", "k1").await.unwrap();
+    assert_eq!(got1.to_vec(), body);
+    let (_, got0) = stores[2].get_object("bkt0", "k0").await.unwrap();
+    assert_eq!(got0.to_vec(), body);
+
+    // ⑤ 指纹盘上内容（S-G 口径）：set0 段盘 = v2、set1 段盘 = v3 set=1
+    let tf0 = tokio::fs::read_to_string(crate::layout::sys_dir(&node_dirs[0][0], "topo"))
+        .await
+        .unwrap();
+    let tf1 = tokio::fs::read_to_string(crate::layout::sys_dir(&node_dirs[0][4], "topo"))
+        .await
+        .unwrap();
+    assert_eq!(tf0.trim(), "v2 node=n1 slot=0", "set0 段盘记录");
+    assert_eq!(
+        tf1.trim(),
+        "v3 set=1 node=n1 slot=0",
+        "set1 段盘记录（组内槽 0）"
+    );
+
+    // ⑥ resolver 返回 None（全可达且确无行）→ 放置 fail-closed 为 NoSuchBucket
+    //（桶目录已建：ensure_bucket 过关后由 set 解析兜底——绝不静默回落 set0）
+    stores[0].create_bucket("bkt-miss").await.unwrap();
+    let err = stores[0]
+        .put_object("bkt-miss", "kx", Bytes::from(vec![1u8; 200 * 1024]), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::NoSuchBucket(_)),
+        "无行桶应 NoSuchBucket（实得 {err:?}）"
+    );
 }
 
 /// Task 5a/5b：摘 1 节点（剩 9 槽=恰好 quorum）→ 写成功；读经重建成功。
@@ -3309,16 +3475,17 @@ async fn cluster_topology_fingerprint_detects_reorder() {
         },
     ];
     let mk_cfg = |order: Vec<std::path::PathBuf>| {
-        let topo =
-            drives::ClusterTopology::new(0, specs.clone(), &ec::EcConfig::default()).unwrap();
+        let sets =
+            drives::ClusterSets::single("n1", specs.clone(), &ec::EcConfig::default()).unwrap();
         let mesh = InProcessMesh::new();
         let mut cfg = StoreConfig::new(&order[0]);
         cfg.drives = order;
         cfg.fsync = false;
         cfg.cluster = Some(Arc::new(drives::ClusterConfig {
-            topo,
+            sets,
             transport: mesh,
             placement_v2: false,
+            resolver: None,
         }));
         cfg
     };
@@ -3927,17 +4094,17 @@ async fn rebalance_moves_shards_across_nodes_in_cluster() {
     assert_eq!(rep.objects_moved, 0, "{rep:?}");
 }
 
-/// 切片 5（verifier F5-a）：拓扑记录 v1→v2 兼容解析与畸形 fail-closed。
+/// 切片 5/8（verifier F5-a）：拓扑记录 v1→v2→v3 兼容解析与畸形 fail-closed。
 #[test]
 fn topo_record_parses_v1_and_v2_and_rejects_garbage() {
     assert_eq!(
         super::parse_topo_record("v2 node=n1 slot=0"),
-        Some(("n1".to_string(), 0))
+        Some((0, "n1".to_string(), 0))
     );
-    // v1 旧记录：slots= 段被忽略，按 (node,slot) 取出
+    // v1 旧记录：slots= 段被忽略，按 (node,slot) 取出（set 视为 0）
     assert_eq!(
         super::parse_topo_record("v1 slots=12 node=n2 slot=5"),
-        Some(("n2".to_string(), 5))
+        Some((0, "n2".to_string(), 5))
     );
     assert_eq!(super::parse_topo_record("garbage"), None);
     assert_eq!(super::parse_topo_record("v2 node=n1"), None, "缺 slot 段");
@@ -3946,10 +4113,24 @@ fn topo_record_parses_v1_and_v2_and_rejects_garbage() {
         None,
         "slot 非数字"
     );
-    // 构造器与解析器互逆（写盘与 console 共用的唯一出处）
+    // 切片 8：v3 带 set；v3+set=0 = 拒启（写路径永不产出该形态）
     assert_eq!(
-        super::parse_topo_record(&super::topo_record("n3", 7)),
-        Some(("n3".to_string(), 7))
+        super::parse_topo_record("v3 set=1 node=n2 slot=3"),
+        Some((1, "n2".to_string(), 3))
+    );
+    assert_eq!(
+        super::parse_topo_record("v3 set=0 node=n1 slot=0"),
+        None,
+        "v3+set0 非法"
+    );
+    // 构造器与解析器互逆（写盘与 console 共用的唯一出处）；set0 恒 v2、set>0 恒 v3
+    assert_eq!(
+        super::parse_topo_record(&super::topo_record(0, "n3", 7)),
+        Some((0, "n3".to_string(), 7))
+    );
+    assert_eq!(
+        super::parse_topo_record(&super::topo_record(2, "n3", 7)),
+        Some((2, "n3".to_string(), 7))
     );
 }
 
@@ -3978,8 +4159,8 @@ fn appending_nodes_keeps_existing_bases() {
             "节点 {} 的前缀基址在尾部追加下不变",
             i
         );
-        let r4 = super::topo_record(&t4.self_node().id, t4.local_slot_base());
-        let r5 = super::topo_record(&t5.self_node().id, t5.local_slot_base());
+        let r4 = super::topo_record(0, &t4.self_node().id, t4.local_slot_base());
+        let r5 = super::topo_record(0, &t5.self_node().id, t5.local_slot_base());
         assert_eq!(
             r4, r5,
             "既有盘的 (node,slot) 记录在追加下不变（指纹兼容的根）"

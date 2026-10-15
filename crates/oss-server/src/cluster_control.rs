@@ -52,6 +52,7 @@ impl ControlBackend for SqliteControlBackend {
                     secret: Some(r.get("sk")),
                     flag: None,
                     names: None,
+                    set: None,
                 }))
             }
             ControlQuery::Permission {
@@ -117,6 +118,100 @@ impl ControlBackend for SqliteControlBackend {
                     ..Default::default()
                 }))
             }
+            ControlQuery::BucketSet(bucket) => {
+                // M4 切片 8：桶 → set（无行 = None；found=false 与「有行 set=0」由 set 字段区分）
+                let row = sqlx::query("SELECT set_id FROM buckets WHERE name = ?")
+                    .bind(&bucket)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(enc)?;
+                Ok(row.map(|r| ControlRow {
+                    set: Some(r.get::<i64, _>("set_id") as u32),
+                    ..Default::default()
+                }))
+            }
         }
+    }
+}
+
+/// 桶 → set 解析（M4 切片 8 / 子设计 S-C）：本地 SELECT → miss 扇出（**独立扇出面，不复用
+/// 吞错的 ControlMesh::ask**——verifier M2）。语义：任一传输错 → Err；收集全部 Some 要求
+/// set 一致（行分叉 = Err）；只有「全部可达且都答无」才 None。单 set 由 Store 侧短路，不调用。
+#[derive(Debug)]
+pub struct DbSetResolver {
+    pool: sqlx::SqlitePool,
+    peers: Vec<String>,
+    transport: std::sync::Arc<dyn xl_store::mesh::MeshTransport>,
+}
+
+impl DbSetResolver {
+    pub fn new(
+        pool: sqlx::SqlitePool,
+        peers: Vec<String>,
+        transport: std::sync::Arc<dyn xl_store::mesh::MeshTransport>,
+    ) -> Self {
+        Self {
+            pool,
+            peers,
+            transport,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl xl_store::mesh::SetResolver for DbSetResolver {
+    async fn resolve_bucket_set(
+        &self,
+        bucket: &str,
+    ) -> std::result::Result<Option<u32>, xl_store::error::Error> {
+        use xl_store::error::Error;
+        let enc = |e: sqlx::Error| Error::Encode(format!("set 解析查询失败: {e}"));
+        // 本地先行（本节点恒可达）
+        let local: Option<u32> = sqlx::query("SELECT set_id FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(enc)?
+            .map(|r| r.get::<i64, _>("set_id") as u32);
+        let mut found: Option<u32> = local;
+        if found.is_none() && !self.peers.is_empty() {
+            // 并发扇出：任一 Err → 整体 Err（不可达 ≠ 无行）；Some 一致性要求
+            let mut futs = futures::stream::FuturesUnordered::new();
+            for p in &self.peers {
+                let t = self.transport.clone();
+                let b = bucket.to_string();
+                futs.push(async move {
+                    let row = t
+                        .control_query(p, xl_store::mesh::ControlQuery::BucketSet(b))
+                        .await;
+                    (p.clone(), row)
+                });
+            }
+            use futures::StreamExt as _;
+            while let Some((node, row)) = futs.next().await {
+                match row {
+                    Ok(Some(r)) => {
+                        if let Some(s) = r.set {
+                            match found {
+                                Some(prev) if prev != s => {
+                                    return Err(Error::Encode(format!(
+                                        "桶 {bucket} 的 set 行分叉：{prev} vs {s}（节点 {node}）——拒用，人工介入"
+                                    )));
+                                }
+                                _ => found = Some(s),
+                            }
+                        }
+                    }
+                    // 「对端答无行」= 可达观察（收集完毕才判 None：全部可达且全无 → None）
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(Error::Encode(format!(
+                            "set 解析扇出到 {node} 失败（不可达 ≠ 无行）：{e}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 }

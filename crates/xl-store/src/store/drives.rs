@@ -22,14 +22,6 @@ pub fn drive_index(shard: u8, n_drives: usize) -> usize {
     (shard as usize) % n_drives.max(1)
 }
 
-/// 对象 → set 映射（设计 §5.3 的确定性哈希）。
-/// **留形不留行为**：M2b 单 set（sets == 1）取模恒 0；M4 引入多 set / rebalance 时本公式直接生效。
-#[allow(dead_code)]
-pub fn set_index(bucket: &str, key: &str, sets: usize) -> usize {
-    let h = crc32c::crc32c(format!("{bucket}/{key}").as_bytes());
-    (h as usize) % sets.max(1)
-}
-
 /// 分片在指定盘上的路径：`<drive>/<bucket>/<展平键>/<uuid>/part.<part>.<shard>`。
 pub fn shard_path(
     drive: &Path,
@@ -85,6 +77,19 @@ pub struct ClusterTopology {
 impl ClusterTopology {
     /// `ec` 提供 data+parity：槽位数不足 `data+parity` 的集群连 EC 8+4 都摆不下（oss.toml 同口径）。
     pub fn new(self_idx: usize, nodes: Vec<NodeSpec>, ec: &super::ec::EcConfig) -> Result<Self> {
+        Self::build(self_idx, nodes, ec, true)
+    }
+
+    /// `check_per_node_parity`：多节点拓扑须逐节点 `drive_count ≤ parity`（防丢节点不可重建）；
+    /// **单节点拓扑豁免**（slice 5 规则把合法单节点集群一刀切拒了——xl-client 往返测试自切片 5
+    /// 起静默红：单节点丢节点 = 全丢，与单机多盘同语义，无「节点级」可保护项）；
+    /// flat 命名空间拓扑（不承载放置）同样不适用。build 为唯一入口（new/flat 共用）。
+    fn build(
+        self_idx: usize,
+        nodes: Vec<NodeSpec>,
+        ec: &super::ec::EcConfig,
+        check_per_node_parity: bool,
+    ) -> Result<Self> {
         if nodes.is_empty() {
             return Err(Error::Encode("集群节点列表为空".into()));
         }
@@ -104,14 +109,17 @@ impl ClusterTopology {
                     n.id
                 )));
             }
-            if n.drive_count > ec.parity as u16 {
+            if check_per_node_parity && nodes.len() > 1 && n.drive_count > ec.parity as u16 {
                 return Err(Error::Encode(format!(
-                    "节点 {} 盘数 {} 超过 parity {}（单节点可承载分片数须 ≤ parity）",
+                    "节点 {} 盘数 {} 超过 parity {}（多节点集群里单节点可承载分片数须 ≤ parity，丢节点才可重建）",
                     n.id, n.drive_count, ec.parity
                 )));
             }
         }
-        if self_idx >= nodes.len() {
+        // M4 切片 8：`self_idx == usize::MAX` = 占位「本节点不在此拓扑」（多 set 里非自属 set 的
+        // 组内拓扑）；此时 local_drive_of_slot 天然全 None（node != sentinel），
+        // 但 **self_node()/local_slot_base() 不得调用**（见方法注）。
+        if self_idx != usize::MAX && self_idx >= nodes.len() {
             return Err(Error::Encode(format!(
                 "self_idx {self_idx} 越界（共 {} 节点）",
                 nodes.len()
@@ -166,10 +174,17 @@ impl ClusterTopology {
         (node == self.self_idx).then(|| (slot - self.bases[node]) as usize)
     }
 
+    /// 本节点首槽（仅对 self_idx 有效的拓扑调用；sentinel 占位会 panic——调用前用 self_idx_opt）。
     pub fn local_slot_base(&self) -> u16 {
         self.bases[self.self_idx]
     }
 
+    /// 本节点在此拓扑中（非 sentinel 占位）。
+    pub fn self_idx_opt(&self) -> Option<usize> {
+        (self.self_idx < self.nodes.len()).then_some(self.self_idx)
+    }
+
+    /// 仅对 self_idx 有效的拓扑调用（sentinel 占位会 panic）。
     pub fn self_node(&self) -> &NodeSpec {
         &self.nodes[self.self_idx]
     }
@@ -187,19 +202,136 @@ impl ClusterTopology {
     }
 }
 
+/// 多 set 拓扑集合（M4 切片 8；子设计 v3）。**两个槽号域，绝不可混用**：
+///
+/// - `sets[i]` = set i 的**组内**槽空间（分片面：放置公式、ShardRef.drive、分片 RPC 的 set+slot）；
+/// - `flat` = **全局扁平编号**（命名空间面：meta ack 链 `slot_base`/prepared_local/`node_of_slot`
+///   回滚路由要求全集群唯一编号）——按 id 去重的全节点并集，每节点 drive_count = Σ 各 set 盘数；
+///   k=1 时与单 set 的旧 topo 逐字节同构。
+///
+/// 命名空间面（meta/桶目录/版本目录）跨全部 set 镜像（S-L 口径），其广播循环一律用 `flat.nodes`。
+#[derive(Clone, Debug)]
+pub struct ClusterSets {
+    pub sets: Vec<ClusterTopology>,
+    pub flat: ClusterTopology,
+    /// 自节点在 `data_dirs` 的 (set, offset, len) 段表（set 升序；顺序契约 = 子设计 S-A）。
+    pub self_ranges: Vec<(u16, usize, usize)>,
+}
+
+impl ClusterSets {
+    /// `sets_nodes[i]` = set i 的节点条目（同物理节点可在多个 set 各出一条，id 相同）。
+    /// 校验：每 set 走 ClusterTopology::new 全套 + **同 id 跨 set 的 addr 必须一致**（RPC 只按
+    /// id 路由——不一致则目标无定义，verifier M3）+ self 至少在一个 set + 总盘数 ≤255（口径 d）。
+    pub fn new(
+        self_id: &str,
+        sets_nodes: Vec<Vec<NodeSpec>>,
+        ec: &super::ec::EcConfig,
+    ) -> Result<Self> {
+        if sets_nodes.is_empty() {
+            return Err(Error::Encode("cluster.sets 为空".into()));
+        }
+        // addr 一致性（跨 set 同 id）
+        let mut addr_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for nodes in &sets_nodes {
+            for n in nodes {
+                match addr_of.get(n.id.as_str()) {
+                    Some(a) if *a != n.addr => {
+                        return Err(Error::Encode(format!(
+                            "节点 {} 跨 set 的 addr 不一致（«{a}» vs «{}»）——RPC 只按 id 路由",
+                            n.id, n.addr
+                        )));
+                    }
+                    _ => {
+                        addr_of.insert(&n.id, &n.addr);
+                    }
+                }
+            }
+        }
+        let mut sets = Vec::with_capacity(sets_nodes.len());
+        let mut self_ranges = Vec::new();
+        let mut offset = 0usize;
+        let mut self_seen = false;
+        for (set_i, nodes) in sets_nodes.iter().enumerate() {
+            let self_idx = nodes
+                .iter()
+                .position(|n| n.id == self_id)
+                .unwrap_or(usize::MAX); // 非自属 set：sentinel 占位
+            let topo = ClusterTopology::new(self_idx, nodes.clone(), ec)?;
+            if let Some(si) = topo.self_idx_opt() {
+                self_seen = true;
+                self_ranges.push((set_i as u16, offset, nodes[si].drive_count as usize));
+                offset += nodes[si].drive_count as usize;
+            }
+            sets.push(topo);
+        }
+        if !self_seen {
+            return Err(Error::Encode(format!(
+                "本节点 «{self_id}» 不在任何 set 的节点表内"
+            )));
+        }
+        // flat：按 id 去重的全节点并集（首见顺序），drive_count = Σ
+        let mut flat_nodes: Vec<NodeSpec> = Vec::new();
+        for nodes in &sets_nodes {
+            for n in nodes {
+                match flat_nodes.iter_mut().find(|m| m.id == n.id) {
+                    Some(m) => {
+                        m.drive_count = m
+                            .drive_count
+                            .checked_add(n.drive_count)
+                            .ok_or_else(|| Error::Encode(format!("节点 {} 盘数溢出 u16", n.id)))?
+                    }
+                    None => flat_nodes.push(n.clone()),
+                }
+            }
+        }
+        let self_flat = flat_nodes
+            .iter()
+            .position(|n| n.id == self_id)
+            .ok_or_else(|| Error::Encode("flat：本节点缺席（不可达）".into()))?;
+        // flat 不承载放置（命名空间面镜像）→ 不适用逐节点 parity 规则；≤255/≥min 仍在
+        let flat = ClusterTopology::build(self_flat, flat_nodes, ec, false)?;
+        Ok(Self {
+            sets,
+            flat,
+            self_ranges,
+        })
+    }
+
+    /// 单 set 便捷构造（k=1：flat 与 set0 同构）——单组部署与测试用。
+    pub fn single(self_id: &str, nodes: Vec<NodeSpec>, ec: &super::ec::EcConfig) -> Result<Self> {
+        Self::new(self_id, vec![nodes], ec)
+    }
+
+    /// (set, 组内盘序) → cfg.drives 扁平下标（= 自节点该 set 段 offset + 组内序）。
+    /// `None` = 越界/该盘不在本节点。**洞 1 修法 (a)：一切物理盘寻址经此映射**。
+    pub fn flat_of(&self, set: u16, ordinal: usize) -> Option<usize> {
+        self.self_ranges
+            .iter()
+            .find(|(s, _, len)| *s == set && ordinal < *len)
+            .map(|(_, off, _)| off + ordinal)
+    }
+
+    pub fn set_topo(&self, set: u16) -> Option<&ClusterTopology> {
+        self.sets.get(set as usize)
+    }
+}
+
 /// 集群运行面：静态拓扑 + 节点间传输（trait 见 [`crate::mesh`]；tonic 实现由 xl-client 注入）。
 pub struct ClusterConfig {
-    pub topo: ClusterTopology,
+    pub sets: ClusterSets,
     pub transport: Arc<dyn MeshTransport>,
     /// M4 切片 5 放置开关（显式；混版集群里未开的旧节点会按恒等公式服务 → fail-closed
     /// 可诊断——滚动升级需「全节点升级（仍 v1）→ 全节点开启 → rebalance」）。
     pub placement_v2: bool,
+    /// M4 切片 8：桶 → set 解析。`None` = 未注入：单 set 由 Store 短路（不调用）；
+    /// 多 set 命中 = fail-closed Err（配置错误不得静默）。
+    pub resolver: Option<Arc<dyn crate::mesh::SetResolver>>,
 }
 
 impl std::fmt::Debug for ClusterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClusterConfig")
-            .field("topo", &self.topo)
+            .field("sets", &self.sets)
             .finish_non_exhaustive()
     }
 }
@@ -236,49 +368,106 @@ impl Store {
         }
     }
 
-    /// 槽位 → 本机盘下标（None = 不在本机）。单机：槽位即盘下标（v1 恒等/放置语义一致）。
-    pub(in crate::store) fn local_drive_idx_of_slot(&self, slot: u16) -> Option<usize> {
+    /// 桶 → set（M4 切片 8；**数据面每 op 一次**）。单 set（含单机）短路静态 0（零新增查询，
+    /// verifier Q6③）；多 set 走注入 resolver——`Ok(None)`（全可达且确无行）→ NoSuchBucket，
+    /// `Err`（传输错/行分叉/超界）上抛 fail-closed，**绝不静默回落 0**（S-C）。
+    pub(in crate::store) async fn set_of_bucket(&self, bucket: &str) -> Result<u16> {
+        match self.resolve_bucket_set(bucket).await? {
+            Some(s) => Ok(s),
+            // 「全部可达且确无行」→ 桶不存在（放行会把分片写进错误组）
+            None => Err(Error::NoSuchBucket(bucket.to_string())),
+        }
+    }
+
+    /// 桶 → set 探测（**控制面/启动回填用**；与 set_of_bucket 同源、None 不转 NoSuchBucket）：
+    /// 单机/单 set → `Some(0)`（零查询短路）；多 set → resolver（`Ok(None)` = 全部可达且确无
+    /// 行——回填只在此态插 set=0，**任一传输错是不插行**，verifier 终审洞 2）。
+    pub async fn resolve_bucket_set(&self, bucket: &str) -> Result<Option<u16>> {
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return Ok(Some(0));
+        };
+        if cl.sets.sets.len() == 1 {
+            return Ok(Some(0));
+        }
+        let resolver = cl
+            .resolver
+            .as_ref()
+            .ok_or_else(|| Error::Encode("多 set 集群未注入 SetResolver".into()))?;
+        match resolver.resolve_bucket_set(bucket).await? {
+            Some(s) => {
+                let s = u16::try_from(s).map_err(|_| Error::Encode(format!("set {s} 越界")))?;
+                if cl.sets.set_topo(s).is_none() {
+                    return Err(Error::Encode(format!(
+                        "set {s} 不在拓扑内（共 {} 组）",
+                        cl.sets.sets.len()
+                    )));
+                }
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 槽位 → 本机盘下标（None = 不在本机）。**分片面语义：slot 为组内槽，经 `flat_of` 映射到
+    /// cfg.drives 扁平下标**（洞 1 修法 (a)——组内序 ≠ 扁平序，多 set 直接透传会写错盘）。
+    /// 单机：槽位即盘下标（v1 恒等/放置语义一致）。
+    pub(in crate::store) fn local_drive_idx_of_slot(&self, set: u16, slot: u16) -> Option<usize> {
         match self.cfg.cluster.as_deref() {
             None => (slot as usize)
                 .lt(&self.cfg.drives.len())
                 .then_some(slot as usize),
-            Some(cl) => cl.topo.local_drive_of_slot(slot),
+            Some(cl) => {
+                let topo = cl.sets.set_topo(set)?;
+                let ord = topo.local_drive_of_slot(slot)?;
+                cl.sets.flat_of(set, ord)
+            }
         }
     }
 
     /// 分片放置（v1/v2 分派，见 [`ClusterTopology::place`] 与 [`Self::placement_hash`]）。
-    pub(in crate::store) fn slot_of_shard(&self, hash: u64, shard: u8) -> u16 {
+    /// 集群：在**桶所属 set** 的组内槽空间算（set 越界 → Err，fail-closed）。
+    pub(in crate::store) fn slot_of_shard(&self, set: u16, hash: u64, shard: u8) -> Result<u16> {
         match self.cfg.cluster.as_deref() {
             None => {
                 let n = self.cfg.drives.len();
-                if self.placement_v2() {
+                Ok(if self.placement_v2() {
                     ((hash.wrapping_add(shard as u64)) % n as u64) as u16
                 } else {
                     drive_index(shard, n) as u16
-                }
+                })
             }
-            Some(cl) => cl.topo.place(hash, shard, cl.placement_v2),
+            Some(cl) => {
+                let topo = cl
+                    .sets
+                    .set_topo(set)
+                    .ok_or_else(|| Error::Encode(format!("set {set} 不在拓扑内")))?;
+                Ok(topo.place(hash, shard, cl.placement_v2))
+            }
         }
     }
 
-    /// 槽位 → 落点。越界返回 None（meta 里的 drive 是外部输入，须防呆）。
-    pub(in crate::store) fn slot_target(&self, slot: u16) -> Option<ShardTarget<'_>> {
+    /// 槽位 → 落点（slot = **桶所属 set 的组内槽**）。越界返回 None（meta 里的 drive 是外部输入，须防呆）。
+    pub(in crate::store) fn slot_target(&self, set: u16, slot: u16) -> Option<ShardTarget<'_>> {
         match self.cfg.cluster.as_deref() {
             None => Some(ShardTarget::Local {
                 drive: drive_root(&self.cfg.drives, slot as u8)?,
                 slot,
             }),
             Some(cl) => {
-                if slot >= cl.topo.slot_count() {
+                let topo = cl.sets.set_topo(set)?;
+                if slot >= topo.slot_count() {
                     return None;
                 }
-                match cl.topo.local_drive_of_slot(slot) {
-                    Some(d) => Some(ShardTarget::Local {
-                        drive: drive_root(&self.cfg.drives, d as u8)?,
-                        slot,
-                    }),
+                match topo.local_drive_of_slot(slot) {
+                    Some(ord) => {
+                        let flat = cl.sets.flat_of(set, ord)?;
+                        Some(ShardTarget::Local {
+                            drive: drive_root(&self.cfg.drives, flat as u8)?,
+                            slot,
+                        })
+                    }
                     None => Some(ShardTarget::Remote {
-                        node: &cl.topo.nodes[cl.topo.node_of_slot(slot)].id,
+                        node: &topo.nodes[topo.node_of_slot(slot)].id,
                         slot,
                     }),
                 }
@@ -286,9 +475,9 @@ impl Store {
         }
     }
 
-    /// meta 的 ShardRef → 落点（读路径统一入口）。
-    pub(in crate::store) fn shard_target(&self, s: &ShardRef) -> Option<ShardTarget<'_>> {
-        self.slot_target(s.drive as u16)
+    /// meta 的 ShardRef → 落点（读路径统一入口；drive = 桶所属 set 的组内槽）。
+    pub(in crate::store) fn shard_target(&self, set: u16, s: &ShardRef) -> Option<ShardTarget<'_>> {
+        self.slot_target(set, s.drive as u16)
     }
 }
 
@@ -309,15 +498,6 @@ mod tests {
         // 13 盘：分片铺满前 12 盘（第 13 盘不用）
         assert_eq!(drive_index(12, 13), 12);
         assert_eq!(drive_index(0, 13), 0);
-    }
-
-    #[test]
-    fn set_index_single_set_is_zero_and_deterministic() {
-        assert_eq!(set_index("bucket", "a/b.txt", 1), 0);
-        // 多 set 时同键恒同 set（rebalance 之外不允许漂移）
-        let a = set_index("bucket", "a/b.txt", 7);
-        assert_eq!(a, set_index("bucket", "a/b.txt", 7));
-        assert!(a < 7);
     }
 
     #[test]

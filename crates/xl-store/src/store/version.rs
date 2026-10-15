@@ -165,8 +165,8 @@ impl Store {
             let _ = tokio::fs::rename(&old_dir, &trash).await;
         }
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -348,8 +348,8 @@ impl Store {
             local
         };
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }

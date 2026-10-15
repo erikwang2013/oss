@@ -36,6 +36,8 @@ pub struct ShardWrite {
     pub is_final: bool,
     /// M4 切片 5：请求方携带的槽位（写路径 = 放置结果；服务端只校验归属，不重算公式）。
     pub slot: u32,
+    /// M4 切片 8：桶所属 set（槽为**组内**槽；服务端按 sets[set] 校验 + flat_of 映射物理盘）。
+    pub set: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +53,8 @@ pub struct ShardRead {
     pub length: u64,
     /// M4 切片 5：请求方携带的槽位（= meta 的 ShardRef.drive；老槽在 flip 后不再有记录）。
     pub slot: u32,
+    /// M4 切片 8：桶所属 set（组内槽域）。
+    pub set: u32,
 }
 
 /// 单片删除（M4 切片 5：rebalance 翻转后的老片清理；槽位显式携带）。
@@ -62,6 +66,8 @@ pub struct ShardDelete {
     pub part: u32,
     pub shard: u32,
     pub slot: u32,
+    /// M4 切片 8：桶所属 set（组内槽域）。
+    pub set: u32,
 }
 
 /// 版本目录引用（删除 / 回收两用；UUID 是版本目录名，天然幂等）。
@@ -188,6 +194,8 @@ pub enum ControlQuery {
     OwnedBuckets(i64),
     VisibleBuckets(i64),
     BucketOwner(String),
+    /// M4 切片 8：桶 → set（无行 = None）
+    BucketSet(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -198,6 +206,8 @@ pub struct ControlRow {
     pub secret: Option<String>,
     pub flag: Option<bool>,
     pub names: Option<Vec<String>>,
+    /// M4 切片 8：BucketSet 应答
+    pub set: Option<u32>,
 }
 
 /// 控制面后端（Task 9）：服务端**本地**查询执行器。oss-server 注入 sqlx 实现
@@ -207,6 +217,15 @@ pub struct ControlRow {
 pub trait ControlBackend: Send + Sync + std::fmt::Debug {
     /// 白名单查询（安全边界在实现侧）；None = 本节点查无。
     async fn control_query(&self, q: ControlQuery) -> Result<Option<ControlRow>>;
+}
+
+/// 桶 → set 解析（M4 切片 8）。**独立于 MeshTransport 的扇出面**（verifier M2）：
+/// 「对端不可达」必须与「对端答无行」可区分——不复用吞错的 ControlMesh::ask 语义。
+#[async_trait::async_trait]
+pub trait SetResolver: Send + Sync + std::fmt::Debug {
+    /// `Ok(Some(set))` = 有行（含一致性合并）；`Ok(None)` = **全部可达且都答无**；
+    /// `Err` = 任一传输错 / 行分叉（多节点答案不一致）/ 无任何可达节点。
+    async fn resolve_bucket_set(&self, bucket: &str) -> Result<Option<u32>>;
 }
 
 /// 节点间传输。实现必须：幂等（write_shard/delete_version）、超时即错（调用方按

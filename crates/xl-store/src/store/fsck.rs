@@ -84,8 +84,8 @@ impl Store {
         // 集群：peer 探活（down → 报告项；其数据不巡检不计缺）
         let mut peers_up: Vec<String> = Vec::new();
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -163,7 +163,21 @@ impl Store {
             }
         }
 
+        // M4 切片 8：per-bucket set 缓存（keys 按 (bucket,key) 排序；解析失败 = 该桶键跳过 + 计数）
+        let mut cur_bucket: Option<String> = None;
+        let mut cur_set: u16 = 0;
         for (bucket, key) in keys {
+            if cur_bucket.as_deref() != Some(bucket.as_str()) {
+                match self.set_of_bucket(&bucket).await {
+                    Ok(s) => cur_set = s,
+                    Err(e) => {
+                        tracing::warn!(bucket = %bucket, error = %e, "fsck：set 解析失败（该桶键跳过）");
+                        r.corrupt_meta += 1;
+                        continue;
+                    }
+                }
+                cur_bucket = Some(bucket.clone());
+            }
             r.objects_scanned += 1;
             // 单次 read_meta 快照同时构建「引用集」与「期望文件集」——**不得二次读取**：
             // 第二次 Err 会让 expected 为空而 referenced 非空 → --repair 把活对象分片
@@ -197,7 +211,8 @@ impl Store {
                 for v in &m.versions {
                     if let Some(l) = &v.data_layout {
                         for s in &l.shards {
-                            if let Some(di) = self.local_drive_idx_of_slot(s.drive as u16) {
+                            if let Some(di) = self.local_drive_idx_of_slot(cur_set, s.drive as u16)
+                            {
                                 expected_files.insert((
                                     di,
                                     v.part.uuid.clone(),
@@ -269,7 +284,7 @@ impl Store {
                 if let Some(l) = &v.data_layout {
                     let uuid = v.part.uuid.clone();
                     for s in &l.shards {
-                        match self.shard_target(s) {
+                        match self.shard_target(cur_set, s) {
                             Some(drives::ShardTarget::Local { drive, .. }) => {
                                 let Ok(path) = drives::shard_path(drive, &bucket, &key, &uuid, s)
                                 else {
@@ -297,6 +312,7 @@ impl Store {
                                     uuid: uuid.clone(),
                                     part: s.part as u32,
                                     shard: s.shard as u32,
+                                    set: cur_set as u32,
                                     offset: 0,
                                     length: 0, // 整片（fsck 全量校验语义）
                                     slot: s.drive as u32,
@@ -402,8 +418,8 @@ impl Store {
         };
         let mut peers_up: Vec<String> = Vec::new();
         if let Some(cl) = self.cfg.cluster.as_deref() {
-            let self_id = cl.topo.self_node().id.clone();
-            for n in &cl.topo.nodes {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
                 }
@@ -414,7 +430,20 @@ impl Store {
             }
         }
         let (keys, _buckets) = self.collect_namespace().await?;
+        let mut cur_bucket: Option<String> = None;
+        let mut cur_set: u16 = 0;
         for (bucket, key) in keys {
+            if cur_bucket.as_deref() != Some(bucket.as_str()) {
+                match self.set_of_bucket(&bucket).await {
+                    Ok(s) => cur_set = s,
+                    Err(e) => {
+                        tracing::warn!(bucket = %bucket, error = %e, "scrub：set 解析失败（该桶键跳过）");
+                        rep.corrupt_meta += 1;
+                        continue;
+                    }
+                }
+                cur_bucket = Some(bucket.clone());
+            }
             let m = match self.read_meta(&bucket, &key).await {
                 Ok(Some(m)) => m,
                 Ok(None) => continue,
@@ -495,7 +524,10 @@ impl Store {
                 'blocks: for t in 0..blocks {
                     let mut chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(l.shards.len());
                     for (i, s) in l.shards.iter().enumerate() {
-                        match self.read_shard_block(&bucket, &key, v, s, i, t, ss).await? {
+                        match self
+                            .read_shard_block(cur_set, &bucket, &key, v, s, i, t, ss)
+                            .await?
+                        {
                             Some(b) => chunks.push(Some(b)),
                             None => {
                                 v_missing += 1;

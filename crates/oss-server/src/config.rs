@@ -51,6 +51,10 @@ pub struct NodeToml {
     pub id: String,
     pub addr: String,
     pub drive_count: u16,
+    /// M4 切片 8：所属 set（缺省 0 = 单 set 部署；同物理节点可在多个 set 各出一条，
+    /// 同 id 各条的 addr 必须一致——由 ClusterSets::new 校验）。
+    #[serde(default)]
+    pub set: Option<u16>,
 }
 
 /// `[ec]` 配置节（映射到 xl-store 的 `EcConfig` + `inline_threshold`）。
