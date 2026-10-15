@@ -138,6 +138,10 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   - 控制台上传只能进「`[[groups]]` 分组映射的目标桶」——子账户要往自有桶传，走 S3 面。
 >   - 撤回授权对**在途分块上传**不追溯（preprocess 已放行的会传完）；新请求即时生效。
 >   - 建子账户 API 固定为非管理员（防提权）；口令至少 8 位；删除用户级联清其密钥与授权。
+>   - 口令存 **Argon2id**（m=19456, t=2, p=1）；历史 sha256 口令在**成功登录时透明升级**（无需重置）。
+>   - **登录无速率限制**（Argon2 每次校验 ~19 MiB 内存）——暴力尝试面未封，后续补限速。
+>   - **桶策略只在 S3 面生效**：控制台与 aetherupload 上传面仍走三档 permissions。
+>   - **删桶连带清空该桶策略与生命周期规则**（S3 面与控制面删桶都清）——同名重建不继承，防旧规则误删。
 
 ## Docker（compose）
 
@@ -360,6 +364,34 @@ GET / HEAD / DeleteObject 带 `--version-id` 点名版本；`copy-object --copy-
 - **饥饿边界**：单轮单规则 ≤10 万键（100 页 × 1000）；超出即**截停记 jobs.error**（`state=error`，不静默）——
   但**扫描位点不跨轮持久化**，前缀下若长期 >10 万「未到期」键，尾部的到期键可能长期扫不到（调小 prefix 拆规则可解）。
 - **陈旧作业行**：进程崩溃可能留下 `state='running'` 的 jobs 行（无自动回收，展示层可按 updated_at 过旧识别）。
+
+## 桶策略与审计（M4）
+
+控制台 API `GET/PUT /api/v1/buckets/{bucket}/policy`（桶主或管理员；**桶不存在 = 404**——防给
+尚不存在的桶预置策略、同名桶日后创建即继承）：`PUT` 为**全量替换**（≤64 KiB、≤100 条 statement、
+顶层必须对象、`Effect` 必须为 `Allow`/`Deny` 且 Principal/Action/Resource 非空；越出支持子集或
+拼错即 400，不静默空转），`GET` 回读原文（未配 = `null`）。S3 面判定口径：**显式 Deny 优先 →
+Allow 提升 → 无匹配回落三档 permissions**；策略读/解析失败 fail-closed 拒。`CopyObject`
+**源/目标两轴独立判定**：目标桶写策略与源桶读策略各判各的，**源桶 Deny 压过目标桶 Allow**
+（否则有目标桶写权者可绕过源桶 Deny 拷走机密），且**源桶 Allow 不能替代目标桶写权限**。
+`DeleteObjects` **逐键授权**：批量删的键在请求体、`check` 阶段不可见，授权下放 handler 逐键判定
+（与单键删同口径——策略 Deny → 拒 / Allow → 放 / 无匹配 → 回落三档）；Deny 键以 `AccessDenied`
+记入响应 `errors[]` 并落审计，其余键照删（§3.4 部分失败语义；否则前缀级 Deny 会被一条批量删
+请求整体绕过）。
+
+支持子集（`crates/xl-s3/src/policy.rs`）：`Effect` · `Principal.AWS`（`"*"` | AK | `"uid:<n>"`）·
+`Action`（精确或尾部 `*` 通配，如 `s3:Get*`）· `Resource`（桶级 `arn:aws:s3:::<bucket>` /
+对象级 `arn:aws:s3:::<bucket>/<prefix>*`，**按 op 类别单轴匹配**——桶级 op 只见桶 ARN、
+对象 op 只见对象 ARN，与 AWS 一致）。**明确不做**：Conditions / NotAction / NotResource /
+Principal 的 ARN 形态 / **匿名（无凭据）放行**——`Principal:"*"` 只对任意**有效 AK** 生效，
+真正匿名需认证层改造。显式 Deny 对桶主与管理员同样生效（AWS 语义，e2e 实测）——管理员只旁路
+三档 permissions，不旁路桶策略 Deny。
+
+审计：S3 面每次授权判定（允许与拒绝都）落一行 SQLite `audit_log`，`detail` 记策略来源
+（`policy:allow` / `policy:deny` / `policy:error`）；`GET /api/v1/audit?limit=&decision=allow|deny`
+（仅管理员；limit 默认 100、钳 1..=1000；`decision` 只认 allow/deny，其它值视为不过滤，最新在前）。
+`tests/e2e_s3.sh` 第 17 节实弹覆盖（Deny 优先 / 校验 400 / 审计查询 / 清策略恢复 / 删桶清策略 /
+批量删逐键授权）。
 
 ## 验收
 
