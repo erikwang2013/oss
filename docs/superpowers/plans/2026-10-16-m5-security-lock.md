@@ -112,18 +112,160 @@
 加密对象静默报废（不可逆），且 provider 先跑会在 store 的盘在册扫描里插进「无 drive-id 的
 .oss.sys」污染降级判定。生成门闩（要求 store 已初始化/drive-id 在）与顺序在切片 2 子设计定。
 
-子设计要点（待评审细化）：
-- 流式插入点：`put.rs` 的 `harvest_body` 之后、`ec::ChunkWriter.encode_block` 之前，**逐块**加密
-  （块 = 现有 64KiB 粒度；GCM tag 16B 附加；末块补零在加密**后**……顺序待评）；总长 = 明文 + 每块 tag。
-- nonce：`nonce_seed[8] || block_no[4]` 派生（GCM 96-bit）；`nonce_seed` 每 part 随机、落 meta；
-  同 DEK 下不重用（part 号参与或 seed 每 part 新——评估）。
-- EC 参数与 crc32c：分片 CRC 对**密文**（落盘态）；ETag/checksum 对**明文**（读端解密后原生校验，
-  设计决策记录）。
-- Range 读：命中密文块 → 解密 → 切片（块内 tag 位置换算）；逐块对偶校验在解密后进行。
-- inline 对象：加密后 inline？还是 inline 不加密（记档）？——给结论。
-- MPU/版本：每 part 独立 DEK 或对象级单 DEK 多 part？（AWS 语义 + 重建简洁性权衡）
-- 旧对象（无 encryption 字段）零回归；加密对象在 `ec.enabled=false` 旧形态的行为。
-- **定稿**：§
+**子设计 v2（2026-10-16，评审第 1 轮 B1-B6 已修、S1-S8 已采，交复评）——块对齐信封加密（DARE 式）**
+
+**D1 核心形态（块对齐）**：明文流按 `PLAIN_UNIT = 65536 − 16 = 65520B` 分单元；单元 u 独立
+AES-256-GCM（tag 16B，AAD 见 D4）→ **密文单元恒 65536B（= `ec::CHUNK_W`）**，末单元短（明文尾+16）。
+于是「EC 单元 ↔（片 s, 块 t）」成**双射**：`u = s·blocks_ec + t`（∵ `ss = blocks_ec·W`）。
+收益：写侧 gather 逐单元取 P 段 → 加密切片 → `encode_block` 原样喂（单元即整块）；读侧每个解码块
+恰为一个整单元，无跨块窗；tag 永不跨片；每单元加解密恰一次。**否**弃「密文流=明文+逐块 tag 顺拼」
+方案：tag 周期与 W-window 错位，跨窗单元要重加密（虽确定性可行但复杂）。依据：MinIO DARE 同构
+（加密块与 erasure 条带对齐）+ 设计 §7.6「先加密再 EC」+ 工作令「块 = 现有 64KiB 粒度」。
+
+**D2 长度换算（单源函数，写读共用，置 `crypto.rs`）**：`nb = ceil(P/65520)`；**P=0 ⇒ nb=0、
+c_len=0、无单元**（几何函数对 nb==0 显式短路，防 `nb−1` 下溢——B1）；`unit_clen(u) = u < nb−1 ?
+65536 : (P − 65520·(nb−1)) + 16`；`c_len = (nb−1)·65536 + unit_clen(nb−1)`（P>0，等价
+`c_len = P + 16·nb`）；`blocks_ec = ceil(c_len / (data·65536))`；`ss = blocks_ec·65536`。单元 u 的
+明文区间 `[65520·u, min(65520·(u+1), P))`。恒等式 `data·blocks_ec ≥ nb` 由 `c_len > (nb−1)·W`
+保证（末单元至少 +17B）。**上限单点校验（写读共用，B3）**：`P ≤ 65520·2³²`（=
+281,406,257,233,920 B ≈ **281.4 TB**），超限 → `Error::Crypto` fail-closed——nonce 取 BE32(u)
+的不变量在读侧同样强制。`u ≥ nb` 的条带盘上恒全零，**读侧必须显式跳过**（D7）。
+
+**D3 nonce**：`nonce = seed(8B 随机) ‖ BE32(u)`。**每对象一把 DEK（wrap 一次）+ 每存储流一个
+seed**（本片 MPU 合并为单流，见 D8——「每 part 一 wrap」不适用）。同 DEK 下单元号唯一 ⇒ nonce
+唯一；跨对象 DEK 不同 ⇒ 无跨对象面。seed 随机源写死 OsRng（kms.rs `new_dek` 同口径）。
+**记档（S5 回填）**：本片每对象仅 1 wrap ⇒ 切片 1 复验「wrap 随机 nonce 2³²/钥」的触限 =
+2³² 对象/钥，远超现实——口径闭合。
+
+**D4 AAD**：单元加密带 `AAD = b"oss-m5|" ‖ key_id`——闭合切片 1 复验记档①「key_id 随切片 2 的
+meta 格式纳入 AAD」。**wrap 层（kms.rs）保持无 AAD 不动**（recheck 判定可接受；交叉替换只 tag
+失配 fail-closed）。AAD 无版本前缀风险不计：算法判别靠 D5 algorithm 白名单（白名单外读侧
+`CorruptMeta` fail-closed），单元级换位被「位置相关 nonce」天然拦截。
+
+**D5 meta**：`Version.encryption: Option<EncryptionRecord>`（Option + `serde(default)` 前向兼容
+契约）：
+```rust
+pub struct EncryptionRecord {
+    pub algorithm: String,       // 本片唯一值 "AES256-GCM-DARE-65520-v1"（S1：自描述几何
+                                 // PLAIN_UNIT=65520 / W=65536 / DARE 布局——格式一回写即锁死，
+                                 // 方案演进靠新标识，读侧白名单 fail-closed）
+    pub key_id: String,          // "file" / "k<n>"
+    pub wrapped_dek_hex: String, // 60B hex；SSE-C（切片 3）允许空
+    pub nonce_seed_hex: String,  // 8B hex（16 字符）
+}
+```
+decode 信任边界校验：algorithm 白名单（唯一值）；key_id 可打印 ≤64；hex 合法 + 长度（wrapped 0
+或 60B、seed 16 hex 恰 8B）；违者 `CorruptMeta`。「wrapped 空 + 算法白名单内」为 SSE-C 预留的
+**合法解码形态**，读侧 unwrap 空必拒 → 测试双钉（decode 允 / read `Crypto`，S2）。golden 摘要
+**第六次有意识更新**（注释注明 M5 切片 2 增 encryption 字段）。**期望长度口径 = `c_len(size)`，
+改面三处（B4）**：read.rs:79（get）、read.rs:162（range）、**version.rs:282（read_version_data）**。
+inline 上限联动：decode 放宽 `c_len(MAX_INLINE)=131120`；阈值 ≤ MAX_INLINE 校验不变。
+
+**D6 写入管线**：`put_object_stream_with_meta` / `complete_multipart_upload_versioned` 增
+`encryption: Option<EncSpec>` 参数（其余调用点传 None；切片 3 由 S3 头映射）。起点（对象锁内）：
+`dek=new_dek(); (wrapped,key_id)=按 spec 选 provider.wrap_dek(&dek)?; seed=OsRng 8B` →
+`EncCtx{cipher,seed,key_id}`。`stage_payload`/`stage_payload_multi` 增 `enc: Option<&EncCtx>`
+（None = 零行为变化）：gather 按单元取 P 段（短读按实长补零）→ 加密切片 → 喂 `encode_block`；
+`blocks/ss` 以 **c_len** 算；**分片 CRC 覆盖密文（落盘态）**；ETag/MD5/SHA256/checksum 均对明文
+（harvest 不变，读端解密后终验）。inline 分支：P 读回后**按 D2 单元切分加密**（P>65520 时 nb 可为 2/3，非「整段单 tag」，N1）——
+`InlineData.bytes = C = c_len(P)`；**P=0 ⇒ C 空**（与 D2 短路一致）。
+`PartRef.size = P`（明文），sha256 = 明文 sha。**ec.enabled=false + EncSpec → 两条写路径起点
+（stage 前）检查 → `Error::Encode("encryption requires ec.enabled")`**（该模式下连 inline 分支
+都不存在——put.rs 分支序如此；记档：切片 3 在 S3 面提前映射 4xx）。版本链：encryption 随 Version
+落 meta——旧版本各留各的记录 ⇒ 换主密钥后旧版本仍可读（验收⑤）；delete marker 无 encryption。
+**CopyObject 遗漏面（记档 S3）**：store.rs:1212-1231 `copy_object` = get（解密成 P）→ put(None)
+⇒ 密文源会复制成**明文目标**；本片 S3 面无头映射不可达；切片 3 决定语义（随源/桶默认/显式记档）。
+**aether 摄取** = `crates/oss-server/src/aether.rs:131-142`（内部摄取按明文落 None）✓。**MPU×AWS
+偏离**（本实现 complete 时单流加密 vs AWS 分片级）→ 切片 3/7 文档落纸（S4）。
+
+**D7 读管线**：`read_ec_range` 对 `v.encryption` 存在者——
+- 整读：按 **c_len** 截断重建 C（现循环 `obj_start = s·ss + t·W ≡ u·W` 恒等式使重建代码**原样
+  工作**）；逐单元 trim 到 `unit_clen(u)` → GCM 解密（AAD 同 D4）→ 拼 P → 截 P → **SHA256 对 P
+  终验**（`v.part.sha256` 是明文 sha，信任锚不变）；读时修 `repair_shards_chunked` 改用重建出的
+  **C** 重编（非 P）。
+- Range：**u 驱动精确读**——`u0=a/65520`；`u1=(b−1)/65520`；**空区间 [x,x) 先行短路返回空**
+  （read.rs:153 约定 start==end 合法，勿让 b−1 下溢——照 read.rs:462 `saturating_sub` 先例钳
+  下界，B2）；按 t 去重解码块（一块 12 片读一次）；**u ≥ nb 的单元显式跳过**（零条带不可解密，
+  防伪 Crypto）；每单元取片 `s=u/blocks_ec` 的块前 `unit_clen(u)` 字节解密 → 与请求区间求交
+  拷贝。比草稿「(s,t) 窗猜」更精确；**对偶校验/坏片定位仍在密文（落盘态）进行**（优于草稿
+  「解密后」：检错不需解密、在 GCM 之前完成定位）。`real_len=(ss−t·W).min(W)` 为密文口径、
+  单元 trim 走 `unit_clen`，两层勿混。tag 校验失败 → `Error::Crypto` fail-closed。
+- legacy parts 分支（无 data_layout/inline）遇 encryption → `CorruptMeta`；**拒落点在
+  version.rs:299-314**（非 read.rs）。
+- unwrap 一次/读调用（N6 口径：不引全局缓存；记档）；provider 缺失 → `Error::Crypto` fail-closed。
+
+**D8 MPU**：保持「complete 时 concat → 单流」既有形态——加密只在 `stage_payload*`（complete 内）
+发生 ⇒ **对象级单 DEK + 单 seed**；upload_part 暂存保持明文（与单段 PUT 的 `tmp/part.1` 明文暂存
+同口径——提交前不可见；记档：暂存明文为已知边界，切片 7 README 写明）。`concat_stream_verified`
+的并发重传快照核验对明文做，不变。
+
+**D9 接线与门闩**：`Store` 增 `encryption: OnceLock<EncState>`；`EncState { file:
+Option<Arc<FileKeyProvider>>, kms: Option<Arc<KmsFileProvider>> }` + **wrap 按 spec 选路
+（SseS3→file、SseKms→kms）、unwrap 按 key_id 路由（"file"→file、"k<n>"→kms）**——切片 1 遗留的
+双 provider 路由条本片落定。`Store::init_encryption(file_path: Option<PathBuf>, kms_dir:
+Option<PathBuf>) -> Result<()>`：**须在 `Store::open` 成功后调用**（前提块）；门闩 = root 盘
+`<root>/.oss.sys/drive-id` 在册才允许（掉盘/未在册 → Err 拒启、**不生成**）。oss-server
+`state.rs` 在 open 后读 env（`OSS_MASTER_KEY_FILE` / `OSS_KMS_DIR`）调之——env 接线本片落地；
+两 env 均未设 = 不启用加密（Store 照旧，零行为变化）。门闩先于**任何** provider 构造（含
+open_or_init 的创建路径）；被拒路径**磁盘不得出现新钥文件**（D12⑥ 断言，S6）。首启全盘 down 为
+open 既有盲点（store.rs:249-273 warn 容忍），非本片引入——记档。
+
+**D10 API 面**：`pub enum EncSpec { SseS3, SseKms }`（切片 3 扩展 SseC 与请求参数）；
+`ObjectInfo` 增 `encryption: Option<EncryptionRecord>`（切片 3 回 head 头用）——**定义 1 处 +
+构造 5 处**（N3）：store.rs:92（定义）；put.rs:700、mpu.rs:414、version.rs:433、list.rs:255-264、
+**read.rs:24（load_object_info）**。
+
+**D11 改动面清单（B6 补全）**：新 `crates/xl-store/src/crypto.rs`（几何 + 单元 AEAD +
+`EncSpec`/`EncState`/`EncCtx`）｜`meta.rs`（EncryptionRecord + decode 校验 + golden）｜`lib.rs`
+（pub mod）｜`store.rs`（OnceLock + init_encryption + 选路）｜`store/put.rs`、`store/read.rs`、
+`store/mpu.rs`｜**`store/version.rs`（:282 期望长度、:299-314 legacy 拒、:433 ObjectInfo）**｜
+**`store/list.rs`（:255-264 ObjectInfo）**｜**`store/fsck.rs`（:482 scrub inline 校验按
+encryption 分支取 `c_len(size)`——否则加密 inline 对象误报 failed，B5）**｜`store/tests.rs`
+（Version 字面量）｜需补字段的 `meta::Version` 字面量 **7 处**（裸 grep「Version {」23 处含定义/impl/DeleteOutcome
+等——复评 N2 勘误；含 meta.rs 自身测）｜
+`crates/oss-server/src/state.rs`（env 接线）｜`crates/xl-s3/src/service.rs` **三处**调用点
+（:494 put、:617 complete、:1236 copy→None；切片 3 映射头）｜`crates/oss-server/src/aether.rs`
+（:131-142，None）｜新测试放 `store/tests_crypto.rs`（tests.rs 已 4.3k 行）。
+
+**D12 测试计划（评审第 1 轮补 7 项）**：① 往返/几何——size ∈ {**0**、1、65519/65520/65521
+（单元边界±1）、131039/131040/131041、2·W·data±1（块边界）}：写读等 + 随机 Range（含跨单元/跨
+ss 边界、**空区间 [x,x) 返回空**）等 + **盘上布局契约**（按 D2 独立构造 C，与 part.<shard> 逐段
+比对）；② 篡改：密文翻 1B→Crypto、wrapped_dek 翻 1B→Crypto、另钥 provider→Crypto、**wrapped 空
++ 算法在白名单 → decode 允而 read `Crypto`（双钉）**；③ 泄露：≥200KB 全 marker 明文 → 全部片 +
+parity + inline-C 内 grep 不到任何 ≥16B 明文窗（验收②单测级锚）；两单元全零明文 → 两段密文不等；
+④ MPU（≥2 part，首段 ≥5MiB）整读/Range 往返；版本链 v1 加密 + v2 覆盖后 v1 仍可读（⑤）；
+delete marker 不受影响；**version.rs 点名读（get/range/head）回归**；⑤ 旧对象零回归；
+ec.enabled=false + EncSpec → Err；inline 加密（C 长 = c_len）与内联 Range；**repair-from-C 回归
+（丢片→整读→盘上分片与写侧契约逐段一致→再读通过；突变「从 P 重编码」必红）**；**多盘/集群
+stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] → init Err **且磁盘无新钥文件**；
+正常 Ok；重复 init → Err；**decode 拒测（非法 algorithm/hex/越界长度）**；**MPU 暂存明文断言
+（上传后暂存区 part.N 为明文、complete 后版本目录全密文）**。e2e/头/STS 归切片 3/7。
+- 评审记录（第 1 轮，verifier-m5s2-design，报告 /tmp/m5s2-design-verifier-report.md）：架构成立、
+无结构性隐患；阻断 B1-B6 已修（B1 P=0 短路 / B2 空 range 钳下界 / B3 上限读写共用 / B4 期望长度
+三处 / B5 fsck:482 / B6 面补全），建议 S1-S8 已采（S5 为口径回填行）。
+- **定稿（2026-10-16）**：七闸全绿于终树（xl-store **179+1ignored**（kms 16 / crypto 5 /
+  tests_crypto 15 枚）/ kill9 2 / oss-server 67 / xl-s3 52 / xl-client+xl-proto 5 / clippy
+  --workspace --all-targets -D warnings / fmt）。**锚（复验口径）**：全树 `git diff|md5sum` =
+  `b1e64732`（两个新文件均在 `-N` 索引内）+ `crypto.rs` sha256 `545384b7` + `tests_crypto.rs`
+  sha256 `e3533dff`；勘误：更早锚 `e3f65030` 系 crypto.rs 尚未 `add -N`（未进 diff 文本）时刻的
+  口径——复验已逐字节复现，内容零漂移。verifier **两段四轮**：子设计段——第 1 轮 需修订（B1-B6：
+  P=0 短路 / 空 range 钳下界 / 上限读写共用 / 期望长度三处 / fsck:482 / 改动面补全；S1-S8 采）→
+  v2 复评 **可实施** + N1-N4 折入点检通过；实现段——对抗核查 **可收口**（九点全成立：几何单源读写
+  共用、写读管线、三处 inline、legacy 三拒、门闩先于任何 provider 构造、调用面全 None、明文路径
+  逐字节零回归；突变判别 3/4 可红），M1-M3（SseKms 零覆盖 / MPU 暂存断言 / 空区间无判别测）+ L1
+  （unit_plain_len 断言）+ L2（fsck 对 encryption+parts 口径）修入并 scoped 复验 **可收口**（五项
+  全 ADDRESSED、零新问题、七闸 B 树全绿计数自洽）。**核心形态**：DARE 式块对齐信封加密——明文单元
+  65520B → 密文单元恒 65536B（=CHUNK_W）；(片 s, 块 t)↔单元 u=s·blocks_ec+t 双射（tag 不跨块、
+  每单元加解密恰一次）；nonce = seed(8B OsRng) ‖ BE32(u)；AAD = `b"oss-m5|"` ‖ key_id；每对象 1
+  DEK（wrap 一次）+ 1 seed；ETag/MD5/SHA256 对明文、分片 CRC 对密文、对偶校验在密文域；meta
+  `Version.encryption`（algorithm="AES256-GCM-DARE-65520-v1" 自描述几何；golden 第六次有意识
+  更新）；读时修从 **C** 重编码。e2e/头/STS 归切片 3/7。**记档**：①L4——init_encryption 部分失败
+  （file 成、kms 败）留下已生成 file 钥文件：失败即 Err、重试幂等（open_or_init 复用），无静默报废；
+  ②L5——MPU 加密起点先于 upload 存在性检查（不存在的 upload 也耗一次 wrap，错误语义不变）；③L6——
+  三处 inline 文案统一「≠ {expected}」为有意识变化；④D6 四项（CopyObject 语义 / MPU×AWS 偏离 /
+  暂存区明文边界 / provider env 默认路径）挂切片 3/7；⑤fsck/scrub 只做密文域 CRC/对偶、GCM 完整性
+  靠读时 SHA（D7 设计）；⑥恶意 meta 大 size 巨分配属既有面（本片 c_len≈size 未加剧）；⑦M1 负例①
+  与 kms.rs canonical 既有拒重叠、L1 断言无直接单测（复验记档级观察）。提交 `f501bc2`。
 
 ## 切片 3：S3 面 SSE 接线
 
@@ -133,6 +275,9 @@
       KmsFileProvider——同部署 SSE-S3 与 SSE-KMS 混用）；trait 是否加请求 CMK 形参
       （`x-amz-server-side-encryption-aws-kms-key-id` 语义）在接线时定夺并记档；
       key_id 建议纳入 meta AAD（切片 2 定格式时一并）
+- [ ] **切片 2 遗留（复评 S3/S4）**：CopyObject 语义定夺（密文源 → 目标：随源 / 桶默认 / 显式
+      记档——store.rs:1212-1231 现为解密成 P 再 None 写）；MPU×AWS 偏离（complete 单流加密 vs
+      AWS 分片级）落切片 7 README
 - [ ] `head-object`/`get-object` 回 `x-amz-server-side-encryption*`（SSE-C 必回算法；S3/KMS 回 S3/KMS+key_id）
 - [ ] SSE-C 错 key → 拒绝（HMAC 校验，`sse_c_hmac` 落 meta；密钥**绝不落盘**）
 - [ ] 桶级默认加密（PutBucketEncryption/GetBucketEncryption + buckets 列）——评：是否本片（AWS 常用）
