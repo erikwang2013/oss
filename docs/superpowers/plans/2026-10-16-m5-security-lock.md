@@ -42,9 +42,9 @@
       本节点按旧 set 路由、旧 owner 判权，与已收广播的 peer 静默分叉）
 - [x] 启动回填对账保持（**双保险为真**：磁盘面 + 表行面，均走**权威**扇出解析——verifier 高 2：
       原回填走数据面本地先行解析，把本地陈旧值原样写回，对「行存在且 set 已变」收敛不成立）
-- **定稿（2026-10-16）**：七闸全绿（xl-store 143+1ignored / kill9 / oss-server 全套含新增 3 枚
+- **定稿（2026-10-16）**：七闸全绿（xl-store 143+1ignored / kill9 2 / oss-server 67 全二进制含新增 3 枚
   [`control_write_bucket_row_reconverges_stale_row`、`authoritative_resolve_overrides_stale_local_row`、
-  `upsert_bucket_owner_set_overrides_stale_row`] / xl-s3 45+2 枚 owner 覆盖语义 / xl-client+xl-proto /
+  `upsert_bucket_owner_set_overrides_stale_row`] / xl-s3 52（含 owner 覆盖语义 2 枚）/ xl-client+xl-proto 5 /
   clippy --workspace --all-targets -D warnings / fmt；最终树 `git diff | md5sum` = `6a650fbd`，相对
   全闸树 `c4d60f92` 仅 mesh_api.rs 三行注释、xl-store lib 复跑于终树）。verifier **两轮对抗**：
   第 1 轮 阻断 1（发起端 IGNORE 不对称分叉）+ 高 2（回填假兜底）→ 全修；第 2 轮复验 **可收口**
@@ -57,7 +57,7 @@
   ②接线层（四条广播调用点 + 两回填接线）零测试覆盖（突变存活）→ 切片 7 e2e 断言补；③启动开销
   多 set 两对账面 2×桶数×(N-1) 逐桶扇出（桶内并发；行面去重磁盘面名字可减半，未做）；
   ④接收端广播不覆盖 owner（陈旧节点「上一世 owner」本地 is_owner 仍真——HEAD 即存在，未恶化）；
-  ⑤「对端全 None 保守不动」正确（本节点建桶若对端全漏播，删行会把活桶 404）。提交 `<回填>`。
+  ⑤「对端全 None 保守不动」正确（本节点建桶若对端全漏播，删行会把活桶 404）。提交 `41d760d`。
 
 ## 切片 1：密钥库（KeyProvider）
 
