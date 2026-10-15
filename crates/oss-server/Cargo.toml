@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 xl-store.workspace = true
 xl-client.workspace = true
+argon2 = "0.5"
 async-trait = "0.1"
 uuid.workspace = true
 xl-s3.workspace = true

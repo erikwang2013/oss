@@ -81,3 +81,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 );
+
+-- M4 切片 7：桶策略与审计
+CREATE TABLE IF NOT EXISTS bucket_policies (
+    bucket      TEXT PRIMARY KEY,
+    policy_json TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,
+    uid        INTEGER NOT NULL,
+    op         TEXT NOT NULL,            -- S3 op 名（如 GetObject）
+    bucket     TEXT,
+    object_key TEXT,
+    decision   TEXT NOT NULL,            -- allow | deny
+    detail     TEXT
+);

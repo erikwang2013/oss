@@ -23,10 +23,13 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 
 /// 已认证用户身份：`check` 里解析 AK 后塞进请求扩展（s3s 官方机制
 /// `S3AccessContext::extensions_mut`），后续 handler 用 `req.extensions.get::<AuthedUser>()` 读取。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 带 `ak`：handler 级逐键策略复评（DeleteObjects）需要与 check 同源的 Principal 匹配输入；
+/// 控制台/aether 合成身份给空串（各自面不走桶策略）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthedUser {
     pub uid: i64,
     pub is_admin: bool,
+    pub ak: String,
 }
 
 /// 权限动作（与 `permissions` 表三列一一对应）。
@@ -111,6 +114,61 @@ impl Acl {
             .unwrap_or_else(|| "Off".to_string()))
     }
 
+    /// 桶策略读取（M4 切片 7）：None = 未配；**解析失败 = Err**（check 里 fail-closed 拒）。
+    pub async fn bucket_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::policy::PolicyDoc>, sqlx::Error> {
+        let row = sqlx::query("SELECT policy_json FROM bucket_policies WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(r) = row else { return Ok(None) };
+        let json: String = r.get("policy_json");
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+    }
+
+    /// 审计落行（判定后；允许与拒绝都记；best-effort 由调用方 warn）。
+    pub async fn write_audit(
+        &self,
+        uid: i64,
+        op: &str,
+        bucket: Option<&str>,
+        object_key: Option<&str>,
+        decision: &str,
+        detail: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        sqlx::query(
+            "INSERT INTO audit_log (ts, uid, op, bucket, object_key, decision, detail) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(uid)
+        .bind(op)
+        .bind(bucket)
+        .bind(object_key)
+        .bind(decision)
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清桶策略（删桶时调用——与生命周期规则同款 S6-1 语义）。
+    pub async fn clear_bucket_policy(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶
     /// 对象；verifier S6-1）。表在共享 DB（migrations 0001），S3 面与控制面同口径。
     pub async fn clear_lifecycle_rules(&self, bucket: &str) -> Result<(), sqlx::Error> {
@@ -119,6 +177,42 @@ impl Acl {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// DeleteObjects **逐键**授权（handler 用；verifier 阻断 1c 的修复点）。批量删的对象键在
+    /// 请求体、check() 阶段不可见——若不逐键复评，「前缀 Deny」可被一条批量删请求整体绕过，
+    /// 而「桶级 ARN Deny」又会误压整个请求。判定与单键删在 check() 里的融合完全同口径：
+    /// 策略显式 Deny → 拒；策略 Allow → 放；无匹配 → 回落表三档。
+    /// 返回 `(allowed, deny_detail)`：deny_detail 仅拒绝时有值（`policy:deny` = 策略拒，
+    /// `None` = 表三档拒），供 handler 落审计。策略/表读取失败 → 调用方 fail-closed。
+    pub async fn key_delete_decision(
+        &self,
+        user: &AuthedUser,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(bool, Option<&'static str>), sqlx::Error> {
+        let decision = match self.bucket_policy(bucket).await? {
+            Some(doc) => {
+                let pr = crate::policy::PolicyRequest {
+                    op: "DeleteObjects",
+                    ak: &user.ak,
+                    uid: user.uid,
+                    bucket,
+                    key: Some(key),
+                };
+                crate::policy::s3_action("DeleteObject")
+                    .and_then(|a| crate::policy::evaluate(&doc, &pr, a))
+            }
+            None => None,
+        };
+        match decision {
+            Some(true) => Ok((true, None)),
+            Some(false) => Ok((false, Some("policy:deny"))),
+            None => {
+                let allowed = self.can(user.clone(), Action::Delete, bucket).await?;
+                Ok((allowed, None))
+            }
+        }
     }
 
     /// 写桶版本控制状态（PutBucketVersioning；授权门已确认桶主/管理员）。
@@ -154,6 +248,7 @@ impl Acl {
             return Ok(Some(AuthedUser {
                 uid: r.get("user_id"),
                 is_admin: r.get::<i64, _>("is_admin") != 0,
+                ak: access_key.to_string(),
             }));
         }
         // 集群（Task 9）：本地查无 → 扇出（节点 B 建的号/签的 AK，节点 A 也认）
@@ -163,6 +258,7 @@ impl Acl {
             return Ok(Some(AuthedUser {
                 uid: row.uid.unwrap_or(0),
                 is_admin: row.is_admin.unwrap_or(false),
+                ak: access_key.to_string(),
             }));
         }
         Ok(None)
@@ -327,48 +423,189 @@ impl S3Access for Acl {
             .await
             .map_err(acl_err)?
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
-        // handler 读取：ListBuckets 过滤 / CreateBucket 记账（随请求搬进 S3Request.extensions）
-        cx.extensions_mut().insert(user);
-        if user.is_admin {
-            return Ok(());
-        }
+        // handler 读取：ListBuckets 过滤 / CreateBucket 记账 / DeleteObjects 逐键复评
+        //（随请求搬进 S3Request.extensions）
+        cx.extensions_mut().insert(user.clone());
+        // 管理员旁路**表级三档**，但不再提前 return：桶策略的显式 Deny 对管理员同样生效
+        // （AWS 语义），且管理员请求照常落审计。旧实现此处直接 Ok，Deny 与审计双双落空
+        // （verifier 阻断 2——两侧都要，admin 与子账户各自被检查项覆盖）。
+        let is_admin = user.is_admin;
 
         let op = cx.s3_op().name();
         // 桶名必须用 `get_bucket_name()`：`as_bucket()` 只匹配 `S3Path::Bucket` 变体，
         // 对象路径（`Object{bucket,key}`）会返回 None——用它会把一切对象级 op 误判成
         // 「无桶」而全拒（子账户实弹 403 的根因，管理员旁路曾掩盖）。
         let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
-        let Some(gate) = classify(op) else {
-            tracing::warn!(uid = user.uid, op, "授权拒绝（未映射 op，fail-closed）");
-            return Err(s3s::s3_error!(AccessDenied, "access denied"));
-        };
-        let allow = match gate {
-            // 列表由 handler 过滤；建桶任何已认证用户（建后记账 owner）
-            Gate::Open => true,
-            Gate::OwnerBucket => match &bucket {
-                Some(b) => self.is_owner(b, user.uid).await.map_err(acl_err)?,
-                None => false,
-            },
-            Gate::Need(action) => self.can_opt(user, action, &bucket).await?,
-            Gate::Copy => {
-                // 目标写 + 源读（源在 header；用 s3s 的解析器——header 是 URL 编码且有
-                // / 前导与 ?versionId 形态，解析失败与反序列化同判，直接拒绝不误伤）
-                let dst = self.can_opt(user, Action::Write, &bucket).await?;
-                let src = match cx
-                    .headers()
-                    .get(X_AMZ_COPY_SOURCE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(CopySource::parse)
-                {
-                    Some(Ok(CopySource::Bucket { bucket, .. })) => self
-                        .can(user, Action::Read, &bucket)
-                        .await
-                        .map_err(acl_err)?,
-                    _ => false,
-                };
-                dst && src
+        // DeleteObjects：对象键在请求体里，check 阶段拿不到 → 授权**整体下放 handler 逐键**
+        //（service.rs::delete_objects 对每个键跑 policy×表三档，与单键删同口径；AWS 亦逐键
+        // 授权）。此处只保身份与下面审计，避免「批量删绕过前缀 Deny」（verifier 阻断 1c）
+        // 与反向「桶级 ARN Deny 误压整个批量请求」两种偏差。
+        let delegated = op == "DeleteObjects";
+        // 表级基线拆两轴：dst（目标/主体动作）与 src（仅 CopyObject 的源读）。两轴独立 =
+        // 策略融合时不会互相抬升/塌缩（旧实现 src Allow 能抬掉 dst 表拒、dst Allow(Put) 能
+        // 抬掉 src 表读——verifier 阻断 1b）；最终 allow = 两轴合取。
+        let (mut allow_dst, mut allow_src) = if is_admin || delegated {
+            (true, true)
+        } else {
+            // can()/can_opt() 取 by-value；user 后面还要用（策略 Principal / 审计）→ 克隆一份
+            let gate_user = user.clone();
+            match classify(op) {
+                None => {
+                    tracing::warn!(uid = user.uid, op, "授权拒绝（未映射 op，fail-closed）");
+                    return Err(s3s::s3_error!(AccessDenied, "access denied"));
+                }
+                Some(gate) => match gate {
+                    // 列表由 handler 过滤；建桶任何已认证用户（建后记账 owner）
+                    Gate::Open => (true, true),
+                    Gate::OwnerBucket => match &bucket {
+                        Some(b) => (self.is_owner(b, user.uid).await.map_err(acl_err)?, true),
+                        None => (false, true),
+                    },
+                    Gate::Need(action) => (self.can_opt(gate_user, action, &bucket).await?, true),
+                    Gate::Copy => {
+                        // 目标写 + 源读（源在 header；用 s3s 的解析器——header 是 URL 编码
+                        // 且有 / 前导与 ?versionId 形态，解析失败与反序列化同判，直接拒绝）
+                        let dst = self
+                            .can_opt(gate_user.clone(), Action::Write, &bucket)
+                            .await?;
+                        let src = match cx
+                            .headers()
+                            .get(X_AMZ_COPY_SOURCE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(CopySource::parse)
+                        {
+                            Some(Ok(CopySource::Bucket { bucket, .. })) => self
+                                .can(gate_user, Action::Read, &bucket)
+                                .await
+                                .map_err(acl_err)?,
+                            _ => false,
+                        };
+                        (dst, src)
+                    }
+                },
             }
         };
+        // —— 桶策略融合（M4 切片 7）：显式 Deny 优先 → Allow 提升 → 无匹配回落三档 ——
+        // 两轴**各自**融合：dst 轴所有 op；src 轴仅 CopyObject 且**始终**评估（与目标桶有无
+        // 策略无关——旧实现把 src 评估嵌在 dst 有策略分支内，dst 无策略时 src Deny 被完全
+        // 跳过：verifier 阻断 1a）。策略读/解析失败按轴 fail-closed 拒（不静默放行）。
+        // 未映射 op（s3_action None）不参与。匿名放行未实现——记档于 policy.rs 头注。
+        let key: Option<String> = cx.s3_path().as_object().map(|(_, k)| k.to_string());
+        let (mut saw_deny, mut saw_error, mut saw_allow) = (false, false, false);
+        if !delegated && let Some(b) = &bucket {
+            match self.bucket_policy(b).await {
+                Ok(Some(doc)) => {
+                    let pr = crate::policy::PolicyRequest {
+                        op,
+                        ak: &ak,
+                        uid: user.uid,
+                        bucket: b,
+                        key: key.as_deref(),
+                    };
+                    // CopyObject 的目标桶策略管目标写（不走 s3_action 通用映射）
+                    let act = if op == "CopyObject" {
+                        crate::policy::s3_action("PutObject")
+                    } else {
+                        crate::policy::s3_action(op)
+                    };
+                    if let Some(a) = act {
+                        match crate::policy::evaluate(&doc, &pr, a) {
+                            Some(false) => {
+                                allow_dst = false;
+                                saw_deny = true;
+                            }
+                            Some(true) => {
+                                allow_dst = true;
+                                saw_allow = true;
+                            }
+                            None => {} // 无匹配：回落既有判定
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, bucket = %b, "桶策略读取/解析失败——fail-closed 拒绝");
+                    allow_dst = false;
+                    saw_error = true;
+                }
+            }
+        }
+        if op == "CopyObject" {
+            // 源桶策略管源读，**独立于目标桶策略**评估（Deny 优先：src Deny 压过 dst Allow
+            // ——否则有目标桶写权者可绕过源桶 Deny 拷贝机密）。源桶策略读取失败同样 fail-closed。
+            if let Some(Ok(CopySource::Bucket {
+                bucket: src_bucket,
+                key: src_key,
+                ..
+            })) = cx
+                .headers()
+                .get(X_AMZ_COPY_SOURCE)
+                .and_then(|v| v.to_str().ok())
+                .map(CopySource::parse)
+            {
+                match self.bucket_policy(&src_bucket).await {
+                    Ok(Some(sdoc)) => {
+                        let spr = crate::policy::PolicyRequest {
+                            op,
+                            ak: &ak,
+                            uid: user.uid,
+                            bucket: &src_bucket,
+                            key: Some(&src_key),
+                        };
+                        if let Some(sa) = crate::policy::s3_action("GetObject") {
+                            match crate::policy::evaluate(&sdoc, &spr, sa) {
+                                Some(false) => {
+                                    allow_src = false;
+                                    saw_deny = true;
+                                }
+                                Some(true) => {
+                                    allow_src = true;
+                                    saw_allow = true;
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, bucket = %src_bucket, "源桶策略读取失败——fail-closed");
+                        allow_src = false;
+                        saw_error = true;
+                    }
+                }
+            }
+        }
+        let allow = allow_dst && allow_src;
+        // 审计注解：只标「策略实际决定了方向」的判定；拒绝侧 Deny > error 优先归类
+        let policy_detail: Option<&str> = if allow {
+            if saw_allow {
+                Some("policy:allow")
+            } else {
+                None
+            }
+        } else if saw_deny {
+            Some("policy:deny")
+        } else if saw_error {
+            Some("policy:error")
+        } else {
+            None
+        };
+
+        // 审计（允许与拒绝都记；failed 只 warn——审计不可用时不得反向影响判定）
+        if let Err(e) = self
+            .write_audit(
+                user.uid,
+                op,
+                bucket.as_deref(),
+                key.as_deref(),
+                if allow { "allow" } else { "deny" },
+                policy_detail,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "审计落行失败");
+        }
+
         if allow {
             Ok(())
         } else {
@@ -601,10 +838,12 @@ mod tests {
     const SUB: AuthedUser = AuthedUser {
         uid: 2,
         is_admin: false,
+        ak: String::new(),
     };
     const ADMIN: AuthedUser = AuthedUser {
         uid: 1,
         is_admin: true,
+        ak: String::new(),
     };
 
     #[test]
@@ -711,7 +950,8 @@ mod tests {
             a.user_of_key("AK_OK").await.unwrap(),
             Some(AuthedUser {
                 uid: 2,
-                is_admin: false
+                is_admin: false,
+                ak: "AK_OK".to_string()
             })
         );
         assert_eq!(a.user_of_key("AK_EXPIRED").await.unwrap(), None);
@@ -719,7 +959,8 @@ mod tests {
             a.user_of_key("AK_ADMIN").await.unwrap(),
             Some(AuthedUser {
                 uid: 9,
-                is_admin: true
+                is_admin: true,
+                ak: "AK_ADMIN".to_string()
             })
         );
         assert_eq!(a.user_of_key("AK_UNKNOWN").await.unwrap(), None);
@@ -774,6 +1015,7 @@ mod tests {
         let u = AuthedUser {
             uid: 7,
             is_admin: false,
+            ak: String::new(),
         };
         assert!(a.can(u, Action::Read, "bkt").await.unwrap());
     }
@@ -787,6 +1029,7 @@ mod tests {
         let u = AuthedUser {
             uid: 7,
             is_admin: false,
+            ak: String::new(),
         };
         assert!(!a.can(u, Action::Read, "bkt").await.unwrap());
         assert_eq!(a.user_of_key("AK_PEER").await.unwrap(), None);

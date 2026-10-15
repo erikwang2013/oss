@@ -128,7 +128,8 @@ impl Db {
     }
 
     pub async fn verify_user(&self, username: &str, password: &str) -> Result<Option<i64>> {
-        // ponytail: 非常量时间比较 + 用户存在性时序（未命中不比对）M1 已接受；M4 换 Argon2 时随方案处置。
+        // M4 切片 7：Argon2id 恒时校验（password-hash 的 verify_password 内部恒时）；
+        // 旧 M1 格式（sha256 单轮）仍可验证——**登录成功即透明重写升级**（一次迁移）。
         // status='active'：被停用的账号登录直接按「用户名或密码错误」处理（不问不答）。
         let row = sqlx::query(
             "SELECT id, password_hash FROM users WHERE username = ? AND status = 'active'",
@@ -136,10 +137,31 @@ impl Db {
         .bind(username)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|r| {
-            let hash: String = r.get("password_hash");
-            (crate::db::hash_password(password) == hash).then(|| r.get::<i64, _>("id"))
-        }))
+        let Some(r) = row else {
+            // 用户存在性 oracle 收口（verifier 切片 7 观察 A）：Argon2 让「未命中早退」
+            // 与「命中校验」的时延差从 µs 放大到几十 ms、网络可测——未命中路径先对一个
+            // 固定 dummy 串跑一次同参数 verify 再返回，两侧时延拉平。
+            crate::db::dummy_verify(password);
+            return Ok(None);
+        };
+        let stored: String = r.get("password_hash");
+        let id: i64 = r.get("id");
+        if !crate::db::verify_password(password, &stored) {
+            return Ok(None);
+        }
+        if crate::db::is_legacy_hash(&stored) {
+            // 透明升级（失败只 warn：本次登录已成功，下次再来）
+            let upgraded = crate::db::hash_password(password);
+            if let Err(e) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+                .bind(&upgraded)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+            {
+                tracing::warn!(error = %e, user = %username, "旧口令哈希透明升级失败");
+            }
+        }
+        Ok(Some(id))
     }
 
     pub async fn create_access_key(&self, ak: &str, sk: &str, user_id: i64) -> Result<()> {
@@ -552,14 +574,62 @@ impl Db {
     }
 }
 
-/// M1 的口令哈希：SHA-256 加固定前缀盐。
-/// ponytail: 不是 Argon2/bcrypt；M4 引入真实口令策略时一并换掉。
+/// 口令哈希（M4 切片 7 起）：Argon2id（salt 随机、串内自描述 `$argon2id$...`）。
 pub fn hash_password(password: &str) -> String {
+    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    let salt = SaltString::generate(&mut OsRng);
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 哈希（默认参数）不会失败")
+        .to_string()
+}
+
+/// M1 旧格式（`sha256("oss-m1-salt:"+pw)` hex）——仅供 `verify_password` 的遗留分支使用。
+fn legacy_hash(password: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"oss-m1-salt:");
     h.update(password.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// 旧格式判定：非 `$argon2` 前缀的 64 位 hex（M1 单轮 sha256）。
+pub fn is_legacy_hash(hash: &str) -> bool {
+    !hash.starts_with("$argon2") && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 未命中路径的时延拉平（观察 A）：与真实校验同参数的 dummy verify。
+/// 固定 dummy 串（公钥性质，无秘密）：仅用于消耗与真实路径同量的 CPU/内存。
+/// 参数（m=19456,t=2,p=1）= `Argon2::default()`，与真实哈希同强度——测试钉住可解析性。
+pub(crate) const DUMMY_ARGON2: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+pub fn dummy_verify(password: &str) {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let parsed = PasswordHash::new(DUMMY_ARGON2)
+        .expect("DUMMY_ARGON2 必须是合法 PHC 串（测试钉住；解析失败会让 oracle 收口失效）");
+    let _ = argon2::Argon2::default().verify_password(password.as_bytes(), &parsed);
+}
+
+/// 恒时校验（Argon2 走 password-hash 的 verify；旧格式走定长 hex 比较）。
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    if stored.starts_with("$argon2") {
+        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        match PasswordHash::new(stored) {
+            Ok(parsed) => argon2::Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        let calc = legacy_hash(password);
+        // 定长比较（两者恒 64 字符）
+        calc.as_bytes()
+            .iter()
+            .zip(stored.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+            && stored.len() == calc.len()
+    }
 }
 
 #[cfg(test)]
@@ -1070,5 +1140,139 @@ impl Db {
                 })
             })
             .collect())
+    }
+
+    // ——— M4 切片 7：桶策略与审计 ———
+
+    /// 桶 DB 行存在性（控制面写前置校验：防「给不存在桶预置策略，同名桶日后创建即继承」
+    /// ——S6-1 同类边角，verifier 非阻断 3）。盘上有、表里无的历史桶由启动回填补齐。
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// 桶策略原文（None = 未配）。
+    pub async fn bucket_policy(&self, bucket: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT policy_json FROM bucket_policies WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("policy_json")))
+    }
+
+    /// 写桶策略（全量替换）。
+    pub async fn set_bucket_policy(&self, bucket: &str, json: &str, now: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET policy_json = excluded.policy_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清桶策略（删桶时连同清理——桶名可复用，S6-1 同款语义）。
+    pub async fn clear_bucket_policy(&self, bucket: &str) -> Result<()> {
+        sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 审计查询（控制台；可选 decision 过滤；最新在前）。
+    pub async fn list_audit(
+        &self,
+        limit: i64,
+        decision: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id, ts, uid, op, bucket, object_key, decision, detail FROM audit_log \
+             WHERE (?1 IS NULL OR decision = ?1) ORDER BY id DESC LIMIT ?2",
+        )
+        .bind(decision)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<i64, _>("id"),
+                    "ts": r.get::<i64, _>("ts"),
+                    "uid": r.get::<i64, _>("uid"),
+                    "op": r.get::<String, _>("op"),
+                    "bucket": r.get::<Option<String>, _>("bucket"),
+                    "object_key": r.get::<Option<String>, _>("object_key"),
+                    "decision": r.get::<String, _>("decision"),
+                    "detail": r.get::<Option<String>, _>("detail"),
+                })
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod argon2_tests {
+    use super::*;
+
+    async fn db() -> Db {
+        Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    /// M4 切片 7：Argon2id 新哈希 + 旧格式透明升级 + dummy 串可解析。
+    #[tokio::test]
+    async fn argon2_hashing_with_legacy_upgrade() {
+        let db = db().await;
+        // 新哈希：Argon2id 且可验证
+        db.create_user("u1", "pw-123456", false).await.unwrap();
+        let (h1,): (String,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE username = 'u1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(h1.starts_with("$argon2"), "新哈希必须是 Argon2id：{h1}");
+        assert!(crate::db::verify_password("pw-123456", &h1));
+        assert!(!crate::db::verify_password("wrong", &h1));
+
+        // 旧格式：直插 legacy 哈希 → 登录成功并透明升级；错口令仍拒
+        let legacy = legacy_hash("old-pw-123");
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, created_at) \
+             VALUES ('legacy', ?, 0, 1)",
+        )
+        .bind(&legacy)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            db.verify_user("legacy", "old-pw-123")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (h2,): (String,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE username = 'legacy'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            h2.starts_with("$argon2"),
+            "登录成功应透明升级为 Argon2：{h2}"
+        );
+        assert!(db.verify_user("legacy", "nope").await.unwrap().is_none());
+
+        // dummy 串（oracle 收口）必须可解析
+        assert!(
+            argon2::password_hash::PasswordHash::new(DUMMY_ARGON2).is_ok(),
+            "DUMMY_ARGON2 PHC 解析失败会让未命中路径的时延拉平失效"
+        );
     }
 }

@@ -93,7 +93,18 @@ async fn require_perm(
     action: Action,
 ) -> Result<(), Response> {
     let acl = state.acl();
-    match acl.can(AuthedUser { uid, is_admin }, action, bucket).await {
+    match acl
+        .can(
+            AuthedUser {
+                uid,
+                is_admin,
+                ak: String::new(),
+            },
+            action,
+            bucket,
+        )
+        .await
+    {
         Ok(true) => Ok(()),
         Ok(false) => Err(forbidden("无权访问该桶")),
         Err(e) => {
@@ -117,6 +128,9 @@ pub fn routes() -> Router<AppState> {
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
         )
+        // M4 切片 7：桶策略（桶主或管理员）与审计（管理员）
+        .route("/buckets/{bucket}/policy", get(get_policy).put(put_policy))
+        .route("/audit", get(list_audit))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
         .route("/buckets/{bucket}/objects", get(list_objects))
@@ -301,24 +315,143 @@ async fn list_jobs(
     }
 }
 
+/// 归属门（桶主或管理员）——policy/lifecycle 共用；桶必须存在（404 护栏：防给不存在桶
+/// 预置策略/规则、同名桶日后创建即继承——verifier 非阻断 3）。
+#[allow(clippy::result_large_err)]
+async fn require_owner_or_admin(
+    state: &AppState,
+    payload: &JwtPayload,
+    bucket: &str,
+) -> Result<(), Response> {
+    let (uid, is_admin) = who(state, payload).await?;
+    match state.acl().is_owner(bucket, uid).await {
+        Ok(owner) if owner || is_admin => {} // 桶主或管理员 → 过归属门
+        Ok(_) => return Err(forbidden("需要桶主或管理员")),
+        Err(e) => {
+            tracing::error!(error = %e, "归属查询失败");
+            return Err(internal_error());
+        }
+    }
+    match state.db.bucket_exists(bucket).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "NoSuchBucket").into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "桶存在性查询失败");
+            Err(internal_error())
+        }
+    }
+}
+
+/// 桶策略（M4 切片 7）：读 —— 桶主或管理员；返回原文 JSON 或 null。
+async fn get_policy(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
+    }
+    match state.db.bucket_policy(&bucket).await {
+        Ok(Some(json)) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(v) => Json(v).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "stored policy corrupt").into_response(),
+        },
+        Ok(None) => Json(serde_json::Value::Null).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "读桶策略失败");
+            internal_error()
+        }
+    }
+}
+
+/// 桶策略全量替换：写 —— 桶主或管理员。body 必须能按策略子集解析（400 否则）；
+/// 上限 64 KiB / ≤100 条 statement（防呆）。
+async fn put_policy(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    body: String,
+) -> Response {
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
+    }
+    if body.len() > 64 * 1024 {
+        return (StatusCode::BAD_REQUEST, "策略过大（≤64KiB）").into_response();
+    }
+    // 顶层必须为对象（serde 的位置形式会把裸 `[]`/`[...]` 吞成「空/错位策略」）
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) if v.is_object() => {}
+        Ok(_) => return (StatusCode::BAD_REQUEST, "策略顶层必须是对象").into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("策略解析失败: {e}")).into_response();
+        }
+    }
+    match serde_json::from_str::<xl_s3::policy::PolicyDoc>(&body) {
+        Ok(doc) => {
+            if doc.statement.len() > 100 {
+                return (StatusCode::BAD_REQUEST, "statement 过多（≤100）").into_response();
+            }
+            // 语义校验（Effect 拼错/缺字段 = 语句静默空转，verifier 非阻断 1）
+            if let Err(m) = doc.validate() {
+                return (StatusCode::BAD_REQUEST, format!("策略校验失败: {m}")).into_response();
+            }
+        }
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("策略解析失败: {e}")).into_response();
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match state.db.set_bucket_policy(&bucket, &body, now).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "写桶策略失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    decision: Option<String>,
+}
+
+/// 审计查询（M4 切片 7；管理员）：`?limit=100&decision=deny|allow`。
+async fn list_audit(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    axum::extract::Query(q): axum::extract::Query<AuditQuery>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let decision = q
+        .decision
+        .as_deref()
+        .filter(|d| *d == "allow" || *d == "deny");
+    match state.db.list_audit(limit, decision).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询审计失败");
+            internal_error()
+        }
+    }
+}
+
 /// 桶生命周期规则（M4 切片 6）：读 —— 桶主或管理员。
 async fn get_lifecycle(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
     Path(bucket): Path<String>,
 ) -> Response {
-    let (uid, is_admin) = match who(&state, &payload).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    match state.acl().is_owner(&bucket, uid).await {
-        Ok(true) => {}
-        Ok(false) if is_admin => {}
-        Ok(false) => return forbidden("需要桶主或管理员"),
-        Err(e) => {
-            tracing::error!(error = %e, "归属查询失败");
-            return internal_error();
-        }
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
     }
     match state.db.list_lifecycle_rules(&bucket).await {
         Ok(rows) => Json(
@@ -359,18 +492,8 @@ async fn put_lifecycle(
     Path(bucket): Path<String>,
     Json(rules): Json<Vec<LifecycleRuleIn>>,
 ) -> Response {
-    let (uid, is_admin) = match who(&state, &payload).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    match state.acl().is_owner(&bucket, uid).await {
-        Ok(true) => {}
-        Ok(false) if is_admin => {}
-        Ok(false) => return forbidden("需要桶主或管理员"),
-        Err(e) => {
-            tracing::error!(error = %e, "归属查询失败");
-            return internal_error();
-        }
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
     }
     if rules.len() > 100 {
         return (StatusCode::BAD_REQUEST, "规则过多（≤100）").into_response();
@@ -517,6 +640,9 @@ async fn delete_bucket(
             // S6-1：生命周期规则一并清——桶名可复用，旧规则复活会误删新桶对象
             if let Err(e) = state.acl().clear_lifecycle_rules(&bucket).await {
                 tracing::warn!(error = ?e, "清理桶生命周期规则失败");
+            }
+            if let Err(e) = state.acl().clear_bucket_policy(&bucket).await {
+                tracing::warn!(error = ?e, "清理桶策略失败");
             }
             StatusCode::NO_CONTENT.into_response()
         }

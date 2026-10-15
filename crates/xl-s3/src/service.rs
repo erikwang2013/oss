@@ -348,7 +348,7 @@ impl S3 for OssS3 {
             .map_err(to_s3_error)?;
         // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
         // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）
-        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().copied()
+        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().cloned()
             && let Err(e) = self.acl.record_bucket_owner(&bucket, user.uid).await
         {
             tracing::warn!(error = ?e, bucket, "桶归属记账失败");
@@ -384,6 +384,9 @@ impl S3 for OssS3 {
         if let Err(e) = self.acl.clear_lifecycle_rules(&bucket).await {
             tracing::warn!(error = ?e, bucket, "删桶生命周期规则清理失败");
         }
+        if let Err(e) = self.acl.clear_bucket_policy(&bucket).await {
+            tracing::warn!(error = ?e, bucket, "删桶策略清理失败");
+        }
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 
@@ -394,7 +397,7 @@ impl S3 for OssS3 {
         let buckets = self.store.list_buckets().await.map_err(to_s3_error)?;
         // 磁盘列表是权威（历史桶可能没有 DB 行）；非管理员与可见集求交
         let visible: Option<std::collections::HashSet<String>> =
-            match req.extensions.get::<crate::access::AuthedUser>().copied() {
+            match req.extensions.get::<crate::access::AuthedUser>().cloned() {
                 Some(u) if !u.is_admin => Some(
                     self.acl
                         .visible(u.uid)
@@ -865,9 +868,48 @@ impl S3 for OssS3 {
         // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
         // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
         let versioned = self.versioned(&bucket).await?;
+        // 逐键授权（M4 切片 7 / verifier 阻断 1c）：批量删的键在请求体里、check() 阶段不可见，
+        // 授权在此逐键完成（策略 Deny/Allow/回落表三档，与单键删同口径；AWS 亦逐键授权）。
+        // 判定基础设施失败 = 该键 fail-closed；被拒键记 AccessDenied 进 errors 后继续（§3.4 部分失败）。
+        let user = req.extensions.get::<crate::access::AuthedUser>().cloned();
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for obj in req.input.delete.objects {
+            let decision = match &user {
+                Some(u) => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
+                None => Ok((false, None)), // check 恒塞身份；防御性 fail-closed
+            };
+            let (allowed, deny_detail) = match decision {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, key = %obj.key, "批量删逐键判权失败——fail-closed");
+                    (false, None)
+                }
+            };
+            if !allowed {
+                let uid = user.as_ref().map_or(0, |u| u.uid);
+                if let Err(e) = self
+                    .acl
+                    .write_audit(
+                        uid,
+                        "DeleteObjects",
+                        Some(&bucket),
+                        Some(&obj.key),
+                        "deny",
+                        deny_detail,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "审计落行失败");
+                }
+                errors.push(Error {
+                    key: Some(obj.key),
+                    code: Some("AccessDenied".to_string()),
+                    message: Some("access denied".to_string()),
+                    ..Default::default()
+                });
+                continue;
+            }
             match self
                 .store
                 .delete_object_versioned(&bucket, &obj.key, obj.version_id.as_deref(), versioned)

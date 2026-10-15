@@ -74,6 +74,7 @@ impl ControlBackend for SqliteControlBackend {
                             AuthedUser {
                                 uid,
                                 is_admin: false,
+                                ak: String::new(),
                             },
                             act,
                             &bucket,

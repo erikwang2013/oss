@@ -91,7 +91,15 @@ async fn gate(
     match st
         .app
         .acl()
-        .can(AuthedUser { uid, is_admin }, action, bucket)
+        .can(
+            AuthedUser {
+                uid,
+                is_admin,
+                ak: String::new(),
+            },
+            action,
+            bucket,
+        )
         .await
     {
         Ok(true) => None,

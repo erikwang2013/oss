@@ -12,8 +12,10 @@ BUCKET="e2e-$(date +%s)"
 # 权限段（步骤 15）的两个桶：授权桶与未授权桶；在 EXIT trap 里一并兜底清理
 PERM_BUCKET="zzz-perm-read-$(date +%s)"
 OTHER_BUCKET="zzz-perm-other-$(date +%s)"
+POLICY_BUCKET="pol-$(date +%s)"
+POLICY2_BUCKET="pol2-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
+trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
@@ -351,4 +353,173 @@ N=$(count_versions); [ "$N" = "0" ] || { echo "版本全删后应 0，实际 $N"
 aws_s3 rb "s3://$VB" --force >/dev/null
 echo "   版本控制段通过（3 版本/点名读/marker/回滚/删版本）"
 
-echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制）"
+echo "== 17. 桶策略 + 审计（M4 切片 7：Deny 优先（含压过 admin 与授权行）/校验 400/审计查询/清策略恢复）=="
+PB="$POLICY_BUCKET"
+aws_s3 mb "s3://$PB" >/dev/null
+printf 'open\n' > "$WORK/open.txt"; printf 'sec\n' > "$WORK/sec.txt"
+aws_s3 cp "$WORK/open.txt" "s3://$PB/open.txt" >/dev/null
+aws_s3 cp "$WORK/sec.txt" "s3://$PB/secret/x.txt" >/dev/null
+
+# 拒信口径：HEAD 请求（aws s3 cp 下载会先 HeadObject）无响应体 → aws 打 "(403) ... Forbidden"，
+# 带体请求（DELETE/GET）才有 "(AccessDenied)"。两种形态都接受——语义不变：仍要求命令非零退出 + 拒信。
+deny_msg_ok() { echo "$1" | grep -qE 'AccessDenied|\(403\)|Forbidden'; }
+
+echo "--- 17a. 校验 400（畸形 Action / 顶层裸数组 / Effect 拼错）+ 写策略 204 + 回读 ---"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"Statement":[{"Effect":"Allow","Action":1}]}')
+[ "$CODE" = "400" ] || { echo "畸形策略应 400，实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '[]')
+[ "$CODE" = "400" ] || { echo "顶层非对象应 400，实际 $CODE"; exit 1; }
+# Effect 拼错必须 400（拼错 = 语句静默空转，正是「不静默忽略」要拦的）
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"Statement":[{"Effect":"Dney","Principal":{"AWS":"*"},"Action":"s3:*","Resource":"arn:aws:s3:::'"$PB"'/*"}]}')
+[ "$CODE" = "400" ] || { echo "Effect 拼错应 400，实际 $CODE"; exit 1; }
+# 给不存在桶写策略必须 404（防同名桶日后创建即继承）
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/zzz-nope-$(date +%s)/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"Statement":[]}')
+[ "$CODE" = "404" ] || { echo "不存在桶写策略应 404，实际 $CODE"; exit 1; }
+POL='{"Statement":[
+  {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$PB"'/secret*"},
+  {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::'"$PB"'/secret*"}]}'
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d "$POL")
+[ "$CODE" = "204" ] || { echo "写策略应 204，实际 $CODE"; exit 1; }
+curl -s "$ENDPOINT/api/v1/buckets/$PB/policy" -H "authorization: Bearer $ADMIN_TOKEN" | grep -q secret \
+  || { echo "策略回读缺 secret"; exit 1; }
+
+echo "--- 17b. Deny 生效（显式 Deny 压过桶主/管理员——AWS 语义）：secret 403、域外放行 ---"
+OUT=$(aws_s3 cp "s3://$PB/secret/x.txt" "$WORK/pol-gone" 2>&1) && { echo "Deny 前缀仍可读: $OUT"; exit 1; }
+deny_msg_ok "$OUT" || { echo "Deny 前缀应报 AccessDenied/403: $OUT"; exit 1; }
+aws_s3 cp "s3://$PB/open.txt" "$WORK/pol-open" >/dev/null || { echo "Deny 域外应放行"; exit 1; }
+cmp "$WORK/pol-open" "$WORK/open.txt"
+
+echo "--- 17b2. 子账户：授权行 Allow + 策略 Deny → Deny 压过授权行（融合核心语义）---"
+POLSUB="polsub-$(date +%s)"; POLSUB_PW="$POLSUB-pw-1234"
+SUB2_ID=$(curl -s -X POST "$ENDPOINT/api/v1/users" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d "{\"username\":\"$POLSUB\",\"password\":\"$POLSUB_PW\"}" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+[ -n "$SUB2_ID" ] || { echo "建策略测试子账户失败"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB2_ID/permissions" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d "[{\"bucket\":\"$PB\",\"read\":true}]")
+[ "$CODE" = "204" ] || { echo "授读应 204，实际 $CODE"; exit 1; }
+SUB2_TOKEN=$(curl -s -X POST "$ENDPOINT/api/v1/login" -H 'content-type: application/json' \
+  -d "{\"username\":\"$POLSUB\",\"password\":\"$POLSUB_PW\"}" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+SUB2_AK="POL$(date +%s)ACCESSKEY"; SUB2_SK="polsecret$(date +%s)0123456789"
+curl -s -X POST "$ENDPOINT/api/v1/access-keys" -H "authorization: Bearer $SUB2_TOKEN" \
+  -H 'content-type: application/json' -d "{\"access_key\":\"$SUB2_AK\",\"secret_key\":\"$SUB2_SK\"}" \
+  | grep -q "$SUB2_AK" || { echo "子账户签发 AK 失败"; exit 1; }
+pol_aws() { AWS_ACCESS_KEY_ID="$SUB2_AK" AWS_SECRET_ACCESS_KEY="$SUB2_SK" aws --endpoint-url "$ENDPOINT" "$@"; }
+pol_aws s3 cp "s3://$PB/open.txt" "$WORK/pol-sub-open" >/dev/null || { echo "授权行读应放行"; exit 1; }
+OUT=$(pol_aws s3 cp "s3://$PB/secret/x.txt" "$WORK/pol-sub-gone" 2>&1) && { echo "策略 Deny 前缀仍可读: $OUT"; exit 1; }
+deny_msg_ok "$OUT" || { echo "策略 Deny 应压过授权行: $OUT"; exit 1; }
+
+echo "--- 17b3. CopyObject 两轴独立（verifier 阻断 1 回归钉）---"
+PB2="$POLICY2_BUCKET"
+aws_s3 mb "s3://$PB2" >/dev/null
+set_perms() {
+  local body=$1
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/users/$SUB2_ID/permissions" \
+    -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d "$body")
+  [ "$CODE" = "204" ] || { echo "改权限应 204，实际 $CODE"; exit 1; }
+}
+# (1) 目标桶**无策略** + 源桶策略 Deny → 仍必须 403（旧实现 src 评估嵌在 dst 有策略分支内，此场景被整个跳过）
+set_perms "[{\"bucket\":\"$PB\",\"read\":true},{\"bucket\":\"$PB2\",\"write\":true}]"
+OUT=$(pol_aws s3 cp "s3://$PB/secret/x.txt" "s3://$PB2/leak.txt" 2>&1) && { echo "dst 无策略时 src Deny 被跳过: $OUT"; exit 1; }
+deny_msg_ok "$OUT" || { echo "src Deny 应生效: $OUT"; exit 1; }
+# (2) 源策略 Allow 不得抬掉「目标桶表无写」（旧实现 src Allow 会把整体抬成放行）
+set_perms "[{\"bucket\":\"$PB\",\"read\":true}]"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"uid:'"$SUB2_ID"'"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$PB"'/*"}]}')
+[ "$CODE" = "204" ] || { echo "换 Allow 策略应 204，实际 $CODE"; exit 1; }
+OUT=$(pol_aws s3 cp "s3://$PB/open.txt" "s3://$PB2/nowrite.txt" 2>&1) && { echo "src Allow 抬掉了 dst 表无写: $OUT"; exit 1; }
+deny_msg_ok "$OUT" || { echo "dst 表无写应拒: $OUT"; exit 1; }
+# (3) 源策略 Allow 提升「源表无读」（功能修复：dst 无策略时 src Allow 必须被尊重）+ dst 表写
+set_perms "[{\"bucket\":\"$PB2\",\"write\":true}]"
+pol_aws s3 cp "s3://$PB/open.txt" "s3://$PB2/open-copy.txt" >/dev/null || { echo "src 策略 Allow 应提升源表无读"; exit 1; }
+aws_s3 cp "s3://$PB2/open-copy.txt" "$WORK/pol-copy-back" >/dev/null
+cmp "$WORK/pol-copy-back" "$WORK/open.txt"
+# 恢复现场：子账户权限复原、PB 策略复原为 Deny 文档（供 17c/17d 语境）
+set_perms "[{\"bucket\":\"$PB\",\"read\":true},{\"bucket\":\"$PB2\",\"write\":true}]"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d "$POL")
+[ "$CODE" = "204" ] || { echo "复原 Deny 策略应 204，实际 $CODE"; exit 1; }
+
+echo "--- 17b4. 批量删逐键授权（verifier 阻断 1c 修复钉）：Deny 键拒、普通键照删（单请求混合）---"
+printf 'del\n' > "$WORK/del.txt"
+aws_s3 cp "$WORK/del.txt" "s3://$PB/open-del.txt" >/dev/null
+set_perms "[{\"bucket\":\"$PB\",\"read\":true,\"delete\":true},{\"bucket\":\"$PB2\",\"write\":true}]"
+# 基线：单键删 secret → 403（DeleteObject Deny 在 check 层按对象键命中）
+OUT=$(pol_aws s3api delete-object --bucket "$PB" --key secret/x.txt 2>&1) && { echo "单键删 secret 应被 Deny: $OUT"; exit 1; }
+deny_msg_ok "$OUT" || { echo "单键删 secret 应 AccessDenied/403: $OUT"; exit 1; }
+# 批量删混合请求：secret 键进 Errors（旧实现整请求被绕过 = 洞），普通键进 Deleted
+DOUT=$(pol_aws s3api delete-objects --bucket "$PB" \
+  --delete '{"Objects":[{"Key":"secret/x.txt"},{"Key":"open-del.txt"}],"Quiet":false}' 2>&1) \
+  || { echo "批量删请求应成功（部分失败语义）: $DOUT"; exit 1; }
+echo "$DOUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+errs={e["Key"]:e.get("Code") for e in (d.get("Errors") or [])}
+dels={x["Key"] for x in (d.get("Deleted") or [])}
+assert errs.get("secret/x.txt")=="AccessDenied", f"secret 键应被拒: {d}"
+assert "open-del.txt" in dels, f"普通键应删掉: {d}"
+' || { echo "批量删逐键断言失败: $DOUT"; exit 1; }
+# 复核落盘状态（走 ls --recursive——非递归 ls 只显示 "secret/" 前缀目录行；
+# 且 GetObject 被上面的策略 Deny，不能用 cp 复核）
+LS=$(aws_s3 ls --recursive "s3://$PB/")
+echo "$LS" | grep -q "secret/x.txt" || { echo "secret 不应被删"; exit 1; }
+if echo "$LS" | grep -q open-del.txt; then echo "open-del.txt 应已删"; exit 1; fi
+# 拒键审计：批量删的按键 deny 行也要落
+AJSON=$(curl -s "$ENDPOINT/api/v1/audit?limit=50&decision=deny" -H "authorization: Bearer $ADMIN_TOKEN")
+echo "$AJSON" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+assert any(r.get("op")=="DeleteObjects" and r.get("object_key")=="secret/x.txt" for r in rows), "缺批量删拒键审计行"
+' || { echo "批量删拒键审计缺失: $AJSON"; exit 1; }
+
+echo "--- 17c. 审计：?decision=deny 全 deny 且含本桶 deny 行 ---"
+AJSON=$(curl -s "$ENDPOINT/api/v1/audit?limit=200&decision=deny" -H "authorization: Bearer $ADMIN_TOKEN")
+echo "$AJSON" | PB="$PB" python3 -c '
+import json,os,sys
+rows=json.load(sys.stdin)
+assert rows, "deny 审计为空"
+assert all(r["decision"]=="deny" for r in rows), "decision 过滤失效"
+assert any(r.get("bucket")==os.environ["PB"] for r in rows), "缺本桶 deny 行"
+' || { echo "审计断言失败: $AJSON"; exit 1; }
+
+echo "--- 17d. 清策略（空 statement）→ 恢复访问 ---"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"Statement":[]}')
+[ "$CODE" = "204" ] || { echo "清策略应 204，实际 $CODE"; exit 1; }
+aws_s3 cp "s3://$PB/secret/x.txt" "$WORK/pol-back" >/dev/null || { echo "清策略后应恢复可读"; exit 1; }
+cmp "$WORK/pol-back" "$WORK/sec.txt"
+# 子账户也复读：清策略后授权行恢复生效
+pol_aws s3 cp "s3://$PB/secret/x.txt" "$WORK/pol-sub-back" >/dev/null || { echo "清策略后子账户应恢复可读"; exit 1; }
+cmp "$WORK/pol-sub-back" "$WORK/sec.txt"
+
+echo "--- 17e. S3 面删桶（aws rb）同样清策略：同名重建后 GET 应为 null ---"
+# 用 PB2（其对象不含删 Deny 键，rb --force 的批量删可正常走完；PB 的 secret 键在 17d 清策略前删不动）
+POL2='{"Statement":[{"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$PB2"'/secret*"}]}'
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$PB2/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d "$POL2")
+[ "$CODE" = "204" ] || { echo "重下策略应 204，实际 $CODE"; exit 1; }
+aws_s3 rb "s3://$PB2" --force >/dev/null
+aws_s3 mb "s3://$PB2" >/dev/null
+curl -s "$ENDPOINT/api/v1/buckets/$PB2/policy" -H "authorization: Bearer $ADMIN_TOKEN" | grep -q null \
+  || { echo "S3 面删桶未清策略（同名重建继承旧策略）"; exit 1; }
+aws_s3 rb "s3://$PB2" --force >/dev/null
+# PB 收尾（17d 已清策略，rb 的批量删走表权限：admin 放行）
+aws_s3 rb "s3://$PB" --force >/dev/null
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/api/v1/users/$SUB2_ID" \
+  -H "authorization: Bearer $ADMIN_TOKEN")
+[ "$CODE" = "204" ] || { echo "删策略测试子账户应 204，实际 $CODE"; exit 1; }
+echo "   桶策略段通过（Deny 优先/400 校验/审计查询/清策略恢复/S3 面删桶清策略/Deny 压过授权行）"
+
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计）"

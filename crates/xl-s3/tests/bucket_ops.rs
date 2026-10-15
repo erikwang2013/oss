@@ -126,6 +126,7 @@ async fn versioning_enabled_and_off_rejected() {
         r.extensions.insert(xl_s3::access::AuthedUser {
             uid: 1,
             is_admin: true,
+            ak: String::new(),
         });
         r
     }

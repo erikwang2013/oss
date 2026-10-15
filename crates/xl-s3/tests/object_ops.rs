@@ -21,12 +21,25 @@ async fn acl() -> xl_s3::access::Acl {
         "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off');\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
-          PRIMARY KEY (user_id, bucket));",
+          PRIMARY KEY (user_id, bucket));\
+         CREATE TABLE bucket_policies (bucket TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);\
+         CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, uid INTEGER NOT NULL, op TEXT NOT NULL, bucket TEXT, object_key TEXT, decision TEXT NOT NULL, detail TEXT);",
     )
     .execute(&pool)
     .await
     .unwrap();
     xl_s3::access::Acl::new(pool)
+}
+
+/// 带身份（生产路径 check() 恒塞 AuthedUser；批量删逐键判权依赖它）。
+fn with_user<T>(input: T) -> S3Request<T> {
+    let mut r = req(input);
+    r.extensions.insert(xl_s3::access::AuthedUser {
+        uid: 1,
+        is_admin: true,
+        ak: String::new(),
+    });
+    r
 }
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -144,27 +157,29 @@ async fn delete_objects_is_batch_and_idempotent() {
     }
     // DeleteObjectsInput 没有 Default，用生成 builder 构造
     let out = s3
-        .delete_objects(req(DeleteObjectsInput::builder()
-            .bucket("alpha".to_string())
-            .delete(Delete {
-                objects: vec![
-                    ObjectIdentifier {
-                        key: "k1".into(),
-                        ..Default::default()
-                    },
-                    ObjectIdentifier {
-                        key: "k2".into(),
-                        ..Default::default()
-                    },
-                    ObjectIdentifier {
-                        key: "never-existed".into(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            })
-            .build()
-            .unwrap()))
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("alpha".to_string())
+                .delete(Delete {
+                    objects: vec![
+                        ObjectIdentifier {
+                            key: "k1".into(),
+                            ..Default::default()
+                        },
+                        ObjectIdentifier {
+                            key: "k2".into(),
+                            ..Default::default()
+                        },
+                        ObjectIdentifier {
+                            key: "never-existed".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
         .await
         .unwrap()
         .output;
@@ -207,27 +222,29 @@ async fn delete_objects_reports_per_key_errors() {
     // 混批：合法键 + 非法键（a//b 含空路径段）+ 又一个合法键。§3.4：部分失败不回滚，
     // 成功的进 deleted、失败的进 errors，且错误之后的键继续处理。
     let out = s3
-        .delete_objects(req(DeleteObjectsInput::builder()
-            .bucket("alpha".to_string())
-            .delete(Delete {
-                objects: vec![
-                    ObjectIdentifier {
-                        key: "ok1".into(),
-                        ..Default::default()
-                    },
-                    ObjectIdentifier {
-                        key: "a//b".into(),
-                        ..Default::default()
-                    },
-                    ObjectIdentifier {
-                        key: "ok2".into(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            })
-            .build()
-            .unwrap()))
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("alpha".to_string())
+                .delete(Delete {
+                    objects: vec![
+                        ObjectIdentifier {
+                            key: "ok1".into(),
+                            ..Default::default()
+                        },
+                        ObjectIdentifier {
+                            key: "a//b".into(),
+                            ..Default::default()
+                        },
+                        ObjectIdentifier {
+                            key: "ok2".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
         .await
         .unwrap()
         .output;
@@ -278,14 +295,16 @@ async fn delete_objects_accepts_exactly_1000_keys() {
         })
         .collect();
     let out = s3
-        .delete_objects(req(DeleteObjectsInput::builder()
-            .bucket("alpha".to_string())
-            .delete(Delete {
-                objects,
-                ..Default::default()
-            })
-            .build()
-            .unwrap()))
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("alpha".to_string())
+                .delete(Delete {
+                    objects,
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
         .await
         .unwrap()
         .output;
@@ -303,14 +322,16 @@ async fn delete_objects_rejects_more_than_1000_keys() {
         })
         .collect();
     let err = s3
-        .delete_objects(req(DeleteObjectsInput::builder()
-            .bucket("alpha".to_string())
-            .delete(Delete {
-                objects,
-                ..Default::default()
-            })
-            .build()
-            .unwrap()))
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("alpha".to_string())
+                .delete(Delete {
+                    objects,
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
         .await
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
