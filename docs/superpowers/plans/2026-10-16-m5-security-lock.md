@@ -61,18 +61,56 @@
 
 ## 切片 1：密钥库（KeyProvider）
 
-- [ ] `xl-store` 新模块 `crypto.rs`（或 `kms.rs`）：`KeyProvider` trait
+- [x] `xl-store` 新模块 `crypto.rs`（或 `kms.rs`）：`KeyProvider` trait
       `wrap_dek(dek) -> (wrapped, key_id) / unwrap_dek(wrapped, key_id) -> dek`
-- [ ] 文件主密钥：`OSS_MASTER_KEY_FILE`（默认 `<data_root>/.oss.sys/master.key`，0600，32B 随机，
+- [x] 文件主密钥：`OSS_MASTER_KEY_FILE`（默认 `<data_root>/.oss.sys/master.key`，0600，32B 随机，
       首启生成）；**多节点同一主密钥**（运维分发的不是文件内容而是同一把——记录于 README）
-- [ ] KMS 文件实现（`key_id` 多主密钥：目录内 `key-<id>.bin`；`key_id` 记录用于换钥后旧 DEK 仍可解——
+- [x] KMS 文件实现（`key_id` 多主密钥：目录内 `key-<id>.bin`；`key_id` 记录用于换钥后旧 DEK 仍可解——
       验收 ⑤）；HTTP KMS：trait + 明确 NotImplemented 桩（钉子）
-- [ ] DEK：每对象 32B（OsRng）；wrap 算法 AES-256-GCM（wrap 层独立 nonce 全随机，非派生）
-- [ ] 单测：wrap/unwrap 往返、错 key_id 拒绝、换主密钥后旧 wrap 仍解（模拟 ⑤）、主密钥文件权限与
+- [x] DEK：每对象 32B（OsRng）；wrap 算法 AES-256-GCM（wrap 层独立 nonce 全随机，非派生）
+- [x] 单测：wrap/unwrap 往返、错 key_id 拒绝、换主密钥后旧 wrap 仍解（模拟 ⑤）、主密钥文件权限与
       生成幂等
-- **定稿**：§
+- **定稿（2026-10-16）**：七闸全绿于终树（xl-store 159+1ignored（kms 16 枚）/ kill9 2 /
+  oss-server 67 全二进制 / xl-s3 52 / xl-client+xl-proto 5 / clippy --workspace --all-targets
+  -D warnings / fmt）。**双哈希锚**：终闸树 `git diff | md5sum` = `5f193ef4`（kms.rs 经 `add -N`
+  纳入哈希——第 2 轮 `0de33398` 仅覆盖 tracked 文件，本轮修正）+ kms.rs sha256 `c3320e62`；
+  相对第 2 轮复验树（`0de33398` / kms.rs `fd59a7b6`）的增量 = N1-N4 收尾。oss-server 闸首跑遇
+  rustc ICE（机器重启致 incremental query-cache 损坏，日志明示 corrupt artifact、零代码诊断）→
+  清损坏目录 + `CARGO_INCREMENTAL=0` 复跑绿；ICE 原文留档 /tmp/m5s1c-ossserver-ice.log。
+  verifier **三轮对抗**：第 1 轮 不可收口——高 1（unwrap 读路径会**创建**主密钥文件→幽灵钥被 max
+  扫描扶正，且 `k4294967295` 可溢出 rotate）/ 高 2（掉盘首启静默生成新钥→**已写死为切片 2 前置
+  约束**）/ 中 3（已存在文件权限不校验）/ 中 4（生成后无目录 fsync）/ 中 5（wrong-length 无钉，
+  <12B 落 panic 面）/ 低 6（解析宽容）——全修；第 2 轮复验 **可收口**（读路径只读重建 + 规范形态
+  校验 + 权限拒启 + 目录 fsync + 14 枚单测突变核对）；第 3 轮 scoped 复验 **可收口**（N1 非空无
+  合规钥目录→拒启、静默生成收窄至真·空目录；N2 规范判据补**可判别**双钉——k1 存在时 "k01" 必拒
+  + `parse_key_file` 直测，删 filter / 删规范比较均必红；N3 `write_new`→`Result<()>`；N4 目录
+  fsync 的 open 失败同口径 warn；回归面六项全绿）。证据：/tmp/m5s1-verifier-report.md、
+  /tmp/m5s1-verifier-recheck.md、/tmp/m5s1-verifier-nfix.md——前两份因机器重启清空 /tmp 后自
+  子代理 transcript **逐字节恢复**，树以哈希锚钉死未漂移（恢复账本
+  `.superpowers/sdd/2026-10-16-m5-security-lock/progress.md`）。篡改/错钥/长度/权限四类失败全
+  `Error::Crypto` fail-closed；键料不泄（手工 Debug 有测钉、错误文案无钥无路径、S3 面 500 泛化
+  映射）。**记档**：①无 AAD 可接受，key_id 建议随切片 2 的 meta 格式纳入 AAD；②wrap 随机 nonce
+  按钥 2^32 上限（本片每对象 1 wrap；切片 2 若每 part 一 wrap 需换钥口径）；③trait 无「请求 CMK」
+  形参——切片 3 定夺；④双 provider key_id 路由（"file"/"k<n>"）→ 切片 3 遗留条；⑤`OSS_KMS_DIR`
+  为模块新造 env 命名、`default_path`/`default_dir` 生产零调用（env 接线随切片 2/3）；
+  ⑥chacha20poly1305 未引（未用不引，需第二算法再引）；⑦HTTP KMS 只留 trait（钉子「只留 trait」
+  取字面，未落 NotImplemented 实体）；⑧半写钥文件=永久启动失败须人工删（错误文案已带处方，
+  README 补）；⑨unwrap 每次 `std::fs::read`（2 syscall）——切片 2/3 定缓存或 tokio::fs 口径；
+  ⑩权限校验引入启动硬失败面（0644/无 POSIX mode 的文件系统拒启）→ 切片 7 README 主密钥运维章写
+  「install -m 600 分发 / 权限报错处置 / 数据盘须支持 POSIX 权限」；⑪KMS 目录 0755（共享主机建议
+  0700；目录写权 = 钥控制权）；⑫并发面已核（首启 create_new + 有界重试覆半写窗；双进程 rotate
+  收敛无损坏、内存 current 可落后——切片 7 e2e 可补）；⑬无 zeroize（核心转储面，可选）；⑭权限
+  过宽属永久错却按 transient 重试（重试集=全部 Crypto；无害 fail-closed，可细分）；⑮KMS 目录须为
+  **专用空子目录**——挂载点根自带 lost+found 会首启拒启（fail-closed、文案可循；README 与 ⑩
+  同章）；⑯open_or_init 的 max 命中分支扫到半写钥时无重试（µs 窗、显式拒启可重启自愈；切片 2/3
+  定夺是否纳入）。提交 `997c47f`。
 
 ## 切片 2：加密数据面（**执行前先出子设计交 verifier 评审**）
+
+**前提（切片 1 verifier 高 2，接线前必须钉死）**：KeyProvider 初始化必须在 `Store::open`
+**成功之后**、且以**在册盘**为根——掉盘首启（挂载点在父 fs 残留）时生成新主密钥会让既有
+加密对象静默报废（不可逆），且 provider 先跑会在 store 的盘在册扫描里插进「无 drive-id 的
+.oss.sys」污染降级判定。生成门闩（要求 store 已初始化/drive-id 在）与顺序在切片 2 子设计定。
 
 子设计要点（待评审细化）：
 - 流式插入点：`put.rs` 的 `harvest_body` 之后、`ec::ChunkWriter.encode_block` 之前，**逐块**加密
@@ -91,6 +129,10 @@
 
 - [ ] PutObject/CreateMPU/UploadPart/CompleteMPU/CopyObject/GET/HEAD 的 SSE 头全链
       （s3s DTO 已备 `server_side_encryption`/`sse_customer_*` 字段）
+- [ ] **切片 1 遗留接线**：按 key_id 路由 provider（`"file"` → FileKeyProvider；`"k<n>"` →
+      KmsFileProvider——同部署 SSE-S3 与 SSE-KMS 混用）；trait 是否加请求 CMK 形参
+      （`x-amz-server-side-encryption-aws-kms-key-id` 语义）在接线时定夺并记档；
+      key_id 建议纳入 meta AAD（切片 2 定格式时一并）
 - [ ] `head-object`/`get-object` 回 `x-amz-server-side-encryption*`（SSE-C 必回算法；S3/KMS 回 S3/KMS+key_id）
 - [ ] SSE-C 错 key → 拒绝（HMAC 校验，`sse_c_hmac` 落 meta；密钥**绝不落盘**）
 - [ ] 桶级默认加密（PutBucketEncryption/GetBucketEncryption + buckets 列）——评：是否本片（AWS 常用）
