@@ -10,9 +10,10 @@ use bytes::Bytes;
 use futures::Stream;
 use tokio::io::AsyncWriteExt;
 
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{self, ChecksumRecord, XlMeta};
+use crate::meta::{self, ChecksumRecord, EncryptionRecord, XlMeta};
 
 mod drives;
 pub mod ec;
@@ -100,6 +101,8 @@ pub struct ObjectInfo {
     pub checksum: Option<ChecksumRecord>,
     /// S3 线格式版本号（"null" = 无版本控制条目）；列表并集的降级条目为 None
     pub version_id: Option<String>,
+    /// M5 切片 2：加密记录（切片 3 回 `x-amz-server-side-encryption*` 响应头用；None = 明文对象）
+    pub encryption: Option<EncryptionRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,6 +133,8 @@ pub struct Store {
     quorum_unmet_lock: AtomicU64,
     /// M3 集群锁表（节点侧；`mesh_lock` 与协调者本地授予共用）。
     cluster_locks: Arc<lock::LockTable>,
+    /// M5 切片 2：密钥库状态（`init_encryption` 一次性置入；未启用 = 空，零行为变化）。
+    encryption: std::sync::OnceLock<crypto::EncState>,
 }
 
 /// 对象锁守卫：进程内 tokio 互斥 + 跨进程 flock（`File` drop 即释放 flock）
@@ -320,10 +325,57 @@ impl Store {
             quorum_unmet_write: AtomicU64::new(0),
             quorum_unmet_lock: AtomicU64::new(0),
             cluster_locks: Arc::new(lock::LockTable::default()),
+            encryption: std::sync::OnceLock::new(),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;
         Ok(store)
+    }
+
+    /// M5 切片 2：密钥库接线（**前提块**：须在 `open` 成功后调用——掉盘首启若先生成新主密钥，
+    /// 盘恢复后既有加密对象全部静默报废；且 provider 先跑会往盘在册扫描里插「无 drive-id 的
+    /// `.oss.sys`」污染降级判定）。
+    /// 门闩：root 盘 `drive-id` 在册才允许构造/生成；未在册 → Err **且不落任何钥文件**。
+    /// 两参数均 None → Err（未调用本函数 = 不启用加密，Store 行为零变化）。
+    pub async fn init_encryption(
+        &self,
+        file_path: Option<PathBuf>,
+        kms_dir: Option<PathBuf>,
+    ) -> Result<()> {
+        if file_path.is_none() && kms_dir.is_none() {
+            return Err(Error::Encode(
+                "init_encryption：file/kms 至少给一个路径".into(),
+            ));
+        }
+        let marker = layout::sys_dir(self.cfg.root(), "drive-id");
+        if !matches!(tokio::fs::try_exists(&marker).await, Ok(true)) {
+            return Err(Error::Crypto(format!(
+                "根盘未在册（缺 {}）——拒绝初始化密钥库（防掉盘首启生成新主密钥）",
+                marker.display()
+            )));
+        }
+        let file = match file_path {
+            Some(p) => Some(Arc::new(
+                crate::kms::FileKeyProvider::open_or_init(&p).await?,
+            )),
+            None => None,
+        };
+        let kms = match kms_dir {
+            Some(d) => Some(Arc::new(
+                crate::kms::KmsFileProvider::open_or_init(&d).await?,
+            )),
+            None => None,
+        };
+        self.encryption
+            .set(crypto::EncState { file, kms })
+            .map_err(|_| Error::Encode("加密已初始化（init_encryption 不可重复）".into()))
+    }
+
+    /// 已初始化的加密状态（未启用 → `Crypto` fail-closed；写读路径统一经此取 provider）。
+    pub(in crate::store) fn enc_state(&self) -> Result<&crypto::EncState> {
+        self.encryption
+            .get()
+            .ok_or_else(|| Error::Crypto("未配置加密（init_encryption 未调用）".into()))
     }
 
     pub fn root(&self) -> &Path {
@@ -1287,3 +1339,5 @@ fn now_nanos() -> i64 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_crypto;

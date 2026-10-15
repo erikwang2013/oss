@@ -138,6 +138,7 @@ impl EventSink for IngestSink {
                     Default::default(),
                     None,
                     versioned,
+                    None, // M5 切片 2：内部摄取按明文落盘（记档）
                 )
                 .await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((size, info))

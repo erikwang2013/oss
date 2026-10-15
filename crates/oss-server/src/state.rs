@@ -230,6 +230,23 @@ impl AppState {
         }
         let store = Store::open(store_cfg).await?;
 
+        // M5 切片 2：密钥库接线（**前提块**：须在 open 成功后——掉盘首启不得生成新主密钥；
+        // 未在册时 init_encryption 内部门闩会拒启）。env 一个不设 = 不启用加密（零行为变化）：
+        // - OSS_MASTER_KEY_FILE：SSE-S3 单钥文件路径（provider file/"file"）
+        // - OSS_KMS_DIR：SSE-KMS 多钥目录路径（provider kms/"k<n>"）
+        let master_file = std::env::var("OSS_MASTER_KEY_FILE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let kms_dir = std::env::var("OSS_KMS_DIR").ok().filter(|s| !s.is_empty());
+        if master_file.is_some() || kms_dir.is_some() {
+            store
+                .init_encryption(
+                    master_file.map(std::path::PathBuf::from),
+                    kms_dir.map(std::path::PathBuf::from),
+                )
+                .await?;
+        }
+
         // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒
         // 仅管理员可见/可管）。INSERT OR IGNORE 幂等，已存在（含已有 owner）不覆盖。
         match store.list_buckets().await {

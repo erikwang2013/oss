@@ -5,6 +5,7 @@ use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, Version, XlMeta};
@@ -30,6 +31,7 @@ impl Store {
             user_metadata: v.user_metadata.clone(),
             checksum: v.checksum.clone(),
             version_id: Some(v.version_id_str()),
+            encryption: v.encryption.clone(),
         })
     }
 
@@ -76,14 +78,25 @@ impl Store {
 
             // 形态分派：内联 → EC 布局 → 旧 parts/part
             if let Some(inline) = &v.inline {
-                if inline.bytes.len() as u64 != v.size {
+                // M5 切片 2：加密 inline 落盘态 = 密文 C = c_len(P)；明文对象逐字节原口径
+                let expected = match &v.encryption {
+                    Some(_) => crypto::Geometry::new(v.size)?.cipher_len,
+                    None => v.size,
+                };
+                if inline.bytes.len() as u64 != expected {
                     return Err(Error::CorruptMeta(format!(
-                        "{bucket}/{key}: 内联长度 {} ≠ 对象长度 {}",
-                        inline.bytes.len(),
-                        v.size
+                        "{bucket}/{key}: 内联长度 {} ≠ {expected}",
+                        inline.bytes.len()
                     )));
                 }
-                return Ok((info, Bytes::from(inline.bytes.clone())));
+                let bytes = match &v.encryption {
+                    None => inline.bytes.clone(),
+                    Some(rec) => {
+                        let ctx = crypto::UnitCtx::for_read(rec, self.enc_state()?).await?;
+                        crypto::open_all(&ctx, v.size, &inline.bytes)?
+                    }
+                };
+                return Ok((info, Bytes::from(bytes)));
             }
             if let Some(l) = &v.data_layout {
                 match self
@@ -96,6 +109,12 @@ impl Store {
                 }
             }
 
+            // M5 切片 2：加密对象不会以旧 parts 形态落盘（写前 fail-closed）——见到即损坏/伪造
+            if v.encryption.is_some() {
+                return Err(Error::CorruptMeta(format!(
+                    "{bucket}/{key}: 加密版本出现在旧 parts 形态（写路径不可能产出）"
+                )));
+            }
             let parts = v.effective_parts();
             // 旧形态（ec.enabled=false）parts 路径：整份读进内存——遗留形态按设计保留（非 EC
             // 对象本就无分片可流式）；EC 形态走上方 read_ec_range 分块路径。
@@ -159,15 +178,26 @@ impl Store {
 
             // 形态分派（同 get_object；M4 切片 2 起 EC 区间读只取命中块 + 逐块重建）
             if let Some(inline) = &v.inline {
-                if inline.bytes.len() as u64 != v.size {
+                // M5 切片 2：加密 inline 落盘态 = 密文 C = c_len(P)，先解密再切片
+                let expected = match &v.encryption {
+                    Some(_) => crypto::Geometry::new(v.size)?.cipher_len,
+                    None => v.size,
+                };
+                if inline.bytes.len() as u64 != expected {
                     return Err(Error::CorruptMeta(format!(
-                        "{bucket}/{key}: 内联长度 {} ≠ 对象长度 {}",
-                        inline.bytes.len(),
-                        v.size
+                        "{bucket}/{key}: 内联长度 {} ≠ {expected}",
+                        inline.bytes.len()
                     )));
                 }
+                let plain = match &v.encryption {
+                    None => inline.bytes.clone(),
+                    Some(rec) => {
+                        let ctx = crypto::UnitCtx::for_read(rec, self.enc_state()?).await?;
+                        crypto::open_all(&ctx, v.size, &inline.bytes)?
+                    }
+                };
                 return Ok(Bytes::copy_from_slice(
-                    &inline.bytes[range.start as usize..range.end as usize],
+                    &plain[range.start as usize..range.end as usize],
                 ));
             }
             if let Some(l) = &v.data_layout {
@@ -180,6 +210,12 @@ impl Store {
                 }
             }
 
+            // M5 切片 2：加密对象不会以旧 parts 形态落盘（写前 fail-closed）——见到即损坏/伪造
+            if v.encryption.is_some() {
+                return Err(Error::CorruptMeta(format!(
+                    "{bucket}/{key}: 加密版本出现在旧 parts 形态（写路径不可能产出）"
+                )));
+            }
             // 跨 part 映射：按 parts 序列累计偏移，只读命中段（首尾 part 各读一段）。
             // ponytail: M2a 单盘无分片；M2b 起 part 内部再映射到分片。
             let parts = v.effective_parts();
@@ -403,10 +439,21 @@ impl Store {
                 l.shards.len()
             )));
         }
+        // M5 切片 2：加密读上下文（一次/读调用，N6 口径）——几何按明文长单源换算
+        let enc = match &v.encryption {
+            Some(rec) => Some(crypto::UnitCtx::for_read(rec, self.enc_state()?).await?),
+            None => None,
+        };
+        let geo = match enc {
+            Some(_) => Some(crypto::Geometry::new(v.size)?),
+            None => None,
+        };
+        // EC 载荷长 = 密文流长（无加密 = 明文长，逐字节原口径）
+        let payload_len = geo.map_or(v.size, |g| g.cipher_len);
         let blocks = ss.div_ceil(ec::CHUNK_W as u64);
         let out_len = match &range {
             Some(r) => (r.end - r.start) as usize,
-            None => v.size as usize,
+            None => payload_len as usize, // 整读先重建 C（加密时）再解密
         };
         let mut out = vec![0u8; out_len];
         let mut reader = ec::ChunkReader::new(cfg)?;
@@ -441,19 +488,73 @@ impl Store {
                             return Err(Error::CorruptMeta("分块解码未补齐数据片".into()));
                         };
                         let obj_start = i as u64 * ss + t * ec::CHUNK_W as u64;
-                        if obj_start >= v.size {
+                        if obj_start >= payload_len {
                             continue;
                         }
                         // 该片该块的**真实长度**（旧布局末块短于 W；新布局恒为 W）——
-                        // 不裁剪会把补零尾巴覆盖到相邻片段的数据上（旧布局多块实测踩过）
+                        // 不裁剪会把补零尾巴覆盖到相邻片段的数据上（旧布局多块实测踩过）。
+                        // 加密时 payload_len = c_len：重建产物 = 密文流 C（恒等式 obj_start ≡ u·W）。
                         let real_len = (ss - t * ec::CHUNK_W as u64).min(ec::CHUNK_W as u64);
-                        let obj_end = (obj_start + real_len).min(v.size);
+                        let obj_end = (obj_start + real_len).min(payload_len);
                         out[obj_start as usize..obj_end as usize]
                             .copy_from_slice(&c[..(obj_end - obj_start) as usize]);
                     }
                 }
             }
             Some(r) => {
+                if let (Some(ctx), Some(g)) = (&enc, &geo) {
+                    // ===== M5 切片 2：加密区间读（u 驱动精确读；B2 空区间先行短路）=====
+                    if r.start == r.end {
+                        return Ok(Some(Bytes::new()));
+                    }
+                    let u0 = g.unit_of_plain(r.start);
+                    let u1 = g.unit_of_plain(r.end - 1);
+                    debug_assert!(u1 < g.units, "区间读单元必 < nb（r.end ≤ P 约束）");
+                    let mut prev_t: Option<u64> = None;
+                    let mut block_chunks: Vec<Option<Vec<u8>>> = Vec::new();
+                    for u in u0..=u1 {
+                        // 单元 u 的密文在（片 s = u/blocks, 块 t = u%blocks）——块解码按 t 去重
+                        // （一次 12 片读服务所有同 t 单元；t 跨 s 层回绕时重解一次）
+                        let t = u % blocks;
+                        let s = (u / blocks) as usize;
+                        if prev_t != Some(t) {
+                            let Some(c) = self
+                                .read_decode_block(
+                                    set,
+                                    bucket,
+                                    key,
+                                    v,
+                                    l,
+                                    &mut reader,
+                                    t,
+                                    ss,
+                                    strict,
+                                    &mut any_bytes,
+                                    &mut missing,
+                                )
+                                .await?
+                            else {
+                                return Ok(None);
+                            };
+                            block_chunks = c;
+                            prev_t = Some(t);
+                        }
+                        let clen = g.unit_cipher_len(u) as usize;
+                        let ct = block_chunks[s]
+                            .as_ref()
+                            .ok_or_else(|| Error::CorruptMeta("分块解码未补齐数据片".into()))?;
+                        let plain = ctx.cipher.open(&ctx.seed, u as u32, &ct[..clen])?;
+                        let pstart = g.unit_plain_start(u);
+                        let a = r.start.max(pstart);
+                        let b = r.end.min(pstart + plain.len() as u64);
+                        if a < b {
+                            out[(a - r.start) as usize..(b - r.start) as usize].copy_from_slice(
+                                &plain[(a - pstart) as usize..(b - pstart) as usize],
+                            );
+                        }
+                    }
+                    return Ok(Some(Bytes::from(out)));
+                }
                 // 区间读：「(片段 s, 块 t) 对」迭代——对象偏移 o 的落位 = (o/ss, (o%ss)/W)。
                 // s0..s1 为区间覆盖的片段；块解码按 t 去重（一块 12 片读一次，服务所有片段）。
                 // 代价注记：**跨片段大区间**会解码 [0, blocks) 全部块（IO ≈ 整对象，内存仍
@@ -519,6 +620,23 @@ impl Store {
 
         if range.is_none() {
             // 整读：SHA256 终验（区间读没有整份可校验——逐块对偶已在 decode_block 里承担）
+            if let Some(ctx) = &enc {
+                // out 现为密文流 C：解密（逐单元 trim；条带补零由 c_len 截断兜住）→ P 域终验。
+                // 读时修须从 **C** 重编码（从 P 重编码会写出错误分片内容）。
+                let c = std::mem::take(&mut out);
+                let plain = crypto::open_all(ctx, v.size, &c)?;
+                if hex::encode(Sha256::digest(&plain)) != v.part.sha256 {
+                    return Err(Error::CorruptMeta(format!(
+                        "EC 重建后 SHA256 与提交记录不符（对象 {} 字节）",
+                        v.size
+                    )));
+                }
+                if !missing.is_empty() {
+                    self.repair_shards_chunked(set, bucket, key, v, l, &c, &missing)
+                        .await;
+                }
+                return Ok(Some(Bytes::from(plain)));
+            }
             if hex::encode(Sha256::digest(&out)) != v.part.sha256 {
                 return Err(Error::CorruptMeta(format!(
                     "EC 重建后 SHA256 与提交记录不符（对象 {} 字节）",

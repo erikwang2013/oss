@@ -14,6 +14,7 @@ use md5::{Digest as _, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{PartRef, Version, XlMeta};
@@ -179,7 +180,7 @@ impl Store {
         upload_id: &str,
         parts: &[(u16, String)],
     ) -> Result<ObjectInfo> {
-        self.complete_multipart_upload_versioned(bucket, key, upload_id, parts, false)
+        self.complete_multipart_upload_versioned(bucket, key, upload_id, parts, false, None)
             .await
     }
 
@@ -192,6 +193,7 @@ impl Store {
         upload_id: &str,
         parts: &[(u16, String)],
         versioned: bool,
+        encryption: Option<crypto::EncSpec>,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // 桶窗口（同单段 PUT）
@@ -203,6 +205,20 @@ impl Store {
             dir
         };
         let _guard = self.lock_object(bucket, key).await?;
+
+        // M5 切片 2：加密上下文（起点；wrap 一次/对象）。ec.enabled=false → 写前 fail-closed。
+        let enc_ctx = match encryption {
+            Some(spec) => {
+                if !self.cfg.ec.enabled {
+                    return Err(Error::Encode(
+                        "encryption requires ec.enabled（加密数据面需要 EC 管线）".into(),
+                    ));
+                }
+                Some(crypto::UnitCtx::for_write(spec, self.enc_state()?).await?)
+            }
+            None => None,
+        };
+        let enc_record = enc_ctx.as_ref().map(|(_, r)| r.clone());
 
         let dir = self.mpu_dir(bucket, key, upload_id)?;
         if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
@@ -297,12 +313,17 @@ impl Store {
                         &uuid,
                         &tmp,
                         concat_stream_verified(snapshots),
+                        enc_ctx.as_ref().map(|(c, _)| c),
                     )
                     .await?;
                 (s, e, sh, l, i)
             } else {
-                self.stage_payload(&tmp, concat_stream_verified(snapshots))
-                    .await?
+                self.stage_payload(
+                    &tmp,
+                    concat_stream_verified(snapshots),
+                    enc_ctx.as_ref().map(|(c, _)| c),
+                )
+                .await?
             };
             let version = Version {
                 version_id: if versioned {
@@ -332,6 +353,8 @@ impl Store {
                 is_latest: None,
                 // NTP 回拨收口：epoch = 旧链 max+1（与单段 PUT 同口径）
                 epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
+                // M5 切片 2：加密记录随版本落 meta（单流形态：MPU 于 complete 合并后加密）
+                encryption: enc_record.clone(),
             };
             let mut meta = match (versioned, old_meta.as_ref()) {
                 (true, Some(old)) => {
@@ -425,6 +448,7 @@ impl Store {
             } else {
                 "null".to_string()
             }),
+            encryption: enc_record,
         })
     }
 

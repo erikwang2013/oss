@@ -8,6 +8,7 @@ use md5::{Digest as _, Md5};
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt};
 
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, ChecksumRecord, PartRef, Version, XlMeta};
@@ -32,6 +33,35 @@ async fn gather_block(
             src.seek(std::io::SeekFrom::Start(start)).await?;
             src.read_exact(&mut c[..take]).await?;
         }
+        ins.push(c);
+    }
+    Ok(ins)
+}
+
+/// 散读一块（M5 切片 2 加密版）：第 i 片第 t 块的输入 = 单元 `u = i·blocks_ec + t` 的密文
+/// （短单元右补零至块宽；`u ≥ nb` 的条带恒零）。P 侧按 `[65520·u, +len)` 散读。
+async fn gather_block_enc(
+    src: &mut tokio::fs::File,
+    geo: &crypto::Geometry,
+    blocks_ec: u64,
+    t: u64,
+    data: usize,
+    ctx: &crypto::UnitCtx,
+) -> Result<Vec<Vec<u8>>> {
+    let mut ins = Vec::with_capacity(data);
+    for i in 0..data {
+        let u = i as u64 * blocks_ec + t;
+        if u >= geo.units {
+            ins.push(vec![0u8; ec::CHUNK_W]);
+            continue;
+        }
+        let start = geo.unit_plain_start(u);
+        let len = geo.unit_plain_len(u) as usize;
+        let mut p = vec![0u8; len];
+        src.seek(std::io::SeekFrom::Start(start)).await?;
+        src.read_exact(&mut p).await?;
+        let mut c = ctx.cipher.seal(&ctx.seed, u as u32, &p)?;
+        c.resize(ec::CHUNK_W, 0); // 末单元短 → 右补零至块宽（读侧按 unit_cipher_len trim）
         ins.push(c);
     }
     Ok(ins)
@@ -66,6 +96,7 @@ impl Store {
             user_metadata,
             None,
             false, // 兼容壳：无版本控制（S3 层显式传 state）
+            None,  // 兼容壳：无加密（切片 3 由 S3 头映射）
         )
         .await
     }
@@ -100,6 +131,7 @@ impl Store {
             Default::default(),
             None,
             false,
+            None, // 兼容壳：无加密
         )
         .await
     }
@@ -146,6 +178,7 @@ impl Store {
         &self,
         tmp: &std::path::Path,
         body: ByteStream,
+        enc: Option<&crypto::UnitCtx>,
     ) -> Result<(
         u64,
         String,
@@ -164,16 +197,24 @@ impl Store {
             // enabled=false：M1 旧形态——part.1 原样保留（随 tmp rename 一起就位），无内联无分片
             (None, None)
         } else if size == 0 || size < self.cfg.inline_threshold {
-            // 内联：小文件读回进 meta，删 part.1（版本目录只剩 xl.meta）
+            // 内联：小文件读回进 meta（加密时按单元切成密文 C = c_len(P)；P=0 ⇒ C 空），
+            // 删 part.1（版本目录只剩 xl.meta）
             let bytes = tokio::fs::read(&part_path).await?;
             tokio::fs::remove_file(&part_path).await?;
-            (None, Some(meta::InlineData { bytes }))
+            let stored = match enc {
+                None => bytes,
+                Some(ctx) => crypto::seal_all(ctx, &bytes)?,
+            };
+            (None, Some(meta::InlineData { bytes: stored }))
         } else {
             // EC 分块编码（M4 切片 2）：常量内存（块缓冲 ≈1.3 MiB，与对象大小无关）——
-            // part.1 散读逐块编 → 逐片写 part.1.<shard>（整片 fsync 在末块后一次），删 part.1
+            // part.1 散读逐块编 → 逐片写 part.1.<shard>（整片 fsync 在末块后一次），删 part.1。
+            // M5 切片 2：加密时 EC 载荷 = 密文流 C（几何/分块全按 c_len；单元↔(片,块) 双射）。
             let data = self.cfg.ec.data as usize;
             let total = data + self.cfg.ec.parity as usize;
-            let blocks = size.div_ceil((data * ec::CHUNK_W) as u64);
+            let geo = enc.map(|_| crypto::Geometry::new(size)).transpose()?;
+            let payload_len = geo.map_or(size, |g| g.cipher_len);
+            let blocks = payload_len.div_ceil((data * ec::CHUNK_W) as u64);
             let ss = blocks * ec::CHUNK_W as u64;
             let mut w = ec::ChunkWriter::new(self.cfg.ec)?;
             let mut src = tokio::fs::File::open(&part_path).await?;
@@ -182,7 +223,12 @@ impl Store {
                 files.push(tokio::fs::File::create(tmp.join(format!("part.1.{i}"))).await?);
             }
             for t in 0..blocks {
-                let ins = gather_block(&mut src, size, ss, t, data).await?;
+                let ins = match (enc, &geo) {
+                    (Some(ctx), Some(g)) => {
+                        gather_block_enc(&mut src, g, blocks, t, data, ctx).await?
+                    }
+                    _ => gather_block(&mut src, size, ss, t, data).await?,
+                };
                 let out = w.encode_block(&ins)?;
                 for (i, chunk) in out.iter().enumerate() {
                     files[i].write_all(chunk).await?;
@@ -239,6 +285,7 @@ impl Store {
         uuid: &str,
         tmp: &std::path::Path,
         body: ByteStream,
+        enc: Option<&crypto::UnitCtx>,
     ) -> Result<(
         u64,
         String,
@@ -252,21 +299,28 @@ impl Store {
         if size == 0 || size < self.cfg.inline_threshold {
             let bytes = tokio::fs::read(&part_path).await?;
             tokio::fs::remove_file(&part_path).await?;
+            let stored = match enc {
+                None => bytes,
+                Some(ctx) => crypto::seal_all(ctx, &bytes)?,
+            };
             return Ok((
                 size,
                 etag,
                 sha256,
                 None,
-                Some(meta::InlineData { bytes }),
+                Some(meta::InlineData { bytes: stored }),
                 Vec::new(),
             ));
         }
 
         // M4 切片 2：分块编码（常量内存），分片直写目标槽位。
         // 每片一条落盘通道；某片任一块失败即该片作废（ok[i]=false），quorum 按「完整片数」计。
+        // M5 切片 2：加密时 EC 载荷 = 密文流 C（几何/分块全按 c_len；单元↔(片,块) 双射）。
         let data = self.cfg.ec.data as usize;
         let total = data + self.cfg.ec.parity as usize;
-        let blocks = size.div_ceil((data * ec::CHUNK_W) as u64);
+        let geo = enc.map(|_| crypto::Geometry::new(size)).transpose()?;
+        let payload_len = geo.map_or(size, |g| g.cipher_len);
+        let blocks = payload_len.div_ceil((data * ec::CHUNK_W) as u64);
         let ss = blocks * ec::CHUNK_W as u64;
         let mut w = ec::ChunkWriter::new(self.cfg.ec)?;
         let mut src = tokio::fs::File::open(&part_path).await?;
@@ -343,7 +397,10 @@ impl Store {
         }
 
         for t in 0..blocks {
-            let ins = gather_block(&mut src, size, ss, t, data).await?;
+            let ins = match (enc, &geo) {
+                (Some(ctx), Some(g)) => gather_block_enc(&mut src, g, blocks, t, data, ctx).await?,
+                _ => gather_block(&mut src, size, ss, t, data).await?,
+            };
             let out = w.encode_block(&ins)?;
             let is_final = t + 1 == blocks;
             for (i, chunk) in out.iter().enumerate() {
@@ -530,6 +587,7 @@ impl Store {
         user_metadata: BTreeMap<String, String>,
         checksum: Option<ChecksumRecord>,
         versioned: bool,
+        encryption: Option<crypto::EncSpec>,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // 桶窗口（桶锁内，M2b-2 Task 10）：ensure + 对象目录先落盘——此后 delete_bucket
@@ -546,6 +604,21 @@ impl Store {
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
+
+        // M5 切片 2：加密上下文（起点；wrap 一次/对象 + 8B 随机 seed）。ec.enabled=false 下
+        // 加密数据面无形态（连 inline 分支都不存在）→ 写前 fail-closed。
+        let enc_ctx = match encryption {
+            Some(spec) => {
+                if !self.cfg.ec.enabled {
+                    return Err(Error::Encode(
+                        "encryption requires ec.enabled（加密数据面需要 EC 管线）".into(),
+                    ));
+                }
+                Some(crypto::UnitCtx::for_write(spec, self.enc_state()?).await?)
+            }
+            None => None,
+        };
+        let enc_record = enc_ctx.as_ref().map(|(_, r)| r.clone());
 
         // M-6 裁决：损坏的 meta 让 PUT fail-closed（报错），不静默当作空对象覆盖——盘上可能还有旧数据，宁可失败也不毁
         let old_meta = self.read_meta(bucket, key).await?;
@@ -565,11 +638,19 @@ impl Store {
             let (size, etag, sha256, data_layout, inline) = if multi {
                 // 多盘：分片直写各盘版本目录（数据先于 meta；无需候选 meta 落 tmp）
                 let (s, e, sh, l, i, _touched) = self
-                    .stage_payload_multi(bucket, key, &uuid, &tmp, body)
+                    .stage_payload_multi(
+                        bucket,
+                        key,
+                        &uuid,
+                        &tmp,
+                        body,
+                        enc_ctx.as_ref().map(|(c, _)| c),
+                    )
                     .await?;
                 (s, e, sh, l, i)
             } else {
-                self.stage_payload(&tmp, body).await?
+                self.stage_payload(&tmp, body, enc_ctx.as_ref().map(|(c, _)| c))
+                    .await?
             };
 
             let version = Version {
@@ -602,6 +683,8 @@ impl Store {
                 is_latest: None,
                 // NTP 回拨收口：epoch = 旧链 max+1（单调写序号，副本择新优先用它）
                 epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
+                // M5 切片 2：加密记录随版本落 meta（旧版本各留各的记录 → 换主密钥后仍可读）
+                encryption: enc_record.clone(),
             };
             // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
             let mut meta = match (versioned, old_meta.as_ref()) {
@@ -711,6 +794,7 @@ impl Store {
             } else {
                 "null".to_string()
             }),
+            encryption: enc_record,
         })
     }
 }

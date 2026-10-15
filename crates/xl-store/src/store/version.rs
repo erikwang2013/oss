@@ -14,6 +14,7 @@
 use bytes::Bytes;
 use std::ops::Range as StdRange;
 
+use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{PartRef, Version, XlMeta};
@@ -102,6 +103,7 @@ impl Store {
                 is_latest: None,
                 // NTP 回拨收口：marker 也是新写版本，epoch 同样单调 +1
                 epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
+                encryption: None, // marker 无数据，恒无加密记录
             };
             let marker_vid = marker.version_id_str();
             let mut m = match old.as_ref() {
@@ -279,22 +281,39 @@ impl Store {
         range: Option<StdRange<u64>>,
     ) -> Result<Option<Bytes>> {
         if let Some(inline) = &v.inline {
-            if inline.bytes.len() as u64 != v.size {
+            // M5 切片 2：加密 inline 落盘态 = 密文 C = c_len(P)（B4 期望长度落点之一）
+            let expected = match &v.encryption {
+                Some(_) => crypto::Geometry::new(v.size)?.cipher_len,
+                None => v.size,
+            };
+            if inline.bytes.len() as u64 != expected {
                 return Err(Error::CorruptMeta(format!(
-                    "{bucket}/{key}: 内联长度 {} ≠ 对象长度 {}",
-                    inline.bytes.len(),
-                    v.size
+                    "{bucket}/{key}: 内联长度 {} ≠ {expected}",
+                    inline.bytes.len()
                 )));
             }
+            let plain = match &v.encryption {
+                None => inline.bytes.clone(),
+                Some(rec) => {
+                    let ctx = crypto::UnitCtx::for_read(rec, self.enc_state()?).await?;
+                    crypto::open_all(&ctx, v.size, &inline.bytes)?
+                }
+            };
             let b = match range {
-                None => Bytes::from(inline.bytes.clone()),
-                Some(r) => Bytes::copy_from_slice(&inline.bytes[r.start as usize..r.end as usize]),
+                None => Bytes::from(plain),
+                Some(r) => Bytes::copy_from_slice(&plain[r.start as usize..r.end as usize]),
             };
             return Ok(Some(b));
         }
         if let Some(l) = &v.data_layout {
             // strict=true：版本点名读按 fail-closed 直报损坏（无整读重试语义）
             return self.read_ec_range(bucket, key, v, l, range, true).await;
+        }
+        // M5 切片 2：加密对象不会以旧 parts 形态落盘（写前 fail-closed）——见到即损坏/伪造（B4）
+        if v.encryption.is_some() {
+            return Err(Error::CorruptMeta(format!(
+                "{bucket}/{key}: 加密版本出现在旧 parts 形态（写路径不可能产出）"
+            )));
         }
         // 旧 parts（M2a / ec.enabled=false 遗留形态）：整份读后切片
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
@@ -440,5 +459,6 @@ fn version_info(key: &str, v: &Version) -> ObjectInfo {
         user_metadata: v.user_metadata.clone(),
         checksum: v.checksum.clone(),
         version_id: Some(v.version_id_str()),
+        encryption: v.encryption.clone(),
     }
 }

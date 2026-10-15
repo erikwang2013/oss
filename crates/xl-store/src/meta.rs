@@ -66,6 +66,10 @@ pub struct Version {
     /// 老 meta 无此字段 → None（按 0 参与排秩）。
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// M5 切片 2：数据面加密记录（Some = 对象数据为块对齐 AEAD 密文；见 `crypto` 模块）。
+    /// 前向兼容契约：只加 Option 字段（老解码器跳过未知字段）。
+    #[serde(default)]
+    pub encryption: Option<EncryptionRecord>,
 }
 
 impl Version {
@@ -135,6 +139,19 @@ pub struct InlineData {
     pub bytes: Vec<u8>,
 }
 
+/// M5 切片 2：对象数据加密记录（meta 不含秘密：wrapped DEK 是 GCM 包裹的密文，可公开）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EncryptionRecord {
+    /// 方案标识（白名单唯一值；自描述几何——格式一回写即锁死，演进靠新标识）。
+    pub algorithm: String,
+    /// 主密钥 id（`"file"` = 单钥文件；`"k<n>"` = KMS 目录；SSE-C 预留）。
+    pub key_id: String,
+    /// 信封 wrap 的 DEK（60B hex = nonce‖ct‖tag）；SSE-C（切片 3）允许空串。
+    pub wrapped_dek_hex: String,
+    /// 每存储流 8B 随机 nonce seed（hex 16 字符）；单元 u 的 nonce = seed ‖ BE32(u)。
+    pub nonce_seed_hex: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PartRef {
     /// 版本目录名（`<对象目录>/<uuid>/`）。
@@ -173,14 +190,45 @@ impl XlMeta {
                     v.part.uuid
                 )));
             }
-            // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）
+            // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）。
+            // M5 切片 2：加密 inline 的落盘态是密文（C = c_len(P)），上限随方案放宽。
+            let inline_limit = if v.encryption.is_some() {
+                crate::crypto::MAX_INLINE_CIPHERTEXT
+            } else {
+                MAX_INLINE
+            };
             if let Some(inline) = &v.inline
-                && inline.bytes.len() as u64 > MAX_INLINE
+                && inline.bytes.len() as u64 > inline_limit
             {
                 return Err(Error::CorruptMeta(format!(
-                    "inline 超上限：{} > {MAX_INLINE}",
+                    "inline 超上限：{} > {inline_limit}",
                     inline.bytes.len()
                 )));
+            }
+            // M5 切片 2：加密记录白名单校验（信任边界；存量对象无此字段 = 明文，零回归）
+            if let Some(enc) = &v.encryption {
+                if enc.algorithm != crate::crypto::ALGO {
+                    return Err(Error::CorruptMeta(format!(
+                        "未知加密方案：{:?}",
+                        enc.algorithm
+                    )));
+                }
+                let kid_ok = !enc.key_id.is_empty()
+                    && enc.key_id.len() <= 64
+                    && enc.key_id.bytes().all(|b| (0x20..=0x7e).contains(&b));
+                let wrapped_ok = enc.wrapped_dek_hex.is_empty()
+                    || (enc.wrapped_dek_hex.len() == 120
+                        && enc.wrapped_dek_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+                let seed_ok = enc.nonce_seed_hex.len() == 16
+                    && enc.nonce_seed_hex.bytes().all(|b| b.is_ascii_hexdigit());
+                if !kid_ok || !wrapped_ok || !seed_ok {
+                    return Err(Error::CorruptMeta(format!(
+                        "加密记录字段非法：key_id={:?} wrapped_len={} seed_len={}",
+                        enc.key_id,
+                        enc.wrapped_dek_hex.len(),
+                        enc.nonce_seed_hex.len()
+                    )));
+                }
             }
             // EC 布局基本自洽：分片数必须等于 data+parity（下标型字段，无路径穿越面）
             if let Some(l) = &v.data_layout
@@ -302,6 +350,7 @@ mod tests {
                 is_delete_marker: None,
                 is_latest: None,
                 epoch: None,
+                encryption: None,
             }],
         }
     }
@@ -478,13 +527,14 @@ mod tests {
         // M2a Task 5 起 Version 增加 parts 字段（单段写 nil）、协议补全 Task 3 起增加 checksum 字段
         //（默认 nil）、M2b Task 3 起增加 data_layout/inline 字段（默认 nil）、M4 切片 3 起增加
         // is_delete_marker/is_latest（无版本写 nil——老解码器跳过未知字段 = 前向兼容契约），
-        // 摘要均按「有意识更新」流程重算（本次为第四次；**第五次**：M4 切片 4 增 epoch 字段）。
+        // 摘要均按「有意识更新」流程重算（本次为第四次；**第五次**：M4 切片 4 增 epoch 字段；
+        // **第六次**：M5 切片 2 增 encryption 字段——明文对象写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "05b141826a5be4a2b45936467c283fae70368fe4e25d059d9416978baf4173ff"
+            "f9adab1e752c5bed9616ae9dc4c3cbe3a20aa3d0b58b2740e3013bfad2f7ca96"
         );
     }
 }
@@ -514,6 +564,7 @@ mod parts_tests {
             is_delete_marker: None,
             is_latest: None,
             epoch: None,
+            encryption: None,
         }
     }
 

@@ -477,14 +477,34 @@ impl Store {
                 rep.versions_scanned += 1;
                 let vid = v.version_id_str();
                 let Some(l) = &v.data_layout else {
-                    // inline：解码边界已验长度上限，这里再对 size 一致性
+                    // inline：解码边界已验长度上限，这里再对长度一致性。
+                    // M5 切片 2：加密 inline 的落盘态是密文 C = c_len(P)（B5——否则误报 failed）。
                     if let Some(inline) = &v.inline {
-                        if inline.bytes.len() as u64 != v.size {
+                        let expected = if v.encryption.is_some() {
+                            match crate::crypto::Geometry::new(v.size) {
+                                Ok(g) => g.cipher_len,
+                                Err(_) => {
+                                    rep.failed_versions
+                                        .push(format!("{bucket}/{key}@{vid}: 加密对象超上限"));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            v.size
+                        };
+                        if inline.bytes.len() as u64 != expected {
                             rep.failed_versions
                                 .push(format!("{bucket}/{key}@{vid}: 内联长度不符"));
                         } else {
                             rep.ok_versions += 1;
                         }
+                        continue;
+                    }
+                    // M5 切片 2（L2）：加密版本不可能以旧 parts 形态落盘（读侧同拒）——
+                    // 报告面口径与读侧对齐，手工 meta 不再误报 ok
+                    if v.encryption.is_some() {
+                        rep.failed_versions
+                            .push(format!("{bucket}/{key}@{vid}: 加密版本出现在旧 parts 形态"));
                         continue;
                     }
                     // 旧 parts（ec.enabled=false 遗留形态）：文件存在 + 长度校（注释口径兑现）

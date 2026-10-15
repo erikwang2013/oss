@@ -499,6 +499,7 @@ impl S3 for OssS3 {
                 metadata.unwrap_or_default().into_iter().collect(),
                 checksum_record,
                 versioned,
+                None, // M5 切片 2：SSE 头映射归切片 3（本片仅数据面）
             )
             .await;
         let info = match result {
@@ -614,7 +615,7 @@ impl S3 for OssS3 {
         let versioned = self.versioned(&bucket).await?;
         let info = self
             .store
-            .complete_multipart_upload_versioned(&bucket, &key, &upload_id, &pairs, versioned)
+            .complete_multipart_upload_versioned(&bucket, &key, &upload_id, &pairs, versioned, None)
             .await
             .map_err(to_s3_error)?;
         Ok(S3Response::new(CompleteMultipartUploadOutput {
@@ -1241,6 +1242,7 @@ impl S3 for OssS3 {
                 src_info.user_metadata,
                 None,
                 dst_versioned,
+                None, // M5：copy 的 SSE 语义（随源/桶默认）切片 3 定夺（复评 S3）
             )
             .await
             .map_err(to_s3_error)?;
