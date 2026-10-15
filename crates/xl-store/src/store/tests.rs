@@ -4123,6 +4123,22 @@ fn topo_record_parses_v1_and_v2_and_rejects_garbage() {
         None,
         "v3+set0 非法"
     );
+    // P3-2 不变量：set= 字段 ⟺ v3——v1/v2 携带 set= 一律拒收（人为错改形态）
+    assert_eq!(
+        super::parse_topo_record("v2 set=1 node=n1 slot=0"),
+        None,
+        "v2 带 set= 非法"
+    );
+    assert_eq!(
+        super::parse_topo_record("v1 slots=12 set=1 node=n1 slot=0"),
+        None,
+        "v1 带 set= 非法"
+    );
+    assert_eq!(
+        super::parse_topo_record("v3 node=n1 slot=0"),
+        None,
+        "v3 缺 set= 非法"
+    );
     // 构造器与解析器互逆（写盘与 console 共用的唯一出处）；set0 恒 v2、set>0 恒 v3
     assert_eq!(
         super::parse_topo_record(&super::topo_record(0, "n3", 7)),

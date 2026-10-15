@@ -126,19 +126,23 @@ impl AppState {
                     // 无行者先扇出问 set：有答按答插；「全部可达且全无」→ set0+warn（存量语义）；
                     // **任一传输错 → 不插行**（下次启动重试；「不可达」不得写死 set0——
                     // verifier 终审洞 2：升级后 set=1 桶的行在不可达窗口被写死 0 即分片错组）
-                    let set = match store.resolve_bucket_set(&b.name).await {
-                        Ok(Some(s)) => s,
+                    match store.resolve_bucket_set(&b.name).await {
+                        // P3-3：权威 set **对账**（不止补缺）——陈旧行（删桶重建后别节点残留）在此收敛
+                        Ok(Some(s)) => {
+                            if let Err(e) = db.upsert_bucket_set(&b.name, s).await {
+                                tracing::warn!(error = %e, bucket = %b.name, "回填对账失败");
+                            }
+                        }
                         Ok(None) => {
+                            // 全可达且确无行：仅缺行时插 set=0（**不覆盖**已有行——None 无权威值）
                             tracing::warn!(bucket = %b.name, "回填：全集群确无该桶行，按 set=0（存量语义）");
-                            0
+                            if let Err(e) = db.insert_bucket(&b.name, None).await {
+                                tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, bucket = %b.name, "回填：set 解析不可达，本轮跳过（下次启动重试）");
-                            continue;
                         }
-                    };
-                    if let Err(e) = db.insert_bucket_set(&b.name, None, set).await {
-                        tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
                     }
                 }
             }

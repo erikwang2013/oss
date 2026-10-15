@@ -1266,6 +1266,11 @@ fn parse_topo_record(s: &str) -> Option<(u16, String, u16)> {
             set = v.parse::<u16>().ok();
         }
     }
+    // P3-2 不变量：写路径 **set= 字段存在 ⟺ v3**——v1/v2 带 set=（或 v3 缺 set=）都是
+    // 人为错改的形态，一律拒收（不再只靠「v3+set0」单点判）。全等比对仍按解析三元组（R2）。
+    if set.is_some() != is_v3 {
+        return None;
+    }
     let set = set.unwrap_or(0);
     if is_v3 && set == 0 {
         return None; // 拒启：v3+set0 是人为错改的形态

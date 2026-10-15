@@ -227,6 +227,22 @@ impl Db {
         Ok(())
     }
 
+    /// P3-3：回填对账——把权威解析到的 set 覆盖到已有行（仅 set_id 列；owner/versioning 不动）。
+    /// 场景：桶删除后在别节点重建为另一 set，本节点陈旧行（INSERT OR IGNORE 不会更新）会在
+    /// 下次启动被此处收敛；行不存在则插入（owner NULL，与历史桶回填同权）。
+    pub async fn upsert_bucket_set(&self, name: &str, set: u16) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, NULL, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET set_id = excluded.set_id",
+        )
+        .bind(name)
+        .bind(now())
+        .bind(set as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_bucket_rows(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT name FROM buckets ORDER BY name")
             .fetch_all(&self.pool)
@@ -1244,6 +1260,39 @@ impl Db {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod bucket_set_tests {
+    use super::*;
+
+    /// P3-3：回填对账只动 set_id——owner 保留；缺行时插入。
+    #[tokio::test]
+    async fn upsert_bucket_set_reconciles_without_clobbering_owner() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let uid = db.create_user("u1", "pw-123456", false).await.unwrap();
+        db.insert_bucket_set("bk", Some(uid), 0).await.unwrap();
+        // 权威解析 = set1 → 对账覆盖
+        db.upsert_bucket_set("bk", 1).await.unwrap();
+        let row = sqlx::query("SELECT owner_id, set_id FROM buckets WHERE name = 'bk'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<i64>, _>("owner_id"),
+            Some(uid),
+            "owner 不得被对账清掉"
+        );
+        assert_eq!(row.get::<i64, _>("set_id"), 1, "set_id 应收敛到权威值");
+        // 缺行：对账插入 owner NULL
+        db.upsert_bucket_set("bk2", 2).await.unwrap();
+        let row = sqlx::query("SELECT owner_id, set_id FROM buckets WHERE name = 'bk2'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<i64>, _>("owner_id"), None);
+        assert_eq!(row.get::<i64, _>("set_id"), 2);
     }
 }
 

@@ -45,16 +45,24 @@ impl Store {
         // M4 切片 8：per-bucket set 缓存（未扩容的 set 新旧组内槽相等 → need 空 → 天然 0 移动）
         let mut cur_bucket: Option<String> = None;
         let mut cur_set: u16 = 0;
+        let mut cur_failed = false;
         for (bucket, key) in keys {
             if cur_bucket.as_deref() != Some(bucket.as_str()) {
+                cur_bucket = Some(bucket.clone());
                 match self.set_of_bucket(&bucket).await {
-                    Ok(s) => cur_set = s,
+                    Ok(s) => {
+                        cur_set = s;
+                        cur_failed = false;
+                    }
                     Err(e) => {
+                        // P3-1：失败也缓存（同 fsck 主循环）
                         rep.skipped.push(format!("{bucket}: set 解析失败 {e}"));
-                        continue;
+                        cur_failed = true;
                     }
                 }
-                cur_bucket = Some(bucket.clone());
+            }
+            if cur_failed {
+                continue;
             }
             rep.objects_scanned += 1;
             // 锁外粗读：定位「链尾向前第一个非 marker 数据版本」

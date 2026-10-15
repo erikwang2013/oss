@@ -166,17 +166,25 @@ impl Store {
         // M4 切片 8：per-bucket set 缓存（keys 按 (bucket,key) 排序；解析失败 = 该桶键跳过 + 计数）
         let mut cur_bucket: Option<String> = None;
         let mut cur_set: u16 = 0;
+        let mut cur_failed = false;
         for (bucket, key) in keys {
             if cur_bucket.as_deref() != Some(bucket.as_str()) {
+                cur_bucket = Some(bucket.clone());
                 match self.set_of_bucket(&bucket).await {
-                    Ok(s) => cur_set = s,
+                    Ok(s) => {
+                        cur_set = s;
+                        cur_failed = false;
+                    }
                     Err(e) => {
-                        tracing::warn!(bucket = %bucket, error = %e, "fsck：set 解析失败（该桶键跳过）");
+                        // P3-1：失败也缓存——同桶后续键静默跳过，不再逐键重复扇出、计数只记一次
+                        tracing::warn!(bucket = %bucket, error = %e, "fsck：set 解析失败（该桶全部键跳过）");
                         r.corrupt_meta += 1;
-                        continue;
+                        cur_failed = true;
                     }
                 }
-                cur_bucket = Some(bucket.clone());
+            }
+            if cur_failed {
+                continue;
             }
             r.objects_scanned += 1;
             // 单次 read_meta 快照同时构建「引用集」与「期望文件集」——**不得二次读取**：
@@ -432,17 +440,25 @@ impl Store {
         let (keys, _buckets) = self.collect_namespace().await?;
         let mut cur_bucket: Option<String> = None;
         let mut cur_set: u16 = 0;
+        let mut cur_failed = false;
         for (bucket, key) in keys {
             if cur_bucket.as_deref() != Some(bucket.as_str()) {
+                cur_bucket = Some(bucket.clone());
                 match self.set_of_bucket(&bucket).await {
-                    Ok(s) => cur_set = s,
+                    Ok(s) => {
+                        cur_set = s;
+                        cur_failed = false;
+                    }
                     Err(e) => {
-                        tracing::warn!(bucket = %bucket, error = %e, "scrub：set 解析失败（该桶键跳过）");
+                        // P3-1：失败也缓存（同 fsck 主循环）
+                        tracing::warn!(bucket = %bucket, error = %e, "scrub：set 解析失败（该桶全部键跳过）");
                         rep.corrupt_meta += 1;
-                        continue;
+                        cur_failed = true;
                     }
                 }
-                cur_bucket = Some(bucket.clone());
+            }
+            if cur_failed {
+                continue;
             }
             let m = match self.read_meta(&bucket, &key).await {
                 Ok(Some(m)) => m,
