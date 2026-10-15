@@ -174,3 +174,30 @@ pub fn spawn_worker(state: AppState) {
     });
     tracing::info!(interval_secs = secs, "lifecycle worker 已启动");
 }
+
+/// C5：审计保留清理 worker——`OSS_AUDIT_RETENTION_DAYS`（默认 0 = 不清理，保持现状）。
+/// 每小时清理一次 `ts < now - days*86400` 的行；清理失败只 warn（保留策略非关键路径）。
+pub fn spawn_audit_cleanup(state: AppState) {
+    let days: i64 = std::env::var("OSS_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if days <= 0 {
+        tracing::info!("审计保留清理未启用（OSS_AUDIT_RETENTION_DAYS=0）");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(Duration::from_secs(3600));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            t.tick().await;
+            let cutoff = now_secs() - days * 86_400;
+            match state.db.delete_audit_older_than(cutoff).await {
+                Ok(n) if n > 0 => tracing::info!(deleted = n, "审计保留清理"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "审计保留清理失败"),
+            }
+        }
+    });
+    tracing::info!(days, "审计保留清理 worker 已启动（每小时一次）");
+}

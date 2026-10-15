@@ -9,7 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{DataLayout, Version};
+use crate::meta::{self, DataLayout, Version};
 
 use super::{Store, drives, ec};
 
@@ -136,6 +136,14 @@ impl Store {
         for &i in need {
             let s = &l.shards[i];
             let new_slot = self.slot_of_shard(set, hash, i as u8)?;
+            // C4 快路径：本地→本地且同设备 → hardlink（免整片重拷）。崩溃安全：翻前新旧同
+            // inode，翻后删旧名只是减 link 计数。任何失败（EXDEV/权限/EEXIST）→ 回落分块 copy。
+            if self
+                .try_link_shard(set, bucket, key, uuid, s, new_slot)
+                .await
+            {
+                continue;
+            }
             for t in 0..blocks {
                 let Some(chunk) = self
                     .read_shard_block(set, bucket, key, v, s, i, t, ss)
@@ -201,6 +209,53 @@ impl Store {
             }
         }
         Ok(need.len())
+    }
+
+    /// C4：本地→本地 hardlink 快路径（同设备才成；跨设备 EXDEV → false 回落分块 copy）。
+    /// 目标目录按 (set, new_slot) 的物理盘拼接——与 write_shard_chunk 的 Local 分支同式。
+    async fn try_link_shard(
+        &self,
+        set: u16,
+        bucket: &str,
+        key: &str,
+        uuid: &str,
+        s: &meta::ShardRef,
+        new_slot: u16,
+    ) -> bool {
+        let old_slot = s.drive as u16;
+        let (
+            Some(drives::ShardTarget::Local { drive: src, .. }),
+            Some(drives::ShardTarget::Local { drive: dst, .. }),
+        ) = (
+            self.slot_target(set, old_slot),
+            self.slot_target(set, new_slot),
+        )
+        else {
+            return false; // 任一端远端：走 RPC 分块路径
+        };
+        if src == dst {
+            return false; // 同盘（need 理论上不含）：防御
+        }
+        if !drives::drive_up(src).await || !drives::drive_up(dst).await {
+            return false;
+        }
+        let Ok(old_path) = drives::shard_path(src, bucket, key, uuid, s) else {
+            return false;
+        };
+        let Ok(new_dir) = layout::object_dir(dst, bucket, key).map(|d| d.join(uuid)) else {
+            return false;
+        };
+        let new_path = new_dir.join(format!("part.{}.{}", s.part, s.shard));
+        if tokio::fs::create_dir_all(&new_dir).await.is_err() {
+            return false;
+        }
+        match tokio::fs::hard_link(&old_path, &new_path).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(old = %old_path.display(), error = %e, "hardlink 快路径不可用，回落分块 copy");
+                false
+            }
+        }
     }
 
     /// 分块写指定槽（本地定位写 / 远端 chunked RPC）——搬迁目标写。

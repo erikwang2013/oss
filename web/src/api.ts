@@ -146,4 +146,14 @@ export interface ClusterStatus {
   topo_fingerprint: string | null
   nodes: ClusterNode[]
   quorum_unmet: { write: number; lock: number }
+  /** M4 切片 8：多 set 分组视图（每 set 独立槽域，跨 set 槽号会重号）；单机/旧后端缺省 */
+  sets?: ClusterSet[]
+}
+
+export interface ClusterSet {
+  set: number
+  slot_count: number
+  /** 本节点是否属于该 set */
+  self: boolean
+  nodes: ClusterNode[]
 }

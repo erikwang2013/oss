@@ -18,6 +18,119 @@ pub struct AppState {
     /// 控制面（`/api/v1`）与上传口（`/aetherupload`）共用的 JWT 门面：
     /// 登录用它签发，路由层用同一实例的 `JwtLayer` 校验（跨面 token 因此天然互通）。
     pub jwt: Arc<JwtAuth>,
+    /// 登录限速（C1）：账号失败锁定 + 全局失败上限（Argon2 ~19MiB/次 的资源放大面封口）。
+    pub login_limiter: Arc<LoginLimiter>,
+}
+
+/// 登录限速（C1）。**单进程内存态**（每节点独立，重启清零——限速非持久配额，重启放宽可接受）：
+/// - 账号维度：10 分钟窗口内失败 ≥5 → 锁 10 分钟（429 + Retry-After）——防定向爆破；
+/// - 全局维度：60 秒窗口内失败 ≥120（跨用户名）→ 全体暂拒——防「随机用户名洪水」刷 Argon2
+///   （每次失败无论用户名是否存在都付一次 dummy_verify 的同价成本）。
+///
+/// 防护面：登录只；已认证的 `/me/password` 不在此列（攻击者已持凭据，改密需旧密校验）。
+pub struct LoginLimiter {
+    inner: std::sync::Mutex<LimiterState>,
+}
+
+struct LimiterState {
+    per_user: std::collections::HashMap<String, UserWindow>,
+    /// (窗口内失败数, 窗口起点秒)
+    global: (u32, i64),
+}
+
+#[derive(Clone, Copy)]
+struct UserWindow {
+    fails: u32,
+    window_start: i64,
+    locked_until: i64,
+}
+
+const USER_FAILS_MAX: u32 = 5;
+const USER_WINDOW_SECS: i64 = 600;
+const USER_LOCK_SECS: i64 = 600;
+const GLOBAL_FAILS_MAX: u32 = 120;
+const GLOBAL_WINDOW_SECS: i64 = 60;
+
+fn limiter_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl LoginLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(LimiterState {
+                per_user: std::collections::HashMap::new(),
+                global: (0, 0),
+            }),
+        }
+    }
+
+    /// 尝试前检查。`Err(秒)` = 被拒（Retry-After）。
+    pub fn check(&self, username: &str) -> Result<(), u64> {
+        let now = limiter_now();
+        let st = self.inner.lock().unwrap();
+        if let Some(w) = st.per_user.get(username)
+            && w.locked_until > now
+        {
+            return Err((w.locked_until - now) as u64);
+        }
+        let (gf, gw) = st.global;
+        if now - gw < GLOBAL_WINDOW_SECS && gf >= GLOBAL_FAILS_MAX {
+            return Err((GLOBAL_WINDOW_SECS - (now - gw)).max(1) as u64);
+        }
+        Ok(())
+    }
+
+    /// 失败记账（凭据错误路径）。
+    pub fn on_failure(&self, username: &str) {
+        let now = limiter_now();
+        let mut st = self.inner.lock().unwrap();
+        // 全局窗口
+        if now - st.global.1 >= GLOBAL_WINDOW_SECS {
+            st.global = (1, now);
+        } else {
+            st.global.0 = st.global.0.saturating_add(1);
+        }
+        // 账号窗口
+        let w = st
+            .per_user
+            .entry(username.to_string())
+            .or_insert(UserWindow {
+                fails: 0,
+                window_start: now,
+                locked_until: 0,
+            });
+        if now - w.window_start >= USER_WINDOW_SECS {
+            w.fails = 0;
+            w.window_start = now;
+        }
+        w.fails = w.fails.saturating_add(1);
+        if w.fails >= USER_FAILS_MAX {
+            w.locked_until = now + USER_LOCK_SECS;
+            w.fails = 0; // 锁定期间不再累加；解锁后窗口从头计
+            w.window_start = now + USER_LOCK_SECS;
+        }
+        // 防内存无界：条目过多时清掉已过期窗口（简陋但足够——ponytail）
+        if st.per_user.len() > 10_000 {
+            st.per_user
+                .retain(|_, w| w.locked_until > now || now - w.window_start < USER_WINDOW_SECS);
+        }
+    }
+
+    /// 成功即清账号窗口（全局窗口不清——一次成功不洗白洪水信号）。
+    pub fn on_success(&self, username: &str) {
+        let mut st = self.inner.lock().unwrap();
+        st.per_user.remove(username);
+    }
+}
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AppState {
@@ -238,6 +351,7 @@ impl AppState {
         // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
         // （`/aetherupload/display/login` 之类整段不匹配），照常校验。
         // secret 短于 32 字节（jwt-rust 的 256 位下限）、黑名单目录不可建，都启动即失败。
+        let login_limiter = Arc::new(LoginLimiter::new());
         let jwt = Arc::new(
             JwtAuth::from_config(JwtConfig {
                 secret_key: cfg.jwt_secret.clone(),
@@ -277,6 +391,7 @@ impl AppState {
             store: Arc::clone(&ingest.store),
             ingest,
             jwt,
+            login_limiter,
         }
     }
 }
@@ -306,6 +421,57 @@ fn sets_nodes_by_set(
         ));
     }
     Ok(by_set.into_values().collect())
+}
+
+#[cfg(test)]
+mod login_limiter_tests {
+    use super::*;
+
+    /// 5 次失败 → 锁定；锁定期内即使口令正确也拒（check 先于校验）；成功清零。
+    #[test]
+    fn user_lockout_and_reset() {
+        let l = LoginLimiter::new();
+        for _ in 0..USER_FAILS_MAX {
+            assert!(l.check("u").is_ok());
+            l.on_failure("u");
+        }
+        assert!(
+            l.check("u").is_err(),
+            "第 {} 次失败后应锁定",
+            USER_FAILS_MAX
+        );
+        // 别的账号不受影响
+        assert!(l.check("v").is_ok());
+        // 过期解锁（直接拨表：把锁定窗口拨到过去）
+        {
+            let mut st = l.inner.lock().unwrap();
+            let w = st.per_user.get_mut("u").unwrap();
+            w.locked_until = limiter_now() - 1;
+            w.window_start = limiter_now() - 1;
+        }
+        assert!(l.check("u").is_ok(), "锁定过期应放行");
+        // 成功后窗口清零
+        l.on_failure("w");
+        l.on_success("w");
+        assert!(l.check("w").is_ok());
+        assert!(!l.inner.lock().unwrap().per_user.contains_key("w"));
+    }
+
+    /// 全局失败上限：跨账号洪水被整体暂拒；窗口滑动后恢复。
+    #[test]
+    fn global_flood_ceiling() {
+        let l = LoginLimiter::new();
+        for i in 0..GLOBAL_FAILS_MAX {
+            l.on_failure(&format!("flood{i}"));
+        }
+        assert!(l.check("anyone").is_err(), "全局失败上限应暂拒全体");
+        // 拨回窗口 → 恢复
+        {
+            let mut st = l.inner.lock().unwrap();
+            st.global.1 = limiter_now() - GLOBAL_WINDOW_SECS - 1;
+        }
+        assert!(l.check("anyone").is_ok(), "窗口滑过后应恢复");
+    }
 }
 
 #[cfg(test)]

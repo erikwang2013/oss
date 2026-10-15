@@ -74,6 +74,51 @@ export default function Cluster() {
         />
       </Card>
 
+      {isCluster && (data?.sets?.length ?? 0) > 1 && (
+        <Card title="set 分组（多 set）" style={{ marginTop: 16 }} styles={{ body: { padding: 0 } }}>
+          <Table
+            rowKey="set"
+            dataSource={data?.sets ?? []}
+            pagination={false}
+            columns={[
+              {
+                title: 'set',
+                dataIndex: 'set',
+                width: 80,
+                render: (v: number) => <Tag color="blue">set {v}</Tag>,
+              },
+              { title: '槽位', dataIndex: 'slot_count', width: 100 },
+              {
+                title: '本节点',
+                dataIndex: 'self',
+                width: 100,
+                render: (v: boolean) =>
+                  v ? <Tag color="green">在册</Tag> : <Tag>不在册</Tag>,
+              },
+              {
+                title: '节点',
+                dataIndex: 'nodes',
+                render: (nodes: { id: string; drive_count: number }[]) => (
+                  <Flex gap={6} wrap>
+                    {nodes.map((n) => (
+                      <Tag key={n.id}>
+                        {n.id} × {n.drive_count}
+                      </Tag>
+                    ))}
+                  </Flex>
+                ),
+              },
+            ]}
+          />
+          <Typography.Text
+            type="secondary"
+            style={{ display: 'block', padding: '8px 16px', fontSize: 12 }}
+          >
+            各 set 槽号是独立槽域、跨 set 会重号——按 set 分组读；桶创建时钉定 set，跨 set 不搬迁。
+          </Typography.Text>
+        </Card>
+      )}
+
       {isCluster && data?.topo_fingerprint && (
         <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
           拓扑指纹：{data.topo_fingerprint}（本节点首盘 .oss.sys/topo 记录，逐盘 slot 递增；不一致即拒启）

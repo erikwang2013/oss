@@ -362,15 +362,54 @@ impl Acl {
 
     /// 桶归属登记（S3 面 CreateBucket 用；幂等——已存在（含历史 NULL owner）不覆盖）。
     pub async fn record_bucket_owner(&self, bucket: &str, uid: i64) -> Result<(), sqlx::Error> {
+        self.record_bucket_owner_set(bucket, uid, 0).await
+    }
+
+    /// 带 set 的归属登记（C3：S3 面建桶缺省走自动指派；单 set 恒 0）。
+    pub async fn record_bucket_owner_set(
+        &self,
+        bucket: &str,
+        uid: i64,
+        set: u16,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?)",
         )
         .bind(bucket)
         .bind(uid)
         .bind(now())
+        .bind(set as i64)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// C3：建桶自动指派——选**当前桶数最少**的 set（并列取小号）；无行数据按 0 计。
+    /// 单 set/单机 k=1 恒 0（零查询）。指派只影响**新桶**；已有桶不迁（S-L 口径）。
+    pub async fn pick_least_loaded_set(&self, k: u16) -> Result<u16, sqlx::Error> {
+        if k <= 1 {
+            return Ok(0);
+        }
+        let rows = sqlx::query("SELECT set_id, COUNT(*) AS c FROM buckets GROUP BY set_id")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut counts: std::collections::HashMap<u16, i64> = std::collections::HashMap::new();
+        for r in &rows {
+            let s = r.get::<i64, _>("set_id");
+            if let Ok(s) = u16::try_from(s) {
+                counts.insert(s, r.get::<i64, _>("c"));
+            }
+        }
+        let mut best = 0u16;
+        let mut best_c = i64::MAX;
+        for i in 0..k {
+            let c = counts.get(&i).copied().unwrap_or(0);
+            if c < best_c {
+                best = i;
+                best_c = c;
+            }
+        }
+        Ok(best)
     }
 
     /// 删桶后的记账清理（S3 与控制台两条删桶路径共用同一实现）：
@@ -766,6 +805,48 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+mod pick_set_tests {
+    use super::*;
+
+    /// C3：最少桶数优先；并列取小号；k=1 恒 0 且零查询。
+    #[tokio::test]
+    async fn pick_least_loaded_set() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, set_id INTEGER NOT NULL DEFAULT 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let acl = Acl::new(pool.clone());
+        assert_eq!(acl.pick_least_loaded_set(1).await.unwrap(), 0, "k=1 恒 0");
+        // 空库 → 0（并列取小号）
+        assert_eq!(acl.pick_least_loaded_set(3).await.unwrap(), 0);
+        for n in ["a", "b"] {
+            sqlx::query("INSERT INTO buckets (name, creation_date, set_id) VALUES (?, 0, 0)")
+                .bind(n)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // set0=2, set1=0, set2=0 → 取 1
+        assert_eq!(acl.pick_least_loaded_set(3).await.unwrap(), 1);
+        sqlx::query("INSERT INTO buckets (name, creation_date, set_id) VALUES ('c', 0, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // set0=2, set1=1, set2=0 → 取 2
+        assert_eq!(acl.pick_least_loaded_set(3).await.unwrap(), 2);
+        sqlx::query("INSERT INTO buckets (name, creation_date, set_id) VALUES ('d', 0, 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 2/1/1 → 取 1（并列取小号）
+        assert_eq!(acl.pick_least_loaded_set(3).await.unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -779,7 +860,7 @@ mod tests {
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);\
              CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, \
-              versioning TEXT NOT NULL DEFAULT 'Off');\
+              versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0);\
              CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
               can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
               PRIMARY KEY (user_id, bucket));",

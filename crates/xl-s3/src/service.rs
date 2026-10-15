@@ -347,11 +347,24 @@ impl S3 for OssS3 {
             .await
             .map_err(to_s3_error)?;
         // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
+        // C3：多 set 下缺省**自动指派**（桶数最少的 set；单 set 恒 0 零查询）。
         // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）
-        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().cloned()
-            && let Err(e) = self.acl.record_bucket_owner(&bucket, user.uid).await
-        {
-            tracing::warn!(error = ?e, bucket, "桶归属记账失败");
+        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().cloned() {
+            let k = self.store.cluster().map_or(1, |c| c.sets.sets.len() as u16);
+            let set = match self.acl.pick_least_loaded_set(k).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = ?e, bucket, "set 指派失败，回落 set0");
+                    0
+                }
+            };
+            if let Err(e) = self
+                .acl
+                .record_bucket_owner_set(&bucket, user.uid, set)
+                .await
+            {
+                tracing::warn!(error = ?e, bucket, "桶归属记账失败");
+            }
         }
         Ok(S3Response::new(CreateBucketOutput::default()))
     }

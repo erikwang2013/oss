@@ -1231,6 +1231,16 @@ impl Db {
         Ok(())
     }
 
+    /// C5：审计保留策略——删除 ts < cutoff 的行，返回删除数（worker 按 OSS_AUDIT_RETENTION_DAYS）。
+    pub async fn delete_audit_older_than(&self, cutoff: i64) -> Result<u64> {
+        let n = sqlx::query("DELETE FROM audit_log WHERE ts < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n)
+    }
+
     /// 审计查询（控制台；可选 decision 过滤；最新在前）。
     pub async fn list_audit(
         &self,
@@ -1293,6 +1303,30 @@ mod bucket_set_tests {
             .unwrap();
         assert_eq!(row.get::<Option<i64>, _>("owner_id"), None);
         assert_eq!(row.get::<i64, _>("set_id"), 2);
+    }
+
+    /// C5：审计保留——只删窗口外旧行。
+    #[tokio::test]
+    async fn audit_retention_deletes_only_old_rows() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let now = now();
+        for (ts, dec) in [(1i64, "allow"), (now, "deny")] {
+            sqlx::query(
+                "INSERT INTO audit_log (ts, uid, op, decision) VALUES (?, 1, 'GetObject', ?)",
+            )
+            .bind(ts)
+            .bind(dec)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let n = db.delete_audit_older_than(now - 100).await.unwrap();
+        assert_eq!(n, 1, "只删窗口外旧行");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
     }
 }
 

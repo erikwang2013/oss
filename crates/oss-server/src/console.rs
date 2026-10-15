@@ -156,8 +156,18 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
+    // C1 登录限速：账号锁定 + 全局失败上限（Argon2 资源放大面）。429 + Retry-After。
+    if let Err(wait) = state.login_limiter.check(&body.username) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, wait.to_string())],
+            "登录尝试过多，请稍后再试",
+        )
+            .into_response();
+    }
     match state.db.verify_user(&body.username, &body.password).await {
         Ok(Some(uid)) => {
+            state.login_limiter.on_success(&body.username);
             // 12h 过期在 JwtConfig.default_expire（state.rs）；sub=uid 供各 handler 还原
             let token = state
                 .jwt
@@ -173,7 +183,11 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
                 }
             }
         }
-        Ok(None) => (StatusCode::UNAUTHORIZED, "用户名或密码错误").into_response(),
+        Ok(None) => {
+            state.login_limiter.on_failure(&body.username);
+            (StatusCode::UNAUTHORIZED, "用户名或密码错误").into_response()
+        }
+        // DB 故障不算爆破信号（不计入限速——限量的是凭据尝试，不是基础设施故障）
         Err(e) => {
             tracing::error!(error = %e, "登录查询失败");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -622,14 +636,26 @@ async fn create_bucket(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let set = body.set.unwrap_or(0);
     let set_count = state
         .store
         .cluster()
         .map_or(1, |c| c.sets.sets.len() as u16);
-    if set >= set_count {
-        return (StatusCode::BAD_REQUEST, "set 越界").into_response();
-    }
+    // C3：显式 set 校验；缺省走自动指派（桶数最少的 set；单 set 恒 0）
+    let set = match body.set {
+        Some(s) => {
+            if s >= set_count {
+                return (StatusCode::BAD_REQUEST, "set 越界").into_response();
+            }
+            s
+        }
+        None => match state.acl().pick_least_loaded_set(set_count).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "set 指派失败，回落 set0");
+                0
+            }
+        },
+    };
     if let Err(e) = state.store.create_bucket(&body.name).await {
         return store_error(e).into_response();
     }
