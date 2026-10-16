@@ -477,10 +477,53 @@ stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] →
 
 ## 切片 6：SK 加密存
 
-- [ ] `access_keys.secret_key` 信封加密（复用切片 1 的 KeyProvider；`enc:v1:` 前缀识别，明文存量
+- [x] `access_keys.secret_key` 信封加密（复用切片 1 的 KeyProvider；`enc:v1:` 前缀识别，明文存量
       读到即透明重写）
-- [ ] auth.rs / 控制面展示（列表只回 AK）一致改动；测试：存量迁移、密文库启动可用
-- **定稿**：§
+- [x] auth.rs / 控制面展示（列表只回 AK）一致改动；测试：存量迁移、密文库启动可用
+- **定稿（2026-10-17）**：代码提交 `9a2cee3`（10 文件 +704/−20）+ 本定稿提交（紧随其后）。
+  七闸实测（C 树 `git diff|md5sum` = `38689ecc`；gate6 rc 口径修正后 `clippy-cargo-rc=0`）：
+  xl-store **191+1ignored**（kms 20）/ kill9 2 / oss-server 67 / xl-s3 **54+3+28**（lib 54 含
+  skvault 4 + auth 13 + sts 9）/ xl-client+xl-proto 5 / clippy 净 / fmt 净。锚：kms.rs `00f78248`、
+  store.rs `47c3cccd`、auth.rs `ee8d46c5`、sts.rs `6d20e377`、skvault.rs `4f3161ba`、router.rs
+  `db470c5d`、console.rs `bbd4138c`、state.rs `b034d7ff`（sha256 前16）。
+  verifier **两轮**（报告 `.superpowers/sdd/2026-10-16-m5-security-lock/verifier-m5s6-report.md`）：
+  ①对抗核查「不可直接收口」（无代码级安全缺陷；A2 clippy 红 + T6 承诺测试缺位 + P3-3~8 + D 记档；
+  **中间态真缺口「AssumeRole 会话 SK 明文落库」被 B 树修复并钉住**——切片 5 的 `issue` 是第二写点，
+  T5「唯一写点」乃勘误）；②修复轮 → 增量复查「**可收口**」（A2 闭合、P3-1/2/4/6/7/8 逐条判推收口、
+  D7 rc 口径修正双重证实、锚全程无漂移）。
+  **落地形态**：`enc:v1:<key_id>:<b64(ct)>:<b64(wrapped)>`（AAD=oss-sk-v1 域分隔、每行 32B DEK、
+  kms 优先/file 兜底）；**生产 SK 写出点恰 3 处**（console 建键 / STS 签发 / 读侧迁移重写）——
+  全部 vault-aware、失败 fail-closed；**mesh 携带封存字节**（明文 SK 不过网，消费端解密）；
+  存量明文行读侧 guarded 透明重写。
+  **记档**：①D1 威胁模型边界——加密只防 DB **只读**泄露（备份/拷贝）；DB 写者无主密钥亦可写自选
+  明文 SK 接管任意 AK（切片前有 DB 写权本就全权；README「加密（M5）」节写明）；②D2 无库+密文 500
+  的外部可探测性（增量信息仅「服务端错配」）；③D3 mesh **迁移前**明文行仍以明文过网（与切片前同，
+  无回归；应答侧 seal-on-read 未做）；④D4 密钥库配置一致性 = 部署硬约束（撤 env 即全存量 500；
+  README 运维节）；⑤D5 session_policy…SK 路由与 `EncState::provider_for_key_id` 逻辑重复（可归并）；
+  ⑥D6 迁移/解密失败只有日志无 metric（集群丢钥表现为 500 峰值）；⑦D7 七闸 rc 口径（pipefail +
+  PIPESTATUS，修正已有）；⑧D8 P3-1 测试不钉 AAD 字面值（无安全后果——每行独立 DEK 无跨域钥复用）；
+  ⑨P3-3 console 写面端到端并入切片 7 e2e（带 `OSS_MASTER_KEY_FILE` 起服务 → 建键 → 真签名 →
+  sqlite 行前缀断言）。
+
+**接线裁决（2026-10-17，实施前定，交 verifier 随实现核查）**：
+- **T1 形态**：`enc:v1:<key_id>:<b64(ct)>:<b64(wrapped)>` —— `ct = nonce(12)‖GCM 密文‖tag(16)`，
+  AAD = `b"oss-sk-v1"`（与数据面单元域分隔）；DEK 每行新生成（OsRng 32B），`wrapped` =
+  provider.wrap_dek(DEK)。**前缀 `enc:v1:` 即判别**（明文存量不动、混存期共存）。密钥库函数本体
+  落 `xl-store/kms.rs`（`seal_secret`/`open_secret`/`is_sealed`——aes-gcm 只在 xl-store，xl-s3
+  零新增依赖）；key_id 路由（`"file"` → file provider；`"k<n>"` → kms provider）在调用侧。
+- **T2 provider 选择**：**kms 目录优先、file 兜底**（多钥目录轮换友好——换钥旧 wrap 仍可解）；
+  两库皆无 = vault None = 明文直存（零行为变化，同切片 2 门闩口径）。
+- **T3 读面**：`auth.rs::get_secret_key` 与 `cluster_control` AccessKey 扇出两处解密。失败面：
+  密文行 + vault None（撤了 env 配置）→ **InternalError**（全局错配，日志明示——不伪装成
+  InvalidAccessKeyId；认证面「负例锁死错误码」的既有测试只覆盖未知/停/过期，不冲突）；vault Some
+  + 解密失败（丢钥/篡改）→ InternalError fail-closed。
+- **T4 透明重写**：读见**明文 + vault Some** → guarded UPDATE（`WHERE access_key=? AND
+  secret_key=?`，防并发覆盖）落密文，best-effort（失败仅 warn，不阻断本次认证）。
+- **T5 写面**：**两处生产写点**（P3-8 勘误：原写「唯一」）——console `create_access_key`（state.vault
+  加密后入 db；响应回明文一次）与 **STS `issue`**（会话 SK，切片 5 代码本片补 vault——核查轮自查
+  先行发现）+ 第三类「读侧迁移重写」（T4）；`db.rs` 保持哑层零改动；AK 列表已只回 AK（无 SK 泄露面）。
+- **T6 测试**：kms.rs 单测（roundtrip / 明文非前缀 / 篡改 tag / 错 key_id / 坏 b64 / 域分隔）；
+  auth 三态（密文可解 / 明文迁移（行变 enc:v1:）/ 密文无库 500）；扇出路径解密（oss-server 侧）。
 
 ## 切片 7：WebIdentity（条件式）+ 收尾
 
