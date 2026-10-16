@@ -579,6 +579,8 @@ impl MeshTransport for TonicMesh {
             flag: Some(resp.flag),
             names: Some(resp.names),
             set: Some(resp.set),
+            // M5 切片 5（S9）：空串 = 无策略（与 row.session_policy=None 同义）
+            session_policy: (!resp.session_policy.is_empty()).then_some(resp.session_policy),
         }))
     }
 }
@@ -903,6 +905,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 flag: r.flag.unwrap_or(false),
                 names: r.names.unwrap_or_default(),
                 set: r.set.unwrap_or(0),
+                session_policy: r.session_policy.unwrap_or_default(),
             },
             None => xl_proto::ControlResp {
                 found: false,

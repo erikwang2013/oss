@@ -67,7 +67,9 @@ enum ControlKind { ACCESS_KEY=0; PERMISSION=1; OWNED_BUCKETS=2; VISIBLE_BUCKETS=
 message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
                       string secret=5; bool flag=6; repeated string names=7;
                       // M4 切片 8：BUCKET_SET 应答（found=true 时有效）
-                      uint32 set=8; }
+                      uint32 set=8;
+                      // M5 切片 5：ACCESS_KEY 应答——会话策略原文（含 session 交集求值用）
+                      string session_policy=9; }
 message ControlWriteReq {
   // 目前唯一 kind：BUCKET_ROW_SET（a=bucket；has_set=true → set=值；false → 删行）
   uint32 kind=1; string a=2; bool has_set=3; uint32 set=4;

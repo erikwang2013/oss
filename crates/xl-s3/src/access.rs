@@ -262,14 +262,77 @@ impl Acl {
             }
             None => None,
         };
-        match decision {
-            Some(true) => Ok((true, None)),
-            Some(false) => Ok((false, Some("policy:deny"))),
-            None => {
-                let allowed = self.can(user.clone(), Action::Delete, bucket).await?;
-                Ok((allowed, None))
+        let (allowed, detail) = match decision {
+            Some(true) => (true, None),
+            Some(false) => (false, Some("policy:deny")),
+            None => (self.can(user.clone(), Action::Delete, bucket).await?, None),
+        };
+        // M5 切片 5（S8）：会话策略在这里同步叠交集——批量删逐键判定与 check() 的单键
+        // 口径必须同源，否则会话策略可被一条批量删整体绕过。会话 Deny/无匹配 → 拒。
+        if allowed && let Some(sdoc) = self.session_policy_of(&user.ak).await? {
+            let pr = crate::policy::PolicyRequest {
+                op: "DeleteObjects",
+                ak: &user.ak,
+                uid: user.uid,
+                bucket,
+                key: Some(key),
+            };
+            match crate::policy::s3_action("DeleteObject")
+                .and_then(|a| crate::policy::evaluate(&sdoc, &pr, a))
+            {
+                Some(true) => {}
+                _ => return Ok((false, Some("session:deny"))),
             }
         }
+        Ok((allowed, detail))
+    }
+
+    /// M5 切片 5（S8）：会话策略交集融合——在表三档 × 桶策略之后叠会话判定：
+    /// 会话 Deny → 拒；**无匹配 → 拒**（未 Allow 即拒）；Allow → 保留基线（不能抬升）。
+    /// CopyObject 双轴分别求值（dst=`PutObject` 映射 / src=`GetObject`），与桶策略融合同构。
+    /// `s3_action` 未映射 op：会话不约束（词表缺项，同桶策略口径；定稿记档）。
+    /// 返回 `((allow_dst, allow_src), detail)`；无会话策略 = 原样返回 `((..), None)`。
+    /// 抽出独立方法以便单测直钉（S3AccessContext 不可外部构造，check() 本体无法在单测驱动）。
+    async fn fuse_session(
+        &self,
+        pr: crate::policy::PolicyRequest<'_>,
+        src: Option<crate::policy::PolicyRequest<'_>>,
+        mut allow_dst: bool,
+        mut allow_src: bool,
+    ) -> Result<((bool, bool), Option<&'static str>), sqlx::Error> {
+        let op = pr.op;
+        let Some(sdoc) = self.session_policy_of(pr.ak).await? else {
+            return Ok(((allow_dst, allow_src), None));
+        };
+        let dst_act = if op == "CopyObject" {
+            crate::policy::s3_action("PutObject")
+        } else {
+            crate::policy::s3_action(op)
+        };
+        let mut denied = false;
+        if let Some(a) = dst_act
+            && crate::policy::evaluate(&sdoc, &pr, a) != Some(true)
+        {
+            allow_dst = false;
+            denied = true;
+        }
+        // P2-1 复验修复：src 轴在**源桶/源键**的 pr 上求值（调用方自 CopySource 构造；
+        // 解析失败 → None，此时 Gate::Copy 基线已置 allow_src=false，fail-closed 不塌）
+        if let Some(spr) = src
+            && let Some(a) = crate::policy::s3_action("GetObject")
+            && crate::policy::evaluate(&sdoc, &spr, a) != Some(true)
+        {
+            allow_src = false;
+            denied = true;
+        }
+        Ok((
+            (allow_dst, allow_src),
+            Some(if denied {
+                "session:deny"
+            } else {
+                "session:allow"
+            }),
+        ))
     }
 
     /// 写桶版本控制状态（PutBucketVersioning；授权门已确认桶主/管理员）。
@@ -291,13 +354,21 @@ impl Acl {
     ///（认证面与授权面查的是同一行，任一处撤销即同时失效）；**账号停用（users.status）
     /// 同样使 AK 失效**——停用即全链路出局。
     pub async fn user_of_key(&self, access_key: &str) -> Result<Option<AuthedUser>, sqlx::Error> {
+        // M5 切片 5：与 SigV4Auth::get_secret_key 同口径（含会话父链条件——三处 SQL 逐字
+        // 一致：auth.rs / 此处 / cluster_control AccessKey；P3-1 补父**用户**停用同样传播）。
         let row = sqlx::query(
             "SELECT ak.user_id AS user_id, u.is_admin AS is_admin \
              FROM access_keys ak JOIN users u ON u.id = ak.user_id \
+             LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
+             LEFT JOIN users pu ON pu.id = p.user_id \
              WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
-               AND (ak.expires_at IS NULL OR ak.expires_at > ?)",
+               AND (ak.expires_at IS NULL OR ak.expires_at > ?) \
+               AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
+                    AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \
+                    AND pu.status = 'active'))",
         )
         .bind(access_key)
+        .bind(now())
         .bind(now())
         .fetch_optional(&self.pool)
         .await?;
@@ -319,6 +390,50 @@ impl Acl {
             }));
         }
         Ok(None)
+    }
+
+    /// M5 切片 5（S8）：AK 的会话策略（`kind='session'` 且 `session_policy` 非空时）。
+    /// 本地查无 → 扇出（远端应答带 `session_policy`；NULL/空 = 无约束，与线上口径一致）。
+    /// 解析失败 → Err（调用方 fail-closed 拒）。非会话键 → `None`。
+    pub async fn session_policy_of(
+        &self,
+        access_key: &str,
+    ) -> Result<Option<crate::policy::PolicyDoc>, sqlx::Error> {
+        // 空串 = 控制台/aether 合成身份（AuthedUser 口径——各自面不走策略）→ 无会话
+        if access_key.is_empty() {
+            return Ok(None);
+        }
+        let local: Option<Option<String>> =
+            sqlx::query_scalar("SELECT session_policy FROM access_keys WHERE access_key = ?")
+                .bind(access_key)
+                .fetch_optional(&self.pool)
+                .await?;
+        let raw = match local {
+            Some(sp) => sp,
+            None => {
+                // 远端铸的会话键：扇出取策略原文（ControlRow.session_policy）。
+                // P3-2 复验修复：本地无行 + 扇出**无答**（全不可达）→ Err（fail-closed）——
+                // 「答了但无策略」与「没人答得上来」不可混同，后者静默放行即 fail-open
+                // （user_of_key 此前已答过，本处再答失败 = 竞态窗口）。
+                match &self.mesh {
+                    Some(m) => match m.ask(ControlQuery::AccessKey(access_key.to_string())).await {
+                        Some(row) => row.session_policy,
+                        None => {
+                            return Err(sqlx::Error::Protocol(
+                                "会话策略扇出不可达（fail-closed）".into(),
+                            ));
+                        }
+                    },
+                    None => None,
+                }
+            }
+        };
+        let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let doc: crate::policy::PolicyDoc =
+            serde_json::from_str(&raw).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        Ok(Some(doc))
     }
 
     /// 桶主？（`buckets.owner_id == uid`）
@@ -683,6 +798,58 @@ impl S3Access for Acl {
                 }
             }
         }
+        // —— 会话策略融合（M5 切片 5 / S8）：在表三档 × 桶策略融合之后叠**交集** ——
+        // 语义本体在 `fuse_session`（抽出以便单测直钉——S3AccessContext 不可外部构造）。
+        // **P2-1 复验修复**：CopyObject 的 src 轴必须用**源桶/源键**构造 PolicyRequest 求值
+        // （与上面桶策略 src 轴同构）——曾复用 dst 的 pr，会话对源读的收窄可被 copy 绕过。
+        let mut session_detail: Option<&'static str> = None;
+        if !delegated && let Some(b) = &bucket {
+            // CopyObject 源解析一次持有（String 落外层作用域，PolicyRequest 借之）
+            let copy_src: Option<(String, String)> = if op == "CopyObject" {
+                match cx
+                    .headers()
+                    .get(X_AMZ_COPY_SOURCE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(CopySource::parse)
+                {
+                    Some(Ok(CopySource::Bucket { bucket, key, .. })) => {
+                        Some((bucket.to_string(), key.to_string()))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let src_pr =
+                copy_src
+                    .as_ref()
+                    .map(|(src_bucket, src_key)| crate::policy::PolicyRequest {
+                        op,
+                        ak: &ak,
+                        uid: user.uid,
+                        bucket: src_bucket,
+                        key: Some(src_key),
+                    });
+            let ((d, s), detail) = self
+                .fuse_session(
+                    crate::policy::PolicyRequest {
+                        op,
+                        ak: &ak,
+                        uid: user.uid,
+                        bucket: b,
+                        key: key.as_deref(),
+                    },
+                    src_pr,
+                    allow_dst,
+                    allow_src,
+                )
+                .await
+                .map_err(acl_err)?;
+            allow_dst = d;
+            allow_src = s;
+            session_detail = detail;
+        }
+
         let allow = allow_dst && allow_src;
         // 审计注解：只标「策略实际决定了方向」的判定；拒绝侧 Deny > error 优先归类
         let policy_detail: Option<&str> = if allow {
@@ -698,6 +865,13 @@ impl S3Access for Acl {
         } else {
             None
         };
+        // 会话判定缀后（policy 在前、session 在后；「;」分隔供审计查询 LIKE 匹配）
+        let detail: Option<String> = match (policy_detail, session_detail) {
+            (Some(p), Some(s)) => Some(format!("{p};{s}")),
+            (Some(p), None) => Some(p.to_string()),
+            (None, Some(s)) => Some(s.to_string()),
+            (None, None) => None,
+        };
 
         // 审计（允许与拒绝都记；failed 只 warn——审计不可用时不得反向影响判定）
         if let Err(e) = self
@@ -707,7 +881,7 @@ impl S3Access for Acl {
                 bucket.as_deref(),
                 key.as_deref(),
                 if allow { "allow" } else { "deny" },
-                policy_detail,
+                detail.as_deref(),
             )
             .await
         {
@@ -921,18 +1095,20 @@ mod tests {
 
     /// 最小 schema 的内联建库（列与 oss-server/migrations/0001_init.sql 对齐；
     /// xl-s3 不能反向依赖 oss-server，模式同 auth.rs 的测试 helper）。
-    async fn acl() -> Acl {
+    pub(super) async fn acl() -> Acl {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER NOT NULL DEFAULT 0, \
               status TEXT NOT NULL DEFAULT 'active');\
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
-              status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL);\
+              status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL, \
+              parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');\
              CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, \
               versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0);\
              CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
               can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
-              PRIMARY KEY (user_id, bucket));",
+              PRIMARY KEY (user_id, bucket));\
+             CREATE TABLE bucket_policies (bucket TEXT PRIMARY KEY, policy_json TEXT NOT NULL);",
         )
         .execute(&pool)
         .await
@@ -940,7 +1116,7 @@ mod tests {
         Acl::new(pool)
     }
 
-    async fn add_user(a: &Acl, id: i64, admin: bool) {
+    pub(super) async fn add_user(a: &Acl, id: i64, admin: bool) {
         sqlx::query("INSERT INTO users (id, username, is_admin) VALUES (?, ?, ?)")
             .bind(id)
             .bind(format!("u{id}"))
@@ -950,7 +1126,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn add_key(a: &Acl, ak: &str, uid: i64, expires_at: Option<i64>) {
+    pub(super) async fn add_key(a: &Acl, ak: &str, uid: i64, expires_at: Option<i64>) {
         sqlx::query(
             "INSERT INTO access_keys (access_key, secret_key, user_id, expires_at, created_at) VALUES (?, 'sk', ?, ?, 0)",
         )
@@ -1154,7 +1330,7 @@ mod tests {
 
     // ---------- Task 9：控制面读扇出 ----------
 
-    fn mesh_with(peer_row: Option<ControlRow>) -> ControlMesh {
+    pub(super) fn mesh_with(peer_row: Option<ControlRow>) -> ControlMesh {
         let mesh = test_support::FakeMesh::new();
         mesh.answer("peer1", peer_row);
         ControlMesh {
@@ -1179,6 +1355,7 @@ mod tests {
                 flag: Some(true),
                 names: None,
                 set: None,
+                session_policy: None,
             }))),
         );
         let u = AuthedUser {
@@ -1221,6 +1398,7 @@ mod tests {
                 flag: None,
                 names: None,
                 set: None,
+                session_policy: None,
             }))),
         );
         assert!(a.is_owner("bkt", 7).await.unwrap());
@@ -1238,9 +1416,371 @@ mod tests {
                 flag: None,
                 names: Some(vec!["beta".into(), "gamma".into()]),
                 set: None,
+                session_policy: None,
             }))),
         );
         let v = a2.visible(7).await.unwrap();
         assert!(v.contains(&"beta".to_string()) && v.contains(&"gamma".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::tests::{acl, add_key, add_user, mesh_with};
+    use super::*;
+
+    /// 会话键行（测试装置）：kind='session' + parent + 可选 policy。
+    async fn add_session(a: &Acl, ak: &str, uid: i64, parent: &str, policy: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, status, expires_at, created_at, parent_ak, session_policy, kind) \
+             VALUES (?, 'SK_SESS', ?, 'active', 4000000000, 0, ?, ?, 'session')",
+        )
+        .bind(ak)
+        .bind(uid)
+        .bind(parent)
+        .bind(policy)
+        .execute(&a.pool)
+        .await
+        .unwrap();
+    }
+
+    const GET_ONLY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#;
+
+    /// session_policy_of：本地命中 / 非会话键 None / 坏 JSON Err / 扇出取原文。
+    #[tokio::test]
+    async fn session_policy_of_sources() {
+        let a = acl().await;
+        add_user(&a, 7, false).await;
+        add_key(&a, "AKIA_LONG", 7, None).await;
+        add_session(&a, "ASIA_S1", 7, "AKIA_LONG", Some(GET_ONLY)).await;
+        add_session(&a, "ASIA_S2", 7, "AKIA_LONG", None).await;
+        assert!(a.session_policy_of("ASIA_S1").await.unwrap().is_some());
+        assert!(a.session_policy_of("ASIA_S2").await.unwrap().is_none());
+        assert!(a.session_policy_of("AKIA_LONG").await.unwrap().is_none());
+        // 坏 JSON → Err（调用方 fail-closed）
+        add_session(&a, "ASIA_BAD", 7, "AKIA_LONG", Some("{not-json")).await;
+        assert!(a.session_policy_of("ASIA_BAD").await.is_err());
+        // 扇出：本地无行 → 远端应答带 session_policy
+        let b = Acl::with_mesh(
+            acl().await.pool.clone(),
+            Some(mesh_with(Some(ControlRow {
+                uid: Some(7),
+                is_admin: Some(false),
+                active: Some(true),
+                secret: Some("SK_PEER".into()),
+                session_policy: Some(GET_ONLY.to_string()),
+                ..Default::default()
+            }))),
+        );
+        assert!(b.session_policy_of("ASIA_REMOTE").await.unwrap().is_some());
+        // 远端无策略（None）= 无约束
+        let c = Acl::with_mesh(
+            acl().await.pool.clone(),
+            Some(mesh_with(Some(ControlRow {
+                uid: Some(7),
+                secret: Some("SK".into()),
+                session_policy: None,
+                ..Default::default()
+            }))),
+        );
+        assert!(c.session_policy_of("ASIA_REMOTE2").await.unwrap().is_none());
+    }
+
+    /// fuse_session 调用包装（测试便利）：构造 dst PolicyRequest；`src` = CopyObject 源（桶, 键）。
+    #[allow(clippy::too_many_arguments)] // 测试装置：平铺语义参（同 rebalance 先例）
+    async fn fuse(
+        a: &Acl,
+        ak: &str,
+        op: &str,
+        bucket: &str,
+        key: Option<&str>,
+        src: Option<(&str, &str)>,
+        d: bool,
+        s: bool,
+    ) -> ((bool, bool), Option<&'static str>) {
+        a.fuse_session(
+            crate::policy::PolicyRequest {
+                op,
+                ak,
+                uid: 7,
+                bucket,
+                key,
+            },
+            src.map(|(sb, sk)| crate::policy::PolicyRequest {
+                op,
+                ak,
+                uid: 7,
+                bucket: sb,
+                key: Some(sk),
+            }),
+            d,
+            s,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// fuse_session 交集矩阵：Allow 保留 / Deny 拒 / 无匹配拒 / CopyObject 双轴 / 未映射 op 不约束 / 非会话无痕。
+    #[tokio::test]
+    async fn fuse_session_intersection_matrix() {
+        let a = acl().await;
+        add_user(&a, 7, false).await;
+        add_key(&a, "AKIA_LONG", 7, None).await;
+        add_session(&a, "ASIA_G", 7, "AKIA_LONG", Some(GET_ONLY)).await;
+        // 会话 Allow：基线保留
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_G",
+            "GetObject",
+            "bkt",
+            Some("k"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!((d, s, det) == (true, true, Some("session:allow")));
+        // 无匹配（PutObject 不在策略里）→ 交集拒
+        let ((d, _), det) = fuse(
+            &a,
+            "ASIA_G",
+            "PutObject",
+            "bkt",
+            Some("k"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!(!d && det == Some("session:deny"));
+        // 资源不匹配（别的桶）→ 拒
+        let ((d, _), det) = fuse(
+            &a,
+            "ASIA_G",
+            "GetObject",
+            "other",
+            Some("k"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!(!d && det == Some("session:deny"));
+        // CopyObject：dst 轴（PutObject 映射）无匹配 → 拒；src 轴（GetObject）在策略内 → 保留
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_G",
+            "CopyObject",
+            "bkt",
+            Some("k"),
+            Some(("bkt", "k")),
+            true,
+            true,
+        )
+        .await;
+        assert!(!d && s && det == Some("session:deny"));
+        // 反向：策略只允许 PutObject 时，CopyObject 的 src 轴（GetObject）红、dst 轴绿
+        add_session(
+            &a,
+            "ASIA_P",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bkt/*"}]}"#),
+        )
+        .await;
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_P",
+            "CopyObject",
+            "bkt",
+            Some("k"),
+            Some(("bkt", "k")),
+            true,
+            true,
+        )
+        .await;
+        assert!(d && !s && det == Some("session:deny"));
+        // 未映射 op（如 PutObjectLockConfiguration）：会话不约束（词表缺项口径）
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_G",
+            "PutObjectLockConfiguration",
+            "bkt",
+            None,
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!((d, s, det) == (true, true, Some("session:allow")));
+        // 非会话键：原样返回、无 detail
+        let ((d, s), det) = fuse(
+            &a,
+            "AKIA_LONG",
+            "PutObject",
+            "bkt",
+            Some("k"),
+            None,
+            true,
+            false,
+        )
+        .await;
+        assert!((d, s, det) == (true, false, None));
+        // 显式 Deny 语句 → 拒（Deny 优先于同策略 Allow）
+        add_session(
+            &a,
+            "ASIA_D",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"},{"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*"}]}"#),
+        )
+        .await;
+        let ((d, _), det) = fuse(
+            &a,
+            "ASIA_D",
+            "GetObject",
+            "bkt",
+            Some("secret.txt"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!(!d && det == Some("session:deny"));
+    }
+
+    /// 批量删逐键判定叠会话：会话只放 GetObject → 删键被会话拒（防批量删绕过）。
+    #[tokio::test]
+    async fn key_delete_decision_applies_session() {
+        let a = acl().await;
+        add_user(&a, 7, false).await;
+        add_key(&a, "AKIA_LONG", 7, None).await;
+        // 表三档放行（can_delete=1）
+        sqlx::query("INSERT INTO permissions (user_id, bucket, can_delete) VALUES (7, 'bkt', 1)")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        add_session(&a, "ASIA_G", 7, "AKIA_LONG", Some(GET_ONLY)).await;
+        let u = AuthedUser {
+            uid: 7,
+            is_admin: false,
+            ak: "ASIA_G".into(),
+        };
+        assert_eq!(
+            a.key_delete_decision(&u, "bkt", "k").await.unwrap(),
+            (false, Some("session:deny"))
+        );
+        // 会话未覆盖 DeleteObject → 恒拒；换成放行 DeleteObject 的会话 → 表三档生效
+        add_session(
+            &a,
+            "ASIA_DEL",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::bkt/*"}]}"#),
+        )
+        .await;
+        let u2 = AuthedUser {
+            uid: 7,
+            is_admin: false,
+            ak: "ASIA_DEL".into(),
+        };
+        assert_eq!(
+            a.key_delete_decision(&u2, "bkt", "k").await.unwrap(),
+            (true, None)
+        );
+    }
+
+    /// P2-1 复验修复判别：CopyObject 的 src 轴用**源桶/源键**求值——曾复用 dst pr，
+    /// 会话对源读的收窄可被 copy 绕过（src 轴在目标资源上误命中 Allow）。
+    #[tokio::test]
+    async fn fuse_session_copy_src_axis_uses_source_resource() {
+        let a = acl().await;
+        add_user(&a, 7, false).await;
+        add_key(&a, "AKIA_LONG", 7, None).await;
+        // 会话收窄：bkt/* 可写、srcbkt/* 可读（「只许从 srcbkt 拷入 bkt」）
+        add_session(
+            &a,
+            "ASIA_CP",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject"],"Resource":"arn:aws:s3:::bkt/*"},{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject"],"Resource":"arn:aws:s3:::srcbkt/*"}]}"#),
+        )
+        .await;
+        // 合法拷贝：dst=bkt src=srcbkt → 双轴过
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_CP",
+            "CopyObject",
+            "bkt",
+            Some("k"),
+            Some(("srcbkt", "o")),
+            true,
+            true,
+        )
+        .await;
+        assert!((d, s, det) == (true, true, Some("session:allow")));
+        // 未覆盖源：src=other → src 轴在源资源上无匹配 → 拒（本用例对旧码亦红/绿不可判别，
+        // 判别核心在下一段「安全向」）
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_CP",
+            "CopyObject",
+            "bkt",
+            Some("k"),
+            Some(("other", "o")),
+            true,
+            true,
+        )
+        .await;
+        assert!(
+            (d, s, det) == (true, false, Some("session:deny")),
+            "src 轴必须用源桶求值（P2-1）"
+        );
+        // 安全向判别（verifier 复现口径）：会话在 **dst 资源**上放行 Get+Put 时，
+        // 「从任意源桶拷入」必须仍被 src 轴拒——旧实现（src 轴复用 dst pr）会在此误放行。
+        add_session(
+            &a,
+            "ASIA_OPEN",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bkt/*"}]}"#),
+        )
+        .await;
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_OPEN",
+            "CopyObject",
+            "bkt",
+            Some("k"),
+            Some(("secret", "o")),
+            true,
+            true,
+        )
+        .await;
+        assert!(
+            (d, s, det) == (true, false, Some("session:deny")),
+            "src≠dst 桶时 src 轴不得在目标资源上误命中（P2-1 安全向）"
+        );
+        // 同桶拷贝（dst 即源）→ 双轴允许（策略覆盖 bkt/*）
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_OPEN",
+            "CopyObject",
+            "bkt",
+            Some("k2"),
+            Some(("bkt", "k1")),
+            true,
+            true,
+        )
+        .await;
+        assert!((d, s, det) == (true, true, Some("session:allow")));
+    }
+
+    /// P3-2 复验修复判别：本地无行 + 扇出无答（全不可达）→ Err（fail-closed），
+    /// 不得把「没人答得上来」静默当「无策略」放行。
+    #[tokio::test]
+    async fn session_policy_of_mesh_no_answer_is_error() {
+        let d = Acl::with_mesh(acl().await.pool.clone(), Some(mesh_with(None)));
+        assert!(d.session_policy_of("ASIA_REMOTE_X").await.is_err());
     }
 }

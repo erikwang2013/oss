@@ -208,6 +208,9 @@ pub struct ControlRow {
     pub names: Option<Vec<String>>,
     /// M4 切片 8：BucketSet 应答
     pub set: Option<u32>,
+    /// M5 切片 5（S9）：AccessKey 应答携带的会话策略原文（`kind='session'` 且非空时；
+    /// 远端节点据此照常评价会话交集）。
+    pub session_policy: Option<String>,
 }
 
 /// 控制面后端（Task 9）：服务端**本地**查询执行器。oss-server 注入 sqlx 实现

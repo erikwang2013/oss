@@ -33,14 +33,22 @@ impl ControlBackend for SqliteControlBackend {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                // 与 SigV4Auth::get_secret_key 同口径（条件逐字一致）
+                // 与 SigV4Auth::get_secret_key 同口径（条件逐字一致；M5 切片 5 起含
+                // 会话父链条件——父须 long-term 且 active 未过期，父属主用户亦 active（P3-1））
                 let row = sqlx::query(
-                    "SELECT ak.secret_key AS sk, ak.user_id AS uid, u.is_admin AS is_admin \
+                    "SELECT ak.secret_key AS sk, ak.user_id AS uid, u.is_admin AS is_admin, \
+                            ak.session_policy AS sp \
                      FROM access_keys ak JOIN users u ON u.id = ak.user_id \
+                     LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
+                     LEFT JOIN users pu ON pu.id = p.user_id \
                      WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
-                       AND (ak.expires_at IS NULL OR ak.expires_at > ?)",
+                       AND (ak.expires_at IS NULL OR ak.expires_at > ?) \
+                       AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
+                            AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \
+                            AND pu.status = 'active'))",
                 )
                 .bind(&ak)
+                .bind(now)
                 .bind(now)
                 .fetch_optional(&self.pool)
                 .await
@@ -53,6 +61,7 @@ impl ControlBackend for SqliteControlBackend {
                     flag: None,
                     names: None,
                     set: None,
+                    session_policy: r.get::<Option<String>, _>("sp"),
                 }))
             }
             ControlQuery::Permission {

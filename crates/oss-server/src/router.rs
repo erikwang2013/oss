@@ -35,6 +35,9 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         state.control_mesh(),
     ));
     s3_builder.set_access(acl);
+    // M5 切片 5：STS 前置路由（POST / + form-urlencoded 拦为 AssumeRole/GetSessionToken；
+    // 校验签名后 req.credentials 已验证——StsRoute 直接以调用者 AK 为父）。
+    s3_builder.set_route(xl_s3::sts::StsRoute::new(state.db.pool().clone()));
     let s3 = s3_builder.build();
 
     // 控制面：`/api/v1` 整体走 jwt-rust 的 JwtLayer，`/login` 在 except 名单里

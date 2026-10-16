@@ -5,3 +5,4 @@ pub mod lock;
 pub mod policy;
 pub mod service;
 pub mod sse;
+pub mod sts;

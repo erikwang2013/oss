@@ -74,7 +74,8 @@ impl Db {
 
     /// 极小增量迁移：0001 是**整份重放**（全部 IF NOT EXISTS），而 `ALTER ADD COLUMN`
     /// 不幂等，放不进重放——增量列在这里探测后补齐。新库由 0001 直接带列，两个路径收敛。
-    /// 字面量 SQL（sqlx 0.9 拒动态串）；目前只有一个增量列（users.status）。
+    /// 字面量 SQL（sqlx 0.9 拒动态串）；增量列：users.status · buckets.set_id ·
+    /// buckets.object_lock 三列（M5 切片 4）· access_keys 会话三列（M5 切片 5）。
     async fn ensure_columns(&self) -> Result<()> {
         // M4 切片 8：buckets.set（多 set 归属；老库补列，幂等——与 status 同款竞态容忍）
         let bcols = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
@@ -116,6 +117,36 @@ impl Db {
                 && let Err(e) = sqlx::query(ddl).execute(&self.pool).await
             {
                 let again = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
+                    .fetch_all(&self.pool)
+                    .await?;
+                if !again.iter().any(|r| r.get::<String, _>("name") == name) {
+                    return Err(e);
+                }
+            }
+        }
+        // M5 切片 5：access_keys 会话三列（parent_ak/session_policy/kind；同款幂等补列）
+        let acols = sqlx::query("SELECT name FROM pragma_table_info('access_keys')")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_ak = |n: &str| acols.iter().any(|r| r.get::<String, _>("name") == n);
+        for (name, ddl) in [
+            (
+                "parent_ak",
+                "ALTER TABLE access_keys ADD COLUMN parent_ak TEXT",
+            ),
+            (
+                "session_policy",
+                "ALTER TABLE access_keys ADD COLUMN session_policy TEXT",
+            ),
+            (
+                "kind",
+                "ALTER TABLE access_keys ADD COLUMN kind TEXT NOT NULL DEFAULT 'long-term'",
+            ),
+        ] {
+            if !has_ak(name)
+                && let Err(e) = sqlx::query(ddl).execute(&self.pool).await
+            {
+                let again = sqlx::query("SELECT name FROM pragma_table_info('access_keys')")
                     .fetch_all(&self.pool)
                     .await?;
                 if !again.iter().any(|r| r.get::<String, _>("name") == name) {
@@ -225,8 +256,10 @@ impl Db {
     // SigV4 的 AK → SK 查询归 xl-s3/src/auth.rs（SigV4Auth）；这里不再保留第二份，防 M5 双改。
 
     pub async fn list_access_keys(&self, user_id: i64) -> Result<Vec<String>> {
+        // M5 切片 5：控制台只列长时键（会话行由 STS 签发、海量短寿，不进「访问密钥」页）
         let rows = sqlx::query(
-            "SELECT access_key FROM access_keys WHERE user_id = ? ORDER BY created_at, access_key",
+            "SELECT access_key FROM access_keys WHERE user_id = ? AND kind = 'long-term' \
+             ORDER BY created_at, access_key",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
