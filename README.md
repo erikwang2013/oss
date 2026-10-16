@@ -13,7 +13,9 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
 `x-amz-meta-*` 元数据、流式 PUT、孤儿回收）+ M2b（存储切片：单机多盘 + 纠删码 8+4、
 quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）+ M3（分布式切片：
 节点间 gRPC mesh、静态槽位拓扑、跨节点 quorum 读写、节点故障容忍与读修复、quorum 租约锁、
-混沌 e2e）**——`aws-cli`/`rclone`
+混沌 e2e）+ M4（运维与 IAM：版本控制、生命周期、桶策略、审计、heal/scrub、rebalance、
+多 set）**，正在进行 **M5（安全与锁定：加密数据面与 SSE 三模式、对象锁已落地；STS 进行中）**
+——`aws-cli`/`rclone`
 的大文件默认路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
@@ -42,8 +44,19 @@ kill -9 断电用例（SIGABRT 四注入点）。
 槽位表 + 拓扑指纹）· 跨节点 quorum 读写（提交 quorum + 补偿、读覆盖率快路径）· 节点故障容忍
 （kill -9 / SIGSTOP 混沌 e2e 实证）· 读修复（read-repair + fsck 集群化差集补齐）· 节点间
 quorum 租约锁（节点域 Q_n）· `/health/cluster` 集群健康端点。
-未实现（见设计文档的阶段表）：版本控制 · 加密 · 复制 · 对象锁/STS 等
-完整 IAM（细粒度策略、预设模板留 M4+）。
+已实现（M4 + 扩展包 C1-C5）：版本控制（版本链 / delete marker / 回滚 / 点名版本读删）·
+生命周期到期自动删（jobs 进度可见）· 桶策略（显式 Deny 优先；CopyObject 源/目标双轴判定；
+批量删逐键授权）· 审计日志与查询（C5 保留期自动清理）· `heal`/`scrub` 独立命令 · rebalance
+追加式扩容（C4 同盘 hardlink 快路径）· 多 set 横向扩容（桶钉 set；C2 控制台 sets 视图；
+C3 建桶缺省自动指派负载最小的 set）· 登录限速（C1：账号 10 分钟 5 败锁定 + 全局 60 秒 120 败
+暂拒，429 + Retry-After）。
+进行中（M5 安全与锁定；切片 0–4 已落地）：集群控制面行一致性广播（切片 0）· 主密钥密钥库
+（切片 1，单钥文件 + 多钥 KMS 目录）· 加密数据面（切片 2，先加密后 EC 的 DARE 式块对齐
+AES-256-GCM）· S3 面 SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁
+GOVERNANCE / COMPLIANCE / Legal Hold + 桶级默认保留规则（切片 4）。
+**未实现**（见设计文档的阶段表）：STS 临时凭据与 WebIdentity（M5 切片 5/7 进行中）·
+SK 加密存储（M5 切片 6）· 复制（M6/M7）· 事件流与 Select（M6）· 访问点 / Object Lambda（M8）·
+跨站点强一致（M9）· 细粒度 IAM 预设模板。
 
 ## 架构
 
@@ -51,8 +64,8 @@ quorum 租约锁（节点域 Q_n）· `/health/cluster` 集群健康端点。
 
 | crate / 目录 | 职责 |
 |---|---|
-| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` v1 编解码、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock |
-| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`） |
+| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
+| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配 |
 | `crates/xl-proto` | 节点间 gRPC 协议：`oss.proto` 消息与 service 定义（prost + tonic-build 全量生成） |
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
 | `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI |
@@ -63,7 +76,9 @@ quorum 租约锁（节点域 Q_n）· `/health/cluster` 集群健康端点。
 `xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。
 **提交永远是「数据先到位 → meta 翻转」**：单盘 = 同盘 rename；多盘 = 各盘 meta 两阶段提交
 （全盘 `xl.meta.new` 准备 ≥ quorum 才逐盘转正；读取**最新副本**胜）。小对象（< 128 KiB）内联进
-`xl.meta`、不落数据文件。临时区在每盘 `.oss.sys/{tmp, trash, locks}`，盘身份标识 `drive-id` 防插错盘。
+`xl.meta`、不落数据文件。启用加密（M5）后数据文件存的是**密文分片**（先加密后 EC），
+包裹的 DEK 与 `key_id` 记在 `xl.meta` 内（元数据本身不含密钥明文）。临时区在每盘
+`.oss.sys/{tmp, trash, locks}`，盘身份标识 `drive-id` 防插错盘。
 控制面元数据（用户/密钥/桶/上传记录/秒传索引）在 SQLite。
 
 ## 请求周期
@@ -139,7 +154,9 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   - 撤回授权对**在途分块上传**不追溯（preprocess 已放行的会传完）；新请求即时生效。
 >   - 建子账户 API 固定为非管理员（防提权）；口令至少 8 位；删除用户级联清其密钥与授权。
 >   - 口令存 **Argon2id**（m=19456, t=2, p=1）；历史 sha256 口令在**成功登录时透明升级**（无需重置）。
->   - **登录无速率限制**（Argon2 每次校验 ~19 MiB 内存）——暴力尝试面未封，后续补限速。
+>   - **登录限速（C1）**：账号维度 10 分钟窗口失败 ≥5 次 → 锁 10 分钟；全局维度 60 秒窗口
+>     失败 ≥120 次（跨用户名，防随机用户名洪水刷 Argon2）→ 全体暂拒（429 + `Retry-After`）。
+>     单进程内存态：每节点独立、重启清零（限速非持久配额）。只护登录口；已认证的改密不在此列。
 >   - **桶策略只在 S3 面生效**：控制台与 aetherupload 上传面仍走三档 permissions。
 >   - **删桶连带清空该桶策略与生命周期规则**（S3 面与控制面删桶都清）——同名重建不继承，防旧规则误删。
 > - **多 set（M4）边界**：
@@ -148,6 +165,10 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   - **跨 set 桶名唯一性在并发建桶下是 best-effort**（既有跨节点查重 TOCTOU 同款）。
 >   - **`[[groups]]` 分组的目标桶钉 set0**（控制台上传面不参与新 set）。
 >   - **加盘只能加在最后一个 set**（前滚约束）：往中间 set 加盘 → 启动指纹拒启，不可行。
+> - **加密与对象锁（M5）边界**：详见「加密（M5）」「对象锁（M5）」两节记档段；跨节点要点——
+>   桶锁状态列（`buckets.object_lock*`）随控制面行广播传播，属**最终一致**：窗口期内非版本化
+>   覆盖写/回收路径 **fail-closed 拒删**（不静默放行）；行同步强一致归 M9。**多节点加密须先
+>   把同一把主密钥（文件或 KMS 目录整份）分发到全部节点**再开写，否则本节点读不了别节点写的对象。
 
 ## Docker（compose）
 
@@ -318,7 +339,8 @@ scrape_configs:
    全节点升级完再开 `placement="v2"`。**
 3. 追加拓扑（加盘/加节点，见下）。
 4. 逐节点 `oss-server rebalance --dry-run` 看计划。
-5. `oss-server rebalance --apply`（幂等，可重跑续搬）。
+5. `oss-server rebalance --apply`（幂等，可重跑续搬；同盘搬迁走 **hardlink 快路径**，C4——
+   免整片重拷、崩溃安全，跨设备自动回落分块 copy）。
 
 **加盘**：只能往**最后一个节点**追加 `data_dirs`（中间节点加盘会位移其后节点槽位，启动时指纹拒启）。
 新盘必须先「入册」——在已挂载的新盘上
@@ -353,6 +375,7 @@ GET / HEAD / DeleteObject 带 `--version-id` 点名版本；`copy-object --copy-
   返回 400 InvalidArgument（fail-loud）。
 - 集群：版本追加仍走 write_meta quorum（整份 meta 重写）；`list-object-versions` 集群路径为逐键 quorum 读
   （低频运维面，量级上去再做分页 RPC——记档）。
+- 对象锁（M5）：开锁桶须版本控制 Enabled（建桶旗标会一并自动开）；锁定版本的删除语义见「对象锁（M5）」节。
 
 ## 生命周期（M4）
 
@@ -394,6 +417,8 @@ Principal 的 ARN 形态 / **匿名（无凭据）放行**——`Principal:"*"` 
 三档 permissions，不旁路桶策略 Deny。
 
 审计：S3 面每次授权判定（允许与拒绝都）落一行 SQLite `audit_log`，`detail` 记策略来源
+（`policy:allow` / `policy:deny` / `policy:error`）；**保留期清理（C5）**：`OSS_AUDIT_RETENTION_DAYS`
+（默认 0 = 不清理）开启后每小时清 `ts` 超出保留期的行（best-effort，失败只 warn）。
 （`policy:allow` / `policy:deny` / `policy:error`）；`GET /api/v1/audit?limit=&decision=allow|deny`
 （仅管理员；limit 默认 100、钳 1..=1000；`decision` 只认 allow/deny，其它值视为不过滤，最新在前）。
 `tests/e2e_s3.sh` 第 17 节实弹覆盖（Deny 优先 / 校验 400 / 审计查询 / 清策略恢复 / 删桶清策略 /
@@ -425,9 +450,10 @@ set = 1
 # n2 / n3 同构…
 ```
 
-**桶钉 set**：控制台建桶（`POST /api/v1/buckets`）可选 `set`（校验 < 组数；缺省 0）；S3 面
-CreateBucket 缺省 set0（S3 指名 set 归后续）。归属存 `buckets.set_id` 列（老库启动幂等补列，
-存量 = 0）。**set 一经创建不可变**——没有改 set 的 API，已有桶不跨 set 搬迁。
+**桶钉 set**：控制台建桶（`POST /api/v1/buckets`）可选 `set`（校验 < 组数；**缺省自动指派**
+到桶数最少的 set，C3）；S3 面 CreateBucket（协议无 set 形参）缺省同样**自动指派**到负载最小的
+set（单 set 恒 0）。归属存 `buckets.set_id` 列（老库启动幂等补列，存量 = 0）。
+**set 一经创建不可变**——没有改 set 的 API，已有桶不跨 set 搬迁。
 
 **隔离口径**：set 只约束**数据分片**（放置公式与分片 RPC 写/读/删）；**桶目录与 `xl.meta`
 跨全部 set 镜像**（命名空间面：每盘一份完整命名空间副本，全盘迭代）——空桶目录与元数据副本
@@ -442,10 +468,71 @@ set>0 段盘写 `v3 set=… node=… slot=…`（slot 为**组内槽**）；`v3`
 
 **观测**：`GET /api/v1/cluster/status`（admin）新增 `sets` 数组（每 set 一条：组内槽数、节点表、
 本节点是否属该组）；顶层 `nodes` / `slot_count` 为按 id 去重的节点并集（命名空间面口径）。
-**各 set 的槽号是独立槽域，跨 set 会重号——按 set 分组读**（控制台「集群」页表格当前仍是顶层
-去重视图）。
+**各 set 的槽号是独立槽域，跨 set 会重号——按 set 分组读**（控制台「集群」页已按 set 分组展示，
+C2）。
+
+## 加密（M5）
+
+**顺序是硬约束：先加密，再纠删码**——写路径 `明文 → 块对齐流式加密（AES-256-GCM，DARE 式
+65520B 明文单元 → 65536B 密文单元）→ EC 编码 → 落盘`，读路径反向；因此**单个分片（不足 quorum）
+不含任何明文信息**，parity 块同理（验收 ②）。
+
+三种模式由请求头选定（**env 一个不配 = 加密整体不启用，零行为变化**）：
+
+| 模式 | 启用 / 请求 | 密钥来源 | 盘上存什么 |
+|---|---|---|---|
+| SSE-S3 | env `OSS_MASTER_KEY_FILE=<路径>`；头 `x-amz-server-side-encryption: AES256` | 单主密钥文件（缺省 `<data_root>/.oss.sys/master.key`，0600 首启自动生成；**多节点须分发同一把**） | 包装后的 DEK，`key_id="file"` |
+| SSE-KMS | env `OSS_KMS_DIR=<目录>`；头 `aws:kms` | 多钥目录 `key-<n>.bin`（当前钥 = 最大 n） | 包装后的 DEK + `key_id="k<n>"` |
+| SSE-C | 头 `x-amz-server-side-encryption-customer-{algorithm,key,key-MD5}`（每次请求带 32B 客户端钥） | 客户端 | **只存 `base64(MD5(key))` 校验值（AWS 同款 24 字符头），密钥绝不落盘** |
+
+- 每对象一把 32B DEK（OsRng 生成）；单元 nonce = 随机种子(8B) ‖ BE32(单元号)，单元号把
+  （EC 分片, 块）双射到密文单元——同一 DEK 下 nonce 不重用。
+- 响应头：PUT / HEAD / GET 回 `x-amz-server-side-encryption`（SSE-C 另回 customer-key-MD5 等
+  校验头），`aws-cli` 的 `sse` 参数直连可用。
+- **口径**：ETag / Content-MD5 / SHA256 全部对**明文**计算（协议语义不变）；分片 CRC32C 对**密文**；
+  SSE-KMS 请求若**显式带 CMK**（`…-aws-kms-key-id`）→ 400 拒绝（多主密钥轮换编排未做，
+  明确拒优于静默忽略）；读/删 SSE-C 对象必须带同一把钥（错钥 → 400，校验值即判据）。
+- MPU：SSE 意图在 CreateMultipartUpload 记录（含 SSE-C 校验值），Complete 统一落地；
+  SSE-C 的 UploadPart / Complete 须全程带同名钥；读写响应带版本/加密头。
+- **换主密钥不重写数据**（验收 ⑤）：DEK 的包裹体在 `xl.meta`，只要旧 `key_id` 的钥仍在即可解——
+  轮换 = 往 `OSS_KMS_DIR` 加入更大的 `key-<n>.bin`（新写用新钥，旧对象照读）；
+  单钥文件 provider 直接换文件会让旧 `key_id="file"` 的包裹不可解（**先迁到 KMS 目录再轮换**）。
+- **边界（记档）**：桶级默认加密（`put-bucket-encryption`）未实现；aetherupload 内部摄取
+  不带加密（存入为明文）；未配对应 env 时请求该模式 → 500（fail-closed，不静默落明文）；
+  HTTP KMS 未实作（`KeyProvider` trait 已留接入点，文件型 KMS 即多钥目录）。
+- `tests/e2e_s3.sh` 第 18 节（随 M5 收尾落地）实弹覆盖「写入 → head 头断言 → 盘上 grep
+  明文特征串」。
+
+## 对象锁（M5）
+
+**桶级**：`CreateBucket` 带 `x-amz-bucket-object-lock-enabled: true` 建桶即开锁（**自动开版本
+控制**，AWS 语义）；或对已开版本控制的桶 `PutObjectLockConfiguration` 开锁并设**默认保留规则**
+（`Days`/`Years`，归一为天存储，上限 36500 天；`Enabled` 只能开不能关——二次 Put 只许改规则）。
+默认规则对**未带锁头**的 PUT 生效（显式锁头优先，不叠加）。
+
+**对象级头**（PutObject / CopyObject 目标 / CreateMultipartUpload；MPU 在 create 时记录、
+complete 时落地）：
+
+- `x-amz-object-lock-mode: GOVERNANCE | COMPLIANCE` + `x-amz-object-lock-retain-until-date`
+  —— 必须**成对**且 until 在未来（否则 400）；桶未开锁带锁头 → 400。
+- `x-amz-object-lock-legal-hold: ON | OFF` —— 独立于 retention。
+
+**删除守卫**（点名删版本 / 批量删 / 覆盖写回收 / 控制台删路径统一）：`until ≤ now`（到期）可删；
+未到期 **COMPLIANCE 一律拒（含管理员）**；未到期 **GOVERNANCE 仅
+`x-amz-bypass-governance-retention: true` 放行**（调用方须已鉴权）；**Legal Hold ON 一律拒**。
+拒删 = 403 `AccessDenied`（批量删逐键记入响应 `errors[]`，其余键照删）。无版本号 DELETE 照常打
+delete marker（锁定版本天然留存）；生命周期删除同理。
+Legal Hold 开关 API：`put/get-object-legal-hold`（`put` 须点名版本且**桶已开锁**，否则 400；
+`get` 为元数据面读——SSE-C 对象不要求客户钥）。
+响应面：GET / HEAD 回 `x-amz-object-lock-mode` / `-retain-until-date` / `-legal-hold`。
+
+**边界（记档）**：`Put/GetObjectRetention`（改保留期）未接线（延后）；控制台尚无锁状态展示
+（S3 API 面完整可用）；`buckets` 表锁列跨节点的**行广播**传播，窗口期内非版本化回收路径
+fail-closed 拒删（强一致归 M9，见「已知限制」）。
 
 ## 验收
+
+
 
 覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）见下方脚本；控制台的登录/上传/秒传/密钥常规路径见
 「控制台（M1b）」的 Playwright e2e；**1 GB 上传与断线续传为人工验证项**（指引同 M1b 段）。
@@ -465,10 +552,13 @@ cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空�
 
 - 设计文档：`docs/superpowers/specs/2026-10-10-minio-clone-design.md`
 - 功能规格：`docs/superpowers/specs/2026-10-10-feature-spec.md`
-- M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`
+- M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`（前端：`…-m1b-frontend-console.md`）
 - M2a 实现计划：`docs/superpowers/plans/2026-10-12-m2a-usability-slice.md`
 - M2b 实现计划（多盘 / EC / 断电一致性）：`docs/superpowers/plans/2026-10-12-m2b-ec-multidisk.md`
 - 子账户与权限体系实施记录：`docs/superpowers/plans/2026-10-13-subaccounts-permissions.md`
+- M3 分布式实现记录：`docs/superpowers/plans/2026-10-13-m3-distributed.md`
+- M4 运维与 IAM 实现记录：`docs/superpowers/plans/2026-10-14-m4-ops-iam.md`
+- M5 安全与锁定实施记录（进行中）：`docs/superpowers/plans/2026-10-16-m5-security-lock.md`
 
 ---
 

@@ -377,6 +377,15 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 - nonce 由 `nonce_seed` + part 号派生，保证同一 DEK 下不重用 nonce
 - `xl.meta` 中 `Version.encryption` 记录算法与包装结果；元数据本身不加密（不含秘密）
 
+**落地记录（M5 切片 1-3，2026-10-16）**：实现了块对齐的 DARE 式变体——明文按 65520B 单元切齐
+（= 65536B 密文单元），单元号 `u = s·blocks_ec + t` 把（EC 分片 s, 块 t）**双射**到密文单元，
+nonce = 随机种子(8B) ‖ BE32(u)——非本节的「part 号派生」但达成同一目标（同 DEK 下 nonce
+不重用），且天然支持 Range 读与分片级 EC 重编码（从 C 重编 parity 无需明文）。SSE-C 的
+「HMAC 校验」落为 **`base64(MD5(key))`**（AWS customer-key-MD5 同款，客户端兼容优先）；
+SSE-KMS 的文件实现即「多钥目录」（`key-<n>.bin`，当前钥=最大 n，加钥即轮换），HTTP KMS 以
+`KeyProvider` trait 预留。校验口径：ETag/MD5/SHA256 对**明文**、分片 CRC 对**密文**——
+协议语义不变（DEK 的包裹体 `wrapped` 与 `key_id` 落 `xl.meta`）。桶级默认加密未实现（记档）。
+
 ### 7.7 Access Point 与 Object Lambda 的改写层（M8）
 
 两者是同一个机制：**请求到达 S3 服务之前的改写**。
@@ -455,6 +464,13 @@ rebalance / heal 独立命令 / 多 set / 控制面强一致顺延 M4 / M9。
 3. 生命周期规则到期自动转换/删除（`jobs` 表可见进度）
 4. 策略拒绝：无权限的 AK 访问被拒且审计表有记录
 
+**M4 落地状态（2026-10-15 / v1.7.0；扩展包 C1-C5 随 v1.8.0，2026-10-16）**：版本控制（版本链 /
+delete marker / 回滚 / 点名版本读删）· 生命周期到期自动删（`jobs` 进度）· 桶策略（显式 Deny
+优先；CopyObject 源/目标双轴；批量删逐键授权）· 审计（S3 面判定落 `audit_log` + 查询）·
+heal / scrub 独立命令 · rebalance 追加式扩容（C4 同盘 hardlink 快路径）· 多 set 横向扩容
+（桶钉 set；C2 控制台 sets 视图；C3 建桶缺省自动指派最闲 set）· 登录限速（C1）· 审计保留
+清理（C5）——均已落地；验收 ①–④ e2e 实证。分层/转换归 M8，控制面强一致归 M9。
+
 ### M5 安全与锁定（2-3 周）
 
 **范围**：SSE-S3 / SSE-KMS（含文件型 KMS 实现）/ SSE-C · 对象锁（Governance + Compliance + Legal Hold）· STS（AssumeRole / GetSessionToken / AssumeRoleWithWebIdentity）
@@ -465,6 +481,13 @@ rebalance / heal 独立命令 / 多 set / 控制面强一致顺延 M4 / M9。
 3. 对象锁：Compliance 模式下删除版本被拒（含管理员）；到期后可删
 4. STS：AssumeRole 拿到临时凭据，`aws-cli` 用它能访问；过期后拒绝；会话策略与用户策略取交集生效
 5. SSE-KMS 换主密钥后旧对象仍可读（DEK 未变）
+
+**M5 落地状态（进行中，2026-10-16 起）**：切片 0 集群行一致性广播 · 切片 1 密钥库
+（`KeyProvider` trait + 单钥文件 + 多钥 KMS 目录，验收 ⑤）· 切片 2 加密数据面（先加密后 EC、
+DARE 式块对齐 AES-256-GCM，验收 ①②数据面侧）· 切片 3 S3 面 SSE 三模式全链 · 切片 4 对象锁
+（桶级默认保留 + 对象级 GOVERNANCE/COMPLIANCE/Legal Hold + 删除守卫，验收 ③）——**已落地**；
+剩余：切片 5 STS（验收 ④）· 切片 6 SK 加密存储 · 切片 7 WebIdentity（条件式）+ e2e §18 +
+README + 收尾。实施记录见 `plans/2026-10-16-m5-security-lock.md`。
 
 ### M6 数据流（3-5 周）
 

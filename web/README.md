@@ -1,6 +1,8 @@
 # OSS 控制台（web）
 
-「oss」对象存储的 Web 控制台：登录、桶与对象浏览（上传/下载/删除）、访问密钥管理。
+「oss」对象存储的 Web 控制台：登录、桶与对象浏览（上传/下载/删除）、访问密钥管理、
+子账户与授权、集群状态（按 set 分组）。桶策略 / 生命周期规则 / 作业（jobs）/ 审计查询
+目前为**控制台 API 面**（`/api/v1`，见根 README「桶策略与审计」「生命周期」节），无独立页面。
 React 19 + antd 5 + TanStack Query + react-router，Vite 构建。项目总览与后端见根 [README](../README.md)。
 
 ## 命令
@@ -14,5 +16,5 @@ React 19 + antd 5 + TanStack Query + react-router，Vite 构建。项目总览�
 ## 目录
 
 - `src/api.ts` — API 客户端（`api`/`rawApi`，401 统一清 token 跳登录）与 token 存取（localStorage + cookie）
-- `src/pages/` — 登录 / 桶 / 对象 / 密钥页面；`src/upload/` — aetherupload 分块上传
+- `src/pages/` — 登录 / 桶 / 对象 / 密钥 / 子账户（Users）/ 集群（Cluster）页面；`src/upload/` — aetherupload 分块上传
 - `src/__tests__/`、`e2e/` — 单元测试与 Playwright 端到端用例

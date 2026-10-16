@@ -333,17 +333,75 @@ stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] →
 
 ## 切片 4：对象锁
 
-- [ ] 桶级：`PutObjectLockConfiguration`/`GetObjectLockConfiguration`（s3s DTO 核实）+ `buckets.object_lock`
-      列启用（须开版本控制，AWS 语义）；控制台可读
-- [ ] 对象级：PutObject 的 `x-amz-object-lock-mode` / `-retain-until-date` / `-legal-hold` 头
+**接线裁决（2026-10-16，实施前定，交 verifier 随实现核查）**：
+- **L1 meta**：`Version.lock: Option<ObjectLockRecord { mode: Option<String>（GOVERNANCE/COMPLIANCE）,
+  retain_until_nanos: Option<i64>, legal_hold: bool }`——retention（mode+until 成对）与 legal hold
+  独立；decode 校验 pair/枚举/非负。golden 第七次有意识更新（Version 增 lock 字段，明文 nil）。
+- **L2 桶级**：`buckets` 表 ensure_columns：`object_lock INTEGER DEFAULT 0` +
+  `object_lock_default_mode TEXT` + `object_lock_default_days INTEGER`（默认保留规则**归一为天**
+  存储——years×365 换算，记档）。PutObjectLockConfiguration：须 versioning Enabled（否则 400
+  InvalidBucketState）；**Enabled 只能开不能关**（二次 Put 只许改默认规则）；Get 恒回 Enabled+规则。
+  CreateBucket 带 `x-amz-bucket-object-lock-enabled: true` → 建桶即开锁 + **自动开版本控制**（AWS 语义）。
+- **L3 对象级**：PutObject/CopyObject（目标）/CreateMPU 的 `x-amz-object-lock-*` 头；
+  桶未开锁带锁头 → 400；mode 与 until 必须成对且 until 在未来；无显式头而桶有默认规则 → 服务层
+  **计算并落盘**（仅锁开启桶）。MPU：create 记入 mpu.meta（mode/until/legal_hold 三字段，同 sse_kind
+  模式），complete 带 None → 由 create 记录**落地**；不一致 → 400。**（N2/P3-a/P3-b 复验补）**：
+  Put/GetObjectLegalHold 落地——put 须点名版本**且桶已开锁**（否则 400；行缺失按 N4 分层）；get 为
+  元数据面读（不校验 SSE-C 客户钥）；`Put/GetObjectRetention` 延后（s3s 缺省 501）。
+- **L4 守卫**（store）：点名删版本前查 `Version.lock`——legal_hold → `Error::ObjectLocked`；
+  COMPLIANCE 且未到期 → 一律拒（**含 admin**）；GOVERNANCE 且未到期 → 仅 `bypass_governance=true`
+  放行；到期（`until <= now`）放行。追加 `delete_object_versioned_ext(..., bypass_governance: bool)`
+  （旧签名委托 false，零 churn）。批量删自然经逐键路径；delete-marker（无版本号删）与版本桶**追加
+  写**不受锁约束（AWS 语义）。
+- **L5 错误面**：`Error::ObjectLocked` → `S3ErrorCode::AccessDenied`（403，AWS 对锁定删除的码）。
+- **L6 生命周期**：锁定版本**跳过删除**（AWS 语义，非报错）——oss-server 作业对
+  `Err(ObjectLocked)` 计跳过+warn（实现落点随作业代码核）。
+- **L7 不变量（B2 复验后重写）**：锁对象只存在于 versioned=Enabled 桶（L2 强制），且集群下
+  「`buckets` 表锁列跨节点同步」为前提条件——行广播是最终一致（P4-1 家族，同「桶版本状态不跨
+  节点」；强一致列 **M9 前置**）；非版本化覆盖写/回收**四路径**（purge / 整键删 / 覆盖写 / MPU
+  complete）以**链上活动锁 fail-closed 守卫**（`chain_active_lock`——legal_hold 或未到期 mode
+  皆拒，含 GOVERNANCE：整链操作无 bypass 语义可适用）兜底。原「不可达 + debug_assert」表述作废
+  （N7：全仓无锁断言，守卫即兜底）。时钟依赖 NTP（引用设计口径）；测试直接构造过期 until 值即可，
+  无需时钟注入。
+
+- [x] 桶级：`PutObjectLockConfiguration`/`GetObjectLockConfiguration`（s3s DTO 核实）+ `buckets.object_lock`
+      列启用（须开版本控制，AWS 语义）；控制台可读 —— 控制台读取延后（记档⑥）
+- [x] 对象级：PutObject 的 `x-amz-object-lock-mode` / `-retain-until-date` / `-legal-hold` 头
       （桶未开启 → 400）
-- [ ] 守卫：删除（点名删版本/批量删/生命周期/覆盖写）检查 `Version.lock`——Governance：拒，除非
+- [x] 守卫：删除（点名删版本/批量删/生命周期/覆盖写）检查 `Version.lock`——Governance：拒，除非
       `x-amz-bypass-governance-retention: true`（且非匿名）；**Compliance：一律拒（含 admin）**；
       Legal Hold 独立于 retaining
-- [ ] 到期：`retain_until < now` 即可删；时钟依赖 NTP（引用切片 4/epoch 口径）
-- [ ] 测试：Compliance 拒删（含 admin）→ 拨表到期 → 可删；Governance + bypass 头放行路径；
+- [x] 到期：`retain_until < now` 即可删；时钟依赖 NTP（引用切片 4/epoch 口径）
+- [x] 测试：Compliance 拒删（含 admin）→ 拨表到期 → 可删；Governance + bypass 头放行路径；
       LegalHold 开关；批量删逐键守卫
-- **定稿**：§
+- **定稿（2026-10-17）**：代码提交 `bb9cee1`（23 文件 +2153/−17）+ 本定稿/全库文档提交（紧随其后）。
+  七闸实测（B 树，`git diff|md5sum` = `00720ba1`——闸后计划文本有改写，代码零漂移；A 树 `502a053c`
+  亦全绿，同代码面除 P3 增量）：xl-store **188+1ignored**（tests_lock 5 枚：守卫矩阵 / MPU 落地 /
+  decode 边界 / 空记录 / B1B2+P3-c 到期判别力）/ kill9 2 / oss-server 67 / xl-s3 **30+3+28**
+  （object_lock 线级 3 枚：roundtrip / fixes / legal_hold_gates）/ xl-client+xl-proto 5 /
+  clippy `--workspace --all-targets -D warnings` 净 / fmt 净。锚：tests_lock `e65bc9a4`、
+  version.rs `c7daada0`、service.rs `bd57bebac4`、lock.rs `433bd14a`、store.rs `d3377fcc`
+  （sha256 前16）。
+  verifier **三轮**（报告 `.superpowers/sdd/2026-10-16-m5-security-lock/verifier-m5s4-rereview.md`）：
+  ①实现对抗核查「不可直接收口」（B1 purge 绕过 / B2 行传播缺口 / N2~N4）→ 修复轮 → scoped 复验
+  「可收口」（锚逐字节吻合）；②P3 收口轮（P3-a 门禁 / P3-b 元数据面读 / P3-c 判别力）→ 增量复查
+  「可收口」（含变异推演：删 `until > now` 可红）。
+  **落地形态**：meta `Version.lock`（L1，golden 第七次）；桶列三枚（L2）+ 建桶旗标 upsert + Enabled
+  不可关 + 默认规则 cap 36500 天（N3）；对象头三件套 + `resolve_lock`（桶默认规则落地；N4 行缺失用
+  `bucket_exists` 分层：桶在=未开锁语义 / 桶亡=404）；守卫矩阵（L4）+ 非版本化**四路径**
+  （purge/整键删/覆盖写/MPU complete）链锁 fail-closed（B2 缓解口径）；删除/覆盖/批量删全链 403
+  AccessDenied（L5，批量删逐键入 errors[]）；生命周期**零改动**核验（L6：versioned 走 marker 天然
+  留存 / 触发守卫时走通用 skipped+warn）；LegalHold put/get 双 API（put 须点名版本且桶已开锁；
+  get 元数据面读）。
+  **记档**：①**L7 重写**（见上——不变量限定「单节点 或 行同步前提」；行同步强一致列 **M9 前置**）；
+  ②L6 核验结论（非新记档）；③N5 aether 内部摄取不带锁（IngestSink `lock=None`——同切片 2 内部摄取
+  明文样式）；④N6 Put config 宽容面（`object_lock_enabled` 缺省放行——AWS 要求显式；`rule` 缺省 =
+  清空默认规则，AWS 同口径）；⑤`Put/GetObjectRetention` 未接线（s3s 缺省 501 NotImplemented，
+  延后）；⑥控制台锁状态展示延后（S3 API 面完整）；⑦**D4**：Put/GetObjectLegalHold 为元数据面
+  操作——**get 不设开锁门禁**（Ruling 7：读=发现面；行陈旧窗口下 gating 读反劣；MinIO 同口径；
+  AWS 400 差异记档）、SSE-C 对象不要求客户钥（AWS 要求——差异记档；数据面照旧 400，hold 读不是
+  旁路，有线级测试钉）；⑧fine-print：点名读 marker 版本 hold → 400 InvalidArgument（AWS 惯例 405，
+  与 set 对称的既有选择）。
 
 ## 切片 5：STS
 

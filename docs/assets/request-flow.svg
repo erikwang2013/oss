@@ -1,85 +1,90 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 760" width="960" height="760"
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 780" width="960" height="780"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS 请求周期</title>
-  <desc>两条入口（S3 直传与浏览器分块上传）汇入同一条 xl-store 提交协议。</desc>
+  <desc>两条入口（S3 直传与浏览器分块上传）汇入同一条 xl-store 提交协议；启用 SSE 时先流式加密再 EC 编码。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
     </marker>
   </defs>
 
-  <rect x="1" y="1" width="958" height="758" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+  <rect x="1" y="1" width="958" height="778" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
   <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 请求周期</text>
-  <text x="40" y="70" font-size="12" fill="#64748b">两条入口（S3 直传 / 浏览器分块上传）在「提交协议」处汇合 —— 提交之前的一切对客户端不可见</text>
+  <text x="40" y="70" font-size="12" fill="#64748b">两条入口（S3 直传 / 浏览器分块上传）在「提交协议」处汇合 —— 提交之前的一切对客户端不可见 · 启用 SSE 时先加密后 EC</text>
 
   <text x="60" y="108" font-size="13" font-weight="600" fill="#1e3a8a">① S3 直传（aws-cli / rclone）</text>
   <text x="520" y="108" font-size="13" font-weight="600" fill="#0f766e">② 浏览器分块上传（aetherupload）</text>
 
   <!-- 左列：S3 直传 -->
-  <rect x="60" y="124" width="420" height="64" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="78" y="150" font-size="12.5" font-weight="600" fill="#1e3a8a">客户端发起 PUT /{bucket}/{key}</text>
-  <text x="78" y="170" font-size="10.5" fill="#64748b">aws-cli / rclone · 带 SigV4 签名头</text>
-  <line x1="270" y1="188" x2="270" y2="204" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="60" y="124" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="78" y="148" font-size="12.5" font-weight="600" fill="#1e3a8a">客户端发起 PUT /{bucket}/{key}</text>
+  <text x="78" y="168" font-size="10.5" fill="#64748b">SigV4 签名头 · 可带 SSE / 对象锁头 · 版本参数</text>
+  <line x1="270" y1="182" x2="270" y2="196" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="60" y="208" width="420" height="64" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="78" y="234" font-size="12.5" font-weight="600" fill="#1e3a8a">oss-server：fallback_service → s3s</text>
-  <text x="78" y="254" font-size="10.5" fill="#64748b">解析请求 · SigV4Auth 查 access_keys 验签</text>
-  <line x1="270" y1="272" x2="270" y2="288" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="60" y="200" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="78" y="224" font-size="12.5" font-weight="600" fill="#1e3a8a">oss-server：fallback_service → s3s</text>
+  <text x="78" y="244" font-size="10.5" fill="#64748b">SigV4 验签 + 授权（桶策略 Deny 优先 → 三档权限，M4）</text>
+  <line x1="270" y1="258" x2="270" y2="272" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="60" y="292" width="420" height="64" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="78" y="318" font-size="12.5" font-weight="600" fill="#1e3a8a">OssS3（xl-s3）：put_object</text>
-  <text x="78" y="338" font-size="10.5" fill="#64748b">M1 整份读入请求体（≤ 256 MiB；M2 换流式）</text>
-  <line x1="270" y1="356" x2="270" y2="372" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="60" y="276" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="78" y="300" font-size="12.5" font-weight="600" fill="#1e3a8a">OssS3（xl-s3）：put_object</text>
+  <text x="78" y="320" font-size="10.5" fill="#64748b">解析 SSE / 锁头（M5）· 桶默认保留规则落地 · 校验和</text>
+  <line x1="270" y1="334" x2="270" y2="348" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="60" y="376" width="420" height="64" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="78" y="402" font-size="12.5" font-weight="600" fill="#1e3a8a">put_object_stream（xl-store）</text>
-  <text x="78" y="422" font-size="10.5" fill="#64748b">提交后返回 200 OK + ETag（内容整份 MD5）</text>
-  <line x1="270" y1="440" x2="270" y2="552" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="60" y="352" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="78" y="376" font-size="12.5" font-weight="600" fill="#1e3a8a">put_object_stream（xl-store，流式）</text>
+  <text x="78" y="396" font-size="10.5" fill="#64748b">M2a 起不再整份读内存（内存峰值 ≈ 块缓冲）</text>
+  <line x1="270" y1="410" x2="270" y2="424" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="60" y="428" width="420" height="58" rx="10" fill="#fdf4ff" stroke="#f0abfc"/>
+  <text x="78" y="452" font-size="12.5" font-weight="600" fill="#86198f">带 SSE：先加密 → 再 EC 编码（M5）</text>
+  <text x="78" y="472" font-size="10.5" fill="#a21caf">明文按 65520B 单元 AES-256-GCM → 65536B 密文 → 8+4 分片</text>
+  <line x1="270" y1="486" x2="270" y2="580" stroke="#94a3b8" marker-end="url(#a)"/>
 
   <!-- 右列：浏览器分块上传 -->
-  <rect x="520" y="124" width="400" height="52" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
-  <text x="538" y="146" font-size="12" font-weight="600" fill="#0f766e">preprocess：分组 / 文件名 / 大小 / 整份 MD5</text>
-  <text x="538" y="164" font-size="10" fill="#64748b">秒传命中 → 直接成功（0 分块），短路后续</text>
-  <line x1="720" y1="176" x2="720" y2="188" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="520" y="124" width="400" height="46" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
+  <text x="538" y="144" font-size="12" font-weight="600" fill="#0f766e">preprocess：分组 / 文件名 / 大小 / 整份 MD5</text>
+  <text x="538" y="161" font-size="10" fill="#64748b">秒传命中 → 直接成功（0 分块），短路后续</text>
+  <line x1="720" y1="170" x2="720" y2="182" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="520" y="192" width="400" height="52" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
-  <text x="538" y="214" font-size="12" font-weight="600" fill="#0f766e">POST /aetherupload/uploading ×N（分块，1 MB/块）</text>
-  <text x="538" y="232" font-size="10" fill="#64748b">每块写暂存盘 *.part · 断点信息写 _header/</text>
-  <line x1="720" y1="244" x2="720" y2="256" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="520" y="186" width="400" height="46" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
+  <text x="538" y="206" font-size="12" font-weight="600" fill="#0f766e">POST /aetherupload/uploading ×N（分块，1 MB/块）</text>
+  <text x="538" y="223" font-size="10" fill="#64748b">每块写暂存盘 *.part · 断点信息写 _header/</text>
+  <line x1="720" y1="232" x2="720" y2="244" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="520" y="260" width="400" height="52" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
-  <text x="538" y="282" font-size="12" font-weight="600" fill="#0f766e">全部块到齐 → 服务端合并成品</text>
-  <text x="538" y="300" font-size="10" fill="#64748b">成品名 = 整份 MD5 + 扩展名 · 子目录 = UTC 年月</text>
-  <line x1="720" y1="312" x2="720" y2="324" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="520" y="248" width="400" height="46" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
+  <text x="538" y="268" font-size="12" font-weight="600" fill="#0f766e">全部块到齐 → 服务端合并成品</text>
+  <text x="538" y="285" font-size="10" fill="#64748b">成品名 = 整份 MD5 + 扩展名 · 子目录 = UTC 年月</text>
+  <line x1="720" y1="294" x2="720" y2="306" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="520" y="328" width="400" height="52" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
-  <text x="538" y="350" font-size="12" font-weight="600" fill="#0f766e">upload_complete 事件 → IngestSink</text>
-  <text x="538" y="368" font-size="10" fill="#64748b">成品文件流式进内核（原生 ingest，省一跳 HTTP）</text>
-  <line x1="720" y1="380" x2="720" y2="392" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="520" y="310" width="400" height="46" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
+  <text x="538" y="330" font-size="12" font-weight="600" fill="#0f766e">upload_complete 事件 → IngestSink</text>
+  <text x="538" y="347" font-size="10" fill="#64748b">成品文件流式进内核（原生 ingest，省一跳 HTTP）</text>
+  <line x1="720" y1="356" x2="720" y2="368" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="520" y="396" width="400" height="52" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
-  <text x="538" y="418" font-size="12" font-weight="600" fill="#0f766e">put_object_stream（xl-store）</text>
-  <text x="538" y="436" font-size="10" fill="#64748b">与 S3 直传同一提交协议</text>
-  <line x1="720" y1="448" x2="720" y2="460" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="520" y="372" width="400" height="46" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
+  <text x="538" y="392" font-size="12" font-weight="600" fill="#0f766e">put_object_stream（xl-store）</text>
+  <text x="538" y="409" font-size="10" fill="#64748b">与 S3 直传同一提交协议 · 内部摄取不带 SSE（M5 记档）</text>
+  <line x1="720" y1="418" x2="720" y2="430" stroke="#94a3b8" marker-end="url(#a)"/>
 
-  <rect x="520" y="464" width="400" height="52" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
-  <text x="538" y="486" font-size="12" font-weight="600" fill="#0f766e">record_upload → uploads 表</text>
-  <text x="538" y="504" font-size="10" fill="#64748b">控制台「上传记录」可见（独立登记）</text>
-  <line x1="720" y1="516" x2="720" y2="552" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="520" y="434" width="400" height="46" rx="10" fill="#f0fdfa" stroke="#99f6e4"/>
+  <text x="538" y="454" font-size="12" font-weight="600" fill="#0f766e">record_upload → uploads 表</text>
+  <text x="538" y="471" font-size="10" fill="#64748b">控制台「上传记录」可见（独立登记）</text>
+  <line x1="720" y1="480" x2="720" y2="580" stroke="#94a3b8" marker-end="url(#a)"/>
 
   <!-- 提交协议 -->
-  <rect x="60" y="560" width="840" height="110" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
-  <text x="80" y="586" font-size="13" font-weight="600" fill="#166534">xl-store 提交协议（顺序不可变）</text>
-  <text x="80" y="610" font-size="10.5" fill="#374151">① .oss.sys/tmp/&lt;uuid&gt;/part.1 —— 边写边算 MD5 + SHA256 + size</text>
-  <text x="80" y="628" font-size="10.5" fill="#374151">② 候选 xl.meta 同写 tmp 目录</text>
-  <text x="80" y="646" font-size="10.5" fill="#374151">③ 同盘 rename → buckets/&lt;桶&gt;/&lt;对象&gt;/&lt;uuid&gt;/ —— 数据就位（仍不可见）</text>
-  <text x="520" y="610" font-size="10.5" font-weight="600" fill="#b45309">④ xl.meta.new + fsync → rename 覆盖 xl.meta ← 提交点</text>
-  <text x="520" y="628" font-size="10.5" fill="#374151">⑤ 旧版本目录 → .oss.sys/trash/</text>
-  <text x="520" y="646" font-size="10.5" fill="#374151">崩在 ③④ 之间 / ④ 之后 → 不可见残骸；读路径只信 xl.meta</text>
+  <rect x="60" y="588" width="860" height="112" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <text x="80" y="614" font-size="13" font-weight="600" fill="#166534">xl-store 提交协议（顺序不可变）</text>
+  <text x="80" y="638" font-size="10.5" fill="#374151">① .oss.sys/tmp/&lt;uuid&gt;/part.N.&lt;shard&gt; —— 边写边算 MD5 + SHA256（明文口径）+ 分片 CRC（密文）</text>
+  <text x="80" y="656" font-size="10.5" fill="#374151">② 候选 xl.meta 同写 tmp 目录（版本链 / 加密记录 / 锁记录）</text>
+  <text x="80" y="674" font-size="10.5" fill="#374151">③ 各盘 rename → 数据就位（仍不可见）</text>
+  <text x="530" y="638" font-size="10.5" font-weight="600" fill="#b45309">④ xl.meta.new + fsync → 逐盘转正 ← 提交点（两阶段提交 ≥ quorum）</text>
+  <text x="530" y="656" font-size="10.5" fill="#374151">⑤ 非版本桶：旧版本目录 → trash；版本桶：旧版本留在链上</text>
+  <text x="530" y="674" font-size="10.5" fill="#374151">崩溃只会留下不可见残骸；读路径只信 xl.meta</text>
 
-  <text x="60" y="696" font-size="10.5" fill="#94a3b8">M1：S3 面只有认证、没有授权 —— 任何有效 AK/SK 可访问所有桶（授权在 M4）</text>
-  <text x="60" y="716" font-size="10.5" fill="#94a3b8">浏览器链路：秒传索引 instant_index 带 TTL 兜底；成品在暂存盘合并后由 ingest 流式进内核（ReaderStream）</text>
+  <text x="60" y="724" font-size="10.5" fill="#94a3b8">加密顺序硬约束：先加密后 EC —— 单个分片流出（不足 quorum）不含明文信息；SSE-C 的钥只在内存（盘上仅存 key-MD5 校验值）</text>
+  <text x="60" y="744" font-size="10.5" fill="#94a3b8">浏览器链路：秒传索引 instant_index 带 TTL 兜底；成品在暂存盘合并后由 ingest 流式进内核（ReaderStream）</text>
 
-  <text x="930" y="748" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
+  <text x="930" y="768" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
 </svg>

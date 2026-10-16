@@ -392,6 +392,16 @@
 
 **边界**：对象锁**不阻止**读。Compliance 模式的保留**不可逆** —— 设置界面必须有明确的二次确认文案。
 
+**落地记录（M5 切片 4，2026-10-17）**：桶级开关语义按 AWS 修正——`PutObjectLockConfiguration`
+要求**版本控制已 Enabled**（否则 400 `InvalidBucketState`；建桶旗标
+`x-amz-bucket-object-lock-enabled` 会一并自动开版本控制），**Enabled 只能开不能关**
+（二次 Put 只许改默认保留规则）；本条原「只能在建桶时或未启用版本控制时开启」表述作废。
+`PutObjectLegalHold` / `GetObjectLegalHold` 已落地（`put` 须点名版本且桶已开锁——未开锁 400；`get` 为元数据面读，SSE-C 对象不要求客户钥，与 AWS 须带数据钥的差异记档）；**`Put/GetObjectRetention`
+未接线**（延后，见 M5 计划定稿记档）。拒绝规则均已落地：点名删版本 / 批量删 / 非版本化覆盖写
+回收一致判定（到期可删；COMPLIANCE 含管理员一律拒；GOVERNANCE 仅 bypass 头放行；
+Legal Hold ON 一律拒），拒删 = 403 `AccessDenied`。无版本号 DELETE 照打 delete marker
+（锁定版本天然留存）。控制台锁状态展示延后（S3 API 面完整）。
+
 ---
 
 ## 8. 服务端加密（SSE） —— `M5`
@@ -420,6 +430,15 @@
 - 元数据本身**不加密**（不含秘密；用户元数据里的敏感信息由用户自己负责 —— 写入文档）
 - 换主密钥（`key_id`）后旧对象仍可读（DEK 未变，只是包装主密钥变了）
 - KMS 不可达 → 拒写（`InternalError`），**不降级为不加密**
+
+**落地记录（M5 切片 1-3，2026-10-16/17）**：§8.2 的「nonce 由 `nonce_seed` + part 号派生」
+落为**块对齐单元号**派生（nonce = 种子‖BE32(单元号)，单元号把（EC 分片, 块）双射到密文单元，
+65520B 明文 → 65536B 密文，DARE 式；同 DEK 下 nonce 不重用这一目标不变，且 Range 读与
+分片级重编码天然成立）。§8.1 的「SSE-C 只存 HMAC」落为 **`base64(MD5(key))`**（AWS
+customer-key-MD5 同款）。§8.2 的「读 SSE-C 密钥不匹配 → `AccessDenied`」落为
+**400 `InvalidArgument`**（AWS 对 SSE-C 错钥即 4xx 客户端错，非 403；格式不符/缺头同 400）。
+SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥轮换编排未做）。
+桶级默认加密（`PutBucketEncryption`）未实现。aetherupload 内部摄取不带加密（明文入盘，记档）。
 
 ---
 

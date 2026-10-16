@@ -4,15 +4,21 @@
 
 ## 当前状态
 
-规划完成、代码未开工。**以 docs/ 为准**：
+M1–M4 已完成（v1.7.0，2026-10-15；扩展包 C1-C5 随 v1.8.0，2026-10-16）；**M5 安全与锁定
+进行中**——切片 0–4 已落地（集群行一致性广播 · 密钥库 · 加密数据面 DARE 式 · S3 面 SSE-S3/
+KMS/C · 对象锁），切片 5–7 剩余（STS · SK 加密存储 · WebIdentity + 收尾）。**以 docs/ 为准**：
 
-- `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1）
-- `docs/superpowers/specs/2026-10-10-feature-spec.md` —— 19 个功能域规格（行为/接口/边界/错误码）
-- `docs/superpowers/plans/2026-10-10-m1a-backend-slice.md` —— M1a 实现计划（16 个 task，含端到端验收脚本）
+- `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1；§8 含各阶段落地状态）
+- `docs/superpowers/specs/2026-10-10-feature-spec.md` —— 功能域规格（行为/接口/边界/错误码；M5 域含落地记录）
+- `docs/superpowers/plans/` —— 各里程碑实现计划与定稿记录（最新：`2026-10-16-m5-security-lock.md`）
+- `README.md` —— 运行 / 运维 / 验收 / 已知边界（对外口径的主入口）
 
-## 结构（按 M1a 计划）
+## 结构（五个 crate，单向依赖）
 
-`crates/xl-store`（存储内核，不依赖任何框架）→ `crates/xl-s3`（s3s 的 S3 trait 实现）→ `crates/oss-server`（e-cat 应用 + 控制台 API + aetherupload 接线）
+`crates/xl-store`（存储内核，不依赖任何框架：xl.meta 编解码 / EC 8+4 / quorum / 版本链 /
+加密与锁 / 密钥库）→ `crates/xl-s3`（s3s 的 S3 trait 实现）与 `crates/xl-client`（mesh 的
+tonic 实现，`crates/xl-proto` 为节点间 gRPC 协议）→ `crates/oss-server`（e-cat 应用 +
+控制台 API + aetherupload 接线）。
 
 ## 构建与测试
 
@@ -21,7 +27,13 @@ cargo check --workspace
 cargo test --workspace
 ```
 
+收敛口径「七闸」（提交前）：`cargo test -p xl-store --lib` · `-p xl-store --test kill9` ·
+`-p oss-server` · `-p xl-s3` · `-p xl-client -p xl-proto` · `cargo clippy --workspace
+--all-targets -- -D warnings` · `cargo fmt --all --check`。
+
 ## 注意
 
 - 依赖版本锁在 workspace `Cargo.toml`；axum 必须全仓唯一 0.8.x（ecat 与 aetherupload 都锚定它）
-- 执行 M1a 计划时按 task 顺序逐任务做，端到端验收脚本是 `tests/e2e_s3.sh`
+- **升级须整栈同版本**（分片 RPC 带分块字段）：不要滚动升级，先停后换或整栈重建
+- e2e：`tests/e2e_s3.sh`（需 aws-cli + rclone；`E2E_LONG=1` 门控长跑）、
+  `tests/e2e_m3_cluster.sh`（4 节点集群 + 混沌段）

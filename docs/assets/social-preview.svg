@@ -87,14 +87,14 @@
     <g>
     <rect x="736" y="384" width="232" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
     <rect x="748" y="400" width="5" height="42" rx="2.5" fill="#2dd4bf"/>
-    <text x="766" y="417" font-size="18" font-weight="600" fill="#0f172a">单盘直存（M1）</text>
-    <text x="766" y="439" font-size="12.5" fill="#64748b">single-disk storage (M1)</text>
+    <text x="766" y="417" font-size="18" font-weight="600" fill="#0f172a">纠删码 · 分布式</text>
+    <text x="766" y="439" font-size="12.5" fill="#64748b">erasure-coded · clustered</text>
   </g>
     <g>
     <rect x="988" y="384" width="232" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
     <rect x="1000" y="400" width="5" height="42" rx="2.5" fill="#4ade80"/>
-    <text x="1018" y="417" font-size="18" font-weight="600" fill="#0f172a">分块上传 · 秒传</text>
-    <text x="1018" y="439" font-size="12.5" fill="#64748b">chunked upload · instant</text>
+    <text x="1018" y="417" font-size="18" font-weight="600" fill="#0f172a">版本 · 加密 · 锁</text>
+    <text x="1018" y="439" font-size="12.5" fill="#64748b">versioning · SSE · object lock</text>
   </g>
 
   <text x="530" y="540" font-size="17" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">github.com/erikwang2013/oss</text>
