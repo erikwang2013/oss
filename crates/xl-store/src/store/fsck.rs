@@ -374,7 +374,7 @@ impl Store {
                     if idx == last_idx {
                         let _ = self.get_object(&bucket, &key).await;
                     } else {
-                        let _ = self.read_version_data(&bucket, &key, v, None).await;
+                        let _ = self.read_version_data(&bucket, &key, v, None, None).await;
                     }
                 }
             }

@@ -174,13 +174,72 @@ impl UnitCipher {
     }
 }
 
-/// 请求侧加密模式（切片 3 扩展 SSE-C 变体与请求参数）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SSE-C 客户端密钥（32B；只在请求内存里流转，**绝不落盘**）。校验值 = base64(MD5(key))——
+/// AWS 同款 `x-amz-server-side-encryption-customer-key-MD5`，meta 仅落该校验值。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SseCKey {
+    key: [u8; KEY_LEN],
+    md5_b64: String,
+}
+
+/// 手工 Debug：不打印钥字节（同 kms.rs 防泄露口径）。
+impl std::fmt::Debug for SseCKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseCKey")
+            .field("md5_b64", &self.md5_b64)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SseCKey {
+    /// 从 base64（标准含 padding）解 32B 客户钥；字符/长度非法 → `InvalidArgument`（S3 面 400）。
+    pub fn from_b64(b64: &str) -> Result<Self> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|_| Error::InvalidArgument("SSE-C key 不是合法 base64".into()))?;
+        let key: [u8; KEY_LEN] = raw.try_into().map_err(|v: Vec<u8>| {
+            Error::InvalidArgument(format!("SSE-C key 长度非法：{} 字节（应 32）", v.len()))
+        })?;
+        Ok(Self::from_key(key))
+    }
+
+    pub fn from_key(key: [u8; KEY_LEN]) -> Self {
+        use base64::Engine as _;
+        use md5::{Digest as _, Md5};
+        let md5_b64 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(key));
+        Self { key, md5_b64 }
+    }
+
+    /// 记录的校验值（base64(MD5(key))，24 字符）。
+    pub fn md5_b64(&self) -> &str {
+        &self.md5_b64
+    }
+
+    /// 请求随带的 `...-customer-key-MD5` 头（如有）必须与计算值一致（AWS 语义）。
+    pub fn check_md5_header(&self, given: &str) -> Result<()> {
+        if given.trim() != self.md5_b64 {
+            return Err(Error::InvalidArgument(
+                "SSE-C key 与 key-MD5 头不一致".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn key(&self) -> &[u8; KEY_LEN] {
+        &self.key
+    }
+}
+
+/// 请求侧加密模式（切片 3 落 SSE-C 变体）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncSpec {
     /// SSE-S3：文件主密钥 provider（key_id "file"）。
     SseS3,
     /// SSE-KMS（文件型实现）：多主密钥目录 provider（key_id "k<n>"）。
     SseKms,
+    /// SSE-C：客户端钥直接作单元 AEK（无信封；key_id "sse-c"）。
+    SseC(SseCKey),
 }
 
 /// 密钥 provider 组合（切片 3 的双 provider 路由面提前落定）：
@@ -203,6 +262,8 @@ impl EncState {
                 .as_deref()
                 .map(|p| p as &dyn KeyProvider)
                 .ok_or_else(|| Error::Crypto("SSE-KMS 未配置 KMS 目录 provider".into())),
+            // SSE-C 不经 provider（客户端钥直用）；for_write 已在更早分支处理
+            EncSpec::SseC(_) => Err(Error::Crypto("SSE-C 不经 provider 选路".into())),
         }
     }
 
@@ -281,7 +342,30 @@ fn hex_fixed<const N: usize>(s: &str, what: &str) -> Result<[u8; N]> {
 
 impl UnitCtx {
     /// 写侧：按 spec 选 provider → 新 DEK wrap 一次 → 新 seed → （上下文, meta 记录）。
-    pub async fn for_write(spec: EncSpec, state: &EncState) -> Result<(Self, EncryptionRecord)> {
+    pub async fn for_write(
+        spec: EncSpec,
+        state: Option<&EncState>,
+    ) -> Result<(Self, EncryptionRecord)> {
+        if let EncSpec::SseC(k) = spec {
+            let seed = new_seed();
+            let rec = EncryptionRecord {
+                algorithm: ALGO.to_string(),
+                key_id: "sse-c".to_string(),
+                wrapped_dek_hex: String::new(),
+                nonce_seed_hex: hex::encode(seed),
+                sse_c_key_md5: Some(k.md5_b64().to_string()),
+            };
+            return Ok((
+                Self {
+                    cipher: UnitCipher::new(k.key(), "sse-c"),
+                    seed,
+                    key_id: "sse-c".to_string(),
+                },
+                rec,
+            ));
+        }
+        let state =
+            state.ok_or_else(|| Error::Crypto("未配置加密（init_encryption 未调用）".into()))?;
         let provider = state.provider_for_spec(spec)?;
         let dek = kms::new_dek();
         let (wrapped, key_id) = provider.wrap_dek(&dek).await?;
@@ -291,6 +375,7 @@ impl UnitCtx {
             key_id: key_id.clone(),
             wrapped_dek_hex: hex::encode(&wrapped),
             nonce_seed_hex: hex::encode(seed),
+            sse_c_key_md5: None,
         };
         Ok((
             Self {
@@ -302,9 +387,14 @@ impl UnitCtx {
         ))
     }
 
-    /// 读侧：校验方案白名单 → 按 key_id 路由 provider → unwrap DEK → 上下文。
-    /// 未知 algorithm / 空 wrapped（SSE-C 预留形态）/ unwrap 失败 → fail-closed。
-    pub async fn for_read(rec: &EncryptionRecord, state: &EncState) -> Result<Self> {
+    /// 读侧：校验方案白名单 → SSE-C 记录走客户钥（**必校验 key-MD5**）/ 其余按 key_id 路由
+    /// provider unwrap DEK → 上下文。缺钥/错钥/非 SSE-C 对象携带钥 → `InvalidArgument`
+    /// （S3 面 400，AWS 语义）；记录形态非法 → fail-closed。
+    pub async fn for_read(
+        rec: &EncryptionRecord,
+        state: Option<&EncState>,
+        sse_c: Option<&SseCKey>,
+    ) -> Result<Self> {
         if rec.algorithm != ALGO {
             return Err(Error::CorruptMeta(format!(
                 "未知加密方案：{:?}（本版仅 {:?}）",
@@ -312,11 +402,37 @@ impl UnitCtx {
             )));
         }
         let seed = hex_fixed::<8>(&rec.nonce_seed_hex, "nonce_seed")?;
-        if rec.wrapped_dek_hex.is_empty() {
-            return Err(Error::Crypto(
-                "记录为 SSE-C 形态（wrapped 为空），本版不可解（切片 3 接线）".into(),
+        if rec.key_id == "sse-c" {
+            let k = sse_c.ok_or_else(|| {
+                Error::InvalidArgument(
+                    "SSE-C 对象需要客户端密钥（x-amz-server-side-encryption-customer-key）".into(),
+                )
+            })?;
+            match rec.sse_c_key_md5.as_deref() {
+                Some(exp) if exp == k.md5_b64() => {}
+                Some(_) => {
+                    return Err(Error::InvalidArgument(
+                        "SSE-C 密钥与对象记录的 key-MD5 不匹配".into(),
+                    ));
+                }
+                None => return Err(Error::CorruptMeta("SSE-C 记录缺 sse_c_key_md5".into())),
+            }
+            return Ok(Self {
+                cipher: UnitCipher::new(k.key(), "sse-c"),
+                seed,
+                key_id: "sse-c".to_string(),
+            });
+        }
+        if sse_c.is_some() {
+            return Err(Error::InvalidArgument(
+                "对象非 SSE-C 加密，不应携带客户端密钥".into(),
             ));
         }
+        if rec.wrapped_dek_hex.is_empty() {
+            return Err(Error::CorruptMeta("非 SSE-C 记录缺 wrapped_dek".into()));
+        }
+        let state =
+            state.ok_or_else(|| Error::Crypto("未配置加密（init_encryption 未调用）".into()))?;
         let wrapped = hex::decode(&rec.wrapped_dek_hex)
             .map_err(|e| Error::Crypto(format!("wrapped_dek 非 hex: {e}")))?;
         let provider = state.provider_for_key_id(&rec.key_id)?;
@@ -431,44 +547,107 @@ mod tests {
 
     #[test]
     fn read_path_validation_is_fail_closed() {
-        // 非法 hex / 长度 → CorruptMeta；空 wrapped → Crypto（SSE-C 预留形态）
-        let mk = |algo: &str, kid: &str, w: &str, s: &str| EncryptionRecord {
+        // 非法 hex / 长度 / 三态不一致 → CorruptMeta；路由/缺钥面 → fail-closed（Crypto/InvalidArgument）
+        let mk = |algo: &str, kid: &str, w: &str, s: &str, m: Option<&str>| EncryptionRecord {
             algorithm: algo.into(),
             key_id: kid.into(),
             wrapped_dek_hex: w.into(),
             nonce_seed_hex: s.into(),
+            sse_c_key_md5: m.map(str::to_string),
         };
-        let f = |rec: EncryptionRecord| {
+        let f = |rec: EncryptionRecord, k: Option<SseCKey>| {
             futures::executor::block_on(UnitCtx::for_read(
                 &rec,
-                &EncState {
+                Some(&EncState {
                     file: None,
                     kms: None,
-                },
+                }),
+                k.as_ref(),
             ))
         };
         assert!(matches!(
-            f(mk("AES-OTHER", "file", "", "00")),
+            f(mk("AES-OTHER", "file", "", "00", None), None),
             Err(Error::CorruptMeta(_))
         ));
         let good_seed = hex::encode([1u8; 8]);
+        // 切片 3 收紧：非 SSE-C 记录不得空 wrapped（切片 2 的「预留」形态已收编）
         assert!(matches!(
-            f(mk(ALGO, "file", "", &good_seed)),
+            f(mk(ALGO, "file", "", &good_seed, None), None),
+            Err(Error::CorruptMeta(_))
+        ));
+        assert!(matches!(
+            f(mk(ALGO, "file", "zz", &good_seed, None), None),
             Err(Error::Crypto(_))
         ));
         assert!(matches!(
-            f(mk(ALGO, "file", "zz", &good_seed)),
-            Err(Error::Crypto(_))
-        ));
-        assert!(matches!(
-            f(mk(ALGO, "file", "aabb", "nothex")),
+            f(mk(ALGO, "file", "aabb", "nothex", None), None),
             Err(Error::CorruptMeta(_))
         ));
         // 合法形态但 provider 未配置 → Crypto（路由面 fail-closed）
         let wrapped60 = hex::encode([0u8; 60]);
         assert!(matches!(
-            f(mk(ALGO, "file", &wrapped60, &good_seed)),
+            f(mk(ALGO, "file", &wrapped60, &good_seed, None), None),
             Err(Error::Crypto(_))
         ));
+
+        // —— SSE-C（R1）——
+        let k = SseCKey::from_key([5u8; KEY_LEN]);
+        let md5 = k.md5_b64().to_string();
+        // 钥在且 MD5 符 → Ok（无需任何 provider）
+        assert!(
+            f(
+                mk(ALGO, "sse-c", "", &good_seed, Some(&md5)),
+                Some(k.clone())
+            )
+            .is_ok()
+        );
+        // 缺钥 / 错钥 → InvalidArgument（400）
+        assert!(matches!(
+            f(mk(ALGO, "sse-c", "", &good_seed, Some(&md5)), None),
+            Err(Error::InvalidArgument(_))
+        ));
+        let wrong = SseCKey::from_key([6u8; KEY_LEN]);
+        assert!(matches!(
+            f(mk(ALGO, "sse-c", "", &good_seed, Some(&md5)), Some(wrong)),
+            Err(Error::InvalidArgument(_))
+        ));
+        // sse-c 记录缺 md5 → CorruptMeta；非 sse-c 对象携带钥 → InvalidArgument
+        assert!(matches!(
+            f(mk(ALGO, "sse-c", "", &good_seed, None), Some(k.clone())),
+            Err(Error::CorruptMeta(_))
+        ));
+        assert!(matches!(
+            f(mk(ALGO, "file", &wrapped60, &good_seed, None), Some(k)),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn sse_c_key_b64_and_md5_contract() {
+        let key = [9u8; KEY_LEN];
+        let k = SseCKey::from_key(key);
+        assert_eq!(k.md5_b64().len(), 24, "base64(MD5) 恒 24 字符");
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        let back = SseCKey::from_b64(&b64).unwrap();
+        assert_eq!(back.md5_b64(), k.md5_b64(), "base64 往返一致");
+        // key-MD5 头校验：符/不符
+        assert!(k.check_md5_header(k.md5_b64()).is_ok());
+        assert!(matches!(
+            k.check_md5_header("AAAAAAAAAAAAAAAAAAAAAAAA"),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 非法 base64 / 错长度 → InvalidArgument
+        assert!(matches!(
+            SseCKey::from_b64("not base64!!"),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            SseCKey::from_b64(&base64::engine::general_purpose::STANDARD.encode([0u8; 16])),
+            Err(Error::InvalidArgument(_))
+        ));
+        // Debug 不泄露钥字节
+        let d = format!("{k:?}");
+        assert!(d.contains("SseCKey") && !d.contains(&format!("{key:?}")));
     }
 }

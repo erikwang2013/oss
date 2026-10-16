@@ -614,7 +614,7 @@ impl Store {
                         "encryption requires ec.enabled（加密数据面需要 EC 管线）".into(),
                     ));
                 }
-                Some(crypto::UnitCtx::for_write(spec, self.enc_state()?).await?)
+                Some(crypto::UnitCtx::for_write(spec, self.maybe_enc_state()).await?)
             }
             None => None,
         };

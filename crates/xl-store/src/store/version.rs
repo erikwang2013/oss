@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{PartRef, Version, XlMeta};
 
+use super::read::check_read_sse_c;
 use super::{ObjectInfo, Store};
 
 /// [`Store::delete_object_versioned`] 的结果（S3 DeleteObject 响应字段来源）。
@@ -202,6 +203,18 @@ impl Store {
         key: &str,
         version_id: &str,
     ) -> Result<ObjectInfo> {
+        self.head_object_version_ext(bucket, key, version_id, None)
+            .await
+    }
+
+    /// 指定版本 HEAD（可带 SSE-C 客户钥；M5 切片 3——校验同 `check_read_sse_c`）。
+    pub async fn head_object_version_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<ObjectInfo> {
         self.ensure_bucket(bucket).await?;
         let m = self
             .read_meta(bucket, key)
@@ -213,6 +226,7 @@ impl Store {
         if v.delete_marker() {
             return Err(Error::DeleteMarker(format!("{bucket}/{key}@{version_id}")));
         }
+        check_read_sse_c(v, sse_c)?;
         Ok(version_info(key, v))
     }
 
@@ -222,6 +236,18 @@ impl Store {
         bucket: &str,
         key: &str,
         version_id: &str,
+    ) -> Result<(ObjectInfo, Bytes)> {
+        self.get_object_version_ext(bucket, key, version_id, None)
+            .await
+    }
+
+    /// 指定版本整读（可带 SSE-C 客户钥；M5 切片 3）。
+    pub async fn get_object_version_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        sse_c: Option<&crypto::SseCKey>,
     ) -> Result<(ObjectInfo, Bytes)> {
         self.ensure_bucket(bucket).await?;
         let m = self
@@ -234,8 +260,9 @@ impl Store {
         if v.delete_marker() {
             return Err(Error::DeleteMarker(format!("{bucket}/{key}@{version_id}")));
         }
+        check_read_sse_c(v, sse_c)?;
         let bytes = self
-            .read_version_data(bucket, key, v, None)
+            .read_version_data(bucket, key, v, None, sse_c)
             .await?
             .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
         Ok((version_info(key, v), bytes))
@@ -249,6 +276,19 @@ impl Store {
         version_id: &str,
         range: StdRange<u64>,
     ) -> Result<Bytes> {
+        self.get_object_range_version_ext(bucket, key, version_id, range, None)
+            .await
+    }
+
+    /// 指定版本区间读（可带 SSE-C 客户钥；M5 切片 3）。
+    pub async fn get_object_range_version_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        range: StdRange<u64>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<Bytes> {
         self.ensure_bucket(bucket).await?;
         let m = self
             .read_meta(bucket, key)
@@ -260,13 +300,14 @@ impl Store {
         if v.delete_marker() {
             return Err(Error::DeleteMarker(format!("{bucket}/{key}@{version_id}")));
         }
+        check_read_sse_c(v, sse_c)?;
         if range.start > range.end || range.end > v.size {
             return Err(Error::InvalidKey(format!(
                 "range {range:?} 越界（版本 {} 字节）",
                 v.size
             )));
         }
-        self.read_version_data(bucket, key, v, Some(range))
+        self.read_version_data(bucket, key, v, Some(range), sse_c)
             .await?
             .ok_or_else(|| Error::NoSuchKey(key.to_string()))
     }
@@ -279,6 +320,7 @@ impl Store {
         key: &str,
         v: &Version,
         range: Option<StdRange<u64>>,
+        sse_c: Option<&crypto::SseCKey>,
     ) -> Result<Option<Bytes>> {
         if let Some(inline) = &v.inline {
             // M5 切片 2：加密 inline 落盘态 = 密文 C = c_len(P)（B4 期望长度落点之一）
@@ -295,7 +337,7 @@ impl Store {
             let plain = match &v.encryption {
                 None => inline.bytes.clone(),
                 Some(rec) => {
-                    let ctx = crypto::UnitCtx::for_read(rec, self.enc_state()?).await?;
+                    let ctx = crypto::UnitCtx::for_read(rec, self.maybe_enc_state(), sse_c).await?;
                     crypto::open_all(&ctx, v.size, &inline.bytes)?
                 }
             };
@@ -307,7 +349,9 @@ impl Store {
         }
         if let Some(l) = &v.data_layout {
             // strict=true：版本点名读按 fail-closed 直报损坏（无整读重试语义）
-            return self.read_ec_range(bucket, key, v, l, range, true).await;
+            return self
+                .read_ec_range(bucket, key, v, l, range, true, sse_c)
+                .await;
         }
         // M5 切片 2：加密对象不会以旧 parts 形态落盘（写前 fail-closed）——见到即损坏/伪造（B4）
         if v.encryption.is_some() {

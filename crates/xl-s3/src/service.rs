@@ -17,6 +17,7 @@ use xl_store::meta::ChecksumRecord;
 use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
+use crate::sse::{parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec};
 
 pub struct OssS3 {
     store: Arc<Store>,
@@ -446,6 +447,17 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<PutObjectOutput>> {
         // 先于解构求值（只借 input）：解构会部分搬走 metadata 等字段
         let declared = declared_checksum(&req.input)?;
+        // M5 切片 3：SSE 头解析（R1/R2）；密钥对象随之进入 store（绝不落盘）
+        let sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            req.input
+                .server_side_encryption
+                .as_ref()
+                .map(|s| s.as_str()),
+            req.input.ssekms_key_id.as_deref(),
+        )?;
         let PutObjectInput {
             bucket,
             key,
@@ -499,7 +511,7 @@ impl S3 for OssS3 {
                 metadata.unwrap_or_default().into_iter().collect(),
                 checksum_record,
                 versioned,
-                None, // M5 切片 2：SSE 头映射归切片 3（本片仅数据面）
+                sse.spec, // M5 切片 3：SSE 头映射（R1/R2）
             )
             .await;
         let info = match result {
@@ -507,9 +519,16 @@ impl S3 for OssS3 {
             Err(e) => return Err(stream_err_to_s3(e, &exceeded, &body_err)),
         };
 
+        let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(info.etag)),
             version_id: info.version_id.clone(),
+            server_side_encryption: so
+                .server_side_encryption
+                .map(ServerSideEncryption::from_static),
+            ssekms_key_id: so.kms_key_id,
+            sse_customer_algorithm: so.sse_c_algorithm.map(str::to_string),
+            sse_customer_key_md5: so.sse_c_key_md5, // P2-a 复验补：PUT 响应回 key-MD5
             ..Default::default()
         }))
     }
@@ -518,6 +537,17 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        // M5 切片 3（R5）：SSE-C 只在暂存 meta 记 md5（钥绝不落盘）；其余模式在 complete 定。
+        let sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            req.input
+                .server_side_encryption
+                .as_ref()
+                .map(|s| s.as_str()),
+            req.input.ssekms_key_id.as_deref(),
+        )?;
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -527,18 +557,27 @@ impl S3 for OssS3 {
         } = req.input;
         let upload_id = self
             .store
-            .create_multipart_upload(
+            .create_multipart_upload_ext(
                 &bucket,
                 &key,
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
+                sse.sse_c_md5(),
+                sse.sse_kind(), // R5 扩展（P2-b）：SSE-S3/KMS 意图持久化，complete 落地
             )
             .await
             .map_err(to_s3_error)?;
+        let so = sse_out_from_spec(&sse);
         Ok(S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id),
+            server_side_encryption: so
+                .server_side_encryption
+                .map(ServerSideEncryption::from_static),
+            ssekms_key_id: so.kms_key_id,
+            sse_customer_algorithm: so.sse_c_algorithm.map(str::to_string),
+            sse_customer_key_md5: so.sse_c_key_md5,
             ..Default::default()
         }))
     }
@@ -547,6 +586,15 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        // M5 切片 3（R5）：UploadPart 携带的 SSE-C 只做一致性核对（md5 vs create 记录）；
+        // 该 DTO 无 server_side_encryption/ssekms_key_id 字段（AWS 调用惯例亦然）。
+        let sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            None,
+            None,
+        )?;
         let UploadPartInput {
             bucket,
             key,
@@ -572,14 +620,28 @@ impl S3 for OssS3 {
         let (stream, exceeded, body_err) = limit_stream(body, self.max_put_bytes);
         let etag = match self
             .store
-            .upload_part(&bucket, &key, &upload_id, part_number as u16, stream)
+            .upload_part_ext(
+                &bucket,
+                &key,
+                &upload_id,
+                part_number as u16,
+                stream,
+                sse.sse_c_md5(),
+            )
             .await
         {
             Ok(etag) => etag,
             Err(e) => return Err(stream_err_to_s3(e, &exceeded, &body_err)),
         };
+        let so = sse_out_from_spec(&sse);
         Ok(S3Response::new(UploadPartOutput {
             e_tag: Some(ETag::Strong(etag)),
+            server_side_encryption: so
+                .server_side_encryption
+                .map(ServerSideEncryption::from_static),
+            ssekms_key_id: so.kms_key_id,
+            sse_customer_algorithm: so.sse_c_algorithm.map(str::to_string),
+            sse_customer_key_md5: so.sse_c_key_md5, // P2-a 复验补
             ..Default::default()
         }))
     }
@@ -588,6 +650,16 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        // M5 切片 3（R5）：complete 的 SSE-C 决定最终加密（单流）且须与 create 同钥；
+        // 该 DTO 无 server_side_encryption/ssekms_key_id 字段（SSE-S3/KMS 由 create 头记档，
+        // complete 以 SSE-C md5 一致性为主——R5 记档）。
+        let sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            None,
+            None,
+        )?;
         let CompleteMultipartUploadInput {
             bucket,
             key,
@@ -615,16 +687,33 @@ impl S3 for OssS3 {
         let versioned = self.versioned(&bucket).await?;
         let info = self
             .store
-            .complete_multipart_upload_versioned(&bucket, &key, &upload_id, &pairs, versioned, None)
+            .complete_multipart_upload_versioned(
+                &bucket,
+                &key,
+                &upload_id,
+                &pairs,
+                versioned,
+                sse.spec.clone(),
+            )
             .await
             .map_err(to_s3_error)?;
-        Ok(S3Response::new(CompleteMultipartUploadOutput {
+        let so = sse_out(info.encryption.as_ref());
+        let mut resp = S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
             e_tag: Some(ETag::Strong(info.etag)),
             version_id: info.version_id.clone(),
+            server_side_encryption: so
+                .server_side_encryption
+                .map(ServerSideEncryption::from_static),
+            ssekms_key_id: so.kms_key_id,
             ..Default::default()
-        }))
+        });
+        // CompleteMultipartUploadOutput 无 SSE-C 字段 → 头补 algorithm + key-MD5
+        if let Some(md5) = so.sse_c_key_md5 {
+            resp.headers = sse_c_headers(&md5);
+        }
+        Ok(resp)
     }
 
     async fn abort_multipart_upload(
@@ -677,12 +766,28 @@ impl S3 for OssS3 {
         let bucket = req.input.bucket;
         let key = req.input.key;
         let version_id = req.input.version_id.clone();
+        // M5 切片 3：SSE-C 读钥（GET 只有 customer 三件套；服务端校验在 store 读路径）
+        let sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            None,
+            None,
+        )?;
 
         // 条件求值需要 info：统一先取一次 head（Range 分支本来也要 size）；条件失败不读盘上数据。
         // M4：带 versionId 时点读该版本（marker 版本 → 405 DeleteMarker，经 to_s3_error）。
         let info = match &version_id {
-            Some(v) => self.store.head_object_version(&bucket, &key, v).await,
-            None => self.store.head_object(&bucket, &key).await,
+            Some(v) => {
+                self.store
+                    .head_object_version_ext(&bucket, &key, v, sse.key.as_ref())
+                    .await
+            }
+            None => {
+                self.store
+                    .head_object_ext(&bucket, &key, sse.key.as_ref())
+                    .await
+            }
         }
         .map_err(to_s3_error)?;
         if let Err(status) = eval_preconditions(
@@ -711,8 +816,16 @@ impl S3 for OssS3 {
                 let bytes = if start == 0 && end == info.size {
                     // 显式全段 Range：仍回 206（S3 语义），数据走整读
                     match &version_id {
-                        Some(v) => self.store.get_object_version(&bucket, &key, v).await,
-                        None => self.store.get_object(&bucket, &key).await,
+                        Some(v) => {
+                            self.store
+                                .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
+                                .await
+                        }
+                        None => {
+                            self.store
+                                .get_object_ext(&bucket, &key, sse.key.as_ref())
+                                .await
+                        }
                     }
                     .map_err(to_s3_error)?
                     .1
@@ -720,10 +833,20 @@ impl S3 for OssS3 {
                     match &version_id {
                         Some(v) => {
                             self.store
-                                .get_object_range_version(&bucket, &key, v, start..end)
+                                .get_object_range_version_ext(
+                                    &bucket,
+                                    &key,
+                                    v,
+                                    start..end,
+                                    sse.key.as_ref(),
+                                )
                                 .await
                         }
-                        None => self.store.get_object_range(&bucket, &key, start..end).await,
+                        None => {
+                            self.store
+                                .get_object_range_ext(&bucket, &key, start..end, sse.key.as_ref())
+                                .await
+                        }
                     }
                     .map_err(to_s3_error)?
                 };
@@ -733,8 +856,16 @@ impl S3 for OssS3 {
             }
             None => {
                 let bytes = match &version_id {
-                    Some(v) => self.store.get_object_version(&bucket, &key, v).await,
-                    None => self.store.get_object(&bucket, &key).await,
+                    Some(v) => {
+                        self.store
+                            .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
+                            .await
+                    }
+                    None => {
+                        self.store
+                            .get_object_ext(&bucket, &key, sse.key.as_ref())
+                            .await
+                    }
                 }
                 .map_err(to_s3_error)?
                 .1;
@@ -790,7 +921,18 @@ impl S3 for OssS3 {
             apply_checksum_get(&mut out, rec);
         }
 
-        Ok(S3Response::with_status(out, status))
+        // M5 切片 3（R6）：SSE 响应头（S3/KMS 走字段；SSE-C 的 key-MD5 走 headers 补）
+        let so = sse_out(info.encryption.as_ref());
+        out.server_side_encryption = so
+            .server_side_encryption
+            .map(ServerSideEncryption::from_static);
+        out.ssekms_key_id = so.kms_key_id;
+        out.sse_customer_algorithm = so.sse_c_algorithm.map(str::to_string);
+        let mut resp = S3Response::with_status(out, status);
+        if let Some(md5) = so.sse_c_key_md5 {
+            resp.headers = sse_c_key_md5_header(&md5);
+        }
+        Ok(resp)
     }
 
     async fn head_object(
@@ -798,15 +940,23 @@ impl S3 for OssS3 {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let version_id = req.input.version_id.clone();
+        // M5 切片 3：SSE-C 校验（HEAD 不解密，只对记录校 key-MD5——由 store 读路径执行）
+        let sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            None,
+            None,
+        )?;
         let info = match &version_id {
             Some(v) => {
                 self.store
-                    .head_object_version(&req.input.bucket, &req.input.key, v)
+                    .head_object_version_ext(&req.input.bucket, &req.input.key, v, sse.key.as_ref())
                     .await
             }
             None => {
                 self.store
-                    .head_object(&req.input.bucket, &req.input.key)
+                    .head_object_ext(&req.input.bucket, &req.input.key, sse.key.as_ref())
                     .await
             }
         }
@@ -840,7 +990,18 @@ impl S3 for OssS3 {
         if let Some(rec) = &info.checksum {
             apply_checksum_head(&mut out, rec);
         }
-        Ok(S3Response::new(out))
+        // M5 切片 3（R6）：SSE 响应头（同 GET）
+        let so = sse_out(info.encryption.as_ref());
+        out.server_side_encryption = so
+            .server_side_encryption
+            .map(ServerSideEncryption::from_static);
+        out.ssekms_key_id = so.kms_key_id;
+        out.sse_customer_algorithm = so.sse_c_algorithm.map(str::to_string);
+        let mut resp = S3Response::new(out);
+        if let Some(md5) = so.sse_c_key_md5 {
+            resp.headers = sse_c_key_md5_header(&md5);
+        }
+        Ok(resp)
     }
 
     async fn delete_object(
@@ -1217,16 +1378,36 @@ impl S3 for OssS3 {
             ));
         }
 
+        // M5 切片 3（R4）：源钥（copy-source-sse-c*，源为 SSE-C 必带否则 store 读必拒）
+        // 与目标 SSE（sse_customer_*/server_side_encryption；未给 = 明文目标——AWS 无桶默认时同义）
+        let src_sse = parse_sse(
+            req.input.copy_source_sse_customer_algorithm.as_deref(),
+            req.input.copy_source_sse_customer_key.as_deref(),
+            req.input.copy_source_sse_customer_key_md5.as_deref(),
+            None,
+            None,
+        )?;
+        let dst_sse = parse_sse(
+            req.input.sse_customer_algorithm.as_deref(),
+            req.input.sse_customer_key.as_deref(),
+            req.input.sse_customer_key_md5.as_deref(),
+            req.input
+                .server_side_encryption
+                .as_ref()
+                .map(|s| s.as_str()),
+            req.input.ssekms_key_id.as_deref(),
+        )?;
+
         // 源：点名版本（回滚路径）或最新
         let (src_info, bytes) = match version_id.as_deref() {
             Some(vid) => self
                 .store
-                .get_object_version(bucket, key, vid)
+                .get_object_version_ext(bucket, key, vid, src_sse.key.as_ref())
                 .await
                 .map_err(to_s3_error)?,
             None => self
                 .store
-                .get_object(bucket, key)
+                .get_object_ext(bucket, key, src_sse.key.as_ref())
                 .await
                 .map_err(to_s3_error)?,
         };
@@ -1242,11 +1423,12 @@ impl S3 for OssS3 {
                 src_info.user_metadata,
                 None,
                 dst_versioned,
-                None, // M5：copy 的 SSE 语义（随源/桶默认）切片 3 定夺（复评 S3）
+                dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
             )
             .await
             .map_err(to_s3_error)?;
 
+        let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(CopyObjectOutput {
             version_id: info.version_id.clone(),
             copy_object_result: Some(CopyObjectResult {
@@ -1255,6 +1437,12 @@ impl S3 for OssS3 {
                 last_modified: Some(last_modified(info.last_modified_nanos)),
                 ..Default::default()
             }),
+            server_side_encryption: so
+                .server_side_encryption
+                .map(ServerSideEncryption::from_static),
+            ssekms_key_id: so.kms_key_id,
+            sse_customer_algorithm: so.sse_c_algorithm.map(str::to_string),
+            sse_customer_key_md5: so.sse_c_key_md5,
             ..Default::default()
         }))
     }

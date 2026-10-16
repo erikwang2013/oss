@@ -371,11 +371,11 @@ impl Store {
             .map_err(|_| Error::Encode("加密已初始化（init_encryption 不可重复）".into()))
     }
 
-    /// 已初始化的加密状态（未启用 → `Crypto` fail-closed；写读路径统一经此取 provider）。
-    pub(in crate::store) fn enc_state(&self) -> Result<&crypto::EncState> {
-        self.encryption
-            .get()
-            .ok_or_else(|| Error::Crypto("未配置加密（init_encryption 未调用）".into()))
+    /// 加密状态（未启用 = None）。**所有**写读路径经此取 provider——SSE-C 分支不需要
+    /// provider（`for_write/for_read` 只在 S3/KMS 分支对 None fail-closed），若在此直接
+    /// 报错会把「未接线」误伤为 SSE-C 不可用（切片 3 实测踩过）。
+    pub(in crate::store) fn maybe_enc_state(&self) -> Option<&crypto::EncState> {
+        self.encryption.get()
     }
 
     pub fn root(&self) -> &Path {

@@ -34,6 +34,14 @@ struct MpuMeta {
     #[serde(default)]
     user_metadata: BTreeMap<String, String>,
     created_nanos: i64,
+    /// M5 切片 3（R5）：SSE-C 上传的 base64(MD5(key)) 校验值（create 时记；**钥本身绝不落盘**）。
+    /// create/UploadPart/Complete 三处必须携带同一把钥（md5 一致），否则 400。
+    #[serde(default)]
+    sse_c_md5: Option<String>,
+    /// M5 切片 3（R5 扩展，P2-b）：create 携带的 SSE-S3/KMS 意图（"sse-s3"/"sse-kms"）。
+    /// AWS 语义下该头只出现在 create——complete 必须据此**落地加密**，不得静默降级为明文。
+    #[serde(default)]
+    sse_kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +77,21 @@ impl Store {
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
     ) -> Result<String> {
+        self.create_multipart_upload_ext(bucket, key, content_type, user_metadata, None, None)
+            .await
+    }
+
+    /// 创建 MPU（可带 SSE-C 记录 + SSE-S3/KMS 意图；M5 切片 3/R5——只记 md5 与 kind，
+    /// 密钥绝不落盘；kind 在 complete 落地）。
+    pub async fn create_multipart_upload_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<String>,
+        user_metadata: BTreeMap<String, String>,
+        sse_c_md5: Option<&str>,
+        sse_kind: Option<&str>,
+    ) -> Result<String> {
         layout::validate_key(key)?;
         // 桶窗口（M2b-2 Task 10，同单段 PUT）：ensure + 对象目录先落
         let obj_dir = {
@@ -86,6 +109,8 @@ impl Store {
             content_type,
             user_metadata,
             created_nanos: now_nanos(),
+            sse_c_md5: sse_c_md5.map(str::to_string),
+            sse_kind: sse_kind.map(str::to_string),
         };
         let bytes = rmp_serde::to_vec_named(&meta).map_err(|e| Error::Encode(e.to_string()))?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -106,7 +131,22 @@ impl Store {
         key: &str,
         upload_id: &str,
         part_number: u16,
+        body: ByteStream,
+    ) -> Result<String> {
+        self.upload_part_ext(bucket, key, upload_id, part_number, body, None)
+            .await
+    }
+
+    /// 上传一个 part（可带 SSE-C 校验；M5 切片 3/R5）：create 记了 md5 则本 part 必带同钥
+    /// （md5 一致）；未记则不得携带。分片暂存仍明文（D8），实际加密在 complete 单流。
+    pub async fn upload_part_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u16,
         mut body: ByteStream,
+        sse_c_md5: Option<&str>,
     ) -> Result<String> {
         if !(1..=MAX_PARTS).contains(&part_number) {
             return Err(Error::InvalidPart(format!(
@@ -115,8 +155,28 @@ impl Store {
         }
         self.ensure_bucket(bucket).await?;
         let dir = self.mpu_dir(bucket, key, upload_id)?;
-        if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
-            return Err(Error::NoSuchUpload(upload_id.to_string()));
+        // R5：读暂存 meta（存在性 + SSE-C 一致性一次完成）
+        let mpu: MpuMeta = match tokio::fs::read(dir.join(MPU_META_FILE)).await {
+            Ok(b) => rmp_serde::from_slice(&b)
+                .map_err(|e| Error::CorruptMeta(format!("mpu.meta 解码失败: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NoSuchUpload(upload_id.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match (mpu.sse_c_md5.as_deref(), sse_c_md5) {
+            (Some(exp), Some(got)) if exp == got => {}
+            (Some(_), _) => {
+                return Err(Error::InvalidArgument(
+                    "SSE-C 上传需携带创建 MPU 时的同一密钥（md5 不符或缺失）".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::InvalidArgument(
+                    "该 MPU 未以 SSE-C 创建，不应携带客户端密钥".into(),
+                ));
+            }
+            (None, None) => {}
         }
 
         // 半截文件防护：先写 part.N.new，流完整落盘后 rename 覆盖 part.N
@@ -206,26 +266,75 @@ impl Store {
         };
         let _guard = self.lock_object(bucket, key).await?;
 
-        // M5 切片 2：加密上下文（起点；wrap 一次/对象）。ec.enabled=false → 写前 fail-closed。
-        let enc_ctx = match encryption {
-            Some(spec) => {
-                if !self.cfg.ec.enabled {
-                    return Err(Error::Encode(
-                        "encryption requires ec.enabled（加密数据面需要 EC 管线）".into(),
-                    ));
-                }
-                Some(crypto::UnitCtx::for_write(spec, self.enc_state()?).await?)
-            }
-            None => None,
-        };
-        let enc_record = enc_ctx.as_ref().map(|(_, r)| r.clone());
-
         let dir = self.mpu_dir(bucket, key, upload_id)?;
         if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
         }
         let mpu: MpuMeta = rmp_serde::from_slice(&tokio::fs::read(dir.join(MPU_META_FILE)).await?)
             .map_err(|e| Error::CorruptMeta(format!("mpu.meta 解码失败: {e}")))?;
+
+        // R5：SSE-C 一致性（create ↔ complete 双向）——create 记了 md5 则 complete 必带同钥；
+        // create 未记则不得携带客户端密钥（AWS 语义：SSE-C 参数须全程一致）。
+        match (mpu.sse_c_md5.as_deref(), &encryption) {
+            (Some(exp), Some(crypto::EncSpec::SseC(k))) if k.md5_b64() == exp => {}
+            (Some(_), _) => {
+                return Err(Error::InvalidArgument(
+                    "complete 需携带创建 MPU 时的 SSE-C 密钥".into(),
+                ));
+            }
+            (None, Some(crypto::EncSpec::SseC(_))) => {
+                return Err(Error::InvalidArgument(
+                    "该 MPU 未以 SSE-C 创建，complete 不应携带客户端密钥".into(),
+                ));
+            }
+            (None, _) => {}
+        }
+
+        // R5 扩展（P2-b 复验补）：create 记录的 SSE-S3/KMS 意图在 complete **落地**——AWS 语义下
+        // 该头只出现在 create；不落地则「create 回 AES256、对象实为明文」= 静默降级。
+        let effective_enc: Option<crypto::EncSpec> =
+            match (encryption.as_ref(), mpu.sse_kind.as_deref()) {
+                (None, None) => None,
+                (None, Some("sse-s3")) => Some(crypto::EncSpec::SseS3),
+                (None, Some("sse-kms")) => Some(crypto::EncSpec::SseKms),
+                (None, Some(other)) => {
+                    return Err(Error::CorruptMeta(format!(
+                        "mpu.meta sse_kind 非法：{other:?}"
+                    )));
+                }
+                (Some(crypto::EncSpec::SseC(_)), None) => encryption.clone(),
+                (Some(crypto::EncSpec::SseC(_)), Some(_)) => {
+                    return Err(Error::InvalidArgument(
+                        "create 已带 SSE-S3/KMS 头，complete 不得携带 SSE-C".into(),
+                    ));
+                }
+                (Some(crypto::EncSpec::SseS3), Some("sse-s3"))
+                | (Some(crypto::EncSpec::SseKms), Some("sse-kms")) => encryption.clone(),
+                (Some(crypto::EncSpec::SseS3 | crypto::EncSpec::SseKms), None) => {
+                    return Err(Error::InvalidArgument(
+                        "create 未声明 SSE-S3/KMS，complete 不应携带该模式".into(),
+                    ));
+                }
+                (Some(crypto::EncSpec::SseS3 | crypto::EncSpec::SseKms), Some(_)) => {
+                    return Err(Error::InvalidArgument(
+                        "create 与 complete 的 SSE 模式不一致".into(),
+                    ));
+                }
+            };
+
+        // M5 切片 2/3：加密上下文（wrap 一次/对象）。ec.enabled=false → 写前 fail-closed。
+        let enc_ctx = match &effective_enc {
+            Some(spec) => {
+                if !self.cfg.ec.enabled {
+                    return Err(Error::Encode(
+                        "encryption requires ec.enabled（加密数据面需要 EC 管线）".into(),
+                    ));
+                }
+                Some(crypto::UnitCtx::for_write(spec.clone(), self.maybe_enc_state()).await?)
+            }
+            None => None,
+        };
+        let enc_record = enc_ctx.as_ref().map(|(_, r)| r.clone());
 
         if parts.is_empty() {
             return Err(Error::InvalidPart("parts 为空".into()));

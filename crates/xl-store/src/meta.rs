@@ -146,10 +146,14 @@ pub struct EncryptionRecord {
     pub algorithm: String,
     /// 主密钥 id（`"file"` = 单钥文件；`"k<n>"` = KMS 目录；SSE-C 预留）。
     pub key_id: String,
-    /// 信封 wrap 的 DEK（60B hex = nonce‖ct‖tag）；SSE-C（切片 3）允许空串。
+    /// 信封 wrap 的 DEK（60B hex = nonce‖ct‖tag）；SSE-C 恒空串（钥在客户端，绝不落盘）。
     pub wrapped_dek_hex: String,
     /// 每存储流 8B 随机 nonce seed（hex 16 字符）；单元 u 的 nonce = seed ‖ BE32(u)。
     pub nonce_seed_hex: String,
+    /// M5 切片 3（SSE-C）：base64(MD5(客户钥))——AWS 同款 key-MD5 校验值（24 字符）。
+    /// `key_id="sse-c"` 时必在、其余恒无（decode 强制三态一致，见下方校验）。
+    #[serde(default)]
+    pub sse_c_key_md5: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -205,7 +209,9 @@ impl XlMeta {
                     inline.bytes.len()
                 )));
             }
-            // M5 切片 2：加密记录白名单校验（信任边界；存量对象无此字段 = 明文，零回归）
+            // M5 切片 2/3：加密记录白名单校验（信任边界；存量对象无此字段 = 明文，零回归）。
+            // 三态一致性（切片 3）：key_id="sse-c" ⟺ wrapped 空 ⟺ sse_c_key_md5 在；其余形态 ⟺
+            // wrapped 120hex ⟺ sse_c_key_md5 无（切片 2 的「空 wrapped 预留」形态在 SSE-C 定义后收编）。
             if let Some(enc) = &v.encryption {
                 if enc.algorithm != crate::crypto::ALGO {
                     return Err(Error::CorruptMeta(format!(
@@ -216,17 +222,36 @@ impl XlMeta {
                 let kid_ok = !enc.key_id.is_empty()
                     && enc.key_id.len() <= 64
                     && enc.key_id.bytes().all(|b| (0x20..=0x7e).contains(&b));
-                let wrapped_ok = enc.wrapped_dek_hex.is_empty()
-                    || (enc.wrapped_dek_hex.len() == 120
-                        && enc.wrapped_dek_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+                let is_ssec = enc.key_id == "sse-c";
+                let wrapped_ok = if is_ssec {
+                    enc.wrapped_dek_hex.is_empty()
+                } else {
+                    enc.wrapped_dek_hex.len() == 120
+                        && enc.wrapped_dek_hex.bytes().all(|b| b.is_ascii_hexdigit())
+                };
+                let md5_ok = match &enc.sse_c_key_md5 {
+                    Some(m) if is_ssec => {
+                        m.len() == 24
+                            && m.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+                            })
+                    }
+                    None if !is_ssec => true,
+                    _ => false,
+                };
                 let seed_ok = enc.nonce_seed_hex.len() == 16
                     && enc.nonce_seed_hex.bytes().all(|b| b.is_ascii_hexdigit());
-                if !kid_ok || !wrapped_ok || !seed_ok {
+                if !kid_ok || !wrapped_ok || !seed_ok || !md5_ok {
                     return Err(Error::CorruptMeta(format!(
-                        "加密记录字段非法：key_id={:?} wrapped_len={} seed_len={}",
+                        "加密记录字段非法：key_id={:?} wrapped_len={} seed_len={} sse_c_md5={}",
                         enc.key_id,
                         enc.wrapped_dek_hex.len(),
-                        enc.nonce_seed_hex.len()
+                        enc.nonce_seed_hex.len(),
+                        if enc.sse_c_key_md5.is_some() {
+                            "set"
+                        } else {
+                            "-"
+                        },
                     )));
                 }
             }

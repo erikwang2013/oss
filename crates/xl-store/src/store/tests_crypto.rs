@@ -54,7 +54,7 @@ fn shard_paths(d: &std::path::Path, key: &str, uuid: &str) -> Vec<std::path::Pat
 
 /// 独立重建密文流 C（确定性：SEAL 只依赖 DEK/seed/单元号）。
 async fn rebuild_c(s: &Store, rec: &meta::EncryptionRecord, plain: &[u8]) -> Vec<u8> {
-    let ctx = crypto::UnitCtx::for_read(rec, s.enc_state().unwrap())
+    let ctx = crypto::UnitCtx::for_read(rec, s.maybe_enc_state(), None)
         .await
         .unwrap();
     crypto::seal_all(&ctx, plain).unwrap()
@@ -84,6 +84,379 @@ fn expected_shards_via_ec(c: &[u8], geo: &crypto::Geometry, blocks: u64) -> Vec<
         }
     }
     out
+}
+
+// ---------- 切片 3：SSE-C ----------
+
+#[tokio::test]
+async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
+    // SSE-C 不需要任何 provider（客户端钥直用）——纯 store()
+    let (s, d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let key = crypto::SseCKey::from_key([11u8; 32]);
+    let wrong = crypto::SseCKey::from_key([12u8; 32]);
+    let body = payload(300_000);
+    let info = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(body.clone()),
+            None,
+            Default::default(),
+            None,
+            false,
+            Some(EncSpec::SseC(key.clone())),
+        )
+        .await
+        .unwrap();
+    let rec = info.encryption.as_ref().unwrap();
+    assert_eq!(rec.key_id, "sse-c");
+    assert!(rec.wrapped_dek_hex.is_empty(), "SSE-C 无 wrapped");
+    assert_eq!(rec.sse_c_key_md5.as_deref(), Some(key.md5_b64()));
+
+    // 带钥整读 / Range ✓
+    let (_, got) = s.get_object_ext("alpha", "k", Some(&key)).await.unwrap();
+    assert_eq!(got, body);
+    let r = s
+        .get_object_range_ext("alpha", "k", 65_500..65_540, Some(&key))
+        .await
+        .unwrap();
+    assert_eq!(&r[..], &body[65_500..65_540]);
+
+    // 缺钥 / 错钥 → InvalidArgument（400）；HEAD 同口径
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        s.get_object_ext("alpha", "k", Some(&wrong)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(s.head_object_ext("alpha", "k", Some(&key)).await.is_ok());
+    assert!(matches!(
+        s.head_object_ext("alpha", "k", None).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // 非 SSE-C 对象 + 客户钥 → 拒（AWS 语义）
+    s.put_object("alpha", "p", payload(1000), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.head_object_ext("alpha", "p", Some(&key)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        s.get_object_ext("alpha", "p", Some(&key)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // inline 加密（< 128KiB）+ 内联 Range
+    let small = payload(100_000);
+    s.put_object_stream_with_meta(
+        "alpha",
+        "i",
+        stream_of(small.clone()),
+        None,
+        Default::default(),
+        None,
+        false,
+        Some(EncSpec::SseC(key.clone())),
+    )
+    .await
+    .unwrap();
+    let (_, g) = s.get_object_ext("alpha", "i", Some(&key)).await.unwrap();
+    assert_eq!(g, small);
+    let ri = s
+        .get_object_range_ext("alpha", "i", 65_510..65_530, Some(&key))
+        .await
+        .unwrap();
+    assert_eq!(&ri[..], &small[65_510..65_530]);
+    // inline 的 meta 文件无明文窗（SSE-C 同口径）
+    let mb = tokio::fs::read(meta_path(d.path(), "i")).await.unwrap();
+    assert!(!contains_window(&mb, &small[..16]));
+
+    // 盘上分片 = 客户端钥下的密文（换钥写不出同字节）
+    let m = s.read_meta("alpha", "k").await.unwrap().unwrap();
+    let paths = shard_paths(d.path(), "k", &m.latest().unwrap().part.uuid);
+    let b0 = tokio::fs::read(&paths[0]).await.unwrap();
+    assert!(!contains_window(&b0, &body[..16]));
+
+    // 版本链：v1 SSE-C，明文 v2 覆盖后 v1 仍可带钥点名读
+    let v1 = payload(200_000);
+    let info1 = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "v",
+            stream_of(v1.clone()),
+            None,
+            Default::default(),
+            None,
+            true,
+            Some(EncSpec::SseC(key.clone())),
+        )
+        .await
+        .unwrap();
+    let id1 = info1.version_id.clone().unwrap();
+    s.put_object_stream_with_meta(
+        "alpha",
+        "v",
+        stream_of(payload(300_001)),
+        None,
+        Default::default(),
+        None,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let (_, g1) = s
+        .get_object_version_ext("alpha", "v", &id1, Some(&key))
+        .await
+        .unwrap();
+    assert_eq!(g1, v1);
+    assert!(matches!(
+        s.get_object_version("alpha", "v", &id1).await,
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[tokio::test]
+async fn sse_c_mpu_consistency() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let k1 = crypto::SseCKey::from_key([21u8; 32]);
+    let k2 = crypto::SseCKey::from_key([22u8; 32]);
+    let p1 = payload(5 * 1024 * 1024 + 1);
+    let p2 = payload(300_000);
+
+    // create 带 SSE-C：upload 缺钥/错钥 → 拒；同钥 ✓
+    let up = s
+        .create_multipart_upload_ext(
+            "alpha",
+            "k",
+            None,
+            Default::default(),
+            Some(k1.md5_b64()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.upload_part_ext("alpha", "k", &up, 1, stream_of(p1.clone()), None)
+            .await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        s.upload_part_ext(
+            "alpha",
+            "k",
+            &up,
+            1,
+            stream_of(p1.clone()),
+            Some(k2.md5_b64())
+        )
+        .await,
+        Err(Error::InvalidArgument(_))
+    ));
+    let e1 = s
+        .upload_part_ext(
+            "alpha",
+            "k",
+            &up,
+            1,
+            stream_of(p1.clone()),
+            Some(k1.md5_b64()),
+        )
+        .await
+        .unwrap();
+    let e2 = s
+        .upload_part_ext(
+            "alpha",
+            "k",
+            &up,
+            2,
+            stream_of(p2.clone()),
+            Some(k1.md5_b64()),
+        )
+        .await
+        .unwrap();
+
+    // complete：缺钥/错钥 → 拒；同钥 ✓ → 读回（带钥）
+    assert!(matches!(
+        s.complete_multipart_upload_versioned(
+            "alpha",
+            "k",
+            &up,
+            &[(1, e1.clone()), (2, e2.clone())],
+            false,
+            None
+        )
+        .await,
+        Err(Error::InvalidArgument(_))
+    ));
+    let r_wrong = s
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "k",
+            &up,
+            &[(1, e1.clone()), (2, e2.clone())],
+            false,
+            Some(EncSpec::SseC(k2.clone())),
+        )
+        .await;
+    assert!(
+        matches!(r_wrong, Err(Error::InvalidArgument(_))),
+        "错钥 complete 应 InvalidArgument，实得 {r_wrong:?}"
+    );
+    let info = s
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "k",
+            &up,
+            &[(1, e1), (2, e2)],
+            false,
+            Some(EncSpec::SseC(k1.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.encryption.as_ref().unwrap().key_id, "sse-c");
+    let concat: Vec<u8> = p1.iter().chain(p2.iter()).copied().collect();
+    let (_, got) = s.get_object_ext("alpha", "k", Some(&k1)).await.unwrap();
+    assert_eq!(&got[..], &concat[..]);
+
+    // create 无 SSE-C + complete 带 → 拒（双向）；upload 带钥同样拒（(None,Some) 分支，P3-c）
+    let up2 = s
+        .create_multipart_upload("alpha", "k2", None, Default::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.upload_part_ext(
+            "alpha",
+            "k2",
+            &up2,
+            1,
+            stream_of(payload(5 * 1024 * 1024 + 1)),
+            Some(k1.md5_b64())
+        )
+        .await,
+        Err(Error::InvalidArgument(_))
+    ));
+    let e = s
+        .upload_part(
+            "alpha",
+            "k2",
+            &up2,
+            1,
+            stream_of(payload(5 * 1024 * 1024 + 1)),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.complete_multipart_upload_versioned(
+            "alpha",
+            "k2",
+            &up2,
+            &[(1, e)],
+            false,
+            Some(EncSpec::SseC(k1.clone()))
+        )
+        .await,
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[tokio::test]
+async fn mpu_create_sse_kind_lands_at_complete() {
+    // P2-b 复验补：create 带的 SSE-S3/KMS 头必须持久化并在 complete 落地（否则静默降级为明文）
+    let (s, d) = enc_store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let p1 = payload(5 * 1024 * 1024 + 1);
+    let p2 = payload(300_000);
+    let concat: Vec<u8> = p1.iter().chain(p2.iter()).copied().collect();
+
+    // (a) sse-s3 意图 → complete 未带任何 SSE → 对象落 SSE-S3（key_id "file"）
+    let up = s
+        .create_multipart_upload_ext("alpha", "a", None, Default::default(), None, Some("sse-s3"))
+        .await
+        .unwrap();
+    let e1 = s
+        .upload_part("alpha", "a", &up, 1, stream_of(p1.clone()))
+        .await
+        .unwrap();
+    let e2 = s
+        .upload_part("alpha", "a", &up, 2, stream_of(p2.clone()))
+        .await
+        .unwrap();
+    let info = s
+        .complete_multipart_upload_versioned("alpha", "a", &up, &[(1, e1), (2, e2)], false, None)
+        .await
+        .unwrap();
+    let rec = info
+        .encryption
+        .as_ref()
+        .expect("create 的 SSE-S3 意图须在 complete 落地");
+    assert_eq!(rec.key_id, "file");
+    let (_, got) = s.get_object("alpha", "a").await.unwrap();
+    assert_eq!(&got[..], &concat[..]);
+    // 盘上无明文窗
+    let m = s.read_meta("alpha", "a").await.unwrap().unwrap();
+    let b0 = tokio::fs::read(&shard_paths(d.path(), "a", &m.latest().unwrap().part.uuid)[0])
+        .await
+        .unwrap();
+    assert!(!contains_window(&b0, &p1[..16]));
+
+    // (b) sse-kms 意图 → key_id "k<n>"
+    let up2 = s
+        .create_multipart_upload_ext(
+            "alpha",
+            "b",
+            None,
+            Default::default(),
+            None,
+            Some("sse-kms"),
+        )
+        .await
+        .unwrap();
+    let e1 = s
+        .upload_part("alpha", "b", &up2, 1, stream_of(p1.clone()))
+        .await
+        .unwrap();
+    let e2 = s
+        .upload_part("alpha", "b", &up2, 2, stream_of(p2.clone()))
+        .await
+        .unwrap();
+    let info = s
+        .complete_multipart_upload_versioned("alpha", "b", &up2, &[(1, e1), (2, e2)], false, None)
+        .await
+        .unwrap();
+    assert!(info.encryption.as_ref().unwrap().key_id.starts_with('k'));
+
+    // (c) 模式不一致：create sse-s3 + complete 带 SSE-C → 400
+    let up3 = s
+        .create_multipart_upload_ext("alpha", "c", None, Default::default(), None, Some("sse-s3"))
+        .await
+        .unwrap();
+    let e1 = s
+        .upload_part("alpha", "c", &up3, 1, stream_of(p1.clone()))
+        .await
+        .unwrap();
+    let k = crypto::SseCKey::from_key([31u8; 32]);
+    let e = s
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "c",
+            &up3,
+            &[(1, e1)],
+            false,
+            Some(EncSpec::SseC(k)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::InvalidArgument(_)),
+        "模式不一致应 400：{e:?}"
+    );
 }
 
 fn contains_window(hay: &[u8], needle: &[u8]) -> bool {
@@ -416,7 +789,7 @@ async fn mpu_complete_encrypted_roundtrip() {
     let p1 = payload(5 * 1024 * 1024 + 123);
     let p2 = payload(300_000);
     let upload = s
-        .create_multipart_upload("alpha", "k", None, Default::default())
+        .create_multipart_upload_ext("alpha", "k", None, Default::default(), None, Some("sse-s3"))
         .await
         .unwrap();
     let e1 = s
@@ -433,6 +806,7 @@ async fn mpu_complete_encrypted_roundtrip() {
     assert_eq!(&st1[..], &p1[..], "暂存 part.1 应为明文（提交前不可见）");
     let st2 = tokio::fs::read(staging.join("part.2")).await.unwrap();
     assert_eq!(&st2[..], &p2[..], "暂存 part.2 应为明文");
+    // create 已声明 sse-s3（R5 扩展）：complete 不带参数即落地加密
     let info = s
         .complete_multipart_upload_versioned(
             "alpha",
@@ -440,7 +814,7 @@ async fn mpu_complete_encrypted_roundtrip() {
             &upload,
             &[(1, e1), (2, e2)],
             false,
-            Some(EncSpec::SseS3),
+            None,
         )
         .await
         .unwrap();
@@ -696,7 +1070,7 @@ async fn init_gate_and_idempotence() {
 
 #[tokio::test]
 async fn decode_rejects_bad_encryption_records() {
-    let mk = |algo: &str, kid: &str, wrapped: &str, seed: &str| {
+    let mk = |algo: &str, kid: &str, wrapped: &str, seed: &str, md5: Option<&str>| {
         let mut m = XlMeta {
             object_key: "k".into(),
             versions: vec![meta::Version::default()],
@@ -707,22 +1081,56 @@ async fn decode_rejects_bad_encryption_records() {
             key_id: kid.into(),
             wrapped_dek_hex: wrapped.into(),
             nonce_seed_hex: seed.into(),
+            sse_c_key_md5: md5.map(str::to_string),
         });
         m
     };
     let good_seed = hex::encode([1u8; 8]);
     let good_wrapped = hex::encode([0u8; 60]);
-    // 合法（含 SSE-C 预留：空 wrapped）→ 往返
-    let ok = mk(crypto::ALGO, "file", &good_wrapped, &good_seed);
+    let good_md5 = crypto::SseCKey::from_key([3u8; 32]).md5_b64().to_string();
+    // 合法：服务端形态 与 SSE-C 形态（三态一致）各一 → 往返
+    let ok = mk(crypto::ALGO, "file", &good_wrapped, &good_seed, None);
     assert_eq!(XlMeta::decode(&ok.encode().unwrap()).unwrap(), ok);
-    let ok_c = mk(crypto::ALGO, "file", "", &good_seed);
+    let ok_c = mk(crypto::ALGO, "sse-c", "", &good_seed, Some(&good_md5));
     assert_eq!(XlMeta::decode(&ok_c.encode().unwrap()).unwrap(), ok_c);
-    // 非法：算法 / wrapped 长度 / seed 长度 / key_id 控制字符
+    // 非法：算法 / wrapped 长度 / seed 长度 / key_id 控制字符 / 三态不一致（切片 3 收紧）
     for bad in [
-        mk("AES256-GCM", "file", &good_wrapped, &good_seed),
-        mk(crypto::ALGO, "file", &hex::encode([0u8; 59]), &good_seed),
-        mk(crypto::ALGO, "file", &good_wrapped, &hex::encode([1u8; 7])),
-        mk(crypto::ALGO, "bad\nid", &good_wrapped, &good_seed),
+        mk("AES256-GCM", "file", &good_wrapped, &good_seed, None),
+        mk(
+            crypto::ALGO,
+            "file",
+            &hex::encode([0u8; 59]),
+            &good_seed,
+            None,
+        ),
+        mk(
+            crypto::ALGO,
+            "file",
+            &good_wrapped,
+            &hex::encode([1u8; 7]),
+            None,
+        ),
+        mk(crypto::ALGO, "bad\nid", &good_wrapped, &good_seed, None),
+        // file + 空 wrapped（切片 2 的「预留」形态已收编）
+        mk(crypto::ALGO, "file", "", &good_seed, None),
+        // sse-c + 非空 wrapped
+        mk(
+            crypto::ALGO,
+            "sse-c",
+            &good_wrapped,
+            &good_seed,
+            Some(&good_md5),
+        ),
+        // sse-c 缺 md5
+        mk(crypto::ALGO, "sse-c", "", &good_seed, None),
+        // file 带 md5
+        mk(
+            crypto::ALGO,
+            "file",
+            &good_wrapped,
+            &good_seed,
+            Some(&good_md5),
+        ),
     ] {
         assert!(
             matches!(
@@ -733,10 +1141,10 @@ async fn decode_rejects_bad_encryption_records() {
         );
     }
 
-    // 读侧：SSE-C 预留形态（空 wrapped）落盘 → read 必拒 Crypto
+    // 读侧：SSE-C 记录（空 wrapped + md5）落盘 → 不带钥 read 必拒 InvalidArgument（400）
     let (s, d) = enc_store().await;
     s.create_bucket("alpha").await.unwrap();
-    let mut m = mk(crypto::ALGO, "file", "", &good_seed);
+    let mut m = mk(crypto::ALGO, "sse-c", "", &good_seed, Some(&good_md5));
     let v = &mut m.versions[0];
     v.size = 10;
     v.inline = Some(meta::InlineData {
@@ -756,12 +1164,12 @@ async fn decode_rejects_bad_encryption_records() {
         .unwrap();
     let e = s.get_object("alpha", "k").await.unwrap_err();
     assert!(
-        matches!(e, Error::Crypto(_)),
-        "空 wrapped 读应 Crypto：{e:?}"
+        matches!(e, Error::InvalidArgument(_)),
+        "SSE-C 记录无钥读应 InvalidArgument：{e:?}"
     );
 
     // 非法记录落盘 → 解码即拒（read_meta）
-    let mut bad = mk("AES256-GCM", "file", &good_wrapped, &good_seed);
+    let mut bad = mk("AES256-GCM", "file", &good_wrapped, &good_seed, None);
     bad.object_key = "b".into();
     let v = &mut bad.versions[0];
     v.part = meta::PartRef {

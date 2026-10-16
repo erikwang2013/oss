@@ -1523,3 +1523,291 @@ async fn head_with_range_still_returns_full_length() {
         "HEAD+Range 仍回全量长度"
     );
 }
+
+// ---------- M5 切片 3：SSE 线级（P3-c 复验补——P2-a 类接线错此前无闸能抓） ----------
+
+/// 加密接线版 service（保留 store 句柄以 init_encryption；SSE-C 用例不需要 provider）。
+async fn service_enc() -> (OssS3, Arc<Store>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let sys = xl_store::layout::sys_dir(dir.path(), "");
+    store
+        .init_encryption(Some(sys.join("master.key")), Some(sys.join("kms")))
+        .await
+        .unwrap();
+    (
+        OssS3::new(store.clone(), acl().await, 16 * 1024 * 1024),
+        store,
+        dir,
+    )
+}
+
+#[tokio::test]
+async fn sse_c_wire_roundtrip_and_headers() {
+    use base64::Engine as _;
+    let (s3, _store, _d) = service_enc().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let key = [7u8; 32];
+    let k = xl_store::crypto::SseCKey::from_key(key);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+    let md5 = k.md5_b64().to_string();
+
+    // PUT 带 SSE-C：响应回 algorithm + key-MD5（P2-a 钉死）
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "c".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"hello-sse-c",
+            ))),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.sse_customer_algorithm.as_deref(), Some("AES256"));
+    assert_eq!(
+        out.sse_customer_key_md5.as_deref(),
+        Some(md5.as_str()),
+        "PUT 响应须回 key-MD5（P2-a）"
+    );
+    assert!(out.server_side_encryption.is_none(), "SSE-C 不回 SSE 头");
+
+    // GET 带钥：algorithm 字段 + key-MD5 响应头（R6 with_headers 补）
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "c".into(),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(g.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+    assert!(g.output.server_side_encryption.is_none());
+    assert_eq!(
+        g.headers
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .unwrap(),
+        md5.as_str()
+    );
+
+    // GET 缺钥 → 400 InvalidArgument
+    let e = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "c".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        &s3s::S3ErrorCode::InvalidArgument,
+        "缺钥应 400：{e:?}"
+    );
+
+    // PUT 错 md5 头 → 400
+    let e = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "c2".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some("AAAAAAAAAAAAAAAAAAAAAAAA".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        &s3s::S3ErrorCode::InvalidArgument,
+        "错 md5 头应 400：{e:?}"
+    );
+
+    // HEAD 带钥 ✓ / 缺钥 400
+    let h = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "c".into(),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(h.output.content_length, Some(11));
+    let e = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "c".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidArgument);
+
+    // MPU 全链（P2-a 同族：create/upload/complete 的 SSE-C 字段与头）
+    let co = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "m".into(),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(co.sse_customer_key_md5.as_deref(), Some(md5.as_str()));
+    let upload_id = co.upload_id.unwrap();
+    let part = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "alpha".into(),
+            key: "m".into(),
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from(vec![
+                1u8;
+                5 * 1024 * 1024
+                    + 1
+            ]))),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        part.sse_customer_key_md5.as_deref(),
+        Some(md5.as_str()),
+        "UploadPart 响应须回 key-MD5（P2-a）"
+    );
+    let done = s3
+        .complete_multipart_upload(req(CompleteMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "m".into(),
+            upload_id,
+            multipart_upload: Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(ETag::Strong(
+                        part.e_tag.as_ref().unwrap().value().to_string(),
+                    )),
+                    ..Default::default()
+                }]),
+            }),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    // CompleteMultipartUploadOutput 无 SSE-C 字段 → 双头补齐
+    assert_eq!(
+        done.headers
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .unwrap(),
+        "AES256"
+    );
+    assert_eq!(
+        done.headers
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .unwrap(),
+        md5.as_str()
+    );
+}
+
+#[tokio::test]
+async fn sse_s3_wire_headers_and_kms_cmk_rejected() {
+    let (s3, _store, _d) = service_enc().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // SSE-S3：PUT/GET 回 AES256
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "e".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"hello-sse-s3",
+            ))),
+            server_side_encryption: Some(ServerSideEncryption::from_static("AES256")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        out.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "e".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        g.output.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+    assert!(g.output.sse_customer_algorithm.is_none());
+    // SSE-KMS：回 aws:kms + key_id（k<n>）
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"hello-sse-kms",
+            ))),
+            server_side_encryption: Some(ServerSideEncryption::from_static("aws:kms")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        out.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("aws:kms")
+    );
+    assert!(out.ssekms_key_id.as_deref().unwrap_or("").starts_with('k'));
+    // 显式 CMK → 400（R2）
+    let e = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "ck".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            server_side_encryption: Some(ServerSideEncryption::from_static("aws:kms")),
+            ssekms_key_id: Some("arn:aws:kms:cmk".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        &s3s::S3ErrorCode::InvalidRequest,
+        "显式 CMK 应 400：{e:?}"
+    );
+}

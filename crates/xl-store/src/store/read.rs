@@ -12,6 +12,34 @@ use crate::meta::{self, Version, XlMeta};
 
 use super::{ObjectInfo, Store, drives, ec};
 
+/// M5 切片 3（R1/R6）：读面前置校验——SSE-C 记录必带客户钥且 key-MD5 符；非 SSE-C 记录
+/// 不得携带客户钥（否则 400，AWS 语义）。HEAD/GET/版本点名读共用（不解密，仅元数据校验）。
+pub(in crate::store) fn check_read_sse_c(
+    v: &Version,
+    sse_c: Option<&crypto::SseCKey>,
+) -> Result<()> {
+    match (&v.encryption, sse_c) {
+        (Some(rec), _) if rec.key_id == "sse-c" => {
+            let k = sse_c.ok_or_else(|| {
+                Error::InvalidArgument(
+                    "SSE-C 对象需要客户端密钥（x-amz-server-side-encryption-customer-key）".into(),
+                )
+            })?;
+            match rec.sse_c_key_md5.as_deref() {
+                Some(exp) if exp == k.md5_b64() => Ok(()),
+                Some(_) => Err(Error::InvalidArgument(
+                    "SSE-C 密钥与对象记录的 key-MD5 不匹配".into(),
+                )),
+                None => Err(Error::CorruptMeta("SSE-C 记录缺 sse_c_key_md5".into())),
+            }
+        }
+        (_, Some(_)) => Err(Error::InvalidArgument(
+            "对象非 SSE-C 加密，不应携带客户端密钥".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl Store {
     pub(in crate::store) fn load_object_info(
         &self,
@@ -36,6 +64,17 @@ impl Store {
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
+        self.head_object_ext(bucket, key, None).await
+    }
+
+    /// HEAD（可带 SSE-C 客户钥；M5 切片 3）：SSE-C 对象必须携带**同一把**钥（校验 key-MD5，
+    /// 不解密——HEAD 只回元数据）；非 SSE-C 对象携带钥 → 400（AWS 语义）。
+    pub async fn head_object_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<ObjectInfo> {
         self.ensure_bucket(bucket).await?;
         let m = self
             .read_meta(bucket, key)
@@ -45,6 +84,9 @@ impl Store {
         // v1 从简只回状态码——记档边界）
         if m.latest_is_marker() {
             return Err(Error::NoSuchKey(key.to_string()));
+        }
+        if let Some(v) = m.latest() {
+            check_read_sse_c(v, sse_c)?;
         }
         self.load_object_info(bucket, key, &m)
     }
@@ -56,6 +98,16 @@ impl Store {
     /// meta 拿新版本再试；两轮都读不到 = 对象确实不在（或被并发删除）→ NoSuchKey。
     /// ponytail: 固定重试一次；持续覆写风暴下不保证收敛（M2 快照读解决）。
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectInfo, Bytes)> {
+        self.get_object_ext(bucket, key, None).await
+    }
+
+    /// 读对象（可带 SSE-C 客户钥；M5 切片 3）。旧签名委托 None，零 churn。
+    pub async fn get_object_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, Bytes)> {
         self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
@@ -74,6 +126,7 @@ impl Store {
             if v.delete_marker() {
                 return Err(Error::NoSuchKey(key.to_string()));
             }
+            check_read_sse_c(v, sse_c)?;
             let info = self.load_object_info(bucket, key, &m)?;
 
             // 形态分派：内联 → EC 布局 → 旧 parts/part
@@ -92,7 +145,8 @@ impl Store {
                 let bytes = match &v.encryption {
                     None => inline.bytes.clone(),
                     Some(rec) => {
-                        let ctx = crypto::UnitCtx::for_read(rec, self.enc_state()?).await?;
+                        let ctx =
+                            crypto::UnitCtx::for_read(rec, self.maybe_enc_state(), sse_c).await?;
                         crypto::open_all(&ctx, v.size, &inline.bytes)?
                     }
                 };
@@ -100,7 +154,7 @@ impl Store {
             }
             if let Some(l) = &v.data_layout {
                 match self
-                    .read_ec_range(bucket, key, v, l, None, round > 0)
+                    .read_ec_range(bucket, key, v, l, None, round > 0, sse_c)
                     .await?
                 {
                     Some(bytes) => return Ok((info, bytes)),
@@ -150,6 +204,17 @@ impl Store {
         key: &str,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes> {
+        self.get_object_range_ext(bucket, key, range, None).await
+    }
+
+    /// 有界读（可带 SSE-C 客户钥；M5 切片 3）。旧签名委托 None，零 churn。
+    pub async fn get_object_range_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: std::ops::Range<u64>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<Bytes> {
         self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
@@ -168,6 +233,7 @@ impl Store {
             if v.delete_marker() {
                 return Err(Error::NoSuchKey(key.to_string()));
             }
+            check_read_sse_c(v, sse_c)?;
 
             if range.start > range.end || range.end > v.size {
                 return Err(Error::InvalidKey(format!(
@@ -192,7 +258,8 @@ impl Store {
                 let plain = match &v.encryption {
                     None => inline.bytes.clone(),
                     Some(rec) => {
-                        let ctx = crypto::UnitCtx::for_read(rec, self.enc_state()?).await?;
+                        let ctx =
+                            crypto::UnitCtx::for_read(rec, self.maybe_enc_state(), sse_c).await?;
                         crypto::open_all(&ctx, v.size, &inline.bytes)?
                     }
                 };
@@ -202,7 +269,7 @@ impl Store {
             }
             if let Some(l) = &v.data_layout {
                 match self
-                    .read_ec_range(bucket, key, v, l, Some(range.clone()), round > 0)
+                    .read_ec_range(bucket, key, v, l, Some(range.clone()), round > 0, sse_c)
                     .await?
                 {
                     Some(bytes) => return Ok(bytes),
@@ -414,6 +481,7 @@ impl Store {
     ///
     /// 整读做 SHA256 终验 + 读时修（按「片」整片回写，见 `repair_shards_chunked`）；
     /// 区间读只经逐块对偶校验、不做修复（修复归整读/`heal`）。
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::store) async fn read_ec_range(
         &self,
         bucket: &str,
@@ -422,6 +490,7 @@ impl Store {
         l: &meta::DataLayout,
         range: Option<std::ops::Range<u64>>,
         strict: bool,
+        sse_c: Option<&crypto::SseCKey>,
     ) -> Result<Option<Bytes>> {
         // M4 切片 8：桶所属 set（一次解析、本对象读全线透传）
         let set = self.set_of_bucket(bucket).await?;
@@ -439,9 +508,9 @@ impl Store {
                 l.shards.len()
             )));
         }
-        // M5 切片 2：加密读上下文（一次/读调用，N6 口径）——几何按明文长单源换算
+        // M5 切片 2/3：加密读上下文（一次/读调用，N6 口径）——几何按明文长单源换算
         let enc = match &v.encryption {
-            Some(rec) => Some(crypto::UnitCtx::for_read(rec, self.enc_state()?).await?),
+            Some(rec) => Some(crypto::UnitCtx::for_read(rec, self.maybe_enc_state(), sse_c).await?),
             None => None,
         };
         let geo = match enc {
