@@ -29,11 +29,23 @@ const AR_DEFAULT: i64 = 3600;
 
 pub struct StsRoute {
     pool: SqlitePool,
+    /// M5 切片 6（T5 校正）：SK 加密库——签发会话的 SK 与 console 同口径封存入库
+    /// （`issue` 是 `access_keys` 的**第二个写点**，切片 6 核查轮补齐）。
+    vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
 }
 
 impl StsRoute {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, vault: None }
+    }
+
+    /// M5 切片 6：接 SK 加密库（builder 风格；router 装配处调用）。
+    pub fn with_vault(
+        mut self,
+        vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
+    ) -> Self {
+        self.vault = vault;
+        self
     }
 
     /// AssumeRole（S6）：角色 = 用户别名（ARN `arn:...:iam::<acct>:role/<name>`）；
@@ -70,8 +82,15 @@ impl StsRoute {
         let dur = duration(fields, "DurationSeconds", AR_DEFAULT, AR_MIN, AR_MAX)?;
         let policy = session_policy(fields)?;
         let session_name = field(fields, "RoleSessionName").unwrap_or_else(|| "session".into());
-        let (ak, sk, token) =
-            issue(&self.pool, role_uid, caller_ak, dur, policy.as_deref()).await?;
+        let (ak, sk, token) = issue(
+            &self.pool,
+            self.vault.as_deref(),
+            role_uid,
+            caller_ak,
+            dur,
+            policy.as_deref(),
+        )
+        .await?;
         let expires = now_secs() + dur;
         let account = "oss"; // 单租户简化（S6）：acct 段不校验，回显固定
         let body = format!(
@@ -110,7 +129,8 @@ impl StsRoute {
             .await?
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
         let dur = duration(fields, "DurationSeconds", GST_DEFAULT, GST_MIN, GST_MAX)?;
-        let (ak, sk, token) = issue(&self.pool, uid, caller_ak, dur, None).await?;
+        let (ak, sk, token) =
+            issue(&self.pool, self.vault.as_deref(), uid, caller_ak, dur, None).await?;
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <GetSessionTokenResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
@@ -187,6 +207,7 @@ impl S3Route for StsRoute {
 /// 落一行会话（S1：AK `ASIA`+32hex / SK 32B hex / token 不落库）。
 async fn issue(
     pool: &SqlitePool,
+    vault: Option<&crate::skvault::SecretVault>,
     uid: i64,
     parent_ak: &str,
     dur_secs: i64,
@@ -199,6 +220,14 @@ async fn issue(
     let ak = format!("ASIA{}", hex16().map_err(rng)?);
     let sk = hex32().map_err(rng)?;
     let token = hex32().map_err(rng)?;
+    // M5 切片 6：库启用时封存入库（响应仍回明文一次——SDK 只在此刻拿到 SK）
+    let stored = match vault {
+        Some(v) => v.seal(&sk).await.map_err(|e| {
+            tracing::error!(error = %e, "会话 SK 加密失败——拒绝签发（fail-closed）");
+            s3s::s3_error!(InternalError, "internal error")
+        })?,
+        None => sk.clone(),
+    };
     let now = now_secs();
     sqlx::query(
         "INSERT INTO access_keys \
@@ -206,7 +235,7 @@ async fn issue(
          VALUES (?, ?, ?, 'active', ?, ?, ?, ?, 'session')",
     )
     .bind(&ak)
-    .bind(&sk)
+    .bind(&stored)
     .bind(uid)
     .bind(now + dur_secs)
     .bind(now)
@@ -521,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn issue_lands_resolvable_session_row() {
         let pool = sts_db().await;
-        let (ak, _sk, token) = issue(&pool, 2, "AKIA_SUB", 900, None).await.unwrap();
+        let (ak, _sk, token) = issue(&pool, None, 2, "AKIA_SUB", 900, None).await.unwrap();
         assert!(ak.starts_with("ASIA"));
         assert_eq!(token.len(), 64);
         let (uid, kind, parent, exp): (i64, String, String, i64) = sqlx::query_as(
@@ -561,7 +590,7 @@ mod tests {
             Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
         ));
         // 会话键不得作为调用者（kind 条件）
-        let (sak, _, _) = issue(&pool, 1, "AKIA_ROOT", 900, None).await.unwrap();
+        let (sak, _, _) = issue(&pool, None, 1, "AKIA_ROOT", 900, None).await.unwrap();
         assert!(matches!(
             route.assume_role(&sak, &f).await,
             Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
@@ -637,5 +666,40 @@ mod tests {
                 .unwrap();
         assert_eq!(kind, "session");
         assert_eq!(parent, "AKIA_ROOT");
+    }
+    /// M5 切片 6：库启用时会话 SK **封存入库**（响应回明文一次；DB 行非明文；认证面可解）。
+    #[tokio::test]
+    async fn issue_seals_sk_when_vault_present() {
+        let pool = sts_db().await;
+        let td = tempfile::tempdir().unwrap();
+        let p = xl_store::kms::FileKeyProvider::open_or_init(&td.path().join("m.key"))
+            .await
+            .unwrap();
+        let vault = std::sync::Arc::new(
+            crate::skvault::SecretVault::from_enc_state(Some(&xl_store::crypto::EncState {
+                file: Some(std::sync::Arc::new(p)),
+                kms: None,
+            }))
+            .unwrap(),
+        );
+        let (ak, sk, _) = issue(&pool, Some(&vault), 2, "AKIA_SUB", 900, None)
+            .await
+            .unwrap();
+        // 返回值是明文（SDK 只在此刻拿到）；DB 行是封存
+        assert!(!xl_store::kms::is_sealed(&sk), "响应 SK 应为明文：{sk}");
+        let stored: String =
+            sqlx::query_scalar("SELECT secret_key FROM access_keys WHERE access_key = ?")
+                .bind(&ak)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(xl_store::kms::is_sealed(&stored), "{stored}");
+        assert_eq!(
+            vault.open(&stored).await.unwrap().as_deref(),
+            Some(sk.as_str())
+        );
+        // 端到端：认证面（带库）解出同一 SK
+        let auth = crate::auth::SigV4Auth::new(pool.clone()).with_vault(Some(vault));
+        assert_eq!(auth.get_secret_key(&ak).await.unwrap().expose(), sk);
     }
 }

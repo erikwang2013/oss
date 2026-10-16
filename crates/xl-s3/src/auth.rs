@@ -11,16 +11,91 @@ pub struct SigV4Auth {
     pool: SqlitePool,
     /// 集群控制面扇出（Task 9；None = 单节点：本地查无即拒）
     mesh: Option<crate::access::ControlMesh>,
+    /// M5 切片 6：SK 加密库（None = 未启用=明文直存；T2/T3）。扇出路径携带**封存字节**
+    /// （mesh 上不出现明文 SK），消费端（本处）统一解密。
+    vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
 }
 
 impl SigV4Auth {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool, mesh: None }
+        Self {
+            pool,
+            mesh: None,
+            vault: None,
+        }
     }
 
     /// 集群形态（Task 9）：本地查无此 AK → 扇出 peers（节点 B 签的 AK，节点 A 也认）。
     pub fn with_mesh(pool: SqlitePool, mesh: Option<crate::access::ControlMesh>) -> Self {
-        Self { pool, mesh }
+        Self {
+            pool,
+            mesh,
+            vault: None,
+        }
+    }
+
+    /// M5 切片 6：接 SK 加密库（builder 风格；router 装配处调用）。
+    pub fn with_vault(
+        mut self,
+        vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
+    ) -> Self {
+        self.vault = vault;
+        self
+    }
+
+    /// SK 归解（T3/T4）：未启用库 → 明文直读（`enc:v1:` 行则 500 fail-closed）；
+    /// 启用库 → 封存行解密 / 明文行**透明重写**（仅本地行，`local=true`；best-effort 不阻断）。
+    async fn resolve_sk(&self, access_key: &str, raw: String, local: bool) -> S3Result<String> {
+        let Some(v) = &self.vault else {
+            if xl_store::kms::is_sealed(&raw) {
+                tracing::error!(access_key, "SK 为密文但未配置密钥库（env 缺失？）——拒认证");
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "internal error",
+                ));
+            }
+            return Ok(raw);
+        };
+        match v.open(&raw).await {
+            Ok(Some(plain)) => Ok(plain),
+            Ok(None) => {
+                if local {
+                    match v.seal(&raw).await {
+                        Ok(sealed) => {
+                            // guarded（防并发读互覆）：只把「读到的这一版」换成密文
+                            match sqlx::query(
+                                "UPDATE access_keys SET secret_key = ? \
+                                 WHERE access_key = ? AND secret_key = ?",
+                            )
+                            .bind(&sealed)
+                            .bind(access_key)
+                            .bind(&raw)
+                            .execute(&self.pool)
+                            .await
+                            {
+                                // guarded no-op（并发已由他者转正）静默；真失败 warn
+                                Ok(r) if r.rows_affected() > 0 => {
+                                    tracing::info!(access_key, "SK 透明重写为密文（存量迁移）")
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, access_key, "SK 透明重写失败（下轮再试）")
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, access_key, "SK 加密失败（保持明文）"),
+                    }
+                }
+                Ok(raw)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, access_key, "SK 解密失败（丢钥/篡改/域不符？）——拒认证");
+                Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "internal error",
+                ))
+            }
+        }
     }
 }
 
@@ -59,10 +134,11 @@ impl S3Auth for SigV4Auth {
         })?;
 
         if let Some(r) = row {
-            return Ok(SecretKey::from(sqlx::Row::get::<String, _>(
-                &r,
-                "secret_key",
-            )));
+            let raw = sqlx::Row::get::<String, _>(&r, "secret_key");
+            return self
+                .resolve_sk(access_key, raw, true)
+                .await
+                .map(SecretKey::from);
         }
         // S3 错误面（spec §0.2）：会话行在册但已过期 → ExpiredToken（仅 kind='session'；
         // 长时键维持 InvalidAccessKeyId——「负例锁死错误码」的既有测试扩面而非破坏）。
@@ -95,7 +171,11 @@ impl S3Auth for SigV4Auth {
                 .await
             && let Some(sk) = row.secret
         {
-            return Ok(SecretKey::from(sk));
+            // M5 切片 6：对端行可为 enc:v1: 封存（mesh 不带明文；本节点共享同一主密钥）
+            return self
+                .resolve_sk(access_key, sk, false)
+                .await
+                .map(SecretKey::from);
         }
         Err(S3Error::with_message(
             S3ErrorCode::InvalidAccessKeyId,
@@ -234,6 +314,134 @@ mod tests {
         insert_key(&pool, "AKIA_DISABLED", "SK", None).await;
         let auth = SigV4Auth::new(pool);
         assert_invalid_ak(&auth.get_secret_key("AKIA_DISABLED").await.unwrap_err());
+    }
+
+    // ---------- M5 切片 6：SK 加密存 ----------
+
+    async fn vault(td: &tempfile::TempDir) -> std::sync::Arc<crate::skvault::SecretVault> {
+        use xl_store::crypto::EncState;
+        let p = xl_store::kms::FileKeyProvider::open_or_init(&td.path().join("m.key"))
+            .await
+            .unwrap();
+        std::sync::Arc::new(
+            crate::skvault::SecretVault::from_enc_state(Some(&EncState {
+                file: Some(std::sync::Arc::new(p)),
+                kms: None,
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// 三态：密文行可解；明文行 + 库 → 可解且**透明重写**为 enc:v1:；明文行无库 → 照旧。
+    #[tokio::test]
+    async fn sk_sealed_resolves_and_plaintext_migrates() {
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        let td = tempfile::tempdir().unwrap();
+        let v = vault(&td).await;
+        // (a) 密文行
+        let sealed = v.seal("SK_SEALED_0000001").await.unwrap();
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) VALUES ('AKIA_ENC', ?, 1, 0)",
+        )
+        .bind(&sealed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth = SigV4Auth::new(pool.clone()).with_vault(Some(v.clone()));
+        assert_eq!(
+            auth.get_secret_key("AKIA_ENC").await.unwrap().expose(),
+            "SK_SEALED_0000001"
+        );
+        // (b) 明文行 + 库：可解 + 行被重写为密文（透明迁移）
+        insert_key(&pool, "AKIA_PLAIN", "SK_PLAIN_0000001", None).await;
+        assert_eq!(
+            auth.get_secret_key("AKIA_PLAIN").await.unwrap().expose(),
+            "SK_PLAIN_0000001"
+        );
+        let now_stored: String = sqlx::query_scalar(
+            "SELECT secret_key FROM access_keys WHERE access_key = 'AKIA_PLAIN'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            xl_store::kms::is_sealed(&now_stored),
+            "透明重写未发生：{now_stored}"
+        );
+        // 重写后再解（走密文分支）
+        assert_eq!(
+            auth.get_secret_key("AKIA_PLAIN").await.unwrap().expose(),
+            "SK_PLAIN_0000001"
+        );
+        // (c) 无库 + 明文行：照旧可解（零行为变化）；无库 + 密文行（上方已迁移的）必须拒
+        insert_key(&pool, "AKIA_PLAIN2", "SK_PLAIN2_0000001", None).await;
+        let auth_novault = SigV4Auth::new(pool.clone());
+        assert_eq!(
+            auth_novault
+                .get_secret_key("AKIA_PLAIN2")
+                .await
+                .unwrap()
+                .expose(),
+            "SK_PLAIN2_0000001"
+        );
+        assert!(
+            auth_novault.get_secret_key("AKIA_PLAIN").await.is_err(),
+            "已迁移为密文的行在无库实例下必须拒"
+        );
+    }
+
+    /// 密文行 + 无库 → InternalError（fail-closed，不伪装 InvalidAccessKeyId）。
+    #[tokio::test]
+    async fn sealed_sk_without_vault_fails_closed() {
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        let td = tempfile::tempdir().unwrap();
+        let v = vault(&td).await;
+        let sealed = v.seal("SK_X_000000000001").await.unwrap();
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) VALUES ('AKIA_ENC2', ?, 1, 0)",
+        )
+        .bind(&sealed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth = SigV4Auth::new(pool.clone()); // 无 vault
+        let e = auth.get_secret_key("AKIA_ENC2").await.unwrap_err();
+        assert_eq!(e.code(), &S3ErrorCode::InternalError, "{e:?}");
+        // 丢钥（换个库）→ 解密失败 → InternalError
+        let td2 = tempfile::tempdir().unwrap();
+        let v2 = vault(&td2).await;
+        let auth2 = SigV4Auth::new(pool.clone()).with_vault(Some(v2));
+        let e = auth2.get_secret_key("AKIA_ENC2").await.unwrap_err();
+        assert_eq!(e.code(), &S3ErrorCode::InternalError, "{e:?}");
+    }
+
+    /// M5 切片 6（P3-2 承诺测试）：扇出路径携带**封存字节**（mesh 无明文 SK）——
+    /// 本节点用共享同一库解密；无库实例对封存应答必须拒（不伪装 InvalidAccessKeyId）。
+    #[tokio::test]
+    async fn peer_fanout_carries_sealed_sk() {
+        let td = tempfile::tempdir().unwrap();
+        let v = vault(&td).await;
+        let sealed = v.seal("SK_PEER_SEALED_01").await.unwrap();
+        let row = || xl_store::mesh::ControlRow {
+            uid: Some(7),
+            is_admin: Some(false),
+            active: Some(true),
+            secret: Some(sealed.clone()),
+            ..Default::default()
+        };
+        // 有库：解出明文 SK
+        let auth = SigV4Auth::with_mesh(oss_test_db().await, Some(mesh_with(Some(row()))))
+            .with_vault(Some(v));
+        assert_eq!(
+            auth.get_secret_key("AKIA_PEER_ENC").await.unwrap().expose(),
+            "SK_PEER_SEALED_01"
+        );
+        // 无库：封存应答拒（InternalError，fail-closed）
+        let auth2 = SigV4Auth::with_mesh(oss_test_db().await, Some(mesh_with(Some(row()))));
+        let e = auth2.get_secret_key("AKIA_PEER_ENC").await.unwrap_err();
+        assert_eq!(e.code(), &S3ErrorCode::InternalError, "{e:?}");
     }
 
     // ---------- Task 9：控制面读扇出 ----------

@@ -29,6 +29,8 @@ impl ControlBackend for SqliteControlBackend {
     async fn control_query(&self, q: ControlQuery) -> Result<Option<ControlRow>> {
         match q {
             ControlQuery::AccessKey(ak) => {
+                // M5 切片 6：`secret` 原样返回（可为 enc:v1: 封存——**mesh 上不出现明文 SK**，
+                // 消费端（发起节点 SigV4Auth）用同一密钥库解密；两节点须已分发同一主密钥）。
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)

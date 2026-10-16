@@ -932,7 +932,18 @@ async fn create_access_key(
     let sk = body
         .secret_key
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-    match state.db.create_access_key(&ak, &sk, uid).await {
+    // M5 切片 6（T5）：库启用时封存入库；响应照旧回明文一次
+    let stored = match &state.vault {
+        Some(v) => match v.seal(&sk).await {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                tracing::error!(error = %e, "SK 加密失败——拒绝创建（fail-closed）");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "secret key 加密失败").into_response();
+            }
+        },
+        None => sk.clone(),
+    };
+    match state.db.create_access_key(&ak, &stored, uid).await {
         Ok(()) => Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response(),
         // UNIQUE 冲突说人话；不落 sqlite 原文
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {

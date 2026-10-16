@@ -20,6 +20,8 @@ pub struct AppState {
     pub jwt: Arc<JwtAuth>,
     /// 登录限速（C1）：账号失败锁定 + 全局失败上限（Argon2 ~19MiB/次 的资源放大面封口）。
     pub login_limiter: Arc<LoginLimiter>,
+    /// M5 切片 6：SK 加密库（`OSS_MASTER_KEY_FILE`/`OSS_KMS_DIR` 未配 = None = 明文直存）。
+    pub vault: Option<Arc<xl_s3::skvault::SecretVault>>,
 }
 
 /// 登录限速（C1）。**单进程内存态**（每节点独立，重启清零——限速非持久配额，重启放宽可接受）：
@@ -419,6 +421,9 @@ impl AppState {
             })
             .unwrap_or_else(|e| panic!("jwt-rust 初始化失败: {e}")),
         );
+        // M5 切片 6：SK 库自 Store 的密钥库状态（须在 init_encryption 之后——本函数由
+        // 启动路径在 store open+init 完成后调用）。
+        let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
         let cfg = Arc::new(cfg);
         let db = Arc::new(db);
         let ingest = Arc::new(crate::aether::IngestSink {
@@ -433,6 +438,7 @@ impl AppState {
             ingest,
             jwt,
             login_limiter,
+            vault,
         }
     }
 }

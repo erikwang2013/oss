@@ -315,6 +315,95 @@ impl KeyProvider for KmsFileProvider {
     }
 }
 
+// ---------- M5 切片 6：SK（access_keys.secret_key）信封加密（裁决 T1） ----------
+//
+// 形态：`enc:v1:<key_id>:<b64(ct)>:<b64(wrapped)>`；`ct = nonce(12)‖GCM 密文‖tag(16)`，
+// AAD = `b"oss-sk-v1"`（与数据面单元域分隔）；每行新生成 32B DEK，`wrapped` = wrap_dek(DEK)。
+// key_id 路由（"file" → FileKeyProvider；"k<n>" → KmsFileProvider）由调用侧（vault）做。
+
+use base64::Engine as _;
+
+/// SK 密文前缀（判别明/密文；明文存量不动、混存期共存）。
+pub const SECRET_PREFIX: &str = "enc:v1:";
+/// SK 层 AAD（域分隔）。
+const SK_AAD: &[u8] = b"oss-sk-v1";
+
+fn b64() -> base64::engine::general_purpose::GeneralPurpose {
+    base64::engine::general_purpose::STANDARD
+}
+
+/// 是否已封装（前缀判别）。
+pub fn is_sealed(s: &str) -> bool {
+    s.starts_with(SECRET_PREFIX)
+}
+
+/// 密文行 → key_id（未封装/坏形态 → None）。
+pub fn sealed_key_id(stored: &str) -> Option<&str> {
+    let rest = stored.strip_prefix(SECRET_PREFIX)?;
+    rest.split(':').next().filter(|k| !k.is_empty())
+}
+
+/// 封装明文 SK → `enc:v1:...`（每行新 DEK；provider 决定 key_id）。
+pub async fn seal_secret(p: &dyn KeyProvider, plaintext: &str) -> Result<String> {
+    let dek = new_dek();
+    let cipher = gcm(&dek);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher
+        .encrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext.as_bytes(),
+                aad: SK_AAD,
+            },
+        )
+        .map_err(|_| Error::Crypto("SK 加密失败".into()))?;
+    let mut blob = Vec::with_capacity(NONCE_LEN + ct.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    let (wrapped, key_id) = p.wrap_dek(&dek).await?;
+    Ok(format!(
+        "{SECRET_PREFIX}{key_id}:{}:{}",
+        b64().encode(&blob),
+        b64().encode(&wrapped)
+    ))
+}
+
+/// 解封 `enc:v1:...` → 明文 SK；未封装行 → `Error::InvalidArgument`（调用方先 `is_sealed`）。
+/// 篡改/丢钥/坏 b64 → `Error::Crypto`（fail-closed）。
+pub async fn open_secret(p: &dyn KeyProvider, stored: &str) -> Result<String> {
+    let rest = stored
+        .strip_prefix(SECRET_PREFIX)
+        .ok_or_else(|| Error::InvalidArgument("非 enc:v1 封装行".into()))?;
+    let mut parts = rest.splitn(3, ':');
+    let key_id = parts.next().filter(|k| !k.is_empty());
+    let (Some(key_id), Some(blob_b64), Some(wrapped_b64), None) =
+        (key_id, parts.next(), parts.next(), parts.next())
+    else {
+        return Err(Error::Crypto("SK 封装行形态非法".into()));
+    };
+    let blob = b64()
+        .decode(blob_b64)
+        .map_err(|_| Error::Crypto("SK 封装箱坏 b64".into()))?;
+    let wrapped = b64()
+        .decode(wrapped_b64)
+        .map_err(|_| Error::Crypto("SK 封装 wrapped 坏 b64".into()))?;
+    if blob.len() < NONCE_LEN + TAG_LEN {
+        return Err(Error::Crypto("SK 封装箱过短".into()));
+    }
+    let dek = p.unwrap_dek(&wrapped, key_id).await?;
+    let (nonce, ct) = blob.split_at(NONCE_LEN);
+    let pt = gcm(&dek)
+        .decrypt(
+            aes_gcm::Nonce::from_slice(nonce),
+            aes_gcm::aead::Payload {
+                msg: ct,
+                aad: SK_AAD,
+            },
+        )
+        .map_err(|_| Error::Crypto("SK 解密失败（错钥/篡改/域不符）".into()))?;
+    String::from_utf8(pt).map_err(|_| Error::Crypto("SK 明文非 UTF-8".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +737,132 @@ mod tests {
             !d.contains(&format!("{:?}", kp.current_key)),
             "KmsFileProvider Debug 泄露钥"
         );
+    }
+
+    /// M5 切片 6：SK 封存/解封 + 失败面。
+    #[tokio::test]
+    async fn seal_open_secret_roundtrip_and_failures() {
+        let td = tempfile::tempdir().unwrap();
+        let p = FileKeyProvider::open_or_init(&td.path().join("master.key"))
+            .await
+            .unwrap();
+        let sealed = seal_secret(&p, "SK_TOP_SECRET_0001").await.unwrap();
+        assert!(sealed.starts_with("enc:v1:file:"), "{sealed}");
+        assert!(is_sealed(&sealed));
+        assert_eq!(sealed_key_id(&sealed), Some("file"));
+        assert_eq!(
+            open_secret(&p, &sealed).await.unwrap(),
+            "SK_TOP_SECRET_0001"
+        );
+        // 非封装行 → InvalidArgument（调用方先 is_sealed）
+        assert!(matches!(
+            open_secret(&p, "plain-sk").await.unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
+        // 篡改 ct（b64 中段翻一个字符）→ Crypto
+        let mut parts: Vec<String> = sealed.split(':').map(str::to_string).collect();
+        let mut ct = parts[3].clone().into_bytes();
+        ct[2] = if ct[2] == b'A' { b'B' } else { b'A' };
+        parts[3] = String::from_utf8(ct).unwrap();
+        let tampered = parts.join(":");
+        assert!(matches!(
+            open_secret(&p, &tampered).await.unwrap_err(),
+            Error::Crypto(_)
+        ));
+        // 错 key_id（file 封装改成 k9）→ file provider 拒
+        let wrong_id = sealed.replacen("enc:v1:file:", "enc:v1:k9:", 1);
+        assert!(matches!(
+            open_secret(&p, &wrong_id).await.unwrap_err(),
+            Error::Crypto(_)
+        ));
+        // 坏 b64 → Crypto；形态残缺 → Crypto
+        assert!(matches!(
+            open_secret(&p, "enc:v1:file:!!!:###").await.unwrap_err(),
+            Error::Crypto(_)
+        ));
+        assert!(matches!(
+            open_secret(&p, "enc:v1:file:onlyonepart")
+                .await
+                .unwrap_err(),
+            Error::Crypto(_)
+        ));
+        // 每行独立 DEK：同明文两次封装 → 字节不同
+        let s2 = seal_secret(&p, "SK_TOP_SECRET_0001").await.unwrap();
+        assert_ne!(sealed, s2);
+        assert_eq!(open_secret(&p, &s2).await.unwrap(), "SK_TOP_SECRET_0001");
+    }
+
+    /// M5 切片 6（P3-1 域分隔）：用**其他 AAD**（数据面形态）封装同样的 SK → 必解不开。
+    #[tokio::test]
+    async fn seal_secret_aad_domain_separation() {
+        let td = tempfile::tempdir().unwrap();
+        let p = FileKeyProvider::open_or_init(&td.path().join("master.key"))
+            .await
+            .unwrap();
+        let dek = new_dek();
+        let (wrapped, kid) = p.wrap_dek(&dek).await.unwrap();
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct = gcm(&dek)
+            .encrypt(
+                &nonce,
+                aes_gcm::aead::Payload {
+                    msg: b"SK_TOP_SECRET_0001",
+                    aad: b"wrong-aad-domain", // ← 域错
+                },
+            )
+            .unwrap();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ct);
+        let forged = format!(
+            "{SECRET_PREFIX}{kid}:{}:{}",
+            b64().encode(&blob),
+            b64().encode(&wrapped)
+        );
+        assert!(matches!(
+            open_secret(&p, &forged).await.unwrap_err(),
+            Error::Crypto(_)
+        ));
+        // 同构造但 AAD 正确 → 可解（证明差异确实来自 AAD，而非构造路径）
+        let nonce2 = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct2 = gcm(&dek)
+            .encrypt(
+                &nonce2,
+                aes_gcm::aead::Payload {
+                    msg: b"SK_TOP_SECRET_0001",
+                    aad: SK_AAD,
+                },
+            )
+            .unwrap();
+        let mut blob2 = Vec::new();
+        blob2.extend_from_slice(&nonce2);
+        blob2.extend_from_slice(&ct2);
+        let ok = format!(
+            "{SECRET_PREFIX}{kid}:{}:{}",
+            b64().encode(&blob2),
+            b64().encode(&wrapped)
+        );
+        assert_eq!(open_secret(&p, &ok).await.unwrap(), "SK_TOP_SECRET_0001");
+    }
+
+    /// M5 切片 6（P3-4）：短 blob 护栏（防 `split_at` panic）——合法 wrapped + 短 ct。
+    #[tokio::test]
+    async fn seal_secret_short_blob_guard() {
+        let td = tempfile::tempdir().unwrap();
+        let p = FileKeyProvider::open_or_init(&td.path().join("master.key"))
+            .await
+            .unwrap();
+        let sealed = seal_secret(&p, "SK_TOP_SECRET_0001").await.unwrap();
+        let parts: Vec<&str> = sealed.split(':').collect();
+        let short = format!(
+            "{SECRET_PREFIX}file:{}:{}",
+            b64().encode([0u8; 5]), // < NONCE_LEN + TAG_LEN
+            parts[4]
+        );
+        assert!(matches!(
+            open_secret(&p, &short).await.unwrap_err(),
+            Error::Crypto(_)
+        ));
     }
 
     /// 并发首启竞态：败者先读到半写文件 → 有界重试等到 32B 写完即成功（不误报损坏）。

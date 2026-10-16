@@ -373,6 +373,12 @@ impl Store {
             .map_err(|_| Error::Encode("加密已初始化（init_encryption 不可重复）".into()))
     }
 
+    /// M5 切片 6：密钥库状态**外部只读视图**（oss-server 构造 SK 加密库/装配用）；
+    /// 未启用 = None。内部写读路径仍走 `maybe_enc_state`（语义见其注）。
+    pub fn enc_state(&self) -> Option<&crypto::EncState> {
+        self.encryption.get()
+    }
+
     /// 加密状态（未启用 = None）。**所有**写读路径经此取 provider——SSE-C 分支不需要
     /// provider（`for_write/for_read` 只在 S3/KMS 分支对 None fail-closed），若在此直接
     /// 报错会把「未接线」误伤为 SSE-C 不可用（切片 3 实测踩过）。
