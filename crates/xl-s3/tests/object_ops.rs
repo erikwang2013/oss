@@ -18,7 +18,7 @@ async fn service() -> (OssS3, tempfile::TempDir) {
 async fn acl() -> xl_s3::access::Acl {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql(
-        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0);\
+        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER);\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
           PRIMARY KEY (user_id, bucket));\
@@ -1809,5 +1809,654 @@ async fn sse_s3_wire_headers_and_kms_cmk_rejected() {
         e.code(),
         &s3s::S3ErrorCode::InvalidRequest,
         "显式 CMK 应 400：{e:?}"
+    );
+}
+
+// ---------- M5 切片 4：对象锁线级 ----------
+
+fn now_nanos_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+}
+
+fn future_ts(secs: i64) -> ObjectLockRetainUntilDate {
+    xl_s3::lock::ts_from_nanos(now_nanos_i64() + secs * 1_000_000_000)
+}
+
+fn lock_cfg(mode: &'static str, days: i32) -> ObjectLockConfiguration {
+    ObjectLockConfiguration {
+        object_lock_enabled: Some(ObjectLockEnabled::from_static("Enabled")),
+        rule: Some(ObjectLockRule {
+            default_retention: Some(DefaultRetention {
+                mode: Some(ObjectLockRetentionMode::from_static(mode)),
+                days: Some(days),
+                years: None,
+            }),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn object_lock_wire_roundtrip_and_guards() {
+    let (s3, _d) = service().await;
+    // 建桶带锁标志 → 自动开版本控制（AWS 语义）
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "lockb".into(),
+        object_lock_enabled_for_bucket: Some(true),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // Get config → Enabled（尚无默认规则）
+    let cfg = s3
+        .get_object_lock_configuration(req(GetObjectLockConfigurationInput {
+            bucket: "lockb".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let oc = cfg.object_lock_configuration.unwrap();
+    assert_eq!(
+        oc.object_lock_enabled.as_ref().map(|e| e.as_str()),
+        Some("Enabled")
+    );
+    assert!(oc.rule.is_none());
+    // Put config：默认 COMPLIANCE 30 天
+    s3.put_object_lock_configuration(req(PutObjectLockConfigurationInput {
+        bucket: "lockb".into(),
+        object_lock_configuration: Some(lock_cfg("COMPLIANCE", 30)),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let cfg = s3
+        .get_object_lock_configuration(req(GetObjectLockConfigurationInput {
+            bucket: "lockb".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let dr = cfg
+        .object_lock_configuration
+        .unwrap()
+        .rule
+        .unwrap()
+        .default_retention
+        .unwrap();
+    assert_eq!(dr.days, Some(30));
+
+    // PUT 无显式头 → 默认规则落地（HEAD 见 COMPLIANCE + 未来截止）
+    let put = s3
+        .put_object(req(PutObjectInput {
+            bucket: "lockb".into(),
+            key: "d".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let vid = put.version_id.clone().unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "lockb".into(),
+            key: "d".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        head.object_lock_mode.as_ref().map(|m| m.as_str()),
+        Some("COMPLIANCE")
+    );
+    assert!(head.object_lock_retain_until_date.is_some());
+
+    // 点名删锁定版本 → 403 AccessDenied；bypass 对 COMPLIANCE 无效
+    for bypass in [None, Some(true)] {
+        let e = s3
+            .delete_object(req(DeleteObjectInput {
+                bucket: "lockb".into(),
+                key: "d".into(),
+                version_id: Some(vid.clone()),
+                bypass_governance_retention: bypass,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied, "{e:?}");
+    }
+
+    // GOVERNANCE + 未来：无 bypass 403；bypass 放行
+    let putg = s3
+        .put_object(req(PutObjectInput {
+            bucket: "lockb".into(),
+            key: "g".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"y"))),
+            object_lock_mode: Some(ObjectLockMode::from_static("GOVERNANCE")),
+            object_lock_retain_until_date: Some(future_ts(3600)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let gvid = putg.version_id.unwrap();
+    let e = s3
+        .delete_object(req(DeleteObjectInput {
+            bucket: "lockb".into(),
+            key: "g".into(),
+            version_id: Some(gvid.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
+    let ok = s3
+        .delete_object(req(DeleteObjectInput {
+            bucket: "lockb".into(),
+            key: "g".into(),
+            version_id: Some(gvid),
+            bypass_governance_retention: Some(true),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(ok.output.delete_marker, None, "删的是版本不是加 marker");
+
+    // legal hold：put 带 hold → 一律拒（含 bypass）
+    s3.put_object(req(PutObjectInput {
+        bucket: "lockb".into(),
+        key: "h".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"z"))),
+        object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let hvid = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "lockb".into(),
+            key: "h".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    let e = s3
+        .delete_object(req(DeleteObjectInput {
+            bucket: "lockb".into(),
+            key: "h".into(),
+            version_id: Some(hvid),
+            bypass_governance_retention: Some(true),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
+
+    // 未开锁桶：带锁头 PUT → 400；Get config → 404；Put config（无版本）→ InvalidBucketState
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "plain".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let e = s3
+        .put_object(req(PutObjectInput {
+            bucket: "plain".into(),
+            key: "x".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"p"))),
+            object_lock_mode: Some(ObjectLockMode::from_static("GOVERNANCE")),
+            object_lock_retain_until_date: Some(future_ts(60)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest);
+    let e = s3
+        .get_object_lock_configuration(req(GetObjectLockConfigurationInput {
+            bucket: "plain".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        &s3s::S3ErrorCode::ObjectLockConfigurationNotFoundError
+    );
+    let e = s3
+        .put_object_lock_configuration(req(PutObjectLockConfigurationInput {
+            bucket: "plain".into(),
+            object_lock_configuration: Some(lock_cfg("GOVERNANCE", 1)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidBucketState);
+}
+
+#[tokio::test]
+async fn object_lock_wire_fixes() {
+    let (s3, _store, _d) = service_enc().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "locks".into(),
+        object_lock_enabled_for_bucket: Some(true),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // N3：默认规则超 36500 天上限 → 400
+    let e = s3
+        .put_object_lock_configuration(req(PutObjectLockConfigurationInput {
+            bucket: "locks".into(),
+            object_lock_configuration: Some(lock_cfg("COMPLIANCE", 40_000)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest);
+
+    // N4：不存在的桶 + 锁头 → 404 NoSuchBucket
+    let e = s3
+        .put_object(req(PutObjectInput {
+            bucket: "nope".into(),
+            key: "x".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            object_lock_mode: Some(ObjectLockMode::from_static("GOVERNANCE")),
+            object_lock_retain_until_date: Some(future_ts(60)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    // N2：legal hold 开关线级（ON → 挡删；缺版本号 400；OFF → 放行）
+    let ph = s3
+        .put_object(req(PutObjectInput {
+            bucket: "locks".into(),
+            key: "h".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"h"))),
+            object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let hvid = ph.version_id.unwrap();
+    let g = s3
+        .get_object_legal_hold(req(GetObjectLegalHoldInput {
+            bucket: "locks".into(),
+            key: "h".into(),
+            version_id: Some(hvid.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        g.legal_hold.unwrap().status.as_ref().map(|s| s.as_str()),
+        Some("ON")
+    );
+    let e = s3
+        .put_object_legal_hold(req(PutObjectLegalHoldInput {
+            bucket: "locks".into(),
+            key: "h".into(),
+            version_id: None,
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(ObjectLockLegalHoldStatus::from_static("OFF")),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest);
+    s3.put_object_legal_hold(req(PutObjectLegalHoldInput {
+        bucket: "locks".into(),
+        key: "h".into(),
+        version_id: Some(hvid.clone()),
+        legal_hold: Some(ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static("OFF")),
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "locks".into(),
+        key: "h".into(),
+        version_id: Some(hvid),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // §8-i：批量删逐键守卫——COMPLIANCE 版进 errors、版本仍可读
+    let pc = s3
+        .put_object(req(PutObjectInput {
+            bucket: "locks".into(),
+            key: "c".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"c"))),
+            object_lock_mode: Some(ObjectLockMode::from_static("COMPLIANCE")),
+            object_lock_retain_until_date: Some(future_ts(3600)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let cvid = pc.version_id.unwrap();
+    let out = s3
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("locks".to_string())
+                .delete(Delete {
+                    objects: vec![ObjectIdentifier {
+                        key: "c".into(),
+                        version_id: Some(cvid.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
+        .await
+        .unwrap()
+        .output;
+    let errs = out.errors.unwrap_or_default();
+    assert!(
+        errs.iter()
+            .any(|e| e.code.as_deref() == Some("AccessDenied")),
+        "锁定版本批量删应进 errors：{errs:?}"
+    );
+    assert!(
+        s3.head_object(req(HeadObjectInput {
+            bucket: "locks".into(),
+            key: "c".into(),
+            version_id: Some(cvid),
+            ..Default::default()
+        }))
+        .await
+        .is_ok()
+    );
+
+    // §8-ii：CopyObject 目的锁
+    s3.put_object(req(PutObjectInput {
+        bucket: "locks".into(),
+        key: "src".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"src"))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("locks".to_string())
+        .key("dst".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "locks".into(),
+            key: "src".into(),
+            version_id: None,
+        })
+        .object_lock_mode(Some(ObjectLockMode::from_static("GOVERNANCE")))
+        .object_lock_retain_until_date(Some(future_ts(60)))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let hd = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "locks".into(),
+            key: "dst".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        hd.object_lock_mode.as_ref().map(|m| m.as_str()),
+        Some("GOVERNANCE")
+    );
+
+    // §8-iii：CreateMPU 线级锁参数（create 带 → complete 落地）
+    let co = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "locks".into(),
+            key: "m".into(),
+            object_lock_mode: Some(ObjectLockMode::from_static("COMPLIANCE")),
+            object_lock_retain_until_date: Some(future_ts(3600)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let upid = co.upload_id.unwrap();
+    let part = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "locks".into(),
+            key: "m".into(),
+            upload_id: upid.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from(vec![
+                1u8;
+                5 * 1024 * 1024
+                    + 1
+            ]))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
+        bucket: "locks".into(),
+        key: "m".into(),
+        upload_id: upid,
+        multipart_upload: Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: Some(ETag::Strong(
+                    part.e_tag.as_ref().unwrap().value().to_string(),
+                )),
+                ..Default::default()
+            }]),
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let hm = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "locks".into(),
+            key: "m".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        hm.object_lock_mode.as_ref().map(|m| m.as_str()),
+        Some("COMPLIANCE")
+    );
+
+    // 显式 legal-hold 优先：不叠默认 retention；二次 Put config 改默认规则生效
+    s3.put_object_lock_configuration(req(PutObjectLockConfigurationInput {
+        bucket: "locks".into(),
+        object_lock_configuration: Some(lock_cfg("COMPLIANCE", 30)),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "locks".into(),
+        key: "h2".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"h2"))),
+        object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let hd2 = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "locks".into(),
+            key: "h2".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(
+        hd2.object_lock_mode.is_none(),
+        "显式 hold 不叠默认 retention（显式优先）"
+    );
+    assert_eq!(
+        hd2.object_lock_legal_hold_status
+            .as_ref()
+            .map(|s| s.as_str()),
+        Some("ON")
+    );
+    s3.put_object_lock_configuration(req(PutObjectLockConfigurationInput {
+        bucket: "locks".into(),
+        object_lock_configuration: Some(lock_cfg("GOVERNANCE", 1)),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let cfg2 = s3
+        .get_object_lock_configuration(req(GetObjectLockConfigurationInput {
+            bucket: "locks".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let dr2 = cfg2
+        .object_lock_configuration
+        .unwrap()
+        .rule
+        .unwrap()
+        .default_retention
+        .unwrap();
+    assert_eq!(dr2.days, Some(1));
+    assert_eq!(
+        dr2.mode.as_ref().map(|m| m.as_str().to_string()),
+        Some("GOVERNANCE".to_string())
+    );
+}
+
+// P3-a/P3-b 复验补（切片 4 收口轮）：legal hold 门禁 + SSE-C 对象 hold 元数据读
+#[tokio::test]
+async fn object_lock_legal_hold_gates() {
+    use base64::Engine as _;
+    let (s3, _store, _d) = service_enc().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "locks".into(),
+        object_lock_enabled_for_bucket: Some(true),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // P3-a：未开锁桶设 legal hold → 400（须开锁桶）；不存在桶 → 404
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "nolo".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let pn = s3
+        .put_object(req(PutObjectInput {
+            bucket: "nolo".into(),
+            key: "x".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let e = s3
+        .put_object_legal_hold(req(PutObjectLegalHoldInput {
+            bucket: "nolo".into(),
+            key: "x".into(),
+            version_id: pn.version_id.clone().or(Some("null".into())),
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        &s3s::S3ErrorCode::InvalidRequest,
+        "未开锁桶设 hold 应 400：{e:?}"
+    );
+    let e = s3
+        .put_object_legal_hold(req(PutObjectLegalHoldInput {
+            bucket: "ghost".into(),
+            key: "x".into(),
+            version_id: Some("v".into()),
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    // P3-b：SSE-C 对象（带 legal hold）的 GetObjectLegalHold 不要求客户钥
+    let key = [9u8; 32];
+    let k = xl_store::crypto::SseCKey::from_key(key);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+    let md5 = k.md5_b64().to_string();
+    let ph = s3
+        .put_object(req(PutObjectInput {
+            bucket: "locks".into(),
+            key: "ssec".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"ssec"))),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(b64.clone()),
+            sse_customer_key_md5: Some(md5.clone()),
+            object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let svid = ph.version_id.unwrap();
+    let g = s3
+        .get_object_legal_hold(req(GetObjectLegalHoldInput {
+            bucket: "locks".into(),
+            key: "ssec".into(),
+            version_id: Some(svid.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        g.legal_hold.unwrap().status.as_ref().map(|s| s.as_str()),
+        Some("ON"),
+        "P3-b：SSE-C 对象 hold 可读（无需客户钥）"
+    );
+    // 数据面仍须钥（hold 元数据读不能变成数据读的旁路）
+    let e = s3
+        .get_object(req(GetObjectInput {
+            bucket: "locks".into(),
+            key: "ssec".into(),
+            version_id: Some(svid),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        &s3s::S3ErrorCode::InvalidArgument,
+        "SSE-C 数据读缺钥仍 400"
     );
 }

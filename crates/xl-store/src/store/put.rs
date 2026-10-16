@@ -97,6 +97,7 @@ impl Store {
             None,
             false, // 兼容壳：无版本控制（S3 层显式传 state）
             None,  // 兼容壳：无加密（切片 3 由 S3 头映射）
+            None,  // 兼容壳：无对象锁
         )
         .await
     }
@@ -132,6 +133,7 @@ impl Store {
             None,
             false,
             None, // 兼容壳：无加密
+            None, // 兼容壳：无对象锁
         )
         .await
     }
@@ -588,6 +590,7 @@ impl Store {
         checksum: Option<ChecksumRecord>,
         versioned: bool,
         encryption: Option<crypto::EncSpec>,
+        lock: Option<meta::ObjectLockRecord>,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // 桶窗口（桶锁内，M2b-2 Task 10）：ensure + 对象目录先落盘——此后 delete_bucket
@@ -619,9 +622,19 @@ impl Store {
             None => None,
         };
         let enc_record = enc_ctx.as_ref().map(|(_, r)| r.clone());
+        // M5 切片 4：对象锁（空记录归一为 None，不落字段）
+        let lock_record = lock.filter(|l| !l.is_empty());
 
         // M-6 裁决：损坏的 meta 让 PUT fail-closed（报错），不静默当作空对象覆盖——盘上可能还有旧数据，宁可失败也不毁
         let old_meta = self.read_meta(bucket, key).await?;
+        // M5 切片 4（B2 兜底）：非版本化覆盖写会回收旧版本——链上带锁 → fail-closed
+        // （陈旧节点行未同步 versioned 时也不得借 recycle 销毁锁定版本）
+        if !versioned
+            && let Some(old) = old_meta.as_ref()
+            && let Some(why) = super::version::chain_active_lock(old)
+        {
+            return Err(Error::ObjectLocked(format!("覆盖写将回收锁定版本：{why}")));
+        }
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
         // per-key 单调 mod_time（C4）：latest-wins 裁决与墙钟脱钩（M2b R8 的正解在 M3 兑现）
@@ -685,6 +698,8 @@ impl Store {
                 epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
                 // M5 切片 2：加密记录随版本落 meta（旧版本各留各的记录 → 换主密钥后仍可读）
                 encryption: enc_record.clone(),
+                // M5 切片 4：对象锁随版本落 meta（守卫在删除路径）
+                lock: lock_record.clone(),
             };
             // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
             let mut meta = match (versioned, old_meta.as_ref()) {
@@ -795,6 +810,7 @@ impl Store {
                 "null".to_string()
             }),
             encryption: enc_record,
+            lock: lock_record,
         })
     }
 }

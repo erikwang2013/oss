@@ -12,6 +12,7 @@ bytes.workspace = true
 futures.workspace = true
 # Range 的 206 需要 http::StatusCode（s3s 不 re-export）；http 本就在依赖树里（s3s 直连），非新增 crate
 http = "1"
+time.workspace = true
 # M4 切片 7：桶策略的 JSON 解析（serde 已在依赖树里——s3s 直连，非新增 crate 语系）
 serde.workspace = true
 serde_json.workspace = true

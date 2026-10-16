@@ -17,10 +17,65 @@ use std::ops::Range as StdRange;
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{PartRef, Version, XlMeta};
+use crate::meta::{self, PartRef, Version, XlMeta};
 
 use super::read::check_read_sse_c;
 use super::{ObjectInfo, Store};
+
+/// M5 切片 4（B1/B2 复验补）：该版本的「不可删原因」（**不含 bypass 语义**——整链场景
+/// purge/覆盖写用；点名删版本的 bypass 语义在 [`check_lock_delete`]）。
+pub(in crate::store) fn active_lock_reason(v: &Version) -> Option<String> {
+    let l = v.lock.as_ref()?;
+    if l.legal_hold {
+        return Some(format!("legal hold（版本 {}）", v.version_id_str()));
+    }
+    if let (Some(mode), Some(until)) = (l.mode.as_deref(), l.retain_until_nanos)
+        && until > super::now_nanos()
+    {
+        return Some(format!(
+            "{mode} 保留至 {until}（版本 {}）",
+            v.version_id_str()
+        ));
+    }
+    None
+}
+
+/// 链上任一「不可删」版本 → Some(原因)。purge 与「非版本化覆盖写」守卫共用（B2：集群
+/// 陈旧行/控制台硬删等绕过 S3 点名删的路径，在此 fail-closed 兜底）。
+pub(in crate::store) fn chain_active_lock(m: &XlMeta) -> Option<String> {
+    m.versions.iter().find_map(active_lock_reason)
+}
+
+/// M5 切片 4（L4）：删除守卫——锁定版本拒绝删除，返回 `Error::ObjectLocked`（S3 面 403）。
+/// COMPLIANCE 与 legal hold **一律拒（含 admin）**；GOVERNANCE 仅 `bypass_governance` 放行；
+/// `until <= now`（到期）放行。时钟依赖 NTP（设计口径；测试直接构造过期值，无需时钟注入）。
+fn check_lock_delete(v: &Version, bypass_governance: bool) -> Result<()> {
+    let Some(l) = &v.lock else { return Ok(()) };
+    if l.legal_hold {
+        return Err(Error::ObjectLocked(format!(
+            "legal hold 生效中（版本 {}）",
+            v.version_id_str()
+        )));
+    }
+    if let (Some(mode), Some(until)) = (l.mode.as_deref(), l.retain_until_nanos)
+        && until > super::now_nanos()
+    {
+        match mode {
+            "COMPLIANCE" => {
+                return Err(Error::ObjectLocked(format!(
+                    "Compliance 保留期至 {until}（含 admin 不可删）"
+                )));
+            }
+            "GOVERNANCE" if !bypass_governance => {
+                return Err(Error::ObjectLocked(format!(
+                    "Governance 保留期至 {until}（需 x-amz-bypass-governance-retention）"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 /// [`Store::delete_object_versioned`] 的结果（S3 DeleteObject 响应字段来源）。
 #[derive(Debug, Clone, PartialEq)]
@@ -68,11 +123,32 @@ impl Store {
         version_id: Option<&str>,
         versioned: bool,
     ) -> Result<DeleteOutcome> {
+        self.delete_object_versioned_ext(bucket, key, version_id, versioned, false)
+            .await
+    }
+
+    /// 版本感知删除（可带 `x-amz-bypass-governance-retention`；M5 切片 4）。
+    /// `bypass_governance=true` 仅对 GOVERNANCE 保留期生效；COMPLIANCE 与 legal hold 不受其影响。
+    pub async fn delete_object_versioned_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        versioned: bool,
+        bypass_governance: bool,
+    ) -> Result<DeleteOutcome> {
         self.ensure_bucket(bucket).await?;
         let _guard = self.lock_object(bucket, key).await?;
 
         let Some(vid) = version_id else {
             if !versioned {
+                // M5 切片 4（B2 兜底）：非版本化整键删先查链——陈旧节点（行未同步）也不得
+                // 借 purge 清掉锁定版本
+                if let Some(old) = self.read_meta(bucket, key).await?
+                    && let Some(why) = chain_active_lock(&old)
+                {
+                    return Err(Error::ObjectLocked(format!("键存在锁定版本：{why}")));
+                }
                 self.purge_key(bucket, key).await?;
                 return Ok(DeleteOutcome::Object);
             }
@@ -105,6 +181,7 @@ impl Store {
                 // NTP 回拨收口：marker 也是新写版本，epoch 同样单调 +1
                 epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
                 encryption: None, // marker 无数据，恒无加密记录
+                lock: None,       // marker 无数据，恒无锁
             };
             let marker_vid = marker.version_id_str();
             let mut m = match old.as_ref() {
@@ -131,6 +208,9 @@ impl Store {
             return Ok(DeleteOutcome::Version { version_id: vid }); // 幂等：版本不存在
         };
         let removed = old.versions[pos].clone();
+        // M5 切片 4（L4）：对象锁守卫——legal hold / COMPLIANCE 未到期一律拒（含 admin）；
+        // GOVERNANCE 未到期仅 bypass 放行；到期（until <= now）放行。delete-marker 路径不受锁约束。
+        check_lock_delete(&removed, bypass_governance)?;
         let mut m = old.clone();
         m.versions.remove(pos);
         if m.versions.is_empty() {
@@ -194,6 +274,92 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// M5 切片 4（N2 复验补）：翻转某版本 legal hold（开关 ON/OFF）。
+    /// marker 版本 → InvalidArgument；键/版本不存在 → NoSuchKey。重写 meta（rank 防倒退：
+    /// 链尾 epoch 抬到旧链 max+1，同点名删口径）。
+    pub async fn set_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        on: bool,
+    ) -> Result<()> {
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(old) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let mut m = old.clone();
+        let target = m
+            .versions
+            .iter()
+            .position(|v| v.version_id_str() == version_id)
+            .ok_or_else(|| Error::NoSuchKey(format!("{key}@{version_id}")))?;
+        if m.versions[target].delete_marker() {
+            return Err(Error::InvalidArgument(
+                "delete marker 不支持 legal hold".into(),
+            ));
+        }
+        {
+            let v = &mut m.versions[target];
+            let l = v.lock.get_or_insert(meta::ObjectLockRecord {
+                mode: None,
+                retain_until_nanos: None,
+                legal_hold: false,
+            });
+            l.legal_hold = on;
+            if l.is_empty() {
+                v.lock = None; // 关闭后无 retention/无 hold → 不残留空记录
+            }
+        }
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
+        m.refresh_latest_flags();
+        self.write_meta(bucket, key, &m, Some(&old)).await?;
+        Ok(())
+    }
+
+    /// M5 切片 4（P3-b 复验补）：读某版本 legal hold（**元数据面**——不做 SSE-C 客户钥
+    /// 校验，锁状态非秘密；与 AWS「SSE-C 对象须带数据钥」的差异记档）。`None` = 无版本号
+    /// （按 GET 口径取 latest；latest 为 marker → NoSuchKey）。marker 版本 → InvalidArgument
+    /// （与 set_object_legal_hold 对称）。无锁记录 → false。
+    pub async fn get_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<bool> {
+        self.ensure_bucket(bucket).await?;
+        let m = self
+            .read_meta(bucket, key)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        let v = match version_id {
+            Some(vid) => {
+                let v = m
+                    .find_version(vid)
+                    .ok_or_else(|| Error::NoSuchKey(format!("{key}@{vid}")))?;
+                if v.delete_marker() {
+                    return Err(Error::InvalidArgument(
+                        "delete marker 不支持 legal hold".into(),
+                    ));
+                }
+                v
+            }
+            None => {
+                let v = m
+                    .latest()
+                    .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+                if v.delete_marker() {
+                    return Err(Error::NoSuchKey(key.to_string())); // 链尾 marker = 无版本号解析视同不存在
+                }
+                v
+            }
+        };
+        Ok(v.lock.as_ref().is_some_and(|l| l.legal_hold))
     }
 
     /// 指定版本元数据（HEAD ?versionId）。marker 版本 → `DeleteMarker`（S3 405）。
@@ -504,5 +670,6 @@ fn version_info(key: &str, v: &Version) -> ObjectInfo {
         checksum: v.checksum.clone(),
         version_id: Some(v.version_id_str()),
         encryption: v.encryption.clone(),
+        lock: v.lock.clone(),
     }
 }

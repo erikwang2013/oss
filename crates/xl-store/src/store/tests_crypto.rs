@@ -106,6 +106,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
             None,
             false,
             Some(EncSpec::SseC(key.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -162,6 +163,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
         None,
         false,
         Some(EncSpec::SseC(key.clone())),
+        None,
     )
     .await
     .unwrap();
@@ -194,6 +196,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
             None,
             true,
             Some(EncSpec::SseC(key.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -206,6 +209,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
         Default::default(),
         None,
         true,
+        None,
         None,
     )
     .await
@@ -238,6 +242,7 @@ async fn sse_c_mpu_consistency() {
             None,
             Default::default(),
             Some(k1.md5_b64()),
+            None,
             None,
         )
         .await
@@ -290,6 +295,7 @@ async fn sse_c_mpu_consistency() {
             &up,
             &[(1, e1.clone()), (2, e2.clone())],
             false,
+            None,
             None
         )
         .await,
@@ -303,6 +309,7 @@ async fn sse_c_mpu_consistency() {
             &[(1, e1.clone()), (2, e2.clone())],
             false,
             Some(EncSpec::SseC(k2.clone())),
+            None,
         )
         .await;
     assert!(
@@ -317,6 +324,7 @@ async fn sse_c_mpu_consistency() {
             &[(1, e1), (2, e2)],
             false,
             Some(EncSpec::SseC(k1.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -359,7 +367,8 @@ async fn sse_c_mpu_consistency() {
             &up2,
             &[(1, e)],
             false,
-            Some(EncSpec::SseC(k1.clone()))
+            Some(EncSpec::SseC(k1.clone())),
+            None
         )
         .await,
         Err(Error::InvalidArgument(_))
@@ -377,7 +386,15 @@ async fn mpu_create_sse_kind_lands_at_complete() {
 
     // (a) sse-s3 意图 → complete 未带任何 SSE → 对象落 SSE-S3（key_id "file"）
     let up = s
-        .create_multipart_upload_ext("alpha", "a", None, Default::default(), None, Some("sse-s3"))
+        .create_multipart_upload_ext(
+            "alpha",
+            "a",
+            None,
+            Default::default(),
+            None,
+            Some("sse-s3"),
+            None,
+        )
         .await
         .unwrap();
     let e1 = s
@@ -389,7 +406,15 @@ async fn mpu_create_sse_kind_lands_at_complete() {
         .await
         .unwrap();
     let info = s
-        .complete_multipart_upload_versioned("alpha", "a", &up, &[(1, e1), (2, e2)], false, None)
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "a",
+            &up,
+            &[(1, e1), (2, e2)],
+            false,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let rec = info
@@ -415,6 +440,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             Default::default(),
             None,
             Some("sse-kms"),
+            None,
         )
         .await
         .unwrap();
@@ -427,14 +453,30 @@ async fn mpu_create_sse_kind_lands_at_complete() {
         .await
         .unwrap();
     let info = s
-        .complete_multipart_upload_versioned("alpha", "b", &up2, &[(1, e1), (2, e2)], false, None)
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "b",
+            &up2,
+            &[(1, e1), (2, e2)],
+            false,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert!(info.encryption.as_ref().unwrap().key_id.starts_with('k'));
 
     // (c) 模式不一致：create sse-s3 + complete 带 SSE-C → 400
     let up3 = s
-        .create_multipart_upload_ext("alpha", "c", None, Default::default(), None, Some("sse-s3"))
+        .create_multipart_upload_ext(
+            "alpha",
+            "c",
+            None,
+            Default::default(),
+            None,
+            Some("sse-s3"),
+            None,
+        )
         .await
         .unwrap();
     let e1 = s
@@ -450,6 +492,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             &[(1, e1)],
             false,
             Some(EncSpec::SseC(k)),
+            None,
         )
         .await
         .unwrap_err();
@@ -486,6 +529,7 @@ async fn encrypted_roundtrip_geometry_boundaries() {
                 None,
                 false,
                 Some(EncSpec::SseS3),
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("size={n} put 失败: {e}"));
@@ -537,6 +581,7 @@ async fn encrypted_disk_layout_contract_and_crc() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -581,6 +626,7 @@ async fn tamper_two_shards_fails_closed() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -615,6 +661,7 @@ async fn tamper_inline_ciphertext_and_wrapped_dek_fail_closed() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -643,6 +690,7 @@ async fn tamper_inline_ciphertext_and_wrapped_dek_fail_closed() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -677,6 +725,7 @@ async fn wrong_or_missing_provider_fails_closed() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -718,6 +767,7 @@ async fn shards_and_inline_leak_no_plaintext_window() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -742,6 +792,7 @@ async fn shards_and_inline_leak_no_plaintext_window() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -770,6 +821,7 @@ async fn shards_and_inline_leak_no_plaintext_window() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -789,7 +841,15 @@ async fn mpu_complete_encrypted_roundtrip() {
     let p1 = payload(5 * 1024 * 1024 + 123);
     let p2 = payload(300_000);
     let upload = s
-        .create_multipart_upload_ext("alpha", "k", None, Default::default(), None, Some("sse-s3"))
+        .create_multipart_upload_ext(
+            "alpha",
+            "k",
+            None,
+            Default::default(),
+            None,
+            Some("sse-s3"),
+            None,
+        )
         .await
         .unwrap();
     let e1 = s
@@ -814,6 +874,7 @@ async fn mpu_complete_encrypted_roundtrip() {
             &upload,
             &[(1, e1), (2, e2)],
             false,
+            None,
             None,
         )
         .await
@@ -852,6 +913,7 @@ async fn sse_kms_roundtrip_and_key_id_routing() {
             None,
             false,
             Some(EncSpec::SseKms),
+            None,
         )
         .await
         .unwrap();
@@ -884,6 +946,7 @@ async fn sse_kms_roundtrip_and_key_id_routing() {
             None,
             false,
             Some(EncSpec::SseKms),
+            None,
         )
         .await
         .unwrap_err();
@@ -908,6 +971,7 @@ async fn version_chain_keeps_old_encrypted_versions_readable() {
             None,
             true,
             Some(EncSpec::SseS3),
+            None,
         )
         .await
         .unwrap();
@@ -922,6 +986,7 @@ async fn version_chain_keeps_old_encrypted_versions_readable() {
         None,
         true,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -972,6 +1037,7 @@ async fn plaintext_objects_coexist_with_encrypted() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -1032,6 +1098,7 @@ async fn ec_disabled_encryption_rejected_at_write() {
             None,
             false,
             Some(EncSpec::SseS3),
+            None,
         )
         .await
         .unwrap_err();
@@ -1206,6 +1273,7 @@ async fn fsck_and_repair_ok_on_encrypted_objects() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -1220,6 +1288,7 @@ async fn fsck_and_repair_ok_on_encrypted_objects() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();
@@ -1294,6 +1363,7 @@ async fn multi_drive_encrypted_roundtrip_and_leak() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
     )
     .await
     .unwrap();

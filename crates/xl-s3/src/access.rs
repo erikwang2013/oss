@@ -114,6 +114,63 @@ impl Acl {
             .unwrap_or_else(|| "Off".to_string()))
     }
 
+    /// M5 切片 4：桶对象锁状态 → `Some((enabled, 默认模式, 默认天数))`；**行不存在 = None**
+    /// （N4 复验补：调用方可据此区分「桶不存在(404)」与「锁未开(400)」）。
+    pub async fn bucket_lock(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<(bool, Option<String>, Option<i64>)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT object_lock, object_lock_default_mode, object_lock_default_days \
+             FROM buckets WHERE name = ?",
+        )
+        .bind(bucket)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                r.get::<i64, _>("object_lock") != 0,
+                r.get::<Option<String>, _>("object_lock_default_mode"),
+                r.get::<Option<i64>, _>("object_lock_default_days"),
+            )
+        }))
+    }
+
+    /// M5 切片 4：开桶锁——`object_lock=1` **且自动开版本控制**（AWS：锁须版本化，建桶带
+    /// `x-amz-bucket-object-lock-enabled` 时二者一并生效）。**Upsert**：建桶旗标可能先于记账
+    /// 行到达（两条调用序都安全）；冲突时只改锁/版本列，不碰 owner/set/creation_date。
+    pub async fn enable_bucket_lock(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date, versioning, set_id, object_lock) \
+             VALUES (?, NULL, ?, 'Enabled', 0, 1) \
+             ON CONFLICT(name) DO UPDATE SET object_lock = 1, versioning = 'Enabled'",
+        )
+        .bind(bucket)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// M5 切片 4：设/改默认保留规则（仅锁已开启桶；调用方先校验；None = 清空规则）。
+    pub async fn set_bucket_lock_rule(
+        &self,
+        bucket: &str,
+        mode: Option<&str>,
+        days: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE buckets SET object_lock_default_mode = ?, object_lock_default_days = ? \
+             WHERE name = ?",
+        )
+        .bind(mode)
+        .bind(days)
+        .bind(bucket)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 桶策略读取（M4 切片 7）：None = 未配；**解析失败 = Err**（check 里 fail-closed 拒）。
     pub async fn bucket_policy(
         &self,

@@ -263,6 +263,7 @@ fn merge_page(
                         version_id: None,
                         // 并集降级条目：无全量信息（切片 3 的 SSE 头仅由 head/get 面提供）
                         encryption: None,
+                        lock: None,
                     },
                 };
                 result.objects.push(info);

@@ -70,6 +70,9 @@ pub struct Version {
     /// 前向兼容契约：只加 Option 字段（老解码器跳过未知字段）。
     #[serde(default)]
     pub encryption: Option<EncryptionRecord>,
+    /// M5 切片 4：对象锁（retention 与 legal hold 独立；见 [`ObjectLockRecord`]）。
+    #[serde(default)]
+    pub lock: Option<ObjectLockRecord>,
 }
 
 impl Version {
@@ -154,6 +157,27 @@ pub struct EncryptionRecord {
     /// `key_id="sse-c"` 时必在、其余恒无（decode 强制三态一致，见下方校验）。
     #[serde(default)]
     pub sse_c_key_md5: Option<String>,
+}
+
+/// M5 切片 4：对象锁记录（retention 与 legal hold **相互独立**；meta 无秘密）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectLockRecord {
+    /// `"GOVERNANCE"` / `"COMPLIANCE"`；与 `retain_until_nanos` **成对**（无 retention 则两者皆 None）。
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 保留截止（unix 纳秒；`直到该时刻为止禁删`——`until <= now` 即可删）。
+    #[serde(default)]
+    pub retain_until_nanos: Option<i64>,
+    /// Legal hold：独立于 retention，开启期间禁删（含 admin）；关闭需显式调用。
+    #[serde(default)]
+    pub legal_hold: bool,
+}
+
+impl ObjectLockRecord {
+    /// 是否为「空记录」（无 retention 无 hold）——空则不落字段。
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none() && self.retain_until_nanos.is_none() && !self.legal_hold
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -252,6 +276,18 @@ impl XlMeta {
                         } else {
                             "-"
                         },
+                    )));
+                }
+            }
+            // M5 切片 4：对象锁记录（信任边界）——mode 白名单、与 until 成对、until 非负
+            if let Some(l) = &v.lock {
+                let mode_ok = matches!(l.mode.as_deref(), None | Some("GOVERNANCE" | "COMPLIANCE"));
+                let pair_ok = l.mode.is_some() == l.retain_until_nanos.is_some();
+                let until_ok = l.retain_until_nanos.is_none_or(|t| t >= 0);
+                if !mode_ok || !pair_ok || !until_ok {
+                    return Err(Error::CorruptMeta(format!(
+                        "对象锁记录非法：mode={:?} until={:?}",
+                        l.mode, l.retain_until_nanos
                     )));
                 }
             }
@@ -376,6 +412,7 @@ mod tests {
                 is_latest: None,
                 epoch: None,
                 encryption: None,
+                lock: None,
             }],
         }
     }
@@ -553,13 +590,14 @@ mod tests {
         //（默认 nil）、M2b Task 3 起增加 data_layout/inline 字段（默认 nil）、M4 切片 3 起增加
         // is_delete_marker/is_latest（无版本写 nil——老解码器跳过未知字段 = 前向兼容契约），
         // 摘要均按「有意识更新」流程重算（本次为第四次；**第五次**：M4 切片 4 增 epoch 字段；
-        // **第六次**：M5 切片 2 增 encryption 字段——明文对象写 nil，老解码器跳过）。
+        // **第六次**：M5 切片 2 增 encryption 字段——明文对象写 nil，老解码器跳过；
+        // **第七次**：M5 切片 4 增 lock 字段——无锁对象写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "f9adab1e752c5bed9616ae9dc4c3cbe3a20aa3d0b58b2740e3013bfad2f7ca96"
+            "8a5efe9f8a1074e6540f16c0eb9c3b75556d53de2aecc02a5d3fb97f95a1c78a"
         );
     }
 }
@@ -590,6 +628,7 @@ mod parts_tests {
             is_latest: None,
             epoch: None,
             encryption: None,
+            lock: None,
         }
     }
 

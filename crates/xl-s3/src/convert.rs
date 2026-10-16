@@ -20,6 +20,8 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         // 对 delete marker 版本点名 GET/HEAD：405（S3 语义）
         StoreError::DeleteMarker(_) => S3ErrorCode::MethodNotAllowed,
         StoreError::InvalidArgument(_) => S3ErrorCode::InvalidArgument,
+        // M5 切片 4：锁定删除 → 403 AccessDenied（AWS 对对象锁拒绝的口径）
+        StoreError::ObjectLocked(_) => S3ErrorCode::AccessDenied,
         // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体。
         // M5：Crypto（wrap 解不开/主密钥缺失）暂同归 500 泛化——对客户端可纠正的形态
         // （SSE-C 错钥 → 4xx）在切片 3 接线时再细分，此处不提前放宽。

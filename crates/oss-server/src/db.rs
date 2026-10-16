@@ -93,6 +93,36 @@ impl Db {
                 return Err(e);
             }
         }
+        // M5 切片 4：对象锁三列（同款幂等补列）
+        let bcols = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
+            .fetch_all(&self.pool)
+            .await?;
+        let has = |n: &str| bcols.iter().any(|r| r.get::<String, _>("name") == n);
+        for (name, ddl) in [
+            (
+                "object_lock",
+                "ALTER TABLE buckets ADD COLUMN object_lock INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "object_lock_default_mode",
+                "ALTER TABLE buckets ADD COLUMN object_lock_default_mode TEXT",
+            ),
+            (
+                "object_lock_default_days",
+                "ALTER TABLE buckets ADD COLUMN object_lock_default_days INTEGER",
+            ),
+        ] {
+            if !has(name)
+                && let Err(e) = sqlx::query(ddl).execute(&self.pool).await
+            {
+                let again = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
+                    .fetch_all(&self.pool)
+                    .await?;
+                if !again.iter().any(|r| r.get::<String, _>("name") == name) {
+                    return Err(e);
+                }
+            }
+        }
         let cols = sqlx::query("SELECT name FROM pragma_table_info('users')")
             .fetch_all(&self.pool)
             .await?;

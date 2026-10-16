@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{self, ChecksumRecord, EncryptionRecord, XlMeta};
+use crate::meta::{self, ChecksumRecord, EncryptionRecord, ObjectLockRecord, XlMeta};
 
 mod drives;
 pub mod ec;
@@ -103,6 +103,8 @@ pub struct ObjectInfo {
     pub version_id: Option<String>,
     /// M5 切片 2：加密记录（切片 3 回 `x-amz-server-side-encryption*` 响应头用；None = 明文对象）
     pub encryption: Option<EncryptionRecord>,
+    /// M5 切片 4：对象锁（切片 4 回 `x-amz-object-lock-*` 响应头用；None = 无锁）
+    pub lock: Option<ObjectLockRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1181,6 +1183,13 @@ impl Store {
         self.ensure_bucket(bucket).await?;
         // 与 put 同键串行：删除进行中不得有写者把新版本 rename 进来（否则版本目录会被连带删掉）
         let _guard = self.lock_object(bucket, key).await?;
+        // M5 切片 4（B1 复验补）：硬删（控制台/内部）与 S3 面同口径——链上任一锁定版本即拒；
+        // 控制台删对象端点经此收口（原直达 purge_key 绕过守卫，admin 可销毁 COMPLIANCE 对象）
+        if let Some(m) = self.read_meta(bucket, key).await?
+            && let Some(why) = version::chain_active_lock(&m)
+        {
+            return Err(Error::ObjectLocked(format!("键存在锁定版本：{why}")));
+        }
         self.purge_key(bucket, key).await
     }
 
@@ -1341,3 +1350,5 @@ fn now_nanos() -> i64 {
 mod tests;
 #[cfg(test)]
 mod tests_crypto;
+#[cfg(test)]
+mod tests_lock;

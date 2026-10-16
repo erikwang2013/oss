@@ -43,6 +43,9 @@ pub enum Error {
     /// 精确映射（如 SSE-C 错钥 → 4xx，而非 500 泛化）。
     #[error("crypto error: {0}")]
     Crypto(String),
+    /// M5 切片 4：对象锁拒绝（retention/legal hold 生效中）→ S3 403 AccessDenied（客户端可纠正）。
+    #[error("object locked: {0}")]
+    ObjectLocked(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

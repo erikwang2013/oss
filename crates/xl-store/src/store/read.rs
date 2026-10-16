@@ -60,6 +60,7 @@ impl Store {
             checksum: v.checksum.clone(),
             version_id: Some(v.version_id_str()),
             encryption: v.encryption.clone(),
+            lock: v.lock.clone(),
         })
     }
 

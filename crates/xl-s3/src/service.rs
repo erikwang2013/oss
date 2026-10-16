@@ -17,6 +17,7 @@ use xl_store::meta::ChecksumRecord;
 use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
+use crate::lock::{apply_lock_out, bucket_lock_out, parse_bucket_lock_rule, parse_put_lock};
 use crate::sse::{parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec};
 
 pub struct OssS3 {
@@ -45,6 +46,53 @@ impl OssS3 {
             store,
             acl,
             max_put_bytes,
+        }
+    }
+
+    /// M5 切片 4（L2/L3）：桶锁状态 + 请求锁 → 生效记录。
+    /// 桶行不存在且带锁头 → 404 NoSuchBucket（N4）；未开锁带锁头 → 400；
+    /// 无头 + 开锁桶有默认规则 → 按默认规则计算；余 None（存量无行桶保持既有行为）。
+    async fn resolve_lock(
+        &self,
+        bucket: &str,
+        req: Option<xl_store::meta::ObjectLockRecord>,
+    ) -> S3Result<Option<xl_store::meta::ObjectLockRecord>> {
+        let row = self.acl.bucket_lock(bucket).await.map_err(|e| {
+            tracing::error!(error = %e, "读取桶对象锁状态失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        match (row, req) {
+            (Some((false, _, _)), Some(_)) => Err(s3s::s3_error!(
+                InvalidRequest,
+                "bucket object lock is not enabled"
+            )),
+            (Some((_, _, _)), Some(l)) => Ok(Some(l)),
+            (None, Some(_)) => {
+                // N4 补：行缺失 ≠ 桶不存在。有些桶行可能先于记账缺失（测试/控制台路径），
+                // 真桶按「未开锁」400，真不存在的桶才 404（store 为存在性权威）。
+                let exists = self
+                    .store
+                    .bucket_exists(bucket)
+                    .await
+                    .map_err(to_s3_error)?;
+                if exists {
+                    Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "bucket object lock is not enabled"
+                    ))
+                } else {
+                    Err(s3s::s3_error!(NoSuchBucket, "bucket not found"))
+                }
+            }
+            (None, None) => Ok(None),
+            (Some((true, mode, days)), None) => {
+                if let (Some(m), Some(d)) = (mode, days) {
+                    Ok(Some(crate::lock::default_retention_record(&m, d)))
+                } else {
+                    Ok(None)
+                }
+            }
+            (Some((false, _, _)), None) => Ok(None),
         }
     }
 }
@@ -347,6 +395,15 @@ impl S3 for OssS3 {
             .create_bucket(&bucket)
             .await
             .map_err(to_s3_error)?;
+        // M5 切片 4（L2）：建桶即开锁（AWS：x-amz-bucket-object-lock-enabled 顺带开版本控制）
+        if req.input.object_lock_enabled_for_bucket == Some(true) {
+            self.acl.enable_bucket_lock(&bucket).await.map_err(|e| {
+                tracing::error!(error = %e, bucket, "开桶锁失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+            // 行变更广播（lock/versioning 与归属行同批；best-effort，与 C3 同口径）
+            self.store.broadcast_bucket_row(&bucket, None).await;
+        }
         // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
         // C3：多 set 下缺省**自动指派**（桶数最少的 set；单 set 恒 0 零查询）。
         // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）
@@ -458,6 +515,16 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
             req.input.ssekms_key_id.as_deref(),
         )?;
+        // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
+        let lock_req = parse_put_lock(
+            req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
+            req.input.object_lock_retain_until_date.as_ref(),
+            req.input
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(|s| s.as_str()),
+        )?;
+        let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
         let PutObjectInput {
             bucket,
             key,
@@ -512,6 +579,7 @@ impl S3 for OssS3 {
                 checksum_record,
                 versioned,
                 sse.spec, // M5 切片 3：SSE 头映射（R1/R2）
+                lock,     // M5 切片 4（L3）
             )
             .await;
         let info = match result {
@@ -548,6 +616,16 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
             req.input.ssekms_key_id.as_deref(),
         )?;
+        // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
+        let lock_req = parse_put_lock(
+            req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
+            req.input.object_lock_retain_until_date.as_ref(),
+            req.input
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(|s| s.as_str()),
+        )?;
+        let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -564,6 +642,7 @@ impl S3 for OssS3 {
                 metadata.unwrap_or_default().into_iter().collect(),
                 sse.sse_c_md5(),
                 sse.sse_kind(), // R5 扩展（P2-b）：SSE-S3/KMS 意图持久化，complete 落地
+                lock.as_ref(),  // M5 切片 4（L3）：锁意图持久化，complete 落地
             )
             .await
             .map_err(to_s3_error)?;
@@ -694,6 +773,7 @@ impl S3 for OssS3 {
                 &pairs,
                 versioned,
                 sse.spec.clone(),
+                None,
             )
             .await
             .map_err(to_s3_error)?;
@@ -921,6 +1001,14 @@ impl S3 for OssS3 {
             apply_checksum_get(&mut out, rec);
         }
 
+        // M5 切片 4（L6）：对象锁响应头（GET）
+        apply_lock_out(
+            info.lock.as_ref(),
+            &mut out.object_lock_mode,
+            &mut out.object_lock_retain_until_date,
+            &mut out.object_lock_legal_hold_status,
+        );
+
         // M5 切片 3（R6）：SSE 响应头（S3/KMS 走字段；SSE-C 的 key-MD5 走 headers 补）
         let so = sse_out(info.encryption.as_ref());
         out.server_side_encryption = so
@@ -990,6 +1078,13 @@ impl S3 for OssS3 {
         if let Some(rec) = &info.checksum {
             apply_checksum_head(&mut out, rec);
         }
+        // M5 切片 4（L6）：对象锁响应头（HEAD）
+        apply_lock_out(
+            info.lock.as_ref(),
+            &mut out.object_lock_mode,
+            &mut out.object_lock_retain_until_date,
+            &mut out.object_lock_legal_hold_status,
+        );
         // M5 切片 3（R6）：SSE 响应头（同 GET）
         let so = sse_out(info.encryption.as_ref());
         out.server_side_encryption = so
@@ -1004,6 +1099,188 @@ impl S3 for OssS3 {
         Ok(resp)
     }
 
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        let bucket = req.input.bucket;
+        let row = self.acl.bucket_lock(&bucket).await.map_err(|e| {
+            tracing::error!(error = %e, "读取桶对象锁状态失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        let Some((enabled, mode, days)) = row else {
+            // N4：桶不存在 → 404（区别于「存在但未开锁」的 ObjectLockConfigurationNotFoundError）；
+            // 行缺失但桶在（记账缺）→ 按未开锁处理。
+            let exists = self
+                .store
+                .bucket_exists(&bucket)
+                .await
+                .map_err(to_s3_error)?;
+            return if exists {
+                Err(s3s::s3_error!(
+                    ObjectLockConfigurationNotFoundError,
+                    "object lock configuration not found"
+                ))
+            } else {
+                Err(s3s::s3_error!(NoSuchBucket, "bucket not found"))
+            };
+        };
+        if !enabled {
+            return Err(s3s::s3_error!(
+                ObjectLockConfigurationNotFoundError,
+                "object lock configuration not found"
+            ));
+        }
+        Ok(S3Response::new(GetObjectLockConfigurationOutput {
+            object_lock_configuration: Some(bucket_lock_out(mode.as_deref(), days)),
+        }))
+    }
+
+    /// M5 切片 4（N2 复验补）：开关某版本 legal hold（ON/OFF）。
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        let PutObjectLegalHoldInput {
+            bucket,
+            key,
+            version_id,
+            legal_hold,
+            ..
+        } = req.input;
+        let Some(vid) = version_id else {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "version id is required for object legal hold"
+            ));
+        };
+        // P3-a 复验补：须开锁桶（AWS：无对象锁配置 → 400；N4 同口径分层——桶在 = 未开锁 400，
+        // 桶亡 = 404）。防「非 WORM 语境下产出不可删版本」。
+        {
+            let row = self.acl.bucket_lock(&bucket).await.map_err(|e| {
+                tracing::error!(error = %e, "读取桶对象锁状态失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+            let enabled = match row {
+                Some((enabled, _, _)) => enabled,
+                None => {
+                    if !self
+                        .store
+                        .bucket_exists(&bucket)
+                        .await
+                        .map_err(to_s3_error)?
+                    {
+                        return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
+                    }
+                    false
+                }
+            };
+            if !enabled {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "bucket object lock is not enabled"
+                ));
+            }
+        }
+        let on = match legal_hold
+            .as_ref()
+            .and_then(|h| h.status.as_ref())
+            .map(|s| s.as_str())
+        {
+            Some(ObjectLockLegalHoldStatus::ON) => true,
+            Some(ObjectLockLegalHoldStatus::OFF) => false,
+            _ => {
+                return Err(s3s::s3_error!(InvalidRequest, "invalid legal hold status"));
+            }
+        };
+        self.store
+            .set_object_legal_hold(&bucket, &key, &vid, on)
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(PutObjectLegalHoldOutput::default()))
+    }
+
+    /// M5 切片 4（N2 复验补）：读某版本 legal hold 状态。
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        // P3-b 复验补：元数据面读（不经 head_object 的 SSE-C 客户钥校验——SSE-C 对象「能设
+        // 不能读」的缺口收口；锁状态非秘密，与 AWS 须带数据钥的差异记档）。
+        let on = self
+            .store
+            .get_legal_hold(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await
+            .map_err(to_s3_error)?;
+        let status = if on {
+            ObjectLockLegalHoldStatus::from_static("ON")
+        } else {
+            ObjectLockLegalHoldStatus::from_static("OFF")
+        };
+        Ok(S3Response::new(GetObjectLegalHoldOutput {
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(status),
+            }),
+        }))
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        let bucket = req.input.bucket;
+        let (mode, days) = parse_bucket_lock_rule(req.input.object_lock_configuration.as_ref())?;
+        let row = self.acl.bucket_lock(&bucket).await.map_err(|e| {
+            tracing::error!(error = %e, "读取桶对象锁状态失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        // N4：桶不存在 → 404；行缺失但桶在（记账缺）→ 按未开锁走版本检查
+        let enabled = match row {
+            Some((enabled, _, _)) => enabled,
+            None => {
+                if !self
+                    .store
+                    .bucket_exists(&bucket)
+                    .await
+                    .map_err(to_s3_error)?
+                {
+                    return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
+                }
+                false
+            }
+        };
+        if !enabled {
+            // 首次开启：AWS 要求版本控制已 Enabled（锁须版本化）；开启即保持 Enabled（L2：不可关）
+            let ver = self.acl.bucket_versioning(&bucket).await.map_err(|e| {
+                tracing::error!(error = %e, "读取桶版本状态失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+            if ver != "Enabled" {
+                return Err(s3s::s3_error!(
+                    InvalidBucketState,
+                    "object lock requires bucket versioning enabled"
+                ));
+            }
+            self.acl.enable_bucket_lock(&bucket).await.map_err(|e| {
+                tracing::error!(error = %e, bucket, "开桶锁失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+            self.store.broadcast_bucket_row(&bucket, None).await;
+        }
+        self.acl
+            .set_bucket_lock_rule(&bucket, mode.as_deref(), days)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, bucket, "写桶锁默认规则失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
+    }
+
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
@@ -1011,10 +1288,12 @@ impl S3 for OssS3 {
         let bucket = req.input.bucket;
         let key = req.input.key;
         let vid = req.input.version_id.clone();
+        // M5 切片 4（L4）：Governance bypass 头（调用方均经鉴权链——「非匿名」成立）
+        let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         let versioned = self.versioned(&bucket).await?;
         let outcome = self
             .store
-            .delete_object_versioned(&bucket, &key, vid.as_deref(), versioned)
+            .delete_object_versioned_ext(&bucket, &key, vid.as_deref(), versioned, bypass)
             .await
             .map_err(to_s3_error)?;
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
@@ -1047,6 +1326,8 @@ impl S3 for OssS3 {
         // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
         // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
         let versioned = self.versioned(&bucket).await?;
+        // M5 切片 4（L4）：Governance bypass 头（请求级，作用于全部键——AWS 语义）
+        let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         // 逐键授权（M4 切片 7 / verifier 阻断 1c）：批量删的键在请求体里、check() 阶段不可见，
         // 授权在此逐键完成（策略 Deny/Allow/回落表三档，与单键删同口径；AWS 亦逐键授权）。
         // 判定基础设施失败 = 该键 fail-closed；被拒键记 AccessDenied 进 errors 后继续（§3.4 部分失败）。
@@ -1091,7 +1372,13 @@ impl S3 for OssS3 {
             }
             match self
                 .store
-                .delete_object_versioned(&bucket, &obj.key, obj.version_id.as_deref(), versioned)
+                .delete_object_versioned_ext(
+                    &bucket,
+                    &obj.key,
+                    obj.version_id.as_deref(),
+                    versioned,
+                    bypass,
+                )
                 .await
             {
                 Ok(outcome) => {
@@ -1397,6 +1684,16 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
             req.input.ssekms_key_id.as_deref(),
         )?;
+        // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
+        let dst_lock_req = parse_put_lock(
+            req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
+            req.input.object_lock_retain_until_date.as_ref(),
+            req.input
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(|s| s.as_str()),
+        )?;
+        let dst_lock = self.resolve_lock(&req.input.bucket, dst_lock_req).await?;
 
         // 源：点名版本（回滚路径）或最新
         let (src_info, bytes) = match version_id.as_deref() {
@@ -1424,6 +1721,7 @@ impl S3 for OssS3 {
                 None,
                 dst_versioned,
                 dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
+                dst_lock,     // M5 切片 4（L3）
             )
             .await
             .map_err(to_s3_error)?;

@@ -1771,6 +1771,7 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
                 is_latest: None,
                 epoch: None,
                 encryption: None,
+                lock: None,
             }],
         }
     };
@@ -2200,6 +2201,7 @@ async fn legacy_parts_form_still_readable() {
         is_latest: None,
         epoch: None,
         encryption: None,
+        lock: None,
     };
     let m = XlMeta {
         object_key: "legacy".into(),
@@ -2411,6 +2413,7 @@ async fn meta_roundtrips_checksum_record() {
         Default::default(),
         Some(rec.clone()),
         false,
+        None,
         None,
     )
     .await
@@ -3753,6 +3756,7 @@ async fn versioning_chain_full_flow() {
             None,
             true, // versioned
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4029,6 +4033,7 @@ async fn scrub_detects_bad_and_missing_shards_full_chain() {
             Default::default(),
             None,
             true,
+            None,
             None,
         )
         .await

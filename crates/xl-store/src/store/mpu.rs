@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{PartRef, Version, XlMeta};
+use crate::meta::{self, PartRef, Version, XlMeta};
 use crate::store::{ByteStream, ObjectInfo, Store, now_nanos};
 
 /// 暂存区标记文件；存在即「这是一个活着的 MPU 暂存区」。
@@ -42,6 +42,13 @@ struct MpuMeta {
     /// AWS 语义下该头只出现在 create——complete 必须据此**落地加密**，不得静默降级为明文。
     #[serde(default)]
     sse_kind: Option<String>,
+    /// M5 切片 4（L3）：create 携带的对象锁意图（同 AWS：锁头只出现在 create，complete 落地）。
+    #[serde(default)]
+    lock_mode: Option<String>,
+    #[serde(default)]
+    lock_until_nanos: Option<i64>,
+    #[serde(default)]
+    lock_legal_hold: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,12 +84,13 @@ impl Store {
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
     ) -> Result<String> {
-        self.create_multipart_upload_ext(bucket, key, content_type, user_metadata, None, None)
+        self.create_multipart_upload_ext(bucket, key, content_type, user_metadata, None, None, None)
             .await
     }
 
     /// 创建 MPU（可带 SSE-C 记录 + SSE-S3/KMS 意图；M5 切片 3/R5——只记 md5 与 kind，
     /// 密钥绝不落盘；kind 在 complete 落地）。
+    #[allow(clippy::too_many_arguments)] // 参数面 = 线头映射，无需聚合体（同 rebalance/read 先例）
     pub async fn create_multipart_upload_ext(
         &self,
         bucket: &str,
@@ -91,6 +99,7 @@ impl Store {
         user_metadata: BTreeMap<String, String>,
         sse_c_md5: Option<&str>,
         sse_kind: Option<&str>,
+        lock: Option<&meta::ObjectLockRecord>,
     ) -> Result<String> {
         layout::validate_key(key)?;
         // 桶窗口（M2b-2 Task 10，同单段 PUT）：ensure + 对象目录先落
@@ -111,6 +120,9 @@ impl Store {
             created_nanos: now_nanos(),
             sse_c_md5: sse_c_md5.map(str::to_string),
             sse_kind: sse_kind.map(str::to_string),
+            lock_mode: lock.and_then(|l| l.mode.clone()),
+            lock_until_nanos: lock.and_then(|l| l.retain_until_nanos),
+            lock_legal_hold: lock.is_some_and(|l| l.legal_hold),
         };
         let bytes = rmp_serde::to_vec_named(&meta).map_err(|e| Error::Encode(e.to_string()))?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -240,12 +252,13 @@ impl Store {
         upload_id: &str,
         parts: &[(u16, String)],
     ) -> Result<ObjectInfo> {
-        self.complete_multipart_upload_versioned(bucket, key, upload_id, parts, false, None)
+        self.complete_multipart_upload_versioned(bucket, key, upload_id, parts, false, None, None)
             .await
     }
 
     /// 版本控制感知的 complete（M4 切片 3）：`versioned` 时追加版本（保留旧目录），
     /// 否则维持单版本 + 回收的 M2b 语义（与单段 PUT 同口径）。
+    #[allow(clippy::too_many_arguments)] // 同 create_multipart_upload_ext：线头直通
     pub async fn complete_multipart_upload_versioned(
         &self,
         bucket: &str,
@@ -254,6 +267,7 @@ impl Store {
         parts: &[(u16, String)],
         versioned: bool,
         encryption: Option<crypto::EncSpec>,
+        lock: Option<meta::ObjectLockRecord>,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // 桶窗口（同单段 PUT）
@@ -289,6 +303,41 @@ impl Store {
             }
             (None, _) => {}
         }
+
+        // M5 切片 4（L3）：create 记录的锁意图在 complete **落地**（AWS：锁头只出现在 create）。
+        // complete 携带（仅直调 store API 可构造）须与 create 记录一致；否则 400。
+        let recorded_lock = match (
+            mpu.lock_mode.as_deref(),
+            mpu.lock_until_nanos,
+            mpu.lock_legal_hold,
+        ) {
+            (None, None, false) => None,
+            (m, u, h) => Some(meta::ObjectLockRecord {
+                mode: m.map(str::to_string),
+                retain_until_nanos: u,
+                legal_hold: h,
+            }),
+        };
+        let effective_lock: Option<meta::ObjectLockRecord> = match (&lock, &recorded_lock) {
+            (None, None) => None,
+            (None, Some(rec)) => Some(rec.clone()),
+            (Some(l), None) => {
+                // 与 sse_kind 同口径：create 未声明而 complete 携带 → fail-closed
+                if l.is_empty() {
+                    None
+                } else {
+                    return Err(Error::InvalidArgument(
+                        "create 未声明对象锁，complete 不应携带锁参数".into(),
+                    ));
+                }
+            }
+            (Some(l), Some(rec)) if l == rec => Some(l.clone()),
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidArgument(
+                    "create 与 complete 的对象锁参数不一致".into(),
+                ));
+            }
+        };
 
         // R5 扩展（P2-b 复验补）：create 记录的 SSE-S3/KMS 意图在 complete **落地**——AWS 语义下
         // 该头只出现在 create；不落地则「create 回 AES256、对象实为明文」= 静默降级。
@@ -399,6 +448,13 @@ impl Store {
 
         // M-6 同口径：损坏旧 meta 让 complete fail-closed
         let old_meta = self.read_meta(bucket, key).await?;
+        // M5 切片 4（B2 兜底）：非版本化 complete 回收旧版本前查链锁
+        if !versioned
+            && let Some(old) = old_meta.as_ref()
+            && let Some(why) = super::version::chain_active_lock(old)
+        {
+            return Err(Error::ObjectLocked(format!("覆盖写将回收锁定版本：{why}")));
+        }
         // per-key 单调 mod_time（C4）：与单段 PUT 同口径
         let now = match old_meta.as_ref().and_then(|m| m.latest()) {
             Some(v) => now_nanos().max(v.mod_time_nanos + 1),
@@ -464,6 +520,8 @@ impl Store {
                 epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
                 // M5 切片 2：加密记录随版本落 meta（单流形态：MPU 于 complete 合并后加密）
                 encryption: enc_record.clone(),
+                // M5 切片 4：对象锁（create 记录的意图在此落地）
+                lock: effective_lock.clone(),
             };
             let mut meta = match (versioned, old_meta.as_ref()) {
                 (true, Some(old)) => {
@@ -558,6 +616,7 @@ impl Store {
                 "null".to_string()
             }),
             encryption: enc_record,
+            lock: effective_lock,
         })
     }
 
