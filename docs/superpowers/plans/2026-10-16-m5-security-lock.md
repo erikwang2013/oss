@@ -269,19 +269,67 @@ stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] →
 
 ## 切片 3：S3 面 SSE 接线
 
-- [ ] PutObject/CreateMPU/UploadPart/CompleteMPU/CopyObject/GET/HEAD 的 SSE 头全链
+- [x] PutObject/CreateMPU/UploadPart/CompleteMPU/CopyObject/GET/HEAD 的 SSE 头全链
       （s3s DTO 已备 `server_side_encryption`/`sse_customer_*` 字段）
-- [ ] **切片 1 遗留接线**：按 key_id 路由 provider（`"file"` → FileKeyProvider；`"k<n>"` →
+- [x] **切片 1 遗留接线**：按 key_id 路由 provider（`"file"` → FileKeyProvider；`"k<n>"` →
       KmsFileProvider——同部署 SSE-S3 与 SSE-KMS 混用）；trait 是否加请求 CMK 形参
       （`x-amz-server-side-encryption-aws-kms-key-id` 语义）在接线时定夺并记档；
       key_id 建议纳入 meta AAD（切片 2 定格式时一并）
-- [ ] **切片 2 遗留（复评 S3/S4）**：CopyObject 语义定夺（密文源 → 目标：随源 / 桶默认 / 显式
+- [x] **切片 2 遗留（复评 S3/S4）**：CopyObject 语义定夺（密文源 → 目标：随源 / 桶默认 / 显式
       记档——store.rs:1212-1231 现为解密成 P 再 None 写）；MPU×AWS 偏离（complete 单流加密 vs
       AWS 分片级）落切片 7 README
-- [ ] `head-object`/`get-object` 回 `x-amz-server-side-encryption*`（SSE-C 必回算法；S3/KMS 回 S3/KMS+key_id）
-- [ ] SSE-C 错 key → 拒绝（HMAC 校验，`sse_c_hmac` 落 meta；密钥**绝不落盘**）
-- [ ] 桶级默认加密（PutBucketEncryption/GetBucketEncryption + buckets 列）——评：是否本片（AWS 常用）
-- **定稿**：§
+- [x] `head-object`/`get-object` 回 `x-amz-server-side-encryption*`（SSE-C 必回算法；S3/KMS 回 S3/KMS+key_id）
+- [x] SSE-C 错 key → 拒绝（HMAC 校验，`sse_c_hmac` 落 meta；密钥**绝不落盘**）
+- [x] 桶级默认加密（PutBucketEncryption/GetBucketEncryption + buckets 列）——评：是否本片（AWS 常用）
+**接线裁决（2026-10-16，实施前定，交 verifier 随实现核查）**：
+- **R1 SSE-C 形态**：客户端钥（32B）**直接作单元 AEK**（无信封）；校验值 = **base64(MD5(key))（AWS
+  同款 key-MD5）**而非 HMAC——与 aws-cli 行为逐字节对齐；落 meta 新字段
+  `EncryptionRecord.sse_c_key_md5`，`key_id="sse-c"`、`wrapped_dek` 恒空（decode 强制三态一致）。
+  密钥绝不落盘；错钥/缺钥 → `Error::InvalidArgument`（→400）。读/HEAD 均校验 MD5；非 SSE-C 对象
+  带 SSE-C 头 → 400（AWS 语义）。
+- **R2 trait CMK 形参**：显式 `x-amz-server-side-encryption-aws-kms-key-id` → **400 fail-closed**
+  （文件型 KMS 单主密钥；「KMS 多主密钥轮换编排」恰在钉子不做清单）；HTTP KMS 落地时再开。
+  ——闭合切片 1 遗留条（定夺 = 拒而记档）。
+- **R3 桶级默认加密**：**不本片**——需 buckets 列 + 三组 handler + 覆写/复制面联动，属独立小片；
+  记档进切片 7 遗留（「M5 后独立小片」）。
+- **R4 CopyObject**：源读按 `copy-source-sse-c*` 头（源为 SSE-C 必带，否则 400）；目标按
+  `sse_customer_*`/`server_side_encryption` 显式头决定，未给 = 明文目标（AWS 无桶默认时同义）
+  ——履行切片 2 复评 S3 承诺。
+- **R5 MPU 一致性**：Create 时 SSE-C → `mpu.meta` 记 md5；UploadPart/Complete 必带同钥（md5 不符/
+  缺失 → 400）；Create 无而 Complete 带 SSE-C → 400。分片暂存仍明文（D8 口径），加密在 complete
+  单流。**（复验升级 P2-b）**：SSE-S3/KMS 意图由 Create 记入 `mpu.meta.sse_kind` 并在 Complete
+  **落地**（AWS：该头只出现在 create）——不落地=「create 回 AES256、对象实为明文」静默降级；
+  跨调用模式不一致 / 单侧携带 → 400。原「SseS3/KMS 不强制」措辞作废。
+- **R6 读面**：`get/head/version` 增 `_ext` 变体带 `Option<&SseCKey>`（旧签名委托 None，零 churn）；
+  GET/HEAD 响应：S3/KMS 回 `server_side_encryption` + `ssekms_key_id`（= meta key_id）；SSE-C 回
+  `sse_customer_algorithm` + key-MD5（DTO 缺字段处用 `S3Response::with_headers` 补）。
+- **R7 错误面**：客户端可纠正类一律 `InvalidArgument` → 400（convert.rs 既有映射）；服务端类维持
+  Crypto → 500。
+- **R8 测试面**：xl-s3 新模块 `sse.rs`（纯解析/响应助手 + 单测）；store 级 SSE-C 往返/Range/内联/
+  MPU 一致性/错钥进 `tests_crypto.rs`。
+- **定稿（2026-10-16）**：七闸全绿于终树（xl-store **183+1ignored**（SSE-C 新测 4 枚）/ kill9 2 /
+  oss-server 67 / xl-s3 **56**（sse.rs 3 + 服务层线级 2）/ xl-client+xl-proto 5 / clippy
+  --workspace --all-targets -D warnings / fmt）。**锚**：闸树 `git diff|md5sum` = `4d6a0f13`
+  （代码自闸后零漂移；计划 R5 段系闸后按其复验观察改写）；sse.rs `597ee959` / service.rs
+  `dce5ba87` / object_ops.rs `af960700` / mpu.rs `56ceb218` / tests_crypto.rs `c81a81a8`。
+  verifier **两轮**：第 1 轮 对抗核查 可收口（R1-R8 全条成立、钥不落盘全链证明、读面 6 落点枚举、
+  无 provider 纯 SSE-C 可用），定夺两枚 P2 + P3-a 修复；scoped 复验 **可收口**（P2-a/P2-b/P3-a/
+  P3-c①② 全 ADDRESSED、零新引入）。**落地形态**：SSE-C = 客户端钥直作单元 AEK（无信封）+
+  base64(MD5(key)) 为唯一落盘校验值（key_id="sse-c"、wrapped 恒空、decode 三态一致，切片 2 的
+  「空 wrapped 预留」形态被收编）；SSE-S3/KMS 响应回 server_side_encryption+ssekms_key_id；SSE-C
+  回 algorithm + key-MD5（GET/HEAD 的 MD5 头与 Complete 的 dual 头经 `S3Response::with_headers`
+  补）；MPU 三向一致性（create 记 md5 与 sse_kind → upload/complete 校验 → **kind 在 complete
+  落地加密**）；CMK 显式指定 → 400（R2 钉子）；CopyObject 源/目标双向接线（R4）。
+  **复验修复记**：P2-a（PUT/UploadPart 响应补 key-MD5，服务层线级测试直钉）、P2-b（create 的
+  SSE-S3/KMS 意图经 mpu.meta 持久化并在 complete 落地——修前属「create 回 AES256、对象实为明文」
+  静默降级）、P3-a（SSE-C×CMK 互斥 400）。**记档**：①P3-b——`store.copy_object`（store.rs）仍为
+  读明文再写 None 的遗留实现（S3 面已不走；console/内部启用前须带 spec）；②P3-d——头形态错误用
+  InvalidRequest、store 面客户端可纠正类用 InvalidArgument，皆 400（AWS 对齐）；③P3-c 残余——
+  (None,Some 非法 kind)/(Some(SseS3),None) 两分支与 GET 线测 body 未直钉（复验判 P3 微缺口，
+  语义已逐分支推演）；④fsck repair 对无钥 SSE-C 对象读时修静默跳过（`let _ =`；分片级 CRC 计数
+  不受影响——修复需钥，属正确行为）；⑤桶级默认加密按 R3 未本片（切片 7 遗留「M5 后独立小片」）；
+  ⑥仅直调 store API 可构造的 complete 单侧 SSE-S3/KMS → 400（R5 扩展 fail-closed）。提交
+  `40ecc9a`。
 
 ## 切片 4：对象锁
 
