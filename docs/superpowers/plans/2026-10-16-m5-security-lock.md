@@ -405,14 +405,75 @@ stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] →
 
 ## 切片 5：STS
 
-- [ ] `access_keys` 扩展：`parent_ak` / `session_policy` / `kind`（long-term|session）——ensure_columns 幂等
-- [ ] `GetSessionToken`（自凭据派生更短 TTL）与 `AssumeRole`（角色先落「角色=用户别名」最小模型：
+- [x] `access_keys` 扩展：`parent_ak` / `session_policy` / `kind`（long-term|session）——ensure_columns 幂等
+- [x] `GetSessionToken`（自凭据派生更短 TTL）与 `AssumeRole`（角色先落「角色=用户别名」最小模型：
       RoleSessionName/Policy 参数/时长上限；ARN 形态 `arn:oss:iam::<acct>:role/<name>`——账号单租户简化）
-- [ ] SigV4 链：`x-amz-security-token` 头解析 → auth.rs 校验会话 AK + 过期 + 父链
-- [ ] 会话策略 ∩ 用户策略：check()/Acl 带出会话策略，在既有融合后**再叠**（会话 Deny 优先 + 会话
+- [x] SigV4 链：`x-amz-security-token` 头解析 → auth.rs 校验会话 AK + 过期 + 父链
+- [x] 会话策略 ∩ 用户策略：check()/Acl 带出会话策略，在既有融合后**再叠**（会话 Deny 优先 + 会话
       未 Allow 即拒——交集语义）；审计 detail 标 session
-- [ ] 测试：签发→用→过期拒；会话策略比用户更窄时生效；凭据对 S3 面与控制面各面的行为口径
-- **定稿**：§
+- [x] 测试：签发→用→过期拒；会话策略比用户更窄时生效；凭据对 S3 面与控制面各面的行为口径
+- **定稿（2026-10-17）**：代码提交 `e87275d`（11 文件 +1401/−23）+ 本定稿提交（紧随其后）。
+  七闸实测（B 树 `git diff|md5sum` = `61e37eac`；闸后 access.rs 仅测试面增补——ASIA_OPEN 安全向
+  断言+注释修正，零行为漂移，复验建议项）：xl-store **188+1ignored** / kill9 2 / oss-server 67 /
+  xl-s3 **46+3+28**（lib 46 含 sts 8 枚 + auth 11（新增父链/ExpiredToken/父属主停用 3）+ access
+  session_tests 5）/ xl-client+xl-proto 5 / clippy `--workspace --all-targets -D warnings` 净 /
+  fmt 净。锚：sts.rs `6375329b`、auth.rs `a2603b70`、access.rs `be244b12`（测试增补后）、
+  cluster_control.rs `d249733e`、oss.proto `7ef816b2`、mesh.rs `b82098c6`、xl-client `56c59771`
+  （sha256 前16）。
+  verifier **两轮**（报告 `.superpowers/sdd/2026-10-16-m5-security-lock/verifier-m5s5-report.md`）：
+  ①对抗核查「不可直接收口」——**P2-1**：`fuse_session` 的 CopyObject **src 轴在目标桶/键上求值**
+  （会话对源读的收窄可被 copy 绕过；同桶用例曾掩盖）+ P3-1 父属主停用不传播 / P3-2 策略扇出吞错
+  fail-open 竞态 / P3-3 urandom 全零兜底；②修复轮 → 增量复查「**可收口**」（P2-1/P3-1/P3-2 真判别
+  推演全过；S1-S7/S9 全成立；s3s「签名先于 call」经源码核实 ops/mod.rs:945）。
+  **落地形态**：会话行 = access_keys（kind/parent_ak/expires_at/session_policy）；AK `ASIA`+32hex；
+  token 不落库（AK 即凭据）；父链一层 + 父属主 active（三处 SQL 逐字同口径 + 扇出携带 sp）；
+  过期会话 → ExpiredToken（长时键维持 InvalidAccessKeyId）；StsRoute 前置（不覆写 check_access）；
+  AssumeRole 限管理员（S6 加严）；`fuse_session` 交集（src 轴在**源资源**求值——P2-1 修复）+
+  DeleteObjects 逐键叠会话；审计缀 `;session:<allow|deny>`。
+  **记档**：①session_token 不校验（s3s S3Auth 无头面；AWS 信任链差异）；②STS 错误走 S3 错误 XML
+  （非 STS ErrorResponse 形态；成功路径 aws-cli 直用）；③GET query 形态（`?Action=`）不接（走成未知
+  S3 op 错误）；④时长越界用 InvalidArgument（AWS ValidationError 码不在 s3s 词表）；⑤会话无级联
+  清理（孤儿行自然不可用）；⑥S6：acct 段不校验、角色无信任策略（限管理员即此位）；⑦S8：未映射
+  s3_action 的 op 会话不约束（词表缺项）；⑧P3-3 属审查级（无注入 seam，无法测试判别）；⑨集群
+  扇出无答 → 500（fail-closed 行为面，P3-2 修复的直接后果）；⑩凭据对控制面口径：会话仅在 S3 面
+  生效（控制台/aether 走 JWT，无 AK 入口——不适用即不测，口径记录）。
+
+**接线裁决（2026-10-17，实施前定，交 verifier 随实现核查）**：
+- **S1 会话模型**：会话 = `access_keys` 行（`kind='session'`、`parent_ak` 指父、`expires_at` 必非空、
+  `session_policy` 可选 JSON）；AK 形态 `ASIA` + 32 hex（OsRng）；SK = 32B hex。**session_token 随响应
+  返回但不落库、不校验**（s3s 的 S3Auth 接口只有 AK→SK 无头面；AK 即凭据——AWS 信任链差异记档）。
+  会话只在 **S3 面**生效（控制台/aetherupload 走 JWT，无 AK 入口）。
+- **S2 父链**（三处 SQL 同口径：auth.rs / user_of_key / cluster_control AccessKey）：父链 = 一层，
+  父须 `kind='long-term'` 且 active、未过期（行子查询/LET JOIN 条件式——非会话行等价恒真）。
+  父删/停 → 子即失效；**无级联删除**（孤儿会话行自然不可用，清理记档）。
+- **S3 过期错误面**（spec §0.2）：会话行存在但过期 → 认证层 **ExpiredToken**（仅 `kind='session'`；
+  长时键维持 InvalidAccessKeyId）；「负例锁死错误码」测试扩面而非破坏。
+- **S4 路由**：s3s `S3Route`——`is_match` = POST ∧ path=`/` ∧ form-urlencoded（谓词廉价无副作用）；
+  s3s 管线保证 **verify_signature 在 route.call 前**（ops/mod.rs:945）→ call 时 `req.credentials`
+  已验证；**不覆写 check_access**（默认要求凭据 = STS 须签名，MinIO 同）。只支持 POST 形（GET query
+  形不接，记档）。`set_route` 在 router.rs 装配。
+- **S5 请求/响应**：form 字段 Action/Version/DurationSeconds/RoleArn/RoleSessionName/Policy；
+  响应 XML（AssumeRoleResponse / GetSessionTokenResponse + Credentials）`text/xml`。**错误响应走 s3s
+  S3 错误 XML**（非 STS ErrorResponse 形态——记档；成功路径 aws-cli 直用）。
+- **S6 角色最小模型**：「角色 = 用户别名」——RoleArn `arn:oss:iam::<acct>:role/<name>`，`<name>`
+  解析为**用户名**；不存在/停用 → AccessDenied。不校验 acct 段（单租户简化；记档）。会话 user_id =
+  角色用户的 uid（= 以该用户身份行使权限）。**（实施中加严，2026-10-17）调用者须管理员**：
+  无角色信任策略的最小模型若谁都能 AssumeRole → 子账户可自铸 admin 角色会话 = 提权面；管理员
+  已全权，铸造任何角色会话不构成提权（记档：角色信任关系归完整 IAM）。GetSessionToken 任意用户
+  可自派生（无提权面；调用者须 long-term 长时键——临时凭据不可再签）。
+- **S7 时长**：GetSessionToken 900..=129_600（默认 43200）；AssumeRole 900..=43_200（默认 3600）。
+  越界/非法 → 400（`InvalidArgument`；AWS 的 `ValidationError` 码不在 s3s 词表——记档）。
+  **上限无角色策略约束**（最小模型；记档）。
+- **S8 会话策略**：仅 **AssumeRole 收** `Policy` 参数（AWS：GetSessionToken 无此参数；带了忽略=记档）；
+  ≤4096 字节、解析/校验失败 → 400 `MalformedPolicyDocument` 语义走 `InvalidArgument`（码差异记档）。
+  **求值**：在表三档 × 桶策略融合**之后**叠交集——会话 `Deny` → 拒；**无匹配 → 拒**（未 Allow 即拒）；
+  `Allow` → 保留基线（不能抬升）。**s3_action 未映射 op 会话不约束**（词表缺项，同桶策略口径；
+  记档）。CopyObject 双轴分别求值（dst=PutObject 映射 / src=GetObject），与桶策略融合同构。
+  读/解析失败 → fail-closed 拒。**DeleteObjects**：check 下放 handler——`key_delete_decision`
+  逐键同步叠会话判定（防批量删绕过会话策略）。审计 detail：会话决定方向时缀 `;session:<allow|deny|error>`。
+- **S9 集群**：会话行单节点铸（同 AK 口径：任一节点铸的全集群可用）；`ControlResp` 加
+  `string session_policy=9`（整栈同版本升级约束不变）；扇出 AccessKey 应答带 session_policy，远端
+  节点照常评价交集。**session_policy=NULL 的会话经扇出 = 无约束**（与线上口径一致）。
 
 ## 切片 6：SK 加密存
 
