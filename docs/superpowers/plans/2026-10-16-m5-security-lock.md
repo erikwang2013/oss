@@ -436,7 +436,13 @@ stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] →
   清理（孤儿行自然不可用）；⑥S6：acct 段不校验、角色无信任策略（限管理员即此位）；⑦S8：未映射
   s3_action 的 op 会话不约束（词表缺项）；⑧P3-3 属审查级（无注入 seam，无法测试判别）；⑨集群
   扇出无答 → 500（fail-closed 行为面，P3-2 修复的直接后果）；⑩凭据对控制面口径：会话仅在 S3 面
-  生效（控制台/aether 走 JWT，无 AK 入口——不适用即不测，口径记录）。
+  生效（控制台/aether 走 JWT，无 AK 入口——不适用即不测，口径记录）；⑪PostObject（form 上传）
+  对带对象级 ARN 的会话策略**恒拒**（check 阶段键在 form body 不可见，桶级 ARN 又不匹配——同
+  DeleteObjects 但未做逐键复评；本版控制台/aether 不走 PostObject + 会话，记档）；⑫**跨节点过期码
+  漂移**：过期判定探针仅本地——会话行在对端、经扇出命中过期时，对外码是 InvalidAccessKeyId 而非
+  ExpiredToken（单节点路径是本码；与 ⑨ 同族）；⑬**StsRoute 全链本地库**（caller_of/角色查找不
+  扇出）：调用者长时键须在**接收 STS 请求的节点** DB 在册——集群下经未持行节点 AssumeRole 会
+  AccessDenied（签发本身单节点写、**使用**全集群可用不受影响；记档）。
 
 **接线裁决（2026-10-17，实施前定，交 verifier 随实现核查）**：
 - **S1 会话模型**：会话 = `access_keys` 行（`kind='session'`、`parent_ak` 指父、`expires_at` 必非空、
