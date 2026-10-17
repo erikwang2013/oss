@@ -961,8 +961,13 @@ fn classify(op: &str) -> Option<Gate> {
         "GetBucketReplication" => Gate::Need(Action::Read),
         "DeleteBucketReplication" => Gate::OwnerBucket,
         // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
-        "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject"
-        | "ListObjectVersions" => Gate::Need(Action::Read),
+        "HeadBucket"
+        | "ListObjectsV2"
+        | "ListParts"
+        | "GetObject"
+        | "HeadObject"
+        | "ListObjectVersions"
+        | "SelectObjectContent" => Gate::Need(Action::Read),
         // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
         // put_object，op 名看到的是 "PostObject"，不映射它就是浏览器表单直传的漏检点）
         "PutObject"
@@ -1237,6 +1242,7 @@ mod tests {
             "ListObjectVersions",
             "GetObject",
             "HeadObject",
+            "SelectObjectContent",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Read)), "{op}");
         }

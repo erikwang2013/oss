@@ -5,6 +5,7 @@ pub mod events;
 pub mod lock;
 pub mod notify;
 pub mod policy;
+pub mod select;
 pub mod service;
 pub mod skvault;
 pub mod sse;

@@ -39,6 +39,10 @@ aes-gcm = "0.10"
 # M5 切片 3：SSE-C 的 base64 钥/key-MD5 编解码（AWS 线格式）
 base64 = "0.22"
 rskafka = { version = "0.6", default-features = false }
+# M6 切片 2：S3 Select 的 SQL AST（AWS 方言求值器自写）
+sqlparser = "0.53"
+# M6 切片 2：GZIP 输入解压（纯 Rust backend）
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # M5 切片 4：对象锁 retain-until 的时间换算（s3s::dto::Timestamp ↔ OffsetDateTime）
 time = "0.3"
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }

@@ -1581,6 +1581,289 @@ impl S3 for OssS3 {
         ))
     }
 
+    /// M6 切片 2：S3 Select（规格 §12；Records/Progress/Stats/End 事件序列 → s3s 成帧）。
+    async fn select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        use crate::select as sel;
+        // 全量缓冲上限（README 记档）；解压另设上限防压缩炸弹
+        const MAX_INPUT: usize = 256 * 1024 * 1024;
+        const MAX_INFLATED: usize = 512 * 1024 * 1024;
+
+        let SelectObjectContentInput {
+            bucket,
+            key,
+            request,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            ..
+        } = req.input;
+        // 1) 请求校验先行（白名单/格式/压缩/ScanRange），不支持的语法不付读取成本
+        if request.expression_type.as_str() != "SQL" {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "only SQL expression type is supported"
+            ));
+        }
+        let plan = sel::parse(&request.expression)?;
+        let comp = request
+            .input_serialization
+            .compression_type
+            .as_ref()
+            .map(|c| c.as_str().to_string())
+            .unwrap_or_else(|| "NONE".to_string());
+        match comp.as_str() {
+            "NONE" | "GZIP" => {}
+            "BZIP2" => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "BZIP2 compression is not supported yet"
+                ));
+            }
+            other => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "不支持的压缩类型：{}",
+                    other
+                ));
+            }
+        }
+        if comp == "GZIP" && request.scan_range.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "ScanRange is not supported for GZIP objects"
+            ));
+        }
+        if request.input_serialization.parquet.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "Parquet input is not supported yet"
+            ));
+        }
+
+        // 输入/输出格式
+        let cf = |v: &str| -> S3Result<u8> {
+            let b = v.as_bytes();
+            if b.len() != 1 {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "CSV delimiter must be a single byte"
+                ));
+            }
+            Ok(b[0])
+        };
+        let in_fmt = match (
+            request.input_serialization.csv.as_ref(),
+            request.input_serialization.json.as_ref(),
+        ) {
+            (Some(c), None) => {
+                let d = sel::CsvIn {
+                    field: cf(c.field_delimiter.as_deref().unwrap_or(","))?,
+                    quote: cf(c.quote_character.as_deref().unwrap_or("\""))?,
+                    escape: cf(c.quote_escape_character.as_deref().unwrap_or("\""))?,
+                    record: cf(c.record_delimiter.as_deref().unwrap_or("\n"))?,
+                    // AWS 缺省注释字符 #
+                    comments: Some(cf(c.comments.as_deref().unwrap_or("#"))?),
+                    header: match c
+                        .file_header_info
+                        .as_ref()
+                        .map(|x| x.as_str())
+                        .unwrap_or("NONE")
+                    {
+                        "USE" => sel::HeaderMode::Use,
+                        "IGNORE" => sel::HeaderMode::Ignore,
+                        "NONE" => sel::HeaderMode::None,
+                        _ => return Err(s3s::s3_error!(InvalidRequest, "invalid FileHeaderInfo")),
+                    },
+                    allow_quoted_record_delimiter: c.allow_quoted_record_delimiter.unwrap_or(false),
+                };
+                sel::InFormat::Csv(d)
+            }
+            (None, Some(j)) => {
+                let lines = match j.type_.as_ref().map(|x| x.as_str()).unwrap_or("DOCUMENT") {
+                    "LINES" => true,
+                    "DOCUMENT" => false,
+                    _ => return Err(s3s::s3_error!(InvalidRequest, "invalid JSON type")),
+                };
+                sel::InFormat::Json { lines }
+            }
+            _ => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "exactly one of CSV/JSON input serialization is required"
+                ));
+            }
+        };
+        let out_fmt = match (
+            request.output_serialization.csv.as_ref(),
+            request.output_serialization.json.as_ref(),
+        ) {
+            (Some(c), None) => sel::OutFormat::Csv(sel::CsvOut {
+                field: cf(c.field_delimiter.as_deref().unwrap_or(","))?,
+                quote: cf(c.quote_character.as_deref().unwrap_or("\""))?,
+                escape: cf(c.quote_escape_character.as_deref().unwrap_or("\""))?,
+                always_quote: c.quote_fields.as_ref().map(|x| x.as_str()) == Some("ALWAYS"),
+                record: cf(c.record_delimiter.as_deref().unwrap_or("\n"))?,
+            }),
+            (None, Some(j)) => sel::OutFormat::Json {
+                record: cf(j.record_delimiter.as_deref().unwrap_or("\n"))?,
+            },
+            _ => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "exactly one of CSV/JSON output serialization is required"
+                ));
+            }
+        };
+        // JSON DOCUMENT 无法按记录偏移做 ScanRange —— 读对象前拒绝
+        if request.scan_range.is_some() && matches!(in_fmt, sel::InFormat::Json { lines: false }) {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "ScanRange 不支持 JSON DOCUMENT 输入"
+            ));
+        }
+        let progress = request
+            .request_progress
+            .as_ref()
+            .and_then(|p| p.enabled)
+            .unwrap_or(false);
+        // SSE-C 对象读取（钥来自 Select 请求头三件套）
+        let sse = crate::sse::parse_sse(
+            sse_customer_algorithm.as_deref(),
+            sse_customer_key.as_deref(),
+            sse_customer_key_md5.as_deref(),
+            None,
+            None,
+        )?;
+
+        // 2) 读取 + 解压（先 HEAD 量体积，避免为超大对象付全量读/解密）
+        let info = self
+            .store
+            .head_object_ext(&bucket, &key, sse.key.as_ref())
+            .await
+            .map_err(to_s3_error)?;
+        if info.size > MAX_INPUT as u64 {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "对象超过 S3 Select 的 256MiB 输入上限"
+            ));
+        }
+        let (_info, bytes) = self
+            .store
+            .get_object_ext(&bucket, &key, sse.key.as_ref())
+            .await
+            .map_err(to_s3_error)?;
+        if bytes.len() > MAX_INPUT {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "对象超过 S3 Select 的 256MiB 输入上限"
+            ));
+        }
+        let input_owned: Vec<u8> = if comp == "GZIP" {
+            use std::io::Read as _;
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(&bytes[..])
+                .take(MAX_INFLATED as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|_| s3s::s3_error!(InvalidRequest, "GZIP decompress failed"))?;
+            if out.len() > MAX_INFLATED {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "GZIP 解压后超过 512MiB 上限"
+                ));
+            }
+            out
+        } else {
+            bytes.to_vec()
+        };
+
+        // 3) ScanRange：AWS 语义 = 记录首字节落在区间内则整条处理；仅 End = 末尾 N 字节
+        let len = input_owned.len() as i64;
+        let mut scan: Option<(i64, i64)> = None;
+        if let Some(sr) = request.scan_range.as_ref() {
+            let (start, end) = match (sr.start, sr.end) {
+                (None, None) => (0, len.saturating_sub(1)),
+                (Some(s), None) => (s, len.saturating_sub(1)),
+                (Some(s), Some(e)) => {
+                    if s > e {
+                        return Err(s3s::s3_error!(
+                            InvalidRequest,
+                            "ScanRange Start 不得大于 End"
+                        ));
+                    }
+                    (s, e)
+                }
+                (None, Some(n)) => {
+                    if n < 0 {
+                        return Err(s3s::s3_error!(InvalidRequest, "ScanRange 不允许负值"));
+                    }
+                    ((len - n).max(0), len.saturating_sub(1))
+                }
+            };
+            if start < 0 || end < 0 {
+                return Err(s3s::s3_error!(InvalidRequest, "ScanRange 不允许负值"));
+            }
+            scan = Some((start, end));
+        }
+        let scan_bytes = scan.map(|(lo, hi)| {
+            if len == 0 {
+                return 0;
+            }
+            let lo = lo.clamp(0, len);
+            let hi = hi.clamp(0, len - 1);
+            if lo <= hi { hi - lo + 1 } else { 0 }
+        });
+        let default_scanned = if comp == "GZIP" {
+            bytes.len() as i64
+        } else {
+            len
+        };
+
+        let events = sel::evaluate(
+            &plan,
+            &input_owned,
+            &in_fmt,
+            &out_fmt,
+            &sel::EvalOptions {
+                request_progress: progress,
+                scanned: Some(scan_bytes.unwrap_or(default_scanned)),
+                scan,
+            },
+        )?;
+
+        let mut evs = Vec::with_capacity(events.len());
+        for e in events {
+            evs.push(Ok(match e {
+                sel::SelectEvent::Records(b) => SelectObjectContentEvent::Records(RecordsEvent {
+                    payload: Some(Body::from(b)),
+                }),
+                sel::SelectEvent::Progress(s) => {
+                    SelectObjectContentEvent::Progress(ProgressEvent {
+                        details: Some(Progress {
+                            bytes_scanned: Some(s.bytes_scanned),
+                            bytes_processed: Some(s.bytes_processed),
+                            bytes_returned: Some(s.bytes_returned),
+                        }),
+                    })
+                }
+                sel::SelectEvent::Stats(s) => SelectObjectContentEvent::Stats(StatsEvent {
+                    details: Some(Stats {
+                        bytes_scanned: Some(s.bytes_scanned),
+                        bytes_processed: Some(s.bytes_processed),
+                        bytes_returned: Some(s.bytes_returned),
+                    }),
+                }),
+                sel::SelectEvent::End => SelectObjectContentEvent::End(EndEvent {}),
+            }));
+        }
+        let stream = SelectObjectContentEventStream::new(futures::stream::iter(evs));
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(stream),
+        }))
+    }
+
     /// M6 切片 0：读桶通知配置（未配置 = 空配置）。
     async fn get_bucket_notification_configuration(
         &self,
