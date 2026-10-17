@@ -482,12 +482,16 @@ heal / scrub 独立命令 · rebalance 追加式扩容（C4 同盘 hardlink 快�
 4. STS：AssumeRole 拿到临时凭据，`aws-cli` 用它能访问；过期后拒绝；会话策略与用户策略取交集生效
 5. SSE-KMS 换主密钥后旧对象仍可读（DEK 未变）
 
-**M5 落地状态（进行中，2026-10-16 起）**：切片 0 集群行一致性广播 · 切片 1 密钥库
-（`KeyProvider` trait + 单钥文件 + 多钥 KMS 目录，验收 ⑤）· 切片 2 加密数据面（先加密后 EC、
-DARE 式块对齐 AES-256-GCM，验收 ①②数据面侧）· 切片 3 S3 面 SSE 三模式全链 · 切片 4 对象锁
-（桶级默认保留 + 对象级 GOVERNANCE/COMPLIANCE/Legal Hold + 删除守卫，验收 ③）——**已落地**；
-剩余：切片 5 STS（验收 ④）· 切片 6 SK 加密存储 · 切片 7 WebIdentity（条件式）+ e2e §18 +
-README + 收尾。实施记录见 `plans/2026-10-16-m5-security-lock.md`。
+**M5 落地状态（2026-10-17）**：切片 0 集群行一致性广播 · 切片 1 密钥库（`KeyProvider` trait +
+单钥文件 + 多钥 KMS 目录，验收 ⑤）· 切片 2 加密数据面（先加密后 EC、DARE 式块对齐
+AES-256-GCM，验收 ①②数据面侧）· 切片 3 S3 面 SSE 三模式全链 · 切片 4 对象锁（桶级默认保留 +
+对象级 GOVERNANCE/COMPLIANCE/Legal Hold + 删除守卫，验收 ③）· 切片 5 STS（AssumeRole /
+GetSessionToken + 会话策略交集；**AssumeRole 限管理员**——无角色信任策略的最小模型防提权，
+验收 ④）· 切片 6 SK 信封加密存（console 建键 / STS 签发 / 读侧迁移三写点全 vault-aware）——
+**已落地**。**AssumeRoleWithWebIdentity 经成本评估裁剪延后**（JWKS 拉取需出站 TLS 客户端依赖栈；
+验收不涉；接入点已留）——用户知悉项，见 M5 计划。e2e：`tests/e2e_s3.sh` §18（SSE 三模式 +
+盘上明文 grep + 对象锁全矩阵 + STS + SK 落库密文）与 `e2e_m3_cluster.sh` §0c（桶行广播接线）。
+实施记录见 `plans/2026-10-16-m5-security-lock.md`。
 
 ### M6 数据流（3-5 周）
 

@@ -529,11 +529,37 @@ stage_payload_multi 加密往返**；⑥ 门闩：drives=[未在册, 在册] →
 
 - [ ] AssumeRoleWithWebIdentity：验 RS256 JWT（jsonwebtoken）+ JWKS 拉取缓存（`OSS_OIDC_ISSUER` 配置）
       ——**成本评估后决策**：做则全链测试；不做则计划记档裁剪（设计文档范围项，需用户知悉）
-- [ ] e2e_s3.sh 新 §18：SSE 三模式写入→head 头断言→盘上 grep 明文特征串（验收 ①②）；锁头部；
+      ——**裁决（2026-10-17）：裁剪不做，记档延后**。成本盘点：JWKS 拉取需新增**出站 TLS HTTP 客户端**
+      （reqwest/rustls 全栈新依赖）+ RS256 验签（jsonwebtoken）+ 信任面配置（issuer/audience）+ 测试用
+      JWKS 服务，属独立小片；**验收 ①–⑤ 不含 WebIdentity**（④ 已由 AssumeRole/GetSessionToken 达成）；
+      设计文档 §M5 原文即以本片为条件项。**延后非丢弃**：接入点 = `StsRoute::call` 的动作分发
+      （`Some(_)` 分支）+ `caller_of` 的免签名路径（WebIdentity 为匿名调用，须覆写 `check_access`），
+      随 M6 或用户点名再做。README「STS（M5）」节明示此裁剪（用户知悉面）。
+- [x] e2e_s3.sh 新 §18：SSE 三模式写入→head 头断言→盘上 grep 明文特征串（验收 ①②）；锁头部；
       STS 临时凭据调用（验收 ③④）；**并补切片 0 遗留的接线断言**（建/删桶后各节点解析立即一致，
-      免重启——广播四条调用点 + 回填接线的 e2e 覆盖）
-- [ ] README：加密/锁/STS 章节 + 主密钥运维（分发/轮换口径）+ 已知边界
-- [ ] 计划定稿（逐片勾选 + 证据链）；发布待用户口令
+      免重启——广播四条调用点 + 回填接线的 e2e 覆盖）——**接线断言落 `e2e_m3_cluster.sh` §0c**
+      （「各节点」语义属集群；单机脚本无从断言）
+- [x] README：加密/锁/STS 章节 + 主密钥运维（分发/轮换口径）+ 已知边界
+- [x] 计划定稿（逐片勾选 + 证据链）；发布待用户口令
+- **定稿（2026-10-17）**：交付 = e2e 双脚本 + 全库文档收口；提交 `test(m5-s7)` 与 `docs(m5)` 两枚。
+  **实跑证据（本机真进程 · aws-cli + rclone 实弹）**：
+  - `tests/e2e_s3.sh` 全本 **EXIT=0**（§1–18 全绿）。§18：SSE-S3/KMS/C 写入 → 响应/HEAD 头断言 →
+    往返一致 → SSE-C 错钥必拒；**盘上 grep**（`E2E_DATA_DIR`）——加密键分片无明文特征 +
+    **明文对照键必现**（grep 方法判别性同场证明，验收 ①②盘面）；对象锁全矩阵（COMPLIANCE 拒删
+    含点名删 / GOVERNANCE+bypass / LegalHold ON→拒→OFF→放 / 桶默认规则 / 未开锁桶 hold 400）；
+    STS（AssumeRole 可用 / **会话策略交集**：策略外 put 403 而策略内 get 放行 / GetSessionToken）；
+    SK 落库前缀 `enc:v1:` + 新键真签名（P3-3 端到端）。日志
+    `.superpowers/sdd/2026-10-16-m5-security-lock/e2e-s3-m5-full.log`。首跑 EXIT=1 仅因锁桶清理被
+    COMPLIANCE 守卫正确阻止 → 改容错式断言（预期失败 = 守卫生效证据）后二跑全绿。
+  - `tests/e2e_m3_cluster.sh` 全本 **EXIT=0**（①③④⑤ + ⑤-positive + 控制面扇出 + §0c + fsck 补齐）。
+    **§0c 桶行广播接线**（切片 0 记档②的 e2e 补）：n1 建桶 → n2/n3/n4 即时可写；n1 删桶 →
+    各节点即时拒写（免重启）。首跑 §④ 轮 55 单发读瞬态——服务端日志时间戳核证失败时刻**零异常**
+    （warn 全属 §① kill 窗口）→ 客户端侧单发瞬态（`AWS_MAX_ATTEMPTS=1` + load 尖峰）；重跑
+    §④ 100 轮全过。日志 `.superpowers/sdd/2026-10-16-m5-security-lock/e2e-m3-cluster-m5.log`。
+  - **WebIdentity**：按裁决裁剪延后（README「STS（M5）」节明示，用户知悉项）。
+  - **M5 全切片（0–7）收口**，验收对映：① = §18a-c + 18d（e2e 实弹）；② = 切片 2 单测 +
+    18d 盘面证据；③ = §18e 实弹 + 测试锁到期路径；④ = §18f 实弹 + 单测 ExpiredToken；⑤ =
+    kms 单测模拟换钥 + KMS 多钥目录机制。**发布待用户口令**。
 
 ## 执行模型
 

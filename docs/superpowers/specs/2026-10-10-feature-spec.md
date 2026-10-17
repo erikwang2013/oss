@@ -138,6 +138,16 @@
 
 **边界**：不做 MFA；不做外部 IdP 的 OIDC 发现（WebIdentity 只校验我们信任的签发者列表）。
 
+**落地记录（M5 切片 5-6，2026-10-17）**：`AssumeRole` / `GetSessionToken` 落地（s3s `S3Route`
+前置拦截、Query/XML 形态）；`AssumeRoleWithWebIdentity` **裁剪延后**（成本评估见 M5 计划——
+JWKS 拉取需出站 TLS 客户端新依赖栈；接入点已留）。语义落点：**AssumeRole 限管理员调用**
+（「角色 = 用户别名」，无角色信任策略时防子账户自铸 admin 会话）；会话行落 `access_keys`
+（`kind='session'`、`parent_ak` 父链一层、`expires_at` **必非空**、`session_policy` 可选）；
+**会话策略与用户策略取交集**（在表三档 × 桶策略之后叠加：Deny → 拒 / 无匹配 → 拒 / Allow 不可
+抬升）；`x-amz-security-token` 头随签名携带但 **token 本体不落库不校验**（AK 即凭据——s3s 的
+S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期会话 → `ExpiredToken`（§0.2 表）。
+密文口径：会话 SK 与长时键同为 `enc:v1:` 信封加密存（切片 6）。
+
 ### 1.4 策略求值 —— `M4`
 
 **做什么**：判断「这个身份对这个资源做这个操作」是否允许。

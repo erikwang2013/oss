@@ -14,8 +14,7 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
 quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）+ M3（分布式切片：
 节点间 gRPC mesh、静态槽位拓扑、跨节点 quorum 读写、节点故障容忍与读修复、quorum 租约锁、
 混沌 e2e）+ M4（运维与 IAM：版本控制、生命周期、桶策略、审计、heal/scrub、rebalance、
-多 set）**，正在进行 **M5（安全与锁定：加密数据面与 SSE 三模式、对象锁已落地；STS 进行中）**
-——`aws-cli`/`rclone`
+多 set）+ M5（安全与锁定：SSE 三模式、对象锁、STS 临时凭据、SK 加密存）**——`aws-cli`/`rclone`
 的大文件默认路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
@@ -50,13 +49,14 @@ quorum 租约锁（节点域 Q_n）· `/health/cluster` 集群健康端点。
 追加式扩容（C4 同盘 hardlink 快路径）· 多 set 横向扩容（桶钉 set；C2 控制台 sets 视图；
 C3 建桶缺省自动指派负载最小的 set）· 登录限速（C1：账号 10 分钟 5 败锁定 + 全局 60 秒 120 败
 暂拒，429 + Retry-After）。
-进行中（M5 安全与锁定；切片 0–4 已落地）：集群控制面行一致性广播（切片 0）· 主密钥密钥库
-（切片 1，单钥文件 + 多钥 KMS 目录）· 加密数据面（切片 2，先加密后 EC 的 DARE 式块对齐
-AES-256-GCM）· S3 面 SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁
-GOVERNANCE / COMPLIANCE / Legal Hold + 桶级默认保留规则（切片 4）。
-**未实现**（见设计文档的阶段表）：STS 临时凭据与 WebIdentity（M5 切片 5/7 进行中）·
-SK 加密存储（M5 切片 6）· 复制（M6/M7）· 事件流与 Select（M6）· 访问点 / Object Lambda（M8）·
-跨站点强一致（M9）· 细粒度 IAM 预设模板。
+已实现（M5 安全与锁定）：集群控制面行一致性广播（切片 0）· 主密钥密钥库（切片 1，单钥文件 +
+多钥 KMS 目录）· 加密数据面（切片 2，先加密后 EC 的 DARE 式块对齐 AES-256-GCM）· S3 面
+SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁 GOVERNANCE / COMPLIANCE / Legal Hold +
+桶级默认保留规则（切片 4）· STS 临时凭据 AssumeRole/GetSessionToken + 会话策略交集（切片 5）·
+`access_keys.secret_key` 信封加密 + 存量透明迁移（切片 6）。**WebIdentity 经成本评估裁剪延后**
+（需出站 TLS 客户端新依赖栈；验收 ①–⑤ 不涉；记档于 M5 计划——用户知悉项）。
+**未实现**（见设计文档的阶段表）：复制（M6/M7）· 事件流与 Select（M6）· 访问点 / Object Lambda
+（M8）· 跨站点强一致（M9）· 细粒度 IAM 预设模板。
 
 ## 架构
 
@@ -497,6 +497,13 @@ C2）。
 - **换主密钥不重写数据**（验收 ⑤）：DEK 的包裹体在 `xl.meta`，只要旧 `key_id` 的钥仍在即可解——
   轮换 = 往 `OSS_KMS_DIR` 加入更大的 `key-<n>.bin`（新写用新钥，旧对象照读）；
   单钥文件 provider 直接换文件会让旧 `key_id="file"` 的包裹不可解（**先迁到 KMS 目录再轮换**）。
+- **SK 加密存（M5）**：`access_keys.secret_key` 同样信封加密（`enc:v1:` 前缀，AAD 域分隔，
+  每行独立 DEK；kms 目录优先、单钥文件兜底）——**两处写点**（控制台建键、STS 签发）与**读侧
+  透明迁移**（存量明文行被读到即原地重写为密文）；集群下密文过网、消费端解密（mesh 不出现
+  明文 SK）。**运维硬约束**：多节点须分发同一把主密钥；**撤掉 `OSS_MASTER_KEY_FILE`/`OSS_KMS_DIR`
+  环境变量会让既有密文行全部 500（fail-closed）**——变更前先规划。**威胁模型边界（记档）**：
+  加密只防**只读**泄露（备份/快照/误拷贝）；对数据库有写权限者可写入自选明文 SK 接管任意 AK
+  （切片前有 DB 写权本就全权，非新增面）。
 - **边界（记档）**：桶级默认加密（`put-bucket-encryption`）未实现；aetherupload 内部摄取
   不带加密（存入为明文）；未配对应 env 时请求该模式 → 500（fail-closed，不静默落明文）；
   HTTP KMS 未实作（`KeyProvider` trait 已留接入点，文件型 KMS 即多钥目录）。
@@ -530,6 +537,35 @@ Legal Hold 开关 API：`put/get-object-legal-hold`（`put` 须点名版本且**
 （S3 API 面完整可用）；`buckets` 表锁列跨节点的**行广播**传播，窗口期内非版本化回收路径
 fail-closed 拒删（强一致归 M9，见「已知限制」）。
 
+## STS 临时凭据（M5）
+
+标准 STS 协议（Query/XML）由 s3s 前置路由拦截（`POST /` + form 编码；**须 SigV4 签名**，
+不覆写 `check_access`）。实现两种操作：
+
+```bash
+# AssumeRole（调用者须**管理员**——最小模型无角色信任策略，防子账户自铸 admin 会话提权；
+# 「角色 = 用户别名」，ARN 形如 arn:oss:iam::oss:role/<用户名>）
+aws --endpoint-url http://127.0.0.1:9000 sts assume-role \
+  --role-arn arn:oss:iam::oss:role/erik --role-session-name s1 --duration-seconds 900 \
+  [--policy '{"Version":"2012-10-17","Statement":[...]}']
+# GetSessionToken（任意长时键自派生，TTL 900..=129600 秒，默认 12h）
+aws --endpoint-url http://127.0.0.1:9000 sts get-session-token --duration-seconds 900
+```
+
+- 响应含 `AccessKeyId`（`ASIA…`）/ `SecretAccessKey` / `SessionToken` / `Expiration`；
+  临时凭据对 S3 面**全集群可用**（会话行随 AK 扇出）。
+- **会话策略（仅 AssumeRole 的 `Policy` 参数，≤4096B）与用户权限取交集**：在表三档 × 桶策略
+  融合**之后**再叠——会话 Deny → 拒；**无匹配 → 拒**（未 Allow 即拒）；会话不能抬升权限。
+  `DeleteObjects` 逐键同样叠会话判定（防批量删绕过）；审计 detail 缀 `;session:<allow|deny>`。
+- **过期**：会话行过期 → `ExpiredToken`（长时键过期维持 `InvalidAccessKeyId`）；**父链一层**：
+  父键（或父属主账号）删/停/过期 → 子即失效（父须为长时键；会话不能作父）。
+- **边界（记档）**：`SessionToken` 本体不落库不校验（AK 即凭据——s3s 认证接口无头面，AWS
+  信任链差异）；错误响应用 S3 错误 XML（非 STS `ErrorResponse` 形态，成功路径 aws-cli 直用）；
+  GET query 形（`?Action=`）不接；时长越界报 400 `InvalidArgument`（AWS 为 `ValidationError`）；
+  会话**只对 S3 面**生效（控制台/aether 走 JWT，无 AK 入口）；过期会话行不自动清理（自然不可用）。
+- **AssumeRoleWithWebIdentity：裁剪延后**（成本评估：JWKS 拉取需出站 TLS 客户端新依赖栈；
+  验收 ①–⑤ 不涉及；记档于 M5 计划，接入点已留——`StsRoute` 动作分发 + `check_access` 匿名覆写）。
+
 ## 验收
 
 
@@ -540,12 +576,16 @@ fail-closed 拒删（强一致归 M9，见「已知限制」）。
 
 ```bash
 AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 tests/e2e_s3.sh
+# M5 全量（步骤 18）：服务须以密钥库启动（OSS_MASTER_KEY_FILE/OSS_KMS_DIR），可选：
+#   E2E_DATA_DIR=<data_dir>  盘上明文特征 grep（含明文对照键的判别性断言）
+#   E2E_DB=<sqlite 路径>     SK 落库密文前缀（enc:v1:）断言
 ```
 
 集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：
 
 ```bash
 cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空闲；约 8–15 分钟（含 §⑤ 超时预算）
+# 含 §0c：桶行广播接线（建/删桶后各节点即时一致，免重启——M5 切片 0 遗留断言）
 ```
 
 ## 参考文档
