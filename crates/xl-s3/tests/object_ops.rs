@@ -26,7 +26,8 @@ async fn acl() -> xl_s3::access::Acl {
          CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, uid INTEGER NOT NULL, op TEXT NOT NULL, bucket TEXT, object_key TEXT, decision TEXT NOT NULL, detail TEXT);\
          CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
           status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL, \
-          parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');",
+          parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');\
+         CREATE TABLE event_configs (bucket TEXT PRIMARY KEY, config_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);",
     )
     .execute(&pool)
     .await
@@ -2461,5 +2462,454 @@ async fn object_lock_legal_hold_gates() {
         e.code(),
         &s3s::S3ErrorCode::InvalidArgument,
         "SSE-C 数据读缺钥仍 400"
+    );
+}
+
+// ---------- M6 切片 0：事件发射六路径 + 通知配置 API ----------
+
+/// 捕获的事件（op, bucket, key, version_id, size, etag）。
+type MockEvent = (
+    xl_s3::events::S3EventOp,
+    String,
+    String,
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+);
+
+#[derive(Default)]
+struct MockSink {
+    got: std::sync::Mutex<Vec<MockEvent>>,
+}
+
+#[async_trait::async_trait]
+impl xl_s3::events::EventSink for MockSink {
+    async fn emit(
+        &self,
+        op: xl_s3::events::S3EventOp,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        size: Option<u64>,
+        etag: Option<&str>,
+        _source: xl_s3::events::EventSource,
+    ) {
+        self.got.lock().unwrap().push((
+            op,
+            bucket.to_string(),
+            key.to_string(),
+            version_id.map(str::to_string),
+            size,
+            etag.map(str::to_string),
+        ));
+    }
+}
+
+#[tokio::test]
+async fn events_emitted_on_all_write_paths() {
+    use xl_s3::events::S3EventOp;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let sink = Arc::new(MockSink::default());
+    let s3 = OssS3::new(store, acl().await, 16 * 1024 * 1024)
+        .with_events(Some(sink.clone() as Arc<dyn xl_s3::events::EventSink>));
+
+    // 版本桶（marker 场景）；带身份建桶以落 buckets 行（版本状态查询前提）
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: "evb".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_bucket_versioning(req(PutBucketVersioningInput {
+        bucket: "evb".into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        mfa: None,
+        versioning_configuration: VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static("Enabled")),
+            mfa_delete: None,
+        },
+    }))
+    .await
+    .unwrap();
+
+    // 1) Put
+    let p = s3
+        .put_object(req(PutObjectInput {
+            bucket: "evb".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"hello"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let v1 = p.version_id.clone().unwrap();
+    // 2) Copy
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("evb".to_string())
+        .key("k2".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "evb".into(),
+            key: "k".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    // 3) CompleteMPU
+    let up = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "evb".into(),
+            key: "mpu".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .upload_id
+        .unwrap();
+    let part = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "evb".into(),
+            key: "mpu".into(),
+            upload_id: up.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from(vec![
+                1u8;
+                5 * 1024 * 1024
+                    + 1
+            ]))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
+        bucket: "evb".into(),
+        key: "mpu".into(),
+        upload_id: up,
+        multipart_upload: Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: Some(ETag::Strong(
+                    part.e_tag.as_ref().unwrap().value().to_string(),
+                )),
+                ..Default::default()
+            }]),
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // 4) 点名删版本 → RemovedDelete
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "evb".into(),
+        key: "k".into(),
+        version_id: Some(v1.clone()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // 5) 无版本号删 → marker
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "evb".into(),
+        key: "k".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // 6) 批量删（逐键）
+    s3.delete_objects(with_user(
+        DeleteObjectsInput::builder()
+            .bucket("evb".to_string())
+            .delete(Delete {
+                objects: vec![ObjectIdentifier {
+                    key: "k2".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .build()
+            .unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    let got = sink.got.lock().unwrap().clone();
+    let names: Vec<&str> = got.iter().map(|g| g.0.event_name()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "s3:ObjectCreated:Put",
+            "s3:ObjectCreated:Copy",
+            "s3:ObjectCreated:CompleteMultipartUpload",
+            "s3:ObjectRemoved:Delete",
+            "s3:ObjectRemoved:DeleteMarkerCreated",
+            "s3:ObjectRemoved:DeleteMarkerCreated", // 批量删对版本桶的空版本号删 = marker
+        ],
+        "{got:?}"
+    );
+    // 字段抽查：put 带 size/etag/version；copy 目标键正确
+    let put = &got[0];
+    assert_eq!(put.1, "evb");
+    assert_eq!(put.2, "k");
+    assert_eq!(put.4, Some(5));
+    assert!(put.5.is_some());
+    assert_eq!(got[1].2, "k2");
+    let _ = S3EventOp::RemovedDelete;
+}
+
+#[tokio::test]
+async fn notification_config_api_roundtrip_and_errors() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "notifb".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // 写配置
+    let cfg = NotificationConfiguration {
+        queue_configurations: Some(QueueConfigurationList::from(vec![QueueConfiguration {
+            id: Some(NotificationId::from("cfg-0".to_string())),
+            queue_arn: QueueArn::from("arn:oss:sqs::t1:kafka".to_string()),
+            events: EventList::from(vec![
+                Event::from("s3:ObjectCreated:Put".to_string()),
+                Event::from("s3:ObjectRemoved:Delete".to_string()),
+            ]),
+            filter: Some(NotificationConfigurationFilter {
+                key: Some(S3KeyFilter {
+                    filter_rules: Some(FilterRuleList::from(vec![FilterRule {
+                        name: Some(FilterRuleName::from_static("prefix")),
+                        value: Some(FilterRuleValue::from("logs/".to_string())),
+                    }])),
+                }),
+            }),
+        }])),
+        ..Default::default()
+    };
+    s3.put_bucket_notification_configuration(req(
+        PutBucketNotificationConfigurationInput::builder()
+            .bucket("notifb".to_string())
+            .notification_configuration(cfg)
+            .build()
+            .unwrap(),
+    ))
+    .await
+    .unwrap();
+    // 回读
+    let got = s3
+        .get_bucket_notification_configuration(req(GetBucketNotificationConfigurationInput {
+            bucket: "notifb".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let qs = got.queue_configurations.unwrap();
+    assert_eq!(qs.len(), 1);
+    assert_eq!(qs[0].queue_arn.as_str(), "arn:oss:sqs::t1:kafka");
+    let rules = qs[0]
+        .filter
+        .as_ref()
+        .unwrap()
+        .key
+        .as_ref()
+        .unwrap()
+        .filter_rules
+        .as_ref()
+        .unwrap();
+    assert_eq!(rules[0].value.as_ref().unwrap().as_str(), "logs/");
+
+    // ObjectAccessed → 400（R5 记档：本片不实现）
+    let bad = NotificationConfiguration {
+        queue_configurations: Some(QueueConfigurationList::from(vec![QueueConfiguration {
+            id: None,
+            queue_arn: QueueArn::from("arn:oss:sqs::t1:kafka".to_string()),
+            events: EventList::from(vec![Event::from("s3:ObjectAccessed:Get".to_string())]),
+            filter: None,
+        }])),
+        ..Default::default()
+    };
+    let e = s3
+        .put_bucket_notification_configuration(req(
+            PutBucketNotificationConfigurationInput::builder()
+                .bucket("notifb".to_string())
+                .notification_configuration(bad)
+                .build()
+                .unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidArgument);
+
+    // 不存在的桶 → 404
+    let e = s3
+        .get_bucket_notification_configuration(req(GetBucketNotificationConfigurationInput {
+            bucket: "ghost".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    // 空配置清空 → 回读空
+    s3.put_bucket_notification_configuration(req(
+        PutBucketNotificationConfigurationInput::builder()
+            .bucket("notifb".to_string())
+            .notification_configuration(NotificationConfiguration::default())
+            .build()
+            .unwrap(),
+    ))
+    .await
+    .unwrap();
+    let got = s3
+        .get_bucket_notification_configuration(req(GetBucketNotificationConfigurationInput {
+            bucket: "notifb".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(got.queue_configurations.unwrap_or_default().is_empty());
+}
+
+/// M6 切片 0（P2-1）：幂等空删——204 但**不发事件**；真删仍发（对照）。
+#[tokio::test]
+async fn events_not_emitted_on_empty_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let sink = Arc::new(MockSink::default());
+    let s3 = OssS3::new(store, acl().await, 1024 * 1024)
+        .with_events(Some(sink.clone() as Arc<dyn xl_s3::events::EventSink>));
+
+    // 非版本桶：空删不发射
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "ebk".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "ebk".into(),
+        key: "never".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    assert!(sink.got.lock().unwrap().is_empty(), "空删不得发事件");
+    // 真删 → 发射
+    s3.put_object(req(PutObjectInput {
+        bucket: "ebk".into(),
+        key: "real".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"r"))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "ebk".into(),
+        key: "real".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    assert_eq!(sink.got.lock().unwrap().len(), 2, "put + delete 各一条");
+
+    // 版本桶：点名删不存在的版本 → 不发射；批量删缺失键 → deleted 列出但不发射
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: "ebkv".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_bucket_versioning(req(PutBucketVersioningInput {
+        bucket: "ebkv".into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        mfa: None,
+        versioning_configuration: VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static("Enabled")),
+            mfa_delete: None,
+        },
+    }))
+    .await
+    .unwrap();
+    let before = sink.got.lock().unwrap().len();
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "ebkv".into(),
+        key: "k".into(),
+        version_id: Some("no-such-version".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    assert_eq!(sink.got.lock().unwrap().len(), before, "空版本删不得发事件");
+    // 版本桶无版本号删缺失键 = 建 marker（AWS 语义）→ 事件**应发**；对照断言：
+    let out = s3
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("ebkv".to_string())
+                .delete(Delete {
+                    objects: vec![ObjectIdentifier {
+                        key: "missing".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
+        .await
+        .unwrap()
+        .output;
+    assert!(
+        out.deleted
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|d| d.key.as_deref() == Some("missing")),
+        "S3 语义：不存在的键也进 deleted[]"
+    );
+    assert_eq!(
+        sink.got.lock().unwrap().len(),
+        before + 1,
+        "版本桶无版本号删缺失键 = 建 marker → DeleteMarkerCreated 应发"
+    );
+    // 非版本桶批量删缺失键：进 deleted[] 但不发事件（P2-1 核心）
+    let before2 = sink.got.lock().unwrap().len();
+    let out = s3
+        .delete_objects(with_user(
+            DeleteObjectsInput::builder()
+                .bucket("ebk".to_string())
+                .delete(Delete {
+                    objects: vec![ObjectIdentifier {
+                        key: "missing2".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        ))
+        .await
+        .unwrap()
+        .output;
+    assert!(
+        out.deleted
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|d| d.key.as_deref() == Some("missing2"))
+    );
+    assert_eq!(
+        sink.got.lock().unwrap().len(),
+        before2,
+        "非版本桶空删不得发事件"
     );
 }

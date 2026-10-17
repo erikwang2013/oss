@@ -25,11 +25,16 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // 授权门：Acl 同时给 service（ListBuckets 过滤/建桶记账）与 access 层（set_access）
     // Task 9：集群时 Acl/SigV4Auth 接控制面读扇出（本地 miss → peers；写仍本地，M9 收口）
     let acl = state.acl();
-    let mut s3_builder = S3ServiceBuilder::new(OssS3::new(
-        Arc::clone(&state.store),
-        acl.clone(),
-        state.cfg.max_put_bytes,
-    ));
+    let mut s3_builder = S3ServiceBuilder::new(
+        OssS3::new(
+            Arc::clone(&state.store),
+            acl.clone(),
+            state.cfg.max_put_bytes,
+        )
+        .with_events(Some(
+            Arc::clone(&state.events) as Arc<dyn xl_s3::events::EventSink>
+        )),
+    );
     s3_builder.set_auth(
         SigV4Auth::with_mesh(state.db.pool().clone(), state.control_mesh())
             .with_vault(state.vault.clone()), // M5 切片 6：SK 解密/透明重写

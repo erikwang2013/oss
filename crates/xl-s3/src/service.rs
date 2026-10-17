@@ -17,6 +17,7 @@ use xl_store::meta::ChecksumRecord;
 use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
+use crate::events::{EventSink, EventSource, S3EventOp};
 use crate::lock::{apply_lock_out, bucket_lock_out, parse_bucket_lock_rule, parse_put_lock};
 use crate::sse::{parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec};
 
@@ -27,6 +28,8 @@ pub struct OssS3 {
     acl: crate::access::Acl,
     /// 单次 PUT 的整份读入上限，见 `put_object` 的 ponytail 取舍。
     max_put_bytes: usize,
+    /// M6 切片 0：事件接收方（oss-server 注入；None = 不发事件，测试/未接线形态）。
+    events: Option<Arc<dyn EventSink>>,
 }
 
 impl OssS3 {
@@ -46,6 +49,31 @@ impl OssS3 {
             store,
             acl,
             max_put_bytes,
+            events: None,
+        }
+    }
+
+    /// M6 切片 0：注入事件接收方（builder 风格；router 装配处调用）。
+    pub fn with_events(mut self, sink: Option<Arc<dyn EventSink>>) -> Self {
+        self.events = sink;
+        self
+    }
+
+    /// 事件发射（post-commit 尽力而为；接收方自吞错误，绝不影响请求结果）。
+    #[allow(clippy::too_many_arguments)] // 事件字段面平铺（同 EventSink::emit）
+    async fn emit(
+        &self,
+        op: S3EventOp,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        size: Option<u64>,
+        etag: Option<&str>,
+        source: EventSource,
+    ) {
+        if let Some(sink) = &self.events {
+            sink.emit(op, bucket, key, version_id, size, etag, source)
+                .await;
         }
     }
 
@@ -457,6 +485,9 @@ impl S3 for OssS3 {
         if let Err(e) = self.acl.clear_lifecycle_rules(&bucket).await {
             tracing::warn!(error = ?e, bucket, "删桶生命周期规则清理失败");
         }
+        if let Err(e) = self.acl.clear_bucket_notification(&bucket).await {
+            tracing::warn!(error = %e, bucket, "删桶清通知配置失败（同名重建可能继承）");
+        }
         if let Err(e) = self.acl.clear_bucket_policy(&bucket).await {
             tracing::warn!(error = ?e, bucket, "删桶策略清理失败");
         }
@@ -525,6 +556,8 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
         )?;
         let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
+        // M6 切片 0：事件来源（解构 req.input 前自 headers 取）
+        let event_source = EventSource::from_headers(&req.headers);
         let PutObjectInput {
             bucket,
             key,
@@ -586,6 +619,16 @@ impl S3 for OssS3 {
             Ok(info) => info,
             Err(e) => return Err(stream_err_to_s3(e, &exceeded, &body_err)),
         };
+        self.emit(
+            S3EventOp::CreatedPut,
+            &bucket,
+            &key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            event_source,
+        )
+        .await;
 
         let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(PutObjectOutput {
@@ -729,6 +772,7 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let event_source = EventSource::from_headers(&req.headers);
         // M5 切片 3（R5）：complete 的 SSE-C 决定最终加密（单流）且须与 create 同钥；
         // 该 DTO 无 server_side_encryption/ssekms_key_id 字段（SSE-S3/KMS 由 create 头记档，
         // complete 以 SSE-C md5 一致性为主——R5 记档）。
@@ -777,6 +821,16 @@ impl S3 for OssS3 {
             )
             .await
             .map_err(to_s3_error)?;
+        self.emit(
+            S3EventOp::CreatedCompleteMultipartUpload,
+            &bucket,
+            &key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            event_source,
+        )
+        .await;
         let so = sse_out(info.encryption.as_ref());
         let mut resp = S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(bucket),
@@ -1285,6 +1339,7 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let event_source = EventSource::from_headers(&req.headers);
         let bucket = req.input.bucket;
         let key = req.input.key;
         let vid = req.input.version_id.clone();
@@ -1299,9 +1354,47 @@ impl S3 for OssS3 {
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
         // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
         let (dm, vid) = match outcome {
-            DeleteOutcome::Marker { version_id } => (Some(true), Some(version_id)),
-            DeleteOutcome::Version { version_id } => (None, Some(version_id)),
-            DeleteOutcome::Object => (None, None),
+            DeleteOutcome::Marker { version_id } => {
+                self.emit(
+                    S3EventOp::RemovedDeleteMarkerCreated,
+                    &bucket,
+                    &key,
+                    Some(&version_id),
+                    None,
+                    None,
+                    event_source,
+                )
+                .await;
+                (Some(true), Some(version_id))
+            }
+            DeleteOutcome::Version { version_id } => {
+                self.emit(
+                    S3EventOp::RemovedDelete,
+                    &bucket,
+                    &key,
+                    Some(&version_id),
+                    None,
+                    None,
+                    event_source,
+                )
+                .await;
+                (None, Some(version_id))
+            }
+            DeleteOutcome::Object => {
+                self.emit(
+                    S3EventOp::RemovedDelete,
+                    &bucket,
+                    &key,
+                    None,
+                    None,
+                    None,
+                    event_source,
+                )
+                .await;
+                (None, None)
+            }
+            // P2-1：幂等空删（未发生删除）——204 但不发事件
+            DeleteOutcome::NotFound => (None, None),
         };
         Ok(S3Response::new(DeleteObjectOutput {
             delete_marker: dm,
@@ -1314,6 +1407,7 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let event_source = EventSource::from_headers(&req.headers);
         let bucket = req.input.bucket;
         // §3.4：一次最多 1000 个
         if req.input.delete.objects.len() > 1000 {
@@ -1384,10 +1478,46 @@ impl S3 for OssS3 {
                 Ok(outcome) => {
                     let (dm, dmv, vid) = match outcome {
                         DeleteOutcome::Marker { version_id } => {
+                            self.emit(
+                                S3EventOp::RemovedDeleteMarkerCreated,
+                                &bucket,
+                                &obj.key,
+                                Some(&version_id),
+                                None,
+                                None,
+                                event_source.clone(),
+                            )
+                            .await;
                             (Some(true), Some(version_id), None)
                         }
-                        DeleteOutcome::Version { version_id } => (None, None, Some(version_id)),
-                        DeleteOutcome::Object => (None, None, None),
+                        DeleteOutcome::Version { version_id } => {
+                            self.emit(
+                                S3EventOp::RemovedDelete,
+                                &bucket,
+                                &obj.key,
+                                Some(&version_id),
+                                None,
+                                None,
+                                event_source.clone(),
+                            )
+                            .await;
+                            (None, None, Some(version_id))
+                        }
+                        DeleteOutcome::Object => {
+                            self.emit(
+                                S3EventOp::RemovedDelete,
+                                &bucket,
+                                &obj.key,
+                                None,
+                                None,
+                                None,
+                                event_source.clone(),
+                            )
+                            .await;
+                            (None, None, None)
+                        }
+                        // P2-1：幂等空删——进 deleted[]（S3 语义）但不发事件
+                        DeleteOutcome::NotFound => (None, None, None),
                     };
                     deleted.push(DeletedObject {
                         key: Some(obj.key),
@@ -1416,6 +1546,75 @@ impl S3 for OssS3 {
             deleted: (!deleted.is_empty()).then_some(deleted),
             errors: (!errors.is_empty()).then_some(errors),
             ..Default::default()
+        }))
+    }
+
+    /// M6 切片 0：桶通知配置（全量替换；空配置 = 清空）。校验失败 400 不静默。
+    async fn put_bucket_notification_configuration(
+        &self,
+        req: S3Request<PutBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket));
+        }
+        let targets =
+            crate::notify::parse_notification_config(&req.input.notification_configuration)?;
+        let json = serde_json::to_string(&targets).map_err(|e| {
+            tracing::error!(error = %e, "通知配置序列化失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        self.acl
+            .set_bucket_notification(&bucket, &json)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, bucket, "写通知配置失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        Ok(S3Response::new(
+            PutBucketNotificationConfigurationOutput::default(),
+        ))
+    }
+
+    /// M6 切片 0：读桶通知配置（未配置 = 空配置）。
+    async fn get_bucket_notification_configuration(
+        &self,
+        req: S3Request<GetBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket));
+        }
+        let row = self.acl.bucket_notification(&bucket).await.map_err(|e| {
+            tracing::error!(error = %e, bucket, "读通知配置失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        let cfg = match row {
+            Some(json) => {
+                let targets: Vec<crate::notify::EventTarget> = serde_json::from_str(&json)
+                    .map_err(|e| {
+                        tracing::error!(error = %e, bucket, "通知配置解析失败（fail-closed 500）");
+                        s3s::s3_error!(InternalError, "internal error")
+                    })?;
+                crate::notify::notification_config_out(&targets)
+            }
+            None => NotificationConfiguration::default(),
+        };
+        Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
+            event_bridge_configuration: cfg.event_bridge_configuration,
+            lambda_function_configurations: cfg.lambda_function_configurations,
+            queue_configurations: cfg.queue_configurations,
+            topic_configurations: cfg.topic_configurations,
         }))
     }
 
@@ -1642,6 +1841,7 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let event_source = EventSource::from_headers(&req.headers);
         // s3s 已将 x-amz-copy-source 解码、去掉前导 '/' 并解析成枚举；这里只接受桶形式
         let CopySource::Bucket {
             ref bucket,
@@ -1725,6 +1925,16 @@ impl S3 for OssS3 {
             )
             .await
             .map_err(to_s3_error)?;
+        self.emit(
+            S3EventOp::CreatedCopy,
+            &req.input.bucket,
+            &req.input.key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            event_source,
+        )
+        .await;
 
         let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(CopyObjectOutput {

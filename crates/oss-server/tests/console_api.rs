@@ -512,3 +512,74 @@ async fn access_key_validation_and_duplicate() {
         "不泄底层原文: {text}"
     );
 }
+
+/// M6 切片 0（P2-1 复查补）：控制台删**不存在**的对象 → 204 且不发事件。
+#[tokio::test]
+async fn console_delete_missing_emits_no_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let tok = login_token(&base).await;
+    st.store.create_bucket("cmb").await.unwrap();
+    st.db.insert_bucket("cmb", None).await.unwrap();
+    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('cmb', ?)")
+        .bind(
+            r#"[{"id":"a","target":"t1","events":["s3:ObjectRemoved:Delete"],"prefix":null,"suffix":null}]"#,
+        )
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .delete(format!("{base}/api/v1/buckets/cmb/objects/never.txt"))
+        .bearer_auth(tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "空删幂等 204");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE bucket='cmb'")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "空删不得发事件");
+}
+
+/// M6 切片 0（R5/P2-4）：控制台删对象发 `s3:ObjectRemoved:Delete`（source=oss-console）。
+#[tokio::test]
+async fn console_delete_emits_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let tok = login_token(&base).await;
+    st.store.create_bucket("cdb").await.unwrap();
+    st.db.insert_bucket("cdb", None).await.unwrap();
+    st.store
+        .put_object("cdb", "d.txt", bytes::Bytes::from_static(b"d"), None)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('cdb', ?)")
+        .bind(
+            r#"[{"id":"a","target":"t1","events":["s3:ObjectRemoved:Delete"],"prefix":null,"suffix":null}]"#,
+        )
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .delete(format!("{base}/api/v1/buckets/cdb/objects/d.txt"))
+        .bearer_auth(tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let json: String = sqlx::query_scalar("SELECT event_json FROM event_outbox WHERE bucket='cdb'")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["eventName"], "s3:ObjectRemoved:Delete");
+    assert_eq!(v["source"]["userAgent"], "oss-console");
+    assert_eq!(v["s3"]["object"]["key"], "d.txt");
+}

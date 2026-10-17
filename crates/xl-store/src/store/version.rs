@@ -80,6 +80,8 @@ fn check_lock_delete(v: &Version, bypass_governance: bool) -> Result<()> {
 /// [`Store::delete_object_versioned`] 的结果（S3 DeleteObject 响应字段来源）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeleteOutcome {
+    /// M6 切片 0（P2-1）：幂等空删（键/版本不存在，未发生删除）——服务端 204 但**不发事件**。
+    NotFound,
     /// 版本控制桶无版本号删除：追加了 delete marker
     Marker { version_id: String },
     /// 点名删除了某版本（含 marker）
@@ -144,9 +146,12 @@ impl Store {
             if !versioned {
                 // M5 切片 4（B2 兜底）：非版本化整键删先查链——陈旧节点（行未同步）也不得
                 // 借 purge 清掉锁定版本
-                if let Some(old) = self.read_meta(bucket, key).await?
-                    && let Some(why) = chain_active_lock(&old)
-                {
+                let old = self.read_meta(bucket, key).await?;
+                let Some(old) = old else {
+                    // M6 切片 0（P2-1）：空删幂等——未发生删除，事件不发
+                    return Ok(DeleteOutcome::NotFound);
+                };
+                if let Some(why) = chain_active_lock(&old) {
                     return Err(Error::ObjectLocked(format!("键存在锁定版本：{why}")));
                 }
                 self.purge_key(bucket, key).await?;
@@ -202,10 +207,10 @@ impl Store {
         // 点名删版本
         let vid = vid.to_string();
         let Some(old) = self.read_meta(bucket, key).await? else {
-            return Ok(DeleteOutcome::Version { version_id: vid }); // 幂等：键不存在
+            return Ok(DeleteOutcome::NotFound); // 幂等空删：键不存在（不发事件）
         };
         let Some(pos) = old.versions.iter().position(|v| v.version_id_str() == vid) else {
-            return Ok(DeleteOutcome::Version { version_id: vid }); // 幂等：版本不存在
+            return Ok(DeleteOutcome::NotFound); // 幂等空删：版本不存在（不发事件）
         };
         let removed = old.versions[pos].clone();
         // M5 切片 4（L4）：对象锁守卫——legal hold / COMPLIANCE 未到期一律拒（含 admin）；

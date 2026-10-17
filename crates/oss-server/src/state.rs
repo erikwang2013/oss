@@ -22,6 +22,8 @@ pub struct AppState {
     pub login_limiter: Arc<LoginLimiter>,
     /// M5 切片 6：SK 加密库（`OSS_MASTER_KEY_FILE`/`OSS_KMS_DIR` 未配 = None = 明文直存）。
     pub vault: Option<Arc<xl_s3::skvault::SecretVault>>,
+    /// M6 切片 0：事件总线接收方 + worker（event_outbox）。
+    pub events: Arc<crate::events::SqlEventSink>,
 }
 
 /// 登录限速（C1）。**单进程内存态**（每节点独立，重启清零——限速非持久配额，重启放宽可接受）：
@@ -424,12 +426,15 @@ impl AppState {
         // M5 切片 6：SK 库自 Store 的密钥库状态（须在 init_encryption 之后——本函数由
         // 启动路径在 store open+init 完成后调用）。
         let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
+        // M6 切片 0：事件接收方（worker 在 serve 路径挂载）
+        let events = Arc::new(crate::events::SqlEventSink::new(db.pool().clone()));
         let cfg = Arc::new(cfg);
         let db = Arc::new(db);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::new(store),
             db: Arc::clone(&db),
             cfg: Arc::clone(&cfg),
+            events: Some(Arc::clone(&events)),
         });
         Self {
             cfg,
@@ -439,6 +444,7 @@ impl AppState {
             jwt,
             login_limiter,
             vault,
+            events,
         }
     }
 }

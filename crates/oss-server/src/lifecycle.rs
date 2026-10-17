@@ -14,6 +14,23 @@ use xl_store::store::ListRequest;
 
 use crate::state::AppState;
 
+/// M6 切片 0：删除结果 → 生命周期事件（`None` = NotFound 空删，**不发事件**）。
+/// 抽出纯函数以便确定性单测（并发窄窗的 NotFound 无法在集成层稳定构造）。
+pub(crate) fn lifecycle_event(
+    outcome: &xl_store::store::DeleteOutcome,
+) -> Option<(&'static str, Option<&str>)> {
+    match outcome {
+        xl_store::store::DeleteOutcome::Marker { version_id } => Some((
+            "s3:LifecycleExpiration:DeleteMarkerCreated",
+            Some(version_id.as_str()),
+        )),
+        xl_store::store::DeleteOutcome::Version { .. } | xl_store::store::DeleteOutcome::Object => {
+            Some(("s3:LifecycleExpiration:Delete", None))
+        }
+        xl_store::store::DeleteOutcome::NotFound => None,
+    }
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -121,7 +138,25 @@ pub async fn sweep_once(state: &AppState) -> usize {
                         .delete_object_versioned(&rule.bucket, &o.key, None, versioned)
                         .await
                     {
-                        Ok(_) => deleted += 1,
+                        Ok(outcome) => {
+                            // M6 切片 0（R5 + P2-1）：事件映射走纯函数；NotFound（并发窄窗
+                            // head 后 delete 前被删）→ None：不发事件、不计 deleted。
+                            if let Some((name, vid)) = lifecycle_event(&outcome) {
+                                state
+                                    .events
+                                    .emit_named(
+                                        name,
+                                        &rule.bucket,
+                                        &o.key,
+                                        vid,
+                                        None,
+                                        None,
+                                        xl_s3::events::EventSource::internal("oss-lifecycle"),
+                                    )
+                                    .await;
+                                deleted += 1;
+                            }
+                        }
                         Err(xl_store::error::Error::NoSuchKey(_)) => {} // 并发已删：不计
                         Err(e) => {
                             tracing::warn!(bucket = %rule.bucket, key = %o.key, error = %e, "lifecycle：删除失败（计 skipped）");
@@ -200,4 +235,36 @@ pub fn spawn_audit_cleanup(state: AppState) {
         }
     });
     tracing::info!(days, "审计保留清理 worker 已启动（每小时一次）");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lifecycle_event;
+    use xl_store::store::DeleteOutcome;
+
+    /// M6 切片 0（P2-1/P2-4 复查补）：删除结果 → 事件映射的确定性矩阵。
+    #[test]
+    fn lifecycle_event_mapping_matrix() {
+        assert_eq!(
+            lifecycle_event(&DeleteOutcome::Marker {
+                version_id: "v9".into()
+            }),
+            Some(("s3:LifecycleExpiration:DeleteMarkerCreated", Some("v9")))
+        );
+        assert_eq!(
+            lifecycle_event(&DeleteOutcome::Version {
+                version_id: "v1".into()
+            }),
+            Some(("s3:LifecycleExpiration:Delete", None))
+        );
+        assert_eq!(
+            lifecycle_event(&DeleteOutcome::Object),
+            Some(("s3:LifecycleExpiration:Delete", None))
+        );
+        assert_eq!(
+            lifecycle_event(&DeleteOutcome::NotFound),
+            None,
+            "空删（并发窄窗）不得发事件"
+        );
+    }
 }

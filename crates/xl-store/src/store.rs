@@ -1185,18 +1185,26 @@ impl Store {
         }
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+    /// 硬删整键（控制台/内部）。返回 **是否真的删掉了对象**（`false` = 键本就不存在，
+    /// 幂等空删）——M6 P2-1：调用方据此决定是否发 `ObjectRemoved` 事件（同锁内判定，
+    /// 无 head→delete TOCTOU；也避免 SSE-C 对象 head 需客户钥而误判不存在）。
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool> {
         self.ensure_bucket(bucket).await?;
         // 与 put 同键串行：删除进行中不得有写者把新版本 rename 进来（否则版本目录会被连带删掉）
         let _guard = self.lock_object(bucket, key).await?;
         // M5 切片 4（B1 复验补）：硬删（控制台/内部）与 S3 面同口径——链上任一锁定版本即拒；
         // 控制台删对象端点经此收口（原直达 purge_key 绕过守卫，admin 可销毁 COMPLIANCE 对象）
-        if let Some(m) = self.read_meta(bucket, key).await?
-            && let Some(why) = version::chain_active_lock(&m)
-        {
-            return Err(Error::ObjectLocked(format!("键存在锁定版本：{why}")));
-        }
-        self.purge_key(bucket, key).await
+        let existed = match self.read_meta(bucket, key).await? {
+            Some(m) => {
+                if let Some(why) = version::chain_active_lock(&m) {
+                    return Err(Error::ObjectLocked(format!("键存在锁定版本：{why}")));
+                }
+                true
+            }
+            None => false,
+        };
+        self.purge_key(bucket, key).await?;
+        Ok(existed)
     }
 
     /// 整键清理（meta 可见性提交 + 数据目录）：[`Self::delete_object`] 与版本链清空

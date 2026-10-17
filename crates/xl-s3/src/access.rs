@@ -226,6 +226,43 @@ impl Acl {
         Ok(())
     }
 
+    /// M6 切片 0：桶通知配置（None = 未配置；json 原文，解析在 notify 模块）。
+    pub async fn bucket_notification(&self, bucket: &str) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT config_json FROM event_configs WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("config_json")))
+    }
+
+    /// M6 切片 0：写桶通知配置（全量替换）。
+    pub async fn set_bucket_notification(
+        &self,
+        bucket: &str,
+        config_json: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO event_configs (bucket, config_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET config_json = excluded.config_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(config_json)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// M6 切片 0：删桶时清通知配置（防同名重建继承旧规则）。
+    pub async fn clear_bucket_notification(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM event_configs WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶
     /// 对象；verifier S6-1）。表在共享 DB（migrations 0001），S3 面与控制面同口径。
     pub async fn clear_lifecycle_rules(&self, bucket: &str) -> Result<(), sqlx::Error> {
@@ -917,6 +954,12 @@ fn classify(op: &str) -> Option<Gate> {
         // M4 版本控制：桶级状态改成开版本控制 = 桶主/管理员；读状态与列版本归读
         "PutBucketVersioning" => Gate::OwnerBucket,
         "GetBucketVersioning" => Gate::Need(Action::Read),
+        // M6 切片 0/4：桶通知与复制配置（写配置归桶主，读归读档）
+        "PutBucketNotificationConfiguration" => Gate::OwnerBucket,
+        "GetBucketNotificationConfiguration" => Gate::Need(Action::Read),
+        "PutBucketReplication" => Gate::OwnerBucket,
+        "GetBucketReplication" => Gate::Need(Action::Read),
+        "DeleteBucketReplication" => Gate::OwnerBucket,
         // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
         "HeadBucket" | "ListObjectsV2" | "ListParts" | "GetObject" | "HeadObject"
         | "ListObjectVersions" => Gate::Need(Action::Read),

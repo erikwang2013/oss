@@ -72,6 +72,8 @@ pub struct IngestSink {
     pub store: Arc<Store>,
     pub db: Arc<Db>,
     pub cfg: Arc<AppConfig>,
+    /// M6 切片 0（R5）：aether 内部摄取事件（ObjectCreated:Post；内部路径占位 source）。
+    pub events: Option<Arc<crate::events::SqlEventSink>>,
 }
 
 impl IngestSink {
@@ -147,6 +149,18 @@ impl EventSink for IngestSink {
 
         match result {
             Ok((size, info)) => {
+                // M6 切片 0（R5）：内部摄取事件（ObjectCreated:Post；source 占位）
+                if let Some(ev) = &self.events {
+                    block_on(ev.emit_named(
+                        "s3:ObjectCreated:Post",
+                        &bucket,
+                        &key,
+                        info.version_id.as_deref(),
+                        Some(info.size),
+                        Some(&info.etag),
+                        xl_s3::events::EventSource::internal("oss-aether"),
+                    ));
+                }
                 let saved_path =
                     SavedPath::encode(&resource.group, &resource.group_sub_dir, &resource.name);
                 if let Err(e) = block_on(self.db.record_upload(

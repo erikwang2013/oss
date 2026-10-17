@@ -242,3 +242,83 @@ async fn duplicate_prefix_rejected_400() {
         .unwrap();
     assert_eq!(resp.status(), 204);
 }
+
+/// M6 切片 0（R5/P2-4）：生命周期删除发 LifecycleExpiration 事件（非版本 Delete /
+/// 版本桶 MarkerCreated 两型各一）。
+#[tokio::test]
+async fn lifecycle_emits_expiration_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+
+    // 非版本桶：ObjectRemoved 型 Delete
+    st.store.create_bucket("lpa").await.unwrap();
+    st.db.insert_bucket("lpa", None).await.unwrap();
+    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('lpa', ?)")
+        .bind(
+            r#"[{"id":"a","target":"t1","events":["s3:LifecycleExpiration:Delete"],"prefix":null,"suffix":null}]"#,
+        )
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    st.store
+        .put_object("lpa", "gone.txt", bytes::Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    st.db
+        .set_lifecycle_rules("lpa", &[rule("", 0)], 1)
+        .await
+        .unwrap();
+
+    // 版本桶：打 marker → MarkerCreated 型
+    st.store.create_bucket("lpb").await.unwrap();
+    st.db.insert_bucket("lpb", None).await.unwrap();
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'lpb'")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('lpb', ?)")
+        .bind(
+            r#"[{"id":"b","target":"t2","events":["s3:LifecycleExpiration:DeleteMarkerCreated"],"prefix":null,"suffix":null}]"#,
+        )
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    // 版本桶写入：with_meta 的 versioned=true 追加版本
+    st.store
+        .put_object_stream_with_meta(
+            "lpb",
+            "vm.txt",
+            Box::pin(futures::stream::once(async {
+                Ok(bytes::Bytes::from_static(b"y"))
+            })),
+            None,
+            Default::default(),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    st.db
+        .set_lifecycle_rules("lpb", &[rule("", 0)], 1)
+        .await
+        .unwrap();
+
+    sweep_once(&st).await;
+
+    let names: Vec<(String, String)> =
+        sqlx::query_as("SELECT target_id, event_json FROM event_outbox ORDER BY id")
+            .fetch_all(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(names.len(), 2, "{names:?}");
+    let n0: serde_json::Value = serde_json::from_str(&names[0].1).unwrap();
+    assert_eq!(n0["eventName"], "s3:LifecycleExpiration:Delete");
+    assert_eq!(n0["source"]["userAgent"], "oss-lifecycle");
+    let n1: serde_json::Value = serde_json::from_str(&names[1].1).unwrap();
+    assert_eq!(
+        n1["eventName"],
+        "s3:LifecycleExpiration:DeleteMarkerCreated"
+    );
+}

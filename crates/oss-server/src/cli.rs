@@ -179,6 +179,11 @@ pub async fn run(
             // M4 切片 6：生命周期 worker（serve 专属；运维命令不挂）。
             // 间隔 OSS_LIFECYCLE_INTERVAL_SECS（默认 60；0=关闭）
             crate::lifecycle::spawn_worker(state.clone());
+            // M6 切片 0：事件 outbox worker（OSS_EVENT_INTERVAL_SECS，0=关）
+            crate::events::spawn_worker(
+                std::sync::Arc::clone(&state.events),
+                state.db.pool().clone(),
+            );
             // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
             crate::lifecycle::spawn_audit_cleanup(state.clone());
 

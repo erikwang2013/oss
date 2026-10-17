@@ -100,3 +100,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
     decision   TEXT NOT NULL,            -- allow | deny
     detail     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS event_configs (
+    bucket TEXT PRIMARY KEY,
+    config_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS event_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',   -- pending | sending | dead（M6 R2 两态租约）
+    attempts INTEGER NOT NULL DEFAULT 0,
+    claimed_at INTEGER,
+    next_retry_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_event_outbox_claim ON event_outbox (state, next_retry_at);

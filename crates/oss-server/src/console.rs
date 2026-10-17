@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
 use xl_s3::access::{Action, AuthedUser};
+use xl_s3::events::EventSink as _;
 
 use crate::state::AppState;
 
@@ -706,6 +707,9 @@ async fn delete_bucket(
             if let Err(e) = state.acl().clear_lifecycle_rules(&bucket).await {
                 tracing::warn!(error = ?e, "清理桶生命周期规则失败");
             }
+            if let Err(e) = state.acl().clear_bucket_notification(&bucket).await {
+                tracing::warn!(error = %e, bucket = %bucket, "删桶清通知配置失败");
+            }
             if let Err(e) = state.acl().clear_bucket_policy(&bucket).await {
                 tracing::warn!(error = ?e, "清理桶策略失败");
             }
@@ -796,8 +800,26 @@ async fn delete_object(
     if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Delete).await {
         return r;
     }
+    // M6 切片 0（P2-1 复查补）：store 在锁内返回「是否真删」——空删幂等，只有真删才发事件
     match state.store.delete_object(&bucket, &key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(deleted) => {
+            if deleted {
+                // M6 切片 0（R5）：控制台删对象事件（硬删整键 → ObjectRemoved:Delete）
+                state
+                    .events
+                    .emit(
+                        xl_s3::events::S3EventOp::RemovedDelete,
+                        &bucket,
+                        &key,
+                        None,
+                        None,
+                        None,
+                        xl_s3::events::EventSource::internal("oss-console"),
+                    )
+                    .await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => store_error(e).into_response(),
     }
 }

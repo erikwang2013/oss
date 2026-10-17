@@ -5,6 +5,7 @@ pub mod cluster_control;
 pub mod config;
 pub mod console;
 pub mod db;
+pub mod events;
 pub mod lifecycle;
 pub mod router;
 pub mod state;

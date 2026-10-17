@@ -1173,7 +1173,7 @@ async fn concurrent_puts_and_deletes_never_observe_torn_state() {
                     .await
                     .map(|_| ())
             } else {
-                s.delete_object("alpha", "same").await
+                s.delete_object("alpha", "same").await.map(|_| ())
             }
         }));
     }
@@ -3875,7 +3875,7 @@ async fn versioning_chain_full_flow() {
         "被删版本目录应进 trash"
     );
 
-    // 幂等：删不存在的版本 → Ok（S3 语义）
+    // 幂等：删不存在的版本 → Ok(NotFound)（S3 语义；M6 P2-1：空删与真删可判别，事件层据此不发事件）
     let out = s
         .delete_object_versioned(
             "alpha",
@@ -3885,7 +3885,7 @@ async fn versioning_chain_full_flow() {
         )
         .await
         .unwrap();
-    assert!(matches!(out, DeleteOutcome::Version { .. }));
+    assert!(matches!(out, DeleteOutcome::NotFound));
 
     // 删光 → 整键清理
     s.delete_object_versioned("alpha", "k", Some(&v_ids[0]), true)

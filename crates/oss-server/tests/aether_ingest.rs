@@ -123,6 +123,7 @@ async fn sink_without_bucket_skips_ingest() {
         store: Arc::clone(&st.store),
         db: Arc::clone(&st.db),
         cfg: Arc::new(cfg),
+        events: None,
     };
 
     let sub = "2026-10";
@@ -164,4 +165,53 @@ async fn build_runtime_prepares_staging_dirs() {
         "预处理要往 _header/ 写断点文件"
     );
     assert!(st.cfg.staging_dir.join("file").is_dir(), "分组目录要先建好");
+}
+
+/// M6 切片 0（R5/P2-4）：aether ingest 发 `s3:ObjectCreated:Post` 事件入 outbox。
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_emits_object_created_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("files").await.unwrap();
+    // 桶通知配置：files 桶 → target t1，收 Post
+    sqlx::query(
+        "INSERT INTO event_configs (bucket, config_json) VALUES ('files', ?)",
+    )
+    .bind(r#"[{"id":"a","target":"t1","events":["s3:ObjectCreated:Post"],"prefix":null,"suffix":null}]"#)
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+
+    let sub = "2026-10";
+    let group_dir = st.cfg.staging_dir.join("file").join(sub);
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let body = b"post-event upload";
+    let md5 = hex::encode({
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(body);
+        h.finalize()
+    });
+    let name = format!("{md5}.txt");
+    std::fs::write(group_dir.join(&name), body).unwrap();
+    let resource = Resource::new(&st.cfg.staging_dir, "file", "file", sub, &name);
+    st.ingest.upload_complete(&resource);
+
+    let (target, json): (String, String) =
+        sqlx::query_as("SELECT target_id, event_json FROM event_outbox WHERE bucket='files'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(target, "t1");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["eventName"], "s3:ObjectCreated:Post");
+    assert_eq!(v["source"]["host"], "internal");
+    assert_eq!(v["source"]["userAgent"], "oss-aether");
+    assert_eq!(v["s3"]["bucket"]["name"], "files");
+    assert_eq!(
+        v["s3"]["object"]["key"],
+        format!("{sub}%2F{name}"),
+        "事件键须为 AWS URL 编码形态"
+    );
+    assert_eq!(v["s3"]["object"]["versionId"], "null");
 }
