@@ -29,6 +29,27 @@ pub struct AppConfig {
     /// M3 集群节 `[cluster]`；未配置 = 单节点（v1.4.0 行为）。
     #[serde(default)]
     pub cluster: Option<ClusterToml>,
+    /// M6 切片 1：Kafka 通知目标 `[[kafka.targets]]`（静态配置，同集群 secret 的配置文件信任）。
+    #[serde(default)]
+    pub kafka: KafkaToml,
+}
+
+/// `[[kafka.targets]]`：桶通知 ARN `arn:oss:sqs::<id>:kafka` 的 id → 连接与主题映射。
+/// **deny_unknown_fields**（P3-f 复查补）：`[[kafka.target]]` 这类拼错必须启动即拒，
+/// 不得静默退回 Noop（事件全丢）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaToml {
+    #[serde(default)]
+    pub targets: Vec<KafkaTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KafkaTarget {
+    /// 与桶通知 ARN 中的 `<id>` 对应（白名单 `[A-Za-z0-9._-]{1,64}`，见 notify.rs）
+    pub id: String,
+    pub brokers: Vec<String>,
+    pub topic: String,
 }
 
 /// `[cluster]`：扁平静态拓扑（设计 §5.3——无 DC/Region/AZ，M3+ 同样适用）。
@@ -112,7 +133,40 @@ impl AppConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
-        Ok(toml::from_str(&text)?)
+        let cfg: Self = toml::from_str(&text)?;
+        cfg.kafka_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
+        Ok(cfg)
+    }
+
+    /// M6 切片 1（P3-f）：`[[kafka.targets]]` 校验——id 白名单/唯一、brokers/topic 非空。
+    /// 启动即 fail-closed（错配置不静默进死信）。
+    pub fn kafka_validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for t in &self.kafka.targets {
+            if t.id.is_empty()
+                || t.id.len() > 64
+                || !t
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                return Err(format!(
+                    "[[kafka.targets]] id 非法：{:?}（白名单 [A-Za-z0-9._-]，≤64）",
+                    t.id
+                ));
+            }
+            if !seen.insert(t.id.clone()) {
+                return Err(format!("[[kafka.targets]] id 重复：{}", t.id));
+            }
+            if t.brokers.is_empty() || t.brokers.iter().any(|b| b.trim().is_empty()) {
+                return Err(format!("[[kafka.targets]] {} 的 brokers 不能为空", t.id));
+            }
+            if t.topic.trim().is_empty() {
+                return Err(format!("[[kafka.targets]] {} 的 topic 不能为空", t.id));
+            }
+        }
+        Ok(())
     }
 
     pub fn bucket_for_group(&self, group: &str) -> Option<&str> {
@@ -291,6 +345,7 @@ mod tests {
             jwt_secret: String::new(),
             max_put_bytes: 1024,
             groups: vec![],
+            kafka: KafkaToml::default(),
             cluster: None,
         }
     }
@@ -368,6 +423,68 @@ mod tests {
         assert!(
             r.admin_password.is_none(),
             "无文件时不生成管理员口令（裸跑无口令即不引导）"
+        );
+    }
+
+    /// M6 切片 1（P3-f）：Kafka 目标配置校验矩阵（启动 fail-closed）。
+    #[test]
+    fn kafka_targets_validation_matrix() {
+        let mk = |id: &str, brokers: Vec<&str>, topic: &str| KafkaTarget {
+            id: id.into(),
+            brokers: brokers.into_iter().map(str::to_string).collect(),
+            topic: topic.into(),
+        };
+        let cfg = |targets| AppConfig {
+            listen: "127.0.0.1:0".into(),
+            data_dir: std::path::PathBuf::from("/tmp/x"),
+            data_dirs: None,
+            ec: Default::default(),
+            staging_dir: std::path::PathBuf::from("/tmp/x"),
+            database_url: "sqlite::memory:".into(),
+            jwt_secret: "k".repeat(32),
+            max_put_bytes: 1,
+            groups: vec![],
+            cluster: None,
+            kafka: KafkaToml { targets },
+        };
+        // 合法
+        assert!(
+            cfg(vec![mk("t1", vec!["127.0.0.1:9092"], "events")])
+                .kafka_validate()
+                .is_ok()
+        );
+        // 非法 id（路径穿越/超长）
+        assert!(
+            cfg(vec![mk("../x", vec!["b:1"], "t")])
+                .kafka_validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![mk("a/b", vec!["b:1"], "t")])
+                .kafka_validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![mk(&"a".repeat(65), vec!["b:1"], "t")])
+                .kafka_validate()
+                .is_err()
+        );
+        // 重复 id / 空 brokers / 空 broker 串 / 空 topic
+        assert!(
+            cfg(vec![mk("t1", vec!["b:1"], "x"), mk("t1", vec!["b:2"], "y")])
+                .kafka_validate()
+                .is_err()
+        );
+        assert!(cfg(vec![mk("t1", vec![], "x")]).kafka_validate().is_err());
+        assert!(
+            cfg(vec![mk("t1", vec![" "], "x")])
+                .kafka_validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![mk("t1", vec!["b:1"], " ")])
+                .kafka_validate()
+                .is_err()
         );
     }
 }

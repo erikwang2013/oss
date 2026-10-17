@@ -123,7 +123,7 @@ impl Notifier for NoopNotifier {
     }
 }
 
-/// 自 env 构造（切片 1 接 Kafka 后扩展）。
+/// 自 env 构造（切片 0 文件 sink；切片 1 起 Kafka 优先，见 [`notifier_from_config`]）。
 pub fn notifier_from_env() -> Arc<dyn Notifier> {
     if let Ok(spec) = std::env::var("OSS_EVENT_SINK")
         && let Some(f) = FileNotifier::from_spec(&spec)
@@ -131,6 +131,168 @@ pub fn notifier_from_env() -> Arc<dyn Notifier> {
         return Arc::new(f);
     }
     Arc::new(NoopNotifier)
+}
+
+// ---------- Kafka 后端（M6 切片 1） ----------
+
+/// R1/V1 分级：Kafka 错误 → NotifyFailure（permanent 才吃死信预算）。
+/// 连接类（Connection/Timeout/Request IO·帧错/未归类）**永不 dead**；鉴权与协议级
+/// 永久错计 attempts（>10 → dead）。`UnknownTopicOrPartition` 归可重试（协议无法区分
+/// 「真缺失」与元数据未同步；部署口径：topic 预创建，producer 用 `UnknownTopicHandling::Error`
+/// 让 outbox 观察而非 rskafka 内部无限重试）。
+pub fn classify_kafka_err(e: &rskafka::client::error::Error) -> NotifyFailure {
+    use rskafka::client::error::{Error as KErr, RequestError as R};
+    let permanent = match e {
+        KErr::Connection(_) => false,
+        KErr::Request(R::NoVersionMatch { .. }) => true,
+        KErr::Request(_) => false, // IO / Poisoned / Read·Write 帧错
+        KErr::ServerError { protocol_error, .. } => classify_protocol_err(protocol_error).permanent,
+        _ => false, // InvalidResponse 等未归类：默认可重试（护验收②）
+    };
+    NotifyFailure {
+        permanent,
+        message: e.to_string(),
+    }
+}
+
+/// V1 永久错表（协议级）。表外一律可重试——`UnknownTopicOrPartition` 明确在此列
+/// （协议无法区分真缺失与元数据未同步；部署口径 topic 预创建）。
+pub fn classify_protocol_err(p: &rskafka::client::error::ProtocolError) -> NotifyFailure {
+    use rskafka::client::error::ProtocolError as P;
+    let permanent = matches!(
+        p,
+        P::SaslAuthenticationFailed
+            | P::TopicAuthorizationFailed
+            | P::ClusterAuthorizationFailed
+            | P::UnsupportedSaslMechanism
+            | P::IllegalSaslState
+            | P::SecurityDisabled
+            | P::InvalidTopicException
+            | P::MessageTooLarge
+            | P::RecordListTooLarge
+            | P::UnsupportedCompressionType
+            | P::UnsupportedVersion
+            | P::InvalidRequiredAcks
+            | P::InvalidRecord
+            | P::InvalidRequest
+            | P::PolicyViolation
+            | P::CorruptMessage
+    );
+    NotifyFailure {
+        permanent,
+        message: format!("{p:?}"),
+    }
+}
+
+fn kafka_now() -> rskafka::chrono::DateTime<rskafka::chrono::Utc> {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    rskafka::chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+        .unwrap_or_else(|| rskafka::chrono::DateTime::from_timestamp(0, 0).expect("epoch"))
+}
+
+struct KafkaRoute {
+    brokers: Vec<String>,
+    topic: String,
+}
+
+/// Kafka 通知器：target id → `[[kafka.targets]]` 静态映射；Client 按 broker 集惰性建连并缓存。
+pub struct KafkaNotifier {
+    routes: std::collections::HashMap<String, KafkaRoute>,
+    clients: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<rskafka::client::Client>>,
+    >,
+}
+
+impl KafkaNotifier {
+    pub fn new(targets: &[crate::config::KafkaTarget]) -> Self {
+        let routes = targets
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    KafkaRoute {
+                        brokers: t.brokers.clone(),
+                        topic: t.topic.clone(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            routes,
+            clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    async fn client_for(
+        &self,
+        key: &str,
+        brokers: &[String],
+    ) -> Result<std::sync::Arc<rskafka::client::Client>, NotifyFailure> {
+        // 双检：先读缓存，miss 则持锁建连（并发首用只建一次）
+        if let Some(c) = self.clients.lock().await.get(key) {
+            return Ok(c.clone());
+        }
+        // 退避收紧：连接/元数据重试带 5s deadline——broker 停机时 send 会**及时失败**
+        // 让 outbox 记 attempts 并按 R1 重试；rskafka 默认（max 500s 且无 deadline）会
+        // 在停机期无限重试、饿死 outbox 的观测与退避语义。
+        let backoff = rskafka::BackoffConfig {
+            init_backoff: std::time::Duration::from_millis(100),
+            max_backoff: std::time::Duration::from_secs(2),
+            base: 2.0,
+            deadline: Some(std::time::Duration::from_secs(5)),
+        };
+        let built = rskafka::client::ClientBuilder::new(brokers.to_vec())
+            .backoff_config(backoff)
+            .build()
+            .await
+            .map_err(|e| classify_kafka_err(&e))?;
+        let shared = std::sync::Arc::new(built);
+        self.clients
+            .lock()
+            .await
+            .insert(key.to_string(), std::sync::Arc::clone(&shared));
+        Ok(shared)
+    }
+}
+
+#[async_trait::async_trait]
+impl Notifier for KafkaNotifier {
+    async fn send(&self, target: &str, payload: &str) -> Result<(), NotifyFailure> {
+        use rskafka::client::partition::{Compression, UnknownTopicHandling};
+        let Some(route) = self.routes.get(target) else {
+            return Err(NotifyFailure::permanent(format!(
+                "unknown kafka target id: {target:?} (check [[kafka.targets]])"
+            )));
+        };
+        let brokers_key = route.brokers.join(",");
+        let client = self.client_for(&brokers_key, &route.brokers).await?;
+        let pc = client
+            .partition_client(route.topic.clone(), 0, UnknownTopicHandling::Error)
+            .await
+            .map_err(|e| classify_kafka_err(&e))?;
+        let rec = rskafka::record::Record {
+            key: None,
+            value: Some(payload.as_bytes().to_vec()),
+            headers: Default::default(),
+            // rskafka 的 chrono 无 clock：用 Unix 秒/纳秒构造 DateTime<Utc>（no_std 亦可用）
+            timestamp: kafka_now(),
+        };
+        pc.produce(vec![rec], Compression::NoCompression)
+            .await
+            .map(|_| ())
+            .map_err(|e| classify_kafka_err(&e))
+    }
+}
+
+/// 装配口径（切片 1）：`[[kafka.targets]]` 非空 → Kafka 优先；否则退回 env 文件 sink / Noop
+/// （切片 0 行为）。SASL/SSL 未接线（记档——rskafka 支持后加）。
+pub fn notifier_from_config(targets: &[crate::config::KafkaTarget]) -> Arc<dyn Notifier> {
+    if !targets.is_empty() {
+        return Arc::new(KafkaNotifier::new(targets));
+    }
+    notifier_from_env()
 }
 
 // ---------- 事件 JSON（S3 通知形状） ----------
@@ -248,11 +410,11 @@ pub struct SqlEventSink {
 }
 
 impl SqlEventSink {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool, notifier: Arc<dyn Notifier>) -> Self {
         Self {
             pool,
             region: EVENT_REGION.to_string(),
-            notifier: notifier_from_env(),
+            notifier,
         }
     }
 
@@ -894,6 +1056,93 @@ mod tests {
             (state.as_str(), attempts),
             ("pending", 4),
             "回收不计 attempts；仅投递失败一次 +1（3+1=4）"
+        );
+    }
+
+    /// 切片 1（V1 表）：Kafka 协议级错误分级矩阵——永久表逐枚 + 可重试样本。
+    #[test]
+    fn kafka_error_classification_matrix() {
+        use rskafka::client::error::ProtocolError as P;
+        let permanent = [
+            P::SaslAuthenticationFailed,
+            P::TopicAuthorizationFailed,
+            P::ClusterAuthorizationFailed,
+            P::UnsupportedSaslMechanism,
+            P::IllegalSaslState,
+            P::SecurityDisabled,
+            P::InvalidTopicException,
+            P::MessageTooLarge,
+            P::RecordListTooLarge,
+            P::UnsupportedCompressionType,
+            P::UnsupportedVersion,
+            P::InvalidRequiredAcks,
+            P::InvalidRecord,
+            P::InvalidRequest,
+            P::PolicyViolation,
+            P::CorruptMessage,
+        ];
+        for p in permanent {
+            assert!(classify_protocol_err(&p).permanent, "{p:?} 应判永久");
+        }
+        // 可重试样本（含 V1 点名的 UnknownTopicOrPartition 与未归类默认）
+        for p in [
+            P::UnknownTopicOrPartition,
+            P::LeaderNotAvailable,
+            P::NotLeaderOrFollower,
+            P::RequestTimedOut,
+            P::BrokerNotAvailable,
+            P::NetworkException,
+            P::OffsetOutOfRange, // 表外 → 默认可重试
+        ] {
+            assert!(!classify_protocol_err(&p).permanent, "{p:?} 应判可重试");
+        }
+    }
+
+    /// 切片 1（P3-a 复查订正）：`ServerError` 可从公开 API 构造（NoVersionMatch 仍不可），
+    /// 委派链（ServerError → classify_protocol_err）三行钉住。
+    #[test]
+    fn kafka_server_error_delegates() {
+        use rskafka::client::error::{Error as KErr, ProtocolError as P, RequestContext as C};
+        let mk = |p: P| KErr::ServerError {
+            protocol_error: p,
+            error_message: None,
+            request: C::Topic("t".into()),
+            response: None,
+            is_virtual: false,
+        };
+        assert!(classify_kafka_err(&mk(P::SaslAuthenticationFailed)).permanent);
+        assert!(!classify_kafka_err(&mk(P::UnknownTopicOrPartition)).permanent);
+        assert!(!classify_kafka_err(&mk(P::RequestTimedOut)).permanent);
+    }
+
+    /// 切片 1（P3-b）：KafkaNotifier 的 unknown target → permanent（误配 11 次进死信，
+    /// 且不会产生任何网络 I/O）。
+    #[tokio::test]
+    async fn kafka_notifier_unknown_target_permanent() {
+        let n = KafkaNotifier::new(&[crate::config::KafkaTarget {
+            id: "t1".into(),
+            brokers: vec!["127.0.0.1:1".into()],
+            topic: "x".into(),
+        }]);
+        let f = n.send("nope", "{}").await.unwrap_err();
+        assert!(f.permanent);
+        assert!(f.message.contains("unknown kafka target"));
+    }
+
+    /// 切片 1（P3-b/c 侧）：broker 不可达 → 可重试（连接类），且在收紧退避的 deadline 内返回。
+    #[tokio::test]
+    async fn kafka_notifier_unreachable_retryable() {
+        let n = KafkaNotifier::new(&[crate::config::KafkaTarget {
+            id: "t1".into(),
+            brokers: vec!["127.0.0.1:1".into()],
+            topic: "x".into(),
+        }]);
+        let started = std::time::Instant::now();
+        let f = n.send("t1", "{}").await.unwrap_err();
+        assert!(!f.permanent, "连接类必须可重试（永不 dead）：{}", f.message);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "deadline 收紧后应在有限时间返回"
         );
     }
 

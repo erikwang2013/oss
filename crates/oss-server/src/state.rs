@@ -426,8 +426,12 @@ impl AppState {
         // M5 切片 6：SK 库自 Store 的密钥库状态（须在 init_encryption 之后——本函数由
         // 启动路径在 store open+init 完成后调用）。
         let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
-        // M6 切片 0：事件接收方（worker 在 serve 路径挂载）
-        let events = Arc::new(crate::events::SqlEventSink::new(db.pool().clone()));
+        // M6 切片 0/1：事件接收方（worker 在 serve 路径挂载；Kafka 目标优先，否则 env 文件 sink）
+        let notifier = crate::events::notifier_from_config(&cfg.kafka.targets);
+        let events = Arc::new(crate::events::SqlEventSink::new(
+            db.pool().clone(),
+            notifier,
+        ));
         let cfg = Arc::new(cfg);
         let db = Arc::new(db);
         let ingest = Arc::new(crate::aether::IngestSink {
