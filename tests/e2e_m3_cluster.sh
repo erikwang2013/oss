@@ -127,6 +127,28 @@ echo "   扇出路径通"
 
 W=$(mktemp -d); trap 'cleanup; rm -rf "$W"' EXIT
 
+# ---- M5 切片 0（P4-1）接线断言：建/删桶后各节点行解析立即一致（免重启）----
+# （单 set 配置下为接线冒烟：广播把行写全达 → 各节点即时可写；跨 set 陈旧行收敛由
+#   control_write 单测覆盖，深水位归 M9）
+echo "== 0c. 桶行广播接线：n1 建桶 → 各节点即时可写；删桶 → 各节点即时拒写 =="
+B0="m5row-$(date +%s)"
+aws --endpoint-url "$N1" s3 mb "s3://$B0" >/dev/null || { echo "FAIL: n1 建桶"; exit 1; }
+printf 'row\n' > "$W/row.bin"
+for u in "$N2" "$N3" "$N4"; do
+  aws --endpoint-url "$u" s3 cp "$W/row.bin" "s3://$B0/row.bin" >/dev/null \
+    || { echo "FAIL: 建桶后 $u 即时写入失败（行未广播达？）"; exit 1; }
+done
+aws --endpoint-url "$N2" s3 cp "s3://$B0/row.bin" "$W/row.back" >/dev/null
+cmp "$W/row.bin" "$W/row.back" || { echo "FAIL: 行传播后读不一致"; exit 1; }
+aws --endpoint-url "$N1" s3 rm "s3://$B0" --recursive >/dev/null
+aws --endpoint-url "$N1" s3 rb "s3://$B0" >/dev/null || { echo "FAIL: n1 删桶"; exit 1; }
+for u in "$N2" "$N3" "$N4"; do
+  if aws --endpoint-url "$u" s3 cp "$W/row.bin" "s3://$B0/row2.bin" >/dev/null 2>&1; then
+    echo "FAIL: 删桶后 $u 仍可写（行未收敛）"; exit 1
+  fi
+done
+echo "   建/删桶行广播接线即时收敛 ✓"
+
 echo "== ①③. 写 10MiB（n1）→ 4 节点读一致（cmp） =="
 aws --endpoint-url "$N1" s3 mb s3://m3sync >/dev/null
 head -c 10485760 /dev/urandom > "$W/ten.bin"
@@ -226,4 +248,4 @@ cmp "$W/ten.bin" "$W/rt.bin" || { echo "FAIL: 恢复后 n3 读不一致"; exit 1
 curl -s "$N1/health/cluster" >/dev/null
 echo "   恢复后读写一致 ✓"
 
-echo "M3 集群验收全部通过（①③④⑤ + ⑤-positive + 控制面扇出 + fsck 补齐）"
+echo "M3 集群验收全部通过（①③④⑤ + ⑤-positive + 控制面扇出 + 桶行广播接线 + fsck 补齐）"

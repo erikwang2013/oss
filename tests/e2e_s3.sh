@@ -14,8 +14,11 @@ PERM_BUCKET="zzz-perm-read-$(date +%s)"
 OTHER_BUCKET="zzz-perm-other-$(date +%s)"
 POLICY_BUCKET="pol-$(date +%s)"
 POLICY2_BUCKET="pol2-$(date +%s)"
+# M5 段（步骤 18）的两个桶：SSE 与对象锁
+SSE_BUCKET="sse-$(date +%s)"
+LOCK_BUCKET="lock-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
+trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET" "$SSE_BUCKET" "$LOCK_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
@@ -522,4 +525,172 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/api/v1/users/
 [ "$CODE" = "204" ] || { echo "删策略测试子账户应 204，实际 $CODE"; exit 1; }
 echo "   桶策略段通过（Deny 优先/400 校验/审计查询/清策略恢复/S3 面删桶清策略/Deny 压过授权行）"
 
-echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计）"
+echo "== 18. M5 安全：SSE 三模式 + 对象锁 + STS 临时凭据（验收 ①②③④）=="
+# 前置（README「加密（M5）」运维口径）：服务须以密钥库启动（OSS_MASTER_KEY_FILE 与/或
+# OSS_KMS_DIR；多节点须分发同一把主密钥）。E2E_DATA_DIR=<data_dir> 设定时额外做盘上
+# 明文特征 grep（判别力对照：明文键的特征**必须**找得到）。
+aws_s3 mb "s3://$SSE_BUCKET" >/dev/null
+
+echo "--- 18a. SSE-S3：写 → 响应/HEAD 回 AES256 → 往返一致 ---"
+MARK="M5PLAINTEXTMARKER$(date +%s)ZZ"
+{ printf '%s' "$MARK"; head -c 200000 /dev/urandom; } > "$WORK/sec18.bin"
+aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$SSE_BUCKET" --key s3enc.bin \
+  --body "$WORK/sec18.bin" --server-side-encryption AES256 > "$WORK/sse_put.json"
+grep -q '"ServerSideEncryption": "AES256"' "$WORK/sse_put.json" \
+  || { echo "SSE-S3 PUT 未回 AES256：$(cat "$WORK/sse_put.json")"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$SSE_BUCKET" --key s3enc.bin \
+  | grep -q '"ServerSideEncryption": "AES256"' || { echo "SSE-S3 HEAD 缺加密头"; exit 1; }
+aws_s3 cp "s3://$SSE_BUCKET/s3enc.bin" "$WORK/sse_back.bin" >/dev/null
+cmp "$WORK/sec18.bin" "$WORK/sse_back.bin" || { echo "SSE-S3 往返不一致"; exit 1; }
+
+echo "--- 18b. SSE-KMS：写 → 回 aws:kms ---"
+aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$SSE_BUCKET" --key kmsenc.bin \
+  --body "$WORK/sec18.bin" --server-side-encryption aws:kms > "$WORK/kms_put.json"
+grep -q '"ServerSideEncryption": "aws:kms"' "$WORK/kms_put.json" \
+  || { echo "SSE-KMS PUT 未回 aws:kms：$(cat "$WORK/kms_put.json")"; exit 1; }
+aws_s3 cp "s3://$SSE_BUCKET/kmsenc.bin" "$WORK/kms_back.bin" >/dev/null
+cmp "$WORK/sec18.bin" "$WORK/kms_back.bin" || { echo "SSE-KMS 往返不一致"; exit 1; }
+
+echo "--- 18c. SSE-C：客户钥直用（钥不落盘）；错钥必拒 ---"
+head -c 32 /dev/urandom > "$WORK/ssec.key"
+head -c 32 /dev/urandom > "$WORK/wrong.key"
+aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$SSE_BUCKET" --key ssec.bin \
+  --body "$WORK/sec18.bin" --sse-customer-algorithm AES256 --sse-customer-key "fileb://$WORK/ssec.key" \
+  > "$WORK/ssec_put.json"
+grep -q '"SSECustomerAlgorithm": "AES256"' "$WORK/ssec_put.json" \
+  || { echo "SSE-C PUT 未回 algorithm：$(cat "$WORK/ssec_put.json")"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$SSE_BUCKET" --key ssec.bin \
+  --sse-customer-algorithm AES256 --sse-customer-key "fileb://$WORK/ssec.key" "$WORK/ssec_back.bin" >/dev/null
+cmp "$WORK/sec18.bin" "$WORK/ssec_back.bin" || { echo "SSE-C 往返不一致"; exit 1; }
+if aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$SSE_BUCKET" --key ssec.bin \
+    --sse-customer-algorithm AES256 --sse-customer-key "fileb://$WORK/wrong.key" "$WORK/wrong.bin" >/dev/null 2>&1; then
+  echo "SSE-C 错钥必须拒（竟成功）"; exit 1
+fi
+
+echo "--- 18d. 盘上明文 grep（E2E_DATA_DIR 设定时；含判别力对照）---"
+if [ -n "${E2E_DATA_DIR:-}" ]; then
+  # 对照：明文键（无 SSE）→ 特征必须在盘上找得到
+  printf '%s' "$MARK" > "$WORK/plain18.bin"
+  aws_s3 cp "$WORK/plain18.bin" "s3://$SSE_BUCKET/plain.bin" >/dev/null
+  grep -rq "$MARK" "$E2E_DATA_DIR" || { echo "对照失败：明文键的特征在盘上找不到（grep 方法无效）"; exit 1; }
+  # 删除明文键后（其目录回收），加密键落盘不得含特征：直接对加密键目录 grep 亦可，
+  # 但更简单的是先删明文键再全盘 grep——trash 残骸仍可能在（回收窗口），故改为直接
+  # 断言：全盘 grep 中，明文特征只出现在 plain.bin（及其 trash）子树 → 精确断言：
+  for key in s3enc kmsenc ssec; do
+    if find "$E2E_DATA_DIR" -path "*$key*" -type f -exec grep -l "$MARK" {} + 2>/dev/null | head -1 | grep -q .; then
+      echo "加密键 $key 的盘上分片含明文特征"; exit 1
+    fi
+  done
+  echo "   加密键分片无明文特征（明文对照键有——判别有效）"
+else
+  echo "   （E2E_DATA_DIR 未设，跳过盘上 grep；设 data_dir 路径可启用）"
+fi
+
+echo "--- 18e. 对象锁：COMPLIANCE 拒删（含点名删）→ GOVERNANCE bypass → LegalHold ---"
+aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$LOCK_BUCKET" --object-lock-enabled-for-bucket
+aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning --bucket "$LOCK_BUCKET" | grep -q Enabled \
+  || { echo "锁桶应自动开版本控制"; exit 1; }
+LOCK_DATE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+CID=$(aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$LOCK_BUCKET" --key comp.bin \
+  --body "$WORK/plain18.bin" --object-lock-mode COMPLIANCE --object-lock-retain-until-date "$LOCK_DATE" \
+  --query VersionId --output text)
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$LOCK_BUCKET" --key comp.bin \
+  | grep -q '"ObjectLockMode": "COMPLIANCE"' || { echo "COMPLIANCE 头缺失"; exit 1; }
+if aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$LOCK_BUCKET" --key comp.bin --version-id "$CID" >/dev/null 2>&1; then
+  echo "COMPLIANCE 未到期必须拒删"; exit 1
+fi
+GID=$(aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$LOCK_BUCKET" --key gov.bin \
+  --body "$WORK/plain18.bin" --object-lock-mode GOVERNANCE --object-lock-retain-until-date "$LOCK_DATE" \
+  --query VersionId --output text)
+if aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$LOCK_BUCKET" --key gov.bin --version-id "$GID" >/dev/null 2>&1; then
+  echo "GOVERNANCE 无 bypass 必须拒删"; exit 1
+fi
+aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$LOCK_BUCKET" --key gov.bin \
+  --version-id "$GID" --bypass-governance-retention >/dev/null \
+  || { echo "GOVERNANCE + bypass 应放行"; exit 1; }
+HID=$(aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$LOCK_BUCKET" --key hold.bin \
+  --body "$WORK/plain18.bin" --object-lock-legal-hold-status ON --query VersionId --output text)
+if aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$LOCK_BUCKET" --key hold.bin --version-id "$HID" >/dev/null 2>&1; then
+  echo "LegalHold ON 必须拒删"; exit 1
+fi
+aws --endpoint-url "$ENDPOINT" s3api put-object-legal-hold --bucket "$LOCK_BUCKET" --key hold.bin \
+  --version-id "$HID" --legal-hold Status=OFF >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-legal-hold --bucket "$LOCK_BUCKET" --key hold.bin \
+  --version-id "$HID" | grep -q OFF || { echo "LegalHold OFF 读回失败"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket "$LOCK_BUCKET" --key hold.bin --version-id "$HID" >/dev/null \
+  || { echo "OFF 后应放行"; exit 1; }
+# 桶级默认规则 + 未开锁桶设 hold 400（P3-a 线级）
+aws --endpoint-url "$ENDPOINT" s3api put-object-lock-configuration --bucket "$LOCK_BUCKET" \
+  --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=GOVERNANCE,Days=1}}' >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-lock-configuration --bucket "$LOCK_BUCKET" \
+  | grep -q '"Days": 1' || { echo "默认保留规则回读失败"; exit 1; }
+if aws --endpoint-url "$ENDPOINT" s3api put-object-legal-hold --bucket "$BUCKET" --key one.bin \
+    --legal-hold Status=ON >/dev/null 2>&1; then
+  echo "未开锁桶设 legal hold 必须 400"; exit 1
+fi
+echo "   对象锁段通过（COMPLIANCE 拒含 admin / bypass / LegalHold 开关 / 默认规则 / 门禁）"
+
+echo "--- 18f. STS：AssumeRole → 临时凭据可用；会话策略收窄生效；GetSessionToken ---"
+AR_JSON=$(aws --endpoint-url "$ENDPOINT" sts assume-role \
+  --role-arn "arn:oss:iam::oss:role/$ADMIN_USER" --role-session-name e2e18 \
+  --duration-seconds 900 --output json)
+TAK=$(echo "$AR_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])')
+TSK=$(echo "$AR_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])')
+TSTOKEN=$(echo "$AR_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["SessionToken"])')
+echo "$TAK" | grep -q '^ASIA' || { echo "STS AK 形态不对：$TAK"; exit 1; }
+TMP_AWS() { AWS_ACCESS_KEY_ID="$TAK" AWS_SECRET_ACCESS_KEY="$TSK" AWS_SESSION_TOKEN="$TSTOKEN" \
+  aws --endpoint-url "$ENDPOINT" "$@"; }
+TMP_AWS s3api list-buckets | grep -q "$SSE_BUCKET" || { echo "临时凭据不可用"; exit 1; }
+# 会话策略收窄：只许 GetObject $SSE_BUCKET/* → put 必 403、get 放行
+SPOL='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$SSE_BUCKET"'/*"}]}'
+AR2=$(aws --endpoint-url "$ENDPOINT" sts assume-role --role-arn "arn:oss:iam::oss:role/$ADMIN_USER" \
+  --role-session-name e2e18sp --duration-seconds 900 --policy "$SPOL" --output json)
+T2AK=$(echo "$AR2" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])')
+T2SK=$(echo "$AR2" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])')
+T2TK=$(echo "$AR2" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["SessionToken"])')
+T2_AWS() { AWS_ACCESS_KEY_ID="$T2AK" AWS_SECRET_ACCESS_KEY="$T2SK" AWS_SESSION_TOKEN="$T2TK" \
+  aws --endpoint-url "$ENDPOINT" "$@"; }
+T2_AWS s3api get-object --bucket "$SSE_BUCKET" --key s3enc.bin "$WORK/sp_back.bin" >/dev/null \
+  || { echo "会话策略内 GetObject 应放行"; exit 1; }
+if T2_AWS s3api put-object --bucket "$SSE_BUCKET" --key sp_put.bin --body "$WORK/plain18.bin" >/dev/null 2>&1; then
+  echo "会话策略外 PutObject 必须拒（交集失效）"; exit 1
+fi
+GST=$(aws --endpoint-url "$ENDPOINT" sts get-session-token --duration-seconds 900 --output json)
+GTAK=$(echo "$GST" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["AccessKeyId"])')
+GTSK=$(echo "$GST" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["SecretAccessKey"])')
+GTTK=$(echo "$GST" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Credentials"]["SessionToken"])')
+AWS_ACCESS_KEY_ID="$GTAK" AWS_SECRET_ACCESS_KEY="$GTSK" AWS_SESSION_TOKEN="$GTTK" \
+  aws --endpoint-url "$ENDPOINT" s3api list-buckets >/dev/null || { echo "GetSessionToken 凭据不可用"; exit 1; }
+echo "   STS 段通过（AssumeRole 可用 / 会话策略交集 / GetSessionToken；过期路径单测覆盖）"
+
+echo "--- 18g. SK 加密存（P3-3）：建键 → 返回 SK 真签名可用；E2E_DB 设定时断言落库密文 ---"
+NEW_AK="E2E18AK$(date +%s)000000"
+NEW_SK="E2E18SK$(date +%s)000000SECRET"
+CODE=$(curl -s -o "$WORK/sk_new.json" -w '%{http_code}' -X POST "$ENDPOINT/api/v1/access-keys" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d "{\"access_key\":\"$NEW_AK\",\"secret_key\":\"$NEW_SK\"}")
+[ "$CODE" = "200" ] || { echo "建键应 200，实际 $CODE：$(cat "$WORK/sk_new.json")"; exit 1; }
+AWS_ACCESS_KEY_ID="$NEW_AK" AWS_SECRET_ACCESS_KEY="$NEW_SK" \
+  aws --endpoint-url "$ENDPOINT" s3api list-buckets >/dev/null || { echo "新键签名不可用"; exit 1; }
+if [ -n "${E2E_DB:-}" ]; then
+  PREFIX=$(python3 -c "
+import sqlite3,sys
+c=sqlite3.connect('$E2E_DB')
+r=c.execute('SELECT secret_key FROM access_keys WHERE access_key=?',('$NEW_AK',)).fetchone()
+print(r[0][:7] if r else 'MISSING')")
+  [ "$PREFIX" = "enc:v1:" ] || { echo "SK 落库非密文（前缀 $PREFIX；库未启用则不设 E2E_DB 跑本段）"; exit 1; }
+  echo "   SK 落库前缀 enc:v1: ✓"
+fi
+curl -s -o /dev/null -X DELETE "$ENDPOINT/api/v1/access-keys/$NEW_AK" -H "authorization: Bearer $ADMIN_TOKEN"
+echo "   SK 加密段通过（建键 → 真签名 → 落库密文口径）"
+
+aws_s3 rb "s3://$SSE_BUCKET" --force >/dev/null
+# 锁桶清理必失败——COMPLIANCE 未到期版本不可删（守卫生效的直接证据）；容错式断言：
+if aws_s3 rb "s3://$LOCK_BUCKET" --force >/dev/null 2>&1; then
+  echo "锁桶竟删光（COMPLIANCE 守卫失效！）"; exit 1
+else
+  echo "   锁桶保留 COMPLIANCE 版本（预期：守卫阻止清理；到期后人工/脚本可清）"
+fi
+echo ""
+
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计 / M5 SSE+对象锁+STS）"
