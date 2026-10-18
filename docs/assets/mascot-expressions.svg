@@ -3,18 +3,6 @@
   <title>吞吞（TunTun）的 12 种彩色动态表情</title>
   <desc>项目宠物吞吞（TunTun）的十二种彩色动态表情：笑、欢乐、哭、沮丧、惊恐、愤怒、撒娇、卖萌、讨好、敲打、捂脸、吐舌头。</desc>
   <defs>
-        <radialGradient id="bg0" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fff7ed"/><stop offset="1" stop-color="#ffedd5"/></radialGradient>
-        <radialGradient id="bg1" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fefce8"/><stop offset="1" stop-color="#fde68a"/></radialGradient>
-        <radialGradient id="bg2" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#eff6ff"/><stop offset="1" stop-color="#dbeafe"/></radialGradient>
-        <radialGradient id="bg3" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#f1f5f9"/><stop offset="1" stop-color="#e2e8f0"/></radialGradient>
-        <radialGradient id="bg4" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#f5f3ff"/><stop offset="1" stop-color="#ede9fe"/></radialGradient>
-        <radialGradient id="bg5" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fef2f2"/><stop offset="1" stop-color="#fee2e2"/></radialGradient>
-        <radialGradient id="bg6" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fdf2f8"/><stop offset="1" stop-color="#fce7f3"/></radialGradient>
-        <radialGradient id="bg7" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fdf4ff"/><stop offset="1" stop-color="#fae8ff"/></radialGradient>
-        <radialGradient id="bg8" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#f0fdf4"/><stop offset="1" stop-color="#dcfce7"/></radialGradient>
-        <radialGradient id="bg9" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fff7ed"/><stop offset="1" stop-color="#fed7aa"/></radialGradient>
-        <radialGradient id="bg10" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fdf2f8"/><stop offset="1" stop-color="#fecdd3"/></radialGradient>
-        <radialGradient id="bg11" cx="50%" cy="42%" r="70%"><stop offset="0" stop-color="#fefce8"/><stop offset="1" stop-color="#fef08a"/></radialGradient>
     <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#7ba3cc"/><stop offset="1" stop-color="#55779c"/>
     </linearGradient>
@@ -50,14 +38,11 @@
       <circle cx="394" cy="410" r="5" fill="#4ade80"/>
     </g>
   </defs>
-  <rect x="1" y="1" width="1182" height="1172" rx="28" fill="#ffffff" stroke="#e5e7eb"/>
   <text x="34" y="46" font-size="23" font-weight="700" fill="#0f172a">吞吞 · 12 种彩色动态表情</text>
   <text x="34" y="68" font-size="12" fill="#64748b">笑 / 欢乐 / 哭 / 沮丧 / 惊恐 / 愤怒 / 撒娇 / 卖萌 / 讨好 / 敲打 / 捂脸 / 吐舌头</text>
   <text x="1150" y="68" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
 
   <g>
-    <rect x="20" y="86" width="280" height="322" rx="22" fill="url(#bg0)" stroke="#f59e0b" stroke-opacity="0.22"/>
-    <circle cx="262" cy="124" r="26" fill="#f59e0b" opacity="0.10"/>
       <g transform="translate(-2.4,22.6) scale(0.58)">
     
     <use xlink:href="#bucket" href="#bucket"/>
@@ -83,8 +68,6 @@
     <text x="160.0" y="382" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">SMILE</text>
   </g>
   <g>
-    <rect x="308" y="86" width="280" height="322" rx="22" fill="url(#bg1)" stroke="#eab308" stroke-opacity="0.22"/>
-    <circle cx="550" cy="124" r="26" fill="#eab308" opacity="0.10"/>
       <g transform="translate(285.6,22.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="translate" values="0 0;0 -10;0 0" dur="0.65s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -160,8 +143,6 @@
     <text x="448.0" y="382" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">JOY</text>
   </g>
   <g>
-    <rect x="596" y="86" width="280" height="322" rx="22" fill="url(#bg2)" stroke="#3b82f6" stroke-opacity="0.22"/>
-    <circle cx="838" cy="124" r="26" fill="#3b82f6" opacity="0.10"/>
       <g transform="translate(573.6,22.6) scale(0.58)">
     
     <use xlink:href="#bucket" href="#bucket"/>
@@ -206,8 +187,6 @@
     <text x="736.0" y="382" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">CRY</text>
   </g>
   <g>
-    <rect x="884" y="86" width="280" height="322" rx="22" fill="url(#bg3)" stroke="#64748b" stroke-opacity="0.22"/>
-    <circle cx="1126" cy="124" r="26" fill="#64748b" opacity="0.10"/>
       <g transform="translate(861.6,22.6) scale(0.58)">
     
     <use xlink:href="#bucket" href="#bucket"/>
@@ -241,8 +220,6 @@
     <text x="1024.0" y="382" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">DEJECTED</text>
   </g>
   <g>
-    <rect x="20" y="416" width="280" height="322" rx="22" fill="url(#bg4)" stroke="#8b5cf6" stroke-opacity="0.22"/>
-    <circle cx="262" cy="454" r="26" fill="#8b5cf6" opacity="0.10"/>
       <g transform="translate(-2.4,352.6) scale(0.58)">
     
     <use xlink:href="#bucket" href="#bucket"/>
@@ -286,8 +263,6 @@
     <text x="160.0" y="712" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">TERRIFIED</text>
   </g>
   <g>
-    <rect x="308" y="416" width="280" height="322" rx="22" fill="url(#bg5)" stroke="#ef4444" stroke-opacity="0.22"/>
-    <circle cx="550" cy="454" r="26" fill="#ef4444" opacity="0.10"/>
       <g transform="translate(285.6,352.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="translate" values="0 0;3 0;-3 0;0 0" keyTimes="0;0.3;0.6;1" dur="0.26s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -329,8 +304,6 @@
     <text x="448.0" y="712" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">ANGRY</text>
   </g>
   <g>
-    <rect x="596" y="416" width="280" height="322" rx="22" fill="url(#bg6)" stroke="#ec4899" stroke-opacity="0.22"/>
-    <circle cx="838" cy="454" r="26" fill="#ec4899" opacity="0.10"/>
       <g transform="translate(573.6,352.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="rotate" values="-3 280 430;3 280 430;-3 280 430" dur="2.6s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -396,8 +369,6 @@
     <text x="736.0" y="712" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">SPOILED</text>
   </g>
   <g>
-    <rect x="884" y="416" width="280" height="322" rx="22" fill="url(#bg7)" stroke="#d946ef" stroke-opacity="0.22"/>
-    <circle cx="1126" cy="454" r="26" fill="#d946ef" opacity="0.10"/>
       <g transform="translate(861.6,352.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="rotate" values="-2 280 430;2 280 430;-2 280 430" dur="2.8s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -459,8 +430,6 @@
     <text x="1024.0" y="712" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">ACT CUTE</text>
   </g>
   <g>
-    <rect x="20" y="746" width="280" height="322" rx="22" fill="url(#bg8)" stroke="#22c55e" stroke-opacity="0.22"/>
-    <circle cx="262" cy="784" r="26" fill="#22c55e" opacity="0.10"/>
       <g transform="translate(-2.4,682.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="translate" values="0 0;0 3;0 0" dur="1.4s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -504,8 +473,6 @@
     <text x="160.0" y="1042" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">PLEAD</text>
   </g>
   <g>
-    <rect x="308" y="746" width="280" height="322" rx="22" fill="url(#bg9)" stroke="#f97316" stroke-opacity="0.22"/>
-    <circle cx="550" cy="784" r="26" fill="#f97316" opacity="0.10"/>
       <g transform="translate(285.6,682.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="translate" values="0 0;0 2;0 0" dur="0.45s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -548,8 +515,6 @@
     <text x="448.0" y="1042" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">KNOCK</text>
   </g>
   <g>
-    <rect x="596" y="746" width="280" height="322" rx="22" fill="url(#bg10)" stroke="#f43f5e" stroke-opacity="0.22"/>
-    <circle cx="838" cy="784" r="26" fill="#f43f5e" opacity="0.10"/>
       <g transform="translate(573.6,682.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="translate" values="0 0;0 2;0 0" dur="2.2s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
@@ -592,8 +557,6 @@
     <text x="736.0" y="1042" font-size="10.5" fill="#64748b" text-anchor="middle" letter-spacing="1">FACEPALM</text>
   </g>
   <g>
-    <rect x="884" y="746" width="280" height="322" rx="22" fill="url(#bg11)" stroke="#eab308" stroke-opacity="0.22"/>
-    <circle cx="1126" cy="784" r="26" fill="#eab308" opacity="0.10"/>
       <g transform="translate(861.6,682.6) scale(0.58)">
     <g><animateTransform attributeName="transform" type="rotate" values="-2 280 430;2 280 430;-2 280 430" dur="2.4s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>

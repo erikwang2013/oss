@@ -53,19 +53,18 @@
   </defs>
   <rect x="1" y="1" width="1278" height="638" rx="18" fill="none" stroke="#e5e7eb"/>
 
-  <!-- 吉祥物 -->
+  <!-- 吉祥物 · 笑 -->
   <g transform="translate(-25,-5)">
     <use xlink:href="#bucket" href="#bucket"/>
-      <ellipse cx="222" cy="315" rx="16" ry="19" fill="#22303f"/>
-  <ellipse cx="338" cy="315" rx="16" ry="19" fill="#22303f"/>
-  <circle cx="227" cy="307" r="5.5" fill="#ffffff"/>
-  <circle cx="343" cy="307" r="5.5" fill="#ffffff"/>
-  <circle cx="216" cy="325" r="3" fill="#ffffff" opacity="0.85"/>
-  <circle cx="332" cy="325" r="3" fill="#ffffff" opacity="0.85"/>
-  <ellipse cx="194" cy="338" rx="17" ry="9" fill="#f0b9a6" opacity="0.5"/>
-  <ellipse cx="366" cy="338" rx="17" ry="9" fill="#f0b9a6" opacity="0.5"/>
-  <ellipse cx="280" cy="338" rx="6.5" ry="5" fill="#33506d"/>
-  <path d="M262,350 Q280,363 298,350" fill="none" stroke="#22303f" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M206,320 Q222,304 238,320" fill="none" stroke="#22303f" stroke-width="5.5" stroke-linecap="round"/>
+    <path d="M322,320 Q338,304 354,320" fill="none" stroke="#22303f" stroke-width="5.5" stroke-linecap="round"/>
+    <ellipse cx="194" cy="340" rx="18" ry="10" fill="#f0b9a6" opacity="0.4"/>
+    <ellipse cx="366" cy="340" rx="18" ry="10" fill="#f0b9a6" opacity="0.4"/>
+    <ellipse cx="280" cy="336" rx="6.5" ry="5" fill="#33506d"/>
+    <g transform="translate(280,360)">
+      <path d="M-24,-16 Q0,18 24,-16 Z" fill="#22303f"/>
+      <ellipse cx="0" cy="2" rx="10" ry="6" fill="#f2a68f"/>
+    </g>
   </g>
   <g transform="translate(452,150) scale(1.1)"><path d="M0,-14 L3.3,-3.3 L14,0 L3.3,3.3 L0,14 L-3.3,3.3 L-14,0 L-3.3,-3.3 Z" fill="#f59e0b"/></g>
   <g transform="translate(470,420) scale(0.85)"><path d="M0,-14 L3.3,-3.3 L14,0 L3.3,3.3 L0,14 L-3.3,3.3 L-14,0 L-3.3,-3.3 Z" fill="#f59e0b"/></g>
@@ -79,22 +78,22 @@
   <line x1="530" y1="352" x2="1220" y2="352" stroke="#e2e8f0"/>
 
     <g>
-    <rect x="530" y="384" width="186" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
+    <rect x="530" y="384" width="150" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
     <rect x="542" y="400" width="5" height="42" rx="2.5" fill="#60a5fa"/>
     <text x="560" y="417" font-size="18" font-weight="600" fill="#0f172a">S3 兼容</text>
     <text x="560" y="439" font-size="12.5" fill="#64748b">S3-compatible</text>
   </g>
     <g>
-    <rect x="736" y="384" width="232" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
-    <rect x="748" y="400" width="5" height="42" rx="2.5" fill="#2dd4bf"/>
-    <text x="766" y="417" font-size="18" font-weight="600" fill="#0f172a">纠删码 · 分布式</text>
-    <text x="766" y="439" font-size="12.5" fill="#64748b">erasure-coded · clustered</text>
+    <rect x="696" y="384" width="210" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
+    <rect x="708" y="400" width="5" height="42" rx="2.5" fill="#2dd4bf"/>
+    <text x="726" y="417" font-size="18" font-weight="600" fill="#0f172a">纠删码 · 分布式</text>
+    <text x="726" y="439" font-size="12.5" fill="#64748b">erasure-coded · clustered</text>
   </g>
     <g>
-    <rect x="988" y="384" width="232" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
-    <rect x="1000" y="400" width="5" height="42" rx="2.5" fill="#4ade80"/>
-    <text x="1018" y="417" font-size="18" font-weight="600" fill="#0f172a">版本 · 加密 · 锁 · 数据流 · 多站点</text>
-    <text x="1018" y="439" font-size="12.5" fill="#64748b">versioning · SSE · lock · dataflow</text>
+    <rect x="922" y="384" width="298" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
+    <rect x="934" y="400" width="5" height="42" rx="2.5" fill="#4ade80"/>
+    <text x="952" y="417" font-size="17" font-weight="600" fill="#0f172a">版本 · 加密 · 锁 · 多站点</text>
+    <text x="952" y="439" font-size="11.5" fill="#64748b">versioning · SSE · lock · multi-site</text>
   </g>
 
   <text x="530" y="540" font-size="17" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">github.com/erikwang2013/oss</text>
