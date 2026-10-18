@@ -335,8 +335,8 @@ async fn lifecycle_emits_expiration_events() {
             true,
             None,
             None,
-        
-            None,)
+            None,
+        )
         .await
         .unwrap();
     st.db
