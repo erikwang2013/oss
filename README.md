@@ -1,6 +1,8 @@
 ![吞吞（OSS 项目宠物）：一只装着三块对象立方体的存储桶，戴着绿色状态灯](docs/assets/mascot.svg)
 
-![吞吞的表情形态：哭、笑、沮丧、惊恐、得意](docs/assets/mascot-expressions.svg)
+![吞吞的 12 种彩色动态表情：笑、欢乐、哭、沮丧、惊恐、愤怒、撒娇、卖萌、讨好、敲打、捂脸、吐舌头](docs/assets/mascot-expressions.svg)
+
+单张彩色动态 SVG 见 [`docs/pet-expressions/`](docs/pet-expressions/)（12 种形态，均带动画）。
 
 # oss（吞吞）—— 自研分布式对象存储系统
 
