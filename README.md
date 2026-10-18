@@ -55,8 +55,11 @@ SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁 GOVERNANCE / COMPLIANC
 桶级默认保留规则（切片 4）· STS 临时凭据 AssumeRole/GetSessionToken + 会话策略交集（切片 5）·
 `access_keys.secret_key` 信封加密 + 存量透明迁移（切片 6）。**WebIdentity 经成本评估裁剪延后**
 （需出站 TLS 客户端新依赖栈；验收 ①–⑤ 不涉；记档于 M5 计划——用户知悉项）。
-**未实现**（见设计文档的阶段表）：复制（M6/M7）· 事件流与 Select（M6）· 访问点 / Object Lambda
-（M8）· 跨站点强一致（M9）· 细粒度 IAM 预设模板。
+已实现（M6 数据流）：事件通知（S3 通知配置 + Kafka，至少一次 outbox）· S3 Select（CSV/JSON、
+SQL 白名单、ScanRange、Progress/Stats 帧）· 桶复制（规则 API、9 写入口入队、SigV4 出站、
+PENDING→COMPLETED/FAILED、停机积压追平）。
+**未实现**（见设计文档的阶段表）：访问点 / Object Lambda（M8）· 跨站点强一致（M9）·
+细粒度 IAM 预设模板 · 复制带宽限速/跨站点。
 
 ## 架构
 
@@ -566,6 +569,94 @@ aws --endpoint-url http://127.0.0.1:9000 sts get-session-token --duration-second
 - **AssumeRoleWithWebIdentity：裁剪延后**（成本评估：JWKS 拉取需出站 TLS 客户端新依赖栈；
   验收 ①–⑤ 不涉及；记档于 M5 计划，接入点已留——`StsRoute` 动作分发 + `check_access` 匿名覆写）。
 
+## 事件通知（M6）
+
+桶通知配置走 S3 协议（`PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration`）；
+事件写入本地 outbox（`event_outbox`，至少一次）后由 worker 投递。目标只支持 Kafka：
+
+```toml
+# oss.toml：通知目标静态配置（id 与桶配置 ARN 对应）
+[[kafka.targets]]
+id = "t1"
+brokers = ["127.0.0.1:9092"]
+topic = "oss-events"
+```
+
+```bash
+aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-notification-configuration \
+  --bucket bkt --notification-configuration '{
+    "QueueConfigurations":[{
+      "Id":"all","QueueArn":"arn:oss:sqs::t1:kafka",
+      "Events":["s3:ObjectCreated:Put","s3:ObjectRemoved:Delete"],
+      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"logs/"}]}}
+    }]}'
+```
+
+- 事件名白名单：`s3:ObjectCreated:{Put,Post,Copy,CompleteMultipartUpload}` ·
+  `s3:ObjectRemoved:{Delete,DeleteMarkerCreated}` · `s3:LifecycleExpiration:{Delete,DeleteMarkerCreated}`。
+  事件 JSON 为 AWS 通知形状（`eventVersion 2.1`、`eventSource oss:s3`、urlencoded key、sequencer）。
+- 投递语义：**至少一次**（稳态不重；崩溃窗可能重投）。永久错（鉴权/协议）>10 次入死信；
+  连接类错误永不放弃（退避封顶 300s）。Topic 需**预创建**（部署前置；UTOP 不判死）。
+- 无 Kafka 时的调试旁路：`OSS_EVENT_SINK=file:/<dir>`（落文件，测试用）；worker 间隔
+  `OSS_EVENT_INTERVAL_SECS`（默认 1；0=关）。
+- 边界：SASL/SSL 未接线（内网假设）；`s3:ObjectAccessed:*` 未实现（配置返回 400）。
+
+## S3 Select（M6）
+
+`SelectObjectContent` 支持 CSV / JSON（LINES/DOCUMENT）× 输出 CSV / JSON，压缩 NONE/GZIP：
+
+```bash
+aws --endpoint-url http://127.0.0.1:9000 s3api select-object-content \
+  --bucket bkt --key data.csv \
+  --expression "SELECT s._1, s._2 FROM S3Object WHERE s._2 > 15 LIMIT 10" --expression-type SQL \
+  --input-serialization '{"CSV":{},"CompressionType":"NONE"}' \
+  --output-serialization '{"CSV":{}}' /tmp/out.csv
+```
+
+- SQL 子集（白名单外一律 `InvalidRequest`，不静默错结果）：`SELECT 列|* FROM S3Object [s]
+  [WHERE …] [LIMIT n]`；比较、AND/OR/NOT（SQL 三值逻辑）、BETWEEN/IN/LIKE/IS NULL、CAST；
+  函数 `substring/trim/lower/upper/char_length/abs/ceil/floor/round`；聚合
+  `count(*)/sum/min/max/avg`（不支持 GROUP BY；聚合须独占投影）。CSV 列 `s._1`；JSON 路径 `s.a.b`。
+- 输入：CSV 分隔符/引号/转义/记录分隔符/注释（缺省 `#`）/表头可配；`AllowQuotedRecordDelimiter`
+  缺省 false。ScanRange 按「记录首字节落在区间内则整条处理」；仅给 End = 扫描末尾 N 字节；
+  GZIP 与 ScanRange 互斥；JSON DOCUMENT 不支持 ScanRange。
+- 输出：Records ≤256KiB 分片 + Progress（约 1MiB 节奏，`--request-progress`）+ Stats + End；
+  Stats 三计数独立（`BytesScanned` 原始/压缩后、`BytesProcessed` 送入求值器、`BytesReturned` 输出）。
+- 上限/边界（记档）：对象 ≤256MiB、GZIP 解压 ≤512MiB（全量缓冲，无并发预算）；BZIP2 返回 400
+  （后置）；Parquet 未支持；CRLF 保留 `\r`；空 CSV 字段进 sum/avg 报 400；LIKE 模式 ≤4096 字节。
+
+## 桶复制（M6）
+
+源桶须**版本控制 Enabled**；目标用 `[[remotes]]` 静态配置，规则 `Destination.Bucket` 写成
+`<remote-id>/<桶名>`：
+
+```toml
+[[remotes]]
+id = "r1"
+endpoint = "http://10.0.0.2:9000"   # 仅 http（TLS 未接线，启动期拒绝 https）
+access_key = "..."                   # 目标实例上铸造的 AK
+secret_key = "..."
+region = "us-east-1"
+```
+
+```bash
+aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-replication --bucket srcbucket \
+  --replication-configuration '{"Role":"arn:oss:iam::oss:role/replication","Rules":[{
+    "ID":"logs","Status":"Enabled","Filter":{"Prefix":"logs/"},
+    "Destination":{"Bucket":"r1/dstbucket"},
+    "DeleteMarkerReplication":{"Status":"Enabled"}}]}'
+```
+
+- 覆盖全部写入口：PUT / MPU complete / CopyObject / 单删与批量删 marker / aether 摄取 /
+  控制台删除 / 生命周期删除。对象另带 `x-amz-replication-status`：源 `PENDING`→`COMPLETED`
+  （任一目的地永久失败超限 → `FAILED`）；目标为 `REPLICA`（防环，REPLICA 不再入队）。
+- 出站为 SigV4 + http1 PUT（`x-amz-replication-status: REPLICA` 纳入签名）；worker 300s 租约 +
+  R1 分级重试（连接/408/429/5xx 永不放弃、其余 4xx 永久、>10 次死信）；积压写入 `repl_outbox`，
+  目标恢复后自动追平。间隔 `OSS_REPL_INTERVAL_SECS`（默认 1；0=关）。
+- 边界（记档）：目标桶/主题需**预创建**；SSE-C 源对象不可复制（客户钥不落盘）；版本定向删除
+  与 `Priority` 不生效（不同目的地都会复制）；MPU 源 ETag 目标重算（不做 ETag 断言）；
+  单对象整读入内存（≤16 并发）；`Role` 不参与鉴权。
+
 ## 验收
 
 
@@ -579,6 +670,14 @@ AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:900
 # M5 全量（步骤 18）：服务须以密钥库启动（OSS_MASTER_KEY_FILE/OSS_KMS_DIR），可选：
 #   E2E_DATA_DIR=<data_dir>  盘上明文特征 grep（含明文对照键的判别性断言）
 #   E2E_DB=<sqlite 路径>     SK 落库密文前缀（enc:v1:）断言
+```
+
+M6 全量（§19：Select 对当前 ENDPOINT + Kafka（docker redpanda）+ 复制双实例）：
+
+```bash
+cargo build -p oss-server && AK=... SK=... ENDPOINT=... tests/e2e_s3.sh
+tests/e2e_replication.sh        # 仅复制：自动起源/目标两实例（约 1–2 分钟）
+tests/e2e_kafka.sh              # 仅 Kafka 三阶段（redpanda docker；约 1 分钟）
 ```
 
 集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：

@@ -693,4 +693,66 @@ else
 fi
 echo ""
 
-echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计 / M5 SSE+对象锁+STS）"
+echo "== 19. M6：S3 Select / Kafka / 桶复制 =="
+# 19a. Select：CSV + JSON LINES + --request-progress 帧可解析 + 边界 400
+printf 'a,10\na,20\nb,30\n' > "$WORK/sel.csv"
+aws_s3 cp "$WORK/sel.csv" "s3://$BUCKET/sel.csv" >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api select-object-content --bucket "$BUCKET" --key sel.csv \
+  --expression "SELECT s._1 FROM S3Object WHERE s._2 > 15" --expression-type SQL \
+  --input-serialization '{"CSV":{},"CompressionType":"NONE"}' \
+  --output-serialization '{"CSV":{}}' "$WORK/sel.out"
+grep -qx "a" "$WORK/sel.out" && grep -qx "b" "$WORK/sel.out" \
+  || { echo "CSV Select 输出不符：$(cat "$WORK/sel.out")"; exit 1; }
+printf '{"name":"jo","n":7}\n{"name":"al","n":9}\n' > "$WORK/sel.jsonl"
+aws_s3 cp "$WORK/sel.jsonl" "s3://$BUCKET/sel.jsonl" >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api select-object-content --bucket "$BUCKET" --key sel.jsonl \
+  --expression "SELECT s.name FROM S3Object s WHERE s.n > 8" --expression-type SQL \
+  --input-serialization '{"JSON":{"Type":"LINES"},"CompressionType":"NONE"}' \
+  --output-serialization '{"JSON":{}}' "$WORK/sel.jsonl.out"
+python3 - "$WORK/sel.jsonl.out" <<'PY'
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert rows == [{"name":"al"}], rows
+print("   JSON Select ✓", rows)
+PY
+# >1MiB 输入 + --request-progress：CLI 必须能解析事件流（Progress/Stats/End 帧）
+python3 - "$WORK/selbig.csv" <<'PY'
+import sys
+with open(sys.argv[1],"w") as f:
+    for i in range(200000):
+        f.write(f"k{i},v{i}\n")
+PY
+aws_s3 cp "$WORK/selbig.csv" "s3://$BUCKET/selbig.csv" >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api select-object-content --bucket "$BUCKET" --key selbig.csv \
+  --expression "SELECT s._1 FROM S3Object LIMIT 3" --expression-type SQL --request-progress '{"Enabled": true}' \
+  --input-serialization '{"CSV":{},"CompressionType":"NONE"}' \
+  --output-serialization '{"CSV":{}}' "$WORK/selbig.out"
+[ "$(wc -l < "$WORK/selbig.out")" -eq 3 ] || { echo "Select LIMIT 3 输出行数不符"; exit 1; }
+if aws --endpoint-url "$ENDPOINT" s3api select-object-content --bucket "$BUCKET" --key sel.csv \
+  --expression "SELECT nope(s._1) FROM S3Object" --expression-type SQL \
+  --input-serialization '{"CSV":{},"CompressionType":"NONE"}' \
+  --output-serialization '{"CSV":{}}' "$WORK/sel.bad" >/dev/null 2>&1; then
+  echo "白名单外 Select 竟成功（应 400）"; exit 1
+else
+  echo "   Select 边界 400 ✓"
+fi
+echo "   Select 段通过（CSV/JSON/Progress/边界）"
+
+# 19b. Kafka（redpanda docker；无 docker 则跳过并记行）
+if command -v docker >/dev/null 2>&1; then
+  echo "--- 19b. Kafka 通知三阶段（真实 redpanda）---"
+  bash tests/e2e_kafka.sh
+else
+  echo "--- 19b. Kafka 段跳过（docker 不可用）---"
+fi
+
+# 19c. 桶复制（两个真实实例；OSS_BIN 缺省 target/debug/oss-server）
+if [ "${M6_E2E_REPL:-1}" != "0" ] && [ -x "${OSS_BIN:-$PWD/target/debug/oss-server}" ]; then
+  echo "--- 19c. 桶复制双实例 e2e ---"
+  OSS_BIN="${OSS_BIN:-$PWD/target/debug/oss-server}" bash tests/e2e_replication.sh
+else
+  echo "--- 19c. 复制段跳过（无二进制或 M6_E2E_REPL=0）---"
+fi
+
+echo ""
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计 / M5 SSE+对象锁+STS / M6 Select+Kafka+复制）"
