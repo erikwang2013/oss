@@ -566,6 +566,16 @@ async fn console_delete_emits_event() {
         .await
         .unwrap();
 
+    // M6 切片 4（V3②）：控制台硬删同样入复制队列（无源版本号）
+    sqlx::query(
+        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('cdb', ?) \
+         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
+    )
+    .bind(r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":true,"enabled":true}]"#)
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+
     let resp = reqwest::Client::new()
         .delete(format!("{base}/api/v1/buckets/cdb/objects/d.txt"))
         .bearer_auth(tok)
@@ -573,6 +583,13 @@ async fn console_delete_emits_event() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE bucket='cdb' AND is_delete_marker=1 AND version_id=''",
+    )
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "控制台硬删应入复制队列");
 
     let json: String = sqlx::query_scalar("SELECT event_json FROM event_outbox WHERE bucket='cdb'")
         .fetch_one(st.db.pool())

@@ -22,7 +22,7 @@ hex = "0.4"
 thiserror = "2"
 bytes = "1"
 futures = "0.3"
-tokio = { version = "1", features = ["fs", "io-util", "sync", "rt", "rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "sync", "rt", "rt-multi-thread", "macros", "signal", "time", "net"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 
@@ -45,5 +45,10 @@ sqlparser = "0.53"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # M5 切片 4：对象锁 retain-until 的时间换算（s3s::dto::Timestamp ↔ OffsetDateTime）
 time = "0.3"
+# M6 切片 4：复制出站客户端（SigV4 签名 + hyper http1 直连；与 s3s 同族版本）
+s3s-sigv4 = "0.17"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }

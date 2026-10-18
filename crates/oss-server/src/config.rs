@@ -32,6 +32,28 @@ pub struct AppConfig {
     /// M6 切片 1：Kafka 通知目标 `[[kafka.targets]]`（静态配置，同集群 secret 的配置文件信任）。
     #[serde(default)]
     pub kafka: KafkaToml,
+    /// M6 切片 4：复制远端 `[[remotes]]`（Destination.Bucket 形如 `<id>/<bucket>`）。
+    #[serde(default)]
+    pub remotes: Vec<RemoteTarget>,
+}
+
+/// `[[remotes]]`：复制出站目标端点与凭证（静态配置信任，同集群 secret 口径）。
+/// **deny_unknown_fields**：拼错必须启动即拒（静默少一条 remote 会让规则校验失败）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteTarget {
+    /// 规则 Destination 引用的 id（白名单 `[A-Za-z0-9._-]{1,64}`）
+    pub id: String,
+    /// 目标 S3 端点基址（http；TLS 未接线，https 启动期拒绝）
+    pub endpoint: String,
+    pub access_key: String,
+    pub secret_key: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+}
+
+fn default_region() -> String {
+    "us-east-1".to_string()
 }
 
 /// `[[kafka.targets]]`：桶通知 ARN `arn:oss:sqs::<id>:kafka` 的 id → 连接与主题映射。
@@ -136,6 +158,8 @@ impl AppConfig {
         let cfg: Self = toml::from_str(&text)?;
         cfg.kafka_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.remotes_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
     }
 
@@ -164,6 +188,50 @@ impl AppConfig {
             }
             if t.topic.trim().is_empty() {
                 return Err(format!("[[kafka.targets]] {} 的 topic 不能为空", t.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// M6 切片 4：`[[remotes]]` 校验——id 白名单/唯一、endpoint 可解析（http + host）、
+    /// AK/SK/region 非空。启动 fail-closed。
+    pub fn remotes_validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.remotes {
+            if r.id.is_empty()
+                || r.id.len() > 64
+                || !r
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                return Err(format!(
+                    "[[remotes]] id 非法：{:?}（白名单 [A-Za-z0-9._-]，≤64）",
+                    r.id
+                ));
+            }
+            if !seen.insert(r.id.clone()) {
+                return Err(format!("[[remotes]] id 重复：{}", r.id));
+            }
+            let uri: hyper::Uri = r
+                .endpoint
+                .parse()
+                .map_err(|_| format!("[[remotes]] {} 的 endpoint 非法：{}", r.id, r.endpoint))?;
+            // 仅 http：出站客户端无 TLS（记档）；https 在启动期 fail-closed，避免运行期死信
+            if uri.scheme_str() != Some("http") || uri.host().is_none() {
+                return Err(format!(
+                    "[[remotes]] {} 的 endpoint 必须是 http://host[:port]（TLS 未接线）：{}",
+                    r.id, r.endpoint
+                ));
+            }
+            if r.access_key.trim().is_empty() || r.secret_key.trim().is_empty() {
+                return Err(format!(
+                    "[[remotes]] {} 的 access_key/secret_key 不能为空",
+                    r.id
+                ));
+            }
+            if r.region.trim().is_empty() {
+                return Err(format!("[[remotes]] {} 的 region 不能为空", r.id));
             }
         }
         Ok(())
@@ -347,6 +415,7 @@ mod tests {
             groups: vec![],
             kafka: KafkaToml::default(),
             cluster: None,
+            remotes: vec![],
         }
     }
 
@@ -426,6 +495,53 @@ mod tests {
         );
     }
 
+    /// M6 切片 4：复制远端配置校验矩阵（启动 fail-closed）。
+    #[test]
+    fn remotes_validation_matrix() {
+        let mk = |id: &str, endpoint: &str| RemoteTarget {
+            id: id.into(),
+            endpoint: endpoint.into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+            region: "us-east-1".into(),
+        };
+        let cfg = |remotes| {
+            let mut c = base_cfg();
+            c.remotes = remotes;
+            c
+        };
+        assert!(
+            cfg(vec![mk("r1", "http://127.0.0.1:9001")])
+                .remotes_validate()
+                .is_ok()
+        );
+        // https 在启动期 fail-closed（出站客户端无 TLS，记档）
+        assert!(
+            cfg(vec![mk("r1", "https://s3.example.com")])
+                .remotes_validate()
+                .is_err()
+        );
+        // 非法 id / 重复 / 坏 endpoint / 非 http(s) / 空凭证
+        assert!(
+            cfg(vec![mk("../x", "http://h:1")])
+                .remotes_validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![mk("r1", "http://h:1"), mk("r1", "http://h:2")])
+                .remotes_validate()
+                .is_err()
+        );
+        assert!(cfg(vec![mk("r1", "not a uri")]).remotes_validate().is_err());
+        assert!(cfg(vec![mk("r1", "ftp://h:1")]).remotes_validate().is_err());
+        let mut e = mk("r1", "http://h:1");
+        e.secret_key = " ".into();
+        assert!(cfg(vec![e]).remotes_validate().is_err());
+        let mut e = mk("r1", "http://h:1");
+        e.region = " ".into();
+        assert!(cfg(vec![e]).remotes_validate().is_err());
+    }
+
     /// M6 切片 1（P3-f）：Kafka 目标配置校验矩阵（启动 fail-closed）。
     #[test]
     fn kafka_targets_validation_matrix() {
@@ -446,6 +562,7 @@ mod tests {
             groups: vec![],
             cluster: None,
             kafka: KafkaToml { targets },
+            remotes: vec![],
         };
         // 合法
         assert!(

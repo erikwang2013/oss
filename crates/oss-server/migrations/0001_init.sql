@@ -120,3 +120,29 @@ CREATE TABLE IF NOT EXISTS event_outbox (
     last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_event_outbox_claim ON event_outbox (state, next_retry_at);
+
+-- M6 切片 4：桶复制规则与出站积压（R2 300s 租约；is_delete_marker 为计划外必要列——切片 3 定稿记档）
+CREATE TABLE IF NOT EXISTS replication_rules (
+    bucket TEXT PRIMARY KEY,
+    rules_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS repl_outbox (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket TEXT NOT NULL,
+    key TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    etag TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    remote_id TEXT NOT NULL,
+    dest_bucket TEXT NOT NULL,
+    is_delete_marker INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending',   -- pending | sending | dead
+    attempts INTEGER NOT NULL DEFAULT 0,
+    claimed_at INTEGER,
+    next_retry_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_repl_outbox_claim ON repl_outbox (state, next_retry_at);

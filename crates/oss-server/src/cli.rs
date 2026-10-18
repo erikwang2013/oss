@@ -184,6 +184,12 @@ pub async fn run(
                 std::sync::Arc::clone(&state.events),
                 state.db.pool().clone(),
             );
+            // M6 切片 4：复制 outbox worker（OSS_REPL_INTERVAL_SECS，0=关）
+            crate::replication::spawn_repl_worker(
+                state.db.pool().clone(),
+                std::sync::Arc::clone(&state.store),
+                std::sync::Arc::clone(&state.repl_client),
+            );
             // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
             crate::lifecycle::spawn_audit_cleanup(state.clone());
 

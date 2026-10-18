@@ -74,6 +74,8 @@ pub struct IngestSink {
     pub cfg: Arc<AppConfig>,
     /// M6 切片 0（R5）：aether 内部摄取事件（ObjectCreated:Post；内部路径占位 source）。
     pub events: Option<Arc<crate::events::SqlEventSink>>,
+    /// M6 切片 4（V3②）：内部摄取的复制入队（同一后写派发面）
+    pub repl: Option<Arc<crate::replication::SqlReplSink>>,
 }
 
 impl IngestSink {
@@ -160,6 +162,19 @@ impl EventSink for IngestSink {
                         Some(&info.etag),
                         xl_s3::events::EventSource::internal("oss-aether"),
                     ));
+                }
+                // M6 切片 4（V3②）：aether 摄取入队（版本化才复制；sink 内判定 "null"）
+                if let Some(rs) = &self.repl {
+                    use xl_s3::replication::ReplicationSink as _;
+                    block_on(rs.on_write(xl_s3::replication::WriteInfo {
+                        bucket: &bucket,
+                        key: &key,
+                        version_id: info.version_id.as_deref(),
+                        etag: &info.etag,
+                        size: info.size,
+                        is_delete_marker: false,
+                        is_replica: false,
+                    }));
                 }
                 let saved_path =
                     SavedPath::encode(&resource.group, &resource.group_sub_dir, &resource.name);

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 xl-store.workspace = true
+bytes.workspace = true
 xl-client.workspace = true
 argon2 = "0.5"
 async-trait = "0.1"
@@ -30,6 +31,10 @@ jwt-rust = { version = "1.0.1", features = ["axum"] }
 serde.workspace = true
 serde_json.workspace = true
 s3s.workspace = true
+s3s-sigv4.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

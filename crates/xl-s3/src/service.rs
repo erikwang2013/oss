@@ -30,6 +30,10 @@ pub struct OssS3 {
     max_put_bytes: usize,
     /// M6 切片 0：事件接收方（oss-server 注入；None = 不发事件，测试/未接线形态）。
     events: Option<Arc<dyn EventSink>>,
+    /// M6 切片 4：复制写入钩子（post-commit 入队；None = 未接线）
+    repl_sink: Option<Arc<dyn crate::replication::ReplicationSink>>,
+    /// M6 切片 4：复制配置读存（Put/Get/DeleteBucketReplication）
+    repl_store: Option<Arc<dyn crate::replication::ReplicationStore>>,
 }
 
 impl OssS3 {
@@ -50,6 +54,8 @@ impl OssS3 {
             acl,
             max_put_bytes,
             events: None,
+            repl_sink: None,
+            repl_store: None,
         }
     }
 
@@ -57,6 +63,24 @@ impl OssS3 {
     pub fn with_events(mut self, sink: Option<Arc<dyn EventSink>>) -> Self {
         self.events = sink;
         self
+    }
+
+    /// M6 切片 4：注入复制写入钩子 + 配置存储（builder 风格；router 装配处调用）。
+    pub fn with_replication(
+        mut self,
+        sink: Option<Arc<dyn crate::replication::ReplicationSink>>,
+        store: Option<Arc<dyn crate::replication::ReplicationStore>>,
+    ) -> Self {
+        self.repl_sink = sink;
+        self.repl_store = store;
+        self
+    }
+
+    /// 复制写提交回调（post-commit 尽力而为；实现自吞错误）。
+    async fn repl_on_write(&self, info: crate::replication::WriteInfo<'_>) {
+        if let Some(sink) = &self.repl_sink {
+            sink.on_write(info).await;
+        }
     }
 
     /// 事件发射（post-commit 尽力而为；接收方自吞错误，绝不影响请求结果）。
@@ -647,6 +671,17 @@ impl S3 for OssS3 {
                 .await
                 .map_err(to_s3_error)?;
         }
+        // M6 切片 4：复制入队（REPLICA 摄入不再复制——防环）
+        self.repl_on_write(crate::replication::WriteInfo {
+            bucket: &bucket,
+            key: &key,
+            version_id: info.version_id.as_deref(),
+            etag: &info.etag,
+            size: info.size,
+            is_delete_marker: false,
+            is_replica: replica,
+        })
+        .await;
 
         let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(PutObjectOutput {
@@ -848,6 +883,17 @@ impl S3 for OssS3 {
             Some(&info.etag),
             event_source,
         )
+        .await;
+        // M6 切片 4：MPU 提交同样入队（MPU 源 ETag 非 MD5，目标侧重算——断言按单段源跳过）
+        self.repl_on_write(crate::replication::WriteInfo {
+            bucket: &bucket,
+            key: &key,
+            version_id: info.version_id.as_deref(),
+            etag: &info.etag,
+            size: info.size,
+            is_delete_marker: false,
+            is_replica: false,
+        })
         .await;
         let so = sse_out(info.encryption.as_ref());
         let mut resp = S3Response::new(CompleteMultipartUploadOutput {
@@ -1387,6 +1433,17 @@ impl S3 for OssS3 {
                     event_source,
                 )
                 .await;
+                // M6 切片 4：marker 入队受 DeleteMarkerReplication 控制（sink 侧过滤）
+                self.repl_on_write(crate::replication::WriteInfo {
+                    bucket: &bucket,
+                    key: &key,
+                    version_id: Some(&version_id),
+                    etag: "",
+                    size: 0,
+                    is_delete_marker: true,
+                    is_replica: false,
+                })
+                .await;
                 (Some(true), Some(version_id))
             }
             DeleteOutcome::Version { version_id } => {
@@ -1510,6 +1567,17 @@ impl S3 for OssS3 {
                                 event_source.clone(),
                             )
                             .await;
+                            // M6 切片 4（V3②）：批量删除的 marker 同样入队
+                            self.repl_on_write(crate::replication::WriteInfo {
+                                bucket: &bucket,
+                                key: &obj.key,
+                                version_id: Some(&version_id),
+                                etag: "",
+                                size: 0,
+                                is_delete_marker: true,
+                                is_replica: false,
+                            })
+                            .await;
                             (Some(true), Some(version_id), None)
                         }
                         DeleteOutcome::Version { version_id } => {
@@ -1601,6 +1669,118 @@ impl S3 for OssS3 {
         Ok(S3Response::new(
             PutBucketNotificationConfigurationOutput::default(),
         ))
+    }
+
+    // ---------- M6 切片 4：桶复制配置 API ----------
+
+    async fn put_bucket_replication(
+        &self,
+        req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
+        }
+        // AWS：复制要求版本控制 Enabled
+        let ver = self.acl.bucket_versioning(&bucket).await.map_err(|e| {
+            tracing::error!(error = %e, bucket, "读取桶版本状态失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        if ver != "Enabled" {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "bucket versioning must be Enabled for replication"
+            ));
+        }
+        let Some(store) = &self.repl_store else {
+            return Err(s3s::s3_error!(
+                NotImplemented,
+                "replication is not configured on this server"
+            ));
+        };
+        let ids = store.remote_ids().await;
+        let rules = crate::replication::parse_replication_config(
+            &req.input.replication_configuration,
+            &ids,
+        )?;
+        let json = serde_json::to_string(&rules).map_err(|e| {
+            tracing::error!(error = %e, "序列化复制规则失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        store.save_rules(&bucket, &json).await.map_err(|e| {
+            tracing::error!(error = %e, bucket, "写复制规则失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        Ok(S3Response::new(PutBucketReplicationOutput::default()))
+    }
+
+    async fn get_bucket_replication(
+        &self,
+        req: S3Request<GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
+        }
+        let Some(store) = &self.repl_store else {
+            return Err(s3s::s3_error!(
+                NotImplemented,
+                "replication is not configured on this server"
+            ));
+        };
+        let Some(json) = store.load_rules(&bucket).await.map_err(|e| {
+            tracing::error!(error = %e, bucket, "读复制规则失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?
+        else {
+            return Err(s3s::s3_error!(
+                ReplicationConfigurationNotFoundError,
+                "replication configuration not found"
+            ));
+        };
+        let rules = crate::replication::rules_from_json(&json).map_err(|e| {
+            tracing::error!(error = %e, bucket, "复制规则记录损坏");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        let cfg = ReplicationConfiguration {
+            role: "arn:oss:iam::replication".to_string(),
+            rules: rules.iter().map(repl_rule_to_dto).collect(),
+        };
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(cfg),
+        }))
+    }
+
+    async fn delete_bucket_replication(
+        &self,
+        req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
+        }
+        if let Some(store) = &self.repl_store {
+            store.remove_rules(&bucket).await.map_err(|e| {
+                tracing::error!(error = %e, bucket, "删复制规则失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        }
+        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
     /// M6 切片 2：S3 Select（规格 §12；Records/Progress/Stats/End 事件序列 → s3s 成帧）。
@@ -2240,6 +2420,17 @@ impl S3 for OssS3 {
             event_source,
         )
         .await;
+        // M6 切片 4（V3②）：复制入队覆盖 CopyObject
+        self.repl_on_write(crate::replication::WriteInfo {
+            bucket: &req.input.bucket,
+            key: &req.input.key,
+            version_id: info.version_id.as_deref(),
+            etag: &info.etag,
+            size: info.size,
+            is_delete_marker: false,
+            is_replica: false,
+        })
+        .await;
 
         let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(CopyObjectOutput {
@@ -2258,5 +2449,40 @@ impl S3 for OssS3 {
             sse_customer_key_md5: so.sse_c_key_md5,
             ..Default::default()
         }))
+    }
+}
+
+/// 规则 IR → DTO（GetBucketReplication 回读）。
+fn repl_rule_to_dto(r: &crate::replication::ReplRule) -> ReplicationRule {
+    ReplicationRule {
+        delete_marker_replication: Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(
+                if r.delete_marker {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                },
+            )),
+        }),
+        destination: Destination {
+            access_control_translation: None,
+            account: None,
+            bucket: format!("{}/{}", r.remote_id, r.dest_bucket),
+            encryption_configuration: None,
+            metrics: None,
+            replication_time: None,
+            storage_class: None,
+        },
+        existing_object_replication: None,
+        filter: r.prefix.as_ref().map(|p| ReplicationRuleFilter {
+            and: None,
+            prefix: Some(p.clone()),
+            tag: None,
+        }),
+        id: Some(r.id.clone()),
+        prefix: None,
+        priority: None,
+        source_selection_criteria: None,
+        status: ReplicationRuleStatus::from_static(if r.enabled { "Enabled" } else { "Disabled" }),
     }
 }

@@ -404,6 +404,40 @@ impl Store {
         Ok(())
     }
 
+    /// M6 切片 4（P2-2）：置 PENDING 但**不降级终态**（COMPLETED/FAILED/REPLICA 保持）。
+    /// 用于入队侧——并发 worker 可能已在 PENDING 写入前完成复制。
+    pub async fn mark_replication_pending(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<bool> {
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(old) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let mut m = old.clone();
+        let target = m
+            .versions
+            .iter()
+            .position(|v| v.version_id_str() == version_id)
+            .ok_or_else(|| Error::NoSuchKey(format!("{key}@{version_id}")))?;
+        if matches!(
+            m.versions[target].replication_status.as_deref(),
+            Some("COMPLETED" | "FAILED" | "REPLICA")
+        ) {
+            return Ok(false);
+        }
+        m.versions[target].replication_status = Some("PENDING".to_string());
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
+        m.refresh_latest_flags();
+        self.write_meta(bucket, key, &m, Some(&old)).await?;
+        Ok(true)
+    }
+
     /// 指定版本元数据（HEAD ?versionId）。marker 版本 → `DeleteMarker`（S3 405）。
     pub async fn head_object_version(
         &self,

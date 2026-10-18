@@ -24,6 +24,12 @@ pub struct AppState {
     pub vault: Option<Arc<xl_s3::skvault::SecretVault>>,
     /// M6 切片 0：事件总线接收方 + worker（event_outbox）。
     pub events: Arc<crate::events::SqlEventSink>,
+    /// M6 切片 4：复制写入钩子（repl_outbox 入队）
+    pub repl_sink: Arc<crate::replication::SqlReplSink>,
+    /// M6 切片 4：复制规则存储（Put/Get/DeleteBucketReplication）
+    pub repl_store: Arc<crate::replication::SqlReplStore>,
+    /// M6 切片 4：复制出站客户端（worker 用）
+    pub repl_client: Arc<crate::repl_client::ReplClient>,
 }
 
 /// 登录限速（C1）。**单进程内存态**（每节点独立，重启清零——限速非持久配额，重启放宽可接受）：
@@ -432,23 +438,39 @@ impl AppState {
             db.pool().clone(),
             notifier,
         ));
+        // M6 切片 4：复制（规则存储 + 写入钩子 + 出站客户端；worker 在 serve 路径挂载）
+        let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
+        let repl_store = Arc::new(crate::replication::SqlReplStore::new(
+            db.pool().clone(),
+            remote_ids,
+        ));
+        let store = Arc::new(store);
+        let repl_sink = Arc::new(crate::replication::SqlReplSink::new(
+            db.pool().clone(),
+            Arc::clone(&store),
+        ));
+        let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
         let cfg = Arc::new(cfg);
         let db = Arc::new(db);
         let ingest = Arc::new(crate::aether::IngestSink {
-            store: Arc::new(store),
+            store: Arc::clone(&store),
             db: Arc::clone(&db),
             cfg: Arc::clone(&cfg),
             events: Some(Arc::clone(&events)),
+            repl: Some(Arc::clone(&repl_sink)),
         });
         Self {
             cfg,
             db,
-            store: Arc::clone(&ingest.store),
+            store,
             ingest,
             jwt,
             login_limiter,
             vault,
             events,
+            repl_sink,
+            repl_store,
+            repl_client,
         }
     }
 }

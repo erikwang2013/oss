@@ -78,6 +78,63 @@ async fn replication_status_on_delete_marker() {
     assert!(matches!(e, Err(Error::NoSuchKey(_))), "{e:?}");
 }
 
+/// P2-2：PENDING 写入不得把终态降级（并发 worker 已完成后的迟到 PENDING）。
+#[tokio::test]
+async fn pending_write_does_not_downgrade_terminal_status() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let v = put(&s, "k", b"x", true).await;
+    let vid = v.version_id.unwrap();
+    // 初次：None → PENDING（true）
+    assert!(
+        s.mark_replication_pending("alpha", "k", &vid)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.head_object_version("alpha", "k", &vid)
+            .await
+            .unwrap()
+            .replication_status
+            .as_deref(),
+        Some("PENDING")
+    );
+    // 终态后迟到 PENDING：不降级
+    s.set_replication_status("alpha", "k", &vid, Some("COMPLETED"))
+        .await
+        .unwrap();
+    assert!(
+        !s.mark_replication_pending("alpha", "k", &vid)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.head_object_version("alpha", "k", &vid)
+            .await
+            .unwrap()
+            .replication_status
+            .as_deref(),
+        Some("COMPLETED")
+    );
+    // FAILED/REPLICA 同样不降级
+    s.set_replication_status("alpha", "k", &vid, Some("FAILED"))
+        .await
+        .unwrap();
+    assert!(
+        !s.mark_replication_pending("alpha", "k", &vid)
+            .await
+            .unwrap()
+    );
+    s.set_replication_status("alpha", "k", &vid, Some("REPLICA"))
+        .await
+        .unwrap();
+    assert!(
+        !s.mark_replication_pending("alpha", "k", &vid)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn replication_status_roundtrip_clear_and_whitelist() {
     let (s, _d) = store().await;

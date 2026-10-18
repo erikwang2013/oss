@@ -142,6 +142,44 @@ async fn lifecycle_versioned_bucket_marks_deleted() {
     assert!(vl.entries[0].is_marker && vl.entries[0].is_latest);
 }
 
+/// M6 切片 4（V3②）：生命周期删除（marker）入复制队列。
+#[tokio::test]
+async fn lifecycle_delete_enqueues_replication() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("lrb").await.unwrap();
+    st.db.insert_bucket("lrb", None).await.unwrap();
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'lrb'")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    st.store
+        .put_object("lrb", "old.txt", bytes::Bytes::from_static(b"v"), None)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('lrb', ?) \
+         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
+    )
+    .bind(r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":true,"enabled":true}]"#)
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+    let mut r = rule("", 0);
+    r.bucket = "lrb".into();
+    st.db.set_lifecycle_rules("lrb", &[r], 1).await.unwrap();
+
+    sweep_once(&st).await;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE bucket='lrb' AND is_delete_marker=1 \
+         AND version_id != ''",
+    )
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "生命周期 marker 应带版本号入复制队列");
+}
+
 // ——— S6-1/S6-3：走真控制面路由的回归 ———
 
 use oss_server::router::build_router;

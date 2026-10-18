@@ -154,6 +154,21 @@ pub async fn sweep_once(state: &AppState) -> usize {
                                         xl_s3::events::EventSource::internal("oss-lifecycle"),
                                     )
                                     .await;
+                                // M6 切片 4（V3②）：生命周期删除入队（marker 有版本号；
+                                // 非版本桶整键删无版本号，状态面不维护）
+                                use xl_s3::replication::ReplicationSink as _;
+                                state
+                                    .repl_sink
+                                    .on_write(xl_s3::replication::WriteInfo {
+                                        bucket: &rule.bucket,
+                                        key: &o.key,
+                                        version_id: vid,
+                                        etag: "",
+                                        size: 0,
+                                        is_delete_marker: true,
+                                        is_replica: false,
+                                    })
+                                    .await;
                                 deleted += 1;
                             }
                         }

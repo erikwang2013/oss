@@ -33,7 +33,11 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         )
         .with_events(Some(
             Arc::clone(&state.events) as Arc<dyn xl_s3::events::EventSink>
-        )),
+        ))
+        .with_replication(
+            Some(Arc::clone(&state.repl_sink) as Arc<dyn xl_s3::replication::ReplicationSink>),
+            Some(Arc::clone(&state.repl_store) as Arc<dyn xl_s3::replication::ReplicationStore>),
+        ),
     );
     s3_builder.set_auth(
         SigV4Auth::with_mesh(state.db.pool().clone(), state.control_mesh())

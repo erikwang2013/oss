@@ -11,6 +11,57 @@ use aetherupload::saved_path::SavedPath;
 use common::state;
 use oss_server::aether::IngestSink;
 
+/// M6 切片 4（V3②）：aether 摄取同样入复制队列（版本桶）。
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_enqueues_replication_for_versioned_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("files").await.unwrap();
+    st.db.insert_bucket("files", None).await.unwrap();
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'files'")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('files', ?) \
+         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
+    )
+    .bind(r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":false,"enabled":true}]"#)
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+
+    let sub = "2026-10";
+    let group_dir = st.cfg.staging_dir.join("file").join(sub);
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let body = b"repl upload";
+    let md5 = hex::encode({
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(body);
+        h.finalize()
+    });
+    let path = group_dir.join(format!("{md5}.txt"));
+    std::fs::write(&path, body).unwrap();
+    let resource = Resource::new(
+        &st.cfg.staging_dir,
+        "file",
+        "file",
+        sub,
+        &format!("{md5}.txt"),
+    );
+
+    st.ingest.upload_complete(&resource);
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE bucket='files' AND is_delete_marker=0 \
+         AND version_id != 'null'",
+    )
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "aether 摄取应入复制队列（版本化提交）");
+}
+
 #[tokio::test(flavor = "multi_thread")] // block_on 用了 block_in_place，单线程 runtime 会 panic
 async fn ingest_sink_puts_finished_file_into_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,6 +175,7 @@ async fn sink_without_bucket_skips_ingest() {
         db: Arc::clone(&st.db),
         cfg: Arc::new(cfg),
         events: None,
+        repl: None,
     };
 
     let sub = "2026-10";

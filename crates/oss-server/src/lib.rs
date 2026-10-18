@@ -7,5 +7,7 @@ pub mod console;
 pub mod db;
 pub mod events;
 pub mod lifecycle;
+pub mod repl_client;
+pub mod replication;
 pub mod router;
 pub mod state;

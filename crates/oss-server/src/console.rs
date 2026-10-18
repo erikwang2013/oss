@@ -817,6 +817,20 @@ async fn delete_object(
                         xl_s3::events::EventSource::internal("oss-console"),
                     )
                     .await;
+                // M6 切片 4（V3②）：控制台整键硬删 → 目标 DELETE（无源版本号，状态面不维护）
+                use xl_s3::replication::ReplicationSink as _;
+                state
+                    .repl_sink
+                    .on_write(xl_s3::replication::WriteInfo {
+                        bucket: &bucket,
+                        key: &key,
+                        version_id: None,
+                        etag: "",
+                        size: 0,
+                        is_delete_marker: true,
+                        is_replica: false,
+                    })
+                    .await;
             }
             StatusCode::NO_CONTENT.into_response()
         }

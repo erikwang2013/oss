@@ -24,7 +24,7 @@ pub const EVENT_LEASE_SECS: i64 = 60;
 /// 永久错死信上限（R1：仅 Permanent 且 attempts > 10）。
 pub const MAX_ATTEMPTS: i64 = 10;
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
