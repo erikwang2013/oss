@@ -65,6 +65,10 @@ PENDING→COMPLETED/FAILED、停机积压追平）。
 
 ![系统架构](docs/assets/architecture.svg)
 
+M6 数据流（事件通知 / S3 Select / 桶复制）：
+
+![M6 数据流：事件 / Select / 复制](docs/assets/m6-dataflow.svg)
+
 | crate / 目录 | 职责 |
 |---|---|
 | `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
@@ -73,7 +77,8 @@ PENDING→COMPLETED/FAILED、停机积压追平）。
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
 | `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI |
 | `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
-| `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（17 步 + `E2E_LONG=1` 门控长跑） |
+| `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（19 步，含 M6 Select/Kafka/复制；+ `E2E_LONG=1` 门控长跑） |
+| `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
 `xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。

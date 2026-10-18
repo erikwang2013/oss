@@ -505,6 +505,18 @@ GetSessionToken + 会话策略交集；**AssumeRole 限管理员**——无角�
 5. 远端不可达期间积压进 `repl_outbox`，恢复后自动追平
 6. Select 的 SQL 子集边界测试：不支持的语法返回明确的 `InvalidRequest`，而非错误结果
 
+**M6 落地状态（2026-10-18 / v1.10.0）**：切片 0 事件总线（EventSink 六发射点 + R5 三内部路径 ·
+通知配置 API · event_outbox worker R2 租约/R1 分级）· 切片 1 Kafka（rskafka 生产者 +
+`[[kafka.targets]]` 静态配置；redpanda 真 broker e2e 三阶段 ① ②）· 切片 2 S3 Select（sqlparser
+白名单 IR + SQL 三值逻辑 + CSV/JSON + ScanRange + Records/Progress/Stats/End 事件序列 ③ ⑥）·
+切片 3 复制状态面（Version/ObjectInfo 状态、decode 白名单、HEAD/GET `x-amz-replication-status`、
+REPLICA 摄入）· 切片 4 桶复制（规则 API、9 写入口入队、repl_outbox worker 300s 租约、SigV4 +
+hyper 出站；PENDING→COMPLETED/FAILED、停机积压追平 ④ ⑤）· 切片 5 e2e/README（`e2e_s3.sh` §19 +
+`e2e_replication.sh`；复制/Select/Kafka 三件 e2e 实跑 EXIT=0）。**记档**：Parquet/BZIP2 后置；
+Kafka SASL/SSL 与复制的 TLS 未接线（复制 http-only）；Select 全量缓冲 256/512MiB；复制整对象
+入内存/无限速；版本定向删除不复制；Priority/Role/EOR 回读有损；SSE-C 源不可复制。实施记录见
+`plans/2026-10-17-m6-dataflow.md`。
+
 ### M7 多站点异步复制（4-6 周）
 
 **范围**：站点身份 · 站点间管理 API · 对象双向异步复制 · IAM/桶/策略变更的日志复制 · 断点续传与重放
