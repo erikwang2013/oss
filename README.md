@@ -58,8 +58,12 @@ SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁 GOVERNANCE / COMPLIANC
 已实现（M6 数据流）：事件通知（S3 通知配置 + Kafka，至少一次 outbox）· S3 Select（CSV/JSON、
 SQL 白名单、ScanRange、Progress/Stats 帧）· 桶复制（规则 API、9 写入口入队、SigV4 出站、
 PENDING→COMPLETED/FAILED、停机积压追平）。
+已实现（M7 多站点异步复制）：单节点站点对（`[site]` 唯一开关 + 管理 API 配对/ping/status）·
+控制面 changelog（SQLite 触发器捕获、LWW `(ts,priority,origin,seq)` + 本地写门控 + apply 抑制）·
+配对快照（单事务、入钟、只本地胜者）· 对象复制复用 `repl_outbox`（逐 peer 入队、发送前
+`GET ?versioning` 预检、metadata 透传、REPLICA 防环）· 停机积压追平、死信/游标/状态面。
 **未实现**（见设计文档的阶段表）：访问点 / Object Lambda（M8）· 跨站点强一致（M9）·
-细粒度 IAM 预设模板 · 复制带宽限速/跨站点。
+细粒度 IAM 预设模板 · 复制带宽限速。
 
 ## 架构
 
@@ -68,6 +72,10 @@ PENDING→COMPLETED/FAILED、停机积压追平）。
 M6 数据流（事件通知 / S3 Select / 桶复制）：
 
 ![M6 数据流：事件 / Select / 复制](docs/assets/m6-dataflow.svg)
+
+M7 多站点异步复制（控制面 changelog + 对象 outbox）：
+
+![M7 多站点复制](docs/assets/m7-sites.svg)
 
 | crate / 目录 | 职责 |
 |---|---|
@@ -79,6 +87,7 @@ M6 数据流（事件通知 / S3 Select / 桶复制）：
 | `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
 | `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（19 步，含 M6 Select/Kafka/复制；+ `E2E_LONG=1` 门控长跑） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
+| `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
 `xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。
@@ -665,6 +674,49 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-replication --bucket s
   与 `Priority` 不生效（不同目的地都会复制）；MPU 源 ETag 目标重算（不做 ETag 断言）；
   单对象整读入内存（≤16 并发）；`Role` 不参与鉴权。
 
+## 多站点复制（M7）
+
+两个**单节点**实例建立站点对，双向异步复制控制面与版本化对象。`[site]` 是唯一开关（与
+`[cluster]` 互斥；未配置时站点 API 一律 404）：
+
+```toml
+[site]
+name = "site-a"
+region = "ap-east-1"     # 配对时对端校验一致
+priority = 10            # 同秒 LWW 的裁决优先级
+token = "<32–128 位十六进制>"   # 控制面通道共享密钥；缺省首启随机生成
+```
+
+```bash
+# 管理员面：本站身份（含 token）→ 在 A 上配对 B（B 端也需配对 A 才是双向）
+curl -s $A/api/v1/site -H "authorization: Bearer $JWT"
+curl -s -X POST $A/api/v1/sites -H "authorization: Bearer $JWT" -H 'content-type: application/json' -d '{
+  "peer_id":"b","endpoint":"http://10.0.0.2:9000","region":"eu-west-1","priority":10,
+  "s3_access_key":"<B 上铸造的 AK>","s3_secret_key":"<SK>",
+  "peer_site_token":"<B 的 site token>"}'
+curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/outbox
+```
+
+- **控制面**：`buckets`（列级 versioning/owner/lock）、`bucket_policies`、`permissions`、
+  `users`、长时 `access_keys` 的变更由 SQLite 触发器写入 `site_changelog`；worker 逐 peer
+  按 cursor 出货（≤100 条/批，`OSS_SITE_INTERVAL_SECS` 默认 1s）。冲突用 LWW
+  `(ts, priority, origin, seq)`：ts 新者胜，同秒按 priority，再按 origin 字典序；本地写若旧于
+  已知时钟会被 BEFORE 门控拒绝（409/500 直到追上）。**管理员行不复制**、STS 会话键不复制。
+- **配对快照**：`POST /sites` 在单事务内写 `sites` + cursor + 五类实体快照，快照同事务入本地
+  时钟；只快照「本地时钟无行或 origin=本站」的实体，避免同时配对互相回显。
+- **对象**：复用 `repl_outbox`（`target_kind='site'`），每个 peer 一行；仅版本化数据写与
+  marker 入队，删除要求源桶 versioning=Enabled。worker 发送前签名 `GET /{bucket}?versioning`
+  （10s 缓存；404/非 Enabled → 可重试），PUT 透传 content-type 与 `x-amz-meta-*`、要求目标返回
+  真实 version-id（`null` → 重试）。同版本多目标聚合 PENDING→COMPLETED/FAILED。
+- **边界（记档）**：仅 http（TLS 未接线）；单节点站点对；版本 UUID 两端不一致、版本定向删除
+  不复制；非空桶删除不生效（保留行与数据，记死信）；锁/标签/SSE 不复制，SSE-C 源永久错；
+  AK 密文需两端同主密钥（配对只校验 vault 开关一致，不校验同一把钥）；控制面最终一致（无强一致，
+  归 M9）；端点/凭据明文存储；`priority` 仅在**同秒**裁决（新 ts 的低优先级仍胜旧 ts 的高优先级——
+  与早期规格「按优先级裁决」有偏差）；解配期间的本地控制面改动不被捕获，且对端快照可能在重配对时
+  覆盖这些改动（上次由对端胜出的实体）——需在重配对后重做；`x-amz-replication-status: REPLICA`
+  由任意已认证写者提供，可被用于抑制复制（M6 既有信任面，M7 的 DELETE 防环依赖同一头）；桶删除时
+  若策略/授权行的 LWW 时钟更新，会按 L7 保留，同名桶重建可能继承这些残留行（跨站点并发删/改窗口）。
+
 ## 验收
 
 
@@ -686,6 +738,7 @@ M6 全量（§19：Select 对当前 ENDPOINT + Kafka（docker redpanda）+ 复�
 cargo build -p oss-server && AK=... SK=... ENDPOINT=... tests/e2e_s3.sh
 tests/e2e_replication.sh        # 仅复制：自动起源/目标两实例（约 1–2 分钟）
 tests/e2e_kafka.sh              # 仅 Kafka 三阶段（redpanda docker；约 1 分钟）
+tests/e2e_sites.sh              # M7 多站点：自动起 A/B 两实例并双向配对（约 2–4 分钟）
 ```
 
 集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：

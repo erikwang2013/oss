@@ -93,7 +93,7 @@
     <g>
     <rect x="988" y="384" width="232" height="74" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
     <rect x="1000" y="400" width="5" height="42" rx="2.5" fill="#4ade80"/>
-    <text x="1018" y="417" font-size="18" font-weight="600" fill="#0f172a">版本 · 加密 · 锁 · 数据流</text>
+    <text x="1018" y="417" font-size="18" font-weight="600" fill="#0f172a">版本 · 加密 · 锁 · 数据流 · 多站点</text>
     <text x="1018" y="439" font-size="12.5" fill="#64748b">versioning · SSE · lock · dataflow</text>
   </g>
 

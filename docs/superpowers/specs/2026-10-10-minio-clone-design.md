@@ -232,7 +232,7 @@ struct ObjectLock { mode: Governance | Compliance, retain_until: Option<i64>, le
 struct TierState { state: Hot | Archived | RestorePending | Restored, restore_expires: Option<i64> }  // M8
 ```
 
-### 5.2 控制面 SQL 模型（19 张表，全部是薄表）
+### 5.2 控制面 SQL 模型（25 张表，全部是薄表）
 
 **对象数据永远不进 SQL。** 这里只有控制面状态。
 
@@ -249,6 +249,7 @@ struct TierState { state: Hot | Archived | RestorePending | Restored, restore_ex
 | `jobs` · `job_tasks` | **作业引擎**：Batch Ops / 生命周期转换 / Restore / Inventory / 复制重试共用 | M4（雏形）· M8（完整） |
 | `event_configs` · `event_outbox` | 桶通知配置与**持久化事件队列**（Kafka 挂了不丢） | M6 |
 | `repl_outbox` | 复制积压队列（含跨站点，含重放） | M6/M7 |
+| `site_config` · `sites` · `site_changelog` · `site_entity_clock` · `site_cursors` · `site_apply_dead` | 站点身份/关系、控制面 changelog（LWW 时钟）、出货游标与死信 | M7 |
 | `instant_index` | aetherupload 秒传索引（替代 Redis，带 TTL） | M1 |
 | `uploads` | `savedPath → bucket/key/owner` 映射 | M1 |
 | `audit_log` | 审计 | M4 |
@@ -530,6 +531,26 @@ Kafka SASL/SSL 与复制的 TLS 未接线（复制 http-only）；Select 全量�
 2. 任一站点的桶/策略变更在对端可见
 3. 断开 WAN 一段时间后恢复：积压全部重放，双向数据一致（逐 ETag 对拍）
 4. 两端同时写同一 key 不产生损坏（版本不可变，追加式传播）
+
+**落地状态（2026-10-18）**：已实现并收敛为**单节点站点对**（`[site]` 唯一开关，`[cluster]` 互斥；
+无站点页面/`/sites/{id}/join`）。控制面由 SQLite 触发器捕获 buckets/bucket_policies/permissions/
+users（排除管理员）/长时 access_keys，写入 `site_changelog`；冲突模型为 **LWW `(ts, priority,
+origin_site_id, seq)`（ts 优先，priority 仅同秒裁决）**——与本节「按站点优先级裁决」的早期表述有
+偏差，以 ts-first 为准；本地写受 BEFORE 门控（旧于已知时钟 → 409/500 直到追上），apply 事务内
+`apply_ctx=1` 抑制触发器。配对快照单事务、只快照本地胜者并同事务入钟。对象复制复用
+`repl_outbox.target_kind='site'`：仅版本化数据写与 marker 入队，发送前签名 `GET ?versioning`
+预检（10s 缓存）；PUT 与 DELETE 均带 `x-amz-replication-status: REPLICA` 防环（目标端不再入队）。
+实施记录见 `plans/2026-10-18-m7-multisite.md`。
+
+**范围收缩与边界（记档）**：仅 http（TLS 未接线）；版本 UUID 两端不一致、版本定向删除不复制；
+非空桶删除不生效（保留行/数据，死信可查）；锁/标签/SSE 不复制，SSE-C 源永久错；`uid:<id>`
+Principal 不重映射；AK 密文需两端同主密钥（配对时校验双方 vault 开关一致，但不校验同一把钥）；
+changelog 无裁剪、重配对全量重放；**解配期间的本地控制面改动不被捕获**（触发器以 `sites` 非空为
+条件；重配对只重放解配前已记录的历史），且**对端快照可能在重配对时覆盖解配期间的本地改动**
+（若该实体上次由对端胜出）——这类变更需在重配对后重做；
+dead 载荷截断
+4KB 且对端 dead 本端不可见；端点/凭据明文存储、无 token 轮换；强一致（openraft / sync 桶 /
+stretch EC）仍归 M9。
 
 ### M8 S3 控制面服务（4-6 周）
 

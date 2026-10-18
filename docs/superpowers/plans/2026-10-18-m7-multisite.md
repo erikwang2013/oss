@@ -1,4 +1,4 @@
-# M7 多站点异步复制 实施计划（工作令 v3）
+# M7 多站点异步复制 实施计划（工作令 v4 + 定稿）
 
 > 设计文档 §7.2 / §7.3 / §M7；功能规格 §10.2 / §19。
 > **验收**（设计文档 §M7）：
@@ -190,6 +190,27 @@
 1) 控制面最终一致：LWW ts-first + 本地写门控；**远端未来 ts 会让本地写暂时 409/500 直到钟追上**（上限
    保护：>now+300s 入 dead）；强一致归 M9；2) 版本 UUID 不一致、版本定向删除不复制、MPU/大对象 ETag 口径；
 3) 锁/标签不复制；SSE 源明文过 http；SSE-C 源不可复制；4) 非空桶删除不生效（保留行与数据，记 last_error）；
-5) `uid:<id>` Principal 不重映射；6) AK 密文需同主密钥；STS 会话键不复制；7) 管理员行不复制；
-8) changelog 无裁剪/重配对全量重放；9) dead 载荷截断 4KB 且对端 dead 本端不可见；10) 端点/凭据明文存储、
-   无 token 轮换。
+5) `uid:<id>` Principal 不重映射；6) AK 密文需同主密钥（配对只校验 vault 开关一致，无法校验同一把钥）；
+STS 会话键不复制；7) 管理员行不复制；8) changelog 无裁剪/重配对全量重放；**解配窗口内本地控制面改动
+不被捕获，且对端快照可能在重配对时覆盖这些改动**（上次由对端胜出的实体）——需在重配对后重做；
+9) dead 载荷截断 4KB 且对端 dead 本端不可见；10) 端点/凭据明文存储、无 token 轮换；11)
+`x-amz-replication-status` 头由任意已认证写者提供，可用于抑制复制（M6 既有信任面，M7 的 DELETE
+防环依赖同一头）；12) 桶删除时若策略/授权行的 LWW 时钟更新会按 L7 保留，同名桶重建可能继承残留行。
+
+## 定稿（2026-10-18）
+
+- **代码提交** `7b223a9`（18 文件 +5500/−116：迁移/站点面/apply/出货/对象复制/测试/e2e）。
+  本定稿提交只含文档与图。
+- **七闸实测**（树锚 tracked+untracked md5 `4a84c93d…`；防伪脚本 `wrapper_rc=0`，GATES-DONE）：
+  xl-store **195+1ignored** / kill9 2 / oss-server lib **50** + 19 个集成二进制 **115**（含 M7 17 例）/
+  xl-s3 **130** / xl-client+xl-proto / `clippy --workspace --all-targets -D warnings` / `fmt --all --check`。
+- **对抗评审**：计划三轮（v1 B1–B12 → v2 R1–R8 → v3 R9–R12 → v4）；实现 round1（core/repl）暴露
+  H1（删桶物理先删、记账门控 ABORT 静默 204/200）、P0-2（双向 marker 自激回环）、P1-3（解配/丢行
+  版本永久 PENDING）等；round2 scoped 复评确认闭合，残余项（M3 解配窗口、同主密钥不可校验、
+  L6 TOCTOU、L7 同名重建残留、旧开发库 origin）按「已知边界」记档。
+- **e2e**：`tests/e2e_sites.sh` 双向两实例 **PASS**（EXIT=0，0 FAIL）：快照/ping、建桶后立刻写双向、
+  策略/用户传播、同名管理员保护、断连积压双向追平、marker 6s 静默（防回环）、并发同 key、
+  R3b 非空桶删除 dead+数据保留、空桶删除、R8 重启不回退 versioning、非版本桶不跨界。
+- **文档/图**：README「多站点复制（M7）」；设计 §7.3 + §5.2（表清单）+ M7 落地状态；功能规格 §10.2
+  注记；`docs/assets/m7-sites.svg`；架构图 M1–M7；social preview 文案。
+- **发布**：仅本地提交完成；**推送 / tag / GitHub Release 待用户明确口令**。

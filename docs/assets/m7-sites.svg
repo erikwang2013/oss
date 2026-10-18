@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <title>M7 多站点异步复制：控制面 changelog + 对象 outbox</title>
+  <desc>两个单节点站点 A/B 互相配对：控制面写经 SQLite 触发器落 site_changelog，LWW (ts,priority,origin,seq) 门控，ship worker 按 cursor 出货；对象写经 ReplSink 逐 peer 落 repl_outbox(target_kind=site)，worker 先签名探询 GET ?versioning 再 SigV4 PUT REPLICA。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="958" height="558" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="40" y="44" font-size="20" font-weight="700" fill="#0f172a">OSS · M7 多站点异步复制</text>
+  <text x="40" y="68" font-size="12" fill="#64748b">单节点站点对：控制面 LWW changelog（ts 优先，同秒 priority 裁决）+ 对象 outbox（逐 peer、版本化、REPLICA 防环）</text>
+
+  <!-- A -->
+  <rect x="40" y="92" width="400" height="392" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="56" y="118" font-size="14" font-weight="700" fill="#1d4ed8">站点 A（[site] name=A region=ap-east-1）</text>
+
+  <text x="56" y="146" font-size="11" font-weight="700" fill="#475569">控制面</text>
+  <rect x="56" y="154" width="368" height="36" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="240" y="176" font-size="11" fill="#1e3a8a" text-anchor="middle">console / S3 控制写（buckets · policy · user · AK · permission）</text>
+  <line x1="240" y1="190" x2="240" y2="202" stroke="#3b82f6" marker-end="url(#blue)"/>
+  <rect x="56" y="204" width="368" height="44" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="240" y="221" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">SQLite 触发器 → site_changelog + site_entity_clock</text>
+  <text x="240" y="237" font-size="9.5" fill="#64748b" text-anchor="middle">本地写 BEFORE 门控 · apply_ctx 抑制 · LWW (ts,priority,origin,seq)</text>
+  <line x1="240" y1="248" x2="240" y2="260" stroke="#3b82f6" marker-end="url(#blue)"/>
+  <rect x="56" y="262" width="368" height="36" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="240" y="284" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">ship worker · cursor≤100/批 · 失败记 last_error</text>
+
+  <text x="56" y="326" font-size="11" font-weight="700" fill="#475569">对象面</text>
+  <rect x="56" y="334" width="368" height="36" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+  <text x="240" y="356" font-size="11" fill="#5b21b6" text-anchor="middle">版本化写 / marker → ReplSink::enqueue_sites（逐 peer）</text>
+  <line x1="240" y1="370" x2="240" y2="382" stroke="#8b5cf6" marker-end="url(#violet)"/>
+  <rect x="56" y="384" width="368" height="44" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="240" y="401" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">repl_outbox（target_kind='site'）→ worker</text>
+  <text x="240" y="417" font-size="9.5" fill="#64748b" text-anchor="middle">GET ?versioning 预检（10s 缓存）→ SigV4 PUT REPLICA → version-id 校验</text>
+  <rect x="56" y="440" width="368" height="28" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-dasharray="4 3"/>
+  <text x="240" y="458" font-size="9.5" fill="#64748b" text-anchor="middle">游标/死信/outbox 状态 → GET /api/v1/sites/{id}/status</text>
+
+  <!-- B -->
+  <rect x="520" y="92" width="400" height="392" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="536" y="118" font-size="14" font-weight="700" fill="#047857">站点 B（[site] name=B region=eu-west-1）</text>
+
+  <text x="536" y="146" font-size="11" font-weight="700" fill="#475569">接收/应用（token 面）</text>
+  <rect x="536" y="154" width="368" height="36" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="720" y="176" font-size="11" fill="#065f46" text-anchor="middle">POST /api/v1/site/changelog（x-oss-site-token）</text>
+  <line x1="720" y1="190" x2="720" y2="202" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="536" y="204" width="368" height="44" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="720" y="221" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">apply_changelog（单事务 · apply_ctx=1）</text>
+  <text x="720" y="237" font-size="9.5" fill="#64748b" text-anchor="middle">LWW 跳过 / 毒丸 dead / 桶删三分类 / 最终行对账（clock 跳过也执行）</text>
+  <line x1="720" y1="248" x2="720" y2="260" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="536" y="262" width="368" height="36" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="720" y="284" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">本地控制表（bucket/策略/用户/AK/权限）· 管理员行保护</text>
+
+  <text x="536" y="326" font-size="11" font-weight="700" fill="#475569">对象面</text>
+  <rect x="536" y="334" width="368" height="36" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="720" y="356" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">S3 接收（PUT REPLICA / DELETE marker）</text>
+  <line x1="720" y1="370" x2="720" y2="382" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="536" y="384" width="368" height="44" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="720" y="401" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">content-type / x-amz-meta-* 透传 · 目标 version-id 非 null</text>
+  <text x="720" y="417" font-size="9.5" fill="#64748b" text-anchor="middle">REPLICA 不再入队（防环）；版本 UUID 两端不同（记档）</text>
+  <rect x="536" y="440" width="368" height="28" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-dasharray="4 3"/>
+  <text x="720" y="458" font-size="9.5" fill="#64748b" text-anchor="middle">配对快照：sites + cursor + 五类实体同一事务（只本地胜者，入钟）</text>
+
+  <!-- flows -->
+  <line x1="424" y1="280" x2="532" y2="172" stroke="#3b82f6" stroke-width="1.6" marker-end="url(#blue)"/>
+  <text x="478" y="208" font-size="9.5" fill="#1d4ed8" text-anchor="middle">changelog</text>
+  <line x1="532" y1="282" x2="424" y2="176" stroke="#3b82f6" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#blue)"/>
+  <text x="478" y="252" font-size="9.5" fill="#1d4ed8" text-anchor="middle">B→A 同构</text>
+  <line x1="424" y1="404" x2="532" y2="356" stroke="#8b5cf6" stroke-width="1.6" marker-end="url(#violet)"/>
+  <text x="478" y="372" font-size="9.5" fill="#6d28d9" text-anchor="middle">对象/标记</text>
+  <line x1="532" y1="406" x2="424" y2="358" stroke="#8b5cf6" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#violet)"/>
+  <text x="478" y="398" font-size="9.5" fill="#6d28d9" text-anchor="middle">B→A 同构</text>
+
+  <!-- bottom -->
+  <rect x="40" y="500" width="880" height="40" rx="10" fill="#fffbeb" stroke="#fde68a"/>
+  <text x="56" y="518" font-size="10.5" fill="#92400e">边界：单节点站点对 · 仅 http · ts-first（priority 仅同秒裁决）· 非空桶删除不生效 · 版本定向删除不复制 · 锁/标签/SSE 不复制 · dead 载荷截断 4KB</text>
+  <text x="56" y="532" font-size="10" fill="#a16207">worker 间隔：OSS_SITE_INTERVAL_SECS / OSS_REPL_INTERVAL_SECS（默认 1s，0=关）；控制面最终一致，强一致归 M9</text>
+</svg>
