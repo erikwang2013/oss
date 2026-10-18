@@ -522,6 +522,7 @@ impl Store {
                 encryption: enc_record.clone(),
                 // M5 切片 4：对象锁（create 记录的意图在此落地）
                 lock: effective_lock.clone(),
+                replication_status: None,
             };
             let mut meta = match (versioned, old_meta.as_ref()) {
                 (true, Some(old)) => {
@@ -617,6 +618,7 @@ impl Store {
             }),
             encryption: enc_record,
             lock: effective_lock,
+            replication_status: None,
         })
     }
 

@@ -700,6 +700,7 @@ impl Store {
                 encryption: enc_record.clone(),
                 // M5 切片 4：对象锁随版本落 meta（守卫在删除路径）
                 lock: lock_record.clone(),
+                replication_status: None,
             };
             // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
             let mut meta = match (versioned, old_meta.as_ref()) {
@@ -811,6 +812,7 @@ impl Store {
             }),
             encryption: enc_record,
             lock: lock_record,
+            replication_status: None,
         })
     }
 }

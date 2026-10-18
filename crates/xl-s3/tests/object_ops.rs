@@ -2913,3 +2913,94 @@ async fn events_not_emitted_on_empty_deletes() {
         "非版本桶空删不得发事件"
     );
 }
+
+// ---------- M6 切片 3：复制状态面（REPLICA 摄入 + HEAD/GET 响应头） ----------
+
+#[tokio::test]
+async fn replication_status_headers_and_replica_ingest() {
+    let (s3, store, _d) = service_enc().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "repbucket".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // 普通 PUT → 无复制状态
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "repbucket".into(),
+            key: "plain".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"hi"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let vid = out.version_id.unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "repbucket".into(),
+            key: "plain".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(head.replication_status.is_none());
+
+    // store 设 PENDING → HEAD/GET 输出 x-amz-replication-status
+    store
+        .set_replication_status("repbucket", "plain", &vid, Some("PENDING"))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "repbucket".into(),
+            key: "plain".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        head.replication_status.as_ref().map(|r| r.as_str()),
+        Some("PENDING")
+    );
+    let get = s3
+        .get_object(req(GetObjectInput {
+            bucket: "repbucket".into(),
+            key: "plain".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        get.replication_status.as_ref().map(|r| r.as_str()),
+        Some("PENDING")
+    );
+
+    // REPLICA 摄入：复制源 PUT 带 x-amz-replication-status: REPLICA → 落为 REPLICA
+    let mut r = req(PutObjectInput {
+        bucket: "repbucket".into(),
+        key: "copy".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"rep"))),
+        ..Default::default()
+    });
+    r.headers
+        .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+    s3.put_object(r).await.unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "repbucket".into(),
+            key: "copy".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        head.replication_status.as_ref().map(|r| r.as_str()),
+        Some("REPLICA")
+    );
+}

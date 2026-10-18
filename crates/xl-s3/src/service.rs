@@ -558,6 +558,13 @@ impl S3 for OssS3 {
         let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
         // M6 切片 0：事件来源（解构 req.input 前自 headers 取）
         let event_source = EventSource::from_headers(&req.headers);
+        // M6 切片 3：REPLICA 摄入（复制源 PutObject 带 x-amz-replication-status: REPLICA；
+        // 信任复制方凭证——与 AWS 复制目标侧同口径，边界记档）
+        let replica = req
+            .headers
+            .get("x-amz-replication-status")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"));
         let PutObjectInput {
             bucket,
             key,
@@ -629,6 +636,17 @@ impl S3 for OssS3 {
             event_source,
         )
         .await;
+        if replica {
+            self.store
+                .set_replication_status(
+                    &bucket,
+                    &key,
+                    info.version_id.as_deref().unwrap_or("null"),
+                    Some("REPLICA"),
+                )
+                .await
+                .map_err(to_s3_error)?;
+        }
 
         let so = sse_out(info.encryption.as_ref());
         Ok(S3Response::new(PutObjectOutput {
@@ -1063,6 +1081,8 @@ impl S3 for OssS3 {
             &mut out.object_lock_legal_hold_status,
         );
 
+        // M6 切片 3：复制状态（x-amz-replication-status）
+        out.replication_status = info.replication_status.clone().map(ReplicationStatus::from);
         // M5 切片 3（R6）：SSE 响应头（S3/KMS 走字段；SSE-C 的 key-MD5 走 headers 补）
         let so = sse_out(info.encryption.as_ref());
         out.server_side_encryption = so
@@ -1139,6 +1159,8 @@ impl S3 for OssS3 {
             &mut out.object_lock_retain_until_date,
             &mut out.object_lock_legal_hold_status,
         );
+        // M6 切片 3：复制状态（x-amz-replication-status）
+        out.replication_status = info.replication_status.clone().map(ReplicationStatus::from);
         // M5 切片 3（R6）：SSE 响应头（同 GET）
         let so = sse_out(info.encryption.as_ref());
         out.server_side_encryption = so

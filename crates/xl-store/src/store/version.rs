@@ -183,6 +183,7 @@ impl Store {
                 inline: None,
                 is_delete_marker: Some(true),
                 is_latest: None,
+                replication_status: None,
                 // NTP 回拨收口：marker 也是新写版本，epoch 同样单调 +1
                 epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
                 encryption: None, // marker 无数据，恒无加密记录
@@ -365,6 +366,42 @@ impl Store {
             }
         };
         Ok(v.lock.as_ref().is_some_and(|l| l.legal_hold))
+    }
+
+    /// M6 切片 3：设置/清除版本级复制状态（meta 重写 + 链尾 epoch 抬升，同 legal-hold 口径）。
+    /// `status = None` 清除；白名单 PENDING/COMPLETED/FAILED/REPLICA。
+    pub async fn set_replication_status(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        status: Option<&str>,
+    ) -> Result<()> {
+        if let Some(s) = status
+            && !matches!(s, "PENDING" | "COMPLETED" | "FAILED" | "REPLICA")
+        {
+            return Err(Error::InvalidArgument(format!("非法复制状态：{s}")));
+        }
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(old) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let mut m = old.clone();
+        let target = m
+            .versions
+            .iter()
+            .position(|v| v.version_id_str() == version_id)
+            .ok_or_else(|| Error::NoSuchKey(format!("{key}@{version_id}")))?;
+        // V3①：marker 版本允许携带复制状态（切片 4 DeleteMarkerReplication 成功态依赖；
+        // 与 legal-hold 的 marker 拒绝口径有意不同——仅拒「版本不存在」）。
+        m.versions[target].replication_status = status.map(str::to_string);
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
+        m.refresh_latest_flags();
+        self.write_meta(bucket, key, &m, Some(&old)).await?;
+        Ok(())
     }
 
     /// 指定版本元数据（HEAD ?versionId）。marker 版本 → `DeleteMarker`（S3 405）。
@@ -676,5 +713,6 @@ fn version_info(key: &str, v: &Version) -> ObjectInfo {
         version_id: Some(v.version_id_str()),
         encryption: v.encryption.clone(),
         lock: v.lock.clone(),
+        replication_status: v.replication_status.clone(),
     }
 }

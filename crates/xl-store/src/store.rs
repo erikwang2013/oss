@@ -105,6 +105,8 @@ pub struct ObjectInfo {
     pub encryption: Option<EncryptionRecord>,
     /// M5 切片 4：对象锁（切片 4 回 `x-amz-object-lock-*` 响应头用；None = 无锁）
     pub lock: Option<ObjectLockRecord>,
+    /// M6 切片 3：复制状态（PENDING/COMPLETED/FAILED/REPLICA；None = 非复制对象）
+    pub replication_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1366,3 +1368,5 @@ mod tests;
 mod tests_crypto;
 #[cfg(test)]
 mod tests_lock;
+#[cfg(test)]
+mod tests_replication;

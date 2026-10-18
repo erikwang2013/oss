@@ -61,6 +61,7 @@ impl Store {
             version_id: Some(v.version_id_str()),
             encryption: v.encryption.clone(),
             lock: v.lock.clone(),
+            replication_status: v.replication_status.clone(),
         })
     }
 

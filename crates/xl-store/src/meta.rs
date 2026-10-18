@@ -73,6 +73,10 @@ pub struct Version {
     /// M5 切片 4：对象锁（retention 与 legal hold 独立；见 [`ObjectLockRecord`]）。
     #[serde(default)]
     pub lock: Option<ObjectLockRecord>,
+    /// M6 切片 3：桶复制状态（PENDING/COMPLETED/FAILED/REPLICA；None = 非复制对象）。
+    /// decode 白名单校验（信任边界）；老解码器跳过未知字段 = 前向兼容。
+    #[serde(default)]
+    pub replication_status: Option<String>,
 }
 
 impl Version {
@@ -217,6 +221,12 @@ impl XlMeta {
                     "part.uuid 非法: {:?}",
                     v.part.uuid
                 )));
+            }
+            // M6 切片 3：复制状态白名单（信任边界）
+            if let Some(rs) = &v.replication_status
+                && !matches!(rs.as_str(), "PENDING" | "COMPLETED" | "FAILED" | "REPLICA")
+            {
+                return Err(Error::CorruptMeta(format!("非法复制状态：{rs:?}")));
             }
             // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）。
             // M5 切片 2：加密 inline 的落盘态是密文（C = c_len(P)），上限随方案放宽。
@@ -413,6 +423,7 @@ mod tests {
                 epoch: None,
                 encryption: None,
                 lock: None,
+                replication_status: None,
             }],
         }
     }
@@ -576,6 +587,26 @@ mod tests {
         assert!(legacy.rank() > legacy2.rank());
     }
 
+    /// M6 切片 3：复制状态 decode 白名单（合法四态 + 非法拒绝）。
+    #[test]
+    fn replication_status_decode_whitelist() {
+        for ok in ["PENDING", "COMPLETED", "FAILED", "REPLICA"] {
+            let mut m = sample();
+            m.versions[0].replication_status = Some(ok.to_string());
+            let bytes = m.encode().unwrap();
+            assert_eq!(XlMeta::decode(&bytes).unwrap(), m, "{ok} 应可读");
+        }
+        for bad in ["", "COMPLETE", "pending", "OK", "REPLICA "] {
+            let mut m = sample();
+            m.versions[0].replication_status = Some(bad.to_string());
+            let bytes = m.encode().unwrap();
+            assert!(
+                matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))),
+                "{bad:?} 应被拒"
+            );
+        }
+    }
+
     #[test]
     fn golden_bytes_stable() {
         // 字段名与表示在 named 编码下就是磁盘契约：自读自写的 roundtrip 抓不到
@@ -591,13 +622,14 @@ mod tests {
         // is_delete_marker/is_latest（无版本写 nil——老解码器跳过未知字段 = 前向兼容契约），
         // 摘要均按「有意识更新」流程重算（本次为第四次；**第五次**：M4 切片 4 增 epoch 字段；
         // **第六次**：M5 切片 2 增 encryption 字段——明文对象写 nil，老解码器跳过；
-        // **第七次**：M5 切片 4 增 lock 字段——无锁对象写 nil，老解码器跳过）。
+        // **第七次**：M5 切片 4 增 lock 字段——无锁对象写 nil，老解码器跳过；
+        // **第八次**：M6 切片 3 增 replication_status 字段——非复制对象写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "8a5efe9f8a1074e6540f16c0eb9c3b75556d53de2aecc02a5d3fb97f95a1c78a"
+            "29bb7d19e86b742d3b9dbb1c48a23303f707353370efcc44e6e2c3a5f8c7a505"
         );
     }
 }
@@ -629,6 +661,7 @@ mod parts_tests {
             epoch: None,
             encryption: None,
             lock: None,
+            replication_status: None,
         }
     }
 

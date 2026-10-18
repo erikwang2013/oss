@@ -1772,6 +1772,7 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
                 epoch: None,
                 encryption: None,
                 lock: None,
+                replication_status: None,
             }],
         }
     };
@@ -2202,6 +2203,7 @@ async fn legacy_parts_form_still_readable() {
         epoch: None,
         encryption: None,
         lock: None,
+        replication_status: None,
     };
     let m = XlMeta {
         object_key: "legacy".into(),
