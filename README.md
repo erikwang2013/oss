@@ -765,3 +765,14 @@ cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空�
 ---
 
 © 2026 erik.xyz · 以 Apache-2.0 许可发布
+
+<!-- assets-license:start -->
+## 视觉资产授权 / Visual Assets License
+
+本项目的项目宠物、图片、图标、表情（包括 `docs/pet-expressions/` 等目录下的
+SVG / PNG）**不是开源资产**，版权归作者所有。未经书面许可不得复制、修改、再分发或
+用于商业用途；商业使用需取得商业授权，联系 **erik@erik.xyz**。详见
+[ASSETS-LICENSE.md](ASSETS-LICENSE.md)。
+
+> 代码部分仍遵循仓库原有 `LICENSE`；第三方素材（如明确标注的 Go Gopher 等）仍遵循其原许可证。
+<!-- assets-license:end -->
