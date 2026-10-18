@@ -74,6 +74,41 @@ pub struct PermissionRow {
     pub delete: bool,
 }
 
+// ——— M8 S0：作业引擎数据结构 ———
+
+/// 建作业时的一条任务。
+#[derive(Debug, Clone)]
+pub struct NewJobTask {
+    pub action: String,
+    pub payload: String,
+    pub dedupe_key: Option<String>,
+}
+
+/// 建作业规格（S3/S4b/S5 共用）。
+#[derive(Debug, Clone, Default)]
+pub struct JobSpec {
+    pub kind: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub requested_by: Option<i64>,
+    pub priority: i64,
+    pub parent_job_id: Option<i64>,
+    pub report_bucket: Option<String>,
+    pub report_prefix: Option<String>,
+    pub spec_json: Option<String>,
+    pub tasks: Vec<NewJobTask>,
+}
+
+/// 领取到的任务（worker 执行输入）。
+#[derive(Debug, Clone)]
+pub struct ClaimedTask {
+    pub job_id: i64,
+    pub task_no: i64,
+    pub action: String,
+    pub payload_json: String,
+    pub attempt: i64,
+}
+
 // migrations/ 只是目录命名习惯：本实现用 include_str! + raw_sql 原样执行整份 schema，
 // 不建 _sqlx_migrations —— 将来加 0002 不会自动执行（M2 起再引 sqlx migrate）。
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
@@ -1789,6 +1824,165 @@ mod tests {
             .unwrap();
         assert_eq!(jobs, 1, "jobs 必须按审计保留");
     }
+
+    fn task(action: &str) -> NewJobTask {
+        NewJobTask {
+            action: action.into(),
+            payload: "{}".into(),
+            dedupe_key: None,
+        }
+    }
+
+    /// M8 S0：领取优先级/重试退避/上限/作业收敛/暂停取消/重试子作业/配额。
+    #[tokio::test]
+    async fn job_engine_state_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("jobs.db").display()
+        ))
+        .await
+        .unwrap();
+        // 低优先级先建、高优先级后建：领取必须按 priority DESC
+        let low = db
+            .create_job(
+                &JobSpec {
+                    kind: "batch".into(),
+                    bucket: "b1".into(),
+                    requested_by: Some(7),
+                    priority: 1,
+                    tasks: vec![task("ReplaceTags")],
+                    ..Default::default()
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+        let high = db
+            .create_job(
+                &JobSpec {
+                    kind: "batch".into(),
+                    bucket: "b1".into(),
+                    requested_by: Some(7),
+                    priority: 9,
+                    tasks: vec![task("ReplaceTags")],
+                    ..Default::default()
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.job_inflight_counts(Some(7)).await.unwrap(), (2, 2));
+        let claimed = db.claim_task(1000, 900).await.unwrap().unwrap();
+        assert_eq!(claimed.job_id, high, "高优先级必须先领");
+        // 成功 → 作业 done
+        assert_eq!(
+            db.finish_task(high, 1, true, "Succeeded", None, 1001, 3)
+                .await
+                .unwrap(),
+            "done"
+        );
+        let j = db.job_get(high).await.unwrap().unwrap();
+        assert_eq!(j["state"], "done");
+        assert_eq!(j["succeeded"], 1);
+
+        // 低优先级任务：失败 2 次（退避）后第 3 次达上限 → failed/error
+        let c = db.claim_task(1000, 900).await.unwrap().unwrap();
+        assert_eq!(c.job_id, low);
+        assert_eq!(
+            db.finish_task(low, 1, false, "InternalError", Some("x"), 1001, 3)
+                .await
+                .unwrap(),
+            "queued"
+        );
+        // 未到 next_at 不可领
+        assert!(db.claim_task(1001, 900).await.unwrap().is_none());
+        let c = db.claim_task(5000, 900).await.unwrap().unwrap();
+        assert_eq!(c.attempt, 1);
+        assert_eq!(
+            db.finish_task(low, 1, false, "InternalError", None, 5001, 3)
+                .await
+                .unwrap(),
+            "queued"
+        );
+        let c = db.claim_task(10_000, 900).await.unwrap().unwrap();
+        assert_eq!(c.attempt, 2);
+        assert_eq!(
+            db.finish_task(low, 1, false, "PermanentFailure", None, 10_001, 3)
+                .await
+                .unwrap(),
+            "failed"
+        );
+        let j = db.job_get(low).await.unwrap().unwrap();
+        assert_eq!(j["state"], "error");
+        assert_eq!(j["failed"], 1);
+
+        // retry-failed 建子作业（只含失败任务）
+        let child = db.job_retry_failed(low, 20_000).await.unwrap().unwrap();
+        let cj = db.job_get(child).await.unwrap().unwrap();
+        assert_eq!(cj["parent_job_id"], low);
+        assert_eq!(cj["total"], 1);
+        let tasks = db.job_tasks(child, 0, 10).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["action"], "ReplaceTags");
+        // 清空子作业，避免干扰后续领取
+        let cc = db.claim_task(20_001, 900).await.unwrap().unwrap();
+        assert_eq!(cc.job_id, child);
+        db.finish_task(child, 1, true, "Succeeded", None, 20_002, 3)
+            .await
+            .unwrap();
+
+        // 暂停/恢复/取消
+        let p = db
+            .create_job(
+                &JobSpec {
+                    kind: "batch".into(),
+                    bucket: "b1".into(),
+                    tasks: vec![task("Copy"), task("Delete")],
+                    ..Default::default()
+                },
+                30_000,
+            )
+            .await
+            .unwrap();
+        let c = db.claim_task(30_001, 900).await.unwrap().unwrap();
+        assert_eq!(c.job_id, p);
+        assert!(db.job_set_state(p, "pause", 30_002).await.unwrap());
+        assert!(db.claim_task(30_003, 900).await.unwrap().is_none());
+        assert!(db.job_set_state(p, "resume", 30_004).await.unwrap());
+        assert!(db.job_set_state(p, "cancel", 30_005).await.unwrap());
+        // 排队任务被取消；在跑任务允许完成
+        let tasks = db.job_tasks(p, 0, 10).await.unwrap();
+        assert_eq!(tasks[0]["state"], "running");
+        assert_eq!(tasks[1]["state"], "cancelled");
+        assert_eq!(
+            db.finish_task(p, 1, true, "Succeeded", None, 30_006, 3)
+                .await
+                .unwrap(),
+            "done"
+        );
+        let j = db.job_get(p).await.unwrap().unwrap();
+        assert_eq!(j["state"], "cancelled", "取消后不得被收敛覆盖");
+
+        // 超时回收：running 且 deadline 过期 → 一次失败
+        let t = db
+            .create_job(
+                &JobSpec {
+                    kind: "batch".into(),
+                    bucket: "b1".into(),
+                    tasks: vec![task("Copy")],
+                    ..Default::default()
+                },
+                40_000,
+            )
+            .await
+            .unwrap();
+        db.claim_task(40_000, 10).await.unwrap().unwrap();
+        assert_eq!(db.recover_expired_tasks(40_100, 3).await.unwrap(), 1);
+        let tasks = db.job_tasks(t, 0, 10).await.unwrap();
+        assert_eq!(tasks[0]["state"], "queued");
+        assert_eq!(tasks[0]["attempt"], 1);
+    }
 }
 
 // ——— M4 切片 6：生命周期规则与作业（jobs 表进度） ———
@@ -1957,6 +2151,464 @@ impl Db {
                 })
             })
             .collect())
+    }
+
+    // ——— M8 S0：作业引擎（jobs/job_tasks） ———
+
+    /// 建作业 + 任务（同一事务）。任务 `task_no` 从 1 起；作业初始 `queued`。
+    pub async fn create_job(&self, spec: &JobSpec, now: i64) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let id = sqlx::query(
+            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
+             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
+             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&spec.kind)
+        .bind(&spec.bucket)
+        .bind(&spec.prefix)
+        .bind(spec.tasks.len() as i64)
+        .bind(spec.priority)
+        .bind(spec.requested_by)
+        .bind(spec.parent_job_id)
+        .bind(&spec.report_bucket)
+        .bind(&spec.report_prefix)
+        .bind(&spec.spec_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        for (i, t) in spec.tasks.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, next_at, dedupe_key) \
+                 VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            )
+            .bind(id)
+            .bind(i as i64 + 1)
+            .bind(&t.action)
+            .bind(&t.payload)
+            .bind(now)
+            .bind(&t.dedupe_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// `(该用户, 全局)` 的 inflight 作业数（queued/running/paused）。
+    pub async fn job_inflight_counts(&self, requested_by: Option<i64>) -> Result<(i64, i64)> {
+        let user: i64 = match requested_by {
+            Some(uid) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM jobs WHERE requested_by = ? \
+                     AND state IN ('queued','running','paused')",
+                )
+                .bind(uid)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            None => 0,
+        };
+        let global: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running','paused')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((user, global))
+    }
+
+    /// 原子领取一条任务（BEGIN IMMEDIATE）。先提升 queued 作业，再按优先级/时间取一条。
+    pub async fn claim_task(&self, now: i64, timeout_secs: i64) -> Result<Option<ClaimedTask>> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::raw_sql("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let out = async {
+            sqlx::query(
+                "UPDATE jobs SET state = 'running', started_at = COALESCE(started_at, ?), updated_at = ? \
+                 WHERE state = 'queued' AND EXISTS (SELECT 1 FROM job_tasks t \
+                 WHERE t.job_id = jobs.id AND t.state IN ('queued','running'))",
+            )
+            .bind(now)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+            let row = sqlx::query(
+                "SELECT t.job_id, t.task_no, t.action, t.payload_json, t.attempt \
+                 FROM job_tasks t JOIN jobs j ON j.id = t.job_id \
+                 WHERE t.state = 'queued' AND t.next_at <= ? AND j.state = 'running' \
+                 ORDER BY j.priority DESC, t.next_at, t.task_no LIMIT 1",
+            )
+            .bind(now)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(r) = row else {
+                return Ok::<Option<ClaimedTask>, sqlx::Error>(None);
+            };
+            let (job_id, task_no): (i64, i64) = (r.get("job_id"), r.get("task_no"));
+            sqlx::query(
+                "UPDATE job_tasks SET state = 'running', started_at = ?, deadline_at = ? \
+                 WHERE job_id = ? AND task_no = ? AND state = 'queued'",
+            )
+            .bind(now)
+            .bind(now + timeout_secs)
+            .bind(job_id)
+            .bind(task_no)
+            .execute(&mut *conn)
+            .await?;
+            Ok(Some(ClaimedTask {
+                job_id,
+                task_no,
+                action: r.get("action"),
+                payload_json: r.get("payload_json"),
+                attempt: r.get("attempt"),
+            }))
+        }
+        .await;
+        let tail = if out.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        if let Err(e) = sqlx::raw_sql(tail).execute(&mut *conn).await {
+            tracing::warn!(error = %e, "job claim {tail} 失败");
+        }
+        out
+    }
+
+    /// 任务终态/重试。成功 → done；失败未达上限 → queued（指数退避）；达上限 → failed。
+    /// 返回任务新状态；作业在无 queued/running 任务时收敛为 done/error。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_task(
+        &self,
+        job_id: i64,
+        task_no: i64,
+        ok: bool,
+        code: &str,
+        message: Option<&str>,
+        now: i64,
+        max_attempts: i64,
+    ) -> Result<&'static str> {
+        let mut tx = self.pool.begin().await?;
+        let row =
+            sqlx::query("SELECT state, attempt FROM job_tasks WHERE job_id = ? AND task_no = ?")
+                .bind(job_id)
+                .bind(task_no)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(r) = row else {
+            tx.commit().await?;
+            return Ok("missing");
+        };
+        if r.get::<String, _>("state") != "running" {
+            tx.commit().await?;
+            return Ok("not-running");
+        }
+        let attempt: i64 = r.get("attempt");
+        if ok {
+            sqlx::query(
+                "UPDATE job_tasks SET state = 'done', result_code = ?, result_string = ?, \
+                 finished_at = ? WHERE job_id = ? AND task_no = ?",
+            )
+            .bind(code)
+            .bind(message)
+            .bind(now)
+            .bind(job_id)
+            .bind(task_no)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE jobs SET succeeded = succeeded + 1, progress = progress + 1, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(now)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        } else if attempt + 1 < max_attempts {
+            let backoff = 10i64
+                .saturating_mul(2i64.saturating_pow(attempt.min(30) as u32))
+                .min(300)
+                + (now % 1000).abs();
+            sqlx::query(
+                "UPDATE job_tasks SET state = 'queued', attempt = attempt + 1, next_at = ?, \
+                 result_code = ?, result_string = ?, started_at = NULL, deadline_at = NULL \
+                 WHERE job_id = ? AND task_no = ?",
+            )
+            .bind(now + backoff)
+            .bind(code)
+            .bind(message)
+            .bind(job_id)
+            .bind(task_no)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE jobs SET updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query(
+                "UPDATE job_tasks SET state = 'failed', attempt = attempt + 1, \
+                 result_code = 'PermanentFailure', result_string = ?, finished_at = ? \
+                 WHERE job_id = ? AND task_no = ?",
+            )
+            .bind(message)
+            .bind(now)
+            .bind(job_id)
+            .bind(task_no)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE jobs SET failed = failed + 1, progress = progress + 1, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(now)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // 作业收敛：仍 running 且无未终态任务 → done（无 failed）/error
+        sqlx::query(
+            "UPDATE jobs SET state = CASE WHEN failed > 0 THEN 'error' ELSE 'done' END, \
+             finished_at = ?, updated_at = ? \
+             WHERE id = ? AND state = 'running' AND NOT EXISTS \
+             (SELECT 1 FROM job_tasks WHERE job_id = ? AND state IN ('queued','running'))",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(if ok {
+            "done"
+        } else if attempt + 1 < max_attempts {
+            "queued"
+        } else {
+            "failed"
+        })
+    }
+
+    /// 超时回收：running 且 deadline 过期 → 按一次失败处理。返回回收条数。
+    pub async fn recover_expired_tasks(&self, now: i64, max_attempts: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT job_id, task_no FROM job_tasks \
+             WHERE state = 'running' AND deadline_at IS NOT NULL AND deadline_at < ?",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        for r in &rows {
+            self.finish_task(
+                r.get("job_id"),
+                r.get("task_no"),
+                false,
+                "Timeout",
+                Some("task deadline exceeded"),
+                now,
+                max_attempts,
+            )
+            .await?;
+        }
+        Ok(rows.len())
+    }
+
+    /// 作业详情（None = 不存在）。
+    pub async fn job_get(&self, id: i64) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            "SELECT id, kind, bucket, prefix, state, spec_json, progress, total, succeeded, \
+             failed, report_bucket, report_prefix, priority, requested_by, parent_job_id, \
+             error, created_at, started_at, finished_at, updated_at FROM jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            serde_json::json!({
+                "id": r.get::<i64, _>("id"),
+                "kind": r.get::<String, _>("kind"),
+                "bucket": r.get::<String, _>("bucket"),
+                "prefix": r.get::<String, _>("prefix"),
+                "state": r.get::<String, _>("state"),
+                "spec_json": r.get::<Option<String>, _>("spec_json"),
+                "progress": r.get::<i64, _>("progress"),
+                "total": r.get::<i64, _>("total"),
+                "succeeded": r.get::<i64, _>("succeeded"),
+                "failed": r.get::<i64, _>("failed"),
+                "report_bucket": r.get::<Option<String>, _>("report_bucket"),
+                "report_prefix": r.get::<Option<String>, _>("report_prefix"),
+                "priority": r.get::<i64, _>("priority"),
+                "requested_by": r.get::<Option<i64>, _>("requested_by"),
+                "parent_job_id": r.get::<Option<i64>, _>("parent_job_id"),
+                "error": r.get::<Option<String>, _>("error"),
+                "created_at": r.get::<i64, _>("created_at"),
+                "started_at": r.get::<Option<i64>, _>("started_at"),
+                "finished_at": r.get::<Option<i64>, _>("finished_at"),
+                "updated_at": r.get::<i64, _>("updated_at"),
+            })
+        }))
+    }
+
+    /// 作业级错误文案（报告写失败等；不改任务终态）。
+    pub async fn job_set_error(&self, id: i64, msg: &str, now: i64) -> Result<()> {
+        sqlx::query("UPDATE jobs SET error = ?, updated_at = ? WHERE id = ?")
+            .bind(msg)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 作业归属/状态（API 判权用）。
+    pub async fn job_owner(&self, id: i64) -> Result<Option<(Option<i64>, String)>> {
+        let row = sqlx::query("SELECT requested_by, state FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("requested_by"), r.get("state"))))
+    }
+
+    /// 任务分页（task_no 升序）。
+    pub async fn job_tasks(
+        &self,
+        id: i64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT task_no, action, state, attempt, next_at, result_code, result_string, \
+             started_at, finished_at FROM job_tasks WHERE job_id = ? \
+             ORDER BY task_no LIMIT ? OFFSET ?",
+        )
+        .bind(id)
+        .bind(limit.clamp(1, 500))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "task_no": r.get::<i64, _>("task_no"),
+                    "action": r.get::<String, _>("action"),
+                    "state": r.get::<String, _>("state"),
+                    "attempt": r.get::<i64, _>("attempt"),
+                    "next_at": r.get::<i64, _>("next_at"),
+                    "result_code": r.get::<Option<String>, _>("result_code"),
+                    "result_string": r.get::<Option<String>, _>("result_string"),
+                    "started_at": r.get::<Option<i64>, _>("started_at"),
+                    "finished_at": r.get::<Option<i64>, _>("finished_at"),
+                })
+            })
+            .collect())
+    }
+
+    /// 状态操作：`pause`/`resume`/`cancel`。返回是否有行被改（false = 不存在或状态不允许）。
+    pub async fn job_set_state(&self, id: i64, action: &str, now: i64) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let n = match action {
+            "pause" => sqlx::query(
+                "UPDATE jobs SET state = 'paused', updated_at = ? WHERE id = ? AND state = 'running'",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected(),
+            "resume" => sqlx::query(
+                "UPDATE jobs SET state = 'running', updated_at = ? WHERE id = ? AND state = 'paused'",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected(),
+            "cancel" => {
+                let n = sqlx::query(
+                    "UPDATE jobs SET state = 'cancelled', updated_at = ? \
+                     WHERE id = ? AND state IN ('queued','running','paused')",
+                )
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if n > 0 {
+                    sqlx::query(
+                        "UPDATE job_tasks SET state = 'cancelled', finished_at = ? \
+                         WHERE job_id = ? AND state = 'queued'",
+                    )
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                n
+            }
+            _ => 0,
+        };
+        tx.commit().await?;
+        Ok(n > 0)
+    }
+
+    /// 失败任务重试：建子作业（只含 failed 任务，原 task_no 保留为顺序），返回新 job id。
+    pub async fn job_retry_failed(&self, id: i64, now: i64) -> Result<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        let job = sqlx::query(
+            "SELECT kind, bucket, prefix, priority, requested_by, report_bucket, report_prefix, spec_json \
+             FROM jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(j) = job else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let tasks = sqlx::query(
+            "SELECT action, payload_json FROM job_tasks WHERE job_id = ? AND state = 'failed' \
+             ORDER BY task_no",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if tasks.is_empty() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let new_id = sqlx::query(
+            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
+             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
+             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(j.get::<String, _>("kind"))
+        .bind(j.get::<String, _>("bucket"))
+        .bind(j.get::<String, _>("prefix"))
+        .bind(tasks.len() as i64)
+        .bind(j.get::<i64, _>("priority"))
+        .bind(j.get::<Option<i64>, _>("requested_by"))
+        .bind(id)
+        .bind(j.get::<Option<String>, _>("report_bucket"))
+        .bind(j.get::<Option<String>, _>("report_prefix"))
+        .bind(j.get::<Option<String>, _>("spec_json"))
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        for (i, t) in tasks.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, next_at) \
+                 VALUES (?, ?, ?, ?, 'queued', ?)",
+            )
+            .bind(new_id)
+            .bind(i as i64 + 1)
+            .bind(t.get::<String, _>("action"))
+            .bind(t.get::<String, _>("payload_json"))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(new_id))
     }
 
     // ——— M4 切片 7：桶策略与审计 ———

@@ -6,6 +6,7 @@ pub mod config;
 pub mod console;
 pub mod db;
 pub mod events;
+pub mod jobs;
 pub mod lifecycle;
 pub mod repl_client;
 pub mod replication;

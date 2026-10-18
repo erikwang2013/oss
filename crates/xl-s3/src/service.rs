@@ -34,6 +34,8 @@ pub struct OssS3 {
     repl_sink: Option<Arc<dyn crate::replication::ReplicationSink>>,
     /// M6 切片 4：复制配置读存（Put/Get/DeleteBucketReplication）
     repl_store: Option<Arc<dyn crate::replication::ReplicationStore>>,
+    /// M8 S0：删桶后的控制面清理（oss-server 注入；None = 未接线）
+    bucket_cleanup: Option<Arc<dyn crate::bucket_cleanup::BucketCleanupSink>>,
 }
 
 impl OssS3 {
@@ -56,6 +58,26 @@ impl OssS3 {
             events: None,
             repl_sink: None,
             repl_store: None,
+            bucket_cleanup: None,
+        }
+    }
+
+    /// M8 S0：注入删桶清理实现（builder 风格；S1 装配 ApCache 后接线）。
+    pub fn with_bucket_cleanup(
+        mut self,
+        sink: Option<Arc<dyn crate::bucket_cleanup::BucketCleanupSink>>,
+    ) -> Self {
+        self.bucket_cleanup = sink;
+        self
+    }
+
+    /// M8 S0：删桶后 best-effort 清 M8 表并总是失效 AP 缓存。
+    async fn cleanup_m8(&self, bucket: &str) {
+        if let Some(sink) = &self.bucket_cleanup {
+            if let Err(e) = sink.clear_bucket_m8(bucket).await {
+                tracing::warn!(error = %e, bucket, "删桶 M8 表清理失败");
+            }
+            sink.invalidate_ap_cache(bucket);
         }
     }
 
@@ -579,7 +601,10 @@ impl S3 for OssS3 {
             if is_site_conflict(&e) {
                 match self.acl.bucket_lock(&bucket).await {
                     // 远端 delete 已胜出（无行）：本地删除同样已生效，按幂等成功返回。
-                    Ok(None) => return Ok(S3Response::new(DeleteBucketOutput::default())),
+                    Ok(None) => {
+                        self.cleanup_m8(&bucket).await;
+                        return Ok(S3Response::new(DeleteBucketOutput::default()));
+                    }
                     // 行仍在（远端 upsert/权限胜出）：恢复空桶并 409。
                     Ok(Some(_)) => {
                         if let Err(re) = self.store.create_bucket(&bucket).await {
@@ -612,6 +637,8 @@ impl S3 for OssS3 {
         }
         // M5 切片 0（P4-1）：删行广播（best-effort）
         self.store.broadcast_bucket_row(&bucket, None).await;
+        // M8 S0：控制面状态清理 + AP 缓存失效（best-effort）
+        self.cleanup_m8(&bucket).await;
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 

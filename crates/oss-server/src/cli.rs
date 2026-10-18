@@ -196,6 +196,12 @@ pub async fn run(
             );
             // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
             crate::lifecycle::spawn_audit_cleanup(state.clone());
+            // M8 S0：通用作业引擎（S3/S4b/S5 的任务动作；0 关闭）
+            crate::jobs::spawn_workers(
+                std::sync::Arc::clone(&state.db),
+                std::sync::Arc::clone(&state.store),
+                std::sync::Arc::new(crate::jobs::NoopExecutor),
+            );
 
             let router = crate::router::build_router(state)?;
             let mut app = ecat::App::builder()

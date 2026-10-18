@@ -1,5 +1,6 @@
 pub mod access;
 pub mod auth;
+pub mod bucket_cleanup;
 pub mod convert;
 pub mod events;
 pub mod lock;

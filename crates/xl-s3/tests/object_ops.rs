@@ -3934,3 +3934,43 @@ async fn copy_rejects_bad_directives_and_bad_tags() {
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
 }
+
+// ---- M8 S0：删桶跨 crate 清理钩子 ----
+
+#[derive(Default)]
+struct FakeCleanup {
+    cleared: std::sync::Mutex<Vec<String>>,
+    invalidated: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl xl_s3::bucket_cleanup::BucketCleanupSink for FakeCleanup {
+    async fn clear_bucket_m8(&self, bucket: &str) -> Result<(), String> {
+        self.cleared.lock().unwrap().push(bucket.to_string());
+        Ok(())
+    }
+    fn invalidate_ap_cache(&self, bucket: &str) {
+        self.invalidated.lock().unwrap().push(bucket.to_string());
+    }
+}
+
+#[tokio::test]
+async fn delete_bucket_invokes_m8_cleanup_sink() {
+    let (s3, _d) = service().await;
+    let sink = Arc::new(FakeCleanup::default());
+    let s3 = s3.with_bucket_cleanup(Some(sink.clone()));
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: "m8clean".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.delete_bucket(with_user(DeleteBucketInput {
+        bucket: "m8clean".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    assert_eq!(*sink.cleared.lock().unwrap(), ["m8clean".to_string()]);
+    assert_eq!(*sink.invalidated.lock().unwrap(), ["m8clean".to_string()]);
+}

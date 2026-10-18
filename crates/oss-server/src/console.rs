@@ -5,7 +5,7 @@
 //! 授权（谁能做什么）走三面共用的 `xl_s3::access::Acl`：管理员全量；子账户按
 //! permissions 三档（读/写/删）+ 自有桶全权；403 用纯文本（前端 `rawApi` 直接展示 resp.text）。
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -125,6 +125,9 @@ pub fn routes() -> Router<AppState> {
         .route("/cluster/status", get(cluster_status))
         // M4 切片 6：作业记录（管理员）与桶生命周期规则（桶主或管理员）
         .route("/jobs", get(list_jobs))
+        // M8 S0：作业详情/控制（admin 或 requested_by）
+        .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}/{action}", post(job_action))
         .route(
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
@@ -354,6 +357,98 @@ async fn list_jobs(
         Ok(rows) => Json(rows).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询 jobs 失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct JobDetailQuery {
+    #[serde(default)]
+    offset: i64,
+    #[serde(default = "default_task_limit")]
+    limit: i64,
+}
+
+fn default_task_limit() -> i64 {
+    50
+}
+
+/// 作业读权限：admin，或该作业的 `requested_by`。
+async fn job_access(state: &AppState, payload: &JwtPayload, id: i64) -> Result<(), Response> {
+    let (uid, is_admin) = who(state, payload).await?;
+    match state.db.job_owner(id).await {
+        Ok(Some((owner, _))) if is_admin || owner == Some(uid) => Ok(()),
+        Ok(Some(_)) => Err(forbidden("需要作业所有者或管理员")),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "作业不存在").into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "查作业归属失败");
+            Err(internal_error())
+        }
+    }
+}
+
+/// 作业详情 + 任务分页。
+async fn get_job(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+    Query(q): Query<JobDetailQuery>,
+) -> Response {
+    if let Err(r) = job_access(&state, &payload, id).await {
+        return r;
+    }
+    let job = match state.db.job_get(id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => return (StatusCode::NOT_FOUND, "作业不存在").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查作业详情失败");
+            return internal_error();
+        }
+    };
+    match state.db.job_tasks(id, q.offset, q.limit).await {
+        Ok(tasks) => Json(serde_json::json!({
+            "job": job, "tasks": tasks, "offset": q.offset, "limit": q.limit,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查作业任务失败");
+            internal_error()
+        }
+    }
+}
+
+/// `pause` / `resume` / `cancel` / `retry-failed`。
+async fn job_action(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path((id, action)): Path<(i64, String)>,
+) -> Response {
+    if let Err(r) = job_access(&state, &payload, id).await {
+        return r;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if action == "retry-failed" {
+        return match state.db.job_retry_failed(id, now).await {
+            Ok(Some(new_id)) => Json(serde_json::json!({"job_id": new_id})).into_response(),
+            Ok(None) => (StatusCode::CONFLICT, "没有可重试的失败任务").into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "重试失败任务出错");
+                internal_error()
+            }
+        };
+    }
+    if !matches!(action.as_str(), "pause" | "resume" | "cancel") {
+        return (StatusCode::BAD_REQUEST, "未知作业操作").into_response();
+    }
+    match state.db.job_set_state(id, &action, now).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::CONFLICT, "作业状态不允许该操作").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "作业状态操作失败");
             internal_error()
         }
     }

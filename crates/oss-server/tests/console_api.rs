@@ -600,3 +600,129 @@ async fn console_delete_emits_event() {
     assert_eq!(v["source"]["userAgent"], "oss-console");
     assert_eq!(v["s3"]["object"]["key"], "d.txt");
 }
+
+/// M8 S0：作业详情/控制 API——admin 全量、子账户仅自己的作业、状态操作。
+#[tokio::test]
+async fn jobs_api_ownership_and_actions() {
+    use oss_server::db::{JobSpec, NewJobTask};
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let sub_uid = st.db.create_user("sub", "pw2", false).await.unwrap();
+    // 系统作业（requested_by=None）：仅 admin 可见
+    let sys = st
+        .db
+        .create_job(
+            &JobSpec {
+                kind: "batch".into(),
+                tasks: vec![NewJobTask {
+                    action: "Copy".into(),
+                    payload: "{}".into(),
+                    dedupe_key: None,
+                }],
+                ..Default::default()
+            },
+            1000,
+        )
+        .await
+        .unwrap();
+    // 子账户自己的作业
+    let own = st
+        .db
+        .create_job(
+            &JobSpec {
+                kind: "batch".into(),
+                requested_by: Some(sub_uid),
+                tasks: vec![NewJobTask {
+                    action: "Copy".into(),
+                    payload: "{}".into(),
+                    dedupe_key: None,
+                }],
+                ..Default::default()
+            },
+            1000,
+        )
+        .await
+        .unwrap();
+    let app = build_router(st.clone()).unwrap();
+    let client = reqwest::Client::new();
+    let base_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = base_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(base_listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let admin = login_token(&base).await;
+    let sub: serde_json::Value = client
+        .post(format!("{base}/api/v1/login"))
+        .json(&serde_json::json!({"username": "sub", "password": "pw2"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sub = sub["token"].as_str().unwrap().to_string();
+
+    // admin 看系统作业；子账户 403
+    let r = client
+        .get(format!("{base}/api/v1/jobs/{sys}"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["job"]["id"], sys);
+    assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
+    let r = client
+        .get(format!("{base}/api/v1/jobs/{sys}"))
+        .bearer_auth(&sub)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // 子账户自己的作业可读；先领取一条任务 → pause/resume 可用
+    let r = client
+        .get(format!("{base}/api/v1/jobs/{own}"))
+        .bearer_auth(&sub)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // 取消系统作业，确保下一条领取落在 own 上
+    st.db.job_set_state(sys, "cancel", 1001).await.unwrap();
+    let claimed = st.db.claim_task(1001, 900).await.unwrap().unwrap();
+    assert_eq!(claimed.job_id, own);
+    for action in ["pause", "resume", "cancel"] {
+        let r = client
+            .post(format!("{base}/api/v1/jobs/{own}/{action}"))
+            .bearer_auth(&sub)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204, "{action}");
+    }
+    // 取消后 retry-failed 无失败任务 → 409
+    let r = client
+        .post(format!("{base}/api/v1/jobs/{own}/retry-failed"))
+        .bearer_auth(&sub)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    // 未授权动作/不存在作业
+    let r = client
+        .post(format!("{base}/api/v1/jobs/{own}/explode"))
+        .bearer_auth(&sub)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = client
+        .get(format!("{base}/api/v1/jobs/999999"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}
