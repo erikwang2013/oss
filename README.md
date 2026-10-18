@@ -133,6 +133,9 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
 > - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M4+）；
 >   多区间 Range（`bytes=0-9,20-29`）→ 400 `InvalidArgument`（s3s 解析层拦截）；HEAD 带 Range 不支持。
+> - **对象标签未实现（501）**：`Put/Get/DeleteObjectTagging` 与 PUT/COPY 的 `x-amz-tagging*` 头未接线（工作令未排；功能规格 §3.7 要求）。
+> - **CopyObject `REPLACE` 未实现**：`x-amz-metadata-directive: REPLACE` 与 `x-amz-tagging-directive` 被忽略——始终按 COPY 继承源元数据（规格 §3.5 标注「待后续」，此处显式记档）。
+> - **控制台页面缺口**：M5 加密/KMS 设置页、M6 事件页与 Select 工作台、M4 桶策略编辑与审计查询 UI 未做；对应后端 API 均已完整（可用 aws-cli / 控制台 API 操作）。
 > - Multipart **part 级** `x-amz-checksum-*` 不校验（静默忽略，M2b 接组合语义）；单段 PUT 的
 >   Content-MD5 / `x-amz-checksum-*` 已在提交点前校验（不符 → `BadDigest`，对象不落盘）。
 > - 控制台「上传记录」是登记历史：对象或暂存文件被删后，记录行仍在（按设计，作审计线索）。

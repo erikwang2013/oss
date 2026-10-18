@@ -470,6 +470,9 @@ delete marker / 回滚 / 点名版本读删）· 生命周期到期自动删（`
 heal / scrub 独立命令 · rebalance 追加式扩容（C4 同盘 hardlink 快路径）· 多 set 横向扩容
 （桶钉 set；C2 控制台 sets 视图；C3 建桶缺省自动指派最闲 set）· 登录限速（C1）· 审计保留
 清理（C5）——均已落地；验收 ①–④ e2e 实证。分层/转换归 M8，控制面强一致归 M9。
+**M4 规格缺口（2026-10-18 记）**：对象标签 `Put/Get/DeleteObjectTagging`（功能规格 §3.7）未实现
+（501），工作令未排；控制台桶策略编辑与审计查询 UI 未做（后端 API 完整）；CopyObject `REPLACE`
+元数据指令未实现（规格 §3.5 已标注待后续）。
 
 ### M5 安全与锁定（2-3 周）
 
@@ -515,7 +518,8 @@ hyper 出站；PENDING→COMPLETED/FAILED、停机积压追平 ④ ⑤）· 切�
 `e2e_replication.sh`；复制/Select/Kafka 三件 e2e 实跑 EXIT=0）。**记档**：Parquet/BZIP2 后置；
 Kafka SASL/SSL 与复制的 TLS 未接线（复制 http-only）；Select 全量缓冲 256/512MiB；复制整对象
 入内存/无限速；版本定向删除不复制；Priority/Role/EOR 回读有损；SSE-C 源不可复制。实施记录见
-`plans/2026-10-17-m6-dataflow.md`。
+`plans/2026-10-17-m6-dataflow.md`。**规格缺口（2026-10-18 记）**：控制台「事件页」「Select 工作台」
+未做（功能规格 M6 行；后端 API 完整）。
 
 ### M7 多站点异步复制（4-6 周）
 
