@@ -69,6 +69,15 @@ pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>
     let now = crate::db::now();
     let recover = db.clone();
     tokio::spawn(async move {
+        // 崩溃遗留：running 超过 300s 或 deadline 已过 → 按一次失败回收
+        match recover
+            .recover_stale_tasks(now - 300, env.max_attempts)
+            .await
+        {
+            Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收崩溃遗留任务"),
+            Err(e) => tracing::warn!(error = %e, "job：启动回收失败"),
+            _ => {}
+        }
         match recover.recover_expired_tasks(now, env.max_attempts).await {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收过期任务"),
             Err(e) => tracing::warn!(error = %e, "job：启动回收失败"),

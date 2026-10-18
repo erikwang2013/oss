@@ -1982,6 +1982,27 @@ mod tests {
         let tasks = db.job_tasks(t, 0, 10).await.unwrap();
         assert_eq!(tasks[0]["state"], "queued");
         assert_eq!(tasks[0]["attempt"], 1);
+        // 清掉退避中的超时作业，避免下一条 claim 抢到它
+        assert!(db.job_set_state(t, "cancel", 40_200).await.unwrap());
+
+        // 启动恢复：running 且 started_at 早于 cutoff（崩溃遗留，deadline 未到）
+        let s = db
+            .create_job(
+                &JobSpec {
+                    kind: "batch".into(),
+                    bucket: "b1".into(),
+                    tasks: vec![task("Copy")],
+                    ..Default::default()
+                },
+                50_000,
+            )
+            .await
+            .unwrap();
+        db.claim_task(50_000, 3600).await.unwrap().unwrap();
+        assert_eq!(db.recover_stale_tasks(50_100, 3).await.unwrap(), 1);
+        let tasks = db.job_tasks(s, 0, 10).await.unwrap();
+        assert_eq!(tasks[0]["state"], "queued");
+        assert_eq!(tasks[0]["attempt"], 1);
     }
 }
 
@@ -2403,6 +2424,30 @@ impl Db {
                 "Timeout",
                 Some("task deadline exceeded"),
                 now,
+                max_attempts,
+            )
+            .await?;
+        }
+        Ok(rows.len())
+    }
+
+    /// 启动恢复：running 且 `started_at < cutoff`（进程崩溃遗留）按一次失败处理。
+    pub async fn recover_stale_tasks(&self, cutoff: i64, max_attempts: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT job_id, task_no FROM job_tasks \
+             WHERE state = 'running' AND started_at IS NOT NULL AND started_at < ?",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        for r in &rows {
+            self.finish_task(
+                r.get("job_id"),
+                r.get("task_no"),
+                false,
+                "Timeout",
+                Some("process restart recovery"),
+                crate::db::now(),
                 max_attempts,
             )
             .await?;
