@@ -7,6 +7,13 @@
 > ③ 断开 WAN 一段时间后恢复：积压全部重放，双向数据一致（逐 ETag 对拍）
 > ④ 两端同时写同一 key 不产生损坏（版本不可变，追加式传播）
 >
+> **v4 修订（2026-10-18，第三轮 R9–R12）**：对账 `create_bucket` 非幂等（先 `bucket_exists`，并发
+> `BucketAlreadyExists` 视为成功——R9）；死信重投 `INSERT OR REPLACE`（R10）；AK/权限 apply 解析到本地
+> admin → dead（R11）；桶删除分类 `NoSuchBucket`=已删继续 / `BucketNotEmpty`=dead 保留行 / 其余 500
+> 重试（R12）；配对 sites 行+cursor+快照**同事务**（P1）；site PUT 响应 `x-amz-version-id` 为空 → 可重试
+> （P2）；启动回填对账包进 apply_ctx 抑制（P3）；触发器 SQL 用完整 `EXISTS(SELECT 1 FROM apply_ctx …)`
+> 形态（P4）。评审：`plan-review-v3.md`。
+>
 > **v3 修订（2026-10-18，按 verifier-m7-plan 第二轮 R1–R8）**：apply 期抑制覆盖 BEFORE；种子落点
 > 与触发器激活条件（仅 `[site]` 且有 peer）；桶对账按最终行/物理空态而非批内 op；快照入本地钟且
 > 只快照本地胜者；admin 排除补全（upsert/触发器/快照）；site 数据发送前校验对端 versioning；
@@ -65,6 +72,8 @@
 
 ## 切片 0：站点身份 + 关系 API + 迁移底座
 
+- **启动回填抑制（P3）**：`AppState::load` 的两轮桶行对账在 `apply_ctx.active=1` 包裹下执行
+  （结束后复位 0；单节点 set_id 恒 0，但兑现「启动维护写不产生站点条目」）。
 - **迁移**：`db.rs::connect` = 0001 → `ensure_columns()`（含 `repl_outbox.target_kind` 探测补列）
   → `raw_sql(0002_m7_site.sql)`（表 `IF NOT EXISTS`；触发器 `DROP+CREATE`；索引 IF NOT EXISTS）
   → `INSERT OR IGNORE site_config`（uuid v4、name="site"、region us-east-1、priority 0、random token 32hex）
@@ -111,9 +120,14 @@
   - policy/permission/user/AK 应用规则同 v2（用户删除按 username 走完整级联：access_keys/permissions/
     uploads.owner_id=NULL/buckets.owner_id=NULL；本地 admin 目标 → dead）；
   - 更新 clock。
-  - 提交后**按最终状态对账**：对批内出现的每个 bucket 实体，若 `buckets` 行存在 → `store.create_bucket`
-    （幂等）；行不存在 → no-op（物理删除已在条目应用时完成）。**不得按批内 op 决策**（R3a）。
-    create 失败 → 500 让对端重试；重试时仍按键存在对账（幂等）。
+  - 提交后**按最终状态对账**：对批内出现的每个 bucket 实体，若 `buckets` 行存在 → 先
+    `store.bucket_exists`，不存在才 `store.create_bucket`（`BucketAlreadyExists` 并发窗口视为成功——
+    R9）；行不存在 → no-op（物理删除已在条目应用时完成）。**不得按批内 op 决策**（R3a）。其余错误
+    → 500 让对端重试。
+  - 桶删除条目分类（R12）：`void`（目录不存在/`NoSuchBucket`）→ 视为已删，继续删行+清表；
+    `BucketNotEmpty` → 不删行+dead；`QuorumUnmet`/IO → 整批 500 重试。
+  - 死信写入用 `INSERT OR REPLACE`（同一 (peer_id,seq) 重投幂等——R10）；AK/权限 apply 解析到本地
+    `is_admin=1` 用户 → dead（R11）。
 - 409 映射：console 建桶/策略等端点捕获 `site replication conflict` → 409 并清理已做物理副作用
   （console 建桶先 DB 行后物理，失败回滚物理——P2）。
 - 测试：触发器矩阵（5 表 × I/U/D × 激活/未激活/apply 期/UPSERT/INSERT OR IGNORE）；本地门控（ABORT/409）；
@@ -124,7 +138,7 @@
 
 - shipping worker（`OSS_SITE_INTERVAL_SECS` 默认 1，0=关）：逐 peer 读 seq > cursor（≤100）→ POST；
   2xx 推进 cursor（dead 越过）；失败记 last_error 下 tick 重试。
-- **配对快照**（`POST /sites` 新建 peer 后，单事务）：对 `users(is_admin=0)`、`access_keys(kind='long-term'
+- **配对快照**（`POST /sites`：**sites 行 + cursor + 快照同事务**，崩溃即整体回滚；P1）：对 `users(is_admin=0)`、`access_keys(kind='long-term'
   且用户非 admin)`、`permissions(用户非 admin)`、`buckets`、`bucket_policies` 中**本地 clock 无行或
   origin=本站**的实体插入 changelog（origin=self，ts=now）**并同步 upsert 本地 clock**（R4；避免回显与
   同时配对分叉）。peer cursor=0 → 首轮全量送达；LWW 幂等。
@@ -147,6 +161,7 @@
 
 - `ReplClient::single(endpoint, ak, sk, region)`；worker 按 `sites` 取参数；peer 不存在 → 丢行 + 警告
   （不改状态）。
+- **发送后置（P2）**：PUT 响应 `x-amz-version-id` 缺失/为 "null" → 按可重试处理（versioning 竞态）。
 - **发送前置**：site 数据/marker 行发送前，对目标桶做签名 `GET /{bucket}?versioning`：
   404 或状态非 Enabled → 可重试；结果按 `(peer,bucket)` 缓存 10s（R6）。仅 site 行生效（P8）。
 - metadata 透传：PUT 带 `content-type` + `x-amz-meta-*`；锁/标签/SSE 不复制（记档）。
