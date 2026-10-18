@@ -51,7 +51,7 @@ pub enum StringOrVec {
 }
 
 impl StringOrVec {
-    fn iter(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         match self {
             StringOrVec::Empty => Box::new(std::iter::empty()),
             StringOrVec::One(s) => Box::new(std::iter::once(s.as_str())),
@@ -95,7 +95,7 @@ pub fn s3_action(op: &str) -> Option<&'static str> {
     })
 }
 
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     // 仅支持尾部 `*`（AWS 的 `s3:Get*` / 前缀资源形态；中缀通配等不做）
     match pattern.strip_suffix('*') {
         Some(prefix) => value.starts_with(prefix),

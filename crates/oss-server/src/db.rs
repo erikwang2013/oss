@@ -99,6 +99,17 @@ pub struct JobSpec {
     pub tasks: Vec<NewJobTask>,
 }
 
+/// 访问点行（M8 S1）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessPointRow {
+    pub name: String,
+    pub bucket: String,
+    pub owner_id: i64,
+    pub policy_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// 领取到的任务（worker 执行输入）。
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
@@ -408,6 +419,111 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    // ---------- M8（S1）：访问点 ----------
+
+    /// 建 AP（同名冲突由调用方按 409 处理）。
+    pub async fn create_access_point(
+        &self,
+        name: &str,
+        bucket: &str,
+        owner_id: i64,
+        policy_json: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(bucket)
+        .bind(owner_id)
+        .bind(policy_json)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_access_point(&self, name: &str) -> Result<Option<AccessPointRow>> {
+        let row = sqlx::query(
+            "SELECT name, bucket, owner_id, policy_json, created_at, updated_at \
+             FROM access_points WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| AccessPointRow {
+            name: r.get("name"),
+            bucket: r.get("bucket"),
+            owner_id: r.get("owner_id"),
+            policy_json: r.get("policy_json"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    /// `bucket=None` → 全部（缓存预加载）；Some → 该桶（级联失效/列举）。
+    pub async fn list_access_points(&self, bucket: Option<&str>) -> Result<Vec<AccessPointRow>> {
+        let rows = match bucket {
+            Some(b) => {
+                sqlx::query(
+                    "SELECT name, bucket, owner_id, policy_json, created_at, updated_at \
+                     FROM access_points WHERE bucket = ? ORDER BY name",
+                )
+                .bind(b)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT name, bucket, owner_id, policy_json, created_at, updated_at \
+                     FROM access_points ORDER BY name",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .iter()
+            .map(|r| AccessPointRow {
+                name: r.get("name"),
+                bucket: r.get("bucket"),
+                owner_id: r.get("owner_id"),
+                policy_json: r.get("policy_json"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    /// 更新 AP 策略（None = 清策略）。
+    pub async fn set_access_point_policy(
+        &self,
+        name: &str,
+        policy_json: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        let n =
+            sqlx::query("UPDATE access_points SET policy_json = ?, updated_at = ? WHERE name = ?")
+                .bind(policy_json)
+                .bind(now)
+                .bind(name)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub async fn delete_access_point(&self, name: &str) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM access_points WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
     }
 
     // ---------- M8（S0）：桶删除的 M8 状态清理 ----------
@@ -2003,6 +2119,58 @@ mod tests {
         let tasks = db.job_tasks(s, 0, 10).await.unwrap();
         assert_eq!(tasks[0]["state"], "queued");
         assert_eq!(tasks[0]["attempt"], 1);
+    }
+
+    /// M8 S1：访问点 CRUD 与按桶列举。
+    #[tokio::test]
+    async fn access_point_crud() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("ap.db").display()
+        ))
+        .await
+        .unwrap();
+        db.create_access_point("ap1", "b1", 7, None, 1)
+            .await
+            .unwrap();
+        db.create_access_point("ap2", "b2", 8, Some(r#"{"Statement":[]}"#), 2)
+            .await
+            .unwrap();
+        let a = db.get_access_point("ap1").await.unwrap().unwrap();
+        assert_eq!(a.bucket, "b1");
+        assert_eq!(a.owner_id, 7);
+        assert!(a.policy_json.is_none());
+        assert_eq!(db.list_access_points(None).await.unwrap().len(), 2);
+        let b1 = db.list_access_points(Some("b1")).await.unwrap();
+        assert_eq!(b1.len(), 1);
+        assert_eq!(b1[0].name, "ap1");
+        // 更新策略 + 清空
+        assert!(
+            db.set_access_point_policy("ap1", Some(r#"{"Statement":[]}"#), 3)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.get_access_point("ap1")
+                .await
+                .unwrap()
+                .unwrap()
+                .policy_json
+                .is_some()
+        );
+        db.set_access_point_policy("ap1", None, 4).await.unwrap();
+        assert!(
+            db.get_access_point("ap1")
+                .await
+                .unwrap()
+                .unwrap()
+                .policy_json
+                .is_none()
+        );
+        assert!(db.delete_access_point("ap2").await.unwrap());
+        assert!(db.get_access_point("ap2").await.unwrap().is_none());
+        assert!(!db.delete_access_point("missing").await.unwrap());
     }
 }
 
