@@ -1,4 +1,4 @@
-# M8 S3 控制面服务 实施计划（工作令 v2）
+# M8 S3 控制面服务 实施计划（工作令 v3.1）
 
 > 设计文档 §M8 / §5.2 / §7.1 / §7.4 / §7.7；功能规格 §13–§17。
 > 基线：`7c4dd73`（M1–M7 完成）。M8 与 M9 解耦，不依赖 openraft。
@@ -11,8 +11,14 @@
 > ⑤ 分层：生命周期转 GLACIER；HEAD 显示存储类；GET 返回 InvalidObjectState；RestoreObject
 >    返回 `x-amz-restore: ongoing-request="true"`；完成后可读；到期回收恢复副本。
 >
-> 计划状态：**v2（2026-10-19）**。v2 按 `/tmp/plan-review-m8.md` 的 B1–B12、C1–C13 逐项修订；
-> 计划作者只读源码、只改本计划，不碰源码、不跑 cargo。
+> 计划状态：**v3.1（2026-10-19）**。v2 按 `/tmp/plan-review-m8.md` 的 B1–B12、C1–C13 逐项修订；
+> v3 按 `/tmp/m8-plan-review-scoped.md` 的 3 条阻断 + N1/N2/N3/N13 追加；v3.1 按
+> `/tmp/m8-plan-review-v3.md` 的唯一阻断 R1 修订（TierGc 契约前移到 S4a）。计划作者只读源码、
+> 只改本计划，不碰源码、不跑 cargo。
+>
+> v3 锚点：`/tmp/m8-plan-review-scoped.md`（NO-GO，阻断 3 条：Transition 配置入口、S2/S3
+> 漏 S4a 依赖、B10 跨 crate partial）。
+> v3.1 锚点：`/tmp/m8-plan-review-v3.md`（NO-GO，仅 R1：S3 隐式依赖 S4b 的 TierGc 契约）。
 
 ## v2 修订清单（逐项收口）
 
@@ -45,6 +51,24 @@
 | C11 | 安全门补 AP 审计/Principal 边界、OLAP 代理/gzip/输入/WASM 指针、Batch 各动作权限、tier 凭据信任面、作业配额。 |
 | C12 | 工期改为 **5–6 周**；给 M8.1 可选裁剪清单；修正测试冲击与性能边界。 |
 | C13 | 删除“已存在 ap 桶”无效声明（`validate_bucket` 要求 3..=63）；STS 限额改为 64 KiB；记录 `S3Route` 顺序、`OssS3::Clone`、`S3AccessContext` 私有、Restore 状态头 override。 |
+
+## v3 修订清单（scoped 复核）
+
+| 项 | 修订落点 |
+|---|---|
+| 阻断 1 | S4b 新增「生命周期配置入口（Transition 规则）」：实现 S3 `Put/GetBucketLifecycleConfiguration` + `DeleteBucketLifecycle`（`LifecycleStore` 注入）、扩展控制台 `LifecycleRuleIn`（`Row` 由 S0 扩）、明确 DB 列/读写/回读、M4 `sweep_once` 只删过期、S4b `sweep_transitions` 读取规则→任务；S6 e2e 先建规则再 force-sweep；补 API/作业/回读/错误矩阵测试。 |
+| 阻断 2 | 切片表：S2 改为依赖 `S1 + S4a`，S3 补 `S4a`；顺序改为 `S0 → S4a →（S1 → S2）与（S4b/S5）`；`x-amz-restore` 交叉测试明确到 S4b；S2 验收锚补归档 403/storage-class 和 restore 头交叉点；S3 Copy 归档源测试依赖 S4a。 |
+| 阻断 3 | S0 的 B10 改写为跨 crate `BucketCleanupSink { clear_bucket_m8, invalidate_ap_cache }`：xl-s3 定义 trait，oss-server `SqlBucketCleanup` 实现并注入 `OssS3`/`SqliteControlBackend`/console/site；路径③ tx 内 SQL、commit 后失效 cache；四路径调用者/注入点/测试文件逐一列出。 |
+| N1 | inner builder **不调用** `set_auth(None)`/`set_access(None)`（s3s 0.17 setter 只收实现，builder 默认 None）；补 unsigned inner 集成测试。 |
+| N2 | `ApRoute` 必须包装/委托现有 `StsRoute`：`is_match` 先 AP 后 STS，`check_access`/`call` 对应委托；只占一个 `set_route` 槽，保留 STS 回归。 |
+| N3 | tier 远端 key 在 `TierBackend` 边界保持 raw；只在 `ReplClient` canonical path 编码一次；不在 oss-server 预编码，避免双重编码；补 raw/保留字符测试。 |
+| N13 | 在 `job_actions.rs` 定义 `BatchMutationHooks { repl: Arc<dyn ReplicationSink>, tier_gc: Arc<dyn TierGcSink> }`，作为 Batch 写/删的唯一副作用入口；不另造第三套 sink。 |
+
+## v3.1 修订清单（scoped 复核 R1）
+
+| 项 | 修订落点 |
+|---|---|
+| R1 | 把 `TierGcSink` trait、`DeleteOutcome` 的 `TierRef` 扩展、`OssS3::with_tier_gc` 前移到 **S4a**（S2/S3 已依赖 S4a）；S4b 只保留 TierGc 实现/worker 与 Transition/Restore。S3 依赖保持 `S0/S2/P0 + S4a`，Delete/清 tier 随 S4a 可用，仅 Restore action 等 S4b；切片表、顺序、验收锚同步。S4a 估时 **2–3 d → 3 d**（多出契约、`DeleteOutcome` 调用点修复与测试）。 |
 
 ## 钉子（防蔓延）
 
@@ -89,16 +113,16 @@ M8 只钉消费契约，**不实现**；契约以 `2026-10-19-s3-gaps-tagging-re
 |---|---|---|---|---|---|
 | S0 | 作业引擎与迁移 | `0003_m8.sql`（全部 M8 表/索引）+ `jobs`/`job_tasks` + 领取/重试/超时/配额/报告 + 控制台作业 API | ③⑤ 底座 | 无 | 4–5 d |
 | S1 | 访问点 | AP 表/CRUD + `ApRoute` + 策略交集 + 内层转发 + 审计/规范化 | ① | 无（S0 的表由 S0 建） | 5–6 d |
-| S2 | Object Lambda | HTTP 变换器（SSRF/输入/限额/条件头）+ WASM feature + GET 语义 | ② | S1 | 4–5 d |
-| S4a | 分层元数据前置 | `storage_class`/`tier` 字段、phase gate、MPU class、`InvalidObjectState` | ⑤ 元数据 | 无 | 2–3 d |
-| S4b | Transition/Restore | tier 后端、Transition 作业、RestoreSink、reaper/对账、TierGc | ⑤ | S0/S4a | 5–6 d |
+| S2 | Object Lambda | HTTP 变换器（SSRF/输入/限额/条件头）+ WASM feature + GET 语义 | ② | `S1 + S4a`（存储类/InvalidObjectState）；`x-amz-restore` 交叉测试待 S4b | 4–5 d |
+| S4a | 分层元数据前置 | `storage_class`/`tier` 字段、phase gate、MPU class、`InvalidObjectState`、`TierGcSink`/`DeleteOutcome::TierRef` | ⑤ 元数据；S2/S3 前置 | 无 | 3 d |
+| S4b | Transition/Restore | 生命周期 Transition 配置/读取 + tier 后端、Transition 作业、RestoreSink、reaper/对账、TierGc 实现 | ⑤ | S0/S4a | 5–6 d |
 | S5 | Inventory | 配置 op + 薄封装 + 日/周生成器 + force-run + manifest/CSV.gz | ④ | S4a（仅元数据） | 5–6 d |
-| S3 | Batch Operations | 清单 + 五种动作 + 报告 + retry-failed + mutation hooks | ③ | S0/S2/P0 外部；Restore 动作需 S4b | 4–5 d |
+| S3 | Batch Operations | 清单 + 五种动作 + 报告 + retry-failed + mutation hooks | ③ | `S0/S2/P0 + S4a`；Delete/清 tier 随 S4a，Restore 动作需 S4b | 4–5 d |
 | S6 | 控制台/Web/E2E/文档 | 新 API 页面、对象页、指标、e2e、文档/图、定稿 | ①–⑤ | 全部 | 5–6 d |
 
-顺序：S0 →（S1 → S2）与（S4a → S4b/S5）并行；S3 在 S0/S2 + P0 gate 后启动（Restore 动作等 S4b）；
-S6 最后。**两人并行约 5–6 周**（设计口径 4–6 周；按集成/e2e/返工取上限）；单人串行约 9–11 周。
-M8 不因 M9 延期。
+顺序：`S0 → S4a →（S1 → S2）与（S4b/S5）`；S3 在 S2 + S4a（+P0 external gate）后启动，
+Delete/清 tier 随 S4a，Restore 动作等 S4b；S6 最后。S4a 3 d 进入关键路径，**两人并行约 5–6 周**（设计口径 4–6 周；
+按集成/e2e/返工取上限）；单人串行约 9–11 周。M8 不因 M9 延期。
 
 **M8.1 可选裁剪（仅当必须压到 4 周）**：WASM；Batch `InvokeLambda`；Inventory version 模式与
 `IsMultipartUploaded`/`IntelligentTieringAccessTier`、Weekly；Batch Copy/Delete/Restore 动作（只留
@@ -108,10 +132,16 @@ ReplaceTags）；Web Jobs/Tiers 页面（保留 API）；AP 桶级 op；多 tier
 ## 执行模型
 
 - 一个切片一个写入者，按文件划界；共享热点 `crates/xl-store/src/meta.rs` 由 S4a 单写，
-  `service.rs` 由 S4a/S4b 串行改；`db.rs`/`0003_m8.sql` 由 S0 单写，后续切片不改编排。
-- 新增文件优先：`crates/xl-s3/src/{ap.rs, olap.rs, inventory.rs, restore.rs}`、
-  `crates/oss-server/src/{jobs.rs, job_actions.rs, access_points_api.rs, tier.rs, inventory.rs,
-  inventory_api.rs, tiers_api.rs}`、`crates/xl-store/src/store/tier.rs`。
+  `service.rs` 的写入顺序为 **S4a → S1（`Clone`/字段）→ S4b（lifecycle/restore 方法）**；
+  S4b 与 S1 并行时先做 `lifecycle.rs`/store/tests，`service.rs` 等 S1 合入后再改。
+  `db.rs`/`0003_m8.sql` 由 S0 单写，后续切片不改编排。
+  `access.rs`/`policy.rs` 由 S1 → S4b 串行：S1 先加 AP op 推导/授权，S4b 再追加
+  lifecycle/restore action，S4b 不得抢在 S1 前改这两个文件。`router.rs`/`state.rs` 同理：
+  S1 先落 outer/inner 与 `ApCache`，S4b 只追加 `with_lifecycle`/`lifecycle` 字段并按同一串行队列合入。
+- 新增文件优先：`crates/xl-s3/src/{ap.rs, olap.rs, inventory.rs, restore.rs, lifecycle.rs,
+  bucket_cleanup.rs}`、`crates/oss-server/src/{jobs.rs, job_actions.rs, access_points_api.rs,
+  lifecycle_store.rs, bucket_cleanup.rs, tier.rs, inventory.rs, inventory_api.rs, tiers_api.rs}`、
+  `crates/xl-store/src/store/tier.rs`。
 - 编译冲击一次性处理：`put_object_stream_with_meta` 新参数（s3-gaps 已加 tags，本计划加
   `storage_class`）触及约 40 个调用点；`ObjectInfo`/`VersionEntry`/`DeleteOutcome` 字面量与 match 由
   编译器驱动补齐；不新增 builder。受影响既有测试必须回归：`classify`/`s3_action`、router
@@ -180,23 +210,61 @@ CREATE INDEX IF NOT EXISTS idx_tier_restores_expiry ON tier_restores(state, expi
 `db.rs`：`const SCHEMA_M8: &str = include_str!("../migrations/0003_m8.sql");`；`connect()` 在
 `ensure_columns()` 与 `SCHEMA_M7` 之后执行 `sqlx::raw_sql(SCHEMA_M8).execute(&pool)`。`jobs` 新列
 （`spec_json/progress/total/succeeded/failed/report_bucket/report_prefix/priority/requested_by/
-parent_job_id/started_at/finished_at`）与 `lifecycle_rules.transition_days/transition_class/
-transition_tier` 继续走 `ensure_columns`。`tier_restores` 无 FK，由 B10 的 `clear_bucket_m8` 清理。
+parent_job_id/started_at/finished_at`）与 `lifecycle_rules.rule_id/expiration_days/
+transition_days/transition_class/transition_tier` 继续走 `ensure_columns`；补列后建
+`CREATE UNIQUE INDEX IF NOT EXISTS idx_lifecycle_rule_id ON lifecycle_rules(bucket, rule_id)
+WHERE rule_id IS NOT NULL`（重复 connect 幂等）。`lifecycle_rules` 旧
+`expire_days` 列保持 NOT NULL：无 Expiration 的新规则写哨兵 `-1`，语义由 `expiration_days` 承担，
+worker 只把 `expiration_days` 非 NULL 或旧 `expire_days>=0` 视为有过期动作。`LifecycleRuleRow`
+同步扩为 `rule_id/prefix/expire_days/expiration_days/transition_days/transition_class/
+transition_tier/enabled/updated_at`，`list_lifecycle_rules/set_lifecycle_rules` 读写全字段；
+S4b 只做 `LifecycleRuleSpec`↔Row 映射，不再改 `db.rs`。扩 Row 会触及
+`tests/lifecycle.rs` 的 Row 字面量，S0 同片机械补齐。`tier_restores` 无 FK，由 B10 的
+`clear_bucket_m8` 清理。
 
 **旧库升级测试**：临时库分别只执行 0001+0002（模拟旧库）与空库，调用 `Db::connect`；断言
 `job_tasks/access_points/olap_configs/inventory_configs/inventory_runs/tier_restores` 与 jobs/
-lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须启动失败（不得吞错）。
+lifecycle 新列、`idx_lifecycle_rule_id` 存在；重复 connect 幂等。`0003` 任一语句失败必须启动
+失败（不得吞错）。
 
-### 桶删除统一清理（B10）
-- 在 `Db` 抽 `clear_bucket_m8(bucket: &str)`（同一 SQL 片段可接受 `&mut SqliteConnection`，
-  供 site apply 在既有事务内调用）；删除 `access_points`（`olap_configs` 由 FK 级联）、
-  `inventory_configs`、`inventory_runs`、`tier_restores`；`jobs` 按审计保留，不按桶删。
-- **四条路径全部调用**：① `xl-s3` S3 `DeleteBucket`（`service.rs::delete_bucket`）；
-  ② `oss-server` 控制台删桶；③ `site.rs::apply_bucket` 的 `e.op == "delete"`（在既有 tx 内）；
-  ④ `cluster_control.rs::control_write` 的 `BucketRowSet { set: None }`。调用后统一
-  `ApCache::invalidate_bucket(bucket)`；site 路径把 cache 传入或删除后全局 reload。
-- 测试：四条路径各删桶 → `access_points/olap_configs/inventory_configs/inventory_runs/
-  tier_restores` 为空；重建同名桶后 AP/Inventory 404（不继承旧策略/endpoint），旧 AP 缓存不再命中。
+### 桶删除统一清理（B10，v3 跨 crate）
+- **契约**：`xl-s3` 新增 `bucket_cleanup.rs`：
+  ```rust
+  #[async_trait]
+  pub trait BucketCleanupSink: Send + Sync {
+      async fn clear_bucket_m8(&self, bucket: &str) -> Result<(), String>;
+      fn invalidate_ap_cache(&self, bucket: &str);
+  }
+  ```
+  `OssS3` 新增 `bucket_cleanup: Option<Arc<dyn BucketCleanupSink>>` 与
+  `with_bucket_cleanup(Option<Arc<dyn BucketCleanupSink>>)`；`#[derive(Clone)]` 共享同一 `Arc`。
+- **实现**：oss-server `SqlBucketCleanup { db: Arc<Db>, ap_cache: Arc<ApCache> }` 实现 trait；
+  `clear_bucket_m8` 调 `Db`，`invalidate_ap_cache` 调 `ApCache::invalidate_bucket`。`Db` 提供：
+  - `clear_bucket_m8(&self, bucket)`：pool 版，供 S3/console/cluster；
+  - `clear_bucket_m8_tx(&mut SqliteConnection, bucket)`：同一 SQL 片段，供 site apply 事务内调用。
+  删除 `access_points`（`olap_configs` 由 FK 级联；FK 未开则显式删）、`inventory_configs`、
+  `inventory_runs`、`tier_restores`、`lifecycle_rules`；`jobs` 按审计保留。`tier_restores`/
+  `lifecycle_rules` 无 FK，必须显式删。
+- **四条路径的调用者/注入点**：
+  ① `xl-s3` `service.rs::delete_bucket`：物理删除成功后（含 site-conflict 幂等成功分支），
+     `bucket_cleanup.clear_bucket_m8` best-effort + 总是 `invalidate_ap_cache`；失败 warn，不改变
+     已完成的物理删除结果。
+  ② `oss-server` 控制台删桶：`AppState.bucket_cleanup` 调 `clear_bucket_m8` + `invalidate_ap_cache`；
+     失败 warn/审计，不把已删物理桶补偿回来。
+  ③ `site.rs::apply_bucket` 的 `e.op == "delete"`：在既有 `tx` 内调
+     `Db::clear_bucket_m8_tx(tx, bucket)`；**cache 失效必须在 `tx.commit()` 成功后**由调用方
+     `state.bucket_cleanup.invalidate_ap_cache(bucket)` 执行；commit 失败不失效 cache。
+  ④ `cluster_control.rs::control_write` 的 `BucketRowSet { set: None }`：`SqliteControlBackend`
+     新增 `cleanup: Option<Arc<dyn BucketCleanupSink>>` 与 `with_bucket_cleanup(...)`；
+     `new(pool)` 保持默认 `None`（既有测试调用点不改）；删 `buckets` 行后调 `clear_bucket_m8` +
+     `invalidate_ap_cache`（best-effort）。生产装配注入 `SqlBucketCleanup`，单测可注入 fake/None。
+- **装配顺序**：`AppState` 先建 `Arc<ApCache>`，再建 `Arc<SqlBucketCleanup>` 并存为
+  `AppState.bucket_cleanup: Arc<dyn BucketCleanupSink>`；`SqliteControlBackend`
+  在 `Store::open` 前用 `with_bucket_cleanup(cleanup.clone())` 注入；router 构造 `OssS3` 时
+  `with_bucket_cleanup(Some(cleanup.clone()))`；console/site 从 `AppState` 取同一实例。
+- 测试文件 `crates/oss-server/tests/m8_bucket_cleanup.rs`：四条路径各删桶 → M8 表为空；重建同名桶后
+  AP/Inventory 404（不继承旧策略/endpoint）；预热的旧 AP 缓存不再命中；路径③提交失败时 cache 不被
+  失效；路径①/④清理失败只 warn 不影响删桶结果。
 
 ### 作业状态与调度
 - 状态：保留 M4 `running|done|error`，新增 `queued|paused|cancelled`；任务 `queued|running|done|failed|
@@ -242,9 +310,13 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 ### 路由与鉴权（关键决策）
 - **外层/内层**：`OssS3` 实现 `Clone`（字段均为 Arc/值；`Acl` 已 Clone）。router 先构造带全部 sink 的
   `outer_s3`，`let inner_s3 = outer_s3.clone()`；outer 用 `s3_builder.set_auth(SigV4Auth...)`、
-  `set_access(acl)`、`set_route(ApRoute)`；inner 用 `S3ServiceBuilder::new(inner_s3)`，
-  `set_auth(None)`、`set_access(None)`、不挂 route，不监听、不出 router。inner 必须共享
+  `set_access(acl)`、`set_route(ApRoute::new(ap, StsRoute::new(...)))`；inner 用
+  `S3ServiceBuilder::new(inner_s3)`，**不调用** `set_auth`/`set_access`（s3s 0.17 的 setter 只接受
+  实现，builder 默认就是 None；N1），不挂 route，不监听、不出 router。inner 必须共享
   events/repl/inventory/restore/tier 全部 sink（否则 AP Put 静默丢事件/复制，B5 测试钉住）。
+- **route 组合（N2）**：s3s builder 只有一个 `set_route` 槽，不能同时挂 `ApRoute` 与既有 `StsRoute`。
+  `ApRoute::new(ap, sts)` 包装 `StsRoute`：`is_match` 先判 `/ap/`，否则委托 STS；`check_access`/
+  `call` 对应委托（AP 命中走 AP，否则走 STS）；STS 回归测试保留。不得为 AP 再建第二个 router。
 - 外层 `custom_route_max_body_size = None`（流式 PUT；该值是全局放宽，所有 custom route 都需自守）；
   STS route 自行 **64 KiB** 读限（`sts.rs` 的 `MAX_BODY`，不是 1 MiB）。`is_match` 先判 AP 前缀，
   否则委托 STS。
@@ -308,7 +380,8 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 - `oss-server/tests/m8_ap.rs`（in-process + SigV4 helper）：CRUD/权限；AP 策略 3×3（身份/桶/AP
   各自 Deny/Allow/无匹配）+ Deny 优先；Copy 目标 `s3:PutObject`；桶级 AP ARN；跨 AP 隔离；
   GET/HEAD/PUT/DELETE/ListV2/MPU/Copy 经 AP；Copy 源/目标双授权；DeleteObjects/UploadPartCopy 501；
-  AP 删除后 404；桶删除级联；未签名/坏签名 403；匿名 403；AP Put 触发事件/复制各一次；坏策略 500。
+  AP 删除后 404；桶删除级联；未签名/坏签名 403；匿名 403；AP Put 触发事件/复制各一次；坏策略 500；
+  inner `S3Service::call` 无签名/无 access 直接 200（N1）；`ApRoute` 未命中时 STS 回归（N2）。
 - 边界：主机别名/匿名/跨账号/多节点不做；AP 策略仅现有方言 + 严格子集；经 AP 的 aws-chunked 尾随
   checksum 不转发 trailing headers（预计算 `x-amz-checksum-*` 可用）；当前路径式，将来虚拟主机需
   重写 Host。
@@ -316,6 +389,10 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 ## S2：Object Lambda（HTTP 变换器 + WASM feature）
 
 ### 配置与依赖
+- **依赖 S1 + S4a**：归档/过期 403 `InvalidObjectState`、`x-amz-storage-class` 来自 S4a；S4a
+  未合并前 S2 只用 `STANDARD` fixture 测非归档路径。对象锁/SSE 头沿用 M4 `ObjectInfo.lock/
+  encryption`（S2 只断言透传，不新增字段）。`x-amz-restore` 只做透传，与 Restore 的交叉联测等
+  S4b（S2 验收锚不把 restore 作为前置）。
 - `olap_configs` 表见 S0；API `GET/PUT /api/v1/access-points/{name}/transform`（owner/admin）。
   `kind=http` 必须有 endpoint；`kind=wasm` 仅 `olap-wasm` feature 时可用；模块 ≤16 MiB 存 BLOB，
   保存编译并记 SHA-256；每 AP 至多一个变换器；AP/桶删除级联。
@@ -362,12 +439,19 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 ### 测试
 - `xl-s3/tests/olap_ops.rs`：mock axum 变换器；请求头/体、输出长度/ETag、Content-Type、条件
   304/412、Range/partNumber 400、超时、超限、5xx、重定向/私网/IPv4-mapped/代理/gzip 炸弹；
-  **经 `/ap/<name>/<key>` 的完整链路**（不只是 service 层）；响应头透传。
+  **经 `/ap/<name>/<key>` 的完整链路**（不只是 service 层）；响应头透传。S4a 落地后加
+  `x-amz-storage-class` 与归档 403 断言；S4b 落地后加 `x-amz-restore` 头交叉断言（不阻塞 S2 收口）。
 - `--features olap-wasm`：WAT 小模块、fuel、内存、坏 ABI、越界指针、超大模块、模块更新缓存失效；
   无 feature 时 wasm 配置 400。
 
 ## S3：Batch Operations（清单 → 任务 → 报告）
 
+- **依赖 `S0/S2/P0 + S4a`**：Copy 源版本读、归档判定与 `PermanentFailure` 用 S4a 的
+  `storage_class`/`InvalidObjectState`；Delete 的 `DeleteOutcome::TierRef`、`TierGcSink` 与
+  `BatchMutationHooks.tier_gc` 也在 S4a（S4b 只提供真实 sink 实现），故 Delete/清 tier 在 S4b
+  前可完整实现，用 S4a 的 archived fixture + fake sink 测。只有 Restore 动作需 S4b 的
+  `RestoreSink`，在 S4b 前该 action 返回创建期 400（能力未启用），不静默降级。归档源 Copy 测试
+  随 S4a 启用；P0 为 external gate。
 - 控制台 `POST /api/v1/jobs`（kind=batch）body：`manifest_bucket/manifest_key/operation/
   target{bucket,prefix}/tags/restore/transform_access_point/report_bucket/report_prefix/priority`。
 - **创建时授权（按创建者身份）**：清单桶 `GetObject`；Copy 源桶及源键 `GetObject`；目标桶按动作
@@ -377,11 +461,16 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
   **逐任务执行前再校验一次**（桶策略/身份可能已变），失败记 PermanentFailure 而不是整作业崩。
 - 清单：CSV `bucket,key[,versionId]`（表头/CRLF/BOM 容忍）；行数 ≤10000、对象 ≤16 MiB、键
   `validate_key`；非法行创建失败 400；创建时快照到 `job_tasks`，之后改清单不影响。
-- 动作（`job_actions.rs` 直接 store/Acl，但必须走 **BatchMutationHooks**，C8）：
+- **BatchMutationHooks（N13）**：在 `job_actions.rs` 定义
+  `struct BatchMutationHooks { repl: Arc<dyn ReplicationSink>, tier_gc: Arc<dyn TierGcSink> }`；
+  Copy 成功后 `hooks.repl.on_write(...)`，Delete 返回的 `TierRef` 交 `hooks.tier_gc.delete(...)`。
+  Batch 不新增第三套 sink、不直连 `ReplClient`/tier 后端；与 `OssS3` 注入同一组 `Arc`
+  （`TierGcSink` 契约/字段来自 S4a，S4b 才有真实实现）。
+- 动作（`job_actions.rs` 直接 store/Acl，副作用统一走上述 hooks，C8）：
   - CopyObject：源版本读；归档/SSE-C 源 → PermanentFailure；目标写 `target.bucket + target.prefix +
     原 key`，标签/元数据按 Copy 语义；写后调用 `ReplicationSink.on_write`；目标覆盖；
   - DeleteObject：逐键 `delete_object_versioned`（带 versionId 定点删）；`DeleteOutcome` 的 tier refs
-    交给 `TierGcSink`；
+    交给 `TierGcSink`（S4a 后可用）；
   - ReplaceTags/PutObjectTagging：整体替换为作业 tags（≤10）；对象不存在 → PermanentFailure；
   - RestoreObject：等价 S3 RestoreObject，走 S4b 的 RestoreSink；已在恢复 → 幂等成功；
   - InvokeLambda：对象 POST 给指定 OLAP HTTP 变换器，2xx 成功，输出丢弃；SSE-C/WASM 拒绝。
@@ -389,19 +478,34 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 - 报告：`taskId,bucket,key,versionId,resultCode,resultString,startTime,endTime`；resultCode
   `Succeeded|PermanentFailure`；ISO8601 UTC；写 `<report_prefix>/<job_id>/results.csv`；取消时未执行
   任务不进报告；重试成功记 Succeeded。
-- 执行器由 `oss-server` 注入同一组 `Arc<dyn ReplSink>`/`Arc<dyn TierGcSink>`（与 `OssS3` 相同），
-  不复制 S3 service 的鉴权/事件逻辑；这是 Batch 与在线写路径一致性的唯一入口。
+- 执行器由 `oss-server` 注入同一组 `Arc<dyn ReplicationSink>`/`Arc<dyn TierGcSink>`（与 `OssS3` 相同；
+  `tier_gc` 契约随 S4a，真实实现随 S4b 注入），不复制 S3 service 的鉴权/事件逻辑；这是 Batch 与
+  在线写路径一致性的唯一入口。
 - 重试：任务指数退避；`retry-failed` 建子作业只含 PermanentFailure，报告独立目录；父报告不变。
 - 测试：1000 行 ReplaceTags；五种动作；CSV 引号/CRLF/BOM/非法行/行数上限；versionId；无权限
   PermanentFailure 不中断；清单/报告桶权限；取消/暂停；retry-failed；复制桶 Copy 入队、归档 Delete
-  清 tier、SSE-C 拒绝；报告列/时间格式；重复执行幂等。
+  清 tier（S4a archived fixture + fake sink）、SSE-C 拒绝；归档源 Copy → PermanentFailure（S4a 后
+  启用）；报告列/时间格式；重复执行幂等。
 
-## S4a：分层元数据前置（独立提交，S5 依赖）
+## S4a：分层元数据前置（独立提交，S2/S3/S5 依赖）
 
 - `Version` 新增（全部 Option，旧 meta 解码 None）：
   - `storage_class: Option<String>`（None=STANDARD）；
   - `tier: Option<TierState>`：`{ backend, key, size, etag, sha256, phase: Archived|Restoring|Restored,
     archived_at, restore_expires_at }`。
+- **TierGc 契约（R1，前移到本片）**：
+  - `xl-store::store::version` 增 `TierRef { backend: String, key: String }`（派生
+    Debug/Clone/PartialEq）；`DeleteOutcome` 改为
+    `Version { version_id, tier: Option<TierRef> }`、`Object { tiers: Vec<TierRef> }`（`Marker`/
+    `NotFound` 不变）。现有 `delete_object_versioned*` 从 `Version.tier` 填 ref；非归档版本为
+    `None`/空；S4b 的归档删除辅助复用同一 `TierRef`。`Version` 增字段、`Object` 由 unit 变
+    struct，所有 match 调用点（xl-store/xl-s3/oss-server 测试）由编译器兜底补 `..`/`Object { .. }`，
+    S4a 同片完成。
+  - `xl-s3` 增 `TierGcSink` trait（`async fn delete(&self, refs: &[TierRef]) -> Result<(), String>`）
+    与 `OssS3::with_tier_gc(Option<Arc<dyn TierGcSink>>)`；本片只落契约与注入，真正 tier DELETE
+    的实现在 S4b（本片可注入 fake/None）。
+  - 测试：`DeleteOutcome` 带/不带 tier ref；`Version` 点名删/`Object` 整键删；`Marker`/`NotFound`
+    无 ref；fake `TierGcSink` 收到 refs、失败不影响删除结果；`OssS3` 未注入时删除仍成功。
 - 可接受类：STANDARD/STANDARD_IA/ONEZONE_IA/INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE/
   REDUCED_REDUNDANCY；未知 400 `InvalidStorageClass`；归档类直写 PUT/MPU/Copy 目标一律 400。
 - `ObjectInfo` 增 `storage_class/tier_phase/restore_expires_at`；`VersionEntry` 增 `storage_class`；
@@ -424,6 +528,82 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 
 ## S4b：存储分层与 Restore
 
+### 生命周期配置入口（Transition 规则，阻断 1）
+- **共享类型与校验（xl-s3）**：`lifecycle.rs` 增
+  `LifecycleRuleSpec { rule_id: Option<String>, prefix: String, expiration_days: Option<u32>,
+  transition_days: Option<u32>, transition_class: Option<String>, transition_tier: Option<String>,
+  enabled: bool }` 与 `validate_rules(&mut Vec<LifecycleRuleSpec>, tier_ids: &[String])`
+  （就地补全缺省 rule_id 与解析后的 transition_tier）。console 与 S3
+  两个入口只用这一份校验；上限沿用 M4 的 100 条（AWS 1000 落档为边界）。约束：每条至少一个
+  Expiration/Transition；`transition_days`/`transition_class` 同有同无；class ∈
+  {STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, GLACIER_IR, DEEP_ARCHIVE}；
+  days 0..=36500；prefix ≤1024 且无控制字符；rule_id ≤255 且桶内唯一；prefix 桶内唯一（沿用 M4
+  主键）。**归档类**（GLACIER/GLACIER_IR/DEEP_ARCHIVE）的 tier 在写入时解析并持久化：显式
+  `transition_tier` 必须存在；为空且恰一个 tier → 取该 id；0 个或多于 1 个 → 400。解析后存实际
+  tier id（之后改 `[[tiers]]` 不静默改目标）。**非归档类**（STANDARD_IA/ONEZONE_IA/
+  INTELLIGENT_TIERING）不需要 tier，`transition_tier` 归一为 NULL（显式给出也忽略）。
+- **S3 API（xl-s3 service）**：实现 `put_bucket_lifecycle_configuration` /
+  `get_bucket_lifecycle_configuration` / `delete_bucket_lifecycle`（覆盖 s3s 默认 501）。
+  `OssS3` 增 `lifecycle: Option<Arc<dyn LifecycleStore>>` 与 `with_lifecycle`；未注入 → 501。
+  `Acl::classify`/`policy::s3_action` 增 `s3:GetLifecycleConfiguration`（Get）与
+  `s3:PutLifecycleConfiguration`（Put/Delete），桶级 ARN；否则新 op fail-closed。PUT 全量替换
+  （AWS 语义），GET 无配置 → 404 `NoSuchLifecycleConfiguration`，DELETE 幂等 204。
+  `LifecycleError` 映射：`NoSuchBucket→404 NoSuchBucket`、`NoSuchConfiguration→404
+  NoSuchLifecycleConfiguration`、`Invalid→400 InvalidRequest`、`NotImplemented→501`、
+  `Internal→500 InternalError`。
+- **解析/回读**：`PutBucketLifecycleConfigurationInput.lifecycle_configuration.rules` 必须存在且
+  1..=100；`Rule.id` 缺省生成 `rule-<序号>` 并持久化；`status` 仅 Enabled/Disabled ↔ `enabled`。
+  Filter 仅接受空或 `filter.prefix`；legacy `rule.prefix` 等价映射，二者同时出现且不一致 → 400；
+  `filter.tag`/`object_size_*`/`and` → 501 `NotImplemented`。Expiration 仅 `days`（映射
+  `expiration_days`）；`date`/`expired_object_delete_marker` → 501。Transitions 仅 1 条且只认
+  `days`+`storage_class`；`date`、多条、`noncurrent_version_*`、`abort_incomplete_multipart_upload`
+  → 501。**先拒绝不支持的字段（501），再校验至少一个受支持动作（否则 400）**，避免把 501 误报成
+  400。回读按 `(prefix, rule_id)` 稳定排序，字段与规范化输入一致（writer 只输出 filter.prefix）。
+- **存储（S0 列 + 统一读写）**：`LifecycleStore` trait（xl-s3）：
+  ```rust
+  pub enum LifecycleError { NoSuchBucket, NoSuchConfiguration, Invalid(String),
+      NotImplemented(String), Internal(String) }
+  #[async_trait]
+  pub trait LifecycleStore: Send + Sync {
+      async fn get_rules(&self, bucket: &str)
+          -> Result<Option<Vec<LifecycleRuleSpec>>, LifecycleError>;
+      async fn put_rules(&self, bucket: &str, rules: &[LifecycleRuleSpec])
+          -> Result<(), LifecycleError>;
+      async fn delete_rules(&self, bucket: &str) -> Result<(), LifecycleError>;
+  }
+  ```
+  `SqlLifecycleStore { db: Arc<Db>, tier_ids: Arc<Vec<String>> }`（tier 配置启动期固定；
+  oss-server）实现：`put_rules` 先 clone 成 `Vec` 再调 `validate_rules`，写规范化后的规则
+  （两个入口都无法绕过）；`db.bucket_exists` 决定 404；
+  `Db::list_lifecycle_rules/set_lifecycle_rules`（S0 扩展）已是 `rule_id, prefix, expire_days
+  (=expiration 或哨兵 -1), expiration_days, transition_days, transition_class, transition_tier,
+  enabled, updated_at`；S4b 只做 Spec↔Row 映射；`set_lifecycle_rules` 由 S0 保持单事务
+  `DELETE + INSERT`；
+  旧 M4 行（`expiration_days IS NULL AND expire_days>=0`）读作 `expiration_days=expire_days`；
+  `rule_id IS NULL` 的旧行回读时按 `(prefix)` 序号合成 `rule-<n>`（只读合成，不回写）。
+  `AppState` 增 `lifecycle: Arc<dyn LifecycleStore>`；S3 outer/inner 与 console 共用同一实例注入；
+  console `LifecycleRuleIn` 增 `rule_id/transition_days/transition_class/transition_tier`，且
+  `expire_days` 改为可空（缺省=无过期），PUT/GET 走同一 `LifecycleStore`，不再直接调 `Db`。
+- **规则读取者**：M4 `sweep_once` 只处理 `expiration_days` 非空（或旧 `expire_days>=0`）且 Enabled
+  的规则，Transition-only 规则必须跳过；S4b `sweep_transitions` 遍历 `Db::list_bucket_rows`，逐桶
+  `LifecycleStore::get_rules`，只取 `transition_days` 非空的 Enabled 规则，按 `transition_days`
+  与对象 LastModified 判到期，用持久化的 class/tier 入队（任务 payload 固化 class/tier，执行期
+  不回读规则；入队后改规则不影响在队任务），去重键同 C7。console GET 与 S3
+  `GetBucketLifecycleConfiguration` 必须返回同一组规则。
+- **错误矩阵**：桶不存在（三个 op）→ 404 NoSuchBucket；GET 无规则 → 404
+  NoSuchLifecycleConfiguration；config 缺失/空 rules → 400 MalformedXML；>100 条 → 400
+  InvalidRequest；rule_id/prefix 重复、既无 expiration 也无 transition、prefix/filter 冲突、
+  归档类 tier 缺失或歧义 → 400 InvalidRequest；非法 class → 400 InvalidStorageClass；days 越界/ID 超长 →
+  400 InvalidArgument；不支持的 Filter/Tag/Size/And、Expiration.date、Transition.date、多条
+  Transition、noncurrent/abort/expired-marker → 501 NotImplemented。Disabled 规则可写可读但不被
+  任何 sweep 选中；DELETE 后 GET → 404。
+- **测试**：`xl-s3/tests/lifecycle_ops.rs`（PUT/GET/DELETE 往返、filter/expiry/transition 解析、
+  归档类无 tier 400/非归档类无 tier 可写、disabled、错误矩阵、未注入 store 501、
+  `classify`/`policy` 两个新 action）；`oss-server/tests/
+  m8_lifecycle_api.rs`（console 与 S3 经同一 DB 互读、旧 M4 哨兵行回读、PUT 全量替换、
+  rule→`sweep_transitions` 任务与去重、`sweep_once` 跳过 transition-only、删桶清规则；
+  `tests/lifecycle.rs` Row 字面量由 S0 补齐）；e2e 建规则后 force-sweep。
+
 ### tier 后端与配置
 - `[[tiers]]` 静态配置（模型同 `[[remotes]]`）：`id, endpoint, bucket, access_key, secret_key,
   region`；v1 仅远端 S3 兼容端点，https 启动期拒绝（TLS 后置）。
@@ -431,10 +611,11 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
   `S3TierBackend` 在 `ReplClient` 上扩展 `get_object`/`head_object`（SigV4+hyper，流式后续）。
   远端 key `<tier_id>/<bucket>/<version_id>/<percent-encoded key>`；PUT 用 **Content-MD5 与 SHA-256**
   双重校验，GET 校验 size/SHA-256；远端 ETag 存入 `tier.etag` 但**不与源 multipart ETag 比较**。
-- Transition 规则：`lifecycle_rules.transition_days/transition_class/transition_tier`（S0 补列）。
-  `transition_tier` 为空且 `[[tiers]]` 恰一个时取之；多个且未指定 → 配置/规则校验 400；
-  一条规则一个目标类。sweep `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）或 admin
-  `POST /api/v1/tiers/sweep` force；单次最多 10000 个对象。
+- Transition 规则的存储/配置/回读见上节；sweep `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）或
+  admin `POST /api/v1/tiers/sweep` force；单次最多 10000 个对象。
+- **tier key 编码（N3）**：Transition 作业从 store 取到的 key 保持 raw 传给 `TierBackend`；
+  `S3TierBackend` 调 `ReplClient` 时由 canonical path 统一编码一次，oss-server 不得预编码。
+  测试含空格、`+`、`%2F`、中文键的 PUT/GET 往返（远端 key 唯一且可读回）。
 - **去重（C7）**：任务 `dedupe_key = tier:{bucket}:{key}:{version_id}:{class}`；
   `INSERT OR IGNORE` 唯一索引；终态清空 `dedupe_key`；`archive_version` 对已 Archived 同 class
   幂等成功（不同 class 400）。sweep 跳过 `replication_status ∈ {PENDING, FAILED}`，下轮重试。
@@ -465,11 +646,10 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
   `tier.phase=Restoring` 但无 row/无 job 的版本（`scan_tier_pending`，元数据树 O(N) 一次）→ 重置
   Archived 并重排恢复；读/HEAD 发现 `Version.tier.restore_expires_at<=now` 时即使行缺失也按过期
   处理并 best-effort 删行。读路径过期一律 403。
-- **删除回收**：`DeleteOutcome` 扩展携带 `TierRef { backend, key }`：
-  `Version { version_id, tier: Option<TierRef> }`、`Object { tiers: Vec<TierRef> }`；`delete_archived`
-  返回 ref；S3 删除、M4 生命周期删除、Batch Delete 都交给 `TierGcSink` best-effort DELETE，失败只
-  记日志（孤儿，无 GC）。`xl-s3` 增 `TierGcSink` trait 与 `OssS3::with_tier_gc`、
-  `OssS3::with_restore`；router 的 outer/inner 都注入同一组 sink。
+- **删除回收**：`DeleteOutcome`/`TierRef`/`TierGcSink`/`OssS3::with_tier_gc` 已在 S4a；本片实现
+  `S3TierGc`（基于 `TierBackend` 的 DELETE）并注入 router outer/inner。`delete_archived` 返回
+  `TierRef`；S3 删除、M4 生命周期删除、Batch Delete 都交给该 sink best-effort DELETE，失败只记
+  日志（孤儿，无 GC）。`OssS3::with_restore` 仍在本片。
 - 事件：白名单增 `s3:LifecycleTransition`、`s3:ObjectRestore:Post`、`s3:ObjectRestore:Completed`；
   Restore 受理发 Post，完成发 Completed；`RestoreObjectOutput` 无状态字段，必须用
   `S3Response.status/headers` 覆盖 202 + `x-amz-restore`；GET/HEAD 可用 s3s DTO 的 `restore` 字段
@@ -516,7 +696,8 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 ## S6：控制台/Web/E2E/文档
 
 - API 汇总：`access_points_api.rs`（S1 CRUD/策略 + S2 transform）、`jobs_api.rs`（S0 + Batch 创建）、
-  `inventory_api.rs`（S5 + force-run）、`tiers_api.rs`（`GET /tiers` 健康、`POST /tiers/sweep` admin）。
+  `inventory_api.rs`（S5 + force-run）、`tiers_api.rs`（`GET /tiers` 健康、`POST /tiers/sweep` admin）；
+  `console.rs` lifecycle 扩字段并改用 `LifecycleStore`（S4b）。
 - 权限：AP/inventory owner/admin；`GET /jobs` admin-only；job 详情/控制 creator/admin；tiers admin。
   审计：AP CRUD/策略、job 创建/取消、transform 配置、force-run、force-sweep 写 `audit_log`。
 - Web：`pages/AccessPoints.tsx`、`pages/Jobs.tsx`、`pages/Tiers.tsx`；`Objects.tsx` 增标签/
@@ -534,8 +715,11 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
      → 子 job `total=1,succeeded=1`、子报告 1 行、父报告不变；
   3. Inventory：配置 → `POST .../run` force-run → 拉 manifest/CSV.gz → gunzip、列与 fileSchema
      一致、files[0].md5/size 一致、对象数/版本数/marker 正确；
-  4. 分层：mock tier（本地 axum S3 stub 或第二 oss 实例）+ `POST /tiers/sweep` force → HEAD 类 →
-     GET 403 → Restore 202/完成可读；到期回收由 `m8_tier.rs` 用 past expiry 直接调 reaper；
+  4. 分层：mock tier（本地 axum S3 stub 或第二 oss 实例）→
+     `aws s3api put-bucket-lifecycle-configuration` 建 Transition 规则（GLACIER、days=0）→
+     `get-bucket-lifecycle-configuration` 断言回读 → `POST /tiers/sweep` force → HEAD 类 →
+     GET 403 → Restore 202/完成可读 → `delete-bucket-lifecycle` 后 GET 404；到期回收由
+     `m8_tier.rs` 用 past expiry 直接调 reaper；
   5. 回归：标准 S3、STS、M4 lifecycle、M6/M7 复制。
 - 文档：README「M8 控制面」；设计 §M8 落地状态/偏差（M6 重试不迁移、HEAD 不变换、单节点、
   仅远端 tier、直写归档拒绝、Batch 不发通知、Inventory 可选列限制）；功能规格 §14–§16 注记；
@@ -557,6 +741,9 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 5. **Tier**：静态凭据明文/http 与 `[[remotes]]` 同信任面（仅内网/管理员配置）；PUT Content-MD5+
    SHA-256，GET size/SHA；不做公网 SSRF 检查（内网冷存预期）。
 6. **作业**：spec 不可变；控制限 creator/admin；配额；审计；错误文案不含凭据。
+7. **生命周期配置**：S3 与 console 共用 `validate_rules`；S3 op 走 `s3:Get/PutLifecycleConfiguration`
+   桶级授权，console owner/admin；PUT 全量替换单事务；Filter/date/多 Transition/noncurrent 一律 501；
+   tier 在写入时解析并持久化，避免配置漂移。
 
 ## 已知边界（在案）
 
@@ -570,7 +757,9 @@ lifecycle 新列存在；重复 connect 幂等。`0003` 任一语句失败必须
 6. Inventory 全量扫描、单数据文件、不做 Parquet/hive/跨账号/增量；版本可选字段可能 N+1 head；
    `IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持。
 7. 分层 v1 仅远端 S3 tier；全内存搬运（1 GiB）；SSE 不转；存储类不随复制；直写归档拒绝；
-   每规则单目标类；Transition 单次 1 万对象。
+   每规则单目标类；Transition 单次 1 万对象。S3 生命周期配置 v1 上限 100 条、Filter 仅 prefix、
+   Expiration/Transition 仅 days；date/tag/size/And/noncurrent/abort 一律 501；每桶每 prefix
+   一条规则（沿用 M4 主键）。
 8. 归档对象与同版本新二进制绑定；旧二进制读已回收分片会失败；启用 Transition 前全量升级。
 9. tier 远端删除 best-effort，失败留孤儿；无 GC/对账；恢复到期精度 300s；restore 行/版本对账
    只处理有 row 的恢复。
@@ -599,11 +788,15 @@ Web `npm test` + `npm run build`；E2E `tests/e2e_m8.sh` 与既有 `e2e_s3.sh`/`
 - ① `m8_ap.rs`：AP 策略矩阵 + canonical key + Copy 目标 `s3:PutObject` + 桶级 ARN + Deny 优先 +
   AP Put 事件/复制；完整路径 `olap_ops.rs`。
 - ② `olap_ops.rs`：经 AP 的 mock HTTP 变换器，输出字节、Content-Length、ETag、Range 400、条件
-  304/412、输入/gzip/代理/响应头。
-- ③ `e2e_m8.sh`：1000 行 ReplaceTags + 1 失败 + retry-failed + 报告断言；P0 gate 之后执行。
+  304/412、输入/gzip/代理/响应头；`x-amz-storage-class`/归档 403 在 S4a 后、`x-amz-restore` 在
+  S4b 后补交叉断言。
+- ③ `e2e_m8.sh`：1000 行 ReplaceTags + 1 失败 + retry-failed + 报告断言；P0 gate 之后执行；
+  归档源 Copy PermanentFailure、Delete/清 tier 随 S4a（fake sink），Restore 动作随 S4b。
 - ④ Inventory：Rust 注入 now 的 Daily/Weekly due/去重 + e2e force-run 的 manifest/CSV/MD5/列断言。
-- ⑤ `m8_tier.rs` + e2e force-sweep：归档/HEAD 类/GET 403/Restore 202/409/完成/过期 403/回收；tier 5xx
-  重试耗尽、meta 失败、重启对账。
+- ⑤ `m8_tier.rs` + `m8_lifecycle_api.rs` + e2e force-sweep：归档/HEAD 类/GET 403/Restore
+  202/409/完成/过期 403/回收；tier 5xx 重试耗尽、meta 失败、重启对账；S4a 的
+  `DeleteOutcome` tier refs + `TierGcSink` 注入/未注入空删；S3 `Put/GetBucketLifecycleConfiguration`
+  + `DeleteBucketLifecycle` 往返/错误矩阵/rule→sweep 任务去重，e2e 先建规则再 force-sweep。
 
 ## 定稿（待）
 
