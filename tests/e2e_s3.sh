@@ -17,8 +17,10 @@ POLICY2_BUCKET="pol2-$(date +%s)"
 # M5 段（步骤 18）的两个桶：SSE 与对象锁
 SSE_BUCKET="sse-$(date +%s)"
 LOCK_BUCKET="lock-$(date +%s)"
+# M8 前置（步骤 20）：对象标签 + CopyObject DIRECTIVE
+TAG_BUCKET="tag-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET" "$SSE_BUCKET" "$LOCK_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
+trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET" "$SSE_BUCKET" "$LOCK_BUCKET" "$TAG_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
@@ -694,6 +696,8 @@ fi
 echo ""
 
 echo "== 19. M6：S3 Select / Kafka / 桶复制 =="
+# 步骤 14 已删 $BUCKET；Select 段复用同名桶，这里重建（EXIT trap 会再清理）
+aws_s3 mb "s3://$BUCKET" >/dev/null
 # 19a. Select：CSV + JSON LINES + --request-progress 帧可解析 + 边界 400
 printf 'a,10\na,20\nb,30\n' > "$WORK/sel.csv"
 aws_s3 cp "$WORK/sel.csv" "s3://$BUCKET/sel.csv" >/dev/null
@@ -755,4 +759,118 @@ else
 fi
 
 echo ""
-echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计 / M5 SSE+对象锁+STS / M6 Select+Kafka+复制）"
+echo "== 20. M8 前置：对象标签 + CopyObject DIRECTIVE =="
+aws_s3 mb "s3://$TAG_BUCKET"
+aws --endpoint-url "$ENDPOINT" s3api put-bucket-versioning --bucket "$TAG_BUCKET" \
+  --versioning-configuration Status=Enabled >/dev/null
+printf 'tag-source' > "$WORK/tag.src"
+
+# 20a. PutObject x-amz-tagging（URL 解码）+ GET/HEAD tag-count
+aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$TAG_BUCKET" --key src \
+  --body "$WORK/tag.src" --content-type text/plain --metadata m1=v1 \
+  --tagging "env=prod&team=%E4%B8%AD%E6%96%87" >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" --key src \
+  > "$WORK/tags.json"
+python3 - "$WORK/tags.json" <<'PY'
+import json,sys
+ts={t['Key']:t['Value'] for t in json.load(open(sys.argv[1]))['TagSet']}
+assert ts == {'env':'prod','team':'中文'}, ts
+print("   PutObject tagging URL 解码 ✓", ts)
+PY
+TC=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$TAG_BUCKET" --key src \
+  --query TagCount --output text)
+[ "$TC" = "2" ] || { echo "HEAD TagCount 应为 2（实际 $TC）"; exit 1; }
+
+# 20b. Put/DeleteObjectTagging + 标签写不新增版本
+aws --endpoint-url "$ENDPOINT" s3api put-object-tagging --bucket "$TAG_BUCKET" --key src \
+  --tagging 'TagSet=[{Key=a,Value=1},{Key=b,Value=2}]' >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" --key src \
+  --query 'TagSet[].Key' --output text | grep -q "a" \
+  || { echo "PutObjectTagging 未生效"; exit 1; }
+NV_BEFORE=$(aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$TAG_BUCKET" \
+  --prefix src --query 'length(Versions)' --output text)
+aws --endpoint-url "$ENDPOINT" s3api delete-object-tagging --bucket "$TAG_BUCKET" --key src >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" --key src \
+  --query 'length(TagSet)' --output text | grep -qx 0 \
+  || { echo "DeleteObjectTagging 未清空"; exit 1; }
+NV_AFTER=$(aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$TAG_BUCKET" \
+  --prefix src --query 'length(Versions)' --output text)
+[ "$NV_BEFORE" = "$NV_AFTER" ] || { echo "标签写新增了版本：$NV_BEFORE → $NV_AFTER"; exit 1; }
+
+# 20c. 版本隔离：旧版本打标签不影响默认版本
+V1=$(aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$TAG_BUCKET" --key ver \
+  --body "$WORK/tag.src" --tagging "v=1" --query VersionId --output text)
+aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$TAG_BUCKET" --key ver \
+  --body "$WORK/tag.src" --tagging "v=2" >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api put-object-tagging --bucket "$TAG_BUCKET" --key ver \
+  --version-id "$V1" --tagging 'TagSet=[{Key=v,Value=old}]' >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" --key ver \
+  --query 'TagSet[0].Value' --output text | grep -qx "2" \
+  || { echo "旧版本标签写污染了默认版本"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" --key ver \
+  --version-id "$V1" --query 'TagSet[0].Value' --output text | grep -qx "old" \
+  || { echo "旧版本标签未生效"; exit 1; }
+
+# 20d. Copy 两轴：默认全继承；REPLACE 轴独立
+aws --endpoint-url "$ENDPOINT" s3api put-object-tagging --bucket "$TAG_BUCKET" --key src \
+  --tagging 'TagSet=[{Key=a,Value=1}]' >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$TAG_BUCKET" --key cp-default \
+  --copy-source "$TAG_BUCKET/src" >/dev/null
+CP_META=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$TAG_BUCKET" --key cp-default \
+  --query 'Metadata.m1' --output text)
+[ "$CP_META" = "v1" ] || { echo "默认 copy 未继承 metadata（$CP_META）"; exit 1; }
+CP_TAGS=$(aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" \
+  --key cp-default --query 'TagSet[0].Key' --output text)
+[ "$CP_TAGS" = "a" ] || { echo "默认 copy 未继承标签"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$TAG_BUCKET" --key cp-md \
+  --copy-source "$TAG_BUCKET/src" --metadata-directive REPLACE \
+  --content-type text/x-t >/dev/null
+MT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$TAG_BUCKET" --key cp-md \
+  --query 'length(Metadata)' --output text)
+CT=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$TAG_BUCKET" --key cp-md \
+  --query ContentType --output text)
+[ "$MT" = "0" ] && [ "$CT" = "text/x-t" ] || { echo "metadata REPLACE 轴不符（$CT / $MT）"; exit 1; }
+CP_TAGS=$(aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" \
+  --key cp-md --query 'TagSet[0].Key' --output text)
+[ "$CP_TAGS" = "a" ] || { echo "metadata REPLACE 不应影响标签轴"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$TAG_BUCKET" --key cp-tags \
+  --copy-source "$TAG_BUCKET/src" --tagging-directive REPLACE --tagging "x=9" >/dev/null
+CP_TAGS=$(aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" \
+  --key cp-tags --query 'TagSet[0].Key' --output text)
+[ "$CP_TAGS" = "x" ] || { echo "tagging REPLACE 未生效"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$TAG_BUCKET" --key cp-clear \
+  --copy-source "$TAG_BUCKET/src" --tagging-directive REPLACE >/dev/null
+CP_TAGS=$(aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" \
+  --key cp-clear --query 'length(TagSet)' --output text)
+[ "$CP_TAGS" = "0" ] || { echo "tagging REPLACE 缺省应清空"; exit 1; }
+
+# 20e. copy-to-self：仅 metadata REPLACE 放行（版本桶出新版本）
+V_SELF=$(aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$TAG_BUCKET" --key self \
+  --body "$WORK/tag.src" --tagging "s=1" --query VersionId --output text)
+aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$TAG_BUCKET" --key self \
+  --copy-source "$TAG_BUCKET/self" --metadata-directive REPLACE >/dev/null
+V_SELF2=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$TAG_BUCKET" --key self \
+  --query VersionId --output text)
+[ "$V_SELF" != "$V_SELF2" ] || { echo "copy-to-self 未产生新版本"; exit 1; }
+if aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$TAG_BUCKET" --key self \
+  --copy-source "$TAG_BUCKET/self" >/dev/null 2>&1; then
+  echo "copy-to-self 无 REPLACE 竟成功（应 400）"; exit 1
+else
+  echo "   copy-to-self 无 REPLACE 拒 ✓"
+fi
+
+# 20f. 非法标签矩阵 → 均非零退出
+K129=$(printf 'k%.0s' $(seq 1 129))
+MUST11=""
+for i in $(seq 0 10); do MUST11="${MUST11}t${i}=v&"; done
+MUST11=${MUST11%&}
+for bad in "$MUST11" "a=1&a=2" "${K129}=v" "a=%0A"; do
+  if aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$TAG_BUCKET" --key bad \
+    --body "$WORK/tag.src" --tagging "$bad" >/dev/null 2>&1; then
+    echo "非法标签竟成功：${bad:0:40}"; exit 1
+  fi
+done
+echo "   非法标签矩阵拒绝 ✓"
+echo ""
+
+echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计 / M5 SSE+对象锁+STS / M6 Select+Kafka+复制 / M8 前置标签+Copy 指令）"

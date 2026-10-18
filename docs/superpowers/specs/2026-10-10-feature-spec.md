@@ -241,7 +241,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **DeleteObjects（批量）**：一次最多 1000 个；部分失败时 `Errors` 数组列出失败项，成功的仍在 `Deleted` 里。**不做事务回滚**。
 
-### 3.5 CopyObject —— `M1`（COPY 指令：M2a 已落地；REPLACE 待后续）
+### 3.5 CopyObject —— `M1`（COPY 指令 M2a 落地；REPLACE 两轴 2026-10-19 落地）
 
 **行为**：`x-amz-copy-source` 形如 `/{src-bucket}/{src-key}`（可带 `?versionId=`）。M1 实现为「读出源字节 → 写入目标」（真实复制）；M2 起改为**服务端分片级复制**（不经过内存）。
 
@@ -265,7 +265,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **边界**：未完成的上传占用磁盘；`clean` 命令按 mtime 回收（默认 7 天）。`CompleteMultipartUpload` 是所有上传中唯一**非原子可见**的操作：拼接期间对象不可见，拼接完成后一次性提交 `xl.meta`。
 
-### 3.7 对象标签与元数据 —— `M2`/`M4`
+### 3.7 对象标签与元数据 —— `M2`/`M4`（标签 2026-10-19 落地；边界：不跨界复制、MPU/控制台标签未做）
 
 `PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`（M4）—— 最多 10 个标签，键 ≤ 128 字符，值 ≤ 256 字符。`x-amz-meta-*` 用户元数据（**M2a 已落地**）—— 总计 ≤ 2 KiB（大小写归一化行为以 s3s 实测为准）。
 
