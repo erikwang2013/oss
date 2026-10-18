@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, PartRef, Version, XlMeta};
 
-use super::read::check_read_sse_c;
+use super::read::{check_read_sse_c, check_tier_readable};
 use super::{ObjectInfo, Store};
 
 /// M5 切片 4（B1/B2 复验补）：该版本的「不可删原因」（**不含 bypass 语义**——整链场景
@@ -84,10 +84,27 @@ pub enum DeleteOutcome {
     NotFound,
     /// 版本控制桶无版本号删除：追加了 delete marker
     Marker { version_id: String },
-    /// 点名删除了某版本（含 marker）
-    Version { version_id: String },
-    /// 非版本桶：整键删除（M2b 语义）
-    Object,
+    /// 点名删除了某版本（含 marker）；归档版本带回远端引用（S4a/S4b 清 tier 用）
+    Version {
+        version_id: String,
+        tier: Option<TierRef>,
+    },
+    /// 非版本桶：整键删除（M2b 语义）；归档版本带回远端引用
+    Object { tiers: Vec<TierRef> },
+}
+
+/// M8 S4a：被删归档版本的远端引用（`backend`/`key` 原样转交 TierGcSink）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierRef {
+    pub backend: String,
+    pub key: String,
+}
+
+fn tier_ref(v: &meta::Version) -> Option<TierRef> {
+    v.tier.as_ref().map(|t| TierRef {
+        backend: t.backend.clone(),
+        key: t.key.clone(),
+    })
 }
 
 /// 版本枚举条目（ListObjectVersions 行）。
@@ -100,6 +117,8 @@ pub struct VersionEntry {
     pub size: u64,
     pub etag: String,
     pub mod_time_nanos: i64,
+    /// M8 S4a：存储类（None = STANDARD）。
+    pub storage_class: Option<String>,
 }
 
 /// [`Store::list_object_versions`] 的单页结果。
@@ -154,8 +173,9 @@ impl Store {
                 if let Some(why) = chain_active_lock(&old) {
                     return Err(Error::ObjectLocked(format!("键存在锁定版本：{why}")));
                 }
+                let tiers = old.versions.iter().filter_map(tier_ref).collect();
                 self.purge_key(bucket, key).await?;
-                return Ok(DeleteOutcome::Object);
+                return Ok(DeleteOutcome::Object { tiers });
             }
             // 追加 delete marker（无数据目录；链尾哨兵）
             let old = self.read_meta(bucket, key).await?; // 损坏 fail-closed（同写路径口径）
@@ -185,6 +205,8 @@ impl Store {
                 is_latest: None,
                 replication_status: None,
                 tags: None,
+                storage_class: None,
+                tier: None,
                 // NTP 回拨收口：marker 也是新写版本，epoch 同样单调 +1
                 epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
                 encryption: None, // marker 无数据，恒无加密记录
@@ -215,6 +237,7 @@ impl Store {
             return Ok(DeleteOutcome::NotFound); // 幂等空删：版本不存在（不发事件）
         };
         let removed = old.versions[pos].clone();
+        let removed_tier = tier_ref(&removed);
         // M5 切片 4（L4）：对象锁守卫——legal hold / COMPLIANCE 未到期一律拒（含 admin）；
         // GOVERNANCE 未到期仅 bypass 放行；到期（until <= now）放行。delete-marker 路径不受锁约束。
         check_lock_delete(&removed, bypass_governance)?;
@@ -222,7 +245,10 @@ impl Store {
         m.versions.remove(pos);
         if m.versions.is_empty() {
             self.purge_key(bucket, key).await?;
-            return Ok(DeleteOutcome::Version { version_id: vid });
+            return Ok(DeleteOutcome::Version {
+                version_id: vid,
+                tier: removed_tier,
+            });
         }
         m.refresh_latest_flags();
         // rank 防倒退（verifier #2）：链重写不得让 max_epoch 下降——否则掉线盘/半翻盘的旧链
@@ -238,7 +264,10 @@ impl Store {
             self.recycle_version_dir(bucket, key, &removed.part.uuid)
                 .await;
         }
-        Ok(DeleteOutcome::Version { version_id: vid })
+        Ok(DeleteOutcome::Version {
+            version_id: vid,
+            tier: removed_tier,
+        })
     }
 
     /// 指定版本目录 → 各盘 trash（本地 rename + 远端 RPC；best-effort——meta 已不引用）。
@@ -651,6 +680,7 @@ impl Store {
         range: Option<StdRange<u64>>,
         sse_c: Option<&crypto::SseCKey>,
     ) -> Result<Option<Bytes>> {
+        check_tier_readable(v, bucket, key)?;
         if let Some(inline) = &v.inline {
             // M5 切片 2：加密 inline 落盘态 = 密文 C = c_len(P)（B4 期望长度落点之一）
             let expected = match &v.encryption {
@@ -808,6 +838,7 @@ impl Store {
                     size: v.size,
                     etag: v.etag.clone(),
                     mod_time_nanos: v.mod_time_nanos,
+                    storage_class: v.storage_class.clone(),
                 });
             }
         }
@@ -836,5 +867,8 @@ fn version_info(key: &str, v: &Version) -> ObjectInfo {
         lock: v.lock.clone(),
         replication_status: v.replication_status.clone(),
         tags: v.tags.clone().unwrap_or_default(),
+        storage_class: v.storage_class.clone(),
+        tier_phase: v.tier.as_ref().map(|t| t.phase),
+        restore_expires_at: v.tier.as_ref().and_then(|t| t.restore_expires_at),
     }
 }

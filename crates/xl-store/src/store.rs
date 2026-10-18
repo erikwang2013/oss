@@ -28,7 +28,7 @@ mod read;
 mod rebalance;
 mod version;
 pub use rebalance::RebalanceReport;
-pub use version::{DeleteOutcome, VersionEntry, VersionList};
+pub use version::{DeleteOutcome, TierRef, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
 pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec};
@@ -109,6 +109,12 @@ pub struct ObjectInfo {
     pub replication_status: Option<String>,
     /// M8 前置：对象标签（空 = 无标签；顺序同写入端）。
     pub tags: Vec<meta::ObjectTag>,
+    /// M8 S4a：存储类（None = STANDARD）。
+    pub storage_class: Option<String>,
+    /// M8 S4a：分层阶段（None = 无 tier 记录）。
+    pub tier_phase: Option<meta::TierPhase>,
+    /// M8 S4a：Restore 到期时刻（unix 秒；None = 未恢复/永久）。
+    pub restore_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1374,3 +1380,5 @@ mod tests_lock;
 mod tests_replication;
 #[cfg(test)]
 mod tests_tags;
+#[cfg(test)]
+mod tests_tier;

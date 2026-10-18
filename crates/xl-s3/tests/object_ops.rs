@@ -3974,3 +3974,171 @@ async fn delete_bucket_invokes_m8_cleanup_sink() {
     assert_eq!(*sink.cleared.lock().unwrap(), ["m8clean".to_string()]);
     assert_eq!(*sink.invalidated.lock().unwrap(), ["m8clean".to_string()]);
 }
+
+// ---- M8 S4a：存储类 ----
+
+#[tokio::test]
+async fn storage_class_wire_put_head_list_copy() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "cls".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "cls".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        storage_class: Some(StorageClass::from("STANDARD_IA".to_string())),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "cls".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        head.storage_class.as_ref().map(|s| s.as_str()),
+        Some("STANDARD_IA")
+    );
+    let get = s3
+        .get_object(req(GetObjectInput {
+            bucket: "cls".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        get.storage_class.as_ref().map(|s| s.as_str()),
+        Some("STANDARD_IA")
+    );
+    let list = s3
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "cls".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        list.contents.unwrap()[0]
+            .storage_class
+            .as_ref()
+            .map(|s| s.as_str()),
+        Some("STANDARD_IA")
+    );
+
+    // Copy 目标显式 class；未给 = STANDARD
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("cls".to_string())
+        .key("dst".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "cls".into(),
+            key: "k".into(),
+            version_id: None,
+        })
+        .storage_class(Some(StorageClass::from("ONEZONE_IA".to_string())))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "cls".into(),
+            key: "dst".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        head.storage_class.as_ref().map(|s| s.as_str()),
+        Some("ONEZONE_IA")
+    );
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("cls".to_string())
+        .key("dst2".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "cls".into(),
+            key: "k".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "cls".into(),
+            key: "dst2".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.storage_class, None);
+
+    // 未知名/归档类直写 → InvalidStorageClass
+    for bad in ["WARM", "GLACIER"] {
+        let err = s3
+            .put_object(req(PutObjectInput {
+                bucket: "cls".into(),
+                key: "bad".into(),
+                body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+                storage_class: Some(StorageClass::from(bad.to_string())),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidStorageClass, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn storage_class_mpu_create_validation() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "clm".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let err = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "clm".into(),
+            key: "k".into(),
+            storage_class: Some(StorageClass::from("GLACIER".to_string())),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidStorageClass);
+    let err = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "clm".into(),
+            key: "k".into(),
+            storage_class: Some(StorageClass::from("WARM".to_string())),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidStorageClass);
+    // 合法类可创建（Complete 落地在 store 单测覆盖）
+    s3.create_multipart_upload(req(CreateMultipartUploadInput {
+        bucket: "clm".into(),
+        key: "k".into(),
+        storage_class: Some(StorageClass::from("INTELLIGENT_TIERING".to_string())),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+}

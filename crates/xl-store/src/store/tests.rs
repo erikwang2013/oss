@@ -1774,6 +1774,8 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
                 lock: None,
                 replication_status: None,
                 tags: None,
+                storage_class: None,
+                tier: None,
             }],
         }
     };
@@ -2206,6 +2208,8 @@ async fn legacy_parts_form_still_readable() {
         lock: None,
         replication_status: None,
         tags: None,
+        storage_class: None,
+        tier: None,
     };
     let m = XlMeta {
         object_key: "legacy".into(),
@@ -2417,6 +2421,7 @@ async fn meta_roundtrips_checksum_record() {
         Default::default(),
         Some(rec.clone()),
         false,
+        None,
         None,
         None,
         None,
@@ -3763,6 +3768,7 @@ async fn versioning_chain_full_flow() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3948,7 +3954,7 @@ async fn versioning_chain_full_flow() {
         .delete_object_versioned("alpha", "plain", None, false)
         .await
         .unwrap();
-    assert_eq!(out, DeleteOutcome::Object);
+    assert_eq!(out, DeleteOutcome::Object { tiers: vec![] });
     assert!(matches!(
         s.get_object("alpha", "plain").await,
         Err(Error::NoSuchKey(_))
@@ -4039,6 +4045,7 @@ async fn scrub_detects_bad_and_missing_shards_full_chain() {
             Default::default(),
             None,
             true,
+            None,
             None,
             None,
             None,

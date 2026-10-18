@@ -342,6 +342,7 @@ async fn lifecycle_emits_expiration_events() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();

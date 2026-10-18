@@ -145,6 +145,7 @@ impl EventSink for IngestSink {
                     None, // M5 切片 2：内部摄取按明文落盘（记档）
                     None, // M5 切片 4：对象锁（内部摄取不设）
                     None,
+                    None,
                 )
                 .await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((size, info))

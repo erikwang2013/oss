@@ -44,6 +44,7 @@ async fn put_locked(s: &Store, key: &str, l: Option<ObjectLockRecord>) -> (Strin
             None,
             l,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -135,7 +136,16 @@ async fn mpu_lock_lands_at_complete() {
     s.create_bucket("alpha").await.unwrap();
     let l = lock("COMPLIANCE", now_plus(3600), true); // 保留 + hold 同时
     let up = s
-        .create_multipart_upload_ext("alpha", "k", None, Default::default(), None, None, Some(&l))
+        .create_multipart_upload_ext(
+            "alpha",
+            "k",
+            None,
+            Default::default(),
+            None,
+            None,
+            Some(&l),
+            None,
+        )
         .await
         .unwrap();
     let e1 = s
@@ -259,6 +269,7 @@ async fn empty_lock_is_not_stored() {
             None,
             Some(empty),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -276,6 +287,7 @@ async fn empty_lock_is_not_stored() {
             false,
             Some(EncSpec::SseC(key.clone())),
             Some(lock("GOVERNANCE", now_plus(60), false)),
+            None,
             None,
         )
         .await
@@ -312,6 +324,7 @@ async fn purge_and_overwrite_guards_block_locked_versions() {
             Default::default(),
             None,
             false,
+            None,
             None,
             None,
             None,

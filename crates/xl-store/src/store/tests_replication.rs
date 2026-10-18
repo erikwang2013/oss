@@ -26,6 +26,7 @@ async fn put(s: &Store, key: &str, body: &'static [u8], versioned: bool) -> Obje
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap()

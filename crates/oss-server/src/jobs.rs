@@ -229,6 +229,7 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
             None,
             None,
             None,
+            None,
         )
         .await
         .map_err(|e| format!("报告写入失败: {e}"));

@@ -81,6 +81,66 @@ pub struct Version {
     /// 只加 Option 字段 = 前向兼容契约；decode 校验长度/字符集/重复键（信任边界）。
     #[serde(default)]
     pub tags: Option<Vec<ObjectTag>>,
+    /// M8 S4a：存储类（None = STANDARD；白名单见 [`STORAGE_CLASSES`]）。
+    #[serde(default)]
+    pub storage_class: Option<String>,
+    /// M8 S4a：分层状态（None = 数据全在本地）。
+    #[serde(default)]
+    pub tier: Option<TierState>,
+}
+
+/// M8 S4a：可接受的存储类（S3 子集）。
+pub const STORAGE_CLASSES: [&str; 8] = [
+    "STANDARD",
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "GLACIER",
+    "GLACIER_IR",
+    "DEEP_ARCHIVE",
+    "REDUCED_REDUNDANCY",
+];
+
+/// 归档类：本地分片可被回收，读需 Restore（S4b）。
+pub fn is_archive_class(s: &str) -> bool {
+    matches!(s, "GLACIER" | "GLACIER_IR" | "DEEP_ARCHIVE")
+}
+
+pub fn is_valid_storage_class(s: &str) -> bool {
+    STORAGE_CLASSES.contains(&s)
+}
+
+/// 存储类归一：`STANDARD` → None（线上语义 None=STANDARD）。
+pub fn normalize_storage_class(s: Option<&str>) -> Option<String> {
+    s.map(str::to_uppercase).filter(|s| s != "STANDARD")
+}
+
+/// M8 S4a：分层状态（远端 tier 上的归档副本）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TierState {
+    pub backend: String,
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    pub sha256: String,
+    pub phase: TierPhase,
+    pub archived_at: i64,
+    #[serde(default)]
+    pub restore_expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TierPhase {
+    Archived,
+    Restoring,
+    Restored,
+}
+
+impl TierPhase {
+    /// 本地数据是否可读（Archived/Restoring 不可读；Restored 回填后本地有数据）。
+    pub fn local_readable(self) -> bool {
+        matches!(self, TierPhase::Restored)
+    }
 }
 
 /// 对象标签（S3 Tag）。键唯一、最多 [`MAX_TAGS`] 条。
@@ -136,7 +196,15 @@ pub fn validate_tags(tags: &[ObjectTag]) -> std::result::Result<(), String> {
 
 impl Version {
     /// 统一的 parts 视图：单段 → `vec![part]`，多段 → 原列表（克隆）。
+    /// M8 S4a：Archived/Restoring 本地无可读分片 → 空（fsck/GC/读路径据此跳过本地分片）。
     pub fn effective_parts(&self) -> Vec<PartRef> {
+        if self
+            .tier
+            .as_ref()
+            .is_some_and(|t| !t.phase.local_readable())
+        {
+            return Vec::new();
+        }
         match &self.parts {
             Some(parts) => parts.clone(),
             None => vec![self.part.clone()],
@@ -288,6 +356,27 @@ impl XlMeta {
                 && let Err(e) = validate_tags(tags)
             {
                 return Err(Error::CorruptMeta(format!("标签非法：{e}")));
+            }
+            // M8 S4a：存储类/分层状态（信任边界）
+            if let Some(sc) = &v.storage_class
+                && (!is_valid_storage_class(sc) || sc == "STANDARD")
+            {
+                return Err(Error::CorruptMeta(format!("非法存储类：{sc:?}")));
+            }
+            if let Some(t) = &v.tier {
+                let ok = |s: &str, max: usize| {
+                    !s.is_empty() && s.len() <= max && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                };
+                if !ok(&t.backend, 64) || !ok(&t.key, 2048) {
+                    return Err(Error::CorruptMeta(format!(
+                        "分层记录标识非法：backend={:?} key_len={}",
+                        t.backend,
+                        t.key.len()
+                    )));
+                }
+                if t.archived_at < 0 || t.restore_expires_at.is_some_and(|x| x < 0) {
+                    return Err(Error::CorruptMeta("分层记录时间戳为负".into()));
+                }
             }
             // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）。
             // M5 切片 2：加密 inline 的落盘态是密文（C = c_len(P)），上限随方案放宽。
@@ -486,6 +575,8 @@ mod tests {
                 lock: None,
                 replication_status: None,
                 tags: None,
+                storage_class: None,
+                tier: None,
             }],
         }
     }
@@ -686,13 +777,14 @@ mod tests {
         // **第六次**：M5 切片 2 增 encryption 字段——明文对象写 nil，老解码器跳过；
         // **第七次**：M5 切片 4 增 lock 字段——无锁对象写 nil，老解码器跳过；
         // **第八次**：M6 切片 3 增 replication_status 字段——非复制对象写 nil，老解码器跳过；
-        // **第九次**：M8 前置增 tags 字段——无标签对象写 nil，老解码器跳过）。
+        // **第九次**：M8 前置增 tags 字段——无标签对象写 nil，老解码器跳过；
+        // **第十次**：M8 S4a 增 storage_class/tier 字段——普通对象写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "e85b90792fc2b61c86937b28244125bdcff5d6744ce984398a557f4be605d302"
+            "5e3b717907a9b86c81ca9206286649d970909f5bd3cfac3be8aa88b30b05679b"
         );
     }
 }
@@ -726,6 +818,8 @@ mod parts_tests {
             lock: None,
             replication_status: None,
             tags: None,
+            storage_class: None,
+            tier: None,
         }
     }
 

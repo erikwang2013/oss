@@ -108,6 +108,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
             Some(EncSpec::SseC(key.clone())),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -166,6 +167,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
         Some(EncSpec::SseC(key.clone())),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -200,6 +202,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
             Some(EncSpec::SseC(key.clone())),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -212,6 +215,7 @@ async fn sse_c_roundtrip_range_inline_head_and_wrong_key() {
         Default::default(),
         None,
         true,
+        None,
         None,
         None,
         None,
@@ -246,6 +250,7 @@ async fn sse_c_mpu_consistency() {
             None,
             Default::default(),
             Some(k1.md5_b64()),
+            None,
             None,
             None,
         )
@@ -398,6 +403,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             None,
             Some("sse-s3"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -445,6 +451,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             None,
             Some("sse-kms"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -479,6 +486,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             Default::default(),
             None,
             Some("sse-s3"),
+            None,
             None,
         )
         .await
@@ -535,6 +543,7 @@ async fn encrypted_roundtrip_geometry_boundaries() {
                 Some(EncSpec::SseS3),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("size={n} put 失败: {e}"));
@@ -588,6 +597,7 @@ async fn encrypted_disk_layout_contract_and_crc() {
         Some(EncSpec::SseS3),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -634,6 +644,7 @@ async fn tamper_two_shards_fails_closed() {
         Some(EncSpec::SseS3),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -670,6 +681,7 @@ async fn tamper_inline_ciphertext_and_wrapped_dek_fail_closed() {
         Some(EncSpec::SseS3),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -698,6 +710,7 @@ async fn tamper_inline_ciphertext_and_wrapped_dek_fail_closed() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )
@@ -734,6 +747,7 @@ async fn wrong_or_missing_provider_fails_closed() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )
@@ -779,6 +793,7 @@ async fn shards_and_inline_leak_no_plaintext_window() {
         Some(EncSpec::SseS3),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -803,6 +818,7 @@ async fn shards_and_inline_leak_no_plaintext_window() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )
@@ -835,6 +851,7 @@ async fn shards_and_inline_leak_no_plaintext_window() {
         Some(EncSpec::SseS3),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -861,6 +878,7 @@ async fn mpu_complete_encrypted_roundtrip() {
             Default::default(),
             None,
             Some("sse-s3"),
+            None,
             None,
         )
         .await
@@ -928,6 +946,7 @@ async fn sse_kms_roundtrip_and_key_id_routing() {
             Some(EncSpec::SseKms),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -962,6 +981,7 @@ async fn sse_kms_roundtrip_and_key_id_routing() {
             Some(EncSpec::SseKms),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -988,6 +1008,7 @@ async fn version_chain_keeps_old_encrypted_versions_readable() {
             Some(EncSpec::SseS3),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1002,6 +1023,7 @@ async fn version_chain_keeps_old_encrypted_versions_readable() {
         None,
         true,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )
@@ -1054,6 +1076,7 @@ async fn plaintext_objects_coexist_with_encrypted() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )
@@ -1116,6 +1139,7 @@ async fn ec_disabled_encryption_rejected_at_write() {
             None,
             false,
             Some(EncSpec::SseS3),
+            None,
             None,
             None,
         )
@@ -1294,6 +1318,7 @@ async fn fsck_and_repair_ok_on_encrypted_objects() {
         Some(EncSpec::SseS3),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1308,6 +1333,7 @@ async fn fsck_and_repair_ok_on_encrypted_objects() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )
@@ -1384,6 +1410,7 @@ async fn multi_drive_encrypted_roundtrip_and_leak() {
         None,
         false,
         Some(EncSpec::SseS3),
+        None,
         None,
         None,
     )

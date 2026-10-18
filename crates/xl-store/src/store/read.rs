@@ -40,6 +40,23 @@ pub(in crate::store) fn check_read_sse_c(
     }
 }
 
+/// M8 S4a：归档/恢复中的版本本地无可读数据 → 403 InvalidObjectState。
+pub(in crate::store) fn check_tier_readable(
+    v: &meta::Version,
+    bucket: &str,
+    key: &str,
+) -> Result<()> {
+    if let Some(t) = &v.tier
+        && !t.phase.local_readable()
+    {
+        return Err(Error::InvalidObjectState(format!(
+            "{bucket}/{key}: 归档对象当前不可读（phase={:?}）",
+            t.phase
+        )));
+    }
+    Ok(())
+}
+
 impl Store {
     pub(in crate::store) fn load_object_info(
         &self,
@@ -63,6 +80,9 @@ impl Store {
             lock: v.lock.clone(),
             replication_status: v.replication_status.clone(),
             tags: v.tags.clone().unwrap_or_default(),
+            storage_class: v.storage_class.clone(),
+            tier_phase: v.tier.as_ref().map(|t| t.phase),
+            restore_expires_at: v.tier.as_ref().and_then(|t| t.restore_expires_at),
         })
     }
 
@@ -129,6 +149,7 @@ impl Store {
             if v.delete_marker() {
                 return Err(Error::NoSuchKey(key.to_string()));
             }
+            check_tier_readable(v, bucket, key)?;
             check_read_sse_c(v, sse_c)?;
             let info = self.load_object_info(bucket, key, &m)?;
 
@@ -236,6 +257,7 @@ impl Store {
             if v.delete_marker() {
                 return Err(Error::NoSuchKey(key.to_string()));
             }
+            check_tier_readable(v, bucket, key)?;
             check_read_sse_c(v, sse_c)?;
 
             if range.start > range.end || range.end > v.size {

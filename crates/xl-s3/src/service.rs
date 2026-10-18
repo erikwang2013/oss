@@ -36,6 +36,8 @@ pub struct OssS3 {
     repl_store: Option<Arc<dyn crate::replication::ReplicationStore>>,
     /// M8 S0：删桶后的控制面清理（oss-server 注入；None = 未接线）
     bucket_cleanup: Option<Arc<dyn crate::bucket_cleanup::BucketCleanupSink>>,
+    /// M8 S4a：删除归档版本的远端 tier 清理（S4b 注入真实实现；None = 不清理）
+    tier_gc: Option<Arc<dyn crate::tier_gc::TierGcSink>>,
 }
 
 impl OssS3 {
@@ -59,6 +61,25 @@ impl OssS3 {
             repl_sink: None,
             repl_store: None,
             bucket_cleanup: None,
+            tier_gc: None,
+        }
+    }
+
+    /// M8 S4a：注入 tier 清理实现（S4b 装配真实 sink；本片可 fake/None）。
+    pub fn with_tier_gc(mut self, sink: Option<Arc<dyn crate::tier_gc::TierGcSink>>) -> Self {
+        self.tier_gc = sink;
+        self
+    }
+
+    /// M8 S4a：删除已成功的归档版本 → 远端清理（best-effort）。
+    async fn tier_gc_delete(&self, refs: &[xl_store::store::TierRef]) {
+        if refs.is_empty() {
+            return;
+        }
+        if let Some(sink) = &self.tier_gc
+            && let Err(e) = sink.delete(refs).await
+        {
+            tracing::warn!(error = %e, n = refs.len(), "tier 清理失败（本地删除已生效）");
         }
     }
 
@@ -263,6 +284,22 @@ fn parse_tagging_header(raw: &str) -> S3Result<Vec<ObjectTag>> {
         .collect();
     xl_store::meta::validate_tags(&tags).map_err(|e| s3s::s3_error!(InvalidTag, "{}", e))?;
     Ok(tags)
+}
+
+/// M8 S4a：存储类解析/校验。`allow_archive=false`（直写 PUT/MPU/Copy 目标）拒绝归档类。
+fn parse_storage_class(raw: Option<&str>, allow_archive: bool) -> S3Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let sc = raw.to_ascii_uppercase();
+    if !xl_store::meta::is_valid_storage_class(&sc) {
+        return Err(s3s::s3_error!(InvalidStorageClass, "invalid storage class"));
+    }
+    if !allow_archive && xl_store::meta::is_archive_class(&sc) {
+        return Err(s3s::s3_error!(
+            InvalidStorageClass,
+            "archive storage class requires lifecycle transition"
+        ));
+    }
+    Ok(xl_store::meta::normalize_storage_class(Some(&sc)))
 }
 
 /// M8 前置：PutObjectTagging 的 XML TagSet → 校验后的标签集合。
@@ -711,6 +748,12 @@ impl S3 for OssS3 {
             .get("x-amz-replication-status")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"));
+        // M8 S4a：存储类（REPLICA 摄入不携带；归档类直写拒）
+        let storage_class = if replica {
+            None
+        } else {
+            parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?
+        };
         let PutObjectInput {
             bucket,
             key,
@@ -777,6 +820,7 @@ impl S3 for OssS3 {
                 sse.spec, // M5 切片 3：SSE 头映射（R1/R2）
                 lock,     // M5 切片 4（L3）
                 tags,     // M8 前置：写入版本标签
+                storage_class,
             )
             .await;
         let info = match result {
@@ -855,6 +899,9 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
         )?;
         let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
+        // M8 S4a（B12）：Create 声明的存储类随 mpu.meta 持久化，Complete 落地；归档类拒
+        let storage_class =
+            parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?;
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -872,6 +919,7 @@ impl S3 for OssS3 {
                 sse.sse_c_md5(),
                 sse.sse_kind(), // R5 扩展（P2-b）：SSE-S3/KMS 意图持久化，complete 落地
                 lock.as_ref(),  // M5 切片 4（L3）：锁意图持久化，complete 落地
+                storage_class,
             )
             .await
             .map_err(to_s3_error)?;
@@ -1219,6 +1267,11 @@ impl S3 for OssS3 {
             version_id: info.version_id.clone(),
             // M8 前置：有标签时回 x-amz-tagging-count（HeadObject 同）
             tag_count: (!info.tags.is_empty()).then_some(info.tags.len() as i32),
+            // M8 S4a：存储类（None = STANDARD，s3s 序列化缺省）
+            storage_class: info
+                .storage_class
+                .as_ref()
+                .map(|s| StorageClass::from(s.clone())),
             ..Default::default()
         };
         // response-content-* 是响应头覆盖：客户端给什么值就原样下发（含 &filename= 的 RFC 5987
@@ -1328,6 +1381,10 @@ impl S3 for OssS3 {
             metadata: Some(info.user_metadata.into_iter().collect()),
             version_id: info.version_id.clone(),
             tag_count: (!info.tags.is_empty()).then_some(info.tags.len() as i32),
+            storage_class: info
+                .storage_class
+                .as_ref()
+                .map(|s| StorageClass::from(s.clone())),
             ..Default::default()
         };
         // 校验和回写（HEAD）
@@ -1563,6 +1620,7 @@ impl S3 for OssS3 {
             .map_err(to_s3_error)?;
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
         // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
+        let mut tier_refs = Vec::new();
         let (dm, vid) = match outcome {
             DeleteOutcome::Marker { version_id } => {
                 self.emit(
@@ -1588,7 +1646,8 @@ impl S3 for OssS3 {
                 .await;
                 (Some(true), Some(version_id))
             }
-            DeleteOutcome::Version { version_id } => {
+            DeleteOutcome::Version { version_id, tier } => {
+                tier_refs.extend(tier);
                 self.emit(
                     S3EventOp::RemovedDelete,
                     &bucket,
@@ -1601,7 +1660,8 @@ impl S3 for OssS3 {
                 .await;
                 (None, Some(version_id))
             }
-            DeleteOutcome::Object => {
+            DeleteOutcome::Object { tiers } => {
+                tier_refs = tiers;
                 self.emit(
                     S3EventOp::RemovedDelete,
                     &bucket,
@@ -1617,6 +1677,7 @@ impl S3 for OssS3 {
             // P2-1：幂等空删（未发生删除）——204 但不发事件
             DeleteOutcome::NotFound => (None, None),
         };
+        self.tier_gc_delete(&tier_refs).await;
         Ok(S3Response::new(DeleteObjectOutput {
             delete_marker: dm,
             version_id: vid,
@@ -1703,6 +1764,7 @@ impl S3 for OssS3 {
                 .await
             {
                 Ok(outcome) => {
+                    let mut tier_refs = Vec::new();
                     let (dm, dmv, vid) = match outcome {
                         DeleteOutcome::Marker { version_id } => {
                             self.emit(
@@ -1728,7 +1790,8 @@ impl S3 for OssS3 {
                             .await;
                             (Some(true), Some(version_id), None)
                         }
-                        DeleteOutcome::Version { version_id } => {
+                        DeleteOutcome::Version { version_id, tier } => {
+                            tier_refs.extend(tier);
                             self.emit(
                                 S3EventOp::RemovedDelete,
                                 &bucket,
@@ -1741,7 +1804,8 @@ impl S3 for OssS3 {
                             .await;
                             (None, None, Some(version_id))
                         }
-                        DeleteOutcome::Object => {
+                        DeleteOutcome::Object { tiers } => {
+                            tier_refs = tiers;
                             self.emit(
                                 S3EventOp::RemovedDelete,
                                 &bucket,
@@ -1757,6 +1821,7 @@ impl S3 for OssS3 {
                         // P2-1：幂等空删——进 deleted[]（S3 语义）但不发事件
                         DeleteOutcome::NotFound => (None, None, None),
                     };
+                    self.tier_gc_delete(&tier_refs).await;
                     deleted.push(DeletedObject {
                         key: Some(obj.key),
                         delete_marker: dm,
@@ -2368,8 +2433,10 @@ impl S3 for OssS3 {
                 e_tag: Some(ETag::Strong(e.etag.clone())),
                 size: Some(e.size as i64),
                 last_modified: Some(last_modified(e.mod_time_nanos)),
-                storage_class: Some(ObjectVersionStorageClass::from_static(
-                    ObjectVersionStorageClass::STANDARD,
+                storage_class: Some(ObjectVersionStorageClass::from(
+                    e.storage_class
+                        .clone()
+                        .unwrap_or_else(|| "STANDARD".to_string()),
                 )),
                 ..Default::default()
             })
@@ -2446,8 +2513,10 @@ impl S3 for OssS3 {
                 size: Some(o.size as i64),
                 e_tag: Some(ETag::Strong(o.etag.clone())),
                 last_modified: Some(last_modified(o.last_modified_nanos)),
-                storage_class: Some(ObjectStorageClass::from_static(
-                    ObjectStorageClass::STANDARD,
+                storage_class: Some(ObjectStorageClass::from(
+                    o.storage_class
+                        .clone()
+                        .unwrap_or_else(|| "STANDARD".to_string()),
                 )),
                 ..Default::default()
             })
@@ -2569,6 +2638,9 @@ impl S3 for OssS3 {
                 .await
                 .map_err(to_s3_error)?,
         };
+        // M8 S4a：目标存储类（未给 = STANDARD；归档类直写拒）
+        let storage_class =
+            parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?;
         // M8 前置：两轴独立选择目标元数据/标签（REPLACE 未提供 = 清空）
         let (content_type, user_metadata): (
             Option<String>,
@@ -2613,6 +2685,7 @@ impl S3 for OssS3 {
                 dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
                 dst_lock,     // M5 切片 4（L3）
                 tags,
+                storage_class,
             )
             .await
             .map_err(to_s3_error)?;

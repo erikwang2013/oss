@@ -57,6 +57,7 @@ async fn put_versioned(store: &Store, key: &str, body: &'static [u8]) -> (String
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -728,6 +729,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
             BTreeMap::from([("foo".to_string(), "Bar".to_string())]),
             None,
             true,
+            None,
             None,
             None,
             None,

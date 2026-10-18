@@ -44,6 +44,7 @@ async fn put(
         None,
         None,
         t,
+        None,
     )
     .await
     .unwrap()
@@ -231,6 +232,7 @@ async fn invalid_tags_rejected_at_put_and_set() {
             None,
             None,
             Some(tags(&[("k", "1"), ("k", "2")])),
+            None,
         )
         .await;
     assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");

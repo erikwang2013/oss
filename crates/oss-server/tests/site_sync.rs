@@ -296,6 +296,7 @@ async fn snapshot_ship_apply_and_replay() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -350,6 +351,7 @@ async fn snapshot_ship_apply_and_replay() {
             Default::default(),
             None,
             true,
+            None,
             None,
             None,
             None,

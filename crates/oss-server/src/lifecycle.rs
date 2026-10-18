@@ -24,7 +24,8 @@ pub(crate) fn lifecycle_event(
             "s3:LifecycleExpiration:DeleteMarkerCreated",
             Some(version_id.as_str()),
         )),
-        xl_store::store::DeleteOutcome::Version { .. } | xl_store::store::DeleteOutcome::Object => {
+        xl_store::store::DeleteOutcome::Version { .. }
+        | xl_store::store::DeleteOutcome::Object { .. } => {
             Some(("s3:LifecycleExpiration:Delete", None))
         }
         xl_store::store::DeleteOutcome::NotFound => None,
@@ -268,12 +269,13 @@ mod tests {
         );
         assert_eq!(
             lifecycle_event(&DeleteOutcome::Version {
-                version_id: "v1".into()
+                version_id: "v1".into(),
+                tier: None,
             }),
             Some(("s3:LifecycleExpiration:Delete", None))
         );
         assert_eq!(
-            lifecycle_event(&DeleteOutcome::Object),
+            lifecycle_event(&DeleteOutcome::Object { tiers: vec![] }),
             Some(("s3:LifecycleExpiration:Delete", None))
         );
         assert_eq!(

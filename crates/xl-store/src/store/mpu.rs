@@ -49,6 +49,9 @@ struct MpuMeta {
     lock_until_nanos: Option<i64>,
     #[serde(default)]
     lock_legal_hold: bool,
+    /// M8 S4a：Create 时声明的存储类（Complete 落地到版本；归档类在 Create 被拒）。
+    #[serde(default)]
+    storage_class: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,8 +87,17 @@ impl Store {
         content_type: Option<String>,
         user_metadata: BTreeMap<String, String>,
     ) -> Result<String> {
-        self.create_multipart_upload_ext(bucket, key, content_type, user_metadata, None, None, None)
-            .await
+        self.create_multipart_upload_ext(
+            bucket,
+            key,
+            content_type,
+            user_metadata,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// 创建 MPU（可带 SSE-C 记录 + SSE-S3/KMS 意图；M5 切片 3/R5——只记 md5 与 kind，
@@ -100,8 +112,16 @@ impl Store {
         sse_c_md5: Option<&str>,
         sse_kind: Option<&str>,
         lock: Option<&meta::ObjectLockRecord>,
+        storage_class: Option<String>,
     ) -> Result<String> {
         layout::validate_key(key)?;
+        // M8 S4a：存储类归一/白名单；归档类在服务层已拒（store 兜底）
+        let storage_class = meta::normalize_storage_class(storage_class.as_deref());
+        if let Some(sc) = &storage_class
+            && (!meta::is_valid_storage_class(sc) || meta::is_archive_class(sc))
+        {
+            return Err(Error::InvalidArgument(format!("非法存储类：{sc}")));
+        }
         // 桶窗口（M2b-2 Task 10，同单段 PUT）：ensure + 对象目录先落
         let obj_dir = {
             let _bguard = self.lock_bucket_owned(bucket).await;
@@ -123,6 +143,7 @@ impl Store {
             lock_mode: lock.and_then(|l| l.mode.clone()),
             lock_until_nanos: lock.and_then(|l| l.retain_until_nanos),
             lock_legal_hold: lock.is_some_and(|l| l.legal_hold),
+            storage_class,
         };
         let bytes = rmp_serde::to_vec_named(&meta).map_err(|e| Error::Encode(e.to_string()))?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -524,6 +545,8 @@ impl Store {
                 lock: effective_lock.clone(),
                 replication_status: None,
                 tags: None,
+                storage_class: mpu.storage_class.clone(),
+                tier: None,
             };
             let mut meta = match (versioned, old_meta.as_ref()) {
                 (true, Some(old)) => {
@@ -622,6 +645,9 @@ impl Store {
             replication_status: None,
             // M8 前置：MPU 的 x-amz-tagging 不在本切片（契约外）
             tags: Vec::new(),
+            storage_class: mpu.storage_class.clone(),
+            tier_phase: None,
+            restore_expires_at: None,
         })
     }
 
