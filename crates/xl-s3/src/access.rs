@@ -966,12 +966,15 @@ fn classify(op: &str) -> Option<Gate> {
         | "ListParts"
         | "GetObject"
         | "HeadObject"
+        | "GetObjectTagging"
         | "ListObjectVersions"
         | "SelectObjectContent" => Gate::Need(Action::Read),
         // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
         // put_object，op 名看到的是 "PostObject"，不映射它就是浏览器表单直传的漏检点）
         "PutObject"
         | "PostObject"
+        | "PutObjectTagging"
+        | "DeleteObjectTagging"
         | "CreateMultipartUpload"
         | "UploadPart"
         | "CompleteMultipartUpload"
@@ -1243,6 +1246,7 @@ mod tests {
             "GetObject",
             "HeadObject",
             "SelectObjectContent",
+            "GetObjectTagging",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Read)), "{op}");
         }
@@ -1253,6 +1257,8 @@ mod tests {
             "UploadPart",
             "CompleteMultipartUpload",
             "AbortMultipartUpload",
+            "PutObjectTagging",
+            "DeleteObjectTagging",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Write)), "{op}");
         }
@@ -1741,6 +1747,65 @@ mod session_tests {
 
     /// P2-1 复验修复判别：CopyObject 的 src 轴用**源桶/源键**求值——曾复用 dst pr，
     /// 会话对源读的收窄可被 copy 绕过（src 轴在目标资源上误命中 Allow）。
+    #[tokio::test]
+    async fn fuse_session_tagging_folds_into_object_actions() {
+        let a = acl().await;
+        add_user(&a, 7, false).await;
+        add_key(&a, "AKIA_LONG", 7, None).await;
+        add_session(&a, "ASIA_G", 7, "AKIA_LONG", Some(GET_ONLY)).await;
+        // GetObjectTagging 折叠到 s3:GetObject → 只读会话放行
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_G",
+            "GetObjectTagging",
+            "bkt",
+            Some("k"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!((d, s, det) == (true, true, Some("session:allow")));
+        // Put/DeleteObjectTagging 折叠到 s3:PutObject → 只读会话拒
+        for op in ["PutObjectTagging", "DeleteObjectTagging"] {
+            let ((d, _), det) = fuse(&a, "ASIA_G", op, "bkt", Some("k"), None, true, true).await;
+            assert!(!d && det == Some("session:deny"), "{op}");
+        }
+        // 只写会话：PutObjectTagging 放行、GetObjectTagging 拒
+        add_session(
+            &a,
+            "ASIA_P",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bkt/*"}]}"#),
+        )
+        .await;
+        let ((d, _), det) = fuse(
+            &a,
+            "ASIA_P",
+            "PutObjectTagging",
+            "bkt",
+            Some("k"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!(d && det == Some("session:allow"));
+        let ((d, _), det) = fuse(
+            &a,
+            "ASIA_P",
+            "GetObjectTagging",
+            "bkt",
+            Some("k"),
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert!(!d && det == Some("session:deny"));
+    }
+
     #[tokio::test]
     async fn fuse_session_copy_src_axis_uses_source_resource() {
         let a = acl().await;

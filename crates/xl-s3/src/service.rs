@@ -13,7 +13,7 @@ use s3s::checksum::ChecksumHasher;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
-use xl_store::meta::ChecksumRecord;
+use xl_store::meta::{ChecksumRecord, ObjectTag};
 use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 
 use crate::convert::to_s3_error;
@@ -231,6 +231,30 @@ fn stream_err_to_s3(
 /// M7：SQLite BEFORE 门控的 `RAISE(ABORT,'site replication conflict')` 探测。
 fn is_site_conflict(e: &(impl std::fmt::Display + ?Sized)) -> bool {
     e.to_string().contains("site replication conflict")
+}
+
+/// M8 前置：`x-amz-tagging`（URL query 串）→ 校验后的标签集合。
+fn parse_tagging_header(raw: &str) -> S3Result<Vec<ObjectTag>> {
+    let tags: Vec<ObjectTag> = crate::sts::parse_form(raw.as_bytes())
+        .into_iter()
+        .map(|(key, value)| ObjectTag { key, value })
+        .collect();
+    xl_store::meta::validate_tags(&tags).map_err(|e| s3s::s3_error!(InvalidTag, "{}", e))?;
+    Ok(tags)
+}
+
+/// M8 前置：PutObjectTagging 的 XML TagSet → 校验后的标签集合。
+fn tagging_from_dto(t: &Tagging) -> S3Result<Vec<ObjectTag>> {
+    let tags: Vec<ObjectTag> = t
+        .tag_set
+        .iter()
+        .map(|tag| ObjectTag {
+            key: tag.key.clone().unwrap_or_default(),
+            value: tag.value.clone().unwrap_or_default(),
+        })
+        .collect();
+    xl_store::meta::validate_tags(&tags).map_err(|e| s3s::s3_error!(InvalidTag, "{}", e))?;
+    Ok(tags)
 }
 
 /// 校验和算法（本计划覆盖 s3s 输入里显式声明的那几种；组合语义留 M2b）。
@@ -667,9 +691,19 @@ impl S3 for OssS3 {
             content_type,
             content_length,
             metadata,
+            tagging,
             ..
         } = req.input;
         let body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
+        // M8 前置：x-amz-tagging（URL query 串）。REPLICA 摄入显式忽略标签（M6 边界）。
+        let tags = if replica {
+            None
+        } else {
+            match tagging.as_deref() {
+                Some(raw) if !raw.is_empty() => Some(parse_tagging_header(raw)?),
+                _ => None,
+            }
+        };
 
         // 声明长度已知且超限：不读体直接 413
         if let Some(cl) = content_length {
@@ -715,8 +749,8 @@ impl S3 for OssS3 {
                 versioned,
                 sse.spec, // M5 切片 3：SSE 头映射（R1/R2）
                 lock,     // M5 切片 4（L3）
-            
-                None,)
+                tags,     // M8 前置：写入版本标签
+            )
             .await;
         let info = match result {
             Ok(info) => info,
@@ -1156,6 +1190,8 @@ impl S3 for OssS3 {
             metadata: Some(info.user_metadata.into_iter().collect()),
             // 透出实际读到的版本号（点名版本 = 该版本；未点名 = 当前最新）
             version_id: info.version_id.clone(),
+            // M8 前置：有标签时回 x-amz-tagging-count（HeadObject 同）
+            tag_count: (!info.tags.is_empty()).then_some(info.tags.len() as i32),
             ..Default::default()
         };
         // response-content-* 是响应头覆盖：客户端给什么值就原样下发（含 &filename= 的 RFC 5987
@@ -1264,6 +1300,7 @@ impl S3 for OssS3 {
             last_modified: Some(last_modified(info.last_modified_nanos)),
             metadata: Some(info.user_metadata.into_iter().collect()),
             version_id: info.version_id.clone(),
+            tag_count: (!info.tags.is_empty()).then_some(info.tags.len() as i32),
             ..Default::default()
         };
         // 校验和回写（HEAD）
@@ -2422,11 +2459,39 @@ impl S3 for OssS3 {
             return Err(s3s::s3_error!(InvalidRequest, "unsupported copy source"));
         };
 
+        // M8 前置：两条指令轴（默认 COPY）。s3s 的指令类型解析宽松，非法值在此拒。
+        let md = req
+            .input
+            .metadata_directive
+            .as_ref()
+            .map(|d| d.as_str())
+            .unwrap_or("COPY");
+        let td = req
+            .input
+            .tagging_directive
+            .as_ref()
+            .map(|d| d.as_str())
+            .unwrap_or("COPY");
+        if !matches!(md, "COPY" | "REPLACE") {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "invalid x-amz-metadata-directive"
+            ));
+        }
+        if !matches!(td, "COPY" | "REPLACE") {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "invalid x-amz-tagging-directive"
+            ));
+        }
+
         // 规格 §3.5 边界：同桶同键且**无源版本号**一律拒（S3 语义：InvalidRequest）。
         // M4 版本控制：`?versionId=` 的同键 copy 是标准回滚惯用法（旧版本 → 新版本），放行。
+        // M8 前置：metadata REPLACE 解锁同键 copy（AWS 语义：原地替换元数据/标签）。
         if version_id.is_none()
             && bucket.as_ref() == req.input.bucket.as_str()
             && key.as_ref() == req.input.key.as_str()
+            && md != "REPLACE"
         {
             return Err(s3s::s3_error!(
                 InvalidRequest,
@@ -2477,6 +2542,35 @@ impl S3 for OssS3 {
                 .await
                 .map_err(to_s3_error)?,
         };
+        // M8 前置：两轴独立选择目标元数据/标签（REPLACE 未提供 = 清空）
+        let (content_type, user_metadata): (
+            Option<String>,
+            std::collections::BTreeMap<String, String>,
+        ) = if md == "REPLACE" {
+            (
+                req.input.content_type.clone(),
+                req.input
+                    .metadata
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            (
+                src_info.content_type.clone(),
+                src_info.user_metadata.clone(),
+            )
+        };
+        let tags = if td == "REPLACE" {
+            // 缺省 = 空集 → 清空
+            Some(parse_tagging_header(
+                req.input.tagging.as_deref().unwrap_or(""),
+            )?)
+        } else {
+            // COPY 时携带 x-amz-tagging 一律忽略（AWS 语义）
+            Some(src_info.tags.clone())
+        };
         // 目标桶版本策略随 copy 生效（版本桶 copy 出的是新版本）
         let dst_versioned = self.versioned(&req.input.bucket).await?;
         let info = self
@@ -2485,14 +2579,14 @@ impl S3 for OssS3 {
                 &req.input.bucket,
                 &req.input.key,
                 Box::pin(futures::stream::once(async move { Ok(bytes) })),
-                src_info.content_type,
-                src_info.user_metadata,
+                content_type,
+                user_metadata,
                 None,
                 dst_versioned,
                 dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
                 dst_lock,     // M5 切片 4（L3）
-            
-                None,)
+                tags,
+            )
             .await
             .map_err(to_s3_error)?;
         self.emit(
@@ -2533,6 +2627,71 @@ impl S3 for OssS3 {
             sse_customer_algorithm: so.sse_c_algorithm.map(str::to_string),
             sse_customer_key_md5: so.sse_c_key_md5,
             ..Default::default()
+        }))
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let tags = tagging_from_dto(&req.input.tagging)?;
+        let vid = self
+            .store
+            .set_object_tags(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+                tags,
+            )
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(PutObjectTaggingOutput {
+            version_id: Some(vid),
+        }))
+    }
+
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let (vid, tags) = self
+            .store
+            .get_object_tags(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await
+            .map_err(to_s3_error)?;
+        let tag_set = tags
+            .into_iter()
+            .map(|t| Tag {
+                key: Some(t.key),
+                value: Some(t.value),
+            })
+            .collect();
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set,
+            version_id: Some(vid),
+        }))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let vid = self
+            .store
+            .set_object_tags(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+                Vec::new(),
+            )
+            .await
+            .map_err(to_s3_error)?;
+        Ok(S3Response::new(DeleteObjectTaggingOutput {
+            version_id: Some(vid),
         }))
     }
 }

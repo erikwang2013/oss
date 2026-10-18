@@ -3004,3 +3004,933 @@ async fn replication_status_headers_and_replica_ingest() {
         Some("REPLICA")
     );
 }
+
+// ---- M8 前置：对象标签（切片 1） ----
+
+async fn versioned(s3: &OssS3, bucket: &str) {
+    // 版本控制状态经 ACL 登记表读写 → 建桶须带身份（记账 owner）
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: bucket.into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_bucket_versioning(req(PutBucketVersioningInput {
+        bucket: bucket.into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        mfa: None,
+        versioning_configuration: VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static("Enabled")),
+            mfa_delete: None,
+        },
+    }))
+    .await
+    .unwrap();
+}
+
+fn tag_pair(t: &Tag) -> (&str, &str) {
+    (t.key.as_deref().unwrap(), t.value.as_deref().unwrap())
+}
+
+#[tokio::test]
+async fn tagging_roundtrip_put_get_delete_and_counts() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        tagging: Some("env=prod&team=core".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // 顺序保持（保序是契约）
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.tag_set.len(), 2);
+    assert_eq!(tag_pair(&out.tag_set[0]), ("env", "prod"));
+    assert_eq!(tag_pair(&out.tag_set[1]), ("team", "core"));
+    assert_eq!(out.version_id.as_deref(), Some("null"));
+    // 非版本桶用字面量 null 点名版本
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            version_id: Some("null".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.tag_set.len(), 2);
+    // header URL 解码：%20→空格、%2B→'+'、字面 '+'→空格
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "url".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        tagging: Some("k%20ey=v%2B1&lit=a+b".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "url".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(tag_pair(&out.tag_set[0]), ("k ey", "v+1"));
+    assert_eq!(tag_pair(&out.tag_set[1]), ("lit", "a b"));
+
+    // GET/HEAD 带 x-amz-tagging-count
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.tag_count, Some(2));
+    let get = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(get.tag_count, Some(2));
+
+    // PUT Tagging 整组替换
+    s3.put_object_tagging(req(PutObjectTaggingInput {
+        bucket: "alpha".into(),
+        key: "k".into(),
+        tagging: Tagging {
+            tag_set: vec![Tag {
+                key: Some("only".into()),
+                value: Some("one".into()),
+            }],
+        },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        request_payer: None,
+        version_id: None,
+    }))
+    .await
+    .unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.tag_set.len(), 1);
+    assert_eq!(tag_pair(&out.tag_set[0]), ("only", "one"));
+
+    // DELETE Tagging 清空
+    s3.delete_object_tagging(req(DeleteObjectTaggingInput {
+        bucket: "alpha".into(),
+        key: "k".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(out.tag_set.is_empty());
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.tag_count, None);
+
+    // 缺失键 → NoSuchKey
+    let err = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "missing".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
+    // 缺桶 → NoSuchBucket
+    let err = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "nobucket".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchBucket);
+}
+
+#[tokio::test]
+async fn tagging_version_isolation_and_marker_errors() {
+    let (s3, _d) = service().await;
+    versioned(&s3, "vtag").await;
+    let v1 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"1"))),
+            tagging: Some("a=1".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "vtag".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"2"))),
+        tagging: Some("b=2".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // 点名旧版本
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            version_id: Some(v1.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.version_id.as_deref(), Some(v1.as_str()));
+    assert_eq!(tag_pair(&out.tag_set[0]), ("a", "1"));
+    // 改旧版本标签不影响链尾
+    s3.put_object_tagging(req(PutObjectTaggingInput {
+        bucket: "vtag".into(),
+        key: "k".into(),
+        version_id: Some(v1.clone()),
+        tagging: Tagging {
+            tag_set: vec![Tag {
+                key: Some("c".into()),
+                value: Some("3".into()),
+            }],
+        },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        request_payer: None,
+    }))
+    .await
+    .unwrap();
+    let tail = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(tag_pair(&tail.tag_set[0]), ("b", "2"));
+
+    // 无版本号删 → 链尾 marker：默认读视同不存在，点名 marker → 405
+    let del = s3
+        .delete_object(req(DeleteObjectInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(del.delete_marker, Some(true));
+    let err = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
+    let marker_vid = s3
+        .list_object_versions(req(ListObjectVersionsInput {
+            bucket: "vtag".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .delete_markers
+        .unwrap()[0]
+        .version_id
+        .clone()
+        .unwrap();
+    let err = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            version_id: Some(marker_vid.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::MethodNotAllowed);
+    let err = s3
+        .delete_object_tagging(req(DeleteObjectTaggingInput {
+            bucket: "vtag".into(),
+            key: "k".into(),
+            version_id: Some(marker_vid),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::MethodNotAllowed);
+}
+
+#[tokio::test]
+async fn tagging_invalid_matrix_and_boundaries() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "ttag".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let put = |tagging: &str| {
+        let tagging = tagging.to_string();
+        req(PutObjectInput {
+            bucket: "ttag".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            tagging: Some(tagging),
+            ..Default::default()
+        })
+    };
+    let bad = [
+        "a=1&a=2", // 重复键
+        "=v",      // 空键
+        "a#=1",    // 非法字符
+        "a=1&=2",  // 第二个空键
+        "a=%0A",   // 控制字符
+        "a!=1",    // 非法字符
+        "a=%zz",   // 坏转义（保留原文 → '%' 非法）
+    ];
+    for t in bad {
+        let err = s3.put_object(put(t)).await.unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag, "{t}");
+    }
+    // 11 条超限
+    let many: Vec<String> = (0..11).map(|i| format!("k{i}=v")).collect();
+    let err = s3.put_object(put(&many.join("&"))).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag);
+    // 键 129 / 值 257 超限
+    let k129 = format!("{}=", "k".repeat(129));
+    let err = s3.put_object(put(&k129)).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag);
+    let v257 = format!("a={}", "v".repeat(257));
+    let err = s3.put_object(put(&v257)).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag);
+
+    // 正向边界：10 条、键 128、值 256
+    let k128 = format!("{}=v", "k".repeat(128));
+    let v256 = format!("a={}", "v".repeat(256));
+    let mut ten: Vec<String> = (0..8).map(|i| format!("k{i}=v")).collect();
+    ten.push(k128);
+    ten.push(v256);
+    s3.put_object(put(&ten.join("&"))).await.unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "ttag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.tag_set.len(), 10);
+    assert_eq!(out.tag_set[8].key.as_deref().unwrap().len(), 128);
+    assert_eq!(out.tag_set[9].value.as_deref().unwrap().len(), 256);
+    // 128 个中文字符键（按 Unicode 标量计数）
+    let zh = format!("{}=v", "中".repeat(128));
+    s3.put_object(put(&zh)).await.unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "ttag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.tag_set[0].key.as_deref().unwrap().chars().count(), 128);
+
+    // PUT Tagging：缺 key → InvalidTag；空 TagSet 合法（= 清空）
+    let err = s3
+        .put_object_tagging(req(PutObjectTaggingInput {
+            bucket: "ttag".into(),
+            key: "k".into(),
+            tagging: Tagging {
+                tag_set: vec![Tag {
+                    key: None,
+                    value: Some("v".into()),
+                }],
+            },
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            request_payer: None,
+            version_id: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag);
+    s3.put_object_tagging(req(PutObjectTaggingInput {
+        bucket: "ttag".into(),
+        key: "k".into(),
+        tagging: Tagging { tag_set: vec![] },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        request_payer: None,
+        version_id: None,
+    }))
+    .await
+    .unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "ttag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(out.tag_set.is_empty());
+}
+
+#[tokio::test]
+async fn tagging_replica_ingest_drops_tags() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "rtag".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let mut r = req(PutObjectInput {
+        bucket: "rtag".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        tagging: Some("a=1".into()),
+        ..Default::default()
+    });
+    r.headers
+        .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+    s3.put_object(r).await.unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "rtag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(out.tag_set.is_empty(), "复制摄入不落标签（标签不跨界）");
+}
+
+#[tokio::test]
+async fn post_object_form_tagging_reaches_store() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "posttag".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // s3s 默认 post_object 委托 put_object，tagging 经 input 映射透传
+    s3.post_object(req(PostObjectInput {
+        bucket: "posttag".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"p"))),
+        tagging: Some("form=yes".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "posttag".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(tag_pair(&out.tag_set[0]), ("form", "yes"));
+}
+
+// ---- M8 前置：CopyObject 两轴 DIRECTIVE（切片 2） ----
+
+fn src(bucket: &str, key: &str, vid: Option<&str>) -> CopySource {
+    CopySource::Bucket {
+        bucket: bucket.into(),
+        key: key.into(),
+        version_id: vid.map(Into::into),
+    }
+}
+
+fn meta(pairs: &[(&str, &str)]) -> Metadata {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+async fn tags_of(s3: &OssS3, bucket: &str, key: &str) -> Vec<(String, String)> {
+    let out = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    out.tag_set
+        .iter()
+        .map(|t| {
+            (
+                t.key.clone().unwrap_or_default(),
+                t.value.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn copy_directive_axes_are_independent() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "copyb".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "copyb".into(),
+        key: "src".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"s"))),
+        content_type: Some("text/plain".into()),
+        metadata: Some(meta(&[("m", "1")])),
+        tagging: Some("a=1".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    // 默认 COPY：元数据 + 标签全继承
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("copyb".to_string())
+        .key("both".to_string())
+        .copy_source(src("copyb", "src", None))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "copyb".into(),
+            key: "both".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(head.metadata.as_ref(), Some(&meta(&[("m", "1")])));
+    assert_eq!(
+        tags_of(&s3, "copyb", "both").await,
+        [("a".into(), "1".into())]
+    );
+
+    // metadata REPLACE（仅 content-type）：元数据轴替换、标签轴仍 COPY
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("copyb".to_string())
+        .key("md".to_string())
+        .copy_source(src("copyb", "src", None))
+        .metadata_directive(Some(MetadataDirective::from_static("REPLACE")))
+        .content_type(Some("text/x-t".into()))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "copyb".into(),
+            key: "md".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.content_type.as_deref(), Some("text/x-t"));
+    assert_eq!(
+        head.metadata.as_ref(),
+        Some(&Metadata::default()),
+        "REPLACE 未给 metadata → 清空"
+    );
+    assert_eq!(
+        tags_of(&s3, "copyb", "md").await,
+        [("a".into(), "1".into())]
+    );
+
+    // metadata REPLACE（仅 metadata）：content-type 不继承
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("copyb".to_string())
+        .key("md2".to_string())
+        .copy_source(src("copyb", "src", None))
+        .metadata_directive(Some(MetadataDirective::from_static("REPLACE")))
+        .metadata(Some(meta(&[("m", "2")])))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "copyb".into(),
+            key: "md2".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.content_type, None);
+    assert_eq!(head.metadata.as_ref(), Some(&meta(&[("m", "2")])));
+
+    // tagging REPLACE + header → 标签替换、metadata 仍继承
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("copyb".to_string())
+        .key("tg".to_string())
+        .copy_source(src("copyb", "src", None))
+        .tagging_directive(Some(TaggingDirective::from_static("REPLACE")))
+        .tagging(Some("x=9".into()))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        tags_of(&s3, "copyb", "tg").await,
+        [("x".into(), "9".into())]
+    );
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "copyb".into(),
+            key: "tg".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.metadata.as_ref(), Some(&meta(&[("m", "1")])));
+
+    // COPY 时携带 x-amz-tagging → 忽略、继承源
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("copyb".to_string())
+        .key("ign".to_string())
+        .copy_source(src("copyb", "src", None))
+        .tagging(Some("z=9".into()))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        tags_of(&s3, "copyb", "ign").await,
+        [("a".into(), "1".into())]
+    );
+
+    // tagging REPLACE 不带 header → 清空
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("copyb".to_string())
+        .key("empty".to_string())
+        .copy_source(src("copyb", "src", None))
+        .tagging_directive(Some(TaggingDirective::from_static("REPLACE")))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    assert!(tags_of(&s3, "copyb", "empty").await.is_empty());
+}
+
+#[tokio::test]
+async fn copy_from_old_version_inherits_that_versions_tags() {
+    let (s3, _d) = service().await;
+    versioned(&s3, "cpv").await;
+    let v1 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "cpv".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"1"))),
+            tagging: Some("old=1".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "cpv".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"2"))),
+        tagging: Some("new=2".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("cpv".to_string())
+        .key("dst".to_string())
+        .copy_source(src("cpv", "k", Some(v1.as_str())))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        tags_of(&s3, "cpv", "dst").await,
+        [("old".into(), "1".into())]
+    );
+}
+
+#[tokio::test]
+async fn copy_to_self_requires_metadata_replace() {
+    let (s3, _d) = service().await;
+    versioned(&s3, "selfv").await;
+    let v1 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "selfv".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            metadata: Some(meta(&[("m", "1")])),
+            tagging: Some("a=1".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+
+    // 仅 td=REPLACE（md=COPY）→ 仍拒
+    let err = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("selfv".to_string())
+            .key("k".to_string())
+            .copy_source(src("selfv", "k", None))
+            .tagging_directive(Some(TaggingDirective::from_static("REPLACE")))
+            .build()
+            .unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+    // 默认 COPY → 拒
+    let err = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("selfv".to_string())
+            .key("k".to_string())
+            .copy_source(src("selfv", "k", None))
+            .build()
+            .unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+
+    // md=REPLACE 放行：新版本、元数据替换、标签默认继承
+    let out = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("selfv".to_string())
+            .key("k".to_string())
+            .copy_source(src("selfv", "k", None))
+            .metadata_directive(Some(MetadataDirective::from_static("REPLACE")))
+            .metadata(Some(meta(&[("m", "2")])))
+            .build()
+            .unwrap()))
+        .await
+        .unwrap()
+        .output;
+    let v2 = out.version_id.unwrap();
+    assert_ne!(v1, v2);
+    let versions = s3
+        .list_object_versions(req(ListObjectVersionsInput {
+            bucket: "selfv".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(versions.versions.unwrap().len(), 2);
+    // 旧版本元数据/标签未动
+    let old = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "selfv".into(),
+            key: "k".into(),
+            version_id: Some(v1.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(old.metadata.as_ref(), Some(&meta(&[("m", "1")])));
+    assert_eq!(
+        tags_of(&s3, "selfv", "k").await,
+        [("a".into(), "1".into())],
+        "链尾标签默认 COPY 继承"
+    );
+    let tail = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "selfv".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(tail.metadata.as_ref(), Some(&meta(&[("m", "2")])));
+
+    // 非版本桶：md=REPLACE 原地覆盖成功
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "selfn".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "selfn".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        metadata: Some(meta(&[("m", "1")])),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("selfn".to_string())
+        .key("k".to_string())
+        .copy_source(src("selfn", "k", None))
+        .metadata_directive(Some(MetadataDirective::from_static("REPLACE")))
+        .metadata(Some(meta(&[("m", "3")])))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "selfn".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.metadata.as_ref(), Some(&meta(&[("m", "3")])));
+}
+
+#[tokio::test]
+async fn copy_rejects_bad_directives_and_bad_tags() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "cpbad".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "cpbad".into(),
+        key: "src".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    // 非法指令值（s3s 类型解析宽松，服务端拒）
+    for (md, td) in [
+        (Some(MetadataDirective::from("replace".to_string())), None),
+        (None, Some(TaggingDirective::from("COPYX".to_string()))),
+    ] {
+        let err = s3
+            .copy_object(req(CopyObjectInput::builder()
+                .bucket("cpbad".to_string())
+                .key("dst".to_string())
+                .copy_source(src("cpbad", "src", None))
+                .metadata_directive(md)
+                .tagging_directive(td)
+                .build()
+                .unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    }
+    // REPLACE 标签非法 → InvalidTag，且目标未产生
+    let err = s3
+        .copy_object(req(CopyObjectInput::builder()
+            .bucket("cpbad".to_string())
+            .key("bad".to_string())
+            .copy_source(src("cpbad", "src", None))
+            .tagging_directive(Some(TaggingDirective::from_static("REPLACE")))
+            .tagging(Some("a=%0A".into()))
+            .build()
+            .unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag);
+    let err = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "cpbad".into(),
+            key: "bad".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
+}

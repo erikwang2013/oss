@@ -75,9 +75,11 @@ pub struct PolicyRequest<'a> {
 /// op → `s3:<Action>`（子集；未映射返回 None → 策略不参与，回落既有判定）。
 pub fn s3_action(op: &str) -> Option<&'static str> {
     Some(match op {
-        "GetObject" | "HeadObject" => "s3:GetObject",
+        "GetObject" | "HeadObject" | "GetObjectTagging" => "s3:GetObject",
         "PutObject"
         | "PostObject"
+        | "PutObjectTagging"
+        | "DeleteObjectTagging"
         | "CreateMultipartUpload"
         | "UploadPart"
         | "CompleteMultipartUpload"
@@ -261,8 +263,37 @@ mod tests {
         assert_eq!(s3_action("PutObject"), Some("s3:PutObject"));
         assert_eq!(s3_action("DeleteObjects"), Some("s3:DeleteObject"));
         assert_eq!(s3_action("ListObjectsV2"), Some("s3:ListBucket"));
+        // M8 前置：标签 op 折叠到对象读/写（AWS 语义）
+        assert_eq!(s3_action("GetObjectTagging"), Some("s3:GetObject"));
+        assert_eq!(s3_action("PutObjectTagging"), Some("s3:PutObject"));
+        assert_eq!(s3_action("DeleteObjectTagging"), Some("s3:PutObject"));
         assert_eq!(s3_action("CopyObject"), None);
         assert_eq!(s3_action("Frobnicate"), None);
+    }
+
+    /// 标签 op 折叠后，s3:GetObject / s3:PutObject 的 Deny 同样压住标签读写。
+    #[test]
+    fn tagging_folds_into_object_actions() {
+        let deny_read = doc(r#"{"Statement":[
+            {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}
+        ]}"#);
+        assert_eq!(
+            evaluate(
+                &deny_read,
+                &req("GetObjectTagging", Some("a")),
+                "s3:GetObject"
+            ),
+            Some(false)
+        );
+        let allow_write = doc(r#"{"Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bkt/*"}
+        ]}"#);
+        for op in ["PutObjectTagging", "DeleteObjectTagging"] {
+            assert_eq!(
+                evaluate(&allow_write, &req(op, Some("a")), "s3:PutObject"),
+                Some(true)
+            );
+        }
     }
 
     /// Resource 按 op 类别单轴（verifier 非阻断 2）：桶 ARN 不匹配对象请求、对象 ARN 不匹配桶请求。
