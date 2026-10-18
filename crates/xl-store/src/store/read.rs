@@ -62,6 +62,7 @@ impl Store {
             encryption: v.encryption.clone(),
             lock: v.lock.clone(),
             replication_status: v.replication_status.clone(),
+            tags: v.tags.clone().unwrap_or_default(),
         })
     }
 

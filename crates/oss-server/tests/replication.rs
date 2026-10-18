@@ -56,7 +56,8 @@ async fn put_versioned(store: &Store, key: &str, body: &'static [u8]) -> (String
             true,
             None,
             None,
-        )
+        
+            None,)
         .await
         .unwrap();
     (info.version_id.unwrap(), info.etag)
@@ -729,7 +730,8 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
             true,
             None,
             None,
-        )
+        
+            None,)
         .await
         .unwrap();
     let vid = info.version_id.clone().unwrap();

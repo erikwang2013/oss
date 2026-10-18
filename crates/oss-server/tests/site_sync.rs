@@ -295,7 +295,8 @@ async fn snapshot_ship_apply_and_replay() {
             true,
             None,
             None,
-        )
+        
+            None,)
         .await
         .unwrap();
     let site_vid = vinfo.version_id.unwrap();
@@ -351,7 +352,8 @@ async fn snapshot_ship_apply_and_replay() {
             true,
             None,
             None,
-        )
+        
+            None,)
         .await
         .unwrap();
     let drop_vid = drop_info.version_id.clone().unwrap();

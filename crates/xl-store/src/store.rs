@@ -107,6 +107,8 @@ pub struct ObjectInfo {
     pub lock: Option<ObjectLockRecord>,
     /// M6 切片 3：复制状态（PENDING/COMPLETED/FAILED/REPLICA；None = 非复制对象）
     pub replication_status: Option<String>,
+    /// M8 前置：对象标签（空 = 无标签；顺序同写入端）。
+    pub tags: Vec<meta::ObjectTag>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1370,3 +1372,5 @@ mod tests_crypto;
 mod tests_lock;
 #[cfg(test)]
 mod tests_replication;
+#[cfg(test)]
+mod tests_tags;

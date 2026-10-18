@@ -715,7 +715,8 @@ impl S3 for OssS3 {
                 versioned,
                 sse.spec, // M5 切片 3：SSE 头映射（R1/R2）
                 lock,     // M5 切片 4（L3）
-            )
+            
+                None,)
             .await;
         let info = match result {
             Ok(info) => info,
@@ -2490,7 +2491,8 @@ impl S3 for OssS3 {
                 dst_versioned,
                 dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
                 dst_lock,     // M5 切片 4（L3）
-            )
+            
+                None,)
             .await
             .map_err(to_s3_error)?;
         self.emit(

@@ -98,6 +98,7 @@ impl Store {
             false, // 兼容壳：无版本控制（S3 层显式传 state）
             None,  // 兼容壳：无加密（切片 3 由 S3 头映射）
             None,  // 兼容壳：无对象锁
+            None,  // M8 前置：无标签
         )
         .await
     }
@@ -134,6 +135,7 @@ impl Store {
             false,
             None, // 兼容壳：无加密
             None, // 兼容壳：无对象锁
+            None, // M8 前置：无标签
         )
         .await
     }
@@ -591,8 +593,15 @@ impl Store {
         versioned: bool,
         encryption: Option<crypto::EncSpec>,
         lock: Option<meta::ObjectLockRecord>,
+        tags: Option<Vec<meta::ObjectTag>>,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
+        // M8 前置：标签在写入口先校验（与 set_replication_status 白名单同模式）；
+        // 空集合归一为 None（S3 无标签与空 TagSet 等价）。
+        if let Some(t) = &tags {
+            meta::validate_tags(t).map_err(Error::InvalidArgument)?;
+        }
+        let tags = tags.filter(|t| !t.is_empty());
         // 桶窗口（桶锁内，M2b-2 Task 10）：ensure + 对象目录先落盘——此后 delete_bucket
         // 见到非空必拒，桶「复活」窗口关闭。失败清理时清掉可能新建的空目录（空目录会卡住删桶）
         let obj_dir = {
@@ -701,7 +710,7 @@ impl Store {
                 // M5 切片 4：对象锁随版本落 meta（守卫在删除路径）
                 lock: lock_record.clone(),
                 replication_status: None,
-                tags: None,
+                tags: tags.clone(),
             };
             // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
             let mut meta = match (versioned, old_meta.as_ref()) {
@@ -814,6 +823,7 @@ impl Store {
             encryption: enc_record,
             lock: lock_record,
             replication_status: None,
+            tags: tags.unwrap_or_default(),
         })
     }
 }

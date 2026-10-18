@@ -405,6 +405,92 @@ impl Store {
         Ok(())
     }
 
+    /// M8 前置：写某版本标签（空 vec = 清除）。返回解析到的版本号（"null" 或 uuid）。
+    /// 无 versionId = 链尾（链尾 marker → NoSuchKey）；点名 marker → DeleteMarker（405）；
+    /// 未知版本 → NoSuchKey。标签写只重写 meta，不新增版本。
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: Vec<meta::ObjectTag>,
+    ) -> Result<String> {
+        meta::validate_tags(&tags).map_err(Error::InvalidArgument)?;
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(old) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let mut m = old.clone();
+        let target = match version_id {
+            Some(vid) => {
+                let idx = m
+                    .versions
+                    .iter()
+                    .position(|v| v.version_id_str() == vid)
+                    .ok_or_else(|| Error::NoSuchKey(format!("{key}@{vid}")))?;
+                if m.versions[idx].delete_marker() {
+                    return Err(Error::DeleteMarker(format!("{bucket}/{key}@{vid}")));
+                }
+                idx
+            }
+            None => {
+                let idx = m
+                    .versions
+                    .len()
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+                if m.versions[idx].delete_marker() {
+                    return Err(Error::NoSuchKey(key.to_string()));
+                }
+                idx
+            }
+        };
+        let vid = m.versions[target].version_id_str();
+        m.versions[target].tags = (!tags.is_empty()).then_some(tags);
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
+        m.refresh_latest_flags();
+        self.write_meta(bucket, key, &m, Some(&old)).await?;
+        Ok(vid)
+    }
+
+    /// M8 前置：读某版本标签。None = 链尾；链尾 marker → NoSuchKey；点名 marker → DeleteMarker。
+    pub async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<(String, Vec<meta::ObjectTag>)> {
+        self.ensure_bucket(bucket).await?;
+        let m = self
+            .read_meta(bucket, key)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        let v = match version_id {
+            Some(vid) => {
+                let v = m
+                    .find_version(vid)
+                    .ok_or_else(|| Error::NoSuchKey(format!("{key}@{vid}")))?;
+                if v.delete_marker() {
+                    return Err(Error::DeleteMarker(format!("{bucket}/{key}@{vid}")));
+                }
+                v
+            }
+            None => {
+                let v = m
+                    .latest()
+                    .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+                if v.delete_marker() {
+                    return Err(Error::NoSuchKey(key.to_string()));
+                }
+                v
+            }
+        };
+        Ok((v.version_id_str(), v.tags.clone().unwrap_or_default()))
+    }
+
     /// M6 切片 4（P2-2）：置 PENDING 但**不降级终态**（COMPLETED/FAILED/REPLICA 保持）。
     /// 用于入队侧——并发 worker 可能已在 PENDING 写入前完成复制。
     pub async fn mark_replication_pending(
@@ -749,5 +835,6 @@ fn version_info(key: &str, v: &Version) -> ObjectInfo {
         encryption: v.encryption.clone(),
         lock: v.lock.clone(),
         replication_status: v.replication_status.clone(),
+        tags: v.tags.clone().unwrap_or_default(),
     }
 }

@@ -265,6 +265,8 @@ fn merge_page(
                         encryption: None,
                         lock: None,
                         replication_status: None,
+                        // 并集降级条目无全量信息（标签只在 Get/Head/GetTagging 面）
+                        tags: Vec::new(),
                     },
                 };
                 result.objects.push(info);

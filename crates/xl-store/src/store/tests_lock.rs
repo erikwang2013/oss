@@ -43,6 +43,7 @@ async fn put_locked(s: &Store, key: &str, l: Option<ObjectLockRecord>) -> (Strin
             true, // versioned：锁对象只存在于版本桶（L7）
             None,
             l,
+            None,
         )
         .await
         .unwrap();
@@ -257,6 +258,7 @@ async fn empty_lock_is_not_stored() {
             false,
             None,
             Some(empty),
+            None,
         )
         .await
         .unwrap();
@@ -274,6 +276,7 @@ async fn empty_lock_is_not_stored() {
             false,
             Some(EncSpec::SseC(key.clone())),
             Some(lock("GOVERNANCE", now_plus(60), false)),
+            None,
         )
         .await
         .unwrap();
@@ -309,6 +312,7 @@ async fn purge_and_overwrite_guards_block_locked_versions() {
             Default::default(),
             None,
             false,
+            None,
             None,
             None,
         )

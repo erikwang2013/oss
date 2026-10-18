@@ -620,6 +620,8 @@ impl Store {
             encryption: enc_record,
             lock: effective_lock,
             replication_status: None,
+            // M8 前置：MPU 的 x-amz-tagging 不在本切片（契约外）
+            tags: Vec::new(),
         })
     }
 
