@@ -184,6 +184,7 @@ impl Store {
                 is_delete_marker: Some(true),
                 is_latest: None,
                 replication_status: None,
+                tags: None,
                 // NTP 回拨收口：marker 也是新写版本，epoch 同样单调 +1
                 epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
                 encryption: None, // marker 无数据，恒无加密记录

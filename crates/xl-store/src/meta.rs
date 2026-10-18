@@ -1,7 +1,7 @@
 //! xl.meta v1 —— 每个对象目录一份，是**唯一的提交点**。
 //!
 //! 编码：`[1 字节格式版本][msgpack 载荷]`。版本字节是前向兼容的锚点：
-//! 后续阶段（版本控制/加密/对象锁/复制）只往 `Version` 里加 `Option` 字段，
+//! 后续阶段（版本控制/加密/对象锁/复制/对象标签）只往 `Version` 里加 `Option` 字段，
 //! 老解码器靠 serde 的默认「跳过未知字段」行为继续可读。
 //! 非 Option 字段必须带 `#[serde(default)]`——新解码器读旧文件时，缺 default 会硬报
 //! `missing field`（M4 的 is_latest/is_delete_marker 等要照此办）。
@@ -77,6 +77,61 @@ pub struct Version {
     /// decode 白名单校验（信任边界）；老解码器跳过未知字段 = 前向兼容。
     #[serde(default)]
     pub replication_status: Option<String>,
+    /// M8 前置：对象标签（键值对，按客户端顺序；None/空 = 无标签）。
+    /// 只加 Option 字段 = 前向兼容契约；decode 校验长度/字符集/重复键（信任边界）。
+    #[serde(default)]
+    pub tags: Option<Vec<ObjectTag>>,
+}
+
+/// 对象标签（S3 Tag）。键唯一、最多 [`MAX_TAGS`] 条。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectTag {
+    pub key: String,
+    pub value: String,
+}
+
+/// S3 允许的标签上限（每对象）。
+pub const MAX_TAGS: usize = 10;
+/// 标签键的 Unicode 标量上限。
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+/// 标签值的 Unicode 标量上限。
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// 校验标签集合（S3 口径）：≤10 条、键 1..=128、值 0..=256（Unicode 标量）、键唯一、
+/// 仅 Unicode 字母/数字 + 空格 + `+ - = . _ : / @`（控制字符/换行天然排除）。
+pub fn validate_tags(tags: &[ObjectTag]) -> std::result::Result<(), String> {
+    if tags.len() > MAX_TAGS {
+        return Err(format!("标签数量超过上限 {}", MAX_TAGS));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(tags.len());
+    for t in tags {
+        if t.key.is_empty() {
+            return Err("标签键不能为空".into());
+        }
+        if t.key.chars().count() > MAX_TAG_KEY_CHARS {
+            return Err(format!("标签键超过 {} 字符", MAX_TAG_KEY_CHARS));
+        }
+        if t.value.chars().count() > MAX_TAG_VALUE_CHARS {
+            return Err(format!("标签值超过 {} 字符", MAX_TAG_VALUE_CHARS));
+        }
+        let ok = |s: &str| {
+            s.chars().all(|c| {
+                c.is_alphanumeric()
+                    || c == ' '
+                    || matches!(c, '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
+            })
+        };
+        if !ok(&t.key) {
+            return Err(format!("标签键含非法字符：{:?}", t.key));
+        }
+        if !ok(&t.value) {
+            return Err(format!("标签值含非法字符：{:?}", t.value));
+        }
+        if !seen.insert(t.key.as_str()) {
+            return Err(format!("标签键重复：{:?}", t.key));
+        }
+    }
+    Ok(())
 }
 
 impl Version {
@@ -227,6 +282,12 @@ impl XlMeta {
                 && !matches!(rs.as_str(), "PENDING" | "COMPLETED" | "FAILED" | "REPLICA")
             {
                 return Err(Error::CorruptMeta(format!("非法复制状态：{rs:?}")));
+            }
+            // M8 前置：标签集合（信任边界——长度/字符集/重复键在解码时收口）
+            if let Some(tags) = &v.tags
+                && let Err(e) = validate_tags(tags)
+            {
+                return Err(Error::CorruptMeta(format!("标签非法：{e}")));
             }
             // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）。
             // M5 切片 2：加密 inline 的落盘态是密文（C = c_len(P)），上限随方案放宽。
@@ -424,6 +485,7 @@ mod tests {
                 encryption: None,
                 lock: None,
                 replication_status: None,
+                tags: None,
             }],
         }
     }
@@ -623,13 +685,14 @@ mod tests {
         // 摘要均按「有意识更新」流程重算（本次为第四次；**第五次**：M4 切片 4 增 epoch 字段；
         // **第六次**：M5 切片 2 增 encryption 字段——明文对象写 nil，老解码器跳过；
         // **第七次**：M5 切片 4 增 lock 字段——无锁对象写 nil，老解码器跳过；
-        // **第八次**：M6 切片 3 增 replication_status 字段——非复制对象写 nil，老解码器跳过）。
+        // **第八次**：M6 切片 3 增 replication_status 字段——非复制对象写 nil，老解码器跳过；
+        // **第九次**：M8 前置增 tags 字段——无标签对象写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "29bb7d19e86b742d3b9dbb1c48a23303f707353370efcc44e6e2c3a5f8c7a505"
+            "e85b90792fc2b61c86937b28244125bdcff5d6744ce984398a557f4be605d302"
         );
     }
 }
@@ -662,6 +725,7 @@ mod parts_tests {
             encryption: None,
             lock: None,
             replication_status: None,
+            tags: None,
         }
     }
 
@@ -848,6 +912,55 @@ mod parts_tests {
         framed.extend(bytes);
         let back = XlMeta::decode(&framed).unwrap();
         assert!(back.versions[0].parts.is_none());
+        assert!(back.versions[0].tags.is_none(), "旧 meta 无 tags → None");
         assert_eq!(back.versions[0].effective_parts()[0].uuid, "u");
+    }
+
+    #[test]
+    fn validate_tags_matrix() {
+        let tag = |k: &str, v: &str| ObjectTag {
+            key: k.into(),
+            value: v.into(),
+        };
+        // 正向：10 条 / 128 字符键 / 256 字符值 / 中文字符按标量计数
+        let max_ok: Vec<ObjectTag> = (0..MAX_TAGS)
+            .map(|i| ObjectTag {
+                key: format!("{i}{}", "键".repeat(127)),
+                value: "v".repeat(256),
+            })
+            .collect();
+        assert!(validate_tags(&max_ok).is_ok());
+        assert!(validate_tags(&[tag("中文键", "中文值")]).is_ok());
+        assert!(validate_tags(&[tag("a b", "v+1=2:3/4@5.6_7-8")]).is_ok());
+        // 反向
+        assert!(validate_tags(&vec![tag("k", "v"); MAX_TAGS + 1]).is_err());
+        assert!(validate_tags(&[tag("", "v")]).is_err());
+        assert!(validate_tags(&[tag(&"k".repeat(129), "v")]).is_err());
+        assert!(validate_tags(&[tag("k", &"v".repeat(257))]).is_err());
+        assert!(validate_tags(&[tag("k", "v"), tag("k", "w")]).is_err());
+        assert!(validate_tags(&[tag("k!", "v")]).is_err());
+        assert!(validate_tags(&[tag("k\n", "v")]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_tags() {
+        let mut v = version(None);
+        v.tags = Some(vec![
+            ObjectTag {
+                key: "dup".into(),
+                value: "1".into(),
+            },
+            ObjectTag {
+                key: "dup".into(),
+                value: "2".into(),
+            },
+        ]);
+        let bytes = XlMeta {
+            object_key: "a".into(),
+            versions: vec![v],
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
     }
 }
