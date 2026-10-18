@@ -1,7 +1,19 @@
-export type Mood = 'happy' | 'smug' | 'dejected' | 'cry' | 'shocked'
+export type Mood =
+  | 'smile'
+  | 'joy'
+  | 'cry'
+  | 'dejected'
+  | 'terrified'
+  | 'angry'
+  | 'spoiled'
+  | 'cute'
+  | 'plead'
+  | 'knock'
+  | 'facepalm'
+  | 'tongue'
 
 /// 项目吉祥物（存储桶小家伙）的 `<img>` 封装。
-/// sprite 在 `web/public/mascot/*.svg`，设计稿见 `docs/assets/mascot*.svg`；
+/// 12 种形态与 `docs/pet-expressions/*.svg` 同源（去掉标签与底色后裁成 184×180）；
 /// SVG 自带的 SMIL 动画（眨眼、落泪、抖动等）经 `<img>` 引用时在浏览器里照常播放。
 export default function Mascot({
   mood,

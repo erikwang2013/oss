@@ -1,16 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     viewBox="8 80 184 180" width="184" height="180">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="8 80 184 180" width="184" height="180">
   <title>OSS 吉祥物 · dejected</title>
   <defs>
     <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#7ba3cc"/>
-      <stop offset="1" stop-color="#55779c"/>
+      <stop offset="0" stop-color="#7ba3cc"/><stop offset="1" stop-color="#55779c"/>
     </linearGradient>
     <linearGradient id="insideGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#22303f"/>
-      <stop offset="1" stop-color="#31445a"/>
+      <stop offset="0" stop-color="#22303f"/><stop offset="1" stop-color="#31445a"/>
     </linearGradient>
-
     <g id="bucket">
       <ellipse cx="280" cy="492" rx="185" ry="16" fill="#0f172a" opacity="0.07"/>
       <ellipse cx="280" cy="200" rx="170" ry="58" fill="url(#insideGrad)"/>
@@ -40,10 +36,11 @@
       <circle cx="394" cy="410" r="5" fill="#4ade80"/>
     </g>
   </defs>
-<g transform="translate(-26,24) scale(0.45)">
+  <g transform="translate(-26,24) scale(0.45)">
+
     <use xlink:href="#bucket" href="#bucket"/>
-    <path d="M450,200 A170,58 0 0 1 110,200 C104,260 132,370 162,430 A118,44 0 0 0 398,430 C428,370 456,260 450,200 Z"
-          fill="#8b98aa" opacity="0">
+
+    <path d="M450,200 A170,58 0 0 1 110,200 C104,260 132,370 162,430 A118,44 0 0 0 398,430 C428,370 456,260 450,200 Z" fill="#8b98aa" opacity="0">
       <animate attributeName="opacity" values="0;0.32;0" keyTimes="0;0.5;1" dur="4.4s" repeatCount="indefinite"/>
     </path>
     <path d="M206,300 L238,306" stroke="#22303f" stroke-width="4" stroke-linecap="round"/>
@@ -62,5 +59,10 @@
     <path d="M266,358 Q280,352 294,358" fill="none" stroke="#22303f" stroke-width="2.4" stroke-linecap="round">
       <animateTransform attributeName="transform" type="translate" values="0 0;0 2;0 0" keyTimes="0;0.5;1" dur="3.4s" repeatCount="indefinite"/>
     </path>
+    <path d="M360,252 C368,259 368,268 360,276 C352,268 352,259 360,252 Z" fill="#a8d8fb" opacity="0.8">
+      <animateTransform attributeName="transform" type="translate" values="0 0;0 12" dur="3.8s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.8;0.7;0" keyTimes="0;0.7;1" dur="3.8s" repeatCount="indefinite"/>
+    </path>
+
   </g>
 </svg>

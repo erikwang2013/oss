@@ -33,7 +33,7 @@ function Shell() {
       <Layout.Sider theme="light" width={216} style={{ borderRight: '1px solid #eef1f5' }}>
         {/* 侧栏品牌位：吉祥物当 logo（导航项本身保留语义图标——14px 的小脸认不出来） */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '16px 20px 10px' }}>
-          <Mascot mood="happy" size={32} alt="OSS 控制台" />
+          <Mascot mood="smile" size={32} alt="OSS 控制台" />
           <span style={{ fontWeight: 700, fontSize: 16 }}>OSS 控制台</span>
         </div>
         <Menu

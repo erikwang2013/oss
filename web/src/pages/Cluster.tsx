@@ -126,7 +126,7 @@ export default function Cluster() {
       )}
       {data?.mode === 'single' && (
         <Flex align="center" gap={12} style={{ marginTop: 16 }}>
-          <Mascot mood="happy" size={40} alt="单机模式" />
+          <Mascot mood="smile" size={40} alt="单机模式" />
           <Typography.Text type="secondary">
             单机部署没有集群拓扑；配置 [cluster] 后此处显示节点表、可达性与指纹。
           </Typography.Text>

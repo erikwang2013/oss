@@ -51,7 +51,7 @@ export default function UploadPanel({
       setLast(outcome)
       message.success({
         content: outcome.instant ? '上传成功（秒传）' : '上传成功',
-        icon: <Mascot mood={outcome.instant ? 'smug' : 'happy'} size={22} alt="" />,
+        icon: <Mascot mood={outcome.instant ? 'cute' : 'smile'} size={22} alt="" />,
       })
       if (outcome.savedPath) {
         await api('/api/v1/uploads/register', {
@@ -137,7 +137,7 @@ export default function UploadPanel({
         {last && (
           <Space align="center">
             <Mascot
-              mood={last.instant ? 'smug' : 'happy'}
+              mood={last.instant ? 'cute' : 'smile'}
               size={56}
               alt={last.instant ? '秒传命中' : '分块上传完成'}
             />

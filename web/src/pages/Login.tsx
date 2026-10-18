@@ -21,7 +21,7 @@ export default function Login() {
     } catch (e) {
       message.error({
         content: e instanceof Error && e.message ? e.message : '登录失败',
-        icon: <Mascot mood="shocked" size={22} alt="" />,
+        icon: <Mascot mood="terrified" size={22} alt="" />,
       })
     } finally {
       setLoading(false)
@@ -41,7 +41,7 @@ export default function Login() {
         background: 'linear-gradient(180deg, #eef4fb 0%, #f8fafc 55%, #f1f5f9 100%)',
       }}
     >
-      <Mascot mood="happy" size={112} alt="OSS 控制台吉祥物" />
+      <Mascot mood="joy" size={112} alt="OSS 控制台吉祥物" />
       <Card
         title="OSS 控制台"
         style={{ width: 360, marginTop: 8, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.08)' }}

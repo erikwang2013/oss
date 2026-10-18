@@ -1,16 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     viewBox="8 80 184 180" width="184" height="180">
-  <title>OSS 吉祥物 · happy</title>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="8 80 184 180" width="184" height="180">
+  <title>OSS 吉祥物 · tongue</title>
   <defs>
     <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#7ba3cc"/>
-      <stop offset="1" stop-color="#55779c"/>
+      <stop offset="0" stop-color="#7ba3cc"/><stop offset="1" stop-color="#55779c"/>
     </linearGradient>
     <linearGradient id="insideGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#22303f"/>
-      <stop offset="1" stop-color="#31445a"/>
+      <stop offset="0" stop-color="#22303f"/><stop offset="1" stop-color="#31445a"/>
     </linearGradient>
-
     <g id="bucket">
       <ellipse cx="280" cy="492" rx="185" ry="16" fill="#0f172a" opacity="0.07"/>
       <ellipse cx="280" cy="200" rx="170" ry="58" fill="url(#insideGrad)"/>
@@ -40,27 +36,31 @@
       <circle cx="394" cy="410" r="5" fill="#4ade80"/>
     </g>
   </defs>
-<g transform="translate(-26,24) scale(0.45)">
+  <g transform="translate(-26,24) scale(0.45)">
+    <g><animateTransform attributeName="transform" type="rotate" values="-2 280 430;2 280 430;-2 280 430" dur="2.4s" repeatCount="indefinite"/>
     <use xlink:href="#bucket" href="#bucket"/>
-    <path d="M206,320 Q222,304 238,320" fill="none" stroke="#22303f" stroke-width="5.5" stroke-linecap="round">
-      <animateTransform attributeName="transform" type="translate" values="0 0;0 -5;0 0" dur="0.9s" begin="0s" repeatCount="indefinite"/>
-    </path>
-    <path d="M322,320 Q338,304 354,320" fill="none" stroke="#22303f" stroke-width="5.5" stroke-linecap="round">
-      <animateTransform attributeName="transform" type="translate" values="0 0;0 -5;0 0" dur="0.9s" begin="0.45s" repeatCount="indefinite"/>
-    </path>
-    <ellipse cx="194" cy="342" rx="19" ry="10" fill="#f0b9a6">
-      <animate attributeName="opacity" values="0.7;1;0.7" dur="2s" repeatCount="indefinite"/>
-    </ellipse>
-    <ellipse cx="366" cy="342" rx="19" ry="10" fill="#f0b9a6">
-      <animate attributeName="opacity" values="0.7;1;0.7" dur="2s" repeatCount="indefinite"/>
-    </ellipse>
-    <ellipse cx="280" cy="334" rx="6.5" ry="5" fill="#33506d"/>
-    <g transform="translate(280,360)">
+
+    <ellipse cx="222" cy="316" rx="16" ry="18" fill="#22303f"/>
+    <circle cx="227" cy="309" r="5" fill="#ffffff"/>
+    <path d="M322,318 Q338,302 354,318" fill="none" stroke="#22303f" stroke-width="5.5" stroke-linecap="round"/>
+    <ellipse cx="280" cy="336" rx="6.5" ry="5" fill="#33506d"/>
+    <ellipse cx="194" cy="340" rx="18" ry="10" fill="#fb7185" opacity="0.55"><animate attributeName="opacity" values="0.55;0.8;0.55" dur="2s" repeatCount="indefinite"/></ellipse><ellipse cx="366" cy="340" rx="18" ry="10" fill="#fb7185" opacity="0.55"><animate attributeName="opacity" values="0.55;0.8;0.55" dur="2s" repeatCount="indefinite"/></ellipse>
+    <path d="M258,350 Q280,342 302,350 Q296,366 280,368 Q264,366 258,350 Z" fill="#22303f"/>
+    <g transform="translate(280,356)">
       <g>
-        <animateTransform attributeName="transform" type="scale" values="1 1;1.1 0.88;1 1" dur="0.9s" repeatCount="indefinite"/>
-        <path d="M-24,-16 Q0,18 24,-16 Z" fill="#22303f"/>
-        <ellipse cx="0" cy="2" rx="10" ry="6" fill="#f2a68f"/>
+        <animateTransform attributeName="transform" type="rotate" values="-7;7;-7" dur="0.8s" repeatCount="indefinite"/>
+        <path d="M-7,-2 Q0,-6 7,-2 Q10,16 0,20 Q-10,16 -7,-2 Z" fill="#fb7185"/>
+        <path d="M0,2 L0,14" stroke="#e11d48" stroke-width="1.6" stroke-linecap="round"/>
       </g>
+    </g>
+    <g transform="translate(416,330)">
+      <path d="M0,-10 L2.5,-2.5 L10,0 L2.5,2.5 L0,10 L-2.5,2.5 L-10,0 L-2.5,-2.5 Z" fill="#fbbf24">
+        <animateTransform attributeName="transform" type="scale" values="0.7;1.2;0.7" dur="1s" repeatCount="indefinite"/>
+      </path>
+    </g>
+    <path d="M320,352 Q330,346 340,352" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-dasharray="3 4">
+      <animate attributeName="opacity" values="0.2;1;0.2" dur="0.9s" repeatCount="indefinite"/>
+    </path>
     </g>
   </g>
 </svg>
