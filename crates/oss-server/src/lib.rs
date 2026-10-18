@@ -10,4 +10,6 @@ pub mod lifecycle;
 pub mod repl_client;
 pub mod replication;
 pub mod router;
+pub mod site;
+pub mod site_client;
 pub mod state;

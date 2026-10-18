@@ -76,6 +76,31 @@ impl OssS3 {
         self
     }
 
+    /// M7：建桶记账冲突后的补偿——按**最终行**判断：远端 upsert 胜出（行存在）时保留
+    /// 物理桶；远端 delete 胜出（无行）才删除刚建的空目录（不可误删对端已建桶）。
+    async fn rollback_created_bucket(&self, bucket: &str) {
+        match self.acl.bucket_lock(bucket).await {
+            Ok(Some(_)) => {
+                // 行存在：物理桶应存在（若并发窗口里被删则补建空桶）。
+                match self.store.bucket_exists(bucket).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(e) = self.store.create_bucket(bucket).await {
+                            tracing::warn!(error = %e, bucket, "冲突补偿补建物理桶失败");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, bucket, "冲突补偿查桶失败"),
+                }
+            }
+            Ok(None) => {
+                if let Err(e) = self.store.delete_bucket(bucket).await {
+                    tracing::warn!(error = %e, bucket, "冲突补偿删除空桶失败");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, bucket, "冲突补偿读桶行失败（保守保留物理桶）"),
+        }
+    }
+
     /// 复制写提交回调（post-commit 尽力而为；实现自吞错误）。
     async fn repl_on_write(&self, info: crate::replication::WriteInfo<'_>) {
         if let Some(sink) = &self.repl_sink {
@@ -201,6 +226,11 @@ fn stream_err_to_s3(
         return s3s::s3_error!(IncompleteBody, "failed to read request body");
     }
     to_s3_error(e)
+}
+
+/// M7：SQLite BEFORE 门控的 `RAISE(ABORT,'site replication conflict')` 探测。
+fn is_site_conflict(e: &(impl std::fmt::Display + ?Sized)) -> bool {
+    e.to_string().contains("site replication conflict")
 }
 
 /// 校验和算法（本计划覆盖 s3s 输入里显式声明的那几种；组合语义留 M2b）。
@@ -449,16 +479,25 @@ impl S3 for OssS3 {
             .map_err(to_s3_error)?;
         // M5 切片 4（L2）：建桶即开锁（AWS：x-amz-bucket-object-lock-enabled 顺带开版本控制）
         if req.input.object_lock_enabled_for_bucket == Some(true) {
-            self.acl.enable_bucket_lock(&bucket).await.map_err(|e| {
+            if let Err(e) = self.acl.enable_bucket_lock(&bucket).await {
+                // M7 M1：记账门控失败时按最终行补偿（远端 upsert 胜出则保留物理桶）。
+                self.rollback_created_bucket(&bucket).await;
+                if is_site_conflict(&e) {
+                    return Err(s3s::s3_error!(
+                        OperationAborted,
+                        "site replication conflict"
+                    ));
+                }
                 tracing::error!(error = %e, bucket, "开桶锁失败");
-                s3s::s3_error!(InternalError, "internal error")
-            })?;
+                return Err(s3s::s3_error!(InternalError, "internal error"));
+            }
             // 行变更广播（lock/versioning 与归属行同批；best-effort，与 C3 同口径）
             self.store.broadcast_bucket_row(&bucket, None).await;
         }
         // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
         // C3：多 set 下缺省**自动指派**（桶数最少的 set；单 set 恒 0 零查询）。
-        // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）
+        // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）；
+        // 但站点 LWW 门控冲突必须回滚物理桶并显式失败（M7 M1）。
         if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().cloned() {
             let k = self.store.cluster().map_or(1, |c| c.sets.sets.len() as u16);
             let set = match self.acl.pick_least_loaded_set(k).await {
@@ -473,6 +512,13 @@ impl S3 for OssS3 {
                 .record_bucket_owner_set(&bucket, user.uid, set)
                 .await
             {
+                if is_site_conflict(&e) {
+                    self.rollback_created_bucket(&bucket).await;
+                    return Err(s3s::s3_error!(
+                        OperationAborted,
+                        "site replication conflict"
+                    ));
+                }
                 tracing::warn!(error = ?e, bucket, "桶归属记账失败");
             }
             // M5 切片 0（P4-1）：行变更广播（best-effort；关「别节点陈旧行」窗口）
@@ -504,6 +550,31 @@ impl S3 for OssS3 {
             .map_err(to_s3_error)?;
         // 记账清理（授权门已确认桶主/管理员）：清授权行 + 桶行 + 生命周期规则
         if let Err(e) = self.acl.forget_bucket(&bucket).await {
+            // M7 H1：门控 ABORT 时物理桶已删、行/授权未动——按最终行补偿后显式失败，
+            // 不允许“物理已删 + 行残留 + 无 delete changelog”静默成功。
+            if is_site_conflict(&e) {
+                match self.acl.bucket_lock(&bucket).await {
+                    // 远端 delete 已胜出（无行）：本地删除同样已生效，按幂等成功返回。
+                    Ok(None) => return Ok(S3Response::new(DeleteBucketOutput::default())),
+                    // 行仍在（远端 upsert/权限胜出）：恢复空桶并 409。
+                    Ok(Some(_)) => {
+                        if let Err(re) = self.store.create_bucket(&bucket).await {
+                            tracing::warn!(error = %re, bucket, "冲突补偿重建空桶失败");
+                        }
+                    }
+                    Err(re) => {
+                        // 行状态未知：恢复空桶（宁可多一个空目录，也不让行/物理不一致）。
+                        tracing::warn!(error = %re, bucket, "冲突补偿读桶行失败（恢复空桶）");
+                        if let Err(x) = self.store.create_bucket(&bucket).await {
+                            tracing::warn!(error = %x, bucket, "冲突补偿恢复空桶失败");
+                        }
+                    }
+                }
+                return Err(s3s::s3_error!(
+                    OperationAborted,
+                    "site replication conflict"
+                ));
+            }
             tracing::warn!(error = ?e, bucket, "删桶记账清理失败");
         }
         if let Err(e) = self.acl.clear_lifecycle_rules(&bucket).await {
@@ -1408,6 +1479,12 @@ impl S3 for OssS3 {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let event_source = EventSource::from_headers(&req.headers);
+        // P0-2：复制出的 DELETE 不得在目标端再生 marker 回环。
+        let replica = req
+            .headers
+            .get("x-amz-replication-status")
+            .and_then(|v| v.to_str().ok())
+            == Some("REPLICA");
         let bucket = req.input.bucket;
         let key = req.input.key;
         let vid = req.input.version_id.clone();
@@ -1441,7 +1518,7 @@ impl S3 for OssS3 {
                     etag: "",
                     size: 0,
                     is_delete_marker: true,
-                    is_replica: false,
+                    is_replica: replica,
                 })
                 .await;
                 (Some(true), Some(version_id))
@@ -1487,6 +1564,12 @@ impl S3 for OssS3 {
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let event_source = EventSource::from_headers(&req.headers);
+        // P0-2：批量删除的复制请求同样防回环。
+        let replica = req
+            .headers
+            .get("x-amz-replication-status")
+            .and_then(|v| v.to_str().ok())
+            == Some("REPLICA");
         let bucket = req.input.bucket;
         // §3.4：一次最多 1000 个
         if req.input.delete.objects.len() > 1000 {
@@ -1575,7 +1658,7 @@ impl S3 for OssS3 {
                                 etag: "",
                                 size: 0,
                                 is_delete_marker: true,
-                                is_replica: false,
+                                is_replica: replica,
                             })
                             .await;
                             (Some(true), Some(version_id), None)

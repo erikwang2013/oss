@@ -35,6 +35,36 @@ pub struct AppConfig {
     /// M6 切片 4：复制远端 `[[remotes]]`（Destination.Bucket 形如 `<id>/<bucket>`）。
     #[serde(default)]
     pub remotes: Vec<RemoteTarget>,
+    /// M7：站点节 `[site]`——存在即启用多站点复制（单节点站点对；与 `[cluster]` 互斥）。
+    #[serde(default)]
+    pub site: Option<SiteToml>,
+}
+
+/// `[site]`：本站点身份覆盖（缺省由首启种子生成）。`token` 为控制面通道共享密钥
+/// （`X-OSS-Site-Token`；对端在 `POST /api/v1/sites` 中配置）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteToml {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_region")]
+    pub region: String,
+    #[serde(default)]
+    pub priority: i64,
+    /// ≥32 位 hex（缺省随机生成并落库）
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl Default for SiteToml {
+    fn default() -> Self {
+        Self {
+            name: None,
+            region: default_region(),
+            priority: 0,
+            token: None,
+        }
+    }
 }
 
 /// `[[remotes]]`：复制出站目标端点与凭证（静态配置信任，同集群 secret 口径）。
@@ -160,6 +190,8 @@ impl AppConfig {
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.remotes_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.site_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
     }
 
@@ -232,6 +264,30 @@ impl AppConfig {
             }
             if r.region.trim().is_empty() {
                 return Err(format!("[[remotes]] {} 的 region 不能为空", r.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// M7：`[site]` 校验——name ≤64/非空、region 非空、token 32..=128 hex；与 `[cluster]` 互斥
+    /// （M7 = 单节点站点对，集群站点归后续）。
+    pub fn site_validate(&self) -> Result<(), String> {
+        if let Some(s) = &self.site {
+            if let Some(n) = &s.name
+                && (n.trim().is_empty() || n.len() > 64)
+            {
+                return Err(format!("[site].name 非法：{n:?}（非空且 ≤64）"));
+            }
+            if s.region.trim().is_empty() || s.region.len() > 64 {
+                return Err(format!("[site].region 非法：{:?}", s.region));
+            }
+            if let Some(t) = &s.token
+                && (t.len() < 32 || t.len() > 128 || !t.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err("[site].token 非法：需 32–128 位十六进制".into());
+            }
+            if self.cluster.is_some() {
+                return Err("[site] 与 [cluster] 互斥（M7 仅支持单节点站点对）".into());
             }
         }
         Ok(())
@@ -416,6 +472,7 @@ mod tests {
             kafka: KafkaToml::default(),
             cluster: None,
             remotes: vec![],
+            site: None,
         }
     }
 
@@ -542,6 +599,52 @@ mod tests {
         assert!(cfg(vec![e]).remotes_validate().is_err());
     }
 
+    /// M7：`[site]` 校验矩阵（token 形态 / 与 cluster 互斥）。
+    #[test]
+    fn site_validation_matrix() {
+        let mut c = base_cfg();
+        let hex = "a".repeat(32);
+        c.site = Some(SiteToml {
+            name: Some("a".into()),
+            region: "us-east-1".into(),
+            priority: 10,
+            token: Some(hex.clone()),
+        });
+        assert!(c.site_validate().is_ok());
+        // 未给 token（缺省随机）与空 name 也合法
+        c.site = Some(SiteToml::default());
+        assert!(c.site_validate().is_ok());
+        // 非法 token：短/非 hex
+        let bad = |t: &str| {
+            let mut c = base_cfg();
+            c.site = Some(SiteToml {
+                token: Some(t.into()),
+                ..Default::default()
+            });
+            c.site_validate().is_err()
+        };
+        assert!(bad("short"));
+        assert!(bad(&"z".repeat(32)));
+        assert!(bad(&"a".repeat(129)));
+        // name 过长 / region 空
+        let mut c = base_cfg();
+        c.site = Some(SiteToml {
+            name: Some("x".repeat(65)),
+            ..Default::default()
+        });
+        assert!(c.site_validate().is_err());
+        let mut c = base_cfg();
+        c.site = Some(SiteToml {
+            region: " ".into(),
+            ..Default::default()
+        });
+        assert!(c.site_validate().is_err());
+        // cluster + site 互斥
+        let mut c = cluster_cfg();
+        c.site = Some(SiteToml::default());
+        assert!(c.site_validate().is_err());
+    }
+
     /// M6 切片 1（P3-f）：Kafka 目标配置校验矩阵（启动 fail-closed）。
     #[test]
     fn kafka_targets_validation_matrix() {
@@ -563,6 +666,7 @@ mod tests {
             cluster: None,
             kafka: KafkaToml { targets },
             remotes: vec![],
+            site: None,
         };
         // 合法
         assert!(

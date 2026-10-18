@@ -184,6 +184,10 @@ pub async fn run(
                 std::sync::Arc::clone(&state.events),
                 state.db.pool().clone(),
             );
+            // M7：站点控制面 changelog worker（OSS_SITE_INTERVAL_SECS，0=关）
+            if state.site_enabled {
+                crate::site::spawn_site_worker(state.db.pool().clone());
+            }
             // M6 切片 4：复制 outbox worker（OSS_REPL_INTERVAL_SECS，0=关）
             crate::replication::spawn_repl_worker(
                 state.db.pool().clone(),

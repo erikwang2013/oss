@@ -22,6 +22,34 @@ pub struct UploadRecord {
     pub created_at: i64,
 }
 
+/// 本站在复制关系中的身份（`site_config` 单行；token 仅供控制面通信用，接口层负责脱敏）。
+#[derive(Debug, Clone)]
+pub struct SiteIdentity {
+    pub id: String,
+    pub name: String,
+    pub region: String,
+    pub priority: i64,
+    pub token: String,
+}
+
+/// 对端站点行（`sites`；含出站凭据——接口层必须脱敏）。
+#[derive(Debug, Clone)]
+pub struct SitePeer {
+    pub peer_id: String,
+    /// 对端 `site_config.id`（配对时由 identity 校验取得；dead 表按它归属）
+    pub remote_site_id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub region: String,
+    pub priority: i64,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    pub peer_site_token: String,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 /// 控制台用户行（子账户管理页用；`permissions` 全量随行返回，页面上直接展示摘要）。
 #[derive(Debug, Clone, Serialize)]
 pub struct UserRow {
@@ -49,6 +77,9 @@ pub struct PermissionRow {
 // migrations/ 只是目录命名习惯：本实现用 include_str! + raw_sql 原样执行整份 schema，
 // 不建 _sqlx_migrations —— 将来加 0002 不会自动执行（M2 起再引 sqlx migrate）。
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
+/// M7：每次启动重放（表 IF NOT EXISTS；触发器 DROP+CREATE；必须在 ensure_columns 之后——
+/// 触发器引用运行时补列 kind/status/object_lock）。
+const SCHEMA_M7: &str = include_str!("../migrations/0002_m7_site.sql");
 
 pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
@@ -69,7 +100,45 @@ impl Db {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         let db = Self { pool };
         db.ensure_columns().await?;
+        // M7：增量列就位后再建站点表/触发器（触发器引用补列），并种下本站身份。
+        sqlx::raw_sql(SCHEMA_M7).execute(&db.pool).await?;
+        db.site_bootstrap().await?;
         Ok(db)
+    }
+
+    /// 本站身份种子（幂等）：首启生成 uuid + 32 hex token；后续启动不动。
+    /// 同时复位 `apply_ctx`（上次进程若在启动对账/apply 中途退出，防止抑制永久残留——P12）。
+    async fn site_bootstrap(&self) -> Result<()> {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        // 身份必须**恰好一行**：触发器 `SELECT id FROM site_config LIMIT 1` 与
+        // `site_identity()` 的查询计划可能取到不同行（索引扫描 vs rowid 扫描）。
+        // 旧版本缺陷可能留下多行 → 收敛到最早一行；新库用固定 id（36 字符，保持 uuid 形态）。
+        sqlx::query("DELETE FROM site_config WHERE rowid <> (SELECT MIN(rowid) FROM site_config)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO site_config (id, name, region, priority, site_token, created_at) \
+             SELECT ?, 'site', 'us-east-1', 0, ?, ? \
+             WHERE NOT EXISTS (SELECT 1 FROM site_config)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(token)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("UPDATE apply_ctx SET active = 0 WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 启动对账期间抑制站点触发器（P3；结束后由调用方复位 0）。
+    pub async fn set_apply_ctx(&self, active: bool) -> Result<()> {
+        sqlx::query("UPDATE apply_ctx SET active = ? WHERE id = 1")
+            .bind(active as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// 极小增量迁移：0001 是**整份重放**（全部 IF NOT EXISTS），而 `ALTER ADD COLUMN`
@@ -175,6 +244,188 @@ impl Db {
                 }
             }
         }
+        // M7：repl_outbox 站点目标列（幂等补列；老库升级路径）
+        let rcols = sqlx::query("SELECT name FROM pragma_table_info('repl_outbox')")
+            .fetch_all(&self.pool)
+            .await?;
+        if !rcols
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "target_kind")
+            && let Err(e) = sqlx::query(
+                "ALTER TABLE repl_outbox ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'remote'",
+            )
+            .execute(&self.pool)
+            .await
+        {
+            let again = sqlx::query("SELECT name FROM pragma_table_info('repl_outbox')")
+                .fetch_all(&self.pool)
+                .await?;
+            if !again
+                .iter()
+                .any(|r| r.get::<String, _>("name") == "target_kind")
+            {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    // ---------- M7：站点身份与关系 ----------
+
+    pub async fn site_identity(&self) -> Result<SiteIdentity> {
+        let r =
+            sqlx::query("SELECT id, name, region, priority, site_token FROM site_config LIMIT 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(SiteIdentity {
+            id: r.get("id"),
+            name: r.get("name"),
+            region: r.get("region"),
+            priority: r.get("priority"),
+            token: r.get("site_token"),
+        })
+    }
+
+    /// `[site]` 配置覆盖（load 在桶对账之前调用；None 字段保持种子值）。
+    pub async fn apply_site_config(
+        &self,
+        name: Option<&str>,
+        region: Option<&str>,
+        priority: Option<i64>,
+        token: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE site_config SET name = COALESCE(?, name), region = COALESCE(?, region), \
+             priority = COALESCE(?, priority), site_token = COALESCE(?, site_token)",
+        )
+        .bind(name)
+        .bind(region)
+        .bind(priority)
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_sites(&self) -> Result<Vec<SitePeer>> {
+        let rows = sqlx::query("SELECT * FROM sites ORDER BY created_at, peer_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(site_peer_from_row).collect())
+    }
+
+    pub async fn get_site(&self, peer_id: &str) -> Result<Option<SitePeer>> {
+        let r = sqlx::query("SELECT * FROM sites WHERE peer_id = ?")
+            .bind(peer_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.as_ref().map(site_peer_from_row))
+    }
+
+    pub async fn count_sites(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sites")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn insert_site(&self, p: &SitePeer) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO sites (peer_id, remote_site_id, name, endpoint, region, priority, \
+             s3_access_key, s3_secret_key, peer_site_token, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&p.peer_id)
+        .bind(&p.remote_site_id)
+        .bind(&p.name)
+        .bind(&p.endpoint)
+        .bind(&p.region)
+        .bind(p.priority)
+        .bind(&p.s3_access_key)
+        .bind(&p.s3_secret_key)
+        .bind(&p.peer_site_token)
+        .bind(p.created_at)
+        .execute(&mut *tx)
+        .await?;
+        // 出货游标从 0 起（首轮全量送达含配对快照）
+        sqlx::query(
+            "INSERT OR IGNORE INTO site_cursors (peer_id, last_seq, updated_at) VALUES (?, 0, ?)",
+        )
+        .bind(&p.peer_id)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 删除 peer：同事务丢弃其 site 出站行与游标（对象复制不再尝试该目的地）。
+    /// 删除 peer：同事务丢弃其 site 出站行与游标；返回被删掉的**非空版本**集合
+    /// （调用方据此结算版本终态）。`DELETE ... RETURNING` 作为事务第一条写语句，
+    /// 与解配并发入队的行之间不存在 TOCTOU。
+    pub async fn delete_site(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<Vec<(String, String, String)>>> {
+        use sqlx::Row as _;
+        let mut tx = self.pool.begin().await?;
+        let remote: Option<String> =
+            sqlx::query_scalar("SELECT remote_site_id FROM sites WHERE peer_id = ?")
+                .bind(peer_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if remote.is_none() {
+            return Ok(None);
+        }
+        let rows = sqlx::query(
+            "DELETE FROM repl_outbox WHERE target_kind = 'site' AND remote_id = ? \
+             AND version_id <> '' RETURNING bucket, key, version_id",
+        )
+        .bind(peer_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let affected: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|r| (r.get("bucket"), r.get("key"), r.get("version_id")))
+            .collect();
+        sqlx::query(
+            "DELETE FROM repl_outbox WHERE target_kind = 'site' AND remote_id = ? \
+             AND version_id = ''",
+        )
+        .bind(peer_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM site_cursors WHERE peer_id = ?")
+            .bind(peer_id)
+            .execute(&mut *tx)
+            .await?;
+        // 解配时清掉该 peer 的控制面死信（否则重配对后 status 的 dead 计数失真）。
+        if let Some(remote) = &remote {
+            sqlx::query("DELETE FROM site_apply_dead WHERE peer_id = ?")
+                .bind(remote)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let r = sqlx::query("DELETE FROM sites WHERE peer_id = ?")
+            .bind(peer_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok((r.rows_affected() == 1).then_some(affected))
+    }
+
+    pub async fn update_site_ping(
+        &self,
+        peer_id: &str,
+        ts: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sites SET last_seen = ?, last_error = ? WHERE peer_id = ?")
+            .bind(ts)
+            .bind(error)
+            .bind(peer_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -763,6 +1014,23 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     }
 }
 
+fn site_peer_from_row(r: &sqlx::sqlite::SqliteRow) -> SitePeer {
+    SitePeer {
+        peer_id: r.get("peer_id"),
+        remote_site_id: r.get("remote_site_id"),
+        name: r.get("name"),
+        endpoint: r.get("endpoint"),
+        region: r.get("region"),
+        priority: r.get("priority"),
+        s3_access_key: r.get("s3_access_key"),
+        s3_secret_key: r.get("s3_secret_key"),
+        peer_site_token: r.get("peer_site_token"),
+        created_at: r.get("created_at"),
+        last_seen: r.get("last_seen"),
+        last_error: r.get("last_error"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1347,87 @@ mod tests {
             db.set_user_status(admin3, false).await.unwrap(),
             "对已停用管理员重复停用：幂等 no-op，不得被守卫误杀"
         );
+    }
+
+    /// M7：site_config 种子幂等（同库二次 connect 不改 id/token）；apply_site_config 覆盖。
+    #[tokio::test]
+    async fn site_bootstrap_idempotent_and_config_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("site.db").display());
+        let db = Db::connect(&url).await.unwrap();
+        let a = db.site_identity().await.unwrap();
+        assert_eq!(a.id.len(), 36, "uuid");
+        assert_eq!(a.token.len(), 32, "32 hex token");
+        let db2 = Db::connect(&url).await.unwrap();
+        let b = db2.site_identity().await.unwrap();
+        assert_eq!(
+            (a.id.as_str(), a.token.as_str()),
+            (b.id.as_str(), b.token.as_str())
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM site_config")
+            .fetch_one(db2.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "site_config 必须始终恰好一行（身份/触发器同源）");
+        db2.apply_site_config(
+            Some("east"),
+            Some("eu-west-1"),
+            Some(7),
+            Some(&"b".repeat(32)),
+        )
+        .await
+        .unwrap();
+        let c = db2.site_identity().await.unwrap();
+        assert_eq!(c.name, "east");
+        assert_eq!(c.region, "eu-west-1");
+        assert_eq!(c.priority, 7);
+        assert_eq!(c.token, "b".repeat(32));
+    }
+
+    /// M7：v1.10 老库（无 0002、无 target_kind）升级——补列 + 建表 + 种子，二次启动幂等；
+    /// 写入一次证明 schema 可用（触发器在切片 1a 才创建）。
+    #[tokio::test]
+    async fn m7_upgrade_from_v110_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+        // 造一条 pre-M7 的 repl_outbox 行（无 target_kind 列）
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS replication_rules (bucket TEXT PRIMARY KEY, rules_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE IF NOT EXISTS repl_outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, key TEXT NOT NULL, \
+              version_id TEXT NOT NULL, etag TEXT NOT NULL, size INTEGER NOT NULL, remote_id TEXT NOT NULL, \
+              dest_bucket TEXT NOT NULL, is_delete_marker INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', \
+              attempts INTEGER NOT NULL DEFAULT 0, claimed_at INTEGER, next_retry_at INTEGER NOT NULL DEFAULT 0, \
+              created_at INTEGER NOT NULL DEFAULT 0, last_error TEXT);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let db = Db::connect(&url).await.unwrap();
+        let cols = sqlx::query("SELECT name FROM pragma_table_info('repl_outbox')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            cols.iter()
+                .any(|r| r.get::<String, _>("name") == "target_kind")
+        );
+        assert!(db.site_identity().await.is_ok());
+        // 实写一次（触发器纳入后此测试升级为「写一次验证触发器」）
+        db.insert_bucket("upgrade-bkt", None).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name='upgrade-bkt'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // 二次连接不报错
+        drop(db);
+        let _ = Db::connect(&url).await.unwrap();
     }
 
     /// ensure_columns 幂等：老库（无 status 列）升级补列；再开一次不得重复 ALTER 报错。

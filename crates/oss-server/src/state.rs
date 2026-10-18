@@ -30,6 +30,10 @@ pub struct AppState {
     pub repl_store: Arc<crate::replication::SqlReplStore>,
     /// M6 切片 4：复制出站客户端（worker 用）
     pub repl_client: Arc<crate::repl_client::ReplClient>,
+    /// M7：本站身份（`site_config` 单行，启动时读取；token 不下发给未授权面）
+    pub site: Arc<crate::db::SiteIdentity>,
+    /// M7：`[site]` 是否配置（唯一开关；无 `[site]` 不挂站点路由语义、不可配对）
+    pub site_enabled: bool,
 }
 
 /// 登录限速（C1）。**单进程内存态**（每节点独立，重启清零——限速非持久配额，重启放宽可接受）：
@@ -178,6 +182,17 @@ impl AppState {
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
         let db = Db::connect(&cfg.database_url).await?;
+        // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
+        // 经 `AppState::new` 同样会再应用一次（幂等）。
+        if let Some(site) = cfg.site.as_ref() {
+            db.apply_site_config(
+                site.name.as_deref(),
+                Some(site.region.as_str()),
+                Some(site.priority),
+                site.token.as_deref(),
+            )
+            .await?;
+        }
         let mut store_cfg = StoreConfig::new(&drives[0]);
         store_cfg.drives = drives;
         store_cfg.ec = xl_store::store::ec::EcConfig {
@@ -257,6 +272,11 @@ impl AppState {
                 .await?;
         }
 
+        // M7（P3）：两轮启动对账期间抑制站点触发器——维护写（set_id 收敛/补行）不得
+        // 产生 changelog；结束后复位 0。进程若中途退出，下次 connect 的 site_bootstrap 复位。
+        if let Err(e) = db.set_apply_ctx(true).await {
+            tracing::warn!(error = %e, "启动对账抑制开关失败（继续）");
+        }
         // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒
         // 仅管理员可见/可管）。INSERT OR IGNORE 幂等，已存在（含已有 owner）不覆盖。
         match store.list_buckets().await {
@@ -312,6 +332,9 @@ impl AppState {
             }
             Err(e) => tracing::warn!(error = %e, "启动对账：列举桶行失败"),
         }
+        if let Err(e) = db.set_apply_ctx(false).await {
+            tracing::warn!(error = %e, "启动对账抑制复位失败");
+        }
 
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
         // 口令来源：OSS_ADMIN_PASSWORD 非空优先；空/缺时用密钥文件解析值（配了
@@ -349,6 +372,11 @@ impl AppState {
         // 集群：滚动启动时对端可能尚未就绪——**本地确保 + 广播尽力**（严格 fail-closed
         // 留给运行时的用户请求；缺口由写路径懒自愈与 fsck 差集补齐兜底）。
         // 实弹教训：docker 集群栈里 n1 先于对端启动，严格扇出会让启动即退。
+        // M7（L2）：groups 桶的记账写也属于启动维护，必须抑制站点触发器（否则时钟领先时
+        // INSERT OR IGNORE 仍会触发 BEFORE 门控 ABORT，进程起不来）。
+        if let Err(e) = db.set_apply_ctx(true).await {
+            tracing::warn!(error = %e, "groups 回填抑制开关失败（继续）");
+        }
         for g in &cfg.groups {
             if cfg.cluster.is_some() {
                 store.mesh_ensure_bucket(&g.bucket).await?;
@@ -369,8 +397,11 @@ impl AppState {
             // M4 切片 8：groups 桶钉 set 0（多 set 下不参与新组——目录/行按 set0 口径收口，C3）
             db.insert_bucket(&g.bucket, None).await?;
         }
+        if let Err(e) = db.set_apply_ctx(false).await {
+            tracing::warn!(error = %e, "groups 回填抑制复位失败");
+        }
 
-        Ok(Self::new(cfg, db, store))
+        Ok(Self::new(cfg, db, store).await)
     }
 
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
@@ -397,7 +428,24 @@ impl AppState {
         xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
     }
 
-    pub fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
+    pub async fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
+        // M7：`[site]` 覆盖种子（先于任何控制面写；load 与 tests 共用此路径）
+        if let Some(site) = cfg.site.as_ref() {
+            db.apply_site_config(
+                site.name.as_deref(),
+                Some(site.region.as_str()),
+                Some(site.priority),
+                site.token.as_deref(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[site] 写入失败: {e}"));
+        }
+        let site = Arc::new(
+            db.site_identity()
+                .await
+                .unwrap_or_else(|e| panic!("site_config 种子缺失/不可读: {e}")),
+        );
+        let site_enabled = cfg.site.is_some();
         // except 只有 `/login`：console 路由经 nest 时 axum 的 StripPrefix 会先把
         // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
         // （`/aetherupload/display/login` 之类整段不匹配），照常校验。
@@ -423,7 +471,12 @@ impl AppState {
                     ..Default::default()
                 },
                 middleware: jwt_rust::config::MiddlewareConfig {
-                    except: vec!["/login".into()],
+                    // M7：站点控制面通道（token / token 头）两条不走 JWT
+                    except: vec![
+                        "/login".into(),
+                        "/site/identity".into(),
+                        "/site/changelog".into(),
+                    ],
                 },
                 ..Default::default()
             })
@@ -471,6 +524,8 @@ impl AppState {
             repl_sink,
             repl_store,
             repl_client,
+            site,
+            site_enabled,
         }
     }
 }

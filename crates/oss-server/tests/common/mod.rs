@@ -1,4 +1,4 @@
-use oss_server::config::{AppConfig, GroupTarget};
+use oss_server::config::{AppConfig, GroupTarget, SiteToml};
 use oss_server::db::Db;
 use oss_server::state::AppState;
 use xl_store::store::{Store, StoreConfig};
@@ -6,7 +6,15 @@ use xl_store::store::{Store, StoreConfig};
 /// 测试共用 secret（jwt-rust 要求 ≥32 字符）；测试自己造令牌时也用它签名。
 pub const JWT_SECRET: &str = "0123456789abcdef0123456789abcdef";
 
+/// 部分测试 target 只用 `state_with_site`；每个 target 独立编译 common，避免 dead_code 告警
+/// 在 `clippy -D warnings` 下误杀。
+#[allow(dead_code)]
 pub async fn state(dir: &std::path::Path) -> AppState {
+    state_with_site(dir, None).await
+}
+
+/// M7 测试用：带 `[site]` 的 AppState（None = M7 关闭，站点路由 404）。
+pub async fn state_with_site(dir: &std::path::Path, site: Option<SiteToml>) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
@@ -25,10 +33,11 @@ pub async fn state(dir: &std::path::Path) -> AppState {
         cluster: None, // 单节点测试形态；集群 fixture 走 in-process 基座（xl-store::store::tests）
         kafka: Default::default(),
         remotes: vec![],
+        site,
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
     let store = Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap();
     let db = Db::connect(&cfg.database_url).await.unwrap();
-    AppState::new(cfg, db, store)
+    AppState::new(cfg, db, store).await
 }

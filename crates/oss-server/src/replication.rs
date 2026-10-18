@@ -5,7 +5,9 @@
 //! - 永久错超 10 次 → `state='dead'` 且版本状态 FAILED；连接类错误永不 dead（退避封顶 300s）；
 //! - 成功 → 版本状态 COMPLETED 并删行；marker 成功同样 COMPLETED。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sqlx::SqlitePool;
@@ -103,62 +105,67 @@ fn rule_matches(r: &ReplRule, info: &WriteInfo<'_>) -> bool {
 impl ReplicationSink for SqlReplSink {
     async fn on_write(&self, info: WriteInfo<'_>) {
         // REPLICA 不再复制（防环）。数据写仅版本化提交（"null" = 未开/暂停版本）；
-        // 删除操作（marker 或硬删）允许无版本号（V3②：写路径全覆盖；顶点状态仅在有版本时维护）。
+        // 删除操作（marker）允许无版本号（V3②：写路径全覆盖；顶点状态仅在有版本时维护）。
         if info.is_replica {
             return;
         }
-        if !info.is_delete_marker {
+        // 无版本号的删除（硬删）：只走站点路径（M6 规则侧需要版本读，无法处理）。
+        let is_hard_delete = !info.is_delete_marker && info.version_id.is_none();
+        if !info.is_delete_marker && !is_hard_delete {
             let Some(vid) = info.version_id else { return };
             if vid == "null" {
                 return;
             }
         }
-        let json = match sqlx::query_scalar::<_, String>(
-            "SELECT rules_json FROM replication_rules WHERE bucket = ?",
-        )
-        .bind(info.bucket)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(Some(j)) => j,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::warn!(error = %e, bucket = info.bucket, "读复制规则失败——本写不复制（不影响请求）");
-                return;
-            }
-        };
-        let rules = match xl_s3::replication::rules_from_json(&json) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, bucket = info.bucket, "复制规则记录损坏——跳过");
-                return;
-            }
-        };
         let mut matched = false;
-        for r in rules.iter().filter(|r| rule_matches(r, &info)) {
-            matched = true;
-            if let Err(e) = sqlx::query(
-                "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
-                 dest_bucket, is_delete_marker, state, attempts, next_retry_at, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?)",
+        // M6 桶复制规则（与 M7 站点对相互独立：没有规则也仍可能命中站点）
+        if !is_hard_delete {
+            match sqlx::query_scalar::<_, String>(
+                "SELECT rules_json FROM replication_rules WHERE bucket = ?",
             )
             .bind(info.bucket)
-            .bind(info.key)
-            .bind(info.version_id.unwrap_or(""))
-            .bind(info.etag)
-            .bind(info.size as i64)
-            .bind(&r.remote_id)
-            .bind(&r.dest_bucket)
-            .bind(i64::from(info.is_delete_marker))
-            .bind(now())
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await
             {
-                tracing::warn!(error = %e, bucket = info.bucket, key = info.key, "复制入队失败");
+                Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json) {
+                    Ok(rules) => {
+                        for r in rules.iter().filter(|r| rule_matches(r, &info)) {
+                            matched = true;
+                            if let Err(e) = sqlx::query(
+                                "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
+                                 dest_bucket, is_delete_marker, target_kind, state, attempts, next_retry_at, created_at) \
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'remote', 'pending', 0, 0, ?)",
+                            )
+                            .bind(info.bucket)
+                            .bind(info.key)
+                            .bind(info.version_id.unwrap_or(""))
+                            .bind(info.etag)
+                            .bind(info.size as i64)
+                            .bind(&r.remote_id)
+                            .bind(&r.dest_bucket)
+                            .bind(i64::from(info.is_delete_marker))
+                            .bind(now())
+                            .execute(&self.pool)
+                            .await
+                            {
+                                tracing::warn!(error = %e, bucket = info.bucket, key = info.key, "复制入队失败");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, bucket = info.bucket, "复制规则记录损坏——跳过");
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, bucket = info.bucket, "读复制规则失败——本写不复制（不影响请求）");
+                }
             }
         }
+        // M7：站点对入队（独立于桶复制规则；非版本桶删除不跨界）
+        let site_matched = self.enqueue_sites(&info).await;
         // 单调 PENDING：并发 worker 可能已 COMPLETED（P2-2，不降级终态）；无版本号（硬删）跳过
-        if matched
+        if (matched || site_matched)
             && let Some(vid) = info.version_id
             && let Err(e) = self
                 .store
@@ -167,6 +174,70 @@ impl ReplicationSink for SqlReplSink {
         {
             tracing::warn!(error = %e, bucket = info.bucket, key = info.key, "置 PENDING 失败");
         }
+    }
+}
+
+impl SqlReplSink {
+    /// M7 切片 2a：逐 peer 入队。删除写要求源桶 versioning=Enabled
+    /// （Off/Suspended 不入队——记档；marker 带版本，硬删版本列为空）。
+    async fn enqueue_sites(&self, info: &WriteInfo<'_>) -> bool {
+        if info.is_delete_marker || info.version_id.is_none() {
+            let v: Option<String> = match sqlx::query_scalar(
+                "SELECT versioning FROM buckets WHERE name = ?",
+            )
+            .bind(info.bucket)
+            .fetch_optional(&self.pool)
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, bucket = info.bucket, "读桶 versioning 失败——站点删除不入队");
+                    return false;
+                }
+            };
+            if v.as_deref() != Some("Enabled") {
+                return false;
+            }
+        }
+        let peers: Vec<String> =
+            match sqlx::query_scalar("SELECT peer_id FROM sites ORDER BY peer_id")
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "读站点对失败——本写不复制到站点");
+                    return false;
+                }
+            };
+        if peers.is_empty() {
+            return false;
+        }
+        let mut matched = false;
+        for peer in peers {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
+                 dest_bucket, is_delete_marker, target_kind, state, attempts, next_retry_at, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'site', 'pending', 0, 0, ?)",
+            )
+            .bind(info.bucket)
+            .bind(info.key)
+            .bind(info.version_id.unwrap_or(""))
+            .bind(info.etag)
+            .bind(info.size as i64)
+            .bind(&peer)
+            .bind(info.bucket)
+            .bind(i64::from(info.is_delete_marker))
+            .bind(now())
+            .execute(&self.pool)
+            .await
+            {
+                tracing::warn!(error = %e, bucket = info.bucket, key = info.key, peer = %peer, "站点复制入队失败");
+            } else {
+                matched = true;
+            }
+        }
+        matched
     }
 }
 
@@ -181,8 +252,83 @@ struct ReplRow {
     remote_id: String,
     dest_bucket: String,
     is_delete_marker: bool,
+    target_kind: String,
     attempts: i64,
     claimed_at: Option<i64>,
+}
+
+/// M7 R6：目标桶 versioning 探询缓存（按 peer+bucket，10s）。
+static VERSIONING_CACHE: LazyLock<Mutex<HashMap<String, (Instant, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const VERSIONING_TTL: Duration = Duration::from_secs(10);
+
+/// `cache_key` 含 endpoint（`endpoint\u{1f}bucket`）——解配/换端点后不会命中旧目标缓存。
+async fn site_versioning_ready(
+    client: &ReplClient,
+    cache_key: &str,
+    bucket: &str,
+) -> Result<(), ReplError> {
+    {
+        let cache = VERSIONING_CACHE.lock().unwrap();
+        if let Some((at, st)) = cache.get(cache_key)
+            && at.elapsed() < VERSIONING_TTL
+        {
+            return if st == "Enabled" {
+                Ok(())
+            } else {
+                Err(ReplError::retryable(format!(
+                    "目标桶 versioning={st}（等待就绪）"
+                )))
+            };
+        }
+    }
+    let st = client.get_bucket_versioning("site", bucket).await?;
+    {
+        let mut cache = VERSIONING_CACHE.lock().unwrap();
+        cache.insert(cache_key.to_string(), (Instant::now(), st.clone()));
+    }
+    if st == "Enabled" {
+        Ok(())
+    } else {
+        Err(ReplError::retryable(format!(
+            "目标桶 versioning={st}（等待就绪）"
+        )))
+    }
+}
+
+fn invalidate_versioning_cache(cache_key: &str) {
+    VERSIONING_CACHE.lock().unwrap().remove(cache_key);
+}
+
+/// site PUT/DELETE 的 404：桶可能在预检后被删/重建——驱逐缓存并按可重试处理（P2-4）。
+fn site_404_retry(e: ReplError, cache_key: &str, op: &str) -> ReplError {
+    if e.status == Some(404) {
+        invalidate_versioning_cache(cache_key);
+        ReplError::retryable(format!("目标桶不存在（{op}）：{}", e.message))
+    } else {
+        e
+    }
+}
+
+async fn site_peer(
+    pool: &SqlitePool,
+    peer_id: &str,
+) -> Result<Option<(String, String, String, String)>, sqlx::Error> {
+    use sqlx::Row as _;
+    let row = sqlx::query(
+        "SELECT endpoint, s3_access_key, s3_secret_key, region FROM sites WHERE peer_id = ?",
+    )
+    .bind(peer_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get("endpoint"),
+            r.get("s3_access_key"),
+            r.get("s3_secret_key"),
+            r.get("region"),
+        )
+    }))
 }
 
 async fn renew_claim(pool: &SqlitePool, seq: i64, old: Option<i64>) -> Option<i64> {
@@ -263,11 +409,28 @@ async fn requeue_or_bury(
 }
 
 /// 一行复制：marker → 目标 DELETE；数据版本 → 读源 + PUT（带 REPLICA）。
-async fn send_row(store: &Store, client: &ReplClient, r: &ReplRow) -> Result<(), ReplError> {
-    if r.is_delete_marker {
-        return client
-            .delete_object(&r.remote_id, &r.dest_bucket, &r.key)
+/// `is_site`：站点行——发送前做 versioning 就绪探询（R6），PUT 要求真实 version-id，
+/// 并透传 content-type/x-amz-meta-*。
+async fn send_row(
+    store: &Store,
+    client: &ReplClient,
+    remote_id: &str,
+    r: &ReplRow,
+    is_site: bool,
+    cache_key: Option<&str>,
+) -> Result<(), ReplError> {
+    if let Some(key) = cache_key {
+        site_versioning_ready(client, key, &r.dest_bucket).await?;
+    }
+    // marker 或硬删（版本列为空）都以 DELETE 表达（P2-5）。
+    if r.is_delete_marker || r.version_id.is_empty() {
+        let res = client
+            .delete_object(remote_id, &r.dest_bucket, &r.key)
             .await;
+        return match (res, cache_key) {
+            (Err(e), Some(key)) => Err(site_404_retry(e, key, "DELETE")),
+            (r, _) => r,
+        };
     }
     // 必须读行内记录的**那一个版本**（对象可能已被覆写；读 latest 会复制错内容）
     let info = store
@@ -291,41 +454,98 @@ async fn send_row(store: &Store, client: &ReplClient, r: &ReplRow) -> Result<(),
         .get_object_version(&r.bucket, &r.key, &r.version_id)
         .await
         .map_err(|e| ReplError::retryable(format!("读源对象失败：{e}")))?;
-    client
-        .put_object(&r.remote_id, &r.dest_bucket, &r.key, bytes, &r.etag)
-        .await
+    if is_site {
+        let res = client
+            .put_object_with_meta(
+                remote_id,
+                &r.dest_bucket,
+                &r.key,
+                bytes,
+                &r.etag,
+                info.content_type.as_deref(),
+                &info.user_metadata,
+                true,
+            )
+            .await;
+        match (res, cache_key) {
+            (Err(e), Some(key)) => Err(site_404_retry(e, key, "PUT")),
+            (r, _) => r,
+        }
+    } else {
+        client
+            .put_object(remote_id, &r.dest_bucket, &r.key, bytes, &r.etag)
+            .await
+    }
 }
 
 /// P2-1：一个版本的复制终态聚合——仍有 pending/sending 行则保持 PENDING；
-/// 存在 dead 行则 FAILED；否则 COMPLETED。
-async fn settle_version_status(pool: &SqlitePool, store: &Store, r: &ReplRow) {
-    async fn count(pool: &SqlitePool, r: &ReplRow, state: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM repl_outbox WHERE bucket=? AND key=? AND version_id=? \
-             AND state=?",
-        )
-        .bind(&r.bucket)
-        .bind(&r.key)
-        .bind(&r.version_id)
-        .bind(state)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0)
-    }
-    if count(pool, r, "pending").await > 0 || count(pool, r, "sending").await > 0 {
+/// 存在 dead 行则 FAILED；否则 COMPLETED。`dropped=true` 表示解配丢弃了剩余行：
+/// 无剩余行时清除状态（`None`，不再有复制义务），而不是谎报 COMPLETED。
+async fn settle_version_status(pool: &SqlitePool, store: &Store, r: &ReplRow, dropped: bool) {
+    use sqlx::Row as _;
+    // 单条聚合：三次独立 COUNT 之间的窗口可能把仍有 pending 行误判为已完成。
+    let counts = sqlx::query(
+        "SELECT COALESCE(SUM(state='pending'),0) AS pending, \
+                COALESCE(SUM(state='sending'),0) AS sending, \
+                COALESCE(SUM(state='dead'),0) AS dead \
+         FROM repl_outbox WHERE bucket=? AND key=? AND version_id=?",
+    )
+    .bind(&r.bucket)
+    .bind(&r.key)
+    .bind(&r.version_id)
+    .fetch_one(pool)
+    .await;
+    let (pending, sending, dead) = match counts {
+        Ok(counts) => (
+            counts.get::<i64, _>("pending"),
+            counts.get::<i64, _>("sending"),
+            counts.get::<i64, _>("dead"),
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "复制终态聚合计数失败（本轮不写状态）");
+            return;
+        }
+    };
+    if pending > 0 || sending > 0 {
         return; // 其他规则仍在途：保持 PENDING
     }
-    let status = if count(pool, r, "dead").await > 0 {
-        "FAILED"
+    let status = if dead > 0 {
+        Some("FAILED")
+    } else if dropped {
+        None
     } else {
-        "COMPLETED"
+        Some("COMPLETED")
     };
     if let Err(e) = store
-        .set_replication_status(&r.bucket, &r.key, &r.version_id, Some(status))
+        .set_replication_status(&r.bucket, &r.key, &r.version_id, status)
         .await
     {
-        tracing::warn!(error = %e, status, "复制终态写入失败（对象可能已被删除）");
+        tracing::warn!(error = %e, ?status, "复制终态写入失败（对象可能已被删除）");
     }
+}
+
+/// 解配后结算（console `DELETE /sites/{id}` 用）：该版本可能只剩被删掉的 site 行。
+pub async fn settle_version_after_drop(
+    pool: &SqlitePool,
+    store: &Store,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) {
+    let r = ReplRow {
+        seq: 0,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version_id.to_string(),
+        etag: String::new(),
+        remote_id: String::new(),
+        dest_bucket: String::new(),
+        is_delete_marker: false,
+        target_kind: "site".into(),
+        attempts: 0,
+        claimed_at: None,
+    };
+    settle_version_status(pool, store, &r, true).await;
 }
 
 /// 一轮：回收过期租约 → claim → 逐行续租/发送/完成或重试。返回 (成功, 失败)。
@@ -352,7 +572,7 @@ pub async fn process_repl_once(
          WHERE state='pending' AND seq IN (SELECT seq FROM repl_outbox WHERE state='pending' \
                        AND next_retry_at <= ? ORDER BY seq LIMIT ?) \
          RETURNING seq, bucket, key, version_id, etag, remote_id, dest_bucket, \
-         is_delete_marker, attempts, claimed_at",
+         is_delete_marker, target_kind, attempts, claimed_at",
     )
     .bind(now_s)
     .bind(now_s)
@@ -378,13 +598,45 @@ pub async fn process_repl_once(
             remote_id: row.get("remote_id"),
             dest_bucket: row.get("dest_bucket"),
             is_delete_marker: row.get::<i64, _>("is_delete_marker") != 0,
+            target_kind: row.get("target_kind"),
             attempts: row.get("attempts"),
             claimed_at: row.get("claimed_at"),
         };
         let Some(token) = renew_claim(pool, r.seq, r.claimed_at).await else {
             continue;
         };
-        match send_row(store, client, &r).await {
+        let outcome: Result<(), ReplError> = if r.target_kind == "site" {
+            match site_peer(pool, &r.remote_id).await {
+                Ok(Some((endpoint, ak, sk, region))) => {
+                    match ReplClient::single(&endpoint, &ak, &sk, &region) {
+                        Ok(c) => {
+                            let cache_key = format!("{endpoint}\u{1f}{}", r.dest_bucket);
+                            send_row(store, &c, "site", &r, true, Some(&cache_key)).await
+                        }
+                        Err(f) => Err(f),
+                    }
+                }
+                Ok(None) => {
+                    // 已解除配对：丢行并结算版本状态（否则只有该 site 行的版本永久 PENDING——P1-3）。
+                    let _ = sqlx::query(
+                        "DELETE FROM repl_outbox WHERE seq=? AND claimed_at IS ? AND state='sending'",
+                    )
+                    .bind(r.seq)
+                    .bind(Some(token))
+                    .execute(pool)
+                    .await;
+                    if !r.version_id.is_empty() {
+                        settle_version_status(pool, store, &r, true).await;
+                    }
+                    tracing::warn!(seq = r.seq, peer = %r.remote_id, "站点对已解除——丢弃出站行");
+                    continue;
+                }
+                Err(e) => Err(ReplError::retryable(format!("读站点对失败：{e}"))),
+            }
+        } else {
+            send_row(store, client, &r.remote_id, &r, false, None).await
+        };
+        match outcome {
             Ok(()) => {
                 let claimed = finish_ok(pool, r.seq, Some(token)).await;
                 if claimed {
@@ -395,7 +647,7 @@ pub async fn process_repl_once(
                 // P2-1：多规则聚合——仍有在途行则保持 PENDING；有死信则 FAILED；否则 COMPLETED。
                 // P3-5：token 失配时不得写状态（该行可能已被新 worker 接管）。
                 if claimed && !r.version_id.is_empty() {
-                    settle_version_status(pool, store, &r).await;
+                    settle_version_status(pool, store, &r, false).await;
                 }
             }
             Err(f) => {

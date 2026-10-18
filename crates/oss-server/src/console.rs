@@ -6,7 +6,7 @@
 //! permissions 三档（读/写/删）+ 自有桶全权；403 用纯文本（前端 `rawApi` 直接展示 resp.text）。
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -153,6 +153,17 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/users/{id}/permissions",
             get(get_user_permissions).put(set_user_permissions),
+        )
+        // M7：站点身份与关系（`[site]` 未配置时 handlers 404；identity 走 token 而非 JWT）
+        .route("/site", get(site_info))
+        .route("/site/identity", get(site_identity))
+        .route("/sites", get(list_sites).post(create_site))
+        .route("/sites/{peer_id}", delete(delete_site))
+        .route("/sites/{peer_id}/ping", post(ping_site))
+        .route("/sites/{peer_id}/status", get(site_status))
+        .route(
+            "/site/changelog",
+            post(site_changelog).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
 }
 
@@ -440,6 +451,9 @@ async fn put_policy(
     match state.db.set_bucket_policy(&bucket, &body, now).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
+            if let Some(r) = site_conflict(&e) {
+                return r;
+            }
             tracing::error!(error = %e, "写桶策略失败");
             internal_error()
         }
@@ -666,6 +680,32 @@ async fn create_bucket(
         .upsert_bucket_owner_set(&body.name, Some(uid), set)
         .await
     {
+        // M7 P2：站点 LWW 门控拒绝时物理桶已建——按**最终行**补偿后返回 409：
+        // 远端 upsert 胜出（行存在）保留物理桶；远端 delete 胜出（无行）才删空目录。
+        if let Some(r) = site_conflict(&e) {
+            let has_row = match sqlx::query_scalar::<_, i64>("SELECT 1 FROM buckets WHERE name = ?")
+                .bind(&body.name)
+                .fetch_optional(state.db.pool())
+                .await
+            {
+                Ok(v) => v.is_some(),
+                Err(re) => {
+                    // 行状态未知：保留刚建的物理桶（宁可孤儿目录，不误删对端数据）。
+                    tracing::warn!(error = %re, bucket = %body.name, "冲突补偿读桶行失败（保留物理桶）");
+                    return r;
+                }
+            };
+            if has_row {
+                if !state.store.bucket_exists(&body.name).await.unwrap_or(false)
+                    && let Err(re) = state.store.create_bucket(&body.name).await
+                {
+                    tracing::warn!(error = %re, bucket = %body.name, "冲突补偿补建物理桶失败");
+                }
+            } else if let Err(re) = state.store.delete_bucket(&body.name).await {
+                tracing::warn!(error = %re, bucket = %body.name, "冲突回滚物理桶失败");
+            }
+            return r;
+        }
         // 桶已建成：控制面行缺失只影响列表展示，不失败请求
         tracing::warn!(error = %e, "写入桶行失败");
     }
@@ -700,6 +740,36 @@ async fn delete_bucket(
     match state.store.delete_bucket(&bucket).await {
         Ok(()) => {
             if let Err(e) = state.acl().forget_bucket(&bucket).await {
+                // M7 H1：门控 ABORT 时物理桶已删、行/授权未动——恢复空桶（删除前为空）
+                // 并返回 409，绝不能让“物理已删 + 行残留 + 无 delete changelog”静默成功。
+                if let Some(r) = site_conflict(&e) {
+                    // 按最终行补偿：远端 delete 已胜出（无行）→ 本地删除同样已生效，204；
+                    // 行仍在（远端 upsert/权限胜出）→ 恢复空桶并 409。
+                    let has_row = match sqlx::query_scalar::<_, i64>(
+                        "SELECT 1 FROM buckets WHERE name = ?",
+                    )
+                    .bind(&bucket)
+                    .fetch_optional(state.db.pool())
+                    .await
+                    {
+                        Ok(v) => v.is_some(),
+                        Err(re) => {
+                            // 行状态未知：恢复空桶，不让行/物理不一致。
+                            tracing::warn!(error = %re, bucket = %bucket, "冲突补偿读桶行失败（恢复空桶）");
+                            if let Err(x) = state.store.create_bucket(&bucket).await {
+                                tracing::warn!(error = %x, bucket = %bucket, "冲突补偿恢复空桶失败");
+                            }
+                            return r;
+                        }
+                    };
+                    if !has_row {
+                        return StatusCode::NO_CONTENT.into_response();
+                    }
+                    if let Err(re) = state.store.create_bucket(&bucket).await {
+                        tracing::warn!(error = %re, bucket = %bucket, "冲突补偿重建空桶失败");
+                    }
+                    return r;
+                }
                 // 桶已删除：记账行残留只影响列表展示，不失败请求
                 tracing::warn!(error = ?e, "清理桶记账失败");
             }
@@ -1281,6 +1351,431 @@ async fn set_user_status(
         Err(e) => {
             tracing::error!(error = %e, "更新用户状态失败");
             internal_error()
+        }
+    }
+}
+
+// ---------------- M7：站点身份与关系（单节点站点对） ----------------
+
+#[derive(Debug, Deserialize)]
+struct CreateSiteBody {
+    peer_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    endpoint: String,
+    region: String,
+    #[serde(default)]
+    priority: i64,
+    s3_access_key: String,
+    s3_secret_key: String,
+    peer_site_token: String,
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut d = 0u8;
+    for i in 0..a.len() {
+        d |= a[i] ^ b[i];
+    }
+    d == 0
+}
+
+fn site_disabled() -> Response {
+    (StatusCode::NOT_FOUND, "site replication is not enabled").into_response()
+}
+
+/// M7：触发器 BEFORE 门控（`RAISE(ABORT,'site replication conflict')`）→ 409。
+fn site_conflict(e: impl std::fmt::Display) -> Option<Response> {
+    if e.to_string().contains("site replication conflict") {
+        Some((StatusCode::CONFLICT, "site replication conflict").into_response())
+    } else {
+        None
+    }
+}
+
+fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": state.site.id,
+        "name": state.site.name,
+        "region": state.site.region,
+        "priority": state.site.priority,
+        "has_vault": state.vault.is_some(),
+        "enabled": state.site_enabled,
+    });
+    if with_token {
+        v["site_token"] = serde_json::Value::String(state.site.token.clone());
+    }
+    v
+}
+
+/// `GET /api/v1/site`（管理员）：本站身份 + 配对用 token。
+async fn site_info(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    Json(site_json(&state, true)).into_response()
+}
+
+/// `GET /api/v1/site/identity`（token 面；JWT except）：供对端 ping/配对校验。
+async fn site_identity(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    let Some(tok) = headers
+        .get(crate::site_client::SITE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (StatusCode::UNAUTHORIZED, "missing site token").into_response();
+    };
+    if !ct_eq(tok, &state.site.token) {
+        return (StatusCode::UNAUTHORIZED, "invalid site token").into_response();
+    }
+    Json(site_json(&state, false)).into_response()
+}
+
+fn peer_json(p: &crate::db::SitePeer) -> serde_json::Value {
+    serde_json::json!({
+        "peer_id": p.peer_id,
+        "remote_site_id": p.remote_site_id,
+        "name": p.name,
+        "endpoint": p.endpoint,
+        "region": p.region,
+        "priority": p.priority,
+        "last_seen": p.last_seen,
+        "last_error": p.last_error,
+        "has_credentials": true,
+    })
+}
+
+/// `GET /api/v1/sites`（管理员；脱敏——绝不回显 AK/SK/token）。
+async fn list_sites(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    match state.db.list_sites().await {
+        Ok(rows) => Json(rows.iter().map(peer_json).collect::<Vec<_>>()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "列出站点失败");
+            internal_error()
+        }
+    }
+}
+
+/// `POST /api/v1/sites`（管理员）：建立（至多一个）站点对。同步校验对端可达与 region 一致性。
+async fn create_site(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Json(body): Json<CreateSiteBody>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let bad = |m: String| (StatusCode::BAD_REQUEST, m).into_response();
+    if body.peer_id.is_empty()
+        || body.peer_id.len() > 64
+        || !body
+            .peer_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return bad("peer_id 非法（[A-Za-z0-9._-]，≤64）".into());
+    }
+    if body.peer_id == state.site.id {
+        return bad("peer_id 不能等于本机站点 id".into());
+    }
+    if !(32..=128).contains(&body.peer_site_token.len())
+        || !body.peer_site_token.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return bad("peer_site_token 非法（32–128 位十六进制）".into());
+    }
+    if body.s3_access_key.trim().is_empty() || body.s3_secret_key.trim().is_empty() {
+        return bad("s3_access_key/secret_key 不能为空".into());
+    }
+    if body.region.trim().is_empty() || body.region.len() > 64 {
+        return bad("[site].region 非法".into());
+    }
+    let endpoint = match crate::site_client::validate_endpoint(&body.endpoint) {
+        Ok(e) => e,
+        Err(e) => return bad(e),
+    };
+    match state.db.count_sites().await {
+        Ok(n) if n >= 1 => return bad("M7 仅支持单站点对（已存在一个 peer）".into()),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "统计站点失败");
+            return internal_error();
+        }
+    }
+    // 同步校验对端可达 + region 一致 + 非本机
+    let ident = match crate::site_client::get_identity(&endpoint, &body.peer_site_token).await {
+        Ok(i) => i,
+        Err(e) => return bad(format!("对端 identity 校验失败：{e}")),
+    };
+    if ident.id == state.site.id {
+        return bad("对端 identity 与本机相同（endpoint 填错？）".into());
+    }
+    if ident.region != body.region {
+        return bad(format!(
+            "region 不一致：对端 {} / 配置 {}",
+            ident.region, body.region
+        ));
+    }
+    // M7：AK 密文按各自主密钥封装——两端 vault 状态必须一致（否则运行期认证 500）。
+    if ident.has_vault != state.vault.is_some() {
+        return bad(
+            "主密钥库状态不一致：两端必须同时启用或同时未启用 vault（AK 密文需同主密钥）".into(),
+        );
+    }
+    let peer = crate::db::SitePeer {
+        peer_id: body.peer_id.clone(),
+        remote_site_id: ident.id.clone(),
+        name: body.name.unwrap_or_else(|| body.peer_id.clone()),
+        endpoint,
+        region: body.region,
+        priority: body.priority,
+        s3_access_key: body.s3_access_key,
+        s3_secret_key: body.s3_secret_key,
+        peer_site_token: body.peer_site_token,
+        created_at: crate::db::now(),
+        last_seen: Some(crate::db::now()),
+        last_error: None,
+    };
+    match crate::site::insert_peer_with_snapshot(&state, &peer).await {
+        Ok(()) => Json(peer_json(&peer)).into_response(),
+        Err(e) if e.contains("UNIQUE") || e.contains("已存在站点对") => {
+            bad("peer 已存在（M7 单站点对）".into())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "写站点/快照失败");
+            internal_error()
+        }
+    }
+}
+
+/// `GET /api/v1/sites/{peer_id}/status`（管理员）：游标 lag / outbox 积压 / 死信。
+async fn site_status(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let Some(peer) = state.db.get_site(&peer_id).await.ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let pool = state.db.pool();
+    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM site_changelog")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    let cursor: i64 = sqlx::query_scalar("SELECT last_seq FROM site_cursors WHERE peer_id = ?")
+        .bind(&peer_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND remote_id=? \
+         AND state='pending'",
+    )
+    .bind(&peer_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let sending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND remote_id=? \
+         AND state='sending'",
+    )
+    .bind(&peer_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let dead_objs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND remote_id=? \
+         AND state='dead'",
+    )
+    .bind(&peer_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let dead_ctrl = crate::site::dead_count(pool, &peer.remote_site_id)
+        .await
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "peer_id": peer.peer_id,
+        "remote_site_id": peer.remote_site_id,
+        "control_lag": (max_seq - cursor).max(0),
+        "control_dead": dead_ctrl,
+        "object_pending": pending,
+        "object_sending": sending,
+        "object_dead": dead_objs,
+        "last_seen": peer.last_seen,
+        "last_error": peer.last_error,
+    }))
+    .into_response()
+}
+
+/// `DELETE /api/v1/sites/{peer_id}`（管理员）：解除站点对（同事务丢弃 site 出站行与游标）。
+async fn delete_site(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    // P1-3：解配在事务内用 `DELETE ... RETURNING` 收集被丢弃的非空版本，删后逐个结算。
+    match state.db.delete_site(&peer_id).await {
+        Ok(Some(affected)) => {
+            for (bucket, key, version_id) in affected {
+                crate::replication::settle_version_after_drop(
+                    state.db.pool(),
+                    &state.store,
+                    &bucket,
+                    &key,
+                    &version_id,
+                )
+                .await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "删站点失败");
+            internal_error()
+        }
+    }
+}
+
+/// `POST /api/v1/sites/{peer_id}/ping`（管理员）：token 面校验对端并记录 last_seen/last_error。
+async fn ping_site(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let Some(peer) = state.db.get_site(&peer_id).await.ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match crate::site_client::get_identity(&peer.endpoint, &peer.peer_site_token).await {
+        Ok(ident) => {
+            let now = crate::db::now();
+            if let Err(e) = state.db.update_site_ping(&peer_id, now, None).await {
+                tracing::warn!(error = %e, "记录 ping 失败");
+            }
+            if ident.region != peer.region {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "region 不一致：对端 {} / 配置 {}",
+                        ident.region, peer.region
+                    ),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "id": ident.id,
+                "name": ident.name,
+                "region": ident.region,
+                "priority": ident.priority,
+                "has_vault": ident.has_vault,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let now = crate::db::now();
+            let _ = state.db.update_site_ping(&peer_id, now, Some(&e)).await;
+            (StatusCode::BAD_GATEWAY, format!("ping 失败：{e}")).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangelogBody {
+    entries: Vec<crate::site::Entry>,
+}
+
+/// `POST /api/v1/site/changelog`（token 面；JWT except）：应用对端控制面变更批次。
+async fn site_changelog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChangelogBody>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    let Some(tok) = headers
+        .get(crate::site_client::SITE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (StatusCode::UNAUTHORIZED, "missing site token").into_response();
+    };
+    if !ct_eq(tok, &state.site.token) {
+        return (StatusCode::UNAUTHORIZED, "invalid site token").into_response();
+    }
+    // L8：token 不能脱离“当前配对关系”单独生效——解配后旧 token 立即失效；
+    // 每条 origin 必须是当前唯一 peer 的 remote_site_id（禁止伪造归属）。
+    let remote: Option<String> =
+        match sqlx::query_scalar("SELECT remote_site_id FROM sites LIMIT 1")
+            .fetch_optional(state.db.pool())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "读站点对失败");
+                return internal_error();
+            }
+        };
+    let Some(remote) = remote else {
+        return (StatusCode::UNAUTHORIZED, "site pair not established").into_response();
+    };
+    if body.entries.iter().any(|e| e.origin_site_id != remote) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "origin does not match paired site",
+        )
+            .into_response();
+    }
+    match crate::site::apply_changelog(&state, body.entries).await {
+        Ok(st) => Json(serde_json::json!({
+            "applied": st.applied, "skipped": st.skipped, "dead": st.dead,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "changelog 应用失败（整批重试）");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     }
 }

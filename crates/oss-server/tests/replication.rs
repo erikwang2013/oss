@@ -26,7 +26,12 @@ async fn fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::Temp
           version_id TEXT NOT NULL, etag TEXT NOT NULL, size INTEGER NOT NULL, remote_id TEXT NOT NULL, \
           dest_bucket TEXT NOT NULL, is_delete_marker INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', \
           attempts INTEGER NOT NULL DEFAULT 0, claimed_at INTEGER, next_retry_at INTEGER NOT NULL DEFAULT 0, \
-          created_at INTEGER NOT NULL DEFAULT 0, last_error TEXT);",
+          created_at INTEGER NOT NULL DEFAULT 0, last_error TEXT, \
+          target_kind TEXT NOT NULL DEFAULT 'remote');\
+         CREATE TABLE buckets (name TEXT PRIMARY KEY, versioning TEXT NOT NULL DEFAULT 'Off');\
+         CREATE TABLE sites (peer_id TEXT PRIMARY KEY, endpoint TEXT NOT NULL DEFAULT '', \
+          s3_access_key TEXT NOT NULL DEFAULT '', s3_secret_key TEXT NOT NULL DEFAULT '', \
+          region TEXT NOT NULL DEFAULT 'us-east-1', last_error TEXT);",
     )
     .execute(&pool)
     .await
@@ -501,7 +506,11 @@ async fn worker_retry_then_dead_and_marker_delete() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].method, "DELETE");
     assert_eq!(seen[0].path, "/dst/k");
-    assert!(seen[0].replication.is_none(), "DELETE 不带 REPLICA 头");
+    assert_eq!(
+        seen[0].replication.as_deref(),
+        Some("REPLICA"),
+        "DELETE 必须带 REPLICA 头（防双向回环——P0-2）"
+    );
 }
 
 #[tokio::test]
@@ -528,4 +537,347 @@ async fn worker_backlog_unreachable_then_recovers() {
     let c = client(&endpoint);
     assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
     assert!(outbox_rows(&pool).await.is_empty());
+}
+
+// ---------------- M7 切片 2a/2b：站点入队矩阵 + 动态 peer 出站 ----------------
+
+async fn site_fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
+    let (pool, store, a, b) = fixture().await;
+    sqlx::query("INSERT INTO sites (peer_id) VALUES ('p1')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO buckets (name, versioning) VALUES ('rbk', 'Enabled')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    (pool, store, a, b)
+}
+
+async fn site_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn site_enqueue_matrix() {
+    let (pool, store, _a, _b) = site_fixture().await;
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let (vid, etag) = put_versioned(&store, "k", b"x").await;
+    macro_rules! info {
+        ($v:expr, $marker:expr, $replica:expr) => {
+            WriteInfo {
+                bucket: "rbk",
+                key: "k",
+                version_id: $v,
+                etag: &etag,
+                size: 1,
+                is_delete_marker: $marker,
+                is_replica: $replica,
+            }
+        };
+    }
+    // 数据写 → 每个 peer 一行（无 replication_rules 也入队）。
+    sink.on_write(info!(Some(&vid), false, false)).await;
+    assert_eq!(site_count(&pool).await, 1);
+    let row = sqlx::query(
+        "SELECT target_kind, remote_id, dest_bucket, is_delete_marker, version_id \
+         FROM repl_outbox WHERE target_kind='site'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    use sqlx::Row as _;
+    assert_eq!(row.get::<String, _>("target_kind"), "site");
+    assert_eq!(row.get::<String, _>("remote_id"), "p1");
+    assert_eq!(row.get::<String, _>("dest_bucket"), "rbk");
+    assert_eq!(row.get::<i64, _>("is_delete_marker"), 0);
+    assert_eq!(row.get::<String, _>("version_id"), vid);
+
+    // marker → 入队（版本桶 Enabled）。
+    sink.on_write(info!(Some("dm-1"), true, false)).await;
+    assert_eq!(site_count(&pool).await, 2);
+    // REPLICA / null 版本 → 不入队。
+    sink.on_write(info!(Some("v-other"), false, true)).await;
+    sink.on_write(info!(Some("null"), false, false)).await;
+    assert_eq!(site_count(&pool).await, 2);
+    // 硬删（无版本）在 Enabled 桶 → 入队且版本列为空。
+    sink.on_write(info!(None, false, false)).await;
+    assert_eq!(site_count(&pool).await, 3);
+    let empty: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE version_id='' AND target_kind='site'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(empty, 1);
+    // Suspended → 删除不入队。
+    sqlx::query("UPDATE buckets SET versioning='Suspended' WHERE name='rbk'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sink.on_write(info!(Some("dm-2"), true, false)).await;
+    assert_eq!(site_count(&pool).await, 3);
+}
+
+#[derive(Clone, Debug)]
+struct SiteSeen {
+    method: String,
+    uri: String,
+    replication: Option<String>,
+    content_type: Option<String>,
+    meta_foo: Option<String>,
+}
+
+/// 站点 mock：GET ?versioning 按共享状态回答；PUT 回 etag + version-id
+/// （key 含 "nullver" 时故意不回 version-id——P2 重试用例）。
+async fn site_mock(
+    versioning: Arc<Mutex<String>>,
+    etag: String,
+) -> (String, Arc<Mutex<Vec<SiteSeen>>>) {
+    use hyper::service::service_fn;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    let etag = Arc::new(etag);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = Arc::clone(&seen2);
+            let versioning = Arc::clone(&versioning);
+            let etag = Arc::clone(&etag);
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let seen = Arc::clone(&seen);
+                    let versioning = Arc::clone(&versioning);
+                    let etag = Arc::clone(&etag);
+                    async move {
+                        let method = req.method().to_string();
+                        let uri = req.uri().to_string();
+                        let replication = req
+                            .headers()
+                            .get("x-amz-replication-status")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let content_type = req
+                            .headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let meta_foo = req
+                            .headers()
+                            .get("x-amz-meta-foo")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        seen.lock().unwrap().push(SiteSeen {
+                            method: method.clone(),
+                            uri: uri.clone(),
+                            replication,
+                            content_type,
+                            meta_foo,
+                        });
+                        let mut resp = Response::new(Full::new(Bytes::new()));
+                        if method == "GET" {
+                            let st = versioning.lock().unwrap().clone();
+                            if st == "404" {
+                                *resp.status_mut() = StatusCode::NOT_FOUND;
+                            } else {
+                                let xml = format!(
+                                    "<VersioningConfiguration><Status>{st}</Status></VersioningConfiguration>"
+                                );
+                                *resp.body_mut() = Full::new(Bytes::from(xml));
+                            }
+                        } else if method == "PUT" {
+                            resp.headers_mut()
+                                .insert("etag", format!("\"{}\"", *etag).parse().unwrap());
+                            if !uri.contains("nullver") {
+                                resp.headers_mut()
+                                    .insert("x-amz-version-id", "v-remote-1".parse().unwrap());
+                            }
+                        }
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn site_worker_preflight_metadata_retry_and_null_version() {
+    use std::collections::BTreeMap;
+    let (pool, store, _a, _b) = site_fixture().await;
+    let info = store
+        .put_object_stream_with_meta(
+            "rbk",
+            "k",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"payload"))
+            })),
+            Some("text/plain".into()),
+            BTreeMap::from([("foo".to_string(), "Bar".to_string())]),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let vid = info.version_id.clone().unwrap();
+    let etag = info.etag.clone();
+    // 站点行：白名单凭据写入 sites。
+    sqlx::query(
+        "UPDATE sites SET endpoint='http://127.0.0.1:1', s3_access_key='ak', \
+         s3_secret_key='sk', region='us-east-1' WHERE peer_id='p1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "k",
+        version_id: Some(&vid),
+        etag: &etag,
+        size: 7,
+        is_delete_marker: false,
+        is_replica: false,
+    })
+    .await;
+    assert_eq!(site_count(&pool).await, 1);
+
+    // 1) 目标 versioning 404 → 可重试（不 PUT）。
+    let state = Arc::new(Mutex::new("404".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), etag.clone()).await;
+    sqlx::query("UPDATE sites SET endpoint=? WHERE peer_id='p1'")
+        .bind(&endpoint)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let outer = ReplClient::new(&[]);
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (0, 1));
+    assert!(seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+    assert_eq!(outbox_rows(&pool).await[0].0, "pending");
+    // P3-7：把 attempts 推到 bury 阈值——仍 pending 才证明 404 被归为可重试（而非 11 轮后 dead）。
+    sqlx::query("UPDATE repl_outbox SET attempts=10, next_retry_at=0 WHERE target_kind='site'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (0, 1));
+    let rows = outbox_rows(&pool).await;
+    assert_eq!(rows[0].0, "pending", "404 预检必须是可重试：{rows:?}");
+    assert_eq!(rows[0].1, 11);
+    assert!(
+        rows[0].3.as_deref().unwrap_or("").contains("versioning"),
+        "失败原因应记录 versioning 探询：{:?}",
+        rows[0].3
+    );
+
+    // 2) 就绪 → PUT 带 REPLICA/content-type/metadata，且要求真实 version-id。
+    *state.lock().unwrap() = "Enabled".into();
+    sqlx::query("UPDATE repl_outbox SET next_retry_at=0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    let seen_snapshot = seen.lock().unwrap().clone();
+    let puts: Vec<&SiteSeen> = seen_snapshot.iter().filter(|s| s.method == "PUT").collect();
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].replication.as_deref(), Some("REPLICA"));
+    assert_eq!(puts[0].content_type.as_deref(), Some("text/plain"));
+    assert_eq!(puts[0].meta_foo.as_deref(), Some("Bar"));
+    let gets: Vec<&SiteSeen> = seen_snapshot.iter().filter(|s| s.method == "GET").collect();
+    assert!(
+        gets.iter().any(|g| g.uri.contains("versioning=")),
+        "预检必须是 ?versioning：{gets:?}"
+    );
+    let h = store.head_object_version("rbk", "k", &vid).await.unwrap();
+    assert_eq!(h.replication_status.as_deref(), Some("COMPLETED"));
+
+    // 2b) marker 与硬删行都以 DELETE 发送（带 REPLICA 防回环——P0-2/P2-5）。
+    let (dm_vid, dm_etag) = put_versioned(&store, "dm", b"dm").await;
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "dm",
+        version_id: Some(&dm_vid),
+        etag: &dm_etag,
+        size: 0,
+        is_delete_marker: true,
+        is_replica: false,
+    })
+    .await;
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "hard",
+        version_id: None,
+        etag: "",
+        size: 0,
+        is_delete_marker: false,
+        is_replica: false,
+    })
+    .await;
+    sqlx::query("UPDATE repl_outbox SET next_retry_at=0 WHERE target_kind='site'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (2, 0));
+    let seen = seen.lock().unwrap().clone();
+    let dels: Vec<&SiteSeen> = seen.iter().filter(|s| s.method == "DELETE").collect();
+    assert_eq!(dels.len(), 2, "marker 与硬删都走 DELETE");
+    assert!(
+        dels.iter()
+            .all(|d| d.replication.as_deref() == Some("REPLICA")),
+        "DELETE 必须带 REPLICA 头"
+    );
+
+    // 3) PUT 响应 version-id 为 null/缺失 → 可重试，不静默成功。
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    // 与 "k" 同内容 → ETag 与 mock 返回值一致，确保失败原因是 version-id 缺失而非 ETag 断言。
+    let (vid2, etag2) = put_versioned(&store, "nullver", b"payload").await;
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "nullver",
+        version_id: Some(&vid2),
+        etag: &etag2,
+        size: 1,
+        is_delete_marker: false,
+        is_replica: false,
+    })
+    .await;
+    // 等预检缓存过期不必要：同名桶缓存 Enabled（10s）。PUT 缺 version-id → pending。
+    sqlx::query("UPDATE repl_outbox SET next_retry_at=0 WHERE key='nullver'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (sent, failed) = process_repl_once(&pool, &store, &outer).await;
+    assert_eq!((sent, failed), (0, 1));
+    sqlx::query("UPDATE repl_outbox SET attempts=10, next_retry_at=0 WHERE key='nullver'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (sent, failed) = process_repl_once(&pool, &store, &outer).await;
+    assert_eq!((sent, failed), (0, 1));
+    let (st, err): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error FROM repl_outbox WHERE key='nullver' AND target_kind='site'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        st, "pending",
+        "null version-id 必须可重试（11 轮也不 dead）"
+    );
+    assert!(
+        err.unwrap_or_default().contains("version-id"),
+        "失败原因应指向 version-id"
+    );
 }

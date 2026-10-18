@@ -5,7 +5,7 @@
 //!   对未签名的 x-amz-* 返回 403）。
 //! - 单段源（32 hex ETag）断言响应 ETag；MPU 源 ETag 非 MD5，跳过断言（目标重算）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr as _;
 
 use bytes::Bytes;
@@ -30,6 +30,8 @@ pub enum ErrClass {
 pub struct ReplError {
     pub class: ErrClass,
     pub message: String,
+    /// HTTP 状态（仅远端响应错误有值；连接/构造错误为 None）。
+    pub status: Option<u16>,
 }
 
 impl ReplError {
@@ -37,12 +39,14 @@ impl ReplError {
         Self {
             class: ErrClass::Retryable,
             message: msg.into(),
+            status: None,
         }
     }
     pub fn permanent(msg: impl Into<String>) -> Self {
         Self {
             class: ErrClass::Permanent,
             message: msg.into(),
+            status: None,
         }
     }
 }
@@ -79,6 +83,29 @@ impl ReplClient {
         Self { remotes }
     }
 
+    /// 单目标客户端（M7 站点对：worker 按 `sites` 行动态构造；id 固定为 "site"）。
+    pub fn single(
+        endpoint: &str,
+        access_key: &str,
+        secret_key: &str,
+        region: &str,
+    ) -> Result<Self, ReplError> {
+        let uri = endpoint
+            .parse::<Uri>()
+            .map_err(|e| ReplError::permanent(format!("site endpoint 非法：{e}")))?;
+        let mut remotes = HashMap::new();
+        remotes.insert(
+            "site".to_string(),
+            Remote {
+                uri,
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+                region: region.to_string(),
+            },
+        );
+        Ok(Self { remotes })
+    }
+
     pub async fn put_object(
         &self,
         remote_id: &str,
@@ -87,13 +114,60 @@ impl ReplClient {
         body: Bytes,
         expected_etag: &str,
     ) -> Result<(), ReplError> {
+        self.put_object_with_meta(
+            remote_id,
+            dest_bucket,
+            key,
+            body,
+            expected_etag,
+            None,
+            &BTreeMap::new(),
+            false,
+        )
+        .await
+    }
+
+    /// M7 站点 PUT：透传 content-type/user-metadata，并可要求响应带真实 version-id
+    /// （Suspended/Off 目标返回 "null" → 按可重试处理——P2）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_object_with_meta(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        body: Bytes,
+        expected_etag: &str,
+        content_type: Option<&str>,
+        user_metadata: &BTreeMap<String, String>,
+        require_version: bool,
+    ) -> Result<(), ReplError> {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(ct) = content_type {
+            headers.push(("content-type".into(), ct.to_string()));
+        }
+        for (k, v) in user_metadata {
+            let k = k.to_ascii_lowercase();
+            if k.is_empty()
+                || !k
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                continue; // 非法元数据名：丢弃而非让整次复制永久失败
+            }
+            headers.push((format!("x-amz-meta-{k}"), v.clone()));
+        }
+        // P3-8：lowercase 后重名的头只保留一个（SignedHeaders 与线上头必须一致）。
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
+        headers.dedup_by(|a, b| a.0 == b.0);
         let resp = self
             .send(
                 remote_id,
                 "PUT",
                 dest_bucket,
-                key,
+                Some(key),
+                &[],
                 Some(body),
+                &headers,
                 Some("REPLICA"),
             )
             .await?;
@@ -110,6 +184,17 @@ impl ReplClient {
                 )));
             }
         }
+        if require_version {
+            let vid = resp
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|v| v.to_str().ok());
+            if vid.is_none_or(|v| v.is_empty() || v == "null") {
+                return Err(ReplError::retryable(
+                    "目标返回空/null version-id（versioning 未就绪，稍后重试）",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -119,18 +204,80 @@ impl ReplClient {
         dest_bucket: &str,
         key: &str,
     ) -> Result<(), ReplError> {
-        self.send(remote_id, "DELETE", dest_bucket, key, None, None)
-            .await?;
+        // P0-2：DELETE 也带 REPLICA 头（双向配对时目标端不得回环再入队）。
+        self.send(
+            remote_id,
+            "DELETE",
+            dest_bucket,
+            Some(key),
+            &[],
+            None,
+            &[],
+            Some("REPLICA"),
+        )
+        .await?;
         Ok(())
     }
 
+    /// M7 R6：目标桶 versioning 就绪探询（签名 GET `/{bucket}?versioning`）。
+    /// 404 归一为可重试（控制面/物理桶尚未到达），其余错误按状态分类。
+    pub async fn get_bucket_versioning(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+    ) -> Result<String, ReplError> {
+        let resp = self
+            .send(
+                remote_id,
+                "GET",
+                bucket,
+                None,
+                &[("versioning", "")],
+                None,
+                &[],
+                None,
+            )
+            .await
+            .map_err(|e| {
+                if e.status == Some(404) {
+                    ReplError::retryable(format!("目标桶不存在（versioning 探询）：{}", e.message))
+                } else {
+                    e
+                }
+            })?;
+        let mut body = Vec::new();
+        let mut incoming = resp.into_body();
+        while body.len() < 4096 {
+            match incoming.frame().await {
+                Some(Ok(f)) => {
+                    if let Some(d) = f.data_ref() {
+                        let take = (4096 - body.len()).min(d.len());
+                        body.extend_from_slice(&d[..take]);
+                    }
+                }
+                _ => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&body);
+        let status = text
+            .split("<Status>")
+            .nth(1)
+            .and_then(|s| s.split("</Status>").next())
+            .unwrap_or("Off")
+            .trim();
+        Ok(status.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn send(
         &self,
         remote_id: &str,
         method: &str,
         dest_bucket: &str,
-        key: &str,
+        key: Option<&str>,
+        query: &[(&str, &str)],
         body: Option<Bytes>,
+        headers: &[(String, String)],
         replication_status: Option<&'static str>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, ReplError> {
         let remote = self.remotes.get(remote_id).ok_or_else(|| {
@@ -150,34 +297,43 @@ impl ReplClient {
         let body_bytes = body.unwrap_or_default();
         let payload_hex = hex::encode(sha2::Sha256::digest(&body_bytes));
         let amz = amz_date_now()?;
-        let mut signed: Vec<(&str, String)> = vec![
-            ("host", host.clone()),
-            ("x-amz-content-sha256", payload_hex.clone()),
-            ("x-amz-date", amz.fmt_iso8601().to_string()),
+        let mut signed: Vec<(String, String)> = vec![
+            ("host".into(), host.clone()),
+            ("x-amz-content-sha256".into(), payload_hex.clone()),
+            ("x-amz-date".into(), amz.fmt_iso8601().to_string()),
         ];
         if let Some(rs) = replication_status {
-            signed.push(("x-amz-replication-status", rs.to_string()));
+            signed.push(("x-amz-replication-status".into(), rs.to_string()));
         }
-        signed.sort_by(|a, b| a.0.cmp(b.0));
-        let signed_refs: Vec<(&str, &str)> = signed.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let decoded_path = format!("/{dest_bucket}/{key}");
+        signed.extend(headers.iter().cloned());
+        signed.sort_by(|a, b| a.0.cmp(&b.0));
+        let signed_refs: Vec<(&str, &str)> = signed
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let decoded_path = match key {
+            Some(k) => format!("/{dest_bucket}/{k}"),
+            None => format!("/{dest_bucket}"),
+        };
         let payload = Payload::SingleChunk(payload_hex.as_str());
-        let canonical = create_canonical_request(
-            method,
-            &decoded_path,
-            &[] as &[(&str, &str)],
-            &signed_refs,
-            payload,
-        );
-        // 规范请求第二行即 AWS 编码后的 URI（与实际请求必须逐字节一致）
-        let encoded_path = canonical
-            .lines()
-            .nth(1)
-            .ok_or_else(|| ReplError::permanent("规范请求缺少 URI 行"))?
-            .to_string();
+        let canonical =
+            create_canonical_request(method, &decoded_path, query, &signed_refs, payload);
+        // 规范请求的第 2 行是编码后的 path、第 3 行是编码后的 query（可为空）；
+        // 实际请求 URI 必须把两者拼回去（M6 只取第 2 行——加 query 后会丢签名参数）。
+        let mut clines = canonical.lines();
+        let _ = clines.next();
+        let enc_path = clines
+            .next()
+            .ok_or_else(|| ReplError::permanent("规范请求缺少 URI 行"))?;
+        let enc_query = clines.next().unwrap_or("");
+        let encoded_path = if enc_query.is_empty() {
+            enc_path.to_string()
+        } else {
+            format!("{enc_path}?{enc_query}")
+        };
         let sts = create_string_to_sign(&canonical, &amz, &remote.region, "s3");
         let sig = calculate_signature(&sts, &remote.secret_key, &amz, &remote.region, "s3");
-        let signed_names: Vec<&str> = signed.iter().map(|(k, _)| *k).collect();
+        let signed_names: Vec<&str> = signed.iter().map(|(k, _)| k.as_str()).collect();
         let auth = format!(
             "AWS4-HMAC-SHA256 Credential={}/{}/{}/s3/aws4_request, SignedHeaders={}, Signature={}",
             remote.access_key,
@@ -190,7 +346,7 @@ impl ReplClient {
             .map_err(|e| ReplError::permanent(format!("请求 URI 构造失败：{e}")))?;
         let mut req = Request::builder().method(method).uri(uri);
         for (k, v) in &signed {
-            req = req.header(*k, v);
+            req = req.header(k.as_str(), v.as_str());
         }
         req = req.header("authorization", auth);
         let req = req
@@ -236,10 +392,15 @@ impl ReplClient {
 
 fn classify_status(status: StatusCode, text: &str) -> ReplError {
     let msg = format!("目标返回 {}：{text}", status.as_u16());
-    if status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error() {
-        ReplError::retryable(msg)
+    let class = if status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error() {
+        ErrClass::Retryable
     } else {
-        ReplError::permanent(msg)
+        ErrClass::Permanent
+    };
+    ReplError {
+        class,
+        message: msg,
+        status: Some(status.as_u16()),
     }
 }
 
@@ -308,7 +469,7 @@ mod tests {
         );
         // URI 行已 AWS 编码（空格 → %20）
         assert!(c.lines().nth(1).unwrap().contains("a%20b.txt"), "{c}");
-        // DELETE 不带该头
+        // 未传入时省略该头（纯函数行为；线上 DELETE 现在也带 REPLICA——P0-2）
         let c = canonical_for_test("DELETE", "/dst/k", "h:1", "abc", None);
         assert!(!c.contains("x-amz-replication-status"), "{c}");
     }
