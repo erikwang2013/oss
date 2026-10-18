@@ -9,9 +9,15 @@ use oss_server::lifecycle::sweep_once;
 fn rule(prefix: &str, days: i64) -> LifecycleRuleRow {
     LifecycleRuleRow {
         bucket: "bkt".into(),
+        rule_id: None,
         prefix: prefix.into(),
         expire_days: days,
+        expiration_days: None,
+        transition_days: None,
+        transition_class: None,
+        transition_tier: None,
         enabled: true,
+        updated_at: 0,
     }
 }
 

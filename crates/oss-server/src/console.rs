@@ -505,7 +505,12 @@ async fn get_lifecycle(
             rows.into_iter()
                 .map(|r| {
                     serde_json::json!({
-                        "prefix": r.prefix, "expire_days": r.expire_days, "enabled": r.enabled,
+                        "rule_id": r.rule_id, "prefix": r.prefix,
+                        "expire_days": r.expire_days, "expiration_days": r.expiration_days,
+                        "transition_days": r.transition_days,
+                        "transition_class": r.transition_class,
+                        "transition_tier": r.transition_tier,
+                        "enabled": r.enabled, "updated_at": r.updated_at,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -559,9 +564,15 @@ async fn put_lifecycle(
         }
         rows.push(crate::db::LifecycleRuleRow {
             bucket: bucket.clone(),
+            rule_id: None,
             prefix: r.prefix,
             expire_days: r.expire_days,
+            expiration_days: None,
+            transition_days: None,
+            transition_class: None,
+            transition_tier: None,
             enabled: r.enabled,
+            updated_at: 0, // 写路径由 set_lifecycle_rules 统一填 now
         });
     }
     let now = std::time::SystemTime::now()

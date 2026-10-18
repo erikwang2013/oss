@@ -80,6 +80,8 @@ const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 /// M7：每次启动重放（表 IF NOT EXISTS；触发器 DROP+CREATE；必须在 ensure_columns 之后——
 /// 触发器引用运行时补列 kind/status/object_lock）。
 const SCHEMA_M7: &str = include_str!("../migrations/0002_m7_site.sql");
+/// M8（S0）：全部新表/索引一次性建齐；后续切片只使用、不改本文件。
+const SCHEMA_M8: &str = include_str!("../migrations/0003_m8.sql");
 
 pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
@@ -102,6 +104,8 @@ impl Db {
         db.ensure_columns().await?;
         // M7：增量列就位后再建站点表/触发器（触发器引用补列），并种下本站身份。
         sqlx::raw_sql(SCHEMA_M7).execute(&db.pool).await?;
+        // M8：新表无触发器依赖，独立重放；任一语句失败必须启动失败（不吞错）。
+        sqlx::raw_sql(SCHEMA_M8).execute(&db.pool).await?;
         db.site_bootstrap().await?;
         Ok(db)
     }
@@ -266,6 +270,138 @@ impl Db {
             {
                 return Err(e);
             }
+        }
+        // M8（S0）：jobs 作业引擎列（老库补列；幂等）
+        let jcols = sqlx::query("SELECT name FROM pragma_table_info('jobs')")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_j = |n: &str| jcols.iter().any(|r| r.get::<String, _>("name") == n);
+        for (name, ddl) in [
+            ("spec_json", "ALTER TABLE jobs ADD COLUMN spec_json TEXT"),
+            (
+                "progress",
+                "ALTER TABLE jobs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "total",
+                "ALTER TABLE jobs ADD COLUMN total INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "succeeded",
+                "ALTER TABLE jobs ADD COLUMN succeeded INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "failed",
+                "ALTER TABLE jobs ADD COLUMN failed INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "report_bucket",
+                "ALTER TABLE jobs ADD COLUMN report_bucket TEXT",
+            ),
+            (
+                "report_prefix",
+                "ALTER TABLE jobs ADD COLUMN report_prefix TEXT",
+            ),
+            (
+                "priority",
+                "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "requested_by",
+                "ALTER TABLE jobs ADD COLUMN requested_by INTEGER",
+            ),
+            (
+                "parent_job_id",
+                "ALTER TABLE jobs ADD COLUMN parent_job_id INTEGER",
+            ),
+            (
+                "started_at",
+                "ALTER TABLE jobs ADD COLUMN started_at INTEGER",
+            ),
+            (
+                "finished_at",
+                "ALTER TABLE jobs ADD COLUMN finished_at INTEGER",
+            ),
+        ] {
+            if !has_j(name)
+                && let Err(e) = sqlx::query(ddl).execute(&self.pool).await
+            {
+                let again = sqlx::query("SELECT name FROM pragma_table_info('jobs')")
+                    .fetch_all(&self.pool)
+                    .await?;
+                if !again.iter().any(|r| r.get::<String, _>("name") == name) {
+                    return Err(e);
+                }
+            }
+        }
+        // M8（S4a/S4b）：生命周期规则 id/expiration/Transition 五列（老库补列；幂等）
+        let lcols = sqlx::query("SELECT name FROM pragma_table_info('lifecycle_rules')")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_l = |n: &str| lcols.iter().any(|r| r.get::<String, _>("name") == n);
+        for (name, ddl) in [
+            (
+                "rule_id",
+                "ALTER TABLE lifecycle_rules ADD COLUMN rule_id TEXT",
+            ),
+            (
+                "expiration_days",
+                "ALTER TABLE lifecycle_rules ADD COLUMN expiration_days INTEGER",
+            ),
+            (
+                "transition_days",
+                "ALTER TABLE lifecycle_rules ADD COLUMN transition_days INTEGER",
+            ),
+            (
+                "transition_class",
+                "ALTER TABLE lifecycle_rules ADD COLUMN transition_class TEXT",
+            ),
+            (
+                "transition_tier",
+                "ALTER TABLE lifecycle_rules ADD COLUMN transition_tier TEXT",
+            ),
+        ] {
+            if !has_l(name)
+                && let Err(e) = sqlx::query(ddl).execute(&self.pool).await
+            {
+                let again = sqlx::query("SELECT name FROM pragma_table_info('lifecycle_rules')")
+                    .fetch_all(&self.pool)
+                    .await?;
+                if !again.iter().any(|r| r.get::<String, _>("name") == name) {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------- M8（S0）：桶删除的 M8 状态清理 ----------
+
+    /// 删桶后清理 M8 表（jobs 按审计保留）。S3/console/cluster 路径走这里；
+    /// site apply 在既有事务内走 [`Db::clear_bucket_m8_tx`]。
+    pub async fn clear_bucket_m8(&self, bucket: &str) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        Self::clear_bucket_m8_tx(&mut conn, bucket).await
+    }
+
+    /// 事务内版本（`&mut SqliteConnection`；调用方负责 commit 与 cache 失效时机）。
+    pub async fn clear_bucket_m8_tx(conn: &mut sqlx::SqliteConnection, bucket: &str) -> Result<()> {
+        // olap_configs 无 FK 级联保证时也必须清（先按 access_point 删，再删 AP）
+        sqlx::query(
+            "DELETE FROM olap_configs WHERE access_point IN \
+             (SELECT name FROM access_points WHERE bucket = ?)",
+        )
+        .bind(bucket)
+        .execute(&mut *conn)
+        .await?;
+        for sql in [
+            "DELETE FROM access_points WHERE bucket = ?",
+            "DELETE FROM inventory_runs WHERE bucket = ?",
+            "DELETE FROM inventory_configs WHERE bucket = ?",
+            "DELETE FROM tier_restores WHERE bucket = ?",
+            "DELETE FROM lifecycle_rules WHERE bucket = ?",
+        ] {
+            sqlx::query(sql).bind(bucket).execute(&mut *conn).await?;
         }
         Ok(())
     }
@@ -1467,38 +1603,239 @@ mod tests {
         let db = Db::connect(&url).await.unwrap();
         assert!(db.get_user(1).await.unwrap().is_some());
     }
+
+    /// M8 S0：旧库（只有 0001）升级——0003 全部表 + jobs/lifecycle 补列；二次连接幂等。
+    #[tokio::test]
+    async fn m8_schema_and_columns_exist_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v110.db");
+        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let db = Db::connect(&url).await.unwrap();
+        for t in [
+            "job_tasks",
+            "access_points",
+            "olap_configs",
+            "inventory_configs",
+            "inventory_runs",
+            "tier_restores",
+        ] {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(t)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "缺少表 {t}");
+        }
+        let jcols = sqlx::query("SELECT name FROM pragma_table_info('jobs')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        for c in [
+            "spec_json",
+            "progress",
+            "total",
+            "succeeded",
+            "failed",
+            "report_bucket",
+            "report_prefix",
+            "priority",
+            "requested_by",
+            "parent_job_id",
+            "started_at",
+            "finished_at",
+        ] {
+            assert!(
+                jcols.iter().any(|r| r.get::<String, _>("name") == c),
+                "jobs 缺列 {c}"
+            );
+        }
+        let lcols = sqlx::query("SELECT name FROM pragma_table_info('lifecycle_rules')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        for c in [
+            "rule_id",
+            "expiration_days",
+            "transition_days",
+            "transition_class",
+            "transition_tier",
+        ] {
+            assert!(
+                lcols.iter().any(|r| r.get::<String, _>("name") == c),
+                "lifecycle_rules 缺列 {c}"
+            );
+        }
+        let idx: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_lifecycle_rule_id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(idx, 1, "缺少 idx_lifecycle_rule_id");
+        drop(db);
+        // 二次连接：0003/补列均幂等
+        let _ = Db::connect(&url).await.unwrap();
+    }
+
+    /// M8 S0：clear_bucket_m8 清 M8 表（含生命周期规则）、保留 jobs 与其他桶行。
+    #[tokio::test]
+    async fn clear_bucket_m8_cleans_m8_tables_and_keeps_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("m8.db").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO access_points (name,bucket,owner_id,policy_json,created_at,updated_at) \
+               VALUES ('ap1','b1',7,NULL,1,1),('ap2','b2',7,NULL,1,1);\
+             INSERT INTO olap_configs (access_point,kind,endpoint,updated_at) \
+               VALUES ('ap1','http','http://x',1),('ap2','http','http://y',1);\
+             INSERT INTO inventory_configs (bucket,id,owner_id,config_json,updated_at) \
+               VALUES ('b1','daily',7,'{}',1),('b2','daily',7,'{}',1);\
+             INSERT INTO inventory_runs (bucket,config_id,run_key,started_at,state,created_at) \
+               VALUES ('b1','daily','k',1,'done',1),('b2','daily','k',1,'done',1);\
+             INSERT INTO tier_restores (bucket,key,version_id,created_at) \
+               VALUES ('b1','k','v',1),('b2','k','v',1);\
+             INSERT INTO lifecycle_rules (bucket,prefix,expire_days,enabled,updated_at) \
+               VALUES ('b1','',1,1,1),('b2','',1,1,1);\
+             INSERT INTO jobs (kind,bucket,state,created_at,updated_at) \
+               VALUES ('batch','b1','done',1,1);",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.clear_bucket_m8("b1").await.unwrap();
+        for (table, sql) in [
+            (
+                "access_points",
+                "SELECT COUNT(*) FROM access_points WHERE bucket='b1'",
+            ),
+            (
+                "inventory_configs",
+                "SELECT COUNT(*) FROM inventory_configs WHERE bucket='b1'",
+            ),
+            (
+                "inventory_runs",
+                "SELECT COUNT(*) FROM inventory_runs WHERE bucket='b1'",
+            ),
+            (
+                "tier_restores",
+                "SELECT COUNT(*) FROM tier_restores WHERE bucket='b1'",
+            ),
+            (
+                "lifecycle_rules",
+                "SELECT COUNT(*) FROM lifecycle_rules WHERE bucket='b1'",
+            ),
+        ] {
+            let n: i64 = sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(n, 0, "{table} 未清");
+        }
+        // 其他桶的行必须保留（抽查 AP/Inventory/规则）
+        for (table, sql) in [
+            (
+                "access_points",
+                "SELECT COUNT(*) FROM access_points WHERE bucket='b2'",
+            ),
+            (
+                "inventory_configs",
+                "SELECT COUNT(*) FROM inventory_configs WHERE bucket='b2'",
+            ),
+            (
+                "inventory_runs",
+                "SELECT COUNT(*) FROM inventory_runs WHERE bucket='b2'",
+            ),
+            (
+                "tier_restores",
+                "SELECT COUNT(*) FROM tier_restores WHERE bucket='b2'",
+            ),
+            (
+                "lifecycle_rules",
+                "SELECT COUNT(*) FROM lifecycle_rules WHERE bucket='b2'",
+            ),
+        ] {
+            let n: i64 = sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(n, 1, "{table} 误删其他桶行");
+        }
+        let ap2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_points WHERE bucket='b2'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(ap2, 1, "其他桶 AP 被误删");
+        let olap1: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM olap_configs WHERE access_point='ap1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(olap1, 0, "olap_configs 未级联清理");
+        let olap2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM olap_configs WHERE access_point='ap2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(olap2, 1);
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1, "jobs 必须按审计保留");
+    }
 }
 
 // ——— M4 切片 6：生命周期规则与作业（jobs 表进度） ———
 
-/// 生命周期规则行。
+/// 生命周期规则行。M8 S0 扩为全字段（S4b 只做映射，不再改 db.rs）；
+/// `expire_days` 为 M4 旧列（无 Expiration 的新规则写哨兵 -1），`expiration_days` 为新语义。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleRuleRow {
     pub bucket: String,
+    pub rule_id: Option<String>,
     pub prefix: String,
     pub expire_days: i64,
+    pub expiration_days: Option<i64>,
+    pub transition_days: Option<i64>,
+    pub transition_class: Option<String>,
+    pub transition_tier: Option<String>,
     pub enabled: bool,
+    pub updated_at: i64,
+}
+
+fn row_to_lifecycle_rule(r: &sqlx::sqlite::SqliteRow) -> LifecycleRuleRow {
+    LifecycleRuleRow {
+        bucket: r.get("bucket"),
+        rule_id: r.get("rule_id"),
+        prefix: r.get("prefix"),
+        expire_days: r.get("expire_days"),
+        expiration_days: r.get("expiration_days"),
+        transition_days: r.get("transition_days"),
+        transition_class: r.get("transition_class"),
+        transition_tier: r.get("transition_tier"),
+        enabled: r.get::<i64, _>("enabled") != 0,
+        updated_at: r.get("updated_at"),
+    }
 }
 
 impl Db {
     /// 某桶的全部规则（控制台 GET 用）。
     pub async fn list_lifecycle_rules(&self, bucket: &str) -> Result<Vec<LifecycleRuleRow>> {
         let rows = sqlx::query(
-            "SELECT bucket, prefix, expire_days, enabled FROM lifecycle_rules \
-             WHERE bucket = ? ORDER BY prefix",
+            "SELECT bucket, rule_id, prefix, expire_days, expiration_days, transition_days, \
+             transition_class, transition_tier, enabled, updated_at FROM lifecycle_rules \
+             WHERE bucket = ? ORDER BY prefix, rule_id",
         )
         .bind(bucket)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| LifecycleRuleRow {
-                bucket: r.get("bucket"),
-                prefix: r.get("prefix"),
-                expire_days: r.get("expire_days"),
-                enabled: r.get::<i64, _>("enabled") != 0,
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_lifecycle_rule).collect())
     }
 
     /// 全量替换某桶规则（PUT 语义：先删后插，一个事务）。`now` 由调用方给（可测）。
@@ -1515,12 +1852,18 @@ impl Db {
             .await?;
         for r in rules {
             sqlx::query(
-                "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at) \
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, expiration_days, \
+                 transition_days, transition_class, transition_tier, enabled, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(bucket)
+            .bind(&r.rule_id)
             .bind(&r.prefix)
             .bind(r.expire_days)
+            .bind(r.expiration_days)
+            .bind(r.transition_days)
+            .bind(&r.transition_class)
+            .bind(&r.transition_tier)
             .bind(if r.enabled { 1 } else { 0 })
             .bind(now)
             .execute(&mut *tx)
@@ -1533,19 +1876,13 @@ impl Db {
     /// 全部启用规则（worker 扫描用）。
     pub async fn enabled_lifecycle_rules(&self) -> Result<Vec<LifecycleRuleRow>> {
         let rows = sqlx::query(
-            "SELECT bucket, prefix, expire_days, enabled FROM lifecycle_rules WHERE enabled = 1",
+            "SELECT bucket, rule_id, prefix, expire_days, expiration_days, transition_days, \
+             transition_class, transition_tier, enabled, updated_at FROM lifecycle_rules \
+             WHERE enabled = 1",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| LifecycleRuleRow {
-                bucket: r.get("bucket"),
-                prefix: r.get("prefix"),
-                expire_days: r.get("expire_days"),
-                enabled: true,
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_lifecycle_rule).collect())
     }
 
     /// 开一条作业（worker 每次执行一条）。
