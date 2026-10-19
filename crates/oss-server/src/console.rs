@@ -123,6 +123,8 @@ pub fn routes() -> Router<AppState> {
         .route("/groups", get(list_groups))
         // 集群状态（管理员；单机优雅降级为 mode:"single"）
         .route("/cluster/status", get(cluster_status))
+        // M8 S6 缺口 A：加密/KMS 只读状态（管理员；无变更端点）
+        .route("/encryption", get(encryption_status))
         // M4 切片 6：作业记录（管理员）与桶生命周期规则（桶主或管理员）
         .route("/jobs", get(list_jobs))
         // M8 S0：作业详情/控制（admin 或 requested_by）
@@ -149,6 +151,13 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/buckets/{bucket}/objects/{*key}",
             get(get_object).delete(delete_object),
+        )
+        // M8 S6 缺口 A：对象标签（链尾版本）
+        .route(
+            "/buckets/{bucket}/tags/{*key}",
+            get(get_object_tags)
+                .put(put_object_tags)
+                .delete(delete_object_tags),
         )
         .route("/uploads", get(list_uploads))
         .route("/uploads/register", post(register_upload))
@@ -339,6 +348,32 @@ async fn cluster_status(
             .into_response()
         }
     }
+}
+
+/// M8 S6 缺口 A：加密/KMS 只读状态（管理员）。配置仍只在 env（OSS_MASTER_KEY_FILE /
+/// OSS_KMS_DIR）；此处只回布尔与当前主密钥编号，**绝不回密钥材料**，也无变更端点。
+async fn encryption_status(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let es = state.store.enc_state();
+    let (sse_s3, sse_kms, kms_current_key_id) = match es {
+        Some(es) => (
+            es.file.is_some(),
+            es.kms.is_some(),
+            es.kms.as_ref().map(|k| format!("k{}", k.current_id())),
+        ),
+        None => (false, false, None),
+    };
+    Json(serde_json::json!({
+        "sse_s3": sse_s3,
+        "sse_kms": sse_kms,
+        "kms_current_key_id": kms_current_key_id,
+    }))
+    .into_response()
 }
 
 /// 上传分组（oss.toml 的 `[[groups]]`），供上传面板的分组下拉使用。
@@ -576,9 +611,23 @@ struct AuditQuery {
     limit: Option<i64>,
     #[serde(default)]
     decision: Option<String>,
+    /// 时间窗（unix 秒，闭区间）；`key` = object_key 前缀。
+    #[serde(default)]
+    from: Option<i64>,
+    #[serde(default)]
+    to: Option<i64>,
+    #[serde(default)]
+    uid: Option<i64>,
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
-/// 审计查询（M4 切片 7；管理员）：`?limit=100&decision=deny|allow`。
+/// 审计查询（M4 切片 7；管理员）：`?limit=100&decision=deny|allow`，以及
+/// `from/to/uid/op/bucket/key` 过滤（空串视为未给）。
 async fn list_audit(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -587,12 +636,31 @@ async fn list_audit(
     if let Err(r) = admin_of(&state, &payload).await {
         return r;
     }
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let decision = q
-        .decision
-        .as_deref()
-        .filter(|d| *d == "allow" || *d == "deny");
-    match state.db.list_audit(limit, decision).await {
+    if q.from.is_some_and(|v| v < 0) || q.to.is_some_and(|v| v < 0) || q.uid.is_some_and(|v| v < 0)
+    {
+        return (StatusCode::BAD_REQUEST, "时间/uid 不得为负").into_response();
+    }
+    if let (Some(from), Some(to)) = (q.from, q.to)
+        && from > to
+    {
+        return (StatusCode::BAD_REQUEST, "from 不得晚于 to").into_response();
+    }
+    let nonempty = |s: Option<String>| s.filter(|v| !v.is_empty());
+    let (op, bucket, key) = (nonempty(q.op), nonempty(q.bucket), nonempty(q.key));
+    let filter = crate::db::AuditFilter {
+        limit: q.limit.unwrap_or(100).clamp(1, 1000),
+        decision: q
+            .decision
+            .as_deref()
+            .filter(|d| *d == "allow" || *d == "deny"),
+        from: q.from,
+        to: q.to,
+        uid: q.uid,
+        op: op.as_deref(),
+        bucket: bucket.as_deref(),
+        key_prefix: key.as_deref(),
+    };
+    match state.db.list_audit(&filter).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询审计失败");
@@ -1076,6 +1144,80 @@ async fn delete_object(
             }
             StatusCode::NO_CONTENT.into_response()
         }
+        Err(e) => store_error(e).into_response(),
+    }
+}
+
+/// M8 S6 缺口 A：控制台对象标签（仅链尾版本，v1 不收版本参数）。
+/// GET 需 Read；PUT/DELETE 需 Write（桶主/管理员在 require_perm 内已放行）。
+async fn get_object_tags(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
+        return r;
+    }
+    match state.store.get_object_tags(&bucket, &key, None).await {
+        Ok((_vid, tags)) => Json(serde_json::json!({ "tags": tags })).into_response(),
+        Err(e) => store_error(e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ObjectTagsBody {
+    tags: Vec<xl_store::meta::ObjectTag>,
+}
+
+async fn put_object_tags(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path((bucket, key)): Path<(String, String)>,
+    Json(body): Json<ObjectTagsBody>,
+) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Write).await {
+        return r;
+    }
+    // store 对 InvalidArgument 落 5xx（那是通用错误面），这里先校验回 400
+    if let Err(msg) = xl_store::meta::validate_tags(&body.tags) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    match state
+        .store
+        .set_object_tags(&bucket, &key, None, body.tags)
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e).into_response(),
+    }
+}
+
+async fn delete_object_tags(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Write).await {
+        return r;
+    }
+    match state
+        .store
+        .set_object_tags(&bucket, &key, None, Vec::new())
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => store_error(e).into_response(),
     }
 }

@@ -1056,3 +1056,209 @@ async fn transform_preload_resolves_bucket_when_ap_cache_misses() {
     cache.invalidate_bucket("preb");
     assert!(cache.get("ap-pre").unwrap().is_none(), "桶名应从 DB 回查");
 }
+
+/// M8 S6 缺口 A：控制台对象标签路由——set→get→delete 往返、校验、404、非写者 403。
+#[tokio::test]
+async fn object_tags_console_routes() {
+    use oss_server::db::PermissionRow;
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let bob_uid = st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store.create_bucket("tagb").await.unwrap();
+    st.db.insert_bucket("tagb", None).await.unwrap();
+    st.store
+        .put_object("tagb", "a/b.txt", bytes::Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    // bob 只有读权限（非写者）
+    st.db
+        .set_permissions(
+            bob_uid,
+            &[PermissionRow {
+                bucket: "tagb".into(),
+                read: true,
+                write: false,
+                delete: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/buckets/tagb/tags/a/b.txt");
+
+    // 初始为空
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!({"tags": []}));
+
+    // set → get
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"tags": [
+            {"key": "env", "value": "prod"}, {"key": "team", "value": "core"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v["tags"],
+        serde_json::json!([
+            {"key": "env", "value": "prod"}, {"key": "team", "value": "core"}
+        ])
+    );
+
+    // 非写者：读 200、写/删 403
+    let r = client.get(&url).bearer_auth(&bob).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = client
+        .put(&url)
+        .bearer_auth(&bob)
+        .json(&serde_json::json!({"tags": [{"key": "a", "value": "1"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "put");
+    let r = client.delete(&url).bearer_auth(&bob).send().await.unwrap();
+    assert_eq!(r.status(), 403, "delete");
+
+    // 校验：>10 条 / 非法字符 → 400
+    let many: Vec<serde_json::Value> = (0..11)
+        .map(|i| serde_json::json!({"key": format!("k{i}"), "value": "v"}))
+        .collect();
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"tags": many}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"tags": [{"key": "bad!", "value": "v"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // 缺失对象/桶 → 404（标签写不得凭空建对象）
+    let r = client
+        .get(format!("{base}/api/v1/buckets/tagb/tags/nope"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = client
+        .put(format!("{base}/api/v1/buckets/tagb/tags/nope"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"tags": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = client
+        .get(format!("{base}/api/v1/buckets/nope/tags/a"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // delete → 清空
+    let r = client
+        .delete(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!({"tags": []}));
+}
+
+/// M8 S6 缺口 A：加密/KMS 只读状态——admin 200、非 admin 403、仅三个字段（无钥材料）。
+#[tokio::test]
+async fn encryption_status_is_admin_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/encryption");
+
+    // 未接线（env 未配置）：两 false + null
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"sse_s3": false, "sse_kms": false, "kms_current_key_id": null})
+    );
+
+    // 接线后：只回布尔与当前主密钥编号（k0），不含任何钥字节
+    st.store
+        .init_encryption(
+            Some(dir.path().join("master.key")),
+            Some(dir.path().join("kms")),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"sse_s3": true, "sse_kms": true, "kms_current_key_id": "k0"})
+    );
+
+    // 非管理员 403
+    let r = client.get(&url).bearer_auth(&bob).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+}

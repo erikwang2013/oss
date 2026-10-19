@@ -3450,20 +3450,66 @@ impl Db {
         Ok(n)
     }
 
-    /// 审计查询（控制台；可选 decision 过滤；最新在前）。
-    pub async fn list_audit(
-        &self,
-        limit: i64,
-        decision: Option<&str>,
-    ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query(
+    /// 审计查询（控制台；可选 decision/时间窗/uid/op/bucket/key 前缀过滤；最新在前）。
+    /// 动态 WHERE 只拼**固定片段**，用户值一律绑定参数。
+    pub async fn list_audit(&self, f: &AuditFilter<'_>) -> Result<Vec<serde_json::Value>> {
+        let mut sql = String::from(
             "SELECT id, ts, uid, op, bucket, object_key, decision, detail FROM audit_log \
-             WHERE (?1 IS NULL OR decision = ?1) ORDER BY id DESC LIMIT ?2",
-        )
-        .bind(decision)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE 1=1",
+        );
+        for (present, clause) in [
+            (f.decision.is_some(), " AND decision = ?"),
+            (f.from.is_some(), " AND ts >= ?"),
+            (f.to.is_some(), " AND ts <= ?"),
+            (f.uid.is_some(), " AND uid = ?"),
+            (f.op.is_some(), " AND op = ?"),
+            (f.bucket.is_some(), " AND bucket = ?"),
+        ] {
+            if present {
+                sql.push_str(clause);
+            }
+        }
+        // 前缀按字面量匹配：转义 LIKE 元字符，避免用户输入变成通配符
+        let key_pattern = f.key_prefix.map(|p| {
+            let mut s = String::with_capacity(p.len() + 1);
+            for c in p.chars() {
+                if matches!(c, '%' | '_' | '\\') {
+                    s.push('\\');
+                }
+                s.push(c);
+            }
+            s.push('%');
+            s
+        });
+        if key_pattern.is_some() {
+            sql.push_str(" AND object_key LIKE ? ESCAPE '\\'");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+
+        // 绑定顺序必须与上面的 WHERE 片段顺序一致
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        if let Some(v) = f.decision {
+            q = q.bind(v);
+        }
+        if let Some(v) = f.from {
+            q = q.bind(v);
+        }
+        if let Some(v) = f.to {
+            q = q.bind(v);
+        }
+        if let Some(v) = f.uid {
+            q = q.bind(v);
+        }
+        if let Some(v) = f.op {
+            q = q.bind(v);
+        }
+        if let Some(v) = f.bucket {
+            q = q.bind(v);
+        }
+        if let Some(v) = &key_pattern {
+            q = q.bind(v);
+        }
+        let rows = q.bind(f.limit).fetch_all(&self.pool).await?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -3480,6 +3526,19 @@ impl Db {
             })
             .collect())
     }
+}
+
+/// 审计查询的过滤条件（`Db::list_audit`）；`key_prefix` 为 object_key 前缀，其余精确匹配。
+#[derive(Debug)]
+pub struct AuditFilter<'a> {
+    pub limit: i64,
+    pub decision: Option<&'a str>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub uid: Option<i64>,
+    pub op: Option<&'a str>,
+    pub bucket: Option<&'a str>,
+    pub key_prefix: Option<&'a str>,
 }
 
 #[cfg(test)]
