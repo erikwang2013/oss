@@ -20,7 +20,8 @@ use crate::convert::to_s3_error;
 use crate::events::{EventSink, EventSource, S3EventOp};
 use crate::lock::{apply_lock_out, bucket_lock_out, parse_bucket_lock_rule, parse_put_lock};
 use crate::sse::{
-    SseReq, parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec,
+    SseReq, enc_spec_from_default, parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out,
+    sse_out_from_spec,
 };
 
 #[derive(Clone)]
@@ -65,14 +66,11 @@ impl OssS3 {
                 s3s::s3_error!(InternalError, "internal error")
             })?;
         if let Some(v) = stored {
-            sse.spec = Some(match v.as_str() {
-                "AES256" => xl_store::crypto::EncSpec::SseS3,
-                "aws:kms" => xl_store::crypto::EncSpec::SseKms,
-                other => {
-                    tracing::error!(bucket, value = %other, "桶默认加密记录非法");
-                    return Err(s3s::s3_error!(InternalError, "internal error"));
-                }
-            });
+            let Some(spec) = enc_spec_from_default(&v) else {
+                tracing::error!(bucket, value = %v, "桶默认加密记录非法");
+                return Err(s3s::s3_error!(InternalError, "internal error"));
+            };
+            sse.spec = Some(spec);
         }
         Ok(())
     }
@@ -2569,13 +2567,18 @@ impl S3 for OssS3 {
                 ));
             }
         };
-        self.acl
+        let updated = self
+            .acl
             .set_bucket_default_encryption(&bucket, algo)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, bucket, "写桶默认加密失败");
                 s3s::s3_error!(InternalError, "internal error")
             })?;
+        if !updated {
+            tracing::error!(bucket, "桶默认加密写入无行（buckets 记录缺失）");
+            return Err(s3s::s3_error!(InternalError, "internal error"));
+        }
         Ok(S3Response::new(PutBucketEncryptionOutput {}))
     }
 
@@ -2607,6 +2610,11 @@ impl S3 for OssS3 {
                 "server-side encryption configuration not found"
             ));
         };
+        // 写路径已校验；库内出现非法值属记录损坏 → 500（与 apply 路径同口径）
+        if enc_spec_from_default(&algo).is_none() {
+            tracing::error!(bucket, value = %algo, "桶默认加密记录非法");
+            return Err(s3s::s3_error!(InternalError, "internal error"));
+        }
         Ok(S3Response::new(GetBucketEncryptionOutput {
             server_side_encryption_configuration: Some(ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {

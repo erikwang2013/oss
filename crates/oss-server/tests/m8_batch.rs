@@ -635,6 +635,34 @@ async fn five_actions_and_hooks() {
     assert!(f.run(BATCH_INVOKE, &iv).await.is_err(), "500 必须失败");
 }
 
+/// M8 缺口 C：Batch Copy 必须套目标桶默认加密——HEAD 可见 SSE-S3 记录且可解密读回。
+#[tokio::test]
+async fn copy_applies_bucket_default_encryption() {
+    let f = fx().await;
+    f.st.store
+        .init_encryption(Some(f._dir.path().join("master.key")), None)
+        .await
+        .unwrap();
+    f.put("src", "secret", b"top-secret").await;
+    f.db()
+        .set_bucket_default_encryption("dst", "AES256")
+        .await
+        .unwrap();
+    let mut cp = payload("src", "secret", f.admin);
+    cp.target_bucket = Some("dst".into());
+    assert_eq!(f.run(BATCH_COPY, &cp).await.unwrap(), "Succeeded");
+    let info = f.store().head_object("dst", "secret").await.unwrap();
+    let rec = info.encryption.expect("Batch Copy 目标应套用桶默认加密");
+    assert_eq!(rec.key_id, "file", "AES256 默认 → SSE-S3（file provider）");
+    assert_eq!(rec.sse_c_key_md5, None);
+    let (_, body) = f.store().get_object("dst", "secret").await.unwrap();
+    assert_eq!(
+        body,
+        Bytes::from_static(b"top-secret"),
+        "加密对象应可解密读回"
+    );
+}
+
 #[tokio::test]
 async fn archived_and_sse_c_sources_are_rejected() {
     let f = fx().await;

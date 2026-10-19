@@ -2000,6 +2000,44 @@ async fn bucket_default_encryption_applied_and_overridden() {
             .starts_with('k')
     );
 
+    // 显式 SSE-C 同样优先于桶默认（不套默认、不回 SSE 头），且可带钥读回
+    use base64::Engine as _;
+    let ckey = [9u8; 32];
+    let ck = xl_store::crypto::SseCKey::from_key(ckey);
+    let cb64 = base64::engine::general_purpose::STANDARD.encode(ckey);
+    let cmd5 = ck.md5_b64().to_string();
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "sse-c".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"sse-c-wins"))),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(cb64.clone()),
+            sse_customer_key_md5: Some(cmd5.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.sse_customer_algorithm.as_deref(), Some("AES256"));
+    assert!(
+        out.server_side_encryption.is_none(),
+        "显式 SSE-C 不得被桶默认覆盖为 SSE-S3"
+    );
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "sse-c".into(),
+            sse_customer_algorithm: Some("AES256".into()),
+            sse_customer_key: Some(cb64),
+            sse_customer_key_md5: Some(cmd5),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(g.server_side_encryption.is_none());
+
     // MPU：create 无 SSE → 响应回 AES256；complete 落地
     let created = s3
         .create_multipart_upload(req(CreateMultipartUploadInput {

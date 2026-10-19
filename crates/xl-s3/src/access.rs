@@ -275,27 +275,27 @@ impl Acl {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("default_encryption")))
     }
 
-    /// M8 缺口 C：写桶默认加密（全量替换）。
+    /// M8 缺口 C：写桶默认加密（全量替换；桶行不存在 → false）。
     pub async fn set_bucket_default_encryption(
         &self,
         bucket: &str,
         algorithm: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
             .bind(algorithm)
             .bind(bucket)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
-    /// M8 缺口 C：清桶默认加密（幂等；删桶时亦可复用）。
-    pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
+    /// M8 缺口 C：清桶默认加密（幂等；返回是否命中桶行）。
+    pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
             .bind(bucket)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶

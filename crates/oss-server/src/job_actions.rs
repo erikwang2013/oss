@@ -19,6 +19,7 @@ use xl_s3::access::{Acl, AuthedUser};
 use xl_s3::olap::{OlapCache, OlapInput, acquire_transform_slot};
 use xl_s3::replication::{ReplicationSink, WriteInfo};
 use xl_s3::restore::RestoreSink;
+use xl_s3::sse::enc_spec_from_default;
 use xl_s3::tier_gc::TierGcSink;
 use xl_store::meta::ObjectTag;
 use xl_store::store::{DeleteOutcome, Store};
@@ -287,6 +288,19 @@ impl BatchExecutor {
         }
         .map_err(|e| e.to_string())?;
         let versioned = self.versioned(dst_bucket).await?;
+        // M8 缺口 C：Batch Copy 无显式 SSE 入口，直接套目标桶默认加密
+        let encryption = match self
+            .acl
+            .bucket_default_encryption(dst_bucket)
+            .await
+            .map_err(|e| e.to_string())?
+            .as_deref()
+        {
+            Some(v) => Some(
+                enc_spec_from_default(v).ok_or_else(|| format!("目标桶默认加密记录非法: {v}"))?,
+            ),
+            None => None,
+        };
         let tags = (!info.tags.is_empty()).then(|| info.tags.clone());
         let out = self
             .store
@@ -298,7 +312,7 @@ impl BatchExecutor {
                 info.user_metadata.clone(),
                 None,
                 versioned,
-                None,
+                encryption,
                 None,
                 tags,
                 // 目标固定 STANDARD（在线 CopyObject 语义）；源存储类不继承——Restored

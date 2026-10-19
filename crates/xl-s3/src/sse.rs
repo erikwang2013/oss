@@ -36,6 +36,15 @@ impl SseReq {
     }
 }
 
+/// M8 缺口 C：桶默认加密线格式 → `EncSpec`；未知值 → None（记录损坏，调用方失败关闭）。
+pub fn enc_spec_from_default(value: &str) -> Option<EncSpec> {
+    match value {
+        "AES256" => Some(EncSpec::SseS3),
+        "aws:kms" => Some(EncSpec::SseKms),
+        _ => None,
+    }
+}
+
 /// 通用解析（R1/R2）。各 handler 把 DTO 字段借出来传入：
 /// - `algo/key/md5` = `sse_customer_*`；`sse` = `server_side_encryption`；`kms_key_id` = `ssekms_key_id`。
 ///

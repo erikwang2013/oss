@@ -137,9 +137,9 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
     .await
     .unwrap();
 
-    let cfg = |algo: &str, cmk: Option<&str>| {
+    let cfg = |bucket: &str, algo: &'static str, cmk: Option<&str>| {
         req(PutBucketEncryptionInput {
-            bucket: "enc-bkt".into(),
+            bucket: bucket.into(),
             checksum_algorithm: None,
             content_md5: None,
             expected_bucket_owner: None,
@@ -147,21 +147,13 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
                 rules: vec![ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
                         kms_master_key_id: cmk.map(str::to_string),
-                        sse_algorithm: ServerSideEncryption::from_static(algo_static(algo)),
+                        sse_algorithm: ServerSideEncryption::from_static(algo),
                     }),
                     ..Default::default()
                 }],
             },
         })
     };
-    // from_static 需要 'static——把两个合法值钉成常量，非法值走单独构造
-    fn algo_static(a: &str) -> &'static str {
-        match a {
-            "AES256" => "AES256",
-            "aws:kms" => "aws:kms",
-            _ => unreachable!(),
-        }
-    }
     let get = || {
         req(GetBucketEncryptionInput {
             bucket: "enc-bkt".into(),
@@ -177,7 +169,9 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
     );
 
     // SSE-S3 → GET 回 AES256
-    s3.put_bucket_encryption(cfg("AES256", None)).await.unwrap();
+    s3.put_bucket_encryption(cfg("enc-bkt", "AES256", None))
+        .await
+        .unwrap();
     let out = s3.get_bucket_encryption(get()).await.unwrap().output;
     let rule = &out.server_side_encryption_configuration.unwrap().rules[0];
     assert_eq!(
@@ -189,7 +183,7 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
         "AES256"
     );
     // 改为 SSE-KMS → 覆盖
-    s3.put_bucket_encryption(cfg("aws:kms", None))
+    s3.put_bucket_encryption(cfg("enc-bkt", "aws:kms", None))
         .await
         .unwrap();
     let out = s3.get_bucket_encryption(get()).await.unwrap().output;
@@ -204,24 +198,9 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
     );
 
     // 非法：未知算法 / 显式 CMK / 无默认规则 → 400
-    let bad_algo = req(PutBucketEncryptionInput {
-        bucket: "enc-bkt".into(),
-        checksum_algorithm: None,
-        content_md5: None,
-        expected_bucket_owner: None,
-        server_side_encryption_configuration: ServerSideEncryptionConfiguration {
-            rules: vec![ServerSideEncryptionRule {
-                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    kms_master_key_id: None,
-                    sse_algorithm: ServerSideEncryption::from_static("aws:kms:dsse"),
-                }),
-                ..Default::default()
-            }],
-        },
-    });
     for bad in [
-        bad_algo,
-        cfg("aws:kms", Some("arn:aws:kms:cmk")),
+        cfg("enc-bkt", "aws:kms:dsse", None),
+        cfg("enc-bkt", "aws:kms", Some("arn:aws:kms:cmk")),
         req(PutBucketEncryptionInput {
             bucket: "enc-bkt".into(),
             checksum_algorithm: None,
@@ -283,6 +262,26 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    // PUT 不存在的桶 → NoSuchBucket
+    let e = s3
+        .put_bucket_encryption(cfg("ghost", "AES256", None))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    // 盘上有桶但 buckets 行缺失（无身份建桶）→ 500，不静默成功
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "norow".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let e = s3
+        .put_bucket_encryption(cfg("norow", "AES256", None))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InternalError);
 }
 
 /// M4 切片 3：版本控制开关——开启幂等；**已启用后拒绝改回 Off**（写入会整链替换 → 静默丢历史）。

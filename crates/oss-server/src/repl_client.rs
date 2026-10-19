@@ -121,7 +121,8 @@ impl RateLimiter {
 fn limiter_of(target: &RemoteTarget) -> Option<RateLimiter> {
     target
         .max_bytes_per_sec
-        .filter(|&r| r > 0) // 配置校验保证 ≥1024；0 防御性视为不限
+        // 启动期 remotes_validate 是唯一闸门（拒 <1024）；程序化构造的 Some(0) 视为不限
+        .filter(|&r| r > 0)
         .map(RateLimiter::new)
 }
 
