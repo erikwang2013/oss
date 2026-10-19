@@ -64,8 +64,18 @@ PENDING→COMPLETED/FAILED、停机积压追平）。
 控制面 changelog（SQLite 触发器捕获、LWW `(ts,priority,origin,seq)` + 本地写门控 + apply 抑制）·
 配对快照（单事务、入钟、只本地胜者）· 对象复制复用 `repl_outbox`（逐 peer 入队、发送前
 `GET ?versioning` 预检、metadata 透传、REPLICA 防环）· 停机积压追平、死信/游标/状态面。
-**未实现**（见设计文档的阶段表）：访问点 / Object Lambda（M8）· 跨站点强一致（M9）·
-细粒度 IAM 预设模板 · 复制带宽限速。
+已实现（M8 进行中）：**S3 缺口（P0）** 对象标签 `Put/Get/DeleteObjectTagging` +
+PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagging-directive`
+两轴（REPLACE 独立、同键仅 metadata REPLACE 放行）· **作业引擎** `jobs/job_tasks`
+（`BEGIN IMMEDIATE` 领取、优先级、指数退避、超时回收、失败重试子作业、CSV 报告、
+`/api/v1/jobs/{id}` 详情与 pause/resume/cancel/retry-failed）· **存储类/分层元数据前置**
+（`storage_class`/`TierState`、Archived/Restoring phase gate → 403 `InvalidObjectState`、
+MPU class、`TierGcSink` 删除契约）· **访问点**（路径式 `/ap/<name>/<key>`、严格 AP 策略与
+身份/桶策略交集、canonical key、签名剥离与内层转发、AP CRUD/策略 API——签名 HTTP 全链路
+验收收尾中）。
+**未实现**（M8 剩余）：Object Lambda（S2）· Transition/Restore 与生命周期 Transition 配置
+（S4b）· Inventory（S5）· Batch Operations（S3）· 控制台/Web 新页面与 M8 e2e（S6）·
+跨站点强一致（M9）· 细粒度 IAM 预设模板 · 复制带宽限速。
 
 ## 架构
 
@@ -79,13 +89,17 @@ M7 多站点异步复制（控制面 changelog + 对象 outbox）：
 
 ![M7 多站点复制](docs/assets/m7-sites.svg)
 
+M8 控制面（访问点路由 / 作业引擎 / 存储类与分层，S0+S4a+S1 已落地）：
+
+![M8 控制面](docs/assets/m8-control-plane.svg)
+
 | crate / 目录 | 职责 |
 |---|---|
-| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
-| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配 |
+| `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录 / 标签 / storage_class / tier）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
+| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配；M8 增访问点路由（`ap.rs`）、TierGc/删桶清理契约 |
 | `crates/xl-proto` | 节点间 gRPC 协议：`oss.proto` 消息与 service 定义（prost + tonic-build 全量生成） |
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
-| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI |
+| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；M8 增作业引擎（`jobs.rs`）、访问点 API（`access_points_api.rs`）与 0003 迁移 |
 | `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
 | `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（19 步，含 M6 Select/Kafka/复制；+ `E2E_LONG=1` 门控长跑） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
@@ -722,6 +736,77 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   由任意已认证写者提供，可被用于抑制复制（M6 既有信任面，M7 的 DELETE 防环依赖同一头）；桶删除时
   若策略/授权行的 LWW 时钟更新，会按 L7 保留，同名桶重建可能继承这些残留行（跨站点并发删/改窗口）。
 
+## M8 控制面（进行中：S0+S4a+S1）
+
+M8 分片交付；以下为**已落地**能力与用法，剩余分片（Object Lambda / Transition+Restore /
+Inventory / Batch / 控制台页面）见设计文档阶段表。
+
+### 对象标签与 Copy 指令（P0，已完整）
+
+```bash
+aws --endpoint-url $E s3api put-object --bucket b --key k --body f \
+  --tagging "env=prod&team=%E4%B8%AD%E6%96%87"
+aws --endpoint-url $E s3api get-object-tagging --bucket b --key k
+aws --endpoint-url $E s3api put-object-tagging --bucket b --key k \
+  --tagging 'TagSet=[{Key=a,Value=1}]'
+aws --endpoint-url $E s3api delete-object-tagging --bucket b --key k
+# Copy 两轴：REPLACE 未提供即清空；COPY 时携带 tagging 头被忽略
+aws --endpoint-url $E s3api copy-object --bucket b --key dst --copy-source b/src \
+  --metadata-directive REPLACE --tagging-directive REPLACE --tagging "x=9"
+```
+
+约束：≤10 条；key 1..=128 / value 0..=256（Unicode 标量）；非法 → 400 `InvalidTag`；
+无 versionId 取链尾，链尾 marker → 404，点名 marker → 405；标签不随复制/站点传播。
+
+### 作业引擎（S0，已落地）
+
+```bash
+curl -s $E/api/v1/jobs/1 -H "authorization: Bearer $JWT"      # 详情 + tasks 分页
+curl -s -X POST $E/api/v1/jobs/1/pause -H "authorization: Bearer $JWT"
+curl -s -X POST $E/api/v1/jobs/1/retry-failed -H "authorization: Bearer $JWT"
+```
+
+- 环境：`OSS_JOB_WORKERS`（默认 2，0=关闭）、`OSS_JOBS_INTERVAL_SECS`（2）、
+  `OSS_JOB_MAX_ATTEMPTS`（3）、`OSS_JOB_TASK_TIMEOUT_SECS`（900）、
+  `OSS_TIER_TASK_TIMEOUT_SECS`（3600）。
+- 领取按 `priority DESC, next_at, task_no`；失败指数退避（≤300s），达上限记
+  `PermanentFailure`；终态批作业写 `<report_prefix>/<job_id>/results.csv`。
+- 单节点 SQLite 多 worker；多进程/多节点不支持（M9）。M4 生命周期**过期删除**仍走
+  `sweep_once`，不搬入该引擎。
+
+### 访问点（S1，路由/策略/CRUD 已落地）
+
+```bash
+curl -s -X POST $E/api/v1/access-points -H "authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{"name":"ap-one","bucket":"b","policy":{
+    "Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+      "Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}}'
+aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走 /ap/ap-one/k
+```
+
+- 路由仅路径式 `/ap/<name>/<key>`（无 `<name>-s3alias` 主机别名）；标准 SigV4 签名照常。
+- 鉴权 = 身份/表三档/桶策略/会话策略 **∩** AP 策略（显式 Deny 优先；AP 有策略但无匹配 → 拒）；
+  CopyObject 目标轴按 `s3:PutObject`；审计合并为一条。
+- AP 策略为严格子集：拒绝未知字段 / `Condition` / `NotAction` / `NotResource`；
+  Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
+- 支持：Get/Head/Put/DeleteObject、ListObjectsV2、ListObjectVersions、MPU
+  Create/Complete/Abort/UploadPart、CopyObject、Get/Put/DeleteObjectTagging、
+  Get/PutBucketVersioning、HeadBucket；`UploadPartCopy`/`DeleteObjects`/RestoreObject 等 501。
+- 边界：不做匿名/跨账号/VPC 来源限制/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
+  checksum 不转发 trailing headers。
+
+### 存储类与分层元数据（S4a，已落地前置）
+
+- PUT/MPU Create/Copy 接受 `x-amz-storage-class`：STANDARD/STANDARD_IA/ONEZONE_IA/
+  INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE/REDUCED_REDUNDANCY；未知或
+  **归档类直写** → 400 `InvalidStorageClass`。HEAD/GET/List/Versions 回读存储类（None=STANDARD）。
+- `Version` 增 `storage_class` / `tier`（`backend/key/size/etag/sha256/phase/archived_at/
+  restore_expires_at`）；Archived/Restoring 的本地分片视图为空，GET/Range → 403
+  `InvalidObjectState`（HEAD 仍可读元数据）；fsck 不报缺片。
+- 删除归档版本时 `DeleteOutcome` 带回 `TierRef`，`TierGcSink` 清远端（真实 tier 后端与
+  Transition/Restore 在 S4b）。
+- 边界：存储类/标签不随 M6/M7 复制传播；归档对象需在同版本二进制内读取。
+
 ## 验收
 
 
@@ -746,6 +831,16 @@ tests/e2e_kafka.sh              # 仅 Kafka 三阶段（redpanda docker；约 1 
 tests/e2e_sites.sh              # M7 多站点：自动起 A/B 两实例并双向配对（约 2–4 分钟）
 ```
 
+M8（已落地分片）测试锚：
+
+```bash
+cargo test -p xl-store --lib            # S4a 元数据/phase/DeleteOutcome tier refs + 黄金摘要
+cargo test -p xl-s3 --lib ap::          # AP 策略/ARN/缓存/解码/op 推导/route check_access
+cargo test -p oss-server --lib          # 0003 迁移/补列/AP CRUD/作业状态机
+cargo test -p oss-server --test jobs_engine --test console_api
+# S3 标签 + Copy 指令在 tests/e2e_s3.sh 步骤 20（已含于全量脚本）
+```
+
 集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：
 
 ```bash
@@ -763,7 +858,11 @@ cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空�
 - 子账户与权限体系实施记录：`docs/superpowers/plans/2026-10-13-subaccounts-permissions.md`
 - M3 分布式实现记录：`docs/superpowers/plans/2026-10-13-m3-distributed.md`
 - M4 运维与 IAM 实现记录：`docs/superpowers/plans/2026-10-14-m4-ops-iam.md`
-- M5 安全与锁定实施记录（进行中）：`docs/superpowers/plans/2026-10-16-m5-security-lock.md`
+- M5 安全与锁定实施记录（已发布）：`docs/superpowers/plans/2026-10-16-m5-security-lock.md`
+- M6 数据流实施记录（已发布）：`docs/superpowers/plans/2026-10-17-m6-dataflow.md`
+- M7 多站点实施记录（已发布）：`docs/superpowers/plans/2026-10-18-m7-multisite.md`
+- M8 前置（对象标签 / Copy 指令）：`docs/superpowers/plans/2026-10-19-s3-gaps-tagging-replace.md`
+- M8 控制面计划（v3.1，S0/S4a/S1 已落地）：`docs/superpowers/plans/2026-10-19-m8-control-plane.md`
 
 ---
 

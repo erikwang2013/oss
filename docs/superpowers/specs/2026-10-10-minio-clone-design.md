@@ -320,6 +320,11 @@ App::builder()
 
 ### 7.1 作业引擎（M8 引入，但 M4 的生命周期转换就有雏形）
 
+**落地状态（2026-10-19）**：S0 已落地 `jobs/job_tasks`（`0003_m8.sql`）、
+`BEGIN IMMEDIATE` 领取、优先级、指数退避、超时回收、失败重试子作业、CSV 报告与
+控制台详情/暂停/恢复/取消/retry-failed API。Batch/Transition/Restore/Inventory 的
+任务动作随 S3/S4b/S5 接入；M6 复制重试与 M4 生命周期过期删除**不迁入**本引擎（M8 钉）。
+
 一个引擎，五个消费者：**Batch Operations · 生命周期存储类转换 · Glacier Restore · Inventory 生成 · 复制积压重试**。
 
 ```
@@ -351,6 +356,12 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 **CAP 选择必须显式**：sync 桶在远端站点不可达时**写返回 503**。不做「自动降级为 async」——那会让「强一致」这个承诺失去意义。写延迟下限 = 跨站点 RTT，因此 sync 只适合合规桶与小对象。此约束必须出现在桶创建界面的文案里。
 
 ### 7.4 存储分层（M8）
+
+**落地状态（2026-10-19）**：S4a 已落地元数据前置——`Version.storage_class` /
+`TierState`（Archived/Restoring/Restored）、phase gate（GET/Range → 403
+`InvalidObjectState`，fsck 不计缺片）、PUT/MPU/Copy 存储类解析与回读、MPU class、
+`DeleteOutcome` tier refs 与 `TierGcSink` 契约。tier 后端、`RestoreObject` 与
+Transition 作业在 S4b。
 
 - Storage Class 记录在 `xl.meta` 的 `Version.storage_class`
 - **tier 后端是可插拔的**：远端 S3 兼容端点（扩展后的 `ecat-data-s3`）或本地冷盘池（不同 EC 参数，如 12+4）
@@ -388,6 +399,11 @@ SSE-KMS 的文件实现即「多钥目录」（`key-<n>.bin`，当前钥=最大 
 协议语义不变（DEK 的包裹体 `wrapped` 与 `key_id` 落 `xl.meta`）。桶级默认加密未实现（记档）。
 
 ### 7.7 Access Point 与 Object Lambda 的改写层（M8）
+
+**落地状态（2026-10-19）**：S1 已落地路径式 AP——`ApRoute`（canonical key、op 推导、
+身份/桶策略 × AP 策略交集、单条审计、签名剥离、URI 改写、内层转发、STS 单槽组合）、
+严格 AP 策略解析、AP 缓存与 CRUD/策略 API。Object Lambda（HTTP/WASM 变换器）在 S2；
+`<name>-s3alias` 主机别名、匿名与跨账号不做（M8 钉）。
 
 两者是同一个机制：**请求到达 S3 服务之前的改写**。
 
@@ -555,6 +571,12 @@ stretch EC）仍归 M9。
 ### M8 S3 控制面服务（4-6 周）
 
 **范围**：Access Points（CRUD 自建 + `S3Route` 寻址）· Object Lambda（读变换：HTTP 变换器默认 + WASM 可选）· Batch Operations（作业引擎）· Inventory（CSV.gz + manifest.json，列对齐 AWS v1 schema）· 存储分层与 Restore
+
+**落地状态（2026-10-19）**：P0（对象标签 + Copy 两轴）· S0（作业引擎/迁移）·
+S4a（存储类/分层元数据前置）· S1（访问点路由/策略/CRUD，签名 HTTP 全链路测试收尾）
+已落地；S2 Object Lambda、S4b Transition/Restore、S5 Inventory、S3 Batch、S6
+控制台/Web/E2E 未实施。实施计划 v3.1 已经 scoped 复核 GO
+（`docs/superpowers/plans/2026-10-19-m8-control-plane.md`）。
 
 **验收**
 1. 建 AP 后经 `/ap/<name>/<key>` 访问，且 AP 策略与桶策略取交集生效

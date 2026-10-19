@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <title>M8 控制面：访问点 · 作业引擎 · 存储分层</title>
+  <desc>路径式访问点请求经 ApRoute 规范化/策略交集后重写转发到内层 S3；SQLite 0003_m8 承载 AP/OLAP/作业/清单/恢复状态；作业 worker 领取任务并执行 Batch/Transition/Restore/Inventory；存储类与 TierState 落在 Version，归档阶段读路径返回 InvalidObjectState，删除时 TierGc 清理远端副本。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6"/>
+    </marker>
+    <marker id="amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="958" height="598" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="40" y="44" font-size="20" font-weight="700" fill="#0f172a">OSS · M8 控制面</text>
+  <text x="40" y="68" font-size="12" fill="#64748b">访问点路由（策略交集） · 通用作业引擎 · 存储类与分层元数据</text>
+  <text x="40" y="88" font-size="11" fill="#059669">已落地：S3 缺口（对象标签 / Copy 指令）· S0 作业引擎 · S4a 分层元数据 · S1 访问点（签名全链路测试收尾中）</text>
+  <text x="40" y="106" font-size="11" fill="#b45309">规划中：S2 Object Lambda · S4b Transition/Restore · S5 Inventory · S3 Batch · S6 控制台/Web/E2E</text>
+
+  <!-- 左：请求路径 -->
+  <rect x="40" y="124" width="470" height="300" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="56" y="150" font-size="14" font-weight="700" fill="#1d4ed8">请求路径</text>
+
+  <rect x="56" y="164" width="438" height="34" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="275" y="185" font-size="11" fill="#1e3a8a" text-anchor="middle">aws-cli / SDK：路径式 /ap/&lt;name&gt;/&lt;key&gt; 或标准 S3 路径</text>
+  <line x1="275" y1="198" x2="275" y2="212" stroke="#3b82f6" marker-end="url(#blue)"/>
+
+  <rect x="56" y="214" width="438" height="82" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="275" y="233" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">ApRoute（外层 route 槽，先 AP 后 STS）</text>
+  <text x="275" y="251" font-size="10" fill="#475569" text-anchor="middle">严格百分号解码 → canonical key（拒 NUL / . / .. / 坏转义）· op 推导</text>
+  <text x="275" y="267" font-size="10" fill="#475569" text-anchor="middle">Acl::check_op（身份 × 表三档 × 桶策略 × 会话）∩ AP 策略（Deny 优先）</text>
+  <text x="275" y="283" font-size="10" fill="#475569" text-anchor="middle">单条审计（policy/ap 合并）· 剥离 Authorization 与 X-Amz-* 签名 query</text>
+  <line x1="275" y1="296" x2="275" y2="310" stroke="#8b5cf6" marker-end="url(#violet)"/>
+
+  <rect x="56" y="312" width="438" height="42" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+  <text x="275" y="330" font-size="11" font-weight="600" fill="#5b21b6" text-anchor="middle">内层 S3Service（无 auth/access/route）+ OssS3</text>
+  <text x="275" y="346" font-size="10" fill="#6d28d9" text-anchor="middle">URI 重写为 /&lt;bucket&gt;/&lt;raw_suffix&gt; · 事件/复制/TierGc 共享同一组 sink</text>
+  <line x1="275" y1="354" x2="275" y2="368" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="56" y="370" width="438" height="40" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="275" y="388" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">xl-store：版本链 / EC 分片 / 加密 / 锁 / 标签 / storage_class / tier</text>
+  <text x="275" y="402" font-size="9.5" fill="#64748b" text-anchor="middle">标准 S3 路径经外层 SigV4 + Acl::check 直达同一 OssS3</text>
+
+  <!-- 右：控制面 -->
+  <rect x="530" y="124" width="390" height="300" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="546" y="150" font-size="14" font-weight="700" fill="#0f766e">控制面（SQLite · 0003_m8.sql）</text>
+
+  <rect x="546" y="164" width="358" height="34" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="725" y="185" font-size="11" fill="#065f46" text-anchor="middle">access_points · olap_configs（FK 级联）</text>
+  <rect x="546" y="204" width="358" height="34" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="725" y="225" font-size="11" fill="#065f46" text-anchor="middle">jobs · job_tasks（priority / deadline / dedupe / report）</text>
+  <rect x="546" y="244" width="358" height="34" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="725" y="265" font-size="11" fill="#065f46" text-anchor="middle">inventory_configs · inventory_runs · tier_restores</text>
+
+  <line x1="725" y1="278" x2="725" y2="292" stroke="#d97706" marker-end="url(#amber)"/>
+  <rect x="546" y="294" width="358" height="44" rx="8" fill="#fffbeb" stroke="#fde68a"/>
+  <text x="725" y="312" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">job worker × N（OSS_JOB_WORKERS，默认 2）</text>
+  <text x="725" y="328" font-size="10" fill="#a16207" text-anchor="middle">BEGIN IMMEDIATE 领取 · 优先级 · 指数退避 · 超时回收 · 配额</text>
+
+  <line x1="725" y1="338" x2="725" y2="352" stroke="#d97706" marker-end="url(#amber)"/>
+  <rect x="546" y="354" width="358" height="56" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="725" y="372" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">TaskExecutor：Batch / Transition / Restore / Inventory</text>
+  <text x="725" y="388" font-size="10" fill="#475569" text-anchor="middle">结果写 job_tasks · 终态 CSV → report/&lt;job_id&gt;/results.csv</text>
+  <text x="725" y="402" font-size="10" fill="#475569" text-anchor="middle">retry-failed 建子作业（parent_job_id）</text>
+
+  <!-- 底：存储类/分层 -->
+  <rect x="40" y="444" width="880" height="134" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="56" y="470" font-size="14" font-weight="700" fill="#7c3aed">存储类与分层（S4a）</text>
+
+  <rect x="56" y="484" width="250" height="76" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="181" y="503" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">Version.storage_class</text>
+  <text x="181" y="520" font-size="10" fill="#475569" text-anchor="middle">STANDARD_IA / ONEZONE_IA / GLACIER…</text>
+  <text x="181" y="536" font-size="10" fill="#475569" text-anchor="middle">None = STANDARD · 白名单 + 归一</text>
+  <text x="181" y="552" font-size="10" fill="#475569" text-anchor="middle">归档类直写 PUT/MPU/Copy → 400</text>
+
+  <line x1="306" y1="522" x2="330" y2="522" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="332" y="484" width="270" height="76" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+  <text x="467" y="503" font-size="11" font-weight="600" fill="#5b21b6" text-anchor="middle">Version.tier: TierState</text>
+  <text x="467" y="520" font-size="10" fill="#6d28d9" text-anchor="middle">phase = Archived / Restoring / Restored</text>
+  <text x="467" y="536" font-size="10" fill="#6d28d9" text-anchor="middle">Archived/Restoring：effective_parts 为空</text>
+  <text x="467" y="552" font-size="10" fill="#6d28d9" text-anchor="middle">GET/Range → 403 InvalidObjectState（HEAD 可读）</text>
+
+  <line x1="602" y1="522" x2="626" y2="522" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="628" y="484" width="276" height="76" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="766" y="503" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">删除与 GC</text>
+  <text x="766" y="520" font-size="10" fill="#475569" text-anchor="middle">DeleteOutcome::Version{tier} / Object{tiers}</text>
+  <text x="766" y="536" font-size="10" fill="#475569" text-anchor="middle">TierGcSink 清理远端（S4b 注入真实实现）</text>
+  <text x="766" y="552" font-size="10" fill="#475569" text-anchor="middle">§ 标签按版本存储，不随复制/站点传播</text>
+</svg>

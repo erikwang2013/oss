@@ -184,7 +184,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 ### 2.4 桶配置类操作（各自的章节）
 
-`HeadBucket`（M1，存在性探测）· `GetBucketLocation`（M1，恒返回配置的 region）· 版本控制（§6）· 对象锁（§7）· 加密（§8）· 生命周期（§9）· 复制（§10）· 通知（§11）· 清单（§15）· 标签（M4）· 策略（M4）· ACL（**不做**，仅支持 `private` 与 `bucket-owner-full-control` 两种 canned ACL，其余 → `NotImplemented`）
+`HeadBucket`（M1，存在性探测）· `GetBucketLocation`（M1，恒返回配置的 region）· 版本控制（§6）· 对象锁（§7）· 加密（§8）· 生命周期（§9）· 复制（§10）· 通知（§11）· 清单（§15）· 标签（M4；2026-10-19 作为 M8 P0 补齐）· 策略（M4）· ACL（**不做**，仅支持 `private` 与 `bucket-owner-full-control` 两种 canned ACL，其余 → `NotImplemented`）
 
 ---
 
@@ -568,6 +568,9 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 ## 13. Access Points 与 Object Lambda —— `M8`
 
+> **落地状态（2026-10-19）**：S1 已落地路径式 AP（路由/策略交集/CRUD；签名 HTTP 全链路
+> 测试收尾中）；Object Lambda（S2）与 `<name>-s3alias` 主机名未实施。
+
 ### 13.1 Access Points
 
 **机制**：**新建访问点 CRUD 不在 S3 协议里**（`CreateAccessPoint` 属于 S3 Control API，独立服务、独立端点、独立签名）→ 走控制台 API；而**使用**走 `S3Route` 前置层，与标准 S3 请求共用同一条解析路径。
@@ -597,6 +600,10 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 ---
 
 ## 14. 存储分层与 Restore —— `M8`
+
+> **落地状态（2026-10-19）**：S4a 已落地 `storage_class`/`TierState` 元数据、phase gate
+> （归档 GET → 403 `InvalidObjectState`）、MPU class 与 `TierGcSink` 契约；tier 后端、
+> Transition 作业与 `RestoreObject`（S4b）未实施。
 
 ### 14.1 存储类
 
@@ -644,6 +651,10 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 ---
 
 ## 16. Batch Operations 与作业引擎 —— `M8`
+
+> **落地状态（2026-10-19）**：S0 作业引擎已落地（`jobs/job_tasks`、领取/重试/超时/报告、
+> 控制台详情与 pause/resume/cancel/retry-failed）；Batch/Transition/Restore/Inventory 的
+> 任务动作随 S3/S4b/S5 接入。M4 生命周期过期删除与 M6 复制重试不迁入本引擎（M8 钉）。
 
 ### 16.1 作业引擎（一个引擎，五个消费者）
 
@@ -696,9 +707,9 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 站点 | `GET/POST /api/v1/sites`、`/api/v1/sites/{id}/join` | M7 |
 | 通知 | `GET/PUT /api/v1/buckets/{b}/notifications`、`GET /api/v1/events/dead-letter` | M6 |
 | Select | `POST /api/v1/buckets/{b}/select`（工作台，代理 `SelectObjectContent`） | M6 |
-| 访问点 | `GET/POST /api/v1/access-points`、`PUT .../{name}/policy` | M8 |
+| 访问点 | `GET/POST /api/v1/access-points`、`PUT .../{name}/policy` | M8（S1 已落地） |
 | OLAP | `GET/PUT /api/v1/access-points/{name}/transform` | M8 |
-| 作业 | `GET/POST /api/v1/jobs`、`GET /api/v1/jobs/{id}`、`POST .../{id}/{pause,resume,cancel}` | M8 |
+| 作业 | `GET/POST /api/v1/jobs`、`GET /api/v1/jobs/{id}`、`POST .../{id}/{pause,resume,cancel,retry-failed}` | M8（S0 详情/控制已落地） |
 | 清单 | `GET/PUT /api/v1/buckets/{b}/inventory` | M8 |
 | 分层 | `GET/PUT /api/v1/tiers` | M8 |
 | 健康 | `/health/live`、`/health/ready`、`/health/cluster` | M1/M3 |
@@ -720,10 +731,10 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 复制与站点 | 桶复制规则、站点拓扑图、积压深度、站点加入向导 | M6/M7 |
 | 事件通知 | 桶通知配置、死信查看与重投 | M6 |
 | Select 工作台 | 选对象、写 SQL、看结果流与字节统计 | M6 |
-| 访问点与 OLAP | 访问点 CRUD、策略、变换器配置与试跑 | M8 |
-| 作业中心 | Batch 作业列表/进度/报告下载、重跑失败项 | M8 |
+| 访问点与 OLAP | 访问点 CRUD、策略、变换器配置与试跑 | M8（AP 后端已落地；Web/OLAP 未做） |
+| 作业中心 | Batch 作业列表/进度/报告下载、重跑失败项 | M8（后端已落地；Web 未做） |
 | Inventory | 配置、历史清单、下载 | M8 |
-| 分层 | tier 后端配置、存储类映射 | M8 |
+| 分层 | tier 后端配置、存储类映射 | M8（元数据前置已落地） |
 | 设置 | 上传分组、限制、加密主密钥、KMS 连接 | M2（分组）/M5（加密） |
 
 **前端技术**：React 19 + Vite + TypeScript + antd v5 + `@tanstack/react-query`；上传复用 aetherupload 自带的 `aetherupload-all.js`（含 zepto + spark-md5），React 侧包一个 `useUpload` hook 驱动它 —— **不重写分片逻辑**。
@@ -767,11 +778,11 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | **M1** | SigV4 认证 · 控制台登录 · 桶 CRUD · 对象 PUT/GET/HEAD/DELETE/批量删 · CopyObject · ListObjectsV2/V1 · aetherupload 预处理/分块/秒传/原生 ingest/分组 · 控制台 API（认证/桶/对象/上传/密钥/分组）· 登录/桶/对象/访问密钥四页（上传面板并入对象页） |
 | **M2** | 多段上传全套 · Range 与条件请求 · 用户元数据 · 流式大对象 · 纠删码 · 小对象内联 · 多盘 · 断电一致性 · fsck（**协议面与孤儿回收部分 → M2a 已落地；存储层（EC 8+4、内联、多盘 quorum、拔盘容忍、读时修、fsck、kill -9 用例）→ M2b 已落地**） |
 | **M3** | 多节点 mesh · 静态拓扑 · 对象→纠删组哈希 · quorum 读写 · 节点故障容忍 · 读修复 · 集群健康端点 · 节点间 quorum 租约锁（**已落地 2026-10-14**；控制面强一致归 M9） |
-| **M4** | 版本控制 · 生命周期 · 策略求值与 IAM · 用户与策略页 · 审计 · scrub/heal/rebalance · 集群状态页 · 对象标签 |
+| **M4** | 版本控制 · 生命周期 · 策略求值与 IAM · 用户与策略页 · 审计 · scrub/heal/rebalance · 集群状态页 · 对象标签（2026-10-19 M8 P0 补齐：含 Copy 两轴指令） |
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |
 | **M6** | 事件总线 + Kafka 通知（含 `ecat-mq-kafka`）· S3 Select · 桶复制（含 `ecat-data-s3` 扩展）· 事件页 · Select 工作台 |
 | **M7** | 跨站点异步双向复制 · 站点身份与管理 API · 配置/IAM 日志复制 · 站点页 |
-| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页 |
+| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**进行中：P0 标签/Copy 指令、S0 作业引擎、S4a 分层元数据、S1 访问点已落地；S2/S4b/S5/S3/S6 未实施**） |
 | **M9** | 控制面 `openraft` 跨站点强一致 · sync 桶 · stretch EC · 站点故障语义 |
 
 **与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 与 `2026-10-10-m1b-frontend-console.md` 回答「M1 前后端怎么写」（逐任务代码与测试）。
