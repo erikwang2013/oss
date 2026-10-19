@@ -315,3 +315,32 @@ async fn archive_restore_state_machine() {
     let v = s.tier_version("alpha", "k", &vid).await.unwrap().unwrap();
     assert_eq!(v.tier.unwrap().phase, TierPhase::Archived);
 }
+
+/// 归档提交前源版本已被改写（etag 不符）→ 拒绝且本地数据保持可读（meta 失败不毁本地）。
+#[tokio::test]
+async fn archive_meta_failure_keeps_local() {
+    let (s, _d) = store().await;
+    let info = put(&s, "keep", true, None).await;
+    let vid = info.version_id.clone().unwrap();
+    let e = s
+        .archive_version(
+            "alpha",
+            "keep",
+            &vid,
+            ArchiveSpec {
+                backend: "s3".into(),
+                key: "cold/alpha/keep".into(),
+                size: info.size,
+                source_etag: "stale-etag".into(),
+                etag: "remote".into(),
+                sha256: "00".into(),
+                class: "GLACIER".into(),
+            },
+            100,
+        )
+        .await;
+    assert!(matches!(e, Err(Error::CorruptMeta(_))), "{e:?}");
+    let (head, bytes) = s.get_object("alpha", "keep").await.unwrap();
+    assert_eq!(head.tier_phase, None);
+    assert_eq!(&bytes[..], b"tier-data");
+}
