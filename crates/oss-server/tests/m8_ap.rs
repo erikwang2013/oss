@@ -143,7 +143,7 @@ async fn login(base: &str, username: &str) -> String {
 
 // ---------- 最小 SigV4 签名 ----------
 
-/// 百分号解码（查询用 form 语义：`+` → 空格）。合法转义由测试自己构造。
+/// 百分号解码（查询用 form 语义：`+` → 空格）。非法/截断转义按字面量保留。
 fn pct_decode(s: &str, plus_as_space: bool) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -154,10 +154,15 @@ fn pct_decode(s: &str, plus_as_space: bool) -> String {
                 let hi = (b[i + 1] as char).to_digit(16);
                 let lo = (b[i + 2] as char).to_digit(16);
                 match (hi, lo) {
-                    (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
-                    _ => out.push(b'%'),
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
                 }
-                i += 3;
             }
             b'+' if plus_as_space => {
                 out.push(b' ');
@@ -170,6 +175,33 @@ fn pct_decode(s: &str, plus_as_space: bool) -> String {
         }
     }
     String::from_utf8(out).unwrap()
+}
+
+/// 查询组件百分号编码（unreserved 原样，其余 `%XX`），防止 `+`/`&`/`=` 破坏查询。
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[test]
+fn pct_helpers_handle_malformed_escapes_and_reserved_chars() {
+    assert_eq!(pct_decode("a%2Fb", false), "a/b");
+    assert_eq!(pct_decode("%252F", false), "%2F");
+    assert_eq!(pct_decode("a+b", true), "a b");
+    assert_eq!(pct_decode("a+b", false), "a+b");
+    // 非法/截断转义：`%` 与后续字符都按字面量保留，不吞字符
+    assert_eq!(pct_decode("%zz", false), "%zz");
+    assert_eq!(pct_decode("%2", false), "%2");
+    assert_eq!(pct_decode("100%", false), "100%");
+    assert_eq!(pct_encode("a+b=c&d/e f"), "a%2Bb%3Dc%26d%2Fe%20f");
+    assert_eq!(pct_decode(&pct_encode("a+b=c&d/e f"), true), "a+b=c&d/e f");
 }
 
 fn query_pairs(q: &str) -> Vec<(String, String)> {
@@ -1006,7 +1038,10 @@ async fn object_ops_through_ap() {
         .and_then(|s| s.split("</UploadId>").next())
         .expect("CreateMultipartUpload 缺 UploadId")
         .to_string();
-    let part_q = format!("/ap/ops-ap/dir/mpu?partNumber=1&uploadId={upload_id}");
+    let part_q = format!(
+        "/ap/ops-ap/dir/mpu?partNumber=1&uploadId={}",
+        pct_encode(&upload_id)
+    );
     let r = signed(&e, Method::PUT, &part_q, &[], b"part-one", &ak, &sk, "s3").await;
     assert_eq!(r.status(), 200);
     let etag = r
@@ -1019,7 +1054,7 @@ async fn object_ops_through_ap() {
     let complete = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
     );
-    let complete_q = format!("/ap/ops-ap/dir/mpu?uploadId={upload_id}");
+    let complete_q = format!("/ap/ops-ap/dir/mpu?uploadId={}", pct_encode(&upload_id));
     assert_eq!(
         send_status(
             &e,
@@ -1066,7 +1101,7 @@ async fn object_ops_through_ap() {
         .and_then(|s| s.split("</UploadId>").next())
         .unwrap()
         .to_string();
-    let abort_q = format!("/ap/ops-ap/abortme?uploadId={abort_id}");
+    let abort_q = format!("/ap/ops-ap/abortme?uploadId={}", pct_encode(&abort_id));
     assert_eq!(
         send_status(&e, Method::DELETE, &abort_q, &[], b"", &ak, &sk, "s3").await,
         204
@@ -1368,6 +1403,45 @@ async fn copy_dual_auth_and_canonical_keys() {
         .await,
         1
     );
+
+    // AP 显式 Deny（身份/桶均 Allow）仍写一行 deny 审计，detail 带 ap:deny
+    set_ap_policy(
+        &e,
+        "keys-ap",
+        "dstb",
+        alice_id,
+        Some(&ap_policy("Deny", "s3:GetObject", ap_obj)),
+    )
+    .await;
+    sqlx::query("DELETE FROM audit_log")
+        .execute(e.st.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/keys-ap/a%2Fb",
+            &[],
+            b"",
+            &alice_ak,
+            &alice_sk,
+            "s3"
+        )
+        .await,
+        403
+    );
+    let (decision, detail): (String, Option<String>) = sqlx::query_as(
+        "SELECT decision, detail FROM audit_log WHERE op='GetObject' AND object_key='a/b'",
+    )
+    .fetch_one(e.st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(decision, "deny");
+    assert!(
+        detail.as_deref().unwrap_or("").contains("ap:deny"),
+        "deny 审计应含 ap:deny: {detail:?}"
+    );
 }
 
 /// AP Put 触发事件/复制各一次（内层共享 sink，AP 不额外发）。
@@ -1469,9 +1543,12 @@ async fn fail_closed_and_bucket_delete_cascade() {
     direct_ap(&e, "gone-ap", "casb", admin_id, None).await;
     e.st.db.delete_access_point("gone-ap").await.unwrap();
     e.st.ap_cache.remove("gone-ap");
-    assert_eq!(
-        send_status(&e, Method::GET, "/ap/gone-ap/x", &[], b"", &ak, &sk, "s3").await,
-        404
+    let r = signed(&e, Method::GET, "/ap/gone-ap/x", &[], b"", &ak, &sk, "s3").await;
+    assert_eq!(r.status(), 404);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("<Code>NoSuchAccessPoint</Code>"),
+        "未知 AP 应是 NoSuchAccessPoint 而非标准路径回落: {body}"
     );
 
     // 坏策略：运行期加载失败 → 500（不得当作无策略）
