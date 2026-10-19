@@ -80,6 +80,18 @@ impl RestoreSink for SqlRestoreSink {
             .map(|(id, _)| id)
             .map_err(|e| e.to_string())
     }
+
+    async fn forget_restore(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(), String> {
+        self.db
+            .delete_restore(bucket, key, version_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 作业执行器：`Transition` / `RestoreObject`。
@@ -109,6 +121,12 @@ impl M8TaskExecutor {
             events,
             max_tier_bytes,
         }
+    }
+
+    /// 测试/运维：覆盖单对象上限（默认 `OSS_TIER_MAX_BYTES` 或 1 GiB）。
+    pub fn with_max_tier_bytes(mut self, max: u64) -> Self {
+        self.max_tier_bytes = max;
+        self
     }
 
     fn emit(
@@ -160,6 +178,10 @@ impl M8TaskExecutor {
                 v.storage_class, p.class
             ));
         }
+        // SSE 对象不参与任何 Transition（sweep 已跳过；手工/批量入队在此拒绝）。
+        if v.encryption.is_some() {
+            return Err("SSE 对象不参与 Transition".to_string());
+        }
         if is_archive_class(&p.class) {
             let tier_id = p
                 .tier
@@ -175,9 +197,6 @@ impl M8TaskExecutor {
                     "对象 {} 字节超过 OSS_TIER_MAX_BYTES={}",
                     v.size, self.max_tier_bytes
                 ));
-            }
-            if v.encryption.is_some() {
-                return Err("SSE 对象不参与 Transition".to_string());
             }
             let (info, bytes) = self
                 .store
@@ -272,7 +291,21 @@ impl M8TaskExecutor {
             .tiers
             .get(&t.backend)
             .ok_or_else(|| format!("tier {:?} 未配置", t.backend))?;
+        // 元数据先挡一次，GET 回来再挡一次（后端可能撒谎/配置漂移）。
+        if t.size > self.max_tier_bytes {
+            return Err(format!(
+                "恢复对象 {} 字节超过 OSS_TIER_MAX_BYTES={}",
+                t.size, self.max_tier_bytes
+            ));
+        }
         let bytes = backend.get(&t.key).await?;
+        if bytes.len() as u64 > self.max_tier_bytes {
+            return Err(format!(
+                "恢复数据 {} 字节超过 OSS_TIER_MAX_BYTES={}",
+                bytes.len(),
+                self.max_tier_bytes
+            ));
+        }
         if bytes.len() as u64 != t.size {
             return Err(format!("恢复数据长度 {} ≠ {}", bytes.len(), t.size));
         }

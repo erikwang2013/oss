@@ -58,7 +58,9 @@ pub async fn sweep_transitions(
                 if examined > 10_000 {
                     break 'buckets;
                 }
-                if e.is_marker
+                // NoncurrentVersionTransition 未支持（501）：只转当前版本。
+                if !e.is_latest
+                    || e.is_marker
                     || e.encrypted
                     || e.tier_phase.is_some()
                     || matches!(e.replication_status.as_deref(), Some("PENDING" | "FAILED"))

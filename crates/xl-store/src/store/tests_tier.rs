@@ -316,6 +316,98 @@ async fn archive_restore_state_machine() {
     assert_eq!(v.tier.unwrap().phase, TierPhase::Archived);
 }
 
+fn version_dir(s: &Store, key: &str, uuid: &str) -> std::path::PathBuf {
+    crate::layout::object_dir(s.cfg.root(), "alpha", key)
+        .unwrap()
+        .join(uuid)
+}
+
+async fn uuid_of(s: &Store, key: &str, version_id: &str) -> String {
+    s.read_meta("alpha", key)
+        .await
+        .unwrap()
+        .unwrap()
+        .versions
+        .iter()
+        .find(|v| v.version_id_str() == version_id)
+        .unwrap()
+        .part
+        .uuid
+        .clone()
+}
+
+fn archive_spec(key: &str, info: &ObjectInfo) -> ArchiveSpec {
+    ArchiveSpec {
+        backend: "s3".into(),
+        key: format!("cold/alpha/{key}"),
+        size: info.size,
+        source_etag: info.etag.clone(),
+        etag: "remote-etag".into(),
+        sha256: hex::encode(crate::mesh::content_hash(b"tier-data")),
+        class: "GLACIER".into(),
+    }
+}
+
+/// 归档提交后回收版本目录；同一 uuid 仍被其它版本引用时保留。
+#[tokio::test]
+async fn archive_reclaims_physical_dir_unless_uuid_shared() {
+    let (s, _d) = store().await;
+    let info = put(&s, "k", true, None).await;
+    let vid = info.version_id.clone().unwrap();
+    let uuid = uuid_of(&s, "k", &vid).await;
+    let dir = version_dir(&s, "k", &uuid);
+    assert!(dir.exists(), "写入后应有版本目录");
+    s.archive_version("alpha", "k", &vid, archive_spec("k", &info), 100)
+        .await
+        .unwrap();
+    assert!(!dir.exists(), "归档后版本目录应被回收");
+
+    // 第二个版本引用同一 uuid → 目录必须保留
+    let (s, _d) = store().await;
+    let a = put(&s, "shared", true, None).await;
+    let b = put(&s, "shared", true, None).await;
+    let a_vid = a.version_id.clone().unwrap();
+    let b_vid = b.version_id.clone().unwrap();
+    let uuid = uuid_of(&s, "shared", &a_vid).await;
+    let mut m = s.read_meta("alpha", "shared").await.unwrap().unwrap();
+    for v in &mut m.versions {
+        if v.version_id_str() == b_vid {
+            v.part.uuid = uuid.clone();
+        }
+    }
+    s.write_meta("alpha", "shared", &m, None).await.unwrap();
+    let dir = version_dir(&s, "shared", &uuid);
+    s.archive_version("alpha", "shared", &a_vid, archive_spec("shared", &a), 100)
+        .await
+        .unwrap();
+    assert!(dir.exists(), "共享 uuid 的版本目录不得回收");
+}
+
+/// prepare 已写 part.1、随后行更新失败 → abort 必须清掉 prepared 副本。
+#[tokio::test]
+async fn abort_restore_removes_prepared_data() {
+    let (s, _d) = store().await;
+    let info = put(&s, "k", true, None).await;
+    let vid = info.version_id.clone().unwrap();
+    let uuid = uuid_of(&s, "k", &vid).await;
+    let dir = version_dir(&s, "k", &uuid);
+    s.archive_version("alpha", "k", &vid, archive_spec("k", &info), 100)
+        .await
+        .unwrap();
+    s.mark_restore_pending("alpha", "k", &vid).await.unwrap();
+    s.restore_prepare("alpha", "k", &vid, b"tier-data")
+        .await
+        .unwrap();
+    assert!(dir.join("part.1").exists());
+    s.abort_restore("alpha", "k", &vid).await.unwrap();
+    assert!(
+        !dir.join("part.1").exists(),
+        "abort 后不得残留 prepared 数据"
+    );
+    let v = s.tier_version("alpha", "k", &vid).await.unwrap().unwrap();
+    assert_eq!(v.tier.unwrap().phase, TierPhase::Archived);
+}
+
 /// 归档提交前源版本已被改写（etag 不符）→ 拒绝且本地数据保持可读（meta 失败不毁本地）。
 #[tokio::test]
 async fn archive_meta_failure_keeps_local() {

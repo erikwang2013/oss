@@ -280,6 +280,20 @@ mod tests {
         assert_eq!(s3_action("DeleteObjectTagging"), Some("s3:PutObject"));
         assert_eq!(s3_action("CopyObject"), None);
         assert_eq!(s3_action("Frobnicate"), None);
+        // M8 S4b：生命周期配置与恢复动作
+        assert_eq!(
+            s3_action("GetBucketLifecycleConfiguration"),
+            Some("s3:GetLifecycleConfiguration")
+        );
+        assert_eq!(
+            s3_action("PutBucketLifecycleConfiguration"),
+            Some("s3:PutLifecycleConfiguration")
+        );
+        assert_eq!(
+            s3_action("DeleteBucketLifecycle"),
+            Some("s3:PutLifecycleConfiguration")
+        );
+        assert_eq!(s3_action("RestoreObject"), Some("s3:RestoreObject"));
         // M8 S5：Inventory 桶级动作
         assert_eq!(
             s3_action("GetBucketInventoryConfiguration"),

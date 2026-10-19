@@ -174,6 +174,14 @@ async fn transition_restore_roundtrip_and_reaper() {
         "tier.etag 存远端 ETag，源 ETag 另存：{}",
         t.etag
     );
+    // 远端收到的字节必须与 meta 记录的 SHA-256 一致（归档内容绑定）。
+    let stored = mock.objs.lock().unwrap().get(&remote).cloned().unwrap();
+    use sha2::Digest as _;
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&stored)),
+        t.sha256,
+        "MockTier 收到的字节 SHA-256 必须等于 tier.sha256"
+    );
 
     // Archived：HEAD 可读元数据、无 x-amz-restore；GET 403
     let head = s3

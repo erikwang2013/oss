@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use common::state;
 use s3s::dto::{
-    BucketLifecycleConfiguration, GetBucketLifecycleConfigurationInput, LifecycleRule,
-    LifecycleRuleFilter, PutBucketLifecycleConfigurationInput, Transition, TransitionStorageClass,
+    BucketLifecycleConfiguration, ExpirationStatus, GetBucketLifecycleConfigurationInput,
+    LifecycleRule, LifecycleRuleFilter, PutBucketLifecycleConfigurationInput, Transition,
+    TransitionStorageClass,
 };
 use s3s::{S3, S3Request};
 use xl_s3::lifecycle::LifecycleRuleSpec;
@@ -311,6 +312,126 @@ async fn sweep_transitions_enqueues_and_dedupes() {
     // 删桶清理规则（S0 共用清理）
     st.db.clear_bucket_m8("bkt").await.unwrap();
     assert!(st.db.list_lifecycle_rules("bkt").await.unwrap().is_empty());
+}
+
+/// DISABLED 规则可写可读，但 sweep 永不选中。
+#[tokio::test]
+async fn disabled_transition_rule_readable_but_never_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("bkt").await.unwrap();
+    st.db.insert_bucket("bkt", None).await.unwrap();
+    st.store
+        .put_object("bkt", "s3/a.txt", bytes::Bytes::from_static(b"a"), None)
+        .await
+        .unwrap();
+    let s3 = OssS3::new(Arc::clone(&st.store), st.acl(), st.cfg.max_put_bytes)
+        .with_lifecycle(Some(Arc::clone(&st.lifecycle)));
+    s3.put_bucket_lifecycle_configuration(req(PutBucketLifecycleConfigurationInput {
+        bucket: "bkt".into(),
+        lifecycle_configuration: Some(BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::DISABLED),
+                ..s3_rule("off")
+            }],
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let out = s3
+        .get_bucket_lifecycle_configuration(req(GetBucketLifecycleConfigurationInput {
+            bucket: "bkt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let rules = out.rules.unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].status.as_str(), ExpirationStatus::DISABLED);
+    assert_eq!(rules[0].transitions.as_ref().unwrap()[0].days, Some(1));
+
+    let queued = oss_server::tier_jobs::sweep_transitions(&st.db, &st.store, st.lifecycle.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(queued, 0, "DISABLED 规则不得入队");
+    assert!(st.db.list_jobs(10).await.unwrap().is_empty());
+}
+
+/// NoncurrentVersionTransition 未支持（501）：sweep 只转当前版本。
+#[tokio::test]
+async fn sweep_only_transitions_current_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("bkt").await.unwrap();
+    st.db.insert_bucket("bkt", None).await.unwrap();
+    let stream = |b: &'static [u8]| -> xl_store::store::ByteStream {
+        Box::pin(futures::stream::once(async move {
+            Ok(bytes::Bytes::from_static(b))
+        }))
+    };
+    let old = st
+        .store
+        .put_object_stream_with_meta(
+            "bkt",
+            "v.txt",
+            stream(b"old"),
+            None,
+            Default::default(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let new = st
+        .store
+        .put_object_stream_with_meta(
+            "bkt",
+            "v.txt",
+            stream(b"new"),
+            None,
+            Default::default(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    st.lifecycle
+        .put_rules(
+            "bkt",
+            &[LifecycleRuleSpec {
+                rule_id: Some("t1".into()),
+                prefix: String::new(),
+                expiration_days: None,
+                transition_days: Some(0),
+                transition_class: Some("STANDARD_IA".into()),
+                transition_tier: None,
+                enabled: true,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let queued = oss_server::tier_jobs::sweep_transitions(&st.db, &st.store, st.lifecycle.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(queued, 1, "只转当前版本");
+    let raw: String = sqlx::query_scalar("SELECT payload_json FROM job_tasks")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(payload["version_id"], new.version_id.unwrap());
+    assert_ne!(payload["version_id"], old.version_id.unwrap());
 }
 
 /// admin `POST /api/v1/tiers/sweep` 强制跑一轮。

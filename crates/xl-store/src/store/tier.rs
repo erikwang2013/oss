@@ -303,18 +303,35 @@ impl Store {
     }
 
     /// 恢复失败回滚：Restoring → Archived（已 Restored 不动，避免毁掉可见副本）。
+    /// prepare 写下的 part.1 对读路径不可见，回滚时一并回收（共享 uuid 则保留）。
     pub async fn abort_restore(&self, bucket: &str, key: &str, version_id: &str) -> Result<()> {
-        self.mutate_version(bucket, key, version_id, |_old, v| {
-            if let Some(t) = &mut v.tier
-                && t.phase == TierPhase::Restoring
-            {
-                t.phase = TierPhase::Archived;
-                t.restore_expires_at = None;
-            }
-            Ok(())
-        })
-        .await
-        .map(|_| ())
+        let out = self
+            .mutate_version(bucket, key, version_id, |_old, v| {
+                if let Some(t) = &mut v.tier
+                    && t.phase == TierPhase::Restoring
+                {
+                    t.phase = TierPhase::Archived;
+                    t.restore_expires_at = None;
+                }
+                Ok(())
+            })
+            .await?;
+        if out.tier.as_ref().map(|t| t.phase) != Some(TierPhase::Archived) {
+            return Ok(());
+        }
+        let Ok(Some(m)) = self.read_meta(bucket, key).await else {
+            return Ok(());
+        };
+        let uuid = &out.part.uuid;
+        if m.versions
+            .iter()
+            .filter(|v| !v.delete_marker() && &v.part.uuid == uuid)
+            .count()
+            <= 1
+        {
+            self.recycle_version_dir(bucket, key, uuid).await;
+        }
+        Ok(())
     }
 
     /// 过期回收：仅当版本处于 Restored 且到期（`<= now`）时执行；返回是否回收。

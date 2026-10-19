@@ -149,6 +149,22 @@ fn dto_roundtrip_keeps_supported_shape() {
 }
 
 #[test]
+fn generated_ids_avoid_explicit_ids() {
+    let mut rules = vec![
+        spec("a"),
+        LifecycleRuleSpec {
+            rule_id: Some("rule-1".into()),
+            ..spec("b")
+        },
+        spec("c"),
+    ];
+    validate_rules(&mut rules, &[]).unwrap();
+    assert_eq!(rules[0].rule_id.as_deref(), Some("rule-2"));
+    assert_eq!(rules[1].rule_id.as_deref(), Some("rule-1"));
+    assert_eq!(rules[2].rule_id.as_deref(), Some("rule-3"));
+}
+
+#[test]
 fn prefix_conflict_and_duplicates_rejected() {
     let cfg = BucketLifecycleConfiguration {
         rules: vec![LifecycleRule {

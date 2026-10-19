@@ -93,13 +93,12 @@ pub fn validate_rules(
             rules.len()
         )));
     }
+    // 显式 id 先全部占位（重复显式 id 报错）；自动 id 跳过已占用编号，避免与显式 id 冲突。
     let mut ids = std::collections::HashSet::new();
-    let mut prefixes = std::collections::HashSet::new();
-    for (i, r) in rules.iter_mut().enumerate() {
-        if r.rule_id.as_deref().is_none_or(str::is_empty) {
-            r.rule_id = Some(format!("rule-{}", i + 1));
-        }
-        let id = r.rule_id.as_deref().expect("上面已补全");
+    for r in rules.iter() {
+        let Some(id) = r.rule_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
         if id.chars().count() > MAX_ID_CHARS {
             return Err(LifecycleError::InvalidArgument(format!(
                 "rule_id 超过 {MAX_ID_CHARS} 字符"
@@ -107,6 +106,18 @@ pub fn validate_rules(
         }
         if !ids.insert(id.to_string()) {
             return Err(LifecycleError::Invalid(format!("rule_id 重复：{id}")));
+        }
+    }
+    let mut prefixes = std::collections::HashSet::new();
+    for (i, r) in rules.iter_mut().enumerate() {
+        if r.rule_id.as_deref().is_none_or(str::is_empty) {
+            let mut n = i + 1;
+            while ids.contains(&format!("rule-{n}")) {
+                n += 1;
+            }
+            let id = format!("rule-{n}");
+            ids.insert(id.clone());
+            r.rule_id = Some(id);
         }
         if r.prefix.len() > MAX_PREFIX_BYTES {
             return Err(LifecycleError::InvalidArgument(format!(

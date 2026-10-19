@@ -108,6 +108,38 @@ impl OssS3 {
             .ok_or_else(|| s3s::s3_error!(NotImplemented, "restore is not wired"))
     }
 
+    /// M8 S4b：读/HEAD 发现恢复已过期 → 与 reaper 同路 best-effort 回收本地副本并删行。
+    /// 失败留给 reaper（Version phase/expiry 始终是真相）。
+    async fn cleanup_expired_restore(&self, bucket: &str, key: &str, info: &ObjectInfo) {
+        if info.tier_phase != Some(xl_store::meta::TierPhase::Restored) {
+            return;
+        }
+        let Some(exp) = info.restore_expires_at else {
+            return;
+        };
+        let now = now_secs();
+        if exp > now {
+            return;
+        }
+        let vid = info
+            .version_id
+            .clone()
+            .unwrap_or_else(|| "null".to_string());
+        match self.store.expire_restore(bucket, key, &vid, now).await {
+            Ok(true) => {}
+            Ok(false) => return, // 竞态：别人已处理（或实际未到期），行留给 reaper
+            Err(e) => {
+                tracing::warn!(error = %e, bucket, key, "读路径回收过期恢复失败（留给 reaper）");
+                return;
+            }
+        }
+        if let Some(sink) = &self.restore
+            && let Err(e) = sink.forget_restore(bucket, key, &vid).await
+        {
+            tracing::warn!(error = %e, bucket, key, "读路径删除过期恢复行失败");
+        }
+    }
+
     /// M8 S5：注入 Inventory 配置存储（console 与 S3 共用同一实例）。
     pub fn with_inventory(
         mut self,
@@ -392,6 +424,13 @@ fn inventory_error(e: crate::inventory::InventoryError) -> s3s::S3Error {
             s3s::s3_error!(InternalError, "internal error")
         }
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// M8 S4b：GET/HEAD 的 `x-amz-restore` 三态（Archived 无头；Restoring ongoing；
@@ -1282,6 +1321,8 @@ impl S3 for OssS3 {
             }
         }
         .map_err(to_s3_error)?;
+        // M8 S4b：过期恢复在此兜底回收（GET 仍按 InvalidObjectState 403）。
+        self.cleanup_expired_restore(&bucket, &key, &info).await;
         if let Err(status) = eval_preconditions(
             &info,
             req.input.if_match.as_ref(),
@@ -1473,6 +1514,9 @@ impl S3 for OssS3 {
             }
         }
         .map_err(to_s3_error)?;
+        // M8 S4b：过期恢复兜底（HEAD 元数据仍可读，响应头按过期态给 ongoing=false）。
+        self.cleanup_expired_restore(&req.input.bucket, &req.input.key, &info)
+            .await;
         // 条件与 GET 同口径（§3.3 的「错误一律 404」只罩读错误；304/412 是条件结果，照常返回）
         if let Err(status) = eval_preconditions(
             &info,

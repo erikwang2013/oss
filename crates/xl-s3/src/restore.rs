@@ -31,6 +31,10 @@ pub trait RestoreSink: Send + Sync {
         version_id: &str,
         days: u32,
     ) -> Result<i64, String>;
+
+    /// 读/HEAD 发现恢复已过期：删行（best-effort；本地副本与 phase 已由 store 处理）。
+    async fn forget_restore(&self, bucket: &str, key: &str, version_id: &str)
+    -> Result<(), String>;
 }
 
 fn valid_tier(t: &str) -> bool {
