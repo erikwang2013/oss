@@ -65,6 +65,12 @@ pub enum S3EventOp {
     RemovedDelete,
     /// `s3:ObjectRemoved:DeleteMarkerCreated`（无版本号删 → marker）
     RemovedDeleteMarkerCreated,
+    /// M8 S4b：`s3:LifecycleTransition`（归档/存储类转换完成）
+    LifecycleTransition,
+    /// M8 S4b：`s3:ObjectRestore:Post`（Restore 受理）
+    RestorePost,
+    /// M8 S4b：`s3:ObjectRestore:Completed`（恢复完成可读）
+    RestoreCompleted,
 }
 
 impl S3EventOp {
@@ -76,6 +82,9 @@ impl S3EventOp {
             Self::CreatedCompleteMultipartUpload => "s3:ObjectCreated:CompleteMultipartUpload",
             Self::RemovedDelete => "s3:ObjectRemoved:Delete",
             Self::RemovedDeleteMarkerCreated => "s3:ObjectRemoved:DeleteMarkerCreated",
+            Self::LifecycleTransition => "s3:LifecycleTransition",
+            Self::RestorePost => "s3:ObjectRestore:Post",
+            Self::RestoreCompleted => "s3:ObjectRestore:Completed",
         }
     }
 

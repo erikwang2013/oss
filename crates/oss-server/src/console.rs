@@ -134,6 +134,8 @@ pub fn routes() -> Router<AppState> {
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
         )
+        // M8 S4b：admin 强制跑一轮 Transition sweep
+        .route("/tiers/sweep", post(force_tier_sweep))
         // M4 切片 7：桶策略（桶主或管理员）与审计（管理员）
         .route("/buckets/{bucket}/policy", get(get_policy).put(put_policy))
         .route("/audit", get(list_audit))
@@ -598,34 +600,63 @@ async fn get_lifecycle(
     if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
         return r;
     }
-    match state.db.list_lifecycle_rules(&bucket).await {
-        Ok(rows) => Json(
-            rows.into_iter()
+    match state.lifecycle.get_rules(&bucket).await {
+        Ok(None) => Json(Vec::<serde_json::Value>::new()).into_response(),
+        Ok(Some(rules)) => Json(
+            rules
+                .into_iter()
                 .map(|r| {
+                    let expiration_days = r.expiration_days.map(i64::from);
                     serde_json::json!({
                         "rule_id": r.rule_id, "prefix": r.prefix,
-                        "expire_days": r.expire_days, "expiration_days": r.expiration_days,
+                        // 旧前端字段：无过期 = 哨兵 -1（与 S0 行口径一致）
+                        "expire_days": expiration_days.unwrap_or(-1),
+                        "expiration_days": expiration_days,
                         "transition_days": r.transition_days,
                         "transition_class": r.transition_class,
                         "transition_tier": r.transition_tier,
-                        "enabled": r.enabled, "updated_at": r.updated_at,
+                        "enabled": r.enabled,
                     })
                 })
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "查询生命周期规则失败");
-            internal_error()
-        }
+        Err(e) => lifecycle_err(e),
     }
+}
+
+/// M8 S4b：console 与 S3 共用 `LifecycleError` 的状态码映射。
+fn lifecycle_err(e: xl_s3::lifecycle::LifecycleError) -> Response {
+    use xl_s3::lifecycle::LifecycleError as E;
+    let status = match &e {
+        E::NoSuchBucket | E::NoSuchConfiguration => StatusCode::NOT_FOUND,
+        E::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+        E::Invalid(_) | E::InvalidClass(_) | E::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        E::Internal(_) => {
+            tracing::error!(error = %e, "lifecycle 内部错误");
+            return internal_error();
+        }
+    };
+    (status, e.to_string()).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 struct LifecycleRuleIn {
     #[serde(default)]
+    rule_id: Option<String>,
+    #[serde(default)]
     prefix: String,
-    expire_days: i64,
+    /// 旧前端字段；`-1` = 无过期（GET 回读口径）。
+    #[serde(default)]
+    expire_days: Option<i64>,
+    #[serde(default)]
+    expiration_days: Option<i64>,
+    #[serde(default)]
+    transition_days: Option<u32>,
+    #[serde(default)]
+    transition_class: Option<String>,
+    #[serde(default)]
+    transition_tier: Option<String>,
     #[serde(default = "default_true_bool")]
     enabled: bool,
 }
@@ -648,39 +679,55 @@ async fn put_lifecycle(
     if rules.len() > 100 {
         return (StatusCode::BAD_REQUEST, "规则过多（≤100）").into_response();
     }
-    let mut rows = Vec::with_capacity(rules.len());
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut specs = Vec::with_capacity(rules.len());
     for r in rules {
-        if r.prefix.len() > 1024 || r.prefix.chars().any(char::is_control) {
-            return (StatusCode::BAD_REQUEST, "prefix 非法").into_response();
-        }
-        if !seen.insert(r.prefix.clone()) {
-            return (StatusCode::BAD_REQUEST, "prefix 重复").into_response();
-        }
-        if !(0..=36_500).contains(&r.expire_days) {
-            return (StatusCode::BAD_REQUEST, "expire_days 须在 0..=36500").into_response();
-        }
-        rows.push(crate::db::LifecycleRuleRow {
-            bucket: bucket.clone(),
-            rule_id: None,
+        // 旧前端只发 expire_days；两个字段都给时以 expiration_days 为准。
+        // -1 是 GET 回读的「无过期」哨兵；其它负数仍拒绝（与 S0 口径一致）。
+        let expiration_days = match (r.expiration_days, r.expire_days) {
+            (Some(d), _) => Some(d),
+            (None, Some(d)) if d >= 0 => Some(d),
+            (None, Some(-1)) | (None, None) => None,
+            (None, Some(_)) => {
+                return (StatusCode::BAD_REQUEST, "expire_days 须在 0..=36500").into_response();
+            }
+        };
+        let expiration_days = match expiration_days {
+            Some(d) => match u32::try_from(d) {
+                Ok(v) => Some(v),
+                Err(_) => return (StatusCode::BAD_REQUEST, "expire_days 越界").into_response(),
+            },
+            None => None,
+        };
+        specs.push(xl_s3::lifecycle::LifecycleRuleSpec {
+            rule_id: r.rule_id,
             prefix: r.prefix,
-            expire_days: r.expire_days,
-            expiration_days: None,
-            transition_days: None,
-            transition_class: None,
-            transition_tier: None,
+            expiration_days,
+            transition_days: r.transition_days,
+            transition_class: r.transition_class,
+            transition_tier: r.transition_tier,
             enabled: r.enabled,
-            updated_at: 0, // 写路径由 set_lifecycle_rules 统一填 now
         });
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    match state.db.set_lifecycle_rules(&bucket, &rows, now).await {
+    match state.lifecycle.put_rules(&bucket, &specs).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => lifecycle_err(e),
+    }
+}
+
+/// M8 S4b：admin 强制 Transition sweep（返回本轮入队数）。
+async fn force_tier_sweep(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    match crate::tier_jobs::sweep_transitions(&state.db, &state.store, state.lifecycle.as_ref())
+        .await
+    {
+        Ok(queued) => Json(serde_json::json!({ "queued": queued })).into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "写生命周期规则失败");
+            tracing::error!(error = %e, "强制 tier sweep 失败");
             internal_error()
         }
     }

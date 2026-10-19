@@ -38,6 +38,22 @@ pub struct AppConfig {
     /// M7：站点节 `[site]`——存在即启用多站点复制（单节点站点对；与 `[cluster]` 互斥）。
     #[serde(default)]
     pub site: Option<SiteToml>,
+    /// M8 S4b：远端 tier `[[tiers]]`（S3 兼容端点；https 启动期拒绝）。
+    #[serde(default)]
+    pub tiers: Vec<TierTarget>,
+}
+
+/// `[[tiers]]`：归档远端。模型同 `[[remotes]]`，另加目标桶。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierTarget {
+    pub id: String,
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+    #[serde(default = "default_region")]
+    pub region: String,
 }
 
 /// `[site]`：本站点身份覆盖（缺省由首启种子生成）。`token` 为控制面通道共享密钥
@@ -190,6 +206,8 @@ impl AppConfig {
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.remotes_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.tiers_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.site_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
@@ -267,6 +285,57 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+
+    /// M8 S4b：`[[tiers]]` 校验——id 白名单/唯一、endpoint http+host、bucket 非空、
+    /// AK/SK/region 非空。https 启动期拒绝（TLS 后置）。
+    pub fn tiers_validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for t in &self.tiers {
+            if t.id.is_empty()
+                || t.id.len() > 64
+                || !t
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                return Err(format!(
+                    "[[tiers]] id 非法：{:?}（白名单 [A-Za-z0-9._-]，≤64）",
+                    t.id
+                ));
+            }
+            if !seen.insert(t.id.clone()) {
+                return Err(format!("[[tiers]] id 重复：{}", t.id));
+            }
+            let uri: hyper::Uri = t
+                .endpoint
+                .parse()
+                .map_err(|_| format!("[[tiers]] {} 的 endpoint 非法：{}", t.id, t.endpoint))?;
+            if uri.scheme_str() != Some("http") || uri.host().is_none() {
+                return Err(format!(
+                    "[[tiers]] {} 的 endpoint 必须是 http://host[:port]（TLS 未接线）：{}",
+                    t.id, t.endpoint
+                ));
+            }
+            if t.bucket.trim().is_empty() {
+                return Err(format!("[[tiers]] {} 的 bucket 不能为空", t.id));
+            }
+            if t.access_key.trim().is_empty() || t.secret_key.trim().is_empty() {
+                return Err(format!(
+                    "[[tiers]] {} 的 access_key/secret_key 不能为空",
+                    t.id
+                ));
+            }
+            if t.region.trim().is_empty() {
+                return Err(format!("[[tiers]] {} 的 region 不能为空", t.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// 规则校验/归档解析用的 tier id 列表（顺序同配置）。
+    pub fn tier_ids(&self) -> Vec<String> {
+        self.tiers.iter().map(|t| t.id.clone()).collect()
     }
 
     /// M7：`[site]` 校验——name ≤64/非空、region 非空、token 32..=128 hex；与 `[cluster]` 互斥
@@ -473,6 +542,7 @@ mod tests {
             cluster: None,
             remotes: vec![],
             site: None,
+            tiers: vec![],
         }
     }
 
@@ -599,6 +669,48 @@ mod tests {
         assert!(cfg(vec![e]).remotes_validate().is_err());
     }
 
+    /// M8 S4b：`[[tiers]]` 校验矩阵（https 启动期拒绝）。
+    #[test]
+    fn tiers_validation_matrix() {
+        let mk = |id: &str, endpoint: &str| TierTarget {
+            id: id.into(),
+            endpoint: endpoint.into(),
+            bucket: "tb".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+            region: "us-east-1".into(),
+        };
+        let cfg = |tiers| {
+            let mut c = base_cfg();
+            c.tiers = tiers;
+            c
+        };
+        assert!(
+            cfg(vec![mk("cold", "http://127.0.0.1:9001")])
+                .tiers_validate()
+                .is_ok()
+        );
+        // https 启动期 fail-closed（出站无 TLS）
+        assert!(
+            cfg(vec![mk("cold", "https://s3.example.com")])
+                .tiers_validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![mk("cold", "http://h:1"), mk("cold", "http://h:2")])
+                .tiers_validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![mk("../x", "http://h:1")])
+                .tiers_validate()
+                .is_err()
+        );
+        let mut e = mk("cold", "http://h:1");
+        e.bucket = " ".into();
+        assert!(cfg(vec![e]).tiers_validate().is_err());
+    }
+
     /// M7：`[site]` 校验矩阵（token 形态 / 与 cluster 互斥）。
     #[test]
     fn site_validation_matrix() {
@@ -667,6 +779,7 @@ mod tests {
             kafka: KafkaToml { targets },
             remotes: vec![],
             site: None,
+            tiers: vec![],
         };
         // 合法
         assert!(

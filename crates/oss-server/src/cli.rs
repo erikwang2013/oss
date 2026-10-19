@@ -196,11 +196,24 @@ pub async fn run(
             );
             // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
             crate::lifecycle::spawn_audit_cleanup(state.clone());
-            // M8 S0：通用作业引擎（S3/S4b/S5 的任务动作；0 关闭）
+            // M8 S0：通用作业引擎（S4b 的 Transition/Restore 动作；0 关闭）
+            let executor = std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
+                std::sync::Arc::clone(&state.db),
+                std::sync::Arc::clone(&state.store),
+                std::sync::Arc::clone(&state.tiers),
+                std::sync::Arc::clone(&state.events),
+            ));
             crate::jobs::spawn_workers(
                 std::sync::Arc::clone(&state.db),
                 std::sync::Arc::clone(&state.store),
-                std::sync::Arc::new(crate::jobs::NoopExecutor),
+                executor,
+            );
+            // M8 S4b：restore 启动对账 + Transition sweep / 过期 reaper 周期
+            crate::tier_jobs::spawn(
+                std::sync::Arc::clone(&state.db),
+                std::sync::Arc::clone(&state.store),
+                std::sync::Arc::clone(&state.lifecycle),
+                std::sync::Arc::clone(&state.restore_sink),
             );
 
             let router = crate::router::build_router(state)?;

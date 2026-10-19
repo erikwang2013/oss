@@ -231,3 +231,87 @@ async fn meta_decode_rejects_bad_tier_and_class() {
 fn xl_meta_decode(bytes: &[u8]) -> crate::error::Result<crate::meta::XlMeta> {
     crate::meta::XlMeta::decode(bytes)
 }
+
+/// M8 S4b：归档幂等/换类拒绝、恢复两阶段顺序、过期回收。
+#[tokio::test]
+async fn archive_restore_state_machine() {
+    let (s, _d) = store().await;
+    let info = put(&s, "k", true, None).await;
+    let vid = info.version_id.clone().unwrap();
+    let data = b"tier-data";
+    let sha = hex::encode(crate::mesh::content_hash(data));
+    let spec = |class: &str| ArchiveSpec {
+        backend: "s3".into(),
+        key: "cold/alpha/k".into(),
+        size: data.len() as u64,
+        source_etag: info.etag.clone(),
+        etag: "remote-etag".into(),
+        sha256: sha.clone(),
+        class: class.into(),
+    };
+    s.archive_version("alpha", "k", &vid, spec("GLACIER"), 100)
+        .await
+        .unwrap();
+    // 同 class 幂等；不同 class 400
+    s.archive_version("alpha", "k", &vid, spec("GLACIER"), 101)
+        .await
+        .unwrap();
+    let e = s
+        .archive_version("alpha", "k", &vid, spec("DEEP_ARCHIVE"), 102)
+        .await;
+    assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
+
+    let v = s.tier_version("alpha", "k", &vid).await.unwrap().unwrap();
+    let t = v.tier.as_ref().unwrap();
+    assert_eq!(t.phase, TierPhase::Archived);
+    assert_eq!(t.etag, "remote-etag", "远端 ETag 与源 ETag 分开存");
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::InvalidObjectState(_))
+    ));
+
+    // Restoring：读仍 403；重复受理 409
+    s.mark_restore_pending("alpha", "k", &vid).await.unwrap();
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::InvalidObjectState(_))
+    ));
+    let e = s.mark_restore_pending("alpha", "k", &vid).await;
+    assert!(
+        matches!(e, Err(Error::RestoreAlreadyInProgress(_))),
+        "{e:?}"
+    );
+
+    // abort 回 Archived；再受理
+    s.abort_restore("alpha", "k", &vid).await.unwrap();
+    s.mark_restore_pending("alpha", "k", &vid).await.unwrap();
+    // prepare 长度校验；prepare 后、commit 前不可见
+    let e = s.restore_prepare("alpha", "k", &vid, b"short").await;
+    assert!(matches!(e, Err(Error::CorruptMeta(_))), "{e:?}");
+    s.restore_prepare("alpha", "k", &vid, data).await.unwrap();
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::InvalidObjectState(_))
+    ));
+
+    let expires = now_secs() + 1000;
+    s.restore_commit("alpha", "k", &vid, expires).await.unwrap();
+    let (head, got) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(&got[..], data);
+    assert_eq!(head.tier_phase, Some(TierPhase::Restored));
+    assert_eq!(head.restore_expires_at, Some(expires));
+
+    // 未到期不回收；到期回收后本地数据不可读、phase 回 Archived
+    assert!(
+        !s.expire_restore("alpha", "k", &vid, expires - 1)
+            .await
+            .unwrap()
+    );
+    assert!(s.expire_restore("alpha", "k", &vid, expires).await.unwrap());
+    assert!(matches!(
+        s.get_object("alpha", "k").await,
+        Err(Error::InvalidObjectState(_))
+    ));
+    let v = s.tier_version("alpha", "k", &vid).await.unwrap().unwrap();
+    assert_eq!(v.tier.unwrap().phase, TierPhase::Archived);
+}

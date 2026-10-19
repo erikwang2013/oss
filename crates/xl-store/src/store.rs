@@ -26,8 +26,10 @@ mod mpu;
 mod put;
 mod read;
 mod rebalance;
+mod tier;
 mod version;
 pub use rebalance::RebalanceReport;
+pub use tier::ArchiveSpec;
 pub use version::{DeleteOutcome, TierRef, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
@@ -1361,6 +1363,10 @@ fn parse_topo_record(s: &str) -> Option<(u16, String, u16)> {
         return None; // 拒启：v3+set0 是人为错改的形态
     }
     Some((set, node?, slot?))
+}
+
+fn now_secs() -> i64 {
+    now_nanos() / 1_000_000_000
 }
 
 fn now_nanos() -> i64 {

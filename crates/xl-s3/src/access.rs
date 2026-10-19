@@ -967,6 +967,10 @@ fn classify(op: &str) -> Option<Gate> {
         "PutBucketReplication" => Gate::OwnerBucket,
         "GetBucketReplication" => Gate::Need(Action::Read),
         "DeleteBucketReplication" => Gate::OwnerBucket,
+        // M8 S4b：生命周期配置（写配置 = 桶主，读 = 读档）；RestoreObject 是写动作
+        "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle" => Gate::OwnerBucket,
+        "GetBucketLifecycleConfiguration" => Gate::Need(Action::Read),
+        "RestoreObject" => Gate::Need(Action::Write),
         // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
         "HeadBucket"
         | "ListObjectsV2"
@@ -1254,6 +1258,7 @@ mod tests {
             "HeadObject",
             "SelectObjectContent",
             "GetObjectTagging",
+            "GetBucketLifecycleConfiguration",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Read)), "{op}");
         }
@@ -1266,6 +1271,7 @@ mod tests {
             "AbortMultipartUpload",
             "PutObjectTagging",
             "DeleteObjectTagging",
+            "RestoreObject",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Write)), "{op}");
         }
@@ -1273,6 +1279,9 @@ mod tests {
             assert_eq!(classify(op), Some(Gate::Need(Action::Delete)), "{op}");
         }
         assert_eq!(classify("CopyObject"), Some(Gate::Copy));
+        for op in ["PutBucketLifecycleConfiguration", "DeleteBucketLifecycle"] {
+            assert_eq!(classify(op), Some(Gate::OwnerBucket), "{op}");
+        }
         // 未映射（含 s3s 存在但本服务未实现的桶策略类 op）→ fail-closed
         for op in ["PutBucketPolicy", "Frobnicate"] {
             assert_eq!(classify(op), None, "{op}");

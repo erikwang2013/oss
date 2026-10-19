@@ -99,6 +99,30 @@ pub struct JobSpec {
     pub tasks: Vec<NewJobTask>,
 }
 
+/// M8 S4b：Restore 行（`tier_restores`；reaper/对账的跨 crate 视图）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreRow {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    pub expires_at: i64,
+    pub job_id: Option<i64>,
+    pub state: String,
+    pub created_at: i64,
+}
+
+fn row_to_restore(r: &sqlx::sqlite::SqliteRow) -> RestoreRow {
+    RestoreRow {
+        bucket: r.get("bucket"),
+        key: r.get("key"),
+        version_id: r.get("version_id"),
+        expires_at: r.get("expires_at"),
+        job_id: r.get("job_id"),
+        state: r.get("state"),
+        created_at: r.get("created_at"),
+    }
+}
+
 /// 访问点行（M8 S1）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccessPointRow {
@@ -2476,6 +2500,202 @@ impl Db {
         Ok(id)
     }
 
+    /// 建带 dedupe 的作业：任务 `INSERT OR IGNORE`，一条都没插入（全被去重）→
+    /// 整个事务回滚并返回 None（C7：不产生空作业）。
+    pub async fn create_job_dedup(&self, spec: &JobSpec, now: i64) -> Result<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        let id = sqlx::query(
+            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
+             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
+             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&spec.kind)
+        .bind(&spec.bucket)
+        .bind(&spec.prefix)
+        .bind(spec.tasks.len() as i64)
+        .bind(spec.priority)
+        .bind(spec.requested_by)
+        .bind(spec.parent_job_id)
+        .bind(&spec.report_bucket)
+        .bind(&spec.report_prefix)
+        .bind(&spec.spec_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        let mut inserted = 0i64;
+        for (i, t) in spec.tasks.iter().enumerate() {
+            let n = sqlx::query(
+                "INSERT OR IGNORE INTO job_tasks \
+                 (job_id, task_no, action, payload_json, state, next_at, dedupe_key) \
+                 VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            )
+            .bind(id)
+            .bind(i as i64 + 1)
+            .bind(&t.action)
+            .bind(&t.payload)
+            .bind(now)
+            .bind(&t.dedupe_key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            inserted += n as i64;
+        }
+        if inserted == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        if inserted != spec.tasks.len() as i64 {
+            sqlx::query("UPDATE jobs SET total = ? WHERE id = ?")
+                .bind(inserted)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(id))
+    }
+
+    /// M8 S4b：Restore 受理（单事务）——建 kind=restore 单任务作业 + upsert `tier_restores`
+    /// `state='pending', expires_at=0`。返回 `(job_id, 是否新建任务)`。
+    pub async fn create_restore_job(
+        &self,
+        spec: &JobSpec,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        now: i64,
+    ) -> Result<(i64, bool)> {
+        let mut tx = self.pool.begin().await?;
+        let id = sqlx::query(
+            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
+             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
+             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&spec.kind)
+        .bind(&spec.bucket)
+        .bind(&spec.prefix)
+        .bind(spec.tasks.len() as i64)
+        .bind(spec.priority)
+        .bind(spec.requested_by)
+        .bind(spec.parent_job_id)
+        .bind(&spec.report_bucket)
+        .bind(&spec.report_prefix)
+        .bind(&spec.spec_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        let mut inserted = false;
+        for (i, t) in spec.tasks.iter().enumerate() {
+            let n = sqlx::query(
+                "INSERT OR IGNORE INTO job_tasks \
+                 (job_id, task_no, action, payload_json, state, next_at, dedupe_key) \
+                 VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            )
+            .bind(id)
+            .bind(i as i64 + 1)
+            .bind(&t.action)
+            .bind(&t.payload)
+            .bind(now)
+            .bind(&t.dedupe_key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            inserted |= n > 0;
+        }
+        sqlx::query(
+            "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, created_at) \
+             VALUES (?, ?, ?, 0, ?, 'pending', ?) \
+             ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
+             expires_at = 0, job_id = excluded.job_id, state = 'pending', created_at = excluded.created_at",
+        )
+        .bind(bucket)
+        .bind(key)
+        .bind(version_id)
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((id, inserted))
+    }
+
+    /// 某状态的 Restore 行（reaper/对账）。
+    pub async fn restore_rows(&self, state: &str) -> Result<Vec<RestoreRow>> {
+        let rows = sqlx::query(
+            "SELECT bucket, key, version_id, expires_at, job_id, state, created_at \
+             FROM tier_restores WHERE state = ? ORDER BY created_at",
+        )
+        .bind(state)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_restore).collect())
+    }
+
+    pub async fn restore_row(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<RestoreRow>> {
+        let row = sqlx::query(
+            "SELECT bucket, key, version_id, expires_at, job_id, state, created_at \
+             FROM tier_restores WHERE bucket = ? AND key = ? AND version_id = ?",
+        )
+        .bind(bucket)
+        .bind(key)
+        .bind(version_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(row_to_restore))
+    }
+
+    pub async fn set_restore_state(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        state: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE tier_restores SET state = ?, expires_at = ? \
+             WHERE bucket = ? AND key = ? AND version_id = ?",
+        )
+        .bind(state)
+        .bind(expires_at)
+        .bind(bucket)
+        .bind(key)
+        .bind(version_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_restore(&self, bucket: &str, key: &str, version_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM tier_restores WHERE bucket = ? AND key = ? AND version_id = ?")
+            .bind(bucket)
+            .bind(key)
+            .bind(version_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 作业是否仍有 queued/running 任务（启动对账判断是否需要重排）。
+    pub async fn job_task_active(&self, job_id: i64) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_tasks WHERE job_id = ? AND state IN ('queued','running')",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
+    }
+
     /// `(该用户, 全局)` 的 inflight 作业数（queued/running/paused）。
     pub async fn job_inflight_counts(&self, requested_by: Option<i64>) -> Result<(i64, i64)> {
         let user: i64 = match requested_by {
@@ -2581,9 +2801,10 @@ impl Db {
         }
         let attempt: i64 = r.get("attempt");
         if ok {
+            // C7：终态清空 dedupe_key（成功后同键可再次入队）。
             sqlx::query(
                 "UPDATE job_tasks SET state = 'done', result_code = ?, result_string = ?, \
-                 finished_at = ? WHERE job_id = ? AND task_no = ?",
+                 finished_at = ?, dedupe_key = NULL WHERE job_id = ? AND task_no = ?",
             )
             .bind(code)
             .bind(message)
@@ -2625,8 +2846,8 @@ impl Db {
         } else {
             sqlx::query(
                 "UPDATE job_tasks SET state = 'failed', attempt = attempt + 1, \
-                 result_code = 'PermanentFailure', result_string = ?, finished_at = ? \
-                 WHERE job_id = ? AND task_no = ?",
+                 result_code = 'PermanentFailure', result_string = ?, finished_at = ?, \
+                 dedupe_key = NULL WHERE job_id = ? AND task_no = ?",
             )
             .bind(message)
             .bind(now)

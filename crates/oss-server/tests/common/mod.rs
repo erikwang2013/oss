@@ -1,4 +1,4 @@
-use oss_server::config::{AppConfig, GroupTarget, SiteToml};
+use oss_server::config::{AppConfig, GroupTarget, SiteToml, TierTarget};
 use oss_server::db::Db;
 use oss_server::state::AppState;
 use xl_store::store::{Store, StoreConfig};
@@ -15,6 +15,20 @@ pub async fn state(dir: &std::path::Path) -> AppState {
 
 /// M7 测试用：带 `[site]` 的 AppState（None = M7 关闭，站点路由 404）。
 pub async fn state_with_site(dir: &std::path::Path, site: Option<SiteToml>) -> AppState {
+    state_with_targets(dir, site, vec![]).await
+}
+
+/// M8 S4b 测试用：带 `[[tiers]]` 的 AppState（后端由用例替换为 mock）。
+#[allow(dead_code)]
+pub async fn state_with_tiers(dir: &std::path::Path, tiers: Vec<TierTarget>) -> AppState {
+    state_with_targets(dir, None, tiers).await
+}
+
+async fn state_with_targets(
+    dir: &std::path::Path,
+    site: Option<SiteToml>,
+    tiers: Vec<TierTarget>,
+) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
@@ -33,6 +47,7 @@ pub async fn state_with_site(dir: &std::path::Path, site: Option<SiteToml>) -> A
         cluster: None, // 单节点测试形态；集群 fixture 走 in-process 基座（xl-store::store::tests）
         kafka: Default::default(),
         remotes: vec![],
+        tiers,
         site,
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();

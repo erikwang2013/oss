@@ -119,6 +119,12 @@ pub struct VersionEntry {
     pub mod_time_nanos: i64,
     /// M8 S4a：存储类（None = STANDARD）。
     pub storage_class: Option<String>,
+    /// M8 S4b：分层阶段（None = 无 tier 记录；对账扫描用）。
+    pub tier_phase: Option<crate::meta::TierPhase>,
+    /// M6：复制状态（Transition sweep 跳过 PENDING/FAILED）。
+    pub replication_status: Option<String>,
+    /// M8 S4b：SSE 对象不参与 Transition（sweep 跳过）。
+    pub encrypted: bool,
 }
 
 /// [`Store::list_object_versions`] 的单页结果。
@@ -839,6 +845,9 @@ impl Store {
                     etag: v.etag.clone(),
                     mod_time_nanos: v.mod_time_nanos,
                     storage_class: v.storage_class.clone(),
+                    tier_phase: v.tier.as_ref().map(|t| t.phase),
+                    replication_status: v.replication_status.clone(),
+                    encrypted: v.encryption.is_some(),
                 });
             }
         }

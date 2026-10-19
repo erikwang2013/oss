@@ -20,6 +20,7 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         // 对 delete marker 版本点名 GET/HEAD：405（S3 语义）
         StoreError::DeleteMarker(_) => S3ErrorCode::MethodNotAllowed,
         StoreError::InvalidObjectState(_) => S3ErrorCode::InvalidObjectState,
+        StoreError::RestoreAlreadyInProgress(_) => S3ErrorCode::RestoreAlreadyInProgress,
         StoreError::InvalidArgument(_) => S3ErrorCode::InvalidArgument,
         // M5 切片 4：锁定删除 → 403 AccessDenied（AWS 对对象锁拒绝的口径）
         StoreError::ObjectLocked(_) => S3ErrorCode::AccessDenied,

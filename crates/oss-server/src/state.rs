@@ -42,6 +42,14 @@ pub struct AppState {
     pub ap_region: String,
     /// M8 S0/B10：所有删桶路径共用的 M8 清理（Db 清表 + AP 缓存失效）。
     pub bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
+    /// M8 S4b：生命周期规则存储（S3 协议面 + console 共用）。
+    pub lifecycle: Arc<dyn xl_s3::lifecycle::LifecycleStore>,
+    /// M8 S4b：远端 tier 后端（Transition 归档 / Restore 取回 / GC）。
+    pub tiers: Arc<crate::tier::TierBackends>,
+    /// M8 S4b：RestoreObject 入队。
+    pub restore_sink: Arc<dyn xl_s3::restore::RestoreSink>,
+    /// M8 S4b：删除对象时回收远端归档副本。
+    pub tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink>,
 }
 
 /// M8 S0/S1：删桶清理的跨 crate 实现（Db 清表 + AP 缓存失效）。
@@ -600,6 +608,15 @@ impl AppState {
             Arc::clone(&store),
         ));
         let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
+        // M8 S4b：tier 后端固定于启动配置；规则校验只认这些 id。
+        let tiers = Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers));
+        let lifecycle: Arc<dyn xl_s3::lifecycle::LifecycleStore> = Arc::new(
+            crate::lifecycle_store::SqlLifecycleStore::new(Arc::clone(&db), Arc::new(tiers.ids())),
+        );
+        let restore_sink: Arc<dyn xl_s3::restore::RestoreSink> =
+            Arc::new(crate::tier_jobs::SqlRestoreSink::new(Arc::clone(&db)));
+        let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
+            Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
@@ -626,6 +643,10 @@ impl AppState {
             olap_cache,
             ap_region,
             bucket_cleanup,
+            lifecycle,
+            tiers,
+            restore_sink,
+            tier_gc,
         }
     }
 }

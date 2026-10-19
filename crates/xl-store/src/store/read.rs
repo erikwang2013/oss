@@ -46,12 +46,17 @@ pub(in crate::store) fn check_tier_readable(
     bucket: &str,
     key: &str,
 ) -> Result<()> {
-    if let Some(t) = &v.tier
-        && !t.phase.local_readable()
-    {
+    let Some(t) = &v.tier else { return Ok(()) };
+    if !t.phase.local_readable() {
         return Err(Error::InvalidObjectState(format!(
             "{bucket}/{key}: 归档对象当前不可读（phase={:?}）",
             t.phase
+        )));
+    }
+    // M8 S4b：恢复期已过按不可读处理（即使 reaper 尚未删行/回收本地副本）。
+    if t.restore_expires_at.is_some_and(|e| e <= super::now_secs()) {
+        return Err(Error::InvalidObjectState(format!(
+            "{bucket}/{key}: 恢复期已过"
         )));
     }
     Ok(())

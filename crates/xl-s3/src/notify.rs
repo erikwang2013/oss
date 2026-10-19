@@ -18,6 +18,10 @@ pub const ALLOWED_EVENTS: &[&str] = &[
     "s3:ObjectRemoved:DeleteMarkerCreated",
     "s3:LifecycleExpiration:Delete",
     "s3:LifecycleExpiration:DeleteMarkerCreated",
+    // M8 S4b：Transition / Restore
+    "s3:LifecycleTransition",
+    "s3:ObjectRestore:Post",
+    "s3:ObjectRestore:Completed",
 ];
 
 /// 单条归一化配置（内部 JSON 的 serde 形状）。

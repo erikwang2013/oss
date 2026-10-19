@@ -18,7 +18,7 @@ use s3s_sigv4::{
 use sha2::Digest as _;
 use tokio::net::TcpStream;
 
-use crate::config::RemoteTarget;
+use crate::config::{RemoteTarget, TierTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrClass {
@@ -81,6 +81,123 @@ impl ReplClient {
             })
             .collect();
         Self { remotes }
+    }
+
+    /// M8 S4b：tier 目标（同 `[[remotes]]` 形态 + 目标桶；id 即 tier id）。
+    pub fn new_tiers(targets: &[TierTarget]) -> Self {
+        let remotes = targets
+            .iter()
+            .filter_map(|t| {
+                let uri = t.endpoint.parse::<Uri>().ok()?;
+                Some((
+                    t.id.clone(),
+                    Remote {
+                        uri,
+                        access_key: t.access_key.clone(),
+                        secret_key: t.secret_key.clone(),
+                        region: t.region.clone(),
+                    },
+                ))
+            })
+            .collect();
+        Self { remotes }
+    }
+
+    /// tier PUT：`Content-MD5`（签入）并断言响应 ETag == 本地 MD5（远端 ETag 口径）。
+    pub async fn tier_put(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        md5_hex: &str,
+    ) -> Result<String, ReplError> {
+        let raw = hex::decode(md5_hex).map_err(|_| ReplError::permanent("MD5 非法"))?;
+        let md5_b64 =
+            base64::engine::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw);
+        let headers = vec![("content-md5".to_string(), md5_b64)];
+        let resp = self
+            .send(
+                remote_id,
+                "PUT",
+                bucket,
+                Some(key),
+                &[],
+                Some(body),
+                &headers,
+                None,
+            )
+            .await?;
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_default();
+        if etag != md5_hex {
+            return Err(ReplError::permanent(format!(
+                "tier PUT ETag 不符（期望 {md5_hex}，得到 {etag:?}）"
+            )));
+        }
+        Ok(etag)
+    }
+
+    /// tier GET：整份读入（恢复作业随后校验 size/SHA-256）。
+    pub async fn tier_get(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Bytes, ReplError> {
+        let resp = self
+            .send(remote_id, "GET", bucket, Some(key), &[], None, &[], None)
+            .await?;
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| ReplError::retryable(format!("读取 tier 响应体失败：{e}")))?;
+        Ok(body.to_bytes())
+    }
+
+    /// tier HEAD：远端无此键 → Ok(None)。
+    pub async fn tier_head(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<u64>, ReplError> {
+        match self
+            .send(remote_id, "HEAD", bucket, Some(key), &[], None, &[], None)
+            .await
+        {
+            Ok(resp) => Ok(Some(
+                resp.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            )),
+            Err(e) if e.status == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// tier DELETE（GC）：远端无此键 → Ok（幂等）。
+    pub async fn tier_delete(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), ReplError> {
+        match self
+            .send(remote_id, "DELETE", bucket, Some(key), &[], None, &[], None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.status == Some(404) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// 单目标客户端（M7 站点对：worker 按 `sites` 行动态构造；id 固定为 "site"）。

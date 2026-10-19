@@ -42,6 +42,9 @@ pub enum Error {
     /// M8 S4a：归档对象当前不可读（未 Restore/恢复期已过）→ S3 403 `InvalidObjectState`。
     #[error("invalid object state: {0}")]
     InvalidObjectState(String),
+    /// M8 S4b：Restore 已在进行/已恢复 → S3 409 `RestoreAlreadyInProgress`。
+    #[error("restore already in progress: {0}")]
+    RestoreAlreadyInProgress(String),
     /// M5 密钥库/加解密：wrap 解密失败（篡改/错钥）、主密钥文件损坏等——独立变体供上层
     /// 精确映射（如 SSE-C 错钥 → 4xx，而非 500 泛化）。
     #[error("crypto error: {0}")]

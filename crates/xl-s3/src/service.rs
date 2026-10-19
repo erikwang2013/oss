@@ -39,6 +39,10 @@ pub struct OssS3 {
     bucket_cleanup: Option<Arc<dyn crate::bucket_cleanup::BucketCleanupSink>>,
     /// M8 S4a：删除归档版本的远端 tier 清理（S4b 注入真实实现；None = 不清理）
     tier_gc: Option<Arc<dyn crate::tier_gc::TierGcSink>>,
+    /// M8 S4b：生命周期规则读写（None = 501）。
+    lifecycle: Option<Arc<dyn crate::lifecycle::LifecycleStore>>,
+    /// M8 S4b：Restore 入队（None = 501）。
+    restore: Option<Arc<dyn crate::restore::RestoreSink>>,
 }
 
 impl OssS3 {
@@ -63,6 +67,8 @@ impl OssS3 {
             repl_store: None,
             bucket_cleanup: None,
             tier_gc: None,
+            lifecycle: None,
+            restore: None,
         }
     }
 
@@ -70,6 +76,33 @@ impl OssS3 {
     pub fn with_tier_gc(mut self, sink: Option<Arc<dyn crate::tier_gc::TierGcSink>>) -> Self {
         self.tier_gc = sink;
         self
+    }
+
+    /// M8 S4b：注入生命周期规则存储（console 与 S3 共用同一实例）。
+    pub fn with_lifecycle(
+        mut self,
+        store: Option<Arc<dyn crate::lifecycle::LifecycleStore>>,
+    ) -> Self {
+        self.lifecycle = store;
+        self
+    }
+
+    /// M8 S4b：注入 Restore 入队 sink（None = RestoreObject 501）。
+    pub fn with_restore(mut self, sink: Option<Arc<dyn crate::restore::RestoreSink>>) -> Self {
+        self.restore = sink;
+        self
+    }
+
+    fn lifecycle_store(&self) -> S3Result<&Arc<dyn crate::lifecycle::LifecycleStore>> {
+        self.lifecycle
+            .as_ref()
+            .ok_or_else(|| s3s::s3_error!(NotImplemented, "lifecycle configuration is not wired"))
+    }
+
+    fn restore_sink(&self) -> S3Result<&Arc<dyn crate::restore::RestoreSink>> {
+        self.restore
+            .as_ref()
+            .ok_or_else(|| s3s::s3_error!(NotImplemented, "restore is not wired"))
     }
 
     /// M8 S4a：删除已成功的归档版本 → 远端清理（best-effort）。
@@ -301,6 +334,44 @@ fn parse_storage_class(raw: Option<&str>, allow_archive: bool) -> S3Result<Optio
         ));
     }
     Ok(xl_store::meta::normalize_storage_class(Some(&sc)))
+}
+
+/// M8 S4b：生命周期错误矩阵 → S3 错误码。
+fn lifecycle_error(e: crate::lifecycle::LifecycleError) -> s3s::S3Error {
+    use crate::lifecycle::LifecycleError as E;
+    match e {
+        E::NoSuchBucket => s3s::s3_error!(NoSuchBucket),
+        E::NoSuchConfiguration => s3s::s3_error!(NoSuchLifecycleConfiguration),
+        E::Invalid(m) => s3s::s3_error!(InvalidRequest, "{}", m),
+        E::InvalidClass(m) => s3s::s3_error!(InvalidStorageClass, "{}", m),
+        E::InvalidArgument(m) => s3s::s3_error!(InvalidArgument, "{}", m),
+        E::NotImplemented(m) => s3s::s3_error!(NotImplemented, "{}", m),
+        E::Internal(m) => {
+            tracing::error!(error = %m, "生命周期存储失败");
+            s3s::s3_error!(InternalError, "internal error")
+        }
+    }
+}
+
+/// M8 S4b：GET/HEAD 的 `x-amz-restore` 三态（Archived 无头；Restoring ongoing；
+/// Restored 带到期时刻）。
+fn restore_header(info: &ObjectInfo) -> Option<String> {
+    match info.tier_phase? {
+        xl_store::meta::TierPhase::Archived => None,
+        xl_store::meta::TierPhase::Restoring => Some("ongoing-request=\"true\"".to_string()),
+        xl_store::meta::TierPhase::Restored => {
+            let exp = info.restore_expires_at?;
+            let odt = time::OffsetDateTime::from_unix_timestamp(exp).ok()?;
+            let mut buf = Vec::new();
+            Timestamp::from(odt)
+                .format(TimestampFormat::HttpDate, &mut buf)
+                .ok()?;
+            Some(format!(
+                "ongoing-request=\"false\", expiry-date=\"{}\"",
+                String::from_utf8(buf).ok()?
+            ))
+        }
+    }
 }
 
 /// M8 前置：PutObjectTagging 的 XML TagSet → 校验后的标签集合。
@@ -1253,6 +1324,7 @@ impl S3 for OssS3 {
             }
         };
         let len = bytes.len() as i64;
+        let restore = restore_header(&info);
 
         let mut out = GetObjectOutput {
             body: Some(StreamingBlob::from_bytes(bytes)),
@@ -1262,6 +1334,8 @@ impl S3 for OssS3 {
             last_modified: Some(last_modified(info.last_modified_nanos)),
             accept_ranges: Some("bytes".to_string()),
             content_range,
+            // M8 S4b：x-amz-restore 三态
+            restore,
             // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
             metadata: Some(info.user_metadata.into_iter().collect()),
             // 透出实际读到的版本号（点名版本 = 该版本；未点名 = 当前最新）
@@ -1374,11 +1448,14 @@ impl S3 for OssS3 {
             }
             return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
         }
+        let restore = restore_header(&info);
         let mut out = HeadObjectOutput {
             content_length: Some(info.size as i64),
             content_type: info.content_type,
             e_tag: Some(ETag::Strong(info.etag)),
             last_modified: Some(last_modified(info.last_modified_nanos)),
+            // M8 S4b：x-amz-restore 三态
+            restore,
             metadata: Some(info.user_metadata.into_iter().collect()),
             version_id: info.version_id.clone(),
             tag_count: (!info.tags.is_empty()).then_some(info.tags.len() as i32),
@@ -2387,6 +2464,129 @@ impl S3 for OssS3 {
                 Err(s3s::s3_error!(InternalError, "internal error"))
             }
         }
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let store = self.lifecycle_store()?;
+        let Some(cfg) = req.input.lifecycle_configuration else {
+            return Err(s3s::s3_error!(
+                MalformedXML,
+                "lifecycle configuration is required"
+            ));
+        };
+        if cfg.rules.is_empty() {
+            return Err(s3s::s3_error!(
+                MalformedXML,
+                "lifecycle rules must not be empty"
+            ));
+        }
+        let specs = crate::lifecycle::parse_lifecycle_config(&cfg).map_err(lifecycle_error)?;
+        store
+            .put_rules(&req.input.bucket, &specs)
+            .await
+            .map_err(lifecycle_error)?;
+        Ok(S3Response::new(
+            PutBucketLifecycleConfigurationOutput::default(),
+        ))
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        let store = self.lifecycle_store()?;
+        let rules = store
+            .get_rules(&req.input.bucket)
+            .await
+            .map_err(lifecycle_error)?
+            .ok_or_else(|| {
+                s3s::s3_error!(
+                    NoSuchLifecycleConfiguration,
+                    "the lifecycle configuration does not exist"
+                )
+            })?;
+        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+            rules: Some(crate::lifecycle::rules_to_dto(&rules)),
+            ..Default::default()
+        }))
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        let store = self.lifecycle_store()?;
+        store
+            .delete_rules(&req.input.bucket)
+            .await
+            .map_err(lifecycle_error)?;
+        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+    }
+
+    async fn restore_object(
+        &self,
+        req: S3Request<RestoreObjectInput>,
+    ) -> S3Result<S3Response<RestoreObjectOutput>> {
+        let sink = self.restore_sink()?;
+        let bucket = req.input.bucket;
+        let key = req.input.key;
+        // versionId 可缺省：解析为当前版本（非版本桶 = "null"）。
+        let version_id = match req.input.version_id {
+            Some(v) => v,
+            None => self
+                .store
+                .head_object(&bucket, &key)
+                .await
+                .map_err(to_s3_error)?
+                .version_id
+                .unwrap_or_else(|| "null".to_string()),
+        };
+        let header = req
+            .headers
+            .get("x-amz-restore-request")
+            .and_then(|v| v.to_str().ok());
+        let days =
+            crate::restore::parse_restore_request(req.input.restore_request.as_ref(), header)
+                .map_err(|e| match e {
+                    crate::restore::RestoreError::InvalidRequest(m) => {
+                        s3s::s3_error!(InvalidRequest, "{}", m)
+                    }
+                    crate::restore::RestoreError::InvalidArgument(m) => {
+                        s3s::s3_error!(InvalidArgument, "{}", m)
+                    }
+                })?;
+        // B9：xl-s3 只标记 pending + 交付 sink；sink 失败回滚 pending。
+        self.store
+            .mark_restore_pending(&bucket, &key, &version_id)
+            .await
+            .map_err(to_s3_error)?;
+        if let Err(e) = sink.enqueue_restore(&bucket, &key, &version_id, days).await {
+            tracing::error!(error = %e, bucket, key, "Restore 入队失败，回滚 pending");
+            if let Err(re) = self.store.abort_restore(&bucket, &key, &version_id).await {
+                tracing::warn!(error = %re, bucket, key, "Restore 回滚失败");
+            }
+            return Err(s3s::s3_error!(InternalError, "restore enqueue failed"));
+        }
+        self.emit(
+            S3EventOp::RestorePost,
+            &bucket,
+            &key,
+            Some(&version_id),
+            None,
+            None,
+            EventSource::from_headers(&req.headers),
+        )
+        .await;
+        let mut resp =
+            S3Response::with_status(RestoreObjectOutput::default(), StatusCode::ACCEPTED);
+        resp.headers.insert(
+            "x-amz-restore",
+            http::HeaderValue::from_static("ongoing-request=\"true\""),
+        );
+        Ok(resp)
     }
 
     async fn list_object_versions(

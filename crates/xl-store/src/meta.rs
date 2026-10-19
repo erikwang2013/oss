@@ -364,8 +364,10 @@ impl XlMeta {
                 return Err(Error::CorruptMeta(format!("非法存储类：{sc:?}")));
             }
             if let Some(t) = &v.tier {
+                // tier.key 保存 raw 对象键（含中文等非 ASCII；HTTP 路径编码在 ReplClient，N3），
+                // 只拒绝控制字符即可。
                 let ok = |s: &str, max: usize| {
-                    !s.is_empty() && s.len() <= max && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                    !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)
                 };
                 if !ok(&t.backend, 64) || !ok(&t.key, 2048) {
                     return Err(Error::CorruptMeta(format!(

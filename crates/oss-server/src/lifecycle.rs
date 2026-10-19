@@ -50,6 +50,14 @@ pub async fn sweep_once(state: &AppState) -> usize {
     };
     let mut ran = 0usize;
     for rule in rules {
+        // M8 S4b：Transition-only 规则（expiration_days 空）不归 M4 到期删除管。
+        let Some(expire_days) = rule.expiration_days.or(if rule.expire_days >= 0 {
+            Some(rule.expire_days)
+        } else {
+            None
+        }) else {
+            continue;
+        };
         ran += 1;
         let started = now_secs();
         let job = match state
@@ -75,13 +83,10 @@ pub async fn sweep_once(state: &AppState) -> usize {
         };
         // 负值防呆（verifier S6-2 附属）：console 已拦 0..=36500；直写 DB 绕过时这里
         // fail-closed——`.max(0)` 会静默变成「立即全删」
-        if rule.expire_days < 0 {
-            err = Some(format!(
-                "规则 expire_days 为负（{}），拒绝执行",
-                rule.expire_days
-            ));
+        if expire_days < 0 {
+            err = Some(format!("规则有效期天数为负（{expire_days}），拒绝执行"));
         }
-        let cutoff = now_secs() - rule.expire_days.max(0) * 86_400;
+        let cutoff = now_secs() - expire_days.max(0) * 86_400;
 
         if err.is_none() {
             let mut token: Option<String> = None;
@@ -140,6 +145,19 @@ pub async fn sweep_once(state: &AppState) -> usize {
                         .await
                     {
                         Ok(outcome) => {
+                            // M8 S4b：归档版本删除后回收远端副本（best-effort，失败只 warn）。
+                            let refs: Vec<xl_store::store::TierRef> = match &outcome {
+                                xl_store::store::DeleteOutcome::Version { tier, .. } => {
+                                    tier.iter().cloned().collect()
+                                }
+                                xl_store::store::DeleteOutcome::Object { tiers } => tiers.clone(),
+                                _ => vec![],
+                            };
+                            if !refs.is_empty()
+                                && let Err(e) = state.tier_gc.delete(&refs).await
+                            {
+                                tracing::warn!(error = %e, n = refs.len(), "lifecycle：tier 清理失败");
+                            }
                             // M6 切片 0（R5 + P2-1）：事件映射走纯函数；NotFound（并发窄窗
                             // head 后 delete 前被删）→ None：不发事件、不计 deleted。
                             if let Some((name, vid)) = lifecycle_event(&outcome) {

@@ -88,6 +88,11 @@ pub fn s3_action(op: &str) -> Option<&'static str> {
         "HeadBucket" | "ListObjectsV2" | "ListObjectVersions" | "ListParts" => "s3:ListBucket",
         "GetBucketVersioning" => "s3:GetBucketVersioning",
         "PutBucketVersioning" => "s3:PutBucketVersioning",
+        "GetBucketLifecycleConfiguration" => "s3:GetLifecycleConfiguration",
+        "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle" => {
+            "s3:PutLifecycleConfiguration"
+        }
+        "RestoreObject" => "s3:RestoreObject",
         "DeleteBucket" => "s3:DeleteBucket",
         "CreateBucket" => "s3:CreateBucket",
         // CopyObject 需源读 + 目标写两个动作——在调用方拆开处理，不走此映射

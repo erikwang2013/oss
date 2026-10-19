@@ -95,8 +95,11 @@ async fn negative_expire_days_rule_fails_closed() {
         .put_object("nbk", "keep.txt", bytes::Bytes::from_static(b"k"), None)
         .await
         .unwrap();
+    // M8 S4b 后负值只可能出自直接写 `expiration_days`（旧 `expire_days=-1` 是
+    // Transition-only 哨兵，按无过期跳过）。
     let mut bad = rule("", -1);
     bad.bucket = "nbk".into();
+    bad.expiration_days = Some(-1);
     st.db.set_lifecycle_rules("nbk", &[bad], 1).await.unwrap();
 
     sweep_once(&st).await;
