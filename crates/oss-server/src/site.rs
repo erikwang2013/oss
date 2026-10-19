@@ -171,6 +171,8 @@ pub async fn apply_changelog(state: &AppState, entries: Vec<Entry>) -> Result<Ap
 
     let mut stats = ApplyStats::default();
     let mut bucket_entities: std::collections::BTreeSet<String> = Default::default();
+    // B10：已应用的桶删除 → 提交成功后失效 AP 缓存（提交失败不失效）。
+    let mut deleted_buckets: Vec<String> = Vec::new();
     let now = crate::db::now();
 
     for e in &entries {
@@ -206,7 +208,12 @@ pub async fn apply_changelog(state: &AppState, entries: Vec<Entry>) -> Result<Ap
         }
         match e.entity.as_str() {
             "bucket" => match apply_bucket(&mut tx, &state.store, e).await? {
-                Ok(()) => stats.applied += 1,
+                Ok(()) => {
+                    if e.op == "delete" {
+                        deleted_buckets.push(e.entity_id.clone());
+                    }
+                    stats.applied += 1
+                }
                 Err(why) => {
                     bury(&mut tx, &e.origin_site_id, e, &why).await?;
                     stats.dead += 1;
@@ -265,6 +272,11 @@ pub async fn apply_changelog(state: &AppState, entries: Vec<Entry>) -> Result<Ap
         .await
         .map_err(|e| bad(e.to_string()))?;
     tx.commit().await.map_err(|e| bad(e.to_string()))?;
+
+    // B10：只有提交成功才失效 AP 缓存。
+    for name in deleted_buckets {
+        state.bucket_cleanup.invalidate_ap_cache(&name);
+    }
 
     // R9：提交后按**最终行**对账物理桶（clock 跳过也执行；重试幂等）
     for name in bucket_entities {
@@ -360,6 +372,11 @@ async fn apply_bucket(
                 .execute(&mut *tx)
                 .await
                 .map_err(|err| bad(err.to_string()))?;
+                // B10：事务内清 M8 表（AP/Inventory/Tier/Lifecycle）；cache 失效由调用方
+                // 在 commit 成功后执行——提交失败不得失效。
+                crate::db::Db::clear_bucket_m8_tx(&mut *tx, &e.entity_id)
+                    .await
+                    .map_err(|err| bad(err.to_string()))?;
                 Ok(Ok(()))
             }
             Err(xl_store::error::Error::BucketNotEmpty(_)) => Ok(Err("桶非空，删除未应用".into())),

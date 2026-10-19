@@ -848,6 +848,12 @@ async fn delete_bucket(
     }
     match state.store.delete_bucket(&bucket).await {
         Ok(()) => {
+            // B10：物理删除已生效——清 M8 控制面状态并失效 AP 缓存（失败只告警，不补偿桶）。
+            // 放在分支之前：站点冲突补偿重建空桶时同样不得继承旧 AP/Inventory 配置。
+            if let Err(e) = state.bucket_cleanup.clear_bucket_m8(&bucket).await {
+                tracing::warn!(error = %e, bucket = %bucket, "删桶 M8 表清理失败");
+            }
+            state.bucket_cleanup.invalidate_ap_cache(&bucket);
             if let Err(e) = state.acl().forget_bucket(&bucket).await {
                 // M7 H1：门控 ABORT 时物理桶已删、行/授权未动——恢复空桶（删除前为空）
                 // 并返回 409，绝不能让“物理已删 + 行残留 + 无 delete changelog”静默成功。

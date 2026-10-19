@@ -38,6 +38,8 @@ pub struct AppState {
     pub ap_cache: Arc<xl_s3::ap::ApCache>,
     /// M8 S1：AP ARN 的 region（取 `[site].region`，缺省 us-east-1）
     pub ap_region: String,
+    /// M8 S0/B10：所有删桶路径共用的 M8 清理（Db 清表 + AP 缓存失效）。
+    pub bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
 }
 
 /// M8 S0/S1：删桶清理的跨 crate 实现（Db 清表 + AP 缓存失效）。
@@ -211,7 +213,7 @@ impl AppState {
         std::fs::create_dir_all(&cfg.staging_dir)
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
-        let db = Db::connect(&cfg.database_url).await?;
+        let db = Arc::new(Db::connect(&cfg.database_url).await?);
         // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
         // 经 `AppState::new` 同样会再应用一次（幂等）。
         if let Some(site) = cfg.site.as_ref() {
@@ -231,6 +233,11 @@ impl AppState {
             enabled: cfg.ec.enabled,
         };
         store_cfg.inline_threshold = cfg.ec.inline_threshold;
+        // B10：控制面删桶路径的清理实现须在 Store::open 前注入（集群控制面写）。
+        let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
+        let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> = Arc::new(
+            SqlBucketCleanup::new(Arc::clone(&db), Arc::clone(&ap_cache)),
+        );
         // M3 集群（配了 [cluster] 才走）：静态拓扑 + 节点间传输注入存储内核。
         // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
         // ClusterTopology::new 与 Store::open（self 一致性）。
@@ -279,9 +286,10 @@ impl AppState {
                 resolver,
             }));
             // Task 9：控制面读扇出的本节点执行器（判权复用 xl-s3::Acl；只查本地 DB）
-            store_cfg.control = Some(Arc::new(crate::cluster_control::SqliteControlBackend::new(
-                db.pool().clone(),
-            )));
+            store_cfg.control = Some(Arc::new(
+                crate::cluster_control::SqliteControlBackend::new(db.pool().clone())
+                    .with_bucket_cleanup(Some(Arc::clone(&bucket_cleanup))),
+            ));
         }
         let store = Store::open(store_cfg).await?;
 
@@ -431,7 +439,7 @@ impl AppState {
             tracing::warn!(error = %e, "groups 回填抑制复位失败");
         }
 
-        Ok(Self::new(cfg, db, store).await)
+        Ok(Self::new_with(cfg, db, store, ap_cache, bucket_cleanup).await)
     }
 
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
@@ -459,6 +467,23 @@ impl AppState {
     }
 
     pub async fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
+        let db = Arc::new(db);
+        let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
+        let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> = Arc::new(
+            SqlBucketCleanup::new(Arc::clone(&db), Arc::clone(&ap_cache)),
+        );
+        Self::new_with(cfg, db, store, ap_cache, bucket_cleanup).await
+    }
+
+    /// `load` 预建 AP 缓存与清理实现（控制面写要在 `Store::open` 前注入），
+    /// tests 走 [`AppState::new`] 同一装配语义。
+    async fn new_with(
+        cfg: AppConfig,
+        db: Arc<Db>,
+        store: Store,
+        ap_cache: Arc<xl_s3::ap::ApCache>,
+        bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
+    ) -> Self {
         // M7：`[site]` 覆盖种子（先于任何控制面写；load 与 tests 共用此路径）
         if let Some(site) = cfg.site.as_ref() {
             db.apply_site_config(
@@ -477,7 +502,6 @@ impl AppState {
         );
         let site_enabled = cfg.site.is_some();
         // M8 S1：AP 缓存预加载（坏策略行跳过并告警；运行期 source 查询会再 fail-closed）
-        let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
         match db.list_access_points(None).await {
             Ok(rows) => {
                 for r in rows {
@@ -554,7 +578,6 @@ impl AppState {
         ));
         let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
         let cfg = Arc::new(cfg);
-        let db = Arc::new(db);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
             db: Arc::clone(&db),
@@ -578,6 +601,7 @@ impl AppState {
             site_enabled,
             ap_cache,
             ap_region,
+            bucket_cleanup,
         }
     }
 }

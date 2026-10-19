@@ -9,14 +9,36 @@ use xl_s3::access::{Acl, Action, AuthedUser};
 use xl_store::error::{Error, Result};
 use xl_store::mesh::{ControlBackend, ControlQuery, ControlRow};
 
-#[derive(Debug)]
 pub struct SqliteControlBackend {
     pool: SqlitePool,
+    /// B10：删桶行的 M8 清理；`new(pool)` 保持 None（单测/无装配可跑）。
+    cleanup: Option<std::sync::Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>>,
+}
+
+impl std::fmt::Debug for SqliteControlBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteControlBackend")
+            .field("pool", &self.pool)
+            .field("cleanup", &self.cleanup.is_some())
+            .finish()
+    }
 }
 
 impl SqliteControlBackend {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            cleanup: None,
+        }
+    }
+
+    /// 生产装配注入删桶清理（best-effort：失败只告警，不影响控制面写结果）。
+    pub fn with_bucket_cleanup(
+        mut self,
+        cleanup: Option<std::sync::Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>>,
+    ) -> Self {
+        self.cleanup = cleanup;
+        self
     }
 }
 
@@ -172,6 +194,13 @@ impl ControlBackend for SqliteControlBackend {
                         .execute(&self.pool)
                         .await
                         .map_err(enc)?;
+                    // B10：行删除已生效——清 M8 表并失效 AP 缓存（best-effort，不改写结果）。
+                    if let Some(cleanup) = &self.cleanup {
+                        if let Err(e) = cleanup.clear_bucket_m8(&bucket).await {
+                            tracing::warn!(error = %e, bucket = %bucket, "控制面删桶 M8 表清理失败");
+                        }
+                        cleanup.invalidate_ap_cache(&bucket);
+                    }
                 }
             },
         }
