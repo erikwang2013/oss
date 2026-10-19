@@ -284,7 +284,8 @@ impl Db {
     /// 极小增量迁移：0001 是**整份重放**（全部 IF NOT EXISTS），而 `ALTER ADD COLUMN`
     /// 不幂等，放不进重放——增量列在这里探测后补齐。新库由 0001 直接带列，两个路径收敛。
     /// 字面量 SQL（sqlx 0.9 拒动态串）；增量列：users.status · buckets.set_id ·
-    /// buckets.object_lock 三列（M5 切片 4）· access_keys 会话三列（M5 切片 5）。
+    /// buckets.object_lock 三列（M5 切片 4）· buckets.default_encryption（M8 缺口 C）·
+    /// access_keys 会话三列（M5 切片 5）。
     async fn ensure_columns(&self) -> Result<()> {
         // M4 切片 8：buckets.set（多 set 归属；老库补列，幂等——与 status 同款竞态容忍）
         let bcols = sqlx::query("SELECT name FROM pragma_table_info('buckets')")
@@ -320,6 +321,10 @@ impl Db {
             (
                 "object_lock_default_days",
                 "ALTER TABLE buckets ADD COLUMN object_lock_default_days INTEGER",
+            ),
+            (
+                "default_encryption",
+                "ALTER TABLE buckets ADD COLUMN default_encryption TEXT",
             ),
         ] {
             if !has(name)
@@ -1155,6 +1160,38 @@ impl Db {
             .unwrap_or_else(|| "Off".to_string()))
     }
 
+    /// M8 缺口 C：桶默认加密（"AES256"/"aws:kms"；None = 未配置）。
+    pub async fn get_bucket_default_encryption(&self, bucket: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT default_encryption FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("default_encryption")))
+    }
+
+    /// M8 缺口 C：写桶默认加密（桶不存在 → 0 行）。
+    pub async fn set_bucket_default_encryption(
+        &self,
+        bucket: &str,
+        algorithm: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
+            .bind(algorithm)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// M8 缺口 C：清桶默认加密（幂等）。
+    pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool> {
+        let res = sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// 某用户拥有的桶（控制台桶列表能力位计算用）。
     pub async fn owned_buckets(&self, uid: i64) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT name FROM buckets WHERE owner_id = ? ORDER BY name")
@@ -1908,6 +1945,47 @@ mod tests {
         // 二次 connect：列已存在，不得因重复 ALTER 失败
         let db = Db::connect(&url).await.unwrap();
         assert!(db.get_user(1).await.unwrap().is_some());
+    }
+
+    /// M8 缺口 C：老库 buckets 无 default_encryption → ensure_columns 补列后可用。
+    #[tokio::test]
+    async fn legacy_db_gains_default_encryption_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-enc.db");
+        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, \
+              creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        db.insert_bucket("old-b", None).await.unwrap();
+        assert_eq!(
+            db.get_bucket_default_encryption("old-b").await.unwrap(),
+            None
+        );
+        assert!(
+            db.set_bucket_default_encryption("old-b", "aws:kms")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_bucket_default_encryption("old-b").await.unwrap(),
+            Some("aws:kms".to_string())
+        );
+        assert!(db.clear_bucket_default_encryption("old-b").await.unwrap());
+        assert_eq!(
+            db.get_bucket_default_encryption("old-b").await.unwrap(),
+            None
+        );
     }
 
     /// M8 S0：旧库（只有 0001）升级——0003 全部表 + jobs/lifecycle 补列；二次连接幂等。

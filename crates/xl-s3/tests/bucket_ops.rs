@@ -11,7 +11,7 @@ use xl_store::store::{Store, StoreConfig};
 async fn acl() -> xl_s3::access::Acl {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql(
-        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER);\
+        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT);\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
           PRIMARY KEY (user_id, bucket));",
@@ -114,6 +114,175 @@ async fn head_missing_bucket_is_no_such_bucket() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchBucket);
+}
+
+/// M8 缺口 C：桶默认加密 PUT/GET/DELETE 往返 + 非法配置拒（400）。
+#[tokio::test]
+async fn bucket_encryption_roundtrip_and_invalid_config() {
+    // 默认加密存在 buckets 行上 → 建桶必须带身份（record_bucket_owner）
+    fn with_user<T>(input: T) -> S3Request<T> {
+        let mut r = req(input);
+        r.extensions.insert(xl_s3::access::AuthedUser {
+            uid: 1,
+            is_admin: true,
+            ak: String::new(),
+        });
+        r
+    }
+    let (s3, _d) = service().await;
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: "enc-bkt".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let cfg = |algo: &str, cmk: Option<&str>| {
+        req(PutBucketEncryptionInput {
+            bucket: "enc-bkt".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            server_side_encryption_configuration: ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        kms_master_key_id: cmk.map(str::to_string),
+                        sse_algorithm: ServerSideEncryption::from_static(algo_static(algo)),
+                    }),
+                    ..Default::default()
+                }],
+            },
+        })
+    };
+    // from_static 需要 'static——把两个合法值钉成常量，非法值走单独构造
+    fn algo_static(a: &str) -> &'static str {
+        match a {
+            "AES256" => "AES256",
+            "aws:kms" => "aws:kms",
+            _ => unreachable!(),
+        }
+    }
+    let get = || {
+        req(GetBucketEncryptionInput {
+            bucket: "enc-bkt".into(),
+            ..Default::default()
+        })
+    };
+
+    // 未配置 → 专属错误码（s3s 定义的 ServerSideEncryptionConfigurationNotFoundError）
+    let err = s3.get_bucket_encryption(get()).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        &s3s::S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError
+    );
+
+    // SSE-S3 → GET 回 AES256
+    s3.put_bucket_encryption(cfg("AES256", None)).await.unwrap();
+    let out = s3.get_bucket_encryption(get()).await.unwrap().output;
+    let rule = &out.server_side_encryption_configuration.unwrap().rules[0];
+    assert_eq!(
+        rule.apply_server_side_encryption_by_default
+            .as_ref()
+            .unwrap()
+            .sse_algorithm
+            .as_str(),
+        "AES256"
+    );
+    // 改为 SSE-KMS → 覆盖
+    s3.put_bucket_encryption(cfg("aws:kms", None))
+        .await
+        .unwrap();
+    let out = s3.get_bucket_encryption(get()).await.unwrap().output;
+    assert_eq!(
+        out.server_side_encryption_configuration.unwrap().rules[0]
+            .apply_server_side_encryption_by_default
+            .as_ref()
+            .unwrap()
+            .sse_algorithm
+            .as_str(),
+        "aws:kms"
+    );
+
+    // 非法：未知算法 / 显式 CMK / 无默认规则 → 400
+    let bad_algo = req(PutBucketEncryptionInput {
+        bucket: "enc-bkt".into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        server_side_encryption_configuration: ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    kms_master_key_id: None,
+                    sse_algorithm: ServerSideEncryption::from_static("aws:kms:dsse"),
+                }),
+                ..Default::default()
+            }],
+        },
+    });
+    for bad in [
+        bad_algo,
+        cfg("aws:kms", Some("arn:aws:kms:cmk")),
+        req(PutBucketEncryptionInput {
+            bucket: "enc-bkt".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            server_side_encryption_configuration: ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule::default()],
+            },
+        }),
+    ] {
+        let e = s3.put_bucket_encryption(bad).await.unwrap_err();
+        assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest, "{e:?}");
+    }
+    // 非法 PUT 未破坏已存配置
+    let out = s3.get_bucket_encryption(get()).await.unwrap().output;
+    assert_eq!(
+        out.server_side_encryption_configuration.unwrap().rules[0]
+            .apply_server_side_encryption_by_default
+            .as_ref()
+            .unwrap()
+            .sse_algorithm
+            .as_str(),
+        "aws:kms"
+    );
+
+    // DELETE 幂等；之后 GET 回到未配置
+    s3.delete_bucket_encryption(req(DeleteBucketEncryptionInput {
+        bucket: "enc-bkt".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.delete_bucket_encryption(req(DeleteBucketEncryptionInput {
+        bucket: "enc-bkt".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let err = s3.get_bucket_encryption(get()).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        &s3s::S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError
+    );
+
+    // 桶不存在 → NoSuchBucket
+    let e = s3
+        .get_bucket_encryption(req(GetBucketEncryptionInput {
+            bucket: "ghost".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
+    let e = s3
+        .delete_bucket_encryption(req(DeleteBucketEncryptionInput {
+            bucket: "ghost".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchBucket);
 }
 
 /// M4 切片 3：版本控制开关——开启幂等；**已启用后拒绝改回 Off**（写入会整链替换 → 静默丢历史）。

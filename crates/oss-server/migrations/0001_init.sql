@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     creation_date INTEGER NOT NULL,
     versioning    TEXT NOT NULL DEFAULT 'Off',  -- M4 用
     object_lock   INTEGER NOT NULL DEFAULT 0,   -- M1 只写 0；M5 用。不加 CHECK
-    set_id        INTEGER NOT NULL DEFAULT 0    -- M4 切片 8：桶→set 归属（ensure_columns 给老库补列）
+    set_id        INTEGER NOT NULL DEFAULT 0,   -- M4 切片 8：桶→set 归属（ensure_columns 给老库补列）
+    default_encryption TEXT                     -- M8 缺口 C：桶默认加密（"AES256"/"aws:kms"；NULL = 未配置）
 );
 
 CREATE TABLE IF NOT EXISTS uploads (

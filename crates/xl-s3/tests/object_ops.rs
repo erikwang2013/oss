@@ -18,7 +18,7 @@ async fn service() -> (OssS3, tempfile::TempDir) {
 async fn acl() -> xl_s3::access::Acl {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql(
-        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER);\
+        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT);\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
           PRIMARY KEY (user_id, bucket));\
@@ -1904,6 +1904,186 @@ async fn sse_s3_wire_headers_and_kms_cmk_rejected() {
         &s3s::S3ErrorCode::InvalidRequest,
         "显式 CMK 应 400：{e:?}"
     );
+}
+
+/// M8 缺口 C：桶默认加密——PUT/MPU create+complete/Copy 目标都套默认；显式 SSE 优先；
+/// DELETE 后恢复明文。
+#[tokio::test]
+async fn bucket_default_encryption_applied_and_overridden() {
+    let (s3, _store, _d) = service_enc().await;
+    // 默认加密存在 buckets 行上 → 建桶必须带身份（record_bucket_owner）
+    let mut create = req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    });
+    create.extensions.insert(xl_s3::access::AuthedUser {
+        uid: 1,
+        is_admin: true,
+        ak: String::new(),
+    });
+    s3.create_bucket(create).await.unwrap();
+    let put = |key: &'static str, body: &'static [u8], sse: Option<&'static str>| {
+        req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: key.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(body))),
+            server_side_encryption: sse.map(ServerSideEncryption::from_static),
+            ..Default::default()
+        })
+    };
+    let get = |key: &'static str| {
+        req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: key.into(),
+            ..Default::default()
+        })
+    };
+    let enc_cfg = |algo: &'static str| {
+        req(PutBucketEncryptionInput {
+            bucket: "alpha".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            server_side_encryption_configuration: ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        kms_master_key_id: None,
+                        sse_algorithm: ServerSideEncryption::from_static(algo),
+                    }),
+                    ..Default::default()
+                }],
+            },
+        })
+    };
+
+    // 默认配置前：明文源对象（拷贝的输入）
+    let out = s3.put_object(put("src", b"copy-me", None)).await.unwrap();
+    assert!(out.output.server_side_encryption.is_none());
+
+    s3.put_bucket_encryption(enc_cfg("AES256")).await.unwrap();
+
+    // PUT 无 SSE → 套默认 AES256（响应与回读一致）
+    let out = s3
+        .put_object(put("dflt", b"plain-put", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.output
+            .server_side_encryption
+            .as_ref()
+            .map(|s| s.as_str()),
+        Some("AES256")
+    );
+    let g = s3.get_object(get("dflt")).await.unwrap().output;
+    assert_eq!(
+        g.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+
+    // 显式 SSE-KMS 覆盖桶默认
+    let out = s3
+        .put_object(put("explicit", b"explicit-kms", Some("aws:kms")))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.output
+            .server_side_encryption
+            .as_ref()
+            .map(|s| s.as_str()),
+        Some("aws:kms")
+    );
+    assert!(
+        out.output
+            .ssekms_key_id
+            .as_deref()
+            .unwrap_or("")
+            .starts_with('k')
+    );
+
+    // MPU：create 无 SSE → 响应回 AES256；complete 落地
+    let created = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        created.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+    let upload_id = created.upload_id.unwrap();
+    let up = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"multipart-default",
+            ))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let done = s3
+        .complete_multipart_upload(req(CompleteMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id,
+            multipart_upload: Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(ETag::Strong(up.e_tag.unwrap().value().to_string())),
+                    ..Default::default()
+                }]),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        done.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+    let g = s3.get_object(get("mp")).await.unwrap().output;
+    assert_eq!(
+        g.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+
+    // CopyObject：目标桶默认生效（源为明文）
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("alpha".to_string())
+        .key("copied".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "alpha".into(),
+            key: "src".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let g = s3.get_object(get("copied")).await.unwrap().output;
+    assert_eq!(
+        g.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("AES256")
+    );
+
+    // DELETE 默认 → 新 PUT 恢复明文
+    s3.delete_bucket_encryption(req(DeleteBucketEncryptionInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let out = s3.put_object(put("after", b"no-enc", None)).await.unwrap();
+    assert!(out.output.server_side_encryption.is_none());
 }
 
 // ---------- M5 切片 4：对象锁线级 ----------

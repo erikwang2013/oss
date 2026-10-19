@@ -263,6 +263,41 @@ impl Acl {
         Ok(())
     }
 
+    /// M8 缺口 C：桶默认加密（"AES256"/"aws:kms"；None = 未配置）。
+    pub async fn bucket_default_encryption(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT default_encryption FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("default_encryption")))
+    }
+
+    /// M8 缺口 C：写桶默认加密（全量替换）。
+    pub async fn set_bucket_default_encryption(
+        &self,
+        bucket: &str,
+        algorithm: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
+            .bind(algorithm)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// M8 缺口 C：清桶默认加密（幂等；删桶时亦可复用）。
+    pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶
     /// 对象；verifier S6-1）。表在共享 DB（migrations 0001），S3 面与控制面同口径。
     pub async fn clear_lifecycle_rules(&self, bucket: &str) -> Result<(), sqlx::Error> {
@@ -970,6 +1005,9 @@ fn classify(op: &str) -> Option<Gate> {
         // M8 S4b：生命周期配置（写配置 = 桶主，读 = 读档）；RestoreObject 是写动作
         "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle" => Gate::OwnerBucket,
         "GetBucketLifecycleConfiguration" => Gate::Need(Action::Read),
+        // M8 缺口 C：桶默认加密（写配置 = 桶主，读 = 读档）
+        "PutBucketEncryption" | "DeleteBucketEncryption" => Gate::OwnerBucket,
+        "GetBucketEncryption" => Gate::Need(Action::Read),
         // M8 S5：Inventory 配置（写配置 = 桶主，读 = 读档）
         "PutBucketInventoryConfiguration" | "DeleteBucketInventoryConfiguration" => {
             Gate::OwnerBucket
@@ -1268,6 +1306,7 @@ mod tests {
             "GetBucketLifecycleConfiguration",
             "GetBucketInventoryConfiguration",
             "ListBucketInventoryConfigurations",
+            "GetBucketEncryption",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Read)), "{op}");
         }
@@ -1293,6 +1332,8 @@ mod tests {
             "DeleteBucketLifecycle",
             "PutBucketInventoryConfiguration",
             "DeleteBucketInventoryConfiguration",
+            "PutBucketEncryption",
+            "DeleteBucketEncryption",
         ] {
             assert_eq!(classify(op), Some(Gate::OwnerBucket), "{op}");
         }

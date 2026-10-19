@@ -19,7 +19,9 @@ use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 use crate::convert::to_s3_error;
 use crate::events::{EventSink, EventSource, S3EventOp};
 use crate::lock::{apply_lock_out, bucket_lock_out, parse_bucket_lock_rule, parse_put_lock};
-use crate::sse::{parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec};
+use crate::sse::{
+    SseReq, parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec,
+};
 
 #[derive(Clone)]
 pub struct OssS3 {
@@ -48,6 +50,33 @@ pub struct OssS3 {
 }
 
 impl OssS3 {
+    /// M8 缺口 C：请求未带任何显式 SSE（含 SSE-C）时套用桶默认加密；显式请求永远优先。
+    /// 库内未知值属记录损坏 → 500（不静默降级为明文）。
+    async fn apply_default_encryption(&self, bucket: &str, sse: &mut SseReq) -> S3Result<()> {
+        if sse.spec.is_some() {
+            return Ok(());
+        }
+        let stored = self
+            .acl
+            .bucket_default_encryption(bucket)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, bucket, "读取桶默认加密失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        if let Some(v) = stored {
+            sse.spec = Some(match v.as_str() {
+                "AES256" => xl_store::crypto::EncSpec::SseS3,
+                "aws:kms" => xl_store::crypto::EncSpec::SseKms,
+                other => {
+                    tracing::error!(bucket, value = %other, "桶默认加密记录非法");
+                    return Err(s3s::s3_error!(InternalError, "internal error"));
+                }
+            });
+        }
+        Ok(())
+    }
+
     /// 桶版本控制是否 Enabled（读 DB；查库失败上抛 500——状态不可知时不写数据）。
     async fn versioned(&self, bucket: &str) -> S3Result<bool> {
         match self.acl.bucket_versioning(bucket).await {
@@ -871,7 +900,7 @@ impl S3 for OssS3 {
         // 先于解构求值（只借 input）：解构会部分搬走 metadata 等字段
         let declared = declared_checksum(&req.input)?;
         // M5 切片 3：SSE 头解析（R1/R2）；密钥对象随之进入 store（绝不落盘）
-        let sse = parse_sse(
+        let mut sse = parse_sse(
             req.input.sse_customer_algorithm.as_deref(),
             req.input.sse_customer_key.as_deref(),
             req.input.sse_customer_key_md5.as_deref(),
@@ -881,6 +910,9 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
             req.input.ssekms_key_id.as_deref(),
         )?;
+        // M8 缺口 C：无显式 SSE 时套用桶默认（显式头永远优先）
+        self.apply_default_encryption(&req.input.bucket, &mut sse)
+            .await?;
         // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
         let lock_req = parse_put_lock(
             req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
@@ -1031,7 +1063,7 @@ impl S3 for OssS3 {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         // M5 切片 3（R5）：SSE-C 只在暂存 meta 记 md5（钥绝不落盘）；其余模式在 complete 定。
-        let sse = parse_sse(
+        let mut sse = parse_sse(
             req.input.sse_customer_algorithm.as_deref(),
             req.input.sse_customer_key.as_deref(),
             req.input.sse_customer_key_md5.as_deref(),
@@ -1041,6 +1073,9 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
             req.input.ssekms_key_id.as_deref(),
         )?;
+        // M8 缺口 C：无显式 SSE 时套用桶默认（create 记档，complete 落地）
+        self.apply_default_encryption(&req.input.bucket, &mut sse)
+            .await?;
         // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
         let lock_req = parse_put_lock(
             req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
@@ -2486,6 +2521,129 @@ impl S3 for OssS3 {
         }))
     }
 
+    // ---------- M8 缺口 C：桶默认加密 API ----------
+
+    /// 只接受单条 SSE-S3/SSE-KMS 默认规则；SSE-C 与显式 CMK 均拒（后者属非目标）。
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket));
+        }
+        let [rule] = req
+            .input
+            .server_side_encryption_configuration
+            .rules
+            .as_slice()
+        else {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "exactly one encryption rule is required"
+            ));
+        };
+        let Some(default) = &rule.apply_server_side_encryption_by_default else {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "missing apply_server_side_encryption_by_default"
+            ));
+        };
+        if default.kms_master_key_id.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "file-backed KMS does not support specifying a CMK"
+            ));
+        }
+        let algo = match default.sse_algorithm.as_str() {
+            a @ ("AES256" | "aws:kms") => a,
+            _ => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "unsupported server-side encryption"
+                ));
+            }
+        };
+        self.acl
+            .set_bucket_default_encryption(&bucket, algo)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, bucket, "写桶默认加密失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        Ok(S3Response::new(PutBucketEncryptionOutput {}))
+    }
+
+    /// 未配置 → `ServerSideEncryptionConfigurationNotFoundError`（s3s 定义的状态码）。
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket));
+        }
+        let Some(algo) = self
+            .acl
+            .bucket_default_encryption(&bucket)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, bucket, "读桶默认加密失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?
+        else {
+            return Err(s3s::s3_error!(
+                ServerSideEncryptionConfigurationNotFoundError,
+                "server-side encryption configuration not found"
+            ));
+        };
+        Ok(S3Response::new(GetBucketEncryptionOutput {
+            server_side_encryption_configuration: Some(ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        kms_master_key_id: None,
+                        sse_algorithm: ServerSideEncryption::from(algo),
+                    }),
+                    ..Default::default()
+                }],
+            }),
+        }))
+    }
+
+    /// 幂等：无配置时删除同样成功（AWS 语义）。
+    async fn delete_bucket_encryption(
+        &self,
+        req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        let bucket = req.input.bucket;
+        if !self
+            .store
+            .bucket_exists(&bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(NoSuchBucket));
+        }
+        self.acl
+            .clear_bucket_default_encryption(&bucket)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, bucket, "清桶默认加密失败");
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        Ok(S3Response::new(DeleteBucketEncryptionOutput {}))
+    }
+
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -2970,7 +3128,7 @@ impl S3 for OssS3 {
             None,
             None,
         )?;
-        let dst_sse = parse_sse(
+        let mut dst_sse = parse_sse(
             req.input.sse_customer_algorithm.as_deref(),
             req.input.sse_customer_key.as_deref(),
             req.input.sse_customer_key_md5.as_deref(),
@@ -2980,6 +3138,9 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
             req.input.ssekms_key_id.as_deref(),
         )?;
+        // M8 缺口 C：目标桶默认加密（仅目标；源钥/源加密不受影响）
+        self.apply_default_encryption(&req.input.bucket, &mut dst_sse)
+            .await?;
         // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
         let dst_lock_req = parse_put_lock(
             req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
