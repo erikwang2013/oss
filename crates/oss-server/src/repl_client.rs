@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr as _;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -56,6 +58,71 @@ struct Remote {
     access_key: String,
     secret_key: String,
     region: String,
+    /// M8 缺口 C：`max_bytes_per_sec` 的令牌桶；None = 不限速（旧行为）。
+    limiter: Option<RateLimiter>,
+}
+
+/// 令牌桶：容量 = 1 秒的量，空闲后最多攒 1 秒的突发。
+struct TokenBucket {
+    rate: u64,
+    capacity: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: u64) -> Self {
+        let full = rate as f64;
+        Self {
+            rate,
+            capacity: full,
+            tokens: full,
+            last: Instant::now(),
+        }
+    }
+
+    /// 补桶后取走现有 token（至多 `n`），返回仍未满足的字节数。
+    /// 必须部分取走：容量只有 1 秒的量，等「攒够整对象」会永远等不到。
+    fn drain(&mut self, n: u64, now: Instant) -> u64 {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate as f64).min(self.capacity);
+        self.last = now;
+        let take = self.tokens.min(n as f64);
+        self.tokens -= take;
+        n - take as u64
+    }
+}
+
+struct RateLimiter {
+    rate: u64,
+    bucket: Mutex<TokenBucket>,
+}
+
+impl RateLimiter {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            bucket: Mutex::new(TokenBucket::new(rate)),
+        }
+    }
+
+    /// shortcut: 对象级限速（整份配额等够再发，单对象内不成形）；需要逐块整形时升级为流式发送。
+    async fn acquire(&self, mut remaining: u64) {
+        while remaining > 0 {
+            remaining = self.bucket.lock().unwrap().drain(remaining, Instant::now());
+            if remaining > 0 {
+                let wait = Duration::from_secs_f64(remaining as f64 / self.rate as f64);
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+fn limiter_of(target: &RemoteTarget) -> Option<RateLimiter> {
+    target
+        .max_bytes_per_sec
+        .filter(|&r| r > 0) // 配置校验保证 ≥1024；0 防御性视为不限
+        .map(RateLimiter::new)
 }
 
 /// 出站客户端（remotes 静态映射；连接每请求新建——复制频率低，无池化）。
@@ -76,6 +143,7 @@ impl ReplClient {
                         access_key: t.access_key.clone(),
                         secret_key: t.secret_key.clone(),
                         region: t.region.clone(),
+                        limiter: limiter_of(t),
                     },
                 ))
             })
@@ -96,6 +164,7 @@ impl ReplClient {
                         access_key: t.access_key.clone(),
                         secret_key: t.secret_key.clone(),
                         region: t.region.clone(),
+                        limiter: None,
                     },
                 ))
             })
@@ -218,6 +287,7 @@ impl ReplClient {
                 access_key: access_key.to_string(),
                 secret_key: secret_key.to_string(),
                 region: region.to_string(),
+                limiter: None,
             },
         );
         Ok(Self { remotes })
@@ -412,6 +482,12 @@ impl ReplClient {
 
         // 签名
         let body_bytes = body.unwrap_or_default();
+        // M8 缺口 C：按远端独立令牌桶整形（GET/HEAD/DELETE 无 body 不限）
+        if !body_bytes.is_empty()
+            && let Some(l) = &remote.limiter
+        {
+            l.acquire(body_bytes.len() as u64).await;
+        }
         let payload_hex = hex::encode(sha2::Sha256::digest(&body_bytes));
         let amz = amz_date_now()?;
         let mut signed: Vec<(String, String)> = vec![
@@ -569,6 +645,61 @@ fn canonical_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(id: &str, max: Option<u64>) -> RemoteTarget {
+        RemoteTarget {
+            id: id.into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+            region: "us-east-1".into(),
+            max_bytes_per_sec: max,
+        }
+    }
+
+    /// M8 缺口 C：令牌桶——初始 1s 满桶、按时间补桶、容量封顶 1s、超额部分取走剩余。
+    #[test]
+    fn token_bucket_refill_and_burst_cap() {
+        let mut b = TokenBucket::new(1000);
+        let t0 = Instant::now();
+        assert_eq!(b.drain(1000, t0), 0, "初始满桶可整取");
+        assert_eq!(b.drain(500, t0), 500, "空桶时全部欠账");
+        let t1 = t0 + Duration::from_millis(250);
+        assert_eq!(b.drain(500, t1), 250, "补 250 后仍欠 250");
+        let t2 = t0 + Duration::from_secs(10);
+        assert_eq!(b.drain(1000, t2), 0, "空闲再久也只攒 1 秒的量");
+        assert_eq!(b.drain(1, t2), 1);
+        // 大于容量的对象分段落账：先取走现有，再欠剩余（不会死等）
+        let mut b = TokenBucket::new(1000);
+        let t3 = Instant::now();
+        assert_eq!(b.drain(2500, t3), 1500);
+    }
+
+    /// M8 缺口 C：每个 remote 独立桶——耗尽 r1 不影响 r2。
+    #[test]
+    fn rate_limiters_are_per_remote() {
+        let c = ReplClient::new(&[target("r1", Some(1024)), target("r2", Some(1024))]);
+        let r1 = c.remotes["r1"].limiter.as_ref().unwrap();
+        let r2 = c.remotes["r2"].limiter.as_ref().unwrap();
+        assert_eq!(
+            r1.bucket.lock().unwrap().drain(1024, Instant::now()),
+            0,
+            "r1 一次取空 1 秒额度"
+        );
+        assert_eq!(
+            r2.bucket.lock().unwrap().drain(1024, Instant::now()),
+            0,
+            "r1 的消耗不得影响 r2"
+        );
+        assert_eq!(
+            r1.bucket.lock().unwrap().drain(1, Instant::now()),
+            1,
+            "r1 已空"
+        );
+        // 未配置 limit → 无桶
+        let c = ReplClient::new(&[target("r3", None)]);
+        assert!(c.remotes["r3"].limiter.is_none());
+    }
 
     #[test]
     fn canonical_includes_replication_header() {

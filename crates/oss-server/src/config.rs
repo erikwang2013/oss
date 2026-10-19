@@ -96,6 +96,9 @@ pub struct RemoteTarget {
     pub secret_key: String,
     #[serde(default = "default_region")]
     pub region: String,
+    /// M8 缺口 C：出站复制带宽上限（字节/秒；None = 不限，行为与旧版完全一致）。
+    #[serde(default)]
+    pub max_bytes_per_sec: Option<u64>,
 }
 
 fn default_region() -> String {
@@ -282,6 +285,15 @@ impl AppConfig {
             }
             if r.region.trim().is_empty() {
                 return Err(format!("[[remotes]] {} 的 region 不能为空", r.id));
+            }
+            // 0 会除零、过小则单对象等待数小时——启动期拒
+            if let Some(rate) = r.max_bytes_per_sec
+                && rate < 1024
+            {
+                return Err(format!(
+                    "[[remotes]] {} 的 max_bytes_per_sec 必须 ≥ 1024（1 KiB/s），实际 {rate}",
+                    r.id
+                ));
             }
         }
         Ok(())
@@ -631,6 +643,7 @@ mod tests {
             access_key: "ak".into(),
             secret_key: "sk".into(),
             region: "us-east-1".into(),
+            max_bytes_per_sec: None,
         };
         let cfg = |remotes| {
             let mut c = base_cfg();
@@ -667,6 +680,27 @@ mod tests {
         let mut e = mk("r1", "http://h:1");
         e.region = " ".into();
         assert!(cfg(vec![e]).remotes_validate().is_err());
+        // M8 缺口 C：带宽上限——None 放行；0 与 <1 KiB/s 启动期拒
+        let mut e = mk("r1", "http://h:1");
+        e.max_bytes_per_sec = Some(1024);
+        assert!(cfg(vec![e]).remotes_validate().is_ok());
+        for bad in [0, 1, 1023] {
+            let mut e = mk("r1", "http://h:1");
+            e.max_bytes_per_sec = Some(bad);
+            let err = cfg(vec![e]).remotes_validate().unwrap_err();
+            assert!(err.contains("max_bytes_per_sec"), "{err}");
+        }
+    }
+
+    /// M8 缺口 C：Toml 省略 `max_bytes_per_sec` = None（旧配置零改动）。
+    #[test]
+    fn remote_max_bytes_per_sec_serde_default() {
+        let base = "id='r1'\nendpoint='http://h:1'\naccess_key='ak'\nsecret_key='sk'\n";
+        let r: RemoteTarget = toml::from_str(base).unwrap();
+        assert_eq!(r.max_bytes_per_sec, None);
+        let with = format!("{base}max_bytes_per_sec = 2048\n");
+        let r: RemoteTarget = toml::from_str(&with).unwrap();
+        assert_eq!(r.max_bytes_per_sec, Some(2048));
     }
 
     /// M8 S4b：`[[tiers]]` 校验矩阵（https 启动期拒绝）。

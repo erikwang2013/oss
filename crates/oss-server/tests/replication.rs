@@ -43,13 +43,15 @@ async fn fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::Temp
 }
 
 async fn put_versioned(store: &Store, key: &str, body: &'static [u8]) -> (String, String) {
+    put_versioned_owned(store, key, Bytes::from_static(body)).await
+}
+
+async fn put_versioned_owned(store: &Store, key: &str, body: Bytes) -> (String, String) {
     let info = store
         .put_object_stream_with_meta(
             "rbk",
             key,
-            Box::pin(futures::stream::once(async move {
-                Ok(Bytes::from_static(body))
-            })),
+            Box::pin(futures::stream::once(async move { Ok(body) })),
             None,
             Default::default(),
             None,
@@ -266,14 +268,19 @@ async fn mock_server(
     mock_server_scripted(Arc::new(move |_p: &str| (status, etag.clone()))).await
 }
 
-fn client(endpoint: &str) -> ReplClient {
-    ReplClient::new(&[RemoteTarget {
-        id: "r1".into(),
+fn target(id: &str, endpoint: &str, max: Option<u64>) -> RemoteTarget {
+    RemoteTarget {
+        id: id.into(),
         endpoint: endpoint.into(),
         access_key: "ak".into(),
         secret_key: "sk".into(),
         region: "us-east-1".into(),
-    }])
+        max_bytes_per_sec: max,
+    }
+}
+
+fn client(endpoint: &str) -> ReplClient {
+    ReplClient::new(&[target("r1", endpoint, None)])
 }
 
 async fn enqueue_one(pool: &SqlitePool, store: Arc<Store>, key: &str) -> String {
@@ -322,6 +329,44 @@ async fn worker_put_success_signs_replica_header() {
         auth.contains("x-amz-replication-status"),
         "REPLICA 头必须纳入 SignedHeaders：{auth}"
     );
+}
+
+/// M8 缺口 C：`max_bytes_per_sec` 对多 MiB 对象生效（对象级整形）。
+/// 2 MiB @ 1 MiB/s：初始桶 1 MiB，再等 ~1s；下界取宽松的 700ms（高负载只增不减）。
+#[tokio::test]
+async fn bandwidth_limit_paces_large_put() {
+    let (pool, store, _a, _b) = fixture().await;
+    let body = Bytes::from(vec![7u8; 2 * 1024 * 1024]);
+    let (vid, etag) = put_versioned_owned(&store, "big", body.clone()).await;
+    sqlx::query(
+        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?) \
+         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
+    )
+    .bind(rules_json(None, false))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "big",
+        version_id: Some(&vid),
+        etag: &etag,
+        size: body.len() as u64,
+        is_delete_marker: false,
+        is_replica: false,
+    })
+    .await;
+    let (endpoint, seen, _h) = mock_server(StatusCode::OK, Some(etag)).await;
+    let c = ReplClient::new(&[target("r1", &endpoint, Some(1024 * 1024))]);
+    let start = std::time::Instant::now();
+    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(700),
+        "限速未生效（应等待 ~1s）：{elapsed:?}"
+    );
+    assert_eq!(seen.lock().unwrap()[0].body.len(), body.len());
 }
 
 /// 行内 version_id 必须被尊重：对象已覆写时复制的是旧版本内容（不是 latest）。
