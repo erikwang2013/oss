@@ -409,7 +409,9 @@ pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3:
     let rows = match db.list_olap_configs().await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!(error = %e, "变换器预加载失败（GET 将直通原文）");
+            // 无法得知哪些 AP 有变换器：保持未加载，AP 请求 500（不得静默直通原文）。
+            tracing::error!(error = %e, "变换器预加载失败（AP 请求将 500，直到重载成功）");
+            cache.mark_failed();
             return;
         }
     };
@@ -432,6 +434,7 @@ pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3:
             }
         }
     }
+    cache.mark_loaded();
 }
 
 /// `ApSource` 的 DB 实现（缓存未命中时查询；非法策略 → Err → 路由 500 fail-closed）。

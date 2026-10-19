@@ -639,6 +639,10 @@ impl s3s::route::S3Route for ApRoute {
                 "access point context missing"
             ));
         };
+        // 全量配置未加载/加载失败时无从得知该 AP 是否有变换器：fail-closed，绝不直通原文。
+        if !self.olap.is_loaded() {
+            return Err(s3s::s3_error!(InternalError, "transform cache unavailable"));
+        }
         // S2：配置了变换器的 AP 只允许 GET/HEAD；写操作 405。Range/partNumber 会让
         // 内层返回局部字节，变换后 ETag/长度语义不再成立 → 400。
         let transform = self.olap.get(&inv.ap_name);

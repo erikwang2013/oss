@@ -209,6 +209,7 @@ async fn test_env() -> TestEnv {
     let s3 = OssS3::new(Arc::clone(&store), acl.clone(), 1 << 20);
     let ap_cache = Arc::new(ApCache::new());
     let olap = Arc::new(OlapCache::new());
+    olap.mark_loaded(); // 模拟启动预加载成功（未加载态由 fail-closed 用例单独覆盖）
     let inner = Arc::new(S3ServiceBuilder::new(s3.clone()).build());
     let ap_route = Arc::new(ApRoute::new(
         Arc::clone(&ap_cache),
@@ -455,6 +456,56 @@ async fn ap_without_transform_passes_through() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(&body[..], b"hello");
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// 全量配置未成功加载时 fail-closed：AP 请求 500 且不直通原文；加载成功后恢复直通。
+#[tokio::test]
+async fn unloaded_transform_cache_fails_closed_until_loaded() {
+    let _g = env_guard(true).await;
+    let env = test_env().await;
+    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    add_ap(&env, "plain");
+
+    env.olap.mark_failed(); // 模拟预加载失败
+    let (st, _, body) = send(&env, get("/ap/plain/hello", &[])).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(String::from_utf8_lossy(&body).contains("InternalError"));
+    assert!(
+        !String::from_utf8_lossy(&body).contains("hello"),
+        "未加载时不得直通原文: {body:?}"
+    );
+
+    env.olap.mark_loaded();
+    let (st, _, body) = send(&env, get("/ap/plain/hello", &[])).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"hello", "加载成功后无变换器的 AP 应直通");
+}
+
+/// 钉住 304 还原所依赖的不变量：经 AP 的正常 200 GetObject 必带 ETag；条件 304 不调变换器。
+#[tokio::test]
+async fn success_200_carries_etag_and_304_skips_transform() {
+    let _g = env_guard(true).await;
+    let (endpoint, m) = mock(upper_reply()).await;
+    let env = test_env().await;
+    put_obj(&env, "empty", b"", None, &[], None, false).await;
+    put_obj(&env, "text", b"abc", None, &[], None, false).await;
+    add_ap(&env, "ap1");
+    add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
+
+    for key in ["empty", "text"] {
+        let (st, h, _) = send(&env, get(&format!("/ap/ap1/{key}"), &[])).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            h.contains_key("etag"),
+            "200 GetObject 必须带 ETag（304 还原依赖）: {key}"
+        );
+    }
+    let hits = m.hits.load(Ordering::SeqCst);
+    let inm = format!("\"{}\"", etag_hex(b"abc"));
+    let (st, _, body) = send(&env, get("/ap/ap1/text", &[("if-none-match", &inm)])).await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    assert_eq!(m.hits.load(Ordering::SeqCst), hits, "304 不得调用变换器");
 }
 
 #[tokio::test]

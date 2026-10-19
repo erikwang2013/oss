@@ -988,3 +988,36 @@ async fn access_point_transform_api() {
     assert!(st.olap_cache.get("ap-two").is_none());
     assert!(st.db.get_olap_config("ap-two").await.unwrap().is_none());
 }
+
+/// 预加载失败注入：`olap_configs` 不可读 → 缓存保持“未加载”（AP 请求 fail-closed）；
+/// 恢复后再次预加载成功 → 置为已加载。
+#[tokio::test]
+async fn transform_preload_failure_keeps_cache_unloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    assert!(st.olap_cache.is_loaded(), "启动预加载成功应置为已加载");
+
+    sqlx::query("DROP TABLE olap_configs")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let cache = xl_s3::olap::OlapCache::new();
+    oss_server::access_points_api::preload_olap(&st.db, &st.ap_cache, &cache).await;
+    assert!(!cache.is_loaded(), "列表失败必须退回未加载（fail-closed）");
+
+    sqlx::raw_sql(
+        "CREATE TABLE olap_configs (
+          access_point TEXT PRIMARY KEY REFERENCES access_points(name) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('http', 'wasm')),
+          endpoint TEXT, module BLOB, module_sha256 TEXT,
+          timeout_ms INTEGER NOT NULL DEFAULT 5000,
+          max_response_bytes INTEGER NOT NULL DEFAULT 67108864,
+          updated_at INTEGER NOT NULL);",
+    )
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+    let cache = xl_s3::olap::OlapCache::new();
+    oss_server::access_points_api::preload_olap(&st.db, &st.ap_cache, &cache).await;
+    assert!(cache.is_loaded(), "加载成功后应恢复");
+}

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(feature = "olap-wasm")]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -557,14 +558,32 @@ fn check_region(ptr: i32, len: i32, mem_size: usize) -> Result<usize, String> {
 
 /// 变换器缓存：AP 名 → (桶, 编译产物)。控制面写路径更新；路由读路径 miss = 无变换器。
 /// 桶删除级联（与 `ApCache::invalidate_bucket` 同步调用）。
+///
+/// `loaded` 区分“全量配置尚未成功加载/加载失败”与“该 AP 无变换器”：前者 AP 请求必须
+/// fail-closed（否则 DB 故障时会静默返回原文），由启动预加载/后续重载置位或清位。
 #[derive(Default)]
 pub struct OlapCache {
     inner: RwLock<HashMap<String, (String, Arc<OlapTransform>)>>,
+    loaded: AtomicBool,
 }
 
 impl OlapCache {
+    /// 新建缓存处于“未加载”态；加载器成功完成一次全量预加载后须调用 `mark_loaded`。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    pub fn mark_loaded(&self) {
+        self.loaded.store(true, Ordering::Release);
+    }
+
+    /// 全量预加载失败：无论此前是否加载过，都退回 fail-closed。
+    pub fn mark_failed(&self) {
+        self.loaded.store(false, Ordering::Release);
     }
 
     pub fn get(&self, ap: &str) -> Option<Arc<OlapTransform>> {
