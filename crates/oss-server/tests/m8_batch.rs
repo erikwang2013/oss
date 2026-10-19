@@ -541,7 +541,7 @@ async fn five_actions_and_hooks() {
         )
         .await
         .unwrap();
-    // 注入 allow_private，避免测试进程级环境变量。
+    // 固定 allow_private，避免测试进程级环境变量。
     let transform = |url: &str| {
         OlapTransform::prepare_with_allow_private(
             "http",
@@ -549,7 +549,7 @@ async fn five_actions_and_hooks() {
             None,
             5_000,
             1 << 20,
-            true,
+            Some(true),
         )
         .unwrap()
     };

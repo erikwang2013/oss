@@ -89,8 +89,8 @@ pub struct OlapTransform {
     max_response_bytes: usize,
     /// 预加载失败原因：配置在但变换器不可用 → GET 500（不得静默直通原文）。
     broken: Option<String>,
-    /// 私网 endpoint 放行（保存时与请求解析时共用；测试可显式注入）。
-    allow_private: bool,
+    /// 私网 endpoint 放行：`None` = 保存/请求时各读一次环境（撤销即时生效）；测试可固定。
+    allow_private: Option<bool>,
     #[cfg(feature = "olap-wasm")]
     module: Option<wasmtime::Module>,
 }
@@ -110,18 +110,18 @@ impl OlapTransform {
             module,
             timeout_ms,
             max_response_bytes,
-            allow_private(),
+            None,
         )
     }
 
-    /// 同 [`Self::prepare`]，但显式指定私网放行——测试注入，不读进程环境变量。
+    /// 同 [`Self::prepare`]，但固定私网放行判定：`Some(v)` 测试注入，`None` 走环境。
     pub fn prepare_with_allow_private(
         kind: &str,
         endpoint: Option<String>,
         module: Option<&[u8]>,
         timeout_ms: i64,
         max_response_bytes: i64,
-        allow_private: bool,
+        pinned: Option<bool>,
     ) -> Result<Self, String> {
         let kind = OlapKind::parse(kind).ok_or("kind 必须是 http/wasm")?;
         if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
@@ -139,14 +139,14 @@ impl OlapTransform {
         match kind {
             OlapKind::Http => {
                 let endpoint = endpoint.ok_or("kind=http 必须提供 endpoint")?;
-                validate_endpoint_with(&endpoint, allow_private)?;
+                validate_endpoint_with(&endpoint, pinned.unwrap_or_else(allow_private))?;
                 Ok(Self {
                     kind,
                     endpoint: Some(endpoint),
                     timeout,
                     max_response_bytes,
                     broken: None,
-                    allow_private,
+                    allow_private: pinned,
                     #[cfg(feature = "olap-wasm")]
                     module: None,
                 })
@@ -169,7 +169,7 @@ impl OlapTransform {
                         timeout,
                         max_response_bytes,
                         broken: None,
-                        allow_private,
+                        allow_private: pinned,
                         module: Some(module),
                     })
                 }
@@ -227,7 +227,7 @@ impl OlapTransform {
             timeout: Duration::from_secs(1),
             max_response_bytes: 0,
             broken: Some(reason),
-            allow_private: false,
+            allow_private: None,
             #[cfg(feature = "olap-wasm")]
             module: None,
         }
@@ -464,8 +464,10 @@ impl OlapTransform {
 /// 解析并校验目标地址；域名返回全部钉扎地址，混合记录中出现一个私网即整体拒。
 async fn resolve_target(
     t: &EndpointTarget,
-    allow_private: bool,
+    pinned: Option<bool>,
 ) -> Result<Vec<SocketAddr>, String> {
+    // 未固定时按请求时环境判定：撤销 OSS_OLAP_ALLOW_PRIVATE 即刻生效，无需 reload。
+    let allow = pinned.unwrap_or_else(allow_private);
     let addrs: Vec<SocketAddr> = match t.ip {
         Some(ip) => vec![SocketAddr::new(ip, t.port)],
         None => tokio::net::lookup_host((t.host.as_str(), t.port))
@@ -476,7 +478,7 @@ async fn resolve_target(
     if addrs.is_empty() {
         return Err("transform DNS 无结果".into());
     }
-    if !allow_private {
+    if !allow {
         for a in &addrs {
             if !ip_is_public(a.ip()) {
                 return Err("transform endpoint 指向非公网地址".into());
