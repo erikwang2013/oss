@@ -726,3 +726,107 @@ async fn jobs_api_ownership_and_actions() {
         .unwrap();
     assert_eq!(r.status(), 404);
 }
+
+/// M8 S1：访问点 CRUD/策略 API（owner/admin、严格策略 400、缓存同步）。
+#[tokio::test]
+async fn access_points_api_crud() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.store.create_bucket("apb").await.unwrap();
+    st.db.insert_bucket("apb", None).await.unwrap();
+    let app = build_router(st.clone()).unwrap();
+    let client = reqwest::Client::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let tok = login_token(&base).await;
+
+    // 建 AP（带策略）
+    let r = client
+        .post(format!("{base}/api/v1/access-points"))
+        .bearer_auth(&tok)
+        .json(&serde_json::json!({
+            "name": "ap-one", "bucket": "apb",
+            "policy": {"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+                "Action":"s3:GetObject","Resource":"arn:aws:s3:::apb/*"}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    assert!(st.ap_cache.get("ap-one").is_some(), "缓存未更新");
+    // 重名 409
+    let r = client
+        .post(format!("{base}/api/v1/access-points"))
+        .bearer_auth(&tok)
+        .json(&serde_json::json!({"name": "ap-one", "bucket": "apb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    // 非法名 400
+    let r = client
+        .post(format!("{base}/api/v1/access-points"))
+        .bearer_auth(&tok)
+        .json(&serde_json::json!({"name": "Bad Name", "bucket": "apb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    // 列表/详情
+    let r = client
+        .get(format!("{base}/api/v1/access-points"))
+        .bearer_auth(&tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let rows: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    let r = client
+        .get(format!("{base}/api/v1/access-points/ap-one"))
+        .bearer_auth(&tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // 坏策略（Condition）→ 400
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-one/policy"))
+        .bearer_auth(&tok)
+        .json(
+            &serde_json::json!({"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+            "Action":"s3:GetObject","Resource":"arn:x","Condition":{}}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    // 合法清策略（null）→ 204
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-one/policy"))
+        .bearer_auth(&tok)
+        .json(&serde_json::json!(null))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    // 删除 → 404 + 缓存移除
+    let r = client
+        .delete(format!("{base}/api/v1/access-points/ap-one"))
+        .bearer_auth(&tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(st.ap_cache.get("ap-one").is_none());
+    let r = client
+        .get(format!("{base}/api/v1/access-points/ap-one"))
+        .bearer_auth(&tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}

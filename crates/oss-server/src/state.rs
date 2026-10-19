@@ -34,6 +34,36 @@ pub struct AppState {
     pub site: Arc<crate::db::SiteIdentity>,
     /// M7：`[site]` 是否配置（唯一开关；无 `[site]` 不挂站点路由语义、不可配对）
     pub site_enabled: bool,
+    /// M8 S1：访问点缓存（CRUD/桶删除负责失效；路由读路径 fail-closed）
+    pub ap_cache: Arc<xl_s3::ap::ApCache>,
+    /// M8 S1：AP ARN 的 region（取 `[site].region`，缺省 us-east-1）
+    pub ap_region: String,
+}
+
+/// M8 S0/S1：删桶清理的跨 crate 实现（Db 清表 + AP 缓存失效）。
+pub struct SqlBucketCleanup {
+    db: Arc<Db>,
+    ap_cache: Arc<xl_s3::ap::ApCache>,
+}
+
+impl SqlBucketCleanup {
+    pub fn new(db: Arc<Db>, ap_cache: Arc<xl_s3::ap::ApCache>) -> Self {
+        Self { db, ap_cache }
+    }
+}
+
+#[async_trait::async_trait]
+impl xl_s3::bucket_cleanup::BucketCleanupSink for SqlBucketCleanup {
+    async fn clear_bucket_m8(&self, bucket: &str) -> Result<(), String> {
+        self.db
+            .clear_bucket_m8(bucket)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn invalidate_ap_cache(&self, bucket: &str) {
+        self.ap_cache.invalidate_bucket(bucket);
+    }
 }
 
 /// 登录限速（C1）。**单进程内存态**（每节点独立，重启清零——限速非持久配额，重启放宽可接受）：
@@ -446,6 +476,26 @@ impl AppState {
                 .unwrap_or_else(|e| panic!("site_config 种子缺失/不可读: {e}")),
         );
         let site_enabled = cfg.site.is_some();
+        // M8 S1：AP 缓存预加载（坏策略行跳过并告警；运行期 source 查询会再 fail-closed）
+        let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
+        match db.list_access_points(None).await {
+            Ok(rows) => {
+                for r in rows {
+                    match xl_s3::ap::AccessPoint::from_row(
+                        r.name,
+                        r.bucket,
+                        r.owner_id,
+                        r.policy_json,
+                        &site.region,
+                    ) {
+                        Ok(ap) => ap_cache.put(ap),
+                        Err(e) => tracing::warn!(error = %e, "AP 预加载跳过非法策略行"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "AP 预加载失败（路由将按需查询）"),
+        }
+        let ap_region = site.region.clone();
         // except 只有 `/login`：console 路由经 nest 时 axum 的 StripPrefix 会先把
         // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
         // （`/aetherupload/display/login` 之类整段不匹配），照常校验。
@@ -526,6 +576,8 @@ impl AppState {
             repl_client,
             site,
             site_enabled,
+            ap_cache,
+            ap_region,
         }
     }
 }

@@ -21,6 +21,7 @@ use crate::events::{EventSink, EventSource, S3EventOp};
 use crate::lock::{apply_lock_out, bucket_lock_out, parse_bucket_lock_rule, parse_put_lock};
 use crate::sse::{parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out, sse_out_from_spec};
 
+#[derive(Clone)]
 pub struct OssS3 {
     store: Arc<Store>,
     /// 判权/记账（桶归属、可见性过滤）；授权门本体在 `S3ServiceBuilder::set_access`

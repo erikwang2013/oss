@@ -25,30 +25,46 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // 授权门：Acl 同时给 service（ListBuckets 过滤/建桶记账）与 access 层（set_access）
     // Task 9：集群时 Acl/SigV4Auth 接控制面读扇出（本地 miss → peers；写仍本地，M9 收口）
     let acl = state.acl();
-    let mut s3_builder = S3ServiceBuilder::new(
-        OssS3::new(
-            Arc::clone(&state.store),
-            acl.clone(),
-            state.cfg.max_put_bytes,
-        )
-        .with_events(Some(
-            Arc::clone(&state.events) as Arc<dyn xl_s3::events::EventSink>
-        ))
-        .with_replication(
-            Some(Arc::clone(&state.repl_sink) as Arc<dyn xl_s3::replication::ReplicationSink>),
-            Some(Arc::clone(&state.repl_store) as Arc<dyn xl_s3::replication::ReplicationStore>),
-        ),
-    );
+    let oss_s3 = OssS3::new(
+        Arc::clone(&state.store),
+        acl.clone(),
+        state.cfg.max_put_bytes,
+    )
+    .with_events(Some(
+        Arc::clone(&state.events) as Arc<dyn xl_s3::events::EventSink>
+    ))
+    .with_replication(
+        Some(Arc::clone(&state.repl_sink) as Arc<dyn xl_s3::replication::ReplicationSink>),
+        Some(Arc::clone(&state.repl_store) as Arc<dyn xl_s3::replication::ReplicationStore>),
+    )
+    .with_bucket_cleanup(Some(Arc::new(crate::state::SqlBucketCleanup::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.ap_cache),
+    ))
+        as Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>));
+    // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
+    let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
+    let mut s3_builder = S3ServiceBuilder::new(oss_s3);
     s3_builder.set_auth(
         SigV4Auth::with_mesh(state.db.pool().clone(), state.control_mesh())
             .with_vault(state.vault.clone()), // M5 切片 6：SK 解密/透明重写
     );
-    s3_builder.set_access(acl);
-    // M5 切片 5：STS 前置路由（POST / + form-urlencoded 拦为 AssumeRole/GetSessionToken；
-    // 校验签名后 req.credentials 已验证——StsRoute 直接以调用者 AK 为父）。
-    s3_builder.set_route(
+    s3_builder.set_access(acl.clone());
+    // M8 S1（N2）：AP 与 STS 共用一个 route 槽：先 AP，未命中委托 STS。
+    let sts: Arc<dyn s3s::route::S3Route> = Arc::new(
         xl_s3::sts::StsRoute::new(state.db.pool().clone()).with_vault(state.vault.clone()),
     );
+    let ap = xl_s3::ap::ApRoute::new(
+        Arc::clone(&state.ap_cache),
+        Arc::new(crate::access_points_api::DbApSource {
+            db: Arc::clone(&state.db),
+            region: state.ap_region.clone(),
+        }),
+        acl,
+        inner,
+    )
+    .with_fallback(sts);
+    s3_builder.set_route(ap);
     let s3 = s3_builder.build();
 
     // 控制面：`/api/v1` 整体走 jwt-rust 的 JwtLayer，`/login` 在 except 名单里

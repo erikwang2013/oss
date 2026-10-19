@@ -1,3 +1,4 @@
+pub mod access_points_api;
 pub mod aether;
 pub mod aether_gate;
 pub mod cli;

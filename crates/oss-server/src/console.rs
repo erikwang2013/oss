@@ -128,6 +128,8 @@ pub fn routes() -> Router<AppState> {
         // M8 S0：作业详情/控制（admin 或 requested_by）
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/{action}", post(job_action))
+        // M8 S1：访问点 CRUD/策略
+        .merge(crate::access_points_api::routes())
         .route(
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
@@ -375,6 +377,7 @@ fn default_task_limit() -> i64 {
 }
 
 /// 作业读权限：admin，或该作业的 `requested_by`。
+#[allow(clippy::result_large_err)]
 async fn job_access(state: &AppState, payload: &JwtPayload, id: i64) -> Result<(), Response> {
     let (uid, is_admin) = who(state, payload).await?;
     match state.db.job_owner(id).await {

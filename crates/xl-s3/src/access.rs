@@ -654,7 +654,7 @@ impl Acl {
         &self,
         user: AuthedUser,
         action: Action,
-        bucket: &Option<String>,
+        bucket: Option<&str>,
     ) -> Result<bool, S3Error> {
         match bucket {
             Some(b) => self.can(user, action, b).await.map_err(acl_err),
@@ -671,31 +671,21 @@ pub(crate) fn acl_err(e: sqlx::Error) -> S3Error {
 
 /// s3s 的授权入口：`check` 在反序列化**前**对每个请求执行（我们已 `set_auth` → 恒走；
 /// per-op 方法默认 Ok 是叠加非替代，无需实现）。判据与三面共用的 [`Acl::can`] 同源；匿名一律拒。
-#[async_trait::async_trait]
-impl S3Access for Acl {
-    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        // 先克隆 AK（credentials() 借自 cx，与随后的 extensions_mut 冲突）
-        let Some(ak) = cx.credentials().map(|c| c.access_key.clone()) else {
-            return Err(s3s::s3_error!(AccessDenied, "Authentication required"));
-        };
-        let user = self
-            .user_of_key(&ak)
-            .await
-            .map_err(acl_err)?
-            .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
-        // handler 读取：ListBuckets 过滤 / CreateBucket 记账 / DeleteObjects 逐键复评
-        //（随请求搬进 S3Request.extensions）
-        cx.extensions_mut().insert(user.clone());
-        // 管理员旁路**表级三档**，但不再提前 return：桶策略的显式 Deny 对管理员同样生效
-        // （AWS 语义），且管理员请求照常落审计。旧实现此处直接 Ok，Deny 与审计双双落空
-        // （verifier 阻断 2——两侧都要，admin 与子账户各自被检查项覆盖）。
+impl Acl {
+    /// M8 S1：把 `check` 的判定主体抽成可复用方法（AP 路由用；`check` 包装后照常审计）。
+    /// `copy_src` = 已解析的 (源桶, 源键)，仅 CopyObject 使用；返回 (allow, detail)。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn check_op(
+        &self,
+        user: &AuthedUser,
+        ak: &str,
+        op: &str,
+        bucket: Option<&str>,
+        key: Option<&str>,
+        copy_src: Option<(&str, &str)>,
+    ) -> S3Result<(bool, Option<String>)> {
         let is_admin = user.is_admin;
 
-        let op = cx.s3_op().name();
-        // 桶名必须用 `get_bucket_name()`：`as_bucket()` 只匹配 `S3Path::Bucket` 变体，
-        // 对象路径（`Object{bucket,key}`）会返回 None——用它会把一切对象级 op 误判成
-        // 「无桶」而全拒（子账户实弹 403 的根因，管理员旁路曾掩盖）。
-        let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
         // DeleteObjects：对象键在请求体里，check 阶段拿不到 → 授权**整体下放 handler 逐键**
         //（service.rs::delete_objects 对每个键跑 policy×表三档，与单键删同口径；AWS 亦逐键
         // 授权）。此处只保身份与下面审计，避免「批量删绕过前缀 Deny」（verifier 阻断 1c）
@@ -721,24 +711,19 @@ impl S3Access for Acl {
                         Some(b) => (self.is_owner(b, user.uid).await.map_err(acl_err)?, true),
                         None => (false, true),
                     },
-                    Gate::Need(action) => (self.can_opt(gate_user, action, &bucket).await?, true),
+                    Gate::Need(action) => (self.can_opt(gate_user, action, bucket).await?, true),
                     Gate::Copy => {
                         // 目标写 + 源读（源在 header；用 s3s 的解析器——header 是 URL 编码
                         // 且有 / 前导与 ?versionId 形态，解析失败与反序列化同判，直接拒绝）
                         let dst = self
-                            .can_opt(gate_user.clone(), Action::Write, &bucket)
+                            .can_opt(gate_user.clone(), Action::Write, bucket)
                             .await?;
-                        let src = match cx
-                            .headers()
-                            .get(X_AMZ_COPY_SOURCE)
-                            .and_then(|v| v.to_str().ok())
-                            .map(CopySource::parse)
-                        {
-                            Some(Ok(CopySource::Bucket { bucket, .. })) => self
-                                .can(gate_user, Action::Read, &bucket)
+                        let src = match copy_src {
+                            Some((src_bucket, _)) => self
+                                .can(gate_user, Action::Read, src_bucket)
                                 .await
                                 .map_err(acl_err)?,
-                            _ => false,
+                            None => false,
                         };
                         (dst, src)
                     }
@@ -750,17 +735,16 @@ impl S3Access for Acl {
         // 策略无关——旧实现把 src 评估嵌在 dst 有策略分支内，dst 无策略时 src Deny 被完全
         // 跳过：verifier 阻断 1a）。策略读/解析失败按轴 fail-closed 拒（不静默放行）。
         // 未映射 op（s3_action None）不参与。匿名放行未实现——记档于 policy.rs 头注。
-        let key: Option<String> = cx.s3_path().as_object().map(|(_, k)| k.to_string());
         let (mut saw_deny, mut saw_error, mut saw_allow) = (false, false, false);
         if !delegated && let Some(b) = &bucket {
             match self.bucket_policy(b).await {
                 Ok(Some(doc)) => {
                     let pr = crate::policy::PolicyRequest {
                         op,
-                        ak: &ak,
+                        ak,
                         uid: user.uid,
                         bucket: b,
-                        key: key.as_deref(),
+                        key,
                     };
                     // CopyObject 的目标桶策略管目标写（不走 s3_action 通用映射）
                     let act = if op == "CopyObject" {
@@ -793,24 +777,15 @@ impl S3Access for Acl {
         if op == "CopyObject" {
             // 源桶策略管源读，**独立于目标桶策略**评估（Deny 优先：src Deny 压过 dst Allow
             // ——否则有目标桶写权者可绕过源桶 Deny 拷贝机密）。源桶策略读取失败同样 fail-closed。
-            if let Some(Ok(CopySource::Bucket {
-                bucket: src_bucket,
-                key: src_key,
-                ..
-            })) = cx
-                .headers()
-                .get(X_AMZ_COPY_SOURCE)
-                .and_then(|v| v.to_str().ok())
-                .map(CopySource::parse)
-            {
-                match self.bucket_policy(&src_bucket).await {
+            if let Some((src_bucket, src_key)) = copy_src {
+                match self.bucket_policy(src_bucket).await {
                     Ok(Some(sdoc)) => {
                         let spr = crate::policy::PolicyRequest {
                             op,
-                            ak: &ak,
+                            ak,
                             uid: user.uid,
-                            bucket: &src_bucket,
-                            key: Some(&src_key),
+                            bucket: src_bucket,
+                            key: Some(src_key),
                         };
                         if let Some(sa) = crate::policy::s3_action("GetObject") {
                             match crate::policy::evaluate(&sdoc, &spr, sa) {
@@ -842,39 +817,21 @@ impl S3Access for Acl {
         let mut session_detail: Option<&'static str> = None;
         if !delegated && let Some(b) = &bucket {
             // CopyObject 源解析一次持有（String 落外层作用域，PolicyRequest 借之）
-            let copy_src: Option<(String, String)> = if op == "CopyObject" {
-                match cx
-                    .headers()
-                    .get(X_AMZ_COPY_SOURCE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(CopySource::parse)
-                {
-                    Some(Ok(CopySource::Bucket { bucket, key, .. })) => {
-                        Some((bucket.to_string(), key.to_string()))
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let src_pr =
-                copy_src
-                    .as_ref()
-                    .map(|(src_bucket, src_key)| crate::policy::PolicyRequest {
-                        op,
-                        ak: &ak,
-                        uid: user.uid,
-                        bucket: src_bucket,
-                        key: Some(src_key),
-                    });
+            let src_pr = copy_src.map(|(src_bucket, src_key)| crate::policy::PolicyRequest {
+                op,
+                ak,
+                uid: user.uid,
+                bucket: src_bucket,
+                key: Some(src_key),
+            });
             let ((d, s), detail) = self
                 .fuse_session(
                     crate::policy::PolicyRequest {
                         op,
-                        ak: &ak,
+                        ak,
                         uid: user.uid,
                         bucket: b,
-                        key: key.as_deref(),
+                        key,
                     },
                     src_pr,
                     allow_dst,
@@ -909,6 +866,56 @@ impl S3Access for Acl {
             (None, Some(s)) => Some(s.to_string()),
             (None, None) => None,
         };
+        Ok((allow_dst && allow_src, detail))
+    }
+}
+
+#[async_trait::async_trait]
+impl S3Access for Acl {
+    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // 先克隆 AK（credentials() 借自 cx，与随后的 extensions_mut 冲突）
+        let Some(ak) = cx.credentials().map(|c| c.access_key.clone()) else {
+            return Err(s3s::s3_error!(AccessDenied, "Authentication required"));
+        };
+        let user = self
+            .user_of_key(&ak)
+            .await
+            .map_err(acl_err)?
+            .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
+        // handler 读取：ListBuckets 过滤 / CreateBucket 记账 / DeleteObjects 逐键复评
+        //（随请求搬进 S3Request.extensions）
+        cx.extensions_mut().insert(user.clone());
+        // 管理员旁路**表级三档**，但不再提前 return：桶策略的显式 Deny 对管理员同样生效
+        // （AWS 语义），且管理员请求照常落审计。旧实现此处直接 Ok，Deny 与审计双双落空
+        // （verifier 阻断 2——两侧都要，admin 与子账户各自被检查项覆盖）。
+        let op = cx.s3_op().name();
+        let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
+        let key: Option<String> = cx.s3_path().as_object().map(|(_, k)| k.to_string());
+        let copy_src: Option<(String, String)> = if op == "CopyObject" {
+            match cx
+                .headers()
+                .get(X_AMZ_COPY_SOURCE)
+                .and_then(|v| v.to_str().ok())
+                .map(CopySource::parse)
+            {
+                Some(Ok(CopySource::Bucket { bucket, key, .. })) => {
+                    Some((bucket.to_string(), key.to_string()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (allow, detail) = self
+            .check_op(
+                &user,
+                &ak,
+                op,
+                bucket.as_deref(),
+                key.as_deref(),
+                copy_src.as_ref().map(|(b, k)| (b.as_str(), k.as_str())),
+            )
+            .await?;
 
         // 审计（允许与拒绝都记；failed 只 warn——审计不可用时不得反向影响判定）
         if let Err(e) = self
