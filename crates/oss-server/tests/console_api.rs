@@ -13,9 +13,13 @@ async fn serve(app: axum::Router) -> String {
 
 /// 用 common::state 的固定口令建的用户换一个 token（用例需先 create_user）。
 async fn login_token(base: &str) -> String {
+    login_as(base, "erik", "pw").await
+}
+
+async fn login_as(base: &str, username: &str, password: &str) -> String {
     let login: serde_json::Value = reqwest::Client::new()
         .post(format!("{base}/api/v1/login"))
-        .json(&serde_json::json!({"username": "erik", "password": "pw"}))
+        .json(&serde_json::json!({"username": username, "password": password}))
         .send()
         .await
         .unwrap()
@@ -829,4 +833,158 @@ async fn access_points_api_crud() {
         .await
         .unwrap();
     assert_eq!(r.status(), 404);
+}
+
+/// M8 S2：变换器配置 API（owner/admin、参数校验、缓存同步、删 AP/删桶级联）。
+#[tokio::test]
+async fn access_point_transform_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store.create_bucket("apb").await.unwrap();
+    st.db.insert_bucket("apb", None).await.unwrap();
+    let app = build_router(st.clone()).unwrap();
+    let client = reqwest::Client::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+
+    let r = client
+        .post(format!("{base}/api/v1/access-points"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"name": "ap-one", "bucket": "apb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    // 未配置 → 404
+    let r = client
+        .get(format!("{base}/api/v1/access-points/ap-one/transform"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    // 非桶主非管理员 → 403
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-one/transform"))
+        .bearer_auth(&bob)
+        .json(&serde_json::json!({"kind": "http", "endpoint": "http://example.com/x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    // 未知字段由 serde 拒绝（axum JSON 数据错误 → 422）
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-one/transform"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"kind": "http", "endpoint": "http://example.com/x", "extra": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    // 参数校验：kind、kind 与字段组合、URL 形状、限额
+    for bad in [
+        serde_json::json!({"kind": "ftp", "endpoint": "http://example.com/x"}),
+        serde_json::json!({"kind": "http", "endpoint": "http://example.com/x", "module_b64": "KG1vZHVsZSk="}),
+        serde_json::json!({"kind": "http"}),
+        serde_json::json!({"kind": "wasm", "endpoint": "http://example.com/x", "module_b64": "KG1vZHVsZSk="}),
+        serde_json::json!({"kind": "wasm"}),
+        serde_json::json!({"kind": "http", "endpoint": "ftp://example.com/x"}),
+        serde_json::json!({"kind": "http", "endpoint": "http://u:p@example.com/x"}),
+        serde_json::json!({"kind": "http", "endpoint": "http://example.com/x", "timeout_ms": 10}),
+        serde_json::json!({"kind": "http", "endpoint": "http://example.com/x", "max_response_bytes": 0}),
+    ] {
+        let r = client
+            .put(format!("{base}/api/v1/access-points/ap-one/transform"))
+            .bearer_auth(&admin)
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+    // 合法保存 → 204 + 缓存/DB 同步；GET 只回摘要（不回模块字节）
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-one/transform"))
+        .bearer_auth(&admin)
+        .json(
+            &serde_json::json!({"kind": "http", "endpoint": "http://example.com/x",
+            "timeout_ms": 2000, "max_response_bytes": 1024}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(st.olap_cache.get("ap-one").is_some(), "缓存未更新");
+    let row = st.db.get_olap_config("ap-one").await.unwrap().unwrap();
+    assert_eq!(row.kind, "http");
+    let r = client
+        .get(format!("{base}/api/v1/access-points/ap-one/transform"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cfg: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(cfg["kind"], "http");
+    assert_eq!(cfg["endpoint"], "http://example.com/x");
+    assert_eq!(cfg["timeout_ms"], 2000);
+    assert_eq!(cfg["max_response_bytes"], 1024);
+    assert!(cfg["module_sha256"].is_null());
+    assert!(cfg["module_size"].is_null());
+    // WASM：默认关闭时保存即拒；开启 feature 时合法空模块可编译（运行期导出缺失另行报错）
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-one/transform"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"kind": "wasm", "module_b64": "KG1vZHVsZSk="}))
+        .send()
+        .await
+        .unwrap();
+    #[cfg(not(feature = "olap-wasm"))]
+    assert_eq!(r.status(), 400);
+    #[cfg(feature = "olap-wasm")]
+    assert_eq!(r.status(), 204);
+    // 删 AP → 两缓存 + DB 行一并清
+    let r = client
+        .delete(format!("{base}/api/v1/access-points/ap-one"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(st.olap_cache.get("ap-one").is_none());
+    assert!(st.db.get_olap_config("ap-one").await.unwrap().is_none());
+    // 删桶级联：AP/变换器行与两缓存都失效
+    let r = client
+        .post(format!("{base}/api/v1/access-points"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"name": "ap-two", "bucket": "apb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let r = client
+        .put(format!("{base}/api/v1/access-points/ap-two/transform"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"kind": "http", "endpoint": "http://example.com/y"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(st.olap_cache.get("ap-two").is_some());
+    let r = client
+        .delete(format!("{base}/api/v1/buckets/apb"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(st.ap_cache.get("ap-two").is_none());
+    assert!(st.olap_cache.get("ap-two").is_none());
+    assert!(st.db.get_olap_config("ap-two").await.unwrap().is_none());
 }
