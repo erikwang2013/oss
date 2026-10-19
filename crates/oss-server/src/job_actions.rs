@@ -1,0 +1,460 @@
+//! M8 S3：Batch Operations（清单解析 + 五种动作 + 副作用钩子）。
+//!
+//! 创建期授权/快照在 [`crate::job_actions_api`]；本模块只负责：清单 CSV、单任务载荷、
+//! [`BatchExecutor`]（执行前按**当时的**身份/策略再授权一次，失败留给引擎按重试上限收敛
+//! 为 PermanentFailure，不中断作业）。Batch 不发桶通知；副作用只走 [`BatchMutationHooks`]
+//! （复制入队 + tier 远端回收），与在线写路径同一组 sink。
+//!
+//! 动作语义：Copy 只读源（可带 versionId），目标键 = `target.prefix + 原 key`，标签/元数据
+//! 按 Copy 语义复制；ReplaceTags 对清单对象自身整体替换标签；Delete 的 tier refs 交 GC；
+//! Restore 等价 S3 RestoreObject（Restoring/Restored → 幂等成功）；InvokeLambda 只接受
+//! HTTP 变换器，输出丢弃。
+
+use std::sync::Arc;
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+use xl_s3::access::{Acl, AuthedUser};
+use xl_s3::olap::{OlapCache, OlapInput, acquire_transform_slot};
+use xl_s3::replication::{ReplicationSink, WriteInfo};
+use xl_s3::restore::RestoreSink;
+use xl_s3::tier_gc::TierGcSink;
+use xl_store::meta::ObjectTag;
+use xl_store::store::{DeleteOutcome, Store};
+
+use crate::db::Db;
+use crate::jobs::TaskExecutor;
+
+/// 清单对象上限（与 S3 Batch 一致）。
+pub(crate) const MAX_MANIFEST_BYTES: usize = 16 << 20;
+/// 单作业任务上限。
+pub(crate) const MAX_MANIFEST_ROWS: usize = 10_000;
+
+pub const BATCH_COPY: &str = "BatchCopyObject";
+pub const BATCH_DELETE: &str = "BatchDeleteObject";
+pub const BATCH_TAGS: &str = "BatchReplaceTags";
+pub const BATCH_RESTORE: &str = "BatchRestoreObject";
+pub const BATCH_INVOKE: &str = "BatchInvokeLambda";
+
+/// 创建期错误 → HTTP（与控制台其余 handler 同口径：403 纯文本、500 泛化）。
+#[derive(Debug)]
+pub enum BatchError {
+    Invalid(String),
+    Denied(String),
+    NotFound(String),
+    Quota(String),
+    Internal(String),
+}
+
+impl IntoResponse for BatchError {
+    fn into_response(self) -> Response {
+        let (code, msg) = match self {
+            BatchError::Invalid(m) => (StatusCode::BAD_REQUEST, m),
+            BatchError::Denied(m) => (StatusCode::FORBIDDEN, m),
+            BatchError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            BatchError::Quota(m) => (StatusCode::TOO_MANY_REQUESTS, m),
+            BatchError::Internal(m) => {
+                tracing::error!(error = %m, "batch 创建失败");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            }
+        };
+        (code, msg).into_response()
+    }
+}
+
+/// 清单一行（创建时快照进 `job_tasks.payload_json`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestRow {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// 解析 `bucket,key[,versionId]` CSV：容忍 BOM/表头/CRLF，允许引号字段；
+/// 空行跳过；键逐行 `validate_key`；非法行整单 400。
+pub fn parse_manifest(bytes: &[u8]) -> Result<Vec<ManifestRow>, BatchError> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(bytes);
+    let mut rows: Vec<ManifestRow> = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec.map_err(|e| BatchError::Invalid(format!("清单 CSV 解析失败: {e}")))?;
+        if rec.iter().all(|f| f.trim().is_empty()) {
+            continue;
+        }
+        let line = rec.position().map(|p| p.line()).unwrap_or(0);
+        if rows.is_empty()
+            && rec
+                .get(0)
+                .is_some_and(|f| f.trim().eq_ignore_ascii_case("bucket"))
+            && rec
+                .get(1)
+                .is_some_and(|f| f.trim().eq_ignore_ascii_case("key"))
+        {
+            continue; // 表头只容首行
+        }
+        if rec.len() < 2 || rec.len() > 3 {
+            return Err(BatchError::Invalid(format!(
+                "清单第 {line} 行：需要 bucket,key[,versionId]"
+            )));
+        }
+        let bucket = rec[0].trim();
+        let key = &rec[1];
+        if bucket.is_empty() || key.is_empty() {
+            return Err(BatchError::Invalid(format!("清单第 {line} 行：桶或键为空")));
+        }
+        xl_store::layout::validate_bucket(bucket)
+            .map_err(|e| BatchError::Invalid(format!("清单第 {line} 行：{e}")))?;
+        xl_store::layout::validate_key(key)
+            .map_err(|e| BatchError::Invalid(format!("清单第 {line} 行：{e}")))?;
+        let version_id = rec
+            .get(2)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        rows.push(ManifestRow {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+        });
+        if rows.len() > MAX_MANIFEST_ROWS {
+            return Err(BatchError::Invalid(format!(
+                "清单超过 {MAX_MANIFEST_ROWS} 行上限"
+            )));
+        }
+    }
+    if rows.is_empty() {
+        return Err(BatchError::Invalid("清单为空".into()));
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOp {
+    Copy,
+    Delete,
+    ReplaceTags,
+    Restore,
+    Invoke,
+}
+
+impl BatchOp {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "CopyObject" | "Copy" => Self::Copy,
+            "DeleteObject" | "Delete" => Self::Delete,
+            "ReplaceTags" | "PutObjectTagging" => Self::ReplaceTags,
+            "RestoreObject" | "Restore" => Self::Restore,
+            "InvokeLambda" => Self::Invoke,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn action(self) -> &'static str {
+        match self {
+            Self::Copy => BATCH_COPY,
+            Self::Delete => BATCH_DELETE,
+            Self::ReplaceTags => BATCH_TAGS,
+            Self::Restore => BATCH_RESTORE,
+            Self::Invoke => BATCH_INVOKE,
+        }
+    }
+}
+
+/// 单任务载荷：`TaskExecutor` 拿不到 job_id/请求体，所有参数都在这里。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BatchActionPayload {
+    pub bucket: String,
+    pub key: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    /// 创建者 uid（执行前复验身份，见模块头注）。
+    pub uid: i64,
+    #[serde(default)]
+    pub target_bucket: Option<String>,
+    #[serde(default)]
+    pub target_prefix: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<ObjectTag>,
+    #[serde(default)]
+    pub restore_days: Option<u32>,
+    #[serde(default)]
+    pub transform_access_point: Option<String>,
+}
+
+/// 写路径副作用（N13）：复制入队与 tier 远端回收都复用在线路径的同一组 sink。
+pub struct BatchMutationHooks {
+    pub repl: Arc<dyn ReplicationSink>,
+    pub tier_gc: Arc<dyn TierGcSink>,
+}
+
+/// `Batch*` 动作执行器。
+pub struct BatchExecutor {
+    db: Arc<Db>,
+    store: Arc<Store>,
+    acl: Acl,
+    restore: Arc<dyn RestoreSink>,
+    olap: Arc<OlapCache>,
+    hooks: BatchMutationHooks,
+}
+
+impl BatchExecutor {
+    pub fn new(
+        db: Arc<Db>,
+        store: Arc<Store>,
+        acl: Acl,
+        restore: Arc<dyn RestoreSink>,
+        olap: Arc<OlapCache>,
+        hooks: BatchMutationHooks,
+    ) -> Self {
+        Self {
+            db,
+            store,
+            acl,
+            restore,
+            olap,
+            hooks,
+        }
+    }
+
+    async fn versioned(&self, bucket: &str) -> Result<bool, String> {
+        self.db
+            .get_bucket_versioning(bucket)
+            .await
+            .map(|s| s == "Enabled")
+            .map_err(|e| e.to_string())
+    }
+
+    /// 执行前复验：创建者仍有效 + 当前策略仍允许。失败即 Err（引擎收敛为 PermanentFailure）。
+    async fn author(
+        &self,
+        p: &BatchActionPayload,
+        op: &str,
+        bucket: &str,
+        key: &str,
+        copy_src: Option<(&str, &str)>,
+    ) -> Result<AuthedUser, String> {
+        let Some((_, is_admin, active)) =
+            self.db.get_user(p.uid).await.map_err(|e| e.to_string())?
+        else {
+            return Err("创建者账号已不存在".into());
+        };
+        if !active {
+            return Err("创建者账号已停用".into());
+        }
+        let user = AuthedUser {
+            uid: p.uid,
+            is_admin,
+            ak: String::new(),
+        };
+        match self
+            .acl
+            .check_op(&user, "", op, Some(bucket), Some(key), copy_src)
+            .await
+        {
+            Ok((true, _)) => Ok(user),
+            Ok((false, detail)) => {
+                Err(detail.unwrap_or_else(|| format!("无权 {op} {bucket}/{key}")))
+            }
+            Err(e) => Err(format!("判权失败: {e}")),
+        }
+    }
+
+    async fn copy(&self, p: &BatchActionPayload) -> Result<String, String> {
+        let dst_bucket = p.target_bucket.as_deref().ok_or("缺少目标桶")?;
+        let dst_key = format!("{}{}", p.target_prefix.as_deref().unwrap_or(""), p.key);
+        self.author(
+            p,
+            "CopyObject",
+            dst_bucket,
+            &dst_key,
+            Some((&p.bucket, &p.key)),
+        )
+        .await?;
+        let (info, bytes) = match &p.version_id {
+            Some(v) => {
+                self.store
+                    .get_object_version_ext(&p.bucket, &p.key, v, None)
+                    .await
+            }
+            None => self.store.get_object_ext(&p.bucket, &p.key, None).await,
+        }
+        .map_err(|e| e.to_string())?;
+        let versioned = self.versioned(dst_bucket).await?;
+        let tags = (!info.tags.is_empty()).then(|| info.tags.clone());
+        let out = self
+            .store
+            .put_object_stream_with_meta(
+                dst_bucket,
+                &dst_key,
+                Box::pin(futures::stream::once(async move { Ok(bytes) })),
+                info.content_type.clone(),
+                info.user_metadata.clone(),
+                None,
+                versioned,
+                None,
+                None,
+                tags,
+                info.storage_class.clone(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.hooks
+            .repl
+            .on_write(WriteInfo {
+                bucket: dst_bucket,
+                key: &dst_key,
+                version_id: out.version_id.as_deref(),
+                etag: &out.etag,
+                size: out.size,
+                is_delete_marker: false,
+                is_replica: false,
+            })
+            .await;
+        Ok("Succeeded".into())
+    }
+
+    async fn delete(&self, p: &BatchActionPayload) -> Result<String, String> {
+        self.author(p, "DeleteObject", &p.bucket, &p.key, None)
+            .await?;
+        let versioned = self.versioned(&p.bucket).await?;
+        let outcome = self
+            .store
+            .delete_object_versioned(&p.bucket, &p.key, p.version_id.as_deref(), versioned)
+            .await
+            .map_err(|e| e.to_string())?;
+        let refs = match outcome {
+            DeleteOutcome::Version { tier: Some(t), .. } => vec![t],
+            DeleteOutcome::Object { tiers } => tiers,
+            _ => Vec::new(),
+        };
+        if !refs.is_empty()
+            && let Err(e) = self.hooks.tier_gc.delete(&refs).await
+        {
+            tracing::warn!(bucket = %p.bucket, key = %p.key, error = %e, "batch 删对象后清 tier 失败");
+        }
+        Ok("Succeeded".into())
+    }
+
+    async fn replace_tags(&self, p: &BatchActionPayload) -> Result<String, String> {
+        self.author(p, "PutObjectTagging", &p.bucket, &p.key, None)
+            .await?;
+        self.store
+            .set_object_tags(&p.bucket, &p.key, p.version_id.as_deref(), p.tags.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok("Succeeded".into())
+    }
+
+    async fn restore(&self, p: &BatchActionPayload) -> Result<String, String> {
+        self.author(p, "RestoreObject", &p.bucket, &p.key, None)
+            .await?;
+        let version_id = match &p.version_id {
+            Some(v) => v.clone(),
+            None => self
+                .store
+                .head_object(&p.bucket, &p.key)
+                .await
+                .map_err(|e| e.to_string())?
+                .version_id
+                .unwrap_or_else(|| "null".to_string()),
+        };
+        match self
+            .store
+            .mark_restore_pending(&p.bucket, &p.key, &version_id)
+            .await
+        {
+            // Restoring/Restored：幂等成功（在线路径此处 409；Batch 语义记档）。
+            Err(xl_store::error::Error::RestoreAlreadyInProgress(_)) => Ok("Succeeded".into()),
+            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                if let Err(e) = self
+                    .restore
+                    .enqueue_restore(&p.bucket, &p.key, &version_id, p.restore_days.unwrap_or(1))
+                    .await
+                {
+                    let _ = self
+                        .store
+                        .abort_restore(&p.bucket, &p.key, &version_id)
+                        .await;
+                    return Err(format!("Restore 入队失败: {e}"));
+                }
+                Ok("Succeeded".into())
+            }
+        }
+    }
+
+    async fn invoke(&self, p: &BatchActionPayload) -> Result<String, String> {
+        let user = self.author(p, "GetObject", &p.bucket, &p.key, None).await?;
+        let ap = p
+            .transform_access_point
+            .as_deref()
+            .ok_or("缺少 transform_access_point")?;
+        let Some(row) = self
+            .db
+            .get_access_point(ap)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Err(format!("access point {ap} 不存在"));
+        };
+        if !user.is_admin && row.owner_id != user.uid {
+            return Err("transform access point 需 owner/admin".into());
+        }
+        // 配置可能在创建后被改成 wasm：执行前复核一次。
+        let cfg = self
+            .db
+            .get_olap_config(ap)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("transform access point 未配置变换器")?;
+        if cfg.kind != "http" {
+            return Err("仅支持 http 变换器（WASM 不支持）".into());
+        }
+        let t = self
+            .olap
+            .get(ap)
+            .map_err(|e| e.to_string())?
+            .ok_or("变换器未加载（配置更新后重试）")?;
+        let (info, bytes) = self
+            .store
+            .get_object_ext(&p.bucket, &p.key, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let slot = acquire_transform_slot().await?;
+        t.transform(
+            OlapInput {
+                bucket: &p.bucket,
+                key: &p.key,
+                version_id: info.version_id.as_deref(),
+                etag: Some(&info.etag),
+                bytes,
+            },
+            &slot,
+        )
+        .await?; // 输出丢弃
+        Ok("Succeeded".into())
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for BatchExecutor {
+    async fn execute(&self, action: &str, payload: &str) -> Result<String, String> {
+        let p: BatchActionPayload =
+            serde_json::from_str(payload).map_err(|e| format!("payload 非法: {e}"))?;
+        match action {
+            BATCH_COPY => self.copy(&p).await,
+            BATCH_DELETE => self.delete(&p).await,
+            BATCH_TAGS => self.replace_tags(&p).await,
+            BATCH_RESTORE => self.restore(&p).await,
+            BATCH_INVOKE => self.invoke(&p).await,
+            other => Err(format!("未注册的作业动作: {other}")),
+        }
+    }
+}

@@ -163,11 +163,12 @@ pub async fn worker_once(
 }
 
 /// 作业终态且有 `report_prefix` 时写 `<prefix>/<job_id>/results.csv`（幂等覆盖）。
+/// `kind=batch` 用 S3 报告列；其余作业保留引擎通用列。取消后也落一次报告（未执行任务不进报告）。
 async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), String> {
     let Some(job) = db.job_get(job_id).await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
-    if job["state"] != "done" && job["state"] != "error" {
+    if !matches!(job["state"].as_str(), Some("done" | "error" | "cancelled")) {
         return Ok(());
     }
     let Some(bucket) = job["report_bucket"].as_str() else {
@@ -176,32 +177,79 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
     let Some(prefix) = job["report_prefix"].as_str() else {
         return Ok(());
     };
-    // 分页取全量任务（上限 10000，S3 创建时已限）
-    let mut rows = Vec::new();
-    let mut offset = 0i64;
-    loop {
-        let page = db
-            .job_tasks(job_id, offset, 500)
-            .await
-            .map_err(|e| e.to_string())?;
-        if page.is_empty() {
-            break;
-        }
-        offset += page.len() as i64;
-        rows.extend(page);
-    }
     let mut w = csv::Writer::from_writer(Vec::new());
-    w.write_record(["task_no", "action", "state", "result_code", "result_string"])
-        .map_err(|e| e.to_string())?;
-    for r in &rows {
+    if job["kind"].as_str() == Some("batch") {
         w.write_record([
-            r["task_no"].to_string(),
-            r["action"].as_str().unwrap_or("").to_string(),
-            r["state"].as_str().unwrap_or("").to_string(),
-            r["result_code"].as_str().unwrap_or("").to_string(),
-            r["result_string"].as_str().unwrap_or("").to_string(),
+            "taskId",
+            "bucket",
+            "key",
+            "versionId",
+            "resultCode",
+            "resultString",
+            "startTime",
+            "endTime",
         ])
         .map_err(|e| e.to_string())?;
+        for r in db
+            .job_report_rows(job_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            // 取消时未执行（从未 started）的任务不进报告
+            let (Some(started), finished) = (r["started_at"].as_i64(), r["finished_at"].as_i64())
+            else {
+                continue;
+            };
+            let p: Option<crate::job_actions::BatchActionPayload> =
+                serde_json::from_str(r["payload_json"].as_str().unwrap_or("")).ok();
+            let (b, k, v) = p
+                .map(|p| (p.bucket, p.key, p.version_id.unwrap_or_default()))
+                .unwrap_or_default();
+            let code = r["result_code"].as_str().unwrap_or("");
+            let string = match r["result_string"].as_str() {
+                Some(s) => s.to_string(),
+                None if code == "Succeeded" => "Succeeded".to_string(),
+                None => String::new(),
+            };
+            w.write_record([
+                r["task_no"].to_string(),
+                b,
+                k,
+                v,
+                code.to_string(),
+                string,
+                iso8601_secs(started),
+                finished.map(iso8601_secs).unwrap_or_default(),
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+    } else {
+        // 分页取全量任务（上限 10000，S3 创建时已限）
+        let mut rows = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = db
+                .job_tasks(job_id, offset, 500)
+                .await
+                .map_err(|e| e.to_string())?;
+            if page.is_empty() {
+                break;
+            }
+            offset += page.len() as i64;
+            rows.extend(page);
+        }
+        w.write_record(["task_no", "action", "state", "result_code", "result_string"])
+            .map_err(|e| e.to_string())?;
+        for r in &rows {
+            w.write_record([
+                r["task_no"].to_string(),
+                r["action"].as_str().unwrap_or("").to_string(),
+                r["state"].as_str().unwrap_or("").to_string(),
+                r["result_code"].as_str().unwrap_or("").to_string(),
+                r["result_string"].as_str().unwrap_or("").to_string(),
+            ])
+            .map_err(|e| e.to_string())?;
+        }
     }
     let bytes = w.into_inner().map_err(|e| e.to_string())?;
     let prefix = prefix.trim_matches('/');
@@ -238,4 +286,26 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
         let _ = db.job_set_error(job_id, &msg, crate::db::now()).await;
     }
     Ok(())
+}
+
+/// ISO8601 UTC（秒精度；库内时间戳本身就是秒）。
+fn iso8601_secs(t: i64) -> String {
+    let dt =
+        time::OffsetDateTime::from_unix_timestamp(t).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
+
+/// 取消等状态变更后立即落一次报告（失败只记日志；下一次任务收敛会重写）。
+pub(crate) async fn write_report_now(db: &Db, store: &Store, job_id: i64) {
+    if let Err(e) = maybe_write_report(db, store, job_id).await {
+        tracing::warn!(job_id, error = %e, "job 报告写入失败");
+    }
 }

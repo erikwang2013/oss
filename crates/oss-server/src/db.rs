@@ -3176,6 +3176,31 @@ impl Db {
         Ok(Some(new_id))
     }
 
+    /// 报告行（含 `payload_json`）：S3 Batch 报告需要从载荷回读 bucket/key/versionId。
+    /// 与 [`Self::job_tasks`] 分列——控制台分页不暴露内部载荷。
+    pub async fn job_report_rows(&self, id: i64) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT task_no, payload_json, result_code, result_string, started_at, finished_at \
+             FROM job_tasks WHERE job_id = ? ORDER BY task_no",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "task_no": r.get::<i64, _>("task_no"),
+                    "payload_json": r.get::<String, _>("payload_json"),
+                    "result_code": r.get::<Option<String>, _>("result_code"),
+                    "result_string": r.get::<Option<String>, _>("result_string"),
+                    "started_at": r.get::<Option<i64>, _>("started_at"),
+                    "finished_at": r.get::<Option<i64>, _>("finished_at"),
+                })
+            })
+            .collect())
+    }
+
     // ——— M8 S5：Inventory 配置与运行行 ———
 
     pub async fn inventory_config_count(&self, bucket: &str) -> Result<i64> {

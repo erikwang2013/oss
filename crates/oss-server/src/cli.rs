@@ -89,10 +89,11 @@ fn say(m: &str) {
     }
 }
 
-/// serve 的作业动作分派：Inventory 走 S5 生成器，其余落 M8 S4b 执行器。
+/// serve 的作业动作分派：Inventory 走 S5 生成器，Batch* 走 S3 执行器，其余落 M8 S4b。
 struct ServeTaskExecutor {
     tier: std::sync::Arc<crate::tier_jobs::M8TaskExecutor>,
     inventory: std::sync::Arc<crate::inventory::InventoryRunner>,
+    batch: std::sync::Arc<crate::job_actions::BatchExecutor>,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +101,8 @@ impl crate::jobs::TaskExecutor for ServeTaskExecutor {
     async fn execute(&self, action: &str, payload: &str) -> Result<String, String> {
         if action == "Inventory" {
             crate::jobs::TaskExecutor::execute(self.inventory.as_ref(), action, payload).await
+        } else if action.starts_with("Batch") {
+            crate::jobs::TaskExecutor::execute(self.batch.as_ref(), action, payload).await
         } else {
             crate::jobs::TaskExecutor::execute(self.tier.as_ref(), action, payload).await
         }
@@ -213,7 +216,7 @@ pub async fn run(
             );
             // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
             crate::lifecycle::spawn_audit_cleanup(state.clone());
-            // M8 S0：通用作业引擎（S4b 的 Transition/Restore + S5 Inventory；0 关闭）
+            // M8 S0：通用作业引擎（S4b 的 Transition/Restore + S3 Batch + S5 Inventory；0 关闭）
             let executor = std::sync::Arc::new(ServeTaskExecutor {
                 tier: std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
                     std::sync::Arc::clone(&state.db),
@@ -222,6 +225,19 @@ pub async fn run(
                     std::sync::Arc::clone(&state.events),
                 )),
                 inventory: std::sync::Arc::clone(&state.inventory_runner),
+                // Batch：与在线写路径共用同一组 sink（不发桶通知）
+                batch: std::sync::Arc::new(crate::job_actions::BatchExecutor::new(
+                    std::sync::Arc::clone(&state.db),
+                    std::sync::Arc::clone(&state.store),
+                    state.acl(),
+                    std::sync::Arc::clone(&state.restore_sink),
+                    std::sync::Arc::clone(&state.olap_cache),
+                    crate::job_actions::BatchMutationHooks {
+                        repl: state.repl_sink.clone()
+                            as std::sync::Arc<dyn xl_s3::replication::ReplicationSink>,
+                        tier_gc: std::sync::Arc::clone(&state.tier_gc),
+                    },
+                )),
             });
             crate::jobs::spawn_workers(
                 std::sync::Arc::clone(&state.db),
