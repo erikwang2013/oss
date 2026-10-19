@@ -140,8 +140,16 @@ pub fn routes() -> Router<AppState> {
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
         )
-        // M8 S4b：admin 强制跑一轮 Transition sweep
+        // M8 S4b：admin 强制跑一轮 Transition sweep；tier 只读状态（Task 6a 后端预备）
+        .route("/tiers", get(list_tiers))
         .route("/tiers/sweep", post(force_tier_sweep))
+        // Task 6a：桶默认加密读/写/清（与 S3 面同源）
+        .route(
+            "/buckets/{bucket}/encryption",
+            get(get_bucket_encryption)
+                .put(put_bucket_encryption)
+                .delete(delete_bucket_encryption),
+        )
         // M4 切片 7：桶策略（桶主或管理员）与审计（管理员）
         .route("/buckets/{bucket}/policy", get(get_policy).put(put_policy))
         // M8 S6 缺口 B：桶事件通知配置（S3 面同源）与一次性 Select 代理
@@ -1450,6 +1458,111 @@ async fn put_lifecycle(
     }
 }
 
+/// Task 6a：`[[tiers]]` 只读状态（管理员）。`healthy` = 哨兵键 HEAD 可达
+/// （404/无键也算可达——远端活着）；凭证字段绝不投影。
+async fn list_tiers(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let mut out = Vec::with_capacity(state.tiers.targets().len());
+    for t in state.tiers.targets() {
+        let healthy = match state.tiers.get(&t.id) {
+            Some(b) => b.head(".console-healthcheck").await.is_ok(),
+            None => false,
+        };
+        out.push(serde_json::json!({
+            "id": t.id.as_str(),
+            "endpoint": t.endpoint.as_str(),
+            "bucket": t.bucket.as_str(),
+            "healthy": healthy,
+        }));
+    }
+    Json(out).into_response()
+}
+
+#[derive(Deserialize)]
+struct BucketEncryptionBody {
+    algorithm: String,
+}
+
+/// Task 6a：桶默认加密只读（读权限；磁盘桶不存在 → 404；未配置 → algorithm:null）。
+async fn get_bucket_encryption(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+) -> Response {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
+        return r;
+    }
+    match state.store.bucket_exists(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "NoSuchBucket").into_response(),
+        Err(e) => return store_error(e).into_response(),
+    }
+    match state.acl().bucket_default_encryption(&bucket).await {
+        Ok(algorithm) => Json(serde_json::json!({ "algorithm": algorithm })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, bucket, "读桶默认加密失败");
+            internal_error()
+        }
+    }
+}
+
+/// Task 6a：设置桶默认加密（桶主/管理员）。仅 AES256 / aws:kms；0 行 → 500。
+async fn put_bucket_encryption(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    Json(body): Json<BucketEncryptionBody>,
+) -> Response {
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
+    }
+    if !matches!(body.algorithm.as_str(), "AES256" | "aws:kms") {
+        return (StatusCode::BAD_REQUEST, "algorithm 须为 AES256 或 aws:kms").into_response();
+    }
+    match state
+        .acl()
+        .set_bucket_default_encryption(&bucket, &body.algorithm)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => {
+            tracing::error!(bucket, "写桶默认加密无行（buckets 记录缺失）");
+            internal_error()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, bucket, "写桶默认加密失败");
+            internal_error()
+        }
+    }
+}
+
+/// Task 6a：清除桶默认加密（桶主/管理员，幂等）。
+async fn delete_bucket_encryption(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
+    }
+    match state.acl().clear_bucket_default_encryption(&bucket).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, bucket, "清桶默认加密失败");
+            internal_error()
+        }
+    }
+}
+
 /// M8 S4b：admin 强制 Transition sweep（返回本轮入队数）。
 async fn force_tier_sweep(
     State(state): State<AppState>,
@@ -1720,7 +1833,11 @@ async fn list_objects(
     match state.store.list_objects(&bucket, &req).await {
         Ok(r) => Json(serde_json::json!({
             "objects": r.objects.iter().map(|o| serde_json::json!({
-                "key": o.key, "size": o.size, "etag": o.etag, "content_type": o.content_type
+                "key": o.key, "size": o.size, "etag": o.etag, "content_type": o.content_type,
+                // Task 6a：Objects 页直接展示存储类/归档阶段/恢复到期，避免逐对象 HEAD
+                "storage_class": o.storage_class.as_deref(),
+                "tier_phase": o.tier_phase.map(|p| format!("{p:?}")),
+                "restore_expires_at": o.restore_expires_at,
             })).collect::<Vec<_>>(),
             "common_prefixes": r.common_prefixes,
             "is_truncated": r.is_truncated,

@@ -1700,3 +1700,298 @@ async fn policy_templates_listing() {
     let r = client.get(&url).send().await.unwrap();
     assert_eq!(r.status(), 401);
 }
+
+/// Task 6a：无 `[[tiers]]` → `[]`；普通用户 403。
+#[tokio::test]
+async fn tiers_list_empty_and_admin_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+
+    let r = client
+        .get(format!("{base}/api/v1/tiers"))
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "仅管理员可读");
+
+    let v: serde_json::Value = client
+        .get(format!("{base}/api/v1/tiers"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!([]));
+}
+
+/// Task 6a：tier 只读状态——404 哨兵 = 远端可达（healthy），连接失败 = false；不投影凭证。
+#[tokio::test]
+async fn tiers_list_health_without_credentials() {
+    use oss_server::config::TierTarget;
+
+    // 任意请求 404：HEAD 哨兵得 404 → tier_head 返回 Ok(None) → healthy
+    let mock = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    let target = |id: &str, endpoint: &str, bucket: &str| TierTarget {
+        id: id.into(),
+        endpoint: endpoint.into(),
+        bucket: bucket.into(),
+        access_key: "ak-secret".into(),
+        secret_key: "sk-secret".into(),
+        region: "us-east-1".into(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let st = common::state_with_tiers(
+        dir.path(),
+        vec![
+            target("cold", &format!("http://{addr}"), "tb"),
+            target("dead", "http://127.0.0.1:1", "tb2"),
+        ],
+    )
+    .await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_token(&base).await;
+
+    let v: Vec<serde_json::Value> = reqwest::Client::new()
+        .get(format!("{base}/api/v1/tiers"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v.len(), 2);
+    assert_eq!(v[0]["id"], "cold");
+    assert_eq!(v[0]["endpoint"], format!("http://{addr}"));
+    assert_eq!(v[0]["bucket"], "tb");
+    assert_eq!(v[0]["healthy"], true, "404 哨兵 = 远端可达");
+    assert_eq!(v[1]["id"], "dead");
+    assert_eq!(v[1]["healthy"], false, "连接失败 = 不健康");
+    for t in &v {
+        assert!(t.get("access_key").is_none() && t.get("secret_key").is_none());
+    }
+}
+
+/// Task 6a：桶默认加密控制台路由——读权限 GET、桶主/管理员写、404/400/403。
+#[tokio::test]
+async fn bucket_encryption_console_routes() {
+    use oss_server::db::PermissionRow;
+
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let bob_uid = st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store.create_bucket("encb").await.unwrap();
+    st.db.insert_bucket("encb", None).await.unwrap();
+    st.db
+        .set_permissions(
+            bob_uid,
+            &[PermissionRow {
+                bucket: "encb".into(),
+                read: true,
+                write: false,
+                delete: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/buckets/encb/encryption");
+
+    // 未配置 → null；有读权限的子账户可读
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!({"algorithm": null}));
+
+    // PUT AES256 → 204 → GET 往返
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"algorithm": "AES256"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["algorithm"], "AES256");
+
+    // 未知算法 400
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"algorithm": "aws:kms:dsse"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // 非桶主（仅有读权限）写/删 403
+    let r = client
+        .put(&url)
+        .bearer_auth(&bob)
+        .json(&serde_json::json!({"algorithm": "aws:kms"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = client.delete(&url).bearer_auth(&bob).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+
+    // DELETE → 204，回到 null
+    let r = client
+        .delete(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let v: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["algorithm"], serde_json::Value::Null);
+
+    // 缺桶 → GET/PUT/DELETE 均 404
+    let missing = format!("{base}/api/v1/buckets/ghost/encryption");
+    let r = client
+        .get(&missing)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = client
+        .put(&missing)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"algorithm": "AES256"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = client
+        .delete(&missing)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}
+
+/// Task 6a：对象列表带存储类/归档阶段/恢复到期（缺失为 null），供 Objects 页免 N+1。
+#[tokio::test]
+async fn object_list_includes_storage_and_tier_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.store.create_bucket("alpha").await.unwrap();
+    st.store
+        .put_object("alpha", "plain.txt", bytes::Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    st.store
+        .put_object_stream_with_meta(
+            "alpha",
+            "ia.txt",
+            Box::pin(futures::stream::once(async {
+                Ok(bytes::Bytes::from_static(b"ia"))
+            })),
+            None,
+            Default::default(),
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("STANDARD_IA".into()),
+        )
+        .await
+        .unwrap();
+    st.store
+        .put_object("alpha", "cold.txt", bytes::Bytes::from_static(b"c"), None)
+        .await
+        .unwrap();
+    let info = st.store.head_object("alpha", "cold.txt").await.unwrap();
+    st.store
+        .archive_version(
+            "alpha",
+            "cold.txt",
+            info.version_id.as_deref().unwrap_or("null"),
+            xl_store::store::ArchiveSpec {
+                backend: "cold".into(),
+                key: "k".into(),
+                size: info.size,
+                source_etag: info.etag.clone(),
+                etag: "remote".into(),
+                sha256: "00".into(),
+                class: "GLACIER".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_token(&base).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/buckets/alpha/objects?limit=10"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let objs = v["objects"].as_array().unwrap();
+    let find = |key: &str| objs.iter().find(|o| o["key"] == key).unwrap();
+
+    let plain = find("plain.txt");
+    assert_eq!(plain["storage_class"], serde_json::Value::Null);
+    assert_eq!(plain["tier_phase"], serde_json::Value::Null);
+    assert_eq!(plain["restore_expires_at"], serde_json::Value::Null);
+
+    let ia = find("ia.txt");
+    assert_eq!(ia["storage_class"], "STANDARD_IA");
+    assert_eq!(ia["tier_phase"], serde_json::Value::Null);
+
+    let cold = find("cold.txt");
+    assert_eq!(cold["storage_class"], "GLACIER");
+    assert_eq!(cold["tier_phase"], "Archived");
+    assert_eq!(cold["restore_expires_at"], serde_json::Value::Null);
+}

@@ -84,6 +84,8 @@ impl TierBackend for S3TierBackend {
 #[derive(Clone, Default)]
 pub struct TierBackends {
     map: HashMap<String, Arc<dyn TierBackend>>,
+    /// 控制台只读状态元数据；只投影 id/endpoint/bucket，绝不带凭证。
+    targets: Vec<TierTarget>,
 }
 
 impl TierBackends {
@@ -93,19 +95,30 @@ impl TierBackends {
                 .into_iter()
                 .map(|b| (b.id().to_string(), b))
                 .collect(),
+            targets: Vec::new(),
         }
     }
 
     pub fn from_config(tiers: &[TierTarget]) -> Self {
         let client = Arc::new(ReplClient::new_tiers(tiers));
-        Self::new(
-            tiers
-                .iter()
-                .map(|t| {
-                    Arc::new(S3TierBackend::new(t, Arc::clone(&client))) as Arc<dyn TierBackend>
-                })
-                .collect(),
-        )
+        let map = tiers
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    Arc::new(S3TierBackend::new(t, Arc::clone(&client))) as Arc<dyn TierBackend>,
+                )
+            })
+            .collect();
+        Self {
+            map,
+            targets: tiers.to_vec(),
+        }
+    }
+
+    /// 配置的 tier 目标（顺序同 `[[tiers]]`；调用方只可读出展示字段）。
+    pub fn targets(&self) -> &[TierTarget] {
+        &self.targets
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn TierBackend>> {
