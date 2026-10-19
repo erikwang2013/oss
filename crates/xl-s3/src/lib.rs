@@ -6,6 +6,7 @@ pub mod convert;
 pub mod events;
 pub mod lock;
 pub mod notify;
+pub mod olap;
 pub mod policy;
 pub mod replication;
 pub mod select;

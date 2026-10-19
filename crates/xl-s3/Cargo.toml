@@ -17,16 +17,24 @@ time.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 s3s.workspace = true
+tokio.workspace = true
 sqlx = { workspace = true }
 tracing.workspace = true
 # M6 切片 2：S3 Select（SQL AST + GZIP）
 sqlparser.workspace = true
 flate2.workspace = true
+# M8 S2：Object Lambda（HTTP 变换器出站 + 输出 ETag / key-b64）
+reqwest.workspace = true
+base64.workspace = true
+md-5.workspace = true
+hex.workspace = true
+# 仅 olap-wasm feature：36.x 是支持 MSRV 1.86 的维护分支（49.x 需 1.96，超出工作区 1.89）
+wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
+
+[features]
+default = []
+olap-wasm = ["dep:wasmtime"]
 
 [dev-dependencies]
-async-trait = "0.1"
-md-5.workspace = true
-base64.workspace = true
-hex.workspace = true
 tempfile = "3"
-tokio.workspace = true
+axum.workspace = true

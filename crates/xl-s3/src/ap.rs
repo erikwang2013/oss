@@ -270,6 +270,7 @@ pub trait ApSource: Send + Sync {
 /// 路由写入 extensions 的调用意图（`call` 读取）。
 #[derive(Debug, Clone)]
 pub struct ApInvocation {
+    pub ap_name: String,
     pub bucket: String,
     pub raw_suffix: String,
     pub canonical_key: Option<String>,
@@ -281,6 +282,8 @@ pub struct ApRoute {
     cache: Arc<ApCache>,
     source: Arc<dyn ApSource>,
     acl: crate::access::Acl,
+    /// M8 S2 变换器缓存（AP 名 → 编译产物）；miss = 不改写响应体。
+    olap: Arc<crate::olap::OlapCache>,
     /// 内层服务：无 auth/access/route（N1），共享同一 OssS3 与 sinks。
     inner: Arc<s3s::service::S3Service>,
     /// 同一槽位的既有路由（N2：STS）；非 AP 请求原样委托。
@@ -296,12 +299,14 @@ impl ApRoute {
         cache: Arc<ApCache>,
         source: Arc<dyn ApSource>,
         acl: crate::access::Acl,
+        olap: Arc<crate::olap::OlapCache>,
         inner: Arc<s3s::service::S3Service>,
     ) -> Self {
         Self {
             cache,
             source,
             acl,
+            olap,
             inner,
             fallback: None,
         }
@@ -612,6 +617,7 @@ impl s3s::route::S3Route for ApRoute {
         }
         req.extensions.insert(user);
         req.extensions.insert(ApInvocation {
+            ap_name: name,
             bucket: ap.bucket,
             raw_suffix,
             canonical_key: key.map(str::to_string),
@@ -633,6 +639,26 @@ impl s3s::route::S3Route for ApRoute {
                 "access point context missing"
             ));
         };
+        // S2：配置了变换器的 AP 只允许 GET/HEAD；写操作 405。Range/partNumber 会让
+        // 内层返回局部字节，变换后 ETag/长度语义不再成立 → 400。
+        let transform = self.olap.get(&inv.ap_name);
+        if transform.is_some() {
+            if !matches!(req.method, http::Method::GET | http::Method::HEAD) {
+                return Err(s3s::s3_error!(
+                    MethodNotAllowed,
+                    "object transform only supports GET/HEAD"
+                ));
+            }
+            if inv.op == "GetObject"
+                && (req.headers.contains_key(http::header::RANGE)
+                    || query_has(req.uri.query().unwrap_or(""), "partNumber"))
+            {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "Range/partNumber is not supported with object transform"
+                ));
+            }
+        }
         let path = if inv.raw_suffix.is_empty() {
             format!("/{}", inv.bucket)
         } else {
@@ -659,7 +685,24 @@ impl s3s::route::S3Route for ApRoute {
             tracing::error!(error = ?e, "AP 内层调用失败");
             s3s::s3_error!(InternalError, "internal error")
         })?;
-        let (parts, body) = resp.into_parts();
+        let (mut parts, mut body) = resp.into_parts();
+        // 仅 200 的 GetObject 体走变换；304/412/403/404 等原样回（条件求值已在内层完成）。
+        if let Some(t) = &transform
+            && parts.status == http::StatusCode::OK
+            && inv.op == "GetObject"
+        {
+            // s3s 0.17 的 GetObject 生成层丢弃 S3Response.status：内层的条件 304 被序列化成
+            // 200 + 默认空输出。成功对象必带 ETag，据此识别并还原 304，且不调用变换器。
+            if !parts.headers.contains_key(http::header::ETAG) {
+                return Ok(S3Response {
+                    output: s3s::Body::empty(),
+                    status: Some(http::StatusCode::NOT_MODIFIED),
+                    headers: parts.headers,
+                    extensions: parts.extensions,
+                });
+            }
+            body = apply_transform(t, &inv, &mut parts, body).await?;
+        }
         Ok(S3Response {
             output: body,
             status: Some(parts.status),
@@ -667,6 +710,65 @@ impl s3s::route::S3Route for ApRoute {
             extensions: parts.extensions,
         })
     }
+}
+
+/// 读入原对象 → 变换 → 重写表示层头。原始 Last-Modified/meta/version-id/
+/// storage-class/restore/锁/SSE-C 响应头保留；Content-Length/ETag/Content-Type 按变换结果重算。
+async fn apply_transform(
+    t: &crate::olap::OlapTransform,
+    inv: &ApInvocation,
+    parts: &mut http::response::Parts,
+    mut body: s3s::Body,
+) -> S3Result<s3s::Body> {
+    let limit = crate::olap::max_input_bytes();
+    let input = body.store_all_limited(limit).await.map_err(|e| {
+        if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some() {
+            s3s::s3_error!(EntityTooLarge, "object exceeds transform input limit")
+        } else {
+            tracing::error!(error = %e, "读取待变换对象失败");
+            s3s::s3_error!(InternalError, "internal error")
+        }
+    })?;
+    let etag =
+        header_str(&parts.headers, http::header::ETAG).map(|s| s.trim_matches('"').to_string());
+    let version_id = header_str(&parts.headers, s3s::header::X_AMZ_VERSION_ID).map(str::to_string);
+    let out = t
+        .transform(crate::olap::OlapInput {
+            bucket: &inv.bucket,
+            key: inv.canonical_key.as_deref().unwrap_or_default(),
+            version_id: version_id.as_deref(),
+            etag: etag.as_deref(),
+            bytes: input,
+        })
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, ap = %inv.ap_name, "对象变换失败");
+            s3s::s3_error!(InternalError, "object transform failed")
+        })?;
+    use md5::Digest as _;
+    let etag = hex::encode(md5::Md5::digest(&out.bytes));
+    let headers = &mut parts.headers;
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from(out.bytes.len() as u64),
+    );
+    headers.insert(
+        http::header::ETAG,
+        http::HeaderValue::from_str(&format!("\"{etag}\"")).expect("hex ETag 恒合法"),
+    );
+    headers.remove(http::header::RANGE);
+    headers.remove(http::header::ACCEPT_RANGES);
+    headers.remove(http::header::CONTENT_RANGE);
+    if let Some(ct) = out.content_type
+        && let Ok(v) = http::HeaderValue::from_str(&ct)
+    {
+        headers.insert(http::header::CONTENT_TYPE, v);
+    }
+    Ok(out.bytes.into())
+}
+
+fn header_str(headers: &http::HeaderMap, name: http::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
 }
 
 #[cfg(test)]
@@ -774,7 +876,13 @@ mod tests {
                 Ok(None)
             }
         }
-        let route = ApRoute::new(cache, Arc::new(NoSource), acl, inner);
+        let route = ApRoute::new(
+            cache,
+            Arc::new(NoSource),
+            acl,
+            Arc::new(crate::olap::OlapCache::new()),
+            inner,
+        );
         let mk = |path: &str| {
             let mut r = S3Request {
                 input: s3s::Body::empty(),
