@@ -633,14 +633,26 @@ async fn get_notifications(
     if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
         return r;
     }
+    // Acl::can 对管理员短路，补桶存在性检查（与 get_lifecycle 同口径）
+    match state.db.bucket_exists(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "NoSuchBucket").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "桶存在性查询失败");
+            return internal_error();
+        }
+    }
     match state.acl().bucket_notification(&bucket).await {
         Ok(Some(json)) => match serde_json::from_str::<Vec<xl_s3::notify::EventTarget>>(&json) {
             Ok(targets) => Json(xl_s3::notify::notification_config_out(&targets)).into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "stored notification config corrupt",
-            )
-                .into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, bucket = %bucket, "stored notification config corrupt");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "stored notification config corrupt",
+                )
+                    .into_response()
+            }
         },
         Ok(None) => Json(xl_s3::notify::notification_config_out(&[])).into_response(),
         Err(e) => {
@@ -753,8 +765,11 @@ async fn list_dead_events(
                     serde_json::json!({
                         "id": r.get::<i64, _>("id"),
                         "bucket": r.get::<String, _>("bucket"),
-                        "object_key": ev.pointer("/s3/object/key")
-                            .cloned().unwrap_or(serde_json::Value::Null),
+                        // 载荷里是 AWS URL 编码键（space→+，/→%2F）；展示解码后的原件
+                        "object_key": ev.pointer("/s3/object/key").and_then(|v| v.as_str())
+                            .map(crate::events::aws_decode_key)
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null),
                         "event": ev.pointer("/eventName")
                             .cloned().unwrap_or(serde_json::Value::Null),
                         "attempts": r.get::<i64, _>("attempts"),
@@ -987,10 +1002,17 @@ fn select_formats(
                 "quote_escape_character",
             )?,
             record: select_byte(c.record_delimiter.as_deref(), b'\n', "record_delimiter")?,
-            always_quote: c
-                .quote_fields
-                .as_deref()
-                .is_some_and(|v| v.eq_ignore_ascii_case("ALWAYS")),
+            always_quote: match c.quote_fields.as_deref() {
+                None => false,
+                Some(v) if v.eq_ignore_ascii_case("ALWAYS") => true,
+                Some(v) if v.eq_ignore_ascii_case("ASNEEDED") => false,
+                Some(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "quote_fields 只支持 ALWAYS/ASNEEDED".into(),
+                    ));
+                }
+            },
         })
     } else if body.output.format.eq_ignore_ascii_case("JSON") {
         if body.output.csv.is_some() {

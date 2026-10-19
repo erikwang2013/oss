@@ -312,6 +312,37 @@ pub fn aws_encode_key(key: &str) -> String {
     out
 }
 
+/// 逆 `aws_encode_key`（控制台展示用）：`+`→空格，`%XX`→字节；非法序列原样保留。
+pub fn aws_decode_key(encoded: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16);
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h as u8 * 16 + l as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn sequencer() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1192,5 +1223,14 @@ mod tests {
         let body = std::fs::read_to_string(td.path().join("kv1.log")).unwrap();
         let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
         assert_eq!(v["eventName"], "s3:ObjectCreated:Put");
+    }
+
+    #[test]
+    fn aws_decode_key_inverts_encoding() {
+        for key in ["dir/a b+c.txt", "空格 中文/%2F", "plain"] {
+            assert_eq!(aws_decode_key(&aws_encode_key(key)), key);
+        }
+        // 非法百分号序列原样保留，不 panic
+        assert_eq!(aws_decode_key("a%zz%b"), "a%zz%b");
     }
 }

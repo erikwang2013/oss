@@ -1292,6 +1292,15 @@ async fn notifications_console_crud() {
         .unwrap();
     assert_eq!(got["queue_configurations"], serde_json::json!([]));
 
+    // 不存在的桶：管理员也不得因 Acl::can 短路而拿到 200 空配置
+    let r = client
+        .get(format!("{base}/api/v1/buckets/nope/notifications"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
     // PUT 全量替换 → 204；GET 回读同形（ARN 由 target 回拼）
     let cfg = serde_json::json!({"queue_configurations": [{
         "id": "cfg-0",
@@ -1410,7 +1419,7 @@ async fn dead_letter_list_and_redeliver() {
 
     let payload = serde_json::json!({
         "eventName": "s3:ObjectCreated:Put",
-        "s3": {"object": {"key": "a b.txt"}}
+        "s3": {"object": {"key": "dir%2Fa+b.txt"}}
     })
     .to_string();
     let id: i64 = sqlx::query_scalar(
@@ -1442,7 +1451,8 @@ async fn dead_letter_list_and_redeliver() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["id"], id);
     assert_eq!(list[0]["bucket"], "bkt");
-    assert_eq!(list[0]["object_key"], "a b.txt");
+    // 载荷里是 URL 编码（%2F / +）；列表展示解码后的键
+    assert_eq!(list[0]["object_key"], "dir/a b.txt");
     assert_eq!(list[0]["event"], "s3:ObjectCreated:Put");
     assert_eq!(list[0]["attempts"], 5);
     assert_eq!(list[0]["last_error"], "boom");
@@ -1595,6 +1605,16 @@ async fn select_proxy_csv_filter_and_errors() {
         v["records"],
         serde_json::json!([["alice", "30"], ["bob", "20"]])
     );
+
+    // quote_fields 未知值 → 400（不得静默降级为 ASNEEDED）
+    let body = serde_json::json!({
+        "key": "data.csv",
+        "expression": "SELECT * FROM S3Object",
+        "input": {"format": "CSV"},
+        "output": {"format": "CSV", "csv": {"quote_fields": "SOMETIMES"}}
+    });
+    let r = run(&admin, body).await.unwrap();
+    assert_eq!(r.status(), 400);
 
     // 非法 SQL → 400
     let body = serde_json::json!({
