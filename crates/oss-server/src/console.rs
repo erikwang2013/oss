@@ -128,6 +128,8 @@ pub fn routes() -> Router<AppState> {
         // M8 S0：作业详情/控制（admin 或 requested_by）
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/{action}", post(job_action))
+        // M8 S3：Batch 创建（POST /jobs，与上面的 GET 合并）
+        .merge(crate::job_actions_api::routes())
         // M8 S1：访问点 CRUD/策略
         .merge(crate::access_points_api::routes())
         // M8 S5：Inventory 配置（owner/admin）
@@ -452,7 +454,13 @@ async fn job_action(
         return (StatusCode::BAD_REQUEST, "未知作业操作").into_response();
     }
     match state.db.job_set_state(id, &action, now).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // 取消后立即落一次报告（未执行任务被 started_at 过滤；后续运行中任务收尾会重写）。
+            if action == "cancel" {
+                crate::jobs::write_report_now(&state.db, &state.store, id).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::CONFLICT, "作业状态不允许该操作").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "作业状态操作失败");
