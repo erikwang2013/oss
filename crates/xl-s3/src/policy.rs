@@ -166,6 +166,60 @@ impl PolicyDoc {
     }
 }
 
+/// 控制台 IAM 预设模板（静态目录，不落库）。占位符由客户端替换，保存仍走既有
+/// `PUT /buckets/{bucket}/policy` 的 `PolicyDoc::validate`。
+///
+/// 安全口径：只有 Allow；Principal 一律 `${PRINCIPAL}`（**永不 `*`**）；不含删除动作；
+/// 不提供 public-read / public-write / 匿名模板。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PolicyTemplate {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub doc: serde_json::Value,
+}
+
+/// 预设目录（顺序与数量是对外契约，测试钉住）。
+pub fn policy_templates() -> Vec<PolicyTemplate> {
+    let allow = |actions: &[&str], resource: &str| {
+        serde_json::json!({
+            "Effect": "Allow",
+            "Principal": { "AWS": "${PRINCIPAL}" },
+            "Action": actions,
+            "Resource": resource,
+        })
+    };
+    vec![
+        PolicyTemplate {
+            id: "read-only",
+            name: "只读",
+            description: "列出桶并读取桶内对象（${PRINCIPAL} 替换为 AK 或 uid:<n>，${BUCKET} 替换为桶名）",
+            doc: serde_json::json!({"Statement": [
+                allow(&["s3:ListBucket"], "arn:aws:s3:::${BUCKET}"),
+                allow(&["s3:GetObject"], "arn:aws:s3:::${BUCKET}/*"),
+            ]}),
+        },
+        PolicyTemplate {
+            id: "read-write",
+            name: "读写",
+            description: "列出桶、读取并写入桶内对象，不含删除（同上占位符）",
+            doc: serde_json::json!({"Statement": [
+                allow(&["s3:ListBucket"], "arn:aws:s3:::${BUCKET}"),
+                allow(&["s3:GetObject"], "arn:aws:s3:::${BUCKET}/*"),
+                allow(&["s3:PutObject"], "arn:aws:s3:::${BUCKET}/*"),
+            ]}),
+        },
+        PolicyTemplate {
+            id: "prefix-isolated",
+            name: "前缀隔离",
+            description: "仅允许 ${PREFIX} 前缀内对象的读写；不授予 ListBucket（避免暴露前缀外的键名）",
+            doc: serde_json::json!({"Statement": [
+                allow(&["s3:GetObject", "s3:PutObject"], "arn:aws:s3:::${BUCKET}/${PREFIX}*"),
+            ]}),
+        },
+    ]
+}
+
 /// 单动作判定：`Some(true)` Allow / `Some(false)` Deny / `None` 无匹配。
 pub fn evaluate(policy: &PolicyDoc, p: &PolicyRequest<'_>, action: &str) -> Option<bool> {
     let mut allowed = false;
@@ -373,5 +427,35 @@ mod tests {
             "Action":"s3:Get*","Resource":"arn:aws:s3:::bkt/*"}]}"#,
         );
         assert!(ok.validate().is_ok());
+    }
+
+    /// 预设目录：数量/顺序稳定；占位符原样与替换后都过校验；无匿名 Principal、无删除动作。
+    #[test]
+    fn preset_templates_validate_and_are_safe() {
+        let ts = policy_templates();
+        let ids: Vec<_> = ts.iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["read-only", "read-write", "prefix-isolated"]);
+        for t in &ts {
+            let doc: PolicyDoc = serde_json::from_value(t.doc.clone()).unwrap();
+            doc.validate().unwrap();
+            let filled = t
+                .doc
+                .to_string()
+                .replace("${BUCKET}", "bkt")
+                .replace("${PREFIX}", "logs/")
+                .replace("${PRINCIPAL}", "uid:7");
+            let doc: PolicyDoc = serde_json::from_str(&filled).unwrap();
+            doc.validate().unwrap();
+            for st in &doc.statement {
+                assert_eq!(st.effect, "Allow", "{}", t.id);
+                for p in st.principal.aws.iter() {
+                    assert_ne!(p, "*", "{} 不得含匿名 Principal", t.id);
+                }
+                for a in st.action.iter() {
+                    assert!(!a.contains("Delete"), "{} 不得含删除动作", t.id);
+                    assert_ne!(a, "s3:*", "{} 不得用全通配动作", t.id);
+                }
+            }
+        }
     }
 }

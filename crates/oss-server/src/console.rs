@@ -144,6 +144,19 @@ pub fn routes() -> Router<AppState> {
         .route("/tiers/sweep", post(force_tier_sweep))
         // M4 切片 7：桶策略（桶主或管理员）与审计（管理员）
         .route("/buckets/{bucket}/policy", get(get_policy).put(put_policy))
+        // M8 S6 缺口 B：桶事件通知配置（S3 面同源）与一次性 Select 代理
+        .route(
+            "/buckets/{bucket}/notifications",
+            get(get_notifications)
+                .put(put_notifications)
+                .delete(delete_notifications),
+        )
+        .route("/buckets/{bucket}/select", post(select_object))
+        // M8 S6 缺口 B：死信可见性/重投（管理员）
+        .route("/events/dead", get(list_dead_events))
+        .route("/events/{id}/redeliver", post(redeliver_event))
+        // M8 S6 缺口 B：IAM 预设模板（登录即可读；不含敏感信息）
+        .route("/policy-templates", get(list_policy_templates))
         .route("/audit", get(list_audit))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket))
@@ -603,6 +616,629 @@ async fn put_policy(
             internal_error()
         }
     }
+}
+
+// ---------- M8 S6 缺口 B：桶事件通知配置（与 S3 面同一状态） ----------
+
+/// GET：Read 权限；返回与 S3 GetBucketNotificationConfiguration 同形的配置（未配置 = 空列表）。
+async fn get_notifications(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+) -> Response {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
+        return r;
+    }
+    match state.acl().bucket_notification(&bucket).await {
+        Ok(Some(json)) => match serde_json::from_str::<Vec<xl_s3::notify::EventTarget>>(&json) {
+            Ok(targets) => Json(xl_s3::notify::notification_config_out(&targets)).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stored notification config corrupt",
+            )
+                .into_response(),
+        },
+        Ok(None) => Json(xl_s3::notify::notification_config_out(&[])).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "读通知配置失败");
+            internal_error()
+        }
+    }
+}
+
+/// PUT：全量替换（桶主或管理员）；S3 线格式 JSON → `notify::parse_notification_config`
+/// 校验（≤100 targets / 事件白名单 / ARN 白名单），存归一化配置。
+async fn put_notifications(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    body: String,
+) -> Response {
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
+    }
+    if body.len() > 64 * 1024 {
+        return (StatusCode::BAD_REQUEST, "通知配置过大（≤64KiB）").into_response();
+    }
+    let cfg: s3s::dto::NotificationConfiguration = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("通知配置解析失败: {e}")).into_response();
+        }
+    };
+    let targets = match xl_s3::notify::parse_notification_config(&cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                e.message()
+                    .unwrap_or("invalid notification configuration")
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let json = match serde_json::to_string(&targets) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(error = %e, "通知配置序列化失败");
+            return internal_error();
+        }
+    };
+    match state.acl().set_bucket_notification(&bucket, &json).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "写通知配置失败");
+            internal_error()
+        }
+    }
+}
+
+/// DELETE：清空配置（桶主或管理员）。
+async fn delete_notifications(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
+        return r;
+    }
+    match state.acl().clear_bucket_notification(&bucket).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "清通知配置失败");
+            internal_error()
+        }
+    }
+}
+
+// ---------- M8 S6 缺口 B：死信可见性与重投（管理员） ----------
+
+#[derive(Debug, Deserialize)]
+struct DeadQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// GET：`state='dead'` 的行，最新在前；limit 与 /audit 同口径钳位 1..=1000。
+async fn list_dead_events(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    axum::extract::Query(q): axum::extract::Query<DeadQuery>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    use sqlx::Row as _;
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let rows = sqlx::query(
+        "SELECT id, bucket, event_json, attempts, last_error, created_at FROM event_outbox \
+         WHERE state='dead' ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(state.db.pool())
+    .await;
+    match rows {
+        Ok(rows) => Json(
+            rows.iter()
+                .map(|r| {
+                    let raw: String = r.get("event_json");
+                    // event_outbox 无对象键/事件名列——两者都在事件载荷 JSON 里
+                    let ev: serde_json::Value =
+                        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({
+                        "id": r.get::<i64, _>("id"),
+                        "bucket": r.get::<String, _>("bucket"),
+                        "object_key": ev.pointer("/s3/object/key")
+                            .cloned().unwrap_or(serde_json::Value::Null),
+                        "event": ev.pointer("/eventName")
+                            .cloned().unwrap_or(serde_json::Value::Null),
+                        "attempts": r.get::<i64, _>("attempts"),
+                        "last_error": r.get::<Option<String>, _>("last_error"),
+                        "created_at": r.get::<i64, _>("created_at"),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查询死信失败");
+            internal_error()
+        }
+    }
+}
+
+/// POST：dead → pending（复位 attempts/claimed_at/next_retry_at/last_error），交给原 worker
+/// 重试；0 行（不存在或不是 dead）→ 404。不删除/重插，保持 at-least-once 语义。
+async fn redeliver_event(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match sqlx::query(
+        "UPDATE event_outbox SET state='pending', claimed_at=NULL, next_retry_at=?, attempts=0, \
+         last_error=NULL WHERE id=? AND state='dead'",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(state.db.pool())
+    .await
+    {
+        Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => (StatusCode::NOT_FOUND, "死信事件不存在").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "重投死信失败");
+            internal_error()
+        }
+    }
+}
+
+// ---------- M8 S6 缺口 B：IAM 预设模板（静态目录，登录即可读） ----------
+
+async fn list_policy_templates(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = who(&state, &payload).await {
+        return r;
+    }
+    Json(xl_s3::policy::policy_templates()).into_response()
+}
+
+// ---------- M8 S6 缺口 B：一次性 Select 代理 ----------
+
+/// 输入上限与 S3 面一致；输出上限保护控制台单次 JSON 响应（越限 400，不静默截断）。
+const SELECT_MAX_INPUT: u64 = 256 * 1024 * 1024;
+const SELECT_MAX_RECORDS: usize = 10_000;
+const SELECT_MAX_OUT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct SelectBody {
+    key: String,
+    expression: String,
+    input: SelectInput,
+    output: SelectOutput,
+    /// 点名版本（缺省 = 链尾）。
+    #[serde(default)]
+    version_id: Option<String>,
+    #[serde(default)]
+    scan_range: Option<SelectScanRange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectInput {
+    /// "CSV" | "JSON"（大小写不敏感）。
+    format: String,
+    #[serde(default)]
+    csv: Option<SelectCsvIn>,
+    #[serde(default)]
+    json: Option<SelectJsonIn>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SelectCsvIn {
+    field_delimiter: Option<String>,
+    quote_character: Option<String>,
+    quote_escape_character: Option<String>,
+    record_delimiter: Option<String>,
+    comments: Option<String>,
+    file_header_info: Option<String>,
+    allow_quoted_record_delimiter: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SelectJsonIn {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectOutput {
+    format: String,
+    #[serde(default)]
+    csv: Option<SelectCsvOut>,
+    #[serde(default)]
+    json: Option<SelectJsonOut>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SelectCsvOut {
+    field_delimiter: Option<String>,
+    quote_character: Option<String>,
+    quote_escape_character: Option<String>,
+    record_delimiter: Option<String>,
+    quote_fields: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SelectJsonOut {
+    record_delimiter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectScanRange {
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+type SelectErr = (StatusCode, String);
+
+fn select_byte(v: Option<&str>, default: u8, name: &str) -> Result<u8, SelectErr> {
+    match v {
+        None => Ok(default),
+        Some(s) if s.len() == 1 => Ok(s.as_bytes()[0]),
+        Some(_) => Err((StatusCode::BAD_REQUEST, format!("{name} 必须是单字节字符"))),
+    }
+}
+
+/// 请求 DTO → 引擎格式（与 service.rs::select_object_content 同口径；不含压缩）。
+fn select_formats(
+    body: &SelectBody,
+) -> Result<(xl_s3::select::InFormat, xl_s3::select::OutFormat), SelectErr> {
+    use xl_s3::select::{CsvIn, CsvOut, HeaderMode, InFormat, OutFormat};
+    let in_fmt = if body.input.format.eq_ignore_ascii_case("CSV") {
+        if body.input.json.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "input.format=CSV 时不得提供 json 选项".into(),
+            ));
+        }
+        let c = body.input.csv.clone().unwrap_or_default();
+        let header = match c.file_header_info.as_deref().unwrap_or("NONE") {
+            "USE" => HeaderMode::Use,
+            "IGNORE" => HeaderMode::Ignore,
+            "NONE" => HeaderMode::None,
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "file_header_info 只支持 USE/IGNORE/NONE".into(),
+                ));
+            }
+        };
+        InFormat::Csv(CsvIn {
+            field: select_byte(c.field_delimiter.as_deref(), b',', "field_delimiter")?,
+            quote: select_byte(c.quote_character.as_deref(), b'"', "quote_character")?,
+            escape: select_byte(
+                c.quote_escape_character.as_deref(),
+                b'"',
+                "quote_escape_character",
+            )?,
+            record: select_byte(c.record_delimiter.as_deref(), b'\n', "record_delimiter")?,
+            comments: Some(select_byte(c.comments.as_deref(), b'#', "comments")?),
+            header,
+            allow_quoted_record_delimiter: c.allow_quoted_record_delimiter.unwrap_or(false),
+        })
+    } else if body.input.format.eq_ignore_ascii_case("JSON") {
+        if body.input.csv.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "input.format=JSON 时不得提供 csv 选项".into(),
+            ));
+        }
+        let lines = match body
+            .input
+            .json
+            .as_ref()
+            .and_then(|j| j.kind.as_deref())
+            .unwrap_or("DOCUMENT")
+        {
+            "LINES" => true,
+            "DOCUMENT" => false,
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "json.type 只支持 DOCUMENT/LINES".into(),
+                ));
+            }
+        };
+        InFormat::Json { lines }
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input.format 只支持 CSV/JSON".into(),
+        ));
+    };
+
+    let out_fmt = if body.output.format.eq_ignore_ascii_case("CSV") {
+        if body.output.json.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "output.format=CSV 时不得提供 json 选项".into(),
+            ));
+        }
+        let c = body.output.csv.clone().unwrap_or_default();
+        OutFormat::Csv(CsvOut {
+            field: select_byte(c.field_delimiter.as_deref(), b',', "field_delimiter")?,
+            quote: select_byte(c.quote_character.as_deref(), b'"', "quote_character")?,
+            escape: select_byte(
+                c.quote_escape_character.as_deref(),
+                b'"',
+                "quote_escape_character",
+            )?,
+            record: select_byte(c.record_delimiter.as_deref(), b'\n', "record_delimiter")?,
+            always_quote: c
+                .quote_fields
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("ALWAYS")),
+        })
+    } else if body.output.format.eq_ignore_ascii_case("JSON") {
+        if body.output.csv.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "output.format=JSON 时不得提供 csv 选项".into(),
+            ));
+        }
+        let record = select_byte(
+            body.output
+                .json
+                .as_ref()
+                .and_then(|j| j.record_delimiter.as_deref()),
+            b'\n',
+            "record_delimiter",
+        )?;
+        // 控制台把 records 转成 JSON 数组返回：靠 serde_json 流式解析，分隔符须为空白
+        if !record.is_ascii_whitespace() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "JSON 输出的 record_delimiter 必须是空白字符".into(),
+            ));
+        }
+        OutFormat::Json { record }
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "output.format 只支持 CSV/JSON".into(),
+        ));
+    };
+    Ok((in_fmt, out_fmt))
+}
+
+/// Store 读错误分档：SSE-C（控制台无客户钥）/ 客户端可纠正参数 → 400；归档中 → 403。
+fn select_store_error(e: xl_store::error::Error) -> Response {
+    use xl_store::error::Error;
+    match &e {
+        Error::InvalidArgument(m) => (StatusCode::BAD_REQUEST, m.clone()).into_response(),
+        Error::InvalidObjectState(m) => (StatusCode::FORBIDDEN, m.clone()).into_response(),
+        Error::DeleteMarker(m) => (StatusCode::NOT_FOUND, m.clone()).into_response(),
+        _ => store_error(e).into_response(),
+    }
+}
+
+/// 一次性 Select：桶 Read 权限；读取走与 S3 SelectObjectContent 相同的 store 路径；
+/// 返回 `{records, stats}`（CSV → 字段数组数组；JSON → JSON 值数组）。
+async fn select_object(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    Json(body): Json<SelectBody>,
+) -> Response {
+    let (uid, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Read).await {
+        return r;
+    }
+    let plan = match xl_s3::select::parse(&body.expression) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                e.message().unwrap_or("invalid SQL").to_string(),
+            )
+                .into_response();
+        }
+    };
+    let (in_fmt, out_fmt) = match select_formats(&body) {
+        Ok(v) => v,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    if body.scan_range.is_some() && matches!(in_fmt, xl_s3::select::InFormat::Json { lines: false })
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "ScanRange 不支持 JSON DOCUMENT 输入",
+        )
+            .into_response();
+    }
+
+    // 控制台不保存客户密钥：SSE-C 对象在 head 阶段即被 store 拒为 InvalidArgument → 400。
+    let vid = body.version_id.as_deref().filter(|v| !v.is_empty());
+    let head = match vid {
+        Some(v) => {
+            state
+                .store
+                .head_object_version_ext(&bucket, &body.key, v, None)
+                .await
+        }
+        None => state.store.head_object_ext(&bucket, &body.key, None).await,
+    };
+    let info = match head {
+        Ok(i) => i,
+        Err(e) => return select_store_error(e),
+    };
+    if info.size > SELECT_MAX_INPUT {
+        return (
+            StatusCode::BAD_REQUEST,
+            "对象超过 S3 Select 的 256MiB 输入上限",
+        )
+            .into_response();
+    }
+    let got = match vid {
+        Some(v) => {
+            state
+                .store
+                .get_object_version_ext(&bucket, &body.key, v, None)
+                .await
+        }
+        None => state.store.get_object_ext(&bucket, &body.key, None).await,
+    };
+    let bytes = match got {
+        Ok((_, b)) if b.len() as u64 <= SELECT_MAX_INPUT => b,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "对象超过 S3 Select 的 256MiB 输入上限",
+            )
+                .into_response();
+        }
+        Err(e) => return select_store_error(e),
+    };
+
+    // ScanRange：AWS 语义 = 记录首字节落在区间内则整条处理；仅 end = 末尾 N 字节。
+    let len = bytes.len() as i64;
+    let mut scan = None;
+    let mut scanned = len;
+    if let Some(sr) = body.scan_range.as_ref() {
+        if sr.start.is_some_and(|v| v < 0) || sr.end.is_some_and(|v| v < 0) {
+            return (StatusCode::BAD_REQUEST, "ScanRange 不允许负值").into_response();
+        }
+        let (start, end) = match (sr.start, sr.end) {
+            (None, None) => (0, len.saturating_sub(1)),
+            (Some(s), None) => (s, len.saturating_sub(1)),
+            (Some(s), Some(e)) => {
+                if s > e {
+                    return (StatusCode::BAD_REQUEST, "ScanRange Start 不得大于 End")
+                        .into_response();
+                }
+                (s, e)
+            }
+            (None, Some(n)) => ((len - n).max(0), len.saturating_sub(1)),
+        };
+        scan = Some((start, end));
+        scanned = if len == 0 {
+            0
+        } else {
+            let lo = start.clamp(0, len);
+            let hi = end.clamp(0, len - 1);
+            if lo <= hi { hi - lo + 1 } else { 0 }
+        };
+    }
+
+    let events = match xl_s3::select::evaluate_capped(
+        &plan,
+        &bytes,
+        &in_fmt,
+        &out_fmt,
+        &xl_s3::select::EvalOptions {
+            request_progress: false,
+            scanned: Some(scanned),
+            scan,
+        },
+        SELECT_MAX_RECORDS,
+        SELECT_MAX_OUT_BYTES,
+    ) {
+        Ok(evs) => evs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                e.message().unwrap_or("select failed").to_string(),
+            )
+                .into_response();
+        }
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut stats = xl_s3::select::StatsData::default();
+    for ev in events {
+        match ev {
+            xl_s3::select::SelectEvent::Records(b) => out.extend_from_slice(&b),
+            xl_s3::select::SelectEvent::Stats(s) => stats = s,
+            _ => {}
+        }
+    }
+    let records: Vec<serde_json::Value> = match &out_fmt {
+        xl_s3::select::OutFormat::Json { .. } => {
+            let text = match std::str::from_utf8(&out) {
+                Ok(t) => t,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "select output is not UTF-8",
+                    )
+                        .into_response();
+                }
+            };
+            let mut vals = Vec::new();
+            for v in serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>() {
+                match v {
+                    Ok(v) => vals.push(v),
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "JSON 输出无法按记录解析（record_delimiter 须为空白字符）",
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            vals
+        }
+        xl_s3::select::OutFormat::Csv(c) => {
+            let cin = xl_s3::select::CsvIn {
+                field: c.field,
+                quote: c.quote,
+                escape: c.escape,
+                record: c.record,
+                comments: None,
+                header: xl_s3::select::HeaderMode::None,
+                allow_quoted_record_delimiter: true,
+            };
+            match xl_s3::select::parse_csv(&out, &cin) {
+                Ok(p) => p
+                    .records
+                    .into_iter()
+                    .map(|(fields, _)| serde_json::json!(fields))
+                    .collect(),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        e.message().unwrap_or("CSV 输出解析失败").to_string(),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    Json(serde_json::json!({
+        "records": records,
+        "stats": {
+            "bytes_scanned": stats.bytes_scanned,
+            "bytes_processed": stats.bytes_processed,
+            "bytes_returned": stats.bytes_returned,
+        },
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]

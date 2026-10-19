@@ -1262,3 +1262,421 @@ async fn encryption_status_is_admin_read_only() {
     let r = client.get(&url).bearer_auth(&bob).send().await.unwrap();
     assert_eq!(r.status(), 403);
 }
+
+// ---------- M8 S6 缺口 B：通知 CRUD / 死信 / Select 代理 / IAM 预设 ----------
+
+/// 通知配置：GET/PUT/DELETE 往返（与 S3 面同源）、非法 ARN 400、>100 targets 400、非桶主 403。
+#[tokio::test]
+async fn notifications_console_crud() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store.create_bucket("notb").await.unwrap();
+    st.db.insert_bucket("notb", None).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/buckets/notb/notifications");
+
+    // 初始 = 空配置
+    let got: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["queue_configurations"], serde_json::json!([]));
+
+    // PUT 全量替换 → 204；GET 回读同形（ARN 由 target 回拼）
+    let cfg = serde_json::json!({"queue_configurations": [{
+        "id": "cfg-0",
+        "queue_arn": "arn:oss:sqs::t1:kafka",
+        "events": ["s3:ObjectCreated:Put"],
+        "filter": {"key": {"filter_rules": [{"name": "prefix", "value": "logs/"}]}}
+    }]});
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&cfg)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let got: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        got["queue_configurations"][0]["queue_arn"],
+        "arn:oss:sqs::t1:kafka"
+    );
+    assert_eq!(
+        got["queue_configurations"][0]["events"],
+        serde_json::json!(["s3:ObjectCreated:Put"])
+    );
+    // 与 S3 面同源：存的是归一化内部形态
+    let stored = st.acl().bucket_notification("notb").await.unwrap().unwrap();
+    assert!(stored.contains(r#""target":"t1""#), "{stored}");
+
+    // 非桶主写 → 403
+    let r = client
+        .put(&url)
+        .bearer_auth(&bob)
+        .json(&cfg)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // 非法 ARN → 400
+    let bad = serde_json::json!({"queue_configurations": [{
+        "queue_arn": "arn:aws:sqs:us-east-1:1:q", "events": ["s3:ObjectCreated:Put"]
+    }]});
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // >100 targets → 400
+    let many: Vec<serde_json::Value> = (0..101)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("c{i}"), "queue_arn": "arn:oss:sqs::t:kafka",
+                "events": ["s3:ObjectCreated:Put"]
+            })
+        })
+        .collect();
+    let r = client
+        .put(&url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"queue_configurations": many}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // DELETE → 清空
+    let r = client
+        .delete(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let got: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["queue_configurations"], serde_json::json!([]));
+    assert!(
+        st.acl()
+            .bucket_notification("notb")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// 死信：list 只回 state='dead'、字段取自事件载荷；re-deliver 复位为 pending 且不可重复；非 admin 403。
+#[tokio::test]
+async fn dead_letter_list_and_redeliver() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+
+    let payload = serde_json::json!({
+        "eventName": "s3:ObjectCreated:Put",
+        "s3": {"object": {"key": "a b.txt"}}
+    })
+    .to_string();
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO event_outbox (bucket, target_id, event_json, state, attempts, created_at, \
+         last_error) VALUES ('bkt', 't1', ?, 'dead', 5, 123, 'boom') RETURNING id",
+    )
+    .bind(&payload)
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    // pending 行不得出现在死信列表
+    sqlx::query(
+        "INSERT INTO event_outbox (bucket, target_id, event_json, state) \
+         VALUES ('bkt', 't1', '{}', 'pending')",
+    )
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/events/dead?limit=10"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], id);
+    assert_eq!(list[0]["bucket"], "bkt");
+    assert_eq!(list[0]["object_key"], "a b.txt");
+    assert_eq!(list[0]["event"], "s3:ObjectCreated:Put");
+    assert_eq!(list[0]["attempts"], 5);
+    assert_eq!(list[0]["last_error"], "boom");
+    assert_eq!(list[0]["created_at"], 123);
+
+    // limit 与 /audit 同口径钳位（0 → 1，超大 → 1000，不报错）
+    for limit in ["0", "99999"] {
+        let r = client
+            .get(format!("{base}/api/v1/events/dead?limit={limit}"))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "limit={limit}");
+    }
+
+    // 非 admin 403（列表与重投均拒）
+    let r = client
+        .get(format!("{base}/api/v1/events/dead"))
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = client
+        .post(format!("{base}/api/v1/events/{id}/redeliver"))
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // 重投：dead → pending，attempts/claimed_at/last_error 复位
+    let r = client
+        .post(format!("{base}/api/v1/events/{id}/redeliver"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let row: (String, i64, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT state, attempts, claimed_at, last_error FROM event_outbox WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row, ("pending".to_string(), 0, None, None));
+
+    // 二次重投（已不是 dead）→ 404
+    let r = client
+        .post(format!("{base}/api/v1/events/{id}/redeliver"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}
+
+/// Select 代理：CSV 过滤 → records/stats；非法 SQL 400；无读 403；缺对象 404；SSE-C 400；记录上限。
+#[tokio::test]
+async fn select_proxy_csv_filter_and_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store.create_bucket("selb").await.unwrap();
+    st.store
+        .put_object(
+            "selb",
+            "data.csv",
+            bytes::Bytes::from_static(b"name,age\nalice,30\nbob,20\n"),
+            None,
+        )
+        .await
+        .unwrap();
+    // SSE-C 对象：控制台不保存客户密钥 → 400
+    {
+        use xl_store::crypto::{EncSpec, SseCKey};
+        let stream: xl_store::store::ByteStream = Box::pin(futures::stream::once(async {
+            Ok(bytes::Bytes::from_static(b"a\n"))
+        }));
+        st.store
+            .put_object_stream_with_meta(
+                "selb",
+                "secret.csv",
+                stream,
+                None,
+                Default::default(),
+                None,
+                false,
+                Some(EncSpec::SseC(SseCKey::from_key([7u8; 32]))),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // 10,001 行 → 越过控制台记录上限
+    st.store
+        .put_object(
+            "selb",
+            "many.csv",
+            bytes::Bytes::from("x\n".repeat(10_001)),
+            None,
+        )
+        .await
+        .unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/buckets/selb/select");
+    let run = |token: &str, body: serde_json::Value| {
+        client
+            .post(&url)
+            .bearer_auth(token.to_string())
+            .json(&body)
+            .send()
+    };
+
+    // CSV(header) → JSON 输出：过滤出 1 条，stats 按输入字节
+    let body = serde_json::json!({
+        "key": "data.csv",
+        "expression": "SELECT s.name, s.age FROM S3Object s WHERE s.age > 25",
+        "input": {"format": "CSV", "csv": {"file_header_info": "USE"}},
+        "output": {"format": "JSON"}
+    });
+    let resp = run(&admin, body).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["records"],
+        serde_json::json!([{"age": "30", "name": "alice"}])
+    );
+    assert_eq!(v["stats"]["bytes_scanned"], 25);
+    assert!(v["stats"]["bytes_returned"].as_i64().unwrap() > 0);
+
+    // CSV 输出：records = 字段数组
+    let body = serde_json::json!({
+        "key": "data.csv",
+        "expression": "SELECT * FROM S3Object",
+        "input": {"format": "CSV", "csv": {"file_header_info": "IGNORE"}},
+        "output": {"format": "CSV"}
+    });
+    let v: serde_json::Value = run(&admin, body).await.unwrap().json().await.unwrap();
+    // IGNORE = 跳过首行表头
+    assert_eq!(
+        v["records"],
+        serde_json::json!([["alice", "30"], ["bob", "20"]])
+    );
+
+    // 非法 SQL → 400
+    let body = serde_json::json!({
+        "key": "data.csv", "expression": "DELETE FROM S3Object",
+        "input": {"format": "CSV"}, "output": {"format": "CSV"}
+    });
+    let r = run(&admin, body).await.unwrap();
+    assert_eq!(r.status(), 400);
+    // 缺对象 → 404
+    let body = serde_json::json!({
+        "key": "nope.csv", "expression": "SELECT * FROM S3Object",
+        "input": {"format": "CSV"}, "output": {"format": "CSV"}
+    });
+    let r = run(&admin, body).await.unwrap();
+    assert_eq!(r.status(), 404);
+    // 无读权限 → 403
+    let body = serde_json::json!({
+        "key": "data.csv", "expression": "SELECT * FROM S3Object",
+        "input": {"format": "CSV"}, "output": {"format": "CSV"}
+    });
+    let r = run(&bob, body).await.unwrap();
+    assert_eq!(r.status(), 403);
+    // SSE-C 对象 → 400
+    let body = serde_json::json!({
+        "key": "secret.csv", "expression": "SELECT * FROM S3Object",
+        "input": {"format": "CSV"}, "output": {"format": "CSV"}
+    });
+    let r = run(&admin, body).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(
+        r.text().await.unwrap().contains("SSE-C"),
+        "SSE-C 拒绝需给出可理解文案"
+    );
+    // 记录上限 → 400（不静默截断）
+    let body = serde_json::json!({
+        "key": "many.csv", "expression": "SELECT * FROM S3Object",
+        "input": {"format": "CSV"}, "output": {"format": "CSV"}
+    });
+    let r = run(&admin, body).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("记录上限"));
+}
+
+/// IAM 预设：登录即可读、数量稳定；每个 doc 过 PolicyDoc::validate 且无匿名 Principal。
+#[tokio::test]
+async fn policy_templates_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/policy-templates");
+
+    for token in [&admin, &bob] {
+        let r = client.get(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(r.status(), 200, "普通登录用户与管理员都可读");
+        let list: Vec<serde_json::Value> = r.json().await.unwrap();
+        let ids: Vec<&str> = list.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["read-only", "read-write", "prefix-isolated"]);
+        for t in &list {
+            let doc: xl_s3::policy::PolicyDoc = serde_json::from_value(t["doc"].clone()).unwrap();
+            doc.validate()
+                .unwrap_or_else(|e| panic!("{}: {e}", t["id"]));
+            for st in t["doc"]["Statement"].as_array().unwrap() {
+                let bad = match &st["Principal"]["AWS"] {
+                    serde_json::Value::String(s) => s == "*",
+                    serde_json::Value::Array(a) => a.iter().any(|v| v == "*"),
+                    _ => true,
+                };
+                assert!(!bad, "{} 不得含匿名 Principal", t["id"]);
+                assert!(
+                    !st["Action"].to_string().contains("Delete"),
+                    "{} 不得含删除动作",
+                    t["id"]
+                );
+            }
+        }
+    }
+    // 匿名 → 401（所有 console 路由由 JwtLayer 统一挡）
+    let r = client.get(&url).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+}

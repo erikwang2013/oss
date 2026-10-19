@@ -737,6 +737,38 @@ pub fn evaluate(
     out_fmt: &OutFormat,
     opts: &EvalOptions,
 ) -> s3s::S3Result<Vec<SelectEvent>> {
+    evaluate_inner(plan, input, in_fmt, out_fmt, opts, None)
+}
+
+/// 控制台一次性 Select 用：加输出上限（记录数 / 渲染字节）。越限返回 `InvalidRequest`
+/// （400，不静默截断）——控制台把全部 records 一次读进内存，需要有界失败。
+pub fn evaluate_capped(
+    plan: &SelectPlan,
+    input: &[u8],
+    in_fmt: &InFormat,
+    out_fmt: &OutFormat,
+    opts: &EvalOptions,
+    max_records: usize,
+    max_bytes: usize,
+) -> s3s::S3Result<Vec<SelectEvent>> {
+    evaluate_inner(
+        plan,
+        input,
+        in_fmt,
+        out_fmt,
+        opts,
+        Some((max_records, max_bytes)),
+    )
+}
+
+fn evaluate_inner(
+    plan: &SelectPlan,
+    input: &[u8],
+    in_fmt: &InFormat,
+    out_fmt: &OutFormat,
+    opts: &EvalOptions,
+    caps: Option<(usize, usize)>,
+) -> s3s::S3Result<Vec<SelectEvent>> {
     // 1) 解析输入记录（全量缓冲——本片记档取舍）
     enum Parsed {
         Csv(ParsedCsv),
@@ -808,6 +840,14 @@ pub fn evaluate(
             break;
         }
         let line = project(plan, rec, csv_header.as_deref(), out_fmt)?;
+        if let Some((max_records, max_bytes)) = caps {
+            if out_count >= max_records {
+                return Err(bad(format!("结果超过 {max_records} 条记录上限")));
+            }
+            if out.len() + line.len() > max_bytes {
+                return Err(bad(format!("结果超过 {max_bytes} 字节上限")));
+            }
+        }
         if line.is_empty() {
             // 全表达式为 NULL 且 JSON 输出空对象等——仍输出一条空记录（AWS 输出空行）
         }
@@ -817,6 +857,11 @@ pub fn evaluate(
     if only_agg && plan.limit != Some(0) {
         let st = agg_state.get_or_insert_with(|| AggState::new(&plan.items[0]));
         let line = st.render(out_fmt)?;
+        if let Some((_, max_bytes)) = caps
+            && line.len() > max_bytes
+        {
+            return Err(bad(format!("结果超过 {max_bytes} 字节上限")));
+        }
         if !line.is_empty() {
             out.push_str(&line);
         }
@@ -1812,6 +1857,35 @@ mod tests {
             )),
             ""
         );
+    }
+
+    #[test]
+    fn evaluate_capped_enforces_record_and_byte_limits() {
+        let plan = parse("SELECT * FROM S3Object").unwrap();
+        let opts = EvalOptions {
+            request_progress: false,
+            scanned: None,
+            scan: None,
+        };
+        let eval = |max_records, max_bytes| {
+            evaluate_capped(
+                &plan,
+                b"a\nb\nc\n",
+                &InFormat::Csv(csv_opts()),
+                &OutFormat::Csv(CsvOut::default()),
+                &opts,
+                max_records,
+                max_bytes,
+            )
+        };
+        // 3 条恰好到限 → 成功；再多一条则 400
+        assert!(eval(3, 1024).is_ok());
+        let err = eval(2, 1024).unwrap_err();
+        assert!(err.message().unwrap().contains("记录上限"), "{err}");
+        let err = eval(3, 3).unwrap_err();
+        assert!(err.message().unwrap().contains("字节上限"), "{err}");
+        // 上限内正常返回完整记录（3 条两字节 = 6 字节）
+        assert_eq!(records_text(&eval(3, 6).unwrap()), "a\nb\nc\n");
     }
 
     #[test]
