@@ -327,14 +327,13 @@ async fn disabled_transition_rule_readable_but_never_swept() {
         .unwrap();
     let s3 = OssS3::new(Arc::clone(&st.store), st.acl(), st.cfg.max_put_bytes)
         .with_lifecycle(Some(Arc::clone(&st.lifecycle)));
+    let mut rule = s3_rule("off");
+    rule.status = ExpirationStatus::from_static(ExpirationStatus::DISABLED);
+    // days=0：对象立即到期；若 sweep 漏掉 enabled 过滤，本测试会真的入队。
+    rule.transitions.as_mut().unwrap()[0].days = Some(0);
     s3.put_bucket_lifecycle_configuration(req(PutBucketLifecycleConfigurationInput {
         bucket: "bkt".into(),
-        lifecycle_configuration: Some(BucketLifecycleConfiguration {
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::DISABLED),
-                ..s3_rule("off")
-            }],
-        }),
+        lifecycle_configuration: Some(BucketLifecycleConfiguration { rules: vec![rule] }),
         ..Default::default()
     }))
     .await
@@ -350,7 +349,7 @@ async fn disabled_transition_rule_readable_but_never_swept() {
     let rules = out.rules.unwrap();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].status.as_str(), ExpirationStatus::DISABLED);
-    assert_eq!(rules[0].transitions.as_ref().unwrap()[0].days, Some(1));
+    assert_eq!(rules[0].transitions.as_ref().unwrap()[0].days, Some(0));
 
     let queued = oss_server::tier_jobs::sweep_transitions(&st.db, &st.store, st.lifecycle.as_ref())
         .await
