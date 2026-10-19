@@ -64,7 +64,8 @@ fn env(max_attempts: i64, timeout_secs: i64) -> JobEnv {
 
 fn spec(tasks: Vec<&str>, report: bool) -> JobSpec {
     JobSpec {
-        kind: "batch".into(),
+        // 非 batch：走引擎通用报告列（batch 列格式由 m8_batch 覆盖）
+        kind: "generic".into(),
         bucket: "reports".into(),
         requested_by: Some(7),
         tasks: tasks
