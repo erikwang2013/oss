@@ -255,6 +255,21 @@ pub async fn create_batch(
         None,
     )
     .await?;
+    let head = state
+        .store
+        .head_object(&req.manifest_bucket, &req.manifest_key)
+        .await
+        .map_err(|e| match e {
+            xl_store::error::Error::NoSuchKey(_) => BatchError::NotFound("清单对象不存在".into()),
+            other => invalid(format!("清单读取失败: {other}")),
+        })?;
+    // 先按 HEAD 大小挡 16 MiB，避免为超限清单分配整块内存；读入后再兜一次。
+    if head.size > MAX_MANIFEST_BYTES as u64 {
+        return Err(invalid(format!(
+            "清单超过 {} MiB 上限",
+            MAX_MANIFEST_BYTES >> 20
+        )));
+    }
     let (_, bytes) = state
         .store
         .get_object_ext(&req.manifest_bucket, &req.manifest_key, None)

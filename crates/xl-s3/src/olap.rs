@@ -89,6 +89,8 @@ pub struct OlapTransform {
     max_response_bytes: usize,
     /// 预加载失败原因：配置在但变换器不可用 → GET 500（不得静默直通原文）。
     broken: Option<String>,
+    /// 私网 endpoint 放行（保存时与请求解析时共用；测试可显式注入）。
+    allow_private: bool,
     #[cfg(feature = "olap-wasm")]
     module: Option<wasmtime::Module>,
 }
@@ -101,6 +103,25 @@ impl OlapTransform {
         module: Option<&[u8]>,
         timeout_ms: i64,
         max_response_bytes: i64,
+    ) -> Result<Self, String> {
+        Self::prepare_with_allow_private(
+            kind,
+            endpoint,
+            module,
+            timeout_ms,
+            max_response_bytes,
+            allow_private(),
+        )
+    }
+
+    /// 同 [`Self::prepare`]，但显式指定私网放行——测试注入，不读进程环境变量。
+    pub fn prepare_with_allow_private(
+        kind: &str,
+        endpoint: Option<String>,
+        module: Option<&[u8]>,
+        timeout_ms: i64,
+        max_response_bytes: i64,
+        allow_private: bool,
     ) -> Result<Self, String> {
         let kind = OlapKind::parse(kind).ok_or("kind 必须是 http/wasm")?;
         if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
@@ -118,13 +139,14 @@ impl OlapTransform {
         match kind {
             OlapKind::Http => {
                 let endpoint = endpoint.ok_or("kind=http 必须提供 endpoint")?;
-                validate_endpoint(&endpoint)?;
+                validate_endpoint_with(&endpoint, allow_private)?;
                 Ok(Self {
                     kind,
                     endpoint: Some(endpoint),
                     timeout,
                     max_response_bytes,
                     broken: None,
+                    allow_private,
                     #[cfg(feature = "olap-wasm")]
                     module: None,
                 })
@@ -147,6 +169,7 @@ impl OlapTransform {
                         timeout,
                         max_response_bytes,
                         broken: None,
+                        allow_private,
                         module: Some(module),
                     })
                 }
@@ -204,6 +227,7 @@ impl OlapTransform {
             timeout: Duration::from_secs(1),
             max_response_bytes: 0,
             broken: Some(reason),
+            allow_private: false,
             #[cfg(feature = "olap-wasm")]
             module: None,
         }
@@ -263,11 +287,7 @@ fn parse_endpoint(endpoint: &str) -> Result<EndpointTarget, String> {
 }
 
 /// 保存时校验：形状 + IP 字面量的内网拒（域名留到每次请求解析后判）。
-fn validate_endpoint(endpoint: &str) -> Result<(), String> {
-    validate_endpoint_with(endpoint, allow_private())
-}
-
-/// 可注入判定，测试不依赖进程环境变量。
+/// `allow_private` 由调用方注入（生产读环境变量，测试显式传入）。
 fn validate_endpoint_with(endpoint: &str, allow_private: bool) -> Result<(), String> {
     let t = parse_endpoint(endpoint)?;
     if let Some(ip) = t.ip
@@ -340,7 +360,7 @@ impl OlapTransform {
     async fn http_transform(&self, input: OlapInput<'_>) -> Result<OlapOutput, String> {
         let endpoint = self.endpoint.as_deref().ok_or("http 变换器缺 endpoint")?;
         let target = parse_endpoint(endpoint)?;
-        let addrs = resolve_target(&target).await?;
+        let addrs = resolve_target(&target, self.allow_private).await?;
 
         let mut builder = reqwest::Client::builder()
             .no_proxy() // 环境代理不得绕过 DNS 钉扎
@@ -442,7 +462,10 @@ impl OlapTransform {
 }
 
 /// 解析并校验目标地址；域名返回全部钉扎地址，混合记录中出现一个私网即整体拒。
-async fn resolve_target(t: &EndpointTarget) -> Result<Vec<SocketAddr>, String> {
+async fn resolve_target(
+    t: &EndpointTarget,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, String> {
     let addrs: Vec<SocketAddr> = match t.ip {
         Some(ip) => vec![SocketAddr::new(ip, t.port)],
         None => tokio::net::lookup_host((t.host.as_str(), t.port))
@@ -453,7 +476,7 @@ async fn resolve_target(t: &EndpointTarget) -> Result<Vec<SocketAddr>, String> {
     if addrs.is_empty() {
         return Err("transform DNS 无结果".into());
     }
-    if !allow_private() {
+    if !allow_private {
         for a in &addrs {
             if !ip_is_public(a.ip()) {
                 return Err("transform endpoint 指向非公网地址".into());
@@ -716,8 +739,8 @@ mod tests {
     #[test]
     fn endpoint_shape_validation() {
         // 形状合法（不解析 DNS）
-        assert!(validate_endpoint("https://example.com/hook").is_ok());
-        assert!(validate_endpoint("http://example.com:8080/hook?x=1").is_ok());
+        assert!(validate_endpoint_with("https://example.com/hook", false).is_ok());
+        assert!(validate_endpoint_with("http://example.com:8080/hook?x=1", false).is_ok());
         for bad in [
             "ftp://example.com/x",
             "file:///etc/passwd",
@@ -725,7 +748,7 @@ mod tests {
             "https://user@example.com/x",
             "not-a-url",
         ] {
-            assert!(validate_endpoint(bad).is_err(), "{bad}");
+            assert!(validate_endpoint_with(bad, false).is_err(), "{bad}");
         }
         // IP 字面量保存即拒；显式注入 allow_private=false，不依赖进程环境变量。
         assert!(validate_endpoint_with("http://127.0.0.1:9/", false).is_err());

@@ -301,7 +301,9 @@ impl BatchExecutor {
                 None,
                 None,
                 tags,
-                info.storage_class.clone(),
+                // 目标固定 STANDARD（在线 CopyObject 语义）；源存储类不继承——Restored
+                // 归档源会把 GLACIER 写成一个无 tier 的非法目标状态。
+                None,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -422,11 +424,15 @@ impl BatchExecutor {
             .get(ap)
             .map_err(|e| e.to_string())?
             .ok_or("变换器未加载（配置更新后重试）")?;
-        let (info, bytes) = self
-            .store
-            .get_object_ext(&p.bucket, &p.key, None)
-            .await
-            .map_err(|e| e.to_string())?;
+        let (info, bytes) = match &p.version_id {
+            Some(v) => {
+                self.store
+                    .get_object_version_ext(&p.bucket, &p.key, v, None)
+                    .await
+            }
+            None => self.store.get_object_ext(&p.bucket, &p.key, None).await,
+        }
+        .map_err(|e| e.to_string())?;
         let slot = acquire_transform_slot().await?;
         t.transform(
             OlapInput {

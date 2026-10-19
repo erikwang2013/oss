@@ -14,6 +14,7 @@ use oss_server::job_actions::{
 use oss_server::job_actions_api::{BatchCreateRequest, TagsBody, create_batch};
 use oss_server::jobs::{JobEnv, TaskExecutor, worker_once};
 use oss_server::state::AppState;
+use sha2::Digest as _;
 use xl_s3::olap::OlapTransform;
 use xl_s3::replication::{ReplicationSink, WriteInfo};
 use xl_s3::restore::RestoreSink;
@@ -503,7 +504,6 @@ async fn five_actions_and_hooks() {
     assert_eq!(f.restore.calls.lock().unwrap().len(), 1, "已在恢复不再入队");
 
     // ---- InvokeLambda：POST 给 HTTP 变换器，输出丢弃 ----
-    unsafe { std::env::set_var("OSS_OLAP_ALLOW_PRIVATE", "1") };
     let hits = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let app = axum::Router::new()
         .route(
@@ -515,6 +515,10 @@ async fn five_actions_and_hooks() {
                     "ok"
                 },
             ),
+        )
+        .route(
+            "/fail",
+            axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
         )
         .with_state(Arc::clone(&hits));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -537,18 +541,20 @@ async fn five_actions_and_hooks() {
         )
         .await
         .unwrap();
-    f.st.olap_cache.put(
-        "ap1",
-        "src",
-        OlapTransform::prepare(
+    // 注入 allow_private，避免测试进程级环境变量。
+    let transform = |url: &str| {
+        OlapTransform::prepare_with_allow_private(
             "http",
-            Some(format!("http://{addr}/t")),
+            Some(url.to_string()),
             None,
             5_000,
             1 << 20,
+            true,
         )
-        .unwrap(),
-    );
+        .unwrap()
+    };
+    f.st.olap_cache
+        .put("ap1", "src", transform(&format!("http://{addr}/t")));
     f.put("src", "invoke", b"payload-bytes").await;
     let mut iv = payload("src", "invoke", f.admin);
     iv.transform_access_point = Some("ap1".into());
@@ -557,6 +563,76 @@ async fn five_actions_and_hooks() {
         hits.lock().unwrap().as_slice(),
         &[b"payload-bytes".to_vec()]
     );
+
+    // 清单 versionId 生效：读旧版本而非最新
+    let old = f
+        .store()
+        .put_object_stream_with_meta(
+            "src",
+            "invoke-ver",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"old-bytes"))
+            })),
+            None,
+            Default::default(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .version_id
+        .unwrap();
+    f.store()
+        .put_object_stream_with_meta(
+            "src",
+            "invoke-ver",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"new-bytes"))
+            })),
+            None,
+            Default::default(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut iv = payload("src", "invoke-ver", f.admin);
+    iv.transform_access_point = Some("ap1".into());
+    iv.version_id = Some(old);
+    assert_eq!(f.run(BATCH_INVOKE, &iv).await.unwrap(), "Succeeded");
+    assert_eq!(hits.lock().unwrap().last().unwrap(), &b"old-bytes".to_vec());
+
+    // 变换器非 2xx → Err（引擎按上限收敛）
+    f.db()
+        .create_access_point("ap-fail", "src", f.admin, None, 1)
+        .await
+        .unwrap();
+    f.db()
+        .set_olap_config(
+            "ap-fail",
+            "http",
+            Some(&format!("http://{addr}/fail")),
+            None,
+            None,
+            5_000,
+            1 << 20,
+            1,
+        )
+        .await
+        .unwrap();
+    f.st.olap_cache
+        .put("ap-fail", "src", transform(&format!("http://{addr}/fail")));
+    let mut iv = payload("src", "invoke", f.admin);
+    iv.transform_access_point = Some("ap-fail".into());
+    assert!(f.run(BATCH_INVOKE, &iv).await.is_err(), "500 必须失败");
 }
 
 #[tokio::test]
@@ -691,6 +767,100 @@ async fn versioned_source_copy_and_tag() {
     assert_eq!(old_tags, t.tags);
     let (_, latest_tags) = f.store().get_object_tags("src", "doc", None).await.unwrap();
     assert!(latest_tags.is_empty(), "最新版本不得被改");
+
+    // Delete + versionId：只删指定版本，最新版本仍可读
+    let mut d = payload("src", "doc", f.admin);
+    d.version_id = Some(v1.clone());
+    assert_eq!(f.run(BATCH_DELETE, &d).await.unwrap(), "Succeeded");
+    assert!(
+        f.store()
+            .get_object_version_ext("src", "doc", &v1, None)
+            .await
+            .is_err(),
+        "指定版本应已删除"
+    );
+    assert_eq!(
+        f.store().get_object("src", "doc").await.unwrap().1,
+        Bytes::from_static(b"two")
+    );
+}
+
+/// 回归：Restored 归档源的 Batch Copy 不得继承 GLACIER（否则目标无 tier，非法态）；
+/// 目标应为 STANDARD 且可读。顺带覆盖 Restored 态再次 Restore 的幂等。
+#[tokio::test]
+async fn restored_archive_copy_is_standard_and_readable() {
+    let f = fx().await;
+    let data = b"thawed-bytes";
+    let info = f
+        .store()
+        .put_object("src", "thaw", Bytes::from_static(data), None)
+        .await
+        .unwrap();
+    let vid = info.version_id.clone().unwrap_or_else(|| "null".into());
+    f.store()
+        .archive_version(
+            "src",
+            "thaw",
+            &vid,
+            ArchiveSpec {
+                backend: "cold".into(),
+                key: "thaw-key".into(),
+                size: info.size,
+                source_etag: info.etag.clone(),
+                etag: "remote".into(),
+                sha256: hex::encode(sha2::Sha256::digest(data)),
+                class: "GLACIER".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    f.store()
+        .mark_restore_pending("src", "thaw", &vid)
+        .await
+        .unwrap();
+    f.store()
+        .restore_prepare("src", "thaw", &vid, data)
+        .await
+        .unwrap();
+    f.store()
+        .restore_commit("src", "thaw", &vid, wall_now() + 3600)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store()
+            .head_object("src", "thaw")
+            .await
+            .unwrap()
+            .storage_class
+            .as_deref(),
+        Some("GLACIER"),
+        "源确为归档类"
+    );
+
+    let mut cp = payload("src", "thaw", f.admin);
+    cp.target_bucket = Some("dst".into());
+    assert_eq!(f.run(BATCH_COPY, &cp).await.unwrap(), "Succeeded");
+    let (dst, body) = f.store().get_object("dst", "thaw").await.unwrap();
+    assert_eq!(body, Bytes::from_static(data), "目标内容可读");
+    assert_eq!(dst.storage_class, None, "目标固定 STANDARD，不继承 GLACIER");
+    let dst_vid = dst.version_id.clone().unwrap_or_else(|| "null".into());
+    assert!(
+        f.store()
+            .tier_version("dst", "thaw", &dst_vid)
+            .await
+            .unwrap()
+            .unwrap()
+            .tier
+            .is_none(),
+        "目标不得带 tier 记录"
+    );
+
+    // Restored 态再 Restore：幂等成功且不重复入队
+    let mut r = payload("src", "thaw", f.admin);
+    r.restore_days = Some(1);
+    assert_eq!(f.run(BATCH_RESTORE, &r).await.unwrap(), "Succeeded");
+    assert!(f.restore.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -763,6 +933,23 @@ async fn creation_validation_permissions_and_quota() {
     let f = fx().await;
     f.put("src", "m.csv", b"src,a\n").await;
     let other = f.db().create_user("other", "pw", false).await.unwrap();
+
+    // 清单超 16 MiB：HEAD 阶段即拒（不把整块对象读进内存）
+    f.store()
+        .put_object(
+            "src",
+            "big.csv",
+            Bytes::from(vec![b'a'; (16 << 20) + 1]),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut big = req("ReplaceTags", "big.csv");
+    big.tags = tags(&[("k", "v")]);
+    assert!(matches!(
+        create_batch(&f.st, f.admin, true, big).await,
+        Err(BatchError::Invalid(_))
+    ));
 
     // 清单桶不可读 → 403
     let mut r = req("ReplaceTags", "m.csv");
