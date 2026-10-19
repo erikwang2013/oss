@@ -4,6 +4,7 @@ pub mod auth;
 pub mod bucket_cleanup;
 pub mod convert;
 pub mod events;
+pub mod inventory;
 pub mod lifecycle;
 pub mod lock;
 pub mod notify;

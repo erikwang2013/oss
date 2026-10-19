@@ -40,7 +40,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     .with_bucket_cleanup(Some(Arc::clone(&state.bucket_cleanup)))
     .with_lifecycle(Some(Arc::clone(&state.lifecycle)))
     .with_restore(Some(Arc::clone(&state.restore_sink)))
-    .with_tier_gc(Some(Arc::clone(&state.tier_gc)));
+    .with_tier_gc(Some(Arc::clone(&state.tier_gc)))
+    .with_inventory(Some(Arc::clone(&state.inventory)));
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
     let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);

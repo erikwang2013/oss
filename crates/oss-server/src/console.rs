@@ -60,7 +60,7 @@ fn stale_user() -> Response {
 
 /// uid + is_admin 一次取出（普通登录路由用）。**被停用的账号视同失效**（旧 token 立即作废）。
 #[allow(clippy::result_large_err)]
-async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Response> {
+pub(crate) async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Response> {
     let uid = uid_of(payload)?;
     match state.db.get_user(uid).await {
         Ok(Some((_, is_admin, true))) => Ok((uid, is_admin)),
@@ -130,6 +130,8 @@ pub fn routes() -> Router<AppState> {
         .route("/jobs/{id}/{action}", post(job_action))
         // M8 S1：访问点 CRUD/策略
         .merge(crate::access_points_api::routes())
+        // M8 S5：Inventory 配置（owner/admin）
+        .merge(crate::inventory_api::routes())
         .route(
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
@@ -462,7 +464,7 @@ async fn job_action(
 /// 归属门（桶主或管理员）——policy/lifecycle 共用；桶必须存在（404 护栏：防给不存在桶
 /// 预置策略/规则、同名桶日后创建即继承——verifier 非阻断 3）。
 #[allow(clippy::result_large_err)]
-async fn require_owner_or_admin(
+pub(crate) async fn require_owner_or_admin(
     state: &AppState,
     payload: &JwtPayload,
     bucket: &str,

@@ -43,6 +43,8 @@ pub struct OssS3 {
     lifecycle: Option<Arc<dyn crate::lifecycle::LifecycleStore>>,
     /// M8 S4b：Restore 入队（None = 501）。
     restore: Option<Arc<dyn crate::restore::RestoreSink>>,
+    /// M8 S5：Inventory 配置读写（None = 501）。
+    inventory: Option<Arc<dyn crate::inventory::InventoryStore>>,
 }
 
 impl OssS3 {
@@ -69,6 +71,7 @@ impl OssS3 {
             tier_gc: None,
             lifecycle: None,
             restore: None,
+            inventory: None,
         }
     }
 
@@ -103,6 +106,21 @@ impl OssS3 {
         self.restore
             .as_ref()
             .ok_or_else(|| s3s::s3_error!(NotImplemented, "restore is not wired"))
+    }
+
+    /// M8 S5：注入 Inventory 配置存储（console 与 S3 共用同一实例）。
+    pub fn with_inventory(
+        mut self,
+        store: Option<Arc<dyn crate::inventory::InventoryStore>>,
+    ) -> Self {
+        self.inventory = store;
+        self
+    }
+
+    fn inventory_store(&self) -> S3Result<&Arc<dyn crate::inventory::InventoryStore>> {
+        self.inventory
+            .as_ref()
+            .ok_or_else(|| s3s::s3_error!(NotImplemented, "inventory configuration is not wired"))
     }
 
     /// M8 S4a：删除已成功的归档版本 → 远端清理（best-effort）。
@@ -348,6 +366,29 @@ fn lifecycle_error(e: crate::lifecycle::LifecycleError) -> s3s::S3Error {
         E::NotImplemented(m) => s3s::s3_error!(NotImplemented, "{}", m),
         E::Internal(m) => {
             tracing::error!(error = %m, "生命周期存储失败");
+            s3s::s3_error!(InternalError, "internal error")
+        }
+    }
+}
+
+/// M8 S5：Inventory 错误矩阵 → S3 错误码（AWS 无 NoSuchConfiguration 码，用自定义码 + 404）。
+fn inventory_error(e: crate::inventory::InventoryError) -> s3s::S3Error {
+    use crate::inventory::InventoryError as E;
+    match e {
+        E::NoSuchBucket => s3s::s3_error!(NoSuchBucket),
+        E::NoSuchConfiguration => {
+            let mut err = s3s::S3Error::with_message(
+                s3s::S3ErrorCode::Custom("NoSuchConfiguration".into()),
+                "the inventory configuration does not exist",
+            );
+            err.set_status_code(StatusCode::NOT_FOUND);
+            err
+        }
+        E::InvalidArgument(m) => s3s::s3_error!(InvalidArgument, "{}", m),
+        E::AccessDenied(m) => s3s::s3_error!(AccessDenied, "{}", m),
+        E::NotImplemented(m) => s3s::s3_error!(NotImplemented, "{}", m),
+        E::Internal(m) => {
+            tracing::error!(error = %m, "inventory 存储失败");
             s3s::s3_error!(InternalError, "internal error")
         }
     }
@@ -2524,6 +2565,79 @@ impl S3 for OssS3 {
             .await
             .map_err(lifecycle_error)?;
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+    }
+
+    async fn put_bucket_inventory_configuration(
+        &self,
+        req: S3Request<PutBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketInventoryConfigurationOutput>> {
+        let store = self.inventory_store()?;
+        let owner = req
+            .extensions
+            .get::<crate::access::AuthedUser>()
+            .cloned()
+            .ok_or_else(|| s3s::s3_error!(AccessDenied, "access denied"))?;
+        let input = req.input;
+        if input.id != input.inventory_configuration.id {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "id in URL and body must match"
+            ));
+        }
+        store
+            .put_config(&input.bucket, &owner, &input.inventory_configuration)
+            .await
+            .map_err(inventory_error)?;
+        Ok(S3Response::new(
+            PutBucketInventoryConfigurationOutput::default(),
+        ))
+    }
+
+    async fn get_bucket_inventory_configuration(
+        &self,
+        req: S3Request<GetBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketInventoryConfigurationOutput>> {
+        let store = self.inventory_store()?;
+        let cfg = store
+            .get_config(&req.input.bucket, &req.input.id)
+            .await
+            .map_err(inventory_error)?
+            .ok_or_else(|| {
+                inventory_error(crate::inventory::InventoryError::NoSuchConfiguration)
+            })?;
+        Ok(S3Response::new(GetBucketInventoryConfigurationOutput {
+            inventory_configuration: Some(cfg),
+        }))
+    }
+
+    async fn delete_bucket_inventory_configuration(
+        &self,
+        req: S3Request<DeleteBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<DeleteBucketInventoryConfigurationOutput>> {
+        let store = self.inventory_store()?;
+        store
+            .delete_config(&req.input.bucket, &req.input.id)
+            .await
+            .map_err(inventory_error)?;
+        Ok(S3Response::new(
+            DeleteBucketInventoryConfigurationOutput::default(),
+        ))
+    }
+
+    async fn list_bucket_inventory_configurations(
+        &self,
+        req: S3Request<ListBucketInventoryConfigurationsInput>,
+    ) -> S3Result<S3Response<ListBucketInventoryConfigurationsOutput>> {
+        let store = self.inventory_store()?;
+        let list = store
+            .list_configs(&req.input.bucket)
+            .await
+            .map_err(inventory_error)?;
+        Ok(S3Response::new(ListBucketInventoryConfigurationsOutput {
+            inventory_configuration_list: Some(list),
+            is_truncated: Some(false),
+            ..Default::default()
+        }))
     }
 
     async fn restore_object(

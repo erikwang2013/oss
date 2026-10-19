@@ -92,6 +92,12 @@ pub fn s3_action(op: &str) -> Option<&'static str> {
         "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle" => {
             "s3:PutLifecycleConfiguration"
         }
+        // M8 S5：Inventory（读/写/删三种桶级动作）
+        "GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations" => {
+            "s3:GetInventoryConfiguration"
+        }
+        "PutBucketInventoryConfiguration" => "s3:PutInventoryConfiguration",
+        "DeleteBucketInventoryConfiguration" => "s3:DeleteInventoryConfiguration",
         "RestoreObject" => "s3:RestoreObject",
         "DeleteBucket" => "s3:DeleteBucket",
         "CreateBucket" => "s3:CreateBucket",
@@ -274,6 +280,19 @@ mod tests {
         assert_eq!(s3_action("DeleteObjectTagging"), Some("s3:PutObject"));
         assert_eq!(s3_action("CopyObject"), None);
         assert_eq!(s3_action("Frobnicate"), None);
+        // M8 S5：Inventory 桶级动作
+        assert_eq!(
+            s3_action("GetBucketInventoryConfiguration"),
+            Some("s3:GetInventoryConfiguration")
+        );
+        assert_eq!(
+            s3_action("PutBucketInventoryConfiguration"),
+            Some("s3:PutInventoryConfiguration")
+        );
+        assert_eq!(
+            s3_action("DeleteBucketInventoryConfiguration"),
+            Some("s3:DeleteInventoryConfiguration")
+        );
     }
 
     /// 标签 op 折叠后，s3:GetObject / s3:PutObject 的 Deny 同样压住标签读写。

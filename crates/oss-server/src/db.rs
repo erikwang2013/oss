@@ -123,6 +123,46 @@ fn row_to_restore(r: &sqlx::sqlite::SqliteRow) -> RestoreRow {
     }
 }
 
+/// M8 S5：Inventory 配置行（`config_json` = s3s DTO 的 JSON）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryConfigRow {
+    pub bucket: String,
+    pub id: String,
+    pub owner_id: i64,
+    pub config_json: String,
+    pub updated_at: i64,
+}
+
+/// M8 S5：Inventory 运行行（`started_at` = 实际开始执行的时刻）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryRunRow {
+    pub id: i64,
+    pub bucket: String,
+    pub config_id: String,
+    pub run_key: String,
+    pub started_at: i64,
+    pub state: String,
+    pub job_id: Option<i64>,
+    pub manifest_key: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+}
+
+fn inventory_run_row(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
+    InventoryRunRow {
+        id: r.get("id"),
+        bucket: r.get("bucket"),
+        config_id: r.get("config_id"),
+        run_key: r.get("run_key"),
+        started_at: r.get("started_at"),
+        state: r.get("state"),
+        job_id: r.get("job_id"),
+        manifest_key: r.get("manifest_key"),
+        error: r.get("error"),
+        created_at: r.get("created_at"),
+    }
+}
+
 /// 访问点行（M8 S1）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccessPointRow {
@@ -3134,6 +3174,200 @@ impl Db {
         }
         tx.commit().await?;
         Ok(Some(new_id))
+    }
+
+    // ——— M8 S5：Inventory 配置与运行行 ———
+
+    pub async fn inventory_config_count(&self, bucket: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM inventory_configs WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("n"))
+    }
+
+    pub async fn inventory_get_config(
+        &self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<Option<InventoryConfigRow>> {
+        let row = sqlx::query(
+            "SELECT bucket, id, owner_id, config_json, updated_at FROM inventory_configs \
+             WHERE bucket = ? AND id = ?",
+        )
+        .bind(bucket)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| InventoryConfigRow {
+            bucket: r.get("bucket"),
+            id: r.get("id"),
+            owner_id: r.get("owner_id"),
+            config_json: r.get("config_json"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    pub async fn inventory_list_configs(&self, bucket: &str) -> Result<Vec<InventoryConfigRow>> {
+        let rows = sqlx::query(
+            "SELECT bucket, id, owner_id, config_json, updated_at FROM inventory_configs \
+             WHERE bucket = ? ORDER BY id",
+        )
+        .bind(bucket)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| InventoryConfigRow {
+                bucket: r.get("bucket"),
+                id: r.get("id"),
+                owner_id: r.get("owner_id"),
+                config_json: r.get("config_json"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    /// 生成器用：全部桶的配置（ORDER BY bucket, id 保证调度确定性）。
+    pub async fn inventory_list_all_configs(&self) -> Result<Vec<InventoryConfigRow>> {
+        let rows = sqlx::query(
+            "SELECT bucket, id, owner_id, config_json, updated_at FROM inventory_configs \
+             ORDER BY bucket, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| InventoryConfigRow {
+                bucket: r.get("bucket"),
+                id: r.get("id"),
+                owner_id: r.get("owner_id"),
+                config_json: r.get("config_json"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    pub async fn inventory_upsert_config(
+        &self,
+        bucket: &str,
+        id: &str,
+        owner_id: i64,
+        config_json: &str,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, id) DO UPDATE SET \
+             owner_id = excluded.owner_id, config_json = excluded.config_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(id)
+        .bind(owner_id)
+        .bind(config_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn inventory_delete_config(&self, bucket: &str, id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM inventory_configs WHERE bucket = ? AND id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// 建运行行；`(bucket, config_id, run_key)` 已存在 → None（同槽去重）。
+    pub async fn inventory_create_run(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        let r = sqlx::query(
+            "INSERT OR IGNORE INTO inventory_runs \
+             (bucket, config_id, run_key, started_at, state, created_at) \
+             VALUES (?, ?, ?, 0, 'running', ?)",
+        )
+        .bind(bucket)
+        .bind(config_id)
+        .bind(run_key)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok((r.rows_affected() > 0).then(|| r.last_insert_rowid()))
+    }
+
+    pub async fn inventory_run_set_job(&self, run_id: i64, job_id: i64) -> Result<()> {
+        sqlx::query("UPDATE inventory_runs SET job_id = ? WHERE id = ?")
+            .bind(job_id)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 执行器开始跑时写实际开始时刻（槽时间只体现在 run_key）。
+    pub async fn inventory_run_started(&self, run_id: i64, now: i64) -> Result<()> {
+        sqlx::query("UPDATE inventory_runs SET started_at = ? WHERE id = ? AND started_at = 0")
+            .bind(now)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn inventory_run_by_key(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+    ) -> Result<Option<InventoryRunRow>> {
+        let row = sqlx::query(
+            "SELECT id, bucket, config_id, run_key, started_at, state, job_id, manifest_key, \
+             error, created_at FROM inventory_runs WHERE bucket = ? AND config_id = ? AND run_key = ?",
+        )
+        .bind(bucket)
+        .bind(config_id)
+        .bind(run_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(inventory_run_row))
+    }
+
+    pub async fn inventory_run_finish(
+        &self,
+        run_id: i64,
+        state: &str,
+        manifest_key: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE inventory_runs SET state = ?, manifest_key = ?, error = ? WHERE id = ?",
+        )
+        .bind(state)
+        .bind(manifest_key)
+        .bind(error)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Inventory 作业的 `progress` = 已扫描对象数（任务收尾时引擎会 +1，调用方存 n-1）。
+    pub async fn job_set_progress(&self, job_id: i64, progress: i64, now: i64) -> Result<()> {
+        sqlx::query("UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?")
+            .bind(progress)
+            .bind(now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // ——— M4 切片 7：桶策略与审计 ———

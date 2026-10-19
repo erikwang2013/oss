@@ -2250,6 +2250,7 @@ dependencies = [
  "csv",
  "ecat",
  "ecat-logging",
+ "flate2",
  "futures",
  "hex",
  "http-body-util",

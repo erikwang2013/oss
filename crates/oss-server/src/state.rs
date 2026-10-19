@@ -50,6 +50,28 @@ pub struct AppState {
     pub restore_sink: Arc<dyn xl_s3::restore::RestoreSink>,
     /// M8 S4b：删除对象时回收远端归档副本。
     pub tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink>,
+    /// M8 S5：Inventory 配置存储（S3 与 console 共用）。
+    pub inventory: Arc<dyn xl_s3::inventory::InventoryStore>,
+    /// M8 S5：Inventory 生成执行器（作业引擎的 `Inventory` 动作）。
+    pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
+}
+
+fn mesh_of(store: &Store) -> Option<xl_s3::access::ControlMesh> {
+    store.cluster().map(|c| {
+        let self_id = c.sets.flat.self_node().id.clone();
+        xl_s3::access::ControlMesh {
+            transport: c.transport.clone(),
+            peers: c
+                .sets
+                .flat
+                .nodes
+                .iter()
+                .filter(|n| n.id != self_id)
+                .map(|n| n.id.clone())
+                .collect(),
+            self_id,
+        }
+    })
 }
 
 /// M8 S0/S1：删桶清理的跨 crate 实现（Db 清表 + AP 缓存失效）。
@@ -468,21 +490,7 @@ impl AppState {
 
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
     pub fn control_mesh(&self) -> Option<xl_s3::access::ControlMesh> {
-        self.store.cluster().map(|c| {
-            let self_id = c.sets.flat.self_node().id.clone();
-            xl_s3::access::ControlMesh {
-                transport: c.transport.clone(),
-                peers: c
-                    .sets
-                    .flat
-                    .nodes
-                    .iter()
-                    .filter(|n| n.id != self_id)
-                    .map(|n| n.id.clone())
-                    .collect(),
-                self_id,
-            }
-        })
+        mesh_of(&self.store)
     }
 
     /// 三面共用的判权实例（Task 9：集群时自动带读扇出；SQL 唯一事实源在 xl-s3::Acl）。
@@ -617,6 +625,17 @@ impl AppState {
             Arc::new(crate::tier_jobs::SqlRestoreSink::new(Arc::clone(&db)));
         let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
             Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
+        // M8 S5：Inventory 配置存储与执行器（共用三面判权实例语义）。
+        let inv_acl = xl_s3::access::Acl::with_mesh(db.pool().clone(), mesh_of(&store));
+        let inventory: Arc<dyn xl_s3::inventory::InventoryStore> = Arc::new(
+            crate::inventory_store::SqlInventoryStore::new(Arc::clone(&db), inv_acl.clone()),
+        );
+        let inventory_runner = Arc::new(crate::inventory::InventoryRunner::new(
+            Arc::clone(&db),
+            Arc::clone(&store),
+            inv_acl,
+            cfg.staging_dir.clone(),
+        ));
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
@@ -647,6 +666,8 @@ impl AppState {
             tiers,
             restore_sink,
             tier_gc,
+            inventory,
+            inventory_runner,
         }
     }
 }

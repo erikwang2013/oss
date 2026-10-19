@@ -970,6 +970,13 @@ fn classify(op: &str) -> Option<Gate> {
         // M8 S4b：生命周期配置（写配置 = 桶主，读 = 读档）；RestoreObject 是写动作
         "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle" => Gate::OwnerBucket,
         "GetBucketLifecycleConfiguration" => Gate::Need(Action::Read),
+        // M8 S5：Inventory 配置（写配置 = 桶主，读 = 读档）
+        "PutBucketInventoryConfiguration" | "DeleteBucketInventoryConfiguration" => {
+            Gate::OwnerBucket
+        }
+        "GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations" => {
+            Gate::Need(Action::Read)
+        }
         "RestoreObject" => Gate::Need(Action::Write),
         // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
         "HeadBucket"
@@ -1259,6 +1266,8 @@ mod tests {
             "SelectObjectContent",
             "GetObjectTagging",
             "GetBucketLifecycleConfiguration",
+            "GetBucketInventoryConfiguration",
+            "ListBucketInventoryConfigurations",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Read)), "{op}");
         }
@@ -1279,7 +1288,12 @@ mod tests {
             assert_eq!(classify(op), Some(Gate::Need(Action::Delete)), "{op}");
         }
         assert_eq!(classify("CopyObject"), Some(Gate::Copy));
-        for op in ["PutBucketLifecycleConfiguration", "DeleteBucketLifecycle"] {
+        for op in [
+            "PutBucketLifecycleConfiguration",
+            "DeleteBucketLifecycle",
+            "PutBucketInventoryConfiguration",
+            "DeleteBucketInventoryConfiguration",
+        ] {
             assert_eq!(classify(op), Some(Gate::OwnerBucket), "{op}");
         }
         // 未映射（含 s3s 存在但本服务未实现的桶策略类 op）→ fail-closed

@@ -89,6 +89,23 @@ fn say(m: &str) {
     }
 }
 
+/// serve 的作业动作分派：Inventory 走 S5 生成器，其余落 M8 S4b 执行器。
+struct ServeTaskExecutor {
+    tier: std::sync::Arc<crate::tier_jobs::M8TaskExecutor>,
+    inventory: std::sync::Arc<crate::inventory::InventoryRunner>,
+}
+
+#[async_trait::async_trait]
+impl crate::jobs::TaskExecutor for ServeTaskExecutor {
+    async fn execute(&self, action: &str, payload: &str) -> Result<String, String> {
+        if action == "Inventory" {
+            crate::jobs::TaskExecutor::execute(self.inventory.as_ref(), action, payload).await
+        } else {
+            crate::jobs::TaskExecutor::execute(self.tier.as_ref(), action, payload).await
+        }
+    }
+}
+
 /// 跑一条命令，返回进程退出码（0 成功 / 1 失败 / serve 正常退出为 0）。
 pub async fn run(
     cmd: Command,
@@ -196,13 +213,16 @@ pub async fn run(
             );
             // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
             crate::lifecycle::spawn_audit_cleanup(state.clone());
-            // M8 S0：通用作业引擎（S4b 的 Transition/Restore 动作；0 关闭）
-            let executor = std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
-                std::sync::Arc::clone(&state.db),
-                std::sync::Arc::clone(&state.store),
-                std::sync::Arc::clone(&state.tiers),
-                std::sync::Arc::clone(&state.events),
-            ));
+            // M8 S0：通用作业引擎（S4b 的 Transition/Restore + S5 Inventory；0 关闭）
+            let executor = std::sync::Arc::new(ServeTaskExecutor {
+                tier: std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
+                    std::sync::Arc::clone(&state.db),
+                    std::sync::Arc::clone(&state.store),
+                    std::sync::Arc::clone(&state.tiers),
+                    std::sync::Arc::clone(&state.events),
+                )),
+                inventory: std::sync::Arc::clone(&state.inventory_runner),
+            });
             crate::jobs::spawn_workers(
                 std::sync::Arc::clone(&state.db),
                 std::sync::Arc::clone(&state.store),
@@ -215,6 +235,8 @@ pub async fn run(
                 std::sync::Arc::clone(&state.lifecycle),
                 std::sync::Arc::clone(&state.restore_sink),
             );
+            // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
+            crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db));
 
             let router = crate::router::build_router(state)?;
             let mut app = ecat::App::builder()
