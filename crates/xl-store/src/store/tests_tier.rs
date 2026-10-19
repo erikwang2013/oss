@@ -177,6 +177,7 @@ async fn mpu_storage_class_lands_on_completed_version() {
             None,
             None,
             Some("ONEZONE_IA".into()),
+            None,
         )
         .await
         .unwrap();
@@ -200,6 +201,7 @@ async fn mpu_storage_class_lands_on_completed_version() {
             None,
             None,
             Some("GLACIER".into()),
+            None,
         )
         .await;
     assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");

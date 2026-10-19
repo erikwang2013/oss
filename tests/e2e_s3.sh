@@ -871,6 +871,34 @@ for bad in "$MUST11" "a=1&a=2" "${K129}=v" "a=%0A"; do
   fi
 done
 echo "   非法标签矩阵拒绝 ✓"
+
+# 20g. MPU：create 的 --tagging 在 complete 落地；>10 条在 create 即拒
+MPU_ID=$(aws --endpoint-url "$ENDPOINT" s3api create-multipart-upload --bucket "$TAG_BUCKET" \
+  --key mpu-tagged --tagging "m=1&n=2" --query UploadId --output text)
+MPU_ET=$(aws --endpoint-url "$ENDPOINT" s3api upload-part --bucket "$TAG_BUCKET" --key mpu-tagged \
+  --upload-id "$MPU_ID" --part-number 1 --body "$WORK/tag.src" --query ETag --output text)
+python3 - "$MPU_ET" "$WORK/mpu-complete.json" <<'PY'
+import json,sys
+json.dump({"Parts":[{"ETag":sys.argv[1].strip(),"PartNumber":1}]}, open(sys.argv[2],"w"))
+PY
+aws --endpoint-url "$ENDPOINT" s3api complete-multipart-upload --bucket "$TAG_BUCKET" \
+  --key mpu-tagged --upload-id "$MPU_ID" --multipart-upload "file://$WORK/mpu-complete.json" >/dev/null
+aws --endpoint-url "$ENDPOINT" s3api get-object-tagging --bucket "$TAG_BUCKET" --key mpu-tagged \
+  > "$WORK/mpu-tags.json"
+python3 - "$WORK/mpu-tags.json" <<'PY'
+import json,sys
+ts={t['Key']:t['Value'] for t in json.load(open(sys.argv[1]))['TagSet']}
+assert ts == {'m':'1','n':'2'}, ts
+print("   MPU create 标签落地 ✓", ts)
+PY
+if MPU_BAD=$(aws --endpoint-url "$ENDPOINT" s3api create-multipart-upload --bucket "$TAG_BUCKET" \
+  --key mpu-bad --tagging "$MUST11" --query UploadId --output text 2>/dev/null); then
+  aws --endpoint-url "$ENDPOINT" s3api abort-multipart-upload --bucket "$TAG_BUCKET" \
+    --key mpu-bad --upload-id "$MPU_BAD" >/dev/null 2>&1
+  echo "MPU >10 标签竟成功"; exit 1
+else
+  echo "   MPU >10 标签拒绝 ✓"
+fi
 echo ""
 
 echo "S3 验收全部通过（含 M2a multipart / Range / 元数据 / 子账户权限 / M4 版本控制 / 桶策略+审计 / M5 SSE+对象锁+STS / M6 Select+Kafka+复制 / M8 前置标签+Copy 指令）"

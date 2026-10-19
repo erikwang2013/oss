@@ -1059,8 +1059,14 @@ impl S3 for OssS3 {
             key,
             content_type,
             metadata,
+            tagging,
             ..
         } = req.input;
+        // M8 缺口 A：Create 的 x-amz-tagging 随 mpu.meta 持久化，complete 落地（同 PUT 口径）
+        let tags = match tagging.as_deref() {
+            Some(raw) if !raw.is_empty() => Some(parse_tagging_header(raw)?),
+            _ => None,
+        };
         let upload_id = self
             .store
             .create_multipart_upload_ext(
@@ -1072,6 +1078,7 @@ impl S3 for OssS3 {
                 sse.sse_kind(), // R5 扩展（P2-b）：SSE-S3/KMS 意图持久化，complete 落地
                 lock.as_ref(),  // M5 切片 4（L3）：锁意图持久化，complete 落地
                 storage_class,
+                tags,
             )
             .await
             .map_err(to_s3_error)?;

@@ -253,6 +253,7 @@ async fn sse_c_mpu_consistency() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -404,6 +405,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             Some("sse-s3"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -452,6 +454,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             Some("sse-kms"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -486,6 +489,7 @@ async fn mpu_create_sse_kind_lands_at_complete() {
             Default::default(),
             None,
             Some("sse-s3"),
+            None,
             None,
             None,
         )
@@ -878,6 +882,7 @@ async fn mpu_complete_encrypted_roundtrip() {
             Default::default(),
             None,
             Some("sse-s3"),
+            None,
             None,
             None,
         )

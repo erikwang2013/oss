@@ -247,3 +247,77 @@ async fn invalid_tags_rejected_at_put_and_set() {
     let e = s.set_object_tags("alpha", "k", None, many).await;
     assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
 }
+
+/// 单 part MPU 全流程（create → upload → complete）；`t` 走 Create 的标签参数。
+async fn mpu(
+    s: &Store,
+    key: &str,
+    t: Option<Vec<ObjectTag>>,
+    versioned: bool,
+) -> Result<ObjectInfo> {
+    let id = s
+        .create_multipart_upload_ext(
+            "alpha",
+            key,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            None,
+            t,
+        )
+        .await?;
+    let etag = s
+        .upload_part("alpha", key, &id, 1, stream_of(b"mpu-body"))
+        .await?;
+    s.complete_multipart_upload_versioned("alpha", key, &id, &[(1, etag)], versioned, None, None)
+        .await
+}
+
+#[tokio::test]
+async fn mpu_create_tags_land_on_complete() {
+    let (s, _d) = store().await;
+    let want = tags(&[("env", "prod"), ("team", "core")]);
+    let info = mpu(&s, "mp", Some(want.clone()), false).await.unwrap();
+    // ObjectInfo 与版本 meta 同源；GET 标签读的就是落地版本
+    assert_eq!(info.tags, want);
+    let (_, got) = s.get_object_tags("alpha", "mp", None).await.unwrap();
+    assert_eq!(got, want);
+    let m = s.read_meta("alpha", "mp").await.unwrap().unwrap();
+    assert_eq!(m.latest().unwrap().tags, Some(want));
+
+    // 版本控制桶同样落到新版本（链尾）
+    let info = mpu(&s, "mpv", Some(tags(&[("v", "1")])), true)
+        .await
+        .unwrap();
+    assert_eq!(info.tags, tags(&[("v", "1")]));
+    let (_, got) = s.get_object_tags("alpha", "mpv", None).await.unwrap();
+    assert_eq!(got, tags(&[("v", "1")]));
+}
+
+#[tokio::test]
+async fn mpu_without_tags_stays_none() {
+    let (s, _d) = store().await;
+    let info = mpu(&s, "mp", None, false).await.unwrap();
+    assert!(info.tags.is_empty());
+    let (_, got) = s.get_object_tags("alpha", "mp", None).await.unwrap();
+    assert!(got.is_empty());
+    let m = s.read_meta("alpha", "mp").await.unwrap().unwrap();
+    assert!(m.latest().unwrap().tags.is_none());
+}
+
+#[tokio::test]
+async fn mpu_create_rejects_invalid_tags() {
+    let (s, _d) = store().await;
+    let many: Vec<ObjectTag> = (0..11)
+        .map(|i| ObjectTag {
+            key: format!("k{i}"),
+            value: "v".into(),
+        })
+        .collect();
+    let e = mpu(&s, "mp", Some(many), false).await;
+    assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
+    let e = mpu(&s, "mp2", Some(tags(&[("bad!", "v")])), false).await;
+    assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
+}

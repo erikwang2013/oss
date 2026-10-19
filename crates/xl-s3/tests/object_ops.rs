@@ -1082,6 +1082,96 @@ async fn multipart_flow_through_service() {
 }
 
 #[tokio::test]
+async fn multipart_create_tagging_lands_and_rejects_oversize() {
+    // M8 缺口 A：Create 的 x-amz-tagging 在 complete 落地；>10 条在 Create 即拒
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let created = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mpt".into(),
+            tagging: Some("env=prod&team=core".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let upload_id = created.upload_id.unwrap();
+    let up = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "alpha".into(),
+            key: "mpt".into(),
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"t"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let etag = up.e_tag.unwrap().value().to_string();
+    s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
+        bucket: "alpha".into(),
+        key: "mpt".into(),
+        upload_id: upload_id.clone(),
+        multipart_upload: Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: Some(ETag::Strong(etag)),
+                ..Default::default()
+            }]),
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let got = s3
+        .get_object_tagging(req(GetObjectTaggingInput {
+            bucket: "alpha".into(),
+            key: "mpt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let mut pairs: Vec<(String, String)> = got
+        .tag_set
+        .into_iter()
+        .map(|t| (t.key.unwrap(), t.value.unwrap()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "core".to_string())
+        ]
+    );
+
+    // 11 条 → InvalidTag；暂存区不创建
+    let oversize = (0..11)
+        .map(|i| format!("k{i}=v"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let err = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mpt-bad".into(),
+            tagging: Some(oversize),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidTag);
+}
+
+#[tokio::test]
 async fn conditional_requests_follow_rfc9110() {
     // S3 协议补全 Task 1：If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since。
     // 条件对同一份 GET/HEAD 生效；304 无 body；412 = PreconditionFailed。

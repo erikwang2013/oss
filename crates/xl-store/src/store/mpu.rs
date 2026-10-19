@@ -52,6 +52,10 @@ struct MpuMeta {
     /// M8 S4a：Create 时声明的存储类（Complete 落地到版本；归档类在 Create 被拒）。
     #[serde(default)]
     storage_class: Option<String>,
+    /// M8 S6 缺口 A：Create 的 `x-amz-tagging`（Complete 落地到版本；Complete 无标签输入）。
+    /// 旧 msgpack 无此字段 → None（在途 MPU 跨版本升级仍可 complete）。
+    #[serde(default)]
+    pub tags: Option<Vec<meta::ObjectTag>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,12 +100,13 @@ impl Store {
             None,
             None,
             None,
+            None,
         )
         .await
     }
 
     /// 创建 MPU（可带 SSE-C 记录 + SSE-S3/KMS 意图；M5 切片 3/R5——只记 md5 与 kind，
-    /// 密钥绝不落盘；kind 在 complete 落地）。
+    /// 密钥绝不落盘；kind 在 complete 落地）。`tags` = Create 的标签，complete 落地。
     #[allow(clippy::too_many_arguments)] // 参数面 = 线头映射，无需聚合体（同 rebalance/read 先例）
     pub async fn create_multipart_upload_ext(
         &self,
@@ -113,8 +118,13 @@ impl Store {
         sse_kind: Option<&str>,
         lock: Option<&meta::ObjectLockRecord>,
         storage_class: Option<String>,
+        tags: Option<Vec<meta::ObjectTag>>,
     ) -> Result<String> {
         layout::validate_key(key)?;
+        // 信任边界：同单段 PUT（put.rs），非法标签在 Create 即拒
+        if let Some(t) = &tags {
+            meta::validate_tags(t).map_err(Error::InvalidArgument)?;
+        }
         // M8 S4a：存储类归一/白名单；归档类在服务层已拒（store 兜底）
         let storage_class = meta::normalize_storage_class(storage_class.as_deref());
         if let Some(sc) = &storage_class
@@ -144,6 +154,7 @@ impl Store {
             lock_until_nanos: lock.and_then(|l| l.retain_until_nanos),
             lock_legal_hold: lock.is_some_and(|l| l.legal_hold),
             storage_class,
+            tags,
         };
         let bytes = rmp_serde::to_vec_named(&meta).map_err(|e| Error::Encode(e.to_string()))?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -544,7 +555,8 @@ impl Store {
                 // M5 切片 4：对象锁（create 记录的意图在此落地）
                 lock: effective_lock.clone(),
                 replication_status: None,
-                tags: None,
+                // Create 声明的标签在 complete 落地（complete 无标签输入）
+                tags: mpu.tags.clone(),
                 storage_class: mpu.storage_class.clone(),
                 tier: None,
             };
@@ -643,8 +655,7 @@ impl Store {
             encryption: enc_record,
             lock: effective_lock,
             replication_status: None,
-            // M8 前置：MPU 的 x-amz-tagging 不在本切片（契约外）
-            tags: Vec::new(),
+            tags: mpu.tags.unwrap_or_default(),
             storage_class: mpu.storage_class.clone(),
             tier_phase: None,
             restore_expires_at: None,
@@ -769,4 +780,42 @@ fn concat_stream_verified(snapshots: Vec<(u16, PathBuf, PartMeta)>) -> ByteStrea
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 滚动升级：旧 `mpu.meta`（无 tags 字段）必须解码为 None——否则在途 MPU 全部报废。
+    #[test]
+    fn old_mpu_meta_without_tags_decodes() {
+        #[derive(Serialize)]
+        struct OldMpuMeta {
+            content_type: Option<String>,
+            user_metadata: BTreeMap<String, String>,
+            created_nanos: i64,
+            sse_c_md5: Option<String>,
+            sse_kind: Option<String>,
+            lock_mode: Option<String>,
+            lock_until_nanos: Option<i64>,
+            lock_legal_hold: bool,
+            storage_class: Option<String>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldMpuMeta {
+            content_type: Some("text/plain".into()),
+            user_metadata: BTreeMap::new(),
+            created_nanos: 42,
+            sse_c_md5: None,
+            sse_kind: None,
+            lock_mode: None,
+            lock_until_nanos: None,
+            lock_legal_hold: false,
+            storage_class: None,
+        })
+        .unwrap();
+        let m: MpuMeta = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(m.tags.is_none());
+        assert_eq!(m.created_nanos, 42);
+        assert_eq!(m.content_type.as_deref(), Some("text/plain"));
+    }
 }
