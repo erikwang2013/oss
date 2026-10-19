@@ -121,10 +121,11 @@ impl Store {
         tags: Option<Vec<meta::ObjectTag>>,
     ) -> Result<String> {
         layout::validate_key(key)?;
-        // 信任边界：同单段 PUT（put.rs），非法标签在 Create 即拒
+        // 信任边界：同单段 PUT（put.rs），非法标签在 Create 即拒；空集合归一为 None
         if let Some(t) = &tags {
             meta::validate_tags(t).map_err(Error::InvalidArgument)?;
         }
+        let tags = tags.filter(|t| !t.is_empty());
         // M8 S4a：存储类归一/白名单；归档类在服务层已拒（store 兜底）
         let storage_class = meta::normalize_storage_class(storage_class.as_deref());
         if let Some(sc) = &storage_class

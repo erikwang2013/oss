@@ -3469,20 +3469,9 @@ impl Db {
                 sql.push_str(clause);
             }
         }
-        // 前缀按字面量匹配：转义 LIKE 元字符，避免用户输入变成通配符
-        let key_pattern = f.key_prefix.map(|p| {
-            let mut s = String::with_capacity(p.len() + 1);
-            for c in p.chars() {
-                if matches!(c, '%' | '_' | '\\') {
-                    s.push('\\');
-                }
-                s.push(c);
-            }
-            s.push('%');
-            s
-        });
-        if key_pattern.is_some() {
-            sql.push_str(" AND object_key LIKE ? ESCAPE '\\'");
+        // 前缀按字节字面量匹配：键区分大小写（LIKE 对 ASCII 不区分），无需转义通配符
+        if f.key_prefix.is_some() {
+            sql.push_str(" AND substr(object_key, 1, length(?)) = ?");
         }
         sql.push_str(" ORDER BY id DESC LIMIT ?");
 
@@ -3506,8 +3495,8 @@ impl Db {
         if let Some(v) = f.bucket {
             q = q.bind(v);
         }
-        if let Some(v) = &key_pattern {
-            q = q.bind(v);
+        if let Some(v) = f.key_prefix {
+            q = q.bind(v).bind(v);
         }
         let rows = q.bind(f.limit).fetch_all(&self.pool).await?;
         Ok(rows

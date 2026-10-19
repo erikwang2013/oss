@@ -208,9 +208,10 @@ async fn audit_filters_by_time_identity_resource_and_op() {
     assert_eq!(audit_rows(base, tok, "?bucket=b2").await.len(), 1);
     assert_eq!(audit_rows(base, tok, "?uid=2").await.len(), 2);
     assert_eq!(audit_rows(base, tok, "?from=200&to=300").await.len(), 2);
-    // 前缀按字面量：dir/ 不匹配 dir2/
+    // 前缀按字节字面量且区分大小写：dir/ 不匹配 dir2/，Dir/ 不匹配 dir/
     let dirhits = audit_rows(base, tok, "?key=dir/").await;
     assert_eq!(dirhits.len(), 2, "{dirhits:?}");
+    assert_eq!(audit_rows(base, tok, "?key=Dir/").await.len(), 0);
     // 组合过滤
     let combo = audit_rows(base, tok, "?bucket=b1&op=GetObject&key=dir/").await;
     assert_eq!(combo.len(), 1);

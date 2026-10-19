@@ -308,6 +308,16 @@ async fn mpu_without_tags_stays_none() {
 }
 
 #[tokio::test]
+async fn mpu_empty_tags_normalize_to_none() {
+    // P0 契约：空 TagSet 与无标签等价（同单段 PUT），线上 `x-amz-tagging: "&"` 也走这里
+    let (s, _d) = store().await;
+    let info = mpu(&s, "mp", Some(Vec::new()), false).await.unwrap();
+    assert!(info.tags.is_empty());
+    let m = s.read_meta("alpha", "mp").await.unwrap().unwrap();
+    assert!(m.latest().unwrap().tags.is_none());
+}
+
+#[tokio::test]
 async fn mpu_create_rejects_invalid_tags() {
     let (s, _d) = store().await;
     let many: Vec<ObjectTag> = (0..11)
