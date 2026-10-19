@@ -110,6 +110,32 @@ pub struct AccessPointRow {
     pub updated_at: i64,
 }
 
+/// 变换器配置行（M8 S2）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OlapConfigRow {
+    pub access_point: String,
+    pub kind: String,
+    pub endpoint: Option<String>,
+    pub module: Option<Vec<u8>>,
+    pub module_sha256: Option<String>,
+    pub timeout_ms: i64,
+    pub max_response_bytes: i64,
+    pub updated_at: i64,
+}
+
+fn olap_row(r: &sqlx::sqlite::SqliteRow) -> OlapConfigRow {
+    OlapConfigRow {
+        access_point: r.get("access_point"),
+        kind: r.get("kind"),
+        endpoint: r.get("endpoint"),
+        module: r.get("module"),
+        module_sha256: r.get("module_sha256"),
+        timeout_ms: r.get("timeout_ms"),
+        max_response_bytes: r.get("max_response_bytes"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
 /// 领取到的任务（worker 执行输入）。
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
@@ -518,12 +544,77 @@ impl Db {
     }
 
     pub async fn delete_access_point(&self, name: &str) -> Result<bool> {
+        // SQLite 默认不启用 FK —— 显式删变换器行，不依赖 ON DELETE CASCADE。
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM olap_configs WHERE access_point = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
         let n = sqlx::query("DELETE FROM access_points WHERE name = ?")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        tx.commit().await?;
         Ok(n > 0)
+    }
+
+    // ---------- M8（S2）：Object Lambda 变换器 ----------
+
+    pub async fn get_olap_config(&self, name: &str) -> Result<Option<OlapConfigRow>> {
+        let row = sqlx::query(
+            "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
+             max_response_bytes, updated_at FROM olap_configs WHERE access_point = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| olap_row(&r)))
+    }
+
+    /// 启动预加载用（全部）。
+    pub async fn list_olap_configs(&self) -> Result<Vec<OlapConfigRow>> {
+        let rows = sqlx::query(
+            "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
+             max_response_bytes, updated_at FROM olap_configs ORDER BY access_point",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(olap_row).collect())
+    }
+
+    /// 每 AP 至多一条（PK upsert）；保存前已由调用方编译校验。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_olap_config(
+        &self,
+        name: &str,
+        kind: &str,
+        endpoint: Option<&str>,
+        module: Option<&[u8]>,
+        module_sha256: Option<&str>,
+        timeout_ms: i64,
+        max_response_bytes: i64,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO olap_configs (access_point, kind, endpoint, module, module_sha256, \
+             timeout_ms, max_response_bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(access_point) DO UPDATE SET kind = excluded.kind, \
+             endpoint = excluded.endpoint, module = excluded.module, \
+             module_sha256 = excluded.module_sha256, timeout_ms = excluded.timeout_ms, \
+             max_response_bytes = excluded.max_response_bytes, updated_at = excluded.updated_at",
+        )
+        .bind(name)
+        .bind(kind)
+        .bind(endpoint)
+        .bind(module)
+        .bind(module_sha256)
+        .bind(timeout_ms)
+        .bind(max_response_bytes)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ---------- M8（S0）：桶删除的 M8 状态清理 ----------

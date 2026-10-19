@@ -2,17 +2,20 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
+use base64::Engine as _;
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::db::Db;
 use crate::state::AppState;
 use xl_s3::ap::{AccessPoint, ApSource};
+use xl_s3::olap::OlapTransform;
 
 /// `/api/v1/access-points`（挂 console nest 下；JWT 已由外层 JwtLayer 校验）。
 pub fn routes() -> Router<AppState> {
@@ -20,6 +23,13 @@ pub fn routes() -> Router<AppState> {
         .route("/access-points", get(list).post(create))
         .route("/access-points/{name}", get(get_one).delete(delete_one))
         .route("/access-points/{name}/policy", put(put_policy))
+        .route(
+            "/access-points/{name}/transform",
+            // wasm 模块 ≤16 MiB，base64 后 ~22 MiB；axum Json 默认 2 MiB 不够。
+            get(get_transform)
+                .put(put_transform)
+                .layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
+        )
 }
 
 fn now() -> i64 {
@@ -222,6 +232,7 @@ async fn delete_one(
     match state.db.delete_access_point(&name).await {
         Ok(true) => {
             state.ap_cache.remove(&name);
+            state.olap_cache.remove(&name);
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "AP 不存在").into_response(),
@@ -278,6 +289,147 @@ async fn put_policy(
         Err(e) => {
             tracing::error!(error = %e, "更新 AP 策略失败");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// M8 S2：变换器配置（module 以标准 base64 传入；响应不含模块字节，只回摘要/大小）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutTransform {
+    kind: String,
+    endpoint: Option<String>,
+    module_b64: Option<String>,
+    timeout_ms: Option<i64>,
+    max_response_bytes: Option<i64>,
+}
+
+async fn get_transform(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(r) = owned(&state, &payload, &name).await {
+        return r;
+    }
+    match state.db.get_olap_config(&name).await {
+        Ok(Some(c)) => Json(serde_json::json!({
+            "kind": c.kind,
+            "endpoint": c.endpoint,
+            "module_sha256": c.module_sha256,
+            "module_size": c.module.as_ref().map(Vec::len),
+            "timeout_ms": c.timeout_ms,
+            "max_response_bytes": c.max_response_bytes,
+            "updated_at": c.updated_at,
+        }))
+        .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "未配置变换器").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "查变换器配置失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn put_transform(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(name): Path<String>,
+    Json(body): Json<PutTransform>,
+) -> Response {
+    let row = match owned(&state, &payload, &name).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    match body.kind.as_str() {
+        "http" if body.module_b64.is_some() => {
+            return bad("kind=http 不接受 module_b64");
+        }
+        "http" if body.endpoint.is_none() => return bad("kind=http 必须提供 endpoint"),
+        "wasm" if body.endpoint.is_some() => return bad("kind=wasm 不接受 endpoint"),
+        "wasm" if body.module_b64.is_none() => return bad("kind=wasm 必须提供 module_b64"),
+        "http" | "wasm" => {}
+        _ => return bad("kind 必须是 http/wasm"),
+    }
+    let module = match body.module_b64.as_deref() {
+        Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(m) => Some(m),
+            Err(_) => return bad("module_b64 不是合法 base64"),
+        },
+        None => None,
+    };
+    if let Some(m) = &module
+        && m.len() > xl_s3::olap::MAX_MODULE_BYTES
+    {
+        return bad("wasm 模块超过 16 MiB");
+    }
+    let timeout_ms = body.timeout_ms.unwrap_or(5000);
+    let max_response_bytes = body
+        .max_response_bytes
+        .unwrap_or(xl_s3::olap::DEFAULT_MAX_RESPONSE_BYTES);
+    // 保存即编译（WASM）并校验 URL 形状/限额；失败 400。
+    let transform = match OlapTransform::prepare(
+        &body.kind,
+        body.endpoint.clone(),
+        module.as_deref(),
+        timeout_ms,
+        max_response_bytes,
+    ) {
+        Ok(t) => t,
+        Err(e) => return bad(&e),
+    };
+    let sha = module.as_ref().map(|m| hex::encode(Sha256::digest(m)));
+    match state
+        .db
+        .set_olap_config(
+            &name,
+            &body.kind,
+            body.endpoint.as_deref(),
+            module.as_deref(),
+            sha.as_deref(),
+            timeout_ms,
+            max_response_bytes,
+            now(),
+        )
+        .await
+    {
+        Ok(()) => {
+            state.olap_cache.put(&name, &row.bucket, transform);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "保存变换器配置失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// 启动预加载：DB 行 → 编译产物入缓存。坏配置存 broken 占位（GET 500，fail-closed）。
+pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3::olap::OlapCache) {
+    let rows = match db.list_olap_configs().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "变换器预加载失败（GET 将直通原文）");
+            return;
+        }
+    };
+    for r in rows {
+        let Some(ap) = ap_cache.get(&r.access_point) else {
+            tracing::warn!(ap = %r.access_point, "变换器预加载跳过：AP 不可用");
+            continue;
+        };
+        match OlapTransform::prepare(
+            &r.kind,
+            r.endpoint.clone(),
+            r.module.as_deref(),
+            r.timeout_ms,
+            r.max_response_bytes,
+        ) {
+            Ok(t) => cache.put(&r.access_point, &ap.bucket, t),
+            Err(e) => {
+                tracing::error!(error = %e, ap = %r.access_point, "变换器预加载失败（GET 将 500）");
+                cache.put(&r.access_point, &ap.bucket, OlapTransform::broken(e));
+            }
         }
     }
 }

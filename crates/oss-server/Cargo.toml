@@ -41,14 +41,21 @@ tokio.workspace = true
 tokio-util.workspace = true
 toml = "1.1"
 csv = "1"
+base64.workspace = true
 tracing.workspace = true
+
+[features]
+default = []
+# M8 S2：WASM 变换器默认不编译；透传给 xl-s3。
+olap-wasm = ["xl-s3/olap-wasm"]
 
 [dev-dependencies]
 # 测试用独立签发器造边界令牌（换 secret 的伪签、绝对 exp 的过期）：jsonwebtoken 只在测试里被引用。
 jsonwebtoken = "11"
+# aether_ingest 用 md5 造落盘文件名
 md-5.workspace = true
 # bytes 只在集成测试里用（put_object 造体）；sqlx 是 [dependencies] 的重复声明，删
 bytes.workspace = true
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["json"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full"] }

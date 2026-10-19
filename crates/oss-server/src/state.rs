@@ -36,6 +36,8 @@ pub struct AppState {
     pub site_enabled: bool,
     /// M8 S1：访问点缓存（CRUD/桶删除负责失效；路由读路径 fail-closed）
     pub ap_cache: Arc<xl_s3::ap::ApCache>,
+    /// M8 S2：变换器缓存（AP 名 → 编译产物；控制面 PUT/删除/桶删除失效）
+    pub olap_cache: Arc<xl_s3::olap::OlapCache>,
     /// M8 S1：AP ARN 的 region（取 `[site].region`，缺省 us-east-1）
     pub ap_region: String,
     /// M8 S0/B10：所有删桶路径共用的 M8 清理（Db 清表 + AP 缓存失效）。
@@ -46,11 +48,20 @@ pub struct AppState {
 pub struct SqlBucketCleanup {
     db: Arc<Db>,
     ap_cache: Arc<xl_s3::ap::ApCache>,
+    olap_cache: Arc<xl_s3::olap::OlapCache>,
 }
 
 impl SqlBucketCleanup {
-    pub fn new(db: Arc<Db>, ap_cache: Arc<xl_s3::ap::ApCache>) -> Self {
-        Self { db, ap_cache }
+    pub fn new(
+        db: Arc<Db>,
+        ap_cache: Arc<xl_s3::ap::ApCache>,
+        olap_cache: Arc<xl_s3::olap::OlapCache>,
+    ) -> Self {
+        Self {
+            db,
+            ap_cache,
+            olap_cache,
+        }
     }
 }
 
@@ -65,6 +76,7 @@ impl xl_s3::bucket_cleanup::BucketCleanupSink for SqlBucketCleanup {
 
     fn invalidate_ap_cache(&self, bucket: &str) {
         self.ap_cache.invalidate_bucket(bucket);
+        self.olap_cache.invalidate_bucket(bucket);
     }
 }
 
@@ -235,9 +247,13 @@ impl AppState {
         store_cfg.inline_threshold = cfg.ec.inline_threshold;
         // B10：控制面删桶路径的清理实现须在 Store::open 前注入（集群控制面写）。
         let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
-        let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> = Arc::new(
-            SqlBucketCleanup::new(Arc::clone(&db), Arc::clone(&ap_cache)),
-        );
+        let olap_cache = Arc::new(xl_s3::olap::OlapCache::new());
+        let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> =
+            Arc::new(SqlBucketCleanup::new(
+                Arc::clone(&db),
+                Arc::clone(&ap_cache),
+                Arc::clone(&olap_cache),
+            ));
         // M3 集群（配了 [cluster] 才走）：静态拓扑 + 节点间传输注入存储内核。
         // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
         // ClusterTopology::new 与 Store::open（self 一致性）。
@@ -439,7 +455,7 @@ impl AppState {
             tracing::warn!(error = %e, "groups 回填抑制复位失败");
         }
 
-        Ok(Self::new_with(cfg, db, store, ap_cache, bucket_cleanup).await)
+        Ok(Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup).await)
     }
 
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
@@ -469,10 +485,14 @@ impl AppState {
     pub async fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
         let db = Arc::new(db);
         let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
-        let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> = Arc::new(
-            SqlBucketCleanup::new(Arc::clone(&db), Arc::clone(&ap_cache)),
-        );
-        Self::new_with(cfg, db, store, ap_cache, bucket_cleanup).await
+        let olap_cache = Arc::new(xl_s3::olap::OlapCache::new());
+        let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> =
+            Arc::new(SqlBucketCleanup::new(
+                Arc::clone(&db),
+                Arc::clone(&ap_cache),
+                Arc::clone(&olap_cache),
+            ));
+        Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup).await
     }
 
     /// `load` 预建 AP 缓存与清理实现（控制面写要在 `Store::open` 前注入），
@@ -482,6 +502,7 @@ impl AppState {
         db: Arc<Db>,
         store: Store,
         ap_cache: Arc<xl_s3::ap::ApCache>,
+        olap_cache: Arc<xl_s3::olap::OlapCache>,
         bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
     ) -> Self {
         // M7：`[site]` 覆盖种子（先于任何控制面写；load 与 tests 共用此路径）
@@ -519,6 +540,8 @@ impl AppState {
             }
             Err(e) => tracing::warn!(error = %e, "AP 预加载失败（路由将按需查询）"),
         }
+        // M8 S2：变换器预加载（须在 AP 之后——缓存条目要按 AP 查桶名做级联失效）
+        crate::access_points_api::preload_olap(&db, &ap_cache, &olap_cache).await;
         let ap_region = site.region.clone();
         // except 只有 `/login`：console 路由经 nest 时 axum 的 StripPrefix 会先把
         // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
@@ -600,6 +623,7 @@ impl AppState {
             site,
             site_enabled,
             ap_cache,
+            olap_cache,
             ap_region,
             bucket_cleanup,
         }

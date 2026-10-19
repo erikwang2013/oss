@@ -57,6 +57,7 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
             region: state.ap_region.clone(),
         }),
         acl,
+        Arc::clone(&state.olap_cache),
         inner,
     )
     .with_fallback(sts);
