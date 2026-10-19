@@ -37,6 +37,9 @@ const MAX_CONFIGURED_RESPONSE: i64 = 1024 * 1024 * 1024;
 const WASM_FUEL: u64 = 200_000_000;
 #[cfg(feature = "olap-wasm")]
 const WASM_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// WASM 表元素上限（防止用巨大 table 绕过内存限额）。
+#[cfg(feature = "olap-wasm")]
+const WASM_TABLE_ELEMENTS: usize = 100_000;
 
 /// 变换器种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +181,20 @@ fn transform_gate() -> &'static tokio::sync::Semaphore {
     &GATE
 }
 
+/// 取变换并发槽。调用方必须在读取输入体**之前**取得，并持有到变换输出完成，
+/// 使缓冲、变换与输出全部计入并发额度。
+pub async fn acquire_transform_slot() -> Result<tokio::sync::SemaphorePermit<'static>, String> {
+    transform_gate()
+        .acquire()
+        .await
+        .map_err(|_| "transform gate closed".to_string())
+}
+
+/// 当前空闲槽数（诊断/测试用）。
+pub fn available_transform_slots() -> usize {
+    transform_gate().available_permits()
+}
+
 impl OlapTransform {
     /// 预加载失败占位（GET 500，而不是静默返回未变换内容）。
     pub fn broken(reason: String) -> Self {
@@ -192,15 +209,16 @@ impl OlapTransform {
         }
     }
 
-    /// 执行变换。错误详情只允许进日志（可能含 endpoint/IP）。
-    pub async fn transform(&self, input: OlapInput<'_>) -> Result<OlapOutput, String> {
+    /// 执行变换。`slot` 由 [`acquire_transform_slot`] 取得，须已覆盖输入体读取。
+    /// 错误详情只允许进日志（可能含 endpoint/IP）。
+    pub async fn transform(
+        &self,
+        input: OlapInput<'_>,
+        _slot: &tokio::sync::SemaphorePermit<'static>,
+    ) -> Result<OlapOutput, String> {
         if let Some(reason) = &self.broken {
             return Err(format!("变换器不可用: {reason}"));
         }
-        let _permit = transform_gate()
-            .acquire()
-            .await
-            .map_err(|_| "transform gate closed".to_string())?;
         match self.kind {
             OlapKind::Http => self.http_transform(input).await,
             OlapKind::Wasm => self.wasm_transform(input).await,
@@ -246,9 +264,14 @@ fn parse_endpoint(endpoint: &str) -> Result<EndpointTarget, String> {
 
 /// 保存时校验：形状 + IP 字面量的内网拒（域名留到每次请求解析后判）。
 fn validate_endpoint(endpoint: &str) -> Result<(), String> {
+    validate_endpoint_with(endpoint, allow_private())
+}
+
+/// 可注入判定，测试不依赖进程环境变量。
+fn validate_endpoint_with(endpoint: &str, allow_private: bool) -> Result<(), String> {
     let t = parse_endpoint(endpoint)?;
     if let Some(ip) = t.ip
-        && !allow_private()
+        && !allow_private
         && !ip_is_public(ip)
     {
         return Err("endpoint 指向非公网地址".into());
@@ -355,6 +378,14 @@ impl OlapTransform {
         if !status.is_success() {
             return Err(format!("transform status {status}"));
         }
+        // gzip 已由 reqwest 解压并从响应头移除；其余编码无法安全透出（会以原文
+        // Content-Type 发出压缩字节），直接 500。
+        if let Some(enc) = resp.headers().get(http::header::CONTENT_ENCODING) {
+            let enc = enc.to_str().unwrap_or("");
+            if !enc.eq_ignore_ascii_case("identity") {
+                return Err(format!("transform content-encoding {enc} unsupported"));
+            }
+        }
         // Content-Length 是解压前值，只作快速拒绝；真正计数在解压后的流上。
         if let Some(len) = resp.content_length()
             && len > self.max_response_bytes as u64
@@ -441,6 +472,7 @@ fn wasm_engine() -> &'static wasmtime::Engine {
         let mut cfg = wasmtime::Config::new();
         cfg.consume_fuel(true);
         cfg.epoch_interruption(true);
+        cfg.wasm_multi_memory(false); // 只允许单 memory（StoreLimits 再兜底）
         let engine = wasmtime::Engine::new(&cfg).expect("wasm engine 配置恒定合法");
         // 全局 epoch 心跳：超时返回后残留的 spawn_blocking 任务也会在下一拍自行 Trap，
         // 不依赖调用方持有/中止每请求 ticker（否则会绕过并发闸继续占 CPU）。
@@ -474,8 +506,10 @@ fn wasm_execute(
     let engine = wasm_engine();
     let limits = StoreLimitsBuilder::new()
         .memory_size(WASM_MEMORY_BYTES)
+        .memories(1)
         .instances(1)
         .tables(1)
+        .table_elements(WASM_TABLE_ELEMENTS)
         .build();
     let mut store = Store::new(engine, WasmLimits { limits });
     store.limiter(|s| &mut s.limits);
@@ -586,25 +620,39 @@ impl OlapCache {
         self.loaded.store(false, Ordering::Release);
     }
 
-    pub fn get(&self, ap: &str) -> Option<Arc<OlapTransform>> {
-        self.inner.read().ok()?.get(ap).map(|(_, t)| Arc::clone(t))
+    /// 读缓存。锁中毒视为整体不可用（fail-closed），不得降级成“该 AP 无变换器”。
+    pub fn get(&self, ap: &str) -> Result<Option<Arc<OlapTransform>>, String> {
+        match self.inner.read() {
+            Ok(w) => Ok(w.get(ap).map(|(_, t)| Arc::clone(t))),
+            Err(_) => {
+                self.mark_failed();
+                Err("transform cache poisoned".into())
+            }
+        }
     }
 
     pub fn put(&self, ap: &str, bucket: &str, transform: OlapTransform) {
-        if let Ok(mut w) = self.inner.write() {
-            w.insert(ap.to_string(), (bucket.to_string(), Arc::new(transform)));
+        match self.inner.write() {
+            Ok(mut w) => {
+                w.insert(ap.to_string(), (bucket.to_string(), Arc::new(transform)));
+            }
+            Err(_) => self.mark_failed(),
         }
     }
 
     pub fn remove(&self, ap: &str) {
-        if let Ok(mut w) = self.inner.write() {
-            w.remove(ap);
+        match self.inner.write() {
+            Ok(mut w) => {
+                w.remove(ap);
+            }
+            Err(_) => self.mark_failed(),
         }
     }
 
     pub fn invalidate_bucket(&self, bucket: &str) {
-        if let Ok(mut w) = self.inner.write() {
-            w.retain(|_, (b, _)| b != bucket);
+        match self.inner.write() {
+            Ok(mut w) => w.retain(|_, (b, _)| b != bucket),
+            Err(_) => self.mark_failed(),
         }
     }
 
@@ -679,9 +727,10 @@ mod tests {
         ] {
             assert!(validate_endpoint(bad).is_err(), "{bad}");
         }
-        // IP 字面量保存即拒（本地 mock 走 OSS_OLAP_ALLOW_PRIVATE 的用例在集成测试）
-        assert!(validate_endpoint("http://127.0.0.1:9/").is_err());
-        assert!(validate_endpoint("http://[::ffff:127.0.0.1]:9/").is_err());
+        // IP 字面量保存即拒；显式注入 allow_private=false，不依赖进程环境变量。
+        assert!(validate_endpoint_with("http://127.0.0.1:9/", false).is_err());
+        assert!(validate_endpoint_with("http://[::ffff:127.0.0.1]:9/", false).is_err());
+        assert!(validate_endpoint_with("http://127.0.0.1:9/", true).is_ok());
     }
 
     #[test]
@@ -722,10 +771,24 @@ mod tests {
         c.put("a1", "b1", mk());
         c.put("a2", "b2", mk());
         assert_eq!(c.len(), 2);
-        assert!(c.get("a1").is_some());
+        assert!(c.get("a1").unwrap().is_some());
         c.remove("a2");
-        assert!(c.get("a2").is_none());
+        assert!(c.get("a2").unwrap().is_none());
         c.invalidate_bucket("b1");
         assert!(c.is_empty());
+    }
+
+    /// 锁中毒必须 fail-closed：get 返回 Err 并清掉 loaded，不能当作“无变换器”。
+    #[test]
+    fn cache_poison_fails_closed() {
+        let c = OlapCache::new();
+        c.mark_loaded();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = c.inner.write().unwrap();
+            panic!("poison the lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(c.get("anything").is_err());
+        assert!(!c.is_loaded());
     }
 }

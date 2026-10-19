@@ -597,6 +597,83 @@ async fn output_limit_and_gzip_bomb_count_decompressed() {
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
+/// gzip 由客户端解码后接受；其它编码无法安全透出 → 500（不得以原文 CT 发压缩字节）。
+#[tokio::test]
+async fn gzip_ok_and_unsupported_content_encoding_is_500() {
+    let _g = env_guard(true).await;
+    use std::io::Write as _;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(b"hello").unwrap();
+    let gz = enc.finish().unwrap();
+    let (gz_endpoint, _) = mock(move |_, _| {
+        (
+            StatusCode::OK,
+            header_map(&[("content-encoding", "gzip")]),
+            Bytes::from(gz.clone()),
+        )
+    })
+    .await;
+    let env = test_env().await;
+    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    add_ap(&env, "gz");
+    add_http_transform(&env, "gz", &gz_endpoint, 5000, 1 << 20);
+    let (st, h, body) = send(&env, get("/ap/gz/hello", &[])).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"hello");
+    assert!(!h.contains_key("content-encoding"), "{h:?}");
+
+    let (br_endpoint, _) = mock(|_, body| {
+        (
+            StatusCode::OK,
+            header_map(&[("content-encoding", "br")]),
+            body,
+        )
+    })
+    .await;
+    add_ap(&env, "br");
+    add_http_transform(&env, "br", &br_endpoint, 5000, 1 << 20);
+    let (st, _, body) = send(&env, get("/ap/br/hello", &[])).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("InternalError"), "{text}");
+    assert!(!text.contains("br"), "{text}");
+}
+
+/// 原对象带校验和时，变换后必须移除 `x-amz-checksum-*`（描述原文字节）。
+#[tokio::test]
+async fn checksum_headers_removed_after_transform() {
+    let _g = env_guard(true).await;
+    let (endpoint, _) = mock(upper_reply()).await;
+    let env = test_env().await;
+    add_ap(&env, "ap1");
+    add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
+    use md5::Digest as _;
+    let md5_b64 = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(b"hello"));
+    let (st, _, _) = send(
+        &env,
+        method(
+            "PUT",
+            "/bkt/ck",
+            &[("content-md5", &md5_b64), ("content-length", "5")],
+            b"hello",
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // 直读确认校验和头确实存在，避免断言落空。
+    let (st, h, _) = send(&env, get("/bkt/ck", &[])).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h.contains_key("x-amz-checksum-md5"), "{h:?}");
+
+    let (st, h, body) = send(&env, get("/ap/ap1/ck", &[])).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"HELLO");
+    assert!(
+        !h.keys().any(|k| k.as_str().starts_with("x-amz-checksum-")),
+        "变换后不得保留原校验和: {h:?}"
+    );
+}
+
 #[tokio::test]
 async fn redirect_is_not_followed() {
     let _g = env_guard(true).await;
@@ -782,6 +859,24 @@ mod wasm {
 
     const BAD_ABI: &str = r#"(module (memory (export "memory") 1))"#;
 
+    const MULTI_MEMORY: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (memory 1)
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "dealloc") (param i32 i32))
+          (func (export "transform") (param i32 i32) (result i64) (i64.const 0)))
+    "#;
+
+    const HUGE_TABLE: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (table 200000 funcref)
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "dealloc") (param i32 i32))
+          (func (export "transform") (param i32 i32) (result i64) (i64.const 0)))
+    "#;
+
     const OOB: &str = r#"
         (module
           (memory (export "memory") 1)
@@ -854,6 +949,22 @@ mod wasm {
         let (st, _, _) = send(&env, get("/ap/ap1/hello", &[])).await;
         assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
         add_wasm(&env, "ap1", OOB, 5000);
+        let (st, _, _) = send(&env, get("/ap/ap1/hello", &[])).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// 多 memory 在引擎层禁用；巨大 table 被 StoreLimits 拒绝 → 500。
+    #[tokio::test]
+    async fn multi_memory_and_huge_table_are_rejected() {
+        let _g = env_guard(true).await;
+        let e =
+            match OlapTransform::prepare("wasm", None, Some(MULTI_MEMORY.as_bytes()), 5000, 1024) {
+                Ok(_) => panic!("multi-memory 应被拒"),
+                Err(e) => e,
+            };
+        assert!(!e.is_empty());
+        let env = setup().await;
+        add_wasm(&env, "ap1", HUGE_TABLE, 5000);
         let (st, _, _) = send(&env, get("/ap/ap1/hello", &[])).await;
         assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
     }

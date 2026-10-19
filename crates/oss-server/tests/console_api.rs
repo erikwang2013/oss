@@ -920,7 +920,7 @@ async fn access_point_transform_api() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    assert!(st.olap_cache.get("ap-one").is_some(), "缓存未更新");
+    assert!(st.olap_cache.get("ap-one").unwrap().is_some(), "缓存未更新");
     let row = st.db.get_olap_config("ap-one").await.unwrap().unwrap();
     assert_eq!(row.kind, "http");
     let r = client
@@ -957,7 +957,7 @@ async fn access_point_transform_api() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    assert!(st.olap_cache.get("ap-one").is_none());
+    assert!(st.olap_cache.get("ap-one").unwrap().is_none());
     assert!(st.db.get_olap_config("ap-one").await.unwrap().is_none());
     // 删桶级联：AP/变换器行与两缓存都失效
     let r = client
@@ -976,7 +976,7 @@ async fn access_point_transform_api() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    assert!(st.olap_cache.get("ap-two").is_some());
+    assert!(st.olap_cache.get("ap-two").unwrap().is_some());
     let r = client
         .delete(format!("{base}/api/v1/buckets/apb"))
         .bearer_auth(&admin)
@@ -985,7 +985,7 @@ async fn access_point_transform_api() {
         .unwrap();
     assert_eq!(r.status(), 204);
     assert!(st.ap_cache.get("ap-two").is_none());
-    assert!(st.olap_cache.get("ap-two").is_none());
+    assert!(st.olap_cache.get("ap-two").unwrap().is_none());
     assert!(st.db.get_olap_config("ap-two").await.unwrap().is_none());
 }
 
@@ -1020,4 +1020,39 @@ async fn transform_preload_failure_keeps_cache_unloaded() {
     let cache = xl_s3::olap::OlapCache::new();
     oss_server::access_points_api::preload_olap(&st.db, &st.ap_cache, &cache).await;
     assert!(cache.is_loaded(), "加载成功后应恢复");
+}
+
+/// AP 缓存未命中时，预加载必须回查 DB 解析桶名（不能跳过变换器）。
+#[tokio::test]
+async fn transform_preload_resolves_bucket_when_ap_cache_misses() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db
+        .create_access_point("ap-pre", "preb", 1, None, 0)
+        .await
+        .unwrap();
+    st.db
+        .set_olap_config(
+            "ap-pre",
+            "http",
+            Some("http://example.com/"),
+            None,
+            None,
+            5000,
+            1 << 20,
+            0,
+        )
+        .await
+        .unwrap();
+
+    // state() 之后才建 AP，故 st.ap_cache 不含它；再传一个全新空缓存模拟 AP 预加载失败。
+    let empty_ap_cache = xl_s3::ap::ApCache::new();
+    let cache = xl_s3::olap::OlapCache::new();
+    oss_server::access_points_api::preload_olap(&st.db, &empty_ap_cache, &cache).await;
+    assert!(cache.is_loaded());
+    assert!(cache.get("ap-pre").unwrap().is_some(), "不能跳过该行");
+    cache.invalidate_bucket("other");
+    assert!(cache.get("ap-pre").unwrap().is_some());
+    cache.invalidate_bucket("preb");
+    assert!(cache.get("ap-pre").unwrap().is_none(), "桶名应从 DB 回查");
 }

@@ -416,9 +416,22 @@ pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3:
         }
     };
     for r in rows {
-        let Some(ap) = ap_cache.get(&r.access_point) else {
-            tracing::warn!(ap = %r.access_point, "变换器预加载跳过：AP 不可用");
-            continue;
+        // AP 预加载可能失败/未含此 AP；直接回查 DB 拿桶名，不能因此跳过变换器。
+        let bucket = match ap_cache.get(&r.access_point) {
+            Some(ap) => ap.bucket,
+            None => match db.get_access_point(&r.access_point).await {
+                Ok(Some(row)) => row.bucket,
+                Ok(None) => {
+                    tracing::error!(ap = %r.access_point, "变换器预加载失败：AP 不存在");
+                    cache.mark_failed();
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, ap = %r.access_point, "变换器预加载回查 AP 失败");
+                    cache.mark_failed();
+                    return;
+                }
+            },
         };
         match OlapTransform::prepare(
             &r.kind,
@@ -427,10 +440,10 @@ pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3:
             r.timeout_ms,
             r.max_response_bytes,
         ) {
-            Ok(t) => cache.put(&r.access_point, &ap.bucket, t),
+            Ok(t) => cache.put(&r.access_point, &bucket, t),
             Err(e) => {
                 tracing::error!(error = %e, ap = %r.access_point, "变换器预加载失败（GET 将 500）");
-                cache.put(&r.access_point, &ap.bucket, OlapTransform::broken(e));
+                cache.put(&r.access_point, &bucket, OlapTransform::broken(e));
             }
         }
     }

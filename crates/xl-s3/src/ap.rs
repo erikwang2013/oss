@@ -645,7 +645,13 @@ impl s3s::route::S3Route for ApRoute {
         }
         // S2：配置了变换器的 AP 只允许 GET/HEAD；写操作 405。Range/partNumber 会让
         // 内层返回局部字节，变换后 ETag/长度语义不再成立 → 400。
-        let transform = self.olap.get(&inv.ap_name);
+        let transform = match self.olap.get(&inv.ap_name) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, ap = %inv.ap_name, "变换器缓存不可用");
+                return Err(s3s::s3_error!(InternalError, "transform cache unavailable"));
+            }
+        };
         if transform.is_some() {
             if !matches!(req.method, http::Method::GET | http::Method::HEAD) {
                 return Err(s3s::s3_error!(
@@ -724,6 +730,11 @@ async fn apply_transform(
     parts: &mut http::response::Parts,
     mut body: s3s::Body,
 ) -> S3Result<s3s::Body> {
+    // 先占并发槽再读体：输入缓冲、变换与输出都在 16 路闸内。
+    let slot = crate::olap::acquire_transform_slot().await.map_err(|e| {
+        tracing::error!(error = %e, "变换并发槽获取失败");
+        s3s::s3_error!(InternalError, "object transform failed")
+    })?;
     let limit = crate::olap::max_input_bytes();
     let input = body.store_all_limited(limit).await.map_err(|e| {
         if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some() {
@@ -737,13 +748,16 @@ async fn apply_transform(
         header_str(&parts.headers, http::header::ETAG).map(|s| s.trim_matches('"').to_string());
     let version_id = header_str(&parts.headers, s3s::header::X_AMZ_VERSION_ID).map(str::to_string);
     let out = t
-        .transform(crate::olap::OlapInput {
-            bucket: &inv.bucket,
-            key: inv.canonical_key.as_deref().unwrap_or_default(),
-            version_id: version_id.as_deref(),
-            etag: etag.as_deref(),
-            bytes: input,
-        })
+        .transform(
+            crate::olap::OlapInput {
+                bucket: &inv.bucket,
+                key: inv.canonical_key.as_deref().unwrap_or_default(),
+                version_id: version_id.as_deref(),
+                etag: etag.as_deref(),
+                bytes: input,
+            },
+            &slot,
+        )
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, ap = %inv.ap_name, "对象变换失败");
@@ -763,6 +777,15 @@ async fn apply_transform(
     headers.remove(http::header::RANGE);
     headers.remove(http::header::ACCEPT_RANGES);
     headers.remove(http::header::CONTENT_RANGE);
+    // 校验和头描述的是原文字节，变换后不再成立。
+    let stale: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-amz-checksum-"))
+        .cloned()
+        .collect();
+    for k in stale {
+        headers.remove(k);
+    }
     if let Some(ct) = out.content_type
         && let Ok(v) = http::HeaderValue::from_str(&ct)
     {
@@ -1057,6 +1080,77 @@ mod tests {
         assert_eq!(
             c.bucket_arn(),
             "arn:aws:s3:eu-west-1:000000000000:accesspoint/ap1"
+        );
+    }
+
+    /// 结构断言：并发槽在读取输入体期间已被持有（缓冲不得发生在闸外）。
+    #[tokio::test]
+    async fn permit_is_held_while_buffering_input() {
+        use std::future::Future as _;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct Gated {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: Option<tokio::sync::oneshot::Receiver<()>>,
+            done: bool,
+        }
+        impl futures::Stream for Gated {
+            type Item = Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                if let Some(tx) = self.started.take() {
+                    let _ = tx.send(());
+                }
+                if self.done {
+                    return Poll::Ready(None);
+                }
+                let release = self.release.as_mut().expect("release");
+                match Pin::new(release).poll(cx) {
+                    Poll::Ready(_) => {
+                        self.done = true;
+                        Poll::Ready(Some(Ok(bytes::Bytes::from_static(b"hello"))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+        impl s3s::stream::ByteStream for Gated {}
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let stream = Gated {
+            started: Some(started_tx),
+            release: Some(release_rx),
+            done: false,
+        };
+        let body = s3s::Body::from(Box::pin(stream) as s3s::stream::DynByteStream);
+        let t = crate::olap::OlapTransform::broken("test".into());
+        let inv = ApInvocation {
+            ap_name: "ap1".into(),
+            bucket: "bkt".into(),
+            raw_suffix: "k".into(),
+            canonical_key: Some("k".into()),
+            op: "GetObject",
+        };
+        let mut parts = http::Response::new(()).into_parts().0;
+        let before = crate::olap::available_transform_slots();
+        let task = tokio::spawn(async move { apply_transform(&t, &inv, &mut parts, body).await });
+
+        started_rx.await.unwrap();
+        assert_eq!(
+            crate::olap::available_transform_slots(),
+            before - 1,
+            "读体期间必须持有并发槽"
+        );
+        release_tx.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            crate::olap::available_transform_slots(),
+            before,
+            "结束后归还槽"
         );
     }
 }
