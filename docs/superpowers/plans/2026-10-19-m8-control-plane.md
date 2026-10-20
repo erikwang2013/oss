@@ -814,24 +814,24 @@ S6 之外的控制面缺口以 Task 7a/7b/7c 收口（不在原 S0–S6 编号�
 
 ## 定稿（2026-10-20）
 
-- 代码 HEAD：`8116a12`（S0–S6 + 7a/7b/7c；Task 6b 未改 Rust/Web 源码）。
-- 文档/e2e 提交：`a3579ee`（README、设计/功能规格、两张 SVG、`tests/e2e_m8.sh`）+
-  后续小修（e2e 注明 1 worker 前置、Inventory 诊断输出）；本定稿与报告另提交。
-- 七闸（base `8116a12`）：① `xl-store` 220 passed / 1 ignored；② kill9 专项 1 passed；
-  ③ `oss-server` 203 passed；④ `xl-s3` 181 passed / **1 failed**；⑤ `xl-client`+`xl-proto`
-  5 passed；⑥ clippy `--workspace --all-targets -D warnings` exit 0；⑦ fmt `--check` exit 0。
-- ④ 唯一失败 `olap_ops::checksum_headers_removed_after_transform` 为测试夹具过期：内联
-  `SCHEMA` 缺 `default_encryption` 列（生产库由 0003 迁移补列），非产品缺陷；feature 闸
-  `-p xl-s3 --features olap-wasm` 同因 185 passed / 1 failed。受限「不改 Rust」未修夹具。
-- Web：`npm test` 18 passed（3 files）；`npm run build` 通过；Playwright `m8-console` 9 passed。
-- E2E：`tests/e2e_m8.sh` 全跑 **PASS**，耗时 4679s（约 78 分钟；1 worker × 1s 间隔、
-  1000 与 1000+1 两个 Batch 作业）；步骤 4 Tier=ran，步骤 6 默认 SKIP。
-  另单独执行 M6 `tests/e2e_replication.sh` 与 M7 `tests/e2e_sites.sh`：均 PASS（exit 0）。
-- 评审/修复：Task 6b 自审（按任务约束未另设评审子代理）；e2e 多轮运行中发现并修正 5 处
-  脚本/文档缺陷——Inventory MD5 base64、`Transitions` 列表、版本/删除标记清理、
-  Restore 线上状态、Batch 拆为 1000 与 1001 两段。
-- 残余边界：RestoreObject 的 202 由 router 层中间件按 POST + `restore` 查询补写；
-  SQLite 单写者下 `finish_task` 锁冲突以 busy_timeout(30s) + 5 次重试兜底，
-  领取后按动作收紧 deadline（非 tier 900s）；失败重试退避含 `now%1000` 秒抖动；
-  控制面单节点；tier 仅远端 http。
+- 代码 HEAD：`7aea819`（S0–S6 + 7a/7b/7c + Task 8 修复 + Task 10 I1–I5；含 `578f7c0`
+  olap 夹具、`443a7be` Restore 202 中间件、`dc60eb4` SQLite 锁重试/deadline、
+  `c06f401` web 测试串行化）。Task 6b 未改 Rust/Web 源码。
+- 文档/e2e 提交：`a3579ee` + `9dd8479` + `6279835`（e2e 1 worker 前置与 Inventory 诊断）；
+  本定稿另提交。
+- 七闸（`7aea819`，`/tmp/m8-final-gates.log`，FINAL FAIL=0）：
+  ① `xl-store` 220 passed / 1 ignored；② kill9 专项 2 passed；③ `oss-server` 214 passed；
+  ④ `xl-s3` 194 passed；⑤ `xl-client`+`xl-proto` 5 passed；⑥ clippy
+  `--workspace --all-targets -D warnings` exit 0；⑦ fmt `--check` exit 0。
+- feature 闸 `-p xl-s3 --features olap-wasm`：198 passed / 0 failed，exit 0。
+- Web：`npm test` 18 passed（3 files，`--no-file-parallelism`）；`npm run build`、lint、
+  typecheck:e2e 均 exit 0；Playwright `m8-console` 9 passed（6a 已验证）。
+- E2E：`tests/e2e_m8.sh` 于 `6279835` 全跑 **PASS**，4679s（1 worker × 1s；AP /
+  Batch 1000+1001 / Inventory / Tier=ran / 回归）；步骤 6 默认 SKIP。另单独执行 M6
+  `tests/e2e_replication.sh` 与 M7 `tests/e2e_sites.sh`：均 PASS（exit 0）。
+- 评审：Task 9 整支评审 0 Critical / 5 Important / 12 Minor；Task 10 I1–I5 修复后
+  review Approved（I4 empty-AK inventory 授权 minor 记档）。
+- 残余：Restore 202 中间件与 I1–I5 修复在 `7aea819` 仅由定向集成测试覆盖；未在最终 HEAD
+  重跑 78 分钟全量 e2e。SQLite 单写者以 busy_timeout(30s) + finish 重试 + 按动作 deadline
+  兜底，失败重试退避仍含 `now%1000` 抖动；控制面单节点；tier 仅远端 http。
 - 发布：仅本地提交；推送/tag/Release 待用户明确口令。
