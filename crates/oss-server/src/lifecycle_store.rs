@@ -97,6 +97,22 @@ impl LifecycleStore for SqlLifecycleStore {
         {
             return Err(LifecycleError::NoSuchBucket);
         }
+        // M9：sync 桶只允许 Expiration（Transition 无跨站语义）。
+        if rules
+            .iter()
+            .any(|r| r.transition_days.is_some() || r.transition_class.is_some())
+            && self
+                .db
+                .bucket_sync_state(bucket)
+                .await
+                .map_err(|e| LifecycleError::Internal(e.to_string()))?
+                .0
+                == "sync"
+        {
+            return Err(LifecycleError::InvalidArgument(
+                "lifecycle Transition is not supported on sync buckets".into(),
+            ));
+        }
         // 两个入口都从这里过：clone 后统一校验（就地补全 rule_id/transition_tier）。
         let mut specs = rules.to_vec();
         validate_rules(&mut specs, &self.tier_ids)?;

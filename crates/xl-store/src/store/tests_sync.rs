@@ -249,7 +249,7 @@ async fn forced_id_idempotent_and_conflict() {
     assert_eq!(again.etag, first.etag);
     assert!(matches!(
         put(&s, "k.txt", b"other".to_vec(), ext).await,
-        Err(Error::InvalidArgument(_))
+        Err(Error::Conflict(_))
     ));
     // 冲突不毁已有对象
     let (_, bytes) = s.get_object("alpha", "k.txt").await.unwrap();
@@ -404,12 +404,90 @@ async fn multi_drive_replay_keeps_committed_version() {
     let (_, bytes) = s.get_object("alpha", "k.txt").await.unwrap();
     assert_eq!(bytes, data);
 
-    // 异体同 id：400 且不毁旧数据。
+    // 异体同 id：409 且不毁旧数据。
     assert!(matches!(
         put(&s, "k.txt", b"different".to_vec(), ext()).await,
-        Err(Error::InvalidArgument(_))
+        Err(Error::Conflict(_))
     ));
     let (_, bytes) = s.get_object("alpha", "k.txt").await.unwrap();
     assert_eq!(bytes, data);
     assert_eq!(gate.calls.load(Ordering::SeqCst), 0, "REPLICA 摄入不 gate");
+}
+
+/// M9 S2：MPU Complete 走同一门——拼接时 tee、gate 先于 meta、成功落 COMPLETED + 同 id。
+async fn mpu_complete(s: &Store, key: &str, body: Vec<u8>) -> Result<ObjectInfo> {
+    let up = s
+        .create_multipart_upload_ext(
+            "alpha",
+            key,
+            Some("text/plain".into()),
+            Default::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let etag = s
+        .upload_part_ext(
+            "alpha",
+            key,
+            &up,
+            1,
+            Box::pin(futures::stream::once(async move { Ok(Bytes::from(body)) })),
+            None,
+        )
+        .await?;
+    s.complete_multipart_upload_versioned("alpha", key, &up, &[(1, etag)], true, None, None)
+        .await
+}
+
+#[tokio::test]
+async fn mpu_complete_gates_after_tee_before_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = MockGate::new(dir.path(), true);
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.gate = Some(gate.clone());
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+
+    let info = mpu_complete(&s, "mpu.bin", b"hello mpu".to_vec())
+        .await
+        .unwrap();
+    {
+        let seen = gate.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].size, 9);
+        assert!(seen[0].tee_exists, "MPU gate 时必须已 tee 出拼接明文");
+        assert_eq!(seen[0].tee_len, 9);
+        assert!(!seen[0].meta_visible, "MPU gate 必须先于本地 meta 翻转");
+    }
+    assert_eq!(info.replication_status.as_deref(), Some("COMPLETED"));
+    assert_eq!(info.remote_version_id, info.version_id);
+    let (_, bytes) = s.get_object("alpha", "mpu.bin").await.unwrap();
+    assert_eq!(&bytes[..], b"hello mpu");
+    assert_eq!(tee_entries(dir.path()), 0, "成功后 tee 必须清理");
+}
+
+#[tokio::test]
+async fn mpu_gate_failure_leaves_no_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = MockGate::new(dir.path(), true);
+    gate.fail.store(true, Ordering::SeqCst);
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.gate = Some(gate.clone());
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+
+    let err = mpu_complete(&s, "mpu.bin", b"hello mpu".to_vec())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        s.head_object("alpha", "mpu.bin").await,
+        Err(Error::NoSuchKey(_))
+    ));
+    assert_eq!(tee_entries(dir.path()), 0, "失败后 tee 必须清理");
 }

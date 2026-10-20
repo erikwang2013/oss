@@ -1,16 +1,18 @@
 //! M9 S1：sync 桶 remote-first PutObject 进程内验收。
 //!
 //! 覆盖：成功（远端收到同体/同 ETag/同 origin id，远端回同 id → 本地可见、
-//! `COMPLETED`、无站点 outbox）；远端失败/超时/版本 id 不符/无版本 → 503 且本地
-//! 不可见、tee 清理、无 outbox；0/2 peer、删桶中、本地/远端 versioning 未就绪 →
-//! 503；sync 上限 → 400；async 桶路径逐字节不变（照常入队）；接收端 token 校验与
-//! origin id 采纳/重放/冲突。
+//! `COMPLETED`、无站点 outbox）；远端失败/超时/无版本 → 503，版本 id 不符 → 502，
+//! 均本地不可见、tee 清理、无 outbox；0/2 peer、删桶中 → 503，versioning 未就绪 →
+//! 409；sync 上限 → 400；async 桶路径逐字节不变（照常入队）；接收端 token 校验与
+//! origin id 采纳/重放/冲突（409）；MPU Complete 与 CopyObject 的远端先确认与
+//! 元数据透传；不支持组合的 4xx/501 边界；补偿删除走本地站点路由（不回环）。
 //!
 //! SigV4 用 s3s-sigv4 规范原语在测试内最小实现（同 m8_ap）。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
@@ -57,6 +59,9 @@ struct Seen {
     replication: Option<String>,
     content_type: Option<String>,
     meta_foo: Option<String>,
+    tagging: Option<String>,
+    storage_class: Option<String>,
+    checksum_sha256: Option<String>,
 }
 
 struct MockRemote {
@@ -82,6 +87,21 @@ impl MockRemote {
             .unwrap()
             .iter()
             .filter(|s| s.method == "DELETE")
+            .cloned()
+            .collect()
+    }
+
+    fn calls(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+
+    /// M9 S2：补偿删除只允许走站点内部路由（POST），不得发普通 S3 DELETE（会回环）。
+    fn site_deletes(&self) -> Vec<Seen> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST" && s.uri.contains("/api/v1/site/delete-object"))
             .cloned()
             .collect()
     }
@@ -127,6 +147,9 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                         let replication = hdr("x-amz-replication-status");
                         let content_type = hdr("content-type");
                         let meta_foo = hdr("x-amz-meta-foo");
+                        let tagging = hdr("x-amz-tagging");
+                        let storage_class = hdr("x-amz-storage-class");
+                        let checksum_sha256 = hdr("x-amz-checksum-sha256");
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         seen.lock().unwrap().push(Seen {
                             method: method.clone(),
@@ -138,6 +161,9 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                             replication,
                             content_type,
                             meta_foo,
+                            tagging,
+                            storage_class,
+                            checksum_sha256,
                         });
                         let m = *mode.lock().unwrap();
                         let mut resp = Response::new(Full::new(Bytes::new()));
@@ -312,7 +338,7 @@ async fn make_bucket(st: &AppState, name: &str, uid: i64, mode: &str) {
 async fn set_bucket(st: &AppState, name: &str, col: &str, val: &str) {
     assert!(matches!(
         col,
-        "replication_mode" | "versioning" | "deleting"
+        "replication_mode" | "versioning" | "deleting" | "object_lock"
     ));
     let sql = format!("UPDATE buckets SET {col} = ? WHERE name = ?");
     sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -396,10 +422,19 @@ async fn signed(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let pairs: Vec<(String, String)> = Vec::new();
+    // M9 S2：MPU/子资源请求带查询串，必须一起进规范请求。
+    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+    let pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (kv.to_string(), String::new()),
+        })
+        .collect();
     let canonical = create_canonical_request(
         method.as_str(),
-        req.url().path(),
+        path_only,
         &pairs,
         &refs,
         Payload::SingleChunk(&payload_hex),
@@ -492,15 +527,171 @@ async fn sync_put_remote_first_success() {
     assert_eq!(tee_entries(&e), 0);
 }
 
+/// M9 S2：PutObject 的 tags/storage-class/checksum 必须随门 PUT 到达远端；
+/// CopyObject 目标走同一门（远端先确认、同 id），并复制 tags/metadata/storage-class。
 #[tokio::test]
-async fn remote_failure_wrong_id_and_unversioned_are_503_and_invisible() {
-    let e = env(Mode::Fail, 1 << 20).await;
-    let cases = [
-        (Mode::Fail, "fail.txt"),
-        (Mode::WrongId, "wrong.txt"),
-        (Mode::NoVersion, "nover.txt"),
+async fn sync_copy_forwards_metadata_and_roundtrips() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let body = b"copy me".to_vec();
+    let sum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+    let src_h = [
+        ("content-type", "text/plain"),
+        ("x-amz-tagging", "k1=v1&k2=v2"),
+        ("x-amz-storage-class", "STANDARD_IA"),
+        ("x-amz-checksum-sha256", sum.as_str()),
+        ("x-amz-meta-foo", "bar"),
     ];
-    for (mode, key) in cases {
+    let r = signed(&e, Method::PUT, "/syn/src.txt", &src_h, &body).await;
+    assert_eq!(r.status(), 200);
+    let src_vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let seen = e.remote.puts();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].tagging.as_deref(), Some("k1=v1&k2=v2"));
+    assert_eq!(seen[0].storage_class.as_deref(), Some("STANDARD_IA"));
+    assert_eq!(seen[0].checksum_sha256.as_deref(), Some(sum.as_str()));
+
+    let r = signed(
+        &e,
+        Method::PUT,
+        "/syn/dst.txt",
+        &[
+            ("x-amz-copy-source", "/syn/src.txt"),
+            // Copy 的存储类是目标属性（AWS：缺省 STANDARD，不继承源）；显式给出以验证透传。
+            ("x-amz-storage-class", "STANDARD_IA"),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let dst_vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .expect("sync copy 必须返回目标 version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(dst_vid, src_vid);
+    let seen = e.remote.puts();
+    assert_eq!(seen.len(), 2, "copy 目标也必须远端先确认");
+    assert_eq!(seen[1].body, body);
+    assert_eq!(seen[1].origin.as_deref(), Some(dst_vid.as_str()));
+    assert_eq!(seen[1].tagging.as_deref(), Some("k1=v1&k2=v2"));
+    assert_eq!(seen[1].storage_class.as_deref(), Some("STANDARD_IA"));
+    assert_eq!(seen[1].meta_foo.as_deref(), Some("bar"));
+
+    // 本地目标字段与远端收到的字段一一对应（A/B 一致），且内容可读。
+    let g = signed(&e, Method::GET, "/syn/dst.txt", &[], &[]).await;
+    assert_eq!(g.status(), 200);
+    assert_eq!(g.bytes().await.unwrap().as_ref(), body.as_slice());
+    let h = signed(&e, Method::HEAD, "/syn/dst.txt", &[], &[]).await;
+    assert_eq!(
+        h.headers().get("x-amz-storage-class").unwrap(),
+        "STANDARD_IA"
+    );
+    assert_eq!(h.headers().get("x-amz-meta-foo").unwrap(), "bar");
+    assert_eq!(h.headers().get("x-amz-tagging-count").unwrap(), "2");
+    let t = signed(&e, Method::GET, "/syn/dst.txt?tagging", &[], &[]).await;
+    assert_eq!(t.status(), 200);
+    let xml = t.text().await.unwrap();
+    assert!(
+        xml.contains("<Key>k1</Key>") && xml.contains("<Value>v1</Value>"),
+        "{xml}"
+    );
+    assert_eq!(outbox(&e.st, "syn", "dst.txt").await, 0);
+    assert_eq!(tee_entries(&e), 0);
+}
+
+/// M9 §2.4：sync 写不支持的组合必须显式 4xx/501，且不得触远端。
+#[tokio::test]
+async fn sync_write_boundaries_reject_unsupported_combinations() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    // 直接置桶锁位（enable_bucket_lock 的 upsert 会撞站点时钟触发器，测试不测该路径）；
+    // 桶锁配置 op 未映射到权限词表（非 admin fail-closed 403），临时提权以验证到 sync 边界。
+    set_bucket(&e.st, "syn", "object_lock", "1").await;
+    sqlx::query("UPDATE users SET is_admin = 1")
+        .execute(e.st.db.pool())
+        .await
+        .unwrap();
+    // SSE-C → 400
+    let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let ssec = [
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-server-side-encryption-customer-key", key.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::PUT, "/syn/ssec.bin", &ssec, b"x")
+            .await
+            .status(),
+        400
+    );
+    // 对象锁 → 409（桶锁已开，锁头能过 resolve_lock，才验证到 sync 边界）
+    assert_eq!(
+        signed(
+            &e,
+            Method::PUT,
+            "/syn/lock.bin",
+            &[("x-amz-object-lock-legal-hold", "ON")],
+            b"x"
+        )
+        .await
+        .status(),
+        409
+    );
+    // Tagging API → 501
+    let tag = br#"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>"#;
+    assert_eq!(
+        signed(
+            &e,
+            Method::PUT,
+            "/syn/ssec.bin?tagging",
+            &[("content-type", "application/xml")],
+            tag
+        )
+        .await
+        .status(),
+        501
+    );
+    // 桶级默认锁 → 409
+    let lock_cfg = br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#;
+    assert_eq!(
+        signed(
+            &e,
+            Method::PUT,
+            "/syn?object-lock",
+            &[("content-type", "application/xml")],
+            lock_cfg
+        )
+        .await
+        .status(),
+        409
+    );
+    // lifecycle Transition → 400（同步副本无法在远端做分层迁移）
+    let lc = br#"<LifecycleConfiguration><Rule><ID>r</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"#;
+    assert_eq!(
+        signed(
+            &e,
+            Method::PUT,
+            "/syn?lifecycle",
+            &[("content-type", "application/xml")],
+            lc
+        )
+        .await
+        .status(),
+        400
+    );
+    assert_eq!(e.remote.calls(), 0, "被拒边界不得触远端");
+}
+
+#[tokio::test]
+async fn remote_failure_and_unversioned_are_503_and_invisible() {
+    let e = env(Mode::Fail, 1 << 20).await;
+    for (mode, key) in [(Mode::Fail, "fail.txt"), (Mode::NoVersion, "nover.txt")] {
         *e.remote.mode.lock().unwrap() = mode;
         let path = format!("/syn/{key}");
         let r = put(&e, &path, b"body").await;
@@ -510,6 +701,26 @@ async fn remote_failure_wrong_id_and_unversioned_are_503_and_invisible() {
         assert_eq!(outbox(&e.st, "syn", key).await, 0, "{mode:?} 不得入 outbox");
         assert_eq!(tee_entries(&e), 0, "{mode:?} 后 tee 必须清理");
     }
+}
+
+/// M9 §2.4：远端 id 与本地预生成 UUID 不符 = 双站同 id 契约破坏 → 502（不可重试）。
+#[tokio::test]
+async fn remote_version_id_mismatch_is_502_and_invisible() {
+    let e = env(Mode::WrongId, 1 << 20).await;
+    let r = put(&e, "/syn/wrong.txt", b"body").await;
+    assert_eq!(r.status(), 502);
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/wrong.txt", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(tee_entries(&e), 0);
+    assert_eq!(
+        intent_rows(&e.st).await,
+        1,
+        "id 不符保留 intent 供 repair/恢复清理远端错 id 版本"
+    );
 }
 
 #[tokio::test]
@@ -553,11 +764,11 @@ async fn gates_require_single_peer_and_ready_bucket() {
     set_bucket(&e.st, "syn", "deleting", "1").await;
     e.st.store.invalidate_gate("syn");
     assert_eq!(put(&e, "/syn/gate4.txt", b"x").await.status(), 503);
-    // 本地 versioning 未启用（sync 依赖双站同 id）
+    // 本地 versioning 未启用（sync 依赖双站同 id）→ 409（桶状态可纠正，非暂时不可用）
     set_bucket(&e.st, "syn", "deleting", "0").await;
     set_bucket(&e.st, "syn", "versioning", "Suspended").await;
     e.st.store.invalidate_gate("syn");
-    assert_eq!(put(&e, "/syn/gate5.txt", b"x").await.status(), 503);
+    assert_eq!(put(&e, "/syn/gate5.txt", b"x").await.status(), 409);
     // 被拒的写一次远端调用都没有；gate3 是唯一成功者。
     assert_eq!(e.remote.puts().len(), 1);
     assert_eq!(outbox(&e.st, "syn", "gate4.txt").await, 0);
@@ -594,11 +805,137 @@ async fn sync_max_bytes_rejected_before_remote() {
     assert_eq!(tee_entries(&e), 0);
 }
 
+/// M9 S2：MPU Complete 与 PutObject 同一门——拼接后 tee 明文 → 整对象远端 PUT
+/// （同 origin id）→ 本地 meta 翻转；失败则不可见且 tee 清理。
+#[tokio::test]
+async fn sync_mpu_complete_is_remote_first_and_roundtrips() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let r = signed(
+        &e,
+        Method::POST,
+        "/syn/mpu.bin?uploads",
+        &[
+            ("content-type", "text/x-mpu"),
+            ("x-amz-tagging", "mp=1"),
+            ("x-amz-storage-class", "STANDARD_IA"),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let xml = r.text().await.unwrap();
+    let upload_id = xml
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("create MPU 必须返回 UploadId")
+        .to_string();
+    let part = b"hello multipart".to_vec();
+    let part_path = format!("/syn/mpu.bin?partNumber=1&uploadId={upload_id}");
+    let r = signed(&e, Method::PUT, &part_path, &[], &part).await;
+    assert_eq!(r.status(), 200);
+    let etag = r
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+         <ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let r = signed(
+        &e,
+        Method::POST,
+        &format!("/syn/mpu.bin?uploadId={upload_id}"),
+        &[("content-type", "application/xml")],
+        complete.as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .expect("sync Complete 必须返回 version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let puts = e.remote.puts();
+    assert_eq!(puts.len(), 1, "Complete 只允许一次远端 PUT");
+    assert_eq!(puts[0].body, part, "远端收到整对象明文");
+    assert_eq!(puts[0].origin.as_deref(), Some(vid.as_str()));
+    assert_eq!(puts[0].tagging.as_deref(), Some("mp=1"));
+    assert_eq!(puts[0].storage_class.as_deref(), Some("STANDARD_IA"));
+    assert_eq!(puts[0].content_type.as_deref(), Some("text/x-mpu"));
+    let g = signed(&e, Method::GET, "/syn/mpu.bin", &[], &[]).await;
+    assert_eq!(g.status(), 200);
+    assert_eq!(g.bytes().await.unwrap().as_ref(), part.as_slice());
+    assert_eq!(
+        signed(&e, Method::HEAD, "/syn/mpu.bin", &[], &[])
+            .await
+            .headers()
+            .get("x-amz-replication-status")
+            .unwrap(),
+        "COMPLETED"
+    );
+    assert_eq!(outbox(&e.st, "syn", "mpu.bin").await, 0);
+    assert_eq!(tee_entries(&e), 0);
+
+    // 失败：拼接+tee 之后远端 500 → 503，本地不可见，tee 清理。
+    let r = signed(&e, Method::POST, "/syn/mpu2.bin?uploads", &[], &[]).await;
+    let xml = r.text().await.unwrap();
+    let uid2 = xml
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .unwrap()
+        .to_string();
+    let r = signed(
+        &e,
+        Method::PUT,
+        &format!("/syn/mpu2.bin?partNumber=1&uploadId={uid2}"),
+        &[],
+        &part,
+    )
+    .await;
+    let etag2 = r
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    *e.remote.mode.lock().unwrap() = Mode::Fail;
+    let complete2 = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+         <ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let r = signed(
+        &e,
+        Method::POST,
+        &format!("/syn/mpu2.bin?uploadId={uid2}"),
+        &[("content-type", "application/xml")],
+        complete2.as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status(), 503);
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/mpu2.bin", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(outbox(&e.st, "syn", "mpu2.bin").await, 0);
+    assert_eq!(tee_entries(&e), 0);
+}
+
 #[tokio::test]
 async fn replica_intake_requires_token_and_adopts_origin_id() {
     let e = env(Mode::Ok, 1 << 20).await;
     let origin = uuid::Uuid::new_v4().to_string();
     let body = b"from-peer".to_vec();
+    let sum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
     // 缺 token / 错 token → 403
     let missing = [
         ("content-type", "text/plain"),
@@ -626,8 +963,11 @@ async fn replica_intake_requires_token_and_adopts_origin_id() {
         ("x-amz-replication-status", "REPLICA"),
         ("x-oss-site-token", LOCAL_TOKEN),
         ("x-oss-origin-version-id", origin.as_str()),
+        ("x-amz-tagging", "k1=v1&k2=v2"),
+        ("x-amz-storage-class", "STANDARD_IA"),
+        ("x-amz-checksum-sha256", sum.as_str()),
     ];
-    // 正确 token：采用 origin id，不调用远端门。
+    // 正确 token：采用 origin id，不调用远端门；tags/存储类/校验和随版本保留（A/B 一致）。
     let r = signed(&e, Method::PUT, "/syn/in3.txt", &h, &body).await;
     assert_eq!(r.status(), 200);
     assert_eq!(
@@ -649,18 +989,41 @@ async fn replica_intake_requires_token_and_adopts_origin_id() {
         head.headers().get("x-amz-replication-status").unwrap(),
         "REPLICA"
     );
-    // 同 id 同体重放幂等；同 id 异体冲突 400。
+    assert_eq!(
+        head.headers().get("x-amz-storage-class").unwrap(),
+        "STANDARD_IA"
+    );
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap(), "2");
+    assert_eq!(
+        head.headers().get("x-amz-checksum-sha256").unwrap(),
+        sum.as_str()
+    );
+    let t = signed(&e, Method::GET, "/syn/in3.txt?tagging", &[], &[]).await;
+    assert_eq!(t.status(), 200);
+    let xml = t.text().await.unwrap();
+    assert!(
+        xml.contains("<Key>k1</Key>") && xml.contains("<Value>v1</Value>"),
+        "{xml}"
+    );
+    // 同 id 同体重放幂等；同 id 异体冲突 → 409（M9 §2.4 强制 id 冲突）。
     assert_eq!(
         signed(&e, Method::PUT, "/syn/in3.txt", &h, &body)
             .await
             .status(),
         200
     );
+    // 异体请求不带 checksum（否则先撞校验和 400，测不到强制 id 冲突）。
+    let conflict = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", origin.as_str()),
+    ];
     assert_eq!(
-        signed(&e, Method::PUT, "/syn/in3.txt", &h, b"different")
+        signed(&e, Method::PUT, "/syn/in3.txt", &conflict, b"different")
             .await
             .status(),
-        400
+        409
     );
 }
 
@@ -688,8 +1051,8 @@ async fn replica_intake_requires_local_versioning() {
         signed(&e, Method::PUT, "/syn/noversion.txt", &h, b"body")
             .await
             .status(),
-        503,
-        "本端 versioning 未启用时不得摄入 REPLICA"
+        409,
+        "本端 versioning 未启用时不得摄入 REPLICA（可纠正的桶状态 → 409）"
     );
     assert_eq!(
         signed(&e, Method::GET, "/syn/noversion.txt", &[], &[])
@@ -698,6 +1061,63 @@ async fn replica_intake_requires_local_versioning() {
         404
     );
     assert!(e.remote.puts().is_empty());
+}
+
+/// M9 S2/M6：站点补偿删除路由只做本地删除（token 认证、JWT 豁免、永不转发）。
+#[tokio::test]
+async fn site_delete_route_is_local_only_and_token_authed() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    // 用 REPLICA 摄入造一个已知 id 的本地版本（不触远端）。
+    let origin = uuid::Uuid::new_v4().to_string();
+    let h = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", origin.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::PUT, "/syn/site-del.txt", &h, b"bye")
+            .await
+            .status(),
+        200
+    );
+    let url = format!("{}/api/v1/site/delete-object", e.base);
+    let body = serde_json::json!({"bucket": "syn", "key": "site-del.txt", "version_id": origin});
+    // 错 token → 403，对象仍在。
+    let r = e
+        .http
+        .post(&url)
+        .header("x-oss-site-token", "ffffffffffffffffffffffffffffffff")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/site-del.txt", &[], &[])
+            .await
+            .status(),
+        200
+    );
+    // 正确 token → 204；重复调用幂等 204。
+    for _ in 0..2 {
+        let r = e
+            .http
+            .post(&url)
+            .header("x-oss-site-token", LOCAL_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+    }
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/site-del.txt", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(e.remote.calls(), 0, "补偿路由不得转发远端（无回环）");
 }
 
 async fn intent_rows(st: &AppState) -> i64 {
@@ -746,6 +1166,7 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     assert_eq!(intent_rows(&e.st).await, 0);
     assert!(!tee.exists(), "恢复必须清 tee");
     assert!(e.remote.deletes().is_empty(), "本地已有版本，不得删远端");
+    assert!(e.remote.site_deletes().is_empty());
     assert_eq!(
         signed(&e, Method::GET, "/syn/committed.txt", &[], &[])
             .await
@@ -759,12 +1180,19 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     std::fs::write(&tee2, b"y").unwrap();
     insert_intent(&e.st, &orphan, "orphan.txt", &tee2).await;
     recover_write_intents(&e.st).await;
-    let dels = e.remote.deletes();
+    // M6/S2：补偿删除走站点内部路由（token 校验、只删本地、永不转发）；
+    // 普通 S3 DELETE 会在双站间回环，必须零调用。
+    let dels = e.remote.site_deletes();
     assert_eq!(dels.len(), 1);
+    let body = String::from_utf8_lossy(&dels[0].body);
     assert!(
-        dels[0].uri.contains(&format!("versionId={orphan}")),
-        "删除必须点名同 id: {}",
-        dels[0].uri
+        body.contains(&format!("\"version_id\":\"{orphan}\"")),
+        "补偿删除必须点名同 id: {body}"
+    );
+    assert_eq!(dels[0].token.as_deref(), Some(PEER_TOKEN));
+    assert!(
+        e.remote.deletes().is_empty(),
+        "补偿不得发普通 S3 DELETE（回环）"
     );
     assert_eq!(intent_rows(&e.st).await, 0);
     assert!(!tee2.exists());
@@ -812,12 +1240,12 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     .execute(e.st.db.pool())
     .await
     .unwrap();
-    let deletes_before = e.remote.deletes().len();
+    let deletes_before = e.remote.site_deletes().len();
     recover_write_intents(&e.st).await;
     assert_eq!(intent_rows(&e.st).await, 1, "在途 intent 必须保留");
     assert!(tee4.exists(), "在途 intent 的 tee 必须保留");
     assert_eq!(
-        e.remote.deletes().len(),
+        e.remote.site_deletes().len(),
         deletes_before,
         "在途写不得触发远端删除"
     );

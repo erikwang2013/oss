@@ -28,6 +28,14 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         StoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
         // M9：明确不支持的能力 → 501。
         StoreError::Unsupported(_) => S3ErrorCode::NotImplemented,
+        // M9：状态冲突（sync 版本化未就绪/同 id 异体）→ 409。
+        StoreError::Conflict(_) => S3ErrorCode::ConditionalRequestConflict,
+        // M9：远端 ack 的版本 id 与预生成不一致 → 502（s3s 无 BadGateway 变体，强制状态码）。
+        StoreError::BadGateway(_) => {
+            let mut err = S3Error::with_message(S3ErrorCode::InternalError, e.to_string());
+            err.set_status_code(http::StatusCode::BAD_GATEWAY);
+            return err;
+        }
         // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体。
         // M5：Crypto（wrap 解不开/主密钥缺失）暂同归 500 泛化——对客户端可纠正的形态
         // （SSE-C 错钥 → 4xx）在切片 3 接线时再细分，此处不提前放宽。
@@ -90,12 +98,17 @@ mod tests {
     }
 
     #[test]
-    fn sync_errors_map_to_503_and_501() {
+    fn sync_errors_map_to_503_501_409_502() {
         let err = to_s3_error(StoreError::Unavailable("remote down".into()));
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message(), Some("unavailable: remote down"));
         let err = to_s3_error(StoreError::Unsupported("sync mpu".into()));
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        let err = to_s3_error(StoreError::Conflict("versioning suspended".into()));
+        assert_eq!(err.status_code(), Some(http::StatusCode::CONFLICT));
+        let err = to_s3_error(StoreError::BadGateway("sync version id mismatch".into()));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_GATEWAY));
+        assert_eq!(err.message(), Some("bad gateway: sync version id mismatch"));
     }
 
     #[test]

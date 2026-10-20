@@ -474,6 +474,9 @@ async fn send_row(
                 &r.etag,
                 info.content_type.as_deref(),
                 &info.user_metadata,
+                None, // M6/M7 异步复制不透传标签（旧行为）
+                None,
+                None,
                 true,
                 None, // M9：异步站点复制不再带 sync token
                 None,

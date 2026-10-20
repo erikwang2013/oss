@@ -27,6 +27,8 @@ pub struct GateRequest<'a> {
     pub user_metadata: &'a BTreeMap<String, String>,
     pub tags: Option<&'a [ObjectTag]>,
     pub storage_class: Option<&'a str>,
+    /// 客户端声明的校验和（远端按同值重算校验后落盘）。
+    pub checksum: Option<&'a crate::meta::ChecksumRecord>,
 }
 
 /// 远端确认回执。`remote_version_id` 必须等于 `local_version_id`（双站同 id）。
@@ -50,6 +52,12 @@ pub enum GateError {
     /// 门拒绝（如桶非 sync 形态）→ 400。
     #[error("{0}")]
     Rejected(String),
+    /// 本地前置不满足（sync 桶版本化未 Enabled）→ 409。
+    #[error("{0}")]
+    Conflict(String),
+    /// 远端 ack 的版本 id 与预生成 id 不符 → 502。
+    #[error("{0}")]
+    VersionMismatch(String),
 }
 
 impl From<GateError> for crate::error::Error {
@@ -60,6 +68,8 @@ impl From<GateError> for crate::error::Error {
                 Self::InvalidArgument("object exceeds sync max_object_bytes".into())
             }
             GateError::Rejected(m) => Self::InvalidArgument(m),
+            GateError::Conflict(m) => Self::Conflict(m),
+            GateError::VersionMismatch(m) => Self::BadGateway(m),
         }
     }
 }

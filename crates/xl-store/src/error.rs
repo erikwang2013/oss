@@ -58,6 +58,12 @@ pub enum Error {
     /// M9：明确的能力边界 → S3 501。
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// M9：状态冲突（sync 版本化未就绪/同 id 异体）→ S3 409。
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// M9：远端确认与本地预期不符（版本 id 不一致）→ S3 502。
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1006,16 +1006,30 @@ impl S3 for OssS3 {
             .get("x-amz-replication-status")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"));
+        // M9：sync 桶写边界（SSE-C 承诺客户端密钥双站可读；跨站对象锁语义未定义）。
+        let sync = self
+            .store
+            .sync_mode(&req.input.bucket)
+            .await
+            .map_err(to_s3_error)?;
+        if sync && !replica {
+            if matches!(sse.spec, Some(xl_store::crypto::EncSpec::SseC(_))) {
+                return Err(s3s::s3_error!(
+                    InvalidArgument,
+                    "SSE-C is not supported on sync buckets"
+                ));
+            }
+            if lock.as_ref().is_some_and(|l| !l.is_empty()) {
+                return Err(s3s::s3_error!(
+                    ConditionalRequestConflict,
+                    "object lock is not supported on sync buckets"
+                ));
+            }
+        }
         // M9：sync 桶的 REPLICA 摄入必须带匹配 site token + origin id；采用 origin UUID
         // 作本地版本 id（双站同 id），且不再 gate/再复制（防环）。
         let mut forced_version_id = None;
-        if replica
-            && self
-                .store
-                .sync_mode(&req.input.bucket)
-                .await
-                .map_err(to_s3_error)?
-        {
+        if replica && sync {
             let presented = req
                 .headers
                 .get("x-oss-site-token")
@@ -1035,8 +1049,8 @@ impl S3 for OssS3 {
                     .to_string(),
             );
         }
-        // M8 S4a：存储类（REPLICA 摄入不携带；归档类直写拒）
-        let storage_class = if replica {
+        // M8 S4a：存储类（M6/M7 REPLICA 不携带；token 验证的 sync 副本保留；归档类直写拒）
+        let storage_class = if replica && forced_version_id.is_none() {
             None
         } else {
             parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?
@@ -1052,8 +1066,9 @@ impl S3 for OssS3 {
             ..
         } = req.input;
         let body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
-        // M8 前置：x-amz-tagging（URL query 串）。REPLICA 摄入显式忽略标签（M6 边界）。
-        let tags = if replica {
+        // M8 前置：x-amz-tagging（URL query 串）。M6/M7 REPLICA 显式忽略标签；
+        // token 验证的 sync 副本保留（与本地版本字段一致）。
+        let tags = if replica && forced_version_id.is_none() {
             None
         } else {
             match tagging.as_deref() {
@@ -1193,6 +1208,26 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
         )?;
         let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
+        // M9：sync 桶写边界（同 PUT；SSE-C/锁意图都不得进入 mpu.meta）
+        if self
+            .store
+            .sync_mode(&req.input.bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            if matches!(sse.spec, Some(xl_store::crypto::EncSpec::SseC(_))) {
+                return Err(s3s::s3_error!(
+                    InvalidArgument,
+                    "SSE-C is not supported on sync buckets"
+                ));
+            }
+            if lock.as_ref().is_some_and(|l| !l.is_empty()) {
+                return Err(s3s::s3_error!(
+                    ConditionalRequestConflict,
+                    "object lock is not supported on sync buckets"
+                ));
+            }
+        }
         // M8 S4a（B12）：Create 声明的存储类随 mpu.meta 持久化，Complete 落地；归档类拒
         let storage_class =
             parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?;
@@ -1325,6 +1360,15 @@ impl S3 for OssS3 {
             multipart_upload,
             ..
         } = req.input;
+        // M9：sync 桶不接受 SSE-C（create 已拒；此处兜底 complete 携带密钥的直调）
+        if matches!(sse.spec, Some(xl_store::crypto::EncSpec::SseC(_)))
+            && self.store.sync_mode(&bucket).await.map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "SSE-C is not supported on sync buckets"
+            ));
+        }
         let Some(mu) = multipart_upload else {
             return Err(s3s::s3_error!(InvalidRequest, "missing multipart_upload"));
         };
@@ -1860,6 +1904,13 @@ impl S3 for OssS3 {
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
         let bucket = req.input.bucket;
+        // M9：sync 桶不允许对象锁（写侧锁意图已 409；桶级默认锁同样拒绝）。
+        if self.store.sync_mode(&bucket).await.map_err(to_s3_error)? {
+            return Err(s3s::s3_error!(
+                ConditionalRequestConflict,
+                "object lock is not supported on sync buckets"
+            ));
+        }
         let (mode, days) = parse_bucket_lock_rule(req.input.object_lock_configuration.as_ref())?;
         let row = self.acl.bucket_lock(&bucket).await.map_err(|e| {
             tracing::error!(error = %e, "读取桶对象锁状态失败");
@@ -3277,6 +3328,26 @@ impl S3 for OssS3 {
                 .map(|s| s.as_str()),
         )?;
         let dst_lock = self.resolve_lock(&req.input.bucket, dst_lock_req).await?;
+        // M9：sync 目标桶写边界（SSE-C 目标 400；对象锁 409）
+        if self
+            .store
+            .sync_mode(&req.input.bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            if matches!(dst_sse.spec, Some(xl_store::crypto::EncSpec::SseC(_))) {
+                return Err(s3s::s3_error!(
+                    InvalidArgument,
+                    "SSE-C is not supported on sync buckets"
+                ));
+            }
+            if dst_lock.as_ref().is_some_and(|l| !l.is_empty()) {
+                return Err(s3s::s3_error!(
+                    ConditionalRequestConflict,
+                    "object lock is not supported on sync buckets"
+                ));
+            }
+        }
 
         // 源：点名版本（回滚路径）或最新
         let (src_info, bytes) = match version_id.as_deref() {
@@ -3387,6 +3458,18 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        // M9：标签 API 不复制（sync 写只带 Create/PUT 时的 x-amz-tagging）。
+        if self
+            .store
+            .sync_mode(&req.input.bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(
+                NotImplemented,
+                "object tagging is not supported on sync buckets"
+            ));
+        }
         let tags = tagging_from_dto(&req.input.tagging)?;
         let vid = self
             .store
@@ -3433,6 +3516,18 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        // M9：同 put_object_tagging——标签变更不跨站，sync 桶明确拒绝。
+        if self
+            .store
+            .sync_mode(&req.input.bucket)
+            .await
+            .map_err(to_s3_error)?
+        {
+            return Err(s3s::s3_error!(
+                NotImplemented,
+                "object tagging is not supported on sync buckets"
+            ));
+        }
         let vid = self
             .store
             .set_object_tags(

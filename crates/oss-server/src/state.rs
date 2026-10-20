@@ -626,6 +626,7 @@ impl AppState {
                         "/login".into(),
                         "/site/identity".into(),
                         "/site/changelog".into(),
+                        "/site/delete-object".into(),
                     ],
                 },
                 ..Default::default()

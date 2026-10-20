@@ -18,6 +18,7 @@ use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, PartRef, Version, XlMeta};
+use crate::store::put::TeeGuard;
 use crate::store::{ByteStream, ObjectInfo, Store, now_nanos};
 
 /// 暂存区标记文件；存在即「这是一个活着的 MPU 暂存区」。
@@ -497,90 +498,52 @@ impl Store {
         // 装进新版本目录（内联 / EC 形态）——与单段 PUT 同一形态核心
         let uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
+        // M9：sync 桶 complete 同样先 staging（不可见）→ 远端确认 → 本地 meta 翻转。
+        // MPU 的 tee 在拼接 part 流时一次写出（无法从已存 part 安全重建 ETag/元数据）。
+        let sync = self.sync_mode(bucket).await?;
+        let max_bytes = sync.then_some(self.cfg.sync_max_bytes);
+        let tee = sync.then(|| TeeGuard::new(self.tee_dir().join(format!("{uuid}.plain"))));
+        let tee_path = tee.as_ref().and_then(TeeGuard::path);
         // 集群 + 单盘节点也必须走槽位路径（与 put.rs 同口径）
         let multi = self.cfg.cluster.is_some() || self.cfg.multi_drive();
-        let staged: Result<(u64, XlMeta)> = async {
+        // 1) staging：数据落位但对读路径不可见
+        let staged: Result<(
+            u64,
+            String,
+            Option<meta::DataLayout>,
+            Option<meta::InlineData>,
+        )> = async {
             // concat_stream_verified 逐段核验 bytes == sidecar 快照，通过则 size 恒等于各段总和。
             // upload_part 不持对象锁（允许并发传不同 part）：complete 期间零件被并发重传
             // = 快照与实际字节不一致 → InvalidPart（fail-closed，让客户端重试 complete）
             let (size, _md5, sha256, data_layout, inline) = if multi {
                 let (s, e, sh, l, i, _touched) = self
-                    .stage_payload_multi(
+                    .stage_payload_multi_tee(
                         bucket,
                         key,
                         &uuid,
                         &tmp,
                         concat_stream_verified(snapshots),
                         enc_ctx.as_ref().map(|(c, _)| c),
+                        tee_path,
+                        max_bytes,
                     )
                     .await?;
                 (s, e, sh, l, i)
             } else {
-                self.stage_payload(
+                self.stage_payload_tee(
                     &tmp,
                     concat_stream_verified(snapshots),
                     enc_ctx.as_ref().map(|(c, _)| c),
+                    tee_path,
+                    max_bytes,
                 )
                 .await?
             };
-            let version = Version {
-                version_id: if versioned {
-                    uuid::Uuid::parse_str(&uuid).map_err(|e| {
-                        Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}"))
-                    })?
-                } else {
-                    uuid::Uuid::nil()
-                },
-                mod_time_nanos: now,
-                size,
-                etag: etag.clone(),
-                content_type: mpu.content_type.clone(),
-                user_metadata: mpu.user_metadata.clone(),
-                // 兼容位：整对象引用（sha256 = 整份 SHA256，读路径 EC 终验用）
-                part: PartRef {
-                    uuid: uuid.clone(),
-                    part: 1,
-                    size,
-                    sha256,
-                },
-                parts: None,    // 裁决：新写入不再使用 parts（降为 M2a 旧对象只读兼容位）
-                checksum: None, // multipart 组合校验和留 M2b
-                data_layout,
-                inline,
-                is_delete_marker: None,
-                is_latest: None,
-                // NTP 回拨收口：epoch = 旧链 max+1（与单段 PUT 同口径）
-                epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
-                // M5 切片 2：加密记录随版本落 meta（单流形态：MPU 于 complete 合并后加密）
-                encryption: enc_record.clone(),
-                // M5 切片 4：对象锁（create 记录的意图在此落地）
-                lock: effective_lock.clone(),
-                replication_status: None,
-                remote_version_id: None,
-                // Create 声明的标签在 complete 落地（complete 无标签输入）
-                tags: mpu.tags.clone(),
-                storage_class: mpu.storage_class.clone(),
-                tier: None,
-            };
-            let mut meta = match (versioned, old_meta.as_ref()) {
-                (true, Some(old)) => {
-                    let mut m = old.clone();
-                    m.versions.push(version);
-                    m
-                }
-                _ => XlMeta {
-                    object_key: key.to_string(),
-                    versions: vec![version],
-                },
-            };
-            meta.refresh_latest_flags();
-            if !multi {
-                tokio::fs::write(tmp.join(crate::meta::META_FILE), meta.encode()?).await?;
-            }
-            Ok((size, meta))
+            Ok((size, sha256, data_layout, inline))
         }
         .await;
-        let (size, meta) = match staged {
+        let (size, sha256, data_layout, inline) = match staged {
             Ok(v) => v,
             Err(e) => {
                 if multi {
@@ -591,44 +554,170 @@ impl Store {
             }
         };
 
-        if multi {
-            // 多盘：两阶段 meta 提交（数据已在各盘版本目录就位；见 put.rs 同款流程）
-            // 提交点前复查租约（Task 8）
-            if _guard.lease_lost() {
-                self.rollback_versions(bucket, key, &uuid).await;
-                let _ = tokio::fs::remove_dir_all(&tmp).await;
-                return Err(Error::QuorumUnmet("集群锁租约丢失，MPU 提交中止".into()));
-            }
-            let quorum = self.cfg.ec.data as usize + 1;
-            let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
-                Ok(n) => n,
+        // 2) gate：staging 后、本地 meta 翻转前（sync 桶必须远端先确认）。
+        let ticket = if sync {
+            let plaintext = match tee_path {
+                Some(p) => p,
+                None => {
+                    if multi {
+                        self.rollback_versions(bucket, key, &uuid).await;
+                    }
+                    let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    return Err(Error::Encode("sync tee 缺失（明文副本未生成）".into()));
+                }
+            };
+            let req = crate::gate::GateRequest {
+                bucket,
+                key,
+                local_version_id: &uuid,
+                plaintext,
+                size,
+                etag: &etag,
+                content_type: mpu.content_type.as_deref(),
+                user_metadata: &mpu.user_metadata,
+                tags: mpu.tags.as_deref(),
+                storage_class: mpu.storage_class.as_deref(),
+                checksum: None, // multipart 组合校验和留 M2b
+            };
+            match self.gate_commit(req).await {
+                Ok(t) => Some(t),
                 Err(e) => {
-                    self.rollback_versions(bucket, key, &uuid).await;
+                    if multi {
+                        self.rollback_versions(bucket, key, &uuid).await;
+                    }
                     let _ = tokio::fs::remove_dir_all(&tmp).await;
                     return Err(e);
                 }
-            };
-            if flipped == 0 {
-                self.rollback_versions(bucket, key, &uuid).await;
-                self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
-                let _ = tokio::fs::remove_dir_all(&tmp).await;
-                return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
             }
-            if flipped < quorum {
-                tracing::warn!(
-                    flipped,
-                    quorum,
-                    "meta 翻转不足 quorum（已提交，M4 heal 补副本）"
-                );
+        } else {
+            None
+        };
+        let remote_version_id = ticket.as_ref().and_then(|t| t.remote_version_id.clone());
+
+        // 3) Version 与候选 meta（gate 成功之后才构造——本地提交不得先于远端）
+        let version = Version {
+            version_id: if versioned {
+                uuid::Uuid::parse_str(&uuid)
+                    .map_err(|e| Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}")))?
+            } else {
+                uuid::Uuid::nil()
+            },
+            mod_time_nanos: now,
+            size,
+            etag: etag.clone(),
+            content_type: mpu.content_type.clone(),
+            user_metadata: mpu.user_metadata.clone(),
+            // 兼容位：整对象引用（sha256 = 整份 SHA256，读路径 EC 终验用）
+            part: PartRef {
+                uuid: uuid.clone(),
+                part: 1,
+                size,
+                sha256,
+            },
+            parts: None,    // 裁决：新写入不再使用 parts（降为 M2a 旧对象只读兼容位）
+            checksum: None, // multipart 组合校验和留 M2b
+            data_layout,
+            inline,
+            is_delete_marker: None,
+            is_latest: None,
+            // NTP 回拨收口：epoch = 旧链 max+1（与单段 PUT 同口径）
+            epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
+            // M5 切片 2：加密记录随版本落 meta（单流形态：MPU 于 complete 合并后加密）
+            encryption: enc_record.clone(),
+            // M5 切片 4：对象锁（create 记录的意图在此落地）
+            lock: effective_lock.clone(),
+            // sync 写远端已确认 → COMPLETED；非 sync 保持 M6 口径（None）。
+            replication_status: ticket.as_ref().map(|_| "COMPLETED".to_string()),
+            remote_version_id: remote_version_id.clone(),
+            // Create 声明的标签在 complete 落地（complete 无标签输入）
+            tags: mpu.tags.clone(),
+            storage_class: mpu.storage_class.clone(),
+            tier: None,
+        };
+        let mut meta = match (versioned, old_meta.as_ref()) {
+            (true, Some(old)) => {
+                let mut m = old.clone();
+                m.versions.push(version);
+                m
+            }
+            _ => XlMeta {
+                object_key: key.to_string(),
+                versions: vec![version],
+            },
+        };
+        meta.refresh_latest_flags();
+        let candidate: Result<()> = if multi {
+            Ok(())
+        } else {
+            match meta.encode() {
+                Ok(bytes) => tokio::fs::write(tmp.join(crate::meta::META_FILE), bytes)
+                    .await
+                    .map_err(Error::from),
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = candidate {
+            if let Some(t) = &ticket {
+                self.abort_gate(t).await;
+            }
+            if multi {
+                self.rollback_versions(bucket, key, &uuid).await;
             }
             let _ = tokio::fs::remove_dir_all(&tmp).await;
-        } else {
-            // 数据就位（同盘 rename）→ 唯一提交点
-            tokio::fs::create_dir_all(&obj_dir).await?;
-            tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
-            self.write_meta(bucket, key, &meta, old_meta.as_ref())
-                .await?;
+            return Err(e);
         }
+
+        // 4) 本地提交（提交点 = xl.meta 翻转）。失败 → 补偿远端（best-effort）。
+        let committed: Result<()> = async {
+            if multi {
+                // 多盘：两阶段 meta 提交（数据已在各盘版本目录就位；见 put.rs 同款流程）
+                // 提交点前复查租约（Task 8）
+                if _guard.lease_lost() {
+                    self.rollback_versions(bucket, key, &uuid).await;
+                    let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    return Err(Error::QuorumUnmet("集群锁租约丢失，MPU 提交中止".into()));
+                }
+                let quorum = self.cfg.ec.data as usize + 1;
+                let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.rollback_versions(bucket, key, &uuid).await;
+                        let _ = tokio::fs::remove_dir_all(&tmp).await;
+                        return Err(e);
+                    }
+                };
+                if flipped == 0 {
+                    self.rollback_versions(bucket, key, &uuid).await;
+                    self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
+                    let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
+                }
+                if flipped < quorum {
+                    tracing::warn!(
+                        flipped,
+                        quorum,
+                        "meta 翻转不足 quorum（已提交，M4 heal 补副本）"
+                    );
+                }
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+            } else {
+                // 数据就位（同盘 rename）→ 唯一提交点
+                tokio::fs::create_dir_all(&obj_dir).await?;
+                tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
+                self.write_meta(bucket, key, &meta, old_meta.as_ref())
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = committed {
+            if let Some(t) = &ticket {
+                self.abort_gate(t).await;
+            }
+            return Err(e);
+        }
+        // 本地提交点已过：通知门清理写 intent。
+        self.commit_gate(&ticket).await;
 
         // 暂存区收尾（best-effort：提交点已过）：mpu.meta 生死门先改名，再整目录删。
         // 若删到一半崩溃，残骸无 meta 引用，由 `reap_stale` 按 mtime 回收
@@ -656,8 +745,8 @@ impl Store {
             }),
             encryption: enc_record,
             lock: effective_lock,
-            replication_status: None,
-            remote_version_id: None,
+            replication_status: ticket.as_ref().map(|_| "COMPLETED".to_string()),
+            remote_version_id,
             tags: mpu.tags.unwrap_or_default(),
             storage_class: mpu.storage_class.clone(),
             tier_phase: None,

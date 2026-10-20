@@ -217,23 +217,7 @@ impl Store {
     /// 收全后按 `inline_threshold` 转形态，返回
     /// `(size, 整份 MD5 etag, 整份 SHA256, data_layout, inline)`。
     /// 调用方负责候选 meta 与提交协议（rename → write_meta）。单盘形态专用；
-    /// 多盘分发走 [`Store::stage_payload_multi`]。
-    pub(in crate::store) async fn stage_payload(
-        &self,
-        tmp: &std::path::Path,
-        body: ByteStream,
-        enc: Option<&crypto::UnitCtx>,
-    ) -> Result<(
-        u64,
-        String,
-        String,
-        Option<meta::DataLayout>,
-        Option<meta::InlineData>,
-    )> {
-        self.stage_payload_tee(tmp, body, enc, None, None).await
-    }
-
-    /// 带 tee/上限的形态核心（sync 单段 PUT 用；mpu 走无 tee 的兼容壳）。
+    /// 多盘分发走 `stage_payload_multi_tee`；`tee`/`max_bytes` 仅 sync 桶给出。
     pub(in crate::store) async fn stage_payload_tee(
         &self,
         tmp: &std::path::Path,
@@ -341,27 +325,7 @@ impl Store {
     /// 内联（< 阈值）不落数据文件：数据进 meta，冗余由 meta 多盘复制提供（M2b-1 记录的边界在此收口）。
     ///
     /// 返回 `(size, etag, sha256, data_layout, inline, 已触碰槽位)`；`touched` 供调用方回滚。
-    pub(in crate::store) async fn stage_payload_multi(
-        &self,
-        bucket: &str,
-        key: &str,
-        uuid: &str,
-        tmp: &std::path::Path,
-        body: ByteStream,
-        enc: Option<&crypto::UnitCtx>,
-    ) -> Result<(
-        u64,
-        String,
-        String,
-        Option<meta::DataLayout>,
-        Option<meta::InlineData>,
-        Vec<u16>,
-    )> {
-        self.stage_payload_multi_tee(bucket, key, uuid, tmp, body, enc, None, None)
-            .await
-    }
-
-    /// 带 tee/上限的多盘落盘（sync 单段 PUT 用）。
+    /// `tee`/`max_bytes` 仅 sync 桶给出。
     #[allow(clippy::too_many_arguments)]
     pub(in crate::store) async fn stage_payload_multi_tee(
         &self,
@@ -864,9 +828,7 @@ impl Store {
                 // 返回被重放版本本身（不是链上 latest）：调用端按 id 相等判定幂等。
                 return Ok(super::version::version_info(key, v));
             }
-            return Err(Error::InvalidArgument(format!(
-                "origin version id 冲突：{id}"
-            )));
+            return Err(Error::Conflict(format!("origin version id 冲突：{id}")));
         }
 
         // 2) gate：staging 后、本地 meta 翻转前（sync 桶必须远端先确认）。
@@ -890,6 +852,7 @@ impl Store {
                 user_metadata: &user_metadata,
                 tags: tags.as_deref(),
                 storage_class: storage_class.as_deref(),
+                checksum: checksum.as_ref(),
             };
             match self.gate_commit(req).await {
                 Ok(t) => Some(t),
@@ -1114,14 +1077,14 @@ impl Store {
     }
 
     /// 本地提交失败后的远端补偿（best-effort：结果不改变客户端错误）。
-    async fn abort_gate(&self, ticket: &crate::gate::GateTicket) {
+    pub(in crate::store) async fn abort_gate(&self, ticket: &crate::gate::GateTicket) {
         if let Some(gate) = &self.cfg.gate {
             gate.abort(ticket).await;
         }
     }
 
     /// 本地提交成功：门清理写 intent。
-    async fn commit_gate(&self, ticket: &Option<crate::gate::GateTicket>) {
+    pub(in crate::store) async fn commit_gate(&self, ticket: &Option<crate::gate::GateTicket>) {
         if let (Some(gate), Some(t)) = (&self.cfg.gate, ticket) {
             gate.committed(t).await;
         }
@@ -1129,14 +1092,14 @@ impl Store {
 }
 
 /// sync 明文 tee 的清理守卫：成功、失败、取消（future drop）都删文件。
-struct TeeGuard(Option<std::path::PathBuf>);
+pub(in crate::store) struct TeeGuard(Option<std::path::PathBuf>);
 
 impl TeeGuard {
-    fn new(path: std::path::PathBuf) -> Self {
+    pub(in crate::store) fn new(path: std::path::PathBuf) -> Self {
         Self(Some(path))
     }
 
-    fn path(&self) -> Option<&std::path::Path> {
+    pub(in crate::store) fn path(&self) -> Option<&std::path::Path> {
         self.0.as_deref()
     }
 }

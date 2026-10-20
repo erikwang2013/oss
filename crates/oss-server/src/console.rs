@@ -198,6 +198,8 @@ pub fn routes() -> Router<AppState> {
         // M7：站点身份与关系（`[site]` 未配置时 handlers 404；identity 走 token 而非 JWT）
         .route("/site", get(site_info))
         .route("/site/identity", get(site_identity))
+        // M9：sync 补偿的本地定点删除（token 面；只删本站，永不转发）
+        .route("/site/delete-object", post(site_delete_object))
         .route("/sites", get(list_sites).post(create_site))
         .route("/sites/{peer_id}", delete(delete_site))
         .route("/sites/{peer_id}/ping", post(ping_site))
@@ -2066,6 +2068,18 @@ async fn put_object_tags(
     if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Write).await {
         return r;
     }
+    // M9：标签变更不跨站——sync 桶明确 501（S3 Tagging API 同口径）。
+    match state.store.sync_mode(&bucket).await {
+        Ok(true) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "object tagging is not supported on sync buckets",
+            )
+                .into_response();
+        }
+        Ok(false) => {}
+        Err(e) => return store_error(e).into_response(),
+    }
     // store 对 InvalidArgument 落 5xx（那是通用错误面），这里先校验回 400
     if let Err(msg) = xl_store::meta::validate_tags(&body.tags) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -2091,6 +2105,18 @@ async fn delete_object_tags(
     };
     if let Err(r) = require_perm(&state, uid, is_admin, &bucket, Action::Write).await {
         return r;
+    }
+    // M9：同 put_object_tags。
+    match state.store.sync_mode(&bucket).await {
+        Ok(true) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "object tagging is not supported on sync buckets",
+            )
+                .into_response();
+        }
+        Ok(false) => {}
+        Err(e) => return store_error(e).into_response(),
     }
     match state
         .store
@@ -2995,5 +3021,54 @@ async fn site_changelog(
             tracing::warn!(error = %e, "changelog 应用失败（整批重试）");
             (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SiteDeleteBody {
+    bucket: String,
+    key: String,
+    #[serde(default)]
+    version_id: Option<String>,
+    #[serde(default)]
+    marker_id: Option<String>,
+}
+
+/// `POST /api/v1/site/delete-object`（token 面；JWT except）：sync 补偿的本地定点删除。
+/// 只删本站版本，永不转发——普通 S3 DELETE 是 remote-first 路径，走它会 A→B→A 回环。
+async fn site_delete_object(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SiteDeleteBody>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    let ok = headers
+        .get(crate::site_client::SITE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|tok| ct_eq(tok, &state.site.token));
+    if !ok {
+        return (StatusCode::FORBIDDEN, "invalid site token").into_response();
+    }
+    // marker 删除/创建属 remote-first 删除切片；未实现前明确拒绝而非静默跳过。
+    if body.marker_id.is_some() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "marker delete is not supported yet",
+        )
+            .into_response();
+    }
+    let Some(vid) = body.version_id else {
+        return (StatusCode::BAD_REQUEST, "version_id is required").into_response();
+    };
+    // sync 桶创建即 Enabled；显式版本删除对不存在版本幂等成功（DeleteOutcome::NotFound）。
+    match state
+        .store
+        .delete_object_versioned_ext(&body.bucket, &body.key, Some(&vid), true, false)
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }

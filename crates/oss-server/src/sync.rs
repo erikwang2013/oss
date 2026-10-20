@@ -298,7 +298,8 @@ impl PutCommitGate for SiteSyncGate {
             return Err(GateError::Unavailable("bucket is being deleted".into()));
         }
         if !st.versioned {
-            return Err(GateError::Unavailable(
+            // M9 §2.4：sync 桶 Suspended/Off → 409（可纠正的桶状态，不是暂时不可用）。
+            return Err(GateError::Conflict(
                 "sync bucket requires versioning Enabled".into(),
             ));
         }
@@ -336,6 +337,9 @@ impl PutCommitGate for SiteSyncGate {
             req.etag,
             req.content_type,
             req.user_metadata,
+            req.tags,
+            req.storage_class,
+            req.checksum,
             true, // require_version：远端 versioning 必须已 Enabled
             Some(&peer.peer_site_token),
             Some(req.local_version_id),
@@ -346,8 +350,9 @@ impl PutCommitGate for SiteSyncGate {
             .map_err(|e| GateError::Unavailable(format!("remote put failed: {}", e.message)))?
             .ok_or_else(|| GateError::Unavailable("remote returned no version id".into()))?;
         if remote != req.local_version_id {
-            return Err(GateError::Unavailable(format!(
-                "remote version id mismatch: local {}, remote {remote}",
+            // 双站同 id 的硬契约破坏：502（不是重试可解的暂时不可用），intent 保留待 repair。
+            return Err(GateError::VersionMismatch(format!(
+                "sync version id mismatch: local {}, remote {remote}",
                 req.local_version_id
             )));
         }

@@ -379,6 +379,15 @@ impl BatchExecutor {
     async fn replace_tags(&self, p: &BatchActionPayload) -> Result<String, String> {
         self.author(p, "PutObjectTagging", &p.bucket, &p.key, None)
             .await?;
+        // M9：标签不跨站复制——sync 桶明确拒绝（与 S3 Tagging API 同口径）。
+        if self
+            .store
+            .sync_mode(&p.bucket)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err("NotImplemented: object tagging is not supported on sync buckets".into());
+        }
         self.store
             .set_object_tags(&p.bucket, &p.key, p.version_id.as_deref(), p.tags.clone())
             .await

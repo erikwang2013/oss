@@ -310,6 +310,9 @@ impl ReplClient {
             expected_etag,
             None,
             &BTreeMap::new(),
+            None,
+            None,
+            None,
             false,
             None,
             None,
@@ -320,7 +323,8 @@ impl ReplClient {
 
     /// M7 站点 PUT：透传 content-type/user-metadata，并可要求响应带真实 version-id
     /// （Suspended/Off 目标返回 "null" → 按可重试处理——P2）。
-    /// M9：`site_token`/`origin_version_id` 进 SigV4 SignedHeaders（sync 摄入校验+同 id）；
+    /// M9：`site_token`/`origin_version_id` 进 SigV4 SignedHeaders（sync 摄入校验+同 id），
+    /// tags/storage-class/checksum 一并透传（远端重算校验后落同值）；
     /// 返回远端 `x-amz-version-id`（无则 None）。
     #[allow(clippy::too_many_arguments)]
     pub async fn put_object_with_meta(
@@ -332,6 +336,9 @@ impl ReplClient {
         expected_etag: &str,
         content_type: Option<&str>,
         user_metadata: &BTreeMap<String, String>,
+        tags: Option<&[xl_store::meta::ObjectTag]>,
+        storage_class: Option<&str>,
+        checksum: Option<&xl_store::meta::ChecksumRecord>,
         require_version: bool,
         site_token: Option<&str>,
         origin_version_id: Option<&str>,
@@ -345,6 +352,25 @@ impl ReplClient {
         }
         if let Some(v) = origin_version_id {
             headers.push(("x-oss-origin-version-id".into(), v.to_string()));
+        }
+        if let Some(tags) = tags.filter(|t| !t.is_empty()) {
+            let q = tags
+                .iter()
+                .map(|t| format!("{}={}", pct(&t.key), pct(&t.value)))
+                .collect::<Vec<_>>()
+                .join("&");
+            headers.push(("x-amz-tagging".into(), q));
+        }
+        if let Some(sc) = storage_class {
+            headers.push(("x-amz-storage-class".into(), sc.to_string()));
+        }
+        if let Some(c) = checksum {
+            let h = if c.algorithm.eq_ignore_ascii_case("MD5") {
+                "content-md5".to_string()
+            } else {
+                format!("x-amz-checksum-{}", c.algorithm.to_ascii_lowercase())
+            };
+            headers.push((h, c.value_base64.clone()));
         }
         for (k, v) in user_metadata {
             let k = k.to_ascii_lowercase();
@@ -398,7 +424,9 @@ impl ReplClient {
         Ok(vid)
     }
 
-    /// M9：按版本 id 定点删除（同步门补偿；404 = 已不存在 → 成功）。
+    /// M9：按版本 id 定点删除（同步门补偿）。
+    /// 走站点内部路由（token 认证、只做本地删除、永不转发——普通 S3 DELETE 会回环）；
+    /// 404 = 路由/对象不存在 → 视为已删。
     pub async fn delete_object_version(
         &self,
         remote_id: &str,
@@ -407,19 +435,24 @@ impl ReplClient {
         version_id: &str,
         site_token: Option<&str>,
     ) -> Result<(), ReplError> {
-        let headers: Vec<(String, String)> = site_token
-            .map(|t| vec![("x-oss-site-token".to_string(), t.to_string())])
-            .unwrap_or_default();
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let body = serde_json::json!({
+            "bucket": dest_bucket, "key": key, "version_id": version_id,
+        })
+        .to_string();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-oss-site-token".to_string(), token.to_string()),
+        ];
         match self
-            .send(
+            .send_path(
                 remote_id,
-                "DELETE",
-                dest_bucket,
-                Some(key),
-                &[("versionId", version_id)],
-                None,
+                "POST",
+                "/api/v1/site/delete-object",
+                &[],
+                Some(Bytes::from(body)),
                 &headers,
-                Some("REPLICA"),
+                None,
             )
             .await
         {
@@ -511,6 +544,34 @@ impl ReplClient {
         headers: &[(String, String)],
         replication_status: Option<&'static str>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, ReplError> {
+        let decoded_path = match key {
+            Some(k) => format!("/{dest_bucket}/{k}"),
+            None => format!("/{dest_bucket}"),
+        };
+        self.send_path(
+            remote_id,
+            method,
+            &decoded_path,
+            query,
+            body,
+            headers,
+            replication_status,
+        )
+        .await
+    }
+
+    /// 站点内部路由（非 S3 路径）用：签名/连接与 `send` 同源，路径由调用方给。
+    #[allow(clippy::too_many_arguments)]
+    async fn send_path(
+        &self,
+        remote_id: &str,
+        method: &str,
+        decoded_path: &str,
+        query: &[(&str, &str)],
+        body: Option<Bytes>,
+        headers: &[(String, String)],
+        replication_status: Option<&'static str>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, ReplError> {
         let remote = self.remotes.get(remote_id).ok_or_else(|| {
             ReplError::permanent(format!("remote {remote_id:?} 未配置（规则校验应已拦截）"))
         })?;
@@ -548,13 +609,9 @@ impl ReplClient {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let decoded_path = match key {
-            Some(k) => format!("/{dest_bucket}/{k}"),
-            None => format!("/{dest_bucket}"),
-        };
         let payload = Payload::SingleChunk(payload_hex.as_str());
         let canonical =
-            create_canonical_request(method, &decoded_path, query, &signed_refs, payload);
+            create_canonical_request(method, decoded_path, query, &signed_refs, payload);
         // 规范请求的第 2 行是编码后的 path、第 3 行是编码后的 query（可为空）；
         // 实际请求 URI 必须把两者拼回去（M6 只取第 2 行——加 query 后会丢签名参数）。
         let mut clines = canonical.lines();
@@ -643,6 +700,19 @@ fn classify_status(status: StatusCode, text: &str) -> ReplError {
 
 fn is_single_part_etag(etag: &str) -> bool {
     etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `x-amz-tagging` 是 URL query 串；对端 `sts::parse_form` 解码 `%XX`/`+`。
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn amz_date_now() -> Result<AmzDate, ReplError> {
