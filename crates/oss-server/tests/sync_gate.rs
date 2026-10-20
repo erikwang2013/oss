@@ -20,7 +20,7 @@ use md5::{Digest as _, Md5};
 use oss_server::config::{AppConfig, SiteToml, SyncToml};
 use oss_server::db::{Db, PermissionRow, SitePeer};
 use oss_server::state::AppState;
-use oss_server::sync::SiteSyncGate;
+use oss_server::sync::{SiteSyncGate, recover_write_intents};
 use reqwest::Method;
 use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
@@ -49,7 +49,9 @@ enum Mode {
 #[derive(Clone, Debug)]
 struct Seen {
     method: String,
+    uri: String,
     body: Vec<u8>,
+    authorization: Option<String>,
     token: Option<String>,
     origin: Option<String>,
     replication: Option<String>,
@@ -70,6 +72,16 @@ impl MockRemote {
             .unwrap()
             .iter()
             .filter(|s| s.method == "PUT")
+            .cloned()
+            .collect()
+    }
+
+    fn deletes(&self) -> Vec<Seen> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "DELETE")
             .cloned()
             .collect()
     }
@@ -108,6 +120,8 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                                 .and_then(|v| v.to_str().ok())
                                 .map(str::to_string)
                         };
+                        let uri = req.uri().to_string();
+                        let authorization = hdr("authorization");
                         let token = hdr("x-oss-site-token");
                         let origin = hdr("x-oss-origin-version-id");
                         let replication = hdr("x-amz-replication-status");
@@ -116,7 +130,9 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         seen.lock().unwrap().push(Seen {
                             method: method.clone(),
+                            uri,
                             body: body.to_vec(),
+                            authorization,
                             token,
                             origin: origin.clone(),
                             replication,
@@ -194,6 +210,10 @@ fn peer(endpoint: &str) -> SitePeer {
 
 /// 文件库（两个连接共享：门一个、AppState 一个；内存库不共享）。
 async fn env(mode: Mode, sync_max: u64) -> Env {
+    env_inner(mode, sync_max, true).await
+}
+
+async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     let remote = spawn_remote(mode).await;
     let dbdir = tempfile::tempdir().unwrap();
     let datadir = tempfile::tempdir().unwrap();
@@ -206,6 +226,7 @@ async fn env(mode: Mode, sync_max: u64) -> Env {
         Arc::clone(&gate_db),
         Duration::from_millis(TIMEOUT_MS),
         sync_max,
+        site_enabled,
     )));
     sc.sync_max_bytes = sync_max;
     sc.tee_dir = Some(tee_dir.clone());
@@ -224,7 +245,7 @@ async fn env(mode: Mode, sync_max: u64) -> Env {
         kafka: Default::default(),
         remotes: vec![],
         tiers: vec![],
-        site: Some(SiteToml {
+        site: site_enabled.then(|| SiteToml {
             name: Some("a".into()),
             region: REGION.into(),
             priority: 0,
@@ -443,6 +464,15 @@ async fn sync_put_remote_first_success() {
     assert_eq!(seen[0].body, body);
     assert_eq!(seen[0].origin.as_deref(), Some(vid.as_str()));
     assert_eq!(seen[0].token.as_deref(), Some(PEER_TOKEN));
+    // 自定义头必须进 SigV4 SignedHeaders（否则可被中间人改写）。
+    let auth = seen[0]
+        .authorization
+        .as_deref()
+        .expect("远端 PUT 必须带签名");
+    assert!(
+        auth.contains("x-oss-site-token") && auth.contains("x-oss-origin-version-id"),
+        "SignedHeaders 缺站点头: {auth}"
+    );
     assert_eq!(seen[0].replication.as_deref(), Some("REPLICA"));
     assert_eq!(seen[0].content_type.as_deref(), Some("text/plain"));
     assert_eq!(seen[0].meta_foo.as_deref(), Some("bar"));
@@ -632,4 +662,131 @@ async fn replica_intake_requires_token_and_adopts_origin_id() {
             .status(),
         400
     );
+}
+
+#[tokio::test]
+async fn sync_write_requires_site_config() {
+    let e = env_inner(Mode::Ok, 1 << 20, false).await;
+    assert_eq!(put(&e, "/syn/nosite.txt", b"x").await.status(), 503);
+    assert!(e.remote.puts().is_empty(), "无 [site] 不得触远端");
+    assert_eq!(intent_rows(&e.st).await, 0, "前置拒绝不得留 intent");
+}
+
+#[tokio::test]
+async fn replica_intake_requires_local_versioning() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    set_bucket(&e.st, "syn", "versioning", "Suspended").await;
+    e.st.store.invalidate_gate("syn");
+    let origin = uuid::Uuid::new_v4().to_string();
+    let h = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", origin.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::PUT, "/syn/noversion.txt", &h, b"body")
+            .await
+            .status(),
+        503,
+        "本端 versioning 未启用时不得摄入 REPLICA"
+    );
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/noversion.txt", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    assert!(e.remote.puts().is_empty());
+}
+
+async fn intent_rows(st: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM sync_write_intents")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap()
+}
+
+async fn insert_intent(st: &AppState, id: &str, key: &str, tee: &std::path::Path) {
+    sqlx::query(
+        "INSERT INTO sync_write_intents \
+         (id, bucket, key, local_version_id, remote_version_id, tee_path, commit_json, \
+          state, created_at, updated_at) VALUES (?, 'syn', ?, ?, ?, ?, '{}', 'remote_done', 0, 0)",
+    )
+    .bind(id)
+    .bind(key)
+    .bind(id)
+    .bind(id)
+    .bind(tee.to_string_lossy().into_owned())
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+}
+
+/// I1：恢复三态——本地已提交只清行；远端孤儿删远端；不可达保留重试。
+#[tokio::test]
+async fn recovery_cleans_committed_and_orphan_intents() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    std::fs::create_dir_all(&e.tee_dir).unwrap();
+
+    // A) 本地 meta 已有该 id：只清 intent/tee，不删远端。
+    let r = put(&e, "/syn/committed.txt", b"committed").await;
+    assert_eq!(r.status(), 200);
+    let vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let tee = e.tee_dir.join(format!("{vid}.plain"));
+    std::fs::write(&tee, b"x").unwrap();
+    insert_intent(&e.st, &vid, "committed.txt", &tee).await;
+    recover_write_intents(&e.st).await;
+    assert_eq!(intent_rows(&e.st).await, 0);
+    assert!(!tee.exists(), "恢复必须清 tee");
+    assert!(e.remote.deletes().is_empty(), "本地已有版本，不得删远端");
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/committed.txt", &[], &[])
+            .await
+            .status(),
+        200
+    );
+
+    // B) 本地无该 id（远端可能已提交）：删远端同 id 后清行。
+    let orphan = uuid::Uuid::new_v4().to_string();
+    let tee2 = e.tee_dir.join(format!("{orphan}.plain"));
+    std::fs::write(&tee2, b"y").unwrap();
+    insert_intent(&e.st, &orphan, "orphan.txt", &tee2).await;
+    recover_write_intents(&e.st).await;
+    let dels = e.remote.deletes();
+    assert_eq!(dels.len(), 1);
+    assert!(
+        dels[0].uri.contains(&format!("versionId={orphan}")),
+        "删除必须点名同 id: {}",
+        dels[0].uri
+    );
+    assert_eq!(intent_rows(&e.st).await, 0);
+    assert!(!tee2.exists());
+
+    // C) 远端不可达：保留；恢复可达后清掉。
+    sqlx::query("UPDATE sites SET endpoint = 'http://127.0.0.1:1'")
+        .execute(e.st.db.pool())
+        .await
+        .unwrap();
+    let pending = uuid::Uuid::new_v4().to_string();
+    let tee3 = e.tee_dir.join(format!("{pending}.plain"));
+    std::fs::write(&tee3, b"z").unwrap();
+    insert_intent(&e.st, &pending, "retry.txt", &tee3).await;
+    recover_write_intents(&e.st).await;
+    assert_eq!(intent_rows(&e.st).await, 1, "远端不可达必须保留 intent");
+    assert!(tee3.exists(), "保留时不得删 tee");
+    sqlx::query("UPDATE sites SET endpoint = ?")
+        .bind(&e.remote.base)
+        .execute(e.st.db.pool())
+        .await
+        .unwrap();
+    recover_write_intents(&e.st).await;
+    assert_eq!(intent_rows(&e.st).await, 0);
+    assert!(!tee3.exists());
 }

@@ -73,6 +73,8 @@ pub trait PutCommitGate: Send + Sync + std::fmt::Debug {
     async fn before_commit(&self, req: GateRequest<'_>) -> Result<GateTicket, GateError>;
     /// 本地提交失败后的补偿（best-effort，不改变返回给客户端的错误）。
     async fn abort(&self, ticket: &GateTicket);
+    /// 本地 meta 已成功提交：实现方清理写 intent（崩溃窗口的恢复凭据）。默认无操作。
+    async fn committed(&self, _ticket: &GateTicket) {}
     /// 桶复制模式变更（建桶/删桶/apply）失效缓存。默认无操作。
     fn invalidate(&self, _bucket: &str) {}
 }

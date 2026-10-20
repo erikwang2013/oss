@@ -861,8 +861,8 @@ impl Store {
             self.discard_staged(bucket, key, &stage_uuid, &tmp, &obj_dir, multi)
                 .await;
             if v.size == size && v.etag == etag {
-                let old = old_meta.as_ref().expect("replay 来自旧 meta");
-                return self.load_object_info(bucket, key, old);
+                // 返回被重放版本本身（不是链上 latest）：调用端按 id 相等判定幂等。
+                return Ok(super::version::version_info(key, v));
             }
             return Err(Error::InvalidArgument(format!(
                 "origin version id 冲突：{id}"
@@ -1055,6 +1055,9 @@ impl Store {
             return Err(e);
         }
 
+        // 本地提交点已过：通知门清理写 intent（崩溃窗口的恢复凭据）。
+        self.commit_gate(&ticket).await;
+
         Ok(ObjectInfo {
             key: key.to_string(),
             size,
@@ -1114,6 +1117,13 @@ impl Store {
     async fn abort_gate(&self, ticket: &crate::gate::GateTicket) {
         if let Some(gate) = &self.cfg.gate {
             gate.abort(ticket).await;
+        }
+    }
+
+    /// 本地提交成功：门清理写 intent。
+    async fn commit_gate(&self, ticket: &Option<crate::gate::GateTicket>) {
+        if let (Some(gate), Some(t)) = (&self.cfg.gate, ticket) {
+            gate.committed(t).await;
         }
     }
 }

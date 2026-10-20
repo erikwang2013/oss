@@ -281,6 +281,7 @@ impl AppState {
             Arc::clone(&db),
             std::time::Duration::from_millis(cfg.sync.timeout_ms),
             cfg.sync.max_object_bytes,
+            cfg.site.is_some(),
         )));
         store_cfg.sync_max_bytes = cfg.sync.max_object_bytes;
         store_cfg.drives = drives;

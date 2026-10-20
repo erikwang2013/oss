@@ -196,6 +196,11 @@ pub async fn run(
                 });
             }
 
+            // M9 S1：sync 写 intent 恢复（先跑启动轮，再挂 30s worker）。
+            crate::sync::recover_write_intents(&state).await;
+            if state.site_enabled {
+                crate::sync::spawn_intent_worker(state.clone());
+            }
             // M4 切片 6：生命周期 worker（serve 专属；运维命令不挂）。
             // 间隔 OSS_LIFECYCLE_INTERVAL_SECS（默认 60；0=关闭）
             crate::lifecycle::spawn_worker(state.clone());

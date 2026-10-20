@@ -863,7 +863,7 @@ impl Store {
 }
 
 /// 从版本条目构造 ObjectInfo（`load_object_info` 的历史版本对偶）。
-fn version_info(key: &str, v: &Version) -> ObjectInfo {
+pub(in crate::store) fn version_info(key: &str, v: &Version) -> ObjectInfo {
     ObjectInfo {
         key: key.to_string(),
         size: v.size,

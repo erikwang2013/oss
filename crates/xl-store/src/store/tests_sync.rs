@@ -278,6 +278,106 @@ async fn sync_max_bytes_rejected_before_gate() {
     assert_eq!(tee_entries(dir.path()), 0);
 }
 
+/// M3：重放返回被重放的那个版本（不是链上 latest），否则发起端 id 校验会误判。
+#[tokio::test]
+async fn replay_returns_matched_version_not_latest() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = MockGate::new(dir.path(), true);
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.gate = Some(gate.clone());
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+
+    let v1 = put(&s, "k.txt", b"one".to_vec(), PutExt::default())
+        .await
+        .unwrap();
+    let v2 = put(&s, "k.txt", b"two".to_vec(), PutExt::default())
+        .await
+        .unwrap();
+    assert_ne!(v1.version_id, v2.version_id);
+
+    let replay = put(
+        &s,
+        "k.txt",
+        b"one".to_vec(),
+        PutExt {
+            replica: true,
+            forced_version_id: v1.version_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay.version_id, v1.version_id,
+        "重放必须返回被重放版本，而不是 latest"
+    );
+    assert_eq!(replay.etag, v1.etag);
+    let head = s.head_object("alpha", "k.txt").await.unwrap();
+    assert_eq!(head.version_id, v2.version_id, "latest 不得被重放改写");
+}
+
+/// M5：远端确认后本地提交失败 → abort 补偿（计划要求的失败路径）。
+#[tokio::test]
+async fn local_commit_failure_aborts_remote_ticket() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = MockGate::new(dir.path(), true);
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.gate = Some(gate.clone());
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    // 提交点必然失败：xl.meta.new 位置先占成目录（File::create → EISDIR）。
+    let obj_dir = layout::object_dir(dir.path(), "alpha", "k.txt").unwrap();
+    std::fs::create_dir_all(obj_dir.join(meta::META_NEW_FILE)).unwrap();
+
+    let err = put(&s, "k.txt", b"hello".to_vec(), PutExt::default())
+        .await
+        .unwrap_err();
+    assert!(
+        !matches!(err, Error::Unavailable(_)),
+        "本地提交失败: {err:?}"
+    );
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        gate.aborts.load(Ordering::SeqCst),
+        1,
+        "本地提交失败必须补偿远端"
+    );
+    assert!(matches!(
+        s.head_object("alpha", "k.txt").await,
+        Err(Error::NoSuchKey(_))
+    ));
+    assert_eq!(tee_entries(dir.path()), 0, "失败后 tee 必须清理");
+}
+
+/// M5：多盘/EC 直写路径也必须 tee 明文并先过门（覆盖 stage_payload_multi_tee）。
+#[tokio::test]
+async fn multi_drive_sync_tees_plaintext_before_gate() {
+    let dirs: Vec<_> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    let gate = MockGate::new(dirs[0].path(), true);
+    cfg.gate = Some(gate.clone());
+    let s = Store::open(cfg).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+
+    let data = vec![7u8; 300_000];
+    let info = put(&s, "ec.bin", data.clone(), PutExt::default())
+        .await
+        .unwrap();
+    {
+        let seen = gate.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].size, data.len() as u64);
+        assert!(seen[0].tee_exists, "EC 路径 gate 时必须已 tee 出明文");
+        assert_eq!(seen[0].tee_len, data.len() as u64);
+        assert!(!seen[0].meta_visible, "gate 必须先于本地 meta 翻转");
+    }
+    assert_eq!(info.replication_status.as_deref(), Some("COMPLETED"));
+    let (_, bytes) = s.get_object("alpha", "ec.bin").await.unwrap();
+    assert_eq!(bytes, data);
+    assert_eq!(tee_entries(dirs[0].path()), 0);
+}
+
 /// 多盘路径的数据直写版本目录：重投不得覆盖/回滚已提交版本。
 #[tokio::test]
 async fn multi_drive_replay_keeps_committed_version() {
