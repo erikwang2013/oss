@@ -637,6 +637,10 @@ async fn jobs_api_ownership_and_actions() {
             &JobSpec {
                 kind: "batch".into(),
                 requested_by: Some(sub_uid),
+                priority: 7,
+                parent_job_id: Some(sys),
+                report_bucket: Some("reports".into()),
+                report_prefix: Some("out".into()),
                 tasks: vec![NewJobTask {
                     action: "Copy".into(),
                     payload: "{}".into(),
@@ -693,6 +697,45 @@ async fn jobs_api_ownership_and_actions() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+    let own_detail: serde_json::Value = r.json().await.unwrap();
+    // GET /jobs 列表投影须与详情同值（Web Jobs 页列）
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/jobs"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let item = list
+        .iter()
+        .find(|j| j["id"] == own)
+        .expect("own job in list");
+    assert_eq!(item["priority"], 7);
+    assert_eq!(item["total"], 1);
+    assert_eq!(item["succeeded"], 0);
+    assert_eq!(item["failed"], 0);
+    assert_eq!(item["requested_by"], sub_uid);
+    assert_eq!(item["report_bucket"], "reports");
+    assert_eq!(item["report_prefix"], "out");
+    assert_eq!(item["parent_job_id"], sys);
+    assert!(item["started_at"].is_null());
+    assert!(item["finished_at"].is_null());
+    for f in [
+        "priority",
+        "total",
+        "succeeded",
+        "failed",
+        "requested_by",
+        "report_bucket",
+        "report_prefix",
+        "started_at",
+        "finished_at",
+        "parent_job_id",
+    ] {
+        assert_eq!(item[f], own_detail["job"][f], "{f}");
+    }
     // 取消系统作业，确保下一条领取落在 own 上
     st.db.job_set_state(sys, "cancel", 1001).await.unwrap();
     let claimed = st.db.claim_task(1001, 900).await.unwrap().unwrap();

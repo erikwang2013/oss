@@ -2546,11 +2546,13 @@ impl Db {
         Ok(())
     }
 
-    /// 最近作业（控制台 GET /jobs；最新在前）。
+    /// 最近作业（控制台 GET /jobs；最新在前）。列投影与 `job_get` 同值。
     pub async fn list_jobs(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             "SELECT id, kind, bucket, prefix, state, scanned, deleted, skipped, error, \
-             created_at, updated_at FROM jobs ORDER BY id DESC LIMIT ?",
+             priority, total, succeeded, failed, requested_by, report_bucket, report_prefix, \
+             parent_job_id, started_at, finished_at, created_at, updated_at \
+             FROM jobs ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -2568,6 +2570,16 @@ impl Db {
                     "deleted": r.get::<i64, _>("deleted"),
                     "skipped": r.get::<i64, _>("skipped"),
                     "error": r.get::<Option<String>, _>("error"),
+                    "priority": r.get::<i64, _>("priority"),
+                    "total": r.get::<i64, _>("total"),
+                    "succeeded": r.get::<i64, _>("succeeded"),
+                    "failed": r.get::<i64, _>("failed"),
+                    "requested_by": r.get::<Option<i64>, _>("requested_by"),
+                    "report_bucket": r.get::<Option<String>, _>("report_bucket"),
+                    "report_prefix": r.get::<Option<String>, _>("report_prefix"),
+                    "parent_job_id": r.get::<Option<i64>, _>("parent_job_id"),
+                    "started_at": r.get::<Option<i64>, _>("started_at"),
+                    "finished_at": r.get::<Option<i64>, _>("finished_at"),
                     "created_at": r.get::<i64, _>("created_at"),
                     "updated_at": r.get::<i64, _>("updated_at"),
                 })
