@@ -304,6 +304,8 @@ impl Store {
         lock: Option<meta::ObjectLockRecord>,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
+        // M9 S3：删桶 quiesce 屏障（complete 也是提交点）。
+        let _writer = self.begin_write(bucket)?;
         // 桶窗口（同单段 PUT）
         let obj_dir = {
             let _bguard = self.lock_bucket_owned(bucket).await;

@@ -52,6 +52,8 @@ pub struct OssS3 {
     sync_ready: bool,
     /// M9：本机站点 token（sync 摄入的 `x-oss-site-token` 校验；None = 拒收）。
     site_token: Option<String>,
+    /// M9 S3：共享删除服务（None = 未接线/测试：直接 store，M7 行为不变）。
+    sync_delete: Option<Arc<dyn crate::sync_delete::SyncDeleteSink>>,
 }
 
 impl OssS3 {
@@ -105,6 +107,38 @@ impl OssS3 {
             inventory: None,
             sync_ready: false,
             site_token: None,
+            sync_delete: None,
+        }
+    }
+
+    /// M9 S3：注入共享删除服务（sync 桶 remote-first；None 保持 store 直连）。
+    pub fn with_sync_delete(
+        mut self,
+        sink: Option<Arc<dyn crate::sync_delete::SyncDeleteSink>>,
+    ) -> Self {
+        self.sync_delete = sink;
+        self
+    }
+
+    /// 删除统一入口：四类外部 caller 都不直接调 `store.delete_*`。
+    async fn delete_versioned(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        versioned: bool,
+        bypass: bool,
+    ) -> xl_store::error::Result<DeleteOutcome> {
+        match &self.sync_delete {
+            Some(s) => {
+                s.delete_versioned(bucket, key, version_id, versioned, bypass)
+                    .await
+            }
+            None => {
+                self.store
+                    .delete_object_versioned_ext(bucket, key, version_id, versioned, bypass)
+                    .await
+            }
         }
     }
 
@@ -781,6 +815,23 @@ impl S3 for OssS3 {
                 "object lock is not supported on sync buckets"
             ));
         }
+        // M9 S3：sync 依赖唯一数据 peer（0/多行 = 站点配对未就绪）。
+        if replication_mode == "sync" {
+            match self.acl.site_peer_count().await {
+                Ok(1) => {}
+                Ok(n) => {
+                    return Err(s3s::s3_error!(
+                        OperationAborted,
+                        "sync requires exactly one site peer (have {})",
+                        n
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, bucket, "读站点 peer 数失败");
+                    return Err(s3s::s3_error!(InternalError, "internal error"));
+                }
+            }
+        }
         // M9：陈旧行重建不得静默改模式（与 console 同口径，先于物理建桶）。
         match self.acl.bucket_replication_mode_row(&bucket).await {
             Ok(Some(existing)) if existing != replication_mode => {
@@ -886,10 +937,12 @@ impl S3 for OssS3 {
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let bucket = req.input.bucket;
-        self.store
-            .delete_bucket(&bucket)
-            .await
-            .map_err(to_s3_error)?;
+        // M9 S3：sync 桶走双站 quiesce/查空/远端删除，async 桶保持 M7 本地删除。
+        match &self.sync_delete {
+            Some(s) => s.delete_bucket(&bucket).await,
+            None => self.store.delete_bucket(&bucket).await,
+        }
+        .map_err(to_s3_error)?;
         // 记账清理（授权门已确认桶主/管理员）：清授权行 + 桶行 + 生命周期规则
         if let Err(e) = self.acl.forget_bucket(&bucket).await {
             // M7 H1：门控 ABORT 时物理桶已删、行/授权未动——按最终行补偿后显式失败，
@@ -1984,8 +2037,7 @@ impl S3 for OssS3 {
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         let versioned = self.versioned(&bucket).await?;
         let outcome = self
-            .store
-            .delete_object_versioned_ext(&bucket, &key, vid.as_deref(), versioned, bypass)
+            .delete_versioned(&bucket, &key, vid.as_deref(), versioned, bypass)
             .await
             .map_err(to_s3_error)?;
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
@@ -2078,6 +2130,15 @@ impl S3 for OssS3 {
         // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
         // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
         let versioned = self.versioned(&bucket).await?;
+        // M9 §2.4 N2：sync 桶任一远端失败 → 整体 503（成功键已提交；对象可见性幂等）。
+        // async 桶保持逐键错误口径（M7 不变）。
+        let sync_bucket = self
+            .acl
+            .bucket_replication_mode(&bucket)
+            .await
+            .map(|m| m == "sync")
+            .unwrap_or(false);
+        let mut remote_failure: Option<StoreError> = None;
         // M5 切片 4（L4）：Governance bypass 头（请求级，作用于全部键——AWS 语义）
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         // 逐键授权（M4 切片 7 / verifier 阻断 1c）：批量删的键在请求体里、check() 阶段不可见，
@@ -2123,8 +2184,7 @@ impl S3 for OssS3 {
                 continue;
             }
             match self
-                .store
-                .delete_object_versioned_ext(
+                .delete_versioned(
                     &bucket,
                     &obj.key,
                     obj.version_id.as_deref(),
@@ -2202,6 +2262,10 @@ impl S3 for OssS3 {
                 Err(e @ (StoreError::NoSuchBucket(_) | StoreError::InvalidBucketName(_))) => {
                     return Err(to_s3_error(e));
                 }
+                // 远端不可达/超时：记住并继续逐键（其余键仍各自尝试），最后整体 503。
+                Err(e @ StoreError::Unavailable(_)) if sync_bucket => {
+                    remote_failure.get_or_insert(e);
+                }
                 Err(e) => {
                     // 经 to_s3_error：4xx 保留原文，5xx 细节只进日志
                     let s3err = to_s3_error(e);
@@ -2215,6 +2279,12 @@ impl S3 for OssS3 {
             }
         }
 
+        if let Some(e) = remote_failure {
+            if let Some(s) = &self.sync_delete {
+                s.record_partial();
+            }
+            return Err(to_s3_error(e));
+        }
         Ok(S3Response::new(DeleteObjectsOutput {
             deleted: (!deleted.is_empty()).then_some(deleted),
             errors: (!errors.is_empty()).then_some(errors),

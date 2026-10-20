@@ -193,6 +193,8 @@ pub struct BatchActionPayload {
 pub struct BatchMutationHooks {
     pub repl: Arc<dyn ReplicationSink>,
     pub tier_gc: Arc<dyn TierGcSink>,
+    /// M9 S3：共享删除入口（sync 桶远端优先；batch 不直连 store.delete_*）。
+    pub sync_delete: Arc<dyn xl_s3::sync_delete::SyncDeleteSink>,
 }
 
 /// `Batch*` 动作执行器。
@@ -340,9 +342,11 @@ impl BatchExecutor {
         self.author(p, "DeleteObject", &p.bucket, &p.key, None)
             .await?;
         let versioned = self.versioned(&p.bucket).await?;
+        // M9 S3：sync 桶远端优先（batch 不直连 store.delete_*）；async 桶行为不变。
         let outcome = self
-            .store
-            .delete_object_versioned(&p.bucket, &p.key, p.version_id.as_deref(), versioned)
+            .hooks
+            .sync_delete
+            .delete_versioned(&p.bucket, &p.key, p.version_id.as_deref(), versioned, false)
             .await
             .map_err(|e| e.to_string())?;
         let refs = match outcome {

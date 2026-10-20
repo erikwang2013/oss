@@ -7,6 +7,9 @@
 #       默认（M9_STRETCH=0）跑步骤 1/2/3/5；M9_STRETCH=1 跑 1/2/4/5（步骤 3 显式跳过）。
 # 功能门控：未接线的构建按 /api/v1/raft/status 的 capabilities.raft/sync/stretch 自动跳过
 #       对应步骤并打印原因；M9_STRICT=1 时跳过升级为 FAIL（功能齐备后 CI 用）。
+# S3 覆盖补充：步骤 3 已含版本删/marker 同 id/DeleteObjects 503/outbox=0；DeleteBucket
+#       quiesce/非空回滚、生命周期 Expiration remote-first 由 crates/oss-server/tests/sync_gate.rs
+#       进程内覆盖（本脚本不跑，因需在途写者与远端可控状态）。
 # 前置：`cargo build -p oss-server`；aws-cli；curl；python3。
 # 用法：OSS_BIN=target/debug/oss-server tests/e2e_m9.sh
 #       M9_STRETCH=1 OSS_BIN=target/debug/oss-server tests/e2e_m9.sh   # 2×6 stretch

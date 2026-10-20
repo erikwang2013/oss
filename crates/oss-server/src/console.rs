@@ -8,12 +8,13 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, head, post, put};
 use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
 use xl_s3::access::{Action, AuthedUser};
 use xl_s3::events::EventSink as _;
+use xl_s3::sync_delete::SyncDeleteSink as _;
 
 use crate::state::AppState;
 
@@ -200,6 +201,10 @@ pub fn routes() -> Router<AppState> {
         .route("/site/identity", get(site_identity))
         // M9：sync 补偿的本地定点删除（token 面；只删本站，永不转发）
         .route("/site/delete-object", post(site_delete_object))
+        .route("/site/delete-bucket", post(site_delete_bucket))
+        .route("/site/head-object", head(site_head_object))
+        .route("/site/bucket-empty", get(site_bucket_empty))
+        .route("/site/bucket-quiesce", post(site_bucket_quiesce))
         .route("/sites", get(list_sites).post(create_site))
         .route("/sites/{peer_id}", delete(delete_site))
         .route("/sites/{peer_id}/ping", post(ping_site))
@@ -258,10 +263,12 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
         Error::InvalidBucketName(_) | Error::InvalidKey(_) => {
             (StatusCode::BAD_REQUEST, e.to_string())
         }
-        // 这两个语义是「客户端可纠正的冲突」，S3 本身也用 409；不落 5xx
-        Error::BucketAlreadyExists(_) | Error::BucketNotEmpty(_) => {
+        // 这几个语义是「客户端可纠正的冲突」，S3 本身也用 409；不落 5xx
+        Error::BucketAlreadyExists(_) | Error::BucketNotEmpty(_) | Error::Conflict(_) => {
             (StatusCode::CONFLICT, e.to_string())
         }
+        // M9：sync 远端不可达/intent 保留 → 503（与 S3 面同口径）。
+        Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
         _ => {
             tracing::error!(error = %e, "控制台 store 操作失败");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
@@ -1733,6 +1740,21 @@ async fn create_bucket(
                 )
                     .into_response();
             }
+            // M9 S3：sync 依赖唯一数据 peer（witness 不写 sites 行）。
+            match state.db.list_sites().await {
+                Ok(sites) if sites.len() == 1 => {}
+                Ok(sites) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!("sync requires exactly one site peer (have {})", sites.len()),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "读站点 peer 数失败");
+                    return internal_error();
+                }
+            }
         }
         other => {
             return (
@@ -1848,7 +1870,8 @@ async fn delete_bucket(
             }
         }
     }
-    match state.store.delete_bucket(&bucket).await {
+    // M9 S3：sync 桶远端优先（双站 quiesce/查空）；async 桶走原本地删除。
+    match state.sync_delete.delete_bucket(&bucket).await {
         Ok(()) => {
             // B10：物理删除已生效——清 M8 控制面状态并失效 AP 缓存（失败只告警，不补偿桶）。
             // 放在分支之前：站点冲突补偿重建空桶时同样不得继承旧 AP/Inventory 配置。
@@ -1994,7 +2017,12 @@ async fn delete_object(
         return r;
     }
     // M6 切片 0（P2-1 复查补）：store 在锁内返回「是否真删」——空删幂等，只有真删才发事件
-    match state.store.delete_object(&bucket, &key).await {
+    // M9 S3：sync 桶远端优先（远端先清全部版本）；async 桶走原本地硬删。
+    match state
+        .sync_delete
+        .delete_key_all_versions(&bucket, &key)
+        .await
+    {
         Ok(deleted) => {
             if deleted {
                 // M6 切片 0（R5）：控制台删对象事件（硬删整键 → ObjectRemoved:Delete）
@@ -3033,6 +3061,55 @@ struct SiteDeleteBody {
     version_id: Option<String>,
     #[serde(default)]
     marker_id: Option<String>,
+    /// 控制台整键硬删（sync：远端先清全部版本）。
+    #[serde(default)]
+    all_versions: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SiteHeadQuery {
+    bucket: String,
+    key: String,
+    version_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SiteBucketQuery {
+    bucket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SiteBucketBody {
+    bucket: String,
+    /// quiesce 回滚（超时/非空路径）。
+    #[serde(default)]
+    release: bool,
+}
+
+/// 内部路由的 store 错误分档（503/409 语义必须透传；其余 500 不外泄细节）。
+fn site_store_error(e: xl_store::error::Error) -> Response {
+    use xl_store::error::Error;
+    let status = match &e {
+        Error::NoSuchBucket(_) | Error::NoSuchKey(_) => StatusCode::NOT_FOUND,
+        Error::BucketNotEmpty(_) | Error::Conflict(_) => StatusCode::CONFLICT,
+        Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Error::InvalidBucketName(_) | Error::InvalidKey(_) | Error::InvalidArgument(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => {
+            tracing::error!(error = %e, "站点内部路由 store 操作失败");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, e.to_string()).into_response()
+}
+
+/// token 校验（常量时间；与既有站点路由同口径）。
+fn site_token_ok(state: &AppState, headers: &HeaderMap) -> bool {
+    headers
+        .get(crate::site_client::SITE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|tok| ct_eq(tok, &state.site.token))
 }
 
 /// `POST /api/v1/site/delete-object`（token 面；JWT except）：sync 补偿的本地定点删除。
@@ -3045,23 +3122,43 @@ async fn site_delete_object(
     if !state.site_enabled {
         return site_disabled();
     }
-    let ok = headers
-        .get(crate::site_client::SITE_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|tok| ct_eq(tok, &state.site.token));
-    if !ok {
+    if !site_token_ok(&state, &headers) {
         return (StatusCode::FORBIDDEN, "invalid site token").into_response();
     }
-    // marker 删除/创建属 remote-first 删除切片；未实现前明确拒绝而非静默跳过。
-    if body.marker_id.is_some() {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "marker delete is not supported yet",
-        )
-            .into_response();
+    // 接收端 local-only：只做本地删除/marker，永不转发（B4）。
+    if body.all_versions {
+        return match state.store.delete_object(&body.bucket, &body.key).await {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => site_store_error(e),
+        };
+    }
+    if let Some(marker) = body.marker_id {
+        let spec = xl_store::store::DeleteMarkerSpec {
+            marker_uuid: marker.clone(),
+            remote_version_id: Some(marker),
+        };
+        return match state
+            .store
+            .delete_object_versioned_with_marker(
+                &body.bucket,
+                &body.key,
+                None,
+                true,
+                false,
+                Some(spec),
+            )
+            .await
+        {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => site_store_error(e),
+        };
     }
     let Some(vid) = body.version_id else {
-        return (StatusCode::BAD_REQUEST, "version_id is required").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "version_id, marker_id or all_versions is required",
+        )
+            .into_response();
     };
     // sync 桶创建即 Enabled；显式版本删除对不存在版本幂等成功（DeleteOutcome::NotFound）。
     match state
@@ -3070,6 +3167,116 @@ async fn site_delete_object(
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => store_error(e).into_response(),
+        Err(e) => site_store_error(e),
+    }
+}
+
+/// `HEAD /api/v1/site/head-object`（token 面）：远端版本存在性探询。
+/// 200 = 版本存在；405 = delete marker；404 = 不存在（恢复规则的三态）。
+async fn site_head_object(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SiteHeadQuery>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if !site_token_ok(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "invalid site token").into_response();
+    }
+    match state
+        .store
+        .head_object_version(&q.bucket, &q.key, &q.version_id)
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(xl_store::error::Error::DeleteMarker(_)) => {
+            StatusCode::METHOD_NOT_ALLOWED.into_response()
+        }
+        Err(
+            e @ (xl_store::error::Error::NoSuchKey(_) | xl_store::error::Error::NoSuchBucket(_)),
+        ) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e) => site_store_error(e),
+    }
+}
+
+/// `GET /api/v1/site/bucket-empty?bucket=`：204 空 / 409 非空 / 404 桶不存在。
+async fn site_bucket_empty(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SiteBucketQuery>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if !site_token_ok(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "invalid site token").into_response();
+    }
+    match state.store.bucket_exists(&q.bucket).await {
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(true) => {}
+        Err(e) => return site_store_error(e),
+    }
+    match state.store.bucket_is_empty(&q.bucket).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::CONFLICT, "bucket not empty").into_response(),
+        Err(e) => site_store_error(e),
+    }
+}
+
+/// `POST /api/v1/site/bucket-quiesce {bucket[,release]}`：置 deleting 并等本站写者归零
+/// （30s 上限），成功保持标志直到 delete-bucket/释放。`release=true` 回滚。
+async fn site_bucket_quiesce(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SiteBucketBody>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if !site_token_ok(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "invalid site token").into_response();
+    }
+    if body.release {
+        state.store.unmark_deleting(&body.bucket);
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    match state.store.bucket_exists(&body.bucket).await {
+        // 桶已不存在 = 无写者可等：视作已 quiesce（对端删除后的 intent 重试幂等）。
+        Ok(false) => return StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {}
+        Err(e) => return site_store_error(e),
+    }
+    state.store.mark_deleting(&body.bucket);
+    if state
+        .store
+        .wait_writers_idle(&body.bucket, std::time::Duration::from_secs(30))
+        .await
+    {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        state.store.unmark_deleting(&body.bucket);
+        (StatusCode::CONFLICT, "timed out waiting for active writers").into_response()
+    }
+}
+
+/// `POST /api/v1/site/delete-bucket {bucket}`：接收端本地删桶（只删本站，永不转发）。
+async fn site_delete_bucket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SiteBucketBody>,
+) -> Response {
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    if !site_token_ok(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "invalid site token").into_response();
+    }
+    match state.store.delete_bucket(&body.bucket).await {
+        Ok(()) => {
+            state.store.unmark_deleting(&body.bucket);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => site_store_error(e),
     }
 }

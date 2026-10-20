@@ -134,6 +134,14 @@ impl Acl {
             .unwrap_or_else(|| "async".to_string()))
     }
 
+    /// M9 S3：sync 建桶前置——数据站点 peer 数必须恰为 1（witness 不写 `sites` 行）。
+    pub async fn site_peer_count(&self) -> Result<usize, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sites")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n as usize)
+    }
+
     /// M5 切片 4：桶对象锁状态 → `Some((enabled, 默认模式, 默认天数))`；**行不存在 = None**
     /// （N4 复验补：调用方可据此区分「桶不存在(404)」与「锁未开(400)」）。
     pub async fn bucket_lock(
@@ -669,7 +677,7 @@ impl Acl {
              (name, owner_id, creation_date, versioning, set_id, object_lock, \
               object_lock_default_mode, object_lock_default_days, default_encryption, \
               replication_mode, deleting) \
-             VALUES (?, ?, ?, 'Off', ?, 0, NULL, NULL, NULL, ?, 0) \
+             VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, 0) \
              ON CONFLICT(name) DO UPDATE SET \
               owner_id = excluded.owner_id, set_id = excluded.set_id, \
               versioning = excluded.versioning, \
@@ -682,6 +690,12 @@ impl Acl {
         .bind(bucket)
         .bind(uid)
         .bind(now())
+        // M9：sync 桶建桶即 Enabled（双站同 id 依赖版本链）；async 保持 Off。
+        .bind(if replication_mode == "sync" {
+            "Enabled"
+        } else {
+            "Off"
+        })
         .bind(set as i64)
         .bind(replication_mode)
         .execute(&self.pool)

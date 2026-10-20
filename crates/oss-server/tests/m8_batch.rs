@@ -138,6 +138,8 @@ impl Fx {
             BatchMutationHooks {
                 repl: Arc::clone(&self.repl) as Arc<dyn ReplicationSink>,
                 tier_gc: Arc::clone(&self.gc) as Arc<dyn TierGcSink>,
+                sync_delete: Arc::clone(&self.st.sync_delete)
+                    as Arc<dyn xl_s3::sync_delete::SyncDeleteSink>,
             },
         )
     }

@@ -240,8 +240,9 @@ pub async fn run(
                 });
             }
 
-            // M9 S1：sync 写 intent 恢复（先跑启动轮，再挂 30s worker）。
+            // M9 S1/S3：sync 写/删 intent 恢复（先跑启动轮，再挂 30s worker）。
             crate::sync::recover_write_intents(&state).await;
+            crate::sync::recover_delete_intents(&state).await;
             if state.site_enabled {
                 crate::sync::spawn_intent_worker(state.clone());
             }
@@ -285,6 +286,8 @@ pub async fn run(
                         repl: state.repl_sink.clone()
                             as std::sync::Arc<dyn xl_s3::replication::ReplicationSink>,
                         tier_gc: std::sync::Arc::clone(&state.tier_gc),
+                        sync_delete: state.sync_delete.clone()
+                            as std::sync::Arc<dyn xl_s3::sync_delete::SyncDeleteSink>,
                     },
                 )),
             });

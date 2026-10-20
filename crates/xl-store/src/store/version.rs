@@ -93,6 +93,15 @@ pub enum DeleteOutcome {
     Object { tiers: Vec<TierRef> },
 }
 
+/// M9 S3：调用方预生成的 delete marker 身份（双站同 id 的发送端/接收端共用）。
+#[derive(Debug, Clone, Default)]
+pub struct DeleteMarkerSpec {
+    /// marker 版本 UUID（字符串形式；与远端同 id）。
+    pub marker_uuid: String,
+    /// 远端版本 id（发送端 = marker_uuid；接收端摄入时同 id）。
+    pub remote_version_id: Option<String>,
+}
+
 /// M8 S4a：被删归档版本的远端引用（`backend`/`key` 原样转交 TierGcSink）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TierRef {
@@ -164,6 +173,30 @@ impl Store {
         versioned: bool,
         bypass_governance: bool,
     ) -> Result<DeleteOutcome> {
+        self.delete_object_versioned_with_marker(
+            bucket,
+            key,
+            version_id,
+            versioned,
+            bypass_governance,
+            None,
+        )
+        .await
+    }
+
+    /// M9 S3：同 [`Self::delete_object_versioned_ext`]，marker 分支可用调用方预生成的
+    /// 身份（双站同 id）；`marker_spec` 只影响 `version_id=None && versioned` 的 marker。
+    pub async fn delete_object_versioned_with_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        versioned: bool,
+        bypass_governance: bool,
+        marker_spec: Option<DeleteMarkerSpec>,
+    ) -> Result<DeleteOutcome> {
+        // M9 S3：删桶 quiesce 屏障——deleting 置位后新写 503，在途写者计数到零后才删桶。
+        let _writer = self.begin_write(bucket)?;
         self.ensure_bucket(bucket).await?;
         let _guard = self.lock_object(bucket, key).await?;
 
@@ -185,13 +218,41 @@ impl Store {
             }
             // 追加 delete marker（无数据目录；链尾哨兵）
             let old = self.read_meta(bucket, key).await?; // 损坏 fail-closed（同写路径口径）
+            // M9：同 id marker 已存在 → 幂等成功（恢复 worker 的「只补本地」不重造）。
+            if let Some(spec) = marker_spec.as_ref()
+                && !spec.marker_uuid.is_empty()
+                && old.as_ref().is_some_and(|m| {
+                    m.versions
+                        .iter()
+                        .any(|v| v.version_id_str() == spec.marker_uuid)
+                })
+            {
+                return Ok(DeleteOutcome::Marker {
+                    version_id: spec.marker_uuid.clone(),
+                });
+            }
             let now = match old.as_ref().and_then(|m| m.latest()) {
                 Some(v) => super::now_nanos().max(v.mod_time_nanos + 1),
                 None => super::now_nanos(),
             };
-            let uuid = uuid::Uuid::new_v4().to_string();
+            let (uuid, version_uuid, remote_version_id) = match marker_spec {
+                Some(s) if !s.marker_uuid.is_empty() => {
+                    let parsed = uuid::Uuid::parse_str(&s.marker_uuid).map_err(|_| {
+                        Error::InvalidArgument(format!("非法 marker uuid: {}", s.marker_uuid))
+                    })?;
+                    (s.marker_uuid, parsed, s.remote_version_id)
+                }
+                _ => {
+                    let u = uuid::Uuid::new_v4().to_string();
+                    (
+                        u.clone(),
+                        uuid::Uuid::parse_str(&u).expect("自造 uuid"),
+                        None,
+                    )
+                }
+            };
             let marker = Version {
-                version_id: uuid::Uuid::parse_str(&uuid).expect("自造 uuid"),
+                version_id: version_uuid,
                 mod_time_nanos: now,
                 size: 0,
                 etag: String::new(),
@@ -210,7 +271,7 @@ impl Store {
                 is_delete_marker: Some(true),
                 is_latest: None,
                 replication_status: None,
-                remote_version_id: None,
+                remote_version_id,
                 tags: None,
                 storage_class: None,
                 tier: None,

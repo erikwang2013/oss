@@ -1165,7 +1165,7 @@ impl Db {
              (name, owner_id, creation_date, versioning, set_id, object_lock, \
               object_lock_default_mode, object_lock_default_days, default_encryption, \
               replication_mode, deleting) \
-             VALUES (?, ?, ?, 'Off', ?, 0, NULL, NULL, NULL, ?, 0) \
+             VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, 0) \
              ON CONFLICT(name) DO UPDATE SET \
               owner_id = excluded.owner_id, set_id = excluded.set_id, \
               versioning = excluded.versioning, \
@@ -1178,6 +1178,12 @@ impl Db {
         .bind(name)
         .bind(owner_id)
         .bind(now())
+        // M9：sync 桶建桶即 Enabled（双站同 id 依赖版本链）；async 保持 Off。
+        .bind(if replication_mode == "sync" {
+            "Enabled"
+        } else {
+            "Off"
+        })
         .bind(set as i64)
         .bind(replication_mode)
         .execute(&self.pool)
@@ -1214,6 +1220,16 @@ impl Db {
                 )
             })
             .unwrap_or_else(|| ("async".into(), false, "Off".into())))
+    }
+
+    /// M9 S3：删桶 quiesce 标志（S6 起改由 Raft `SetBucketDeleting` 命令承载）。
+    pub async fn set_bucket_deleting(&self, name: &str, deleting: bool) -> Result<()> {
+        sqlx::query("UPDATE buckets SET deleting = ? WHERE name = ?")
+            .bind(i64::from(deleting))
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// 全量桶名 → 模式（console 列表一次查完，避免逐桶查询）。

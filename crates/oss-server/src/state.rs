@@ -30,6 +30,8 @@ pub struct AppState {
     pub repl_store: Arc<crate::replication::SqlReplStore>,
     /// M6 切片 4：复制出站客户端（worker 用）
     pub repl_client: Arc<crate::repl_client::ReplClient>,
+    /// M9 S3：共享删除服务（S3/生命周期/Batch/控制台统一入口；sync 桶远端优先）。
+    pub sync_delete: Arc<crate::sync::SiteSyncDelete>,
     /// M7：本站身份（`site_config` 单行，启动时读取；token 不下发给未授权面）
     pub site: Arc<crate::db::SiteIdentity>,
     /// M7：`[site]` 是否配置（唯一开关；无 `[site]` 不挂站点路由语义、不可配对）
@@ -677,6 +679,10 @@ impl AppState {
                         "/site/identity".into(),
                         "/site/changelog".into(),
                         "/site/delete-object".into(),
+                        "/site/delete-bucket".into(),
+                        "/site/head-object".into(),
+                        "/site/bucket-empty".into(),
+                        "/site/bucket-quiesce".into(),
                     ],
                 },
                 ..Default::default()
@@ -699,6 +705,13 @@ impl AppState {
             remote_ids,
         ));
         let store = Arc::new(store);
+        // M9 S3：共享删除服务（sync 桶 remote-first；非 sync 委托 store）。
+        let sync_delete = Arc::new(crate::sync::SiteSyncDelete::new(
+            Arc::clone(&db),
+            Arc::clone(&store),
+            std::time::Duration::from_millis(cfg.sync.timeout_ms),
+            site_enabled,
+        ));
         let repl_sink = Arc::new(
             crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
                 // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
@@ -745,6 +758,7 @@ impl AppState {
             repl_sink,
             repl_store,
             repl_client,
+            sync_delete,
             site,
             site_enabled,
             ap_cache,

@@ -18,7 +18,9 @@ async fn acl_pool() -> sqlx::SqlitePool {
         "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT, replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
-          PRIMARY KEY (user_id, bucket));",
+          PRIMARY KEY (user_id, bucket));\
+         CREATE TABLE sites (peer_id TEXT PRIMARY KEY);\
+         INSERT INTO sites (peer_id) VALUES ('peer');",
     )
     .execute(&pool)
     .await

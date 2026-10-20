@@ -491,3 +491,47 @@ async fn mpu_gate_failure_leaves_no_object() {
     ));
     assert_eq!(tee_entries(dir.path()), 0, "失败后 tee 必须清理");
 }
+
+/// M9 S3：active-writer 屏障——deleting 置位后新写 503；在途写者归零前删桶等待/超时回滚。
+#[tokio::test]
+async fn deleting_barrier_blocks_writes_and_waits_for_active_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+
+    let writer = s.begin_write("alpha").unwrap();
+    // 有在途写者：begin_delete 超时 → 503 语义错误，并回滚 deleting（不永久封写）。
+    let err = match s
+        .begin_delete("alpha", std::time::Duration::from_millis(60))
+        .await
+    {
+        Ok(_) => panic!("在途写者未归零时 begin_delete 必须超时"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+    let second = s.begin_write("alpha").unwrap();
+
+    // deleting 置位后新写拒绝；已持有的在途写者不受影响。
+    s.mark_deleting("alpha");
+    assert!(matches!(s.begin_write("alpha"), Err(Error::Unavailable(_))));
+    drop(second);
+    assert!(
+        !s.wait_writers_idle("alpha", std::time::Duration::from_millis(60))
+            .await,
+        "写者未 drop 前不得判空闲"
+    );
+    drop(writer);
+    assert!(
+        s.wait_writers_idle("alpha", std::time::Duration::from_millis(500))
+            .await
+    );
+
+    // 写者归零：begin_delete 成功；期间新写继续拒绝；guard drop 后解除封禁。
+    let guard = s
+        .begin_delete("alpha", std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+    assert!(matches!(s.begin_write("alpha"), Err(Error::Unavailable(_))));
+    drop(guard);
+    let _third = s.begin_write("alpha").unwrap();
+}

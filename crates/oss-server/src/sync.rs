@@ -11,15 +11,20 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use sqlx::Row as _;
+use xl_s3::sync_delete::SyncDeleteSink;
 use xl_store::error::Error as StoreError;
 use xl_store::gate::{GateError, GateRequest, GateTicket, PutCommitGate};
+use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store};
 
 use crate::db::Db;
-use crate::repl_client::ReplClient;
+use crate::repl_client::{ReplClient, ReplError};
 use crate::state::AppState;
 
 /// 模式缓存 TTL（建桶/删桶/apply 会显式失效；TTL 只兜底漏网）。
 const CACHE_TTL: Duration = Duration::from_secs(10);
+/// 删桶 quiesce 上限（两端各 30s；客户端留 5s 裕量）。
+const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+const QUIESCE_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 /// 写 intent 状态：远端调用前 / 远端已确认（本地未提交）。
 const INTENT_PENDING: &str = "remote_pending";
 const INTENT_DONE: &str = "remote_done";
@@ -109,28 +114,11 @@ impl SiteSyncGate {
 
     /// 唯一数据 peer（witness 不写 `sites` 行；0/多行 = sync 前置不满足 → 503）。
     async fn peer(&self) -> Result<crate::db::SitePeer, GateError> {
-        let sites = self
-            .db
-            .list_sites()
-            .await
-            .map_err(|e| GateError::Unavailable(format!("read sites: {e}")))?;
-        if sites.len() != 1 {
-            return Err(GateError::Unavailable(format!(
-                "sync requires exactly one site peer (have {})",
-                sites.len()
-            )));
-        }
-        Ok(sites.into_iter().next().expect("len == 1"))
+        peer(&self.db).await
     }
 
     fn client(peer: &crate::db::SitePeer) -> Result<ReplClient, GateError> {
-        ReplClient::single(
-            &peer.endpoint,
-            &peer.s3_access_key,
-            &peer.s3_secret_key,
-            &peer.region,
-        )
-        .map_err(|e| GateError::Unavailable(format!("site endpoint invalid: {}", e.message)))
+        client(peer)
     }
 
     /// 远端 PUT 前落盘写 intent（kill -9 后恢复的唯一凭据）。
@@ -220,9 +208,51 @@ async fn clean_intent(db: &Db, id: &str) {
     }
 }
 
+/// M9 S1 N12 / S2 M4：清理无 intent 引用的陈旧 tee 明文（>1h）。
+/// 有 intent 的由恢复统一处理（不能抢在恢复前删掉补偿/补提交的凭据）。
+async fn clean_orphan_tees(state: &AppState) {
+    let dir = state.store.tee_dir();
+    let referenced: std::collections::HashSet<String> =
+        match sqlx::query_scalar::<_, String>("SELECT tee_path FROM sync_write_intents")
+            .fetch_all(state.db.pool())
+            .await
+        {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "tee 清理：读取 intent 失败（本轮跳过）");
+                return;
+            }
+        };
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(e) => e,
+        Err(_) => return, // 目录未创建 = 无 tee
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("plain") {
+            continue;
+        }
+        if referenced.contains(&path.to_string_lossy().into_owned()) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > Duration::from_secs(3600));
+        if old {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+}
+
 /// 启动 + 周期恢复：本地 meta 有该 id → 只清 intent；否则删远端同 id。
 /// 本地查询失败/远端不可达 → 保留，30s 后重试。
 pub async fn recover_write_intents(state: &AppState) {
+    clean_orphan_tees(state).await;
     // 只恢复“已完成/已崩溃”的陈旧行：在途写从插行到本地 meta 翻转必然短于
     // sync.timeout_ms + 提交耗时；60s 裕量覆盖病态 fsync。否则 worker 可能删掉
     // 仍在途、但远端已提交的版本（客户端 200、远端无副本）。
@@ -292,6 +322,7 @@ pub fn spawn_intent_worker(state: AppState) {
         loop {
             t.tick().await;
             recover_write_intents(&state).await;
+            recover_delete_intents(&state).await;
         }
     });
 }
@@ -402,5 +433,713 @@ impl PutCommitGate for SiteSyncGate {
         if let Ok(mut c) = self.cache.lock() {
             c.remove(bucket);
         }
+    }
+}
+
+// ———————————————— M9 S3：remote-first 删除服务 ————————————————
+
+/// 唯一数据 peer（witness 不写 `sites` 行；0/多行 = sync 前置不满足 → 503）。
+async fn peer(db: &Db) -> Result<crate::db::SitePeer, GateError> {
+    let sites = db
+        .list_sites()
+        .await
+        .map_err(|e| GateError::Unavailable(format!("read sites: {e}")))?;
+    if sites.len() != 1 {
+        return Err(GateError::Unavailable(format!(
+            "sync requires exactly one site peer (have {})",
+            sites.len()
+        )));
+    }
+    Ok(sites.into_iter().next().expect("len == 1"))
+}
+
+fn client(peer: &crate::db::SitePeer) -> Result<ReplClient, GateError> {
+    ReplClient::single(
+        &peer.endpoint,
+        &peer.s3_access_key,
+        &peer.s3_secret_key,
+        &peer.region,
+    )
+    .map_err(|e| GateError::Unavailable(format!("site endpoint invalid: {}", e.message)))
+}
+
+/// 远端删除错误 → store 错误：409/400 保留确定性语义，其余 fail-closed 503。
+fn remote_delete_error(e: ReplError) -> StoreError {
+    match e.status {
+        Some(409) => StoreError::Conflict(format!("remote conflict: {}", e.message)),
+        Some(400) => StoreError::InvalidArgument(format!("remote rejected: {}", e.message)),
+        _ => StoreError::Unavailable(format!("remote delete failed: {}", e.message)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadStatus {
+    Found,
+    Marker,
+    NotFound,
+}
+
+/// 共享删除服务：sync 桶远端优先（intent → 对端 token 路由 → 本地提交）；
+/// 非 sync 桶原样委托 store（M7 行为不变）。
+pub struct SiteSyncDelete {
+    db: Arc<Db>,
+    store: Arc<Store>,
+    timeout: Duration,
+    site_enabled: bool,
+    /// DeleteObjects 因远端失败整体 503 的次数（部分键已提交）。
+    partial_total: std::sync::atomic::AtomicU64,
+    /// 周期 worker 收敛的 delete intent 行数。
+    recovered_total: std::sync::atomic::AtomicU64,
+}
+
+impl SiteSyncDelete {
+    pub fn new(db: Arc<Db>, store: Arc<Store>, timeout: Duration, site_enabled: bool) -> Self {
+        Self {
+            db,
+            store,
+            timeout,
+            site_enabled,
+            partial_total: Default::default(),
+            recovered_total: Default::default(),
+        }
+    }
+
+    pub fn partial_total(&self) -> u64 {
+        self.partial_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn recovered_total(&self) -> u64 {
+        self.recovered_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (is_sync, deleting, versioning Enabled)。
+    async fn state(&self, bucket: &str) -> Result<(bool, bool, bool), StoreError> {
+        self.db
+            .bucket_sync_state(bucket)
+            .await
+            .map(|(mode, deleting, versioning)| (mode == "sync", deleting, versioning == "Enabled"))
+            .map_err(|e| StoreError::Unavailable(format!("read bucket mode: {e}")))
+    }
+
+    async fn peer(&self) -> Result<crate::db::SitePeer, StoreError> {
+        peer(&self.db).await.map_err(StoreError::from)
+    }
+
+    fn client(&self, peer: &crate::db::SitePeer) -> Result<ReplClient, StoreError> {
+        client(peer).map_err(StoreError::from)
+    }
+
+    /// 远端调用前落盘 intent（kill -9 后恢复的唯一凭据；FULL 同步确保先于远端可见）。
+    #[allow(clippy::too_many_arguments)]
+    async fn intent_insert(
+        &self,
+        op: &str,
+        bucket: &str,
+        key: &str,
+        local_version_id: &str,
+        remote_version_id: &str,
+        marker_version_id: &str,
+    ) -> Result<String, StoreError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = crate::db::now();
+        let mut conn = self
+            .db
+            .pool()
+            .acquire()
+            .await
+            .map_err(|e| StoreError::Unavailable(format!("intent acquire: {e}")))?;
+        sqlx::query("PRAGMA synchronous = FULL")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| StoreError::Unavailable(format!("intent pragma: {e}")))?;
+        sqlx::query(
+            "INSERT INTO sync_delete_intents \
+             (id, bucket, key, op, local_version_id, remote_version_id, marker_version_id, \
+              state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(bucket)
+        .bind(key)
+        .bind(op)
+        .bind(local_version_id)
+        .bind(remote_version_id)
+        .bind(marker_version_id)
+        .bind(INTENT_PENDING)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Unavailable(format!("delete intent: {e}")))?;
+        Ok(id)
+    }
+
+    async fn intent_done(&self, id: &str) {
+        if let Err(e) =
+            sqlx::query("UPDATE sync_delete_intents SET state = ?, updated_at = ? WHERE id = ?")
+                .bind(INTENT_DONE)
+                .bind(crate::db::now())
+                .bind(id)
+                .execute(self.db.pool())
+                .await
+        {
+            tracing::warn!(id, error = %e, "delete intent 状态更新失败（恢复按 pending 重放）");
+        }
+    }
+
+    async fn intent_clean(&self, id: &str) {
+        if let Err(e) = sqlx::query("DELETE FROM sync_delete_intents WHERE id = ?")
+            .bind(id)
+            .execute(self.db.pool())
+            .await
+        {
+            tracing::warn!(id, error = %e, "delete intent 删除失败（下轮恢复重试）");
+        }
+    }
+
+    async fn remote_delete_version(
+        &self,
+        client: &ReplClient,
+        peer: &crate::db::SitePeer,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(), StoreError> {
+        let call = client.delete_object_version(
+            "site",
+            bucket,
+            key,
+            version_id,
+            Some(&peer.peer_site_token),
+        );
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(remote_delete_error(e)),
+            Err(_) => Err(StoreError::Unavailable("remote delete timeout".into())),
+        }
+    }
+
+    async fn remote_head(
+        &self,
+        client: &ReplClient,
+        peer: &crate::db::SitePeer,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<HeadStatus, StoreError> {
+        let call = client.head_object_version(
+            "site",
+            bucket,
+            key,
+            version_id,
+            Some(&peer.peer_site_token),
+        );
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(Ok(true)) => Ok(HeadStatus::Found),
+            Ok(Ok(false)) => Ok(HeadStatus::Marker),
+            Ok(Err(e)) if e.status == Some(404) => Ok(HeadStatus::NotFound),
+            Ok(Err(e)) => Err(remote_delete_error(e)),
+            Err(_) => Err(StoreError::Unavailable("remote head timeout".into())),
+        }
+    }
+
+    /// 点名删版本：远端同 id 删除 → 本地删。M9 前无映射对象 → 409（需 --repair）。
+    async fn delete_version_remote(
+        &self,
+        client: &ReplClient,
+        peer: &crate::db::SitePeer,
+        bucket: &str,
+        key: &str,
+        vid: &str,
+        bypass: bool,
+    ) -> Result<DeleteOutcome, StoreError> {
+        match self.store.head_object_version(bucket, key, vid).await {
+            Ok(info) => match info.remote_version_id.as_deref() {
+                Some(rid) if rid == vid => {}
+                Some(rid) => {
+                    return Err(StoreError::Conflict(format!(
+                        "sync mapping mismatch (local {vid}, remote {rid}); run sync-reconcile --repair"
+                    )));
+                }
+                None => {
+                    return Err(StoreError::Conflict(
+                        "object has no remote mapping; run sync-reconcile --repair".into(),
+                    ));
+                }
+            },
+            // marker 自身 id 即远端 id（双站同 id 契约）；本地已无 = 幂等继续。
+            Err(StoreError::DeleteMarker(_))
+            | Err(StoreError::NoSuchKey(_))
+            | Err(StoreError::NoSuchBucket(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let id = self
+            .intent_insert("delete_version", bucket, key, vid, vid, "")
+            .await?;
+        if let Err(e) = self
+            .remote_delete_version(client, peer, bucket, key, vid)
+            .await
+        {
+            tracing::warn!(bucket, key, vid, error = %e, "sync 版本删：远端失败（intent 保留）");
+            return Err(e);
+        }
+        self.intent_done(&id).await;
+        match self
+            .store
+            .delete_object_versioned_ext(bucket, key, Some(vid), true, bypass)
+            .await
+        {
+            Ok(out) => {
+                self.intent_clean(&id).await;
+                Ok(out)
+            }
+            Err(e) => {
+                tracing::warn!(bucket, key, vid, error = %e, "sync 版本删：本地失败（intent 保留，worker 重试）");
+                Err(e)
+            }
+        }
+    }
+
+    /// 无版本号删：预生成 marker UUID，远端先建同 id marker，本地再落同 id。
+    async fn create_marker_remote(
+        &self,
+        client: &ReplClient,
+        peer: &crate::db::SitePeer,
+        bucket: &str,
+        key: &str,
+    ) -> Result<DeleteOutcome, StoreError> {
+        let marker = uuid::Uuid::new_v4().to_string();
+        let id = self
+            .intent_insert("create_marker", bucket, key, "", &marker, &marker)
+            .await?;
+        let call = client.delete_marker("site", bucket, key, &marker, Some(&peer.peer_site_token));
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let e = remote_delete_error(e);
+                tracing::warn!(bucket, key, error = %e, "sync marker：远端失败（intent 保留）");
+                return Err(e);
+            }
+            Err(_) => {
+                return Err(StoreError::Unavailable(
+                    "remote delete marker timeout".into(),
+                ));
+            }
+        }
+        self.intent_done(&id).await;
+        let spec = DeleteMarkerSpec {
+            marker_uuid: marker.clone(),
+            remote_version_id: Some(marker),
+        };
+        match self
+            .store
+            .delete_object_versioned_with_marker(bucket, key, None, true, false, Some(spec))
+            .await
+        {
+            Ok(out) => {
+                self.intent_clean(&id).await;
+                Ok(out)
+            }
+            Err(e) => {
+                tracing::warn!(bucket, key, error = %e, "sync marker：本地失败（intent 保留，worker 补齐）");
+                Err(e)
+            }
+        }
+    }
+
+    /// 删桶：两站 quiesce → 两站查空 → 远端删 → 本地删。
+    /// 失败保留 deleting + intent（worker 重试）；非空/超时回滚并 409。
+    async fn delete_bucket_flow(&self, bucket: &str, intent_id: &str) -> Result<(), StoreError> {
+        if !self.site_enabled {
+            return Err(StoreError::Unavailable(
+                "[site] not configured: sync deletes unavailable".into(),
+            ));
+        }
+        let peer = self.peer().await?;
+        let client = self.client(&peer)?;
+        self.db
+            .set_bucket_deleting(bucket, true)
+            .await
+            .map_err(|e| StoreError::Unavailable(format!("set deleting: {e}")))?;
+        self.store.invalidate_gate(bucket);
+        self.store.mark_deleting(bucket);
+        if !self.store.wait_writers_idle(bucket, QUIESCE_TIMEOUT).await {
+            self.rollback_bucket(&client, &peer, bucket).await;
+            return Err(StoreError::Unavailable(
+                "timed out waiting for active writers".into(),
+            ));
+        }
+        // 对端 quiesce：等本站计数归零后才 200；超时/非空 → 409/503 并回滚两端。
+        let token = Some(peer.peer_site_token.as_str());
+        let call = client.bucket_quiesce("site", bucket, token);
+        match tokio::time::timeout(QUIESCE_CALL_TIMEOUT, call).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.rollback_bucket(&client, &peer, bucket).await;
+                let e = remote_delete_error(e);
+                self.intent_clean(intent_id).await;
+                return Err(e);
+            }
+            Err(_) => {
+                self.rollback_bucket(&client, &peer, bucket).await;
+                self.intent_clean(intent_id).await;
+                return Err(StoreError::Unavailable("remote quiesce timeout".into()));
+            }
+        }
+        let empty_local = match self.store.bucket_is_empty(bucket).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.rollback_bucket(&client, &peer, bucket).await;
+                self.intent_clean(intent_id).await;
+                return Err(e);
+            }
+        };
+        let empty_remote = match tokio::time::timeout(
+            QUIESCE_CALL_TIMEOUT,
+            client.bucket_is_empty("site", bucket, token),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                self.rollback_bucket(&client, &peer, bucket).await;
+                let e = remote_delete_error(e);
+                self.intent_clean(intent_id).await;
+                return Err(e);
+            }
+            Err(_) => {
+                self.rollback_bucket(&client, &peer, bucket).await;
+                self.intent_clean(intent_id).await;
+                return Err(StoreError::Unavailable("remote empty check timeout".into()));
+            }
+        };
+        if !empty_local || !empty_remote {
+            self.rollback_bucket(&client, &peer, bucket).await;
+            self.intent_clean(intent_id).await;
+            return Err(StoreError::BucketNotEmpty(bucket.to_string()));
+        }
+        // 超时/失败：保留 deleting + intent，worker 重试（远端可能已删，重试幂等）。
+        match tokio::time::timeout(
+            QUIESCE_CALL_TIMEOUT,
+            client.delete_bucket("site", bucket, token),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(remote_delete_error(e)),
+            Err(_) => {
+                return Err(StoreError::Unavailable(
+                    "remote delete bucket timeout".into(),
+                ));
+            }
+        }
+        // 远端已删：本地失败同样保留 intent（重试先撞远端 404 = 已删）。
+        self.store.delete_bucket(bucket).await?;
+        self.store.unmark_deleting(bucket);
+        if let Err(e) = self.db.set_bucket_deleting(bucket, false).await {
+            tracing::warn!(bucket, error = %e, "清 deleting 标志失败（worker 会重试删桶）");
+        }
+        self.store.invalidate_gate(bucket);
+        self.intent_clean(intent_id).await;
+        Ok(())
+    }
+
+    /// quiesce 回滚：释放对端 + 本地 deleting + DB deleting=0。
+    async fn rollback_bucket(&self, client: &ReplClient, peer: &crate::db::SitePeer, bucket: &str) {
+        let _ = tokio::time::timeout(
+            QUIESCE_CALL_TIMEOUT,
+            client.bucket_quiesce_release("site", bucket, Some(&peer.peer_site_token)),
+        )
+        .await;
+        self.store.unmark_deleting(bucket);
+        if let Err(e) = self.db.set_bucket_deleting(bucket, false).await {
+            tracing::warn!(bucket, error = %e, "回滚 deleting 标志失败");
+        }
+        self.store.invalidate_gate(bucket);
+    }
+}
+
+#[async_trait]
+impl SyncDeleteSink for SiteSyncDelete {
+    async fn delete_versioned(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        versioned: bool,
+        bypass_governance: bool,
+    ) -> Result<DeleteOutcome, StoreError> {
+        let (sync, _deleting, versioning) = self.state(bucket).await?;
+        if !sync {
+            return self
+                .store
+                .delete_object_versioned_ext(bucket, key, version_id, versioned, bypass_governance)
+                .await;
+        }
+        if !self.site_enabled {
+            return Err(StoreError::Unavailable(
+                "[site] not configured: sync deletes unavailable".into(),
+            ));
+        }
+        if !versioning {
+            return Err(StoreError::Conflict(
+                "sync bucket requires versioning Enabled".into(),
+            ));
+        }
+        let peer = self.peer().await?;
+        let client = self.client(&peer)?;
+        match version_id {
+            Some(vid) => {
+                self.delete_version_remote(&client, &peer, bucket, key, vid, bypass_governance)
+                    .await
+            }
+            None if versioned => self.create_marker_remote(&client, &peer, bucket, key).await,
+            None => Err(StoreError::Conflict(
+                "sync bucket requires versioning Enabled".into(),
+            )),
+        }
+    }
+
+    async fn delete_key_all_versions(&self, bucket: &str, key: &str) -> Result<bool, StoreError> {
+        let (sync, _deleting, _versioning) = self.state(bucket).await?;
+        if !sync {
+            return self.store.delete_object(bucket, key).await;
+        }
+        if !self.site_enabled {
+            return Err(StoreError::Unavailable(
+                "[site] not configured: sync deletes unavailable".into(),
+            ));
+        }
+        let peer = self.peer().await?;
+        let client = self.client(&peer)?;
+        let id = self
+            .intent_insert("delete_key", bucket, key, "", "", "")
+            .await?;
+        match tokio::time::timeout(
+            self.timeout,
+            client.delete_object_all("site", bucket, key, Some(&peer.peer_site_token)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let e = remote_delete_error(e);
+                tracing::warn!(bucket, key, error = %e, "sync 整键删：远端失败（intent 保留）");
+                return Err(e);
+            }
+            Err(_) => {
+                return Err(StoreError::Unavailable("remote delete timeout".into()));
+            }
+        }
+        self.intent_done(&id).await;
+        match self.store.delete_object(bucket, key).await {
+            Ok(existed) => {
+                self.intent_clean(&id).await;
+                Ok(existed)
+            }
+            Err(e) => {
+                tracing::warn!(bucket, key, error = %e, "sync 整键删：本地失败（intent 保留）");
+                Err(e)
+            }
+        }
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), StoreError> {
+        let (sync, _deleting, _versioning) = self.state(bucket).await?;
+        if !sync {
+            return self.store.delete_bucket(bucket).await;
+        }
+        let id = self
+            .intent_insert("delete_bucket", bucket, "", "", "", "")
+            .await?;
+        self.delete_bucket_flow(bucket, &id).await
+    }
+
+    fn record_partial(&self) {
+        self.partial_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 启动 + 周期恢复：`remote_pending` 先按远端 HEAD 收敛（200/405=在、404=不在），
+/// `remote_done` 只补本地；本地失败保留行下一轮重试（不重启也恢复）。
+pub async fn recover_delete_intents(state: &AppState) {
+    let cutoff = crate::db::now() - (state.cfg.sync.timeout_ms as i64 / 1000 + 60);
+    let rows = match sqlx::query(
+        "SELECT id, bucket, key, op, local_version_id, remote_version_id, marker_version_id, state \
+         FROM sync_delete_intents WHERE updated_at < ?",
+    )
+    .bind(cutoff)
+    .fetch_all(state.db.pool())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "delete intent 恢复：读取失败");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let svc = &*state.sync_delete;
+    let mut recovered = 0usize;
+    for row in rows {
+        let id: String = row.get("id");
+        let bucket: String = row.get("bucket");
+        let key: String = row.get("key");
+        let op: String = row.get("op");
+        let local_vid: Option<String> = row.get("local_version_id");
+        let marker_vid: Option<String> = row.get("marker_version_id");
+        let done = row.get::<String, _>("state") == INTENT_DONE;
+        match op.as_str() {
+            "delete_bucket" => {
+                if svc.delete_bucket_flow(&bucket, &id).await.is_ok() {
+                    recovered += 1;
+                }
+            }
+            "delete_version" => {
+                let Some(vid) = local_vid.filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let remote_ok = if done {
+                    true
+                } else {
+                    match svc.peer().await {
+                        Ok(peer) => match svc.client(&peer) {
+                            Ok(client) => {
+                                match svc.remote_head(&client, &peer, &bucket, &key, &vid).await {
+                                    Ok(HeadStatus::NotFound) => true,
+                                    Ok(_) => svc
+                                        .remote_delete_version(&client, &peer, &bucket, &key, &vid)
+                                        .await
+                                        .is_ok(),
+                                    Err(_) => false,
+                                }
+                            }
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    }
+                };
+                if !remote_ok {
+                    continue;
+                }
+                svc.intent_done(&id).await;
+                if svc
+                    .store
+                    .delete_object_versioned_ext(&bucket, &key, Some(&vid), true, false)
+                    .await
+                    .is_ok()
+                {
+                    svc.intent_clean(&id).await;
+                    recovered += 1;
+                }
+            }
+            "create_marker" => {
+                let Some(marker) = marker_vid.filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let remote_ok = if done {
+                    true
+                } else {
+                    match svc.peer().await {
+                        Ok(peer) => match svc.client(&peer) {
+                            Ok(client) => {
+                                match svc
+                                    .remote_head(&client, &peer, &bucket, &key, &marker)
+                                    .await
+                                {
+                                    Ok(HeadStatus::NotFound) => {
+                                        let call = client.delete_marker(
+                                            "site",
+                                            &bucket,
+                                            &key,
+                                            &marker,
+                                            Some(&peer.peer_site_token),
+                                        );
+                                        tokio::time::timeout(svc.timeout, call)
+                                            .await
+                                            .is_ok_and(|r| r.is_ok())
+                                    }
+                                    Ok(_) => true,
+                                    Err(_) => false,
+                                }
+                            }
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    }
+                };
+                if !remote_ok {
+                    continue;
+                }
+                svc.intent_done(&id).await;
+                // 本地已有同 id（marker 或版本）→ 只清 intent，不重造（at-least-once）。
+                match svc.store.head_object_version(&bucket, &key, &marker).await {
+                    Ok(_) | Err(StoreError::DeleteMarker(_)) => {
+                        svc.intent_clean(&id).await;
+                        recovered += 1;
+                    }
+                    Err(StoreError::NoSuchKey(_)) => {
+                        let spec = DeleteMarkerSpec {
+                            marker_uuid: marker.clone(),
+                            remote_version_id: Some(marker),
+                        };
+                        if svc
+                            .store
+                            .delete_object_versioned_with_marker(
+                                &bucket,
+                                &key,
+                                None,
+                                true,
+                                false,
+                                Some(spec),
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            svc.intent_clean(&id).await;
+                            recovered += 1;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            "delete_key" => {
+                let remote_ok = match svc.peer().await {
+                    Ok(peer) => match svc.client(&peer) {
+                        Ok(client) => {
+                            let call = client.delete_object_all(
+                                "site",
+                                &bucket,
+                                &key,
+                                Some(&peer.peer_site_token),
+                            );
+                            tokio::time::timeout(svc.timeout, call)
+                                .await
+                                .is_ok_and(|r| r.is_ok())
+                        }
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                };
+                if !remote_ok {
+                    continue;
+                }
+                if svc.store.delete_object(&bucket, &key).await.is_ok() {
+                    svc.intent_clean(&id).await;
+                    recovered += 1;
+                }
+            }
+            other => tracing::warn!(op = other, id, "未知 delete intent op（保留）"),
+        }
+    }
+    if recovered > 0 {
+        svc.recovered_total
+            .fetch_add(recovered as u64, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(recovered, "sync delete intent 恢复完成");
     }
 }

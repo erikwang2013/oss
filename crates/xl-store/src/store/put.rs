@@ -679,6 +679,8 @@ impl Store {
         ext: super::PutExt,
     ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
+        // M9 S3：删桶 quiesce 屏障（PUT/MPU/Copy/控制台上传共用本入口）。
+        let _writer = self.begin_write(bucket)?;
         // M8 前置：标签在写入口先校验（与 set_replication_status 白名单同模式）；
         // 空集合归一为 None（S3 无标签与空 TagSet 等价）。
         if let Some(t) = &tags {

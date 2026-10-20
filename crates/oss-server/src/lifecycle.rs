@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use xl_s3::sync_delete::SyncDeleteSink as _;
 use xl_store::store::ListRequest;
 
 use crate::state::AppState;
@@ -138,10 +139,10 @@ pub async fn sweep_once(state: &AppState) -> usize {
                             continue;
                         }
                     }
-                    // 删除：版本桶打 marker，非版本桶整键删
+                    // 删除：版本桶打 marker，非版本桶整键删；M9 S3 sync 桶走远端优先。
                     match state
-                        .store
-                        .delete_object_versioned(&rule.bucket, &o.key, None, versioned)
+                        .sync_delete
+                        .delete_versioned(&rule.bucket, &o.key, None, versioned, false)
                         .await
                     {
                         Ok(outcome) => {

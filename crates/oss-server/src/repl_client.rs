@@ -462,6 +462,224 @@ impl ReplClient {
         }
     }
 
+    /// M9 S3：远端创建同 id delete marker（内部路由，只做本地 marker，永不转发）。
+    /// 404 = 路由/版本不存在 → 视为已删（幂等）。
+    pub async fn delete_marker(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        marker_id: &str,
+        site_token: Option<&str>,
+    ) -> Result<(), ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let body = serde_json::json!({
+            "bucket": dest_bucket, "key": key, "marker_id": marker_id,
+        })
+        .to_string();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-oss-site-token".to_string(), token.to_string()),
+        ];
+        match self
+            .send_path(
+                remote_id,
+                "POST",
+                "/api/v1/site/delete-object",
+                &[],
+                Some(Bytes::from(body)),
+                &headers,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.status == Some(404) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// M9 S3：远端整键硬删（控制台对象删除；内部路由，只做本地清理）。
+    pub async fn delete_object_all(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        site_token: Option<&str>,
+    ) -> Result<(), ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let body = serde_json::json!({
+            "bucket": dest_bucket, "key": key, "all_versions": true,
+        })
+        .to_string();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-oss-site-token".to_string(), token.to_string()),
+        ];
+        match self
+            .send_path(
+                remote_id,
+                "POST",
+                "/api/v1/site/delete-object",
+                &[],
+                Some(Bytes::from(body)),
+                &headers,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.status == Some(404) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// M9 S3：远端版本 HEAD（token 路由）。`Ok(true)` = 版本存在、`Ok(false)` = delete marker；
+    /// 404 由调用方按「不存在」处理（错误对象带 status=404）。
+    pub async fn head_object_version(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        version_id: &str,
+        site_token: Option<&str>,
+    ) -> Result<bool, ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let headers = vec![("x-oss-site-token".to_string(), token.to_string())];
+        match self
+            .send_path(
+                remote_id,
+                "HEAD",
+                "/api/v1/site/head-object",
+                &[
+                    ("bucket", dest_bucket),
+                    ("key", key),
+                    ("version_id", version_id),
+                ],
+                None,
+                &headers,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.status == Some(405) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// M9 S3：远端桶空检查（内部路由）。`Ok(true)` = 空；409 = 非空。
+    pub async fn bucket_is_empty(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        site_token: Option<&str>,
+    ) -> Result<bool, ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let headers = vec![("x-oss-site-token".to_string(), token.to_string())];
+        match self
+            .send_path(
+                remote_id,
+                "GET",
+                "/api/v1/site/bucket-empty",
+                &[("bucket", bucket)],
+                None,
+                &headers,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.status == Some(409) => Ok(false),
+            // 桶已不存在也算空（删除目标已达成）。
+            Err(e) if e.status == Some(404) => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// M9 S3：对端 quiesce（置 deleting + 等 active-writer 归零，30s 上限）。
+    pub async fn bucket_quiesce(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        site_token: Option<&str>,
+    ) -> Result<(), ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let body = serde_json::json!({ "bucket": bucket }).to_string();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-oss-site-token".to_string(), token.to_string()),
+        ];
+        self.send_path(
+            remote_id,
+            "POST",
+            "/api/v1/site/bucket-quiesce",
+            &[],
+            Some(Bytes::from(body)),
+            &headers,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// 回滚对端 quiesce（超时/非空/失败的补偿路径）。
+    pub async fn bucket_quiesce_release(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        site_token: Option<&str>,
+    ) -> Result<(), ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let body = serde_json::json!({ "bucket": bucket, "release": true }).to_string();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-oss-site-token".to_string(), token.to_string()),
+        ];
+        self.send_path(
+            remote_id,
+            "POST",
+            "/api/v1/site/bucket-quiesce",
+            &[],
+            Some(Bytes::from(body)),
+            &headers,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// M9 S3：远端本地删桶（内部路由；404 = 已删，幂等成功）。
+    pub async fn delete_bucket(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        site_token: Option<&str>,
+    ) -> Result<(), ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
+        let body = serde_json::json!({ "bucket": bucket }).to_string();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-oss-site-token".to_string(), token.to_string()),
+        ];
+        match self
+            .send_path(
+                remote_id,
+                "POST",
+                "/api/v1/site/delete-bucket",
+                &[],
+                Some(Bytes::from(body)),
+                &headers,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.status == Some(404) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn delete_object(
         &self,
         remote_id: &str,

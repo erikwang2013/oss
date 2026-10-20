@@ -42,10 +42,17 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     .with_restore(Some(Arc::clone(&state.restore_sink)))
     .with_tier_gc(Some(Arc::clone(&state.tier_gc)))
     .with_inventory(Some(Arc::clone(&state.inventory)))
-    // M9 S4：stretch 禁止 sync 桶（对象内容不得依赖单站点异步副本）。
-    .with_sync_ready(crate::raft::SYNC_READY && state.cfg.stretch.is_none())
+    // M9 S4：stretch 禁止 sync 桶（对象内容不得依赖单站点异步副本）；
+    // M9 S3：S3 面的 sync 建桶同样要求 [raft]（与 console 同口径）。
+    .with_sync_ready(
+        crate::raft::SYNC_READY && state.cfg.stretch.is_none() && state.cfg.raft.is_some(),
+    )
     // M9：sync 摄入 token 校验（无 [site] = None → 一律 403）
-    .with_site_token(state.site_enabled.then(|| state.site.token.clone()));
+    .with_site_token(state.site_enabled.then(|| state.site.token.clone()))
+    // M9 S3：S3/lifecycle/batch/console 删除统一走远端优先服务。
+    .with_sync_delete(Some(
+        Arc::clone(&state.sync_delete) as Arc<dyn xl_s3::sync_delete::SyncDeleteSink>
+    ));
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
     let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);
@@ -200,6 +207,22 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         "# HELP oss_slot_count 全局槽位数（单机 = 本机盘数）\n# TYPE oss_slot_count gauge\n",
     );
     out.push_str(&format!("oss_slot_count {slot_count}\n"));
+    out.push_str(
+        "# HELP oss_sync_delete_partial_total DeleteObjects 远端失败整体 503 次数（部分键已提交）\n\
+         # TYPE oss_sync_delete_partial_total counter\n",
+    );
+    out.push_str(&format!(
+        "oss_sync_delete_partial_total {}\n",
+        state.sync_delete.partial_total()
+    ));
+    out.push_str(
+        "# HELP oss_sync_delete_recovered_total 周期 worker 收敛的 sync delete intent 行数\n\
+         # TYPE oss_sync_delete_recovered_total counter\n",
+    );
+    out.push_str(&format!(
+        "oss_sync_delete_recovered_total {}\n",
+        state.sync_delete.recovered_total()
+    ));
     (
         [(
             header::CONTENT_TYPE,

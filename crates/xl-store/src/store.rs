@@ -1,10 +1,11 @@
 //! 存储内核。M1：单盘、无纠删码，但**提交协议与 xl.meta 格式按最终设计落**，
 //! M2 只是把「一个 part 一个文件」换成「一个 part 若干分片」。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -30,7 +31,7 @@ mod tier;
 mod version;
 pub use rebalance::RebalanceReport;
 pub use tier::ArchiveSpec;
-pub use version::{DeleteOutcome, TierRef, VersionEntry, VersionList};
+pub use version::{DeleteMarkerSpec, DeleteOutcome, TierRef, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
 pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec};
@@ -169,6 +170,45 @@ pub struct Store {
     cluster_locks: Arc<lock::LockTable>,
     /// M5 切片 2：密钥库状态（`init_encryption` 一次性置入；未启用 = 空，零行为变化）。
     encryption: std::sync::OnceLock<crypto::EncState>,
+    /// M9 S3：每桶在途写者计数 + 删桶标志（删桶 quiesce 的进程内屏障）。
+    writers: Mutex<WriterState>,
+}
+
+#[derive(Default)]
+struct WriterState {
+    active: HashMap<String, usize>,
+    deleting: HashSet<String>,
+}
+
+/// 在途写者守卫（RAII：drop 时计数减一）。
+pub struct WriteGuard<'a> {
+    store: &'a Store,
+    bucket: String,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut w) = self.store.writers.lock() {
+            match w.active.get_mut(&self.bucket) {
+                Some(n) if *n > 1 => *n -= 1,
+                _ => {
+                    w.active.remove(&self.bucket);
+                }
+            }
+        }
+    }
+}
+
+/// 删桶守卫（RAII：drop 时清 deleting 标志）。
+pub struct DeletingGuard<'a> {
+    store: &'a Store,
+    bucket: String,
+}
+
+impl Drop for DeletingGuard<'_> {
+    fn drop(&mut self) {
+        self.store.unmark_deleting(&self.bucket);
+    }
 }
 
 /// 对象锁守卫：进程内 tokio 互斥 + 跨进程 flock（`File` drop 即释放 flock）
@@ -367,6 +407,7 @@ impl Store {
             quorum_unmet_lock: AtomicU64::new(0),
             cluster_locks: Arc::new(lock::LockTable::default()),
             encryption: std::sync::OnceLock::new(),
+            writers: Mutex::new(WriterState::default()),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;
@@ -449,8 +490,91 @@ impl Store {
         }
     }
 
+    /// M9 S3：写入口取在途写者守卫。删桶标志置位后拒绝新写（503）。
+    pub fn begin_write(&self, bucket: &str) -> Result<WriteGuard<'_>> {
+        let mut w = self
+            .writers
+            .lock()
+            .map_err(|_| Error::Io(std::io::Error::other("writer lock poisoned")))?;
+        if w.deleting.contains(bucket) {
+            return Err(Error::Unavailable("bucket is being deleted".into()));
+        }
+        *w.active.entry(bucket.to_string()).or_default() += 1;
+        Ok(WriteGuard {
+            store: self,
+            bucket: bucket.to_string(),
+        })
+    }
+
+    /// 置删桶标志（幂等；已被其它删桶流程置位也返回）。
+    pub fn mark_deleting(&self, bucket: &str) {
+        if let Ok(mut w) = self.writers.lock() {
+            w.deleting.insert(bucket.to_string());
+        }
+    }
+
+    pub fn unmark_deleting(&self, bucket: &str) {
+        if let Ok(mut w) = self.writers.lock() {
+            w.deleting.remove(bucket);
+            if w.active.get(bucket).copied().unwrap_or(0) == 0 {
+                w.active.remove(bucket);
+            }
+        }
+    }
+
+    /// 等待在途写者归零（不改变 deleting）。超时返回 false。
+    pub async fn wait_writers_idle(&self, bucket: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let active = self
+                .writers
+                .lock()
+                .map(|w| w.active.get(bucket).copied().unwrap_or(0))
+                .unwrap_or(0);
+            if active == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 置 deleting + 等写者归零（上限 `timeout`）；失败回滚标志。
+    pub async fn begin_delete(&self, bucket: &str, timeout: Duration) -> Result<DeletingGuard<'_>> {
+        self.mark_deleting(bucket);
+        if !self.wait_writers_idle(bucket, timeout).await {
+            self.unmark_deleting(bucket);
+            return Err(Error::Unavailable(
+                "timed out waiting for active writers".into(),
+            ));
+        }
+        Ok(DeletingGuard {
+            store: self,
+            bucket: bucket.to_string(),
+        })
+    }
+
+    /// 桶是否为空（各在册盘均无对象目录项；桶不存在视为空）。删桶前置。
+    pub async fn bucket_is_empty(&self, bucket: &str) -> Result<bool> {
+        layout::validate_bucket(bucket)?;
+        for drive in &self.cfg.drives {
+            let dir = layout::bucket_dir(drive, bucket);
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if entries.next_entry().await?.is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// tee 明文暂存目录（延迟创建；在版本目录之外——失败/取消只删文件，不牵扯 staging）。
-    pub(in crate::store) fn tee_dir(&self) -> PathBuf {
+    pub fn tee_dir(&self) -> PathBuf {
         self.cfg
             .tee_dir
             .clone()
@@ -640,18 +764,8 @@ impl Store {
             }
         }
         // 任一在册盘上还有对象目录就拒绝（S3 语义）
-        for drive in &self.cfg.drives {
-            let dir = layout::bucket_dir(drive, bucket);
-            let mut entries = match tokio::fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let non_empty = entries.next_entry().await?.is_some();
-            drop(entries);
-            if non_empty {
-                return Err(Error::BucketNotEmpty(bucket.to_string()));
-            }
+        if !self.bucket_is_empty(bucket).await? {
+            return Err(Error::BucketNotEmpty(bucket.to_string()));
         }
         // 集群：逐节点「空检查 + 删」（服务端原子做）；任一节点不可达/非空 → 中止。
         // 部分节点已删是自洽的：全局存在性 = 任一节点有（本函数上方的 bucket_exists 同口径）；
@@ -1251,6 +1365,8 @@ impl Store {
     /// 幂等空删）——M6 P2-1：调用方据此决定是否发 `ObjectRemoved` 事件（同锁内判定，
     /// 无 head→delete TOCTOU；也避免 SSE-C 对象 head 需客户钥而误判不存在）。
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool> {
+        // M9 S3：删桶 quiesce 屏障（与版本删/写同口径）。
+        let _writer = self.begin_write(bucket)?;
         self.ensure_bucket(bucket).await?;
         // 与 put 同键串行：删除进行中不得有写者把新版本 rename 进来（否则版本目录会被连带删掉）
         let _guard = self.lock_object(bucket, key).await?;
