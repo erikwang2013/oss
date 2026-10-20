@@ -75,6 +75,12 @@ export interface ObjectEntry {
   size: number
   etag: string
   content_type: string | null
+  /** M8：存储类（生命周期 Transition 后变化）；从未设置 = null */
+  storage_class?: string | null
+  /** M8：归档阶段 Debug 名——Archived / Restoring / Restored */
+  tier_phase?: string | null
+  /** M8：临时恢复到期（unix 秒）；null = 无临时副本 */
+  restore_expires_at?: number | null
 }
 export interface ObjectList {
   objects: ObjectEntry[]
@@ -156,4 +162,156 @@ export interface ClusterSet {
   /** 本节点是否属于该 set */
   self: boolean
   nodes: ClusterNode[]
+}
+
+// ——— M8 控制面（Task 6a 页面用）———
+
+/** 访问点（DB 行的投影；policy 为已解析 JSON 或 null）。 */
+export interface AccessPointInfo {
+  name: string
+  bucket: string
+  owner_id: number
+  policy: unknown | null
+  created_at: number
+  updated_at: number
+}
+
+/** 变换器配置读视图：不返回模块字节，只回摘要/大小。 */
+export interface TransformInfo {
+  kind: 'http' | 'wasm'
+  endpoint: string | null
+  module_sha256: string | null
+  module_size: number | null
+  timeout_ms: number
+  max_response_bytes: number
+  updated_at: number
+}
+
+/**
+ * 作业行。列表端点（GET /jobs）只投影历史列（scanned/deleted/skipped），
+ * 作业引擎字段（priority/total/succeeded/failed/requested_by）只在详情端点出现。
+ */
+export interface JobSummary {
+  id: number
+  kind: string
+  bucket: string
+  prefix: string
+  state: string
+  scanned?: number
+  deleted?: number
+  skipped?: number
+  error?: string | null
+  created_at: number
+  updated_at: number
+  progress?: number
+  total?: number
+  succeeded?: number
+  failed?: number
+  priority?: number
+  requested_by?: number | null
+  report_bucket?: string | null
+  report_prefix?: string | null
+  started_at?: number | null
+  finished_at?: number | null
+}
+
+export interface JobTask {
+  task_no: number
+  action: string
+  state: string
+  attempt: number
+  next_at: number
+  result_code: string | null
+  result_string: string | null
+  started_at: number | null
+  finished_at: number | null
+}
+
+export interface JobDetail {
+  job: JobSummary
+  tasks: JobTask[]
+  offset: number
+  limit: number
+}
+
+export interface TierInfo {
+  id: string
+  endpoint: string
+  bucket: string
+  healthy: boolean
+}
+
+export interface InventoryConfig {
+  id: string
+  is_enabled: boolean
+  frequency: string
+  destination_bucket: string
+  destination_prefix: string | null
+  format: string
+  filter_prefix: string | null
+  included_object_versions: string
+  optional_fields: string[]
+}
+
+export interface PolicyTemplate {
+  id: string
+  name: string
+  description: string
+  doc: unknown
+}
+
+export interface AuditRow {
+  id: number
+  ts: number
+  uid: number
+  op: string
+  bucket: string | null
+  object_key: string | null
+  decision: string
+  detail: string | null
+}
+
+/** GET /encryption（只读；无变更端点）。 */
+export interface EncryptionStatus {
+  sse_s3: boolean
+  sse_kms: boolean
+  kms_current_key_id: string | null
+}
+
+export interface BucketEncryption {
+  /** null = 未配置 */
+  algorithm: string | null
+}
+
+export interface NotificationQueue {
+  id?: string
+  queue_arn?: string
+  events?: string[]
+  filter?: { key?: { filter_rules?: { name?: string; value?: string }[] } }
+}
+
+/** 与 S3 GetBucketNotificationConfiguration 同形的线格式（snake_case）。 */
+export interface NotificationConfig {
+  queue_configurations?: NotificationQueue[]
+}
+
+export interface DeadEvent {
+  id: number
+  bucket: string
+  object_key: string | null
+  event: string | null
+  attempts: number
+  last_error: string | null
+  created_at: number
+}
+
+export interface ObjectTag {
+  key: string
+  value: string
+}
+
+export interface SelectResult {
+  /** CSV 输出 → string[][]；JSON 输出 → JSON 值数组 */
+  records: unknown[]
+  stats: { bytes_scanned: number; bytes_processed: number; bytes_returned: number }
 }

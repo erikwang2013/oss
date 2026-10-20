@@ -1,15 +1,26 @@
 import { useMemo, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { App, Breadcrumb, Button, Card, Popconfirm, Space, Table, Tooltip } from 'antd'
+import { App, Breadcrumb, Button, Card, Input, Modal, Popconfirm, Space, Table, Tag, Tooltip } from 'antd'
 import { FileOutlined, FolderOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, rawApi, type BucketInfo, type ObjectList } from '../api'
-import { humanSize } from '../format'
+import { api, rawApi, type BucketInfo, type ObjectList, type ObjectTag } from '../api'
+import { fmtTime, humanSize } from '../format'
+import InventoryModal from '../InventoryModal'
 import PageHeader from '../PageHeader'
 import UploadPanel from '../upload/UploadPanel'
 
 // 显式给出行类型：否则 antd Table 会从各列 render 的参数注解反推 RecordType，推出带 string 字面量的错误类型，rowKey 与 render 都编译不过
-type Row = { kind: 'dir'; key: string } | { kind: 'obj'; key: string; size: number; etag: string }
+type Row =
+  | { kind: 'dir'; key: string }
+  | {
+      kind: 'obj'
+      key: string
+      size: number
+      etag: string
+      storage_class?: string | null
+      tier_phase?: string | null
+      restore_expires_at?: number | null
+    }
 
 export default function Objects() {
   const { bucket = '' } = useParams()
@@ -19,6 +30,8 @@ export default function Objects() {
   const [sp, setSp] = useSearchParams()
   const prefix = sp.get('prefix') ?? ''
   const [uploading, setUploading] = useState(false)
+  const [inventoryOpen, setInventoryOpen] = useState(false)
+  const [tagsKey, setTagsKey] = useState<string | null>(null)
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ['objects', bucket, prefix],
@@ -76,9 +89,17 @@ export default function Objects() {
     )
   }, [bucket, prefix])
 
-  const rows = [
+  const rows: Row[] = [
     ...(data?.common_prefixes ?? []).map((p) => ({ kind: 'dir' as const, key: p })),
-    ...(data?.objects ?? []).map((o) => ({ kind: 'obj' as const, key: o.key, size: o.size, etag: o.etag })),
+    ...(data?.objects ?? []).map((o) => ({
+      kind: 'obj' as const,
+      key: o.key,
+      size: o.size,
+      etag: o.etag,
+      storage_class: o.storage_class,
+      tier_phase: o.tier_phase,
+      restore_expires_at: o.restore_expires_at,
+    })),
   ]
 
   return (
@@ -89,6 +110,13 @@ export default function Objects() {
         sub={prefix ? `前缀 ${prefix}` : '对象浏览'}
         extra={
           <>
+            <Link to={`/buckets/${encodeURIComponent(bucket)}/policy`}>
+              <Button>桶策略</Button>
+            </Link>
+            <Link to={`/buckets/${encodeURIComponent(bucket)}/select`}>
+              <Button>Select 查询</Button>
+            </Link>
+            <Button onClick={() => setInventoryOpen(true)}>清单配置</Button>
             <Button icon={<ReloadOutlined />} onClick={() => refetch()} loading={isFetching} aria-label="刷新" />
             {canWrite && (
               <Button type="primary" onClick={() => setUploading(true)}>上传</Button>
@@ -121,17 +149,43 @@ export default function Objects() {
             },
             {
               title: '大小',
-              width: 120,
+              width: 110,
               render: (_: unknown, r: { kind: string; size?: number }) => (r.kind === 'dir' ? '-' : humanSize(r.size ?? 0)),
             },
-            { title: 'ETag', dataIndex: 'etag', width: 320, render: (v?: string) => v ?? '-' },
+            {
+              title: '存储类',
+              width: 120,
+              render: (_: unknown, r: { kind: string; storage_class?: string | null }) =>
+                r.kind === 'dir' ? '-' : (r.storage_class ?? '-'),
+            },
+            {
+              // tier_phase 直接来自控制台列表（无需逐对象 HEAD）；null = 未归档
+              title: '恢复状态',
+              width: 200,
+              render: (_: unknown, r: { kind: string; tier_phase?: string | null; restore_expires_at?: number | null }) => {
+                if (r.kind === 'dir' || !r.tier_phase) return '-'
+                const label =
+                  { Archived: '已归档', Restoring: '恢复中', Restored: '已恢复' }[r.tier_phase] ?? r.tier_phase
+                const color = r.tier_phase === 'Restored' ? 'green' : r.tier_phase === 'Restoring' ? 'processing' : 'default'
+                return (
+                  <Tag color={color}>
+                    {label}
+                    {r.tier_phase === 'Restored' && r.restore_expires_at
+                      ? `（至 ${fmtTime(r.restore_expires_at)}）`
+                      : ''}
+                  </Tag>
+                )
+              },
+            },
+            { title: 'ETag', dataIndex: 'etag', width: 280, render: (v?: string) => v ?? '-' },
             {
               title: '操作',
-              width: 160,
+              width: 220,
               render: (_: unknown, r: { kind: 'dir' | 'obj'; key: string }) =>
                 r.kind === 'obj' && (
                   <>
                     <Button size="small" onClick={() => download(r.key)} style={{ marginRight: 8 }}>下载</Button>
+                    <Button size="small" onClick={() => setTagsKey(r.key)} style={{ marginRight: 8 }}>标签</Button>
                     {canDelete && (
                       <Popconfirm title={`删除 ${r.key}？`} onConfirm={() => remove.mutate(r.key)}>
                         <Button size="small" danger>删除</Button>
@@ -144,6 +198,136 @@ export default function Objects() {
         />
       </Card>
       <UploadPanel open={uploading} bucket={bucket} onClose={() => setUploading(false)} />
+      {inventoryOpen && <InventoryModal bucket={bucket} onClose={() => setInventoryOpen(false)} />}
+      {tagsKey && (
+        <TagsModal
+          bucket={bucket}
+          objectKey={tagsKey}
+          canWrite={canWrite}
+          onClose={() => setTagsKey(null)}
+        />
+      )}
     </>
+  )
+}
+
+/** 对象标签（链尾版本）：读需 Read、写/清需 Write；键唯一且非空，上限 10。 */
+function TagsModal({
+  bucket,
+  objectKey,
+  canWrite,
+  onClose,
+}: {
+  bucket: string
+  objectKey: string
+  canWrite: boolean
+  onClose: () => void
+}) {
+  const { message } = App.useApp()
+  const qc = useQueryClient()
+  // 未编辑时直接展示服务端值，避免 effect 回填
+  const [draft, setDraft] = useState<ObjectTag[] | null>(null)
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['object-tags', bucket, objectKey],
+    queryFn: () =>
+      api<{ tags: ObjectTag[] }>(
+        `/api/v1/buckets/${encodeURIComponent(bucket)}/tags/${encodeURIComponent(objectKey)}`,
+      ),
+  })
+
+  const rows = draft ?? data?.tags ?? []
+
+  const path = `/api/v1/buckets/${encodeURIComponent(bucket)}/tags/${encodeURIComponent(objectKey)}`
+  const invalidate = () => qc.invalidateQueries({ queryKey: ['object-tags', bucket, objectKey] })
+
+  const save = useMutation({
+    mutationFn: (tags: ObjectTag[]) => api(path, { method: 'PUT', body: JSON.stringify({ tags }) }),
+    onSuccess: () => {
+      message.success('标签已保存')
+      invalidate()
+      onClose()
+    },
+    onError: (e: Error) => message.error(e.message),
+  })
+
+  const clear = useMutation({
+    mutationFn: () => api(path, { method: 'DELETE' }),
+    onSuccess: () => {
+      message.success('标签已清空')
+      setDraft([])
+      invalidate()
+    },
+    onError: (e: Error) => message.error(e.message),
+  })
+
+  const submit = () => {
+    const tags = rows.filter((r) => r.key.trim() || r.value.trim())
+    if (tags.some((r) => !r.key.trim())) {
+      message.warning('标签键不能为空')
+      return
+    }
+    if (tags.length > 10) {
+      message.warning('每个对象最多 10 个标签')
+      return
+    }
+    save.mutate(tags.map((r) => ({ key: r.key.trim(), value: r.value })))
+  }
+
+  return (
+    <Modal
+      title={`对象标签 · ${objectKey}`}
+      open
+      width={640}
+      onCancel={onClose}
+      onOk={submit}
+      confirmLoading={save.isPending}
+      okText="保存"
+      okButtonProps={{ disabled: !canWrite }}
+      footer={(_, { OkBtn, CancelBtn }) => (
+        <>
+          <Button danger disabled={!canWrite || isLoading} onClick={() => clear.mutate()} style={{ float: 'left' }}>
+            清空全部
+          </Button>
+          <CancelBtn />
+          <OkBtn />
+        </>
+      )}
+    >
+      {!canWrite && (
+        <Tag color="orange" style={{ marginBottom: 12 }}>
+          当前账号对该桶没有写权限，只能查看
+        </Tag>
+      )}
+      {rows.map((r, i) => (
+        <Space key={i} align="baseline" style={{ display: 'flex', marginBottom: 8 }}>
+          <Input
+            value={r.key}
+            onChange={(e) => setDraft(rows.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))}
+            placeholder="键"
+            aria-label="标签键"
+            style={{ width: 220 }}
+          />
+          <Input
+            value={r.value}
+            onChange={(e) => setDraft(rows.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+            placeholder="值"
+            aria-label="标签值"
+            style={{ width: 260 }}
+          />
+          <Button size="small" disabled={!canWrite} onClick={() => setDraft(rows.filter((_, j) => j !== i))}>
+            移除
+          </Button>
+        </Space>
+      ))}
+      <Button
+        size="small"
+        disabled={!canWrite || isLoading || rows.length >= 10}
+        onClick={() => setDraft([...rows, { key: '', value: '' }])}
+      >
+        添加标签
+      </Button>
+      {isLoading && <div style={{ marginTop: 8, color: '#64748b' }}>加载中…</div>}
+    </Modal>
   )
 }

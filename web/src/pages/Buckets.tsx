@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { App, Button, Card, Input, Modal, Popconfirm, Space, Table, Tag, Typography } from 'antd'
+import { App, Button, Card, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type BucketInfo } from '../api'
+import { api, type BucketEncryption, type BucketInfo } from '../api'
+import InventoryModal from '../InventoryModal'
 import PageHeader from '../PageHeader'
 
 export default function Buckets() {
@@ -10,6 +11,8 @@ export default function Buckets() {
   const qc = useQueryClient()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  const [inventoryBucket, setInventoryBucket] = useState<string | null>(null)
+  const [encryptionBucket, setEncryptionBucket] = useState<string | null>(null)
 
   const { data: buckets = [], isLoading } = useQuery({
     queryKey: ['buckets'],
@@ -73,14 +76,20 @@ export default function Buckets() {
             },
             {
               title: '操作',
-              width: 120,
-              // 删除按钮按 can_delete 显隐（后端另有「桶主或管理员」403 兜底）
-              render: (_: unknown, b: BucketInfo) =>
-                b.can_delete && (
-                  <Popconfirm title={`删除桶 ${b.name}？（须为空桶）`} onConfirm={() => remove.mutate(b.name)}>
-                    <Button danger size="small">删除</Button>
-                  </Popconfirm>
-                ),
+              width: 250,
+              render: (_: unknown, b: BucketInfo) => (
+                <Space size={8}>
+                  {/* 清单/加密：owner 或 admin（后端判权；非 owner 点保存会看到 403 文案） */}
+                  <Button size="small" onClick={() => setInventoryBucket(b.name)}>清单</Button>
+                  <Button size="small" onClick={() => setEncryptionBucket(b.name)}>加密</Button>
+                  {/* 删除按钮按 can_delete 显隐（后端另有「桶主或管理员」403 兜底） */}
+                  {b.can_delete && (
+                    <Popconfirm title={`删除桶 ${b.name}？（须为空桶）`} onConfirm={() => remove.mutate(b.name)}>
+                      <Button danger size="small">删除</Button>
+                    </Popconfirm>
+                  )}
+                </Space>
+              ),
             },
           ]}
         />
@@ -103,6 +112,72 @@ export default function Buckets() {
           autoFocus
         />
       </Modal>
+      {inventoryBucket && (
+        <InventoryModal bucket={inventoryBucket} onClose={() => setInventoryBucket(null)} />
+      )}
+      {encryptionBucket && (
+        <EncryptionModal bucket={encryptionBucket} onClose={() => setEncryptionBucket(null)} />
+      )}
     </>
+  )
+}
+
+/** 桶默认加密：GET 读现状；AES256/aws:kms → PUT，none → DELETE（清除）。 */
+function EncryptionModal({ bucket, onClose }: { bucket: string; onClose: () => void }) {
+  const { message } = App.useApp()
+  const qc = useQueryClient()
+  // 未编辑时直接展示服务端值，避免 effect 回填
+  const [draft, setDraft] = useState<'AES256' | 'aws:kms' | 'none'>()
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['bucket-encryption', bucket],
+    queryFn: () =>
+      api<BucketEncryption>(`/api/v1/buckets/${encodeURIComponent(bucket)}/encryption`),
+  })
+
+  const algorithm =
+    draft ??
+    (data?.algorithm === 'AES256' || data?.algorithm === 'aws:kms' ? data.algorithm : 'none')
+
+  const save = useMutation({
+    mutationFn: () =>
+      algorithm === 'none'
+        ? api(`/api/v1/buckets/${encodeURIComponent(bucket)}/encryption`, { method: 'DELETE' })
+        : api(`/api/v1/buckets/${encodeURIComponent(bucket)}/encryption`, {
+            method: 'PUT',
+            body: JSON.stringify({ algorithm }),
+          }),
+    onSuccess: () => {
+      message.success(algorithm === 'none' ? '已清除默认加密' : '默认加密已保存')
+      qc.invalidateQueries({ queryKey: ['bucket-encryption', bucket] })
+      onClose()
+    },
+    onError: (e: Error) => message.error(e.message),
+  })
+
+  return (
+    <Modal
+      title={`默认加密 · ${bucket}`}
+      open
+      onCancel={onClose}
+      onOk={() => save.mutate()}
+      confirmLoading={save.isPending || isLoading}
+      okText="保存"
+    >
+      <Select
+        value={algorithm}
+        onChange={setDraft}
+        aria-label="默认加密算法"
+        style={{ width: '100%', marginBottom: 12 }}
+        options={[
+          { value: 'none', label: '不加密（清除配置）' },
+          { value: 'AES256', label: 'SSE-S3（AES256）' },
+          { value: 'aws:kms', label: 'SSE-KMS（aws:kms）' },
+        ]}
+      />
+      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        对桶内新写入对象生效（PUT / 分片 / Copy）。KMS 需在服务端配置 OSS_KMS_DIR。
+      </Typography.Text>
+    </Modal>
   )
 }
