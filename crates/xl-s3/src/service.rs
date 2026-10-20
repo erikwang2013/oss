@@ -788,6 +788,8 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let bucket = req.input.bucket;
         // M9：复制模式头（缺省 async）；sync 需能力开关就绪。
+        // S3（I3）：`sync_ready` 由 oss-server 注入为
+        // SYNC_READY && RAFT_READY && [raft] && !stretch（xl-s3 不反依赖该常量）。
         let replication_mode = match req.headers.get("x-oss-replication-mode") {
             None => "async",
             Some(v) => match v.to_str().unwrap_or("").trim() {

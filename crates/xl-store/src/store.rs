@@ -792,6 +792,62 @@ impl Store {
         Ok(())
     }
 
+    /// M9 S3：sync 桶物理删除——逐盘把桶目录原子 rename 到
+    /// `.oss.sys/trash/<bucket>/<uuid>`，成功后 best-effort 清理；rename 后桶即刻不可见，
+    /// 残留 tombstone 由下次删除/重试清掉。桶已不存在 = 幂等成功（不重建目录）。
+    /// 仅 sync 流程使用；M7 async 保持 [`Self::delete_bucket`] 语义。
+    pub async fn delete_bucket_sync(&self, bucket: &str) -> Result<()> {
+        layout::validate_bucket(bucket)?;
+        let _bguard = self.lock_bucket_owned(bucket).await;
+        if !self.bucket_exists(bucket).await? {
+            return Ok(());
+        }
+        for drive in &self.cfg.drives {
+            if !drives::drive_up(drive).await {
+                return Err(Error::QuorumUnmet(format!(
+                    "盘 {} 不在册，删桶中止（防插回复活）",
+                    drive.display()
+                )));
+            }
+        }
+        if !self.bucket_is_empty(bucket).await? {
+            return Err(Error::BucketNotEmpty(bucket.to_string()));
+        }
+        if let Some(cl) = self.cfg.cluster.as_deref() {
+            let self_id = cl.sets.flat.self_node().id.clone();
+            for n in &cl.sets.flat.nodes {
+                if n.id == self_id {
+                    continue;
+                }
+                cl.transport.delete_bucket_dir(&n.id, bucket).await?;
+            }
+        }
+        let gen_id = uuid::Uuid::new_v4().to_string();
+        let mut tombstones = Vec::new();
+        for drive in &self.cfg.drives {
+            let src = layout::bucket_dir(drive, bucket);
+            if !tokio::fs::try_exists(&src).await? {
+                continue;
+            }
+            let trash = layout::sys_dir(drive, "trash").join(bucket);
+            // 上一代残留先清（失败留待下次）；同桶锁内无并发删桶。
+            let _ = tokio::fs::remove_dir_all(&trash).await;
+            tokio::fs::create_dir_all(&trash).await?;
+            let dst = trash.join(&gen_id);
+            match tokio::fs::rename(&src, &dst).await {
+                Ok(()) => tombstones.push(dst),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for dst in tombstones {
+            if let Err(e) = tokio::fs::remove_dir_all(&dst).await {
+                tracing::warn!(path = %dst.display(), error = %e, "sync 桶 tombstone 清理失败（留待重试）");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         // 评审 R3：各盘取并集（drive0 掉线不得让列举静默变空）；创建时间取首个见到该桶的盘。
         let mut out: Vec<BucketInfo> = Vec::new();

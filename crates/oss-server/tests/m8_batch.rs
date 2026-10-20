@@ -1292,3 +1292,27 @@ async fn http_create_then_cancel() {
         1
     );
 }
+
+/// M9 S3 m5：Batch Delete 对 sync 桶走共享 sink；站点未配对（sink 不可用）→ 任务失败，
+/// 本地对象原样（不得绕过 sink 直连 store 删除）。
+#[tokio::test]
+async fn batch_delete_on_sync_bucket_refuses_without_remote() {
+    let f = fx().await;
+    f.put("src", "sync-del", b"keep").await;
+    sqlx::query(
+        "UPDATE buckets SET replication_mode = 'sync', versioning = 'Enabled' WHERE name = 'src'",
+    )
+    .execute(f.db().pool())
+    .await
+    .unwrap();
+    let d = payload("src", "sync-del", f.admin);
+    let err = f.run(BATCH_DELETE, &d).await.unwrap_err();
+    assert!(
+        err.contains("not configured"),
+        "必须由共享 sink 拒绝：{err}"
+    );
+    assert!(
+        f.store().head_object("src", "sync-del").await.is_ok(),
+        "sync 删失败时本地对象必须原样"
+    );
+}
