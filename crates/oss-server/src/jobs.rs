@@ -296,24 +296,37 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
         .await
         .map(|s| s == "Enabled")
         .unwrap_or(false);
-    let written = store
-        .put_object_stream_with_meta(
-            bucket,
-            &key,
-            Box::pin(futures::stream::once(async move {
-                Ok(bytes::Bytes::from(bytes))
-            })),
-            Some("text/csv".to_string()),
-            std::collections::BTreeMap::new(),
-            None,
-            versioned,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| format!("报告写入失败: {e}"));
+    let written: Result<(), String> = async {
+        // I5：报告对象同样套报告桶默认加密（与 S3 写入路径同口径；坏记录 fail-closed）。
+        let encryption = match db.get_bucket_default_encryption(bucket).await {
+            Ok(Some(v)) => Some(
+                xl_s3::sse::enc_spec_from_default(&v)
+                    .ok_or_else(|| format!("报告桶默认加密记录非法: {v}"))?,
+            ),
+            Ok(None) => None,
+            Err(e) => return Err(format!("读取报告桶默认加密失败: {e}")),
+        };
+        store
+            .put_object_stream_with_meta(
+                bucket,
+                &key,
+                Box::pin(futures::stream::once(async move {
+                    Ok(bytes::Bytes::from(bytes))
+                })),
+                Some("text/csv".to_string()),
+                std::collections::BTreeMap::new(),
+                None,
+                versioned,
+                encryption,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("报告写入失败: {e}"))
+    }
+    .await;
     if let Err(msg) = written {
         tracing::warn!(job_id, error = %msg, "job 报告写入失败");
         let _ = db.job_set_error(job_id, &msg, crate::db::now()).await;

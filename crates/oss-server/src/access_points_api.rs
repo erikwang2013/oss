@@ -158,6 +158,18 @@ async fn create(
         .await
     {
         Ok(()) => {
+            state
+                .audit(
+                    uid,
+                    "control:ap-create",
+                    Some(&body.bucket),
+                    Some(&body.name),
+                    Some(&format!(
+                        "policy={}",
+                        if policy_json.is_some() { "set" } else { "none" }
+                    )),
+                )
+                .await;
             if let Ok(ap) = AccessPoint::from_row(
                 body.name.clone(),
                 body.bucket.clone(),
@@ -188,7 +200,7 @@ async fn owned(
     state: &AppState,
     payload: &JwtPayload,
     name: &str,
-) -> Result<crate::db::AccessPointRow, Response> {
+) -> Result<(crate::db::AccessPointRow, i64), Response> {
     let (uid, admin) = who(state, payload).await?;
     let Some(row) = (match state.db.get_access_point(name).await {
         Ok(v) => v,
@@ -207,7 +219,7 @@ async fn owned(
     if !admin && !is_owner {
         return Err((StatusCode::FORBIDDEN, "需要桶主或管理员").into_response());
     }
-    Ok(row)
+    Ok((row, uid))
 }
 
 async fn get_one(
@@ -216,7 +228,7 @@ async fn get_one(
     Path(name): Path<String>,
 ) -> Response {
     match owned(&state, &payload, &name).await {
-        Ok(row) => Json(row_json(&row)).into_response(),
+        Ok((row, _)) => Json(row_json(&row)).into_response(),
         Err(r) => r,
     }
 }
@@ -226,13 +238,23 @@ async fn delete_one(
     Extension(payload): Extension<JwtPayload>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = owned(&state, &payload, &name).await {
-        return r;
-    }
+    let (row, uid) = match owned(&state, &payload, &name).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     match state.db.delete_access_point(&name).await {
         Ok(true) => {
             state.ap_cache.remove(&name);
             state.olap_cache.remove(&name);
+            state
+                .audit(
+                    uid,
+                    "control:ap-delete",
+                    Some(&row.bucket),
+                    Some(&row.name),
+                    None,
+                )
+                .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, "AP 不存在").into_response(),
@@ -249,7 +271,7 @@ async fn put_policy(
     Path(name): Path<String>,
     Json(policy): Json<serde_json::Value>,
 ) -> Response {
-    let row = match owned(&state, &payload, &name).await {
+    let (row, uid) = match owned(&state, &payload, &name).await {
         Ok(r) => r,
         Err(r) => return r,
     };
@@ -274,6 +296,19 @@ async fn put_policy(
         .await
     {
         Ok(true) => {
+            state
+                .audit(
+                    uid,
+                    "control:ap-policy",
+                    Some(&row.bucket),
+                    Some(&row.name),
+                    Some(if policy_json.is_some() {
+                        "policy=set"
+                    } else {
+                        "policy=clear"
+                    }),
+                )
+                .await;
             if let Ok(ap) = AccessPoint::from_row(
                 row.name,
                 row.bucket,
@@ -337,7 +372,7 @@ async fn put_transform(
     Path(name): Path<String>,
     Json(body): Json<PutTransform>,
 ) -> Response {
-    let row = match owned(&state, &payload, &name).await {
+    let (row, uid) = match owned(&state, &payload, &name).await {
         Ok(r) => r,
         Err(r) => return r,
     };
@@ -394,6 +429,15 @@ async fn put_transform(
         .await
     {
         Ok(()) => {
+            state
+                .audit(
+                    uid,
+                    "control:ap-transform",
+                    Some(&row.bucket),
+                    Some(&row.name),
+                    Some(&format!("kind={}", body.kind)),
+                )
+                .await;
             state.olap_cache.put(&name, &row.bucket, transform);
             StatusCode::NO_CONTENT.into_response()
         }

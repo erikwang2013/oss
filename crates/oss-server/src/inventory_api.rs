@@ -219,11 +219,22 @@ async fn run_now(
     let now = crate::db::now();
     let run_key = format!("manual-{now}");
     match crate::inventory::enqueue_run(&state.db, &bucket, &id, &run_key, Some(uid), now).await {
-        Ok(Some(job_id)) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({"run_key": run_key, "job_id": job_id})),
-        )
-            .into_response(),
+        Ok(Some(job_id)) => {
+            state
+                .audit(
+                    uid,
+                    "control:inventory-run",
+                    Some(&bucket),
+                    Some(&id),
+                    Some(&format!("run_key={run_key};job={job_id}")),
+                )
+                .await;
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"run_key": run_key, "job_id": job_id})),
+            )
+                .into_response()
+        }
         Ok(None) => (StatusCode::CONFLICT, "run already queued").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "inventory force-run 入队失败");

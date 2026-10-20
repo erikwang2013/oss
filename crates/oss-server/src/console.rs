@@ -438,12 +438,12 @@ fn default_task_limit() -> i64 {
     50
 }
 
-/// 作业读权限：admin，或该作业的 `requested_by`。
+/// 作业读权限：admin，或该作业的 `requested_by`。返回 uid（控制面审计用）。
 #[allow(clippy::result_large_err)]
-async fn job_access(state: &AppState, payload: &JwtPayload, id: i64) -> Result<(), Response> {
+async fn job_access(state: &AppState, payload: &JwtPayload, id: i64) -> Result<i64, Response> {
     let (uid, is_admin) = who(state, payload).await?;
     match state.db.job_owner(id).await {
-        Ok(Some((owner, _))) if is_admin || owner == Some(uid) => Ok(()),
+        Ok(Some((owner, _))) if is_admin || owner == Some(uid) => Ok(uid),
         Ok(Some(_)) => Err(forbidden("需要作业所有者或管理员")),
         Ok(None) => Err((StatusCode::NOT_FOUND, "作业不存在").into_response()),
         Err(e) => {
@@ -489,16 +489,28 @@ async fn job_action(
     Extension(payload): Extension<JwtPayload>,
     Path((id, action)): Path<(i64, String)>,
 ) -> Response {
-    if let Err(r) = job_access(&state, &payload, id).await {
-        return r;
-    }
+    let uid = match job_access(&state, &payload, id).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if action == "retry-failed" {
         return match state.db.job_retry_failed(id, now).await {
-            Ok(Some(new_id)) => Json(serde_json::json!({"job_id": new_id})).into_response(),
+            Ok(Some(new_id)) => {
+                state
+                    .audit(
+                        uid,
+                        "control:job-retry",
+                        None,
+                        None,
+                        Some(&format!("job={id};child={new_id}")),
+                    )
+                    .await;
+                Json(serde_json::json!({"job_id": new_id})).into_response()
+            }
             Ok(None) => (StatusCode::CONFLICT, "没有可重试的失败任务").into_response(),
             Err(e) => {
                 tracing::error!(error = %e, "重试失败任务出错");
@@ -511,6 +523,15 @@ async fn job_action(
     }
     match state.db.job_set_state(id, &action, now).await {
         Ok(true) => {
+            state
+                .audit(
+                    uid,
+                    &format!("control:job-{action}"),
+                    None,
+                    None,
+                    Some(&format!("job={id}")),
+                )
+                .await;
             // 取消后立即落一次报告（未执行任务被 started_at 过滤；后续运行中任务收尾会重写）。
             if action == "cancel" {
                 crate::jobs::write_report_now(&state.db, &state.store, id).await;
@@ -1568,13 +1589,25 @@ async fn force_tier_sweep(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
 ) -> Response {
-    if let Err(r) = admin_of(&state, &payload).await {
-        return r;
-    }
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
     match crate::tier_jobs::sweep_transitions(&state.db, &state.store, state.lifecycle.as_ref())
         .await
     {
-        Ok(queued) => Json(serde_json::json!({ "queued": queued })).into_response(),
+        Ok(queued) => {
+            state
+                .audit(
+                    uid,
+                    "control:tier-sweep",
+                    None,
+                    None,
+                    Some(&format!("queued={queued}")),
+                )
+                .await;
+            Json(serde_json::json!({ "queued": queued })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "强制 tier sweep 失败");
             internal_error()

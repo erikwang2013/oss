@@ -498,6 +498,24 @@ impl AppState {
         xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
     }
 
+    /// M8 S6：控制面写操作审计（best-effort——落行失败只 warn，绝不改变动作结果）。
+    pub(crate) async fn audit(
+        &self,
+        uid: i64,
+        op: &str,
+        bucket: Option<&str>,
+        key: Option<&str>,
+        detail: Option<&str>,
+    ) {
+        if let Err(e) = self
+            .acl()
+            .write_audit(uid, op, bucket, key, "allow", detail)
+            .await
+        {
+            tracing::warn!(error = %e, op, "控制面审计落行失败");
+        }
+    }
+
     pub async fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
         let db = Arc::new(db);
         let ap_cache = Arc::new(xl_s3::ap::ApCache::new());

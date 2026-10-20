@@ -794,8 +794,9 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
 - 支持：Get/Head/Put/DeleteObject、ListObjectsV2、ListObjectVersions、MPU
   Create/Complete/Abort/UploadPart、CopyObject、Get/Put/DeleteObjectTagging、
-  Get/PutBucketVersioning、HeadBucket、RestoreObject、桶生命周期配置、桶默认加密、
-  Inventory 配置；`UploadPartCopy`/`DeleteObjects` 等 501。
+  Get/PutBucketVersioning、HeadBucket、RestoreObject；`UploadPartCopy`/`DeleteObjects`
+  等 501。桶生命周期配置、桶默认加密、Inventory 配置是控制面 / S3 桶级操作，
+  **不经 AP**（`/ap/...` 上无对应形状，调用 501）。
 - 边界：不做匿名/跨账号/VPC 来源限制/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
   checksum 不转发 trailing headers。
 

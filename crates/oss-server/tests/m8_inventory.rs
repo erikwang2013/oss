@@ -689,6 +689,18 @@ async fn force_run_and_disabled_config() {
         run_row(&st, "src", "c1", &run_key).await.job_id
     );
     assert_eq!(run_row(&st, "src", "c1", &run_key).await.started_at, 0);
+    // I3：force-run 留控制面审计（uid/op/目标/detail）
+    let (actor, decision, detail): (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT uid, decision, detail FROM audit_log WHERE op = 'control:inventory-run' AND bucket = 'src' AND object_key = 'c1'",
+    )
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!((actor, decision.as_str()), (uid, "allow"));
+    assert!(
+        detail.unwrap().contains(&format!("run_key={run_key};job=")),
+        "detail 应记录 run_key 与 job"
+    );
 
     // 不存在的配置 → 404
     assert_eq!(
@@ -1053,6 +1065,121 @@ async fn destination_revoked_marks_job_error() {
             .objects
             .is_empty()
     );
+}
+
+/// I4：目标桶策略显式 Deny PutObject 压过所有者/管理员表权限——配置期拒绝、运行期报错且无输出。
+#[tokio::test]
+async fn destination_bucket_policy_deny_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let deny = serde_json::json!({"Version":"2012-10-17","Statement":[{
+        "Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:PutObject",
+        "Resource":"arn:aws:s3:::dst/*"}]})
+    .to_string();
+    st.db.set_bucket_policy("dst", &deny, 0).await.unwrap();
+
+    let err = put(&st, uid, "src", &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, InventoryError::AccessDenied(ref m) if m.contains("PutObject")),
+        "配置期必须被桶策略 Deny 拦住：err={err:?}"
+    );
+
+    // 显式 Allow（所有者/管理员路径）→ 配置成功
+    let allow = serde_json::json!({"Version":"2012-10-17","Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject",
+        "Resource":"arn:aws:s3:::dst/*"}]})
+    .to_string();
+    st.db.set_bucket_policy("dst", &allow, 0).await.unwrap();
+    put(&st, uid, "src", &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap();
+
+    // 配置后目标桶收紧为 Deny：运行期复核失败，job/run 报错且无输出
+    st.db.set_bucket_policy("dst", &deny, 0).await.unwrap();
+    let key = "manual-deny";
+    let job = enqueue_run(&st.db, "src", "c1", key, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let run = run_row(&st, "src", "c1", key).await;
+    assert_eq!(run.state, "error");
+    assert_eq!(run.manifest_key, None);
+    assert!(
+        run.error.as_deref().unwrap_or("").contains("PutObject"),
+        "error={:?}",
+        run.error
+    );
+    let job_row = st.db.job_get(job).await.unwrap().unwrap();
+    assert_eq!(job_row["state"], "error");
+    assert!(
+        st.store
+            .list_objects("dst", &Default::default())
+            .await
+            .unwrap()
+            .objects
+            .is_empty(),
+        "Deny 后不得写出任何目标对象"
+    );
+}
+
+/// I5：Inventory 数据文件与 manifest 必须套目标桶默认加密（AES256 → SSE-S3）。
+#[tokio::test]
+async fn outputs_apply_destination_default_encryption() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    st.store
+        .init_encryption(Some(dir.path().join("master.key")), None)
+        .await
+        .unwrap();
+    st.db
+        .set_bucket_default_encryption("dst", "AES256")
+        .await
+        .unwrap();
+    st.store
+        .put_object("src", "a.txt", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    put(&st, uid, "src", &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap();
+
+    let key = "manual-enc";
+    enqueue_run(&st.db, "src", "c1", key, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+
+    let run = run_row(&st, "src", "c1", key).await;
+    assert_eq!(run.state, "done", "error: {:?}", run.error);
+    let mkey = run.manifest_key.expect("manifest_key");
+    let rec = st
+        .store
+        .head_object("dst", &mkey)
+        .await
+        .unwrap()
+        .encryption
+        .expect("manifest 应套用桶默认加密");
+    assert_eq!(rec.key_id, "file", "AES256 → SSE-S3（file provider）");
+
+    let (manifest, data) = output(&st, "dst", "src", "c1", key).await;
+    assert!(!data.is_empty());
+    let dkey = manifest["files"][0]["key"].as_str().unwrap();
+    let rec = st
+        .store
+        .head_object("dst", dkey)
+        .await
+        .unwrap()
+        .encryption
+        .expect("数据文件应套用桶默认加密");
+    assert_eq!(rec.key_id, "file", "AES256 → SSE-S3（file provider）");
 }
 
 // ---------- console 测试脚手架 ----------

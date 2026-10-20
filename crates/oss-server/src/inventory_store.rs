@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use s3s::dto::InventoryConfiguration;
-use xl_s3::access::{Acl, Action, AuthedUser};
+use xl_s3::access::{Acl, AuthedUser};
 use xl_s3::inventory::{InventoryError, InventoryStore, validate_config};
 
 use crate::db::Db;
@@ -56,11 +56,30 @@ impl InventoryStore for SqlInventoryStore {
             }
             Err(e) => return Err(InventoryError::Internal(e.to_string())),
         }
-        match self.acl.can(owner.clone(), Action::Write, dest).await {
-            Ok(true) => {}
-            Ok(false) => {
+        // I4：走正典 check_op（表三档 × 桶策略，显式 Deny 优先——admin/owner 也受 Deny 约束）。
+        // 配置期没有 run_key，用同形状代表键（真实 data/manifest 键在运行期复核）。
+        let prefix = cfg
+            .destination
+            .s3_bucket_destination
+            .prefix
+            .as_deref()
+            .unwrap_or("")
+            .trim_matches('/');
+        let probe = if prefix.is_empty() {
+            format!("{bucket}/{}/probe/manifest.json", cfg.id)
+        } else {
+            format!("{prefix}/{bucket}/{}/probe/manifest.json", cfg.id)
+        };
+        match self
+            .acl
+            .check_op(owner, "", "PutObject", Some(dest), Some(&probe), None)
+            .await
+        {
+            Ok((true, _)) => {}
+            Ok((false, detail)) => {
+                let suffix = detail.map(|d| format!("（{d}）")).unwrap_or_default();
                 return Err(InventoryError::AccessDenied(format!(
-                    "配置所有者没有目标桶 {dest} 的 PutObject 权限"
+                    "配置所有者没有目标桶 {dest} 的 PutObject 权限{suffix}"
                 )));
             }
             Err(e) => return Err(InventoryError::Internal(e.to_string())),

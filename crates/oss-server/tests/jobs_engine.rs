@@ -49,6 +49,7 @@ async fn setup() -> (Db, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
             .unwrap(),
     );
     store.create_bucket("reports").await.unwrap();
+    db.insert_bucket("reports", None).await.unwrap();
     (db, store, db_dir, store_dir)
 }
 
@@ -227,4 +228,37 @@ async fn worker_tightens_deadline_by_action() {
             .await
             .unwrap();
     assert_eq!(deadline, 5600, "tier 动作按 tier_timeout_secs");
+}
+
+/// I5：报告对象必须套报告桶默认加密（AES256 → SSE-S3），且可解密读回。
+#[tokio::test]
+async fn report_applies_bucket_default_encryption() {
+    let (db, store, _d1, store_dir) = setup().await;
+    store
+        .init_encryption(Some(store_dir.path().join("master.key")), None)
+        .await
+        .unwrap();
+    db.set_bucket_default_encryption("reports", "AES256")
+        .await
+        .unwrap();
+    let id = db
+        .create_job(&spec(vec!["Copy"], true), 1000)
+        .await
+        .unwrap();
+    assert!(
+        worker_once(&db, &store, &OkExec, env(3, 30), 1000)
+            .await
+            .unwrap()
+    );
+
+    let key = format!("out/{id}/results.csv");
+    let info = store.head_object("reports", &key).await.unwrap();
+    let rec = info.encryption.expect("报告应套用桶默认加密");
+    assert_eq!(rec.key_id, "file", "AES256 → SSE-S3（file provider）");
+    let (_, body) = store.get_object("reports", &key).await.unwrap();
+    assert!(
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("Copy-ok")
+    );
 }

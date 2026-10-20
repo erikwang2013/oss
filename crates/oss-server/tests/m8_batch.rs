@@ -23,18 +23,28 @@ use xl_store::crypto::{EncSpec, SseCKey};
 use xl_store::meta::{ObjectTag, TierPhase};
 use xl_store::store::{ArchiveSpec, Store, TierRef};
 
+#[derive(Debug, PartialEq)]
+struct ReplWrite {
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    is_delete_marker: bool,
+}
+
 #[derive(Default)]
 struct FakeRepl {
-    writes: Mutex<Vec<(String, String)>>,
+    writes: Mutex<Vec<ReplWrite>>,
 }
 
 #[async_trait::async_trait]
 impl ReplicationSink for FakeRepl {
     async fn on_write(&self, info: WriteInfo<'_>) {
-        self.writes
-            .lock()
-            .unwrap()
-            .push((info.bucket.to_string(), info.key.to_string()));
+        self.writes.lock().unwrap().push(ReplWrite {
+            bucket: info.bucket.to_string(),
+            key: info.key.to_string(),
+            version_id: info.version_id.map(str::to_string),
+            is_delete_marker: info.is_delete_marker,
+        });
     }
 }
 
@@ -294,6 +304,31 @@ async fn batch_1000_replace_tags_failure_retry_and_report() {
     r.report_prefix = Some("out".into());
     let created = create_batch(&f.st, f.admin, true, r).await.unwrap();
     assert_eq!(created.total, 1001);
+    // I3：Batch 创建落控制面审计（allow；目标是清单对象）
+    let (op, bucket, key, decision, detail): (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT op, bucket, object_key, decision, detail FROM audit_log \
+         WHERE op='control:job-create'",
+    )
+    .fetch_one(f.db().pool())
+    .await
+    .unwrap();
+    assert_eq!(op, "control:job-create");
+    assert_eq!(bucket.as_deref(), Some("src"));
+    assert_eq!(key.as_deref(), Some("manifest.csv"));
+    assert_eq!(decision, "allow");
+    assert!(
+        detail
+            .as_deref()
+            .unwrap_or("")
+            .contains(&format!("job={}", created.job_id)),
+        "detail={detail:?}"
+    );
     // 快照：改清单不影响已建任务
     f.put("src", "manifest.csv", b"src,only\r\n").await;
     assert_eq!(
@@ -425,10 +460,15 @@ async fn five_actions_and_hooks() {
             value: "v".into()
         }]
     );
-    assert_eq!(
-        f.repl.writes.lock().unwrap().as_slice(),
-        &[("dst".to_string(), "copies/a".to_string())]
-    );
+    {
+        let writes = f.repl.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            (writes[0].bucket.as_str(), writes[0].key.as_str()),
+            ("dst", "copies/a")
+        );
+        assert!(!writes[0].is_delete_marker);
+    }
     // 重复执行幂等（覆盖同一目标键）
     assert_eq!(f.run(BATCH_COPY, &cp).await.unwrap(), "Succeeded");
     assert_eq!(
@@ -633,6 +673,62 @@ async fn five_actions_and_hooks() {
     let mut iv = payload("src", "invoke", f.admin);
     iv.transform_access_point = Some("ap-fail".into());
     assert!(f.run(BATCH_INVOKE, &iv).await.is_err(), "500 必须失败");
+}
+
+/// I1：Batch Delete 产生 delete marker 时必须入复制队列（与在线 delete_object 同语义）；
+/// 指定版本删除不入队。
+#[tokio::test]
+async fn delete_marker_is_enqueued_for_replication() {
+    let f = fx().await;
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'src'")
+        .execute(f.db().pool())
+        .await
+        .unwrap();
+
+    // 无版本删除 → marker 入队（is_delete_marker=true，带 marker 版本号）
+    f.put("src", "marker", b"x").await;
+    let d = payload("src", "marker", f.admin);
+    assert_eq!(f.run(BATCH_DELETE, &d).await.unwrap(), "Succeeded");
+    {
+        let writes = f.repl.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "marker 必须入复制队列");
+        assert_eq!(
+            (writes[0].bucket.as_str(), writes[0].key.as_str()),
+            ("src", "marker")
+        );
+        assert!(writes[0].is_delete_marker);
+        assert!(writes[0].version_id.is_some(), "marker 版本号必须带上");
+    }
+
+    // 指定版本删除 → 与在线路径一致：不入队
+    f.put("src", "ver", b"y").await;
+    let vid = f
+        .store()
+        .head_object("src", "ver")
+        .await
+        .unwrap()
+        .version_id;
+    let mut vd = payload("src", "ver", f.admin);
+    vd.version_id = Some(vid.unwrap_or_else(|| "null".into()));
+    assert_eq!(f.run(BATCH_DELETE, &vd).await.unwrap(), "Succeeded");
+    assert_eq!(f.repl.writes.lock().unwrap().len(), 1, "指定版本删除不入队");
+}
+
+/// I3：控制面审计失败只 warn，不改变动作结果。
+#[tokio::test]
+async fn audit_failure_does_not_block_batch_create() {
+    let f = fx().await;
+    f.put("src", "m.csv", b"src,a\n").await;
+    sqlx::query("DROP TABLE audit_log")
+        .execute(f.db().pool())
+        .await
+        .unwrap();
+    let mut r = req("ReplaceTags", "m.csv");
+    r.tags = tags(&[("k", "v")]);
+    let created = create_batch(&f.st, f.admin, true, r)
+        .await
+        .expect("审计失败不得阻断建作业");
+    assert_eq!(created.total, 1);
 }
 
 /// M8 缺口 C：Batch Copy 必须套目标桶默认加密——HEAD 可见 SSE-S3 记录且可解密读回。

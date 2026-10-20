@@ -347,8 +347,26 @@ impl BatchExecutor {
             .map_err(|e| e.to_string())?;
         let refs = match outcome {
             DeleteOutcome::Version { tier: Some(t), .. } => vec![t],
+            DeleteOutcome::Version { tier: None, .. } => Vec::new(),
             DeleteOutcome::Object { tiers } => tiers,
-            _ => Vec::new(),
+            // I1：与在线 delete_object 同语义——仅缺省删（产生 marker）入复制队列；
+            // 指定版本删除不入队（DeleteMarkerReplication 管的是 marker）。
+            DeleteOutcome::Marker { version_id } => {
+                self.hooks
+                    .repl
+                    .on_write(WriteInfo {
+                        bucket: &p.bucket,
+                        key: &p.key,
+                        version_id: Some(&version_id),
+                        etag: "",
+                        size: 0,
+                        is_delete_marker: true,
+                        is_replica: false,
+                    })
+                    .await;
+                Vec::new()
+            }
+            DeleteOutcome::NotFound => Vec::new(),
         };
         if !refs.is_empty()
             && let Err(e) = self.hooks.tier_gc.delete(&refs).await

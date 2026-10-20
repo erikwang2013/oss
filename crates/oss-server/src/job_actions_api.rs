@@ -381,6 +381,15 @@ pub async fn create_batch(
         .create_job(&spec, crate::db::now())
         .await
         .map_err(|e| BatchError::Internal(e.to_string()))?;
+    state
+        .audit(
+            uid,
+            "control:job-create",
+            Some(&req.manifest_bucket),
+            Some(&req.manifest_key),
+            Some(&format!("job={job_id};tasks={total}")),
+        )
+        .await;
     Ok(BatchCreated { job_id, total })
 }
 

@@ -2038,3 +2038,30 @@ async fn object_list_includes_storage_and_tier_fields() {
     assert_eq!(cold["tier_phase"], "Archived");
     assert_eq!(cold["restore_expires_at"], serde_json::Value::Null);
 }
+
+/// I3：admin 强制 tier sweep 留控制面审计（uid/op/detail）。
+#[tokio::test]
+async fn tier_force_sweep_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    let uid = st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/tiers/sweep"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["queued"], 0);
+    let (actor, decision, detail): (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT uid, decision, detail FROM audit_log WHERE op = 'control:tier-sweep'",
+    )
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!((actor, decision.as_str()), (uid, "allow"));
+    assert_eq!(detail.as_deref(), Some("queued=0"));
+}

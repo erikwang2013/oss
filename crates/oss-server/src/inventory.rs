@@ -14,8 +14,9 @@ use flate2::write::GzEncoder;
 use futures::StreamExt as _;
 use md5::{Digest as _, Md5};
 use s3s::dto::InventoryConfiguration;
-use xl_s3::access::{Acl, Action, AuthedUser};
+use xl_s3::access::{Acl, AuthedUser};
 use xl_s3::inventory::{csv_columns, filter_prefix, includes_all_versions};
+use xl_s3::sse::enc_spec_from_default;
 use xl_store::meta::{ChecksumRecord, EncryptionRecord, ObjectLockRecord};
 use xl_store::store::{ByteStream, ListRequest, ObjectInfo, Store};
 
@@ -263,23 +264,6 @@ impl InventoryRunner {
             is_admin,
             ak: String::new(),
         };
-        match self.acl.can(owner, Action::Write, &dest).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let msg = format!("配置所有者没有目标桶 {dest} 的 PutObject 权限");
-                return Err(self.fail(run.id, run.job_id, msg).await);
-            }
-            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
-        }
-        if !self
-            .db
-            .bucket_exists(&dest)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            let msg = format!("目标桶不存在：{dest}");
-            return Err(self.fail(run.id, run.job_id, msg).await);
-        }
         let base = join_key(&[
             cfg.destination
                 .s3_bucket_destination
@@ -292,6 +276,31 @@ impl InventoryRunner {
         ]);
         let data_key = format!("{base}/data/{}.csv.gz", uuid::Uuid::new_v4());
         let manifest_key = format!("{base}/manifest.json");
+        // I4：运行期以**实际键**复核 PutObject（融合桶策略，显式 Deny 优先）。
+        for key in [&data_key, &manifest_key] {
+            match self
+                .acl
+                .check_op(&owner, "", "PutObject", Some(&dest), Some(key), None)
+                .await
+            {
+                Ok((true, _)) => {}
+                Ok((false, detail)) => {
+                    let suffix = detail.map(|d| format!("（{d}）")).unwrap_or_default();
+                    let msg = format!("配置所有者没有目标桶 {dest} 的 PutObject 权限{suffix}");
+                    return Err(self.fail(run.id, run.job_id, msg).await);
+                }
+                Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+            }
+        }
+        if !self
+            .db
+            .bucket_exists(&dest)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            let msg = format!("目标桶不存在：{dest}");
+            return Err(self.fail(run.id, run.job_id, msg).await);
+        }
         let tmp = self.staging_dir.join(format!(
             "inventory-{}-{}.tmp",
             p.config_id,
@@ -399,6 +408,19 @@ impl InventoryRunner {
             .await
             .map_err(|e| e.to_string())?
             == "Enabled";
+        // I5：目标桶默认加密同样覆盖服务端生成对象（与 S3 写入路径同口径；坏记录 fail-closed）。
+        let encryption = match self
+            .acl
+            .bucket_default_encryption(dest)
+            .await
+            .map_err(|e| e.to_string())?
+            .as_deref()
+        {
+            Some(v) => Some(
+                enc_spec_from_default(v).ok_or_else(|| format!("目标桶默认加密记录非法: {v}"))?,
+            ),
+            None => None,
+        };
         let f = tokio::fs::File::open(tmp)
             .await
             .map_err(|e| format!("打开 staging 文件失败：{e}"))?;
@@ -414,7 +436,7 @@ impl InventoryRunner {
                 BTreeMap::new(),
                 None,
                 versioned,
-                None,
+                encryption.clone(),
                 None,
                 None,
                 None,
@@ -431,12 +453,20 @@ impl InventoryRunner {
             "files": [{"key": data_key, "size": gz_size, "md5Checksum": md5}],
         });
         let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+        // manifest 改走 stream+meta 入口以携带与 data 文件相同的默认加密。
         self.store
-            .put_object(
+            .put_object_stream_with_meta(
                 dest,
                 manifest_key,
-                Bytes::from(bytes),
+                Box::pin(futures::stream::once(async move { Ok(Bytes::from(bytes)) })),
                 Some("application/json".to_string()),
+                BTreeMap::new(),
+                None,
+                versioned,
+                encryption,
+                None,
+                None,
+                None,
             )
             .await
             .map_err(|e| format!("manifest 写入目标桶失败：{e}"))?;

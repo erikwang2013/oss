@@ -22,6 +22,8 @@ use s3s_sigv4::{
 use sha2::{Digest, Sha256};
 use xl_s3::ap::AccessPoint;
 use xl_s3::replication::ReplicationStore as _;
+use xl_store::meta::TierPhase;
+use xl_store::store::ArchiveSpec;
 
 const REGION: &str = "us-east-1";
 
@@ -388,6 +390,14 @@ async fn console_crud_permissions_and_cache() {
         201
     );
     assert!(e.st.ap_cache.get("owner-ap").is_some(), "创建后缓存未同步");
+    let (uid, decision, detail): (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT uid, decision, detail FROM audit_log WHERE op = 'control:ap-create' AND object_key = 'owner-ap'",
+    )
+    .fetch_one(e.st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!((uid, decision.as_str()), (owner_id, "allow"));
+    assert_eq!(detail.as_deref(), Some("policy=none"));
     // 重名 409 / 非法名 400 / 桶不存在 404 / 坏策略 400
     assert_eq!(
         create(
@@ -520,6 +530,13 @@ async fn console_crud_permissions_and_cache() {
             .status(),
         204
     );
+    let detail: Option<String> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE op = 'control:ap-policy' AND object_key = 'owner-ap'",
+    )
+    .fetch_one(e.st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detail.as_deref(), Some("policy=set"));
     assert_eq!(
         send_status(
             &e,
@@ -585,6 +602,32 @@ async fn console_crud_permissions_and_cache() {
         )
         .await,
         404
+    );
+    let (decision, bucket): (String, Option<String>) = sqlx::query_as(
+        "SELECT decision, bucket FROM audit_log WHERE op = 'control:ap-delete' AND object_key = 'owner-ap'",
+    )
+    .fetch_one(e.st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (decision.as_str(), bucket.as_deref()),
+        ("allow", Some("crudb"))
+    );
+
+    // I3：审计落行失败只 warn，不阻断动作
+    sqlx::query("DROP TABLE audit_log")
+        .execute(e.st.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        create(
+            &owner_tok,
+            serde_json::json!({"name":"noaudit-ap","bucket":"crudb"})
+        )
+        .await
+        .unwrap()
+        .status(),
+        201
     );
 }
 
@@ -1167,6 +1210,100 @@ async fn object_ops_through_ap() {
         .await,
         501
     );
+}
+
+/// I2：`POST /ap/<name>/<key>?restore` 推导 RestoreObject（AP 策略 s3:RestoreObject），
+/// 内层原样转发 `restore` 查询 → 202 + `x-amz-restore`，归档版本进入 Restoring。
+#[tokio::test]
+async fn restore_object_through_ap() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (owner_id, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "coldb", Some(owner_id)).await;
+    direct_ap(&e, "cold-ap", "coldb", owner_id, None).await;
+
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/ap/cold-ap/arch",
+            &[],
+            b"cold",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    // 仅放行 RestoreObject 的 AP 策略：POST ?restore 走 s3:RestoreObject 维度
+    set_ap_policy(
+        &e,
+        "cold-ap",
+        "coldb",
+        owner_id,
+        Some(&ap_policy(
+            "Allow",
+            "s3:RestoreObject",
+            "arn:aws:s3:::coldb/*",
+        )),
+    )
+    .await;
+    let info = e.st.store.head_object("coldb", "arch").await.unwrap();
+    let vid = info.version_id.clone().unwrap_or_else(|| "null".into());
+    e.st.store
+        .archive_version(
+            "coldb",
+            "arch",
+            &vid,
+            ArchiveSpec {
+                backend: "cold".into(),
+                key: "tier-key".into(),
+                size: info.size,
+                source_etag: info.etag.clone(),
+                etag: "remote".into(),
+                sha256: "00".into(),
+                class: "GLACIER".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/cold-ap/arch?restore",
+        &[("x-amz-restore-request", "days=1")],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 202);
+    assert_eq!(
+        r.headers()
+            .get("x-amz-restore")
+            .and_then(|v| v.to_str().ok()),
+        Some("ongoing-request=\"true\"")
+    );
+    let tier =
+        e.st.store
+            .tier_version("coldb", "arch", &vid)
+            .await
+            .unwrap()
+            .unwrap()
+            .tier
+            .unwrap();
+    assert_eq!(tier.phase, TierPhase::Restoring);
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE op = 'RestoreObject' AND object_key = 'arch' AND decision = 'allow'",
+    )
+    .fetch_one(e.st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "AP 路径的 RestoreObject 应留审计");
 }
 
 /// Copy 源/目标双授权 + canonical key 只解码一次（策略/审计同一 key）+ 合并审计一行。

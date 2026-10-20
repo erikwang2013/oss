@@ -460,8 +460,11 @@ fn derive_op(
                 Ok("CreateMultipartUpload")
             } else if query_has(query, "uploadId") {
                 Ok("CompleteMultipartUpload")
+            } else if query_has(query, "restore") {
+                // S4b：内层 RestoreObject 已启用（restore 查询随 call() 原样转发）
+                Ok("RestoreObject")
             } else {
-                // restore（S4b 启用）/ delete（批量删不支持）/ 其余
+                // delete（批量删不支持）/ 其余
                 Err(s3s::s3_error!(
                     NotImplemented,
                     "unsupported access point operation"
@@ -819,6 +822,25 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// I2：POST `?restore` 推导为 RestoreObject（其余未知 POST 形状仍 501）。
+    #[test]
+    fn derive_op_post_shapes() {
+        use http::Method;
+        assert_eq!(
+            derive_op(&Method::POST, Some("k"), "restore", false).unwrap(),
+            "RestoreObject"
+        );
+        assert_eq!(
+            derive_op(&Method::POST, Some("k"), "restore&versionId=v1", false).unwrap(),
+            "RestoreObject"
+        );
+        assert_eq!(
+            derive_op(&Method::POST, None, "uploads", false).unwrap(),
+            "CreateMultipartUpload"
+        );
+        assert!(derive_op(&Method::POST, Some("k"), "delete", false).is_err());
     }
 
     #[test]
