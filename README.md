@@ -64,18 +64,19 @@ PENDING→COMPLETED/FAILED、停机积压追平）。
 控制面 changelog（SQLite 触发器捕获、LWW `(ts,priority,origin,seq)` + 本地写门控 + apply 抑制）·
 配对快照（单事务、入钟、只本地胜者）· 对象复制复用 `repl_outbox`（逐 peer 入队、发送前
 `GET ?versioning` 预检、metadata 透传、REPLICA 防环）· 停机积压追平、死信/游标/状态面。
-已实现（M8 进行中）：**S3 缺口（P0）** 对象标签 `Put/Get/DeleteObjectTagging` +
+已实现（M8 完整，2026-10-20）：**S3 缺口（P0）** 对象标签 `Put/Get/DeleteObjectTagging` +
 PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagging-directive`
-两轴（REPLACE 独立、同键仅 metadata REPLACE 放行）· **作业引擎** `jobs/job_tasks`
-（`BEGIN IMMEDIATE` 领取、优先级、指数退避、超时回收、失败重试子作业、CSV 报告、
-`/api/v1/jobs/{id}` 详情与 pause/resume/cancel/retry-failed）· **存储类/分层元数据前置**
-（`storage_class`/`TierState`、Archived/Restoring phase gate → 403 `InvalidObjectState`、
-MPU class、`TierGcSink` 删除契约）· **访问点**（路径式 `/ap/<name>/<key>`、严格 AP 策略与
-身份/桶策略交集、canonical key、签名剥离与内层转发、AP CRUD/策略 API——签名 HTTP 全链路
-验收收尾中）。
-**未实现**（M8 剩余）：Object Lambda（S2）· Transition/Restore 与生命周期 Transition 配置
-（S4b）· Inventory（S5）· Batch Operations（S3）· 控制台/Web 新页面与 M8 e2e（S6）·
-跨站点强一致（M9）· 细粒度 IAM 预设模板 · 复制带宽限速。
+两轴（REPLACE 独立、同键仅 metadata REPLACE 放行）· **访问点与 Object Lambda（S1/S2）**
+（路径式 `/ap/<name>/<key>`、严格 AP 策略与身份/桶策略交集、canonical key、签名剥离与内层
+转发、AP CRUD/策略 API；HTTP 变换器默认、WASM 变换器 `olap-wasm` feature 门控）· **作业引擎
+与 Batch Operations（S0/S3）**（`jobs/job_tasks`、`BEGIN IMMEDIATE` 领取、优先级、指数退避、
+超时回收、失败重试子作业、CSV 报告、1000+1 清单与 retry-failed）· **Inventory（S5）**
+（Daily/Weekly 调度、force-run、manifest.json + `data/*.csv.gz`、AWS v1 必含列 + 可选列）·
+**存储类/分层与 Restore（S4a/S4b）**（`storage_class`/`TierState`、Archived/Restoring phase
+gate → 403 `InvalidObjectState`、远端 S3 tier 后端、生命周期 Transition、RestoreObject 异步受理、
+到期回收、`TierGcSink` 删除契约）· **S6 控制台页面与 `tests/e2e_m8.sh`**。
+**不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
+CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单。
 
 ## 架构
 
@@ -89,19 +90,20 @@ M7 多站点异步复制（控制面 changelog + 对象 outbox）：
 
 ![M7 多站点复制](docs/assets/m7-sites.svg)
 
-M8 控制面（访问点路由 / 作业引擎 / 存储类与分层，S0+S4a+S1 已落地）：
+M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Restore / 控制台页面，S0–S6）：
 
 ![M8 控制面](docs/assets/m8-control-plane.svg)
 
 | crate / 目录 | 职责 |
 |---|---|
 | `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录 / 标签 / storage_class / tier）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
-| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配；M8 增访问点路由（`ap.rs`）、TierGc/删桶清理契约 |
+| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配；M8 增访问点路由（`ap.rs`）、Object Lambda（`olap.rs`）、Restore/生命周期（`restore.rs`/`lifecycle.rs`）、TierGc/删桶清理契约 |
 | `crates/xl-proto` | 节点间 gRPC 协议：`oss.proto` 消息与 service 定义（prost + tonic-build 全量生成） |
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
-| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；M8 增作业引擎（`jobs.rs`）、访问点 API（`access_points_api.rs`）与 0003 迁移 |
-| `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e |
+| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；M8 增作业引擎（`jobs.rs`）、Batch（`job_actions*.rs`）、访问点/OLAP（`access_points_api.rs`）、Inventory（`inventory*.rs`）、分层/恢复（`tier*.rs`）与 0003 迁移 |
+| `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e；M8 增访问点/作业/分层/清单/通知/审计/设置页面 |
 | `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（19 步，含 M6 Select/Kafka/复制；+ `E2E_LONG=1` 门控长跑） |
+| `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
 
@@ -736,10 +738,11 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   由任意已认证写者提供，可被用于抑制复制（M6 既有信任面，M7 的 DELETE 防环依赖同一头）；桶删除时
   若策略/授权行的 LWW 时钟更新，会按 L7 保留，同名桶重建可能继承这些残留行（跨站点并发删/改窗口）。
 
-## M8 控制面（进行中：S0+S4a+S1）
+## M8 控制面（S0–S6 已落地）
 
-M8 分片交付；以下为**已落地**能力与用法，剩余分片（Object Lambda / Transition+Restore /
-Inventory / Batch / 控制台页面）见设计文档阶段表。
+以下为 M8 已落地能力与用法；设计偏差与已知边界见本节末与设计文档 §M8。
+控制面状态存于 SQLite `0003_m8.sql`（`access_points`/`olap_configs`/`jobs`/`job_tasks`/
+`inventory_configs`/`inventory_runs`/`tier_restores`），**单节点单进程**语义。
 
 ### 对象标签与 Copy 指令（P0，已完整）
 
@@ -758,7 +761,7 @@ aws --endpoint-url $E s3api copy-object --bucket b --key dst --copy-source b/src
 约束：≤10 条；key 1..=128 / value 0..=256（Unicode 标量）；非法 → 400 `InvalidTag`；
 无 versionId 取链尾，链尾 marker → 404，点名 marker → 405；标签不随复制/站点传播。
 
-### 作业引擎（S0，已落地）
+### 作业引擎与 Batch Operations（S0/S3）
 
 ```bash
 curl -s $E/api/v1/jobs/1 -H "authorization: Bearer $JWT"      # 详情 + tasks 分页
@@ -774,7 +777,7 @@ curl -s -X POST $E/api/v1/jobs/1/retry-failed -H "authorization: Bearer $JWT"
 - 单节点 SQLite 多 worker；多进程/多节点不支持（M9）。M4 生命周期**过期删除**仍走
   `sweep_once`，不搬入该引擎。
 
-### 访问点（S1，路由/策略/CRUD 已落地）
+### 访问点与 Object Lambda（S1/S2）
 
 ```bash
 curl -s -X POST $E/api/v1/access-points -H "authorization: Bearer $JWT" \
@@ -791,11 +794,12 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
 - 支持：Get/Head/Put/DeleteObject、ListObjectsV2、ListObjectVersions、MPU
   Create/Complete/Abort/UploadPart、CopyObject、Get/Put/DeleteObjectTagging、
-  Get/PutBucketVersioning、HeadBucket；`UploadPartCopy`/`DeleteObjects`/RestoreObject 等 501。
+  Get/PutBucketVersioning、HeadBucket、RestoreObject、桶生命周期配置、桶默认加密、
+  Inventory 配置；`UploadPartCopy`/`DeleteObjects` 等 501。
 - 边界：不做匿名/跨账号/VPC 来源限制/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
   checksum 不转发 trailing headers。
 
-### 存储类与分层元数据（S4a，已落地前置）
+### 存储类、分层与 Restore（S4a/S4b）
 
 - PUT/MPU Create/Copy 接受 `x-amz-storage-class`：STANDARD/STANDARD_IA/ONEZONE_IA/
   INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE/REDUCED_REDUNDANCY；未知或
@@ -806,6 +810,152 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
 - 删除归档版本时 `DeleteOutcome` 带回 `TierRef`，`TierGcSink` 清远端（真实 tier 后端与
   Transition/Restore 在 S4b）。
 - 边界：存储类/标签不随 M6/M7 复制传播；归档对象需在同版本二进制内读取。
+
+### Object Lambda（S2，只读变换）
+
+```bash
+# 配置变换器（owner/admin）；kind=http，endpoint 由管理员信任
+curl -s -X PUT $E/api/v1/access-points/ap-one/transform \
+  -H "authorization: Bearer $JWT" -H 'content-type: application/json' \
+  -d '{"kind":"http","endpoint":"https://olap.example.com/transform","timeout_ms":5000,"max_response_bytes":67108864}'
+aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际 GET /ap/ap-one/k
+```
+
+- ABI：`POST <endpoint>`，body = 原始对象字节；头 `x-oss-bucket/version-id/etag/size/key-b64`；
+  响应体即变换后字节，`Content-Type` 可覆盖；`Content-Length`/`ETag` 按变换结果重算。
+- 只变换 GET 对象体；HEAD 直通、写操作 405。条件头 304/412 透传；Range → 400；输出全缓冲。
+- 限额：输入 `OSS_OLAP_MAX_INPUT_BYTES`（默认 64 MiB）、输出 `max_response_bytes`（默认 64 MiB，
+  上限 1 GiB）、`timeout_ms` 1–30s、每进程 16 并发；HTTP 仅 http/https，拒内网/保留地址与
+  重定向，每次解析钉扎（SSRF 防线）。
+- WASM：`{"kind":"wasm","module_b64":"..."}`（模块 ≤16 MiB，保存即编译）；须以
+  `--features olap-wasm` 构建，否则保存 400「未启用」，GET 不会静默直通。
+- 边界：无写变换；配置无试跑；变换器故障 → GET 500（不返回原文）。
+
+### Batch Operations（S3）
+
+```bash
+# 1) 清单：对象桶内 CSV，表头 bucket,key[,versionId]（BOM/CRLF 容忍）
+# 2) 建作业（JWT）；operation = CopyObject|DeleteObject|ReplaceTags|RestoreObject|InvokeLambda
+curl -s -X POST $E/api/v1/jobs \
+  -H "authorization: Bearer $JWT" -H 'content-type: application/json' -d '{
+    "kind":"batch","manifest_bucket":"b","manifest_key":"manifest.csv",
+    "operation":"ReplaceTags","tags":{"env":"prod"},
+    "report_bucket":"reports","report_prefix":"batch/run1","priority":0}'
+# → 201 {"job_id":1,"total":1001}
+curl -s $E/api/v1/jobs/1 -H "authorization: Bearer $JWT"   # {"job":{state,total,succeeded,failed,…},"tasks":[…]}
+curl -s -X POST $E/api/v1/jobs/1/retry-failed -H "authorization: Bearer $JWT"  # → {"job_id":2}
+```
+
+- 任务动作：Copy 按 Copy 语义（目标桶/前缀、REPLACE 元数据/标签）；Delete 清 tier refs；
+  ReplaceTags 整体替换标签；Restore 走 S4b 恢复；InvokeLambda 仅 HTTP 变换器。
+- 配额：`OSS_JOB_MAX_INFLIGHT_PER_USER`（100）/`OSS_JOB_MAX_INFLIGHT_GLOBAL`（1000）；
+  创建期逐行授权（去重），清单/任务上限见错误文案。
+- 报告：`<report_prefix>/<job_id>/results.csv`，固定列
+  `taskId,bucket,key,versionId,resultCode,resultString,startTime,endTime`；仅已启动任务入报告；
+  `Succeeded`/`PermanentFailure`；时间 `%Y-%m-%dT%H:%M:%SZ`。
+- `retry-failed` 建子作业（`parent_job_id`，仅失败任务），父报告不被改写；无失败项 → 409。
+- 边界：无抢占、无跨账号清单；作业终态 `done`/`error`/`cancelled`（有失败即 `error`）。
+
+### Inventory（S5）
+
+```bash
+curl -s -X PUT $E/api/v1/buckets/b/inventory -H "authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{
+    "id":"inv1","is_enabled":true,"frequency":"Daily",
+    "destination_bucket":"reports","destination_prefix":"inv","format":"CSV",
+    "filter_prefix":"","included_object_versions":"All",
+    "optional_fields":["ReplicationStatus","EncryptionStatus"]}'
+curl -s -X POST $E/api/v1/buckets/b/inventory/inv1/run -H "authorization: Bearer $JWT"
+# → 202 {"run_key":"manual-<epoch>","job_id":3}
+aws --endpoint-url $E s3 cp \
+  s3://reports/inv/b/inv1/manual-<epoch>/manifest.json - | head
+```
+
+- 调度：Daily（UTC 日期）/Weekly（ISO 周），worker `OSS_INVENTORY_INTERVAL_SECS`（默认 60，
+  0 关闭）；同槽唯一去重，停机只补最近一槽；force-run 供测试/运维（owner/admin）。
+- 输出：`<dest_prefix>/<source_bucket>/<config_id>/<run_key>/manifest.json` +
+  `data/<uuid>.csv.gz`；manifest 含 `sourceBucket/destinationBucket/version/fileSchema/files[]`，
+  `files[]` 的 `size`/`md5Checksum` 是 gzip 后字节数与 MD5（base64，对齐 AWS v1）。
+- 列：必含 9 列 `Bucket,Key,VersionId,IsLatest,DeleteMarker,Size,LastModifiedDate,ETag,StorageClass`；
+  可选 6 列按固定顺序追加 `ReplicationStatus,EncryptionStatus,ObjectLockRetainUntilDate,
+  ObjectLockMode,ObjectLockLegalHoldStatus,ChecksumAlgorithm`。
+- 边界：全量扫描、单数据文件（gzip 后 ≤5 GiB）、CSV 仅；不做 Parquet/hive/跨账号/增量；
+  `IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持；可选列可能逐版本 head。
+
+### 分层 Transition 与 Restore（S4b）
+
+```toml
+# oss.toml：远端 S3 兼容 tier（仅 http；https 启动期拒绝）
+[[tiers]]
+id = "t1"
+endpoint = "http://127.0.0.1:40125"
+bucket = "cold"
+access_key = "TIERAK"
+secret_key = "TIERSK"
+region = "us-east-1"
+```
+
+```bash
+# 生命周期转 GLACIER（days=0 = 下一轮 sweep 立即满足；tier 由写入时解析并持久化）
+aws --endpoint-url $E s3api put-bucket-lifecycle-configuration --bucket b \
+  --lifecycle-configuration '{"Rules":[{"ID":"cold","Status":"Enabled","Filter":{"Prefix":""},
+    "Transitions":[{"Days":0,"StorageClass":"GLACIER"}]}]}'
+aws --endpoint-url $E s3api get-bucket-lifecycle-configuration --bucket b   # 回读往返
+curl -s -X POST $E/api/v1/tiers/sweep -H "authorization: Bearer $JWT"      # {"queued":n}
+curl -s $E/api/v1/tiers -H "authorization: Bearer $JWT"                    # [{id,endpoint,bucket,healthy}]
+
+aws --endpoint-url $E s3api head-object --bucket b --key k                 # StorageClass=GLACIER
+aws --endpoint-url $E s3api get-object --bucket b --key k out              # 403 InvalidObjectState
+curl -si --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" \
+  -X POST "$E/b/k?restore" -H 'x-amz-restore-request: days=1'              # 200 + ongoing-request="true"（见下）
+aws --endpoint-url $E s3api get-object --bucket b --key k out              # 恢复完成后可读
+aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
+```
+
+- 生命周期规则也可经控制台 `GET/PUT /api/v1/buckets/{b}/lifecycle` 配置
+  （`transition_days/transition_class/transition_tier`）；S3 与 console 共用同一校验，PUT 全量替换。
+- Transition 由 `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）周期扫描 + 管理端 force-sweep；
+  按对象去重，仅当前非加密非分层版本，单次 ≤10000 对象；全内存搬运（单对象 ≤`OSS_TIER_MAX_BYTES`，默认 1 GiB）。
+- Restore：body XML `<RestoreRequest><Days>n</Days></RestoreRequest>` 或
+  `x-amz-restore-request: days=n[,tier=]`，days 1..=36500（缺省 1）；返回
+  `x-amz-restore: ongoing-request="true"`；HEAD 三态（Archived 无头 / Restoring /
+  Restored `ongoing-request="false", expiry-date=…`）。
+  已知偏差：s3s 0.17 的 RestoreObject 生成代码固定按 200 OK 序列化并丢弃
+  `S3Response.status`，故线上 HTTP 状态是 200（进程内 handler 设的 202 不可达）。
+- 到期回收：reaper `OSS_TIER_REAPER_INTERVAL_SECS`（默认 300），精度约 300s；过期后回到
+  Archived（GET 再次 403）。启动时对账 pending/restored 行与 Version。
+- 边界：tier 仅远端 S3（无本地冷盘池）、endpoint 仅 http、无远端 GC/对账（删除 best-effort，
+  失败留孤儿）；SSE 对象不 Transition；归档对象复制/站点复制不可用（先 Restore）。
+
+### 控制台页面（S6）
+
+- **访问点**：AP CRUD、严格策略编辑、HTTP/WASM 变换器配置与回读。
+- **作业**：Batch 创建、进度、任务分页、暂停/恢复/取消、retry-failed；详情展示报告桶/前缀
+  （报告对象在对象浏览器查看）。
+- **存储层**：`[[tiers]]` 只读状态（health）与 force-sweep。
+- **桶页 / 对象页**：Inventory 配置弹窗；对象标签编辑、存储类、恢复状态与 Restore 按钮；
+  桶默认加密；桶策略模板。
+- **审计 / 设置 / 事件 / Select**：审计过滤；SSE/KMS 只读状态；事件通知 CRUD + 管理员死信
+  查看/重投；一次性 Select 代理工作台。
+- 管理员菜单按 `is_admin` 门控；M8 页面 Playwright 用例 `web/e2e/m8-console.spec.ts`。
+
+### M8 已知边界（在案）
+
+1. 控制面单节点：AP 缓存、作业引擎、Inventory 调度、tier reaper 均按单进程；多节点共享
+   SQLite 不支持，强一致归 M9。
+2. AP 仅路径前缀；无 `<name>-s3alias`/匿名/跨账号/VPC；不支持 ListBuckets/Create/DeleteBucket/
+   DeleteObjects/UploadPartCopy。
+3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
+4. Batch 无抢占/跨账号；InvokeLambda 仅 HTTP；动作不发桶通知但发复制/清 tier。
+5. Inventory 全量扫描、CSV 单文件；不做 Parquet/hive/跨账号/增量。
+6. 分层 v1 仅远端 S3 tier（http）、全内存搬运；S3 生命周期 Filter 仅 prefix、
+   Expiration/Transition 仅 days，date/tag/size/And/noncurrent/abort → 501；单规则单目标类。
+7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort，
+   无 GC/对账；恢复到期精度约 300s。
+8. 作业状态库内 `done/error`（映射 Completed/Failed）；取消时未执行任务不进报告；
+   CSV 不做公式转义。
+9. RestoreObject 线上 HTTP 状态为 200 而非 202：s3s 0.17 生成代码丢弃
+   `S3Response.status`；`x-amz-restore` 头与恢复语义不受影响。
 
 ## 验收
 
@@ -831,14 +981,30 @@ tests/e2e_kafka.sh              # 仅 Kafka 三阶段（redpanda docker；约 1 
 tests/e2e_sites.sh              # M7 多站点：自动起 A/B 两实例并双向配对（约 2–4 分钟）
 ```
 
-M8（已落地分片）测试锚：
+M8 测试锚：
 
 ```bash
-cargo test -p xl-store --lib            # S4a 元数据/phase/DeleteOutcome tier refs + 黄金摘要
-cargo test -p xl-s3 --lib ap::          # AP 策略/ARN/缓存/解码/op 推导/route check_access
-cargo test -p oss-server --lib          # 0003 迁移/补列/AP CRUD/作业状态机
+cargo test -p xl-store --lib            # 标签/storage_class/tier phase/DeleteOutcome tier refs
+cargo test -p xl-s3 --lib               # AP/OLAP/restore/lifecycle/inventory 形校验 + 策略矩阵
+cargo test -p oss-server --lib          # 0003 迁移/补列/AP CRUD/作业状态机/Inventory/tier 调度
+cargo test -p oss-server --test m8_ap --test m8_batch --test m8_tier --test m8_lifecycle_api
 cargo test -p oss-server --test jobs_engine --test console_api
+cargo test -p xl-s3 --features olap-wasm   # WASM 变换器（需 wasmtime 环境）
 # S3 标签 + Copy 指令在 tests/e2e_s3.sh 步骤 20（已含于全量脚本）
+```
+
+M8 端到端（控制面；服务已启动，脚本自行播种 AK/桶，退出时清理）：
+
+```bash
+AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 \
+  ADMIN_USER=erik ADMIN_PASSWORD=changeme tests/e2e_m8.sh
+# 分层段：服务须以 [[tiers]] 启动；可选 TIER_ENDPOINT/TIER_AK/TIER_SK 让脚本自建远端桶，
+# 或 E2E_M8_SKIP_TIER=1 显式跳过（输出 SKIP 行，不静默省段）。
+# 其它旋钮：E2E_M8_PARALLEL(8) / E2E_M8_JOB_TIMEOUT(3600) / E2E_M8_TIER_TIMEOUT(240) /
+#           E2E_M8_M4_TIMEOUT(150) / E2E_M8_REPL_SMOKE=1（追加 e2e_replication/e2e_sites）。
+# 作业吞吐取服务端 OSS_JOB_WORKERS/OSS_JOBS_INTERVAL_SECS（默认 2 worker × 2s，单个
+# 1000 任务作业约 17 分钟起；脚本跑 1000 与 1000+1 两个批次作业）。单节点 SQLite 单写者，
+# 调大 worker 数会加重写锁竞争，建议保持默认或 1 worker + 1s 间隔（单作业约 35 分钟）。
 ```
 
 集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：
@@ -862,7 +1028,12 @@ cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空�
 - M6 数据流实施记录（已发布）：`docs/superpowers/plans/2026-10-17-m6-dataflow.md`
 - M7 多站点实施记录（已发布）：`docs/superpowers/plans/2026-10-18-m7-multisite.md`
 - M8 前置（对象标签 / Copy 指令）：`docs/superpowers/plans/2026-10-19-s3-gaps-tagging-replace.md`
-- M8 控制面计划（v3.1，S0/S4a/S1 已落地）：`docs/superpowers/plans/2026-10-19-m8-control-plane.md`
+- M8 控制面计划（v3.1，S0–S6 已实施；含验收锚与残余边界）：
+  `docs/superpowers/plans/2026-10-19-m8-control-plane.md`
+- M8 缺口收口（后端补口：MPU 标签、控制台标签路由、审计过滤、加密/KMS 状态、通知死信、
+  Select 代理、桶默认加密、IAM 预设、复制限速；以及 M4/M5/M6 文档化缺口页）：见 M8 计划
+  「缺口收口与偏差」节、设计文档 §M8 落地状态
+- M8 e2e：`tests/e2e_m8.sh`（前置与旋钮见「M8 测试锚」段）
 
 ---
 

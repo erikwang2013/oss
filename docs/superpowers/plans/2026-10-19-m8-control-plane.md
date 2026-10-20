@@ -798,6 +798,18 @@ Web `npm test` + `npm run build`；E2E `tests/e2e_m8.sh` 与既有 `e2e_s3.sh`/`
   `DeleteOutcome` tier refs + `TierGcSink` 注入/未注入空删；S3 `Put/GetBucketLifecycleConfiguration`
   + `DeleteBucketLifecycle` 往返/错误矩阵/rule→sweep 任务去重，e2e 先建规则再 force-sweep。
 
+## 缺口收口与偏差（2026-10-20）
+
+S6 之外的控制面缺口以 Task 7a/7b/7c 收口（不在原 S0–S6 编号内，均已在 8116a12 之前落地）：
+- 7a（`2650b86`/`33291cc`/`6189b95`）：MPU create 的 `x-amz-tagging` 持久化；控制台对象标签
+  路由；审计过滤（from/to/uid/op/bucket/key-prefix）；加密/KMS 只读状态。
+- 7b（`312c94a`/`1ad61c2`）：控制台通知 CRUD、死信列表/重投、一次性 Select 代理、IAM 预设模板。
+- 7c（`1850276`/`8cc69c4`/`67bebd1`）：桶默认加密（SSE-S3/SSE-KMS）落在 PUT/MPU/Copy；
+  复制出站 `max_bytes_per_sec` 令牌桶限速。
+- 未做（记录非目标）：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换（用户
+  2026-10-17 决定另行处理）；M9 同步强一致不在 M8。
+- 其余设计偏差见设计文档 §M8「与设计的偏差（记档）」。
+
 ## 定稿（待）
 
 - 实施完成后补：提交哈希、七闸与 feature/web/e2e 计数、评审/对抗轮次、残余边界。

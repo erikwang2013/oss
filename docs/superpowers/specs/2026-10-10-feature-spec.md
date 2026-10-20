@@ -568,8 +568,8 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 ## 13. Access Points 与 Object Lambda —— `M8`
 
-> **落地状态（2026-10-19）**：S1 已落地路径式 AP（路由/策略交集/CRUD；签名 HTTP 全链路
-> 测试收尾中）；Object Lambda（S2）与 `<name>-s3alias` 主机名未实施。
+> **落地状态（2026-10-20）**：S1 路径式 AP 与 S2 Object Lambda 均已落地（HTTP 变换器默认、
+> WASM `olap-wasm` feature 门控）；`<name>-s3alias` 主机名、匿名/跨账号 AP 与写变换不做。
 
 ### 13.1 Access Points
 
@@ -581,7 +581,8 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 **控制台 API**：`GET/POST /api/v1/access-points`、`GET/DELETE /api/v1/access-points/{name}`、`PUT .../{name}/policy`
 
-**边界**：不做网络来源限制（VPC endpoint 概念不适用）；不做跨账号访问点。
+**边界**：仅路径式 `/ap/<name>/<key>`（无 `<name>-s3alias` 主机别名）；不做网络来源限制
+（VPC endpoint 概念不适用）；不做匿名/跨账号访问点。
 
 ### 13.2 Object Lambda
 
@@ -595,15 +596,22 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 **行为**：GET 经 `/ap/<name>/<key>` → 取对象 → 变换 → 返回。`Content-Length` 与 `ETag` 语义要正确（变换后长度可能变化 → 重新算或改用 chunked）。
 
-**边界**：**只做读变换** —— AWS 标准 Object Lambda 也没有写路径，自造协议任何客户端都不认。变换器超时可配，超时 → `InternalError`。
+**落地形态（S2）**：HTTP 变换器 `POST <endpoint>`（body = 原始字节；头 `x-oss-bucket/
+version-id/etag/size/key-b64`），响应体为变换后字节、`Content-Type` 可覆盖；`Content-Length`/
+`ETag` 按变换结果重算。条件头 304/412 透传，Range → 400，HEAD 直通，写操作 405。限额：输入
+`OSS_OLAP_MAX_INPUT_BYTES`（64 MiB）、输出 `max_response_bytes`（默认 64 MiB，上限 1 GiB）、
+`timeout_ms` 1–30s、每进程 16 并发；HTTP 仅 http/https，拒内网/保留地址与重定向（每次解析钉扎）。
+WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构建时保存 400。
+
+**边界**：**只做读变换** —— AWS 标准 Object Lambda 也没有写路径，自造协议任何客户端都不认。变换器超时 → `InternalError`；配置无试跑；变换失败返回 500，不静默直通原文。
 
 ---
 
 ## 14. 存储分层与 Restore —— `M8`
 
-> **落地状态（2026-10-19）**：S4a 已落地 `storage_class`/`TierState` 元数据、phase gate
-> （归档 GET → 403 `InvalidObjectState`）、MPU class 与 `TierGcSink` 契约；tier 后端、
-> Transition 作业与 `RestoreObject`（S4b）未实施。
+> **落地状态（2026-10-20）**：S4a 元数据（`storage_class`/`TierState`/phase gate/MPU class/
+> `TierGcSink`）与 S4b（远端 S3 tier 后端、生命周期 Transition、`RestoreObject`、到期 reaper、
+> 启动对账）均已落地；仅远端 tier（http），无本地冷盘池。
 
 ### 14.1 存储类
 
@@ -611,10 +619,10 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 存储类记录在 `xl.meta` 的 `Version.storage_class`。**协议语义完整实现，物理实现是可插拔 tier 后端**：
 
-| tier 后端 | 说明 |
-|---|---|
-| 远端 S3 兼容端点 | 经扩展后的 `ecat-data-s3`（流式 multipart） |
-| 本地冷盘池 | 不同 EC 参数（如热池 8+4、冷池 12+4），可能更慢的介质 |
+| tier 后端 | 说明 | 状态 |
+|---|---|---|
+| 远端 S3 兼容端点 | `[[tiers]]` 静态配置（`id/endpoint/bucket/access_key/secret_key/region`），仅 http；全内存搬运，单对象 `OSS_TIER_MAX_BYTES`（默认 1 GiB） | 已落地 |
+| 本地冷盘池 | 不同 EC 参数（如热池 8+4、冷池 12+4），可能更慢的介质 | 未实施（设计保留） |
 
 **不模拟磁带** —— 那不在对象存储范围内，MinIO 的 ILM tiering 也是同一模型。
 
@@ -630,35 +638,54 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 ### 14.3 生命周期驱动
 
 `Transition` 规则 → 作业引擎生成 tier 转换任务（复制到 tier 后端 + 更新 meta + 回收本地分片）。
+落地：S3 `Put/Get/DeleteBucketLifecycleConfiguration` 与控制台 lifecycle 共用校验，tier 在写入
+时解析并持久化；sweep 由 `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）周期执行 +
+`POST /api/v1/tiers/sweep` 强制；按对象去重、仅当前非加密非分层版本、单次 ≤10000 对象。
+到期回收 reaper 间隔 `OSS_TIER_REAPER_INTERVAL_SECS`（默认 300，精度约 300s）。
 
 ---
 
 ## 15. Inventory —— `M8`
 
-**配置**：`PutBucketInventoryConfiguration` —— 源桶、目标桶+前缀、频率（`Daily`/`Weekly`）、输出格式（`CSV` / `Parquet`（后置））、是否含版本、可选字段列表、可选 Filter（前缀）。
+> **落地状态（2026-10-20）**：S5 已落地——S3 `Put/Get/List/DeleteBucketInventoryConfiguration`
+> 与控制台薄封装、Daily/Weekly 调度、force-run、manifest + CSV.gz（MD5/大小为 gzip 后字节）。
 
-**输出布局**（对齐 AWS v1，让既有工具能直接读）：
+**配置**：`PutBucketInventoryConfiguration` —— 源桶、目标桶+前缀、频率（`Daily`/`Weekly`）、输出格式（`CSV`；`Parquet` 后置）、是否含版本、可选字段列表、可选 Filter（前缀）。
+
+**输出布局**（对齐 AWS v1，让既有工具能直接读；偏离见下）：
 ```
-<dest-prefix>/<source-bucket>/<config-id>/<yyyy-MM-ddTHH-mm-ssZ>/manifest.json
-<dest-prefix>/<source-bucket>/<config-id>/<yyyy-MM-ddTHH-mm-ssZ>/data/<uuid>.csv.gz
+<dest-prefix>/<source-bucket>/<config-id>/<run_key>/manifest.json
+<dest-prefix>/<source-bucket>/<config-id>/<run_key>/data/<uuid>.csv.gz
 ```
-`manifest.json` 含 `sourceBucket`、`destinationBucket`、`version`、`creationTimestamp`、`fileFormat`、`fileSchema`、`files[{key,size,md5Checksum}]`。
+`run_key`：Daily = `YYYY-MM-DD`（UTC），Weekly = `YYYY-Www`，force-run = `manual-<epoch>`。
+`manifest.json` 含 `sourceBucket`、`destinationBucket`、`version`、`creationTimestamp`、`fileFormat`、`fileSchema`、`files[{key,size,md5Checksum}]`；`size`/`md5Checksum` 对应 gzip 后字节数与 MD5（base64）。
 
-**列**（`fileSchema`）：`Bucket`、`Key`、`VersionId`、`IsLatest`、`DeleteMarker`、`Size`、`LastModifiedDate`、`ETag`、`StorageClass`、`IsMultipartUploaded`、`ReplicationStatus`、`EncryptionStatus`、`ObjectLockRetainUntilDate`、`ObjectLockMode`、`ObjectLockLegalHoldStatus`、`ChecksumAlgorithm`、`IntelligentTieringAccessTier`
+**列**（`fileSchema`）：必含 9 列 `Bucket`、`Key`、`VersionId`、`IsLatest`、`DeleteMarker`、
+`Size`、`LastModifiedDate`、`ETag`、`StorageClass`；可选 6 列按固定顺序追加
+`ReplicationStatus`、`EncryptionStatus`、`ObjectLockRetainUntilDate`、`ObjectLockMode`、
+`ObjectLockLegalHoldStatus`、`ChecksumAlgorithm`。
 
-**边界**：不做 `hive/` 分区布局（后置）；不做 S3 Inventory 的跨账号投递。
+**控制台**：`GET/PUT /api/v1/buckets/{b}/inventory`、`DELETE .../{id}`、
+`POST .../{id}/run`（force-run → 202 `{"run_key","job_id"}`）。调度 worker
+`OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 关闭），同槽唯一去重，停机只补最近一槽。
+
+**边界**：不做 `hive/` 分区布局（后置）；不做 S3 Inventory 的跨账号投递；全量扫描、单数据
+文件（gzip 后 ≤5 GiB）、不做增量；`IsMultipartUploaded`/`IntelligentTieringAccessTier`
+不支持。
 
 ---
 
 ## 16. Batch Operations 与作业引擎 —— `M8`
 
-> **落地状态（2026-10-19）**：S0 作业引擎已落地（`jobs/job_tasks`、领取/重试/超时/报告、
-> 控制台详情与 pause/resume/cancel/retry-failed）；Batch/Transition/Restore/Inventory 的
-> 任务动作随 S3/S4b/S5 接入。M4 生命周期过期删除与 M6 复制重试不迁入本引擎（M8 钉）。
+> **落地状态（2026-10-20）**：S0 作业引擎与 S3 Batch 均落地（`jobs/job_tasks`、领取/重试/
+> 超时/报告、控制台详情与 pause/resume/cancel/retry-failed、1000+1 ReplaceTags 与 retry-failed
+> 子作业）；Transition/Restore/Inventory 已作为任务动作接入。M4 生命周期过期删除与 M6 复制
+> 重试不迁入本引擎（M8 钉，各自 worker/outbox 保留）。
 
 ### 16.1 作业引擎（一个引擎，五个消费者）
 
-**消费者**：Batch Operations · 生命周期转换 · Glacier Restore · Inventory 生成 · 复制积压重试
+**消费者**：Batch Operations · 生命周期转换 · Glacier Restore · Inventory 生成
+（复制积压重试**不迁入**：仍由 M6 outbox worker 负责）
 
 **模型**
 ```
@@ -682,9 +709,12 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | `RestoreObject` | 批量取回 |
 | `InvokeLambda` | 批量走 Object Lambda 变换器 |
 
-**报告**：`results.csv` 写回指定桶，列 `taskId, bucket, key, versionId, resultCode, resultString, startTime, endTime`（`resultCode` 沿用 AWS 的 `Succeeded`/`PermanentFailure` 语义）。
+**报告**：`results.csv` 写回指定桶，列 `taskId, bucket, key, versionId, resultCode, resultString, startTime, endTime`（`resultCode` 沿用 AWS 的 `Succeeded`/`PermanentFailure` 语义）；仅已启动任务入报告，时间 `%Y-%m-%dT%H:%M:%SZ`。`retry-failed` 建子作业（`parent_job_id`，仅失败任务），父报告不改写。
 
-**边界**：不做作业优先级抢占（队列按优先级排序即可）；不做跨账号清单。
+**落地限额**：`OSS_JOB_MAX_INFLIGHT_PER_USER`（100）/`OSS_JOB_MAX_INFLIGHT_GLOBAL`（1000）；
+创建期逐行授权并去重；作业终态 `done`/`error`/`cancelled`（有失败即 `error`）。
+
+**边界**：不做作业优先级抢占（队列按优先级排序即可）；不做跨账号清单；InvokeLambda 仅 HTTP 变换器。
 
 ---
 
@@ -702,16 +732,20 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 用户策略 | `GET/POST /api/v1/users`、`/api/v1/policies` | M4 |
 | 生命周期 | `GET/PUT /api/v1/buckets/{b}/lifecycle` | M4 |
 | 集群 | `GET /api/v1/cluster/status`、`/disks`、`/erasure-sets`、`/scrub` | M3/M4 |
-| 审计 | `GET /api/v1/audit` | M4 |
+| 审计 | `GET /api/v1/audit`（`from/to/uid/op/bucket/key/decision` 过滤） | M4/M8 |
 | 复制 | `GET/PUT /api/v1/buckets/{b}/replication`、`GET /api/v1/remotes` | M6 |
 | 站点 | `GET/POST /api/v1/sites`、`/api/v1/sites/{id}/join` | M7 |
-| 通知 | `GET/PUT /api/v1/buckets/{b}/notifications`、`GET /api/v1/events/dead-letter` | M6 |
-| Select | `POST /api/v1/buckets/{b}/select`（工作台，代理 `SelectObjectContent`） | M6 |
-| 访问点 | `GET/POST /api/v1/access-points`、`PUT .../{name}/policy` | M8（S1 已落地） |
-| OLAP | `GET/PUT /api/v1/access-points/{name}/transform` | M8 |
-| 作业 | `GET/POST /api/v1/jobs`、`GET /api/v1/jobs/{id}`、`POST .../{id}/{pause,resume,cancel,retry-failed}` | M8（S0 详情/控制已落地） |
-| 清单 | `GET/PUT /api/v1/buckets/{b}/inventory` | M8 |
-| 分层 | `GET/PUT /api/v1/tiers` | M8 |
+| 通知 | `GET/PUT/DELETE /api/v1/buckets/{b}/notifications`、`GET /api/v1/events/dead`、`POST /api/v1/events/{id}/redeliver` | M6/M8 |
+| Select | `POST /api/v1/buckets/{b}/select`（工作台，代理 `SelectObjectContent`） | M6/M8 |
+| 加密状态 | `GET /api/v1/encryption`（管理员，只读 SSK/S3-KMS 状态） | M5/M8 |
+| 策略模板 | `GET /api/v1/policy-templates`（静态 IAM 预设） | M4/M8 |
+| 访问点 | `GET/POST /api/v1/access-points`、`GET/DELETE .../{name}`、`PUT .../{name}/policy` | M8（S1 已落地） |
+| OLAP | `GET/PUT /api/v1/access-points/{name}/transform` | M8（S2 已落地） |
+| 作业 | `GET/POST /api/v1/jobs`、`GET /api/v1/jobs/{id}`、`POST .../{id}/{pause,resume,cancel,retry-failed}` | M8（S0/S3 已落地） |
+| 清单 | `GET/PUT /api/v1/buckets/{b}/inventory`、`DELETE .../{id}`、`POST .../{id}/run` | M8（S5 已落地） |
+| 分层 | `GET /api/v1/tiers`、`POST /api/v1/tiers/sweep`（admin） | M8（S4b 已落地） |
+| 对象标签 | `GET/PUT /api/v1/buckets/{b}/tags/{*key}`（控制台） | M8（S6 缺口页） |
+| 桶加密 | `GET/PUT/DELETE /api/v1/buckets/{b}/encryption` | M8（默认加密） |
 | 健康 | `/health/live`、`/health/ready`、`/health/cluster` | M1/M3 |
 
 ### 17.2 Web 页面
@@ -727,15 +761,16 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 用户与策略 | 用户、策略文档编辑、绑定 | M4 |
 | 生命周期 | 规则可视化编辑器 | M4 |
 | 集群状态 | 盘用量与健康、纠删组、scrub/heal 进度、rebalance | M3/M4 |
-| 审计日志 | 按时间/身份/资源/动作过滤 | M4 |
+| 审计日志 | 按时间/身份/资源/动作过滤 | M4/M8 |
 | 复制与站点 | 桶复制规则、站点拓扑图、积压深度、站点加入向导 | M6/M7 |
-| 事件通知 | 桶通知配置、死信查看与重投 | M6 |
-| Select 工作台 | 选对象、写 SQL、看结果流与字节统计 | M6 |
-| 访问点与 OLAP | 访问点 CRUD、策略、变换器配置与试跑 | M8（AP 后端已落地；Web/OLAP 未做） |
-| 作业中心 | Batch 作业列表/进度/报告下载、重跑失败项 | M8（后端已落地；Web 未做） |
-| Inventory | 配置、历史清单、下载 | M8 |
-| 分层 | tier 后端配置、存储类映射 | M8（元数据前置已落地） |
-| 设置 | 上传分组、限制、加密主密钥、KMS 连接 | M2（分组）/M5（加密） |
+| 事件通知 | 桶通知配置、死信查看与重投 | M6/M8 |
+| Select 工作台 | 选对象、写 SQL、看结果流与字节统计 | M6/M8 |
+| 访问点与 OLAP | 访问点 CRUD、策略、变换器配置与回读 | M8（S1/S2 已落地） |
+| 作业中心 | Batch 创建、列表/进度、暂停/恢复/取消、重跑失败项、报告路径 | M8（S0/S3 已落地） |
+| Inventory | 桶页配置弹窗、force-run | M8（S5 已落地） |
+| 分层 | tier 只读状态（健康/哨兵键）、强制 sweep | M8（S4b 已落地） |
+| 对象页 | 标签编辑、存储类、恢复状态与 Restore、默认加密入口 | M8 |
+| 设置 | 上传分组、限制、SSE/KMS 只读状态（材料只在 env） | M2/M5/M8 |
 
 **前端技术**：React 19 + Vite + TypeScript + antd v5 + `@tanstack/react-query`；上传复用 aetherupload 自带的 `aetherupload-all.js`（含 zepto + spark-md5），React 侧包一个 `useUpload` hook 驱动它 —— **不重写分片逻辑**。
 

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" width="960" height="800"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS 系统架构</title>
-  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点/作业引擎/存储类）。</desc>
+  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点与 OLAP/作业与 Batch/Inventory/存储分层与 Restore/控制台页面）。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
@@ -11,7 +11,7 @@
   <rect x="1" y="1" width="958" height="798" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
   <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 系统架构</text>
-  <text x="40" y="70" font-size="12" fill="#64748b">Rust 2024 · 五 crate 单向依赖 oss-server → xl-s3 / xl-client → xl-store（mesh 走 xl-proto）· 多盘 EC · 集群 · 版本链 · 加密与锁 · 事件/Select/复制（M1–M6）· 多站点异步复制（M7）· M8 控制面（AP/作业/分层）</text>
+  <text x="40" y="70" font-size="12" fill="#64748b">Rust 2024 · 五 crate 单向依赖 oss-server → xl-s3 / xl-client → xl-store（mesh 走 xl-proto）· 多盘 EC · 集群 · 版本链 · 加密与锁 · 事件/Select/复制（M1–M6）· 多站点异步复制（M7）· M8 控制面（AP/OLAP · 作业/Batch · Inventory · 分层/Restore · 控制台页）</text>
 
   <!-- 客户端 -->
   <rect x="690" y="94" width="250" height="56" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
@@ -41,8 +41,8 @@
   <text x="76" y="378" font-size="11" fill="#374151">集群状态（按 set 分组 · C2）</text>
   <text x="76" y="404" font-size="11" fill="#94a3b8">前端登录后种 cookie oss_token</text>
   <text x="76" y="426" font-size="10.5" fill="#94a3b8">口令 Argon2id · 历史 sha256 登录时透明升级</text>
-  <text x="76" y="450" font-size="10.5" fill="#64748b">M6 worker：事件 outbox → Kafka · 复制 outbox → 远端</text>
-  <text x="76" y="464" font-size="10.5" fill="#64748b">M7 worker：站点 changelog → 对端 · 站点 outbox → peer</text>
+  <text x="76" y="450" font-size="10.5" fill="#64748b">M6/M7 worker：事件 outbox → Kafka · 复制/站点 outbox → 远端/peer</text>
+  <text x="76" y="464" font-size="10.5" fill="#64748b">M8 job worker：Batch · Inventory · Transition · Restore</text>
 
   <rect x="345" y="232" width="270" height="240" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
   <text x="361" y="262" font-size="13" font-weight="600" fill="#0f172a">/aetherupload/*　分块上传</text>
@@ -63,7 +63,7 @@
   <text x="765" y="348" font-size="10.5" fill="#374151" text-anchor="middle">OssS3（xl-s3）</text>
   <text x="765" y="363" font-size="10" fill="#64748b" text-anchor="middle">授权：策略 Deny 优先 → 三档权限（M4）</text>
   <text x="765" y="376" font-size="10" fill="#64748b" text-anchor="middle">SSE / 对象锁头解析（M5）</text>
-  <text x="765" y="394" font-size="10" fill="#64748b" text-anchor="middle">Select · 事件/复制入队（M6）· 站点对入队（M7）· AP 路由（M8）</text>
+  <text x="765" y="394" font-size="10" fill="#64748b" text-anchor="middle">Select/事件/复制（M6）· 站点（M7）· AP/OLAP/分层（M8）</text>
   <text x="646" y="404" font-size="11" fill="#374151">桶/对象 CRUD · 版本链 · Multipart · Range</text>
   <text x="646" y="424" font-size="11" fill="#374151">CopyObject（源/目标双轴判权）· 批量删逐键</text>
   <text x="646" y="446" font-size="10.5" fill="#94a3b8">对象锁桶须版本控制 Enabled</text>
@@ -115,8 +115,8 @@
   <rect x="660" y="690" width="240" height="88" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
   <text x="676" y="712" font-size="12" font-weight="600" fill="#334155">SQLite（控制面）</text>
   <text x="676" y="730" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">users · access_keys · buckets</text>
-  <text x="676" y="746" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">桶策略 · 生命周期 · jobs · audit_log · 复制规则</text>
-  <text x="676" y="762" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">uploads · instant_index</text>
+  <text x="676" y="746" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">桶策略 · 生命周期 · jobs · audit_log</text>
+  <text x="676" y="762" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">inventory · tier_restores · uploads · 复制规则</text>
 
   <text x="930" y="788" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
 </svg>

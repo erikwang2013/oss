@@ -572,11 +572,35 @@ stretch EC）仍归 M9。
 
 **范围**：Access Points（CRUD 自建 + `S3Route` 寻址）· Object Lambda（读变换：HTTP 变换器默认 + WASM 可选）· Batch Operations（作业引擎）· Inventory（CSV.gz + manifest.json，列对齐 AWS v1 schema）· 存储分层与 Restore
 
-**落地状态（2026-10-19）**：P0（对象标签 + Copy 两轴）· S0（作业引擎/迁移）·
-S4a（存储类/分层元数据前置）· S1（访问点路由/策略/CRUD，签名 HTTP 全链路测试收尾）
-已落地；S2 Object Lambda、S4b Transition/Restore、S5 Inventory、S3 Batch、S6
-控制台/Web/E2E 未实施。实施计划 v3.1 已经 scoped 复核 GO
-（`docs/superpowers/plans/2026-10-19-m8-control-plane.md`）。
+**落地状态（2026-10-20，S0–S6 全部落地）**：P0（对象标签 + Copy 两轴）· S0（作业引擎/
+迁移）· S1（访问点路由/策略/CRUD）· S2（Object Lambda：HTTP 默认 + WASM feature 门控）·
+S3（Batch：清单/ReplaceTags/Copy/Delete/Restore/InvokeLambda + CSV 报告 + retry-failed）·
+S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 Transition、Restore/reaper/启动
+对账）· S5（Inventory Daily/Weekly + force-run + manifest/CSV.gz）· S6（控制台页面与
+`tests/e2e_m8.sh`）。实施计划：`docs/superpowers/plans/2026-10-19-m8-control-plane.md`。
+
+**与设计的偏差（记档）**：
+- Inventory 运行路径用 `<run_key>`（Daily=UTC 日期 `YYYY-MM-DD`、Weekly=`YYYY-Www`、
+  force-run=`manual-<epoch>`），不是 `yyyy-MM-ddTHH-mm-ssZ` 时间戳；manifest 字段与
+  `data/*.csv.gz` 布局其余对齐 AWS v1。
+- Inventory 列收敛为 9 必含 + 6 可选；`IsMultipartUploaded`/`IntelligentTieringAccessTier`
+  不支持（现有元数据不可推导）。
+- 分层仅远端 S3 兼容 tier（endpoint 仅 http，TLS 未接线），无本地冷盘池；GLACIER/
+  DEEP_ARCHIVE 自动解析到单一 tier；全内存搬运（单对象上限）；tier 远端删除 best-effort、
+  无 GC/对账；恢复到期精度约 300s。
+- Object Lambda 只做读变换；HTTP 变换器默认，WASM 需 `olap-wasm` feature；输出全缓冲；
+  输入/输出/超时/并发限额与 SSRF 拒绝见 S2 实现。
+- RestoreObject 线上 HTTP 状态是 200 而非 202：s3s 0.17 的生成代码固定按 `200 OK` 序列化
+  并丢弃 `S3Response.status`（服务层设置的 202 仅进程内可见）；`x-amz-restore:
+  ongoing-request="true"` 与异步恢复语义不受影响。
+- AP 仅路径式 `/ap/<name>/<key>`，无 `<name>-s3alias`、匿名、跨账号或 VPC 来源限制。
+- S6 补齐先前记档的 M4/M5/M6 控制台缺口页（审计过滤、通知死信、SSE/KMS 只读、Select 代理、
+  IAM 预设、桶默认加密、对象标签编辑）+ M8 页面（访问点/作业/分层/清单）；未新增计划外
+  后端能力。
+
+**仍不做（非目标）**：M9 同步强一致（openraft / sync 桶 / stretch EC）·
+`AssumeRoleWithWebIdentity` · SSE-KMS 显式 CMK/多钥轮换 · AP 主机别名/匿名/跨账号 ·
+Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单 · 本地冷盘池 tier。
 
 **验收**
 1. 建 AP 后经 `/ap/<name>/<key>` 访问，且 AP 策略与桶策略取交集生效
