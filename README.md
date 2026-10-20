@@ -1002,9 +1002,10 @@ AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:900
 # 或 E2E_M8_SKIP_TIER=1 显式跳过（输出 SKIP 行，不静默省段）。
 # 其它旋钮：E2E_M8_PARALLEL(8) / E2E_M8_JOB_TIMEOUT(3600) / E2E_M8_TIER_TIMEOUT(240) /
 #           E2E_M8_M4_TIMEOUT(150) / E2E_M8_REPL_SMOKE=1（追加 e2e_replication/e2e_sites）。
-# 作业吞吐取服务端 OSS_JOB_WORKERS/OSS_JOBS_INTERVAL_SECS（默认 2 worker × 2s，单个
-# 1000 任务作业约 17 分钟起；脚本跑 1000 与 1000+1 两个批次作业）。单节点 SQLite 单写者，
-# 调大 worker 数会加重写锁竞争，建议保持默认或 1 worker + 1s 间隔（单作业约 35 分钟）。
+# 作业吞吐取服务端 OSS_JOB_WORKERS/OSS_JOBS_INTERVAL_SECS。e2e 建议 OSS_JOB_WORKERS=1 +
+# OSS_JOBS_INTERVAL_SECS=1（当前引擎 finish_task 在默认 2 worker + 负载下可能锁冲突，任务
+# 停在 running 直到 deadline；见 task-6b 报告）。干净 1000 任务作业约 17 分钟；含失败重试
+# 的 1001 作业受退避抖动影响可能再多数分钟到十几分钟。脚本跑 1000 与 1000+1 两个作业。
 ```
 
 集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：

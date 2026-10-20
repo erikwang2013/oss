@@ -814,8 +814,8 @@ S6 之外的控制面缺口以 Task 7a/7b/7c 收口（不在原 S0–S6 编号�
 ## 定稿（2026-10-20）
 
 - 代码 HEAD：`8116a12`（S0–S6 + 7a/7b/7c；Task 6b 未改 Rust/Web 源码）。
-- 文档/e2e 提交：`a3579ee`（README、设计/功能规格、两张 SVG、`tests/e2e_m8.sh`）；
-  本定稿与报告另提交。
+- 文档/e2e 提交：`a3579ee`（README、设计/功能规格、两张 SVG、`tests/e2e_m8.sh`）+
+  后续小修（e2e 注明 1 worker 前置、Inventory 诊断输出）；本定稿与报告另提交。
 - 七闸（base `8116a12`）：① `xl-store` 220 passed / 1 ignored；② kill9 专项 1 passed；
   ③ `oss-server` 203 passed；④ `xl-s3` 181 passed / **1 failed**；⑤ `xl-client`+`xl-proto`
   5 passed；⑥ clippy `--workspace --all-targets -D warnings` exit 0；⑦ fmt `--check` exit 0。

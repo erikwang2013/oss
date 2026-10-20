@@ -6,10 +6,11 @@
 # 分层段（步骤 4）：服务须以 `[[tiers]]` 启动（远端 S3 兼容端点），否则显式 SKIP 并记行；
 #   可设 TIER_AK/TIER_SK + TIER_ENDPOINT 让脚本自动建远端桶（否则假定该桶已存在）。
 # 可选：E2E_M8_SKIP_TIER=1 强制跳过分层；E2E_M8_REPL_SMOKE=1 追加 M6/M7 双实例回归。
-#   E2E_M8_PARALLEL（缺省 8）/ E2E_M8_JOB_TIMEOUT（3600s；默认 2 worker × 2s 间隔的
-#   单个 1000 任务作业约需 17 分钟，本脚本跑 1000 与 1000+1 两个作业；单节点 SQLite
-#   单写者，调大 OSS_JOB_WORKERS 会加重写锁竞争，建议保持默认或调小
-#   OSS_JOBS_INTERVAL_SECS）/ E2E_M8_TIER_TIMEOUT（240s）/ E2E_M8_M4_TIMEOUT（150s）。
+#   E2E_M8_PARALLEL（缺省 8）/ E2E_M8_JOB_TIMEOUT（3600s；单个 1000 任务作业在
+#   1 worker × 1s 间隔下约 17 分钟，本脚本跑 1000 与 1000+1 两个作业。单节点 SQLite
+#   单写者，e2e 建议 OSS_JOB_WORKERS=1 + OSS_JOBS_INTERVAL_SECS=1：默认 2 worker 在
+#   负载下可能触发 finish_task 锁竞争，任务停在 running 直到 deadline 回收）
+#   / E2E_M8_TIER_TIMEOUT（240s）/ E2E_M8_M4_TIMEOUT（150s）。
 # 不触发 CI；不修改服务端任何配置。
 set -euo pipefail
 
@@ -261,6 +262,7 @@ aws_api get-object --bucket "${BUCKETS[4]}" --key "$DKEY" "$WORK/data.csv.gz" >/
 # manifest.files[].md5Checksum 与 AWS Inventory 一致：gzip 后字节 MD5 的 base64。
 MD5=$(python3 -c 'import base64,hashlib,sys;print(base64.b64encode(hashlib.md5(open(sys.argv[1],"rb").read()).digest()).decode())' "$WORK/data.csv.gz")
 SZ=$(stat -c %s "$WORK/data.csv.gz")
+echo "   inventory data: key=$DKEY size=$SZ md5=$MD5"
 python3 - "$WORK/manifest.json" "$DKEY" "$MD5" "$SZ" "${BUCKETS[3]}" <<'PY' || die "manifest 断言失败"
 import json,sys
 m=json.load(open(sys.argv[1]))
