@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { App, Button, Form, Input, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type InventoryConfig } from './api'
@@ -20,6 +20,8 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [form] = Form.useForm()
+  // 编辑既有配置：id 只读，is_enabled 保持原值（保存是整行 upsert）
+  const [editing, setEditing] = useState<InventoryConfig | null>(null)
 
   const { data: configs = [], isLoading } = useQuery({
     queryKey: ['inventory', bucket],
@@ -36,6 +38,8 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
       }),
     onSuccess: () => {
       message.success('清单配置已保存')
+      setEditing(null)
+      form.setFieldsValue({ id: undefined })
       invalidate()
     },
     onError: (e: Error) => message.error(e.message),
@@ -67,7 +71,7 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
     const v = await form.validateFields()
     save.mutate({
       id: v.id,
-      is_enabled: true,
+      is_enabled: editing?.is_enabled ?? true,
       frequency: v.frequency,
       destination_bucket: v.destination_bucket,
       destination_prefix: v.destination_prefix || null,
@@ -79,6 +83,7 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
   }
 
   const edit = (c: InventoryConfig) => {
+    setEditing(c)
     form.setFieldsValue({
       id: c.id,
       frequency: c.frequency,
@@ -145,7 +150,7 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
       <Form form={form} layout="vertical">
         <Space wrap size={12} align="start">
           <Form.Item name="id" label="配置 ID" rules={[{ required: true }]} style={{ width: 180 }}>
-            <Input placeholder="daily-inventory" />
+            <Input placeholder="daily-inventory" readOnly={editing !== null} />
           </Form.Item>
           <Form.Item name="frequency" label="频率" rules={[{ required: true }]}>
             <Select

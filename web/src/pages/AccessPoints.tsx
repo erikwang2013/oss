@@ -239,7 +239,7 @@ function TransformModal({ ap, onClose }: { ap: AccessPointInfo; onClose: () => v
   const kind = draft.kind ?? data?.kind ?? 'http'
   const endpoint = draft.endpoint ?? data?.endpoint ?? ''
   const timeoutMs = draft.timeout_ms ?? data?.timeout_ms ?? 5000
-  const maxBytes = draft.max_response_bytes ?? 64 * 1024 * 1024
+  const maxBytes = draft.max_response_bytes ?? data?.max_response_bytes ?? 64 * 1024 * 1024
 
   const save = useMutation({
     mutationFn: (body: Record<string, unknown>) =>

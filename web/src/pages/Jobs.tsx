@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -37,12 +38,21 @@ export default function Jobs() {
   const [batchOpen, setBatchOpen] = useState(false)
   const [detailId, setDetailId] = useState<number | null>(null)
 
-  const { data: jobs = [], isLoading } = useQuery({
+  const { data: jobs = [], isLoading, error } = useQuery({
     queryKey: ['jobs'],
     queryFn: () => api<JobSummary[]>('/api/v1/jobs'),
-    // 列表兼作进度面板：作业执行在后台，定时刷新即可（详情另有 2s 轮询）
-    refetchInterval: 15_000,
+    // 只有存在活动作业时才轮询（列表兼作进度面板；详情另有 2s 轮询）
+    refetchInterval: (q) =>
+      q.state.data?.some((j) => ['queued', 'running', 'paused'].includes(j.state)) ? 15_000 : false,
   })
+
+  // batch 没有 progress 字段：已完成 = succeeded+failed；未开始时不显示 0/N
+  const progressText = (j: JobSummary) => {
+    const total = j.total ?? '—'
+    if (j.kind !== 'batch') return `${j.scanned ?? '—'} / ${total}`
+    const done = j.progress ?? (j.succeeded ?? 0) + (j.failed ?? 0)
+    return done > 0 || ['done', 'error', 'cancelled'].includes(j.state) ? `${done} / ${total}` : `— / ${total}`
+  }
 
   return (
     <>
@@ -55,6 +65,7 @@ export default function Jobs() {
           </Button>
         }
       />
+      {error && <Alert type="error" showIcon message={error.message} style={{ marginBottom: 12 }} />}
       <Card styles={{ body: { padding: 0 } }}>
         <Table<JobSummary>
           rowKey="id"
@@ -73,7 +84,7 @@ export default function Jobs() {
             {
               title: '进度/总数',
               width: 110,
-              render: (_: unknown, j: JobSummary) => `${j.progress ?? j.scanned ?? '—'} / ${j.total ?? '—'}`,
+              render: (_: unknown, j: JobSummary) => progressText(j),
             },
             {
               title: '成功/失败',

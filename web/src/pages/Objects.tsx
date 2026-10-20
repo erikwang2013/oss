@@ -286,9 +286,11 @@ function TagsModal({
       okButtonProps={{ disabled: !canWrite }}
       footer={(_, { OkBtn, CancelBtn }) => (
         <>
-          <Button danger disabled={!canWrite || isLoading} onClick={() => clear.mutate()} style={{ float: 'left' }}>
-            清空全部
-          </Button>
+          <Popconfirm title="清空该对象的全部标签？" onConfirm={() => clear.mutate()} disabled={!canWrite || isLoading}>
+            <Button danger disabled={!canWrite || isLoading} style={{ float: 'left' }}>
+              清空全部
+            </Button>
+          </Popconfirm>
           <CancelBtn />
           <OkBtn />
         </>

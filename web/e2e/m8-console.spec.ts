@@ -31,6 +31,20 @@ async function newBucket(page: Page): Promise<string> {
   return bucket
 }
 
+/** 走浏览器 fetch 建访问点（避开创建弹窗的桶下拉选择）。 */
+async function newAccessPoint(page: Page, name: string, bucket: string) {
+  const status = await page.evaluate(async ({ name, bucket }) => {
+    const token = localStorage.getItem('oss.token')
+    const r = await fetch('/api/v1/access-points', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name, bucket }),
+    })
+    return r.status
+  }, { name, bucket })
+  expect(status).toBe(201)
+}
+
 /** 上传到默认分组（file → files），返回服务端落点键。 */
 async function uploadToFiles(page: Page, name: string, content: string): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), 'oss-e2e-m8-'))
@@ -117,6 +131,7 @@ test('事件通知：保存目标并回读，死信区块可见', async ({ page 
   await expect(page.getByLabel('通知配置 ID')).toHaveValue('cfg-e2e')
 
   await expect(page.getByRole('heading', { name: '死信事件' })).toBeVisible()
+  await expect(page.locator('.ant-table').last().getByText('暂无数据')).toBeVisible()
 })
 
 test('Select 工作台：上传 CSV 后执行 SELECT * 并渲染记录', async ({ page }) => {
@@ -151,6 +166,41 @@ test('访问点/作业/存储层：渲染表格并打开创建弹窗', async ({ 
   await page.getByRole('link', { name: '存储层' }).click()
   await expect(page.getByRole('heading', { name: '存储层' })).toBeVisible()
   await expect(page.getByRole('button', { name: /强制 sweep/ })).toBeVisible()
+  await expect(page.getByRole('columnheader', { name: 'Endpoint' })).toBeVisible()
+  await expect(page.getByRole('columnheader', { name: '健康' })).toBeVisible()
+  await expect(
+    page.locator('.ant-table-row').first().or(page.getByText('暂无数据').first()),
+  ).toBeVisible()
+})
+
+test('访问点：策略与变换器保存后回读（max_response_bytes 不丢）', async ({ page }) => {
+  await login(page)
+  const bucket = await newBucket(page)
+  const ap = `zzz-e2e-ap-${Date.now()}-${randomUUID().slice(0, 8)}`
+  await newAccessPoint(page, ap, bucket)
+
+  await page.getByRole('link', { name: '访问点' }).click()
+  const row = page.getByRole('row', { name: new RegExp(ap) })
+  await expect(row).toBeVisible()
+
+  // 策略：保存后列表 refetch，等「已配置」再重开断言
+  await row.getByRole('button', { name: /策\s*略/ }).click()
+  await page.getByLabel('访问点策略 JSON').fill('{"Statement":[]}')
+  await page.locator('.ant-modal').getByRole('button', { name: /保\s*存/ }).click()
+  await expect(page.getByText('策略已保存')).toBeVisible({ timeout: 15_000 })
+  await expect(row.getByText('已配置')).toBeVisible({ timeout: 15_000 })
+  await row.getByRole('button', { name: /策\s*略/ }).click()
+  await expect(page.getByLabel('访问点策略 JSON')).toHaveValue(/"Statement"/)
+  await page.locator('.ant-modal').getByRole('button', { name: /取\s*消/ }).click()
+
+  // 变换器：自定义 max_response_bytes 必须在重开时回读（I1 回归）
+  await row.getByRole('button', { name: '变换器' }).click()
+  await page.getByLabel('变换器 endpoint').fill('https://example.com/lambda')
+  await page.getByLabel('变换器 max_response_bytes').fill('1048576')
+  await page.locator('.ant-modal').getByRole('button', { name: /保\s*存/ }).click()
+  await expect(page.getByText('变换器已保存')).toBeVisible({ timeout: 15_000 })
+  await row.getByRole('button', { name: '变换器' }).click()
+  await expect(page.getByLabel('变换器 max_response_bytes')).toHaveValue('1048576')
 })
 
 test('桶清单与默认加密：保存配置并回读', async ({ page }) => {

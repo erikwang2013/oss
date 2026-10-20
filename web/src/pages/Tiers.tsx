@@ -1,4 +1,4 @@
-import { App, Button, Card, Table, Tag } from 'antd'
+import { Alert, App, Button, Card, Table, Tag } from 'antd'
 import { CloudUploadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type TierInfo } from '../api'
@@ -9,7 +9,7 @@ export default function Tiers() {
   const { message } = App.useApp()
   const qc = useQueryClient()
 
-  const { data: tiers = [], isLoading, isFetching, refetch } = useQuery({
+  const { data: tiers = [], isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['tiers'],
     queryFn: () => api<TierInfo[]>('/api/v1/tiers'),
   })
@@ -42,6 +42,7 @@ export default function Tiers() {
           </>
         }
       />
+      {error && <Alert type="error" showIcon message={error.message} style={{ marginBottom: 12 }} />}
       <Card styles={{ body: { padding: 0 } }}>
         <Table<TierInfo>
           rowKey="id"

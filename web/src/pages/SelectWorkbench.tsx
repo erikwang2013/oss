@@ -27,6 +27,10 @@ function renderCell(v: unknown) {
 /** CSV 输出是 string[][]（按列序号），JSON 输出是对象数组（按键并集）——两种都支持。 */
 function columnsFor(records: unknown[]) {
   const first = records[0]
+  // JSON 输出可能是标量数组（如 SELECT count(*)），按单列渲染
+  if (first !== undefined && (first === null || typeof first !== 'object')) {
+    return [{ title: '值', render: (_: unknown, r: Row) => renderCell(r.__row) }]
+  }
   if (first && typeof first === 'object' && !Array.isArray(first)) {
     const keys = Array.from(
       new Set(records.flatMap((r) => (r && typeof r === 'object' ? Object.keys(r) : []))),
