@@ -774,6 +774,13 @@ impl S3 for OssS3 {
                 }
             },
         };
+        // M9：对象锁与 sync 无跨站语义（retention/legal hold 只写本站）——建桶即拒。
+        if replication_mode == "sync" && req.input.object_lock_enabled_for_bucket == Some(true) {
+            return Err(s3s::s3_error!(
+                ConditionalRequestConflict,
+                "object lock is not supported on sync buckets"
+            ));
+        }
         // M9：陈旧行重建不得静默改模式（与 console 同口径，先于物理建桶）。
         match self.acl.bucket_replication_mode_row(&bucket).await {
             Ok(Some(existing)) if existing != replication_mode => {

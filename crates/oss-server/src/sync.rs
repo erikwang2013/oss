@@ -26,6 +26,16 @@ const INTENT_DONE: &str = "remote_done";
 /// 写 intent 恢复周期（启动时先跑一轮）。
 const INTENT_RECOVER_SECS: u64 = 30;
 
+/// 远端 4xx 中 409/400 是确定性拒绝，保留语义避免客户端对不可重试错误无限重试；
+/// 其余（403 本站凭证/配置问题、5xx、连接错误）一律 503 fail-closed。
+fn remote_gate_error(e: crate::repl_client::ReplError) -> GateError {
+    match e.status {
+        Some(409) => GateError::Conflict(format!("remote conflict: {}", e.message)),
+        Some(400) => GateError::Rejected(format!("remote rejected: {}", e.message)),
+        _ => GateError::Unavailable(format!("remote put failed: {}", e.message)),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BucketState {
     sync: bool,
@@ -318,10 +328,10 @@ impl PutCommitGate for SiteSyncGate {
         let peer = self.peer().await?;
         let client = Self::client(&peer)?;
         let body = tokio::fs::read(req.plaintext).await.map_err(|e| {
-            GateError::Unavailable(format!("read tee {}: {e}", req.plaintext.display()))
+            GateError::Internal(format!("read tee {}: {e}", req.plaintext.display()))
         })?;
         if body.len() as u64 != req.size {
-            return Err(GateError::Unavailable(format!(
+            return Err(GateError::Internal(format!(
                 "tee size mismatch: {} != {}",
                 body.len(),
                 req.size
@@ -347,10 +357,16 @@ impl PutCommitGate for SiteSyncGate {
         let remote = tokio::time::timeout(self.timeout, call)
             .await
             .map_err(|_| GateError::Unavailable("remote ack timeout".into()))?
-            .map_err(|e| GateError::Unavailable(format!("remote put failed: {}", e.message)))?
+            .map_err(remote_gate_error)?
             .ok_or_else(|| GateError::Unavailable("remote returned no version id".into()))?;
         if remote != req.local_version_id {
-            // 双站同 id 的硬契约破坏：502（不是重试可解的暂时不可用），intent 保留待 repair。
+            // 双站同 id 的硬契约破坏：502。恢复只按本地 id 补偿，远端异 id 版本无法自动定位；
+            // 记下远端 id 供 S3 sync-reconcile 修复（intent 保留不删）。
+            tracing::error!(
+                bucket = req.bucket, key = req.key,
+                local = req.local_version_id, remote = %remote,
+                "sync version id mismatch：远端异 id 版本需 repair"
+            );
             return Err(GateError::VersionMismatch(format!(
                 "sync version id mismatch: local {}, remote {remote}",
                 req.local_version_id

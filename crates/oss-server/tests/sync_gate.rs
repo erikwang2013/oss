@@ -46,6 +46,8 @@ enum Mode {
     Slow,
     WrongId,
     NoVersion,
+    Conflict,
+    BadRequest,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +200,8 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                                     resp.headers_mut()
                                         .insert("etag", format!("\"{etag}\"").parse().unwrap());
                                 }
+                                Mode::Conflict => *resp.status_mut() = StatusCode::CONFLICT,
+                                Mode::BadRequest => *resp.status_mut() = StatusCode::BAD_REQUEST,
                             }
                         }
                         Ok::<_, std::convert::Infallible>(resp)
@@ -643,6 +647,95 @@ async fn sync_write_boundaries_reject_unsupported_combinations() {
         .status(),
         409
     );
+    // MPU create / complete SSE-C → 400（与 PUT 同一 sync 边界）
+    let mut mpu_ssec = vec![ssec[0], ssec[1]];
+    mpu_ssec.push(("content-type", "text/plain"));
+    assert_eq!(
+        signed(
+            &e,
+            Method::POST,
+            "/syn/ssec-mpu.bin?uploads",
+            &mpu_ssec,
+            &[]
+        )
+        .await
+        .status(),
+        400
+    );
+    // complete 的 SSE-C 是直调兜底：先建普通 MPU 并传一个 part。
+    let r = signed(&e, Method::POST, "/syn/ssec-complete.bin?uploads", &[], &[]).await;
+    assert_eq!(r.status(), 200);
+    let xml = r.text().await.unwrap();
+    let upload_id = xml
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("create MPU 必须返回 UploadId")
+        .to_string();
+    let r = signed(
+        &e,
+        Method::PUT,
+        &format!("/syn/ssec-complete.bin?partNumber=1&uploadId={upload_id}"),
+        &[],
+        b"x",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let etag = r
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+         <ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let complete_headers = [("content-type", "application/xml"), ssec[0], ssec[1]];
+    assert_eq!(
+        signed(
+            &e,
+            Method::POST,
+            &format!("/syn/ssec-complete.bin?uploadId={upload_id}"),
+            &complete_headers,
+            complete.as_bytes()
+        )
+        .await
+        .status(),
+        400
+    );
+    // Copy dest SSE-C → 400 / dest 对象锁 → 409（源用 REPLICA 摄入，避免触远端）。
+    let origin = uuid::Uuid::new_v4().to_string();
+    let seed = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", origin.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::PUT, "/syn/copy-src.bin", &seed, b"src")
+            .await
+            .status(),
+        200
+    );
+    let copy_ssec = [("x-amz-copy-source", "/syn/copy-src.bin"), ssec[0], ssec[1]];
+    assert_eq!(
+        signed(&e, Method::PUT, "/syn/copy-ssec.bin", &copy_ssec, &[])
+            .await
+            .status(),
+        400
+    );
+    let copy_lock = [
+        ("x-amz-copy-source", "/syn/copy-src.bin"),
+        ("x-amz-object-lock-legal-hold", "ON"),
+    ];
+    assert_eq!(
+        signed(&e, Method::PUT, "/syn/copy-lock.bin", &copy_lock, &[])
+            .await
+            .status(),
+        409
+    );
     // Tagging API → 501
     let tag = br#"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>"#;
     assert_eq!(
@@ -701,6 +794,28 @@ async fn remote_failure_and_unversioned_are_503_and_invisible() {
         assert_eq!(outbox(&e.st, "syn", key).await, 0, "{mode:?} 不得入 outbox");
         assert_eq!(tee_entries(&e), 0, "{mode:?} 后 tee 必须清理");
     }
+}
+
+/// M9 S2 M4：远端 409/400 是确定性拒绝，保留语义，不折叠成可重试的 503。
+#[tokio::test]
+async fn remote_4xx_preserves_conflict_and_bad_request() {
+    let e = env(Mode::Conflict, 1 << 20).await;
+    assert_eq!(put(&e, "/syn/conflict.txt", b"x").await.status(), 409);
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/conflict.txt", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    *e.remote.mode.lock().unwrap() = Mode::BadRequest;
+    assert_eq!(put(&e, "/syn/bad.txt", b"x").await.status(), 400);
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/bad.txt", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(tee_entries(&e), 0);
 }
 
 /// M9 §2.4：远端 id 与本地预生成 UUID 不符 = 双站同 id 契约破坏 → 502（不可重试）。

@@ -43,21 +43,24 @@ pub struct GateTicket {
 
 #[derive(Debug, Error)]
 pub enum GateError {
-    /// 远端不可达/超时/版本 id 不符/本地前置不满足 → 503。
+    /// 远端不可达/超时/远端 5xx/本站配置不满足 → 503。
     #[error("{0}")]
     Unavailable(String),
     /// 超过 `[sync].max_object_bytes` → 400。
     #[error("object exceeds sync max_object_bytes")]
     TooLarge,
-    /// 门拒绝（如桶非 sync 形态）→ 400。
+    /// 门拒绝（远端 400 或本地能力边界）→ 400。
     #[error("{0}")]
     Rejected(String),
-    /// 本地前置不满足（sync 桶版本化未 Enabled）→ 409。
+    /// 本地前置不满足（sync 桶版本化未 Enabled）或远端 409 → 409。
     #[error("{0}")]
     Conflict(String),
     /// 远端 ack 的版本 id 与预生成 id 不符 → 502。
     #[error("{0}")]
     VersionMismatch(String),
+    /// 本地内部不变量破坏（tee 缺失/大小不符）→ 500，不诱导客户端重试。
+    #[error("{0}")]
+    Internal(String),
 }
 
 impl From<GateError> for crate::error::Error {
@@ -70,6 +73,7 @@ impl From<GateError> for crate::error::Error {
             GateError::Rejected(m) => Self::InvalidArgument(m),
             GateError::Conflict(m) => Self::Conflict(m),
             GateError::VersionMismatch(m) => Self::BadGateway(m),
+            GateError::Internal(m) => Self::Io(std::io::Error::other(m)),
         }
     }
 }
@@ -87,4 +91,16 @@ pub trait PutCommitGate: Send + Sync + std::fmt::Debug {
     async fn committed(&self, _ticket: &GateTicket) {}
     /// 桶复制模式变更（建桶/删桶/apply）失效缓存。默认无操作。
     fn invalidate(&self, _bucket: &str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 内部不变量破坏归 Io（s3 层 → 500），不是可重试的 503。
+    #[test]
+    fn internal_error_maps_to_io() {
+        let e: crate::error::Error = GateError::Internal("tee missing".into()).into();
+        assert!(matches!(e, crate::error::Error::Io(_)));
+    }
 }

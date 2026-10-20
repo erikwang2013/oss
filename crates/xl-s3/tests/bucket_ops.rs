@@ -472,6 +472,35 @@ async fn replication_mode_header_gate_and_readback() {
     );
 }
 
+/// M9 S2 I1：sync 建桶带对象锁 → 409，且拒绝发生在物理建桶前（同一入口矩阵）。
+#[tokio::test]
+async fn sync_create_with_object_lock_is_409() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s3 = OssS3::new(store, acl().await, 1024 * 1024).with_sync_ready(true);
+    let err = s3
+        .create_bucket(with_mode(
+            with_user(CreateBucketInput {
+                bucket: "sync-lock".into(),
+                object_lock_enabled_for_bucket: Some(true),
+                ..Default::default()
+            }),
+            "sync",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::ConditionalRequestConflict);
+    assert!(
+        s3.head_bucket(req(HeadBucketInput {
+            bucket: "sync-lock".into(),
+            ..Default::default()
+        }))
+        .await
+        .is_err(),
+        "拒绝必须发生在物理建桶前"
+    );
+}
+
 /// M9 S0：guard ABORT → 500 且物理桶回滚（绝不以成功返回）。
 #[tokio::test]
 async fn create_bucket_guard_abort_rolls_back_and_500() {
