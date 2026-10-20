@@ -300,6 +300,8 @@ impl AppState {
                 Arc::clone(&ap_cache),
                 Arc::clone(&olap_cache),
             ));
+        // M9 S4：stretch 首次启用标记（检查在 Store::open 前做，marker 在 open 成功后写）。
+        let mut stretch_first_init = false;
         // M3 集群（配了 [cluster] 才走）：静态拓扑 + 节点间传输注入存储内核。
         // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
         // ClusterTopology::new 与 Store::open（self 一致性）。
@@ -394,8 +396,14 @@ impl AppState {
                 resolver: None,
                 stretch: true,
             }));
+            stretch_first_init = stretch_startup_check(&db, &store_cfg.drives).await?;
         }
         let store = Store::open(store_cfg).await?;
+        if stretch_first_init {
+            db.schema_meta_set_if_absent("stretch_initialized", "1")
+                .await
+                .map_err(|e| format!("写入 stretch_initialized 失败: {e}"))?;
+        }
 
         // M5 切片 2：密钥库接线（**前提块**：须在 open 成功后——掉盘首启不得生成新主密钥；
         // 未在册时 init_encryption 内部门闩会拒启）。env 一个不设 = 不启用加密（零行为变化）：
@@ -779,6 +787,62 @@ fn sets_nodes_by_set(
     Ok(by_set.into_values().collect())
 }
 
+/// M9 S4（P1-7）：`[stretch]` 只允许全新部署——首次启用要求库内无桶/无 sync 桶、
+/// 各 data_dir 只有 `.oss.sys`；返回是否首次（调用方在 `Store::open` 成功后写标记）。
+/// P0-1：任何一次 stretch 启动都不得残留 M7 站点 outbox 行，否则 worker 会复制出
+/// 第二份整对象副本。
+async fn stretch_startup_check(db: &Db, drives: &[PathBuf]) -> Result<bool, String> {
+    let site_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM repl_outbox WHERE target_kind = 'site'")
+            .fetch_one(db.pool())
+            .await
+            .map_err(|e| format!("stretch 启动检查 repl_outbox 失败: {e}"))?;
+    if site_rows > 0 {
+        return Err(format!(
+            "stretch 禁止既有 M7 站点复制任务（repl_outbox target_kind='site' 共 {site_rows} 行）：\
+             请先导出对象并按全新部署重建"
+        ));
+    }
+    if db
+        .schema_meta("stretch_initialized")
+        .await
+        .map_err(|e| format!("stretch 启动检查 schema_meta 失败: {e}"))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let sync_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE replication_mode = 'sync'")
+            .fetch_one(db.pool())
+            .await
+            .map_err(|e| format!("stretch 启动检查 buckets 失败: {e}"))?;
+    let bucket_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| format!("stretch 启动检查 buckets 失败: {e}"))?;
+    if bucket_rows > 0 {
+        return Err(format!(
+            "stretch 只允许全新空库（buckets 共 {bucket_rows} 行、其中 sync 桶 {sync_rows} 个）：\
+             请先导出对象并清空库/盘后重启"
+        ));
+    }
+    for d in drives {
+        for ent in std::fs::read_dir(d)
+            .map_err(|e| format!("stretch 启动检查目录 {} 失败: {e}", d.display()))?
+            .flatten()
+        {
+            if ent.file_name() != std::ffi::OsStr::new(".oss.sys") {
+                return Err(format!(
+                    "stretch 只允许全新空存储（{} 含 {}）：请先导出并清空 data_dirs",
+                    d.display(),
+                    ent.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod login_limiter_tests {
     use super::*;
@@ -866,5 +930,85 @@ mod set_group_tests {
         assert!(err.contains("连续"), "{err}");
         let err = sets_nodes_by_set(&[node("n1", None), node("n2", Some(2))]).unwrap_err();
         assert!(err.contains("连续"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod stretch_startup_tests {
+    use super::*;
+
+    fn drives(tmp: &tempfile::TempDir) -> Vec<PathBuf> {
+        let d = tmp.path().join("d0");
+        std::fs::create_dir_all(&d).unwrap();
+        vec![d]
+    }
+
+    async fn empty_db() -> Db {
+        Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn fresh_store_ok_then_marker_skips_emptiness() {
+        let db = empty_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = drives(&tmp);
+        std::fs::create_dir_all(ds[0].join(".oss.sys")).unwrap();
+        assert!(stretch_startup_check(&db, &ds).await.unwrap());
+        db.schema_meta_set_if_absent("stretch_initialized", "1")
+            .await
+            .unwrap();
+        // 非首次启动不再要求空库/空盘（历史数据正常服务）
+        db.insert_bucket("old-b", None).await.unwrap();
+        assert!(!stretch_startup_check(&db, &ds).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn old_store_with_buckets_rejected() {
+        let db = empty_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = drives(&tmp);
+        db.insert_bucket_full("b", None, 0, "async").await.unwrap();
+        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
+        assert!(e.contains("全新空库"), "{e}");
+        assert!(e.contains("buckets 共 1 行"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn sync_bucket_rejected() {
+        let db = empty_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = drives(&tmp);
+        db.insert_bucket_full("s", None, 0, "sync").await.unwrap();
+        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
+        assert!(e.contains("sync 桶 1 个"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn bucket_dir_rejected() {
+        let db = empty_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = drives(&tmp);
+        std::fs::create_dir_all(ds[0].join("oldbucket")).unwrap();
+        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
+        assert!(e.contains("全新空存储"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn site_outbox_rows_rejected_even_after_marker() {
+        let db = empty_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = drives(&tmp);
+        db.schema_meta_set_if_absent("stretch_initialized", "1")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
+             dest_bucket, target_kind) VALUES ('b','k','v','e',1,'r','b','site')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
+        assert!(e.contains("target_kind='site'"), "{e}");
     }
 }

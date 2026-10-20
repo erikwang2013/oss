@@ -4,7 +4,7 @@
 pub const RAFT_READY: bool = false;
 /// sync 桶创建/读写是否可用。S3 出口翻转。
 pub const SYNC_READY: bool = false;
-/// stretch 2×6 数据面是否可用。S4 出口翻转。
+/// stretch 2×6 数据面（S4）已实现；控制面（Raft 桶创建/身份配对）就绪后随 S7/S9 翻转。
 pub const STRETCH_READY: bool = false;
 
 /// `GET /api/v1/raft/status` 的 S0 骨架（S5 补 leader/term/applied）。

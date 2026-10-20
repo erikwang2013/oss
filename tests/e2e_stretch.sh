@@ -31,8 +31,7 @@ A_MESH=$(free_port); B_MESH=$(free_port)
 A="http://127.0.0.1:$A_HTTP"; B="http://127.0.0.1:$B_HTTP"
 W=$(mktemp -d)
 MESH_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
-RAFT_TOKEN_A=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
-RAFT_TOKEN_B=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
+RAFT_TOKEN=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
 TOK_A=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 TOK_B=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 A_ADMIN="erik"; A_PW="pw-admin-a"
@@ -66,8 +65,9 @@ wait_tcp() { # port
 # mk_cfg <dir> <node> <peer> <http> <mesh> <peer_mesh> <raft_id> <bootstrap>
 mk_cfg() {
   local dir="$W/$1" node="$2" peer="$3" http="$4" mesh="$5" peermesh="$6" raft_id="$7" boot="$8"
-  local token="$TOK_A" raft_token="$RAFT_TOKEN_A" region="r1"
-  [ "$node" = "B" ] && { token="$TOK_B"; raft_token="$RAFT_TOKEN_B"; region="r2"; }
+  # cluster_token 两端一致（S7/S9 三投票人握手要求）；仅站点 token/区域不同
+  local token="$TOK_A" raft_token="$RAFT_TOKEN" region="r1"
+  [ "$node" = "B" ] && { token="$TOK_B"; region="r2"; }
   mkdir -p "$dir"
   local dirs=()
   for i in 0 1 2 3 4 5; do mkdir -p "$dir/d$i"; dirs+=("\"$dir/d$i\""); done
@@ -177,6 +177,16 @@ head -c 4096 /dev/urandom > "$W/small.bin"
 ck aws_a s3 cp "$W/big.bin" "s3://$BUCKET/big.bin"
 ck aws_a s3 cp "$W/small.bin" "s3://$BUCKET/small.bin"
 
+echo "== 2b. P0-1：每站 1 版本 / 无站点 outbox / 无异步整对象副本 =="
+ck [ "$(aws_a s3api list-object-versions --bucket "$BUCKET" --prefix big.bin --query 'length(Versions)' --output text)" = "1" ]
+ck [ "$(aws_b s3api list-object-versions --bucket "$BUCKET" --prefix big.bin --query 'length(Versions)' --output text)" = "1" ]
+for D in a b; do
+  n=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=5); print(c.execute(\"SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site'\").fetchone()[0])" "$W/$D/oss.db")
+  ck [ "$n" = "0" ]
+done
+# B 只有 6 个 EC 分片（12 才意味着 M7 异步整对象副本）
+ck [ "$(find "$W/b"/d[0-5] -type f -path '*/big.bin/*' -name 'part.1.*' 2>/dev/null | wc -l)" = "6" ]
+
 echo "== 3. 两站点读一致 + HEAD =="
 ck aws_a s3 cp "s3://$BUCKET/big.bin" "$W/big.a"
 ck aws_b s3 cp "s3://$BUCKET/big.bin" "$W/big.b"
@@ -188,23 +198,26 @@ ck [ "$(aws_b s3api head-object --bucket "$BUCKET" --key big.bin --query Content
 ck [ "$(aws_a s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text)" = \
     "$(aws_b s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text)" ]
 
-echo "== 4. 分片/meta 落盘证明（每站点 6 片/块、每盘 1 片、meta 12 份同哈希）=="
+echo "== 4. 分片/meta 落盘证明（每站点每对象 6 片、每盘 1 片、meta 跨站 12 份同哈希）=="
+# 每站点只落本地 6 槽：big + small 各 6 片 → 12；所有块同 part.1（块内偏移追加），无 part.2
 parts_a=$(find "$W/a"/d[0-5] -type f -name 'part.*' 2>/dev/null | wc -l)
 parts_b=$(find "$W/b"/d[0-5] -type f -name 'part.*' 2>/dev/null | wc -l)
-# big.bin = 2 块 × 12 片；small.bin = 1 块 × 12 片 → 每站点 (2+1)×6 = 18
-ck [ "$parts_a" = "18" ]
-ck [ "$parts_b" = "18" ]
-# 每块每站点恰 6 片（1 片/盘）
-for p in 1 2; do
-  n=$(find "$W/a"/d[0-5] -type f -name "part.$p.*" 2>/dev/null | wc -l)
-  ck [ "$n" = "6" ]
-done
-# 每个 drive 上都有分片（12 片覆盖 12 盘，1 片/盘/块）
+ck [ "$parts_a" = "12" ]
+ck [ "$parts_b" = "12" ]
+ck [ "$(find "$W/a"/d[0-5] -type f -name 'part.2.*' 2>/dev/null | wc -l)" = "0" ]
+# 每对象每站点恰 6 片（1 片/盘）
+ck [ "$(find "$W/a"/d[0-5] -type f -path '*/big.bin/*' -name 'part.1.*' 2>/dev/null | wc -l)" = "6" ]
+ck [ "$(find "$W/a"/d[0-5] -type f -path '*/small.bin/*' -name 'part.1.*' 2>/dev/null | wc -l)" = "6" ]
+# 每个 drive 上都有分片（12 片覆盖 12 盘，1 片/盘）
 for d in 0 1 2 3 4 5; do
   ck [ "$(find "$W/a/d$d" -type f -name 'part.*' 2>/dev/null | wc -l)" -ge 1 ]
 done
+# 每站每对象 meta 6 份（各写本地 6 盘），两站合计 12；镜像内容逐字节相同
 meta_a=$(find "$W/a"/d[0-5] -type f -path '*/big.bin/*' -name xl.meta 2>/dev/null | wc -l)
-ck [ "$meta_a" = "12" ]
+meta_b=$(find "$W/b"/d[0-5] -type f -path '*/big.bin/*' -name xl.meta 2>/dev/null | wc -l)
+ck [ "$meta_a" = "6" ]
+ck [ "$meta_b" = "6" ]
+ck [ "$((meta_a + meta_b))" = "12" ]
 uniq_meta=$(find "$W/a"/d[0-5] -type f -path '*/big.bin/*' -name xl.meta -exec sha256sum {} + 2>/dev/null | cut -d' ' -f1 | sort -u | wc -l)
 ck [ "$uniq_meta" = "1" ]
 
@@ -216,8 +229,8 @@ fi
 if aws_a_t s3 cp "$W/small.bin" "s3://$BUCKET/while-b-down.bin" >/dev/null 2>&1; then
   echo "FAIL: 停 B 后 PUT 不应成功"; FAILS=$((FAILS+1))
 fi
-# 单站点 6 片 < data=8：离线不可重建（对象目录里只有本站点分片）
-ck [ "$(find "$W/a"/d[0-5] -type f -name 'part.1.*' 2>/dev/null | wc -l)" -lt 8 ]
+# big 对象在 A 只有本地 6 片 < data=8：离线不可重建（按对象统计，不混入 small）
+ck [ "$(find "$W/a"/d[0-5] -type f -path '*/big.bin/*' -name 'part.1.*' 2>/dev/null | wc -l)" = "6" ]
 
 echo "== 6. 恢复 B：GET 重新成功 =="
 start_b
@@ -236,37 +249,56 @@ if aws_b_t s3 cp "s3://$BUCKET/big.bin" "$W/down2.bin" >/dev/null 2>&1; then
 fi
 start_a
 
-echo "== 8. 配置负例（每项必须非零退出，不启动）=="
-neg() { # name python-transform
-  local name="$1" code="$2" d="$W/neg" port
-  port=$(free_port)
-  rm -rf "$d"; mkdir -p "$d"
-  python3 - "$W/a/oss.toml" "$d/oss.toml" "$code" "$port" <<'PY'
+echo "== 8. 配置负例（每项必须非零退出，且日志含预期校验文案）=="
+neg() { # name expected-log-text python-transform
+  local name="$1" expect="$2" code="$3" d="$W/neg" port mesh peer i
+  port=$(free_port); mesh=$(free_port); peer=$(free_port)
+  rm -rf "$d"; mkdir -p "$d" "$d/staging"
+  local dirs=""
+  for i in 0 1 2 3 4 5; do mkdir -p "$d/d$i"; dirs+="\"$d/d$i\","; done
+  # 所有监听/存储先指向隔离副本：负例即使意外放行，也不碰 A 的端口或在线数据
+  python3 - "$W/a/oss.toml" "$d/oss.toml" "$code" "$port" "$mesh" "$peer" "${dirs%,}" "$d" <<'PY'
 import re, sys
-src, dst, code, port = sys.argv[1:5]
+src, dst, code, port, mesh, peer, dirs, base = sys.argv[1:9]
 t = open(src).read()
-exec(code)
-# 负例若意外通过校验也不得撞正在运行的 A：换监听端口与库路径
 t = re.sub(r'listen = "[^"]*"', 'listen = "127.0.0.1:%s"' % port, t, count=1)
-t = re.sub(r'database_url = "[^"]*"', 'database_url = "sqlite://%s/oss.db?mode=rwc"' % dst.rsplit("/", 1)[0], t, count=1)
+t = re.sub(r'database_url = "[^"]*"', 'database_url = "sqlite://%s/oss.db?mode=rwc"' % base, t, count=1)
+t = re.sub(r'self_addr = "[^"]*"', 'self_addr = "127.0.0.1:%s"' % mesh, t, count=1)
+t = re.sub(r'peer_addr = "[^"]*"', 'peer_addr = "127.0.0.1:%s"' % peer, t, count=1)
+t = re.sub(r'data_dir = "[^"]*"', 'data_dir = "%s/d0"' % base, t, count=1)
+t = re.sub(r'data_dirs = \[.*?\]', 'data_dirs = [%s]' % dirs, t, count=1)
+t = re.sub(r'staging_dir = "[^"]*"', 'staging_dir = "%s/staging"' % base, t, count=1)
+exec(code)
 open(dst, "w").write(t)
 PY
   ( cd "$d" && timeout 10 "$BIN" serve >"$d/$name.log" 2>&1 )
   local rc=$?
   if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
     echo "FAIL: 负例 $name 未被拒（rc=$rc）"; FAILS=$((FAILS+1)); tail -5 "$d/$name.log"
+  elif ! grep -qF -- "$expect" "$d/$name.log"; then
+    echo "FAIL: 负例 $name 文案不含 «$expect»"; FAILS=$((FAILS+1)); tail -5 "$d/$name.log"
   fi
 }
-neg inline_nonzero  't = t.replace("inline_threshold = 0", "inline_threshold = 1024")'
-neg five_drives     'import re; m = re.search(r"data_dirs = \[(.*?)\]", t); p = m.group(1).split(", "); t = t.replace(m.group(0), "data_dirs = [" + ", ".join(p[:-1]) + "]")'
-neg peer_five       't = t.replace("peer_drives = 6", "peer_drives = 5")'
-neg ec_8_3          't = t.replace("parity = 4", "parity = 3")'
-neg placement_v1    't = t.replace("placement = \"v2\"", "placement = \"v1\"")'
-neg https_peer      't = t.replace("peer_addr = \"127.0.0.1:", "peer_addr = \"https://127.0.0.1:")'
-neg self_eq_raft    'import re; mesh = re.search(r"self_addr = \"127\.0\.0\.1:(\d+)\"", t).group(1); t = re.sub(r"advertise_endpoint = \"http://127\.0\.0\.1:\d+\"", "advertise_endpoint = \"http://127.0.0.1:" + mesh + "\"", t)'
-neg no_raft         'import re; t = re.sub(r"\n\[raft\][\s\S]*", "", t)'
-neg no_site         'import re; t = re.sub(r"\n\[site\][\s\S]*?(?=\n\[stretch\])", "", t)'
-neg with_cluster    't += "\n[cluster]\nnode_id = \"A\"\nsecret = \"x\"\nnodes = []\n"'
+neg inline_nonzero '[stretch] 要求 [ec].inline_threshold=0' \
+    't = t.replace("inline_threshold = 0", "inline_threshold = 1024")'
+neg five_drives    '[stretch] 本站点必须配置恰好 6 条 [[data_dirs]]' \
+    'import re; m = re.search(r"data_dirs = \[(.*?)\]", t); p = [x for x in m.group(1).split(",") if x.strip()]; t = t.replace(m.group(0), "data_dirs = [" + ",".join(p[:-1]) + "]")'
+neg peer_five      '[stretch].peer_drives 必须为 6，实际 5' \
+    't = t.replace("peer_drives = 6", "peer_drives = 5")'
+neg ec_8_3         '[stretch] 要求 [ec] enabled=true、data=8、parity=4' \
+    't = t.replace("parity = 4", "parity = 3")'
+neg placement_v1   '[stretch].placement 只支持 "v2"' \
+    't = t.replace("placement = \"v2\"", "placement = \"v1\"")'
+neg https_peer     '[stretch].peer_addr 必须是 host:port 或 http://host:port' \
+    't = t.replace("peer_addr = \"127.0.0.1:", "peer_addr = \"https://127.0.0.1:")'
+neg self_eq_raft   '[stretch].self_addr 不能与 [raft].advertise_endpoint 同端口' \
+    'import re; mesh = re.search(r"self_addr = \"127\.0\.0\.1:(\d+)\"", t).group(1); t = re.sub(r"advertise_endpoint = \"http://127\.0\.0\.1:\d+\"", "advertise_endpoint = \"http://127.0.0.1:" + mesh + "\"", t)'
+neg no_raft        '[stretch] 需要 [raft]' \
+    'import re; t = re.sub(r"\n\[raft\][\s\S]*", "", t)'
+neg no_site        '[stretch] 需要 [site]' \
+    'import re; t = re.sub(r"\n\[site\][\s\S]*?(?=\n\[stretch\])", "", t); t = re.sub(r"\n\[raft\][\s\S]*", "", t)'
+neg with_cluster   '[site] 与 [cluster] 互斥' \
+    't += "\n[cluster]\nnode_id = \"A\"\nsecret = \"x\"\nnodes = []\n"'
 
 echo "== 结果 =="
 if [ "$FAILS" -ne 0 ]; then
