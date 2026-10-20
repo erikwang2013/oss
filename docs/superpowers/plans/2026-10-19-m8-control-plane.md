@@ -652,7 +652,8 @@ lifecycle 新列、`idx_lifecycle_rule_id` 存在；重复 connect 幂等。`000
   日志（孤儿，无 GC）。`OssS3::with_restore` 仍在本片。
 - 事件：白名单增 `s3:LifecycleTransition`、`s3:ObjectRestore:Post`、`s3:ObjectRestore:Completed`；
   Restore 受理发 Post，完成发 Completed；`RestoreObjectOutput` 无状态字段，必须用
-  `S3Response.status/headers` 覆盖 202 + `x-amz-restore`；GET/HEAD 可用 s3s DTO 的 `restore` 字段
+  `S3Response.status/headers` 覆盖 202 + `x-amz-restore`（线上被 s3s 0.17 固定为 200，见「定稿」）；
+  GET/HEAD 可用 s3s DTO 的 `restore` 字段
   或响应头输出，`tag_count` 属 P0 契约（GET/HEAD）。
 - 测试：meta/旧 meta；类 PUT/HEAD/GET/List/Copy/MPU；归档类直写拒绝；mock tier Transition
   （字节/SHA、本地回收、重复 sweep 去重、replication pending 跳过）；MPU 源 Transition（不比较
@@ -718,7 +719,7 @@ lifecycle 新列、`idx_lifecycle_rule_id` 存在；重复 connect 幂等。`000
   4. 分层：mock tier（本地 axum S3 stub 或第二 oss 实例）→
      `aws s3api put-bucket-lifecycle-configuration` 建 Transition 规则（GLACIER、days=0）→
      `get-bucket-lifecycle-configuration` 断言回读 → `POST /tiers/sweep` force → HEAD 类 →
-     GET 403 → Restore 202/完成可读 → `delete-bucket-lifecycle` 后 GET 404；到期回收由
+     GET 403 → Restore 受理（线上 200，见定稿）/完成可读 → `delete-bucket-lifecycle` 后 GET 404；到期回收由
      `m8_tier.rs` 用 past expiry 直接调 reaper；
   5. 回归：标准 S3、STS、M4 lifecycle、M6/M7 复制。
 - 文档：README「M8 控制面」；设计 §M8 落地状态/偏差（M6 重试不迁移、HEAD 不变换、单节点、
@@ -810,7 +811,25 @@ S6 之外的控制面缺口以 Task 7a/7b/7c 收口（不在原 S0–S6 编号�
   2026-10-17 决定另行处理）；M9 同步强一致不在 M8。
 - 其余设计偏差见设计文档 §M8「与设计的偏差（记档）」。
 
-## 定稿（待）
+## 定稿（2026-10-20）
 
-- 实施完成后补：提交哈希、七闸与 feature/web/e2e 计数、评审/对抗轮次、残余边界。
+- 代码 HEAD：`8116a12`（S0–S6 + 7a/7b/7c；Task 6b 未改 Rust/Web 源码）。
+- 文档/e2e 提交：`a3579ee`（README、设计/功能规格、两张 SVG、`tests/e2e_m8.sh`）；
+  本定稿与报告另提交。
+- 七闸（base `8116a12`）：① `xl-store` 220 passed / 1 ignored；② kill9 专项 1 passed；
+  ③ `oss-server` 203 passed；④ `xl-s3` 181 passed / **1 failed**；⑤ `xl-client`+`xl-proto`
+  5 passed；⑥ clippy `--workspace --all-targets -D warnings` exit 0；⑦ fmt `--check` exit 0。
+- ④ 唯一失败 `olap_ops::checksum_headers_removed_after_transform` 为测试夹具过期：内联
+  `SCHEMA` 缺 `default_encryption` 列（生产库由 0003 迁移补列），非产品缺陷；feature 闸
+  `-p xl-s3 --features olap-wasm` 同因 185 passed / 1 failed。受限「不改 Rust」未修夹具。
+- Web：`npm test` 18 passed（3 files）；`npm run build` 通过；Playwright `m8-console` 9 passed。
+- E2E：`tests/e2e_m8.sh` 全跑 **PASS**，耗时 4679s（约 78 分钟；1 worker × 1s 间隔、
+  1000 与 1000+1 两个 Batch 作业）；步骤 4 Tier=ran，步骤 6 默认 SKIP。
+  另单独执行 M6 `tests/e2e_replication.sh` 与 M7 `tests/e2e_sites.sh`：均 PASS（exit 0）。
+- 评审/修复：Task 6b 自审（按任务约束未另设评审子代理）；e2e 多轮运行中发现并修正 5 处
+  脚本/文档缺陷——Inventory MD5 base64、`Transitions` 列表、版本/删除标记清理、
+  Restore 线上 200、Batch 拆为 1000 与 1001 两段。
+- 残余边界：RestoreObject 线上 200（s3s 0.17 生成代码丢弃 handler 的 202）；SQLite 单写者
+  `finish_task` 读→写升级可能锁冲突，任务延迟到 deadline 回收（建议 1 worker 或改造事务）；
+  失败重试退避含 `now%1000` 秒抖动；控制面单节点；tier 仅远端 http。
 - 发布：仅本地提交；推送/tag/Release 待用户明确口令。

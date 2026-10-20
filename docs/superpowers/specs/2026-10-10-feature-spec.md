@@ -817,7 +817,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |
 | **M6** | 事件总线 + Kafka 通知（含 `ecat-mq-kafka`）· S3 Select · 桶复制（含 `ecat-data-s3` 扩展）· 事件页 · Select 工作台 |
 | **M7** | 跨站点异步双向复制 · 站点身份与管理 API · 配置/IAM 日志复制 · 站点页 |
-| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**进行中：P0 标签/Copy 指令、S0 作业引擎、S4a 分层元数据、S1 访问点已落地；S2/S4b/S5/S3/S6 未实施**） |
+| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）**；非目标：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换、AP 主机别名/匿名/跨账号；M9 另列） |
 | **M9** | 控制面 `openraft` 跨站点强一致 · sync 桶 · stretch EC · 站点故障语义 |
 
 **与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 与 `2026-10-10-m1b-frontend-console.md` 回答「M1 前后端怎么写」（逐任务代码与测试）。

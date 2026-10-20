@@ -320,10 +320,10 @@ App::builder()
 
 ### 7.1 作业引擎（M8 引入，但 M4 的生命周期转换就有雏形）
 
-**落地状态（2026-10-19）**：S0 已落地 `jobs/job_tasks`（`0003_m8.sql`）、
+**落地状态（2026-10-20）**：S0 已落地 `jobs/job_tasks`（`0003_m8.sql`）、
 `BEGIN IMMEDIATE` 领取、优先级、指数退避、超时回收、失败重试子作业、CSV 报告与
-控制台详情/暂停/恢复/取消/retry-failed API。Batch/Transition/Restore/Inventory 的
-任务动作随 S3/S4b/S5 接入；M6 复制重试与 M4 生命周期过期删除**不迁入**本引擎（M8 钉）。
+控制台详情/暂停/恢复/取消/retry-failed API；Batch/Transition/Restore/Inventory 任务动作
+已接入（S3/S4b/S5）。M6 复制重试与 M4 生命周期过期删除**不迁入**本引擎（M8 钉）。
 
 一个引擎，五个消费者：**Batch Operations · 生命周期存储类转换 · Glacier Restore · Inventory 生成 · 复制积压重试**。
 
