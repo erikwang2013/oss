@@ -106,6 +106,7 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：控制面并发写三端一致、sync remote-first + 断连 503、stretch 2×6 单站故障/恢复；能力未接线自动 SKIP） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
 `xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。
@@ -1015,6 +1016,20 @@ AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:900
 cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空闲；约 8–15 分钟（含 §⑤ 超时预算）
 # 含 §0c：桶行广播接线（建/删桶后各节点即时一致，免重启——M5 切片 0 遗留断言）
 ```
+
+M9 强一致端到端（自动起 A/B 数据站点 + witness C，端口/目录全自动，退出清理）：
+
+```bash
+cargo build -p oss-server && tests/e2e_m9.sh              # 默认 sync 模式（约 3–6 分钟）
+M9_STRETCH=1 tests/e2e_m9.sh                              # Stretch EC 2×6 模式（约 3–6 分钟）
+# OSS_BIN=target/debug/oss-server 可指定二进制；M9_STRICT=1 把 SKIP 升级为 FAIL（功能齐备后 CI 用）。
+```
+
+功能门控：脚本读 `GET /api/v1/raft/status` 的 `capabilities.{raft,sync,stretch}` 决定跑哪些段。
+未接线的构建会以 `SKIP: 原因` 显式跳过对应段并退出 0（不是静默省段）；Raft 存量构建的
+`enabled=false` 同样按能力处理。sync 桶与 stretch 按计划 v3 **互斥**（同一集群不可同时启用），
+默认跑步骤 1/2/3/5，`M9_STRETCH=1` 跑 1/2/4/5（步骤 3 显式 SKIP）。sync/stretch 的能力为
+false 时，对应步骤只跳过而不伪造通过；功能齐备后的验收请加 `M9_STRICT=1` 以捕获回归。
 
 ## 参考文档
 
