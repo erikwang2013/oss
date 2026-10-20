@@ -186,7 +186,7 @@ const SCHEMA: &str = "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT,
  CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL DEFAULT 0, \
   versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, \
   object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, \
-  object_lock_default_days INTEGER);\
+  object_lock_default_days INTEGER, default_encryption TEXT);\
  CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
   can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, \
   can_delete INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, bucket));\
