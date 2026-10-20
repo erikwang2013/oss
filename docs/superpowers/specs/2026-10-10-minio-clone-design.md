@@ -590,9 +590,9 @@ S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 T
   无 GC/对账；恢复到期精度约 300s。
 - Object Lambda 只做读变换；HTTP 变换器默认，WASM 需 `olap-wasm` feature；输出全缓冲；
   输入/输出/超时/并发限额与 SSRF 拒绝见 S2 实现。
-- RestoreObject 线上 HTTP 状态是 200 而非 202：s3s 0.17 的生成代码固定按 `200 OK` 序列化
-  并丢弃 `S3Response.status`（服务层设置的 202 仅进程内可见）；`x-amz-restore:
-  ongoing-request="true"` 与异步恢复语义不受影响。
+- RestoreObject 返回 202 + `x-amz-restore: ongoing-request="true"`。s3s 0.17 的生成代码
+  固定按 `200 OK` 序列化并丢弃 `S3Response.status`（服务层设置的 202 仅进程内可见），
+  router 层中间件把 POST `?restore` 的 200 改写为 202；错误状态与其它请求原样透传。
 - AP 仅路径式 `/ap/<name>/<key>`，无 `<name>-s3alias`、匿名、跨账号或 VPC 来源限制。
 - S6 补齐先前记档的 M4/M5/M6 控制台缺口页（审计过滤、通知死信、SSE/KMS 只读、Select 代理、
   IAM 预设、桶默认加密、对象标签编辑）+ M8 页面（访问点/作业/分层/清单）；未新增计划外

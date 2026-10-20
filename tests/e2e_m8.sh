@@ -334,9 +334,9 @@ PY
     RCODE=$(curl -sS -i --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" -X POST \
       "$ENDPOINT/${BUCKETS[5]}/archived.bin?restore" -H 'x-amz-restore-request: days=1' \
       -o "$WORK/restore.http" -w '%{http_code}') || die "restore-object 请求失败"
-    # 线上实际 200：s3s 0.17 的 RestoreObject 生成代码固定按 200 OK 序列化，丢弃
-    # S3Response.status（server 层设的 202 只在进程内可见）。语义仍为异步受理。
-    [ "$RCODE" = 200 ] || die "restore-object HTTP $RCODE ≠ 200（s3s 0.17 线上实际值）：$(head -c 300 "$WORK/restore.http")"
+    # s3s 0.17 的 RestoreObject 生成代码固定按 200 OK 序列化并丢弃 S3Response.status；
+    # router 层中间件把 POST ?restore 的 200 改写回 S3 语义的 202。
+    [ "$RCODE" = 202 ] || die "restore-object HTTP $RCODE ≠ 202：$(head -c 300 "$WORK/restore.http")"
     grep -qi '^x-amz-restore: ongoing-request="true"' "$WORK/restore.http" || die "restore 响应缺 x-amz-restore ongoing"
     rd_ok() { aws_api get-object --bucket "${BUCKETS[5]}" --key archived.bin "$WORK/restored.out" >/dev/null 2>&1 && cmp -s "$WORK/tier.bin" "$WORK/restored.out"; }
     wait_true "$TIER_TIMEOUT" "恢复" rd_ok || die "对象未在 ${TIER_TIMEOUT}s 内可读/字节不符"
@@ -344,7 +344,7 @@ PY
     OUT=$(aws_api get-bucket-lifecycle-configuration --bucket "${BUCKETS[5]}" 2>&1) && die "删规则后 GET lifecycle 应 404"
     echo "$OUT" | grep -q NoSuchLifecycleConfiguration || die "删规则后未回 404：$OUT"
     TIER_STEP=ran
-    echo "   Transition GLACIER / GET 403 / Restore 200+ongoing / 恢复可读 / 删规则 404 通过"
+    echo "   Transition GLACIER / GET 403 / Restore 202+ongoing / 恢复可读 / 删规则 404 通过"
   fi
 fi
 

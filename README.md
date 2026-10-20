@@ -907,7 +907,7 @@ curl -s $E/api/v1/tiers -H "authorization: Bearer $JWT"                    # [{i
 aws --endpoint-url $E s3api head-object --bucket b --key k                 # StorageClass=GLACIER
 aws --endpoint-url $E s3api get-object --bucket b --key k out              # 403 InvalidObjectState
 curl -si --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" \
-  -X POST "$E/b/k?restore" -H 'x-amz-restore-request: days=1'              # 200 + ongoing-request="true"（见下）
+  -X POST "$E/b/k?restore" -H 'x-amz-restore-request: days=1'              # 202 + ongoing-request="true"（见下）
 aws --endpoint-url $E s3api get-object --bucket b --key k out              # 恢复完成后可读
 aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 ```
@@ -918,10 +918,10 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
   按对象去重，仅当前非加密非分层版本，单次 ≤10000 对象；全内存搬运（单对象 ≤`OSS_TIER_MAX_BYTES`，默认 1 GiB）。
 - Restore：body XML `<RestoreRequest><Days>n</Days></RestoreRequest>` 或
   `x-amz-restore-request: days=n[,tier=]`，days 1..=36500（缺省 1）；返回
-  `x-amz-restore: ongoing-request="true"`；HEAD 三态（Archived 无头 / Restoring /
+  HTTP 202 + `x-amz-restore: ongoing-request="true"`；HEAD 三态（Archived 无头 / Restoring /
   Restored `ongoing-request="false", expiry-date=…`）。
-  已知偏差：s3s 0.17 的 RestoreObject 生成代码固定按 200 OK 序列化并丢弃
-  `S3Response.status`，故线上 HTTP 状态是 200（进程内 handler 设的 202 不可达）。
+  s3s 0.17 的 RestoreObject 生成代码固定按 200 OK 序列化并丢弃 `S3Response.status`；
+  router 层中间件把 POST `?restore` 的 200 改写为 202（错误状态与其它请求原样透传）。
 - 到期回收：reaper `OSS_TIER_REAPER_INTERVAL_SECS`（默认 300），精度约 300s；过期后回到
   Archived（GET 再次 403）。启动时对账 pending/restored 行与 Version。
 - 边界：tier 仅远端 S3（无本地冷盘池）、endpoint 仅 http、无远端 GC/对账（删除 best-effort，
@@ -954,8 +954,8 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    无 GC/对账；恢复到期精度约 300s。
 8. 作业状态库内 `done/error`（映射 Completed/Failed）；取消时未执行任务不进报告；
    CSV 不做公式转义。
-9. RestoreObject 线上 HTTP 状态为 200 而非 202：s3s 0.17 生成代码丢弃
-   `S3Response.status`；`x-amz-restore` 头与恢复语义不受影响。
+9. RestoreObject 的 202 由 router 层中间件补写（s3s 0.17 生成代码丢弃
+   `S3Response.status`）；识别口径为 POST + `restore` 查询子资源。
 
 ## 验收
 

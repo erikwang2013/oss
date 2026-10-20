@@ -94,8 +94,29 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         .nest("/api/v1", console)
         .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
-        .with_state(state);
+        .with_state(state)
+        // 层在路由之后挂：同时包住 fallback（S3 面）。
+        .layer(middleware::from_fn(restore_accepted));
     Ok(app)
+}
+
+/// s3s 0.17 的 RestoreObject 生成代码固定按 `200 OK` 序列化并丢弃 `S3Response.status`，
+/// handler 里设的 202 到不了线上；这里在 HTTP 层补回 S3 语义（仅 POST `?restore`，
+/// 且只改写 200，错误状态原样透传）。`x-amz-restore` 服务已设置，entry 避免重复。
+async fn restore_accepted(req: Request, next: Next) -> Response {
+    let is_restore = req.method() == axum::http::Method::POST
+        && req.uri().query().is_some_and(|q| {
+            q.split('&')
+                .any(|kv| kv.split('=').next() == Some("restore"))
+        });
+    let mut res = next.run(req).await;
+    if is_restore && res.status() == StatusCode::OK {
+        *res.status_mut() = StatusCode::ACCEPTED;
+        res.headers_mut()
+            .entry(header::HeaderName::from_static("x-amz-restore"))
+            .or_insert(HeaderValue::from_static("ongoing-request=\"true\""));
+    }
+    res
 }
 
 /// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
@@ -289,6 +310,59 @@ async fn handle_s3_error(err: s3s::HttpError) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::label_escape;
+    use axum::http::StatusCode;
+
+    /// RestoreObject 线上状态修复：仅 POST `?restore` 的 200 → 202 + `x-amz-restore`；
+    /// 普通 POST/GET 与形似查询（`x-restore`）原样通过。
+    #[tokio::test]
+    async fn restore_post_is_rewritten_to_202() {
+        async fn ok() -> StatusCode {
+            StatusCode::OK
+        }
+        let app = axum::Router::new()
+            .fallback(ok)
+            .layer(axum::middleware::from_fn(super::restore_accepted));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+
+        let res = http
+            .post(format!("http://{addr}/b/k?restore"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 202);
+        assert_eq!(res.headers()["x-amz-restore"], "ongoing-request=\"true\"");
+        assert_eq!(res.headers().get_all("x-amz-restore").iter().count(), 1);
+
+        let res = http
+            .post(format!("http://{addr}/b/k?restore=1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 202, "?restore=<v> 也是 RestoreObject");
+
+        for (method, path) in [
+            ("POST", "/b/k"),
+            ("POST", "/b/k?x-restore=1"),
+            ("GET", "/b/k?restore"),
+        ] {
+            let res = http
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("http://{addr}{path}"),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "{method} {path} 不应被改写");
+            assert!(
+                res.headers().get("x-amz-restore").is_none(),
+                "{method} {path}"
+            );
+        }
+    }
 
     /// 标签值转义：坏配置（node id 带引号/反斜杠/换行）不得产出坏样本行。
     /// 反斜杠必须先转义（先换引号会把 `\"` 里的反斜杠二次转义错）。

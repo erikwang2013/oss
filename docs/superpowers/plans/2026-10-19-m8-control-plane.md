@@ -652,7 +652,8 @@ lifecycle 新列、`idx_lifecycle_rule_id` 存在；重复 connect 幂等。`000
   日志（孤儿，无 GC）。`OssS3::with_restore` 仍在本片。
 - 事件：白名单增 `s3:LifecycleTransition`、`s3:ObjectRestore:Post`、`s3:ObjectRestore:Completed`；
   Restore 受理发 Post，完成发 Completed；`RestoreObjectOutput` 无状态字段，必须用
-  `S3Response.status/headers` 覆盖 202 + `x-amz-restore`（线上被 s3s 0.17 固定为 200，见「定稿」）；
+  `S3Response.status/headers` 覆盖 202 + `x-amz-restore`（s3s 0.17 线上固定 200，
+  由 router 层中间件改写为 202）；
   GET/HEAD 可用 s3s DTO 的 `restore` 字段
   或响应头输出，`tag_count` 属 P0 契约（GET/HEAD）。
 - 测试：meta/旧 meta；类 PUT/HEAD/GET/List/Copy/MPU；归档类直写拒绝；mock tier Transition
@@ -719,7 +720,7 @@ lifecycle 新列、`idx_lifecycle_rule_id` 存在；重复 connect 幂等。`000
   4. 分层：mock tier（本地 axum S3 stub 或第二 oss 实例）→
      `aws s3api put-bucket-lifecycle-configuration` 建 Transition 规则（GLACIER、days=0）→
      `get-bucket-lifecycle-configuration` 断言回读 → `POST /tiers/sweep` force → HEAD 类 →
-     GET 403 → Restore 受理（线上 200，见定稿）/完成可读 → `delete-bucket-lifecycle` 后 GET 404；到期回收由
+     GET 403 → Restore 受理（202，router 层改写）/完成可读 → `delete-bucket-lifecycle` 后 GET 404；到期回收由
      `m8_tier.rs` 用 past expiry 直接调 reaper；
   5. 回归：标准 S3、STS、M4 lifecycle、M6/M7 复制。
 - 文档：README「M8 控制面」；设计 §M8 落地状态/偏差（M6 重试不迁移、HEAD 不变换、单节点、
@@ -828,8 +829,9 @@ S6 之外的控制面缺口以 Task 7a/7b/7c 收口（不在原 S0–S6 编号�
   另单独执行 M6 `tests/e2e_replication.sh` 与 M7 `tests/e2e_sites.sh`：均 PASS（exit 0）。
 - 评审/修复：Task 6b 自审（按任务约束未另设评审子代理）；e2e 多轮运行中发现并修正 5 处
   脚本/文档缺陷——Inventory MD5 base64、`Transitions` 列表、版本/删除标记清理、
-  Restore 线上 200、Batch 拆为 1000 与 1001 两段。
-- 残余边界：RestoreObject 线上 200（s3s 0.17 生成代码丢弃 handler 的 202）；SQLite 单写者
-  `finish_task` 读→写升级可能锁冲突，任务延迟到 deadline 回收（建议 1 worker 或改造事务）；
-  失败重试退避含 `now%1000` 秒抖动；控制面单节点；tier 仅远端 http。
+  Restore 线上状态、Batch 拆为 1000 与 1001 两段。
+- 残余边界：RestoreObject 的 202 由 router 层中间件按 POST + `restore` 查询补写；
+  SQLite 单写者下 `finish_task` 锁冲突以 busy_timeout(30s) + 5 次重试兜底，
+  领取后按动作收紧 deadline（非 tier 900s）；失败重试退避含 `now%1000` 秒抖动；
+  控制面单节点；tier 仅远端 http。
 - 发布：仅本地提交；推送/tag/Release 待用户明确口令。

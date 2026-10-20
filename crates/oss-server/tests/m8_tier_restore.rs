@@ -14,9 +14,14 @@ use xl_store::meta::TierPhase;
 use md5::Digest as _;
 use oss_server::config::TierTarget;
 use oss_server::jobs::TaskExecutor as _;
+use oss_server::router::build_router;
 use oss_server::state::AppState;
 use oss_server::tier::{S3TierBackend, S3TierGc, TierBackend, TierBackends, tier_key};
 use oss_server::tier_jobs::{M8TaskExecutor, reconcile_restores};
+use s3s_sigv4::{
+    AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
+};
+use sha2::Sha256;
 
 /// 内存 tier 后端：PUT 返回与源 ETag 不同的远端 ETag（钉「不比较源 ETag」）。
 #[derive(Default)]
@@ -110,6 +115,68 @@ fn req<T>(input: T) -> S3Request<T> {
         service: None,
         trailing_headers: None,
     }
+}
+
+/// 对 `POST /<bucket>/<key>?restore` 发一个最小 SigV4 签名请求（只签本用例用到的头）。
+async fn signed_restore_post(
+    base: &str,
+    bucket: &str,
+    key: &str,
+    ak: &str,
+    sk: &str,
+) -> reqwest::Response {
+    const REGION: &str = "us-east-1";
+    let path = format!("/{bucket}/{key}");
+    let host = base.strip_prefix("http://").unwrap().to_string();
+    let payload_hex = hex::encode(Sha256::digest(b""));
+    let t = time::OffsetDateTime::now_utc();
+    let amz = AmzDate::parse(&format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    ))
+    .unwrap();
+    let mut to_sign = [
+        ("host".to_string(), host.clone()),
+        ("x-amz-content-sha256".to_string(), payload_hex.clone()),
+        ("x-amz-date".to_string(), amz.fmt_iso8601().to_string()),
+        ("x-amz-restore-request".to_string(), "days=1".to_string()),
+    ];
+    to_sign.sort_by(|a, b| a.0.cmp(&b.0));
+    let refs: Vec<(&str, &str)> = to_sign
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    // 线上 `?restore` 与 canonical 形态 `restore=` 等价（s3s 按空值 form 解析）。
+    let pairs = [("restore".to_string(), String::new())];
+    let canonical = create_canonical_request(
+        "POST",
+        &path,
+        &pairs,
+        &refs,
+        Payload::SingleChunk(&payload_hex),
+    );
+    let sts = create_string_to_sign(&canonical, &amz, REGION, "s3");
+    let sig = calculate_signature(&sts, sk, &amz, REGION, "s3");
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={ak}/{}/{REGION}/s3/aws4_request, SignedHeaders={}, Signature={sig}",
+        amz.fmt_date(),
+        refs.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";")
+    );
+    reqwest::Client::new()
+        .post(format!("{base}{path}?restore"))
+        .header("host", host)
+        .header("x-amz-content-sha256", payload_hex)
+        .header("x-amz-date", amz.fmt_iso8601().to_string())
+        .header("x-amz-restore-request", "days=1")
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .send()
+        .await
+        .expect("HTTP 请求发送失败")
 }
 
 fn payload(bucket: &str, key: &str, vid: &str, class: &str, tier: Option<&str>) -> String {
@@ -266,6 +333,41 @@ async fn restore_without_version_id_targets_latest() {
     let row = st
         .db
         .restore_row("bkt", "v.txt", &vid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "pending");
+}
+
+/// 线上闭环：签名 POST `?restore` 经 build_router 返回 202 + `x-amz-restore`
+/// （s3s 0.17 生成代码固定 200，router 层中间件补回 202）。
+#[tokio::test]
+async fn restore_object_over_http_returns_202_and_header() {
+    let (st, _mock, _d) = setup().await;
+    let vid = archive(&st, "archived.bin", b"arch-data").await;
+    let uid = st.db.create_user("restorer", "pw", true).await.unwrap();
+    st.db
+        .create_access_key("AKIARESTORE00000001", "secret-restore", uid)
+        .await
+        .unwrap();
+    let app = build_router(st.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let resp = signed_restore_post(
+        &format!("http://{addr}"),
+        "bkt",
+        "archived.bin",
+        "AKIARESTORE00000001",
+        "secret-restore",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(resp.headers()["x-amz-restore"], "ongoing-request=\"true\"");
+    let row = st
+        .db
+        .restore_row("bkt", "archived.bin", &vid)
         .await
         .unwrap()
         .unwrap();
