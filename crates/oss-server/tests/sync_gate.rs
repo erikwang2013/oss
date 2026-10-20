@@ -789,4 +789,36 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     recover_write_intents(&e.st).await;
     assert_eq!(intent_rows(&e.st).await, 0);
     assert!(!tee3.exists());
+
+    // D) 在途写（updated_at=now）不得被恢复 worker 删除；否则会删掉远端已确认版本。
+    let inflight = uuid::Uuid::new_v4().to_string();
+    let tee4 = e.tee_dir.join(format!("{inflight}.plain"));
+    std::fs::write(&tee4, b"w").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sqlx::query(
+        "INSERT INTO sync_write_intents \
+         (id, bucket, key, local_version_id, remote_version_id, tee_path, commit_json, \
+          state, created_at, updated_at) VALUES (?, 'syn', 'inflight.txt', ?, ?, ?, '{}', \
+          'remote_pending', 0, ?)",
+    )
+    .bind(&inflight)
+    .bind(&inflight)
+    .bind(&inflight)
+    .bind(tee4.to_string_lossy().into_owned())
+    .bind(now)
+    .execute(e.st.db.pool())
+    .await
+    .unwrap();
+    let deletes_before = e.remote.deletes().len();
+    recover_write_intents(&e.st).await;
+    assert_eq!(intent_rows(&e.st).await, 1, "在途 intent 必须保留");
+    assert!(tee4.exists(), "在途 intent 的 tee 必须保留");
+    assert_eq!(
+        e.remote.deletes().len(),
+        deletes_before,
+        "在途写不得触发远端删除"
+    );
 }

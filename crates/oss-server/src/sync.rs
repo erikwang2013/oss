@@ -213,16 +213,22 @@ async fn clean_intent(db: &Db, id: &str) {
 /// 启动 + 周期恢复：本地 meta 有该 id → 只清 intent；否则删远端同 id。
 /// 本地查询失败/远端不可达 → 保留，30s 后重试。
 pub async fn recover_write_intents(state: &AppState) {
-    let rows = match sqlx::query("SELECT id, bucket, key FROM sync_write_intents")
-        .fetch_all(state.db.pool())
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "sync intent 恢复：读取失败");
-            return;
-        }
-    };
+    // 只恢复“已完成/已崩溃”的陈旧行：在途写从插行到本地 meta 翻转必然短于
+    // sync.timeout_ms + 提交耗时；60s 裕量覆盖病态 fsync。否则 worker 可能删掉
+    // 仍在途、但远端已提交的版本（客户端 200、远端无副本）。
+    let cutoff = crate::db::now() - (state.cfg.sync.timeout_ms as i64 / 1000 + 60);
+    let rows =
+        match sqlx::query("SELECT id, bucket, key FROM sync_write_intents WHERE updated_at < ?")
+            .bind(cutoff)
+            .fetch_all(state.db.pool())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "sync intent 恢复：读取失败");
+                return;
+            }
+        };
     if rows.is_empty() {
         return;
     }
