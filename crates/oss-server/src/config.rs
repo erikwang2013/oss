@@ -41,6 +41,185 @@ pub struct AppConfig {
     /// M8 S4b：远端 tier `[[tiers]]`（S3 兼容端点；https 启动期拒绝）。
     #[serde(default)]
     pub tiers: Vec<TierTarget>,
+    /// M9：`[raft]` 控制面（存在即 Raft 模式；要求 `[site]`；与 `[[groups]]` 互斥）。
+    #[serde(default)]
+    pub raft: Option<RaftToml>,
+    /// M9：`[sync]` sync 桶数据面上限（缺省见 Default；无 `[raft]` 时不生效）。
+    #[serde(default)]
+    pub sync: SyncToml,
+    /// M9：`[stretch]` 2×6 stretch EC 预设（要求 `[site]` + `[raft]`；与 `[cluster]` 互斥）。
+    #[serde(default)]
+    pub stretch: Option<StretchToml>,
+}
+
+/// `[raft]`：3-voter 控制面运行时参数。`advertise_endpoint` 是主 HTTP（Raft RPC 路由），
+/// 与 `[stretch].self_addr` 的 mesh gRPC 端口必须分离。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RaftToml {
+    /// Raft u64 节点 id（A=1,B=2,C=3）；0 非法。
+    pub node_id: u64,
+    #[serde(default)]
+    pub role: RaftRole,
+    #[serde(default)]
+    pub bootstrap: bool,
+    /// 主 HTTP 基址，如 `http://a:9000`（host:port 必填）。
+    pub advertise_endpoint: String,
+    pub cluster_token: String,
+    #[serde(default)]
+    pub db_path: Option<PathBuf>,
+    #[serde(default = "default_election_timeout_ms")]
+    pub election_timeout_ms: u64,
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_rpc_timeout_ms")]
+    pub rpc_timeout_ms: u64,
+    #[serde(default = "default_install_snapshot_timeout_ms")]
+    pub install_snapshot_timeout_ms: u64,
+    /// 默认 0（快照后不留 log）。
+    #[serde(default)]
+    pub max_in_snapshot_log_to_keep: u64,
+    #[serde(default = "default_purge_batch_size")]
+    pub purge_batch_size: u64,
+    #[serde(default = "default_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    /// 原始字节；上限 4 MiB（JSON 约 16 MiB/块）。
+    #[serde(default = "default_snapshot_max_chunk_size")]
+    pub snapshot_max_chunk_size: u64,
+    /// 快照总上限，默认 512 MiB，可配上限 1 GiB。
+    #[serde(default = "default_snapshot_max_bytes")]
+    pub snapshot_max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RaftRole {
+    #[default]
+    Voter,
+    Witness,
+}
+
+/// `[sync]`：sync 桶单对象上限与远端调用超时（仅 sync 调用；共享 ReplClient 不设默认超时）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncToml {
+    #[serde(default = "default_sync_max_object_bytes")]
+    pub max_object_bytes: u64,
+    #[serde(default = "default_sync_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for SyncToml {
+    fn default() -> Self {
+        Self {
+            max_object_bytes: default_sync_max_object_bytes(),
+            timeout_ms: default_sync_timeout_ms(),
+        }
+    }
+}
+
+/// `[stretch]`：2 站点 × 6 盘、EC 8+4 预设。`node_id` 是数据面拓扑 id（非 Raft u64）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StretchToml {
+    pub node_id: String,
+    /// 本站 mesh gRPC 监听地址（`host:port` 或 `http://host:port`）。
+    pub self_addr: String,
+    pub peer_node_id: String,
+    pub peer_addr: String,
+    #[serde(default = "default_peer_drives")]
+    pub peer_drives: u16,
+    #[serde(default = "default_stretch_placement")]
+    pub placement: String,
+    pub mesh_secret: String,
+    #[serde(default = "default_mesh_timeout_ms")]
+    pub mesh_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessConfig {
+    pub node_id: u64,
+    pub advertise_endpoint: String,
+    pub cluster_token: String,
+    pub db_path: PathBuf,
+    pub state_db: PathBuf,
+}
+
+fn default_election_timeout_ms() -> u64 {
+    5_000
+}
+fn default_heartbeat_interval_ms() -> u64 {
+    1_000
+}
+fn default_rpc_timeout_ms() -> u64 {
+    5_000
+}
+fn default_install_snapshot_timeout_ms() -> u64 {
+    300_000
+}
+fn default_purge_batch_size() -> u64 {
+    1_024
+}
+fn default_write_timeout_ms() -> u64 {
+    10_000
+}
+fn default_snapshot_max_chunk_size() -> u64 {
+    4 * 1024 * 1024
+}
+fn default_snapshot_max_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+fn default_sync_max_object_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+fn default_sync_timeout_ms() -> u64 {
+    10_000
+}
+fn default_peer_drives() -> u16 {
+    6
+}
+fn default_stretch_placement() -> String {
+    "v2".to_string()
+}
+fn default_mesh_timeout_ms() -> u64 {
+    5_000
+}
+
+/// 接受 `host:port` / `http://host:port`；拒绝 https、path/query/userinfo、空 host/port。
+/// 返回小写 host 的 `host:port`（TonicMesh 会自行再拼 `http://`）。
+fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(format!("{field} 不能为空"));
+    }
+    let rest = if let Some(r) = s.strip_prefix("http://") {
+        r
+    } else if s.contains("://") {
+        return Err(format!(
+            "{field} 必须是 host:port 或 http://host:port（TLS/其他协议未接线）：{raw}"
+        ));
+    } else {
+        s
+    };
+    if rest.is_empty()
+        || rest.contains('/')
+        || rest.contains('?')
+        || rest.contains('#')
+        || rest.contains('@')
+    {
+        return Err(format!(
+            "{field} 非法：{raw:?}（不接受 path/query/userinfo，需 host:port）"
+        ));
+    }
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{field} 缺少端口：{raw:?}"))?;
+    if host.is_empty() || port.is_empty() || port.parse::<u16>().ok().filter(|p| *p != 0).is_none()
+    {
+        return Err(format!("{field} 的 host/port 非法：{raw:?}"));
+    }
+    Ok(format!("{}:{port}", host.to_ascii_lowercase()))
 }
 
 /// `[[tiers]]`：归档远端。模型同 `[[remotes]]`，另加目标桶。
@@ -213,6 +392,8 @@ impl AppConfig {
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.site_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.raft_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
     }
 
@@ -370,6 +551,117 @@ impl AppConfig {
             if self.cluster.is_some() {
                 return Err("[site] 与 [cluster] 互斥（M7 仅支持单节点站点对）".into());
             }
+        }
+        Ok(())
+    }
+
+    /// M9：`[raft]` 校验——必须 `[site]`、node_id>0、advertise 可解析、cluster_token 非空；
+    /// 与 `[cluster]`/`[[groups]]` 互斥。`[sync]` 仅校验上限，无 `[raft]` 时不生效。
+    pub fn raft_validate(&self) -> Result<(), String> {
+        self.sync_validate()?;
+        if let Some(r) = &self.raft {
+            if self.site.is_none() {
+                return Err("[raft] 需要 [site]（站点身份由 M7 [site] 提供）".into());
+            }
+            if self.cluster.is_some() {
+                return Err("[raft] 与 [cluster] 互斥".into());
+            }
+            if !self.groups.is_empty() {
+                return Err("[raft] 与 [[groups]] 互斥（guard 会拒绝分组桶写入）".into());
+            }
+            if r.node_id == 0 {
+                return Err("[raft].node_id 必须 > 0".into());
+            }
+            if r.cluster_token.trim().is_empty() {
+                return Err("[raft].cluster_token 不能为空".into());
+            }
+            normalize_http_addr(&r.advertise_endpoint, "[raft].advertise_endpoint")?;
+            if r.snapshot_max_chunk_size == 0 || r.snapshot_max_chunk_size > 4 * 1024 * 1024 {
+                return Err(format!(
+                    "[raft].snapshot_max_chunk_size 必须在 1..=4 MiB，实际 {}",
+                    r.snapshot_max_chunk_size
+                ));
+            }
+            if r.snapshot_max_bytes == 0 || r.snapshot_max_bytes > 1024 * 1024 * 1024 {
+                return Err(format!(
+                    "[raft].snapshot_max_bytes 必须在 1..=1 GiB，实际 {}",
+                    r.snapshot_max_bytes
+                ));
+            }
+        }
+        self.stretch_validate()
+    }
+
+    pub fn sync_validate(&self) -> Result<(), String> {
+        if self.sync.max_object_bytes == 0 {
+            return Err("[sync].max_object_bytes 必须 > 0".into());
+        }
+        if self.sync.timeout_ms == 0 {
+            return Err("[sync].timeout_ms 必须 > 0".into());
+        }
+        Ok(())
+    }
+
+    /// M9：`[stretch]` 校验——必须 `[site]`+`[raft]`，与 `[cluster]`/`[[groups]]` 互斥；
+    /// 2×6、EC 8+4、inline=0、placement=v2、mesh_secret 非空；地址规范化后 self≠peer，
+    /// 且主 HTTP（advertise）端口与 mesh gRPC（self_addr）分离。
+    pub fn stretch_validate(&self) -> Result<(), String> {
+        let Some(s) = &self.stretch else {
+            return Ok(());
+        };
+        if self.site.is_none() {
+            return Err("[stretch] 需要 [site]".into());
+        }
+        let Some(r) = &self.raft else {
+            return Err("[stretch] 需要 [raft]".into());
+        };
+        if self.cluster.is_some() {
+            return Err("[stretch] 与 [cluster] 互斥".into());
+        }
+        if !self.groups.is_empty() {
+            return Err("[stretch] 与 [[groups]] 互斥".into());
+        }
+        if s.node_id.trim().is_empty() || s.peer_node_id.trim().is_empty() {
+            return Err("[stretch].node_id/peer_node_id 不能为空".into());
+        }
+        if s.node_id == s.peer_node_id {
+            return Err("[stretch].node_id 与 peer_node_id 不能相同".into());
+        }
+        let self_addr = normalize_http_addr(&s.self_addr, "[stretch].self_addr")?;
+        let peer_addr = normalize_http_addr(&s.peer_addr, "[stretch].peer_addr")?;
+        if self_addr == peer_addr {
+            return Err("[stretch].self_addr 与 peer_addr 不能相同".into());
+        }
+        let advertise = normalize_http_addr(&r.advertise_endpoint, "[raft].advertise_endpoint")?;
+        if advertise == self_addr {
+            return Err(
+                "[stretch].self_addr 不能与 [raft].advertise_endpoint 同端口（主 HTTP 与 mesh gRPC 必须分离）"
+                    .into(),
+            );
+        }
+        if s.peer_drives != 6 {
+            return Err(format!(
+                "[stretch].peer_drives 必须为 6，实际 {}",
+                s.peer_drives
+            ));
+        }
+        if self.data_dirs.as_ref().is_none_or(|d| d.len() != 6) {
+            return Err("[stretch] 本站点必须配置恰好 6 条 [[data_dirs]]".into());
+        }
+        if s.placement != "v2" {
+            return Err(format!(
+                "[stretch].placement 只支持 \"v2\"，实际 {:?}",
+                s.placement
+            ));
+        }
+        if s.mesh_secret.trim().is_empty() {
+            return Err("[stretch].mesh_secret 不能为空".into());
+        }
+        if !self.ec.enabled || self.ec.data != 8 || self.ec.parity != 4 {
+            return Err("[stretch] 要求 [ec] enabled=true、data=8、parity=4".into());
+        }
+        if self.ec.inline_threshold != 0 {
+            return Err("[stretch] 要求 [ec].inline_threshold=0".into());
         }
         Ok(())
     }
@@ -555,6 +847,9 @@ mod tests {
             remotes: vec![],
             site: None,
             tiers: vec![],
+            raft: None,
+            sync: Default::default(),
+            stretch: None,
         }
     }
 
@@ -814,6 +1109,9 @@ mod tests {
             remotes: vec![],
             site: None,
             tiers: vec![],
+            raft: None,
+            sync: Default::default(),
+            stretch: None,
         };
         // 合法
         assert!(
@@ -854,5 +1152,238 @@ mod tests {
                 .kafka_validate()
                 .is_err()
         );
+    }
+
+    fn raft_toml() -> RaftToml {
+        RaftToml {
+            node_id: 1,
+            role: RaftRole::Voter,
+            bootstrap: true,
+            advertise_endpoint: "http://a:9000".into(),
+            cluster_token: "t".repeat(64),
+            db_path: None,
+            election_timeout_ms: default_election_timeout_ms(),
+            heartbeat_interval_ms: default_heartbeat_interval_ms(),
+            rpc_timeout_ms: default_rpc_timeout_ms(),
+            install_snapshot_timeout_ms: default_install_snapshot_timeout_ms(),
+            max_in_snapshot_log_to_keep: 0,
+            purge_batch_size: default_purge_batch_size(),
+            write_timeout_ms: default_write_timeout_ms(),
+            snapshot_max_chunk_size: default_snapshot_max_chunk_size(),
+            snapshot_max_bytes: default_snapshot_max_bytes(),
+        }
+    }
+
+    fn stretch_toml() -> StretchToml {
+        StretchToml {
+            node_id: "A".into(),
+            self_addr: "a:9100".into(),
+            peer_node_id: "B".into(),
+            peer_addr: "http://b:9100".into(),
+            peer_drives: 6,
+            placement: "v2".into(),
+            mesh_secret: "s".repeat(64),
+            mesh_timeout_ms: default_mesh_timeout_ms(),
+        }
+    }
+
+    fn m9_cfg() -> AppConfig {
+        let mut c = base_cfg();
+        c.site = Some(Default::default());
+        c.data_dirs = Some((0..6).map(|i| PathBuf::from(format!("/d{i}"))).collect());
+        c.ec = EcToml {
+            enabled: true,
+            data: 8,
+            parity: 4,
+            inline_threshold: 0,
+        };
+        c.raft = Some(raft_toml());
+        c.stretch = Some(stretch_toml());
+        c
+    }
+
+    #[test]
+    fn m9_raft_runtime_defaults() {
+        let r: RaftToml = toml::from_str(
+            r#"
+node_id = 1
+advertise_endpoint = "http://a:9000"
+cluster_token = "x"
+"#,
+        )
+        .unwrap();
+        assert_eq!(r.role, RaftRole::Voter);
+        assert!(!r.bootstrap);
+        assert_eq!(r.election_timeout_ms, 5_000);
+        assert_eq!(r.heartbeat_interval_ms, 1_000);
+        assert_eq!(r.rpc_timeout_ms, 5_000);
+        assert_eq!(r.install_snapshot_timeout_ms, 300_000);
+        assert_eq!(r.max_in_snapshot_log_to_keep, 0);
+        assert_eq!(r.purge_batch_size, 1_024);
+        assert_eq!(r.write_timeout_ms, 10_000);
+        assert_eq!(r.snapshot_max_chunk_size, 4 * 1024 * 1024);
+        assert_eq!(r.snapshot_max_bytes, 512 * 1024 * 1024);
+        let s = SyncToml::default();
+        assert_eq!(s.max_object_bytes, 64 * 1024 * 1024);
+        assert_eq!(s.timeout_ms, 10_000);
+        let w: RaftToml = toml::from_str(
+            r#"
+node_id = 3
+role = "witness"
+advertise_endpoint = "http://w:9100"
+cluster_token = "x"
+"#,
+        )
+        .unwrap();
+        assert_eq!(w.role, RaftRole::Witness);
+    }
+
+    #[test]
+    fn m9_raft_requires_site_and_rejects_cluster_and_groups() {
+        let mut c = base_cfg();
+        c.raft = Some(raft_toml());
+        assert!(c.raft_validate().unwrap_err().contains("[site]"));
+
+        let mut c = m9_cfg();
+        c.site = None;
+        assert!(c.raft_validate().is_err());
+
+        let mut c = base_cfg();
+        c.cluster = Some(ClusterToml {
+            node_id: "n1".into(),
+            secret: String::new(),
+            nodes: vec![],
+            placement: None,
+        });
+        c.site = Some(Default::default());
+        c.raft = Some(raft_toml());
+        assert!(c.raft_validate().unwrap_err().contains("[cluster]"));
+
+        let mut c = m9_cfg();
+        c.groups = vec![GroupTarget {
+            group: "g".into(),
+            bucket: "b".into(),
+            max_size: 1,
+            extensions: vec![],
+        }];
+        assert!(c.raft_validate().unwrap_err().contains("[[groups]]"));
+
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().node_id = 0;
+        assert!(c.raft_validate().is_err());
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().cluster_token = "  ".into();
+        assert!(c.raft_validate().is_err());
+        for bad in ["https://a:9000", "http://a:9000/x", "a", "a:0", ":9000"] {
+            let mut c = m9_cfg();
+            c.raft.as_mut().unwrap().advertise_endpoint = bad.into();
+            assert!(c.raft_validate().is_err(), "advertise 应拒绝 {bad:?}");
+        }
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().snapshot_max_chunk_size = 4 * 1024 * 1024 + 1;
+        assert!(c.raft_validate().is_err());
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().snapshot_max_bytes = 1024 * 1024 * 1024 + 1;
+        assert!(c.raft_validate().is_err());
+    }
+
+    #[test]
+    fn m9_stretch_requires_site_and_raft() {
+        let mut c = base_cfg();
+        c.stretch = Some(stretch_toml());
+        assert!(c.stretch_validate().unwrap_err().contains("[site]"));
+
+        let mut c = base_cfg();
+        c.site = Some(Default::default());
+        c.stretch = Some(stretch_toml());
+        assert!(c.stretch_validate().unwrap_err().contains("[raft]"));
+
+        let mut c = m9_cfg();
+        c.cluster = Some(ClusterToml {
+            node_id: "n1".into(),
+            secret: String::new(),
+            nodes: vec![],
+            placement: None,
+        });
+        assert!(c.stretch_validate().unwrap_err().contains("[cluster]"));
+        let mut c = m9_cfg();
+        c.groups = vec![GroupTarget {
+            group: "g".into(),
+            bucket: "b".into(),
+            max_size: 1,
+            extensions: vec![],
+        }];
+        assert!(c.stretch_validate().unwrap_err().contains("[[groups]]"));
+    }
+
+    #[test]
+    fn m9_stretch_self_addr_required_normalized_and_distinct() {
+        // 缺 self_addr（serde 必填字段）
+        assert!(
+            toml::from_str::<StretchToml>(
+                r#"
+node_id = "A"
+peer_node_id = "B"
+peer_addr = "b:9100"
+mesh_secret = "x"
+"#,
+            )
+            .is_err()
+        );
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().self_addr = "https://a:9100".into();
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().peer_addr = "http://b:9100/path".into();
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().self_addr = "A:9100".into();
+        c.stretch.as_mut().unwrap().peer_addr = "http://a:9100".into();
+        assert!(c.stretch_validate().unwrap_err().contains("不能相同"));
+        // 主 HTTP 与 mesh gRPC 同端口
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().advertise_endpoint = "http://a:9100".into();
+        assert!(
+            c.stretch_validate()
+                .unwrap_err()
+                .contains("advertise_endpoint")
+        );
+    }
+
+    #[test]
+    fn m9_stretch_topology_and_ec_validation() {
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().peer_drives = 5;
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().placement = "v1".into();
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().mesh_secret = " ".into();
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().peer_node_id = "A".into();
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.data_dirs = Some(vec!["/d0".into()]);
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.ec.data = 6;
+        assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.ec.inline_threshold = 1;
+        assert!(c.stretch_validate().is_err());
+        assert!(m9_cfg().stretch_validate().is_ok());
+    }
+
+    #[test]
+    fn m9_sync_validation() {
+        assert!(base_cfg().raft_validate().is_ok(), "默认关闭必须通过");
+        let mut c = base_cfg();
+        c.sync.max_object_bytes = 0;
+        assert!(c.raft_validate().is_err());
+        let mut c = base_cfg();
+        c.sync.timeout_ms = 0;
+        assert!(c.raft_validate().is_err());
     }
 }

@@ -40,6 +40,7 @@ fn peer(peer_id: &str, remote_site_id: &str) -> SitePeer {
         created_at: now(),
         last_seen: None,
         last_error: None,
+        raft_node_id: None,
     }
 }
 

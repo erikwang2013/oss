@@ -15,6 +15,7 @@ pub mod job_actions_api;
 pub mod jobs;
 pub mod lifecycle;
 pub mod lifecycle_store;
+pub mod raft;
 pub mod repl_client;
 pub mod replication;
 pub mod router;

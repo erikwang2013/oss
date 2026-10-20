@@ -1647,6 +1647,13 @@ async fn list_buckets(
                 return internal_error();
             }
         };
+    let modes = match state.db.bucket_replication_modes().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "查询桶复制模式失败");
+            return internal_error();
+        }
+    };
     let out: Vec<serde_json::Value> = buckets
         .into_iter()
         .filter_map(|b| {
@@ -1659,12 +1666,17 @@ async fn list_buckets(
             if !(is_admin || own || r || w || d) {
                 return None;
             }
+            let replication_mode = modes
+                .get(&b.name)
+                .cloned()
+                .unwrap_or_else(|| "async".into());
             Some(serde_json::json!({
                 "name": b.name,
                 "is_owner": own,
                 "can_read": can_read,
                 "can_write": can_write,
                 "can_delete": can_delete,
+                "replication_mode": replication_mode,
             }))
         })
         .collect();
@@ -1677,6 +1689,9 @@ struct CreateBucketBody {
     /// M4 切片 8：目标 set（缺省 0；校验 < 组数——单 set 下非 0 一律 400）
     #[serde(default)]
     set: Option<u16>,
+    /// M9：`async`（缺省）/ `sync`；sync 需能力开关与 Raft 控制面就绪。
+    #[serde(default)]
+    replication_mode: Option<String>,
 }
 
 /// 任何**在册**用户可建桶（建桶者即桶主，自动全权；被停用账号的旧 JWT 在此同样失效）。
@@ -1689,6 +1704,55 @@ async fn create_bucket(
         Ok(v) => v,
         Err(r) => return r,
     };
+    // M9 S0：Raft 控制写通道尚未接线（S6 翻转 RAFT_READY）。
+    if state.cfg.raft.is_some() && !crate::raft::RAFT_READY {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft control plane is not ready",
+        )
+            .into_response();
+    }
+    let replication_mode = body.replication_mode.as_deref().unwrap_or("async");
+    match replication_mode {
+        "async" => {}
+        "sync" => {
+            if !crate::raft::SYNC_READY {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "sync replication mode is not available",
+                )
+                    .into_response();
+            }
+            if state.cfg.raft.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "sync replication mode requires [raft]",
+                )
+                    .into_response();
+            }
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid replication mode: {other}"),
+            )
+                .into_response();
+        }
+    }
+    // M9：同名桶重建不允许改变复制模式（陈旧行清理不能静默改写语义）。
+    if let Ok(Some(existing)) =
+        sqlx::query_scalar::<_, String>("SELECT replication_mode FROM buckets WHERE name = ?")
+            .bind(&body.name)
+            .fetch_optional(state.db.pool())
+            .await
+        && existing != replication_mode
+    {
+        return (
+            StatusCode::CONFLICT,
+            "bucket replication mode cannot be changed on recreate",
+        )
+            .into_response();
+    }
     let set_count = state
         .store
         .cluster()
@@ -1715,7 +1779,7 @@ async fn create_bucket(
     // M5 切片 0：覆盖语义——陈旧行（删桶记账容忍失败残留）随重建收敛 set 与 owner
     if let Err(e) = state
         .db
-        .upsert_bucket_owner_set(&body.name, Some(uid), set)
+        .upsert_bucket_owner_set_mode(&body.name, Some(uid), set, replication_mode)
         .await
     {
         // M7 P2：站点 LWW 门控拒绝时物理桶已建——按**最终行**补偿后返回 409：
@@ -1744,8 +1808,12 @@ async fn create_bucket(
             }
             return r;
         }
-        // 桶已建成：控制面行缺失只影响列表展示，不失败请求
-        tracing::warn!(error = %e, "写入桶行失败");
+        // M9：行写失败（含 guard ABORT）不得以 204 静默成功——回滚刚建的物理桶并 5xx。
+        tracing::error!(error = %e, bucket = %body.name, "写入桶行失败");
+        if let Err(re) = state.store.delete_bucket(&body.name).await {
+            tracing::warn!(error = %re, bucket = %body.name, "行写失败回滚物理桶失败");
+        }
+        return internal_error();
     }
     // M5 切片 0（P4-1）：行变更广播（best-effort）
     state
@@ -2526,7 +2594,29 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
         "priority": state.site.priority,
         "has_vault": state.vault.is_some(),
         "enabled": state.site_enabled,
+        "raft_node_id": state.cfg.raft.as_ref().map(|r| r.node_id),
+        "advertise_endpoint": state.cfg.raft.as_ref().map(|r| r.advertise_endpoint.clone()),
+        "capabilities": {
+            "raft": crate::raft::RAFT_READY && state.cfg.raft.is_some(),
+            "sync": crate::raft::SYNC_READY,
+            "stretch": crate::raft::STRETCH_READY && state.cfg.stretch.is_some(),
+        },
     });
+    // S4/S7 共用形状；fingerprint 只暴露 SHA-256，不回传 secret。
+    if let Some(s) = &state.cfg.stretch {
+        v["stretch"] = serde_json::json!({
+            "node_id": s.node_id,
+            "self_addr": s.self_addr,
+            "peer_node_id": s.peer_node_id,
+            "peer_drives": s.peer_drives,
+            "ec": { "data": state.cfg.ec.data, "parity": state.cfg.ec.parity },
+            "placement": s.placement,
+            "mesh_secret_fingerprint": hex::encode({
+                use sha2::Digest as _;
+                sha2::Sha256::digest(s.mesh_secret.as_bytes())
+            }),
+        });
+    }
     if with_token {
         v["site_token"] = serde_json::Value::String(state.site.token.clone());
     }
@@ -2679,6 +2769,7 @@ async fn create_site(
         created_at: crate::db::now(),
         last_seen: Some(crate::db::now()),
         last_error: None,
+        raft_node_id: None,
     };
     match crate::site::insert_peer_with_snapshot(&state, &peer).await {
         Ok(()) => Json(peer_json(&peer)).into_response(),

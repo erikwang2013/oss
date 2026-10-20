@@ -255,7 +255,13 @@ impl AppState {
         std::fs::create_dir_all(&cfg.staging_dir)
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
-        let db = Arc::new(Db::connect(&cfg.database_url).await?);
+        let db = Arc::new(match cfg.raft.as_ref() {
+            Some(r) if r.role == crate::config::RaftRole::Witness => {
+                Db::connect_witness(&cfg.database_url).await?
+            }
+            Some(_) => Db::connect_raft(&cfg.database_url).await?,
+            None => Db::connect(&cfg.database_url).await?,
+        });
         // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
         // 经 `AppState::new` 同样会再应用一次（幂等）。
         if let Some(site) = cfg.site.as_ref() {
@@ -267,6 +273,8 @@ impl AppState {
             )
             .await?;
         }
+        // M9：无条件模式守卫（connect_* 已执行一次；这里按计划顺序在 site 配置后复验）。
+        db.prepare_raft_mode(cfg.raft.is_some()).await?;
         let mut store_cfg = StoreConfig::new(&drives[0]);
         store_cfg.drives = drives;
         store_cfg.ec = xl_store::store::ec::EcConfig {
@@ -443,6 +451,9 @@ impl AppState {
                         "创建管理员账号（口令取自环境变量或密钥文件）"
                     );
                 }
+                // M9 N8：identity/配对使用首个管理员名；已写入不覆盖。
+                db.schema_meta_set_if_absent("admin_username", &user)
+                    .await?;
             }
             (Some(_), None) => {
                 tracing::warn!(

@@ -301,6 +301,7 @@ async fn bucket_delete_conflict_restores_physical_and_returns_409() {
             created_at: now(),
             last_seen: None,
             last_error: None,
+            raft_node_id: None,
         })
         .await
         .unwrap();

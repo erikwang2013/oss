@@ -48,6 +48,8 @@ pub struct OssS3 {
     restore: Option<Arc<dyn crate::restore::RestoreSink>>,
     /// M8 S5：Inventory 配置读写（None = 501）。
     inventory: Option<Arc<dyn crate::inventory::InventoryStore>>,
+    /// M9：sync 桶能力开关（oss-server 注入 `SYNC_READY`；false 时创建 sync 桶 400）。
+    sync_ready: bool,
 }
 
 impl OssS3 {
@@ -99,7 +101,14 @@ impl OssS3 {
             lifecycle: None,
             restore: None,
             inventory: None,
+            sync_ready: false,
         }
+    }
+
+    /// M9：sync 桶能力（由 oss-server 按 `SYNC_READY` 注入）。
+    pub fn with_sync_ready(mut self, ready: bool) -> Self {
+        self.sync_ready = ready;
+        self
     }
 
     /// M8 S4a：注入 tier 清理实现（S4b 装配真实 sink；本片可 fake/None）。
@@ -735,11 +744,63 @@ impl S3 for OssS3 {
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let bucket = req.input.bucket;
+        // M9：复制模式头（缺省 async）；sync 需能力开关就绪。
+        let replication_mode = match req.headers.get("x-oss-replication-mode") {
+            None => "async",
+            Some(v) => match v.to_str().unwrap_or("").trim() {
+                "async" => "async",
+                "sync" if self.sync_ready => "sync",
+                "sync" => {
+                    return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "sync replication mode is not available"
+                    ));
+                }
+                other => {
+                    return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "invalid replication mode: {}",
+                        other
+                    ));
+                }
+            },
+        };
         self.store
             .create_bucket(&bucket)
             .await
             .map_err(to_s3_error)?;
-        // M5 切片 4（L2）：建桶即开锁（AWS：x-amz-bucket-object-lock-enabled 顺带开版本控制）
+        // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
+        // C3：多 set 下缺省**自动指派**（桶数最少的 set；单 set 恒 0 零查询）。
+        // 记账失败必须回滚物理桶并显式失败（M7 M1：不允许「物理已建 + 行缺失/门控拒」静默成功）。
+        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().cloned() {
+            let k = self.store.cluster().map_or(1, |c| c.sets.sets.len() as u16);
+            let set = match self.acl.pick_least_loaded_set(k).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = ?e, bucket, "set 指派失败，回落 set0");
+                    0
+                }
+            };
+            if let Err(e) = self
+                .acl
+                .record_bucket_owner_set_mode(&bucket, user.uid, set, replication_mode)
+                .await
+            {
+                self.rollback_created_bucket(&bucket).await;
+                if is_site_conflict(&e) {
+                    return Err(s3s::s3_error!(
+                        OperationAborted,
+                        "site replication conflict"
+                    ));
+                }
+                tracing::error!(error = ?e, bucket, "桶归属记账失败");
+                return Err(s3s::s3_error!(InternalError, "internal error"));
+            }
+            // M5 切片 0（P4-1）：行变更广播（best-effort；关「别节点陈旧行」窗口）
+            self.store.broadcast_bucket_row(&bucket, Some(set)).await;
+        }
+        // M5 切片 4（L2）：建桶即开锁（AWS：x-amz-bucket-object-lock-enabled 顺带开版本控制）。
+        // 必须在全列归属写之后：开锁只改 versioning/object_lock，归属写不会把它重置。
         if req.input.object_lock_enabled_for_bucket == Some(true) {
             if let Err(e) = self.acl.enable_bucket_lock(&bucket).await {
                 // M7 M1：记账门控失败时按最终行补偿（远端 upsert 胜出则保留物理桶）。
@@ -756,36 +817,6 @@ impl S3 for OssS3 {
             // 行变更广播（lock/versioning 与归属行同批；best-effort，与 C3 同口径）
             self.store.broadcast_bucket_row(&bucket, None).await;
         }
-        // 桶归属记账（授权门已确认调用者身份并塞了 AuthedUser）：建桶者即桶主。
-        // C3：多 set 下缺省**自动指派**（桶数最少的 set；单 set 恒 0 零查询）。
-        // 记账失败不失败请求（桶已建成；与 console 同口径——缺行只影响归属判定）；
-        // 但站点 LWW 门控冲突必须回滚物理桶并显式失败（M7 M1）。
-        if let Some(user) = req.extensions.get::<crate::access::AuthedUser>().cloned() {
-            let k = self.store.cluster().map_or(1, |c| c.sets.sets.len() as u16);
-            let set = match self.acl.pick_least_loaded_set(k).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = ?e, bucket, "set 指派失败，回落 set0");
-                    0
-                }
-            };
-            if let Err(e) = self
-                .acl
-                .record_bucket_owner_set(&bucket, user.uid, set)
-                .await
-            {
-                if is_site_conflict(&e) {
-                    self.rollback_created_bucket(&bucket).await;
-                    return Err(s3s::s3_error!(
-                        OperationAborted,
-                        "site replication conflict"
-                    ));
-                }
-                tracing::warn!(error = ?e, bucket, "桶归属记账失败");
-            }
-            // M5 切片 0（P4-1）：行变更广播（best-effort；关「别节点陈旧行」窗口）
-            self.store.broadcast_bucket_row(&bucket, Some(set)).await;
-        }
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
@@ -795,7 +826,24 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         let bucket = req.input.bucket;
         match self.store.bucket_exists(&bucket).await {
-            Ok(true) => Ok(S3Response::new(HeadBucketOutput::default())),
+            Ok(true) => {
+                let mode = self
+                    .acl
+                    .bucket_replication_mode(&bucket)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, bucket, "读桶复制模式失败");
+                        s3s::s3_error!(InternalError, "internal error")
+                    })?;
+                let mut resp = S3Response::new(HeadBucketOutput::default());
+                if let Ok(v) = http::HeaderValue::from_str(&mode) {
+                    resp.headers.insert(
+                        http::header::HeaderName::from_static("x-oss-replication-mode"),
+                        v,
+                    );
+                }
+                Ok(resp)
+            }
             Ok(false) => Err(s3s::s3_error!(NoSuchBucket)),
             Err(e) => Err(to_s3_error(e)),
         }
@@ -2712,10 +2760,19 @@ impl S3 for OssS3 {
                 } else {
                     BucketVersioningStatus::from_static("Off")
                 };
-                Ok(S3Response::new(GetBucketVersioningOutput {
+                let mut resp = S3Response::new(GetBucketVersioningOutput {
                     status: Some(status),
                     ..Default::default()
-                }))
+                });
+                if let Ok(mode) = self.acl.bucket_replication_mode(&req.input.bucket).await
+                    && let Ok(v) = http::HeaderValue::from_str(&mode)
+                {
+                    resp.headers.insert(
+                        http::header::HeaderName::from_static("x-oss-replication-mode"),
+                        v,
+                    );
+                }
+                Ok(resp)
             }
             Err(e) => {
                 tracing::error!(error = %e, "读桶版本控制状态失败");

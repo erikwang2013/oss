@@ -49,6 +49,9 @@ async fn state_with_targets(
         remotes: vec![],
         tiers,
         site,
+        raft: None,
+        sync: Default::default(),
+        stretch: None,
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { App, Button, Card, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type BucketEncryption, type BucketInfo } from '../api'
+import { api, type BucketEncryption, type BucketInfo, type RaftStatus } from '../api'
 import InventoryModal from '../InventoryModal'
 import PageHeader from '../PageHeader'
 
@@ -11,6 +11,7 @@ export default function Buckets() {
   const qc = useQueryClient()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  const [newMode, setNewMode] = useState<'async' | 'sync'>('async')
   const [inventoryBucket, setInventoryBucket] = useState<string | null>(null)
   const [encryptionBucket, setEncryptionBucket] = useState<string | null>(null)
 
@@ -18,12 +19,22 @@ export default function Buckets() {
     queryKey: ['buckets'],
     queryFn: () => api<BucketInfo[]>('/api/v1/buckets'),
   })
+  // M9：后端能力位（S0 全 false → sync 选项置灰）
+  const { data: raft } = useQuery({
+    queryKey: ['raft-status'],
+    queryFn: () => api<RaftStatus>('/api/v1/raft/status'),
+    staleTime: 30_000,
+  })
+  const syncAvailable = raft?.capabilities?.sync === true
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['buckets'] })
 
   const create = useMutation({
-    mutationFn: (name: string) =>
-      api('/api/v1/buckets', { method: 'POST', body: JSON.stringify({ name }) }),
+    mutationFn: ({ name, mode }: { name: string; mode: 'async' | 'sync' }) =>
+      api('/api/v1/buckets', {
+        method: 'POST',
+        body: JSON.stringify({ name, replication_mode: mode }),
+      }),
     onSuccess: () => { message.success('已创建'); setCreating(false); invalidate() },
     onError: (e: Error) => message.error(e.message),
   })
@@ -41,7 +52,7 @@ export default function Buckets() {
         sub="点击桶名进入浏览；任何登录用户都可建桶（建桶者即桶主，自动全权）"
         extra={
           // 任何登录用户都可建桶（建桶者即桶主，自动全权）
-          <Button type="primary" onClick={() => { setNewName(''); setCreating(true) }}>
+          <Button type="primary" onClick={() => { setNewName(''); setNewMode('async'); setCreating(true) }}>
             新建桶
           </Button>
         }
@@ -56,6 +67,14 @@ export default function Buckets() {
               title: '桶名',
               dataIndex: 'name',
               render: (name: string) => <Link to={`/buckets/${encodeURIComponent(name)}`}>{name}</Link>,
+            },
+            {
+              title: '复制模式',
+              width: 110,
+              render: (_: unknown, b: BucketInfo) =>
+                b.replication_mode === 'sync'
+                  ? <Tag color="blue">sync</Tag>
+                  : <Tag>async</Tag>,
             },
             {
               title: '归属',
@@ -100,17 +119,40 @@ export default function Buckets() {
         onCancel={() => setCreating(false)}
         onOk={() => {
           if (!newName) { message.warning('请输入桶名'); return }
-          create.mutate(newName)
+          create.mutate({ name: newName, mode: newMode })
         }}
         confirmLoading={create.isPending}
       >
-        <Input
-          id="new-bucket-name"
-          value={newName}
-          onChange={(e) => setNewName(e.target.value)}
-          placeholder="3-63 字符，小写字母数字与 - ."
-          autoFocus
-        />
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Input
+            id="new-bucket-name"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="3-63 字符，小写字母数字与 - ."
+            autoFocus
+          />
+          <Select
+            id="new-bucket-mode"
+            value={newMode}
+            onChange={(v: 'async' | 'sync') => setNewMode(v)}
+            style={{ width: '100%' }}
+            options={[
+              { value: 'async', label: 'async（异步复制，缺省）' },
+              {
+                value: 'sync',
+                label: syncAvailable
+                  ? 'sync（远端确认后才返回）'
+                  : 'sync（当前后端未启用）',
+                disabled: !syncAvailable,
+              },
+            ]}
+          />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            3-voter 控制面；sync 写/删均远端确认；单数据站点宕机控制面可写但 sync 503；
+            stretch 两站点缺一不可。sync 创建后不可改回 async；写/删计入远端 RTT（默认超时
+            10 s）；默认单对象上限 64 MiB，面向小对象/合规。
+          </Typography.Text>
+        </Space>
       </Modal>
       {inventoryBucket && (
         <InventoryModal bucket={inventoryBucket} onClose={() => setInventoryBucket(null)} />

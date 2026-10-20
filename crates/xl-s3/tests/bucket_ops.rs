@@ -11,7 +11,7 @@ use xl_store::store::{Store, StoreConfig};
 async fn acl() -> xl_s3::access::Acl {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql(
-        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT);\
+        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT, replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
           PRIMARY KEY (user_id, bucket));",
@@ -23,9 +23,31 @@ async fn acl() -> xl_s3::access::Acl {
 }
 
 async fn service() -> (OssS3, tempfile::TempDir) {
+    service_with_acl(acl().await).await
+}
+
+async fn service_with_acl(acl: xl_s3::access::Acl) -> (OssS3, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
-    (OssS3::new(store, acl().await, 1024 * 1024), dir)
+    (OssS3::new(store, acl, 1024 * 1024), dir)
+}
+
+fn with_user<T>(input: T) -> S3Request<T> {
+    let mut r = req(input);
+    r.extensions.insert(xl_s3::access::AuthedUser {
+        uid: 1,
+        is_admin: true,
+        ak: String::new(),
+    });
+    r
+}
+
+fn with_mode<T>(mut r: S3Request<T>, mode: &'static str) -> S3Request<T> {
+    r.headers.insert(
+        http::header::HeaderName::from_static("x-oss-replication-mode"),
+        http::HeaderValue::from_static(mode),
+    );
+    r
 }
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -120,15 +142,6 @@ async fn head_missing_bucket_is_no_such_bucket() {
 #[tokio::test]
 async fn bucket_encryption_roundtrip_and_invalid_config() {
     // 默认加密存在 buckets 行上 → 建桶必须带身份（record_bucket_owner）
-    fn with_user<T>(input: T) -> S3Request<T> {
-        let mut r = req(input);
-        r.extensions.insert(xl_s3::access::AuthedUser {
-            uid: 1,
-            is_admin: true,
-            ak: String::new(),
-        });
-        r
-    }
     let (s3, _d) = service().await;
     s3.create_bucket(with_user(CreateBucketInput {
         bucket: "enc-bkt".into(),
@@ -371,4 +384,122 @@ async fn versioning_enabled_and_off_rejected() {
     }))
     .await
     .unwrap();
+}
+
+/// M9 S0：`x-oss-replication-mode` 头——未就绪 400、非法值 400、就绪时落行并可读回。
+#[tokio::test]
+async fn replication_mode_header_gate_and_readback() {
+    let (s3, _d) = service().await;
+    // SYNC_READY=false（默认）：sync 头必须 400，且不得建物理桶
+    let err = s3
+        .create_bucket(with_mode(
+            req(CreateBucketInput {
+                bucket: "sync-b".into(),
+                ..Default::default()
+            }),
+            "sync",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert!(
+        s3.head_bucket(req(HeadBucketInput {
+            bucket: "sync-b".into(),
+            ..Default::default()
+        }))
+        .await
+        .is_err(),
+        "未就绪时不得留下物理桶"
+    );
+    let err = s3
+        .create_bucket(with_mode(
+            req(CreateBucketInput {
+                bucket: "bad-b".into(),
+                ..Default::default()
+            }),
+            "eventual",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+
+    // 能力就绪：sync 模式写行；HeadBucket/GetBucketVersioning 读回同一模式。
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s3 = OssS3::new(store, acl().await, 1024 * 1024).with_sync_ready(true);
+    s3.create_bucket(with_mode(
+        with_user(CreateBucketInput {
+            bucket: "sync-ok".into(),
+            ..Default::default()
+        }),
+        "sync",
+    ))
+    .await
+    .unwrap();
+    let head = s3
+        .head_bucket(req(HeadBucketInput {
+            bucket: "sync-ok".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        head.headers
+            .get("x-oss-replication-mode")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "sync"
+    );
+    let ver = s3
+        .get_bucket_versioning(req(GetBucketVersioningInput {
+            bucket: "sync-ok".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        ver.headers
+            .get("x-oss-replication-mode")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "sync"
+    );
+}
+
+/// M9 S0：guard ABORT → 500 且物理桶回滚（绝不以成功返回）。
+#[tokio::test]
+async fn create_bucket_guard_abort_rolls_back_and_500() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, \
+          versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, \
+          object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, \
+          object_lock_default_days INTEGER, default_encryption TEXT, \
+          replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
+         CREATE TRIGGER raft_guard_buckets_ins BEFORE INSERT ON buckets \
+          BEGIN SELECT RAISE(ABORT, 'raft: control write outside apply'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s3, _d) = service_with_acl(xl_s3::access::Acl::new(pool)).await;
+    let err = s3
+        .create_bucket(with_user(CreateBucketInput {
+            bucket: "guarded".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert!(
+        s3.head_bucket(req(HeadBucketInput {
+            bucket: "guarded".into(),
+            ..Default::default()
+        }))
+        .await
+        .is_err(),
+        "行写失败后物理桶必须回滚"
+    );
 }

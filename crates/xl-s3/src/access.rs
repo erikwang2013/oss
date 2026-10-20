@@ -114,6 +114,17 @@ impl Acl {
             .unwrap_or_else(|| "Off".to_string()))
     }
 
+    /// M9：桶复制模式（行不存在 = "async"，与缺行旧桶同口径）。
+    pub async fn bucket_replication_mode(&self, bucket: &str) -> Result<String, sqlx::Error> {
+        let row = sqlx::query("SELECT replication_mode FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("replication_mode"))
+            .unwrap_or_else(|| "async".to_string()))
+    }
+
     /// M5 切片 4：桶对象锁状态 → `Some((enabled, 默认模式, 默认天数))`；**行不存在 = None**
     /// （N4 复验补：调用方可据此区分「桶不存在(404)」与「锁未开(400)」）。
     pub async fn bucket_lock(
@@ -607,7 +618,11 @@ impl Acl {
     /// 桶归属登记（历史形态，无 set；幂等——已存在不覆盖，测试钉）。
     pub async fn record_bucket_owner(&self, bucket: &str, uid: i64) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, 0)",
+            "INSERT OR IGNORE INTO buckets \
+             (name, owner_id, creation_date, versioning, set_id, object_lock, \
+              object_lock_default_mode, object_lock_default_days, default_encryption, \
+              replication_mode, deleting) \
+             VALUES (?, ?, ?, 'Off', 0, 0, NULL, NULL, NULL, 'async', 0)",
         )
         .bind(bucket)
         .bind(uid)
@@ -627,14 +642,39 @@ impl Acl {
         uid: i64,
         set: u16,
     ) -> Result<(), sqlx::Error> {
+        self.record_bucket_owner_set_mode(bucket, uid, set, "async")
+            .await
+    }
+
+    /// M9：同 [`Self::record_bucket_owner_set`]，并写 `replication_mode`。
+    /// ON CONFLICT 全列重置（set 随重建收敛，M5 阻断 1）；creation_date 保持首建。
+    pub async fn record_bucket_owner_set_mode(
+        &self,
+        bucket: &str,
+        uid: i64,
+        set: u16,
+        replication_mode: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(name) DO UPDATE SET owner_id = excluded.owner_id, set_id = excluded.set_id",
+            "INSERT INTO buckets \
+             (name, owner_id, creation_date, versioning, set_id, object_lock, \
+              object_lock_default_mode, object_lock_default_days, default_encryption, \
+              replication_mode, deleting) \
+             VALUES (?, ?, ?, 'Off', ?, 0, NULL, NULL, NULL, ?, 0) \
+             ON CONFLICT(name) DO UPDATE SET \
+              owner_id = excluded.owner_id, set_id = excluded.set_id, \
+              versioning = excluded.versioning, \
+              object_lock = excluded.object_lock, \
+              object_lock_default_mode = excluded.object_lock_default_mode, \
+              object_lock_default_days = excluded.object_lock_default_days, \
+              default_encryption = excluded.default_encryption, \
+              replication_mode = excluded.replication_mode, deleting = excluded.deleting",
         )
         .bind(bucket)
         .bind(uid)
         .bind(now())
         .bind(set as i64)
+        .bind(replication_mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1211,7 +1251,10 @@ mod tests {
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL, \
               parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');\
              CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, \
-              versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0);\
+              versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, \
+              object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, \
+              object_lock_default_days INTEGER, default_encryption TEXT, \
+              replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
              CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
               can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
               PRIMARY KEY (user_id, bucket));\

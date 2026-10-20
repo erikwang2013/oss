@@ -41,7 +41,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     .with_lifecycle(Some(Arc::clone(&state.lifecycle)))
     .with_restore(Some(Arc::clone(&state.restore_sink)))
     .with_tier_gc(Some(Arc::clone(&state.tier_gc)))
-    .with_inventory(Some(Arc::clone(&state.inventory)));
+    .with_inventory(Some(Arc::clone(&state.inventory)))
+    .with_sync_ready(crate::raft::SYNC_READY);
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
     let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);
@@ -91,6 +92,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         // Prometheus 文本面（M4 观测面）。公开口径与 /health/* 相同：只暴露节点 id 与
         // 计数（/health/cluster 本就公开同量级信息）；要收严时在外层套鉴权即可。
         .route("/metrics", get(metrics))
+        // M9 S0 骨架：S5 补 leader/term/applied；B 经 advertise_endpoint 访问。
+        .route("/api/v1/raft/status", get(raft_status))
         .nest("/api/v1", console)
         .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
@@ -98,6 +101,10 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         // 层在路由之后挂：同时包住 fallback（S3 面）。
         .layer(middleware::from_fn(restore_accepted));
     Ok(app)
+}
+
+async fn raft_status() -> Json<serde_json::Value> {
+    Json(crate::raft::status_json())
 }
 
 /// s3s 0.17 的 RestoreObject 生成代码固定按 `200 OK` 序列化并丢弃 `S3Response.status`，

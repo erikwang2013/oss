@@ -116,6 +116,14 @@ export interface BucketInfo {
   can_read: boolean
   can_write: boolean
   can_delete: boolean
+  /** M9：async（缺省）/ sync（远端确认后才返回） */
+  replication_mode?: 'async' | 'sync'
+}
+
+/** M9：控制面能力位（S0 全 false；S3/S6 翻转） */
+export interface RaftStatus {
+  enabled: boolean
+  capabilities?: { raft: boolean; sync: boolean; stretch: boolean }
 }
 
 /** 子账户 × 桶 的三档权限 */

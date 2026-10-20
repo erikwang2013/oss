@@ -48,6 +48,8 @@ pub struct SitePeer {
     pub created_at: i64,
     pub last_seen: Option<i64>,
     pub last_error: Option<String>,
+    /// M9：对端 Raft u64 节点 id（M7 行 NULL）。
+    pub raft_node_id: Option<u64>,
 }
 
 /// 控制台用户行（子账户管理页用；`permissions` 全量随行返回，页面上直接展示摘要）。
@@ -218,6 +220,8 @@ const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 const SCHEMA_M7: &str = include_str!("../migrations/0002_m7_site.sql");
 /// M8（S0）：全部新表/索引一次性建齐；后续切片只使用、不改本文件。
 const SCHEMA_M8: &str = include_str!("../migrations/0003_m8.sql");
+/// M9 S0：控制面契约表 + 11 张复制表的 guard。每次启动重放（IF NOT EXISTS / DROP+CREATE）。
+const SCHEMA_M9: &str = include_str!("../migrations/0004_m9.sql");
 
 pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
@@ -227,7 +231,23 @@ pub(crate) fn now() -> i64 {
 }
 
 impl Db {
+    /// M7/M8 默认连接：重放 M9 schema 后 `prepare_raft_mode(false)`（drop guard），
+    /// 库已处于 Raft 模式（`schema_meta.raft_mode=on`）时拒绝启动（降级守卫）。
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with(url, true, false).await
+    }
+
+    /// M9：Raft 数据站点连接（种 site_config，保留/重建 guard，drop `site_*` 触发器）。
+    pub async fn connect_raft(url: &str) -> Result<Self> {
+        Self::connect_with(url, true, true).await
+    }
+
+    /// M9 witness：不种 `site_config`（witness 无站点行），其余同 Raft。
+    pub async fn connect_witness(url: &str) -> Result<Self> {
+        Self::connect_with(url, false, true).await
+    }
+
+    async fn connect_with(url: &str, seed_site: bool, raft: bool) -> Result<Self> {
         // WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
         // `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
         // busy_timeout：多 job worker 并发写同库时用等待代替立即 SQLITE_BUSY（默认 5s 偏短）。
@@ -244,8 +264,86 @@ impl Db {
         sqlx::raw_sql(SCHEMA_M7).execute(&db.pool).await?;
         // M8：新表无触发器依赖，独立重放；任一语句失败必须启动失败（不吞错）。
         sqlx::raw_sql(SCHEMA_M8).execute(&db.pool).await?;
-        db.site_bootstrap().await?;
+        // M9：契约表 + guard 重放；列迁移在 M7 表存在后执行。
+        sqlx::raw_sql(SCHEMA_M9).execute(&db.pool).await?;
+        db.ensure_columns_m9().await?;
+        if seed_site {
+            db.site_bootstrap().await?;
+        }
+        db.prepare_raft_mode(raft).await?;
         Ok(db)
+    }
+
+    /// 模式切换（无条件调用）：
+    /// - `false`：库为 `raft_mode=on` → 拒绝启动；否则 drop 全部 `raft_guard_*`（M7 可写）。
+    /// - `true`：重放 M9 重建 guard、drop 全部 `site_*`、写 on、复位 apply ctx。
+    pub async fn prepare_raft_mode(&self, on: bool) -> Result<()> {
+        if on {
+            sqlx::raw_sql(SCHEMA_M9).execute(&self.pool).await?;
+            self.drop_triggers("site_%").await?;
+            sqlx::query(
+                "INSERT INTO schema_meta (key, value) VALUES ('raft_mode', 'on') \
+                 ON CONFLICT(key) DO UPDATE SET value = 'on'",
+            )
+            .execute(&self.pool)
+            .await?;
+            self.set_raft_apply_ctx(false).await?;
+        } else {
+            if self.schema_meta("raft_mode").await?.as_deref() == Some("on") {
+                return Err(sqlx::Error::Protocol(
+                    "配置缺少 [raft] 但数据库处于 Raft 模式（schema_meta.raft_mode=on）：\
+                     请恢复 [raft] 配置，或按 runbook 执行 force recovery"
+                        .into(),
+                ));
+            }
+            self.drop_triggers("raft_guard_%").await?;
+        }
+        Ok(())
+    }
+
+    /// 按 `sqlite_master` 名称模式 drop 触发器（名称来自库内，非用户输入）。
+    async fn drop_triggers(&self, pattern: &str) -> Result<()> {
+        let rows =
+            sqlx::query("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE ?")
+                .bind(pattern)
+                .fetch_all(&self.pool)
+                .await?;
+        for row in rows {
+            let name: String = row.get("name");
+            let sql = format!("DROP TRIGGER IF EXISTS \"{}\"", name.replace('"', "\"\""));
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// `schema_meta` 读（不存在 = None）。
+    pub async fn schema_meta(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM schema_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("value")))
+    }
+
+    /// 仅在 key 不存在时写入（首启身份持久化；返回是否写入）。
+    pub async fn schema_meta_set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        let res = sqlx::query("INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// apply 事务内标记（S5 接线；S0 提供契约）。
+    pub async fn set_raft_apply_ctx(&self, active: bool) -> Result<()> {
+        sqlx::query("UPDATE raft_apply_ctx SET active = ? WHERE id = 1")
+            .bind(active as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// 本站身份种子（幂等）：首启生成 uuid + 32 hex token；后续启动不动。
@@ -327,6 +425,14 @@ impl Db {
             (
                 "default_encryption",
                 "ALTER TABLE buckets ADD COLUMN default_encryption TEXT",
+            ),
+            (
+                "replication_mode",
+                "ALTER TABLE buckets ADD COLUMN replication_mode TEXT NOT NULL DEFAULT 'async'",
+            ),
+            (
+                "deleting",
+                "ALTER TABLE buckets ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0",
             ),
         ] {
             if !has(name)
@@ -513,6 +619,31 @@ impl Db {
                 if !again.iter().any(|r| r.get::<String, _>("name") == name) {
                     return Err(e);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// M9：`sites.raft_node_id`（Raft 模式下对端身份的 u64 id；M7 行留 NULL）。
+    async fn ensure_columns_m9(&self) -> Result<()> {
+        let cols = sqlx::query("SELECT name FROM pragma_table_info('sites')")
+            .fetch_all(&self.pool)
+            .await?;
+        if !cols
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "raft_node_id")
+            && let Err(e) = sqlx::query("ALTER TABLE sites ADD COLUMN raft_node_id INTEGER")
+                .execute(&self.pool)
+                .await
+        {
+            let again = sqlx::query("SELECT name FROM pragma_table_info('sites')")
+                .fetch_all(&self.pool)
+                .await?;
+            if !again
+                .iter()
+                .any(|r| r.get::<String, _>("name") == "raft_node_id")
+            {
+                return Err(e);
             }
         }
         Ok(())
@@ -781,8 +912,8 @@ impl Db {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO sites (peer_id, remote_site_id, name, endpoint, region, priority, \
-             s3_access_key, s3_secret_key, peer_site_token, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             s3_access_key, s3_secret_key, peer_site_token, created_at, raft_node_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&p.peer_id)
         .bind(&p.remote_site_id)
@@ -794,6 +925,7 @@ impl Db {
         .bind(&p.s3_secret_key)
         .bind(&p.peer_site_token)
         .bind(p.created_at)
+        .bind(p.raft_node_id.map(|v| v as i64))
         .execute(&mut *tx)
         .await?;
         // 出货游标从 0 起（首轮全量送达含配对快照）
@@ -978,13 +1110,29 @@ impl Db {
         owner_id: Option<i64>,
         set: u16,
     ) -> Result<()> {
+        self.insert_bucket_full(name, owner_id, set, "async").await
+    }
+
+    /// M9 全列建桶行（INSERT OR IGNORE；已存在的权威行不重置）。`set_id` 是本地路由列。
+    pub async fn insert_bucket_full(
+        &self,
+        name: &str,
+        owner_id: Option<i64>,
+        set: u16,
+        replication_mode: &str,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO buckets \
+             (name, owner_id, creation_date, versioning, set_id, object_lock, \
+              object_lock_default_mode, object_lock_default_days, default_encryption, \
+              replication_mode, deleting) \
+             VALUES (?, ?, ?, 'Off', ?, 0, NULL, NULL, NULL, ?, 0)",
         )
         .bind(name)
         .bind(owner_id)
         .bind(now())
         .bind(set as i64)
+        .bind(replication_mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -999,17 +1147,71 @@ impl Db {
         owner_id: Option<i64>,
         set: u16,
     ) -> Result<()> {
+        self.upsert_bucket_owner_set_mode(name, owner_id, set, "async")
+            .await
+    }
+
+    /// M9：同 [`Self::upsert_bucket_owner_set`]，并写 `replication_mode`。
+    /// ON CONFLICT 全列重置（set 随重建收敛，M5 阻断 1）；creation_date 保持首建。
+    pub async fn upsert_bucket_owner_set_mode(
+        &self,
+        name: &str,
+        owner_id: Option<i64>,
+        set: u16,
+        replication_mode: &str,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(name) DO UPDATE SET owner_id = excluded.owner_id, set_id = excluded.set_id",
+            "INSERT INTO buckets \
+             (name, owner_id, creation_date, versioning, set_id, object_lock, \
+              object_lock_default_mode, object_lock_default_days, default_encryption, \
+              replication_mode, deleting) \
+             VALUES (?, ?, ?, 'Off', ?, 0, NULL, NULL, NULL, ?, 0) \
+             ON CONFLICT(name) DO UPDATE SET \
+              owner_id = excluded.owner_id, set_id = excluded.set_id, \
+              versioning = excluded.versioning, \
+              object_lock = excluded.object_lock, \
+              object_lock_default_mode = excluded.object_lock_default_mode, \
+              object_lock_default_days = excluded.object_lock_default_days, \
+              default_encryption = excluded.default_encryption, \
+              replication_mode = excluded.replication_mode, deleting = excluded.deleting",
         )
         .bind(name)
         .bind(owner_id)
         .bind(now())
         .bind(set as i64)
+        .bind(replication_mode)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 桶的复制模式；行不存在 = "async"（读取路径与缺行旧桶同口径）。
+    pub async fn bucket_replication_mode(&self, name: &str) -> Result<String> {
+        let row = sqlx::query("SELECT replication_mode FROM buckets WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("replication_mode"))
+            .unwrap_or_else(|| "async".into()))
+    }
+
+    /// 全量桶名 → 模式（console 列表一次查完，避免逐桶查询）。
+    pub async fn bucket_replication_modes(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let rows = sqlx::query("SELECT name, replication_mode FROM buckets")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("name"),
+                    r.get::<String, _>("replication_mode"),
+                )
+            })
+            .collect())
     }
 
     /// P3-3：回填对账——把**权威**解析到的 set 覆盖到已有行（仅 set_id 列；owner/versioning
@@ -1509,6 +1711,7 @@ fn site_peer_from_row(r: &sqlx::sqlite::SqliteRow) -> SitePeer {
         created_at: r.get("created_at"),
         last_seen: r.get("last_seen"),
         last_error: r.get("last_error"),
+        raft_node_id: r.get::<Option<i64>, _>("raft_node_id").map(|v| v as u64),
     }
 }
 
