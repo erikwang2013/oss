@@ -79,11 +79,24 @@ impl ReplicationStore for SqlReplStore {
 pub struct SqlReplSink {
     pool: SqlitePool,
     store: Arc<Store>,
+    /// M9 S4：stretch 站点关闭 M7 异步**站点**对象复制（数据面已由 EC 双站点承担，
+    /// 再复制一份是浪费且单站点本就写不成功）；M6 规则复制不受影响。
+    site_data_replication: bool,
 }
 
 impl SqlReplSink {
     pub fn new(pool: SqlitePool, store: Arc<Store>) -> Self {
-        Self { pool, store }
+        Self {
+            pool,
+            store,
+            site_data_replication: true,
+        }
+    }
+
+    /// M9 S4：`[stretch]` 传 false——`enqueue_sites` 整体短路（不写 `target_kind='site'` 行）。
+    pub fn with_site_data_replication(mut self, on: bool) -> Self {
+        self.site_data_replication = on;
+        self
     }
 }
 
@@ -191,6 +204,9 @@ impl SqlReplSink {
     /// M7 切片 2a：逐 peer 入队。删除写要求源桶 versioning=Enabled
     /// （Off/Suspended 不入队——记档；marker 带版本，硬删版本列为空）。
     async fn enqueue_sites(&self, info: &WriteInfo<'_>) -> bool {
+        if !self.site_data_replication {
+            return false;
+        }
         if info.is_delete_marker || info.version_id.is_none() {
             let v: Option<String> = match sqlx::query_scalar(
                 "SELECT versioning FROM buckets WHERE name = ?",

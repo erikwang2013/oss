@@ -1718,7 +1718,8 @@ async fn create_bucket(
     match replication_mode {
         "async" => {}
         "sync" => {
-            if !crate::raft::SYNC_READY {
+            // M9 S4：stretch 禁止 sync 桶（与 S3 面 router 的 sync_ready 同口径）。
+            if !crate::raft::SYNC_READY || state.cfg.stretch.is_some() {
                 return (
                     StatusCode::BAD_REQUEST,
                     "sync replication mode is not available",

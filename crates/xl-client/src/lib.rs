@@ -221,13 +221,30 @@ impl std::fmt::Debug for TonicMesh {
 impl TonicMesh {
     /// `nodes` = (node_id, "ip:port") 全表（含自身——集群锁要对全节点广播，含本机的表操作）。
     pub fn new(_self_id: &str, secret: &str, nodes: &[(String, String)]) -> Result<Self> {
+        Self::new_with_timeouts(
+            _self_id,
+            secret,
+            nodes,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+    }
+
+    /// M9 S4：同 [`Self::new`]，连接/请求超时可配（stretch `[stretch].mesh_timeout_ms`）。
+    pub fn new_with_timeouts(
+        _self_id: &str,
+        secret: &str,
+        nodes: &[(String, String)],
+        connect: Duration,
+        request: Duration,
+    ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
         let mut clients = HashMap::with_capacity(nodes.len());
         for (id, addr) in nodes {
             let ep = Endpoint::from_shared(format!("http://{addr}"))
                 .map_err(|e| Error::Encode(format!("节点 {id} 地址非法（{addr}）：{e}")))?
-                .connect_timeout(Duration::from_secs(1))
-                .timeout(Duration::from_secs(5));
+                .connect_timeout(connect)
+                .timeout(request);
             let ch = ep.connect_lazy();
             clients.insert(
                 id.clone(),
@@ -930,6 +947,7 @@ pub async fn serve(store: Arc<Store>, addr: SocketAddr, secret: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xl_store::store::ec::EcConfig;
     use xl_store::store::{ClusterConfig, ClusterSets, NodeSpec, StoreConfig};
 
     async fn free_addr() -> SocketAddr {
@@ -979,6 +997,151 @@ mod tests {
         assert!(e.contains("Unauthenticated"), "实得：{e}");
     }
 
+    /// M9 S4：stretch 2×6——A 经真实 TonicMesh 写 B 的 6 个远端槽（B 是规范序第二节点），
+    /// 6/6 成功且每盘恰 1 片；服务端槽归属校验不得误拒。
+    #[tokio::test]
+    async fn stretch_peer_six_remote_slots() {
+        let a_tmp: Vec<tempfile::TempDir> =
+            (0..6).map(|_| tempfile::TempDir::new().unwrap()).collect();
+        let b_tmp: Vec<tempfile::TempDir> =
+            (0..6).map(|_| tempfile::TempDir::new().unwrap()).collect();
+        let a_dirs: Vec<std::path::PathBuf> =
+            a_tmp.iter().map(|d| d.path().to_path_buf()).collect();
+        let b_dirs: Vec<std::path::PathBuf> =
+            b_tmp.iter().map(|d| d.path().to_path_buf()).collect();
+        let (a_addr, b_addr) = (free_addr().await, free_addr().await);
+        let ec = EcConfig {
+            data: 8,
+            parity: 4,
+            enabled: true,
+        };
+        // 故意反序：两端 `new_stretch` 都必须规范为 [A,B]
+        let nodes = vec![
+            NodeSpec {
+                id: "B".into(),
+                addr: b_addr.to_string(),
+                drive_count: 6,
+            },
+            NodeSpec {
+                id: "A".into(),
+                addr: a_addr.to_string(),
+                drive_count: 6,
+            },
+        ];
+        let secret = "mesh-secret".to_string();
+
+        // B：服务端（规范序 self_idx=1）
+        let b_sets = ClusterSets::new_stretch("B", nodes.clone(), &ec).unwrap();
+        let b_pairs: Vec<(String, String)> = b_sets
+            .flat
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.addr.clone()))
+            .collect();
+        let b_mesh = Arc::new(TonicMesh::new("B", &secret, &b_pairs).unwrap());
+        let mut b_cfg = StoreConfig::new(&b_dirs[0]);
+        b_cfg.drives = b_dirs.clone();
+        b_cfg.ec = ec;
+        b_cfg.inline_threshold = 0;
+        b_cfg.cluster = Some(Arc::new(ClusterConfig {
+            sets: b_sets,
+            transport: b_mesh,
+            placement_v2: true,
+            resolver: None,
+            stretch: true,
+        }));
+        let b_store = Arc::new(Store::open(b_cfg).await.unwrap());
+        let b2 = Arc::clone(&b_store);
+        let b_secret = secret.clone();
+        tokio::spawn(async move {
+            let _ = serve(b2, b_addr, b_secret).await;
+        });
+
+        // A：客户端
+        let a_sets = ClusterSets::new_stretch("A", nodes, &ec).unwrap();
+        let a_pairs: Vec<(String, String)> = a_sets
+            .flat
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.addr.clone()))
+            .collect();
+        let mesh = Arc::new(TonicMesh::new("A", &secret, &a_pairs).unwrap());
+        let mut a_cfg = StoreConfig::new(&a_dirs[0]);
+        a_cfg.drives = a_dirs.clone();
+        a_cfg.ec = ec;
+        a_cfg.inline_threshold = 0;
+        a_cfg.cluster = Some(Arc::new(ClusterConfig {
+            sets: a_sets,
+            transport: mesh.clone(),
+            placement_v2: true,
+            resolver: None,
+            stretch: true,
+        }));
+        let a_store = Arc::new(Store::open(a_cfg).await.unwrap());
+
+        let mut ready = false;
+        for _ in 0..40 {
+            if mesh.health("B").await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "B mesh server 未就绪");
+
+        let topo = a_store.cluster().unwrap().sets.set_topo(0).unwrap().clone();
+        let remote: Vec<u16> = (0..topo.slot_count())
+            .filter(|s| topo.local_drive_of_slot(*s).is_none())
+            .collect();
+        assert_eq!(
+            remote,
+            (6..12).collect::<Vec<u16>>(),
+            "B 的槽须为规范序第二段"
+        );
+
+        let data = bytes::Bytes::from_static(b"stretch-shard-payload");
+        let crc = xl_store::store::ec::crc32c_of(&data);
+        for slot in &remote {
+            mesh.write_shard(
+                "B",
+                xl_store::mesh::ShardWrite {
+                    bucket: "bkt".into(),
+                    key: "k".into(),
+                    uuid: "u1".into(),
+                    part: 1,
+                    shard: *slot as u32,
+                    crc32c: crc,
+                    data: data.clone(),
+                    chunked: false,
+                    offset: 0,
+                    chunk_crc32c: 0,
+                    is_final: false,
+                    slot: *slot as u32,
+                    set: 0,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // 6/6 落盘：B 的每个盘恰 1 片；A 本地 0 片（全写远端）
+        for slot in &remote {
+            let p = xl_store::layout::object_dir(&b_dirs[(*slot - 6) as usize], "bkt", "k")
+                .unwrap()
+                .join("u1")
+                .join(format!("part.1.{slot}"));
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                &data[..],
+                "B 盘 {slot} 内容不符"
+            );
+        }
+        let a_files = a_dirs
+            .iter()
+            .filter_map(|d| std::fs::read_dir(d.join("bkt")).ok())
+            .count();
+        assert_eq!(a_files, 0, "A 不应有本地分片目录");
+    }
+
     /// 未知节点名显式报错（不 panic、不静默）。
     #[tokio::test]
     async fn unknown_node_is_explicit_error() {
@@ -1021,6 +1184,7 @@ mod tests {
             sets,
             transport: mesh.clone(),
             resolver: None,
+            stretch: false,
         }));
         let store = Arc::new(Store::open(cfg).await.unwrap());
         let s2 = store.clone();

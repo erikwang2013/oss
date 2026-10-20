@@ -42,7 +42,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     .with_restore(Some(Arc::clone(&state.restore_sink)))
     .with_tier_gc(Some(Arc::clone(&state.tier_gc)))
     .with_inventory(Some(Arc::clone(&state.inventory)))
-    .with_sync_ready(crate::raft::SYNC_READY)
+    // M9 S4：stretch 禁止 sync 桶（对象内容不得依赖单站点异步副本）。
+    .with_sync_ready(crate::raft::SYNC_READY && state.cfg.stretch.is_none())
     // M9：sync 摄入 token 校验（无 [site] = None → 一律 403）
     .with_site_token(state.site_enabled.then(|| state.site.token.clone()));
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。

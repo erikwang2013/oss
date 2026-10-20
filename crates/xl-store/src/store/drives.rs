@@ -302,6 +302,50 @@ impl ClusterSets {
         Self::new(self_id, vec![nodes], ec)
     }
 
+    /// M9 S4：stretch 2×6 预设（EC 8+4、placement v2）。
+    ///
+    /// **规范顺序**：节点先按 `node_id` 升序排序（与调用方传入顺序/本机身份无关）——两端
+    /// 必须得到同一槽序，否则一半分片会被对端 `mesh_api` 的归属核对拒写。
+    /// `check_per_node_parity=false`：stretch 明确**不承诺站点级容灾**（单站点 6 片 < data=8），
+    /// 逐节点 `drive_count ≤ parity` 上限不适用；`ClusterTopology::new` 仍保持该上限。
+    pub fn new_stretch(
+        self_id: &str,
+        mut nodes: Vec<NodeSpec>,
+        ec: &super::ec::EcConfig,
+    ) -> Result<Self> {
+        if nodes.len() != 2 {
+            return Err(Error::Encode(format!(
+                "stretch 必须恰 2 个数据节点，实际 {}",
+                nodes.len()
+            )));
+        }
+        if !ec.enabled || ec.data != 8 || ec.parity != 4 {
+            return Err(Error::Encode(format!(
+                "stretch 要求 EC 8+4（enabled），实际 data={} parity={} enabled={}",
+                ec.data, ec.parity, ec.enabled
+            )));
+        }
+        for n in &nodes {
+            if n.drive_count != 6 {
+                return Err(Error::Encode(format!(
+                    "stretch 每站点必须恰 6 盘，节点 {} 为 {}",
+                    n.id, n.drive_count
+                )));
+            }
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let self_idx = nodes
+            .iter()
+            .position(|n| n.id == self_id)
+            .ok_or_else(|| Error::Encode(format!("本节点 «{self_id}» 不在 stretch 节点表内")))?;
+        let topo = ClusterTopology::build(self_idx, nodes, ec, false)?;
+        Ok(Self {
+            sets: vec![topo.clone()],
+            flat: topo,
+            self_ranges: vec![(0, 0, 6)],
+        })
+    }
+
     /// (set, 组内盘序) → cfg.drives 扁平下标（= 自节点该 set 段 offset + 组内序）。
     /// `None` = 越界/该盘不在本节点。**洞 1 修法 (a)：一切物理盘寻址经此映射**。
     pub fn flat_of(&self, set: u16, ordinal: usize) -> Option<usize> {
@@ -326,6 +370,8 @@ pub struct ClusterConfig {
     /// M4 切片 8：桶 → set 解析。`None` = 未注入：单 set 由 Store 短路（不调用）；
     /// 多 set 命中 = fail-closed Err（配置错误不得静默）。
     pub resolver: Option<Arc<dyn crate::mesh::SetResolver>>,
+    /// M9 S4：stretch 2×6 模式（`Store::open` 据此强制 `inline_threshold==0`）。
+    pub stretch: bool,
 }
 
 impl std::fmt::Debug for ClusterConfig {
@@ -601,6 +647,109 @@ mod tests {
             None,
             "槽 12 归属节点 d（远端），且永无分片"
         );
+    }
+
+    fn stretch_nodes() -> Vec<NodeSpec> {
+        vec![n("B", 6), n("A", 6)] // 故意反序：new_stretch 必须自行规范排序
+    }
+
+    /// M9 S4：2×6 stretch——任意 hash 下每站点恰 6 片（< data=8）、每盘恰 1 片、12 槽全用。
+    #[test]
+    fn stretch_2x6_placements_are_6_per_site_for_all_hashes() {
+        let cs = ClusterSets::new_stretch("A", stretch_nodes(), &ec84()).unwrap();
+        assert_eq!(cs.sets.len(), 1);
+        assert_eq!(cs.flat.slot_count(), 12);
+        assert_eq!(cs.self_ranges, vec![(0u16, 0usize, 6usize)]);
+        let t = &cs.sets[0];
+        assert_eq!(t.self_idx, 0, "A 在规范序中居首");
+        assert_eq!(
+            t.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        // 12 个 hash 余数即全部放置形态
+        for h in 0..12u64 {
+            let mut per_node = [0usize; 2];
+            let mut slots: Vec<u16> = Vec::new();
+            for shard in 0..12u8 {
+                let slot = t.place(h, shard, true);
+                per_node[t.node_of_slot(slot)] += 1;
+                slots.push(slot);
+            }
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(
+                slots.len(),
+                12,
+                "h={h}：12 分片必须占 12 个不同槽（1 片/盘）"
+            );
+            assert_eq!(per_node, [6, 6], "h={h}：每站点恰 6 片");
+            assert!(
+                per_node.iter().all(|&n| n < ec84().data as usize),
+                "h={h}：单站点 6 < data 8，无法独立重建"
+            );
+        }
+        // 本机视角：A 的槽 0..6 本地、6..12 远端；B 反之
+        assert_eq!(t.local_drive_of_slot(0), Some(0));
+        assert_eq!(t.local_drive_of_slot(5), Some(5));
+        assert_eq!(t.local_drive_of_slot(6), None);
+        assert_eq!(cs.flat_of(0, 5), Some(5));
+        let cs_b = ClusterSets::new_stretch("B", stretch_nodes(), &ec84()).unwrap();
+        assert_eq!(cs_b.sets[0].self_idx, 1);
+        assert_eq!(cs_b.sets[0].local_drive_of_slot(6), Some(0));
+        assert_eq!(cs_b.sets[0].local_drive_of_slot(0), None);
+        // 两端槽序一致（与传入顺序无关）
+        for h in 0..12u64 {
+            for shard in 0..12u8 {
+                assert_eq!(
+                    cs.sets[0].place(h, shard, true),
+                    cs_b.sets[0].place(h, shard, true)
+                );
+            }
+        }
+    }
+
+    /// M9 S4：配置矩阵 fail-closed；`ClusterTopology::new` 仍保留逐节点 parity 上限。
+    #[test]
+    fn stretch_rejects_bad_config_but_new_stays_strict() {
+        let ec = ec84();
+        let err = |nodes: Vec<NodeSpec>, ec: &super::super::ec::EcConfig| {
+            ClusterSets::new_stretch("A", nodes, ec)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err(vec![n("A", 6)], &ec).contains("2 个数据节点"));
+        assert!(err(vec![n("A", 6), n("B", 5)], &ec).contains("6 盘"));
+        assert!(err(vec![n("A", 6), n("B", 6), n("C", 6)], &ec).contains("2 个数据节点"));
+        assert!(
+            err(
+                vec![n("A", 6), n("B", 6)],
+                &super::super::ec::EcConfig {
+                    data: 8,
+                    parity: 3,
+                    enabled: true,
+                }
+            )
+            .contains("8+4")
+        );
+        assert!(
+            err(
+                vec![n("A", 6), n("B", 6)],
+                &super::super::ec::EcConfig {
+                    data: 9,
+                    parity: 4,
+                    enabled: true,
+                }
+            )
+            .contains("8+4")
+        );
+        assert!(
+            ClusterSets::new_stretch("C", vec![n("A", 6), n("B", 6)], &ec)
+                .unwrap_err()
+                .to_string()
+                .contains("不在 stretch 节点表内")
+        );
+        // 回归钉：普通集群构造仍拒绝 6 > parity
+        assert!(ClusterTopology::new(0, vec![n("A", 6), n("B", 6)], &ec).is_err());
     }
 
     #[test]

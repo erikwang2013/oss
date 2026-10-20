@@ -188,7 +188,7 @@ fn default_mesh_timeout_ms() -> u64 {
 
 /// 接受 `host:port` / `http://host:port`；拒绝 https、path/query/userinfo、空 host/port。
 /// 返回小写 host 的 `host:port`（TonicMesh 会自行再拼 `http://`）。
-fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
+pub(crate) fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
     let s = raw.trim();
     if s.is_empty() {
         return Err(format!("{field} 不能为空"));
@@ -678,6 +678,9 @@ impl AppConfig {
         }
         if s.mesh_secret.trim().is_empty() {
             return Err("[stretch].mesh_secret 不能为空".into());
+        }
+        if s.mesh_timeout_ms == 0 {
+            return Err("[stretch].mesh_timeout_ms 必须 > 0".into());
         }
         if !self.ec.enabled || self.ec.data != 8 || self.ec.parity != 4 {
             return Err("[stretch] 要求 [ec] enabled=true、data=8、parity=4".into());
@@ -1405,6 +1408,13 @@ mesh_secret = "x"
         let mut c = m9_cfg();
         c.ec.inline_threshold = 1;
         assert!(c.stretch_validate().is_err());
+        let mut c = m9_cfg();
+        c.stretch.as_mut().unwrap().mesh_timeout_ms = 0;
+        assert!(
+            c.stretch_validate()
+                .unwrap_err()
+                .contains("mesh_timeout_ms")
+        );
         assert!(m9_cfg().stretch_validate().is_ok());
     }
 

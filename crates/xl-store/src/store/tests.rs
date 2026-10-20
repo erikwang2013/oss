@@ -23,6 +23,47 @@ async fn open_is_idempotent() {
     Store::open(StoreConfig::new(dir.path())).await.unwrap();
 }
 
+/// M9 S4：stretch 下对象字节只进分片——`inline_threshold != 0` 启动即拒。
+#[tokio::test]
+async fn open_stretch_rejects_nonzero_inline_threshold() {
+    let tmp: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::TempDir::new().unwrap()).collect();
+    let dirs: Vec<std::path::PathBuf> = tmp.iter().map(|d| d.path().to_path_buf()).collect();
+    let ec = ec::EcConfig {
+        data: 8,
+        parity: 4,
+        enabled: true,
+    };
+    let nodes = vec![
+        drives::NodeSpec {
+            id: "A".into(),
+            addr: "127.0.0.1:1".into(),
+            drive_count: 6,
+        },
+        drives::NodeSpec {
+            id: "B".into(),
+            addr: "127.0.0.1:2".into(),
+            drive_count: 6,
+        },
+    ];
+    let sets = drives::ClusterSets::new_stretch("A", nodes, &ec).unwrap();
+    let mut cfg = StoreConfig::new(&dirs[0]);
+    cfg.drives = dirs;
+    cfg.ec = ec;
+    cfg.inline_threshold = 1;
+    cfg.cluster = Some(Arc::new(drives::ClusterConfig {
+        sets,
+        transport: InProcessMesh::new(),
+        placement_v2: true,
+        resolver: None,
+        stretch: true,
+    }));
+    let e = match Store::open(cfg).await {
+        Ok(_) => panic!("stretch + inline_threshold=1 必须拒启"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("inline_threshold=0"), "{e}");
+}
+
 #[tokio::test]
 async fn create_and_list_buckets() {
     let (s, _d) = store().await;
@@ -2748,6 +2789,7 @@ impl Cluster {
                 transport: mesh.clone(),
                 placement_v2,
                 resolver: None,
+                stretch: false,
             }));
             stores.push(Arc::new(Store::open(cfg).await.unwrap()));
         }
@@ -2927,6 +2969,7 @@ async fn multiset_isolation_flat_mapping_and_mirror() {
             placement_v2: false,
             transport: mesh.clone(),
             resolver: Some(Arc::new(FixedResolver)),
+            stretch: false,
         }));
         let st = Arc::new(Store::open(cfg).await.unwrap());
         mesh.register(id, &st);
@@ -3088,6 +3131,7 @@ async fn bucket_row_broadcast_reaches_all_peers() {
             placement_v2: false,
             transport: mesh.clone(),
             resolver: None,
+            stretch: false,
         }));
         let st = Arc::new(Store::open(cfg).await.unwrap());
         mesh.register(id, &st);
@@ -3616,6 +3660,7 @@ async fn cluster_topology_fingerprint_detects_reorder() {
             transport: mesh,
             placement_v2: false,
             resolver: None,
+            stretch: false,
         }));
         cfg
     };
