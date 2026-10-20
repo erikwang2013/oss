@@ -346,12 +346,54 @@ impl AppState {
                 transport: mesh,
                 placement_v2,
                 resolver,
+                stretch: false,
             }));
             // Task 9：控制面读扇出的本节点执行器（判权复用 xl-s3::Acl；只查本地 DB）
             store_cfg.control = Some(Arc::new(
                 crate::cluster_control::SqliteControlBackend::new(db.pool().clone())
                     .with_bucket_cleanup(Some(Arc::clone(&bucket_cleanup))),
             ));
+        } else if let Some(st) = cfg.stretch.as_ref() {
+            // M9 S4：2×6 stretch——拓扑由 `new_stretch` 规范排序（两端同槽序），
+            // placement v2 固定、单 set 无需 SetResolver；数据面复用 TonicMesh。
+            let self_addr =
+                crate::config::normalize_http_addr(&st.self_addr, "[stretch].self_addr")?;
+            let peer_addr =
+                crate::config::normalize_http_addr(&st.peer_addr, "[stretch].peer_addr")?;
+            let nodes = vec![
+                xl_store::store::NodeSpec {
+                    id: st.node_id.clone(),
+                    addr: self_addr,
+                    drive_count: 6,
+                },
+                xl_store::store::NodeSpec {
+                    id: st.peer_node_id.clone(),
+                    addr: peer_addr,
+                    drive_count: st.peer_drives,
+                },
+            ];
+            let sets =
+                xl_store::store::ClusterSets::new_stretch(&st.node_id, nodes, &store_cfg.ec)?;
+            let pairs: Vec<(String, String)> = sets
+                .flat
+                .nodes
+                .iter()
+                .map(|n| (n.id.clone(), n.addr.clone()))
+                .collect();
+            let mesh = Arc::new(xl_client::TonicMesh::new_with_timeouts(
+                &st.node_id,
+                &st.mesh_secret,
+                &pairs,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(st.mesh_timeout_ms),
+            )?);
+            store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
+                sets,
+                transport: mesh,
+                placement_v2: true,
+                resolver: None,
+                stretch: true,
+            }));
         }
         let store = Store::open(store_cfg).await?;
 
@@ -648,10 +690,11 @@ impl AppState {
             remote_ids,
         ));
         let store = Arc::new(store);
-        let repl_sink = Arc::new(crate::replication::SqlReplSink::new(
-            db.pool().clone(),
-            Arc::clone(&store),
-        ));
+        let repl_sink = Arc::new(
+            crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
+                // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
+                .with_site_data_replication(cfg.stretch.is_none()),
+        );
         let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
         // M8 S4b：tier 后端固定于启动配置；规则校验只认这些 id。
         let tiers = Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers));

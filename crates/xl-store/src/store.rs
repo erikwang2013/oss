@@ -231,6 +231,13 @@ impl Store {
             // data+parity 的全局校验在 ClusterTopology::new（槽位数 ≥ 12）。
             // M4 切片 8：多 set 下自节点盘数 = 各 set 段之和（顺序契约见 ClusterSets::new）。
             let cl = cfg.cluster.as_ref().unwrap();
+            // M9 S4：stretch 要求对象字节只进分片（meta 仅元数据，可镜像）——阈值非 0 启动即拒。
+            if cl.stretch && cfg.inline_threshold != 0 {
+                return Err(Error::Encode(format!(
+                    "stretch 要求 inline_threshold=0，实际 {}",
+                    cfg.inline_threshold
+                )));
+            }
             let declared: usize = cl.sets.self_ranges.iter().map(|(_, _, len)| len).sum();
             let flat_self = cl.sets.flat.self_node();
             if declared != n || flat_self.drive_count as usize != n {

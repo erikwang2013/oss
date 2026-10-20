@@ -188,7 +188,7 @@ fn default_mesh_timeout_ms() -> u64 {
 
 /// 接受 `host:port` / `http://host:port`；拒绝 https、path/query/userinfo、空 host/port。
 /// 返回小写 host 的 `host:port`（TonicMesh 会自行再拼 `http://`）。
-fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
+pub(crate) fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
     let s = raw.trim();
     if s.is_empty() {
         return Err(format!("{field} 不能为空"));
