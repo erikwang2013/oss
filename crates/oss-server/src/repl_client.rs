@@ -311,12 +311,17 @@ impl ReplClient {
             None,
             &BTreeMap::new(),
             false,
+            None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     /// M7 站点 PUT：透传 content-type/user-metadata，并可要求响应带真实 version-id
     /// （Suspended/Off 目标返回 "null" → 按可重试处理——P2）。
+    /// M9：`site_token`/`origin_version_id` 进 SigV4 SignedHeaders（sync 摄入校验+同 id）；
+    /// 返回远端 `x-amz-version-id`（无则 None）。
     #[allow(clippy::too_many_arguments)]
     pub async fn put_object_with_meta(
         &self,
@@ -328,10 +333,18 @@ impl ReplClient {
         content_type: Option<&str>,
         user_metadata: &BTreeMap<String, String>,
         require_version: bool,
-    ) -> Result<(), ReplError> {
+        site_token: Option<&str>,
+        origin_version_id: Option<&str>,
+    ) -> Result<Option<String>, ReplError> {
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(ct) = content_type {
             headers.push(("content-type".into(), ct.to_string()));
+        }
+        if let Some(t) = site_token {
+            headers.push(("x-oss-site-token".into(), t.to_string()));
+        }
+        if let Some(v) = origin_version_id {
+            headers.push(("x-oss-origin-version-id".into(), v.to_string()));
         }
         for (k, v) in user_metadata {
             let k = k.to_ascii_lowercase();
@@ -372,18 +385,48 @@ impl ReplClient {
                 )));
             }
         }
-        if require_version {
-            let vid = resp
-                .headers()
-                .get("x-amz-version-id")
-                .and_then(|v| v.to_str().ok());
-            if vid.is_none_or(|v| v.is_empty() || v == "null") {
-                return Err(ReplError::retryable(
-                    "目标返回空/null version-id（versioning 未就绪，稍后重试）",
-                ));
-            }
+        let vid = resp
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if require_version && vid.as_deref().is_none_or(|v| v.is_empty() || v == "null") {
+            return Err(ReplError::retryable(
+                "目标返回空/null version-id（versioning 未就绪，稍后重试）",
+            ));
         }
-        Ok(())
+        Ok(vid)
+    }
+
+    /// M9：按版本 id 定点删除（同步门补偿；404 = 已不存在 → 成功）。
+    pub async fn delete_object_version(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        version_id: &str,
+        site_token: Option<&str>,
+    ) -> Result<(), ReplError> {
+        let headers: Vec<(String, String)> = site_token
+            .map(|t| vec![("x-oss-site-token".to_string(), t.to_string())])
+            .unwrap_or_default();
+        match self
+            .send(
+                remote_id,
+                "DELETE",
+                dest_bucket,
+                Some(key),
+                &[("versionId", version_id)],
+                None,
+                &headers,
+                Some("REPLICA"),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.status == Some(404) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn delete_object(

@@ -52,6 +52,12 @@ pub enum Error {
     /// M5 切片 4：对象锁拒绝（retention/legal hold 生效中）→ S3 403 AccessDenied（客户端可纠正）。
     #[error("object locked: {0}")]
     ObjectLocked(String),
+    /// M9：sync 门不可用（远端失败/超时/配对缺失/删桶中）→ S3 503。
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+    /// M9：明确的能力边界 → S3 501。
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

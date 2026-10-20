@@ -84,6 +84,7 @@ impl Store {
             encryption: v.encryption.clone(),
             lock: v.lock.clone(),
             replication_status: v.replication_status.clone(),
+            remote_version_id: v.remote_version_id.clone(),
             tags: v.tags.clone().unwrap_or_default(),
             storage_class: v.storage_class.clone(),
             tier_phase: v.tier.as_ref().map(|t| t.phase),

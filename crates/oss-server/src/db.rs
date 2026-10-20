@@ -1196,6 +1196,26 @@ impl Db {
             .unwrap_or_else(|| "async".into()))
     }
 
+    /// M9：sync 写门所需桶状态 `(replication_mode, deleting, versioning)`；
+    /// 行不存在 = ("async", false, "Off")（与缺行旧桶同口径）。
+    pub async fn bucket_sync_state(&self, name: &str) -> Result<(String, bool, String)> {
+        let row = sqlx::query(
+            "SELECT replication_mode, deleting, versioning FROM buckets WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get::<String, _>("replication_mode"),
+                    r.get::<i64, _>("deleting") != 0,
+                    r.get::<String, _>("versioning"),
+                )
+            })
+            .unwrap_or_else(|| ("async".into(), false, "Off".into())))
+    }
+
     /// 全量桶名 → 模式（console 列表一次查完，避免逐桶查询）。
     pub async fn bucket_replication_modes(
         &self,

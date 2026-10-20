@@ -1815,6 +1815,8 @@ async fn create_bucket(
         }
         return internal_error();
     }
+    // M9：门模式缓存失效（行已写入——新建 sync 桶首次写即生效）。
+    state.store.invalidate_gate(&body.name);
     // M5 切片 0（P4-1）：行变更广播（best-effort）
     state
         .store
@@ -1851,6 +1853,8 @@ async fn delete_bucket(
                 tracing::warn!(error = %e, bucket = %bucket, "删桶 M8 表清理失败");
             }
             state.bucket_cleanup.invalidate_ap_cache(&bucket);
+            // M9：物理桶已删——无论行清理是否成功都不再把写当 sync 拦截。
+            state.store.invalidate_gate(&bucket);
             if let Err(e) = state.acl().forget_bucket(&bucket).await {
                 // M7 H1：门控 ABORT 时物理桶已删、行/授权未动——恢复空桶（删除前为空）
                 // 并返回 409，绝不能让“物理已删 + 行残留 + 无 delete changelog”静默成功。

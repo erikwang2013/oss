@@ -556,6 +556,7 @@ impl Store {
                 // M5 切片 4：对象锁（create 记录的意图在此落地）
                 lock: effective_lock.clone(),
                 replication_status: None,
+                remote_version_id: None,
                 // Create 声明的标签在 complete 落地（complete 无标签输入）
                 tags: mpu.tags.clone(),
                 storage_class: mpu.storage_class.clone(),
@@ -656,6 +657,7 @@ impl Store {
             encryption: enc_record,
             lock: effective_lock,
             replication_status: None,
+            remote_version_id: None,
             tags: mpu.tags.unwrap_or_default(),
             storage_class: mpu.storage_class.clone(),
             tier_phase: None,

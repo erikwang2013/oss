@@ -144,14 +144,36 @@ impl Store {
 
     /// 前段（单段 PUT / MPU complete / 多盘分发共用）：流式收 `body` 到 `tmp/part.1`
     /// 并做增量哈希。返回 `(size, 整份 MD5 etag, 整份 SHA256, part.1 路径)`。
-    pub(in crate::store) async fn harvest_body(
+    /// `tee`：sync 桶 staging 期间同时落一份**明文**（加密/EC 之前——形态差异在此抹平）。
+    /// `max_bytes`：超限即中止（早停，避免 sync 桶被超大对象填盘）。
+    async fn harvest_body_tee(
         &self,
         tmp: &std::path::Path,
         mut body: ByteStream,
+        tee: Option<&std::path::Path>,
+        max_bytes: Option<u64>,
     ) -> Result<(u64, String, String, std::path::PathBuf)> {
         tokio::fs::create_dir_all(tmp).await?;
         let part_path = tmp.join("part.1");
         let mut file = tokio::fs::File::create(&part_path).await?;
+        let mut tee_file = match tee {
+            Some(p) => {
+                if let Some(dir) = p.parent() {
+                    tokio::fs::create_dir_all(dir).await?;
+                }
+                // 明文只给本进程读：0600（tee 目录在建桶目录外）
+                Some(
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(p)
+                        .await?,
+                )
+            }
+            None => None,
+        };
         let mut md5 = Md5::new();
         let mut sha = Sha256::new();
         let mut size: u64 = 0;
@@ -160,11 +182,27 @@ impl Store {
             md5.update(&chunk);
             sha.update(&chunk);
             size += chunk.len() as u64;
+            if let Some(max) = max_bytes
+                && size > max
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "object exceeds sync max_object_bytes ({max})"
+                )));
+            }
             file.write_all(&chunk).await?;
+            if let Some(f) = &mut tee_file {
+                f.write_all(&chunk).await?;
+            }
         }
         file.flush().await?;
         if self.cfg.fsync {
             file.sync_all().await?;
+        }
+        if let Some(f) = &mut tee_file {
+            f.flush().await?;
+            if self.cfg.fsync {
+                f.sync_all().await?; // 远端调用前 tee 必须可读
+            }
         }
         drop(file);
         Ok((
@@ -192,7 +230,26 @@ impl Store {
         Option<meta::DataLayout>,
         Option<meta::InlineData>,
     )> {
-        let (size, etag, sha256, part_path) = self.harvest_body(tmp, body).await?;
+        self.stage_payload_tee(tmp, body, enc, None, None).await
+    }
+
+    /// 带 tee/上限的形态核心（sync 单段 PUT 用；mpu 走无 tee 的兼容壳）。
+    pub(in crate::store) async fn stage_payload_tee(
+        &self,
+        tmp: &std::path::Path,
+        body: ByteStream,
+        enc: Option<&crypto::UnitCtx>,
+        tee: Option<&std::path::Path>,
+        max_bytes: Option<u64>,
+    ) -> Result<(
+        u64,
+        String,
+        String,
+        Option<meta::DataLayout>,
+        Option<meta::InlineData>,
+    )> {
+        let (size, etag, sha256, part_path) =
+            self.harvest_body_tee(tmp, body, tee, max_bytes).await?;
 
         // 2) 收尾转形态。为什么不像任务书最初设想的「收全再分叉」：那会失去流式落盘
         // 语义（M2a 的握手测试与 README 承诺）。M4 切片 2 起转形态本身也流式：
@@ -300,7 +357,32 @@ impl Store {
         Option<meta::InlineData>,
         Vec<u16>,
     )> {
-        let (size, etag, sha256, part_path) = self.harvest_body(tmp, body).await?;
+        self.stage_payload_multi_tee(bucket, key, uuid, tmp, body, enc, None, None)
+            .await
+    }
+
+    /// 带 tee/上限的多盘落盘（sync 单段 PUT 用）。
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::store) async fn stage_payload_multi_tee(
+        &self,
+        bucket: &str,
+        key: &str,
+        uuid: &str,
+        tmp: &std::path::Path,
+        body: ByteStream,
+        enc: Option<&crypto::UnitCtx>,
+        tee: Option<&std::path::Path>,
+        max_bytes: Option<u64>,
+    ) -> Result<(
+        u64,
+        String,
+        String,
+        Option<meta::DataLayout>,
+        Option<meta::InlineData>,
+        Vec<u16>,
+    )> {
+        let (size, etag, sha256, part_path) =
+            self.harvest_body_tee(tmp, body, tee, max_bytes).await?;
 
         if size == 0 || size < self.cfg.inline_threshold {
             let bytes = tokio::fs::read(&part_path).await?;
@@ -598,6 +680,40 @@ impl Store {
         tags: Option<Vec<meta::ObjectTag>>,
         storage_class: Option<String>,
     ) -> Result<ObjectInfo> {
+        self.put_object_stream_with_meta_ext(
+            bucket,
+            key,
+            body,
+            content_type,
+            user_metadata,
+            checksum,
+            versioned,
+            encryption,
+            lock,
+            tags,
+            storage_class,
+            super::PutExt::default(),
+        )
+        .await
+    }
+
+    /// M9 扩展写入口：`ext.replica` = 接收端摄入（不 gate）；`ext.forced_version_id` = 双站同 id。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_object_stream_with_meta_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: ByteStream,
+        content_type: Option<String>,
+        user_metadata: BTreeMap<String, String>,
+        checksum: Option<ChecksumRecord>,
+        versioned: bool,
+        encryption: Option<crypto::EncSpec>,
+        lock: Option<meta::ObjectLockRecord>,
+        tags: Option<Vec<meta::ObjectTag>>,
+        storage_class: Option<String>,
+        ext: super::PutExt,
+    ) -> Result<ObjectInfo> {
         layout::validate_key(key)?;
         // M8 前置：标签在写入口先校验（与 set_replication_status 白名单同模式）；
         // 空集合归一为 None（S3 无标签与空 TagSet 等价）。
@@ -612,6 +728,9 @@ impl Store {
         {
             return Err(Error::InvalidArgument(format!("非法存储类：{sc}")));
         }
+        // M9：sync 桶先问门（fail-closed）。REPLICA 摄入 = 对端已确认，不再 gate。
+        let sync = !ext.replica && self.sync_mode(bucket).await?;
+        let max_bytes = sync.then_some(self.cfg.sync_max_bytes);
         // 桶窗口（桶锁内，M2b-2 Task 10）：ensure + 对象目录先落盘——此后 delete_bucket
         // 见到非空必拒，桶「复活」窗口关闭。失败清理时清掉可能新建的空目录（空目录会卡住删桶）
         let obj_dir = {
@@ -654,8 +773,33 @@ impl Store {
         {
             return Err(Error::ObjectLocked(format!("覆盖写将回收锁定版本：{why}")));
         }
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&uuid);
+        // 双站同 id：接收端采用 origin UUID 作为版本目录名/version_id。
+        let forced_version_id =
+            match ext.forced_version_id.as_deref() {
+                Some(s) => Some(uuid::Uuid::parse_str(s).map_err(|_| {
+                    Error::InvalidArgument(format!("invalid origin version id: {s}"))
+                })?),
+                None => None,
+            };
+        let uuid = match forced_version_id {
+            Some(id) => id.to_string(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        // 重投（origin id 已在链上）绝不能把数据写进已提交的版本目录（多盘是直写路径）：
+        // 用一次性 uuid staging，比对后丢弃。
+        let replay = forced_version_id.and_then(|id| {
+            old_meta
+                .as_ref()
+                .and_then(|m| m.versions.iter().find(|v| v.version_id == id))
+        });
+        let stage_uuid = match replay {
+            Some(_) => uuid::Uuid::new_v4().to_string(),
+            None => uuid.clone(),
+        };
+        let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&stage_uuid);
+        // sync：staging 期间 tee 明文（版本目录外）；Drop 覆盖成功/失败/取消三种清理。
+        let tee = sync.then(|| TeeGuard::new(self.tee_dir().join(format!("{stage_uuid}.plain"))));
+        let tee_path = tee.as_ref().and_then(TeeGuard::path);
         // per-key 单调 mod_time（C4）：latest-wins 裁决与墙钟脱钩（M2b R8 的正解在 M3 兑现）
         let now = match old_meta.as_ref().and_then(|m| m.latest()) {
             Some(v) => now_nanos().max(v.mod_time_nanos + 1),
@@ -664,158 +808,251 @@ impl Store {
         // 集群 + 单盘节点也必须走槽位路径（否则分片全落本地 tmp，槽位模型失效）
         let multi = self.cfg.cluster.is_some() || self.cfg.multi_drive();
 
-        // 1)+2) 数据与候选 meta 落位；任何写失败/流错误都回滚本轮
+        // 1) staging：数据落位但对读路径不可见；任何写失败/流错误都回滚本轮
         //（未提交前无任何 meta 引用，失败即弃；残留只占空间，由 `oss-server clean` 按 mtime 回收）
-        let staged: Result<(u64, String, XlMeta)> = async {
-            let (size, etag, sha256, data_layout, inline) = if multi {
+        type Staged = (
+            u64,
+            String,
+            String,
+            Option<meta::DataLayout>,
+            Option<meta::InlineData>,
+        );
+        let staged: Result<Staged> = async {
+            if multi {
                 // 多盘：分片直写各盘版本目录（数据先于 meta；无需候选 meta 落 tmp）
                 let (s, e, sh, l, i, _touched) = self
-                    .stage_payload_multi(
+                    .stage_payload_multi_tee(
                         bucket,
                         key,
-                        &uuid,
+                        &stage_uuid,
                         &tmp,
                         body,
                         enc_ctx.as_ref().map(|(c, _)| c),
+                        tee_path,
+                        max_bytes,
                     )
                     .await?;
-                (s, e, sh, l, i)
+                Ok((s, e, sh, l, i))
             } else {
-                self.stage_payload(&tmp, body, enc_ctx.as_ref().map(|(c, _)| c))
-                    .await?
-            };
-
-            let version = Version {
-                // 版本控制 Enabled：真实版本号（= 版本目录 uuid）；否则 nil（S3 的 "null" 版本）
-                version_id: if versioned {
-                    uuid::Uuid::parse_str(&uuid).map_err(|e| {
-                        Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}"))
-                    })?
-                } else {
-                    uuid::Uuid::nil()
-                },
-                mod_time_nanos: now,
-                size,
-                etag: etag.clone(),
-                content_type: content_type.clone(),
-                user_metadata: user_metadata.clone(),
-                // 兼容位（旧读方依赖；EC 版的真实文件是 part.1.<shard>，旧读方读不到——「新解旧 ✓ 旧解新 ✗」已受裁定）
-                part: PartRef {
-                    uuid: uuid.clone(),
-                    part: 1,
-                    size,
-                    sha256,
-                },
-                // 单段 PUT 的 parts 恒 None（多段只出现在 M2a 旧对象的只读兼容位）
-                parts: None,
-                checksum: checksum.clone(),
-                data_layout,
-                inline,
-                is_delete_marker: None,
-                is_latest: None,
-                // NTP 回拨收口：epoch = 旧链 max+1（单调写序号，副本择新优先用它）
-                epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
-                // M5 切片 2：加密记录随版本落 meta（旧版本各留各的记录 → 换主密钥后仍可读）
-                encryption: enc_record.clone(),
-                // M5 切片 4：对象锁随版本落 meta（守卫在删除路径）
-                lock: lock_record.clone(),
-                replication_status: None,
-                tags: tags.clone(),
-                storage_class: storage_class.clone(),
-                tier: None,
-            };
-            // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
-            let mut meta = match (versioned, old_meta.as_ref()) {
-                (true, Some(old)) => {
-                    let mut m = old.clone();
-                    m.versions.push(version);
-                    m
-                }
-                _ => XlMeta {
-                    object_key: key.to_string(),
-                    versions: vec![version],
-                },
-            };
-            meta.refresh_latest_flags();
-
-            // 单盘：候选 meta 落 tmp（与数据同目录，随 rename 一起就位）
-            if !multi {
-                tokio::fs::write(tmp.join(meta::META_FILE), meta.encode()?).await?;
+                self.stage_payload_tee(
+                    &tmp,
+                    body,
+                    enc_ctx.as_ref().map(|(c, _)| c),
+                    tee_path,
+                    max_bytes,
+                )
+                .await
             }
-            Ok((size, etag, meta))
         }
         .await;
-        let (size, etag, meta) = match staged {
+        let (size, etag, sha256, data_layout, inline) = match staged {
             Ok(v) => v,
             Err(e) => {
-                if multi {
-                    self.rollback_versions(bucket, key, &uuid).await;
-                }
-                let _ = tokio::fs::remove_dir_all(&tmp).await;
-                let _ = tokio::fs::remove_dir(&obj_dir).await; // 仅当空（窗口新建的）才删得掉
+                self.discard_staged(bucket, key, &stage_uuid, &tmp, &obj_dir, multi)
+                    .await;
                 return Err(e);
             }
         };
 
-        if multi {
-            // 多盘：两阶段 meta 提交（单盘协议是 tmp→rename→write_meta，多盘没有跨盘 rename，
-            // 数据已在各盘版本目录就位，meta 翻转即各盘提交点）
-            // 提交点前复查租约（Task 8：无 fencing 窗口收窄到两次检查之间）
-            if guard.lease_lost() {
-                self.rollback_versions(bucket, key, &uuid).await;
-                let _ = tokio::fs::remove_dir_all(&tmp).await;
-                return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
+        // 双站同 id 重投：已存在且字节一致 → 幂等成功（不再远端调用）；不一致 → 400。
+        if let Some(id) = forced_version_id
+            && let Some(v) = replay
+        {
+            self.discard_staged(bucket, key, &stage_uuid, &tmp, &obj_dir, multi)
+                .await;
+            if v.size == size && v.etag == etag {
+                let old = old_meta.as_ref().expect("replay 来自旧 meta");
+                return self.load_object_info(bucket, key, old);
             }
-            let quorum = self.cfg.ec.data as usize + 1;
-            let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
-                Ok(n) => n,
-                Err(e) => {
-                    // 阶段一失败 = 一盘未翻转：数据目录干净回滚
-                    self.rollback_versions(bucket, key, &uuid).await;
-                    let _ = tokio::fs::remove_dir_all(&tmp).await;
-                    let _ = tokio::fs::remove_dir(&obj_dir).await;
-                    return Err(e);
+            return Err(Error::InvalidArgument(format!(
+                "origin version id 冲突：{id}"
+            )));
+        }
+
+        // 2) gate：staging 后、本地 meta 翻转前（sync 桶必须远端先确认）。
+        let ticket = if sync {
+            let plaintext = match tee_path {
+                Some(p) => p,
+                None => {
+                    self.discard_staged(bucket, key, &uuid, &tmp, &obj_dir, multi)
+                        .await;
+                    return Err(Error::Encode("sync tee 缺失（明文副本未生成）".into()));
                 }
             };
-            if flipped == 0 {
-                // 已准备 ≥quorum 但翻转全失败（病态 IO）：仍属未提交，回滚
-                self.rollback_versions(bucket, key, &uuid).await;
-                self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
-                let _ = tokio::fs::remove_dir_all(&tmp).await;
-                let _ = tokio::fs::remove_dir(&obj_dir).await;
-                self.bump_quorum_unmet_write();
-                return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
-            }
-            if flipped < quorum {
-                tracing::warn!(
-                    flipped,
-                    quorum,
-                    "meta 翻转不足 quorum（已提交，M4 heal 补副本）"
-                );
-            }
-            let _ = tokio::fs::remove_dir_all(&tmp).await; // tmp 仅用于流式收全与哈希
-            if !versioned {
-                // 版本控制桶：旧版本目录**保留**（链上仍有引用）；非版本桶进回收站
-                self.recycle_old(bucket, key, old_meta.as_ref()).await;
+            let req = crate::gate::GateRequest {
+                bucket,
+                key,
+                local_version_id: &uuid,
+                plaintext,
+                size,
+                etag: &etag,
+                content_type: content_type.as_deref(),
+                user_metadata: &user_metadata,
+                tags: tags.as_deref(),
+                storage_class: storage_class.as_deref(),
+            };
+            match self.gate_commit(req).await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    self.discard_staged(bucket, key, &uuid, &tmp, &obj_dir, multi)
+                        .await;
+                    return Err(e);
+                }
             }
         } else {
-            // 3) 同盘 rename：数据就位（此时对读路径仍不可见）；目录 fsync 是 rename 的持久化屏障。
-            // 对象目录在桶窗口已建，但「窗口 → 取到对象锁」之间可能被删（delete 抢先），
-            // 此处幂等重建（delete 走对象锁，此后不会再拆）
-            tokio::fs::create_dir_all(&obj_dir).await?;
-            tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
-            if self.cfg.fsync {
-                Store::sync_dir(&obj_dir).await;
-            }
+            None
+        };
 
-            // 4) 提交点：写 xl.meta.new 再原子覆盖
-            self.write_meta(bucket, key, &meta, old_meta.as_ref())
-                .await?;
-
-            // 5) 老版本进回收站（版本控制桶跳过：旧版本目录仍被链引用）
-            if !versioned {
-                self.recycle_old(bucket, key, old_meta.as_ref()).await;
+        // 3) Version 与候选 meta（gate 成功之后才构造——本地提交不得先于远端）。
+        // 接收端摄入：origin id 即远端 id（双站同 id），落 remote_version_id 供删除对称定位。
+        let remote_version_id = ticket
+            .as_ref()
+            .and_then(|t| t.remote_version_id.clone())
+            .or_else(|| forced_version_id.map(|id| id.to_string()));
+        let version = Version {
+            // 版本控制 Enabled：真实版本号（= 版本目录 uuid）；否则 nil（S3 的 "null" 版本）
+            version_id: if versioned {
+                uuid::Uuid::parse_str(&uuid)
+                    .map_err(|e| Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}")))?
+            } else {
+                uuid::Uuid::nil()
+            },
+            mod_time_nanos: now,
+            size,
+            etag: etag.clone(),
+            content_type: content_type.clone(),
+            user_metadata: user_metadata.clone(),
+            // 兼容位（旧读方依赖；EC 版的真实文件是 part.1.<shard>，旧读方读不到——「新解旧 ✓ 旧解新 ✗」已受裁定）
+            part: PartRef {
+                uuid: uuid.clone(),
+                part: 1,
+                size,
+                sha256,
+            },
+            // 单段 PUT 的 parts 恒 None（多段只出现在 M2a 旧对象的只读兼容位）
+            parts: None,
+            checksum: checksum.clone(),
+            data_layout,
+            inline,
+            is_delete_marker: None,
+            is_latest: None,
+            // NTP 回拨收口：epoch = 旧链 max+1（单调写序号，副本择新优先用它）
+            epoch: Some(old_meta.as_ref().map_or(0, |m| m.max_epoch()) + 1),
+            // M5 切片 2：加密记录随版本落 meta（旧版本各留各的记录 → 换主密钥后仍可读）
+            encryption: enc_record.clone(),
+            // M5 切片 4：对象锁随版本落 meta（守卫在删除路径）
+            lock: lock_record.clone(),
+            // sync 写远端已确认 → COMPLETED；非 sync 保持 M6 口径（None）。
+            replication_status: ticket.as_ref().map(|_| "COMPLETED".to_string()),
+            remote_version_id: remote_version_id.clone(),
+            tags: tags.clone(),
+            storage_class: storage_class.clone(),
+            tier: None,
+        };
+        // 版本链：versioned 且已有链 → 追加（旧版本目录保留）；否则单版本（M2b 语义）
+        let mut meta = match (versioned, old_meta.as_ref()) {
+            (true, Some(old)) => {
+                let mut m = old.clone();
+                m.versions.push(version);
+                m
             }
+            _ => XlMeta {
+                object_key: key.to_string(),
+                versions: vec![version],
+            },
+        };
+        meta.refresh_latest_flags();
+
+        // 单盘：候选 meta 落 tmp（与数据同目录，随 rename 一起就位）
+        let candidate = if multi {
+            Ok(())
+        } else {
+            match meta.encode() {
+                Ok(bytes) => tokio::fs::write(tmp.join(meta::META_FILE), bytes)
+                    .await
+                    .map_err(Error::from),
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = candidate {
+            if let Some(t) = &ticket {
+                self.abort_gate(t).await;
+            }
+            self.discard_staged(bucket, key, &uuid, &tmp, &obj_dir, multi)
+                .await;
+            return Err(e);
+        }
+
+        // 4) 本地提交（提交点 = xl.meta 翻转）。失败 → 补偿远端（best-effort）。
+        let committed: Result<()> = async {
+            if multi {
+                // 多盘：两阶段 meta 提交（单盘协议是 tmp→rename→write_meta，多盘没有跨盘 rename，
+                // 数据已在各盘版本目录就位，meta 翻转即各盘提交点）
+                // 提交点前复查租约（Task 8：无 fencing 窗口收窄到两次检查之间）
+                if guard.lease_lost() {
+                    self.rollback_versions(bucket, key, &uuid).await;
+                    let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
+                }
+                let quorum = self.cfg.ec.data as usize + 1;
+                let flipped = match self.write_meta(bucket, key, &meta, old_meta.as_ref()).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // 阶段一失败 = 一盘未翻转：数据目录干净回滚
+                        self.rollback_versions(bucket, key, &uuid).await;
+                        let _ = tokio::fs::remove_dir_all(&tmp).await;
+                        let _ = tokio::fs::remove_dir(&obj_dir).await;
+                        return Err(e);
+                    }
+                };
+                if flipped == 0 {
+                    // 已准备 ≥quorum 但翻转全失败（病态 IO）：仍属未提交，回滚
+                    self.rollback_versions(bucket, key, &uuid).await;
+                    self.clear_meta_new(bucket, key).await; // R7：清各盘遗留的 .new 暂存 meta
+                    let _ = tokio::fs::remove_dir_all(&tmp).await;
+                    let _ = tokio::fs::remove_dir(&obj_dir).await;
+                    self.bump_quorum_unmet_write();
+                    return Err(Error::QuorumUnmet("meta 翻转全失败，未提交".into()));
+                }
+                if flipped < quorum {
+                    tracing::warn!(
+                        flipped,
+                        quorum,
+                        "meta 翻转不足 quorum（已提交，M4 heal 补副本）"
+                    );
+                }
+                let _ = tokio::fs::remove_dir_all(&tmp).await; // tmp 仅用于流式收全与哈希
+                if !versioned {
+                    // 版本控制桶：旧版本目录**保留**（链上仍有引用）；非版本桶进回收站
+                    self.recycle_old(bucket, key, old_meta.as_ref()).await;
+                }
+            } else {
+                // 同盘 rename：数据就位（此时对读路径仍不可见）；目录 fsync 是 rename 的持久化屏障。
+                // 对象目录在桶窗口已建，但「窗口 → 取到对象锁」之间可能被删（delete 抢先），
+                // 此处幂等重建（delete 走对象锁，此后不会再拆）
+                tokio::fs::create_dir_all(&obj_dir).await?;
+                tokio::fs::rename(&tmp, obj_dir.join(&uuid)).await?;
+                if self.cfg.fsync {
+                    Store::sync_dir(&obj_dir).await;
+                }
+
+                // 提交点：写 xl.meta.new 再原子覆盖
+                self.write_meta(bucket, key, &meta, old_meta.as_ref())
+                    .await?;
+
+                // 老版本进回收站（版本控制桶跳过：旧版本目录仍被链引用）
+                if !versioned {
+                    self.recycle_old(bucket, key, old_meta.as_ref()).await;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = committed {
+            if let Some(t) = &ticket {
+                self.abort_gate(t).await;
+            }
+            return Err(e);
         }
 
         Ok(ObjectInfo {
@@ -834,11 +1071,70 @@ impl Store {
             }),
             encryption: enc_record,
             lock: lock_record,
-            replication_status: None,
+            replication_status: ticket.as_ref().map(|_| "COMPLETED".to_string()),
+            remote_version_id,
             tags: tags.unwrap_or_default(),
             storage_class,
             tier_phase: None,
             restore_expires_at: None,
         })
+    }
+
+    /// 放弃本轮 staging（未提交、无 meta 引用）：多盘回滚槽位 + 删 tmp 与空对象目录。
+    async fn discard_staged(
+        &self,
+        bucket: &str,
+        key: &str,
+        uuid: &str,
+        tmp: &std::path::Path,
+        obj_dir: &std::path::Path,
+        multi: bool,
+    ) {
+        if multi {
+            self.rollback_versions(bucket, key, uuid).await;
+        }
+        let _ = tokio::fs::remove_dir_all(tmp).await;
+        let _ = tokio::fs::remove_dir(obj_dir).await; // 仅当空（窗口新建的）才删得掉
+    }
+
+    /// gate 入口（S2 MPU complete 复用）：staging 后、Version 前调用。
+    pub(in crate::store) async fn gate_commit(
+        &self,
+        req: crate::gate::GateRequest<'_>,
+    ) -> Result<crate::gate::GateTicket> {
+        let gate = self
+            .cfg
+            .gate
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("sync gate 未配置".into()))?;
+        gate.before_commit(req).await.map_err(Error::from)
+    }
+
+    /// 本地提交失败后的远端补偿（best-effort：结果不改变客户端错误）。
+    async fn abort_gate(&self, ticket: &crate::gate::GateTicket) {
+        if let Some(gate) = &self.cfg.gate {
+            gate.abort(ticket).await;
+        }
+    }
+}
+
+/// sync 明文 tee 的清理守卫：成功、失败、取消（future drop）都删文件。
+struct TeeGuard(Option<std::path::PathBuf>);
+
+impl TeeGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for TeeGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

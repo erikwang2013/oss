@@ -276,6 +276,13 @@ impl AppState {
         // M9：无条件模式守卫（connect_* 已执行一次；这里按计划顺序在 site 配置后复验）。
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
         let mut store_cfg = StoreConfig::new(&drives[0]);
+        // M9 S1：sync 写提交门（必须在 Store::open 前注入——open 克隆配置）。
+        store_cfg.gate = Some(Arc::new(crate::sync::SiteSyncGate::new(
+            Arc::clone(&db),
+            std::time::Duration::from_millis(cfg.sync.timeout_ms),
+            cfg.sync.max_object_bytes,
+        )));
+        store_cfg.sync_max_bytes = cfg.sync.max_object_bytes;
         store_cfg.drives = drives;
         store_cfg.ec = xl_store::store::ec::EcConfig {
             data: cfg.ec.data,

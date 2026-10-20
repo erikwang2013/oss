@@ -77,6 +77,9 @@ pub struct Version {
     /// decode 白名单校验（信任边界）；老解码器跳过未知字段 = 前向兼容。
     #[serde(default)]
     pub replication_status: Option<String>,
+    /// M9 S1：sync 桶远端版本 id（双站同 id；None = 非 sync 写/旧 meta）。删除按同 id 定点。
+    #[serde(default)]
+    pub remote_version_id: Option<String>,
     /// M8 前置：对象标签（键值对，按客户端顺序；None/空 = 无标签）。
     /// 只加 Option 字段 = 前向兼容契约；decode 校验长度/字符集/重复键（信任边界）。
     #[serde(default)]
@@ -351,6 +354,15 @@ impl XlMeta {
             {
                 return Err(Error::CorruptMeta(format!("非法复制状态：{rs:?}")));
             }
+            // M9：远端版本 id 会进删除请求的 query——空/超长/控制字符一律拒（信任边界）。
+            if let Some(rv) = &v.remote_version_id
+                && (rv.is_empty() || rv.len() > 64 || rv.chars().any(char::is_control))
+            {
+                return Err(Error::CorruptMeta(format!(
+                    "remote_version_id 非法：len={}",
+                    rv.len()
+                )));
+            }
             // M8 前置：标签集合（信任边界——长度/字符集/重复键在解码时收口）
             if let Some(tags) = &v.tags
                 && let Err(e) = validate_tags(tags)
@@ -576,6 +588,7 @@ mod tests {
                 encryption: None,
                 lock: None,
                 replication_status: None,
+                remote_version_id: None,
                 tags: None,
                 storage_class: None,
                 tier: None,
@@ -780,13 +793,14 @@ mod tests {
         // **第七次**：M5 切片 4 增 lock 字段——无锁对象写 nil，老解码器跳过；
         // **第八次**：M6 切片 3 增 replication_status 字段——非复制对象写 nil，老解码器跳过；
         // **第九次**：M8 前置增 tags 字段——无标签对象写 nil，老解码器跳过；
-        // **第十次**：M8 S4a 增 storage_class/tier 字段——普通对象写 nil，老解码器跳过）。
+        // **第十次**：M8 S4a 增 storage_class/tier 字段——普通对象写 nil，老解码器跳过；
+        // **第十一次**：M9 S1 增 remote_version_id 字段——非 sync 写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "5e3b717907a9b86c81ca9206286649d970909f5bd3cfac3be8aa88b30b05679b"
+            "9ad1fe87188185c1b395f80291f899af60c4603a2747bef61655940f83b0f8e5"
         );
     }
 }
@@ -819,6 +833,7 @@ mod parts_tests {
             encryption: None,
             lock: None,
             replication_status: None,
+            remote_version_id: None,
             tags: None,
             storage_class: None,
             tier: None,

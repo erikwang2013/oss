@@ -57,6 +57,12 @@ pub struct StoreConfig {
     pub cluster_lock_backoff_ms: (u64, u64),
     /// M3 控制面读扇出的服务端执行器（Task 9；oss-server 注入 sqlx 实现）。
     pub control: Option<Arc<dyn crate::mesh::ControlBackend>>,
+    /// M9：sync 桶写提交门。None = 无 sync 能力（M7/async 路径逐字节不变）。
+    pub gate: Option<Arc<dyn crate::gate::PutCommitGate>>,
+    /// M9：sync 桶单对象上限（`[sync].max_object_bytes`）。
+    pub sync_max_bytes: u64,
+    /// M9：sync tee 明文暂存目录（None = `<root>/.oss.sys/tee`）。
+    pub tee_dir: Option<PathBuf>,
 }
 
 impl StoreConfig {
@@ -71,6 +77,9 @@ impl StoreConfig {
             cluster_lock_retries: 10,
             cluster_lock_backoff_ms: (50, 200),
             control: None,
+            gate: None,
+            sync_max_bytes: 64 * 1024 * 1024,
+            tee_dir: None,
         }
     }
 
@@ -109,6 +118,8 @@ pub struct ObjectInfo {
     pub lock: Option<ObjectLockRecord>,
     /// M6 切片 3：复制状态（PENDING/COMPLETED/FAILED/REPLICA；None = 非复制对象）
     pub replication_status: Option<String>,
+    /// M9：sync 桶远端版本 id（双站同 id；None = 非 sync 对象）。
+    pub remote_version_id: Option<String>,
     /// M8 前置：对象标签（空 = 无标签；顺序同写入端）。
     pub tags: Vec<meta::ObjectTag>,
     /// M8 S4a：存储类（None = STANDARD）。
@@ -117,6 +128,15 @@ pub struct ObjectInfo {
     pub tier_phase: Option<meta::TierPhase>,
     /// M8 S4a：Restore 到期时刻（unix 秒；None = 未恢复/永久）。
     pub restore_expires_at: Option<i64>,
+}
+
+/// M9：写入口可选扩展（既有 11 参签名保持为兼容壳，~50 处调用点不动）。
+#[derive(Debug, Clone, Default)]
+pub struct PutExt {
+    /// 接收端 sync 摄入（token 校验后的 REPLICA）：对端已确认，不再调用 gate。
+    pub replica: bool,
+    /// 双站同 id 摄入：origin UUID 字符串（S3 头原样；store 校验并强制为版本目录/version_id）。
+    pub forced_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -405,6 +425,29 @@ impl Store {
     /// 集群面访问（None = 单节点，v1.4.0 行为）。oss-server 用它取拓扑与传输。
     pub fn cluster(&self) -> Option<&drives::ClusterConfig> {
         self.cfg.cluster.as_deref()
+    }
+
+    /// M9：桶是否 sync 模式（无门 = false）。失败 fail-closed（写入口据此拒写）。
+    pub async fn sync_mode(&self, bucket: &str) -> Result<bool> {
+        let Some(gate) = &self.cfg.gate else {
+            return Ok(false);
+        };
+        gate.is_sync(bucket).await.map_err(Error::from)
+    }
+
+    /// M9：桶复制模式变更后失效门缓存（建桶/删桶/apply）。
+    pub fn invalidate_gate(&self, bucket: &str) {
+        if let Some(gate) = &self.cfg.gate {
+            gate.invalidate(bucket);
+        }
+    }
+
+    /// tee 明文暂存目录（延迟创建；在版本目录之外——失败/取消只删文件，不牵扯 staging）。
+    pub(in crate::store) fn tee_dir(&self) -> PathBuf {
+        self.cfg
+            .tee_dir
+            .clone()
+            .unwrap_or_else(|| layout::sys_dir(self.cfg.root(), "tee"))
     }
 
     /// quorum 未达计数快照（写/锁分列；`/health/cluster` 的最小信号）。
@@ -1384,6 +1427,8 @@ mod tests_crypto;
 mod tests_lock;
 #[cfg(test)]
 mod tests_replication;
+#[cfg(test)]
+mod tests_sync;
 #[cfg(test)]
 mod tests_tags;
 #[cfg(test)]

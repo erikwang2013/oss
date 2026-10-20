@@ -50,6 +50,8 @@ pub struct OssS3 {
     inventory: Option<Arc<dyn crate::inventory::InventoryStore>>,
     /// M9：sync 桶能力开关（oss-server 注入 `SYNC_READY`；false 时创建 sync 桶 400）。
     sync_ready: bool,
+    /// M9：本机站点 token（sync 摄入的 `x-oss-site-token` 校验；None = 拒收）。
+    site_token: Option<String>,
 }
 
 impl OssS3 {
@@ -102,12 +104,19 @@ impl OssS3 {
             restore: None,
             inventory: None,
             sync_ready: false,
+            site_token: None,
         }
     }
 
     /// M9：sync 桶能力（由 oss-server 按 `SYNC_READY` 注入）。
     pub fn with_sync_ready(mut self, ready: bool) -> Self {
         self.sync_ready = ready;
+        self
+    }
+
+    /// M9：本机站点 token（`[site].token`；sync 摄入校验用）。
+    pub fn with_site_token(mut self, token: Option<String>) -> Self {
+        self.site_token = token;
         self
     }
 
@@ -813,6 +822,8 @@ impl S3 for OssS3 {
             // M5 切片 0（P4-1）：行变更广播（best-effort；关「别节点陈旧行」窗口）
             self.store.broadcast_bucket_row(&bucket, Some(set)).await;
         }
+        // M9：门模式缓存失效必须在行写入之后（新建 sync 桶后首次写即生效）。
+        self.store.invalidate_gate(&bucket);
         // M5 切片 4（L2）：建桶即开锁（AWS：x-amz-bucket-object-lock-enabled 顺带开版本控制）。
         // 必须在全列归属写之后：开锁只改 versioning/object_lock，归属写不会把它重置。
         if req.input.object_lock_enabled_for_bucket == Some(true) {
@@ -880,6 +891,7 @@ impl S3 for OssS3 {
                 match self.acl.bucket_lock(&bucket).await {
                     // 远端 delete 已胜出（无行）：本地删除同样已生效，按幂等成功返回。
                     Ok(None) => {
+                        self.store.invalidate_gate(&bucket);
                         self.cleanup_m8(&bucket).await;
                         return Ok(S3Response::new(DeleteBucketOutput::default()));
                     }
@@ -915,6 +927,8 @@ impl S3 for OssS3 {
         }
         // M5 切片 0（P4-1）：删行广播（best-effort）
         self.store.broadcast_bucket_row(&bucket, None).await;
+        // M9：删桶后门模式缓存失效（10s 内不再把写当 sync 拦截）
+        self.store.invalidate_gate(&bucket);
         // M8 S0：控制面状态清理 + AP 缓存失效（best-effort）
         self.cleanup_m8(&bucket).await;
         Ok(S3Response::new(DeleteBucketOutput::default()))
@@ -992,6 +1006,35 @@ impl S3 for OssS3 {
             .get("x-amz-replication-status")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"));
+        // M9：sync 桶的 REPLICA 摄入必须带匹配 site token + origin id；采用 origin UUID
+        // 作本地版本 id（双站同 id），且不再 gate/再复制（防环）。
+        let mut forced_version_id = None;
+        if replica
+            && self
+                .store
+                .sync_mode(&req.input.bucket)
+                .await
+                .map_err(to_s3_error)?
+        {
+            let presented = req
+                .headers
+                .get("x-oss-site-token")
+                .and_then(|v| v.to_str().ok());
+            let ok = match (self.site_token.as_deref(), presented) {
+                (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
+                _ => false,
+            };
+            if !ok {
+                return Err(s3s::s3_error!(AccessDenied, "site token required"));
+            }
+            forced_version_id = Some(
+                req.headers
+                    .get("x-oss-origin-version-id")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| s3s::s3_error!(InvalidRequest, "origin version id required"))?
+                    .to_string(),
+            );
+        }
         // M8 S4a：存储类（REPLICA 摄入不携带；归档类直写拒）
         let storage_class = if replica {
             None
@@ -1053,7 +1096,7 @@ impl S3 for OssS3 {
         let versioned = self.versioned(&bucket).await?;
         let result = self
             .store
-            .put_object_stream_with_meta(
+            .put_object_stream_with_meta_ext(
                 &bucket,
                 &key,
                 stream,
@@ -1065,6 +1108,10 @@ impl S3 for OssS3 {
                 lock,     // M5 切片 4（L3）
                 tags,     // M8 前置：写入版本标签
                 storage_class,
+                xl_store::store::PutExt {
+                    replica,
+                    forced_version_id,
+                },
             )
             .await;
         let info = match result {
@@ -3435,4 +3482,13 @@ fn repl_rule_to_dto(r: &crate::replication::ReplRule) -> ReplicationRule {
         source_selection_criteria: None,
         status: ReplicationRuleStatus::from_static(if r.enabled { "Enabled" } else { "Disabled" }),
     }
+}
+
+/// 常数时间比较（sync 站点 token；长度不等短路径返回 false 不泄漏内容）。
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }

@@ -109,6 +109,16 @@ impl ReplicationSink for SqlReplSink {
         if info.is_replica {
             return;
         }
+        // M9：sync 桶无异步 outbox（remote-first 已在写路径确认；失败即 503，不降级）。
+        // 模式未知时同样不入队（fail-closed：宁可少一条异步复制，不可给 sync 桶造假队列）。
+        match self.store.sync_mode(info.bucket).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, bucket = info.bucket, "读复制模式失败——跳过异步入队");
+                return;
+            }
+        }
         // 无版本号的删除（硬删）：只走站点路径（M6 规则侧需要版本读，无法处理）。
         let is_hard_delete = !info.is_delete_marker && info.version_id.is_none();
         if !info.is_delete_marker && !is_hard_delete {
@@ -465,8 +475,11 @@ async fn send_row(
                 info.content_type.as_deref(),
                 &info.user_metadata,
                 true,
+                None, // M9：异步站点复制不再带 sync token
+                None,
             )
-            .await;
+            .await
+            .map(|_| ());
         match (res, cache_key) {
             (Err(e), Some(key)) => Err(site_404_retry(e, key, "PUT")),
             (r, _) => r,
