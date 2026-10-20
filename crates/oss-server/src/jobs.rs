@@ -119,7 +119,7 @@ pub async fn worker_once(
         .await
         .map_err(|e| e.to_string())?;
     // 领取时动作未知 → DB 截止时间取两类超时的较大值（硬上限）；
-    // 实际执行超时在下面按动作类型收紧。
+    // 领取后立即按动作类型收紧，让非 tier 任务超时后 900s（而非 3600s）即可回收。
     let deadline_secs = env.timeout_secs.max(env.tier_timeout_secs);
     let Some(task) = db
         .claim_task(now, deadline_secs)
@@ -133,6 +133,14 @@ pub async fn worker_once(
     } else {
         env.timeout_secs
     };
+    // 收紧失败不致命：claim 已写下硬上限 deadline，任务仍会被过期回收。
+    if let Err(e) = db
+        .set_task_deadline(task.job_id, task.task_no, now + timeout)
+        .await
+    {
+        tracing::warn!(job_id = task.job_id, task_no = task.task_no, error = %e,
+            "job：收紧任务 deadline 失败（沿用 claim 硬上限）");
+    }
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(timeout.max(1) as u64),
         exec.execute(&task.action, &task.payload_json),
@@ -147,17 +155,42 @@ pub async fn worker_once(
             Some(format!("task exceeded {timeout}s")),
         ),
     };
-    db.finish_task(
-        task.job_id,
-        task.task_no,
-        ok,
-        &code,
-        msg.as_deref(),
-        crate::db::now(),
-        env.max_attempts,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    // 多 worker 共享 WAL 时 finish 偶发 SQLITE_BUSY：重试短退避。全部失败则上报错误，
+    // 任务留 running 由过期回收兜底——绝不在 finish 未落库时继续领下一条。
+    let mut finish_err = None;
+    for attempt in 0..5 {
+        match db
+            .finish_task(
+                task.job_id,
+                task.task_no,
+                ok,
+                &code,
+                msg.as_deref(),
+                crate::db::now(),
+                env.max_attempts,
+            )
+            .await
+        {
+            Ok(_) => {
+                finish_err = None;
+                break;
+            }
+            Err(e) => {
+                finish_err = Some(e);
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+    if let Some(e) = finish_err {
+        tracing::error!(job_id = task.job_id, task_no = task.task_no, error = %e,
+            "job：finish_task 重试 5 次仍失败，任务保持 running（等待超时回收）");
+        return Err(format!(
+            "finish_task 未落库（job {} task {}）: {e}",
+            task.job_id, task.task_no
+        ));
+    }
     maybe_write_report(db, store, task.job_id).await?;
     Ok(true)
 }

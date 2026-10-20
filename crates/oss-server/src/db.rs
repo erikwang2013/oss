@@ -230,9 +230,11 @@ impl Db {
     pub async fn connect(url: &str) -> Result<Self> {
         // WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
         // `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
+        // busy_timeout：多 job worker 并发写同库时用等待代替立即 SQLITE_BUSY（默认 5s 偏短）。
         let opts = url
             .parse::<SqliteConnectOptions>()?
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
         let pool = SqlitePool::connect_with(opts).await?;
         // sqlx::raw_sql 支持一个字符串里的多条语句，schema 文件原样执行
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
@@ -2899,6 +2901,26 @@ impl Db {
             tracing::warn!(error = %e, "job claim {tail} 失败");
         }
         out
+    }
+
+    /// 领取后按动作类型收紧截止时间（claim 时动作未知，只能先写两类超时的较大值）。
+    /// 只改 running 行：终态/已重排任务的 deadline 不被拉回。
+    pub async fn set_task_deadline(
+        &self,
+        job_id: i64,
+        task_no: i64,
+        deadline_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE job_tasks SET deadline_at = ? \
+             WHERE job_id = ? AND task_no = ? AND state = 'running'",
+        )
+        .bind(deadline_at)
+        .bind(job_id)
+        .bind(task_no)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 任务终态/重试。成功 → done；失败未达上限 → queued（指数退避）；达上限 → failed。

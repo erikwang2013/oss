@@ -158,3 +158,73 @@ async fn worker_timeout_is_failure() {
     assert_eq!(tasks[0]["state"], "failed");
     assert_eq!(tasks[0]["result_code"], "PermanentFailure");
 }
+
+/// 领取后收紧 deadline；只改 running 行（终态任务不被拉回）。
+#[tokio::test]
+async fn set_task_deadline_updates_running_row_only() {
+    let (db, _store, _d1, _d2) = setup().await;
+    let id = db
+        .create_job(&spec(vec!["Copy"], false), 1000)
+        .await
+        .unwrap();
+    let task = db.claim_task(1000, 3600).await.unwrap().unwrap();
+    assert_eq!((task.job_id, task.task_no), (id, 1));
+    db.set_task_deadline(id, 1, 1900).await.unwrap();
+    let deadline: i64 =
+        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(deadline, 1900);
+
+    db.finish_task(id, 1, true, "OK", None, 1001, 3)
+        .await
+        .unwrap();
+    db.set_task_deadline(id, 1, 9999).await.unwrap();
+    let deadline: i64 =
+        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(deadline, 1900, "终态任务不应再改 deadline");
+}
+
+/// worker 领到任务后按动作类型收紧 claim 写下的硬上限 deadline。
+#[tokio::test]
+async fn worker_tightens_deadline_by_action() {
+    let (db, store, _d1, _d2) = setup().await;
+    let e = JobEnv {
+        workers: 1,
+        interval_secs: 1,
+        max_attempts: 3,
+        timeout_secs: 30,
+        tier_timeout_secs: 3600,
+    };
+    let id = db
+        .create_job(&spec(vec!["Copy"], false), 1000)
+        .await
+        .unwrap();
+    assert!(worker_once(&db, &store, &OkExec, e, 1000).await.unwrap());
+    let deadline: i64 =
+        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(deadline, 1030, "非 tier 动作按 timeout_secs 收紧");
+
+    let id = db
+        .create_job(&spec(vec!["Transition"], false), 2000)
+        .await
+        .unwrap();
+    assert!(worker_once(&db, &store, &OkExec, e, 2000).await.unwrap());
+    let deadline: i64 =
+        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(deadline, 5600, "tier 动作按 tier_timeout_secs");
+}
