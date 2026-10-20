@@ -14,6 +14,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${OSS_BIN:-$PWD/target/debug/oss-server}"
 [ -x "$BIN" ] || { echo "缺少 oss-server 二进制（先 cargo build -p oss-server，或设 OSS_BIN）"; exit 2; }
+BIN=$(realpath "$BIN")   # 子 shell 会 cd 到临时目录，相对 OSS_BIN 必须先绝对化
 command -v aws >/dev/null || { echo "需要 aws-cli"; exit 2; }
 command -v python3 >/dev/null || { echo "需要 python3"; exit 2; }
 command -v curl >/dev/null || { echo "需要 curl"; exit 2; }
@@ -182,8 +183,8 @@ put_code() { curl -s -o /dev/null -w '%{http_code}' -X PUT "$1" -H "authorizatio
 status_json() {
   local c p
   for p in /api/v1/raft/status /api/v1/site/raft/status; do
-    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1$p")
-    [ "$c" = 200 ] && { curl -s --max-time 5 "$1$p"; return 0; }
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "x-oss-raft-token: $CLUSTER_TOKEN" "$1$p")
+    [ "$c" = 200 ] && { curl -s --max-time 5 -H "x-oss-raft-token: $CLUSTER_TOKEN" "$1$p"; return 0; }
   done
   return 1
 }
@@ -272,16 +273,23 @@ a_get_eq() { aws_a s3 cp "s3://$1/$2" "$W/$3" >/dev/null 2>&1 && cmp -s "$W/$4" 
 echo "== 1. 启动 A/B（[site]+[raft]，模式 $MODE）→ health → /api/v1/raft/status =="
 mk_cfg a "$A_HTTP" "$REG_A" "$TOK_A" 1 true
 mk_cfg b "$B_HTTP" "$REG_B" "$TOK_B" 2 false
-if ! start_a || ! start_b; then
+start_a; A_START=$?
+start_b; B_START=$?
+if [ "$A_START" -ne 0 ] || [ "$B_START" -ne 0 ]; then
   echo "--- A 日志尾 ---"; tail -8 "$W/a/server.log" 2>/dev/null
   echo "--- B 日志尾 ---"; tail -8 "$W/b/server.log" 2>/dev/null
-  skip "该构建不能以 M9 [site]+[raft] 配置启动（Raft 运行时未实现/配置被拒）；e2e 未执行"
+  if [ "$A_START" -ne 0 ] && [ "$B_START" -ne 0 ] && grep -Eqi 'unknown field|unknown variant|missing field|invalid type|invalid value|配置|TOML' "$W/a/server.log" "$W/b/server.log" 2>/dev/null; then
+    skip "构建拒绝 M9 [site]+[raft] 配置（未知字段/校验错误）；e2e 未执行"
+  else
+    fail "启动失败（A=$A_START B=$B_START）：非配置拒绝，按回归处理"
+  fi
   finish
 fi
 ck [ "$(health_code "$A_HTTP")" = 200 ]
 ck [ "$(health_code "$B_HTTP")" = 200 ]
-if ! status_json "$A" > "$W/status.json"; then
-  skip "步骤 1：/api/v1/raft/status 不可用（S0 前构建）"
+if ! retry 30 status_json "$A" > "$W/status.json"; then
+  fail "A/B 健康但 /api/v1/raft/status 不可用（能力路由缺失）"
+  finish
 else
   pass "/api/v1/raft/status 可读"
   CAP_RAFT=$(cap raft); CAP_SYNC=$(cap sync); CAP_STRETCH=$(cap stretch)
@@ -434,10 +442,14 @@ else
   ck retry 90 b_get_eq "$SBK" a.bin sa.back sa.bin
   ck aws_b s3 cp "$W/sb.bin" "s3://$SBK/b.bin"
   ck retry 90 a_get_eq "$SBK" b.bin sb.back sb.bin
+  ck [ "$(aws_a s3api list-object-versions --bucket "$SBK" --prefix a.bin --query 'length(Versions)' --output text)" = 1 ]
+  ck [ "$(aws_b s3api list-object-versions --bucket "$SBK" --prefix a.bin --query 'length(Versions)' --output text)" = 1 ]
+  ck [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$A/api/v1/raft/status")" = 200 ]   # B1：经 A advertise（主 HTTP）可达 status
   SA=$(shards_at "$W/a" "$SBK" a.bin); SB_=$(shards_at "$W/b" "$SBK" a.bin)
   ck [ "$SA" = 6 ]; ck [ "$SB_" = 6 ]; ck [ $((SA + SB_)) = 12 ]
   MA=$(meta_at "$W/a" "$SBK" a.bin); MB=$(meta_at "$W/b" "$SBK" a.bin)
   ck [ $((MA + MB)) = 12 ]   # meta 每盘镜像：两站点各 6 份
+  ck [ "$(outbox_site_count "$SBK")" = 0 ]   # stretch 关闭 M7 站点异步复制
   kill9 "$B_PID"; B_PID=""
   if aws_a s3 cp "s3://$SBK/a.bin" "$W/sa.down" >/dev/null 2>&1; then fail "停 B 后 GET 应非 2xx"
   else pass "停 B 后 GET 非 2xx（6 片 < data=8）"; fi
@@ -450,34 +462,35 @@ fi
 if [ "$CAP_RAFT" != true ]; then
   skip "步骤 5：3-voter 故障/恢复——capabilities.raft=false"
 else
-  echo "== 5. 3-voter：kill B → A+C 可写；kill C → 503；重启 C 追平 =="
-  kill9 "$B_PID"; B_PID=""
+  echo "== 5. 3-voter：kill C → A+B 可写 → C 追平；kill B → A+C 可写；kill C → 503 =="
   UQ="m9q$STAMP"; UQ2="m9c$STAMP"; BAD="m9no$STAMP"
+  kill9 "$C_PID"; C_PID=""
   ok=""
   for _ in $(seq 1 60); do
     code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ\",\"password\":\"m9pass-123\"}")
     case "$code" in 2??) ok=1; break ;; esac; sleep 1
   done
-  ck [ "$ok" = 1 ]   # 停 1 数据站点：A+C quorum 2 仍可写
+  ck [ "$ok" = 1 ]   # C 宕：A+B quorum 2 仍可写
+  if start_c; then
+    ck retry 90 db_has_user "$W/c/control.db" "$UQ"   # C 重启追平 C 宕期间提交的 UQ
+  else
+    fail "C 重启未就绪"; tail -8 "$W/c/server.log"; finish
+  fi
+  kill9 "$B_PID"; B_PID=""
+  ok=""
+  for _ in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ2\",\"password\":\"m9pass-123\"}")
+    case "$code" in 2??) ok=1; break ;; esac; sleep 1
+  done
+  ck [ "$ok" = 1 ]   # B 宕：A+C quorum 2 仍可写
+  ck retry 60 db_has_user "$W/c/control.db" "$UQ2"
   kill9 "$C_PID"; C_PID=""
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$BAD\",\"password\":\"m9pass-123\"}")
   ck [ "$code" = 503 ]   # 仅剩 A：无 quorum
-  if start_c; then
-    ck retry 90 db_has_user "$W/c/control.db" "$UQ"   # C 重启后应用/追平已提交的 UQ
-    ok=""
-    for _ in $(seq 1 60); do
-      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ2\",\"password\":\"m9pass-123\"}")
-      case "$code" in 2??) ok=1; break ;; esac; sleep 1
-    done
-    ck [ "$ok" = 1 ]
-    ck retry 60 db_has_user "$W/c/control.db" "$UQ2"
-    if db_has_user "$W/a/oss.db" "$BAD" || db_has_user "$W/c/control.db" "$BAD"; then
-      fail "无 quorum 的写被提交（分叉）"
-    else
-      pass "无 quorum 的写未提交"
-    fi
+  if db_has_user "$W/a/oss.db" "$BAD" || db_has_user "$W/c/control.db" "$BAD"; then
+    fail "无 quorum 的写被提交（分叉）"
   else
-    fail "C 重启未就绪"; tail -8 "$W/c/server.log"
+    pass "无 quorum 的写未提交"
   fi
 fi
 

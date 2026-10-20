@@ -1020,16 +1020,18 @@ cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空�
 M9 强一致端到端（自动起 A/B 数据站点 + witness C，端口/目录全自动，退出清理）：
 
 ```bash
-cargo build -p oss-server && tests/e2e_m9.sh              # 默认 sync 模式（约 3–6 分钟）
-M9_STRETCH=1 tests/e2e_m9.sh                              # Stretch EC 2×6 模式（约 3–6 分钟）
+cargo build -p oss-server && tests/e2e_m9.sh              # 默认 sync 模式（估算 3–6 分钟）
+M9_STRETCH=1 tests/e2e_m9.sh                              # Stretch EC 2×6 模式（估算 3–6 分钟）
 # OSS_BIN=target/debug/oss-server 可指定二进制；M9_STRICT=1 把 SKIP 升级为 FAIL（功能齐备后 CI 用）。
 ```
 
-功能门控：脚本读 `GET /api/v1/raft/status` 的 `capabilities.{raft,sync,stretch}` 决定跑哪些段。
-未接线的构建会以 `SKIP: 原因` 显式跳过对应段并退出 0（不是静默省段）；Raft 存量构建的
-`enabled=false` 同样按能力处理。sync 桶与 stretch 按计划 v3 **互斥**（同一集群不可同时启用），
-默认跑步骤 1/2/3/5，`M9_STRETCH=1` 跑 1/2/4/5（步骤 3 显式 SKIP）。sync/stretch 的能力为
-false 时，对应步骤只跳过而不伪造通过；功能齐备后的验收请加 `M9_STRICT=1` 以捕获回归。
+功能门控：脚本读 `GET /api/v1/raft/status` 的 `capabilities.{raft,sync,stretch}` 决定跑哪些段；
+未接线（capabilities=false）以 `SKIP: 原因` 显式跳过并退出 0（不是静默省段）。判定只看
+capabilities：`capabilities.raft=true` 时 `enabled` 必须为 true，否则 FAIL。启动阶段只有 A/B 都以
+未知字段/配置校验错误退出才默认 SKIP（旧配置严格拒绝的构建）；运行期启动失败一律 FAIL。sync 桶与
+stretch 按计划 v3 **互斥**（同一集群不可同时启用），默认跑步骤 1/2/3/5，`M9_STRETCH=1`
+跑 1/2/4/5（步骤 3 显式 SKIP）；计划中的独立 `tests/e2e_stretch.sh` 由该模式合并覆盖
+（复用同一 C witness）。功能齐备后的验收请加 `M9_STRICT=1`，跳过即失败。
 
 ## 参考文档
 
