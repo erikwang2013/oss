@@ -828,6 +828,10 @@ async fn stretch_startup_check(db: &Db, drives: &[PathBuf]) -> Result<bool, Stri
         ));
     }
     for d in drives {
+        // 全新部署的 data_dirs 可能尚未创建；不存在等价于空盘，交由 Store::open 创建。
+        if !d.exists() {
+            continue;
+        }
         for ent in std::fs::read_dir(d)
             .map_err(|e| format!("stretch 启动检查目录 {} 失败: {e}", d.display()))?
             .flatten()
@@ -961,6 +965,14 @@ mod stretch_startup_tests {
         // 非首次启动不再要求空库/空盘（历史数据正常服务）
         db.insert_bucket("old-b", None).await.unwrap();
         assert!(!stretch_startup_check(&db, &ds).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fresh_store_with_missing_dirs_ok() {
+        let db = empty_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = vec![tmp.path().join("not-created-yet")];
+        assert!(stretch_startup_check(&db, &missing).await.unwrap());
     }
 
     #[tokio::test]
