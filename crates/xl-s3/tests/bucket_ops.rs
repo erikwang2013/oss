@@ -9,6 +9,10 @@ use xl_store::store::{Store, StoreConfig};
 /// 最小判权库（这些用例直调 service 方法、不走 s3s 授权链；Acl 只被
 /// create/delete_bucket 的记账路径用到）。
 async fn acl() -> xl_s3::access::Acl {
+    xl_s3::access::Acl::new(acl_pool().await)
+}
+
+async fn acl_pool() -> sqlx::SqlitePool {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql(
         "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT, replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
@@ -19,7 +23,7 @@ async fn acl() -> xl_s3::access::Acl {
     .execute(&pool)
     .await
     .unwrap();
-    xl_s3::access::Acl::new(pool)
+    pool
 }
 
 async fn service() -> (OssS3, tempfile::TempDir) {
@@ -501,5 +505,36 @@ async fn create_bucket_guard_abort_rolls_back_and_500() {
         .await
         .is_err(),
         "行写失败后物理桶必须回滚"
+    );
+}
+
+/// I2：陈旧行（sync）上重建请求 async → 409（OperationAborted），且不建物理桶。
+#[tokio::test]
+async fn create_bucket_recreate_mode_change_409() {
+    let pool = acl_pool().await;
+    sqlx::query(
+        "INSERT INTO buckets (name, owner_id, creation_date, replication_mode) \
+         VALUES ('stale', NULL, 0, 'sync')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s3, _d) = service_with_acl(xl_s3::access::Acl::new(pool)).await;
+    let err = s3
+        .create_bucket(with_user(CreateBucketInput {
+            bucket: "stale".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+    assert!(
+        s3.head_bucket(req(HeadBucketInput {
+            bucket: "stale".into(),
+            ..Default::default()
+        }))
+        .await
+        .is_err(),
+        "冲突拒绝时不得建物理桶"
     );
 }

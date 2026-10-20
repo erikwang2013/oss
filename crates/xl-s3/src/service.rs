@@ -765,6 +765,20 @@ impl S3 for OssS3 {
                 }
             },
         };
+        // M9：陈旧行重建不得静默改模式（与 console 同口径，先于物理建桶）。
+        match self.acl.bucket_replication_mode_row(&bucket).await {
+            Ok(Some(existing)) if existing != replication_mode => {
+                return Err(s3s::s3_error!(
+                    OperationAborted,
+                    "bucket replication mode cannot be changed on recreate"
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, bucket, "读桶复制模式失败");
+                return Err(s3s::s3_error!(InternalError, "internal error"));
+            }
+        }
         self.store
             .create_bucket(&bucket)
             .await

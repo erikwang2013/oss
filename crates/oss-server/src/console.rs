@@ -2598,7 +2598,7 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
         "advertise_endpoint": state.cfg.raft.as_ref().map(|r| r.advertise_endpoint.clone()),
         "capabilities": {
             "raft": crate::raft::RAFT_READY && state.cfg.raft.is_some(),
-            "sync": crate::raft::SYNC_READY,
+            "sync": crate::raft::SYNC_READY && state.cfg.raft.is_some(),
             "stretch": crate::raft::STRETCH_READY && state.cfg.stretch.is_some(),
         },
     });
@@ -2608,7 +2608,8 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
             "node_id": s.node_id,
             "self_addr": s.self_addr,
             "peer_node_id": s.peer_node_id,
-            "peer_drives": s.peer_drives,
+            // 本端实盘数；对端声明值不可信（B2）。
+            "drive_count": state.cfg.data_dirs.as_ref().map_or(1, |d| d.len()),
             "ec": { "data": state.cfg.ec.data, "parity": state.cfg.ec.parity },
             "placement": s.placement,
             "mesh_secret_fingerprint": hex::encode({

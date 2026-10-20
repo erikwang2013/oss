@@ -114,14 +114,23 @@ impl Acl {
             .unwrap_or_else(|| "Off".to_string()))
     }
 
-    /// M9：桶复制模式（行不存在 = "async"，与缺行旧桶同口径）。
-    pub async fn bucket_replication_mode(&self, bucket: &str) -> Result<String, sqlx::Error> {
+    /// M9：桶复制模式行；行不存在 = None（建桶前判「重建不得改模式」）。
+    pub async fn bucket_replication_mode_row(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
         let row = sqlx::query("SELECT replication_mode FROM buckets WHERE name = ?")
             .bind(bucket)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row
-            .map(|r| r.get::<String, _>("replication_mode"))
+        Ok(row.map(|r| r.get::<String, _>("replication_mode")))
+    }
+
+    /// M9：桶复制模式（行不存在 = "async"，与缺行旧桶同口径）。
+    pub async fn bucket_replication_mode(&self, bucket: &str) -> Result<String, sqlx::Error> {
+        Ok(self
+            .bucket_replication_mode_row(bucket)
+            .await?
             .unwrap_or_else(|| "async".to_string()))
     }
 

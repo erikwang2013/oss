@@ -3,7 +3,7 @@
 mod common;
 
 use common::JWT_SECRET;
-use oss_server::config::{AppConfig, GroupTarget, RaftToml, SiteToml};
+use oss_server::config::{AppConfig, EcToml, GroupTarget, RaftToml, SiteToml, StretchToml};
 use oss_server::db::Db;
 use oss_server::router::build_router;
 use oss_server::state::AppState;
@@ -55,6 +55,29 @@ cluster_token = "t"
         sync: Default::default(),
         stretch: None,
     }
+}
+
+fn stretch_cfg(dir: &std::path::Path) -> AppConfig {
+    let mut cfg = raft_cfg(dir);
+    cfg.groups = vec![];
+    cfg.ec = EcToml {
+        enabled: true,
+        data: 8,
+        parity: 4,
+        inline_threshold: 0,
+    };
+    cfg.data_dirs = Some((0..6).map(|i| dir.join(format!("d{i}"))).collect());
+    cfg.stretch = Some(StretchToml {
+        node_id: "a".into(),
+        self_addr: "a:9100".into(),
+        peer_node_id: "b".into(),
+        peer_addr: "b:9100".into(),
+        peer_drives: 6,
+        placement: "v2".into(),
+        mesh_secret: "mesh-topsecret-0123456789abcdef".into(),
+        mesh_timeout_ms: 5_000,
+    });
+    cfg
 }
 
 async fn raft_state(dir: &std::path::Path) -> AppState {
@@ -301,7 +324,11 @@ async fn m9_console_sync_create_400_and_mode_readback() {
         .json()
         .await
         .unwrap();
-    assert_eq!(buckets[0]["replication_mode"], "async");
+    let plain = buckets
+        .iter()
+        .find(|b| b["name"] == "plain")
+        .expect("列表应含 plain");
+    assert_eq!(plain["replication_mode"], "async");
 }
 
 #[tokio::test]
@@ -351,4 +378,39 @@ async fn m9_raft_mode_control_write_503_and_status_skeleton() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503, "RAFT_READY=false 控制写必须 503");
+}
+
+/// I1：stretch identity 用本端实盘 `drive_count`（不信任 peer 声明），且不泄漏 secret。
+#[tokio::test]
+async fn m9_stretch_identity_drive_count_and_no_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = stretch_cfg(dir.path());
+    std::fs::create_dir_all(&cfg.data_dir).unwrap();
+    std::fs::create_dir_all(&cfg.staging_dir).unwrap();
+    let store = Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap();
+    let db = Db::connect_raft(&cfg.database_url).await.unwrap();
+    let st = AppState::new(cfg, db, store).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st).unwrap()).await;
+    let token = login(&base).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/site"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let s = &v["stretch"];
+    assert_eq!(s["drive_count"], 6);
+    assert_eq!(s["peer_node_id"], "b");
+    assert_eq!(s["self_addr"], "a:9100");
+    assert_eq!(s["ec"]["data"], 8);
+    assert_eq!(s["ec"]["parity"], 4);
+    assert_eq!(s["placement"], "v2");
+    assert_eq!(s["mesh_secret_fingerprint"].as_str().unwrap().len(), 64);
+    assert!(s.get("peer_drives").is_none(), "不得回传对端声明盘数");
+    let body = serde_json::to_string(&v).unwrap();
+    assert!(!body.contains("topsecret"), "identity 不得回显 mesh_secret");
 }

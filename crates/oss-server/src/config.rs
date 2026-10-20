@@ -222,6 +222,17 @@ fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
     Ok(format!("{}:{port}", host.to_ascii_lowercase()))
 }
 
+/// `[listen]` 的 host:port 解析（端口 0 合法：测试/临时端口部署）。
+fn listen_host_port(raw: &str) -> Option<(String, u16)> {
+    let s = raw.trim();
+    let rest = s.strip_prefix("http://").unwrap_or(s);
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port.parse::<u16>().ok()?))
+}
+
 /// `[[tiers]]`：归档远端。模型同 `[[remotes]]`，另加目标桶。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -636,6 +647,17 @@ impl AppConfig {
         if advertise == self_addr {
             return Err(
                 "[stretch].self_addr 不能与 [raft].advertise_endpoint 同端口（主 HTTP 与 mesh gRPC 必须分离）"
+                    .into(),
+            );
+        }
+        // M8：listen 实绑定与 mesh gRPC 同端口（同 host，或 0.0.0.0/:: 通配）必然冲突。
+        if let Some((lhost, lport)) = listen_host_port(&self.listen)
+            && let Some((shost, sport)) = listen_host_port(&self_addr)
+            && lport == sport
+            && (lhost == shost || matches!(lhost.as_str(), "0.0.0.0" | "::" | "[::]"))
+        {
+            return Err(
+                "[listen] 不能与 [stretch].self_addr 同端口（主 HTTP 与 mesh gRPC 必须分离）"
                     .into(),
             );
         }
@@ -1348,6 +1370,16 @@ mesh_secret = "x"
                 .unwrap_err()
                 .contains("advertise_endpoint")
         );
+        // M8：listen 实绑定与 self_addr 同端口（同 host / 通配绑定）
+        let mut c = m9_cfg();
+        c.listen = "a:9100".into();
+        assert!(c.stretch_validate().unwrap_err().contains("listen"));
+        let mut c = m9_cfg();
+        c.listen = "0.0.0.0:9100".into();
+        assert!(c.stretch_validate().unwrap_err().contains("listen"));
+        let mut c = m9_cfg();
+        c.listen = "0.0.0.0:9000".into();
+        assert!(c.stretch_validate().is_ok());
     }
 
     #[test]
