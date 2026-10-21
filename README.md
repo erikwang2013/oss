@@ -86,9 +86,9 @@ origin version id、staging 明文 tee 0600、写 intent compensate-only）· sy
 `/api/v1/raft/status`）· 3-voter 成员变更/leader 单跳转发 · 双边配对与 B′ 替换 · witness
 独立运行时 · 11 表逻辑快照/安装 · M7→Raft cutover · `raft-export/raft-force-recover` ·
 `sync-reconcile [--repair]` · console Raft 集群卡片。`RAFT_READY`/`SYNC_READY`/
-`STRETCH_READY` 均为 true。**S8/S9 残余**：stretch 模式下配对/加 witness 的组合证据
-未归档；灾备与 11 表并发 diff 已由 `tests/e2e_m9_recovery.sh` / `tests/e2e_m9.sh`
-覆盖（五个 e2e 与验收证据见下）。
+`STRETCH_READY` 均为 true。**S8/S9 验收**：stretch 模式下的配对/加 witness 组合、
+灾备与 11 表并发 diff 均已由 `tests/e2e_m9.sh`（`M9_STRETCH=1`）/
+`tests/e2e_m9_recovery.sh` 覆盖（五个 e2e 与验收证据见下）。
 
 ## 架构
 
@@ -1000,10 +1000,14 @@ append/vote/snapshot/status/membership/write/join。
   转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、M7→Raft
   `raft-cutover`/`raft-export`/`raft-force-recover`、`sync-reconcile [--repair]`、console
   Raft 集群卡片。M7/Local 路径保持字节不变。
-- **验收证据（本机 HEAD `95df75c`，2026-10-22）**：`M9_STRICT=1 tests/e2e_m9.sh`
-  （sync 模式）71 PASS / 0 FAIL / 1 预期 SKIP（stretch 由专用脚本覆盖）；
-  `tests/e2e_stretch.sh` ALL PASS；M7 回归 `tests/e2e_sites.sh` PASS。七闸全绿：
-  fmt/clippy、workspace lib 461、oss-server 集成 348、xl-* 446、web test 18、web build。
+- **验收证据（代码 HEAD `ac007e7`，2026-10-22）**：`M9_STRICT=1 tests/e2e_m9.sh`
+  （sync）78 PASS / 0 FAIL / 1 预期 SKIP；`M9_STRICT=1 M9_STRETCH=1 tests/e2e_m9.sh`
+  （stretch+Raft 配对/witness）59 PASS / 0 FAIL / 1 预期 SKIP；`tests/e2e_m9_recovery.sh`
+  133 PASS / 0 FAIL / 1 预期 SKIP；M7 回归 `tests/e2e_sites.sh` PASS。Rust 聚焦测试
+  164 PASS（lib 112 + raft_access 6 + raft_s71 6 + raft_cutover 4 + sync_gate 36）；
+  `cargo fmt --all --check` 与
+  `cargo clippy -p oss-server -p xl-s3 --all-targets -- -D warnings` 通过。
+  `tests/e2e_stretch.sh` ALL PASS；本次无前端改动，web test/build 沿用发布时结果。
 
 ### 模式矩阵
 
@@ -1013,7 +1017,7 @@ append/vote/snapshot/status/membership/write/join。
 | `[site]` | M7 异步站点对 | 本地 SQLite | 可用（M7） |
 | `[cluster]` | 扁平多节点 EC | 本地 SQLite | 可用（M3/M4） |
 | `[site]` + `[raft]` | M7 异步站点对；sync 桶（1 数据 peer） | Raft 1/2/3 voters（A/B 配对 + C witness） | 可用；控制写经 Raft；`production_ready` 需 ≥3 voters |
-| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 数据面 e2e ALL PASS；stretch 模式下配对/加 witness 的组合证据未归档 |
+| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 数据面与 stretch+Raft 组合 e2e ALL PASS（`M9_STRETCH=1 tests/e2e_m9.sh` 59 PASS） |
 
 启动校验（`config.rs`，均 fail-closed）：`[raft]` 必须有 `[site]`；`[stretch]` 必须有
 `[site]` + `[raft]`；`[cluster]` 与 `[site]`/`[stretch]` 互斥；`[raft]`/`[stretch]` 下
@@ -1336,7 +1340,7 @@ SKIP 外，任何 SKIP 都按 FAIL 处理（`skip_expected` 不计失败）。
   「缺口收口与偏差」节、设计文档 §M8 落地状态
 - M8 e2e：`tests/e2e_m8.sh`（前置与旋钮见「M8 测试锚」段）
 - M9 强一致计划（v5；数据面 S0–S4 + Raft S5、控制面 S6、3-voter/配对/快照/cutover S7
-  已实施；S8/S9 验收已完成，证据归档残余见下）：
+  已实施；S8/S9 验收已完成（证据见下））：
   `docs/superpowers/plans/2026-10-20-m9-strong-consistency.md`
 
 ---

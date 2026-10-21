@@ -356,7 +356,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 **CAP 选择必须显式**：sync 桶在远端站点不可达时**写返回 503**。不做「自动降级为 async」——那会让「强一致」这个承诺失去意义。写延迟下限 = 跨站点 RTT，因此 sync 只适合合规桶与小对象。此约束必须出现在桶创建界面的文案里。
 
-**落地状态（2026-10-22，S0–S9 已实施；残余证据见下）**：S0 模式矩阵/
+**落地状态（2026-10-22，S0–S9 已实施；验收证据见下）**：S0 模式矩阵/
 配置校验/能力开关；S1–S3 sync 数据面（统一 origin version id、staging 明文 tee 0600、
 写 intent compensate-only、remote-first 删除、内部 token 路由、删桶 quiesce、删除 intent
 恢复）；S4 stretch 2×6 数据面；S5 openraft 0.9.25 SQLite 日志/状态机/快照/HTTP 网络；
@@ -366,13 +366,15 @@ S6 控制写路由（11 张控制表单命令提交、确定性 payload、apply 
 `raft-force-recover`、`sync-reconcile [--repair]`。`RAFT_READY`/`SYNC_READY`/
 `STRETCH_READY` 均为 true；`/api/v1/raft/status` 报真实 role/term/applied/voters 与
 `production_ready`（voters≥3）。
-验收证据（本机 HEAD `95df75c`）：`M9_STRICT=1 tests/e2e_m9.sh` 71 PASS/0 FAIL/1 预期 SKIP；
-`tests/e2e_stretch.sh` ALL PASS；`tests/e2e_sites.sh` M7 PASS；七闸全绿。
+验收证据（代码 HEAD `ac007e7`）：`M9_STRICT=1 tests/e2e_m9.sh` 78 PASS/0 FAIL/1 预期 SKIP；
+`M9_STRETCH=1 tests/e2e_m9.sh` 59 PASS；`tests/e2e_m9_recovery.sh` 133 PASS；
+`tests/e2e_stretch.sh` ALL PASS；`tests/e2e_sites.sh` M7 PASS；fmt/clippy 与聚焦 Rust 测试 164 PASS。
 规格收窄不变：sync 与 stretch 互斥；sync 桶要求 `[site]`+`[raft]`+恰好 1 个数据 peer，
 单对象默认 ≤64 MiB、远端超时 10s；stretch 要求 2 数据站点 ×6 盘、EC 8+4、
 `inline_threshold=0`，`self_addr` 是独立 mesh gRPC 端口，禁用 M7 异步站点复制、拒绝 sync
-桶且只允许全新空库。残余：stretch+Raft 配对组合证据未归档（B′/cutover/repair 专用 e2e 见
-`tests/e2e_m9_recovery.sh`；11 表并发 diff 见 `tests/e2e_m9.sh`）。
+桶且只允许全新空库。stretch+Raft 配对/加 witness 组合由
+`M9_STRETCH=1 tests/e2e_m9.sh` 覆盖；B′/cutover/repair 见 `tests/e2e_m9_recovery.sh`；
+11 表并发 diff 见 `tests/e2e_m9.sh`。
 
 ### 7.4 存储分层（M8）
 
@@ -632,7 +634,7 @@ Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单 · 本地
 
 **范围**：控制面 `openraft` 跨站点 · `replication_mode: sync` 桶 · stretch EC · 站点故障语义
 
-**落地状态（2026-10-22，S0–S9 已实施；残余证据见下）**：
+**落地状态（2026-10-22，S0–S9 已实施；验收证据见下）**：
 - 数据面：S0 配置/模式守卫与能力开关；S1–S3 sync 写门（统一 origin version id、staging
   明文 tee 0600、写 intent compensate-only、MPU/Copy 边界）、remote-first 删除（内部 token
   路由、删桶 quiesce、删除 intent 周期恢复）；S4 stretch 2×6 数据面。
@@ -641,11 +643,13 @@ Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单 · 本地
   成员/leader 单跳转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、
   M7→Raft cutover/export/force-recover、`sync-reconcile [--repair]`。
 - 能力开关：`RAFT_READY`/`SYNC_READY`/`STRETCH_READY=true`；`production_ready` 需 ≥3 voters。
-- 验收证据：`M9_STRICT=1 tests/e2e_m9.sh` 71 PASS/0 FAIL/1 预期 SKIP；`tests/e2e_stretch.sh`
-  ALL PASS；`tests/e2e_sites.sh` M7 PASS；七闸全绿（fmt/clippy/lib 461/integration 348/
-  xl-* 446/web 18/build）。
-- 残余：stretch+Raft 配对组合证据未归档（B′/cutover/repair 专用 e2e 见
-  `tests/e2e_m9_recovery.sh`；11 表并发 diff 见 `tests/e2e_m9.sh`）；TLS 仍未接线。
+- 验收证据（代码 HEAD `ac007e7`）：`M9_STRICT=1 tests/e2e_m9.sh` 78 PASS/0 FAIL/1 预期 SKIP；
+  `M9_STRETCH=1 tests/e2e_m9.sh` 59 PASS；`tests/e2e_m9_recovery.sh` 133 PASS；
+  `tests/e2e_stretch.sh` ALL PASS；`tests/e2e_sites.sh` M7 PASS；fmt/clippy 与聚焦
+  Rust 测试 164 PASS。
+- stretch+Raft 配对/加 witness 组合由 `M9_STRETCH=1 tests/e2e_m9.sh` 覆盖；
+  B′/cutover/repair 见 `tests/e2e_m9_recovery.sh`；11 表并发 diff 见 `tests/e2e_m9.sh`；
+  TLS 仍未接线。
 - 规格收窄（③ 2×6）：stretch 不是「sync 支持跨站 EC」；两者互斥。stretch 固定 2 数据
   站点 ×6 盘、EC 8+4、placement v2、inline=0，`Q_s=9`，单站点 6 槽不足，**不承诺站点
   容灾**；禁用 M7 异步站点复制、拒绝 sync 桶、仅允许全新空库。sync 桶要求
