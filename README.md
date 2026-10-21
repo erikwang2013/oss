@@ -986,9 +986,10 @@ membership/write/join。
   转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、M7→Raft
   `raft-cutover`/`raft-export`/`raft-force-recover`、`sync-reconcile [--repair]`、console
   Raft 集群卡片。M7/Local 路径保持字节不变。
-- **验收证据（本机）**：`tests/e2e_m9.sh`（sync 模式）71 PASS / 0 FAIL / 1 SKIP（stretch
-  由专用脚本覆盖：`tests/e2e_stretch.sh` ALL PASS）；`M9_STRICT=1` 用于失败不降级。
-  `cargo test` 的 raft/控制面套件与 `sync_gate` 全绿。
+- **验收证据（本机 HEAD `95df75c`，2026-10-22）**：`M9_STRICT=1 tests/e2e_m9.sh`
+  （sync 模式）71 PASS / 0 FAIL / 1 预期 SKIP（stretch 由专用脚本覆盖）；
+  `tests/e2e_stretch.sh` ALL PASS；M7 回归 `tests/e2e_sites.sh` PASS。七闸全绿：
+  fmt/clippy、workspace lib 461、oss-server 集成 348、xl-* 446、web test 18、web build。
 
 ### 模式矩阵
 
