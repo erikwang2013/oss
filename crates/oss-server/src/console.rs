@@ -3253,7 +3253,11 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         return conflict("raft node id conflict".into());
     }
     match state.db.list_sites().await {
-        Ok(rows) if rows.iter().any(|r| r.raft_node_id == Some(peer_node)) => {
+        Ok(rows)
+            if rows
+                .iter()
+                .any(|r| r.raft_node_id == Some(peer_node) && r.remote_site_id != ident.id) =>
+        {
             return conflict("raft node id conflict".into());
         }
         Ok(_) => {}
@@ -3536,6 +3540,20 @@ async fn site_raft_join(
     }
     if body.raft_node_id == 0 || body.raft_node_id == local_raft.node_id {
         return conflict("raft node id conflict");
+    }
+    match state.db.list_sites().await {
+        Ok(rows)
+            if rows.iter().any(|r| {
+                r.raft_node_id == Some(body.raft_node_id) && r.remote_site_id != body.site_id
+            }) =>
+        {
+            return conflict("raft node id conflict");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "列出站点失败");
+            return internal_error();
+        }
     }
     if let Some(m) = stretch_mismatches(&local_stretch_identity(&state), &body.stretch) {
         return (

@@ -119,7 +119,7 @@ rpc_timeout_ms = 2000
 write_timeout_ms = 3000
 
 [sync]
-timeout_ms = 1000
+timeout_ms = 5000
 max_object_bytes = 67108864
 EOF
   if [ "$MODE" = stretch ]; then

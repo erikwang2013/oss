@@ -655,7 +655,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-            let response = match &entry.payload {
+            let (response, has_effects) = match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     let applied = {
                         let mut cw = apply::control_tx(&mut tx);
@@ -663,9 +663,9 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                             storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
                         })?
                     };
-                    applied.response
+                    (applied.response, !applied.effects.is_empty())
                 }
-                EntryPayload::Blank | EntryPayload::Membership(_) => ControlResponse::Ok,
+                EntryPayload::Blank | EntryPayload::Membership(_) => (ControlResponse::Ok, false),
             };
             let applied_json = encode(ErrorSubject::StateMachine, ErrorVerb::Write, &Some(log_id))?;
             let membership_json = encode(
@@ -688,6 +688,11 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
             tx.commit()
                 .await
                 .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            // S7.2：followers 也执行 post-commit 副作用（桶目录/缓存）。旁路通知由
+            // state 的 watcher 做幂等全量对账（leader 上重复执行无害）。
+            if has_effects && let Some(tx) = &self.install_notify {
+                let _ = tx.send(log_id.index);
+            }
             responses.push(response);
         }
         Ok(responses)
