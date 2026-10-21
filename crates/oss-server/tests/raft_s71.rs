@@ -239,6 +239,20 @@ async fn raft_routes_auth_and_body_limits() {
         .unwrap();
     assert_eq!(resp.status(), 421, "wrong target node id must be rejected");
 
+    // 转发的控制写同样不能落到错误 node_id 的进程。
+    let write = format!("{}/api/v1/site/raft/write", node.base);
+    let cmd = serde_json::json!({"UserDelete": {"username": "nobody"}});
+    let resp = http
+        .post(&write)
+        .header(RPC_TOKEN_HEADER, &node.token)
+        .header(oss_server::raft::routes::FORWARD_HEADER, "1")
+        .header(RPC_TARGET_HEADER, "999")
+        .json(&cmd)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 421, "forwarded write target mismatch");
+
     node.shutdown().await;
 }
 
