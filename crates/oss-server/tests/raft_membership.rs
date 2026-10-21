@@ -180,27 +180,29 @@ async fn leader_loss_and_forwarded_removal() {
     a.handle.shutdown().await;
     drop(a);
 
-    // B+C 仍是 quorum；等待新 leader，然后由 C（可能是 follower）发起移除 A。
+    // B+C 仍是 quorum；等两端对同一新 leader 达成一致（避免把请求转给已死的 A），
+    // 然后由 C（可能是 follower）发起移除 A；选举窗口内允许重试。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let leader = loop {
+    let v = loop {
         let vb = membership::view(&b.handle);
         let vc = membership::view(&c.handle);
-        if let Some(l) = vb.leader.or(vc.leader) {
-            if l == 2 || l == 3 {
-                break l;
+        if vb.leader == vc.leader && matches!(vb.leader, Some(2) | Some(3)) {
+            if let Ok(v) = membership::request(
+                &c.base,
+                "s73-token",
+                &MembershipOp::RemoveNode { node_id: 1 },
+            )
+            .await
+            {
+                break v;
             }
         }
-        assert!(tokio::time::Instant::now() < deadline, "no new leader");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no stable new leader / membership request"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let _ = leader;
-    let v = membership::request(
-        &c.base,
-        "s73-token",
-        &MembershipOp::RemoveNode { node_id: 1 },
-    )
-    .await
-    .unwrap();
     assert_eq!(v.voters, vec![2, 3]);
 
     b.handle.shutdown().await;

@@ -119,6 +119,10 @@ fn source_scan_flags_new_control_table_writers() {
         "events.rs",
         "replication.rs",
         "site.rs",
+        // apply 原语 / 快照安装 / 控制数据映射（唯一允许写复制表的实现层）。
+        "apply.rs",
+        "data.rs",
+        "store.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut findings = vec![];

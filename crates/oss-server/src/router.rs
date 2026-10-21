@@ -253,6 +253,43 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         "oss_sync_ambiguous_total {}\n",
         state.sync_delete.ambiguous_total()
     ));
+    if let Some(handle) = &state.raft {
+        let (term, applied, voters, role) = {
+            let m = handle.raft().metrics();
+            let m = m.borrow();
+            let role = if m.current_leader == Some(handle.node_id()) {
+                "leader"
+            } else {
+                "follower"
+            };
+            (
+                m.current_term,
+                m.last_applied.map(|l| l.index).unwrap_or(0),
+                m.membership_config.voter_ids().count(),
+                role,
+            )
+        };
+        out.push_str("# HELP oss_raft_role 本节点控制面角色（1 = 当前角色）\n");
+        out.push_str("# TYPE oss_raft_role gauge\n");
+        for r in ["leader", "follower", "witness"] {
+            let v =
+                u8::from(
+                    r == role
+                        || (r == "witness"
+                            && state.cfg.raft.as_ref().is_some_and(|c| {
+                                matches!(c.role, crate::config::RaftRole::Witness)
+                            })),
+                );
+            out.push_str(&format!("oss_raft_role{{role=\"{r}\"}} {v}\n"));
+        }
+        out.push_str(&format!(
+            "oss_raft_term {term}\noss_raft_last_applied {applied}\noss_raft_members {voters}\n"
+        ));
+        out.push_str(&format!(
+            "oss_raft_production_ready {}\n",
+            u8::from(voters >= 3)
+        ));
+    }
     (
         [(
             header::CONTENT_TYPE,
