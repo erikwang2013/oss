@@ -30,6 +30,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::apply;
+use super::data::{self, ControlData, InstallCtx};
 use super::{ControlResponse, TypeConfig};
 
 /// 日志/元数据 + 基座状态机表。`raft_applied`/`raft_apply_ctx` 与 `0004_m9.sql` 同名同构。
@@ -388,28 +389,57 @@ pub struct SqliteStateMachine {
     max_snapshot_bytes: u64,
     /// build 的 compare-and-write 与 install 的整表替换互斥（旧 build 不得覆盖新快照）。
     snapshot_lock: Arc<tokio::sync::Mutex<()>>,
+    /// true：快照含 11 张复制表（控制库）；false：S5 基座 KV（raft.db 自测）。
+    control: bool,
+    /// witness 安装时 owner 用哨兵 0（无本地管理员）。
+    witness: bool,
+    /// 安装提交后通知缓存/目录对账任务（S7.2）。
+    install_notify: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl SqliteStateMachine {
     pub async fn open(path: &Path, max_snapshot_bytes: u64) -> Result<Self, sqlx::Error> {
         let pool = connect(path).await?;
-        Ok(Self::with_pool(pool, max_snapshot_bytes))
+        Ok(Self::with_pool(
+            pool,
+            max_snapshot_bytes,
+            false,
+            false,
+            None,
+        ))
     }
 
     /// 主控制库状态机（raft.db 只存日志/投票）。schema 幂等重放，`raft_applied`/ctx 已存在。
     pub async fn open_with_pool(
         pool: SqlitePool,
         max_snapshot_bytes: u64,
+        witness: bool,
+        install_notify: Option<tokio::sync::watch::Sender<u64>>,
     ) -> Result<Self, sqlx::Error> {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        Ok(Self::with_pool(pool, max_snapshot_bytes))
+        Ok(Self::with_pool(
+            pool,
+            max_snapshot_bytes,
+            true,
+            witness,
+            install_notify,
+        ))
     }
 
-    fn with_pool(pool: SqlitePool, max_snapshot_bytes: u64) -> Self {
+    fn with_pool(
+        pool: SqlitePool,
+        max_snapshot_bytes: u64,
+        control: bool,
+        witness: bool,
+        install_notify: Option<tokio::sync::watch::Sender<u64>>,
+    ) -> Self {
         Self {
             pool,
             max_snapshot_bytes,
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control,
+            witness,
+            install_notify,
         }
     }
 
@@ -457,6 +487,106 @@ impl SqliteStateMachine {
             .await
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
         Ok((applied, membership, kv))
+    }
+
+    fn data_err(e: data::DataError) -> StorageError<u64> {
+        storage_err(
+            ErrorSubject::StateMachine,
+            ErrorVerb::Write,
+            std::io::Error::other(e.to_string()),
+        )
+    }
+
+    /// S7.2：11 张复制表 + applied/membership 同一事务读，编码为带校验和的快照。
+    async fn control_snapshot_bytes(
+        &self,
+    ) -> Result<
+        (
+            Option<LogId<u64>>,
+            StoredMembership<u64, BasicNode>,
+            Vec<u8>,
+        ),
+        StorageError<u64>,
+    > {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
+        let (applied, membership) = read_applied(&mut tx).await?;
+        let control = data::read_tx(&mut tx).await.map_err(Self::data_err)?;
+        tx.commit()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
+        let bytes = data::encode_snapshot(&control).map_err(Self::data_err)?;
+        Ok((applied, membership, bytes))
+    }
+
+    /// S7.2：单事务安装 11 张复制表；守卫窗口与 raft_applied/快照同事务提交。
+    async fn install_control(
+        &self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+    ) -> Result<(), StorageError<u64>> {
+        let control: ControlData = data::decode_snapshot(bytes).map_err(Self::data_err)?;
+        let _guard = self.snapshot_lock.lock().await;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        let admin_id: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
+        let ctx = InstallCtx {
+            admin_id,
+            witness: self.witness,
+        };
+        data::install_tx(&mut tx, &control, &ctx)
+            .await
+            .map_err(Self::data_err)?;
+        let meta_json = encode(ErrorSubject::Snapshot(None), ErrorVerb::Write, meta)?;
+        let applied_json = encode(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Write,
+            &meta.last_log_id,
+        )?;
+        let membership_json = encode(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Write,
+            &meta.last_membership,
+        )?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO raft_applied (id, applied_log_id, membership_json) VALUES (1, ?, ?)",
+        )
+        .bind(applied_json)
+        .bind(membership_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
+            .bind(meta_json)
+            .bind(bytes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        tx.commit()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        if let Some(tx) = &self.install_notify {
+            let _ = tx.send(meta.last_log_id.map(|l| l.index).unwrap_or(0));
+        }
+        Ok(())
     }
 
     /// 仅在比已存快照新时写入；与 install 共用 `snapshot_lock`，避免旧 build 覆盖新行。
@@ -590,6 +720,9 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 )),
             ));
         }
+        if self.control && bytes.starts_with(data::SNAPSHOT_MAGIC) {
+            return self.install_control(meta, &bytes).await;
+        }
         let data: SnapshotData = serde_json::from_slice(&bytes)
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
         if data.applied_log_id != meta.last_log_id || data.last_membership != meta.last_membership {
@@ -681,14 +814,19 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let (applied, membership, kv) = self.snapshot_parts().await?;
-        let data = SnapshotData {
-            applied_log_id: applied,
-            last_membership: membership.clone(),
-            kv,
+        let (applied, membership, bytes) = if self.control {
+            self.control_snapshot_bytes().await?
+        } else {
+            let (applied, membership, kv) = self.snapshot_parts().await?;
+            let data = SnapshotData {
+                applied_log_id: applied,
+                last_membership: membership.clone(),
+                kv,
+            };
+            let bytes = serde_json::to_vec(&data)
+                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            (applied, membership, bytes)
         };
-        let bytes = serde_json::to_vec(&data)
-            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
         // Minor 3：构造即拒绝超限快照，避免落库后 install/传输必然失败。
         if bytes.len() as u64 > self.max_snapshot_bytes {
             return Err(storage_err(
@@ -736,9 +874,7 @@ mod tests {
 
     async fn test_machine(dir: &Path) -> (SqliteStateMachine, SqlitePool) {
         let pool = connect(&dir.join("sm.db")).await.unwrap();
-        let sm = SqliteStateMachine::open_with_pool(pool.clone(), 1024 * 1024)
-            .await
-            .unwrap();
+        let sm = SqliteStateMachine::with_pool(pool.clone(), 1024 * 1024, false, false, None);
         (sm, pool)
     }
 
@@ -861,6 +997,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(active, 0, "install 提交后守卫窗口必须复位");
+    }
+
+    /// S7.2：控制面快照（11 表）build → 全新控制库 install；篡改快照拒绝且不写行。
+    #[tokio::test]
+    async fn control_snapshot_round_trip_and_corruption_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let url_a = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("a-control.db").display()
+        );
+        let url_b = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("b-control.db").display()
+        );
+        let db_a = crate::db::Db::connect_raft(&url_a).await.unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(db_a.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
+             VALUES ('snap-user', 'hash', 0, 'active', 1)",
+        )
+        .execute(db_a.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date, versioning, object_lock, \
+             replication_mode, deleting) VALUES ('snap-bucket', NULL, 2, 'Enabled', 0, 'sync', 0)",
+        )
+        .execute(db_a.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+            .execute(db_a.pool())
+            .await
+            .unwrap();
+
+        let mut sm_a =
+            SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None)
+                .await
+                .unwrap();
+        let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
+            .await
+            .unwrap();
+        assert!(snap.snapshot.get_ref().starts_with(data::SNAPSHOT_MAGIC));
+
+        let db_b = crate::db::Db::connect_raft(&url_b).await.unwrap();
+        let mut sm_b =
+            SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None)
+                .await
+                .unwrap();
+        let bytes = snap.snapshot.get_ref().clone();
+        RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(bytes.clone())),
+        )
+        .await
+        .unwrap();
+        let (users, buckets): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM users WHERE username='snap-user'), \
+                    (SELECT COUNT(*) FROM buckets WHERE name='snap-bucket')",
+        )
+        .fetch_one(db_b.pool())
+        .await
+        .unwrap();
+        assert_eq!((users, buckets), (1, 1));
+
+        let mut bad = bytes;
+        *bad.last_mut().unwrap() ^= 0x01;
+        let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(bad)),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("checksum"));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+            .fetch_one(db_b.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "校验失败不得改动目标控制表");
     }
 
     /// Minor 3：序列化后超限的快照在 build 阶段即拒绝。

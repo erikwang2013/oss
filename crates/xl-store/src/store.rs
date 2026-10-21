@@ -490,6 +490,13 @@ impl Store {
         }
     }
 
+    /// M9 S7.2：快照安装后全量失效（不清空 writer 状态，deleting 仍由本地流程管理）。
+    pub fn invalidate_gate_all(&self) {
+        if let Some(gate) = &self.cfg.gate {
+            gate.invalidate_all();
+        }
+    }
+
     /// M9 S3：写入口取在途写者守卫。删桶标志置位后拒绝新写（503）。
     pub fn begin_write(&self, bucket: &str) -> Result<WriteGuard<'_>> {
         let mut w = self

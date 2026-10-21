@@ -674,6 +674,17 @@ impl OlapCache {
         }
     }
 
+    /// 快照安装后全量失效：先清空并回到未加载态，再由 preload 重新建立（fail-closed）。
+    pub fn clear(&self) {
+        match self.inner.write() {
+            Ok(mut w) => {
+                w.clear();
+                self.loaded.store(false, Ordering::Release);
+            }
+            Err(_) => self.mark_failed(),
+        }
+    }
+
     pub fn invalidate_bucket(&self, bucket: &str) {
         match self.inner.write() {
             Ok(mut w) => w.retain(|_, (b, _)| b != bucket),

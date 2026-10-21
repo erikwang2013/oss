@@ -433,6 +433,12 @@ impl PutCommitGate for SiteSyncGate {
         clean_intent(&self.db, &ticket.local_version_id).await;
     }
 
+    fn invalidate_all(&self) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.clear();
+        }
+    }
+
     fn invalidate(&self, bucket: &str) {
         if let Ok(mut c) = self.cache.lock() {
             c.remove(bucket);

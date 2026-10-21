@@ -11,6 +11,7 @@
 pub(crate) mod apply;
 pub mod command;
 pub mod control;
+pub mod data;
 pub mod identity;
 pub mod membership;
 pub mod network;
@@ -353,21 +354,32 @@ impl RaftHandle {
 ///
 /// `bootstrap=false` 且尚无成员时只启动运行时并等待 leader/join（S7 接线），不报错。
 pub async fn spawn(settings: RaftSettings) -> RaftResult<RaftHandle> {
-    spawn_with_control(settings, None).await
+    spawn_with_control(settings, None, None).await
 }
 
 /// S6 生产入口：状态机指向主控制库连接池（apply 与 `raft_applied`/ctx 同库同事务）。
 /// `None` = 基座自测：状态机与日志共用 `raft.db`。
+/// `install_notify`：控制面快照安装提交后收到 applied index（S7.2 缓存/目录对账）。
 pub async fn spawn_with_control(
     settings: RaftSettings,
     control_pool: Option<SqlitePool>,
+    install_notify: Option<tokio::sync::watch::Sender<u64>>,
 ) -> RaftResult<RaftHandle> {
     let config = Arc::new(settings.openraft_config()?);
     let log_store = store::SqliteLogStore::open(&settings.db_path).await?;
     // 未 apply 的成员日志（崩溃窗口）也要阻止再次 initialize；openraft 启动时会重放。
     let has_logs = log_store.has_logs().await?;
+    let witness = matches!(settings.role, crate::config::RaftRole::Witness);
     let state_machine = match control_pool {
-        Some(pool) => SqliteStateMachine::open_with_pool(pool, settings.snapshot_max_bytes).await?,
+        Some(pool) => {
+            SqliteStateMachine::open_with_pool(
+                pool,
+                settings.snapshot_max_bytes,
+                witness,
+                install_notify,
+            )
+            .await?
+        }
         None => SqliteStateMachine::open(&settings.db_path, settings.snapshot_max_bytes).await?,
     };
 

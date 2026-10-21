@@ -61,7 +61,7 @@ pub async fn spawn_node_with_pool(
     let token = settings.cluster_token.clone();
     let pool = control_pool.clone();
     let handle = Arc::new(
-        oss_server::raft::spawn_with_control(settings, control_pool)
+        oss_server::raft::spawn_with_control(settings, control_pool, None)
             .await
             .unwrap(),
     );

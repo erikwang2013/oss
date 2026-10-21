@@ -91,6 +91,9 @@ pub trait PutCommitGate: Send + Sync + std::fmt::Debug {
     async fn committed(&self, _ticket: &GateTicket) {}
     /// 桶复制模式变更（建桶/删桶/apply）失效缓存。默认无操作。
     fn invalidate(&self, _bucket: &str) {}
+
+    /// 快照安装后全量失效（各站点缓存按新控制表重建）。
+    fn invalidate_all(&self) {}
 }
 
 #[cfg(test)]

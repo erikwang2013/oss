@@ -52,7 +52,7 @@ async fn start(
     let url = format!("sqlite://{}?mode=rwc", state_db.display());
     let db = Arc::new(Db::connect_witness(&url).await?);
     identity::verify_and_seed(&db, &settings).await?;
-    let handle = Arc::new(raft::spawn_with_control(settings, Some(db.pool().clone())).await?);
+    let handle = Arc::new(raft::spawn_with_control(settings, Some(db.pool().clone()), None).await?);
     identity::record_initialized(&db, handle.membership_nonempty()).await?;
     Ok((db, handle))
 }

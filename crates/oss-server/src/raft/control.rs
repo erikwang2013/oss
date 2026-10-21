@@ -41,6 +41,41 @@ impl PostCommit {
         }
     }
 
+    /// S7.2：快照安装提交后，按新控制表重建本节点缓存与桶目录（数据站点）。
+    pub async fn after_snapshot_install(&self) {
+        match self.db.list_access_points(None).await {
+            Ok(rows) => {
+                let aps: Vec<_> = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        match xl_s3::ap::AccessPoint::from_row(
+                            row.name,
+                            row.bucket,
+                            row.owner_id,
+                            row.policy_json,
+                            &self.region,
+                        ) {
+                            Ok(ap) => Some(ap),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "快照安装后 AP 行无效（跳过缓存）");
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                self.ap_cache.replace_all(aps);
+            }
+            Err(e) => tracing::warn!(error = %e, "快照安装后读取 AP 失败"),
+        }
+        self.olap_cache.clear();
+        crate::access_points_api::preload_olap(&self.db, &self.ap_cache, &self.olap_cache).await;
+        self.store.invalidate_gate_all();
+        match self.db.list_bucket_rows().await {
+            Ok(rows) => self.store.reconcile_bucket_dirs(&rows).await,
+            Err(e) => tracing::warn!(error = %e, "快照安装后列举桶行失败"),
+        }
+    }
+
     async fn run(&self, effects: Vec<SideEffect>) {
         for effect in effects {
             self.run_one(effect).await;
@@ -227,6 +262,11 @@ impl ControlPlane {
 
     /// `/api/v1/raft/status`：Raft 下报真实运行状态；M7/Local 保持 S0 骨架。
     /// `configured` = `cfg.raft.is_some()`，未配置 `[raft]` 时能力位全 false。
+    /// S7.2：快照安装后的缓存/目录重建入口（state 的 install watcher 调用）。
+    pub async fn after_snapshot_install(&self) {
+        self.post.after_snapshot_install().await;
+    }
+
     pub fn status_json(&self, configured: bool) -> serde_json::Value {
         match &self.inner {
             Inner::Raft(handle) => handle.status_json(configured),

@@ -549,6 +549,7 @@ async fn raft_write_failure_maps_to_503_with_hint_not_silent_204() {
             snapshot_max_bytes: 512 * 1024 * 1024,
         },
         None,
+        None,
     )
     .await
     .unwrap();

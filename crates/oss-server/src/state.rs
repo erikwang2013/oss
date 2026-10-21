@@ -586,9 +586,16 @@ impl AppState {
         // Raft 启动必须晚于本地管理员引导：日志重放里的管理员属主需解析到本地 id。
         // 首启 bootstrap 成功的节点即已初始化（metrics 的成员可能滞后一拍）。
         let bootstrapped = raft_settings.as_ref().is_some_and(|s| s.bootstrap);
+        let (install_tx, install_rx) = if raft_settings.is_some() {
+            let (tx, rx) = tokio::sync::watch::channel(0u64);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let raft = match raft_settings {
             Some(settings) => Some(Arc::new(
-                crate::raft::spawn_with_control(settings, Some(db.pool().clone())).await?,
+                crate::raft::spawn_with_control(settings, Some(db.pool().clone()), install_tx)
+                    .await?,
             )),
             None => None,
         };
@@ -608,7 +615,20 @@ impl AppState {
             }
         }
 
-        Ok(Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, raft).await)
+        let state =
+            Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, raft).await;
+        // S7.2：快照安装后按新控制表重建 AP/OLAP/同步门缓存与桶目录（仅数据站点）。
+        if let Some(mut rx) = install_rx {
+            let control = Arc::clone(&state.control);
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let applied = *rx.borrow_and_update();
+                    control.after_snapshot_install().await;
+                    tracing::info!(applied, "控制面快照安装完成；缓存/桶目录已对账");
+                }
+            });
+        }
+        Ok(state)
     }
 
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。

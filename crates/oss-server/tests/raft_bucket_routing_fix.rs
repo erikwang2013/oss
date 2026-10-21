@@ -148,7 +148,7 @@ async fn setup() -> H {
         snapshot_max_bytes: 512 * 1024 * 1024,
     };
     let handle = Arc::new(
-        oss_server::raft::spawn_with_control(settings, Some(st.db.pool().clone()))
+        oss_server::raft::spawn_with_control(settings, Some(st.db.pool().clone()), None)
             .await
             .unwrap(),
     );
