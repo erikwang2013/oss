@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # M9 强一致端到端（3 进程：数据站点 A/B + 只承载控制面的 witness C）。
-# 覆盖：① 3-voter 控制面并发写收敛（用户/桶/策略三端字段级相等）、单站点故障后仍可写；
-#      ② sync 桶 remote-first PUT/MPU/Copy/删除 + SIGSTOP 断连 503 且本地不可见/未删；
-#      ③ Stretch EC 2×6：两站点读写、单站点故障非 2xx、恢复、每站点 6 片。
+# 覆盖：① 3-voter 控制面并发写收敛（users/access_keys/permissions/buckets/bucket_policies
+#          5 表三端字段级相等；其余 6 张复制表见 norm_check 下的 TODO(S9) cutover 清单）、
+#          单站点故障后仍可写、C 重启真追平；
+#      ② sync 桶 remote-first PUT/MPU/Copy/删除 + SIGSTOP 断连 503 且本地 404/未删
+#          （console 对象删 503、桶删 409 非空、内部 token 403 同段覆盖）；
+#      ③ Stretch EC 2×6：两站点读写、单站点故障非 2xx、恢复、每站点 1 版本/6 片、无 site outbox。
 # 模式：sync 桶与 stretch 按计划 v3 N4 **互斥**，同一集群不能同时启用：
 #       默认（M9_STRETCH=0）跑步骤 1/2/3/5；M9_STRETCH=1 跑 1/2/4/5（步骤 3 显式跳过）。
-# 功能门控：未接线的构建按 /api/v1/raft/status 的 capabilities.raft/sync/stretch 自动跳过
-#       对应步骤并打印原因；M9_STRICT=1 时跳过升级为 FAIL（功能齐备后 CI 用）。
+#       计划 §S9/§7 的独立 tests/e2e_stretch.sh（S4 数据面专用、无 witness）继续作为“四个 e2e”
+#       之一保留；本脚本 M9_STRETCH=1 是复用 A/B/C 的 S9 集成变体，不是它的 wrapper。
+# 功能门控：未接线的构建按 raft status（/api/v1/raft/status 或 /api/v1/site/raft/status）的
+#       capabilities.raft/sync/stretch 自动跳过对应步骤并打印原因。仅当 A/B **都**因配置解析
+#       被拒才 SKIP；其它启动失败（端口/panic/权限）按回归 FAIL。M9_STRICT=1 时跳过升级为 FAIL
+#       （功能齐备后 CI 用）。
 # S3 覆盖补充：步骤 3 已含版本删/marker 同 id/DeleteObjects 503/outbox=0；DeleteBucket
 #       quiesce/非空回滚、生命周期 Expiration remote-first 由 crates/oss-server/tests/sync_gate.rs
-#       进程内覆盖（本脚本不跑，因需在途写者与远端可控状态）。
+#       进程内覆盖（本脚本不跑，因需在途写者与远端可控状态）。Batch Delete 是异步作业
+#       （POST /api/v1/jobs → worker 执行），状态观测需轮询 jobs 表 → TODO(S9)。
 # 前置：`cargo build -p oss-server`；aws-cli；curl；python3。
 # 用法：OSS_BIN=target/debug/oss-server tests/e2e_m9.sh
 #       M9_STRETCH=1 OSS_BIN=target/debug/oss-server tests/e2e_m9.sh   # 2×6 stretch
@@ -35,7 +43,22 @@ is2xx_file() { case "$(cat "$1" 2>/dev/null)" in 2??) return 0 ;; *) return 1 ;;
 retry() { local n=$1 i; shift; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
-A_HTTP=$(free_port); B_HTTP=$(free_port); C_HTTP=$(free_port); A_MESH=$(free_port); B_MESH=$(free_port)
+# 本脚本内去重（bind(0) 的 TOCTOU 仍在，与 e2e_sites.sh/e2e_m3_cluster.sh 同源）：
+# 5 个端口若撞车，A_MESH==A_HTTP 会触发 stretch_validate 拒启并被启动分支吞掉。
+USED_PORTS=""
+pick_ports() {
+  local p v
+  for v in A_HTTP B_HTTP C_HTTP A_MESH B_MESH; do
+    while :; do
+      p=$(free_port)
+      case " $USED_PORTS " in *" $p "*) continue ;; esac
+      break
+    done
+    USED_PORTS="$USED_PORTS $p"
+    printf -v "$v" '%s' "$p"
+  done
+}
+pick_ports
 A="http://127.0.0.1:$A_HTTP"; B="http://127.0.0.1:$B_HTTP"
 W=$(mktemp -d)
 JWT_SECRET="dev-only-change-me-0123456789abcdef"
@@ -167,20 +190,20 @@ start_c() {
 kill9() { local pid="$1"; [ -n "$pid" ] && { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; }
 
 login() {
-  curl -s -X POST "$1/api/v1/login" -H 'content-type: application/json' \
+  curl -s --max-time 10 -X POST "$1/api/v1/login" -H 'content-type: application/json' \
     -d "{\"username\":\"$2\",\"password\":\"$3\"}" |
     python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 print(d.get("token",""))'
 }
-mint() { curl -s -X POST "$1/api/v1/access-keys" -H "authorization: Bearer $2" -H 'content-type: application/json' -d '{}'; }
+mint() { curl -s --max-time 10 -X POST "$1/api/v1/access-keys" -H "authorization: Bearer $2" -H 'content-type: application/json' -d '{}'; }
 json_get() { python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 print(d.get(sys.argv[1],""))' "$1"; }
-post_code() { curl -s -o /dev/null -w '%{http_code}' -X POST "$1" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" > "$4"; }
-put_code() { curl -s -o /dev/null -w '%{http_code}' -X PUT "$1" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" > "$4"; }
+post_code() { curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$1" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" > "$4"; }
+put_code() { curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X PUT "$1" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" > "$4"; }
 
 # S0 骨架在 /api/v1/raft/status，计划 §2.6 的正式路径是 /api/v1/site/raft/status；两者都探。
 status_json() {
@@ -210,15 +233,21 @@ poll_members() { for _ in $(seq 1 60); do [ "$(members_len "$1")" = "$2" ] && re
 # 三端（A/B 的 oss.db + witness 的 control.db）业务字段逐字段比较（代理键归一化）。
 # 只比较本脚本创建的 m9* 实体：bootstrap 管理员 m9admin 是各站点本地种子、witness 无此行，
 # 排除；m9owner 等命令写入的行必须在三端一致。
+# 11 张复制表（plan §2.2）覆盖：本段已比 users/access_keys/permissions/buckets/bucket_policies
+# 共 5 张（非管理员 AK、permissions 三列、owner 按 username）；剩余 6 张——lifecycle_rules、
+# event_configs、replication_rules、access_points、olap_configs、inventory_configs——留待
+# TODO(S9) cutover 段按自然键归一化比较（plan §7 验收①）。
 norm_check() { # db_a db_b db_c users_csv buckets_csv
 python3 - "$@" <<'PY'
 import json, sqlite3, sys
 def dump(p):
     c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
     u = {r[0]: list(r[1:]) for r in c.execute("SELECT username,is_admin,status FROM users WHERE username LIKE 'm9%' AND username <> 'm9admin'")}
+    k = {r[0]: list(r[1:]) for r in c.execute("SELECT a.access_key,u.username,a.status FROM access_keys a JOIN users u ON u.id=a.user_id WHERE u.username LIKE 'm9%' AND u.username <> 'm9admin' AND a.kind='long-term'")}
+    m = {f"{r[0]}|{r[1]}": list(r[2:]) for r in c.execute("SELECT u.username,p.bucket,p.can_read,p.can_write,p.can_delete FROM permissions p JOIN users u ON u.id=p.user_id WHERE u.username LIKE 'm9%' AND u.username <> 'm9admin'")}
     b = {r[0]: list(r[1:]) for r in c.execute("SELECT b.name,u.username,b.versioning,b.replication_mode,b.deleting,b.creation_date FROM buckets b LEFT JOIN users u ON u.id=b.owner_id WHERE b.name LIKE 'm9b-%'")}
     q = {r[0]: r[1] for r in c.execute("SELECT bucket,policy_json FROM bucket_policies WHERE bucket LIKE 'm9b-%'")}
-    return {"users": u, "buckets": b, "policies": q}
+    return {"users": u, "access_keys": k, "permissions": m, "buckets": b, "policies": q}
 try:
     a, b, c = (dump(x) for x in sys.argv[1:4])
 except sqlite3.Error as e:
@@ -229,6 +258,8 @@ need = sys.argv[4].split(",") + sys.argv[5].split(",")
 miss = [k for k in need if k and k not in a["users"] and k not in a["buckets"]]
 if miss:
     print("missing:", miss); sys.exit(3)
+if not a["access_keys"] or not a["permissions"]:
+    print("missing: access_keys/permissions rows"); sys.exit(3)
 print("ok")
 PY
 }
@@ -255,11 +286,24 @@ meta_at() { find "$1"/d* -type f -name 'xl.meta' -path "*/$2/$3/xl.meta" 2>/dev/
 # 轮询谓词（供 retry 复用）
 a_head() { aws_a s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1; }
 b_head() { aws_b s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1; }
-a_missing() { ! a_head "$1" "$2"; }
-b_missing() { ! b_head "$1" "$2"; }
+# 负向 HEAD 只认 404/NoSuchKey/NoSuchVersion（“确实不存在”）；500/连接失败/超时必须暴露，
+# 不能像 `! head` 那样把端点故障吞成假“不可见/未删”。
+s3_absent() { # aws_fn bucket key [version-id]
+  local fn=$1 b=$2 k=$3 v=${4:-} out rc
+  if [ -n "$v" ]; then
+    out=$("$fn" s3api head-object --bucket "$b" --key "$k" --version-id "$v" 2>&1); rc=$?
+  else
+    out=$("$fn" s3api head-object --bucket "$b" --key "$k" 2>&1); rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then echo "HEAD 成功（应不存在）: $b/$k${v:+ @$v}"; return 1; fi
+  if printf '%s' "$out" | grep -Eq '\(404\)|NoSuchKey|NoSuchVersion|Not Found'; then return 0; fi
+  echo "HEAD 非 404 形态（不是“不存在”）：$out"; return 1
+}
+a_missing() { s3_absent aws_a "$1" "$2"; }
+b_missing() { s3_absent aws_b "$1" "$2"; }
 both_missing() { a_missing "$1" "$2" && b_missing "$1" "$2"; }
-b_ver_missing() { ! aws_b s3api head-object --bucket "$1" --key "$2" --version-id "$3" >/dev/null 2>&1; }
-a_ver_missing() { ! aws_a s3api head-object --bucket "$1" --key "$2" --version-id "$3" >/dev/null 2>&1; }
+b_ver_missing() { s3_absent aws_b "$1" "$2" "$3"; }
+a_ver_missing() { s3_absent aws_a "$1" "$2" "$3"; }
 both_versioned() {
   [ "$(aws_a s3api get-bucket-versioning --bucket "$1" --query Status --output text 2>/dev/null)" = Enabled ] && \
   [ "$(aws_b s3api get-bucket-versioning --bucket "$1" --query Status --output text 2>/dev/null)" = Enabled ]
@@ -297,6 +341,10 @@ else
   pass "/api/v1/raft/status 可读"
   CAP_RAFT=$(cap raft); CAP_SYNC=$(cap sync); CAP_STRETCH=$(cap stretch)
   echo "  capabilities: raft=$CAP_RAFT sync=$CAP_SYNC stretch=$CAP_STRETCH"
+  # sync 依赖 Raft 控制面：组合异常必须显式 FAIL，不能让步骤 3 cascade 成“PASS/SKIP”。
+  if [ "$CAP_SYNC" = true ] && [ "$CAP_RAFT" != true ]; then
+    fail "能力组合异常：capabilities.sync=true 但 capabilities.raft=false（sync 需要 Raft 控制面）"
+  fi
   if [ "$CAP_RAFT" = true ]; then
     ck [ "$(enabled_flag "$A")" = true ]
     mk_witness_cfg
@@ -321,15 +369,15 @@ if [ "$CAP_RAFT" != true ]; then
   skip "步骤 2：3-voter 控制面并发写——capabilities.raft=false"
 else
   echo "== 2. 配对 A/B + 加 witness C + 并发控制写（用户/桶/策略）三端字段级一致 =="
-  A_ID=$(curl -s "$A/api/v1/site" -H "authorization: Bearer $AT" | json_get id)
-  A_ST=$(curl -s "$A/api/v1/site" -H "authorization: Bearer $AT" | json_get site_token)
-  B_ID=$(curl -s "$B/api/v1/site" -H "authorization: Bearer $BT" | json_get id)
-  B_ST=$(curl -s "$B/api/v1/site" -H "authorization: Bearer $BT" | json_get site_token)
-  pair() { curl -s -o /dev/null -w '%{http_code}' -X POST "$1/api/v1/sites" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "{\"peer_id\":\"$3\",\"endpoint\":\"$4\",\"region\":\"$5\",\"priority\":10,\"s3_access_key\":\"$6\",\"s3_secret_key\":\"$7\",\"peer_site_token\":\"$8\"}"; }
+  A_ID=$(curl -s --max-time 5 "$A/api/v1/site" -H "authorization: Bearer $AT" | json_get id)
+  A_ST=$(curl -s --max-time 5 "$A/api/v1/site" -H "authorization: Bearer $AT" | json_get site_token)
+  B_ID=$(curl -s --max-time 5 "$B/api/v1/site" -H "authorization: Bearer $BT" | json_get id)
+  B_ST=$(curl -s --max-time 5 "$B/api/v1/site" -H "authorization: Bearer $BT" | json_get site_token)
+  pair() { curl -s --max-time 15 -o /dev/null -w '%{http_code}' -X POST "$1/api/v1/sites" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "{\"peer_id\":\"$3\",\"endpoint\":\"$4\",\"region\":\"$5\",\"priority\":10,\"s3_access_key\":\"$6\",\"s3_secret_key\":\"$7\",\"peer_site_token\":\"$8\"}"; }
   ck [ "$(pair "$A" "$AT" "$B_ID" "$B" "$REG_B" "$B_AK" "$B_SK" "$B_ST")" = 200 ]
   ck [ "$(pair "$B" "$BT" "$A_ID" "$A" "$REG_A" "$A_AK" "$A_SK" "$A_ST")" = 200 ]
   ck poll_members "$A" 2   # B 的成员变更已提交，再加 C（CLI 读当前 membership）
-  if "$BIN" raft-add-witness --config "$W/a/oss.toml" --node-id 3 --endpoint "http://127.0.0.1:$C_HTTP" >>"$W/a/raft-admin.log" 2>&1; then
+  if timeout 20 "$BIN" raft-add-witness --config "$W/a/oss.toml" --node-id 3 --endpoint "http://127.0.0.1:$C_HTTP" >>"$W/a/raft-admin.log" 2>&1; then
     pass "raft-add-witness C"
   else
     fail "raft-add-witness 失败"; tail -5 "$W/a/raft-admin.log"
@@ -368,6 +416,17 @@ print(str(d["production_ready"]).lower() if "production_ready" in d else "")')
   put_code "$B/api/v1/buckets/$BK_B/policy" "$OT_B" "$POL_B" "$W/p2" & p2=$!
   wait "$p1" "$p2"
   ck [ "$(cat "$W/p1")" = 204 ]; ck [ "$(cat "$W/p2")" = 204 ]
+  # P2-3：OWNER（非管理员）铸长时 AK + 写一条 permissions 行——natural key 归一化比对用；
+  # 管理员 AK/permissions 是站点本地行（witness 无管理员），不参与 diff。
+  OWNER_ID=$(curl -s --max-time 5 "$A/api/v1/users" -H "authorization: Bearer $AT" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d=[]
+print(next((str(u.get("id")) for u in d if u.get("username")==sys.argv[1]),""))' "$OWNER")
+  ck [ -n "$OWNER_ID" ]
+  OKEYS=$(mint "$A" "$OT"); O_AK=$(printf '%s' "$OKEYS" | json_get access_key)
+  ck [ -n "$O_AK" ]
+  put_code "$A/api/v1/users/$OWNER_ID/permissions" "$AT" "[{\"bucket\":\"$BK_A\",\"read\":true,\"write\":false,\"delete\":true}]" "$W/perm"
+  ck [ "$(cat "$W/perm")" = 204 ]
   if poll_norm "$UN_A,$UN_B,$OWNER" "$BK_A,$BK_B" >/dev/null; then
     pass "A/B/C 三端用户/桶/策略字段级相等"
   else
@@ -377,12 +436,12 @@ fi
 
 if [ "$MODE" = stretch ]; then
   skip "步骤 3：sync 桶未跑——sync 与 stretch 互斥（计划 v3 N4）；用默认模式运行"
-elif [ "$CAP_SYNC" != true ]; then
-  skip "步骤 3：sync 桶 remote-first——capabilities.sync=false（sync 数据面未接线）"
+elif [ "$CAP_SYNC" != true ] || [ "$CAP_RAFT" != true ]; then
+  skip "步骤 3：sync 桶 remote-first——capabilities.sync=$CAP_SYNC raft=$CAP_RAFT（sync 需要 Raft 控制面）"
 else
   echo "== 3. sync 桶：remote-first PUT/MPU/Copy/删除 + SIGSTOP 断连 503（本地不可见/未删） =="
   SB="m9s-$STAMP"
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/buckets" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"name\":\"$SB\",\"replication_mode\":\"sync\"}")
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/buckets" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"name\":\"$SB\",\"replication_mode\":\"sync\"}")
   ck [ "$code" = 204 ]
   ck retry 60 both_versioned "$SB"   # sync 桶创建即 versioning=Enabled（§2.4）
   head -c 65536 /dev/urandom > "$W/live.bin"
@@ -399,11 +458,13 @@ else
   ck retry 60 b_mpu_size "$SB" mpu.bin
   ck_q aws_a s3api copy-object --bucket "$SB" --key copy.bin --copy-source "$SB/live.bin"
   ck retry 60 b_head "$SB" copy.bin
+  ck_q aws_a s3api put-object --bucket "$SB" --key console.bin --body "$W/meta.bin"
+  ck retry 60 b_head "$SB" console.bin
   echo "  -- SIGSTOP B：PUT/DELETE 必须 503，且本地不可见/未删 --"
   kill -STOP "$B_PID"; sleep 1
   head -c 4096 /dev/urandom > "$W/blocked.bin"
   expect_503 aws_a s3api put-object --bucket "$SB" --key blocked.bin --body "$W/blocked.bin"
-  if a_head "$SB" blocked.bin; then fail "断连 PUT 失败但本地可见"; else pass "断连 PUT 本地不可见"; fi
+  if a_missing "$SB" blocked.bin; then pass "断连 PUT 本地不可见（HEAD 404）"; else fail "断连 PUT 本地不可见断言失败（对象可见或 HEAD 非 404）"; fi
   expect_503 aws_a s3api delete-object --bucket "$SB" --key live.bin
   ck a_head "$SB" live.bin
   VID=$(aws_a s3api head-object --bucket "$SB" --key copy.bin --query VersionId --output text)
@@ -411,6 +472,15 @@ else
   ck a_head "$SB" copy.bin
   expect_503 aws_a s3api delete-objects --bucket "$SB" --delete '{"Objects":[{"Key":"mpu.bin"}],"Quiet":true}'
   ck a_head "$SB" mpu.bin
+  # P2-6：console 对象删除走同一 SyncDeleteService（远端优先）→ B 不可达时 503 且本地不直删
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X DELETE "$A/api/v1/buckets/$SB/objects/console.bin" -H "authorization: Bearer $AT")
+  ck [ "$code" = 503 ]
+  ck a_head "$SB" console.bin
+  # P2-6：内部 token 面（JWT except）缺/错 x-oss-site-token 一律 403（接收端不得降级为本地删）
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$A/api/v1/site/delete-object" -H 'content-type: application/json' -d "{\"bucket\":\"$SB\",\"key\":\"console.bin\",\"all_versions\":true}")
+  ck [ "$code" = 403 ]
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$A/api/v1/site/delete-object" -H 'content-type: application/json' -H "x-oss-site-token: $TOK_B" -d "{\"bucket\":\"$SB\",\"key\":\"console.bin\",\"all_versions\":true}")
+  ck [ "$code" = 403 ]
   echo "  -- SIGCONT B：恢复成功；remote-first 删除（marker/同 id 版本） --"
   kill -CONT "$B_PID"
   ck retry 60 sh -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:$B_HTTP/health/live)\" = 200 ]"
@@ -427,6 +497,10 @@ else
   ck retry 60 b_ver_missing "$SB" copy.bin "$VID"
   ck_q aws_a s3api delete-objects --bucket "$SB" --delete '{"Objects":[{"Key":"mpu.bin"}],"Quiet":true}'
   ck retry 60 both_missing "$SB" mpu.bin
+  # P2-6：console 桶删除在非空 sync 桶上 → 409（双站 quiesce 后查空失败并回滚），本地桶仍在
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X DELETE "$A/api/v1/buckets/$SB" -H "authorization: Bearer $AT")
+  ck [ "$code" = 409 ]
+  ck aws_a s3api head-bucket --bucket "$SB"
   ck [ "$(outbox_site_count "$SB")" = 0 ]   # sync 桶不得进 M7 站点 outbox
 fi
 
@@ -447,12 +521,21 @@ else
   ck retry 90 a_get_eq "$SBK" b.bin sb.back sb.bin
   ck [ "$(aws_a s3api list-object-versions --bucket "$SBK" --prefix a.bin --query 'length(Versions)' --output text)" = 1 ]
   ck [ "$(aws_b s3api list-object-versions --bucket "$SBK" --prefix a.bin --query 'length(Versions)' --output text)" = 1 ]
-  ck [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$A/api/v1/raft/status")" = 200 ]   # B1：经 A advertise（主 HTTP）可达 status
+  # B1（plan §2.5/§7）：A 的 advertise_endpoint 是 B 侧 membership 目标（主 HTTP），该地址必须
+  # 能服务 /api/v1/raft/status。反证：[stretch].self_addr 是 mesh gRPC，不承载 HTTP 面。
+  ck [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$A/api/v1/raft/status")" = 200 ]
+  ck [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$A_MESH/api/v1/raft/status" 2>/dev/null || true)" != 200 ]
   SA=$(shards_at "$W/a" "$SBK" a.bin); SB_=$(shards_at "$W/b" "$SBK" a.bin)
   ck [ "$SA" = 6 ]; ck [ "$SB_" = 6 ]; ck [ $((SA + SB_)) = 12 ]
   MA=$(meta_at "$W/a" "$SBK" a.bin); MB=$(meta_at "$W/b" "$SBK" a.bin)
   ck [ $((MA + MB)) = 12 ]   # meta 每盘镜像：两站点各 6 份
   ck [ "$(outbox_site_count "$SBK")" = 0 ]   # stretch 关闭 M7 站点异步复制
+  # plan §2.4/§7：stretch 禁止 sync 桶——控制台建 sync 桶必须 400（不是 503/静默放行）
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/buckets" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"name\":\"m9sync-$STAMP\",\"replication_mode\":\"sync\"}")
+  ck [ "$code" = 400 ]
+  # TODO(S9)：恢复后 fsck --repair 复检（CLI 已存在：oss-server fsck --repair；需决定与在线 A 的
+  #   并发窗口和报告断言）；提交 ≥9（需 S5/S6 把 raft applied 接到 status 后取差）；B 本地为
+  #   第二节点（需 identity/日志断言）。见 plan §S9/§7 验收③；本段其余断言已就绪。
   kill9 "$B_PID"; B_PID=""
   if aws_a s3 cp "s3://$SBK/a.bin" "$W/sa.down" >/dev/null 2>&1; then fail "停 B 后 GET 应非 2xx"
   else pass "停 B 后 GET 非 2xx（6 片 < data=8）"; fi
@@ -470,10 +553,16 @@ else
   kill9 "$C_PID"; C_PID=""
   ok=""
   for _ in $(seq 1 60); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ\",\"password\":\"m9pass-123\"}")
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ\",\"password\":\"m9pass-123\"}")
     case "$code" in 2??) ok=1; break ;; esac; sleep 1
   done
   ck [ "$ok" = 1 ]   # C 宕：A+B quorum 2 仍可写
+  # 真追平前置：UQ 在 C 宕期间提交，重启前 C 的库不应已有——否则下面的“追平”是空测
+  if [ -f "$W/c/control.db" ] && ! db_has_user "$W/c/control.db" "$UQ"; then
+    pass "C 宕期间无 UQ（待重启追平）"
+  else
+    fail "C 宕期间 UQ 状态异常（已见或 control.db 不可读）——追平测试无效"
+  fi
   if start_c; then
     ck retry 90 db_has_user "$W/c/control.db" "$UQ"   # C 重启追平 C 宕期间提交的 UQ
   else
@@ -482,7 +571,7 @@ else
   kill9 "$B_PID"; B_PID=""
   ok=""
   for _ in $(seq 1 60); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ2\",\"password\":\"m9pass-123\"}")
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$UQ2\",\"password\":\"m9pass-123\"}")
     case "$code" in 2??) ok=1; break ;; esac; sleep 1
   done
   ck [ "$ok" = 1 ]   # B 宕：A+C quorum 2 仍可写
