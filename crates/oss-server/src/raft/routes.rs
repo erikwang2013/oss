@@ -36,13 +36,23 @@ const MEMBERSHIP_BODY_LIMIT: usize = 64 * 1024;
 pub struct RaftExt {
     pub handle: Arc<RaftHandle>,
     pub cluster_token: String,
+    /// 本节点是否配置 `[site]`（sync 能力）与 `[stretch]`；witness/测试为 false。
+    pub sync_configured: bool,
+    pub stretch_configured: bool,
 }
 
 /// 挂到数据站点/witness 路由上（`Router<()>`；无需 AppState）。
-pub fn rpc_router(handle: Arc<RaftHandle>, cluster_token: String) -> Router {
+pub fn rpc_router(
+    handle: Arc<RaftHandle>,
+    cluster_token: String,
+    sync_configured: bool,
+    stretch_configured: bool,
+) -> Router {
     let ext = RaftExt {
         handle,
         cluster_token,
+        sync_configured,
+        stretch_configured,
     };
     Router::new()
         .route(
@@ -117,8 +127,13 @@ async fn snapshot(
 }
 
 async fn status(Extension(ext): Extension<RaftExt>) -> Json<Value> {
-    // rpc_router 只在配置了 [raft] 时挂载（数据站点/witness），能力位按 configured=true。
-    Json(ext.handle.status_json(true))
+    // rpc_router 只在配置了 [raft] 时挂载；sync/stretch 能力位还要求对应配置存在。
+    let mut v = ext.handle.status_json(true);
+    if let Some(caps) = v.get_mut("capabilities") {
+        caps["sync"] = serde_json::json!(super::SYNC_READY && ext.sync_configured);
+        caps["stretch"] = serde_json::json!(super::STRETCH_READY && ext.stretch_configured);
+    }
+    Json(v)
 }
 
 /// 成员变更（S7.3）：token → 解析 → leader 本地执行；follower 单跳转发；无 leader 503。

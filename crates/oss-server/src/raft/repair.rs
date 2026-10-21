@@ -29,6 +29,8 @@ pub struct RepairReport {
     pub mappings_written: usize,
     pub pushed: usize,
     pub markers_pushed: usize,
+    /// 只读模式：远端缺失的 delete marker 数量（未推送）。
+    pub markers_missing: usize,
     pub intents_cleared: u64,
     pub outbox_cleared: u64,
     pub errors: Vec<RepairError>,
@@ -252,7 +254,7 @@ pub async fn run(
                         ),
                         Ok(RemoteHead::Missing) => {
                             if !opts.repair {
-                                report.markers_pushed += 1;
+                                report.markers_missing += 1;
                                 continue;
                             }
                             match client

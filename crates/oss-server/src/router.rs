@@ -126,7 +126,12 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
                 .expect("raft handle implies [raft]")
                 .cluster_token
                 .clone();
-            app.merge(crate::raft::routes::rpc_router(handle, token))
+            app.merge(crate::raft::routes::rpc_router(
+                handle,
+                token,
+                state.cfg.site.is_some(),
+                state.cfg.stretch.is_some(),
+            ))
         }
         None => app,
     };

@@ -61,7 +61,7 @@ fn build_app(handle: Arc<RaftHandle>, token: String) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/health/live", get(|| async { "ok" }))
-        .merge(raft::routes::rpc_router(handle, token))
+        .merge(raft::routes::rpc_router(handle, token, false, false))
 }
 
 async fn bind_addr(

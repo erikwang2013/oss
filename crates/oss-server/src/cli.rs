@@ -995,13 +995,14 @@ async fn sync_reconcile_cmd(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "buckets={} versions={} already_ok={} mappings_written={} pushed={} markers_pushed={} intents_cleared={} outbox_cleared={}",
+            "buckets={} versions={} already_ok={} mappings_written={} pushed={} markers_pushed={} markers_missing={} intents_cleared={} outbox_cleared={}",
             report.buckets,
             report.versions,
             report.already_ok,
             report.mappings_written,
             report.pushed,
             report.markers_pushed,
+            report.markers_missing,
             report.intents_cleared,
             report.outbox_cleared
         );

@@ -65,7 +65,7 @@ pub async fn spawn_node_with_pool(
             .await
             .unwrap(),
     );
-    let app = routes::rpc_router(Arc::clone(&handle), token.clone());
+    let app = routes::rpc_router(Arc::clone(&handle), token.clone(), false, false);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     TestNode {
         handle,

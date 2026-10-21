@@ -115,7 +115,7 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写三端一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 71 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后用户/桶/策略 5 表三端字段级一致（其余 6 表 TODO(S9)）、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 71 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
@@ -998,7 +998,7 @@ membership/write/join。
 | `[site]` | M7 异步站点对 | 本地 SQLite | 可用（M7） |
 | `[cluster]` | 扁平多节点 EC | 本地 SQLite | 可用（M3/M4） |
 | `[site]` + `[raft]` | M7 异步站点对；sync 桶（1 数据 peer） | Raft 1/2/3 voters（A/B 配对 + C witness） | 可用；控制写经 Raft；`production_ready` 需 ≥3 voters |
-| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 可用；sync 桶被拒绝（互斥）；stretch 数据面 e2e ALL PASS |
+| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 数据面 e2e ALL PASS；stretch 模式下配对/加 witness 的组合证据待 S9 |
 
 启动校验（`config.rs`，均 fail-closed）：`[raft]` 必须有 `[site]`；`[stretch]` 必须有
 `[site]` + `[raft]`；`[cluster]` 与 `[site]`/`[stretch]` 互斥；`[raft]`/`[stretch]` 下
@@ -1109,8 +1109,11 @@ timeout_ms = 10000                     # 默认 10s；仅 sync 远端调用 → 
   （≤ `[sync].max_object_bytes`）按本地 version id 重推、刷新 `remote_version_id`、清理
   旧站 `sync_*_intents` 与 `repl_outbox(target_kind='site')`，全部成功后才清
   `sites.reconcile_required`（B′ 替换前该标志令 sync 写/删一律 503）。加密/超大/冲突对象
-  报错并保持 gate，退出码 1。用法：`oss-server sync-reconcile [--repair] [--bucket B]
-  [--json] --config a.toml`（建议停服运行；会打开本机 raft.db）。
+  报错并保持 gate，退出码 1。只读模式只报告（`markers_missing` 为远端缺失 marker 数）。
+  `--bucket B` 仅限定扫描/诊断，**不清**站点级 gate/intents/outbox；清门需全库运行。
+  用法：`oss-server sync-reconcile [--repair] [--bucket B] [--json] --config a.toml`
+  （离线 `Db::connect_offline` + `Store::open`，不加载 AppState/不打开 raft.db；建议停服避免
+  对象目录并发写）。
 
 ### stretch 2×6（数据面 + Raft 控制面已接线）
 
@@ -1161,31 +1164,41 @@ db_path = "/var/lib/oss/raft.db"
   stretch 启动发现遗留行即拒绝启动；M6 规则复制（外部 remote）仍可用。stretch 下创建
   sync 桶 400；首次启用还要求全新空库（`buckets=0`、各 `data_dirs` 只有 `.oss.sys`、
   无 sync 桶），通过后写 `stretch_initialized`，之后正常重启不再要求空库；**不支持原地
-  迁移**。`[stretch]` 与 `[cluster]`/`[[groups]]` 互斥。
+  迁移**。`[stretch]` 与 `[cluster]`/`[[groups]]` 互斥。未配对（本地 `buckets` 行数为 0）
+  的 Raft 启动会**跳过桶目录对账**，避免把对端站点拥有的目录当孤儿隔离；完成配对后正常
+  重启即执行完整对账。
 - **单盘故障**：EC 8+4 可在站点内重建，但 `Q_s=9` 仍要求至少 9 槽可达；站点恢复后用
   `fsck --repair`/`heal` 通过 mesh 修复缺失分片。
 
-### force recovery runbook
+### cutover / force recovery runbook
 
-命令已实现（`raft-export`/`raft-force-recover`）；硬约束是**禁止手改旧 `raft.db`**，
-新集群绝不写旧 epoch。
+硬约束：**禁止手改旧 `raft.db`**，新集群绝不写旧 epoch。
 
-1. 停全部节点，保留旧 `raft.db`/`control.db` 与对象备份；记录每步使用的配置与导出文件。
-2. 选控制状态最全的存活数据站点执行 `raft-export`（11 张业务表、自然键，不含 LogId 语义）。
-   若只剩 witness C，用 `raft-export --witness --config witness.toml` 读 C 的 `state_db`，
-   **只导出控制面**；C 无对象目录，对象必须从备份恢复。
-3. 归档旧 `raft.db`，运行 `raft-force-recover --config <survivor> --from <export>
-   --new-node-id <N> --yes`：建全新空 `raft.db`，单事务导入业务行，重置 `raft_applied`/
-   `raft_apply_ctx`，并在全新空日志上 `initialize({N})`（单节点 quorum）。
-4. 用 `bootstrap=false` 启动该节点（只加载既有 membership，不再 initialize，也不等旧 leader）；
-   其他节点回来后 `add_learner` → 追平 → `change_membership(最终 voters)`。
-5. 对象从备份/异地副本恢复；sync 桶对端恢复后跑 `sync-reconcile --repair`；stretch 必须
-   两站点数据都从备份恢复。未提交写会丢失。
-6. 单点永久丢失的目标处理：**C 丢失** → A+B 仍 quorum 2，部署新 witness（新 node_id =
-   当前最大 + 1），加 learner 追平后替换旧 voter；**B 站点永久丢失且有 sync 桶** → A+C
-   仍 quorum 2，复用旧 B 的 site UUID/token 但用新 Raft node_id 部署 B'，加 learner 后跑
-   `sync-reconcile --repair`，确认前不得标可服务（有 sync 桶时 `DELETE /sites` 应 409）；
-   **A+B 同时丢失** → 按 2–5 建新集群，对象从备份恢复。
+**M7 → Raft cutover**（两台 M7 库切到控制面 Raft）：
+
+1. 停 A/B；`oss-server raft-export --config a/oss.toml --out /backup/export.json`（11 张复制表，
+   自然键；`--witness` 仅用于备份 witness 的 `state_db`，该导出不能用于 cutover/恢复）。
+2. 对每个 M7 目标库先 dry-run：`raft-cutover --config x/oss.toml --from export.json --dry-run`；
+   无冲突后去掉 `--dry-run`。目标必须是 **未进入 raft mode** 的 M7 库、版本/admin/vault
+   与导出一致、`[cluster]` 不存在、site changelog lag=0、`site_apply_dead` 为空；
+   `--overwrite` 才允许覆盖目标独有复制行。cutover 成功后写 `raft_cutover` 并置
+   `raft_mode=on`（此后无 `[raft]` 的启动会被拒绝）。
+3. 启动 A（`bootstrap=true`）、B（`false`），控制台配对，`raft-add-witness` 加 C。
+
+**force recovery**（A+B 永久丢失，只剩导出/备份）：
+
+1. 准备一个**干净目标控制库**：同版本、已 `raft-cutover` 到 raft mode、`raft_applied`
+   为空、无 `raft_snapshot` 行、存在本地 admin；`raft.db` 路径必须全新/空。
+2. `oss-server raft-force-recover --config survivor/oss.toml --from export.json --node-id N --yes`
+   ——导入 11 表并在空日志上 `initialize({N})`；不会重置/覆盖既有 `raft_applied`，非空即拒绝。
+3. 以 `bootstrap=false` 启动该节点（身份校验会比对 `raft_bootstrap=0`，不再 initialize）；
+   其他站点恢复后按配对/learner 流程加入。
+4. 对象从备份/异地副本恢复；sync 桶对端恢复后跑 `sync-reconcile --repair`；stretch 两站点
+   数据都必须从备份恢复。未提交写会丢失。
+5. 单点永久丢失：**C 丢失** → A+B 仍 quorum 2，部署新 witness（新 node_id = 当前最大 + 1）
+   加 learner 追平后替换；**B 永久丢失且有 sync 桶** → A+C 仍 quorum 2，复用旧 B 的 site
+   UUID/token、新 Raft node_id 部署 B'，`sync-reconcile --repair` 完成前不得标可服务
+   （有 sync 桶时 `DELETE /sites` 应 409）；**A+B 同时丢失** → 按上述 force recovery。
 
 ### 部署与安全边界
 

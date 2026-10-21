@@ -37,6 +37,8 @@ pass() { PASSES=$((PASSES+1)); echo "  PASS: $*"; }
 fail() { FAILS=$((FAILS+1)); echo "FAIL: $*"; }
 # 功能未接线 → skip；STRICT 下视为失败
 skip() { if [ "$STRICT" = "1" ]; then fail "STRICT: $*"; else SKIPS=$((SKIPS+1)); echo "SKIP: $*"; fi; }
+# 模式互斥导致的预期跳过（sync vs stretch）：strict 下不算失败。
+skip_expected() { SKIPS=$((SKIPS+1)); echo "SKIP(expected): $*"; }
 ck() { local m="$*"; if "$@"; then pass "$m"; else fail "$m"; fi; }
 ck_q() { local m="$*"; if "$@" >/dev/null 2>&1; then pass "$m"; else fail "$m"; fi; }  # 静默成功的写命令
 is2xx_file() { case "$(cat "$1" 2>/dev/null)" in 2??) return 0 ;; *) return 1 ;; esac; }
@@ -435,7 +437,7 @@ print(next((str(u.get("id")) for u in d if u.get("username")==sys.argv[1]),""))'
 fi
 
 if [ "$MODE" = stretch ]; then
-  skip "步骤 3：sync 桶未跑——sync 与 stretch 互斥（计划 v3 N4）；用默认模式运行"
+  skip_expected "步骤 3：sync 桶未跑——sync 与 stretch 互斥（计划 v3 N4）；用默认模式运行"
 elif [ "$CAP_SYNC" != true ] || [ "$CAP_RAFT" != true ]; then
   skip "步骤 3：sync 桶 remote-first——capabilities.sync=$CAP_SYNC raft=$CAP_RAFT（sync 需要 Raft 控制面）"
 else
@@ -505,7 +507,7 @@ else
 fi
 
 if [ "$MODE" != stretch ]; then
-  skip "步骤 4：Stretch 2×6 未启用——用 M9_STRETCH=1 运行（sync 与 stretch 互斥，同一集群不可同时启用）"
+  skip_expected "步骤 4：Stretch 2×6 未启用——用 M9_STRETCH=1 运行（sync 与 stretch 互斥，同一集群不可同时启用）"
 elif [ "$CAP_STRETCH" != true ]; then
   skip "步骤 4：Stretch EC——capabilities.stretch=false（数据面未接线）"
 else
