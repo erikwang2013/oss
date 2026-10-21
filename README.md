@@ -1273,7 +1273,8 @@ M9 强一致端到端（自动起 A/B 数据站点 + witness C，端口/目录�
 ```bash
 cargo build -p oss-server && tests/e2e_m9.sh              # 默认 sync 模式（估算 3–6 分钟）
 M9_STRETCH=1 tests/e2e_m9.sh                              # Stretch EC 2×6 模式（估算 3–6 分钟）
-# OSS_BIN=target/debug/oss-server 可指定二进制；M9_STRICT=1 把 SKIP 升级为 FAIL（功能齐备后 CI 用）。
+# OSS_BIN=target/debug/oss-server 可指定二进制；M9_STRICT=1 除模式互斥的预期 SKIP 外，
+# 任何 SKIP 升级为 FAIL（功能齐备后 CI 用）。
 ```
 
 功能门控：脚本读 `GET /api/v1/raft/status` 的 `capabilities.{raft,sync,stretch}` 决定跑哪些段；
@@ -1283,7 +1284,8 @@ capabilities：`capabilities.raft=true` 时 `enabled` 必须为 true，否则 FA
 stretch 按计划 v3 **互斥**（同一集群不可同时启用），默认跑步骤 1/2/3/5，`M9_STRETCH=1`
 跑 1/2/4/5（步骤 3 显式 SKIP）。独立的 `tests/e2e_stretch.sh` 已落地，直接用真实两站点
 验证 S4 数据面（不依赖 witness C）；`tests/e2e_m9.sh` 的 stretch 段仍按 capability 门控，
-未接线时 SKIP。功能齐备后的验收请加 `M9_STRICT=1`，跳过即失败。
+未接线时 SKIP。功能齐备后的验收请加 `M9_STRICT=1`：除 sync/stretch 模式互斥的预期
+SKIP 外，任何 SKIP 都按 FAIL 处理（`skip_expected` 不计失败）。
 
 ## 参考文档
 

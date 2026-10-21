@@ -12,7 +12,8 @@
 #       之一保留；本脚本 M9_STRETCH=1 是复用 A/B/C 的 S9 集成变体，不是它的 wrapper。
 # 功能门控：未接线的构建按 raft status（/api/v1/raft/status 或 /api/v1/site/raft/status）的
 #       capabilities.raft/sync/stretch 自动跳过对应步骤并打印原因。仅当 A/B **都**因配置解析
-#       被拒才 SKIP；其它启动失败（端口/panic/权限）按回归 FAIL。M9_STRICT=1 时跳过升级为 FAIL
+#       被拒才 SKIP；其它启动失败（端口/panic/权限）按回归 FAIL。M9_STRICT=1 时除模式互斥的
+#       预期 SKIP 外，跳过升级为 FAIL
 #       （功能齐备后 CI 用）。
 # S3 覆盖补充：步骤 3 已含版本删/marker 同 id/DeleteObjects 503/outbox=0；DeleteBucket
 #       quiesce/非空回滚、生命周期 Expiration remote-first 由 crates/oss-server/tests/sync_gate.rs
