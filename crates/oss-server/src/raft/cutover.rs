@@ -2,34 +2,18 @@
 //!
 //! 所有写路径只经 `data::install_tx`（与快照安装同一映射），不编辑/复用旧 `raft.db`。
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+mod export;
+mod recover;
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+pub use export::{
+    EXPORT_FORMAT, EXPORT_KIND, ExportFile, build_export, read_export, verify_export, write_export,
+};
+pub use recover::{ForceRecoverReport, force_recover};
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::data::{self, ControlData, InstallCtx};
-use super::store::SqliteLogStore;
-use super::{RaftHandle, RaftSettings};
 use crate::db::Db;
-
-pub const EXPORT_FORMAT: u32 = 1;
-pub const EXPORT_KIND: &str = "oss-raft-control-export";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportFile {
-    pub format: u32,
-    pub kind: String,
-    pub source_site: String,
-    pub source_node_id: Option<u64>,
-    pub source_role: String,
-    pub version: String,
-    pub admin_username: Option<String>,
-    pub has_vault: Option<bool>,
-    pub exported_at: i64,
-    pub sha256: String,
-    pub data: ControlData,
-}
 
 #[derive(Debug, Clone)]
 pub struct TargetFacts {
@@ -49,7 +33,7 @@ pub struct CutoverOptions {
 pub struct Diff {
     pub table: &'static str,
     pub key: String,
-    pub field: &'static str,
+    pub field: String,
     pub source: Option<String>,
     pub target: Option<String>,
 }
@@ -83,112 +67,71 @@ impl std::fmt::Display for CutoverError {
 
 impl std::error::Error for CutoverError {}
 
-#[derive(Debug, Clone)]
-pub struct ForceRecoverReport {
-    pub node_id: u64,
-    pub voters: Vec<u64>,
-    pub raft_db: PathBuf,
-}
-
-/// 读取 11 张复制表并生成带校验和的导出文件（只读；不重放 schema/模式）。
-pub async fn build_export(
-    db: &Db,
-    source_site: String,
-    source_node_id: Option<u64>,
-    source_role: &str,
-    admin_username: Option<String>,
-    has_vault: Option<bool>,
-) -> Result<ExportFile, String> {
-    // 在线导出也必须在一个读事务里完成，避免并发控制写把 11 表导出成撕裂组合。
-    let mut tx = db.pool().begin().await.map_err(|e| format!("begin: {e}"))?;
-    let data = data::read_tx(&mut tx)
-        .await
-        .map_err(|e| format!("read control data: {e}"))?;
-    tx.commit().await.map_err(|e| format!("commit: {e}"))?;
-    let payload = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
-    let sha256 = hex::encode(Sha256::digest(&payload));
-    Ok(ExportFile {
-        format: EXPORT_FORMAT,
-        kind: EXPORT_KIND.to_string(),
-        source_site,
-        source_node_id,
-        source_role: source_role.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        admin_username,
-        has_vault,
-        exported_at: crate::db::now(),
-        sha256,
-        data,
-    })
-}
-
-pub fn verify_export(export: &ExportFile) -> Result<(), String> {
-    if export.format != EXPORT_FORMAT || export.kind != EXPORT_KIND {
-        return Err(format!(
-            "unsupported export format/kind: {}/{}",
-            export.format, export.kind
-        ));
-    }
-    let payload = serde_json::to_vec(&export.data).map_err(|e| e.to_string())?;
-    let want = hex::encode(Sha256::digest(&payload));
-    if want != export.sha256 {
-        return Err("export checksum mismatch".into());
-    }
-    Ok(())
-}
-
-pub fn write_export(path: &Path, export: &ExportFile) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(export)?;
-    std::fs::write(path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-pub fn read_export(path: &Path) -> Result<ExportFile, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let export: ExportFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse export: {e}"))?;
-    verify_export(&export)?;
-    Ok(export)
-}
-
-fn keyed<T, F>(rows: &[T], f: F) -> BTreeMap<String, String>
-where
-    T: Serialize,
-    F: Fn(&T) -> String,
-{
+fn keyed<T: serde::Serialize, F: Fn(&T) -> String>(
+    rows: &[T],
+    f: F,
+) -> BTreeMap<String, serde_json::Value> {
     rows.iter()
         .map(|r| {
             (
                 f(r),
-                serde_json::to_string(r).unwrap_or_else(|_| "<unserializable>".into()),
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
             )
         })
         .collect()
 }
 
+/// 同一主键的两行逐字段比较（字段名按字典序，保证报告稳定）；非对象行退回整行。
+fn diff_row(
+    table: &'static str,
+    key: &str,
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+) -> Vec<Diff> {
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return vec![Diff {
+            table,
+            key: key.to_string(),
+            field: "row".into(),
+            source: Some(a.to_string()),
+            target: Some(b.to_string()),
+        }];
+    };
+    let fields: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    let mut out = Vec::new();
+    for f in fields {
+        let (va, vb) = (a.get(f), b.get(f));
+        if va != vb {
+            out.push(Diff {
+                table,
+                key: key.to_string(),
+                field: f.clone(),
+                source: va.map(|v| v.to_string()),
+                target: vb.map(|v| v.to_string()),
+            });
+        }
+    }
+    out
+}
+
 fn diff_table<T, F>(table: &'static str, src: &[T], dst: &[T], f: F, out: &mut Vec<Diff>)
 where
-    T: Serialize,
+    T: serde::Serialize,
     F: Fn(&T) -> String,
 {
     let a = keyed(src, &f);
     let b = keyed(dst, &f);
     let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
     for k in keys {
-        let (sa, sb) = (a.get(k), b.get(k));
-        if sa != sb {
-            out.push(Diff {
+        match (a.get(k), b.get(k)) {
+            (Some(va), Some(vb)) => out.extend(diff_row(table, k, va, vb)),
+            (sa, sb) => out.push(Diff {
                 table,
                 key: k.clone(),
-                field: "row",
-                source: sa.cloned(),
-                target: sb.cloned(),
-            });
+                field: "row".into(),
+                source: sa.map(|v| v.to_string()),
+                target: sb.map(|v| v.to_string()),
+            }),
         }
     }
 }
@@ -433,143 +376,4 @@ pub async fn cutover(
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
     Ok(report)
-}
-
-/// force recovery：仅接受全新 `raft.db` + 已导出业务表；初始化单节点 `{N}` 后退出。
-pub async fn force_recover(
-    db: &Db,
-    raft_db_path: &Path,
-    settings: &RaftSettings,
-    export: &ExportFile,
-    new_node_id: u64,
-) -> Result<ForceRecoverReport, String> {
-    verify_export(export)?;
-    if export.source_role == "witness" {
-        return Err(
-            "witness force recovery is not implemented; rebuild the witness as a fresh learner"
-                .into(),
-        );
-    }
-    if new_node_id == 0 {
-        return Err("new node id must be > 0".into());
-    }
-    if raft_db_path.exists() {
-        let logs = SqliteLogStore::open(raft_db_path)
-            .await
-            .map_err(|e| format!("open raft log: {e}"))?;
-        if logs.has_logs().await.map_err(|e| e.to_string())? {
-            return Err(format!(
-                "raft log already has entries: {}; refusing to edit an old log",
-                raft_db_path.display()
-            ));
-        }
-        drop(logs);
-    }
-    if db
-        .schema_meta("raft_mode")
-        .await
-        .map_err(|e| e.to_string())?
-        .as_deref()
-        != Some("on")
-    {
-        return Err("control DB is not in raft mode; run raft-cutover first".into());
-    }
-    let applied_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM raft_applied WHERE applied_log_id IS NOT NULL")
-            .fetch_one(db.pool())
-            .await
-            .map_err(|e| e.to_string())?;
-    let has_snapshot_table: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'raft_snapshot'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .map_err(|e| e.to_string())?;
-    let snapshot_count: i64 = if has_snapshot_table > 0 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM raft_snapshot")
-            .fetch_one(db.pool())
-            .await
-            .map_err(|e| e.to_string())?
-    } else {
-        0
-    };
-    if applied_count != 0 || snapshot_count != 0 {
-        return Err("control DB already has applied raft state; refusing to merge".into());
-    }
-    let admin_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-            .fetch_optional(db.pool())
-            .await
-            .map_err(|e| e.to_string())?;
-    if admin_id.is_none() {
-        return Err("no local admin user; bootstrap an admin before recovery".into());
-    }
-    let mut tx = db.pool().begin().await.map_err(|e| e.to_string())?;
-    sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    data::install_tx(
-        &mut tx,
-        &export.data,
-        &InstallCtx {
-            admin_id,
-            witness: false,
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    tx.commit().await.map_err(|e| e.to_string())?;
-
-    let mut settings = settings.clone();
-    settings.node_id = new_node_id;
-    settings.bootstrap = true;
-    settings.db_path = raft_db_path.to_path_buf();
-    let handle: RaftHandle = super::spawn_with_control(settings, Some(db.pool().clone()), None)
-        .await
-        .map_err(|e| format!("initialize recovered node: {e}"))?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let voters = loop {
-        let v = super::membership::view(&handle);
-        if v.voters == vec![new_node_id] {
-            break v.voters;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("recovered membership did not converge to {N}".into());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
-    handle.shutdown().await;
-    db.schema_meta_set("raft_node_id", &new_node_id.to_string())
-        .await
-        .map_err(|e| e.to_string())?;
-    // 身份编码只认 "1"/"0"（raft/identity.rs）；写 "false" 会让下次启动被拒。
-    db.schema_meta_set("raft_bootstrap", "0")
-        .await
-        .map_err(|e| e.to_string())?;
-    db.schema_meta_set("raft_initialized", "1")
-        .await
-        .map_err(|e| e.to_string())?;
-    let marker = serde_json::json!({
-        "new_node_id": new_node_id,
-        "source_site": export.source_site,
-        "source_role": export.source_role,
-        "exported_at": export.exported_at,
-        "recovered_at": crate::db::now(),
-    });
-    db.schema_meta_set(
-        "raft_force_recover",
-        &serde_json::to_string(&marker).map_err(|e| e.to_string())?,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(ForceRecoverReport {
-        node_id: new_node_id,
-        voters,
-        raft_db: raft_db_path.to_path_buf(),
-    })
 }
