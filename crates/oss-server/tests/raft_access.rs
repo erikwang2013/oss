@@ -631,6 +631,9 @@ async fn status_reports_real_raft_state_and_ready_flags() {
     // 本测试只有 [raft] 无 [stretch]：能力位按实际配置为 false（与 /api/v1/site 同口径）。
     assert_eq!(v["capabilities"]["stretch"], false);
     let _ = STRETCH_READY;
+    // leader 已应用全部本地日志：lag=0、stale=false。
+    assert_eq!(v["lag"], 0);
+    assert_eq!(v["stale"], false);
 
     // M7/Local（无 [raft]）：S0 骨架，能力位全 false（与 /api/v1/site 同口径）。
     let m7dir = tempfile::tempdir().unwrap();
@@ -648,6 +651,72 @@ async fn status_reports_real_raft_state_and_ready_flags() {
     assert_eq!(v["capabilities"]["raft"], false);
     assert_eq!(v["capabilities"]["sync"], false);
     assert_eq!(v["capabilities"]["stretch"], false);
+}
+
+/// post-release 观测：/metrics 暴露 raft/sync/stretch 新指标，leader 变更计数随选举前进。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_exposes_raft_sync_and_stretch_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = raft_state(dir.path()).await;
+    st.db.create_user(ADMIN, ADMIN_PW, true).await.unwrap();
+    wait_leader(&st).await;
+    let base = serve(build_router(st.clone()).unwrap()).await;
+
+    let value = |body: &str, name: &str| {
+        body.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse::<u64>().ok())
+    };
+    // leader_changes 由后台采样任务累加，与选举完成有时序差：轮询等它 >= 1。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = client()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if value(&body, "oss_raft_leader_changes_total").is_some_and(|n| n >= 1) {
+            break body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader_changes 未累加:\n{body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    for name in [
+        "oss_raft_leader_changes_total",
+        "oss_raft_apply_errors_total",
+        "oss_raft_forward_total",
+        "oss_raft_snapshot_bytes",
+        "oss_sync_acked_total",
+        "oss_sync_failed_total",
+        "oss_sync_write_intent_recovered_total",
+        "oss_sync_delete_partial_total",
+        "oss_sync_delete_recovered_total",
+        "oss_sync_ambiguous_total",
+        "oss_stretch_slots_ok",
+    ] {
+        assert!(
+            body.contains(&format!("# TYPE {name}")),
+            "{name} 缺 TYPE：{body}"
+        );
+    }
+    // 单节点：无转发/apply 失败/快照；sync 尚无写；无 [stretch] → 0。
+    assert_eq!(value(&body, "oss_raft_apply_errors_total"), Some(0));
+    assert_eq!(value(&body, "oss_raft_forward_total"), Some(0));
+    assert_eq!(value(&body, "oss_raft_snapshot_bytes"), Some(0));
+    assert_eq!(value(&body, "oss_sync_acked_total"), Some(0));
+    assert_eq!(value(&body, "oss_sync_failed_total"), Some(0));
+    assert_eq!(
+        value(&body, "oss_sync_write_intent_recovered_total"),
+        Some(0)
+    );
+    assert_eq!(value(&body, "oss_stretch_slots_ok"), Some(0));
+    st.raft.as_ref().unwrap().shutdown().await;
 }
 
 /// READY 翻转前的 503 与翻转后的单命令建桶用同一用例覆盖：断言跟着常量走。

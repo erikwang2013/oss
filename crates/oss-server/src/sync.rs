@@ -57,6 +57,29 @@ struct Cached {
     state: BucketState,
 }
 
+/// `/metrics` 的 sync 提交门计数（AppState 与门共享一份 `Arc`）。
+#[derive(Debug, Default)]
+pub struct SyncMetrics {
+    acked: AtomicU64,
+    /// 门（`before_commit`）返回错误的次数，含前置校验失败。
+    failed: AtomicU64,
+    write_intent_recovered: AtomicU64,
+}
+
+impl SyncMetrics {
+    pub fn acked_total(&self) -> u64 {
+        self.acked.load(Ordering::Relaxed)
+    }
+
+    pub fn failed_total(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    pub fn write_intent_recovered_total(&self) -> u64 {
+        self.write_intent_recovered.load(Ordering::Relaxed)
+    }
+}
+
 /// 站点 sync 门：`buckets.replication_mode='sync'` 的写必须远端先确认。
 pub struct SiteSyncGate {
     db: Arc<Db>,
@@ -65,6 +88,7 @@ pub struct SiteSyncGate {
     /// `[site]` 已配置（未配置时 sync 写不可用——残留 sites 行不足以授权远端写）。
     site_enabled: bool,
     cache: Mutex<HashMap<String, Cached>>,
+    metrics: Arc<SyncMetrics>,
 }
 
 impl std::fmt::Debug for SiteSyncGate {
@@ -84,7 +108,14 @@ impl SiteSyncGate {
             max_bytes,
             site_enabled,
             cache: Mutex::new(HashMap::new()),
+            metrics: Arc::new(SyncMetrics::default()),
         }
+    }
+
+    /// 与 `AppState` 共享 `/metrics` 计数（默认独立一份，测试/恢复用）。
+    pub fn with_metrics(mut self, metrics: Arc<SyncMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     async fn state(&self, bucket: &str) -> Result<BucketState, GateError> {
@@ -314,6 +345,12 @@ pub async fn recover_write_intents(state: &AppState) {
             }
         }
     }
+    if cleaned > 0 {
+        state
+            .sync_metrics
+            .write_intent_recovered
+            .fetch_add(cleaned as u64, Ordering::Relaxed);
+    }
     tracing::info!(cleaned, kept, "sync intent 恢复完成");
 }
 
@@ -352,68 +389,77 @@ impl PutCommitGate for SiteSyncGate {
     }
 
     async fn before_commit(&self, req: GateRequest<'_>) -> Result<GateTicket, GateError> {
-        if !self.site_enabled {
-            return Err(GateError::Unavailable(
-                "[site] not configured: sync writes unavailable".into(),
-            ));
-        }
-        if req.size > self.max_bytes {
-            return Err(GateError::TooLarge);
-        }
-        let peer = self.peer().await?;
-        let client = Self::client(&peer)?;
-        let body = tokio::fs::read(req.plaintext).await.map_err(|e| {
-            GateError::Internal(format!("read tee {}: {e}", req.plaintext.display()))
-        })?;
-        if body.len() as u64 != req.size {
-            return Err(GateError::Internal(format!(
-                "tee size mismatch: {} != {}",
-                body.len(),
-                req.size
-            )));
-        }
-        // 远端调用之前落 intent：此处返回 Err 时行保留，恢复会删远端可能的同 id 版本。
-        self.intent_begin(&req).await?;
-        let call = client.put_object_with_meta(
-            "site",
-            req.bucket,
-            req.key,
-            Bytes::from(body),
-            req.etag,
-            req.content_type,
-            req.user_metadata,
-            req.tags,
-            req.storage_class,
-            req.checksum,
-            true, // require_version：远端 versioning 必须已 Enabled
-            Some(&peer.peer_site_token),
-            Some(req.local_version_id),
-        );
-        let remote = tokio::time::timeout(self.timeout, call)
-            .await
-            .map_err(|_| GateError::Unavailable("remote ack timeout".into()))?
-            .map_err(remote_gate_error)?
-            .ok_or_else(|| GateError::Unavailable("remote returned no version id".into()))?;
-        if remote != req.local_version_id {
-            // 双站同 id 的硬契约破坏：502。恢复只按本地 id 补偿，远端异 id 版本无法自动定位；
-            // 记下远端 id 供 S3 sync-reconcile 修复（intent 保留不删）。
-            tracing::error!(
-                bucket = req.bucket, key = req.key,
-                local = req.local_version_id, remote = %remote,
-                "sync version id mismatch：远端异 id 版本需 repair"
+        let result: Result<_, GateError> = async {
+            if !self.site_enabled {
+                return Err(GateError::Unavailable(
+                    "[site] not configured: sync writes unavailable".into(),
+                ));
+            }
+            if req.size > self.max_bytes {
+                return Err(GateError::TooLarge);
+            }
+            let peer = self.peer().await?;
+            let client = Self::client(&peer)?;
+            let body = tokio::fs::read(req.plaintext).await.map_err(|e| {
+                GateError::Internal(format!("read tee {}: {e}", req.plaintext.display()))
+            })?;
+            if body.len() as u64 != req.size {
+                return Err(GateError::Internal(format!(
+                    "tee size mismatch: {} != {}",
+                    body.len(),
+                    req.size
+                )));
+            }
+            // 远端调用之前落 intent：此处返回 Err 时行保留，恢复会删远端可能的同 id 版本。
+            self.intent_begin(&req).await?;
+            let call = client.put_object_with_meta(
+                "site",
+                req.bucket,
+                req.key,
+                Bytes::from(body),
+                req.etag,
+                req.content_type,
+                req.user_metadata,
+                req.tags,
+                req.storage_class,
+                req.checksum,
+                true, // require_version：远端 versioning 必须已 Enabled
+                Some(&peer.peer_site_token),
+                Some(req.local_version_id),
             );
-            return Err(GateError::VersionMismatch(format!(
-                "sync version id mismatch: local {}, remote {remote}",
-                req.local_version_id
-            )));
+            let remote = tokio::time::timeout(self.timeout, call)
+                .await
+                .map_err(|_| GateError::Unavailable("remote ack timeout".into()))?
+                .map_err(remote_gate_error)?
+                .ok_or_else(|| GateError::Unavailable("remote returned no version id".into()))?;
+            if remote != req.local_version_id {
+                // 双站同 id 的硬契约破坏：502。恢复只按本地 id 补偿，远端异 id 版本无法自动定位；
+                // 记下远端 id 供 S3 sync-reconcile 修复（intent 保留不删）。
+                tracing::error!(
+                    bucket = req.bucket, key = req.key,
+                    local = req.local_version_id, remote = %remote,
+                    "sync version id mismatch：远端异 id 版本需 repair"
+                );
+                return Err(GateError::VersionMismatch(format!(
+                    "sync version id mismatch: local {}, remote {remote}",
+                    req.local_version_id
+                )));
+            }
+            self.intent_done(req.local_version_id).await;
+            Ok(GateTicket {
+                remote_version_id: Some(remote),
+                bucket: req.bucket.to_string(),
+                key: req.key.to_string(),
+                local_version_id: req.local_version_id.to_string(),
+            })
         }
-        self.intent_done(req.local_version_id).await;
-        Ok(GateTicket {
-            remote_version_id: Some(remote),
-            bucket: req.bucket.to_string(),
-            key: req.key.to_string(),
-            local_version_id: req.local_version_id.to_string(),
-        })
+        .await;
+        if result.is_ok() {
+            self.metrics.acked.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     async fn abort(&self, ticket: &GateTicket) {

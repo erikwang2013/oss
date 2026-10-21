@@ -2,6 +2,10 @@
 //!
 //! `production_ready` 按计划 §2.6：少于 3 个 voter 只允许开发/测试，状态里显式标 false。
 //! S7.1：`role` 是配置角色（voter/witness），运行态在 `state`；另报成员/leader 地址。
+//!
+//! `lag` = `last_log_index - last_applied.index`（无值按 0）；`stale` = 本节点非 leader
+//! 且 `lag > 0`。follower 的读是本机已 apply 状态，**不是**线性一致读：`stale=true` 只表示
+//! 至少晚于 leader 一条已提交日志，读到的旧值仍需业务侧按版本/条件判断。
 
 use serde_json::{Value, json};
 
@@ -24,6 +28,11 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         .map(|(id, n)| (id.to_string(), Value::String(n.addr.clone())))
         .collect();
     let state = format!("{:?}", m.state).to_lowercase();
+    let is_leader = m.current_leader == Some(m.id);
+    let lag = m
+        .last_log_index
+        .unwrap_or(0)
+        .saturating_sub(m.last_applied.as_ref().map(|l| l.index).unwrap_or(0));
     let leader_endpoint = m
         .current_leader
         .and_then(|l| membership.get_node(&l).map(|n| n.addr.clone()));
@@ -42,6 +51,9 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         "term": m.current_term,
         "state": state,
         "applied": m.last_applied.as_ref().map(log_id_json),
+        // follower 读 = 本机 applied 状态（非线性一致）；stale 只标记「落后 > 0」。
+        "lag": lag,
+        "stale": !is_leader && lag > 0,
         "snapshot": m.snapshot.as_ref().map(log_id_json),
         "purged": m.purged.as_ref().map(log_id_json),
         "voters": voters,

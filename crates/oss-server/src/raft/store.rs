@@ -15,6 +15,7 @@ use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::entry::RaftPayload;
@@ -31,6 +32,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::apply;
 use super::data::{self, ControlData, InstallCtx};
+use super::metrics::Metrics;
 use super::{ControlResponse, TypeConfig};
 
 /// 日志/元数据 + 基座状态机表。`raft_applied`/`raft_apply_ctx` 与 `0004_m9.sql` 同名同构。
@@ -395,6 +397,8 @@ pub struct SqliteStateMachine {
     witness: bool,
     /// 安装提交后通知缓存/目录对账任务（S7.2）。
     install_notify: Option<tokio::sync::watch::Sender<u64>>,
+    /// 与 [`super::RaftHandle`] 共享的观测计数（apply 失败在此累加）。
+    counters: Arc<Metrics>,
 }
 
 impl SqliteStateMachine {
@@ -440,7 +444,13 @@ impl SqliteStateMachine {
             control,
             witness,
             install_notify,
+            counters: Arc::new(Metrics::default()),
         }
+    }
+
+    /// 与 [`super::RaftHandle`] 共享的观测计数（apply 失败在此累加）。
+    pub fn counters(&self) -> &Arc<Metrics> {
+        &self.counters
     }
 
     /// 已应用 LogId 与成员（`RaftStateMachine::applied_state` 的固有版本，测试/S6 用）。
@@ -617,6 +627,19 @@ impl SqliteStateMachine {
             .map(|_| ())
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))
     }
+
+    /// 已落库快照的字节数（无快照/读失败 = 0；gauge 只读，不因查询失败给 /metrics 报错）。
+    pub async fn snapshot_bytes(&self) -> u64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(length(data), 0) FROM raft_snapshot WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .max(0) as u64
+    }
 }
 
 impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
@@ -633,69 +656,79 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let entries: Vec<_> = entries.into_iter().collect();
-        // 成员是跨 entry 状态（空白/成员日志也要落），applied 每条即本 entry。
-        let (_, mut last_membership) = self.applied().await?;
-        let mut responses = Vec::with_capacity(entries.len());
-        // 每条 entry 一个事务：控制表写入 + raft_applied + ctx 原子提交。
-        // 失败只回滚当前条（fail-stop 后 openraft 不再前进），已提交条目的响应不重复。
-        for entry in &entries {
-            let log_id = entry.log_id;
-            if let Some(m) = entry.get_membership() {
-                last_membership = StoredMembership::new(Some(log_id), m.clone());
-            }
-
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-            // 守卫放行窗口：与数据/raft_applied 同一事务；提交前复位。
-            sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-            let (response, has_effects) = match &entry.payload {
-                EntryPayload::Normal(cmd) => {
-                    let applied = {
-                        let mut cw = apply::control_tx(&mut tx);
-                        apply::apply_command(&mut cw, cmd).await.map_err(|e| {
-                            storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
-                        })?
-                    };
-                    (applied.response, !applied.effects.is_empty())
+        // 计数口径：一次 apply 批失败 +1（openraft 随后 fail-stop，不会重试同一批）。
+        let result: Result<_, StorageError<u64>> = async {
+            let entries: Vec<_> = entries.into_iter().collect();
+            // 成员是跨 entry 状态（空白/成员日志也要落），applied 每条即本 entry。
+            let (_, mut last_membership) = self.applied().await?;
+            let mut responses = Vec::with_capacity(entries.len());
+            // 每条 entry 一个事务：控制表写入 + raft_applied + ctx 原子提交。
+            // 失败只回滚当前条（fail-stop 后 openraft 不再前进），已提交条目的响应不重复。
+            for entry in &entries {
+                let log_id = entry.log_id;
+                if let Some(m) = entry.get_membership() {
+                    last_membership = StoredMembership::new(Some(log_id), m.clone());
                 }
-                EntryPayload::Blank | EntryPayload::Membership(_) => (ControlResponse::Ok, false),
-            };
-            let applied_json = encode(ErrorSubject::StateMachine, ErrorVerb::Write, &Some(log_id))?;
-            let membership_json = encode(
-                ErrorSubject::StateMachine,
-                ErrorVerb::Write,
-                &last_membership,
-            )?;
-            sqlx::query(
-                "INSERT OR REPLACE INTO raft_applied (id, applied_log_id, membership_json) VALUES (1, ?, ?)",
-            )
-            .bind(applied_json)
-            .bind(membership_json)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-            sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                // 守卫放行窗口：与数据/raft_applied 同一事务；提交前复位。
+                sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                let (response, has_effects) = match &entry.payload {
+                    EntryPayload::Normal(cmd) => {
+                        let applied = {
+                            let mut cw = apply::control_tx(&mut tx);
+                            apply::apply_command(&mut cw, cmd).await.map_err(|e| {
+                                storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
+                            })?
+                        };
+                        (applied.response, !applied.effects.is_empty())
+                    }
+                    EntryPayload::Blank | EntryPayload::Membership(_) => (ControlResponse::Ok, false),
+                };
+                let applied_json = encode(ErrorSubject::StateMachine, ErrorVerb::Write, &Some(log_id))?;
+                let membership_json = encode(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    &last_membership,
+                )?;
+                sqlx::query(
+                    "INSERT OR REPLACE INTO raft_applied (id, applied_log_id, membership_json) VALUES (1, ?, ?)",
+                )
+                .bind(applied_json)
+                .bind(membership_json)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-            tx.commit()
-                .await
-                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-            // S7.2：followers 也执行 post-commit 副作用（桶目录/缓存）。旁路通知由
-            // state 的 watcher 做幂等全量对账（leader 上重复执行无害）。
-            if has_effects && let Some(tx) = &self.install_notify {
-                let _ = tx.send(log_id.index);
+                sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                // S7.2：followers 也执行 post-commit 副作用（桶目录/缓存）。旁路通知由
+                // state 的 watcher 做幂等全量对账（leader 上重复执行无害）。
+                if has_effects && let Some(tx) = &self.install_notify {
+                    let _ = tx.send(log_id.index);
+                }
+                responses.push(response);
             }
-            responses.push(response);
+            Ok(responses)
         }
-        Ok(responses)
+        .await;
+        if result.is_err() {
+            self.counters
+                .apply_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {

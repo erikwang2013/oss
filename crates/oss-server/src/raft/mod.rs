@@ -15,6 +15,7 @@ pub mod cutover;
 pub mod data;
 pub mod identity;
 pub mod membership;
+pub mod metrics;
 pub mod network;
 pub mod repair;
 pub mod routes;
@@ -25,6 +26,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::error::{ClientWriteError, RaftError};
@@ -158,6 +160,8 @@ pub struct RaftHandle {
     raft: Raft<TypeConfig>,
     settings: RaftSettings,
     state_machine: SqliteStateMachine,
+    /// 与状态机共享的观测计数（apply 错误由状态机累加）。
+    counters: Arc<metrics::Metrics>,
 }
 
 impl RaftHandle {
@@ -175,6 +179,10 @@ impl RaftHandle {
 
     pub fn state_machine(&self) -> &SqliteStateMachine {
         &self.state_machine
+    }
+
+    pub fn counters(&self) -> &Arc<metrics::Metrics> {
+        &self.counters
     }
 
     /// 成员表是否已有 voter（`metrics().membership_config`；勿跨 `.await` 持借用）。
@@ -246,6 +254,7 @@ impl RaftHandle {
                 let Some(endpoint) = endpoint else {
                     return Err(WriteError::ForwardToLeader { leader, endpoint });
                 };
+                self.counters.forward_total.fetch_add(1, Ordering::Relaxed);
                 self.forward_write(&endpoint, leader, forward_copy, timeout)
                     .await
             }
@@ -387,6 +396,7 @@ pub async fn spawn_with_control(
         None => SqliteStateMachine::open(&settings.db_path, settings.snapshot_max_bytes).await?,
     };
 
+    let counters = Arc::clone(state_machine.counters());
     let network = network::HttpNetworkFactory::new(settings.cluster_token.clone());
     let raft = Raft::new(
         settings.node_id,
@@ -396,11 +406,27 @@ pub async fn spawn_with_control(
         state_machine.clone(),
     )
     .await?;
+    // leader 变更计数：watch 只保留最新值（合并的中间跳变不逐一计数）。
+    let mut watch = raft.metrics();
+    let mut last_leader = watch.borrow_and_update().current_leader;
+    let watch_counters = Arc::clone(&counters);
+    tokio::spawn(async move {
+        while watch.changed().await.is_ok() {
+            let leader = watch.borrow_and_update().current_leader;
+            if leader != last_leader {
+                watch_counters
+                    .leader_changes_total
+                    .fetch_add(1, Ordering::Relaxed);
+                last_leader = leader;
+            }
+        }
+    });
 
     let handle = RaftHandle {
         raft,
         settings,
         state_machine,
+        counters,
     };
     handle.bootstrap_if_needed(has_logs).await?;
     Ok(handle)

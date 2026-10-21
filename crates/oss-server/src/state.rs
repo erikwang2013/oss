@@ -32,6 +32,8 @@ pub struct AppState {
     pub repl_client: Arc<crate::repl_client::ReplClient>,
     /// M9 S3：共享删除服务（S3/生命周期/Batch/控制台统一入口；sync 桶远端优先）。
     pub sync_delete: Arc<crate::sync::SiteSyncDelete>,
+    /// M9 post-release：sync 提交门 `/metrics` 计数（与 `store` 内的门共享一份）。
+    pub sync_metrics: Arc<crate::sync::SyncMetrics>,
     /// M7：本站身份（`site_config` 单行，启动时读取；token 不下发给未授权面）
     pub site: Arc<crate::db::SiteIdentity>,
     /// M7：`[site]` 是否配置（唯一开关；无 `[site]` 不挂站点路由语义、不可配对）
@@ -302,12 +304,16 @@ impl AppState {
         db.assert_mode_guards().await?;
         let mut store_cfg = StoreConfig::new(&drives[0]);
         // M9 S1：sync 写提交门（必须在 Store::open 前注入——open 克隆配置）。
-        store_cfg.gate = Some(Arc::new(crate::sync::SiteSyncGate::new(
-            Arc::clone(&db),
-            std::time::Duration::from_millis(cfg.sync.timeout_ms),
-            cfg.sync.max_object_bytes,
-            cfg.site.is_some(),
-        )));
+        let sync_metrics = Arc::new(crate::sync::SyncMetrics::default());
+        store_cfg.gate = Some(Arc::new(
+            crate::sync::SiteSyncGate::new(
+                Arc::clone(&db),
+                std::time::Duration::from_millis(cfg.sync.timeout_ms),
+                cfg.sync.max_object_bytes,
+                cfg.site.is_some(),
+            )
+            .with_metrics(Arc::clone(&sync_metrics)),
+        ));
         store_cfg.sync_max_bytes = cfg.sync.max_object_bytes;
         store_cfg.drives = drives;
         store_cfg.ec = xl_store::store::ec::EcConfig {
@@ -624,8 +630,10 @@ impl AppState {
             }
         }
 
-        let state =
+        let mut state =
             Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, raft).await;
+        // 门在 `Store::open` 前已用同一份 Arc 构建；与构造时的默认计数对齐。
+        state.sync_metrics = sync_metrics;
         // S7.2：快照安装后按新控制表重建 AP/OLAP/同步门缓存与桶目录（仅数据站点）。
         if let Some(mut rx) = install_rx {
             let control = Arc::clone(&state.control);
@@ -878,6 +886,7 @@ impl AppState {
             repl_store,
             repl_client,
             sync_delete,
+            sync_metrics: Arc::new(crate::sync::SyncMetrics::default()),
             site,
             site_enabled,
             ap_cache,

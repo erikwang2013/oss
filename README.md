@@ -976,9 +976,11 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 **能力状态（2026-10-21，本分支）**：`crates/oss-server/src/raft/mod.rs` 的
 `RAFT_READY=true`、`SYNC_READY=true`、`STRETCH_READY=true` 决定运行时门控（能力位还要求
 对应配置存在）。`GET /api/v1/raft/status` 报真实状态（`enabled/node_id/role/leader/term/
-applied/snapshot/purged/voters/learners/production_ready`；`voters<3` 时
-`production_ready=false`）；`/api/v1/site/raft/*` 提供 append/vote/snapshot/status/
-membership/write/join。
+applied/lag/stale/snapshot/purged/voters/learners/production_ready`；`voters<3` 时
+`production_ready=false`）。`lag` = `last_log_index - last_applied.index`（无值按 0）；
+`stale` = 本节点非 leader 且 `lag>0`——follower 的读是本机已 apply 状态，**不是**线性一致
+读，`stale` 只提示可能读到落后至少一条已提交日志的旧值。`/api/v1/site/raft/*` 提供
+append/vote/snapshot/status/membership/write/join。
 
 - **已落地**：S0 模式矩阵/配置校验/能力开关；S1–S3 sync 数据面（统一 origin version id、
   写门与写 intent、MPU/Copy 边界、remote-first 删除、内部 token 路由、删桶 quiesce、删除

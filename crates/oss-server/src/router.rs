@@ -240,6 +240,17 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         "# HELP oss_slot_count 全局槽位数（单机 = 本机盘数）\n# TYPE oss_slot_count gauge\n",
     );
     out.push_str(&format!("oss_slot_count {slot_count}\n"));
+    // stretch 数据面信号：未配置 [stretch] 时为 0（本机可达槽数此时无 stretch 语义）。
+    let stretch_slots_ok = if state.cfg.stretch.is_some() {
+        local.slots.iter().filter(|(_, up)| *up).count()
+    } else {
+        0
+    };
+    out.push_str(
+        "# HELP oss_stretch_slots_ok 本机可达盘/槽数（stretch 数据面信号；未配置 [stretch] = 0）\n\
+         # TYPE oss_stretch_slots_ok gauge\n",
+    );
+    out.push_str(&format!("oss_stretch_slots_ok {stretch_slots_ok}\n"));
     out.push_str(
         "# HELP oss_sync_delete_partial_total DeleteObjects 远端失败整体 503 次数（部分键已提交）\n\
          # TYPE oss_sync_delete_partial_total counter\n",
@@ -263,6 +274,30 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
     out.push_str(&format!(
         "oss_sync_ambiguous_total {}\n",
         state.sync_delete.ambiguous_total()
+    ));
+    out.push_str(
+        "# HELP oss_sync_acked_total sync 写远端确认成功次数\n\
+         # TYPE oss_sync_acked_total counter\n",
+    );
+    out.push_str(&format!(
+        "oss_sync_acked_total {}\n",
+        state.sync_metrics.acked_total()
+    ));
+    out.push_str(
+        "# HELP oss_sync_failed_total sync 写提交门失败次数（含前置校验失败）\n\
+         # TYPE oss_sync_failed_total counter\n",
+    );
+    out.push_str(&format!(
+        "oss_sync_failed_total {}\n",
+        state.sync_metrics.failed_total()
+    ));
+    out.push_str(
+        "# HELP oss_sync_write_intent_recovered_total 恢复 worker 清理的写 intent 行数\n\
+         # TYPE oss_sync_write_intent_recovered_total counter\n",
+    );
+    out.push_str(&format!(
+        "oss_sync_write_intent_recovered_total {}\n",
+        state.sync_metrics.write_intent_recovered_total()
     ));
     if let Some(handle) = &state.raft {
         let (term, applied, voters, role) = {
@@ -299,6 +334,36 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         out.push_str(&format!(
             "oss_raft_production_ready {}\n",
             u8::from(voters >= 3)
+        ));
+        let counters = handle.counters();
+        out.push_str(
+            "# HELP oss_raft_leader_changes_total 控制面 leader 变更次数（含首次当选）\n\
+             # TYPE oss_raft_leader_changes_total counter\n",
+        );
+        out.push_str(&format!(
+            "oss_raft_leader_changes_total {}\n",
+            counters.leader_changes()
+        ));
+        out.push_str(
+            "# HELP oss_raft_apply_errors_total 状态机 apply 失败次数（fail-stop 前每批失败 +1）\n\
+             # TYPE oss_raft_apply_errors_total counter\n",
+        );
+        out.push_str(&format!(
+            "oss_raft_apply_errors_total {}\n",
+            counters.apply_errors()
+        ));
+        out.push_str(
+            "# HELP oss_raft_forward_total follower 转发到 leader 的控制写次数\n\
+             # TYPE oss_raft_forward_total counter\n",
+        );
+        out.push_str(&format!("oss_raft_forward_total {}\n", counters.forwards()));
+        out.push_str(
+            "# HELP oss_raft_snapshot_bytes 当前已落库快照字节数（无快照 = 0）\n\
+             # TYPE oss_raft_snapshot_bytes gauge\n",
+        );
+        out.push_str(&format!(
+            "oss_raft_snapshot_bytes {}\n",
+            handle.state_machine().snapshot_bytes().await
         ));
     }
     (
