@@ -28,6 +28,7 @@ async fn login(base: &str) -> String {
 
 fn site(name: &str, token_char: char) -> SiteToml {
     SiteToml {
+        id: None,
         name: Some(name.into()),
         region: "us-east-1".into(),
         priority: 10,

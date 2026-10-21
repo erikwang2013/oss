@@ -10,11 +10,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::state::AppState;
 
-/// 固定读当前目录的 `oss.toml`（与 M1 的既有行为一致，运维命令也没有别的配置来源）。
+/// 默认读当前目录的 `oss.toml`；`--config <path>` 可覆盖（离线/管理命令必须能换库）。
 pub const CONFIG_PATH: &str = "oss.toml";
 
 pub const USAGE: &str = "\
-用法：oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub|rebalance [--dry-run|--apply]]
+用法：oss-server [--config <path>] <命令> [选项]
 
   serve          启动服务（默认，无参数时同此）
   groups         建分组目录（幂等；不建就一定上传失败）
@@ -26,6 +26,19 @@ pub const USAGE: &str = "\
   rebalance [--dry-run|--apply]
                  扩容搬迁（默认 dry-run）：把存量对象迁到展开放置（placement=v2；未开则空跑）；
                  逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
+  witness        启动 witness 控制面节点（读 --config 的 [raft]；无数据目录/S3 面）
+  raft-add-witness --node-id N --endpoint <advertise_url> [--replace OLD]
+                 通过本机 advertise_endpoint 的 HTTP 成员路由加 witness（不二次打开 raft.db）
+  raft-remove-node --node-id N
+                 同上，移除成员
+  raft-export [--out PATH] [--witness]
+                 导出复制子集（默认 stdout；--witness 读 [raft].state_db）
+  raft-cutover --from PATH [--peer-config PATH] [--dry-run] [--overwrite]
+                 以导出文件割接控制面（S7.5）
+  raft-force-recover --from PATH --node-id N --yes
+                 从导出文件重建 N 的单节点集群（S7.5）
+  sync-reconcile [--repair] [--bucket B] [--json]
+                 B′ 站点对账（S7.5）
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,6 +60,149 @@ pub enum Command {
     Rebalance {
         dry_run: bool,
     },
+    /// M9 S7.1：witness 控制面节点（独立运行时，不建 AppState）。
+    Witness,
+    /// M9 S7.1：经本机 Raft HTTP 路由加 witness（成员变更由 S7.3 实现）。
+    RaftAddWitness {
+        node_id: u64,
+        endpoint: String,
+        replace: Option<u64>,
+    },
+    RaftRemoveNode {
+        node_id: u64,
+    },
+    /// M9 S7.5（S7.1 只固定 CLI 形状）
+    RaftExport {
+        out: Option<std::path::PathBuf>,
+        witness: bool,
+    },
+    RaftCutover {
+        from: std::path::PathBuf,
+        peer_config: Option<std::path::PathBuf>,
+        dry_run: bool,
+        overwrite: bool,
+    },
+    RaftForceRecover {
+        from: std::path::PathBuf,
+        new_node_id: u64,
+        yes: bool,
+    },
+    SyncReconcile {
+        repair: bool,
+        bucket: Option<String>,
+        json: bool,
+    },
+}
+
+/// 取出 `--config <path>` / `--config=<path>`（恰好一次；缺省 `oss.toml`）。
+/// 其余参数原样返回给 [`parse_args`]。
+pub fn split_config(args: &[String]) -> Result<(std::path::PathBuf, Vec<String>), &'static str> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut cfg: Option<std::path::PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if a == "--config" {
+            i += 1;
+            args.get(i).ok_or(USAGE)?
+        } else if let Some(v) = a.strip_prefix("--config=") {
+            v
+        } else {
+            out.push(a.clone());
+            i += 1;
+            continue;
+        };
+        if value.is_empty() || cfg.is_some() {
+            return Err(USAGE);
+        }
+        cfg = Some(std::path::PathBuf::from(value));
+        i += 1;
+    }
+    Ok((
+        cfg.unwrap_or_else(|| std::path::PathBuf::from(CONFIG_PATH)),
+        out,
+    ))
+}
+
+/// 命令是否需要完整 `AppState::load`。离线/管理命令必须绕开（否则二次打开 raft.db）。
+pub fn needs_full_state(cmd: &Command) -> bool {
+    !matches!(
+        cmd,
+        Command::Witness
+            | Command::RaftAddWitness { .. }
+            | Command::RaftRemoveNode { .. }
+            | Command::RaftExport { .. }
+            | Command::RaftCutover { .. }
+            | Command::RaftForceRecover { .. }
+            | Command::SyncReconcile { .. }
+    )
+}
+
+/// 严格标志解析：`--name value` / `--name=value`，重复或未知 → 用法错误。
+fn parse_flags(
+    args: &[String],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> Result<
+    (
+        std::collections::BTreeMap<String, String>,
+        std::collections::BTreeSet<String>,
+    ),
+    &'static str,
+> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut flags = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if bool_flags.contains(&a.as_str()) {
+            if !flags.insert(a.clone()) {
+                return Err(USAGE);
+            }
+            i += 1;
+        } else if value_flags.contains(&a.as_str()) {
+            let v = args
+                .get(i + 1)
+                .filter(|v| !v.starts_with("--"))
+                .ok_or(USAGE)?;
+            if values.insert(a.clone(), v.clone()).is_some() {
+                return Err(USAGE);
+            }
+            i += 2;
+        } else if let Some((k, v)) = a.split_once('=') {
+            if v.is_empty() || !value_flags.contains(&k) {
+                return Err(USAGE);
+            }
+            if values.insert(k.to_string(), v.to_string()).is_some() {
+                return Err(USAGE);
+            }
+            i += 1;
+        } else {
+            return Err(USAGE);
+        }
+    }
+    Ok((values, flags))
+}
+
+fn req_u64(
+    values: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<u64, &'static str> {
+    values
+        .get(name)
+        .ok_or(USAGE)?
+        .parse::<u64>()
+        .map_err(|_| USAGE)
+}
+
+fn opt_u64(
+    values: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<Option<u64>, &'static str> {
+    values
+        .get(name)
+        .map(|v| v.parse::<u64>().map_err(|_| USAGE))
+        .transpose()
 }
 
 /// 解析子命令（入参为去掉 argv[0] 后的参数）。未知子命令或多余参数 → `Err(用法)`（调用方 exit 2）。
@@ -75,6 +231,63 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
         ("rebalance", []) => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--dry-run" => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--apply" => Ok(Command::Rebalance { dry_run: false }),
+        ("witness", []) => Ok(Command::Witness),
+        ("raft-add-witness", rest) => {
+            let (v, _) = parse_flags(rest, &["--node-id", "--endpoint", "--replace"], &[])?;
+            let node_id = req_u64(&v, "--node-id")?;
+            let endpoint = v
+                .get("--endpoint")
+                .filter(|e| e.starts_with("http://"))
+                .cloned()
+                .ok_or(USAGE)?;
+            Ok(Command::RaftAddWitness {
+                node_id,
+                endpoint,
+                replace: opt_u64(&v, "--replace")?,
+            })
+        }
+        ("raft-remove-node", rest) => {
+            let (v, _) = parse_flags(rest, &["--node-id"], &[])?;
+            Ok(Command::RaftRemoveNode {
+                node_id: req_u64(&v, "--node-id")?,
+            })
+        }
+        ("raft-export", rest) => {
+            let (v, flags) = parse_flags(rest, &["--out"], &["--witness"])?;
+            Ok(Command::RaftExport {
+                out: v.get("--out").map(std::path::PathBuf::from),
+                witness: flags.contains("--witness"),
+            })
+        }
+        ("raft-cutover", rest) => {
+            let (v, flags) = parse_flags(
+                rest,
+                &["--from", "--peer-config"],
+                &["--dry-run", "--overwrite"],
+            )?;
+            Ok(Command::RaftCutover {
+                from: v.get("--from").map(std::path::PathBuf::from).ok_or(USAGE)?,
+                peer_config: v.get("--peer-config").map(std::path::PathBuf::from),
+                dry_run: flags.contains("--dry-run"),
+                overwrite: flags.contains("--overwrite"),
+            })
+        }
+        ("raft-force-recover", rest) => {
+            let (v, flags) = parse_flags(rest, &["--from", "--node-id"], &["--yes"])?;
+            Ok(Command::RaftForceRecover {
+                from: v.get("--from").map(std::path::PathBuf::from).ok_or(USAGE)?,
+                new_node_id: req_u64(&v, "--node-id")?,
+                yes: flags.contains("--yes"),
+            })
+        }
+        ("sync-reconcile", rest) => {
+            let (v, flags) = parse_flags(rest, &["--bucket"], &["--repair", "--json"])?;
+            Ok(Command::SyncReconcile {
+                repair: flags.contains("--repair"),
+                bucket: v.get("--bucket").cloned(),
+                json: flags.contains("--json"),
+            })
+        }
         _ => Err(USAGE),
     }
 }
@@ -468,7 +681,85 @@ pub async fn run(
                 1
             })
         }
+        // main 只对 needs_full_state 的命令调用 run；离线命令误入是内部接线错误。
+        Command::Witness
+        | Command::RaftAddWitness { .. }
+        | Command::RaftRemoveNode { .. }
+        | Command::RaftExport { .. }
+        | Command::RaftCutover { .. }
+        | Command::RaftForceRecover { .. }
+        | Command::SyncReconcile { .. } => {
+            Err("内部错误：离线命令不得走 AppState::run（应走 run_offline）".into())
+        }
     }
+}
+
+/// 不经 `AppState::load` 的命令入口：witness 运行时与 HTTP 成员客户端。
+/// 关键：这些命令**不得**再构造第二个 `Raft`/打开同一 `raft.db`。
+pub async fn run_offline(
+    cmd: Command,
+    cfg_path: &std::path::Path,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    match cmd {
+        Command::Witness => crate::witness::run(cfg_path).await,
+        Command::RaftAddWitness {
+            node_id,
+            endpoint,
+            replace,
+        } => {
+            let cfg = crate::config::AppConfig::load(cfg_path)?;
+            let raft = cfg
+                .raft
+                .as_ref()
+                .ok_or("[raft] 未配置：无法定位本机 advertise_endpoint")?;
+            membership_rpc(
+                raft,
+                serde_json::json!({
+                    "action": "add",
+                    "node_id": node_id,
+                    "endpoint": endpoint,
+                    "replace": replace,
+                }),
+            )
+            .await
+        }
+        Command::RaftRemoveNode { node_id } => {
+            let cfg = crate::config::AppConfig::load(cfg_path)?;
+            let raft = cfg
+                .raft
+                .as_ref()
+                .ok_or("[raft] 未配置：无法定位本机 advertise_endpoint")?;
+            membership_rpc(
+                raft,
+                serde_json::json!({"action": "remove", "node_id": node_id}),
+            )
+            .await
+        }
+        other => Err(format!("{other:?} 尚未实现（S7.3/S7.5）").into()),
+    }
+}
+
+/// 向本机 `[raft].advertise_endpoint` 的成员路由发一次有界 HTTP 请求。
+async fn membership_rpc(
+    raft: &crate::config::RaftToml,
+    body: serde_json::Value,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!(
+        "{}/api/v1/site/raft/membership",
+        raft.advertise_endpoint.trim_end_matches('/')
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header(crate::raft::RPC_TOKEN_HEADER, &raft.cluster_token)
+        .timeout(Duration::from_secs(20))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("连接本机 Raft HTTP（{}）失败: {e}", raft.advertise_endpoint))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    println!("{text}");
+    Ok(if status.is_success() { 0 } else { 1 })
 }
 
 /// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；
@@ -535,6 +826,156 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_reads_offline_commands() {
+        assert_eq!(parse_args(&args(&["witness"])), Ok(Command::Witness));
+        assert_eq!(
+            parse_args(&args(&[
+                "raft-add-witness",
+                "--node-id",
+                "3",
+                "--endpoint",
+                "http://127.0.0.1:9000",
+            ])),
+            Ok(Command::RaftAddWitness {
+                node_id: 3,
+                endpoint: "http://127.0.0.1:9000".into(),
+                replace: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "raft-add-witness",
+                "--node-id=3",
+                "--endpoint=http://w:9",
+                "--replace=2",
+            ])),
+            Ok(Command::RaftAddWitness {
+                node_id: 3,
+                endpoint: "http://w:9".into(),
+                replace: Some(2),
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["raft-remove-node", "--node-id", "2"])),
+            Ok(Command::RaftRemoveNode { node_id: 2 })
+        );
+        assert_eq!(
+            parse_args(&args(&["raft-export", "--witness", "--out", "/x.json"])),
+            Ok(Command::RaftExport {
+                out: Some("/x.json".into()),
+                witness: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "raft-cutover",
+                "--from",
+                "/e.json",
+                "--peer-config=/b.toml",
+                "--dry-run",
+            ])),
+            Ok(Command::RaftCutover {
+                from: "/e.json".into(),
+                peer_config: Some("/b.toml".into()),
+                dry_run: true,
+                overwrite: false,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "raft-force-recover",
+                "--from",
+                "/e.json",
+                "--node-id",
+                "1",
+                "--yes",
+            ])),
+            Ok(Command::RaftForceRecover {
+                from: "/e.json".into(),
+                new_node_id: 1,
+                yes: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["sync-reconcile", "--repair", "--bucket", "b"])),
+            Ok(Command::SyncReconcile {
+                repair: true,
+                bucket: Some("b".into()),
+                json: false,
+            })
+        );
+    }
+
+    #[test]
+    fn split_config_extracts_exactly_one() {
+        use std::path::PathBuf;
+        let (p, rest) = split_config(&args(&["witness"])).unwrap();
+        assert_eq!(p, PathBuf::from(CONFIG_PATH));
+        assert_eq!(rest, args(&["witness"]));
+        let (p, rest) = split_config(&args(&["--config", "/x.toml", "witness"])).unwrap();
+        assert_eq!(p, PathBuf::from("/x.toml"));
+        assert_eq!(rest, args(&["witness"]));
+        let (p, rest) = split_config(&args(&["raft-export", "--config=/y.toml"])).unwrap();
+        assert_eq!(p, PathBuf::from("/y.toml"));
+        assert_eq!(rest, args(&["raft-export"]));
+        for bad in [
+            &["--config"][..],
+            &["--config="][..],
+            &["--config", "a", "--config", "b"][..],
+            &["--config=a", "--config=b"][..],
+        ] {
+            assert!(split_config(&args(bad)).is_err(), "应拒绝: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn needs_full_state_classifies_offline_commands() {
+        for cmd in [
+            Command::Serve,
+            Command::Groups,
+            Command::Build,
+            Command::Clean { days: 1 },
+            Command::Fsck { repair: false },
+            Command::Heal,
+            Command::Scrub,
+            Command::Rebalance { dry_run: true },
+        ] {
+            assert!(needs_full_state(&cmd), "{cmd:?}");
+        }
+        for cmd in [
+            Command::Witness,
+            Command::RaftAddWitness {
+                node_id: 1,
+                endpoint: "http://w:1".into(),
+                replace: None,
+            },
+            Command::RaftRemoveNode { node_id: 1 },
+            Command::RaftExport {
+                out: None,
+                witness: false,
+            },
+            Command::RaftCutover {
+                from: "e".into(),
+                peer_config: None,
+                dry_run: true,
+                overwrite: false,
+            },
+            Command::RaftForceRecover {
+                from: "e".into(),
+                new_node_id: 1,
+                yes: true,
+            },
+            Command::SyncReconcile {
+                repair: false,
+                bucket: None,
+                json: false,
+            },
+        ] {
+            assert!(!needs_full_state(&cmd), "{cmd:?}");
+        }
+    }
+
+    #[test]
     fn parse_args_rejects_bad_input() {
         for bad in [
             &["frobnicate"][..],
@@ -552,6 +993,41 @@ mod tests {
             &["rebalance", "--go"][..], // rebalance 只认 --dry-run/--apply
             &["rebalance", "x", "y"][..],
             &["/etc/oss.toml"][..], // 旧的「首参=配置路径」不再是合法用法
+            &["witness", "x"][..],
+            &["raft-add-witness", "--node-id", "3"][..], // 缺 endpoint
+            &[
+                "raft-add-witness",
+                "--node-id",
+                "x",
+                "--endpoint",
+                "http://w:1",
+            ][..],
+            &[
+                "raft-add-witness",
+                "--node-id",
+                "3",
+                "--endpoint",
+                "https://w:1",
+            ][..],
+            &[
+                "raft-add-witness",
+                "--node-id",
+                "3",
+                "--endpoint",
+                "http://w:1",
+                "--go",
+            ][..],
+            &[
+                "raft-add-witness",
+                "--node-id",
+                "3",
+                "--node-id",
+                "4",
+                "--endpoint",
+                "http://w:1",
+            ][..],
+            &["raft-cutover", "--dry-run"][..],  // 缺 --from
+            &["sync-reconcile", "--bucket"][..], // 缺值
         ] {
             assert_eq!(parse_args(&args(bad)), Err(USAGE), "应拒绝: {bad:?}");
         }

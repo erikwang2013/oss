@@ -115,9 +115,23 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         .nest("/api/v1", console)
         .merge(aether.with_state(()))
         .fallback_service(HandleError::new(s3, handle_s3_error))
-        .with_state(state)
-        // 层在路由之后挂：同时包住 fallback（S3 面）。
-        .layer(middleware::from_fn(restore_accepted));
+        .with_state(state.clone());
+    // S7.1：Raft RPC 路由只在 `[raft]` 下挂载；走集群令牌，不经 console JWT 层。
+    let app = match state.raft.clone() {
+        Some(handle) => {
+            let token = state
+                .cfg
+                .raft
+                .as_ref()
+                .expect("raft handle implies [raft]")
+                .cluster_token
+                .clone();
+            app.merge(crate::raft::routes::rpc_router(handle, token))
+        }
+        None => app,
+    };
+    // 层在路由之后挂：同时包住 fallback（S3 面）。
+    let app = app.layer(middleware::from_fn(restore_accepted));
     Ok(app)
 }
 

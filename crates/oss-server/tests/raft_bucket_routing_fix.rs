@@ -133,6 +133,7 @@ async fn setup() -> H {
 
     let settings = RaftSettings {
         node_id: 1,
+        role: oss_server::config::RaftRole::Voter,
         bootstrap: true,
         advertise_endpoint: "http://127.0.0.1:1".to_string(),
         cluster_token: "s6c-fix".to_string(),

@@ -227,6 +227,16 @@ const SCHEMA_M8: &str = include_str!("../migrations/0003_m8.sql");
 /// M9 S0：控制面契约表 + 11 张复制表的 guard。每次启动重放（IF NOT EXISTS / DROP+CREATE）。
 const SCHEMA_M9: &str = include_str!("../migrations/0004_m9.sql");
 
+/// WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
+/// `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
+/// busy_timeout：多 job worker 并发写同库时用等待代替立即 SQLITE_BUSY（默认 5s 偏短）。
+fn wal_options(url: &str) -> Result<SqliteConnectOptions> {
+    Ok(url
+        .parse::<SqliteConnectOptions>()?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(30)))
+}
+
 pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -238,28 +248,40 @@ impl Db {
     /// M7/M8 默认连接：重放 M9 schema 后 `prepare_raft_mode(false)`（drop guard），
     /// 库已处于 Raft 模式（`schema_meta.raft_mode=on`）时拒绝启动（降级守卫）。
     pub async fn connect(url: &str) -> Result<Self> {
-        Self::connect_with(url, true, false).await
+        Self::connect_with(url, true, false, None).await
     }
 
     /// M9：Raft 数据站点连接（种 site_config，保留/重建 guard，drop `site_*` 触发器）。
     pub async fn connect_raft(url: &str) -> Result<Self> {
-        Self::connect_with(url, true, true).await
+        Self::connect_with(url, true, true, None).await
+    }
+
+    /// S7.1：serve 启动路径——带 `[site].id` 首启种子（已有库 id 不一致 → 拒绝启动）。
+    pub async fn connect_site(url: &str, raft: bool, site_id: Option<&str>) -> Result<Self> {
+        Self::connect_with(url, true, raft, site_id).await
     }
 
     /// M9 witness：不种 `site_config`（witness 无站点行），其余同 Raft。
     pub async fn connect_witness(url: &str) -> Result<Self> {
-        Self::connect_with(url, false, true).await
+        Self::connect_with(url, false, true, None).await
     }
 
-    async fn connect_with(url: &str, seed_site: bool, raft: bool) -> Result<Self> {
-        // WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
-        // `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
-        // busy_timeout：多 job worker 并发写同库时用等待代替立即 SQLITE_BUSY（默认 5s 偏短）。
-        let opts = url
-            .parse::<SqliteConnectOptions>()?
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_secs(30));
-        let pool = SqlitePool::connect_with(opts).await?;
+    /// 离线运维连接：只开 WAL 池，不重放 schema、不切模式（避免二次开 raft.db / 降级守卫）。
+    pub async fn connect_offline(url: &str) -> Result<Self> {
+        let pool = SqlitePool::connect_with(wal_options(url)?).await?;
+        Ok(Self {
+            pool,
+            raft_mode: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    async fn connect_with(
+        url: &str,
+        seed_site: bool,
+        raft: bool,
+        site_id: Option<&str>,
+    ) -> Result<Self> {
+        let pool = SqlitePool::connect_with(wal_options(url)?).await?;
         // sqlx::raw_sql 支持一个字符串里的多条语句，schema 文件原样执行
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         let db = Self {
@@ -275,7 +297,7 @@ impl Db {
         sqlx::raw_sql(SCHEMA_M9).execute(&db.pool).await?;
         db.ensure_columns_m9().await?;
         if seed_site {
-            db.site_bootstrap().await?;
+            db.site_bootstrap(site_id).await?;
         }
         db.prepare_raft_mode(raft).await?;
         Ok(db)
@@ -393,6 +415,19 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
+    /// 无条件写 `schema_meta`（Raft 身份状态：initialize 后置 1 等）。
+    pub async fn upsert_schema_meta(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// apply 事务内标记：**只允许本模块启动路径使用**——apply 在自身事务里写同一行，
     /// 外部调用者拿不到写控制表的入口（编译闸，matrix §9）。
     async fn set_raft_apply_ctx(&self, active: bool) -> Result<()> {
@@ -404,8 +439,9 @@ impl Db {
     }
 
     /// 本站身份种子（幂等）：首启生成 uuid + 32 hex token；后续启动不动。
+    /// S7.1：`[site].id` 仅用于首启；已有行 id 不同 → 拒绝启动。
     /// 同时复位 `apply_ctx`（上次进程若在启动对账/apply 中途退出，防止抑制永久残留——P12）。
-    async fn site_bootstrap(&self) -> Result<()> {
+    async fn site_bootstrap(&self, seed_id: Option<&str>) -> Result<()> {
         let token = uuid::Uuid::new_v4().simple().to_string();
         // 身份必须**恰好一行**：触发器 `SELECT id FROM site_config LIMIT 1` 与
         // `site_identity()` 的查询计划可能取到不同行（索引扫描 vs rowid 扫描）。
@@ -413,12 +449,40 @@ impl Db {
         sqlx::query("DELETE FROM site_config WHERE rowid <> (SELECT MIN(rowid) FROM site_config)")
             .execute(&self.pool)
             .await?;
+        let existing: Option<String> = sqlx::query_scalar("SELECT id FROM site_config LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(seed) = seed_id {
+            // 配置层已校验；DB 也是信任边界（旧库/手改配置）。
+            if seed.is_empty()
+                || seed.len() > 64
+                || !seed
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "[site].id 非法：{seed:?}（白名单 [A-Za-z0-9._-]，≤64）"
+                )));
+            }
+            if let Some(old) = &existing
+                && old != seed
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "[site].id={seed} 与库内站点 id={old} 不一致：拒绝启动（id 一经生成不可变更）"
+                )));
+            }
+        }
+        let id = match (seed_id, &existing) {
+            (Some(seed), _) => seed.to_string(),
+            (None, Some(old)) => old.clone(),
+            (None, None) => uuid::Uuid::new_v4().to_string(),
+        };
         sqlx::query(
             "INSERT INTO site_config (id, name, region, priority, site_token, created_at) \
              SELECT ?, 'site', 'us-east-1', 0, ?, ? \
              WHERE NOT EXISTS (SELECT 1 FROM site_config)",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(id)
         .bind(token)
         .bind(now())
         .execute(&self.pool)

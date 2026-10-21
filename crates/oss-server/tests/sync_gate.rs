@@ -436,6 +436,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
         remotes: vec![],
         tiers: vec![],
         site: site_enabled.then(|| SiteToml {
+            id: None,
             name: Some("a".into()),
             region: REGION.into(),
             priority: 0,

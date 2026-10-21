@@ -68,6 +68,9 @@ pub struct RaftToml {
     pub cluster_token: String,
     #[serde(default)]
     pub db_path: Option<PathBuf>,
+    /// witness 专用控制库（voter 出现即拒绝）；witness 必填。
+    #[serde(default)]
+    pub state_db: Option<PathBuf>,
     #[serde(default = "default_election_timeout_ms")]
     pub election_timeout_ms: u64,
     #[serde(default = "default_heartbeat_interval_ms")]
@@ -89,6 +92,32 @@ pub struct RaftToml {
     /// 快照总上限，默认 512 MiB，可配上限 1 GiB。
     #[serde(default = "default_snapshot_max_bytes")]
     pub snapshot_max_bytes: u64,
+}
+
+impl RaftToml {
+    /// serve/witness 共用校验：node_id、token、advertise、快照上限。
+    pub fn validate_common(&self) -> Result<(), String> {
+        if self.node_id == 0 {
+            return Err("[raft].node_id 必须 > 0".into());
+        }
+        if self.cluster_token.trim().is_empty() {
+            return Err("[raft].cluster_token 不能为空".into());
+        }
+        normalize_http_addr(&self.advertise_endpoint, "[raft].advertise_endpoint")?;
+        if self.snapshot_max_chunk_size == 0 || self.snapshot_max_chunk_size > 4 * 1024 * 1024 {
+            return Err(format!(
+                "[raft].snapshot_max_chunk_size 必须在 1..=4 MiB，实际 {}",
+                self.snapshot_max_chunk_size
+            ));
+        }
+        if self.snapshot_max_bytes == 0 || self.snapshot_max_bytes > 1024 * 1024 * 1024 {
+            return Err(format!(
+                "[raft].snapshot_max_bytes 必须在 1..=1 GiB，实际 {}",
+                self.snapshot_max_bytes
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -136,14 +165,38 @@ pub struct StretchToml {
     pub mesh_timeout_ms: u64,
 }
 
+/// witness 配置：`[raft]` 表 + role="witness"（独立子命令；无 `[site]`/数据目录）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WitnessConfig {
-    pub node_id: u64,
-    pub advertise_endpoint: String,
-    pub cluster_token: String,
-    pub db_path: PathBuf,
-    pub state_db: PathBuf,
+pub struct WitnessToml {
+    pub raft: RaftToml,
+}
+
+impl WitnessToml {
+    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
+        let cfg: Self = toml::from_str(&text)?;
+        cfg.validate().map_err(|e| format!("配置校验失败：{e}"))?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let r = &self.raft;
+        if r.role != RaftRole::Witness {
+            return Err("witness 配置的 [raft].role 必须是 \"witness\"".into());
+        }
+        if r.bootstrap {
+            return Err("witness 配置的 [raft].bootstrap 必须为 false".into());
+        }
+        if r.state_db.is_none() {
+            return Err("witness 配置缺少 [raft].state_db".into());
+        }
+        if r.db_path.is_none() {
+            return Err("witness 配置缺少 [raft].db_path".into());
+        }
+        r.validate_common()
+    }
 }
 
 fn default_election_timeout_ms() -> u64 {
@@ -251,6 +304,9 @@ pub struct TierTarget {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteToml {
+    /// M9 S7.1：首启站点 id（缺省生成 UUID）；已有库不同 id 拒绝启动。
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default = "default_region")]
@@ -265,6 +321,7 @@ pub struct SiteToml {
 impl Default for SiteToml {
     fn default() -> Self {
         Self {
+            id: None,
             name: None,
             region: default_region(),
             priority: 0,
@@ -546,6 +603,17 @@ impl AppConfig {
     /// （M7 = 单节点站点对，集群站点归后续）。
     pub fn site_validate(&self) -> Result<(), String> {
         if let Some(s) = &self.site {
+            if let Some(id) = &s.id
+                && (id.is_empty()
+                    || id.len() > 64
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+            {
+                return Err(format!(
+                    "[site].id 非法：{id:?}（白名单 [A-Za-z0-9._-]，≤64）"
+                ));
+            }
             if let Some(n) = &s.name
                 && (n.trim().is_empty() || n.len() > 64)
             {
@@ -571,6 +639,12 @@ impl AppConfig {
     pub fn raft_validate(&self) -> Result<(), String> {
         self.sync_validate()?;
         if let Some(r) = &self.raft {
+            if r.role == RaftRole::Witness {
+                return Err("witness 必须使用 witness 子命令（serve 不接受 role=witness）".into());
+            }
+            if r.state_db.is_some() {
+                return Err("[raft].state_db 仅 witness 使用，voter 不得配置".into());
+            }
             if self.site.is_none() {
                 return Err("[raft] 需要 [site]（站点身份由 M7 [site] 提供）".into());
             }
@@ -580,25 +654,7 @@ impl AppConfig {
             if !self.groups.is_empty() {
                 return Err("[raft] 与 [[groups]] 互斥（guard 会拒绝分组桶写入）".into());
             }
-            if r.node_id == 0 {
-                return Err("[raft].node_id 必须 > 0".into());
-            }
-            if r.cluster_token.trim().is_empty() {
-                return Err("[raft].cluster_token 不能为空".into());
-            }
-            normalize_http_addr(&r.advertise_endpoint, "[raft].advertise_endpoint")?;
-            if r.snapshot_max_chunk_size == 0 || r.snapshot_max_chunk_size > 4 * 1024 * 1024 {
-                return Err(format!(
-                    "[raft].snapshot_max_chunk_size 必须在 1..=4 MiB，实际 {}",
-                    r.snapshot_max_chunk_size
-                ));
-            }
-            if r.snapshot_max_bytes == 0 || r.snapshot_max_bytes > 1024 * 1024 * 1024 {
-                return Err(format!(
-                    "[raft].snapshot_max_bytes 必须在 1..=1 GiB，实际 {}",
-                    r.snapshot_max_bytes
-                ));
-            }
+            r.validate_common()?;
         }
         self.stretch_validate()
     }
@@ -1071,6 +1127,7 @@ mod tests {
         let mut c = base_cfg();
         let hex = "a".repeat(32);
         c.site = Some(SiteToml {
+            id: Some("site-a_1".into()),
             name: Some("a".into()),
             region: "us-east-1".into(),
             priority: 10,
@@ -1092,6 +1149,20 @@ mod tests {
         assert!(bad("short"));
         assert!(bad(&"z".repeat(32)));
         assert!(bad(&"a".repeat(129)));
+        // S7.1：[site].id 白名单
+        for (id, ok) in [
+            ("abc.DEF_1-2", true),
+            ("", false),
+            ("a/b", false),
+            ("x".repeat(65).as_str(), false),
+        ] {
+            let mut c = base_cfg();
+            c.site = Some(SiteToml {
+                id: Some(id.into()),
+                ..Default::default()
+            });
+            assert_eq!(c.site_validate().is_ok(), ok, "[site].id={id:?}");
+        }
         // name 过长 / region 空
         let mut c = base_cfg();
         c.site = Some(SiteToml {
@@ -1187,6 +1258,7 @@ mod tests {
             advertise_endpoint: "http://a:9000".into(),
             cluster_token: "t".repeat(64),
             db_path: None,
+            state_db: None,
             election_timeout_ms: default_election_timeout_ms(),
             heartbeat_interval_ms: default_heartbeat_interval_ms(),
             rpc_timeout_ms: default_rpc_timeout_ms(),
@@ -1261,6 +1333,47 @@ cluster_token = "x"
         )
         .unwrap();
         assert_eq!(w.role, RaftRole::Witness);
+    }
+
+    /// S7.1：witness TOML（仅 `[raft]` 表）解析/校验；serve 拒绝 witness 与 voter state_db。
+    #[test]
+    fn m9_witness_toml_and_serve_role_guards() {
+        let text = r#"
+[raft]
+node_id = 3
+role = "witness"
+advertise_endpoint = "http://w:9100"
+cluster_token = "x"
+db_path = "/x/raft.db"
+state_db = "/x/state.db"
+"#;
+        let dir = std::env::temp_dir().join(format!("oss-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.toml");
+        std::fs::write(&path, text).unwrap();
+        let w = WitnessToml::load(&path).unwrap();
+        assert_eq!(w.raft.node_id, 3);
+        assert_eq!(w.raft.role, RaftRole::Witness);
+        assert!(w.raft.state_db.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let mut bad = w.clone();
+        bad.raft.bootstrap = true;
+        assert!(bad.validate().is_err());
+        let mut bad = w.clone();
+        bad.raft.state_db = None;
+        assert!(bad.validate().is_err());
+        let mut bad = w;
+        bad.raft.role = RaftRole::Voter;
+        assert!(bad.validate().is_err());
+
+        // serve：role=witness / voter+state_db 均拒绝
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().role = RaftRole::Witness;
+        assert!(c.raft_validate().unwrap_err().contains("witness 子命令"));
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().state_db = Some(PathBuf::from("/x"));
+        assert!(c.raft_validate().unwrap_err().contains("state_db"));
     }
 
     #[test]

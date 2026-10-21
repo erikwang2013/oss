@@ -51,7 +51,8 @@ tracing.workspace = true
 # 关闭 generic-snapshot-data：快照数据为 Cursor<Vec<u8>>，分块传输由 openraft 内置。
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 # M9 S5：Raft RPC HTTP 客户端（workspace 已锁定 rustls 版）。
-reqwest.workspace = true
+# S7.1：write 转发/成员 CLI 用 .json()（只加 feature，不加依赖）。
+reqwest = { workspace = true, features = ["json"] }
 
 [features]
 default = []

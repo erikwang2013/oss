@@ -11,7 +11,9 @@
 pub(crate) mod apply;
 pub mod command;
 pub mod control;
+pub mod identity;
 pub mod network;
+pub mod routes;
 pub mod status;
 pub mod store;
 
@@ -75,6 +77,7 @@ impl std::error::Error for WriteError {}
 #[derive(Debug, Clone)]
 pub struct RaftSettings {
     pub node_id: u64,
+    pub role: crate::config::RaftRole,
     pub bootstrap: bool,
     pub advertise_endpoint: String,
     pub cluster_token: String,
@@ -98,6 +101,7 @@ impl RaftSettings {
             .ok_or_else(|| "[raft].db_path 必填（raft.db 路径）".to_string())?;
         Ok(Self {
             node_id: t.node_id,
+            role: t.role,
             bootstrap: t.bootstrap,
             advertise_endpoint: t.advertise_endpoint.clone(),
             cluster_token: t.cluster_token.clone(),
@@ -154,6 +158,28 @@ impl RaftHandle {
 
     pub fn state_machine(&self) -> &SqliteStateMachine {
         &self.state_machine
+    }
+
+    /// 成员表是否已有 voter（`metrics().membership_config`；勿跨 `.await` 持借用）。
+    pub fn membership_nonempty(&self) -> bool {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        m.membership_config
+            .membership()
+            .voter_ids()
+            .next()
+            .is_some()
+    }
+
+    /// 当前 leader 的 advertise 地址（成员表查不到 = None；S7.1 follower 单跳转发用）。
+    pub fn leader_endpoint(&self) -> Option<String> {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        let leader = m.current_leader?;
+        m.membership_config
+            .membership()
+            .get_node(&leader)
+            .map(|n| n.addr.clone())
     }
 
     /// 应用层 deadline 的写入口：超时返回错误（写可能已提交，调用方按超时语义处理）。
@@ -290,6 +316,7 @@ mod tests {
     fn test_settings(dir: &Path) -> RaftSettings {
         RaftSettings {
             node_id: 1,
+            role: crate::config::RaftRole::Voter,
             bootstrap: true,
             advertise_endpoint: "http://127.0.0.1:1".to_string(),
             cluster_token: "test-cluster-token".to_string(),

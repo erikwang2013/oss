@@ -22,6 +22,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::process::exit(2);
         }
     };
+    // `--config` 先摘出：witness/成员管理命令不得走 AppState::load（会二次打开 raft.db）。
+    let (cfg_path, args) = match cli::split_config(&args) {
+        Ok(v) => v,
+        Err(usage) => {
+            eprint!("{usage}");
+            std::process::exit(2);
+        }
+    };
     let cmd = match cli::parse_args(&args) {
         Ok(cmd) => cmd,
         Err(usage) => {
@@ -30,9 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let state = oss_server::state::AppState::load(std::path::Path::new(cli::CONFIG_PATH)).await?;
-
-    let code = cli::run(cmd, state).await?;
+    let code = if cli::needs_full_state(&cmd) {
+        let state = oss_server::state::AppState::load(&cfg_path).await?;
+        cli::run(cmd, state).await?
+    } else {
+        cli::run_offline(cmd, &cfg_path).await?
+    };
     if code != 0 {
         std::process::exit(code);
     }

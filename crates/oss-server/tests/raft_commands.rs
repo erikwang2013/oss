@@ -956,6 +956,7 @@ async fn raft_applies_control_commands_to_guarded_control_db() {
     let db = oss_server::db::Db::connect_raft(&url).await.unwrap();
     let settings = RaftSettings {
         node_id: 1,
+        role: oss_server::config::RaftRole::Voter,
         bootstrap: true,
         advertise_endpoint: "http://127.0.0.1:1".to_string(),
         cluster_token: "test-cluster-token".to_string(),

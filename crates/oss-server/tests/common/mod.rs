@@ -3,6 +3,8 @@ use oss_server::db::Db;
 use oss_server::state::AppState;
 use xl_store::store::{Store, StoreConfig};
 
+pub mod raft_harness;
+
 /// 测试共用 secret（jwt-rust 要求 ≥32 字符）；测试自己造令牌时也用它签名。
 pub const JWT_SECRET: &str = "0123456789abcdef0123456789abcdef";
 

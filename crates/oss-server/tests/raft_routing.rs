@@ -534,6 +534,7 @@ async fn raft_write_failure_maps_to_503_with_hint_not_silent_204() {
     let dead = oss_server::raft::spawn_with_control(
         RaftSettings {
             node_id: 9,
+            role: oss_server::config::RaftRole::Voter,
             bootstrap: false,
             advertise_endpoint: "http://127.0.0.1:19001".to_string(),
             cluster_token: "s6b-cluster-token".to_string(),

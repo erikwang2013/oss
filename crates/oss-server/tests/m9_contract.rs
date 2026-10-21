@@ -415,7 +415,8 @@ async fn m9_raft_status_reports_real_state_and_ready_flags() {
     assert_eq!(status["enabled"], true);
     assert_eq!(status["node_id"], 1);
     assert_eq!(status["leader"], 1, "单节点必须选出 leader");
-    assert_eq!(status["role"], "leader");
+    assert_eq!(status["role"], "voter");
+    assert_eq!(status["state"], "leader");
     assert!(status["term"].as_u64().unwrap() >= 1);
     assert_eq!(status["capabilities"]["raft"], oss_server::raft::RAFT_READY);
     assert_eq!(status["capabilities"]["sync"], oss_server::raft::SYNC_READY);

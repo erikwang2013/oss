@@ -620,7 +620,10 @@ async fn status_reports_real_raft_state_and_ready_flags() {
     assert_eq!(v["enabled"], true);
     assert_eq!(v["node_id"], 1);
     assert_eq!(v["leader"], 1);
-    assert_eq!(v["role"], "leader");
+    assert_eq!(v["role"], "voter");
+    assert_eq!(v["state"], "leader");
+    assert_eq!(v["initialized"], true);
+    assert_eq!(v["members"], serde_json::json!([1]));
     assert!(v["term"].as_u64().unwrap() >= 1);
     assert_eq!(v["capabilities"]["raft"], RAFT_READY);
     assert_eq!(v["capabilities"]["sync"], SYNC_READY);

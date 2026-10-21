@@ -19,6 +19,7 @@ fn now() -> i64 {
 
 fn site(name: &str, ch: char) -> SiteToml {
     SiteToml {
+        id: None,
         name: Some(name.into()),
         region: "us-east-1".into(),
         priority: 0,

@@ -58,6 +58,8 @@ pub struct AppState {
     pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
     /// M9 S6：控制写门面（Local = M7/standalone；Raft = `[raft]`）。S6b-d 的路由唯一入口。
     pub control: Arc<crate::raft::control::ControlPlane>,
+    /// M9 S7.1：Raft 句柄（路由/状态共用；无 `[raft]` = None）。
+    pub raft: Option<Arc<crate::raft::RaftHandle>>,
 }
 
 fn mesh_of(store: &Store) -> Option<xl_s3::access::ControlMesh> {
@@ -259,13 +261,26 @@ impl AppState {
         std::fs::create_dir_all(&cfg.staging_dir)
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
-        let db = Arc::new(match cfg.raft.as_ref() {
-            Some(r) if r.role == crate::config::RaftRole::Witness => {
-                Db::connect_witness(&cfg.database_url).await?
-            }
-            Some(_) => Db::connect_raft(&cfg.database_url).await?,
-            None => Db::connect(&cfg.database_url).await?,
-        });
+        // witness 由 `witness` 子命令承载（config 已拒绝 serve + role=witness）。
+        let db = Arc::new(
+            Db::connect_site(
+                &cfg.database_url,
+                cfg.raft.is_some(),
+                cfg.site.as_ref().and_then(|s| s.id.as_deref()),
+            )
+            .await?,
+        );
+        // M9 S7.1：身份必须在任何控制面写之前种子/校验（首次启动也写 schema_meta）。
+        let raft_settings = match cfg.raft.as_ref() {
+            Some(t) => Some(
+                crate::raft::RaftSettings::from_toml(t)
+                    .map_err(|e| format!("[raft] 配置非法: {e}"))?,
+            ),
+            None => None,
+        };
+        if let Some(settings) = &raft_settings {
+            crate::raft::identity::verify_and_seed(&db, settings).await?;
+        }
         // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
         // 经 `AppState::new` 同样会再应用一次（幂等）。
         if let Some(site) = cfg.site.as_ref() {
@@ -569,16 +584,20 @@ impl AppState {
         }
 
         // Raft 启动必须晚于本地管理员引导：日志重放里的管理员属主需解析到本地 id。
-        let raft = match cfg.raft.as_ref() {
-            Some(t) => {
-                let settings = crate::raft::RaftSettings::from_toml(t)
-                    .map_err(|e| format!("[raft] 配置非法: {e}"))?;
-                Some(Arc::new(
-                    crate::raft::spawn_with_control(settings, Some(db.pool().clone())).await?,
-                ))
-            }
+        // 首启 bootstrap 成功的节点即已初始化（metrics 的成员可能滞后一拍）。
+        let bootstrapped = raft_settings.as_ref().is_some_and(|s| s.bootstrap);
+        let raft = match raft_settings {
+            Some(settings) => Some(Arc::new(
+                crate::raft::spawn_with_control(settings, Some(db.pool().clone())).await?,
+            )),
             None => None,
         };
+        // S7.1：初始化标志以 live 成员为准（首启 bootstrap 后写 1；witness/等 join 写 0）。
+        crate::raft::identity::record_initialized(
+            &db,
+            bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
+        )
+        .await?;
 
         // M9 I-1：Raft 启动对账须在控制状态载入后、serve 前——apply 与 mkdir 之间崩溃
         // 或删桶副作用失败留下的 row/dir 不一致在此修复；只读行、不追加日志。
@@ -717,6 +736,8 @@ impl AppState {
                         "/site/head-object".into(),
                         "/site/bucket-empty".into(),
                         "/site/bucket-quiesce".into(),
+                        // S7.1：配对入口走集群/站点令牌，不认 JWT（S7.4 实现）。
+                        "/site/raft/join".into(),
                     ],
                 },
                 ..Default::default()
@@ -735,9 +756,9 @@ impl AppState {
         let store = Arc::new(store);
         // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
         // 先于共享存储构造——S6c 起它们的控制写要经同一门面。
-        let control = Arc::new(match raft {
+        let control = Arc::new(match &raft {
             Some(handle) => crate::raft::control::ControlPlane::raft(
-                handle,
+                Arc::clone(handle),
                 Arc::clone(&db),
                 Arc::clone(&store),
                 Arc::clone(&ap_cache),
@@ -830,6 +851,7 @@ impl AppState {
             inventory,
             inventory_runner,
             control,
+            raft,
         }
     }
 }
