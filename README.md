@@ -1075,7 +1075,9 @@ timeout_ms = 10000                     # 默认 10s；仅 sync 远端调用 → 
   tee 不能重建 MPU ETag/元数据。无 intent 的孤儿 tee 超过 **1 小时**由启动/周期清理删除，
   有 intent 的交给恢复 worker（启动先跑一轮，之后 30s 周期；只处理超过
   `timeout + 60s` 的行，避免误伤在途）。
-- 元数据复制 content-type/user-metadata/标签/storage-class；checksum 远端重算；
+- 元数据复制 content-type/user-metadata/标签/storage-class；PUT/MPU 的 checksum 远端重算，
+  CopyObject 继承源对象 checksum（`x-amz-checksum-*`）并随 sync 门 PUT 透传且进 SigV4
+  SignedHeaders，源对象无 checksum 时目标也不伪造；A/B 两侧 HEAD 校验和一致。
   SSE-S3/KMS 由目标本地决定。默认 64 MiB / 10s 要求约 ≥52 Mbps 上行，WAN 带宽不足时须下调
   `max_object_bytes` 或提高 `timeout_ms`；默认面向小对象/合规桶。
 
@@ -1182,7 +1184,9 @@ db_path = "/var/lib/oss/raft.db"
 1. 停 A/B；`oss-server raft-export --config a/oss.toml --out /backup/export.json`（11 张复制表，
    自然键；`--witness` 仅用于备份 witness 的 `state_db`，该导出不能用于 cutover/恢复）。
 2. 对每个 M7 目标库先 dry-run：`raft-cutover --config x/oss.toml --from export.json --dry-run`；
-   无冲突后去掉 `--dry-run`。目标必须是 **未进入 raft mode** 的 M7 库、版本/admin/vault
+   无冲突后去掉 `--dry-run`。冲突按 **11 张表自然键逐字段**报告
+   （`table/key/field/source/target`，同一行多个字段不同即多条），而非整行摘要。
+   目标必须是 **未进入 raft mode** 的 M7 库、版本/admin/vault
    与导出一致、`[cluster]` 不存在、site changelog lag=0、`site_apply_dead` 为空；
    `--overwrite` 才允许覆盖目标独有复制行。cutover 成功后写 `raft_cutover` 并置
    `raft_mode=on`（此后无 `[raft]` 的启动会被拒绝）。
@@ -1191,9 +1195,12 @@ db_path = "/var/lib/oss/raft.db"
 **force recovery**（A+B 永久丢失，只剩导出/备份）：
 
 1. 准备一个**干净目标控制库**：同版本、已 `raft-cutover` 到 raft mode、`raft_applied`
-   为空、无 `raft_snapshot` 行、存在本地 admin；`raft.db` 路径必须全新/空。
+   为空、无 `raft_snapshot` 行、存在本地 admin（**witness 目标例外**：witness 无本地
+   管理员也可恢复，安装属主写哨兵 `0`）；`raft.db` 路径必须全新/空。
 2. `oss-server raft-force-recover --config survivor/oss.toml --from export.json --node-id N --yes`
    ——导入 11 表并在空日志上 `initialize({N})`；不会重置/覆盖既有 `raft_applied`，非空即拒绝。
+   `--config` 也可指向 witness 的 `witness.toml`（`[raft].state_db` 经
+   `Db::connect_witness` 打开；数据站点配置优先），恢复后同样以 `bootstrap=false` 启动。
 3. 以 `bootstrap=false` 启动该节点（身份校验会比对 `raft_bootstrap=0`，不再 initialize）；
    其他站点恢复后按配对/learner 流程加入。
 4. 对象从备份/异地副本恢复；sync 桶对端恢复后跑 `sync-reconcile --repair`；stretch 两站点
