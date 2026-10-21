@@ -848,7 +848,13 @@ impl AppState {
         ));
         let admin_username = db.schema_meta("admin_username").await.ok().flatten();
         let vault_probe = match &vault {
-            Some(v) => v.seal("oss-vault-probe-v1").await.ok(),
+            Some(v) => match v.seal("oss-vault-probe-v1").await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::error!(error = %e, "vault probe seal failed; pairing will report mismatch");
+                    None
+                }
+            },
             None => None,
         };
         let cfg = Arc::new(cfg);

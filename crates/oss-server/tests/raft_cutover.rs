@@ -129,6 +129,19 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
     let mode = dst.schema_meta("raft_mode").await.unwrap();
     assert_eq!(mode.as_deref(), Some("on"));
     assert!(dst.schema_meta("raft_cutover").await.unwrap().is_some());
+    // mode-on 的目标不得再次被 cutover 覆盖。
+    let err = cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CutoverError::Invalid(_)), "{err}");
     // 无 [raft] 的旧启动路径必须拒绝已切模式的库。
     let url = format!("sqlite://{}?mode=rwc", dir.path().join("dst.db").display());
     assert!(Db::connect(&url).await.is_err());
@@ -190,7 +203,21 @@ async fn force_recover_fresh_log_and_refuses_existing() {
     );
     assert_eq!(
         dst.schema_meta("raft_bootstrap").await.unwrap().as_deref(),
-        Some("false")
+        Some("0")
+    );
+    // 恢复产物必须能以 bootstrap=false 再启动（身份编码 "0"/"1"）。
+    let mut restart = settings.clone();
+    restart.node_id = 7;
+    restart.bootstrap = false;
+    oss_server::raft::identity::verify_and_seed(&dst, &restart)
+        .await
+        .unwrap();
+    restart.bootstrap = true;
+    assert!(
+        oss_server::raft::identity::verify_and_seed(&dst, &restart)
+            .await
+            .is_err(),
+        "bootstrap 漂移必须被身份校验拒绝"
     );
     // 已有日志 → 二次恢复必须拒绝，不得编辑旧日志。
     assert!(

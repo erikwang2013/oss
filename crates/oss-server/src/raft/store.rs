@@ -725,7 +725,16 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 )),
             ));
         }
-        if self.control && bytes.starts_with(data::SNAPSHOT_MAGIC) {
+        if self.control {
+            if !bytes.starts_with(data::SNAPSHOT_MAGIC) {
+                return Err(storage_err(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    std::io::Error::other(
+                        "control state machine requires OSSCTL1 snapshot (legacy KV snapshot rejected)",
+                    ),
+                ));
+            }
             return self.install_control(meta, &bytes).await;
         }
         let data: SnapshotData = serde_json::from_slice(&bytes)

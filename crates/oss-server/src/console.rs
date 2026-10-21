@@ -3321,10 +3321,6 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         raft_node_id: Some(peer_node),
         reconcile_required: false,
     };
-    if let Err(e) = state.db.upsert_pair_peer(&peer).await {
-        tracing::error!(error = %e, "写站点行失败");
-        return internal_error();
-    }
 
     // 管理员长时 AK（join body 需要与对方同主密钥封装的 SK）。
     let creds: Option<(String, String)> = sqlx::query_as(
@@ -3435,6 +3431,15 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
+    // 成员变更成功后才更新本地行：若 ReplaceVoter/AddWitness 失败，旧 node id 保留在行里，
+    // 重试仍能识别 B′ 替换并再次执行（S7.4 review I1）。
+    if let Err(e) = state.db.upsert_pair_peer(&peer).await {
+        tracing::error!(error = %e, "写站点行失败");
+        return internal_error();
+    }
+    if replaced {
+        let _ = state.db.set_site_reconcile_required(&row_id, true).await;
+    }
     let initialized = state.raft.as_ref().is_some_and(|h| h.membership_nonempty());
     let _ = crate::raft::identity::record_initialized(&state.db, initialized).await;
     Json(peer_json(&peer)).into_response()
@@ -3523,8 +3528,22 @@ async fn site_raft_join(
     {
         return conflict("admin username mismatch");
     }
-    if body.has_vault != state.vault.is_some() {
+    if !ident.raft_enabled {
+        return conflict("peer has no [raft]");
+    }
+    if ident.region != body.region {
+        return bad("region mismatch");
+    }
+    if ident.has_vault != body.has_vault || body.has_vault != state.vault.is_some() {
         return bad("vault state mismatch");
+    }
+    if let Some(ad) = ident.advertise_endpoint.as_deref()
+        && ad.trim_end_matches('/') != raft_endpoint
+    {
+        return conflict("raft endpoint mismatch");
+    }
+    if ident.stretch != body.stretch {
+        return conflict("stretch identity mismatch");
     }
     if state.vault.is_some() {
         let ok = match vault_probe_matches(&state, body.vault_probe.as_deref()).await {
@@ -3562,8 +3581,21 @@ async fn site_raft_join(
         )
             .into_response();
     }
+    // B′ 识别：沿用同 remote_site_id 的旧行标签；node id 变化 = 替换（两侧发起者同规则）。
+    let existing = state
+        .db
+        .list_sites()
+        .await
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r.remote_site_id == body.site_id));
+    let old_node = existing.as_ref().and_then(|r| r.raft_node_id);
+    let row_id = existing
+        .as_ref()
+        .map(|r| r.peer_id.clone())
+        .unwrap_or_else(|| body.site_id.clone());
+    let replaced = old_node.is_some_and(|old| old != body.raft_node_id);
     let peer = crate::db::SitePeer {
-        peer_id: body.site_id.clone(),
+        peer_id: row_id.clone(),
         remote_site_id: body.site_id.clone(),
         name: body.name,
         endpoint: data_endpoint,
@@ -3578,22 +3610,32 @@ async fn site_raft_join(
         raft_node_id: Some(body.raft_node_id),
         reconcile_required: false,
     };
+    // 成员变更先于本地行更新：失败时旧 node id 仍在，重试可重新识别 B′。
+    let membership_op = if replaced {
+        Some(crate::raft::membership::MembershipOp::ReplaceVoter {
+            node_id: body.raft_node_id,
+            endpoint: raft_endpoint.clone(),
+            old_node_id: old_node.unwrap(),
+        })
+    } else if local_raft.bootstrap {
+        Some(crate::raft::membership::MembershipOp::AddWitness {
+            node_id: body.raft_node_id,
+            endpoint: raft_endpoint.clone(),
+        })
+    } else {
+        None
+    };
+    if let Some(op) = membership_op
+        && let Err(e) = membership_apply_any(&state, &op).await
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("membership: {e}")).into_response();
+    }
     if let Err(e) = state.db.upsert_pair_peer(&peer).await {
         tracing::error!(error = %e, "join 写站点行失败");
         return internal_error();
     }
-    if local_raft.bootstrap {
-        if let Err(e) = membership_apply_any(
-            &state,
-            &crate::raft::membership::MembershipOp::AddWitness {
-                node_id: body.raft_node_id,
-                endpoint: raft_endpoint,
-            },
-        )
-        .await
-        {
-            return (StatusCode::SERVICE_UNAVAILABLE, format!("membership: {e}")).into_response();
-        }
+    if replaced {
+        let _ = state.db.set_site_reconcile_required(&row_id, true).await;
     }
     let view = state
         .raft

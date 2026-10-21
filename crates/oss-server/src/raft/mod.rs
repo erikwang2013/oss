@@ -261,6 +261,7 @@ impl RaftHandle {
         cmd: ControlCommand,
         timeout: Duration,
     ) -> Result<ControlResponse, WriteError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let sent = reqwest::Client::new()
             .post(format!(
                 "{}/api/v1/site/raft/write",
@@ -288,7 +289,8 @@ impl RaftHandle {
                 }
                 let reply: WriteReply = serde_json::from_slice(&body)
                     .map_err(|e| WriteError::Raft(format!("leader write reply: {e}")))?;
-                if !self.wait_applied(reply.applied_index, timeout).await {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !self.wait_applied(reply.applied_index, left).await {
                     return Err(WriteError::Timeout(timeout));
                 }
                 Ok(reply.response)

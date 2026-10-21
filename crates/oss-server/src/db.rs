@@ -1070,10 +1070,12 @@ impl Db {
     /// S7.4：Raft 配对行写入/更新；按 peer_id 或 remote_site_id 采用既有 M7 行，
     /// 不写 `site_cursors/changelog`（Raft 下 sites 是站点本地表，S6d 启动断言要求 site_* 为空）。
     pub async fn upsert_pair_peer(&self, p: &SitePeer) -> Result<()> {
+        // 注意：UPDATE 不触碰 `reconcile_required`——该门只能由 repair 成功清除
+        // （S7.4 review I2：重复/重试配对不得把 B′ 未修复状态打开）。
         let updated = sqlx::query(
             "UPDATE sites SET remote_site_id = ?, name = ?, endpoint = ?, region = ?, priority = ?, \
-             s3_access_key = ?, s3_secret_key = ?, peer_site_token = ?, raft_node_id = ?, \
-             reconcile_required = ? WHERE peer_id = ? OR remote_site_id = ?",
+             s3_access_key = ?, s3_secret_key = ?, peer_site_token = ?, raft_node_id = ? \
+             WHERE peer_id = ? OR remote_site_id = ?",
         )
         .bind(&p.remote_site_id)
         .bind(&p.name)
@@ -1084,7 +1086,6 @@ impl Db {
         .bind(&p.s3_secret_key)
         .bind(&p.peer_site_token)
         .bind(p.raft_node_id.map(|v| v as i64))
-        .bind(if p.reconcile_required { 1i64 } else { 0 })
         .bind(&p.peer_id)
         .bind(&p.remote_site_id)
         .execute(&self.pool)

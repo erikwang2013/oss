@@ -531,7 +531,15 @@ pub(crate) async fn install_tx(
     .execute(&mut *conn)
     .await
     .map_err(sql)?;
-    // 6. 复制用户（管理员行不动）。
+    // 6. 复制用户（管理员行不动）。`uploads.owner_id` 有 FK 指向 users（本地表），
+    // 与 `delete_user` 同口径先置 NULL，否则有历史上传行的库安装会 FK 失败。
+    sqlx::query(
+        "UPDATE uploads SET owner_id = NULL \
+         WHERE owner_id IN (SELECT id FROM users WHERE is_admin = 0)",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(sql)?;
     sqlx::query("DELETE FROM users WHERE is_admin = 0")
         .execute(&mut *conn)
         .await
@@ -966,8 +974,27 @@ mod tests {
             witness: false,
         };
         install_tx(&mut tx, &sample, &ctx).await.unwrap();
+        // 本地历史上传行（FK 指向非 admin 用户）不得让安装失败；owner 置 NULL。
+        let alice: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO uploads (saved_path, bucket, key, group_name, size, etag, owner_id, created_at) \
+             VALUES ('g/k', 'b1', 'k', 'g', 1, 'e', ?, 1)",
+        )
+        .bind(alice)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
         // 重复安装必须幂等（全量替换而非累积）。
         install_tx(&mut tx, &sample, &ctx).await.unwrap();
+        let upload_owner: Option<i64> =
+            sqlx::query_scalar("SELECT owner_id FROM uploads WHERE saved_path = 'g/k'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(upload_owner, None, "非 admin 属主的 uploads 行必须置 NULL");
         let read = read_tx(&mut tx).await.unwrap();
         tx.commit().await.unwrap();
         assert_eq!(read, sample, "11 表自然键往返必须一致");

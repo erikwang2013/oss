@@ -195,11 +195,11 @@ async fn raft_routes_auth_and_body_limits() {
     let resp = http
         .post(&membership)
         .header(RPC_TOKEN_HEADER, &node.token)
-        .json(&serde_json::json!({"action": "add"}))
+        .json(&serde_json::json!({"op": "not_a_membership_op"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 501, "S7.1 成员变更未实现");
+    assert_eq!(resp.status(), 400, "未知成员操作必须是 400（S7.3 已接线）");
 
     let append = format!("{}/api/v1/site/raft/append", node.base);
     let resp = http

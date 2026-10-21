@@ -16,7 +16,8 @@ use super::RaftHandle;
 /// 入列前等待快照构建完成的上限（快照失败 = 不添加 learner）。
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 /// 成员变更请求（follower → leader）超时。
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// 覆盖 leader 侧 `ensure_snapshot`（10s）+ 成员写（write_timeout）的转发上限。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]

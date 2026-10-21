@@ -99,14 +99,12 @@ pub async fn build_export(
     admin_username: Option<String>,
     has_vault: Option<bool>,
 ) -> Result<ExportFile, String> {
-    let mut conn = db
-        .pool()
-        .acquire()
-        .await
-        .map_err(|e| format!("acquire: {e}"))?;
-    let data = data::read_tx(&mut conn)
+    // 在线导出也必须在一个读事务里完成，避免并发控制写把 11 表导出成撕裂组合。
+    let mut tx = db.pool().begin().await.map_err(|e| format!("begin: {e}"))?;
+    let data = data::read_tx(&mut tx)
         .await
         .map_err(|e| format!("read control data: {e}"))?;
+    tx.commit().await.map_err(|e| format!("commit: {e}"))?;
     let payload = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
     let sha256 = hex::encode(Sha256::digest(&payload));
     Ok(ExportFile {
@@ -278,14 +276,18 @@ fn diff_control(src: &ControlData, dst: &ControlData) -> Vec<Diff> {
 }
 
 async fn target_control(db: &Db) -> Result<ControlData, CutoverError> {
-    let mut conn = db
+    let mut tx = db
         .pool()
-        .acquire()
+        .begin()
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
-    data::read_tx(&mut conn)
+    let data = data::read_tx(&mut tx)
         .await
-        .map_err(|e| CutoverError::Db(e.to_string()))
+        .map_err(|e| CutoverError::Db(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| CutoverError::Db(e.to_string()))?;
+    Ok(data)
 }
 
 async fn m7_lag_zero(db: &Db) -> Result<bool, CutoverError> {
@@ -310,6 +312,17 @@ pub async fn cutover(
     if export.source_role != "voter" {
         return Err(CutoverError::Invalid(
             "witness export cannot be used for cutover".into(),
+        ));
+    }
+    if db
+        .schema_meta("raft_mode")
+        .await
+        .map_err(|e| CutoverError::Db(e.to_string()))?
+        .as_deref()
+        == Some("on")
+    {
+        return Err(CutoverError::Invalid(
+            "target DB is already in raft mode; refusing to overwrite live control state".into(),
         ));
     }
     if facts.version != export.version {
@@ -431,6 +444,12 @@ pub async fn force_recover(
     new_node_id: u64,
 ) -> Result<ForceRecoverReport, String> {
     verify_export(export)?;
+    if export.source_role == "witness" {
+        return Err(
+            "witness force recovery is not implemented; rebuild the witness as a fresh learner"
+                .into(),
+        );
+    }
     if new_node_id == 0 {
         return Err("new node id must be > 0".into());
     }
@@ -528,7 +547,8 @@ pub async fn force_recover(
     db.schema_meta_set("raft_node_id", &new_node_id.to_string())
         .await
         .map_err(|e| e.to_string())?;
-    db.schema_meta_set("raft_bootstrap", "false")
+    // 身份编码只认 "1"/"0"（raft/identity.rs）；写 "false" 会让下次启动被拒。
+    db.schema_meta_set("raft_bootstrap", "0")
         .await
         .map_err(|e| e.to_string())?;
     db.schema_meta_set("raft_initialized", "1")

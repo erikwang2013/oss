@@ -951,13 +951,43 @@ async fn sync_reconcile_cmd(
     bucket: Option<String>,
     json: bool,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    // 运维应在服务停止时运行：AppState::load 会打开 raft.db 并启动单节点运行时。
-    let state = AppState::load(cfg_path).await?;
+    // 离线：绝不 AppState::load（会二次打开 raft.db 并启动运行时/启动对账）。
+    let cfg = crate::config::AppConfig::load(cfg_path)?;
+    let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
+    let drives = cfg
+        .data_dirs
+        .clone()
+        .unwrap_or_else(|| vec![cfg.data_dir.clone()]);
+    let mut sc = xl_store::store::StoreConfig::new(&drives[0]);
+    sc.drives = drives;
+    sc.ec = xl_store::store::ec::EcConfig {
+        data: cfg.ec.data,
+        parity: cfg.ec.parity,
+        enabled: cfg.ec.enabled,
+    };
+    sc.inline_threshold = cfg.ec.inline_threshold;
+    sc.sync_max_bytes = cfg.sync.max_object_bytes;
+    // sync-reconcile 是运维修数据路径：不注入写门（只读对象 + 定点映射写）。
+    sc.gate = None;
+    let store = xl_store::store::Store::open(sc).await?;
+    let master_file = std::env::var("OSS_MASTER_KEY_FILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let kms_dir = std::env::var("OSS_KMS_DIR").ok().filter(|s| !s.is_empty());
+    if master_file.is_some() || kms_dir.is_some() {
+        store
+            .init_encryption(
+                master_file.map(std::path::PathBuf::from),
+                kms_dir.map(std::path::PathBuf::from),
+            )
+            .await?;
+    }
+    let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
     let report = crate::raft::repair::run(
-        &state.db,
-        &state.store,
-        state.vault.as_deref(),
-        state.cfg.sync.max_object_bytes,
+        &db,
+        &store,
+        vault.as_deref(),
+        cfg.sync.max_object_bytes,
         &crate::raft::repair::RepairOptions { bucket, repair },
     )
     .await?;
@@ -978,9 +1008,6 @@ async fn sync_reconcile_cmd(
         for e in &report.errors {
             eprintln!("{} {}@{}: {}", e.bucket, e.key, e.version_id, e.message);
         }
-    }
-    if let Some(h) = &state.raft {
-        h.shutdown().await;
     }
     Ok(if report.has_errors() { 1 } else { 0 })
 }

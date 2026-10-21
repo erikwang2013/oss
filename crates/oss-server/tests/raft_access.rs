@@ -628,7 +628,9 @@ async fn status_reports_real_raft_state_and_ready_flags() {
     assert!(v["term"].as_u64().unwrap() >= 1);
     assert_eq!(v["capabilities"]["raft"], RAFT_READY);
     assert_eq!(v["capabilities"]["sync"], SYNC_READY);
-    assert_eq!(v["capabilities"]["stretch"], STRETCH_READY);
+    // 本测试只有 [raft] 无 [stretch]：能力位按实际配置为 false（与 /api/v1/site 同口径）。
+    assert_eq!(v["capabilities"]["stretch"], false);
+    let _ = STRETCH_READY;
 
     // M7/Local（无 [raft]）：S0 骨架，能力位全 false（与 /api/v1/site 同口径）。
     let m7dir = tempfile::tempdir().unwrap();

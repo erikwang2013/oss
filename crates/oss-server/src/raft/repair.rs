@@ -55,18 +55,31 @@ fn err(
     });
 }
 
-async fn remote_exists(
+/// 内部 `/site/head-object` 的三态：200 对象 / 405 marker / 404 缺失。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteHead {
+    Object,
+    Marker,
+    Missing,
+}
+
+async fn remote_head(
     client: &ReplClient,
     peer_id: &str,
     bucket: &str,
     key: &str,
     version_id: &str,
     token: &str,
-) -> Result<bool, String> {
-    client
+) -> Result<RemoteHead, String> {
+    match client
         .head_object_version(peer_id, bucket, key, version_id, Some(token))
         .await
-        .map_err(|e| e.message)
+    {
+        Ok(true) => Ok(RemoteHead::Object),
+        Ok(false) => Ok(RemoteHead::Marker),
+        Err(e) if e.status == Some(404) => Ok(RemoteHead::Missing),
+        Err(e) => Err(e.message),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,7 +231,7 @@ pub async fn run(
                 report.versions += 1;
                 let local_id = entry.version_id.clone();
                 if entry.is_marker {
-                    let exists = match remote_exists(
+                    match remote_head(
                         &client,
                         &peer.peer_id,
                         bucket,
@@ -228,40 +241,42 @@ pub async fn run(
                     )
                     .await
                     {
-                        Ok(v) => v,
-                        Err(e) => {
-                            err(&mut report, bucket, &entry.key, &local_id, e);
-                            continue;
-                        }
-                    };
-                    if exists {
-                        report.already_ok += 1;
-                        continue;
-                    }
-                    if !opts.repair {
-                        report.markers_pushed += 1;
-                        continue;
-                    }
-                    match client
-                        .delete_marker(
-                            &peer.peer_id,
+                        Err(e) => err(&mut report, bucket, &entry.key, &local_id, e),
+                        Ok(RemoteHead::Marker) => report.already_ok += 1,
+                        Ok(RemoteHead::Object) => err(
+                            &mut report,
                             bucket,
                             &entry.key,
                             &local_id,
-                            Some(&peer.peer_site_token),
-                        )
-                        .await
-                    {
-                        Ok(()) => report.markers_pushed += 1,
-                        Err(e) => {
-                            err(&mut report, bucket, &entry.key, &local_id, e.message);
+                            "id collision: remote object exists with marker id",
+                        ),
+                        Ok(RemoteHead::Missing) => {
+                            if !opts.repair {
+                                report.markers_pushed += 1;
+                                continue;
+                            }
+                            match client
+                                .delete_marker(
+                                    &peer.peer_id,
+                                    bucket,
+                                    &entry.key,
+                                    &local_id,
+                                    Some(&peer.peer_site_token),
+                                )
+                                .await
+                            {
+                                Ok(()) => report.markers_pushed += 1,
+                                Err(e) => {
+                                    err(&mut report, bucket, &entry.key, &local_id, e.message)
+                                }
+                            }
                         }
                     }
                     continue;
                 }
                 let mapped = entry.remote_version_id.as_deref();
                 if mapped == Some(local_id.as_str()) {
-                    match remote_exists(
+                    match remote_head(
                         &client,
                         &peer.peer_id,
                         bucket,
@@ -271,8 +286,16 @@ pub async fn run(
                     )
                     .await
                     {
-                        Ok(true) => report.already_ok += 1,
-                        Ok(false) => {
+                        Err(e) => err(&mut report, bucket, &entry.key, &local_id, e),
+                        Ok(RemoteHead::Object) => report.already_ok += 1,
+                        Ok(RemoteHead::Marker) => err(
+                            &mut report,
+                            bucket,
+                            &entry.key,
+                            &local_id,
+                            "remote marker exists with object id",
+                        ),
+                        Ok(RemoteHead::Missing) => {
                             if opts.repair {
                                 push_version(
                                     store,
@@ -296,12 +319,12 @@ pub async fn run(
                                 );
                             }
                         }
-                        Err(e) => err(&mut report, bucket, &entry.key, &local_id, e),
                     }
                     continue;
                 }
+                let mut try_local = true;
                 if let Some(other) = mapped {
-                    let other_exists = remote_exists(
+                    match remote_head(
                         &client,
                         &peer.peer_id,
                         bucket,
@@ -310,11 +333,80 @@ pub async fn run(
                         &peer.peer_site_token,
                     )
                     .await
-                    .unwrap_or(false);
-                    if other_exists {
+                    {
+                        Ok(RemoteHead::Object) => {
+                            if opts.repair {
+                                match store
+                                    .set_remote_version_id(
+                                        bucket,
+                                        &entry.key,
+                                        &local_id,
+                                        Some(other),
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => report.mappings_written += 1,
+                                    Err(e) => err(
+                                        &mut report,
+                                        bucket,
+                                        &entry.key,
+                                        &local_id,
+                                        format!("map: {e}"),
+                                    ),
+                                }
+                            } else {
+                                report.already_ok += 1;
+                            }
+                            try_local = false;
+                        }
+                        Ok(RemoteHead::Marker) => {
+                            err(
+                                &mut report,
+                                bucket,
+                                &entry.key,
+                                &local_id,
+                                "legacy mapping points at marker",
+                            );
+                            try_local = false;
+                        }
+                        Ok(RemoteHead::Missing) => {}
+                        Err(e) => {
+                            err(&mut report, bucket, &entry.key, &local_id, e);
+                            try_local = false;
+                        }
+                    }
+                }
+                if !try_local {
+                    continue;
+                }
+                // 无有效映射（或旧映射远端已缺失）：本地 id 已在 → 写映射；否则重推同 id。
+                match remote_head(
+                    &client,
+                    &peer.peer_id,
+                    bucket,
+                    &entry.key,
+                    &local_id,
+                    &peer.peer_site_token,
+                )
+                .await
+                {
+                    Err(e) => err(&mut report, bucket, &entry.key, &local_id, e),
+                    Ok(RemoteHead::Marker) => err(
+                        &mut report,
+                        bucket,
+                        &entry.key,
+                        &local_id,
+                        "remote marker exists with object id",
+                    ),
+                    Ok(RemoteHead::Object) => {
                         if opts.repair {
                             match store
-                                .set_remote_version_id(bucket, &entry.key, &local_id, Some(other))
+                                .set_remote_version_id(
+                                    bucket,
+                                    &entry.key,
+                                    &local_id,
+                                    Some(&local_id),
+                                )
                                 .await
                             {
                                 Ok(()) => report.mappings_written += 1,
@@ -329,59 +421,31 @@ pub async fn run(
                         } else {
                             report.already_ok += 1;
                         }
-                        continue;
                     }
-                }
-                // 无有效映射：本地 id 已在 → 写映射；否则重推同 id。
-                let local_exists = remote_exists(
-                    &client,
-                    &peer.peer_id,
-                    bucket,
-                    &entry.key,
-                    &local_id,
-                    &peer.peer_site_token,
-                )
-                .await
-                .unwrap_or(false);
-                if local_exists {
-                    if opts.repair {
-                        match store
-                            .set_remote_version_id(bucket, &entry.key, &local_id, Some(&local_id))
-                            .await
-                        {
-                            Ok(()) => report.mappings_written += 1,
-                            Err(e) => err(
+                    Ok(RemoteHead::Missing) => {
+                        if opts.repair {
+                            push_version(
+                                store,
+                                &client,
+                                &mut report,
+                                &peer.peer_id,
+                                &peer.peer_site_token,
+                                bucket,
+                                &entry.key,
+                                &local_id,
+                                max_object_bytes,
+                            )
+                            .await;
+                        } else {
+                            err(
                                 &mut report,
                                 bucket,
                                 &entry.key,
                                 &local_id,
-                                format!("map: {e}"),
-                            ),
+                                "no remote mapping and no same-id object",
+                            );
                         }
-                    } else {
-                        report.already_ok += 1;
                     }
-                } else if opts.repair {
-                    push_version(
-                        store,
-                        &client,
-                        &mut report,
-                        &peer.peer_id,
-                        &peer.peer_site_token,
-                        bucket,
-                        &entry.key,
-                        &local_id,
-                        max_object_bytes,
-                    )
-                    .await;
-                } else {
-                    err(
-                        &mut report,
-                        bucket,
-                        &entry.key,
-                        &local_id,
-                        "no remote mapping and no same-id object",
-                    );
                 }
             }
             if !page.is_truncated {
@@ -391,7 +455,8 @@ pub async fn run(
             version_marker = page.next_version_id_marker;
         }
     }
-    if opts.repair && !report.has_errors() {
+    // `--bucket` 只用于诊断：未验证其余 sync 桶前不得清站点级门/intents。
+    if opts.repair && opts.bucket.is_none() && !report.has_errors() {
         let mut tx = db.pool().begin().await.map_err(|e| e.to_string())?;
         let intents: u64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_write_intents")
             .fetch_one(&mut *tx)
