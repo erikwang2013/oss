@@ -739,7 +739,24 @@ pub async fn run_offline(
             )
             .await
         }
-        other => Err(format!("{other:?} 尚未实现（S7.3/S7.5）").into()),
+        Command::RaftExport { out, witness } => export_cmd(cfg_path, out, witness).await,
+        Command::RaftCutover {
+            from,
+            peer_config,
+            dry_run,
+            overwrite,
+        } => cutover_cmd(cfg_path, &from, peer_config.as_deref(), dry_run, overwrite).await,
+        Command::RaftForceRecover {
+            from,
+            new_node_id,
+            yes,
+        } => force_recover_cmd(cfg_path, &from, new_node_id, yes).await,
+        Command::SyncReconcile {
+            repair,
+            bucket,
+            json,
+        } => sync_reconcile_cmd(cfg_path, repair, bucket, json).await,
+        other => Err(format!("{other:?} 不是离线命令（内部接线错误）").into()),
     }
 }
 
@@ -764,6 +781,208 @@ async fn membership_rpc(
     let text = resp.text().await.unwrap_or_default();
     println!("{text}");
     Ok(if status.is_success() { 0 } else { 1 })
+}
+
+fn sqlite_url(path: &std::path::Path) -> String {
+    format!("sqlite://{}?mode=rw", path.display())
+}
+
+fn env_has_vault() -> bool {
+    ["OSS_MASTER_KEY_FILE", "OSS_KMS_DIR"].iter().any(|k| {
+        std::env::var(k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+async fn export_cmd(
+    cfg_path: &std::path::Path,
+    out: Option<std::path::PathBuf>,
+    witness: bool,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let (db, source_site, node_id, role, admin, has_vault) = if witness {
+        let w = crate::config::WitnessToml::load(cfg_path)?;
+        let state_db = w.raft.state_db.as_ref().ok_or("witness 缺少 state_db")?;
+        let db = crate::db::Db::connect_offline(&sqlite_url(state_db)).await?;
+        (
+            db,
+            "witness".to_string(),
+            Some(w.raft.node_id),
+            "witness".to_string(),
+            None,
+            None,
+        )
+    } else {
+        let cfg = crate::config::AppConfig::load(cfg_path)?;
+        let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
+        let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
+        let site = db
+            .schema_meta("raft_site_id")
+            .await?
+            .unwrap_or_else(|| "site".into());
+        let admin = db.schema_meta("admin_username").await?;
+        (
+            db,
+            site,
+            Some(raft.node_id),
+            "voter".to_string(),
+            admin,
+            Some(env_has_vault()),
+        )
+    };
+    let export = crate::raft::cutover::build_export(
+        &db,
+        source_site.clone(),
+        node_id,
+        &role,
+        admin,
+        has_vault,
+    )
+    .await?;
+    match out.as_deref() {
+        Some(p) if p != std::path::Path::new("-") => {
+            crate::raft::cutover::write_export(p, &export)?;
+            println!("导出完成: {}", p.display());
+        }
+        _ => println!("{}", serde_json::to_string_pretty(&export)?),
+    }
+    Ok(0)
+}
+
+async fn cutover_cmd(
+    cfg_path: &std::path::Path,
+    from: &std::path::Path,
+    peer_config: Option<&std::path::Path>,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let export = crate::raft::cutover::read_export(from)?;
+    let mut paths = vec![cfg_path.to_path_buf()];
+    if let Some(p) = peer_config {
+        paths.push(p.to_path_buf());
+    }
+    let mut targets = Vec::new();
+    for p in &paths {
+        let cfg = crate::config::AppConfig::load(p)?;
+        let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
+        let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
+        let facts = crate::raft::cutover::TargetFacts {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            has_vault: env_has_vault(),
+            admin_username: db.schema_meta("admin_username").await?,
+            has_cluster: cfg.cluster.is_some(),
+        };
+        let _ = raft;
+        targets.push((p.clone(), db, facts));
+    }
+    // 先 dry-run 全部目标，再写；避免第二个目标失败时第一个已切模式。
+    for (_, db, facts) in &targets {
+        let report = crate::raft::cutover::cutover(
+            db,
+            facts,
+            &export,
+            &crate::raft::cutover::CutoverOptions {
+                dry_run: true,
+                overwrite,
+            },
+        )
+        .await?;
+        if !report.conflicts.is_empty() {
+            for d in &report.conflicts {
+                eprintln!("conflict {} {} {}", d.table, d.key, d.field);
+            }
+        }
+    }
+    if dry_run {
+        println!("dry-run: 校验通过（{} 个目标）", targets.len());
+        return Ok(0);
+    }
+    for (path, db, facts) in &targets {
+        let report = crate::raft::cutover::cutover(
+            db,
+            facts,
+            &export,
+            &crate::raft::cutover::CutoverOptions {
+                dry_run: false,
+                overwrite,
+            },
+        )
+        .await?;
+        println!(
+            "cutover 完成: {} ({} 张表)",
+            path.display(),
+            report.rows.len()
+        );
+    }
+    println!("下一步：A 以 bootstrap=true、B 以 false 启动，配对后 raft-add-witness C");
+    Ok(0)
+}
+
+async fn force_recover_cmd(
+    cfg_path: &std::path::Path,
+    from: &std::path::Path,
+    new_node_id: u64,
+    yes: bool,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    if !yes {
+        return Err("raft-force-recover 需要 --yes 确认".into());
+    }
+    let export = crate::raft::cutover::read_export(from)?;
+    let cfg = crate::config::AppConfig::load(cfg_path)?;
+    let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
+    let settings = crate::raft::RaftSettings::from_toml(raft)?;
+    let raft_db = settings.db_path.clone();
+    let db = crate::db::Db::connect_raft(&cfg.database_url).await?;
+    let report =
+        crate::raft::cutover::force_recover(&db, &raft_db, &settings, &export, new_node_id).await?;
+    println!(
+        "force-recover 完成: node={} voters={:?} raft_db={}",
+        report.node_id,
+        report.voters,
+        report.raft_db.display()
+    );
+    println!("以 bootstrap=false 启动本节点；恢复其他站点后配对；对象数据从备份恢复");
+    Ok(0)
+}
+
+async fn sync_reconcile_cmd(
+    cfg_path: &std::path::Path,
+    repair: bool,
+    bucket: Option<String>,
+    json: bool,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    // 运维应在服务停止时运行：AppState::load 会打开 raft.db 并启动单节点运行时。
+    let state = AppState::load(cfg_path).await?;
+    let report = crate::raft::repair::run(
+        &state.db,
+        &state.store,
+        state.vault.as_deref(),
+        state.cfg.sync.max_object_bytes,
+        &crate::raft::repair::RepairOptions { bucket, repair },
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "buckets={} versions={} already_ok={} mappings_written={} pushed={} markers_pushed={} intents_cleared={} outbox_cleared={}",
+            report.buckets,
+            report.versions,
+            report.already_ok,
+            report.mappings_written,
+            report.pushed,
+            report.markers_pushed,
+            report.intents_cleared,
+            report.outbox_cleared
+        );
+        for e in &report.errors {
+            eprintln!("{} {}@{}: {}", e.bucket, e.key, e.version_id, e.message);
+        }
+    }
+    if let Some(h) = &state.raft {
+        h.shutdown().await;
+    }
+    Ok(if report.has_errors() { 1 } else { 0 })
 }
 
 /// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；

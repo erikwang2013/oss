@@ -408,6 +408,19 @@ impl Db {
     }
 
     /// 仅在 key 不存在时写入（首启身份持久化；返回是否写入）。
+    /// S7.5：无条件写 `schema_meta`（cutover/force-recover 标记）。
+    pub async fn schema_meta_set(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn schema_meta_set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
         let res = sqlx::query("INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)")
             .bind(key)

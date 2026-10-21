@@ -11,10 +11,12 @@
 pub(crate) mod apply;
 pub mod command;
 pub mod control;
+pub mod cutover;
 pub mod data;
 pub mod identity;
 pub mod membership;
 pub mod network;
+pub mod repair;
 pub mod routes;
 pub mod status;
 pub mod store;

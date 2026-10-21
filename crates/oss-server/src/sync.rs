@@ -460,7 +460,13 @@ async fn peer(db: &Db) -> Result<crate::db::SitePeer, GateError> {
             sites.len()
         )));
     }
-    Ok(sites.into_iter().next().expect("len == 1"))
+    let peer = sites.into_iter().next().expect("len == 1");
+    if peer.reconcile_required {
+        return Err(GateError::Unavailable(
+            "peer requires sync-reconcile --repair (B' replacement not complete)".into(),
+        ));
+    }
+    Ok(peer)
 }
 
 fn client(peer: &crate::db::SitePeer) -> Result<ReplClient, GateError> {

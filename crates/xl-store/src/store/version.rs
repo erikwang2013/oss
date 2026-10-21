@@ -134,6 +134,8 @@ pub struct VersionEntry {
     pub replication_status: Option<String>,
     /// M8 S4b：SSE 对象不参与 Transition（sweep 跳过）。
     pub encrypted: bool,
+    /// M9 S7.5：两站同 origin id 映射（sync-reconcile 读/写）。
+    pub remote_version_id: Option<String>,
 }
 
 /// [`Store::list_object_versions`] 的单页结果。
@@ -494,6 +496,34 @@ impl Store {
         // V3①：marker 版本允许携带复制状态（切片 4 DeleteMarkerReplication 成功态依赖；
         // 与 legal-hold 的 marker 拒绝口径有意不同——仅拒「版本不存在」）。
         m.versions[target].replication_status = status.map(str::to_string);
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
+        m.refresh_latest_flags();
+        self.write_meta(bucket, key, &m, Some(&old)).await?;
+        Ok(())
+    }
+
+    /// M9 S7.5：刷新某版本的远端同 id 映射（sync-reconcile 用；不新增版本）。
+    pub async fn set_remote_version_id(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        remote: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(old) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let mut m = old.clone();
+        let target = m
+            .versions
+            .iter()
+            .position(|v| v.version_id_str() == version_id)
+            .ok_or_else(|| Error::NoSuchKey(format!("{key}@{version_id}")))?;
+        m.versions[target].remote_version_id = remote.map(str::to_string);
         if let Some(last) = m.versions.last_mut() {
             last.epoch = Some(old.max_epoch() + 1);
         }
@@ -910,6 +940,7 @@ impl Store {
                     tier_phase: v.tier.as_ref().map(|t| t.phase),
                     replication_status: v.replication_status.clone(),
                     encrypted: v.encryption.is_some(),
+                    remote_version_id: v.remote_version_id.clone(),
                 });
             }
         }
