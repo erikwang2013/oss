@@ -1,11 +1,15 @@
-//! M9 控制面：Raft 基座（S5）。
+//! M9 控制面：Raft 基座（S5）+ 控制命令/apply 门面核（S6a）。
 //!
-//! S0 只提供能力开关；S5 接入 openraft 0.9.25 单节点运行时。命令应用到真实控制表由 S6
-//! 负责，本模块的 `ControlCommand` 只覆盖基座自测用的最小 KV，集成方通过 [`spawn`] 接入。
+//! S5 接入 openraft 0.9.25 单节点运行时；S6a 增加 [`command`]（唯一写意图）、[`apply`]
+//! （自然键映射 + 守卫事务）、[`control`]（Local/Raft 门面）。HTTP 路由与能力开关仍由
+//! S6b-d/S7 接线，[`RAFT_READY`] 保持 false。
 
 // openraft 的 ConfigError/StorageError/RPCError 体积由第三方类型固定，调用方无法瘦身。
 #![allow(clippy::result_large_err)]
 
+pub(crate) mod apply;
+pub mod command;
+pub mod control;
 pub mod network;
 pub mod status;
 pub mod store;
@@ -17,7 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::{BasicNode, Config, Raft};
-use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+
+pub use command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, SizeError};
 
 use store::SqliteStateMachine;
 
@@ -46,18 +52,23 @@ openraft::declare_raft_types!(
         R = ControlResponse,
 );
 
-/// 最小控制命令。S6 用真实实体命令替换/扩展；基座只验证日志、apply 与快照路径。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlCommand {
-    Set { key: String, value: String },
-    Delete { key: String },
+/// Raft 写入口错误：超时（可能已提交）与运行时/转发错误。
+#[derive(Debug)]
+pub enum WriteError {
+    Timeout(Duration),
+    Raft(String),
 }
 
-/// 每条 entry 必须返回一个响应（成员/blank entry 也返回）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlResponse {
-    Ok,
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(d) => write!(f, "raft client_write timed out after {d:?}"),
+            Self::Raft(m) => write!(f, "raft client_write: {m}"),
+        }
+    }
 }
+
+impl std::error::Error for WriteError {}
 
 /// `[raft]` 运行时设置（与 `config::RaftToml` 解耦，测试可不读配置文件）。
 #[derive(Debug, Clone)]
@@ -145,12 +156,12 @@ impl RaftHandle {
     }
 
     /// 应用层 deadline 的写入口：超时返回错误（写可能已提交，调用方按超时语义处理）。
-    pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, String> {
+    pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, WriteError> {
         let timeout = Duration::from_millis(self.settings.write_timeout_ms);
         match tokio::time::timeout(timeout, self.raft.client_write(cmd)).await {
-            Err(_) => Err(format!("raft client_write timed out after {timeout:?}")),
+            Err(_) => Err(WriteError::Timeout(timeout)),
             Ok(Ok(resp)) => Ok(resp.data),
-            Ok(Err(e)) => Err(e.to_string()),
+            Ok(Err(e)) => Err(WriteError::Raft(e.to_string())),
         }
     }
 
@@ -189,12 +200,23 @@ impl RaftHandle {
 ///
 /// `bootstrap=false` 且尚无成员时只启动运行时并等待 leader/join（S7 接线），不报错。
 pub async fn spawn(settings: RaftSettings) -> RaftResult<RaftHandle> {
+    spawn_with_control(settings, None).await
+}
+
+/// S6 生产入口：状态机指向主控制库连接池（apply 与 `raft_applied`/ctx 同库同事务）。
+/// `None` = 基座自测：状态机与日志共用 `raft.db`。
+pub async fn spawn_with_control(
+    settings: RaftSettings,
+    control_pool: Option<SqlitePool>,
+) -> RaftResult<RaftHandle> {
     let config = Arc::new(settings.openraft_config()?);
     let log_store = store::SqliteLogStore::open(&settings.db_path).await?;
     // 未 apply 的成员日志（崩溃窗口）也要阻止再次 initialize；openraft 启动时会重放。
     let has_logs = log_store.has_logs().await?;
-    let state_machine =
-        SqliteStateMachine::open(&settings.db_path, settings.snapshot_max_bytes).await?;
+    let state_machine = match control_pool {
+        Some(pool) => SqliteStateMachine::open_with_pool(pool, settings.snapshot_max_bytes).await?,
+        None => SqliteStateMachine::open(&settings.db_path, settings.snapshot_max_bytes).await?,
+    };
 
     let network = network::HttpNetworkFactory::new(settings.cluster_token.clone());
     let raft = Raft::new(
@@ -278,7 +300,7 @@ mod tests {
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1024,
             write_timeout_ms: 20_000,
-            snapshot_max_chunk_size: 4 * 1024 * 1024,
+            snapshot_max_chunk_size: SNAPSHOT_CHUNK_MAX,
             snapshot_max_bytes: 512 * 1024 * 1024,
         }
     }
@@ -472,6 +494,19 @@ mod tests {
             entries.len()
         );
         assert_eq!(entries.last().unwrap().log_id, last);
+
+        // Minor 1：[start, stop) 语义——Excluded 起点必须跳过该条。
+        let mid = store
+            .try_get_log_entries((
+                std::ops::Bound::Excluded(entries[0].log_id.index),
+                std::ops::Bound::Included(entries[2].log_id.index),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            mid.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![entries[1].log_id.index, entries[2].log_id.index]
+        );
 
         // vote / committed 持久化（重开文件后仍在）。
         let vote = openraft::Vote::new_committed(9, 1);

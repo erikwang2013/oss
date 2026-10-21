@@ -14,6 +14,7 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::entry::RaftPayload;
@@ -26,9 +27,10 @@ use openraft::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use super::{ControlCommand, ControlResponse, TypeConfig};
+use super::apply;
+use super::{ControlResponse, TypeConfig};
 
 /// 日志/元数据 + 基座状态机表。`raft_applied`/`raft_apply_ctx` 与 `0004_m9.sql` 同名同构。
 const SCHEMA: &str = r#"
@@ -160,7 +162,12 @@ impl RaftLogReader<TypeConfig> for SqliteLogStore {
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         let start = match range.start_bound() {
-            Bound::Included(i) | Bound::Excluded(i) => *i,
+            Bound::Included(i) => *i,
+            // [start, stop)：Excluded(i) 从 i+1 开始（Minor 1）。
+            Bound::Excluded(i) => match i.checked_add(1) {
+                Some(v) => v,
+                None => return Ok(Vec::new()),
+            },
             Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
@@ -338,43 +345,84 @@ struct SnapshotData {
     kv: BTreeMap<String, String>,
 }
 
-/// SQLite 状态机：apply 在同一事务内更新数据、`raft_applied`（完整 LogId + 成员）与 apply ctx。
+async fn read_applied(
+    conn: &mut SqliteConnection,
+) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+    let row = sqlx::query("SELECT applied_log_id, membership_json FROM raft_applied WHERE id = 1")
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
+    let Some(row) = row else {
+        return Ok((None, StoredMembership::default()));
+    };
+    let applied: Option<LogId<u64>> = match row.get::<Option<String>, _>("applied_log_id") {
+        Some(s) => decode(ErrorSubject::StateMachine, ErrorVerb::Read, &s)?,
+        None => None,
+    };
+    let membership: StoredMembership<u64, BasicNode> =
+        match row.get::<Option<String>, _>("membership_json") {
+            Some(s) => decode(ErrorSubject::StateMachine, ErrorVerb::Read, &s)?,
+            None => StoredMembership::default(),
+        };
+    Ok((applied, membership))
+}
+
+async fn read_kv(
+    conn: &mut SqliteConnection,
+) -> Result<BTreeMap<String, String>, StorageError<u64>> {
+    let rows = sqlx::query("SELECT key, value FROM raft_kv")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("key"), r.get("value")))
+        .collect())
+}
+
+/// SQLite 状态机：apply 每条 entry 一个事务，更新数据、`raft_applied`（完整 LogId + 成员）
+/// 与 apply ctx 原子提交。生产入口 [`Self::open_with_pool`] 指向主控制库连接池。
 #[derive(Clone)]
 pub struct SqliteStateMachine {
     pool: SqlitePool,
     max_snapshot_bytes: u64,
+    /// build 的 compare-and-write 与 install 的整表替换互斥（旧 build 不得覆盖新快照）。
+    snapshot_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqliteStateMachine {
     pub async fn open(path: &Path, max_snapshot_bytes: u64) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            pool: connect(path).await?,
+        let pool = connect(path).await?;
+        Ok(Self::with_pool(pool, max_snapshot_bytes))
+    }
+
+    /// 主控制库状态机（raft.db 只存日志/投票）。schema 幂等重放，`raft_applied`/ctx 已存在。
+    pub async fn open_with_pool(
+        pool: SqlitePool,
+        max_snapshot_bytes: u64,
+    ) -> Result<Self, sqlx::Error> {
+        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        Ok(Self::with_pool(pool, max_snapshot_bytes))
+    }
+
+    fn with_pool(pool: SqlitePool, max_snapshot_bytes: u64) -> Self {
+        Self {
+            pool,
             max_snapshot_bytes,
-        })
+            snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// 已应用 LogId 与成员（`RaftStateMachine::applied_state` 的固有版本，测试/S6 用）。
     pub async fn applied(
         &self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let row =
-            sqlx::query("SELECT applied_log_id, membership_json FROM raft_applied WHERE id = 1")
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        let Some(row) = row else {
-            return Ok((None, StoredMembership::default()));
-        };
-        let applied: Option<LogId<u64>> = match row.get::<Option<String>, _>("applied_log_id") {
-            Some(s) => decode(ErrorSubject::StateMachine, ErrorVerb::Read, &s)?,
-            None => None,
-        };
-        let membership: StoredMembership<u64, BasicNode> =
-            match row.get::<Option<String>, _>("membership_json") {
-                Some(s) => decode(ErrorSubject::StateMachine, ErrorVerb::Read, &s)?,
-                None => StoredMembership::default(),
-            };
-        Ok((applied, membership))
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
+        read_applied(&mut conn).await
     }
 
     /// 基座 KV 读取（S6 换成控制表查询）。
@@ -387,6 +435,7 @@ impl SqliteStateMachine {
         Ok(row.map(|r| r.get("value")))
     }
 
+    /// I1：applied/membership 与 kv 必须来自同一 SQLite 读快照（单事务两次 SELECT）。
     async fn snapshot_parts(
         &self,
     ) -> Result<
@@ -397,16 +446,46 @@ impl SqliteStateMachine {
         ),
         StorageError<u64>,
     > {
-        let (applied, membership) = self.applied().await?;
-        let rows = sqlx::query("SELECT key, value FROM raft_kv")
-            .fetch_all(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        let kv = rows
-            .into_iter()
-            .map(|r| (r.get("key"), r.get("value")))
-            .collect();
+        let (applied, membership) = read_applied(&mut tx).await?;
+        let kv = read_kv(&mut tx).await?;
+        tx.commit()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
         Ok((applied, membership, kv))
+    }
+
+    /// 仅在比已存快照新时写入；与 install 共用 `snapshot_lock`，避免旧 build 覆盖新行。
+    async fn persist_snapshot(
+        &self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+    ) -> Result<(), StorageError<u64>> {
+        let _guard = self.snapshot_lock.lock().await;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT meta FROM raft_snapshot WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
+        if let Some(json) = current {
+            let existing: SnapshotMeta<u64, BasicNode> =
+                decode(ErrorSubject::Snapshot(None), ErrorVerb::Read, &json)?;
+            if existing.last_log_id >= meta.last_log_id {
+                return Ok(());
+            }
+        }
+        let meta_json = encode(ErrorSubject::Snapshot(None), ErrorVerb::Write, meta)?;
+        sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
+            .bind(meta_json)
+            .bind(bytes)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))
     }
 }
 
@@ -425,72 +504,62 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         I::IntoIter: OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let (mut last_applied, mut last_membership) = self.applied().await?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-
-        // 守卫放行窗口：与数据/raft_applied 同一事务；提交前复位。
-        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-
+        // 成员是跨 entry 状态（空白/成员日志也要落），applied 每条即本 entry。
+        let (_, mut last_membership) = self.applied().await?;
         let mut responses = Vec::with_capacity(entries.len());
+        // 每条 entry 一个事务：控制表写入 + raft_applied + ctx 原子提交。
+        // 失败只回滚当前条（fail-stop 后 openraft 不再前进），已提交条目的响应不重复。
         for entry in &entries {
             let log_id = entry.log_id;
             if let Some(m) = entry.get_membership() {
                 last_membership = StoredMembership::new(Some(log_id), m.clone());
             }
-            match &entry.payload {
-                EntryPayload::Normal(ControlCommand::Set { key, value }) => {
-                    sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
-                        .bind(key)
-                        .bind(value)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
-                        })?;
-                }
-                EntryPayload::Normal(ControlCommand::Delete { key }) => {
-                    sqlx::query("DELETE FROM raft_kv WHERE key = ?")
-                        .bind(key)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
-                        })?;
-                }
-                EntryPayload::Blank | EntryPayload::Membership(_) => {}
-            }
-            last_applied = Some(log_id);
-            responses.push(ControlResponse::Ok);
-        }
 
-        let applied_json = encode(ErrorSubject::StateMachine, ErrorVerb::Write, &last_applied)?;
-        let membership_json = encode(
-            ErrorSubject::StateMachine,
-            ErrorVerb::Write,
-            &last_membership,
-        )?;
-        sqlx::query(
-            "INSERT OR REPLACE INTO raft_applied (id, applied_log_id, membership_json) VALUES (1, ?, ?)",
-        )
-        .bind(applied_json)
-        .bind(membership_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-        sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            // 守卫放行窗口：与数据/raft_applied 同一事务；提交前复位。
+            sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            let response = match &entry.payload {
+                EntryPayload::Normal(cmd) => {
+                    let applied = {
+                        let mut cw = apply::control_tx(&mut tx);
+                        apply::apply_command(&mut cw, cmd).await.map_err(|e| {
+                            storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
+                        })?
+                    };
+                    applied.response
+                }
+                EntryPayload::Blank | EntryPayload::Membership(_) => ControlResponse::Ok,
+            };
+            let applied_json = encode(ErrorSubject::StateMachine, ErrorVerb::Write, &Some(log_id))?;
+            let membership_json = encode(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                &last_membership,
+            )?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO raft_applied (id, applied_log_id, membership_json) VALUES (1, ?, ?)",
+            )
+            .bind(applied_json)
+            .bind(membership_json)
             .execute(&mut *tx)
             .await
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-        tx.commit()
-            .await
-            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            tx.commit()
+                .await
+                .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            responses.push(response);
+        }
         Ok(responses)
     }
 
@@ -532,9 +601,16 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         }
 
         let meta_json = encode(ErrorSubject::Snapshot(None), ErrorVerb::Write, meta)?;
+        // 与 build 的 compare-and-write 互斥；安装期间同样打开守卫窗口（Minor 2），
+        // DELETE/INSERT 与 ctx=1 同事务，提交前复位。
+        let _guard = self.snapshot_lock.lock().await;
         let mut tx = self
             .pool
             .begin()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut *tx)
             .await
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
         sqlx::query("DELETE FROM raft_kv")
@@ -570,6 +646,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
             .bind(meta_json)
             .bind(&bytes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
             .execute(&mut *tx)
             .await
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
@@ -609,6 +689,18 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
         };
         let bytes = serde_json::to_vec(&data)
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+        // Minor 3：构造即拒绝超限快照，避免落库后 install/传输必然失败。
+        if bytes.len() as u64 > self.max_snapshot_bytes {
+            return Err(storage_err(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                std::io::Error::other(format!(
+                    "snapshot {} bytes exceeds limit {} (raft.snapshot_max_bytes)",
+                    bytes.len(),
+                    self.max_snapshot_bytes
+                )),
+            ));
+        }
         let snapshot_id = format!(
             "{}-{}",
             applied.map(|l| l.index).unwrap_or(0),
@@ -622,16 +714,206 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             last_membership: membership,
             snapshot_id,
         };
-        let meta_json = encode(ErrorSubject::Snapshot(None), ErrorVerb::Write, &meta)?;
-        sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
-            .bind(meta_json)
-            .bind(&bytes)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        // I1：读快照与写入之间可能有更新条目被 apply；旧 build 不得覆盖更新的 raft_snapshot。
+        self.persist_snapshot(&meta, &bytes).await?;
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(bytes)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::ControlCommand;
+    use openraft::entry::Entry;
+    use openraft::{CommittedLeaderId, RaftSnapshotBuilder};
+
+    fn log_id(index: u64) -> LogId<u64> {
+        LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+
+    async fn test_machine(dir: &Path) -> (SqliteStateMachine, SqlitePool) {
+        let pool = connect(&dir.join("sm.db")).await.unwrap();
+        let sm = SqliteStateMachine::open_with_pool(pool.clone(), 1024 * 1024)
+            .await
+            .unwrap();
+        (sm, pool)
+    }
+
+    async fn set(sm: &mut SqliteStateMachine, index: u64, value: &str) {
+        RaftStateMachine::<TypeConfig>::apply(
+            sm,
+            [Entry {
+                log_id: log_id(index),
+                payload: EntryPayload::Normal(ControlCommand::Set {
+                    key: "k".into(),
+                    value: value.into(),
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// I1：applied 与 kv 的读取必须落在同一事务快照；并发 apply 不得造成 meta/data 错位。
+    #[tokio::test]
+    async fn snapshot_reads_share_one_transaction_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, pool) = test_machine(dir.path()).await;
+        set(&mut sm, 1, "v1").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            read_kv(&mut tx).await.unwrap().get("k").map(String::as_str),
+            Some("v1")
+        );
+        // 读者事务已取快照；另一连接提交下一条 apply。
+        set(&mut sm, 2, "v2").await;
+        let (applied, _) = read_applied(&mut tx).await.unwrap();
+        assert_eq!(
+            applied,
+            Some(log_id(1)),
+            "applied 与同一读快照的 kv 必须一致（不得读到新 meta + 旧数据）"
+        );
+        assert_eq!(
+            read_kv(&mut tx).await.unwrap().get("k").map(String::as_str),
+            Some("v1")
+        );
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(read_applied(&mut tx).await.unwrap().0, Some(log_id(2)));
+        assert_eq!(
+            read_kv(&mut tx).await.unwrap().get("k").map(String::as_str),
+            Some("v2")
+        );
+    }
+
+    /// I1：build 与 install 交错时，旧 build 不得覆盖更新的 raft_snapshot 行。
+    #[tokio::test]
+    async fn older_snapshot_does_not_overwrite_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, _pool) = test_machine(dir.path()).await;
+        let meta = |index: u64, id: &str| SnapshotMeta {
+            last_log_id: Some(log_id(index)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: id.to_string(),
+        };
+
+        sm.persist_snapshot(&meta(5, "new"), b"new").await.unwrap();
+        sm.persist_snapshot(&meta(3, "old"), b"old").await.unwrap();
+        let snap = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.meta.snapshot_id, "new");
+        assert_eq!(snap.snapshot.get_ref().as_slice(), b"new");
+
+        sm.persist_snapshot(&meta(7, "newer"), b"newer")
+            .await
+            .unwrap();
+        let snap = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.meta.snapshot_id, "newer");
+    }
+
+    /// Minor 2：install 在自身事务里打开守卫窗口，提交前复位。
+    #[tokio::test]
+    async fn install_snapshot_runs_inside_apply_guard_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, pool) = test_machine(dir.path()).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER test_install_guard BEFORE INSERT ON raft_kv \
+             WHEN IFNULL((SELECT active FROM raft_apply_ctx WHERE id = 1), 0) <> 1 \
+             BEGIN SELECT RAISE(ABORT, 'raft: control write outside apply'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let membership = StoredMembership::default();
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id(1)),
+            last_membership: membership.clone(),
+            snapshot_id: "s1".into(),
+        };
+        let data = SnapshotData {
+            applied_log_id: Some(log_id(1)),
+            last_membership: membership,
+            kv: BTreeMap::from([("k".to_string(), "v".to_string())]),
+        };
+        let bytes = serde_json::to_vec(&data).unwrap();
+        RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm,
+            &meta,
+            Box::new(Cursor::new(bytes)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sm.get("k").await.unwrap(), Some("v".to_string()));
+        let active: i64 = sqlx::query_scalar("SELECT active FROM raft_apply_ctx WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 0, "install 提交后守卫窗口必须复位");
+    }
+
+    /// Minor 3：序列化后超限的快照在 build 阶段即拒绝。
+    #[tokio::test]
+    async fn build_snapshot_rejects_serialized_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sm.db");
+        let mut sm = SqliteStateMachine::open(&path, 16).await.unwrap();
+        let err = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("exceeds"), "{err}");
+    }
+
+    /// 每条 entry 恰好一个响应；applied 前进到批内最后一条。
+    #[tokio::test]
+    async fn apply_returns_one_response_per_entry_and_advances_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, _pool) = test_machine(dir.path()).await;
+        let entries = [1, 2].map(|i| Entry {
+            log_id: log_id(i),
+            payload: EntryPayload::Normal(ControlCommand::Set {
+                key: format!("k{i}"),
+                value: "v".into(),
+            }),
+        });
+        let responses = RaftStateMachine::<TypeConfig>::apply(&mut sm, entries)
+            .await
+            .unwrap();
+        assert_eq!(responses, vec![ControlResponse::Ok, ControlResponse::Ok]);
+        assert_eq!(sm.applied().await.unwrap().0, Some(log_id(2)));
+        assert_eq!(sm.get("k1").await.unwrap(), Some("v".to_string()));
+        assert_eq!(sm.get("k2").await.unwrap(), Some("v".to_string()));
+    }
+
+    /// apply 在自身事务里打开守卫窗口，提交前复位（Minor 2 的 apply 侧对照）。
+    #[tokio::test]
+    async fn apply_opens_guard_window_and_resets_ctx() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, pool) = test_machine(dir.path()).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER test_apply_guard BEFORE INSERT ON raft_kv \
+             WHEN IFNULL((SELECT active FROM raft_apply_ctx WHERE id = 1), 0) <> 1 \
+             BEGIN SELECT RAISE(ABORT, 'raft: control write outside apply'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        set(&mut sm, 1, "v").await;
+        let active: i64 = sqlx::query_scalar("SELECT active FROM raft_apply_ctx WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 0);
     }
 }

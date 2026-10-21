@@ -13,6 +13,15 @@ fn db_url(dir: &std::path::Path) -> String {
     format!("sqlite://{}?mode=rwc", dir.join("m9.db").display())
 }
 
+/// S6a 起 `Db::set_raft_apply_ctx` 模块私有；测试用同语义原始 SQL 搭 apply 事务窗口。
+async fn set_apply_ctx(db: &Db, active: bool) {
+    sqlx::query("UPDATE raft_apply_ctx SET active = ? WHERE id = 1")
+        .bind(active as i64)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
 async fn count_triggers(db: &Db, pattern: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE ?")
         .bind(pattern)
@@ -227,7 +236,7 @@ async fn m9_guards_block_outside_apply_with_admin_exceptions() {
     );
 
     // apply 事务内造数据（非管理员用户 + AK + 管理员）
-    db.set_raft_apply_ctx(true).await.unwrap();
+    set_apply_ctx(&db, true).await;
     sqlx::query(
         "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES ('u','h',0,0)",
     )
@@ -246,7 +255,7 @@ async fn m9_guards_block_outside_apply_with_admin_exceptions() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    db.set_raft_apply_ctx(false).await.unwrap();
+    set_apply_ctx(&db, false).await;
 
     // 例外：session AK、管理员属主 AK、管理员 permissions、admin 用户行
     for sql in [
@@ -283,9 +292,9 @@ async fn m9_guards_block_outside_apply_with_admin_exceptions() {
     );
 
     // apply ctx 放行桶写
-    db.set_raft_apply_ctx(true).await.unwrap();
+    set_apply_ctx(&db, true).await;
     db.insert_bucket("applied", None).await.unwrap();
-    db.set_raft_apply_ctx(false).await.unwrap();
+    set_apply_ctx(&db, false).await;
     assert!(db.bucket_exists("applied").await.unwrap());
 }
 
