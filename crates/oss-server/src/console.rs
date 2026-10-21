@@ -50,6 +50,35 @@ fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
+/// M9 S6b：控制写失败 → HTTP（413/503 带原因；500 不泄漏内部）。
+/// 503 的文本含 raft/forward 提示（3 节点转发与 leader hint 由 S7 接线）。
+fn control_failure(e: crate::raft::control::ControlError) -> Response {
+    match e.http_status() {
+        413 => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
+        503 => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+        _ => {
+            tracing::error!(error = %e, "控制写失败");
+            internal_error()
+        }
+    }
+}
+
+/// M9 S6b：apply 业务拒绝 → 与 `raft::control::response_status` 完全一致
+/// （Ok 200 / BucketNotEmpty+Conflict 409 / NotFound 404 / Invalid 400），绝不静默 204。
+/// `Ok` 由调用方处理，传进来按 500 兜底（不应发生）。
+fn control_rejection(resp: crate::raft::ControlResponse, conflict: &'static str) -> Response {
+    match resp {
+        crate::raft::ControlResponse::NotFound => StatusCode::NOT_FOUND.into_response(),
+        crate::raft::ControlResponse::BucketNotEmpty | crate::raft::ControlResponse::Conflict => {
+            (StatusCode::CONFLICT, conflict).into_response()
+        }
+        crate::raft::ControlResponse::Invalid => {
+            (StatusCode::BAD_REQUEST, "invalid control command").into_response()
+        }
+        crate::raft::ControlResponse::Ok => internal_error(),
+    }
+}
+
 /// JWT 有效但用户在库里没了（被删）：401 与 JwtLayer 同形，前端会清 token 回登录页。
 fn stale_user() -> Response {
     (
@@ -2259,7 +2288,7 @@ async fn create_access_key(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateKeyBody>,
 ) -> impl IntoResponse {
-    let (uid, _) = match who(&state, &payload).await {
+    let (uid, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -2298,16 +2327,42 @@ async fn create_access_key(
         },
         None => sk.clone(),
     };
-    match state.db.create_access_key(&ak, &stored, uid).await {
-        Ok(()) => Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response(),
-        // UNIQUE 冲突说人话；不落 sqlite 原文
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            (StatusCode::BAD_REQUEST, "access key 已存在").into_response()
+    // M9 S6b：仅 Raft 模式且非管理员属主走控制命令（K1）；M7/standalone 与 K2（管理员
+    // 属主，guard 例外）保持原直写路径不变——ak/sk 与 created_at 在 append 前算好。
+    if !state.control.is_raft() || is_admin {
+        return match state.db.create_access_key(&ak, &stored, uid).await {
+            Ok(()) => {
+                Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response()
+            }
+            // UNIQUE 冲突说人话；不落 sqlite 原文
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                (StatusCode::BAD_REQUEST, "access key 已存在").into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "写入访问密钥失败");
+                internal_error()
+            }
+        };
+    }
+    let username = match state.db.get_user(uid).await {
+        Ok(Some((name, _, _))) => name,
+        _ => return stale_user(),
+    };
+    let cmd = crate::raft::ControlCommand::AccessKeyCreate {
+        access_key: ak.clone(),
+        secret_key: stored,
+        username,
+        kind: "long-term".into(),
+        parent_ak: None,
+        session_policy: None,
+        created_at: crate::db::now(),
+    };
+    match state.control.write(cmd).await {
+        Ok(crate::raft::ControlResponse::Ok) => {
+            Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %e, "写入访问密钥失败");
-            internal_error()
-        }
+        Ok(resp) => control_rejection(resp, "access key 已存在"),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -2353,15 +2408,47 @@ async fn create_user(
     if body.password.len() < 8 {
         return (StatusCode::BAD_REQUEST, "口令过短（至少 8 位）").into_response();
     }
-    match state.db.create_user(username, &body.password, false).await {
-        Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            (StatusCode::BAD_REQUEST, "用户名已存在").into_response()
+    // M9 S6b：M7/standalone 保持原直写路径不变；只有 Raft 模式走控制命令。
+    if !state.control.is_raft() {
+        return match state.db.create_user(username, &body.password, false).await {
+            Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                (StatusCode::BAD_REQUEST, "用户名已存在").into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "创建用户失败");
+                internal_error()
+            }
+        };
+    }
+    // M9 S6b U1：Argon2 与 created_at 在 append 前算好；apply 只写行（is_admin 恒 0）。
+    let cmd = crate::raft::ControlCommand::UserCreate {
+        username: username.to_string(),
+        password_hash: crate::db::hash_password(&body.password),
+        status: "active".into(),
+        created_at: crate::db::now(),
+    };
+    match state.control.write(cmd).await {
+        Ok(crate::raft::ControlResponse::Ok) => {
+            // 命令不带本地自增 id（跨站点自然键是 username），提交后回查一次。
+            match sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ?")
+                .bind(username)
+                .fetch_optional(state.db.pool())
+                .await
+            {
+                Ok(Some(id)) => Json(serde_json::json!({ "id": id })).into_response(),
+                Ok(None) => {
+                    tracing::error!(user = %username, "建用户已提交但回查不到行");
+                    internal_error()
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "回查新用户失败");
+                    internal_error()
+                }
+            }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "创建用户失败");
-            internal_error()
-        }
+        Ok(resp) => control_rejection(resp, "用户名已存在"),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -2378,38 +2465,53 @@ async fn delete_user(
     if id == me {
         return (StatusCode::BAD_REQUEST, "不能删除自己").into_response();
     }
-    match state.db.get_user(id).await {
-        Ok(Some((_, true, _))) => match state.db.count_admins().await {
+    let (username, is_admin) = match state.db.get_user(id).await {
+        Ok(Some((name, true, _))) => match state.db.count_admins().await {
             Ok(n) if n <= 1 => {
                 return (StatusCode::BAD_REQUEST, "不能删除最后一个管理员").into_response();
             }
-            Ok(_) => {}
+            Ok(_) => (name, true),
             Err(e) => {
                 tracing::error!(error = %e, "统计管理员失败");
                 return internal_error();
             }
         },
-        Ok(Some((_, false, _))) => {}
+        Ok(Some((name, false, _))) => (name, false),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
             return internal_error();
         }
-    }
-    match state.db.delete_user(id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        // 上面的预检给友好文案；false 且用户仍在 = 并发下守卫触发（评审 P2 的原子兜底）
-        Ok(false) => {
-            if matches!(state.db.get_user(id).await, Ok(Some(_))) {
-                (StatusCode::BAD_REQUEST, "不能删除最后一个在册管理员").into_response()
-            } else {
-                StatusCode::NOT_FOUND.into_response()
+    };
+    // M9 S6b：管理员账号是本地 guard 例外，且 M7/standalone 保持原路径不变。
+    if !state.control.is_raft() || is_admin {
+        return match state.db.delete_user(id).await {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            // 预检给友好文案；false 且用户仍在 = 并发下守卫触发（评审 P2 的原子兜底）
+            Ok(false) => {
+                if matches!(state.db.get_user(id).await, Ok(Some(_))) {
+                    (StatusCode::BAD_REQUEST, "不能删除最后一个在册管理员").into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
             }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "删除用户失败");
-            internal_error()
-        }
+            Err(e) => {
+                tracing::error!(error = %e, "删除用户失败");
+                internal_error()
+            }
+        };
+    }
+    // M9 S6b U2：命令以 username 为业务键；apply 事务内重跑最后管理员守卫与全量级联
+    // （AKs/permissions/buckets.owner_id/uploads.owner_id）。
+    match state
+        .control
+        .write(crate::raft::ControlCommand::UserDelete { username })
+        .await
+    {
+        Ok(crate::raft::ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        // 预检给友好文案；Conflict = 并发下 apply 守卫触发（评审 P2 的原子兜底）
+        Ok(resp) => control_rejection(resp, "不能删除最后一个在册管理员"),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -2431,13 +2533,47 @@ async fn reset_password(
     if body.password.len() < 8 {
         return (StatusCode::BAD_REQUEST, "口令过短（至少 8 位）").into_response();
     }
-    match state.db.set_password(id, &body.password).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+    if !state.control.is_raft() {
+        return match state.db.set_password(id, &body.password).await {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "重置口令失败");
+                internal_error()
+            }
+        };
+    }
+    let (username, is_admin) = match state.db.get_user(id).await {
+        Ok(Some((name, is_admin, _))) => (name, is_admin),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "重置口令失败");
-            internal_error()
+            tracing::error!(error = %e, "查询用户失败");
+            return internal_error();
         }
+    };
+    // M9 S6b：管理员账号是本地 guard 例外（不进复制集）。
+    if is_admin {
+        return match state.db.set_password(id, &body.password).await {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "重置口令失败");
+                internal_error()
+            }
+        };
+    }
+    // M9 S6b U3：hash 在 append 前算好；apply 只更新 password_hash。
+    match state
+        .control
+        .write(crate::raft::ControlCommand::UserSetPassword {
+            username,
+            password_hash: crate::db::hash_password(&body.password),
+        })
+        .await
+    {
+        Ok(crate::raft::ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(resp) => control_rejection(resp, "重置口令冲突"),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -2480,29 +2616,55 @@ async fn set_user_permissions(
     if let Err(r) = admin_of(&state, &payload).await {
         return r;
     }
-    match state.db.get_user(id).await {
-        Ok(Some(_)) => {}
+    let (username, is_admin) = match state.db.get_user(id).await {
+        Ok(Some((name, is_admin, _))) => (name, is_admin),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
             return internal_error();
         }
+    };
+    // M9 S6b：管理员目标与 M7/standalone 保持原直写路径不变。
+    if !state.control.is_raft() || is_admin {
+        let rows: Vec<crate::db::PermissionRow> = body
+            .into_iter()
+            .map(|p| crate::db::PermissionRow {
+                bucket: p.bucket,
+                read: p.read,
+                write: p.write,
+                delete: p.delete,
+            })
+            .collect();
+        return match state.db.set_permissions(id, &rows).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "写入权限失败");
+                internal_error()
+            }
+        };
     }
-    let rows: Vec<crate::db::PermissionRow> = body
+    // M9 S6b U6：自然键 (username,bucket,3 bits)；apply 全量替换并丢弃全 0 行
+    //（无行 = 无权限，与旧 set_permissions 一致）。本地 id 不进命令。
+    let permissions: Vec<crate::raft::PermissionBits> = body
         .into_iter()
-        .map(|p| crate::db::PermissionRow {
+        .map(|p| crate::raft::PermissionBits {
             bucket: p.bucket,
             read: p.read,
             write: p.write,
             delete: p.delete,
         })
         .collect();
-    match state.db.set_permissions(id, &rows).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "写入权限失败");
-            internal_error()
-        }
+    match state
+        .control
+        .write(crate::raft::ControlCommand::UserSetPermissions {
+            username,
+            permissions,
+        })
+        .await
+    {
+        Ok(crate::raft::ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(resp) => control_rejection(resp, "权限写入冲突"),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -2521,7 +2683,7 @@ async fn change_my_password(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<ChangePasswordBody>,
 ) -> Response {
-    let (uid, _) = match who(&state, &payload).await {
+    let (uid, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -2540,12 +2702,29 @@ async fn change_my_password(
             return internal_error();
         }
     }
-    match state.db.set_password(uid, &body.new_password).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "改密失败");
-            internal_error()
-        }
+    // M9 S6b：管理员账号是本地 guard 例外；M7/standalone 走原直写路径。
+    if !state.control.is_raft() || is_admin {
+        return match state.db.set_password(uid, &body.new_password).await {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "写入口令失败");
+                internal_error()
+            }
+        };
+    }
+    // M9 S6b U4：verify 只读（H1 已抑制 Argon2 透明升级）；改密本身必须走控制命令。
+    match state
+        .control
+        .write(crate::raft::ControlCommand::UserSetPassword {
+            username,
+            password_hash: crate::db::hash_password(&body.new_password),
+        })
+        .await
+    {
+        Ok(crate::raft::ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::raft::ControlResponse::NotFound) => stale_user(),
+        Ok(resp) => control_rejection(resp, "改密冲突"),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -2569,38 +2748,48 @@ async fn set_user_status(
     if id == me && !body.active {
         return (StatusCode::BAD_REQUEST, "不能停用自己").into_response();
     }
-    match state.db.get_user(id).await {
-        Ok(Some((_, true, _))) if !body.active => match state.db.count_active_admins().await {
+    let (username, is_admin) = match state.db.get_user(id).await {
+        Ok(Some((name, true, _))) if !body.active => match state.db.count_active_admins().await {
             Ok(n) if n <= 1 => {
                 return (StatusCode::BAD_REQUEST, "不能停用最后一个在册管理员").into_response();
             }
-            Ok(_) => {}
+            Ok(_) => (name, true),
             Err(e) => {
                 tracing::error!(error = %e, "统计管理员失败");
                 return internal_error();
             }
         },
-        Ok(Some(_)) => {}
+        Ok(Some((name, is_admin, _))) => (name, is_admin),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
             return internal_error();
         }
-    }
-    match state.db.set_user_status(id, body.active).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        // 上面的预检给友好文案；false 且用户仍在 = 并发下守卫触发（评审 P2 的原子兜底）
-        Ok(false) => {
-            if matches!(state.db.get_user(id).await, Ok(Some(_))) {
-                (StatusCode::BAD_REQUEST, "不能停用最后一个在册管理员").into_response()
-            } else {
-                StatusCode::NOT_FOUND.into_response()
+    };
+    // M9 S6b：管理员账号是本地 guard 例外；M7/standalone 走原直写路径。
+    if !state.control.is_raft() || is_admin {
+        return match state.db.set_user_status(id, body.active).await {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "启停用账号失败");
+                internal_error()
             }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "更新用户状态失败");
-            internal_error()
-        }
+        };
+    }
+    // M9 S6b U5：预检保留（友好文案），最后管理员守卫在 apply 内原子重检。
+    let status = if body.active { "active" } else { "disabled" };
+    match state
+        .control
+        .write(crate::raft::ControlCommand::UserSetStatus {
+            username,
+            status: status.into(),
+        })
+        .await
+    {
+        Ok(crate::raft::ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(resp) => control_rejection(resp, "不能停用最后一个在册管理员"),
+        Err(e) => control_failure(e),
     }
 }
 

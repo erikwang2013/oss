@@ -14,6 +14,8 @@ pub struct SigV4Auth {
     /// M5 切片 6：SK 加密库（None = 未启用=明文直存；T2/T3）。扇出路径携带**封存字节**
     /// （mesh 上不出现明文 SK），消费端（本处）统一解密。
     vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
+    /// M9 S6b H2：Raft 模式下 `access_keys` 只能由 apply 写——禁止透明重封（明文行为）。
+    raft_mode: bool,
 }
 
 impl SigV4Auth {
@@ -22,6 +24,7 @@ impl SigV4Auth {
             pool,
             mesh: None,
             vault: None,
+            raft_mode: false,
         }
     }
 
@@ -31,6 +34,7 @@ impl SigV4Auth {
             pool,
             mesh,
             vault: None,
+            raft_mode: false,
         }
     }
 
@@ -40,6 +44,13 @@ impl SigV4Auth {
         vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
     ) -> Self {
         self.vault = vault;
+        self
+    }
+
+    /// M9 S6b H2：`true` = Raft 控制面（router 依 `state.control.is_raft()` 注入）。
+    /// 明文 SK 不许就地重封——`UPDATE access_keys` 只能发生在 apply 事务内。
+    pub fn with_raft_mode(mut self, on: bool) -> Self {
+        self.raft_mode = on;
         self
     }
 
@@ -59,6 +70,17 @@ impl SigV4Auth {
         match v.open(&raw).await {
             Ok(Some(plain)) => Ok(plain),
             Ok(None) => {
+                if local && self.raft_mode {
+                    // H2：apply 之外禁止写 access_keys（随机 nonce 会让各站点密文分叉）。
+                    tracing::error!(
+                        access_key,
+                        "Raft 模式下 SK 为明文（无法用共享库解密），拒绝透明重封——需经控制命令写入"
+                    );
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "internal error",
+                    ));
+                }
                 if local {
                     match v.seal(&raw).await {
                         Ok(sealed) => {
@@ -388,6 +410,62 @@ mod tests {
         assert!(
             auth_novault.get_secret_key("AKIA_PLAIN").await.is_err(),
             "已迁移为密文的行在无库实例下必须拒"
+        );
+    }
+
+    /// M9 S6b H2：Raft 模式下明文 SK **不得**就地重封（`access_keys` 只能经 apply 写）；
+    /// 密文行仍可解（共享库），M7 实例仍保留透明重封行为。
+    #[tokio::test]
+    async fn raft_mode_suppresses_plaintext_sk_reseal() {
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        let td = tempfile::tempdir().unwrap();
+        let v = vault(&td).await;
+        insert_key(&pool, "AKIA_RAFT_PLAIN", "SK_RAFT_PLAIN_01", None).await;
+        let sealed = v.seal("SK_RAFT_SEALED_01").await.unwrap();
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) \
+             VALUES ('AKIA_RAFT_ENC', ?, 1, 0)",
+        )
+        .bind(&sealed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let raft = SigV4Auth::new(pool.clone())
+            .with_vault(Some(v.clone()))
+            .with_raft_mode(true);
+        // 明文行：拒绝认证且**一行不写**（无 UPDATE，密文不变）。
+        let err = raft.get_secret_key("AKIA_RAFT_PLAIN").await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError, "{err:?}");
+        let stored: String = sqlx::query_scalar(
+            "SELECT secret_key FROM access_keys WHERE access_key = 'AKIA_RAFT_PLAIN'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, "SK_RAFT_PLAIN_01", "Raft 模式禁止透明重封");
+        // 封存行（共享库可解）照常认证。
+        assert_eq!(
+            raft.get_secret_key("AKIA_RAFT_ENC").await.unwrap().expose(),
+            "SK_RAFT_SEALED_01"
+        );
+
+        // M7/standalone（默认）：同一明文行照旧透明重封为密文。
+        let m7 = SigV4Auth::new(pool.clone()).with_vault(Some(v));
+        assert_eq!(
+            m7.get_secret_key("AKIA_RAFT_PLAIN").await.unwrap().expose(),
+            "SK_RAFT_PLAIN_01"
+        );
+        let migrated: String = sqlx::query_scalar(
+            "SELECT secret_key FROM access_keys WHERE access_key = 'AKIA_RAFT_PLAIN'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            xl_store::kms::is_sealed(&migrated),
+            "M7 透明重封必须保留：{migrated}"
         );
     }
 
