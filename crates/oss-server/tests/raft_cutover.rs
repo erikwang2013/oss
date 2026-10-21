@@ -53,6 +53,25 @@ fn facts() -> TargetFacts {
     }
 }
 
+fn raft_settings(node_id: u64, role: RaftRole, db_path: std::path::PathBuf) -> RaftSettings {
+    RaftSettings {
+        node_id,
+        role,
+        bootstrap: false,
+        advertise_endpoint: "http://127.0.0.1:1".into(),
+        cluster_token: "recover-token".into(),
+        db_path,
+        election_timeout_ms: 500,
+        heartbeat_interval_ms: 100,
+        install_snapshot_timeout_ms: 5_000,
+        max_in_snapshot_log_to_keep: 0,
+        purge_batch_size: 1024,
+        write_timeout_ms: 5_000,
+        snapshot_max_chunk_size: 4 * 1024 * 1024,
+        snapshot_max_bytes: 512 * 1024 * 1024,
+    }
+}
+
 #[tokio::test]
 async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -177,22 +196,7 @@ async fn force_recover_fresh_log_and_refuses_existing() {
     .unwrap();
 
     let raft_db = dir.path().join("fresh-raft.db");
-    let settings = RaftSettings {
-        node_id: 7,
-        role: RaftRole::Voter,
-        bootstrap: false,
-        advertise_endpoint: "http://127.0.0.1:1".into(),
-        cluster_token: "recover-token".into(),
-        db_path: raft_db.clone(),
-        election_timeout_ms: 500,
-        heartbeat_interval_ms: 100,
-        install_snapshot_timeout_ms: 5_000,
-        max_in_snapshot_log_to_keep: 0,
-        purge_batch_size: 1024,
-        write_timeout_ms: 5_000,
-        snapshot_max_chunk_size: 4 * 1024 * 1024,
-        snapshot_max_bytes: 512 * 1024 * 1024,
-    };
+    let settings = raft_settings(7, RaftRole::Voter, raft_db.clone());
     let report = cutover::force_recover(&dst, &raft_db, &settings, &export, 7)
         .await
         .unwrap();
@@ -225,4 +229,99 @@ async fn force_recover_fresh_log_and_refuses_existing() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn cutover_diff_reports_changed_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "src3.db").await;
+    seed_admin_and_rows(&src).await;
+    let export = cutover::build_export(
+        &src,
+        "site-a".into(),
+        Some(1),
+        "voter",
+        Some("admin".into()),
+        Some(false),
+    )
+    .await
+    .unwrap();
+    let dst = db_at(dir.path(), "dst3.db").await;
+    seed_admin_and_rows(&dst).await;
+    sqlx::query("UPDATE buckets SET versioning = 'Suspended' WHERE name = 'b1'")
+        .execute(dst.pool())
+        .await
+        .unwrap();
+    let err = cutover::cutover(&dst, &facts(), &export, &CutoverOptions::default())
+        .await
+        .unwrap_err();
+    let CutoverError::Conflict(diffs) = err else {
+        panic!("expected conflict, got {err}");
+    };
+    // 只有 bucket.versioning 不同 → 一条字段级冲突，而不是整行。
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert_eq!(diffs[0].table, "buckets");
+    assert_eq!(diffs[0].key, "b1");
+    assert_eq!(diffs[0].field, "versioning");
+    assert_eq!(diffs[0].source.as_deref(), Some("\"Enabled\""));
+    assert_eq!(diffs[0].target.as_deref(), Some("\"Suspended\""));
+}
+
+#[tokio::test]
+async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    // 导出内容与来源库模式无关：witness 的 11 张表同样由 apply 写入；这里用可播种的
+    // M7 库造同形导出，并标记 source_role=witness。
+    let src = db_at(dir.path(), "w-src.db").await;
+    seed_admin_and_rows(&src).await;
+    let export = cutover::build_export(&src, "witness".into(), Some(3), "witness", None, None)
+        .await
+        .unwrap();
+
+    let dst_url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("w-dst.db").display()
+    );
+    let dst = Db::connect_witness(&dst_url).await.unwrap();
+    let raft_db = dir.path().join("w-fresh-raft.db");
+    let settings = raft_settings(3, RaftRole::Witness, raft_db.clone());
+    let report = cutover::force_recover(&dst, &raft_db, &settings, &export, 3)
+        .await
+        .unwrap();
+    assert_eq!(report.node_id, 3);
+    assert_eq!(report.voters, vec![3]);
+    // witness 无本地管理员也能安装（AP/inventory 属主写哨兵 0）。
+    let buckets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name = 'b1'")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    assert_eq!(buckets, 1);
+    for (key, want) in [
+        ("raft_node_id", "3"),
+        ("raft_bootstrap", "0"),
+        ("raft_initialized", "1"),
+    ] {
+        assert_eq!(
+            dst.schema_meta(key).await.unwrap().as_deref(),
+            Some(want),
+            "{key}"
+        );
+    }
+    assert!(
+        dst.schema_meta("raft_force_recover")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // witness 重启（bootstrap=false + role=witness）必须通过身份校验：
+    // voter 校验 site_id，witness 无 site_config、跳过该项。
+    oss_server::raft::identity::verify_and_seed(&dst, &settings)
+        .await
+        .unwrap();
+    let handle = oss_server::raft::spawn_with_control(settings, Some(dst.pool().clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(oss_server::raft::membership::view(&handle).voters, vec![3]);
+    handle.shutdown().await;
 }

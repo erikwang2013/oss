@@ -36,7 +36,7 @@ pub const USAGE: &str = "\
   raft-cutover --from PATH [--peer-config PATH] [--dry-run] [--overwrite]
                  以导出文件割接控制面（S7.5）
   raft-force-recover --from PATH --node-id N --yes
-                 从导出文件重建 N 的单节点集群（S7.5）
+                 从导出文件重建 N 的单节点集群（数据站点或 witness 配置；S7.5）
   sync-reconcile [--repair] [--bucket B] [--json]
                  B′ 站点对账（S7.5）
 ";
@@ -929,11 +929,30 @@ async fn force_recover_cmd(
         return Err("raft-force-recover 需要 --yes 确认".into());
     }
     let export = crate::raft::cutover::read_export(from)?;
-    let cfg = crate::config::AppConfig::load(cfg_path)?;
-    let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
-    let settings = crate::raft::RaftSettings::from_toml(raft)?;
-    let raft_db = settings.db_path.clone();
-    let db = crate::db::Db::connect_raft(&cfg.database_url).await?;
+    // 数据站点配置优先；否则按 witness 配置（仅 [raft]）打开 state_db。
+    let (db, settings, raft_db) = match crate::config::AppConfig::load(cfg_path) {
+        Ok(cfg) => {
+            let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
+            let settings = crate::raft::RaftSettings::from_toml(raft)?;
+            let raft_db = settings.db_path.clone();
+            let db = crate::db::Db::connect_raft(&cfg.database_url).await?;
+            (db, settings, raft_db)
+        }
+        Err(_) => {
+            let w = crate::config::WitnessToml::load(cfg_path)?;
+            let state_db = w.raft.state_db.as_ref().ok_or("witness 缺少 state_db")?;
+            let settings = crate::raft::RaftSettings::from_toml(&w.raft)?;
+            let raft_db = settings.db_path.clone();
+            for p in [state_db.as_path(), raft_db.as_path()] {
+                if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
+            let url = format!("sqlite://{}?mode=rwc", state_db.display());
+            let db = crate::db::Db::connect_witness(&url).await?;
+            (db, settings, raft_db)
+        }
+    };
     let report =
         crate::raft::cutover::force_recover(&db, &raft_db, &settings, &export, new_node_id).await?;
     println!(
