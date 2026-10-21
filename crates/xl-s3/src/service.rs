@@ -529,12 +529,14 @@ fn now_secs() -> i64 {
 fn bucket_control_error(e: BucketControlError) -> s3s::S3Error {
     match e {
         BucketControlError::NotFound => s3s::s3_error!(NoSuchBucket, "bucket not found"),
+        // M-3：非建桶路径的 Conflict 是状态冲突，不是「同名桶已存在」。
         BucketControlError::Conflict => {
             s3s::s3_error!(
-                BucketAlreadyExists,
+                OperationAborted,
                 "bucket request conflicts with current state"
             )
         }
+        BucketControlError::NotEmpty => s3s::s3_error!(BucketNotEmpty, "bucket is not empty"),
         BucketControlError::Invalid => s3s::s3_error!(InvalidRequest, "invalid bucket request"),
         BucketControlError::TooLarge => {
             s3s::s3_error!(EntityTooLarge, "control command exceeds raft limit")
@@ -546,6 +548,56 @@ fn bucket_control_error(e: BucketControlError) -> s3s::S3Error {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "internal error")
         }
     }
+}
+
+/// 建桶专用：apply 的 Conflict = 同名桶已存在（模型冲突在 apply 前已预检 409）。
+fn bucket_create_error(e: BucketControlError) -> s3s::S3Error {
+    match e {
+        BucketControlError::Conflict => {
+            s3s::s3_error!(BucketAlreadyExists, "bucket already exists")
+        }
+        other => bucket_control_error(other),
+    }
+}
+
+/// 桶策略校验与 console `put_policy` 同口径：≤64 KiB、顶层对象、`PolicyDoc` 可解析、
+/// ≤100 条 statement、语义校验通过。
+fn validate_bucket_policy(body: &str) -> S3Result<()> {
+    if body.len() > 64 * 1024 {
+        return Err(s3s::s3_error!(InvalidRequest, "policy exceeds 64 KiB"));
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) if v.is_object() => {}
+        Ok(_) => {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "policy must be a JSON object"
+            ));
+        }
+        Err(e) => {
+            return Err(s3s::s3_error!(InvalidRequest, "policy parse error: {e}"));
+        }
+    }
+    match serde_json::from_str::<crate::policy::PolicyDoc>(body) {
+        Ok(doc) => {
+            if doc.statement.len() > 100 {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "policy has too many statements (max 100)"
+                ));
+            }
+            if let Err(m) = doc.validate() {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "policy validation failed: {m}"
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(s3s::s3_error!(InvalidRequest, "policy parse error: {e}"));
+        }
+    }
+    Ok(())
 }
 
 /// M8 S4b：GET/HEAD 的 `x-amz-restore` 三态（Archived 无头；Restoring ongoing；
@@ -916,7 +968,7 @@ impl S3 for OssS3 {
                 default_encryption: None,
             })
             .await
-            .map_err(bucket_control_error)?;
+            .map_err(bucket_create_error)?;
             self.store.invalidate_gate(&bucket);
             self.store.broadcast_bucket_row(&bucket, Some(0)).await;
             return Ok(S3Response::new(CreateBucketOutput::default()));
@@ -2443,6 +2495,42 @@ impl S3 for OssS3 {
         ))
     }
 
+    /// M9 S6c（B16）：桶策略全量替换。Raft 一条 `BucketSetPolicy`；M7 保持 s3s 的
+    /// NotImplemented（本服务此前未实现 S3 桶策略写，行为不变）。
+    async fn put_bucket_policy(
+        &self,
+        req: S3Request<PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        let Some(sink) = &self.bucket_control else {
+            return Err(s3s::s3_error!(
+                NotImplemented,
+                "PutBucketPolicy is not implemented yet"
+            ));
+        };
+        validate_bucket_policy(&req.input.policy)?;
+        sink.set_policy(&req.input.bucket, &req.input.policy, now_secs())
+            .await
+            .map_err(bucket_control_error)?;
+        Ok(S3Response::new(PutBucketPolicyOutput::default()))
+    }
+
+    /// M9 S6c（B17）：删除桶策略。Raft 一条 `BucketDeletePolicy`；M7 同上。
+    async fn delete_bucket_policy(
+        &self,
+        req: S3Request<DeleteBucketPolicyInput>,
+    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        let Some(sink) = &self.bucket_control else {
+            return Err(s3s::s3_error!(
+                NotImplemented,
+                "DeleteBucketPolicy is not implemented yet"
+            ));
+        };
+        sink.delete_policy(&req.input.bucket)
+            .await
+            .map_err(bucket_control_error)?;
+        Ok(S3Response::new(DeleteBucketPolicyOutput::default()))
+    }
+
     // ---------- M6 切片 4：桶复制配置 API ----------
 
     async fn put_bucket_replication(
@@ -3805,4 +3893,61 @@ fn ct_eq(a: &str, b: &str) -> bool {
             .zip(b.bytes())
             .fold(0u8, |acc, (x, y)| acc | (x ^ y))
             == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_control_error_mapping_is_specific() {
+        assert_eq!(
+            bucket_control_error(BucketControlError::NotFound).code(),
+            &s3s::S3ErrorCode::NoSuchBucket
+        );
+        assert_eq!(
+            bucket_control_error(BucketControlError::Conflict).code(),
+            &s3s::S3ErrorCode::OperationAborted
+        );
+        assert_eq!(
+            bucket_control_error(BucketControlError::NotEmpty).code(),
+            &s3s::S3ErrorCode::BucketNotEmpty
+        );
+        // 仅建桶把 Conflict 映射为 BucketAlreadyExists（M-3）。
+        assert_eq!(
+            bucket_create_error(BucketControlError::Conflict).code(),
+            &s3s::S3ErrorCode::BucketAlreadyExists
+        );
+        assert_eq!(
+            bucket_control_error(BucketControlError::TooLarge).code(),
+            &s3s::S3ErrorCode::EntityTooLarge
+        );
+        assert_eq!(
+            bucket_control_error(BucketControlError::Unavailable).code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
+        assert_eq!(
+            bucket_control_error(BucketControlError::Internal).code(),
+            &s3s::S3ErrorCode::InternalError
+        );
+    }
+
+    #[test]
+    fn bucket_policy_validation_mirrors_console() {
+        assert!(validate_bucket_policy("{\"Version\":\"2012-10-17\",\"Statement\":[]}").is_ok());
+        assert_eq!(
+            validate_bucket_policy("[]").unwrap_err().code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            validate_bucket_policy("not json").unwrap_err().code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            validate_bucket_policy(&format!("{{\"x\":\"{}\"}}", "a".repeat(64 * 1024)))
+                .unwrap_err()
+                .code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+    }
 }

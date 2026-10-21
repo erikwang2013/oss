@@ -578,6 +578,15 @@ impl AppState {
             None => None,
         };
 
+        // M9 I-1：Raft 启动对账须在控制状态载入后、serve 前——apply 与 mkdir 之间崩溃
+        // 或删桶副作用失败留下的 row/dir 不一致在此修复；只读行、不追加日志。
+        if raft.is_some() {
+            match db.list_bucket_rows().await {
+                Ok(rows) => store.reconcile_bucket_dirs(&rows).await,
+                Err(e) => tracing::warn!(error = %e, "Raft 启动对账：列举桶行失败（跳过本轮）"),
+            }
+        }
+
         Ok(Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, raft).await)
     }
 

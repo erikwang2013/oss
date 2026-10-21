@@ -28,6 +28,8 @@ pub enum BucketControlError {
     NotFound,
     /// 业务冲突（建桶模式冲突/已存在竞态）。
     Conflict,
+    /// 桶非空（删除前置拒绝）。
+    NotEmpty,
     Invalid,
     /// 命令超过 24 MiB。
     TooLarge,
@@ -61,4 +63,13 @@ pub trait BucketControlSink: Send + Sync {
         bucket: &str,
         algorithm: Option<String>,
     ) -> Result<(), BucketControlError>;
+    /// 全量替换桶策略（`policy_json` 由 handler 校验/序列化，`updated_at` 先算好）。
+    async fn set_policy(
+        &self,
+        bucket: &str,
+        policy_json: &str,
+        updated_at: i64,
+    ) -> Result<(), BucketControlError>;
+    /// 删除桶策略（无策略行 = 幂等成功；桶不存在 = NotFound）。
+    async fn delete_policy(&self, bucket: &str) -> Result<(), BucketControlError>;
 }

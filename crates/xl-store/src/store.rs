@@ -848,6 +848,78 @@ impl Store {
         Ok(())
     }
 
+    /// M9 I-1：Raft 启动对账（plan §5）——日志是事实源，但物理目录可能缺失（apply 与
+    /// mkdir 之间崩溃）或残留（delete 副作用失败）。`rows` = `buckets` 表全量桶名：
+    /// - 有行：每块在册盘补建桶目录（幂等）；
+    /// - 无行的桶目录：空目录删除，非空目录改名到 `.oss.sys/orphan/<name>.<uuid>`
+    ///   （绝不删除非空——孤儿目录可能含未入账数据，留给运维甄别）。
+    ///
+    /// 幂等；单盘失败只告警不阻塞启动（下次重启重试）。
+    pub async fn reconcile_bucket_dirs(&self, rows: &[String]) {
+        let known: HashSet<&str> = rows.iter().map(String::as_str).collect();
+        for bucket in rows {
+            if let Err(e) = layout::validate_bucket(bucket) {
+                tracing::warn!(bucket = %bucket, error = %e, "启动对账：桶名非法，跳过");
+                continue;
+            }
+            for drive in &self.cfg.drives {
+                let dir = layout::bucket_dir(drive, bucket);
+                if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                    tracing::warn!(path = %dir.display(), error = %e, "启动对账：补建桶目录失败");
+                }
+            }
+        }
+        for drive in &self.cfg.drives {
+            let mut entries = match tokio::fs::read_dir(drive).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(drive = %drive.display(), error = %e, "启动对账：列举盘失败");
+                    continue;
+                }
+            };
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(drive = %drive.display(), error = %e, "启动对账：读目录项失败");
+                        break;
+                    }
+                };
+                if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == layout::SYS_DIR || known.contains(name.as_str()) {
+                    continue;
+                }
+                let src = entry.path();
+                let _bguard = self.lock_bucket_owned(&name).await;
+                // 空目录直接删；非空（或并发写入）改名隔离。
+                match tokio::fs::remove_dir(&src).await {
+                    Ok(()) => tracing::info!(path = %src.display(), "启动对账：删除无行的空桶目录"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        let orphan = layout::sys_dir(drive, "orphan");
+                        if let Err(e) = tokio::fs::create_dir_all(&orphan).await {
+                            tracing::warn!(path = %orphan.display(), error = %e, "启动对账：建 orphan 目录失败");
+                            continue;
+                        }
+                        let dst = orphan.join(format!("{name}.{}", uuid::Uuid::new_v4()));
+                        match tokio::fs::rename(&src, &dst).await {
+                            Ok(()) => {
+                                tracing::warn!(bucket = %name, dst = %dst.display(), "启动对账：无行的非空桶目录已隔离")
+                            }
+                            Err(e) => {
+                                tracing::warn!(bucket = %name, error = %e, "启动对账：隔离孤儿桶目录失败")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         // 评审 R3：各盘取并集（drive0 掉线不得让列举静默变空）；创建时间取首个见到该桶的盘。
         let mut out: Vec<BucketInfo> = Vec::new();

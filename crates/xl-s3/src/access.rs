@@ -1071,6 +1071,8 @@ fn classify(op: &str) -> Option<Gate> {
         // M8 缺口 C：桶默认加密（写配置 = 桶主，读 = 读档）
         "PutBucketEncryption" | "DeleteBucketEncryption" => Gate::OwnerBucket,
         "GetBucketEncryption" => Gate::Need(Action::Read),
+        // M9 S6c（B16/B17）：桶策略写入 = 桶主/管理员（与 console put_policy 同口径）
+        "PutBucketPolicy" | "DeleteBucketPolicy" => Gate::OwnerBucket,
         // M8 S5：Inventory 配置（写配置 = 桶主，读 = 读档）
         "PutBucketInventoryConfiguration" | "DeleteBucketInventoryConfiguration" => {
             Gate::OwnerBucket
@@ -1400,13 +1402,14 @@ mod tests {
             "DeleteBucketInventoryConfiguration",
             "PutBucketEncryption",
             "DeleteBucketEncryption",
+            // M9 S6c：S3 桶策略写已实现（Raft 一条命令；M7 仍 NotImplemented）
+            "PutBucketPolicy",
+            "DeleteBucketPolicy",
         ] {
             assert_eq!(classify(op), Some(Gate::OwnerBucket), "{op}");
         }
-        // 未映射（含 s3s 存在但本服务未实现的桶策略类 op）→ fail-closed
-        for op in ["PutBucketPolicy", "Frobnicate"] {
-            assert_eq!(classify(op), None, "{op}");
-        }
+        // 未映射 op → fail-closed
+        assert_eq!(classify("Frobnicate"), None);
     }
 
     #[tokio::test]

@@ -865,6 +865,19 @@ impl Db {
         Ok(())
     }
 
+    /// M9 S6c（M-1）：Raft 删桶后只清**本地** M8 行。复制表已由 apply 级联清空，
+    /// 且受 `raft_guard_*` 保护不得再直写（会 ABORT）；这里仅补 `inventory_runs`/
+    /// `tier_restores` 两张本地表。幂等。
+    pub async fn clear_bucket_local_m8(&self, bucket: &str) -> Result<()> {
+        for sql in [
+            "DELETE FROM inventory_runs WHERE bucket = ?",
+            "DELETE FROM tier_restores WHERE bucket = ?",
+        ] {
+            sqlx::query(sql).bind(bucket).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
     // ---------- M7：站点身份与关系 ----------
 
     pub async fn site_identity(&self) -> Result<SiteIdentity> {

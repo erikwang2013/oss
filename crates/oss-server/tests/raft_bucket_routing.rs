@@ -505,6 +505,13 @@ async fn s3_delete_bucket_cascades_union_in_one_command() {
     // 每张级联表各播一行（全部经控制命令，guard 生效）。
     use oss_server::raft::ControlCommand as C;
     let seed = [
+        // S6a 修复后管理员 IAM 写被拒；权限级联用普通用户验证。
+        C::UserCreate {
+            username: "bob".into(),
+            password_hash: "hash".into(),
+            status: "active".into(),
+            created_at: 1,
+        },
         C::BucketSetLifecycle {
             bucket: "dbk".into(),
             rules: vec![oss_server::raft::LifecycleRuleCmd {
@@ -560,7 +567,7 @@ async fn s3_delete_bucket_cascades_union_in_one_command() {
             updated_at: 1,
         },
         C::UserSetPermissions {
-            username: "erik".into(),
+            username: "bob".into(),
             permissions: vec![oss_server::raft::PermissionBits {
                 bucket: "dbk".into(),
                 read: true,
@@ -722,18 +729,24 @@ async fn sync_delete_success_tombstones_physical_dir() {
     assert_applied(&h, before + 2).await;
     assert!(bucket_row(&h, "syncb").await.is_none());
     assert!(!h.state.store.bucket_exists("syncb").await.unwrap());
-    // sync 删桶的物理副作用是 tombstone（rename 进 trash），不是直接 rm。
+    // sync 删桶的物理副作用是 tombstone：rename 进 `.oss.sys/trash/<bucket>/<uuid>`
+    // 后尽力立即清；桶目录本身必须已消失（与 M7 共用 store::delete_bucket_sync）。
     let trash = h
         .dir
         .path()
         .join("data")
         .join(".oss.sys")
         .join("trash")
-        .join("bucket.syncb");
+        .join("syncb");
     assert!(
-        trash.exists(),
-        "tombstone 未落到 trash: {}",
+        trash.is_dir(),
+        "tombstone 目录未落到 trash: {}",
         trash.display()
+    );
+    assert_eq!(
+        std::fs::read_dir(&trash).unwrap().count(),
+        0,
+        "tombstone 应已尽力清理（留空目录待下轮）"
     );
     let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_delete_intents")
         .fetch_one(h.state.db.pool())

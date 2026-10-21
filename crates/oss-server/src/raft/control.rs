@@ -292,6 +292,10 @@ impl ControlPlane {
                         }
                     }
                 }
+                let deleted = match &cmd {
+                    ControlCommand::BucketDelete { name } => Some(name.clone()),
+                    _ => None,
+                };
                 let response = match handle.write(cmd).await {
                     Ok(r) => r,
                     Err(WriteError::Timeout(d)) => {
@@ -301,6 +305,14 @@ impl ControlPlane {
                 };
                 if response == ControlResponse::Ok {
                     self.post.run(effects).await;
+                }
+                // M-1：apply 级联只清复制表；inventory_runs/tier_restores 是本站本地行，
+                // 成功或幂等 NotFound 都要清（重建同名桶不得继承旧运行/恢复记录）。
+                if let Some(name) = deleted
+                    && matches!(response, ControlResponse::Ok | ControlResponse::NotFound)
+                    && let Err(e) = self.db.clear_bucket_local_m8(&name).await
+                {
+                    tracing::warn!(error = %e, bucket = %name, "删桶本地 M8 行清理失败");
                 }
                 Ok(response)
             }
@@ -316,7 +328,8 @@ fn sink_result(
     match r {
         Ok(ControlResponse::Ok) => Ok(()),
         Ok(ControlResponse::NotFound) => Err(E::NotFound),
-        Ok(ControlResponse::Conflict | ControlResponse::BucketNotEmpty) => Err(E::Conflict),
+        Ok(ControlResponse::Conflict) => Err(E::Conflict),
+        Ok(ControlResponse::BucketNotEmpty) => Err(E::NotEmpty),
         Ok(ControlResponse::Invalid) => Err(E::Invalid),
         Err(ControlError::TooLarge { .. }) => Err(E::TooLarge),
         Err(ControlError::Timeout(m) | ControlError::Unavailable(m)) => {
@@ -434,6 +447,34 @@ impl xl_s3::bucket_control::BucketControlSink for ControlPlane {
         };
         sink_result(self.write(cmd).await)
     }
+
+    async fn set_policy(
+        &self,
+        bucket: &str,
+        policy_json: &str,
+        updated_at: i64,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        sink_result(
+            self.write(ControlCommand::BucketSetPolicy {
+                bucket: bucket.to_string(),
+                policy_json: policy_json.to_string(),
+                updated_at,
+            })
+            .await,
+        )
+    }
+
+    async fn delete_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        sink_result(
+            self.write(ControlCommand::BucketDeletePolicy {
+                bucket: bucket.to_string(),
+            })
+            .await,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +496,70 @@ mod tests {
         assert_eq!(response_status(ControlResponse::Conflict), 409);
         assert_eq!(response_status(ControlResponse::NotFound), 404);
         assert_eq!(response_status(ControlResponse::Invalid), 400);
+    }
+
+    #[test]
+    fn sink_result_keeps_conflict_and_not_empty_distinct() {
+        use xl_s3::bucket_control::BucketControlError as E;
+        assert_eq!(
+            sink_result(Ok(ControlResponse::BucketNotEmpty)),
+            Err(E::NotEmpty)
+        );
+        assert_eq!(sink_result(Ok(ControlResponse::Conflict)), Err(E::Conflict));
+        assert_eq!(
+            sink_result(Err(ControlError::TooLarge { bytes: 1, max: 2 })),
+            Err(E::TooLarge)
+        );
+        assert_eq!(
+            sink_result(Err(ControlError::Internal("x".into()))),
+            Err(E::Internal)
+        );
+    }
+
+    /// I-1 的副作用底座：重复执行幂等；物理失败 3 次后放弃（不 panic），
+    /// 盘恢复后再次执行即修复（启动对账走同一入口）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_commit_effects_idempotent_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m9.db").display());
+        let db = Arc::new(Db::connect_raft(&url).await.unwrap());
+        let store = Arc::new(
+            Store::open(xl_store::store::StoreConfig::new(dir.path().join("data")))
+                .await
+                .unwrap(),
+        );
+        let post = PostCommit::new(
+            db,
+            Arc::clone(&store),
+            Arc::new(xl_s3::ap::ApCache::new()),
+            Arc::new(xl_s3::olap::OlapCache::new()),
+            "us-east-1".into(),
+        );
+
+        post.run_one(SideEffect::BucketDirCreate("pcb".into()))
+            .await;
+        post.run_one(SideEffect::BucketDirCreate("pcb".into()))
+            .await;
+        assert!(store.bucket_exists("pcb").await.unwrap());
+        post.run_one(SideEffect::BucketDirTombstone("pcb".into()))
+            .await;
+        post.run_one(SideEffect::BucketDirTombstone("pcb".into()))
+            .await;
+        assert!(!store.bucket_exists("pcb").await.unwrap());
+
+        // 数据盘临时换成普通文件：建目录 3 次失败后返回（不 panic、不卡死）。
+        let data = dir.path().join("data");
+        let backup = dir.path().join("data.bak");
+        tokio::fs::rename(&data, &backup).await.unwrap();
+        tokio::fs::write(&data, b"not a dir").await.unwrap();
+        post.run_one(SideEffect::BucketDirCreate("pcb2".into()))
+            .await;
+        assert!(!store.bucket_exists("pcb2").await.unwrap_or(false));
+        tokio::fs::remove_file(&data).await.unwrap();
+        tokio::fs::rename(&backup, &data).await.unwrap();
+        // 重跑同一副作用 = 对账修复（幂等）。
+        post.run_one(SideEffect::BucketDirCreate("pcb2".into()))
+            .await;
+        assert!(store.bucket_exists("pcb2").await.unwrap());
     }
 }
