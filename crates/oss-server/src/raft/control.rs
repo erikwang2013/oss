@@ -225,6 +225,14 @@ impl ControlPlane {
         matches!(self.inner, Inner::Raft(_))
     }
 
+    /// `/api/v1/raft/status`：Raft 下报真实运行状态；M7/Local 保持 S0 骨架。
+    pub fn status_json(&self) -> serde_json::Value {
+        match &self.inner {
+            Inner::Raft(handle) => handle.status_json(),
+            Inner::Local(_) => super::status_json(),
+        }
+    }
+
     /// xl-s3 注入用：仅 Raft 模式返回 sink（M7/standalone 保持 `None` 直写路径）。
     pub fn bucket_sink(
         self: &Arc<Self>,

@@ -310,6 +310,48 @@ impl Db {
         Ok(())
     }
 
+    /// S6d 启动断言：模式与库内状态一致——Raft 下 33 个 `raft_guard_*` 触发器在、M7
+    /// 站点状态表为空（`sites` 配对行允许）；M7 下守卫全灭。不一致即拒绝启动。
+    pub async fn assert_mode_guards(&self) -> Result<()> {
+        let guards: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'raft_guard\\_%' ESCAPE '\\'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !self.raft_mode() {
+            return if guards == 0 {
+                Ok(())
+            } else {
+                Err(sqlx::Error::Protocol(format!(
+                    "M7 模式不应存在 raft_guard_* 触发器，实际 {guards} 个"
+                )))
+            };
+        }
+        if guards != 33 {
+            return Err(sqlx::Error::Protocol(format!(
+                "Raft 模式守卫不完整：raft_guard_* 触发器 {guards}/33"
+            )));
+        }
+        // 表名是常量；M7 日志/游标状态在 Raft 下必须为空（配对 `sites` 行不在此列）。
+        for table in [
+            "site_changelog",
+            "site_entity_clock",
+            "site_cursors",
+            "site_apply_dead",
+        ] {
+            let n: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&self.pool)
+                    .await?;
+            if n != 0 {
+                return Err(sqlx::Error::Protocol(format!(
+                    "Raft 模式站点状态表 {table} 应为空，实际 {n} 行"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// M9：是否为 Raft 控制库（`connect_raft`/`connect_witness` 或 `prepare_raft_mode(true)`）。
     pub fn raft_mode(&self) -> bool {
         self.raft_mode.load(std::sync::atomic::Ordering::Relaxed)

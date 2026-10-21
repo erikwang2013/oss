@@ -279,6 +279,8 @@ impl AppState {
         }
         // M9：无条件模式守卫（connect_* 已执行一次；这里按计划顺序在 site 配置后复验）。
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
+        // S6d：模式与库内触发器/站点状态一致才放行。
+        db.assert_mode_guards().await?;
         let mut store_cfg = StoreConfig::new(&drives[0]);
         // M9 S1：sync 写提交门（必须在 Store::open 前注入——open 克隆配置）。
         store_cfg.gate = Some(Arc::new(crate::sync::SiteSyncGate::new(

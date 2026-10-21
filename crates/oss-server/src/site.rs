@@ -737,6 +737,12 @@ pub async fn insert_peer_with_snapshot(
     if inserted != 1 {
         return Err("已存在站点对（M7 单 peer）".into());
     }
+    // M9 S6d：Raft 下配对行保持本地，但不种 M7 changelog/游标（启动断言 site_* 为空；
+    // 快照与成员由 S7 的配对流程实现）。M7 路径逐字节不变。
+    if state.control.is_raft() {
+        tx.commit().await.map_err(|e| bad(e.to_string()))?;
+        return Ok(());
+    }
     sqlx::query(
         "INSERT OR IGNORE INTO site_cursors (peer_id, last_seq, updated_at) VALUES (?, 0, ?)",
     )

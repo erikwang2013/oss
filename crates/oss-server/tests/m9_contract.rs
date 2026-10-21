@@ -89,13 +89,41 @@ fn stretch_cfg(dir: &std::path::Path) -> AppConfig {
     cfg
 }
 
+/// S6d 起状态/控制面走真实单节点 Raft（`AppState::load` 同时跑启动断言）。
 async fn raft_state(dir: &std::path::Path) -> AppState {
-    let cfg = raft_cfg(dir);
-    std::fs::create_dir_all(&cfg.data_dir).unwrap();
-    std::fs::create_dir_all(&cfg.staging_dir).unwrap();
-    let store = Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap();
-    let db = Db::connect_raft(&cfg.database_url).await.unwrap();
-    AppState::new(cfg, db, store).await
+    let path = dir.join("oss.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+listen = "127.0.0.1:0"
+data_dir = "{data}"
+staging_dir = "{staging}"
+database_url = "sqlite://{db}?mode=rwc"
+jwt_secret = "0123456789abcdef0123456789abcdef"
+
+[site]
+name = "m9c"
+region = "us-east-1"
+
+[raft]
+node_id = 1
+bootstrap = true
+advertise_endpoint = "http://127.0.0.1:19002"
+cluster_token = "m9c"
+db_path = "{raft_db}"
+election_timeout_ms = 500
+heartbeat_interval_ms = 100
+write_timeout_ms = 5000
+"#,
+            data = dir.join("data").display(),
+            staging = dir.join("staging").display(),
+            db = dir.join("control.db").display(),
+            raft_db = dir.join("raft.db").display(),
+        ),
+    )
+    .unwrap();
+    AppState::load(&path).await.unwrap()
 }
 
 async fn serve(app: axum::Router) -> String {
@@ -362,21 +390,39 @@ async fn m9_console_recreate_mode_change_409() {
     assert_eq!(resp.status(), 409, "重建不得改复制模式");
 }
 
+/// S6d：状态报真实 Raft 运行态；capabilities 跟随 READY 常量（翻转前 503、翻转后单命令）。
 #[tokio::test]
-async fn m9_raft_mode_control_write_503_and_status_skeleton() {
+async fn m9_raft_status_reports_real_state_and_ready_flags() {
     let dir = tempfile::tempdir().unwrap();
     let st = raft_state(dir.path()).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
-    let base = serve(build_router(st).unwrap()).await;
-    // 状态骨架：无鉴权可达；S0 恒 enabled=false、sync 能力 false
-    let status: serde_json::Value = reqwest::get(format!("{base}/api/v1/raft/status"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(status["enabled"], false);
-    assert_eq!(status["capabilities"]["sync"], false);
+    let base = serve(build_router(st.clone()).unwrap()).await;
+
+    // 单节点选举完成后再断言 leader/role；状态路由无鉴权。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let status: serde_json::Value = loop {
+        let v: serde_json::Value = reqwest::get(format!("{base}/api/v1/raft/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["leader"] == 1 || tokio::time::Instant::now() >= deadline {
+            break v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["node_id"], 1);
+    assert_eq!(status["leader"], 1, "单节点必须选出 leader");
+    assert_eq!(status["role"], "leader");
+    assert!(status["term"].as_u64().unwrap() >= 1);
+    assert_eq!(status["capabilities"]["raft"], oss_server::raft::RAFT_READY);
+    assert_eq!(status["capabilities"]["sync"], oss_server::raft::SYNC_READY);
+    assert_eq!(
+        status["capabilities"]["stretch"],
+        oss_server::raft::STRETCH_READY
+    );
 
     let token = login(&base).await;
     let resp = reqwest::Client::new()
@@ -386,7 +432,16 @@ async fn m9_raft_mode_control_write_503_and_status_skeleton() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 503, "RAFT_READY=false 控制写必须 503");
+    if oss_server::raft::RAFT_READY {
+        assert_eq!(resp.status(), 204, "翻转后建桶必须经 Raft 成功");
+        let row: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name = 'raftb'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(row, 1);
+    } else {
+        assert_eq!(resp.status(), 503, "RAFT_READY=false 控制写必须 503");
+    }
 }
 
 /// I1：stretch identity 用本端实盘 `drive_count`（不信任 peer 声明），且不泄漏 secret。

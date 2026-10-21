@@ -14,12 +14,14 @@ pub fn status_json(handle: &RaftHandle) -> Value {
     let m = handle.raft().metrics();
     let m = m.borrow();
     let voters: Vec<u64> = m.membership_config.voter_ids().collect();
+    let role = format!("{:?}", m.state).to_lowercase();
     json!({
         "enabled": m.running_state.is_ok(),
         "node_id": m.id,
+        "role": role,
         "leader": m.current_leader,
         "term": m.current_term,
-        "state": format!("{:?}", m.state).to_lowercase(),
+        "state": role,
         "applied": m.last_applied.as_ref().map(log_id_json),
         "snapshot": m.snapshot.as_ref().map(log_id_json),
         "purged": m.purged.as_ref().map(log_id_json),

@@ -52,7 +52,7 @@ fn internal_error() -> Response {
 
 /// M9 S6b：控制写失败 → HTTP（413/503 带原因；500 不泄漏内部）。
 /// 503 的文本含 raft/forward 提示（3 节点转发与 leader hint 由 S7 接线）。
-fn control_failure(e: crate::raft::control::ControlError) -> Response {
+pub(crate) fn control_failure(e: crate::raft::control::ControlError) -> Response {
     match e.http_status() {
         413 => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
         503 => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
@@ -66,7 +66,10 @@ fn control_failure(e: crate::raft::control::ControlError) -> Response {
 /// M9 S6b：apply 业务拒绝 → 与 `raft::control::response_status` 完全一致
 /// （Ok 200 / BucketNotEmpty+Conflict 409 / NotFound 404 / Invalid 400），绝不静默 204。
 /// `Ok` 由调用方处理，传进来按 500 兜底（不应发生）。
-fn control_rejection(resp: crate::raft::ControlResponse, conflict: &'static str) -> Response {
+pub(crate) fn control_rejection(
+    resp: crate::raft::ControlResponse,
+    conflict: &'static str,
+) -> Response {
     match resp {
         crate::raft::ControlResponse::NotFound => StatusCode::NOT_FOUND.into_response(),
         crate::raft::ControlResponse::BucketNotEmpty | crate::raft::ControlResponse::Conflict => {
@@ -240,7 +243,9 @@ pub fn routes() -> Router<AppState> {
         .route("/sites/{peer_id}/status", get(site_status))
         .route(
             "/site/changelog",
-            post(site_changelog).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+            get(site_changelog_get)
+                .post(site_changelog)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
 }
 
@@ -305,26 +310,16 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
     }
 }
 
-/// M9 S6c：控制写结果 → console HTTP（成功由调用方给 204）。
-#[allow(clippy::result_large_err)]
-fn control_result(
+/// M9 S6d：控制写成功 → 204；业务拒绝/门面错误统一走 S6b 的两个映射 helper
+/// （503 保留 `ControlError::to_string()` 的 raft/forward 提示，绝不静默 204）。
+fn control_write_status(
     r: Result<crate::raft::ControlResponse, crate::raft::control::ControlError>,
-) -> Result<(), Response> {
-    use crate::raft::ControlResponse as R;
-    let reject = |code: StatusCode, msg: &str| Err((code, msg.to_string()).into_response());
+    conflict: &'static str,
+) -> Response {
     match r {
-        Ok(R::Ok) => Ok(()),
-        Ok(R::NotFound) => reject(StatusCode::NOT_FOUND, "NoSuchBucket"),
-        Ok(R::BucketNotEmpty) => reject(StatusCode::CONFLICT, "BucketNotEmpty"),
-        Ok(R::Conflict) => reject(StatusCode::CONFLICT, "conflict"),
-        Ok(R::Invalid) => reject(StatusCode::BAD_REQUEST, "invalid request"),
-        Err(e) => {
-            tracing::error!(error = %e, "控制写失败");
-            reject(
-                StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                "control plane write failed",
-            )
-        }
+        Ok(crate::raft::ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(resp) => control_rejection(resp, conflict),
+        Err(e) => control_failure(e),
     }
 }
 
@@ -697,7 +692,7 @@ async fn put_policy(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if state.control.is_raft() {
-        return match control_result(
+        return control_write_status(
             state
                 .control
                 .write(crate::raft::ControlCommand::BucketSetPolicy {
@@ -706,10 +701,8 @@ async fn put_policy(
                     updated_at: now,
                 })
                 .await,
-        ) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(r) => r,
-        };
+            "policy 写入冲突",
+        );
     }
     match state.db.set_bucket_policy(&bucket, &body, now).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -818,10 +811,7 @@ async fn put_notifications(
                 updated_at: crate::db::now(),
             }
         };
-        return match control_result(state.control.write(cmd).await) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(r) => r,
-        };
+        return control_write_status(state.control.write(cmd).await, "通知配置写入冲突");
     }
     match state.acl().set_bucket_notification(&bucket, &json).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -842,15 +832,13 @@ async fn delete_notifications(
         return r;
     }
     if state.control.is_raft() {
-        return match control_result(
+        return control_write_status(
             state
                 .control
                 .write(crate::raft::ControlCommand::BucketClearNotification { bucket })
                 .await,
-        ) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(r) => r,
-        };
+            "通知配置写入冲突",
+        );
     }
     match state.acl().clear_bucket_notification(&bucket).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1654,7 +1642,7 @@ async fn put_bucket_encryption(
         return (StatusCode::BAD_REQUEST, "algorithm 须为 AES256 或 aws:kms").into_response();
     }
     if state.control.is_raft() {
-        return match control_result(
+        return control_write_status(
             state
                 .control
                 .write(crate::raft::ControlCommand::BucketSetDefaultEncryption {
@@ -1662,10 +1650,8 @@ async fn put_bucket_encryption(
                     algorithm: body.algorithm,
                 })
                 .await,
-        ) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(r) => r,
-        };
+            "加密配置写入冲突",
+        );
     }
     match state
         .acl()
@@ -1694,15 +1680,13 @@ async fn delete_bucket_encryption(
         return r;
     }
     if state.control.is_raft() {
-        return match control_result(
+        return control_write_status(
             state
                 .control
                 .write(crate::raft::ControlCommand::BucketClearDefaultEncryption { bucket })
                 .await,
-        ) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(r) => r,
-        };
+            "加密配置写入冲突",
+        );
     }
     match state.acl().clear_bucket_default_encryption(&bucket).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -1941,28 +1925,29 @@ async fn create_bucket(
                 }
             }
         };
-        if let Err(r) = control_result(
-            state
-                .control
-                .write(crate::raft::ControlCommand::BucketCreate {
-                    name: body.name.clone(),
-                    owner,
-                    created_at: crate::db::now(),
-                    replication_mode: replication_mode.to_string(),
-                    versioning: if replication_mode == "sync" {
-                        "Enabled"
-                    } else {
-                        "Off"
-                    }
-                    .to_string(),
-                    object_lock: false,
-                    object_lock_default_mode: None,
-                    object_lock_default_days: None,
-                    default_encryption: None,
-                })
-                .await,
-        ) {
-            return r;
+        match state
+            .control
+            .write(crate::raft::ControlCommand::BucketCreate {
+                name: body.name.clone(),
+                owner,
+                created_at: crate::db::now(),
+                replication_mode: replication_mode.to_string(),
+                versioning: if replication_mode == "sync" {
+                    "Enabled"
+                } else {
+                    "Off"
+                }
+                .to_string(),
+                object_lock: false,
+                object_lock_default_mode: None,
+                object_lock_default_days: None,
+                default_encryption: None,
+            })
+            .await
+        {
+            Ok(crate::raft::ControlResponse::Ok) => {}
+            Ok(resp) => return control_rejection(resp, "BucketAlreadyExists"),
+            Err(e) => return control_failure(e),
         }
         state.store.invalidate_gate(&body.name);
         state.store.broadcast_bucket_row(&body.name, Some(0)).await;
@@ -3363,12 +3348,34 @@ struct ChangelogBody {
     entries: Vec<crate::site::Entry>,
 }
 
+/// M9 S6d：Raft 模式不复用 M7 changelog（控制面走 Raft 日志，S7 的 `/site/raft/*`）。
+/// M7（`[raft]` off）下 GET 仍是 405（原先只有 POST），POST 行为逐字节不变。
+fn changelog_raft_conflict(state: &AppState) -> Option<Response> {
+    state.control.is_raft().then(|| {
+        (
+            StatusCode::CONFLICT,
+            "M7 site changelog is disabled in Raft mode",
+        )
+            .into_response()
+    })
+}
+
+async fn site_changelog_get(State(state): State<AppState>) -> Response {
+    if let Some(r) = changelog_raft_conflict(&state) {
+        return r;
+    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
 /// `POST /api/v1/site/changelog`（token 面；JWT except）：应用对端控制面变更批次。
 async fn site_changelog(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ChangelogBody>,
 ) -> Response {
+    if let Some(r) = changelog_raft_conflict(&state) {
+        return r;
+    }
     if !state.site_enabled {
         return site_disabled();
     }

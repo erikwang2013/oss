@@ -12,7 +12,9 @@ use jwt_rust::JwtPayload;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::console::{control_failure, control_rejection};
 use crate::db::Db;
+use crate::raft::{ControlCommand, ControlResponse};
 use crate::state::AppState;
 use xl_s3::ap::{AccessPoint, ApSource};
 use xl_s3::olap::OlapTransform;
@@ -152,6 +154,58 @@ async fn create(
         }
     };
     let ts = now();
+    // M9 S6d：Raft 一条命令（属主 uid→username 预解析；apply 只做确定性映射）。
+    // 缓存由提交后 SideEffect::ApReload 刷新。
+    if state.control.is_raft() {
+        let owner = if admin {
+            None
+        } else {
+            match state.db.get_user(uid).await {
+                Ok(Some((name, _, _))) => Some(name),
+                Ok(None) => {
+                    return (StatusCode::UNAUTHORIZED, "用户不存在或已失效").into_response();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "查询 AP 属主失败");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+                }
+            }
+        };
+        return match state
+            .control
+            .write(ControlCommand::AccessPointPut {
+                name: body.name.clone(),
+                bucket: body.bucket.clone(),
+                owner,
+                policy_json: policy_json.clone(),
+                created_at: ts,
+                updated_at: ts,
+            })
+            .await
+        {
+            Ok(ControlResponse::Ok) => {
+                state
+                    .audit(
+                        uid,
+                        "control:ap-create",
+                        Some(&body.bucket),
+                        Some(&body.name),
+                        Some(&format!(
+                            "policy={}",
+                            if policy_json.is_some() { "set" } else { "none" }
+                        )),
+                    )
+                    .await;
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({"name": body.name})),
+                )
+                    .into_response()
+            }
+            Ok(resp) => control_rejection(resp, "AP 已存在"),
+            Err(e) => control_failure(e),
+        };
+    }
     match state
         .db
         .create_access_point(&body.name, &body.bucket, uid, policy_json.as_deref(), ts)
@@ -242,6 +296,29 @@ async fn delete_one(
         Ok(v) => v,
         Err(r) => return r,
     };
+    // M9 S6d：apply 级联删 OLAP；缓存由 SideEffect::{ApRemove,OlapRemove} 清理。
+    if state.control.is_raft() {
+        return match state
+            .control
+            .write(ControlCommand::AccessPointDelete { name: name.clone() })
+            .await
+        {
+            Ok(ControlResponse::Ok) => {
+                state
+                    .audit(
+                        uid,
+                        "control:ap-delete",
+                        Some(&row.bucket),
+                        Some(&row.name),
+                        None,
+                    )
+                    .await;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(resp) => control_rejection(resp, "AP 删除冲突"),
+            Err(e) => control_failure(e),
+        };
+    }
     match state.db.delete_access_point(&name).await {
         Ok(true) => {
             state.ap_cache.remove(&name);
@@ -290,6 +367,37 @@ async fn put_policy(
             Err(e) => return bad(&e),
         }
     };
+    // M9 S6d：Raft 一条命令；缓存由 SideEffect::ApReload 刷新。
+    if state.control.is_raft() {
+        return match state
+            .control
+            .write(ControlCommand::AccessPointSetPolicy {
+                name: name.clone(),
+                policy_json: policy_json.clone(),
+                updated_at: now(),
+            })
+            .await
+        {
+            Ok(ControlResponse::Ok) => {
+                state
+                    .audit(
+                        uid,
+                        "control:ap-policy",
+                        Some(&row.bucket),
+                        Some(&row.name),
+                        Some(if policy_json.is_some() {
+                            "policy=set"
+                        } else {
+                            "policy=clear"
+                        }),
+                    )
+                    .await;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(resp) => control_rejection(resp, "AP 策略写入冲突"),
+            Err(e) => control_failure(e),
+        };
+    }
     match state
         .db
         .set_access_point_policy(&name, policy_json.as_deref(), now())
@@ -414,6 +522,39 @@ async fn put_transform(
         Err(e) => return bad(&e),
     };
     let sha = module.as_ref().map(|m| hex::encode(Sha256::digest(m)));
+    // M9 S6d：Raft 一条命令（module base64 + sha 已在 append 前算好；apply 只解码写行）。
+    // 缓存由 SideEffect::OlapReload 重新预加载。
+    if state.control.is_raft() {
+        return match state
+            .control
+            .write(ControlCommand::OlapPut {
+                access_point: name.clone(),
+                kind: body.kind.clone(),
+                endpoint: body.endpoint.clone(),
+                module: body.module_b64.clone(),
+                module_sha256: sha,
+                timeout_ms,
+                max_response_bytes,
+                updated_at: now(),
+            })
+            .await
+        {
+            Ok(ControlResponse::Ok) => {
+                state
+                    .audit(
+                        uid,
+                        "control:ap-transform",
+                        Some(&row.bucket),
+                        Some(&row.name),
+                        Some(&format!("kind={}", body.kind)),
+                    )
+                    .await;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(resp) => control_rejection(resp, "变换器写入冲突"),
+            Err(e) => control_failure(e),
+        };
+    }
     match state
         .db
         .set_olap_config(
