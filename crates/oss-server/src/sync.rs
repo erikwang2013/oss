@@ -474,7 +474,9 @@ impl PutCommitGate for SiteSyncGate {
             .delete_remote_version(&ticket.bucket, &ticket.key, &ticket.local_version_id)
             .await
         {
-            Ok(()) => clean_intent(&self.db, &ticket.local_version_id).await,
+            Ok(()) => {
+                clean_intent(&self.db, &ticket.local_version_id).await;
+            }
             Err(e) => tracing::warn!(
                 bucket = %ticket.bucket, key = %ticket.key, error = %e,
                 "sync abort：远端补偿删除失败（intent 保留，恢复重试）"
