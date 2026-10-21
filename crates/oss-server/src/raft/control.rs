@@ -226,10 +226,11 @@ impl ControlPlane {
     }
 
     /// `/api/v1/raft/status`：Raft 下报真实运行状态；M7/Local 保持 S0 骨架。
-    pub fn status_json(&self) -> serde_json::Value {
+    /// `configured` = `cfg.raft.is_some()`，未配置 `[raft]` 时能力位全 false。
+    pub fn status_json(&self, configured: bool) -> serde_json::Value {
         match &self.inner {
-            Inner::Raft(handle) => handle.status_json(),
-            Inner::Local(_) => super::status_json(),
+            Inner::Raft(handle) => handle.status_json(configured),
+            Inner::Local(_) => super::status_json(configured),
         }
     }
 

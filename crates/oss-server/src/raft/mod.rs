@@ -212,8 +212,8 @@ impl RaftHandle {
     }
 
     /// S6 的 `GET /api/v1/site/raft/status` 数据源。
-    pub fn status_json(&self) -> serde_json::Value {
-        status::status_json(self)
+    pub fn status_json(&self, configured: bool) -> serde_json::Value {
+        status::status_json(self, configured)
     }
 
     pub async fn shutdown(&self) {
@@ -290,15 +290,15 @@ impl RaftHandle {
     }
 }
 
-/// `GET /api/v1/raft/status` 的 S0 骨架（S5 补 leader/term/applied）。
-/// capabilities 供 UI 置灰未就绪模式；运行时状态见 [`status::status_json`]。
-pub fn status_json() -> serde_json::Value {
+/// `GET /api/v1/raft/status` 的 S0 骨架（M7/standalone）。
+/// `configured` = `cfg.raft.is_some()`；未配置时能力位全 false（与 `/api/v1/site` 同口径）。
+pub fn status_json(configured: bool) -> serde_json::Value {
     serde_json::json!({
         "enabled": false,
         "capabilities": {
-            "raft": RAFT_READY,
-            "sync": SYNC_READY,
-            "stretch": STRETCH_READY,
+            "raft": configured && RAFT_READY,
+            "sync": configured && SYNC_READY,
+            "stretch": configured && STRETCH_READY,
         },
     })
 }

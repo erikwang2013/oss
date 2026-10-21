@@ -115,7 +115,8 @@ async fn snapshot(
 }
 
 async fn status(Extension(ext): Extension<RaftExt>) -> Json<Value> {
-    Json(ext.handle.status_json())
+    // rpc_router 只在配置了 [raft] 时挂载（数据站点/witness），能力位按 configured=true。
+    Json(ext.handle.status_json(true))
 }
 
 /// S7.3 拥有成员变更；S7.1 只固定路由/鉴权/体上限形状（CLI 客户端已按 HTTP 走）。

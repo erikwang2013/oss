@@ -629,7 +629,7 @@ async fn status_reports_real_raft_state_and_ready_flags() {
     assert_eq!(v["capabilities"]["sync"], SYNC_READY);
     assert_eq!(v["capabilities"]["stretch"], STRETCH_READY);
 
-    // M7/Local：仍是 S0 骨架（enabled=false），但能力旗标一致。
+    // M7/Local（无 [raft]）：S0 骨架，能力位全 false（与 /api/v1/site 同口径）。
     let m7dir = tempfile::tempdir().unwrap();
     let m7 = common::state(m7dir.path()).await;
     let m7base = serve(build_router(m7).unwrap()).await;
@@ -642,8 +642,9 @@ async fn status_reports_real_raft_state_and_ready_flags() {
         .await
         .unwrap();
     assert_eq!(v["enabled"], false);
-    assert_eq!(v["capabilities"]["raft"], RAFT_READY);
-    assert_eq!(v["capabilities"]["sync"], SYNC_READY);
+    assert_eq!(v["capabilities"]["raft"], false);
+    assert_eq!(v["capabilities"]["sync"], false);
+    assert_eq!(v["capabilities"]["stretch"], false);
 }
 
 /// READY 翻转前的 503 与翻转后的单命令建桶用同一用例覆盖：断言跟着常量走。
