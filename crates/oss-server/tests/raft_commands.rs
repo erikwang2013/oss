@@ -373,6 +373,19 @@ async fn admin_target_iam_commands_are_invalid() {
         .create_access_key("ADMINAK", "sk", admin_id)
         .await
         .unwrap();
+    let admin_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'admin'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
+         VALUES (?, 'kept', 1, 0, 0)",
+    )
+    .bind(admin_id)
+    .execute(st.db.pool())
+    .await
+    .unwrap();
 
     for cmd in [
         ControlCommand::UserDelete {
@@ -416,6 +429,23 @@ async fn admin_target_iam_commands_are_invalid() {
             .await
             .unwrap();
     assert_eq!((status.as_str(), n), ("active", 1));
+    let stored_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'admin'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_hash, admin_hash,
+        "拒绝后管理员口令哈希必须逐字节不变"
+    );
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM permissions WHERE user_id = ? AND bucket = 'kept' AND can_read = 1",
+    )
+    .bind(admin_id)
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "UserSetPermissions 拒绝不得清空管理员权限行");
     let (ak_status, n): (String, i64) =
         sqlx::query_as("SELECT status, COUNT(*) FROM access_keys WHERE access_key = 'ADMINAK'")
             .fetch_one(st.db.pool())

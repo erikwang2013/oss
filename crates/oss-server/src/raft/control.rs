@@ -1,8 +1,9 @@
-//! M9 控制面门面：`Local`（M7/standalone）与 `Raft` 的统一写入口。
+//! M9 控制面门面：`Raft` 是 M9 唯一 HTTP 写入口；`Local` 仅供测试/兼容。
 //!
-//! `Local` 用与 apply 完全相同的单事务映射（调用方在进门前已算好 hash/封装的 SK/时间戳），
-//! 提交后执行同一副作用表——因此 M7 的最终状态与旧直写路径一致。`Raft` 在 append 前做
-//! 24 MiB 尺寸闸、写超时有界（503），提交后幂等执行副作用（失败重试 3 次并留给启动对账）。
+//! HTTP handler 必须先 `is_raft()`：只有 Raft 分支可接 M9 路由，M7/standalone 的桶
+//! 生命周期（set 指派、物理优先、LWW 补偿、广播）继续走 console/S3 旧路径。`Raft`
+//! 在 append 前做 24 MiB 尺寸闸、写超时有界（503），提交后幂等执行副作用（失败重试
+//! 3 次并留给启动对账）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -211,7 +212,7 @@ impl ControlPlane {
     /// 一次控制写：恰好一条命令、恰好一个 `ControlResponse`。
     pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, ControlError> {
         match &self.inner {
-            // S6b-d 路由闸：只有事件循环/测试用 Local；HTTP handler 不得把 M7
+            // S6b-d 路由闸：Local 仅供测试/兼容；HTTP handler 不得把 M7
             // 桶生命周期接进来（review I1）。
             Inner::Local(db) => {
                 let mut tx = db.pool().begin().await.map_err(internal)?;
