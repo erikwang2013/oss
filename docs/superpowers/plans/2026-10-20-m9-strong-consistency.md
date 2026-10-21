@@ -72,7 +72,7 @@ v4 **4/4 P1（B1–B4）** 已在 v5 落点。累计 **88 项中 80 项**有明�
 | P1-10 openraft 适配/尺寸 | `features=["serde","storage-v2"]`（v4 修正）；v2 traits 直连、无 `Adaptor`、原生 async fn；module base64；append/vote 32 MiB；快照分块 | §2.3, S5 |
 | P1-11 0004 不可重放 | 表 `IF NOT EXISTS`、触发器先 `DROP IF EXISTS`、ctx `INSERT OR IGNORE`；连续 connect 测试 | §2.3, S0 |
 | N1 tee 临时文件位置 | `staging_dir/tee/<uuid>.plain`（版本目录外）；成功/失败/超时/取消均清理 | S1 |
-| N2 超时歧义可能远端可见 | `sync_ambiguous_total`；S3 对超时做一次 HEAD 探测，能定位则补偿；文档 | S2/S3 |
+| N2 超时歧义可能远端可见 | `oss_sync_ambiguous_total`；S3 对超时做一次 HEAD 探测，能定位则补偿；文档 | S2/S3 |
 | N3 转发超时歧义 | 文档：命令可能已提交；重试按 Conflict/NotFound 幂等；测试 | S8 |
 | N4 follower 授权陈旧 | 安全章节明示：撤销在 follower 应用前仍可认证 | S8/S9 |
 | N5 Raft 下对象 worker | 只停 M7 changelog worker；async 对象 repl worker 保留；回归 e2e | S6/S9 |
@@ -692,7 +692,7 @@ state_db = "/var/lib/oss-witness/control.db"
      读 C 的 `state_db`，只导出控制面 11 表；对象数据必须从备份恢复（C 无对象目录）。
      导出源与 `--config`/`state_db` 必须显式记录在 runbook。
   2. 归档旧 `raft.db`；`oss-server raft-force-recover --config <survivor> --from <export>
-     --new-node-id <N> --yes`：建**全新空 `raft.db`**，把业务行单事务导入 `control.db`，
+     --node-id <N> --yes`：建**全新空 `raft.db`**，把业务行单事务导入 `control.db`，
      重置 `raft_applied` 与 `raft_apply_ctx`。
   3. `raft-force-recover` 在同一命令中对**全新空日志**执行 `Raft::initialize({N})`（单节点
      quorum），再启动该节点；启动配置 `bootstrap=false` 只加载既有 membership，**不会**再
@@ -980,7 +980,7 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
   Tagging API/Batch tag（`service.rs:3268,3313`；`console.rs:2003,2025`；`job_actions.rs:383`）
   sync → 501；lifecycle Expiration 允许、Transition 400；标签/存储类仅随 PUT/MPU/Copy 复制。
 - 远端超时歧义：origin id 已知；一次 HEAD `?versionId=<local id>` 能定位则 `abort`，否则
-  `sync_ambiguous_total` + 写 intent 周期补偿；文档“可能远端可见”。
+  `oss_sync_ambiguous_total` + 写 intent 周期补偿；文档“可能远端可见”。
 - 测试：MPU/Copy sync（本地/远端同一 version id）、MPU tee 存在且内容等于对象明文、
   远端调用前 tee 缺失 500、kill -9 ack/commit 边界按补偿收敛、tags/class 远端 GET、
   幂等重推、SSE-C 400、tag 501、lock 409、Suspended 409、lifecycle Transition 400、
@@ -1330,9 +1330,11 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
   正确；远端分片失败 fail-fast；零字节/1 字节 meta 12/9。
 - **快照/权限**：非 admin 权限行、admin 权限、AP/Inventory owner 在安装后仍指向正确用户；
   B' 替换 repair 后同 id 版本删除成功。
-- 指标：`oss_raft_role/term/last_applied/members/leader_changes/apply_errors/forward/
-  snapshot_bytes`、`oss_sync_acked/failed/ambiguous/delete_*`、`oss_stretch_slots_ok`、
-  `oss_sync_write_intent_recovered_total`、`oss_sync_delete_recovered_total`。
+- 指标：`oss_raft_role`、`oss_raft_term`、`oss_raft_last_applied`、`oss_raft_members`、
+  `oss_raft_production_ready`、`oss_raft_leader_changes_total`、`oss_raft_apply_errors_total`、
+  `oss_raft_forward_total`、`oss_raft_snapshot_bytes`；`oss_sync_acked_total`、
+  `oss_sync_failed_total`、`oss_sync_write_intent_recovered_total`、`oss_sync_delete_partial_total`、
+  `oss_sync_delete_recovered_total`、`oss_sync_ambiguous_total`；`oss_stretch_slots_ok`。
 - 验收测试：① 3-voter 并发写 + 归一化 diff；④ kill/restart/snapshot/cutover + membership
   相等；② 与 S3 共用；③ 与 S4 共用；上述故障注入全部纳入 S8 清单。
 - 出口：七闸；验收 ①④ 全绿。
@@ -1354,11 +1356,12 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
   5. sync 边界：versioning Suspended 409、object lock 409、SSE-C 400、tag 501、
      lifecycle Transition 400；内部路由缺/错 `x-oss-site-token` → 403，S3 DELETE 不带 token
      仍走 remote-first（代理剥离不会降级）；async 桶在 Raft 下仍复制（对象 worker 保留）；
-  6. cutover：M7 双边 fixture → export/merge/start/配对/加 C → 11 表全列 diff=0，
-     permissions `(username,bucket)` 与 `can_read/can_write/can_delete` 三列、owner 重映射
-     正确；B' 替换后 repair，并从 A/B' 两侧删除同一旧版本；
-  7. 收尾：解配/停进程/临时目录清理。
-- `tests/e2e_stretch.sh`：复用 e2e_m9 的 C witness（或 `[raft]` 单节点 dev 只测数据面）；
+  6. 收尾：解配/停进程/临时目录清理。
+
+- `tests/e2e_m9_recovery.sh`（灾备）：M7 export/cutover 11 表全列 diff、permissions
+  `(username,bucket)` 与 `can_read/can_write/can_delete` 三列、owner 重映射、B' 替换后
+  repair，并从 A/B' 两侧删除同一旧版本；force-recover 后 `bootstrap=false` 重启。
+- `tests/e2e_stretch.sh`：不依赖 witness C（S4 数据面专用；三 voter/witness 用例在 `e2e_m9.sh`）；
   两站点 × 6 盘、8+4、inline=0；**真实 `oss-server` 二进制**用 `[stretch].self_addr` 启动
   mesh gRPC server（不是测试 harness），两站点 mesh 互通；真实 mesh 分片写/读/range；
   停 B → GET/PUT 非 2xx；恢复 → `fsck --repair`；断言每站点 6 片、meta 镜像 12/提交 ≥9、
@@ -1380,7 +1383,7 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
   `initialize({N})`，仅 C 存活时 `raft-export --witness` + 对象从备份）、TLS 私网要求；
   设计 §7.3/§M9 与 feature spec §10.2 增实现裁决、③ 2×6 说明，并**同步修正 sync+stretch
   的规格收窄**（设计 §7.3 / feature spec §10.2）。
-- 出口：七闸 + web test/build + 四个 e2e 全绿；最终验收证据填入 §7。
+- 出口：七闸 + web test/build + 五个 e2e 全绿；最终验收证据填入 §7。
 
 ## 6. 风险登记
 
@@ -1421,7 +1424,7 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
 | 两节点永久丢失 | 离线 `raft-force-recover`；优先从存活数据站点导出；仅 C 存活时 `raft-export --witness` 只导控制状态、对象从备份；禁止手改 raft.db；明确丢未提交写 |
 | stretch WAN 性能/超时 | 64 KiB/块、6 远端片/块；仅合规/小对象；`mesh_timeout_ms`；preflight 测量 |
 | stretch 无站点容灾 | 文档/UI/验收明示；不做虚假承诺 |
-| sync 删除超时歧义 | intent + `head_object_version` 200/405/404 三态 + `sync_delete_ambiguous_total`；内部 token 路由；文档 |
+| sync 删除超时歧义 | intent + `head_object_version` 200/405/404 三态 + `oss_sync_ambiguous_total`；内部 token 路由；文档 |
 | sync marker 重试重复 | 明确 at-least-once：对象不可见/同 id 版本删除幂等；不承诺 `ListObjectVersions` 列表逐项相同；文档 + e2e 断言 |
 | ReplClient 超时回归 async | 共享 client 无默认；sync 每调用；async 大超时 |
 | 转发/命令超时歧义 | 文档 + 重试 Conflict/NotFound；测试 |
@@ -1459,7 +1462,7 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
 7. `cargo fmt --all --check`
 
 另列：`cargo test -p xl-s3 --features olap-wasm`；`npm --prefix web test`、`build`；
-`e2e_m9.sh`、`e2e_stretch.sh`、`e2e_sites.sh`、`e2e_m8.sh`。
+`e2e_m9.sh`、`e2e_m9_recovery.sh`、`e2e_stretch.sh`、`e2e_sites.sh`、`e2e_m8.sh`。
 
 **分片闸门矩阵**
 
@@ -1475,14 +1478,16 @@ pub enum GateError { Unavailable(String), TooLarge, Rejected(String) }
 | S6 | `raft_commands`、`raft_guard`、`raft_routing`、apply 单 R/`ClientWriteResponse`、`PayloadTooLarge`、`client_write` deadline、M7 回归、groups 拒绝、SetBucketDeleting（仅 sync） |
 | S7 | `raft_three_voter`、`raft_pairing`、`raft_cutover`、leader-aware membership、C leader、B' repair、force recovery、permissions 三列、**stretch identity 六字段 mismatch** |
 | S8 | 验收 ①④、故障注入（写 intent kill-9 **compensate-only**、删 intent/marker 405、MPU tee、Batch/console 删除、bucket 竞态/M7 回归、stretch 无 async）、指标 |
-| S9 | 四个 e2e、web unit/build/Playwright、七闸全量 |
+| S9 | 五个 e2e、web unit/build/Playwright、七闸全量 |
 
 **最终验收证据**
 - 七闸 exit 0 + 测试计数；clippy/fmt 无输出。
 - `e2e_m9.sh`：3 voters、单站点宕控制写、A+B 宕 503、C leader 成员变更、sync
   PUT/DELETE 503/恢复、从 B 发起版本/marker 删除、写 intent kill -9 **compensate-only**
   恢复、marker 405 恢复、MPU tee、Batch/console 对象/桶删除、内部 token 403/剥离不降级、
-  桶删竞态、cutover 11 表 + permissions 三列、`--repair`、async 回归；`FINAL FAIL=0`。
+  桶删竞态、async 回归；`FINAL FAIL=0`。
+- `e2e_m9_recovery.sh`：cutover 11 表 + permissions 三列、`--repair`、witness/force-recover；
+  `FINAL FAIL=0`。
 - `e2e_stretch.sh`：两站点 6 片/9 槽/inline=0；**真实 `oss-server` 由 `self_addr` 启动
   mesh server**、真实 mesh 写；B 本地第二；每站 1 版本、无 site outbox；停站非 2xx；
   **B 经 A 的 `advertise_endpoint` 访问 `/api/v1/raft/status` 成功**；恢复修复；`FINAL FAIL=0`。

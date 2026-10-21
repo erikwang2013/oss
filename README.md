@@ -86,8 +86,9 @@ origin version id、staging 明文 tee 0600、写 intent compensate-only）· sy
 `/api/v1/raft/status`）· 3-voter 成员变更/leader 单跳转发 · 双边配对与 B′ 替换 · witness
 独立运行时 · 11 表逻辑快照/安装 · M7→Raft cutover · `raft-export/raft-force-recover` ·
 `sync-reconcile [--repair]` · console Raft 集群卡片。`RAFT_READY`/`SYNC_READY`/
-`STRETCH_READY` 均为 true。**S8/S9 剩余**：故障注入验收脚本扩展、全量七闸/四个 e2e 的最终
-证据归档（`tests/e2e_m9.sh` 与 `tests/e2e_stretch.sh` 已在本机通过；见下表）。
+`STRETCH_READY` 均为 true。**S8/S9 残余**：stretch 模式下配对/加 witness 的组合证据
+未归档；灾备与 11 表并发 diff 已由 `tests/e2e_m9_recovery.sh` / `tests/e2e_m9.sh`
+覆盖（五个 e2e 与验收证据见下）。
 
 ## 架构
 
@@ -1012,7 +1013,7 @@ append/vote/snapshot/status/membership/write/join。
 | `[site]` | M7 异步站点对 | 本地 SQLite | 可用（M7） |
 | `[cluster]` | 扁平多节点 EC | 本地 SQLite | 可用（M3/M4） |
 | `[site]` + `[raft]` | M7 异步站点对；sync 桶（1 数据 peer） | Raft 1/2/3 voters（A/B 配对 + C witness） | 可用；控制写经 Raft；`production_ready` 需 ≥3 voters |
-| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 数据面 e2e ALL PASS；stretch 模式下配对/加 witness 的组合证据待 S9 |
+| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 数据面 e2e ALL PASS；stretch 模式下配对/加 witness 的组合证据未归档 |
 
 启动校验（`config.rs`，均 fail-closed）：`[raft]` 必须有 `[site]`；`[stretch]` 必须有
 `[site]` + `[raft]`；`[cluster]` 与 `[site]`/`[stretch]` 互斥；`[raft]`/`[stretch]` 下
@@ -1193,10 +1194,12 @@ db_path = "/var/lib/oss/raft.db"
 **M7 → Raft cutover**（两台 M7 库切到控制面 Raft）：
 
 1. 停 A/B；`oss-server raft-export --config a/oss.toml --out /backup/export.json`（11 张复制表，
-   自然键；`--witness` 仅用于备份 witness 的 `state_db`，该导出不能用于 cutover/恢复）。
+   自然键；`--witness` 仅导出 witness 的 `state_db`（只含控制面 11 表，不含对象）；
+   该导出不能用于 cutover；可用于 force recovery，对象数据仍从备份恢复）。
 2. 对每个 M7 目标库先 dry-run：`raft-cutover --config x/oss.toml --from export.json --dry-run`；
    无冲突后去掉 `--dry-run`。冲突按 **11 张表自然键逐字段**报告
-   （`table/key/field/source/target`，同一行多个字段不同即多条），而非整行摘要。
+   （CLI 每行 `conflict <table> <key> <field>`，同一行多个字段不同即多条；
+   `Diff` 另含 source/target，但当前 CLI 不打印），而非整行摘要。
    目标必须是 **未进入 raft mode** 的 M7 库、版本/admin/vault
    与导出一致、`[cluster]` 不存在、site changelog lag=0、`site_apply_dead` 为空；
    `--overwrite` 才允许覆盖目标独有复制行。cutover 成功后写 `raft_cutover` 并置
@@ -1293,8 +1296,9 @@ M9 强一致端到端（自动起 A/B 数据站点 + witness C，端口/目录�
 ```bash
 cargo build -p oss-server && tests/e2e_m9.sh              # 默认 sync 模式（估算 3–6 分钟）
 M9_STRETCH=1 tests/e2e_m9.sh                              # Stretch EC 2×6 模式（估算 3–6 分钟）
+bash tests/e2e_m9_recovery.sh                             # 灾备：cutover/force-recover/B′ + repair（需 sqlite3）
 # OSS_BIN=target/debug/oss-server 可指定二进制；M9_STRICT=1 除模式互斥的预期 SKIP 外，
-# 任何 SKIP 升级为 FAIL（功能齐备后 CI 用）。
+# 任何 SKIP 升级为 FAIL（功能齐备后 CI 用）；e2e_m9_recovery 另需 aws-cli/curl/python3/sqlite3。
 ```
 
 功能门控：脚本读 `GET /api/v1/raft/status` 的 `capabilities.{raft,sync,stretch}` 决定跑哪些段；
@@ -1328,7 +1332,7 @@ SKIP 外，任何 SKIP 都按 FAIL 处理（`skip_expected` 不计失败）。
   「缺口收口与偏差」节、设计文档 §M8 落地状态
 - M8 e2e：`tests/e2e_m8.sh`（前置与旋钮见「M8 测试锚」段）
 - M9 强一致计划（v5；数据面 S0–S4 + Raft S5、控制面 S6、3-voter/配对/快照/cutover S7
-  已实施；S8/S9 为故障验收与证据归档）：
+  已实施；S8/S9 验收已完成，证据归档残余见下）：
   `docs/superpowers/plans/2026-10-20-m9-strong-consistency.md`
 
 ---

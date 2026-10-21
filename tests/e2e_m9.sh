@@ -9,7 +9,7 @@
 #      ③ Stretch EC 2×6：两站点读写、单站点故障非 2xx、恢复、每站点 1 版本/6 片、无 site outbox。
 # 模式：sync 桶与 stretch 按计划 v3 N4 **互斥**，同一集群不能同时启用：
 #       默认（M9_STRETCH=0）跑步骤 1/2/3/5；M9_STRETCH=1 跑 1/2/4/5（步骤 3 显式跳过）。
-#       计划 §S9/§7 的独立 tests/e2e_stretch.sh（S4 数据面专用、无 witness）继续作为“四个 e2e”
+#       计划 §S9/§7 的独立 tests/e2e_stretch.sh（S4 数据面专用、无 witness）继续作为“五个 e2e”
 #       之一保留；本脚本 M9_STRETCH=1 是复用 A/B/C 的 S9 集成变体，不是它的 wrapper。
 # 功能门控：未接线的构建按 raft status（/api/v1/raft/status 或 /api/v1/site/raft/status）的
 #       capabilities.raft/sync/stretch 自动跳过对应步骤并打印原因。仅当 A/B **都**因配置解析
