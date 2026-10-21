@@ -2707,7 +2707,7 @@ async fn change_my_password(
         return match state.db.set_password(uid, &body.new_password).await {
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => {
-                tracing::error!(error = %e, "写入口令失败");
+                tracing::error!(error = %e, "改密失败");
                 internal_error()
             }
         };
@@ -2770,9 +2770,16 @@ async fn set_user_status(
     if !state.control.is_raft() || is_admin {
         return match state.db.set_user_status(id, body.active).await {
             Ok(true) => StatusCode::NO_CONTENT.into_response(),
-            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            // 上面的预检给友好文案；false 且用户仍在 = 并发下守卫触发（评审 P2 的原子兜底）
+            Ok(false) => {
+                if matches!(state.db.get_user(id).await, Ok(Some(_))) {
+                    (StatusCode::BAD_REQUEST, "不能停用最后一个在册管理员").into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }
             Err(e) => {
-                tracing::error!(error = %e, "启停用账号失败");
+                tracing::error!(error = %e, "更新用户状态失败");
                 internal_error()
             }
         };

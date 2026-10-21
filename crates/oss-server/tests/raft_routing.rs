@@ -69,6 +69,20 @@ async fn raft_state(dir: &std::path::Path) -> AppState {
     AppState::load(&cfg).await.unwrap()
 }
 
+/// K1 专用：与 `raft_state` 相同，但开启密钥库（M5 接线后从 `enc_state` 派生 vault）。
+/// 不走 `OSS_MASTER_KEY_FILE` 环境变量，避免进程级 env 与其它并行用例互相污染。
+async fn raft_state_with_vault(dir: &std::path::Path) -> AppState {
+    let mut st = raft_state(dir).await;
+    st.store
+        .init_encryption(Some(dir.join("master.key")), None)
+        .await
+        .unwrap();
+    st.vault =
+        xl_s3::skvault::SecretVault::from_enc_state(st.store.enc_state()).map(std::sync::Arc::new);
+    assert!(st.vault.is_some(), "测试夹具必须启用 vault");
+    st
+}
+
 async fn serve(app: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -320,7 +334,7 @@ async fn raft_user_paths_write_one_command_each_and_map_responses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_access_keys_route_non_admin_and_keep_guard_exceptions_local() {
     let dir = tempfile::tempdir().unwrap();
-    let st = raft_state(dir.path()).await;
+    let st = raft_state_with_vault(dir.path()).await;
     st.db.create_user(ADMIN, ADMIN_PW, true).await.unwrap();
     wait_leader(&st).await;
     let base = serve(build_router(st.clone()).unwrap()).await;
@@ -328,7 +342,8 @@ async fn raft_access_keys_route_non_admin_and_keep_guard_exceptions_local() {
     create_sub(&base, &admin, "sub", "pw12345678").await;
     let sub = login(&base, "sub", "pw12345678").await.unwrap();
 
-    // K1：非管理员属主 AK = 一条命令；kind 落 long-term，属主按 username 解析。
+    // K1：非管理员属主 AK = 一条命令；kind 落 long-term，属主按 username 解析；
+    // 入日志/落库的是 **append 前封存** 的密文，响应仍一次性回明文。
     let before = applied_index(&st).await;
     let resp = client()
         .post(format!("{base}/api/v1/access-keys"))
@@ -340,16 +355,23 @@ async fn raft_access_keys_route_non_admin_and_keep_guard_exceptions_local() {
     assert_eq!(resp.status(), StatusCode::OK);
     let created: serde_json::Value = resp.json().await.unwrap();
     let ak = created["access_key"].as_str().unwrap().to_string();
+    let plain_sk = created["secret_key"].as_str().unwrap().to_string();
     assert_eq!(applied_index(&st).await, before + 1, "K1 恰好一条命令");
-    let row: (i64, String) = sqlx::query_as(
-        "SELECT u.is_admin, ak.kind FROM access_keys ak JOIN users u ON u.id = ak.user_id \
-         WHERE ak.access_key = ?",
+    let row: (i64, String, String) = sqlx::query_as(
+        "SELECT u.is_admin, ak.kind, ak.secret_key FROM access_keys ak \
+         JOIN users u ON u.id = ak.user_id WHERE ak.access_key = ?",
     )
     .bind(&ak)
     .fetch_one(st.db.pool())
     .await
     .unwrap();
-    assert_eq!(row, (0, "long-term".into()));
+    assert_eq!((row.0, row.1.as_str()), (0, "long-term"));
+    assert!(
+        xl_store::kms::is_sealed(&row.2),
+        "复制的 secret_key 必须是封存密文: {}",
+        row.2
+    );
+    assert_ne!(row.2, plain_sk, "落库/复制值不得等于响应明文 SK");
 
     // 显式 AK 重名：apply Conflict → 409；仍一条命令。
     let before = applied_index(&st).await;
