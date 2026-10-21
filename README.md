@@ -117,7 +117,8 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后用户/桶/策略 5 表三端字段级一致（其余 6 表 TODO(S9)）、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 71 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 71 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
+| `tests/e2e_m9_recovery.sh` | M9 灾备验收（真进程 + CLI：M7 export/cutover 字段级冲突与 overwrite、force-recover 后 `bootstrap=false` 重启；witness 运行时/export/force-recover；B′ 替换 + `sync-reconcile --repair` 门） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
@@ -359,7 +360,13 @@ drive_count = 3
 - `data_dirs` 顺序是拓扑的一部分：错位会在启动时被 `.oss.sys/topo` 指纹拒绝（大声失败）。
 
 **观测**：`GET /metrics`（Prometheus 文本；**公开**，注释已写明与 `/health/cluster` 同量级信息）——`oss_quorum_unmet_total{op="write"|"lock"}` ·
-`oss_node_up{node=…}` · `oss_drive_count` · `oss_slot_count`。控制台「集群」页（管理员菜单：模式 / 槽位 / quorum 未达计数 +
+`oss_node_up{node=…}` · `oss_drive_count` · `oss_slot_count`。M9 另暴露
+`oss_raft_role{role="leader"|"follower"|"witness"}`、`oss_raft_term`、`oss_raft_last_applied`、
+`oss_raft_members`、`oss_raft_production_ready`、`oss_raft_leader_changes_total`、
+`oss_raft_apply_errors_total`、`oss_raft_forward_total`、`oss_raft_snapshot_bytes`；
+sync 面 `oss_sync_acked_total`、`oss_sync_failed_total`、`oss_sync_write_intent_recovered_total`、
+`oss_sync_delete_partial_total`、`oss_sync_delete_recovered_total`、`oss_sync_ambiguous_total`；
+stretch 面 `oss_stretch_slots_ok`（未配置 `[stretch]` 时为 0）。控制台「集群」页（管理员菜单：模式 / 槽位 / quorum 未达计数 +
 节点表 + 拓扑指纹，15s 自刷新；单机显示单机模式提示）与 `GET /api/v1/cluster/status`（admin；单机优雅降级 `mode:"single"`）同源。
 
 ```yaml
