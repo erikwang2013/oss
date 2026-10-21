@@ -772,7 +772,8 @@ async fn membership_rpc(
     let resp = reqwest::Client::new()
         .post(&url)
         .header(crate::raft::RPC_TOKEN_HEADER, &raft.cluster_token)
-        .timeout(Duration::from_secs(20))
+        // 服务端 leader 转发上限 30s（快照 10s + 成员写），CLI 必须覆盖该窗口。
+        .timeout(Duration::from_secs(40))
         .json(&body)
         .send()
         .await

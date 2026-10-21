@@ -3305,7 +3305,7 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         .as_ref()
         .map(|r| r.peer_id.clone())
         .unwrap_or_else(|| body.peer_id.clone());
-    let peer = crate::db::SitePeer {
+    let mut peer = crate::db::SitePeer {
         peer_id: row_id.clone(),
         remote_site_id: ident.id.clone(),
         name: body.name.clone().unwrap_or_else(|| ident.name.clone()),
@@ -3439,6 +3439,7 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
     }
     if replaced {
         let _ = state.db.set_site_reconcile_required(&row_id, true).await;
+        peer.reconcile_required = true;
     }
     let initialized = state.raft.as_ref().is_some_and(|h| h.membership_nonempty());
     let _ = crate::raft::identity::record_initialized(&state.db, initialized).await;

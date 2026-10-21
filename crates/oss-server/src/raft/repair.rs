@@ -499,3 +499,42 @@ pub async fn run(
     }
     Ok(report)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Query;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::head;
+    use std::collections::HashMap;
+
+    /// C2 回归：内部 HEAD 的 200/405/404/5xx 必须映射为 Object/Marker/Missing/Err。
+    #[tokio::test]
+    async fn remote_head_maps_tristate_and_transport_errors() {
+        let app = axum::Router::new().route(
+            "/api/v1/site/head-object",
+            head(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("version_id").map(String::as_str) {
+                    Some("obj") => StatusCode::OK.into_response(),
+                    Some("marker") => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    Some("boom") => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            ReplClient::single(&format!("http://{addr}"), "AK", "SK", "us-east-1").unwrap();
+        let head = |vid: &'static str| {
+            let client = &client;
+            async move { remote_head(client, "site", "b", "k", vid, "tok").await }
+        };
+        assert_eq!(head("obj").await.unwrap(), RemoteHead::Object);
+        assert_eq!(head("marker").await.unwrap(), RemoteHead::Marker);
+        assert_eq!(head("gone").await.unwrap(), RemoteHead::Missing);
+        assert!(head("boom").await.is_err(), "5xx 不得折叠成 Missing");
+    }
+}
