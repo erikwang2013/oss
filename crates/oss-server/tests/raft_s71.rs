@@ -9,11 +9,20 @@ use openraft::Vote;
 use openraft::raft::InstallSnapshotRequest;
 use openraft::storage::RaftStateMachine;
 use oss_server::db::Db;
-use oss_server::raft::{RPC_TOKEN_HEADER, TypeConfig};
+use oss_server::raft::membership;
+use oss_server::raft::{ControlCommand, ControlResponse, RPC_TOKEN_HEADER, TypeConfig};
 use oss_server::state::AppState;
 
 fn raft_db(dir: &Path) -> String {
     format!("sqlite://{}?mode=rwc", dir.join("control.db").display())
+}
+
+async fn control_db(dir: &Path, name: &str) -> Db {
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.join(format!("{name}.db")).display()
+    );
+    Db::connect_raft(&url).await.unwrap()
 }
 
 fn write_cfg(
@@ -234,6 +243,79 @@ async fn raft_write_without_leader_is_503_with_hint() {
     assert_eq!(body["error"], "no leader");
     assert!(body["hint"].as_str().unwrap().contains("retry"));
     node.shutdown().await;
+}
+
+/// post-release 观测：follower 的 status 带 lag/stale（追平后 stale=false）；
+/// follower 控制写单跳转发，`forward_total` 计数前进。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_status_stale_and_forward_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_db = control_db(dir.path(), "obs-a").await;
+    let b_db = control_db(dir.path(), "obs-b").await;
+    let mut sa = settings(dir.path(), 1, true);
+    sa.cluster_token = "s71-obs-token".into();
+    let a = raft_harness::spawn_node_with_pool(sa, Some(a_db.pool().clone())).await;
+    let mut sb = settings(dir.path(), 2, false);
+    sb.cluster_token = "s71-obs-token".into();
+    let b = raft_harness::spawn_node_with_pool(sb, Some(b_db.pool().clone())).await;
+    assert_eq!(raft_harness::wait_leader(&a.handle).await, 1);
+    membership::promote_voter(&a.handle, 2, b.base.clone())
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let status = format!("{}/api/v1/site/raft/status", b.base);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let v: serde_json::Value = loop {
+        let v: serde_json::Value = http
+            .get(&status)
+            .header(RPC_TOKEN_HEADER, &b.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["leader"] == 1 && v["state"] == "follower" && v["lag"] == 0 {
+            break v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "follower 未追平 leader: {v}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(v["node_id"], 2);
+    assert_eq!(v["stale"], false, "追平的 follower 不应标记 stale");
+
+    // follower 控制写：单跳转交 leader（用户不存在 → NotFound），并等本地 apply。
+    let resp = b
+        .handle
+        .client_write(ControlCommand::UserDelete {
+            username: "__obs_missing__".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp, ControlResponse::NotFound);
+    assert_eq!(
+        b.handle.counters().forwards(),
+        1,
+        "follower 必须恰好转发一次"
+    );
+
+    // leader 变更计数由后台采样任务累加（首次当选 +1），等它观察到。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while a.handle.counters().leader_changes() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader_changes 未累加"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    for n in [a, b] {
+        n.shutdown().await;
+    }
 }
 
 /// 真实 HTTP 分块安装：leader 构建快照 → 手动按 offset 分块 POST → 新节点应用。

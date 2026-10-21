@@ -24,7 +24,7 @@ use oss_server::config::{AppConfig, SiteToml, SyncToml};
 use oss_server::db::{Db, PermissionRow, SitePeer};
 use oss_server::lifecycle::sweep_once;
 use oss_server::state::AppState;
-use oss_server::sync::{SiteSyncGate, recover_delete_intents, recover_write_intents};
+use oss_server::sync::{SiteSyncGate, SyncMetrics, recover_delete_intents, recover_write_intents};
 use reqwest::Method;
 use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
@@ -205,6 +205,8 @@ struct Env {
     base: String,
     http: reqwest::Client,
     remote: MockRemote,
+    /// 与门/AppState 共享的 `/metrics` 计数（生产由 load 注入，测试门先建）。
+    metrics: Arc<SyncMetrics>,
     tee_dir: std::path::PathBuf,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
@@ -412,13 +414,17 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     let gate_db = Arc::new(Db::connect(&db_url).await.unwrap());
     gate_db.insert_site(&peer(&remote.base)).await.unwrap();
     let tee_dir = datadir.path().join("tee");
+    let metrics = Arc::new(SyncMetrics::default());
     let mut sc = StoreConfig::new(datadir.path());
-    sc.gate = Some(Arc::new(SiteSyncGate::new(
-        Arc::clone(&gate_db),
-        Duration::from_millis(TIMEOUT_MS),
-        sync_max,
-        site_enabled,
-    )));
+    sc.gate = Some(Arc::new(
+        SiteSyncGate::new(
+            Arc::clone(&gate_db),
+            Duration::from_millis(TIMEOUT_MS),
+            sync_max,
+            site_enabled,
+        )
+        .with_metrics(Arc::clone(&metrics)),
+    ));
     sc.sync_max_bytes = sync_max;
     sc.tee_dir = Some(tee_dir.clone());
     let store = Store::open(sc).await.unwrap();
@@ -453,7 +459,9 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
     let db = Db::connect(&db_url).await.unwrap();
-    let st = AppState::new(cfg, db, store).await;
+    let mut st = AppState::new(cfg, db, store).await;
+    // 与生产 `load` 同口径：/metrics 读的就是门里的同一份计数。
+    st.sync_metrics = Arc::clone(&metrics);
     let uid = st.db.create_user("alice", "pw", false).await.unwrap();
     st.db.create_access_key(AK, SK, uid).await.unwrap();
     st.db
@@ -487,6 +495,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
         base: format!("http://{addr}"),
         http: reqwest::Client::new(),
         remote,
+        metrics,
         tee_dir,
         _dirs: (dbdir, datadir),
     }
@@ -691,6 +700,35 @@ async fn sync_put_remote_first_success() {
     );
     assert_eq!(outbox(&e.st, "syn", "hello.txt").await, 0);
     assert_eq!(tee_entries(&e), 0);
+}
+
+/// post-release 观测：sync 提交门 acked/failed 随远端结果变化，且 `/metrics` 可见。
+#[tokio::test]
+async fn sync_gate_acked_and_failed_counters_move() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    assert_eq!(e.metrics.acked_total(), 0);
+    assert_eq!(e.metrics.failed_total(), 0);
+
+    assert_eq!(put(&e, "/syn/acked.txt", b"ok").await.status(), 200);
+    assert_eq!(e.metrics.acked_total(), 1);
+    assert_eq!(e.metrics.failed_total(), 0);
+
+    e.remote.fail_put();
+    assert_eq!(put(&e, "/syn/failed.txt", b"x").await.status(), 503);
+    assert_eq!(e.metrics.acked_total(), 1, "失败不得计入 acked");
+    assert_eq!(e.metrics.failed_total(), 1);
+
+    let body = e
+        .http
+        .get(format!("{}/metrics", e.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("oss_sync_acked_total 1"), "{body}");
+    assert!(body.contains("oss_sync_failed_total 1"), "{body}");
 }
 
 /// M9 S2：PutObject 的 tags/storage-class/checksum 必须随门 PUT 到达远端；
@@ -1643,6 +1681,11 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     );
     assert_eq!(intent_rows(&e.st).await, 0);
     assert!(!tee2.exists());
+    assert_eq!(
+        e.metrics.write_intent_recovered_total(),
+        2,
+        "A/B 两轮各恢复 1 行"
+    );
 
     // C) 远端不可达：保留；恢复可达后清掉。
     sqlx::query("UPDATE sites SET endpoint = 'http://127.0.0.1:1'")
