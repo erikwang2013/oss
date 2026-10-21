@@ -750,6 +750,20 @@ async fn sync_copy_forwards_metadata_and_roundtrips() {
     assert_eq!(seen[1].tagging.as_deref(), Some("k1=v1&k2=v2"));
     assert_eq!(seen[1].storage_class.as_deref(), Some("STANDARD_IA"));
     assert_eq!(seen[1].meta_foo.as_deref(), Some("bar"));
+    // M9：Copy 目标 PUT 必须携带与源相同的校验和，且进 SigV4 SignedHeaders。
+    assert_eq!(
+        seen[1].checksum_sha256.as_deref(),
+        Some(sum.as_str()),
+        "Copy 远端 PUT 必须继承源校验和"
+    );
+    let auth = seen[1]
+        .authorization
+        .as_deref()
+        .expect("copy PUT 必须带签名");
+    assert!(
+        auth.contains("x-amz-checksum-sha256"),
+        "校验和必须进 SignedHeaders: {auth}"
+    );
 
     // 本地目标字段与远端收到的字段一一对应（A/B 一致），且内容可读。
     let g = signed(&e, Method::GET, "/syn/dst.txt", &[], &[]).await;
@@ -762,6 +776,17 @@ async fn sync_copy_forwards_metadata_and_roundtrips() {
     );
     assert_eq!(h.headers().get("x-amz-meta-foo").unwrap(), "bar");
     assert_eq!(h.headers().get("x-amz-tagging-count").unwrap(), "2");
+    let hs = signed(&e, Method::HEAD, "/syn/src.txt", &[], &[]).await;
+    assert_eq!(
+        hs.headers().get("x-amz-checksum-sha256").unwrap(),
+        sum.as_str(),
+        "源对象 HEAD 应保留校验和"
+    );
+    assert_eq!(
+        h.headers().get("x-amz-checksum-sha256").unwrap(),
+        hs.headers().get("x-amz-checksum-sha256").unwrap(),
+        "A/B 对象校验和元数据必须一致"
+    );
     let t = signed(&e, Method::GET, "/syn/dst.txt?tagging", &[], &[]).await;
     assert_eq!(t.status(), 200);
     let xml = t.text().await.unwrap();
@@ -771,6 +796,40 @@ async fn sync_copy_forwards_metadata_and_roundtrips() {
     );
     assert_eq!(outbox(&e.st, "syn", "dst.txt").await, 0);
     assert_eq!(tee_entries(&e), 0);
+}
+
+/// M9：源对象无校验和时，Copy 目标不得凭空产生校验和（远端 PUT 与 A/B HEAD 均无）。
+#[tokio::test]
+async fn sync_copy_without_checksum_stays_absent() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let body = b"no checksum".to_vec();
+    let r = signed(
+        &e,
+        Method::PUT,
+        "/syn/plain-src.txt",
+        &[("content-type", "text/plain")],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = signed(
+        &e,
+        Method::PUT,
+        "/syn/plain-dst.txt",
+        &[("x-amz-copy-source", "/syn/plain-src.txt")],
+        &[],
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let seen = e.remote.puts();
+    assert_eq!(seen.len(), 2, "copy 目标也必须远端先确认");
+    assert_eq!(seen[1].body, body);
+    assert_eq!(seen[1].checksum_sha256, None, "无源校验和不得伪造");
+    for key in ["plain-src.txt", "plain-dst.txt"] {
+        let h = signed(&e, Method::HEAD, &format!("/syn/{key}"), &[], &[]).await;
+        assert_eq!(h.status(), 200);
+        assert_eq!(h.headers().get("x-amz-checksum-sha256"), None, "{key}");
+    }
 }
 
 /// M9 §2.4：sync 写不支持的组合必须显式 4xx/501，且不得触远端。
