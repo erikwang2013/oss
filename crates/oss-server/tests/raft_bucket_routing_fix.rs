@@ -285,6 +285,7 @@ async fn insert_peer(h: &H, endpoint: String) {
             last_seen: None,
             last_error: None,
             raft_node_id: None,
+            reconcile_required: false,
         })
         .await
         .unwrap();

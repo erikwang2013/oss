@@ -5,14 +5,13 @@
 //! 无 leader → 503 + hint，所有等待都有界。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Extension;
 use axum::Json;
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,8 +19,11 @@ use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde_json::{Value, json};
 
-use super::command::ControlCommand;
-use super::{RPC_BODY_LIMIT, RPC_TOKEN_HEADER, RaftHandle, TypeConfig, WriteError};
+use super::command::{ControlCommand, SizeError};
+use super::membership::{self, MembershipError, MembershipOp};
+use super::{
+    COMMAND_MAX_BYTES, RPC_BODY_LIMIT, RPC_TOKEN_HEADER, RaftHandle, TypeConfig, WriteError,
+};
 
 /// follower → leader 单跳标记：带此头仍非 leader 不再转发（防环）。
 pub const FORWARD_HEADER: &str = "x-oss-raft-forwarded";
@@ -119,12 +121,66 @@ async fn status(Extension(ext): Extension<RaftExt>) -> Json<Value> {
     Json(ext.handle.status_json(true))
 }
 
-/// S7.3 拥有成员变更；S7.1 只固定路由/鉴权/体上限形状（CLI 客户端已按 HTTP 走）。
-async fn membership(_body: Bytes) -> Response {
-    // 先读完体：S7.1 靠这里触发 64 KiB 上限，S7.3 换成真正的变更请求解析。
+/// 成员变更（S7.3）：token → 解析 → leader 本地执行；follower 单跳转发；无 leader 503。
+async fn membership(
+    Extension(ext): Extension<RaftExt>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let op: MembershipOp = match serde_json::from_slice(&body) {
+        Ok(op) => op,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid membership op: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let view = migration_view(&ext.handle);
+    if view.leader == Some(ext.handle.node_id()) {
+        return match membership::apply_local(&ext.handle, &op).await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => membership_error(e),
+        };
+    }
+    if headers.contains_key(FORWARD_HEADER) {
+        return not_leader_409(view.leader, view.leader_endpoint.clone());
+    }
+    let Some(endpoint) = view.leader_endpoint.clone() else {
+        return no_leader("leader unknown or address missing from membership");
+    };
+    match membership::request_forwarded(&endpoint, &ext.cluster_token, &op).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => membership_error(e),
+    }
+}
+
+fn migration_view(handle: &RaftHandle) -> membership::MemberView {
+    membership::view(handle)
+}
+
+fn membership_error(e: MembershipError) -> Response {
+    match e {
+        MembershipError::NotLeader { view } => not_leader_409(view.leader, view.leader_endpoint),
+        MembershipError::Invalid(msg) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
+        }
+        MembershipError::Raft(msg) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response()
+        }
+        MembershipError::NoQuorum => no_leader("control plane has no quorum"),
+    }
+}
+
+fn not_leader_409(leader: Option<u64>, leader_endpoint: Option<String>) -> Response {
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "membership changes are implemented in S7.3"})),
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "not leader",
+            "leader": leader,
+            "leader_endpoint": leader_endpoint,
+        })),
     )
         .into_response()
 }
@@ -134,80 +190,61 @@ async fn write(
     headers: HeaderMap,
     Json(cmd): Json<ControlCommand>,
 ) -> Response {
+    if let Err(e) = cmd.check_size() {
+        return match e {
+            SizeError::TooLarge(bytes) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": format!("command {bytes} bytes exceeds raft limit {COMMAND_MAX_BYTES}"),
+                })),
+            )
+                .into_response(),
+            SizeError::Encode(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("command encode: {e}")})),
+            )
+                .into_response(),
+        };
+    }
+    // 带转发标记的请求只做本地写（它是别人转来的，禁止再转）。
     let forwarded = headers.contains_key(FORWARD_HEADER);
-    let (leader, leader_endpoint) = {
-        let m = ext.handle.raft().metrics();
-        let m = m.borrow();
-        let leader = m.current_leader;
-        let endpoint = leader.and_then(|l| {
-            m.membership_config
-                .membership()
-                .get_node(&l)
-                .map(|n| n.addr.clone())
-        });
-        (leader, endpoint)
+    let result = if forwarded {
+        ext.handle.write(cmd).await
+    } else {
+        ext.handle.client_write(cmd).await
     };
-    if leader == Some(ext.handle.node_id()) {
-        return local_write(&ext.handle, cmd).await;
-    }
-    if forwarded {
-        return no_leader("request already forwarded once");
-    }
-    let Some(endpoint) = leader_endpoint else {
-        return no_leader("leader unknown or address missing from membership");
-    };
-    forward_write(&ext, &endpoint, cmd).await
-}
-
-async fn local_write(handle: &RaftHandle, cmd: ControlCommand) -> Response {
-    match handle.write(cmd).await {
+    match result {
         Ok(response) => {
             let applied_index = {
-                let m = handle.raft().metrics();
+                let m = ext.handle.raft().metrics();
                 let m = m.borrow();
                 m.last_applied.map(|l| l.index).unwrap_or(0)
             };
             Json(json!({"response": response, "applied_index": applied_index})).into_response()
         }
         Err(WriteError::Timeout(d)) => (
-            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
-                "error": format!("raft write timed out after {d:?}"),
-                "hint": "write may have committed; retry reads before resubmitting",
+                "error": "no quorum",
+                "hint": format!("write may have committed after {d:?}; retry is idempotent"),
             })),
         )
             .into_response(),
-        Err(WriteError::Raft(e)) => no_leader(&format!("local write failed: {e}")),
-    }
-}
-
-async fn forward_write(ext: &RaftExt, endpoint: &str, cmd: ControlCommand) -> Response {
-    let timeout = Duration::from_millis(ext.handle.settings().write_timeout_ms);
-    let client = reqwest::Client::new();
-    let sent = client
-        .post(format!(
-            "{}/api/v1/site/raft/write",
-            endpoint.trim_end_matches('/')
-        ))
-        .header(RPC_TOKEN_HEADER, &ext.cluster_token)
-        .header(FORWARD_HEADER, "1")
-        .timeout(timeout)
-        .json(&cmd)
-        .send()
-        .await;
-    match sent {
-        Ok(resp) => {
-            let status = resp.status();
-            match resp.bytes().await {
-                Ok(bytes) => Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(bytes))
-                    .unwrap_or_else(|_| no_leader("failed to relay leader response")),
-                Err(e) => no_leader(&format!("leader response read failed: {e}")),
-            }
+        Err(WriteError::NoQuorum) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "no quorum",
+                "hint": "write may have committed; retry is idempotent",
+            })),
+        )
+            .into_response(),
+        Err(WriteError::ForwardToLeader { leader, endpoint }) => match (leader, endpoint) {
+            (Some(_), Some(endpoint)) => not_leader_409(leader, Some(endpoint)),
+            _ => no_leader("control plane has no quorum"),
+        },
+        Err(WriteError::Raft(e)) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
         }
-        Err(e) => no_leader(&format!("leader forward failed: {e}")),
     }
 }
 

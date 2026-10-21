@@ -712,16 +712,20 @@ pub async fn run_offline(
                 .raft
                 .as_ref()
                 .ok_or("[raft] 未配置：无法定位本机 advertise_endpoint")?;
-            membership_rpc(
-                raft,
-                serde_json::json!({
-                    "action": "add",
+            let body = match replace {
+                Some(old_node_id) => serde_json::json!({
+                    "op": "replace_voter",
                     "node_id": node_id,
                     "endpoint": endpoint,
-                    "replace": replace,
+                    "old_node_id": old_node_id,
                 }),
-            )
-            .await
+                None => serde_json::json!({
+                    "op": "add_witness",
+                    "node_id": node_id,
+                    "endpoint": endpoint,
+                }),
+            };
+            membership_rpc(raft, body).await
         }
         Command::RaftRemoveNode { node_id } => {
             let cfg = crate::config::AppConfig::load(cfg_path)?;
@@ -731,7 +735,7 @@ pub async fn run_offline(
                 .ok_or("[raft] 未配置：无法定位本机 advertise_endpoint")?;
             membership_rpc(
                 raft,
-                serde_json::json!({"action": "remove", "node_id": node_id}),
+                serde_json::json!({"op": "remove_node", "node_id": node_id}),
             )
             .await
         }

@@ -561,6 +561,7 @@ async fn site_changelog_409_and_pairing_keeps_m7_state_empty() {
         last_seen: None,
         last_error: None,
         raft_node_id: None,
+        reconcile_required: false,
     };
     oss_server::site::insert_peer_with_snapshot(&st, &peer)
         .await
@@ -670,6 +671,7 @@ async fn console_sync_create_gate_and_routing_follow_ready_flags() {
             last_seen: None,
             last_error: None,
             raft_node_id: None,
+            reconcile_required: false,
         })
         .await
         .unwrap();

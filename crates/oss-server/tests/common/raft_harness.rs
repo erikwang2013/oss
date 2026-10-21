@@ -15,6 +15,8 @@ pub struct TestNode {
     pub handle: Arc<RaftHandle>,
     pub base: String,
     pub token: String,
+    /// 传入控制库时保留一份句柄，测试可直接断言行。
+    pub pool: Option<sqlx::SqlitePool>,
 }
 
 impl TestNode {
@@ -44,13 +46,22 @@ pub fn settings(dir: &Path, node_id: u64, bootstrap: bool) -> RaftSettings {
 }
 
 /// 启动节点并在随机端口暴露 `rpc_router`；`advertise_endpoint` 改写为该地址。
-pub async fn spawn_node(mut settings: RaftSettings) -> TestNode {
+pub async fn spawn_node(settings: RaftSettings) -> TestNode {
+    spawn_node_with_pool(settings, None).await
+}
+
+/// 与 [`spawn_node`] 相同，但把控制库连接池交给状态机（成员/转发测试需要真实控制表）。
+pub async fn spawn_node_with_pool(
+    mut settings: RaftSettings,
+    control_pool: Option<sqlx::SqlitePool>,
+) -> TestNode {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     settings.advertise_endpoint = format!("http://{addr}");
     let token = settings.cluster_token.clone();
+    let pool = control_pool.clone();
     let handle = Arc::new(
-        oss_server::raft::spawn_with_control(settings, None)
+        oss_server::raft::spawn_with_control(settings, control_pool)
             .await
             .unwrap(),
     );
@@ -60,6 +71,7 @@ pub async fn spawn_node(mut settings: RaftSettings) -> TestNode {
         handle,
         base: format!("http://{addr}"),
         token,
+        pool,
     }
 }
 

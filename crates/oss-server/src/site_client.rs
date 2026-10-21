@@ -1,6 +1,8 @@
 //! M7：站点控制面 HTTP 客户端（identity 校验 / ping；changelog 出货复用同一发送器）。
 //! 仅 http（M7 信任模型同 `[[remotes]]`），每请求新建连接（控制面低频）。
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::Uri;
@@ -54,14 +56,22 @@ async fn send(
     token: &str,
     body: Option<Bytes>,
 ) -> Result<(u16, Bytes), String> {
-    match tokio::time::timeout(
-        SEND_TIMEOUT,
-        send_inner(endpoint, method, path, token, body),
-    )
-    .await
-    {
+    let headers = [(SITE_TOKEN_HEADER, token)];
+    send_with_headers(endpoint, method, path, &headers, body, SEND_TIMEOUT).await
+}
+
+/// 任意头部的控制面请求（成员变更走集群令牌 + 单跳标记，见 [`post_raft_membership`]）。
+async fn send_with_headers(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<Bytes>,
+    timeout: Duration,
+) -> Result<(u16, Bytes), String> {
+    match tokio::time::timeout(timeout, send_inner(endpoint, method, path, headers, body)).await {
         Ok(r) => r,
-        Err(_) => Err(format!("站点控制面请求超时（{}s）", SEND_TIMEOUT.as_secs())),
+        Err(_) => Err(format!("站点控制面请求超时（{}s）", timeout.as_secs())),
     }
 }
 
@@ -69,7 +79,7 @@ async fn send_inner(
     endpoint: &str,
     method: &str,
     path: &str,
-    token: &str,
+    headers: &[(&str, &str)],
     body: Option<Bytes>,
 ) -> Result<(u16, Bytes), String> {
     let base = validate_endpoint(endpoint)?;
@@ -81,10 +91,10 @@ async fn send_inner(
         .ok_or_else(|| "endpoint 缺 host".to_string())?
         .to_string();
     let port = uri.port_u16().unwrap_or(80);
-    let mut req = hyper::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(SITE_TOKEN_HEADER, token);
+    let mut req = hyper::Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
     if body.is_some() {
         req = req.header("content-type", "application/json");
     }
@@ -135,6 +145,29 @@ pub async fn get_identity(endpoint: &str, token: &str) -> Result<PeerIdentity, S
         ));
     }
     serde_json::from_slice(&body).map_err(|e| format!("identity 解析失败：{e}"))
+}
+
+/// S7.3 成员变更：集群令牌；`forwarded` 只在节点内部转发时置位（单跳，防二次转发）。
+pub(crate) async fn post_raft_membership(
+    endpoint: &str,
+    token: &str,
+    body: Bytes,
+    timeout: Duration,
+    forwarded: bool,
+) -> Result<(u16, Bytes), String> {
+    let mut headers = vec![(crate::raft::RPC_TOKEN_HEADER, token)];
+    if forwarded {
+        headers.push((crate::raft::routes::FORWARD_HEADER, "1"));
+    }
+    send_with_headers(
+        endpoint,
+        "POST",
+        "/api/v1/site/raft/membership",
+        &headers,
+        Some(body),
+        timeout,
+    )
+    .await
 }
 
 /// changelog 出货（切片 1b）：返回 (status, body)。

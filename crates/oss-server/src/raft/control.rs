@@ -305,10 +305,21 @@ impl ControlPlane {
                     ControlCommand::BucketDelete { name } => Some(name.clone()),
                     _ => None,
                 };
-                let response = match handle.write(cmd).await {
+                let response = match handle.client_write(cmd).await {
                     Ok(r) => r,
                     Err(WriteError::Timeout(d)) => {
                         return Err(ControlError::Timeout(format!("after {d:?}")));
+                    }
+                    Err(WriteError::ForwardToLeader { leader, endpoint }) => {
+                        return Err(ControlError::Unavailable(format!(
+                            "not leader (leader={leader:?}, endpoint={endpoint:?}); retry on the leader"
+                        )));
+                    }
+                    Err(WriteError::NoQuorum) => {
+                        return Err(ControlError::Unavailable(
+                            "no leader/quorum; write may have committed, retry is idempotent"
+                                .into(),
+                        ));
                     }
                     Err(WriteError::Raft(msg)) => return Err(ControlError::Unavailable(msg)),
                 };

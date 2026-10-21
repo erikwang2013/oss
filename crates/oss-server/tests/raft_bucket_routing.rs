@@ -646,6 +646,7 @@ async fn sync_delete_rolls_back_and_keeps_bucket_on_peer_failure() {
             last_seen: None,
             last_error: None,
             raft_node_id: None,
+            reconcile_required: false,
         })
         .await
         .unwrap();
@@ -714,6 +715,7 @@ async fn sync_delete_success_tombstones_physical_dir() {
             last_seen: None,
             last_error: None,
             raft_node_id: None,
+            reconcile_required: false,
         })
         .await
         .unwrap();

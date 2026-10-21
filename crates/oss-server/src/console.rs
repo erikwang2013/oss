@@ -3072,6 +3072,8 @@ fn peer_json(p: &crate::db::SitePeer) -> serde_json::Value {
         "priority": p.priority,
         "last_seen": p.last_seen,
         "last_error": p.last_error,
+        "raft_node_id": p.raft_node_id,
+        "reconcile_required": p.reconcile_required,
         "has_credentials": true,
     })
 }
@@ -3178,6 +3180,7 @@ async fn create_site(
         last_seen: Some(crate::db::now()),
         last_error: None,
         raft_node_id: None,
+        reconcile_required: false,
     };
     match crate::site::insert_peer_with_snapshot(&state, &peer).await {
         Ok(()) => Json(peer_json(&peer)).into_response(),
@@ -3270,6 +3273,76 @@ async fn delete_site(
     }
     if let Err(r) = admin_of(&state, &payload).await {
         return r;
+    }
+    // M9 S7.3：Raft 模式下先做成员移除；任何失败都不得删本地对端行。
+    if state.control.is_raft() {
+        let sync_buckets: i64 = match sqlx::query_scalar(
+            "SELECT COUNT(*) FROM buckets WHERE replication_mode = 'sync'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "统计 sync 桶失败");
+                return internal_error();
+            }
+        };
+        if sync_buckets > 0 {
+            return (
+                StatusCode::CONFLICT,
+                "sync buckets present; remove or convert them before unpairing",
+            )
+                .into_response();
+        }
+        let peer = match state.db.get_site(&peer_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "读取站点失败");
+                return internal_error();
+            }
+        };
+        if let Some(node_id) = peer.raft_node_id {
+            let Some(handle) = state.raft.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "raft handle unavailable; cannot remove voter",
+                )
+                    .into_response();
+            };
+            let op = crate::raft::membership::MembershipOp::RemoveNode { node_id };
+            let view = crate::raft::membership::view(handle);
+            let result = if view.leader == Some(handle.node_id()) {
+                crate::raft::membership::apply_local(handle, &op).await
+            } else if let Some(endpoint) = view.leader_endpoint.clone() {
+                let token = state
+                    .cfg
+                    .raft
+                    .as_ref()
+                    .map(|r| r.cluster_token.clone())
+                    .unwrap_or_default();
+                crate::raft::membership::request(&endpoint, &token, &op).await
+            } else {
+                Err(crate::raft::membership::MembershipError::NoQuorum)
+            };
+            use crate::raft::membership::MembershipError;
+            match result {
+                Ok(_) => {}
+                Err(MembershipError::Invalid(msg)) => {
+                    return (StatusCode::CONFLICT, msg).into_response();
+                }
+                Err(MembershipError::NotLeader { .. }) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "no leader").into_response();
+                }
+                Err(MembershipError::NoQuorum) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "no quorum").into_response();
+                }
+                Err(MembershipError::Raft(msg)) => {
+                    return (StatusCode::BAD_GATEWAY, msg).into_response();
+                }
+            }
+        }
     }
     // P1-3：解配在事务内用 `DELETE ... RETURNING` 收集被丢弃的非空版本，删后逐个结算。
     match state.db.delete_site(&peer_id).await {

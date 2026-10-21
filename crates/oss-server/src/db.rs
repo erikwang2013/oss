@@ -54,6 +54,8 @@ pub struct SitePeer {
     pub last_error: Option<String>,
     /// M9：对端 Raft u64 节点 id（M7 行 NULL）。
     pub raft_node_id: Option<u64>,
+    /// M9 S7.4：替换站点后，sync 修复完成前拒绝向该对端复制/服务。
+    pub reconcile_required: bool,
 }
 
 /// 控制台用户行（子账户管理页用；`permissions` 全量随行返回，页面上直接展示摘要）。
@@ -766,6 +768,16 @@ impl Db {
             {
                 return Err(e);
             }
+        }
+        if !cols
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "reconcile_required")
+        {
+            sqlx::query(
+                "ALTER TABLE sites ADD COLUMN reconcile_required INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await?;
         }
         Ok(())
     }
@@ -1893,6 +1905,7 @@ fn site_peer_from_row(r: &sqlx::sqlite::SqliteRow) -> SitePeer {
         last_seen: r.get("last_seen"),
         last_error: r.get("last_error"),
         raft_node_id: r.get::<Option<i64>, _>("raft_node_id").map(|v| v as u64),
+        reconcile_required: r.get::<i64, _>("reconcile_required") != 0,
     }
 }
 

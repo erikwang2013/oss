@@ -395,6 +395,7 @@ fn peer(endpoint: &str) -> SitePeer {
         last_seen: None,
         last_error: None,
         raft_node_id: None,
+        reconcile_required: false,
     }
 }
 

@@ -12,6 +12,7 @@ pub(crate) mod apply;
 pub mod command;
 pub mod control;
 pub mod identity;
+pub mod membership;
 pub mod network;
 pub mod routes;
 pub mod status;
@@ -23,7 +24,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use openraft::error::{ClientWriteError, RaftError};
 use openraft::{BasicNode, Config, Raft};
+use serde::Deserialize;
 use sqlx::SqlitePool;
 
 pub use command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, SizeError};
@@ -55,11 +58,18 @@ openraft::declare_raft_types!(
         R = ControlResponse,
 );
 
-/// Raft 写入口错误：超时（可能已提交）与运行时/转发错误。
+/// Raft 写入口错误：超时（可能已提交）、运行时错误、需要转发到 leader、无 quorum。
 #[derive(Debug)]
 pub enum WriteError {
     Timeout(Duration),
     Raft(String),
+    /// 本节点不是 leader 且没有可转发的地址（路由 → 409/503，绝不二次转发）。
+    ForwardToLeader {
+        leader: Option<u64>,
+        endpoint: Option<String>,
+    },
+    /// 无法联系 leader / 无 quorum（写可能已提交，重试幂等）。
+    NoQuorum,
 }
 
 impl std::fmt::Display for WriteError {
@@ -67,6 +77,10 @@ impl std::fmt::Display for WriteError {
         match self {
             Self::Timeout(d) => write!(f, "raft client_write timed out after {d:?}"),
             Self::Raft(m) => write!(f, "raft client_write: {m}"),
+            Self::ForwardToLeader { leader, endpoint } => {
+                write!(f, "not leader (leader={leader:?}, endpoint={endpoint:?})")
+            }
+            Self::NoQuorum => write!(f, "no leader/quorum"),
         }
     }
 }
@@ -182,13 +196,125 @@ impl RaftHandle {
             .map(|n| n.addr.clone())
     }
 
-    /// 应用层 deadline 的写入口：超时返回错误（写可能已提交，调用方按超时语义处理）。
+    /// 本地写（不做 leader 转发）：超时返回错误（写可能已提交），成功后等到 apply
+    /// 越过本条日志再返回（`/write` 的 applied_index 才是可等待的下界）。
     pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, WriteError> {
         let timeout = Duration::from_millis(self.settings.write_timeout_ms);
-        match tokio::time::timeout(timeout, self.raft.client_write(cmd)).await {
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, self.raft.client_write(cmd)).await {
             Err(_) => Err(WriteError::Timeout(timeout)),
-            Ok(Ok(resp)) => Ok(resp.data),
+            Ok(Ok(resp)) => {
+                let index = resp.log_id.index;
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !self.wait_applied(index, left).await {
+                    return Err(WriteError::Timeout(timeout));
+                }
+                Ok(resp.data)
+            }
+            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f)))) => {
+                Err(WriteError::ForwardToLeader {
+                    leader: f.leader_id,
+                    endpoint: f.leader_node.map(|n| n.addr),
+                })
+            }
             Ok(Err(e)) => Err(WriteError::Raft(e.to_string())),
+        }
+    }
+
+    /// 控制写（follower 可用）：本地提交；否则向 leader 的 `/api/v1/site/raft/write`
+    /// 转交一次（`x-oss-raft-forwarded: 1`，最多一跳）。
+    pub async fn client_write(&self, cmd: ControlCommand) -> Result<ControlResponse, WriteError> {
+        let timeout = Duration::from_millis(self.settings.write_timeout_ms);
+        let deadline = tokio::time::Instant::now() + timeout;
+        // 命令可能很大（≤24 MiB）：ForwardToLeader 不带数据，转发要留一份副本。
+        let forward_copy = cmd.clone();
+        match tokio::time::timeout_at(deadline, self.raft.client_write(cmd)).await {
+            Err(_) => Err(WriteError::Timeout(timeout)),
+            Ok(Ok(resp)) => {
+                let index = resp.log_id.index;
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !self.wait_applied(index, left).await {
+                    return Err(WriteError::Timeout(timeout));
+                }
+                Ok(resp.data)
+            }
+            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f)))) => {
+                let (leader, endpoint) = (f.leader_id, f.leader_node.map(|n| n.addr));
+                let Some(endpoint) = endpoint else {
+                    return Err(WriteError::ForwardToLeader { leader, endpoint });
+                };
+                self.forward_write(&endpoint, leader, forward_copy, timeout)
+                    .await
+            }
+            Ok(Err(e)) => Err(WriteError::Raft(e.to_string())),
+        }
+    }
+
+    /// 向 leader 转交一次控制写；leader 侧再 409（换届）只返回错误，不再二次转发。
+    async fn forward_write(
+        &self,
+        endpoint: &str,
+        leader: Option<u64>,
+        cmd: ControlCommand,
+        timeout: Duration,
+    ) -> Result<ControlResponse, WriteError> {
+        let sent = reqwest::Client::new()
+            .post(format!(
+                "{}/api/v1/site/raft/write",
+                endpoint.trim_end_matches('/')
+            ))
+            .header(RPC_TOKEN_HEADER, &self.settings.cluster_token)
+            .header(routes::FORWARD_HEADER, "1")
+            .timeout(timeout)
+            .json(&cmd)
+            .send()
+            .await;
+        let resp = match sent {
+            Ok(resp) => resp,
+            // leader 地址不可达 = 本节点无法完成提交（可能已提交；重试幂等）。
+            Err(_) => return Err(WriteError::NoQuorum),
+        };
+        let status = resp.status();
+        let body = resp.bytes().await.unwrap_or_default();
+        match status.as_u16() {
+            200 => {
+                #[derive(Deserialize)]
+                struct WriteReply {
+                    response: ControlResponse,
+                    applied_index: u64,
+                }
+                let reply: WriteReply = serde_json::from_slice(&body)
+                    .map_err(|e| WriteError::Raft(format!("leader write reply: {e}")))?;
+                if !self.wait_applied(reply.applied_index, timeout).await {
+                    return Err(WriteError::Timeout(timeout));
+                }
+                Ok(reply.response)
+            }
+            409 => {
+                #[derive(Deserialize)]
+                struct Hint {
+                    #[serde(default)]
+                    leader: Option<u64>,
+                    #[serde(default)]
+                    leader_endpoint: Option<String>,
+                }
+                let hint: Hint = serde_json::from_slice(&body).unwrap_or(Hint {
+                    leader,
+                    leader_endpoint: Some(endpoint.to_string()),
+                });
+                Err(WriteError::ForwardToLeader {
+                    leader: hint.leader,
+                    endpoint: hint.leader_endpoint,
+                })
+            }
+            503 => Err(WriteError::NoQuorum),
+            other => Err(WriteError::Raft(format!(
+                "leader write HTTP {other}: {}",
+                String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ))),
         }
     }
 
