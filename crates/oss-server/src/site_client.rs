@@ -19,6 +19,52 @@ pub struct PeerIdentity {
     pub priority: i64,
     #[serde(default)]
     pub has_vault: bool,
+    // ---- M9 S7.4 配对预检（缺省 = 旧 M7 identity） ----
+    #[serde(default)]
+    pub raft_enabled: bool,
+    #[serde(default)]
+    pub raft_role: Option<String>,
+    #[serde(default)]
+    pub raft_bootstrap: Option<bool>,
+    #[serde(default)]
+    pub raft_initialized: Option<bool>,
+    #[serde(default)]
+    pub raft_node_id: Option<u64>,
+    #[serde(default)]
+    pub advertise_endpoint: Option<String>,
+    #[serde(default)]
+    pub admin_username: Option<String>,
+    #[serde(default)]
+    pub vault_probe: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub stretch: Option<StretchIdentity>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StretchIdentity {
+    pub node_id: String,
+    pub self_addr: String,
+    pub peer_node_id: String,
+    pub drive_count: u16,
+    pub ec: EcIdentity,
+    pub placement: String,
+    pub mesh_secret_fingerprint: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EcIdentity {
+    pub data: u16,
+    pub parity: u16,
+}
+
+#[derive(Debug)]
+pub enum IdentityError {
+    Unauthorized,
+    Status(u16),
+    Transport(String),
+    Decode(String),
 }
 
 /// 端点校验：仅 `http://host[:port]`，无 path/query/userinfo；返回去除尾斜杠的基址。
@@ -134,17 +180,48 @@ async fn send_inner(
 }
 
 pub async fn get_identity(endpoint: &str, token: &str) -> Result<PeerIdentity, String> {
-    let (status, body) = send(endpoint, "GET", "/api/v1/site/identity", token, None).await?;
-    if status != 200 {
-        return Err(format!(
-            "对端 identity 返回 {status}：{}",
-            String::from_utf8_lossy(&body)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        ));
+    get_identity_typed(endpoint, token)
+        .await
+        .map_err(|e| match e {
+            IdentityError::Unauthorized => "对端 identity 拒绝站点令牌（403）".to_string(),
+            IdentityError::Status(s) => format!("对端 identity 返回 {s}"),
+            IdentityError::Transport(m) => format!("对端 identity 连接失败：{m}"),
+            IdentityError::Decode(m) => format!("identity 解析失败：{m}"),
+        })
+}
+
+/// S7.4：配对需要区分 403（错站点令牌）与传输/解码错误。
+pub async fn get_identity_typed(
+    endpoint: &str,
+    token: &str,
+) -> Result<PeerIdentity, IdentityError> {
+    let (status, body) = send(endpoint, "GET", "/api/v1/site/identity", token, None)
+        .await
+        .map_err(IdentityError::Transport)?;
+    match status {
+        200 => serde_json::from_slice(&body).map_err(|e| IdentityError::Decode(e.to_string())),
+        401 | 403 => Err(IdentityError::Unauthorized),
+        s => Err(IdentityError::Status(s)),
     }
-    serde_json::from_slice(&body).map_err(|e| format!("identity 解析失败：{e}"))
+}
+
+/// S7.4 双边配对：向对端 `/join` 提交本站身份（集群令牌；站点令牌在 body 内）。
+pub async fn post_raft_join(
+    endpoint: &str,
+    cluster_token: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+) -> Result<(u16, Bytes), String> {
+    let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
+    send_with_headers(
+        endpoint,
+        "POST",
+        "/api/v1/site/raft/join",
+        &[(crate::raft::RPC_TOKEN_HEADER, cluster_token)],
+        Some(bytes),
+        timeout,
+    )
+    .await
 }
 
 /// S7.3 成员变更：集群令牌；`forwarded` 只在节点内部转发时置位（单跳，防二次转发）。

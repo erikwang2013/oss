@@ -237,6 +237,10 @@ pub fn routes() -> Router<AppState> {
         .route("/site/head-object", head(site_head_object))
         .route("/site/bucket-empty", get(site_bucket_empty))
         .route("/site/bucket-quiesce", post(site_bucket_quiesce))
+        .route(
+            "/site/raft/join",
+            post(site_raft_join).layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/sites", get(list_sites).post(create_site))
         .route("/sites/{peer_id}", delete(delete_site))
         .route("/sites/{peer_id}/ping", post(ping_site))
@@ -3002,6 +3006,16 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
         "has_vault": state.vault.is_some(),
         "enabled": state.site_enabled,
         "raft_node_id": state.cfg.raft.as_ref().map(|r| r.node_id),
+        "raft_enabled": state.cfg.raft.is_some(),
+        "raft_role": state.cfg.raft.as_ref().map(|r| match r.role {
+            crate::config::RaftRole::Voter => "voter",
+            crate::config::RaftRole::Witness => "witness",
+        }),
+        "raft_bootstrap": state.cfg.raft.as_ref().map(|r| r.bootstrap),
+        "raft_initialized": state.raft.as_ref().map(|h| h.membership_nonempty()),
+        "admin_username": state.admin_username,
+        "vault_probe": state.vault_probe,
+        "version": env!("CARGO_PKG_VERSION"),
         "advertise_endpoint": state.cfg.raft.as_ref().map(|r| r.advertise_endpoint.clone()),
         "capabilities": {
             "raft": crate::raft::RAFT_READY && state.cfg.raft.is_some(),
@@ -3098,6 +3112,487 @@ async fn list_sites(
     }
 }
 
+const VAULT_PROBE_PLAINTEXT: &str = "oss-vault-probe-v1";
+
+fn local_stretch_identity(state: &AppState) -> Option<crate::site_client::StretchIdentity> {
+    let s = state.cfg.stretch.as_ref()?;
+    Some(crate::site_client::StretchIdentity {
+        node_id: s.node_id.clone(),
+        self_addr: s.self_addr.clone(),
+        peer_node_id: s.peer_node_id.clone(),
+        drive_count: state.cfg.data_dirs.as_ref().map_or(1, |d| d.len()) as u16,
+        ec: crate::site_client::EcIdentity {
+            data: state.cfg.ec.data as u16,
+            parity: state.cfg.ec.parity as u16,
+        },
+        placement: s.placement.clone(),
+        mesh_secret_fingerprint: {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(s.mesh_secret.as_bytes()))
+        },
+    })
+}
+
+fn stretch_mismatches(
+    local: &Option<crate::site_client::StretchIdentity>,
+    peer: &Option<crate::site_client::StretchIdentity>,
+) -> Option<Vec<&'static str>> {
+    match (local, peer) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => Some(vec!["stretch_presence"]),
+        (Some(a), Some(b)) => {
+            let mut m = Vec::new();
+            if a.node_id != b.node_id {
+                m.push("node_id");
+            }
+            if a.self_addr != b.self_addr {
+                m.push("self_addr");
+            }
+            if a.peer_node_id != b.peer_node_id {
+                m.push("peer_node_id");
+            }
+            if a.drive_count != b.drive_count {
+                m.push("drive_count");
+            }
+            if a.ec != b.ec {
+                m.push("ec");
+            }
+            if a.placement != b.placement {
+                m.push("placement");
+            }
+            if a.mesh_secret_fingerprint != b.mesh_secret_fingerprint {
+                m.push("mesh_secret_fingerprint");
+            }
+            (!m.is_empty()).then_some(m)
+        }
+    }
+}
+
+async fn vault_probe_matches(state: &AppState, peer_probe: Option<&str>) -> Result<bool, Response> {
+    let Some(vault) = state.vault.as_ref() else {
+        return Ok(peer_probe.is_none());
+    };
+    let Some(probe) = peer_probe else {
+        return Ok(false);
+    };
+    match vault.open(probe).await {
+        Ok(Some(p)) => Ok(p == VAULT_PROBE_PLAINTEXT),
+        Ok(None) => Ok(false),
+        Err(e) => {
+            tracing::warn!(error = %e, "vault probe unseal failed");
+            Ok(false)
+        }
+    }
+}
+
+async fn membership_apply_any(
+    state: &AppState,
+    op: &crate::raft::membership::MembershipOp,
+) -> Result<crate::raft::membership::MemberView, crate::raft::membership::MembershipError> {
+    use crate::raft::membership::{self, MembershipError};
+    let Some(handle) = state.raft.as_ref() else {
+        return Err(MembershipError::NoQuorum);
+    };
+    let view = membership::view(handle);
+    if view.leader == Some(handle.node_id()) {
+        membership::apply_local(handle, op).await
+    } else if let Some(endpoint) = view.leader_endpoint.clone() {
+        let token = state
+            .cfg
+            .raft
+            .as_ref()
+            .map(|r| r.cluster_token.clone())
+            .unwrap_or_default();
+        membership::request(&endpoint, &token, op).await
+    } else {
+        Err(MembershipError::NoQuorum)
+    }
+}
+
+/// Raft 模式配对：预检 → 本地行 → 对端 /join → 成员变更。M7 路径不经过此函数。
+async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: String) -> Response {
+    use crate::raft::membership::MembershipOp;
+    let bad = |m: String| (StatusCode::BAD_REQUEST, m).into_response();
+    let conflict = |m: String| (StatusCode::CONFLICT, m).into_response();
+    let Some(local_raft) = state.cfg.raft.as_ref() else {
+        return conflict("local node has no [raft]".into());
+    };
+    let ident = match crate::site_client::get_identity_typed(&endpoint, &body.peer_site_token).await
+    {
+        Ok(i) => i,
+        Err(crate::site_client::IdentityError::Unauthorized) => {
+            return (StatusCode::FORBIDDEN, "invalid peer site token").into_response();
+        }
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("peer identity: {e:?}")).into_response();
+        }
+    };
+    if ident.id == state.site.id {
+        return bad("对端 identity 与本机相同（endpoint 填错？）".into());
+    }
+    if ident.region != body.region {
+        return bad(format!(
+            "region 不一致：对端 {} / 配置 {}",
+            ident.region, body.region
+        ));
+    }
+    if ident.has_vault != state.vault.is_some() {
+        return bad("主密钥库状态不一致（两端必须同时启用或同时未启用 vault）".into());
+    }
+    if !ident.raft_enabled {
+        return conflict("peer has no [raft]".into());
+    }
+    let peer_bootstrap = ident.raft_bootstrap.unwrap_or(false);
+    if peer_bootstrap == local_raft.bootstrap {
+        return conflict("exactly one side must have [raft].bootstrap=true".into());
+    }
+    let Some(peer_node) = ident.raft_node_id.filter(|n| *n > 0) else {
+        return conflict("raft node id conflict".into());
+    };
+    if peer_node == local_raft.node_id {
+        return conflict("raft node id conflict".into());
+    }
+    match state.db.list_sites().await {
+        Ok(rows) if rows.iter().any(|r| r.raft_node_id == Some(peer_node)) => {
+            return conflict("raft node id conflict".into());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "列出站点失败");
+            return internal_error();
+        }
+    }
+    if ident.admin_username.is_none() || ident.admin_username != state.admin_username {
+        return conflict("admin username mismatch".into());
+    }
+    if state.vault.is_some() {
+        let ok = match vault_probe_matches(&state, ident.vault_probe.as_deref()).await {
+            Ok(ok) => ok,
+            Err(r) => return r,
+        };
+        if !ok {
+            return conflict("vault master key mismatch".into());
+        }
+    }
+    if let Some(m) = stretch_mismatches(&local_stretch_identity(&state), &ident.stretch) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stretch identity mismatch", "mismatches": m})),
+        )
+            .into_response();
+    }
+    let peer_raft_endpoint = match ident.advertise_endpoint.as_deref() {
+        Some(e) => match crate::site_client::validate_endpoint(e) {
+            Ok(e) => e,
+            Err(e) => return bad(format!("peer advertise_endpoint: {e}")),
+        },
+        None => return conflict("peer advertise_endpoint missing".into()),
+    };
+
+    // 现有行：同 remote_site_id 采用 M7 标签；node id 变化 = B′ 替换。
+    let existing = state
+        .db
+        .list_sites()
+        .await
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r.remote_site_id == ident.id));
+    let old_node = existing.as_ref().and_then(|r| r.raft_node_id);
+    let row_id = existing
+        .as_ref()
+        .map(|r| r.peer_id.clone())
+        .unwrap_or_else(|| body.peer_id.clone());
+    let peer = crate::db::SitePeer {
+        peer_id: row_id.clone(),
+        remote_site_id: ident.id.clone(),
+        name: body.name.clone().unwrap_or_else(|| ident.name.clone()),
+        endpoint,
+        region: body.region,
+        priority: body.priority,
+        s3_access_key: body.s3_access_key,
+        s3_secret_key: body.s3_secret_key,
+        peer_site_token: body.peer_site_token,
+        created_at: crate::db::now(),
+        last_seen: Some(crate::db::now()),
+        last_error: None,
+        raft_node_id: Some(peer_node),
+        reconcile_required: false,
+    };
+    if let Err(e) = state.db.upsert_pair_peer(&peer).await {
+        tracing::error!(error = %e, "写站点行失败");
+        return internal_error();
+    }
+
+    // 管理员长时 AK（join body 需要与对方同主密钥封装的 SK）。
+    let creds: Option<(String, String)> = sqlx::query_as(
+        "SELECT a.access_key, a.secret_key FROM access_keys a JOIN users u ON u.id = a.user_id \
+         WHERE u.is_admin = 1 AND a.kind = 'long-term' AND a.parent_ak IS NULL \
+           AND a.status = 'active' ORDER BY a.created_at LIMIT 1",
+    )
+    .fetch_optional(state.db.pool())
+    .await
+    .ok()
+    .flatten();
+    let Some((admin_ak, sealed_sk)) = creds else {
+        return conflict("pairing requires an active long-term admin access key".into());
+    };
+    let admin_sk = match &state.vault {
+        Some(v) => match v.open(&sealed_sk).await {
+            Ok(Some(s)) => s,
+            _ => return conflict("cannot unseal admin access key".into()),
+        },
+        None => sealed_sk,
+    };
+    let local_stretch = local_stretch_identity(&state);
+    let join_body = serde_json::json!({
+        "site_id": state.site.id,
+        "name": state.site.name,
+        "region": state.site.region,
+        "priority": state.site.priority,
+        "endpoint": local_raft.advertise_endpoint,
+        "raft_endpoint": local_raft.advertise_endpoint,
+        "raft_node_id": local_raft.node_id,
+        "raft_bootstrap": local_raft.bootstrap,
+        "site_token": state.site.token,
+        "admin_username": state.admin_username,
+        "has_vault": state.vault.is_some(),
+        "vault_probe": state.vault_probe,
+        "s3_access_key": admin_ak,
+        "s3_secret_key": admin_sk,
+        "stretch": local_stretch,
+    });
+    let (status, resp_body) = match crate::site_client::post_raft_join(
+        &peer_raft_endpoint,
+        &local_raft.cluster_token,
+        &join_body,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("peer join: {e}")).into_response();
+        }
+    };
+    if status == 403 {
+        return conflict("cluster token mismatch".into());
+    }
+    if status != 200 {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "peer join returned {status}: {}",
+                String::from_utf8_lossy(&resp_body)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ),
+        )
+            .into_response();
+    }
+
+    let replaced = old_node.is_some_and(|old| old != peer_node);
+    let op = if replaced {
+        MembershipOp::ReplaceVoter {
+            node_id: peer_node,
+            endpoint: peer_raft_endpoint,
+            old_node_id: old_node.unwrap(),
+        }
+    } else {
+        MembershipOp::AddWitness {
+            node_id: peer_node,
+            endpoint: peer_raft_endpoint,
+        }
+    };
+    if local_raft.bootstrap {
+        if let Err(e) = membership_apply_any(&state, &op).await {
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("membership: {e}")).into_response();
+        }
+        if replaced {
+            let _ = state.db.set_site_reconcile_required(&row_id, true).await;
+        }
+    } else {
+        // 非 bootstrap 侧等待 bootstrap 侧完成成员变更（30 s）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let ok = state.raft.as_ref().is_some_and(|h| {
+                let v = crate::raft::membership::view(h);
+                v.voters.contains(&local_raft.node_id) && v.voters.contains(&peer_node)
+            });
+            if ok {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "membership not established by bootstrap peer; retry",
+                )
+                    .into_response();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    let initialized = state.raft.as_ref().is_some_and(|h| h.membership_nonempty());
+    let _ = crate::raft::identity::record_initialized(&state.db, initialized).await;
+    Json(peer_json(&peer)).into_response()
+}
+
+/// `POST /api/v1/site/raft/join`（集群令牌；配对对端调用）：写本地 sites 行，bootstrap 侧加成员。
+#[derive(serde::Deserialize)]
+struct RaftJoinBody {
+    site_id: String,
+    name: String,
+    region: String,
+    #[serde(default)]
+    priority: i64,
+    endpoint: String,
+    raft_endpoint: String,
+    raft_node_id: u64,
+    raft_bootstrap: bool,
+    site_token: String,
+    admin_username: String,
+    #[serde(default)]
+    has_vault: bool,
+    #[serde(default)]
+    vault_probe: Option<String>,
+    s3_access_key: String,
+    s3_secret_key: String,
+    #[serde(default)]
+    stretch: Option<crate::site_client::StretchIdentity>,
+}
+
+async fn site_raft_join(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string()).into_response();
+    let conflict = |m: &str| (StatusCode::CONFLICT, m.to_string()).into_response();
+    let Some(local_raft) = state.cfg.raft.as_ref() else {
+        return conflict("local node has no [raft]");
+    };
+    let provided = headers
+        .get(crate::raft::RPC_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !ct_eq(provided, &local_raft.cluster_token) {
+        return (StatusCode::FORBIDDEN, "invalid raft token").into_response();
+    }
+    if !state.site_enabled {
+        return site_disabled();
+    }
+    let body: RaftJoinBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return bad(&format!("invalid join body: {e}")),
+    };
+    if !(32..=128).contains(&body.site_token.len())
+        || !body.site_token.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return bad("site_token invalid");
+    }
+    let raft_endpoint = match crate::site_client::validate_endpoint(&body.raft_endpoint) {
+        Ok(e) => e,
+        Err(e) => return bad(&e),
+    };
+    let data_endpoint = match crate::site_client::validate_endpoint(&body.endpoint) {
+        Ok(e) => e,
+        Err(e) => return bad(&e),
+    };
+    // 反向校验：用对方站点令牌拉 identity，确认声明的 id/node/admin 一致。
+    let ident = match crate::site_client::get_identity_typed(&raft_endpoint, &body.site_token).await
+    {
+        Ok(i) => i,
+        Err(crate::site_client::IdentityError::Unauthorized) => {
+            return (StatusCode::FORBIDDEN, "invalid peer site token").into_response();
+        }
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("peer identity: {e:?}")).into_response();
+        }
+    };
+    if ident.id != body.site_id {
+        return conflict("site id mismatch");
+    }
+    if ident.raft_node_id != Some(body.raft_node_id) {
+        return conflict("raft node id conflict");
+    }
+    if ident.admin_username.as_deref() != Some(body.admin_username.as_str())
+        || state.admin_username.as_deref() != Some(body.admin_username.as_str())
+    {
+        return conflict("admin username mismatch");
+    }
+    if body.has_vault != state.vault.is_some() {
+        return bad("vault state mismatch");
+    }
+    if state.vault.is_some() {
+        let ok = match vault_probe_matches(&state, body.vault_probe.as_deref()).await {
+            Ok(ok) => ok,
+            Err(r) => return r,
+        };
+        if !ok {
+            return conflict("vault master key mismatch");
+        }
+    }
+    if body.raft_bootstrap == local_raft.bootstrap {
+        return conflict("exactly one bootstrap");
+    }
+    if body.raft_node_id == 0 || body.raft_node_id == local_raft.node_id {
+        return conflict("raft node id conflict");
+    }
+    if let Some(m) = stretch_mismatches(&local_stretch_identity(&state), &body.stretch) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stretch identity mismatch", "mismatches": m})),
+        )
+            .into_response();
+    }
+    let peer = crate::db::SitePeer {
+        peer_id: body.site_id.clone(),
+        remote_site_id: body.site_id.clone(),
+        name: body.name,
+        endpoint: data_endpoint,
+        region: body.region,
+        priority: body.priority,
+        s3_access_key: body.s3_access_key,
+        s3_secret_key: body.s3_secret_key,
+        peer_site_token: body.site_token,
+        created_at: crate::db::now(),
+        last_seen: Some(crate::db::now()),
+        last_error: None,
+        raft_node_id: Some(body.raft_node_id),
+        reconcile_required: false,
+    };
+    if let Err(e) = state.db.upsert_pair_peer(&peer).await {
+        tracing::error!(error = %e, "join 写站点行失败");
+        return internal_error();
+    }
+    if local_raft.bootstrap {
+        if let Err(e) = membership_apply_any(
+            &state,
+            &crate::raft::membership::MembershipOp::AddWitness {
+                node_id: body.raft_node_id,
+                endpoint: raft_endpoint,
+            },
+        )
+        .await
+        {
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("membership: {e}")).into_response();
+        }
+    }
+    let view = state
+        .raft
+        .as_ref()
+        .map(|h| crate::raft::membership::view(h))
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "site_id": state.site.id,
+        "raft_node_id": local_raft.node_id,
+        "leader": view.leader,
+        "voters": view.voters,
+        "learners": view.learners,
+        "nodes": view.nodes,
+    }))
+    .into_response()
+}
+
 /// `POST /api/v1/sites`（管理员）：建立（至多一个）站点对。同步校验对端可达与 region 一致性。
 async fn create_site(
     State(state): State<AppState>,
@@ -3138,6 +3633,9 @@ async fn create_site(
         Ok(e) => e,
         Err(e) => return bad(e),
     };
+    if state.control.is_raft() {
+        return create_site_raft(state, body, endpoint).await;
+    }
     match state.db.count_sites().await {
         Ok(n) if n >= 1 => return bad("M7 仅支持单站点对（已存在一个 peer）".into()),
         Ok(_) => {}

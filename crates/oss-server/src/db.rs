@@ -1054,6 +1054,62 @@ impl Db {
             .await
     }
 
+    /// S7.4：Raft 配对行写入/更新；按 peer_id 或 remote_site_id 采用既有 M7 行，
+    /// 不写 `site_cursors/changelog`（Raft 下 sites 是站点本地表，S6d 启动断言要求 site_* 为空）。
+    pub async fn upsert_pair_peer(&self, p: &SitePeer) -> Result<()> {
+        let updated = sqlx::query(
+            "UPDATE sites SET remote_site_id = ?, name = ?, endpoint = ?, region = ?, priority = ?, \
+             s3_access_key = ?, s3_secret_key = ?, peer_site_token = ?, raft_node_id = ?, \
+             reconcile_required = ? WHERE peer_id = ? OR remote_site_id = ?",
+        )
+        .bind(&p.remote_site_id)
+        .bind(&p.name)
+        .bind(&p.endpoint)
+        .bind(&p.region)
+        .bind(p.priority)
+        .bind(&p.s3_access_key)
+        .bind(&p.s3_secret_key)
+        .bind(&p.peer_site_token)
+        .bind(p.raft_node_id.map(|v| v as i64))
+        .bind(if p.reconcile_required { 1i64 } else { 0 })
+        .bind(&p.peer_id)
+        .bind(&p.remote_site_id)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO sites (peer_id, remote_site_id, name, endpoint, region, priority, \
+                 s3_access_key, s3_secret_key, peer_site_token, created_at, raft_node_id, \
+                 reconcile_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&p.peer_id)
+            .bind(&p.remote_site_id)
+            .bind(&p.name)
+            .bind(&p.endpoint)
+            .bind(&p.region)
+            .bind(p.priority)
+            .bind(&p.s3_access_key)
+            .bind(&p.s3_secret_key)
+            .bind(&p.peer_site_token)
+            .bind(p.created_at)
+            .bind(p.raft_node_id.map(|v| v as i64))
+            .bind(if p.reconcile_required { 1i64 } else { 0 })
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// S7.4 B′：替换站点后、repair 完成前拒绝向该对端服务 sync。
+    pub async fn set_site_reconcile_required(&self, peer_id: &str, required: bool) -> Result<()> {
+        sqlx::query("UPDATE sites SET reconcile_required = ? WHERE peer_id = ?")
+            .bind(if required { 1i64 } else { 0 })
+            .bind(peer_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn insert_site(&self, p: &SitePeer) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(

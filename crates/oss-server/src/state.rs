@@ -60,6 +60,10 @@ pub struct AppState {
     pub control: Arc<crate::raft::control::ControlPlane>,
     /// M9 S7.1：Raft 句柄（路由/状态共用；无 `[raft]` = None）。
     pub raft: Option<Arc<crate::raft::RaftHandle>>,
+    /// M9 S7.4：本地管理员用户名（配对预检/身份 JSON；无管理员 = None）。
+    pub admin_username: Option<String>,
+    /// M9 S7.4：vault 主键探针（同一主键的两站点可互相 unseal；无 vault = None）。
+    pub vault_probe: Option<String>,
 }
 
 fn mesh_of(store: &Store) -> Option<xl_s3::access::ControlMesh> {
@@ -837,6 +841,11 @@ impl AppState {
             inv_acl,
             cfg.staging_dir.clone(),
         ));
+        let admin_username = db.schema_meta("admin_username").await.ok().flatten();
+        let vault_probe = match &vault {
+            Some(v) => v.seal("oss-vault-probe-v1").await.ok(),
+            None => None,
+        };
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
@@ -872,6 +881,8 @@ impl AppState {
             inventory_runner,
             control,
             raft,
+            admin_username,
+            vault_probe,
         }
     }
 }
