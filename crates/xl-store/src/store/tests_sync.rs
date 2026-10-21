@@ -535,3 +535,30 @@ async fn deleting_barrier_blocks_writes_and_waits_for_active_writers() {
     drop(guard);
     let _third = s.begin_write("alpha").unwrap();
 }
+
+/// M9 S3：sync 删桶用 tombstone rename——空桶删除后不可见、幂等；非空仍拒绝。
+#[tokio::test]
+async fn delete_bucket_sync_tombstones_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "keep", bytes::Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.delete_bucket_sync("alpha").await,
+        Err(Error::BucketNotEmpty(_))
+    ));
+    s.delete_object("alpha", "keep").await.unwrap();
+    s.delete_bucket_sync("alpha").await.unwrap();
+    assert!(!s.bucket_exists("alpha").await.unwrap());
+    // 已删再删幂等。
+    s.delete_bucket_sync("alpha").await.unwrap();
+    // 同名重建可写（tombstone 不挡 ensure）。
+    s.create_bucket("alpha").await.unwrap();
+    s.put_object("alpha", "again", bytes::Bytes::from_static(b"y"), None)
+        .await
+        .unwrap();
+    let (_, bytes) = s.get_object("alpha", "again").await.unwrap();
+    assert_eq!(&bytes[..], b"y");
+}

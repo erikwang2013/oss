@@ -11,13 +11,13 @@ use sqlx::SqliteConnection;
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
-/// 控制表写入令牌。字段对 crate 内 raw writer 可见；外部模块无法构造。
-pub struct ControlWrite<'a> {
+/// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
+pub(crate) struct ControlWrite<'a> {
     pub(crate) conn: &'a mut SqliteConnection,
 }
 
 /// 唯一令牌构造器（apply 事务 / Local façade 事务）。
-pub fn control_tx(conn: &mut SqliteConnection) -> ControlWrite<'_> {
+pub(crate) fn control_tx(conn: &mut SqliteConnection) -> ControlWrite<'_> {
     ControlWrite { conn }
 }
 
@@ -29,14 +29,14 @@ impl ControlWrite<'_> {
 
 /// apply 结果：一个响应 + 提交后副作用描述（facade 执行，apply 内绝不执行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Applied {
-    pub response: ControlResponse,
-    pub effects: Vec<SideEffect>,
+pub(crate) struct Applied {
+    pub(crate) response: ControlResponse,
+    pub(crate) effects: Vec<SideEffect>,
 }
 
 /// 提交后副作用（幂等；桶目录/缓存）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SideEffect {
+pub(crate) enum SideEffect {
     BucketDirCreate(String),
     BucketDirDelete(String),
     /// sync 桶删除：整目录 rename 到盘内 `.oss.sys/trash/`（幂等；启动清空）。
@@ -50,7 +50,7 @@ pub enum SideEffect {
 }
 
 /// 命令 → 副作用（纯函数；leader 的 apply 结果不回传，facade 用同一映射重算）。
-pub fn effects_for(cmd: &ControlCommand) -> Vec<SideEffect> {
+pub(crate) fn effects_for(cmd: &ControlCommand) -> Vec<SideEffect> {
     match cmd {
         ControlCommand::BucketCreate { name, .. } => {
             vec![SideEffect::BucketDirCreate(name.clone())]
@@ -103,6 +103,30 @@ async fn admin_id(cw: &mut ControlWrite<'_>) -> Result<Option<i64>, sqlx::Error>
     sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
         .fetch_optional(&mut *cw.conn)
         .await
+}
+
+/// M1：管理员用户/AK 是站点本地状态，IAM 命令不得复制它们（S6b 处理器留本地）。
+async fn username_is_admin(cw: &mut ControlWrite<'_>, username: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? AND is_admin = 1")
+            .bind(username)
+            .fetch_optional(&mut *cw.conn)
+            .await?;
+    Ok(row.is_some())
+}
+
+async fn access_key_owner_is_admin(
+    cw: &mut ControlWrite<'_>,
+    access_key: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM access_keys a JOIN users u ON u.id = a.user_id \
+         WHERE a.access_key = ? AND u.is_admin = 1",
+    )
+    .bind(access_key)
+    .fetch_optional(&mut *cw.conn)
+    .await?;
+    Ok(row.is_some())
 }
 
 async fn bucket_exists(cw: &mut ControlWrite<'_>, bucket: &str) -> Result<bool, sqlx::Error> {
@@ -189,7 +213,7 @@ fn lifecycle_rows(
 }
 
 /// 应用一条命令。业务拒绝 = `Ok(Applied{response})`；内部错误 = `Err`（事务回滚，fail-stop）。
-pub async fn apply_command(
+pub(crate) async fn apply_command(
     cw: &mut ControlWrite<'_>,
     cmd: &ControlCommand,
 ) -> Result<Applied, sqlx::Error> {
@@ -210,22 +234,28 @@ pub async fn apply_command(
                 ControlResponse::Ok
             }
         }
-        ControlCommand::UserDelete { username } => match uid(cw, username).await? {
-            None => ControlResponse::NotFound,
-            Some(id) => {
-                if Db::delete_user_cascade(cw, id).await? {
-                    ControlResponse::Ok
-                } else {
-                    // 守卫拒绝：目标是最后一个在册管理员（命令路径本不产生管理员）。
-                    ControlResponse::Conflict
+        ControlCommand::UserDelete { username } => {
+            if username_is_admin(cw, username).await? {
+                ControlResponse::Invalid
+            } else {
+                match uid(cw, username).await? {
+                    None => ControlResponse::NotFound,
+                    Some(id) => {
+                        if Db::delete_user_cascade(cw, id).await? {
+                            ControlResponse::Ok
+                        } else {
+                            // 守卫拒绝：目标是最后一个在册管理员（命令路径本不产生管理员）。
+                            ControlResponse::Conflict
+                        }
+                    }
                 }
             }
-        },
+        }
         ControlCommand::UserSetPassword {
             username,
             password_hash,
         } => {
-            if password_hash.is_empty() {
+            if password_hash.is_empty() || username_is_admin(cw, username).await? {
                 ControlResponse::Invalid
             } else {
                 match uid(cw, username).await? {
@@ -241,7 +271,7 @@ pub async fn apply_command(
             }
         }
         ControlCommand::UserSetStatus { username, status } => {
-            if !valid_user_status(status) {
+            if !valid_user_status(status) || username_is_admin(cw, username).await? {
                 ControlResponse::Invalid
             } else {
                 match uid(cw, username).await? {
@@ -259,13 +289,19 @@ pub async fn apply_command(
         ControlCommand::UserSetPermissions {
             username,
             permissions,
-        } => match uid(cw, username).await? {
-            None => ControlResponse::NotFound,
-            Some(id) => {
-                Db::set_permissions_raw(cw, id, &permissions_rows(permissions)).await?;
-                ControlResponse::Ok
+        } => {
+            if username_is_admin(cw, username).await? {
+                ControlResponse::Invalid
+            } else {
+                match uid(cw, username).await? {
+                    None => ControlResponse::NotFound,
+                    Some(id) => {
+                        Db::set_permissions_raw(cw, id, &permissions_rows(permissions)).await?;
+                        ControlResponse::Ok
+                    }
+                }
             }
-        },
+        }
         ControlCommand::AccessKeyCreate {
             access_key,
             secret_key,
@@ -275,7 +311,11 @@ pub async fn apply_command(
             session_policy,
             created_at,
         } => {
-            if access_key.is_empty() || secret_key.is_empty() || kind.is_empty() {
+            if access_key.is_empty()
+                || secret_key.is_empty()
+                || kind.is_empty()
+                || username_is_admin(cw, username).await?
+            {
                 ControlResponse::Invalid
             } else {
                 let exists: Option<i64> =
@@ -306,14 +346,16 @@ pub async fn apply_command(
             }
         }
         ControlCommand::AccessKeyDelete { access_key } => {
-            if Db::delete_access_key_raw(cw, access_key).await? {
+            if access_key_owner_is_admin(cw, access_key).await? {
+                ControlResponse::Invalid
+            } else if Db::delete_access_key_raw(cw, access_key).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::AccessKeySetStatus { access_key, status } => {
-            if !valid_user_status(status) {
+            if !valid_user_status(status) || access_key_owner_is_admin(cw, access_key).await? {
                 ControlResponse::Invalid
             } else if Db::set_access_key_status_raw(cw, access_key, status).await? {
                 ControlResponse::Ok
@@ -674,4 +716,45 @@ async fn bucket_exists_for_ap(
         .fetch_optional(&mut *cw.conn)
         .await?;
     Ok(row.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// witness 无本地管理员：AP/inventory owner 用哨兵 0（S7 快照安装同映射）。
+    #[tokio::test]
+    async fn witness_inventory_owner_sentinel_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("witness.db").display()
+        );
+        let db = Db::connect_witness(&url).await.unwrap();
+        let cmd = ControlCommand::InventoryPut {
+            bucket: "b".into(),
+            id: "i".into(),
+            owner: None,
+            config_json: "{}".into(),
+            updated_at: 1,
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let applied = {
+            let mut cw = control_tx(&mut tx);
+            apply_command(&mut cw, &cmd).await.unwrap()
+        };
+        tx.commit().await.unwrap();
+        assert_eq!(applied.response, ControlResponse::Ok);
+        let owner: i64 = sqlx::query_scalar(
+            "SELECT owner_id FROM inventory_configs WHERE bucket = 'b' AND id = 'i'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(owner, 0);
+    }
 }

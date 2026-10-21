@@ -81,6 +81,12 @@ struct MockState {
     put_delay_ms: u64,
     /// PUT 延迟结束后返回 500（造「在途但最终失败」的写者，不提交对象）。
     fail_put: bool,
+    /// 站点 delete-object 路由延迟（毫秒；> TIMEOUT_MS 触发客户端超时，I2）。
+    delete_delay_ms: u64,
+    /// 站点 bucket-quiesce（非 release）延迟（毫秒；并发删桶测试）。
+    quiesce_delay_ms: u64,
+    /// 站点 bucket-quiesce（非 release）返回 500（远端 quiesce 失败回滚测试）。
+    fail_quiesce: bool,
 }
 
 struct MockRemote {
@@ -141,6 +147,18 @@ impl MockRemote {
 
     fn fail_put(&self) {
         self.state.lock().unwrap().fail_put = true;
+    }
+
+    fn set_delete_delay_ms(&self, ms: u64) {
+        self.state.lock().unwrap().delete_delay_ms = ms;
+    }
+
+    fn set_quiesce_delay_ms(&self, ms: u64) {
+        self.state.lock().unwrap().quiesce_delay_ms = ms;
+    }
+
+    fn fail_quiesce(&self) {
+        self.state.lock().unwrap().fail_quiesce = true;
     }
 
     /// 匹配某站点内部路由的 POST（delete-object / bucket-quiesce / delete-bucket）。
@@ -291,6 +309,10 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                             }
                         } else if path == "/api/v1/site/delete-object" {
                             // M9 S3：token 删除（版本/同 id marker/整键）。
+                            let delay = state.lock().unwrap().delete_delay_ms;
+                            if delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                            }
                             let fail_key = state.lock().unwrap().fail_delete_key.clone();
                             let v: serde_json::Value =
                                 serde_json::from_slice(&body).unwrap_or_default();
@@ -317,9 +339,24 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                             } else {
                                 *resp.status_mut() = StatusCode::NO_CONTENT;
                             }
-                        } else if path == "/api/v1/site/bucket-quiesce"
-                            || path == "/api/v1/site/delete-bucket"
-                        {
+                        } else if path == "/api/v1/site/bucket-quiesce" {
+                            let v: serde_json::Value =
+                                serde_json::from_slice(&body).unwrap_or_default();
+                            let release =
+                                v.get("release").and_then(|b| b.as_bool()).unwrap_or(false);
+                            let (delay, fail) = {
+                                let st = state.lock().unwrap();
+                                (st.quiesce_delay_ms, st.fail_quiesce)
+                            };
+                            if !release && delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                            }
+                            if m == Mode::Fail || (!release && fail) {
+                                *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            } else {
+                                *resp.status_mut() = StatusCode::NO_CONTENT;
+                            }
+                        } else if path == "/api/v1/site/delete-bucket" {
                             if m == Mode::Fail {
                                 *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                             } else {
@@ -1431,6 +1468,41 @@ async fn site_delete_route_is_local_only_and_token_authed() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
+
+    // m3：内部路由只接受 sync 桶——async 桶 409 且数据/物理桶不动。
+    assert_eq!(put(&e, "/asy/m3.txt", b"keep").await.status(), 200);
+    for (path, body) in [
+        (
+            "/api/v1/site/delete-object",
+            serde_json::json!({"bucket": "asy", "key": "m3.txt", "all_versions": true}),
+        ),
+        (
+            "/api/v1/site/bucket-quiesce",
+            serde_json::json!({"bucket": "asy"}),
+        ),
+        (
+            "/api/v1/site/delete-bucket",
+            serde_json::json!({"bucket": "asy"}),
+        ),
+    ] {
+        let r = e
+            .http
+            .post(format!("{}{path}", e.base))
+            .header("x-oss-site-token", LOCAL_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409, "{path} 必须拒绝 async 桶");
+    }
+    assert_eq!(
+        signed(&e, Method::GET, "/asy/m3.txt", &[], &[])
+            .await
+            .status(),
+        200,
+        "async 桶对象不得被站点路由删除"
+    );
+    assert!(e.st.store.bucket_exists("asy").await.unwrap());
     assert_eq!(e.remote.calls(), 0, "补偿路由不得转发远端（无回环）");
 }
 
@@ -2055,13 +2127,22 @@ async fn recovery_delete_intents_head_tristate() {
     );
     assert_eq!(delete_intent_rows(&e.st).await, 0);
     assert!(e.st.sync_delete.recovered_total() >= 5);
+
+    // m7：缺必填版本 id 的行 warn + 清理，不得永久残留。
+    insert_delete_intent(&e.st, "delete_version", "bad1.txt", "", "", "").await;
+    insert_delete_intent(&e.st, "create_marker", "bad2.txt", "", "", "").await;
+    recover_delete_intents(&e.st).await;
+    assert_eq!(delete_intent_rows(&e.st).await, 0);
 }
 
 /// M9 S3：delete_bucket intent 周期恢复——远端 quiesce/查空/删除后本地删除，
 /// intent 清理、deleting 回滚（远端桶已删时 quiesce 204 幂等，见站点路由用例）。
+/// C1 后仅“仍 deleting 的 sync 桶”会重跑 flow：模拟 crash 于 flow 中（DB flag 已置）。
 #[tokio::test]
 async fn recovery_delete_bucket_intent_converges() {
     let e = env(Mode::Ok, 1 << 20).await;
+    set_bucket(&e.st, "syn", "deleting", "1").await;
+    e.st.store.mark_deleting("syn");
     insert_delete_intent(&e.st, "delete_bucket", "", "", "", "").await;
     recover_delete_intents(&e.st).await;
     assert!(
@@ -2071,6 +2152,276 @@ async fn recovery_delete_bucket_intent_converges() {
     assert_eq!(delete_intent_rows(&e.st).await, 0);
     assert_eq!(e.remote.quiesces().len(), 1, "远端必须先 quiesce");
     assert!(e.st.sync_delete.recovered_total() >= 1);
+}
+
+/// C1：成功删桶后残留的旧 delete_bucket intent 不得删除同名重建的新桶。
+#[tokio::test]
+async fn recovery_stale_delete_bucket_intent_spares_recreated_bucket() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    assert_eq!(
+        signed(&e, Method::DELETE, "/syn", &[], &[]).await.status(),
+        204
+    );
+    // 模拟 intent_clean 未落盘（崩溃/SQLite busy）：旧行 updated_at=0 必被扫描。
+    insert_delete_intent(&e.st, "delete_bucket", "", "", "", "").await;
+    let uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        .fetch_one(e.st.db.pool())
+        .await
+        .unwrap();
+    make_bucket(&e.st, "syn", uid, "sync").await;
+    // 删桶已清授权行：同名重建需重新授权（否则 S3 面 403）。
+    e.st.db
+        .set_permissions(
+            uid,
+            &[PermissionRow {
+                bucket: "syn".into(),
+                read: true,
+                write: true,
+                delete: true,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(put(&e, "/syn/reborn.txt", b"new").await.status(), 200);
+
+    let quiesces = e.remote.quiesces().len();
+    let bucket_deletes = e.remote.site_posts("/api/v1/site/delete-bucket").len();
+    recover_delete_intents(&e.st).await;
+
+    assert_eq!(delete_intent_rows(&e.st).await, 0, "陈旧 intent 只清行");
+    assert!(
+        e.st.store.bucket_exists("syn").await.unwrap(),
+        "同名新桶必须存活（数据目录不得被删）"
+    );
+    assert_eq!(e.remote.quiesces().len(), quiesces, "恢复不得再 quiesce");
+    assert_eq!(
+        e.remote.site_posts("/api/v1/site/delete-bucket").len(),
+        bucket_deletes,
+        "恢复不得再删远端桶"
+    );
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/reborn.txt", &[], &[])
+            .await
+            .status(),
+        200,
+        "新桶数据必须仍在"
+    );
+    assert_eq!(put(&e, "/syn/after.txt", b"ok").await.status(), 200);
+}
+
+/// I1：deleting=1 后所有删除入口在任何远端调用前拒绝；
+/// 第二个 DeleteBucket 409。本地对象/版本原样。
+#[tokio::test]
+async fn deleting_bucket_rejects_deletes_before_remote() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let r = put(&e, "/syn/i1.txt", b"keep").await;
+    let vid = hdr(&r, "x-amz-version-id");
+    set_bucket(&e.st, "syn", "deleting", "1").await;
+    e.st.store.mark_deleting("syn");
+    let calls = e.remote.calls();
+
+    let d = signed(
+        &e,
+        Method::DELETE,
+        &format!("/syn/i1.txt?versionId={vid}"),
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(d.status(), 503, "deleting 中版本删必须 503");
+    let d = signed(&e, Method::DELETE, "/syn/i1.txt", &[], &[]).await;
+    assert_eq!(d.status(), 503, "deleting 中 marker 删必须 503");
+    let xml = b"<Delete><Object><Key>i1.txt</Key></Object></Delete>";
+    let r = signed(
+        &e,
+        Method::POST,
+        "/syn?delete",
+        &[("content-type", "application/xml")],
+        xml,
+    )
+    .await;
+    assert_eq!(r.status(), 503, "deleting 中 DeleteObjects 必须 503");
+    let r = signed(&e, Method::DELETE, "/syn", &[], &[]).await;
+    assert_eq!(r.status(), 409, "已删除中的桶再删必须 409");
+
+    assert_eq!(e.remote.calls(), calls, "deleting 置位后不得触远端");
+    assert_eq!(
+        signed(
+            &e,
+            Method::GET,
+            &format!("/syn/i1.txt?versionId={vid}"),
+            &[],
+            &[]
+        )
+        .await
+        .status(),
+        200,
+        "被拒的删除不得影响本地版本"
+    );
+    assert_eq!(delete_intent_rows(&e.st).await, 0);
+}
+
+/// I2/N2：远端删超时 → HEAD 探测一次；404 = 已删继续本地，200 = 重试一次，
+/// 重试仍超时 → 503 + ambiguous_total + intent 保留。
+#[tokio::test]
+async fn remote_delete_timeout_probes_head_before_ambiguous() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let r = put(&e, "/syn/i2a.txt", b"a").await;
+    let vid = hdr(&r, "x-amz-version-id");
+    e.remote.set_delete_delay_ms(SLOW_MS);
+    // 默认 HEAD 404：远端已删（响应丢失）→ 本地提交成功，不记 ambiguous。
+    let d = signed(
+        &e,
+        Method::DELETE,
+        &format!("/syn/i2a.txt?versionId={vid}"),
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(d.status(), 204, "HEAD 404 = 已删，必须继续本地提交");
+    assert_eq!(
+        signed(
+            &e,
+            Method::GET,
+            &format!("/syn/i2a.txt?versionId={vid}"),
+            &[],
+            &[]
+        )
+        .await
+        .status(),
+        404
+    );
+    assert_eq!(delete_intent_rows(&e.st).await, 0);
+    assert_eq!(e.st.sync_delete.ambiguous_total(), 0);
+
+    // HEAD 200：版本仍在 → 重试一次；重试仍超时 → ambiguous + 503，本地不改。
+    let r = put(&e, "/syn/i2b.txt", b"b").await;
+    let vid2 = hdr(&r, "x-amz-version-id");
+    e.remote.set_head(&vid2, 200);
+    let before = e.remote.site_deletes().len();
+    let d = signed(
+        &e,
+        Method::DELETE,
+        &format!("/syn/i2b.txt?versionId={vid2}"),
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(d.status(), 503);
+    let dels = e.remote.site_deletes();
+    let attempts = dels[before..]
+        .iter()
+        .filter(|s| body_json(s).get("version_id").and_then(|v| v.as_str()) == Some(vid2.as_str()))
+        .count();
+    assert_eq!(attempts, 2, "HEAD 200 → 必须重试删除一次");
+    assert_eq!(e.st.sync_delete.ambiguous_total(), 1);
+    assert_eq!(
+        delete_intent_rows(&e.st).await,
+        1,
+        "ambiguous 必须保留 intent"
+    );
+    assert_eq!(
+        signed(
+            &e,
+            Method::GET,
+            &format!("/syn/i2b.txt?versionId={vid2}"),
+            &[],
+            &[]
+        )
+        .await
+        .status(),
+        200,
+        "未确认远端删除时本地版本必须仍在"
+    );
+}
+
+/// I4：本地桶已删 + 残留 delete_bucket intent（deleting=1）→ 恢复收敛并清行，不空转。
+#[tokio::test]
+async fn recovery_local_deleted_bucket_intent_converges() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    e.st.store.delete_bucket("syn").await.unwrap();
+    set_bucket(&e.st, "syn", "deleting", "1").await;
+    e.st.store.mark_deleting("syn");
+    insert_delete_intent(&e.st, "delete_bucket", "", "", "", "").await;
+    recover_delete_intents(&e.st).await;
+    assert_eq!(delete_intent_rows(&e.st).await, 0, "本地已删必须收敛清行");
+    let (_, deleting, _) = e.st.db.bucket_sync_state("syn").await.unwrap();
+    assert!(!deleting, "成功后 deleting 必须清零");
+    assert!(!e.st.store.bucket_exists("syn").await.unwrap());
+}
+
+/// m5：两个 DeleteBucket 并发——第二个在 flow 在途时 409，且远端只 quiesce 一次。
+#[tokio::test]
+async fn concurrent_delete_bucket_second_is_409() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    e.remote.set_quiesce_delay_ms(800);
+    let first = async { signed(&e, Method::DELETE, "/syn", &[], &[]).await };
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        signed(&e, Method::DELETE, "/syn", &[], &[]).await
+    };
+    let (a, b) = tokio::join!(first, second);
+    assert_eq!(a.status(), 204);
+    assert_eq!(b.status(), 409, "在途删除中的桶必须 409");
+    assert_eq!(e.remote.quiesces().len(), 1, "并发删桶不得二次 quiesce");
+    assert_eq!(e.remote.site_posts("/api/v1/site/delete-bucket").len(), 1);
+    assert!(!e.st.store.bucket_exists("syn").await.unwrap());
+}
+
+/// m5：远端 quiesce 失败 → 503、释放对端、deleting 回滚、桶恢复可写。
+#[tokio::test]
+async fn delete_bucket_rolls_back_when_remote_quiesce_fails() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    e.remote.fail_quiesce();
+    let r = signed(&e, Method::DELETE, "/syn", &[], &[]).await;
+    assert_eq!(r.status(), 503);
+    assert_eq!(e.remote.quiesce_releases().len(), 1, "失败必须释放对端");
+    assert!(e.remote.site_posts("/api/v1/site/delete-bucket").is_empty());
+    let (_, deleting, _) = e.st.db.bucket_sync_state("syn").await.unwrap();
+    assert!(!deleting, "失败必须回滚 deleting");
+    assert!(e.st.store.bucket_exists("syn").await.unwrap());
+    assert_eq!(put(&e, "/syn/after.txt", b"ok").await.status(), 200);
+}
+
+/// m5：console 对象删（整键）同样走共享 sink：远端 all_versions 先删，本地后删。
+#[tokio::test]
+async fn console_object_delete_on_sync_bucket_is_remote_first() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    assert_eq!(put(&e, "/syn/c1.txt", b"x").await.status(), 200);
+    let login: serde_json::Value = e
+        .http
+        .post(format!("{}/api/v1/login", e.base))
+        .json(&serde_json::json!({"username": "alice", "password": "pw"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().unwrap();
+    let r = e
+        .http
+        .delete(format!("{}/api/v1/buckets/syn/objects/c1.txt", e.base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let dels = e.remote.site_deletes();
+    assert_eq!(dels.len(), 1, "console 删必须远端优先");
+    assert_eq!(
+        body_json(&dels[0])
+            .get("all_versions")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        signed(&e, Method::GET, "/syn/c1.txt", &[], &[])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(outbox(&e.st, "syn", "c1.txt").await, 0);
 }
 
 /// M9 S3：从接收端（B 持有 REPLICA 副本）发起删除同样 remote-first，

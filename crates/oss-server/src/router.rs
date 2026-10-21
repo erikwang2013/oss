@@ -43,9 +43,14 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     .with_tier_gc(Some(Arc::clone(&state.tier_gc)))
     .with_inventory(Some(Arc::clone(&state.inventory)))
     // M9 S4：stretch 禁止 sync 桶（对象内容不得依赖单站点异步副本）；
-    // M9 S3：S3 面的 sync 建桶同样要求 [raft]（与 console 同口径）。
+    // M9 S3（I3）：S3 面的 sync 建桶要求 SYNC_READY + RAFT_READY + [raft]（与 console 同口径）。
+    // “恰好 1 个数据 peer”是运行期 DB 条件（sites 行会变），在建桶入口按请求校验：
+    // service.rs 的 site_peer_count / console 的 list_sites。
     .with_sync_ready(
-        crate::raft::SYNC_READY && state.cfg.stretch.is_none() && state.cfg.raft.is_some(),
+        crate::raft::SYNC_READY
+            && crate::raft::RAFT_READY
+            && state.cfg.stretch.is_none()
+            && state.cfg.raft.is_some(),
     )
     // M9：sync 摄入 token 校验（无 [site] = None → 一律 403）
     .with_site_token(state.site_enabled.then(|| state.site.token.clone()))
@@ -224,6 +229,14 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
     out.push_str(&format!(
         "oss_sync_delete_recovered_total {}\n",
         state.sync_delete.recovered_total()
+    ));
+    out.push_str(
+        "# HELP oss_sync_ambiguous_total 远端删除超时且 HEAD 探测无法定位（执行与否不可判定）次数\n\
+         # TYPE oss_sync_ambiguous_total counter\n",
+    );
+    out.push_str(&format!(
+        "oss_sync_ambiguous_total {}\n",
+        state.sync_delete.ambiguous_total()
     ));
     (
         [(

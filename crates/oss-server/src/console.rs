@@ -1816,18 +1816,27 @@ async fn create_bucket(
     match replication_mode {
         "async" => {}
         "sync" => {
+            // 无 [raft]：形态错误（400），先于“未就绪”判定。
+            if state.cfg.raft.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "sync replication mode requires [raft]",
+                )
+                    .into_response();
+            }
+            // M9 S3（I3）：sync 建桶硬前置 = 控制面已就绪（外层 [raft] 检查之外的显式兜底）。
+            if !crate::raft::RAFT_READY {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "raft control plane is not ready",
+                )
+                    .into_response();
+            }
             // M9 S4：stretch 禁止 sync 桶（与 S3 面 router 的 sync_ready 同口径）。
             if !crate::raft::SYNC_READY || state.cfg.stretch.is_some() {
                 return (
                     StatusCode::BAD_REQUEST,
                     "sync replication mode is not available",
-                )
-                    .into_response();
-            }
-            if state.cfg.raft.is_none() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "sync replication mode requires [raft]",
                 )
                     .into_response();
             }
@@ -3270,6 +3279,19 @@ fn site_token_ok(state: &AppState, headers: &HeaderMap) -> bool {
         .is_some_and(|tok| ct_eq(tok, &state.site.token))
 }
 
+/// m3：内部站点路由只服务 sync 桶；否则持有 site token 的对端可强制 local-only
+/// 删除 async 桶数据。行不存在（桶已在接收端消失）同样拒绝。
+async fn site_require_sync(state: &AppState, bucket: &str) -> Option<Response> {
+    match state.db.bucket_sync_state_row(bucket).await {
+        Ok(Some((mode, _, _))) if mode == "sync" => None,
+        Ok(_) => Some((StatusCode::CONFLICT, "not a sync bucket").into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, bucket, "读桶复制模式失败");
+            Some(internal_error())
+        }
+    }
+}
+
 /// `POST /api/v1/site/delete-object`（token 面；JWT except）：sync 补偿的本地定点删除。
 /// 只删本站版本，永不转发——普通 S3 DELETE 是 remote-first 路径，走它会 A→B→A 回环。
 async fn site_delete_object(
@@ -3282,6 +3304,9 @@ async fn site_delete_object(
     }
     if !site_token_ok(&state, &headers) {
         return (StatusCode::FORBIDDEN, "invalid site token").into_response();
+    }
+    if let Some(r) = site_require_sync(&state, &body.bucket).await {
+        return r;
     }
     // 接收端 local-only：只做本地删除/marker，永不转发（B4）。
     if body.all_versions {
@@ -3405,6 +3430,9 @@ async fn site_bucket_quiesce(
         Ok(true) => {}
         Err(e) => return site_store_error(e),
     }
+    if let Some(r) = site_require_sync(&state, &body.bucket).await {
+        return r;
+    }
     state.store.mark_deleting(&body.bucket);
     if state
         .store
@@ -3430,7 +3458,11 @@ async fn site_delete_bucket(
     if !site_token_ok(&state, &headers) {
         return (StatusCode::FORBIDDEN, "invalid site token").into_response();
     }
-    match state.store.delete_bucket(&body.bucket).await {
+    if let Some(r) = site_require_sync(&state, &body.bucket).await {
+        return r;
+    }
+    // m1：原子 tombstone rename + 重试清理，避免逐盘 remove 中途失败留半删目录。
+    match state.store.delete_bucket_sync(&body.bucket).await {
         Ok(()) => {
             state.store.unmark_deleting(&body.bucket);
             StatusCode::NO_CONTENT.into_response()

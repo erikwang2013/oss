@@ -1221,21 +1221,31 @@ impl Db {
     /// M9：sync 写门所需桶状态 `(replication_mode, deleting, versioning)`；
     /// 行不存在 = ("async", false, "Off")（与缺行旧桶同口径）。
     pub async fn bucket_sync_state(&self, name: &str) -> Result<(String, bool, String)> {
+        Ok(self
+            .bucket_sync_state_row(name)
+            .await?
+            .unwrap_or_else(|| ("async".into(), false, "Off".into())))
+    }
+
+    /// M9 S3：同 [`Self::bucket_sync_state`]，但**行不存在返回 `None`**——删桶恢复据此
+    /// 区分「陈旧 intent」与「同名桶仍存在」，避免误删重建的新桶。
+    pub async fn bucket_sync_state_row(
+        &self,
+        name: &str,
+    ) -> Result<Option<(String, bool, String)>> {
         let row = sqlx::query(
             "SELECT replication_mode, deleting, versioning FROM buckets WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row
-            .map(|r| {
-                (
-                    r.get::<String, _>("replication_mode"),
-                    r.get::<i64, _>("deleting") != 0,
-                    r.get::<String, _>("versioning"),
-                )
-            })
-            .unwrap_or_else(|| ("async".into(), false, "Off".into())))
+        Ok(row.map(|r| {
+            (
+                r.get::<String, _>("replication_mode"),
+                r.get::<i64, _>("deleting") != 0,
+                r.get::<String, _>("versioning"),
+            )
+        }))
     }
 
     /// M9 S3：删桶 quiesce 标志（S6 起改由 Raft `SetBucketDeleting` 命令承载）。
@@ -4680,5 +4690,37 @@ mod argon2_tests {
             argon2::password_hash::PasswordHash::new(DUMMY_ARGON2).is_ok(),
             "DUMMY_ARGON2 PHC 解析失败会让未命中路径的时延拉平失效"
         );
+    }
+
+    /// H1：Raft 模式禁止登录时重写旧哈希（随机盐会让各站点分叉）。
+    #[tokio::test]
+    async fn raft_mode_verify_user_keeps_legacy_hash() {
+        let db = db().await;
+        db.prepare_raft_mode(true).await.unwrap();
+        assert!(db.raft_mode());
+        let legacy = legacy_hash("old-pw-123");
+        db.set_raft_apply_ctx(true).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, created_at) \
+             VALUES ('legacy', ?, 0, 1)",
+        )
+        .bind(&legacy)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.set_raft_apply_ctx(false).await.unwrap();
+
+        assert!(
+            db.verify_user("legacy", "old-pw-123")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'legacy'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, legacy, "Raft 模式不得本地重写旧口令哈希");
     }
 }

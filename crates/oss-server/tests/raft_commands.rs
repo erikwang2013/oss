@@ -5,7 +5,6 @@
 mod common;
 
 use base64::Engine as _;
-use oss_server::raft::apply;
 use oss_server::raft::control::ControlError;
 use oss_server::raft::{
     COMMAND_MAX_BYTES, ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits,
@@ -362,37 +361,102 @@ async fn owner_mapping_and_permission_bits() {
         .await,
         0
     );
+}
 
-    // witness 哨兵：无管理员 → AP/inventory owner_id = 0。
-    let path = dir.path().join("witness.db");
-    let db = oss_server::db::Db::connect_witness(&format!("sqlite://{}?mode=rwc", path.display()))
+/// M1：管理员用户/管理员属主 AK 是站点本地状态，IAM 命令一律 Invalid（S6b 留本地）。
+#[tokio::test]
+async fn admin_target_iam_commands_are_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = common::state(dir.path()).await;
+    let admin_id = st.db.create_user("admin", "pw", true).await.unwrap();
+    st.db
+        .create_access_key("ADMINAK", "sk", admin_id)
         .await
         .unwrap();
-    let cmd = ControlCommand::InventoryPut {
-        bucket: "b".into(),
-        id: "i".into(),
-        owner: None,
-        config_json: "{}".into(),
-        updated_at: 1,
-    };
-    let mut tx = db.pool().begin().await.unwrap();
-    sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    let applied = {
-        let mut cw = apply::control_tx(&mut tx);
-        apply::apply_command(&mut cw, &cmd).await.unwrap()
-    };
-    tx.commit().await.unwrap();
-    assert_eq!(applied.response, ControlResponse::Ok);
-    let witness_owner: i64 = sqlx::query_scalar(
-        "SELECT owner_id FROM inventory_configs WHERE bucket = 'b' AND id = 'i'",
+    let admin_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'admin'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
+         VALUES (?, 'kept', 1, 0, 0)",
     )
-    .fetch_one(db.pool())
+    .bind(admin_id)
+    .execute(st.db.pool())
     .await
     .unwrap();
-    assert_eq!(witness_owner, 0);
+
+    for cmd in [
+        ControlCommand::UserDelete {
+            username: "admin".into(),
+        },
+        ControlCommand::UserSetPassword {
+            username: "admin".into(),
+            password_hash: "new".into(),
+        },
+        ControlCommand::UserSetStatus {
+            username: "admin".into(),
+            status: "disabled".into(),
+        },
+        ControlCommand::UserSetPermissions {
+            username: "admin".into(),
+            permissions: vec![],
+        },
+        ControlCommand::AccessKeyCreate {
+            access_key: "NEWAK".into(),
+            secret_key: "sk".into(),
+            username: "admin".into(),
+            kind: "access_key".into(),
+            parent_ak: None,
+            session_policy: None,
+            created_at: 1,
+        },
+        ControlCommand::AccessKeyDelete {
+            access_key: "ADMINAK".into(),
+        },
+        ControlCommand::AccessKeySetStatus {
+            access_key: "ADMINAK".into(),
+            status: "disabled".into(),
+        },
+    ] {
+        assert_eq!(write(&st, cmd).await, ControlResponse::Invalid);
+    }
+
+    let (status, n): (String, i64) =
+        sqlx::query_as("SELECT status, COUNT(*) FROM users WHERE username = 'admin'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), n), ("active", 1));
+    let stored_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'admin'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_hash, admin_hash,
+        "拒绝后管理员口令哈希必须逐字节不变"
+    );
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM permissions WHERE user_id = ? AND bucket = 'kept' AND can_read = 1",
+    )
+    .bind(admin_id)
+    .fetch_one(st.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "UserSetPermissions 拒绝不得清空管理员权限行");
+    let (ak_status, n): (String, i64) =
+        sqlx::query_as("SELECT status, COUNT(*) FROM access_keys WHERE access_key = 'ADMINAK'")
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!((ak_status.as_str(), n), ("active", 1));
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_keys WHERE access_key = 'NEWAK'")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
 }
 
 #[tokio::test]
