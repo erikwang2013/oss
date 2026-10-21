@@ -878,7 +878,7 @@ async fn cutover_cmd(
     }
     // 先 dry-run 全部目标，再写；避免第二个目标失败时第一个已切模式。
     for (_, db, facts) in &targets {
-        let report = crate::raft::cutover::cutover(
+        let report = match crate::raft::cutover::cutover(
             db,
             facts,
             &export,
@@ -887,7 +887,18 @@ async fn cutover_cmd(
                 overwrite,
             },
         )
-        .await?;
+        .await
+        {
+            Ok(report) => report,
+            Err(crate::raft::cutover::CutoverError::Conflict(diffs)) => {
+                // 非 --overwrite 的冲突在返回 Error 前也打印字段级明细，便于审计定位。
+                for d in &diffs {
+                    eprintln!("conflict {} {} {}", d.table, d.key, d.field);
+                }
+                return Err(crate::raft::cutover::CutoverError::Conflict(diffs).into());
+            }
+            Err(e) => return Err(e.into()),
+        };
         if !report.conflicts.is_empty() {
             for d in &report.conflicts {
                 eprintln!("conflict {} {} {}", d.table, d.key, d.field);
