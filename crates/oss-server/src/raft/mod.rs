@@ -2,8 +2,8 @@
 //!
 //! S5 接入 openraft 0.9.25 单节点运行时；S6 增加 [`command`]（唯一写意图）、[`apply`]
 //! （自然键映射 + 守卫事务）、[`control`]（Local/Raft 门面）并接线控制写路由。
-//! 3-voter 成员/配对/快照/cutover 属 S7；[`RAFT_READY`]/[`SYNC_READY`] 已翻，
-//! [`STRETCH_READY`] 保持 false。
+//! 3-voter/配对/快照/cutover 已在 S7 接线；[`RAFT_READY`]/[`SYNC_READY`]/
+//! [`STRETCH_READY`] 均已翻（stretch 由 e2e 2×6 验证；能力位仍要求对应配置存在）。
 
 // openraft 的 ConfigError/StorageError/RPCError 体积由第三方类型固定，调用方无法瘦身。
 #![allow(clippy::result_large_err)]
@@ -41,7 +41,7 @@ pub const RAFT_READY: bool = true;
 /// sync 桶创建/读写是否可用。S3 数据面全绿且控制面接线后翻转（S6d）。
 pub const SYNC_READY: bool = true;
 /// stretch 2×6 数据面（S4）已实现；控制面（Raft 桶创建/身份配对）就绪后随 S7/S9 翻转。
-pub const STRETCH_READY: bool = false;
+pub const STRETCH_READY: bool = true;
 
 /// Raft RPC 集群令牌头（`/api/v1/site/raft/*`；常量时间校验见 [`network::token_matches`]）。
 pub const RPC_TOKEN_HEADER: &str = "x-oss-raft-token";

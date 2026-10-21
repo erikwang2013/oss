@@ -420,10 +420,8 @@ async fn m9_raft_status_reports_real_state_and_ready_flags() {
     assert!(status["term"].as_u64().unwrap() >= 1);
     assert_eq!(status["capabilities"]["raft"], oss_server::raft::RAFT_READY);
     assert_eq!(status["capabilities"]["sync"], oss_server::raft::SYNC_READY);
-    assert_eq!(
-        status["capabilities"]["stretch"],
-        oss_server::raft::STRETCH_READY
-    );
+    // 能力位还要求实际配置 [stretch]：本测试只有 [raft]，故 stretch=false。
+    assert_eq!(status["capabilities"]["stretch"], false);
 
     let token = login(&base).await;
     let resp = reqwest::Client::new()

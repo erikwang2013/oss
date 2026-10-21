@@ -77,14 +77,15 @@ gate → 403 `InvalidObjectState`、远端 S3 tier 后端、生命周期 Transit
 到期回收、`TierGcSink` 删除契约）· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
 CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单。
-已实现（M9 S0–S6，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
+已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
-（内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · 单节点 Raft
-控制面（控制写单命令 + apply 后缓存失效、`/site/changelog` 409、启动模式断言、真实
-`/api/v1/raft/status`；`RAFT_READY`/`SYNC_READY` 已翻）。**未接线**：3-voter 成员/双边配对/
-快照/cutover 与 witness 运行时（S7）、`sync-reconcile`/`raft-*` 管理命令（S7/S9）、console
-集群卡片（S9）；`STRETCH_READY=false`；`tests/e2e_m9.sh` 的 A/B/C 段落需 S7/S9 后才能作为
-验收门。
+（内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
+（控制写单命令 + apply 后缓存失效、`/site/changelog` 409、启动模式断言、真实
+`/api/v1/raft/status`）· 3-voter 成员变更/leader 单跳转发 · 双边配对与 B′ 替换 · witness
+独立运行时 · 11 表逻辑快照/安装 · M7→Raft cutover · `raft-export/raft-force-recover` ·
+`sync-reconcile [--repair]` · console Raft 集群卡片。`RAFT_READY`/`SYNC_READY`/
+`STRETCH_READY` 均为 true。**S8/S9 剩余**：故障注入验收脚本扩展、全量七闸/四个 e2e 的最终
+证据归档（`tests/e2e_m9.sh` 与 `tests/e2e_stretch.sh` 已在本机通过；见下表）。
 
 ## 架构
 
@@ -114,7 +115,7 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：控制面并发写三端一致、sync remote-first + 断连 503、stretch 2×6 单站故障/恢复）；3-voter 段落依赖 S7 成员 API，S9 前不作为验收门 |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写三端一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 71 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
@@ -968,28 +969,26 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 9. RestoreObject 的 202 由 router 层中间件补写（s3s 0.17 生成代码丢弃
    `S3Response.status`）；识别口径为 POST + `restore` 查询子资源。
 
-## M9 强一致（S0–S6 已落地；S7 3-voter 未交付）
+## M9 强一致（S0–S7 已落地）
 
 **能力状态（2026-10-21，本分支）**：`crates/oss-server/src/raft/mod.rs` 的
-`RAFT_READY=true`、`SYNC_READY=true`、`STRETCH_READY=false` 决定运行时门控。
-`GET /api/v1/raft/status` 报真实单节点状态（`enabled/node_id/role/leader/term/applied/
-snapshot/purged/voters/production_ready`；`voters<3` 时 `production_ready=false`）；
-`/api/v1/site/raft/status` 与 `/api/v1/site/raft/*`（成员/join/快照 RPC）属 S7，尚未注册。
+`RAFT_READY=true`、`SYNC_READY=true`、`STRETCH_READY=true` 决定运行时门控（能力位还要求
+对应配置存在）。`GET /api/v1/raft/status` 报真实状态（`enabled/node_id/role/leader/term/
+applied/snapshot/purged/voters/learners/production_ready`；`voters<3` 时
+`production_ready=false`）；`/api/v1/site/raft/*` 提供 append/vote/snapshot/status/
+membership/write/join。
 
-- **已落地（代码 + 单测/集成测试；S4 另有真进程 e2e）**：S0 模式矩阵/配置校验/能力开关；
-  S1–S3 sync 数据面（统一 origin version id、写门与写 intent、MPU/Copy 边界、
-  remote-first 删除、内部 token 路由、删桶 quiesce、删除 intent 恢复）；S4 stretch 2×6
-  数据面；S5 `raft` 基座（openraft 0.9.25 的 SQLite 日志/状态机/快照/HTTP 网络）；
-  S6 单节点控制面（11 张控制表经 `ControlPlane` 单命令提交、确定性 payload、apply 后
-  缓存失效；`/api/v1/site/changelog` 在 Raft 下 409、site worker 不启动；启动
-  `assert_mode_guards` 模式断言；M7/Local 路径字节不变）。
-- **未交付（S7/S9）**：3-voter 成员与 witness 独立运行时、双边配对、快照/cutover、
-  `raft-add-witness`/`raft-export`/`raft-force-recover`、`sync-reconcile [--repair]`、
-  console M9 集群卡片。当前二进制的子命令只有
-  `serve/groups/build/clean/fsck/heal/scrub/rebalance`，上述命令均不存在。
-- `tests/e2e_m9.sh` 的 A/B/C 三进程段落依赖 S7 成员 API；能力标志已为 true 但脚本尚未按
-  单节点降级，S7/S9 前不作为验收门（`M9_STRICT=1` 只会放大失败）。
-  `tests/e2e_stretch.sh` 不依赖能力开关，可直接验证 S4 数据面。
+- **已落地**：S0 模式矩阵/配置校验/能力开关；S1–S3 sync 数据面（统一 origin version id、
+  写门与写 intent、MPU/Copy 边界、remote-first 删除、内部 token 路由、删桶 quiesce、删除
+  intent 恢复）；S4 stretch 2×6 数据面；S5 openraft 0.9.25 SQLite 日志/状态机/快照/HTTP
+  网络；S6 控制写路由（11 张控制表经 `ControlPlane` 单命令提交、确定性 payload、apply 后
+  缓存/目录副作用、`/site/changelog` 409、启动模式断言）；S7 3-voter 成员变更/leader 单跳
+  转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、M7→Raft
+  `raft-cutover`/`raft-export`/`raft-force-recover`、`sync-reconcile [--repair]`、console
+  Raft 集群卡片。M7/Local 路径保持字节不变。
+- **验收证据（本机）**：`tests/e2e_m9.sh`（sync 模式）71 PASS / 0 FAIL / 1 SKIP（stretch
+  由专用脚本覆盖：`tests/e2e_stretch.sh` ALL PASS）；`M9_STRICT=1` 用于失败不降级。
+  `cargo test` 的 raft/控制面套件与 `sync_gate` 全绿。
 
 ### 模式矩阵
 
@@ -998,8 +997,8 @@ snapshot/purged/voters/production_ready`；`voters<3` 时 `production_ready=fals
 | 无 `[site]/[cluster]/[stretch]` | 单节点（单盘或本地多盘 EC） | 本地 SQLite | 可用（M1/M2） |
 | `[site]` | M7 异步站点对 | 本地 SQLite | 可用（M7） |
 | `[cluster]` | 扁平多节点 EC | 本地 SQLite | 可用（M3/M4） |
-| `[site]` + `[raft]` | M7 异步站点对；sync 桶（1 数据 peer） | 单节点 Raft（1 voter，S6） | 可启动；控制写经 Raft；3-voter 成员待 S7 |
-| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC（S4，可用） | 单节点 Raft（1 voter，S6） | 可启动并读写；sync/stretch 桶按 READY 门控；3-voter 待 S7 |
+| `[site]` + `[raft]` | M7 异步站点对；sync 桶（1 数据 peer） | Raft 1/2/3 voters（A/B 配对 + C witness） | 可用；控制写经 Raft；`production_ready` 需 ≥3 voters |
+| `[site]` + `[stretch]` + `[raft]` | 2×6 stretch EC | Raft（A/B 配对；witness 可选） | 可用；sync 桶被拒绝（互斥）；stretch 数据面 e2e ALL PASS |
 
 启动校验（`config.rs`，均 fail-closed）：`[raft]` 必须有 `[site]`；`[stretch]` 必须有
 `[site]` + `[raft]`；`[cluster]` 与 `[site]`/`[stretch]` 互斥；`[raft]`/`[stretch]` 下
@@ -1007,7 +1006,7 @@ snapshot/purged/voters/production_ready`；`voters<3` 时 `production_ready=fals
 `peer_drives=6`、EC 8+4、`inline_threshold=0`、`placement="v2"`、非空 `mesh_secret`、
 `self_addr≠peer_addr` 且 `self_addr` 与主 HTTP/`[raft].advertise_endpoint` 端口分离。
 
-### witness 部署（目标形态；S7 待交付）
+### witness 部署
 
 生产形态为 **3 voters：A/B 两个数据站点 + C witness**，quorum 2；任意两票可提交，
 A+B、A+C、B+C 均可写。C 只持久化 `raft.db` + 控制面 `state_db`（11 张控制表），
@@ -1020,17 +1019,17 @@ A+B、A+C、B+C 均可写。C 只持久化 `raft.db` + 控制面 `state_db`（11
 | B（数据站点） | 2 | voter，`bootstrap=false` | `[site]`+`[raft]`；写对象；等 leader/配对加入 |
 | C（witness） | 3 | witness，`bootstrap=false` | 独立 `witness.toml`：`node_id/advertise_endpoint/cluster_token/db_path/state_db`；仅控制面 |
 
-目标启动路径为 `oss-server witness --config witness.toml`（`WitnessConfig` + `Db::connect_witness`，
-不构造 Store/S3）。当前分支已能解析 `[raft].role="witness"`、存在 `WitnessConfig` 结构与
-`Db::connect_witness`，但 **`witness` 子命令、witness-only 路由、成员 API 和
-`raft-add-witness` 均未交付**；`[raft]` 进程只以单节点 bootstrap 启动（S6）。因此现在无法
-真正部署 3 voters，上表只是 S7 的目标形态。成员变更目标流程：A 初始化 `{A}` → B 以
-`add_learner(B, blocking)` 追平后 `change_membership({A,B})` → C 追平后加入为第 3 voter；
-不硬编码 `{A,B,C}`，也不在单次变更里直接替换 voter 集。
+启动路径为 `oss-server witness --config witness.toml`（`WitnessToml` + `Db::connect_witness`，
+不构造 Store/S3；HTTP 只暴露 `/health*` 与 `/api/v1/site/raft/*`）。成员流程：A 初始化
+`{A}` → 控制台 `POST /api/v1/sites` 配对 B（A 侧 `add_learner(B, blocking)` 后
+`change_membership({A,B})`，B 侧 `/join` 写本地 `sites` 行）→
+`raft-add-witness --config a/oss.toml --node-id 3 --endpoint http://c:PORT` 让 C 追加快照并加入
+第 3 voter；成员集以 `metrics().membership_config` 为准，不硬编码 `{A,B,C}`。C 可当选 leader，
+follower 的成员变更/控制写经 `x-oss-raft-forwarded` 单跳转发到 leader。
 
 ### sync 写语义（S1–S3 已实现；S6 起能力门开启）
 
-生产配置（单节点 Raft 已接线；3-voter 成员待 S7）：
+生产配置（A/B 配对为 2 voters；加 witness C 后 3 voters）：
 
 ```toml
 [site]
@@ -1053,8 +1052,8 @@ timeout_ms = 10000                     # 默认 10s；仅 sync 远端调用 → 
 
 - **创建前提（S6 起）**：sync 桶要求 `[raft]` + `RAFT_READY` + 恰好 1 个数据 peer；
   创建即 `versioning=Enabled`，`replication_mode` 创建后不可变。`SYNC_READY=true`：
-  S3 面 `x-oss-replication-mode: sync` 与控制台建桶均经单节点 Raft 提交（不再 400/503）；
-  3-voter 部署仍待 S7。sync 桶拒绝对象锁（409）、SSE-C（400）、Tagging API（501）与
+  S3 面 `x-oss-replication-mode: sync` 与控制台建桶均经 Raft 提交（单节点或 3-voter 均可）。
+  sync 桶拒绝对象锁（409）、SSE-C（400）、Tagging API（501）与
   生命周期 Transition（400，仅允许 Expiration）；`Suspended` 版本控制本系统未实现（501）。
 - **同一 origin version id**：提交前预生成本地版本 UUID；远端 token PUT 携带签名头
   `x-oss-origin-version-id`。接收端在 sync 桶 + 合法 `x-oss-site-token` 下采用该 UUID 作为
@@ -1106,10 +1105,14 @@ timeout_ms = 10000                     # 默认 10s；仅 sync 远端调用 → 
 - **删除 intent 恢复**：`sync_delete_intents` 每操作一行 UUID，远端调用前 pending、ack 后
   done、本地成功后删行；30s worker + 启动首轮。`remote_pending` 用 HEAD 三态判断：
   200/405 → 远端仍存在，重试内部删除；404 → 已不存在，本地删；`remote_done` 直接补本地。
-- **`sync-reconcile [--repair]` 当前未实现**：代码只会在缺映射/映射不一致时返回 409 并提示
-  该命令；CLI 属 S3 跟随项（S9 计划），在交付前不要把它当可用运维入口。
+- **`sync-reconcile [--repair]`**：只读模式报告缺映射/远端缺对象；`--repair` 对可读明文
+  （≤ `[sync].max_object_bytes`）按本地 version id 重推、刷新 `remote_version_id`、清理
+  旧站 `sync_*_intents` 与 `repl_outbox(target_kind='site')`，全部成功后才清
+  `sites.reconcile_required`（B′ 替换前该标志令 sync 写/删一律 503）。加密/超大/冲突对象
+  报错并保持 gate，退出码 1。用法：`oss-server sync-reconcile [--repair] [--bucket B]
+  [--json] --config a.toml`（建议停服运行；会打开本机 raft.db）。
 
-### stretch 2×6（S4 数据面已实现；控制面待 S7）
+### stretch 2×6（数据面 + Raft 控制面已接线）
 
 目标配置（两数据站点各一份，C witness 另配；省略 `listen`/`data_dir(s)`/`database_url`
 等通用项，本站必须恰好 6 条 `data_dirs`）：
@@ -1162,10 +1165,10 @@ db_path = "/var/lib/oss/raft.db"
 - **单盘故障**：EC 8+4 可在站点内重建，但 `Q_s=9` 仍要求至少 9 槽可达；站点恢复后用
   `fsck --repair`/`heal` 通过 mesh 修复缺失分片。
 
-### force recovery runbook（计划；S7/S9 交付后可用）
+### force recovery runbook
 
-以下命令/路径在当前构建**尚不存在**，仅记录目标运维流程；硬约束是**禁止手改旧
-`raft.db`**，新集群绝不写旧 epoch。
+命令已实现（`raft-export`/`raft-force-recover`）；硬约束是**禁止手改旧 `raft.db`**，
+新集群绝不写旧 epoch。
 
 1. 停全部节点，保留旧 `raft.db`/`control.db` 与对象备份；记录每步使用的配置与导出文件。
 2. 选控制状态最全的存活数据站点执行 `raft-export`（11 张业务表、自然键，不含 LogId 语义）。
@@ -1188,9 +1191,10 @@ db_path = "/var/lib/oss/raft.db"
 
 - 当前 Raft/site/mesh 传输均为**明文 HTTP/gRPC（TLS 未接线）**：只能部署在受控私网，
   或用外部 TLS 终结/隧道；`cluster_token`、`site.token`、`mesh_secret` 不得出现在公网。
-- 能力开关已翻（`RAFT_READY`/`SYNC_READY=true`，`STRETCH_READY=false`），但控制面仅为
-  **单节点 Raft**：3-voter 成员/witness/cutover 属 S7，未交付前不要把 `[raft]`/`[stretch]`
-  当生产强一致能力；`tests/e2e_m9.sh` 的 A/B/C 段落需 S7/S9 后才能作为验收门。
+- 能力开关已翻（`RAFT_READY`/`SYNC_READY`/`STRETCH_READY=true`）。控制面支持 1–3 voters：
+  A/B 配对后 2 voters，`raft-add-witness` 加 C 后 3 voters（quorum 2，`production_ready=true`）；
+  单节点 bootstrap 仍可用于开发。`tests/e2e_m9.sh`（3 进程）与 `tests/e2e_stretch.sh`
+  已在本机通过；上线前仍应在目标网络重跑并保留证据。
 
 ## 验收
 
@@ -1287,7 +1291,8 @@ stretch 按计划 v3 **互斥**（同一集群不可同时启用），默认跑�
   Select 代理、桶默认加密、IAM 预设、复制限速；以及 M4/M5/M6 文档化缺口页）：见 M8 计划
   「缺口收口与偏差」节、设计文档 §M8 落地状态
 - M8 e2e：`tests/e2e_m8.sh`（前置与旋钮见「M8 测试锚」段）
-- M9 强一致计划（v3；数据面 S0–S4 + Raft 基座 S5 + 单节点控制面 S6；3-voter S7 待交付）：
+- M9 强一致计划（v5；数据面 S0–S4 + Raft S5、控制面 S6、3-voter/配对/快照/cutover S7
+  已实施；S8/S9 为故障验收与证据归档）：
   `docs/superpowers/plans/2026-10-20-m9-strong-consistency.md`
 
 ---
