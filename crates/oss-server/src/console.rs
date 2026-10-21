@@ -3029,6 +3029,7 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
             "node_id": s.node_id,
             "self_addr": s.self_addr,
             "peer_node_id": s.peer_node_id,
+            "peer_addr": s.peer_addr,
             // 本端实盘数；对端声明值不可信（B2）。
             "drive_count": state.cfg.data_dirs.as_ref().map_or(1, |d| d.len()),
             "ec": { "data": state.cfg.ec.data, "parity": state.cfg.ec.parity },
@@ -3120,6 +3121,7 @@ fn local_stretch_identity(state: &AppState) -> Option<crate::site_client::Stretc
         node_id: s.node_id.clone(),
         self_addr: s.self_addr.clone(),
         peer_node_id: s.peer_node_id.clone(),
+        peer_addr: s.peer_addr.clone(),
         drive_count: state.cfg.data_dirs.as_ref().map_or(1, |d| d.len()) as u16,
         ec: crate::site_client::EcIdentity {
             data: state.cfg.ec.data as u16,
@@ -3142,14 +3144,18 @@ fn stretch_mismatches(
         (Some(_), None) | (None, Some(_)) => Some(vec!["stretch_presence"]),
         (Some(a), Some(b)) => {
             let mut m = Vec::new();
-            if a.node_id != b.node_id {
+            // 两端配置互为镜像：本端 node/self_addr 对应对端 peer_*。
+            if a.node_id != b.peer_node_id {
                 m.push("node_id");
             }
-            if a.self_addr != b.self_addr {
+            if a.peer_node_id != b.node_id {
+                m.push("peer_node_id");
+            }
+            if a.self_addr != b.peer_addr {
                 m.push("self_addr");
             }
-            if a.peer_node_id != b.peer_node_id {
-                m.push("peer_node_id");
+            if a.peer_addr != b.self_addr {
+                m.push("peer_addr");
             }
             if a.drive_count != b.drive_count {
                 m.push("drive_count");
@@ -4308,5 +4314,42 @@ async fn site_delete_bucket(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => site_store_error(e),
+    }
+}
+
+#[cfg(test)]
+mod stretch_identity_tests {
+    use super::*;
+    use crate::site_client::{EcIdentity, StretchIdentity};
+
+    fn id(node: &str, self_addr: &str, peer: &str, peer_addr: &str) -> StretchIdentity {
+        StretchIdentity {
+            node_id: node.into(),
+            self_addr: self_addr.into(),
+            peer_node_id: peer.into(),
+            peer_addr: peer_addr.into(),
+            drive_count: 6,
+            ec: EcIdentity { data: 8, parity: 4 },
+            placement: "v2".into(),
+            mesh_secret_fingerprint: "f".repeat(64),
+        }
+    }
+
+    #[test]
+    fn mirrored_stretch_identities_match() {
+        let a = id("A", "a:9100", "B", "b:9100");
+        let b = id("B", "b:9100", "A", "a:9100");
+        assert_eq!(stretch_mismatches(&Some(a), &Some(b)), None);
+    }
+
+    #[test]
+    fn non_mirrored_stretch_identities_mismatch() {
+        let a = id("A", "a:9100", "B", "b:9100");
+        let same = a.clone();
+        let m = stretch_mismatches(&Some(a), &Some(same)).unwrap();
+        assert!(m.contains(&"node_id"));
+        assert!(m.contains(&"peer_node_id"));
+        assert!(m.contains(&"self_addr"));
+        assert!(m.contains(&"peer_addr"));
     }
 }

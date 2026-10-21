@@ -47,6 +47,9 @@ pub struct StretchIdentity {
     pub node_id: String,
     pub self_addr: String,
     pub peer_node_id: String,
+    /// 对端声明的本端 mesh 地址；与 self_addr 交叉校验（旧版本缺省为空）。
+    #[serde(default)]
+    pub peer_addr: String,
     pub drive_count: u16,
     pub ec: EcIdentity,
     pub placement: String,
