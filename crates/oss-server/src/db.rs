@@ -4,10 +4,14 @@ use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 
+use crate::raft::apply::ControlWrite;
+
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
 
 pub struct Db {
     pool: SqlitePool,
+    /// M9 S6a：Raft 模式抑制 `verify_user` 的旧 hash 本地升级（H1；各站点盐不同会分叉）。
+    raft_mode: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,7 +262,10 @@ impl Db {
         let pool = SqlitePool::connect_with(opts).await?;
         // sqlx::raw_sql 支持一个字符串里的多条语句，schema 文件原样执行
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            raft_mode: std::sync::atomic::AtomicBool::new(false),
+        };
         db.ensure_columns().await?;
         // M7：增量列就位后再建站点表/触发器（触发器引用补列），并种下本站身份。
         sqlx::raw_sql(SCHEMA_M7).execute(&db.pool).await?;
@@ -298,7 +305,14 @@ impl Db {
             }
             self.drop_triggers("raft_guard_%").await?;
         }
+        self.raft_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// M9：是否为 Raft 控制库（`connect_raft`/`connect_witness` 或 `prepare_raft_mode(true)`）。
+    pub fn raft_mode(&self) -> bool {
+        self.raft_mode.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 按 `sqlite_master` 名称模式 drop 触发器（名称来自库内，非用户输入）。
@@ -337,8 +351,9 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
-    /// apply 事务内标记（S5 接线；S0 提供契约）。
-    pub async fn set_raft_apply_ctx(&self, active: bool) -> Result<()> {
+    /// apply 事务内标记：**只允许本模块启动路径使用**——apply 在自身事务里写同一行，
+    /// 外部调用者拿不到写控制表的入口（编译闸，matrix §9）。
+    async fn set_raft_apply_ctx(&self, active: bool) -> Result<()> {
         sqlx::query("UPDATE raft_apply_ctx SET active = ? WHERE id = 1")
             .bind(active as i64)
             .execute(&self.pool)
@@ -1059,8 +1074,9 @@ impl Db {
         if !crate::db::verify_password(password, &stored) {
             return Ok(None);
         }
-        if crate::db::is_legacy_hash(&stored) {
-            // 透明升级（失败只 warn：本次登录已成功，下次再来）
+        if crate::db::is_legacy_hash(&stored) && !self.raft_mode() {
+            // 透明升级（失败只 warn：本次登录已成功，下次再来）。
+            // Raft 模式：随机盐会让各站点写出的 hash 不同 → 禁止本地写，只验通过。
             let upgraded = crate::db::hash_password(password);
             if let Err(e) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
                 .bind(&upgraded)
@@ -3865,6 +3881,644 @@ impl Db {
                 })
             })
             .collect())
+    }
+}
+
+// ——— M9 S6a：命令型原始写入 ———
+//
+// apply（以及 M7 的 ControlPlane::Local）在一事务内调用；随机值/时间戳/hash 一律由调用方
+// 预先算好传入。参数带 `ControlWrite` 令牌：令牌只能由 `raft::apply::control_tx` 构造，
+// handler 无法直接拿到这些写入口（matrix §9 编译闸）。
+
+/// 建桶结果：同名同模式=收敛更新（M5 重建语义），模式不同=409。
+pub(crate) enum CreateBucketOutcome {
+    Created,
+    Updated,
+    ModeConflict,
+}
+
+impl Db {
+    pub(crate) async fn create_user_raw(
+        cw: &mut ControlWrite<'_>,
+        username: &str,
+        password_hash: &str,
+        status: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
+             VALUES (?, ?, 0, ?, ?)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(status)
+        .bind(created_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    /// 与 [`Db::delete_user`] 完全同 SQL：守卫写取写锁 + 最后管理员判定 + 全量级联。
+    pub(crate) async fn delete_user_cascade(cw: &mut ControlWrite<'_>, uid: i64) -> Result<bool> {
+        let conn = cw.conn();
+        let gate = sqlx::query(
+            "UPDATE users SET id = id WHERE id = ? AND \
+             (NOT (is_admin = 1 AND status = 'active') \
+              OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
+        )
+        .bind(uid)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if gate == 0 {
+            return Ok(false);
+        }
+        for sql in [
+            "DELETE FROM access_keys WHERE user_id = ?",
+            "DELETE FROM permissions WHERE user_id = ?",
+            "UPDATE buckets SET owner_id = NULL WHERE owner_id = ?",
+            "UPDATE uploads SET owner_id = NULL WHERE owner_id = ?",
+            "DELETE FROM users WHERE id = ?",
+        ] {
+            sqlx::query(sql).bind(uid).execute(&mut *conn).await?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn set_password_raw(
+        cw: &mut ControlWrite<'_>,
+        uid: i64,
+        password_hash: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(password_hash)
+            .bind(uid)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// 与 [`Db::set_user_status`] 同语义（停用走原子最后管理员守卫）。
+    pub(crate) async fn set_user_status_raw(
+        cw: &mut ControlWrite<'_>,
+        uid: i64,
+        active: bool,
+    ) -> Result<bool> {
+        let n = if active {
+            sqlx::query("UPDATE users SET status = 'active' WHERE id = ?")
+                .bind(uid)
+                .execute(&mut *cw.conn())
+                .await?
+                .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE users SET status = 'disabled' WHERE id = ? AND \
+                 (NOT (is_admin = 1 AND status = 'active') \
+                  OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
+            )
+            .bind(uid)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected()
+        };
+        Ok(n == 1)
+    }
+
+    pub(crate) async fn set_permissions_raw(
+        cw: &mut ControlWrite<'_>,
+        uid: i64,
+        rows: &[PermissionRow],
+    ) -> Result<()> {
+        let conn = cw.conn();
+        sqlx::query("DELETE FROM permissions WHERE user_id = ?")
+            .bind(uid)
+            .execute(&mut *conn)
+            .await?;
+        for p in rows {
+            sqlx::query(
+                "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(uid)
+            .bind(&p.bucket)
+            .bind(p.read as i64)
+            .bind(p.write as i64)
+            .bind(p.delete as i64)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_access_key_raw(
+        cw: &mut ControlWrite<'_>,
+        access_key: &str,
+        secret_key: &str,
+        user_id: i64,
+        kind: &str,
+        parent_ak: Option<&str>,
+        session_policy: Option<&str>,
+        created_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO access_keys (access_key, secret_key, user_id, status, kind, \
+             parent_ak, session_policy, created_at) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)",
+        )
+        .bind(access_key)
+        .bind(secret_key)
+        .bind(user_id)
+        .bind(kind)
+        .bind(parent_ak)
+        .bind(session_policy)
+        .bind(created_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_access_key_raw(
+        cw: &mut ControlWrite<'_>,
+        access_key: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM access_keys WHERE access_key = ?")
+            .bind(access_key)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn set_access_key_status_raw(
+        cw: &mut ControlWrite<'_>,
+        access_key: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("UPDATE access_keys SET status = ? WHERE access_key = ?")
+            .bind(status)
+            .bind(access_key)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// 全列建桶（S6c 的 `db`/`access`/`console` 共用 writer）：
+    /// 行不存在 → INSERT（set_id=0，deleting=0）；同名同模式 → 全列收敛但**不写 set_id**；
+    /// 同名不同模式 → `ModeConflict`（无写入）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_bucket_tx(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+        owner_id: Option<i64>,
+        created_at: i64,
+        replication_mode: &str,
+        versioning: &str,
+        object_lock: bool,
+        lock_mode: Option<&str>,
+        lock_days: Option<i64>,
+        default_encryption: Option<&str>,
+    ) -> Result<CreateBucketOutcome> {
+        let conn = cw.conn();
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT replication_mode FROM buckets WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some(mode) = existing {
+            if mode != replication_mode {
+                return Ok(CreateBucketOutcome::ModeConflict);
+            }
+            sqlx::query(
+                "UPDATE buckets SET owner_id = ?, versioning = ?, object_lock = ?, \
+                 object_lock_default_mode = ?, object_lock_default_days = ?, \
+                 default_encryption = ?, replication_mode = ?, deleting = 0 WHERE name = ?",
+            )
+            .bind(owner_id)
+            .bind(versioning)
+            .bind(i64::from(object_lock))
+            .bind(lock_mode)
+            .bind(lock_days)
+            .bind(default_encryption)
+            .bind(replication_mode)
+            .bind(name)
+            .execute(&mut *conn)
+            .await?;
+            return Ok(CreateBucketOutcome::Updated);
+        }
+        sqlx::query(
+            "INSERT INTO buckets \
+             (name, owner_id, creation_date, versioning, set_id, object_lock, \
+              object_lock_default_mode, object_lock_default_days, default_encryption, \
+              replication_mode, deleting) \
+             VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(name)
+        .bind(owner_id)
+        .bind(created_at)
+        .bind(versioning)
+        .bind(i64::from(object_lock))
+        .bind(lock_mode)
+        .bind(lock_days)
+        .bind(default_encryption)
+        .bind(replication_mode)
+        .execute(&mut *conn)
+        .await?;
+        Ok(CreateBucketOutcome::Created)
+    }
+
+    /// 删桶级联：与 `clear_bucket_m8_tx` + console 清理的并集一致（11 表内的从属行）。
+    /// 返回桶行是否存在（不存在 → NotFound，但仍清残留从属行，幂等）。
+    pub(crate) async fn delete_bucket_cascade(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+    ) -> Result<bool> {
+        let conn = cw.conn();
+        sqlx::query(
+            "DELETE FROM olap_configs WHERE access_point IN \
+             (SELECT name FROM access_points WHERE bucket = ?)",
+        )
+        .bind(bucket)
+        .execute(&mut *conn)
+        .await?;
+        for sql in [
+            "DELETE FROM access_points WHERE bucket = ?",
+            "DELETE FROM inventory_configs WHERE bucket = ?",
+            "DELETE FROM permissions WHERE bucket = ?",
+            "DELETE FROM lifecycle_rules WHERE bucket = ?",
+            "DELETE FROM bucket_policies WHERE bucket = ?",
+            "DELETE FROM event_configs WHERE bucket = ?",
+            "DELETE FROM replication_rules WHERE bucket = ?",
+        ] {
+            sqlx::query(sql).bind(bucket).execute(&mut *conn).await?;
+        }
+        let n = sqlx::query("DELETE FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn set_bucket_deleting_raw(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+        deleting: bool,
+    ) -> Result<bool> {
+        let n = sqlx::query("UPDATE buckets SET deleting = ? WHERE name = ?")
+            .bind(i64::from(deleting))
+            .bind(name)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn set_bucket_versioning_raw(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+        versioning: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("UPDATE buckets SET versioning = ? WHERE name = ?")
+            .bind(versioning)
+            .bind(name)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn set_bucket_object_lock_raw(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+        enabled: bool,
+        default_mode: Option<&str>,
+        default_days: Option<i64>,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE buckets SET object_lock = ?, object_lock_default_mode = ?, \
+             object_lock_default_days = ? WHERE name = ?",
+        )
+        .bind(i64::from(enabled))
+        .bind(default_mode)
+        .bind(default_days)
+        .bind(name)
+        .execute(&mut *cw.conn())
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn set_bucket_notification_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        config_json: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO event_configs (bucket, config_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET config_json = excluded.config_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(config_json)
+        .bind(updated_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_bucket_notification_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM event_configs WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_lifecycle_rules_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        rules: &[LifecycleRuleRow],
+        updated_at: i64,
+    ) -> Result<()> {
+        let conn = cw.conn();
+        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *conn)
+            .await?;
+        for r in rules {
+            sqlx::query(
+                "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, \
+                 expiration_days, transition_days, transition_class, transition_tier, \
+                 enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(bucket)
+            .bind(&r.rule_id)
+            .bind(&r.prefix)
+            .bind(r.expire_days)
+            .bind(r.expiration_days)
+            .bind(r.transition_days)
+            .bind(&r.transition_class)
+            .bind(&r.transition_tier)
+            .bind(i64::from(r.enabled))
+            .bind(updated_at)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn clear_lifecycle_rules_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_replication_rules_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        rules_json: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO replication_rules (bucket, rules_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET rules_json = excluded.rules_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(rules_json)
+        .bind(updated_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_replication_rules_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM replication_rules WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_bucket_default_encryption_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        algorithm: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
+            .bind(algorithm)
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn clear_bucket_default_encryption_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn set_bucket_policy_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        policy_json: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET policy_json = excluded.policy_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(policy_json)
+        .bind(updated_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_bucket_policy_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?;
+        Ok(())
+    }
+
+    /// `false` = 同名 AP 已存在（调用方映射 Conflict，不覆盖策略）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_access_point_raw(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+        bucket: &str,
+        owner_id: i64,
+        policy_json: Option<&str>,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let conn = cw.conn();
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM access_points WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if exists.is_some() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(bucket)
+        .bind(owner_id)
+        .bind(policy_json)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(&mut *conn)
+        .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn set_access_point_policy_raw(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+        policy_json: Option<&str>,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let n =
+            sqlx::query("UPDATE access_points SET policy_json = ?, updated_at = ? WHERE name = ?")
+                .bind(policy_json)
+                .bind(updated_at)
+                .bind(name)
+                .execute(&mut *cw.conn())
+                .await?
+                .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn delete_access_point_cascade(
+        cw: &mut ControlWrite<'_>,
+        name: &str,
+    ) -> Result<bool> {
+        let conn = cw.conn();
+        sqlx::query("DELETE FROM olap_configs WHERE access_point = ?")
+            .bind(name)
+            .execute(&mut *conn)
+            .await?;
+        let n = sqlx::query("DELETE FROM access_points WHERE name = ?")
+            .bind(name)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn olap_upsert_raw(
+        cw: &mut ControlWrite<'_>,
+        access_point: &str,
+        kind: &str,
+        endpoint: Option<&str>,
+        module: Option<&[u8]>,
+        module_sha256: Option<&str>,
+        timeout_ms: i64,
+        max_response_bytes: i64,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO olap_configs (access_point, kind, endpoint, module, module_sha256, \
+             timeout_ms, max_response_bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(access_point) DO UPDATE SET kind = excluded.kind, \
+             endpoint = excluded.endpoint, module = excluded.module, \
+             module_sha256 = excluded.module_sha256, timeout_ms = excluded.timeout_ms, \
+             max_response_bytes = excluded.max_response_bytes, updated_at = excluded.updated_at",
+        )
+        .bind(access_point)
+        .bind(kind)
+        .bind(endpoint)
+        .bind(module)
+        .bind(module_sha256)
+        .bind(timeout_ms)
+        .bind(max_response_bytes)
+        .bind(updated_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn olap_delete_raw(
+        cw: &mut ControlWrite<'_>,
+        access_point: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM olap_configs WHERE access_point = ?")
+            .bind(access_point)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub(crate) async fn inventory_upsert_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        id: &str,
+        owner_id: i64,
+        config_json: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, id) DO UPDATE SET \
+             owner_id = excluded.owner_id, config_json = excluded.config_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(bucket)
+        .bind(id)
+        .bind(owner_id)
+        .bind(config_json)
+        .bind(updated_at)
+        .execute(&mut *cw.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn inventory_delete_raw(
+        cw: &mut ControlWrite<'_>,
+        bucket: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM inventory_configs WHERE bucket = ? AND id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&mut *cw.conn())
+            .await?
+            .rows_affected();
+        Ok(n > 0)
     }
 }
 

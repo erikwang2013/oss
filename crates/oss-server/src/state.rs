@@ -56,6 +56,8 @@ pub struct AppState {
     pub inventory: Arc<dyn xl_s3::inventory::InventoryStore>,
     /// M8 S5：Inventory 生成执行器（作业引擎的 `Inventory` 动作）。
     pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
+    /// M9 S6：控制写门面（Local = M7/standalone；Raft = `[raft]`）。S6b-d 的路由唯一入口。
+    pub control: Arc<crate::raft::control::ControlPlane>,
 }
 
 fn mesh_of(store: &Store) -> Option<xl_s3::access::ControlMesh> {
@@ -424,68 +426,73 @@ impl AppState {
                 .await?;
         }
 
+        // M9 H3/H5：Raft 模式下桶/行以日志为事实源，不得做本地对账回填。
+        let raft_enabled = cfg.raft.is_some();
+
         // M7（P3）：两轮启动对账期间抑制站点触发器——维护写（set_id 收敛/补行）不得
         // 产生 changelog；结束后复位 0。进程若中途退出，下次 connect 的 site_bootstrap 复位。
-        if let Err(e) = db.set_apply_ctx(true).await {
-            tracing::warn!(error = %e, "启动对账抑制开关失败（继续）");
-        }
-        // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒
-        // 仅管理员可见/可管）。INSERT OR IGNORE 幂等，已存在（含已有 owner）不覆盖。
-        match store.list_buckets().await {
-            Ok(buckets) => {
-                for b in buckets {
-                    // M4 切片 8：INSERT OR IGNORE 不覆盖已有行（新桶在创建时已带 owner/set）；
-                    // 无行者先扇出问 set：有答按答插；「全部可达且全无」→ set0+warn（存量语义）；
-                    // **任一传输错 → 不插行**（下次启动重试；「不可达」不得写死 set0——
-                    // verifier 终审洞 2：升级后 set=1 桶的行在不可达窗口被写死 0 即分片错组）
-                    match store.resolve_bucket_set_authoritative(&b.name).await {
-                        // P3-3：权威 set **对账**（不止补缺）——陈旧行（删桶重建后别节点残留）在此收敛；
-                        // M5 切片 0：改走**权威**解析（跳过本地短路——原实现把本地陈旧值原样写回，收敛不成立）
-                        Ok(Some(s)) => {
-                            if let Err(e) = db.upsert_bucket_set(&b.name, s).await {
-                                tracing::warn!(error = %e, bucket = %b.name, "回填对账失败");
+        if !raft_enabled {
+            if let Err(e) = db.set_apply_ctx(true).await {
+                tracing::warn!(error = %e, "启动对账抑制开关失败（继续）");
+            }
+            // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒
+            // 仅管理员可见/可管）。INSERT OR IGNORE 幂等，已存在（含已有 owner）不覆盖。
+            match store.list_buckets().await {
+                Ok(buckets) => {
+                    for b in buckets {
+                        // M4 切片 8：INSERT OR IGNORE 不覆盖已有行（新桶在创建时已带 owner/set）；
+                        // 无行者先扇出问 set：有答按答插；「全部可达且全无」→ set0+warn（存量语义）；
+                        // **任一传输错 → 不插行**（下次启动重试；「不可达」不得写死 set0——
+                        // verifier 终审洞 2：升级后 set=1 桶的行在不可达窗口被写死 0 即分片错组）
+                        match store.resolve_bucket_set_authoritative(&b.name).await {
+                            // P3-3：权威 set **对账**（不止补缺）——陈旧行（删桶重建后别节点残留）在此收敛；
+                            // M5 切片 0：改走**权威**解析（跳过本地短路——原实现把本地陈旧值原样写回，收敛不成立）
+                            Ok(Some(s)) => {
+                                if let Err(e) = db.upsert_bucket_set(&b.name, s).await {
+                                    tracing::warn!(error = %e, bucket = %b.name, "回填对账失败");
+                                }
                             }
-                        }
-                        Ok(None) => {
-                            // 全可达且确无行：仅缺行时插 set=0（**不覆盖**已有行——None 无权威值）
-                            tracing::warn!(bucket = %b.name, "回填：全集群确无该桶行，按 set=0（存量语义）");
-                            if let Err(e) = db.insert_bucket(&b.name, None).await {
-                                tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
+                            Ok(None) => {
+                                // 全可达且确无行：仅缺行时插 set=0（**不覆盖**已有行——None 无权威值）
+                                tracing::warn!(bucket = %b.name, "回填：全集群确无该桶行，按 set=0（存量语义）");
+                                if let Err(e) = db.insert_bucket(&b.name, None).await {
+                                    tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
+                                }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, bucket = %b.name, "回填：set 解析不可达，本轮跳过（下次启动重试）");
+                            Err(e) => {
+                                tracing::warn!(error = %e, bucket = %b.name, "回填：set 解析不可达，本轮跳过（下次启动重试）");
+                            }
                         }
                     }
                 }
+                Err(e) => tracing::warn!(error = %e, "启动回填：列举桶失败"),
             }
-            Err(e) => tracing::warn!(error = %e, "启动回填：列举桶失败"),
-        }
 
-        // M5 切片 0（P4-1）第二对账面：表行全量——上面的磁盘循环看不见「行在而目录不在」的
-        // 陈旧行（删桶广播未达该节点 + 目录删除已生效）。对端有行 → 权威值收敛；对端全无行
-        // → 保守不动（可能是本节点建的桶而对端漏收广播——删行会把本节点的活桶 404 掉；
-        // 该残窗随重建广播/下轮重启收敛，彻底强一致归 M9）。
-        match db.list_bucket_rows().await {
-            Ok(names) => {
-                for name in names {
-                    match store.resolve_bucket_set_authoritative(&name).await {
-                        Ok(Some(s)) => {
-                            if let Err(e) = db.upsert_bucket_set(&name, s).await {
-                                tracing::warn!(error = %e, bucket = %name, "行对账收敛失败");
+            // M5 切片 0（P4-1）第二对账面：表行全量——上面的磁盘循环看不见「行在而目录不在」的
+            // 陈旧行（删桶广播未达该节点 + 目录删除已生效）。对端有行 → 权威值收敛；对端全无行
+            // → 保守不动（可能是本节点建的桶而对端漏收广播——删行会把本节点的活桶 404 掉；
+            // 该残窗随重建广播/下轮重启收敛，彻底强一致归 M9）。
+            match db.list_bucket_rows().await {
+                Ok(names) => {
+                    for name in names {
+                        match store.resolve_bucket_set_authoritative(&name).await {
+                            Ok(Some(s)) => {
+                                if let Err(e) = db.upsert_bucket_set(&name, s).await {
+                                    tracing::warn!(error = %e, bucket = %name, "行对账收敛失败");
+                                }
                             }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, bucket = %name, "行对账：权威解析不可达，本轮跳过");
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, bucket = %name, "行对账：权威解析不可达，本轮跳过");
+                            }
                         }
                     }
                 }
+                Err(e) => tracing::warn!(error = %e, "启动对账：列举桶行失败"),
             }
-            Err(e) => tracing::warn!(error = %e, "启动对账：列举桶行失败"),
-        }
-        if let Err(e) = db.set_apply_ctx(false).await {
-            tracing::warn!(error = %e, "启动对账抑制复位失败");
+            if let Err(e) = db.set_apply_ctx(false).await {
+                tracing::warn!(error = %e, "启动对账抑制复位失败");
+            }
         }
 
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
@@ -529,34 +536,49 @@ impl AppState {
         // 实弹教训：docker 集群栈里 n1 先于对端启动，严格扇出会让启动即退。
         // M7（L2）：groups 桶的记账写也属于启动维护，必须抑制站点触发器（否则时钟领先时
         // INSERT OR IGNORE 仍会触发 BEFORE 门控 ABORT，进程起不来）。
-        if let Err(e) = db.set_apply_ctx(true).await {
-            tracing::warn!(error = %e, "groups 回填抑制开关失败（继续）");
-        }
-        for g in &cfg.groups {
-            if cfg.cluster.is_some() {
-                store.mesh_ensure_bucket(&g.bucket).await?;
-                if let Some(cl) = store.cluster() {
-                    let self_id = cl.sets.flat.self_node().id.clone();
-                    for n in &cl.sets.flat.nodes {
-                        if n.id == self_id {
-                            continue;
-                        }
-                        if let Err(e) = cl.transport.ensure_bucket(&n.id, &g.bucket).await {
-                            tracing::warn!(node = %n.id, bucket = %g.bucket, error = %e, "启动建桶广播未达（滚动启动正常；懒自愈/fsck 兜底）");
+        // M9 H3/H5：Raft 模式下 groups 桶行/目录由日志 apply 产生，跳过本地回填。
+        if !raft_enabled {
+            if let Err(e) = db.set_apply_ctx(true).await {
+                tracing::warn!(error = %e, "groups 回填抑制开关失败（继续）");
+            }
+            for g in &cfg.groups {
+                if cfg.cluster.is_some() {
+                    store.mesh_ensure_bucket(&g.bucket).await?;
+                    if let Some(cl) = store.cluster() {
+                        let self_id = cl.sets.flat.self_node().id.clone();
+                        for n in &cl.sets.flat.nodes {
+                            if n.id == self_id {
+                                continue;
+                            }
+                            if let Err(e) = cl.transport.ensure_bucket(&n.id, &g.bucket).await {
+                                tracing::warn!(node = %n.id, bucket = %g.bucket, error = %e, "启动建桶广播未达（滚动启动正常；懒自愈/fsck 兜底）");
+                            }
                         }
                     }
+                } else if !store.bucket_exists(&g.bucket).await? {
+                    store.create_bucket(&g.bucket).await?;
                 }
-            } else if !store.bucket_exists(&g.bucket).await? {
-                store.create_bucket(&g.bucket).await?;
+                // M4 切片 8：groups 桶钉 set 0（多 set 下不参与新组——目录/行按 set0 口径收口，C3）
+                db.insert_bucket(&g.bucket, None).await?;
             }
-            // M4 切片 8：groups 桶钉 set 0（多 set 下不参与新组——目录/行按 set0 口径收口，C3）
-            db.insert_bucket(&g.bucket, None).await?;
-        }
-        if let Err(e) = db.set_apply_ctx(false).await {
-            tracing::warn!(error = %e, "groups 回填抑制复位失败");
+            if let Err(e) = db.set_apply_ctx(false).await {
+                tracing::warn!(error = %e, "groups 回填抑制复位失败");
+            }
         }
 
-        Ok(Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup).await)
+        // Raft 启动必须晚于本地管理员引导：日志重放里的管理员属主需解析到本地 id。
+        let raft = match cfg.raft.as_ref() {
+            Some(t) => {
+                let settings = crate::raft::RaftSettings::from_toml(t)
+                    .map_err(|e| format!("[raft] 配置非法: {e}"))?;
+                Some(Arc::new(
+                    crate::raft::spawn_with_control(settings, Some(db.pool().clone())).await?,
+                ))
+            }
+            None => None,
+        };
+
+        Ok(Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, raft).await)
     }
 
     /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
@@ -597,11 +619,11 @@ impl AppState {
                 Arc::clone(&ap_cache),
                 Arc::clone(&olap_cache),
             ));
-        Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup).await
+        Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, None).await
     }
 
     /// `load` 预建 AP 缓存与清理实现（控制面写要在 `Store::open` 前注入），
-    /// tests 走 [`AppState::new`] 同一装配语义。
+    /// tests 走 [`AppState::new`] 同一装配语义（`None` = Local 门面）。
     async fn new_with(
         cfg: AppConfig,
         db: Arc<Db>,
@@ -609,6 +631,7 @@ impl AppState {
         ap_cache: Arc<xl_s3::ap::ApCache>,
         olap_cache: Arc<xl_s3::olap::OlapCache>,
         bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
+        raft: Option<Arc<crate::raft::RaftHandle>>,
     ) -> Self {
         // M7：`[site]` 覆盖种子（先于任何控制面写；load 与 tests 共用此路径）
         if let Some(site) = cfg.site.as_ref() {
@@ -738,6 +761,24 @@ impl AppState {
             inv_acl,
             cfg.staging_dir.clone(),
         ));
+        // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
+        let control = Arc::new(match raft {
+            Some(handle) => crate::raft::control::ControlPlane::raft(
+                handle,
+                Arc::clone(&db),
+                Arc::clone(&store),
+                Arc::clone(&ap_cache),
+                Arc::clone(&olap_cache),
+                ap_region.clone(),
+            ),
+            None => crate::raft::control::ControlPlane::local(
+                Arc::clone(&db),
+                Arc::clone(&store),
+                Arc::clone(&ap_cache),
+                Arc::clone(&olap_cache),
+                ap_region.clone(),
+            ),
+        });
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
@@ -771,6 +812,7 @@ impl AppState {
             tier_gc,
             inventory,
             inventory_runner,
+            control,
         }
     }
 }

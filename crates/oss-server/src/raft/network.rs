@@ -132,9 +132,17 @@ impl RaftNetwork<TypeConfig> for HttpNetwork {
                 .map_err(|e| RPCError::Network(NetworkError::new(&e)));
         }
         if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-            return Err(RPCError::PayloadTooLarge(
-                PayloadTooLarge::new_entries_hint(entries.max(1) as u64),
-            ));
+            // I2：按半数重试；单条仍超限时无法再拆，显式不可达而不是把 1 当 hint 死循环。
+            if entries > 1 {
+                return Err(RPCError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint((entries / 2).max(1) as u64),
+                ));
+            }
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &std::io::Error::other(
+                    "raft append entry exceeds server body limit; raise the HTTP body limit",
+                ),
+            )));
         }
         let remote: RaftError<u64> =
             serde_json::from_slice(&bytes).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
@@ -197,6 +205,10 @@ impl RaftNetwork<TypeConfig> for HttpNetwork {
 #[cfg(test)]
 mod tests {
     use super::token_matches;
+    use super::*;
+    use openraft::entry::Entry;
+    use openraft::{CommittedLeaderId, LogId, Vote};
+    use std::time::Duration;
 
     #[test]
     fn token_auth_is_exact_and_fails_closed() {
@@ -205,5 +217,60 @@ mod tests {
         assert!(!token_matches("abcd", Some("abc")));
         assert!(!token_matches("abcd", None));
         assert!(!token_matches("", Some("")));
+    }
+
+    async fn rejecting_server() -> String {
+        let app = axum::Router::new().route(
+            APPEND_PATH,
+            axum::routing::post(|| async { axum::http::StatusCode::PAYLOAD_TOO_LARGE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn append(
+        endpoint: &str,
+        entries: usize,
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let mut factory = HttpNetworkFactory::new("t".into());
+        let node = BasicNode {
+            addr: endpoint.to_string(),
+        };
+        let mut net = factory.new_client(2, &node).await;
+        let leader = LogId::new(CommittedLeaderId::new(1, 1), 0);
+        let entries: Vec<_> = (1..=entries as u64)
+            .map(|i| Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), i),
+                payload: openraft::EntryPayload::Blank,
+            })
+            .collect();
+        let last = entries.last().map(|e| e.log_id).unwrap_or(leader);
+        net.append_entries(
+            AppendEntriesRequest {
+                vote: Vote::new_committed(1, 1),
+                prev_log_id: Some(leader),
+                entries,
+                leader_commit: Some(last),
+            },
+            RPCOption::new(Duration::from_secs(5)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_halves_batch_and_fails_loudly_for_single_entry() {
+        let endpoint = rejecting_server().await;
+        match append(&endpoint, 4).await {
+            Err(RPCError::PayloadTooLarge(e)) => assert_eq!(e.entries_hint(), 2),
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+        match append(&endpoint, 1).await {
+            Err(RPCError::Unreachable(_)) => {}
+            other => panic!("expected Unreachable for single entry, got {other:?}"),
+        }
     }
 }
