@@ -721,47 +721,9 @@ impl AppState {
             db.pool().clone(),
             notifier,
         ));
-        // M6 切片 4：复制（规则存储 + 写入钩子 + 出站客户端；worker 在 serve 路径挂载）
-        let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
-        let repl_store = Arc::new(crate::replication::SqlReplStore::new(
-            db.pool().clone(),
-            remote_ids,
-        ));
         let store = Arc::new(store);
-        // M9 S3：共享删除服务（sync 桶 remote-first；非 sync 委托 store）。
-        let sync_delete = Arc::new(crate::sync::SiteSyncDelete::new(
-            Arc::clone(&db),
-            Arc::clone(&store),
-            std::time::Duration::from_millis(cfg.sync.timeout_ms),
-            site_enabled,
-        ));
-        let repl_sink = Arc::new(
-            crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
-                // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
-                .with_site_data_replication(cfg.stretch.is_none()),
-        );
-        let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
-        // M8 S4b：tier 后端固定于启动配置；规则校验只认这些 id。
-        let tiers = Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers));
-        let lifecycle: Arc<dyn xl_s3::lifecycle::LifecycleStore> = Arc::new(
-            crate::lifecycle_store::SqlLifecycleStore::new(Arc::clone(&db), Arc::new(tiers.ids())),
-        );
-        let restore_sink: Arc<dyn xl_s3::restore::RestoreSink> =
-            Arc::new(crate::tier_jobs::SqlRestoreSink::new(Arc::clone(&db)));
-        let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
-            Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
-        // M8 S5：Inventory 配置存储与执行器（共用三面判权实例语义）。
-        let inv_acl = xl_s3::access::Acl::with_mesh(db.pool().clone(), mesh_of(&store));
-        let inventory: Arc<dyn xl_s3::inventory::InventoryStore> = Arc::new(
-            crate::inventory_store::SqlInventoryStore::new(Arc::clone(&db), inv_acl.clone()),
-        );
-        let inventory_runner = Arc::new(crate::inventory::InventoryRunner::new(
-            Arc::clone(&db),
-            Arc::clone(&store),
-            inv_acl,
-            cfg.staging_dir.clone(),
-        ));
         // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
+        // 先于共享存储构造——S6c 起它们的控制写要经同一门面。
         let control = Arc::new(match raft {
             Some(handle) => crate::raft::control::ControlPlane::raft(
                 handle,
@@ -779,6 +741,50 @@ impl AppState {
                 ap_region.clone(),
             ),
         });
+        // M6 切片 4：复制（规则存储 + 写入钩子 + 出站客户端；worker 在 serve 路径挂载）
+        let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
+        let repl_store = Arc::new(
+            crate::replication::SqlReplStore::new(db.pool().clone(), remote_ids)
+                .with_control(Arc::clone(&control)),
+        );
+        // M9 S3：共享删除服务（sync 桶 remote-first；非 sync 委托 store）。
+        let sync_delete = Arc::new(
+            crate::sync::SiteSyncDelete::new(
+                Arc::clone(&db),
+                Arc::clone(&store),
+                std::time::Duration::from_millis(cfg.sync.timeout_ms),
+                site_enabled,
+            )
+            .with_control(Arc::clone(&control)),
+        );
+        let repl_sink = Arc::new(
+            crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
+                // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
+                .with_site_data_replication(cfg.stretch.is_none()),
+        );
+        let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
+        // M8 S4b：tier 后端固定于启动配置；规则校验只认这些 id。
+        let tiers = Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers));
+        let lifecycle: Arc<dyn xl_s3::lifecycle::LifecycleStore> = Arc::new(
+            crate::lifecycle_store::SqlLifecycleStore::new(Arc::clone(&db), Arc::new(tiers.ids()))
+                .with_control(Arc::clone(&control)),
+        );
+        let restore_sink: Arc<dyn xl_s3::restore::RestoreSink> =
+            Arc::new(crate::tier_jobs::SqlRestoreSink::new(Arc::clone(&db)));
+        let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
+            Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
+        // M8 S5：Inventory 配置存储与执行器（共用三面判权实例语义）。
+        let inv_acl = xl_s3::access::Acl::with_mesh(db.pool().clone(), mesh_of(&store));
+        let inventory: Arc<dyn xl_s3::inventory::InventoryStore> = Arc::new(
+            crate::inventory_store::SqlInventoryStore::new(Arc::clone(&db), inv_acl.clone())
+                .with_control(Arc::clone(&control)),
+        );
+        let inventory_runner = Arc::new(crate::inventory::InventoryRunner::new(
+            Arc::clone(&db),
+            Arc::clone(&store),
+            inv_acl,
+            cfg.staging_dir.clone(),
+        ));
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),

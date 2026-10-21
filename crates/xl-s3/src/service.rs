@@ -16,6 +16,7 @@ use xl_store::error::Error as StoreError;
 use xl_store::meta::{ChecksumRecord, ObjectTag};
 use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
 
+use crate::bucket_control::{BucketControlError, BucketControlSink, BucketCreateSpec};
 use crate::convert::to_s3_error;
 use crate::events::{EventSink, EventSource, S3EventOp};
 use crate::lock::{apply_lock_out, bucket_lock_out, parse_bucket_lock_rule, parse_put_lock};
@@ -54,6 +55,8 @@ pub struct OssS3 {
     site_token: Option<String>,
     /// M9 S3：共享删除服务（None = 未接线/测试：直接 store，M7 行为不变）。
     sync_delete: Option<Arc<dyn crate::sync_delete::SyncDeleteSink>>,
+    /// M9 S6c：桶控制写通道（仅 `[raft]` 注入；None = M7/standalone 直写路径不变）。
+    bucket_control: Option<Arc<dyn BucketControlSink>>,
 }
 
 impl OssS3 {
@@ -108,7 +111,17 @@ impl OssS3 {
             sync_ready: false,
             site_token: None,
             sync_delete: None,
+            bucket_control: None,
         }
+    }
+
+    /// M9 S6c：注入 Raft 控制写通道（`None` = 保持 M7 直写）。
+    pub fn with_bucket_control(
+        mut self,
+        sink: Option<Arc<dyn crate::bucket_control::BucketControlSink>>,
+    ) -> Self {
+        self.bucket_control = sink;
+        self
     }
 
     /// M9 S3：注入共享删除服务（sync 桶 remote-first；None 保持 store 直连）。
@@ -512,6 +525,29 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// M9 S6c：控制写拒绝 → s3s 错误（不静默降级）。
+fn bucket_control_error(e: BucketControlError) -> s3s::S3Error {
+    match e {
+        BucketControlError::NotFound => s3s::s3_error!(NoSuchBucket, "bucket not found"),
+        BucketControlError::Conflict => {
+            s3s::s3_error!(
+                BucketAlreadyExists,
+                "bucket request conflicts with current state"
+            )
+        }
+        BucketControlError::Invalid => s3s::s3_error!(InvalidRequest, "invalid bucket request"),
+        BucketControlError::TooLarge => {
+            s3s::s3_error!(EntityTooLarge, "control command exceeds raft limit")
+        }
+        BucketControlError::Unavailable => {
+            s3s::s3_error!(ServiceUnavailable, "control plane unavailable")
+        }
+        BucketControlError::Internal => {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "internal error")
+        }
+    }
+}
+
 /// M8 S4b：GET/HEAD 的 `x-amz-restore` 三态（Archived 无头；Restoring ongoing；
 /// Restored 带到期时刻）。
 fn restore_header(info: &ObjectInfo) -> Option<String> {
@@ -832,6 +868,57 @@ impl S3 for OssS3 {
                 }
             }
         }
+        // M9 S6c：Raft 模式一条命令建桶（owner+mode+versioning+lock 原子）。
+        if let Some(sink) = &self.bucket_control {
+            // 已存在（行或目录）→ 409 BucketAlreadyExists；apply 侧只做 create-or-converge。
+            match self.acl.bucket_replication_mode_row(&bucket).await {
+                Ok(Some(_)) => {
+                    return Err(s3s::s3_error!(BucketAlreadyExists, "bucket already exists"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, bucket, "读桶复制模式失败");
+                    return Err(s3s::s3_error!(InternalError, "internal error"));
+                }
+            }
+            if self
+                .store
+                .bucket_exists(&bucket)
+                .await
+                .map_err(to_s3_error)?
+            {
+                return Err(s3s::s3_error!(BucketAlreadyExists, "bucket already exists"));
+            }
+            let owner_uid = req
+                .extensions
+                .get::<crate::access::AuthedUser>()
+                .and_then(|u| (!u.is_admin).then_some(u.uid));
+            // 开锁建桶顺带 Enabled（与 enable_bucket_lock 的列效果一致）；sync 恒 Enabled。
+            let (object_lock, versioning) =
+                if req.input.object_lock_enabled_for_bucket == Some(true) {
+                    (true, "Enabled")
+                } else if replication_mode == "sync" {
+                    (false, "Enabled")
+                } else {
+                    (false, "Off")
+                };
+            sink.create_bucket(BucketCreateSpec {
+                name: bucket.clone(),
+                owner_uid,
+                created_at: now_secs(),
+                replication_mode: replication_mode.to_string(),
+                versioning: versioning.to_string(),
+                object_lock,
+                object_lock_default_mode: None,
+                object_lock_default_days: None,
+                default_encryption: None,
+            })
+            .await
+            .map_err(bucket_control_error)?;
+            self.store.invalidate_gate(&bucket);
+            self.store.broadcast_bucket_row(&bucket, Some(0)).await;
+            return Ok(S3Response::new(CreateBucketOutput::default()));
+        }
         // M9：陈旧行重建不得静默改模式（与 console 同口径，先于物理建桶）。
         match self.acl.bucket_replication_mode_row(&bucket).await {
             Ok(Some(existing)) if existing != replication_mode => {
@@ -943,6 +1030,15 @@ impl S3 for OssS3 {
             None => self.store.delete_bucket(&bucket).await,
         }
         .map_err(to_s3_error)?;
+        // M9 S6c：Raft 的 BucketDelete 已在 apply 级联清表；这里只做本地缓存失效，
+        // 不再直写受 guard 保护的表（否则 ABORT → 已提交删除被误报为失败）。
+        if self.bucket_control.is_some() {
+            self.store.invalidate_gate(&bucket);
+            if let Some(sink) = &self.bucket_cleanup {
+                sink.invalidate_ap_cache(&bucket);
+            }
+            return Ok(S3Response::new(DeleteBucketOutput::default()));
+        }
         // 记账清理（授权门已确认桶主/管理员）：清授权行 + 桶行 + 生命周期规则
         if let Err(e) = self.acl.forget_bucket(&bucket).await {
             // M7 H1：门控 ABORT 时物理桶已删、行/授权未动——按最终行补偿后显式失败，
@@ -2003,6 +2099,16 @@ impl S3 for OssS3 {
                     "object lock requires bucket versioning enabled"
                 ));
             }
+        }
+        // M9 S6c：Raft 一条命令写 lock+规则两列（versioning 之前已 Enabled）。
+        if let Some(sink) = &self.bucket_control {
+            return sink
+                .set_object_lock(&bucket, true, mode, days)
+                .await
+                .map(|()| S3Response::new(PutObjectLockConfigurationOutput::default()))
+                .map_err(bucket_control_error);
+        }
+        if !enabled {
             self.acl.enable_bucket_lock(&bucket).await.map_err(|e| {
                 tracing::error!(error = %e, bucket, "开桶锁失败");
                 s3s::s3_error!(InternalError, "internal error")
@@ -2298,11 +2404,13 @@ impl S3 for OssS3 {
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
         let bucket = req.input.bucket;
-        if !self
-            .store
-            .bucket_exists(&bucket)
-            .await
-            .map_err(to_s3_error)?
+        // Raft：存在性由 apply 判定（不短路本地物理读，防 follower 误 404）。
+        if self.bucket_control.is_none()
+            && !self
+                .store
+                .bucket_exists(&bucket)
+                .await
+                .map_err(to_s3_error)?
         {
             return Err(s3s::s3_error!(NoSuchBucket));
         }
@@ -2312,6 +2420,15 @@ impl S3 for OssS3 {
             tracing::error!(error = %e, "通知配置序列化失败");
             s3s::s3_error!(InternalError, "internal error")
         })?;
+        if let Some(sink) = &self.bucket_control {
+            // 空配置 = 清空（两站点/快照同口径）。
+            let cfg = if targets.is_empty() { None } else { Some(json) };
+            return sink
+                .set_notification(&bucket, cfg, now_secs())
+                .await
+                .map(|()| S3Response::new(PutBucketNotificationConfigurationOutput::default()))
+                .map_err(bucket_control_error);
+        }
         self.acl
             .set_bucket_notification(&bucket, &json)
             .await
@@ -2764,11 +2881,12 @@ impl S3 for OssS3 {
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         let bucket = req.input.bucket;
-        if !self
-            .store
-            .bucket_exists(&bucket)
-            .await
-            .map_err(to_s3_error)?
+        if self.bucket_control.is_none()
+            && !self
+                .store
+                .bucket_exists(&bucket)
+                .await
+                .map_err(to_s3_error)?
         {
             return Err(s3s::s3_error!(NoSuchBucket));
         }
@@ -2804,6 +2922,13 @@ impl S3 for OssS3 {
                 ));
             }
         };
+        if let Some(sink) = &self.bucket_control {
+            return sink
+                .set_default_encryption(&bucket, Some(algo.to_string()))
+                .await
+                .map(|()| S3Response::new(PutBucketEncryptionOutput {}))
+                .map_err(bucket_control_error);
+        }
         let updated = self
             .acl
             .set_bucket_default_encryption(&bucket, algo)
@@ -2871,13 +2996,21 @@ impl S3 for OssS3 {
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
         let bucket = req.input.bucket;
-        if !self
-            .store
-            .bucket_exists(&bucket)
-            .await
-            .map_err(to_s3_error)?
+        if self.bucket_control.is_none()
+            && !self
+                .store
+                .bucket_exists(&bucket)
+                .await
+                .map_err(to_s3_error)?
         {
             return Err(s3s::s3_error!(NoSuchBucket));
+        }
+        if let Some(sink) = &self.bucket_control {
+            return sink
+                .set_default_encryption(&bucket, None)
+                .await
+                .map(|()| S3Response::new(DeleteBucketEncryptionOutput {}))
+                .map_err(bucket_control_error);
         }
         self.acl
             .clear_bucket_default_encryption(&bucket)
@@ -2926,6 +3059,13 @@ impl S3 for OssS3 {
                 return Err(s3s::s3_error!(InvalidArgument, "invalid versioning status"));
             }
         };
+        if let Some(sink) = &self.bucket_control {
+            return sink
+                .set_versioning(&bucket, stored)
+                .await
+                .map(|()| S3Response::new(PutBucketVersioningOutput::default()))
+                .map_err(bucket_control_error);
+        }
         match self.acl.set_bucket_versioning(&bucket, stored).await {
             Ok(true) => Ok(S3Response::new(PutBucketVersioningOutput::default())),
             Ok(false) => Err(s3s::s3_error!(NoSuchBucket)),

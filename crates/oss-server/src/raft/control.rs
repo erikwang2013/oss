@@ -66,6 +66,18 @@ impl PostCommit {
                 }
                 tracing::warn!(bucket = %name, "建桶目录重试耗尽，留待启动对账");
             }
+            SideEffect::BucketDirTombstone(name) => {
+                for _ in 0..3 {
+                    match self.store.tombstone_bucket(&name).await {
+                        Ok(()) => return,
+                        Err(e) => {
+                            tracing::warn!(error = %e, bucket = %name, "桶目录 tombstone 失败（重试）")
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tracing::warn!(bucket = %name, "桶目录 tombstone 重试耗尽，留待启动清 trash");
+            }
             SideEffect::BucketDirDelete(name) => {
                 for _ in 0..3 {
                     match self.store.bucket_exists(&name).await {
@@ -119,6 +131,8 @@ enum Inner {
 pub struct ControlPlane {
     inner: Inner,
     post: PostCommit,
+    /// 属主解析与 sync 模式判定（append 前的本地读，不写库）。
+    db: Arc<Db>,
 }
 
 /// 门面错误 → HTTP 状态（S6b-d 的 handler 只做映射）：400/404/409/413/500/503。
@@ -179,8 +193,9 @@ impl ControlPlane {
     ) -> Self {
         let post = PostCommit::new(Arc::clone(&db), store, ap_cache, olap_cache, region);
         Self {
-            inner: Inner::Local(db),
+            inner: Inner::Local(db.clone()),
             post,
+            db,
         }
     }
 
@@ -192,15 +207,24 @@ impl ControlPlane {
         olap_cache: Arc<xl_s3::olap::OlapCache>,
         region: String,
     ) -> Self {
-        let post = PostCommit::new(db, store, ap_cache, olap_cache, region);
+        let post = PostCommit::new(Arc::clone(&db), store, ap_cache, olap_cache, region);
         Self {
             inner: Inner::Raft(handle),
             post,
+            db,
         }
     }
 
     pub fn is_raft(&self) -> bool {
         matches!(self.inner, Inner::Raft(_))
+    }
+
+    /// xl-s3 注入用：仅 Raft 模式返回 sink（M7/standalone 保持 `None` 直写路径）。
+    pub fn bucket_sink(
+        self: &Arc<Self>,
+    ) -> Option<Arc<dyn xl_s3::bucket_control::BucketControlSink>> {
+        self.is_raft()
+            .then(|| Arc::clone(self) as Arc<dyn xl_s3::bucket_control::BucketControlSink>)
     }
 
     /// 一次控制写：恰好一条命令、恰好一个 `ControlResponse`。
@@ -229,7 +253,37 @@ impl ControlPlane {
                     },
                     SizeError::Encode(e) => ControlError::Internal(e.to_string()),
                 })?;
-                let effects = apply::effects_for(&cmd);
+                let mut effects = apply::effects_for(&cmd);
+                // sync 桶物理删除用 tombstone（quiesce 后 rename，幂等；启动清 trash）。
+                if let ControlCommand::BucketDelete { name } = &cmd {
+                    match self.db.bucket_sync_state(name).await {
+                        Ok((mode, _, _)) if mode == "sync" => {
+                            effects = effects
+                                .into_iter()
+                                .map(|e| match e {
+                                    SideEffect::BucketDirDelete(n) => {
+                                        SideEffect::BucketDirTombstone(n)
+                                    }
+                                    other => other,
+                                })
+                                .collect();
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            // 读不到模式时用 tombstone 兜底（不物理直删 sync 目录）。
+                            tracing::warn!(error = %e, bucket = %name, "读桶模式失败，删桶副作用按 tombstone 处理");
+                            effects = effects
+                                .into_iter()
+                                .map(|e| match e {
+                                    SideEffect::BucketDirDelete(n) => {
+                                        SideEffect::BucketDirTombstone(n)
+                                    }
+                                    other => other,
+                                })
+                                .collect();
+                        }
+                    }
+                }
                 let response = match handle.write(cmd).await {
                     Ok(r) => r,
                     Err(WriteError::Timeout(d)) => {
@@ -243,5 +297,133 @@ impl ControlPlane {
                 Ok(response)
             }
         }
+    }
+}
+
+/// S6c：控制响应/门面错误 → xl-s3 sink 错误（handler 再映射 S3/console 状态码）。
+fn sink_result(
+    r: Result<ControlResponse, ControlError>,
+) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+    use xl_s3::bucket_control::BucketControlError as E;
+    match r {
+        Ok(ControlResponse::Ok) => Ok(()),
+        Ok(ControlResponse::NotFound) => Err(E::NotFound),
+        Ok(ControlResponse::Conflict | ControlResponse::BucketNotEmpty) => Err(E::Conflict),
+        Ok(ControlResponse::Invalid) => Err(E::Invalid),
+        Err(ControlError::TooLarge { .. }) => Err(E::TooLarge),
+        Err(ControlError::Timeout(m) | ControlError::Unavailable(m)) => {
+            tracing::warn!(error = %m, "control write unavailable");
+            Err(E::Unavailable)
+        }
+        Err(ControlError::Internal(m)) => {
+            tracing::error!(error = %m, "control write failed");
+            Err(E::Internal)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl xl_s3::bucket_control::BucketControlSink for ControlPlane {
+    async fn create_bucket(
+        &self,
+        spec: xl_s3::bucket_control::BucketCreateSpec,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        use xl_s3::bucket_control::BucketControlError as E;
+        // uid → username 在 append 前解析（apply 只做确定性 SQL）。
+        let owner = match spec.owner_uid {
+            None => None,
+            Some(uid) => match self.db.get_user(uid).await {
+                Ok(Some((name, false, _))) => Some(name),
+                Ok(Some((_, true, _))) => None,
+                Ok(None) => {
+                    tracing::error!(uid, "建桶属主用户不存在（不变量破坏）");
+                    return Err(E::Internal);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, uid, "解析建桶属主失败");
+                    return Err(E::Internal);
+                }
+            },
+        };
+        let cmd = ControlCommand::BucketCreate {
+            name: spec.name,
+            owner,
+            created_at: spec.created_at,
+            replication_mode: spec.replication_mode,
+            versioning: spec.versioning,
+            object_lock: spec.object_lock,
+            object_lock_default_mode: spec.object_lock_default_mode,
+            object_lock_default_days: spec.object_lock_default_days,
+            default_encryption: spec.default_encryption,
+        };
+        sink_result(self.write(cmd).await)
+    }
+
+    async fn set_versioning(
+        &self,
+        bucket: &str,
+        status: &str,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        sink_result(
+            self.write(ControlCommand::BucketSetVersioning {
+                name: bucket.to_string(),
+                versioning: status.to_string(),
+            })
+            .await,
+        )
+    }
+
+    async fn set_object_lock(
+        &self,
+        bucket: &str,
+        enabled: bool,
+        default_mode: Option<String>,
+        default_days: Option<i64>,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        sink_result(
+            self.write(ControlCommand::BucketSetObjectLock {
+                name: bucket.to_string(),
+                enabled,
+                default_mode,
+                default_days,
+            })
+            .await,
+        )
+    }
+
+    async fn set_notification(
+        &self,
+        bucket: &str,
+        config_json: Option<String>,
+        updated_at: i64,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        let cmd = match config_json {
+            Some(config_json) => ControlCommand::BucketSetNotification {
+                bucket: bucket.to_string(),
+                config_json,
+                updated_at,
+            },
+            None => ControlCommand::BucketClearNotification {
+                bucket: bucket.to_string(),
+            },
+        };
+        sink_result(self.write(cmd).await)
+    }
+
+    async fn set_default_encryption(
+        &self,
+        bucket: &str,
+        algorithm: Option<String>,
+    ) -> Result<(), xl_s3::bucket_control::BucketControlError> {
+        let cmd = match algorithm {
+            Some(algorithm) => ControlCommand::BucketSetDefaultEncryption {
+                bucket: bucket.to_string(),
+                algorithm,
+            },
+            None => ControlCommand::BucketClearDefaultEncryption {
+                bucket: bucket.to_string(),
+            },
+        };
+        sink_result(self.write(cmd).await)
     }
 }

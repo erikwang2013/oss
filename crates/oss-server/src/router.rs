@@ -52,7 +52,9 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // M9 S3：S3/lifecycle/batch/console 删除统一走远端优先服务。
     .with_sync_delete(Some(
         Arc::clone(&state.sync_delete) as Arc<dyn xl_s3::sync_delete::SyncDeleteSink>
-    ));
+    ))
+    // M9 S6c：仅 Raft 模式注入桶控制面 sink（None = M7 直写路径逐字节不变）。
+    .with_bucket_control(state.control.bucket_sink());
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
     let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);

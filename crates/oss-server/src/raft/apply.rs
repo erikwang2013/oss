@@ -39,6 +39,8 @@ pub struct Applied {
 pub enum SideEffect {
     BucketDirCreate(String),
     BucketDirDelete(String),
+    /// sync 桶删除：整目录 rename 到盘内 `.oss.sys/trash/`（幂等；启动清空）。
+    BucketDirTombstone(String),
     ApReload(String),
     ApRemove(String),
     ApInvalidateBucket(String),

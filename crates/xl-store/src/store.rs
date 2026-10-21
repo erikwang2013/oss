@@ -792,6 +792,32 @@ impl Store {
         Ok(())
     }
 
+    /// 物理删桶的幂等替代（M9 S6c sync 删桶）：各盘桶目录 rename 进
+    /// `.oss.sys/trash/bucket.<name>`，启动 `reap_transient` 清空 trash。
+    /// 源目录缺失 = 已删；trash 残留先删（重试/重复应用安全）。仅本节点各盘。
+    pub async fn tombstone_bucket(&self, bucket: &str) -> Result<()> {
+        layout::validate_bucket(bucket)?;
+        let _bguard = self.lock_bucket_owned(bucket).await;
+        for drive in &self.cfg.drives {
+            let src = layout::bucket_dir(drive, bucket);
+            if !tokio::fs::try_exists(&src).await? {
+                continue;
+            }
+            let trash_dir = layout::sys_dir(drive, "trash");
+            tokio::fs::create_dir_all(&trash_dir).await?;
+            let dst = trash_dir.join(format!("bucket.{bucket}"));
+            if tokio::fs::try_exists(&dst).await? {
+                tokio::fs::remove_dir_all(&dst).await?;
+            }
+            match tokio::fs::rename(&src, &dst).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         // 评审 R3：各盘取并集（drive0 掉线不得让列举静默变空）；创建时间取首个见到该桶的盘。
         let mut out: Vec<BucketInfo> = Vec::new();

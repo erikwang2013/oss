@@ -7,16 +7,47 @@ use std::sync::Arc;
 use xl_s3::lifecycle::{LifecycleError, LifecycleRuleSpec, LifecycleStore, validate_rules};
 
 use crate::db::{Db, LifecycleRuleRow};
+use crate::raft::command::{ControlCommand, ControlResponse, LifecycleRuleCmd};
+use crate::raft::control::ControlPlane;
 
 pub struct SqlLifecycleStore {
     db: Arc<Db>,
     /// 启动期固定的 tier id（归档类规则解析/校验用）。
     tier_ids: Arc<Vec<String>>,
+    /// M9 S6c：仅 Raft 模式路由控制写（None/Local = M7 直写）。
+    control: Option<Arc<ControlPlane>>,
 }
 
 impl SqlLifecycleStore {
     pub fn new(db: Arc<Db>, tier_ids: Arc<Vec<String>>) -> Self {
-        Self { db, tier_ids }
+        Self {
+            db,
+            tier_ids,
+            control: None,
+        }
+    }
+
+    pub fn with_control(mut self, control: Arc<ControlPlane>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn raft_control(&self) -> Option<&Arc<ControlPlane>> {
+        self.control.as_ref().filter(|c| c.is_raft())
+    }
+}
+
+/// 控制响应/写错误 → lifecycle 错误（调用方只做粗粒度映射）。
+fn control_error(
+    r: Result<ControlResponse, crate::raft::control::ControlError>,
+) -> Result<(), LifecycleError> {
+    match r {
+        Ok(ControlResponse::Ok) => Ok(()),
+        Ok(ControlResponse::NotFound) => Err(LifecycleError::NoSuchBucket),
+        Ok(_) => Err(LifecycleError::InvalidArgument(
+            "control write rejected".into(),
+        )),
+        Err(e) => Err(LifecycleError::Internal(e.to_string())),
     }
 }
 
@@ -131,6 +162,30 @@ impl LifecycleStore for SqlLifecycleStore {
                 updated_at: 0, // set_lifecycle_rules 统一填 now
             })
             .collect();
+        if let Some(control) = self.raft_control() {
+            let rules = rows
+                .iter()
+                .map(|r| LifecycleRuleCmd {
+                    rule_id: r.rule_id.clone(),
+                    prefix: r.prefix.clone(),
+                    expire_days: r.expire_days,
+                    expiration_days: r.expiration_days,
+                    transition_days: r.transition_days,
+                    transition_class: r.transition_class.clone(),
+                    transition_tier: r.transition_tier.clone(),
+                    enabled: r.enabled,
+                })
+                .collect();
+            return control_error(
+                control
+                    .write(ControlCommand::BucketSetLifecycle {
+                        bucket: bucket.to_string(),
+                        rules,
+                        updated_at: crate::db::now(),
+                    })
+                    .await,
+            );
+        }
         self.db
             .set_lifecycle_rules(bucket, &rows, crate::db::now())
             .await
@@ -145,6 +200,15 @@ impl LifecycleStore for SqlLifecycleStore {
             .map_err(|e| LifecycleError::Internal(e.to_string()))?
         {
             return Err(LifecycleError::NoSuchBucket);
+        }
+        if let Some(control) = self.raft_control() {
+            return control_error(
+                control
+                    .write(ControlCommand::BucketClearLifecycle {
+                        bucket: bucket.to_string(),
+                    })
+                    .await,
+            );
         }
         self.db
             .set_lifecycle_rules(bucket, &[], crate::db::now())
