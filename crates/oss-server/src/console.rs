@@ -3364,7 +3364,11 @@ async fn site_changelog_get(State(state): State<AppState>) -> Response {
     if let Some(r) = changelog_raft_conflict(&state) {
         return r;
     }
-    StatusCode::METHOD_NOT_ALLOWED.into_response()
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(axum::http::header::ALLOW, "POST")],
+    )
+        .into_response()
 }
 
 /// `POST /api/v1/site/changelog`（token 面；JWT except）：应用对端控制面变更批次。

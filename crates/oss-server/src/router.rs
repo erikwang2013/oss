@@ -122,7 +122,7 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
 }
 
 async fn raft_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(state.control.status_json())
+    Json(state.control.status_json(state.cfg.raft.is_some()))
 }
 
 /// s3s 0.17 的 RestoreObject 生成代码固定按 `200 OK` 序列化并丢弃 `S3Response.status`，

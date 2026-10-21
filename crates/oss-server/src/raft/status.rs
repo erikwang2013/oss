@@ -10,7 +10,9 @@ fn log_id_json(id: &openraft::LogId<u64>) -> Value {
     json!({ "term": id.leader_id.term, "index": id.index })
 }
 
-pub fn status_json(handle: &RaftHandle) -> Value {
+/// `configured` = `cfg.raft.is_some()`：未配置 `[raft]` 时能力位一律 false
+/// （与 `/api/v1/site` 同口径），避免 console 在 M7 下显示 sync 可用。
+pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
     let m = handle.raft().metrics();
     let m = m.borrow();
     let voters: Vec<u64> = m.membership_config.voter_ids().collect();
@@ -28,9 +30,9 @@ pub fn status_json(handle: &RaftHandle) -> Value {
         "voters": voters,
         "production_ready": voters.len() >= 3,
         "capabilities": {
-            "raft": RAFT_READY,
-            "sync": SYNC_READY,
-            "stretch": STRETCH_READY,
+            "raft": configured && RAFT_READY,
+            "sync": configured && SYNC_READY,
+            "stretch": configured && STRETCH_READY,
         },
     })
 }

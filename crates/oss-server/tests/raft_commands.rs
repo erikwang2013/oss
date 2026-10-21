@@ -1100,3 +1100,71 @@ async fn user_delete_cascade_matches_db_semantics() {
         0
     );
 }
+
+/// M3（S6d review）：预检后桶被删的竞态——apply 内复核桶存在，不得留下悬挂行。
+#[tokio::test]
+async fn ap_and_inventory_put_recheck_bucket_existence_in_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = common::state(dir.path()).await;
+    assert_eq!(write(&st, user_create("u")).await, ControlResponse::Ok);
+    assert_eq!(
+        write(&st, bucket_create("race", Some("u"))).await,
+        ControlResponse::Ok
+    );
+    // 模拟 handler 预检通过后、命令 apply 前桶被删。
+    assert_eq!(
+        write(
+            &st,
+            ControlCommand::BucketDelete {
+                name: "race".into()
+            }
+        )
+        .await,
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        write(
+            &st,
+            ControlCommand::AccessPointPut {
+                name: "ap-race".into(),
+                bucket: "race".into(),
+                owner: Some("u".into()),
+                policy_json: None,
+                created_at: 1,
+                updated_at: 1,
+            }
+        )
+        .await,
+        ControlResponse::Invalid
+    );
+    assert_eq!(
+        write(
+            &st,
+            ControlCommand::InventoryPut {
+                bucket: "race".into(),
+                id: "inv-race".into(),
+                owner: Some("u".into()),
+                config_json: "{}".into(),
+                updated_at: 1,
+            }
+        )
+        .await,
+        ControlResponse::Invalid
+    );
+    for (sql, label) in [
+        (
+            "SELECT COUNT(*) FROM access_points WHERE name = 'ap-race'",
+            "access_points",
+        ),
+        (
+            "SELECT COUNT(*) FROM inventory_configs WHERE bucket = 'race'",
+            "inventory_configs",
+        ),
+    ] {
+        let n: i64 = sqlx::query_scalar(sql)
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{label} 不得留下悬挂行");
+    }
+}

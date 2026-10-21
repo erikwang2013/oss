@@ -564,7 +564,8 @@ pub(crate) async fn apply_command(
             created_at,
             updated_at,
         } => {
-            if name.is_empty() || bucket.is_empty() {
+            // 预检与 apply 之间桶可能已被删：在 apply 内复核，拒绝悬挂行（M3）。
+            if name.is_empty() || bucket.is_empty() || !bucket_exists(cw, bucket).await? {
                 ControlResponse::Invalid
             } else {
                 let owner_id = admin_owner_id(cw, owner).await?;
@@ -669,7 +670,12 @@ pub(crate) async fn apply_command(
             config_json,
             updated_at,
         } => {
-            if bucket.is_empty() || id.is_empty() || config_json.is_empty() {
+            // 同 AccessPointPut：apply 内复核桶仍在，避免 dangling inventory 行。
+            if bucket.is_empty()
+                || id.is_empty()
+                || config_json.is_empty()
+                || !bucket_exists(cw, bucket).await?
+            {
                 ControlResponse::Invalid
             } else {
                 let owner_id = admin_owner_id(cw, owner).await?;

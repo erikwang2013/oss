@@ -608,3 +608,20 @@ async fn apply_lww_poison_admin_and_bucket_reconcile() {
         .unwrap();
     assert_eq!(active, 0);
 }
+
+/// M4（S6d review）：M7 下 GET changelog 仍 405，但显式声明 `Allow: POST`。
+#[tokio::test]
+async fn m7_get_changelog_is_405_with_allow_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = common::state(dir.path()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = oss_server::router::build_router(st).unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/site/changelog"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers().get(reqwest::header::ALLOW).unwrap(), "POST");
+}
