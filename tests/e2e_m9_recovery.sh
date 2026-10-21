@@ -99,6 +99,17 @@ json_get() { python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 print(d.get(sys.argv[1],""))' "$1"; }
+# CLI --json 的 stdout 前面可能有 tracing 日志；跳过前缀取第一个 JSON 对象。
+json_file_field() { # file key -> list 长度或标量
+python3 - "$1" "$2" <<'PY'
+import json, sys
+s = open(sys.argv[1], encoding="utf-8").read()
+i = s.find("{")
+d = json.loads(s[i:]) if i >= 0 else {}
+v = d.get(sys.argv[2])
+print(len(v) if isinstance(v, list) else ("" if v is None else v))
+PY
+}
 curl_code() { curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-10}" -H "authorization: Bearer $3" "$1"; }
 status_json() {
   local c p
@@ -612,7 +623,7 @@ if "$BIN" sync-reconcile --repair --config "$W/bprime/oss.toml" --json >"$W/repa
 else
   fail "bprime repair 失败"; cat "$W/repair-bp.err"
 fi
-ck [ "$(python3 -c 'import json;print(len(json.load(open("'"$W"'/repair-bp.json")).get("errors",[])))' 2>/dev/null || echo x)" = 0 ]
+ck [ "$(json_file_field "$W/repair-bp.json" errors)" = 0 ]
 ck [ "$(sites_flag "$A" "$AT")" = 1 ]
 skip "C-1：bprime.toml 的单次 repair 清除 A 侧 503 门 —— repair 只改本机站点行；A 的门只能用 A 的 DB 清（下一段执行）"
 start_serve "$W/bprime" "$B_HTTP" BP_PID "$W/bprime/server.log" || { fail "B′ 重启失败"; tail -10 "$W/bprime/server.log"; finish; }
@@ -625,8 +636,8 @@ if "$BIN" sync-reconcile --repair --config "$W/a/oss.toml" --json >"$W/repair-a.
 else
   fail "A side repair 失败"; cat "$W/repair-a.err"
 fi
-ck [ "$(python3 -c 'import json;d=json.load(open("'"$W"'/repair-a.json"));print(len(d.get("errors",[])))' 2>/dev/null || echo x)" = 0 ]
-PUSHED=$(python3 -c 'import json;print(json.load(open("'"$W"'/repair-a.json")).get("pushed",0))' 2>/dev/null || echo 0)
+ck [ "$(json_file_field "$W/repair-a.json" errors)" = 0 ]
+PUSHED=$(json_file_field "$W/repair-a.json" pushed)
 ck [ "${PUSHED:-0}" -ge 1 ]
 ck [ "$(db_value "$W/a/oss.db" "SELECT reconcile_required FROM sites WHERE remote_site_id='$B_ID'")" = 0 ]
 
