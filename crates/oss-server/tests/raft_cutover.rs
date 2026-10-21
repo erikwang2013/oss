@@ -313,6 +313,12 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
             .unwrap()
             .is_some()
     );
+    // 直接安装的行不在日志里：恢复必须留下基线快照并清日志，新 learner 才能追平。
+    let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_snapshot WHERE id = 1")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    assert_eq!(snapshots, 1, "force recovery must persist a base snapshot");
 
     // witness 重启（bootstrap=false + role=witness）必须通过身份校验：
     // voter 校验 site_id，witness 无 site_config、跳过该项。

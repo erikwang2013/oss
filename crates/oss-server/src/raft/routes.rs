@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use super::command::{ControlCommand, SizeError};
 use super::membership::{self, MembershipError, MembershipOp};
 use super::{
-    COMMAND_MAX_BYTES, RPC_BODY_LIMIT, RPC_TOKEN_HEADER, RaftHandle, TypeConfig, WriteError,
+    COMMAND_MAX_BYTES, RPC_BODY_LIMIT, RPC_TARGET_HEADER, RPC_TOKEN_HEADER, RaftHandle, TypeConfig,
+    WriteError,
 };
 
 /// follower → leader 单跳标记：带此头仍非 leader 不再转发（防环）。
@@ -99,17 +100,46 @@ fn raft_err<E: serde::Serialize>(e: E) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(e)).into_response()
 }
 
+/// Raft RPC 只应答发给本 node_id 的请求。旧成员（endpoint 相同）尚未从 membership
+/// 移除时，新进程绝不能以“异日志 follower”响应，否则 openraft 会 panic。
+fn target_matches(ext: &RaftExt, headers: &HeaderMap) -> bool {
+    headers
+        .get(RPC_TARGET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        == Some(ext.handle.node_id())
+}
+
+fn wrong_target() -> Response {
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        "raft RPC target node id mismatch",
+    )
+        .into_response()
+}
+
 async fn append(
     Extension(ext): Extension<RaftExt>,
+    headers: HeaderMap,
     Json(rpc): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Response {
+    if !target_matches(&ext, &headers) {
+        return wrong_target();
+    }
     match ext.handle.raft().append_entries(rpc).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => raft_err(e),
     }
 }
 
-async fn vote(Extension(ext): Extension<RaftExt>, Json(rpc): Json<VoteRequest<u64>>) -> Response {
+async fn vote(
+    Extension(ext): Extension<RaftExt>,
+    headers: HeaderMap,
+    Json(rpc): Json<VoteRequest<u64>>,
+) -> Response {
+    if !target_matches(&ext, &headers) {
+        return wrong_target();
+    }
     match ext.handle.raft().vote(rpc).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => raft_err(e),
@@ -118,8 +148,12 @@ async fn vote(Extension(ext): Extension<RaftExt>, Json(rpc): Json<VoteRequest<u6
 
 async fn snapshot(
     Extension(ext): Extension<RaftExt>,
+    headers: HeaderMap,
     Json(rpc): Json<InstallSnapshotRequest<TypeConfig>>,
 ) -> Response {
+    if !target_matches(&ext, &headers) {
+        return wrong_target();
+    }
     match ext.handle.raft().install_snapshot(rpc).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => raft_err::<RaftError<u64, InstallSnapshotError>>(e),

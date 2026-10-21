@@ -22,7 +22,7 @@ use openraft::raft::{
 };
 use serde::Serialize;
 
-use super::{RPC_TOKEN_HEADER, TypeConfig};
+use super::{RPC_TARGET_HEADER, RPC_TOKEN_HEADER, TypeConfig};
 
 const APPEND_PATH: &str = "/api/v1/site/raft/append";
 const VOTE_PATH: &str = "/api/v1/site/raft/vote";
@@ -91,6 +91,7 @@ impl HttpNetwork {
         self.client
             .post(format!("{}{}", self.endpoint, path))
             .header(RPC_TOKEN_HEADER, self.token.as_str())
+            .header(RPC_TARGET_HEADER, self.target.to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(ttl)
             .body(body)

@@ -122,6 +122,59 @@ pub async fn force_recover(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
+    // 直接安装的业务行不在 Raft 日志里；先把当前状态固化为快照并清掉日志，后续
+    // learner 才会从快照取得基线。否则它只回放 initialize 之后的命令，缺恢复行。
+    let applied = {
+        let m = handle.raft().metrics();
+        let m = m.borrow();
+        m.last_applied
+    };
+    if let Some(applied) = applied {
+        handle
+            .raft()
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| format!("build recovery snapshot: {e}"))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let done = {
+                let m = handle.raft().metrics();
+                let m = m.borrow();
+                m.snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.index >= applied.index)
+            };
+            if done {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("recovery snapshot did not complete".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        handle
+            .raft()
+            .trigger()
+            .purge_log(applied.index)
+            .await
+            .map_err(|e| format!("purge recovered log: {e}"))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let done = {
+                let m = handle.raft().metrics();
+                let m = m.borrow();
+                m.purged.as_ref().is_some_and(|p| p.index >= applied.index)
+            };
+            if done {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("recovery log purge did not complete".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
     handle.shutdown().await;
     db.schema_meta_set("raft_node_id", &new_node_id.to_string())
         .await

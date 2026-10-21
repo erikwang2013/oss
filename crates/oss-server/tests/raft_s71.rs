@@ -6,11 +6,13 @@ use std::path::Path;
 
 use common::raft_harness::{self, settings};
 use openraft::Vote;
-use openraft::raft::InstallSnapshotRequest;
+use openraft::raft::{InstallSnapshotRequest, VoteRequest};
 use openraft::storage::RaftStateMachine;
 use oss_server::db::Db;
 use oss_server::raft::membership;
-use oss_server::raft::{ControlCommand, ControlResponse, RPC_TOKEN_HEADER, TypeConfig};
+use oss_server::raft::{
+    ControlCommand, ControlResponse, RPC_TARGET_HEADER, RPC_TOKEN_HEADER, TypeConfig,
+};
 use oss_server::state::AppState;
 
 fn raft_db(dir: &Path) -> String {
@@ -221,6 +223,22 @@ async fn raft_routes_auth_and_body_limits() {
         .unwrap();
     assert_eq!(resp.status(), 413, "append 上限 32 MiB");
 
+    // 同一 endpoint 上的新 node_id 不能误答旧成员的 RPC（否则 openraft 会 panic）。
+    let vote = format!("{}/api/v1/site/raft/vote", node.base);
+    let req = VoteRequest::<u64> {
+        vote: Vote::new_committed(1, 1),
+        last_log_id: None,
+    };
+    let resp = http
+        .post(&vote)
+        .header(RPC_TOKEN_HEADER, &node.token)
+        .header(RPC_TARGET_HEADER, "999")
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 421, "wrong target node id must be rejected");
+
     node.shutdown().await;
 }
 
@@ -391,6 +409,7 @@ async fn snapshot_build_upload_and_install_over_http() {
         let resp = http
             .post(&url)
             .header(RPC_TOKEN_HEADER, &b.token)
+            .header(RPC_TARGET_HEADER, "2")
             .json(&req)
             .send()
             .await

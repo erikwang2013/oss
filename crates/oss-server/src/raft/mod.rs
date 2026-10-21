@@ -49,6 +49,9 @@ pub const STRETCH_READY: bool = true;
 
 /// Raft RPC 集群令牌头（`/api/v1/site/raft/*`；常量时间校验见 [`network::token_matches`]）。
 pub const RPC_TOKEN_HEADER: &str = "x-oss-raft-token";
+/// 目标节点 id：防止同一 endpoint 上换了 node_id 的新进程误答旧成员的 Raft RPC
+/// （openraft 会把异日志响应当成 follower log reversion 并 panic）。
+pub const RPC_TARGET_HEADER: &str = "x-oss-raft-target-node-id";
 /// append/vote/snapshot 路由体上限：4 MiB 原始分块的 serde JSON 约 16 MiB。
 pub const RPC_BODY_LIMIT: usize = 32 * 1024 * 1024;
 /// 单条控制命令上限（16 MiB 模块 base64 后约 21.4 MiB）。
