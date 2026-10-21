@@ -1,7 +1,7 @@
 import { Button, Card, Col, Flex, Row, Statistic, Table, Tag, Typography } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
-import { api, type ClusterStatus } from '../api'
+import { api, type ClusterStatus, type RaftStatus } from '../api'
 import PageHeader from '../PageHeader'
 import Mascot from '../Mascot'
 
@@ -13,6 +13,11 @@ export default function Cluster() {
     refetchInterval: 15000, // 面板自刷新：探测成本 = 每 peer 一次 800ms 上限的 health RPC
   })
 
+  const { data: raft } = useQuery({
+    queryKey: ['raft-status'],
+    queryFn: () => api<RaftStatus>('/api/v1/raft/status'),
+    refetchInterval: 15000,
+  })
   const isCluster = data?.mode === 'cluster'
   // 无数据 ≠ 单机：403（非管理员直访）/加载中都不能断言部署形态
   const subtitle = isCluster
@@ -52,6 +57,41 @@ export default function Cluster() {
           </Card>
         </Col>
       </Row>
+
+      {raft?.enabled && (
+        <Card title="Raft 控制面（数据站点 + witness）" style={{ marginTop: 16 }}>
+          <Row gutter={[16, 16]}>
+            <Col xs={12} sm={6}>
+              <Statistic title="角色" value={raft.role ?? '—'} />
+            </Col>
+            <Col xs={12} sm={6}>
+              <Statistic title="leader" value={raft.leader ?? '—'} />
+            </Col>
+            <Col xs={12} sm={6}>
+              <Statistic title="term / applied" value={`${raft.term ?? '—'} / ${raft.applied ?? '—'}`} />
+            </Col>
+            <Col xs={12} sm={6}>
+              <Statistic
+                title="voters / production"
+                value={`${raft.voters?.length ?? 0} / ${raft.production_ready ? 'ready' : 'single'}`}
+              />
+            </Col>
+          </Row>
+          <Flex gap={8} wrap style={{ marginTop: 12 }}>
+            <Tag color="blue">voters: {(raft.voters ?? []).join(', ') || '—'}</Tag>
+            <Tag>learners: {(raft.learners ?? []).join(', ') || '—'}</Tag>
+            <Tag color={raft.capabilities?.sync ? 'green' : 'default'}>
+              sync {raft.capabilities?.sync ? 'on' : 'off'}
+            </Tag>
+            <Tag color={raft.capabilities?.stretch ? 'green' : 'default'}>
+              stretch {raft.capabilities?.stretch ? 'on' : 'off'}
+            </Tag>
+          </Flex>
+          <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+            witness 只存控制面 11 表、不存对象；production_ready 需 ≥3 voters。
+          </Typography.Text>
+        </Card>
+      )}
 
       <Card title="节点" style={{ marginTop: 16 }} styles={{ body: { padding: 0 } }}>
         <Table

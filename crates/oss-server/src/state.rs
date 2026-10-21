@@ -614,6 +614,11 @@ impl AppState {
         // 或删桶副作用失败留下的 row/dir 不一致在此修复；只读行、不追加日志。
         if raft.is_some() {
             match db.list_bucket_rows().await {
+                // 未配对/空控制面（stretch 数据面 e2e、首启前）：本地无行不隔离盘上目录，
+                // 否则会把对端站点拥有的桶目录当孤儿搬走。配对后（有行）才做完整对账。
+                Ok(rows) if rows.is_empty() => {
+                    tracing::info!("Raft 启动对账跳过：本地无桶行（未配对或空站点）")
+                }
                 Ok(rows) => store.reconcile_bucket_dirs(&rows).await,
                 Err(e) => tracing::warn!(error = %e, "Raft 启动对账：列举桶行失败（跳过本轮）"),
             }

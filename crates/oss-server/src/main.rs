@@ -5,7 +5,7 @@
 use oss_server::cli;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> std::process::ExitCode {
     // 先初始化日志：App::run() 里也有一次 init（has_been_set 守卫，不会重复），
     // 但启动自举（管理员引导/建桶）发生在 run() 之前，不提前 init 这些日志会被静默丢弃。
     ecat_logging::init();
@@ -38,14 +38,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let code = if cli::needs_full_state(&cmd) {
-        let state = oss_server::state::AppState::load(&cfg_path).await?;
-        cli::run(cmd, state).await?
+    let code = match if cli::needs_full_state(&cmd) {
+        let state = match oss_server::state::AppState::load(&cfg_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        cli::run(cmd, state).await
     } else {
-        cli::run_offline(cmd, &cfg_path).await?
+        cli::run_offline(cmd, &cfg_path).await
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            // Display 而非 Debug：配置错误里的引号不再被转义（运维/负例脚本可直读）。
+            eprintln!("Error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     if code != 0 {
-        std::process::exit(code);
+        std::process::ExitCode::from(code.clamp(1, 255) as u8)
+    } else {
+        std::process::ExitCode::SUCCESS
     }
-    Ok(())
 }

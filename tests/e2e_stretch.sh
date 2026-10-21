@@ -112,6 +112,7 @@ role = "voter"
 bootstrap = $boot
 advertise_endpoint = "http://127.0.0.1:$http"
 cluster_token = "$raft_token"
+db_path = "$dir/raft.db"
 EOF
 }
 

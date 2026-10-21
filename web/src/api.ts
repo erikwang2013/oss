@@ -123,6 +123,17 @@ export interface BucketInfo {
 /** M9：控制面能力位（S0 全 false；S3/S6 翻转） */
 export interface RaftStatus {
   enabled: boolean
+  node_id?: number
+  role?: string
+  leader?: number | null
+  term?: number
+  state?: string
+  applied?: number
+  voters?: number[]
+  learners?: number[]
+  production_ready?: boolean
+  snapshot?: number | null
+  purged?: number | null
   capabilities?: { raft: boolean; sync: boolean; stretch: boolean }
 }
 
