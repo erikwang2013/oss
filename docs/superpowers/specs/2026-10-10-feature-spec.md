@@ -499,11 +499,27 @@ SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥
 > 删除不跨界、非空桶删除不生效、版本 UUID 两端不同、锁/标签/SSE 不复制、明文 http、同主密钥
 > 约束等）见设计文档 §7.3 与 M7 落地状态。
 
-**同步（M9，按桶 opt-in）**：`replication_mode: sync`。提交 = 本地 EC quorum + 远端站点 meta 确认；支持 **stretch EC**（分片与校验块跨站点分布，单站点不足以独立读出）。
+**同步（M9，按桶 opt-in）**：`replication_mode: sync`。提交 = 本地 staging/tee + 写 intent →
+远端 token PUT 确认**同一 origin version id** → 本地 meta 提交。删除 remote-first；
+`DeleteObjects` 远端不可达/超时/5xx 时整体 503（已成功的键已经提交），确定性 4xx 保留为
+逐键 Errors；无 versionId 的 marker 为 at-least-once（对象不可见幂等，版本列表可能多
+marker）。**sync 与 stretch 互斥**：
+`[stretch]` 集群拒绝 sync 桶，stretch 也不能与既有 sync 桶混用。
 
 **CAP 选择必须显式**：sync 桶在远端不可达时**写返回 503**。**不做自动降级** —— 降级了「强一致」这个词就没有意义。此约束必须出现在桶创建界面。
 
-**同步控制面（M9）**：IAM / 桶 / 策略 / 访问点用 `openraft` 跨站点强一致（状态小、变更低频，Raft over WAN 成立）。
+**同步控制面（M9）**：IAM / 桶 / 策略 / 访问点用 `openraft` 跨站点强一致（状态小、变更低频，Raft over WAN 成立）。生产形态 3 voters：A/B 两个数据站点 + C 控制面 witness，quorum 2；C 不存对象、不在 `sites` 表。
+
+> **实现注记（2026-10-21，S0–S4 + S5 基座；S6/S7 未接线）**：模式/配置守卫、sync 写门
+> （同 origin version id、tee 0600/TTL、写 intent compensate-only）、remote-first 删除
+> （内部 token 路由、删桶 quiesce、删除 intent）与 stretch 2×6 数据面已落地并有测试；
+> `raft` 基座（openraft 0.9.25 日志/状态机/快照/网络）仅有库与单测，未接 server/路由。
+> `RAFT_READY`/`SYNC_READY`/`STRETCH_READY` 当前全 false：sync 建桶被拒、`[raft]` 下
+> 控制台建桶 503，e2e_m9 对相关段 SKIP。Raft 控制路由、3-voter 成员/配对、witness 独立
+> 运行时与 `raft-add-witness`/`raft-export`/`raft-force-recover`/`sync-reconcile [--repair]`
+> 均为**计划项**。stretch 限制：2×6、EC 8+4、`Q_s=9`、单站点不可读写、不支持站点容灾、
+> WAN 吞吐受限、inline=0、禁用 M7 异步站点复制、拒绝 sync 桶、仅全新空库、`self_addr` 为
+> 独立 mesh gRPC 端口。
 
 ---
 
