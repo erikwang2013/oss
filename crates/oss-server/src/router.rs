@@ -63,7 +63,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);
     s3_builder.set_auth(
         SigV4Auth::with_mesh(state.db.pool().clone(), state.control_mesh())
-            .with_vault(state.vault.clone()), // M5 切片 6：SK 解密/透明重写
+            .with_vault(state.vault.clone()) // M5 切片 6：SK 解密/透明重写
+            .with_raft_mode(state.control.is_raft()), // M9 S6b H2：Raft 下禁止 apply 外重封
     );
     s3_builder.set_access(acl.clone());
     // M8 S1（N2）：AP 与 STS 共用一个 route 槽：先 AP，未命中委托 STS。
