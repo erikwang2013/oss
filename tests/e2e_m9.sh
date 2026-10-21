@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # M9 强一致端到端（3 进程：数据站点 A/B + 只承载控制面的 witness C）。
-# 覆盖：① 3-voter 控制面并发写收敛（users/access_keys/permissions/buckets/bucket_policies
-#          5 表三端字段级相等；其余 6 张复制表见 norm_check 下的 TODO(S9) cutover 清单）、
+# 覆盖：① 3-voter 控制面并发写收敛（plan §2.2 全部 11 张复制表三端字段级相等：
+#          users/access_keys/permissions/buckets/bucket_policies + lifecycle_rules/
+#          event_configs/replication_rules/access_points/olap_configs/inventory_configs）、
 #          单站点故障后仍可写、C 重启真追平；
 #      ② sync 桶 remote-first PUT/MPU/Copy/删除 + SIGSTOP 断连 503 且本地 404/未删
 #          （console 对象删 503、桶删 409 非空、内部 token 403 同段覆盖）；
@@ -124,6 +125,15 @@ write_timeout_ms = 3000
 [sync]
 timeout_ms = 5000
 max_object_bytes = 67108864
+
+# M9：replication_rules 的写入口（S3 PutBucketReplication）要求 Destination 引用
+# 一个已配置的 remote id；本测试只用该 id 过校验，不触发任何对象复制。
+[[remotes]]
+id = "m9r"
+endpoint = "http://127.0.0.1:$2"
+access_key = "m9remote-ak"
+secret_key = "m9remote-sk"
+region = "us-east-1"
 EOF
   if [ "$MODE" = stretch ]; then
     local nname peer self_addr peer_addr
@@ -233,38 +243,12 @@ print(str(d.get("enabled",False)).lower())'; }
 poll_login() { local t; for _ in $(seq 1 60); do t=$(login "$1" "$2" "$3"); [ -n "$t" ] && { printf '%s' "$t"; return 0; }; sleep 1; done; return 1; }
 poll_members() { for _ in $(seq 1 60); do [ "$(members_len "$1")" = "$2" ] && return 0; sleep 1; done; return 1; }
 
-# 三端（A/B 的 oss.db + witness 的 control.db）业务字段逐字段比较（代理键归一化）。
-# 只比较本脚本创建的 m9* 实体：bootstrap 管理员 m9admin 是各站点本地种子、witness 无此行，
-# 排除；m9owner 等命令写入的行必须在三端一致。
-# 11 张复制表（plan §2.2）覆盖：本段已比 users/access_keys/permissions/buckets/bucket_policies
-# 共 5 张（非管理员 AK、permissions 三列、owner 按 username）；剩余 6 张——lifecycle_rules、
-# event_configs、replication_rules、access_points、olap_configs、inventory_configs——留待
-# TODO(S9) cutover 段按自然键归一化比较（plan §7 验收①）。
+# 三端（A/B 的 oss.db + witness 的 control.db）11 张复制表业务字段逐字段比较。
+# 归一化/排除规则见 tests/m9_norm.py 头注释：外键按 username、管理员属主归一为
+# 'admin'、bootstrap m9admin 与其 AK/会话为站点本地行排除、buckets.set_id 为本地
+# 物理 set 排除；时间戳由 raft 命令携带（apply 不取本地时钟）故全部比较。
 norm_check() { # db_a db_b db_c users_csv buckets_csv
-python3 - "$@" <<'PY'
-import json, sqlite3, sys
-def dump(p):
-    c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-    u = {r[0]: list(r[1:]) for r in c.execute("SELECT username,is_admin,status FROM users WHERE username LIKE 'm9%' AND username <> 'm9admin'")}
-    k = {r[0]: list(r[1:]) for r in c.execute("SELECT a.access_key,u.username,a.status FROM access_keys a JOIN users u ON u.id=a.user_id WHERE u.username LIKE 'm9%' AND u.username <> 'm9admin' AND a.kind='long-term'")}
-    m = {f"{r[0]}|{r[1]}": list(r[2:]) for r in c.execute("SELECT u.username,p.bucket,p.can_read,p.can_write,p.can_delete FROM permissions p JOIN users u ON u.id=p.user_id WHERE u.username LIKE 'm9%' AND u.username <> 'm9admin'")}
-    b = {r[0]: list(r[1:]) for r in c.execute("SELECT b.name,u.username,b.versioning,b.replication_mode,b.deleting,b.creation_date FROM buckets b LEFT JOIN users u ON u.id=b.owner_id WHERE b.name LIKE 'm9b-%'")}
-    q = {r[0]: r[1] for r in c.execute("SELECT bucket,policy_json FROM bucket_policies WHERE bucket LIKE 'm9b-%'")}
-    return {"users": u, "access_keys": k, "permissions": m, "buckets": b, "policies": q}
-try:
-    a, b, c = (dump(x) for x in sys.argv[1:4])
-except sqlite3.Error as e:
-    print("db error:", e); sys.exit(2)
-if a != b or a != c:
-    print(json.dumps({"a": a, "b": b, "c": c}, ensure_ascii=False, sort_keys=True)); sys.exit(1)
-need = sys.argv[4].split(",") + sys.argv[5].split(",")
-miss = [k for k in need if k and k not in a["users"] and k not in a["buckets"]]
-if miss:
-    print("missing:", miss); sys.exit(3)
-if not a["access_keys"] or not a["permissions"]:
-    print("missing: access_keys/permissions rows"); sys.exit(3)
-print("ok")
-PY
+  python3 tests/m9_norm.py "$@"
 }
 poll_norm() { retry 90 norm_check "$W/a/oss.db" "$W/b/oss.db" "$W/c/control.db" "$1" "$2"; }
 
@@ -371,7 +355,7 @@ STAMP=$(date +%s)
 if [ "$CAP_RAFT" != true ]; then
   skip "步骤 2：3-voter 控制面并发写——capabilities.raft=false"
 else
-  echo "== 2. 配对 A/B + 加 witness C + 并发控制写（用户/桶/策略）三端字段级一致 =="
+  echo "== 2. 配对 A/B + 加 witness C + 并发控制写（11 张复制表）三端字段级一致 =="
   A_ID=$(curl -s --max-time 5 "$A/api/v1/site" -H "authorization: Bearer $AT" | json_get id)
   A_ST=$(curl -s --max-time 5 "$A/api/v1/site" -H "authorization: Bearer $AT" | json_get site_token)
   B_ID=$(curl -s --max-time 5 "$B/api/v1/site" -H "authorization: Bearer $BT" | json_get id)
@@ -430,10 +414,32 @@ print(next((str(u.get("id")) for u in d if u.get("username")==sys.argv[1]),""))'
   ck [ -n "$O_AK" ]
   put_code "$A/api/v1/users/$OWNER_ID/permissions" "$AT" "[{\"bucket\":\"$BK_A\",\"read\":true,\"write\":false,\"delete\":true}]" "$W/perm"
   ck [ "$(cat "$W/perm")" = 204 ]
+  # 六张此前未覆盖的复制表各写 1 行（全部经 raft apply）。路由/载荷：
+  # lifecycle/notifications → console.rs；access-points/transform → access_points_api.rs；
+  # inventory → inventory_api.rs（目标桶须存在且 owner/admin 有 PutObject——$BK_A 满足）；
+  # replication → S3 PutBucketReplication（要求版本控制 Enabled + [[remotes]] id=m9r）。
+  AP="m9ap-$STAMP"
+  ck_q aws_a s3api put-bucket-versioning --bucket "$BK_A" --versioning-configuration Status=Enabled
+  put_code "$A/api/v1/buckets/$BK_A/lifecycle" "$AT" "[{\"rule_id\":\"m9lc-$STAMP\",\"prefix\":\"m9/\",\"expiration_days\":30,\"enabled\":true}]" "$W/lc"
+  ck [ "$(cat "$W/lc")" = 204 ]
+  put_code "$A/api/v1/buckets/$BK_A/notifications" "$AT" "{\"queue_configurations\":[{\"id\":\"m9evt\",\"queue_arn\":\"arn:oss:sqs::m9target-$STAMP:kafka\",\"events\":[\"s3:ObjectCreated:Put\"]}]}" "$W/ev"
+  ck [ "$(cat "$W/ev")" = 204 ]
+  post_code "$A/api/v1/access-points" "$AT" "{\"name\":\"$AP\",\"bucket\":\"$BK_A\"}" "$W/ap"
+  ck [ "$(cat "$W/ap")" = 201 ]
+  put_code "$A/api/v1/access-points/$AP/transform" "$AT" '{"kind":"http","endpoint":"http://m9-olap.invalid/m9"}' "$W/olap"
+  ck [ "$(cat "$W/olap")" = 204 ]
+  put_code "$A/api/v1/buckets/$BK_A/inventory" "$AT" "{\"id\":\"m9inv-$STAMP\",\"frequency\":\"Daily\",\"destination_bucket\":\"$BK_A\"}" "$W/inv"
+  ck [ "$(cat "$W/inv")" = 204 ]
+  cat > "$W/repl.json" <<JSON
+{"Role":"arn:aws:iam::000000000000:role/m9","Rules":[{"ID":"m9rep-$STAMP","Status":"Enabled","Filter":{"Prefix":"m9/"},"Destination":{"Bucket":"m9r/m9dest-$STAMP"},"DeleteMarkerReplication":{"Status":"Disabled"}}]}
+JSON
+  ck_q aws_a s3api put-bucket-replication --bucket "$BK_A" --replication-configuration "file://$W/repl.json"
   if poll_norm "$UN_A,$UN_B,$OWNER" "$BK_A,$BK_B" >/dev/null; then
-    pass "A/B/C 三端用户/桶/策略字段级相等"
+    pass "A/B/C 三端 11 张复制表字段级相等"
   else
-    fail "三端字段级 diff 非空"; poll_norm "$UN_A,$UN_B,$OWNER" "$BK_A,$BK_B"
+    # 已等过 90s：直接单次比对打印一次 A/B/C diff（再 poll 会重复 90 份 JSON）。
+    fail "三端字段级 diff 非空"
+    norm_check "$W/a/oss.db" "$W/b/oss.db" "$W/c/control.db" "$UN_A,$UN_B,$OWNER" "$BK_A,$BK_B"
   fi
 fi
 
