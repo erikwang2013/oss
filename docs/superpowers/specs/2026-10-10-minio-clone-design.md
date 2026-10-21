@@ -350,27 +350,29 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | 层 | 机制 | 阶段 |
 |---|---|---|
 | 对象数据（默认） | 异步双向复制，对齐 MinIO site replication 语义。版本不可变 → 实际是追加式传播；桶删除等命名空间变更按站点优先级裁决 | M7 |
-| 对象数据（opt-in sync） | `replication_mode: sync` 桶：staging/tee + 写 intent 后，远端 token PUT 确认**同一 origin version id**，再本地 meta 提交；远端不可达 503，不降级。**sync 与 stretch 互斥**，同一集群不可同时启用 | M9 S1–S3（代码就绪，能力门控） |
-| 对象数据（opt-in stretch） | `[stretch]` 2×6：EC 8+4 分片跨两站点；单站点 6 槽 < `Q_s=9`，读写都必须双站点齐全；**不承诺站点容灾** | M9 S4（数据面代码就绪，能力门控） |
-| 控制面（IAM/桶/策略/AP） | `openraft` 跨站点强一致；生产形态 3 voters（A/B 数据站点 + C 控制面 witness），quorum 2 | M9 S5 基座库；S6/S7 未接线 |
+| 对象数据（opt-in sync） | `replication_mode: sync` 桶：staging/tee + 写 intent 后，远端 token PUT 确认**同一 origin version id**，再本地 meta 提交；远端不可达 503，不降级。**sync 与 stretch 互斥**，同一集群不可同时启用 | M9 S1–S3（`SYNC_READY=true`） |
+| 对象数据（opt-in stretch） | `[stretch]` 2×6：EC 8+4 分片跨两站点；单站点 6 槽 < `Q_s=9`，读写都必须双站点齐全；**不承诺站点容灾** | M9 S4（`STRETCH_READY=true`，e2e ALL PASS） |
+| 控制面（IAM/桶/策略/AP） | `openraft` 跨站点强一致；生产形态 3 voters（A/B 数据站点 + C 控制面 witness），quorum 2 | M9 S6–S7（已接线：控制写/成员/配对/witness/快照/cutover） |
 
 **CAP 选择必须显式**：sync 桶在远端站点不可达时**写返回 503**。不做「自动降级为 async」——那会让「强一致」这个承诺失去意义。写延迟下限 = 跨站点 RTT，因此 sync 只适合合规桶与小对象。此约束必须出现在桶创建界面的文案里。
 
-**落地状态（2026-10-21，S0–S4 + S5 基座；S6/S7 未接线）**：S0 模式矩阵/配置校验/
-能力开关、S1–S3 sync 数据面（统一 origin version id、staging 明文 tee 0600、写 intent
-compensate-only、remote-first 删除、内部 token 路由、删桶 quiesce、删除 intent 恢复）与
-S4 stretch 2×6 数据面已落地并有单测/集成测试（S4 另有真进程 e2e）。S5 只有 `raft`
-模块（openraft 0.9.25 的 SQLite 日志/状态机/快照/HTTP 网络）与单测，**没有** server
-接线、控制命令 apply 或 `/api/v1/site/raft/*` 路由。
-`RAFT_READY`/`SYNC_READY`/`STRETCH_READY` 当前全 false：
-`/api/v1/raft/status` 报 `enabled=false` 且三项 capability 全 false；S3 建 sync 桶 400，
-`[raft]` 下控制台建桶 503。Raft 控制路由、3-voter 成员/双边配对、witness 独立运行时与
-`raft-add-witness`/`raft-export`/`raft-force-recover`/`sync-reconcile [--repair]` 均为
-**计划项**。规格收窄：sync 与 stretch 互斥；sync 桶要求 `[site]`+`[raft]`+恰好 1 个数据
-peer，单对象默认 ≤64 MiB、远端超时 10s；stretch 要求 2 数据站点 ×6 盘、EC 8+4、
+**落地状态（2026-10-22，S0–S7 已落地；S8/S9 为故障验收与证据归档）**：S0 模式矩阵/
+配置校验/能力开关；S1–S3 sync 数据面（统一 origin version id、staging 明文 tee 0600、
+写 intent compensate-only、remote-first 删除、内部 token 路由、删桶 quiesce、删除 intent
+恢复）；S4 stretch 2×6 数据面；S5 openraft 0.9.25 SQLite 日志/状态机/快照/HTTP 网络；
+S6 控制写路由（11 张控制表单命令提交、确定性 payload、apply 后缓存/目录副作用、
+`/site/changelog` 409、启动模式断言）；S7 3-voter 成员/leader 单跳转发、双边配对与 B′
+替换、witness 独立运行时、11 表逻辑快照/安装、M7→Raft `raft-cutover`/`raft-export`/
+`raft-force-recover`、`sync-reconcile [--repair]`。`RAFT_READY`/`SYNC_READY`/
+`STRETCH_READY` 均为 true；`/api/v1/raft/status` 报真实 role/term/applied/voters 与
+`production_ready`（voters≥3）。
+验收证据（本机 HEAD `95df75c`）：`M9_STRICT=1 tests/e2e_m9.sh` 71 PASS/0 FAIL/1 预期 SKIP；
+`tests/e2e_stretch.sh` ALL PASS；`tests/e2e_sites.sh` M7 PASS；七闸全绿。
+规格收窄不变：sync 与 stretch 互斥；sync 桶要求 `[site]`+`[raft]`+恰好 1 个数据 peer，
+单对象默认 ≤64 MiB、远端超时 10s；stretch 要求 2 数据站点 ×6 盘、EC 8+4、
 `inline_threshold=0`，`self_addr` 是独立 mesh gRPC 端口，禁用 M7 异步站点复制、拒绝 sync
-桶且只允许全新空库。因此 M9 验收 1/2/4 待 S6/S7 接线；验收 3 的数据面可直接由
-`tests/e2e_stretch.sh` 验证。
+桶且只允许全新空库。残余：B′/cutover/repair 的专用多进程 e2e、11 表全量并发 diff、
+stretch+Raft 配对组合证据留 S9。
 
 ### 7.4 存储分层（M8）
 
@@ -630,15 +632,20 @@ Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单 · 本地
 
 **范围**：控制面 `openraft` 跨站点 · `replication_mode: sync` 桶 · stretch EC · 站点故障语义
 
-**落地状态（2026-10-21，S0–S4 + S5 基座；S6/S7 未接线）**：
-- 已落地数据面：S0 配置/模式守卫与能力开关；S1–S3 sync 写门（统一 origin version id、
-  staging 明文 tee 0600、写 intent compensate-only、MPU/Copy 边界）、remote-first 删除
-  （内部 token 路由、删桶 quiesce、删除 intent 周期恢复）；S4 stretch 2×6 数据面。
-- 已落地基座：S5 的 `raft` 库（openraft 0.9.25 日志/状态机/快照/HTTP 网络）+ 单测；
-  未接入 AppState/router，未启动 `raft::spawn`，控制命令也未 apply 到业务表。
-- 未交付（S6/S7/S9 计划）：Raft 控制写路由、3-voter 成员/双边配对、witness 独立运行时与
-  `witness` 子命令、`raft-add-witness`/`raft-export`/`raft-force-recover`、
-  `sync-reconcile [--repair]`。当前三能力开关全 false，e2e_m9 对未接线段 SKIP。
+**落地状态（2026-10-22，S0–S7 已落地；S8/S9 剩余）**：
+- 数据面：S0 配置/模式守卫与能力开关；S1–S3 sync 写门（统一 origin version id、staging
+  明文 tee 0600、写 intent compensate-only、MPU/Copy 边界）、remote-first 删除（内部 token
+  路由、删桶 quiesce、删除 intent 周期恢复）；S4 stretch 2×6 数据面。
+- 控制面：S5 openraft 0.9.25 日志/状态机/快照/HTTP 网络；S6 控制写路由（11 张控制表经
+  `ControlPlane` 单命令提交、apply 后缓存/目录副作用、启动模式断言）；S7 3-voter
+  成员/leader 单跳转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、
+  M7→Raft cutover/export/force-recover、`sync-reconcile [--repair]`。
+- 能力开关：`RAFT_READY`/`SYNC_READY`/`STRETCH_READY=true`；`production_ready` 需 ≥3 voters。
+- 验收证据：`M9_STRICT=1 tests/e2e_m9.sh` 71 PASS/0 FAIL/1 预期 SKIP；`tests/e2e_stretch.sh`
+  ALL PASS；`tests/e2e_sites.sh` M7 PASS；七闸全绿（fmt/clippy/lib 461/integration 348/
+  xl-* 446/web 18/build）。
+- 残余（S8/S9）：B′/cutover/repair 专用多进程 e2e、11 表全量并发 diff、stretch+Raft
+  配对组合证据；TLS 仍未接线。
 - 规格收窄（③ 2×6）：stretch 不是「sync 支持跨站 EC」；两者互斥。stretch 固定 2 数据
   站点 ×6 盘、EC 8+4、placement v2、inline=0，`Q_s=9`，单站点 6 槽不足，**不承诺站点
   容灾**；禁用 M7 异步站点复制、拒绝 sync 桶、仅允许全新空库。sync 桶要求

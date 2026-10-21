@@ -16,7 +16,9 @@ S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分�
 quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）+ M3（分布式切片：
 节点间 gRPC mesh、静态槽位拓扑、跨节点 quorum 读写、节点故障容忍与读修复、quorum 租约锁、
 混沌 e2e）+ M4（运维与 IAM：版本控制、生命周期、桶策略、审计、heal/scrub、rebalance、
-多 set）+ M5（安全与锁定：SSE 三模式、对象锁、STS 临时凭据、SK 加密存）**——`aws-cli`/`rclone`
+多 set）+ M5（安全与锁定：SSE 三模式、对象锁、STS 临时凭据、SK 加密存）+ M6（事件/复制/分层
+与恢复）+ M7（多站点异步复制）+ M8（访问点、Object Lambda、Batch、Inventory、控制台）+ M9
+（同步强一致：sync 桶、stretch 2×6、3-voter Raft 控制面）**——`aws-cli`/`rclone`
 的大文件默认路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：

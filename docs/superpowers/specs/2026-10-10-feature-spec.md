@@ -510,16 +510,17 @@ marker）。**sync 与 stretch 互斥**：
 
 **同步控制面（M9）**：IAM / 桶 / 策略 / 访问点用 `openraft` 跨站点强一致（状态小、变更低频，Raft over WAN 成立）。生产形态 3 voters：A/B 两个数据站点 + C 控制面 witness，quorum 2；C 不存对象、不在 `sites` 表。
 
-> **实现注记（2026-10-21，S0–S4 + S5 基座；S6/S7 未接线）**：模式/配置守卫、sync 写门
+> **实现注记（2026-10-22，S0–S7 已落地；S8/S9 剩余）**：模式/配置守卫、sync 写门
 > （同 origin version id、tee 0600/TTL、写 intent compensate-only）、remote-first 删除
 > （内部 token 路由、删桶 quiesce、删除 intent）与 stretch 2×6 数据面已落地并有测试；
-> `raft` 基座（openraft 0.9.25 日志/状态机/快照/网络）仅有库与单测，未接 server/路由。
-> `RAFT_READY`/`SYNC_READY`/`STRETCH_READY` 当前全 false：sync 建桶被拒、`[raft]` 下
-> 控制台建桶 503，e2e_m9 对相关段 SKIP。Raft 控制路由、3-voter 成员/配对、witness 独立
-> 运行时与 `raft-add-witness`/`raft-export`/`raft-force-recover`/`sync-reconcile [--repair]`
-> 均为**计划项**。stretch 限制：2×6、EC 8+4、`Q_s=9`、单站点不可读写、不支持站点容灾、
-> WAN 吞吐受限、inline=0、禁用 M7 异步站点复制、拒绝 sync 桶、仅全新空库、`self_addr` 为
-> 独立 mesh gRPC 端口。
+> openraft 0.9.25 控制面已接 server/router（11 表单命令 apply、启动模式断言、witness
+> 独立运行时、3-voter 成员/配对、快照、cutover/export/force-recover、`sync-reconcile
+> [--repair]`）。`RAFT_READY`/`SYNC_READY`/`STRETCH_READY=true`；`production_ready` 需
+> ≥3 voters。本机验收：strict e2e_m9 71 PASS/0 FAIL/1 预期 SKIP、e2e_stretch ALL PASS、
+> M7 e2e_sites PASS、七闸全绿。残余（S9）：B′/cutover/repair 专用多进程 e2e、11 表全量
+> 并发 diff、stretch+Raft 配对组合证据。stretch 限制：2×6、EC 8+4、`Q_s=9`、单站点不可
+> 读写、不支持站点容灾、WAN 吞吐受限、inline=0、禁用 M7 异步站点复制、拒绝 sync 桶、
+> 仅全新空库、`self_addr` 为独立 mesh gRPC 端口。
 
 ---
 
