@@ -1,8 +1,9 @@
-//! M9 控制面：Raft 基座（S5）+ 控制命令/apply 门面核（S6a）。
+//! M9 控制面：Raft 基座（S5）+ 控制命令/apply 门面（S6）。
 //!
-//! S5 接入 openraft 0.9.25 单节点运行时；S6a 增加 [`command`]（唯一写意图）、[`apply`]
-//! （自然键映射 + 守卫事务）、[`control`]（Local/Raft 门面）。HTTP 路由与能力开关仍由
-//! S6b-d/S7 接线，[`RAFT_READY`] 保持 false。
+//! S5 接入 openraft 0.9.25 单节点运行时；S6 增加 [`command`]（唯一写意图）、[`apply`]
+//! （自然键映射 + 守卫事务）、[`control`]（Local/Raft 门面）并接线控制写路由。
+//! 3-voter 成员/配对/快照/cutover 属 S7；[`RAFT_READY`]/[`SYNC_READY`] 已翻，
+//! [`STRETCH_READY`] 保持 false。
 
 // openraft 的 ConfigError/StorageError/RPCError 体积由第三方类型固定，调用方无法瘦身。
 #![allow(clippy::result_large_err)]
@@ -27,10 +28,10 @@ pub use command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionB
 
 use store::SqliteStateMachine;
 
-/// 控制写（console/S3 配置写）是否已可走 Raft。S6 出口翻转。
-pub const RAFT_READY: bool = false;
-/// sync 桶创建/读写是否可用。S3 出口翻转。
-pub const SYNC_READY: bool = false;
+/// 控制写（console/S3 配置写）是否已可走 Raft。S6 出口已翻转（单节点）。
+pub const RAFT_READY: bool = true;
+/// sync 桶创建/读写是否可用。S3 数据面全绿且控制面接线后翻转（S6d）。
+pub const SYNC_READY: bool = true;
 /// stretch 2×6 数据面（S4）已实现；控制面（Raft 桶创建/身份配对）就绪后随 S7/S9 翻转。
 pub const STRETCH_READY: bool = false;
 

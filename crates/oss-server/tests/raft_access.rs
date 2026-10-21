@@ -678,19 +678,21 @@ async fn console_sync_create_gate_and_routing_follow_ready_flags() {
         Some(&token),
         reqwest::Method::POST,
         "/api/v1/buckets",
-        Some(json!({"name": "sy", "replication_mode": "sync"})),
+        Some(json!({"name": "syncb", "replication_mode": "sync"})),
     )
     .await;
     if RAFT_READY && SYNC_READY {
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, StatusCode::NO_CONTENT, "sync 建桶失败: {body}");
         wait_applied(&st, before + 1).await;
         let mode: String =
-            sqlx::query_scalar("SELECT replication_mode FROM buckets WHERE name = 'sy'")
+            sqlx::query_scalar("SELECT replication_mode FROM buckets WHERE name = 'syncb'")
                 .fetch_one(st.db.pool())
                 .await
                 .unwrap();
         assert_eq!(mode, "sync");
-        assert!(st.store.bucket_exists("sy").await.unwrap());
+        assert!(st.store.bucket_exists("syncb").await.unwrap());
     } else if !RAFT_READY {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_no_write(&st, before).await;
