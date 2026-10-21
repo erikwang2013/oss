@@ -3168,6 +3168,7 @@ fn stretch_mismatches(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn vault_probe_matches(state: &AppState, peer_probe: Option<&str>) -> Result<bool, Response> {
     let Some(vault) = state.vault.as_ref() else {
         return Ok(peer_probe.is_none());

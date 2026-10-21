@@ -207,8 +207,10 @@ pub async fn run(
             return Err(format!("bucket {only} is not a sync bucket"));
         }
     }
-    let mut report = RepairReport::default();
-    report.buckets = buckets.len();
+    let mut report = RepairReport {
+        buckets: buckets.len(),
+        ..RepairReport::default()
+    };
     for bucket in &buckets {
         let mut key_marker: Option<String> = None;
         let mut version_marker: Option<String> = None;

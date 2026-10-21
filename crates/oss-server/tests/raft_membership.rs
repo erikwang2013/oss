@@ -186,16 +186,16 @@ async fn leader_loss_and_forwarded_removal() {
     let v = loop {
         let vb = membership::view(&b.handle);
         let vc = membership::view(&c.handle);
-        if vb.leader == vc.leader && matches!(vb.leader, Some(2) | Some(3)) {
-            if let Ok(v) = membership::request(
+        if vb.leader == vc.leader
+            && matches!(vb.leader, Some(2) | Some(3))
+            && let Ok(v) = membership::request(
                 &c.base,
                 "s73-token",
                 &MembershipOp::RemoveNode { node_id: 1 },
             )
             .await
-            {
-                break v;
-            }
+        {
+            break v;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
