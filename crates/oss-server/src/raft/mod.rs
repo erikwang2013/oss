@@ -7,7 +7,7 @@
 // openraft 的 ConfigError/StorageError/RPCError 体积由第三方类型固定，调用方无法瘦身。
 #![allow(clippy::result_large_err)]
 
-pub mod apply;
+pub(crate) mod apply;
 pub mod command;
 pub mod control;
 pub mod network;

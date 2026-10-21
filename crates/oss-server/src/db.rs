@@ -4681,4 +4681,36 @@ mod argon2_tests {
             "DUMMY_ARGON2 PHC 解析失败会让未命中路径的时延拉平失效"
         );
     }
+
+    /// H1：Raft 模式禁止登录时重写旧哈希（随机盐会让各站点分叉）。
+    #[tokio::test]
+    async fn raft_mode_verify_user_keeps_legacy_hash() {
+        let db = db().await;
+        db.prepare_raft_mode(true).await.unwrap();
+        assert!(db.raft_mode());
+        let legacy = legacy_hash("old-pw-123");
+        db.set_raft_apply_ctx(true).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, created_at) \
+             VALUES ('legacy', ?, 0, 1)",
+        )
+        .bind(&legacy)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.set_raft_apply_ctx(false).await.unwrap();
+
+        assert!(
+            db.verify_user("legacy", "old-pw-123")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'legacy'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, legacy, "Raft 模式不得本地重写旧口令哈希");
+    }
 }

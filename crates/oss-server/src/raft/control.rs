@@ -111,6 +111,9 @@ impl PostCommit {
 }
 
 enum Inner {
+    /// 测试/兼容门面。HTTP handler 必须先 `is_raft()` 再进 Raft 分支；
+    /// M7/standalone 的桶生命周期（set 指派、物理优先、LWW 补偿、广播）继续走
+    /// console/S3 旧路径，**不得**把 `Local` 接入 M9 路由（S6a review I1 裁决）。
     Local(Arc<Db>),
     Raft(Arc<RaftHandle>),
 }
@@ -170,6 +173,8 @@ fn internal(e: impl std::fmt::Display) -> ControlError {
 }
 
 impl ControlPlane {
+    /// 测试/兼容构造：不复制 M7 的 set 指派/物理优先/LWW 补偿语义。生产 handler
+    /// 只允许在 `is_raft()` 时路由本门面；`!is_raft()` 保持旧直写路径。
     pub fn local(
         db: Arc<Db>,
         store: Arc<Store>,
@@ -206,6 +211,8 @@ impl ControlPlane {
     /// 一次控制写：恰好一条命令、恰好一个 `ControlResponse`。
     pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, ControlError> {
         match &self.inner {
+            // S6b-d 路由闸：只有事件循环/测试用 Local；HTTP handler 不得把 M7
+            // 桶生命周期接进来（review I1）。
             Inner::Local(db) => {
                 let mut tx = db.pool().begin().await.map_err(internal)?;
                 let applied = {
@@ -243,5 +250,27 @@ impl ControlPlane {
                 Ok(response)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_error_and_response_http_mapping() {
+        assert_eq!(
+            ControlError::TooLarge { bytes: 1, max: 2 }.http_status(),
+            413
+        );
+        assert_eq!(ControlError::Timeout("t".into()).http_status(), 503);
+        assert_eq!(ControlError::Unavailable("u".into()).http_status(), 503);
+        assert_eq!(ControlError::Internal("i".into()).http_status(), 500);
+
+        assert_eq!(response_status(ControlResponse::Ok), 200);
+        assert_eq!(response_status(ControlResponse::BucketNotEmpty), 409);
+        assert_eq!(response_status(ControlResponse::Conflict), 409);
+        assert_eq!(response_status(ControlResponse::NotFound), 404);
+        assert_eq!(response_status(ControlResponse::Invalid), 400);
     }
 }
