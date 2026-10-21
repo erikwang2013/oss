@@ -331,7 +331,7 @@ pub async fn request(
     token: &str,
     op: &MembershipOp,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, false).await
+    request_inner(endpoint, token, op, false, None).await
 }
 
 /// 节点内部转发：带单跳标记，目标若已非 leader 直接 409，不再二次转发。
@@ -339,8 +339,9 @@ pub async fn request_forwarded(
     endpoint: &str,
     token: &str,
     op: &MembershipOp,
+    target: Option<u64>,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, true).await
+    request_inner(endpoint, token, op, true, target).await
 }
 
 async fn request_inner(
@@ -348,6 +349,7 @@ async fn request_inner(
     token: &str,
     op: &MembershipOp,
     forwarded: bool,
+    target: Option<u64>,
 ) -> Result<MemberView, MembershipError> {
     let body = serde_json::to_vec(op).map_err(|e| MembershipError::Raft(e.to_string()))?;
     let (status, bytes) = crate::site_client::post_raft_membership(
@@ -356,6 +358,7 @@ async fn request_inner(
         body.into(),
         REQUEST_TIMEOUT,
         forwarded,
+        target,
     )
     .await
     .map_err(MembershipError::Raft)?;

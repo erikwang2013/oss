@@ -118,7 +118,7 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 71 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；本机 78 PASS / 0 FAIL / 1 SKIP（stretch 由专用脚本覆盖） |
 | `tests/e2e_m9_recovery.sh` | M9 灾备验收（真进程 + CLI：M7 export/cutover 字段级冲突与 overwrite、force-recover 后 `bootstrap=false` 重启；witness 运行时/export/force-recover；B′ 替换 + `sync-reconcile --repair` 门） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
@@ -1223,6 +1223,10 @@ db_path = "/var/lib/oss/raft.db"
    加 learner 追平后替换；**B 永久丢失且有 sync 桶** → A+C 仍 quorum 2，复用旧 B 的 site
    UUID/token、新 Raft node_id 部署 B'，`sync-reconcile --repair` 完成前不得标可服务
    （有 sync 桶时 `DELETE /sites` 应 409）；**A+B 同时丢失** → 按上述 force recovery。
+6. **升级顺序（非滚动）**：Raft RPC 自本版本起携带并校验
+   `x-oss-raft-target-node-id`（防止旧 endpoint 上的新 node_id 误答旧成员请求）。所有
+   voter/witness 必须先升级到本版本，再执行成员变更/B′ 替换；旧版本节点缺少该头会被
+   421 拒绝，混合版本集群不受支持。
 
 ### 部署与安全边界
 

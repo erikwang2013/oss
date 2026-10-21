@@ -52,6 +52,15 @@ pub async fn force_recover(
     {
         return Err("control DB is not in raft mode; run raft-cutover first".into());
     }
+    let snapshot_len = data::encode_snapshot(&export.data)
+        .map_err(|e| e.to_string())?
+        .len() as u64;
+    if snapshot_len > settings.snapshot_max_bytes {
+        return Err(format!(
+            "recovery snapshot {snapshot_len} bytes exceeds raft.snapshot_max_bytes {}",
+            settings.snapshot_max_bytes
+        ));
+    }
     let applied_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM raft_applied WHERE applied_log_id IS NOT NULL")
             .fetch_one(db.pool())
@@ -112,31 +121,45 @@ pub async fn force_recover(
         .await
         .map_err(|e| format!("initialize recovered node: {e}"))?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let voters = loop {
-        let v = raft::membership::view(&handle);
-        if v.voters == vec![new_node_id] {
-            break v.voters;
+    let (voters, applied) = loop {
+        let (voters_now, applied_now, membership_log) = {
+            let m = handle.raft().metrics();
+            let m = m.borrow();
+            (
+                m.membership_config.voter_ids().collect::<Vec<u64>>(),
+                m.last_applied,
+                *m.membership_config.log_id(),
+            )
+        };
+        // membership 在 append 后即出现在 metrics，但 apply 要等状态机落库；
+        // 必须等到 applied >= membership log，否则快照会缺刚初始化的成员/基线。
+        let applied_ok = match membership_log {
+            Some(l) => applied_now.is_some_and(|a| a.index >= l.index),
+            None => applied_now.is_some(),
+        };
+        if voters_now == vec![new_node_id] && applied_ok {
+            break (voters_now, applied_now);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("recovered membership did not converge to {N}".into());
+            return Err(format!(
+                "recovered membership/applied state did not converge to {new_node_id}"
+            ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
+    let Some(applied) = applied else {
+        return Err("recovered state has no applied log".into());
+    };
     // 直接安装的业务行不在 Raft 日志里；先把当前状态固化为快照并清掉日志，后续
     // learner 才会从快照取得基线。否则它只回放 initialize 之后的命令，缺恢复行。
-    let applied = {
-        let m = handle.raft().metrics();
-        let m = m.borrow();
-        m.last_applied
-    };
-    if let Some(applied) = applied {
+    let outcome = async {
         handle
             .raft()
             .trigger()
             .snapshot()
             .await
             .map_err(|e| format!("build recovery snapshot: {e}"))?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             let done = {
                 let m = handle.raft().metrics();
@@ -149,7 +172,7 @@ pub async fn force_recover(
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err("recovery snapshot did not complete".into());
+                return Err("recovery snapshot did not complete".to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -159,7 +182,7 @@ pub async fn force_recover(
             .purge_log(applied.index)
             .await
             .map_err(|e| format!("purge recovered log: {e}"))?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             let done = {
                 let m = handle.raft().metrics();
@@ -170,12 +193,15 @@ pub async fn force_recover(
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err("recovery log purge did not complete".into());
+                return Err("recovery log purge did not complete".to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        Ok::<(), String>(())
     }
+    .await;
     handle.shutdown().await;
+    outcome.map_err(|e| format!("{e}; restore the control DB and remove raft.db before retry"))?;
     db.schema_meta_set("raft_node_id", &new_node_id.to_string())
         .await
         .map_err(|e| e.to_string())?;

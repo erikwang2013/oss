@@ -319,6 +319,20 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
         .await
         .unwrap();
     assert_eq!(snapshots, 1, "force recovery must persist a base snapshot");
+    let snap_bytes: Vec<u8> = sqlx::query_scalar("SELECT data FROM raft_snapshot WHERE id = 1")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    let snapshot = oss_server::raft::data::decode_snapshot(&snap_bytes).unwrap();
+    assert!(
+        snapshot.buckets.iter().any(|b| b.name == "b1"),
+        "base snapshot must contain force-recovered rows"
+    );
+    let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_log")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    assert_eq!(logs, 0, "recovery must purge logs covered by the snapshot");
 
     // witness 重启（bootstrap=false + role=witness）必须通过身份校验：
     // voter 校验 site_id，witness 无 site_config、跳过该项。

@@ -231,10 +231,15 @@ pub(crate) async fn post_raft_membership(
     body: Bytes,
     timeout: Duration,
     forwarded: bool,
+    target: Option<u64>,
 ) -> Result<(u16, Bytes), String> {
+    let target = target.map(|t| t.to_string());
     let mut headers = vec![(crate::raft::RPC_TOKEN_HEADER, token)];
     if forwarded {
         headers.push((crate::raft::routes::FORWARD_HEADER, "1"));
+        if let Some(t) = target.as_deref() {
+            headers.push((crate::raft::RPC_TARGET_HEADER, t));
+        }
     }
     send_with_headers(
         endpoint,

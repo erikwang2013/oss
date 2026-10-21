@@ -216,17 +216,18 @@ impl RaftHandle {
         timeout: Duration,
     ) -> Result<ControlResponse, WriteError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let sent = reqwest::Client::new()
+        let mut req = reqwest::Client::new()
             .post(format!(
                 "{}/api/v1/site/raft/write",
                 endpoint.trim_end_matches('/')
             ))
             .header(RPC_TOKEN_HEADER, &self.settings.cluster_token)
             .header(routes::FORWARD_HEADER, "1")
-            .timeout(timeout)
-            .json(&cmd)
-            .send()
-            .await;
+            .timeout(timeout);
+        if let Some(leader) = leader {
+            req = req.header(RPC_TARGET_HEADER, leader.to_string());
+        }
+        let sent = req.json(&cmd).send().await;
         let resp = match sent {
             Ok(resp) => resp,
             // leader 地址不可达 = 本节点无法完成提交（可能已提交；重试幂等）。

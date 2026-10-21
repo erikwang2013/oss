@@ -176,6 +176,9 @@ async fn membership(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if headers.contains_key(FORWARD_HEADER) && !target_matches(&ext, &headers) {
+        return wrong_target();
+    }
     let op: MembershipOp = match serde_json::from_slice(&body) {
         Ok(op) => op,
         Err(e) => {
@@ -199,7 +202,7 @@ async fn membership(
     let Some(endpoint) = view.leader_endpoint.clone() else {
         return no_leader("leader unknown or address missing from membership");
     };
-    match membership::request_forwarded(&endpoint, &ext.cluster_token, &op).await {
+    match membership::request_forwarded(&endpoint, &ext.cluster_token, &op, view.leader).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => membership_error(e),
     }
@@ -239,6 +242,9 @@ async fn write(
     headers: HeaderMap,
     Json(cmd): Json<ControlCommand>,
 ) -> Response {
+    if headers.contains_key(FORWARD_HEADER) && !target_matches(&ext, &headers) {
+        return wrong_target();
+    }
     if let Err(e) = cmd.check_size() {
         return match e {
             SizeError::TooLarge(bytes) => (
