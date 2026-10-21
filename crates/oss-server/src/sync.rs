@@ -223,7 +223,8 @@ impl SiteSyncGate {
 }
 
 /// 清理一条写 intent：先删 tee，再删行（中途崩溃时行仍在，下轮恢复）。
-async fn clean_intent(db: &Db, id: &str) {
+/// 返回 `true` 仅当 intent 行已删除；tee 删除失败仍算清理成功（行是恢复的依据）。
+async fn clean_intent(db: &Db, id: &str) -> bool {
     let tee: Option<String> =
         sqlx::query_scalar("SELECT tee_path FROM sync_write_intents WHERE id = ?")
             .bind(id)
@@ -234,12 +235,16 @@ async fn clean_intent(db: &Db, id: &str) {
     if let Some(p) = tee {
         let _ = tokio::fs::remove_file(p).await;
     }
-    if let Err(e) = sqlx::query("DELETE FROM sync_write_intents WHERE id = ?")
+    match sqlx::query("DELETE FROM sync_write_intents WHERE id = ?")
         .bind(id)
         .execute(db.pool())
         .await
     {
-        tracing::warn!(id, error = %e, "sync intent 删除失败（下轮恢复重试）");
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(id, error = %e, "sync intent 删除失败（下轮恢复重试）");
+            false
+        }
     }
 }
 
@@ -320,8 +325,9 @@ pub async fn recover_write_intents(state: &AppState) {
         let key: String = row.get("key");
         match state.store.head_object_version(&bucket, &key, &id).await {
             Ok(_) => {
-                clean_intent(&state.db, &id).await;
-                cleaned += 1;
+                if clean_intent(&state.db, &id).await {
+                    cleaned += 1;
+                }
             }
             Err(
                 StoreError::NoSuchKey(_)
@@ -329,8 +335,9 @@ pub async fn recover_write_intents(state: &AppState) {
                 | StoreError::NoSuchBucket(_),
             ) => match gate.delete_remote_version(&bucket, &key, &id).await {
                 Ok(()) => {
-                    clean_intent(&state.db, &id).await;
-                    cleaned += 1;
+                    if clean_intent(&state.db, &id).await {
+                        cleaned += 1;
+                    }
                 }
                 Err(e) => {
                     kept += 1;

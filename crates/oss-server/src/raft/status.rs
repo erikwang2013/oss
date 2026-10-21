@@ -3,9 +3,11 @@
 //! `production_ready` 按计划 §2.6：少于 3 个 voter 只允许开发/测试，状态里显式标 false。
 //! S7.1：`role` 是配置角色（voter/witness），运行态在 `state`；另报成员/leader 地址。
 //!
-//! `lag` = `last_log_index - last_applied.index`（无值按 0）；`stale` = 本节点非 leader
-//! 且 `lag > 0`。follower 的读是本机已 apply 状态，**不是**线性一致读：`stale=true` 只表示
-//! 至少晚于 leader 一条已提交日志，读到的旧值仍需业务侧按版本/条件判断。
+//! `lag` = 本机已追加、尚未 apply 的日志条数（apply 积压；无值按 0，**不是**与 leader 的
+//! 差距）。`stale` = 本节点非 leader 且 `lag > 0`，只说明本机有未 apply 的已追加日志。
+//! 注意：分区/断连期间本节点收不到新日志，`lag` 仍为 0、`stale=false`，因此
+//! **`stale=false` 不代表已追上 leader**，不能作为新鲜度保证。follower 的读是本机已
+//! apply 状态，**不是**线性一致读。
 
 use serde_json::{Value, json};
 
@@ -13,6 +15,18 @@ use super::{RAFT_READY, RaftHandle, STRETCH_READY, SYNC_READY};
 
 fn log_id_json(id: &openraft::LogId<u64>) -> Value {
     json!({ "term": id.leader_id.term, "index": id.index })
+}
+
+/// 本机 apply 积压：`stale` 仅表示非 leader 且本地有未 apply 日志；未收到的日志不计。
+fn apply_backlog(
+    is_leader: bool,
+    last_log_index: Option<u64>,
+    last_applied: Option<u64>,
+) -> (u64, bool) {
+    let lag = last_log_index
+        .unwrap_or(0)
+        .saturating_sub(last_applied.unwrap_or(0));
+    (lag, !is_leader && lag > 0)
 }
 
 /// `configured` = `cfg.raft.is_some()`：未配置 `[raft]` 时能力位一律 false
@@ -29,10 +43,11 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         .collect();
     let state = format!("{:?}", m.state).to_lowercase();
     let is_leader = m.current_leader == Some(m.id);
-    let lag = m
-        .last_log_index
-        .unwrap_or(0)
-        .saturating_sub(m.last_applied.as_ref().map(|l| l.index).unwrap_or(0));
+    let (lag, stale) = apply_backlog(
+        is_leader,
+        m.last_log_index,
+        m.last_applied.as_ref().map(|l| l.index),
+    );
     let leader_endpoint = m
         .current_leader
         .and_then(|l| membership.get_node(&l).map(|n| n.addr.clone()));
@@ -51,9 +66,10 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         "term": m.current_term,
         "state": state,
         "applied": m.last_applied.as_ref().map(log_id_json),
-        // follower 读 = 本机 applied 状态（非线性一致）；stale 只标记「落后 > 0」。
+        // follower 读 = 本机 applied 状态（非线性一致）；lag 只是本地 apply 积压，
+        // stale=false 不代表已追上 leader（未收到的日志不体现在 lag 中）。
         "lag": lag,
-        "stale": !is_leader && lag > 0,
+        "stale": stale,
         "snapshot": m.snapshot.as_ref().map(log_id_json),
         "purged": m.purged.as_ref().map(log_id_json),
         "voters": voters,
@@ -67,4 +83,34 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
             "stretch": configured && STRETCH_READY,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_backlog;
+
+    #[test]
+    fn leader_backlog_is_not_stale() {
+        assert_eq!(apply_backlog(true, Some(5), Some(3)), (2, false));
+    }
+
+    #[test]
+    fn follower_backlog_is_stale() {
+        assert_eq!(apply_backlog(false, Some(5), Some(3)), (2, true));
+    }
+
+    #[test]
+    fn caught_up_follower_is_not_stale() {
+        assert_eq!(apply_backlog(false, Some(5), Some(5)), (0, false));
+    }
+
+    #[test]
+    fn missing_metrics_are_zero_and_not_stale() {
+        assert_eq!(apply_backlog(false, None, None), (0, false));
+    }
+
+    #[test]
+    fn applied_ahead_saturates_to_zero() {
+        assert_eq!(apply_backlog(false, Some(2), Some(5)), (0, false));
+    }
 }

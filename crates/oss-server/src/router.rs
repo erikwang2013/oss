@@ -284,7 +284,7 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         state.sync_metrics.acked_total()
     ));
     out.push_str(
-        "# HELP oss_sync_failed_total sync 写提交门失败次数（含前置校验失败）\n\
+        "# HELP oss_sync_failed_total sync 写 before_commit 阶段失败次数（不含 is_sync 门控拒绝）\n\
          # TYPE oss_sync_failed_total counter\n",
     );
     out.push_str(&format!(
@@ -337,7 +337,7 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         ));
         let counters = handle.counters();
         out.push_str(
-            "# HELP oss_raft_leader_changes_total 控制面 leader 变更次数（含首次当选）\n\
+            "# HELP oss_raft_leader_changes_total 控制面 leader 变更采样次数（含首次当选；可能合并中间跳变）\n\
              # TYPE oss_raft_leader_changes_total counter\n",
         );
         out.push_str(&format!(
@@ -353,12 +353,12 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
             counters.apply_errors()
         ));
         out.push_str(
-            "# HELP oss_raft_forward_total follower 转发到 leader 的控制写次数\n\
+            "# HELP oss_raft_forward_total follower 发起的控制写转发尝试次数（含失败；不含成员变更）\n\
              # TYPE oss_raft_forward_total counter\n",
         );
         out.push_str(&format!("oss_raft_forward_total {}\n", counters.forwards()));
         out.push_str(
-            "# HELP oss_raft_snapshot_bytes 当前已落库快照字节数（无快照 = 0）\n\
+            "# HELP oss_raft_snapshot_bytes 当前已落库快照数据字节数（不含 meta；无快照或读失败 = 0 并告警）\n\
              # TYPE oss_raft_snapshot_bytes gauge\n",
         );
         out.push_str(&format!(

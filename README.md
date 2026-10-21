@@ -984,9 +984,11 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 `RAFT_READY=true`、`SYNC_READY=true`、`STRETCH_READY=true` 决定运行时门控（能力位还要求
 对应配置存在）。`GET /api/v1/raft/status` 报真实状态（`enabled/node_id/role/leader/term/
 applied/lag/stale/snapshot/purged/voters/learners/production_ready`；`voters<3` 时
-`production_ready=false`）。`lag` = `last_log_index - last_applied.index`（无值按 0）；
-`stale` = 本节点非 leader 且 `lag>0`——follower 的读是本机已 apply 状态，**不是**线性一致
-读，`stale` 只提示可能读到落后至少一条已提交日志的旧值。`/api/v1/site/raft/*` 提供
+`production_ready=false`）。`lag` = `last_log_index - last_applied.index`，即本机已追加、
+尚未 apply 的日志条数（无值按 0；**不是**与 leader 的差距，未收到的日志不计）；
+`stale` = 本节点非 leader 且 `lag>0`，只说明本机有未 apply 的已追加日志。follower 的读是
+本机已 apply 状态，**不是**线性一致读；分区/断连时 `lag` 仍可能为 0、
+**`stale=false` 不代表已追上 leader**，不能作为新鲜度保证。`/api/v1/site/raft/*` 提供
 append/vote/snapshot/status/membership/write/join。
 
 - **已落地**：S0 模式矩阵/配置校验/能力开关；S1–S3 sync 数据面（统一 origin version id、

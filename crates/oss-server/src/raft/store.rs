@@ -628,17 +628,20 @@ impl SqliteStateMachine {
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))
     }
 
-    /// 已落库快照的字节数（无快照/读失败 = 0；gauge 只读，不因查询失败给 /metrics 报错）。
+    /// 已落库快照的字节数（无快照 = 0；查询失败记 0 并告警，不因 gauge 拖垮 /metrics）。
     pub async fn snapshot_bytes(&self) -> u64 {
-        sqlx::query_scalar::<_, i64>(
+        match sqlx::query_scalar::<_, i64>(
             "SELECT COALESCE(length(data), 0) FROM raft_snapshot WHERE id = 1",
         )
         .fetch_optional(&self.pool)
         .await
-        .ok()
-        .flatten()
-        .unwrap_or(0)
-        .max(0) as u64
+        {
+            Ok(v) => v.unwrap_or(0).max(0) as u64,
+            Err(e) => {
+                tracing::warn!(error = %e, "raft snapshot bytes 查询失败；gauge 记 0");
+                0
+            }
+        }
     }
 }
 
