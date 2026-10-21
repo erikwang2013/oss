@@ -3711,7 +3711,8 @@ impl S3 for OssS3 {
                 Box::pin(futures::stream::once(async move { Ok(bytes) })),
                 content_type,
                 user_metadata,
-                None,
+                // M9：Copy 继承源校验和（随门 PUT 透传对端，A/B 元数据一致）
+                src_info.checksum.clone(),
                 dst_versioned,
                 dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
                 dst_lock,     // M5 切片 4（L3）
