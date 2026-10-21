@@ -7,11 +7,15 @@ use xl_s3::access::{Acl, AuthedUser};
 use xl_s3::inventory::{InventoryError, InventoryStore, validate_config};
 
 use crate::db::Db;
+use crate::raft::command::{ControlCommand, ControlResponse};
+use crate::raft::control::ControlPlane;
 
 pub struct SqlInventoryStore {
     db: Arc<Db>,
     acl: Acl,
     max_configs: i64,
+    /// M9 S6c：仅 Raft 模式路由控制写（None/Local = M7 直写）。
+    control: Option<Arc<ControlPlane>>,
 }
 
 impl SqlInventoryStore {
@@ -24,7 +28,17 @@ impl SqlInventoryStore {
             db,
             acl,
             max_configs,
+            control: None,
         }
+    }
+
+    pub fn with_control(mut self, control: Arc<ControlPlane>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn raft_control(&self) -> Option<&Arc<ControlPlane>> {
+        self.control.as_ref().filter(|c| c.is_raft())
     }
 
     async fn ensure_bucket(&self, bucket: &str) -> Result<(), InventoryError> {
@@ -104,6 +118,37 @@ impl InventoryStore for SqlInventoryStore {
         }
         let json =
             serde_json::to_string(cfg).map_err(|e| InventoryError::Internal(e.to_string()))?;
+        if let Some(control) = self.raft_control() {
+            // 属主 uid → username 在 append 前解析（apply 只做确定性映射）。
+            let owner_name = if owner.is_admin {
+                None
+            } else {
+                match self.db.get_user(owner.uid).await {
+                    Ok(Some((name, _, _))) => Some(name),
+                    Ok(None) => {
+                        return Err(InventoryError::Internal("inventory 属主用户不存在".into()));
+                    }
+                    Err(e) => return Err(InventoryError::Internal(e.to_string())),
+                }
+            };
+            return match control
+                .write(ControlCommand::InventoryPut {
+                    bucket: bucket.to_string(),
+                    id: cfg.id.clone(),
+                    owner: owner_name,
+                    config_json: json,
+                    updated_at: crate::db::now(),
+                })
+                .await
+            {
+                Ok(ControlResponse::Ok) => Ok(()),
+                Ok(ControlResponse::Invalid) => Err(InventoryError::InvalidArgument(
+                    "control write rejected".into(),
+                )),
+                Ok(_) => Err(InventoryError::NoSuchBucket),
+                Err(e) => Err(InventoryError::Internal(e.to_string())),
+            };
+        }
         self.db
             .inventory_upsert_config(bucket, &cfg.id, owner.uid, &json, crate::db::now())
             .await
@@ -148,6 +193,22 @@ impl InventoryStore for SqlInventoryStore {
 
     async fn delete_config(&self, bucket: &str, id: &str) -> Result<(), InventoryError> {
         self.ensure_bucket(bucket).await?;
+        if let Some(control) = self.raft_control() {
+            return match control
+                .write(ControlCommand::InventoryDelete {
+                    bucket: bucket.to_string(),
+                    id: id.to_string(),
+                })
+                .await
+            {
+                // 直写路径删除不存在的配置也返回成功（保持语义）。
+                Ok(ControlResponse::Ok | ControlResponse::NotFound) => Ok(()),
+                Ok(_) => Err(InventoryError::InvalidArgument(
+                    "control write rejected".into(),
+                )),
+                Err(e) => Err(InventoryError::Internal(e.to_string())),
+            };
+        }
         self.db
             .inventory_delete_config(bucket, id)
             .await

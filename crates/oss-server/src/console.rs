@@ -305,6 +305,29 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
     }
 }
 
+/// M9 S6c：控制写结果 → console HTTP（成功由调用方给 204）。
+#[allow(clippy::result_large_err)]
+fn control_result(
+    r: Result<crate::raft::ControlResponse, crate::raft::control::ControlError>,
+) -> Result<(), Response> {
+    use crate::raft::ControlResponse as R;
+    let reject = |code: StatusCode, msg: &str| Err((code, msg.to_string()).into_response());
+    match r {
+        Ok(R::Ok) => Ok(()),
+        Ok(R::NotFound) => reject(StatusCode::NOT_FOUND, "NoSuchBucket"),
+        Ok(R::BucketNotEmpty) => reject(StatusCode::CONFLICT, "BucketNotEmpty"),
+        Ok(R::Conflict) => reject(StatusCode::CONFLICT, "conflict"),
+        Ok(R::Invalid) => reject(StatusCode::BAD_REQUEST, "invalid request"),
+        Err(e) => {
+            tracing::error!(error = %e, "控制写失败");
+            reject(
+                StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                "control plane write failed",
+            )
+        }
+    }
+}
+
 /// 当前登录者（前端角色/菜单的唯一依据）。
 async fn me(State(state): State<AppState>, Extension(payload): Extension<JwtPayload>) -> Response {
     let uid = match uid_of(&payload) {
@@ -673,6 +696,21 @@ async fn put_policy(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    if state.control.is_raft() {
+        return match control_result(
+            state
+                .control
+                .write(crate::raft::ControlCommand::BucketSetPolicy {
+                    bucket,
+                    policy_json: body,
+                    updated_at: now,
+                })
+                .await,
+        ) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(r) => r,
+        };
+    }
     match state.db.set_bucket_policy(&bucket, &body, now).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -768,6 +806,23 @@ async fn put_notifications(
             return internal_error();
         }
     };
+    if state.control.is_raft() {
+        let cmd = if targets.is_empty() {
+            crate::raft::ControlCommand::BucketClearNotification {
+                bucket: bucket.clone(),
+            }
+        } else {
+            crate::raft::ControlCommand::BucketSetNotification {
+                bucket: bucket.clone(),
+                config_json: json,
+                updated_at: crate::db::now(),
+            }
+        };
+        return match control_result(state.control.write(cmd).await) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(r) => r,
+        };
+    }
     match state.acl().set_bucket_notification(&bucket, &json).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -785,6 +840,17 @@ async fn delete_notifications(
 ) -> Response {
     if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
         return r;
+    }
+    if state.control.is_raft() {
+        return match control_result(
+            state
+                .control
+                .write(crate::raft::ControlCommand::BucketClearNotification { bucket })
+                .await,
+        ) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(r) => r,
+        };
     }
     match state.acl().clear_bucket_notification(&bucket).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1587,6 +1653,20 @@ async fn put_bucket_encryption(
     if !matches!(body.algorithm.as_str(), "AES256" | "aws:kms") {
         return (StatusCode::BAD_REQUEST, "algorithm 须为 AES256 或 aws:kms").into_response();
     }
+    if state.control.is_raft() {
+        return match control_result(
+            state
+                .control
+                .write(crate::raft::ControlCommand::BucketSetDefaultEncryption {
+                    bucket,
+                    algorithm: body.algorithm,
+                })
+                .await,
+        ) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(r) => r,
+        };
+    }
     match state
         .acl()
         .set_bucket_default_encryption(&bucket, &body.algorithm)
@@ -1612,6 +1692,17 @@ async fn delete_bucket_encryption(
 ) -> Response {
     if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
         return r;
+    }
+    if state.control.is_raft() {
+        return match control_result(
+            state
+                .control
+                .write(crate::raft::ControlCommand::BucketClearDefaultEncryption { bucket })
+                .await,
+        ) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(r) => r,
+        };
     }
     match state.acl().clear_bucket_default_encryption(&bucket).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -1738,7 +1829,7 @@ async fn create_bucket(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateBucketBody>,
 ) -> impl IntoResponse {
-    let (uid, _) = match who(&state, &payload).await {
+    let (uid, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1815,6 +1906,67 @@ async fn create_bucket(
             "bucket replication mode cannot be changed on recreate",
         )
             .into_response();
+    }
+    // M9 S6c：Raft 一条命令建桶（行+物理目录 409 预检；apply 只做 create-or-converge）。
+    if state.control.is_raft() {
+        match sqlx::query_scalar::<_, i64>("SELECT 1 FROM buckets WHERE name = ?")
+            .bind(&body.name)
+            .fetch_optional(state.db.pool())
+            .await
+        {
+            Ok(Some(_)) => {
+                return (StatusCode::CONFLICT, "BucketAlreadyExists").into_response();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "读桶行失败");
+                return internal_error();
+            }
+        }
+        match state.store.bucket_exists(&body.name).await {
+            Ok(true) => return (StatusCode::CONFLICT, "BucketAlreadyExists").into_response(),
+            Ok(false) => {}
+            Err(e) => return store_error(e).into_response(),
+        }
+        // 属主 uid → username 在 append 前解析（管理员 = None → owner_id NULL）。
+        let owner = if is_admin {
+            None
+        } else {
+            match state.db.get_user(uid).await {
+                Ok(Some((name, _, _))) => Some(name),
+                Ok(None) => return internal_error(),
+                Err(e) => {
+                    tracing::error!(error = %e, "查询桶主失败");
+                    return internal_error();
+                }
+            }
+        };
+        if let Err(r) = control_result(
+            state
+                .control
+                .write(crate::raft::ControlCommand::BucketCreate {
+                    name: body.name.clone(),
+                    owner,
+                    created_at: crate::db::now(),
+                    replication_mode: replication_mode.to_string(),
+                    versioning: if replication_mode == "sync" {
+                        "Enabled"
+                    } else {
+                        "Off"
+                    }
+                    .to_string(),
+                    object_lock: false,
+                    object_lock_default_mode: None,
+                    object_lock_default_days: None,
+                    default_encryption: None,
+                })
+                .await,
+        ) {
+            return r;
+        }
+        state.store.invalidate_gate(&body.name);
+        state.store.broadcast_bucket_row(&body.name, Some(0)).await;
+        return StatusCode::NO_CONTENT.into_response();
     }
     let set_count = state
         .store
@@ -1911,6 +2063,12 @@ async fn delete_bucket(
     // M9 S3：sync 桶远端优先（双站 quiesce/查空）；async 桶走原本地删除。
     match state.sync_delete.delete_bucket(&bucket).await {
         Ok(()) => {
+            // M9 S6c：Raft 的 BucketDelete 已在 apply 级联清表；不再直写受 guard 的表。
+            if state.control.is_raft() {
+                state.bucket_cleanup.invalidate_ap_cache(&bucket);
+                state.store.invalidate_gate(&bucket);
+                return StatusCode::NO_CONTENT.into_response();
+            }
             // B10：物理删除已生效——清 M8 控制面状态并失效 AP 缓存（失败只告警，不补偿桶）。
             // 放在分支之前：站点冲突补偿重建空桶时同样不得继承旧 AP/Inventory 配置。
             if let Err(e) = state.bucket_cleanup.clear_bucket_m8(&bucket).await {

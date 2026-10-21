@@ -27,11 +27,36 @@ const MAX_ATTEMPTS: i64 = 10;
 pub struct SqlReplStore {
     pool: SqlitePool,
     remote_ids: Vec<String>,
+    /// M9 S6c：仅 Raft 模式路由控制写（None/Local = M7 直写）。
+    control: Option<Arc<crate::raft::control::ControlPlane>>,
 }
 
 impl SqlReplStore {
     pub fn new(pool: SqlitePool, remote_ids: Vec<String>) -> Self {
-        Self { pool, remote_ids }
+        Self {
+            pool,
+            remote_ids,
+            control: None,
+        }
+    }
+
+    pub fn with_control(mut self, control: Arc<crate::raft::control::ControlPlane>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn raft_control(&self) -> Option<&Arc<crate::raft::control::ControlPlane>> {
+        self.control.as_ref().filter(|c| c.is_raft())
+    }
+}
+
+fn control_result(
+    r: Result<crate::raft::ControlResponse, crate::raft::control::ControlError>,
+) -> Result<(), String> {
+    match r {
+        Ok(crate::raft::ControlResponse::Ok) => Ok(()),
+        Ok(other) => Err(format!("control write rejected: {other:?}")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -46,6 +71,17 @@ impl ReplicationStore for SqlReplStore {
     }
 
     async fn save_rules(&self, bucket: &str, rules_json: &str) -> Result<(), String> {
+        if let Some(control) = self.raft_control() {
+            return control_result(
+                control
+                    .write(crate::raft::ControlCommand::BucketSetReplication {
+                        bucket: bucket.to_string(),
+                        rules_json: rules_json.to_string(),
+                        updated_at: now(),
+                    })
+                    .await,
+            );
+        }
         sqlx::query(
             "INSERT INTO replication_rules (bucket, rules_json, updated_at) VALUES (?, ?, ?) \
              ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json, \
@@ -61,6 +97,15 @@ impl ReplicationStore for SqlReplStore {
     }
 
     async fn remove_rules(&self, bucket: &str) -> Result<(), String> {
+        if let Some(control) = self.raft_control() {
+            return control_result(
+                control
+                    .write(crate::raft::ControlCommand::BucketClearReplication {
+                        bucket: bucket.to_string(),
+                    })
+                    .await,
+            );
+        }
         sqlx::query("DELETE FROM replication_rules WHERE bucket = ?")
             .bind(bucket)
             .execute(&self.pool)

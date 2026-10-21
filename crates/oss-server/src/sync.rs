@@ -490,6 +490,8 @@ pub struct SiteSyncDelete {
     store: Arc<Store>,
     timeout: Duration,
     site_enabled: bool,
+    /// M9 S6c：仅 Raft 模式路由控制写（None/Local = M7 直写）。
+    control: Option<Arc<crate::raft::control::ControlPlane>>,
     /// DeleteObjects 因远端失败整体 503 的次数（部分键已提交）。
     partial_total: AtomicU64,
     /// 周期 worker 收敛的 delete intent 行数。
@@ -521,10 +523,42 @@ impl SiteSyncDelete {
             store,
             timeout,
             site_enabled,
+            control: None,
             partial_total: Default::default(),
             recovered_total: Default::default(),
             ambiguous_total: Default::default(),
             in_flight: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub fn with_control(mut self, control: Arc<crate::raft::control::ControlPlane>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn raft_control(&self) -> Option<&Arc<crate::raft::control::ControlPlane>> {
+        self.control.as_ref().filter(|c| c.is_raft())
+    }
+
+    /// 控制写 → 删桶错误（M7 的 store 错误口径）。
+    fn control_bucket_error(
+        bucket: &str,
+        r: Result<crate::raft::ControlResponse, crate::raft::control::ControlError>,
+        missing_ok: bool,
+    ) -> Result<(), StoreError> {
+        use crate::raft::ControlResponse as R;
+        match r {
+            Ok(R::Ok) => Ok(()),
+            Ok(R::NotFound) if missing_ok => Ok(()),
+            Ok(R::NotFound) => Err(StoreError::NoSuchBucket(bucket.to_string())),
+            Ok(R::BucketNotEmpty) => Err(StoreError::BucketNotEmpty(bucket.to_string())),
+            Ok(R::Conflict) => Err(StoreError::Conflict(format!(
+                "bucket delete conflict: {bucket}"
+            ))),
+            Ok(R::Invalid) => Err(StoreError::InvalidArgument(format!(
+                "bucket delete invalid: {bucket}"
+            ))),
+            Err(e) => Err(StoreError::Unavailable(e.to_string())),
         }
     }
 
@@ -883,10 +917,38 @@ impl SiteSyncDelete {
         }
         let peer = self.peer().await?;
         let client = self.client(&peer)?;
-        self.db
-            .set_bucket_deleting(bucket, true)
-            .await
-            .map_err(|e| StoreError::Unavailable(format!("set deleting: {e}")))?;
+        if let Some(control) = self.raft_control() {
+            match control
+                .write(crate::raft::ControlCommand::BucketSetDeleting {
+                    name: bucket.to_string(),
+                    deleting: true,
+                })
+                .await
+            {
+                Ok(crate::raft::ControlResponse::Ok) => {}
+                Ok(crate::raft::ControlResponse::NotFound) => {
+                    // 行已不存在：重试撞上已提交的删桶（intent 未清）。物理残留补 tombstone 后收敛。
+                    if let Err(e) = self.store.delete_bucket_sync(bucket).await {
+                        tracing::warn!(bucket, error = %e, "删桶重试：tombstone 残留目录失败");
+                    }
+                    self.store.unmark_deleting(bucket);
+                    self.store.invalidate_gate(bucket);
+                    self.intent_clean(intent_id).await;
+                    return Ok(());
+                }
+                Ok(other) => {
+                    return Err(StoreError::Conflict(format!(
+                        "set deleting rejected: {other:?}"
+                    )));
+                }
+                Err(e) => return Err(StoreError::Unavailable(format!("set deleting: {e}"))),
+            }
+        } else {
+            self.db
+                .set_bucket_deleting(bucket, true)
+                .await
+                .map_err(|e| StoreError::Unavailable(format!("set deleting: {e}")))?;
+        }
         self.store.invalidate_gate(bucket);
         self.store.mark_deleting(bucket);
         if !self.store.wait_writers_idle(bucket, QUIESCE_TIMEOUT).await {
@@ -960,15 +1022,29 @@ impl SiteSyncDelete {
             }
         }
         // 远端已删：本地失败同样保留 intent（重试先撞远端 404 = 已删）。
-        // 本地已无桶（删除已生效/恢复重跑）= 成功，继续清标志与 intent（I4）。
-        match self.store.delete_bucket_sync(bucket).await {
-            Ok(()) | Err(StoreError::NoSuchBucket(_)) => {}
-            Err(e) => return Err(e),
+        if let Some(control) = self.raft_control() {
+            // 一条 BucketDelete：apply 级联清表，post-commit 以 delete_bucket_sync 移走物理目录。
+            // NotFound = 已删（重试幂等）；行已不在，无需再写 deleting=0。
+            Self::control_bucket_error(
+                bucket,
+                control
+                    .write(crate::raft::ControlCommand::BucketDelete {
+                        name: bucket.to_string(),
+                    })
+                    .await,
+                true,
+            )?;
+        } else {
+            // 本地已无桶（删除已生效/恢复重跑）= 成功，继续清标志与 intent（I4）。
+            match self.store.delete_bucket_sync(bucket).await {
+                Ok(()) | Err(StoreError::NoSuchBucket(_)) => {}
+                Err(e) => return Err(e),
+            }
+            if let Err(e) = self.db.set_bucket_deleting(bucket, false).await {
+                tracing::warn!(bucket, error = %e, "清 deleting 标志失败（worker 会重试删桶）");
+            }
         }
         self.store.unmark_deleting(bucket);
-        if let Err(e) = self.db.set_bucket_deleting(bucket, false).await {
-            tracing::warn!(bucket, error = %e, "清 deleting 标志失败（worker 会重试删桶）");
-        }
         self.store.invalidate_gate(bucket);
         self.intent_clean(intent_id).await;
         Ok(())
@@ -982,7 +1058,19 @@ impl SiteSyncDelete {
         )
         .await;
         self.store.unmark_deleting(bucket);
-        if let Err(e) = self.db.set_bucket_deleting(bucket, false).await {
+        if let Some(control) = self.raft_control() {
+            match control
+                .write(crate::raft::ControlCommand::BucketSetDeleting {
+                    name: bucket.to_string(),
+                    deleting: false,
+                })
+                .await
+            {
+                Ok(crate::raft::ControlResponse::Ok | crate::raft::ControlResponse::NotFound) => {}
+                Ok(other) => tracing::warn!(bucket, ?other, "回滚 deleting 标志被拒"),
+                Err(e) => tracing::warn!(bucket, error = %e, "回滚 deleting 标志失败"),
+            }
+        } else if let Err(e) = self.db.set_bucket_deleting(bucket, false).await {
             tracing::warn!(bucket, error = %e, "回滚 deleting 标志失败");
         }
         self.store.invalidate_gate(bucket);
@@ -1086,6 +1174,24 @@ impl SyncDeleteSink for SiteSyncDelete {
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StoreError> {
         let (sync, deleting, _versioning) = self.state(bucket).await?;
         if !sync {
+            if let Some(control) = self.raft_control() {
+                // 非 sync：本地空预检后一条 BucketDelete（物理目录由 post-commit 幂等删除）。
+                if !self.store.bucket_exists(bucket).await? {
+                    return Err(StoreError::NoSuchBucket(bucket.to_string()));
+                }
+                if !self.store.bucket_is_empty(bucket).await? {
+                    return Err(StoreError::BucketNotEmpty(bucket.to_string()));
+                }
+                return Self::control_bucket_error(
+                    bucket,
+                    control
+                        .write(crate::raft::ControlCommand::BucketDelete {
+                            name: bucket.to_string(),
+                        })
+                        .await,
+                    false,
+                );
+            }
             return self.store.delete_bucket(bucket).await;
         }
         // I1：已在删除中 → 409；在途 flow 由 in_flight 串行化（第二个请求不触远端）。
