@@ -2409,10 +2409,7 @@ impl S3 for OssS3 {
         for obj in req.input.delete.objects {
             let decision = match (&user, anonymous) {
                 (Some(u), _) => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
-                (None, true) => self
-                    .acl
-                    .anonymous_delete_decision(&bucket, &obj.key)
-                    .await,
+                (None, true) => self.acl.anonymous_delete_decision(&bucket, &obj.key).await,
                 (None, false) => Ok((false, None)), // check 恒塞身份；防御性 fail-closed
             };
             let (allowed, deny_detail) = match decision {

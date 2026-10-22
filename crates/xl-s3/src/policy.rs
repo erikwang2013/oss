@@ -354,22 +354,39 @@ mod tests {
             {"Effect":"Deny","Principal":{"AWS":["*"]},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*"}
         ]}"#);
         assert_eq!(
-            evaluate(&deny_wins, &anon_req("GetObject", Some("secret/x")), "s3:GetObject"),
+            evaluate(
+                &deny_wins,
+                &anon_req("GetObject", Some("secret/x")),
+                "s3:GetObject"
+            ),
             Some(false)
         );
         assert_eq!(
-            evaluate(&deny_wins, &anon_req("GetObject", Some("open")), "s3:GetObject"),
+            evaluate(
+                &deny_wins,
+                &anon_req("GetObject", Some("open")),
+                "s3:GetObject"
+            ),
             Some(true)
         );
         // 资源前缀：Allow 只覆盖 secret* 时，open 无匹配
         let prefix = doc(r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
             "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*"}]}"#);
         assert_eq!(
-            evaluate(&prefix, &anon_req("GetObject", Some("open")), "s3:GetObject"),
+            evaluate(
+                &prefix,
+                &anon_req("GetObject", Some("open")),
+                "s3:GetObject"
+            ),
             None
         );
         // 非通配 Principal 不得因 uid=0 哨兵或空 AK 命中
-        for principal in [r#""uid:0""#, r#""""#, r#""AKIA_SOMEONE""#, r#"["uid:0","AKIA_X"]"#] {
+        for principal in [
+            r#""uid:0""#,
+            r#""""#,
+            r#""AKIA_SOMEONE""#,
+            r#"["uid:0","AKIA_X"]"#,
+        ] {
             let p: PolicyDoc = serde_json::from_str(&format!(
                 r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":{principal}}},
                 "Action":"s3:*","Resource":"arn:aws:s3:::bkt/*"}}]}}"#
@@ -384,8 +401,10 @@ mod tests {
         // 签名请求口径不变：同一 uid:0 文档对 uid=0 的有效签名用户仍按原语义匹配
         let mut signed_zero = req("GetObject", Some("a"));
         signed_zero.uid = 0;
-        let p = doc(r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"uid:0"},
-            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#);
+        let p = doc(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"uid:0"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#,
+        );
         assert_eq!(
             evaluate(&p, &signed_zero, "s3:GetObject"),
             Some(true),

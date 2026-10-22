@@ -1632,7 +1632,10 @@ mod tests {
             ("PutObject", "public/a"),
             ("DeleteObject", "public/a"),
         ] {
-            let (allow, _) = a.anonymous_decision(op, Some("pub"), Some(key)).await.unwrap();
+            let (allow, _) = a
+                .anonymous_decision(op, Some("pub"), Some(key))
+                .await
+                .unwrap();
             let read = matches!(op, "GetObject" | "HeadObject");
             assert_eq!(allow, read && key == "public/a", "{op} {key}");
         }
@@ -1737,11 +1740,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!allow, "匿名不得放行 {op}");
-            assert_eq!(
-                detail.as_deref(),
-                Some("anonymous:not-data-plane"),
-                "{op}"
-            );
+            assert_eq!(detail.as_deref(), Some("anonymous:not-data-plane"), "{op}");
         }
 
         // 策略读取/解析失败 → fail-closed 拒（不是 500）
@@ -1822,11 +1821,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            a.anonymous_delete_decision("pub", "public/a").await.unwrap(),
+            a.anonymous_delete_decision("pub", "public/a")
+                .await
+                .unwrap(),
             (true, None)
         );
         assert_eq!(
-            a.anonymous_delete_decision("pub", "secret/a").await.unwrap(),
+            a.anonymous_delete_decision("pub", "secret/a")
+                .await
+                .unwrap(),
             (false, Some("policy:deny"))
         );
         // 前缀式 Allow + 前缀外键：无匹配即拒
@@ -1849,12 +1852,7 @@ mod tests {
                 "Resource":"arn:aws:s3:::pub/*"}]}"#,
         )
         .await;
-        assert!(
-            !a.anonymous_delete_decision("pub", "a")
-                .await
-                .unwrap()
-                .0
-        );
+        assert!(!a.anonymous_delete_decision("pub", "a").await.unwrap().0);
     }
 
     /// 签名路径不因匿名分支改变：桶主/策略提升/表三档口径保持原样。
