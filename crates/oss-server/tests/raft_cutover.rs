@@ -69,6 +69,7 @@ fn raft_settings(node_id: u64, role: RaftRole, db_path: std::path::PathBuf) -> R
         write_timeout_ms: 5_000,
         snapshot_max_chunk_size: 4 * 1024 * 1024,
         snapshot_max_bytes: 512 * 1024 * 1024,
+        feature_level: 1,
     }
 }
 

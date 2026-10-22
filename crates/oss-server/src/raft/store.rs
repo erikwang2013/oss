@@ -399,17 +399,23 @@ pub struct SqliteStateMachine {
     install_notify: Option<tokio::sync::watch::Sender<u64>>,
     /// 与 [`super::RaftHandle`] 共享的观测计数（apply 失败在此累加）。
     counters: Arc<Metrics>,
+    /// apply 门控：level > 此值的命令拒绝（控制库 = `min(配置, MAX)`；基座 KV = MAX）。
+    feature_level: u8,
+    /// 已提交激活标记（`schema_meta.raft_feature_level`，缺省 1）的进程内缓存。
+    activation: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl SqliteStateMachine {
     pub async fn open(path: &Path, max_snapshot_bytes: u64) -> Result<Self, sqlx::Error> {
         let pool = connect(path).await?;
+        // 基座 KV 不经网络/控制命令，无激活概念：门控取二进制上限。
         Ok(Self::with_pool(
             pool,
             max_snapshot_bytes,
             false,
             false,
             None,
+            super::compat::MAX_FEATURE_LEVEL,
         ))
     }
 
@@ -419,15 +425,25 @@ impl SqliteStateMachine {
         max_snapshot_bytes: u64,
         witness: bool,
         install_notify: Option<tokio::sync::watch::Sender<u64>>,
+        feature_level: u8,
     ) -> Result<Self, sqlx::Error> {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        Ok(Self::with_pool(
+        let marker = super::compat::read_activation(&pool)
+            .await
+            .map_err(sqlx::Error::Protocol)?;
+        let sm = Self::with_pool(
             pool,
             max_snapshot_bytes,
             true,
             witness,
             install_notify,
-        ))
+            super::compat::advertised_feature(feature_level),
+        );
+        sm.activation.store(
+            marker.max(super::compat::MIN_FEATURE_LEVEL),
+            Ordering::Relaxed,
+        );
+        Ok(sm)
     }
 
     fn with_pool(
@@ -436,6 +452,7 @@ impl SqliteStateMachine {
         control: bool,
         witness: bool,
         install_notify: Option<tokio::sync::watch::Sender<u64>>,
+        feature_level: u8,
     ) -> Self {
         Self {
             pool,
@@ -445,7 +462,16 @@ impl SqliteStateMachine {
             witness,
             install_notify,
             counters: Arc::new(Metrics::default()),
+            feature_level,
+            activation: Arc::new(std::sync::atomic::AtomicU8::new(
+                super::compat::MIN_FEATURE_LEVEL,
+            )),
         }
+    }
+
+    /// 本节点已提交的激活级别（R8 启动守卫/状态诊断）。
+    pub fn activation_level(&self) -> u8 {
+        self.activation.load(Ordering::Relaxed)
     }
 
     /// 与 [`super::RaftHandle`] 共享的观测计数（apply 失败在此累加）。
@@ -533,6 +559,10 @@ impl SqliteStateMachine {
     }
 
     /// S7.2：单事务安装 11 张复制表；守卫窗口与 raft_applied/快照同事务提交。
+    ///
+    /// D6：本版本只有 OSSCTL1（快照不含激活级别），marker 是节点本地且单调不减；
+    /// 安装不重建 `schema_meta`，因此 marker 永不因安装回退。等 OSSCTL2 携带级别时
+    /// 再在此取 `max(marker, snapshot_level)`。
     async fn install_control(
         &self,
         meta: &SnapshotMeta<u64, BasicNode>,
@@ -672,6 +702,24 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 if let Some(m) = entry.get_membership() {
                     last_membership = StoredMembership::new(Some(log_id), m.clone());
                 }
+                // R10：命令级别高于本机配置 → fail-stop（在开启事务前拒绝，绝不半应用）。
+                let required = match &entry.payload {
+                    EntryPayload::Normal(cmd) => cmd.min_feature_level(),
+                    EntryPayload::Blank | EntryPayload::Membership(_) => {
+                        super::compat::MIN_FEATURE_LEVEL
+                    }
+                };
+                if required > self.feature_level {
+                    return Err(storage_err(
+                        ErrorSubject::Apply(log_id),
+                        ErrorVerb::Write,
+                        std::io::Error::other(format!(
+                            "control command requires raft feature level {required}, but \
+                             [raft].feature_level = {}; refusing to apply",
+                            self.feature_level
+                        )),
+                    ));
+                }
 
                 let mut tx = self
                     .pool
@@ -691,6 +739,14 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                                 storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
                             })?
                         };
+                        // R10：与首条 level-2 entry 同事务写激活标记（业务拒绝的响应也写）。
+                        if self.control && required > self.activation.load(Ordering::Relaxed) {
+                            super::compat::bump_activation_tx(&mut tx, required)
+                                .await
+                                .map_err(|e| {
+                                    storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
+                                })?;
+                        }
                         (applied.response, !applied.effects.is_empty())
                     }
                     EntryPayload::Blank | EntryPayload::Membership(_) => (ControlResponse::Ok, false),
@@ -716,6 +772,9 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 tx.commit()
                     .await
                     .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+                if self.control {
+                    self.activation.fetch_max(required, Ordering::Relaxed);
+                }
                 // S7.2：followers 也执行 post-commit 副作用（桶目录/缓存）。旁路通知由
                 // state 的 watcher 做幂等全量对账（leader 上重复执行无害）。
                 if has_effects && let Some(tx) = &self.install_notify {
@@ -924,7 +983,7 @@ mod tests {
 
     async fn test_machine(dir: &Path) -> (SqliteStateMachine, SqlitePool) {
         let pool = connect(&dir.join("sm.db")).await.unwrap();
-        let sm = SqliteStateMachine::with_pool(pool.clone(), 1024 * 1024, false, false, None);
+        let sm = SqliteStateMachine::with_pool(pool.clone(), 1024 * 1024, false, false, None, 1);
         (sm, pool)
     }
 
@@ -1086,7 +1145,7 @@ mod tests {
             .unwrap();
 
         let mut sm_a =
-            SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None)
+            SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None, 1)
                 .await
                 .unwrap();
         let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
@@ -1096,7 +1155,7 @@ mod tests {
 
         let db_b = crate::db::Db::connect_raft(&url_b).await.unwrap();
         let mut sm_b =
-            SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None)
+            SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 1)
                 .await
                 .unwrap();
         let bytes = snap.snapshot.get_ref().clone();
@@ -1185,5 +1244,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(active, 0);
+    }
+
+    /// R10：首条 level-2 entry 与激活标记同事务提交（业务拒绝也写）；高于配置的
+    /// entry 在开启事务前 fail-stop，且不降级 marker。
+    #[tokio::test]
+    async fn level_two_apply_activates_marker_and_gate_rejects_above_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("marker-control.db").display()
+        );
+        let db = crate::db::Db::connect_raft(&url).await.unwrap();
+        let mut sm = SqliteStateMachine::open_with_pool(db.pool().clone(), 1 << 20, false, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(sm.activation_level(), 1);
+        let entries = [
+            Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Normal(ControlCommand::FeatureProbe { reject: true }),
+            },
+            Entry {
+                log_id: log_id(2),
+                payload: EntryPayload::Normal(ControlCommand::Set {
+                    key: "k".into(),
+                    value: "v".into(),
+                }),
+            },
+        ];
+        let responses = RaftStateMachine::<TypeConfig>::apply(&mut sm, entries)
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![ControlResponse::Invalid, ControlResponse::Ok]
+        );
+        assert_eq!(sm.activation_level(), 2);
+        let marker: String =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(marker, "2");
+
+        // 配置 1 的节点收到 level-2 entry：fail-stop，marker 保持 2。
+        let mut sm1 =
+            SqliteStateMachine::open_with_pool(db.pool().clone(), 1 << 20, false, None, 1)
+                .await
+                .unwrap();
+        let err = RaftStateMachine::<TypeConfig>::apply(
+            &mut sm1,
+            [Entry {
+                log_id: log_id(3),
+                payload: EntryPayload::Normal(ControlCommand::FeatureProbe { reject: false }),
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("feature level 2"), "{err}");
+        assert_eq!(sm1.activation_level(), 2);
     }
 }

@@ -10,6 +10,7 @@
 
 pub(crate) mod apply;
 pub mod command;
+pub mod compat;
 pub mod control;
 pub mod cutover;
 pub mod data;
@@ -47,10 +48,12 @@ pub const SYNC_READY: bool = true;
 /// stretch 2×6 数据面（S4）已实现；控制面（Raft 桶创建/身份配对）就绪后随 S7/S9 翻转。
 pub const STRETCH_READY: bool = true;
 
+// ---- 跨版本 wire 契约（Level B 滚动升级）：以下头名/限制一旦发布必须永久保持 ----
+// v1.13.1 是 rolling 基线（它发送 target 头）；wire/feature 握手见 [`compat`]。
 /// Raft RPC 集群令牌头（`/api/v1/site/raft/*`；常量时间校验见 [`network::token_matches`]）。
 pub const RPC_TOKEN_HEADER: &str = "x-oss-raft-token";
 /// 目标节点 id：防止同一 endpoint 上换了 node_id 的新进程误答旧成员的 Raft RPC
-/// （openraft 会把异日志响应当成 follower log reversion 并 panic）。
+/// （openraft 会把异日志响应当成 follower log reversion 并 panic）。永久保留发送与校验。
 pub const RPC_TARGET_HEADER: &str = "x-oss-raft-target-node-id";
 /// append/vote/snapshot 路由体上限：4 MiB 原始分块的 serde JSON 约 16 MiB。
 pub const RPC_BODY_LIMIT: usize = 32 * 1024 * 1024;
@@ -80,6 +83,11 @@ pub enum WriteError {
     },
     /// 无法联系 leader / 无 quorum（写可能已提交，重试幂等）。
     NoQuorum,
+    /// R4：命令要求的 feature 级别高于 leader 当前生效级别（混合版本/配置不足）。
+    FeatureUnavailable {
+        required: u8,
+        effective: u8,
+    },
 }
 
 impl std::fmt::Display for WriteError {
@@ -91,6 +99,13 @@ impl std::fmt::Display for WriteError {
                 write!(f, "not leader (leader={leader:?}, endpoint={endpoint:?})")
             }
             Self::NoQuorum => write!(f, "no leader/quorum"),
+            Self::FeatureUnavailable {
+                required,
+                effective,
+            } => write!(
+                f,
+                "raft feature level {required} not active (effective {effective})"
+            ),
         }
     }
 }
@@ -109,6 +124,8 @@ pub struct RaftHandle {
     counters: Arc<metrics::Metrics>,
     /// peer TLS 物料（None = 明文；Some = Raft RPC/转发/成员请求全走 https）。
     tls: Option<Arc<crate::tls::Tls>>,
+    /// 本节点看到的 peer wire/feature（带 term）；只有 leader 的用于门控。
+    peers: Arc<compat::PeerVersions>,
 }
 
 impl RaftHandle {
@@ -136,6 +153,61 @@ impl RaftHandle {
         &self.counters
     }
 
+    pub fn peers(&self) -> &Arc<compat::PeerVersions> {
+        &self.peers
+    }
+
+    /// 对外宣告/愿意接受的 feature：`min(configured, MAX)`（D3：意愿而非能力）。
+    pub fn advertised_feature(&self) -> u8 {
+        compat::advertised_feature(self.settings.feature_level)
+    }
+
+    /// 本节点已提交的激活级别（缺省 1；基座 KV 无标记）。
+    pub fn activation_level(&self) -> u8 {
+        self.state_machine.activation_level()
+    }
+
+    /// Level B 门控：生效级别 = min(本机配置, 当前 term 的 voter+learner feature)。
+    /// follower 上（`only_if_leader`）不做本地拒绝：它没有当前 term 记录，交给 leader 判。
+    fn check_feature(&self, cmd: &ControlCommand, only_if_leader: bool) -> Result<(), WriteError> {
+        let required = cmd.min_feature_level();
+        if required <= compat::MIN_FEATURE_LEVEL {
+            return Ok(());
+        }
+        let (is_leader, effective) = {
+            let m = self.raft.metrics();
+            let m = m.borrow();
+            if m.current_leader != Some(m.id) {
+                (false, compat::MIN_FEATURE_LEVEL)
+            } else {
+                let voters: Vec<u64> = m.membership_config.voter_ids().collect();
+                let learners: Vec<u64> = m.membership_config.membership().learner_ids().collect();
+                (
+                    true,
+                    compat::effective_feature_level(
+                        self.settings.feature_level,
+                        m.id,
+                        &voters,
+                        &learners,
+                        m.current_term,
+                        &self.peers,
+                    )
+                    .level,
+                )
+            }
+        };
+        if only_if_leader && !is_leader {
+            return Ok(());
+        }
+        if required > effective {
+            return Err(WriteError::FeatureUnavailable {
+                required,
+                effective,
+            });
+        }
+        Ok(())
+    }
+
     /// 成员表是否已有 voter（`metrics().membership_config`；勿跨 `.await` 持借用）。
     pub fn membership_nonempty(&self) -> bool {
         let m = self.raft.metrics();
@@ -161,6 +233,8 @@ impl RaftHandle {
     /// 本地写（不做 leader 转发）：超时返回错误（写可能已提交），成功后等到 apply
     /// 越过本条日志再返回（`/write` 的 applied_index 才是可等待的下界）。
     pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, WriteError> {
+        // 转发入口：即使本节点不是 leader 也按 level-1 生效级别拒绝 level-2（fail closed）。
+        self.check_feature(&cmd, false)?;
         let timeout = Duration::from_millis(self.settings.write_timeout_ms);
         let deadline = tokio::time::Instant::now() + timeout;
         match tokio::time::timeout_at(deadline, self.raft.client_write(cmd)).await {
@@ -186,6 +260,8 @@ impl RaftHandle {
     /// 控制写（follower 可用）：本地提交；否则向 leader 的 `/api/v1/site/raft/write`
     /// 转交一次（`x-oss-raft-forwarded: 1`，最多一跳）。
     pub async fn client_write(&self, cmd: ControlCommand) -> Result<ControlResponse, WriteError> {
+        // leader 本地先判；follower 交给 leader（转发后同样会被 leader 门控）。
+        self.check_feature(&cmd, true)?;
         let timeout = Duration::from_millis(self.settings.write_timeout_ms);
         let deadline = tokio::time::Instant::now() + timeout;
         // 命令可能很大（≤24 MiB）：ForwardToLeader 不带数据，转发要留一份副本。
@@ -236,6 +312,11 @@ impl RaftHandle {
             .post(format!("{endpoint}/api/v1/site/raft/write"))
             .header(RPC_TOKEN_HEADER, &self.settings.cluster_token)
             .header(routes::FORWARD_HEADER, "1")
+            .header(compat::WIRE_HEADER, compat::WIRE_VERSION.to_string())
+            .header(
+                compat::FEATURE_HEADER,
+                self.advertised_feature().to_string(),
+            )
             .timeout(timeout);
         if let Some(leader) = leader {
             req = req.header(RPC_TARGET_HEADER, leader.to_string());
@@ -280,7 +361,26 @@ impl RaftHandle {
                     endpoint: hint.leader_endpoint,
                 })
             }
-            503 => Err(WriteError::NoQuorum),
+            503 => {
+                #[derive(Deserialize)]
+                struct FeatureErr {
+                    #[serde(default)]
+                    error: String,
+                    #[serde(default)]
+                    required: u8,
+                    #[serde(default)]
+                    effective: u8,
+                }
+                if let Ok(f) = serde_json::from_slice::<FeatureErr>(&body)
+                    && f.error == "feature_unavailable"
+                {
+                    return Err(WriteError::FeatureUnavailable {
+                        required: f.required,
+                        effective: f.effective,
+                    });
+                }
+                Err(WriteError::NoQuorum)
+            }
             other => Err(WriteError::Raft(format!(
                 "leader write HTTP {other}: {}",
                 String::from_utf8_lossy(&body)
@@ -352,6 +452,14 @@ pub async fn spawn_with_control_tls(
     // 未 apply 的成员日志（崩溃窗口）也要阻止再次 initialize；openraft 启动时会重放。
     let has_logs = log_store.has_logs().await?;
     let witness = matches!(settings.role, crate::config::RaftRole::Witness);
+    // R8：控制库启动守卫（单点：生产/测试/witness 都经这里）。marker 高于本机配置或
+    // 二进制最高 → 拒绝启动，绝不以降低的级别继续（已激活集群的回滚必须换回二进制）。
+    if let Some(pool) = &control_pool {
+        let marker = compat::read_activation(pool)
+            .await
+            .map_err(std::io::Error::other)?;
+        compat::guard_startup(marker, settings.feature_level).map_err(std::io::Error::other)?;
+    }
     let state_machine = match control_pool {
         Some(pool) => {
             SqliteStateMachine::open_with_pool(
@@ -359,6 +467,7 @@ pub async fn spawn_with_control_tls(
                 settings.snapshot_max_bytes,
                 witness,
                 install_notify,
+                settings.feature_level,
             )
             .await?
         }
@@ -366,13 +475,20 @@ pub async fn spawn_with_control_tls(
     };
 
     let counters = Arc::clone(state_machine.counters());
+    let peers = Arc::new(compat::PeerVersions::default());
     let network = match &tls {
         Some(t) => network::HttpNetworkFactory::new_tls(
             settings.cluster_token.clone(),
             Arc::clone(t),
             t.reqwest_client()?,
+            Arc::clone(&peers),
+            compat::advertised_feature(settings.feature_level),
         ),
-        None => network::HttpNetworkFactory::new(settings.cluster_token.clone()),
+        None => network::HttpNetworkFactory::new(
+            settings.cluster_token.clone(),
+            Arc::clone(&peers),
+            compat::advertised_feature(settings.feature_level),
+        ),
     };
     let raft = Raft::new(
         settings.node_id,
@@ -404,6 +520,7 @@ pub async fn spawn_with_control_tls(
         state_machine,
         counters,
         tls,
+        peers,
     };
     handle.bootstrap_if_needed(has_logs).await?;
     Ok(handle)
@@ -475,6 +592,7 @@ mod tests {
             write_timeout_ms: 20_000,
             snapshot_max_chunk_size: SNAPSHOT_CHUNK_MAX,
             snapshot_max_bytes: 512 * 1024 * 1024,
+            feature_level: 1,
         }
     }
 
@@ -515,6 +633,30 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// R8：已激活 marker=2 的库用 feature_level=1 启动必须拒绝（错误里两个值都要在）。
+    #[tokio::test]
+    async fn startup_refuses_activation_above_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("control.db").display()
+        );
+        let db = crate::db::Db::connect_raft(&url).await.unwrap();
+        sqlx::query("INSERT INTO schema_meta (key, value) VALUES ('raft_feature_level', '2')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut settings = test_settings(dir.path());
+        settings.feature_level = 1;
+        let err = spawn_with_control(settings, Some(db.pool().clone()), None)
+            .await
+            .err()
+            .expect("marker 2 > config 1 必须拒绝启动");
+        let msg = err.to_string();
+        assert!(msg.contains("raft_feature_level=2"), "{msg}");
+        assert!(msg.contains("feature_level=1"), "{msg}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

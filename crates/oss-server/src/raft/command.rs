@@ -3,6 +3,9 @@
 //! 命令只携带**提交前**算好的确定值（Argon2 hash、封装的 SK、时间戳、策略/JSON、模块
 //! base64、排序后的完整规则行）；apply 侧只做 SQL 与自然键解析，不生成随机数或时间。
 //! 变体名与字段名是跨版本/跨站点协议，改名即破坏重放与快照兼容。
+//!
+//! 滚动升级规则（[`super::compat`]）：**绝不**给已有变体加/改名/删字段——旧节点
+//! `deny_unknown_fields` 会拒绝整条 entry；新复制语义只加新变体并标 level 2。
 
 use serde::{Deserialize, Serialize};
 
@@ -202,6 +205,11 @@ pub enum ControlCommand {
     Delete {
         key: String,
     },
+    /// 仅单元测试：level-2 探针，验证激活标记与 apply 门控（不进生产命令集）。
+    #[cfg(test)]
+    FeatureProbe {
+        reject: bool,
+    },
 }
 
 /// 每条 entry 恰好一个响应。业务拒绝走这里（提交后不回滚）；内部错误走 `Err` fail-stop。
@@ -237,6 +245,16 @@ impl std::fmt::Display for SizeError {
 impl std::error::Error for SizeError {}
 
 impl ControlCommand {
+    /// Level B：命令进入 raft log 所需的最低 feature 级别。只有新语义命令返回 2；
+    /// 既有命令永远 1（旧二进制必须能解析并应用）。
+    pub fn min_feature_level(&self) -> u8 {
+        #[cfg(test)]
+        if matches!(self, Self::FeatureProbe { .. }) {
+            return 2;
+        }
+        super::compat::MIN_FEATURE_LEVEL
+    }
+
     /// serde JSON 字节数（与 raft log / RPC 实际编码一致）。
     pub fn encoded_len(&self) -> Result<usize, serde_json::Error> {
         serde_json::to_vec(self).map(|v| v.len())

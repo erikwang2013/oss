@@ -97,6 +97,11 @@ pub struct RaftToml {
     /// 快照总上限，默认 512 MiB，可配上限 1 GiB。
     #[serde(default = "default_snapshot_max_bytes")]
     pub snapshot_max_bytes: u64,
+    /// 本节点愿意激活的最高协议级别：1 = 仅旧协议（默认，二进制升级不改变行为）；
+    /// 2 = 允许 level-2 命令/快照（仍要等所有 voter/learner 宣告 2 才生效）。
+    /// 回滚到旧二进制前必须删除此键（`RaftToml` deny_unknown_fields）。
+    #[serde(default = "default_feature_level")]
+    pub feature_level: u8,
 }
 
 impl RaftToml {
@@ -123,6 +128,16 @@ impl RaftToml {
             return Err(format!(
                 "[raft].snapshot_max_bytes 必须在 1..=1 GiB，实际 {}",
                 self.snapshot_max_bytes
+            ));
+        }
+        if !(crate::raft::compat::MIN_FEATURE_LEVEL..=crate::raft::compat::MAX_FEATURE_LEVEL)
+            .contains(&self.feature_level)
+        {
+            return Err(format!(
+                "[raft].feature_level 必须在 {}..={}，实际 {}",
+                crate::raft::compat::MIN_FEATURE_LEVEL,
+                crate::raft::compat::MAX_FEATURE_LEVEL,
+                self.feature_level
             ));
         }
         Ok(())
@@ -235,6 +250,9 @@ fn default_snapshot_max_chunk_size() -> u64 {
 }
 fn default_snapshot_max_bytes() -> u64 {
     512 * 1024 * 1024
+}
+fn default_feature_level() -> u8 {
+    crate::raft::compat::MIN_FEATURE_LEVEL
 }
 fn default_sync_max_object_bytes() -> u64 {
     64 * 1024 * 1024
@@ -1425,6 +1443,7 @@ mod tests {
             write_timeout_ms: default_write_timeout_ms(),
             snapshot_max_chunk_size: default_snapshot_max_chunk_size(),
             snapshot_max_bytes: default_snapshot_max_bytes(),
+            feature_level: default_feature_level(),
         }
     }
 
@@ -1477,6 +1496,7 @@ cluster_token = "x"
         assert_eq!(r.write_timeout_ms, 10_000);
         assert_eq!(r.snapshot_max_chunk_size, 4 * 1024 * 1024);
         assert_eq!(r.snapshot_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(r.feature_level, 1);
         let s = SyncToml::default();
         assert_eq!(s.max_object_bytes, 64 * 1024 * 1024);
         assert_eq!(s.timeout_ms, 10_000);
@@ -1580,6 +1600,14 @@ state_db = "/x/state.db"
         let mut c = m9_cfg();
         c.raft.as_mut().unwrap().snapshot_max_bytes = 1024 * 1024 * 1024 + 1;
         assert!(c.raft_validate().is_err());
+        for bad in [0u8, 3] {
+            let mut c = m9_cfg();
+            c.raft.as_mut().unwrap().feature_level = bad;
+            assert!(c.raft_validate().is_err(), "feature_level={bad} 应拒绝");
+        }
+        let mut c = m9_cfg();
+        c.raft.as_mut().unwrap().feature_level = 2;
+        assert!(c.raft_validate().is_ok());
     }
 
     #[test]

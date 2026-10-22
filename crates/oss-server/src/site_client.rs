@@ -38,6 +38,11 @@ pub struct PeerIdentity {
     pub vault_probe: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+    // ---- Level B 滚动升级握手（缺省 = 旧节点 wire/feature 1） ----
+    #[serde(default)]
+    pub raft_wire_version: Option<u32>,
+    #[serde(default)]
+    pub raft_feature_level: Option<u8>,
     #[serde(default)]
     pub stretch: Option<StretchIdentity>,
 }
@@ -230,7 +235,15 @@ pub async fn post_raft_join(
     body: &serde_json::Value,
     timeout: Duration,
 ) -> Result<(u16, Bytes), String> {
-    post_raft_join_tls(endpoint, cluster_token, body, timeout, None).await
+    post_raft_join_tls(
+        endpoint,
+        cluster_token,
+        body,
+        timeout,
+        None,
+        crate::raft::compat::MIN_FEATURE_LEVEL,
+    )
+    .await
 }
 
 pub async fn post_raft_join_tls(
@@ -239,13 +252,20 @@ pub async fn post_raft_join_tls(
     body: &serde_json::Value,
     timeout: Duration,
     tls: Option<&crate::tls::Tls>,
+    feature: u8,
 ) -> Result<(u16, Bytes), String> {
     let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
+    let wire = crate::raft::compat::WIRE_VERSION.to_string();
+    let feature = feature.to_string();
     send_with_headers(
         endpoint,
         "POST",
         "/api/v1/site/raft/join",
-        &[(crate::raft::RPC_TOKEN_HEADER, cluster_token)],
+        &[
+            (crate::raft::RPC_TOKEN_HEADER, cluster_token),
+            (crate::raft::compat::WIRE_HEADER, &wire),
+            (crate::raft::compat::FEATURE_HEADER, &feature),
+        ],
         Some(bytes),
         timeout,
         tls,
@@ -254,6 +274,7 @@ pub async fn post_raft_join_tls(
 }
 
 /// S7.3 成员变更：集群令牌；`forwarded` 只在节点内部转发时置位（单跳，防二次转发）。
+#[allow(clippy::too_many_arguments)] // 参数即线格式/传输选项，逐个平铺比临时结构体清楚
 pub(crate) async fn post_raft_membership(
     endpoint: &str,
     token: &str,
@@ -262,9 +283,16 @@ pub(crate) async fn post_raft_membership(
     forwarded: bool,
     target: Option<u64>,
     tls: Option<&crate::tls::Tls>,
+    feature: u8,
 ) -> Result<(u16, Bytes), String> {
     let target = target.map(|t| t.to_string());
-    let mut headers = vec![(crate::raft::RPC_TOKEN_HEADER, token)];
+    let wire = crate::raft::compat::WIRE_VERSION.to_string();
+    let feature = feature.to_string();
+    let mut headers = vec![
+        (crate::raft::RPC_TOKEN_HEADER, token),
+        (crate::raft::compat::WIRE_HEADER, wire.as_str()),
+        (crate::raft::compat::FEATURE_HEADER, feature.as_str()),
+    ];
     if forwarded {
         headers.push((crate::raft::routes::FORWARD_HEADER, "1"));
         if let Some(t) = target.as_deref() {
@@ -281,6 +309,65 @@ pub(crate) async fn post_raft_membership(
         tls,
     )
     .await
+}
+
+/// Level B 预检：对端 `/status` 的握手字段（缺失/非法 = 1）。
+#[derive(Debug, Clone, Copy)]
+pub struct RaftPeerStatus {
+    pub wire: u32,
+    pub feature: u8,
+}
+
+/// 成员/配对预检必须有界：旧节点或坏节点不能把成员变更挂住。
+const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub async fn get_raft_status(endpoint: &str, token: &str) -> Result<RaftPeerStatus, String> {
+    get_raft_status_tls(endpoint, token, None).await
+}
+
+pub async fn get_raft_status_tls(
+    endpoint: &str,
+    token: &str,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<RaftPeerStatus, String> {
+    let wire = crate::raft::compat::WIRE_VERSION.to_string();
+    let feature = crate::raft::compat::MAX_FEATURE_LEVEL.to_string();
+    let (status, body) = send_with_headers(
+        endpoint,
+        "GET",
+        "/api/v1/site/raft/status",
+        &[
+            (crate::raft::RPC_TOKEN_HEADER, token),
+            (crate::raft::compat::WIRE_HEADER, &wire),
+            (crate::raft::compat::FEATURE_HEADER, &feature),
+        ],
+        None,
+        STATUS_PROBE_TIMEOUT,
+        tls,
+    )
+    .await?;
+    if status != 200 {
+        return Err(format!("对端 raft status HTTP {status}"));
+    }
+    #[derive(serde::Deserialize)]
+    struct StatusCompat {
+        #[serde(default = "one_u32")]
+        wire_version: u32,
+        #[serde(default = "one_u8")]
+        feature_level: u8,
+    }
+    fn one_u32() -> u32 {
+        1
+    }
+    fn one_u8() -> u8 {
+        1
+    }
+    let s: StatusCompat =
+        serde_json::from_slice(&body).map_err(|e| format!("raft status 解析失败：{e}"))?;
+    Ok(RaftPeerStatus {
+        wire: s.wire_version.max(1),
+        feature: s.feature_level.max(1),
+    })
 }
 
 /// changelog 出货（切片 1b）：返回 (status, body)。
