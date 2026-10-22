@@ -46,8 +46,8 @@ impl LifecycleStore for MemStore {
         let mut specs = rules.to_vec();
         validate_rules(&mut specs, &self.tier_ids)?;
         specs.sort_by(|a, b| {
-            a.prefix
-                .cmp(&b.prefix)
+            a.prefix()
+                .cmp(b.prefix())
                 .then_with(|| a.rule_id.cmp(&b.rule_id))
         });
         *self.rules.lock().unwrap() = Some(specs);
@@ -180,7 +180,7 @@ async fn roundtrip_put_get_delete() {
         .iter()
         .find(|r| r.rule_id.as_deref() == Some("rule-2"))
         .unwrap();
-    assert_eq!(generated.transition_tier.as_deref(), Some("cold"));
+    assert_eq!(generated.transitions[0].tier.as_deref(), Some("cold"));
 
     let out = s3
         .get_bucket_lifecycle_configuration(req(GetBucketLifecycleConfigurationInput {
@@ -250,7 +250,7 @@ async fn unsupported_and_invalid_matrix() {
     let e = put(&s3, "bkt", vec![]).await.unwrap_err();
     assert_eq!(e.code(), &S3ErrorCode::MalformedXML);
 
-    // 501 优先于 400：带 tag 且无任何受支持动作
+    // Tag 过滤已支持；无动作仍是 400（不再 501）
     let mut tagged = rule(None, None, None, None, None);
     tagged.filter = Some(LifecycleRuleFilter {
         tag: Some(Tag {
@@ -260,9 +260,9 @@ async fn unsupported_and_invalid_matrix() {
         ..Default::default()
     });
     let e = put(&s3, "bkt", vec![tagged]).await.unwrap_err();
-    assert_eq!(e.code(), &S3ErrorCode::NotImplemented, "{e:?}");
+    assert_eq!(e.code(), &S3ErrorCode::InvalidRequest, "{e:?}");
 
-    // Transition.date → 501
+    // Transition.date：非午夜 → InvalidArgument（已支持 Date，不再 501）
     let dated = rule(
         None,
         None,
@@ -277,9 +277,9 @@ async fn unsupported_and_invalid_matrix() {
         }]),
     );
     let e = put(&s3, "bkt", vec![dated]).await.unwrap_err();
-    assert_eq!(e.code(), &S3ErrorCode::NotImplemented);
+    assert_eq!(e.code(), &S3ErrorCode::InvalidArgument);
 
-    // Expiration.date → 501
+    // Expiration.date：非午夜 → InvalidArgument（已支持 Date，不再 501）
     let exp_date = rule(
         None,
         None,
@@ -293,7 +293,7 @@ async fn unsupported_and_invalid_matrix() {
         None,
     );
     let e = put(&s3, "bkt", vec![exp_date]).await.unwrap_err();
-    assert_eq!(e.code(), &S3ErrorCode::NotImplemented);
+    assert_eq!(e.code(), &S3ErrorCode::InvalidArgument);
 
     // 无动作 → 400 InvalidRequest
     let e = put(&s3, "bkt", vec![rule(None, Some("p/"), None, None, None)])
@@ -453,4 +453,111 @@ async fn missing_bucket_404_and_not_injected_501() {
     .await
     .unwrap_err();
     assert_eq!(e.code(), &S3ErrorCode::NotImplemented);
+}
+
+/// P1/P2：Tag/Size 过滤、Expiration.Date、多 Transition、Noncurrent 全量往返。
+#[tokio::test]
+async fn structured_rules_roundtrip() {
+    let (s3, _mem, _d) = service(&["cold"]).await;
+    let now = time::OffsetDateTime::now_utc();
+    let midnight = time::Date::from_calendar_date(now.year(), now.month(), now.day())
+        .unwrap()
+        .midnight()
+        .assume_utc()
+        + time::Duration::days(2);
+    let mut expire = rule(
+        None,
+        None,
+        None,
+        Some(LifecycleExpiration {
+            date: Some(Timestamp::from(midnight)),
+            ..Default::default()
+        }),
+        None,
+    );
+    expire.filter = Some(LifecycleRuleFilter {
+        and: Some(LifecycleRuleAndOperator {
+            prefix: Some("logs/".into()),
+            tags: Some(vec![Tag {
+                key: Some("env".into()),
+                value: Some("prod".into()),
+            }]),
+            object_size_greater_than: Some(10),
+            object_size_less_than: Some(1000),
+        }),
+        ..Default::default()
+    });
+    let tr = rule(
+        None,
+        Some("p/"),
+        None,
+        None,
+        Some(vec![
+            Transition {
+                days: Some(10),
+                storage_class: Some(TransitionStorageClass::from_static("STANDARD_IA")),
+                ..Default::default()
+            },
+            Transition {
+                days: Some(20),
+                storage_class: Some(TransitionStorageClass::from_static("GLACIER")),
+                ..Default::default()
+            },
+        ]),
+    );
+    let mut nc = rule(None, Some("p/"), None, None, None);
+    nc.noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+        noncurrent_days: Some(30),
+        newer_noncurrent_versions: Some(2),
+    });
+    nc.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+        noncurrent_days: Some(60),
+        newer_noncurrent_versions: None,
+        storage_class: Some(TransitionStorageClass::from_static("GLACIER_IR")),
+    }]);
+    put(&s3, "bkt", vec![expire, tr, nc]).await.unwrap();
+
+    let out = s3
+        .get_bucket_lifecycle_configuration(req(GetBucketLifecycleConfigurationInput {
+            bucket: "bkt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let rules = out.rules.unwrap();
+    assert_eq!(rules.len(), 3);
+    let e = rules
+        .iter()
+        .find(|r| r.expiration.as_ref().is_some_and(|e| e.date.is_some()))
+        .expect("date rule");
+    let f = e.filter.as_ref().unwrap();
+    let and = f.and.as_ref().expect("And filter");
+    assert_eq!(and.prefix.as_deref(), Some("logs/"));
+    assert_eq!(and.tags.as_ref().unwrap().len(), 1);
+    assert_eq!(and.object_size_greater_than, Some(10));
+    let t = rules
+        .iter()
+        .find(|r| r.transitions.as_ref().is_some_and(|t| t.len() == 2))
+        .expect("multi transition rule");
+    assert_eq!(t.transitions.as_ref().unwrap()[1].days, Some(20));
+    let n = rules
+        .iter()
+        .find(|r| r.noncurrent_version_expiration.is_some())
+        .expect("noncurrent rule");
+    assert_eq!(
+        n.noncurrent_version_expiration
+            .as_ref()
+            .unwrap()
+            .newer_noncurrent_versions,
+        Some(2)
+    );
+    assert_eq!(
+        n.noncurrent_version_transitions.as_ref().unwrap()[0]
+            .storage_class
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "GLACIER_IR"
+    );
 }

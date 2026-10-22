@@ -36,7 +36,10 @@ use openraft::{BasicNode, Raft};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
-pub use command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, SizeError};
+pub use command::{
+    ControlCommand, ControlResponse, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits,
+    SizeError,
+};
 pub use settings::RaftSettings;
 
 use store::SqliteStateMachine;

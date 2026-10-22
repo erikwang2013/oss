@@ -35,6 +35,23 @@ pub struct LifecycleRuleCmd {
     pub enabled: bool,
 }
 
+/// 结构化生命周期规则（`config_json` = filter/多 Transition/Date/Noncurrent 的版本化 blob）。
+/// 与 V1 分开携带：旧二进制无法解码 V2 变体，写 V2 前需全集群升级。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleRuleCmdV2 {
+    pub rule_id: Option<String>,
+    pub prefix: String,
+    pub expire_days: i64,
+    pub expiration_days: Option<i64>,
+    pub transition_days: Option<i64>,
+    pub transition_class: Option<String>,
+    pub transition_tier: Option<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub config_json: Option<String>,
+}
+
 /// 单条控制命令。所有带 `owner` 的字段是 username；`None` = 管理员属主
 /// （buckets.owner_id 写 NULL，AP/inventory 写本地管理员 id 或 witness 0）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +138,13 @@ pub enum ControlCommand {
     BucketSetLifecycle {
         bucket: String,
         rules: Vec<LifecycleRuleCmd>,
+        updated_at: i64,
+    },
+    /// 未来 level-2 命令：结构化生命周期（config_json）。保留 V1 变体供旧日志/快照重放；
+    /// 旧节点遇到 V2 会解码失败，因此写 V2 前必须完成全集群升级。
+    BucketSetLifecycleV2 {
+        bucket: String,
+        rules: Vec<LifecycleRuleCmdV2>,
         updated_at: i64,
     },
     BucketClearLifecycle {

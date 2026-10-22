@@ -374,4 +374,6 @@ impl TaskExecutor for M8TaskExecutor {
     }
 }
 
-pub use crate::tier_sweep::{reap_once, reconcile_restores, spawn, sweep_transitions};
+pub use crate::tier_sweep::{
+    reap_once, reconcile_restores, spawn, sweep_transitions, sweep_transitions_at,
+};

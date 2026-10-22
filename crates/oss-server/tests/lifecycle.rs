@@ -4,7 +4,7 @@ mod common;
 
 use common::state;
 use oss_server::db::LifecycleRuleRow;
-use oss_server::lifecycle::sweep_once;
+use oss_server::lifecycle::{sweep_once, sweep_once_at};
 use xl_store::store::VersioningMode;
 
 fn rule(prefix: &str, days: i64) -> LifecycleRuleRow {
@@ -19,6 +19,7 @@ fn rule(prefix: &str, days: i64) -> LifecycleRuleRow {
         transition_tier: None,
         enabled: true,
         updated_at: 0,
+        config_json: None,
     }
 }
 
@@ -260,9 +261,9 @@ async fn delete_bucket_clears_lifecycle_rules() {
     );
 }
 
-/// S6-3：重复 prefix → 400（PK(bucket,prefix) 撞库曾是 500）。
+/// P1：同 prefix 多条规则合法（AWS 允许；PK 已改为 (bucket,rule_id)）。
 #[tokio::test]
-async fn duplicate_prefix_rejected_400() {
+async fn duplicate_prefix_allowed_204() {
     let dir = tempfile::tempdir().unwrap();
     let (st, base_tok) = admin_env(dir.path()).await;
     let (base, tok) = base_tok.split_once('|').unwrap();
@@ -274,21 +275,15 @@ async fn duplicate_prefix_rejected_400() {
         .bearer_auth(tok)
         .json(&serde_json::json!([
             {"prefix": "a", "expire_days": 1},
-            {"prefix": "a", "expire_days": 2}
+            {"prefix": "a", "expire_days": 2, "rule_id": "second"}
         ]))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
-    // 正常单条放行
-    let resp = reqwest::Client::new()
-        .put(format!("{base}/api/v1/buckets/dbk/lifecycle"))
-        .bearer_auth(tok)
-        .json(&serde_json::json!([{"prefix": "a", "expire_days": 1}]))
-        .send()
-        .await
-        .unwrap();
     assert_eq!(resp.status(), 204);
+    let rows = st.db.list_lifecycle_rules("dbk").await.unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().any(|r| r.rule_id.as_deref() == Some("second")));
 }
 
 /// M6 切片 0（R5/P2-4）：生命周期删除发 LifecycleExpiration 事件（非版本 Delete /
@@ -371,4 +366,310 @@ async fn lifecycle_emits_expiration_events() {
         n1["eventName"],
         "s3:LifecycleExpiration:DeleteMarkerCreated"
     );
+}
+
+// ——— P1/P2：结构化过滤、Date、EODM、noncurrent ———
+
+use oss_server::state::AppState;
+use xl_s3::lifecycle::{
+    ExpirationAction, LifecycleFilter, LifecycleRuleSpec, NoncurrentExpiration,
+};
+use xl_store::meta::ObjectTag;
+
+fn blank_spec() -> LifecycleRuleSpec {
+    LifecycleRuleSpec {
+        rule_id: None,
+        filter: LifecycleFilter::default(),
+        expiration: None,
+        transitions: vec![],
+        noncurrent_expiration: None,
+        noncurrent_transitions: vec![],
+        enabled: true,
+    }
+}
+
+async fn versioned_bucket(st: &AppState, bucket: &str) {
+    st.store.create_bucket(bucket).await.unwrap();
+    st.db.insert_bucket(bucket, None).await.unwrap();
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = ?")
+        .bind(bucket)
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+}
+
+fn stream(b: &'static [u8]) -> xl_store::store::ByteStream {
+    Box::pin(futures::stream::once(async move {
+        Ok(bytes::Bytes::from_static(b))
+    }))
+}
+
+async fn put_version(st: &AppState, bucket: &str, key: &str, body: &'static [u8]) -> String {
+    st.store
+        .put_object_stream_with_meta(
+            bucket,
+            key,
+            stream(body),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .version_id
+        .unwrap()
+}
+
+/// Tag + Size 过滤：只有同时满足前缀/标签/大小的对象被删；配置落 config_json。
+#[tokio::test]
+async fn structured_tag_and_size_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("fbk").await.unwrap();
+    st.db.insert_bucket("fbk", None).await.unwrap();
+    let put = |key: &'static str, body: &'static [u8], tags: Option<Vec<ObjectTag>>| {
+        let st = st.clone();
+        async move {
+            st.store
+                .put_object_stream_with_meta(
+                    "fbk",
+                    key,
+                    stream(body),
+                    None,
+                    Default::default(),
+                    None,
+                    VersioningMode::Off,
+                    None,
+                    None,
+                    tags,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let prod = || {
+        Some(vec![ObjectTag {
+            key: "env".into(),
+            value: "prod".into(),
+        }])
+    };
+    put("logs/a.txt", b"hello", prod()).await;
+    put("logs/empty.txt", b"", prod()).await;
+    put("logs/dev.txt", b"hello", None).await;
+    put("other/c.txt", b"hello", prod()).await;
+
+    let mut spec = blank_spec();
+    spec.filter = LifecycleFilter {
+        prefix: "logs/".into(),
+        tags: prod().unwrap(),
+        size_gt: Some(0),
+        size_lt: None,
+    };
+    spec.expiration = Some(ExpirationAction::Days { days: 0 });
+    st.lifecycle.put_rules("fbk", &[spec]).await.unwrap();
+    assert!(
+        st.db.list_lifecycle_rules("fbk").await.unwrap()[0]
+            .config_json
+            .is_some(),
+        "Tag/Size 规则必须落结构化 blob"
+    );
+
+    assert_eq!(sweep_once(&st).await, 1);
+    assert!(matches!(
+        st.store.get_object("fbk", "logs/a.txt").await,
+        Err(xl_store::error::Error::NoSuchKey(_))
+    ));
+    for kept in ["logs/empty.txt", "logs/dev.txt", "other/c.txt"] {
+        assert!(
+            st.store.get_object("fbk", kept).await.is_ok(),
+            "{kept} 不应被删"
+        );
+    }
+}
+
+/// Expiration.Date：执行日后清掉当日之前已存在的对象（用注入时刻模拟日期到达）。
+#[tokio::test]
+async fn expiration_date_deletes_objects_existing_before_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("dbk").await.unwrap();
+    st.db.insert_bucket("dbk", None).await.unwrap();
+    st.store
+        .put_object("dbk", "old.txt", bytes::Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let date = (now / 86_400 + 1) * 86_400;
+    let mut spec = blank_spec();
+    spec.expiration = Some(ExpirationAction::Date { date });
+    st.lifecycle.put_rules("dbk", &[spec]).await.unwrap();
+
+    // 未到执行日：不动
+    assert_eq!(sweep_once(&st).await, 1);
+    assert!(st.store.get_object("dbk", "old.txt").await.is_ok());
+    // 执行日之后：删除
+    sweep_once_at(&st, date + 3600).await;
+    assert!(matches!(
+        st.store.get_object("dbk", "old.txt").await,
+        Err(xl_store::error::Error::NoSuchKey(_))
+    ));
+}
+
+/// EODM：唯一版本且为 delete marker 的墓碑被清除。
+#[tokio::test]
+async fn eodm_removes_sole_delete_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    versioned_bucket(&st, "ebk").await;
+    let out = st
+        .store
+        .delete_object_versioned("ebk", "gone.txt", None, VersioningMode::Enabled)
+        .await
+        .unwrap();
+    assert!(matches!(out, xl_store::store::DeleteOutcome::Marker { .. }));
+    let mut spec = blank_spec();
+    spec.expiration = Some(ExpirationAction::ExpiredObjectDeleteMarker);
+    st.lifecycle.put_rules("ebk", &[spec]).await.unwrap();
+
+    assert_eq!(sweep_once(&st).await, 1);
+    let vl = st
+        .store
+        .list_object_versions("ebk", "", 10, None, None)
+        .await
+        .unwrap();
+    assert!(vl.entries.is_empty(), "墓碑应被删除：{vl:?}");
+    let jobs = st.db.list_jobs(10).await.unwrap();
+    assert_eq!(jobs[0]["deleted"], 1, "{jobs:?}");
+}
+
+/// noncurrent：NewerNoncurrentVersions 保留最新 N 个；链上前一条的创建时间是年龄时钟。
+#[tokio::test]
+async fn noncurrent_expiration_retains_newer_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    versioned_bucket(&st, "nbk").await;
+    let mut ids = Vec::new();
+    for body in [b"v0".as_slice(), b"v1", b"v2", b"v3"] {
+        ids.push(put_version(&st, "nbk", "k.txt", body).await);
+    }
+    let mut spec = blank_spec();
+    spec.filter.prefix = "k".into();
+    spec.noncurrent_expiration = Some(NoncurrentExpiration {
+        days: 1,
+        newer: Some(2),
+    });
+    st.lifecycle
+        .put_rules("nbk", &[spec.clone()])
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let future = now + 2 * 86_400;
+    sweep_once_at(&st, future).await;
+
+    let vl = st
+        .store
+        .list_object_versions("nbk", "", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        vl.entries.len(),
+        3,
+        "保留当前 + 最新 2 个 noncurrent：{vl:?}"
+    );
+    assert!(!vl.entries.iter().any(|e| e.version_id == ids[0]));
+
+    // 取消保留数后其余 noncurrent 全部过期，只剩当前版本
+    spec.noncurrent_expiration = Some(NoncurrentExpiration {
+        days: 1,
+        newer: None,
+    });
+    st.lifecycle.put_rules("nbk", &[spec]).await.unwrap();
+    sweep_once_at(&st, future).await;
+    let vl = st
+        .store
+        .list_object_versions("nbk", "", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(vl.entries.len(), 1, "{vl:?}");
+    assert_eq!(vl.entries[0].version_id, ids[3]);
+}
+
+/// noncurrent delete marker 同样可过期（AWS 语义），删后不遮蔽当前版本。
+#[tokio::test]
+async fn noncurrent_expiration_deletes_noncurrent_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    versioned_bucket(&st, "mbk").await;
+    put_version(&st, "mbk", "m.txt", b"v0").await;
+    st.store
+        .delete_object_versioned("mbk", "m.txt", None, VersioningMode::Enabled)
+        .await
+        .unwrap();
+    let latest = put_version(&st, "mbk", "m.txt", b"v1").await;
+    let mut spec = blank_spec();
+    spec.filter.prefix = "m".into();
+    spec.noncurrent_expiration = Some(NoncurrentExpiration {
+        days: 1,
+        newer: None,
+    });
+    st.lifecycle.put_rules("mbk", &[spec]).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sweep_once_at(&st, now + 2 * 86_400).await;
+
+    let vl = st
+        .store
+        .list_object_versions("mbk", "", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        vl.entries.len(),
+        1,
+        "noncurrent marker + 旧版本都过期：{vl:?}"
+    );
+    assert_eq!(vl.entries[0].version_id, latest);
+    assert!(st.store.get_object("mbk", "m.txt").await.is_ok());
+}
+
+/// 坏 config_json fail-closed：开单记 error，绝不按空规则执行删除。
+#[tokio::test]
+async fn corrupt_config_json_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("cbk").await.unwrap();
+    st.db.insert_bucket("cbk", None).await.unwrap();
+    st.store
+        .put_object("cbk", "keep.txt", bytes::Bytes::from_static(b"k"), None)
+        .await
+        .unwrap();
+    let mut bad = rule("", 0);
+    bad.bucket = "cbk".into();
+    bad.config_json = Some("{not json".into());
+    st.db.set_lifecycle_rules("cbk", &[bad], 1).await.unwrap();
+
+    assert_eq!(sweep_once(&st).await, 1);
+    let jobs = st.db.list_jobs(10).await.unwrap();
+    assert_eq!(jobs[0]["state"], "error", "{jobs:?}");
+    assert!(
+        jobs[0]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("config_json"),
+        "{jobs:?}"
+    );
+    assert!(st.store.get_object("cbk", "keep.txt").await.is_ok());
 }

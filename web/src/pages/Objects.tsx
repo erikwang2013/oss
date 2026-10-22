@@ -119,6 +119,9 @@ export default function Objects() {
             <Link to={`/buckets/${encodeURIComponent(bucket)}/policy`}>
               <Button>桶策略</Button>
             </Link>
+            <Link to={`/buckets/${encodeURIComponent(bucket)}/lifecycle`}>
+              <Button>生命周期</Button>
+            </Link>
             <Link to={`/buckets/${encodeURIComponent(bucket)}/select`}>
               <Button>Select 查询</Button>
             </Link>

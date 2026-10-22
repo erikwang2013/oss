@@ -206,6 +206,32 @@ fn lifecycle_rows(
             transition_tier: r.transition_tier.clone(),
             enabled: r.enabled,
             updated_at,
+            config_json: None,
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.prefix, &a.rule_id).cmp(&(&b.prefix, &b.rule_id)));
+    rows
+}
+
+fn lifecycle_rows_v2(
+    bucket: &str,
+    rules: &[crate::raft::command::LifecycleRuleCmdV2],
+    updated_at: i64,
+) -> Vec<LifecycleRuleRow> {
+    let mut rows: Vec<LifecycleRuleRow> = rules
+        .iter()
+        .map(|r| LifecycleRuleRow {
+            bucket: bucket.to_string(),
+            rule_id: r.rule_id.clone(),
+            prefix: r.prefix.clone(),
+            expire_days: r.expire_days,
+            expiration_days: r.expiration_days,
+            transition_days: r.transition_days,
+            transition_class: r.transition_class.clone(),
+            transition_tier: r.transition_tier.clone(),
+            enabled: r.enabled,
+            updated_at,
+            config_json: r.config_json.clone(),
         })
         .collect();
     rows.sort_by(|a, b| (&a.prefix, &a.rule_id).cmp(&(&b.prefix, &b.rule_id)));
@@ -480,6 +506,24 @@ pub(crate) async fn apply_command(
                     cw,
                     bucket,
                     &lifecycle_rows(bucket, rules, *updated_at),
+                    *updated_at,
+                )
+                .await?;
+                ControlResponse::Ok
+            } else {
+                ControlResponse::NotFound
+            }
+        }
+        ControlCommand::BucketSetLifecycleV2 {
+            bucket,
+            rules,
+            updated_at,
+        } => {
+            if bucket_exists(cw, bucket).await? {
+                Db::set_lifecycle_rules_raw(
+                    cw,
+                    bucket,
+                    &lifecycle_rows_v2(bucket, rules, *updated_at),
                     *updated_at,
                 )
                 .await?;

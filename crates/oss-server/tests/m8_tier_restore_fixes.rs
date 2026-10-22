@@ -10,7 +10,7 @@ use bytes::Bytes;
 use s3s::dto::*;
 use s3s::{S3, S3Request};
 use xl_s3::events::EventSink;
-use xl_s3::lifecycle::LifecycleRuleSpec;
+use xl_s3::lifecycle::{LifecycleRuleSpec, TransitionAction};
 use xl_s3::service::OssS3;
 use xl_store::crypto::EncSpec;
 use xl_store::meta::TierPhase;
@@ -212,11 +212,16 @@ async fn sse_object_rejected_and_sweep_skips() {
             "bkt",
             &[LifecycleRuleSpec {
                 rule_id: Some("t1".into()),
-                prefix: String::new(),
-                expiration_days: None,
-                transition_days: Some(0),
-                transition_class: Some("STANDARD_IA".into()),
-                transition_tier: None,
+                filter: Default::default(),
+                expiration: None,
+                transitions: vec![TransitionAction {
+                    days: Some(0),
+                    date: None,
+                    class: "STANDARD_IA".into(),
+                    tier: None,
+                }],
+                noncurrent_expiration: None,
+                noncurrent_transitions: vec![],
                 enabled: true,
             }],
         )
