@@ -277,6 +277,7 @@ fn target(id: &str, endpoint: &str, max: Option<u64>) -> RemoteTarget {
         secret_key: "sk".into(),
         region: "us-east-1".into(),
         max_bytes_per_sec: max,
+        server_name: None,
     }
 }
 

@@ -202,7 +202,15 @@ async fn membership(
     let Some(endpoint) = view.leader_endpoint.clone() else {
         return no_leader("leader unknown or address missing from membership");
     };
-    match membership::request_forwarded(&endpoint, &ext.cluster_token, &op, view.leader).await {
+    match membership::request_forwarded_tls(
+        &endpoint,
+        &ext.cluster_token,
+        &op,
+        view.leader,
+        ext.handle.tls().map(|t| t.as_ref()),
+    )
+    .await
+    {
         Ok(v) => Json(v).into_response(),
         Err(e) => membership_error(e),
     }

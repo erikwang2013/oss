@@ -3212,7 +3212,7 @@ async fn membership_apply_any(
             .as_ref()
             .map(|r| r.cluster_token.clone())
             .unwrap_or_default();
-        membership::request(&endpoint, &token, op).await
+        membership::request_tls(&endpoint, &token, op, Some(state.tls.as_ref())).await
     } else {
         Err(MembershipError::NoQuorum)
     }
@@ -3226,7 +3226,12 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
     let Some(local_raft) = state.cfg.raft.as_ref() else {
         return conflict("local node has no [raft]".into());
     };
-    let ident = match crate::site_client::get_identity_typed(&endpoint, &body.peer_site_token).await
+    let ident = match crate::site_client::get_identity_typed_tls(
+        &endpoint,
+        &body.peer_site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
     {
         Ok(i) => i,
         Err(crate::site_client::IdentityError::Unauthorized) => {
@@ -3369,11 +3374,12 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         "s3_secret_key": admin_sk,
         "stretch": local_stretch,
     });
-    let (status, resp_body) = match crate::site_client::post_raft_join(
+    let (status, resp_body) = match crate::site_client::post_raft_join_tls(
         &peer_raft_endpoint,
         &local_raft.cluster_token,
         &join_body,
         std::time::Duration::from_secs(20),
+        Some(state.tls.as_ref()),
     )
     .await
     {
@@ -3517,7 +3523,12 @@ async fn site_raft_join(
         Err(e) => return bad(&e),
     };
     // 反向校验：用对方站点令牌拉 identity，确认声明的 id/node/admin 一致。
-    let ident = match crate::site_client::get_identity_typed(&raft_endpoint, &body.site_token).await
+    let ident = match crate::site_client::get_identity_typed_tls(
+        &raft_endpoint,
+        &body.site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
     {
         Ok(i) => i,
         Err(crate::site_client::IdentityError::Unauthorized) => {
@@ -3715,7 +3726,13 @@ async fn create_site(
         }
     }
     // 同步校验对端可达 + region 一致 + 非本机
-    let ident = match crate::site_client::get_identity(&endpoint, &body.peer_site_token).await {
+    let ident = match crate::site_client::get_identity_tls(
+        &endpoint,
+        &body.peer_site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
+    {
         Ok(i) => i,
         Err(e) => return bad(format!("对端 identity 校验失败：{e}")),
     };
@@ -3890,7 +3907,13 @@ async fn delete_site(
                     .as_ref()
                     .map(|r| r.cluster_token.clone())
                     .unwrap_or_default();
-                crate::raft::membership::request(&endpoint, &token, &op).await
+                crate::raft::membership::request_tls(
+                    &endpoint,
+                    &token,
+                    &op,
+                    Some(state.tls.as_ref()),
+                )
+                .await
             } else {
                 Err(crate::raft::membership::MembershipError::NoQuorum)
             };
@@ -3950,7 +3973,13 @@ async fn ping_site(
     let Some(peer) = state.db.get_site(&peer_id).await.ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match crate::site_client::get_identity(&peer.endpoint, &peer.peer_site_token).await {
+    match crate::site_client::get_identity_tls(
+        &peer.endpoint,
+        &peer.peer_site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
+    {
         Ok(ident) => {
             let now = crate::db::now();
             if let Err(e) = state.db.update_site_ping(&peer_id, now, None).await {

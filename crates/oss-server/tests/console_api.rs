@@ -1795,6 +1795,7 @@ async fn tiers_list_health_without_credentials() {
         access_key: "ak-secret".into(),
         secret_key: "sk-secret".into(),
         region: "us-east-1".into(),
+        server_name: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let st = common::state_with_tiers(

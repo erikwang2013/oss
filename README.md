@@ -322,6 +322,39 @@ oss-server rebalance     # 扩容搬迁（默认 dry-run）：存量对象迁到
 - 未知子命令或非法参数打印用法并 exit 2；命令失败 exit 1
 - 配置文件路径固定为当前目录的 `oss.toml`（原先的 `oss-server <配置路径>` 用法已移除）
 
+## TLS（传输加密）
+
+默认明文（无 `[tls]` 时与旧版行为一致）。配置 `[tls.server]` 后，主 HTTP/S3/控制台监听器、
+witness、Raft RPC、节点间 gRPC mesh、site/repl/tier 出站与 Kafka 全部启用 TLS——单一开关，
+没有「半 TLS」模式。证书在启动时读取并校验；**轮换证书需要重启**（运行期不热加载）。
+
+```toml
+[tls.server]
+cert = "/etc/oss/server.crt"
+key  = "/etc/oss/server.key"
+# 可选：要求并校验客户端证书（mTLS）。共享监听器上的 S3/控制台/Raft 客户端都必须出示。
+client_ca = "/etc/oss/ca.crt"
+
+[tls.client]
+# 出站额外信任根（平台根始终参与校验）；自签/私有 CA 部署时配置。
+ca_cert = "/etc/oss/ca.crt"
+# 可选：出站客户端身份（mTLS，client_cert/client_key 必须成对）。
+client_cert = "/etc/oss/client.crt"
+client_key  = "/etc/oss/client.key"
+```
+
+- 对端地址仍可写 `http://`（集群节点、site endpoint、Raft `advertise_endpoint`、stretch）：
+  连接时按 `[tls.server]` 升级为 https。未启用 `[tls.server]` 时写 `https://` 启动期拒绝
+  （不静默降级明文）。`[listen]` 建议只写 `host:port`。
+- `[[remotes]]`/`[[tiers]]` 的 `endpoint` 支持 `http://`/`https://`；证书主机名与 endpoint
+  不一致时用 `server_name` 覆写（仅 https）。
+- Kafka：`[[kafka.targets]].tls = true` 启用 SSL；`sasl` 支持 PLAIN / SCRAM-SHA-256 /
+  SCRAM-SHA-512，且必须同时 `tls = true`。SNI 固定为 broker 主机名，证书 SAN 必须匹配。
+- mTLS 是共享监听器的 opt-in：启用后**所有**客户端（S3、控制台、Raft、site）都必须带
+  CA 签发的客户端证书；没有 `verify=false` 旁路。
+- 出站（site/repl/tier/Kafka/mesh）始终校验平台根 + `[tls.client].ca_cert`；mTLS 身份用
+  `[tls.client].client_cert/client_key`。
+
 ## 集群模式（M3）
 
 **静态拓扑**：扁平 node × drive，配置即拓扑（无 DC/区域层级）。未配 `[cluster]` = 单机（本机行为与 v1.4.0
@@ -639,6 +672,12 @@ aws --endpoint-url http://127.0.0.1:9000 sts get-session-token --duration-second
 id = "t1"
 brokers = ["127.0.0.1:9092"]
 topic = "oss-events"
+# 可选：TLS / SASL（SASL 必须同时 tls = true；见 TLS 节）
+tls = false
+# [kafka.targets.sasl]
+# mechanism = "scram-sha-512"   # plain（缺省）/ scram-sha-256 / scram-sha-512
+# username = "..."
+# password = "..."
 ```
 
 ```bash
@@ -658,7 +697,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-notification-configura
   连接类错误永不放弃（退避封顶 300s）。Topic 需**预创建**（部署前置；UTOP 不判死）。
 - 无 Kafka 时的调试旁路：`OSS_EVENT_SINK=file:/<dir>`（落文件，测试用）；worker 间隔
   `OSS_EVENT_INTERVAL_SECS`（默认 1；0=关）。
-- 边界：SASL/SSL 未接线（内网假设）；`s3:ObjectAccessed:*` 未实现（配置返回 400）。
+- 边界：`s3:ObjectAccessed:*` 未实现（配置返回 400）；TLS/SASL 见 TLS 节。
 
 ## S3 Select（M6）
 
@@ -692,7 +731,8 @@ aws --endpoint-url http://127.0.0.1:9000 s3api select-object-content \
 ```toml
 [[remotes]]
 id = "r1"
-endpoint = "http://10.0.0.2:9000"   # 仅 http（TLS 未接线，启动期拒绝 https）
+endpoint = "https://10.0.0.2:9000"  # http/https 均可；https 见 TLS 节
+server_name = "s3.internal"           # 可选：证书主机名与 endpoint 不一致时覆写
 access_key = "..."                   # 目标实例上铸造的 AK
 secret_key = "..."
 region = "us-east-1"
@@ -750,7 +790,7 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   marker 入队，删除要求源桶 versioning=Enabled。worker 发送前签名 `GET /{bucket}?versioning`
   （10s 缓存；404/非 Enabled → 可重试），PUT 透传 content-type 与 `x-amz-meta-*`、要求目标返回
   真实 version-id（`null` → 重试）。同版本多目标聚合 PENDING→COMPLETED/FAILED。
-- **边界（记档）**：仅 http（TLS 未接线）；单节点站点对；版本 UUID 两端不一致、版本定向删除
+- **边界（记档）**：对端地址 http/https 均可（peer TLS 见 TLS 节）；单节点站点对；版本 UUID 两端不一致、版本定向删除
   不复制；非空桶删除不生效（保留行与数据，记死信）；锁/标签/SSE 不复制，SSE-C 源永久错；
   AK 密文需两端同主密钥（配对只校验 vault 开关一致，不校验同一把钥）；控制面最终一致（无强一致，
   归 M9）；端点/凭据明文存储；`priority` 仅在**同秒**裁决（新 ts 的低优先级仍胜旧 ts 的高优先级——
@@ -1234,8 +1274,9 @@ db_path = "/var/lib/oss/raft.db"
 
 ### 部署与安全边界
 
-- 当前 Raft/site/mesh 传输均为**明文 HTTP/gRPC（TLS 未接线）**：只能部署在受控私网，
-  或用外部 TLS 终结/隧道；`cluster_token`、`site.token`、`mesh_secret` 不得出现在公网。
+- Raft/site/mesh 传输默认明文；生产部署应配置 `[tls.server]`（见 TLS 节）启用全链路
+  TLS/mTLS。未启用时只能部署在受控私网或外部 TLS 终结/隧道；`cluster_token`、`site.token`、
+  `mesh_secret` 不得出现在公网。
 - 能力开关已翻（`RAFT_READY`/`SYNC_READY`/`STRETCH_READY=true`）。控制面支持 1–3 voters：
   A/B 配对后 2 voters，`raft-add-witness` 加 C 后 3 voters（quorum 2，`production_ready=true`）；
   单节点 bootstrap 仍可用于开发。`tests/e2e_m9.sh`（3 进程）与 `tests/e2e_stretch.sh`

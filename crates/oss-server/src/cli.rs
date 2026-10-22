@@ -329,7 +329,10 @@ async fn bind_addr(
     raw: &str,
     what: &str,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let raw = raw.strip_prefix("http://").unwrap_or(raw);
+    let raw = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .unwrap_or(raw);
     let addr: std::net::SocketAddr = match raw.parse() {
         Ok(a) => a,
         Err(_) => tokio::net::lookup_host(raw)
@@ -353,13 +356,19 @@ pub async fn run(
     match cmd {
         Command::Serve => {
             let listen = state.cfg.listen.clone();
+            // listen 允许带 http(s):// 前缀（协议由 `[tls.server]` 决定）；绑定前剥离。
+            let listen_bind = listen
+                .strip_prefix("http://")
+                .or_else(|| listen.strip_prefix("https://"))
+                .unwrap_or(&listen)
+                .to_string();
             // 绑定期检（遗留清单修复）：ecat 把 server 丢进 tokio::spawn，start() 失败
             // （如 EADDRINUSE）只记一条 error 日志，而 run() 继续 wait_for_shutdown 等信号
             // → 端口被占时进程「假活」（活着但无监听，systemd 视作健康）。这里先探测绑定
             // 一次：失败直接上抛 → main 非零退出；成功立即释放，随后 ecat 复绑。
             // 释放与复绑之间有毫秒级竞态窗口（他人恰好抢到）——命中时退化为原假活行为，
             // 由 ecat 的 error 日志暴露；根治需 transport 支持外部 listener（上游增强项）。
-            let probe = tokio::net::TcpListener::bind(&listen)
+            let probe = tokio::net::TcpListener::bind(&listen_bind)
                 .await
                 .map_err(|e| format!("监听地址 {listen} 绑定失败: {e}"))?;
             drop(probe);
@@ -407,8 +416,9 @@ pub async fn run(
 
                 let store = Arc::clone(&state.store);
                 let secret = cl.secret.clone();
+                let tls = state.tls.tonic_server();
                 tokio::spawn(async move {
-                    if let Err(e) = xl_client::serve(store, addr, secret).await {
+                    if let Err(e) = xl_client::serve_tls(store, addr, secret, tls).await {
                         // 进程不随 gRPC 退（HTTP 面继续）：对端会将其标 down、quorum 收窄；
                         // 监督/自动重启归 M4 运维面。
                         tracing::error!(error = %e, "mesh gRPC server 退出");
@@ -446,8 +456,9 @@ pub async fn run(
                 }
                 let store = Arc::clone(&state.store);
                 let secret = st.mesh_secret.clone();
+                let tls = state.tls.tonic_server();
                 tokio::spawn(async move {
-                    if let Err(e) = xl_client::serve(store, addr, secret).await {
+                    if let Err(e) = xl_client::serve_tls(store, addr, secret, tls).await {
                         tracing::error!(error = %e, "stretch mesh gRPC server 退出");
                     }
                 });
@@ -470,7 +481,10 @@ pub async fn run(
             // M7：站点控制面 changelog worker（OSS_SITE_INTERVAL_SECS，0=关）
             // M9 S6a：Raft 模式不挂站点 worker（控制写不经 changelog；S6d 再决定替代）。
             if state.site_enabled && state.cfg.raft.is_none() {
-                crate::site::spawn_site_worker(state.db.pool().clone());
+                crate::site::spawn_site_worker(
+                    state.db.pool().clone(),
+                    std::sync::Arc::clone(&state.tls),
+                );
             }
             // M6 切片 4：复制 outbox worker（OSS_REPL_INTERVAL_SECS，0=关）
             crate::replication::spawn_repl_worker(
@@ -520,11 +534,13 @@ pub async fn run(
             // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
             crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db));
 
+            let ecat_tls = state.tls.ecat_server();
             let router = crate::router::build_router(state)?;
-            let mut app = ecat::App::builder()
-                .name("oss")
-                .server(ecat::transport_http::HttpServer::new(listen).router(router))
-                .build()?;
+            let mut server = ecat::transport_http::HttpServer::new(listen_bind).router(router);
+            if let Some(tls) = ecat_tls {
+                server = server.tls(tls);
+            }
+            let mut app = ecat::App::builder().name("oss").server(server).build()?;
             app.run().await?;
             Ok(0)
         }
@@ -708,10 +724,9 @@ pub async fn run_offline(
             replace,
         } => {
             let cfg = crate::config::AppConfig::load(cfg_path)?;
-            let raft = cfg
-                .raft
-                .as_ref()
-                .ok_or("[raft] 未配置：无法定位本机 advertise_endpoint")?;
+            if cfg.raft.is_none() {
+                return Err("[raft] 未配置：无法定位本机 advertise_endpoint".into());
+            }
             let body = match replace {
                 Some(old_node_id) => serde_json::json!({
                     "op": "replace_voter",
@@ -725,16 +740,15 @@ pub async fn run_offline(
                     "endpoint": endpoint,
                 }),
             };
-            membership_rpc(raft, body).await
+            membership_rpc(&cfg, body).await
         }
         Command::RaftRemoveNode { node_id } => {
             let cfg = crate::config::AppConfig::load(cfg_path)?;
-            let raft = cfg
-                .raft
-                .as_ref()
-                .ok_or("[raft] 未配置：无法定位本机 advertise_endpoint")?;
+            if cfg.raft.is_none() {
+                return Err("[raft] 未配置：无法定位本机 advertise_endpoint".into());
+            }
             membership_rpc(
-                raft,
+                &cfg,
                 serde_json::json!({"op": "remove_node", "node_id": node_id}),
             )
             .await
@@ -762,14 +776,18 @@ pub async fn run_offline(
 
 /// 向本机 `[raft].advertise_endpoint` 的成员路由发一次有界 HTTP 请求。
 async fn membership_rpc(
-    raft: &crate::config::RaftToml,
+    cfg: &crate::config::AppConfig,
     body: serde_json::Value,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
+    let tls = crate::tls::Tls::load(&cfg.tls)?;
+    let endpoint = tls.peer_url(&raft.advertise_endpoint)?;
     let url = format!(
         "{}/api/v1/site/raft/membership",
-        raft.advertise_endpoint.trim_end_matches('/')
+        endpoint.trim_end_matches('/')
     );
-    let resp = reqwest::Client::new()
+    let resp = tls
+        .reqwest_client()?
         .post(&url)
         .header(crate::raft::RPC_TOKEN_HEADER, &raft.cluster_token)
         // 服务端 leader 转发上限 30s（快照 10s + 成员写），CLI 必须覆盖该窗口。
@@ -1014,12 +1032,14 @@ async fn sync_reconcile_cmd(
             .await?;
     }
     let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
-    let report = crate::raft::repair::run(
+    let tls = crate::tls::Tls::load(&cfg.tls)?;
+    let report = crate::raft::repair::run_tls(
         &db,
         &store,
         vault.as_deref(),
         cfg.sync.max_object_bytes,
         &crate::raft::repair::RepairOptions { bucket, repair },
+        Some(tls),
     )
     .await?;
     if json {

@@ -6,6 +6,8 @@ use oss_server::cli;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // rustls 0.23 双 provider 下 builder() 会 panic：进程入口先固定 ring。
+    oss_server::tls::install_provider();
     // 先初始化日志：App::run() 里也有一次 init（has_been_set 守卫，不会重复），
     // 但启动自举（管理员引导/建桶）发生在 run() 之前，不提前 init 这些日志会被静默丢弃。
     ecat_logging::init();
