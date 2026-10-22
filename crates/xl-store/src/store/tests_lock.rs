@@ -540,3 +540,260 @@ async fn suspended_write_and_delete_guard_locked_null_version() {
         .unwrap();
     assert!(matches!(out, DeleteOutcome::Marker { .. }));
 }
+
+/// M5 遗留补齐：retention 设置/读取/清除，且 legal hold 与 retention 互不覆盖。
+#[tokio::test]
+async fn retention_roundtrip_preserves_legal_hold() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let hold = ObjectLockRecord {
+        mode: None,
+        retain_until_nanos: None,
+        legal_hold: true,
+    };
+    let (vid, _) = put_locked(&s, "k", Some(hold)).await;
+
+    let until = now_plus(3600);
+    s.set_object_retention(
+        "alpha",
+        "k",
+        &vid,
+        Some(("GOVERNANCE".into(), until)),
+        false,
+    )
+    .await
+    .unwrap();
+    let rec = s
+        .get_object_retention("alpha", "k", Some(&vid))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.mode.as_deref(), Some("GOVERNANCE"));
+    assert_eq!(rec.retain_until_nanos, Some(until));
+    assert!(rec.legal_hold, "写 retention 不得清掉 legal hold");
+    assert!(s.get_legal_hold("alpha", "k", Some(&vid)).await.unwrap());
+
+    // latest 读（无 versionId）同样返回记录
+    let latest = s
+        .get_object_retention("alpha", "k", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.mode.as_deref(), Some("GOVERNANCE"));
+
+    // 清除 retention（GOVERNANCE 未到期 → bypass）不动 legal hold
+    s.set_object_retention("alpha", "k", &vid, None, true)
+        .await
+        .unwrap();
+    let rec = s
+        .get_object_retention("alpha", "k", Some(&vid))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rec.mode.is_none() && rec.retain_until_nanos.is_none());
+    assert!(rec.legal_hold, "清 retention 不得清掉 legal hold");
+
+    // 无锁记录 → None（另一版本）
+    let (vid2, _) = put_locked(&s, "plain", None).await;
+    assert!(
+        s.get_object_retention("alpha", "plain", Some(&vid2))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// M5 遗留补齐：COMPLIANCE 只可延长；GOVERNANCE 缩短/清除需 bypass；到期可自由清除。
+#[tokio::test]
+async fn retention_guards_matrix() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+
+    // (a) COMPLIANCE 未到期：缩短/清除/降级一律拒（bypass 无效），延长放行
+    let (vid, _) = put_locked(&s, "c", Some(lock("COMPLIANCE", now_plus(3600), false))).await;
+    for bypass in [false, true] {
+        let e = s
+            .set_object_retention(
+                "alpha",
+                "c",
+                &vid,
+                Some(("COMPLIANCE".into(), now_plus(1800))),
+                bypass,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::ObjectLocked(_)), "缩短：{e:?}");
+        let e = s
+            .set_object_retention("alpha", "c", &vid, None, bypass)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::ObjectLocked(_)), "清除：{e:?}");
+        let e = s
+            .set_object_retention(
+                "alpha",
+                "c",
+                &vid,
+                Some(("GOVERNANCE".into(), now_plus(7200))),
+                bypass,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::ObjectLocked(_)), "降级：{e:?}");
+    }
+    let extended = now_plus(7200);
+    s.set_object_retention(
+        "alpha",
+        "c",
+        &vid,
+        Some(("COMPLIANCE".into(), extended)),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.get_object_retention("alpha", "c", Some(&vid))
+            .await
+            .unwrap()
+            .unwrap()
+            .retain_until_nanos,
+        Some(extended)
+    );
+
+    // (b) GOVERNANCE 未到期：缩短/清除无 bypass 拒，有 bypass 放行；延长不受限
+    let (vid, _) = put_locked(&s, "g", Some(lock("GOVERNANCE", now_plus(3600), false))).await;
+    let e = s
+        .set_object_retention(
+            "alpha",
+            "g",
+            &vid,
+            Some(("GOVERNANCE".into(), now_plus(1800))),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ObjectLocked(_)), "{e:?}");
+    s.set_object_retention(
+        "alpha",
+        "g",
+        &vid,
+        Some(("GOVERNANCE".into(), now_plus(1800))),
+        true,
+    )
+    .await
+    .unwrap();
+    let e = s
+        .set_object_retention("alpha", "g", &vid, None, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ObjectLocked(_)), "{e:?}");
+    s.set_object_retention("alpha", "g", &vid, None, true)
+        .await
+        .unwrap();
+    assert!(
+        s.get_object_retention("alpha", "g", Some(&vid))
+            .await
+            .unwrap()
+            .is_none(),
+        "bypass 清除后不残留空记录"
+    );
+    // 延长（无 bypass）放行
+    s.set_object_retention(
+        "alpha",
+        "g",
+        &vid,
+        Some(("GOVERNANCE".into(), now_plus(7200))),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // (c) 已到期 COMPLIANCE：无保护作用，可清除且无需 bypass
+    let (vid, _) = put_locked(&s, "e", Some(lock("COMPLIANCE", now_plus(-10), false))).await;
+    s.set_object_retention("alpha", "e", &vid, None, false)
+        .await
+        .unwrap();
+    assert!(
+        s.get_object_retention("alpha", "e", Some(&vid))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // (d) 非法输入：模式白名单、过去时间
+    let (vid, _) = put_locked(&s, "v", None).await;
+    let e = s
+        .set_object_retention(
+            "alpha",
+            "v",
+            &vid,
+            Some(("WORM".into(), now_plus(60))),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+    let e = s
+        .set_object_retention(
+            "alpha",
+            "v",
+            &vid,
+            Some(("GOVERNANCE".into(), now_plus(-60))),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+
+    // (e) delete marker / 不存在版本 / 不存在键 / 不存在桶
+    let (_mk_vid, _) = put_locked(&s, "mk", None).await;
+    let out = s
+        .delete_object_versioned("alpha", "mk", None, VersioningMode::Enabled)
+        .await
+        .unwrap();
+    let DeleteOutcome::Marker { version_id: marker } = out else {
+        panic!("应打 marker");
+    };
+    let e = s
+        .set_object_retention(
+            "alpha",
+            "mk",
+            &marker,
+            Some(("GOVERNANCE".into(), now_plus(60))),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+    let e = s
+        .get_object_retention("alpha", "mk", Some(&marker))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+    let e = s
+        .set_object_retention(
+            "alpha",
+            "nope",
+            "missing",
+            Some(("GOVERNANCE".into(), now_plus(60))),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::NoSuchKey(_)), "{e:?}");
+    let e = s
+        .get_object_retention("alpha", "nope", Some("missing"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::NoSuchKey(_)), "{e:?}");
+    let e = s
+        .set_object_retention(
+            "missing",
+            "k",
+            "v",
+            Some(("GOVERNANCE".into(), now_plus(60))),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::NoSuchBucket(_)), "{e:?}");
+}

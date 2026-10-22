@@ -550,6 +550,149 @@ impl Store {
         Ok(v.lock.as_ref().is_some_and(|l| l.legal_hold))
     }
 
+    /// M5 遗留补齐：设置/清除某版本 retention（legal hold 不动）。
+    /// `retention = None` 清除；未到期 COMPLIANCE 一律拒（含 bypass），未到期 GOVERNANCE
+    /// 缩短/清除需 `bypass_governance`。延长不受限；已到期记录无保护作用。
+    /// marker 版本 → InvalidArgument；键/版本不存在 → NoSuchKey。重写口径同 legal hold。
+    pub async fn set_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        retention: Option<(String, i64)>,
+        bypass_governance: bool,
+    ) -> Result<()> {
+        let requested = match retention {
+            Some((mode, until)) => {
+                if mode != "GOVERNANCE" && mode != "COMPLIANCE" {
+                    return Err(Error::InvalidArgument(format!("非法保留模式：{mode}")));
+                }
+                if until <= super::now_nanos() {
+                    return Err(Error::InvalidArgument(
+                        "retain-until-date 必须在将来".into(),
+                    ));
+                }
+                Some((mode, until))
+            }
+            None => None,
+        };
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(old) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let mut m = old.clone();
+        let target = m
+            .versions
+            .iter()
+            .position(|v| v.version_id_str() == version_id)
+            .ok_or_else(|| Error::NoSuchKey(format!("{key}@{version_id}")))?;
+        if m.versions[target].delete_marker() {
+            return Err(Error::InvalidArgument(
+                "delete marker 不支持 object retention".into(),
+            ));
+        }
+        // 仅未到期的保留期有保护作用；到期记录可自由缩短/清除（删除守卫同口径）。
+        let active =
+            m.versions[target]
+                .lock
+                .as_ref()
+                .and_then(|l| match (&l.mode, l.retain_until_nanos) {
+                    (Some(mode), Some(until)) if until > super::now_nanos() => {
+                        Some((mode.clone(), until))
+                    }
+                    _ => None,
+                });
+        if let Some((old_mode, old_until)) = active {
+            let shortens = match &requested {
+                None => true,
+                Some((mode, until)) => {
+                    *until < old_until || (old_mode == "COMPLIANCE" && mode == "GOVERNANCE")
+                }
+            };
+            match old_mode.as_str() {
+                "COMPLIANCE" if shortens => {
+                    return Err(Error::ObjectLocked(format!(
+                        "Compliance 保留期至 {old_until}（不可缩短/解除，含 admin）"
+                    )));
+                }
+                "GOVERNANCE" if shortens && !bypass_governance => {
+                    return Err(Error::ObjectLocked(format!(
+                        "Governance 保留期至 {old_until}（缩短/解除需 x-amz-bypass-governance-retention）"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        {
+            let v = &mut m.versions[target];
+            match requested {
+                Some((mode, until)) => {
+                    let l = v.lock.get_or_insert(meta::ObjectLockRecord {
+                        mode: None,
+                        retain_until_nanos: None,
+                        legal_hold: false,
+                    });
+                    l.mode = Some(mode);
+                    l.retain_until_nanos = Some(until);
+                }
+                None => {
+                    if let Some(l) = v.lock.as_mut() {
+                        l.mode = None;
+                        l.retain_until_nanos = None;
+                        if l.is_empty() {
+                            v.lock = None; // 无 retention/无 hold → 不残留空记录
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(last) = m.versions.last_mut() {
+            last.epoch = Some(old.max_epoch() + 1);
+        }
+        m.refresh_latest_flags();
+        self.write_meta(bucket, key, &m, Some(&old)).await?;
+        Ok(())
+    }
+
+    /// 读某版本 retention（元数据面，口径同 [`Self::get_legal_hold`]）。
+    /// 返回完整锁记录（含 legal_hold，调用方只取 mode/until）；无锁记录 → None。
+    pub async fn get_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<Option<meta::ObjectLockRecord>> {
+        self.ensure_bucket(bucket).await?;
+        let m = self
+            .read_meta(bucket, key)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        let v = match version_id {
+            Some(vid) => {
+                let v = m
+                    .find_version(vid)
+                    .ok_or_else(|| Error::NoSuchKey(format!("{key}@{vid}")))?;
+                if v.delete_marker() {
+                    return Err(Error::InvalidArgument(
+                        "delete marker 不支持 object retention".into(),
+                    ));
+                }
+                v
+            }
+            None => {
+                let v = m
+                    .latest()
+                    .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+                if v.delete_marker() {
+                    return Err(Error::NoSuchKey(key.to_string()));
+                }
+                v
+            }
+        };
+        Ok(v.lock.clone())
+    }
+
     /// M6 切片 3：设置/清除版本级复制状态（meta 重写 + 链尾 epoch 抬升，同 legal-hold 口径）。
     /// `status = None` 清除；白名单 PENDING/COMPLETED/FAILED/REPLICA。
     pub async fn set_replication_status(
