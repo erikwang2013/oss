@@ -27,6 +27,7 @@ use crate::sse::{
 
 mod list_multipart_uploads;
 mod list_v1;
+mod retention;
 mod upload_part_copy;
 
 #[derive(Clone)]
@@ -2211,6 +2212,21 @@ impl S3 for OssS3 {
                 status: Some(status),
             }),
         }))
+    }
+
+    /// M5 遗留补齐：主体在 `retention.rs`（trait impl 不能按模块拆分，这里只转发）。
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        retention::get_object_retention(self, req).await
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        retention::put_object_retention(self, req).await
     }
 
     async fn put_object_lock_configuration(

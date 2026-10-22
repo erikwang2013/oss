@@ -2043,6 +2043,85 @@ async fn object_list_includes_storage_and_tier_fields() {
     assert_eq!(cold["restore_expires_at"], serde_json::Value::Null);
 }
 
+/// M5 遗留补齐：对象列表带锁字段（retention 与 legal hold 独立；无锁 = null/false）。
+#[tokio::test]
+async fn object_list_includes_lock_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.store.create_bucket("alpha").await.unwrap();
+    st.store
+        .put_object("alpha", "plain.txt", bytes::Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    let until = 4_000_000_000_000_000_000i64; // unix 纳秒（远未来）
+    for (key, lock) in [
+        (
+            "locked.txt",
+            xl_store::meta::ObjectLockRecord {
+                mode: Some("COMPLIANCE".into()),
+                retain_until_nanos: Some(until),
+                legal_hold: false,
+            },
+        ),
+        (
+            "held.txt",
+            xl_store::meta::ObjectLockRecord {
+                mode: None,
+                retain_until_nanos: None,
+                legal_hold: true,
+            },
+        ),
+    ] {
+        st.store
+            .put_object_stream_with_meta(
+                "alpha",
+                key,
+                Box::pin(futures::stream::once(async {
+                    Ok(bytes::Bytes::from_static(b"l"))
+                })),
+                None,
+                Default::default(),
+                None,
+                VersioningMode::Enabled,
+                None,
+                Some(lock),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_token(&base).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/buckets/alpha/objects?limit=10"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let objs = v["objects"].as_array().unwrap();
+    let find = |key: &str| objs.iter().find(|o| o["key"] == key).unwrap();
+
+    let plain = find("plain.txt");
+    assert_eq!(plain["lock_mode"], serde_json::Value::Null);
+    assert_eq!(plain["lock_retain_until"], serde_json::Value::Null);
+    assert_eq!(plain["legal_hold"], false);
+
+    let locked = find("locked.txt");
+    assert_eq!(locked["lock_mode"], "COMPLIANCE");
+    assert_eq!(locked["lock_retain_until"], until / 1_000_000_000);
+    assert_eq!(locked["legal_hold"], false);
+
+    let held = find("held.txt");
+    assert_eq!(held["lock_mode"], serde_json::Value::Null);
+    assert_eq!(held["legal_hold"], true);
+}
+
 /// I3：admin 强制 tier sweep 留控制面审计（uid/op/detail）。
 #[tokio::test]
 async fn tier_force_sweep_is_audited() {
