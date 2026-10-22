@@ -16,7 +16,7 @@ fn stream_of(b: &'static [u8]) -> ByteStream {
     ))
 }
 
-async fn put(s: &Store, key: &str, versioned: bool, class: Option<&str>) -> ObjectInfo {
+async fn put(s: &Store, key: &str, mode: VersioningMode, class: Option<&str>) -> ObjectInfo {
     s.put_object_stream_with_meta(
         "alpha",
         key,
@@ -24,7 +24,7 @@ async fn put(s: &Store, key: &str, versioned: bool, class: Option<&str>) -> Obje
         None,
         Default::default(),
         None,
-        versioned,
+        mode,
         None,
         None,
         None,
@@ -50,7 +50,7 @@ fn tier(phase: TierPhase) -> TierState {
 #[tokio::test]
 async fn storage_class_roundtrip_and_normalization() {
     let (s, _d) = store().await;
-    let info = put(&s, "k", true, Some("STANDARD_IA")).await;
+    let info = put(&s, "k", VersioningMode::Enabled, Some("STANDARD_IA")).await;
     assert_eq!(info.storage_class.as_deref(), Some("STANDARD_IA"));
     let head = s.head_object("alpha", "k").await.unwrap();
     assert_eq!(head.storage_class.as_deref(), Some("STANDARD_IA"));
@@ -71,7 +71,7 @@ async fn storage_class_roundtrip_and_normalization() {
     assert_eq!(vl.entries[0].storage_class.as_deref(), Some("STANDARD_IA"));
 
     // STANDARD 归一为 None；未知类拒
-    let i = put(&s, "std", false, Some("STANDARD")).await;
+    let i = put(&s, "std", VersioningMode::Off, Some("STANDARD")).await;
     assert_eq!(i.storage_class, None);
     let e = s
         .put_object_stream_with_meta(
@@ -81,7 +81,7 @@ async fn storage_class_roundtrip_and_normalization() {
             None,
             Default::default(),
             None,
-            false,
+            VersioningMode::Off,
             None,
             None,
             None,
@@ -94,7 +94,7 @@ async fn storage_class_roundtrip_and_normalization() {
 #[tokio::test]
 async fn archived_phase_gates_reads_but_head_works() {
     let (s, _d) = store().await;
-    put(&s, "k", false, Some("GLACIER")).await;
+    put(&s, "k", VersioningMode::Off, Some("GLACIER")).await;
     let mut m = s.read_meta("alpha", "k").await.unwrap().unwrap();
     m.versions.last_mut().unwrap().tier = Some(tier(TierPhase::Archived));
     s.write_meta("alpha", "k", &m, None).await.unwrap();
@@ -125,12 +125,12 @@ async fn archived_phase_gates_reads_but_head_works() {
 async fn delete_outcome_carries_tier_refs() {
     let (s, _d) = store().await;
     // 非版本桶：整键删带 tiers
-    put(&s, "plain", false, Some("GLACIER")).await;
+    put(&s, "plain", VersioningMode::Off, Some("GLACIER")).await;
     let mut m = s.read_meta("alpha", "plain").await.unwrap().unwrap();
     m.versions.last_mut().unwrap().tier = Some(tier(TierPhase::Archived));
     s.write_meta("alpha", "plain", &m, None).await.unwrap();
     match s
-        .delete_object_versioned("alpha", "plain", None, false)
+        .delete_object_versioned("alpha", "plain", None, VersioningMode::Off)
         .await
         .unwrap()
     {
@@ -143,13 +143,13 @@ async fn delete_outcome_carries_tier_refs() {
     }
 
     // 版本桶：点名删版本带 tier
-    let v = put(&s, "ver", true, Some("GLACIER")).await;
+    let v = put(&s, "ver", VersioningMode::Enabled, Some("GLACIER")).await;
     let vid = v.version_id.unwrap();
     let mut m = s.read_meta("alpha", "ver").await.unwrap().unwrap();
     m.versions.last_mut().unwrap().tier = Some(tier(TierPhase::Archived));
     s.write_meta("alpha", "ver", &m, None).await.unwrap();
     match s
-        .delete_object_versioned("alpha", "ver", Some(&vid), true)
+        .delete_object_versioned("alpha", "ver", Some(&vid), VersioningMode::Enabled)
         .await
         .unwrap()
     {
@@ -210,7 +210,7 @@ async fn mpu_storage_class_lands_on_completed_version() {
 #[tokio::test]
 async fn meta_decode_rejects_bad_tier_and_class() {
     let (s, _d) = store().await;
-    put(&s, "k", false, None).await;
+    put(&s, "k", VersioningMode::Off, None).await;
     let mut m = s.read_meta("alpha", "k").await.unwrap().unwrap();
     m.versions.last_mut().unwrap().storage_class = Some("WARM".into());
     let bytes = m.encode().unwrap();
@@ -238,7 +238,7 @@ fn xl_meta_decode(bytes: &[u8]) -> crate::error::Result<crate::meta::XlMeta> {
 #[tokio::test]
 async fn archive_restore_state_machine() {
     let (s, _d) = store().await;
-    let info = put(&s, "k", true, None).await;
+    let info = put(&s, "k", VersioningMode::Enabled, None).await;
     let vid = info.version_id.clone().unwrap();
     let data = b"tier-data";
     let sha = hex::encode(crate::mesh::content_hash(data));
@@ -354,7 +354,7 @@ fn archive_spec(key: &str, info: &ObjectInfo) -> ArchiveSpec {
 #[tokio::test]
 async fn archive_reclaims_physical_dir_unless_uuid_shared() {
     let (s, _d) = store().await;
-    let info = put(&s, "k", true, None).await;
+    let info = put(&s, "k", VersioningMode::Enabled, None).await;
     let vid = info.version_id.clone().unwrap();
     let uuid = uuid_of(&s, "k", &vid).await;
     let dir = version_dir(&s, "k", &uuid);
@@ -366,8 +366,8 @@ async fn archive_reclaims_physical_dir_unless_uuid_shared() {
 
     // 第二个版本引用同一 uuid → 目录必须保留
     let (s, _d) = store().await;
-    let a = put(&s, "shared", true, None).await;
-    let b = put(&s, "shared", true, None).await;
+    let a = put(&s, "shared", VersioningMode::Enabled, None).await;
+    let b = put(&s, "shared", VersioningMode::Enabled, None).await;
     let a_vid = a.version_id.clone().unwrap();
     let b_vid = b.version_id.clone().unwrap();
     let uuid = uuid_of(&s, "shared", &a_vid).await;
@@ -389,7 +389,7 @@ async fn archive_reclaims_physical_dir_unless_uuid_shared() {
 #[tokio::test]
 async fn abort_restore_removes_prepared_data() {
     let (s, _d) = store().await;
-    let info = put(&s, "k", true, None).await;
+    let info = put(&s, "k", VersioningMode::Enabled, None).await;
     let vid = info.version_id.clone().unwrap();
     let uuid = uuid_of(&s, "k", &vid).await;
     let dir = version_dir(&s, "k", &uuid);
@@ -414,7 +414,7 @@ async fn abort_restore_removes_prepared_data() {
 #[tokio::test]
 async fn archive_meta_failure_keeps_local() {
     let (s, _d) = store().await;
-    let info = put(&s, "keep", true, None).await;
+    let info = put(&s, "keep", VersioningMode::Enabled, None).await;
     let vid = info.version_id.clone().unwrap();
     let e = s
         .archive_version(

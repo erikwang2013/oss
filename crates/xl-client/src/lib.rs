@@ -461,6 +461,7 @@ impl MeshTransport for TonicMesh {
             delimiter: l.delimiter.unwrap_or_default(),
             marker: l.marker.unwrap_or_default(),
             limit: l.limit as u32,
+            include_deleted: l.include_deleted,
         };
         let resp = self
             .client(n)?
@@ -824,6 +825,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 delimiter: (!l.delimiter.is_empty()).then_some(l.delimiter),
                 marker: (!l.marker.is_empty()).then_some(l.marker),
                 limit: l.limit as usize,
+                include_deleted: l.include_deleted,
             })
             .await
             .map_err(internal)?;

@@ -15,6 +15,7 @@ use serde::Deserialize;
 use xl_s3::access::{Action, AuthedUser};
 use xl_s3::events::EventSink as _;
 use xl_s3::sync_delete::SyncDeleteSink as _;
+use xl_store::store::VersioningMode;
 
 use crate::state::AppState;
 
@@ -4172,7 +4173,7 @@ async fn site_delete_object(
                 &body.bucket,
                 &body.key,
                 None,
-                true,
+                VersioningMode::Enabled,
                 false,
                 Some(spec),
             )
@@ -4192,7 +4193,13 @@ async fn site_delete_object(
     // sync 桶创建即 Enabled；显式版本删除对不存在版本幂等成功（DeleteOutcome::NotFound）。
     match state
         .store
-        .delete_object_versioned_ext(&body.bucket, &body.key, Some(&vid), true, false)
+        .delete_object_versioned_ext(
+            &body.bucket,
+            &body.key,
+            Some(&vid),
+            VersioningMode::Enabled,
+            false,
+        )
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),

@@ -671,6 +671,7 @@ async fn collect_peer_keys(
                     delimiter: None,
                     marker: marker.clone(),
                     limit: 1000,
+                    include_deleted: false,
                 },
             )
             .await?;

@@ -15,7 +15,7 @@ use sqlx::Row as _;
 use xl_s3::sync_delete::SyncDeleteSink;
 use xl_store::error::Error as StoreError;
 use xl_store::gate::{GateError, GateRequest, GateTicket, PutCommitGate};
-use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store};
+use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store, VersioningMode};
 
 use crate::db::Db;
 use crate::repl_client::{ReplClient, ReplError};
@@ -920,7 +920,7 @@ impl SiteSyncDelete {
         self.intent_done(&id).await;
         match self
             .store
-            .delete_object_versioned_ext(bucket, key, Some(vid), true, bypass)
+            .delete_object_versioned_ext(bucket, key, Some(vid), VersioningMode::Enabled, bypass)
             .await
         {
             Ok(out) => {
@@ -960,7 +960,14 @@ impl SiteSyncDelete {
         };
         match self
             .store
-            .delete_object_versioned_with_marker(bucket, key, None, true, false, Some(spec))
+            .delete_object_versioned_with_marker(
+                bucket,
+                key,
+                None,
+                VersioningMode::Enabled,
+                false,
+                Some(spec),
+            )
             .await
         {
             Ok(out) => {
@@ -1151,14 +1158,14 @@ impl SyncDeleteSink for SiteSyncDelete {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
         bypass_governance: bool,
     ) -> Result<DeleteOutcome, StoreError> {
         let (sync, deleting, versioning) = self.state(bucket).await?;
         if !sync {
             return self
                 .store
-                .delete_object_versioned_ext(bucket, key, version_id, versioned, bypass_governance)
+                .delete_object_versioned_ext(bucket, key, version_id, mode, bypass_governance)
                 .await;
         }
         // I1：删桶 quiesce 窗口内拒绝新删除（先于任何远端调用，避免远端已删/本地 503 分叉）。
@@ -1182,7 +1189,9 @@ impl SyncDeleteSink for SiteSyncDelete {
                 self.delete_version_remote(&client, &peer, bucket, key, vid, bypass_governance)
                     .await
             }
-            None if versioned => self.create_marker_remote(&client, &peer, bucket, key).await,
+            None if mode == VersioningMode::Enabled => {
+                self.create_marker_remote(&client, &peer, bucket, key).await
+            }
             None => Err(StoreError::Conflict(
                 "sync bucket requires versioning Enabled".into(),
             )),
@@ -1399,7 +1408,13 @@ async fn recover_row(
             svc.intent_done(id).await;
             if svc
                 .store
-                .delete_object_versioned_ext(bucket, key, Some(&vid), true, false)
+                .delete_object_versioned_ext(
+                    bucket,
+                    key,
+                    Some(&vid),
+                    VersioningMode::Enabled,
+                    false,
+                )
                 .await
                 .is_ok()
             {
@@ -1468,7 +1483,7 @@ async fn recover_row(
                             bucket,
                             key,
                             None,
-                            true,
+                            VersioningMode::Enabled,
                             false,
                             Some(spec),
                         )

@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use xl_s3::sync_delete::SyncDeleteSink as _;
-use xl_store::store::ListRequest;
+use xl_store::store::{ListRequest, VersioningMode};
 
 use crate::state::AppState;
 
@@ -75,11 +75,11 @@ pub async fn sweep_once(state: &AppState) -> usize {
         let (mut scanned, mut deleted, mut skipped) = (0i64, 0i64, 0i64);
         let mut err: Option<String> = None;
 
-        let versioned = match state.db.get_bucket_versioning(&rule.bucket).await {
-            Ok(s) => s == "Enabled",
+        let mode = match state.db.get_bucket_versioning(&rule.bucket).await {
+            Ok(s) => VersioningMode::from_status(&s),
             Err(e) => {
                 err = Some(format!("版本状态读取失败: {e}"));
-                false
+                VersioningMode::Off
             }
         };
         // 负值防呆（verifier S6-2 附属）：console 已拦 0..=36500；直写 DB 绕过时这里
@@ -142,7 +142,7 @@ pub async fn sweep_once(state: &AppState) -> usize {
                     // 删除：版本桶打 marker，非版本桶整键删；M9 S3 sync 桶走远端优先。
                     match state
                         .sync_delete
-                        .delete_versioned(&rule.bucket, &o.key, None, versioned, false)
+                        .delete_versioned(&rule.bucket, &o.key, None, mode, false)
                         .await
                     {
                         Ok(outcome) => {

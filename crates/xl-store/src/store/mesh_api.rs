@@ -336,6 +336,7 @@ impl Store {
                 &l.prefix,
                 l.marker.as_deref(),
                 l.delimiter.as_deref(),
+                l.include_deleted,
                 l.limit,
             )
             .await

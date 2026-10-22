@@ -30,7 +30,7 @@ async fn put(
     s: &Store,
     key: &str,
     body: &'static [u8],
-    versioned: bool,
+    mode: VersioningMode,
     t: Option<Vec<ObjectTag>>,
 ) -> ObjectInfo {
     s.put_object_stream_with_meta(
@@ -40,7 +40,7 @@ async fn put(
         None,
         Default::default(),
         None,
-        versioned,
+        mode,
         None,
         None,
         t,
@@ -53,8 +53,22 @@ async fn put(
 #[tokio::test]
 async fn versioned_tags_are_isolated_and_listed() {
     let (s, _d) = store().await;
-    let v1 = put(&s, "k", b"1", true, Some(tags(&[("a", "1")]))).await;
-    let v2 = put(&s, "k", b"2", true, Some(tags(&[("b", "2")]))).await;
+    let v1 = put(
+        &s,
+        "k",
+        b"1",
+        VersioningMode::Enabled,
+        Some(tags(&[("a", "1")])),
+    )
+    .await;
+    let v2 = put(
+        &s,
+        "k",
+        b"2",
+        VersioningMode::Enabled,
+        Some(tags(&[("b", "2")])),
+    )
+    .await;
     let vid1 = v1.version_id.unwrap();
     let vid2 = v2.version_id.unwrap();
     // 默认 = 链尾
@@ -92,11 +106,18 @@ async fn versioned_tags_are_isolated_and_listed() {
 #[tokio::test]
 async fn non_versioned_overwrite_clears_tags() {
     let (s, _d) = store().await;
-    put(&s, "k", b"1", false, Some(tags(&[("a", "1")]))).await;
+    put(
+        &s,
+        "k",
+        b"1",
+        VersioningMode::Off,
+        Some(tags(&[("a", "1")])),
+    )
+    .await;
     let (_, t) = s.get_object_tags("alpha", "k", None).await.unwrap();
     assert_eq!(t, tags(&[("a", "1")]));
     // 覆盖写不带标签 → 旧标签不残留（单版本）
-    put(&s, "k", b"2", false, None).await;
+    put(&s, "k", b"2", VersioningMode::Off, None).await;
     let (_, t) = s.get_object_tags("alpha", "k", None).await.unwrap();
     assert!(t.is_empty(), "{t:?}");
     assert_eq!(
@@ -113,7 +134,14 @@ async fn non_versioned_overwrite_clears_tags() {
 #[tokio::test]
 async fn null_version_tags_roundtrip() {
     let (s, _d) = store().await;
-    put(&s, "k", b"1", false, Some(tags(&[("a", "1")]))).await;
+    put(
+        &s,
+        "k",
+        b"1",
+        VersioningMode::Off,
+        Some(tags(&[("a", "1")])),
+    )
+    .await;
     let (vid, t) = s.get_object_tags("alpha", "k", Some("null")).await.unwrap();
     assert_eq!(vid, "null");
     assert_eq!(t, tags(&[("a", "1")]));
@@ -127,7 +155,14 @@ async fn null_version_tags_roundtrip() {
 #[tokio::test]
 async fn tags_write_bumps_epoch_and_clear_works() {
     let (s, _d) = store().await;
-    put(&s, "k", b"1", true, Some(tags(&[("a", "1")]))).await;
+    put(
+        &s,
+        "k",
+        b"1",
+        VersioningMode::Enabled,
+        Some(tags(&[("a", "1")])),
+    )
+    .await;
     let before = s
         .read_meta("alpha", "k")
         .await
@@ -156,9 +191,16 @@ async fn tags_write_bumps_epoch_and_clear_works() {
 #[tokio::test]
 async fn marker_semantics() {
     let (s, _d) = store().await;
-    put(&s, "k", b"1", true, Some(tags(&[("a", "1")]))).await;
+    put(
+        &s,
+        "k",
+        b"1",
+        VersioningMode::Enabled,
+        Some(tags(&[("a", "1")])),
+    )
+    .await;
     let out = s
-        .delete_object_versioned("alpha", "k", None, true)
+        .delete_object_versioned("alpha", "k", None, VersioningMode::Enabled)
         .await
         .unwrap();
     let marker = match out {
@@ -198,7 +240,14 @@ async fn marker_semantics() {
 #[tokio::test]
 async fn tags_coexist_with_lock_and_replication_status() {
     let (s, _d) = store().await;
-    let v = put(&s, "k", b"1", true, Some(tags(&[("a", "1")]))).await;
+    let v = put(
+        &s,
+        "k",
+        b"1",
+        VersioningMode::Enabled,
+        Some(tags(&[("a", "1")])),
+    )
+    .await;
     let vid = v.version_id.unwrap();
     s.set_object_legal_hold("alpha", "k", &vid, true)
         .await
@@ -228,7 +277,7 @@ async fn invalid_tags_rejected_at_put_and_set() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             Some(tags(&[("k", "1"), ("k", "2")])),
@@ -237,7 +286,7 @@ async fn invalid_tags_rejected_at_put_and_set() {
         .await;
     assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
     // set：11 条
-    put(&s, "k", b"1", true, None).await;
+    put(&s, "k", b"1", VersioningMode::Enabled, None).await;
     let many: Vec<ObjectTag> = (0..11)
         .map(|i| ObjectTag {
             key: format!("k{i}"),
@@ -253,7 +302,7 @@ async fn mpu(
     s: &Store,
     key: &str,
     t: Option<Vec<ObjectTag>>,
-    versioned: bool,
+    mode: VersioningMode,
 ) -> Result<ObjectInfo> {
     let id = s
         .create_multipart_upload_ext(
@@ -271,7 +320,7 @@ async fn mpu(
     let etag = s
         .upload_part("alpha", key, &id, 1, stream_of(b"mpu-body"))
         .await?;
-    s.complete_multipart_upload_versioned("alpha", key, &id, &[(1, etag)], versioned, None, None)
+    s.complete_multipart_upload_versioned("alpha", key, &id, &[(1, etag)], mode, None, None)
         .await
 }
 
@@ -279,7 +328,9 @@ async fn mpu(
 async fn mpu_create_tags_land_on_complete() {
     let (s, _d) = store().await;
     let want = tags(&[("env", "prod"), ("team", "core")]);
-    let info = mpu(&s, "mp", Some(want.clone()), false).await.unwrap();
+    let info = mpu(&s, "mp", Some(want.clone()), VersioningMode::Off)
+        .await
+        .unwrap();
     // ObjectInfo 与版本 meta 同源；GET 标签读的就是落地版本
     assert_eq!(info.tags, want);
     let (_, got) = s.get_object_tags("alpha", "mp", None).await.unwrap();
@@ -288,9 +339,14 @@ async fn mpu_create_tags_land_on_complete() {
     assert_eq!(m.latest().unwrap().tags, Some(want));
 
     // 版本控制桶同样落到新版本（链尾）
-    let info = mpu(&s, "mpv", Some(tags(&[("v", "1")])), true)
-        .await
-        .unwrap();
+    let info = mpu(
+        &s,
+        "mpv",
+        Some(tags(&[("v", "1")])),
+        VersioningMode::Enabled,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.tags, tags(&[("v", "1")]));
     let (_, got) = s.get_object_tags("alpha", "mpv", None).await.unwrap();
     assert_eq!(got, tags(&[("v", "1")]));
@@ -299,7 +355,7 @@ async fn mpu_create_tags_land_on_complete() {
 #[tokio::test]
 async fn mpu_without_tags_stays_none() {
     let (s, _d) = store().await;
-    let info = mpu(&s, "mp", None, false).await.unwrap();
+    let info = mpu(&s, "mp", None, VersioningMode::Off).await.unwrap();
     assert!(info.tags.is_empty());
     let (_, got) = s.get_object_tags("alpha", "mp", None).await.unwrap();
     assert!(got.is_empty());
@@ -311,7 +367,9 @@ async fn mpu_without_tags_stays_none() {
 async fn mpu_empty_tags_normalize_to_none() {
     // P0 契约：空 TagSet 与无标签等价（同单段 PUT），线上 `x-amz-tagging: "&"` 也走这里
     let (s, _d) = store().await;
-    let info = mpu(&s, "mp", Some(Vec::new()), false).await.unwrap();
+    let info = mpu(&s, "mp", Some(Vec::new()), VersioningMode::Off)
+        .await
+        .unwrap();
     assert!(info.tags.is_empty());
     let m = s.read_meta("alpha", "mp").await.unwrap().unwrap();
     assert!(m.latest().unwrap().tags.is_none());
@@ -326,8 +384,8 @@ async fn mpu_create_rejects_invalid_tags() {
             value: "v".into(),
         })
         .collect();
-    let e = mpu(&s, "mp", Some(many), false).await;
+    let e = mpu(&s, "mp", Some(many), VersioningMode::Off).await;
     assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
-    let e = mpu(&s, "mp2", Some(tags(&[("bad!", "v")])), false).await;
+    let e = mpu(&s, "mp2", Some(tags(&[("bad!", "v")])), VersioningMode::Off).await;
     assert!(matches!(e, Err(Error::InvalidArgument(_))), "{e:?}");
 }

@@ -18,7 +18,7 @@ use xl_s3::access::{Acl, AuthedUser};
 use xl_s3::inventory::{csv_columns, filter_prefix, includes_all_versions};
 use xl_s3::sse::enc_spec_from_default;
 use xl_store::meta::{ChecksumRecord, EncryptionRecord, ObjectLockRecord};
-use xl_store::store::{ByteStream, ListRequest, ObjectInfo, Store};
+use xl_store::store::{ByteStream, ListRequest, ObjectInfo, Store, VersioningMode};
 
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::jobs::TaskExecutor;
@@ -402,12 +402,13 @@ impl InventoryRunner {
         if gz_size > MAX_FILE_BYTES {
             return Err(format!("单文件 {gz_size} 字节超过 5 GiB 上限"));
         }
-        let versioned = self
-            .db
-            .get_bucket_versioning(dest)
-            .await
-            .map_err(|e| e.to_string())?
-            == "Enabled";
+        let mode = VersioningMode::from_status(
+            &self
+                .db
+                .get_bucket_versioning(dest)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         // I5：目标桶默认加密同样覆盖服务端生成对象（与 S3 写入路径同口径；坏记录 fail-closed）。
         let encryption = match self
             .acl
@@ -435,7 +436,7 @@ impl InventoryRunner {
                 Some("application/gzip".to_string()),
                 BTreeMap::new(),
                 None,
-                versioned,
+                mode,
                 encryption.clone(),
                 None,
                 None,
@@ -462,7 +463,7 @@ impl InventoryRunner {
                 Some("application/json".to_string()),
                 BTreeMap::new(),
                 None,
-                versioned,
+                mode,
                 encryption,
                 None,
                 None,
