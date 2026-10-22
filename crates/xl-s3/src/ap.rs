@@ -184,7 +184,7 @@ pub fn ap_decision(
     key: Option<&str>,
 ) -> Option<bool> {
     let policy = ap.policy.as_ref()?;
-    let action = if op == "CopyObject" {
+    let action = if crate::access::is_copy(op) {
         crate::policy::s3_action("PutObject")
     } else {
         crate::policy::s3_action(op)
@@ -397,6 +397,17 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|p| p.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
 }
 
+/// `GET /{bucket}`（无 list-type）的 v1 ListObjects 参数白名单；未知子资源仍 fail-closed。
+fn is_list_objects_v1(query: &str) -> bool {
+    strip_signed_query(query).split('&').all(|p| {
+        p.is_empty()
+            || matches!(
+                p.split('=').next().unwrap_or(""),
+                "prefix" | "delimiter" | "marker" | "max-keys" | "encoding-type" | "x-id"
+            )
+    })
+}
+
 fn derive_op(
     method: &http::Method,
     key: Option<&str>,
@@ -408,14 +419,22 @@ fn derive_op(
         Method::GET => {
             if query_has(query, "versions") {
                 Ok("ListObjectVersions")
+            } else if query_has(query, "uploads") {
+                Ok("ListMultipartUploads")
+            } else if key.is_some() && query_has(query, "uploadId") {
+                Ok("ListParts")
             } else if query_has(query, "tagging") {
                 Ok("GetObjectTagging")
+            } else if key.is_some() && query_has(query, "retention") {
+                Ok("GetObjectRetention")
             } else if query_value(query, "list-type") == Some("2") {
                 Ok("ListObjectsV2")
             } else if query_has(query, "versioning") {
                 Ok("GetBucketVersioning")
             } else if key.is_some() {
                 Ok("GetObject")
+            } else if is_list_objects_v1(query) {
+                Ok("ListObjects")
             } else {
                 Err(s3s::s3_error!(
                     NotImplemented,
@@ -433,10 +452,7 @@ fn derive_op(
         Method::PUT => {
             if query_has(query, "uploadId") && query_has(query, "partNumber") {
                 if copy_source {
-                    Err(s3s::s3_error!(
-                        NotImplemented,
-                        "UploadPartCopy is not supported"
-                    ))
+                    Ok("UploadPartCopy")
                 } else {
                     Ok("UploadPart")
                 }
@@ -444,6 +460,8 @@ fn derive_op(
                 Ok("CopyObject")
             } else if query_has(query, "tagging") {
                 Ok("PutObjectTagging")
+            } else if key.is_some() && query_has(query, "retention") {
+                Ok("PutObjectRetention")
             } else if query_has(query, "versioning") {
                 Ok("PutBucketVersioning")
             } else if key.is_some() {
@@ -993,15 +1011,47 @@ mod tests {
     #[test]
     fn op_derivation_matrix() {
         use http::Method;
-        let copy = |q: &str| {
-            derive_op(&Method::PUT, Some("k"), q, true)
-                .map_err(|e| format!("{:?}", e.code()))
-                .unwrap_err()
-        };
-        assert_eq!(copy("partNumber=1&uploadId=u"), "NotImplemented");
+        assert_eq!(
+            derive_op(&Method::PUT, Some("k"), "partNumber=1&uploadId=u", true).unwrap(),
+            "UploadPartCopy"
+        );
         assert_eq!(
             derive_op(&Method::PUT, Some("k"), "", true).unwrap(),
             "CopyObject"
+        );
+        assert_eq!(
+            derive_op(&Method::GET, None, "", false).unwrap(),
+            "ListObjects"
+        );
+        assert_eq!(
+            derive_op(&Method::GET, None, "prefix=p&marker=m&max-keys=5", false).unwrap(),
+            "ListObjects",
+            "v1 列举参数不得被当作未知子资源"
+        );
+        assert_eq!(
+            derive_op(&Method::GET, None, "x-id=ListObjects", false).unwrap(),
+            "ListObjects",
+            "SDK 的 x-id 查询参数不得误判"
+        );
+        assert_eq!(
+            derive_op(&Method::GET, None, "uploads", false).unwrap(),
+            "ListMultipartUploads"
+        );
+        assert_eq!(
+            derive_op(&Method::GET, Some("k"), "uploadId=u", false).unwrap(),
+            "ListParts"
+        );
+        assert_eq!(
+            derive_op(&Method::GET, Some("k"), "retention", false).unwrap(),
+            "GetObjectRetention"
+        );
+        assert_eq!(
+            derive_op(&Method::PUT, Some("k"), "retention", false).unwrap(),
+            "PutObjectRetention"
+        );
+        assert!(
+            derive_op(&Method::GET, None, "acl", false).is_err(),
+            "未知桶级子资源仍 fail-closed"
         );
         assert_eq!(
             derive_op(&Method::GET, None, "list-type=2", false).unwrap(),

@@ -80,12 +80,20 @@ pub fn s3_action(op: &str) -> Option<&'static str> {
         | "PostObject"
         | "PutObjectTagging"
         | "DeleteObjectTagging"
+        | "UploadPartCopy"
         | "CreateMultipartUpload"
         | "UploadPart"
         | "CompleteMultipartUpload"
         | "AbortMultipartUpload" => "s3:PutObject",
         "DeleteObject" | "DeleteObjects" => "s3:DeleteObject",
-        "HeadBucket" | "ListObjectsV2" | "ListObjectVersions" | "ListParts" => "s3:ListBucket",
+        "HeadBucket"
+        | "ListObjects"
+        | "ListObjectsV2"
+        | "ListMultipartUploads"
+        | "ListObjectVersions"
+        | "ListParts" => "s3:ListBucket",
+        "GetObjectRetention" => "s3:GetObjectRetention",
+        "PutObjectRetention" => "s3:PutObjectRetention",
         "GetBucketVersioning" => "s3:GetBucketVersioning",
         "PutBucketVersioning" => "s3:PutBucketVersioning",
         "GetBucketLifecycleConfiguration" => "s3:GetLifecycleConfiguration",
@@ -327,11 +335,23 @@ mod tests {
         assert_eq!(s3_action("GetObject"), Some("s3:GetObject"));
         assert_eq!(s3_action("PutObject"), Some("s3:PutObject"));
         assert_eq!(s3_action("DeleteObjects"), Some("s3:DeleteObject"));
+        assert_eq!(s3_action("ListObjects"), Some("s3:ListBucket"));
         assert_eq!(s3_action("ListObjectsV2"), Some("s3:ListBucket"));
-        // M8 前置：标签 op 折叠到对象读/写（AWS 语义）
+        assert_eq!(s3_action("ListMultipartUploads"), Some("s3:ListBucket"));
+        // M8 前置：标签 op 折叠到对象读/写（AWS 语义）；UploadPartCopy 目标写
         assert_eq!(s3_action("GetObjectTagging"), Some("s3:GetObject"));
         assert_eq!(s3_action("PutObjectTagging"), Some("s3:PutObject"));
         assert_eq!(s3_action("DeleteObjectTagging"), Some("s3:PutObject"));
+        assert_eq!(s3_action("UploadPartCopy"), Some("s3:PutObject"));
+        // 保留策略独立动作（读/写）
+        assert_eq!(
+            s3_action("GetObjectRetention"),
+            Some("s3:GetObjectRetention")
+        );
+        assert_eq!(
+            s3_action("PutObjectRetention"),
+            Some("s3:PutObjectRetention")
+        );
         assert_eq!(s3_action("CopyObject"), None);
         assert_eq!(s3_action("Frobnicate"), None);
         // M8 S4b：生命周期配置与恢复动作
