@@ -18,7 +18,8 @@ use crate::convert::to_s3_error;
 use super::{OssS3, last_modified};
 
 /// AWS 的 `encoding-type=url`：仅保留 RFC 3986 unreserved，其余字节按 UTF-8 %XX（大写）。
-fn url_encode(s: &str) -> String {
+/// `pub(super)`：ListMultipartUploads 复用同一编码口径。
+pub(super) fn url_encode(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {

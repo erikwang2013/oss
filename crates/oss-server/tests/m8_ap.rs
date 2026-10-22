@@ -1081,6 +1081,20 @@ async fn object_ops_through_ap() {
         .and_then(|s| s.split("</UploadId>").next())
         .expect("CreateMultipartUpload 缺 UploadId")
         .to_string();
+    // ListMultipartUploads 经 AP：GET bucket ?uploads 可见进行中的 upload
+    let r = signed(
+        &e,
+        Method::GET,
+        "/ap/ops-ap?uploads",
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains(&upload_id));
     let part_q = format!(
         "/ap/ops-ap/dir/mpu?partNumber=1&uploadId={}",
         pct_encode(&upload_id)
@@ -1180,7 +1194,45 @@ async fn object_ops_through_ap() {
         404
     );
 
-    // 不支持形状：DeleteObjects / UploadPartCopy → 501
+    // UploadPartCopy 经 AP：MPU 目标 + x-amz-copy-source → 200 CopyPartResult
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/ops-ap/dir/copy-part?uploads",
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let xml = r.text().await.unwrap();
+    let copy_id = xml
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("CreateMultipartUpload 缺 UploadId")
+        .to_string();
+    let copy_q = format!(
+        "/ap/ops-ap/dir/copy-part?partNumber=1&uploadId={}",
+        pct_encode(&copy_id)
+    );
+    let r = signed(
+        &e,
+        Method::PUT,
+        &copy_q,
+        &[("x-amz-copy-source", "/opsb/dir/copy.txt")],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("CopyPartResult"));
+
+    // 不支持形状：DeleteObjects → 501
     let delete_xml = b"<Delete><Object><Key>dir/copy.txt</Key></Object></Delete>";
     assert_eq!(
         send_status(
@@ -1189,20 +1241,6 @@ async fn object_ops_through_ap() {
             "/ap/ops-ap?delete",
             &[],
             delete_xml,
-            &ak,
-            &sk,
-            "s3"
-        )
-        .await,
-        501
-    );
-    assert_eq!(
-        send_status(
-            &e,
-            Method::PUT,
-            "/ap/ops-ap/copy?partNumber=1&uploadId=u",
-            &[("x-amz-copy-source", "/opsb/dir/copy.txt")],
-            b"",
             &ak,
             &sk,
             "s3"
