@@ -13,7 +13,13 @@ use bytes::Bytes;
 use flate2::write::GzEncoder;
 use futures::StreamExt as _;
 use md5::{Digest as _, Md5};
-use s3s::dto::InventoryConfiguration;
+use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
+use parquet::column::writer::ColumnWriter;
+use parquet::data_type::{ByteArray, ByteArrayType, BoolType, Int64Type};
+use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::types::Type as SchemaType;
+use s3s::dto::{InventoryConfiguration, InventoryFormat};
 use xl_s3::access::{Acl, AuthedUser};
 use xl_s3::inventory::{csv_columns, filter_prefix, includes_all_versions};
 use xl_s3::sse::enc_spec_from_default;
@@ -274,10 +280,18 @@ impl InventoryRunner {
             &p.config_id,
             &p.run_key,
         ]);
-        let data_key = format!("{base}/data/{}.csv.gz", uuid::Uuid::new_v4());
+        let parquet = cfg.destination.s3_bucket_destination.format.as_str()
+            == InventoryFormat::PARQUET;
+        let ext = if parquet { "parquet" } else { "csv.gz" };
+        let data_key = format!("{base}/data/{}.{ext}", uuid::Uuid::new_v4());
         let manifest_key = format!("{base}/manifest.json");
+        // Hive 兼容清单与数据/清单同目录树，供 Athena SymlinkTextInputFormat 读取。
+        let hive_key = format!(
+            "{base}/hive/dt={}/symlink.txt",
+            hive_partition(crate::db::now())
+        );
         // I4：运行期以**实际键**复核 PutObject（融合桶策略，显式 Deny 优先）。
-        for key in [&data_key, &manifest_key] {
+        for key in [&data_key, &manifest_key, &hive_key] {
             match self
                 .acl
                 .check_op(&owner, "", "PutObject", Some(&dest), Some(key), None)
@@ -314,6 +328,7 @@ impl InventoryRunner {
                 &dest,
                 &data_key,
                 &manifest_key,
+                &hive_key,
                 &tmp,
                 run.job_id,
                 &mut scanned,
@@ -351,56 +366,34 @@ impl InventoryRunner {
         dest: &str,
         data_key: &str,
         manifest_key: &str,
+        hive_key: &str,
         tmp: &Path,
         job_id: Option<i64>,
         scanned: &mut i64,
     ) -> Result<(), String> {
         let columns = csv_columns(cfg);
+        let parquet = cfg.destination.s3_bucket_destination.format.as_str()
+            == InventoryFormat::PARQUET;
         let filter = filter_prefix(cfg).to_string();
         let size = Arc::new(AtomicU64::new(0));
-        let file = std::fs::File::create(tmp).map_err(|e| format!("建 staging 文件失败：{e}"))?;
-        let mut gz = GzEncoder::new(
-            HashingWriter::new(std::io::BufWriter::new(file), Arc::clone(&size)),
-            flate2::Compression::default(),
-        );
-        {
-            let mut w = csv::WriterBuilder::new()
-                .has_headers(false)
-                .from_writer(&mut gz);
-            w.write_record(&columns)
-                .map_err(|e| format!("CSV 头写入失败：{e}"))?;
-            if includes_all_versions(cfg) {
-                self.scan_versions(
-                    source_bucket,
-                    &columns,
-                    &filter,
-                    &mut w,
-                    &size,
-                    job_id,
-                    scanned,
-                )
-                .await?;
-            } else {
-                self.scan_current(
-                    source_bucket,
-                    &columns,
-                    &filter,
-                    &mut w,
-                    &size,
-                    job_id,
-                    scanned,
-                )
-                .await?;
-            }
-            w.flush().map_err(|e| format!("CSV 写入失败：{e}"))?;
+        let mut sink = DataSink::new(tmp, &columns, parquet, Arc::clone(&size))?;
+        if includes_all_versions(cfg) {
+            self.scan_versions(
+                source_bucket,
+                &columns,
+                &filter,
+                &mut sink,
+                &size,
+                job_id,
+                scanned,
+            )
+            .await?;
+        } else {
+            self.scan_current(source_bucket, &filter, &mut sink, &size, job_id, scanned).await?;
         }
-        let (_, md5, gz_size) = gz
-            .finish()
-            .map_err(|e| format!("gzip 收尾失败：{e}"))?
-            .finish()
-            .map_err(|e| format!("staging 写入失败：{e}"))?;
-        if gz_size > MAX_FILE_BYTES {
-            return Err(format!("单文件 {gz_size} 字节超过 5 GiB 上限"));
+        let (md5, file_size) = sink.finish()?;
+        if file_size > MAX_FILE_BYTES {
+            return Err(format!("单文件 {file_size} 字节超过 5 GiB 上限"));
         }
         let versioned = self
             .db
@@ -427,12 +420,17 @@ impl InventoryRunner {
         let body: ByteStream = Box::pin(
             tokio_util::io::ReaderStream::new(f).map(|r| r.map_err(xl_store::error::Error::from)),
         );
+        let content_type = if parquet {
+            "application/vnd.apache.parquet"
+        } else {
+            "application/gzip"
+        };
         self.store
             .put_object_stream_with_meta(
                 dest,
                 data_key,
                 body,
-                Some("application/gzip".to_string()),
+                Some(content_type.to_string()),
                 BTreeMap::new(),
                 None,
                 versioned,
@@ -443,14 +441,39 @@ impl InventoryRunner {
             )
             .await
             .map_err(|e| format!("数据文件写入目标桶失败：{e}"))?;
+        // Hive 兼容清单：一行一个数据文件 S3 URI（Athena SymlinkTextInputFormat）。
+        let symlink = format!("s3://{dest}/{data_key}\n");
+        self.store
+            .put_object_stream_with_meta(
+                dest,
+                hive_key,
+                Box::pin(futures::stream::once(async move {
+                    Ok(Bytes::from(symlink))
+                })),
+                Some("text/plain".to_string()),
+                BTreeMap::new(),
+                None,
+                versioned,
+                encryption.clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| format!("Hive symlink 写入目标桶失败：{e}"))?;
+        let file_schema = if parquet {
+            parquet_schema_string(&columns)?
+        } else {
+            columns.join(",")
+        };
         let manifest = serde_json::json!({
             "sourceBucket": source_bucket,
             "destinationBucket": dest,
             "version": "2016-11-30",
             "creationTimestamp": iso8601_millis(crate::db::now(), 0),
-            "fileFormat": "CSV",
-            "fileSchema": columns.join(","),
-            "files": [{"key": data_key, "size": gz_size, "md5Checksum": md5}],
+            "fileFormat": if parquet { "Parquet" } else { "CSV" },
+            "fileSchema": file_schema,
+            "files": [{"key": data_key, "size": file_size, "md5Checksum": md5}],
         });
         let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
         // manifest 改走 stream+meta 入口以携带与 data 文件相同的默认加密。
@@ -478,9 +501,8 @@ impl InventoryRunner {
     async fn scan_current(
         &self,
         bucket: &str,
-        columns: &[&str],
         filter: &str,
-        w: &mut CsvSink<'_>,
+        sink: &mut DataSink,
         size: &AtomicU64,
         job_id: Option<i64>,
         scanned: &mut i64,
@@ -501,7 +523,7 @@ impl InventoryRunner {
                 .await
                 .map_err(|e| e.to_string())?;
             for info in &page.objects {
-                write_row(w, columns, &current_fields(bucket, info))?;
+                sink.write(&current_fields(bucket, info))?;
             }
             *scanned += page.objects.len() as i64;
             if let Some(j) = job_id {
@@ -525,7 +547,7 @@ impl InventoryRunner {
         bucket: &str,
         columns: &[&str],
         filter: &str,
-        w: &mut CsvSink<'_>,
+        sink: &mut DataSink,
         size: &AtomicU64,
         job_id: Option<i64>,
         scanned: &mut i64,
@@ -564,7 +586,7 @@ impl InventoryRunner {
                 } else {
                     None
                 };
-                write_row(w, columns, &version_fields(bucket, e, head.as_ref()))?;
+                sink.write(&version_fields(bucket, e, head.as_ref()))?;
             }
             *scanned += page.entries.len() as i64;
             if let Some(j) = job_id {
@@ -586,8 +608,385 @@ impl InventoryRunner {
     }
 }
 
+/// CSV / Parquet 两种输出；扫描循环只生产 [`Fields`]，格式差异都在这里。
+enum DataSink {
+    Csv(CsvSink),
+    Parquet(ParquetSink),
+}
+
+impl DataSink {
+    fn new(
+        path: &Path,
+        columns: &[&'static str],
+        parquet: bool,
+        size: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        let file = std::fs::File::create(path).map_err(|e| format!("建 staging 文件失败：{e}"))?;
+        if parquet {
+            return Ok(Self::Parquet(ParquetSink::new(file, columns, size)?));
+        }
+        let mut w = csv::WriterBuilder::new().has_headers(false).from_writer(GzEncoder::new(
+            HashingWriter::new(std::io::BufWriter::new(file), size),
+            flate2::Compression::default(),
+        ));
+        w.write_record(columns)
+            .map_err(|e| format!("CSV 头写入失败：{e}"))?;
+        Ok(Self::Csv(CsvSink {
+            w,
+            columns: columns.to_vec(),
+        }))
+    }
+
+    fn write(&mut self, f: &Fields) -> Result<(), String> {
+        match self {
+            Self::Csv(s) => s.write(f),
+            Self::Parquet(p) => p.write(f),
+        }
+    }
+
+    /// 返回 (base64 MD5, 落盘字节数)。
+    fn finish(self) -> Result<(String, u64), String> {
+        match self {
+            Self::Csv(s) => s.finish(),
+            Self::Parquet(p) => p.finish(),
+        }
+    }
+}
+
 type GzSink = GzEncoder<HashingWriter<std::io::BufWriter<std::fs::File>>>;
-type CsvSink<'a> = csv::Writer<&'a mut GzSink>;
+
+struct CsvSink {
+    w: csv::Writer<GzSink>,
+    columns: Vec<&'static str>,
+}
+
+impl CsvSink {
+    fn write(&mut self, f: &Fields) -> Result<(), String> {
+        let row: Vec<String> = self.columns.iter().map(|c| render(c, f)).collect();
+        self.w
+            .write_record(&row)
+            .map_err(|e| format!("CSV 行写入失败：{e}"))
+    }
+
+    fn finish(mut self) -> Result<(String, u64), String> {
+        self.w
+            .flush()
+            .map_err(|e| format!("CSV 写入失败：{e}"))?;
+        let gz = self
+            .w
+            .into_inner()
+            .map_err(|e| format!("CSV 写入失败：{}", e.into_error()))?;
+        let (_, md5, size) = gz
+            .finish()
+            .map_err(|e| format!("gzip 收尾失败：{e}"))?
+            .finish()
+            .map_err(|e| format!("staging 写入失败：{e}"))?;
+        Ok((md5, size))
+    }
+}
+
+/// 行组大小：限制 Parquet 写入的内存占用。
+const PARQUET_ROW_GROUP_ROWS: usize = 8192;
+
+#[derive(Clone, Copy)]
+enum PKind {
+    Utf8Req,
+    Utf8Opt,
+    BoolOpt,
+    Int64Opt,
+    TimestampOpt,
+}
+
+struct PCol {
+    csv: &'static str,
+    /// AWS Inventory Parquet 使用 lower_snake_case 字段名。
+    name: &'static str,
+    kind: PKind,
+}
+
+fn parquet_columns(columns: &[&'static str]) -> Result<Vec<PCol>, String> {
+    columns
+        .iter()
+        .map(|c| {
+            let (name, kind) = match *c {
+                "Bucket" => ("bucket", PKind::Utf8Req),
+                "Key" => ("key", PKind::Utf8Req),
+                "VersionId" => ("version_id", PKind::Utf8Opt),
+                "IsLatest" => ("is_latest", PKind::BoolOpt),
+                "DeleteMarker" => ("is_delete_marker", PKind::BoolOpt),
+                "Size" => ("size", PKind::Int64Opt),
+                "LastModifiedDate" => ("last_modified_date", PKind::TimestampOpt),
+                "ETag" => ("e_tag", PKind::Utf8Opt),
+                "StorageClass" => ("storage_class", PKind::Utf8Opt),
+                "ReplicationStatus" => ("replication_status", PKind::Utf8Opt),
+                "EncryptionStatus" => ("encryption_status", PKind::Utf8Opt),
+                "ObjectLockRetainUntilDate" => {
+                    ("object_lock_retain_until_date", PKind::TimestampOpt)
+                }
+                "ObjectLockMode" => ("object_lock_mode", PKind::Utf8Opt),
+                "ObjectLockLegalHoldStatus" => {
+                    ("object_lock_legal_hold_status", PKind::Utf8Opt)
+                }
+                "ChecksumAlgorithm" => ("checksum_algorithm", PKind::Utf8Opt),
+                other => return Err(format!("Parquet 不支持的库存列：{other}")),
+            };
+            Ok(PCol {
+                csv: c,
+                name,
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn parquet_schema(cols: &[PCol]) -> Result<SchemaType, String> {
+    let mut fields = Vec::with_capacity(cols.len());
+    for c in cols {
+        let (physical, repetition, logical) = match c.kind {
+            PKind::Utf8Req => (
+                PhysicalType::BYTE_ARRAY,
+                Repetition::REQUIRED,
+                Some(LogicalType::String),
+            ),
+            PKind::Utf8Opt => (
+                PhysicalType::BYTE_ARRAY,
+                Repetition::OPTIONAL,
+                Some(LogicalType::String),
+            ),
+            PKind::BoolOpt => (PhysicalType::BOOLEAN, Repetition::OPTIONAL, None),
+            PKind::Int64Opt => (PhysicalType::INT64, Repetition::OPTIONAL, None),
+            PKind::TimestampOpt => (
+                PhysicalType::INT64,
+                Repetition::OPTIONAL,
+                Some(LogicalType::timestamp(true, TimeUnit::MILLIS)),
+            ),
+        };
+        let field = SchemaType::primitive_type_builder(c.name, physical)
+            .with_repetition(repetition)
+            .with_logical_type(logical)
+            .build()
+            .map_err(|e| format!("Parquet schema 构建失败：{e}"))?;
+        fields.push(Arc::new(field));
+    }
+    SchemaType::group_type_builder("s3.inventory")
+        .with_fields(fields)
+        .build()
+        .map_err(|e| format!("Parquet schema 构建失败：{e}"))
+}
+
+/// manifest 的 `fileSchema`：Hive/Athena 可直接读的 schema 文本。
+fn parquet_schema_string(columns: &[&'static str]) -> Result<String, String> {
+    let cols = parquet_columns(columns)?;
+    let mut out = String::from("message s3.inventory {\n");
+    for c in &cols {
+        let field = match c.kind {
+            PKind::Utf8Req => format!("required binary {} (UTF8);", c.name),
+            PKind::Utf8Opt => format!("optional binary {} (UTF8);", c.name),
+            PKind::BoolOpt => format!("optional boolean {};", c.name),
+            PKind::Int64Opt => format!("optional int64 {};", c.name),
+            PKind::TimestampOpt => format!("optional int64 {} (TIMESTAMP_MILLIS);", c.name),
+        };
+        out.push_str("  ");
+        out.push_str(&field);
+        out.push('\n');
+    }
+    out.push('}');
+    Ok(out)
+}
+
+struct ParquetSink {
+    writer: SerializedFileWriter<HashingWriter<std::io::BufWriter<std::fs::File>>>,
+    cols: Vec<PCol>,
+    rows: Vec<Fields>,
+}
+
+impl ParquetSink {
+    fn new(
+        file: std::fs::File,
+        columns: &[&'static str],
+        size: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        let cols = parquet_columns(columns)?;
+        let schema = Arc::new(parquet_schema(&cols)?);
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let writer = SerializedFileWriter::new(
+            HashingWriter::new(std::io::BufWriter::new(file), size),
+            schema,
+            props,
+        )
+        .map_err(|e| format!("Parquet writer 初始化失败：{e}"))?;
+        Ok(Self {
+            writer,
+            cols,
+            rows: Vec::with_capacity(PARQUET_ROW_GROUP_ROWS),
+        })
+    }
+
+    fn write(&mut self, f: &Fields) -> Result<(), String> {
+        self.rows.push(f.clone());
+        if self.rows.len() >= PARQUET_ROW_GROUP_ROWS {
+            self.flush_group()?;
+        }
+        Ok(())
+    }
+
+    fn flush_group(&mut self) -> Result<(), String> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.rows);
+        let mut rg = self
+            .writer
+            .next_row_group()
+            .map_err(|e| format!("Parquet 行组写入失败：{e}"))?;
+        for col in &self.cols {
+            let Some(mut cw) = rg
+                .next_column()
+                .map_err(|e| format!("Parquet 列写入失败：{e}"))?
+            else {
+                return Err("Parquet 列数不匹配".to_string());
+            };
+            match col.kind {
+                PKind::Utf8Req => {
+                    let values: Vec<ByteArray> = rows
+                        .iter()
+                        .map(|f| ByteArray::from(parquet_string(col.csv, f).unwrap_or_default()))
+                        .collect();
+                    cw.typed::<ByteArrayType>()
+                        .write_batch(&values, None, None)
+                        .map_err(|e| format!("Parquet 写入失败：{e}"))?;
+                }
+                PKind::Utf8Opt => {
+                    let mut values = Vec::with_capacity(rows.len());
+                    let mut defs = Vec::with_capacity(rows.len());
+                    for f in &rows {
+                        match parquet_string(col.csv, f) {
+                            Some(s) => {
+                                values.push(ByteArray::from(s));
+                                defs.push(1);
+                            }
+                            None => defs.push(0),
+                        }
+                    }
+                    cw.typed::<ByteArrayType>()
+                        .write_batch(&values, Some(&defs), None)
+                        .map_err(|e| format!("Parquet 写入失败：{e}"))?;
+                }
+                PKind::BoolOpt => {
+                    let mut values = Vec::with_capacity(rows.len());
+                    let mut defs = Vec::with_capacity(rows.len());
+                    for f in &rows {
+                        match parquet_bool(col.csv, f) {
+                            Some(v) => {
+                                values.push(v);
+                                defs.push(1);
+                            }
+                            None => defs.push(0),
+                        }
+                    }
+                    cw.typed::<BoolType>()
+                        .write_batch(&values, Some(&defs), None)
+                        .map_err(|e| format!("Parquet 写入失败：{e}"))?;
+                }
+                PKind::Int64Opt | PKind::TimestampOpt => {
+                    let mut values = Vec::with_capacity(rows.len());
+                    let mut defs = Vec::with_capacity(rows.len());
+                    for f in &rows {
+                        match parquet_i64(col.csv, f) {
+                            Some(v) => {
+                                values.push(v);
+                                defs.push(1);
+                            }
+                            None => defs.push(0),
+                        }
+                    }
+                    cw.typed::<Int64Type>()
+                        .write_batch(&values, Some(&defs), None)
+                        .map_err(|e| format!("Parquet 写入失败：{e}"))?;
+                }
+            }
+            cw.close()
+                .map_err(|e| format!("Parquet 列收尾失败：{e}"))?;
+        }
+        rg.close()
+            .map_err(|e| format!("Parquet 行组收尾失败：{e}"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(String, u64), String> {
+        self.flush_group()?;
+        let w = self
+            .writer
+            .into_inner()
+            .map_err(|e| format!("Parquet 收尾失败：{e}"))?;
+        let (_, md5, size) = w
+            .finish()
+            .map_err(|e| format!("staging 写入失败：{e}"))?;
+        Ok((md5, size))
+    }
+}
+
+fn parquet_string(col: &str, f: &Fields) -> Option<String> {
+    match col {
+        "Bucket" => Some(f.bucket.clone()),
+        "Key" => Some(f.key.clone()),
+        "VersionId" => (!f.version_id.is_empty()).then(|| f.version_id.clone()),
+        "ETag" => f.etag.clone(),
+        "StorageClass" if f.delete_marker => None,
+        "StorageClass" => Some(
+            f.storage_class
+                .clone()
+                .unwrap_or_else(|| "STANDARD".to_string()),
+        ),
+        "ReplicationStatus" => f.replication.clone(),
+        "EncryptionStatus" if f.delete_marker => None,
+        "EncryptionStatus" => f.encryption.clone(),
+        "ObjectLockMode" => f.lock_mode.clone(),
+        "ObjectLockLegalHoldStatus" if f.delete_marker => None,
+        "ObjectLockLegalHoldStatus" => {
+            Some(if f.legal_hold { "ON" } else { "OFF" }.to_string())
+        }
+        "ChecksumAlgorithm" => f.checksum_algorithm.clone(),
+        _ => None,
+    }
+}
+
+fn parquet_bool(col: &str, f: &Fields) -> Option<bool> {
+    match col {
+        "IsLatest" => Some(f.is_latest),
+        "DeleteMarker" => Some(f.delete_marker),
+        _ => None,
+    }
+}
+
+fn parquet_i64(col: &str, f: &Fields) -> Option<i64> {
+    match col {
+        "Size" => f.size.and_then(|v| i64::try_from(v).ok()),
+        "LastModifiedDate" => Some(f.mod_time_nanos.div_euclid(1_000_000)),
+        "ObjectLockRetainUntilDate" => f
+            .lock_until_nanos
+            .map(|n| n.div_euclid(1_000_000)),
+        _ => None,
+    }
+}
+
+/// Hive 分区时间戳（UTC，AWS `dt=YYYY-MM-DD-HH-MM`）。
+fn hive_partition(now: i64) -> String {
+    let dt =
+        time::OffsetDateTime::from_unix_timestamp(now).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}-{:02}-{:02}",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute()
+    )
+}
 
 fn check_size(size: &AtomicU64) -> Result<(), String> {
     // gzip 内部缓冲可能滞后 ≤32KB；5 GiB 门槛不受影响。
@@ -598,7 +997,7 @@ fn check_size(size: &AtomicU64) -> Result<(), String> {
 }
 
 /// 一行 CSV 的元数据快照（与列顺序解耦）。
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Fields {
     bucket: String,
     key: String,
