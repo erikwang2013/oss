@@ -263,6 +263,7 @@ impl Store {
                         sha256: String::new(),
                     },
                     parts: None,
+                    part_sizes: None,
                     checksum: None,
                     data_layout: None,
                     inline: None,
@@ -335,6 +336,7 @@ impl Store {
                     sha256: String::new(),
                 },
                 parts: None,
+                part_sizes: None,
                 checksum: None,
                 data_layout: None,
                 inline: None,
@@ -846,6 +848,93 @@ impl Store {
         self.read_version_data(bucket, key, v, Some(range), sse_c)
             .await?
             .ok_or_else(|| Error::NoSuchKey(key.to_string()))
+    }
+
+    /// GET/HEAD `?partNumber` 元数据定位（HEAD 用）：一次 meta 读取 →
+    /// (info, 绝对半开区间, parts_count)。marker 语义与 GET/HEAD 一致。
+    pub async fn object_part_span(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        part_number: i32,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, StdRange<u64>, u32)> {
+        let (m, idx) = self
+            .locate_read_version(bucket, key, version_id, sse_c)
+            .await?;
+        let v = &m.versions[idx];
+        let (span, parts_count) = v.part_span(part_number)?;
+        let info = match version_id {
+            Some(_) => version_info(key, v),
+            None => self.load_object_info(bucket, key, &m)?,
+        };
+        Ok((info, span, parts_count))
+    }
+
+    /// GET `?partNumber`：meta 定位与区间读在**同一次调用**内完成（防并发覆写错位）。
+    pub async fn get_object_part_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        part_number: i32,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, Bytes, StdRange<u64>, u32)> {
+        let (m, idx) = self
+            .locate_read_version(bucket, key, version_id, sse_c)
+            .await?;
+        let v = &m.versions[idx];
+        let (span, parts_count) = v.part_span(part_number)?;
+        let info = match version_id {
+            Some(_) => version_info(key, v),
+            None => self.load_object_info(bucket, key, &m)?,
+        };
+        let bytes = self
+            .read_version_data(bucket, key, v, Some(span.clone()), sse_c)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        Ok((info, bytes, span, parts_count))
+    }
+
+    /// 读路径版本定位（返回 meta 与链内下标）：`None` = 链尾（marker → NoSuchKey），
+    /// `Some` = 点名版本（marker → DeleteMarker，S3 405）。
+    async fn locate_read_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(XlMeta, usize)> {
+        self.ensure_bucket(bucket).await?;
+        let m = self
+            .read_meta(bucket, key)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        let idx = match version_id {
+            Some(vid) => {
+                let i = m
+                    .versions
+                    .iter()
+                    .position(|v| v.version_id_str() == vid)
+                    .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+                if m.versions[i].delete_marker() {
+                    return Err(Error::DeleteMarker(format!("{bucket}/{key}@{vid}")));
+                }
+                i
+            }
+            None => {
+                if m.latest_is_marker() {
+                    return Err(Error::NoSuchKey(key.to_string()));
+                }
+                m.versions
+                    .len()
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?
+            }
+        };
+        check_read_sse_c(&m.versions[idx], sse_c)?;
+        Ok((m, idx))
     }
 
     /// 单版本数据读取（整读 / 区间）：inline → EC 分块 → 旧 parts。**单遍**。

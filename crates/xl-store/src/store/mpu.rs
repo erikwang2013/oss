@@ -489,6 +489,8 @@ impl Store {
             h.update(raw);
         }
         let etag = format!("{}-{}", hex::encode(h.finalize()), parts.len());
+        // partNumber 读路径的偏移表：暂存 part 文件在 complete 后可回收，边界只此一份
+        let part_sizes: Vec<u64> = snapshots.iter().map(|(_, _, pm)| pm.size).collect();
 
         // M-6 同口径：损坏旧 meta 让 complete fail-closed
         let old_meta = self.read_meta(bucket, key).await?;
@@ -632,7 +634,8 @@ impl Store {
                 size,
                 sha256,
             },
-            parts: None,    // 裁决：新写入不再使用 parts（降为 M2a 旧对象只读兼容位）
+            parts: None, // 裁决：新写入不再使用 parts（降为 M2a 旧对象只读兼容位）
+            part_sizes: Some(part_sizes),
             checksum: None, // multipart 组合校验和留 M2b
             data_layout,
             inline,

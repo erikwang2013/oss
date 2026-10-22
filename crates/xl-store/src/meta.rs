@@ -43,6 +43,11 @@ pub struct Version {
     /// `None` = M1 单段语义（读 `part`）。只加 `Option` 字段 = 前向兼容契约（见文件头注释）。
     #[serde(default)]
     pub parts: Option<Vec<PartRef>>,
+    /// Multipart complete 时记录的**明文**各段长度（按 part 号升序）——GET/HEAD
+    /// `?partNumber` 的偏移表。None = 旧对象/单段 PUT（part 1 = 整对象；其余段不可定位，
+    /// complete 后暂存 part 文件已回收，边界不可逆）。前向兼容：老解码器跳过未知字段。
+    #[serde(default)]
+    pub part_sizes: Option<Vec<u64>>,
     /// 客户端声明的校验和（Content-MD5 / `x-amz-checksum-*`；服务端在提交点前已验证）。
     /// multipart 的组合校验和语义留 M2b。
     #[serde(default)]
@@ -211,6 +216,39 @@ impl Version {
         match &self.parts {
             Some(parts) => parts.clone(),
             None => vec![self.part.clone()],
+        }
+    }
+
+    /// partNumber → (绝对半开区间, parts_count)。`part_sizes` 缺失（旧对象）时只认 part 1
+    /// = 整对象，其余 416；越界与空 part 同样 416（`Error::InvalidPartRange`）。
+    pub fn part_span(&self, part_number: i32) -> Result<(std::ops::Range<u64>, u32)> {
+        let n = usize::try_from(part_number)
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| Error::InvalidPart(format!("partNumber 必须为正: {part_number}")))?;
+        match &self.part_sizes {
+            Some(sizes) => {
+                let Some(&len) = sizes.get(n - 1) else {
+                    return Err(Error::InvalidPartRange(format!(
+                        "partNumber {n} 超过对象段数 {}",
+                        sizes.len()
+                    )));
+                };
+                if len == 0 {
+                    return Err(Error::InvalidPartRange(format!("part {n} 为空")));
+                }
+                let start = sizes[..n - 1]
+                    .iter()
+                    .try_fold(0u64, |a, &s| a.checked_add(s))
+                    .ok_or_else(|| Error::CorruptMeta("part_sizes 偏移溢出".into()))?;
+                Ok((start..start + len, sizes.len() as u32))
+            }
+            // 空对象没有可表达的 Content-Range（end-1 会下溢）→ 416
+            None if n == 1 && self.size > 0 => Ok((0..self.size, 1)),
+            None if n == 1 => Err(Error::InvalidPartRange("part 1 为空".into())),
+            None => Err(Error::InvalidPartRange(format!(
+                "partNumber {n} 超过对象段数 1（旧对象未记录分段边界）"
+            ))),
         }
     }
 
@@ -501,6 +539,18 @@ impl XlMeta {
                     }
                 }
             }
+            // part_sizes 作 partNumber 偏移表进读路径：条数上限（S3 最多 10000 段）与
+            // 总和 = size 必须自洽（信任边界；损坏/手工构造 → fail-closed）
+            if let Some(sizes) = &v.part_sizes {
+                let sum = sizes.iter().try_fold(0u64, |a, &s| a.checked_add(s));
+                if sizes.is_empty() || sizes.len() > 10_000 || sum != Some(v.size) {
+                    return Err(Error::CorruptMeta(format!(
+                        "part_sizes 非法：{} 段，总和 {sum:?} ≠ size {}",
+                        sizes.len(),
+                        v.size
+                    )));
+                }
+            }
         }
         Ok(m)
     }
@@ -579,6 +629,7 @@ mod tests {
                     sha256: "aa".into(),
                 },
                 parts: None,
+                part_sizes: None,
                 checksum: None,
                 data_layout: None,
                 inline: None,
@@ -794,13 +845,14 @@ mod tests {
         // **第八次**：M6 切片 3 增 replication_status 字段——非复制对象写 nil，老解码器跳过；
         // **第九次**：M8 前置增 tags 字段——无标签对象写 nil，老解码器跳过；
         // **第十次**：M8 S4a 增 storage_class/tier 字段——普通对象写 nil，老解码器跳过；
-        // **第十一次**：M9 S1 增 remote_version_id 字段——非 sync 写 nil，老解码器跳过）。
+        // **第十一次**：M9 S1 增 remote_version_id 字段——非 sync 写 nil，老解码器跳过；
+        // **第十二次**：读路径补全增 part_sizes 字段——旧对象/单段 PUT 写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "9ad1fe87188185c1b395f80291f899af60c4603a2747bef61655940f83b0f8e5"
+            "4ba3d95f8e837693c0cbcdb248c29757be1720b3bda7893837ea3dae10200074"
         );
     }
 }
@@ -824,6 +876,7 @@ mod parts_tests {
                 sha256: "s".into(),
             },
             parts,
+            part_sizes: None,
             checksum: None,
             data_layout: None,
             inline: None,
@@ -866,6 +919,57 @@ mod parts_tests {
         let ps = v.effective_parts();
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[1].part, 2);
+    }
+
+    #[test]
+    fn part_span_matrix() {
+        let mut v = version(None);
+        v.size = 12;
+        v.part_sizes = Some(vec![3, 4, 5]);
+        assert_eq!(v.part_span(1).unwrap(), (0..3, 3));
+        assert_eq!(v.part_span(2).unwrap(), (3..7, 3));
+        assert_eq!(v.part_span(3).unwrap(), (7..12, 3));
+        assert!(matches!(v.part_span(0), Err(Error::InvalidPart(_))));
+        assert!(matches!(v.part_span(-1), Err(Error::InvalidPart(_))));
+        assert!(matches!(v.part_span(4), Err(Error::InvalidPartRange(_))));
+
+        // 旧对象（无 part_sizes）：part 1 = 整对象，其余 416
+        let old = version(None);
+        assert_eq!(old.part_span(1).unwrap(), (0..5, 1));
+        assert!(matches!(old.part_span(2), Err(Error::InvalidPartRange(_))));
+        // 0 字节旧对象：无可表达的 Content-Range → 416
+        let mut empty = version(None);
+        empty.size = 0;
+        assert!(matches!(
+            empty.part_span(1),
+            Err(Error::InvalidPartRange(_))
+        ));
+    }
+
+    #[test]
+    fn part_sizes_roundtrip_and_decode_validation() {
+        let mut v = version(None);
+        v.size = 11;
+        v.part_sizes = Some(vec![5, 6]);
+        let m = XlMeta {
+            object_key: "a".into(),
+            versions: vec![v],
+        };
+        let back = XlMeta::decode(&m.encode().unwrap()).unwrap();
+        assert_eq!(back.versions[0].part_sizes, Some(vec![5, 6]));
+
+        // 信任边界：空表 / 总和 ≠ size 解码即拒
+        for bad in [Some(vec![]), Some(vec![5, 5]), Some(vec![12, 0])] {
+            let mut v = version(None);
+            v.size = 11;
+            v.part_sizes = bad;
+            let m = XlMeta {
+                object_key: "a".into(),
+                versions: vec![v],
+            };
+            let bytes = m.encode().unwrap();
+            assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
+        }
     }
 
     #[test]
@@ -1023,6 +1127,10 @@ mod parts_tests {
         framed.extend(bytes);
         let back = XlMeta::decode(&framed).unwrap();
         assert!(back.versions[0].parts.is_none());
+        assert!(
+            back.versions[0].part_sizes.is_none(),
+            "旧 meta 无 part_sizes → None"
+        );
         assert!(back.versions[0].tags.is_none(), "旧 meta 无 tags → None");
         assert_eq!(back.versions[0].effective_parts()[0].uuid, "u");
     }

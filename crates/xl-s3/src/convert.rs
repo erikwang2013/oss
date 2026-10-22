@@ -14,6 +14,8 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         StoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
         StoreError::NoSuchUpload(_) => S3ErrorCode::NoSuchUpload,
         StoreError::InvalidPart(_) => S3ErrorCode::InvalidPart,
+        // GET/HEAD partNumber 越界（含旧对象无分段边界）→ 416，与 Range 越界同口径
+        StoreError::InvalidPartRange(_) => S3ErrorCode::InvalidRange,
         StoreError::InvalidPartOrder(_) => S3ErrorCode::InvalidPartOrder,
         StoreError::EntityTooSmall(_) => S3ErrorCode::EntityTooSmall,
         StoreError::BadDigest(_) => S3ErrorCode::BadDigest,
