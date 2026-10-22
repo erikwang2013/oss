@@ -20,7 +20,7 @@ use crate::layout;
 use crate::meta::{self, PartRef, Version, XlMeta};
 
 use super::read::{check_read_sse_c, check_tier_readable};
-use super::{ObjectInfo, Store};
+use super::{ObjectInfo, Store, VersioningMode};
 
 /// M5 切片 4（B1/B2 复验补）：该版本的「不可删原因」（**不含 bypass 语义**——整链场景
 /// purge/覆盖写用；点名删版本的 bypass 语义在 [`check_lock_delete`]）。
@@ -149,9 +149,10 @@ pub struct VersionList {
 }
 
 impl Store {
-    /// 版本感知删除（M4 切片 3）。
-    /// - `version_id=None` 且 `versioned`：追加 delete marker——**键不存在也创建**（S3 语义）。
-    /// - `version_id=None` 且非版本桶：走 M2b 整键删除。
+    /// 版本感知删除（M4 切片 3 / S3 Suspended）。
+    /// - `version_id=None` 且 Enabled：追加真 UUID delete marker——**键不存在也创建**（S3 语义）。
+    /// - `version_id=None` 且 Suspended：删链中 null 版本，追加 null delete marker。
+    /// - `version_id=None` 且 Off：走 M2b 整键删除。
     /// - `version_id=Some`：从链中移除该版本（重写 meta = 提交点；该版本目录 → trash）。
     ///   版本/键不存在 = 幂等成功（S3 语义）；链清空 → 整键清理。
     pub async fn delete_object_versioned(
@@ -159,9 +160,9 @@ impl Store {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
     ) -> Result<DeleteOutcome> {
-        self.delete_object_versioned_ext(bucket, key, version_id, versioned, false)
+        self.delete_object_versioned_ext(bucket, key, version_id, mode, false)
             .await
     }
 
@@ -172,14 +173,14 @@ impl Store {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
         bypass_governance: bool,
     ) -> Result<DeleteOutcome> {
         self.delete_object_versioned_with_marker(
             bucket,
             key,
             version_id,
-            versioned,
+            mode,
             bypass_governance,
             None,
         )
@@ -187,13 +188,14 @@ impl Store {
     }
 
     /// M9 S3：同 [`Self::delete_object_versioned_ext`]，marker 分支可用调用方预生成的
-    /// 身份（双站同 id）；`marker_spec` 只影响 `version_id=None && versioned` 的 marker。
+    /// 身份（双站同 id）；`marker_spec` 只影响 `version_id=None && Enabled` 的 marker
+    /// （Suspended 的 marker 版本号恒为 null，无同 id 语义）。
     pub async fn delete_object_versioned_with_marker(
         &self,
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
         bypass_governance: bool,
         marker_spec: Option<DeleteMarkerSpec>,
     ) -> Result<DeleteOutcome> {
@@ -203,7 +205,7 @@ impl Store {
         let _guard = self.lock_object(bucket, key).await?;
 
         let Some(vid) = version_id else {
-            if !versioned {
+            if mode == VersioningMode::Off {
                 // M5 切片 4（B2 兜底）：非版本化整键删先查链——陈旧节点（行未同步）也不得
                 // 借 purge 清掉锁定版本
                 let old = self.read_meta(bucket, key).await?;
@@ -218,7 +220,67 @@ impl Store {
                 self.purge_key(bucket, key).await?;
                 return Ok(DeleteOutcome::Object { tiers });
             }
-            // 追加 delete marker（无数据目录；链尾哨兵）
+            if mode == VersioningMode::Suspended {
+                // AWS：Suspended 无版本号删除 = 移除链中 null 版本（含 null marker），
+                // 追加新的 null delete marker；非 null 历史不动。
+                let old = self.read_meta(bucket, key).await?; // 损坏 fail-closed（同写路径口径）
+                let now = match old.as_ref().and_then(|m| m.latest()) {
+                    Some(v) => super::now_nanos().max(v.mod_time_nanos + 1),
+                    None => super::now_nanos(),
+                };
+                let mut m = old.clone().unwrap_or(XlMeta {
+                    object_key: key.to_string(),
+                    versions: Vec::new(),
+                });
+                let removed: Vec<Version> = m
+                    .versions
+                    .iter()
+                    .filter(|v| v.version_id.is_nil())
+                    .cloned()
+                    .collect();
+                // 被移除的 null 版本同样受对象锁保护（直调 store 时也 fail-closed）
+                for v in &removed {
+                    check_lock_delete(v, bypass_governance)?;
+                }
+                m.versions.retain(|v| !v.version_id.is_nil());
+                let marker = Version {
+                    version_id: uuid::Uuid::nil(),
+                    mod_time_nanos: now,
+                    size: 0,
+                    etag: String::new(),
+                    content_type: None,
+                    user_metadata: Default::default(),
+                    part: PartRef {
+                        uuid: uuid::Uuid::new_v4().to_string(),
+                        part: 1,
+                        size: 0,
+                        sha256: String::new(),
+                    },
+                    parts: None,
+                    checksum: None,
+                    data_layout: None,
+                    inline: None,
+                    is_delete_marker: Some(true),
+                    is_latest: None,
+                    replication_status: None,
+                    remote_version_id: None,
+                    tags: None,
+                    storage_class: None,
+                    tier: None,
+                    // NTP 回拨收口：与 Enabled marker 同口径
+                    epoch: Some(old.as_ref().map_or(0, |m| m.max_epoch()) + 1),
+                    encryption: None,
+                    lock: None,
+                };
+                m.versions.push(marker);
+                m.refresh_latest_flags();
+                self.write_meta(bucket, key, &m, old.as_ref()).await?;
+                self.recycle_versions(bucket, key, &removed).await;
+                return Ok(DeleteOutcome::Marker {
+                    version_id: "null".to_string(),
+                });
+            }
+            // Enabled：追加 delete marker（无数据目录；链尾哨兵）
             let old = self.read_meta(bucket, key).await?; // 损坏 fail-closed（同写路径口径）
             // M9：同 id marker 已存在 → 幂等成功（恢复 worker 的「只补本地」不重造）。
             if let Some(spec) = marker_spec.as_ref()
@@ -379,6 +441,18 @@ impl Store {
                     }
                 }
             }
+        }
+    }
+
+    /// 回收被覆盖写替换下来的版本数据目录（Suspended 的 null 版本；marker 无数据目录）。
+    pub(in crate::store) async fn recycle_versions(
+        &self,
+        bucket: &str,
+        key: &str,
+        versions: &[Version],
+    ) {
+        for v in versions.iter().filter(|v| !v.delete_marker()) {
+            self.recycle_version_dir(bucket, key, &v.part.uuid).await;
         }
     }
 
@@ -857,11 +931,14 @@ impl Store {
         }
         // 键集（完备性同对象列表：各源首页 limit=max+1 的并集覆盖全局前 max 键）
         let mut keys: Vec<String> = {
+            // 先按 key_marker 过滤再截断：否则 >max+1 键的桶第二页为空（本地截断早于
+            // key_marker 的应用）。key_marker 本身保留（其版本链从 version_id_marker 续）。
             let mut local: Vec<String> = self
                 .collect_keys(bucket)
                 .await?
                 .into_iter()
                 .filter(|k| k.starts_with(prefix))
+                .filter(|k| key_marker.is_none_or(|km| k.as_str() >= km))
                 .collect();
             local.sort();
             local.truncate(max + 1);
@@ -877,8 +954,11 @@ impl Store {
                     bucket: bucket.into(),
                     prefix: prefix.into(),
                     delimiter: None,
-                    marker: None,
+                    // 版本列表：key_marker 是包含的续点；远端不得从头返回（否则 >limit 的
+                    // 续页键整段缺失）。delete-marker 链尾的键也必须出现在版本列表。
+                    marker: key_marker.map(str::to_string),
                     limit: max + 1,
+                    include_deleted: true,
                 };
                 match cl.transport.list_local(&n.id, req).await {
                     Ok(page) => keys.extend(page.entries.into_iter().map(|e| e.key)),

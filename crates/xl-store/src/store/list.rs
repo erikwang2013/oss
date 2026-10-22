@@ -40,6 +40,7 @@ impl Store {
                 &prefix,
                 req.continuation_token.as_deref(),
                 delimiter,
+                false,
                 max + 1,
             )
             .await?;
@@ -59,6 +60,7 @@ impl Store {
         prefix: &str,
         start_after: Option<&str>,
         delimiter: Option<&str>,
+        include_deleted: bool,
         limit: usize,
     ) -> Result<(Vec<(crate::mesh::ListEntry, ObjectInfo)>, Vec<String>)> {
         let mut keys = self.collect_keys(bucket).await?;
@@ -95,7 +97,7 @@ impl Store {
             }
             if let Some(m) = self.read_meta(bucket, &k).await? {
                 // 版本控制：链尾为 delete marker 的键在对象列表不可见（版本列表仍可见）
-                if m.latest_is_marker() {
+                if !include_deleted && m.latest_is_marker() {
                     continue;
                 }
                 let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
@@ -134,7 +136,14 @@ impl Store {
 
         // 本机页（本机无桶目录 → 空页）
         let (local_objs, local_cps) = match self
-            .list_page_local(bucket, &prefix, start_after.as_deref(), delimiter, limit)
+            .list_page_local(
+                bucket,
+                &prefix,
+                start_after.as_deref(),
+                delimiter,
+                false,
+                limit,
+            )
             .await
         {
             Ok(x) => x,
@@ -159,6 +168,7 @@ impl Store {
                 delimiter: delimiter.map(|d| d.to_string()),
                 marker: start_after.clone(),
                 limit,
+                include_deleted: false,
             };
             match cl.transport.list_local(&n.id, l).await {
                 Ok(resp) => {

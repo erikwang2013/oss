@@ -137,6 +137,8 @@ pub struct ListLocal {
     pub delimiter: Option<String>,
     pub marker: Option<String>,
     pub limit: usize,
+    /// 版本列表：链尾为 delete marker 的键也要返回（对象列表 = false）。
+    pub include_deleted: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, PartRef, Version, XlMeta};
 use crate::store::put::TeeGuard;
-use crate::store::{ByteStream, ObjectInfo, Store, now_nanos};
+use crate::store::{ByteStream, ObjectInfo, Store, VersioningMode, now_nanos};
 
 /// 暂存区标记文件；存在即「这是一个活着的 MPU 暂存区」。
 /// complete 成功后改名为 [`MPU_DONE_FILE`]——abort 以本标记为生死门，防误删已转正的版本目录。
@@ -286,12 +286,20 @@ impl Store {
         upload_id: &str,
         parts: &[(u16, String)],
     ) -> Result<ObjectInfo> {
-        self.complete_multipart_upload_versioned(bucket, key, upload_id, parts, false, None, None)
+        self.complete_multipart_upload_versioned(
+            bucket,
+            key,
+            upload_id,
+            parts,
+            VersioningMode::Off,
+            None,
+            None,
+        )
             .await
     }
 
-    /// 版本控制感知的 complete（M4 切片 3）：`versioned` 时追加版本（保留旧目录），
-    /// 否则维持单版本 + 回收的 M2b 语义（与单段 PUT 同口径）。
+    /// 版本控制感知的 complete（M4 切片 3 / S3 Suspended）：Enabled 追加版本（保留旧
+    /// 目录）；Suspended 替换链中 null 版本；Off 维持单版本 + 回收的 M2b 语义。
     #[allow(clippy::too_many_arguments)] // 同 create_multipart_upload_ext：线头直通
     pub async fn complete_multipart_upload_versioned(
         &self,
@@ -299,7 +307,7 @@ impl Store {
         key: &str,
         upload_id: &str,
         parts: &[(u16, String)],
-        versioned: bool,
+        mode: VersioningMode,
         encryption: Option<crypto::EncSpec>,
         lock: Option<meta::ObjectLockRecord>,
     ) -> Result<ObjectInfo> {
@@ -484,10 +492,21 @@ impl Store {
 
         // M-6 同口径：损坏旧 meta 让 complete fail-closed
         let old_meta = self.read_meta(bucket, key).await?;
-        // M5 切片 4（B2 兜底）：非版本化 complete 回收旧版本前查链锁
-        if !versioned
-            && let Some(old) = old_meta.as_ref()
-            && let Some(why) = super::version::chain_active_lock(old)
+        // 覆盖写会回收的旧版本：Off = 整链；Suspended = 链中 null 版本（其余保留）。
+        // 链上带锁 → fail-closed（同单段 PUT 口径）。
+        let replaced: Vec<Version> = match (mode, old_meta.as_ref()) {
+            (VersioningMode::Off, Some(old)) => old.versions.clone(),
+            (VersioningMode::Suspended, Some(old)) => old
+                .versions
+                .iter()
+                .filter(|v| v.version_id.is_nil())
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(why) = replaced
+            .iter()
+            .find_map(super::version::active_lock_reason)
         {
             return Err(Error::ObjectLocked(format!("覆盖写将回收锁定版本：{why}")));
         }
@@ -598,7 +617,7 @@ impl Store {
 
         // 3) Version 与候选 meta（gate 成功之后才构造——本地提交不得先于远端）
         let version = Version {
-            version_id: if versioned {
+            version_id: if mode == VersioningMode::Enabled {
                 uuid::Uuid::parse_str(&uuid)
                     .map_err(|e| Error::Encode(format!("版本目录 uuid 解析失败（{uuid}）: {e}")))?
             } else {
@@ -636,9 +655,15 @@ impl Store {
             storage_class: mpu.storage_class.clone(),
             tier: None,
         };
-        let mut meta = match (versioned, old_meta.as_ref()) {
-            (true, Some(old)) => {
+        let mut meta = match (mode, old_meta.as_ref()) {
+            (VersioningMode::Enabled, Some(old)) => {
                 let mut m = old.clone();
+                m.versions.push(version);
+                m
+            }
+            (VersioningMode::Suspended, Some(old)) => {
+                let mut m = old.clone();
+                m.versions.retain(|v| !v.version_id.is_nil());
                 m.versions.push(version);
                 m
             }
@@ -727,8 +752,10 @@ impl Store {
         let _ = tokio::fs::remove_dir_all(&dir).await;
 
         // 老版本进回收站（跨盘遍历，与单段 PUT 相同；版本控制桶跳过——旧版本仍被链引用）
-        if !versioned {
+        if mode == VersioningMode::Off {
             self.recycle_old(bucket, key, old_meta.as_ref()).await;
+        } else if mode == VersioningMode::Suspended {
+            self.recycle_versions(bucket, key, &replaced).await;
         }
 
         Ok(ObjectInfo {
@@ -739,8 +766,8 @@ impl Store {
             last_modified_nanos: now,
             user_metadata: mpu.user_metadata,
             checksum: None,
-            // 与 version_id_str() 同式：versioned 用目录 uuid，否则 S3 的 "null"
-            version_id: Some(if versioned {
+            // 与 version_id_str() 同式：Enabled 用目录 uuid，否则 S3 的 "null"
+            version_id: Some(if mode == VersioningMode::Enabled {
                 uuid.clone()
             } else {
                 "null".to_string()
