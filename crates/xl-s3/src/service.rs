@@ -25,7 +25,9 @@ use crate::sse::{
     sse_out_from_spec,
 };
 
+mod list_multipart_uploads;
 mod list_v1;
+mod upload_part_copy;
 
 #[derive(Clone)]
 pub struct OssS3 {
@@ -1548,6 +1550,14 @@ impl S3 for OssS3 {
             sse_customer_key_md5: so.sse_c_key_md5, // P2-a 复验补
             ..Default::default()
         }))
+    }
+
+    /// UploadPartCopy：主体在 `upload_part_copy.rs`（同上，只转发）。
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        upload_part_copy::upload_part_copy(self, req).await
     }
 
     async fn complete_multipart_upload(
@@ -3595,6 +3605,14 @@ impl S3 for OssS3 {
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         list_v1::list_objects(self, req).await
+    }
+
+    /// ListMultipartUploads：主体在 `list_multipart_uploads.rs`（同上，只转发）。
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        list_multipart_uploads::list_multipart_uploads(self, req).await
     }
 
     async fn list_objects_v2(

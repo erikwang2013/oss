@@ -353,6 +353,42 @@ impl Store {
         })
     }
 
+    /// 服务端 LMU 页（ListUploadsLocal）：本节点一页（upload + cps）。
+    /// 本机无此桶目录 → 空页（并集语义：缺者空贡献，不 404）。
+    pub async fn mesh_list_uploads_local(
+        &self,
+        l: crate::mesh::ListUploadsLocal,
+    ) -> Result<crate::mesh::ListUploadsLocalResp> {
+        let (ups, cps) = match self
+            .list_uploads_page_local(
+                &l.bucket,
+                &l.prefix,
+                l.delimiter.as_deref(),
+                l.key_marker.as_deref(),
+                l.upload_id_marker.as_deref(),
+                l.limit,
+            )
+            .await
+        {
+            Ok(x) => x,
+            Err(Error::NoSuchBucket(_)) => (Vec::new(), Vec::new()),
+            Err(e) => return Err(e),
+        };
+        Ok(crate::mesh::ListUploadsLocalResp {
+            uploads: ups
+                .into_iter()
+                .map(|u| crate::mesh::UploadEntry {
+                    key: u.key,
+                    upload_id: u.upload_id,
+                    initiated_nanos: u.initiated_nanos,
+                    storage_class: u.storage_class.unwrap_or_default(),
+                })
+                .collect(),
+            prefixes: cps,
+            slots_ok: self.cfg.drives.len() as u32,
+        })
+    }
+
     /// best-effort 远程回滚（错误路径专用）：广播各 peer 删版本目录（幂等），1s 短超时
     /// 防拖慢错误路径；失败留给该节点 clean/fsck 按龄回收。
     pub(in crate::store) async fn mesh_rollback_remote(&self, bucket: &str, key: &str, uuid: &str) {
