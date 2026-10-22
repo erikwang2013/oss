@@ -15,6 +15,8 @@ service Mesh {
   rpc DeleteBucket(BucketRef) returns (WriteResp);
   rpc ListBuckets(Empty) returns (BucketsResp);
   rpc ListLocal(ListReq) returns (ListLocalResp);
+  // ListMultipartUploads 的单节点页（集群并集：与 ListLocal 同一完备性口径）
+  rpc ListUploadsLocal(UploadListReq) returns (UploadListLocalResp);
   rpc Health(Empty) returns (NodeHealth);
   rpc Lock(LockReq) returns (LockResp);
   rpc ControlQuery(ControlReq) returns (ControlResp);
@@ -57,6 +59,11 @@ message ListReq { string bucket=1; string prefix=2; string delimiter=3; string m
                   bool marker_exclusive=7; }
 message ListEntry { string key=1; uint64 size=2; string etag=3; int64 max_mod_time_nanos=4; }
 message ListLocalResp { repeated ListEntry entries=1; repeated string prefixes=2; uint32 slots_ok=3; }
+// LMU 单节点页：空串 ↔ None（与 ListReq 同款线上约定）；limit = max-uploads + 1
+message UploadListReq { string bucket=1; string prefix=2; string delimiter=3; string key_marker=4;
+                        string upload_id_marker=5; uint32 limit=6; }
+message UploadEntry { string key=1; string upload_id=2; int64 initiated_nanos=3; string storage_class=4; }
+message UploadListLocalResp { repeated UploadEntry uploads=1; repeated string prefixes=2; uint32 slots_ok=3; }
 message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4; }
 message SlotState { uint32 slot=1; bool up=2; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;

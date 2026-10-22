@@ -525,6 +525,41 @@ impl MeshTransport for TonicMesh {
             slots_ok: resp.slots_ok,
         })
     }
+    async fn list_uploads_local(
+        &self,
+        n: &str,
+        l: mesh::ListUploadsLocal,
+    ) -> Result<mesh::ListUploadsLocalResp> {
+        let req = xl_proto::UploadListReq {
+            bucket: l.bucket,
+            prefix: l.prefix,
+            delimiter: l.delimiter.unwrap_or_default(),
+            key_marker: l.key_marker.unwrap_or_default(),
+            upload_id_marker: l.upload_id_marker.unwrap_or_default(),
+            limit: l.limit as u32,
+        };
+        let resp = self
+            .client(n)?
+            .clone()
+            .list_uploads_local(req)
+            .await
+            .map_err(|e| rpc_err(n, e))?
+            .into_inner();
+        Ok(mesh::ListUploadsLocalResp {
+            uploads: resp
+                .uploads
+                .into_iter()
+                .map(|u| mesh::UploadEntry {
+                    key: u.key,
+                    upload_id: u.upload_id,
+                    initiated_nanos: u.initiated_nanos,
+                    storage_class: u.storage_class,
+                })
+                .collect(),
+            prefixes: resp.prefixes,
+            slots_ok: resp.slots_ok,
+        })
+    }
     async fn lock(&self, n: &str, req: mesh::LockReq) -> Result<mesh::LockResp> {
         let op = match req.op {
             mesh::LockOp::Acquire => xl_proto::LockOp::Acquire,
@@ -879,6 +914,39 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                     size: e.size,
                     etag: e.etag,
                     max_mod_time_nanos: e.max_mod_time_nanos,
+                })
+                .collect(),
+            prefixes: resp.prefixes,
+            slots_ok: resp.slots_ok,
+        }))
+    }
+    async fn list_uploads_local(
+        &self,
+        r: Request<xl_proto::UploadListReq>,
+    ) -> std::result::Result<tonic::Response<xl_proto::UploadListLocalResp>, Status> {
+        let l = r.into_inner();
+        let resp = self
+            .store
+            .mesh_list_uploads_local(mesh::ListUploadsLocal {
+                bucket: l.bucket,
+                prefix: l.prefix,
+                // 线上空串 ↔ None（客户端同款映射）
+                delimiter: (!l.delimiter.is_empty()).then_some(l.delimiter),
+                key_marker: (!l.key_marker.is_empty()).then_some(l.key_marker),
+                upload_id_marker: (!l.upload_id_marker.is_empty()).then_some(l.upload_id_marker),
+                limit: l.limit as usize,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(xl_proto::UploadListLocalResp {
+            uploads: resp
+                .uploads
+                .into_iter()
+                .map(|u| xl_proto::UploadEntry {
+                    key: u.key,
+                    upload_id: u.upload_id,
+                    initiated_nanos: u.initiated_nanos,
+                    storage_class: u.storage_class,
                 })
                 .collect(),
             prefixes: resp.prefixes,
@@ -1383,5 +1451,90 @@ mod tests {
         // 服务端：无令牌 → 拒
         let mut si = SecretInterceptor { secret: "s".into() };
         assert!(si.call(Request::new(())).is_err());
+    }
+
+    /// LMU 远端页的真实 gRPC 往返：None ↔ 空串、prefix/delimiter/key_marker、
+    /// 字段（upload_id/initiated/storage_class）不丢。
+    #[tokio::test]
+    async fn list_uploads_local_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+        store.create_bucket("alpha").await.unwrap();
+        let id_a = store
+            .create_multipart_upload("alpha", "a/1", None, Default::default())
+            .await
+            .unwrap();
+        let id_b = store
+            .create_multipart_upload("alpha", "b", None, Default::default())
+            .await
+            .unwrap();
+
+        let addr = free_addr().await;
+        let s2 = store.clone();
+        tokio::spawn(async move {
+            let _ = serve(s2, addr, "s3cret".into()).await;
+        });
+        let nodes = vec![("n1".to_string(), addr.to_string())];
+        let mesh = TonicMesh::new("n1", "s3cret", &nodes).unwrap();
+
+        // server 启动是异步的：重试若干次直到通
+        let mut ready = false;
+        for _ in 0..40 {
+            if mesh.health("n1").await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "server 未就绪");
+
+        let req = |prefix: &str, delimiter: Option<&str>, key_marker: Option<&str>| {
+            mesh::ListUploadsLocal {
+                bucket: "alpha".into(),
+                prefix: prefix.into(),
+                delimiter: delimiter.map(str::to_string),
+                key_marker: key_marker.map(str::to_string),
+                upload_id_marker: None,
+                limit: 11,
+            }
+        };
+        let r = mesh
+            .list_uploads_local("n1", req("", None, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.uploads
+                .iter()
+                .map(|u| (u.key.as_str(), u.upload_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("a/1", id_a.as_str()), ("b", id_b.as_str())]
+        );
+        assert!(r.uploads.iter().all(|u| u.initiated_nanos > 0));
+        // 线上空串 ↔ None：未声明存储类
+        assert!(r.uploads.iter().all(|u| u.storage_class.is_empty()));
+        assert!(r.prefixes.is_empty());
+
+        // delimiter 折叠 + prefix
+        let r = mesh
+            .list_uploads_local("n1", req("", Some("/"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.prefixes, ["a/"]);
+        assert_eq!(r.uploads.len(), 1);
+        assert_eq!(r.uploads[0].key, "b");
+
+        let r = mesh
+            .list_uploads_local("n1", req("a/", None, None))
+            .await
+            .unwrap();
+        assert_eq!(r.uploads.len(), 1);
+        assert_eq!(r.uploads[0].key, "a/1");
+
+        // key_marker 排他
+        let r = mesh
+            .list_uploads_local("n1", req("", None, Some("b")))
+            .await
+            .unwrap();
+        assert!(r.uploads.is_empty() && r.prefixes.is_empty());
     }
 }
