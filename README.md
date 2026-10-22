@@ -849,17 +849,22 @@ curl -s -X POST $E/api/v1/access-points -H "authorization: Bearer $JWT" \
 aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走 /ap/ap-one/k
 ```
 
-- 路由仅路径式 `/ap/<name>/<key>`（无 `<name>-s3alias` 主机别名）；标准 SigV4 签名照常。
+- 路由：路径式 `/ap/<name>/<key>`；别名 `<name>-s3alias` 同时支持路径首段与
+  Host 首标签（`<name>-s3alias.<endpoint>`）；未知别名 404，不回落桶路由。
+  标准 SigV4 签名照常覆盖原始 path/host。桶名保留 `-s3alias` 后缀（建桶即拒）。
 - 鉴权 = 身份/表三档/桶策略/会话策略 **∩** AP 策略（显式 Deny 优先；AP 有策略但无匹配 → 拒）；
-  CopyObject 目标轴按 `s3:PutObject`；审计合并为一条。
-- AP 策略为严格子集：拒绝未知字段 / `Condition` / `NotAction` / `NotResource`；
+  CopyObject 目标轴按 `s3:PutObject`；审计合并为一条。`DeleteObjects` 逐键叠 AP 策略
+  （被拒键 `<Error>AccessDenied`，其余键照删；请求体上限 1 MiB / 1000 键）。
+- AP 策略为严格子集：拒绝未知字段 / 未知条件运算符 / `NotAction` / `NotResource`；
+  `Condition` 仅 `IpAddress`/`NotIpAddress` + `aws:SourceIp`（IPv4/IPv6 CIDR，保存时校验）；
   Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
-- 支持：Get/Head/Put/DeleteObject、ListObjectsV2、ListObjectVersions、MPU
-  Create/Complete/Abort/UploadPart、CopyObject、Get/Put/DeleteObjectTagging、
-  Get/PutBucketVersioning、HeadBucket、RestoreObject；`UploadPartCopy`/`DeleteObjects`
-  等 501。桶生命周期配置、桶默认加密、Inventory 配置是控制面 / S3 桶级操作，
-  **不经 AP**（`/ap/...` 上无对应形状，调用 501）。
-- 边界：不做匿名/跨账号/VPC 来源限制/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
+  SourceIp 对端来自连接地址；ecat 内置 listener 无 connect_info，反代部署须显式设置
+  `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` 首段（默认不信任，无对端时条件不匹配）。
+- 支持：Get/Head/Put/DeleteObject、DeleteObjects、ListObjectsV2、ListObjectVersions、MPU
+  Create/Complete/Abort/UploadPart/UploadPartCopy、CopyObject、Get/Put/DeleteObjectTagging、
+  Get/PutBucketVersioning、HeadBucket、RestoreObject。桶生命周期配置、桶默认加密、
+  Inventory 配置是控制面 / S3 桶级操作，**不经 AP**（`/ap/...` 上无对应形状，调用 501）。
+- 边界：不做匿名/跨账号/VPC 端点/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
   checksum 不转发 trailing headers。
 
 ### 存储类、分层与 Restore（S4a/S4b）
@@ -1036,8 +1041,8 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 
 1. 控制面单节点：AP 缓存、作业引擎、Inventory 调度、tier reaper 均按单进程；多节点共享
    SQLite 不支持，强一致归 M9。
-2. AP 仅路径前缀；无 `<name>-s3alias`/匿名/跨账号/VPC；不支持 ListBuckets/Create/DeleteBucket/
-   DeleteObjects/UploadPartCopy。
+2. AP 支持 `/ap/<name>` 与 `<name>-s3alias`（路径/Host）；无匿名/跨账号/VPC 端点；不支持
+   ListBuckets/Create/DeleteBucket。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
 4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
    动作不发桶通知但发复制/清 tier。

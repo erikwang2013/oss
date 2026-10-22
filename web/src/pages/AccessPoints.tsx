@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { App, Button, Card, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App, Button, Card, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ApiError,
@@ -113,7 +113,7 @@ export default function AccessPoints() {
     <>
       <PageHeader
         title="访问点"
-        sub="访问点把桶映射到独立端点（/ap/{name}），可叠加策略与 Object Lambda 变换器"
+        sub="访问点把桶映射到独立端点（/ap/{name} 或 {name}-s3alias），可叠加策略与 Object Lambda 变换器"
         extra={
           <Button type="primary" onClick={() => { setName(''); setBucket(undefined); setPolicyText(''); setCreateOpen(true) }}>
             新建访问点
@@ -127,6 +127,12 @@ export default function AccessPoints() {
           dataSource={aps}
           columns={[
             { title: '名称', dataIndex: 'name' },
+            {
+              title: '别名',
+              dataIndex: 'alias',
+              width: 220,
+              render: (v: string) => <Typography.Text copyable={{ text: v }}>{v}</Typography.Text>,
+            },
             { title: '桶', dataIndex: 'bucket' },
             { title: 'owner_id', dataIndex: 'owner_id', width: 100 },
             {

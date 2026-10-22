@@ -1,14 +1,36 @@
 //! M8 S1：访问点（Access Point）——模型、严格策略解析与 op 推导。
 //!
-//! 路由形态只支持路径式 `/ap/<name>/<key>`；AP 只做**额外限制**（与身份/桶策略取交集），
-//! 绝不放松既有授权。策略方言 = 现有 `policy` 子集，但解析更严格（未知字段/条件一律拒）。
+//! 路由形态：`/ap/<name>/<key>`、别名路径 `/<name>-s3alias/<key>`、别名 Host
+//! `<name>-s3alias.<endpoint>`。AP 只做**额外限制**（与身份/桶策略取交集），绝不放松
+//! 既有授权。策略方言 = 现有 `policy` 子集，但解析更严格（未知字段/条件运算符一律拒）。
+//!
+//! 明确不支持（non-goals）：匿名访问点、跨账号、VPC 端点、经 AP 的桶级 Create/Delete/
+//! ListBuckets、AP 缓存一致性。
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use s3s::{S3Request, S3Response, S3Result};
 use serde::Deserialize;
 
 use crate::policy::{StringOrVec, glob_match};
+
+/// AWS 访问点别名后缀；桶名在建桶时保留（`xl_store::layout::validate_bucket`）。
+pub const ALIAS_SUFFIX: &str = "-s3alias";
+
+/// DeleteObjects 请求体硬上限（与 s3s 自定义路由默认体上限一致）。
+const AP_DELETE_MAX_BODY: usize = 1024 * 1024;
+const AP_DELETE_MAX_KEYS: usize = 1000;
+
+/// AP 名（控制面与别名路由共用的唯一判定）：3..=63 位小写字母/数字/`-`，首尾非 `-`。
+pub fn valid_ap_name(name: &str) -> bool {
+    (3..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
 
 /// AP 策略（严格子集：`Statement[].Effect/Principal.AWS/Action/Resource`）。
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +51,8 @@ pub struct ApStatement {
     pub action: StringOrVec,
     #[serde(rename = "Resource")]
     pub resource: StringOrVec,
+    #[serde(default, rename = "Condition")]
+    pub condition: Option<ApCondition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +60,126 @@ pub struct ApStatement {
 pub struct ApPrincipal {
     #[serde(default, rename = "AWS")]
     pub aws: StringOrVec,
+}
+
+/// 条件块：仅 IP 条件（VPC 端点的窄替代）。未知运算符由 `deny_unknown_fields` 拒绝。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApCondition {
+    #[serde(default, rename = "IpAddress")]
+    pub ip_address: Option<ApIpCondition>,
+    #[serde(default, rename = "NotIpAddress")]
+    pub not_ip_address: Option<ApIpCondition>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApIpCondition {
+    #[serde(rename = "aws:SourceIp")]
+    pub source_ip: StringOrVec,
+}
+
+impl ApCondition {
+    fn validate(&self, i: usize) -> Result<(), String> {
+        if self.ip_address.is_none() && self.not_ip_address.is_none() {
+            return Err(format!("Statement[{i}].Condition 不能为空"));
+        }
+        for (op, cond) in [
+            ("IpAddress", &self.ip_address),
+            ("NotIpAddress", &self.not_ip_address),
+        ] {
+            if let Some(cond) = cond {
+                cond.validate(i, op)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 条件是否成立；`None` = 无法求值（缺对端/坏 CIDR）→ 语句不匹配，fail-closed。
+    fn matches(&self, ip: Option<IpAddr>) -> Option<bool> {
+        let ip = ip?;
+        if let Some(c) = &self.ip_address
+            && c.matches(ip) != Some(true)
+        {
+            return Some(false);
+        }
+        if let Some(c) = &self.not_ip_address
+            && c.matches(ip) != Some(false)
+        {
+            return Some(false);
+        }
+        Some(true)
+    }
+}
+
+impl ApIpCondition {
+    fn validate(&self, i: usize, op: &str) -> Result<(), String> {
+        if self.source_ip.iter().next().is_none() {
+            return Err(format!(
+                "Statement[{i}].Condition.{op}.aws:SourceIp 不能为空"
+            ));
+        }
+        for raw in self.source_ip.iter() {
+            if parse_cidr(raw).is_none() {
+                return Err(format!(
+                    "Statement[{i}].Condition.{op}.aws:SourceIp 非法 CIDR: {raw}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 列表内任一 CIDR 命中；空列表/坏 CIDR → `None`（fail-closed）。
+    fn matches(&self, ip: IpAddr) -> Option<bool> {
+        let mut any = false;
+        for raw in self.source_ip.iter() {
+            any = true;
+            if parse_cidr(raw)?.contains(ip) {
+                return Some(true);
+            }
+        }
+        any.then_some(false)
+    }
+}
+
+struct Cidr {
+    net: IpAddr,
+    /// 已按 `net` 家族归一（v4-mapped 会变 v4，故上限按归一后的家族算）。
+    prefix: u8,
+}
+
+fn parse_cidr(raw: &str) -> Option<Cidr> {
+    let raw = raw.trim();
+    let (addr, prefix) = match raw.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (raw, None),
+    };
+    let net = addr.parse::<IpAddr>().ok()?.to_canonical();
+    let max = match net {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix = match prefix {
+        Some(p) => p.parse::<u8>().ok()?,
+        None => max,
+    };
+    (prefix <= max).then_some(Cidr { net, prefix })
+}
+
+impl Cidr {
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.net, ip.to_canonical()) {
+            (IpAddr::V4(n), IpAddr::V4(i)) => prefix_eq(&n.octets(), &i.octets(), self.prefix),
+            (IpAddr::V6(n), IpAddr::V6(i)) => prefix_eq(&n.octets(), &i.octets(), self.prefix),
+            _ => false,
+        }
+    }
+}
+
+fn prefix_eq(net: &[u8], ip: &[u8], prefix: u8) -> bool {
+    let full = usize::from(prefix / 8);
+    let rem = prefix % 8;
+    net[..full] == ip[..full] && (rem == 0 || (net[full] ^ ip[full]) >> (8 - rem) == 0)
 }
 
 impl ApPolicy {
@@ -54,6 +198,9 @@ impl ApPolicy {
             if st.resource.iter().next().is_none() {
                 return Err(format!("Statement[{i}].Resource 不能为空"));
             }
+            if let Some(c) = &st.condition {
+                c.validate(i)?;
+            }
         }
         Ok(())
     }
@@ -69,6 +216,10 @@ impl ApPolicy {
                     .resource
                     .iter()
                     .any(|p| req.resources.iter().any(|r| glob_match(p, r)))
+                || st
+                    .condition
+                    .as_ref()
+                    .is_some_and(|c| c.matches(req.source_ip) != Some(true))
             {
                 continue;
             }
@@ -97,6 +248,8 @@ pub struct ApEvalRequest<'a> {
     pub uid: i64,
     /// AP 对象/桶 ARN 与标准 ARN（两者都参与匹配）
     pub resources: Vec<String>,
+    /// 连接对端（无则带 `SourceIp` 条件的语句一律不匹配，fail-closed）。
+    pub source_ip: Option<IpAddr>,
 }
 
 /// AP 上下文（ARN 生成用）。
@@ -182,6 +335,7 @@ pub fn ap_decision(
     user: &crate::access::AuthedUser,
     op: &str,
     key: Option<&str>,
+    source_ip: Option<IpAddr>,
 ) -> Option<bool> {
     let policy = ap.policy.as_ref()?;
     let action = if crate::access::is_copy(op) {
@@ -206,6 +360,7 @@ pub fn ap_decision(
         ak: &user.ak,
         uid: user.uid,
         resources,
+        source_ip,
     };
     Some(policy.evaluate(&req, action) == Some(true))
 }
@@ -277,6 +432,18 @@ pub struct ApInvocation {
     pub op: &'static str,
 }
 
+/// HTTP 层注入的连接对端（SourceIp 条件求值用）。缺省 → 带 IP 条件的语句不匹配。
+#[derive(Debug, Clone, Copy)]
+pub struct ApPeer(pub IpAddr);
+
+/// DeleteObjects 经 AP 的逐键策略上下文：键在请求体里，整体判定必然失真，
+/// 由 `service.rs::delete_objects` 在逐键循环里叠交集（被拒键绝不进入删除路径）。
+#[derive(Debug, Clone)]
+pub struct ApDeletePolicy {
+    pub ap: AccessPoint,
+    pub source_ip: Option<IpAddr>,
+}
+
 /// `/ap/<name>/...` 前置路由：鉴权（身份/桶策略 × AP 策略交集）→ 重写到内层服务。
 pub struct ApRoute {
     cache: Arc<ApCache>,
@@ -345,6 +512,67 @@ fn parse_ap_path(uri: &http::Uri) -> S3Result<(String, String)> {
         return Err(s3s::s3_error!(InvalidArgument, "missing access point name"));
     }
     Ok((name.to_string(), suffix.to_string()))
+}
+
+/// Host 形式别名：首标签（去端口、转小写、须含 `.` 即 `<alias>.<endpoint>`）以
+/// `-s3alias` 结尾。IPv6 字面量不可能是别名。
+fn host_alias(uri: &http::Uri, headers: &http::HeaderMap) -> Option<String> {
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .map(str::to_string)
+        .or_else(|| uri.authority().map(|a| a.as_str().to_string()))?;
+    if host.starts_with('[') {
+        return None;
+    }
+    let host = host.split(':').next().unwrap_or(host.as_str());
+    if !host.contains('.') {
+        return None;
+    }
+    let label = host
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    label.ends_with(ALIAS_SUFFIX).then_some(label)
+}
+
+/// 路径形式别名：首段（即桶位）以 `-s3alias` 结尾。
+fn path_alias(uri: &http::Uri) -> Option<String> {
+    let first = uri
+        .path()
+        .strip_prefix('/')?
+        .split('/')
+        .next()
+        .unwrap_or("");
+    first.ends_with(ALIAS_SUFFIX).then(|| first.to_string())
+}
+
+/// 剥后缀并校验 AP 名；非法名与未知别名同响应（404），绝不回落桶路由。
+fn strip_alias(seg: &str) -> S3Result<String> {
+    let name = seg.strip_suffix(ALIAS_SUFFIX).unwrap_or(seg);
+    if !valid_ap_name(name) {
+        return Err(s3s::s3_error!(NoSuchAccessPoint, "access point not found"));
+    }
+    Ok(name.to_string())
+}
+
+/// 解析三种形态为 `(ap_name, raw_suffix)`：`/ap/<name>/...`、别名的路径/Host 形式。
+fn parse_ap_target(uri: &http::Uri, headers: &http::HeaderMap) -> S3Result<(String, String)> {
+    if uri.path().starts_with("/ap/") {
+        return parse_ap_path(uri);
+    }
+    if let Some(alias) = host_alias(uri, headers) {
+        let raw_suffix = uri.path().strip_prefix('/').unwrap_or_default().to_string();
+        return Ok((strip_alias(&alias)?, raw_suffix));
+    }
+    if let Some(alias) = path_alias(uri) {
+        let rest = uri.path().strip_prefix('/').unwrap_or_default();
+        let raw_suffix = rest.split_once('/').map_or("", |(_, s)| s).to_string();
+        return Ok((strip_alias(&alias)?, raw_suffix));
+    }
+    Err(s3s::s3_error!(InvalidArgument, "invalid access point path"))
 }
 
 /// 严格百分号解码（拒绝坏转义/非法 UTF-8）。
@@ -481,8 +709,10 @@ fn derive_op(
             } else if query_has(query, "restore") {
                 // S4b：内层 RestoreObject 已启用（restore 查询随 call() 原样转发）
                 Ok("RestoreObject")
+            } else if query_has(query, "delete") {
+                // 键在请求体：逐键授权在 service.rs 里叠 AP 策略（check_access 只校验形状）
+                Ok("DeleteObjects")
             } else {
-                // delete（批量删不支持）/ 其余
                 Err(s3s::s3_error!(
                     NotImplemented,
                     "unsupported access point operation"
@@ -531,6 +761,47 @@ fn strip_signed_query(query: &str) -> String {
         .join("&")
 }
 
+/// DeleteObjects 请求体：1 MiB / 1000 键硬上限。字节用 `store_all_limited` 存回 Body，
+/// 内层 op 照常反序列化（s3s 的 Body 可重放），授权只看键、不改写请求。
+async fn validate_delete_body(req: &mut S3Request<s3s::Body>) -> S3Result<()> {
+    let bytes = req
+        .input
+        .store_all_limited(AP_DELETE_MAX_BODY)
+        .await
+        .map_err(|e| {
+            if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some() {
+                s3s::s3_error!(EntityTooLarge, "delete request body exceeds 1 MiB")
+            } else {
+                tracing::error!(error = %e, "读取 DeleteObjects 请求体失败");
+                s3s::s3_error!(InternalError, "internal error")
+            }
+        })?;
+    parse_delete_xml(&bytes).map(|_| ())
+}
+
+/// 校验 Delete XML 形状；返回对象数。空体 = MissingRequestBodyError（AWS 语义）。
+fn parse_delete_xml(bytes: &[u8]) -> S3Result<usize> {
+    if bytes.is_empty() {
+        return Err(s3s::s3_error!(
+            MissingRequestBodyError,
+            "request body is empty"
+        ));
+    }
+    let mut d = s3s::xml::Deserializer::new(bytes);
+    let delete = <s3s::dto::Delete as s3s::xml::Deserialize<'_>>::deserialize(&mut d)
+        .map_err(|_| s3s::s3_error!(MalformedXML, "malformed XML"))?;
+    d.expect_eof()
+        .map_err(|_| s3s::s3_error!(MalformedXML, "malformed XML"))?;
+    // AWS：>1000 键按 MalformedXML 拒绝（官方错误表如此，不是 InvalidRequest）。
+    if delete.objects.len() > AP_DELETE_MAX_KEYS {
+        return Err(s3s::s3_error!(
+            MalformedXML,
+            "the request has more than 1000 keys"
+        ));
+    }
+    Ok(delete.objects.len())
+}
+
 #[async_trait::async_trait]
 impl s3s::route::S3Route for ApRoute {
     fn is_match(
@@ -540,7 +811,11 @@ impl s3s::route::S3Route for ApRoute {
         headers: &http::HeaderMap,
         extensions: &mut http::Extensions,
     ) -> bool {
-        if uri.path().starts_with("/ap/") {
+        // 别名先于 fallback：未知别名必须 404，绝不能掉进桶路由（桶名已保留该后缀）。
+        if uri.path().starts_with("/ap/")
+            || host_alias(uri, headers).is_some()
+            || path_alias(uri).is_some()
+        {
             extensions.insert(ApMatch(true));
             return true;
         }
@@ -573,8 +848,9 @@ impl s3s::route::S3Route for ApRoute {
                 s3s::s3_error!(InternalError, "internal error")
             })?
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
-        let (name, raw_suffix) = parse_ap_path(&req.uri)?;
+        let (name, raw_suffix) = parse_ap_target(&req.uri, &req.headers)?;
         let ap = self.load_ap(&name).await?;
+        let peer = req.extensions.get::<ApPeer>().map(|p| p.0);
         let canonical = percent_decode_strict(&raw_suffix)?;
         let key: Option<&str> = (!canonical.is_empty()).then_some(canonical.as_str());
         let copy_src: Option<(String, String)> = if req.method == http::Method::PUT {
@@ -608,14 +884,21 @@ impl s3s::route::S3Route for ApRoute {
                 copy_src.as_ref().map(|(b, k)| (b.as_str(), k.as_str())),
             )
             .await?;
-        let ap_decision = ap_decision(&ap, &user, op, key);
-        let allow = base_allow && ap_decision != Some(false);
+        // DeleteObjects 的键在请求体里：整体判定必然失真，逐键交集在 service 里做。
+        let ap_policy = if op == "DeleteObjects" {
+            None
+        } else {
+            ap_decision(&ap, &user, op, key, peer)
+        };
+        let allow = base_allow && ap_policy != Some(false);
         let mut parts: Vec<String> = Vec::new();
         if let Some(d) = base_detail {
             parts.push(d);
         }
-        if let Some(v) = ap_decision {
+        if let Some(v) = ap_policy {
             parts.push(if v { "ap:allow" } else { "ap:deny" }.to_string());
+        } else if op == "DeleteObjects" && ap.policy.is_some() {
+            parts.push("ap:per-key".to_string());
         }
         let detail = (!parts.is_empty()).then(|| parts.join(";"));
         if let Err(e) = self
@@ -635,6 +918,13 @@ impl s3s::route::S3Route for ApRoute {
         if !allow {
             tracing::warn!(uid = user.uid, op, ap = %name, "AP 授权拒绝");
             return Err(s3s::s3_error!(AccessDenied, "access denied"));
+        }
+        if op == "DeleteObjects" {
+            validate_delete_body(req).await?;
+            req.extensions.insert(ApDeletePolicy {
+                ap: ap.clone(),
+                source_ip: peer,
+            });
         }
         req.extensions.insert(user);
         req.extensions.insert(ApInvocation {
@@ -709,9 +999,11 @@ impl s3s::route::S3Route for ApRoute {
         let mut headers = req.headers;
         headers.remove(http::header::AUTHORIZATION);
         *builder.headers_mut().expect("builder headers") = headers;
-        let inner_req = builder
+        let mut inner_req = builder
             .body(req.input)
             .map_err(|_| s3s::s3_error!(InvalidArgument, "invalid request"))?;
+        // AuthedUser/ApDeletePolicy 等扩展必须随请求进内层：批量删逐键授权靠它们。
+        inner_req.extensions_mut().extend(req.extensions);
         let resp = self.inner.call(inner_req).await.map_err(|e| {
             tracing::error!(error = ?e, "AP 内层调用失败");
             s3s::s3_error!(InternalError, "internal error")
@@ -837,6 +1129,12 @@ mod tests {
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","NotAction":"s3:*"}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*","Service":"x"},"Action":"s3:GetObject","Resource":"arn:x"}]}"#,
             r#"{"Statement":[{"Effect":"Dney","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x"}]}"#,
+            // 未知条件运算符/条件键：拒绝而非静默忽略
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceVpc":"vpc-1"}}}]}"#,
+            // 畸形 CIDR 在保存时即拒
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceIp":[]}}}]}"#,
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -858,7 +1156,16 @@ mod tests {
             derive_op(&Method::POST, None, "uploads", false).unwrap(),
             "CreateMultipartUpload"
         );
-        assert!(derive_op(&Method::POST, Some("k"), "delete", false).is_err());
+        // 批量删：桶级 POST ?delete（SDK 两种写法）
+        assert_eq!(
+            derive_op(&Method::POST, None, "delete", false).unwrap(),
+            "DeleteObjects"
+        );
+        assert_eq!(
+            derive_op(&Method::POST, None, "delete=", false).unwrap(),
+            "DeleteObjects"
+        );
+        assert!(derive_op(&Method::POST, None, "acl", false).is_err());
     }
 
     #[test]
@@ -874,10 +1181,151 @@ mod tests {
             ak: "AKIA_X",
             uid: 7,
             resources: vec![format!("arn:aws:s3:::bkt/{key}")],
+            source_ip: None,
         };
         assert_eq!(p.evaluate(&req("open"), "s3:GetObject"), Some(true));
         assert_eq!(p.evaluate(&req("secret/x"), "s3:GetObject"), Some(false));
         assert_eq!(p.evaluate(&req("open"), "s3:PutObject"), None);
+    }
+
+    #[test]
+    fn source_ip_condition_allow_deny_and_fail_closed() {
+        let p = parse(
+            r#"{"Statement":[
+              {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*",
+               "Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","2001:db8::/32"]}}},
+              {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*",
+               "Condition":{"NotIpAddress":{"aws:SourceIp":"10.1.0.0/16"}}}
+            ]}"#,
+        )
+        .unwrap();
+        let eval = |key: &str, ip: &str| {
+            p.evaluate(
+                &ApEvalRequest {
+                    ak: "AKIA_X",
+                    uid: 7,
+                    resources: vec![format!("arn:aws:s3:::bkt/{key}")],
+                    source_ip: ip.parse().ok(),
+                },
+                "s3:GetObject",
+            )
+        };
+        assert_eq!(eval("open", "10.2.3.4"), Some(true));
+        assert_eq!(eval("open", "2001:db8:1::1"), Some(true));
+        // v4-mapped v6 归一后仍命中 v4 网段
+        assert_eq!(eval("open", "::ffff:10.2.3.4"), Some(true));
+        assert_eq!(eval("open", "192.168.1.1"), None, "源 IP 不匹配 → 无 Allow");
+        assert_eq!(eval("open", ""), None, "无对端 → 条件无法求值，fail-closed");
+        // NotIpAddress：不在名单内才满足 Deny 条件
+        assert_eq!(eval("secret/x", "10.2.3.4"), Some(false));
+        assert_eq!(
+            eval("secret/x", "10.1.2.3"),
+            Some(true),
+            "在 NotIpAddress 名单内 → Deny 条件不成立"
+        );
+        assert_eq!(eval("secret/x", ""), None, "缺对端时带条件语句一律不匹配");
+    }
+
+    #[test]
+    fn cidr_parse_and_prefix_boundaries() {
+        let c = |s: &str| parse_cidr(s).unwrap();
+        assert!(c("10.1.2.3/8").contains("10.200.0.1".parse().unwrap()));
+        assert!(!c("10.1.2.3/8").contains("11.0.0.1".parse().unwrap()));
+        assert!(c("10.0.0.0/0").contains("203.0.113.9".parse().unwrap()));
+        assert!(c("2001:db8::/33").contains("2001:db8:7fff::1".parse().unwrap()));
+        assert!(!c("2001:db8::/33").contains("2001:db8:8000::1".parse().unwrap()));
+        assert!(c("192.168.1.1").contains("192.168.1.1".parse().unwrap()));
+        assert!(!c("192.168.1.1").contains("192.168.1.2".parse().unwrap()));
+        for bad in [
+            "",
+            "10.0.0.0/33",
+            "::/129",
+            "1.2.3.4/x",
+            "::ffff:1.2.3.4/120", // 归一为 v4 后 /120 越界 → 畸形
+            "not-an-ip",
+        ] {
+            assert!(parse_cidr(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn alias_target_forms_resolve_name_and_suffix() {
+        let mk = |path: &str, host: Option<&str>| {
+            let mut h = http::HeaderMap::new();
+            if let Some(v) = host {
+                h.insert(http::header::HOST, v.parse().unwrap());
+            }
+            parse_ap_target(&path.parse().unwrap(), &h)
+        };
+        let (n, s) = mk("/ap/ap1/dir/x", None).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("ap1", "dir/x"));
+        // 别名路径（首段即桶位）
+        let (n, s) = mk("/ap1-s3alias/dir/x", None).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("ap1", "dir/x"));
+        let (n, s) = mk("/ap1-s3alias", None).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("ap1", ""));
+        // Host 形式：端口/大小写/末尾点都归一
+        let (n, s) = mk("/dir/x", Some("AP1-s3alias.example.com:9000")).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("ap1", "dir/x"));
+        let (n, s) = mk("/", Some("ap1-s3alias.example.com.")).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("ap1", ""));
+        // 形状合法的别名在此只解析名；是否存在由 load_ap 决定（未知 = 404，e2e 覆盖）。
+        let (n, s) = mk("/nope-s3alias/k", None).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("nope", "k"));
+        let (n, s) = mk("/k", Some("nope-s3alias.example.com")).unwrap();
+        assert_eq!((n.as_str(), s.as_str()), ("nope", "k"));
+        // 非法名（大写/太短）→ NoSuchAccessPoint（绝不回落桶路由）
+        for (p, h) in [
+            ("/X-s3alias/k", None),
+            ("/k", Some("ap-s3alias.example.com")), // 剥离后名太短
+        ] {
+            let e = mk(p, h).unwrap_err();
+            assert_eq!(e.code(), &s3s::S3ErrorCode::NoSuchAccessPoint, "{p} {h:?}");
+        }
+        // 普通桶路径不是 AP
+        assert!(mk("/bucket/key", None).is_err());
+        assert!(mk("/bucket/key", Some("bucket.example.com")).is_err());
+    }
+
+    #[test]
+    fn delete_xml_validation_and_key_cap() {
+        assert_eq!(
+            parse_delete_xml(
+                b"<Delete><Object><Key>a</Key></Object>\
+                  <Object><Key>b</Key><VersionId>v1</VersionId></Object></Delete>"
+            )
+            .unwrap(),
+            2
+        );
+        assert!(matches!(
+            parse_delete_xml(b"").unwrap_err().code(),
+            s3s::S3ErrorCode::MissingRequestBodyError
+        ));
+        assert_eq!(
+            parse_delete_xml(b"<Delete><Object>").unwrap_err().code(),
+            &s3s::S3ErrorCode::MalformedXML
+        );
+        assert_eq!(
+            parse_delete_xml(b"<Delete></Delete><x/>")
+                .unwrap_err()
+                .code(),
+            &s3s::S3ErrorCode::MalformedXML,
+            "尾部杂质必须拒绝"
+        );
+        let build = |n: usize| {
+            let mut xml = String::from("<Delete>");
+            for i in 0..n {
+                xml.push_str(&format!("<Object><Key>k{i}</Key></Object>"));
+            }
+            xml.push_str("</Delete>");
+            xml
+        };
+        assert_eq!(parse_delete_xml(build(1000).as_bytes()).unwrap(), 1000);
+        assert_eq!(
+            parse_delete_xml(build(1001).as_bytes()).unwrap_err().code(),
+            &s3s::S3ErrorCode::MalformedXML,
+            "AWS 对 >1000 键返回 MalformedXML"
+        );
     }
 
     async fn ap_acl() -> crate::access::Acl {
@@ -1073,9 +1521,10 @@ mod tests {
             derive_op(&Method::POST, None, "uploads", false).unwrap(),
             "CreateMultipartUpload"
         );
-        assert!(
-            derive_op(&Method::POST, Some("k"), "delete", false).is_err(),
-            "批量删不支持"
+        assert_eq!(
+            derive_op(&Method::POST, None, "delete", false).unwrap(),
+            "DeleteObjects",
+            "批量删经 AP 走逐键授权"
         );
     }
 
@@ -1108,15 +1557,24 @@ mod tests {
             is_admin: false,
             ak: "AKIA_X".into(),
         };
-        assert_eq!(ap_decision(&ap, &u, "GetObject", Some("open")), Some(true));
         assert_eq!(
-            ap_decision(&ap, &u, "GetObject", Some("secret/x")),
+            ap_decision(&ap, &u, "GetObject", Some("open"), None),
+            Some(true)
+        );
+        assert_eq!(
+            ap_decision(&ap, &u, "GetObject", Some("secret/x"), None),
             Some(false)
         );
         // 无匹配 action → 拒（有策略 = 默认收窄）
-        assert_eq!(ap_decision(&ap, &u, "PutObject", Some("open")), Some(false));
+        assert_eq!(
+            ap_decision(&ap, &u, "PutObject", Some("open"), None),
+            Some(false)
+        );
         let no_policy = AccessPoint { policy: None, ..ap };
-        assert_eq!(ap_decision(&no_policy, &u, "PutObject", Some("open")), None);
+        assert_eq!(
+            ap_decision(&no_policy, &u, "PutObject", Some("open"), None),
+            None
+        );
     }
 
     #[test]
