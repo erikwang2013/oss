@@ -530,7 +530,12 @@ impl SqlEventSink {
                 .ok()
                 .flatten();
         for t in targets {
-            if !t.events.iter().any(|e| e == event_name) {
+            // 精确匹配，或 `s3:ObjectAccessed:*` 这类尾星通配（配置层只放行该通配）
+            if !t.events.iter().any(|e| {
+                e == event_name
+                    || e.strip_suffix('*')
+                        .is_some_and(|p| event_name.starts_with(p))
+            }) {
                 continue;
             }
             if let Some(p) = &t.prefix
@@ -908,6 +913,31 @@ mod tests {
         let targets: Vec<String> = rows.iter().map(|r| r.get("target_id")).collect();
         // logs/x.txt → t1；logs/y.csv → t1+t2；z.csv → t2（删除事件 t2 白名单）；Copy 不在任何名单
         assert_eq!(targets, vec!["t1", "t1", "t2", "t2"]);
+    }
+
+    /// `s3:ObjectAccessed:*` 尾星通配：Get/Head 命中，其他事件不命中。
+    #[tokio::test]
+    async fn accessed_wildcard_matching() {
+        let pool = pool().await;
+        set_cfg(
+            &pool,
+            r#"[{"id":"a","target":"t1","events":["s3:ObjectAccessed:*"],"prefix":null,"suffix":null}]"#,
+        )
+        .await;
+        let sink = SqlEventSink::with_notifier(pool.clone(), Arc::new(NoopNotifier));
+        for op in [
+            S3EventOp::AccessedGet,
+            S3EventOp::AccessedHead,
+            S3EventOp::CreatedPut,
+        ] {
+            sink.emit(op, "bkt", "k", None, Some(1), Some("e"), src())
+                .await;
+        }
+        let rows = sqlx::query("SELECT target_id FROM event_outbox")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "仅 Get/Head 命中通配");
     }
 
     /// R1：永久错 11 次 → dead；连接类 30 次仍 pending（永不 dead）。

@@ -12,7 +12,8 @@ import {
 import { fmtTime } from '../format'
 import PageHeader from '../PageHeader'
 
-// 与 xl_s3::notify::ALLOWED_EVENTS 对齐（M8 从 8 个扩到 11 个：Transition/Restore）
+// 与 xl_s3::notify::ALLOWED_EVENTS 对齐（M8 从 8 个扩到 11 个：Transition/Restore；
+// 读路径补全增 ObjectAccessed 的 Get/Head 与尾星通配）
 const EVENTS = [
   's3:ObjectCreated:Put',
   's3:ObjectCreated:Post',
@@ -25,6 +26,9 @@ const EVENTS = [
   's3:LifecycleTransition',
   's3:ObjectRestore:Post',
   's3:ObjectRestore:Completed',
+  's3:ObjectAccessed:Get',
+  's3:ObjectAccessed:Head',
+  's3:ObjectAccessed:*',
 ]
 
 interface TargetRow {

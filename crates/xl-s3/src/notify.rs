@@ -1,5 +1,5 @@
 //! M6 切片 0：桶通知配置——线格式 ↔ 内部 JSON（裁决 R5：事件白名单两档；
-//! ObjectAccessed / Replication:* / LifecycleTransition 配置 → 400 拒绝并记档）。
+//! Replication:* 配置 → 400 拒绝并记档；ObjectAccessed 于读路径补全时放行）。
 //!
 //! 内部形态（存 `event_configs.config_json`）：
 //! `[{"id":"...","target":"<target_id>","events":["s3:ObjectCreated:Put",...],
@@ -22,6 +22,10 @@ pub const ALLOWED_EVENTS: &[&str] = &[
     "s3:LifecycleTransition",
     "s3:ObjectRestore:Post",
     "s3:ObjectRestore:Completed",
+    // 读路径补全：GET/HEAD 访问事件（通配与具体动作都收；匹配在 SqlEventSink 侧）
+    "s3:ObjectAccessed:*",
+    "s3:ObjectAccessed:Get",
+    "s3:ObjectAccessed:Head",
 ];
 
 /// 单条归一化配置（内部 JSON 的 serde 形状）。
@@ -95,8 +99,9 @@ pub fn parse_notification_config(cfg: &NotificationConfiguration) -> S3Result<Ve
         let mut events = Vec::with_capacity(q.events.len());
         for e in &q.events {
             let name = e.as_ref();
-            // 本实现只收显式事件（P3-4：AWS 本身**支持**通配如 s3:ObjectCreated:*，本仓按计划
-            // 裁决不收——README 记档，迁移用户用显式列表）；未知/本片不支持 → 400
+            // 除 `s3:ObjectAccessed:*` 外只收显式事件（P3-4：AWS 本身**支持**其他通配如
+            // s3:ObjectCreated:*，本仓按计划裁决不收——README 记档，迁移用户用显式列表）；
+            // 未知/本片不支持 → 400
             if !ALLOWED_EVENTS.contains(&name) {
                 return Err(s3s::s3_error!(
                     InvalidArgument,
@@ -264,16 +269,33 @@ mod tests {
         assert_eq!(parsed[1].target, "t2");
         assert_eq!(parsed[1].events.len(), 2);
 
-        // ObjectAccessed 拒绝（R5 记档：本片不实现）
-        let bad_accessed = NotificationConfiguration {
-            queue_configurations: Some(QueueConfigurationList::from(vec![q(
-                "a",
-                "arn:oss:sqs::t1:kafka",
-                &["s3:ObjectAccessed:Get"],
-            )])),
-            ..Default::default()
-        };
-        assert!(parse_notification_config(&bad_accessed).is_err());
+        // ObjectAccessed：通配与具体 Get/Head 都收；:GetTagging 不实现 → 仍拒
+        for ev in [
+            "s3:ObjectAccessed:*",
+            "s3:ObjectAccessed:Get",
+            "s3:ObjectAccessed:Head",
+        ] {
+            let cfg = NotificationConfiguration {
+                queue_configurations: Some(QueueConfigurationList::from(vec![q(
+                    "a",
+                    "arn:oss:sqs::t1:kafka",
+                    &[ev],
+                )])),
+                ..Default::default()
+            };
+            assert_eq!(parse_notification_config(&cfg).unwrap()[0].events, [ev]);
+        }
+        for ev in ["s3:ObjectAccessed:GetTagging", "s3:ObjectAccessed:Junk"] {
+            let cfg = NotificationConfiguration {
+                queue_configurations: Some(QueueConfigurationList::from(vec![q(
+                    "a",
+                    "arn:oss:sqs::t1:kafka",
+                    &[ev],
+                )])),
+                ..Default::default()
+            };
+            assert!(parse_notification_config(&cfg).is_err(), "{ev}");
+        }
 
         // topic/lambda 通道拒绝
         let bad_topic = NotificationConfiguration {

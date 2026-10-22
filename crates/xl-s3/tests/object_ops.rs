@@ -3268,6 +3268,107 @@ async fn events_emitted_on_all_write_paths() {
 }
 
 #[tokio::test]
+async fn accessed_events_only_on_successful_get_and_head() {
+    // ObjectAccessed：200/206/HEAD 200 才发；304/412/416 不发。
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let sink = Arc::new(MockSink::default());
+    let s3 = OssS3::new(store, acl().await, 16 * 1024 * 1024)
+        .with_events(Some(sink.clone() as Arc<dyn xl_s3::events::EventSink>));
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "acc".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let put = s3
+        .put_object(req(PutObjectInput {
+            bucket: "acc".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"abcdef"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let etag = put.e_tag.unwrap().value().to_string();
+    sink.got.lock().unwrap().clear(); // 丢掉 Put 事件
+
+    let get = |range: Option<Range>, if_none_match: Option<ETagCondition>| {
+        let input = GetObjectInput {
+            bucket: "acc".into(),
+            key: "k".into(),
+            range,
+            if_none_match,
+            ..Default::default()
+        };
+        let s3 = s3.clone();
+        async move { s3.get_object(req(input)).await }
+    };
+    get(None, None).await.unwrap(); // 200
+    get(
+        Some(Range::Int {
+            first: 1,
+            last: Some(2),
+        }),
+        None,
+    )
+    .await
+    .unwrap(); // 206
+    let head = |if_match: Option<ETagCondition>, if_none_match: Option<ETagCondition>| {
+        let input = HeadObjectInput {
+            bucket: "acc".into(),
+            key: "k".into(),
+            if_match,
+            if_none_match,
+            ..Default::default()
+        };
+        let s3 = s3.clone();
+        async move { s3.head_object(req(input)).await }
+    };
+    head(None, None).await.unwrap(); // 200
+    // 304 / 412 / 416：均不发事件
+    head(None, Some(ETagCondition::ETag(ETag::Strong(etag.clone()))))
+        .await
+        .unwrap();
+    let err = head(
+        Some(ETagCondition::ETag(ETag::Strong("deadbeef".into()))),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    let err = get(
+        Some(Range::Int {
+            first: 9999,
+            last: None,
+        }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
+
+    let got = sink.got.lock().unwrap().clone();
+    let names: Vec<&str> = got.iter().map(|g| g.0.event_name()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "s3:ObjectAccessed:Get",
+            "s3:ObjectAccessed:Get",
+            "s3:ObjectAccessed:Head",
+        ],
+        "{got:?}"
+    );
+    // 事件字段 = 实际读到的版本/大小/ETag
+    assert_eq!(got[0].1, "acc");
+    assert_eq!(got[0].2, "k");
+    assert_eq!(got[0].3, put.version_id);
+    assert_eq!(got[0].4, Some(6));
+    assert_eq!(got[0].5.as_deref(), Some(etag.as_str()));
+}
+
+#[tokio::test]
 async fn notification_config_api_roundtrip_and_errors() {
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {
@@ -3329,27 +3430,31 @@ async fn notification_config_api_roundtrip_and_errors() {
         .unwrap();
     assert_eq!(rules[0].value.as_ref().unwrap().as_str(), "logs/");
 
-    // ObjectAccessed → 400（R5 记档：本片不实现）
-    let bad = NotificationConfiguration {
-        queue_configurations: Some(QueueConfigurationList::from(vec![QueueConfiguration {
-            id: None,
-            queue_arn: QueueArn::from("arn:oss:sqs::t1:kafka".to_string()),
-            events: EventList::from(vec![Event::from("s3:ObjectAccessed:Get".to_string())]),
-            filter: None,
-        }])),
-        ..Default::default()
-    };
-    let e = s3
-        .put_bucket_notification_configuration(req(
+    // 读路径补全 Task 10：ObjectAccessed 的 Get/Head 与尾星通配均可配置
+    for ev in [
+        "s3:ObjectAccessed:Get",
+        "s3:ObjectAccessed:Head",
+        "s3:ObjectAccessed:*",
+    ] {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(QueueConfigurationList::from(vec![QueueConfiguration {
+                id: None,
+                queue_arn: QueueArn::from("arn:oss:sqs::t1:kafka".to_string()),
+                events: EventList::from(vec![Event::from(ev.to_string())]),
+                filter: None,
+            }])),
+            ..Default::default()
+        };
+        s3.put_bucket_notification_configuration(req(
             PutBucketNotificationConfigurationInput::builder()
                 .bucket("notifb".to_string())
-                .notification_configuration(bad)
+                .notification_configuration(cfg)
                 .build()
                 .unwrap(),
         ))
         .await
-        .unwrap_err();
-    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidArgument);
+        .unwrap_or_else(|e| panic!("{ev} 应可配置: {e:?}"));
+    }
 
     // 不存在的桶 → 404
     let e = s3

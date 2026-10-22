@@ -1812,6 +1812,17 @@ impl S3 for OssS3 {
         };
         let len = bytes.len() as i64;
         let restore = restore_header(&info);
+        // 读路径补全：成功 200/206 才发（304/416/错误已在上面提前返回）
+        self.emit(
+            S3EventOp::AccessedGet,
+            &bucket,
+            &key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            EventSource::from_headers(&req.headers),
+        )
+        .await;
 
         let mut out = GetObjectOutput {
             body: Some(StreamingBlob::from_bytes(bytes)),
@@ -1939,6 +1950,17 @@ impl S3 for OssS3 {
             return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
         }
         let restore = restore_header(&info);
+        // 读路径补全：HEAD 成功 200 才发（304/条件失败/错误已提前返回）
+        self.emit(
+            S3EventOp::AccessedHead,
+            &req.input.bucket,
+            &req.input.key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            EventSource::from_headers(&req.headers),
+        )
+        .await;
         let mut out = HeadObjectOutput {
             content_length: Some(info.size as i64),
             content_type: info.content_type,
