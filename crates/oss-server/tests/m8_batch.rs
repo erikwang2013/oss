@@ -677,6 +677,133 @@ async fn five_actions_and_hooks() {
     assert!(f.run(BATCH_INVOKE, &iv).await.is_err(), "500 必须失败");
 }
 
+#[cfg(feature = "olap-wasm")]
+mod batch_wasm {
+    use super::*;
+
+    /// guest ABI 恒等变换：`memory` + `alloc`/`dealloc`/`transform`。
+    const IDENTITY: &str = r#"
+        (module
+          (memory (export "memory") 2)
+          (global $next (mut i32) (i32.const 1024))
+          (func $alloc (export "alloc") (param $len i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $next))
+            (global.set $next (i32.add (global.get $next) (local.get $len)))
+            (local.get $p))
+          (func (export "dealloc") (param i32 i32))
+          (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
+            (local $out i32)
+            (local.set $out (call $alloc (local.get $len)))
+            (memory.copy (local.get $out) (local.get $ptr) (local.get $len))
+            (i64.or
+              (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+              (i64.extend_i32_u (local.get $len)))))
+    "#;
+
+    async fn wasm_ap(f: &Fx, name: &str, max_response_bytes: i64) {
+        f.db()
+            .create_access_point(name, "src", f.admin, None, 1)
+            .await
+            .unwrap();
+        f.db()
+            .set_olap_config(
+                name,
+                "wasm",
+                None,
+                Some(IDENTITY.as_bytes()),
+                None,
+                5_000,
+                max_response_bytes,
+                1,
+            )
+            .await
+            .unwrap();
+        let t = OlapTransform::prepare(
+            "wasm",
+            None,
+            Some(IDENTITY.as_bytes()),
+            5_000,
+            max_response_bytes,
+        )
+        .unwrap();
+        f.st.olap_cache.put(name, "src", t);
+    }
+
+    /// 创建期接受 WASM AP；执行成功即变换跑通（输出丢弃）。
+    #[tokio::test]
+    async fn invoke_lambda_wasm_transform_succeeds() {
+        let f = fx().await;
+        wasm_ap(&f, "wasm-ap", 1 << 20).await;
+        f.put("src", "m.csv", b"src,wasm-key\n").await;
+        f.put("src", "wasm-key", b"wasm-input").await;
+        let mut r = req("InvokeLambda", "m.csv");
+        r.transform_access_point = Some("wasm-ap".into());
+        assert!(create_batch(&f.st, f.admin, true, r).await.is_ok());
+
+        let mut p = payload("src", "wasm-key", f.admin);
+        p.transform_access_point = Some("wasm-ap".into());
+        assert_eq!(f.run(BATCH_INVOKE, &p).await.unwrap(), "Succeeded");
+    }
+
+    /// 输出超过 max_response_bytes → 任务失败。
+    #[tokio::test]
+    async fn invoke_lambda_wasm_output_limit_fails() {
+        let f = fx().await;
+        wasm_ap(&f, "wasm-ap", 4).await;
+        f.put("src", "wasm-key", b"wasm-input").await;
+        let mut p = payload("src", "wasm-key", f.admin);
+        p.transform_access_point = Some("wasm-ap".into());
+        let e = f.run(BATCH_INVOKE, &p).await.unwrap_err();
+        assert!(e.contains("超限"), "{e}");
+    }
+}
+
+#[cfg(not(feature = "olap-wasm"))]
+mod batch_wasm_disabled {
+    use super::*;
+
+    /// 默认构建：DB 里的 wasm 配置（可能由开启 feature 的构建写入）在创建/执行期
+    /// 都给出明确的 feature 未开启错误，而不是“未加载”。
+    #[tokio::test]
+    async fn wasm_transform_reports_disabled_feature() {
+        let f = fx().await;
+        f.db()
+            .create_access_point("wasm-ap", "src", f.admin, None, 1)
+            .await
+            .unwrap();
+        f.db()
+            .set_olap_config(
+                "wasm-ap",
+                "wasm",
+                None,
+                Some(b"wasm".as_slice()),
+                None,
+                5_000,
+                1024,
+                1,
+            )
+            .await
+            .unwrap();
+        f.put("src", "m.csv", b"src,wasm-key\n").await;
+        f.put("src", "wasm-key", b"x").await;
+
+        let mut r = req("InvokeLambda", "m.csv");
+        r.transform_access_point = Some("wasm-ap".into());
+        let e = match create_batch(&f.st, f.admin, true, r).await {
+            Err(BatchError::Invalid(e)) => e,
+            Err(e) => panic!("期望 Invalid，得到 {e:?}"),
+            Ok(_) => panic!("默认构建应拒绝 wasm 变换器"),
+        };
+        assert!(e.contains("olap-wasm"), "{e}");
+
+        let mut p = payload("src", "wasm-key", f.admin);
+        p.transform_access_point = Some("wasm-ap".into());
+        let e = f.run(BATCH_INVOKE, &p).await.unwrap_err();
+        assert!(e.contains("olap-wasm"), "{e}");
+    }
+}
+
 /// I1：Batch Delete 产生 delete marker 时必须入复制队列（与在线 delete_object 同语义）；
 /// 指定版本删除不入队。
 #[tokio::test]
@@ -1106,7 +1233,7 @@ async fn creation_validation_permissions_and_quota() {
         Err(BatchError::Denied(_))
     ));
 
-    // 校验：非法标签（>10）、未知动作、InvokeLambda 缺 AP、WASM AP
+    // 校验：非法标签（>10）、未知动作、InvokeLambda 缺 AP/缺变换器
     let mut bad_tags = req("ReplaceTags", "m.csv");
     bad_tags.tags = tags(&[("k0", "v")]);
     let mut body = match bad_tags.tags.take().unwrap() {
@@ -1130,26 +1257,13 @@ async fn creation_validation_permissions_and_quota() {
         Err(BatchError::Invalid(_))
     ));
     f.db()
-        .create_access_point("wasm-ap", "src", f.admin, None, 1)
+        .create_access_point("no-transform", "src", f.admin, None, 1)
         .await
         .unwrap();
-    f.db()
-        .set_olap_config(
-            "wasm-ap",
-            "wasm",
-            None,
-            Some(b"wasm".as_slice()),
-            None,
-            5_000,
-            1024,
-            1,
-        )
-        .await
-        .unwrap();
-    let mut w = req("InvokeLambda", "m.csv");
-    w.transform_access_point = Some("wasm-ap".into());
+    let mut n = req("InvokeLambda", "m.csv");
+    n.transform_access_point = Some("no-transform".into());
     assert!(matches!(
-        create_batch(&f.st, f.admin, true, w).await,
+        create_batch(&f.st, f.admin, true, n).await,
         Err(BatchError::Invalid(_))
     ));
 

@@ -17,7 +17,7 @@ use xl_store::meta::{self, ObjectTag};
 
 use crate::db::{JobSpec, NewJobTask};
 use crate::job_actions::{
-    BatchActionPayload, BatchError, BatchOp, MAX_MANIFEST_BYTES, parse_manifest,
+    BatchActionPayload, BatchError, BatchOp, MAX_MANIFEST_BYTES, check_invoke_kind, parse_manifest,
 };
 use crate::state::AppState;
 
@@ -220,9 +220,7 @@ pub async fn create_batch(
                 .await
                 .map_err(|e| BatchError::Internal(e.to_string()))?
                 .ok_or_else(|| invalid("transform access point 未配置变换器"))?;
-            if cfg.kind != "http" {
-                return Err(invalid("仅支持 http 变换器（WASM 不支持）"));
-            }
+            check_invoke_kind(&cfg.kind).map_err(BatchError::Invalid)?;
         }
         (_, Some(_)) => return Err(invalid("transform_access_point 仅用于 InvokeLambda")),
         _ => {}

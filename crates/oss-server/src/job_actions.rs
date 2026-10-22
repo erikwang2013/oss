@@ -7,8 +7,8 @@
 //!
 //! 动作语义：Copy 只读源（可带 versionId），目标键 = `target.prefix + 原 key`，标签/元数据
 //! 按 Copy 语义复制；ReplaceTags 对清单对象自身整体替换标签；Delete 的 tier refs 交 GC；
-//! Restore 等价 S3 RestoreObject（Restoring/Restored → 幂等成功）；InvokeLambda 只接受
-//! HTTP 变换器，输出丢弃。
+//! Restore 等价 S3 RestoreObject（Restoring/Restored → 幂等成功）；InvokeLambda 支持 HTTP
+//! 变换器，构建开启 `olap-wasm` 时也支持 WASM（输出丢弃）。
 
 use std::sync::Arc;
 
@@ -37,6 +37,17 @@ pub const BATCH_DELETE: &str = "BatchDeleteObject";
 pub const BATCH_TAGS: &str = "BatchReplaceTags";
 pub const BATCH_RESTORE: &str = "BatchRestoreObject";
 pub const BATCH_INVOKE: &str = "BatchInvokeLambda";
+
+/// 创建/执行前复核变换器类型。默认构建（未开 `olap-wasm`）明确拒绝 wasm，
+/// 避免落到“变换器未加载”这种误导错误；开启后交给 `OlapTransform` 执行。
+pub(crate) fn check_invoke_kind(kind: &str) -> Result<(), String> {
+    match kind {
+        "http" => Ok(()),
+        "wasm" if cfg!(feature = "olap-wasm") => Ok(()),
+        "wasm" => Err("wasm 变换器未启用（本次构建未开启 olap-wasm）".into()),
+        other => Err(format!("不支持的变换器类型: {other}")),
+    }
+}
 
 /// 创建期错误 → HTTP（与控制台其余 handler 同口径：403 纯文本、500 泛化）。
 #[derive(Debug)]
@@ -461,9 +472,7 @@ impl BatchExecutor {
             .await
             .map_err(|e| e.to_string())?
             .ok_or("transform access point 未配置变换器")?;
-        if cfg.kind != "http" {
-            return Err("仅支持 http 变换器（WASM 不支持）".into());
-        }
+        check_invoke_kind(&cfg.kind)?;
         let t = self
             .olap
             .get(ap)
