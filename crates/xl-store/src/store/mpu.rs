@@ -840,6 +840,20 @@ impl Store {
     }
 }
 
+/// LMU 用摘要：读 `<upload_dir>/mpu.meta` → (created_nanos, storage_class)。
+/// 无 mpu.meta（非暂存区 / 已 complete / 已 abort）→ None。解码失败按损坏上抛，
+/// 调用方跳过单个坏目录并告警——一个坏 mpu.meta 不得打挂整桶列举。
+pub(super) async fn mpu_summary(dir: &std::path::Path) -> Result<Option<(i64, Option<String>)>> {
+    let bytes = match tokio::fs::read(dir.join(MPU_META_FILE)).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let m: MpuMeta = rmp_serde::from_slice(&bytes)
+        .map_err(|e| Error::CorruptMeta(format!("mpu.meta 解码失败: {e}")))?;
+    Ok(Some((m.created_nanos, m.storage_class)))
+}
+
 /// 按声明顺序把暂存的 `part.N` 拼成 64 KiB 块的 `ByteStream`（complete 装对象用），
 /// 并对每段做**字节级核验**：段内容与 sidecar 快照（etag/sha256/长度）不符 →
 /// `InvalidPart`（complete 期间被并发重传；核验对象正是即将提交的字节，竞态在核验点收口）。

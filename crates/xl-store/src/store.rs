@@ -28,6 +28,7 @@ mod put;
 mod read;
 mod rebalance;
 mod tier;
+mod uploads;
 mod version;
 pub use rebalance::RebalanceReport;
 pub use tier::ArchiveSpec;
@@ -182,6 +183,36 @@ pub struct ListResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_token: Option<String>,
+}
+
+/// ListMultipartUploads 请求。排序键是 (key, upload_id)：key_marker 排他，
+/// upload_id_marker 仅在同一 key 内生效（AWS 语义：无 key_marker 时被忽略）。
+#[derive(Debug, Clone, Default)]
+pub struct UploadListRequest {
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<String>,
+    pub max_uploads: Option<usize>,
+}
+
+/// 进行中的 MPU 摘要（一次列举的输出项）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadInfo {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_nanos: i64,
+    /// 创建时固化的存储类（None 在 S3 面回 STANDARD）
+    pub storage_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UploadListResult {
+    pub uploads: Vec<UploadInfo>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
 }
 
 pub struct Store {
@@ -1719,5 +1750,7 @@ mod tests_sync;
 mod tests_tags;
 #[cfg(test)]
 mod tests_tier;
+#[cfg(test)]
+mod tests_uploads;
 #[cfg(test)]
 mod tests_versioning;

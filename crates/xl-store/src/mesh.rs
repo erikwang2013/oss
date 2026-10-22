@@ -151,6 +151,37 @@ pub struct ListLocalResp {
     pub slots_ok: u32,
 }
 
+/// ListMultipartUploads 并集条目：按 (key, upload_id) 全局有序；`initiated_nanos`
+/// 与单机响应同源（mpu.meta.created_nanos）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadEntry {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_nanos: i64,
+    pub storage_class: String,
+}
+
+/// LMU 单节点页请求。分页锚是 (key_marker, upload_id_marker)：
+/// - key_marker 排他（严格大于）；upload_id_marker 仅在同一 key 内生效（id > marker）。
+///   `limit = max_uploads + 1`（集群并集完备性证明与 ListLocal 同款）。
+#[derive(Clone, Debug)]
+pub struct ListUploadsLocal {
+    pub bucket: String,
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ListUploadsLocalResp {
+    pub uploads: Vec<UploadEntry>,
+    pub prefixes: Vec<String>,
+    /// 成功读到的本地盘数（排查用；不参与判定）。
+    pub slots_ok: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct NodeHealth {
     pub node_id: String,
@@ -283,6 +314,18 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
     async fn delete_bucket_dir(&self, node: &str, bucket: &str) -> Result<()>;
     async fn list_bucket_dirs(&self, node: &str) -> Result<Vec<String>>;
     async fn list_local(&self, node: &str, l: ListLocal) -> Result<ListLocalResp>;
+    /// LMU 的远端页。默认 NotImplemented——测试替身免被迫实现；生产实现
+    /// （TonicMesh/InProcessMesh）必须覆盖（缺失时调用方按「少一路并集」warn 消化）。
+    async fn list_uploads_local(
+        &self,
+        node: &str,
+        l: ListUploadsLocal,
+    ) -> Result<ListUploadsLocalResp> {
+        let _ = (node, l);
+        Err(crate::error::Error::Encode(
+            "list_uploads_local 未实现".into(),
+        ))
+    }
     async fn health(&self, node: &str) -> Result<NodeHealth>;
     async fn lock(&self, node: &str, req: LockReq) -> Result<LockResp>;
     async fn control_query(&self, node: &str, q: ControlQuery) -> Result<Option<ControlRow>>;

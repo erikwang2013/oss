@@ -2800,6 +2800,13 @@ impl crate::mesh::MeshTransport for InProcessMesh {
     ) -> crate::error::Result<crate::mesh::ListLocalResp> {
         self.peer(n).await?.mesh_list_local(l).await
     }
+    async fn list_uploads_local(
+        &self,
+        n: &str,
+        l: crate::mesh::ListUploadsLocal,
+    ) -> crate::error::Result<crate::mesh::ListUploadsLocalResp> {
+        self.peer(n).await?.mesh_list_uploads_local(l).await
+    }
     async fn lock(
         &self,
         n: &str,
