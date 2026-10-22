@@ -20,6 +20,9 @@ type Row =
       storage_class?: string | null
       tier_phase?: string | null
       restore_expires_at?: number | null
+      lock_mode?: string | null
+      lock_retain_until?: number | null
+      legal_hold?: boolean
     }
 
 export default function Objects() {
@@ -99,6 +102,9 @@ export default function Objects() {
       storage_class: o.storage_class,
       tier_phase: o.tier_phase,
       restore_expires_at: o.restore_expires_at,
+      lock_mode: o.lock_mode,
+      lock_retain_until: o.lock_retain_until,
+      legal_hold: o.legal_hold,
     })),
   ]
 
@@ -174,6 +180,29 @@ export default function Objects() {
                       ? `（至 ${fmtTime(r.restore_expires_at)}）`
                       : ''}
                   </Tag>
+                )
+              },
+            },
+            {
+              // M5：锁状态直接来自控制台列表（无需逐对象 HEAD）；retention 与 legal hold 独立
+              title: '对象锁',
+              width: 210,
+              render: (
+                _: unknown,
+                r: { kind: string; lock_mode?: string | null; lock_retain_until?: number | null; legal_hold?: boolean },
+              ) => {
+                if (r.kind === 'dir') return '-'
+                if (!r.lock_mode && !r.legal_hold) return '-'
+                return (
+                  <Space size={4}>
+                    {r.lock_mode && (
+                      <Tag color={r.lock_mode === 'COMPLIANCE' ? 'red' : 'blue'}>
+                        {r.lock_mode}
+                        {r.lock_retain_until ? `（至 ${fmtTime(r.lock_retain_until)}）` : ''}
+                      </Tag>
+                    )}
+                    {r.legal_hold && <Tag color="orange">Legal Hold</Tag>}
+                  </Space>
                 )
               },
             },

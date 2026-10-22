@@ -1305,10 +1305,29 @@ db_path = "/var/lib/oss/raft.db"
    加 learner 追平后替换；**B 永久丢失且有 sync 桶** → A+C 仍 quorum 2，复用旧 B 的 site
    UUID/token、新 Raft node_id 部署 B'，`sync-reconcile --repair` 完成前不得标可服务
    （有 sync 桶时 `DELETE /sites` 应 409）；**A+B 同时丢失** → 按上述 force recovery。
-6. **升级顺序（非滚动）**：Raft RPC 自本版本起携带并校验
-   `x-oss-raft-target-node-id`（防止旧 endpoint 上的新 node_id 误答旧成员请求）。所有
-   voter/witness 必须先升级到本版本，再执行成员变更/B′ 替换；旧版本节点缺少该头会被
-   421 拒绝，混合版本集群不受支持。
+6. **升级顺序（M9 控制面 Level B 滚动；数据面仍非滚动）**：Raft RPC 携带并校验
+   `x-oss-raft-target-node-id`（防止旧 endpoint 上的新 node_id 误答旧成员请求），
+   v1.13.1 起为滚动基线；本版本新增 `x-oss-raft-wire-version` /
+   `x-oss-raft-feature-level` 握手（缺失/非法 = 1）。步骤如下：
+   - **二进制滚动（feature level 1）**：逐台重启，**先 follower/learner、最后 leader**；
+     每台重启后在 `/api/v1/site/raft/status` 等到 `applied` 追平再动下一台。此阶段
+     保持 `[raft].feature_level=1`（缺省，旧配置无需改动），行为与旧版一致。
+   - **启用 level 2**：全部 voter/learner 都已是新二进制（`wire_version=2`）后，逐台把
+     `[raft].feature_level=2` 写入配置并重启。leader 的 `effective_feature_level` 只在
+     所有当前 voter **和 learner** 都在当前 term 宣告 2 时才是 2；否则 level-2 写入返回
+     503 `{"error":"feature_unavailable","required":N,"effective":M}`。
+   - **激活 = 不归点**：首条 level-2 entry 提交时，同一 apply 事务写
+     `schema_meta.raft_feature_level=2`（只升不降）。之后回滚必须换回支持该级别的二进制；
+     marker 高于配置或二进制上限时启动直接拒绝。**回滚只在激活前可行**：停集群、换回旧
+     二进制、删除 `feature_level` 键（旧 `RaftToml` 拒绝未知键）、启动。
+   - **窗口内禁止成员变更**：新 leader 在 add/promote/replace 前预检——现有 voter/learner
+     任一 `wire<2`、目标未达标或不可达 → 409 `peer_incompatible`；不可达的旧节点只能被
+     移除/替换。console 配对（`/sites`、`/join`）同样要求对端 identity 带 wire 2 且
+     feature 不低于本机（旧节点缺省 = 1 → 409）。
+   - **不在 Level B 范围内**：M3/M4 数据面（分片 RPC/EC/放置）、TLS 物料、从 < v1.13.1
+     跨大版本、Level C 双向混合写、快照 OSSCTL2（本版本无复制结构变更，快照仍为
+     OSSCTL1）。
+   - 全流程演练：`tests/e2e_m9_rolling.sh`（需 `OSS_OLD_BIN` = v1.13.1；未提供时 SKIP）。
 
 ### 部署与安全边界
 

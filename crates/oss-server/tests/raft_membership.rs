@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::raft_harness::{self, TestNode};
 use oss_server::db::Db;
 use oss_server::raft::membership::{self, MembershipError, MembershipOp};
-use oss_server::raft::{ControlCommand, RPC_TOKEN_HEADER};
+use oss_server::raft::{ControlCommand, RPC_TARGET_HEADER, RPC_TOKEN_HEADER};
 use serde_json::json;
 
 async fn control_db(dir: &Path, name: &str) -> Db {
@@ -93,6 +93,7 @@ async fn three_voters_follower_write_remove_and_forwarded_depth() {
     let r = reqwest::Client::new()
         .post(format!("{}/api/v1/site/raft/write", b.base))
         .header(RPC_TOKEN_HEADER, "s73-token")
+        .header(RPC_TARGET_HEADER, "2")
         .header("x-oss-raft-forwarded", "1")
         .json(&ControlCommand::UserCreate {
             username: "loop".into(),
@@ -207,4 +208,71 @@ async fn leader_loss_and_forwarded_removal() {
 
     b.handle.shutdown().await;
     c.handle.shutdown().await;
+}
+
+/// 只应答 `/status` 的对端（模拟旧 wire / 已升级节点，不参与复制）。
+async fn mock_status(wire: u32, feature: u8) -> String {
+    let app = axum::Router::new().route(
+        "/api/v1/site/raft/status",
+        axum::routing::get(move || async move {
+            axum::Json(serde_json::json!({"wire_version": wire, "feature_level": feature}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_prechecks_reject_legacy_and_unverifiable_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = control_db(dir.path(), "a").await;
+    let a = spawn(dir.path(), 1, true, &db).await;
+    assert_eq!(wait_leader_id(&a.handle).await, 1);
+    let old = mock_status(1, 1).await;
+    let new = mock_status(2, 2).await;
+
+    // R5：目标仍是旧 wire → 拒绝加入。
+    let err = membership::request(
+        &a.base,
+        &a.token,
+        &MembershipOp::AddWitness {
+            node_id: 2,
+            endpoint: old.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, MembershipError::Incompatible(_)), "{err:?}");
+    assert_eq!(membership::view(&a.handle).voters, vec![1]);
+
+    // 旧 learner 已在成员表（滚动窗口内入列）→ R6 阻塞任何新成员变更。
+    a.handle
+        .raft()
+        .add_learner(2, openraft::BasicNode::new(old), false)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !membership::view(&a.handle).learners.contains(&2) {
+        assert!(tokio::time::Instant::now() < deadline, "learner not listed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let err = membership::request(
+        &a.base,
+        &a.token,
+        &MembershipOp::AddWitness {
+            node_id: 3,
+            endpoint: new,
+        },
+    )
+    .await
+    .unwrap_err();
+    match err {
+        MembershipError::Incompatible(m) => assert!(m.contains("peer 2"), "{m}"),
+        other => panic!("expected Incompatible, got {other:?}"),
+    }
+    assert_eq!(membership::view(&a.handle).voters, vec![1]);
+
+    a.handle.shutdown().await;
 }

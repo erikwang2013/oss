@@ -81,6 +81,12 @@ export interface ObjectEntry {
   tier_phase?: string | null
   /** M8：临时恢复到期（unix 秒）；null = 无临时副本 */
   restore_expires_at?: number | null
+  /** M5：对象锁 retention 模式（GOVERNANCE / COMPLIANCE）；null = 无 retention */
+  lock_mode?: string | null
+  /** M5：retention 截止（unix 秒） */
+  lock_retain_until?: number | null
+  /** M5：legal hold（独立于 retention） */
+  legal_hold?: boolean
 }
 export interface ObjectList {
   objects: ObjectEntry[]

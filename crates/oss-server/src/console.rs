@@ -2231,6 +2231,11 @@ async fn list_objects(
                 "storage_class": o.storage_class.as_deref(),
                 "tier_phase": o.tier_phase.map(|p| format!("{p:?}")),
                 "restore_expires_at": o.restore_expires_at,
+                // M5 遗留补齐：对象锁（retention 与 legal hold 独立；null = 无锁/降级条目未知）
+                "lock_mode": o.lock.as_ref().and_then(|l| l.mode.as_deref()),
+                // unix 秒（与 restore_expires_at / fmtTime 同单位）
+                "lock_retain_until": o.lock.as_ref().and_then(|l| l.retain_until_nanos).map(|n| n / 1_000_000_000),
+                "legal_hold": o.lock.as_ref().is_some_and(|l| l.legal_hold),
             })).collect::<Vec<_>>(),
             "common_prefixes": r.common_prefixes,
             "is_truncated": r.is_truncated,
@@ -3090,6 +3095,13 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
         }),
         "raft_bootstrap": state.cfg.raft.as_ref().map(|r| r.bootstrap),
         "raft_initialized": state.raft.as_ref().map(|h| h.membership_nonempty()),
+        // Level B 握手：配对预检读取（旧节点缺省 = wire/feature 1）。
+        "raft_wire_version": state.cfg.raft.as_ref().map(|_| crate::raft::compat::WIRE_VERSION),
+        "raft_feature_level": state
+            .raft
+            .as_ref()
+            .map(|h| h.advertised_feature())
+            .or_else(|| state.cfg.raft.as_ref().map(|_| crate::raft::compat::MIN_FEATURE_LEVEL)),
         "admin_username": state.admin_username,
         "vault_probe": state.vault_probe,
         "version": env!("CARGO_PKG_VERSION"),
@@ -3287,13 +3299,43 @@ async fn membership_apply_any(
             .as_ref()
             .map(|r| r.cluster_token.clone())
             .unwrap_or_default();
-        membership::request_tls(&endpoint, &token, op, Some(state.tls.as_ref())).await
+        membership::request_tls(
+            &endpoint,
+            &token,
+            op,
+            Some(state.tls.as_ref()),
+            handle.advertised_feature(),
+        )
+        .await
     } else {
         Err(MembershipError::NoQuorum)
     }
 }
 
 /// Raft 模式配对：预检 → 本地行 → 对端 /join → 成员变更。M7 路径不经过此函数。
+/// R7：配对前检查对端 identity 的握手字段（缺省 = 旧节点 1）。混合版本配对会
+/// 立刻产生无法验证的成员变更，必须在存站点/发 join 之前拒绝。
+fn peer_compat_check(
+    ident: &crate::site_client::PeerIdentity,
+    local_feature: u8,
+) -> Result<(), String> {
+    let wire = ident.raft_wire_version.unwrap_or(1);
+    if wire < crate::raft::compat::MIN_MEMBERSHIP_WIRE_VERSION {
+        return Err(format!(
+            "peer raft wire {wire} < required {}; upgrade the peer binary first",
+            crate::raft::compat::MIN_MEMBERSHIP_WIRE_VERSION
+        ));
+    }
+    let feature = ident.raft_feature_level.unwrap_or(1);
+    if feature < local_feature {
+        return Err(format!(
+            "peer raft feature {feature} < local {local_feature}; \
+             set [raft].feature_level={local_feature} on the peer first"
+        ));
+    }
+    Ok(())
+}
+
 async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: String) -> Response {
     use crate::raft::membership::MembershipOp;
     let bad = |m: String| (StatusCode::BAD_REQUEST, m).into_response();
@@ -3330,6 +3372,14 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
     }
     if !ident.raft_enabled {
         return conflict("peer has no [raft]".into());
+    }
+    let local_feature = state
+        .raft
+        .as_ref()
+        .map(|h| h.advertised_feature())
+        .unwrap_or_else(|| crate::raft::compat::advertised_feature(local_raft.feature_level));
+    if let Err(m) = peer_compat_check(&ident, local_feature) {
+        return conflict(m);
     }
     let peer_bootstrap = ident.raft_bootstrap.unwrap_or(false);
     if peer_bootstrap == local_raft.bootstrap {
@@ -3455,6 +3505,11 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         &join_body,
         std::time::Duration::from_secs(20),
         Some(state.tls.as_ref()),
+        state
+            .raft
+            .as_ref()
+            .map(|h| h.advertised_feature())
+            .unwrap_or(crate::raft::compat::MIN_FEATURE_LEVEL),
     )
     .await
     {
@@ -3626,6 +3681,14 @@ async fn site_raft_join(
     }
     if !ident.raft_enabled {
         return conflict("peer has no [raft]");
+    }
+    let local_feature = state
+        .raft
+        .as_ref()
+        .map(|h| h.advertised_feature())
+        .unwrap_or_else(|| crate::raft::compat::advertised_feature(local_raft.feature_level));
+    if let Err(m) = peer_compat_check(&ident, local_feature) {
+        return conflict(&m);
     }
     if ident.region != body.region {
         return bad("region mismatch");
@@ -3987,6 +4050,7 @@ async fn delete_site(
                     &token,
                     &op,
                     Some(state.tls.as_ref()),
+                    handle.advertised_feature(),
                 )
                 .await
             } else {
@@ -4006,6 +4070,9 @@ async fn delete_site(
                 }
                 Err(MembershipError::Raft(msg)) => {
                     return (StatusCode::BAD_GATEWAY, msg).into_response();
+                }
+                Err(MembershipError::Incompatible(msg)) => {
+                    return (StatusCode::CONFLICT, msg).into_response();
                 }
             }
         }
@@ -4432,7 +4499,28 @@ async fn site_delete_bucket(
 #[cfg(test)]
 mod stretch_identity_tests {
     use super::*;
-    use crate::site_client::{EcIdentity, StretchIdentity};
+    use crate::site_client::{EcIdentity, PeerIdentity, StretchIdentity};
+
+    fn peer_identity(wire: Option<u32>, feature: Option<u8>) -> PeerIdentity {
+        let mut v = serde_json::json!({"id": "p", "name": "P", "region": "r", "priority": 0});
+        if let Some(wire) = wire {
+            v["raft_wire_version"] = wire.into();
+        }
+        if let Some(feature) = feature {
+            v["raft_feature_level"] = feature.into();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn pairing_rejects_identity_without_wire_two_or_matching_feature() {
+        // 旧 M7 identity：无握手字段 → wire 1，必须拒绝配对（R7）。
+        assert!(peer_compat_check(&peer_identity(None, None), 1).is_err());
+        assert!(peer_compat_check(&peer_identity(Some(2), None), 2).is_err());
+        assert!(peer_compat_check(&peer_identity(Some(2), Some(1)), 2).is_err());
+        assert!(peer_compat_check(&peer_identity(Some(2), Some(2)), 2).is_ok());
+        assert!(peer_compat_check(&peer_identity(Some(2), Some(2)), 1).is_ok());
+    }
 
     fn id(node: &str, self_addr: &str, peer: &str, peer_addr: &str) -> StretchIdentity {
         StretchIdentity {

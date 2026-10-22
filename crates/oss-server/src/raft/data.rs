@@ -6,6 +6,10 @@
 //!
 //! 快照封套（`encode_snapshot`）：`OSSCTL1\n<sha256(payload) 64 位小写 hex>\n<json>`。
 //! 解码先校验 magic / hex / SHA-256，任何失败都 fail-closed（install 在任何写之前拒绝）。
+//!
+//! 格式 1 已冻结：行结构没有 `deny_unknown_fields`，旧节点会**静默丢弃**未知字段并
+//! 清掉未知表。任何 `ControlData` 增删都必须升到 `OSSCTL2`（随激活标记切换），
+//! 绝不能只往格式 1 里加字段。本版本无复制 schema 变更 → 保持 OSSCTL1（D6）。
 
 use std::collections::{HashMap, HashSet};
 

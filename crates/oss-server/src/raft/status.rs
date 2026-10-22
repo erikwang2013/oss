@@ -11,6 +11,7 @@
 
 use serde_json::{Value, json};
 
+use super::compat;
 use super::{RAFT_READY, RaftHandle, STRETCH_READY, SYNC_READY};
 
 fn log_id_json(id: &openraft::LogId<u64>) -> Value {
@@ -55,6 +56,29 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         crate::config::RaftRole::Voter => "voter",
         crate::config::RaftRole::Witness => "witness",
     };
+    // leader 才计算生效等级：follower 没有当前 term 的 peer 记录，报 null 更诚实。
+    let effective = is_leader.then(|| {
+        compat::effective_feature_level(
+            handle.settings().feature_level,
+            m.id,
+            &voters,
+            &learners,
+            m.current_term,
+            handle.peers(),
+        )
+    });
+    // 滚动升级诊断：peer 握手结果带 term（旧 term 记录只展示、不参与门控）。
+    let peer_versions: serde_json::Map<String, Value> = handle
+        .peers()
+        .snapshot()
+        .iter()
+        .map(|(id, p)| {
+            (
+                id.to_string(),
+                json!({"wire": p.wire, "feature": p.feature, "term": p.term}),
+            )
+        })
+        .collect();
     json!({
         "enabled": m.running_state.is_ok(),
         "node_id": m.id,
@@ -77,6 +101,18 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         "learners": learners,
         "nodes": nodes,
         "production_ready": voters.len() >= 3,
+        // ---- Level B 滚动升级握手/诊断（纯增量字段；旧节点无这些键） ----
+        "wire_version": compat::WIRE_VERSION,
+        "feature_level": handle.advertised_feature(),
+        "activation_level": handle.activation_level(),
+        "effective_feature_level": effective.as_ref().map(|e| e.level),
+        "compat": {
+            "min_wire_version": compat::MIN_COMPAT_WIRE_VERSION,
+            "min_membership_wire_version": compat::MIN_MEMBERSHIP_WIRE_VERSION,
+            "peers": peer_versions,
+            "mixed": handle.peers().mixed(m.current_term),
+            "blocked_reason": effective.and_then(|e| e.blocked_reason),
+        },
         "capabilities": {
             "raft": configured && RAFT_READY,
             "sync": configured && SYNC_READY,

@@ -27,6 +27,7 @@ use crate::sse::{
 
 mod list_multipart_uploads;
 mod list_v1;
+mod retention;
 mod upload_part_copy;
 
 #[derive(Clone)]
@@ -2213,6 +2214,21 @@ impl S3 for OssS3 {
         }))
     }
 
+    /// M5 遗留补齐：主体在 `retention.rs`（trait impl 不能按模块拆分，这里只转发）。
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        retention::get_object_retention(self, req).await
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        retention::put_object_retention(self, req).await
+    }
+
     async fn put_object_lock_configuration(
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
@@ -2409,6 +2425,11 @@ impl S3 for OssS3 {
         // 授权在此逐键完成（策略 Deny/Allow/回落表三档，与单键删同口径；AWS 亦逐键授权）。
         // 判定基础设施失败 = 该键 fail-closed；被拒键记 AccessDenied 进 errors 后继续（§3.4 部分失败）。
         let user = req.extensions.get::<crate::access::AuthedUser>().cloned();
+        // 匿名（无凭据）批量删：check 只验「有桶策略」，逐键仍按桶策略复评（无表三档回落）。
+        let anonymous = req
+            .extensions
+            .get::<crate::access::AnonymousAccess>()
+            .is_some();
         // M8 AP：经访问点的批量删由 ApRoute::check_access 挂上下文，逐键叠 AP 策略交集。
         let ap_delete = req.extensions.get::<crate::ap::ApDeletePolicy>();
         let mut deleted = Vec::new();
@@ -2453,9 +2474,10 @@ impl S3 for OssS3 {
                     continue;
                 }
             }
-            let decision = match &user {
-                Some(u) => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
-                None => Ok((false, None)), // check 恒塞身份；防御性 fail-closed
+            let decision = match (&user, anonymous) {
+                (Some(u), _) => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
+                (None, true) => self.acl.anonymous_delete_decision(&bucket, &obj.key).await,
+                (None, false) => Ok((false, None)), // check 恒塞身份；防御性 fail-closed
             };
             let (allowed, deny_detail) = match decision {
                 Ok(v) => v,

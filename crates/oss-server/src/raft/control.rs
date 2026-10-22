@@ -361,6 +361,15 @@ impl ControlPlane {
                                 .into(),
                         ));
                     }
+                    Err(WriteError::FeatureUnavailable {
+                        required,
+                        effective,
+                    }) => {
+                        return Err(ControlError::Unavailable(format!(
+                            "raft feature level {required} not active (effective {effective}); \
+                             finish rollout/enable [raft].feature_level"
+                        )));
+                    }
                     Err(WriteError::Raft(msg)) => return Err(ControlError::Unavailable(msg)),
                 };
                 if response == ControlResponse::Ok {
