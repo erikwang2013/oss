@@ -547,6 +547,7 @@ async fn raft_write_failure_maps_to_503_with_hint_not_silent_204() {
             write_timeout_ms: 2_000,
             snapshot_max_chunk_size: 4 * 1024 * 1024,
             snapshot_max_bytes: 512 * 1024 * 1024,
+            feature_level: 1,
         },
         None,
         None,

@@ -708,6 +708,15 @@ pub(crate) async fn apply_command(
                 .await?;
             ControlResponse::Ok
         }
+        // 不触碰任何表：只用于验证 level-2 激活标记与业务拒绝同样写 marker。
+        #[cfg(test)]
+        ControlCommand::FeatureProbe { reject } => {
+            if *reject {
+                ControlResponse::Invalid
+            } else {
+                ControlResponse::Ok
+            }
+        }
     };
     Ok(Applied { response, effects })
 }

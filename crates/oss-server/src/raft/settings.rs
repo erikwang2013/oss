@@ -21,6 +21,8 @@ pub struct RaftSettings {
     pub write_timeout_ms: u64,
     pub snapshot_max_chunk_size: u64,
     pub snapshot_max_bytes: u64,
+    /// 配置愿意激活的最高 feature 级别（R11 在 `RaftToml`/`from_toml` 都校验）。
+    pub feature_level: u8,
 }
 
 impl RaftSettings {
@@ -30,6 +32,16 @@ impl RaftSettings {
             .db_path
             .clone()
             .ok_or_else(|| "[raft].db_path 必填（raft.db 路径）".to_string())?;
+        if !(super::compat::MIN_FEATURE_LEVEL..=super::compat::MAX_FEATURE_LEVEL)
+            .contains(&t.feature_level)
+        {
+            return Err(format!(
+                "[raft].feature_level 必须在 {}..={}，实际 {}",
+                super::compat::MIN_FEATURE_LEVEL,
+                super::compat::MAX_FEATURE_LEVEL,
+                t.feature_level
+            ));
+        }
         Ok(Self {
             node_id: t.node_id,
             role: t.role,
@@ -45,6 +57,7 @@ impl RaftSettings {
             write_timeout_ms: t.write_timeout_ms,
             snapshot_max_chunk_size: t.snapshot_max_chunk_size,
             snapshot_max_bytes: t.snapshot_max_bytes,
+            feature_level: t.feature_level,
         })
     }
 

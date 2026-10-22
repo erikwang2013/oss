@@ -42,6 +42,7 @@ pub fn settings(dir: &Path, node_id: u64, bootstrap: bool) -> RaftSettings {
         write_timeout_ms: 20_000,
         snapshot_max_chunk_size: oss_server::raft::SNAPSHOT_CHUNK_MAX,
         snapshot_max_bytes: 512 * 1024 * 1024,
+        feature_level: 1,
     }
 }
 

@@ -57,6 +57,7 @@ base64.workspace = true
 tracing.workspace = true
 # M9 S5：Raft 控制面。storage-v2 是 v2 storage traits 的编译前提（非默认 feature）；
 # 关闭 generic-snapshot-data：快照数据为 Cursor<Vec<u8>>，分块传输由 openraft 内置。
+# 版本 = wire/存储格式：pre-1.0 无兼容承诺，升级 openraft 必须换新协议代次并全停升级。
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 # M9 S5：Raft RPC HTTP 客户端（workspace 已锁定 rustls 版）。
 # S7.1：write 转发/成员 CLI 用 .json()（只加 feature，不加依赖）。

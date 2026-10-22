@@ -22,6 +22,7 @@ use openraft::raft::{
 };
 use serde::Serialize;
 
+use super::compat::{self, PeerVersions};
 use super::{RPC_TARGET_HEADER, RPC_TOKEN_HEADER, TypeConfig};
 
 const APPEND_PATH: &str = "/api/v1/site/raft/append";
@@ -49,14 +50,20 @@ pub struct HttpNetworkFactory {
     client: reqwest::Client,
     token: Arc<String>,
     tls: Option<Arc<crate::tls::Tls>>,
+    /// leader 侧 peer 版本表（follower 也记录，只有 leader 的用于门控）。
+    peers: Arc<PeerVersions>,
+    /// 本节点宣告的 feature = min(configured, MAX)（D3）。
+    feature: u8,
 }
 
 impl HttpNetworkFactory {
-    pub fn new(cluster_token: String) -> Self {
+    pub fn new(cluster_token: String, peers: Arc<PeerVersions>, feature: u8) -> Self {
         Self {
             client: reqwest::Client::new(),
             token: Arc::new(cluster_token),
             tls: None,
+            peers,
+            feature,
         }
     }
 
@@ -65,11 +72,15 @@ impl HttpNetworkFactory {
         cluster_token: String,
         tls: Arc<crate::tls::Tls>,
         client: reqwest::Client,
+        peers: Arc<PeerVersions>,
+        feature: u8,
     ) -> Self {
         Self {
             client,
             token: Arc::new(cluster_token),
             tls: Some(tls),
+            peers,
+            feature,
         }
     }
 }
@@ -94,6 +105,8 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
             token: self.token.clone(),
             target,
             endpoint,
+            peers: Arc::clone(&self.peers),
+            feature: self.feature,
         }
     }
 }
@@ -105,6 +118,8 @@ pub struct HttpNetwork {
     token: Arc<String>,
     target: u64,
     endpoint: String,
+    peers: Arc<PeerVersions>,
+    feature: u8,
 }
 
 impl HttpNetwork {
@@ -118,11 +133,32 @@ impl HttpNetwork {
             .post(format!("{}{}", self.endpoint, path))
             .header(RPC_TOKEN_HEADER, self.token.as_str())
             .header(RPC_TARGET_HEADER, self.target.to_string())
+            .header(compat::WIRE_HEADER, compat::WIRE_VERSION.to_string())
+            .header(compat::FEATURE_HEADER, self.feature.to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(ttl)
             .body(body)
             .send()
             .await
+    }
+
+    /// 2xx 响应的握手结果按请求 term 记录；旧节点缺头 = 1（保守）。
+    /// 非 2xx（421/422/500）不是可用记录，不覆盖已知版本。
+    fn record_peer(&self, term: u64, resp: &reqwest::Response) {
+        if !resp.status().is_success() {
+            return;
+        }
+        let wire = compat::parse_wire(
+            resp.headers()
+                .get(compat::WIRE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+        );
+        let feature = compat::parse_feature(
+            resp.headers()
+                .get(compat::FEATURE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+        );
+        self.peers.record(self.target, term, wire, feature);
     }
 }
 
@@ -147,11 +183,13 @@ impl RaftNetwork<TypeConfig> for HttpNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let entries = rpc.entries.len();
+        let term = rpc.vote.leader_id.term;
         let body = encode(&rpc)?;
         let resp = self
             .post(APPEND_PATH, body, option.hard_ttl())
             .await
             .map_err(transport_err)?;
+        self.record_peer(term, &resp);
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(transport_err)?;
         if status.is_success() {
@@ -181,11 +219,13 @@ impl RaftNetwork<TypeConfig> for HttpNetwork {
         rpc: VoteRequest<u64>,
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let term = rpc.vote.leader_id.term;
         let body = encode(&rpc)?;
         let resp = self
             .post(VOTE_PATH, body, option.hard_ttl())
             .await
             .map_err(transport_err)?;
+        self.record_peer(term, &resp);
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(transport_err)?;
         if status.is_success() {
@@ -205,11 +245,13 @@ impl RaftNetwork<TypeConfig> for HttpNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
+        let term = rpc.vote.leader_id.term;
         let body = encode(&rpc)?;
         let resp = self
             .post(SNAPSHOT_PATH, body, option.hard_ttl())
             .await
             .map_err(transport_err)?;
+        self.record_peer(term, &resp);
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(transport_err)?;
         if status.is_success() {
@@ -263,7 +305,11 @@ mod tests {
         endpoint: &str,
         entries: usize,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let mut factory = HttpNetworkFactory::new("t".into());
+        let mut factory = HttpNetworkFactory::new(
+            "t".into(),
+            Arc::new(PeerVersions::default()),
+            compat::MIN_FEATURE_LEVEL,
+        );
         let node = BasicNode {
             addr: endpoint.to_string(),
         };

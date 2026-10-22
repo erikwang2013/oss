@@ -11,7 +11,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,6 +20,7 @@ use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde_json::{Value, json};
 
 use super::command::{ControlCommand, SizeError};
+use super::compat;
 use super::membership::{self, MembershipError, MembershipOp};
 use super::{
     COMMAND_MAX_BYTES, RPC_BODY_LIMIT, RPC_TARGET_HEADER, RPC_TOKEN_HEADER, RaftHandle, TypeConfig,
@@ -32,6 +33,8 @@ pub const FORWARD_HEADER: &str = "x-oss-raft-forwarded";
 pub const WRITE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 /// `/membership` 体上限（S7.3 变更请求很小）。
 const MEMBERSHIP_BODY_LIMIT: usize = 64 * 1024;
+/// 诊断探针必须跨版本可用：不参与入站 wire 版本拒绝（R3）。
+const STATUS_PATH: &str = "/api/v1/site/raft/status";
 
 #[derive(Clone)]
 pub struct RaftExt {
@@ -78,7 +81,41 @@ pub fn rpc_router(
             post(write).layer(DefaultBodyLimit::max(WRITE_BODY_LIMIT)),
         )
         .layer(Extension(ext.clone()))
-        .route_layer(middleware::from_fn_with_state(ext, require_token))
+        .route_layer(middleware::from_fn_with_state(ext.clone(), require_token))
+        // 最外层：所有响应（含 401/403/4xx/5xx）都带握手头；入站在解码前拒绝更高 wire。
+        .route_layer(middleware::from_fn_with_state(ext, advertise_compat))
+}
+
+/// Level B 握手：响应头宣告本机 wire/feature；入站 `wire > 本机` → 426（R1），
+/// 缺失/非法按 1（R2），`/status` 永不拒绝（R3）。它是最外层 route_layer，
+/// 因此鉴权失败等分支也带响应头。
+async fn advertise_compat(State(ext): State<RaftExt>, req: Request, next: Next) -> Response {
+    let received = compat::parse_wire(
+        req.headers()
+            .get(compat::WIRE_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let mut resp = if req.uri().path() != STATUS_PATH && received > compat::WIRE_VERSION {
+        (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(json!({
+                "error": "wire_version_unsupported",
+                "supported": compat::WIRE_VERSION,
+                "received": received,
+            })),
+        )
+            .into_response()
+    } else {
+        next.run(req).await
+    };
+    let headers = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&compat::WIRE_VERSION.to_string()) {
+        headers.insert(compat::WIRE_HEADER, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&ext.handle.advertised_feature().to_string()) {
+        headers.insert(compat::FEATURE_HEADER, v);
+    }
+    resp
 }
 
 /// 缺令牌 401、错令牌 403（均不泄漏期望值）。
@@ -208,6 +245,7 @@ async fn membership(
         &op,
         view.leader,
         ext.handle.tls().map(|t| t.as_ref()),
+        ext.handle.advertised_feature(),
     )
     .await
     {
@@ -230,6 +268,11 @@ fn membership_error(e: MembershipError) -> Response {
             (StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response()
         }
         MembershipError::NoQuorum => no_leader("control plane has no quorum"),
+        MembershipError::Incompatible(msg) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "peer_incompatible", "detail": msg})),
+        )
+            .into_response(),
     }
 }
 
@@ -298,6 +341,23 @@ async fn write(
             Json(json!({
                 "error": "no quorum",
                 "hint": "write may have committed; retry is idempotent",
+            })),
+        )
+            .into_response(),
+        Err(WriteError::FeatureUnavailable {
+            required,
+            effective,
+        }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "feature_unavailable",
+                "required": required,
+                "effective": effective,
+                "hint": format!(
+                    "raft feature level {required} not active (effective {effective}): \
+                     finish binary rollout, set [raft].feature_level={required} on every \
+                     voter/learner, then wait for heartbeats"
+                ),
             })),
         )
             .into_response(),

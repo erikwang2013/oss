@@ -12,6 +12,7 @@ use openraft::{BasicNode, ChangeMembers};
 use serde::{Deserialize, Serialize};
 
 use super::RaftHandle;
+use super::compat;
 
 /// 入列前等待快照构建完成的上限（快照失败 = 不添加 learner）。
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
@@ -55,6 +56,8 @@ pub enum MembershipError {
     Raft(String),
     /// 没有 leader / 无法联系 leader：控制面无 quorum。
     NoQuorum,
+    /// R5/R6：混合版本集群禁止成员变更（目标/现有 peer 未达 wire 2，或不可达）。
+    Incompatible(String),
 }
 
 impl std::fmt::Display for MembershipError {
@@ -64,6 +67,7 @@ impl std::fmt::Display for MembershipError {
             Self::Invalid(m) => write!(f, "invalid membership op: {m}"),
             Self::Raft(m) => write!(f, "membership raft error: {m}"),
             Self::NoQuorum => write!(f, "no leader/quorum"),
+            Self::Incompatible(m) => write!(f, "incompatible peer: {m}"),
         }
     }
 }
@@ -161,6 +165,104 @@ fn valid_endpoint(endpoint: &str) -> Result<(), MembershipError> {
         .map_err(MembershipError::Invalid)
 }
 
+/// R5：目标节点必须已支持成员变更 wire，且 feature 不低于本机宣告级别。
+/// 探不到 = 无法证明兼容 → 拒绝（fail-closed）。
+async fn check_target_compat(
+    handle: &RaftHandle,
+    node_id: u64,
+    endpoint: &str,
+) -> Result<(), MembershipError> {
+    let local = handle.advertised_feature();
+    let status = crate::site_client::get_raft_status_tls(
+        endpoint,
+        &handle.settings().cluster_token,
+        handle.tls().map(|t| t.as_ref()),
+    )
+    .await
+    .map_err(|e| {
+        MembershipError::Incompatible(format!("target node {node_id} status probe failed: {e}"))
+    })?;
+    if status.wire < compat::MIN_MEMBERSHIP_WIRE_VERSION {
+        return Err(MembershipError::Incompatible(format!(
+            "target node {node_id} wire {} < required {}; upgrade it before adding/promoting",
+            status.wire,
+            compat::MIN_MEMBERSHIP_WIRE_VERSION
+        )));
+    }
+    if status.feature < local {
+        return Err(MembershipError::Incompatible(format!(
+            "target node {node_id} feature {} < local {local}; set [raft].feature_level={local} on it first",
+            status.feature
+        )));
+    }
+    Ok(())
+}
+
+/// R6：当前 voter/learner 必须全部 wire >= 2。当前 term 的握手记录优先，
+/// 否则拉一次 `/status`。不可达 peer 阻塞变更，除非它正是本次要移除/替换的旧节点
+/// （否则一个死掉的旧节点会让集群永远无法修复）。
+async fn check_cluster_uniformity(
+    handle: &RaftHandle,
+    allowed_unreachable: Option<u64>,
+) -> Result<(), MembershipError> {
+    let v = view(handle);
+    let term = {
+        let m = handle.raft().metrics();
+        let m = m.borrow();
+        m.current_term
+    };
+    for id in v.voters.iter().chain(v.learners.iter()).copied() {
+        if id == handle.node_id() {
+            continue;
+        }
+        if let Some(p) = handle.peers().get(id)
+            && p.term == term
+        {
+            if p.wire < compat::MIN_MEMBERSHIP_WIRE_VERSION {
+                return Err(MembershipError::Incompatible(format!(
+                    "peer {id} wire {} < required {} (mixed cluster); no membership changes during rollout",
+                    p.wire,
+                    compat::MIN_MEMBERSHIP_WIRE_VERSION
+                )));
+            }
+            continue;
+        }
+        let Some(endpoint) = v.nodes.get(&id) else {
+            if allowed_unreachable == Some(id) {
+                continue;
+            }
+            return Err(MembershipError::Incompatible(format!(
+                "peer {id} has no address and no current-term handshake; cannot verify compatibility"
+            )));
+        };
+        match crate::site_client::get_raft_status_tls(
+            endpoint,
+            &handle.settings().cluster_token,
+            handle.tls().map(|t| t.as_ref()),
+        )
+        .await
+        {
+            Ok(s) if s.wire >= compat::MIN_MEMBERSHIP_WIRE_VERSION => {}
+            Ok(s) => {
+                return Err(MembershipError::Incompatible(format!(
+                    "peer {id} wire {} < required {} (mixed cluster); no membership changes during rollout",
+                    s.wire,
+                    compat::MIN_MEMBERSHIP_WIRE_VERSION
+                )));
+            }
+            Err(e) if allowed_unreachable == Some(id) => {
+                tracing::warn!(node = id, error = %e, "成员变更预检：忽略要移除/替换的不可达节点");
+            }
+            Err(e) => {
+                return Err(MembershipError::Incompatible(format!(
+                    "peer {id} unreachable ({e}); cannot verify compatibility; remove/replace it first"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// learner 入列（blocking：等到日志追平才返回）。已入列则跳过。
 async fn add_learner(
     handle: &RaftHandle,
@@ -188,6 +290,9 @@ pub async fn promote_voter(
     if v.voters.contains(&node_id) {
         return Ok(v);
     }
+    // R5/R6：滚动窗口内禁止成员变更（目标必须 wire>=2/feature 达标，现有成员必须全 wire>=2）。
+    check_target_compat(handle, node_id, &endpoint).await?;
+    check_cluster_uniformity(handle, None).await?;
     if !v.learners.contains(&node_id) {
         add_learner(handle, node_id, &endpoint).await?;
     }
@@ -277,6 +382,9 @@ async fn replace_voter(
         )));
     }
     valid_endpoint(&endpoint)?;
+    // R5/R6：新节点必须达标；旧节点若不可达，允许作为本次替换目标（否则永远替换不掉）。
+    check_target_compat(handle, node_id, &endpoint).await?;
+    check_cluster_uniformity(handle, Some(old_node_id)).await?;
     if !v.learners.contains(&node_id) {
         add_learner(handle, node_id, &endpoint).await?;
     }
@@ -326,12 +434,22 @@ struct LeaderHint {
 }
 
 /// 客户端（CLI/测试）向 leader 发一次成员变更；跟随者可自行转发到 leader。
+/// 无本地配置上下文时只宣告 legacy feature（头仅诊断用，不参与门控）。
 pub async fn request(
     endpoint: &str,
     token: &str,
     op: &MembershipOp,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, false, None, None).await
+    request_inner(
+        endpoint,
+        token,
+        op,
+        false,
+        None,
+        None,
+        crate::raft::compat::MIN_FEATURE_LEVEL,
+    )
+    .await
 }
 
 /// TLS 变体：`tls = Some` 时 endpoint 按 peer TLS 模式升级为 https。
@@ -340,8 +458,9 @@ pub async fn request_tls(
     token: &str,
     op: &MembershipOp,
     tls: Option<&crate::tls::Tls>,
+    feature: u8,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, false, None, tls).await
+    request_inner(endpoint, token, op, false, None, tls, feature).await
 }
 
 /// 节点内部转发：带单跳标记，目标若已非 leader 直接 409，不再二次转发。
@@ -351,7 +470,16 @@ pub async fn request_forwarded(
     op: &MembershipOp,
     target: Option<u64>,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, true, target, None).await
+    request_inner(
+        endpoint,
+        token,
+        op,
+        true,
+        target,
+        None,
+        crate::raft::compat::MIN_FEATURE_LEVEL,
+    )
+    .await
 }
 
 /// TLS 变体（节点内转发）。
@@ -361,8 +489,9 @@ pub async fn request_forwarded_tls(
     op: &MembershipOp,
     target: Option<u64>,
     tls: Option<&crate::tls::Tls>,
+    feature: u8,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, true, target, tls).await
+    request_inner(endpoint, token, op, true, target, tls, feature).await
 }
 
 async fn request_inner(
@@ -372,6 +501,7 @@ async fn request_inner(
     forwarded: bool,
     target: Option<u64>,
     tls: Option<&crate::tls::Tls>,
+    feature: u8,
 ) -> Result<MemberView, MembershipError> {
     let body = serde_json::to_vec(op).map_err(|e| MembershipError::Raft(e.to_string()))?;
     let (status, bytes) = crate::site_client::post_raft_membership(
@@ -382,6 +512,7 @@ async fn request_inner(
         forwarded,
         target,
         tls,
+        feature,
     )
     .await
     .map_err(MembershipError::Raft)?;
@@ -395,6 +526,17 @@ async fn request_inner(
         200 => serde_json::from_slice(&bytes)
             .map_err(|e| MembershipError::Raft(format!("member view decode: {e}"))),
         409 => {
+            // 同 409 有两种语义：leader 提示（可转发）与 R5/R6 兼容性拒绝（不可重试）。
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            if body["error"] == "peer_incompatible" {
+                return Err(MembershipError::Incompatible(
+                    body["detail"]
+                        .as_str()
+                        .unwrap_or("peer incompatibility")
+                        .into(),
+                ));
+            }
             let hint: LeaderHint = serde_json::from_slice(&bytes).unwrap_or(LeaderHint {
                 leader: None,
                 leader_endpoint: None,

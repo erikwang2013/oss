@@ -147,6 +147,7 @@ async fn setup() -> H {
         write_timeout_ms: 20_000,
         snapshot_max_chunk_size: 4 * 1024 * 1024,
         snapshot_max_bytes: 512 * 1024 * 1024,
+        feature_level: 1,
     };
     let handle = Arc::new(
         oss_server::raft::spawn_with_control(settings, Some(st.db.pool().clone()), None)

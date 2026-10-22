@@ -969,6 +969,7 @@ async fn raft_applies_control_commands_to_guarded_control_db() {
         write_timeout_ms: 20_000,
         snapshot_max_chunk_size: 4 * 1024 * 1024,
         snapshot_max_bytes: 512 * 1024 * 1024,
+        feature_level: 1,
     };
     let handle = oss_server::raft::spawn_with_control(settings, Some(db.pool().clone()), None)
         .await
