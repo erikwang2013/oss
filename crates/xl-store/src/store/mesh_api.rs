@@ -335,6 +335,7 @@ impl Store {
                 &l.bucket,
                 &l.prefix,
                 l.marker.as_deref(),
+                l.marker_exclusive,
                 l.delimiter.as_deref(),
                 l.include_deleted,
                 l.limit,

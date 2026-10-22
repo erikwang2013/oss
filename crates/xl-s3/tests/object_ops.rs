@@ -504,6 +504,302 @@ async fn list_objects_v2_rejects_negative_max_keys() {
 }
 
 #[tokio::test]
+async fn list_objects_v1_empty_bucket_and_max_keys_zero() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let out = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(out.contents.as_ref().unwrap().is_empty());
+    assert_eq!(out.is_truncated, Some(false));
+    assert_eq!(out.max_keys, Some(1000)); // 未指定 → 默认 1000
+    assert_eq!(out.next_marker, None);
+
+    // max-keys=0：空页且不截断（不是被截断的首个空页）
+    let out = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(0),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(out.contents.as_ref().unwrap().is_empty());
+    assert_eq!(out.is_truncated, Some(false));
+    assert_eq!(out.next_marker, None);
+}
+
+#[tokio::test]
+async fn list_objects_v1_prefix_delimiter_marker_paging() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    for k in [
+        "a.txt",
+        "docs/1.txt",
+        "docs/2.txt",
+        "docs/deep/3.txt",
+        "z.txt",
+    ] {
+        s3.put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: k.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    }
+    let keys = |out: &ListObjectsOutput| -> Vec<String> {
+        out.contents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.key.clone())
+            .collect()
+    };
+
+    // prefix + delimiter（与 V2 同结果）
+    let out = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            prefix: Some("docs/".into()),
+            delimiter: Some("/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(keys(&out), ["docs/1.txt", "docs/2.txt"]);
+    assert_eq!(
+        out.common_prefixes.unwrap()[0].prefix.as_deref(),
+        Some("docs/deep/")
+    );
+
+    // 无 delimiter：截断时 NextMarker 不返回，用最后一个 Contents 键续页
+    let page1 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(keys(&page1), ["a.txt", "docs/1.txt"]);
+    assert_eq!(page1.is_truncated, Some(true));
+    assert_eq!(page1.next_marker, None);
+    let mut all = keys(&page1);
+
+    let page2 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(2),
+            marker: Some("docs/1.txt".into()), // 排他：不得重复返回 marker 本身
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(keys(&page2), ["docs/2.txt", "docs/deep/3.txt"]);
+    assert_eq!(page2.is_truncated, Some(true));
+    all.extend(keys(&page2));
+
+    let page3 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(2),
+            marker: Some("docs/deep/3.txt".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(!page3.is_truncated.unwrap());
+    all.extend(keys(&page3));
+    assert_eq!(
+        all,
+        [
+            "a.txt",
+            "docs/1.txt",
+            "docs/2.txt",
+            "docs/deep/3.txt",
+            "z.txt"
+        ]
+    );
+
+    // 带 delimiter：NextMarker 返回最后已返回输出；跟随后不重复 cp
+    let p1 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(1),
+            delimiter: Some("/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(keys(&p1), ["a.txt"]);
+    assert_eq!(p1.next_marker.as_deref(), Some("a.txt"));
+
+    let p2 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(1),
+            delimiter: Some("/".into()),
+            marker: p1.next_marker.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(keys(&p2).is_empty());
+    assert_eq!(
+        p2.common_prefixes.as_ref().unwrap()[0].prefix.as_deref(),
+        Some("docs/")
+    );
+    assert_eq!(p2.next_marker.as_deref(), Some("docs/"));
+
+    let p3 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(1),
+            delimiter: Some("/".into()),
+            marker: p2.next_marker.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(keys(&p3), ["z.txt"]);
+    assert_eq!(p3.common_prefixes.unwrap().len(), 0);
+    assert_eq!(p3.is_truncated, Some(false));
+}
+
+#[tokio::test]
+async fn list_objects_v1_encoding_type_url() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    for k in ["a b.txt", "c(1).png", "中文.txt"] {
+        s3.put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: k.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    }
+
+    let out = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = out
+        .contents
+        .unwrap()
+        .into_iter()
+        .filter_map(|o| o.key)
+        .collect();
+    assert_eq!(
+        keys,
+        ["a%20b.txt", "c%281%29.png", "%E4%B8%AD%E6%96%87.txt"]
+    );
+    assert_eq!(
+        out.encoding_type.as_ref().map(EncodingType::as_str),
+        Some("url")
+    );
+
+    // prefix / delimiter 同样按 encoding-type=url 编码
+    let out = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            prefix: Some("中文".into()),
+            delimiter: Some("/".into()),
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.prefix.as_deref(), Some("%E4%B8%AD%E6%96%87"));
+    assert_eq!(out.delimiter.as_deref(), Some("%2F"));
+}
+
+#[tokio::test]
+async fn list_objects_v1_caps_at_1000_keys_and_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    store.create_bucket("alpha").await.unwrap();
+    for i in 0..1001 {
+        store
+            .put_object("alpha", &format!("k{i:04}"), Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    let s3 = OssS3::new(store, acl().await, 1024 * 1024);
+
+    // max-keys=1001：按 S3 上限钳到 1000（响应回显实际生效值）
+    let page1 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(1001),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(page1.max_keys, Some(1000));
+    assert_eq!(page1.contents.as_ref().unwrap().len(), 1000);
+    assert_eq!(page1.is_truncated, Some(true));
+    assert_eq!(page1.next_marker, None);
+    let last = page1.contents.as_ref().unwrap().last().unwrap().key.clone();
+
+    let page2 = s3
+        .list_objects(req(ListObjectsInput {
+            bucket: "alpha".into(),
+            max_keys: Some(1000),
+            marker: last,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(page2.contents.as_ref().unwrap().len(), 1);
+    assert_eq!(
+        page2.contents.as_ref().unwrap()[0].key.as_deref(),
+        Some("k1000")
+    );
+    assert_eq!(page2.is_truncated, Some(false));
+}
+
+#[tokio::test]
 async fn copy_object_copies_bytes() {
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {

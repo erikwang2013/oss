@@ -2146,6 +2146,7 @@ async fn list_objects(
         delimiter: q.delimiter,
         max_keys: q.limit,
         continuation_token: q.cursor,
+        marker: None,
     };
     match state.store.list_objects(&bucket, &req).await {
         Ok(r) => Json(serde_json::json!({

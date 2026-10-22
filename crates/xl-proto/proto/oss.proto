@@ -51,7 +51,10 @@ message MetaAck { bool ok=1; string msg=2; repeated SlotAck slots=3; uint32 slot
 message MetaRead  { string bucket=1; string key=2; }
 message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4; }
 message BucketRef { string bucket=1; }  message BucketsResp { repeated string names=1; }
-message ListReq { string bucket=1; string prefix=2; string delimiter=3; string marker=4; uint32 limit=5; bool include_deleted=6; }
+message ListReq { string bucket=1; string prefix=2; string delimiter=3; string marker=4; uint32 limit=5;
+                  bool include_deleted=6;
+                  // V1 ListObjects：marker 为排他起点（旧节点忽略 = 包含式，仅影响 v1 续页）
+                  bool marker_exclusive=7; }
 message ListEntry { string key=1; uint64 size=2; string etag=3; int64 max_mod_time_nanos=4; }
 message ListLocalResp { repeated ListEntry entries=1; repeated string prefixes=2; uint32 slots_ok=3; }
 message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4; }

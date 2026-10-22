@@ -136,6 +136,8 @@ pub struct ListLocal {
     pub prefix: String,
     pub delimiter: Option<String>,
     pub marker: Option<String>,
+    /// true = V1 排他 marker；false = V2 包含式 token（默认，兼容旧客户端）。
+    pub marker_exclusive: bool,
     pub limit: usize,
     /// 版本列表：链尾为 delete marker 的键也要返回（对象列表 = false）。
     pub include_deleted: bool,

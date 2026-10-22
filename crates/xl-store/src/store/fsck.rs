@@ -670,6 +670,7 @@ async fn collect_peer_keys(
                     prefix: String::new(),
                     delimiter: None,
                     marker: marker.clone(),
+                    marker_exclusive: false,
                     limit: 1000,
                     include_deleted: false,
                 },
