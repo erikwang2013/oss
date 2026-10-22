@@ -131,18 +131,28 @@ fi
 aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key ck.bin \
   --range bytes=0-1 "$WORK/ck-range.bin" >/dev/null
 
-echo "== 11d. 多区间 Range → 400 InvalidArgument（鉴权后 s3s 解析层拦截）=="
-# 实测（aws-cli 2.37 + 本服务）：鉴权**先于**头部解析——未签名请求被鉴权层拦为 403
-# （XML body <Code>AccessDenied</Code><Message>Signature is required</Message>）；
-# 带鉴权后 s3s 解析层拒多区间 → 400 InvalidArgument（"invalid header: range"）。
-# 原「解析层先于鉴权、未签名 curl 也回 400」的推断不成立，两条契约分别钉住。
+echo "== 11d. 多区间 Range → 降级 200 整对象（S3 面剥离 Range；鉴权仍先拦）=="
+# 鉴权**先于**头部解析：未签名请求仍被鉴权层拦为 403（两条契约分别钉住）。
+# 冻结裁决：多区间 Range 不实现 multipart/byteranges —— router 在 S3 fallback 层剥离
+# Range 头，带鉴权的请求降级为 200 + 整对象（单区间语义不变）。
 UNAUTH_BODY=$(curl -s -H 'Range: bytes=0-1,3-4' "$ENDPOINT/$BUCKET/big.bin")
 echo "$UNAUTH_BODY" | grep -q 'AccessDenied' || { echo "未签名请求应被鉴权层拦为 AccessDenied: $UNAUTH_BODY"; exit 1; }
 UNAUTH=$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-1,3-4' "$ENDPOINT/$BUCKET/big.bin")
 [ "$UNAUTH" = "403" ] || { echo "未签名请求应 403，实际 $UNAUTH"; exit 1; }
-OUT=$(aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key big.bin --range 'bytes=0-1,3-4' "$WORK/multi-range.out" 2>&1) \
-  && { echo "多区间 Range 应 400，却成功: $OUT"; exit 1; }
-echo "$OUT" | grep -q 'InvalidArgument' || { echo "应报 InvalidArgument: $OUT"; exit 1; }
+# 预签名 URL 的 SigV4 只签 host（X-Amz-SignedHeaders=host）：Range 不在签名内，剥离后
+# 签名仍有效 → 200 整对象。
+PRESIGNED=$(aws --endpoint-url "$ENDPOINT" s3 presign "s3://$BUCKET/big.bin" --expires-in 120)
+MULTI_CODE=$(curl -s -o "$WORK/multi-range.out" -w '%{http_code}' -H 'Range: bytes=0-1,3-4' "$PRESIGNED")
+[ "$MULTI_CODE" = "200" ] || { echo "预签名多区间 Range 应 200，实际 $MULTI_CODE"; exit 1; }
+cmp "$WORK/big.bin" "$WORK/multi-range.out" || { echo "多区间 Range 应降级整对象 200"; exit 1; }
+# 已知边界（记档）：aws-cli 把 Range 计入 SigV4 SignedHeaders；头在验签前被剥离 →
+# 403 SignatureDoesNotMatch（AWS 原生 200；要支持签 Range 的客户端需 s3s 内部补丁）。
+OUT=$(aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key big.bin --range 'bytes=0-1,3-4' "$WORK/multi-range-signed.out" 2>&1) \
+  && { echo "签 Range 的 aws-cli 多区间应被签名校验拒绝，却成功: $OUT"; exit 1; }
+echo "$OUT" | grep -q 'SignatureDoesNotMatch' || { echo "应报 SignatureDoesNotMatch: $OUT"; exit 1; }
+# HEAD + Range：200 + 区间长度（1 MiB）
+HEADLEN=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --range 'bytes=1048576-2097151' --query ContentLength --output text)
+[ "$HEADLEN" = "1048576" ] || { echo "HEAD+Range Content-Length 应为 1048576，实际 $HEADLEN"; exit 1; }
 
 echo "== 12. 用户元数据往返（--metadata → head-object 可见）=="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/meta.bin" --metadata foo=bar,lang=zh

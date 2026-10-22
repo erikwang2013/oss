@@ -2121,9 +2121,9 @@ async fn checksum_verified_before_commit_and_written_back() {
 }
 
 #[tokio::test]
-async fn head_with_range_still_returns_full_length() {
-    // 协议补全 Task 4：HEAD 带 Range **不支持**（钉契约防未来静默变化）——
-    // 仍回 200 + 全量 Content-Length（aws-cli/rclone 均不依赖 HEAD+Range 的 206 语义）。
+async fn head_with_range_narrows_length() {
+    // 读路径补全 Task 5：HEAD + Range → 200 + 区间长度/Content-Range（无 206、无 body）；
+    // 越界 → 416 InvalidRange。无 Range 时仍回全量。
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "alpha".into(),
@@ -2139,6 +2139,19 @@ async fn head_with_range_still_returns_full_length() {
     }))
     .await
     .unwrap();
+
+    let full = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "hr".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(full.status, None);
+    assert_eq!(full.output.content_length, Some(100));
+    assert!(full.output.content_range.is_none());
+
     let resp = s3
         .head_object(req(HeadObjectInput {
             bucket: "alpha".into(),
@@ -2153,11 +2166,24 @@ async fn head_with_range_still_returns_full_length() {
         .unwrap();
     // HEAD 路径用 S3Response::new（status None = 隐式 200；GET 才统一 with_status）
     assert_eq!(resp.status, None);
-    assert_eq!(
-        resp.output.content_length,
-        Some(100),
-        "HEAD+Range 仍回全量长度"
-    );
+    assert_eq!(resp.output.content_length, Some(10));
+    assert_eq!(resp.output.content_range.as_deref(), Some("bytes 0-9/100"));
+
+    // 越界 → 416
+    let err = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "hr".into(),
+            range: Some(Range::Int {
+                first: 200,
+                last: Some(299),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
 }
 
 // ---------- M5 切片 3：SSE 线级（P3-c 复验补——P2-a 类接线错此前无闸能抓） ----------

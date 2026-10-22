@@ -2009,6 +2009,11 @@ impl S3 for OssS3 {
                 info.size
             ));
             parts_count = Some(n as i32);
+        } else if let Some(range) = &req.input.range {
+            // HEAD + Range：仍 200（HEAD 无 body/无 206），但头部按区间收窄；越界 416。
+            let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
+            content_length = (rr.end - rr.start) as i64;
+            content_range = Some(format!("bytes {}-{}/{}", rr.start, rr.end - 1, info.size));
         }
         let restore = restore_header(&info);
         // 读路径补全：HEAD 成功 200 才发（304/条件失败/错误已提前返回）
