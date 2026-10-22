@@ -603,12 +603,13 @@ echo "$DOUT" | grep -q '<Key>pub/d1.txt</Key>' || { echo "匿名批量删未删�
 echo "$DOUT" | grep -q 'AccessDenied' || { echo "匿名批量删 Deny 键应 AccessDenied: $DOUT"; exit 1; }
 aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$ANON_BUCKET" --key pub/d1.txt >/dev/null 2>&1 \
   && { echo "pub/d1.txt 应已删"; exit 1; }
-aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$ANON_BUCKET" --key priv/data.txt >/dev/null \
-  || { echo "priv/data.txt 不应被删"; exit 1; }
+# 复核保留键走 ListObjects（Deny * 同样压过管理员，HEAD 会被策略拦成 403 而非 404）
+LS=$(aws_s3 ls --recursive "s3://$ANON_BUCKET/")
+echo "$LS" | grep -q "priv/data.txt" || { echo "priv/data.txt 不应被删"; exit 1; }
 
 echo "--- 17f4. 匿名控制面：策略 Allow 也只放数据面，控制面一律 403 ---"
 for spec in "PUT /$ANON_BUCKET?policy" "DELETE /$ANON_BUCKET" "GET /$ANON_BUCKET?versioning" \
-            "GET /$ANON_BUCKET?list-type=2" "POST /$ANON_BUCKET?uploads"; do
+            "GET /$ANON_BUCKET?list-type=2" "POST /$ANON_BUCKET/pub/mpu.txt?uploads"; do
   m=${spec%% *}; p=${spec#* }
   CODE=$(curl -s -o /dev/null -w '%{http_code}' -X "$m" "$ENDPOINT$p")
   [ "$CODE" = "403" ] || { echo "匿名控制面 $m $p 应 403，实际 $CODE"; exit 1; }
