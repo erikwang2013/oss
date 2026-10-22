@@ -910,7 +910,8 @@ curl -s -X POST $E/api/v1/jobs/1/retry-failed -H "authorization: Bearer $JWT"  #
 ```
 
 - 任务动作：Copy 按 Copy 语义（目标桶/前缀、REPLACE 元数据/标签）；Delete 清 tier refs；
-  ReplaceTags 整体替换标签；Restore 走 S4b 恢复；InvokeLambda 仅 HTTP 变换器。
+  ReplaceTags 整体替换标签；Restore 走 S4b 恢复；InvokeLambda 支持 HTTP 变换器，
+  构建开启 `olap-wasm` 时也支持 WASM（输出丢弃）。
 - 配额：`OSS_JOB_MAX_INFLIGHT_PER_USER`（100）/`OSS_JOB_MAX_INFLIGHT_GLOBAL`（1000）；
   创建期逐行授权（去重），清单/任务上限见错误文案。
 - 报告：`<report_prefix>/<job_id>/results.csv`，固定列
@@ -1038,7 +1039,8 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 2. AP 仅路径前缀；无 `<name>-s3alias`/匿名/跨账号/VPC；不支持 ListBuckets/Create/DeleteBucket/
    DeleteObjects/UploadPartCopy。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
-4. Batch 无抢占/跨账号；InvokeLambda 仅 HTTP；动作不发桶通知但发复制/清 tier。
+4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
+   动作不发桶通知但发复制/清 tier。
 5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
    `symlink.txt`（不含 Athena 建表/分区自动发现）。
 6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期 Filter 仅 prefix、
