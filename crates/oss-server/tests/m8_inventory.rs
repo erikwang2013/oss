@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use common::state;
@@ -401,7 +402,7 @@ async fn validation_matrix_and_per_bucket_limit() {
         .await,
         Err(InventoryError::InvalidArgument(_))
     ));
-    // 格式 Parquet → 501
+    // 未知格式 → 501（CSV/Parquet 已支持）
     assert!(matches!(
         put(
             &st,
@@ -409,7 +410,7 @@ async fn validation_matrix_and_per_bucket_limit() {
             "src",
             &bad(&|c| {
                 c.destination.s3_bucket_destination.format =
-                    InventoryFormat::from("Parquet".to_string())
+                    InventoryFormat::from("ORC".to_string())
             })
         )
         .await,
@@ -536,7 +537,7 @@ async fn console_crud_validation_and_owner_guard() {
             HttpStatus::BAD_REQUEST,
         ),
         (
-            serde_json::json!({"id": "c2", "frequency": "Daily", "destination_bucket": "dst", "format": "Parquet"}),
+            serde_json::json!({"id": "c2", "frequency": "Daily", "destination_bucket": "dst", "format": "ORC"}),
             HttpStatus::NOT_IMPLEMENTED,
         ),
         (
@@ -905,7 +906,7 @@ async fn versions_and_optional_metadata_columns() {
                     None,
                     Default::default(),
                     Some(checksum),
-                    true,
+                    VersioningMode::Enabled,
                     Some(EncSpec::SseS3),
                     Some(lock),
                     None,
@@ -928,7 +929,7 @@ async fn versions_and_optional_metadata_columns() {
         .unwrap();
     // 无版本号删除 → 追加 delete marker（成为 latest）
     st.store
-        .delete_object_versioned("src", "v.txt", None, true)
+        .delete_object_versioned("src", "v.txt", None, VersioningMode::Enabled)
         .await
         .unwrap();
     st.store

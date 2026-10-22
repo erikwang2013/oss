@@ -73,12 +73,13 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 转发、AP CRUD/策略 API；HTTP 变换器默认、WASM 变换器 `olap-wasm` feature 门控）· **作业引擎
 与 Batch Operations（S0/S3）**（`jobs/job_tasks`、`BEGIN IMMEDIATE` 领取、优先级、指数退避、
 超时回收、失败重试子作业、CSV 报告、1000+1 清单与 retry-failed）· **Inventory（S5）**
-（Daily/Weekly 调度、force-run、manifest.json + `data/*.csv.gz`、AWS v1 必含列 + 可选列）·
-**存储类/分层与 Restore（S4a/S4b）**（`storage_class`/`TierState`、Archived/Restoring phase
-gate → 403 `InvalidObjectState`、远端 S3 tier 后端、生命周期 Transition、RestoreObject 异步受理、
-到期回收、`TierGcSink` 删除契约）· **S6 控制台页面与 `tests/e2e_m8.sh`**。
+（Daily/Weekly 调度、force-run、manifest.json + `data/*.csv.gz` / `data/*.parquet`、AWS v1
+必含列 + 可选列、Hive `symlink.txt` 清单）· **存储类/分层与 Restore（S4a/S4b）**（`storage_class`/
+`TierState`、Archived/Restoring phase gate → 403 `InvalidObjectState`、远端 S3 与本地冷盘池
+tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
+管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单。
+CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory 跨账号投递 · Batch 抢占/跨账号清单。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
 （内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
@@ -321,6 +322,39 @@ oss-server rebalance     # 扩容搬迁（默认 dry-run）：存量对象迁到
 - `build` 先清空秒传索引再按盘重建：重建瞬间的并发上传会从「秒传命中」回退为正常上传，不丢数据
 - 未知子命令或非法参数打印用法并 exit 2；命令失败 exit 1
 - 配置文件路径固定为当前目录的 `oss.toml`（原先的 `oss-server <配置路径>` 用法已移除）
+
+## TLS（传输加密）
+
+默认明文（无 `[tls]` 时与旧版行为一致）。配置 `[tls.server]` 后，主 HTTP/S3/控制台监听器、
+witness、Raft RPC、节点间 gRPC mesh、site/repl/tier 出站与 Kafka 全部启用 TLS——单一开关，
+没有「半 TLS」模式。证书在启动时读取并校验；**轮换证书需要重启**（运行期不热加载）。
+
+```toml
+[tls.server]
+cert = "/etc/oss/server.crt"
+key  = "/etc/oss/server.key"
+# 可选：要求并校验客户端证书（mTLS）。共享监听器上的 S3/控制台/Raft 客户端都必须出示。
+client_ca = "/etc/oss/ca.crt"
+
+[tls.client]
+# 出站额外信任根（平台根始终参与校验）；自签/私有 CA 部署时配置。
+ca_cert = "/etc/oss/ca.crt"
+# 可选：出站客户端身份（mTLS，client_cert/client_key 必须成对）。
+client_cert = "/etc/oss/client.crt"
+client_key  = "/etc/oss/client.key"
+```
+
+- 对端地址仍可写 `http://`（集群节点、site endpoint、Raft `advertise_endpoint`、stretch）：
+  连接时按 `[tls.server]` 升级为 https。未启用 `[tls.server]` 时写 `https://` 启动期拒绝
+  （不静默降级明文）。`[listen]` 建议只写 `host:port`。
+- `[[remotes]]`/`[[tiers]]` 的 `endpoint` 支持 `http://`/`https://`；证书主机名与 endpoint
+  不一致时用 `server_name` 覆写（仅 https）。
+- Kafka：`[[kafka.targets]].tls = true` 启用 SSL；`sasl` 支持 PLAIN / SCRAM-SHA-256 /
+  SCRAM-SHA-512，且必须同时 `tls = true`。SNI 固定为 broker 主机名，证书 SAN 必须匹配。
+- mTLS 是共享监听器的 opt-in：启用后**所有**客户端（S3、控制台、Raft、site）都必须带
+  CA 签发的客户端证书；没有 `verify=false` 旁路。
+- 出站（site/repl/tier/Kafka/mesh）始终校验平台根 + `[tls.client].ca_cert`；mTLS 身份用
+  `[tls.client].client_cert/client_key`。
 
 ## 集群模式（M3）
 
@@ -639,6 +673,12 @@ aws --endpoint-url http://127.0.0.1:9000 sts get-session-token --duration-second
 id = "t1"
 brokers = ["127.0.0.1:9092"]
 topic = "oss-events"
+# 可选：TLS / SASL（SASL 必须同时 tls = true；见 TLS 节）
+tls = false
+# [kafka.targets.sasl]
+# mechanism = "scram-sha-512"   # plain（缺省）/ scram-sha-256 / scram-sha-512
+# username = "..."
+# password = "..."
 ```
 
 ```bash
@@ -658,7 +698,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-notification-configura
   连接类错误永不放弃（退避封顶 300s）。Topic 需**预创建**（部署前置；UTOP 不判死）。
 - 无 Kafka 时的调试旁路：`OSS_EVENT_SINK=file:/<dir>`（落文件，测试用）；worker 间隔
   `OSS_EVENT_INTERVAL_SECS`（默认 1；0=关）。
-- 边界：SASL/SSL 未接线（内网假设）；`s3:ObjectAccessed:*` 未实现（配置返回 400）。
+- 边界：`s3:ObjectAccessed:*` 未实现（配置返回 400）；TLS/SASL 见 TLS 节。
 
 ## S3 Select（M6）
 
@@ -692,7 +732,8 @@ aws --endpoint-url http://127.0.0.1:9000 s3api select-object-content \
 ```toml
 [[remotes]]
 id = "r1"
-endpoint = "http://10.0.0.2:9000"   # 仅 http（TLS 未接线，启动期拒绝 https）
+endpoint = "https://10.0.0.2:9000"  # http/https 均可；https 见 TLS 节
+server_name = "s3.internal"           # 可选：证书主机名与 endpoint 不一致时覆写
 access_key = "..."                   # 目标实例上铸造的 AK
 secret_key = "..."
 region = "us-east-1"
@@ -750,7 +791,7 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   marker 入队，删除要求源桶 versioning=Enabled。worker 发送前签名 `GET /{bucket}?versioning`
   （10s 缓存；404/非 Enabled → 可重试），PUT 透传 content-type 与 `x-amz-meta-*`、要求目标返回
   真实 version-id（`null` → 重试）。同版本多目标聚合 PENDING→COMPLETED/FAILED。
-- **边界（记档）**：仅 http（TLS 未接线）；单节点站点对；版本 UUID 两端不一致、版本定向删除
+- **边界（记档）**：对端地址 http/https 均可（peer TLS 见 TLS 节）；单节点站点对；版本 UUID 两端不一致、版本定向删除
   不复制；非空桶删除不生效（保留行与数据，记死信）；锁/标签/SSE 不复制，SSE-C 源永久错；
   AK 密文需两端同主密钥（配对只校验 vault 开关一致，不校验同一把钥）；控制面最终一致（无强一致，
   归 M9）；端点/凭据明文存储；`priority` 仅在**同秒**裁决（新 ts 的低优先级仍胜旧 ts 的高优先级——
@@ -897,25 +938,41 @@ aws --endpoint-url $E s3 cp \
 - 调度：Daily（UTC 日期）/Weekly（ISO 周），worker `OSS_INVENTORY_INTERVAL_SECS`（默认 60，
   0 关闭）；同槽唯一去重，停机只补最近一槽；force-run 供测试/运维（owner/admin）。
 - 输出：`<dest_prefix>/<source_bucket>/<config_id>/<run_key>/manifest.json` +
-  `data/<uuid>.csv.gz`；manifest 含 `sourceBucket/destinationBucket/version/fileSchema/files[]`，
-  `files[]` 的 `size`/`md5Checksum` 是 gzip 后字节数与 MD5（base64，对齐 AWS v1）。
+  `data/<uuid>.csv.gz`（CSV）或 `data/<uuid>.parquet`（Parquet）；manifest 含
+  `sourceBucket/destinationBucket/version/fileFormat/fileSchema/files[]`，`files[]` 的
+  `size`/`md5Checksum` 是落盘文件字节数与 MD5（base64，对齐 AWS v1）。
+- Parquet：无 Arrow 依赖的低层 writer，SNAPPY 压缩、8192 行/行组；列名用 AWS Inventory 的
+  lower_snake_case（`bucket,key,version_id,is_latest,is_delete_marker,size,last_modified_date,
+  e_tag,storage_class,...`），`last_modified_date` 为 TIMESTAMP_MILLIS；`fileSchema` 是
+  Hive/Athena 可读的 Parquet schema 文本。
+- Hive 清单：每次运行同写 `<run_key>/hive/dt=YYYY-MM-DD-HH-MM/symlink.txt`（UTC），内容为
+  一行 `s3://<dest>/<data_key>`，供 Athena SymlinkTextInputFormat 读取；与数据/manifest 同样
+  套用目标桶默认加密。CSV 与 Parquet 共用该清单。
 - 列：必含 9 列 `Bucket,Key,VersionId,IsLatest,DeleteMarker,Size,LastModifiedDate,ETag,StorageClass`；
   可选 6 列按固定顺序追加 `ReplicationStatus,EncryptionStatus,ObjectLockRetainUntilDate,
   ObjectLockMode,ObjectLockLegalHoldStatus,ChecksumAlgorithm`。
-- 边界：全量扫描、单数据文件（gzip 后 ≤5 GiB）、CSV 仅；不做 Parquet/hive/跨账号/增量；
+- 边界：全量扫描、单数据文件（≤5 GiB）、CSV/Parquet；不做跨账号/增量；
   `IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持；可选列可能逐版本 head。
 
 ### 分层 Transition 与 Restore（S4b）
 
 ```toml
-# oss.toml：远端 S3 兼容 tier（仅 http；https 启动期拒绝）
+# oss.toml：远端 S3 兼容 tier（kind 缺省 = s3）
 [[tiers]]
 id = "t1"
-endpoint = "http://127.0.0.1:40125"
+kind = "s3"
+endpoint = "http://127.0.0.1:40125"   # http/https
 bucket = "cold"
 access_key = "TIERAK"
 secret_key = "TIERSK"
 region = "us-east-1"
+
+# 本地冷盘池：落盘 <path>/<tier_id>/<bucket>/<version_id>/<raw key>；
+# 同目录临时文件 + fsync + rename，路径段拒绝绝对路径/`..`/NUL。
+[[tiers]]
+id = "local1"
+kind = "local"
+path = "/var/lib/oss/cold"
 ```
 
 ```bash
@@ -925,7 +982,12 @@ aws --endpoint-url $E s3api put-bucket-lifecycle-configuration --bucket b \
     "Transitions":[{"Days":0,"StorageClass":"GLACIER"}]}]}'
 aws --endpoint-url $E s3api get-bucket-lifecycle-configuration --bucket b   # 回读往返
 curl -s -X POST $E/api/v1/tiers/sweep -H "authorization: Bearer $JWT"      # {"queued":n}
-curl -s $E/api/v1/tiers -H "authorization: Bearer $JWT"                    # [{id,endpoint,bucket,healthy}]
+curl -s $E/api/v1/tiers -H "authorization: Bearer $JWT"                    # [{id,kind,path,endpoint,bucket,healthy}]
+# 远端 GC/对账：默认 dry-run；真删必须显式 dry_run=false
+curl -s -X POST $E/api/v1/tiers/gc -H "authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{"dry_run":true,"grace_days":7}'
+curl -s -X POST $E/api/v1/tiers/gc -H "authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{"dry_run":false,"tier":"t1","grace_days":7,"max_deletes":1000}'
 
 aws --endpoint-url $E s3api head-object --bucket b --key k                 # StorageClass=GLACIER
 aws --endpoint-url $E s3api get-object --bucket b --key k out              # 403 InvalidObjectState
@@ -947,8 +1009,16 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
   router 层中间件把 POST `?restore` 的 200 改写为 202（错误状态与其它请求原样透传）。
 - 到期回收：reaper `OSS_TIER_REAPER_INTERVAL_SECS`（默认 300），精度约 300s；过期后回到
   Archived（GET 再次 403）。启动时对账 pending/restored 行与 Version。
-- 边界：tier 仅远端 S3（无本地冷盘池）、endpoint 仅 http、无远端 GC/对账（删除 best-effort，
-  失败留孤儿）；SSE 对象不 Transition；归档对象复制/站点复制不可用（先 Restore）。
+- 本地冷盘池（`kind = "local"`）：`put` 写同目录 `.<name>.tmp-<uuid>` + `fsync` + `rename`，
+  校验 MD5（ETag 为 32 位 hex 时）；`head` 在根目录缺失时返回错误（控制台 health 为 false）；
+  启动后可直接读回已落盘对象，并清理同目录崩溃残留；`delete` 自底向上删空目录。
+- 远端 GC/对账（`POST /api/v1/tiers/gc`，仅管理员）：先列远端、再全量扫本地版本 meta；
+  任一 list/扫描失败整轮中止且不删除；live `TierRef` 永不删除；只删 `<tier_id>/` 前缀内、
+  年龄 ≥ `grace_days`（默认 7）的对象；每轮最多 `max_deletes`（默认 1000）；删除失败逐条返回
+  并保留待下轮；`missing_live` 只提示 live 引用在远端缺失，不写任何数据。`dry_run` 默认 true。
+- 边界：tier 支持远端 S3 与本地冷盘池；全内存搬运；无自动定时 GC（须管理员显式触发）；
+  远端删除仍 best-effort，失败留孤儿待 GC 重试；SSE 对象不 Transition；归档对象复制/站点
+  复制不可用（先 Restore）。
 
 ### 控制台页面（S6）
 
@@ -971,11 +1041,12 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
 4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
    动作不发桶通知但发复制/清 tier。
-5. Inventory 全量扫描、CSV 单文件；不做 Parquet/hive/跨账号/增量。
-6. 分层 v1 仅远端 S3 tier（http）、全内存搬运；S3 生命周期 Filter 仅 prefix、
+5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
+   `symlink.txt`（不含 Athena 建表/分区自动发现）。
+6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期 Filter 仅 prefix、
    Expiration/Transition 仅 days，date/tag/size/And/noncurrent/abort → 501；单规则单目标类。
-7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort，
-   无 GC/对账；恢复到期精度约 300s。
+7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort；
+   GC/对账仅管理员显式触发（默认 dry-run），无自动定时 GC；恢复到期精度约 300s。
 8. 作业状态库内 `done/error`（映射 Completed/Failed）；取消时未执行任务不进报告；
    CSV 不做公式转义。
 9. RestoreObject 的 202 由 router 层中间件补写（s3s 0.17 生成代码丢弃
@@ -1236,8 +1307,9 @@ db_path = "/var/lib/oss/raft.db"
 
 ### 部署与安全边界
 
-- 当前 Raft/site/mesh 传输均为**明文 HTTP/gRPC（TLS 未接线）**：只能部署在受控私网，
-  或用外部 TLS 终结/隧道；`cluster_token`、`site.token`、`mesh_secret` 不得出现在公网。
+- Raft/site/mesh 传输默认明文；生产部署应配置 `[tls.server]`（见 TLS 节）启用全链路
+  TLS/mTLS。未启用时只能部署在受控私网或外部 TLS 终结/隧道；`cluster_token`、`site.token`、
+  `mesh_secret` 不得出现在公网。
 - 能力开关已翻（`RAFT_READY`/`SYNC_READY`/`STRETCH_READY=true`）。控制面支持 1–3 voters：
   A/B 配对后 2 voters，`raft-add-witness` 加 C 后 3 voters（quorum 2，`production_ready=true`）；
   单节点 bootstrap 仍可用于开发。`tests/e2e_m9.sh`（3 进程）与 `tests/e2e_stretch.sh`
@@ -1273,7 +1345,8 @@ M8 测试锚：
 cargo test -p xl-store --lib            # 标签/storage_class/tier phase/DeleteOutcome tier refs
 cargo test -p xl-s3 --lib               # AP/OLAP/restore/lifecycle/inventory 形校验 + 策略矩阵
 cargo test -p oss-server --lib          # 0003 迁移/补列/AP CRUD/作业状态机/Inventory/tier 调度
-cargo test -p oss-server --test m8_ap --test m8_batch --test m8_tier --test m8_lifecycle_api
+cargo test -p oss-server --test m8_ap --test m8_batch --test m8_tier --test m8_lifecycle_api \
+  --test m8_inventory_parquet --test m8_tier_gc
 cargo test -p oss-server --test jobs_engine --test console_api
 cargo test -p xl-s3 --features olap-wasm   # WASM 变换器（需 wasmtime 环境）
 # S3 标签 + Copy 指令在 tests/e2e_s3.sh 步骤 20（已含于全量脚本）

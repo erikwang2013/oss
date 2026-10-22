@@ -22,7 +22,7 @@ use xl_s3::restore::RestoreSink;
 use xl_s3::sse::enc_spec_from_default;
 use xl_s3::tier_gc::TierGcSink;
 use xl_store::meta::ObjectTag;
-use xl_store::store::{DeleteOutcome, Store};
+use xl_store::store::{DeleteOutcome, Store, VersioningMode};
 
 use crate::db::Db;
 use crate::jobs::TaskExecutor;
@@ -237,11 +237,11 @@ impl BatchExecutor {
         }
     }
 
-    async fn versioned(&self, bucket: &str) -> Result<bool, String> {
+    async fn versioning_mode(&self, bucket: &str) -> Result<VersioningMode, String> {
         self.db
             .get_bucket_versioning(bucket)
             .await
-            .map(|s| s == "Enabled")
+            .map(|s| VersioningMode::from_status(&s))
             .map_err(|e| e.to_string())
     }
 
@@ -300,7 +300,7 @@ impl BatchExecutor {
             None => self.store.get_object_ext(&p.bucket, &p.key, None).await,
         }
         .map_err(|e| e.to_string())?;
-        let versioned = self.versioned(dst_bucket).await?;
+        let mode = self.versioning_mode(dst_bucket).await?;
         // M8 缺口 C：Batch Copy 无显式 SSE 入口，直接套目标桶默认加密
         let encryption = match self
             .acl
@@ -324,7 +324,7 @@ impl BatchExecutor {
                 info.content_type.clone(),
                 info.user_metadata.clone(),
                 None,
-                versioned,
+                mode,
                 encryption,
                 None,
                 tags,
@@ -352,12 +352,12 @@ impl BatchExecutor {
     async fn delete(&self, p: &BatchActionPayload) -> Result<String, String> {
         self.author(p, "DeleteObject", &p.bucket, &p.key, None)
             .await?;
-        let versioned = self.versioned(&p.bucket).await?;
+        let mode = self.versioning_mode(&p.bucket).await?;
         // M9 S3：sync 桶远端优先（batch 不直连 store.delete_*）；async 桶行为不变。
         let outcome = self
             .hooks
             .sync_delete
-            .delete_versioned(&p.bucket, &p.key, p.version_id.as_deref(), versioned, false)
+            .delete_versioned(&p.bucket, &p.key, p.version_id.as_deref(), mode, false)
             .await
             .map_err(|e| e.to_string())?;
         let refs = match outcome {

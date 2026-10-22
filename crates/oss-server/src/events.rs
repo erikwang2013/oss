@@ -195,18 +195,32 @@ fn kafka_now() -> rskafka::chrono::DateTime<rskafka::chrono::Utc> {
 struct KafkaRoute {
     brokers: Vec<String>,
     topic: String,
+    tls: bool,
+    sasl: Option<crate::tls_config::KafkaSaslToml>,
 }
 
-/// Kafka 通知器：target id → `[[kafka.targets]]` 静态映射；Client 按 broker 集惰性建连并缓存。
+/// Kafka 通知器：target id → `[[kafka.targets]]` 静态映射；Client 按 target id
+/// 惰性建连并缓存（TLS/SASL 不同的目标不得共享连接）。
 pub struct KafkaNotifier {
     routes: std::collections::HashMap<String, KafkaRoute>,
     clients: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<rskafka::client::Client>>,
     >,
+    tls: std::sync::Arc<crate::tls::Tls>,
 }
 
 impl KafkaNotifier {
     pub fn new(targets: &[crate::config::KafkaTarget]) -> Self {
+        let tls = crate::tls::Tls::load(&crate::tls_config::TlsToml::default())
+            .expect("空 TLS 配置不会失败");
+        Self::new_with_tls(targets, tls)
+    }
+
+    /// 注入进程 TLS 物料（Kafka TLS 使用自定义 CA/客户端身份）。
+    pub fn new_with_tls(
+        targets: &[crate::config::KafkaTarget],
+        tls: std::sync::Arc<crate::tls::Tls>,
+    ) -> Self {
         let routes = targets
             .iter()
             .map(|t| {
@@ -215,6 +229,8 @@ impl KafkaNotifier {
                     KafkaRoute {
                         brokers: t.brokers.clone(),
                         topic: t.topic.clone(),
+                        tls: t.tls,
+                        sasl: t.sasl.clone(),
                     },
                 )
             })
@@ -222,13 +238,14 @@ impl KafkaNotifier {
         Self {
             routes,
             clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            tls,
         }
     }
 
     async fn client_for(
         &self,
         key: &str,
-        brokers: &[String],
+        route: &KafkaRoute,
     ) -> Result<std::sync::Arc<rskafka::client::Client>, NotifyFailure> {
         // 双检：先读缓存，miss 则持锁建连（并发首用只建一次）
         if let Some(c) = self.clients.lock().await.get(key) {
@@ -243,11 +260,23 @@ impl KafkaNotifier {
             base: 2.0,
             deadline: Some(std::time::Duration::from_secs(5)),
         };
-        let built = rskafka::client::ClientBuilder::new(brokers.to_vec())
-            .backoff_config(backoff)
-            .build()
-            .await
-            .map_err(|e| classify_kafka_err(&e))?;
+        let mut builder =
+            rskafka::client::ClientBuilder::new(route.brokers.clone()).backoff_config(backoff);
+        if route.tls {
+            let cfg = self.tls.kafka_config().map_err(NotifyFailure::permanent)?;
+            builder = builder.tls_config(cfg);
+        }
+        if let Some(sasl) = &route.sasl {
+            let creds =
+                rskafka::client::Credentials::new(sasl.username.clone(), sasl.password.clone());
+            let cfg = match sasl.mechanism.as_str() {
+                "scram-sha-256" => rskafka::client::SaslConfig::ScramSha256(creds),
+                "scram-sha-512" => rskafka::client::SaslConfig::ScramSha512(creds),
+                _ => rskafka::client::SaslConfig::Plain(creds),
+            };
+            builder = builder.sasl_config(cfg);
+        }
+        let built = builder.build().await.map_err(|e| classify_kafka_err(&e))?;
         let shared = std::sync::Arc::new(built);
         self.clients
             .lock()
@@ -266,8 +295,7 @@ impl Notifier for KafkaNotifier {
                 "unknown kafka target id: {target:?} (check [[kafka.targets]])"
             )));
         };
-        let brokers_key = route.brokers.join(",");
-        let client = self.client_for(&brokers_key, &route.brokers).await?;
+        let client = self.client_for(target, route).await?;
         let pc = client
             .partition_client(route.topic.clone(), 0, UnknownTopicHandling::Error)
             .await
@@ -287,10 +315,19 @@ impl Notifier for KafkaNotifier {
 }
 
 /// 装配口径（切片 1）：`[[kafka.targets]]` 非空 → Kafka 优先；否则退回 env 文件 sink / Noop
-/// （切片 0 行为）。SASL/SSL 未接线（记档——rskafka 支持后加）。
+/// （切片 0 行为）。TLS/SASL 由目标级 `tls`/`sasl` 开关启用。
 pub fn notifier_from_config(targets: &[crate::config::KafkaTarget]) -> Arc<dyn Notifier> {
+    let tls =
+        crate::tls::Tls::load(&crate::tls_config::TlsToml::default()).expect("空 TLS 配置不会失败");
+    notifier_from_config_tls(targets, tls)
+}
+
+pub fn notifier_from_config_tls(
+    targets: &[crate::config::KafkaTarget],
+    tls: std::sync::Arc<crate::tls::Tls>,
+) -> Arc<dyn Notifier> {
     if !targets.is_empty() {
-        return Arc::new(KafkaNotifier::new(targets));
+        return Arc::new(KafkaNotifier::new_with_tls(targets, tls));
     }
     notifier_from_env()
 }
@@ -1154,6 +1191,8 @@ mod tests {
             id: "t1".into(),
             brokers: vec!["127.0.0.1:1".into()],
             topic: "x".into(),
+            tls: false,
+            sasl: None,
         }]);
         let f = n.send("nope", "{}").await.unwrap_err();
         assert!(f.permanent);
@@ -1167,6 +1206,8 @@ mod tests {
             id: "t1".into(),
             brokers: vec!["127.0.0.1:1".into()],
             topic: "x".into(),
+            tls: false,
+            sasl: None,
         }]);
         let started = std::time::Instant::now();
         let f = n.send("t1", "{}").await.unwrap_err();

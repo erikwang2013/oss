@@ -121,10 +121,10 @@ pub fn validate_config(cfg: &InventoryConfiguration) -> Result<(), InventoryErro
             "destination bucket 为空".into(),
         ));
     }
-    if dest.format.as_str() != InventoryFormat::CSV {
+    let format = dest.format.as_str();
+    if format != InventoryFormat::CSV && format != InventoryFormat::PARQUET {
         return Err(InventoryError::NotImplemented(format!(
-            "inventory format {}",
-            dest.format.as_str()
+            "inventory format {format}"
         )));
     }
     if dest.encryption.is_some() {

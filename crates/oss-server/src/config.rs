@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tls_config::{TlsToml, normalize_peer_addr, parse_endpoint};
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub listen: String,
@@ -50,6 +52,9 @@ pub struct AppConfig {
     /// M9：`[stretch]` 2×6 stretch EC 预设（要求 `[site]` + `[raft]`；与 `[cluster]` 互斥）。
     #[serde(default)]
     pub stretch: Option<StretchToml>,
+    /// TLS：`[tls.server]` 存在 = 集群/站点/mesh/Raft 全链路启用；`[tls.client]` 补充出站信任。
+    #[serde(default)]
+    pub tls: TlsToml,
 }
 
 /// `[raft]`：3-voter 控制面运行时参数。`advertise_endpoint` 是主 HTTP（Raft RPC 路由），
@@ -96,14 +101,18 @@ pub struct RaftToml {
 
 impl RaftToml {
     /// serve/witness 共用校验：node_id、token、advertise、快照上限。
-    pub fn validate_common(&self) -> Result<(), String> {
+    pub fn validate_common(&self, peer_tls: bool) -> Result<(), String> {
         if self.node_id == 0 {
             return Err("[raft].node_id 必须 > 0".into());
         }
         if self.cluster_token.trim().is_empty() {
             return Err("[raft].cluster_token 不能为空".into());
         }
-        normalize_http_addr(&self.advertise_endpoint, "[raft].advertise_endpoint")?;
+        let (_, https) =
+            normalize_peer_addr(&self.advertise_endpoint, "[raft].advertise_endpoint")?;
+        if https && !peer_tls {
+            return Err("[raft].advertise_endpoint 为 https，但缺少 [tls.server]".into());
+        }
         if self.snapshot_max_chunk_size == 0 || self.snapshot_max_chunk_size > 4 * 1024 * 1024 {
             return Err(format!(
                 "[raft].snapshot_max_chunk_size 必须在 1..=4 MiB，实际 {}",
@@ -170,6 +179,9 @@ pub struct StretchToml {
 #[serde(deny_unknown_fields)]
 pub struct WitnessToml {
     pub raft: RaftToml,
+    /// witness 的 Raft RPC 监听 TLS（语义同 serve：server 节存在即 https）。
+    #[serde(default)]
+    pub tls: TlsToml,
 }
 
 impl WitnessToml {
@@ -195,7 +207,8 @@ impl WitnessToml {
         if r.db_path.is_none() {
             return Err("witness 配置缺少 [raft].db_path".into());
         }
-        r.validate_common()
+        self.tls.validate()?;
+        r.validate_common(self.tls.peer_tls())
     }
 }
 
@@ -239,46 +252,19 @@ fn default_mesh_timeout_ms() -> u64 {
     5_000
 }
 
-/// 接受 `host:port` / `http://host:port`；拒绝 https、path/query/userinfo、空 host/port。
-/// 返回小写 host 的 `host:port`（TonicMesh 会自行再拼 `http://`）。
+/// 接受 `host:port` / `http://host:port` / `https://host:port`；拒绝 path/query/userinfo、
+/// 空 host/port。返回小写 host 的 `host:port`（scheme 由 TLS 模式统一裁决）。
 pub(crate) fn normalize_http_addr(raw: &str, field: &str) -> Result<String, String> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return Err(format!("{field} 不能为空"));
-    }
-    let rest = if let Some(r) = s.strip_prefix("http://") {
-        r
-    } else if s.contains("://") {
-        return Err(format!(
-            "{field} 必须是 host:port 或 http://host:port（TLS/其他协议未接线）：{raw}"
-        ));
-    } else {
-        s
-    };
-    if rest.is_empty()
-        || rest.contains('/')
-        || rest.contains('?')
-        || rest.contains('#')
-        || rest.contains('@')
-    {
-        return Err(format!(
-            "{field} 非法：{raw:?}（不接受 path/query/userinfo，需 host:port）"
-        ));
-    }
-    let (host, port) = rest
-        .rsplit_once(':')
-        .ok_or_else(|| format!("{field} 缺少端口：{raw:?}"))?;
-    if host.is_empty() || port.is_empty() || port.parse::<u16>().ok().filter(|p| *p != 0).is_none()
-    {
-        return Err(format!("{field} 的 host/port 非法：{raw:?}"));
-    }
-    Ok(format!("{}:{port}", host.to_ascii_lowercase()))
+    normalize_peer_addr(raw, field).map(|(host_port, _)| host_port)
 }
 
 /// `[listen]` 的 host:port 解析（端口 0 合法：测试/临时端口部署）。
 fn listen_host_port(raw: &str) -> Option<(String, u16)> {
     let s = raw.trim();
-    let rest = s.strip_prefix("http://").unwrap_or(s);
+    let rest = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
     let (host, port) = rest.rsplit_once(':')?;
     if host.is_empty() {
         return None;
@@ -286,17 +272,48 @@ fn listen_host_port(raw: &str) -> Option<(String, u16)> {
     Some((host.to_ascii_lowercase(), port.parse::<u16>().ok()?))
 }
 
-/// `[[tiers]]`：归档远端。模型同 `[[remotes]]`，另加目标桶。
+/// tier 存储形态：`s3`（默认，旧行为）或本地冷盘池 `local`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TierKind {
+    #[default]
+    S3,
+    Local,
+}
+
+impl TierKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// `[[tiers]]`：归档远端或本地冷盘池。`s3` 用 endpoint/bucket/AK/SK；
+/// `local` 只用 `path`（远端字段留空）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TierTarget {
     pub id: String,
+    #[serde(default)]
+    pub kind: TierKind,
+    /// 本地冷盘池根目录（仅 `kind = "local"`）。
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
     pub endpoint: String,
+    #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
     pub access_key: String,
+    #[serde(default)]
     pub secret_key: String,
     #[serde(default = "default_region")]
     pub region: String,
+    /// TLS 证书主机名覆写（仅 https；缺省用 endpoint 的 host）。
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 /// `[site]`：本站点身份覆盖（缺省由首启种子生成）。`token` 为控制面通道共享密钥
@@ -337,7 +354,7 @@ impl Default for SiteToml {
 pub struct RemoteTarget {
     /// 规则 Destination 引用的 id（白名单 `[A-Za-z0-9._-]{1,64}`）
     pub id: String,
-    /// 目标 S3 端点基址（http；TLS 未接线，https 启动期拒绝）
+    /// 目标 S3 端点基址（http/https；https 由 TLS 客户端连接）
     pub endpoint: String,
     pub access_key: String,
     pub secret_key: String,
@@ -346,6 +363,9 @@ pub struct RemoteTarget {
     /// M8 缺口 C：出站复制带宽上限（字节/秒；None = 不限，行为与旧版完全一致）。
     #[serde(default)]
     pub max_bytes_per_sec: Option<u64>,
+    /// TLS 证书主机名覆写（仅 https；缺省用 endpoint 的 host）。
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 fn default_region() -> String {
@@ -368,6 +388,12 @@ pub struct KafkaTarget {
     pub id: String,
     pub brokers: Vec<String>,
     pub topic: String,
+    /// 启用 TLS（broker 证书须包含 broker 主机名；无 SNI 覆写）。
+    #[serde(default)]
+    pub tls: bool,
+    /// SASL 认证（要求 tls=true；rskafka PLAIN/SCRAM）。
+    #[serde(default)]
+    pub sasl: Option<crate::tls_config::KafkaSaslToml>,
 }
 
 /// `[cluster]`：扁平静态拓扑（设计 §5.3——无 DC/Region/AZ，M3+ 同样适用）。
@@ -452,6 +478,8 @@ impl AppConfig {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
         let cfg: Self = toml::from_str(&text)?;
+        cfg.tls_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.kafka_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.remotes_validate()
@@ -463,6 +491,21 @@ impl AppConfig {
         cfg.raft_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
+    }
+
+    /// TLS 模式与监听地址 scheme 一致性；证书物料在 AppState::load 读取（witness 在 run 中）。
+    pub fn tls_validate(&self) -> Result<(), String> {
+        self.tls.validate()?;
+        let listen = self.listen.trim();
+        if listen.starts_with("https://") && !self.tls.peer_tls() {
+            return Err("[listen] 为 https://，但缺少 [tls.server]".into());
+        }
+        if listen.starts_with("http://") && self.tls.peer_tls() {
+            return Err(
+                "[listen] 配置了 http:// 但已启用 [tls.server]；监听地址请写 host:port".into(),
+            );
+        }
+        Ok(())
     }
 
     /// M6 切片 1（P3-f）：`[[kafka.targets]]` 校验——id 白名单/唯一、brokers/topic 非空。
@@ -491,6 +534,15 @@ impl AppConfig {
             if t.topic.trim().is_empty() {
                 return Err(format!("[[kafka.targets]] {} 的 topic 不能为空", t.id));
             }
+            if let Some(sasl) = &t.sasl {
+                if !t.tls {
+                    return Err(format!(
+                        "[[kafka.targets]] {} 配置了 sasl 但 tls=false（SASL 必须走 TLS）",
+                        t.id
+                    ));
+                }
+                sasl.validate(&t.id)?;
+            }
         }
         Ok(())
     }
@@ -515,16 +567,18 @@ impl AppConfig {
             if !seen.insert(r.id.clone()) {
                 return Err(format!("[[remotes]] id 重复：{}", r.id));
             }
-            let uri: hyper::Uri = r
-                .endpoint
-                .parse()
-                .map_err(|_| format!("[[remotes]] {} 的 endpoint 非法：{}", r.id, r.endpoint))?;
-            // 仅 http：出站客户端无 TLS（记档）；https 在启动期 fail-closed，避免运行期死信
-            if uri.scheme_str() != Some("http") || uri.host().is_none() {
-                return Err(format!(
-                    "[[remotes]] {} 的 endpoint 必须是 http://host[:port]（TLS 未接线）：{}",
-                    r.id, r.endpoint
-                ));
+            let ep = parse_endpoint(&r.endpoint, &format!("[[remotes]] {} 的 endpoint", r.id))?;
+            if let Some(sn) = &r.server_name {
+                if !ep.https {
+                    return Err(format!(
+                        "[[remotes]] {} 的 server_name 仅适用于 https 端点",
+                        r.id
+                    ));
+                }
+                crate::tls_config::validate_server_name(
+                    sn,
+                    &format!("[[remotes]] {} 的 server_name", r.id),
+                )?;
             }
             if r.access_key.trim().is_empty() || r.secret_key.trim().is_empty() {
                 return Err(format!(
@@ -568,27 +622,69 @@ impl AppConfig {
             if !seen.insert(t.id.clone()) {
                 return Err(format!("[[tiers]] id 重复：{}", t.id));
             }
-            let uri: hyper::Uri = t
-                .endpoint
-                .parse()
-                .map_err(|_| format!("[[tiers]] {} 的 endpoint 非法：{}", t.id, t.endpoint))?;
-            if uri.scheme_str() != Some("http") || uri.host().is_none() {
-                return Err(format!(
-                    "[[tiers]] {} 的 endpoint 必须是 http://host[:port]（TLS 未接线）：{}",
-                    t.id, t.endpoint
-                ));
-            }
-            if t.bucket.trim().is_empty() {
-                return Err(format!("[[tiers]] {} 的 bucket 不能为空", t.id));
-            }
-            if t.access_key.trim().is_empty() || t.secret_key.trim().is_empty() {
-                return Err(format!(
-                    "[[tiers]] {} 的 access_key/secret_key 不能为空",
-                    t.id
-                ));
-            }
-            if t.region.trim().is_empty() {
-                return Err(format!("[[tiers]] {} 的 region 不能为空", t.id));
+            match t.kind {
+                TierKind::Local => {
+                    let Some(path) = t.path.as_ref() else {
+                        return Err(format!("[[tiers]] {}（local）必须配置 path", t.id));
+                    };
+                    if path.as_os_str().is_empty() {
+                        return Err(format!("[[tiers]] {} 的 path 不能为空", t.id));
+                    }
+                    if !t.endpoint.trim().is_empty()
+                        || !t.bucket.trim().is_empty()
+                        || !t.access_key.trim().is_empty()
+                        || !t.secret_key.trim().is_empty()
+                        || t.server_name.is_some()
+                    {
+                        return Err(format!(
+                            "[[tiers]] {}（local）不得配置 endpoint/bucket/access_key/secret_key/server_name",
+                            t.id
+                        ));
+                    }
+                    if let Ok(md) = std::fs::metadata(path)
+                        && !md.is_dir()
+                    {
+                        return Err(format!(
+                            "[[tiers]] {} 的 path 不是目录：{}",
+                            t.id,
+                            path.display()
+                        ));
+                    }
+                }
+                TierKind::S3 => {
+                    if t.path.is_some() {
+                        return Err(format!(
+                            "[[tiers]] {}（s3）不得配置 path（path 仅用于 local）",
+                            t.id
+                        ));
+                    }
+                    let ep =
+                        parse_endpoint(&t.endpoint, &format!("[[tiers]] {} 的 endpoint", t.id))?;
+                    if let Some(sn) = &t.server_name {
+                        if !ep.https {
+                            return Err(format!(
+                                "[[tiers]] {} 的 server_name 仅适用于 https 端点",
+                                t.id
+                            ));
+                        }
+                        crate::tls_config::validate_server_name(
+                            sn,
+                            &format!("[[tiers]] {} 的 server_name", t.id),
+                        )?;
+                    }
+                    if t.bucket.trim().is_empty() {
+                        return Err(format!("[[tiers]] {} 的 bucket 不能为空", t.id));
+                    }
+                    if t.access_key.trim().is_empty() || t.secret_key.trim().is_empty() {
+                        return Err(format!(
+                            "[[tiers]] {} 的 access_key/secret_key 不能为空",
+                            t.id
+                        ));
+                    }
+                    if t.region.trim().is_empty() {
+                        return Err(format!("[[tiers]] {} 的 region 不能为空", t.id));
+                    }
+                }
             }
         }
         Ok(())
@@ -654,7 +750,7 @@ impl AppConfig {
             if !self.groups.is_empty() {
                 return Err("[raft] 与 [[groups]] 互斥（guard 会拒绝分组桶写入）".into());
             }
-            r.validate_common()?;
+            r.validate_common(self.tls.peer_tls())?;
         }
         self.stretch_validate()
     }
@@ -694,12 +790,18 @@ impl AppConfig {
         if s.node_id == s.peer_node_id {
             return Err("[stretch].node_id 与 peer_node_id 不能相同".into());
         }
-        let self_addr = normalize_http_addr(&s.self_addr, "[stretch].self_addr")?;
-        let peer_addr = normalize_http_addr(&s.peer_addr, "[stretch].peer_addr")?;
+        let (self_addr, self_https) = normalize_peer_addr(&s.self_addr, "[stretch].self_addr")?;
+        let (peer_addr, peer_https) = normalize_peer_addr(&s.peer_addr, "[stretch].peer_addr")?;
+        let (advertise, adv_https) =
+            normalize_peer_addr(&r.advertise_endpoint, "[raft].advertise_endpoint")?;
+        if (self_https || peer_https || adv_https) && !self.tls.peer_tls() {
+            return Err(
+                "[stretch]/[raft] 地址为 https，但缺少 [tls.server]（拒绝明文降级）".into(),
+            );
+        }
         if self_addr == peer_addr {
             return Err("[stretch].self_addr 与 peer_addr 不能相同".into());
         }
-        let advertise = normalize_http_addr(&r.advertise_endpoint, "[raft].advertise_endpoint")?;
         if advertise == self_addr {
             return Err(
                 "[stretch].self_addr 不能与 [raft].advertise_endpoint 同端口（主 HTTP 与 mesh gRPC 必须分离）"
@@ -931,6 +1033,7 @@ mod tests {
             raft: None,
             sync: Default::default(),
             stretch: None,
+            tls: Default::default(),
         }
     }
 
@@ -1020,6 +1123,7 @@ mod tests {
             secret_key: "sk".into(),
             region: "us-east-1".into(),
             max_bytes_per_sec: None,
+            server_name: None,
         };
         let cfg = |remotes| {
             let mut c = base_cfg();
@@ -1031,11 +1135,16 @@ mod tests {
                 .remotes_validate()
                 .is_ok()
         );
-        // https 在启动期 fail-closed（出站客户端无 TLS，记档）
         assert!(
             cfg(vec![mk("r1", "https://s3.example.com")])
                 .remotes_validate()
-                .is_err()
+                .is_ok()
+        );
+        let mut e = mk("r1", "http://h:1");
+        e.server_name = Some("s3.example.com".into());
+        assert!(
+            cfg(vec![e]).remotes_validate().is_err(),
+            "server_name 仅 https"
         );
         // 非法 id / 重复 / 坏 endpoint / 非 http(s) / 空凭证
         assert!(
@@ -1084,11 +1193,14 @@ mod tests {
     fn tiers_validation_matrix() {
         let mk = |id: &str, endpoint: &str| TierTarget {
             id: id.into(),
+            kind: TierKind::S3,
+            path: None,
             endpoint: endpoint.into(),
             bucket: "tb".into(),
             access_key: "ak".into(),
             secret_key: "sk".into(),
             region: "us-east-1".into(),
+            server_name: None,
         };
         let cfg = |tiers| {
             let mut c = base_cfg();
@@ -1100,11 +1212,16 @@ mod tests {
                 .tiers_validate()
                 .is_ok()
         );
-        // https 启动期 fail-closed（出站无 TLS）
         assert!(
             cfg(vec![mk("cold", "https://s3.example.com")])
                 .tiers_validate()
-                .is_err()
+                .is_ok()
+        );
+        let mut e = mk("cold", "http://h:1");
+        e.server_name = Some("s3.example.com".into());
+        assert!(
+            cfg(vec![e]).tiers_validate().is_err(),
+            "server_name 仅 https"
         );
         assert!(
             cfg(vec![mk("cold", "http://h:1"), mk("cold", "http://h:2")])
@@ -1119,6 +1236,43 @@ mod tests {
         let mut e = mk("cold", "http://h:1");
         e.bucket = " ".into();
         assert!(cfg(vec![e]).tiers_validate().is_err());
+
+        // M8：本地冷盘池——只允许 path；远端字段必须为空；path 须是目录。
+        let local = |path: Option<&str>| TierTarget {
+            id: "local1".into(),
+            kind: TierKind::Local,
+            path: path.map(std::path::PathBuf::from),
+            endpoint: String::new(),
+            bucket: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: "us-east-1".into(),
+            server_name: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            cfg(vec![local(Some(dir.path().to_str().unwrap()))])
+                .tiers_validate()
+                .is_ok()
+        );
+        assert!(cfg(vec![local(None)]).tiers_validate().is_err(), "缺 path");
+        let mut e = local(Some(dir.path().to_str().unwrap()));
+        e.endpoint = "http://h:1".into();
+        assert!(
+            cfg(vec![e]).tiers_validate().is_err(),
+            "local 不得带远端字段"
+        );
+        let mut e = local(Some(dir.path().to_str().unwrap()));
+        e.kind = TierKind::S3;
+        assert!(cfg(vec![e]).tiers_validate().is_err(), "s3 不得带 path");
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            cfg(vec![local(Some(file.to_str().unwrap()))])
+                .tiers_validate()
+                .is_err(),
+            "path 是文件"
+        );
     }
 
     /// M7：`[site]` 校验矩阵（token 形态 / 与 cluster 互斥）。
@@ -1189,6 +1343,8 @@ mod tests {
             id: id.into(),
             brokers: brokers.into_iter().map(str::to_string).collect(),
             topic: topic.into(),
+            tls: false,
+            sasl: None,
         };
         let cfg = |targets| AppConfig {
             listen: "127.0.0.1:0".into(),
@@ -1208,6 +1364,7 @@ mod tests {
             raft: None,
             sync: Default::default(),
             stretch: None,
+            tls: Default::default(),
         };
         // 合法
         assert!(

@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use s3s::dto::*;
@@ -14,7 +15,7 @@ use xl_s3::service::OssS3;
 use xl_store::crypto::EncSpec;
 use xl_store::meta::TierPhase;
 
-use oss_server::config::TierTarget;
+use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
 use oss_server::state::AppState;
 use oss_server::tier::{S3TierGc, TierBackend, TierBackends, tier_key};
@@ -58,11 +59,14 @@ impl TierBackend for MockTier {
 fn tier_target() -> TierTarget {
     TierTarget {
         id: "cold".into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: "http://127.0.0.1:9".into(),
         bucket: "tb".into(),
         access_key: "ak".into(),
         secret_key: "sk".into(),
         region: "us-east-1".into(),
+        server_name: None,
     }
 }
 
@@ -172,7 +176,7 @@ async fn sse_object_rejected_and_sweep_skips() {
             None,
             Default::default(),
             None,
-            false,
+            VersioningMode::Off,
             Some(EncSpec::SseC(xl_store::crypto::SseCKey::from_key(
                 [11u8; 32],
             ))),

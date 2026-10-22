@@ -48,6 +48,12 @@ REMOTE_ETAG=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET
 echo "== 6. 前缀与分隔符 =="
 aws_s3 cp "$WORK/one.bin" "s3://$BUCKET/dir/a.bin"
 aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket "$BUCKET" --delimiter / --query 'CommonPrefixes[].Prefix' --output text | grep -q "dir/"
+# ListObjects v1（无 list-type）：delimiter 聚合 + marker 排他分页
+aws --endpoint-url "$ENDPOINT" s3api list-objects --bucket "$BUCKET" --delimiter / --query 'CommonPrefixes[].Prefix' --output text | grep -q "dir/"
+V1_FIRST=$(aws --endpoint-url "$ENDPOINT" s3api list-objects --bucket "$BUCKET" --max-keys 1 --query 'Contents[0].Key' --output text)
+[ "$V1_FIRST" = "dir/a.bin" ] || { echo "v1 首键不符: $V1_FIRST"; exit 1; }
+V1_NEXT=$(aws --endpoint-url "$ENDPOINT" s3api list-objects --bucket "$BUCKET" --marker "$V1_FIRST" --max-keys 1 --query 'Contents[0].Key' --output text)
+[ "$V1_NEXT" = "one.bin" ] || { echo "v1 marker 非排他: $V1_NEXT"; exit 1; }
 
 echo "== 7. CopyObject =="
 aws --endpoint-url "$ENDPOINT" s3api copy-object --bucket "$BUCKET" --key copy.bin --copy-source "$BUCKET/one.bin" >/dev/null

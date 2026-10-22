@@ -15,6 +15,7 @@ use serde::Deserialize;
 use xl_s3::access::{Action, AuthedUser};
 use xl_s3::events::EventSink as _;
 use xl_s3::sync_delete::SyncDeleteSink as _;
+use xl_store::store::VersioningMode;
 
 use crate::state::AppState;
 
@@ -176,6 +177,7 @@ pub fn routes() -> Router<AppState> {
         // M8 S4b：admin 强制跑一轮 Transition sweep；tier 只读状态（Task 6a 后端预备）
         .route("/tiers", get(list_tiers))
         .route("/tiers/sweep", post(force_tier_sweep))
+        .route("/tiers/gc", post(tier_gc))
         // Task 6a：桶默认加密读/写/清（与 S3 面同源）
         .route(
             "/buckets/{bucket}/encryption",
@@ -1592,6 +1594,8 @@ async fn list_tiers(
         };
         out.push(serde_json::json!({
             "id": t.id.as_str(),
+            "kind": t.kind.as_str(),
+            "path": t.path.as_ref().map(|p| p.display().to_string()),
             "endpoint": t.endpoint.as_str(),
             "bucket": t.bucket.as_str(),
             "healthy": healthy,
@@ -1727,6 +1731,78 @@ async fn force_tier_sweep(
         }
         Err(e) => {
             tracing::error!(error = %e, "强制 tier sweep 失败");
+            internal_error()
+        }
+    }
+}
+
+/// M8：tier 远端 GC/对账请求体。缺省 dry-run；真删必须显式 `"dry_run": false`。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct TierGcBody {
+    dry_run: bool,
+    grace_days: u32,
+    max_deletes: usize,
+    /// None = 全部已配置 tier。
+    tier: Option<String>,
+}
+
+impl Default for TierGcBody {
+    fn default() -> Self {
+        Self {
+            dry_run: true,
+            grace_days: crate::tier_gc_sweep::DEFAULT_GRACE_DAYS,
+            max_deletes: crate::tier_gc_sweep::DEFAULT_MAX_DELETES,
+            tier: None,
+        }
+    }
+}
+
+/// M8：admin 触发 tier 远端 GC/对账（dry-run 优先；live 引用与 grace 内对象永不删除）。
+async fn tier_gc(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    body: Option<Json<TierGcBody>>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(id) = &b.tier
+        && state.tiers.get(id).is_none()
+    {
+        return (StatusCode::BAD_REQUEST, format!("tier 不存在：{id}")).into_response();
+    }
+    let opts = crate::tier_gc_sweep::GcOptions {
+        tier: b.tier,
+        dry_run: b.dry_run,
+        grace_days: b.grace_days,
+        max_deletes: b.max_deletes,
+    };
+    if let Err(e) = crate::tier_gc_sweep::validate_opts(&opts) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    match crate::tier_gc_sweep::run_gc(&state.store, &state.tiers, &opts).await {
+        Ok(resp) => {
+            let deleted: usize = resp.reports.iter().map(|r| r.deleted).sum();
+            let failed: usize = resp.reports.iter().map(|r| r.failed).sum();
+            state
+                .audit(
+                    uid,
+                    "control:tier-gc",
+                    None,
+                    None,
+                    Some(&format!(
+                        "dry_run={} grace_days={} deleted={deleted} failed={failed}",
+                        resp.dry_run, resp.grace_days
+                    )),
+                )
+                .await;
+            Json(resp).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "tier GC 失败");
             internal_error()
         }
     }
@@ -2145,6 +2221,7 @@ async fn list_objects(
         delimiter: q.delimiter,
         max_keys: q.limit,
         continuation_token: q.cursor,
+        marker: None,
     };
     match state.store.list_objects(&bucket, &req).await {
         Ok(r) => Json(serde_json::json!({
@@ -3210,7 +3287,7 @@ async fn membership_apply_any(
             .as_ref()
             .map(|r| r.cluster_token.clone())
             .unwrap_or_default();
-        membership::request(&endpoint, &token, op).await
+        membership::request_tls(&endpoint, &token, op, Some(state.tls.as_ref())).await
     } else {
         Err(MembershipError::NoQuorum)
     }
@@ -3224,7 +3301,12 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
     let Some(local_raft) = state.cfg.raft.as_ref() else {
         return conflict("local node has no [raft]".into());
     };
-    let ident = match crate::site_client::get_identity_typed(&endpoint, &body.peer_site_token).await
+    let ident = match crate::site_client::get_identity_typed_tls(
+        &endpoint,
+        &body.peer_site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
     {
         Ok(i) => i,
         Err(crate::site_client::IdentityError::Unauthorized) => {
@@ -3367,11 +3449,12 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         "s3_secret_key": admin_sk,
         "stretch": local_stretch,
     });
-    let (status, resp_body) = match crate::site_client::post_raft_join(
+    let (status, resp_body) = match crate::site_client::post_raft_join_tls(
         &peer_raft_endpoint,
         &local_raft.cluster_token,
         &join_body,
         std::time::Duration::from_secs(20),
+        Some(state.tls.as_ref()),
     )
     .await
     {
@@ -3515,7 +3598,12 @@ async fn site_raft_join(
         Err(e) => return bad(&e),
     };
     // 反向校验：用对方站点令牌拉 identity，确认声明的 id/node/admin 一致。
-    let ident = match crate::site_client::get_identity_typed(&raft_endpoint, &body.site_token).await
+    let ident = match crate::site_client::get_identity_typed_tls(
+        &raft_endpoint,
+        &body.site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
     {
         Ok(i) => i,
         Err(crate::site_client::IdentityError::Unauthorized) => {
@@ -3713,7 +3801,13 @@ async fn create_site(
         }
     }
     // 同步校验对端可达 + region 一致 + 非本机
-    let ident = match crate::site_client::get_identity(&endpoint, &body.peer_site_token).await {
+    let ident = match crate::site_client::get_identity_tls(
+        &endpoint,
+        &body.peer_site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
+    {
         Ok(i) => i,
         Err(e) => return bad(format!("对端 identity 校验失败：{e}")),
     };
@@ -3888,7 +3982,13 @@ async fn delete_site(
                     .as_ref()
                     .map(|r| r.cluster_token.clone())
                     .unwrap_or_default();
-                crate::raft::membership::request(&endpoint, &token, &op).await
+                crate::raft::membership::request_tls(
+                    &endpoint,
+                    &token,
+                    &op,
+                    Some(state.tls.as_ref()),
+                )
+                .await
             } else {
                 Err(crate::raft::membership::MembershipError::NoQuorum)
             };
@@ -3948,7 +4048,13 @@ async fn ping_site(
     let Some(peer) = state.db.get_site(&peer_id).await.ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match crate::site_client::get_identity(&peer.endpoint, &peer.peer_site_token).await {
+    match crate::site_client::get_identity_tls(
+        &peer.endpoint,
+        &peer.peer_site_token,
+        Some(state.tls.as_ref()),
+    )
+    .await
+    {
         Ok(ident) => {
             let now = crate::db::now();
             if let Err(e) = state.db.update_site_ping(&peer_id, now, None).await {
@@ -4172,7 +4278,7 @@ async fn site_delete_object(
                 &body.bucket,
                 &body.key,
                 None,
-                true,
+                VersioningMode::Enabled,
                 false,
                 Some(spec),
             )
@@ -4192,7 +4298,13 @@ async fn site_delete_object(
     // sync 桶创建即 Enabled；显式版本删除对不存在版本幂等成功（DeleteOutcome::NotFound）。
     match state
         .store
-        .delete_object_versioned_ext(&body.bucket, &body.key, Some(&vid), true, false)
+        .delete_object_versioned_ext(
+            &body.bucket,
+            &body.key,
+            Some(&vid),
+            VersioningMode::Enabled,
+            false,
+        )
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),

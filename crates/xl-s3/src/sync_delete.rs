@@ -6,17 +6,18 @@
 
 use async_trait::async_trait;
 use xl_store::error::Result;
-use xl_store::store::DeleteOutcome;
+use xl_store::store::{DeleteOutcome, VersioningMode};
 
 #[async_trait]
 pub trait SyncDeleteSink: Send + Sync {
-    /// 版本感知删除（`version_id=None` + versioned = 预生成同 id delete marker）。
+    /// 版本感知删除（`version_id=None` + Enabled = 预生成同 id delete marker；
+    /// `Suspended` = 移除 null 版本并追加 null marker）。
     async fn delete_versioned(
         &self,
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
         bypass_governance: bool,
     ) -> Result<DeleteOutcome>;
 

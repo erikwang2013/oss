@@ -34,12 +34,19 @@ impl Store {
         // 空 delimiter 视同未指定：find("") 命中每个键的首字节，会把整份键都当 common prefix
         let delimiter = req.delimiter.as_deref().filter(|d| !d.is_empty());
         let prefix = req.prefix.clone().unwrap_or_default();
+        // V1 marker 排他（严格大于）；V2 token 包含起点。两者互斥，marker 优先。
+        let (start_after, exclusive) = match req.marker.as_deref() {
+            Some(m) => (Some(m), true),
+            None => (req.continuation_token.as_deref(), false),
+        };
         let (objs, cps) = self
             .list_page_local(
                 bucket,
                 &prefix,
-                req.continuation_token.as_deref(),
+                start_after,
+                exclusive,
                 delimiter,
+                false,
                 max + 1,
             )
             .await?;
@@ -53,12 +60,16 @@ impl Store {
     /// 单源页（单机路径与集群的 ListLocal 共用）：按 key 序遍历本机键集，
     /// **最多收 `limit` 个输出**（键与 cp 合计；cp 已发不占位也不触发截断——与
     /// M1 单机循环同规则）。条目自带每键本地 max_mod_time（并集判定用）。
+    /// `exclusive`：start_after 为 V1 marker（跳过该键本身）而非 V2 token（包含）。
+    #[allow(clippy::too_many_arguments)] // 列举四选项 + 分页/版本显式传参，内部函数
     pub(in crate::store) async fn list_page_local(
         &self,
         bucket: &str,
         prefix: &str,
         start_after: Option<&str>,
+        exclusive: bool,
         delimiter: Option<&str>,
+        include_deleted: bool,
         limit: usize,
     ) -> Result<(Vec<(crate::mesh::ListEntry, ObjectInfo)>, Vec<String>)> {
         let mut keys = self.collect_keys(bucket).await?;
@@ -71,8 +82,9 @@ impl Store {
                 continue;
             }
             if let Some(after) = start_after {
-                // token = 本页「未返回的第一个 key」，恢复时包含该 key 本身
-                if k.as_str() < after {
+                // V2 token = 本页「未返回的第一个 key」，恢复时包含该 key 本身；
+                // V1 marker = 严格大于（AWS：start listing after this key）。
+                if k.as_str() < after || (exclusive && k.as_str() == after) {
                     continue;
                 }
             }
@@ -80,6 +92,11 @@ impl Store {
                 let rest = &k[prefix.len()..];
                 if let Some(pos) = rest.find(d) {
                     let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
+                    // V1：CommonPrefixes 不返回字典序 <= marker 的项（AWS 语义）；这些键
+                    // 已折叠进被过滤的 cp，不能再作为对象返回。
+                    if exclusive && start_after.is_some_and(|m| cp.as_str() <= m) {
+                        continue;
+                    }
                     // 去重检查在容量判断之前：已发过的 cp 不再占位、也不触发截断
                     if !cps.contains(&cp) {
                         if objects.len() + cps.len() >= limit {
@@ -95,7 +112,7 @@ impl Store {
             }
             if let Some(m) = self.read_meta(bucket, &k).await? {
                 // 版本控制：链尾为 delete marker 的键在对象列表不可见（版本列表仍可见）
-                if m.latest_is_marker() {
+                if !include_deleted && m.latest_is_marker() {
                     continue;
                 }
                 let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
@@ -129,12 +146,24 @@ impl Store {
         }
         let delimiter = req.delimiter.as_deref().filter(|d| !d.is_empty());
         let prefix = req.prefix.clone().unwrap_or_default();
-        let start_after = req.continuation_token.clone();
+        // 与单机同一套互斥语义：V1 marker 排他、V2 token 包含
+        let (start_after, exclusive) = match req.marker.clone() {
+            Some(m) => (Some(m), true),
+            None => (req.continuation_token.clone(), false),
+        };
         let limit = max + 1; // 完备性的关键（见头注证明）
 
         // 本机页（本机无桶目录 → 空页）
         let (local_objs, local_cps) = match self
-            .list_page_local(bucket, &prefix, start_after.as_deref(), delimiter, limit)
+            .list_page_local(
+                bucket,
+                &prefix,
+                start_after.as_deref(),
+                exclusive,
+                delimiter,
+                false,
+                limit,
+            )
             .await
         {
             Ok(x) => x,
@@ -158,7 +187,9 @@ impl Store {
                 prefix: prefix.clone(),
                 delimiter: delimiter.map(|d| d.to_string()),
                 marker: start_after.clone(),
+                marker_exclusive: exclusive,
                 limit,
+                include_deleted: false,
             };
             match cl.transport.list_local(&n.id, l).await {
                 Ok(resp) => {

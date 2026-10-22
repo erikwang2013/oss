@@ -63,6 +63,7 @@ cluster_token = "t"
         raft: Some(raft),
         sync: Default::default(),
         stretch: None,
+        tls: Default::default(),
     }
 }
 

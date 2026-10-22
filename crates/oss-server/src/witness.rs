@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::get;
+use ecat_transport::Server as _;
 
 use crate::config::WitnessToml;
 use crate::db::Db;
@@ -17,25 +18,33 @@ use crate::raft::{self, RaftHandle, RaftSettings, identity};
 pub async fn run(config_path: &Path) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = WitnessToml::load(config_path)?;
     let token = cfg.raft.cluster_token.clone();
-    let (_db, handle) = start(&cfg).await?;
+    let (_db, handle, tls) = start(&cfg).await?;
     let addr = bind_addr(&cfg.raft.advertise_endpoint).await?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("witness 监听 {addr} 绑定失败: {e}"))?;
     tracing::info!(%addr, node_id = handle.node_id(), "witness 启动");
-    axum::serve(listener, build_app(Arc::clone(&handle), token))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    handle.shutdown().await;
+    // witness 与主服务共用 ecat 监听器（同一条 TLS/mTLS 配置）。
+    let mut server =
+        ecat::transport_http::HttpServer::new(addr.to_string()).router(build_app(handle, token));
+    if let Some(t) = tls.ecat_server() {
+        server = server.tls(t);
+    }
+    let server = Arc::new(server);
+    let running = {
+        let s = Arc::clone(&server);
+        tokio::spawn(async move { s.start().await })
+    };
+    let _ = tokio::signal::ctrl_c().await;
+    server.stop().await?;
+    running.await??;
     Ok(0)
 }
 
 /// 打开控制库 → 身份校验 → 启动 Raft（bootstrap=false，等待 join）→ 记录 initialized。
 async fn start(
     cfg: &WitnessToml,
-) -> Result<(Arc<Db>, Arc<RaftHandle>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Arc<Db>, Arc<RaftHandle>, Arc<crate::tls::Tls>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let state_db = cfg
         .raft
         .state_db
@@ -52,9 +61,18 @@ async fn start(
     let url = format!("sqlite://{}?mode=rwc", state_db.display());
     let db = Arc::new(Db::connect_witness(&url).await?);
     identity::verify_and_seed(&db, &settings).await?;
-    let handle = Arc::new(raft::spawn_with_control(settings, Some(db.pool().clone()), None).await?);
+    let tls = crate::tls::Tls::load(&cfg.tls)?;
+    let handle = Arc::new(
+        raft::spawn_with_control_tls(
+            settings,
+            Some(db.pool().clone()),
+            None,
+            tls.peer_tls().then(|| Arc::clone(&tls)),
+        )
+        .await?,
+    );
     identity::record_initialized(&db, handle.membership_nonempty()).await?;
-    Ok((db, handle))
+    Ok((db, handle, tls))
 }
 
 fn build_app(handle: Arc<RaftHandle>, token: String) -> Router {
@@ -105,7 +123,7 @@ state_db = "{}"
         )
         .unwrap();
         let cfg = WitnessToml::load(&cfg_path).unwrap();
-        let (db, handle) = start(&cfg).await.unwrap();
+        let (db, handle, _tls) = start(&cfg).await.unwrap();
         assert!(!handle.membership_nonempty());
 
         // 身份持久化 + witness 控制库无站点行。

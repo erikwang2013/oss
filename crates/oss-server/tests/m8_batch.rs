@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use oss_server::db::{Db, JobSpec, NewJobTask};
@@ -428,7 +429,7 @@ async fn five_actions_and_hooks() {
             Some("text/plain".into()),
             [("meta".to_string(), "yes".to_string())].into(),
             None,
-            false,
+            VersioningMode::Off,
             None,
             None,
             Some(vec![ObjectTag {
@@ -618,7 +619,7 @@ async fn five_actions_and_hooks() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
@@ -638,7 +639,7 @@ async fn five_actions_and_hooks() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
@@ -932,7 +933,7 @@ async fn archived_and_sse_c_sources_are_rejected() {
             None,
             Default::default(),
             None,
-            false,
+            VersioningMode::Off,
             Some(EncSpec::SseC(sse)),
             None,
             None,
@@ -967,7 +968,7 @@ async fn versioned_source_copy_and_tag() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
@@ -987,7 +988,7 @@ async fn versioned_source_copy_and_tag() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

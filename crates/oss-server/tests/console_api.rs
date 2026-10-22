@@ -2,6 +2,7 @@ mod common;
 
 use common::state;
 use oss_server::router::build_router;
+use xl_store::store::VersioningMode;
 
 /// 起真实监听端口的服务，返回 base URL（新用例共用；Step 1 块内两个测试保持原样）。
 async fn serve(app: axum::Router) -> String {
@@ -1586,7 +1587,7 @@ async fn select_proxy_csv_filter_and_errors() {
                 None,
                 Default::default(),
                 None,
-                false,
+                VersioningMode::Off,
                 Some(EncSpec::SseC(SseCKey::from_key([7u8; 32]))),
                 None,
                 None,
@@ -1779,7 +1780,7 @@ async fn tiers_list_empty_and_admin_only() {
 /// Task 6a：tier 只读状态——404 哨兵 = 远端可达（healthy），连接失败 = false；不投影凭证。
 #[tokio::test]
 async fn tiers_list_health_without_credentials() {
-    use oss_server::config::TierTarget;
+    use oss_server::config::{TierKind, TierTarget};
 
     // 任意请求 404：HEAD 哨兵得 404 → tier_head 返回 Ok(None) → healthy
     let mock = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
@@ -1789,11 +1790,14 @@ async fn tiers_list_health_without_credentials() {
 
     let target = |id: &str, endpoint: &str, bucket: &str| TierTarget {
         id: id.into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: endpoint.into(),
         bucket: bucket.into(),
         access_key: "ak-secret".into(),
         secret_key: "sk-secret".into(),
         region: "us-east-1".into(),
+        server_name: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let st = common::state_with_tiers(
@@ -1978,7 +1982,7 @@ async fn object_list_includes_storage_and_tier_fields() {
             None,
             Default::default(),
             None,
-            false,
+            VersioningMode::Off,
             None,
             None,
             None,

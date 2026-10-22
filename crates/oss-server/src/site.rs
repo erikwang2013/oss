@@ -3,6 +3,8 @@
 //! 冲突模型：LWW 元组 `(ts, priority, origin_site_id, seq)`（ts 优先，priority 同秒裁决）。
 //! 毒丸：永久坏条目写 `site_apply_dead` 并越过（cursor 可推进）；DB/IO 错误整批 500 让对端重试。
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
 use xl_store::store::Store;
@@ -916,6 +918,14 @@ pub async fn insert_peer_with_snapshot(
 
 /// 一轮出货：逐 peer 推 cursor 之后的 changelog（≤100 条/批）。
 pub async fn ship_once(pool: &SqlitePool) -> Result<(usize, usize), String> {
+    ship_once_tls(pool, None).await
+}
+
+/// 同 [`ship_once`]；`tls = Some` 时对端地址按 peer TLS 模式升级/校验。
+pub async fn ship_once_tls(
+    pool: &SqlitePool,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<(usize, usize), String> {
     let peers = sqlx::query("SELECT peer_id, endpoint, peer_site_token FROM sites")
         .fetch_all(pool)
         .await
@@ -971,7 +981,13 @@ pub async fn ship_once(pool: &SqlitePool) -> Result<(usize, usize), String> {
             }));
         }
         let body = serde_json::json!({ "entries": entries }).to_string();
-        match crate::site_client::post_changelog(&endpoint, &token, bytes::Bytes::from(body)).await
+        match crate::site_client::post_changelog_tls(
+            &endpoint,
+            &token,
+            bytes::Bytes::from(body),
+            tls,
+        )
+        .await
         {
             Ok((200, _)) => {
                 sqlx::query(
@@ -1019,7 +1035,7 @@ pub async fn ship_once(pool: &SqlitePool) -> Result<(usize, usize), String> {
 }
 
 /// serve 挂载（`OSS_SITE_INTERVAL_SECS` 默认 1s；0=关）。
-pub fn spawn_site_worker(pool: SqlitePool) {
+pub fn spawn_site_worker(pool: SqlitePool, tls: Arc<crate::tls::Tls>) {
     let secs: u64 = std::env::var("OSS_SITE_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1033,7 +1049,7 @@ pub fn spawn_site_worker(pool: SqlitePool) {
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
-            let _ = ship_once(&pool).await;
+            let _ = ship_once_tls(&pool, Some(&tls)).await;
         }
     });
 }

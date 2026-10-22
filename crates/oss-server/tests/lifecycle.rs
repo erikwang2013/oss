@@ -5,6 +5,7 @@ mod common;
 use common::state;
 use oss_server::db::LifecycleRuleRow;
 use oss_server::lifecycle::sweep_once;
+use xl_store::store::VersioningMode;
 
 fn rule(prefix: &str, days: i64) -> LifecycleRuleRow {
     LifecycleRuleRow {
@@ -341,7 +342,7 @@ async fn lifecycle_emits_expiration_events() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

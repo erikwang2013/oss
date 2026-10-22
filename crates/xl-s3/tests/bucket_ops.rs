@@ -303,10 +303,10 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
     assert_eq!(e.code(), &s3s::S3ErrorCode::InternalError);
 }
 
-/// M4 切片 3：版本控制开关——开启幂等；**已启用后拒绝改回 Off**（写入会整链替换 → 静默丢历史）。
-/// Suspended 亦拒绝（语义未实现，明确 501 不静默）。
+/// 版本控制三态：Enabled→Suspended→Enabled 往返；启用过的桶拒绝改回 Off；
+/// Object Lock 桶拒绝 Suspended（InvalidBucketState）。
 #[tokio::test]
-async fn versioning_enabled_and_off_rejected() {
+async fn versioning_state_machine_and_object_lock() {
     // 带身份建桶（record_bucket_owner 需要 AuthedUser 扩展——版本控制状态存在 buckets 行上）
     fn with_user<T>(input: T) -> S3Request<T> {
         let mut r = req(input);
@@ -365,11 +365,71 @@ async fn versioning_enabled_and_off_rejected() {
         Some("Enabled"),
         "Off 被拒后仍应 Enabled"
     );
+    // Enabled → Suspended 允许；随后 Off 仍拒绝（Suspended 也算「启用过」）
+    s3.put_bucket_versioning(cfg("Suspended")).await.unwrap();
+    let got = s3
+        .get_bucket_versioning(req(GetBucketVersioningInput {
+            bucket: "vbk".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.output.status.as_ref().map(|s| s.as_str()),
+        Some("Suspended")
+    );
+    let err = s3.put_bucket_versioning(cfg("Off")).await.unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NotImplemented);
+    // Suspended → Enabled 允许
+    s3.put_bucket_versioning(cfg("Enabled")).await.unwrap();
+    let got = s3
+        .get_bucket_versioning(req(GetBucketVersioningInput {
+            bucket: "vbk".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.output.status.as_ref().map(|s| s.as_str()),
+        Some("Enabled")
+    );
+
+    // Object Lock 桶：Suspended → InvalidBucketState；状态保持 Enabled
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: "lockb".into(),
+        object_lock_enabled_for_bucket: Some(true),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
     let err = s3
-        .put_bucket_versioning(cfg("Suspended"))
+        .put_bucket_versioning(req(PutBucketVersioningInput {
+            bucket: "lockb".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            mfa: None,
+            versioning_configuration: VersioningConfiguration {
+                mfa_delete: None,
+                status: Some(BucketVersioningStatus::from_static("Suspended")),
+            },
+        }))
         .await
         .unwrap_err();
-    assert_eq!(err.code(), &s3s::S3ErrorCode::NotImplemented);
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidBucketState);
+    let got = s3
+        .get_bucket_versioning(req(GetBucketVersioningInput {
+            bucket: "lockb".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.output.status.as_ref().map(|s| s.as_str()),
+        Some("Enabled"),
+        "拒绝 Suspended 后锁桶必须仍为 Enabled"
+    );
+
     // 未启用的桶：Off 幂等接受
     s3.create_bucket(with_user(CreateBucketInput {
         bucket: "vbk2".into(),
@@ -390,6 +450,49 @@ async fn versioning_enabled_and_off_rejected() {
     }))
     .await
     .unwrap();
+}
+
+/// M9 sync 桶依赖真 UUID 版本链：Suspended 必须拒绝，状态保持 Enabled。
+#[tokio::test]
+async fn sync_bucket_rejects_versioning_suspension() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s3 = OssS3::new(store, acl().await, 1024 * 1024).with_sync_ready(true);
+    s3.create_bucket(with_mode(
+        with_user(CreateBucketInput {
+            bucket: "sync-v".into(),
+            ..Default::default()
+        }),
+        "sync",
+    ))
+    .await
+    .unwrap();
+    let err = s3
+        .put_bucket_versioning(req(PutBucketVersioningInput {
+            bucket: "sync-v".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            mfa: None,
+            versioning_configuration: VersioningConfiguration {
+                mfa_delete: None,
+                status: Some(BucketVersioningStatus::from_static("Suspended")),
+            },
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidBucketState);
+    let got = s3
+        .get_bucket_versioning(req(GetBucketVersioningInput {
+            bucket: "sync-v".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.output.status.as_ref().map(|s| s.as_str()),
+        Some("Enabled")
+    );
 }
 
 /// M9 S0：`x-oss-replication-mode` 头——未就绪 400、非法值 400、就绪时落行并可读回。

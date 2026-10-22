@@ -9,6 +9,7 @@ use oss_server::site::Entry;
 use oss_server::state::AppState;
 use serde_json::json;
 use sqlx::Row;
+use xl_store::store::VersioningMode;
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -295,7 +296,7 @@ async fn snapshot_ship_apply_and_replay() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
@@ -353,7 +354,7 @@ async fn snapshot_ship_apply_and_replay() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

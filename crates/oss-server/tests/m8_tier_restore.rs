@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use s3s::dto::*;
@@ -12,7 +13,7 @@ use xl_s3::service::OssS3;
 use xl_store::meta::TierPhase;
 
 use md5::Digest as _;
-use oss_server::config::TierTarget;
+use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
 use oss_server::router::build_router;
 use oss_server::state::AppState;
@@ -64,11 +65,14 @@ impl TierBackend for MockTier {
 fn tier_target(endpoint: &str) -> TierTarget {
     TierTarget {
         id: "cold".into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: endpoint.into(),
         bucket: "tb".into(),
         access_key: "ak".into(),
         secret_key: "sk".into(),
         region: "us-east-1".into(),
+        server_name: None,
     }
 }
 
@@ -300,7 +304,7 @@ async fn restore_without_version_id_targets_latest() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
