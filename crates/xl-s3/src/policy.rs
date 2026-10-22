@@ -9,9 +9,11 @@
 //!   桶级 op 只见桶 ARN，对象 op 只见对象 ARN，与 AWS 一致）。
 //! - 判定：任一匹配的 **Deny** → 拒（最高优先）；否则任一匹配的 **Allow** → 放行；
 //!   无匹配 → `None`（调用方回落既有 permissions 三档）。
+//! - 匿名（无凭据）：`PolicyRequest.anonymous` 下**仅** `Principal` 恰为 `"*"` 的语句参与
+//!   （`uid:<n>`/具体 AK/空 AK 一律不匹配）；放行面另行由 `access.rs` 限定为数据面对象操作。
 //!
 //! 明确不做（记档）：Conditions / NotAction / NotResource / Principal 的 ARN 形态 /
-//! 匿名（无凭据）放行（需 auth 层改造——Principal `"*"` 对**任意有效 AK** 生效）。
+//! 跨账户 Principal / 匿名桶级与 AP 操作。
 
 use serde::Deserialize;
 
@@ -70,6 +72,8 @@ pub struct PolicyRequest<'a> {
     pub bucket: &'a str,
     /// 对象键（桶级 op 为 None）
     pub key: Option<&'a str>,
+    /// 无凭据请求：Principal 只认 `"*"`（`uid:0`/空 AK 不得命中）。
+    pub anonymous: bool,
 }
 
 /// op → `s3:<Action>`（子集；未映射返回 None → 策略不参与，回落既有判定）。
@@ -122,11 +126,15 @@ pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     }
 }
 
-fn principal_matches(p: &PrincipalField, ak: &str, uid: i64) -> bool {
+fn principal_matches(p: &PrincipalField, r: &PolicyRequest<'_>) -> bool {
     p.aws.iter().any(|v| {
+        if r.anonymous {
+            // 匿名只认通配；uid:0 哨兵/空 AK/具体 AK 绝不放行（fail-closed）。
+            return v == "*";
+        }
         v == "*"
-            || v == ak
-            || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(uid)
+            || v == r.ak
+            || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(r.uid)
     })
 }
 
@@ -233,7 +241,7 @@ pub fn evaluate(policy: &PolicyDoc, p: &PolicyRequest<'_>, action: &str) -> Opti
     let mut allowed = false;
     let mut any_match = false;
     for st in &policy.statement {
-        if !principal_matches(&st.principal, p.ak, p.uid) {
+        if !principal_matches(&st.principal, p) {
             continue;
         }
         if !st.action.iter().any(|pat| glob_match(pat, action)) {
@@ -271,6 +279,19 @@ mod tests {
             uid: 7,
             bucket: "bkt",
             key,
+            anonymous: false,
+        }
+    }
+
+    /// 无凭据：uid=0 哨兵 + 空 AK + anonymous 标记。
+    fn anon_req<'a>(op: &'a str, key: Option<&'a str>) -> PolicyRequest<'a> {
+        PolicyRequest {
+            op,
+            ak: "",
+            uid: 0,
+            bucket: "bkt",
+            key,
+            anonymous: true,
         }
     }
 
@@ -292,7 +313,7 @@ mod tests {
             evaluate(&p, &req("GetObject", Some("secret/x")), "s3:GetObject"),
             Some(false)
         );
-        // Principal "*" 对任意**有效 AK** 生效（匿名放行未实现——见头注），AKIA_OTHER 亦命中
+        // Principal "*" 对任意**有效 AK** 生效（签名请求口径不变），AKIA_OTHER 亦命中
         let mut r2 = req("GetObject", Some("open.txt"));
         r2.ak = "AKIA_OTHER";
         assert_eq!(evaluate(&p, &r2, "s3:GetObject"), Some(true));
@@ -314,6 +335,61 @@ mod tests {
         assert_eq!(
             evaluate(&p2, &req("PutObject", Some("a")), "s3:PutObject"),
             None
+        );
+    }
+
+    /// 匿名 Principal 矩阵：只认 `"*"`（字符串/数组）；`uid:0`、空 AK、具体 AK 均不命中；
+    /// Allow 命中/资源前缀/Deny 优先与签名请求同口径。
+    #[test]
+    fn anonymous_principal_only_matches_wildcard() {
+        let wildcard = doc(r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#);
+        assert_eq!(
+            evaluate(&wildcard, &anon_req("GetObject", Some("a")), "s3:GetObject"),
+            Some(true)
+        );
+        // Deny"*" 优先于 Allow"*"
+        let deny_wins = doc(r#"{"Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*","Resource":"arn:aws:s3:::bkt/*"},
+            {"Effect":"Deny","Principal":{"AWS":["*"]},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*"}
+        ]}"#);
+        assert_eq!(
+            evaluate(&deny_wins, &anon_req("GetObject", Some("secret/x")), "s3:GetObject"),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate(&deny_wins, &anon_req("GetObject", Some("open")), "s3:GetObject"),
+            Some(true)
+        );
+        // 资源前缀：Allow 只覆盖 secret* 时，open 无匹配
+        let prefix = doc(r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*"}]}"#);
+        assert_eq!(
+            evaluate(&prefix, &anon_req("GetObject", Some("open")), "s3:GetObject"),
+            None
+        );
+        // 非通配 Principal 不得因 uid=0 哨兵或空 AK 命中
+        for principal in [r#""uid:0""#, r#""""#, r#""AKIA_SOMEONE""#, r#"["uid:0","AKIA_X"]"#] {
+            let p: PolicyDoc = serde_json::from_str(&format!(
+                r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":{principal}}},
+                "Action":"s3:*","Resource":"arn:aws:s3:::bkt/*"}}]}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                evaluate(&p, &anon_req("GetObject", Some("a")), "s3:GetObject"),
+                None,
+                "匿名不得命中 Principal {principal}"
+            );
+        }
+        // 签名请求口径不变：同一 uid:0 文档对 uid=0 的有效签名用户仍按原语义匹配
+        let mut signed_zero = req("GetObject", Some("a"));
+        signed_zero.uid = 0;
+        let p = doc(r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"uid:0"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#);
+        assert_eq!(
+            evaluate(&p, &signed_zero, "s3:GetObject"),
+            Some(true),
+            "签名请求的 uid: 匹配不得因匿名分支改变"
         );
     }
 

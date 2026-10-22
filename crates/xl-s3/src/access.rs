@@ -5,7 +5,9 @@
 //! ——SQL 只有这一处，防两套实现漂移。
 //!
 //! 求值规则（fail-closed）：
-//!   匿名 → 拒；`is_admin` → 全允许；`buckets.owner_id == uid`（桶主）→ 全允许；
+//!   匿名 → **只**评估桶策略（显式 Allow 必需、Deny 优先），且仅放行数据面对象操作
+//!   Get/Head/Put/DeleteObject + DeleteObjects（其余 op 即使策略 Allow 也拒）；
+//!   `is_admin` → 全允许；`buckets.owner_id == uid`（桶主）→ 全允许；
 //!   否则查 `permissions` 行，**无行 = 无权限**。
 //! CreateBucket：任何已认证用户（建后 `record_bucket_owner` 记账）；DeleteBucket：桶主或管理员。
 
@@ -31,6 +33,11 @@ pub struct AuthedUser {
     pub is_admin: bool,
     pub ak: String,
 }
+
+/// 无凭据请求通过桶策略放行后的请求扩展标记（handler 用：DeleteObjects 逐键复评）。
+/// 不复用 `AuthedUser`（uid=0 哨兵不得被当成真实用户/桶主参与表三档判定）。
+#[derive(Debug, Clone, Copy)]
+pub struct AnonymousAccess;
 
 /// 权限动作（与 `permissions` 表三列一一对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +363,7 @@ impl Acl {
                     uid: user.uid,
                     bucket,
                     key: Some(key),
+                    anonymous: false,
                 };
                 crate::policy::s3_action("DeleteObject")
                     .and_then(|a| crate::policy::evaluate(&doc, &pr, a))
@@ -376,6 +384,7 @@ impl Acl {
                 uid: user.uid,
                 bucket,
                 key: Some(key),
+                anonymous: false,
             };
             match crate::policy::s3_action("DeleteObject")
                 .and_then(|a| crate::policy::evaluate(&sdoc, &pr, a))
@@ -385,6 +394,35 @@ impl Acl {
             }
         }
         Ok((allowed, detail))
+    }
+
+    /// 匿名 DeleteObjects 逐键判定：**仅**桶策略，无表三档回落（匿名不继承任何用户权限）。
+    /// 与签名路径同口径：显式 Deny 优先、无匹配即拒。
+    pub async fn anonymous_delete_decision(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(bool, Option<&'static str>), sqlx::Error> {
+        let Some(doc) = self.bucket_policy(bucket).await? else {
+            return Ok((false, Some("anonymous:no-policy")));
+        };
+        let pr = crate::policy::PolicyRequest {
+            op: "DeleteObjects",
+            ak: "",
+            uid: 0,
+            bucket,
+            key: Some(key),
+            anonymous: true,
+        };
+        Ok(
+            match crate::policy::s3_action("DeleteObject")
+                .and_then(|a| crate::policy::evaluate(&doc, &pr, a))
+            {
+                Some(true) => (true, None),
+                Some(false) => (false, Some("policy:deny")),
+                None => (false, Some("anonymous:no-match")),
+            },
+        )
     }
 
     /// M5 切片 5（S8）：会话策略交集融合——在表三档 × 桶策略之后叠会话判定：
@@ -768,8 +806,92 @@ pub(crate) fn acl_err(e: sqlx::Error) -> S3Error {
 }
 
 /// s3s 的授权入口：`check` 在反序列化**前**对每个请求执行（我们已 `set_auth` → 恒走；
-/// per-op 方法默认 Ok 是叠加非替代，无需实现）。判据与三面共用的 [`Acl::can`] 同源；匿名一律拒。
+/// per-op 方法默认 Ok 是叠加非替代，无需实现）。判据与三面共用的 [`Acl::can`] 同源；
+/// 匿名走 [`Acl::anonymous_decision`]（仅桶策略 + 数据面白名单），不进入表三档。
 impl Acl {
+    /// 匿名（无凭据）判权：**只**允许数据面对象操作，且**只**由桶策略显式 Allow。
+    /// 桶/控制面 op（列表、建删桶、策略/ACL/版本控制/MPU/tag/lock…）即使策略写了 Allow
+    /// 也拒——否则匿名策略可自举成提权；无策略/无匹配/策略读取失败一律拒（fail-closed）。
+    /// DeleteObjects 的键在请求体里 → 此处只要求存在桶策略，逐键判定下放 handler。
+    /// 返回 `(allow, detail)`；detail 用于审计（不含任何凭据）。
+    pub async fn anonymous_decision(
+        &self,
+        op: &str,
+        bucket: Option<&str>,
+        key: Option<&str>,
+    ) -> S3Result<(bool, Option<String>)> {
+        let data_plane = matches!(
+            op,
+            "GetObject" | "HeadObject" | "PutObject" | "DeleteObject" | "DeleteObjects"
+        );
+        if !data_plane {
+            return Ok((false, Some("anonymous:not-data-plane".to_string())));
+        }
+        let Some(b) = bucket else {
+            return Ok((false, Some("anonymous:no-bucket".to_string())));
+        };
+        let doc = match self.bucket_policy(b).await {
+            Ok(Some(doc)) => doc,
+            Ok(None) => return Ok((false, Some("anonymous:no-policy".to_string()))),
+            Err(e) => {
+                tracing::error!(error = %e, bucket = %b, "匿名请求读桶策略失败——fail-closed 拒绝");
+                return Ok((false, Some("policy:error".to_string())));
+            }
+        };
+        // DeleteObjects：check 阶段看不到键 → 下放 handler 逐键复评（与签名路径同构）。
+        if op == "DeleteObjects" {
+            return Ok((true, Some("anonymous:delegated".to_string())));
+        }
+        let Some(action) = crate::policy::s3_action(op) else {
+            return Ok((false, Some("anonymous:not-data-plane".to_string())));
+        };
+        let pr = crate::policy::PolicyRequest {
+            op,
+            ak: "",
+            uid: 0,
+            bucket: b,
+            key,
+            anonymous: true,
+        };
+        Ok(match crate::policy::evaluate(&doc, &pr, action) {
+            Some(true) => (true, Some("policy:allow".to_string())),
+            Some(false) => (false, Some("policy:deny".to_string())),
+            None => (false, Some("anonymous:no-match".to_string())),
+        })
+    }
+
+    /// 匿名判权 + 审计；放行时塞 [`AnonymousAccess`] 扩展供 handler 逐键复评。
+    /// 审计 uid=0（anonymous 哨兵；users 自增从 1 起，不写 AK/凭据）。
+    async fn check_anonymous(
+        &self,
+        cx: &mut S3AccessContext<'_>,
+        op: &str,
+        bucket: Option<&str>,
+        key: Option<&str>,
+    ) -> S3Result<()> {
+        let (allow, detail) = self.anonymous_decision(op, bucket, key).await?;
+        if let Err(e) = self
+            .write_audit(
+                0,
+                op,
+                bucket,
+                key,
+                if allow { "allow" } else { "deny" },
+                detail.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "审计落行失败");
+        }
+        if allow {
+            cx.extensions_mut().insert(AnonymousAccess);
+            Ok(())
+        } else {
+            tracing::warn!(uid = 0, op, bucket = ?bucket, "匿名授权拒绝");
+            Err(s3s::s3_error!(AccessDenied, "access denied"))
+        }
+    }
+
     /// M8 S1：把 `check` 的判定主体抽成可复用方法（AP 路由用；`check` 包装后照常审计）。
     /// `copy_src` = 已解析的 (源桶, 源键)，仅 CopyObject 使用；返回 (allow, detail)。
     #[allow(clippy::too_many_arguments)]
@@ -832,7 +954,7 @@ impl Acl {
         // 两轴**各自**融合：dst 轴所有 op；src 轴仅 CopyObject 且**始终**评估（与目标桶有无
         // 策略无关——旧实现把 src 评估嵌在 dst 有策略分支内，dst 无策略时 src Deny 被完全
         // 跳过：verifier 阻断 1a）。策略读/解析失败按轴 fail-closed 拒（不静默放行）。
-        // 未映射 op（s3_action None）不参与。匿名放行未实现——记档于 policy.rs 头注。
+        // 未映射 op（s3_action None）不参与。匿名请求不进本方法（`check` 已分流，见上）。
         let (mut saw_deny, mut saw_error, mut saw_allow) = (false, false, false);
         if !delegated && let Some(b) = &bucket {
             match self.bucket_policy(b).await {
@@ -843,6 +965,7 @@ impl Acl {
                         uid: user.uid,
                         bucket: b,
                         key,
+                        anonymous: false,
                     };
                     // CopyObject 的目标桶策略管目标写（不走 s3_action 通用映射）
                     let act = if is_copy(op) {
@@ -884,6 +1007,7 @@ impl Acl {
                             uid: user.uid,
                             bucket: src_bucket,
                             key: Some(src_key),
+                            anonymous: false,
                         };
                         if let Some(sa) = crate::policy::s3_action("GetObject") {
                             match crate::policy::evaluate(&sdoc, &spr, sa) {
@@ -921,6 +1045,7 @@ impl Acl {
                 uid: user.uid,
                 bucket: src_bucket,
                 key: Some(src_key),
+                anonymous: false,
             });
             let ((d, s), detail) = self
                 .fuse_session(
@@ -930,6 +1055,7 @@ impl Acl {
                         uid: user.uid,
                         bucket: b,
                         key,
+                        anonymous: false,
                     },
                     src_pr,
                     allow_dst,
@@ -971,9 +1097,16 @@ impl Acl {
 #[async_trait::async_trait]
 impl S3Access for Acl {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        // 先克隆 AK（credentials() 借自 cx，与随后的 extensions_mut 冲突）
+        // op 先取成 owned：下文匿名分支需要 &mut cx 塞扩展，不能持有 cx 的借用。
+        let op = cx.s3_op().name().to_string();
+        let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
+        let key: Option<String> = cx.s3_path().as_object().map(|(_, k)| k.to_string());
+        // 先克隆 AK（credentials() 借自 cx，与随后的 extensions_mut 冲突）。
+        // 无凭据 = 匿名：仅桶策略数据面白名单，显式 Allow 必需、Deny 优先。
         let Some(ak) = cx.credentials().map(|c| c.access_key.clone()) else {
-            return Err(s3s::s3_error!(AccessDenied, "Authentication required"));
+            return self
+                .check_anonymous(cx, &op, bucket.as_deref(), key.as_deref())
+                .await;
         };
         let user = self
             .user_of_key(&ak)
@@ -986,9 +1119,7 @@ impl S3Access for Acl {
         // 管理员旁路**表级三档**，但不再提前 return：桶策略的显式 Deny 对管理员同样生效
         // （AWS 语义），且管理员请求照常落审计。旧实现此处直接 Ok，Deny 与审计双双落空
         // （verifier 阻断 2——两侧都要，admin 与子账户各自被检查项覆盖）。
-        let op = cx.s3_op().name();
-        let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
-        let key: Option<String> = cx.s3_path().as_object().map(|(_, k)| k.to_string());
+        let op = op.as_str();
         let copy_src: Option<(String, String)> = if is_copy(op) {
             match cx
                 .headers()
@@ -1331,6 +1462,18 @@ mod tests {
             .unwrap();
     }
 
+    async fn set_policy(a: &Acl, bucket: &str, json: &str) {
+        sqlx::query(
+            "INSERT INTO bucket_policies (bucket, policy_json) VALUES (?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET policy_json = excluded.policy_json",
+        )
+        .bind(bucket)
+        .bind(json)
+        .execute(&a.pool)
+        .await
+        .unwrap();
+    }
+
     async fn grant(a: &Acl, uid: i64, bucket: &str, r: bool, w: bool, d: bool) {
         sqlx::query(
             "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, ?, ?, ?, ?)",
@@ -1458,6 +1601,335 @@ mod tests {
 
         // 无行 = 无权限（fail-closed）
         assert!(!a.can(SUB, Action::Read, "nope").await.unwrap());
+    }
+
+    /// 匿名放行面：显式 Allow 必需、资源前缀生效；写/删各自需要对应 action；
+    /// 桶/控制面 op 即使策略 `s3:*` 也拒（fail-closed）。
+    #[tokio::test]
+    async fn anonymous_requires_explicit_allow_and_data_plane_only() {
+        let a = acl().await;
+        add_bucket(&a, "pub", None).await;
+        // 无策略：数据面也拒
+        let (allow, detail) = a
+            .anonymous_decision("GetObject", Some("pub"), Some("a"))
+            .await
+            .unwrap();
+        assert!(!allow);
+        assert_eq!(detail.as_deref(), Some("anonymous:no-policy"));
+
+        // Allow "*" 只覆盖 public/* 的读；HEAD 走同一 s3:GetObject
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::pub/public/*"}]}"#,
+        )
+        .await;
+        for (op, key) in [
+            ("GetObject", "public/a"),
+            ("HeadObject", "public/a"),
+            ("GetObject", "private/a"),
+            ("PutObject", "public/a"),
+            ("DeleteObject", "public/a"),
+        ] {
+            let (allow, _) = a.anonymous_decision(op, Some("pub"), Some(key)).await.unwrap();
+            let read = matches!(op, "GetObject" | "HeadObject");
+            assert_eq!(allow, read && key == "public/a", "{op} {key}");
+        }
+        // 前缀外 HEAD 同样拒
+        assert!(
+            !a.anonymous_decision("HeadObject", Some("pub"), Some("private/a"))
+                .await
+                .unwrap()
+                .0
+        );
+
+        // 写/删动作各自需要显式 Allow
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+                "Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],
+                "Resource":"arn:aws:s3:::pub/public/*"}]}"#,
+        )
+        .await;
+        for op in ["GetObject", "HeadObject", "PutObject", "DeleteObject"] {
+            assert!(
+                a.anonymous_decision(op, Some("pub"), Some("public/a"))
+                    .await
+                    .unwrap()
+                    .0,
+                "{op}"
+            );
+        }
+        // DeleteObjects：check 阶段只要求存在策略，键级判定在 handler
+        assert!(
+            a.anonymous_decision("DeleteObjects", Some("pub"), None)
+                .await
+                .unwrap()
+                .0
+        );
+        add_bucket(&a, "empty", None).await;
+        assert!(
+            !a.anonymous_decision("DeleteObjects", Some("empty"), None)
+                .await
+                .unwrap()
+                .0,
+            "无策略桶的匿名批量删必须在 check 层拒"
+        );
+        // 无桶路径
+        assert!(
+            !a.anonymous_decision("GetObject", None, Some("a"))
+                .await
+                .unwrap()
+                .0
+        );
+
+        // 桶/控制面 op：策略全通配也一律拒
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*",
+                "Resource":["arn:aws:s3:::pub","arn:aws:s3:::pub/*"]}]}"#,
+        )
+        .await;
+        let control_plane = [
+            "ListBuckets",
+            "ListObjects",
+            "ListObjectsV2",
+            "HeadBucket",
+            "CreateBucket",
+            "DeleteBucket",
+            "PutBucketPolicy",
+            "DeleteBucketPolicy",
+            "GetBucketVersioning",
+            "PutBucketVersioning",
+            "CreateMultipartUpload",
+            "UploadPart",
+            "CompleteMultipartUpload",
+            "AbortMultipartUpload",
+            "ListParts",
+            "ListMultipartUploads",
+            "GetObjectTagging",
+            "PutObjectTagging",
+            "DeleteObjectTagging",
+            "GetObjectRetention",
+            "PutObjectRetention",
+            "CopyObject",
+            "UploadPartCopy",
+            "PostObject",
+            "RestoreObject",
+            "SelectObjectContent",
+            "GetBucketLifecycleConfiguration",
+            "PutBucketLifecycleConfiguration",
+            "DeleteBucketLifecycle",
+            "GetBucketEncryption",
+            "PutBucketEncryption",
+            "PutBucketNotificationConfiguration",
+            "PutBucketReplication",
+            "GetBucketInventoryConfiguration",
+            "PutBucketInventoryConfiguration",
+            "Frobnicate",
+        ];
+        for op in control_plane {
+            let (allow, detail) = a
+                .anonymous_decision(op, Some("pub"), Some("public/a"))
+                .await
+                .unwrap();
+            assert!(!allow, "匿名不得放行 {op}");
+            assert_eq!(
+                detail.as_deref(),
+                Some("anonymous:not-data-plane"),
+                "{op}"
+            );
+        }
+
+        // 策略读取/解析失败 → fail-closed 拒（不是 500）
+        set_policy(&a, "pub", "{not-json").await;
+        let (allow, detail) = a
+            .anonymous_decision("GetObject", Some("pub"), Some("public/a"))
+            .await
+            .unwrap();
+        assert!(!allow);
+        assert_eq!(detail.as_deref(), Some("policy:error"));
+    }
+
+    /// 匿名 Deny 优先 + Principal 只认 "*"（uid:0/空 AK/具体 AK 不得命中）。
+    #[tokio::test]
+    async fn anonymous_deny_wins_and_principal_is_wildcard_only() {
+        let a = acl().await;
+        add_bucket(&a, "pub", None).await;
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[
+                {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+                 "Resource":"arn:aws:s3:::pub/*"},
+                {"Effect":"Deny","Principal":{"AWS":["*"]},"Action":"s3:GetObject",
+                 "Resource":"arn:aws:s3:::pub/secret*"}]}"#,
+        )
+        .await;
+        assert!(
+            a.anonymous_decision("GetObject", Some("pub"), Some("open"))
+                .await
+                .unwrap()
+                .0
+        );
+        let (allow, detail) = a
+            .anonymous_decision("GetObject", Some("pub"), Some("secret/x"))
+            .await
+            .unwrap();
+        assert!(!allow);
+        assert_eq!(detail.as_deref(), Some("policy:deny"));
+
+        // 非通配 Principal 不因 uid=0 哨兵或空 AK 命中
+        for principal in [r#""uid:0""#, r#""""#, r#""AKIA_OTHER""#] {
+            set_policy(
+                &a,
+                "pub",
+                &format!(
+                    r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":{principal}}},
+                    "Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}]}}"#
+                ),
+            )
+            .await;
+            let (allow, detail) = a
+                .anonymous_decision("GetObject", Some("pub"), Some("open"))
+                .await
+                .unwrap();
+            assert!(!allow, "匿名不得命中 Principal {principal}");
+            assert_eq!(detail.as_deref(), Some("anonymous:no-match"));
+        }
+    }
+
+    /// 匿名 DeleteObjects 逐键：策略 Allow 才放；Deny 优先；无匹配/无策略拒；不回落表三档。
+    #[tokio::test]
+    async fn anonymous_delete_objects_per_key_matrix() {
+        let a = acl().await;
+        add_bucket(&a, "pub", None).await;
+        assert_eq!(
+            a.anonymous_delete_decision("pub", "a").await.unwrap(),
+            (false, Some("anonymous:no-policy"))
+        );
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[
+                {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:DeleteObject",
+                 "Resource":"arn:aws:s3:::pub/*"},
+                {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObject",
+                 "Resource":"arn:aws:s3:::pub/secret*"}]}"#,
+        )
+        .await;
+        assert_eq!(
+            a.anonymous_delete_decision("pub", "public/a").await.unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            a.anonymous_delete_decision("pub", "secret/a").await.unwrap(),
+            (false, Some("policy:deny"))
+        );
+        // 前缀式 Allow + 前缀外键：无匹配即拒
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:DeleteObject",
+                "Resource":"arn:aws:s3:::pub/public/*"}]}"#,
+        )
+        .await;
+        assert_eq!(
+            a.anonymous_delete_decision("pub", "other/a").await.unwrap(),
+            (false, Some("anonymous:no-match"))
+        );
+        // uid:0 专属 Principal 不得放行匿名
+        set_policy(
+            &a,
+            "pub",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"uid:0"},"Action":"s3:DeleteObject",
+                "Resource":"arn:aws:s3:::pub/*"}]}"#,
+        )
+        .await;
+        assert!(
+            !a.anonymous_delete_decision("pub", "a")
+                .await
+                .unwrap()
+                .0
+        );
+    }
+
+    /// 签名路径不因匿名分支改变：桶主/策略提升/表三档口径保持原样。
+    #[tokio::test]
+    async fn signed_path_unaffected_by_anonymous_branch() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_user(&a, 3, false).await;
+        add_bucket(&a, "owned", Some(2)).await;
+        let owner = AuthedUser {
+            uid: 2,
+            is_admin: false,
+            ak: "AK2".into(),
+        };
+        // 桶主无策略：签名放行；匿名同一桶无策略拒
+        assert!(
+            a.check_op(&owner, "AK2", "GetObject", Some("owned"), Some("k"), None)
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            !a.anonymous_decision("GetObject", Some("owned"), Some("k"))
+                .await
+                .unwrap()
+                .0
+        );
+
+        // 非桶主无表权限：uid 专属策略 Allow 仍可提升签名用户（既有语义）；匿名不命中
+        add_bucket(&a, "shared", None).await;
+        set_policy(
+            &a,
+            "shared",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"uid:3"},"Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::shared/*"}]}"#,
+        )
+        .await;
+        let sub = AuthedUser {
+            uid: 3,
+            is_admin: false,
+            ak: "AK3".into(),
+        };
+        assert!(
+            a.check_op(&sub, "AK3", "GetObject", Some("shared"), Some("k"), None)
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            !a.anonymous_decision("GetObject", Some("shared"), Some("k"))
+                .await
+                .unwrap()
+                .0
+        );
+
+        // 通配策略对签名用户语义不变（无表权限也可被策略 Allow 提升）；匿名同时放行
+        set_policy(
+            &a,
+            "shared",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::shared/*"}]}"#,
+        )
+        .await;
+        assert!(
+            a.check_op(&sub, "AK3", "GetObject", Some("shared"), Some("k"), None)
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            a.anonymous_decision("GetObject", Some("shared"), Some("k"))
+                .await
+                .unwrap()
+                .0
+        );
     }
 
     #[tokio::test]
@@ -1715,6 +2187,7 @@ mod session_tests {
                 uid: 7,
                 bucket,
                 key,
+                anonymous: false,
             },
             src.map(|(sb, sk)| crate::policy::PolicyRequest {
                 op,
@@ -1722,6 +2195,7 @@ mod session_tests {
                 uid: 7,
                 bucket: sb,
                 key: Some(sk),
+                anonymous: false,
             }),
             d,
             s,

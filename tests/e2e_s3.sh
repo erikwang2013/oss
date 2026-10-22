@@ -14,13 +14,15 @@ PERM_BUCKET="zzz-perm-read-$(date +%s)"
 OTHER_BUCKET="zzz-perm-other-$(date +%s)"
 POLICY_BUCKET="pol-$(date +%s)"
 POLICY2_BUCKET="pol2-$(date +%s)"
+# 匿名（无凭据）策略放行面（步骤 17f）
+ANON_BUCKET="anon-$(date +%s)"
 # M5 段（步骤 18）的两个桶：SSE 与对象锁
 SSE_BUCKET="sse-$(date +%s)"
 LOCK_BUCKET="lock-$(date +%s)"
 # M8 前置（步骤 20）：对象标签 + CopyObject DIRECTIVE
 TAG_BUCKET="tag-$(date +%s)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET" "$SSE_BUCKET" "$LOCK_BUCKET" "$TAG_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
+trap 'rm -rf "$WORK"; for b in "$BUCKET" "$PERM_BUCKET" "$OTHER_BUCKET" "$POLICY_BUCKET" "$POLICY2_BUCKET" "$ANON_BUCKET" "$SSE_BUCKET" "$LOCK_BUCKET" "$TAG_BUCKET"; do aws --endpoint-url "$ENDPOINT" s3 rb "s3://$b" --force >/dev/null 2>&1 || true; done' EXIT
 
 export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_DEFAULT_REGION=us-east-1
 aws_s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
@@ -542,6 +544,90 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/api/v1/users/
   -H "authorization: Bearer $ADMIN_TOKEN")
 [ "$CODE" = "204" ] || { echo "删策略测试子账户应 204，实际 $CODE"; exit 1; }
 echo "   桶策略段通过（Deny 优先/400 校验/审计查询/清策略恢复/S3 面删桶清策略/Deny 压过授权行）"
+
+echo "== 17f. 匿名（无凭据）：桶策略 Principal\"*\" 仅放行数据面对象操作 =="
+aws_s3 mb "s3://$ANON_BUCKET" >/dev/null
+printf 'anon-open\n' > "$WORK/anon-open.txt"
+printf 'anon-secret\n' > "$WORK/anon-secret.txt"
+aws_s3 cp "$WORK/anon-open.txt" "s3://$ANON_BUCKET/pub/open.txt" >/dev/null
+aws_s3 cp "$WORK/anon-open.txt" "s3://$ANON_BUCKET/pub/d1.txt" >/dev/null
+aws_s3 cp "$WORK/anon-secret.txt" "s3://$ANON_BUCKET/priv/data.txt" >/dev/null
+# 无策略：匿名数据面也 403（不回退任何用户权限）
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/$ANON_BUCKET/pub/open.txt")
+[ "$CODE" = "403" ] || { echo "无策略匿名 GET 应 403，实际 $CODE"; exit 1; }
+# 只给具体 AK 的策略：匿名仍 403（Principal 非 "*" 不匹配）
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$ANON_BUCKET/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"'"$AK"'"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$ANON_BUCKET"'/*"}]}')
+[ "$CODE" = "204" ] || { echo "写具体 AK 策略应 204，实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/$ANON_BUCKET/pub/open.txt")
+[ "$CODE" = "403" ] || { echo "具体 AK Principal 不应放行匿名，实际 $CODE"; exit 1; }
+# 通配 Allow（pub/* 读/写/删）+ priv/* 读/删显式 Deny（Deny 优先）
+ANON_POL='{"Statement":[
+  {"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::'"$ANON_BUCKET"'/pub/*"},
+  {"Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::'"$ANON_BUCKET"'/priv/*"}]}'
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$ANON_BUCKET/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d "$ANON_POL")
+[ "$CODE" = "204" ] || { echo "写匿名策略应 204，实际 $CODE"; exit 1; }
+
+echo "--- 17f1. 匿名 GET/HEAD 放行（pub/*）；Deny/策略外 403 无存在性预言 ---"
+curl -s "$ENDPOINT/$ANON_BUCKET/pub/open.txt" | cmp - "$WORK/anon-open.txt" || { echo "匿名 GET 内容不符"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -I "$ENDPOINT/$ANON_BUCKET/pub/open.txt")
+[ "$CODE" = "200" ] || { echo "匿名 HEAD 应 200，实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/$ANON_BUCKET/priv/data.txt")
+[ "$CODE" = "403" ] || { echo "匿名 GET 显式 Deny 应 403，实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/$ANON_BUCKET/priv/missing.txt")
+[ "$CODE" = "403" ] || { echo "Deny 前缀不存在键也应 403（无存在性预言），实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/$ANON_BUCKET/other/missing.txt")
+[ "$CODE" = "403" ] || { echo "策略外键应 403，实际 $CODE"; exit 1; }
+# 签名（管理员）行为不变
+aws_s3 cp "s3://$ANON_BUCKET/pub/open.txt" "$WORK/anon-signed" >/dev/null || { echo "签名请求回归失败"; exit 1; }
+
+echo "--- 17f2. 匿名 PUT → 往返；匿名 DELETE 放行/拒绝 ---"
+printf 'anon-put\n' > "$WORK/anon-put.txt"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/anon-put.txt" \
+  "$ENDPOINT/$ANON_BUCKET/pub/up.txt")
+[ "$CODE" = "200" ] || { echo "匿名 PUT 应 200，实际 $CODE"; exit 1; }
+curl -s "$ENDPOINT/$ANON_BUCKET/pub/up.txt" | cmp - "$WORK/anon-put.txt" || { echo "匿名 PUT 往返不符"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/$ANON_BUCKET/priv/data.txt")
+[ "$CODE" = "403" ] || { echo "匿名 DELETE 显式 Deny 应 403，实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/$ANON_BUCKET/pub/up.txt")
+[ "$CODE" = "204" ] || { echo "匿名 DELETE 放行应 204，实际 $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -I "$ENDPOINT/$ANON_BUCKET/pub/up.txt")
+[ "$CODE" = "404" ] || { echo "匿名删除后 HEAD 应 404，实际 $CODE"; exit 1; }
+
+echo "--- 17f3. 匿名 DeleteObjects：允许键 Deleted、Deny 键 Errors（请求级 200）---"
+DOUT=$(curl -s -X POST "$ENDPOINT/$ANON_BUCKET?delete" -H 'content-type: application/xml' \
+  --data-binary '<Delete><Object><Key>pub/d1.txt</Key></Object><Object><Key>priv/data.txt</Key></Object></Delete>')
+echo "$DOUT" | grep -q '<Key>pub/d1.txt</Key>' || { echo "匿名批量删未删允许键: $DOUT"; exit 1; }
+echo "$DOUT" | grep -q 'AccessDenied' || { echo "匿名批量删 Deny 键应 AccessDenied: $DOUT"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$ANON_BUCKET" --key pub/d1.txt >/dev/null 2>&1 \
+  && { echo "pub/d1.txt 应已删"; exit 1; }
+aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$ANON_BUCKET" --key priv/data.txt >/dev/null \
+  || { echo "priv/data.txt 不应被删"; exit 1; }
+
+echo "--- 17f4. 匿名控制面：策略 Allow 也只放数据面，控制面一律 403 ---"
+for spec in "PUT /$ANON_BUCKET?policy" "DELETE /$ANON_BUCKET" "GET /$ANON_BUCKET?versioning" \
+            "GET /$ANON_BUCKET?list-type=2" "POST /$ANON_BUCKET?uploads"; do
+  m=${spec%% *}; p=${spec#* }
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X "$m" "$ENDPOINT$p")
+  [ "$CODE" = "403" ] || { echo "匿名控制面 $m $p 应 403，实际 $CODE"; exit 1; }
+done
+
+echo "--- 17f5. 匿名审计 uid=0（allow/deny 都落行）---"
+AJSON=$(curl -s "$ENDPOINT/api/v1/audit?limit=200" -H "authorization: Bearer $ADMIN_TOKEN")
+echo "$AJSON" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+assert any(r.get("uid")==0 and r.get("decision")=="allow" and r.get("op")=="GetObject" for r in rows), "缺匿名 allow 审计行"
+assert any(r.get("uid")==0 and r.get("decision")=="deny" for r in rows), "缺匿名 deny 审计行"
+' || { echo "匿名审计断言失败: $AJSON"; exit 1; }
+# 收尾：清策略后删桶（Deny 会挡 --force 的批量删）
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$ANON_BUCKET/policy" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"Statement":[]}')
+[ "$CODE" = "204" ] || { echo "清匿名策略应 204，实际 $CODE"; exit 1; }
+aws_s3 rb "s3://$ANON_BUCKET" --force >/dev/null
+echo "   匿名 Principal 段通过（数据面白名单/Deny 优先/控制面 403/批量删逐键/审计 uid=0）"
 
 echo "== 18. M5 安全：SSE 三模式 + 对象锁 + STS 临时凭据（验收 ①②③④）=="
 # 前置（README「加密（M5）」运维口径）：服务须以密钥库启动（OSS_MASTER_KEY_FILE 与/或
