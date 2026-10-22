@@ -1,12 +1,13 @@
 //! 版本控制（M4 切片 3）：delete marker、指定版本读、版本枚举。
 //!
-//! 桶状态（Off/Enabled）由 S3 层从 `buckets.versioning` 读出后**显式传入**——store 不查库
-//! （与 MeshTransport 注入同一条信任边界原则）。链约定：`XlMeta.versions` 追加序
-//! （链尾 = 最新）；版本控制桶的历史版本目录不可变（写路径不回收、删路径进 trash），
-//! 因此历史版本读没有并发覆写窗口。
+//! 桶状态（Off/Enabled/Suspended）由 S3 层从 `buckets.versioning` 读出后**显式传入**——store
+//! 不查库（与 MeshTransport 注入同一条信任边界原则）。链约定：`XlMeta.versions` 追加序
+//! （链尾 = 最新）；Enabled 桶的历史版本目录不可变（写路径不回收、删路径进 trash），因此
+//! 历史版本读没有并发覆写窗口；Suspended 桶写/删只动 null 版本并保留非 null 历史。
 //!
 //! 明确边界（v1）：
-//! - PutBucketVersioning 只接受 Off→Enabled（单向）；Suspended 由 S3 层拒绝（记档）。
+//! - 状态机（Off/Enabled/Suspended 的合法迁移、Object Lock 桶拒绝 Suspended）由 S3 层裁决；
+//!   store 只按传入模式执行。
 //! - `ListObjectVersions` 集群路径 = 本机键集 ∪ 各 peer 首页（limit=max+1 完备性证明
 //!   同对象列表）；每键的**完整链**由 cluster 感知的 `read_meta` 取（逐键一次，低频运维面，
 //!   与对象列表的"零逐键 RPC"口径在此有意放宽——量级上来再做分页 RPC）。
@@ -929,7 +930,9 @@ impl Store {
                 "version-id-marker 需要同时提供 key-marker".into(),
             ));
         }
-        // 键集（完备性同对象列表：各源首页 limit=max+1 的并集覆盖全局前 max 键）
+        // 键集（完备性同对象列表：各源首页 limit=max+2 的并集覆盖全局前 max 键）。
+        // +2：key_marker 命中的键可能因 version_id_marker 断点续而产出 0 条，需要多取一个
+        // 后继键才能判定截断（否则续页 is_truncated=false，客户端提前收尾丢键）。
         let mut keys: Vec<String> = {
             // 先按 key_marker 过滤再截断：否则 >max+1 键的桶第二页为空（本地截断早于
             // key_marker 的应用）。key_marker 本身保留（其版本链从 version_id_marker 续）。
@@ -941,7 +944,7 @@ impl Store {
                 .filter(|k| key_marker.is_none_or(|km| k.as_str() >= km))
                 .collect();
             local.sort();
-            local.truncate(max + 1);
+            local.truncate(max + 2);
             local
         };
         if let Some(cl) = self.cfg.cluster.as_deref() {
@@ -957,7 +960,8 @@ impl Store {
                     // 版本列表：key_marker 是包含的续点；远端不得从头返回（否则 >limit 的
                     // 续页键整段缺失）。delete-marker 链尾的键也必须出现在版本列表。
                     marker: key_marker.map(str::to_string),
-                    limit: max + 1,
+                    // +2 同本地：续点键可能产出 0 条，多取一键用于判定截断。
+                    limit: max + 2,
                     include_deleted: true,
                 };
                 match cl.transport.list_local(&n.id, req).await {

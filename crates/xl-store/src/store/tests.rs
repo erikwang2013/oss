@@ -2463,7 +2463,7 @@ async fn meta_roundtrips_checksum_record() {
         None,
         Default::default(),
         Some(rec.clone()),
-        false,
+        VersioningMode::Off,
         None,
         None,
         None,
@@ -3463,6 +3463,85 @@ async fn cluster_list_union_and_pagination() {
     assert_eq!(seen, expect, "分页枚举应恰好一次全覆盖");
 }
 
+/// 集群版本列表：key-marker 必须传到 peer（否则续页重复/缺失），且链尾为 delete marker
+/// 的键必须保留（远端 `ListLocal` 的 include_deleted）。
+#[tokio::test]
+async fn cluster_list_versions_keeps_markers_and_paginates_remotely() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    // n2 掉线期写入：n2 本地无键，列表只能靠 peer 页（marker 传播才可验证）
+    c.mesh.down("n2");
+    for i in 0..6 {
+        s1.put_object("bkt", &format!("k{i}"), Bytes::from_static(b"v"), None)
+            .await
+            .unwrap();
+    }
+    s1.put_object_stream_with_meta(
+        "bkt",
+        "dead",
+        Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"v"))
+        })),
+        None,
+        Default::default(),
+        None,
+        VersioningMode::Enabled,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    s1.delete_object_versioned("bkt", "dead", None, VersioningMode::Enabled)
+        .await
+        .unwrap();
+    c.mesh.up("n2");
+
+    let s2 = &c.stores[1];
+    let mut seen: Vec<(String, String, bool)> = Vec::new();
+    let (mut km, mut vm) = (None, None);
+    for _ in 0..20 {
+        let p = s2
+            .list_object_versions("bkt", "", 2, km.as_deref(), vm.as_deref())
+            .await
+            .unwrap();
+        seen.extend(
+            p.entries
+                .iter()
+                .map(|e| (e.key.clone(), e.version_id.clone(), e.is_marker)),
+        );
+        if !p.is_truncated {
+            break;
+        }
+        km = p.next_key_marker;
+        vm = p.next_version_id_marker;
+    }
+    assert_eq!(
+        seen.len(),
+        8,
+        "6 个单版本键 + dead 的数据与 marker：{seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|(k, _, _)| k == "dead").count(),
+        2,
+        "dead 链两版都应列出：{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|(k, _, m)| k == "dead" && *m),
+        "delete-marker-latest 键不得被隐藏：{seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].0 <= w[1].0),
+        "跨页键序必须升序：{seen:?}"
+    );
+    let mut uniq = seen.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), 8, "key-marker 未传播会导致续页重复：{seen:?}");
+}
+
 /// Task 7：fsck 差集检测 + 缺键补建闭环（验收② in-process 版）。
 #[tokio::test]
 async fn cluster_fsck_detects_and_repairs_missing_meta() {
@@ -3811,7 +3890,7 @@ async fn versioning_chain_full_flow() {
             None,
             Default::default(),
             None,
-            true, // versioned
+            VersioningMode::Enabled, // versioned
             None,
             None,
             None,
@@ -3858,7 +3937,7 @@ async fn versioning_chain_full_flow() {
 
     // delete marker：普通读 404、对象列表不见、版本列表见 marker 为 latest
     let out = s
-        .delete_object_versioned("alpha", "k", None, true)
+        .delete_object_versioned("alpha", "k", None, VersioningMode::Enabled)
         .await
         .unwrap();
     let marker_id = match out {
@@ -3888,7 +3967,7 @@ async fn versioning_chain_full_flow() {
     // 删 marker → 恢复可见（读回 c）；同时验证 rank 防倒退（verifier #2）：
     // 链重写必须把修订序号抬到旧链 max+1——否则掉线盘的旧链会凭平/高秩在选举中翻盘
     let pre_dm = read_disk_meta(&s, "alpha", "k").await.max_epoch();
-    s.delete_object_versioned("alpha", "k", Some(&marker_id), true)
+    s.delete_object_versioned("alpha", "k", Some(&marker_id), VersioningMode::Enabled)
         .await
         .unwrap();
     let post_dm = read_disk_meta(&s, "alpha", "k").await.max_epoch();
@@ -3921,7 +4000,7 @@ async fn versioning_chain_full_flow() {
     assert_eq!(p2.entries[0].version_id, v_ids[2], "续页无重叠无遗漏");
 
     // 点名删 v1：读 404、目录进 trash
-    s.delete_object_versioned("alpha", "k", Some(&v_ids[2]), true)
+    s.delete_object_versioned("alpha", "k", Some(&v_ids[2]), VersioningMode::Enabled)
         .await
         .unwrap();
     assert!(matches!(
@@ -3940,17 +4019,17 @@ async fn versioning_chain_full_flow() {
             "alpha",
             "k",
             Some("00000000-0000-0000-0000-000000000000"),
-            true,
+            VersioningMode::Enabled,
         )
         .await
         .unwrap();
     assert!(matches!(out, DeleteOutcome::NotFound));
 
     // 删光 → 整键清理
-    s.delete_object_versioned("alpha", "k", Some(&v_ids[0]), true)
+    s.delete_object_versioned("alpha", "k", Some(&v_ids[0]), VersioningMode::Enabled)
         .await
         .unwrap();
-    s.delete_object_versioned("alpha", "k", Some(&v_ids[1]), true)
+    s.delete_object_versioned("alpha", "k", Some(&v_ids[1]), VersioningMode::Enabled)
         .await
         .unwrap();
     assert!(matches!(
@@ -3972,7 +4051,7 @@ async fn versioning_chain_full_flow() {
     // 不存在的键：版本桶 delete 也创建 marker（S3 语义）——单盘 write_meta_on 需自建目录
     // （verifier 抓的回归：曾因对象目录缺失 500）
     let out = s
-        .delete_object_versioned("alpha", "fresh", None, true)
+        .delete_object_versioned("alpha", "fresh", None, VersioningMode::Enabled)
         .await
         .unwrap();
     assert!(matches!(out, DeleteOutcome::Marker { .. }));
@@ -3998,7 +4077,7 @@ async fn versioning_chain_full_flow() {
         .await
         .unwrap();
     let out = s
-        .delete_object_versioned("alpha", "plain", None, false)
+        .delete_object_versioned("alpha", "plain", None, VersioningMode::Off)
         .await
         .unwrap();
     assert_eq!(out, DeleteOutcome::Object { tiers: vec![] });
@@ -4091,7 +4170,7 @@ async fn scrub_detects_bad_and_missing_shards_full_chain() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

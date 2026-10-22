@@ -1715,3 +1715,5 @@ mod tests_sync;
 mod tests_tags;
 #[cfg(test)]
 mod tests_tier;
+#[cfg(test)]
+mod tests_versioning;
