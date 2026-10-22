@@ -1,12 +1,13 @@
 //! 一个 Router 承载全部 HTTP 面：控制台 + aetherupload + S3 fallback（M1 后续任务往这里加）。
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
 use axum::error_handling::HandleError;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -143,7 +144,40 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     };
     // 层在路由之后挂：同时包住 fallback（S3 面）。
     let app = app.layer(middleware::from_fn(restore_accepted));
+    // M8：SourceIp 条件求值的连接对端（最外层，S3 fallback 也覆盖）。ecat 的 serve 不带
+    // connect_info，生产用可信反代注入 XFF；只有显式 `OSS_AP_TRUSTED_PROXY=1` 才信首段。
+    let trust_proxy = std::env::var("OSS_AP_TRUSTED_PROXY")
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
+        ap_peer(req, next, trust_proxy)
+    }));
     Ok(app)
+}
+
+/// 连接对端 → `ApPeer` extension（缺失则由 AP 的 SourceIp 条件 fail-closed）。
+async fn ap_peer(mut req: Request, next: Next, trust_proxy: bool) -> Response {
+    let ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_canonical())
+        .or_else(|| trust_proxy.then(|| forwarded_ip(req.headers())).flatten());
+    if let Some(ip) = ip {
+        req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
+    }
+    next.run(req).await
+}
+
+/// `X-Forwarded-For` 首段（原始客户端；多级代理时由最近的可信代理追加）。
+fn forwarded_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 async fn raft_status(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -508,6 +542,24 @@ async fn handle_s3_error(err: s3s::HttpError) -> (StatusCode, String) {
 mod tests {
     use super::label_escape;
     use axum::http::StatusCode;
+
+    #[test]
+    fn forwarded_ip_takes_first_hop_only() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(super::forwarded_ip(&h).is_none());
+        h.insert(
+            "x-forwarded-for",
+            " 203.0.113.5 , 10.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            super::forwarded_ip(&h),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        h.insert("x-forwarded-for", "::1".parse().unwrap());
+        assert_eq!(super::forwarded_ip(&h), Some("::1".parse().unwrap()));
+        h.insert("x-forwarded-for", "garbage".parse().unwrap());
+        assert!(super::forwarded_ip(&h).is_none());
+    }
 
     /// RestoreObject 线上状态修复：仅 POST `?restore` 的 200 → 202 + `x-amz-restore`；
     /// 普通 POST/GET 与形似查询（`x-restore`）原样通过。

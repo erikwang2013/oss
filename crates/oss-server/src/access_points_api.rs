@@ -16,7 +16,7 @@ use crate::console::{control_failure, control_rejection};
 use crate::db::Db;
 use crate::raft::{ControlCommand, ControlResponse};
 use crate::state::AppState;
-use xl_s3::ap::{AccessPoint, ApSource};
+use xl_s3::ap::{AccessPoint, ApSource, valid_ap_name};
 use xl_s3::olap::OlapTransform;
 
 /// `/api/v1/access-points`（挂 console nest 下；JWT 已由外层 JwtLayer 校验）。
@@ -63,18 +63,11 @@ fn bad(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
 
-fn valid_ap_name(name: &str) -> bool {
-    (3..=63).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-}
-
 fn row_json(r: &crate::db::AccessPointRow) -> serde_json::Value {
     serde_json::json!({
         "name": r.name, "bucket": r.bucket, "owner_id": r.owner_id,
+        // 别名确定性地由名字派生，不落库（改名不存在，删建即换）。
+        "alias": format!("{}{}", r.name, xl_s3::ap::ALIAS_SUFFIX),
         "policy": r.policy_json.as_ref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
         "created_at": r.created_at, "updated_at": r.updated_at,
     })

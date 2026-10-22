@@ -833,6 +833,7 @@ async fn access_points_api_crud() {
     assert_eq!(r.status(), 200);
     let rows: serde_json::Value = r.json().await.unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["alias"], "ap-one-s3alias", "M8 别名由控制面下发");
     let r = client
         .get(format!("{base}/api/v1/access-points/ap-one"))
         .bearer_auth(&tok)

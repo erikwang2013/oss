@@ -34,8 +34,23 @@ struct Env {
 }
 
 async fn env(dir: &std::path::Path) -> Env {
+    env_with_peer(dir, None).await
+}
+
+/// `peer` = 模拟连接对端（SourceIp 条件）；注入在最外层，等价于真实 listener 的
+/// connect_info（ecat 内置 listener 不提供，生产由 router 的信任反代路径补）。
+async fn env_with_peer(dir: &std::path::Path, peer: Option<std::net::IpAddr>) -> Env {
     let st = state(dir).await;
     let app = build_router(st.clone()).unwrap();
+    let app = match peer {
+        Some(ip) => app.layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
+                next.run(req).await
+            },
+        )),
+        None => app,
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -251,14 +266,20 @@ async fn signed(
 
     let payload_hex = hex::encode(Sha256::digest(body));
     let amz = amz_now();
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap()
-        .split('/')
-        .next()
-        .unwrap()
-        .to_string();
+    // 显式 Host 头（别名 Host 形式）必须参与签名；否则退回 URL authority。
+    let host = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_else(|| {
+            url.split("://")
+                .nth(1)
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap()
+                .to_string()
+        });
 
     let mut to_sign: Vec<(String, String)> = vec![
         ("host".into(), host),
@@ -1232,21 +1253,37 @@ async fn object_ops_through_ap() {
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("CopyPartResult"));
 
-    // 不支持形状：DeleteObjects → 501
-    let delete_xml = b"<Delete><Object><Key>dir/copy.txt</Key></Object></Delete>";
+    // DeleteObjects 经 AP：逐键部分成功（幂等空删也进 Deleted）
+    let delete_xml = b"<Delete><Object><Key>dir/copy.txt</Key></Object>\
+                       <Object><Key>dir/nope</Key></Object></Delete>";
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/ops-ap?delete",
+        &[],
+        delete_xml,
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let xml = r.text().await.unwrap();
+    assert!(xml.contains("<Deleted><Key>dir/copy.txt</Key>"), "{xml}");
+    assert!(xml.contains("<Deleted><Key>dir/nope</Key>"), "{xml}");
     assert_eq!(
         send_status(
             &e,
-            Method::POST,
-            "/ap/ops-ap?delete",
+            Method::GET,
+            "/ap/ops-ap/dir/copy.txt",
             &[],
-            delete_xml,
+            b"",
             &ak,
             &sk,
             "s3"
         )
         .await,
-        501
+        404
     );
 }
 
@@ -1818,4 +1855,479 @@ async fn inner_direct_and_sts_fallback() {
     .await;
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("GetSessionTokenResponse"));
+}
+
+// ---------- M8 缺口：DeleteObjects / `<name>-s3alias` / SourceIp ----------
+
+/// DeleteObjects 经 AP：AP 策略与基线逐键取交集；被拒键部分失败，绝不删除。
+#[tokio::test]
+async fn delete_objects_through_ap_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "admin", true).await;
+    bucket(&e, "delb", Some(uid)).await;
+    let policy = serde_json::json!({"Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"*"},
+         "Action":["s3:PutObject","s3:GetObject","s3:ListBucket","s3:DeleteObject"],
+         "Resource":["arn:aws:s3:::delb","arn:aws:s3:::delb/*"]},
+        {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObject",
+         "Resource":"arn:aws:s3:::delb/ap-denied/*"}
+    ]})
+    .to_string();
+    direct_ap(&e, "del-ap", "delb", uid, Some(&policy)).await;
+    // 基线兜底：桶策略 Deny 的键即使 AP Allow 也拒（交集，不放松）
+    set_bucket_policy(
+        &e,
+        "delb",
+        Some(
+            &serde_json::json!({"Statement":[{
+                "Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObject",
+                "Resource":"arn:aws:s3:::delb/base-denied/*"}]})
+            .to_string(),
+        ),
+    )
+    .await;
+
+    for key in ["ok/a", "ap-denied/b", "base-denied/c"] {
+        assert_eq!(
+            send_status(
+                &e,
+                Method::PUT,
+                &format!("/ap/del-ap/{key}"),
+                &[],
+                b"x",
+                &ak,
+                &sk,
+                "s3"
+            )
+            .await,
+            200,
+            "{key}"
+        );
+    }
+    let xml = b"<Delete>\
+        <Object><Key>ok/a</Key></Object>\
+        <Object><Key>ap-denied/b</Key></Object>\
+        <Object><Key>base-denied/c</Key></Object>\
+        </Delete>";
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/del-ap?delete",
+        &[],
+        xml,
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Deleted><Key>ok/a</Key>"), "{body}");
+    assert!(!body.contains("<Deleted><Key>ap-denied/b</Key>"), "{body}");
+    assert!(
+        !body.contains("<Deleted><Key>base-denied/c</Key>"),
+        "{body}"
+    );
+    assert_eq!(
+        body.matches("<Code>AccessDenied</Code>").count(),
+        2,
+        "{body}"
+    );
+    // 被拒键仍可读，放行键已删
+    for (key, want) in [("ok/a", 404), ("ap-denied/b", 200), ("base-denied/c", 200)] {
+        assert_eq!(
+            send_status(
+                &e,
+                Method::GET,
+                &format!("/ap/del-ap/{key}"),
+                &[],
+                b"",
+                &ak,
+                &sk,
+                "s3"
+            )
+            .await,
+            want,
+            "{key}"
+        );
+    }
+    // 审计：AP 拒键带 ap:deny，与基线 policy:deny 可区分
+    assert_eq!(
+        count(
+            &e,
+            "SELECT COUNT(*) FROM audit_log WHERE op='DeleteObjects' \
+             AND object_key='ap-denied/b' AND decision='deny' AND detail LIKE '%ap:deny%'"
+        )
+        .await,
+        1
+    );
+}
+
+/// DeleteObjects 经 AP 支持 VersionId；请求体畸形/超限在 check 阶段即拒。
+#[tokio::test]
+async fn delete_objects_through_ap_versioned_and_bad_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "verb", Some(uid)).await;
+    e.st.acl()
+        .set_bucket_versioning("verb", "Enabled")
+        .await
+        .unwrap();
+    direct_ap(&e, "ver-ap", "verb", uid, None).await;
+
+    let mut versions = Vec::new();
+    for content in ["one", "two"] {
+        let r = signed(
+            &e,
+            Method::PUT,
+            "/ap/ver-ap/k",
+            &[],
+            content.as_bytes(),
+            &ak,
+            &sk,
+            "s3",
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        versions.push(
+            r.headers()
+                .get("x-amz-version-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let xml = format!(
+        "<Delete><Object><Key>k</Key><VersionId>{}</VersionId></Object></Delete>",
+        versions[0]
+    );
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/ver-ap?delete",
+        &[],
+        xml.as_bytes(),
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains(&format!("<VersionId>{}</VersionId>", versions[0])),
+        "{body}"
+    );
+    // 指定版本已删，当前版本（two）仍在
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            &format!("/ap/ver-ap/k?versionId={}", versions[0]),
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        404
+    );
+    let r = signed(&e, Method::GET, "/ap/ver-ap/k", &[], b"", &ak, &sk, "s3").await;
+    assert_eq!(r.text().await.unwrap(), "two");
+
+    // 空体 → MissingRequestBodyError；畸形/1001 键 → MalformedXML
+    let cases: [(&[u8], &str); 2] = [
+        (b"", "MissingRequestBodyError"),
+        (b"<Delete><Object>", "MalformedXML"),
+    ];
+    for (body, code) in cases {
+        let r = signed(
+            &e,
+            Method::POST,
+            "/ap/ver-ap?delete",
+            &[],
+            body,
+            &ak,
+            &sk,
+            "s3",
+        )
+        .await;
+        assert_eq!(r.status(), 400, "{code}");
+        let text = r.text().await.unwrap();
+        assert!(text.contains(&format!("<Code>{code}</Code>")), "{text}");
+    }
+    let mut many = String::from("<Delete>");
+    for i in 0..=1000 {
+        many.push_str(&format!("<Object><Key>k{i}</Key></Object>"));
+    }
+    many.push_str("</Delete>");
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/ver-ap?delete",
+        &[],
+        many.as_bytes(),
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+    // AWS：>1000 键同样回 MalformedXML（不是 InvalidRequest）
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("<Code>MalformedXML</Code>")
+    );
+    // 1 MiB 上限：超一个字节 → EntityTooLarge。AWS 错误表映射 400（S3 无 413 错误码）；
+    // 带 Content-Length 的请求由 s3s 自定义路由预检在 check_access 前按同码拒绝。
+    let oversize = vec![b'x'; 1024 * 1024 + 1];
+    let r = signed(
+        &e,
+        Method::POST,
+        "/ap/ver-ap?delete",
+        &[],
+        &oversize,
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("<Code>EntityTooLarge</Code>")
+    );
+}
+
+/// 别名：路径首段与 Host 首标签两种形态；未知别名 404 不回落桶；建桶保留后缀。
+#[tokio::test]
+async fn alias_path_and_host_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "aliasb", Some(uid)).await;
+    direct_ap(&e, "alias-ap", "aliasb", uid, None).await;
+    let alias = "alias-ap-s3alias";
+
+    // 路径形式；键含 `/` 原样可用
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            &format!("/{alias}/dir/a.txt"),
+            &[],
+            b"hello",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    let r = signed(
+        &e,
+        Method::GET,
+        &format!("/{alias}/dir/a.txt"),
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "hello");
+    let r = signed(
+        &e,
+        Method::GET,
+        &format!("/{alias}?list-type=2"),
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert!(r.text().await.unwrap().contains("dir/a.txt"));
+
+    // Host 形式（带端口/大小写）：签名覆盖原始 Host
+    let host = "ALIAS-AP-s3alias.example.com:19000";
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/dir/b.txt",
+            &[("host", host)],
+            b"world",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    let r = signed(
+        &e,
+        Method::GET,
+        "/dir/b.txt",
+        &[("host", host)],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "world");
+
+    // DELETE 经别名
+    assert_eq!(
+        send_status(
+            &e,
+            Method::DELETE,
+            &format!("/{alias}/dir/a.txt"),
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        204
+    );
+
+    // 未知别名（路径/Host）→ 404 NoSuchAccessPoint，绝不回落桶路由
+    let r = signed(&e, Method::GET, "/nope-s3alias/x", &[], b"", &ak, &sk, "s3").await;
+    assert_eq!(r.status(), 404);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("<Code>NoSuchAccessPoint</Code>")
+    );
+    let r = signed(
+        &e,
+        Method::GET,
+        "/x",
+        &[("host", "nope-s3alias.example.com")],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 404);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("<Code>NoSuchAccessPoint</Code>")
+    );
+
+    // 后缀保留：所有建桶路径共用 validate_bucket
+    assert!(e.st.store.create_bucket("foo-s3alias").await.is_err());
+}
+
+/// SourceIp 条件：允许网段放行、NotIpAddress 拒；畸形 CIDR 保存即 400。
+#[tokio::test]
+async fn source_ip_condition_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    // 对端 10.8.8.8：在 Allow 的 10/8 内，不在 Deny 的 NotIpAddress 10.9/16 内
+    let e = env_with_peer(dir.path(), Some("10.8.8.8".parse().unwrap())).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "ipb", Some(uid)).await;
+    let policy = serde_json::json!({"Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:GetObject"],
+         "Resource":"arn:aws:s3:::ipb/*",
+         "Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","2001:db8::/32"]}}},
+        {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+         "Resource":"arn:aws:s3:::ipb/secret*",
+         "Condition":{"NotIpAddress":{"aws:SourceIp":"10.9.0.0/16"}}}
+    ]})
+    .to_string();
+    direct_ap(&e, "ip-ap", "ipb", uid, Some(&policy)).await;
+
+    assert_eq!(
+        send_status(&e, Method::PUT, "/ap/ip-ap/open", &[], b"x", &ak, &sk, "s3").await,
+        200
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/ap/ip-ap/secret/s",
+            &[],
+            b"x",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send_status(&e, Method::GET, "/ap/ip-ap/open", &[], b"", &ak, &sk, "s3").await,
+        200
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/ip-ap/secret/s",
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        403
+    );
+
+    // 畸形 CIDR：控制面保存 400（不落库，不会运行期 fail-open）
+    let token = login(&e.base, "owner").await;
+    let bad = serde_json::json!({"name":"bad-ap","bucket":"ipb","policy":{"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+        "Resource":"arn:aws:s3:::ipb/*",
+        "Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}]}});
+    let r = e
+        .http
+        .post(format!("{}/api/v1/access-points", e.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}
+
+/// 无连接对端：带 IP 条件的语句一律不匹配（fail-closed）。
+#[tokio::test]
+async fn source_ip_absent_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "ipnb", Some(uid)).await;
+    let policy = serde_json::json!({"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:GetObject"],
+        "Resource":"arn:aws:s3:::ipnb/*",
+        "Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}]})
+    .to_string();
+    direct_ap(&e, "ipn-ap", "ipnb", uid, Some(&policy)).await;
+    assert_eq!(
+        send_status(&e, Method::PUT, "/ap/ipn-ap/k", &[], b"x", &ak, &sk, "s3").await,
+        403
+    );
+    assert_eq!(
+        send_status(&e, Method::GET, "/ap/ipn-ap/k", &[], b"", &ak, &sk, "s3").await,
+        403
+    );
 }

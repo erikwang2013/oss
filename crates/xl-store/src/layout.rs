@@ -38,7 +38,10 @@ pub fn validate_bucket(name: &str) -> Result<()> {
     if looks_like_ipv4 {
         return reject();
     }
-    if ok_len && ok_chars && ok_edges && ok_no_dotdot && ok_no_xn {
+    // 保留 AP 别名后缀（M8）：`/<name>-s3alias/<key>` 优先当别名解析，撞后缀的桶名
+    // 永远不会被路径式寻址到。选择收口于此（所有建桶路径共用），而非只挡 S3 面。
+    let ok_no_alias = !name.ends_with("-s3alias");
+    if ok_len && ok_chars && ok_edges && ok_no_dotdot && ok_no_xn && ok_no_alias {
         Ok(())
     } else {
         reject()
@@ -189,6 +192,9 @@ mod tests {
         // S3 规则：不得以 xn-- 开头（保留前缀，规格 §2.1）
         assert!(validate_bucket("xn--bucket").is_err());
         assert!(validate_bucket("a-xn--bucket").is_ok()); // 只拦开头
+        // AP 别名后缀保留（M8）：只拦结尾，其余位置照常
+        assert!(validate_bucket("foo-s3alias").is_err());
+        assert!(validate_bucket("foo-s3alias-x").is_ok());
     }
 
     #[test]

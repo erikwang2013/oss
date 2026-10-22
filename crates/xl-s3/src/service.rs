@@ -2430,9 +2430,50 @@ impl S3 for OssS3 {
             .extensions
             .get::<crate::access::AnonymousAccess>()
             .is_some();
+        // M8 AP：经访问点的批量删由 ApRoute::check_access 挂上下文，逐键叠 AP 策略交集。
+        let ap_delete = req.extensions.get::<crate::ap::ApDeletePolicy>();
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for obj in req.input.delete.objects {
+            // AP 拒键先于基线判定；拒键绝不进入 delete_versioned（安全边界）。
+            if let Some(p) = ap_delete {
+                let denied = match &user {
+                    Some(u) => {
+                        crate::ap::ap_decision(
+                            &p.ap,
+                            u,
+                            "DeleteObjects",
+                            Some(&obj.key),
+                            p.source_ip,
+                        ) == Some(false)
+                    }
+                    None => true, // 防御性 fail-closed
+                };
+                if denied {
+                    let uid = user.as_ref().map_or(0, |u| u.uid);
+                    if let Err(e) = self
+                        .acl
+                        .write_audit(
+                            uid,
+                            "DeleteObjects",
+                            Some(&bucket),
+                            Some(&obj.key),
+                            "deny",
+                            Some("ap:deny"),
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "审计落行失败");
+                    }
+                    errors.push(Error {
+                        key: Some(obj.key),
+                        code: Some("AccessDenied".to_string()),
+                        message: Some("access denied".to_string()),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            }
             let decision = match (&user, anonymous) {
                 (Some(u), _) => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
                 (None, true) => self.acl.anonymous_delete_decision(&bucket, &obj.key).await,

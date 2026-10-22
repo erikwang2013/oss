@@ -196,6 +196,8 @@ export interface AccessPointInfo {
   name: string
   bucket: string
   owner_id: number
+  /** `<name>-s3alias`：路径首段或 Host 首标签。 */
+  alias: string
   policy: unknown | null
   created_at: number
   updated_at: number
