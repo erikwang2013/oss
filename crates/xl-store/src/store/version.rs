@@ -131,6 +131,9 @@ pub struct VersionEntry {
     pub storage_class: Option<String>,
     /// M8 S4b：分层阶段（None = 无 tier 记录；对账扫描用）。
     pub tier_phase: Option<crate::meta::TierPhase>,
+    /// M8：live tier 引用（远端 GC 的「永不删除」集合；None = 无远端副本）。
+    pub tier_backend: Option<String>,
+    pub tier_key: Option<String>,
     /// M6：复制状态（Transition sweep 跳过 PENDING/FAILED）。
     pub replication_status: Option<String>,
     /// M8 S4b：SSE 对象不参与 Transition（sweep 跳过）。
@@ -147,6 +150,8 @@ pub struct VersionList {
     /// 下一页续点 = 本页最后一条的 (key, version_id)（S3 的 NextKeyMarker/NextVersionIdMarker 语义）
     pub next_key_marker: Option<String>,
     pub next_version_id_marker: Option<String>,
+    /// 集群下某 peer 键集拉取失败：本页是缺项的并集（GC 等「必须完整」的调用方据此 fail closed）。
+    pub degraded: bool,
 }
 
 impl Store {
@@ -947,6 +952,7 @@ impl Store {
             local.truncate(max + 2);
             local
         };
+        let mut degraded = false;
         if let Some(cl) = self.cfg.cluster.as_deref() {
             let self_id = cl.sets.flat.self_node().id.clone();
             for n in &cl.sets.flat.nodes {
@@ -968,6 +974,7 @@ impl Store {
                 match cl.transport.list_local(&n.id, req).await {
                     Ok(page) => keys.extend(page.entries.into_iter().map(|e| e.key)),
                     Err(e) => {
+                        degraded = true;
                         tracing::warn!(node = %n.id, error = %e, "peer 键集拉取失败（少一路并集）")
                     }
                 }
@@ -976,7 +983,10 @@ impl Store {
         keys.sort();
         keys.dedup();
 
-        let mut out = VersionList::default();
+        let mut out = VersionList {
+            degraded,
+            ..VersionList::default()
+        };
         'keys: for k in keys {
             if let Some(km) = key_marker
                 && k.as_str() < km
@@ -1023,6 +1033,8 @@ impl Store {
                     mod_time_nanos: v.mod_time_nanos,
                     storage_class: v.storage_class.clone(),
                     tier_phase: v.tier.as_ref().map(|t| t.phase),
+                    tier_backend: v.tier.as_ref().map(|t| t.backend.clone()),
+                    tier_key: v.tier.as_ref().map(|t| t.key.clone()),
                     replication_status: v.replication_status.clone(),
                     encrypted: v.encryption.is_some(),
                     remote_version_id: v.remote_version_id.clone(),
