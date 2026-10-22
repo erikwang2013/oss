@@ -1,9 +1,9 @@
 //! M6 切片 0：事件发射点（S3 面）——`EventSink` trait 注入（裁决：保持 crate 依赖方向，
 //! xl-s3 不依赖 oss-server；接收方实现写 `event_outbox`）。
 //!
-//! 发射点 = 六条 S3 写/删路径（Put/Copy/CompleteMPU/Delete/DeleteMarkerCreated×2 处读删）；
-//! 事件类型口径见工作令 R5（对象事件直发；生命周期事件由 oss-server 侧生命周期 worker 直发；
-//! ObjectAccessed 本片不实现）。发射失败**绝不影响**请求结果（接收方自吞并 warn）。
+//! 发射点 = S3 写/删路径（Put/Copy/CompleteMPU/Delete/DeleteMarkerCreated×2 处读删）+
+//! 读路径访问事件（Get/Head）。事件类型口径见工作令 R5（对象事件直发；生命周期事件由
+//! oss-server 侧生命周期 worker 直发）。发射失败**绝不影响**请求结果（接收方自吞并 warn）。
 
 use http::HeaderMap;
 
@@ -71,6 +71,10 @@ pub enum S3EventOp {
     RestorePost,
     /// M8 S4b：`s3:ObjectRestore:Completed`（恢复完成可读）
     RestoreCompleted,
+    /// 读路径：`s3:ObjectAccessed:Get`（GET 成功 200/206；304/416/错误不发）
+    AccessedGet,
+    /// 读路径：`s3:ObjectAccessed:Head`（HEAD 成功 200；304/错误不发）
+    AccessedHead,
 }
 
 impl S3EventOp {
@@ -85,6 +89,8 @@ impl S3EventOp {
             Self::LifecycleTransition => "s3:LifecycleTransition",
             Self::RestorePost => "s3:ObjectRestore:Post",
             Self::RestoreCompleted => "s3:ObjectRestore:Completed",
+            Self::AccessedGet => "s3:ObjectAccessed:Get",
+            Self::AccessedHead => "s3:ObjectAccessed:Head",
         }
     }
 
@@ -150,5 +156,10 @@ mod tests {
         );
         assert!(S3EventOp::RemovedDelete.is_removed());
         assert!(!S3EventOp::CreatedCopy.is_removed());
+        assert_eq!(S3EventOp::AccessedGet.event_name(), "s3:ObjectAccessed:Get");
+        assert_eq!(
+            S3EventOp::AccessedHead.event_name(),
+            "s3:ObjectAccessed:Head"
+        );
     }
 }

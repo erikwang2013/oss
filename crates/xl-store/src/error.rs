@@ -20,6 +20,9 @@ pub enum Error {
     NoSuchUpload(String),
     #[error("invalid part: {0}")]
     InvalidPart(String),
+    /// GET/HEAD `?partNumber`：段号超过对象段数（或旧对象未记录边界/空段）→ S3 416。
+    #[error("part number out of range: {0}")]
+    InvalidPartRange(String),
     #[error("parts not in ascending order: {0}")]
     InvalidPartOrder(String),
     #[error("part too small: {0}")]

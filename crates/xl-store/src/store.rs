@@ -1712,6 +1712,8 @@ mod tests_crypto;
 #[cfg(test)]
 mod tests_lock;
 #[cfg(test)]
+mod tests_parts;
+#[cfg(test)]
 mod tests_replication;
 #[cfg(test)]
 mod tests_sync;

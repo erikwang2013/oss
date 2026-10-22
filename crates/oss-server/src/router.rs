@@ -7,7 +7,7 @@ use axum::Json;
 use axum::Router;
 use axum::error_handling::HandleError;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
@@ -86,6 +86,12 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     .with_fallback(sts);
     s3_builder.set_route(ap);
     let s3 = s3_builder.build();
+    // 读路径补全 Task 5：s3s 0.17 的 Range 解析对多区间（`bytes=0-1,3-4`）直接 400；
+    // 冻结裁决不实现 multipart/byteranges —— 仅 S3 面剥离 Range 头，GET/HEAD 降级整对象 200。
+    // 包成 mini Router 挂 fallback，控制面路由不受影响。
+    let s3: Router = Router::new()
+        .fallback_service(HandleError::new(s3, handle_s3_error))
+        .layer(middleware::from_fn(strip_multirange));
 
     // 控制面：`/api/v1` 整体走 jwt-rust 的 JwtLayer，`/login` 在 except 名单里
     // （名单与 12h 过期都在 AppState::new；nest 会先剥掉 `/api/v1` 前缀，层看到的是 `/login`）。
@@ -114,7 +120,7 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         .route("/api/v1/raft/status", get(raft_status))
         .nest("/api/v1", console)
         .merge(aether.with_state(()))
-        .fallback_service(HandleError::new(s3, handle_s3_error))
+        .fallback_service(s3)
         .with_state(state.clone());
     // S7.1：Raft RPC 路由只在 `[raft]` 下挂载；走集群令牌，不经 console JWT 层。
     let app = match state.raft.clone() {
@@ -167,6 +173,21 @@ async fn restore_accepted(req: Request, next: Next) -> Response {
             .or_insert(HeaderValue::from_static("ongoing-request=\"true\""));
     }
     res
+}
+
+/// 多区间 Range（`bytes=0-1,3-4`）在 s3s 0.17 解析层直接 400；冻结裁决不做
+/// multipart/byteranges —— S3 面剥离该头，GET/HEAD 降级整对象 200。单区间原样透传。
+async fn strip_multirange(mut req: Request, next: Next) -> Response {
+    let multi = matches!(*req.method(), Method::GET | Method::HEAD)
+        && req
+            .headers()
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains(','));
+    if multi {
+        req.headers_mut().remove(header::RANGE);
+    }
+    next.run(req).await
 }
 
 /// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
@@ -538,6 +559,54 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// 多区间 Range 在 S3 fallback 前被剥离（降级整对象）；单区间原样透传。
+    #[tokio::test]
+    async fn multi_range_header_stripped_before_s3_fallback() {
+        async fn echo_range(req: axum::extract::Request) -> String {
+            req.headers()
+                .get(axum::http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        }
+        let app = axum::Router::new()
+            .fallback(echo_range)
+            .layer(axum::middleware::from_fn(super::strip_multirange));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+
+        let res = http
+            .get(format!("http://{addr}/b/k"))
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.text().await.unwrap(), "", "多区间头应被剥离");
+
+        let res = http
+            .get(format!("http://{addr}/b/k"))
+            .header(axum::http::header::RANGE, "bytes=0-3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "bytes=0-3", "单区间不剥离");
+
+        let res = http
+            .post(format!("http://{addr}/b/k"))
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.text().await.unwrap(),
+            "bytes=0-1,3-4",
+            "非 GET/HEAD 不剥离"
+        );
     }
 
     /// 标签值转义：坏配置（node id 带引号/反斜杠/换行）不得产出坏样本行。

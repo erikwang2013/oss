@@ -903,6 +903,7 @@ impl Store {
             },
             // 单段 PUT 的 parts 恒 None（多段只出现在 M2a 旧对象的只读兼容位）
             parts: None,
+            part_sizes: None,
             checksum: checksum.clone(),
             data_layout,
             inline,

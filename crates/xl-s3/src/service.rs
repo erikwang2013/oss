@@ -1702,6 +1702,7 @@ impl S3 for OssS3 {
         let bucket = req.input.bucket;
         let key = req.input.key;
         let version_id = req.input.version_id.clone();
+        let part_number = req.input.part_number;
         // M5 切片 3：SSE-C 读钥（GET 只有 customer 三件套；服务端校验在 store 读路径）
         let sse = parse_sse(
             req.input.sse_customer_algorithm.as_deref(),
@@ -1710,10 +1711,17 @@ impl S3 for OssS3 {
             None,
             None,
         )?;
+        // 冻结裁决：partNumber + Range 组合不做（part 内相对区间留后续）
+        if part_number.is_some() && req.input.range.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "partNumber and Range cannot be used together"
+            ));
+        }
 
         // 条件求值需要 info：统一先取一次 head（Range 分支本来也要 size）；条件失败不读盘上数据。
         // M4：带 versionId 时点读该版本（marker 版本 → 405 DeleteMarker，经 to_s3_error）。
-        let info = match &version_id {
+        let mut info = match &version_id {
             Some(v) => {
                 self.store
                     .head_object_version_ext(&bucket, &key, v, sse.key.as_ref())
@@ -1745,15 +1753,73 @@ impl S3 for OssS3 {
             return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
         }
 
-        // Range → 有界读 + 206/416；无 Range → 整读 + 200。两条路共用同一份响应组装。
-        let (bytes, content_range, status) = match req.input.range {
-            Some(range) => {
-                // 越界 → RangeNotSatisfiable → InvalidRange(416)
-                let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
-                let (start, end) = (rr.start, rr.end);
-                let bytes = if start == 0 && end == info.size {
-                    // 显式全段 Range：仍回 206（S3 语义），数据走整读
-                    match &version_id {
+        // partNumber → 段区间读（206 + Content-Range + parts_count）；Range → 有界读 +
+        // 206/416；无 Range → 整读 + 200。三条路共用同一份响应组装。
+        let mut parts_count = None;
+        let (bytes, content_range, status) = if let Some(pn) = part_number {
+            let (part_info, bytes, span, n) = self
+                .store
+                .get_object_part_ext(&bucket, &key, version_id.as_deref(), pn, sse.key.as_ref())
+                .await
+                .map_err(to_s3_error)?;
+            info = part_info;
+            parts_count = Some(n as i32);
+            let cr = format!("bytes {}-{}/{}", span.start, span.end - 1, info.size);
+            (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
+        } else {
+            match req.input.range {
+                Some(range) => {
+                    // 越界 → RangeNotSatisfiable → InvalidRange(416)
+                    let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
+                    let (start, end) = (rr.start, rr.end);
+                    let bytes = if start == 0 && end == info.size {
+                        // 显式全段 Range：仍回 206（S3 语义），数据走整读
+                        match &version_id {
+                            Some(v) => {
+                                self.store
+                                    .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
+                                    .await
+                            }
+                            None => {
+                                self.store
+                                    .get_object_ext(&bucket, &key, sse.key.as_ref())
+                                    .await
+                            }
+                        }
+                        .map_err(to_s3_error)?
+                        .1
+                    } else {
+                        match &version_id {
+                            Some(v) => {
+                                self.store
+                                    .get_object_range_version_ext(
+                                        &bucket,
+                                        &key,
+                                        v,
+                                        start..end,
+                                        sse.key.as_ref(),
+                                    )
+                                    .await
+                            }
+                            None => {
+                                self.store
+                                    .get_object_range_ext(
+                                        &bucket,
+                                        &key,
+                                        start..end,
+                                        sse.key.as_ref(),
+                                    )
+                                    .await
+                            }
+                        }
+                        .map_err(to_s3_error)?
+                    };
+                    // check 保证 end >= 1（start <= last < full_length 且区间非空）
+                    let cr = format!("bytes {}-{}/{}", start, end - 1, info.size);
+                    (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
+                }
+                None => {
+                    let bytes = match &version_id {
                         Some(v) => {
                             self.store
                                 .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
@@ -1766,52 +1832,24 @@ impl S3 for OssS3 {
                         }
                     }
                     .map_err(to_s3_error)?
-                    .1
-                } else {
-                    match &version_id {
-                        Some(v) => {
-                            self.store
-                                .get_object_range_version_ext(
-                                    &bucket,
-                                    &key,
-                                    v,
-                                    start..end,
-                                    sse.key.as_ref(),
-                                )
-                                .await
-                        }
-                        None => {
-                            self.store
-                                .get_object_range_ext(&bucket, &key, start..end, sse.key.as_ref())
-                                .await
-                        }
-                    }
-                    .map_err(to_s3_error)?
-                };
-                // check 保证 end >= 1（start <= last < full_length 且区间非空）
-                let cr = format!("bytes {}-{}/{}", start, end - 1, info.size);
-                (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
-            }
-            None => {
-                let bytes = match &version_id {
-                    Some(v) => {
-                        self.store
-                            .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
-                            .await
-                    }
-                    None => {
-                        self.store
-                            .get_object_ext(&bucket, &key, sse.key.as_ref())
-                            .await
-                    }
+                    .1;
+                    (bytes, None, StatusCode::OK)
                 }
-                .map_err(to_s3_error)?
-                .1;
-                (bytes, None, StatusCode::OK)
             }
         };
         let len = bytes.len() as i64;
         let restore = restore_header(&info);
+        // 读路径补全：成功 200/206 才发（304/416/错误已在上面提前返回）
+        self.emit(
+            S3EventOp::AccessedGet,
+            &bucket,
+            &key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            EventSource::from_headers(&req.headers),
+        )
+        .await;
 
         let mut out = GetObjectOutput {
             body: Some(StreamingBlob::from_bytes(bytes)),
@@ -1821,6 +1859,7 @@ impl S3 for OssS3 {
             last_modified: Some(last_modified(info.last_modified_nanos)),
             accept_ranges: Some("bytes".to_string()),
             content_range,
+            parts_count,
             // M8 S4b：x-amz-restore 三态
             restore,
             // 空集也回 Some(空)：AWS 语义下与 None 无差别，客户端按「无自定义元数据」处理
@@ -1906,7 +1945,14 @@ impl S3 for OssS3 {
             None,
             None,
         )?;
-        let info = match &version_id {
+        // 冻结裁决：partNumber + Range 组合不做（与 GET 同口径）
+        if req.input.part_number.is_some() && req.input.range.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "partNumber and Range cannot be used together"
+            ));
+        }
+        let mut info = match &version_id {
             Some(v) => {
                 self.store
                     .head_object_version_ext(&req.input.bucket, &req.input.key, v, sse.key.as_ref())
@@ -1938,9 +1984,53 @@ impl S3 for OssS3 {
             }
             return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
         }
+        // partNumber → 段区间（200 + 段 Content-Length/Content-Range + parts_count）。
+        let mut content_length = info.size as i64;
+        let mut content_range = None;
+        let mut parts_count = None;
+        if let Some(pn) = req.input.part_number {
+            let (part_info, span, n) = self
+                .store
+                .object_part_span(
+                    &req.input.bucket,
+                    &req.input.key,
+                    version_id.as_deref(),
+                    pn,
+                    sse.key.as_ref(),
+                )
+                .await
+                .map_err(to_s3_error)?;
+            info = part_info;
+            content_length = (span.end - span.start) as i64;
+            content_range = Some(format!(
+                "bytes {}-{}/{}",
+                span.start,
+                span.end - 1,
+                info.size
+            ));
+            parts_count = Some(n as i32);
+        } else if let Some(range) = &req.input.range {
+            // HEAD + Range：仍 200（HEAD 无 body/无 206），但头部按区间收窄；越界 416。
+            let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
+            content_length = (rr.end - rr.start) as i64;
+            content_range = Some(format!("bytes {}-{}/{}", rr.start, rr.end - 1, info.size));
+        }
         let restore = restore_header(&info);
+        // 读路径补全：HEAD 成功 200 才发（304/条件失败/错误已提前返回）
+        self.emit(
+            S3EventOp::AccessedHead,
+            &req.input.bucket,
+            &req.input.key,
+            info.version_id.as_deref(),
+            Some(info.size),
+            Some(&info.etag),
+            EventSource::from_headers(&req.headers),
+        )
+        .await;
         let mut out = HeadObjectOutput {
-            content_length: Some(info.size as i64),
+            content_length: Some(content_length),
+            content_range,
+            parts_count,
             content_type: info.content_type,
             e_tag: Some(ETag::Strong(info.etag)),
             last_modified: Some(last_modified(info.last_modified_nanos)),
@@ -1955,8 +2045,10 @@ impl S3 for OssS3 {
                 .map(|s| StorageClass::from(s.clone())),
             ..Default::default()
         };
-        // 校验和回写（HEAD）
-        if let Some(rec) = &info.checksum {
+        // 校验和回写（HEAD）：仅整对象（Range/partNumber 的头部按段收窄，回整对象校验和会误导客户端）
+        if out.content_range.is_none()
+            && let Some(rec) = &info.checksum
+        {
             apply_checksum_head(&mut out, rec);
         }
         // M5 切片 4（L6）：对象锁响应头（HEAD）

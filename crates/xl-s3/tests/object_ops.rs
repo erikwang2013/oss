@@ -1378,6 +1378,252 @@ async fn multipart_flow_through_service() {
 }
 
 #[tokio::test]
+async fn part_number_get_head_with_mpu_versions_and_legacy() {
+    // 读路径补全 Task 4：partNumber GET/HEAD（Content-Range/parts_count/版本点读/旧对象）。
+    // 非末段须 ≥ 5 MiB → 单 part 上限放到 16 MiB（service() 的 1 MiB 会 EntityTooLarge）
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s3 = OssS3::new(store, acl().await, 16 * 1024 * 1024);
+    let _d = dir;
+    s3.create_bucket(with_user(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    s3.put_bucket_versioning(req(PutBucketVersioningInput {
+        bucket: "alpha".into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        mfa: None,
+        versioning_configuration: VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static("Enabled")),
+            mfa_delete: None,
+        },
+    }))
+    .await
+    .unwrap();
+
+    // 两段 MPU（非末段须 ≥ 5 MiB）
+    let p1 = vec![b'a'; 5 * 1024 * 1024 + 1];
+    let p2 = vec![b'b'; 300_000];
+    let upload_id = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .upload_id
+        .unwrap();
+    let mut etags = Vec::new();
+    for (n, body) in [(1i32, p1.clone()), (2, p2.clone())] {
+        let out = s3
+            .upload_part(req(UploadPartInput {
+                bucket: "alpha".into(),
+                key: "mp".into(),
+                upload_id: upload_id.clone(),
+                part_number: n,
+                body: Some(StreamingBlob::from_bytes(Bytes::from(body))),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        etags.push(CompletedPart {
+            part_number: Some(n),
+            e_tag: Some(ETag::Strong(out.e_tag.unwrap().value().to_string())),
+            ..Default::default()
+        });
+    }
+    s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
+        bucket: "alpha".into(),
+        key: "mp".into(),
+        upload_id,
+        multipart_upload: Some(CompletedMultipartUpload { parts: Some(etags) }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let total = (p1.len() + p2.len()) as u64;
+    let cr1 = format!("bytes 0-{}/{}", p1.len() - 1, total);
+    let cr2 = format!("bytes {}-{}/{}", p1.len(), total - 1, total);
+
+    // GET part1：206 + 段长/段区间/段数 + 段内容
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(got.status, Some(http::StatusCode::PARTIAL_CONTENT));
+    assert_eq!(got.output.content_length, Some(p1.len() as i64));
+    assert_eq!(got.output.content_range.as_deref(), Some(cr1.as_str()));
+    assert_eq!(got.output.parts_count, Some(2));
+    let mut body = got.output.body.unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(buf, p1);
+
+    // GET part2：段内容为第二段
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(got.output.content_range.as_deref(), Some(cr2.as_str()));
+    let mut body = got.output.body.unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(buf, p2);
+
+    // HEAD part2：200（HEAD 恒 200）+ 段长/段区间/段数
+    let head = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(head.status, None);
+    assert_eq!(head.output.content_length, Some(p2.len() as i64));
+    assert_eq!(head.output.content_range.as_deref(), Some(cr2.as_str()));
+    assert_eq!(head.output.parts_count, Some(2));
+
+    // partNumber + Range → 400 InvalidRequest（GET/HEAD 同口径）
+    for err in [
+        s3.get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(1),
+            range: Some(Range::Int {
+                first: 0,
+                last: Some(3),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err(),
+        s3.head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(1),
+            range: Some(Range::Int {
+                first: 0,
+                last: Some(3),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ())
+        .unwrap_err(),
+    ] {
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+    }
+
+    // 超过段数 → 416 InvalidRange
+    for err in [
+        s3.get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(3),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err(),
+        s3.head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(3),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ())
+        .unwrap_err(),
+    ] {
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
+    }
+
+    // 版本点读：新 PUT 成为 latest 后，旧版本的 part2 仍按原边界读
+    let vid = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "mp".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"new"))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            version_id: Some(vid),
+            part_number: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(got.output.content_range.as_deref(), Some(cr2.as_str()));
+    let mut body = got.output.body.unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(buf, p2);
+
+    // 旧对象（单段 PUT）无 part_sizes：part1 = 整对象，part2 → 416
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(got.output.content_range.as_deref(), Some("bytes 0-2/3"));
+    assert_eq!(got.output.parts_count, Some(1));
+    let err = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            part_number: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
+}
+
+#[tokio::test]
 async fn multipart_create_tagging_lands_and_rejects_oversize() {
     // M8 缺口 A：Create 的 x-amz-tagging 在 complete 落地；>10 条在 Create 即拒
     let (s3, _d) = service().await;
@@ -1875,9 +2121,9 @@ async fn checksum_verified_before_commit_and_written_back() {
 }
 
 #[tokio::test]
-async fn head_with_range_still_returns_full_length() {
-    // 协议补全 Task 4：HEAD 带 Range **不支持**（钉契约防未来静默变化）——
-    // 仍回 200 + 全量 Content-Length（aws-cli/rclone 均不依赖 HEAD+Range 的 206 语义）。
+async fn head_with_range_narrows_length() {
+    // 读路径补全 Task 5：HEAD + Range → 200 + 区间长度/Content-Range（无 206、无 body）；
+    // 越界 → 416 InvalidRange。无 Range 时仍回全量。
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "alpha".into(),
@@ -1893,6 +2139,19 @@ async fn head_with_range_still_returns_full_length() {
     }))
     .await
     .unwrap();
+
+    let full = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "hr".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(full.status, None);
+    assert_eq!(full.output.content_length, Some(100));
+    assert!(full.output.content_range.is_none());
+
     let resp = s3
         .head_object(req(HeadObjectInput {
             bucket: "alpha".into(),
@@ -1907,11 +2166,24 @@ async fn head_with_range_still_returns_full_length() {
         .unwrap();
     // HEAD 路径用 S3Response::new（status None = 隐式 200；GET 才统一 with_status）
     assert_eq!(resp.status, None);
-    assert_eq!(
-        resp.output.content_length,
-        Some(100),
-        "HEAD+Range 仍回全量长度"
-    );
+    assert_eq!(resp.output.content_length, Some(10));
+    assert_eq!(resp.output.content_range.as_deref(), Some("bytes 0-9/100"));
+
+    // 越界 → 416
+    let err = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "hr".into(),
+            range: Some(Range::Int {
+                first: 200,
+                last: Some(299),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
 }
 
 // ---------- M5 切片 3：SSE 线级（P3-c 复验补——P2-a 类接线错此前无闸能抓） ----------
@@ -3268,6 +3540,107 @@ async fn events_emitted_on_all_write_paths() {
 }
 
 #[tokio::test]
+async fn accessed_events_only_on_successful_get_and_head() {
+    // ObjectAccessed：200/206/HEAD 200 才发；304/412/416 不发。
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let sink = Arc::new(MockSink::default());
+    let s3 = OssS3::new(store, acl().await, 16 * 1024 * 1024)
+        .with_events(Some(sink.clone() as Arc<dyn xl_s3::events::EventSink>));
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "acc".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let put = s3
+        .put_object(req(PutObjectInput {
+            bucket: "acc".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"abcdef"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let etag = put.e_tag.unwrap().value().to_string();
+    sink.got.lock().unwrap().clear(); // 丢掉 Put 事件
+
+    let get = |range: Option<Range>, if_none_match: Option<ETagCondition>| {
+        let input = GetObjectInput {
+            bucket: "acc".into(),
+            key: "k".into(),
+            range,
+            if_none_match,
+            ..Default::default()
+        };
+        let s3 = s3.clone();
+        async move { s3.get_object(req(input)).await }
+    };
+    get(None, None).await.unwrap(); // 200
+    get(
+        Some(Range::Int {
+            first: 1,
+            last: Some(2),
+        }),
+        None,
+    )
+    .await
+    .unwrap(); // 206
+    let head = |if_match: Option<ETagCondition>, if_none_match: Option<ETagCondition>| {
+        let input = HeadObjectInput {
+            bucket: "acc".into(),
+            key: "k".into(),
+            if_match,
+            if_none_match,
+            ..Default::default()
+        };
+        let s3 = s3.clone();
+        async move { s3.head_object(req(input)).await }
+    };
+    head(None, None).await.unwrap(); // 200
+    // 304 / 412 / 416：均不发事件
+    head(None, Some(ETagCondition::ETag(ETag::Strong(etag.clone()))))
+        .await
+        .unwrap();
+    let err = head(
+        Some(ETagCondition::ETag(ETag::Strong("deadbeef".into()))),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    let err = get(
+        Some(Range::Int {
+            first: 9999,
+            last: None,
+        }),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRange);
+
+    let got = sink.got.lock().unwrap().clone();
+    let names: Vec<&str> = got.iter().map(|g| g.0.event_name()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "s3:ObjectAccessed:Get",
+            "s3:ObjectAccessed:Get",
+            "s3:ObjectAccessed:Head",
+        ],
+        "{got:?}"
+    );
+    // 事件字段 = 实际读到的版本/大小/ETag
+    assert_eq!(got[0].1, "acc");
+    assert_eq!(got[0].2, "k");
+    assert_eq!(got[0].3, put.version_id);
+    assert_eq!(got[0].4, Some(6));
+    assert_eq!(got[0].5.as_deref(), Some(etag.as_str()));
+}
+
+#[tokio::test]
 async fn notification_config_api_roundtrip_and_errors() {
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {
@@ -3329,27 +3702,31 @@ async fn notification_config_api_roundtrip_and_errors() {
         .unwrap();
     assert_eq!(rules[0].value.as_ref().unwrap().as_str(), "logs/");
 
-    // ObjectAccessed → 400（R5 记档：本片不实现）
-    let bad = NotificationConfiguration {
-        queue_configurations: Some(QueueConfigurationList::from(vec![QueueConfiguration {
-            id: None,
-            queue_arn: QueueArn::from("arn:oss:sqs::t1:kafka".to_string()),
-            events: EventList::from(vec![Event::from("s3:ObjectAccessed:Get".to_string())]),
-            filter: None,
-        }])),
-        ..Default::default()
-    };
-    let e = s3
-        .put_bucket_notification_configuration(req(
+    // 读路径补全 Task 10：ObjectAccessed 的 Get/Head 与尾星通配均可配置
+    for ev in [
+        "s3:ObjectAccessed:Get",
+        "s3:ObjectAccessed:Head",
+        "s3:ObjectAccessed:*",
+    ] {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(QueueConfigurationList::from(vec![QueueConfiguration {
+                id: None,
+                queue_arn: QueueArn::from("arn:oss:sqs::t1:kafka".to_string()),
+                events: EventList::from(vec![Event::from(ev.to_string())]),
+                filter: None,
+            }])),
+            ..Default::default()
+        };
+        s3.put_bucket_notification_configuration(req(
             PutBucketNotificationConfigurationInput::builder()
                 .bucket("notifb".to_string())
-                .notification_configuration(bad)
+                .notification_configuration(cfg)
                 .build()
                 .unwrap(),
         ))
         .await
-        .unwrap_err();
-    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidArgument);
+        .unwrap_or_else(|e| panic!("{ev} 应可配置: {e:?}"));
+    }
 
     // 不存在的桶 → 404
     let e = s3
