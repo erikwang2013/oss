@@ -702,7 +702,32 @@ mod batch_wasm {
               (i64.extend_i32_u (local.get $len)))))
     "#;
 
-    async fn wasm_ap(f: &Fx, name: &str, max_response_bytes: i64) {
+    /// 定长输出（"Z"，长度 1 ≠ 输入长度）：验证输出由 guest 指定区域读取。
+    const FIXED: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (data (i32.const 8) "Z")
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "dealloc") (param i32 i32))
+          (func (export "transform") (param i32 i32) (result i64)
+            (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 1))))
+    "#;
+
+    /// 死循环，由 fuel/epoch 终止。
+    const LOOP: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "dealloc") (param i32 i32))
+          (func (export "transform") (param i32 i32) (result i64)
+            (loop $l (br $l))
+            (i64.const 0)))
+    "#;
+
+    /// 可编译但缺 alloc/dealloc/transform 导出。
+    const BAD_ABI: &str = r#"(module (memory (export "memory") 1))"#;
+
+    async fn wasm_ap_with(f: &Fx, name: &str, wat: &str, timeout_ms: i64, max_response_bytes: i64) {
         f.db()
             .create_access_point(name, "src", f.admin, None, 1)
             .await
@@ -712,9 +737,9 @@ mod batch_wasm {
                 name,
                 "wasm",
                 None,
-                Some(IDENTITY.as_bytes()),
+                Some(wat.as_bytes()),
                 None,
-                5_000,
+                timeout_ms,
                 max_response_bytes,
                 1,
             )
@@ -723,12 +748,16 @@ mod batch_wasm {
         let t = OlapTransform::prepare(
             "wasm",
             None,
-            Some(IDENTITY.as_bytes()),
-            5_000,
+            Some(wat.as_bytes()),
+            timeout_ms,
             max_response_bytes,
         )
         .unwrap();
         f.st.olap_cache.put(name, "src", t);
+    }
+
+    async fn wasm_ap(f: &Fx, name: &str, max_response_bytes: i64) {
+        wasm_ap_with(f, name, IDENTITY, 5_000, max_response_bytes).await;
     }
 
     /// 创建期接受 WASM AP；执行成功即变换跑通（输出丢弃）。
@@ -757,6 +786,77 @@ mod batch_wasm {
         p.transform_access_point = Some("wasm-ap".into());
         let e = f.run(BATCH_INVOKE, &p).await.unwrap_err();
         assert!(e.contains("超限"), "{e}");
+    }
+
+    /// 变换体走通（输出丢弃，但 guest 输出区域被读取）。
+    #[tokio::test]
+    async fn invoke_lambda_wasm_fixed_output_succeeds() {
+        let f = fx().await;
+        wasm_ap_with(&f, "wasm-ap", FIXED, 5_000, 1 << 20).await;
+        f.put("src", "fixed-key", b"longer-than-one-byte").await;
+        let mut p = payload("src", "fixed-key", f.admin);
+        p.transform_access_point = Some("wasm-ap".into());
+        assert_eq!(f.run(BATCH_INVOKE, &p).await.unwrap(), "Succeeded");
+    }
+
+    /// 死循环模块被 fuel/epoch 终止：任务失败且有界耗时（timeout 下限 1000ms）。
+    #[tokio::test]
+    async fn invoke_lambda_wasm_timeout_fails() {
+        let f = fx().await;
+        wasm_ap_with(&f, "wasm-ap", LOOP, 1_000, 1 << 20).await;
+        f.put("src", "loop-key", b"x").await;
+        let mut p = payload("src", "loop-key", f.admin);
+        p.transform_access_point = Some("wasm-ap".into());
+        let t0 = std::time::Instant::now();
+        let e = f.run(BATCH_INVOKE, &p).await.unwrap_err();
+        assert!(e.contains("wasm"), "{e}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(2500),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// 坏模块：编译期拒绝；绕过保存塞入坏 ABI / 配置在但未加载时执行期 fail-closed。
+    #[tokio::test]
+    async fn invoke_lambda_wasm_bad_module_fails_closed() {
+        let f = fx().await;
+        let e =
+            match OlapTransform::prepare("wasm", None, Some(b"not wasm".as_slice()), 5_000, 1024) {
+                Ok(_) => panic!("坏模块应被拒"),
+                Err(e) => e,
+            };
+        assert!(e.contains("wasm 编译失败"), "{e}");
+
+        wasm_ap_with(&f, "bad-abi", BAD_ABI, 5_000, 1 << 20).await;
+        f.put("src", "bad-key", b"x").await;
+        let mut p = payload("src", "bad-key", f.admin);
+        p.transform_access_point = Some("bad-abi".into());
+        let e = f.run(BATCH_INVOKE, &p).await.unwrap_err();
+        assert!(e.contains("wasm 缺"), "{e}");
+
+        // 保存失败/预加载失败的配置不应静默直通或伪成功。
+        f.db()
+            .create_access_point("unloaded", "src", f.admin, None, 1)
+            .await
+            .unwrap();
+        f.db()
+            .set_olap_config(
+                "unloaded",
+                "wasm",
+                None,
+                Some(b"not wasm".as_slice()),
+                None,
+                5_000,
+                1024,
+                1,
+            )
+            .await
+            .unwrap();
+        let mut p = payload("src", "bad-key", f.admin);
+        p.transform_access_point = Some("unloaded".into());
+        let e = f.run(BATCH_INVOKE, &p).await.unwrap_err();
+        assert!(e.contains("未加载"), "{e}");
     }
 }
 
