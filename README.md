@@ -73,12 +73,13 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 转发、AP CRUD/策略 API；HTTP 变换器默认、WASM 变换器 `olap-wasm` feature 门控）· **作业引擎
 与 Batch Operations（S0/S3）**（`jobs/job_tasks`、`BEGIN IMMEDIATE` 领取、优先级、指数退避、
 超时回收、失败重试子作业、CSV 报告、1000+1 清单与 retry-failed）· **Inventory（S5）**
-（Daily/Weekly 调度、force-run、manifest.json + `data/*.csv.gz`、AWS v1 必含列 + 可选列）·
-**存储类/分层与 Restore（S4a/S4b）**（`storage_class`/`TierState`、Archived/Restoring phase
-gate → 403 `InvalidObjectState`、远端 S3 tier 后端、生命周期 Transition、RestoreObject 异步受理、
-到期回收、`TierGcSink` 删除契约）· **S6 控制台页面与 `tests/e2e_m8.sh`**。
+（Daily/Weekly 调度、force-run、manifest.json + `data/*.csv.gz` / `data/*.parquet`、AWS v1
+必含列 + 可选列、Hive `symlink.txt` 清单）· **存储类/分层与 Restore（S4a/S4b）**（`storage_class`/
+`TierState`、Archived/Restoring phase gate → 403 `InvalidObjectState`、远端 S3 与本地冷盘池
+tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
+管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单。
+CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory 跨账号投递 · Batch 抢占/跨账号清单。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
 （内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
@@ -936,25 +937,41 @@ aws --endpoint-url $E s3 cp \
 - 调度：Daily（UTC 日期）/Weekly（ISO 周），worker `OSS_INVENTORY_INTERVAL_SECS`（默认 60，
   0 关闭）；同槽唯一去重，停机只补最近一槽；force-run 供测试/运维（owner/admin）。
 - 输出：`<dest_prefix>/<source_bucket>/<config_id>/<run_key>/manifest.json` +
-  `data/<uuid>.csv.gz`；manifest 含 `sourceBucket/destinationBucket/version/fileSchema/files[]`，
-  `files[]` 的 `size`/`md5Checksum` 是 gzip 后字节数与 MD5（base64，对齐 AWS v1）。
+  `data/<uuid>.csv.gz`（CSV）或 `data/<uuid>.parquet`（Parquet）；manifest 含
+  `sourceBucket/destinationBucket/version/fileFormat/fileSchema/files[]`，`files[]` 的
+  `size`/`md5Checksum` 是落盘文件字节数与 MD5（base64，对齐 AWS v1）。
+- Parquet：无 Arrow 依赖的低层 writer，SNAPPY 压缩、8192 行/行组；列名用 AWS Inventory 的
+  lower_snake_case（`bucket,key,version_id,is_latest,is_delete_marker,size,last_modified_date,
+  e_tag,storage_class,...`），`last_modified_date` 为 TIMESTAMP_MILLIS；`fileSchema` 是
+  Hive/Athena 可读的 Parquet schema 文本。
+- Hive 清单：每次运行同写 `<run_key>/hive/dt=YYYY-MM-DD-HH-MM/symlink.txt`（UTC），内容为
+  一行 `s3://<dest>/<data_key>`，供 Athena SymlinkTextInputFormat 读取；与数据/manifest 同样
+  套用目标桶默认加密。CSV 与 Parquet 共用该清单。
 - 列：必含 9 列 `Bucket,Key,VersionId,IsLatest,DeleteMarker,Size,LastModifiedDate,ETag,StorageClass`；
   可选 6 列按固定顺序追加 `ReplicationStatus,EncryptionStatus,ObjectLockRetainUntilDate,
   ObjectLockMode,ObjectLockLegalHoldStatus,ChecksumAlgorithm`。
-- 边界：全量扫描、单数据文件（gzip 后 ≤5 GiB）、CSV 仅；不做 Parquet/hive/跨账号/增量；
+- 边界：全量扫描、单数据文件（≤5 GiB）、CSV/Parquet；不做跨账号/增量；
   `IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持；可选列可能逐版本 head。
 
 ### 分层 Transition 与 Restore（S4b）
 
 ```toml
-# oss.toml：远端 S3 兼容 tier（仅 http；https 启动期拒绝）
+# oss.toml：远端 S3 兼容 tier（kind 缺省 = s3）
 [[tiers]]
 id = "t1"
-endpoint = "http://127.0.0.1:40125"
+kind = "s3"
+endpoint = "http://127.0.0.1:40125"   # http/https
 bucket = "cold"
 access_key = "TIERAK"
 secret_key = "TIERSK"
 region = "us-east-1"
+
+# 本地冷盘池：落盘 <path>/<tier_id>/<bucket>/<version_id>/<raw key>；
+# 同目录临时文件 + fsync + rename，路径段拒绝绝对路径/`..`/NUL。
+[[tiers]]
+id = "local1"
+kind = "local"
+path = "/var/lib/oss/cold"
 ```
 
 ```bash
@@ -964,7 +981,12 @@ aws --endpoint-url $E s3api put-bucket-lifecycle-configuration --bucket b \
     "Transitions":[{"Days":0,"StorageClass":"GLACIER"}]}]}'
 aws --endpoint-url $E s3api get-bucket-lifecycle-configuration --bucket b   # 回读往返
 curl -s -X POST $E/api/v1/tiers/sweep -H "authorization: Bearer $JWT"      # {"queued":n}
-curl -s $E/api/v1/tiers -H "authorization: Bearer $JWT"                    # [{id,endpoint,bucket,healthy}]
+curl -s $E/api/v1/tiers -H "authorization: Bearer $JWT"                    # [{id,kind,path,endpoint,bucket,healthy}]
+# 远端 GC/对账：默认 dry-run；真删必须显式 dry_run=false
+curl -s -X POST $E/api/v1/tiers/gc -H "authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{"dry_run":true,"grace_days":7}'
+curl -s -X POST $E/api/v1/tiers/gc -H "authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{"dry_run":false,"tier":"t1","grace_days":7,"max_deletes":1000}'
 
 aws --endpoint-url $E s3api head-object --bucket b --key k                 # StorageClass=GLACIER
 aws --endpoint-url $E s3api get-object --bucket b --key k out              # 403 InvalidObjectState
@@ -986,8 +1008,16 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
   router 层中间件把 POST `?restore` 的 200 改写为 202（错误状态与其它请求原样透传）。
 - 到期回收：reaper `OSS_TIER_REAPER_INTERVAL_SECS`（默认 300），精度约 300s；过期后回到
   Archived（GET 再次 403）。启动时对账 pending/restored 行与 Version。
-- 边界：tier 仅远端 S3（无本地冷盘池）、endpoint 仅 http、无远端 GC/对账（删除 best-effort，
-  失败留孤儿）；SSE 对象不 Transition；归档对象复制/站点复制不可用（先 Restore）。
+- 本地冷盘池（`kind = "local"`）：`put` 写同目录 `.<name>.tmp-<uuid>` + `fsync` + `rename`，
+  校验 MD5（ETag 为 32 位 hex 时）；`head` 在根目录缺失时返回错误（控制台 health 为 false）；
+  启动后可直接读回已落盘对象，并清理同目录崩溃残留；`delete` 自底向上删空目录。
+- 远端 GC/对账（`POST /api/v1/tiers/gc`，仅管理员）：先列远端、再全量扫本地版本 meta；
+  任一 list/扫描失败整轮中止且不删除；live `TierRef` 永不删除；只删 `<tier_id>/` 前缀内、
+  年龄 ≥ `grace_days`（默认 7）的对象；每轮最多 `max_deletes`（默认 1000）；删除失败逐条返回
+  并保留待下轮；`missing_live` 只提示 live 引用在远端缺失，不写任何数据。`dry_run` 默认 true。
+- 边界：tier 支持远端 S3 与本地冷盘池；全内存搬运；无自动定时 GC（须管理员显式触发）；
+  远端删除仍 best-effort，失败留孤儿待 GC 重试；SSE 对象不 Transition；归档对象复制/站点
+  复制不可用（先 Restore）。
 
 ### 控制台页面（S6）
 
@@ -1009,11 +1039,12 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    DeleteObjects/UploadPartCopy。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
 4. Batch 无抢占/跨账号；InvokeLambda 仅 HTTP；动作不发桶通知但发复制/清 tier。
-5. Inventory 全量扫描、CSV 单文件；不做 Parquet/hive/跨账号/增量。
-6. 分层 v1 仅远端 S3 tier（http）、全内存搬运；S3 生命周期 Filter 仅 prefix、
+5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
+   `symlink.txt`（不含 Athena 建表/分区自动发现）。
+6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期 Filter 仅 prefix、
    Expiration/Transition 仅 days，date/tag/size/And/noncurrent/abort → 501；单规则单目标类。
-7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort，
-   无 GC/对账；恢复到期精度约 300s。
+7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort；
+   GC/对账仅管理员显式触发（默认 dry-run），无自动定时 GC；恢复到期精度约 300s。
 8. 作业状态库内 `done/error`（映射 Completed/Failed）；取消时未执行任务不进报告；
    CSV 不做公式转义。
 9. RestoreObject 的 202 由 router 层中间件补写（s3s 0.17 生成代码丢弃
@@ -1312,7 +1343,8 @@ M8 测试锚：
 cargo test -p xl-store --lib            # 标签/storage_class/tier phase/DeleteOutcome tier refs
 cargo test -p xl-s3 --lib               # AP/OLAP/restore/lifecycle/inventory 形校验 + 策略矩阵
 cargo test -p oss-server --lib          # 0003 迁移/补列/AP CRUD/作业状态机/Inventory/tier 调度
-cargo test -p oss-server --test m8_ap --test m8_batch --test m8_tier --test m8_lifecycle_api
+cargo test -p oss-server --test m8_ap --test m8_batch --test m8_tier --test m8_lifecycle_api \
+  --test m8_inventory_parquet --test m8_tier_gc
 cargo test -p oss-server --test jobs_engine --test console_api
 cargo test -p xl-s3 --features olap-wasm   # WASM 变换器（需 wasmtime 环境）
 # S3 标签 + Copy 指令在 tests/e2e_s3.sh 步骤 20（已含于全量脚本）

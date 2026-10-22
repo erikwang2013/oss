@@ -11,7 +11,7 @@ use s3s::{S3, S3ErrorCode, S3Request, S3Response};
 use xl_s3::service::OssS3;
 use xl_store::meta::TierPhase;
 
-use oss_server::config::TierTarget;
+use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
 use oss_server::state::AppState;
 use oss_server::tier::{S3TierGc, TierBackend, TierBackends, tier_key};
@@ -58,6 +58,8 @@ impl TierBackend for MockTier {
 fn tier_target(endpoint: &str) -> TierTarget {
     TierTarget {
         id: "cold".into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: endpoint.into(),
         bucket: "tb".into(),
         access_key: "ak".into(),

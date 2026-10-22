@@ -272,14 +272,42 @@ fn listen_host_port(raw: &str) -> Option<(String, u16)> {
     Some((host.to_ascii_lowercase(), port.parse::<u16>().ok()?))
 }
 
-/// `[[tiers]]`：归档远端。模型同 `[[remotes]]`，另加目标桶。
+/// tier 存储形态：`s3`（默认，旧行为）或本地冷盘池 `local`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TierKind {
+    #[default]
+    S3,
+    Local,
+}
+
+impl TierKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// `[[tiers]]`：归档远端或本地冷盘池。`s3` 用 endpoint/bucket/AK/SK；
+/// `local` 只用 `path`（远端字段留空）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TierTarget {
     pub id: String,
+    #[serde(default)]
+    pub kind: TierKind,
+    /// 本地冷盘池根目录（仅 `kind = "local"`）。
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
     pub endpoint: String,
+    #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
     pub access_key: String,
+    #[serde(default)]
     pub secret_key: String,
     #[serde(default = "default_region")]
     pub region: String,
@@ -594,30 +622,69 @@ impl AppConfig {
             if !seen.insert(t.id.clone()) {
                 return Err(format!("[[tiers]] id 重复：{}", t.id));
             }
-            let ep = parse_endpoint(&t.endpoint, &format!("[[tiers]] {} 的 endpoint", t.id))?;
-            if let Some(sn) = &t.server_name {
-                if !ep.https {
-                    return Err(format!(
-                        "[[tiers]] {} 的 server_name 仅适用于 https 端点",
-                        t.id
-                    ));
+            match t.kind {
+                TierKind::Local => {
+                    let Some(path) = t.path.as_ref() else {
+                        return Err(format!("[[tiers]] {}（local）必须配置 path", t.id));
+                    };
+                    if path.as_os_str().is_empty() {
+                        return Err(format!("[[tiers]] {} 的 path 不能为空", t.id));
+                    }
+                    if !t.endpoint.trim().is_empty()
+                        || !t.bucket.trim().is_empty()
+                        || !t.access_key.trim().is_empty()
+                        || !t.secret_key.trim().is_empty()
+                        || t.server_name.is_some()
+                    {
+                        return Err(format!(
+                            "[[tiers]] {}（local）不得配置 endpoint/bucket/access_key/secret_key/server_name",
+                            t.id
+                        ));
+                    }
+                    if let Ok(md) = std::fs::metadata(path)
+                        && !md.is_dir()
+                    {
+                        return Err(format!(
+                            "[[tiers]] {} 的 path 不是目录：{}",
+                            t.id,
+                            path.display()
+                        ));
+                    }
                 }
-                crate::tls_config::validate_server_name(
-                    sn,
-                    &format!("[[tiers]] {} 的 server_name", t.id),
-                )?;
-            }
-            if t.bucket.trim().is_empty() {
-                return Err(format!("[[tiers]] {} 的 bucket 不能为空", t.id));
-            }
-            if t.access_key.trim().is_empty() || t.secret_key.trim().is_empty() {
-                return Err(format!(
-                    "[[tiers]] {} 的 access_key/secret_key 不能为空",
-                    t.id
-                ));
-            }
-            if t.region.trim().is_empty() {
-                return Err(format!("[[tiers]] {} 的 region 不能为空", t.id));
+                TierKind::S3 => {
+                    if t.path.is_some() {
+                        return Err(format!(
+                            "[[tiers]] {}（s3）不得配置 path（path 仅用于 local）",
+                            t.id
+                        ));
+                    }
+                    let ep =
+                        parse_endpoint(&t.endpoint, &format!("[[tiers]] {} 的 endpoint", t.id))?;
+                    if let Some(sn) = &t.server_name {
+                        if !ep.https {
+                            return Err(format!(
+                                "[[tiers]] {} 的 server_name 仅适用于 https 端点",
+                                t.id
+                            ));
+                        }
+                        crate::tls_config::validate_server_name(
+                            sn,
+                            &format!("[[tiers]] {} 的 server_name", t.id),
+                        )?;
+                    }
+                    if t.bucket.trim().is_empty() {
+                        return Err(format!("[[tiers]] {} 的 bucket 不能为空", t.id));
+                    }
+                    if t.access_key.trim().is_empty() || t.secret_key.trim().is_empty() {
+                        return Err(format!(
+                            "[[tiers]] {} 的 access_key/secret_key 不能为空",
+                            t.id
+                        ));
+                    }
+                    if t.region.trim().is_empty() {
+                        return Err(format!("[[tiers]] {} 的 region 不能为空", t.id));
+                    }
+                }
             }
         }
         Ok(())
@@ -1126,6 +1193,8 @@ mod tests {
     fn tiers_validation_matrix() {
         let mk = |id: &str, endpoint: &str| TierTarget {
             id: id.into(),
+            kind: TierKind::S3,
+            path: None,
             endpoint: endpoint.into(),
             bucket: "tb".into(),
             access_key: "ak".into(),
@@ -1167,6 +1236,43 @@ mod tests {
         let mut e = mk("cold", "http://h:1");
         e.bucket = " ".into();
         assert!(cfg(vec![e]).tiers_validate().is_err());
+
+        // M8：本地冷盘池——只允许 path；远端字段必须为空；path 须是目录。
+        let local = |path: Option<&str>| TierTarget {
+            id: "local1".into(),
+            kind: TierKind::Local,
+            path: path.map(std::path::PathBuf::from),
+            endpoint: String::new(),
+            bucket: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: "us-east-1".into(),
+            server_name: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            cfg(vec![local(Some(dir.path().to_str().unwrap()))])
+                .tiers_validate()
+                .is_ok()
+        );
+        assert!(cfg(vec![local(None)]).tiers_validate().is_err(), "缺 path");
+        let mut e = local(Some(dir.path().to_str().unwrap()));
+        e.endpoint = "http://h:1".into();
+        assert!(
+            cfg(vec![e]).tiers_validate().is_err(),
+            "local 不得带远端字段"
+        );
+        let mut e = local(Some(dir.path().to_str().unwrap()));
+        e.kind = TierKind::S3;
+        assert!(cfg(vec![e]).tiers_validate().is_err(), "s3 不得带 path");
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            cfg(vec![local(Some(file.to_str().unwrap()))])
+                .tiers_validate()
+                .is_err(),
+            "path 是文件"
+        );
     }
 
     /// M7：`[site]` 校验矩阵（token 形态 / 与 cluster 互斥）。

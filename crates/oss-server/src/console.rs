@@ -177,6 +177,7 @@ pub fn routes() -> Router<AppState> {
         // M8 S4b：admin 强制跑一轮 Transition sweep；tier 只读状态（Task 6a 后端预备）
         .route("/tiers", get(list_tiers))
         .route("/tiers/sweep", post(force_tier_sweep))
+        .route("/tiers/gc", post(tier_gc))
         // Task 6a：桶默认加密读/写/清（与 S3 面同源）
         .route(
             "/buckets/{bucket}/encryption",
@@ -1593,6 +1594,8 @@ async fn list_tiers(
         };
         out.push(serde_json::json!({
             "id": t.id.as_str(),
+            "kind": t.kind.as_str(),
+            "path": t.path.as_ref().map(|p| p.display().to_string()),
             "endpoint": t.endpoint.as_str(),
             "bucket": t.bucket.as_str(),
             "healthy": healthy,
@@ -1728,6 +1731,78 @@ async fn force_tier_sweep(
         }
         Err(e) => {
             tracing::error!(error = %e, "强制 tier sweep 失败");
+            internal_error()
+        }
+    }
+}
+
+/// M8：tier 远端 GC/对账请求体。缺省 dry-run；真删必须显式 `"dry_run": false`。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct TierGcBody {
+    dry_run: bool,
+    grace_days: u32,
+    max_deletes: usize,
+    /// None = 全部已配置 tier。
+    tier: Option<String>,
+}
+
+impl Default for TierGcBody {
+    fn default() -> Self {
+        Self {
+            dry_run: true,
+            grace_days: crate::tier_gc_sweep::DEFAULT_GRACE_DAYS,
+            max_deletes: crate::tier_gc_sweep::DEFAULT_MAX_DELETES,
+            tier: None,
+        }
+    }
+}
+
+/// M8：admin 触发 tier 远端 GC/对账（dry-run 优先；live 引用与 grace 内对象永不删除）。
+async fn tier_gc(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    body: Option<Json<TierGcBody>>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(id) = &b.tier
+        && state.tiers.get(id).is_none()
+    {
+        return (StatusCode::BAD_REQUEST, format!("tier 不存在：{id}")).into_response();
+    }
+    let opts = crate::tier_gc_sweep::GcOptions {
+        tier: b.tier,
+        dry_run: b.dry_run,
+        grace_days: b.grace_days,
+        max_deletes: b.max_deletes,
+    };
+    if let Err(e) = crate::tier_gc_sweep::validate_opts(&opts) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    match crate::tier_gc_sweep::run_gc(&state.store, &state.tiers, &opts).await {
+        Ok(resp) => {
+            let deleted: usize = resp.reports.iter().map(|r| r.deleted).sum();
+            let failed: usize = resp.reports.iter().map(|r| r.failed).sum();
+            state
+                .audit(
+                    uid,
+                    "control:tier-gc",
+                    None,
+                    None,
+                    Some(&format!(
+                        "dry_run={} grace_days={} deleted={deleted} failed={failed}",
+                        resp.dry_run, resp.grace_days
+                    )),
+                )
+                .await;
+            Json(resp).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "tier GC 失败");
             internal_error()
         }
     }

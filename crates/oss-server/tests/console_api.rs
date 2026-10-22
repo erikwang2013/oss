@@ -1780,7 +1780,7 @@ async fn tiers_list_empty_and_admin_only() {
 /// Task 6a：tier 只读状态——404 哨兵 = 远端可达（healthy），连接失败 = false；不投影凭证。
 #[tokio::test]
 async fn tiers_list_health_without_credentials() {
-    use oss_server::config::TierTarget;
+    use oss_server::config::{TierKind, TierTarget};
 
     // 任意请求 404：HEAD 哨兵得 404 → tier_head 返回 Ok(None) → healthy
     let mock = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
@@ -1790,6 +1790,8 @@ async fn tiers_list_health_without_credentials() {
 
     let target = |id: &str, endpoint: &str, bucket: &str| TierTarget {
         id: id.into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: endpoint.into(),
         bucket: bucket.into(),
         access_key: "ak-secret".into(),

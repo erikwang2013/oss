@@ -20,6 +20,7 @@ use s3s_sigv4::{
 use sha2::Digest as _;
 
 use crate::config::{RemoteTarget, TierTarget};
+use crate::tier::TierObject;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrClass {
@@ -323,6 +324,47 @@ impl ReplClient {
             Err(e) if e.status == Some(404) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// tier ListObjectsV2（GC 对账）：按 prefix 翻页返回 key/LastModified/Size。
+    pub async fn tier_list(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<TierObject>, ReplError> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        // 防御远端不推进 continuation：上限 1000 页 × 1000 键。
+        for _ in 0..1_000 {
+            let mut query: Vec<(&str, &str)> =
+                vec![("list-type", "2"), ("prefix", prefix), ("max-keys", "1000")];
+            if let Some(t) = token.as_deref() {
+                query.push(("continuation-token", t));
+            }
+            let resp = self
+                .send(remote_id, "GET", bucket, None, &query, None, &[], None)
+                .await?;
+            let body = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| ReplError::retryable(format!("读取 tier list 响应体失败：{e}")))?
+                .to_bytes();
+            let page = parse_list_page(&String::from_utf8_lossy(&body))?;
+            out.extend(page.contents);
+            if !page.is_truncated {
+                return Ok(out);
+            }
+            token = page.next_token;
+            if token.is_none() {
+                // 截断却没有续点 = 列表不完整；GC 必须 fail closed，不能拿它当全量。
+                return Err(ReplError::permanent(
+                    "tier list 响应截断但缺少 NextContinuationToken".to_string(),
+                ));
+            }
+        }
+        Err(ReplError::permanent("tier list 翻页超过上限".to_string()))
     }
 
     /// 单目标客户端（M7 站点对：worker 按 `sites` 行动态构造；id 固定为 "site"）。
@@ -1000,6 +1042,67 @@ fn amz_date_now() -> Result<AmzDate, ReplError> {
     AmzDate::parse(&s).map_err(|_| ReplError::permanent("x-amz-date 构造失败"))
 }
 
+struct ListPage {
+    contents: Vec<TierObject>,
+    is_truncated: bool,
+    next_token: Option<String>,
+}
+
+/// 最小 ListBucketResult 解析（不引 XML 依赖；只取 GC 需要的字段）。
+fn parse_list_page(xml: &str) -> Result<ListPage, ReplError> {
+    let mut contents = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<Contents>") {
+        let after = &rest[i + "<Contents>".len()..];
+        let Some(j) = after.find("</Contents>") else {
+            break;
+        };
+        let block = &after[..j];
+        let key = tag_text(block, "Key")
+            .map(xml_unescape)
+            .ok_or_else(|| ReplError::permanent("tier list 缺 Key".to_string()))?;
+        let last_modified = tag_text(block, "LastModified")
+            .and_then(parse_rfc3339)
+            .ok_or_else(|| ReplError::permanent(format!("tier list LastModified 非法：{key}")))?;
+        let size = tag_text(block, "Size")
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| ReplError::permanent(format!("tier list Size 非法：{key}")))?;
+        contents.push(TierObject {
+            key,
+            last_modified,
+            size,
+        });
+        rest = &after[j + "</Contents>".len()..];
+    }
+    Ok(ListPage {
+        contents,
+        is_truncated: tag_text(xml, "IsTruncated") == Some("true"),
+        next_token: tag_text(xml, "NextContinuationToken").map(xml_unescape),
+    })
+}
+
+fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(&xml[start..end])
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp())
+}
+
 /// 构造签名的纯函数（单测用，不联网）。
 #[cfg(test)]
 fn canonical_for_test(
@@ -1106,6 +1209,40 @@ mod tests {
         // 未传入时省略该头（纯函数行为；线上 DELETE 现在也带 REPLICA——P0-2）
         let c = canonical_for_test("DELETE", "/dst/k", "h:1", "abc", None);
         assert!(!c.contains("x-amz-replication-status"), "{c}");
+    }
+
+    /// GC 依赖 list 的 key/时间/续点；XML 实体与下一页标记必须正确解析。
+    #[test]
+    fn tier_list_page_parses_contents_and_token() {
+        let xml = r#"<?xml version="1.0"?>
+<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>tok+1/2=</NextContinuationToken>
+  <Contents>
+    <Key>cold/bkt/v1/a&amp;b.txt</Key>
+    <LastModified>2026-10-20T01:02:03.000Z</LastModified>
+    <Size>42</Size>
+  </Contents>
+</ListBucketResult>"#;
+        let page = parse_list_page(xml).unwrap();
+        assert!(page.is_truncated);
+        assert_eq!(page.next_token.as_deref(), Some("tok+1/2="));
+        assert_eq!(page.contents.len(), 1);
+        assert_eq!(page.contents[0].key, "cold/bkt/v1/a&b.txt");
+        assert_eq!(page.contents[0].size, 42);
+        assert_eq!(
+            page.contents[0].last_modified,
+            time::OffsetDateTime::parse(
+                "2026-10-20T01:02:03Z",
+                &time::format_description::well_known::Rfc3339
+            )
+            .unwrap()
+            .unix_timestamp()
+        );
+
+        // 缺 Key/Size/LastModified = 非法响应（GC fail closed）。
+        assert!(parse_list_page("<Contents><Size>1</Size></Contents>").is_err());
+        assert!(parse_list_page("<Contents><Key>k</Key></Contents>").is_err());
     }
 
     #[test]

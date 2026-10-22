@@ -51,6 +51,8 @@ toml = "1.1"
 csv = "1"
 # M8 S5：Inventory 数据文件 gzip
 flate2.workspace = true
+# M8：Inventory Parquet 输出（无 Arrow 依赖）
+parquet.workspace = true
 base64.workspace = true
 tracing.workspace = true
 # M9 S5：Raft 控制面。storage-v2 是 v2 storage traits 的编译前提（非默认 feature）；
