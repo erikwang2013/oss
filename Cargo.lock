@@ -2510,7 +2510,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oss-server"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "aetherupload-rust",
  "argon2",
@@ -5339,7 +5339,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xl-client"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5354,7 +5354,7 @@ dependencies = [
 
 [[package]]
 name = "xl-proto"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "prost",
  "tonic",
@@ -5363,7 +5363,7 @@ dependencies = [
 
 [[package]]
 name = "xl-s3"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -5390,7 +5390,7 @@ dependencies = [
 
 [[package]]
 name = "xl-store"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
