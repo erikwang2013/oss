@@ -331,7 +331,17 @@ pub async fn request(
     token: &str,
     op: &MembershipOp,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, false, None).await
+    request_inner(endpoint, token, op, false, None, None).await
+}
+
+/// TLS 变体：`tls = Some` 时 endpoint 按 peer TLS 模式升级为 https。
+pub async fn request_tls(
+    endpoint: &str,
+    token: &str,
+    op: &MembershipOp,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<MemberView, MembershipError> {
+    request_inner(endpoint, token, op, false, None, tls).await
 }
 
 /// 节点内部转发：带单跳标记，目标若已非 leader 直接 409，不再二次转发。
@@ -341,7 +351,18 @@ pub async fn request_forwarded(
     op: &MembershipOp,
     target: Option<u64>,
 ) -> Result<MemberView, MembershipError> {
-    request_inner(endpoint, token, op, true, target).await
+    request_inner(endpoint, token, op, true, target, None).await
+}
+
+/// TLS 变体（节点内转发）。
+pub async fn request_forwarded_tls(
+    endpoint: &str,
+    token: &str,
+    op: &MembershipOp,
+    target: Option<u64>,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<MemberView, MembershipError> {
+    request_inner(endpoint, token, op, true, target, tls).await
 }
 
 async fn request_inner(
@@ -350,6 +371,7 @@ async fn request_inner(
     op: &MembershipOp,
     forwarded: bool,
     target: Option<u64>,
+    tls: Option<&crate::tls::Tls>,
 ) -> Result<MemberView, MembershipError> {
     let body = serde_json::to_vec(op).map_err(|e| MembershipError::Raft(e.to_string()))?;
     let (status, bytes) = crate::site_client::post_raft_membership(
@@ -359,6 +381,7 @@ async fn request_inner(
         REQUEST_TIMEOUT,
         forwarded,
         target,
+        tls,
     )
     .await
     .map_err(MembershipError::Raft)?;

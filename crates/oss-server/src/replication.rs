@@ -685,7 +685,9 @@ pub async fn process_repl_once(
         let outcome: Result<(), ReplError> = if r.target_kind == "site" {
             match site_peer(pool, &r.remote_id).await {
                 Ok(Some((endpoint, ak, sk, region))) => {
-                    match ReplClient::single(&endpoint, &ak, &sk, &region) {
+                    match ReplClient::single(&endpoint, &ak, &sk, &region)
+                        .map(|c| c.with_tls(client.tls()))
+                    {
                         Ok(c) => {
                             let cache_key = format!("{endpoint}\u{1f}{}", r.dest_bucket);
                             send_row(store, &c, "site", &r, true, Some(&cache_key)).await

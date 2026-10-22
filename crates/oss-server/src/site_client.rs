@@ -1,5 +1,5 @@
 //! M7：站点控制面 HTTP 客户端（identity 校验 / ping；changelog 出货复用同一发送器）。
-//! 仅 http（M7 信任模型同 `[[remotes]]`），每请求新建连接（控制面低频）。
+//! `[tls.server]` 存在时对端地址升级 https；每请求新建连接（控制面低频）。
 
 use std::time::Duration;
 
@@ -70,28 +70,9 @@ pub enum IdentityError {
     Decode(String),
 }
 
-/// 端点校验：仅 `http://host[:port]`，无 path/query/userinfo；返回去除尾斜杠的基址。
+/// 端点校验：`http|https://host[:port]`，无 path/query/userinfo；返回去尾斜杠基址。
 pub fn validate_endpoint(endpoint: &str) -> Result<String, String> {
-    let trimmed = endpoint.trim_end_matches('/');
-    let uri: Uri = trimmed
-        .parse()
-        .map_err(|_| format!("endpoint 非法：{endpoint}"))?;
-    if uri.scheme_str() != Some("http") {
-        return Err("endpoint 必须是 http://host[:port]（TLS 未接线）".into());
-    }
-    if uri.host().is_none() {
-        return Err("endpoint 缺 host".into());
-    }
-    if uri.path() != "/" && !uri.path().is_empty() {
-        return Err("endpoint 不得带 path".into());
-    }
-    if uri.query().is_some() {
-        return Err("endpoint 不得带 query".into());
-    }
-    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
-        return Err("endpoint 不得带 userinfo".into());
-    }
-    Ok(trimmed.to_string())
+    Ok(crate::tls_config::parse_endpoint(endpoint, "endpoint")?.base)
 }
 
 /// 控制面请求硬超时：单一出货 worker 不得被“接受 TCP 但不回响应”的对端永久挂起。
@@ -104,9 +85,10 @@ async fn send(
     path: &str,
     token: &str,
     body: Option<Bytes>,
+    tls: Option<&crate::tls::Tls>,
 ) -> Result<(u16, Bytes), String> {
     let headers = [(SITE_TOKEN_HEADER, token)];
-    send_with_headers(endpoint, method, path, &headers, body, SEND_TIMEOUT).await
+    send_with_headers(endpoint, method, path, &headers, body, SEND_TIMEOUT, tls).await
 }
 
 /// 任意头部的控制面请求（成员变更走集群令牌 + 单跳标记，见 [`post_raft_membership`]）。
@@ -117,8 +99,14 @@ async fn send_with_headers(
     headers: &[(&str, &str)],
     body: Option<Bytes>,
     timeout: Duration,
+    tls: Option<&crate::tls::Tls>,
 ) -> Result<(u16, Bytes), String> {
-    match tokio::time::timeout(timeout, send_inner(endpoint, method, path, headers, body)).await {
+    match tokio::time::timeout(
+        timeout,
+        send_inner(endpoint, method, path, headers, body, tls),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(_) => Err(format!("站点控制面请求超时（{}s）", timeout.as_secs())),
     }
@@ -130,16 +118,17 @@ async fn send_inner(
     path: &str,
     headers: &[(&str, &str)],
     body: Option<Bytes>,
+    tls: Option<&crate::tls::Tls>,
 ) -> Result<(u16, Bytes), String> {
-    let base = validate_endpoint(endpoint)?;
+    // peer TLS 模式下存储的 http:// 地址在连接期升级；无 TLS 物料的 https 直接拒绝。
+    let base = match tls {
+        Some(t) => t.peer_url(endpoint)?,
+        None => validate_endpoint(endpoint)?,
+    };
+    let ep = crate::tls_config::parse_endpoint(&base, "endpoint")?;
     let uri: Uri = format!("{base}{path}")
         .parse()
         .map_err(|e| format!("请求 URI 构造失败：{e}"))?;
-    let host = uri
-        .host()
-        .ok_or_else(|| "endpoint 缺 host".to_string())?
-        .to_string();
-    let port = uri.port_u16().unwrap_or(80);
     let mut req = hyper::Request::builder().method(method).uri(uri);
     for (name, value) in headers {
         req = req.header(*name, *value);
@@ -151,9 +140,19 @@ async fn send_inner(
         .body(Full::new(body.unwrap_or_default()))
         .map_err(|e| format!("请求构造失败：{e}"))?;
 
-    let stream = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .map_err(|e| format!("连接 {host}:{port} 失败：{e}"))?;
+    let stream: Box<dyn crate::tls::Io> = match tls {
+        Some(t) => t.connect(ep.https, &ep.host, ep.port, None).await?,
+        None if ep.https => {
+            return Err(format!(
+                "endpoint {endpoint} 为 https，但未配置 [tls.server]（拒绝明文发送）"
+            ));
+        }
+        None => Box::new(
+            TcpStream::connect(format!("{}:{}", ep.host, ep.port))
+                .await
+                .map_err(|e| format!("连接 {}:{} 失败：{e}", ep.host, ep.port))?,
+        ),
+    };
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| format!("HTTP1 握手失败：{e}"))?;
@@ -183,7 +182,15 @@ async fn send_inner(
 }
 
 pub async fn get_identity(endpoint: &str, token: &str) -> Result<PeerIdentity, String> {
-    get_identity_typed(endpoint, token)
+    get_identity_tls(endpoint, token, None).await
+}
+
+pub async fn get_identity_tls(
+    endpoint: &str,
+    token: &str,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<PeerIdentity, String> {
+    get_identity_typed_tls(endpoint, token, tls)
         .await
         .map_err(|e| match e {
             IdentityError::Unauthorized => "对端 identity 拒绝站点令牌（403）".to_string(),
@@ -198,7 +205,15 @@ pub async fn get_identity_typed(
     endpoint: &str,
     token: &str,
 ) -> Result<PeerIdentity, IdentityError> {
-    let (status, body) = send(endpoint, "GET", "/api/v1/site/identity", token, None)
+    get_identity_typed_tls(endpoint, token, None).await
+}
+
+pub async fn get_identity_typed_tls(
+    endpoint: &str,
+    token: &str,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<PeerIdentity, IdentityError> {
+    let (status, body) = send(endpoint, "GET", "/api/v1/site/identity", token, None, tls)
         .await
         .map_err(IdentityError::Transport)?;
     match status {
@@ -215,6 +230,16 @@ pub async fn post_raft_join(
     body: &serde_json::Value,
     timeout: Duration,
 ) -> Result<(u16, Bytes), String> {
+    post_raft_join_tls(endpoint, cluster_token, body, timeout, None).await
+}
+
+pub async fn post_raft_join_tls(
+    endpoint: &str,
+    cluster_token: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<(u16, Bytes), String> {
     let bytes = Bytes::from(serde_json::to_vec(body).map_err(|e| e.to_string())?);
     send_with_headers(
         endpoint,
@@ -223,6 +248,7 @@ pub async fn post_raft_join(
         &[(crate::raft::RPC_TOKEN_HEADER, cluster_token)],
         Some(bytes),
         timeout,
+        tls,
     )
     .await
 }
@@ -235,6 +261,7 @@ pub(crate) async fn post_raft_membership(
     timeout: Duration,
     forwarded: bool,
     target: Option<u64>,
+    tls: Option<&crate::tls::Tls>,
 ) -> Result<(u16, Bytes), String> {
     let target = target.map(|t| t.to_string());
     let mut headers = vec![(crate::raft::RPC_TOKEN_HEADER, token)];
@@ -251,6 +278,7 @@ pub(crate) async fn post_raft_membership(
         &headers,
         Some(body),
         timeout,
+        tls,
     )
     .await
 }
@@ -261,12 +289,22 @@ pub async fn post_changelog(
     token: &str,
     body: Bytes,
 ) -> Result<(u16, Bytes), String> {
+    post_changelog_tls(endpoint, token, body, None).await
+}
+
+pub async fn post_changelog_tls(
+    endpoint: &str,
+    token: &str,
+    body: Bytes,
+    tls: Option<&crate::tls::Tls>,
+) -> Result<(u16, Bytes), String> {
     send(
         endpoint,
         "POST",
         "/api/v1/site/changelog",
         token,
         Some(body),
+        tls,
     )
     .await
 }
@@ -281,7 +319,8 @@ mod tests {
             validate_endpoint("http://127.0.0.1:9001/").unwrap(),
             "http://127.0.0.1:9001"
         );
-        assert!(validate_endpoint("https://h:1").is_err());
+        assert_eq!(validate_endpoint("https://h:1").unwrap(), "https://h:1");
+        assert!(validate_endpoint("h:1").is_err());
         assert!(validate_endpoint("http://h:1/path").is_err());
         assert!(validate_endpoint("http://h:1?x=1").is_err());
         assert!(validate_endpoint("http://u@h:1").is_err());

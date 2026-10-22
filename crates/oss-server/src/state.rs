@@ -12,6 +12,8 @@ use xl_store::store::{Store, StoreConfig};
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<AppConfig>,
+    /// 进程 TLS 物料（`[tls]` 未配 = 明文；见 [`crate::tls::Tls`]）。
+    pub tls: Arc<crate::tls::Tls>,
     pub db: Arc<Db>,
     pub store: Arc<Store>,
     pub ingest: Arc<crate::aether::IngestSink>,
@@ -240,6 +242,8 @@ impl AppState {
         cfg_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut cfg = AppConfig::load(cfg_path)?;
+        // TLS 物料先于所有传输层加载（文件缺失/私钥非法 → 启动失败，不降级明文）。
+        let tls = crate::tls::Tls::load(&cfg.tls)?;
         // 密钥兜底解析（docker/无人值守）：空值 → OSS_SECRETS_FILE 复用/生成落盘（见 config.rs）
         let secrets = cfg.resolve_secrets()?;
 
@@ -312,7 +316,8 @@ impl AppState {
                 cfg.sync.max_object_bytes,
                 cfg.site.is_some(),
             )
-            .with_metrics(Arc::clone(&sync_metrics)),
+            .with_metrics(Arc::clone(&sync_metrics))
+            .with_tls(Arc::clone(&tls)),
         ));
         store_cfg.sync_max_bytes = cfg.sync.max_object_bytes;
         store_cfg.drives = drives;
@@ -346,7 +351,12 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            let mesh = Arc::new(xl_client::TonicMesh::new(&cl.node_id, &cl.secret, &pairs)?);
+            let mesh = Arc::new(xl_client::TonicMesh::new_with_tls(
+                &cl.node_id,
+                &cl.secret,
+                &pairs,
+                tls.peer_tls().then(|| tls.tonic_client()),
+            )?);
             // 放置开关：只认 None/"v1"/"v2"——未知值 fail-closed（静默降级为 v1 会让
             // 「以为开了 v2」的运维在 rebalance 里得到空跑报告）
             let placement_v2 = match cl.placement.as_deref() {
@@ -413,12 +423,13 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            let mesh = Arc::new(xl_client::TonicMesh::new_with_timeouts(
+            let mesh = Arc::new(xl_client::TonicMesh::new_with_timeouts_tls(
                 &st.node_id,
                 &st.mesh_secret,
                 &pairs,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_millis(st.mesh_timeout_ms),
+                tls.peer_tls().then(|| tls.tonic_client()),
             )?);
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
                 sets,
@@ -604,8 +615,13 @@ impl AppState {
         };
         let raft = match raft_settings {
             Some(settings) => Some(Arc::new(
-                crate::raft::spawn_with_control(settings, Some(db.pool().clone()), install_tx)
-                    .await?,
+                crate::raft::spawn_with_control_tls(
+                    settings,
+                    Some(db.pool().clone()),
+                    install_tx,
+                    tls.peer_tls().then(|| Arc::clone(&tls)),
+                )
+                .await?,
             )),
             None => None,
         };
@@ -630,8 +646,17 @@ impl AppState {
             }
         }
 
-        let mut state =
-            Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, raft).await;
+        let mut state = Self::new_with(
+            cfg,
+            db,
+            store,
+            ap_cache,
+            olap_cache,
+            bucket_cleanup,
+            raft,
+            tls,
+        )
+        .await;
         // 门在 `Store::open` 前已用同一份 Arc 构建；与构造时的默认计数对齐。
         state.sync_metrics = sync_metrics;
         // S7.2：快照安装后按新控制表重建 AP/OLAP/同步门缓存与桶目录（仅数据站点）。
@@ -686,7 +711,18 @@ impl AppState {
                 Arc::clone(&ap_cache),
                 Arc::clone(&olap_cache),
             ));
-        Self::new_with(cfg, db, store, ap_cache, olap_cache, bucket_cleanup, None).await
+        let tls = crate::tls::Tls::load(&cfg.tls).unwrap_or_else(|e| panic!("TLS 配置非法: {e}"));
+        Self::new_with(
+            cfg,
+            db,
+            store,
+            ap_cache,
+            olap_cache,
+            bucket_cleanup,
+            None,
+            tls,
+        )
+        .await
     }
 
     /// `load` 预建 AP 缓存与清理实现（控制面写要在 `Store::open` 前注入），
@@ -699,6 +735,7 @@ impl AppState {
         olap_cache: Arc<xl_s3::olap::OlapCache>,
         bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
         raft: Option<Arc<crate::raft::RaftHandle>>,
+        tls: Arc<crate::tls::Tls>,
     ) -> Self {
         // M7：`[site]` 覆盖种子（先于任何控制面写；load 与 tests 共用此路径）
         if let Some(site) = cfg.site.as_ref() {
@@ -785,7 +822,8 @@ impl AppState {
         // 启动路径在 store open+init 完成后调用）。
         let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
         // M6 切片 0/1：事件接收方（worker 在 serve 路径挂载；Kafka 目标优先，否则 env 文件 sink）
-        let notifier = crate::events::notifier_from_config(&cfg.kafka.targets);
+        let notifier =
+            crate::events::notifier_from_config_tls(&cfg.kafka.targets, Arc::clone(&tls));
         let events = Arc::new(crate::events::SqlEventSink::new(
             db.pool().clone(),
             notifier,
@@ -824,16 +862,21 @@ impl AppState {
                 std::time::Duration::from_millis(cfg.sync.timeout_ms),
                 site_enabled,
             )
-            .with_control(Arc::clone(&control)),
+            .with_control(Arc::clone(&control))
+            .with_tls(Arc::clone(&tls)),
         );
         let repl_sink = Arc::new(
             crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
                 // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
                 .with_site_data_replication(cfg.stretch.is_none()),
         );
-        let repl_client = Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes));
+        let repl_client =
+            Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes).with_tls(Arc::clone(&tls)));
         // M8 S4b：tier 后端固定于启动配置；规则校验只认这些 id。
-        let tiers = Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers));
+        let tiers = Arc::new(crate::tier::TierBackends::from_config_tls(
+            &cfg.tiers,
+            Some(Arc::clone(&tls)),
+        ));
         let lifecycle: Arc<dyn xl_s3::lifecycle::LifecycleStore> = Arc::new(
             crate::lifecycle_store::SqlLifecycleStore::new(Arc::clone(&db), Arc::new(tiers.ids()))
                 .with_control(Arc::clone(&control)),
@@ -875,6 +918,7 @@ impl AppState {
         });
         Self {
             cfg,
+            tls,
             db,
             store,
             ingest,

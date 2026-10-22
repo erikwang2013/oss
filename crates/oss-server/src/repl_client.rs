@@ -1,6 +1,6 @@
 //! M6 切片 4：复制出站客户端——SigV4（s3s-sigv4 原语）+ hyper http1 直连。
 //!
-//! - 仅 http（TLS 未接线，配置层拒绝 https——记档）。
+//! - 端点 http/https 均可；https 走 rustls（`[tls.client]` 自定义 CA/身份可选）。
 //! - PUT 携带 `x-amz-replication-status: REPLICA`，且该头**纳入 SignedHeaders**（s3s 服务端
 //!   对未签名的 x-amz-* 返回 403）。
 //! - 单段源（32 hex ETag）断言响应 ETag；MPU 源 ETag 非 MD5，跳过断言（目标重算）。
@@ -18,7 +18,6 @@ use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
 };
 use sha2::Digest as _;
-use tokio::net::TcpStream;
 
 use crate::config::{RemoteTarget, TierTarget};
 
@@ -54,7 +53,15 @@ impl ReplError {
 }
 
 struct Remote {
-    uri: Uri,
+    /// 原始端点（站点对等 remote 在 peer TLS 下由此升级 https）。
+    endpoint: String,
+    https: bool,
+    host: String,
+    port: u16,
+    /// TLS SNI 覆写（仅 `[[remotes]]`/`[[tiers]]` 的 https 端点）。
+    server_name: Option<String>,
+    /// M7 站点对等 remote：地址遵循 `[tls.server]` 模式（http 存储、连接期升级）。
+    peer: bool,
     access_key: String,
     secret_key: String,
     region: String,
@@ -126,9 +133,38 @@ fn limiter_of(target: &RemoteTarget) -> Option<RateLimiter> {
         .map(RateLimiter::new)
 }
 
+fn remote_of(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    limiter: Option<RateLimiter>,
+    server_name: Option<String>,
+    peer: bool,
+) -> Option<Remote> {
+    let ep = crate::tls_config::parse_endpoint(endpoint, "remote endpoint").ok()?;
+    Some(Remote {
+        endpoint: endpoint.to_string(),
+        https: ep.https,
+        host: ep.host,
+        port: ep.port,
+        server_name,
+        peer,
+        access_key: access_key.to_string(),
+        secret_key: secret_key.to_string(),
+        region: region.to_string(),
+        limiter,
+    })
+}
+
+fn plain_tls() -> std::sync::Arc<crate::tls::Tls> {
+    crate::tls::Tls::load(&crate::tls_config::TlsToml::default()).expect("空 TLS 配置不会失败")
+}
+
 /// 出站客户端（remotes 静态映射；连接每请求新建——复制频率低，无池化）。
 pub struct ReplClient {
     remotes: HashMap<String, Remote>,
+    tls: std::sync::Arc<crate::tls::Tls>,
 }
 
 impl ReplClient {
@@ -136,20 +172,35 @@ impl ReplClient {
         let remotes = targets
             .iter()
             .filter_map(|t| {
-                let uri = t.endpoint.parse::<Uri>().ok()?;
                 Some((
                     t.id.clone(),
-                    Remote {
-                        uri,
-                        access_key: t.access_key.clone(),
-                        secret_key: t.secret_key.clone(),
-                        region: t.region.clone(),
-                        limiter: limiter_of(t),
-                    },
+                    remote_of(
+                        &t.endpoint,
+                        &t.access_key,
+                        &t.secret_key,
+                        &t.region,
+                        limiter_of(t),
+                        t.server_name.clone(),
+                        false,
+                    )?,
                 ))
             })
             .collect();
-        Self { remotes }
+        Self {
+            remotes,
+            tls: plain_tls(),
+        }
+    }
+
+    /// 注入进程 TLS 物料（自定义 CA / mTLS 身份 / peer 模式）。
+    pub fn with_tls(mut self, tls: std::sync::Arc<crate::tls::Tls>) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// 共享同一份 TLS 物料（复制 worker 的站点对等分支用）。
+    pub fn tls(&self) -> std::sync::Arc<crate::tls::Tls> {
+        std::sync::Arc::clone(&self.tls)
     }
 
     /// M8 S4b：tier 目标（同 `[[remotes]]` 形态 + 目标桶；id 即 tier id）。
@@ -157,20 +208,24 @@ impl ReplClient {
         let remotes = targets
             .iter()
             .filter_map(|t| {
-                let uri = t.endpoint.parse::<Uri>().ok()?;
                 Some((
                     t.id.clone(),
-                    Remote {
-                        uri,
-                        access_key: t.access_key.clone(),
-                        secret_key: t.secret_key.clone(),
-                        region: t.region.clone(),
-                        limiter: None,
-                    },
+                    remote_of(
+                        &t.endpoint,
+                        &t.access_key,
+                        &t.secret_key,
+                        &t.region,
+                        None,
+                        t.server_name.clone(),
+                        false,
+                    )?,
                 ))
             })
             .collect();
-        Self { remotes }
+        Self {
+            remotes,
+            tls: plain_tls(),
+        }
     }
 
     /// tier PUT：`Content-MD5`（签入）并断言响应 ETag == 本地 MD5（远端 ETag 口径）。
@@ -277,21 +332,14 @@ impl ReplClient {
         secret_key: &str,
         region: &str,
     ) -> Result<Self, ReplError> {
-        let uri = endpoint
-            .parse::<Uri>()
-            .map_err(|e| ReplError::permanent(format!("site endpoint 非法：{e}")))?;
+        let remote = remote_of(endpoint, access_key, secret_key, region, None, None, true)
+            .ok_or_else(|| ReplError::permanent(format!("site endpoint 非法：{endpoint}")))?;
         let mut remotes = HashMap::new();
-        remotes.insert(
-            "site".to_string(),
-            Remote {
-                uri,
-                access_key: access_key.to_string(),
-                secret_key: secret_key.to_string(),
-                region: region.to_string(),
-                limiter: None,
-            },
-        );
-        Ok(Self { remotes })
+        remotes.insert("site".to_string(), remote);
+        Ok(Self {
+            remotes,
+            tls: plain_tls(),
+        })
     }
 
     pub async fn put_object(
@@ -793,15 +841,17 @@ impl ReplClient {
         let remote = self.remotes.get(remote_id).ok_or_else(|| {
             ReplError::permanent(format!("remote {remote_id:?} 未配置（规则校验应已拦截）"))
         })?;
-        if remote.uri.scheme_str() != Some("http") {
-            return Err(ReplError::permanent("仅支持 http remote（TLS 未接线）"));
-        }
-        let host = remote
-            .uri
-            .host()
-            .ok_or_else(|| ReplError::permanent("remote endpoint 缺 host"))?
-            .to_string();
-        let port = remote.uri.port_u16().unwrap_or(80);
+        let (https, host, port) = if remote.peer {
+            let url = self
+                .tls
+                .peer_url(&remote.endpoint)
+                .map_err(ReplError::permanent)?;
+            let ep = crate::tls_config::parse_endpoint(&url, "site endpoint")
+                .map_err(ReplError::permanent)?;
+            (ep.https, ep.host, ep.port)
+        } else {
+            (remote.https, remote.host.clone(), remote.port)
+        };
 
         // 签名
         let body_bytes = body.unwrap_or_default();
@@ -854,7 +904,8 @@ impl ReplClient {
             signed_names.join(";"),
             sig
         );
-        let uri = Uri::from_str(&format!("http://{host}:{port}{encoded_path}"))
+        let scheme = if https { "https" } else { "http" };
+        let uri = Uri::from_str(&format!("{scheme}://{host}:{port}{encoded_path}"))
             .map_err(|e| ReplError::permanent(format!("请求 URI 构造失败：{e}")))?;
         let mut req = Request::builder().method(method).uri(uri);
         for (k, v) in &signed {
@@ -866,9 +917,11 @@ impl ReplClient {
             .map_err(|e| ReplError::permanent(format!("请求构造失败：{e}")))?;
 
         // 连接 + 发送
-        let stream = TcpStream::connect(format!("{host}:{port}"))
+        let stream = self
+            .tls
+            .connect(https, &host, port, remote.server_name.as_deref())
             .await
-            .map_err(|e| ReplError::retryable(format!("连接 {host}:{port} 失败：{e}")))?;
+            .map_err(ReplError::retryable)?;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|e| ReplError::retryable(format!("HTTP1 握手失败：{e}")))?;
@@ -986,6 +1039,7 @@ mod tests {
             secret_key: "sk".into(),
             region: "us-east-1".into(),
             max_bytes_per_sec: max,
+            server_name: None,
         }
     }
 

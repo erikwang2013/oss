@@ -107,6 +107,8 @@ pub struct RaftHandle {
     state_machine: SqliteStateMachine,
     /// 与状态机共享的观测计数（apply 错误由状态机累加）。
     counters: Arc<metrics::Metrics>,
+    /// peer TLS 物料（None = 明文；Some = Raft RPC/转发/成员请求全走 https）。
+    tls: Option<Arc<crate::tls::Tls>>,
 }
 
 impl RaftHandle {
@@ -116,6 +118,10 @@ impl RaftHandle {
 
     pub fn node_id(&self) -> u64 {
         self.settings.node_id
+    }
+
+    pub fn tls(&self) -> Option<&Arc<crate::tls::Tls>> {
+        self.tls.as_ref()
     }
 
     pub fn settings(&self) -> &RaftSettings {
@@ -216,11 +222,18 @@ impl RaftHandle {
         timeout: Duration,
     ) -> Result<ControlResponse, WriteError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut req = reqwest::Client::new()
-            .post(format!(
-                "{}/api/v1/site/raft/write",
-                endpoint.trim_end_matches('/')
-            ))
+        let (client, endpoint) = match &self.tls {
+            Some(tls) => (
+                tls.reqwest_client().map_err(WriteError::Raft)?,
+                tls.peer_url(endpoint).map_err(WriteError::Raft)?,
+            ),
+            None => (
+                reqwest::Client::new(),
+                endpoint.trim_end_matches('/').to_string(),
+            ),
+        };
+        let mut req = client
+            .post(format!("{endpoint}/api/v1/site/raft/write"))
             .header(RPC_TOKEN_HEADER, &self.settings.cluster_token)
             .header(routes::FORWARD_HEADER, "1")
             .timeout(timeout);
@@ -324,6 +337,16 @@ pub async fn spawn_with_control(
     control_pool: Option<SqlitePool>,
     install_notify: Option<tokio::sync::watch::Sender<u64>>,
 ) -> RaftResult<RaftHandle> {
+    spawn_with_control_tls(settings, control_pool, install_notify, None).await
+}
+
+/// 同 [`spawn_with_control`]；`tls = Some` 时 Raft RPC 客户端走 https。
+pub async fn spawn_with_control_tls(
+    settings: RaftSettings,
+    control_pool: Option<SqlitePool>,
+    install_notify: Option<tokio::sync::watch::Sender<u64>>,
+    tls: Option<Arc<crate::tls::Tls>>,
+) -> RaftResult<RaftHandle> {
     let config = Arc::new(settings.openraft_config()?);
     let log_store = store::SqliteLogStore::open(&settings.db_path).await?;
     // 未 apply 的成员日志（崩溃窗口）也要阻止再次 initialize；openraft 启动时会重放。
@@ -343,7 +366,14 @@ pub async fn spawn_with_control(
     };
 
     let counters = Arc::clone(state_machine.counters());
-    let network = network::HttpNetworkFactory::new(settings.cluster_token.clone());
+    let network = match &tls {
+        Some(t) => network::HttpNetworkFactory::new_tls(
+            settings.cluster_token.clone(),
+            Arc::clone(t),
+            t.reqwest_client()?,
+        ),
+        None => network::HttpNetworkFactory::new(settings.cluster_token.clone()),
+    };
     let raft = Raft::new(
         settings.node_id,
         config,
@@ -373,6 +403,7 @@ pub async fn spawn_with_control(
         settings,
         state_machine,
         counters,
+        tls,
     };
     handle.bootstrap_if_needed(has_logs).await?;
     Ok(handle)

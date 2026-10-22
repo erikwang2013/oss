@@ -230,6 +230,23 @@ impl TonicMesh {
         )
     }
 
+    /// 同 [`Self::new`]，mesh 全链路 TLS（`Some` = 所有节点走 https，证书主机名校验）。
+    pub fn new_with_tls(
+        _self_id: &str,
+        secret: &str,
+        nodes: &[(String, String)],
+        tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> Result<Self> {
+        Self::new_with_timeouts_tls(
+            _self_id,
+            secret,
+            nodes,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            tls,
+        )
+    }
+
     /// M9 S4：同 [`Self::new`]，连接/请求超时可配（stretch `[stretch].mesh_timeout_ms`）。
     pub fn new_with_timeouts(
         _self_id: &str,
@@ -238,13 +255,35 @@ impl TonicMesh {
         connect: Duration,
         request: Duration,
     ) -> Result<Self> {
+        Self::new_with_timeouts_tls(_self_id, secret, nodes, connect, request, None)
+    }
+
+    /// 超时可配 + 可选 mesh TLS；`tls = None` 保持旧明文行为。
+    pub fn new_with_timeouts_tls(
+        _self_id: &str,
+        secret: &str,
+        nodes: &[(String, String)],
+        connect: Duration,
+        request: Duration,
+        tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
+        let scheme = if tls.is_some() { "https" } else { "http" };
         let mut clients = HashMap::with_capacity(nodes.len());
         for (id, addr) in nodes {
-            let ep = Endpoint::from_shared(format!("http://{addr}"))
+            let host_port = addr
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_end_matches('/');
+            let mut ep = Endpoint::from_shared(format!("{scheme}://{host_port}"))
                 .map_err(|e| Error::Encode(format!("节点 {id} 地址非法（{addr}）：{e}")))?
                 .connect_timeout(connect)
                 .timeout(request);
+            if let Some(t) = &tls {
+                ep = ep
+                    .tls_config(t.clone())
+                    .map_err(|e| Error::Encode(format!("节点 {id} TLS 配置失败：{e}")))?;
+            }
             let ch = ep.connect_lazy();
             clients.insert(
                 id.clone(),
@@ -934,10 +973,26 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
 
 /// 起节点间 gRPC 服务（oss-server 在 cluster 配置时调用；HTTP 端口与 gRPC 端口分离）。
 pub async fn serve(store: Arc<Store>, addr: SocketAddr, secret: String) -> Result<()> {
+    serve_tls(store, addr, secret, None).await
+}
+
+/// 同 [`serve`]；`tls = Some` 时 gRPC 服务端启用 TLS（可要求 mTLS 客户端证书）。
+pub async fn serve_tls(
+    store: Arc<Store>,
+    addr: SocketAddr,
+    secret: String,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+) -> Result<()> {
     let svc = MeshSvc { store };
     let server =
         xl_proto::mesh_server::MeshServer::with_interceptor(svc, SecretInterceptor { secret });
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(t) = tls {
+        builder = builder
+            .tls_config(t)
+            .map_err(|e| Error::Encode(format!("mesh gRPC 服务端 TLS 配置失败：{e}")))?;
+    }
+    builder
         .add_service(server)
         .serve(addr)
         .await

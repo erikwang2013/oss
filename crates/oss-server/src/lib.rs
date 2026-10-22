@@ -26,4 +26,6 @@ pub mod sync;
 pub mod tier;
 pub mod tier_jobs;
 mod tier_sweep;
+pub mod tls;
+pub mod tls_config;
 pub mod witness;

@@ -153,7 +153,9 @@ pub fn normalize_peer_addr(raw: &str, field: &str) -> Result<(String, bool), Str
     } else if let Some(r) = s.strip_prefix("https://") {
         (r, true)
     } else if s.contains("://") {
-        return Err(format!("{field} 必须是 host:port 或 http(s)://host:port：{raw}"));
+        return Err(format!(
+            "{field} 必须是 host:port 或 http(s)://host:port：{raw}"
+        ));
     } else {
         (s, false)
     };
@@ -231,8 +233,7 @@ mod tests {
         let c: TlsToml = toml::from_str("[client]\nclient_cert = \"c.pem\"\n").unwrap();
         assert!(c.validate().is_err());
         let c: TlsToml =
-            toml::from_str("[client]\nclient_cert = \"c.pem\"\nclient_key = \"k.pem\"\n")
-                .unwrap();
+            toml::from_str("[client]\nclient_cert = \"c.pem\"\nclient_key = \"k.pem\"\n").unwrap();
         assert!(c.validate().is_ok());
         let c: TlsToml = toml::from_str("[client]\nca_cert = \"ca.pem\"\n").unwrap();
         assert!(c.validate().is_ok());

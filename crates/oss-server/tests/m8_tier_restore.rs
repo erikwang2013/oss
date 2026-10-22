@@ -69,6 +69,7 @@ fn tier_target(endpoint: &str) -> TierTarget {
         access_key: "ak".into(),
         secret_key: "sk".into(),
         region: "us-east-1".into(),
+        server_name: None,
     }
 }
 
