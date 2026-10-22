@@ -159,6 +159,8 @@ pub fn normalize_peer_addr(raw: &str, field: &str) -> Result<(String, bool), Str
     } else {
         (s, false)
     };
+    // URL 形式的配置常带一个尾斜杠（空 path），等价于 host:port；其余 path 仍拒绝。
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
     if rest.is_empty()
         || rest.contains('/')
         || rest.contains('?')
@@ -218,10 +220,21 @@ mod tests {
             ("a:9000".into(), true)
         );
         assert_eq!(
+            normalize_peer_addr("http://A:9000/", "f").unwrap(),
+            ("a:9000".into(), false)
+        );
+        assert_eq!(
             normalize_peer_addr("127.0.0.1:1", "f").unwrap(),
             ("127.0.0.1:1".into(), false)
         );
-        for bad in ["a", "a:0", ":9000", "http://a:9000/x", "https://u@a:1"] {
+        for bad in [
+            "a",
+            "a:0",
+            ":9000",
+            "http://a:9000/x",
+            "http://a:9000//",
+            "https://u@a:1",
+        ] {
             assert!(normalize_peer_addr(bad, "f").is_err(), "{bad}");
         }
     }
