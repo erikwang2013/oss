@@ -41,7 +41,7 @@ crc32c = "0.6"
 aes-gcm = "0.10"
 # M5 切片 3：SSE-C 的 base64 钥/key-MD5 编解码（AWS 线格式）
 base64 = "0.22"
-rskafka = { version = "0.6", default-features = false }
+rskafka = { version = "0.6", default-features = false, features = ["transport-tls"] }
 # M6 切片 2：S3 Select 的 SQL AST（AWS 方言求值器自写）
 sqlparser = "0.53"
 # M6 切片 2：GZIP 输入解压（纯 Rust backend）
@@ -54,4 +54,12 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
+# TLS：ecat 的 TlsConfig 类型在 ecat-transport 里（ecat 未 re-export）；出站 hyper/reqwest 共用。
+ecat-transport = "7.0.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+# mesh gRPC 双端 TLS（xl-client 服务端/客户端，oss-server 构造配置）。
+tonic = { version = "0.12", features = ["tls", "tls-native-roots"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
