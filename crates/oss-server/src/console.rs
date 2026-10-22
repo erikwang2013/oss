@@ -2231,6 +2231,11 @@ async fn list_objects(
                 "storage_class": o.storage_class.as_deref(),
                 "tier_phase": o.tier_phase.map(|p| format!("{p:?}")),
                 "restore_expires_at": o.restore_expires_at,
+                // M5 遗留补齐：对象锁（retention 与 legal hold 独立；null = 无锁/降级条目未知）
+                "lock_mode": o.lock.as_ref().and_then(|l| l.mode.as_deref()),
+                // unix 秒（与 restore_expires_at / fmtTime 同单位）
+                "lock_retain_until": o.lock.as_ref().and_then(|l| l.retain_until_nanos).map(|n| n / 1_000_000_000),
+                "legal_hold": o.lock.as_ref().is_some_and(|l| l.legal_hold),
             })).collect::<Vec<_>>(),
             "common_prefixes": r.common_prefixes,
             "is_truncated": r.is_truncated,
