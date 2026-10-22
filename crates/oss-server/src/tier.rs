@@ -8,8 +8,17 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::config::TierTarget;
+use crate::config::{TierKind, TierTarget};
+use crate::local_tier::LocalTierBackend;
 use crate::repl_client::ReplClient;
+
+/// GC 列表项（远端 key、最后修改秒、字节数）。
+#[derive(Debug, Clone)]
+pub struct TierObject {
+    pub key: String,
+    pub last_modified: i64,
+    pub size: u64,
+}
 
 /// 单个 tier 的远端对象操作。`key` = 完整远端 key（含 tier_id 前缀，未编码）。
 #[async_trait::async_trait]
@@ -21,6 +30,10 @@ pub trait TierBackend: Send + Sync {
     /// 远端大小；键不存在 → None。
     async fn head(&self, key: &str) -> Result<Option<u64>, String>;
     async fn delete(&self, key: &str) -> Result<(), String>;
+    /// 列出该 tier 前缀下的全部对象（GC 对账用）；不支持的实现返回 Err。
+    async fn list(&self) -> Result<Vec<TierObject>, String> {
+        Err("tier 后端不支持 list".to_string())
+    }
 }
 
 /// 远端 key 构造（N3：raw key 原样拼接）。
@@ -78,6 +91,13 @@ impl TierBackend for S3TierBackend {
             .await
             .map_err(|e| e.message)
     }
+
+    async fn list(&self) -> Result<Vec<TierObject>, String> {
+        self.client
+            .tier_list(&self.id, &self.bucket, &format!("{}/", self.id))
+            .await
+            .map_err(|e| e.message)
+    }
 }
 
 /// tier id → 后端（启动期固定；规则校验只认这里的 id）。
@@ -105,18 +125,33 @@ impl TierBackends {
 
     /// 带进程 TLS 物料（自定义 CA/mTLS 身份；None = 平台根 + 明文端点不变）。
     pub fn from_config_tls(tiers: &[TierTarget], tls: Option<Arc<crate::tls::Tls>>) -> Self {
-        let mut client = ReplClient::new_tiers(tiers);
+        let s3: Vec<TierTarget> = tiers
+            .iter()
+            .filter(|t| t.kind == TierKind::S3)
+            .cloned()
+            .collect();
+        let mut client = ReplClient::new_tiers(&s3);
         if let Some(t) = tls {
             client = client.with_tls(t);
         }
         let client = Arc::new(client);
         let map = tiers
             .iter()
-            .map(|t| {
-                (
+            .filter_map(|t| match t.kind {
+                TierKind::S3 => Some((
                     t.id.clone(),
                     Arc::new(S3TierBackend::new(t, Arc::clone(&client))) as Arc<dyn TierBackend>,
-                )
+                )),
+                TierKind::Local => match t.path.clone() {
+                    Some(path) => Some((
+                        t.id.clone(),
+                        Arc::new(LocalTierBackend::new(t.id.clone(), path)) as Arc<dyn TierBackend>,
+                    )),
+                    None => {
+                        tracing::warn!(id = %t.id, "local tier 缺 path，已跳过");
+                        None
+                    }
+                },
             })
             .collect();
         Self {

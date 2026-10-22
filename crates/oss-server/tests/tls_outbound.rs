@@ -6,7 +6,7 @@ mod common;
 use std::sync::Arc;
 
 use axum::routing::get;
-use oss_server::config::TierTarget;
+use oss_server::config::{TierKind, TierTarget};
 use oss_server::repl_client::ReplClient;
 use oss_server::tls::Tls;
 use oss_server::tls_config::{TlsClientToml, TlsServerToml, TlsToml};
@@ -93,6 +93,8 @@ async fn tier_https_with_server_name_override() {
 
     let target = |server_name: Option<&str>| TierTarget {
         id: "cold".into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: format!("https://{addr}"),
         bucket: "tb".into(),
         access_key: "ak".into(),

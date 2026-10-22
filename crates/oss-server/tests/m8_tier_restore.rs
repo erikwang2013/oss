@@ -13,7 +13,7 @@ use xl_s3::service::OssS3;
 use xl_store::meta::TierPhase;
 
 use md5::Digest as _;
-use oss_server::config::TierTarget;
+use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
 use oss_server::router::build_router;
 use oss_server::state::AppState;
@@ -65,6 +65,8 @@ impl TierBackend for MockTier {
 fn tier_target(endpoint: &str) -> TierTarget {
     TierTarget {
         id: "cold".into(),
+        kind: TierKind::S3,
+        path: None,
         endpoint: endpoint.into(),
         bucket: "tb".into(),
         access_key: "ak".into(),
