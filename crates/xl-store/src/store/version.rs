@@ -960,6 +960,7 @@ impl Store {
                     // 版本列表：key_marker 是包含的续点；远端不得从头返回（否则 >limit 的
                     // 续页键整段缺失）。delete-marker 链尾的键也必须出现在版本列表。
                     marker: key_marker.map(str::to_string),
+                    marker_exclusive: false,
                     // +2 同本地：续点键可能产出 0 条，多取一键用于判定截断。
                     limit: max + 2,
                     include_deleted: true,

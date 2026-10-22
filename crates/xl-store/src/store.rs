@@ -169,7 +169,11 @@ pub struct ListRequest {
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<usize>,
+    /// V2 续页 token：**包含**该键本身（本页第一个未返回输出）。
     pub continuation_token: Option<String>,
+    /// V1 `marker`：**排他**起点，严格大于该键；与 `continuation_token` 互斥
+    /// （两者都设时 marker 优先——V1 语义）。
+    pub marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

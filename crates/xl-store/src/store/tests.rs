@@ -1268,6 +1268,132 @@ async fn list_delimiter_with_pagination_no_duplicate_prefix() {
 }
 
 #[tokio::test]
+async fn list_marker_is_exclusive() {
+    // V1 ListObjects：marker 是排他起点（严格大于），与 V2 token（包含）相反
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    for k in ["a", "b", "c"] {
+        s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    let keys = |r: &crate::store::ListResult| -> Vec<String> {
+        r.objects.iter().map(|o| o.key.clone()).collect()
+    };
+
+    let r = s
+        .list_objects(
+            "alpha",
+            &ListRequest {
+                marker: Some("b".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(keys(&r), ["c"]);
+    // marker 不必是已存在的键：按字典序排他
+    let r = s
+        .list_objects(
+            "alpha",
+            &ListRequest {
+                marker: Some("b0".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(keys(&r), ["c"]);
+    // marker 之后无键：空页且不截断
+    let r = s
+        .list_objects(
+            "alpha",
+            &ListRequest {
+                marker: Some("z".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(r.objects.is_empty() && !r.is_truncated);
+}
+
+#[tokio::test]
+async fn list_marker_with_delimiter_filters_common_prefixes() {
+    // AWS：CommonPrefixes 不返回字典序 <= marker 的项（marker 落在 cp 内部时整段过滤）
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    for k in ["docs/a", "docs/b", "done", "z"] {
+        s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    let req = |marker: &str| ListRequest {
+        marker: Some(marker.to_string()),
+        delimiter: Some("/".into()),
+        ..Default::default()
+    };
+
+    // marker 在 cp 内部 → cp "docs/" < "docs/a" 被过滤，其下键不得以对象形式出现
+    let r = s.list_objects("alpha", &req("docs/a")).await.unwrap();
+    assert_eq!(r.common_prefixes, Vec::<String>::new());
+    assert_eq!(
+        r.objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+        ["done", "z"]
+    );
+    // marker == cp → cp 不重复返回
+    let r = s.list_objects("alpha", &req("docs/")).await.unwrap();
+    assert!(r.common_prefixes.is_empty());
+    // marker 在 cp 之前 → cp 照常返回
+    let r = s.list_objects("alpha", &req("do")).await.unwrap();
+    assert_eq!(r.common_prefixes, vec!["docs/".to_string()]);
+    assert_eq!(
+        r.objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+        ["done", "z"]
+    );
+}
+
+#[tokio::test]
+async fn list_marker_pagination_does_not_repeat() {
+    // V1 续页：客户端用上一页最后输出（含 cp）作 marker，下一页不得重复
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    for k in ["b/x", "b/y", "c"] {
+        s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    let req = |marker: Option<&str>| ListRequest {
+        max_keys: Some(1),
+        delimiter: Some("/".into()),
+        marker: marker.map(str::to_string),
+        ..Default::default()
+    };
+    let page1 = s.list_objects("alpha", &req(None)).await.unwrap();
+    assert_eq!(page1.common_prefixes, vec!["b/".to_string()]);
+    assert!(page1.objects.is_empty()); // cp 已占满唯一输出位
+    assert!(page1.is_truncated);
+
+    let page2 = s
+        .list_objects(
+            "alpha",
+            &req(page1.common_prefixes.first().map(|p| p.as_str())),
+        )
+        .await
+        .unwrap();
+    assert!(page2.common_prefixes.is_empty(), "cp 不得重复返回");
+    assert_eq!(
+        page2
+            .objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        ["c"]
+    );
+    assert!(!page2.is_truncated);
+}
+
+#[tokio::test]
 async fn list_max_keys_zero_is_empty_page() {
     // max-keys=0：空页且不截断（报截断会让客户端拿同一个 token 空转）
     let (s, _d) = store().await;

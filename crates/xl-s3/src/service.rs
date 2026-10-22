@@ -25,6 +25,8 @@ use crate::sse::{
     sse_out_from_spec,
 };
 
+mod list_v1;
+
 #[derive(Clone)]
 pub struct OssS3 {
     store: Arc<Store>,
@@ -3495,6 +3497,14 @@ impl S3 for OssS3 {
         }))
     }
 
+    /// ListObjects v1：主体在 `list_v1.rs`（trait impl 不能按模块拆分，这里只转发）。
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        list_v1::list_objects(self, req).await
+    }
+
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -3529,6 +3539,7 @@ impl S3 for OssS3 {
                     delimiter,
                     max_keys,
                     continuation_token,
+                    ..Default::default()
                 },
             )
             .await
