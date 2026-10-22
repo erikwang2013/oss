@@ -21,7 +21,7 @@ use xl_s3::ap::{AccessPoint, ApCache, ApRoute, ApSource};
 use xl_s3::olap::{OlapCache, OlapTransform};
 use xl_s3::service::OssS3;
 use xl_store::meta::{TierPhase, TierState};
-use xl_store::store::{Store, StoreConfig};
+use xl_store::store::{Store, StoreConfig, VersioningMode};
 
 const BUCKET: &str = "bkt";
 const AK: &str = "AKIA_TEST";
@@ -266,7 +266,7 @@ async fn put_obj(
     ct: Option<&str>,
     meta: &[(&str, &str)],
     sc: Option<&str>,
-    versioned: bool,
+    mode: VersioningMode,
 ) -> xl_store::store::ObjectInfo {
     let metadata: BTreeMap<String, String> = meta
         .iter()
@@ -282,7 +282,7 @@ async fn put_obj(
             ct.map(str::to_string),
             metadata,
             None,
-            versioned,
+            mode,
             None,
             None,
             None,
@@ -332,7 +332,7 @@ async fn http_transform_full_path_headers_and_etag() {
         Some("text/plain"),
         &[("foo", "bar")],
         Some("STANDARD_IA"),
-        false,
+        VersioningMode::Off,
     )
     .await;
     add_ap(&env, "ap1");
@@ -371,7 +371,7 @@ async fn version_id_and_encoded_key_forwarded() {
         Some("text/plain"),
         &[],
         None,
-        true,
+        VersioningMode::Enabled,
     )
     .await;
     let version_id = info.version_id.clone().unwrap();
@@ -392,7 +392,16 @@ async fn conditionals_short_circuit_before_transform() {
     let _g = env_guard(true).await;
     let (endpoint, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
     let etag = etag_hex(b"hello");
@@ -412,7 +421,16 @@ async fn range_and_part_number_are_400() {
     let _g = env_guard(true).await;
     let (endpoint, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
 
@@ -430,7 +448,16 @@ async fn head_passthrough_and_writes_are_405() {
     let _g = env_guard(true).await;
     let (endpoint, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
 
@@ -451,7 +478,16 @@ async fn ap_without_transform_passes_through() {
     let _g = env_guard(true).await;
     let (_, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "plain");
     let (st, _, body) = send(&env, get("/ap/plain/hello", &[])).await;
     assert_eq!(st, StatusCode::OK);
@@ -464,7 +500,16 @@ async fn ap_without_transform_passes_through() {
 async fn unloaded_transform_cache_fails_closed_until_loaded() {
     let _g = env_guard(true).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "plain");
 
     env.olap.mark_failed(); // 模拟预加载失败
@@ -488,8 +533,8 @@ async fn success_200_carries_etag_and_304_skips_transform() {
     let _g = env_guard(true).await;
     let (endpoint, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "empty", b"", None, &[], None, false).await;
-    put_obj(&env, "text", b"abc", None, &[], None, false).await;
+    put_obj(&env, "empty", b"", None, &[], None, VersioningMode::Off).await;
+    put_obj(&env, "text", b"abc", None, &[], None, VersioningMode::Off).await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
 
@@ -521,7 +566,16 @@ async fn upstream_error_is_500_without_leaking_endpoint() {
     })
     .await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
     let (st, _, body) = send(&env, get("/ap/ap1/hello", &[])).await;
@@ -544,7 +598,16 @@ async fn timeout_is_enforced() {
     )
     .await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 1000, 1 << 20);
     let t0 = std::time::Instant::now();
@@ -569,7 +632,16 @@ async fn output_limit_and_gzip_bomb_count_decompressed() {
     })
     .await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "big");
     add_http_transform(&env, "big", &endpoint, 5000, 100);
     let (st, _, _) = send(&env, get("/ap/big/hello", &[])).await;
@@ -615,7 +687,16 @@ async fn gzip_ok_and_unsupported_content_encoding_is_500() {
     })
     .await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "gz");
     add_http_transform(&env, "gz", &gz_endpoint, 5000, 1 << 20);
     let (st, h, body) = send(&env, get("/ap/gz/hello", &[])).await;
@@ -695,7 +776,16 @@ async fn redirect_is_not_followed() {
     })
     .await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
     let (st, _, _) = send(&env, get("/ap/ap1/hello", &[])).await;
@@ -708,7 +798,16 @@ async fn private_mapped_and_localhost_rejected_at_request_time() {
     let _g = env_guard(true).await;
     let (endpoint, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
 
     // 保存时 ALLOW_PRIVATE=1 全放行；请求期摘掉变量后三类目标都必须拒。
     let mapped = endpoint.replace("127.0.0.1", "[::ffff:127.0.0.1]");
@@ -735,7 +834,16 @@ async fn input_limit_is_enforced() {
     let _g = env_guard(true).await;
     let (endpoint, m) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"01234567", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"01234567",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
     unsafe { std::env::set_var("OSS_OLAP_MAX_INPUT_BYTES", "4") };
@@ -763,7 +871,16 @@ async fn proxy_env_is_ignored() {
     }
     let (endpoint, _) = mock(upper_reply()).await;
     let env = test_env().await;
-    put_obj(&env, "hello", b"hello", None, &[], None, false).await;
+    put_obj(
+        &env,
+        "hello",
+        b"hello",
+        None,
+        &[],
+        None,
+        VersioningMode::Off,
+    )
+    .await;
     add_ap(&env, "ap1");
     add_http_transform(&env, "ap1", &endpoint, 5000, 1 << 20);
     let (st, _, body) = send(&env, get("/ap/ap1/hello", &[])).await;
@@ -784,7 +901,7 @@ async fn archived_object_403_before_transform() {
         None,
         &[],
         Some("GLACIER"),
-        false,
+        VersioningMode::Off,
     )
     .await;
     // 无公开 tier 变更 API（S4a 的 phase gate 只在存储内核单测里播种）——直接改盘上
@@ -902,7 +1019,7 @@ mod wasm {
             Some("text/plain"),
             &[],
             None,
-            false,
+            VersioningMode::Off,
         )
         .await;
         add_ap(&env, "ap1");

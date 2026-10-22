@@ -1,6 +1,7 @@
 //! M6 切片 4：复制——入队矩阵 + worker（R2 租约/R1 分级）+ SigV4 出站（mock remote）。
 
 use std::sync::{Arc, Mutex};
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -55,7 +56,7 @@ async fn put_versioned_owned(store: &Store, key: &str, body: Bytes) -> (String, 
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
@@ -774,7 +775,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
             Some("text/plain".into()),
             BTreeMap::from([("foo".to_string(), "Bar".to_string())]),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

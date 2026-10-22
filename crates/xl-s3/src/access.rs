@@ -404,7 +404,7 @@ impl Acl {
         let Some(sdoc) = self.session_policy_of(pr.ak).await? else {
             return Ok(((allow_dst, allow_src), None));
         };
-        let dst_act = if op == "CopyObject" {
+        let dst_act = if is_copy(op) {
             crate::policy::s3_action("PutObject")
         } else {
             crate::policy::s3_action(op)
@@ -845,7 +845,7 @@ impl Acl {
                         key,
                     };
                     // CopyObject 的目标桶策略管目标写（不走 s3_action 通用映射）
-                    let act = if op == "CopyObject" {
+                    let act = if is_copy(op) {
                         crate::policy::s3_action("PutObject")
                     } else {
                         crate::policy::s3_action(op)
@@ -872,7 +872,7 @@ impl Acl {
                 }
             }
         }
-        if op == "CopyObject" {
+        if is_copy(op) {
             // 源桶策略管源读，**独立于目标桶策略**评估（Deny 优先：src Deny 压过 dst Allow
             // ——否则有目标桶写权者可绕过源桶 Deny 拷贝机密）。源桶策略读取失败同样 fail-closed。
             if let Some((src_bucket, src_key)) = copy_src {
@@ -989,7 +989,7 @@ impl S3Access for Acl {
         let op = cx.s3_op().name();
         let bucket: Option<String> = cx.s3_path().get_bucket_name().map(str::to_owned);
         let key: Option<String> = cx.s3_path().as_object().map(|(_, k)| k.to_string());
-        let copy_src: Option<(String, String)> = if op == "CopyObject" {
+        let copy_src: Option<(String, String)> = if is_copy(op) {
             match cx
                 .headers()
                 .get(X_AMZ_COPY_SOURCE)
@@ -1052,6 +1052,11 @@ enum Gate {
     Copy,
 }
 
+/// 复制类 op（目标写 + 源读双轴；CopyObject / UploadPartCopy）。
+pub(crate) fn is_copy(op: &str) -> bool {
+    matches!(op, "CopyObject" | "UploadPartCopy")
+}
+
 fn classify(op: &str) -> Option<Gate> {
     Some(match op {
         "ListBuckets" | "CreateBucket" => Gate::Open,
@@ -1083,11 +1088,14 @@ fn classify(op: &str) -> Option<Gate> {
         "RestoreObject" => Gate::Need(Action::Write),
         // 读（HeadBucket 归读：AWS 语义绑 ListBucket）
         "HeadBucket"
+        | "ListObjects"
         | "ListObjectsV2"
+        | "ListMultipartUploads"
         | "ListParts"
         | "GetObject"
         | "HeadObject"
         | "GetObjectTagging"
+        | "GetObjectRetention"
         | "ListObjectVersions"
         | "SelectObjectContent" => Gate::Need(Action::Read),
         // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
@@ -1096,13 +1104,14 @@ fn classify(op: &str) -> Option<Gate> {
         | "PostObject"
         | "PutObjectTagging"
         | "DeleteObjectTagging"
+        | "PutObjectRetention"
         | "CreateMultipartUpload"
         | "UploadPart"
         | "CompleteMultipartUpload"
         | "AbortMultipartUpload" => Gate::Need(Action::Write),
         // 删
         "DeleteObject" | "DeleteObjects" => Gate::Need(Action::Delete),
-        "CopyObject" => Gate::Copy,
+        "CopyObject" | "UploadPartCopy" => Gate::Copy,
         // 未实现/未知 op：fail-closed（下游本来也是 501；这里统一 403）
         _ => return None,
     })
@@ -1364,13 +1373,16 @@ mod tests {
         );
         for op in [
             "HeadBucket",
+            "ListObjects",
             "ListObjectsV2",
+            "ListMultipartUploads",
             "ListParts",
             "ListObjectVersions",
             "GetObject",
             "HeadObject",
             "SelectObjectContent",
             "GetObjectTagging",
+            "GetObjectRetention",
             "GetBucketLifecycleConfiguration",
             "GetBucketInventoryConfiguration",
             "ListBucketInventoryConfigurations",
@@ -1387,6 +1399,7 @@ mod tests {
             "AbortMultipartUpload",
             "PutObjectTagging",
             "DeleteObjectTagging",
+            "PutObjectRetention",
             "RestoreObject",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Write)), "{op}");
@@ -1394,7 +1407,9 @@ mod tests {
         for op in ["DeleteObject", "DeleteObjects"] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Delete)), "{op}");
         }
-        assert_eq!(classify("CopyObject"), Some(Gate::Copy));
+        for op in ["CopyObject", "UploadPartCopy"] {
+            assert_eq!(classify(op), Some(Gate::Copy), "{op}");
+        }
         for op in [
             "PutBucketLifecycleConfiguration",
             "DeleteBucketLifecycle",
@@ -2028,6 +2043,22 @@ mod session_tests {
         )
         .await;
         assert!((d, s, det) == (true, true, Some("session:allow")));
+        // UploadPartCopy 与 CopyObject 同属双轴：源桶不在会话授权范围 → src 轴拒
+        let ((d, s), det) = fuse(
+            &a,
+            "ASIA_CP",
+            "UploadPartCopy",
+            "bkt",
+            Some("k"),
+            Some(("other", "o")),
+            true,
+            true,
+        )
+        .await;
+        assert!(
+            (d, s, det) == (true, false, Some("session:deny")),
+            "UploadPartCopy 源轴必须走 GetObject 交集"
+        );
     }
 
     /// P3-2 复验修复判别：本地无行 + 扇出无答（全不可达）→ Err（fail-closed），

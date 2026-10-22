@@ -2,6 +2,7 @@ mod common;
 
 use common::state;
 use oss_server::router::build_router;
+use xl_store::store::VersioningMode;
 
 /// 起真实监听端口的服务，返回 base URL（新用例共用；Step 1 块内两个测试保持原样）。
 async fn serve(app: axum::Router) -> String {
@@ -1586,7 +1587,7 @@ async fn select_proxy_csv_filter_and_errors() {
                 None,
                 Default::default(),
                 None,
-                false,
+                VersioningMode::Off,
                 Some(EncSpec::SseC(SseCKey::from_key([7u8; 32]))),
                 None,
                 None,
@@ -1979,7 +1980,7 @@ async fn object_list_includes_storage_and_tier_fields() {
             None,
             Default::default(),
             None,
-            false,
+            VersioningMode::Off,
             None,
             None,
             None,

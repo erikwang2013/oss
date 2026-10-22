@@ -14,7 +14,7 @@ use s3s::dto::*;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use xl_store::error::Error as StoreError;
 use xl_store::meta::{ChecksumRecord, ObjectTag};
-use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store};
+use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store, VersioningMode};
 
 use crate::bucket_control::{BucketControlError, BucketControlSink, BucketCreateSpec};
 use crate::convert::to_s3_error;
@@ -24,6 +24,8 @@ use crate::sse::{
     SseReq, enc_spec_from_default, parse_sse, sse_c_headers, sse_c_key_md5_header, sse_out,
     sse_out_from_spec,
 };
+
+mod list_v1;
 
 #[derive(Clone)]
 pub struct OssS3 {
@@ -84,10 +86,10 @@ impl OssS3 {
         Ok(())
     }
 
-    /// 桶版本控制是否 Enabled（读 DB；查库失败上抛 500——状态不可知时不写数据）。
-    async fn versioned(&self, bucket: &str) -> S3Result<bool> {
+    /// 桶版本控制三态（读 DB；查库失败上抛 500——状态不可知时不写数据）。
+    async fn versioning_mode(&self, bucket: &str) -> S3Result<VersioningMode> {
         match self.acl.bucket_versioning(bucket).await {
-            Ok(s) => Ok(s == "Enabled"),
+            Ok(s) => Ok(VersioningMode::from_status(&s)),
             Err(e) => {
                 tracing::error!(error = %e, "读取桶版本控制状态失败");
                 Err(s3s::s3_error!(InternalError, "internal error"))
@@ -139,17 +141,17 @@ impl OssS3 {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
         bypass: bool,
     ) -> xl_store::error::Result<DeleteOutcome> {
         match &self.sync_delete {
             Some(s) => {
-                s.delete_versioned(bucket, key, version_id, versioned, bypass)
+                s.delete_versioned(bucket, key, version_id, mode, bypass)
                     .await
             }
             None => {
                 self.store
-                    .delete_object_versioned_ext(bucket, key, version_id, versioned, bypass)
+                    .delete_object_versioned_ext(bucket, key, version_id, mode, bypass)
                     .await
             }
         }
@@ -1318,7 +1320,7 @@ impl S3 for OssS3 {
             None => (stream, None),
         };
 
-        let versioned = self.versioned(&bucket).await?;
+        let mode = self.versioning_mode(&bucket).await?;
         let result = self
             .store
             .put_object_stream_with_meta_ext(
@@ -1328,7 +1330,7 @@ impl S3 for OssS3 {
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
                 checksum_record,
-                versioned,
+                mode,
                 sse.spec, // M5 切片 3：SSE 头映射（R1/R2）
                 lock,     // M5 切片 4（L3）
                 tags,     // M8 前置：写入版本标签
@@ -1596,7 +1598,7 @@ impl S3 for OssS3 {
             }
             pairs.push((pn as u16, etag.value().to_string()));
         }
-        let versioned = self.versioned(&bucket).await?;
+        let mode = self.versioning_mode(&bucket).await?;
         let info = self
             .store
             .complete_multipart_upload_versioned(
@@ -1604,7 +1606,7 @@ impl S3 for OssS3 {
                 &key,
                 &upload_id,
                 &pairs,
-                versioned,
+                mode,
                 sse.spec.clone(),
                 None,
             )
@@ -2195,9 +2197,9 @@ impl S3 for OssS3 {
         let vid = req.input.version_id.clone();
         // M5 切片 4（L4）：Governance bypass 头（调用方均经鉴权链——「非匿名」成立）
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
-        let versioned = self.versioned(&bucket).await?;
+        let mode = self.versioning_mode(&bucket).await?;
         let outcome = self
-            .delete_versioned(&bucket, &key, vid.as_deref(), versioned, bypass)
+            .delete_versioned(&bucket, &key, vid.as_deref(), mode, bypass)
             .await
             .map_err(to_s3_error)?;
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
@@ -2289,7 +2291,7 @@ impl S3 for OssS3 {
 
         // §3.4 部分失败语义：逐键删，成功的进 deleted、键级错误进 errors 后继续；
         // 桶级错误（桶不存在/桶名不合法）是请求级错误，整体返回 Err。
-        let versioned = self.versioned(&bucket).await?;
+        let mode = self.versioning_mode(&bucket).await?;
         // M9 §2.4 N2：sync 桶任一远端失败 → 整体 503（成功键已提交；对象可见性幂等）。
         // async 桶保持逐键错误口径（M7 不变）。
         let sync_bucket = self
@@ -2344,13 +2346,7 @@ impl S3 for OssS3 {
                 continue;
             }
             match self
-                .delete_versioned(
-                    &bucket,
-                    &obj.key,
-                    obj.version_id.as_deref(),
-                    versioned,
-                    bypass,
-                )
+                .delete_versioned(&bucket, &obj.key, obj.version_id.as_deref(), mode, bypass)
                 .await
             {
                 Ok(outcome) => {
@@ -3118,7 +3114,6 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let bucket = req.input.bucket;
         let cfg = req.input.versioning_configuration;
-        // v1：只收 Enabled/Off；Suspended 语义未实现——明确拒绝，不静默接受
         let current = match self.acl.bucket_versioning(&bucket).await {
             Ok(s) => s,
             Err(e) => {
@@ -3129,9 +3124,9 @@ impl S3 for OssS3 {
         let stored = match cfg.status.map(|s| s.as_str().to_string()).as_deref() {
             Some("Enabled") => "Enabled",
             Some("Off") => {
-                // 单向：已启用的桶不接受改回 Off——写路径会把整链替换成单版本 → 旧版本目录
-                // 成孤儿被 GC 按龄删除（静默丢历史）。停用语义（Suspended）未实现，明确拒绝。
-                if current == "Enabled" {
+                // 单向：启用过（Enabled/Suspended）的桶不接受改回 Off——写路径会把整链替换成
+                // 单版本 → 旧版本目录成孤儿被 GC 按龄删除（静默丢历史）。
+                if current != "Off" {
                     return Err(s3s::s3_error!(
                         NotImplemented,
                         "disabling versioning is not supported"
@@ -3140,10 +3135,36 @@ impl S3 for OssS3 {
                 "Off"
             }
             Some("Suspended") => {
-                return Err(s3s::s3_error!(
-                    NotImplemented,
-                    "versioning suspension is not supported"
-                ));
+                // Object Lock 桶必须保持 Enabled，否则锁定版本的链语义被破坏。
+                match self.acl.bucket_lock(&bucket).await {
+                    Ok(Some((true, ..))) => {
+                        return Err(s3s::s3_error!(
+                            InvalidBucketState,
+                            "object lock requires bucket versioning enabled"
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "读桶锁状态失败");
+                        return Err(s3s::s3_error!(InternalError, "internal error"));
+                    }
+                }
+                // M9 sync 桶依赖真 UUID 版本链做双站同 id；Suspended 的 null 版本会破坏
+                // 复制/删除对齐（sync 删除路径对此 fail-closed 报 Conflict）。
+                match self.acl.bucket_replication_mode(&bucket).await {
+                    Ok(m) if m == "sync" => {
+                        return Err(s3s::s3_error!(
+                            InvalidBucketState,
+                            "sync bucket requires versioning enabled"
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "读桶复制模式失败");
+                        return Err(s3s::s3_error!(InternalError, "internal error"));
+                    }
+                }
+                "Suspended"
             }
             _ => {
                 return Err(s3s::s3_error!(InvalidArgument, "invalid versioning status"));
@@ -3171,13 +3192,15 @@ impl S3 for OssS3 {
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
         match self.acl.bucket_versioning(&req.input.bucket).await {
-            // 口径注记：未开过版本的桶本系统回 "Off"（AWS 留空）——值域收敛为 Off/Enabled，
+            // 口径注记：未开过版本的桶本系统回 "Off"（AWS 留空）——值域 Off/Enabled/Suspended，
             // aws-cli 展示不受影响（记档边界）
             Ok(s) => {
-                let status = if s == "Enabled" {
-                    BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)
-                } else {
-                    BucketVersioningStatus::from_static("Off")
+                let status = match s.as_str() {
+                    "Enabled" => {
+                        BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)
+                    }
+                    "Suspended" => BucketVersioningStatus::from_static("Suspended"),
+                    _ => BucketVersioningStatus::from_static("Off"),
                 };
                 let mut resp = S3Response::new(GetBucketVersioningOutput {
                     status: Some(status),
@@ -3474,6 +3497,14 @@ impl S3 for OssS3 {
         }))
     }
 
+    /// ListObjects v1：主体在 `list_v1.rs`（trait impl 不能按模块拆分，这里只转发）。
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        list_v1::list_objects(self, req).await
+    }
+
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -3508,6 +3539,7 @@ impl S3 for OssS3 {
                     delimiter,
                     max_keys,
                     continuation_token,
+                    ..Default::default()
                 },
             )
             .await
@@ -3702,7 +3734,7 @@ impl S3 for OssS3 {
             Some(src_info.tags.clone())
         };
         // 目标桶版本策略随 copy 生效（版本桶 copy 出的是新版本）
-        let dst_versioned = self.versioned(&req.input.bucket).await?;
+        let dst_mode = self.versioning_mode(&req.input.bucket).await?;
         let info = self
             .store
             .put_object_stream_with_meta(
@@ -3713,7 +3745,7 @@ impl S3 for OssS3 {
                 user_metadata,
                 // M9：Copy 继承源校验和（随门 PUT 透传对端，A/B 元数据一致）
                 src_info.checksum.clone(),
-                dst_versioned,
+                dst_mode,
                 dst_sse.spec, // M5 切片 3（R4）：目标 SSE 显式头（未给 = 明文目标）
                 dst_lock,     // M5 切片 4（L3）
                 tags,

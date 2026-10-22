@@ -14,7 +14,7 @@ fn stream_of(b: &'static [u8]) -> ByteStream {
     ))
 }
 
-async fn put(s: &Store, key: &str, body: &'static [u8], versioned: bool) -> ObjectInfo {
+async fn put(s: &Store, key: &str, body: &'static [u8], mode: VersioningMode) -> ObjectInfo {
     s.put_object_stream_with_meta(
         "alpha",
         key,
@@ -22,7 +22,7 @@ async fn put(s: &Store, key: &str, body: &'static [u8], versioned: bool) -> Obje
         None,
         Default::default(),
         None,
-        versioned,
+        mode,
         None,
         None,
         None,
@@ -37,11 +37,11 @@ async fn put(s: &Store, key: &str, body: &'static [u8], versioned: bool) -> Obje
 async fn replication_status_on_delete_marker() {
     let (s, _d) = store().await;
     s.create_bucket("alpha").await.unwrap();
-    let v = put(&s, "mk", b"x", true).await;
+    let v = put(&s, "mk", b"x", VersioningMode::Enabled).await;
     assert_eq!(v.version_id.as_deref().map(str::len), Some(36));
     // 删除生成 marker（版本桶）
     let out = s
-        .delete_object_versioned("alpha", "mk", None, true)
+        .delete_object_versioned("alpha", "mk", None, VersioningMode::Enabled)
         .await
         .unwrap();
     let marker_vid = match out {
@@ -85,7 +85,7 @@ async fn replication_status_on_delete_marker() {
 async fn pending_write_does_not_downgrade_terminal_status() {
     let (s, _d) = store().await;
     s.create_bucket("alpha").await.unwrap();
-    let v = put(&s, "k", b"x", true).await;
+    let v = put(&s, "k", b"x", VersioningMode::Enabled).await;
     let vid = v.version_id.unwrap();
     // 初次：None → PENDING（true）
     assert!(
@@ -143,8 +143,8 @@ async fn replication_status_roundtrip_clear_and_whitelist() {
     s.create_bucket("alpha").await.unwrap();
 
     // 版本桶：两版本，状态互不影响
-    let v1 = put(&s, "k", b"one", true).await;
-    let v2 = put(&s, "k", b"two", true).await;
+    let v1 = put(&s, "k", b"one", VersioningMode::Enabled).await;
+    let v2 = put(&s, "k", b"two", VersioningMode::Enabled).await;
     let vid1 = v1.version_id.unwrap();
     s.set_replication_status("alpha", "k", &vid1, Some("PENDING"))
         .await
@@ -157,7 +157,7 @@ async fn replication_status_roundtrip_clear_and_whitelist() {
     assert_ne!(b.version_id, Some(vid1.clone()));
 
     // 非版本化对象：版本号 "null"
-    let nv = put(&s, "nk", b"x", false).await;
+    let nv = put(&s, "nk", b"x", VersioningMode::Off).await;
     assert_eq!(nv.version_id.as_deref(), Some("null"));
     s.set_replication_status("alpha", "nk", "null", Some("COMPLETED"))
         .await

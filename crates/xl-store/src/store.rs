@@ -38,6 +38,30 @@ pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec};
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
+/// 桶版本控制三态（S3 `VersioningConfiguration.Status`）。store 不查库：S3/作业层从
+/// `buckets.versioning` 读出后显式传入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VersioningMode {
+    /// 从未启用 / 未配置：单版本替换链，删除整键清除（M2b 行为）。
+    #[default]
+    Off,
+    /// 每次写追加真 UUID 版本；无版本号删除追加真 UUID marker。
+    Enabled,
+    /// 写/删只作用在 null 版本：写替换链中 null 版本，删移除 null 版本并追加 null marker。
+    Suspended,
+}
+
+impl VersioningMode {
+    /// DB 字符串 → 三态；未知值按 Off（与既有 `s == "Enabled"` 口径一致）。
+    pub fn from_status(s: &str) -> Self {
+        match s {
+            "Enabled" => Self::Enabled,
+            "Suspended" => Self::Suspended,
+            _ => Self::Off,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     /// 数据盘数组（M2b-2 起多盘；单盘形态 = 长度 1）。`drives[0]` 兼作命名空间枚举源与暂存盘。
@@ -145,7 +169,11 @@ pub struct ListRequest {
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
     pub max_keys: Option<usize>,
+    /// V2 续页 token：**包含**该键本身（本页第一个未返回输出）。
     pub continuation_token: Option<String>,
+    /// V1 `marker`：**排他**起点，严格大于该键；与 `continuation_token` 互斥
+    /// （两者都设时 marker 优先——V1 语义）。
+    pub marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1691,3 +1719,5 @@ mod tests_sync;
 mod tests_tags;
 #[cfg(test)]
 mod tests_tier;
+#[cfg(test)]
+mod tests_versioning;
