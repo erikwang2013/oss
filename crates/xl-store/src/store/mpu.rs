@@ -295,7 +295,7 @@ impl Store {
             None,
             None,
         )
-            .await
+        .await
     }
 
     /// 版本控制感知的 complete（M4 切片 3 / S3 Suspended）：Enabled 追加版本（保留旧
@@ -504,10 +504,7 @@ impl Store {
                 .collect(),
             _ => Vec::new(),
         };
-        if let Some(why) = replaced
-            .iter()
-            .find_map(super::version::active_lock_reason)
-        {
+        if let Some(why) = replaced.iter().find_map(super::version::active_lock_reason) {
             return Err(Error::ObjectLocked(format!("覆盖写将回收锁定版本：{why}")));
         }
         // per-key 单调 mod_time（C4）：与单段 PUT 同口径

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::db::Db;
-use xl_store::store::Store;
+use xl_store::store::{Store, VersioningMode};
 
 /// 动作执行器。`Ok(code)` = 成功；`Err(msg)` = 可重试失败（由引擎按上限转 PermanentFailure）。
 #[async_trait::async_trait]
@@ -291,11 +291,11 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
     } else {
         format!("{prefix}/{job_id}/results.csv")
     };
-    let versioned = db
+    let mode = db
         .get_bucket_versioning(bucket)
         .await
-        .map(|s| s == "Enabled")
-        .unwrap_or(false);
+        .map(|s| VersioningMode::from_status(&s))
+        .unwrap_or_default();
     let written: Result<(), String> = async {
         // I5：报告对象同样套报告桶默认加密（与 S3 写入路径同口径；坏记录 fail-closed）。
         let encryption = match db.get_bucket_default_encryption(bucket).await {
@@ -316,7 +316,7 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
                 Some("text/csv".to_string()),
                 std::collections::BTreeMap::new(),
                 None,
-                versioned,
+                mode,
                 encryption,
                 None,
                 None,

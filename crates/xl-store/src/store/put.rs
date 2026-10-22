@@ -96,9 +96,9 @@ impl Store {
             user_metadata,
             None,
             VersioningMode::Off, // 兼容壳：无版本控制（S3 层显式传 state）
-            None,  // 兼容壳：无加密（切片 3 由 S3 头映射）
-            None,  // 兼容壳：无对象锁
-            None,  // M8 前置：无标签
+            None,                // 兼容壳：无加密（切片 3 由 S3 头映射）
+            None,                // 兼容壳：无对象锁
+            None,                // M8 前置：无标签
             None,
         )
         .await
@@ -743,10 +743,7 @@ impl Store {
                 .collect(),
             _ => Vec::new(),
         };
-        if let Some(why) = replaced
-            .iter()
-            .find_map(super::version::active_lock_reason)
-        {
+        if let Some(why) = replaced.iter().find_map(super::version::active_lock_reason) {
             return Err(Error::ObjectLocked(format!("覆盖写将回收锁定版本：{why}")));
         }
         // 双站同 id：接收端采用 origin UUID 作为版本目录名/version_id。

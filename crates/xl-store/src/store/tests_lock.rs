@@ -161,7 +161,15 @@ async fn mpu_lock_lands_at_complete() {
         .unwrap();
     // complete 不带锁参数 → 由 create 记录落地（AWS：锁头只出现在 create）
     let info = s
-        .complete_multipart_upload_versioned("alpha", "k", &up, &[(1, e1)], VersioningMode::Off, None, None)
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "k",
+            &up,
+            &[(1, e1)],
+            VersioningMode::Off,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let rec = info
@@ -312,7 +320,8 @@ async fn purge_and_overwrite_guards_block_locked_versions() {
     ));
     // B2-a：陈旧节点非版本化整键删
     assert!(matches!(
-        s.delete_object_versioned("alpha", "k", None, VersioningMode::Off).await,
+        s.delete_object_versioned("alpha", "k", None, VersioningMode::Off)
+            .await,
         Err(Error::ObjectLocked(_))
     ));
     // B2-b：陈旧节点非版本化覆盖写（recycle 会回收锁定版本）
@@ -349,7 +358,15 @@ async fn purge_and_overwrite_guards_block_locked_versions() {
         .await
         .unwrap();
     let e = s
-        .complete_multipart_upload_versioned("alpha", "k", &up, &[(1, e1)], VersioningMode::Off, None, None)
+        .complete_multipart_upload_versioned(
+            "alpha",
+            "k",
+            &up,
+            &[(1, e1)],
+            VersioningMode::Off,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(e, Error::ObjectLocked(_)), "{e:?}");
@@ -467,4 +484,59 @@ async fn purge_and_overwrite_guards_block_locked_versions() {
         s.get_legal_hold("alpha", "nope", None).await,
         Err(Error::NoSuchKey(_))
     ));
+}
+
+/// Suspended：覆盖写/无版本号删除都只动 null 版本——null 版本的锁必须生效。
+#[tokio::test]
+async fn suspended_write_and_delete_guard_locked_null_version() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    let info = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(payload(200_000)),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Suspended,
+            None,
+            Some(lock("GOVERNANCE", now_plus(3600), false)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.version_id.as_deref(), Some("null"));
+
+    let e = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(payload(200_000)),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Suspended,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ObjectLocked(_)), "{e:?}");
+
+    let e = s
+        .delete_object_versioned("alpha", "k", None, VersioningMode::Suspended)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ObjectLocked(_)), "{e:?}");
+
+    // GOVERNANCE bypass 放行（与点名删版本同口径）
+    let out = s
+        .delete_object_versioned_ext("alpha", "k", None, VersioningMode::Suspended, true)
+        .await
+        .unwrap();
+    assert!(matches!(out, DeleteOutcome::Marker { .. }));
 }

@@ -3512,6 +3512,160 @@ async fn tagging_roundtrip_put_get_delete_and_counts() {
     assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchBucket);
 }
 
+/// Suspended 端到端：PUT 写 null 版本、DELETE 追加 null marker、点名删 marker 恢复历史。
+#[tokio::test]
+async fn suspended_put_delete_end_to_end() {
+    async fn read_body(mut b: StreamingBlob) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut b).await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        buf
+    }
+    let (s3, _d) = service().await;
+    versioned(&s3, "vsus").await;
+    let v1 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"1"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    assert_ne!(v1, "null");
+
+    let cfg = |st: &'static str| {
+        req(PutBucketVersioningInput {
+            bucket: "vsus".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            mfa: None,
+            versioning_configuration: VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(st)),
+                mfa_delete: None,
+            },
+        })
+    };
+    s3.put_bucket_versioning(cfg("Suspended")).await.unwrap();
+    let v2 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"2"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    assert_eq!(v2, "null");
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(read_body(got.body.unwrap()).await, b"2");
+
+    // 版本列表：null 版本为 latest，真 UUID 历史保留
+    let lv = s3
+        .list_object_versions(req(ListObjectVersionsInput {
+            bucket: "vsus".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let versions = lv.versions.unwrap();
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+    assert_eq!(versions[0].is_latest, Some(true));
+    assert_eq!(versions[1].version_id.as_deref(), Some(v1.as_str()));
+
+    // 无版本号删 → null delete marker；默认读 404
+    let del = s3
+        .delete_object(req(DeleteObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(del.delete_marker, Some(true));
+    assert_eq!(del.version_id.as_deref(), Some("null"));
+    let err = s3
+        .get_object(req(GetObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchKey);
+    let lv = s3
+        .list_object_versions(req(ListObjectVersionsInput {
+            bucket: "vsus".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let markers = lv.delete_markers.unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].version_id.as_deref(), Some("null"));
+    assert_eq!(
+        lv.versions.unwrap().len(),
+        1,
+        "非 null 历史保留；null 数据版已移除"
+    );
+
+    // 点名删 null marker → 恢复可见（v1）
+    s3.delete_object(req(DeleteObjectInput {
+        bucket: "vsus".into(),
+        key: "k".into(),
+        version_id: Some("null".into()),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(read_body(got.body.unwrap()).await, b"1");
+
+    // 回 Enabled：新写为真 UUID
+    s3.put_bucket_versioning(cfg("Enabled")).await.unwrap();
+    let v3 = s3
+        .put_object(req(PutObjectInput {
+            bucket: "vsus".into(),
+            key: "k".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"3"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .version_id
+        .unwrap();
+    assert_ne!(v3, "null");
+}
+
 #[tokio::test]
 async fn tagging_version_isolation_and_marker_errors() {
     let (s3, _d) = service().await;
