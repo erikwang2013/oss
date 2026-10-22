@@ -7,8 +7,8 @@ mod common;
 use base64::Engine as _;
 use oss_server::raft::control::ControlError;
 use oss_server::raft::{
-    COMMAND_MAX_BYTES, ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits,
-    RaftSettings, SizeError,
+    COMMAND_MAX_BYTES, ControlCommand, ControlResponse, LifecycleRuleCmd, LifecycleRuleCmdV2,
+    PermissionBits, RaftSettings, SizeError,
 };
 use oss_server::state::AppState;
 use sqlx::Row;
@@ -128,6 +128,21 @@ fn command_serde_round_trip_every_variant_and_rejects_unknown_fields() {
             rules: vec![lifecycle_rule("p", "r")],
             updated_at: 1,
         },
+        ControlCommand::BucketSetLifecycleV2 {
+            bucket: "b".into(),
+            rules: vec![LifecycleRuleCmdV2 {
+                rule_id: Some("r2".into()),
+                prefix: "p/".into(),
+                expire_days: -1,
+                expiration_days: None,
+                transition_days: None,
+                transition_class: None,
+                transition_tier: None,
+                enabled: true,
+                config_json: Some(r#"{"filter":{"prefix":"p/"}}"#.into()),
+            }],
+            updated_at: 1,
+        },
         ControlCommand::BucketClearLifecycle { bucket: "b".into() },
         ControlCommand::BucketSetReplication {
             bucket: "b".into(),
@@ -194,6 +209,19 @@ fn command_serde_round_trip_every_variant_and_rejects_unknown_fields() {
     let unknown_field = r#"{"UserCreate":{"username":"u","password_hash":"h","status":"active","created_at":0,"extra":1}}"#;
     assert!(serde_json::from_str::<ControlCommand>(unknown_field).is_err());
     assert!(serde_json::from_str::<ControlCommand>(r#"{"NoSuchCommand":{}}"#).is_err());
+    // V1 线格式不变（旧节点可解码）；V2 的 config_json 允许缺省（serde default）。
+    let v1 = serde_json::to_string(&ControlCommand::BucketSetLifecycle {
+        bucket: "b".into(),
+        rules: vec![lifecycle_rule("p", "r")],
+        updated_at: 1,
+    })
+    .unwrap();
+    assert!(!v1.contains("config_json"), "{v1}");
+    let v2: ControlCommand = serde_json::from_str(
+        r#"{"BucketSetLifecycleV2":{"bucket":"b","rules":[{"rule_id":null,"prefix":"","expire_days":-1,"expiration_days":null,"transition_days":null,"transition_class":null,"transition_tier":null,"enabled":true}],"updated_at":1}}"#,
+    )
+    .unwrap();
+    assert!(matches!(v2, ControlCommand::BucketSetLifecycleV2 { .. }));
 }
 
 #[test]
@@ -791,13 +819,16 @@ async fn internal_apply_error_rolls_back_partial_writes() {
         ControlResponse::Ok
     );
 
-    // 两条同 prefix 规则违反 (bucket,prefix) 主键：DELETE 已执行、首条 INSERT 已执行，
+    // 两条同 rule_id 规则违反 (bucket,rule_id) 主键：DELETE 已执行、首条 INSERT 已执行，
     // 第二条失败 → 事务回滚，旧行必须原样保留（fail-stop，无部分写）。
     let err = st
         .control
         .write(ControlCommand::BucketSetLifecycle {
             bucket: "b".into(),
-            rules: vec![lifecycle_rule("dup", "r1"), lifecycle_rule("dup", "r2")],
+            rules: vec![
+                lifecycle_rule("dup", "same"),
+                lifecycle_rule("other", "same"),
+            ],
             updated_at: 2,
         })
         .await

@@ -12,7 +12,7 @@ use s3s::dto::{
     TransitionStorageClass,
 };
 use s3s::{S3, S3Request};
-use xl_s3::lifecycle::LifecycleRuleSpec;
+use xl_s3::lifecycle::{LifecycleRuleSpec, NoncurrentTransition, TransitionAction};
 use xl_s3::service::OssS3;
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -157,6 +157,7 @@ async fn console_and_s3_share_one_store() {
             transition_tier: None,
             enabled: true,
             updated_at: 0,
+            config_json: None,
         }],
         0,
     )
@@ -175,6 +176,132 @@ async fn console_and_s3_share_one_store() {
     assert_eq!(listed[0]["rule_id"], "rule-1");
     assert_eq!(listed[0]["expire_days"], 45);
     assert_eq!(listed[0]["expiration_days"], 45);
+}
+
+/// P1：console 结构化 JSON（Filter/Tag/Size/Date/多 Transition/Noncurrent）PUT 后，
+/// console GET 与 S3 GET 回读同一份规则，旧扁平字段保持兼容。
+#[tokio::test]
+async fn console_structured_json_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.store.create_bucket("bkt").await.unwrap();
+    st.db.insert_bucket("bkt", None).await.unwrap();
+    let s3 = OssS3::new(Arc::clone(&st.store), st.acl(), st.cfg.max_put_bytes)
+        .with_lifecycle(Some(Arc::clone(&st.lifecycle)));
+    let base = serve(oss_server::router::build_router(st).unwrap()).await;
+    let token = login(&base).await;
+    let http = reqwest::Client::new();
+
+    let at = time::OffsetDateTime::now_utc() + time::Duration::days(2);
+    let date = format!("{:04}-{:02}-{:02}", at.year(), u8::from(at.month()), at.day());
+    let resp = http
+        .put(format!("{base}/api/v1/buckets/bkt/lifecycle"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!([{
+            "rule_id": "s1",
+            "filter": {
+                "prefix": "logs/",
+                "tags": [{"key": "env", "value": "prod"}],
+                "object_size_greater_than": 10,
+                "object_size_less_than": 1000
+            },
+            "expiration_date": date,
+            "transitions": [
+                {"days": 30, "storage_class": "STANDARD_IA"},
+                {"days": 90, "storage_class": "ONEZONE_IA"}
+            ],
+            "noncurrent_version_expiration": {
+                "noncurrent_days": 7, "newer_noncurrent_versions": 2
+            },
+            "noncurrent_version_transitions": [
+                {"noncurrent_days": 30, "storage_class": "STANDARD_IA"}
+            ]
+        }]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "{}", resp.text().await.unwrap());
+
+    let listed: Vec<serde_json::Value> = http
+        .get(format!("{base}/api/v1/buckets/bkt/lifecycle"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    let r = &listed[0];
+    assert_eq!(r["rule_id"], "s1");
+    assert_eq!(r["filter"]["prefix"], "logs/");
+    assert_eq!(r["filter"]["tags"][0]["key"], "env");
+    assert_eq!(r["filter"]["tags"][0]["value"], "prod");
+    assert_eq!(r["filter"]["object_size_greater_than"], 10);
+    assert_eq!(r["filter"]["object_size_less_than"], 1000);
+    assert_eq!(r["expiration_date"], date.as_str());
+    assert_eq!(r["expire_days"], -1);
+    assert_eq!(r["transitions"][1]["days"], 90);
+    assert_eq!(r["transitions"][1]["storage_class"], "ONEZONE_IA");
+    assert_eq!(r["transition_days"], 30, "旧扁平字段取第一条 transition");
+    assert_eq!(r["noncurrent_version_expiration"]["noncurrent_days"], 7);
+    assert_eq!(
+        r["noncurrent_version_expiration"]["newer_noncurrent_versions"],
+        2
+    );
+    assert_eq!(r["noncurrent_version_transitions"][0]["noncurrent_days"], 30);
+
+    // S3 GET：组合过滤回读为 And；Date/多条 Transition/Noncurrent 原样可见。
+    let out = s3
+        .get_bucket_lifecycle_configuration(req(GetBucketLifecycleConfigurationInput {
+            bucket: "bkt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let rules = out.rules.unwrap();
+    assert_eq!(rules.len(), 1);
+    let and = rules[0]
+        .filter
+        .as_ref()
+        .and_then(|f| f.and.as_ref())
+        .expect("prefix+tag+size 组合应回读为 And");
+    assert_eq!(and.prefix.as_deref(), Some("logs/"));
+    assert_eq!(and.object_size_greater_than, Some(10));
+    assert_eq!(and.object_size_less_than, Some(1000));
+    assert_eq!(and.tags.as_ref().unwrap().len(), 1);
+    assert!(rules[0]
+        .expiration
+        .as_ref()
+        .and_then(|e| e.date.as_ref())
+        .is_some());
+    assert_eq!(rules[0].transitions.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        rules[0].transitions.as_ref().unwrap()[1]
+            .storage_class
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "ONEZONE_IA"
+    );
+    assert_eq!(
+        rules[0]
+            .noncurrent_version_expiration
+            .as_ref()
+            .unwrap()
+            .newer_noncurrent_versions,
+        Some(2)
+    );
+    assert_eq!(
+        rules[0]
+            .noncurrent_version_transitions
+            .as_ref()
+            .unwrap()[0]
+            .noncurrent_days,
+        Some(30)
+    );
 }
 
 /// M4 worker 只处理过期规则；Transition-only 规则必须跳过。
@@ -200,6 +327,7 @@ async fn sweep_once_skips_transition_only_rule() {
             transition_tier: None,
             enabled: true,
             updated_at: 0,
+            config_json: None,
         }
     };
     st.db
@@ -248,11 +376,16 @@ async fn sweep_transitions_enqueues_and_dedupes() {
             "bkt",
             &[LifecycleRuleSpec {
                 rule_id: Some("t1".into()),
-                prefix: String::new(),
-                expiration_days: None,
-                transition_days: Some(0),
-                transition_class: Some("STANDARD_IA".into()),
-                transition_tier: None,
+                filter: Default::default(),
+                expiration: None,
+                transitions: vec![TransitionAction {
+                    days: Some(0),
+                    date: None,
+                    class: "STANDARD_IA".into(),
+                    tier: None,
+                }],
+                noncurrent_expiration: None,
+                noncurrent_transitions: vec![],
                 enabled: true,
             }],
         )
@@ -359,7 +492,7 @@ async fn disabled_transition_rule_readable_but_never_swept() {
     assert!(st.db.list_jobs(10).await.unwrap().is_empty());
 }
 
-/// NoncurrentVersionTransition 未支持（501）：sweep 只转当前版本。
+/// 只有 `transitions` 的规则只转当前版本；noncurrent 由 `noncurrent_transitions` 驱动。
 #[tokio::test]
 async fn sweep_only_transitions_current_versions() {
     let dir = tempfile::tempdir().unwrap();
@@ -410,11 +543,16 @@ async fn sweep_only_transitions_current_versions() {
             "bkt",
             &[LifecycleRuleSpec {
                 rule_id: Some("t1".into()),
-                prefix: String::new(),
-                expiration_days: None,
-                transition_days: Some(0),
-                transition_class: Some("STANDARD_IA".into()),
-                transition_tier: None,
+                filter: Default::default(),
+                expiration: None,
+                transitions: vec![TransitionAction {
+                    days: Some(0),
+                    date: None,
+                    class: "STANDARD_IA".into(),
+                    tier: None,
+                }],
+                noncurrent_expiration: None,
+                noncurrent_transitions: vec![],
                 enabled: true,
             }],
         )
@@ -451,11 +589,16 @@ async fn force_tier_sweep_endpoint() {
             "bkt",
             &[LifecycleRuleSpec {
                 rule_id: Some("t1".into()),
-                prefix: String::new(),
-                expiration_days: None,
-                transition_days: Some(0),
-                transition_class: Some("STANDARD_IA".into()),
-                transition_tier: None,
+                filter: Default::default(),
+                expiration: None,
+                transitions: vec![TransitionAction {
+                    days: Some(0),
+                    date: None,
+                    class: "STANDARD_IA".into(),
+                    tier: None,
+                }],
+                noncurrent_expiration: None,
+                noncurrent_transitions: vec![],
                 enabled: true,
             }],
         )
@@ -472,4 +615,88 @@ async fn force_tier_sweep_endpoint() {
     assert_eq!(resp.status(), 200);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["queued"], 1, "{v}");
+}
+
+/// P2：noncurrent transition 以更新版本创建时间为钟入队，payload 指向具体旧版本。
+#[tokio::test]
+async fn sweep_enqueues_noncurrent_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("nbk").await.unwrap();
+    st.db.insert_bucket("nbk", None).await.unwrap();
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'nbk'")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let stream = |b: &'static [u8]| -> xl_store::store::ByteStream {
+        Box::pin(futures::stream::once(async move {
+            Ok(bytes::Bytes::from_static(b))
+        }))
+    };
+    let put = |body: &'static [u8]| {
+        let st = st.clone();
+        async move {
+            st.store
+                .put_object_stream_with_meta(
+                    "nbk",
+                    "t.txt",
+                    stream(body),
+                    None,
+                    Default::default(),
+                    None,
+                    VersioningMode::Enabled,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .version_id
+                .unwrap()
+        }
+    };
+    let old = put(b"old").await;
+    let _new = put(b"new").await;
+
+    st.lifecycle
+        .put_rules(
+            "nbk",
+            &[LifecycleRuleSpec {
+                rule_id: Some("nc".into()),
+                filter: Default::default(),
+                expiration: None,
+                transitions: vec![],
+                noncurrent_expiration: None,
+                noncurrent_transitions: vec![NoncurrentTransition {
+                    days: 1,
+                    newer: None,
+                    class: "STANDARD_IA".into(),
+                    tier: None,
+                }],
+                enabled: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let queued = oss_server::tier_jobs::sweep_transitions_at(
+        &st.db,
+        &st.store,
+        st.lifecycle.as_ref(),
+        now + 2 * 86_400,
+    )
+    .await
+    .unwrap();
+    assert_eq!(queued, 1, "只入队 noncurrent 版本");
+    let raw: String = sqlx::query_scalar("SELECT payload_json FROM job_tasks")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(payload["version_id"], old);
+    assert_eq!(payload["class"], "STANDARD_IA");
 }

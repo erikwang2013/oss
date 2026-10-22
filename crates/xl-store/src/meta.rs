@@ -147,7 +147,7 @@ impl TierPhase {
 }
 
 /// 对象标签（S3 Tag）。键唯一、最多 [`MAX_TAGS`] 条。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectTag {
     pub key: String,
     pub value: String,

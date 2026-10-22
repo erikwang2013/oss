@@ -329,6 +329,66 @@ export interface ObjectTag {
   value: string
 }
 
+// ——— 生命周期（console.rs 的 LifecycleRuleIn/console_rule_json 投影）———
+// GET 同时返回旧扁平字段与新结构化字段；写入口两者都收，但新字段优先且互斥。
+export interface LifecycleFilter {
+  prefix?: string
+  tags?: ObjectTag[]
+  object_size_greater_than?: number | null
+  object_size_less_than?: number | null
+}
+
+export interface LifecycleTransition {
+  days?: number | null
+  /** YYYY-MM-DD（UTC 午夜） */
+  date?: string | null
+  storage_class: string
+  tier?: string | null
+}
+
+export interface LifecycleNoncurrentExpiration {
+  noncurrent_days: number
+  newer_noncurrent_versions?: number | null
+}
+
+export interface LifecycleNoncurrentTransition {
+  noncurrent_days: number
+  newer_noncurrent_versions?: number | null
+  storage_class: string
+  tier?: string | null
+}
+
+export interface LifecycleRule {
+  rule_id: string | null
+  prefix: string
+  /** 旧字段：无过期 = -1 */
+  expire_days: number
+  expiration_days: number | null
+  transition_days: number | null
+  transition_class: string | null
+  transition_tier: string | null
+  enabled: boolean
+  filter: LifecycleFilter
+  expiration_date: string | null
+  expired_object_delete_marker: boolean
+  transitions: LifecycleTransition[]
+  noncurrent_version_expiration: LifecycleNoncurrentExpiration | null
+  noncurrent_version_transitions: LifecycleNoncurrentTransition[]
+}
+
+/** PUT /lifecycle 的单条规则；旧扁平字段省略，只发结构化字段。 */
+export interface LifecycleRuleInput {
+  rule_id: string | null
+  enabled: boolean
+  filter: LifecycleFilter
+  expiration_days?: number | null
+  expiration_date?: string | null
+  expired_object_delete_marker?: boolean
+  transitions: LifecycleTransition[]
+  noncurrent_version_expiration?: LifecycleNoncurrentExpiration | null
+  noncurrent_version_transitions: LifecycleNoncurrentTransition[]
+}
+
 export interface SelectResult {
   /** CSV 输出 → string[][]；JSON 输出 → JSON 值数组 */
   records: unknown[]

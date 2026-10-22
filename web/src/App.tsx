@@ -28,6 +28,7 @@ import AccessPoints from './pages/AccessPoints'
 import Jobs from './pages/Jobs'
 import Tiers from './pages/Tiers'
 import BucketPolicy from './pages/BucketPolicy'
+import Lifecycle from './pages/Lifecycle'
 import Audit from './pages/Audit'
 import Settings from './pages/Settings'
 import Events from './pages/Events'
@@ -153,6 +154,7 @@ export const router = createBrowserRouter([
       { path: '/buckets', element: <Buckets /> },
       { path: '/buckets/:bucket', element: <Objects /> },
       { path: '/buckets/:bucket/policy', element: <BucketPolicy /> },
+      { path: '/buckets/:bucket/lifecycle', element: <Lifecycle /> },
       { path: '/buckets/:bucket/select', element: <SelectWorkbench /> },
       { path: '/access-points', element: <AccessPoints /> },
       { path: '/events', element: <Events /> },

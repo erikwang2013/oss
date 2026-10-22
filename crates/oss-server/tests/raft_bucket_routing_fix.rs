@@ -20,7 +20,7 @@ use s3s::{S3, S3ErrorCode, S3Request};
 use xl_s3::access::AuthedUser;
 use xl_s3::bucket_control::{BucketControlError, BucketCreateSpec};
 use xl_s3::inventory::InventoryStore;
-use xl_s3::lifecycle::{LifecycleRuleSpec, LifecycleStore};
+use xl_s3::lifecycle::{ExpirationAction, LifecycleRuleSpec, LifecycleStore};
 use xl_s3::replication::ReplicationStore;
 use xl_s3::service::OssS3;
 use xl_s3::sync_delete::SyncDeleteSink;
@@ -897,11 +897,11 @@ heartbeat_interval_ms = 100
             "lbk",
             &[LifecycleRuleSpec {
                 rule_id: Some("r1".into()),
-                prefix: String::new(),
-                expiration_days: Some(1),
-                transition_days: None,
-                transition_class: None,
-                transition_tier: None,
+                filter: Default::default(),
+                expiration: Some(ExpirationAction::Days { days: 1 }),
+                transitions: vec![],
+                noncurrent_expiration: None,
+                noncurrent_transitions: vec![],
                 enabled: true,
             }],
         )

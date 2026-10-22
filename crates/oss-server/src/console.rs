@@ -1465,27 +1465,110 @@ async fn get_lifecycle(
     }
     match state.lifecycle.get_rules(&bucket).await {
         Ok(None) => Json(Vec::<serde_json::Value>::new()).into_response(),
-        Ok(Some(rules)) => Json(
-            rules
-                .into_iter()
-                .map(|r| {
-                    let expiration_days = r.expiration_days.map(i64::from);
-                    serde_json::json!({
-                        "rule_id": r.rule_id, "prefix": r.prefix,
-                        // 旧前端字段：无过期 = 哨兵 -1（与 S0 行口径一致）
-                        "expire_days": expiration_days.unwrap_or(-1),
-                        "expiration_days": expiration_days,
-                        "transition_days": r.transition_days,
-                        "transition_class": r.transition_class,
-                        "transition_tier": r.transition_tier,
-                        "enabled": r.enabled,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(Some(rules)) => {
+            Json(rules.iter().map(console_rule_json).collect::<Vec<_>>()).into_response()
+        }
         Err(e) => lifecycle_err(e),
     }
+}
+
+/// 规则 → console JSON：保留旧扁平字段（旧前端），同时投影完整结构化模型。
+fn console_rule_json(r: &xl_s3::lifecycle::LifecycleRuleSpec) -> serde_json::Value {
+    use xl_s3::lifecycle::ExpirationAction;
+    let expiration_days = r.expiration_days().map(i64::from);
+    let first = r.transitions.first();
+    let (expiration_date, eodm) = match &r.expiration {
+        Some(ExpirationAction::Date { date }) => (Some(date_string(*date)), false),
+        Some(ExpirationAction::ExpiredObjectDeleteMarker) => (None, true),
+        _ => (None, false),
+    };
+    let transitions: Vec<serde_json::Value> = r
+        .transitions
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "days": t.days,
+                "date": t.date.map(date_string),
+                "storage_class": t.class,
+                "tier": t.tier,
+            })
+        })
+        .collect();
+    let noncurrent_expiration = r.noncurrent_expiration.as_ref().map(|n| {
+        serde_json::json!({
+            "noncurrent_days": n.days,
+            "newer_noncurrent_versions": n.newer,
+        })
+    });
+    let noncurrent_transitions: Vec<serde_json::Value> = r
+        .noncurrent_transitions
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "noncurrent_days": t.days,
+                "newer_noncurrent_versions": t.newer,
+                "storage_class": t.class,
+                "tier": t.tier,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "rule_id": r.rule_id, "prefix": r.prefix(),
+        // 旧前端字段：无过期 = 哨兵 -1（与 S0 行口径一致）
+        "expire_days": expiration_days.unwrap_or(-1),
+        "expiration_days": expiration_days,
+        "transition_days": first.and_then(|t| t.days).map(i64::from),
+        "transition_class": first.map(|t| t.class.clone()),
+        "transition_tier": first.and_then(|t| t.tier.clone()),
+        "enabled": r.enabled,
+        "filter": {
+            "prefix": r.filter.prefix,
+            "tags": r.filter.tags,
+            "object_size_greater_than": r.filter.size_gt,
+            "object_size_less_than": r.filter.size_lt,
+        },
+        "expiration_date": expiration_date,
+        "expired_object_delete_marker": eodm,
+        "transitions": transitions,
+        "noncurrent_version_expiration": noncurrent_expiration,
+        "noncurrent_version_transitions": noncurrent_transitions,
+    })
+}
+
+/// unix 秒 → `YYYY-MM-DD`（Date 恒为 UTC 午夜）。
+fn date_string(secs: i64) -> String {
+    let odt =
+        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}",
+        odt.year(),
+        u8::from(odt.month()),
+        odt.day()
+    )
+}
+
+/// `YYYY-MM-DD`（或 RFC3339）→ UTC 午夜 unix 秒。
+fn parse_midnight(s: &str) -> Result<i64, String> {
+    let date = if let Ok(odt) =
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+    {
+        odt.date()
+    } else {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return Err(format!("日期格式应为 YYYY-MM-DD: {s}"));
+        }
+        let year: i32 = parts[0].parse().map_err(|_| format!("年份非法: {s}"))?;
+        let month: u8 = parts[1].parse().map_err(|_| format!("月份非法: {s}"))?;
+        let day: u8 = parts[2].parse().map_err(|_| format!("日期非法: {s}"))?;
+        time::Date::from_calendar_date(
+            year,
+            time::Month::try_from(month).map_err(|_| format!("月份非法: {s}"))?,
+            day,
+        )
+        .map_err(|_| format!("日期非法: {s}"))?
+    };
+    Ok(date.midnight().assume_utc().unix_timestamp())
 }
 
 /// M8 S4b：console 与 S3 共用 `LifecycleError` 的状态码映射。
@@ -1507,6 +1590,7 @@ fn lifecycle_err(e: xl_s3::lifecycle::LifecycleError) -> Response {
 struct LifecycleRuleIn {
     #[serde(default)]
     rule_id: Option<String>,
+    /// 旧前端扁平字段；与 `filter.prefix` 等价（同时给且不同 → 400）。
     #[serde(default)]
     prefix: String,
     /// 旧前端字段；`-1` = 无过期（GET 回读口径）。
@@ -1522,14 +1606,211 @@ struct LifecycleRuleIn {
     transition_tier: Option<String>,
     #[serde(default = "default_true_bool")]
     enabled: bool,
+    // ---- P1 结构化字段（旧字段仍可用；新字段优先且互斥）----
+    #[serde(default)]
+    filter: Option<LifecycleFilterIn>,
+    /// `YYYY-MM-DD`（UTC 午夜）。
+    #[serde(default)]
+    expiration_date: Option<String>,
+    #[serde(default)]
+    expired_object_delete_marker: Option<bool>,
+    #[serde(default)]
+    transitions: Option<Vec<TransitionIn>>,
+    #[serde(default)]
+    noncurrent_version_expiration: Option<NoncurrentExpirationIn>,
+    #[serde(default)]
+    noncurrent_version_transitions: Option<Vec<NoncurrentTransitionIn>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LifecycleFilterIn {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<TagIn>>,
+    #[serde(default)]
+    object_size_greater_than: Option<u64>,
+    #[serde(default)]
+    object_size_less_than: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TagIn {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransitionIn {
+    #[serde(default)]
+    days: Option<u32>,
+    #[serde(default)]
+    date: Option<String>,
+    storage_class: String,
+    #[serde(default)]
+    tier: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NoncurrentExpirationIn {
+    noncurrent_days: u32,
+    #[serde(default)]
+    newer_noncurrent_versions: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NoncurrentTransitionIn {
+    noncurrent_days: u32,
+    #[serde(default)]
+    newer_noncurrent_versions: Option<u32>,
+    storage_class: String,
+    #[serde(default)]
+    tier: Option<String>,
 }
 
 fn default_true_bool() -> bool {
     true
 }
 
+/// console JSON → 规则（结构校验统一在 `put_rules` 的 `validate_rules`）。
+fn console_spec(r: LifecycleRuleIn) -> Result<xl_s3::lifecycle::LifecycleRuleSpec, String> {
+    use xl_s3::lifecycle::{
+        ExpirationAction, LifecycleRuleSpec, NoncurrentExpiration, NoncurrentTransition,
+        TransitionAction,
+    };
+    let LifecycleRuleIn {
+        rule_id,
+        prefix,
+        expire_days,
+        expiration_days,
+        transition_days,
+        transition_class,
+        transition_tier,
+        enabled,
+        filter,
+        expiration_date,
+        expired_object_delete_marker,
+        transitions,
+        noncurrent_version_expiration,
+        noncurrent_version_transitions,
+    } = r;
+    let filter = build_filter(filter, &prefix)?;
+    // 旧前端只发 expire_days；两个字段都给时以 expiration_days 为准。
+    // -1 是 GET 回读的「无过期」哨兵；其它负数仍拒绝（与 S0 口径一致）。
+    let days = match (expiration_days, expire_days) {
+        (Some(d), _) => Some(d),
+        (None, Some(-1)) | (None, None) => None,
+        (None, Some(d)) if d >= 0 => Some(d),
+        (None, Some(_)) => return Err("expire_days 须在 0..=36500".into()),
+    };
+    let days = days
+        .map(|d| u32::try_from(d).map_err(|_| "expire_days 越界".to_string()))
+        .transpose()?;
+    let expiration = if let Some(s) = expiration_date {
+        if days.is_some() || expired_object_delete_marker == Some(true) {
+            return Err("expiration_date 与 expiration_days/ExpiredObjectDeleteMarker 互斥".into());
+        }
+        Some(ExpirationAction::Date {
+            date: parse_midnight(&s)?,
+        })
+    } else if expired_object_delete_marker == Some(true) {
+        if days.is_some() {
+            return Err("ExpiredObjectDeleteMarker 与 Expiration.Days 互斥".into());
+        }
+        Some(ExpirationAction::ExpiredObjectDeleteMarker)
+    } else {
+        days.map(|days| ExpirationAction::Days { days })
+    };
+    let transitions = match transitions {
+        Some(v) if !v.is_empty() => {
+            if transition_days.is_some() || transition_class.is_some() || transition_tier.is_some()
+            {
+                return Err("transitions 与 transition_days/class/tier 不能同时提供".into());
+            }
+            v.into_iter()
+                .map(|t| {
+                    let date = t.date.as_deref().map(parse_midnight).transpose()?;
+                    if t.days.is_some() == date.is_some() {
+                        return Err("Transition 需要且只能有 days 或 date".into());
+                    }
+                    Ok(TransitionAction {
+                        days: t.days,
+                        date,
+                        class: t.storage_class,
+                        tier: t.tier,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        }
+        _ => match (transition_days, transition_class) {
+            (Some(days), Some(class)) => vec![TransitionAction {
+                days: Some(days),
+                date: None,
+                class,
+                tier: transition_tier,
+            }],
+            (None, None) => {
+                if transition_tier.is_some() {
+                    return Err("transition_tier 需要 transition_class".into());
+                }
+                vec![]
+            }
+            _ => return Err("transition_days 与 transition_class 必须同时提供".into()),
+        },
+    };
+    Ok(LifecycleRuleSpec {
+        rule_id,
+        filter,
+        expiration,
+        transitions,
+        noncurrent_expiration: noncurrent_version_expiration.map(|n| NoncurrentExpiration {
+            days: n.noncurrent_days,
+            newer: n.newer_noncurrent_versions,
+        }),
+        noncurrent_transitions: noncurrent_version_transitions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| NoncurrentTransition {
+                days: t.noncurrent_days,
+                newer: t.newer_noncurrent_versions,
+                class: t.storage_class,
+                tier: t.tier,
+            })
+            .collect(),
+        enabled,
+    })
+}
+
+fn build_filter(
+    inp: Option<LifecycleFilterIn>,
+    legacy_prefix: &str,
+) -> Result<xl_s3::lifecycle::LifecycleFilter, String> {
+    let mut f = xl_s3::lifecycle::LifecycleFilter::default();
+    if let Some(i) = inp {
+        f.prefix = i.prefix.unwrap_or_default();
+        f.tags = i
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| xl_store::meta::ObjectTag {
+                key: t.key,
+                value: t.value,
+            })
+            .collect();
+        f.size_gt = i.object_size_greater_than;
+        f.size_lt = i.object_size_less_than;
+    }
+    if !legacy_prefix.is_empty() {
+        if !f.prefix.is_empty() && f.prefix != legacy_prefix {
+            return Err("prefix 与 filter.prefix 冲突".into());
+        }
+        f.prefix = legacy_prefix.to_string();
+    }
+    Ok(f)
+}
+
 /// 桶生命周期规则全量替换（M4 切片 6）：写 —— 桶主或管理员。
-/// 校验：prefix 无控制字符且 ≤1024；expire_days ∈ 0..=36500（0 = 立即到期，测试/激进清理）。
+/// 旧扁平字段与 P1 结构化字段都接受；校验统一由 `validate_rules` 完成。
 async fn put_lifecycle(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -1544,32 +1825,10 @@ async fn put_lifecycle(
     }
     let mut specs = Vec::with_capacity(rules.len());
     for r in rules {
-        // 旧前端只发 expire_days；两个字段都给时以 expiration_days 为准。
-        // -1 是 GET 回读的「无过期」哨兵；其它负数仍拒绝（与 S0 口径一致）。
-        let expiration_days = match (r.expiration_days, r.expire_days) {
-            (Some(d), _) => Some(d),
-            (None, Some(d)) if d >= 0 => Some(d),
-            (None, Some(-1)) | (None, None) => None,
-            (None, Some(_)) => {
-                return (StatusCode::BAD_REQUEST, "expire_days 须在 0..=36500").into_response();
-            }
-        };
-        let expiration_days = match expiration_days {
-            Some(d) => match u32::try_from(d) {
-                Ok(v) => Some(v),
-                Err(_) => return (StatusCode::BAD_REQUEST, "expire_days 越界").into_response(),
-            },
-            None => None,
-        };
-        specs.push(xl_s3::lifecycle::LifecycleRuleSpec {
-            rule_id: r.rule_id,
-            prefix: r.prefix,
-            expiration_days,
-            transition_days: r.transition_days,
-            transition_class: r.transition_class,
-            transition_tier: r.transition_tier,
-            enabled: r.enabled,
-        });
+        match console_spec(r) {
+            Ok(s) => specs.push(s),
+            Err(m) => return (StatusCode::BAD_REQUEST, m).into_response(),
+        }
     }
     match state.lifecycle.put_rules(&bucket, &specs).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

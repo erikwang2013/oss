@@ -291,6 +291,9 @@ impl Db {
             raft_mode: std::sync::atomic::AtomicBool::new(false),
         };
         db.ensure_columns().await?;
+        // 生命周期表主键重建（旧 PK (bucket,prefix) → (bucket,rule_id)）：必须在 0003 建
+        // 唯一索引前完成；触发器由 0004 重放重建。
+        db.ensure_lifecycle_pk().await?;
         // M7：增量列就位后再建站点表/触发器（触发器引用补列），并种下本站身份。
         sqlx::raw_sql(SCHEMA_M7).execute(&db.pool).await?;
         // M8：新表无触发器依赖，独立重放；任一语句失败必须启动失败（不吞错）。
@@ -745,6 +748,10 @@ impl Db {
                 "transition_tier",
                 "ALTER TABLE lifecycle_rules ADD COLUMN transition_tier TEXT",
             ),
+            (
+                "config_json",
+                "ALTER TABLE lifecycle_rules ADD COLUMN config_json TEXT",
+            ),
         ] {
             if !has_l(name)
                 && let Err(e) = sqlx::query(ddl).execute(&self.pool).await
@@ -757,6 +764,54 @@ impl Db {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// 生命周期表主键重建：旧 PK `(bucket,prefix)` 与「同 prefix 多规则」冲突。
+    /// SQLite 不能改 PK，只能一次性重建；幂等（新 PK 时直接返回）。
+    async fn ensure_lifecycle_pk(&self) -> Result<()> {
+        let pk: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, pk FROM pragma_table_info('lifecycle_rules') WHERE pk > 0 ORDER BY pk",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if pk.len() == 2 && pk[0].0 == "bucket" && pk[1].0 == "rule_id" {
+            return Ok(());
+        }
+        // 重建 + 搬行必须原子：崩溃落在 RENAME 与 DROP 之间会丢全部规则。
+        let mut tx = self.pool.begin().await?;
+        sqlx::raw_sql(
+            "DROP INDEX IF EXISTS idx_lifecycle_rule_id;\
+             DROP TRIGGER IF EXISTS raft_guard_lifecycle_rules_ins;\
+             DROP TRIGGER IF EXISTS raft_guard_lifecycle_rules_upd;\
+             DROP TRIGGER IF EXISTS raft_guard_lifecycle_rules_del;\
+             ALTER TABLE lifecycle_rules RENAME TO lifecycle_rules_old;\
+             CREATE TABLE lifecycle_rules (\
+                 bucket TEXT NOT NULL,\
+                 prefix TEXT NOT NULL DEFAULT '',\
+                 expire_days INTEGER NOT NULL,\
+                 enabled INTEGER NOT NULL DEFAULT 1,\
+                 updated_at INTEGER NOT NULL,\
+                 rule_id TEXT,\
+                 expiration_days INTEGER,\
+                 transition_days INTEGER,\
+                 transition_class TEXT,\
+                 transition_tier TEXT,\
+                 config_json TEXT,\
+                 PRIMARY KEY (bucket, rule_id)\
+             );\
+             INSERT INTO lifecycle_rules (bucket,prefix,expire_days,enabled,updated_at,rule_id,\
+                 expiration_days,transition_days,transition_class,transition_tier,config_json) \
+                 SELECT bucket,prefix,expire_days,enabled,updated_at,rule_id,\
+                 expiration_days,transition_days,transition_class,transition_tier,config_json \
+                 FROM lifecycle_rules_old;\
+             DROP TABLE lifecycle_rules_old;\
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_lifecycle_rule_id \
+                 ON lifecycle_rules(bucket, rule_id);",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2466,6 +2521,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+        // 旧 PK (bucket,prefix) 下的既有行：重建必须原样搬过去。
+        sqlx::raw_sql(
+            "INSERT INTO lifecycle_rules (bucket,prefix,expire_days,enabled,updated_at) \
+             VALUES ('old','p/',7,1,1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         pool.close().await;
 
         let url = format!("sqlite://{}?mode=rwc", path.display());
@@ -2520,6 +2583,7 @@ mod tests {
             "transition_days",
             "transition_class",
             "transition_tier",
+            "config_json",
         ] {
             assert!(
                 lcols.iter().any(|r| r.get::<String, _>("name") == c),
@@ -2533,6 +2597,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(idx, 1, "缺少 idx_lifecycle_rule_id");
+        // 旧行保留，且新 PK 允许同桶同 prefix 多规则（旧 PK 下第二条会冲突）。
+        assert_eq!(db.list_lifecycle_rules("old").await.unwrap().len(), 1);
+        let row = |id: &str| LifecycleRuleRow {
+            bucket: "old".into(),
+            rule_id: Some(id.into()),
+            prefix: "p/".into(),
+            expire_days: 7,
+            expiration_days: Some(7),
+            transition_days: None,
+            transition_class: None,
+            transition_tier: None,
+            enabled: true,
+            updated_at: 0,
+            config_json: None,
+        };
+        db.set_lifecycle_rules("old", &[row("r1"), row("r2")], 2)
+            .await
+            .unwrap();
+        assert_eq!(db.list_lifecycle_rules("old").await.unwrap().len(), 2);
         drop(db);
         // 二次连接：0003/补列均幂等
         let _ = Db::connect(&url).await.unwrap();
@@ -2892,6 +2975,8 @@ pub struct LifecycleRuleRow {
     pub transition_tier: Option<String>,
     pub enabled: bool,
     pub updated_at: i64,
+    /// 结构化动作（None = 旧列可完整表达/旧 M4 行）。
+    pub config_json: Option<String>,
 }
 
 fn row_to_lifecycle_rule(r: &sqlx::sqlite::SqliteRow) -> LifecycleRuleRow {
@@ -2906,6 +2991,7 @@ fn row_to_lifecycle_rule(r: &sqlx::sqlite::SqliteRow) -> LifecycleRuleRow {
         transition_tier: r.get("transition_tier"),
         enabled: r.get::<i64, _>("enabled") != 0,
         updated_at: r.get("updated_at"),
+        config_json: r.get("config_json"),
     }
 }
 
@@ -2914,8 +3000,8 @@ impl Db {
     pub async fn list_lifecycle_rules(&self, bucket: &str) -> Result<Vec<LifecycleRuleRow>> {
         let rows = sqlx::query(
             "SELECT bucket, rule_id, prefix, expire_days, expiration_days, transition_days, \
-             transition_class, transition_tier, enabled, updated_at FROM lifecycle_rules \
-             WHERE bucket = ? ORDER BY prefix, rule_id",
+             transition_class, transition_tier, enabled, updated_at, config_json \
+             FROM lifecycle_rules WHERE bucket = ? ORDER BY rule_id, prefix",
         )
         .bind(bucket)
         .fetch_all(&self.pool)
@@ -2938,8 +3024,8 @@ impl Db {
         for r in rules {
             sqlx::query(
                 "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, expiration_days, \
-                 transition_days, transition_class, transition_tier, enabled, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 transition_days, transition_class, transition_tier, enabled, updated_at, config_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(bucket)
             .bind(&r.rule_id)
@@ -2951,6 +3037,7 @@ impl Db {
             .bind(&r.transition_tier)
             .bind(if r.enabled { 1 } else { 0 })
             .bind(now)
+            .bind(&r.config_json)
             .execute(&mut *tx)
             .await?;
         }
@@ -2962,8 +3049,8 @@ impl Db {
     pub async fn enabled_lifecycle_rules(&self) -> Result<Vec<LifecycleRuleRow>> {
         let rows = sqlx::query(
             "SELECT bucket, rule_id, prefix, expire_days, expiration_days, transition_days, \
-             transition_class, transition_tier, enabled, updated_at FROM lifecycle_rules \
-             WHERE enabled = 1",
+             transition_class, transition_tier, enabled, updated_at, config_json \
+             FROM lifecycle_rules WHERE enabled = 1 ORDER BY bucket, rule_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -4467,7 +4554,7 @@ impl Db {
             sqlx::query(
                 "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, \
                  expiration_days, transition_days, transition_class, transition_tier, \
-                 enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 enabled, updated_at, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(bucket)
             .bind(&r.rule_id)
@@ -4479,6 +4566,7 @@ impl Db {
             .bind(&r.transition_tier)
             .bind(i64::from(r.enabled))
             .bind(updated_at)
+            .bind(&r.config_json)
             .execute(&mut *conn)
             .await?;
         }

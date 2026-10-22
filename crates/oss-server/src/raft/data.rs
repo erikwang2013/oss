@@ -94,6 +94,9 @@ pub struct LifecycleRuleRow {
     pub transition_tier: Option<String>,
     pub enabled: bool,
     pub updated_at: i64,
+    /// 结构化动作；旧快照无此字段 → None（按旧列还原）。
+    #[serde(default)]
+    pub config_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,8 +319,8 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
 
     for r in sqlx::query(
         "SELECT bucket, prefix, rule_id, expire_days, expiration_days, transition_days, \
-                transition_class, transition_tier, enabled, updated_at \
-         FROM lifecycle_rules ORDER BY bucket, prefix",
+                transition_class, transition_tier, enabled, updated_at, config_json \
+         FROM lifecycle_rules ORDER BY bucket, rule_id, prefix",
     )
     .fetch_all(&mut *conn)
     .await
@@ -334,6 +337,7 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
             transition_tier: r.get("transition_tier"),
             enabled: r.get::<i64, _>("enabled") != 0,
             updated_at: r.get("updated_at"),
+            config_json: r.get("config_json"),
         });
     }
 
@@ -711,8 +715,8 @@ pub(crate) async fn install_tx(
         sqlx::query(
             "INSERT INTO lifecycle_rules \
              (bucket, prefix, expire_days, enabled, updated_at, rule_id, expiration_days, \
-              transition_days, transition_class, transition_tier) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              transition_days, transition_class, transition_tier, config_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&l.bucket)
         .bind(&l.prefix)
@@ -724,6 +728,7 @@ pub(crate) async fn install_tx(
         .bind(l.transition_days)
         .bind(&l.transition_class)
         .bind(&l.transition_tier)
+        .bind(&l.config_json)
         .execute(&mut *conn)
         .await
         .map_err(sql)?;
@@ -908,6 +913,7 @@ mod tests {
                 transition_tier: Some("cold".into()),
                 enabled: true,
                 updated_at: 16,
+                config_json: None,
             }],
             event_configs: vec![EventConfigRow {
                 bucket: "b1".into(),

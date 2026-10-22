@@ -397,6 +397,7 @@ async fn lifecycle_delete_reclaims_remote() {
                 transition_tier: None,
                 enabled: true,
                 updated_at: 0,
+                config_json: None,
             }],
             0,
         )
