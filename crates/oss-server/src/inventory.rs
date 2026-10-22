@@ -14,8 +14,7 @@ use flate2::write::GzEncoder;
 use futures::StreamExt as _;
 use md5::{Digest as _, Md5};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
-use parquet::column::writer::ColumnWriter;
-use parquet::data_type::{ByteArray, ByteArrayType, BoolType, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::Type as SchemaType;
@@ -280,8 +279,8 @@ impl InventoryRunner {
             &p.config_id,
             &p.run_key,
         ]);
-        let parquet = cfg.destination.s3_bucket_destination.format.as_str()
-            == InventoryFormat::PARQUET;
+        let parquet =
+            cfg.destination.s3_bucket_destination.format.as_str() == InventoryFormat::PARQUET;
         let ext = if parquet { "parquet" } else { "csv.gz" };
         let data_key = format!("{base}/data/{}.{ext}", uuid::Uuid::new_v4());
         let manifest_key = format!("{base}/manifest.json");
@@ -372,8 +371,8 @@ impl InventoryRunner {
         scanned: &mut i64,
     ) -> Result<(), String> {
         let columns = csv_columns(cfg);
-        let parquet = cfg.destination.s3_bucket_destination.format.as_str()
-            == InventoryFormat::PARQUET;
+        let parquet =
+            cfg.destination.s3_bucket_destination.format.as_str() == InventoryFormat::PARQUET;
         let filter = filter_prefix(cfg).to_string();
         let size = Arc::new(AtomicU64::new(0));
         let mut sink = DataSink::new(tmp, &columns, parquet, Arc::clone(&size))?;
@@ -389,7 +388,8 @@ impl InventoryRunner {
             )
             .await?;
         } else {
-            self.scan_current(source_bucket, &filter, &mut sink, &size, job_id, scanned).await?;
+            self.scan_current(source_bucket, &filter, &mut sink, &size, job_id, scanned)
+                .await?;
         }
         let (md5, file_size) = sink.finish()?;
         if file_size > MAX_FILE_BYTES {
@@ -448,13 +448,13 @@ impl InventoryRunner {
             .put_object_stream_with_meta(
                 dest,
                 hive_key,
-                Box::pin(futures::stream::once(async move {
-                    Ok(Bytes::from(symlink))
-                })),
+                Box::pin(futures::stream::once(
+                    async move { Ok(Bytes::from(symlink)) },
+                )),
                 Some("text/plain".to_string()),
                 BTreeMap::new(),
                 None,
-                versioned,
+                mode,
                 encryption.clone(),
                 None,
                 None,
@@ -610,6 +610,8 @@ impl InventoryRunner {
 }
 
 /// CSV / Parquet 两种输出；扫描循环只生产 [`Fields`]，格式差异都在这里。
+/// ParquetSink 自带 writer 缓冲，枚举大小差大；每次运行只有一个 sink，不值得装箱。
+#[allow(clippy::large_enum_variant)]
 enum DataSink {
     Csv(CsvSink),
     Parquet(ParquetSink),
@@ -626,10 +628,12 @@ impl DataSink {
         if parquet {
             return Ok(Self::Parquet(ParquetSink::new(file, columns, size)?));
         }
-        let mut w = csv::WriterBuilder::new().has_headers(false).from_writer(GzEncoder::new(
-            HashingWriter::new(std::io::BufWriter::new(file), size),
-            flate2::Compression::default(),
-        ));
+        let mut w = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(GzEncoder::new(
+                HashingWriter::new(std::io::BufWriter::new(file), size),
+                flate2::Compression::default(),
+            ));
         w.write_record(columns)
             .map_err(|e| format!("CSV 头写入失败：{e}"))?;
         Ok(Self::Csv(CsvSink {
@@ -670,9 +674,7 @@ impl CsvSink {
     }
 
     fn finish(mut self) -> Result<(String, u64), String> {
-        self.w
-            .flush()
-            .map_err(|e| format!("CSV 写入失败：{e}"))?;
+        self.w.flush().map_err(|e| format!("CSV 写入失败：{e}"))?;
         let gz = self
             .w
             .into_inner()
@@ -725,17 +727,11 @@ fn parquet_columns(columns: &[&'static str]) -> Result<Vec<PCol>, String> {
                     ("object_lock_retain_until_date", PKind::TimestampOpt)
                 }
                 "ObjectLockMode" => ("object_lock_mode", PKind::Utf8Opt),
-                "ObjectLockLegalHoldStatus" => {
-                    ("object_lock_legal_hold_status", PKind::Utf8Opt)
-                }
+                "ObjectLockLegalHoldStatus" => ("object_lock_legal_hold_status", PKind::Utf8Opt),
                 "ChecksumAlgorithm" => ("checksum_algorithm", PKind::Utf8Opt),
                 other => return Err(format!("Parquet 不支持的库存列：{other}")),
             };
-            Ok(PCol {
-                csv: c,
-                name,
-                kind,
-            })
+            Ok(PCol { csv: c, name, kind })
         })
         .collect()
 }
@@ -855,7 +851,9 @@ impl ParquetSink {
                 PKind::Utf8Req => {
                     let values: Vec<ByteArray> = rows
                         .iter()
-                        .map(|f| ByteArray::from(parquet_string(col.csv, f).unwrap_or_default()))
+                        .map(|f| {
+                            ByteArray::from(parquet_string(col.csv, f).unwrap_or_default().as_str())
+                        })
                         .collect();
                     cw.typed::<ByteArrayType>()
                         .write_batch(&values, None, None)
@@ -867,7 +865,7 @@ impl ParquetSink {
                     for f in &rows {
                         match parquet_string(col.csv, f) {
                             Some(s) => {
-                                values.push(ByteArray::from(s));
+                                values.push(ByteArray::from(s.as_str()));
                                 defs.push(1);
                             }
                             None => defs.push(0),
@@ -910,8 +908,7 @@ impl ParquetSink {
                         .map_err(|e| format!("Parquet 写入失败：{e}"))?;
                 }
             }
-            cw.close()
-                .map_err(|e| format!("Parquet 列收尾失败：{e}"))?;
+            cw.close().map_err(|e| format!("Parquet 列收尾失败：{e}"))?;
         }
         rg.close()
             .map_err(|e| format!("Parquet 行组收尾失败：{e}"))?;
@@ -924,9 +921,7 @@ impl ParquetSink {
             .writer
             .into_inner()
             .map_err(|e| format!("Parquet 收尾失败：{e}"))?;
-        let (_, md5, size) = w
-            .finish()
-            .map_err(|e| format!("staging 写入失败：{e}"))?;
+        let (_, md5, size) = w.finish().map_err(|e| format!("staging 写入失败：{e}"))?;
         Ok((md5, size))
     }
 }
@@ -948,9 +943,7 @@ fn parquet_string(col: &str, f: &Fields) -> Option<String> {
         "EncryptionStatus" => f.encryption.clone(),
         "ObjectLockMode" => f.lock_mode.clone(),
         "ObjectLockLegalHoldStatus" if f.delete_marker => None,
-        "ObjectLockLegalHoldStatus" => {
-            Some(if f.legal_hold { "ON" } else { "OFF" }.to_string())
-        }
+        "ObjectLockLegalHoldStatus" => Some(if f.legal_hold { "ON" } else { "OFF" }.to_string()),
         "ChecksumAlgorithm" => f.checksum_algorithm.clone(),
         _ => None,
     }
@@ -968,9 +961,7 @@ fn parquet_i64(col: &str, f: &Fields) -> Option<i64> {
     match col {
         "Size" => f.size.and_then(|v| i64::try_from(v).ok()),
         "LastModifiedDate" => Some(f.mod_time_nanos.div_euclid(1_000_000)),
-        "ObjectLockRetainUntilDate" => f
-            .lock_until_nanos
-            .map(|n| n.div_euclid(1_000_000)),
+        "ObjectLockRetainUntilDate" => f.lock_until_nanos.map(|n| n.div_euclid(1_000_000)),
         _ => None,
     }
 }
@@ -1081,12 +1072,6 @@ fn version_fields(
         legal_hold: lock.is_some_and(|l| l.legal_hold),
         checksum_algorithm: checksum.map(|c| c.algorithm.clone()),
     }
-}
-
-fn write_row(w: &mut CsvSink<'_>, columns: &[&str], f: &Fields) -> Result<(), String> {
-    let row: Vec<String> = columns.iter().map(|c| render(c, f)).collect();
-    w.write_record(&row)
-        .map_err(|e| format!("CSV 行写入失败：{e}"))
 }
 
 fn render(col: &str, f: &Fields) -> String {

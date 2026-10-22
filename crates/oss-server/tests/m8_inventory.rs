@@ -402,7 +402,7 @@ async fn validation_matrix_and_per_bucket_limit() {
         .await,
         Err(InventoryError::InvalidArgument(_))
     ));
-    // 格式 Parquet → 501
+    // 未知格式 → 501（CSV/Parquet 已支持）
     assert!(matches!(
         put(
             &st,
@@ -410,7 +410,7 @@ async fn validation_matrix_and_per_bucket_limit() {
             "src",
             &bad(&|c| {
                 c.destination.s3_bucket_destination.format =
-                    InventoryFormat::from("Parquet".to_string())
+                    InventoryFormat::from("ORC".to_string())
             })
         )
         .await,
@@ -537,7 +537,7 @@ async fn console_crud_validation_and_owner_guard() {
             HttpStatus::BAD_REQUEST,
         ),
         (
-            serde_json::json!({"id": "c2", "frequency": "Daily", "destination_bucket": "dst", "format": "Parquet"}),
+            serde_json::json!({"id": "c2", "frequency": "Daily", "destination_bucket": "dst", "format": "ORC"}),
             HttpStatus::NOT_IMPLEMENTED,
         ),
         (
