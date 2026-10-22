@@ -3,6 +3,7 @@
 mod common;
 
 use std::sync::Arc;
+use xl_store::store::VersioningMode;
 
 use common::state;
 use s3s::dto::{
@@ -379,7 +380,7 @@ async fn sweep_only_transitions_current_versions() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,
@@ -396,7 +397,7 @@ async fn sweep_only_transitions_current_versions() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

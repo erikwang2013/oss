@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use s3s::dto::*;
@@ -69,6 +70,7 @@ fn tier_target(endpoint: &str) -> TierTarget {
         access_key: "ak".into(),
         secret_key: "sk".into(),
         region: "us-east-1".into(),
+        server_name: None,
     }
 }
 
@@ -300,7 +302,7 @@ async fn restore_without_version_id_targets_latest() {
             None,
             Default::default(),
             None,
-            true,
+            VersioningMode::Enabled,
             None,
             None,
             None,

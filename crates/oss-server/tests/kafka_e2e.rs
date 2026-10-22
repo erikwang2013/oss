@@ -62,6 +62,8 @@ async fn ctx() -> Option<Ctx> {
         id: "t1".into(),
         brokers: vec![broker.clone()],
         topic: topic.clone(),
+        tls: false,
+        sasl: None,
     }];
     let notifier: Arc<dyn Notifier> = Arc::new(KafkaNotifier::new(&targets));
     let sink = Arc::new(SqlEventSink::new(pool.clone(), notifier));

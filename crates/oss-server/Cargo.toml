@@ -22,6 +22,12 @@ time.workspace = true
 aetherupload-rust.workspace = true
 axum.workspace = true
 ecat.workspace = true
+ecat-transport.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-native-certs.workspace = true
+tonic.workspace = true
 ecat-logging = "7.0.0"
 futures.workspace = true
 hex.workspace = true
@@ -68,4 +74,6 @@ jsonwebtoken = "11"
 bytes.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tempfile = "3"
+# TLS 集成测试用临时 CA/证书（ring provider，与运行时一致）。
+rcgen = "0.14"
 tokio = { workspace = true, features = ["full"] }

@@ -15,7 +15,7 @@ use sqlx::Row as _;
 use xl_s3::sync_delete::SyncDeleteSink;
 use xl_store::error::Error as StoreError;
 use xl_store::gate::{GateError, GateRequest, GateTicket, PutCommitGate};
-use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store};
+use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store, VersioningMode};
 
 use crate::db::Db;
 use crate::repl_client::{ReplClient, ReplError};
@@ -89,6 +89,8 @@ pub struct SiteSyncGate {
     site_enabled: bool,
     cache: Mutex<HashMap<String, Cached>>,
     metrics: Arc<SyncMetrics>,
+    /// peer TLS 物料（站点对等地址按此升级/校验）。
+    tls: Arc<crate::tls::Tls>,
 }
 
 impl std::fmt::Debug for SiteSyncGate {
@@ -109,7 +111,13 @@ impl SiteSyncGate {
             site_enabled,
             cache: Mutex::new(HashMap::new()),
             metrics: Arc::new(SyncMetrics::default()),
+            tls: crate::tls::Tls::plaintext(),
         }
+    }
+
+    pub fn with_tls(mut self, tls: Arc<crate::tls::Tls>) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// 与 `AppState` 共享 `/metrics` 计数（默认独立一份，测试/恢复用）。
@@ -152,8 +160,8 @@ impl SiteSyncGate {
         peer(&self.db).await
     }
 
-    fn client(peer: &crate::db::SitePeer) -> Result<ReplClient, GateError> {
-        client(peer)
+    fn client(&self, peer: &crate::db::SitePeer) -> Result<ReplClient, GateError> {
+        client(peer, &self.tls)
     }
 
     /// 远端 PUT 前落盘写 intent（kill -9 后恢复的唯一凭据）。
@@ -211,7 +219,7 @@ impl SiteSyncGate {
     /// 删除远端同 id 版本（404 视为已删）。恢复与补偿共用。
     async fn delete_remote_version(&self, bucket: &str, key: &str, id: &str) -> Result<(), String> {
         let peer = self.peer().await.map_err(|e| e.to_string())?;
-        let client = Self::client(&peer).map_err(|e| e.to_string())?;
+        let client = self.client(&peer).map_err(|e| e.to_string())?;
         let call =
             client.delete_object_version("site", bucket, key, id, Some(&peer.peer_site_token));
         match tokio::time::timeout(self.timeout, call).await {
@@ -317,7 +325,8 @@ pub async fn recover_write_intents(state: &AppState) {
         Duration::from_millis(state.cfg.sync.timeout_ms),
         state.cfg.sync.max_object_bytes,
         state.site_enabled,
-    );
+    )
+    .with_tls(Arc::clone(&state.tls));
     let (mut cleaned, mut kept) = (0usize, 0usize);
     for row in rows {
         let id: String = row.get("id");
@@ -406,7 +415,7 @@ impl PutCommitGate for SiteSyncGate {
                 return Err(GateError::TooLarge);
             }
             let peer = self.peer().await?;
-            let client = Self::client(&peer)?;
+            let client = self.client(&peer)?;
             let body = tokio::fs::read(req.plaintext).await.map_err(|e| {
                 GateError::Internal(format!("read tee {}: {e}", req.plaintext.display()))
             })?;
@@ -524,13 +533,14 @@ async fn peer(db: &Db) -> Result<crate::db::SitePeer, GateError> {
     Ok(peer)
 }
 
-fn client(peer: &crate::db::SitePeer) -> Result<ReplClient, GateError> {
+fn client(peer: &crate::db::SitePeer, tls: &Arc<crate::tls::Tls>) -> Result<ReplClient, GateError> {
     ReplClient::single(
         &peer.endpoint,
         &peer.s3_access_key,
         &peer.s3_secret_key,
         &peer.region,
     )
+    .map(|c| c.with_tls(Arc::clone(tls)))
     .map_err(|e| GateError::Unavailable(format!("site endpoint invalid: {}", e.message)))
 }
 
@@ -567,6 +577,8 @@ pub struct SiteSyncDelete {
     ambiguous_total: AtomicU64,
     /// 正在执行的删桶 flow（API 或恢复）；恢复跳过，防与在途 API 并发。
     in_flight: Mutex<HashSet<String>>,
+    /// peer TLS 物料（站点对等地址按此升级/校验）。
+    tls: Arc<crate::tls::Tls>,
 }
 
 /// 删桶 flow 的在途标记（drop 时移除；panic/early return 不泄漏）。
@@ -595,11 +607,17 @@ impl SiteSyncDelete {
             recovered_total: Default::default(),
             ambiguous_total: Default::default(),
             in_flight: Mutex::new(HashSet::new()),
+            tls: crate::tls::Tls::plaintext(),
         }
     }
 
     pub fn with_control(mut self, control: Arc<crate::raft::control::ControlPlane>) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    pub fn with_tls(mut self, tls: Arc<crate::tls::Tls>) -> Self {
+        self.tls = tls;
         self
     }
 
@@ -671,7 +689,7 @@ impl SiteSyncDelete {
     }
 
     fn client(&self, peer: &crate::db::SitePeer) -> Result<ReplClient, StoreError> {
-        client(peer).map_err(StoreError::from)
+        client(peer, &self.tls).map_err(StoreError::from)
     }
 
     /// 远端调用前落盘 intent（kill -9 后恢复的唯一凭据；FULL 同步确保先于远端可见）。
@@ -920,7 +938,7 @@ impl SiteSyncDelete {
         self.intent_done(&id).await;
         match self
             .store
-            .delete_object_versioned_ext(bucket, key, Some(vid), true, bypass)
+            .delete_object_versioned_ext(bucket, key, Some(vid), VersioningMode::Enabled, bypass)
             .await
         {
             Ok(out) => {
@@ -960,7 +978,14 @@ impl SiteSyncDelete {
         };
         match self
             .store
-            .delete_object_versioned_with_marker(bucket, key, None, true, false, Some(spec))
+            .delete_object_versioned_with_marker(
+                bucket,
+                key,
+                None,
+                VersioningMode::Enabled,
+                false,
+                Some(spec),
+            )
             .await
         {
             Ok(out) => {
@@ -1151,14 +1176,14 @@ impl SyncDeleteSink for SiteSyncDelete {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-        versioned: bool,
+        mode: VersioningMode,
         bypass_governance: bool,
     ) -> Result<DeleteOutcome, StoreError> {
         let (sync, deleting, versioning) = self.state(bucket).await?;
         if !sync {
             return self
                 .store
-                .delete_object_versioned_ext(bucket, key, version_id, versioned, bypass_governance)
+                .delete_object_versioned_ext(bucket, key, version_id, mode, bypass_governance)
                 .await;
         }
         // I1：删桶 quiesce 窗口内拒绝新删除（先于任何远端调用，避免远端已删/本地 503 分叉）。
@@ -1182,7 +1207,9 @@ impl SyncDeleteSink for SiteSyncDelete {
                 self.delete_version_remote(&client, &peer, bucket, key, vid, bypass_governance)
                     .await
             }
-            None if versioned => self.create_marker_remote(&client, &peer, bucket, key).await,
+            None if mode == VersioningMode::Enabled => {
+                self.create_marker_remote(&client, &peer, bucket, key).await
+            }
             None => Err(StoreError::Conflict(
                 "sync bucket requires versioning Enabled".into(),
             )),
@@ -1399,7 +1426,13 @@ async fn recover_row(
             svc.intent_done(id).await;
             if svc
                 .store
-                .delete_object_versioned_ext(bucket, key, Some(&vid), true, false)
+                .delete_object_versioned_ext(
+                    bucket,
+                    key,
+                    Some(&vid),
+                    VersioningMode::Enabled,
+                    false,
+                )
                 .await
                 .is_ok()
             {
@@ -1468,7 +1501,7 @@ async fn recover_row(
                             bucket,
                             key,
                             None,
-                            true,
+                            VersioningMode::Enabled,
                             false,
                             Some(spec),
                         )

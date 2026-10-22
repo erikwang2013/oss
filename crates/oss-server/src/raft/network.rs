@@ -48,6 +48,7 @@ pub fn token_matches(expected: &str, provided: Option<&str>) -> bool {
 pub struct HttpNetworkFactory {
     client: reqwest::Client,
     token: Arc<String>,
+    tls: Option<Arc<crate::tls::Tls>>,
 }
 
 impl HttpNetworkFactory {
@@ -55,6 +56,20 @@ impl HttpNetworkFactory {
         Self {
             client: reqwest::Client::new(),
             token: Arc::new(cluster_token),
+            tls: None,
+        }
+    }
+
+    /// peer TLS：RPC 地址按 [`crate::tls::Tls::peer_url`] 升级，客户端带自定义 CA/身份。
+    pub fn new_tls(
+        cluster_token: String,
+        tls: Arc<crate::tls::Tls>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            client,
+            token: Arc::new(cluster_token),
+            tls: Some(tls),
         }
     }
 }
@@ -63,11 +78,22 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
     type Network = HttpNetwork;
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+        let endpoint = match &self.tls {
+            Some(tls) => match tls.peer_url(&node.addr) {
+                Ok(url) => url,
+                Err(e) => {
+                    // new_client 不能返回错误：记录后指向必然失败的本地端口，绝不回退明文。
+                    tracing::error!(target, error = %e, "Raft 对端地址无 TLS 可用模式");
+                    "https://127.0.0.1:1".to_string()
+                }
+            },
+            None => node.addr.trim_end_matches('/').to_string(),
+        };
         HttpNetwork {
             client: self.client.clone(),
             token: self.token.clone(),
             target,
-            endpoint: node.addr.trim_end_matches('/').to_string(),
+            endpoint,
         }
     }
 }

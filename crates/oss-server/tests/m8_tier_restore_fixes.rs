@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
 use s3s::dto::*;
@@ -63,6 +64,7 @@ fn tier_target() -> TierTarget {
         access_key: "ak".into(),
         secret_key: "sk".into(),
         region: "us-east-1".into(),
+        server_name: None,
     }
 }
 
@@ -172,7 +174,7 @@ async fn sse_object_rejected_and_sweep_skips() {
             None,
             Default::default(),
             None,
-            false,
+            VersioningMode::Off,
             Some(EncSpec::SseC(xl_store::crypto::SseCKey::from_key(
                 [11u8; 32],
             ))),

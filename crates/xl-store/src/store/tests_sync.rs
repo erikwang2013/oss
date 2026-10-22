@@ -91,7 +91,7 @@ async fn put(s: &Store, key: &str, body: Vec<u8>, ext: PutExt) -> Result<ObjectI
         Some("text/plain".into()),
         [("k".to_string(), "v".to_string())].into_iter().collect(),
         None,
-        true, // sync 桶要求版本控制
+        VersioningMode::Enabled, // sync 桶要求版本控制
         None,
         None,
         None,
@@ -439,8 +439,16 @@ async fn mpu_complete(s: &Store, key: &str, body: Vec<u8>) -> Result<ObjectInfo>
             None,
         )
         .await?;
-    s.complete_multipart_upload_versioned("alpha", key, &up, &[(1, etag)], true, None, None)
-        .await
+    s.complete_multipart_upload_versioned(
+        "alpha",
+        key,
+        &up,
+        &[(1, etag)],
+        VersioningMode::Enabled,
+        None,
+        None,
+    )
+    .await
 }
 
 #[tokio::test]

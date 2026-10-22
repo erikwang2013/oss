@@ -69,6 +69,18 @@ pub async fn run(
     max_object_bytes: u64,
     opts: &RepairOptions,
 ) -> Result<RepairReport, String> {
+    run_tls(db, store, vault, max_object_bytes, opts, None).await
+}
+
+/// 同 [`run`]；`tls = Some` 时站点对端地址按 peer TLS 模式升级/校验。
+pub async fn run_tls(
+    db: &Db,
+    store: &Store,
+    vault: Option<&xl_s3::skvault::SecretVault>,
+    max_object_bytes: u64,
+    opts: &RepairOptions,
+    tls: Option<std::sync::Arc<crate::tls::Tls>>,
+) -> Result<RepairReport, String> {
     let sites = db.list_sites().await.map_err(|e| e.to_string())?;
     if sites.len() != 1 {
         return Err(format!(
@@ -85,14 +97,23 @@ pub async fn run(
             .ok_or_else(|| "peer secret cannot be unsealed".to_string())?,
         _ => peer.s3_secret_key.clone(),
     };
-    let client = ReplClient::new(&[RemoteTarget {
+    // 站点对端地址在 peer TLS 模式下连接期升级（存储仍为 http）。
+    let endpoint = match &tls {
+        Some(t) => t.peer_url(&peer.endpoint)?,
+        None => peer.endpoint.clone(),
+    };
+    let mut client = ReplClient::new(&[RemoteTarget {
         id: peer.peer_id.clone(),
-        endpoint: peer.endpoint.clone(),
+        endpoint,
         access_key: peer.s3_access_key.clone(),
         secret_key: secret,
         region: peer.region.clone(),
         max_bytes_per_sec: None,
+        server_name: None,
     }]);
+    if let Some(t) = tls {
+        client = client.with_tls(t);
+    }
     let mut buckets: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM buckets WHERE replication_mode = 'sync' ORDER BY name",
     )

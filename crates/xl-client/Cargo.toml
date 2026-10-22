@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 xl-proto = { path = "../xl-proto" }
 xl-store = { workspace = true }
-tonic = "0.12"
+tonic.workspace = true
 tokio.workspace = true
 async-trait = "0.1"
 bytes.workspace = true

@@ -100,7 +100,16 @@ impl TierBackends {
     }
 
     pub fn from_config(tiers: &[TierTarget]) -> Self {
-        let client = Arc::new(ReplClient::new_tiers(tiers));
+        Self::from_config_tls(tiers, None)
+    }
+
+    /// 带进程 TLS 物料（自定义 CA/mTLS 身份；None = 平台根 + 明文端点不变）。
+    pub fn from_config_tls(tiers: &[TierTarget], tls: Option<Arc<crate::tls::Tls>>) -> Self {
+        let mut client = ReplClient::new_tiers(tiers);
+        if let Some(t) = tls {
+            client = client.with_tls(t);
+        }
+        let client = Arc::new(client);
         let map = tiers
             .iter()
             .map(|t| {
