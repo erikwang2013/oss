@@ -2468,6 +2468,7 @@ impl S3 for OssS3 {
                             "DeleteObjects",
                             Some(&obj.key),
                             p.source_ip,
+                            p.source_vpc.as_deref(),
                         ) == Some(false)
                     }
                     // 匿名 AP 批量删：逐键只认 Principal "*"，无策略默认拒绝。
@@ -2477,6 +2478,7 @@ impl S3 for OssS3 {
                             "DeleteObjects",
                             Some(&obj.key),
                             p.source_ip,
+                            p.source_vpc.as_deref(),
                         ) == Some(false)
                     }
                     None => true, // 防御性 fail-closed

@@ -163,9 +163,12 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     } else {
         None
     };
+    // `aws:SourceVpc` 的来源证明：静态部署 ID（优先）或可信反代的单行头；非法配置启动失败。
+    let vpc = Arc::new(VpcAttest::from_env(trust_proxy)?);
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
         let trust = trust.clone();
-        async move { ap_peer(req, next, trust).await }
+        let vpc = vpc.clone();
+        async move { ap_peer(req, next, trust, vpc).await }
     }));
     Ok(app)
 }
@@ -214,8 +217,59 @@ impl ProxyTrust {
     }
 }
 
-/// 连接对端 → `ApPeer` extension（缺失则由 AP 的 SourceIp 条件 fail-closed）。
-async fn ap_peer(mut req: Request, next: Next, trust: Option<Arc<ProxyTrust>>) -> Response {
+/// `aws:SourceVpc` 的**来源证明**（不是 PrivateLink 端点身份）：
+/// - `OSS_AP_VPC_ID` 非空：进程级静态证明（单 VPC 部署），头一律不采信；
+/// - 否则仅当 `OSS_AP_TRUSTED_PROXY=1` 时采信恰好一条 `x-oss-source-vpc` 头，
+///   形态须为 `vpc-`/`vpce-` + [a-z0-9-]{1,64}；重复/畸形/未信任 → 无证明（fail-closed）。
+///
+/// 反代必须**覆盖**客户端自带的同名头；未显式开启信任时该头完全无效。
+#[derive(Clone)]
+struct VpcAttest {
+    static_id: Option<String>,
+    trust_proxy: bool,
+}
+
+impl VpcAttest {
+    fn from_env(trust_proxy: bool) -> Result<Self, String> {
+        let static_id = match std::env::var("OSS_AP_VPC_ID") {
+            Ok(v) if !v.trim().is_empty() => {
+                let v = v.trim().to_string();
+                if !xl_s3::ap::valid_vpc_id(&v) {
+                    return Err(format!("OSS_AP_VPC_ID 非法: {}", v.escape_debug()));
+                }
+                Some(v)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            static_id,
+            trust_proxy,
+        })
+    }
+
+    fn value(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        if let Some(id) = &self.static_id {
+            return Some(id.clone());
+        }
+        if !self.trust_proxy {
+            return None;
+        }
+        let mut vals = headers.get_all("x-oss-source-vpc").iter();
+        let raw = vals.next()?.to_str().ok()?.trim();
+        if vals.next().is_some() || !xl_s3::ap::valid_vpc_id(raw) {
+            return None;
+        }
+        Some(raw.to_string())
+    }
+}
+
+/// 连接对端/来源 VPC → `ApPeer`/`ApVpc` extension（缺失则由 AP 条件 fail-closed）。
+async fn ap_peer(
+    mut req: Request,
+    next: Next,
+    trust: Option<Arc<ProxyTrust>>,
+    vpc: Arc<VpcAttest>,
+) -> Response {
     let ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -223,6 +277,9 @@ async fn ap_peer(mut req: Request, next: Next, trust: Option<Arc<ProxyTrust>>) -
         .or_else(|| trust.as_ref().and_then(|t| t.client_ip(req.headers())));
     if let Some(ip) = ip {
         req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
+    }
+    if let Some(id) = vpc.value(req.headers()) {
+        req.extensions_mut().insert(xl_s3::ap::ApVpc(id));
     }
     next.run(req).await
 }
@@ -724,6 +781,62 @@ mod tests {
             super::forwarded_ip(&h, 1, &cidrs),
             Some("203.0.113.5".parse().unwrap())
         );
+    }
+
+    /// SourceVpc 来源证明：静态 ID 优先；未信任代理的头完全无效；重复/畸形头 fail-closed。
+    #[test]
+    fn source_vpc_attestation_static_and_proxy_modes() {
+        use super::VpcAttest;
+        let mut h = axum::http::HeaderMap::new();
+        // 未开启信任：头无效（即使形态合法）
+        let untrusted = VpcAttest {
+            static_id: None,
+            trust_proxy: false,
+        };
+        h.insert("x-oss-source-vpc", "vpc-abc123".parse().unwrap());
+        assert!(untrusted.value(&h).is_none());
+        // 可信反代：恰好一条合法头才成立
+        let trusted = VpcAttest {
+            static_id: None,
+            trust_proxy: true,
+        };
+        assert_eq!(trusted.value(&h).as_deref(), Some("vpc-abc123"));
+        assert_eq!(
+            trusted.value(&axum::http::HeaderMap::new()),
+            None,
+            "缺头 → 无证明"
+        );
+        // 重复头行 → 无证明
+        let mut dup = axum::http::HeaderMap::new();
+        dup.append("x-oss-source-vpc", "vpc-a".parse().unwrap());
+        dup.append("x-oss-source-vpc", "vpc-b".parse().unwrap());
+        assert!(trusted.value(&dup).is_none());
+        // 畸形（逗号拼接/大写/前缀错误/超长）→ 无证明
+        for bad in [
+            "vpc-a,vpc-b",
+            "VPC-ABC",
+            "abc",
+            "vpc-",
+            &format!("vpc-{}", "a".repeat(65)),
+        ] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-oss-source-vpc", bad.parse().unwrap());
+            assert!(trusted.value(&h).is_none(), "{bad}");
+        }
+        // 静态 ID 优先，且头（含伪造值）一律不采信
+        let fixed = VpcAttest {
+            static_id: Some("vpc-static".into()),
+            trust_proxy: false,
+        };
+        assert_eq!(fixed.value(&h).as_deref(), Some("vpc-static"));
+        h.insert("x-oss-source-vpc", "vpc-attacker".parse().unwrap());
+        assert_eq!(fixed.value(&h).as_deref(), Some("vpc-static"));
+        // 配置值校验
+        assert!(xl_s3::ap::valid_vpc_id("vpc-0123456789abcdef0"));
+        assert!(xl_s3::ap::valid_vpc_id("vpce-abc"));
+        assert!(!xl_s3::ap::valid_vpc_id("vpc-"));
+        assert!(!xl_s3::ap::valid_vpc_id("vpc-ABC"));
+        assert!(!xl_s3::ap::valid_vpc_id(""));
     }
 
     /// RestoreObject 线上状态修复：仅 POST `?restore` 的 200 → 202 + `x-amz-restore`；
