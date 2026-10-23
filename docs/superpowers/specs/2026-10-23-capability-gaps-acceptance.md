@@ -56,7 +56,8 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 
 - AP 跨账号、VPC 端点、AP 桶级 Create/Delete/ListBuckets、AP 缓存一致性
   （AP 匿名已于后续批次支持，见 §8）。
-- Inventory 增量/跨账号；Batch 抢占/跨账号（每动作桶通知已于后续批次实现，见 §8）。
+- Inventory 增量（节点本地水位，沿用既有 3.6 实现）；跨账户目标已由 3.7 支持（仅管理员可配置，
+  见 §8）；Batch 抢占/跨账号（每动作桶通知已于后续批次实现，见 §8）。
 - Lifecycle `AbortIncompleteMultipartUpload`（需 MPU 索引，继续 501）。
 - ~~Tier 流式搬运（全内存）~~ —— post-1.14 3.11 已实现：Transition 按 8 MiB 窗口读取源、
   出站 256 KiB 块流式发送（S3 先落暂存文件预计算 SigV4 payload hash）；Restore 流式落盘并
@@ -163,6 +164,14 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
   `OSS_AP_NEGATIVE_CACHE_TTL_SECS`（默认 5，0 = 关闭）、`OSS_AP_CACHE_MAX_ENTRIES`
   （默认 10000）；合法范围外启动失败。未知 AP 负缓存、DB/解析错误不缓存（保持 500）；
   控制面写即时失效；TTL 兜底。跨节点读己之写受 apply 延迟影响，强一致性 non-goal。
+- **3.7 Inventory 跨账户目标**：配置写入时记录源桶 12 位账户（存储 JSON 扩展键
+  `ossSourceAccountId`，旧配置读取时按当前桶账户推导）；`destination_account_id`（S3 线格式
+  `AccountId`）可选，若提供必须为 12 位数字且等于目标桶当前账户。源/目标桶账户不同的
+  **跨账户目标仅管理员可创建**（非管理员 403，即使持目标桶写权限）；运行期复核记录源账户与
+  目标桶账户，漂移即失败且不写任何输出；写入仍走配置所有者的 `PutObject` 检查，不新增绕过。
+  目标桶字段接受桶名或 `arn:aws:s3:::<bucket>`（归一为桶名）。manifest 追加 `accountId`（源）
+  与 `destinationAccountId`（目标）。**账户 = 用户命名空间 v1，不是租户隔离**；增量模式仍为
+  3.6 的节点本地实现，本项不改。
 - **3.9 Batch 每动作桶通知**：成功动作经 `EventSink` 补发到**对象所在桶**的配置
   （Copy→目标桶 `s3:ObjectCreated:Copy`；Delete→`s3:ObjectRemoved:Delete` /
   `DeleteMarkerCreated`；Restore→`s3:ObjectRestore:Post`；NotFound、ReplaceTags、

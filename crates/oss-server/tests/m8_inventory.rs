@@ -17,7 +17,7 @@ use oss_server::state::AppState;
 use reqwest::StatusCode as HttpStatus;
 use s3s::dto::*;
 use s3s::{S3, S3Request};
-use xl_s3::access::AuthedUser;
+use xl_s3::access::{AuthedUser, LEGACY_ACCOUNT, account_id_of};
 use xl_s3::inventory::InventoryError;
 use xl_s3::service::OssS3;
 use xl_store::crypto::EncSpec;
@@ -1205,6 +1205,368 @@ async fn outputs_apply_destination_default_encryption() {
 }
 
 // ---------- console 测试脚手架 ----------
+
+// ---------- 3.7 跨账户目标 ----------
+
+fn account(uid: i64) -> String {
+    account_id_of(uid).expect("uid 派生 12 位账户")
+}
+
+/// 跨账户目标只允许管理员创建；持有目标桶写权限的非管理员仍被拒绝。
+#[tokio::test]
+async fn cross_account_destination_admin_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, admin) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    add_bucket(&st, "subsrc", Some(sub)).await;
+    add_bucket(&st, "subdst", Some(sub)).await;
+    st.db
+        .set_permissions(
+            sub,
+            &[PermissionRow {
+                bucket: "dst".into(),
+                read: false,
+                write: true,
+                delete: false,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let err = st
+        .inventory
+        .put_config("subsrc", &user(sub, false), &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, InventoryError::AccessDenied(ref m) if m.contains("跨账户")),
+        "{err:?}"
+    );
+
+    // 同账户目标（subsrc -> subdst）：非管理员不受影响。
+    st.inventory
+        .put_config("subsrc", &user(sub, false), &cfg("same", "Daily", "subdst"))
+        .await
+        .unwrap();
+    // 跨账户目标：管理员允许。
+    st.inventory
+        .put_config("subsrc", &user(admin, true), &cfg("cross", "Daily", "dst"))
+        .await
+        .unwrap();
+}
+
+/// 目标账户必须为 12 位且等于目标桶当前账户；桶字段接受 ARN 并归一为桶名。
+#[tokio::test]
+async fn destination_account_validation_and_arn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, admin) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    let sub_acct = account(sub);
+
+    let mut c = cfg("c1", "Daily", "dst");
+    c.destination.s3_bucket_destination.account_id = Some(sub_acct.clone());
+    let err = put(&st, admin, "src", &c).await.unwrap_err();
+    assert!(
+        matches!(err, InventoryError::InvalidArgument(ref m) if m.contains("不一致")),
+        "{err:?}"
+    );
+
+    c.destination.s3_bucket_destination.account_id = Some("123".into());
+    assert!(matches!(
+        put(&st, admin, "src", &c).await,
+        Err(InventoryError::InvalidArgument(_))
+    ));
+
+    c.destination.s3_bucket_destination.account_id = Some(LEGACY_ACCOUNT.into());
+    put(&st, admin, "src", &c).await.unwrap();
+    let got = st.inventory.get_config("src", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        got.destination.s3_bucket_destination.account_id.as_deref(),
+        Some(LEGACY_ACCOUNT)
+    );
+
+    // ARN 形态：校验通过并归一为桶名存储/返回。
+    let mut arn = cfg("c2", "Daily", "arn:aws:s3:::dst");
+    arn.destination.s3_bucket_destination.account_id = Some(LEGACY_ACCOUNT.into());
+    put(&st, admin, "src", &arn).await.unwrap();
+    let got = st.inventory.get_config("src", "c2").await.unwrap().unwrap();
+    assert_eq!(got.destination.s3_bucket_destination.bucket, "dst");
+    assert!(matches!(
+        put(
+            &st,
+            admin,
+            "src",
+            &cfg("c3", "Daily", "arn:aws:s3:::dst/key")
+        )
+        .await,
+        Err(InventoryError::InvalidArgument(_))
+    ));
+
+    // S3 线格式同样接受并回显 destination AccountId。
+    let svc = s3(&st);
+    svc.put_bucket_inventory_configuration(as_user(
+        req(PutBucketInventoryConfigurationInput {
+            bucket: "src".into(),
+            id: "s3c".into(),
+            inventory_configuration: c,
+            expected_bucket_owner: None,
+        }),
+        admin,
+        true,
+    ))
+    .await
+    .unwrap();
+    let got = svc
+        .get_bucket_inventory_configuration(req(GetBucketInventoryConfigurationInput {
+            bucket: "src".into(),
+            id: "s3c".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .inventory_configuration
+        .unwrap();
+    assert_eq!(
+        got.destination.s3_bucket_destination.account_id.as_deref(),
+        Some(LEGACY_ACCOUNT)
+    );
+}
+
+/// 跨账户配置由管理员创建后可运行；manifest 记录源/目标账户。
+#[tokio::test]
+async fn cross_account_run_manifest_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, admin) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    add_bucket(&st, "subdst", Some(sub)).await;
+    let sub_acct = account(sub);
+
+    let mut c = cfg("c1", "Daily", "subdst");
+    c.destination.s3_bucket_destination.account_id = Some(sub_acct.clone());
+    put(&st, admin, "src", &c).await.unwrap();
+    st.store
+        .put_object("src", "a.txt", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+
+    let key = "manual-xacct";
+    enqueue_run(&st.db, "src", "c1", key, Some(admin), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+
+    let (manifest, _) = output(&st, "subdst", "src", "c1", key).await;
+    assert_eq!(manifest["sourceBucket"], "src");
+    assert_eq!(manifest["destinationBucket"], "subdst");
+    assert_eq!(manifest["accountId"], LEGACY_ACCOUNT);
+    assert_eq!(
+        manifest["destinationAccountId"].as_str(),
+        Some(sub_acct.as_str())
+    );
+}
+
+/// 运行期复核记录源账户与目标桶账户：属主/账户漂移 → 失败且不写输出。
+#[tokio::test]
+async fn account_drift_fails_run_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, admin) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    add_bucket(&st, "subdst", Some(sub)).await;
+    let sub_acct = account(sub);
+
+    let mut c = cfg("c1", "Daily", "subdst");
+    c.destination.s3_bucket_destination.account_id = Some(sub_acct.clone());
+    put(&st, admin, "src", &c).await.unwrap();
+    st.store
+        .put_object("src", "a.txt", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+
+    let ok = "manual-ok";
+    enqueue_run(&st.db, "src", "c1", ok, Some(admin), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    output(&st, "subdst", "src", "c1", ok).await;
+
+    // 目标桶归属变更：配置账户不再匹配 → 失败关闭，且不写任何目标对象。
+    sqlx::query("UPDATE buckets SET owner_id = NULL WHERE name = 'subdst'")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let drift = "manual-drift";
+    enqueue_run(&st.db, "src", "c1", drift, Some(admin), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let run = run_row(&st, "src", "c1", drift).await;
+    assert_eq!(run.state, "error");
+    assert_eq!(run.manifest_key, None);
+    assert!(
+        run.error.as_deref().unwrap_or("").contains("账户校验失败"),
+        "error={:?}",
+        run.error
+    );
+    assert!(
+        keys_under(&st, "subdst", "src/c1/manual-drift")
+            .await
+            .is_empty()
+    );
+
+    // 恢复目标桶归属，改源桶归属：记录的源账户漂移同样失败关闭。
+    sqlx::query("UPDATE buckets SET owner_id = ? WHERE name = 'subdst'")
+        .bind(sub)
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE buckets SET owner_id = ? WHERE name = 'src'")
+        .bind(sub)
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let src_drift = "manual-src-drift";
+    enqueue_run(&st.db, "src", "c1", src_drift, Some(admin), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let run = run_row(&st, "src", "c1", src_drift).await;
+    assert_eq!(run.state, "error");
+    assert!(
+        run.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("源桶账户已变化"),
+        "error={:?}",
+        run.error
+    );
+}
+
+/// 旧配置 JSON（无源账户扩展键）仍可读写/运行；manifest 按当前桶账户推导。
+#[tokio::test]
+async fn legacy_config_json_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, admin) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let c = cfg("old", "Daily", "dst");
+    let legacy_json = serde_json::to_string(&c).unwrap();
+    st.db
+        .inventory_upsert_config("src", "old", admin, &legacy_json, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        st.inventory.get_config("src", "old").await.unwrap(),
+        Some(c.clone())
+    );
+    assert_eq!(
+        st.inventory.list_configs("src").await.unwrap(),
+        vec![c.clone()]
+    );
+
+    let key = "manual-legacy";
+    enqueue_run(&st.db, "src", "old", key, Some(admin), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let (manifest, _) = output(&st, "dst", "src", "old", key).await;
+    assert_eq!(manifest["accountId"], LEGACY_ACCOUNT);
+    assert_eq!(manifest["destinationAccountId"], LEGACY_ACCOUNT);
+}
+
+/// 控制台：跨账户目标非管理员 403（即使有目标桶写权限）；列表返回源/目标账户。
+#[tokio::test]
+async fn console_cross_account_admin_only_and_account_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, _admin) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    add_bucket(&st, "subsrc", Some(sub)).await;
+    st.db
+        .set_permissions(
+            sub,
+            &[PermissionRow {
+                bucket: "dst".into(),
+                read: false,
+                write: true,
+                delete: false,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let base = serve(oss_server::router::build_router(st.clone()).unwrap()).await;
+    let http = reqwest::Client::new();
+    let sub_token = login(&base, "sub", "pw").await;
+    let admin_token = login(&base, "erik", "pw").await;
+
+    let body = serde_json::json!({
+        "id": "c1", "frequency": "Daily", "destination_bucket": "dst",
+        "destination_account_id": LEGACY_ACCOUNT
+    });
+    assert_eq!(
+        http.put(format!("{base}/api/v1/buckets/subsrc/inventory"))
+            .bearer_auth(&sub_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        HttpStatus::FORBIDDEN
+    );
+
+    // 管理员同账户配置：204，列表回显源/目标账户。
+    assert_eq!(
+        http.put(format!("{base}/api/v1/buckets/src/inventory"))
+            .bearer_auth(&admin_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        HttpStatus::NO_CONTENT
+    );
+    let listed: Vec<serde_json::Value> = http
+        .get(format!("{base}/api/v1/buckets/src/inventory"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed[0]["source_account_id"], LEGACY_ACCOUNT);
+    assert_eq!(listed[0]["destination_account_id"], LEGACY_ACCOUNT);
+
+    // 非 12 位目标账户 → 400。
+    let bad = serde_json::json!({
+        "id": "c2", "frequency": "Daily", "destination_bucket": "dst",
+        "destination_account_id": "42"
+    });
+    assert_eq!(
+        http.put(format!("{base}/api/v1/buckets/src/inventory"))
+            .bearer_auth(&admin_token)
+            .json(&bad)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        HttpStatus::BAD_REQUEST
+    );
+}
 
 async fn serve(app: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

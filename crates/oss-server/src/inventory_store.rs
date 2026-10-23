@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use s3s::dto::InventoryConfiguration;
 use xl_s3::access::{Acl, AuthedUser};
-use xl_s3::inventory::{InventoryError, InventoryStore, validate_config};
+use xl_s3::inventory::{
+    InventoryError, InventoryStore, config_from_json, config_to_json, destination_bucket_name,
+    validate_config,
+};
 
 use crate::db::Db;
 use crate::raft::command::{ControlCommand, ControlResponse};
@@ -60,8 +63,15 @@ impl InventoryStore for SqlInventoryStore {
     ) -> Result<(), InventoryError> {
         self.ensure_bucket(bucket).await?;
         validate_config(cfg)?;
-        let dest = cfg.destination.s3_bucket_destination.bucket.as_str();
-        match self.db.bucket_exists(dest).await {
+        let dest = destination_bucket_name(&cfg.destination.s3_bucket_destination.bucket)
+            .ok_or_else(|| {
+                InventoryError::InvalidArgument(format!(
+                    "destination bucket ARN 非法：{}",
+                    cfg.destination.s3_bucket_destination.bucket
+                ))
+            })?
+            .to_string();
+        match self.db.bucket_exists(&dest).await {
             Ok(true) => {}
             Ok(false) => {
                 return Err(InventoryError::InvalidArgument(format!(
@@ -69,6 +79,31 @@ impl InventoryStore for SqlInventoryStore {
                 )));
             }
             Err(e) => return Err(InventoryError::Internal(e.to_string())),
+        }
+        // 3.7：记录源桶账户；配置了目标账户时必须与目标桶当前账户一致。
+        // 源/目标桶账户不同 = 跨账户目标，只有管理员能创建（运行期写仍走配置所有者的
+        // PutObject 检查，不绕过既有授权）。
+        let source_account = self
+            .db
+            .bucket_account(bucket)
+            .await
+            .map_err(|e| InventoryError::Internal(e.to_string()))?;
+        let dest_account = self
+            .db
+            .bucket_account(&dest)
+            .await
+            .map_err(|e| InventoryError::Internal(e.to_string()))?;
+        if let Some(account) = &cfg.destination.s3_bucket_destination.account_id
+            && account != &dest_account
+        {
+            return Err(InventoryError::InvalidArgument(format!(
+                "destination account_id {account} 与目标桶 {dest} 的账户 {dest_account} 不一致"
+            )));
+        }
+        if source_account != dest_account && !owner.is_admin {
+            return Err(InventoryError::AccessDenied(format!(
+                "跨账户目标桶 {dest}（账户 {dest_account}）仅管理员可配置"
+            )));
         }
         // I4：走正典 check_op（表三档 × 桶策略，显式 Deny 优先——admin/owner 也受 Deny 约束）。
         // 配置期没有 run_key，用同形状代表键（真实 data/manifest 键在运行期复核）。
@@ -86,7 +121,7 @@ impl InventoryStore for SqlInventoryStore {
         };
         match self
             .acl
-            .check_op(owner, "", "PutObject", Some(dest), Some(&probe), None)
+            .check_op(owner, "", "PutObject", Some(&dest), Some(&probe), None)
             .await
         {
             Ok((true, _)) => {}
@@ -116,8 +151,11 @@ impl InventoryStore for SqlInventoryStore {
                 )));
             }
         }
-        let json =
-            serde_json::to_string(cfg).map_err(|e| InventoryError::Internal(e.to_string()))?;
+        // ARN 形态归一为桶名存储；扩展键记录源桶账户（Raft 随 config_json 原样复制）。
+        let mut stored = cfg.clone();
+        stored.destination.s3_bucket_destination.bucket = dest.clone();
+        let json = config_to_json(&stored, Some(&source_account))
+            .map_err(|e| InventoryError::Internal(e.to_string()))?;
         if let Some(control) = self.raft_control() {
             // 属主 uid → username 在 append 前解析（apply 只做确定性映射）。
             let owner_name = if owner.is_admin {
@@ -167,7 +205,8 @@ impl InventoryStore for SqlInventoryStore {
             .await
             .map_err(|e| InventoryError::Internal(e.to_string()))?;
         row.map(|r| {
-            serde_json::from_str(&r.config_json)
+            config_from_json(&r.config_json)
+                .map(|(cfg, _)| cfg)
                 .map_err(|e| InventoryError::Internal(format!("config_json 非法：{e}")))
         })
         .transpose()
@@ -185,7 +224,8 @@ impl InventoryStore for SqlInventoryStore {
             .map_err(|e| InventoryError::Internal(e.to_string()))?;
         rows.iter()
             .map(|r| {
-                serde_json::from_str(&r.config_json)
+                config_from_json(&r.config_json)
+                    .map(|(cfg, _)| cfg)
                     .map_err(|e| InventoryError::Internal(format!("config_json 非法：{e}")))
             })
             .collect()

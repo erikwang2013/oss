@@ -89,8 +89,8 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
 管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换（3.16 已补：显式 CMK + 命名环轮换，见「加密」）· AP 跨账号/VPC 端点（AP 匿名已支持，见「访问点」）· Inventory 跨账号投递 ·
-Batch 抢占/跨账号清单。
+CMK/多钥轮换（3.16 已补：显式 CMK + 命名环轮换，见「加密」）· AP 跨账号/VPC 端点（AP 匿名已支持，见「访问点」）· Inventory 跨账号投递
+（3.7 已补：跨账户目标仅管理员可配置，见「Inventory」）· Batch 抢占/跨账号清单。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
 （内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
@@ -1153,8 +1153,15 @@ aws --endpoint-url $E s3 cp \
 - 列：必含 9 列 `Bucket,Key,VersionId,IsLatest,DeleteMarker,Size,LastModifiedDate,ETag,StorageClass`；
   可选 6 列按固定顺序追加 `ReplicationStatus,EncryptionStatus,ObjectLockRetainUntilDate,
   ObjectLockMode,ObjectLockLegalHoldStatus,ChecksumAlgorithm`。
-- 边界：全量扫描、单数据文件（≤5 GiB）、CSV/Parquet；不做跨账号/增量；
-  `IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持；可选列可能逐版本 head。
+- 账户（3.7）：配置写入时记录源桶 12 位账户（存储 JSON 扩展键 `ossSourceAccountId`，旧配置
+  读取时按当前桶账户推导）；`destination_account_id`（控制台字段，S3 线格式为 `AccountId`）
+  可选，若提供必须为 12 位数字且等于目标桶当前账户。源/目标桶账户不同的**跨账户目标**仅
+  管理员可创建（非管理员 403，即使持有目标桶写权限）；运行期复核源/目标桶账户，漂移即失败
+  且不写任何输出。写入仍走配置所有者的 `PutObject` 检查，不绕过既有授权。目标桶字段接受桶名
+  或 `arn:aws:s3:::<bucket>`（归一为桶名）。账户 = 用户命名空间 v1，**不是租户隔离**。
+- manifest 在标准字段外追加 `accountId`（源桶账户）与 `destinationAccountId`（目标桶账户）。
+- 边界：默认全量扫描（增量模式为 3.6 的节点本地实现，非 CDC）、单数据文件（≤5 GiB）、
+  CSV/Parquet；`IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持；可选列可能逐版本 head。
 
 ### 分层 Transition 与 Restore（S4b）
 
@@ -1258,7 +1265,8 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    动作按**对象所在桶**发桶通知（Copy→目标桶 `CreatedCopy`、Delete→`RemovedDelete`/
    `DeleteMarkerCreated`、Restore→`RestorePost`；ReplaceTags/InvokeLambda 无对应 S3 事件
    类型、不发），并照旧发复制/清 tier。
-5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
+5. Inventory 默认全量扫描（增量为节点本地 3.6 模式）、CSV/Parquet 单数据文件；
+   跨账户目标仅管理员可配置（运行期复核源/目标桶账户）；Hive 兼容面仅
    `symlink.txt`（不含 Athena 建表/分区自动发现）。
 6. 分层支持远端 S3 与本地冷盘池、有界内存流式搬运（源 8 MiB 窗口 / 出站与恢复 256 KiB
    块）；Archived GET（含 Range）不直读远端，须先 Restore；S3 生命周期已支持 tag/size/And Filter、

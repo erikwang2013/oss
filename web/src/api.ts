@@ -273,7 +273,9 @@ export interface InventoryConfig {
   is_enabled: boolean
   frequency: string
   destination_bucket: string
+  destination_account_id: string | null
   destination_prefix: string | null
+  source_account_id: string | null
   format: string
   filter_prefix: string | null
   included_object_versions: string
