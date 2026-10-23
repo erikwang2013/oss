@@ -1043,8 +1043,11 @@ impl Db {
             "DELETE FROM access_points WHERE bucket = ?",
             "DELETE FROM inventory_runs WHERE bucket = ?",
             "DELETE FROM inventory_configs WHERE bucket = ?",
+            "DELETE FROM inventory_cursors WHERE bucket = ?",
+            "DELETE FROM inventory_incremental WHERE bucket = ?",
             "DELETE FROM tier_restores WHERE bucket = ?",
             "DELETE FROM lifecycle_rules WHERE bucket = ?",
+            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
         ] {
             sqlx::query(sql).bind(bucket).execute(&mut *conn).await?;
         }
@@ -1053,10 +1056,13 @@ impl Db {
 
     /// M9 S6c（M-1）：Raft 删桶后只清**本地** M8 行。复制表已由 apply 级联清空，
     /// 且受 `raft_guard_*` 保护不得再直写（会 ABORT）；这里仅补 `inventory_runs`/
-    /// `tier_restores` 两张本地表。幂等。
+    /// `tier_restores`/扫描游标等本地表。幂等。
     pub async fn clear_bucket_local_m8(&self, bucket: &str) -> Result<()> {
         for sql in [
             "DELETE FROM inventory_runs WHERE bucket = ?",
+            "DELETE FROM inventory_cursors WHERE bucket = ?",
+            "DELETE FROM inventory_incremental WHERE bucket = ?",
+            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
             "DELETE FROM tier_restores WHERE bucket = ?",
         ] {
             sqlx::query(sql).bind(bucket).execute(&self.pool).await?;
@@ -3021,6 +3027,11 @@ impl Db {
             .bind(bucket)
             .execute(&mut *tx)
             .await?;
+        // 4.10：规则整桶替换 → 旧扫描游标作废（prefix/动作变了，续扫位置不再可信）。
+        sqlx::query("DELETE FROM lifecycle_cursors WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await?;
         for r in rules {
             sqlx::query(
                 "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, expiration_days, \
@@ -3042,6 +3053,64 @@ impl Db {
             .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// 4.10：读取某规则某阶段的扫描游标（None = 从头扫）。
+    pub async fn lifecycle_cursor_get(
+        &self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT cursor FROM lifecycle_cursors \
+             WHERE bucket = ? AND rule_id = ? AND stage = ?",
+        )
+        .bind(bucket)
+        .bind(rule_id)
+        .bind(stage)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("cursor")))
+    }
+
+    /// 4.10：持久化/清除扫描游标（`None` → 删除行，表示本阶段已扫完，下轮从头）。
+    pub async fn lifecycle_cursor_set(
+        &self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+        cursor: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        match cursor {
+            Some(c) if !c.is_empty() => {
+                sqlx::query(
+                    "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at) \
+                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, rule_id, stage) DO UPDATE SET \
+                     cursor = excluded.cursor, updated_at = excluded.updated_at",
+                )
+                .bind(bucket)
+                .bind(rule_id)
+                .bind(stage)
+                .bind(c)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+            }
+            _ => {
+                sqlx::query(
+                    "DELETE FROM lifecycle_cursors \
+                     WHERE bucket = ? AND rule_id = ? AND stage = ?",
+                )
+                .bind(bucket)
+                .bind(rule_id)
+                .bind(stage)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -3617,6 +3686,26 @@ impl Db {
         Ok(rows.len())
     }
 
+    /// 4.11：回收「state='running' 但没有任何 job_tasks」的作业行。
+    /// lifecycle/inventory 等单条作业只写 jobs 行；进程在 job_start 之后崩溃会永久停在
+    /// running。`cutoff` 限定 created_at（启动时覆盖全部，周期用 now-阈值避免误伤新作业）。
+    pub async fn recover_orphan_jobs(&self, cutoff: i64, now: i64) -> Result<usize> {
+        let n = sqlx::query(
+            "UPDATE jobs SET state = 'error', \
+             error = COALESCE(error, '进程崩溃遗留的 running 作业，已自动回收'), \
+             finished_at = ?, updated_at = ? \
+             WHERE state = 'running' AND created_at <= ? \
+             AND NOT EXISTS (SELECT 1 FROM job_tasks WHERE job_tasks.job_id = jobs.id)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n as usize)
+    }
+
     /// 启动恢复：running 且 `started_at < cutoff`（进程崩溃遗留）按一次失败处理。
     pub async fn recover_stale_tasks(&self, cutoff: i64, max_attempts: i64) -> Result<usize> {
         let rows = sqlx::query(
@@ -3960,16 +4049,140 @@ impl Db {
         .bind(now)
         .execute(&self.pool)
         .await?;
+        // 3.6：配置变更 → 旧增量水位/模式失效（console 随后按请求重新设置模式）。
+        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn inventory_delete_config(&self, bucket: &str, id: &str) -> Result<bool> {
+        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         let r = sqlx::query("DELETE FROM inventory_configs WHERE bucket = ? AND id = ?")
             .bind(bucket)
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected() > 0)
+    }
+
+    /// 3.6：Inventory 增量模式（默认全量；本地表，不进 Raft）。
+    pub async fn inventory_incremental_get(&self, bucket: &str, config_id: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT enabled FROM inventory_incremental WHERE bucket = ? AND config_id = ?",
+        )
+        .bind(bucket)
+        .bind(config_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some_and(|r| r.get::<i64, _>("enabled") != 0))
+    }
+
+    /// 3.6：设置增量模式；关闭时连旧水位一起清掉（重新开启先跑全量）。
+    pub async fn inventory_incremental_set(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        enabled: bool,
+        now: i64,
+    ) -> Result<()> {
+        if enabled {
+            sqlx::query(
+                "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
+                 VALUES (?, ?, 1, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
+                 enabled = 1, updated_at = excluded.updated_at",
+            )
+            .bind(bucket)
+            .bind(config_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
+                .bind(bucket)
+                .bind(config_id)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
+                .bind(bucket)
+                .bind(config_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// 3.6：读取增量水位；`config_updated_at` 不匹配（配置已改）→ None，从头全量。
+    pub async fn inventory_cursor_get(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        config_updated_at: i64,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT cursor FROM inventory_cursors \
+             WHERE bucket = ? AND config_id = ? AND config_updated_at = ?",
+        )
+        .bind(bucket)
+        .bind(config_id)
+        .bind(config_updated_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("cursor")))
+    }
+
+    /// 3.6：写入/清除增量水位（`None` → 删除，回到全量起点）。
+    pub async fn inventory_cursor_set(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        config_updated_at: i64,
+        cursor: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        match cursor {
+            Some(c) if !c.is_empty() => {
+                sqlx::query(
+                    "INSERT INTO inventory_cursors \
+                     (bucket, config_id, cursor, config_updated_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
+                     cursor = excluded.cursor, \
+                     config_updated_at = excluded.config_updated_at, \
+                     updated_at = excluded.updated_at",
+                )
+                .bind(bucket)
+                .bind(config_id)
+                .bind(c)
+                .bind(config_updated_at)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+            }
+            _ => {
+                sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
+                    .bind(bucket)
+                    .bind(config_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// 建运行行；`(bucket, config_id, run_key)` 已存在 → None（同槽去重）。
@@ -4444,8 +4657,11 @@ impl Db {
         for sql in [
             "DELETE FROM access_points WHERE bucket = ?",
             "DELETE FROM inventory_configs WHERE bucket = ?",
+            "DELETE FROM inventory_cursors WHERE bucket = ?",
+            "DELETE FROM inventory_incremental WHERE bucket = ?",
             "DELETE FROM permissions WHERE bucket = ?",
             "DELETE FROM lifecycle_rules WHERE bucket = ?",
+            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
             "DELETE FROM bucket_policies WHERE bucket = ?",
             "DELETE FROM event_configs WHERE bucket = ?",
             "DELETE FROM replication_rules WHERE bucket = ?",
@@ -4550,6 +4766,11 @@ impl Db {
             .bind(bucket)
             .execute(&mut *conn)
             .await?;
+        // 4.10：规则整桶替换 → 旧扫描游标作废（prefix/动作变了，续扫位置不再可信）。
+        sqlx::query("DELETE FROM lifecycle_cursors WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *conn)
+            .await?;
         for r in rules {
             sqlx::query(
                 "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, \
@@ -4578,6 +4799,10 @@ impl Db {
         bucket: &str,
     ) -> Result<()> {
         sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&mut *cw.conn())
+            .await?;
+        sqlx::query("DELETE FROM lifecycle_cursors WHERE bucket = ?")
             .bind(bucket)
             .execute(&mut *cw.conn())
             .await?;
@@ -4804,6 +5029,16 @@ impl Db {
         .bind(updated_at)
         .execute(&mut *cw.conn())
         .await?;
+        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&mut *cw.conn())
+            .await?;
+        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&mut *cw.conn())
+            .await?;
         Ok(())
     }
 
@@ -4812,6 +5047,16 @@ impl Db {
         bucket: &str,
         id: &str,
     ) -> Result<bool> {
+        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&mut *cw.conn())
+            .await?;
+        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
+            .bind(bucket)
+            .bind(id)
+            .execute(&mut *cw.conn())
+            .await?;
         let n = sqlx::query("DELETE FROM inventory_configs WHERE bucket = ? AND id = ?")
             .bind(bucket)
             .bind(id)

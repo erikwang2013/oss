@@ -80,6 +80,38 @@ CREATE TABLE IF NOT EXISTS tier_restores (
 );
 CREATE INDEX IF NOT EXISTS idx_tier_restores_expiry ON tier_restores(state, expires_at);
 
+-- 4.10：生命周期扫描游标（本地表，不进 Raft；配置变更时清空）
+CREATE TABLE IF NOT EXISTS lifecycle_cursors (
+  bucket TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  cursor TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bucket, rule_id, stage)
+);
+
+-- 3.6：Inventory 增量扫描水位（本地表；绑定 config_updated_at 防配置变更后误用旧游标）
+CREATE TABLE IF NOT EXISTS inventory_cursors (
+  bucket TEXT NOT NULL,
+  config_id TEXT NOT NULL,
+  cursor TEXT NOT NULL,
+  config_updated_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bucket, config_id)
+);
+
+-- 3.6：Inventory 增量模式开关（默认全量；本地表，配置整行替换时复位）
+CREATE TABLE IF NOT EXISTS inventory_incremental (
+  bucket TEXT NOT NULL,
+  config_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bucket, config_id)
+);
+
+-- 4.11：无任务 running 作业回收按 (state, created_at) 局部索引，避免每 tick 全表扫
+CREATE INDEX IF NOT EXISTS idx_jobs_running_created ON jobs(created_at) WHERE state = 'running';
+
 -- v3（阻断 1）：生命周期规则 id 桶内唯一（rule_id 列由 db.rs::ensure_columns 补出）
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lifecycle_rule_id ON lifecycle_rules(bucket, rule_id)
   WHERE rule_id IS NOT NULL;
