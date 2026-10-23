@@ -11,6 +11,9 @@
 //!   README 口径）。env 接线在数据面消费它的切片（2/3）落 oss-server config。
 //! - [`KmsFileProvider`]：多主密钥目录（SSE-KMS 用）。`key-<n>.bin`，当前钥 = 最大 n，
 //!   [`KmsFileProvider::rotate`] 加一新钥即换钥；旧 key_id 的 wrap 照旧可解（⑤）。
+//!   命名 CMK（显式 `x-amz-server-side-encryption-aws-kms-key-id`）放在
+//!   `<dir>/cmk/<name>/key-<n>.bin`：名白名单 [a-z0-9-]{1,64}（即路径白名单），每环独立
+//!   轮换，key_id 形态 `cmk:<name>:k<n>`。命名环**只经管理 API 创建**，读路径绝不自动生成。
 //!
 //! HTTP KMS：不做真实实现（切片钉子）——接入点即 [`KeyProvider`] trait，HTTP 客户端
 //! 未来以同一 trait 落地，数据面无需改动。
@@ -44,6 +47,20 @@ pub fn new_dek() -> [u8; KEY_LEN] {
 pub trait KeyProvider: Send + Sync + std::fmt::Debug {
     /// 用**当前**主密钥包裹 DEK → `(wrapped, key_id)`；key_id 记录进对象元数据。
     async fn wrap_dek(&self, dek: &[u8; KEY_LEN]) -> Result<(Vec<u8>, String)>;
+    /// 显式 CMK 变体：`Some(name)` = 用命名 CMK 的当前版本；`None` = 默认钥（同 `wrap_dek`）。
+    /// 不支持命名 CMK 的 provider（SSE-S3 单钥）对 `Some` 一律拒绝。
+    async fn wrap_dek_named(
+        &self,
+        dek: &[u8; KEY_LEN],
+        cmk: Option<&str>,
+    ) -> Result<(Vec<u8>, String)> {
+        match cmk {
+            None => self.wrap_dek(dek).await,
+            Some(_) => Err(Error::Crypto(
+                "该密钥 provider 不支持显式 CMK（SSE-S3 只能用文件主密钥）".into(),
+            )),
+        }
+    }
     /// 用 `key_id` 指定的主密钥解包；错钥/篡改 → `Error::Crypto`（fail-closed，绝不回退
     /// 「试一把看看」的宽口径）。
     async fn unwrap_dek(&self, wrapped: &[u8], key_id: &str) -> Result<[u8; KEY_LEN]>;
@@ -217,6 +234,83 @@ fn parse_key_file(name: &str) -> Option<u32> {
     (name == format!("key-{n}.bin")).then_some(n)
 }
 
+// ---------- 显式 CMK（命名密钥环） ----------
+
+/// CMK 名最大长度；名同时是 `cmk/<name>/` 路径分量，故字符集即路径白名单。
+pub const CMK_NAME_MAX: usize = 64;
+
+/// 严格 CMK 名：`[a-z0-9-]{1,64}`，首尾须字母数字——无 `/`、`.`、`..`、大写与空名，
+/// 路径穿越面在解析处闭合（不依赖后续拼接）。
+pub fn validate_cmk_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= CMK_NAME_MAX
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric();
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "KMS CMK 名称非法：{name:?}（须 [a-z0-9-]，1..={CMK_NAME_MAX}，首尾字母数字）"
+        )))
+    }
+}
+
+/// 线格式 CMK id → 本地 CMK 名。接受裸名或 `arn:…:key/<name>`（AWS 客户端两种都发）；
+/// 仅取 `key/` 后的部分并套严格白名单，ARN 其余段不参与寻址。
+pub fn parse_cmk_id(raw: &str) -> Result<&str> {
+    let s = raw.trim();
+    let name = if s.starts_with("arn:") {
+        s.rsplit_once("key/")
+            .filter(|(p, _)| p.len() > 4)
+            .map(|(_, n)| n)
+            .ok_or_else(|| Error::InvalidArgument(format!("KMS key ARN 非法：{raw:?}")))?
+    } else {
+        s
+    };
+    validate_cmk_name(name)?;
+    Ok(name)
+}
+
+/// 对象 meta 的内部 key_id：`cmk:<name>:k<n>`（冒号在名称白名单之外，形态无歧义）。
+pub fn cmk_key_id(name: &str, n: u32) -> String {
+    format!("cmk:{name}:k{n}")
+}
+
+/// 规范 CMK key_id 解析；异形（非规范版本号/非法名）→ None。
+pub fn parse_cmk_key_id(key_id: &str) -> Option<(&str, u32)> {
+    let rest = key_id.strip_prefix("cmk:")?;
+    let (name, ver) = rest.rsplit_once(':')?;
+    let n: u32 = ver.strip_prefix('k')?.parse().ok()?;
+    (ver == format!("k{n}") && validate_cmk_name(name).is_ok()).then_some((name, n))
+}
+
+/// 命名 CMK 的只读快照（运维/控制台用；**绝不含钥字节**）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmkInfo {
+    pub name: String,
+    /// 当前版本号（新写入用）。
+    pub current: u32,
+    /// 全部版本（解码仍需旧版本——轮换不重写旧对象）。
+    pub versions: Vec<u32>,
+    /// 当前版本钥文件的 mtime（unix 纳秒；仅运维展示）。
+    pub updated_nanos: i64,
+}
+
+/// 列出目录内全部规范 key 版本（空目录 → 空表）。
+fn list_key_versions(dir: &Path) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        if let Some(n) = parse_key_file(&e?.file_name().to_string_lossy()) {
+            out.push(n);
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 impl KmsFileProvider {
     /// 默认目录：`<data_root>/.oss.sys/kms/`（env `OSS_KMS_DIR` 的接线同模块头注口径）。
     pub fn default_dir(data_root: &Path) -> PathBuf {
@@ -224,14 +318,26 @@ impl KmsFileProvider {
     }
 
     /// 目录为空（**真**空）→ 生成 `key-0`（首启）；否则当前钥 = 最大编号。幂等。
+    /// `cmk/` 子目录不参与默认环扫描，但**逐个校验**（见 [`Self::validate_cmk_root`]）：
+    /// 命名 CMK 绝不在读路径自动生成，损坏/异名目录一律拒启（fail-closed）。
     pub async fn open_or_init(dir: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(dir).await?;
         let mut max: Option<u32> = None;
         let mut any_entry = false;
         let mut rd = tokio::fs::read_dir(dir).await?;
         while let Some(e) = rd.next_entry().await? {
+            let fname = e.file_name();
+            if fname == "cmk" {
+                if !e.file_type().await?.is_dir() {
+                    return Err(Error::Crypto(format!(
+                        "KMS 目录 {} 的 cmk 项不是目录——拒启",
+                        dir.display()
+                    )));
+                }
+                continue; // 命名环单独校验
+            }
             any_entry = true;
-            if let Some(n) = parse_key_file(&e.file_name().to_string_lossy()) {
+            if let Some(n) = parse_key_file(&fname.to_string_lossy()) {
                 max = Some(max.map_or(n, |m: u32| m.max(n)));
             }
         }
@@ -250,11 +356,148 @@ impl KmsFileProvider {
                 0
             }
         };
-        Ok(Self {
+        let p = Self {
             dir: dir.to_path_buf(),
             current: n,
             current_key: Self::read_key(dir, n)?,
+        };
+        p.validate_cmk_root()?;
+        Ok(p)
+    }
+
+    /// `cmk/` 根校验：每个子目录名必须是合法 CMK 名、是目录、且至少有一把规范钥文件；
+    /// 任一不合规 → 拒启（防「拼错目录名 → 运行期才 404」与异名/穿越名混入）。
+    fn validate_cmk_root(&self) -> Result<()> {
+        let root = self.dir.join("cmk");
+        let rd = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Error::Crypto(format!("KMS CMK 目录名非 UTF-8：{root:?}")))?;
+            validate_cmk_name(&name)
+                .map_err(|e| Error::Crypto(format!("KMS CMK 目录名非法（{e}）——拒启")))?;
+            if !entry.file_type()?.is_dir() {
+                return Err(Error::Crypto(format!("KMS cmk 下 {name:?} 不是目录——拒启")));
+            }
+            let dir = root.join(&name);
+            let versions = list_key_versions(&dir)?;
+            if versions.is_empty() {
+                return Err(Error::Crypto(format!(
+                    "KMS CMK {name:?} 目录无合规主密钥文件（key-<n>.bin）——拒启"
+                )));
+            }
+            // 权限/长度校验：读一把当前钥即触发 read_key_file 的 0600+32B 检查
+            let _ = Self::read_key(&dir, *versions.last().unwrap())?;
+        }
+        Ok(())
+    }
+
+    fn cmk_dir(&self, name: &str) -> Result<PathBuf> {
+        validate_cmk_name(name)?;
+        Ok(self.dir.join("cmk").join(name))
+    }
+
+    /// 命名 CMK 的当前版本号；不存在 → `InvalidArgument`（客户端可选错名，400）。
+    pub fn ensure_cmk(&self, name: &str) -> Result<u32> {
+        let dir = self.cmk_dir(name)?;
+        let versions = match std::fs::read_dir(&dir) {
+            Ok(_) => list_key_versions(&dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        versions.last().copied().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "KMS CMK {name:?} 不存在或未配置（cmk/{name}/key-0.bin）"
+            ))
         })
+    }
+
+    /// 当前版本的钥字节（wrap 用）；不存在 → InvalidArgument（同上，客户端可纠正）。
+    fn cmk_current_key(&self, name: &str) -> Result<(u32, [u8; KEY_LEN])> {
+        let dir = self.cmk_dir(name)?;
+        let n = self.ensure_cmk(name)?;
+        Ok((n, Self::read_key(&dir, n)?))
+    }
+
+    /// 新建命名 CMK（`key-0`，0600）。已存在 → InvalidArgument（不覆盖、不轮换）。
+    pub async fn create_cmk(&self, name: &str) -> Result<u32> {
+        let dir = self.cmk_dir(name)?;
+        tokio::fs::create_dir_all(&dir).await?;
+        if !list_key_versions(&dir)?.is_empty() {
+            return Err(Error::InvalidArgument(format!("KMS CMK {name:?} 已存在")));
+        }
+        if std::fs::read_dir(&dir)?.next().is_some() {
+            return Err(Error::Crypto(format!(
+                "KMS CMK {name:?} 目录非空但无合规钥——拒绝生成 key-0（防覆盖/混淆）"
+            )));
+        }
+        Self::write_new(&dir, 0).await?;
+        Ok(0)
+    }
+
+    /// 命名 CMK 轮换：新增 `key-<max+1>` 并置为当前；旧版本保留（旧对象仍可解）。
+    pub async fn rotate_cmk(&self, name: &str) -> Result<u32> {
+        let dir = self.cmk_dir(name)?;
+        let cur = self.ensure_cmk(name)?;
+        let next = cur.checked_add(1).ok_or_else(|| {
+            Error::Crypto(format!(
+                "CMK {name:?} 版本号溢出（current={cur}）——需人工整理"
+            ))
+        })?;
+        Self::write_new(&dir, next).await?;
+        Ok(next)
+    }
+
+    /// 全部命名 CMK 快照（名/当前版本/版本表/mtime；无 `cmk/` = 空表）。
+    pub fn list_cmks(&self) -> Result<Vec<CmkInfo>> {
+        let root = self.dir.join("cmk");
+        let rd = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in rd {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if validate_cmk_name(&name).is_err() || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = root.join(&name);
+            let versions = list_key_versions(&dir)?;
+            let Some(&current) = versions.last() else {
+                continue;
+            };
+            let updated_nanos = std::fs::metadata(Self::key_path(&dir, current))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            out.push(CmkInfo {
+                name,
+                current,
+                versions,
+                updated_nanos,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// 当前版本的指纹（SHA-256 前 8 字节 hex）——审计/运维关联用，**不回钥字节**。
+    pub fn cmk_fingerprint(&self, name: &str) -> Result<String> {
+        use sha2::{Digest as _, Sha256};
+        let (_, key) = self.cmk_current_key(name)?;
+        Ok(hex::encode(&Sha256::digest(key)[..8]))
     }
 
     /// 当前主密钥编号（落对象 meta 的 key_id 由 wrap 返回值携带，此值供运维/日志）。
@@ -298,7 +541,32 @@ impl KeyProvider for KmsFileProvider {
         Ok((wrap_with(&self.current_key, dek)?, key_id_of(self.current)))
     }
 
+    async fn wrap_dek_named(
+        &self,
+        dek: &[u8; KEY_LEN],
+        cmk: Option<&str>,
+    ) -> Result<(Vec<u8>, String)> {
+        let Some(name) = cmk else {
+            return self.wrap_dek(dek).await;
+        };
+        let (n, key) = self.cmk_current_key(name)?;
+        Ok((wrap_with(&key, dek)?, cmk_key_id(name, n)))
+    }
+
     async fn unwrap_dek(&self, wrapped: &[u8], key_id: &str) -> Result<[u8; KEY_LEN]> {
+        // 显式 CMK：`cmk:<name>:k<n>` → 命名环；缺失/坏名 → Crypto（数据面 fail-closed）
+        if let Some((name, n)) = parse_cmk_key_id(key_id) {
+            let dir = self
+                .cmk_dir(name)
+                .map_err(|_| Error::Crypto(format!("key_id 形态非法：{key_id:?}")))?;
+            let key = Self::read_key(&dir, n).map_err(|e| match e {
+                Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Error::Crypto(
+                    format!("CMK {name:?} 的 key-{n} 不存在（已轮换且未保留？）"),
+                ),
+                other => other,
+            })?;
+            return unwrap_with(&key, wrapped);
+        }
         // 规范形态校验：只认 "k<n>"（"k+1"/"k01" 等价异形一律拒——与文件名口径同规）
         let n: u32 = key_id
             .strip_prefix('k')
@@ -863,6 +1131,200 @@ mod tests {
             open_secret(&p, &short).await.unwrap_err(),
             Error::Crypto(_)
         ));
+    }
+
+    // ---------- 3.16：显式 CMK（命名环） ----------
+
+    /// 名白名单 = 路径白名单：穿越/大写/空/超长一律拒；线格式接受裸名与 ARN。
+    #[test]
+    fn cmk_name_validation_and_parsing() {
+        let max = "a".repeat(CMK_NAME_MAX);
+        for ok in ["a", "tenant-a", "k0", "a-b-c", max.as_str()] {
+            assert!(validate_cmk_name(ok).is_ok(), "{ok:?} 应合法");
+        }
+        let too_long = "a".repeat(CMK_NAME_MAX + 1);
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "A",
+            "a_b",
+            "a.b",
+            "a/b",
+            "..",
+            "a b",
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(validate_cmk_name(bad), Err(Error::InvalidArgument(_))),
+                "{bad:?} 应拒"
+            );
+        }
+        assert_eq!(parse_cmk_id("tenant-a").unwrap(), "tenant-a");
+        assert_eq!(
+            parse_cmk_id(" arn:aws:kms:us-east-1:000000000000:key/tenant-a ").unwrap(),
+            "tenant-a"
+        );
+        for bad in [
+            "",
+            "..",
+            "x/y",
+            "arn:aws:kms:us-east-1:000000000000:alias/tenant-a",
+            "arn:aws:kms:key/",
+        ] {
+            assert!(parse_cmk_id(bad).is_err(), "{bad:?} 应拒");
+        }
+        assert_eq!(cmk_key_id("t-1", 7), "cmk:t-1:k7");
+        assert_eq!(parse_cmk_key_id("cmk:t-1:k7"), Some(("t-1", 7)));
+        for bad in [
+            "cmk:t-1:k01",
+            "cmk:t-1:k+1",
+            "cmk:T:k0",
+            "cmk::k0",
+            "cmk:t-1",
+            "k0",
+        ] {
+            assert_eq!(parse_cmk_key_id(bad), None, "{bad:?} 应拒");
+        }
+    }
+
+    /// 创建 → wrap/unwrap → 轮换（旧 wrap 仍可解）→ 重启；跨 CMK 解不开。
+    #[tokio::test]
+    async fn cmk_create_roundtrip_rotation_and_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("kms");
+        let p = KmsFileProvider::open_or_init(&dir).await.unwrap();
+        // 未创建：写路径 400，读路径绝不生成目录/钥
+        assert!(matches!(
+            p.wrap_dek_named(&new_dek(), Some("tenant-a")).await,
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(
+            !dir.join("cmk/tenant-a").exists(),
+            "读/写路径不得自动生成 CMK"
+        );
+        // 创建：key-0、0600
+        assert_eq!(p.create_cmk("tenant-a").await.unwrap(), 0);
+        let key0 = dir.join("cmk/tenant-a/key-0.bin");
+        assert_eq!(
+            std::fs::metadata(&key0).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "CMK 钥文件必须 0600"
+        );
+        let dek = new_dek();
+        let (w0, kid0) = p.wrap_dek_named(&dek, Some("tenant-a")).await.unwrap();
+        assert_eq!(kid0, "cmk:tenant-a:k0");
+        assert_eq!(p.unwrap_dek(&w0, &kid0).await.unwrap(), dek);
+        // 缺失版本：Crypto，且不得生成 key-1
+        assert!(matches!(
+            p.unwrap_dek(&w0, "cmk:tenant-a:k1").await,
+            Err(Error::Crypto(_))
+        ));
+        assert!(!dir.join("cmk/tenant-a/key-1.bin").exists());
+        // 跨 CMK：另一把钥解不开
+        p.create_cmk("tenant-b").await.unwrap();
+        let dek_b = new_dek();
+        let (wb, _) = p.wrap_dek_named(&dek_b, Some("tenant-b")).await.unwrap();
+        assert!(matches!(
+            p.unwrap_dek(&wb, &kid0).await,
+            Err(Error::Crypto(_))
+        ));
+        // 轮换：新写 k1；旧 wrap 依 k0 可解
+        assert_eq!(p.rotate_cmk("tenant-a").await.unwrap(), 1);
+        let (w1, kid1) = p.wrap_dek_named(&dek, Some("tenant-a")).await.unwrap();
+        assert_eq!(kid1, "cmk:tenant-a:k1");
+        assert_eq!(p.unwrap_dek(&w0, "cmk:tenant-a:k0").await.unwrap(), dek);
+        assert_eq!(p.unwrap_dek(&w1, &kid1).await.unwrap(), dek);
+        assert_ne!(w0, w1);
+        // 重启：当前版本 k1，旧版本仍可解
+        let p2 = KmsFileProvider::open_or_init(&dir).await.unwrap();
+        assert_eq!(p2.ensure_cmk("tenant-a").unwrap(), 1);
+        assert_eq!(p2.unwrap_dek(&w0, "cmk:tenant-a:k0").await.unwrap(), dek);
+        assert_eq!(p2.unwrap_dek(&w1, "cmk:tenant-a:k1").await.unwrap(), dek);
+        // 列表：按名排序、版本表、指纹只含 hex（无钥字节）
+        let list = p2.list_cmks().unwrap();
+        assert_eq!(
+            list.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["tenant-a", "tenant-b"]
+        );
+        assert_eq!(list[0].versions, vec![0, 1]);
+        assert_eq!(list[0].current, 1);
+        assert!(list[0].updated_nanos > 0);
+        let fp = p2.cmk_fingerprint("tenant-a").unwrap();
+        assert_eq!(fp.len(), 16);
+        assert!(fp.bytes().all(|b| b.is_ascii_hexdigit()));
+        // 重复创建 / 未知轮换 → 400
+        assert!(matches!(
+            p2.create_cmk("tenant-a").await,
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            p2.rotate_cmk("nope").await,
+            Err(Error::InvalidArgument(_))
+        ));
+        // None 保持默认环行为（k<n>）
+        let (_, kid) = p2.wrap_dek_named(&new_dek(), None).await.unwrap();
+        assert_eq!(kid, "k0");
+    }
+
+    /// `cmk/` 根：异名/空目录/非目录项/权限过宽 → 拒启（读路径不修不建）。
+    #[tokio::test]
+    async fn cmk_dir_validation_rejects_bad_layout() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("kms");
+        let p = KmsFileProvider::open_or_init(&dir).await.unwrap();
+        p.create_cmk("good-name").await.unwrap();
+        assert!(KmsFileProvider::open_or_init(&dir).await.is_ok());
+        // 异名目录
+        std::fs::create_dir_all(dir.join("cmk/Bad_Name")).unwrap();
+        assert!(matches!(
+            KmsFileProvider::open_or_init(&dir).await,
+            Err(Error::Crypto(_))
+        ));
+        std::fs::remove_dir_all(dir.join("cmk/Bad_Name")).unwrap();
+        // 空 CMK 目录（无 key-<n>.bin）
+        std::fs::create_dir_all(dir.join("cmk/empty")).unwrap();
+        assert!(matches!(
+            KmsFileProvider::open_or_init(&dir).await,
+            Err(Error::Crypto(_))
+        ));
+        std::fs::remove_dir_all(dir.join("cmk/empty")).unwrap();
+        // 权限过宽
+        let key = dir.join("cmk/good-name/key-0.bin");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            KmsFileProvider::open_or_init(&dir).await,
+            Err(Error::Crypto(_))
+        ));
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // cmk 项是文件不是目录
+        let td2 = tempfile::tempdir().unwrap();
+        let dir2 = td2.path().join("kms");
+        let p2 = KmsFileProvider::open_or_init(&dir2).await.unwrap();
+        let _ = p2;
+        std::fs::write(dir2.join("cmk"), b"not a dir").unwrap();
+        assert!(matches!(
+            KmsFileProvider::open_or_init(&dir2).await,
+            Err(Error::Crypto(_))
+        ));
+    }
+
+    /// SSE-S3 单钥 provider 不支持显式 CMK（fail-closed，绝不回退默认钥）。
+    #[tokio::test]
+    async fn file_provider_rejects_named_cmk() {
+        let td = tempfile::tempdir().unwrap();
+        let p = FileKeyProvider::open_or_init(&td.path().join("master.key"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            p.wrap_dek_named(&new_dek(), Some("tenant-a")).await,
+            Err(Error::Crypto(_))
+        ));
+        let dek = new_dek();
+        let (w, _) = p.wrap_dek_named(&dek, None).await.unwrap();
+        assert_eq!(p.unwrap_dek(&w, "file").await.unwrap(), dek);
     }
 
     /// 并发首启竞态：败者先读到半写文件 → 有界重试等到 32B 写完即成功（不误报损坏）。

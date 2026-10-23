@@ -238,12 +238,14 @@ pub enum EncSpec {
     SseS3,
     /// SSE-KMS（文件型实现）：多主密钥目录 provider（key_id "k<n>"）。
     SseKms,
+    /// SSE-KMS 显式 CMK：命名环的当前版本（key_id "cmk:<name>:k<n>"）。
+    SseKmsCmk(String),
     /// SSE-C：客户端钥直接作单元 AEK（无信封；key_id "sse-c"）。
     SseC(SseCKey),
 }
 
 /// 密钥 provider 组合（切片 3 的双 provider 路由面提前落定）：
-/// wrap 按 spec 选路；unwrap 按记录里的 key_id 路由（"file" → 文件、前缀 "k" → KMS 目录）。
+/// wrap 按 spec 选路；unwrap 按记录里的 key_id 路由（"file" → 文件、前缀 "k"/"cmk:" → KMS 目录）。
 pub struct EncState {
     pub file: Option<Arc<FileKeyProvider>>,
     pub kms: Option<Arc<KmsFileProvider>>,
@@ -257,7 +259,7 @@ impl EncState {
                 .as_deref()
                 .map(|p| p as &dyn KeyProvider)
                 .ok_or_else(|| Error::Crypto("SSE-S3 未配置文件主密钥 provider".into())),
-            EncSpec::SseKms => self
+            EncSpec::SseKms | EncSpec::SseKmsCmk(_) => self
                 .kms
                 .as_deref()
                 .map(|p| p as &dyn KeyProvider)
@@ -275,7 +277,7 @@ impl EncState {
                 .ok_or_else(|| {
                     Error::Crypto("记录 key_id=\"file\" 但未配置文件主密钥 provider".into())
                 })
-        } else if key_id.starts_with('k') {
+        } else if key_id.starts_with('k') || key_id.starts_with("cmk:") {
             self.kms
                 .as_deref()
                 .map(|p| p as &dyn KeyProvider)
@@ -354,6 +356,7 @@ impl UnitCtx {
                 wrapped_dek_hex: String::new(),
                 nonce_seed_hex: hex::encode(seed),
                 sse_c_key_md5: Some(k.md5_b64().to_string()),
+                kms_key_id: None,
             };
             return Ok((
                 Self {
@@ -366,9 +369,14 @@ impl UnitCtx {
         }
         let state =
             state.ok_or_else(|| Error::Crypto("未配置加密（init_encryption 未调用）".into()))?;
+        // 显式 CMK 的 key_id 由 provider 生成（`cmk:<name>:k<n>`）；用户态 id 随记录回显。
+        let cmk = match &spec {
+            EncSpec::SseKmsCmk(name) => Some(name.clone()),
+            _ => None,
+        };
         let provider = state.provider_for_spec(spec)?;
         let dek = kms::new_dek();
-        let (wrapped, key_id) = provider.wrap_dek(&dek).await?;
+        let (wrapped, key_id) = provider.wrap_dek_named(&dek, cmk.as_deref()).await?;
         let seed = new_seed();
         let rec = EncryptionRecord {
             algorithm: ALGO.to_string(),
@@ -376,6 +384,7 @@ impl UnitCtx {
             wrapped_dek_hex: hex::encode(&wrapped),
             nonce_seed_hex: hex::encode(seed),
             sse_c_key_md5: None,
+            kms_key_id: cmk,
         };
         Ok((
             Self {
@@ -554,6 +563,7 @@ mod tests {
             wrapped_dek_hex: w.into(),
             nonce_seed_hex: s.into(),
             sse_c_key_md5: m.map(str::to_string),
+            kms_key_id: None,
         };
         let f = |rec: EncryptionRecord, k: Option<SseCKey>| {
             futures::executor::block_on(UnitCtx::for_read(
