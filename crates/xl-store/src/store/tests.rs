@@ -1085,6 +1085,58 @@ async fn list_with_prefix_and_delimiter() {
     assert_eq!(prefixed.common_prefixes, vec!["docs/deep/".to_string()]);
 }
 
+/// V1 marker + delimiter 跨页：CommonPrefixes 必须按全局字典序占位，
+/// 用“最后输出（对象/CP 取大）”续页不得丢 CP 或重复对象。
+#[tokio::test]
+async fn list_marker_delimiter_pagination_no_loss() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    for k in ["a.txt", "b/1", "b/2", "b/3", "c.txt", "d/1", "d/2", "e.txt"] {
+        s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    let mut marker: Option<String> = None;
+    let mut seen_objects: Vec<String> = Vec::new();
+    let mut seen_cps: Vec<String> = Vec::new();
+    loop {
+        let page = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    delimiter: Some("/".into()),
+                    max_keys: Some(2),
+                    marker: marker.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        seen_objects.extend(page.objects.iter().map(|o| o.key.clone()));
+        seen_cps.extend(page.common_prefixes.iter().cloned());
+        if !page.is_truncated {
+            break;
+        }
+        // V1 NextMarker = 已返回输出（对象/CP）的字典序最大者
+        let last = page
+            .objects
+            .last()
+            .map(|o| o.key.clone())
+            .into_iter()
+            .chain(page.common_prefixes.last().cloned())
+            .max();
+        marker = Some(last.expect("truncated page must have output"));
+    }
+    seen_cps.sort();
+    seen_cps.dedup();
+    assert_eq!(
+        seen_objects,
+        vec!["a.txt", "c.txt", "e.txt"],
+        "对象跨页不得丢失/重复"
+    );
+    assert_eq!(seen_cps, vec!["b/", "d/"], "CommonPrefixes 跨页不得丢失");
+}
+
 #[tokio::test]
 async fn list_pagination() {
     let (s, _d) = store().await;
