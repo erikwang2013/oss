@@ -1511,6 +1511,199 @@ async fn encryption_cmk_admin_api() {
     assert_eq!(rows.len(), 1);
 }
 
+/// CMK rewrap / 删除 API：默认 dry-run、有引用 409 fail-closed（force 不放宽已知引用）、
+/// rewrap 后引用切到当前版本、引用清零后可删；audit 只记名/版本/数量，绝不记钥字节。
+#[tokio::test]
+async fn encryption_cmk_rewrap_and_delete_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store
+        .init_encryption(
+            Some(dir.path().join("master.key")),
+            Some(dir.path().join("kms")),
+        )
+        .await
+        .unwrap();
+    let kms = st.store.enc_state().unwrap().kms.clone().unwrap();
+    kms.create_cmk("tenant-a").await.unwrap();
+    st.store.create_bucket("alpha").await.unwrap();
+    let body = bytes::Bytes::from(vec![7u8; 300_000]);
+    let body_stream = body.clone();
+    let info = st
+        .store
+        .put_object_stream_with_meta(
+            "alpha",
+            "k",
+            Box::pin(futures::stream::once(async move { Ok(body_stream) })),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Off,
+            Some(xl_store::crypto::EncSpec::SseKmsCmk("tenant-a".into())),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.encryption.as_ref().unwrap().key_id, "cmk:tenant-a:k0");
+    let vid = info.version_id.clone().unwrap();
+    kms.rotate_cmk("tenant-a").await.unwrap();
+    let key_hex: String = std::fs::read(dir.path().join("kms/cmk/tenant-a/key-0.bin"))
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let cmk_url = format!("{base}/api/v1/encryption/cmks/tenant-a");
+    let rewrap_url = format!("{cmk_url}/rewrap");
+
+    // 非管理员全部 403
+    assert_eq!(
+        client
+            .delete(&cmk_url)
+            .bearer_auth(&bob)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .post(&rewrap_url)
+            .bearer_auth(&bob)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+
+    // 默认 dry-run：只报告，不写
+    let v: serde_json::Value = client
+        .post(&rewrap_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["apply"], false);
+    assert_eq!(v["candidates"], 1);
+    assert_eq!(v["rewrapped"], 0);
+    assert_eq!(v["items"][0]["status"], "preview");
+    assert_eq!(v["items"][0]["old_key_id"], "cmk:tenant-a:k0");
+    let (_, before) = st.store.get_object("alpha", "k").await.unwrap();
+    assert_eq!(before, body);
+    let refs = st.store.cmk_references("tenant-a").await.unwrap();
+    assert_eq!(
+        refs.refs[0].key_id, "cmk:tenant-a:k0",
+        "dry-run 不得改 meta"
+    );
+
+    // apply：旧版本重加密到当前版本
+    let v: serde_json::Value = client
+        .post(&rewrap_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"apply": true, "limit": 10}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["rewrapped"], 1);
+    assert_eq!(v["failed"], 0);
+    assert_eq!(v["items"][0]["new_key_id"], "cmk:tenant-a:k1");
+    let (info, got) = st.store.get_object("alpha", "k").await.unwrap();
+    assert_eq!(got, body);
+    assert_eq!(info.version_id.as_deref(), Some(vid.as_str()));
+
+    // 仍有引用（现在是 k1）→ 删除 409；force 不得绕过已知引用
+    for q in ["", "?force=true"] {
+        let r = client
+            .delete(format!("{cmk_url}{q}"))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409, "有引用必须 fail-closed（{q}）");
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["deleted"], false);
+        assert_eq!(v["references"], 1);
+        assert_eq!(v["reason"], "references");
+        assert_eq!(v["refs"][0]["key_id"], "cmk:tenant-a:k1");
+    }
+
+    // 引用清零 → 删除成功；列表空
+    assert!(st.store.delete_object("alpha", "k").await.unwrap());
+    let r = client
+        .delete(&cmk_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["deleted"], true);
+    assert_eq!(v["purged"], true);
+    assert_eq!(v["references"], 0);
+    let v: serde_json::Value = client
+        .get(format!("{base}/api/v1/encryption/cmks"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!({"cmks": []}));
+    // 未知 CMK → 400（客户端可纠正）
+    let r = client
+        .post(format!("{base}/api/v1/encryption/cmks/ghost/rewrap"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // 审计：rewrap + delete 各一行；detail 只含名/版本/数量/指纹，绝不含钥字节
+    for (op, needle) in [
+        ("control:cmk-rewrap", "rewrapped=1"),
+        ("control:cmk-delete", "purged=true"),
+    ] {
+        let rows = st
+            .db
+            .list_audit(&oss_server::db::AuditFilter {
+                limit: 10,
+                decision: None,
+                from: None,
+                to: None,
+                uid: None,
+                op: Some(op),
+                bucket: None,
+                key_prefix: None,
+            })
+            .await
+            .unwrap();
+        assert!(!rows.is_empty(), "{op} 应有审计");
+        let detail = rows[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("tenant-a") && detail.contains(needle));
+        assert!(!detail.contains(&key_hex), "审计泄漏钥字节");
+    }
+}
+
 // ---------- M8 S6 缺口 B：通知 CRUD / 死信 / Select 代理 / IAM 预设 ----------
 
 /// 通知配置：GET/PUT/DELETE 往返（与 S3 面同源）、非法 ARN 400、>100 targets 400、非桶主 403。

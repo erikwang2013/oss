@@ -299,6 +299,25 @@ pub struct CmkInfo {
     pub updated_nanos: i64,
 }
 
+/// 删除中的 CMK 隔离句柄（审计/报告用：名字 + 旧版本清单；**不含钥字节**）。
+#[derive(Debug, Clone)]
+pub struct CmkQuarantine {
+    name: String,
+    versions: Vec<u32>,
+    path: PathBuf,
+}
+
+impl CmkQuarantine {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 隔离时的全部版本（升序；current = 末位）。
+    pub fn versions(&self) -> &[u32] {
+        &self.versions
+    }
+}
+
 /// 列出目录内全部规范 key 版本（空目录 → 空表）。
 fn list_key_versions(dir: &Path) -> Result<Vec<u32>> {
     let mut out = Vec::new();
@@ -426,8 +445,15 @@ impl KmsFileProvider {
     }
 
     /// 新建命名 CMK（`key-0`，0600）。已存在 → InvalidArgument（不覆盖、不轮换）。
+    /// 同名隔离目录存在（删除进行中/崩溃残留）→ 拒绝：若允许重建，恢复时两套 key-0
+    /// 冲突，旧对象将永久失钥。
     pub async fn create_cmk(&self, name: &str) -> Result<u32> {
         let dir = self.cmk_dir(name)?;
+        if self.has_quarantine(name)? {
+            return Err(Error::InvalidArgument(format!(
+                "KMS CMK {name:?} 处于删除隔离（.cmk-trash 有残留）——先完成清理再创建"
+            )));
+        }
         tokio::fs::create_dir_all(&dir).await?;
         if !list_key_versions(&dir)?.is_empty() {
             return Err(Error::InvalidArgument(format!("KMS CMK {name:?} 已存在")));
@@ -452,6 +478,93 @@ impl KmsFileProvider {
         })?;
         Self::write_new(&dir, next).await?;
         Ok(next)
+    }
+
+    /// 删除隔离根：`.cmk-trash/`（在 `cmk/` 之外——open_or_init 的命名环校验不扫它，
+    /// 残留隔离目录既不会被当成 CMK，也不会阻塞默认环启动）。
+    fn trash_root(&self) -> PathBuf {
+        self.dir.join(".cmk-trash")
+    }
+
+    /// 同名隔离是否已存在（隔离期禁止重建同名 CMK：否则恢复时 key-0 冲突、旧对象永久失钥）。
+    fn has_quarantine(&self, name: &str) -> Result<bool> {
+        let root = self.trash_root();
+        let rd = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let prefix = format!("{name}.");
+        for entry in rd {
+            if entry?.file_name().to_string_lossy().starts_with(&prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// 删除第一步：把 CMK 目录**原子**移入 `.cmk-trash/`。移动后：
+    /// wrap 立即失败（新对象不再引用该钥），unwrap 也失败（调用方必须先做引用扫描——
+    /// 有引用的 CMK 不允许走到这里）。失败/中止用 [`Self::restore_cmk`] 原样复原。
+    pub async fn quarantine_cmk(&self, name: &str) -> Result<CmkQuarantine> {
+        let dir = self.cmk_dir(name)?;
+        if self.has_quarantine(name)? {
+            return Err(Error::Crypto(format!(
+                "KMS CMK {name:?} 已有隔离残留（上次删除未清完）——先人工清理 .cmk-trash"
+            )));
+        }
+        let versions = match self.ensure_cmk(name) {
+            Ok(last) => {
+                let mut v = list_key_versions(&dir)?;
+                debug_assert_eq!(v.last().copied(), Some(last));
+                v.shrink_to_fit();
+                v
+            }
+            Err(e) => return Err(e),
+        };
+        let trash = self.trash_root();
+        tokio::fs::create_dir_all(&trash).await?;
+        // 名白名单不含 '.'，`<name>.<uuid>` 前缀判别无歧义（同名 CMK 不会误配别人的隔离目录）
+        let dest = trash.join(format!("{name}.{}", uuid::Uuid::new_v4()));
+        tokio::fs::rename(&dir, &dest).await?;
+        if let Ok(d) = tokio::fs::File::open(&trash).await
+            && let Err(e) = d.sync_all().await
+        {
+            tracing::warn!(dir = %trash.display(), error = %e, "CMK 隔离目录 fsync 失败（容忍）");
+        }
+        Ok(CmkQuarantine {
+            name: name.to_string(),
+            versions,
+            path: dest,
+        })
+    }
+
+    /// 删除中止：把隔离目录原样移回 `cmk/<name>/`。
+    /// 隔离期间同名 CMK 已被重建（直接改盘可绕过 API 闸）→ 拒绝合并，留隔离目录待人工处置。
+    pub async fn restore_cmk(&self, q: &CmkQuarantine) -> Result<()> {
+        let dir = self.cmk_dir(&q.name)?;
+        if tokio::fs::try_exists(&dir).await? {
+            return Err(Error::Crypto(format!(
+                "CMK {:?} 在隔离期间被重建——隔离钥不得自动合并，请人工处置 .cmk-trash 残留",
+                q.name
+            )));
+        }
+        tokio::fs::rename(&q.path, &dir).await?;
+        Ok(())
+    }
+
+    /// 删除第二步：清掉隔离目录。`Ok(true)` = 钥材料已彻底移除；
+    /// `Ok(false)` = 仍有残骸（已 warn；钥已不在活动命名空间，provider 无法再使用，需人工清理）。
+    pub async fn purge_quarantine(&self, q: &CmkQuarantine) -> Result<bool> {
+        match tokio::fs::remove_dir_all(&q.path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => {
+                tracing::warn!(cmk = %q.name, path = %q.path.display(), error = %e,
+                    "CMK 隔离目录清理失败（钥已不可用，需人工清理残骸）");
+                Ok(false)
+            }
+        }
     }
 
     /// 全部命名 CMK 快照（名/当前版本/版本表/mtime；无 `cmk/` = 空表）。
@@ -1266,6 +1379,54 @@ mod tests {
         // None 保持默认环行为（k<n>）
         let (_, kid) = p2.wrap_dek_named(&new_dek(), None).await.unwrap();
         assert_eq!(kid, "k0");
+    }
+
+    /// 删除生命周期：隔离 → 恢复 / 隔离 → 销毁；隔离期禁止重建同名 CMK。
+    #[tokio::test]
+    async fn cmk_quarantine_restore_and_purge() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("kms");
+        let p = KmsFileProvider::open_or_init(&dir).await.unwrap();
+        p.create_cmk("tenant-a").await.unwrap();
+        p.rotate_cmk("tenant-a").await.unwrap();
+        let dek = new_dek();
+        let (w0, kid0) = p.wrap_dek_named(&dek, Some("tenant-a")).await.unwrap();
+        // 隔离：目录移出活动命名空间；wrap/unwrap/list 全部消失，重启不报错
+        let q = p.quarantine_cmk("tenant-a").await.unwrap();
+        assert_eq!(q.name(), "tenant-a");
+        assert_eq!(q.versions(), &[0, 1]);
+        assert!(q.path.starts_with(dir.join(".cmk-trash")));
+        assert!(!dir.join("cmk/tenant-a").exists());
+        assert!(matches!(
+            p.unwrap_dek(&w0, &kid0).await,
+            Err(Error::Crypto(_) | Error::InvalidArgument(_))
+        ));
+        assert!(p.list_cmks().unwrap().is_empty());
+        let p2 = KmsFileProvider::open_or_init(&dir).await.unwrap();
+        assert!(p2.list_cmks().unwrap().is_empty());
+        // 隔离期同名创建必须拒绝（否则恢复时两套 key-0 冲突）
+        assert!(matches!(
+            p2.create_cmk("tenant-a").await,
+            Err(Error::InvalidArgument(_))
+        ));
+        // 恢复：原样回来，旧 wrap 可解
+        p.restore_cmk(&q).await.unwrap();
+        assert_eq!(p.list_cmks().unwrap()[0].versions, vec![0, 1]);
+        assert_eq!(p.unwrap_dek(&w0, &kid0).await.unwrap(), dek);
+        // 再次隔离 → 销毁：钥材料消失，同名 CMK 可重新创建（旧对象将永久失钥——上层负责拒删有引用的 CMK）
+        let q = p.quarantine_cmk("tenant-a").await.unwrap();
+        assert!(p.purge_quarantine(&q).await.unwrap());
+        assert!(!q.path.exists());
+        assert_eq!(p.create_cmk("tenant-a").await.unwrap(), 0);
+        assert!(matches!(
+            p.unwrap_dek(&w0, &kid0).await,
+            Err(Error::Crypto(_))
+        ));
+        // 隔离目录被外部重建：恢复拒绝（不覆盖活动 CMK）
+        p.create_cmk("tenant-b").await.unwrap();
+        let qb = p.quarantine_cmk("tenant-b").await.unwrap();
+        std::fs::create_dir_all(dir.join("cmk/tenant-b")).unwrap();
+        assert!(matches!(p.restore_cmk(&qb).await, Err(Error::Crypto(_))));
     }
 
     /// `cmk/` 根：异名/空目录/非目录项/权限过宽 → 拒启（读路径不修不建）。
