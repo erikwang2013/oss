@@ -1038,7 +1038,6 @@ async fn destination_revoked_marks_job_error() {
     add_bucket(&st, "src", None).await;
     add_bucket(&st, "dst", None).await;
     let sub = st.db.create_user("sub", "pw", false).await.unwrap();
-    add_bucket(&st, "subsrc", Some(sub)).await;
 
     st.db
         .set_permissions(
@@ -1054,20 +1053,20 @@ async fn destination_revoked_marks_job_error() {
         .unwrap();
     let c = cfg("c1", "Daily", "dst");
     st.inventory
-        .put_config("subsrc", &user(sub, false), &c)
+        .put_config("src", &user(sub, false), &c)
         .await
         .unwrap();
 
     // 撤掉目标桶写权限后运行：run/job 报错
     st.db.set_permissions(sub, &[]).await.unwrap();
     let key = "manual-revoked";
-    let job = enqueue_run(&st.db, "subsrc", "c1", key, Some(uid), now())
+    let job = enqueue_run(&st.db, "src", "c1", key, Some(uid), now())
         .await
         .unwrap()
         .unwrap();
     run_once(&st).await;
 
-    let run = run_row(&st, "subsrc", "c1", key).await;
+    let run = run_row(&st, "src", "c1", key).await;
     assert_eq!(run.state, "error");
     assert_eq!(run.manifest_key, None);
     assert!(
@@ -1307,12 +1306,14 @@ async fn destination_account_validation_and_arn() {
     ));
 
     // S3 线格式同样接受并回显 destination AccountId。
+    let mut s3c = cfg("s3c", "Daily", "dst");
+    s3c.destination.s3_bucket_destination.account_id = Some(LEGACY_ACCOUNT.into());
     let svc = s3(&st);
     svc.put_bucket_inventory_configuration(as_user(
         req(PutBucketInventoryConfigurationInput {
             bucket: "src".into(),
             id: "s3c".into(),
-            inventory_configuration: c,
+            inventory_configuration: s3c,
             expected_bucket_owner: None,
         }),
         admin,
