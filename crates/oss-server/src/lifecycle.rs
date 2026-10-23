@@ -60,10 +60,12 @@ struct Progress {
 }
 
 /// 4.10：单阶段单轮页预算（默认 100 页 × 1000 条，测试注入小值验证跨轮续扫）。
+/// H3：`max_key_versions` 是单键版本链硬上限——超长链不整链读入内存，跳过该键继续。
 #[derive(Clone, Copy)]
 pub struct SweepLimits {
     pub max_pages: usize,
     pub page_size: usize,
+    pub max_key_versions: usize,
 }
 
 impl Default for SweepLimits {
@@ -71,8 +73,15 @@ impl Default for SweepLimits {
         Self {
             max_pages: 100,
             page_size: 1000,
+            max_key_versions: 10_000,
         }
     }
+}
+
+/// H3：跳过整条版本链的排他 marker。键校验拒绝控制字符，`key\0` 严格大于该键、
+/// 小于任何合法后继键，可让 ListObjectVersions 从下一个键开始（不会漏 delete-marker 键）。
+fn past_key(key: &str) -> String {
+    format!("{key}\u{0}")
 }
 
 const STAGE_CURRENT: &str = "current";
@@ -230,6 +239,7 @@ async fn run_rule(
                 spec,
                 mode,
                 now,
+                job,
                 &mut progress,
                 limits,
             )
@@ -243,6 +253,7 @@ async fn run_rule(
                 spec,
                 mode,
                 now,
+                job,
                 &mut progress,
                 limits,
             )
@@ -257,6 +268,7 @@ async fn run_rule(
                 spec,
                 mode,
                 now,
+                job,
                 &mut progress,
                 limits,
             )
@@ -264,8 +276,17 @@ async fn run_rule(
             err = err.or(e);
         }
         if kinds.abort_mpu {
-            let e =
-                expire_abort_mpu(state, bucket, &rule_key, spec, now, &mut progress, limits).await;
+            let e = expire_abort_mpu(
+                state,
+                bucket,
+                &rule_key,
+                spec,
+                now,
+                job,
+                &mut progress,
+                limits,
+            )
+            .await;
             err = err.or(e);
         }
     }
@@ -287,6 +308,13 @@ async fn run_rule(
         .await
     {
         tracing::warn!(error = %e, "lifecycle：job 收尾失败");
+    }
+}
+
+/// M2：长扫描心跳（每页一次），避免周期孤儿回收把仍在跑的 lifecycle 作业误标 error。
+async fn heartbeat(state: &AppState, job: i64) {
+    if let Err(e) = state.db.job_heartbeat(job, now_secs()).await {
+        tracing::warn!(job, error = %e, "lifecycle：作业心跳失败");
     }
 }
 
@@ -316,6 +344,7 @@ async fn expire_current(
     spec: &LifecycleRuleSpec,
     mode: VersioningMode,
     now: i64,
+    job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
 ) -> Option<String> {
@@ -376,6 +405,7 @@ async fn expire_current(
             Err(xl_store::error::Error::NoSuchBucket(_)) => return None,
             Err(e) => return Some(format!("列举失败: {e}")),
         };
+        heartbeat(state, job).await;
         for o in &page.objects {
             progress.scanned += 1;
             // 删前复读：按列举快照直删会误删「列举后刚被覆盖」的新内容。
@@ -437,6 +467,7 @@ async fn expire_eodm(
     spec: &LifecycleRuleSpec,
     mode: VersioningMode,
     _now: i64,
+    job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
 ) -> Option<String> {
@@ -456,7 +487,8 @@ async fn expire_eodm(
     };
     let mut vid_marker: Option<String> = None;
     let mut pages = 0usize;
-    loop {
+    let mut over_cap = 0usize;
+    'pages: loop {
         pages += 1;
         let page = match state
             .store
@@ -473,6 +505,7 @@ async fn expire_eodm(
             Err(xl_store::error::Error::NoSuchBucket(_)) => return None,
             Err(e) => return Some(format!("版本列举失败: {e}")),
         };
+        heartbeat(state, job).await;
         for e in &page.entries {
             if last_key.as_deref() != Some(e.key.as_str()) {
                 // 先在 key 边界把上一组处理完，再判断预算（整链必须读全才能排名）。
@@ -491,6 +524,22 @@ async fn expire_eodm(
                 last_key = Some(e.key.clone());
                 group.clear();
             }
+            if group.len() >= limits.max_key_versions {
+                // H3：单键链超限 → 丢弃已收条目，直接跳到下一个键（不整链读入、不空转）。
+                over_cap += 1;
+                progress.skipped += 1;
+                tracing::warn!(bucket, key = %e.key, cap = limits.max_key_versions,
+                    "lifecycle：单键版本链超过上限，跳过该键");
+                last_key = None;
+                group.clear();
+                key_marker = Some(past_key(&e.key));
+                vid_marker = None;
+                if pages >= limits.max_pages {
+                    save_cursor(state, bucket, rule_id, STAGE_EODM, key_marker.as_deref()).await;
+                    return Some("单轮页上限截停（版本过多），下轮续扫".into());
+                }
+                continue 'pages;
+            }
             group.push(e.clone());
         }
         if !page.is_truncated {
@@ -500,8 +549,19 @@ async fn expire_eodm(
         vid_marker = page.next_version_id_marker;
     }
     save_cursor(state, bucket, rule_id, STAGE_EODM, None).await;
-    if let Some(k) = last_key {
-        return eodm_group(state, bucket, spec, &k, &group, mode, progress).await;
+    let group_err = if let Some(k) = last_key {
+        eodm_group(state, bucket, spec, &k, &group, mode, progress).await
+    } else {
+        None
+    };
+    if group_err.is_some() {
+        return group_err;
+    }
+    if over_cap > 0 {
+        return Some(format!(
+            "{over_cap} 个键的版本链超过 {} 条，已跳过",
+            limits.max_key_versions
+        ));
     }
     None
 }
@@ -557,6 +617,7 @@ async fn expire_noncurrent(
     spec: &LifecycleRuleSpec,
     mode: VersioningMode,
     now: i64,
+    job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
 ) -> Option<String> {
@@ -580,7 +641,8 @@ async fn expire_noncurrent(
     };
     let mut vid_marker: Option<String> = None;
     let mut pages = 0usize;
-    loop {
+    let mut over_cap = 0usize;
+    'pages: loop {
         pages += 1;
         let page = match state
             .store
@@ -597,6 +659,7 @@ async fn expire_noncurrent(
             Err(xl_store::error::Error::NoSuchBucket(_)) => return None,
             Err(e) => return Some(format!("版本列举失败: {e}")),
         };
+        heartbeat(state, job).await;
         for e in &page.entries {
             if last_key.as_deref() != Some(e.key.as_str()) {
                 // 同 EODM：先处理完上一组，再在 key 边界判断预算。
@@ -622,6 +685,29 @@ async fn expire_noncurrent(
                 last_key = Some(e.key.clone());
                 group.clear();
             }
+            if group.len() >= limits.max_key_versions {
+                // H3：同 EODM——超长链不读入内存，跳过该键并直接续到下一个键。
+                over_cap += 1;
+                progress.skipped += 1;
+                tracing::warn!(bucket, key = %e.key, cap = limits.max_key_versions,
+                    "lifecycle：单键版本链超过上限，跳过该键");
+                last_key = None;
+                group.clear();
+                key_marker = Some(past_key(&e.key));
+                vid_marker = None;
+                if pages >= limits.max_pages {
+                    save_cursor(
+                        state,
+                        bucket,
+                        rule_id,
+                        STAGE_NONCURRENT,
+                        key_marker.as_deref(),
+                    )
+                    .await;
+                    return Some("单轮页上限截停（版本过多），下轮续扫".into());
+                }
+                continue 'pages;
+            }
             group.push(e.clone());
         }
         if !page.is_truncated {
@@ -631,8 +717,19 @@ async fn expire_noncurrent(
         vid_marker = page.next_version_id_marker;
     }
     save_cursor(state, bucket, rule_id, STAGE_NONCURRENT, None).await;
-    if let Some(k) = last_key {
-        return noncurrent_group(state, bucket, spec, nc, &k, &group, mode, now, progress).await;
+    let group_err = if let Some(k) = last_key {
+        noncurrent_group(state, bucket, spec, nc, &k, &group, mode, now, progress).await
+    } else {
+        None
+    };
+    if group_err.is_some() {
+        return group_err;
+    }
+    if over_cap > 0 {
+        return Some(format!(
+            "{over_cap} 个键的版本链超过 {} 条，已跳过",
+            limits.max_key_versions
+        ));
     }
     None
 }
@@ -743,12 +840,14 @@ struct MpuCursor {
 
 /// 未完成分段上传过期（AbortIncompleteMultipartUpload）：仅按前缀 + 创建天数。
 /// MPU 没有对象事件/复制语义（不是已存在对象），中止后只计数。
+#[allow(clippy::too_many_arguments)]
 async fn expire_abort_mpu(
     state: &AppState,
     bucket: &str,
     rule_id: &str,
     spec: &LifecycleRuleSpec,
     now: i64,
+    job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
 ) -> Option<String> {
@@ -788,6 +887,7 @@ async fn expire_abort_mpu(
             Ok(p) => p,
             Err(e) => return Some(format!("MPU 列举失败: {e}")),
         };
+        heartbeat(state, job).await;
         let mut last: Option<(String, String)> = None;
         for u in &page.uploads {
             last = Some((u.key.clone(), u.upload_id.clone()));
@@ -808,7 +908,12 @@ async fn expire_abort_mpu(
                 Ok(()) => progress.deleted += 1,
                 // 并发完成/已删：目标状态已达成。
                 Err(xl_store::error::Error::NoSuchUpload(_)) => {}
-                Err(e) => return Some(format!("中止未完成分段上传失败: {e}")),
+                // M3：单个上传的持久错误不得卡死整条规则/后续 MPU；跳过并计数，游标照常前移。
+                Err(e) => {
+                    progress.skipped += 1;
+                    tracing::warn!(bucket, key = %u.key, upload_id = %u.upload_id, error = %e,
+                        "lifecycle：中止 MPU 失败，跳过该上传");
+                }
             }
         }
         if !page.is_truncated {

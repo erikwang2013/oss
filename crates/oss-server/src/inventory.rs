@@ -334,11 +334,17 @@ impl InventoryRunner {
         // 3.6：增量模式 per config（默认全量）。水位是「上次扫描开始时刻」：
         // 本轮输出 last_modified >= 水位 的对象/版本，扫描开始时刻作为新水位。
         // 增量清单是**非 AWS 扩展**：无版本控制桶的删除无法表现为条目（没有墓碑）。
-        let incremental = self
+        let incremental = match self
             .db
             .inventory_incremental_get(&p.bucket, &p.config_id)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("增量模式读取失败: {e}");
+                return Err(self.fail(run.id, run.job_id, msg).await);
+            }
+        };
         let prev_mark = if incremental {
             match self
                 .db
@@ -396,7 +402,12 @@ impl InventoryRunner {
         }
         match result {
             Ok(()) => {
-                // 数据与 manifest 已写成功才推进水位；失败则本节报错（下轮重扫，重复不丢）。
+                // H1：先把 run 落 done，再推进水位。done 失败时水位不动，任务重试会重放
+                // 同一区间（重复条目安全）；反向顺序在崩溃时会永久漏掉本轮对象。
+                self.db
+                    .inventory_run_finish(run.id, "done", Some(&manifest_key), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if let Some(inc) = inc
                     && let Err(e) = self
                         .db
@@ -409,17 +420,10 @@ impl InventoryRunner {
                         )
                         .await
                 {
-                    let msg = format!("增量水位写入失败: {e}");
-                    let _ = self
-                        .db
-                        .inventory_run_finish(run.id, "error", Some(&manifest_key), Some(&msg))
-                        .await;
-                    return Err(msg);
+                    // run 已 done；水位保持旧值 → 下轮重复输出（覆盖完整），仅告警。
+                    tracing::warn!(bucket = %p.bucket, config = %p.config_id, error = %e,
+                        "inventory：增量水位写入失败，下轮将重复输出上一区间");
                 }
-                self.db
-                    .inventory_run_finish(run.id, "done", Some(&manifest_key), None)
-                    .await
-                    .map_err(|e| e.to_string())?;
                 Ok("done".to_string())
             }
             Err(e) => {
