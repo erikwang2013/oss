@@ -143,3 +143,44 @@ async fn mesh_mtls_requires_client_identity() {
         "mTLS 必须拒绝无客户端证书的 mesh 连接"
     );
 }
+
+/// mesh gRPC 通道热加载：客户端 CA 轮换后下一次 RPC 用新物料重建通道；
+/// 坏物料被 reload 拒绝（旧快照与代次都不变），旧通道继续服务。
+#[tokio::test]
+async fn mesh_channel_adopts_tls_reload_and_rejects_bad_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let other = TestCa::new();
+    let (cert, key) = ca.issue(&["127.0.0.1"], false);
+    // 服务端叶证书由 ca 签发；客户端初始只信任无关的 other（模拟轮换前状态）。
+    let tls = material(dir.path(), &other.pem, (&cert, &key), None, None);
+    let (addr, _task) = start_mesh(&tls).await;
+    let nodes = vec![("n1".to_string(), addr.to_string())];
+    let mesh = xl_client::TonicMesh::new_with_tls_watch(
+        "n1",
+        "mesh-secret",
+        &nodes,
+        Some(tls.tonic_client_watch()),
+    )
+    .unwrap();
+    assert!(mesh.health("n1").await.is_err(), "错 CA 必须失败");
+    assert_eq!(tls.generation(), 0);
+
+    // 只换客户端信任根（服务端证书不变）：成功 reload 后代次推进，下一次 RPC 重建通道。
+    common::tls::write_pem(dir.path(), "ca.crt", &ca.pem);
+    assert!(tls.reload().unwrap(), "CA 内容变化必须触发重建");
+    assert_eq!(tls.generation(), 1);
+    assert!(
+        mesh.health("n1").await.is_ok(),
+        "reload 后下一次 RPC 必须使用新 TLS 物料"
+    );
+
+    // 坏 CA：reload fail closed；快照/代次不变，旧通道继续可用。
+    std::fs::write(dir.path().join("ca.crt"), b"not a pem").unwrap();
+    assert!(tls.reload().is_err(), "非法 CA 必须被拒绝");
+    assert_eq!(tls.generation(), 1, "失败的 reload 不得推进代次");
+    assert!(
+        mesh.health("n1").await.is_ok(),
+        "坏物料不得破坏已建立的 mesh 通道"
+    );
+}

@@ -11,9 +11,10 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
@@ -205,15 +206,26 @@ impl Interceptor for SecretInterceptor {
 
 type MeshChannel = tonic::codegen::InterceptedService<Channel, TokenInterceptor>;
 
+/// mesh TLS 热加载信号：值为当前 tonic 客户端配置（`None` = 明文）。
+pub type TlsWatch = watch::Receiver<Option<tonic::transport::ClientTlsConfig>>;
+
 /// 节点间传输的 tonic 实现（lazy connect：首次 RPC 才建连，不阻塞启动）。
 pub struct TonicMesh {
-    clients: HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>,
+    interceptor: TokenInterceptor,
+    nodes: Vec<(String, String)>,
+    connect: Duration,
+    request: Duration,
+    /// `Some` = 订阅 TLS 物料热加载；成功 reload 后下一次 RPC 前重建全部通道。
+    /// 旧通道上已发出的请求持有自己的 client clone，继续完成（不中断在途 RPC）。
+    tls_watch: Option<Mutex<TlsWatch>>,
+    clients: RwLock<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>>,
 }
 
 impl std::fmt::Debug for TonicMesh {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let clients = self.clients.read().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("TonicMesh")
-            .field("nodes", &self.clients.keys().collect::<Vec<_>>())
+            .field("nodes", &clients.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
@@ -268,6 +280,64 @@ impl TonicMesh {
         tls: Option<tonic::transport::ClientTlsConfig>,
     ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
+        let clients = Self::build_clients(&interceptor, nodes, connect, request, tls.as_ref())?;
+        Ok(Self {
+            interceptor,
+            nodes: nodes.to_vec(),
+            connect,
+            request,
+            tls_watch: None,
+            clients: RwLock::new(clients),
+        })
+    }
+
+    /// mesh TLS 热加载版本：`tls` 为 `None` 时保持明文；`Some` 时以当前值为初始配置，
+    /// 之后每次成功 reload 发布的配置都会在下次 RPC 前重建通道（构建失败保留旧通道）。
+    pub fn new_with_tls_watch(
+        _self_id: &str,
+        secret: &str,
+        nodes: &[(String, String)],
+        tls: Option<TlsWatch>,
+    ) -> Result<Self> {
+        Self::new_with_timeouts_tls_watch(
+            _self_id,
+            secret,
+            nodes,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            tls,
+        )
+    }
+
+    /// [`Self::new_with_tls_watch`] 的连接/请求超时可配版本。
+    pub fn new_with_timeouts_tls_watch(
+        _self_id: &str,
+        secret: &str,
+        nodes: &[(String, String)],
+        connect: Duration,
+        request: Duration,
+        tls: Option<TlsWatch>,
+    ) -> Result<Self> {
+        let interceptor = TokenInterceptor::new(secret)?;
+        let initial = tls.as_ref().map(|rx| rx.borrow().clone()).unwrap_or(None);
+        let clients = Self::build_clients(&interceptor, nodes, connect, request, initial.as_ref())?;
+        Ok(Self {
+            interceptor,
+            nodes: nodes.to_vec(),
+            connect,
+            request,
+            tls_watch: tls.map(Mutex::new),
+            clients: RwLock::new(clients),
+        })
+    }
+
+    fn build_clients(
+        interceptor: &TokenInterceptor,
+        nodes: &[(String, String)],
+        connect: Duration,
+        request: Duration,
+        tls: Option<&tonic::transport::ClientTlsConfig>,
+    ) -> Result<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>> {
         let scheme = if tls.is_some() { "https" } else { "http" };
         let mut clients = HashMap::with_capacity(nodes.len());
         for (id, addr) in nodes {
@@ -279,7 +349,7 @@ impl TonicMesh {
                 .map_err(|e| Error::Encode(format!("节点 {id} 地址非法（{addr}）：{e}")))?
                 .connect_timeout(connect)
                 .timeout(request);
-            if let Some(t) = &tls {
+            if let Some(t) = tls {
                 ep = ep
                     .tls_config(t.clone())
                     .map_err(|e| Error::Encode(format!("节点 {id} TLS 配置失败：{e}")))?;
@@ -290,12 +360,46 @@ impl TonicMesh {
                 xl_proto::mesh_client::MeshClient::with_interceptor(ch, interceptor.clone()),
             );
         }
-        Ok(Self { clients })
+        Ok(clients)
     }
 
-    fn client(&self, node: &str) -> Result<&xl_proto::mesh_client::MeshClient<MeshChannel>> {
+    /// TLS 物料变化时重建全部通道并整体替换；构建失败保留旧通道（fail closed）。
+    fn refresh_tls(&self) {
+        let Some(rx) = &self.tls_watch else { return };
+        let mut rx = rx.lock().unwrap_or_else(|e| e.into_inner());
+        if !rx.has_changed().unwrap_or(false) {
+            return;
+        }
+        let tls = rx.borrow_and_update().clone();
+        match Self::build_clients(
+            &self.interceptor,
+            &self.nodes,
+            self.connect,
+            self.request,
+            tls.as_ref(),
+        ) {
+            Ok(fresh) => {
+                let nodes = fresh.len();
+                *self.clients.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+                tracing::info!(
+                    nodes,
+                    tls = tls.is_some(),
+                    "mesh gRPC TLS 物料已热加载，通道已重建"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "mesh gRPC TLS 通道重建失败，继续使用旧通道")
+            }
+        }
+    }
+
+    fn client(&self, node: &str) -> Result<xl_proto::mesh_client::MeshClient<MeshChannel>> {
+        self.refresh_tls();
         self.clients
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(node)
+            .cloned()
             .ok_or_else(|| Error::Encode(format!("mesh：未知节点 {node}（不在拓扑表内）")))
     }
 }
@@ -305,7 +409,6 @@ impl MeshTransport for TonicMesh {
     async fn health(&self, node: &str) -> Result<mesh::NodeHealth> {
         let resp = self
             .client(node)?
-            .clone()
             .health(xl_proto::Empty {})
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -325,7 +428,6 @@ impl MeshTransport for TonicMesh {
     async fn write_shard(&self, node: &str, w: mesh::ShardWrite) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .write_shard(xl_proto::ShardWrite {
                 bucket: w.bucket,
                 key: w.key,
@@ -349,7 +451,6 @@ impl MeshTransport for TonicMesh {
     async fn read_shard(&self, node: &str, r: mesh::ShardRead) -> Result<Option<bytes::Bytes>> {
         let resp = self
             .client(node)?
-            .clone()
             .read_shard(xl_proto::ShardRead {
                 bucket: r.bucket,
                 key: r.key,
@@ -369,7 +470,6 @@ impl MeshTransport for TonicMesh {
     async fn delete_version(&self, node: &str, d: mesh::VersionDirRef) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .delete_version(dir_ref_to_proto(d))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -379,7 +479,6 @@ impl MeshTransport for TonicMesh {
     async fn delete_shard(&self, node: &str, d: mesh::ShardDelete) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .delete_shard(xl_proto::ShardDelete {
                 bucket: d.bucket,
                 key: d.key,
@@ -397,7 +496,6 @@ impl MeshTransport for TonicMesh {
     async fn recycle_version(&self, node: &str, d: mesh::VersionDirRef) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .recycle_version(dir_ref_to_proto(d))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -407,7 +505,6 @@ impl MeshTransport for TonicMesh {
     async fn prepare_meta(&self, node: &str, m: mesh::MetaWrite) -> Result<mesh::MetaAck> {
         let resp = self
             .client(node)?
-            .clone()
             .prepare_meta(meta_write_to_proto(m))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -417,7 +514,6 @@ impl MeshTransport for TonicMesh {
     async fn commit_meta(&self, node: &str, m: mesh::MetaWrite) -> Result<mesh::MetaAck> {
         let resp = self
             .client(node)?
-            .clone()
             .commit_meta(meta_write_to_proto(m))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -427,7 +523,6 @@ impl MeshTransport for TonicMesh {
     async fn abort_meta(&self, node: &str, m: mesh::MetaWrite) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .abort_meta(meta_write_to_proto(m))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -437,7 +532,6 @@ impl MeshTransport for TonicMesh {
     async fn read_meta(&self, node: &str, r: mesh::MetaRead) -> Result<mesh::MetaSnapshot> {
         let resp = self
             .client(node)?
-            .clone()
             .read_meta(meta_read_to_proto(r))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -452,7 +546,6 @@ impl MeshTransport for TonicMesh {
     async fn delete_meta(&self, node: &str, r: mesh::MetaRead) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .delete_meta(meta_read_to_proto(r))
             .await
             .map_err(|e| rpc_err(node, e))?
@@ -462,7 +555,6 @@ impl MeshTransport for TonicMesh {
     async fn delete_bucket_dir(&self, node: &str, bucket: &str) -> Result<()> {
         let resp = self
             .client(node)?
-            .clone()
             .delete_bucket(xl_proto::BucketRef {
                 bucket: bucket.to_string(),
             })
@@ -474,7 +566,6 @@ impl MeshTransport for TonicMesh {
     async fn ensure_bucket(&self, n: &str, b: &str) -> Result<()> {
         let resp = self
             .client(n)?
-            .clone()
             .ensure_bucket(xl_proto::BucketRef {
                 bucket: b.to_string(),
             })
@@ -486,7 +577,6 @@ impl MeshTransport for TonicMesh {
     async fn list_bucket_dirs(&self, n: &str) -> Result<Vec<String>> {
         let resp = self
             .client(n)?
-            .clone()
             .list_buckets(xl_proto::Empty {})
             .await
             .map_err(|e| rpc_err(n, e))?
@@ -505,7 +595,6 @@ impl MeshTransport for TonicMesh {
         };
         let resp = self
             .client(n)?
-            .clone()
             .list_local(req)
             .await
             .map_err(|e| rpc_err(n, e))?
@@ -540,7 +629,6 @@ impl MeshTransport for TonicMesh {
         };
         let resp = self
             .client(n)?
-            .clone()
             .list_uploads_local(req)
             .await
             .map_err(|e| rpc_err(n, e))?
@@ -568,7 +656,6 @@ impl MeshTransport for TonicMesh {
         };
         let resp = self
             .client(n)?
-            .clone()
             .lock(xl_proto::LockReq {
                 bucket: req.bucket,
                 key: req.key,
@@ -589,7 +676,6 @@ impl MeshTransport for TonicMesh {
         let mesh::ControlWrite::BucketRowSet { bucket, set } = w;
         let resp = self
             .client(node)?
-            .clone()
             .control_write(xl_proto::ControlWriteReq {
                 kind: 0, // BUCKET_ROW_SET
                 a: bucket,
@@ -659,7 +745,6 @@ impl MeshTransport for TonicMesh {
         };
         let resp = self
             .client(n)?
-            .clone()
             .control_query(req)
             .await
             .map_err(|e| rpc_err(n, e))?

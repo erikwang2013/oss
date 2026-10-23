@@ -352,11 +352,11 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            let mesh = Arc::new(xl_client::TonicMesh::new_with_tls(
+            let mesh = Arc::new(xl_client::TonicMesh::new_with_tls_watch(
                 &cl.node_id,
                 &cl.secret,
                 &pairs,
-                tls.peer_tls().then(|| tls.tonic_client()),
+                tls.peer_tls().then(|| tls.tonic_client_watch()),
             )?);
             // 放置开关：只认 None/"v1"/"v2"——未知值 fail-closed（静默降级为 v1 会让
             // 「以为开了 v2」的运维在 rebalance 里得到空跑报告）
@@ -424,13 +424,13 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            let mesh = Arc::new(xl_client::TonicMesh::new_with_timeouts_tls(
+            let mesh = Arc::new(xl_client::TonicMesh::new_with_timeouts_tls_watch(
                 &st.node_id,
                 &st.mesh_secret,
                 &pairs,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_millis(st.mesh_timeout_ms),
-                tls.peer_tls().then(|| tls.tonic_client()),
+                tls.peer_tls().then(|| tls.tonic_client_watch()),
             )?);
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
                 sets,

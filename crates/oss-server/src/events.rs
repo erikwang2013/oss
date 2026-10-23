@@ -200,13 +200,20 @@ struct KafkaRoute {
 }
 
 /// Kafka 通知器：target id → `[[kafka.targets]]` 静态映射；Client 按 target id
-/// 惰性建连并缓存（TLS/SASL 不同的目标不得共享连接）。
+/// 惰性建连并缓存（TLS/SASL 不同的目标不得共享连接）。缓存值带 TLS 物料代次：
+/// 代次变化（证书/CA/身份轮换）后旧客户端不再复用，下次发送前重建。
 pub struct KafkaNotifier {
     routes: std::collections::HashMap<String, KafkaRoute>,
     clients: tokio::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<rskafka::client::Client>>,
+        std::collections::HashMap<String, (u64, std::sync::Arc<rskafka::client::Client>)>,
     >,
     tls: std::sync::Arc<crate::tls::Tls>,
+}
+
+/// 仅 TLS 路由需要随物料代次重建：SASL 凭据来自启动期配置（无运行期热加载源），
+/// 重建客户端时按原配置重新认证，不额外引入凭据轮换语义。
+fn kafka_cache_stale(tls: bool, cached_generation: u64, generation: u64) -> bool {
+    tls && cached_generation != generation
 }
 
 impl KafkaNotifier {
@@ -247,9 +254,25 @@ impl KafkaNotifier {
         key: &str,
         route: &KafkaRoute,
     ) -> Result<std::sync::Arc<rskafka::client::Client>, NotifyFailure> {
-        // 双检：先读缓存，miss 则持锁建连（并发首用只建一次）
-        if let Some(c) = self.clients.lock().await.get(key) {
-            return Ok(c.clone());
+        // 代次在读取 TLS 配置之前取：若 reload 恰好发生在两者之间，只会得到
+        // 「旧代次 + 新配置」，下次发送多重建一次，不会用旧配置冒领新代次。
+        let generation = self.tls.generation();
+        // 双检：先读缓存，代次未变则直接用；否则丢弃旧客户端（在途 send 持有自己的
+        // Arc 继续完成/失败，outbox at-least-once 语义不变），miss 则持锁建连。
+        {
+            let mut clients = self.clients.lock().await;
+            if let Some((cached, client)) = clients.get(key) {
+                if !kafka_cache_stale(route.tls, *cached, generation) {
+                    return Ok(client.clone());
+                }
+                tracing::info!(
+                    target_id = key,
+                    cached_generation = *cached,
+                    generation,
+                    "Kafka TLS 物料已热加载，重建客户端"
+                );
+                clients.remove(key);
+            }
         }
         // 退避收紧：连接/元数据重试带 5s deadline——broker 停机时 send 会**及时失败**
         // 让 outbox 记 attempts 并按 R1 重试；rskafka 默认（max 500s 且无 deadline）会
@@ -278,10 +301,10 @@ impl KafkaNotifier {
         }
         let built = builder.build().await.map_err(|e| classify_kafka_err(&e))?;
         let shared = std::sync::Arc::new(built);
-        self.clients
-            .lock()
-            .await
-            .insert(key.to_string(), std::sync::Arc::clone(&shared));
+        self.clients.lock().await.insert(
+            key.to_string(),
+            (generation, std::sync::Arc::clone(&shared)),
+        );
         Ok(shared)
     }
 }
@@ -1211,6 +1234,15 @@ mod tests {
         assert!(classify_kafka_err(&mk(P::SaslAuthenticationFailed)).permanent);
         assert!(!classify_kafka_err(&mk(P::UnknownTopicOrPartition)).permanent);
         assert!(!classify_kafka_err(&mk(P::RequestTimedOut)).permanent);
+    }
+
+    /// TLS 物料代次变化只让 TLS 路由的缓存客户端失效；明文/SASL-only 路由不重建。
+    /// （SASL 凭据来自启动期配置，无运行期变化源。）
+    #[test]
+    fn kafka_tls_reload_invalidates_only_tls_clients() {
+        assert!(kafka_cache_stale(true, 0, 1), "TLS 路由代次变化必须重建");
+        assert!(!kafka_cache_stale(true, 1, 1), "代次未变复用客户端");
+        assert!(!kafka_cache_stale(false, 0, 1), "非 TLS 路由不随物料重建");
     }
 
     /// 切片 1（P3-b）：KafkaNotifier 的 unknown target → permanent（误配 11 次进死信，
