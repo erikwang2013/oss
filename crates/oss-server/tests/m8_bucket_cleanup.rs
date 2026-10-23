@@ -61,8 +61,17 @@ async fn seed(st: &AppState, bucket: &str, ap: &str) {
     .execute(st.db.pool())
     .await
     .unwrap();
-    st.ap_cache
-        .put(AccessPoint::from_row(ap.into(), bucket.into(), 0, None, REGION).unwrap());
+    st.ap_cache.put(
+        AccessPoint::from_row(
+            ap.into(),
+            bucket.into(),
+            0,
+            None,
+            REGION,
+            xl_s3::access::LEGACY_ACCOUNT,
+        )
+        .unwrap(),
+    );
 }
 
 async fn count(st: &AppState, sql: &str, binder: &str) -> i64 {
