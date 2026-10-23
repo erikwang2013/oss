@@ -6,7 +6,8 @@
 //! 4.7 加固：根目录视为信任根，但**根内任何路径段不得是符号链接**（否则 `link ->
 //! /etc/passwd` 或 `dir -> /tmp/outside` 会逃出根目录）。所有 open/mkdir/rename/unlink
 //! 走 `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` + `*at` 家族，父目录 fd 一旦
-//! 解析即固定，避免「检查后再替换成链接」的 TOCTOU。旧内核无 openat2 → fail closed。
+//! 解析即固定，避免「检查后再替换成链接」的 TOCTOU。Linux <5.6（无 openat2）与非
+//! Linux 回退为逐段 `openat(O_NOFOLLOW)`，仍拒绝任何链接组件。
 
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
@@ -15,11 +16,14 @@ use std::path::{Component, Path, PathBuf};
 use bytes::Bytes;
 use md5::Digest as _;
 use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
+use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::tier::{TierBackend, TierObject};
 
+#[cfg(target_os = "linux")]
 fn resolve_flags() -> ResolveFlags {
     ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS
 }
@@ -29,23 +33,47 @@ fn dir_flags() -> OFlags {
 }
 
 fn io_msg(what: &str, e: Errno) -> String {
-    if e == Errno::NOSYS {
-        return format!("{what}：内核不支持 openat2，拒绝访问（fail closed）");
-    }
     if e == Errno::LOOP {
-        return format!("{what}：路径包含符号链接，拒绝访问（fail closed）");
+        return format!("{what}：路径包含符号链接或非目录路径段，拒绝访问（fail closed）");
     }
     format!("{what}：{e}")
 }
 
-/// 相对根目录打开（openat2 + BENEATH + NO_SYMLINKS）。ENOENT/ENOTDIR 原样返回。
+/// 相对根目录打开。Linux 有 openat2 时用 BENEATH|NO_SYMLINKS；老内核（ENOSYS，<5.6）
+/// 与非 Linux 回退为逐段 openat(O_NOFOLLOW)——每段都不跟随链接，语义等价。
+/// ENOENT/ENOTDIR 原样返回（回退路径的中间段 ENOTDIR 统一折成 ELOOP）。
 fn open_beneath(dir: &OwnedFd, rel: &Path, flags: OFlags) -> Result<OwnedFd, Errno> {
-    rustix::fs::openat2(
+    #[cfg(target_os = "linux")]
+    match rustix::fs::openat2(
         dir,
         rel,
         flags | OFlags::CLOEXEC,
         Mode::empty(),
         resolve_flags(),
+    ) {
+        Err(Errno::NOSYS) => {} // 老内核：走便携回退
+        other => return other,
+    }
+    open_walk(dir, rel, flags)
+}
+
+/// 便携回退：逐段 openat(O_NOFOLLOW|O_DIRECTORY)，父目录 fd 逐级固定。
+fn open_walk(dir: &OwnedFd, rel: &Path, flags: OFlags) -> Result<OwnedFd, Errno> {
+    let comps: Vec<&std::ffi::OsStr> = rel.components().map(|c| c.as_os_str()).collect();
+    let (name, dirs) = comps.split_last().ok_or(Errno::INVAL)?;
+    let mut cur: Option<OwnedFd> = None;
+    for comp in dirs {
+        let base = cur.as_ref().unwrap_or(dir);
+        cur = Some(
+            rustix::fs::openat(base, *comp, dir_flags() | OFlags::NOFOLLOW, Mode::empty())
+                .map_err(|e| if e == Errno::NOTDIR { Errno::LOOP } else { e })?,
+        );
+    }
+    rustix::fs::openat(
+        cur.as_ref().unwrap_or(dir),
+        *name,
+        flags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
     )
 }
 
@@ -67,7 +95,7 @@ fn open_parent(root: &Path, rel: &Path, create: bool) -> Result<(OwnedFd, OsStri
     let mut cur = open_root(root)?;
     for comp in dirs {
         if create {
-            // EEXIST 正常；其它失败留给 openat2 报出具体原因。
+            // EEXIST 正常；其它失败留给 open_beneath 报出具体原因。
             let _ = rustix::fs::mkdirat(&cur, comp.as_os_str(), Mode::from_raw_mode(0o755));
         }
         cur = open_beneath(&cur, Path::new(comp), dir_flags())
@@ -162,7 +190,8 @@ fn get_blocking(root: &Path, rel: &Path) -> Result<Bytes, String> {
 
 fn head_blocking(root: &Path, rel: &Path) -> Result<Option<u64>, String> {
     let rootfd = open_root(root)?;
-    let fd = match open_beneath(&rootfd, rel, OFlags::PATH) {
+    // 用 RDONLY 而非 O_PATH：O_PATH 仅 Linux 有，便携回退/非 Linux 需要可移植 flag。
+    let fd = match open_beneath(&rootfd, rel, OFlags::RDONLY) {
         Ok(fd) => fd,
         Err(e) if e == Errno::NOENT || e == Errno::NOTDIR => return Ok(None),
         Err(e) => return Err(io_msg("本地 tier HEAD 失败", e)),
@@ -357,6 +386,37 @@ mod tests {
 
     fn etag(body: &[u8]) -> String {
         hex::encode(md5::Md5::digest(body))
+    }
+
+    /// M1：便携回退（无 openat2 的内核/非 Linux）同样按段拒绝链接，并打开正常路径。
+    #[test]
+    fn portable_walk_rejects_symlinks_and_opens_plain_path() {
+        use std::io::Read as _;
+
+        let d = tempfile::tempdir().unwrap();
+        let rootfd = open_root(d.path()).unwrap();
+        std::fs::create_dir_all(d.path().join("a/b")).unwrap();
+        std::fs::write(d.path().join("a/b/ok"), b"x").unwrap();
+        let fd = open_walk(&rootfd, Path::new("a/b/ok"), OFlags::RDONLY).unwrap();
+        let mut s = String::new();
+        std::fs::File::from(fd).read_to_string(&mut s).unwrap();
+        assert_eq!(s, "x");
+
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, d.path().join("a/linkdir")).unwrap();
+        assert_eq!(
+            open_walk(&rootfd, Path::new("a/linkdir/x"), OFlags::RDONLY).unwrap_err(),
+            Errno::LOOP,
+            "中间目录链接必须拒绝"
+        );
+        std::fs::write(outside.join("secret"), b"s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), d.path().join("a/b/evil")).unwrap();
+        assert_eq!(
+            open_walk(&rootfd, Path::new("a/b/evil"), OFlags::RDONLY).unwrap_err(),
+            Errno::LOOP,
+            "最终文件链接必须拒绝"
+        );
     }
 
     #[tokio::test]
