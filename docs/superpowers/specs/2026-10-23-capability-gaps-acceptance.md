@@ -1,7 +1,7 @@
 # 能力边界清零验收记录（2026-10-23）
 
 - 基线：`v1.13.1`（`a58d64a`）
-- 集成分支：`feat/capability-gaps`，验收 HEAD `6182b77`（产品代码等价于 `86616eb`，其后仅测试）
+- 集成分支：`feat/capability-gaps`，验收 HEAD `d43d908`（产品代码等价于 `86616eb`；其后仅测试与本文档）
 - 状态：实现、集成、聚焦测试与 S3 全量 e2e 完成；**未 push / tag / release**（等用户授权）
 - 构建环境：主机 `/home` 为 5400rpm 机械盘且被其它会话重压，集成验证统一使用
   `CARGO_TARGET_DIR=/tmp/target-retention`（SSD）；`CARGO_BUILD_JOBS=1`。
