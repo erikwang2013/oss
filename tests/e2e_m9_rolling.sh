@@ -163,6 +163,9 @@ items=d if isinstance(d,list) else d.get("buckets",[])
 print(any((b.get("name") if isinstance(b,dict) else b)==sys.argv[1] for b in items))' "$3" | grep -qx True; }
 poll_pred() { local n=$1; shift; for _ in $(seq 1 "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 leader_is() { [ "$(sf "$1" leader)" = "$2" ]; }
+# 全体重启后 leader 不保证仍是 node 1（Raft 任意 voter 可当选，election_timeout_ms=3000）；
+# A/B 都看到同一个非空 leader 即视为收敛，具体身份与后续用例无关。
+any_leader() { local a b; a=$(sf "$A" leader); b=$(sf "$B" leader); [ -n "$a" ] && [ "$a" != "0" ] && [ "$a" = "$b" ]; }
 members_are() { [ "$(status_json "$1" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -196,7 +199,8 @@ ck poll_pred 60 members_are "$A" 2
 ck timeout 20 "$OLD_BIN" raft-add-witness --config "$W/a/oss.toml" --node-id 3 --endpoint "$C"
 ck poll_pred 60 members_are "$A" 3
 BUCKET="rolling-$RANDOM"
-ck [ "$(bucket_code "$A" "$AT" "$BUCKET")" = 200 ]
+# 控制台建桶成功返回 204（与 e2e_m9 / e2e_m9_recovery 同口径）。
+ck [ "$(bucket_code "$A" "$AT" "$BUCKET")" = 204 ]
 ck poll_pred 30 has_bucket "$B" "$BT" "$BUCKET"
 pass "基线：全旧 3-voter 集群与 level-1 写入就绪"
 
@@ -250,7 +254,7 @@ mk_cfg b "$B_HTTP" "$REG_B" "$TOK_B" 2 false
 mk_witness_cfg c 3 "$C_HTTP"
 A_BIN="$OLD_BIN"; B_BIN="$OLD_BIN"; C_BIN="$OLD_BIN"
 ck start_a; ck start_b; ck start_c
-ck poll_pred 90 leader_is "$A" 1
+ck poll_pred 90 any_leader
 AT=$(login "$A" "$ADMIN" "$APW"); ck [ -n "$AT" ]
 U2="rollback-$RANDOM"
 ck [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$A/api/v1/users" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"username\":\"$U2\",\"password\":\"roll-pass-123\"}")" = 200 ]
@@ -266,7 +270,7 @@ mk_cfg b "$B_HTTP" "$REG_B" "$TOK_B" 2 false
 mk_witness_cfg c 3 "$C_HTTP"
 A_BIN="$NEW_BIN"; B_BIN="$NEW_BIN"; C_BIN="$OLD_BIN"
 ck start_a; ck start_b; ck start_c
-ck poll_pred 90 leader_is "$A" 1
+ck poll_pred 90 any_leader
 mk_witness_cfg d 4 "$D_HTTP"
 ck start_d
 OUT=$(timeout 30 "$NEW_BIN" raft-add-witness --config "$W/a/oss.toml" --node-id 4 --endpoint "$D" 2>&1); RC=$?
