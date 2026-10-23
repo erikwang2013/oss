@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#eef3f8" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0d1a2b" media="(prefers-color-scheme: dark)">
+    <meta name="author" content="艾瑞可 Erik">
+    <meta property="og:locale" content="zh_CN">
+    <meta name="color-scheme" content="light dark">
+    <title>版本日志 | oss（吞吞）</title>
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.14.0，包含 M1 到 M9 的功能迭代、修复与验收记录。">
+    <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
+    <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
+    <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
+    <link rel="manifest" href="manifest.webmanifest">
+    <meta property="og:type" content="article">
+    <meta property="og:site_name" content="oss（吞吞）">
+    <meta property="og:title" content="版本日志 | oss（吞吞）">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到能力边界清零；oss 的完整版本历史与 v1.14.0 变更。">
+    <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
+    <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="stylesheet" href="assets/css/site.css">
+    <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <header class="site-header">
+      <div class="wrap header-inner">
+        <a class="brand" href="./" aria-label="oss 吞吞首页">
+          <img class="brand-pet" src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="34" height="34" alt="">
+          <span class="brand-word">oss<span>吞吞</span></span>
+        </a>
+        <nav class="nav" aria-label="主导航">
+          <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+          <a href="index.html#iterations">迭代</a>
+          <a href="changelog.html" aria-current="page">版本</a>
+          <a href="install.html">安装</a>
+          <a href="usage.html">使用</a>
+          <a href="api.html">API 文档</a>
+          <a href="index.html#download">下载</a>
+        </nav>
+        <div class="header-actions">
+          <a class="btn btn-ghost btn-sm" href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav">菜单</button>
+        </div>
+      </div>
+      <nav class="mobile-nav" id="mobile-nav" aria-label="移动端导航" hidden>
+        <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+        <a href="index.html#iterations">迭代</a>
+        <a href="changelog.html" aria-current="page">版本</a>
+        <a href="install.html">安装</a>
+        <a href="usage.html">使用</a>
+        <a href="api.html">API 文档</a>
+        <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+      </nav>
+    </header>
+    <div id="top-sentinel" aria-hidden="true"></div>
+
+    <main id="main">
+      <div class="doc-hero">
+        <div class="wrap">
+          <h1>版本日志</h1>
+          <p>从 v1.0.0 的单盘内核，到 v1.14.0 的能力边界清零。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+        </div>
+      </div>
+
+      <div class="wrap doc-layout">
+        <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-14-0">v1.14.0</a>
+          <a href="#v1-13-1">v1.13.1</a>
+          <a href="#v1-13-0">v1.13.0</a>
+          <a href="#v1-12-0">v1.12.0</a>
+          <a href="#v1-11-0">v1.11.0</a>
+          <a href="#v1-10-0">v1.10.0</a>
+          <a href="#v1-9-0">v1.9.0</a>
+          <a href="#v1-8-0">v1.8.0</a>
+          <a href="#v1-7-0">v1.7.0</a>
+          <a href="#earlier">更早版本</a>
+        </aside>
+
+        <article class="prose">
+          <p>当前最新发布：<strong>v1.14.0</strong>（2026-10-23）。</p>
+
+          <div class="changelog-list">
+            <details class="changelog-entry" id="v1-14-0" open>
+              <summary><strong>v1.14.0</strong><time datetime="2026-10-23">2026-10-23</time><span>能力边界清零</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>S3</strong>：ListObjects v1；UploadPartCopy；ListMultipartUploads（集群并集）；GET/HEAD <code>partNumber</code>；多区间 Range 降级整对象与 HEAD Range；版本控制三态 / Suspended；noncurrent 生命周期；匿名 Principal；Put/GetObjectRetention 与控制台锁状态；<code>s3:ObjectAccessed:*</code> 事件。</li>
+                  <li><strong>TLS</strong>：监听器、witness、Raft/mesh、site/repl/tier 出站与 Kafka SASL/SSL 全链路；未配置 <code>[tls]</code> 时仍为明文。</li>
+                  <li><strong>M8</strong>：Inventory Parquet/Hive；tier 本地冷盘池与远端 GC；生命周期完整 Filter / Date / 多转换与控制台编辑器；Batch/Object Lambda WASM（<code>olap-wasm</code>）；AP DeleteObjects、<code>-s3alias</code> 与 SourceIp。</li>
+                  <li><strong>M9</strong>：Level B 滚动升级兼容窗口（wire/feature 头、<code>feature_level</code> 门控、成员预检、runbook 与 e2e 脚本）；数据面仍非滚动。</li>
+                  <li><strong>安全</strong>：AP 授权/执行一致性、SourceIp fail-closed、匿名审计限速；验收 0 Critical，2 High 已修复复审。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.14.0" target="_blank" rel="noopener">GitHub Release</a> · 验收记录：<code>docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md</code>；完整配置与边界见 README。</p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-13-1" open>
+              <summary><strong>v1.13.1</strong><time datetime="2026-10-22">2026-10-22</time><span>灾备恢复与控制面加固</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>force recovery 在初始化后固化基线快照并清理日志，新 learner 从快照取得恢复行。</li>
+                  <li>Raft RPC 增加 target node id 校验，B′ 复用旧 endpoint 时不再触发 openraft 日志回退 panic。</li>
+                  <li>转发的控制写与成员操作同样校验目标节点，stretch 配对身份改为镜像比较。</li>
+                  <li>cutover dry-run 输出字段级冲突；raft/sync 指标补齐语义说明。</li>
+                  <li>11 表三端字段级 diff 与灾备 e2e 纳入验收。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.13.1" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-13-0" open>
+              <summary><strong>v1.13.0</strong><time datetime="2026-10-22">2026-10-22</time><span>M9 同步强一致</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>sync 桶：remote-first PUT/MPU/Copy/删除，统一 origin version id，远端失败返回 503。</li>
+                  <li>stretch 2×6：两站点各 6 盘，EC 8+4，单站点故障 fail-closed。</li>
+                  <li>3-voter Raft 控制面：A/B 数据站点 + C witness，quorum 2，成员变更与 leader 单跳转发。</li>
+                  <li>11 表逻辑快照、M7 到 Raft cutover、raft-export、raft-force-recover、sync-reconcile。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.13.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-12-0">
+              <summary><strong>v1.12.0</strong><time datetime="2026-10-20">2026-10-20</time><span>M8 控制面</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>访问点与 Object Lambda，访问点策略与路由。</li>
+                  <li>S3 Batch Operations、Inventory、分层 Transition 与 Restore。</li>
+                  <li>控制台新增访问点、作业、分层、清单、通知、审计与设置页面。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.12.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-11-0">
+              <summary><strong>v1.11.0</strong><time datetime="2026-10-18">2026-10-18</time><span>M7 多站点异步复制</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>站点对、LWW 控制面 changelog、快照出货与对象复制 outbox。</li>
+                  <li>断连积压、重启追平、marker 与并发同 key 用例。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.11.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-10-0">
+              <summary><strong>v1.10.0</strong><time datetime="2026-10-18">2026-10-18</time><span>M6 数据流</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>事件通知与 Kafka 投递、死信与游标状态。</li>
+                  <li>S3 Select 查询与桶复制。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.10.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-9-0">
+              <summary><strong>v1.9.0</strong><time datetime="2026-10-17">2026-10-17</time><span>M5 安全与锁定</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>SSE-S3、SSE-KMS 与密钥库，访问密钥加密落库。</li>
+                  <li>对象锁、STS 临时凭据与桶策略审计。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.9.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-8-0">
+              <summary><strong>v1.8.0</strong><time datetime="2026-10-16">2026-10-16</time><span>扩展包与安全切片</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>扩展包 C1-C5 与集群修复。</li>
+                  <li>M5 安全切片 0-2：行一致性、密钥库与加密数据面。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.8.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="v1-7-0">
+              <summary><strong>v1.7.0</strong><time datetime="2026-10-15">2026-10-15</time><span>M4 运维与 IAM</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li>观测、流式路径、版本控制、heal/scrub、扩容与生命周期。</li>
+                  <li>桶策略、审计、多 set 与运维收尾。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.7.0" target="_blank" rel="noopener">GitHub Release</a></p>
+              </div>
+            </details>
+
+            <details class="changelog-entry" id="earlier">
+              <summary><strong>更早版本</strong><time>2026-10-12 至 2026-10-14</time><span>v1.0.0 到 v1.6.0</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>v1.6.0</strong>：Docker 密钥自动生成落盘，遗留清账。</li>
+                  <li><strong>v1.5.0</strong>：M3 分布式三切片、Docker Compose 与控制台改造。</li>
+                  <li><strong>v1.4.0</strong>：权限体系三面授权，M2b 多盘与 EC 收束。</li>
+                  <li><strong>v1.3.0</strong>：S3 协议补全，Content-MD5、checksum、Range 与 response-content-*。</li>
+                  <li><strong>v1.2.1 / v1.2.0</strong>：依赖升级与 aetherupload 协议迁移。</li>
+                  <li><strong>v1.1.0 到 v1.1.2</strong>：M2a Multipart、Range GET、流式 PUT、元数据与孤儿回收，项目命名吞吞。</li>
+                  <li><strong>v1.0.0</strong>：M1 单盘对象存储内核、S3 CRUD 与 SigV4。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">全部 Releases</a></p>
+              </div>
+            </details>
+          </div>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap footer-grid">
+        <div class="footer-brand">
+          <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
+          <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+        </div>
+        <div class="footer-links">
+          <h2>文档</h2>
+          <a href="install.html">安装</a>
+          <a href="usage.html">使用说明</a>
+          <a href="changelog.html">版本日志</a>
+          <a href="api.html">API 文档</a>
+        </div>
+        <div class="footer-links">
+          <h2>项目</h2>
+          <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="https://github.com/erikwang2013/oss/issues" target="_blank" rel="noopener">Issues</a>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+        </div>
+      </div>
+      <div class="wrap footer-legal">
+        <div class="footer-info" id="busuanzi">
+          <script async src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script>
+          <span id="busuanzi_container_site_pv">本站总访问量 <b id="busuanzi_value_site_pv">0</b> 次 👀</span>
+          <span class="dot">·</span>
+          <span id="busuanzi_container_site_uv">访客数 <b id="busuanzi_value_site_uv">0</b> 人次 🧑‍🚀</span>
+        </div>
+        <div class="legal-links">
+          <a href="https://beian.miit.gov.cn" target="_blank" rel="noopener">粤ICP备2020136226号-10</a>
+          <span>·</span>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+          <span>·</span>
+          <span>© <span data-year>2026</span> oss</span>
+        </div>
+      </div>
+    </footer>
+
+    <button class="to-top" id="to-top" type="button" aria-label="返回顶部" hidden>
+      <img src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="560" height="560" alt="" decoding="async">
+    </button>
+
+    <script src="assets/js/site.js" defer></script>
+  </body>
+</html>

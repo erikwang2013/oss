@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <title>OSS 对象生命周期</title>
+  <desc>对象在磁盘上的状态流转：暂存 → 数据就位 → xl.meta 提交可见；版本链、对象锁/保留期（M5/M8）、noncurrent 生命周期与崩溃残留回收（M2/M4）。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f59e0b"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="958" height="558" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 对象生命周期（盘上状态）</text>
+  <text x="40" y="70" font-size="12" fill="#64748b">读路径只信 xl.meta：提交之前的一切数据对客户端不可见；崩溃残留仅在盘上占空间，由 M2/M4 自检 / GC / fsck 回收</text>
+
+  <!-- 状态行 -->
+  <rect x="60" y="120" width="250" height="110" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="185" y="148" font-size="13" font-weight="600" fill="#0f172a" text-anchor="middle">暂存（staged）</text>
+  <text x="185" y="172" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">.oss.sys/tmp/&lt;uuid&gt;/</text>
+  <text x="185" y="188" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">{part.N.&lt;shard&gt;, 候选 xl.meta}</text>
+  <text x="185" y="212" font-size="10.5" fill="#64748b" text-anchor="middle">协议 ①② ｜ 读路径不可见</text>
+
+  <line x1="310" y1="175" x2="386" y2="175" stroke="#94a3b8" marker-end="url(#a)"/>
+  <text x="348" y="160" font-size="10" font-weight="600" fill="#0f172a" text-anchor="middle">③ 各盘 rename</text>
+
+  <rect x="390" y="120" width="250" height="110" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="515" y="148" font-size="13" font-weight="600" fill="#0f172a" text-anchor="middle">数据就位</text>
+  <text x="515" y="172" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">buckets/&lt;桶&gt;/&lt;对象&gt;/&lt;uuid&gt;/</text>
+  <text x="515" y="188" font-size="10" fill="#475569" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">{part.N.&lt;shard&gt;}</text>
+  <text x="515" y="212" font-size="10.5" fill="#64748b" text-anchor="middle">无 meta 引用，仍不可见</text>
+
+  <line x1="640" y1="175" x2="696" y2="175" stroke="#94a3b8" marker-end="url(#a)"/>
+  <text x="668" y="158" font-size="10" font-weight="600" fill="#b45309" text-anchor="middle">④ 提交点</text>
+  <text x="668" y="196" font-size="9.5" fill="#64748b" text-anchor="middle">xl.meta 翻转</text>
+
+  <rect x="700" y="120" width="220" height="110" rx="10" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <text x="810" y="148" font-size="13" font-weight="600" fill="#166534" text-anchor="middle">已提交（可见）</text>
+  <text x="810" y="172" font-size="10.5" fill="#374151" text-anchor="middle">xl.meta 指向版本目录</text>
+  <text x="810" y="188" font-size="10.5" fill="#374151" text-anchor="middle">HEAD / GET / List 可见</text>
+  <text x="810" y="212" font-size="10.5" fill="#64748b" text-anchor="middle">ETag = 明文整份 MD5</text>
+
+  <!-- 从「已提交」出发的流转 -->
+  <line x1="760" y1="230" x2="760" y2="272" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="810" y1="230" x2="810" y2="272" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="390" y1="230" x2="300" y2="364" stroke="#f59e0b" stroke-dasharray="5 4" marker-end="url(#w)"/>
+
+  <rect x="60" y="276" width="290" height="76" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="205" y="300" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">DELETE（无版本号）</text>
+  <text x="205" y="320" font-size="9.5" fill="#64748b" text-anchor="middle">版本桶：打 delete marker（旧版本留链上）</text>
+  <text x="205" y="336" font-size="9.5" fill="#64748b" text-anchor="middle">非版本桶：对象目录整体移除（键不存在也回成功）</text>
+
+  <rect x="370" y="276" width="290" height="76" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="515" y="300" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">覆盖写（再次 PUT / Copy）</text>
+  <text x="515" y="320" font-size="9.5" fill="#64748b" text-anchor="middle">版本桶：新版本追加，旧版本留链上（可回滚）</text>
+  <text x="515" y="336" font-size="9.5" fill="#64748b" text-anchor="middle">非版本桶：协议 ⑤ 旧目录 → .oss.sys/trash/</text>
+
+  <rect x="680" y="276" width="240" height="76" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="800" y="300" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">生命周期规则（M4/M8）</text>
+  <text x="800" y="320" font-size="9.5" fill="#64748b" text-anchor="middle">worker 扫描 · tag/size/Date 过滤</text>
+  <text x="800" y="336" font-size="9.5" fill="#64748b" text-anchor="middle">当前版本删/marker · noncurrent 过期 · jobs 进度</text>
+
+  <!-- 对象锁守卫 -->
+  <rect x="370" y="368" width="552" height="52" rx="10" fill="#fef2f2" stroke="#fecaca"/>
+  <text x="388" y="390" font-size="11.5" font-weight="600" fill="#991b1b">对象锁/保留守卫（M5/M8 · Put/GetObjectRetention · 桶默认保留）：以上所有「删/回收」先过判定：</text>
+  <text x="388" y="408" font-size="10" fill="#b91c1c">未到期 COMPLIANCE 一律拒（含管理员）· GOVERNANCE 仅 bypass 头放行 · Legal Hold ON 拒 · 到期可删 → 403</text>
+
+  <!-- 崩溃残留 -->
+  <rect x="60" y="368" width="290" height="52" rx="10" fill="#fffbeb" stroke="#fcd34d" stroke-dasharray="5 4"/>
+  <text x="205" y="390" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">崩溃残留（③④ 之间崩 → 孤儿版本目录）</text>
+  <text x="205" y="408" font-size="9.5" fill="#92400e" text-anchor="middle">不可见 · M2 启动自检 / clean / fsck 回收</text>
+
+  <!-- 不变量 -->
+  <rect x="60" y="444" width="840" height="88" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="80" y="468" font-size="10.5" fill="#374151">不变量：无有效 xl.meta 的目录永不被服务 —— 列举跳过非法目录名（warn）；损坏 meta → PUT fail-closed（不静默覆盖）</text>
+  <text x="80" y="488" font-size="10.5" fill="#374151">M2/M4：启动自检 + clean / fsck / heal 回收 tmp 孤儿、trash 残留与无 meta 的垃圾目录（当前仅占盘，不影响正确性）</text>
+  <text x="80" y="508" font-size="10.5" fill="#374151">M5：加密对象的版本目录存密文分片（先加密后 EC）——trash/回收语义不变；锁定版本的回收由删除守卫拒止</text>
+  <text x="80" y="524" font-size="10" fill="#94a3b8">版本桶多版本由 xl.meta 版本链描述；Suspended 桶写 null 版本；trash 只收非版本桶旧目录（M2 自动回收）</text>
+
+  <text x="930" y="548" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
+</svg>

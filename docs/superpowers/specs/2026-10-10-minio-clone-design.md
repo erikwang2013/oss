@@ -1,8 +1,8 @@
 # 自研分布式对象存储系统（MinIO 替代）— 总体设计
 
 - 日期：2026-10-10
-- 状态：已确认范围，待 M1 实现计划
-- 框架：e-cat 7 · 上传：aetherupload-rust 1.0.3 · 协议：s3s 0.17 · 前端：React 19 + antd v5
+- 状态：已实现至 M9（v1.13.1，2026-10-22）；2026-10-23 能力清理合并见验收记录
+- 框架：e-cat 7 · 上传：aetherupload-rust 3.0.0 · 协议：s3s 0.17 · 前端：React 19 + antd v5
 
 ---
 
@@ -38,18 +38,18 @@
 | 应用框架 | `ecat` | 7.0.0 | `App::builder()` + `HttpServer::new(addr).router(r)` + `LifecycleHook`（`HttpServer` 属 `ecat-transport-http`，经 `ecat::transport_http` 再导出） |
 | HTTP 传输 | `ecat-transport-http` | 7.0.0 | 底层即 **axum 0.8** —— 与 aetherupload 的 `ecat` feature 完全对齐 |
 | S3 协议 | `s3s` | 0.17.0 | `S3Service` 是 `tower::Service`，**114 个 S3 操作**，SigV4/XML/流式全包 |
-| 上传 | `aetherupload-rust` | 1.0.3 | feature `ecat` → 返回 `axum::Router<()>`，直接挂载 |
+| 上传 | `aetherupload-rust` | 3.0.0 | feature `ecat` → 返回 `axum::Router<()>`，直接挂载 |
 | 纠删码 | `reed-solomon-erasure` | 6.0.0 | GF(2^8)，已验证 620 万下载 |
 | 控制面 DB | `ecat-data-sqlx` | 7.0.0 | 开发 SQLite / 生产 PostgreSQL，同一 trait |
 | 缓存（可选） | `ecat-data-redis` | 7.0.0 | 仅当外部化秒传索引时才需要；默认不用 |
-| S3 客户端（复制/分层） | `ecat-data-s3` | 7.0.0（**需扩展**） | 现仅 put/get/delete/list，需补流式 multipart / copy / 版本头 |
+| S3 客户端（复制/分层） | `ecat-data-s3` | 7.0.0（**需扩展**） | 计划选型；实现改用自研 SigV4 + hyper/reqwest 出站客户端（见 M6/M8 落地记录） |
 | 认证 | `jwt-rust` | 1.0.1 | 控制面 `/api/v1` 与上传口 `/aetherupload` 的 JWT 校验/签发（axum `JwtLayer` + `encode`，12h）；S3 面走 SigV4。`ecat-auth` 的定位不变，留 M4 策略层（桶策略/IAM） |
 | 分布式锁（M3） | `ecat-lock` | 7.0.0 | 节点间命名空间锁；**M3 定稿：未采用**——落地为自研 quorum 租约锁（`xl-store/src/store/lock.rs`，节点域 Q_n，见「M3 落地状态」） |
 | 可观测 | `ecat-metrics` · `ecat-tracing` · `ecat-logging` | 7.0.0 | Prometheus + OTLP |
 | 中间件 | `ecat-middleware` · `ecat-security` | 7.0.0 | 超时/限流/攻击检测 |
 | 加密（M5） | `aes-gcm` · `chacha20poly1305` | 最新 | RustCrypto |
 | 共识（M9） | `openraft` | 0.9.25 | 仅控制面跨站点强一致 |
-| Kafka（M6） | `rskafka` | 最新 | **纯 Rust，免 librdkafka C 工具链**；抽成 `ecat-mq-kafka` contrib |
+| Kafka（M6） | `rskafka` | 0.6 | **纯 Rust，免 librdkafka C 工具链**；0.6 原生 TLS + SASL PLAIN/SCRAM，无需 rdkafka |
 | S3 Select 解析（M6） | `sqlparser` | 最新 | 只取 AST，求值器自写（AWS 方言不是真 SQL） |
 | WASM 变换器（M8） | `wasmtime` | 最新 | **cargo feature 门控**，默认走 HTTP 变换器 |
 | 前端 | React 19 · Vite · TypeScript · antd v5 · `@tanstack/react-query` | — | 复用 `aetherupload-all.js`（含 zepto + spark-md5） |
@@ -386,6 +386,7 @@ Transition 作业在 S4b。
 
 - Storage Class 记录在 `xl.meta` 的 `Version.storage_class`
 - **tier 后端是可插拔的**：远端 S3 兼容端点（扩展后的 `ecat-data-s3`）或本地冷盘池（不同 EC 参数，如 12+4）
+  （2026-10-23：远端 S3 与本地 `kind="local"` 两种 tier 后端均已落地；远端 GC/对账见 README。）
 - 协议语义完整实现：`x-amz-storage-class` 请求头、`x-amz-restore: ongoing-request="true"; expiry-date="…"` 响应头、`RestoreObject` 异步作业、恢复副本到期回收
 - 生命周期规则驱动转换（`lifecycle_rules` → 作业引擎）
 
@@ -417,14 +418,15 @@ nonce = 随机种子(8B) ‖ BE32(u)——非本节的「part 号派生」但达
 「HMAC 校验」落为 **`base64(MD5(key))`**（AWS customer-key-MD5 同款，客户端兼容优先）；
 SSE-KMS 的文件实现即「多钥目录」（`key-<n>.bin`，当前钥=最大 n，加钥即轮换），HTTP KMS 以
 `KeyProvider` trait 预留。校验口径：ETag/MD5/SHA256 对**明文**、分片 CRC 对**密文**——
-协议语义不变（DEK 的包裹体 `wrapped` 与 `key_id` 落 `xl.meta`）。桶级默认加密未实现（记档）。
+协议语义不变（DEK 的包裹体 `wrapped` 与 `key_id` 落 `xl.meta`）。桶级默认加密已落地
+（2026-10-20，M8 缺口 7c：AES256/aws:kms，显式 CMK 400；PUT/MPU/Copy 套用桶默认值）。
 
 ### 7.7 Access Point 与 Object Lambda 的改写层（M8）
 
 **落地状态（2026-10-19）**：S1 已落地路径式 AP——`ApRoute`（canonical key、op 推导、
 身份/桶策略 × AP 策略交集、单条审计、签名剥离、URI 改写、内层转发、STS 单槽组合）、
 严格 AP 策略解析、AP 缓存与 CRUD/策略 API。Object Lambda（HTTP/WASM 变换器）在 S2；
-`<name>-s3alias` 主机别名、匿名与跨账号不做（M8 钉）。
+`<name>-s3alias`（路径首段与 Host 首标签）已落地（2026-10-23）；AP 匿名/跨账号与写变换仍不做。
 
 两者是同一个机制：**请求到达 S3 服务之前的改写**。
 
@@ -510,7 +512,7 @@ heal / scrub 独立命令 · rebalance 追加式扩容（C4 同盘 hardlink 快�
 清理（C5）——均已落地；验收 ①–④ e2e 实证。分层/转换归 M8，控制面强一致归 M9。
 **M4 规格缺口（2026-10-19 更新）**：对象标签与 CopyObject 两轴 `REPLACE` 已随 M8 前置补齐
 （功能规格 §3.5 / §3.7）；剩余缺口：控制台桶策略编辑与审计查询 UI 未做（后端 API 完整）、
-MPU 标签与控制台标签编辑未做。
+MPU 标签（Create 记录、Complete 落地）与控制台对象标签编辑已落地（2026-10-20，M8 缺口 7a）。
 
 ### M5 安全与锁定（2-3 周）
 
@@ -553,8 +555,8 @@ GetSessionToken + 会话策略交集；**AssumeRole 限管理员**——无角�
 切片 3 复制状态面（Version/ObjectInfo 状态、decode 白名单、HEAD/GET `x-amz-replication-status`、
 REPLICA 摄入）· 切片 4 桶复制（规则 API、9 写入口入队、repl_outbox worker 300s 租约、SigV4 +
 hyper 出站；PENDING→COMPLETED/FAILED、停机积压追平 ④ ⑤）· 切片 5 e2e/README（`e2e_s3.sh` §19 +
-`e2e_replication.sh`；复制/Select/Kafka 三件 e2e 实跑 EXIT=0）。**记档**：Parquet/BZIP2 后置；
-Kafka SASL/SSL 与复制的 TLS 未接线（复制 http-only）；Select 全量缓冲 256/512MiB；复制整对象
+`e2e_replication.sh`；复制/Select/Kafka 三件 e2e 实跑 EXIT=0）。**记档**：S3 Select 的 Parquet/BZIP2 仍后置；
+Kafka SASL/SSL 与复制出站 TLS 已落地（2026-10-23；rskafka 0.6 原生 PLAIN/SCRAM + TLS）；Select 全量缓冲 256/512MiB；复制整对象
 入内存/无限速；版本定向删除不复制；Priority/Role/EOR 回读有损；SSE-C 源不可复制。实施记录见
 `plans/2026-10-17-m6-dataflow.md`。**规格缺口（2026-10-18 记）**：控制台「事件页」「Select 工作台」
 未做（功能规格 M6 行；后端 API 完整）。
@@ -579,7 +581,7 @@ origin_site_id, seq)`（ts 优先，priority 仅同秒裁决）**——与本节
 预检（10s 缓存）；PUT 与 DELETE 均带 `x-amz-replication-status: REPLICA` 防环（目标端不再入队）。
 实施记录见 `plans/2026-10-18-m7-multisite.md`。
 
-**范围收缩与边界（记档）**：仅 http（TLS 未接线）；版本 UUID 两端不一致、版本定向删除不复制；
+**范围收缩与边界（记档）**：对端 http/https 均可（TLS 见 README「TLS」节；2026-10-23 已接线）；版本 UUID 两端不一致、版本定向删除不复制；
 非空桶删除不生效（保留行/数据，死信可查）；锁/标签/SSE 不复制，SSE-C 源永久错；`uid:<id>`
 Principal 不重映射；AK 密文需两端同主密钥（配对时校验双方 vault 开关一致，但不校验同一把钥）；
 changelog 无裁剪、重配对全量重放；**解配期间的本地控制面改动不被捕获**（触发器以 `sites` 非空为
@@ -606,22 +608,25 @@ S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 T
   `data/*.csv.gz` 布局其余对齐 AWS v1。
 - Inventory 列收敛为 9 必含 + 6 可选；`IsMultipartUploaded`/`IntelligentTieringAccessTier`
   不支持（现有元数据不可推导）。
-- 分层仅远端 S3 兼容 tier（endpoint 仅 http，TLS 未接线），无本地冷盘池；GLACIER/
-  DEEP_ARCHIVE 自动解析到单一 tier；全内存搬运（单对象上限）；tier 远端删除 best-effort、
-  无 GC/对账；恢复到期精度约 300s。
+- 分层支持远端 S3 兼容 tier（endpoint http/https）与本地冷盘池 `kind="local"`
+  （2026-10-23）；GLACIER/DEEP_ARCHIVE 自动解析到单一 tier；全内存搬运（单对象上限）；
+  tier 远端删除仍 best-effort，管理员可用 `POST /api/v1/tiers/gc` 显式 GC/对账
+  （默认 dry-run；无自动定时 GC）；恢复到期精度约 300s。
 - Object Lambda 只做读变换；HTTP 变换器默认，WASM 需 `olap-wasm` feature；输出全缓冲；
   输入/输出/超时/并发限额与 SSRF 拒绝见 S2 实现。
 - RestoreObject 返回 202 + `x-amz-restore: ongoing-request="true"`。s3s 0.17 的生成代码
   固定按 `200 OK` 序列化并丢弃 `S3Response.status`（服务层设置的 202 仅进程内可见），
   router 层中间件把 POST `?restore` 的 200 改写为 202；错误状态与其它请求原样透传。
-- AP 仅路径式 `/ap/<name>/<key>`，无 `<name>-s3alias`、匿名、跨账号或 VPC 来源限制。
+- AP 支持 `/ap/<name>/<key>` 与 `<name>-s3alias`（路径首段/Host 首标签）；
+  无匿名、跨账号或 VPC 来源限制（SourceIp 条件支持，反代需 `OSS_AP_TRUSTED_PROXY=1`）。
 - S6 补齐先前记档的 M4/M5/M6 控制台缺口页（审计过滤、通知死信、SSE/KMS 只读、Select 代理、
   IAM 预设、桶默认加密、对象标签编辑）+ M8 页面（访问点/作业/分层/清单）；未新增计划外
   后端能力。
 
-**仍不做（非目标）**：M9 同步强一致（openraft / sync 桶 / stretch EC）·
-`AssumeRoleWithWebIdentity` · SSE-KMS 显式 CMK/多钥轮换 · AP 主机别名/匿名/跨账号 ·
-Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单 · 本地冷盘池 tier。
+**仍不做（非目标）**：`AssumeRoleWithWebIdentity` · SSE-KMS 显式 CMK/多钥轮换 ·
+AP 匿名/跨账号/VPC 端点 · Inventory 跨账号投递/增量 · Batch 抢占/跨账号清单。
+（M9 同步强一致、AP 主机别名、Inventory Parquet/Hive、本地冷盘池 tier、tier GC 已于
+2026-10-23 前落地，见 README 与验收记录。）
 
 **验收**
 1. 建 AP 后经 `/ap/<name>/<key>` 访问，且 AP 策略与桶策略取交集生效
@@ -649,7 +654,8 @@ Inventory Parquet/hive/跨账号投递 · Batch 抢占/跨账号清单 · 本地
   Rust 测试 164 PASS。
 - stretch+Raft 配对/加 witness 组合由 `M9_STRETCH=1 tests/e2e_m9.sh` 覆盖；
   B′/cutover/repair 见 `tests/e2e_m9_recovery.sh`；11 表并发 diff 见 `tests/e2e_m9.sh`；
-  TLS 仍未接线。
+  TLS 已于 2026-10-23 接线（README「TLS」节）；Level B 控制面滚动升级同时落地
+  （wire/feature 握手、`feature_level`、成员预检、runbook）；数据面仍非滚动。
 - 规格收窄（③ 2×6）：stretch 不是「sync 支持跨站 EC」；两者互斥。stretch 固定 2 数据
   站点 ×6 盘、EC 8+4、placement v2、inline=0，`Q_s=9`，单站点 6 槽不足，**不承诺站点
   容灾**；禁用 M7 异步站点复制、拒绝 sync 桶、仅允许全新空库。sync 桶要求

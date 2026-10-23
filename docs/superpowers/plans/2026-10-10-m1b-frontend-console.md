@@ -1,5 +1,10 @@
 # M1b 前端控制台 实现计划
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 补齐 M1 的浏览器侧垂直切片：React 控制台（登录 / 桶列表 / 对象浏览器 / 上传面板 / 访问密钥），上传复用 aetherupload 自带 `aetherupload-all.js`（不重写分片逻辑），让设计文档 M1 验收的第 2、3、4 条（1 GB 上传 + 断线续传、秒传命中、控制台可见可下载可删除）在浏览器里全部成立。

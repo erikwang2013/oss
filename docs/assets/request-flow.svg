@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 780" width="960" height="780"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS 请求周期</title>
-  <desc>两条入口（S3 直传与浏览器分块上传）汇入同一条 xl-store 提交协议；启用 SSE 时先流式加密再 EC 编码。</desc>
+  <desc>两条入口（S3 直传与浏览器分块上传）汇入同一条 xl-store 提交协议；TLS 可选终结，AP 路径/别名先过策略交集；启用 SSE 时先流式加密再 EC 编码。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
@@ -11,25 +11,25 @@
   <rect x="1" y="1" width="958" height="778" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
   <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 请求周期</text>
-  <text x="40" y="70" font-size="12" fill="#64748b">两条入口（S3 直传 / 浏览器分块上传）在「提交协议」处汇合 —— 提交之前的一切对客户端不可见 · 启用 SSE 时先加密后 EC</text>
+  <text x="40" y="70" font-size="12" fill="#64748b">两条入口（S3 直传 / 浏览器分块上传）在「提交协议」处汇合 · TLS 可选终结 · 提交前不可见 · SSE 先加密后 EC</text>
 
-  <text x="60" y="108" font-size="13" font-weight="600" fill="#1e3a8a">① S3 直传（aws-cli / rclone）</text>
+  <text x="60" y="108" font-size="13" font-weight="600" fill="#1e3a8a">① S3 直传（aws-cli / rclone · 含 AP 路径/别名）</text>
   <text x="520" y="108" font-size="13" font-weight="600" fill="#0f766e">② 浏览器分块上传（aetherupload）</text>
 
   <!-- 左列：S3 直传 -->
   <rect x="60" y="124" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="78" y="148" font-size="12.5" font-weight="600" fill="#1e3a8a">客户端发起 PUT /{bucket}/{key}</text>
-  <text x="78" y="168" font-size="10.5" fill="#64748b">SigV4 签名头 · 可带 SSE / 对象锁头 · 版本参数</text>
+  <text x="78" y="148" font-size="12.5" font-weight="600" fill="#1e3a8a">客户端 PUT /{bucket}/{key}（含 /ap/&lt;name&gt;/、别名）</text>
+  <text x="78" y="168" font-size="10.5" fill="#64748b">TLS 可选终结 · SigV4 · SSE/锁/保留头 · 版本参数</text>
   <line x1="270" y1="182" x2="270" y2="196" stroke="#94a3b8" marker-end="url(#a)"/>
 
   <rect x="60" y="200" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="78" y="224" font-size="12.5" font-weight="600" fill="#1e3a8a">oss-server：fallback_service → s3s</text>
-  <text x="78" y="244" font-size="10.5" fill="#64748b">SigV4 验签 + 授权（桶策略 Deny 优先 → 三档权限，M4）</text>
+  <text x="78" y="224" font-size="12.5" font-weight="600" fill="#1e3a8a">oss-server：TLS 终结 → AP 路由 → s3s</text>
+  <text x="78" y="244" font-size="10.5" fill="#64748b">SigV4 验签 + AP 策略交集 + SourceIp/匿名（仅数据面）</text>
   <line x1="270" y1="258" x2="270" y2="272" stroke="#94a3b8" marker-end="url(#a)"/>
 
   <rect x="60" y="276" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
   <text x="78" y="300" font-size="12.5" font-weight="600" fill="#1e3a8a">OssS3（xl-s3）：put_object</text>
-  <text x="78" y="320" font-size="10.5" fill="#64748b">解析 SSE / 锁头（M5）· 桶默认保留规则落地 · 校验和</text>
+  <text x="78" y="320" font-size="10.5" fill="#64748b">解析 SSE/锁/保留头（M5/M8）· 桶默认保留 · 校验和</text>
   <line x1="270" y1="334" x2="270" y2="348" stroke="#94a3b8" marker-end="url(#a)"/>
 
   <rect x="60" y="352" width="420" height="58" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>

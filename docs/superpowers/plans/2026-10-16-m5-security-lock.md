@@ -1,5 +1,10 @@
 # M5 安全与锁定 实施计划（工作令）
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > 设计文档 §7.6 / §M5：**范围** = SSE-S3 / SSE-KMS（含文件型 KMS）/ SSE-C · 对象锁（Governance +
 > Compliance + Legal Hold）· STS（AssumeRole / GetSessionToken / AssumeRoleWithWebIdentity）。
 > **验收**（设计文档 §M5）：

@@ -1,5 +1,10 @@
 # M2b 存储层重构 实现计划（EC · 多盘 · 内联 · 断电一致性）
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 落地设计文档 M2 的**存储层**部分——EC 8+4 纠删码 · 单机多盘 · 小对象内联（< 128 KiB 进 `xl.meta`）· 断电一致性复核 · fsck/scrub 起步——把「单盘直存」升级为「单机真·对象存储」。协议面（Multipart/Range/元数据/GC）已由 M2a 完成，本计划不碰。

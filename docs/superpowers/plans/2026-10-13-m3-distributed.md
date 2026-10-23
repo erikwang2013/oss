@@ -1,5 +1,10 @@
 # M3 分布式 实现计划（节点间 mesh · quorum 读写 · 故障容忍 · 读修复 · 跨节点锁）
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: 逐 Task 执行——每 Task 有独立步骤、伪代码与验收；切片收尾循 m2b 计划的四闸惯例（fmt · clippy 0 · workspace 全绿 · e2e）。
 
 **Goal:** 把 v1.4.0 的单机存储（单机多盘 + EC 8+4 + 子账户权限）升级为**静态拓扑的多节点集群**：任意节点可写（quorum 达成即返回）、任意节点可读（quorum 内可读到最新已提交版本）、拔节点/分区下不损坏、读修复补齐。**按设计文档 §M3 范围行**：节点间 gRPC mesh（xl-proto）· 静态拓扑 · 对象→纠删组哈希 · 跨节点 quorum 读写 · 节点故障容忍 · 读修复 · 节点间命名空间锁。

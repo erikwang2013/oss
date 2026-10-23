@@ -105,7 +105,8 @@
 - 时间偏差 > 15 分钟 → `RequestTimeSkewed`
 - AK 不存在 / 非 active / 已过期 → `InvalidAccessKeyId`
 - 签名不符 → `SignatureDoesNotMatch`
-- 匿名请求：默认拒绝（除非桶策略显式允许匿名，M4）
+- 匿名请求：默认拒绝；仅当桶策略显式 Allow 且 op 属于数据面白名单
+  （Get/Head/Put/DeleteObject、DeleteObjects）时放行（2026-10-23）
 
 **接口（控制台）**
 | 方法 | 路径 | 说明 |
@@ -155,6 +156,22 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 **求值顺序**：显式 Deny 优先 → 身份策略 Allow → 桶策略 Allow → 资源属主（同账号）→ 默认拒绝。
 
 **边界**：支持 S3 策略的 Action / Resource / Principal / Condition 子集；不支持的条件键明确列出并拒绝（不静默忽略 —— 静默忽略一个 Condition 等于越权）。
+
+**匿名 Principal**：桶策略 `Principal:"*"` 显式 Allow 时，无凭据请求可执行数据面对象操作
+（Get/Head/Put/DeleteObject、DeleteObjects 逐键复评）；控制面、桶级操作、对象锁/保留期头一律拒绝；
+Deny 优先、无策略即拒；审计 uid=0。
+
+### 1.5 传输安全（TLS）—— `2026-10-23`
+
+**做什么**：`[tls.server]` 单一开关启用 S3/控制台监听器、witness、Raft RPC、节点间 gRPC mesh、
+site/repl/tier 出站与 Kafka 的 TLS；`[tls.client]` 配置出站额外信任根与 mTLS 客户端身份。
+Kafka `tls = true` + `sasl`（PLAIN/SCRAM-SHA-256/512）。
+
+**行为**：未配置 `[tls]` 时保持旧版明文行为；对端写 `http://` 时按 `[tls.server]` 升级为 https，
+未启用 TLS 时写 `https://` 启动期拒绝（不静默降级）。证书启动期读取并校验，轮换需重启；
+无 `verify=false` 旁路。mTLS 是共享监听器的 opt-in，启用后所有客户端都须带 CA 签发的证书。
+
+**边界**：不实现证书热加载、ACME 自动签发或按路由的差异化 TLS；这些由外部反代/证书管理承担。
 
 ---
 
@@ -208,12 +225,12 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 |---|---|---|
 | `Content-Type` | ✅ | 存 meta，GET 时回 |
 | `x-amz-meta-*` | ✅（M2a 已落地） | 用户元数据，总计 ≤ 2 KiB；全量替换语义（非合并） |
-| `x-amz-storage-class` | ❌（M8） | 默认 STANDARD |
-| `x-amz-server-side-encryption*` | ❌（M5） | |
-| `x-amz-tagging` | ❌（M4） | |
-| `x-amz-object-lock-*` | ❌（M5） | |
+| `x-amz-storage-class` | ✅（M8） | 默认 STANDARD；归档类直写 → 400 |
+| `x-amz-server-side-encryption*` | ✅（M5） | SSE-S3/KMS/C 全链 |
+| `x-amz-tagging` | ✅（M8 前置） | ≤10 条；MPU 在 Create 记录、Complete 落地 |
+| `x-amz-object-lock-*` | ✅（M5） | 桶须已开锁；与 Legal Hold 独立 |
 | `Content-MD5` | ✅（协议补全计划 Task 3 落地） | 与计算值不符 → `BadDigest`（提交点前 fail-closed，对象不落盘） |
-| `x-amz-checksum-*` | ✅（协议补全计划 Task 3 落地；单段 PUT 校验并回写，CRC32C/SHA1/SHA256/SHA512/CRC64NVME，206 不回写；**part 级校验和未校验、组合语义留 M2b**） | |
+| `x-amz-checksum-*` | ✅（协议补全计划 Task 3 落地；单段 PUT 校验并回写，CRC32C/SHA1/SHA256/SHA512/CRC64NVME，206 不回写；**part 级校验和未校验（静默忽略）；组合语义仍未实现，记档**） | |
 
 **边界**：M2a 起流式直通内核（不再整份读内存），单次 PUT/单 part 仍受 `max_put_bytes` 上限。
 
@@ -245,7 +262,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **行为**：`x-amz-copy-source` 形如 `/{src-bucket}/{src-key}`（可带 `?versionId=`）。M1 实现为「读出源字节 → 写入目标」（真实复制）；M2 起改为**服务端分片级复制**（不经过内存）。
 
-**`x-amz-metadata-directive`**：`COPY`（默认，保留源元数据）——M2a 已落地；`REPLACE`（用请求头里的元数据）未实现。
+**`x-amz-metadata-directive`**：`COPY`（默认，保留源元数据）——M2a 已落地；`REPLACE`（用请求头里的元数据）已落地，metadata 与 tagging 两轴独立；未提供即清空。
 
 **边界**：源 = 目标（同桶同键、无 REPLACE、无存储类变更）→ `InvalidRequest`（S3 语义）；跨桶复制需要目标桶的写权限（M4 起）。
 
@@ -266,9 +283,9 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **边界**：未完成的上传占用磁盘；`clean` 命令按 mtime 回收（默认 7 天）。`CompleteMultipartUpload` 是所有上传中唯一**非原子可见**的操作：拼接期间对象不可见，拼接完成后一次性提交 `xl.meta`。
 
-### 3.7 对象标签与元数据 —— `M2`/`M4`（标签 2026-10-19 落地；边界：不跨界复制、MPU/控制台标签未做）
+### 3.7 对象标签与元数据 —— `M2`/`M4`（标签 2026-10-19 落地；2026-10-20 补 MPU 标签与控制台编辑）
 
-`PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`（M4）—— 最多 10 个标签，键 ≤ 128 字符，值 ≤ 256 字符。`x-amz-meta-*` 用户元数据（**M2a 已落地**）—— 总计 ≤ 2 KiB（大小写归一化行为以 s3s 实测为准）。
+`PutObjectTagging` / `GetObjectTagging` / `DeleteObjectTagging`（M4）—— 最多 10 个标签，键 ≤ 128 字符，值 ≤ 256 字符。`x-amz-meta-*` 用户元数据（**M2a 已落地**）—— 总计 ≤ 2 KiB（大小写归一化行为以 s3s 实测为准）。MPU 的 `x-amz-tagging` 在 Create 记录、Complete 落地；控制台对象页支持标签编辑。标签不随 M6/M7 复制传播；`REPLICA` 摄入显式忽略 `x-amz-tagging`。
 
 ---
 
@@ -357,12 +374,14 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 | 场景 | Enabled | Suspended |
 |---|---|---|
 | PUT | 新版本，`version_id` = uuid | 新版本覆盖 `null` 版本 |
-| DELETE（无 versionId） | 插入 delete marker，`version_id` 新 uuid | 删 `null` 版本 |
+| DELETE（无 versionId） | 插入 delete marker，`version_id` 新 uuid | 移除链中 null 版本（含 null marker），追加 null delete marker |
 | DELETE（带 versionId） | 永久删该版本（对象锁可能阻止） | 同左 |
 | GET（无 versionId） | 返回最新非 delete marker 版本 | 同左 |
 | GET（带 versionId） | 返回指定版本 | 同左 |
 
 **响应头**：所有写操作返回 `x-amz-version-id`。
+
+sync 桶拒绝 `Suspended`（409 `InvalidBucketState`），因为双站同 id 依赖真 UUID 版本链。
 
 **`xl.meta` 的 `versions` 数组**在这一阶段从「恒一条」变为多条，靠 `is_latest` 与 `mod_time_nanos` 排序。**格式版本号已在 M2 预留，不需要数据迁移**。
 
@@ -390,6 +409,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **模式**
 - **GOVERNANCE**：持有 `s3:BypassGovernanceRetention` 权限者可带 `x-amz-bypass-governance-retention: true` 提前解除
+  （实现口径：未单设 `s3:BypassGovernanceRetention` 动作；具备 PutObjectRetention 写权限即可带 bypass 头，记档）
 - **COMPLIANCE**：**任何人**（含管理员、root）在到期前都无法删除或缩短保留期 —— 这是合规审计的意义所在
 
 ### 7.3 拒绝规则
@@ -413,7 +433,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 `NoSuchObjectLockConfiguration`；控制台对象列表展示 retention/legal-hold 状态）。拒绝规则均已落地：点名删版本 / 批量删 / 非版本化覆盖写
 回收一致判定（到期可删；COMPLIANCE 含管理员一律拒；GOVERNANCE 仅 bypass 头放行；
 Legal Hold ON 一律拒），拒删 = 403 `AccessDenied`。无版本号 DELETE 照打 delete marker
-（锁定版本天然留存）。控制台锁状态展示延后（S3 API 面完整）。
+（锁定版本天然留存）。控制台对象列表已展示 retention / legal-hold 状态。
 **策略/匿名口径（2026-10-23 安全收口）**：`Get/PutObjectLegalHold` 映射独立动作
 `s3:GetObjectLegalHold`/`s3:PutObjectLegalHold`（不复用 `s3:GetObject`/`s3:PutObject`；AP 同样
 按此判定）。匿名请求携带对象锁头或 `x-amz-bypass-governance-retention` 一律 403——匿名桶策略
@@ -455,7 +475,8 @@ Legal Hold ON 一律拒），拒删 = 403 `AccessDenied`。无版本号 DELETE �
 customer-key-MD5 同款）。§8.2 的「读 SSE-C 密钥不匹配 → `AccessDenied`」落为
 **400 `InvalidArgument`**（AWS 对 SSE-C 错钥即 4xx 客户端错，非 403；格式不符/缺头同 400）。
 SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥轮换编排未做）。
-桶级默认加密（`PutBucketEncryption`）未实现。aetherupload 内部摄取不带加密（明文入盘，记档）。
+桶级默认加密（`PutBucketEncryption`）已落地：只接受单条 SSE-S3/SSE-KMS 规则，SSE-C 与显式 CMK
+拒绝；aetherupload 内部摄取不带加密（明文入盘，记档）。
 
 ---
 
@@ -463,20 +484,32 @@ SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥
 
 ### 9.1 配置
 
-`PutBucketLifecycleConfiguration` / `GetBucketLifecycleConfiguration` —— 最多 1000 条规则，每条：`ID`、`Status`（Enabled/Disabled）、`Filter`（前缀/标签/大小）、`Expiration`、`Transition`、`NoncurrentVersionExpiration`、`AbortIncompleteMultipartUpload`
+`PutBucketLifecycleConfiguration` / `GetBucketLifecycleConfiguration` / `DeleteBucketLifecycle`
+—— 最多 1000 条规则，每条：`ID`、`Status`、`Filter`（Prefix / Tag / ObjectSize* / And 互斥）、
+`Expiration`（Days | Date | ExpiredObjectDeleteMarker）、`Transition`（Days | Date，可多条）、
+`NoncurrentVersionExpiration`（含 `NewerNoncurrentVersions`）、`NoncurrentVersionTransition`。
+`AbortIncompleteMultipartUpload` 仍 501（需存储层 MPU 索引）。
 
 ### 9.2 行为
 
-- 规则由**作业引擎**驱动（§16）：每日扫描，按规则生成删除/转换任务
-- `Expiration.Days` / `.Date`、`ExpiredObjectDeleteMarker`
-- `Transition` 只支持同层内与「转到 tier 后端」（§14），存储类名须在允许列表内，否则 `InvalidStorageClass`
-- `AbortIncompleteMultipartUpload.DaysAfterInitiation`
-- 转换与过期都会发事件（`s3:LifecycleTransition` / `s3:LifecycleExpiration:*`）
+- 生命周期过期删除由独立 worker 按 `OSS_LIFECYCLE_INTERVAL_SECS`（默认 60s；`0` 关闭）
+  扫描 `sweep_once`，**不迁入 §16 作业引擎**；作业引擎负责 Transition/Batch/Restore/Inventory。
+- `Expiration.Days` / `.Date`、`ExpiredObjectDeleteMarker`；版本控制桶默认打 delete marker，
+  非版本桶 = 整键删除。
+- `Transition` 支持 Days/Date、多转换与 `NewerNoncurrentVersions`；存储类名须在允许列表内，
+  否则 `InvalidStorageClass`；tier 在写入时解析并持久化。
+- noncurrent expiration/transition 按“新版本创建时间”计算。
+- 转换与过期发事件（`s3:LifecycleTransition` / `s3:LifecycleExpiration:*`）。
+- 控制台 `GET/PUT /api/v1/buckets/{b}/lifecycle` 与 S3 共用校验，PUT 全量替换；支持
+  filter（prefix/tags/size/And）、expiration_date、expired_object_delete_marker、
+  transitions[]、noncurrent_version_expiration/transitions。
 
 ### 9.3 边界
 
-- 规则**最小粒度是对象**，不是版本（`NoncurrentVersionExpiration` 除外）
-- 到期删除**不是精确时刻**：命中窗口由扫描周期决定（默认每日），文档要写清楚
+- 规则**最小粒度是对象**，不是版本（`NoncurrentVersion*` 除外）。
+- 到期删除**不是精确时刻**：扫描周期默认 60s（不是每日）。
+- `AbortIncompleteMultipartUpload` 仍 501（需 MPU 索引）；Filter 的 tag/size/And 与
+  Date/EODM/多转换已支持。
 
 ---
 
@@ -493,7 +526,7 @@ SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥
 - 删除标记默认**不复制**（`DeleteMarkerReplication: Disabled` 是 S3 的默认值 —— 别搞反）
 - 需要目标桶的写权限与目标桶的版本控制
 
-**限速**：可配带宽上限（否则一条规则能打满出口）。
+**限速**：`[[remotes]].max_bytes_per_sec`（字节/秒，≥1024，按远端独立令牌桶；缺省不限速）。
 
 ### 10.2 跨站点复制 —— `M7`（异步）/ `M9`（同步）
 
@@ -648,9 +681,9 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 
 ## 14. 存储分层与 Restore —— `M8`
 
-> **落地状态（2026-10-20）**：S4a 元数据（`storage_class`/`TierState`/phase gate/MPU class/
-> `TierGcSink`）与 S4b（远端 S3 tier 后端、生命周期 Transition、`RestoreObject`、到期 reaper、
-> 启动对账）均已落地；仅远端 tier（http），无本地冷盘池。
+> **落地状态（2026-10-23 更新）**：S4a 元数据与 S4b（远端 S3 + 本地冷盘池 tier、
+> 生命周期 Transition、RestoreObject、到期 reaper、启动对账、远端 GC/对账）均已落地；
+> `[[tiers]].endpoint` 支持 http/https（TLS 见 §1.5），本地池 `kind="local"`。
 
 ### 14.1 存储类
 
@@ -660,8 +693,8 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 
 | tier 后端 | 说明 | 状态 |
 |---|---|---|
-| 远端 S3 兼容端点 | `[[tiers]]` 静态配置（`id/endpoint/bucket/access_key/secret_key/region`），仅 http；全内存搬运，单对象 `OSS_TIER_MAX_BYTES`（默认 1 GiB） | 已落地 |
-| 本地冷盘池 | 不同 EC 参数（如热池 8+4、冷池 12+4），可能更慢的介质 | 未实施（设计保留） |
+| 远端 S3 兼容端点 | `[[tiers]]` 静态配置（`id/endpoint/bucket/access_key/secret_key/region`），http/https；全内存搬运，单对象 `OSS_TIER_MAX_BYTES`（默认 1 GiB） | 已落地 |
+| 本地冷盘池 | `kind="local"` + `path`；同目录临时文件 + fsync + rename，MD5 校验，路径段拒绝绝对路径/`..`/NUL；适用不同 EC 参数/更慢介质 | 已落地（2026-10-23） |
 
 **不模拟磁带** —— 那不在对象存储范围内，MinIO 的 ILM tiering 也是同一模型。
 
@@ -677,6 +710,11 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 ### 14.3 生命周期驱动
 
 `Transition` 规则 → 作业引擎生成 tier 转换任务（复制到 tier 后端 + 更新 meta + 回收本地分片）。
+
+远端 GC/对账：`POST /api/v1/tiers/gc`（仅管理员，默认 `dry_run=true`）——先列远端再全量扫
+本地 live `TierRef`；`missing_live` 只报告不删；只删 `<tier_id>/` 前缀内、年龄 ≥
+`grace_days`（默认 7）、每轮 ≤ `max_deletes`（默认 1000）；任一 list/扫描失败整轮中止。
+无自动定时 GC，须管理员显式触发。远端删除仍 best-effort，失败留孤儿待下轮。
 落地：S3 `Put/Get/DeleteBucketLifecycleConfiguration` 与控制台 lifecycle 共用校验，tier 在写入
 时解析并持久化；sweep 由 `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）周期执行 +
 `POST /api/v1/tiers/sweep` 强制；按对象去重、仅当前非加密非分层版本、单次 ≤10000 对象。
@@ -686,18 +724,19 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 
 ## 15. Inventory —— `M8`
 
-> **落地状态（2026-10-20）**：S5 已落地——S3 `Put/Get/List/DeleteBucketInventoryConfiguration`
-> 与控制台薄封装、Daily/Weekly 调度、force-run、manifest + CSV.gz（MD5/大小为 gzip 后字节）。
+> **落地状态（2026-10-23 更新）**：S5 已落地——S3 与控制台配置、Daily/Weekly 调度、force-run、
+> manifest + `data/*.csv.gz` 或 `data/*.parquet`、Hive `symlink.txt`。
 
-**配置**：`PutBucketInventoryConfiguration` —— 源桶、目标桶+前缀、频率（`Daily`/`Weekly`）、输出格式（`CSV`；`Parquet` 后置）、是否含版本、可选字段列表、可选 Filter（前缀）。
+**配置**：`PutBucketInventoryConfiguration` —— 源桶、目标桶+前缀、频率（`Daily`/`Weekly`）、输出格式（`CSV` / `Parquet`）、是否含版本、可选字段列表、可选 Filter（前缀）。
 
 **输出布局**（对齐 AWS v1，让既有工具能直接读；偏离见下）：
 ```
 <dest-prefix>/<source-bucket>/<config-id>/<run_key>/manifest.json
-<dest-prefix>/<source-bucket>/<config-id>/<run_key>/data/<uuid>.csv.gz
+<dest-prefix>/<source-bucket>/<config-id>/<run_key>/data/<uuid>.csv.gz | <uuid>.parquet
+<dest-prefix>/<source-bucket>/<config-id>/<run_key>/hive/dt=YYYY-MM-DD-HH-MM/symlink.txt
 ```
 `run_key`：Daily = `YYYY-MM-DD`（UTC），Weekly = `YYYY-Www`，force-run = `manual-<epoch>`。
-`manifest.json` 含 `sourceBucket`、`destinationBucket`、`version`、`creationTimestamp`、`fileFormat`、`fileSchema`、`files[{key,size,md5Checksum}]`；`size`/`md5Checksum` 对应 gzip 后字节数与 MD5（base64）。
+`manifest.json` 含 `sourceBucket`、`destinationBucket`、`version`、`creationTimestamp`、`fileFormat`、`fileSchema`、`files[{key,size,md5Checksum}]`；CSV 的 `size`/`md5Checksum` 对应 gzip 后字节数与 MD5（base64），Parquet 对应文件本身（SNAPPY，8192 行/行组；`last_modified_date` 为 TIMESTAMP_MILLIS）。
 
 **列**（`fileSchema`）：必含 9 列 `Bucket`、`Key`、`VersionId`、`IsLatest`、`DeleteMarker`、
 `Size`、`LastModifiedDate`、`ETag`、`StorageClass`；可选 6 列按固定顺序追加
@@ -708,9 +747,9 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 `POST .../{id}/run`（force-run → 202 `{"run_key","job_id"}`）。调度 worker
 `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 关闭），同槽唯一去重，停机只补最近一槽。
 
-**边界**：不做 `hive/` 分区布局（后置）；不做 S3 Inventory 的跨账号投递；全量扫描、单数据
-文件（gzip 后 ≤5 GiB）、不做增量；`IsMultipartUploaded`/`IntelligentTieringAccessTier`
-不支持。
+**边界**：Hive 仅写 `hive/dt=.../symlink.txt`（不含 Athena 建表/分区自动发现）；不做 S3 Inventory
+的跨账号投递；全量扫描、CSV/Parquet 单数据文件（数据文件 ≤5 GiB，CSV 可 gzip）、不做增量；
+`IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持。
 
 ---
 
@@ -753,7 +792,8 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 **落地限额**：`OSS_JOB_MAX_INFLIGHT_PER_USER`（100）/`OSS_JOB_MAX_INFLIGHT_GLOBAL`（1000）；
 创建期逐行授权并去重；作业终态 `done`/`error`/`cancelled`（有失败即 `error`）。
 
-**边界**：不做作业优先级抢占（队列按优先级排序即可）；不做跨账号清单；InvokeLambda 仅 HTTP 变换器。
+**边界**：不做作业优先级抢占（队列按优先级排序即可）；不做跨账号清单；InvokeLambda 支持 HTTP
+变换器，构建开启 `olap-wasm` 时也支持 WASM（默认关闭、fail-closed）。
 
 ---
 
@@ -825,9 +865,9 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | `build` | 按磁盘现状重建秒传索引 | M1 | 已实现：`oss-server build` |
 | `clean <days>` | 按 mtime 回收临时文件（`_header` 与 `*.part`） | M1 | 已实现：`oss-server clean <days>`；另回收内核 `.oss.sys/tmp/` 的孤儿上传目录 |
 | `fsck` | 启动自检：孤儿版本目录、缺失分片、meta 不一致 | M2 | **M2b 已落地**：`oss-server fsck [--repair]`——孤儿版本目录 / EC 分片 CRC32C 缺坏 / tmp-trash 计数；`--repair` 删孤儿 + 读时修分片；报告落 `.oss.sys/fsck/<时间戳>.json`。独立深度 `scrub` 仍归 M4 |
-| `scrub [--repair]` | 逐分片校验和比对，可选修复 | M4 | 未实现 |
-| `rebalance` | 按新拓扑重新分布 | M4 | 未实现 |
-| `heal` | 补齐缺失分片（读到即修 + 主动扫描） | M4 | 未实现 |
+| `scrub [--repair]` | 逐分片校验和比对，可选修复 | M4 | 已落地：`oss-server scrub [--repair]` |
+| `rebalance` | 按新拓扑重新分布 | M4 | 已落地：`oss-server rebalance [--dry-run|--apply]` |
+| `heal` | 补齐缺失分片（读到即修 + 主动扫描） | M4 | 已落地：`oss-server heal` |
 
 建议 cron：`clean 1` 与 `build` 每日各一次；`scrub --repair` 每周一次。
 

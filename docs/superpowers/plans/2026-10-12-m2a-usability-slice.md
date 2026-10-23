@@ -1,5 +1,10 @@
 # M2a 单盘可用性切片 实现计划
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 M1 明确的用户面缺口补上——`x-amz-meta-*` 元数据往返、Range GET、流式 PutObject、孤儿/垃圾回收（启动自检 + clean 扩展）、Multipart Upload——让 `aws-cli`/`rclone` 的大文件默认路径（≥8 MiB 自动 multipart）与断点重试的原生习惯直接可用。

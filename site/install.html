@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#eef3f8" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0d1a2b" media="(prefers-color-scheme: dark)">
+    <meta name="author" content="艾瑞可 Erik">
+    <meta property="og:locale" content="zh_CN">
+    <meta name="color-scheme" content="light dark">
+    <title>安装 oss（吞吞）| Docker 与源码构建</title>
+    <meta name="description" content="oss（吞吞）安装文档：Docker Compose 一键启动、Rust 源码构建、首次管理员初始化、创建访问密钥、连接 aws-cli、配置全链路 TLS 与集群滚动升级。">
+    <meta name="keywords" content="oss 安装,Docker Compose,Rust 对象存储,S3 服务端,吞吞,TLS,Raft,滚动升级">
+    <link rel="canonical" href="https://oss.erik.xyz/install.html">
+    <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
+    <link rel="manifest" href="manifest.webmanifest">
+    <meta property="og:type" content="article">
+    <meta property="og:site_name" content="oss（吞吞）">
+    <meta property="og:title" content="安装 oss（吞吞）">
+    <meta property="og:description" content="Docker Compose 与源码构建两条安装路径，含首次启动、S3 客户端连接、TLS 与滚动升级。">
+    <meta property="og:url" content="https://oss.erik.xyz/install.html">
+    <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="stylesheet" href="assets/css/site.css">
+    <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <header class="site-header">
+      <div class="wrap header-inner">
+        <a class="brand" href="./" aria-label="oss 吞吞首页">
+          <img class="brand-pet" src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="34" height="34" alt="">
+          <span class="brand-word">oss<span>吞吞</span></span>
+        </a>
+        <nav class="nav" aria-label="主导航">
+          <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+          <a href="index.html#iterations">迭代</a>
+          <a href="changelog.html">版本</a>
+          <a href="install.html" aria-current="page">安装</a>
+          <a href="usage.html">使用</a>
+          <a href="api.html">API 文档</a>
+          <a href="index.html#download">下载</a>
+        </nav>
+        <div class="header-actions">
+          <a class="btn btn-ghost btn-sm" href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav">菜单</button>
+        </div>
+      </div>
+      <nav class="mobile-nav" id="mobile-nav" aria-label="移动端导航" hidden>
+        <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+        <a href="index.html#iterations">迭代</a>
+        <a href="changelog.html">版本</a>
+        <a href="install.html" aria-current="page">安装</a>
+        <a href="usage.html">使用</a>
+        <a href="api.html">API 文档</a>
+        <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+      </nav>
+    </header>
+    <div id="top-sentinel" aria-hidden="true"></div>
+
+    <main id="main">
+      <div class="doc-hero">
+        <div class="wrap">
+          <h1>安装吞吞</h1>
+          <p>两条路径：Docker Compose 最快，源码构建适合改代码和单机调试。首次启动会自动创建数据目录、暂存目录与管理员账号。</p>
+        </div>
+      </div>
+
+      <div class="wrap doc-layout">
+        <aside class="doc-nav" aria-label="本页目录">
+          <a href="#requirements">环境要求</a>
+          <a href="#docker">Docker Compose</a>
+          <a href="#source">源码构建</a>
+          <a href="#first-run">首次启动</a>
+          <a href="#access-key">创建访问密钥</a>
+          <a href="#connect">连接 S3</a>
+          <a href="#tls">TLS 传输</a>
+          <a href="#cluster">集群与强一致</a>
+          <a href="#download">下载与版本</a>
+        </aside>
+
+        <article class="prose">
+          <h2 id="requirements">环境要求</h2>
+          <p>服务端是单个 Rust 二进制，元数据落在 SQLite。生产部署建议 Linux x86_64 或 arm64，至少 2 GB 内存，数据盘按业务容量准备。</p>
+          <ul>
+            <li>Docker 路径：Docker Engine 与 Compose v2。</li>
+            <li>源码路径：Rust 1.89 或更新版本，以及 protoc。</li>
+            <li>客户端：aws-cli、rclone 或任意支持自定义 endpoint 的 S3 SDK。</li>
+          </ul>
+
+          <h2 id="docker">Docker Compose</h2>
+          <p>仓库自带单机 compose，包含 oss-server 与控制台。数据与暂存放在具名卷，首次启动会生成管理员口令。</p>
+          <div class="code-card">
+            <div class="code-head"><span>终端</span><button class="copy-btn" type="button" data-copy="#code-install-docker">复制</button></div>
+            <pre><code id="code-install-docker">git clone https://github.com/erikwang2013/oss.git
+cd oss
+docker compose up -d --build
+
+# 查看自动生成的管理员账号与口令
+cat docker/secrets/generated.env</code></pre>
+          </div>
+          <div class="callout">
+            <img src="assets/img/pet/knock.svg" data-static="assets/img/pet/static/knock.png" width="360" height="400" alt="" decoding="async">
+            <p>默认端口：S3 与控制面在 <code>9000</code>，控制台在 <code>8080</code>。配置文件只读挂载自 <code>docker/oss.toml</code>，改完重启容器即可。</p>
+          </div>
+
+          <h2 id="source">源码构建</h2>
+          <p>源码模式需要 protoc，因为节点间 gRPC 协议在构建期生成。构建完成后直接运行 <code>oss-server serve</code>。</p>
+          <div class="code-card">
+            <div class="code-head"><span>终端</span><button class="copy-btn" type="button" data-copy="#code-install-source">复制</button></div>
+            <pre><code id="code-install-source">git clone https://github.com/erikwang2013/oss.git
+cd oss
+cargo build --release -p oss-server
+
+OSS_ADMIN_USER=admin \
+OSS_ADMIN_PASSWORD='change-me-please' \
+./target/release/oss-server serve</code></pre>
+          </div>
+          <p>开发控制台时另开一个终端：</p>
+          <div class="code-card">
+            <div class="code-head"><span>web</span><button class="copy-btn" type="button" data-copy="#code-install-web">复制</button></div>
+            <pre><code id="code-install-web">cd web
+npm ci
+npm run dev</code></pre>
+          </div>
+
+          <h2 id="first-run">首次启动</h2>
+          <p>首次启动会自动创建数据目录、暂存目录与桶目录，并用环境变量或密钥文件初始化管理员。建议把口令放进密钥文件，不要写进 shell 历史。</p>
+          <ul>
+            <li><code>OSS_ADMIN_USER</code>：管理员用户名。</li>
+            <li><code>OSS_ADMIN_PASSWORD</code>：管理员口令。</li>
+            <li><code>OSS_SECRETS_FILE</code>：可选，密钥文件路径，适合 Docker 自动生成与复用。</li>
+          </ul>
+          <p>启动后打开控制台，使用管理员账号登录。控制台默认在开发模式的 <code>5173</code>，Compose 模式在 <code>8080</code>。</p>
+
+          <h2 id="access-key">创建访问密钥</h2>
+          <p>找到控制台右上角的访问密钥入口，创建一对 AK/SK。也可以用管理员 token 调控制台 API：</p>
+          <div class="code-card">
+            <div class="code-head"><span>HTTP</span><button class="copy-btn" type="button" data-copy="#code-install-token">复制</button></div>
+            <pre><code id="code-install-token"># 登录拿 JWT
+curl -s -X POST http://127.0.0.1:9000/api/v1/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"change-me-please"}'
+
+# 用返回的 token 创建访问密钥
+curl -s -X POST http://127.0.0.1:9000/api/v1/access-keys \
+  -H "authorization: Bearer &lt;token&gt;" \
+  -H 'content-type: application/json' -d '{}'</code></pre>
+          </div>
+
+          <h2 id="connect">连接 S3</h2>
+          <p>把 endpoint 指向 oss，region 任意填写，认证用刚创建的 AK/SK。aws-cli 会自动处理 multipart 与签名。</p>
+          <div class="code-card">
+            <div class="code-head"><span>aws-cli</span><button class="copy-btn" type="button" data-copy="#code-install-cli">复制</button></div>
+            <pre><code id="code-install-cli">export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_DEFAULT_REGION=us-east-1
+E=http://127.0.0.1:9000
+
+aws --endpoint-url $E s3 mb s3://demo
+aws --endpoint-url $E s3 cp ./file.bin s3://demo/file.bin
+aws --endpoint-url $E s3 ls s3://demo/</code></pre>
+          </div>
+          <div class="split-visual" style="margin-top:24px">
+            <button class="image-zoom" type="button" data-image="assets/img/request-flow.svg" data-title="oss 请求周期" aria-label="放大 oss 请求周期图">
+              <img src="assets/img/request-flow.svg" width="900" height="600" alt="oss 请求周期图，S3 直传与浏览器分块上传在提交协议处汇合" decoding="async">
+            </button>
+          </div>
+
+          <h2 id="tls">TLS 传输</h2>
+          <p>默认仍是明文；配置 <code>[tls.server]</code> 后，S3/控制台监听器、witness、Raft RPC、节点间 gRPC mesh、site/repl/tier 出站与 Kafka 一起启用 TLS——没有半 TLS 模式。证书轮换需要重启。</p>
+          <div class="code-card">
+            <div class="code-head"><span>oss.toml</span><button class="copy-btn" type="button" data-copy="#code-install-tls">复制</button></div>
+            <pre><code id="code-install-tls">[tls.server]
+cert = "/etc/oss/server.crt"
+key  = "/etc/oss/server.key"
+# 可选：要求并校验客户端证书（mTLS）
+client_ca = "/etc/oss/ca.crt"
+
+[tls.client]
+# 出站额外信任根（自签/私有 CA 部署时配置）
+ca_cert = "/etc/oss/ca.crt"</code></pre>
+          </div>
+          <p>对端地址仍可写 <code>http://</code>，连接时按 <code>[tls.server]</code> 升级为 https；未启用 TLS 时写 <code>https://</code> 会在启动期拒绝。Kafka 的 SASL/SSL 配置与 mTLS 细节见 <a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README 的 TLS 章节（随发布同步）</a>。</p>
+
+          <h2 id="cluster">集群与强一致</h2>
+          <p>单机跑起来后，可以继续加盘、加节点或配置多站点。M9 提供三种控制面模式：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模式</th><th>配置</th><th>适合</th></tr></thead>
+              <tbody>
+                <tr><td>单机</td><td>无 <code>[site]</code> / <code>[raft]</code></td><td>本地开发、单节点备份</td></tr>
+                <tr><td>多盘 EC</td><td><code>data_dirs</code> + <code>[ec]</code></td><td>单机多盘、纠删码 8+4</td></tr>
+                <tr><td>多站点 Raft</td><td><code>[site]</code> + <code>[raft]</code></td><td>sync 桶、stretch 2×6、3-voter 控制面</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>完整的节点拓扑、witness、sync 写语义、cutover 与 force recovery 步骤在 <a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a> 的 M9 章节（随发布同步）。</p>
+          <p>控制面支持 Level B 滚动升级窗口：先保持 <code>[raft].feature_level = 1</code>（默认），逐个替换节点；全部 voter/learner 都升级后再改为 <code>2</code> 并重启。激活后不可回滚到旧版，数据面（M3/M4）仍非滚动。升级步骤与自动拒绝条件见 README 的「升级顺序」（随发布同步）。</p>
+
+          <h2 id="download">下载与版本</h2>
+          <p>当前 Release 提供源码归档，没有预编译二进制。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.14.0；可直接下载源码包或按本文构建。</p>
+          <p>
+            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.14.0" target="_blank" rel="noopener">打开 v1.14.0 Release</a>
+            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.14.0.tar.gz" target="_blank" rel="noopener">下载源码包</a>
+            <a class="btn btn-ghost" href="changelog.html">版本日志</a>
+          </p>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap footer-grid">
+        <div class="footer-brand">
+          <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
+          <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+        </div>
+        <div class="footer-links">
+          <h2>文档</h2>
+          <a href="install.html">安装</a>
+          <a href="usage.html">使用说明</a>
+          <a href="changelog.html">版本日志</a>
+          <a href="api.html">API 文档</a>
+        </div>
+        <div class="footer-links">
+          <h2>项目</h2>
+          <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="https://github.com/erikwang2013/oss/issues" target="_blank" rel="noopener">Issues</a>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+        </div>
+      </div>
+      <div class="wrap footer-legal">
+        <div class="footer-info" id="busuanzi">
+          <script async src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script>
+          <span id="busuanzi_container_site_pv">本站总访问量 <b id="busuanzi_value_site_pv">0</b> 次 👀</span>
+          <span class="dot">·</span>
+          <span id="busuanzi_container_site_uv">访客数 <b id="busuanzi_value_site_uv">0</b> 人次 🧑‍🚀</span>
+        </div>
+        <div class="legal-links">
+          <a href="https://beian.miit.gov.cn" target="_blank" rel="noopener">粤ICP备2020136226号-10</a>
+          <span>·</span>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+          <span>·</span>
+          <span>© <span data-year>2026</span> oss</span>
+        </div>
+      </div>
+    </footer>
+
+    <button class="to-top" id="to-top" type="button" aria-label="返回顶部" hidden>
+      <img src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="560" height="560" alt="" decoding="async">
+    </button>
+
+    <dialog id="image-dialog" aria-labelledby="image-title">
+      <div class="dialog-head">
+        <h2 id="image-title">架构图</h2>
+        <button class="dialog-close" type="button" data-close-image>关闭</button>
+      </div>
+      <img id="image-large" src="assets/img/architecture.svg" alt="架构图">
+      <p class="dialog-hint">点击背景或按 Esc 关闭。</p>
+    </dialog>
+
+    <script src="assets/js/site.js" defer></script>
+  </body>
+</html>

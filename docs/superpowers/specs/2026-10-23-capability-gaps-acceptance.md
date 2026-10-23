@@ -1,8 +1,9 @@
 # 能力边界清零验收记录（2026-10-23）
 
 - 基线：`v1.13.1`（`a58d64a`）
-- 集成分支：`feat/capability-gaps`，验收 HEAD `d43d908`（产品代码等价于 `86616eb`；其后仅测试与本文档）
-- 状态：实现、集成、聚焦测试与 S3 全量 e2e 完成；**未 push / tag / release**（等用户授权）
+- 发布：**v1.14.0**（2026-10-23），tag `v1.14.0`
+- 集成结果：已合并到 `main`（能力代码 `86616eb`；其后为测试、文档、站点与版本号更新）
+- 状态：实现、集成、聚焦测试与 S3 全量 e2e 完成；已提交、推送并发布
 - 构建环境：主机 `/home` 为 5400rpm 机械盘且被其它会话重压，集成验证统一使用
   `CARGO_TARGET_DIR=/tmp/target-retention`（SSD）；`CARGO_BUILD_JOBS=1`。
 
@@ -96,7 +97,23 @@ Level B 前向兼容窗口已实现：Raft RPC wire/feature 头、term-stamped p
 5. Web `tsc`/`vite` 未运行（worktree 无 `node_modules`）；前端改动为增量、类型一致。
 6. 生命周期破坏性 sweep 的进程内测试覆盖，但未跑独立长时 e2e；AbortIncompleteMultipartUpload 仍 501。
 
-## 6. 发布状态
+## 6. 文档、图片与站点同步（2026-10-23）
 
-分支、提交、测试与文档均在本地集成 worktree；**没有 push、tag、release**。
-发布需用户单独授权，并按仓库发布流程执行 `cargo fmt/clippy` 四闸与版本/README 同步。
+- README：匿名桶策略、AP 资源轴破坏性升级注意、gRPC/滚动升级口径、sync Suspended、
+  桶默认加密、MPU/控制台标签、生命周期结构化配置、partNumber 复制退化、Level B 状态/限制/
+  配置/测试锚、事件白名单、复制限速、技术栈版本与测试计数均已同步。
+- Feature spec：请求头阶段表、CopyObject REPLACE、对象标签、Suspended DELETE、retention/bypass、
+  生命周期 §9、分层 §14、Inventory Parquet/Hive、Batch WASM、运维命令、TLS §1.5 已更新。
+- 设计文档：状态/版本、桶默认加密、AP 别名、MPU 标签、M6/M7/M8/M9 的 TLS 与 Level B、
+  tier 本地盘/GC、非目标列表已更新；历史计划统一加「历史文档」横幅。
+- 图片：architecture / M6 / M7 / M8 / object-lifecycle / request-flow 标签更新；
+  social-preview 修正 forward-ref 渐变并重渲染（中文与蓝色渐变正常）；
+  mascot-static.png / apple-touch-icon.png 用 rsvg-convert 重渲染（修复黑底）。
+- 站点：index/install/usage/changelog/api 增补新能力、TLS/保留期/匿名/滚动升级/协议边界；
+  未发布内容统一标「未发布（能力边界清零）」，最新发布仍为 v1.13.1；sitemap/manifest/SEO 同步。
+
+## 7. 发布状态
+
+提交、测试、文档与站点已纳入 `main`，并发布 **v1.14.0**（tag 与 GitHub Release）。
+注意：GitHub 仓库当前为 private，站点上的 GitHub/Release/源码包链接对未授权访客不可用；
+公开仓库需单独决定。站点静态文件已纳入版本控制，但尚未部署到 `oss.erik.xyz`。

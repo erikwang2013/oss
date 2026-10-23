@@ -1,5 +1,10 @@
 # S3 协议补全 实现计划
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把功能规格里已写死、实现尚未落地的 S3 协议面补齐——**条件请求**（If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since）、**`response-content-*` 响应覆盖参数**、**`Content-MD5` 与 `x-amz-checksum-*` 校验和**——并收口两处边界（多区间 Range 错误码对齐、HEAD 带 Range 的取舍）与控制台对 2.0 问题响应的 e2e 覆盖。

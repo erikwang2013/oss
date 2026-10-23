@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#eef3f8" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0d1a2b" media="(prefers-color-scheme: dark)">
+    <meta name="author" content="艾瑞可 Erik">
+    <meta property="og:locale" content="zh_CN">
+    <meta name="color-scheme" content="light dark">
+    <title>API 文档与多语言生态 | oss（吞吞）</title>
+    <meta name="description" content="oss（吞吞）API 文档入口：S3 兼容 API、README，以及 apidoc-go、apidoc-rust、apidoc-ui 多语言文档工具与同域部署路径。">
+    <meta name="keywords" content="oss API,S3 API,apidoc-go,apidoc-rust,apidoc-ui,API 文档">
+    <link rel="canonical" href="https://oss.erik.xyz/api.html">
+    <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
+    <link rel="manifest" href="manifest.webmanifest">
+    <meta property="og:type" content="article">
+    <meta property="og:site_name" content="oss（吞吞）">
+    <meta property="og:title" content="API 文档与多语言生态 | oss（吞吞）">
+    <meta property="og:description" content="S3 兼容 API、README 与 apidoc 多语言文档入口。">
+    <meta property="og:url" content="https://oss.erik.xyz/api.html">
+    <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="stylesheet" href="assets/css/site.css">
+    <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <header class="site-header">
+      <div class="wrap header-inner">
+        <a class="brand" href="./" aria-label="oss 吞吞首页">
+          <img class="brand-pet" src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="34" height="34" alt="">
+          <span class="brand-word">oss<span>吞吞</span></span>
+        </a>
+        <nav class="nav" aria-label="主导航">
+          <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+          <a href="index.html#iterations">迭代</a>
+          <a href="changelog.html">版本</a>
+          <a href="install.html">安装</a>
+          <a href="usage.html">使用</a>
+          <a href="api.html" aria-current="page">API 文档</a>
+        </nav>
+        <div class="header-actions">
+          <a class="btn btn-ghost btn-sm" href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav">菜单</button>
+        </div>
+      </div>
+      <nav class="mobile-nav" id="mobile-nav" aria-label="移动端导航" hidden>
+        <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+        <a href="index.html#iterations">迭代</a>
+        <a href="changelog.html">版本</a>
+        <a href="install.html">安装</a>
+        <a href="usage.html">使用</a>
+        <a href="api.html" aria-current="page">API 文档</a>
+        <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+      </nav>
+    </header>
+    <div id="top-sentinel" aria-hidden="true"></div>
+
+    <main id="main">
+      <div class="doc-hero">
+        <div class="wrap">
+          <h1>API 文档与多语言生态</h1>
+          <p>oss 的对外协议是 S3，先把 README 与 S3 操作跑通。生态里的 apidoc 系列负责把 Go、Rust 项目的注解生成接口文档，并用 apidoc-ui 统一展示。</p>
+        </div>
+      </div>
+
+      <div class="wrap doc-layout">
+        <aside class="doc-nav" aria-label="本页目录">
+          <a href="#oss-api">oss S3 API</a>
+          <a href="#apidoc">apidoc 生态</a>
+          <a href="#paths">同域部署路径</a>
+          <a href="#ui">apidoc-ui 配置</a>
+          <a href="#more">继续阅读</a>
+        </aside>
+
+        <article class="prose">
+          <h2 id="oss-api">oss S3 API</h2>
+          <p>oss 兼容 S3 的桶与对象操作，支持 SigV4、Multipart Upload / UploadPartCopy / ListMultipartUploads、partNumber、Range GET 与 HEAD Range、ListObjects v1、版本三态、完整生命周期、桶策略与匿名 Principal、对象锁与保留期、事件通知、Select、复制与访问点。直接使用 aws-cli、rclone 或任意 S3 SDK。</p>
+          <ul>
+            <li>服务端点：<code>http://127.0.0.1:9000</code>，路径风格访问。</li>
+            <li>认证：访问密钥 AK/SK，SigV4 签名。</li>
+            <li>完整命令与配置：<a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>。</li>
+          </ul>
+          <div class="code-card">
+            <div class="code-head"><span>最小请求</span><button class="copy-btn" type="button" data-copy="#code-api-s3">复制</button></div>
+            <pre><code id="code-api-s3">aws --endpoint-url http://127.0.0.1:9000 s3api list-buckets
+aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
+  --bucket photos --key cover.jpg</code></pre>
+          </div>
+
+          <h2 id="apidoc">apidoc 生态</h2>
+          <p>apidoc 系列用注解生成接口文档，减少手写文档的漂移。Go 与 Rust 各有一个后端插件，apidoc-ui 是纯静态前端。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>语言 / 组件</th><th>说明</th><th>入口</th></tr></thead>
+              <tbody>
+                <tr><td>Go</td><td>类型化 Doc 声明随路由注册，支持 net/http、Gin、Echo、Chi、Fiber、beego、Kratos、go-zero。</td><td><a href="https://github.com/erikwang2013/apidoc-go" target="_blank" rel="noopener">apidoc-go</a></td></tr>
+                <tr><td>Rust</td><td>proc-macro 在编译期生成文档，linkme 静态收集，兼容 axum、actix-web。</td><td><a href="https://github.com/erikwang2013/apidoc-rust" target="_blank" rel="noopener">apidoc-rust</a></td></tr>
+                <tr><td>UI</td><td>Vue 3 + TypeScript + Vite 的纯静态文档前端，支持在线调试、多应用与 Swagger 导出。</td><td><a href="https://github.com/erikwang2013/apidoc-ui" target="_blank" rel="noopener">apidoc-ui</a></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="paths">同域部署路径</h2>
+          <p>如果把这些文档和 oss 站点放在同一个域名下，可以使用下面的路径。具体由 Web 服务器的静态目录决定。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>路径</th><th>内容</th><th>部署方式</th></tr></thead>
+              <tbody>
+                <tr><td><code>/apidoc-go/</code></td><td>Go 项目文档服务</td><td>需自行部署 apidoc-go 后端或静态产物</td></tr>
+                <tr><td><code>/apidoc-rust/</code></td><td>Rust 项目文档服务</td><td>需自行部署 apidoc-rust 后端或静态产物</td></tr>
+                <tr><td><code>/apidoc-ui/</code></td><td>apidoc-ui 构建产物</td><td>需自行部署；把 <code>apidoc/</code> 目录整体放到该路径</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout">
+            <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
+            <p>apidoc-ui 是纯静态前端，后端地址写在同目录的 <code>config.js</code> 中。修改后刷新即可，不需要重新打包。</p>
+          </div>
+
+          <h2 id="ui">apidoc-ui 配置</h2>
+          <p>把构建产物复制到 <code>/apidoc-ui/</code> 后，确认 <code>index.html</code> 与 <code>config.js</code> 在同一目录，然后按实际后端填写 HOSTS 与 API_PREFIX。</p>
+          <div class="code-card">
+            <div class="code-head"><span>config.js</span><button class="copy-btn" type="button" data-copy="#code-api-config">复制</button></div>
+            <pre><code id="code-api-config">window.apidocFeConfig = {
+  HTTP: {
+    HOSTS: ['https://api.example.com'],
+    API_PREFIX: '/apidoc',
+    TIMEOUT: 30000,
+    WITHCREDENTIALS: false,
+  },
+};</code></pre>
+          </div>
+          <p>多应用通过 URL 参数 <code>?appKey=xxx</code> 切换。替换线上旧文件前先清空旧目录，避免残留的旧哈希资源。</p>
+
+          <h2 id="boundaries">协议边界</h2>
+          <ul>
+            <li><code>partNumber</code> 与 <code>Range</code> 同时出现 → 400 <code>InvalidRequest</code>；复制/分层摄入的对象未携带分段边界，<code>partNumber</code> 退化为仅 part 1 可读。</li>
+            <li>GET 多区间 <code>bytes=0-9,20-29</code> 不返回 <code>multipart/byteranges</code>：服务端剥离 Range 后返回 200 整对象；若 Range 计入 SigV4 SignedHeaders 会 403。</li>
+            <li>匿名 <code>Principal:"*"</code> 仅放行数据面对象操作且须桶策略显式 Allow；控制面与对象锁/保留期头一律 403。</li>
+            <li><code>AbortIncompleteMultipartUpload</code> 仍返回 501；AP 匿名/跨账号/VPC 端点仍为非目标。</li>
+          </ul>
+
+          <h2 id="more">继续阅读</h2>
+          <ul>
+            <li><a href="install.html">安装文档</a>：Docker、源码构建与首次启动。</li>
+            <li><a href="usage.html">使用说明</a>：S3 操作、控制台、版本、加密与 M9 强一致。</li>
+            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.14.0。</li>
+            <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>：完整协议与运维细节（随发布同步）。</li>
+          </ul>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap footer-grid">
+        <div class="footer-brand">
+          <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
+          <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+        </div>
+        <div class="footer-links">
+          <h2>文档</h2>
+          <a href="install.html">安装</a>
+          <a href="usage.html">使用说明</a>
+          <a href="changelog.html">版本日志</a>
+          <a href="api.html">API 文档</a>
+        </div>
+        <div class="footer-links">
+          <h2>项目</h2>
+          <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="https://github.com/erikwang2013/oss/issues" target="_blank" rel="noopener">Issues</a>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+        </div>
+      </div>
+      <div class="wrap footer-legal">
+        <div class="footer-info" id="busuanzi">
+          <script async src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script>
+          <span id="busuanzi_container_site_pv">本站总访问量 <b id="busuanzi_value_site_pv">0</b> 次 👀</span>
+          <span class="dot">·</span>
+          <span id="busuanzi_container_site_uv">访客数 <b id="busuanzi_value_site_uv">0</b> 人次 🧑‍🚀</span>
+        </div>
+        <div class="legal-links">
+          <a href="https://beian.miit.gov.cn" target="_blank" rel="noopener">粤ICP备2020136226号-10</a>
+          <span>·</span>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+          <span>·</span>
+          <span>© <span data-year>2026</span> oss</span>
+        </div>
+      </div>
+    </footer>
+
+    <button class="to-top" id="to-top" type="button" aria-label="返回顶部" hidden>
+      <img src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="560" height="560" alt="" decoding="async">
+    </button>
+
+    <script src="assets/js/site.js" defer></script>
+  </body>
+</html>

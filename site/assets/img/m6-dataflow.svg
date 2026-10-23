@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <title>M6 数据流：事件通知 / S3 Select / 桶复制</title>
+  <desc>三条数据流共享「提交后派发、outbox 至少一次」：事件通知（EventSink → event_outbox → worker → Kafka）、S3 Select（白名单 SQL → 求值 → 事件流帧）、桶复制（ReplSink → repl_outbox → SigV4 PUT → 远端实例）。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="958" height="558" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="40" y="44" font-size="20" font-weight="700" fill="#0f172a">OSS · M6 数据流</text>
+  <text x="40" y="68" font-size="12" fill="#64748b">写后派发 · 积压落 SQLite outbox 分级重试 · 稳态不丢不重，崩溃窗口至少一次 · 读路径 ObjectAccessed（Get/Head 成功才发）</text>
+
+  <!-- ============ 事件通知 ============ -->
+  <rect x="40" y="92" width="280" height="396" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="56" y="118" font-size="14" font-weight="700" fill="#1d4ed8">事件通知（Kafka）</text>
+  <text x="56" y="136" font-size="10.5" fill="#64748b">验收 ① 实收字段 · ② 停机积压→追平</text>
+
+  <rect x="56" y="152" width="248" height="42" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="180" y="170" font-size="11" font-weight="600" fill="#1e3a8a" text-anchor="middle">S3 / aether / console / lifecycle 写提交</text>
+  <text x="180" y="185" font-size="9.5" fill="#3b82f6" text-anchor="middle">8 S3 发射点（含 Get/Head）+ 3 内部路径</text>
+  <line x1="180" y1="194" x2="180" y2="208" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="56" y="210" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="180" y="228" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">EventSink::emit</text>
+  <text x="180" y="243" font-size="9" fill="#64748b" text-anchor="middle">AWS 通知 JSON · 白名单 14 项（含 ObjectAccessed）</text>
+  <line x1="180" y1="252" x2="180" y2="266" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="56" y="268" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="180" y="286" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">event_outbox（SQLite）</text>
+  <text x="180" y="301" font-size="9.5" fill="#64748b" text-anchor="middle">pending / sending / dead · claim token 租约（60s）</text>
+  <line x1="180" y1="310" x2="180" y2="324" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="56" y="326" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="180" y="344" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">worker · R1 分级重试</text>
+  <text x="180" y="359" font-size="9.5" fill="#64748b" text-anchor="middle">连接类永不放弃 · 永久错 &gt;10 次死信 · 退避封顶 300s</text>
+  <line x1="180" y1="368" x2="180" y2="382" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="56" y="384" width="248" height="42" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="180" y="402" font-size="11" font-weight="600" fill="#065f46" text-anchor="middle">Kafka 主题（redpanda / 外部 broker）</text>
+  <text x="180" y="417" font-size="9.5" fill="#059669" text-anchor="middle">topic 预创建 · SASL/SSL 已接线（SASL 需 TLS）</text>
+
+  <text x="56" y="450" font-size="10" fill="#94a3b8">文件 sink 调试旁路：OSS_EVENT_SINK=file:/dir</text>
+  <text x="56" y="466" font-size="10" fill="#94a3b8">worker 间隔：OSS_EVENT_INTERVAL_SECS（默认 1）</text>
+
+  <!-- ============ S3 Select ============ -->
+  <rect x="340" y="92" width="280" height="396" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="356" y="118" font-size="14" font-weight="700" fill="#b45309">S3 Select</text>
+  <text x="356" y="136" font-size="10.5" fill="#64748b">验收 ③ 事件帧 · ⑥ 白名单边界 400</text>
+
+  <rect x="356" y="152" width="248" height="42" rx="8" fill="#fffbeb" stroke="#fde68a"/>
+  <text x="480" y="170" font-size="11" font-weight="600" fill="#78350f" text-anchor="middle">POST /{bucket}/{key}?select</text>
+  <text x="480" y="185" font-size="9" fill="#b45309" text-anchor="middle">ExpressionType=SQL · CSV/JSON · GZIP · ScanRange</text>
+  <line x1="480" y1="194" x2="480" y2="208" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="356" y="210" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="480" y="228" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">校验先行（读对象之前）</text>
+  <text x="480" y="243" font-size="9.5" fill="#64748b" text-anchor="middle">SQL 白名单/格式/压缩/DOCUMENT+ScanRange → 400</text>
+  <line x1="480" y1="252" x2="480" y2="266" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="356" y="268" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="480" y="286" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">sqlparser AST → 白名单 IR</text>
+  <text x="480" y="301" font-size="9.5" fill="#64748b" text-anchor="middle">拒绝 OVER/WINDOW/CTE/DISTINCT/ESCAPE 等修饰</text>
+  <line x1="480" y1="310" x2="480" y2="324" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="356" y="326" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="480" y="344" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">读取 + 求值</text>
+  <text x="480" y="359" font-size="9" fill="#64748b" text-anchor="middle">CSV 字节级 · JSON 两种 · 3VL · 聚合</text>
+  <line x1="480" y1="368" x2="480" y2="382" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="356" y="384" width="248" height="42" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="480" y="402" font-size="11" font-weight="600" fill="#065f46" text-anchor="middle">事件流（s3s 成帧）</text>
+  <text x="480" y="417" font-size="9.5" fill="#059669" text-anchor="middle">Records ≤256KiB · Progress ~1MiB · Stats · End</text>
+
+  <text x="356" y="450" font-size="10" fill="#94a3b8">上限：对象 256MiB · GZIP 解压 512MiB（全量缓冲）</text>
+  <text x="356" y="466" font-size="10" fill="#94a3b8">BZIP2/Parquet 后置 · GZIP 不支持 ScanRange</text>
+
+  <!-- ============ 桶复制 ============ -->
+  <rect x="640" y="92" width="280" height="396" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="656" y="118" font-size="14" font-weight="700" fill="#7e22ce">桶复制</text>
+  <text x="656" y="136" font-size="10.5" fill="#64748b">验收 ④ PENDING→COMPLETED · ⑤ 积压追平</text>
+
+  <rect x="656" y="152" width="248" height="42" rx="8" fill="#faf5ff" stroke="#e9d5ff"/>
+  <text x="780" y="170" font-size="11" font-weight="600" fill="#581c87" text-anchor="middle">写提交（9 入口）</text>
+  <text x="780" y="185" font-size="8.5" fill="#7e22ce" text-anchor="middle">PUT/MPU/Copy/删/批量/aether/console/lifecycle</text>
+  <line x1="780" y1="194" x2="780" y2="208" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="656" y="210" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="780" y="228" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">ReplSink：规则命中</text>
+  <text x="780" y="243" font-size="9" fill="#64748b" text-anchor="middle">前缀过滤 · DM 开关 · REPLICA 防环 · 单调 PENDING</text>
+  <line x1="780" y1="252" x2="780" y2="266" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="656" y="268" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="780" y="286" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">repl_outbox（SQLite）</text>
+  <text x="780" y="301" font-size="9" fill="#64748b" text-anchor="middle">每规则一行 · 300s 租约 · 按行 version_id 读源</text>
+  <line x1="780" y1="310" x2="780" y2="324" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="656" y="326" width="248" height="42" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
+  <text x="780" y="344" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">worker：R1 分级 + 终态聚合</text>
+  <text x="780" y="359" font-size="9" fill="#64748b" text-anchor="middle">在途保持 PENDING · dead→FAILED · 连接类不死信</text>
+  <line x1="780" y1="368" x2="780" y2="382" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <rect x="656" y="384" width="248" height="42" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="780" y="402" font-size="11" font-weight="600" fill="#065f46" text-anchor="middle">远端 oss 实例（SigV4 + REPLICA 头）</text>
+  <text x="780" y="417" font-size="9.5" fill="#059669" text-anchor="middle">同 ETag（单段源断言）· marker → DELETE</text>
+
+  <text x="656" y="450" font-size="10" fill="#94a3b8">[[remotes]] 静态配置 · http/https（TLS 已接线）</text>
+  <text x="656" y="466" font-size="10" fill="#94a3b8">目标桶预创建 · SSE-C 源不支持 · 无限速</text>
+
+  <line x1="40" y1="506" x2="920" y2="506" stroke="#e5e7eb"/>
+  <text x="40" y="528" font-size="10.5" fill="#64748b">outbox 均为「先入队、后写状态」：崩溃只会留下待重试行（至少一次）；worker 与 serve 同进程启动，间隔可配、0=关闭。</text>
+  <text x="40" y="545" font-size="10" fill="#94a3b8">证据：e2e_kafka.sh（三阶段）· tests/e2e_replication.sh（双实例）· README「事件通知 / S3 Select / 桶复制」节</text>
+</svg>

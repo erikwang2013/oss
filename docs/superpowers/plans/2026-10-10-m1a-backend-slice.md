@@ -1,5 +1,10 @@
 # M1a 后端垂直切片 实现计划
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 打通「e-cat 起服务 → s3s 挂载 → 单盘直存 → aetherupload 分块上传原生 ingest → 控制台 API」这条完整链路，让 `aws-cli`/`rclone` 能增删查列、浏览器能上传、控制台能看见。

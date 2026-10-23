@@ -1,0 +1,23 @@
+{
+  "name": "oss（吞吞）",
+  "short_name": "oss 吞吞",
+  "description": "Rust 编写的 S3 兼容分布式对象存储，支持 TLS、访问点、生命周期与滚动升级",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eef3f8",
+  "theme_color": "#0d1a2b",
+  "icons": [
+    {
+      "src": "assets/img/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    },
+    {
+      "src": "assets/img/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

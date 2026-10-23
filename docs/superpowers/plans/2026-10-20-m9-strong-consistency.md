@@ -1,5 +1,10 @@
 # M9 强一致控制面、同步桶与 Stretch EC 实施计划（v5）
 
+> **历史文档（2026-10-23 注）**：本文件记录当时的计划与边界。部分“未实现/非目标/后置”
+> 已在 2026-10-23 能力清理批次或更早落地；以实现代码、README 与
+> `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` 为准。
+
+
 > 设计文档 §M9 / §7.3（`docs/superpowers/specs/2026-10-10-minio-clone-design.md:348-358,612-621,646-664`）；
 > 功能规格 §3.3 / §10.2 / §里程碑（`docs/superpowers/specs/2026-10-10-feature-spec.md:87-92,491-506,815-821`）。
 > 基线：`b160e08`（M8 / v1.12.0 已发布，工作树干净）。本文档是计划；当前任务不改源码，

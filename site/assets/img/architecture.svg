@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" width="960" height="800"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <title>OSS 系统架构</title>
+  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点与 OLAP/作业与 Batch/Inventory/存储分层与 Restore/控制台页面）、M9 Raft 同步强一致与 Level B 滚动升级、TLS/SASL 全链路、AP 别名/SourceIp、Inventory Parquet/Hive、tier local/远端 GC、生命周期完整 Filter。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="958" height="798" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
+
+  <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 系统架构</text>
+  <text x="40" y="70" font-size="11.5" fill="#64748b">Rust 2024 · 五 crate 依赖 · EC 8+4 · 版本/加密/锁 · 事件/Select/复制 · M7 多站点 · M8 AP/OLAP/WASM · Batch · Inventory · 分层 · M9 Raft 滚动 · TLS/SASL</text>
+
+  <!-- 客户端 -->
+  <rect x="690" y="94" width="250" height="56" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="815" y="118" font-size="13.5" font-weight="600" fill="#1e3a8a" text-anchor="middle">aws-cli / rclone</text>
+  <text x="815" y="136" font-size="11" fill="#3b82f6" text-anchor="middle">S3 协议（SigV4 签名 · SSE/锁头 · 版本参数）</text>
+
+  <rect x="170" y="94" width="440" height="56" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="390" y="118" font-size="13.5" font-weight="600" fill="#1e3a8a" text-anchor="middle">浏览器：控制台 SPA（React 19 + antd · Vite）</text>
+  <text x="390" y="136" font-size="11" fill="#3b82f6" text-anchor="middle">aetherupload 分块上传脚本（断线续传 / 秒传）</text>
+
+  <!-- 客户端 → 服务 -->
+  <line x1="850" y1="150" x2="850" y2="228" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="315" y1="150" x2="315" y2="228" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="400" y1="150" x2="400" y2="228" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <!-- oss-server 面板 -->
+  <rect x="40" y="174" width="880" height="356" rx="12" fill="#fbfdff" stroke="#cbd5e1"/>
+  <rect x="40" y="174" width="270" height="30" rx="8" fill="#e2e8f0" stroke="#cbd5e1"/>
+  <text x="52" y="194" font-size="12.5" font-weight="600" fill="#334155">oss-server · ecat + axum（:9000）</text>
+
+  <rect x="60" y="232" width="270" height="240" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="76" y="262" font-size="13" font-weight="600" fill="#0f172a">/api/v1/*　控制台 API</text>
+  <text x="76" y="286" font-size="11" fill="#64748b">JwtLayer（jwt-rust · JWT 12h）· 登录限速（C1）</text>
+  <text x="76" y="312" font-size="11" fill="#374151">登录 · 桶管理 · 对象列表/下载/删除</text>
+  <text x="76" y="334" font-size="11" fill="#374151">上传记录 · 访问密钥 · 子账户与授权</text>
+  <text x="76" y="356" font-size="11" fill="#374151">桶策略 · 生命周期 · 作业/AP/清单（M8）· 审计</text>
+  <text x="76" y="378" font-size="11" fill="#374151">集群状态（按 set 分组 · C2）</text>
+  <text x="76" y="404" font-size="11" fill="#94a3b8">前端登录后种 cookie oss_token</text>
+  <text x="76" y="426" font-size="10.5" fill="#94a3b8">口令 Argon2id · 历史 sha256 登录时透明升级</text>
+  <text x="76" y="450" font-size="10.5" fill="#64748b">M6/M7 worker：outbox → Kafka/远端（TLS/SASL）</text>
+  <text x="76" y="464" font-size="10.5" fill="#64748b">M8 jobs：Batch/Inventory/Transition/Restore</text>
+
+  <rect x="345" y="232" width="270" height="240" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="361" y="262" font-size="13" font-weight="600" fill="#0f172a">/aetherupload/*　分块上传</text>
+  <text x="361" y="286" font-size="11" fill="#64748b">cookie→Bearer 垫片 + JwtLayer</text>
+  <text x="361" y="312" font-size="10.5" fill="#374151">preprocess · uploading · display · download</text>
+  <text x="361" y="334" font-size="11" fill="#374151">秒传索引（SQLite instant_index）</text>
+  <text x="361" y="356" font-size="11" fill="#374151">完成事件 → IngestSink 原生 ingest</text>
+  <text x="361" y="382" font-size="10.5" fill="#b45309">内部摄取明文（不带 SSE · M5 记档）</text>
+  <text x="361" y="404" font-size="11" fill="#374151">上传落桶按 [[groups]] 分组映射</text>
+
+  <rect x="630" y="232" width="270" height="240" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="646" y="262" font-size="13" font-weight="600" fill="#0f172a">S3 fallback（s3s 0.17）</text>
+  <rect x="646" y="274" width="238" height="36" rx="6" fill="#f8fafc" stroke="#dbe3ec"/>
+  <text x="765" y="290" font-size="10.5" fill="#374151" text-anchor="middle">解析请求 + SigV4 验签</text>
+  <text x="765" y="304" font-size="10" fill="#64748b" text-anchor="middle">AK → SK 查 access_keys</text>
+  <line x1="765" y1="310" x2="765" y2="326" stroke="#94a3b8" marker-end="url(#a)"/>
+  <rect x="646" y="330" width="238" height="52" rx="6" fill="#f8fafc" stroke="#dbe3ec"/>
+  <text x="765" y="348" font-size="10.5" fill="#374151" text-anchor="middle">OssS3（xl-s3）</text>
+  <text x="765" y="363" font-size="10" fill="#64748b" text-anchor="middle">授权：策略 Deny 优先 → 三档权限（M4）</text>
+  <text x="765" y="376" font-size="10" fill="#64748b" text-anchor="middle">SSE / 对象锁头解析（M5）</text>
+  <text x="765" y="394" font-size="10" fill="#64748b" text-anchor="middle">AP 别名 / OLAP / 分层（M8）</text>
+  <text x="646" y="412" font-size="11" fill="#374151">桶/对象 CRUD · 版本链 · MPU · Range</text>
+  <text x="646" y="432" font-size="11" fill="#374151">CopyObject（双轴判权）· 批量删逐键</text>
+  <text x="646" y="452" font-size="10.5" fill="#94a3b8">对象锁桶须版本控制 Enabled</text>
+
+  <!-- 面板脚注条 -->
+  <line x1="40" y1="490" x2="920" y2="490" stroke="#e5e7eb"/>
+  <text x="60" y="512" font-size="11" fill="#64748b">ecat 宿主 · 启动自举 · 健康检查 /health/live · /health/cluster · /metrics · CLI：serve / groups / build / clean / fsck / heal / scrub / rebalance</text>
+
+  <!-- 服务 → 内核 -->
+  <line x1="195" y1="530" x2="195" y2="556" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="400" y1="530" x2="400" y2="556" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="590" y1="530" x2="590" y2="556" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <!-- xl-store 内核面板 -->
+  <rect x="40" y="560" width="620" height="104" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <text x="60" y="584" font-size="13" font-weight="600" fill="#166534">xl-store · 存储内核（不依赖任何框架）</text>
+  <text x="60" y="606" font-size="11" fill="#374151">提交协议：tmp → 各盘 rename 数据就位 → xl.meta 两阶段提交（quorum）← 提交点 · 布局校验（__XLDIR__ 展平）</text>
+  <text x="60" y="626" font-size="11" fill="#374151">EC 8+4 编解码与多盘分发 · 版本链（版本桶追加 / delete marker）· 对象锁守卫（GOVERNANCE/COMPLIANCE/LegalHold） · 复制状态（M6）</text>
+  <text x="60" y="646" font-size="11" fill="#374151">密钥库 kms.rs（主密钥 wrap DEK）· 块对齐加密 crypto.rs（先加密后 EC）· mesh quorum 读写 · flock 跨进程锁</text>
+
+  <!-- KMS 侧块 -->
+  <rect x="680" y="560" width="220" height="104" rx="10" fill="#fdf4ff" stroke="#f0abfc"/>
+  <text x="790" y="586" font-size="12" font-weight="600" fill="#86198f" text-anchor="middle">主密钥（M5）</text>
+  <text x="790" y="608" font-size="10" fill="#a21caf" text-anchor="middle">SSE-S3：单钥文件 0600</text>
+  <text x="790" y="626" font-size="10" fill="#a21caf" text-anchor="middle">SSE-KMS：多钥目录（加钥即轮换）</text>
+  <text x="790" y="646" font-size="10" fill="#a21caf" text-anchor="middle">只包 DEK，不加密数据本体</text>
+
+  <!-- 控制面 → SQLite（虚线） -->
+  <line x1="850" y1="530" x2="850" y2="682" stroke="#94a3b8" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="843" y="676" font-size="10" fill="#94a3b8" text-anchor="end">控制面数据（SQL）</text>
+
+  <!-- 内核 → 存储 -->
+  <line x1="205" y1="664" x2="205" y2="686" stroke="#94a3b8" marker-end="url(#a)"/>
+  <line x1="500" y1="664" x2="500" y2="686" stroke="#94a3b8" marker-end="url(#a)"/>
+
+  <!-- 存储层 -->
+  <rect x="60" y="690" width="290" height="88" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="76" y="712" font-size="12" font-weight="600" fill="#334155">data_dir 数据盘 ×N（多盘）</text>
+  <text x="76" y="728" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">&lt;盘&gt;/&lt;桶&gt;/&lt;展平键&gt;/xl.meta</text>
+  <text x="76" y="743" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">{&lt;uuid&gt;/part.N.&lt;shard&gt;}（密文分片）</text>
+  <text x="76" y="758" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">.oss.sys/{tmp, trash, locks} · tier 冷盘池</text>
+
+  <rect x="365" y="690" width="270" height="88" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="381" y="712" font-size="12" font-weight="600" fill="#334155">staging_dir 暂存盘</text>
+  <text x="381" y="730" font-size="10" fill="#475569">分块 *.part → 服务端合并成品</text>
+  <text x="381" y="746" font-size="10" fill="#475569">_header/ 断点 · 秒传命中直接跳过</text>
+  <text x="381" y="762" font-size="10" fill="#94a3b8">成品经 IngestSink 流式进内核</text>
+
+  <rect x="660" y="690" width="240" height="88" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="676" y="712" font-size="12" font-weight="600" fill="#334155">SQLite（控制面）</text>
+  <text x="676" y="730" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">users · access_keys · buckets · audit</text>
+  <text x="676" y="746" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">策略/生命周期 · jobs · AP/OLAP</text>
+  <text x="676" y="762" font-size="10" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">inventory · tier · uploads · 复制</text>
+
+  <text x="930" y="788" font-size="10" fill="#94a3b8" text-anchor="end">© erik.xyz</text>
+</svg>

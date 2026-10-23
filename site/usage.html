@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#eef3f8" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0d1a2b" media="(prefers-color-scheme: dark)">
+    <meta name="author" content="艾瑞可 Erik">
+    <meta property="og:locale" content="zh_CN">
+    <meta name="color-scheme" content="light dark">
+    <title>使用 oss（吞吞）| S3 操作、控制台与强一致模式</title>
+    <meta name="description" content="oss（吞吞）使用说明：aws-cli、multipart/partNumber/Range、控制台、版本三态、完整生命周期、加密、对象锁与保留期、匿名桶策略、事件复制、M9 强一致与 Level B 滚动升级。">
+    <meta name="keywords" content="oss 使用,S3 对象存储,aws-cli,版本控制,生命周期,对象锁,保留期,匿名访问,Raft,强一致,滚动升级">
+    <link rel="canonical" href="https://oss.erik.xyz/usage.html">
+    <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
+    <link rel="manifest" href="manifest.webmanifest">
+    <meta property="og:type" content="article">
+    <meta property="og:site_name" content="oss（吞吞）">
+    <meta property="og:title" content="使用 oss（吞吞）">
+    <meta property="og:description" content="从 aws-cli、MPU/partNumber/Range 到 M9 强一致与 Level B 滚动升级，常用操作、保留期/匿名与控制台路径。">
+    <meta property="og:url" content="https://oss.erik.xyz/usage.html">
+    <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="stylesheet" href="assets/css/site.css">
+    <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <header class="site-header">
+      <div class="wrap header-inner">
+        <a class="brand" href="./" aria-label="oss 吞吞首页">
+          <img class="brand-pet" src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="34" height="34" alt="">
+          <span class="brand-word">oss<span>吞吞</span></span>
+        </a>
+        <nav class="nav" aria-label="主导航">
+          <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+          <a href="index.html#iterations">迭代</a>
+          <a href="changelog.html">版本</a>
+          <a href="install.html">安装</a>
+          <a href="usage.html" aria-current="page">使用</a>
+          <a href="api.html">API 文档</a>
+          <a href="index.html#download">下载</a>
+        </nav>
+        <div class="header-actions">
+          <a class="btn btn-ghost btn-sm" href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="mobile-nav">菜单</button>
+        </div>
+      </div>
+      <nav class="mobile-nav" id="mobile-nav" aria-label="移动端导航" hidden>
+        <a href="index.html">首页</a>
+          <a href="index.html#intro">介绍</a>
+          <a href="index.html#features">功能</a>
+        <a href="index.html#iterations">迭代</a>
+        <a href="changelog.html">版本</a>
+        <a href="install.html">安装</a>
+        <a href="usage.html" aria-current="page">使用</a>
+        <a href="api.html">API 文档</a>
+        <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+      </nav>
+    </header>
+    <div id="top-sentinel" aria-hidden="true"></div>
+
+    <main id="main">
+      <div class="doc-hero">
+        <div class="wrap">
+          <h1>使用吞吞</h1>
+          <p>对外是标准 S3，对内是 Rust 存储内核与可选 Raft 控制面。先用 aws-cli 跑通对象读写，再按需要开启版本、安全、数据流与强一致。</p>
+        </div>
+      </div>
+
+      <div class="wrap doc-layout">
+        <aside class="doc-nav" aria-label="本页目录">
+          <a href="#s3">常用 S3 操作</a>
+          <a href="#s3-mpu">MPU 与 Range</a>
+          <a href="#console">控制台</a>
+          <a href="#versioning">版本与生命周期</a>
+          <a href="#security">加密与对象锁</a>
+          <a href="#retention-anon">保留期与匿名</a>
+          <a href="#dataflow">事件与复制</a>
+          <a href="#m9">M9 强一致</a>
+          <a href="#upgrade">滚动升级</a>
+          <a href="#ops">运维命令</a>
+          <a href="#boundaries">能力边界</a>
+          <a href="#more">继续阅读</a>
+        </aside>
+
+        <article class="prose">
+          <h2 id="s3">常用 S3 操作</h2>
+          <p>把 endpoint、AK、SK 准备好后，aws-cli 的常用命令可以直接使用。区域可以填任意值，服务端按签名与桶配置处理。</p>
+          <div class="code-card">
+            <div class="code-head"><span>aws-cli</span><button class="copy-btn" type="button" data-copy="#code-use-s3">复制</button></div>
+            <pre><code id="code-use-s3">export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_DEFAULT_REGION=us-east-1
+E=http://127.0.0.1:9000
+
+aws --endpoint-url $E s3 mb s3://photos
+aws --endpoint-url $E s3 cp ./cover.jpg s3://photos/cover.jpg
+aws --endpoint-url $E s3 ls s3://photos/
+aws --endpoint-url $E s3 presign s3://photos/cover.jpg --expires-in 3600
+aws --endpoint-url $E s3 rm s3://photos/cover.jpg</code></pre>
+          </div>
+          <p>大文件会自动走 multipart。Range GET、<code>x-amz-meta-*</code>、Storage Class 与对象标签都按 S3 语义处理。</p>
+
+          <h2 id="s3-mpu">Multipart、partNumber 与 Range</h2>
+          <p>除普通分块上传外，还支持从已有对象复制分段、列举未完成上传，以及按段读取。</p>
+          <div class="code-card">
+            <div class="code-head"><span>aws-cli</span><button class="copy-btn" type="button" data-copy="#code-use-mpu">复制</button></div>
+            <pre><code id="code-use-mpu"># 从源对象复制一段作为 part（区间为闭区间）
+aws --endpoint-url $E s3api upload-part-copy --bucket photos \
+  --key big.bin --upload-id &lt;upload-id&gt; --part-number 2 \
+  --copy-source photos/source.bin --copy-source-range bytes=0-5242879
+
+# 列举未完成的分块上传
+aws --endpoint-url $E s3api list-multipart-uploads --bucket photos
+
+# 读取第 2 段
+aws --endpoint-url $E s3api get-object --bucket photos --key big.bin \
+  --part-number 2 part2.bin</code></pre>
+          </div>
+          <ul>
+            <li>ListObjects v1 已实现：<code>aws s3api list-objects</code> 支持 marker / delimiter / max-keys。</li>
+            <li>HEAD 支持单区间 Range；多区间 GET 不返回 <code>multipart/byteranges</code>，服务端会剥离 Range 并返回 200 整对象。</li>
+            <li>若客户端把 Range 计入 SigV4 SignedHeaders，剥离后验签会失败（403 <code>SignatureDoesNotMatch</code>）；预签名 URL 不受影响。</li>
+          </ul>
+
+          <h2 id="console">控制台</h2>
+          <p>控制台是 React 19 + antd 的单页应用，覆盖桶、对象、用户、访问密钥、权限、访问点、作业、Inventory、分层与 Raft 集群状态。</p>
+          <ul>
+            <li>开发模式：后端 <code>9000</code>，前端 <code>5173</code>。</li>
+            <li>Compose 模式：控制台由 nginx 提供，默认 <code>8080</code>。</li>
+            <li>登录后先创建访问密钥，再让 aws-cli 或 SDK 使用。</li>
+          </ul>
+          <div class="callout">
+            <img src="assets/img/pet/cute.svg" data-static="assets/img/pet/static/cute.png" width="360" height="400" alt="" decoding="async">
+            <p>控制台里的桶模式、版本控制、生命周期与访问点操作，最终都会走同一套控制面命令。单机是本地 SQLite，M9 模式经 Raft 提交。</p>
+          </div>
+
+          <h2 id="versioning">版本与生命周期</h2>
+          <p>版本控制支持 <code>Off</code> / <code>Enabled</code> / <code>Suspended</code> 三态。开启后删除对象会生成 delete marker，旧版本仍可读取与恢复；Suspended 下只替换 null 版本。</p>
+          <div class="code-card">
+            <div class="code-head"><span>versioning</span><button class="copy-btn" type="button" data-copy="#code-use-version">复制</button></div>
+            <pre><code id="code-use-version">aws --endpoint-url $E s3api put-bucket-versioning \
+  --bucket photos --versioning-configuration Status=Enabled
+
+aws --endpoint-url $E s3api list-object-versions --bucket photos
+aws --endpoint-url $E s3api get-object --bucket photos --key cover.jpg \
+  --version-id &lt;version-id&gt; cover.old.jpg</code></pre>
+          </div>
+          <p>生命周期规则可在控制台配置，也可以走 S3 API。支持 tag / size / And Filter、Expiration.Date、ExpiredObjectDeleteMarker、多转换、noncurrent expiration / transition 与分层 Restore。对象生命周期图如下。</p>
+          <div class="split-visual" style="margin-top:20px">
+            <button class="image-zoom" type="button" data-image="assets/img/object-lifecycle.svg" data-title="对象生命周期" aria-label="放大对象生命周期图">
+              <img src="assets/img/object-lifecycle.svg" width="900" height="600" alt="oss 对象生命周期图，暂存、提交、版本、删除、noncurrent 生命周期与锁守卫" decoding="async">
+            </button>
+          </div>
+
+          <h2 id="security">加密与对象锁</h2>
+          <p>oss 支持 SSE-S3 与 SSE-KMS 两种服务端加密模式，密钥库启用后访问密钥的 SK 也会加密落库。对象锁需要桶在创建时开启，开启后按保留策略阻止覆盖与删除。</p>
+          <div class="code-card">
+            <div class="code-head"><span>security</span><button class="copy-btn" type="button" data-copy="#code-use-security">复制</button></div>
+            <pre><code id="code-use-security"># 服务端加密上传
+aws --endpoint-url $E s3api put-object \
+  --bucket photos --key secret.bin \
+  --body ./secret.bin --server-side-encryption AES256
+
+# 对象锁桶需要创建时开启
+aws --endpoint-url $E s3api create-bucket \
+  --bucket legal --object-lock-enabled-for-bucket</code></pre>
+          </div>
+          <p>STS 临时凭据分为 AssumeRole 与 GetSessionToken。AssumeRole 只允许管理员调用，避免子账户自铸管理员会话。</p>
+
+          <h2 id="retention-anon">保留期与匿名访问</h2>
+          <p>对象锁桶可对指定版本设置保留期。COMPLIANCE 到期前不可缩短或清除；GOVERNANCE 需要 <code>x-amz-bypass-governance-retention</code> 才能缩短。控制台对象列表会显示 retention / legal-hold 状态。</p>
+          <div class="code-card">
+            <div class="code-head"><span>retention</span><button class="copy-btn" type="button" data-copy="#code-use-retention">复制</button></div>
+            <pre><code id="code-use-retention">aws --endpoint-url $E s3api put-object-retention \
+  --bucket legal --key doc.pdf --version-id &lt;version-id&gt; \
+  --retention 'Mode=COMPLIANCE,RetainUntilDate=2027-01-01T00:00:00Z'
+
+aws --endpoint-url $E s3api get-object-retention \
+  --bucket legal --key doc.pdf --version-id &lt;version-id&gt;</code></pre>
+          </div>
+          <p>匿名访问只对数据面对象操作生效，且必须由桶策略显式 <code>Allow</code>；控制面、桶级操作、对象锁头一律拒绝。示例策略：</p>
+          <div class="code-card">
+            <div class="code-head"><span>bucket policy</span><button class="copy-btn" type="button" data-copy="#code-use-anon">复制</button></div>
+            <pre><code id="code-use-anon">{
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"AWS": "*"},
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::photos/*"
+  }]
+}</code></pre>
+          </div>
+          <p>配置后可用无签名请求读取：<code>curl $E/photos/cover.jpg -o cover.jpg</code>。传输层加密（监听器、Raft/mesh、site/repl/tier、Kafka）见 <a href="install.html#tls">安装页的 TLS 章节</a>。</p>
+
+          <h2 id="dataflow">事件与复制</h2>
+          <p>事件通知通过 <code>oss.toml</code> 配置 Kafka 目标，桶上再写通知配置。S3 Select 走事件与查询路径，桶复制与多站点复制负责把版本送到另一个位置。</p>
+          <ul>
+            <li>事件：桶事件写入 <code>event_outbox</code>，worker 投递到 Kafka，失败重试与死信可查。</li>
+            <li>Select：支持 CSV / JSON 查询，结果流式返回，限制在内存预算内。</li>
+            <li>复制：每桶规则、PENDING 到 COMPLETED 状态、停机积压追平与 marker 处理。</li>
+          </ul>
+          <div class="split-visual" style="margin-top:20px">
+            <button class="image-zoom" type="button" data-image="assets/img/m6-dataflow.svg" data-title="M6 数据流" aria-label="放大 M6 数据流图">
+              <img src="assets/img/m6-dataflow.svg" width="900" height="600" alt="M6 数据流图，事件通知、S3 Select 与桶复制" decoding="async">
+            </button>
+          </div>
+
+          <h2 id="m9">M9 强一致</h2>
+          <p>M9 把控制面放到 Raft 上，并把跨站点数据面分成两种模式。两者互斥，按桶或按集群选择。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模式</th><th>写语义</th><th>适合</th></tr></thead>
+              <tbody>
+                <tr><td>sync 桶</td><td>远端先确认，再提交本地；远端不可达返回 503，不静默降级</td><td>合规桶、小对象、跨站点强一致</td></tr>
+                <tr><td>stretch 2×6</td><td>两站点各 6 盘，EC 8+4，单站点 fail-closed</td><td>双站点数据面，不依赖 witness</td></tr>
+                <tr><td>3-voter Raft</td><td>A/B 数据站点 + C witness，quorum 2</td><td>控制面高可用、成员变更与恢复</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>sync 桶通过控制台创建时选择 sync 模式，或调用控制面 API：</p>
+          <div class="code-card">
+            <div class="code-head"><span>sync bucket</span><button class="copy-btn" type="button" data-copy="#code-use-sync">复制</button></div>
+            <pre><code id="code-use-sync">curl -s -X POST http://127.0.0.1:9000/api/v1/buckets \
+  -H "authorization: Bearer &lt;token&gt;" \
+  -H 'content-type: application/json' \
+  -d '{"name":"compliance","replication_mode":"sync"}'</code></pre>
+          </div>
+          <div class="callout">
+            <img src="assets/img/pet/joy.svg" data-static="assets/img/pet/static/joy.png" width="360" height="400" alt="" decoding="async">
+            <p>M9 的成员变更、witness 部署、cutover 与 force recovery 是运维动作，按 README 的 runbook（随发布同步）执行。不要在运行中的集群手改 <code>raft.db</code>。</p>
+          </div>
+
+          <h2 id="upgrade">Level B 滚动升级</h2>
+          <p>控制面可以逐节点替换：保持 <code>[raft].feature_level = 1</code>（默认），先升级所有 voter 与 learner；leader 的生效级别取当前 voter/learner 的最小值。全部节点都升级后，再把 <code>feature_level</code> 改为 <code>2</code> 并重启，激活会写入 <code>schema_meta.raft_feature_level</code>。</p>
+          <ul>
+            <li>回滚只在激活前可行（停集群、换回旧二进制、删除 <code>feature_level</code> 键后启动）；激活后必须换回支持该级别的二进制。</li>
+            <li>成员 add/promote 会预检目标节点的 wire/feature 级别，混合版本时返回 409 并拒绝。</li>
+            <li>数据面（M3/M4 分片、EC、放置）仍非滚动；跨版本 cutover / force-recover 也不在兼容窗口内。</li>
+          </ul>
+
+          <h2 id="ops">运维命令</h2>
+          <p>服务端二进制自带巡检、修复、扩容与清理命令。建议先用只读或 dry-run 看报告，再执行写操作。</p>
+          <div class="code-card">
+            <div class="code-head"><span>ops</span><button class="copy-btn" type="button" data-copy="#code-use-ops">复制</button></div>
+            <pre><code id="code-use-ops">oss-server clean 1          # 回收 1 天前的 tmp/trash 残骸
+oss-server fsck             # 全盘巡检，报告落 .oss.sys/fsck/
+oss-server fsck --repair    # 最小修复：删孤儿 + 读时修
+oss-server heal             # fsck --repair + 桶目录补建
+oss-server scrub            # 深度巡检，逐块对偶校验
+oss-server rebalance --dry-run
+oss-server rebalance --apply</code></pre>
+          </div>
+          <p>巡检与修复不要和在途上传、写入并跑。每节点各自执行，远端孤儿只由该节点自己回收。</p>
+
+          <h2 id="boundaries">能力边界</h2>
+          <p>以下能力仍是明确非目标，或需要单独的架构工作；调用会 fail-closed 或返回 501：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>边界</th><th>现状</th></tr></thead>
+              <tbody>
+                <tr><td>AP 匿名 / 跨账号 / VPC 端点</td><td>不做；AP 匿名请求 403，SourceIp 仅单层反代</td></tr>
+                <tr><td>AP 桶级 Create/Delete/ListBuckets</td><td>不做；走控制面 API</td></tr>
+                <tr><td>Inventory 增量 / 跨账号</td><td>全量扫描、CSV/Parquet</td></tr>
+                <tr><td>AbortIncompleteMultipartUpload</td><td>501（需 MPU 索引）</td></tr>
+                <tr><td>Batch 抢占 / 跨账号通知</td><td>不做</td></tr>
+                <tr><td>tier 流式搬运</td><td>全内存</td></tr>
+                <tr><td>Level C 双向混合版本 / 数据面滚动</td><td>不做；仅 Level B 控制面窗口</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>已知限制：复制/tier 摄入的对象暂不携带分段边界，<code>partNumber</code> 会退化为旧语义；签 Range 的多区间请求可能 403；<code>part_sizes</code> 只在 MPU complete 落盘。完整清单见仓库的验收记录。</p>
+
+          <h2 id="more">继续阅读</h2>
+          <ul>
+            <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a>：完整配置、S3 API、M8 控制面与 M9 runbook（随发布同步）。</li>
+            <li><a href="install.html">安装文档</a>：Docker、源码、首次启动与访问密钥。</li>
+            <li><a href="changelog.html">版本日志</a>：每个版本的变更与验收记录。</li>
+            <li><a href="api.html">API 文档</a>：多语言 apidoc 入口与同域部署路径。</li>
+          </ul>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap footer-grid">
+        <div class="footer-brand">
+          <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
+          <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+        </div>
+        <div class="footer-links">
+          <h2>文档</h2>
+          <a href="install.html">安装</a>
+          <a href="usage.html">使用说明</a>
+          <a href="changelog.html">版本日志</a>
+          <a href="api.html">API 文档</a>
+        </div>
+        <div class="footer-links">
+          <h2>项目</h2>
+          <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="https://github.com/erikwang2013/oss/issues" target="_blank" rel="noopener">Issues</a>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+        </div>
+      </div>
+      <div class="wrap footer-legal">
+        <div class="footer-info" id="busuanzi">
+          <script async src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script>
+          <span id="busuanzi_container_site_pv">本站总访问量 <b id="busuanzi_value_site_pv">0</b> 次 👀</span>
+          <span class="dot">·</span>
+          <span id="busuanzi_container_site_uv">访客数 <b id="busuanzi_value_site_uv">0</b> 人次 🧑‍🚀</span>
+        </div>
+        <div class="legal-links">
+          <a href="https://beian.miit.gov.cn" target="_blank" rel="noopener">粤ICP备2020136226号-10</a>
+          <span>·</span>
+          <a href="https://erik.xyz" target="_blank" rel="noopener">艾瑞可 Erik</a>
+          <span>·</span>
+          <span>© <span data-year>2026</span> oss</span>
+        </div>
+      </div>
+    </footer>
+
+    <button class="to-top" id="to-top" type="button" aria-label="返回顶部" hidden>
+      <img src="assets/img/mascot.svg" data-static="assets/img/mascot-static.png" width="560" height="560" alt="" decoding="async">
+    </button>
+
+    <dialog id="image-dialog" aria-labelledby="image-title">
+      <div class="dialog-head">
+        <h2 id="image-title">架构图</h2>
+        <button class="dialog-close" type="button" data-close-image>关闭</button>
+      </div>
+      <img id="image-large" src="assets/img/architecture.svg" alt="架构图">
+      <p class="dialog-hint">点击背景或按 Esc 关闭。</p>
+    </dialog>
+
+    <script src="assets/js/site.js" defer></script>
+  </body>
+</html>
