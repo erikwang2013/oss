@@ -1088,6 +1088,136 @@ async fn destination_revoked_marks_job_error() {
     );
 }
 
+/// 运行期复核所有者仍启用：停用后配置不得继续产出（fail-closed，无输出）。
+#[tokio::test]
+async fn disabled_owner_marks_job_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    st.db
+        .set_permissions(
+            sub,
+            &[
+                PermissionRow {
+                    bucket: "src".into(),
+                    read: true,
+                    write: false,
+                    delete: false,
+                },
+                PermissionRow {
+                    bucket: "dst".into(),
+                    read: false,
+                    write: true,
+                    delete: false,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    st.inventory
+        .put_config("src", &user(sub, false), &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap();
+
+    assert!(st.db.set_user_status(sub, false).await.unwrap());
+    let key = "manual-disabled";
+    let job = enqueue_run(&st.db, "src", "c1", key, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+
+    let run = run_row(&st, "src", "c1", key).await;
+    assert_eq!(run.state, "error");
+    assert_eq!(run.manifest_key, None);
+    assert!(
+        run.error.as_deref().unwrap_or("").contains("已停用"),
+        "error={:?}",
+        run.error
+    );
+    let job_row = st.db.job_get(job).await.unwrap().unwrap();
+    assert_eq!(job_row["state"], "error");
+    assert_eq!(job_row["progress"], 0);
+    assert!(
+        keys_under(&st, "dst", &format!("src/c1/{key}"))
+            .await
+            .is_empty()
+    );
+}
+
+/// 运行期复核源桶读权限：撤销后失败关闭，不扫描也不写输出。
+#[tokio::test]
+async fn source_revoked_marks_job_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    let sub = st.db.create_user("sub", "pw", false).await.unwrap();
+    st.db
+        .set_permissions(
+            sub,
+            &[
+                PermissionRow {
+                    bucket: "src".into(),
+                    read: true,
+                    write: false,
+                    delete: false,
+                },
+                PermissionRow {
+                    bucket: "dst".into(),
+                    read: false,
+                    write: true,
+                    delete: false,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    st.inventory
+        .put_config("src", &user(sub, false), &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap();
+
+    // 只撤源桶读、保留目标桶写：目标侧校验仍通过，源扫描授权必须拦住。
+    st.db
+        .set_permissions(
+            sub,
+            &[PermissionRow {
+                bucket: "dst".into(),
+                read: false,
+                write: true,
+                delete: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let key = "manual-src-revoked";
+    let job = enqueue_run(&st.db, "src", "c1", key, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+
+    let run = run_row(&st, "src", "c1", key).await;
+    assert_eq!(run.state, "error");
+    assert_eq!(run.manifest_key, None);
+    assert!(
+        run.error.as_deref().unwrap_or("").contains("ListBucket"),
+        "error={:?}",
+        run.error
+    );
+    let job_row = st.db.job_get(job).await.unwrap().unwrap();
+    assert_eq!(job_row["state"], "error");
+    assert_eq!(job_row["progress"], 0);
+    assert!(
+        keys_under(&st, "dst", &format!("src/c1/{key}"))
+            .await
+            .is_empty()
+    );
+}
+
 /// I4：目标桶策略显式 Deny PutObject 压过所有者/管理员表权限——配置期拒绝、运行期报错且无输出。
 #[tokio::test]
 async fn destination_bucket_policy_deny_wins() {

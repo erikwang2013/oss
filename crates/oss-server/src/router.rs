@@ -155,15 +155,25 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     let app = app.layer(middleware::from_fn(restore_accepted));
     // M8：SourceIp 条件求值的连接对端（最外层，S3 fallback 也覆盖）。ecat 的 serve 不带
     // connect_info，生产用可信反代注入 XFF；只有显式 `OSS_AP_TRUSTED_PROXY=1` 才信。
+    // 转发头仅在直连 TCP 对端落在 `OSS_AP_TRUSTED_PEER_CIDRS` 内时采信；未配置该网段
+    // （或传输层不提供 ConnectInfo，如 ecat 明文 HttpServer）→ 一律不采信（fail-closed）。
     // 默认单层反代（取最右一跳，向后兼容）；多层用 HOPS 或可信 CIDR 配置，解析失败启动失败。
     let trust_proxy = std::env::var("OSS_AP_TRUSTED_PROXY")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
     let trust = if trust_proxy {
-        Some(Arc::new(ProxyTrust::from_env()?))
+        let trust = ProxyTrust::from_env()?;
+        if trust.peers.is_empty() {
+            tracing::warn!(
+                "OSS_AP_TRUSTED_PROXY=1 但未配置 OSS_AP_TRUSTED_PEER_CIDRS：\
+                 X-Forwarded-For / x-oss-source-vpc 一律不采信（fail-closed）"
+            );
+        }
+        Some(Arc::new(trust))
     } else {
         None
     };
     // `aws:SourceVpc` 的来源证明：静态部署 ID（优先）或可信反代的单行头；非法配置启动失败。
+    // 头形态的证明同样要求直连对端是可信反代。
     let vpc = Arc::new(VpcAttest::from_env(trust_proxy)?);
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
         let trust = trust.clone();
@@ -174,42 +184,61 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
 }
 
 /// 可信反代配置（仅 `OSS_AP_TRUSTED_PROXY` 开启时解析）：
+/// - `OSS_AP_TRUSTED_PEER_CIDRS`：允许直连 S3 监听器的反代网段。**只有实际 TCP 对端
+///   落在这些网段内**才采信转发头；未配置 → 转发头一律不采信（安全默认）。仅凭
+///   `OSS_AP_TRUSTED_PROXY=1` 不再足以信任头，避免直连客户端伪造。
 /// - `OSS_AP_TRUSTED_PROXY_HOPS`（默认 1）：前置代理层数，取右起第 HOPS 项为客户端；
 ///   单层反代 = 最右一跳（旧行为）。
 /// - `OSS_AP_TRUSTED_PROXY_CIDRS`：逗号分隔可信代理网段；配置后从右向左跳过可信代理，
-///   首个非可信项为客户端（此模式忽略 HOPS）。
+///   首个非可信项为客户端（此模式忽略 HOPS）。它过滤的是**头内链路**，不是直连对端。
 ///
 /// 非法网段/0 跳 → 启动失败（配置错误不静默降级）。
 #[derive(Clone)]
 struct ProxyTrust {
     hops: usize,
     cidrs: Vec<xl_s3::ap::Cidr>,
+    peers: Vec<xl_s3::ap::Cidr>,
 }
 
 impl ProxyTrust {
     fn from_env() -> Result<Self, String> {
-        let hops = match std::env::var("OSS_AP_TRUSTED_PROXY_HOPS") {
-            Ok(v) if !v.trim().is_empty() => v
-                .trim()
+        Self::parse(
+            std::env::var("OSS_AP_TRUSTED_PROXY_HOPS").ok().as_deref(),
+            std::env::var("OSS_AP_TRUSTED_PROXY_CIDRS").ok().as_deref(),
+            std::env::var("OSS_AP_TRUSTED_PEER_CIDRS").ok().as_deref(),
+        )
+    }
+
+    /// 纯解析入口（测试用）：None = 未设置。
+    fn parse(hops: Option<&str>, cidrs: Option<&str>, peers: Option<&str>) -> Result<Self, String> {
+        let hops = match hops.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => v
                 .parse::<usize>()
                 .map_err(|_| format!("OSS_AP_TRUSTED_PROXY_HOPS 非法: {}", v.escape_debug()))?,
-            _ => 1,
+            None => 1,
         };
         if hops == 0 {
             return Err("OSS_AP_TRUSTED_PROXY_HOPS 必须 >= 1".into());
         }
-        let cidrs = match std::env::var("OSS_AP_TRUSTED_PROXY_CIDRS") {
-            Ok(v) if !v.trim().is_empty() => v
-                .split(',')
-                .map(|raw| {
-                    let raw = raw.trim();
-                    xl_s3::ap::parse_cidr(raw)
-                        .ok_or_else(|| format!("OSS_AP_TRUSTED_PROXY_CIDRS 非法 CIDR: {raw}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => Vec::new(),
-        };
-        Ok(Self { hops, cidrs })
+        Ok(Self {
+            hops,
+            cidrs: parse_cidr_list(cidrs, "OSS_AP_TRUSTED_PROXY_CIDRS")?,
+            peers: parse_cidr_list(peers, "OSS_AP_TRUSTED_PEER_CIDRS")?,
+        })
+    }
+
+    /// 直连对端是否在显式反代网段内。无对端信息（传输层不提供 ConnectInfo）→ false。
+    fn peer_trusted(&self, direct: Option<IpAddr>) -> bool {
+        direct.is_some_and(|ip| self.peers.iter().any(|c| c.contains(ip)))
+    }
+
+    /// AP 条件使用的客户端地址。只有直连对端可信时才解析转发头；否则退回真实对端。
+    /// 转发头畸形/跳数不足 → None（fail-closed，不回退到反代自身 IP）。
+    fn resolve(&self, headers: &axum::http::HeaderMap, direct: Option<IpAddr>) -> Option<IpAddr> {
+        if !self.peer_trusted(direct) {
+            return direct;
+        }
+        self.client_ip(headers)
     }
 
     fn client_ip(&self, headers: &axum::http::HeaderMap) -> Option<IpAddr> {
@@ -217,10 +246,23 @@ impl ProxyTrust {
     }
 }
 
+fn parse_cidr_list(raw: Option<&str>, name: &str) -> Result<Vec<xl_s3::ap::Cidr>, String> {
+    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    v.split(',')
+        .map(|raw| {
+            let raw = raw.trim();
+            xl_s3::ap::parse_cidr(raw).ok_or_else(|| format!("{name} 非法 CIDR: {raw}"))
+        })
+        .collect()
+}
+
 /// `aws:SourceVpc` 的**来源证明**（不是 PrivateLink 端点身份）：
 /// - `OSS_AP_VPC_ID` 非空：进程级静态证明（单 VPC 部署），头一律不采信；
-/// - 否则仅当 `OSS_AP_TRUSTED_PROXY=1` 时采信恰好一条 `x-oss-source-vpc` 头，
-///   形态须为 `vpc-`/`vpce-` + [a-z0-9-]{1,64}；重复/畸形/未信任 → 无证明（fail-closed）。
+/// - 否则仅当 `OSS_AP_TRUSTED_PROXY=1` 且直连对端在 `OSS_AP_TRUSTED_PEER_CIDRS`
+///   内时采信恰好一条 `x-oss-source-vpc` 头，形态须为 `vpc-`/`vpce-` +
+///   [a-z0-9-]{1,64}；重复/畸形/未信任/对端不可信 → 无证明（fail-closed）。
 ///
 /// 反代必须**覆盖**客户端自带的同名头；未显式开启信任时该头完全无效。
 #[derive(Clone)]
@@ -247,11 +289,13 @@ impl VpcAttest {
         })
     }
 
-    fn value(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+    /// `peer_trusted` = 直连对端是否在 `OSS_AP_TRUSTED_PEER_CIDRS` 内。静态 ID 与对端
+    /// 无关；头形态仅在显式信任反代且对端可信时成立，否则无证明（fail-closed）。
+    fn value(&self, headers: &axum::http::HeaderMap, peer_trusted: bool) -> Option<String> {
         if let Some(id) = &self.static_id {
             return Some(id.clone());
         }
-        if !self.trust_proxy {
+        if !self.trust_proxy || !peer_trusted {
             return None;
         }
         let mut vals = headers.get_all("x-oss-source-vpc").iter();
@@ -270,15 +314,19 @@ async fn ap_peer(
     trust: Option<Arc<ProxyTrust>>,
     vpc: Arc<VpcAttest>,
 ) -> Response {
-    let ip = req
+    // ConnectInfo 是唯一可信的直连对端来源；缺失（如 ecat 明文 listener）时转发头不采信。
+    let direct = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_canonical())
-        .or_else(|| trust.as_ref().and_then(|t| t.client_ip(req.headers())));
+        .map(|c| c.0.ip().to_canonical());
+    let (ip, peer_trusted) = match trust.as_ref() {
+        Some(t) => (t.resolve(req.headers(), direct), t.peer_trusted(direct)),
+        None => (direct, false),
+    };
     if let Some(ip) = ip {
         req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
     }
-    if let Some(id) = vpc.value(req.headers()) {
+    if let Some(id) = vpc.value(req.headers(), peer_trusted) {
         req.extensions_mut().insert(xl_s3::ap::ApVpc(id));
     }
     next.run(req).await
@@ -794,15 +842,19 @@ mod tests {
             trust_proxy: false,
         };
         h.insert("x-oss-source-vpc", "vpc-abc123".parse().unwrap());
-        assert!(untrusted.value(&h).is_none());
-        // 可信反代：恰好一条合法头才成立
+        assert!(untrusted.value(&h, true).is_none());
+        // 可信反代 + 可信直连对端：恰好一条合法头才成立
         let trusted = VpcAttest {
             static_id: None,
             trust_proxy: true,
         };
-        assert_eq!(trusted.value(&h).as_deref(), Some("vpc-abc123"));
+        assert_eq!(trusted.value(&h, true).as_deref(), Some("vpc-abc123"));
+        assert!(
+            trusted.value(&h, false).is_none(),
+            "直连对端不在 PEER_CIDRS → 头不采信"
+        );
         assert_eq!(
-            trusted.value(&axum::http::HeaderMap::new()),
+            trusted.value(&axum::http::HeaderMap::new(), true),
             None,
             "缺头 → 无证明"
         );
@@ -810,7 +862,7 @@ mod tests {
         let mut dup = axum::http::HeaderMap::new();
         dup.append("x-oss-source-vpc", "vpc-a".parse().unwrap());
         dup.append("x-oss-source-vpc", "vpc-b".parse().unwrap());
-        assert!(trusted.value(&dup).is_none());
+        assert!(trusted.value(&dup, true).is_none());
         // 畸形（逗号拼接/大写/前缀错误/超长）→ 无证明
         for bad in [
             "vpc-a,vpc-b",
@@ -821,22 +873,67 @@ mod tests {
         ] {
             let mut h = axum::http::HeaderMap::new();
             h.insert("x-oss-source-vpc", bad.parse().unwrap());
-            assert!(trusted.value(&h).is_none(), "{bad}");
+            assert!(trusted.value(&h, true).is_none(), "{bad}");
         }
         // 静态 ID 优先，且头（含伪造值）一律不采信
         let fixed = VpcAttest {
             static_id: Some("vpc-static".into()),
             trust_proxy: false,
         };
-        assert_eq!(fixed.value(&h).as_deref(), Some("vpc-static"));
+        assert_eq!(fixed.value(&h, false).as_deref(), Some("vpc-static"));
         h.insert("x-oss-source-vpc", "vpc-attacker".parse().unwrap());
-        assert_eq!(fixed.value(&h).as_deref(), Some("vpc-static"));
+        assert_eq!(fixed.value(&h, true).as_deref(), Some("vpc-static"));
         // 配置值校验
         assert!(xl_s3::ap::valid_vpc_id("vpc-0123456789abcdef0"));
         assert!(xl_s3::ap::valid_vpc_id("vpce-abc"));
         assert!(!xl_s3::ap::valid_vpc_id("vpc-"));
         assert!(!xl_s3::ap::valid_vpc_id("vpc-ABC"));
         assert!(!xl_s3::ap::valid_vpc_id(""));
+    }
+
+    /// 转发头仅在直连对端属于 `OSS_AP_TRUSTED_PEER_CIDRS` 时采信：
+    /// 直连伪造者退回真实对端；无对端信息/无允许网段/链路畸形 → fail-closed。
+    #[test]
+    fn forwarded_headers_require_trusted_direct_peer() {
+        use super::ProxyTrust;
+        let t = ProxyTrust::parse(None, None, Some("10.0.0.0/8, 127.0.0.1")).unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+
+        // 允许的反代网段 / 回环反代 → 采信链尾客户端
+        assert_eq!(
+            t.resolve(&h, Some("10.1.2.3".parse().unwrap())),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert_eq!(
+            t.resolve(&h, Some("127.0.0.1".parse().unwrap())),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        // 直连对端不在允许网段：只认真实对端，伪造头无效
+        assert_eq!(
+            t.resolve(&h, Some("198.51.100.7".parse().unwrap())),
+            Some("198.51.100.7".parse().unwrap())
+        );
+        assert!(!t.peer_trusted(Some("198.51.100.7".parse().unwrap())));
+        // 无 ConnectInfo（传输层不给对端）：不解析头
+        assert_eq!(t.resolve(&h, None), None);
+        assert!(!t.peer_trusted(None));
+        // 未配置 PEER_CIDRS：安全默认 = 不信任任何转发头
+        let no_peers = ProxyTrust::parse(None, None, None).unwrap();
+        assert_eq!(
+            no_peers.resolve(&h, Some("10.1.2.3".parse().unwrap())),
+            Some("10.1.2.3".parse().unwrap())
+        );
+        assert!(!no_peers.peer_trusted(Some("10.1.2.3".parse().unwrap())));
+        // 重复头行（可信对端）：链不可归属 → None，不回退到反代 IP
+        let mut dup = axum::http::HeaderMap::new();
+        dup.append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        dup.append("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        assert_eq!(t.resolve(&dup, Some("10.1.2.3".parse().unwrap())), None);
+        // 非法 CIDR 配置 → 启动失败
+        assert!(ProxyTrust::parse(None, None, Some("not-a-cidr")).is_err());
+        assert!(ProxyTrust::parse(None, Some("garbage"), None).is_err());
+        assert!(ProxyTrust::parse(Some("0"), None, None).is_err());
     }
 
     /// RestoreObject 线上状态修复：仅 POST `?restore` 的 200 → 202 + `x-amz-restore`；
