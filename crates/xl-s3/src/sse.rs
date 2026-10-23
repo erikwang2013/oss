@@ -26,22 +26,29 @@ impl SseReq {
         }
     }
 
-    /// 服务端模式的持久化标识（MPU create 记录用："sse-s3"/"sse-kms"；SSE-C/无 = None）。
-    pub fn sse_kind(&self) -> Option<&'static str> {
+    /// 服务端模式的持久化标识（MPU create 记录用："sse-s3"/"sse-kms"/"sse-kms:<cmk>"；
+    /// SSE-C/无 = None）。显式 CMK 扩展形态由旧二进制按未知 kind 拒绝（fail-closed）。
+    pub fn sse_kind(&self) -> Option<String> {
         match &self.spec {
-            Some(EncSpec::SseS3) => Some("sse-s3"),
-            Some(EncSpec::SseKms) => Some("sse-kms"),
+            Some(EncSpec::SseS3) => Some("sse-s3".to_string()),
+            Some(EncSpec::SseKms) => Some("sse-kms".to_string()),
+            Some(EncSpec::SseKmsCmk(name)) => Some(format!("sse-kms:{name}")),
             _ => None,
         }
     }
 }
 
-/// M8 缺口 C：桶默认加密线格式 → `EncSpec`；未知值 → None（记录损坏，调用方失败关闭）。
+/// M8 缺口 C / 3.16：桶默认加密线格式 → `EncSpec`；未知值 → None（记录损坏，调用方失败关闭）。
+/// 显式 CMK 编码为 `aws:kms:<name>`（沿用 TEXT 列，无 schema 变更）。
 pub fn enc_spec_from_default(value: &str) -> Option<EncSpec> {
     match value {
         "AES256" => Some(EncSpec::SseS3),
         "aws:kms" => Some(EncSpec::SseKms),
-        _ => None,
+        v => {
+            let name = v.strip_prefix("aws:kms:")?;
+            let name = xl_store::kms::parse_cmk_id(name).ok()?;
+            Some(EncSpec::SseKmsCmk(name.to_string()))
+        }
     }
 }
 
@@ -49,7 +56,8 @@ pub fn enc_spec_from_default(value: &str) -> Option<EncSpec> {
 /// - `algo/key/md5` = `sse_customer_*`；`sse` = `server_side_encryption`；`kms_key_id` = `ssekms_key_id`。
 ///
 /// 规则：SSE-C 三件套与 `sse`/`ssekms_key_id` 互斥；`sse` 只认 "AES256"（SSE-S3）/ "aws:kms"
-/// （文件型 SSE-KMS）；显式 CMK（kms key id）→ 400（R2：钉子「不做多 CMK 编排」）。
+/// （文件型 SSE-KMS）；显式 CMK（kms key id）须与 "aws:kms" 同现，形态非法 → 400。
+/// CMK 是否存在于本节点密钥环由服务层/写路径校验（不在名存在 → 400，fail-closed）。
 pub fn parse_sse(
     algo: Option<&str>,
     key_b64: Option<&str>,
@@ -100,14 +108,14 @@ pub fn parse_sse(
                 out.spec = Some(EncSpec::SseS3);
             }
             "aws:kms" => {
-                if kms_key_id.is_some() {
-                    // R2：文件型 KMS 单主密钥（不做多 CMK 编排）；HTTP KMS 落地时再开
-                    return Err(s3s::s3_error!(
-                        InvalidRequest,
-                        "file-backed KMS does not support specifying a CMK"
-                    ));
-                }
-                out.spec = Some(EncSpec::SseKms);
+                out.spec = Some(match kms_key_id {
+                    // 3.16：显式 CMK——名/ARN 严格解析（路径白名单），存在性由写路径校验。
+                    Some(raw) => {
+                        let name = xl_store::kms::parse_cmk_id(raw).map_err(to_s3_error)?;
+                        EncSpec::SseKmsCmk(name.to_string())
+                    }
+                    None => EncSpec::SseKms,
+                });
             }
             _ => {
                 return Err(s3s::s3_error!(
@@ -156,7 +164,8 @@ pub fn sse_out(rec: Option<&EncryptionRecord>) -> SseOut {
         },
         Some(r) => SseOut {
             server_side_encryption: Some("aws:kms"),
-            kms_key_id: Some(r.key_id.clone()),
+            // 3.16：显式 CMK 回用户态名/ARN；旧记录（或无字段）按内部 key_id 回显（k<n>）。
+            kms_key_id: Some(r.kms_key_id.clone().unwrap_or_else(|| r.key_id.clone())),
             sse_c_algorithm: None,
             sse_c_key_md5: None,
         },
@@ -176,6 +185,12 @@ pub fn sse_out_from_spec(r: &SseReq) -> SseOut {
         Some(EncSpec::SseKms) => SseOut {
             server_side_encryption: Some("aws:kms"),
             kms_key_id: None,
+            sse_c_algorithm: None,
+            sse_c_key_md5: None,
+        },
+        Some(EncSpec::SseKmsCmk(name)) => SseOut {
+            server_side_encryption: Some("aws:kms"),
+            kms_key_id: Some(name.clone()),
             sse_c_algorithm: None,
             sse_c_key_md5: None,
         },
@@ -221,8 +236,25 @@ mod tests {
         assert!(matches!(r.spec, Some(EncSpec::SseS3)));
         let r = parse_sse(None, None, None, Some("aws:kms"), None).unwrap();
         assert!(matches!(r.spec, Some(EncSpec::SseKms)));
-        // 显式 CMK → 400（R2）；未知算法 → 400；kms key id 无 aws:kms → 400
-        assert!(parse_sse(None, None, None, Some("aws:kms"), Some("arn:cmk")).is_err());
+        // 3.16：显式 CMK 裸名 / ARN 两种形态
+        let r = parse_sse(None, None, None, Some("aws:kms"), Some("tenant-a")).unwrap();
+        assert!(matches!(r.spec, Some(EncSpec::SseKmsCmk(ref n)) if n == "tenant-a"));
+        let r = parse_sse(
+            None,
+            None,
+            None,
+            Some("aws:kms"),
+            Some("arn:aws:kms:us-east-1:000000000000:key/tenant-a"),
+        )
+        .unwrap();
+        assert!(matches!(r.spec, Some(EncSpec::SseKmsCmk(ref n)) if n == "tenant-a"));
+        // 非法 CMK（穿越/大写/空/坏 ARN）→ 400；未知算法 → 400；kms key id 无 aws:kms → 400
+        for bad in ["../x", "Tenant", "", "arn:aws:kms:x", "a/b", "-x"] {
+            assert!(
+                parse_sse(None, None, None, Some("aws:kms"), Some(bad)).is_err(),
+                "{bad:?} 应拒"
+            );
+        }
         assert!(parse_sse(None, None, None, Some("aws:kms:dsse"), None).is_err());
         assert!(parse_sse(None, None, None, Some("DES"), None).is_err());
         assert!(parse_sse(None, None, None, None, Some("k0")).is_err());
@@ -263,13 +295,36 @@ mod tests {
             wrapped_dek_hex: String::new(),
             nonce_seed_hex: "00".repeat(8),
             sse_c_key_md5: md5.map(str::to_string),
+            kms_key_id: None,
         };
         assert!(sse_out(None).server_side_encryption.is_none());
         let o = sse_out(Some(&rec("file", None)));
         assert_eq!(o.server_side_encryption, Some("AES256"));
         let o = sse_out(Some(&rec("k3", None)));
         assert_eq!(o.server_side_encryption, Some("aws:kms"));
-        assert_eq!(o.kms_key_id.as_deref(), Some("k3"));
+        assert_eq!(o.kms_key_id.as_deref(), Some("k3"), "旧记录回显 key_id");
+        // 3.16：显式 CMK 记录回显用户态名（优先 kms_key_id）
+        let mut cmk_rec = rec("cmk:tenant-a:k2", None);
+        cmk_rec.kms_key_id = Some("tenant-a".into());
+        let o = sse_out(Some(&cmk_rec));
+        assert_eq!(o.server_side_encryption, Some("aws:kms"));
+        assert_eq!(o.kms_key_id.as_deref(), Some("tenant-a"));
+        // 默认加密线格式：AES256 / aws:kms / aws:kms:<name>；非法 → None
+        assert!(matches!(
+            enc_spec_from_default("AES256"),
+            Some(EncSpec::SseS3)
+        ));
+        assert!(matches!(
+            enc_spec_from_default("aws:kms"),
+            Some(EncSpec::SseKms)
+        ));
+        assert!(matches!(
+            enc_spec_from_default("aws:kms:tenant-a"),
+            Some(EncSpec::SseKmsCmk(ref n)) if n == "tenant-a"
+        ));
+        assert!(enc_spec_from_default("aws:kms:../x").is_none());
+        assert!(enc_spec_from_default("aws:kms:").is_none());
+        assert!(enc_spec_from_default("DES").is_none());
         let o = sse_out(Some(&rec("sse-c", Some("AbCdEfGhIjKlMnOpQrStUv=="))));
         assert!(o.server_side_encryption.is_none(), "SSE-C 不回 SSE 头");
         assert_eq!(o.sse_c_algorithm, Some("AES256"));
