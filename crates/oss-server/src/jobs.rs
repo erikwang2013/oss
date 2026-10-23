@@ -53,6 +53,16 @@ impl JobEnv {
     }
 }
 
+/// 4.11：周期回收「无任务 running 行」的年龄阈值（默认 6h；lifecycle/inventory
+/// 单条作业可能跑很久，阈值取保守值，误标后 job_finish 仍会覆盖为终态）。
+fn orphan_stale_secs() -> i64 {
+    std::env::var("OSS_JOB_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(21_600)
+}
+
 fn is_tier_action(action: &str) -> bool {
     matches!(action, "Transition" | "RestoreObject")
         || action.starts_with("Tier")
@@ -81,6 +91,15 @@ pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>
         match recover.recover_expired_tasks(now, env.max_attempts).await {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收过期任务"),
             Err(e) => tracing::warn!(error = %e, "job：启动回收失败"),
+            _ => {}
+        }
+        // 4.11：启动即回收崩溃遗留的「无任务 running」行（留 10s 余量避开刚启动的作业）。
+        match recover
+            .recover_orphan_jobs(now.saturating_sub(10), now)
+            .await
+        {
+            Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收无任务 running 作业"),
+            Err(e) => tracing::warn!(error = %e, "job：启动回收无任务作业失败"),
             _ => {}
         }
     });
@@ -116,6 +135,10 @@ pub async fn worker_once(
 ) -> Result<bool, String> {
     // 顺手回收超时任务（不需要每 tick 全表扫；这里与领取同频）
     db.recover_expired_tasks(now, env.max_attempts)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 4.11：周期回收「无任务 running」行（超出阈值的崩溃遗留；有局部索引，开销小）。
+    db.recover_orphan_jobs(now.saturating_sub(orphan_stale_secs()), now)
         .await
         .map_err(|e| e.to_string())?;
     // 领取时动作未知 → DB 截止时间取两类超时的较大值（硬上限）；
