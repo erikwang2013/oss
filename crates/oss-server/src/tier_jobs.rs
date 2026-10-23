@@ -5,8 +5,10 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use tokio::io::AsyncWriteExt as _;
 use xl_s3::events::{EventSink, EventSource, S3EventOp};
 use xl_s3::restore::RestoreSink;
 use xl_store::meta::{TierPhase, is_archive_class};
@@ -14,7 +16,13 @@ use xl_store::store::Store;
 
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::jobs::TaskExecutor;
-use crate::tier::{TierBackends, tier_key};
+use crate::tier::{StageGuard, TierBackends, TierByteStream, ensure_free_space, tier_key};
+
+/// 过渡/恢复的搬运窗口：内存驻留上限 = 一个窗口（+ 后端自己的 256 KiB 块）。
+pub const TIER_CHUNK: u64 = 8 << 20;
+
+/// 恢复暂存默认余量：宁可拒绝也不把数据盘写满。
+const RESTORE_FREE_RESERVE: u64 = 64 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TransitionPayload {
@@ -94,6 +102,42 @@ impl RestoreSink for SqlRestoreSink {
     }
 }
 
+/// 按 8 MiB 窗口读取指定版本，作为 tier 上传流（内存不随对象大小增长）。
+fn version_stream(
+    store: Arc<Store>,
+    bucket: String,
+    key: String,
+    version_id: String,
+    size: u64,
+) -> TierByteStream {
+    let stream = futures::stream::unfold(0u64, move |offset| {
+        let store = Arc::clone(&store);
+        let (bucket, key, version_id) = (bucket.clone(), key.clone(), version_id.clone());
+        async move {
+            if offset >= size {
+                return None;
+            }
+            let end = (offset + TIER_CHUNK).min(size);
+            match store
+                .get_object_range_version_ext(&bucket, &key, &version_id, offset..end, None)
+                .await
+            {
+                Ok(chunk) if chunk.len() as u64 == end - offset => Some((Ok(chunk), end)),
+                Ok(chunk) => Some((
+                    Err(format!(
+                        "源版本窗口读取长度 {} ≠ {} 字节",
+                        chunk.len(),
+                        end - offset
+                    )),
+                    size,
+                )),
+                Err(e) => Some((Err(format!("读取源版本失败：{e}")), size)),
+            }
+        }
+    });
+    Box::pin(stream)
+}
+
 /// 作业执行器：`Transition` / `RestoreObject`。
 pub struct M8TaskExecutor {
     db: Arc<Db>,
@@ -101,6 +145,8 @@ pub struct M8TaskExecutor {
     tiers: Arc<TierBackends>,
     events: Arc<crate::events::SqlEventSink>,
     max_tier_bytes: u64,
+    /// 恢复暂存所需空闲余量（测试可放大以覆盖 fail-closed 分支）。
+    restore_free_reserve: u64,
 }
 
 impl M8TaskExecutor {
@@ -120,12 +166,19 @@ impl M8TaskExecutor {
             tiers,
             events,
             max_tier_bytes,
+            restore_free_reserve: RESTORE_FREE_RESERVE,
         }
     }
 
     /// 测试/运维：覆盖单对象上限（默认 `OSS_TIER_MAX_BYTES` 或 1 GiB）。
     pub fn with_max_tier_bytes(mut self, max: u64) -> Self {
         self.max_tier_bytes = max;
+        self
+    }
+
+    /// 测试/运维：覆盖恢复暂存空闲余量（默认 64 MiB）。
+    pub fn with_restore_free_reserve(mut self, reserve: u64) -> Self {
+        self.restore_free_reserve = reserve;
         self
     }
 
@@ -191,29 +244,23 @@ impl M8TaskExecutor {
                 .tiers
                 .get(tier_id)
                 .ok_or_else(|| format!("tier {tier_id:?} 未配置"))?;
-            // 先按元数据拒绝超限/加密对象，再读入内存（避免为拒绝而整份加载）。
+            // 先按元数据拒绝超限/加密对象，再流式读取（避免为拒绝而搬运）。
             if v.size > self.max_tier_bytes {
                 return Err(format!(
                     "对象 {} 字节超过 OSS_TIER_MAX_BYTES={}",
                     v.size, self.max_tier_bytes
                 ));
             }
-            let (info, bytes) = self
-                .store
-                .get_object_version_ext(&p.bucket, &p.key, &p.version_id, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            if bytes.len() as u64 != info.size {
-                return Err(format!(
-                    "读取长度 {} ≠ 元数据 {} 字节",
-                    bytes.len(),
-                    info.size
-                ));
-            }
-            let md5 = hex::encode(md5::Md5::digest(&bytes));
-            let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
             let key = tier_key(tier_id, &p.bucket, &p.version_id, &p.key);
-            let remote_etag = backend.put(&key, bytes, &md5).await?;
+            let body = version_stream(
+                Arc::clone(&self.store),
+                p.bucket.clone(),
+                p.key.clone(),
+                p.version_id.clone(),
+                v.size,
+            );
+            // 后端在流上增量算 MD5/SHA-256；S3 单 PUT 响应 ETag 仍断言等于 MD5。
+            let put = backend.put(&key, body, v.size).await?;
             self.store
                 .archive_version(
                     &p.bucket,
@@ -222,10 +269,10 @@ impl M8TaskExecutor {
                     xl_store::store::ArchiveSpec {
                         backend: tier_id.to_string(),
                         key,
-                        size: info.size,
-                        source_etag: info.etag.clone(),
-                        etag: remote_etag,
-                        sha256,
+                        size: v.size,
+                        source_etag: v.etag.clone(),
+                        etag: put.etag,
+                        sha256: put.sha256,
                         class: p.class.clone(),
                     },
                     crate::db::now(),
@@ -237,8 +284,8 @@ impl M8TaskExecutor {
                 &p.bucket,
                 &p.key,
                 Some(&p.version_id),
-                Some(info.size),
-                Some(&info.etag),
+                Some(v.size),
+                Some(&v.etag),
             );
             Ok("archived".into())
         } else {
@@ -298,25 +345,59 @@ impl M8TaskExecutor {
                 t.size, self.max_tier_bytes
             ));
         }
-        let bytes = backend.get(&t.key).await?;
-        if bytes.len() as u64 > self.max_tier_bytes {
-            return Err(format!(
-                "恢复数据 {} 字节超过 OSS_TIER_MAX_BYTES={}",
-                bytes.len(),
-                self.max_tier_bytes
-            ));
+        // 恢复下载：先查空间，再边写暂存文件边算 SHA-256；失败/取消由 guard 清理。
+        let stage = self
+            .store
+            .restore_stage_path(&p.bucket, &p.key, &v.part.uuid)
+            .map_err(|e| e.to_string())?;
+        let dir = stage
+            .parent()
+            .ok_or_else(|| "恢复暂存路径无父目录".to_string())?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("恢复暂存目录创建失败：{e}"))?;
+        ensure_free_space(dir, t.size, self.restore_free_reserve)?;
+        let guard = StageGuard::new(stage.clone());
+        let mut body = backend.get(&t.key).await?;
+        let mut f = tokio::fs::File::create(&stage)
+            .await
+            .map_err(|e| format!("恢复暂存文件创建失败：{e}"))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut n: u64 = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            n += chunk.len() as u64;
+            // 元数据尺寸是信任边界：远端/后端撒谎时立刻停，不写满磁盘。
+            if n > self.max_tier_bytes {
+                return Err(format!(
+                    "恢复数据 {n} 字节超过 OSS_TIER_MAX_BYTES={}",
+                    self.max_tier_bytes
+                ));
+            }
+            if n > t.size {
+                return Err(format!("恢复数据长度超过元数据 {} 字节", t.size));
+            }
+            hasher.update(&chunk);
+            f.write_all(&chunk)
+                .await
+                .map_err(|e| format!("恢复暂存写入失败：{e}"))?;
         }
-        if bytes.len() as u64 != t.size {
-            return Err(format!("恢复数据长度 {} ≠ {}", bytes.len(), t.size));
+        f.flush()
+            .await
+            .map_err(|e| format!("恢复暂存写入失败：{e}"))?;
+        drop(f);
+        if n != t.size {
+            return Err(format!("恢复数据长度 {n} ≠ {}", t.size));
         }
-        let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+        let sha256 = hex::encode(hasher.finalize());
         if sha256 != t.sha256 {
             return Err("恢复数据 SHA-256 不符".to_string());
         }
         self.store
-            .restore_prepare(&p.bucket, &p.key, &p.version_id, &bytes)
+            .restore_prepare_file(&p.bucket, &p.key, &p.version_id, &stage)
             .await
             .map_err(|e| e.to_string())?;
+        guard.disarm();
         let expires = crate::db::now() + i64::from(p.days) * 86_400;
         self.db
             .set_restore_state(&p.bucket, &p.key, &p.version_id, "restored", expires)
