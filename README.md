@@ -340,19 +340,26 @@ oss-server rebalance     # 扩容搬迁（默认 dry-run）：存量对象迁到
 
 默认明文（无 `[tls]` 时与旧版行为一致）。配置 `[tls.server]` 后，主 HTTP/S3/控制台监听器、
 witness、Raft RPC、节点间 gRPC mesh、site/repl/tier 出站与 Kafka 全部启用 TLS——单一开关，
-没有「半 TLS」模式。证书在启动时读取并校验；**轮换证书需要重启**（运行期不热加载）。
+没有「半 TLS」模式。证书在启动时读取并校验。主监听器与出站客户端支持热加载（见下），
+mesh gRPC 仍按逐节点滚动重启轮换。
 
 ```toml
+[tls]
+# 可选：物料热加载轮询间隔（秒，默认 30；最小 1；0 = 只响应 SIGHUP）。
+# 内容哈希不变不重建；读取/校验失败保留旧物料。
+reload_interval_secs = 30
+
 [tls.server]
 cert = "/etc/oss/server.crt"
-key  = "/etc/oss/server.key"
+key  = "/etc/oss/server.key"          # 必须 0400/0600
 # 可选：要求并校验客户端证书（mTLS）。共享监听器上的 S3/控制台/Raft 客户端都必须出示。
+# 多 CA 轮换窗口：直接拼接多个 PEM。
 client_ca = "/etc/oss/ca.crt"
 
 [tls.client]
-# 出站额外信任根（平台根始终参与校验）；自签/私有 CA 部署时配置。
+# 出站额外信任根（平台根始终参与校验）；自签/私有 CA 部署时配置。多证书 PEM 拼接。
 ca_cert = "/etc/oss/ca.crt"
-# 可选：出站客户端身份（mTLS，client_cert/client_key 必须成对）。
+# 可选：出站客户端身份（mTLS，client_cert/client_key 必须成对；client_key 必须 0400/0600）。
 client_cert = "/etc/oss/client.crt"
 client_key  = "/etc/oss/client.key"
 ```
@@ -368,6 +375,37 @@ client_key  = "/etc/oss/client.key"
   CA 签发的客户端证书；没有 `verify=false` 旁路。
 - 出站（site/repl/tier/Kafka/mesh）始终校验平台根 + `[tls.client].ca_cert`；mTLS 身份用
   `[tls.client].client_cert/client_key`。
+
+### 私钥权限与原子替换
+
+- `[tls.server].key` 与 `[tls.client].client_key` 必须是 **0400 或 0600**（仅属主可读）。
+  组/其他任何位（0644、0640 等）都会让启动失败，错误会同时给出实际权限与 `chmod 600` 命令。
+  证书 `.crt` 不受限制，可以 0644。
+- 替换物料必须原子：先写同目录临时文件 → `chmod 600`（私钥）→ `fsync` → `mv` 覆盖正式路径。
+  不要原地半写或用编辑器直接改：半写会得到证书/私钥不匹配——启动期直接失败，热加载则拒绝
+  新物料并保留旧的（fail closed，不降级明文）。
+
+### 证书轮换（双信任窗口）
+
+CA 轮换不依赖同时呈现两张叶证书，而是先让**旧+新 CA 在双方信任 bundle 里重叠**，再切换
+单张叶证书。按顺序执行，每一步都可回退：
+
+1. **预置新 CA（所有节点）**：把新 CA 证书追加到每个节点的 `[tls.client].ca_cert` 与
+   `[tls.server].client_ca`（多个 PEM 直接拼接，保留旧 CA），然后重启或热加载。确认旧客户端
+   仍能连接——此时新旧 CA 都被信任。
+2. **切换服务端叶证书**：用新 CA 签发的新 `cert`/`key` 原子替换，逐节点重启或热加载。
+   用 `openssl s_client -CAfile new-ca.pem -connect host:port` 或正常 S3 请求确认。
+3. **切换客户端证书**：重签并替换 `[tls.client].client_cert/client_key`，逐节点确认。
+4. **移除旧 CA**：确认所有服务端与客户端都已在新 CA 上之后，从所有 bundle 删除旧 CA，
+   再重启或热加载。**提前删除会让仍持旧证书的客户端立即被拒**（双向都要验证过再删）。
+
+热加载语义（`[tls]` 配好后）：
+
+- 轮询 `reload_interval_secs`（默认 30s，最小 1s，0=关闭）比较文件**内容哈希**，变化才重建；
+  `SIGHUP` 立即触发；1 秒内的重复触发合并（防 SIGHUP 洪水）。
+- 新物料读取/解析/构建失败时保留旧物料并记 error；日志只记证书 SHA-256 指纹，不记私钥。
+- 新连接使用新配置，已建立连接继续用旧配置直到自然结束；mesh gRPC 不在热加载范围，
+  用逐节点滚动重启完成第 2/4 步。
 
 ## 集群模式（M3）
 

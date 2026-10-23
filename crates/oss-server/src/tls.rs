@@ -54,7 +54,7 @@ impl Tls {
             None => None,
             Some(s) => {
                 let cert_pem = read_pem(&s.cert, "[tls.server].cert")?;
-                let key_pem = read_pem(&s.key, "[tls.server].key")?;
+                let key_pem = read_private_key(&s.key, "[tls.server].key")?;
                 parse_certs(&cert_pem, "[tls.server].cert")?;
                 parse_key(&key_pem, "[tls.server].key")?;
                 let client_ca_pem = match &s.client_ca {
@@ -84,7 +84,7 @@ impl Tls {
             }
             if let (Some(cp), Some(kp)) = (&c.client_cert, &c.client_key) {
                 let cert_pem = read_pem(cp, "[tls.client].client_cert")?;
-                let key_pem = read_pem(kp, "[tls.client].client_key")?;
+                let key_pem = read_private_key(kp, "[tls.client].client_key")?;
                 parse_certs(&cert_pem, "[tls.client].client_cert")?;
                 parse_key(&key_pem, "[tls.client].client_key")?;
                 client.cert_pem = Some(cert_pem);
@@ -278,6 +278,35 @@ fn read_pem(path: &std::path::Path, field: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("读取 {field}（{}）失败：{e}", path.display()))
 }
 
+/// 读私钥前强制校验文件权限：只接受 0400/0600（组/其他任何位都拒绝）。
+/// 私钥可读即等于身份可冒用，权限过宽按配置错误 fail closed，不降级继续。
+fn read_private_key(path: &std::path::Path, field: &str) -> Result<Vec<u8>, String> {
+    check_key_permissions(path, field)?;
+    read_pem(path, field)
+}
+
+#[cfg(unix)]
+fn check_key_permissions(path: &std::path::Path, field: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("读取 {field}（{}）失败：{e}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode != 0o400 && mode != 0o600 {
+        return Err(format!(
+            "私钥 {field}（{}）权限不安全：{mode:04o}；必须仅属主可读（0400 或 0600），请执行 chmod 600 {}",
+            path.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 非 Unix 平台没有 st_mode 语义（Windows 用 ACL），不做位检查。
+#[cfg(not(unix))]
+fn check_key_permissions(_path: &std::path::Path, _field: &str) -> Result<(), String> {
+    Ok(())
+}
+
 fn parse_certs(pem: &[u8], field: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let certs = rustls_pemfile::certs(&mut Cursor::new(pem))
         .collect::<Result<Vec<_>, _>>()
@@ -297,6 +326,73 @@ fn parse_key(pem: &[u8], field: &str) -> Result<PrivateKeyDer<'static>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn self_signed() -> (String, String) {
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// 私钥权限：0400/0600 允许，其余（含组/其他可读）一律拒绝；证书不受此检查。
+    #[cfg(unix)]
+    #[test]
+    fn private_key_permissions_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = self_signed();
+        let cert = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        std::fs::write(&cert, &cert_pem).unwrap();
+        std::fs::write(&key, &key_pem).unwrap();
+        // 证书 0644 合法；只有私钥受限。
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let server_cfg = |key: &std::path::Path| TlsToml {
+            server: Some(crate::tls_config::TlsServerToml {
+                cert: cert.clone(),
+                key: key.to_path_buf(),
+                client_ca: None,
+            }),
+            client: None,
+        };
+        for (mode, ok) in [
+            (0o600, true),
+            (0o400, true),
+            (0o644, false),
+            (0o640, false),
+            (0o660, false),
+            (0o604, false),
+            (0o000, false),
+        ] {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+            let result = Tls::load(&server_cfg(&key));
+            assert_eq!(result.is_ok(), ok, "server key mode {mode:04o}");
+            if let Err(e) = result {
+                assert!(
+                    e.contains(&format!("{mode:04o}")),
+                    "错误需列出实际权限：{e}"
+                );
+            }
+        }
+
+        // [tls.client].client_key 同样受限（成对配置才校验）。
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let client_cfg = |key_mode: u32| {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(key_mode)).unwrap();
+            TlsToml {
+                server: None,
+                client: Some(crate::tls_config::TlsClientToml {
+                    ca_cert: None,
+                    client_cert: Some(cert.clone()),
+                    client_key: Some(key.clone()),
+                }),
+            }
+        };
+        assert!(Tls::load(&client_cfg(0o600)).is_ok());
+        assert!(Tls::load(&client_cfg(0o644)).is_err());
+    }
 
     #[test]
     fn missing_server_files_fail_closed() {
