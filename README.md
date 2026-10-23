@@ -28,7 +28,7 @@ Parquet/Hive、tier 本地盘/GC、生命周期全 Filter、Batch WASM）、M9 L
 **v1.14 后硬化（未发布）**：AP 匿名/账户命名空间 v1/SourceVpc/缓存 TTL/无策略默认拒绝/旧别名回落；
 `part_sizes` 复制透传、签 Range 多区间确定性 400；TLS 私钥 0600、CA 双信任轮换、主监听器与出站热加载；
 SSE-KMS 显式 CMK 与命名环轮换；tier 流式搬运/恢复；Batch 每动作桶通知；M7 版本定向删除/元数据复制；
-Select Parquet；本地 tier 符号链接加固、GC 二次快照、生命周期游标、Inventory 增量、AbortMPU；以及
+Select Parquet；本地 tier 符号链接加固、GC 二次快照、生命周期游标、Inventory 增量/跨账户目标、AbortMPU；以及
 Level B 生命周期命令门控/快照 guard 热修。详见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §8–§11。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：

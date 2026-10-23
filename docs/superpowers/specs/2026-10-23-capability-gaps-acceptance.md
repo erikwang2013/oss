@@ -224,3 +224,53 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 **边界（记档）**：混合版本升级前已复制的历史异步版本两端 UUID 不同，其定向删除在目标按同 id
 找不到而幂等成功，可能短暂不一致（建议同版本升级）；M6 远端仍不携带对象元数据、不投递版本删除；
 直接读 tier 仍不在范围——归档对象需 Restore 本地化（§14.2 直读 403 `InvalidObjectState`）。
+
+## 11. 2026-10-24 post-v1.14 硬化集成与最终闸门
+
+**集成**：`feat/post-1.14-hardening`（基于 `v1.14.0`），合并 §8–§10 各 lane、验证 lane 与
+Inventory 跨账户 WIP；最终 Rust/前端树对应提交 `2bda0bc`（本节提交仅追加文档）。**本批未发布**：
+`main`、tag 与 GitHub Release 仍在 `v1.14.0`；仓库 private、站点未部署（§7）。
+
+### 11.1 集成树闸门
+
+| 闸门 | 命令/范围 | 结果 |
+|---|---|---|
+| 格式 | `cargo fmt --all --check` | 0 |
+| Clippy | `cargo clippy -p oss-server -p xl-s3 -p xl-store -p xl-client -p xl-proto --all-targets -- -D warnings` | 0 warning |
+| 库测试 | `cargo test -p xl-store -p xl-s3 -p oss-server --lib` | 268（1 ignored）/ 150 / 152，0 failed |
+| 清单/控制台 | `--test m8_inventory`、`m8_inventory_parquet`、`console_api` | 20 / 4 / 30，0 failed |
+| S3 全量 e2e | `tests/e2e_s3.sh`（38 节；真实进程 + aws-cli/rclone + redpanda；服务同时设 `OSS_MASTER_KEY_FILE` 与 `OSS_KMS_DIR`；脚本 md5 `16202c6d7910e354be5aaa74fd5d3b3f`） | **RC=0**；仅 `E2E_LONG` 默认跳过；含 4.2 签名多区间 `400 InvalidArgument` 断言 |
+| Web | `tsc -b` / `vite build` / Playwright `e2e/m8-console.spec.ts` | 0 / 0（仅既有 >500 kB chunk 警告）/ **9 passed** |
+| M9 lane | `e2e_m9` sync / stretch / recovery / rolling | 78/0/1、59/0/1、133/0/1、65/0/4（SKIP 为预期矩阵） |
+| M8 lane | `tests/e2e_m8.sh` | PASS，4433s（Tier 段按环境 SKIP） |
+
+M9/M8 行为合并前各 lane 树上的实跑结果；合并后重跑的是上表库测试、S3 全量 e2e 与 Web。
+e2e 首次运行暴露两处**测试断言漂移**（非产品缺陷）：`e2e_s3.sh` 11d 仍断言旧 403
+`SignatureDoesNotMatch`，已按 §8 4.2 改为 400 `InvalidArgument`；Playwright 设置页仍匹配旧文案
+「配置由环境变量驱动」，已按 CMK 改版改为 `/环境变量驱动/`。修正后均重跑通过。
+
+### 11.2 本批状态汇总
+
+§8–§10 的能力均已在集成树落地：AP 匿名/账户命名空间 v1/SourceVpc/缓存 TTL/默认拒绝/旧别名回落、
+XFF 信任链、CMK 命名环、TLS 热加载、tier 流式、Batch 每动作通知、M7 版本定向删除与元数据复制、
+Select Parquet、本地 tier openat2 加固、GC 二次快照、生命周期游标、Inventory 增量、AbortMPU、
+Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（§8 3.7，配置/运行期双重账户复核）。
+破坏性升级点与逐项边界以 §8–§10 为准。
+
+### 11.3 仍阻塞 / 非目标（最终状态）
+
+- **Level C 任意双向混合版本**：旧解码器（v1.13.1）无法识别 Level B 数据，需双解码/双写窗口与
+  回滚矩阵；本批未做。CMK、Level B 支持「同版本升级」，不承诺旧二进制读新数据。
+- **M3/M4 数据面滚动升级**：Level B 仅覆盖控制面命令与快照兼容；数据面、TLS 物料、跨版本
+  cutover/force-recover 仍要求停写升级。
+- **`AssumeRoleWithWebIdentity`**：未实现（仅既有静态 AK/临时凭据面）。
+- **完整多租户账户体系**：账户 = 用户命名空间 v1，无账户管理员/共享/配额/隔离；AP 跨账号与
+  Inventory 目标账户都不是租户边界。
+- **M3 MPU 粘节点**：upload_id 为纯 UUID、暂存区节点本地，缺 upload_id→节点持久目录与转发 RPC。
+- **M3 shrink / 单机→集群**：架构项目，未实现。
+- **M8 多节点控制面**：未实现（单节点）。
+- **Select BZIP2**：确定性 400（工作区无 bzip2 依赖，不新增）。
+- **直接读 tier（含 Range）**：不直读远端，归档对象须先 Restore（§14.2）。
+- **Inventory**：跨账户目标仅管理员可配置，运行期复核失败即不写输出；增量仍是节点本地水位。
+- **M7 混合版本历史异步版本**：两端 UUID 不同导致定向删除可能短暂不一致（建议同版本升级）；
+  M6 远端仍不携带对象元数据、不投递版本删除。
