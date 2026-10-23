@@ -147,11 +147,11 @@ PRESIGNED=$(aws --endpoint-url "$ENDPOINT" s3 presign "s3://$BUCKET/big.bin" --e
 MULTI_CODE=$(curl -s -o "$WORK/multi-range.out" -w '%{http_code}' -H 'Range: bytes=0-1,3-4' "$PRESIGNED")
 [ "$MULTI_CODE" = "200" ] || { echo "预签名多区间 Range 应 200，实际 $MULTI_CODE"; exit 1; }
 cmp "$WORK/big.bin" "$WORK/multi-range.out" || { echo "多区间 Range 应降级整对象 200"; exit 1; }
-# 已知边界（记档）：aws-cli 把 Range 计入 SigV4 SignedHeaders；头在验签前被剥离 →
-# 403 SignatureDoesNotMatch（AWS 原生 200；要支持签 Range 的客户端需 s3s 内部补丁）。
+# 已知边界（记档）：aws-cli 把 Range 计入 SigV4 SignedHeaders；签名内 Range 保留到验签后，
+# 多区间由 s3s 返回确定性 400 InvalidArgument（AWS 原生 200；要支持需 s3s 内部补丁）。
 OUT=$(aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$BUCKET" --key big.bin --range 'bytes=0-1,3-4' "$WORK/multi-range-signed.out" 2>&1) \
-  && { echo "签 Range 的 aws-cli 多区间应被签名校验拒绝，却成功: $OUT"; exit 1; }
-echo "$OUT" | grep -q 'SignatureDoesNotMatch' || { echo "应报 SignatureDoesNotMatch: $OUT"; exit 1; }
+  && { echo "签 Range 的 aws-cli 多区间应被拒绝，却成功: $OUT"; exit 1; }
+echo "$OUT" | grep -q 'InvalidArgument' || { echo "应报 InvalidArgument: $OUT"; exit 1; }
 # HEAD + Range：200 + 区间长度（1 MiB）
 HEADLEN=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket "$BUCKET" --key big.bin --range 'bytes=1048576-2097151' --query ContentLength --output text)
 [ "$HEADLEN" = "1048576" ] || { echo "HEAD+Range Content-Length 应为 1048576，实际 $HEADLEN"; exit 1; }
