@@ -2911,11 +2911,21 @@ impl S3 for OssS3 {
                 "ScanRange is not supported for GZIP objects"
             ));
         }
+        // Parquet：AWS 只允许 CompressionType NONE（列内压缩由文件自身声明）；
+        // ScanRange 是字节区间语义，Parquet 列式无行内偏移——均 400 拒绝。
         if request.input_serialization.parquet.is_some() {
-            return Err(s3s::s3_error!(
-                InvalidRequest,
-                "Parquet input is not supported yet"
-            ));
+            if comp != "NONE" {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "CompressionType must be NONE with Parquet input"
+                ));
+            }
+            if request.scan_range.is_some() {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "ScanRange is not supported for Parquet input"
+                ));
+            }
         }
 
         // 输入/输出格式
@@ -2932,8 +2942,9 @@ impl S3 for OssS3 {
         let in_fmt = match (
             request.input_serialization.csv.as_ref(),
             request.input_serialization.json.as_ref(),
+            request.input_serialization.parquet.as_ref(),
         ) {
-            (Some(c), None) => {
+            (Some(c), None, None) => {
                 let d = sel::CsvIn {
                     field: cf(c.field_delimiter.as_deref().unwrap_or(","))?,
                     quote: cf(c.quote_character.as_deref().unwrap_or("\""))?,
@@ -2956,7 +2967,7 @@ impl S3 for OssS3 {
                 };
                 sel::InFormat::Csv(d)
             }
-            (None, Some(j)) => {
+            (None, Some(j), None) => {
                 let lines = match j.type_.as_ref().map(|x| x.as_str()).unwrap_or("DOCUMENT") {
                     "LINES" => true,
                     "DOCUMENT" => false,
@@ -2964,10 +2975,11 @@ impl S3 for OssS3 {
                 };
                 sel::InFormat::Json { lines }
             }
+            (None, None, Some(_)) => sel::InFormat::Parquet,
             _ => {
                 return Err(s3s::s3_error!(
                     InvalidRequest,
-                    "exactly one of CSV/JSON input serialization is required"
+                    "exactly one of CSV/JSON/Parquet input serialization is required"
                 ));
             }
         };

@@ -25,6 +25,9 @@ tracing.workspace = true
 # M6 切片 2：S3 Select（SQL AST + GZIP）
 sqlparser.workspace = true
 flate2.workspace = true
+# S3 Select Parquet 输入：低层 row reader（default-features=false，不拉 Arrow）；
+# json 仅启用 Row::to_json_value（serde_json/base64 本就在依赖树）
+parquet = { workspace = true, features = ["json"] }
 # M8 S2：Object Lambda（HTTP 变换器出站 + 输出 ETag / key-b64）
 reqwest.workspace = true
 base64.workspace = true
