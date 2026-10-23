@@ -215,6 +215,7 @@ fn s3(h: &H) -> OssS3 {
         .with_sync_delete(Some(
             Arc::clone(&h.state.sync_delete) as Arc<dyn SyncDeleteSink>
         ))
+        .with_lifecycle(Some(Arc::clone(&h.state.lifecycle)))
         .with_bucket_control(h.state.control.bucket_sink())
 }
 
@@ -977,6 +978,58 @@ async fn shared_stores_route_control_writes_in_raft() {
         .unwrap();
     assert_applied(&h, before + 1).await;
     assert_eq!(count!(h, "inventory_configs", "shbk"), 0);
+    shutdown(h).await;
+}
+
+/// Level B：feature_level=1 时结构化生命周期 PUT 必须 503（带 required/effective 详情），
+/// 且在 append 前拒绝（不追加控制命令、不落行）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn structured_lifecycle_put_at_feature_level_one_is_503() {
+    let h = setup().await;
+    create_bucket(&h, "lvl1", "async", "Off").await;
+    let before = applied(&h);
+    let err = s3(&h)
+        .put_bucket_lifecycle_configuration(req(PutBucketLifecycleConfigurationInput {
+            bucket: "lvl1".into(),
+            lifecycle_configuration: Some(BucketLifecycleConfiguration {
+                rules: vec![LifecycleRule {
+                    abort_incomplete_multipart_upload: None,
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(30),
+                        ..Default::default()
+                    }),
+                    // Tag filter 无法用旧列表达 → 产生 config_json → V2（level 2）。
+                    filter: Some(LifecycleRuleFilter {
+                        tag: Some(Tag {
+                            key: Some("env".into()),
+                            value: Some("prod".into()),
+                        }),
+                        ..Default::default()
+                    }),
+                    id: Some("tagged".into()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    transitions: None,
+                }],
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(
+        err.status_code(),
+        Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+    );
+    let msg = err.message().unwrap_or_default();
+    assert!(
+        msg.contains("feature level 2") && msg.contains("effective 1"),
+        "503 detail missing required/effective: {msg}"
+    );
+    assert_no_write(&h, before).await;
+    assert_eq!(count!(h, "lifecycle_rules", "lvl1"), 0);
     shutdown(h).await;
 }
 

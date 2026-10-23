@@ -1577,6 +1577,7 @@ fn lifecycle_err(e: xl_s3::lifecycle::LifecycleError) -> Response {
     let status = match &e {
         E::NoSuchBucket | E::NoSuchConfiguration => StatusCode::NOT_FOUND,
         E::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+        E::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         E::Invalid(_) | E::InvalidClass(_) | E::InvalidArgument(_) => StatusCode::BAD_REQUEST,
         E::Internal(_) => {
             tracing::error!(error = %e, "lifecycle 内部错误");

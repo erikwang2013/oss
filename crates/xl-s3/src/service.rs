@@ -493,6 +493,11 @@ fn lifecycle_error(e: crate::lifecycle::LifecycleError) -> s3s::S3Error {
         E::InvalidClass(m) => s3s::s3_error!(InvalidStorageClass, "{}", m),
         E::InvalidArgument(m) => s3s::s3_error!(InvalidArgument, "{}", m),
         E::NotImplemented(m) => s3s::s3_error!(NotImplemented, "{}", m),
+        // 503 细节（required/effective level）原样返回，便于运维定位滚动窗口。
+        E::Unavailable(m) => {
+            tracing::warn!(error = %m, "生命周期控制面不可用");
+            s3s::s3_error!(ServiceUnavailable, "{}", m)
+        }
         E::Internal(m) => {
             tracing::error!(error = %m, "生命周期存储失败");
             s3s::s3_error!(InternalError, "internal error")
