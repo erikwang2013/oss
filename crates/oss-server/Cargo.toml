@@ -53,6 +53,8 @@ csv = "1"
 flate2.workspace = true
 # M8：Inventory Parquet 输出（无 Arrow 依赖）
 parquet.workspace = true
+# M8 4.7：本地 tier 用 openat2(RESOLVE_BENEATH|NO_SYMLINKS) 拒绝根目录内符号链接逃逸
+rustix = { version = "1", features = ["fs"] }
 base64.workspace = true
 tracing.workspace = true
 # M9 S5：Raft 控制面。storage-v2 是 v2 storage traits 的编译前提（非默认 feature）；

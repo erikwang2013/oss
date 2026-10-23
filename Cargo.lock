@@ -2692,6 +2692,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rskafka",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
