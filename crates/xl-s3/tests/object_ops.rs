@@ -2397,8 +2397,8 @@ async fn sse_c_wire_roundtrip_and_headers() {
 }
 
 #[tokio::test]
-async fn sse_s3_wire_headers_and_kms_cmk_rejected() {
-    let (s3, _store, _d) = service_enc().await;
+async fn sse_s3_wire_headers_and_explicit_cmk() {
+    let (s3, store, _d) = service_enc().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "alpha".into(),
         ..Default::default()
@@ -2455,23 +2455,94 @@ async fn sse_s3_wire_headers_and_kms_cmk_rejected() {
         Some("aws:kms")
     );
     assert!(out.ssekms_key_id.as_deref().unwrap_or("").starts_with('k'));
-    // 显式 CMK → 400（R2）
-    let e = s3
-        .put_object(req(PutObjectInput {
+    // 3.16：显式 CMK——坏 ARN / 未配置名 → 400；与 AES256 同现 → InvalidRequest
+    let cmk_put = |key: &'static str, ssekms: &str, algo: &'static str| {
+        req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: key.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            server_side_encryption: Some(ServerSideEncryption::from_static(algo)),
+            ssekms_key_id: Some(ssekms.to_string()),
+            ..Default::default()
+        })
+    };
+    for (input, code) in [
+        (
+            cmk_put("ck-bad-arn", "arn:aws:kms:cmk", "aws:kms"),
+            s3s::S3ErrorCode::InvalidArgument,
+        ),
+        (
+            cmk_put("ck-missing", "ghost", "aws:kms"),
+            s3s::S3ErrorCode::InvalidArgument,
+        ),
+        (
+            cmk_put("ck-aes", "tenant-a", "AES256"),
+            s3s::S3ErrorCode::InvalidRequest,
+        ),
+    ] {
+        let e = s3.put_object(input).await.unwrap_err();
+        assert_eq!(e.code(), &code, "{e:?}");
+    }
+
+    // 创建命名 CMK 后：PUT/GET/HEAD 回用户态名；ARN 原样回显
+    store
+        .enc_state()
+        .unwrap()
+        .kms
+        .as_ref()
+        .unwrap()
+        .create_cmk("tenant-a")
+        .await
+        .unwrap();
+    let out = s3
+        .put_object(cmk_put("ck", "tenant-a", "aws:kms"))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        out.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("aws:kms")
+    );
+    assert_eq!(out.ssekms_key_id.as_deref(), Some("tenant-a"));
+    let g = s3
+        .get_object(req(GetObjectInput {
             bucket: "alpha".into(),
             key: "ck".into(),
-            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
-            server_side_encryption: Some(ServerSideEncryption::from_static("aws:kms")),
-            ssekms_key_id: Some("arn:aws:kms:cmk".into()),
             ..Default::default()
         }))
         .await
-        .unwrap_err();
-    assert_eq!(
-        e.code(),
-        &s3s::S3ErrorCode::InvalidRequest,
-        "显式 CMK 应 400：{e:?}"
-    );
+        .unwrap()
+        .output;
+    assert_eq!(g.ssekms_key_id.as_deref(), Some("tenant-a"));
+    let h = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "ck".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(h.ssekms_key_id.as_deref(), Some("tenant-a"));
+
+    let arn = "arn:aws:kms:us-east-1:000000000000:key/tenant-a";
+    let out = s3
+        .put_object(cmk_put("ck-arn", arn, "aws:kms"))
+        .await
+        .unwrap()
+        .output;
+    // 对象记录里 key_id 是规范名，用户态 id 统一回显规范名（ARN 只是一种寻址写法）
+    assert_eq!(out.ssekms_key_id.as_deref(), Some("tenant-a"));
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "ck-arn".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(g.ssekms_key_id.as_deref(), Some("tenant-a"));
 }
 
 /// M8 缺口 C：桶默认加密——PUT/MPU create+complete/Copy 目标都套默认；显式 SSE 优先；
@@ -2690,6 +2761,250 @@ async fn bucket_default_encryption_applied_and_overridden() {
     .unwrap();
     let out = s3.put_object(put("after", b"no-enc", None)).await.unwrap();
     assert!(out.output.server_side_encryption.is_none());
+}
+
+/// 3.16：桶默认 `aws:kms:<cmk>`——PUT/MPU/Copy 目标都套 CMK；GET 回原 CMK；
+/// 显式默认环/其它 CMK 可覆盖；未知 CMK 写入 400 且不破坏已存配置。
+#[tokio::test]
+async fn bucket_default_encryption_explicit_cmk_applied() {
+    let (s3, store, _d) = service_enc().await;
+    let kms = store.enc_state().unwrap().kms.as_ref().unwrap().clone();
+    kms.create_cmk("tenant-a").await.unwrap();
+    kms.create_cmk("tenant-b").await.unwrap();
+    let mut create = req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    });
+    create.extensions.insert(xl_s3::access::AuthedUser {
+        uid: 1,
+        is_admin: true,
+        ak: String::new(),
+    });
+    s3.create_bucket(create).await.unwrap();
+
+    let enc_cfg = |algo: &'static str, cmk: Option<&str>| {
+        req(PutBucketEncryptionInput {
+            bucket: "alpha".into(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            server_side_encryption_configuration: ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        kms_master_key_id: cmk.map(str::to_string),
+                        sse_algorithm: ServerSideEncryption::from_static(algo),
+                    }),
+                    ..Default::default()
+                }],
+            },
+        })
+    };
+    let get_cfg = || {
+        req(GetBucketEncryptionInput {
+            bucket: "alpha".into(),
+            ..Default::default()
+        })
+    };
+
+    // 名形态写入 → GET 回 aws:kms + CMK 名
+    s3.put_bucket_encryption(enc_cfg("aws:kms", Some("tenant-a")))
+        .await
+        .unwrap();
+    let out = s3.get_bucket_encryption(get_cfg()).await.unwrap().output;
+    let d = out.server_side_encryption_configuration.unwrap().rules[0]
+        .apply_server_side_encryption_by_default
+        .clone()
+        .unwrap();
+    assert_eq!(d.sse_algorithm.as_str(), "aws:kms");
+    assert_eq!(d.kms_master_key_id.as_deref(), Some("tenant-a"));
+
+    // 未知 CMK → 400，且既有配置不变
+    let e = s3
+        .put_bucket_encryption(enc_cfg("aws:kms", Some("ghost")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidArgument, "{e:?}");
+    let out = s3.get_bucket_encryption(get_cfg()).await.unwrap().output;
+    assert_eq!(
+        out.server_side_encryption_configuration.unwrap().rules[0]
+            .apply_server_side_encryption_by_default
+            .as_ref()
+            .unwrap()
+            .kms_master_key_id
+            .as_deref(),
+        Some("tenant-a")
+    );
+
+    // PUT 无 SSE → 套默认 CMK（响应与回读一致）
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "dflt".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"cmk-default",
+            ))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        out.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("aws:kms")
+    );
+    assert_eq!(out.ssekms_key_id.as_deref(), Some("tenant-a"));
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "dflt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(g.ssekms_key_id.as_deref(), Some("tenant-a"));
+
+    // 显式默认环（无 CMK）覆盖桶默认
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "dflt-default".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"kms-default",
+            ))),
+            server_side_encryption: Some(ServerSideEncryption::from_static("aws:kms")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(
+        out.ssekms_key_id.as_deref().unwrap_or("").starts_with('k'),
+        "显式默认环应回 k<n>：{:?}",
+        out.ssekms_key_id
+    );
+
+    // 显式另一 CMK 覆盖桶默认
+    let out = s3
+        .put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: "dflt-b".into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"cmk-b"))),
+            server_side_encryption: Some(ServerSideEncryption::from_static("aws:kms")),
+            ssekms_key_id: Some("tenant-b".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.ssekms_key_id.as_deref(), Some("tenant-b"));
+
+    // MPU create 无 SSE → 回默认 CMK；complete 落地同一 CMK
+    let created = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        created.server_side_encryption.as_ref().map(|s| s.as_str()),
+        Some("aws:kms")
+    );
+    assert_eq!(created.ssekms_key_id.as_deref(), Some("tenant-a"));
+    let upload_id = created.upload_id.unwrap();
+    let up = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"mp-cmk"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let done = s3
+        .complete_multipart_upload(req(CompleteMultipartUploadInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            upload_id,
+            multipart_upload: Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(ETag::Strong(up.e_tag.unwrap().value().to_string())),
+                    ..Default::default()
+                }]),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(done.ssekms_key_id.as_deref(), Some("tenant-a"));
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(g.ssekms_key_id.as_deref(), Some("tenant-a"));
+
+    // CopyObject 目标套默认 CMK
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("alpha".to_string())
+        .key("copied".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "alpha".into(),
+            key: "dflt".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "copied".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(g.ssekms_key_id.as_deref(), Some("tenant-a"));
+
+    // CopyObject 显式目标 CMK 覆盖桶默认
+    s3.copy_object(req(CopyObjectInput::builder()
+        .bucket("alpha".to_string())
+        .key("copied-b".to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: "alpha".into(),
+            key: "dflt".into(),
+            version_id: None,
+        })
+        .server_side_encryption(Some(ServerSideEncryption::from_static("aws:kms")))
+        .ssekms_key_id(Some("tenant-b".to_string()))
+        .build()
+        .unwrap()))
+        .await
+        .unwrap();
+    let g = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "copied-b".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(g.ssekms_key_id.as_deref(), Some("tenant-b"));
 }
 
 // ---------- M5 切片 4：对象锁线级 ----------
