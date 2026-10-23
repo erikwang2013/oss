@@ -298,11 +298,20 @@ export interface AuditRow {
   detail: string | null
 }
 
-/** GET /encryption（只读；无变更端点）。 */
+/** 命名 CMK 快照（GET /encryption；绝不含密钥材料）。 */
+export interface CmkInfo {
+  name: string
+  current_version: number
+  versions: number[]
+  updated_nanos: number
+}
+
+/** GET /encryption（状态只读；CMK 管理走 /encryption/cmks）。 */
 export interface EncryptionStatus {
   sse_s3: boolean
   sse_kms: boolean
   kms_current_key_id: string | null
+  cmks: CmkInfo[]
 }
 
 export interface BucketEncryption {
