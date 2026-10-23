@@ -10,7 +10,7 @@ use crate::config::RaftRole;
 use crate::db::Db;
 use crate::raft::data::{self, InstallCtx};
 use crate::raft::store::SqliteLogStore;
-use crate::raft::{self, RaftHandle, RaftSettings};
+use crate::raft::{self, RaftHandle, RaftSettings, compat};
 
 #[derive(Debug, Clone)]
 pub struct ForceRecoverReport {
@@ -51,6 +51,16 @@ pub async fn force_recover(
         != Some("on")
     {
         return Err("control DB is not in raft mode; run raft-cutover first".into());
+    }
+    let required = data::required_feature_level(&export.data);
+    // 恢复后节点会带 level-2 marker；低于数据要求的配置必然被 R8 启动守卫拒绝。
+    // 在写任何行之前失败，避免留下“数据已装、节点起不来”的半恢复库。
+    if required > compat::advertised_feature(settings.feature_level) {
+        return Err(format!(
+            "export contains level-2 lifecycle data (config_json); set [raft].feature_level = \
+             {required} (current {}) before force recovery",
+            settings.feature_level
+        ));
     }
     let snapshot_len = data::encode_snapshot(&export.data)
         .map_err(|e| e.to_string())?
@@ -106,6 +116,11 @@ pub async fn force_recover(
     data::install_tx(&mut tx, &export.data, &InstallCtx { admin_id, witness })
         .await
         .map_err(|e| e.to_string())?;
+    if required > compat::MIN_FEATURE_LEVEL {
+        compat::bump_activation_tx(&mut tx, required)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
         .execute(&mut *tx)
         .await
