@@ -46,7 +46,10 @@ ecat 监听器、witness、tonic mesh、site/repl/tier 出站 HTTPS、Kafka SASL
 Level B 前向兼容窗口已实现：Raft RPC wire/feature 头、term-stamped peer map、leader
 `effective_feature_level`（含 learners）、`[raft].feature_level` 校验、启动/apply 门控、
 `schema_meta.raft_feature_level` 粘性标记、成员 add/promote 预检、status 诊断、runbook 与
-`tests/e2e_m9_rolling.sh`。D6 确认本批无 replicated `ControlData` 变更，保留 OSSCTL1。
+`tests/e2e_m9_rolling.sh`。D6 原判「本批无 replicated `ControlData` 变更」不成立：
+`LifecycleRuleRow.config_json` 已进快照。2026-10-23 热修把 `BucketSetLifecycleV2` 标为
+level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`），并让快照编码器
+在存在 `config_json` 时拒绝 OSSCTL1（fail-closed，待 OSSCTL2）。
 
 ## 2. 明确不做的边界（非目标，fail-closed/记档）
 
@@ -92,8 +95,9 @@ Level B 前向兼容窗口已实现：Raft RPC wire/feature 头、term-stamped p
 2. 签 Range 的 SigV4 客户端（Range 计入 SignedHeaders）多区间请求会 403
    `SignatureDoesNotMatch`；预签名 URL 不受影响（中间件在验签前剥离）。
 3. AP `X-Forwarded-For` 仅单层反代成立；多层反代需在最近一跳覆盖。
-4. 滚动升级 e2e 脚本已提供但未实跑（缺 v1.13.1 旧二进制）；无 level-2 命令，
-   激活路径由 in-process FeatureProbe/门控测试覆盖。
+4. 滚动升级 e2e 脚本已提供但未实跑（缺 v1.13.1 旧二进制）；level-2 产品命令为
+   `BucketSetLifecycleV2`（结构化生命周期），写入门控/激活由 `tests/raft_commands.rs`
+   与 store 单元测试覆盖。
 5. Web `tsc`/`vite` 未运行（worktree 无 `node_modules`）；前端改动为增量、类型一致。
 6. 生命周期破坏性 sweep 的进程内测试覆盖，但未跑独立长时 e2e；AbortIncompleteMultipartUpload 仍 501。
 
