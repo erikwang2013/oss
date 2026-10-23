@@ -175,6 +175,7 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
 ///   单层反代 = 最右一跳（旧行为）。
 /// - `OSS_AP_TRUSTED_PROXY_CIDRS`：逗号分隔可信代理网段；配置后从右向左跳过可信代理，
 ///   首个非可信项为客户端（此模式忽略 HOPS）。
+///
 /// 非法网段/0 跳 → 启动失败（配置错误不静默降级）。
 #[derive(Clone)]
 struct ProxyTrust {
