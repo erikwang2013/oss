@@ -74,6 +74,7 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
       is_enabled: editing?.is_enabled ?? true,
       frequency: v.frequency,
       destination_bucket: v.destination_bucket,
+      destination_account_id: v.destination_account_id || null,
       destination_prefix: v.destination_prefix || null,
       format: 'CSV',
       filter_prefix: v.filter_prefix || null,
@@ -89,6 +90,7 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
       frequency: c.frequency,
       filter_prefix: c.filter_prefix ?? '',
       destination_bucket: c.destination_bucket,
+      destination_account_id: c.destination_account_id ?? '',
       destination_prefix: c.destination_prefix ?? '',
       included_object_versions: c.included_object_versions,
       optional_fields: c.optional_fields,
@@ -173,6 +175,14 @@ export default function InventoryModal({ bucket, onClose }: { bucket: string; on
             style={{ width: 200 }}
           >
             <Input />
+          </Form.Item>
+          <Form.Item
+            name="destination_account_id"
+            label="目标账户 ID"
+            tooltip="12 位；须等于目标桶所属账户。跨账户目标仅管理员可配置"
+            style={{ width: 200 }}
+          >
+            <Input placeholder="可选" />
           </Form.Item>
           <Form.Item name="destination_prefix" label="目标前缀" style={{ width: 200 }}>
             <Input placeholder="可选" />

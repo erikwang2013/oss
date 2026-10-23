@@ -20,7 +20,9 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::Type as SchemaType;
 use s3s::dto::{InventoryConfiguration, InventoryFormat};
 use xl_s3::access::{Acl, AuthedUser};
-use xl_s3::inventory::{csv_columns, filter_prefix, includes_all_versions};
+use xl_s3::inventory::{
+    config_from_json, csv_columns, destination_bucket_name, filter_prefix, includes_all_versions,
+};
 use xl_s3::sse::enc_spec_from_default;
 use xl_store::meta::{ChecksumRecord, EncryptionRecord, ObjectLockRecord};
 use xl_store::store::{ByteStream, ListRequest, ObjectInfo, Store, VersioningMode};
@@ -254,13 +256,14 @@ impl InventoryRunner {
         if let Some(j) = run.job_id {
             let _ = self.db.job_set_progress(j, 0, now).await;
         }
-        let cfg: InventoryConfiguration = match serde_json::from_str(&cfg_row.config_json) {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("config_json 非法：{e}");
-                return Err(self.fail(run.id, run.job_id, msg).await);
-            }
-        };
+        let (cfg, recorded_source_account): (InventoryConfiguration, Option<String>) =
+            match config_from_json(&cfg_row.config_json) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("config_json 非法：{e}");
+                    return Err(self.fail(run.id, run.job_id, msg).await);
+                }
+            };
         if !cfg.is_enabled {
             if let Some(j) = run.job_id {
                 let _ = self.db.job_set_progress(j, -1, now).await;
@@ -271,7 +274,15 @@ impl InventoryRunner {
                 .await;
             return Ok("skipped".to_string());
         }
-        let dest = cfg.destination.s3_bucket_destination.bucket.clone();
+        let Some(dest) = destination_bucket_name(&cfg.destination.s3_bucket_destination.bucket)
+            .map(str::to_string)
+        else {
+            let msg = format!(
+                "目标桶 ARN 非法：{}",
+                cfg.destination.s3_bucket_destination.bucket
+            );
+            return Err(self.fail(run.id, run.job_id, msg).await);
+        };
         let is_admin = self
             .db
             .get_user(cfg_row.owner_id)
@@ -284,6 +295,28 @@ impl InventoryRunner {
             is_admin,
             ak: String::new(),
         };
+        // 3.7：配置期记录源桶账户；运行期复核源/目标桶账户，失配 fail-closed（不写输出）。
+        let source_account = match self.db.bucket_account(&p.bucket).await {
+            Ok(v) => v,
+            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+        };
+        if let Some(recorded) = recorded_source_account.as_deref()
+            && recorded != source_account.as_str()
+        {
+            let msg =
+                format!("源桶账户已变化（配置 {recorded}，当前 {source_account}），拒绝写出清单");
+            return Err(self.fail(run.id, run.job_id, msg).await);
+        }
+        let dest_account = match self.db.bucket_account(&dest).await {
+            Ok(v) => v,
+            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+        };
+        if let Some(want) = cfg.destination.s3_bucket_destination.account_id.as_deref()
+            && want != dest_account.as_str()
+        {
+            let msg = format!("目标桶账户校验失败（配置 {want}，当前 {dest_account}）");
+            return Err(self.fail(run.id, run.job_id, msg).await);
+        }
         let base = join_key(&[
             cfg.destination
                 .s3_bucket_destination
@@ -385,6 +418,7 @@ impl InventoryRunner {
                 &p.bucket,
                 &cfg,
                 &dest,
+                (&source_account, &dest_account),
                 &data_key,
                 &manifest_key,
                 &hive_key,
@@ -442,6 +476,7 @@ impl InventoryRunner {
         source_bucket: &str,
         cfg: &InventoryConfiguration,
         dest: &str,
+        accounts: (&str, &str),
         data_key: &str,
         manifest_key: &str,
         hive_key: &str,
@@ -557,9 +592,12 @@ impl InventoryRunner {
         } else {
             columns.join(",")
         };
+        // 3.7：账户字段是扩展（AWS manifest 无此键）；`accountId` 为源桶账户。
         let mut manifest = serde_json::json!({
             "sourceBucket": source_bucket,
             "destinationBucket": dest,
+            "accountId": accounts.0,
+            "destinationAccountId": accounts.1,
             "version": "2016-11-30",
             "creationTimestamp": iso8601_millis(crate::db::now(), 0),
             "fileFormat": if parquet { "Parquet" } else { "CSV" },

@@ -34,6 +34,9 @@ struct ConfigBody {
     is_enabled: bool,
     frequency: String,
     destination_bucket: String,
+    /// 3.7：目标桶账户（可选；须等于目标桶当前账户）。跨账户目标仅管理员可配置。
+    #[serde(default)]
+    destination_account_id: Option<String>,
     #[serde(default)]
     destination_prefix: Option<String>,
     #[serde(default = "csv")]
@@ -69,7 +72,7 @@ impl ConfigBody {
         InventoryConfiguration {
             destination: InventoryDestination {
                 s3_bucket_destination: InventoryS3BucketDestination {
-                    account_id: None,
+                    account_id: self.destination_account_id.filter(|a| !a.is_empty()),
                     bucket: self.destination_bucket,
                     encryption: None,
                     format: InventoryFormat::from(self.format),
@@ -101,7 +104,9 @@ struct ConfigView {
     is_enabled: bool,
     frequency: String,
     destination_bucket: String,
+    destination_account_id: Option<String>,
     destination_prefix: Option<String>,
+    source_account_id: Option<String>,
     format: String,
     filter_prefix: Option<String>,
     included_object_versions: String,
@@ -110,14 +115,20 @@ struct ConfigView {
 }
 
 impl ConfigView {
-    fn new(c: &InventoryConfiguration, incremental: bool) -> Self {
+    fn new(
+        c: &InventoryConfiguration,
+        incremental: bool,
+        source_account_id: Option<String>,
+    ) -> Self {
         let d = &c.destination.s3_bucket_destination;
         Self {
             id: c.id.clone(),
             is_enabled: c.is_enabled,
             frequency: c.schedule.frequency.as_str().to_string(),
             destination_bucket: d.bucket.clone(),
+            destination_account_id: d.account_id.clone(),
             destination_prefix: d.prefix.clone(),
+            source_account_id,
             format: d.format.as_str().to_string(),
             filter_prefix: c.filter.as_ref().map(|f| f.prefix.clone()),
             included_object_versions: c.included_object_versions.as_str().to_string(),
@@ -158,6 +169,8 @@ async fn list(
     }
     match state.inventory.list_configs(&bucket).await {
         Ok(list) => {
+            // 账户 = 用户命名空间 v1；配置期已记录，展示当前桶账户（属主变更由运行期复核兜底）。
+            let source_account = state.db.bucket_account(&bucket).await.ok();
             let mut views = Vec::with_capacity(list.len());
             for c in &list {
                 // M5：增量开关/水位是节点本地表，Raft 多节点下不可用，统一报 false。
@@ -170,7 +183,7 @@ async fn list(
                         .await
                         .unwrap_or(false)
                 };
-                views.push(ConfigView::new(c, incremental));
+                views.push(ConfigView::new(c, incremental, source_account.clone()));
             }
             Json(views).into_response()
         }
