@@ -707,6 +707,7 @@ async fn current_expiry_cursor_resumes_across_sweeps() {
     let limits = SweepLimits {
         max_pages: 2,
         page_size: 1,
+        ..SweepLimits::default()
     };
     let now = now_secs();
     sweep_once_at_with(&st, now, limits).await;
@@ -774,6 +775,7 @@ async fn noncurrent_cursor_resumes_without_losing_chain_rank() {
     let limits = SweepLimits {
         max_pages: 2,
         page_size: 2,
+        ..SweepLimits::default()
     };
     let future = now_secs() + 2 * 86_400;
     let mut sweeps = 0;
@@ -798,6 +800,74 @@ async fn noncurrent_cursor_resumes_without_losing_chain_rank() {
         .unwrap();
     assert_eq!(vl.entries.len(), 3, "每个 key 只剩当前版本：{vl:?}");
     assert!(vl.entries.iter().all(|e| !e.is_marker));
+}
+
+/// H3：单键版本链超过硬上限 → 跳过该键（不整链读入/翻页），后续键照常处理，不空转。
+#[tokio::test]
+async fn overlong_version_chain_is_skipped_without_livelock() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    versioned_bucket(&st, "hck").await;
+    for body in [&b"v0"[..], &b"v1"[..], &b"v2"[..], &b"v3"[..], &b"v4"[..]] {
+        put_version(&st, "hck", "a-hot", body).await;
+    }
+    put_version(&st, "hck", "z-later", b"old").await;
+    put_version(&st, "hck", "z-later", b"cur").await;
+    let mut spec = blank_spec();
+    spec.rule_id = Some("h3-rule".into());
+    spec.noncurrent_expiration = Some(NoncurrentExpiration {
+        days: 1,
+        newer: None,
+    });
+    st.lifecycle.put_rules("hck", &[spec]).await.unwrap();
+    let limits = SweepLimits {
+        max_pages: 100,
+        page_size: 2,
+        max_key_versions: 2,
+    };
+    let future = now_secs() + 2 * 86_400;
+
+    sweep_once_at_with(&st, future, limits).await;
+    let hot = st
+        .store
+        .list_object_versions("hck", "a-hot", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(hot.entries.len(), 5, "超限链应整体跳过：{hot:?}");
+    let later = st
+        .store
+        .list_object_versions("hck", "z-later", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        later.entries.len(),
+        1,
+        "跳过超限键后应继续处理后续键：{later:?}"
+    );
+    let jobs = st.db.list_jobs(10).await.unwrap();
+    assert_eq!(jobs[0]["state"], "error", "{jobs:?}");
+    assert!(
+        jobs[0]["error"].as_str().unwrap_or("").contains("超过"),
+        "跳过必须在作业错误中可见：{jobs:?}"
+    );
+    assert!(jobs[0]["skipped"].as_i64().unwrap_or(0) >= 1, "{jobs:?}");
+
+    // 再跑一轮：仍然跳过热键，但不会卡在同一位置（后续键已处理，游标保持清零）。
+    sweep_once_at_with(&st, future, limits).await;
+    assert!(
+        st.db
+            .lifecycle_cursor_get("hck", "h3-rule", "noncurrent")
+            .await
+            .unwrap()
+            .is_none(),
+        "跳过后游标不得停在热键上"
+    );
+    let hot = st
+        .store
+        .list_object_versions("hck", "a-hot", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(hot.entries.len(), 5);
 }
 
 /// 3.10：AbortIncompleteMultipartUpload 按前缀 + 创建天数中止，域外不动。
@@ -882,6 +952,7 @@ async fn abort_mpu_cursor_resumes_across_sweeps() {
     let limits = SweepLimits {
         max_pages: 1,
         page_size: 1,
+        ..SweepLimits::default()
     };
     let mut sweeps = 0;
     loop {
@@ -911,4 +982,60 @@ async fn abort_mpu_cursor_resumes_across_sweeps() {
             .unwrap()
             .is_none()
     );
+}
+
+/// M3：单个 MPU 中止持久失败（EACCES）只跳过该上传，后续 MPU 继续中止，作业不卡死。
+#[tokio::test]
+async fn abort_mpu_per_upload_error_does_not_block_others() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("mpf").await.unwrap();
+    st.db.insert_bucket("mpf", None).await.unwrap();
+    let poisoned = st
+        .store
+        .create_multipart_upload("mpf", "up/a-poison", None, Default::default())
+        .await
+        .unwrap();
+    let good = st
+        .store
+        .create_multipart_upload("mpf", "up/b-good", None, Default::default())
+        .await
+        .unwrap();
+    let mut spec = blank_spec();
+    spec.filter.prefix = "up/".into();
+    spec.abort_mpu_days = Some(1);
+    st.lifecycle.put_rules("mpf", &[spec]).await.unwrap();
+
+    // 暂存目录去掉写权限：abort 的 remove_dir_all 返回 EACCES（非 NoSuchUpload）。
+    let poison_dir = xl_store::layout::object_dir(&dir.path().join("data"), "mpf", "up/a-poison")
+        .unwrap()
+        .join(&poisoned);
+    let mut perms = std::fs::metadata(&poison_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&poison_dir, perms).unwrap();
+
+    let future = now_secs() + 86_401;
+    sweep_once_at(&st, future).await;
+    let left = st
+        .store
+        .list_multipart_uploads("mpf", &UploadListRequest::default())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = left.uploads.iter().map(|u| u.upload_id.as_str()).collect();
+    assert!(
+        ids.contains(&poisoned.as_str()) && !ids.contains(&good.as_str()),
+        "坏上传应保留、后续上传应中止：{ids:?}"
+    );
+    let jobs = st.db.list_jobs(10).await.unwrap();
+    assert_eq!(
+        jobs[0]["state"], "done",
+        "单上传失败不得让整条规则报错：{jobs:?}"
+    );
+    assert!(jobs[0]["skipped"].as_i64().unwrap_or(0) >= 1, "{jobs:?}");
+
+    let mut perms = std::fs::metadata(&poison_dir).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&poison_dir, perms).unwrap();
 }

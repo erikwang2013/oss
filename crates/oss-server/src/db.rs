@@ -3686,15 +3686,15 @@ impl Db {
         Ok(rows.len())
     }
 
-    /// 4.11：回收「state='running' 但没有任何 job_tasks」的作业行。
+    /// 4.11/M2：回收「state='running' 但没有任何 job_tasks」的作业行。
     /// lifecycle/inventory 等单条作业只写 jobs 行；进程在 job_start 之后崩溃会永久停在
-    /// running。`cutoff` 限定 created_at（启动时覆盖全部，周期用 now-阈值避免误伤新作业）。
+    /// running。`cutoff` 限定 updated_at（长作业靠心跳续命，避免把仍在跑的扫描误标 error）。
     pub async fn recover_orphan_jobs(&self, cutoff: i64, now: i64) -> Result<usize> {
         let n = sqlx::query(
             "UPDATE jobs SET state = 'error', \
              error = COALESCE(error, '进程崩溃遗留的 running 作业，已自动回收'), \
              finished_at = ?, updated_at = ? \
-             WHERE state = 'running' AND created_at <= ? \
+             WHERE state = 'running' AND updated_at <= ? \
              AND NOT EXISTS (SELECT 1 FROM job_tasks WHERE job_tasks.job_id = jobs.id)",
         )
         .bind(now)
@@ -3704,6 +3704,16 @@ impl Db {
         .await?
         .rows_affected();
         Ok(n as usize)
+    }
+
+    /// M2：长作业心跳（只续 running 行），让 orphan 回收按 liveness 而非创建时间判断。
+    pub async fn job_heartbeat(&self, job_id: i64, now: i64) -> Result<()> {
+        sqlx::query("UPDATE jobs SET updated_at = ? WHERE id = ? AND state = 'running'")
+            .bind(now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// 启动恢复：running 且 `started_at < cutoff`（进程崩溃遗留）按一次失败处理。

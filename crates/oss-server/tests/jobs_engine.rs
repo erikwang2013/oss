@@ -293,4 +293,19 @@ async fn recover_orphan_jobs_marks_crash_left_running_rows() {
     assert_eq!(l["state"], "running", "有任务行的作业不归本回收器");
     // 幂等：再跑不重复计数
     assert_eq!(db.recover_orphan_jobs(1000, 3000).await.unwrap(), 0);
+
+    // M2：心跳续命的长作业不被误回收；心跳过期后才回收。
+    let hb = db
+        .job_start("lifecycle", "reports", "", 2000)
+        .await
+        .unwrap();
+    db.job_heartbeat(hb, 5000).await.unwrap();
+    assert_eq!(
+        db.recover_orphan_jobs(3000, 6000).await.unwrap(),
+        0,
+        "updated_at 在截止之后：仍在跑"
+    );
+    assert_eq!(db.recover_orphan_jobs(5000, 7000).await.unwrap(), 1);
+    let h = db.job_get(hb).await.unwrap().unwrap();
+    assert_eq!(h["state"], "error");
 }
