@@ -9,7 +9,8 @@
 //!
 //! 格式 1 已冻结：行结构没有 `deny_unknown_fields`，旧节点会**静默丢弃**未知字段并
 //! 清掉未知表。任何 `ControlData` 增删都必须升到 `OSSCTL2`（随激活标记切换），
-//! 绝不能只往格式 1 里加字段。本版本无复制 schema 变更 → 保持 OSSCTL1（D6）。
+//! 绝不能只往格式 1 里加字段。`LifecycleRuleRow.config_json` 是既成的 level-2 数据：
+//! OSSCTL2 落地前编码器对它 fail-closed（见 [`encode_snapshot`]），其余字段仍用 OSSCTL1。
 
 use std::collections::{HashMap, HashSet};
 
@@ -799,7 +800,15 @@ pub(crate) async fn install_tx(
 }
 
 /// 快照封套编码：`OSSCTL1\n<sha256 hex>\n<json>`。
+///
+/// 临时 fail-closed（OSSCTL2 之前）：格式 1 没有 `config_json` 的合法表示，v1.13.1
+/// 安装时会静默丢弃结构化生命周期。宁可拒绝快照/恢复，也不丢 level-2 数据。
 pub fn encode_snapshot(data: &ControlData) -> Result<Vec<u8>, DataError> {
+    if data.lifecycle_rules.iter().any(|r| r.config_json.is_some()) {
+        return Err(DataError::Format(
+            "level-2 data present; refusing OSSCTL1".into(),
+        ));
+    }
     let payload = serde_json::to_vec(data)?;
     let sum = Sha256::digest(&payload);
     let mut out = Vec::with_capacity(MAGIC.len() + HEX_LEN + 1 + payload.len());
@@ -1024,6 +1033,23 @@ mod tests {
         let decoded = decode_snapshot(&bytes).unwrap();
         assert_eq!(decoded, data);
         assert_eq!(encode_snapshot(&decoded).unwrap(), bytes);
+    }
+
+    /// 临时 fail-closed：level-2 生命周期数据不得封进 OSSCTL1（v1.13.1 会静默丢弃）。
+    #[test]
+    fn snapshot_refuses_level_two_lifecycle_data() {
+        assert!(
+            encode_snapshot(&sample())
+                .unwrap()
+                .starts_with(b"OSSCTL1\n")
+        );
+        let mut data = sample();
+        data.lifecycle_rules[0].config_json = Some(r#"{"filter":{"prefix":"logs/"}}"#.into());
+        let err = encode_snapshot(&data).expect_err("config_json must refuse OSSCTL1");
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("level-2 data present")),
+            "{err}"
+        );
     }
 
     /// 1 字节/头部篡改/截断都拒绝；错误分类可区分 checksum 与格式。
