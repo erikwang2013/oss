@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use xl_s3::lifecycle::{ExpirationAction, LifecycleRuleSpec};
 use xl_s3::sync_delete::SyncDeleteSink as _;
-use xl_store::store::{ListRequest, VersionEntry, VersioningMode};
+use xl_store::store::{ListRequest, UploadListRequest, VersionEntry, VersioningMode};
 
 use crate::db::LifecycleRuleRow;
 use crate::state::AppState;
@@ -59,6 +59,35 @@ struct Progress {
     skipped: i64,
 }
 
+/// 4.10：单阶段单轮页预算（默认 100 页 × 1000 条，测试注入小值验证跨轮续扫）。
+#[derive(Clone, Copy)]
+pub struct SweepLimits {
+    pub max_pages: usize,
+    pub page_size: usize,
+}
+
+impl Default for SweepLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 100,
+            page_size: 1000,
+        }
+    }
+}
+
+const STAGE_CURRENT: &str = "current";
+const STAGE_EODM: &str = "eodm";
+const STAGE_NONCURRENT: &str = "noncurrent";
+const STAGE_ABORT_MPU: &str = "abort-mpu";
+
+/// 游标键：新规则用 rule_id；M4 遗留行（rule_id NULL）用 prefix（同桶内唯一）。
+fn cursor_rule_id(spec: &LifecycleRuleSpec) -> String {
+    spec.rule_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("legacy:{}", spec.prefix()))
+}
+
 /// noncurrent 是否到期：保留最新 N 个 noncurrent；年龄以**更新版本**的创建时间为钟。
 fn noncurrent_due(rank: usize, retain: Option<u32>, newer_nanos: i64, days: u32, now: i64) -> bool {
     rank as u32 > retain.unwrap_or(0) && now - secs(newer_nanos) >= i64::from(days) * 86_400
@@ -70,11 +99,12 @@ struct ExpiryKinds {
     current: bool,
     eodm: bool,
     noncurrent: bool,
+    abort_mpu: bool,
 }
 
 impl ExpiryKinds {
     fn any(self) -> bool {
-        self.current || self.eodm || self.noncurrent
+        self.current || self.eodm || self.noncurrent || self.abort_mpu
     }
 }
 
@@ -89,6 +119,7 @@ fn expiry_kinds(spec: &LifecycleRuleSpec) -> ExpiryKinds {
             Some(ExpirationAction::ExpiredObjectDeleteMarker)
         ),
         noncurrent: spec.noncurrent_expiration.is_some(),
+        abort_mpu: spec.abort_mpu_days.is_some(),
     }
 }
 
@@ -99,6 +130,11 @@ pub async fn sweep_once(state: &AppState) -> usize {
 
 /// 单次扫描（注入判定时刻）：集成测试用它模拟「规则到期后」的时间点。
 pub async fn sweep_once_at(state: &AppState, now: i64) -> usize {
+    sweep_once_at_with(state, now, SweepLimits::default()).await
+}
+
+/// 4.10：可注入页预算的扫描入口（集成测试用小预算验证「截停→续扫」）。
+pub async fn sweep_once_at_with(state: &AppState, now: i64, limits: SweepLimits) -> usize {
     let rules = match state.db.enabled_lifecycle_rules().await {
         Ok(r) => r,
         Err(e) => {
@@ -126,7 +162,7 @@ pub async fn sweep_once_at(state: &AppState, now: i64) -> usize {
             continue; // Transition-only 规则归 tier sweep
         }
         ran += 1;
-        run_rule(state, &row.bucket, &spec, kinds, now).await;
+        run_rule(state, &row.bucket, &spec, kinds, now, limits).await;
     }
     ran
 }
@@ -160,7 +196,9 @@ async fn run_rule(
     spec: &LifecycleRuleSpec,
     kinds: ExpiryKinds,
     now: i64,
+    limits: SweepLimits,
 ) {
+    let rule_key = cursor_rule_id(spec);
     let mut progress = Progress::default();
     let mut err: Option<String> = None;
     let started = now_secs();
@@ -183,14 +221,52 @@ async fn run_rule(
         }
     };
     if err.is_none() {
+        // 4.10：各阶段独立推进（各自游标 + 页预算）；某阶段截停不阻塞其他阶段。
         if kinds.current {
-            err = expire_current(state, bucket, spec, mode, now, &mut progress).await;
+            err = expire_current(
+                state,
+                bucket,
+                &rule_key,
+                spec,
+                mode,
+                now,
+                &mut progress,
+                limits,
+            )
+            .await;
         }
-        if err.is_none() && kinds.eodm && mode != VersioningMode::Off {
-            err = expire_eodm(state, bucket, spec, mode, now, &mut progress).await;
+        if kinds.eodm && mode != VersioningMode::Off {
+            let e = expire_eodm(
+                state,
+                bucket,
+                &rule_key,
+                spec,
+                mode,
+                now,
+                &mut progress,
+                limits,
+            )
+            .await;
+            err = err.or(e);
         }
-        if err.is_none() && kinds.noncurrent && mode != VersioningMode::Off {
-            err = expire_noncurrent(state, bucket, spec, mode, now, &mut progress).await;
+        if kinds.noncurrent && mode != VersioningMode::Off {
+            let e = expire_noncurrent(
+                state,
+                bucket,
+                &rule_key,
+                spec,
+                mode,
+                now,
+                &mut progress,
+                limits,
+            )
+            .await;
+            err = err.or(e);
+        }
+        if kinds.abort_mpu {
+            let e =
+                expire_abort_mpu(state, bucket, &rule_key, spec, now, &mut progress, limits).await;
+            err = err.or(e);
         }
     }
     let (st, msg) = match &err {
@@ -214,14 +290,34 @@ async fn run_rule(
     }
 }
 
+/// 游标写入失败只告警：最坏是下轮重复扫/推迟到期，不影响删除安全。
+async fn save_cursor(
+    state: &AppState,
+    bucket: &str,
+    rule_id: &str,
+    stage: &str,
+    cursor: Option<&str>,
+) {
+    if let Err(e) = state
+        .db
+        .lifecycle_cursor_set(bucket, rule_id, stage, cursor, now_secs())
+        .await
+    {
+        tracing::warn!(bucket, rule_id, stage, error = %e, "lifecycle：游标写入失败");
+    }
+}
+
 /// 当前版本过期（Days/Date）。
+#[allow(clippy::too_many_arguments)]
 async fn expire_current(
     state: &AppState,
     bucket: &str,
+    rule_id: &str,
     spec: &LifecycleRuleSpec,
     mode: VersioningMode,
     now: i64,
     progress: &mut Progress,
+    limits: SweepLimits,
 ) -> Option<String> {
     let date = match &spec.expiration {
         Some(ExpirationAction::Days { days }) => Some(now - i64::from(*days) * 86_400),
@@ -233,10 +329,24 @@ async fn expire_current(
         }
         _ => return None,
     };
+    // 4.10：从上轮截停位置续扫。读取失败从头扫（只重复工作，安全）。
+    let mut cursor = match state
+        .db
+        .lifecycle_cursor_get(bucket, rule_id, STAGE_CURRENT)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(bucket, rule_id, error = %e, "lifecycle：游标读取失败，本轮从头扫");
+            None
+        }
+    };
     let mut token: Option<String> = None;
     let mut pages = 0usize;
     loop {
-        if pages >= 100 {
+        if pages >= limits.max_pages {
+            // 截停点前整页已处理完：记页尾 key（marker 排他，下轮从其后继续）。
+            save_cursor(state, bucket, rule_id, STAGE_CURRENT, cursor.as_deref()).await;
             return Some(format!(
                 "单轮页上限截停（前缀下键过多），下轮续扫（scanned={}）",
                 progress.scanned
@@ -249,7 +359,14 @@ async fn expire_current(
                 bucket,
                 &ListRequest {
                     prefix: Some(spec.prefix().to_string()),
+                    max_keys: Some(limits.page_size),
                     continuation_token: token.clone(),
+                    // 续页 token 与 marker 互斥；marker 只在首轮使用。
+                    marker: if token.is_none() {
+                        cursor.clone()
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
             )
@@ -297,38 +414,56 @@ async fn expire_current(
                 }
             }
         }
+        if let Some(last) = page.objects.last() {
+            cursor = Some(last.key.clone());
+        }
         match page.next_token {
             Some(t) if page.is_truncated => token = Some(t),
-            _ => return None,
+            _ => {
+                // 扫完清游标：下轮从头开始，不跳过游标之前新插入的 key。
+                save_cursor(state, bucket, rule_id, STAGE_CURRENT, None).await;
+                return None;
+            }
         }
     }
 }
 
 /// EODM：链上唯一版本且为 delete marker 的墓碑。
+#[allow(clippy::too_many_arguments)]
 async fn expire_eodm(
     state: &AppState,
     bucket: &str,
+    rule_id: &str,
     spec: &LifecycleRuleSpec,
     mode: VersioningMode,
     _now: i64,
     progress: &mut Progress,
+    limits: SweepLimits,
 ) -> Option<String> {
     let mut last_key: Option<String> = None;
     let mut group: Vec<VersionEntry> = Vec::new();
-    let mut key_marker: Option<String> = None;
+    // 4.10：续扫重读「上轮未处理完的 key」整条链（不带 vid marker，避免半条链参与判定）。
+    let mut key_marker = match state
+        .db
+        .lifecycle_cursor_get(bucket, rule_id, STAGE_EODM)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(bucket, rule_id, error = %e, "lifecycle：EODM 游标读取失败，本轮从头扫");
+            None
+        }
+    };
     let mut vid_marker: Option<String> = None;
     let mut pages = 0usize;
     loop {
-        if pages >= 100 {
-            return Some("单轮页上限截停（版本过多），下轮续扫".into());
-        }
         pages += 1;
         let page = match state
             .store
             .list_object_versions(
                 bucket,
                 spec.prefix(),
-                1000,
+                limits.page_size,
                 key_marker.as_deref(),
                 vid_marker.as_deref(),
             )
@@ -340,11 +475,18 @@ async fn expire_eodm(
         };
         for e in &page.entries {
             if last_key.as_deref() != Some(e.key.as_str()) {
-                if let Some(k) = last_key.take()
-                    && let Some(m) =
+                // 先在 key 边界把上一组处理完，再判断预算（整链必须读全才能排名）。
+                if let Some(k) = last_key.take() {
+                    if let Some(m) =
                         eodm_group(state, bucket, spec, &k, &group, mode, progress).await
-                {
-                    return Some(m);
+                    {
+                        return Some(m);
+                    }
+                    // 4.10：至少完成一个 key 后才按预算截停，否则会永远停在起点。
+                    if pages >= limits.max_pages {
+                        save_cursor(state, bucket, rule_id, STAGE_EODM, Some(e.key.as_str())).await;
+                        return Some("单轮页上限截停（版本过多），下轮续扫".into());
+                    }
                 }
                 last_key = Some(e.key.clone());
                 group.clear();
@@ -357,6 +499,7 @@ async fn expire_eodm(
         key_marker = page.next_key_marker;
         vid_marker = page.next_version_id_marker;
     }
+    save_cursor(state, bucket, rule_id, STAGE_EODM, None).await;
     if let Some(k) = last_key {
         return eodm_group(state, bucket, spec, &k, &group, mode, progress).await;
     }
@@ -406,31 +549,45 @@ async fn eodm_group(
 }
 
 /// 非当前版本过期（NoncurrentDays + 可选 NewerNoncurrentVersions）。
+#[allow(clippy::too_many_arguments)]
 async fn expire_noncurrent(
     state: &AppState,
     bucket: &str,
+    rule_id: &str,
     spec: &LifecycleRuleSpec,
     mode: VersioningMode,
     now: i64,
     progress: &mut Progress,
+    limits: SweepLimits,
 ) -> Option<String> {
-    let nc = spec.noncurrent_expiration.as_ref()?;
+    let nc = match spec.noncurrent_expiration.as_ref() {
+        Some(nc) => nc,
+        None => return None,
+    };
     let mut last_key: Option<String> = None;
     let mut group: Vec<VersionEntry> = Vec::new();
-    let mut key_marker: Option<String> = None;
+    // 4.10：同 EODM——续扫整链重读，排名才正确。
+    let mut key_marker = match state
+        .db
+        .lifecycle_cursor_get(bucket, rule_id, STAGE_NONCURRENT)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(bucket, rule_id, error = %e, "lifecycle：noncurrent 游标读取失败，本轮从头扫");
+            None
+        }
+    };
     let mut vid_marker: Option<String> = None;
     let mut pages = 0usize;
     loop {
-        if pages >= 100 {
-            return Some("单轮页上限截停（版本过多），下轮续扫".into());
-        }
         pages += 1;
         let page = match state
             .store
             .list_object_versions(
                 bucket,
                 spec.prefix(),
-                1000,
+                limits.page_size,
                 key_marker.as_deref(),
                 vid_marker.as_deref(),
             )
@@ -442,12 +599,25 @@ async fn expire_noncurrent(
         };
         for e in &page.entries {
             if last_key.as_deref() != Some(e.key.as_str()) {
-                if let Some(k) = last_key.take()
-                    && let Some(m) =
+                // 同 EODM：先处理完上一组，再在 key 边界判断预算。
+                if let Some(k) = last_key.take() {
+                    if let Some(m) =
                         noncurrent_group(state, bucket, spec, nc, &k, &group, mode, now, progress)
                             .await
-                {
-                    return Some(m);
+                    {
+                        return Some(m);
+                    }
+                    if pages >= limits.max_pages {
+                        save_cursor(
+                            state,
+                            bucket,
+                            rule_id,
+                            STAGE_NONCURRENT,
+                            Some(e.key.as_str()),
+                        )
+                        .await;
+                        return Some("单轮页上限截停（版本过多），下轮续扫".into());
+                    }
                 }
                 last_key = Some(e.key.clone());
                 group.clear();
@@ -460,6 +630,7 @@ async fn expire_noncurrent(
         key_marker = page.next_key_marker;
         vid_marker = page.next_version_id_marker;
     }
+    save_cursor(state, bucket, rule_id, STAGE_NONCURRENT, None).await;
     if let Some(k) = last_key {
         return noncurrent_group(state, bucket, spec, nc, &k, &group, mode, now, progress).await;
     }
@@ -561,6 +732,106 @@ async fn fresh_entries(
         .filter(|e| e.key == key)
         .take(2)
         .collect())
+}
+
+/// 3.10：MPU 双 marker 游标（key + upload_id），JSON 存在 lifecycle_cursors.cursor。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MpuCursor {
+    key: String,
+    upload_id: String,
+}
+
+/// 未完成分段上传过期（AbortIncompleteMultipartUpload）：仅按前缀 + 创建天数。
+/// MPU 没有对象事件/复制语义（不是已存在对象），中止后只计数。
+async fn expire_abort_mpu(
+    state: &AppState,
+    bucket: &str,
+    rule_id: &str,
+    spec: &LifecycleRuleSpec,
+    now: i64,
+    progress: &mut Progress,
+    limits: SweepLimits,
+) -> Option<String> {
+    let days = spec.abort_mpu_days?;
+    let (mut key_marker, mut upload_id_marker) = match state
+        .db
+        .lifecycle_cursor_get(bucket, rule_id, STAGE_ABORT_MPU)
+        .await
+    {
+        Ok(Some(raw)) => match serde_json::from_str::<MpuCursor>(&raw) {
+            Ok(c) => (Some(c.key), Some(c.upload_id)),
+            Err(e) => {
+                // 坏游标从头重扫：最多重复列举，不会重复中止（NoSuchUpload 视为成功）。
+                tracing::warn!(bucket, rule_id, error = %e, "lifecycle：MPU 游标损坏，从头扫描");
+                (None, None)
+            }
+        },
+        Ok(None) => (None, None),
+        Err(e) => return Some(format!("MPU 游标读取失败: {e}")),
+    };
+    let mut pages = 0usize;
+    loop {
+        let page = match state
+            .store
+            .list_multipart_uploads(
+                bucket,
+                &UploadListRequest {
+                    prefix: Some(spec.prefix().to_string()),
+                    delimiter: None,
+                    key_marker: key_marker.clone(),
+                    upload_id_marker: upload_id_marker.clone(),
+                    max_uploads: Some(limits.page_size.max(1)),
+                },
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return Some(format!("MPU 列举失败: {e}")),
+        };
+        let mut last: Option<(String, String)> = None;
+        for u in &page.uploads {
+            last = Some((u.key.clone(), u.upload_id.clone()));
+            // 创建时刻缺失/非法 → 年龄不可知，fail closed 跳过。
+            if u.initiated_nanos <= 0 {
+                progress.skipped += 1;
+                continue;
+            }
+            if now - secs(u.initiated_nanos) < i64::from(days) * 86_400 {
+                continue;
+            }
+            progress.scanned += 1;
+            match state
+                .store
+                .abort_multipart_upload(bucket, &u.key, &u.upload_id)
+                .await
+            {
+                Ok(()) => progress.deleted += 1,
+                // 并发完成/已删：目标状态已达成。
+                Err(xl_store::error::Error::NoSuchUpload(_)) => {}
+                Err(e) => return Some(format!("中止未完成分段上传失败: {e}")),
+            }
+        }
+        if !page.is_truncated {
+            save_cursor(state, bucket, rule_id, STAGE_ABORT_MPU, None).await;
+            return None;
+        }
+        pages += 1;
+        let next = match (page.next_key_marker, page.next_upload_id_marker) {
+            (Some(key), Some(upload_id)) => Some(MpuCursor { key, upload_id }),
+            _ => last.map(|(key, upload_id)| MpuCursor { key, upload_id }),
+        };
+        let Some(next) = next else {
+            // 截断却无续页 marker：保守停下，下轮从原游标重扫。
+            return Some("MPU 列举截断但缺续页 marker".to_string());
+        };
+        if pages >= limits.max_pages.max(1) {
+            let raw = serde_json::to_string(&next).unwrap_or_default();
+            save_cursor(state, bucket, rule_id, STAGE_ABORT_MPU, Some(&raw)).await;
+            return Some("单轮页上限截停（MPU 过多），下轮续扫".into());
+        }
+        key_marker = Some(next.key);
+        upload_id_marker = Some(next.upload_id);
+    }
 }
 
 /// 删除结果统一收尾：tier GC、事件、可选复制入队、计数。

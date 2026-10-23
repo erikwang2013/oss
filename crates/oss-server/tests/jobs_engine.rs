@@ -262,3 +262,35 @@ async fn report_applies_bucket_default_encryption() {
             .contains("Copy-ok")
     );
 }
+
+/// 4.11：崩溃遗留的「无任务 running」行按截止时间回收；有任务行的作业不受影响。
+#[tokio::test]
+async fn recover_orphan_jobs_marks_crash_left_running_rows() {
+    let (db, _store, _d1, _d2) = setup().await;
+    let orphan = db
+        .job_start("lifecycle", "reports", "", 1000)
+        .await
+        .unwrap();
+    let live = db
+        .create_job(&spec(vec!["Copy"], false), 1000)
+        .await
+        .unwrap();
+    // 领取一次任务，让 live 成为真正 running 且有任务行的作业。
+    assert!(db.claim_task(1000, 3600).await.unwrap().is_some());
+
+    // 截止时间早于创建：都不回收
+    assert_eq!(db.recover_orphan_jobs(500, 1000).await.unwrap(), 0);
+    // 只有无任务行的 orphan 被标记 error
+    assert_eq!(db.recover_orphan_jobs(1000, 2000).await.unwrap(), 1);
+    let o = db.job_get(orphan).await.unwrap().unwrap();
+    assert_eq!(o["state"], "error");
+    assert_eq!(o["finished_at"], 2000);
+    assert!(
+        o["error"].as_str().unwrap_or("").contains("自动回收"),
+        "{o:?}"
+    );
+    let l = db.job_get(live).await.unwrap().unwrap();
+    assert_eq!(l["state"], "running", "有任务行的作业不归本回收器");
+    // 幂等：再跑不重复计数
+    assert_eq!(db.recover_orphan_jobs(1000, 3000).await.unwrap(), 0);
+}

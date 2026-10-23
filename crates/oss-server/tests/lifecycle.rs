@@ -4,8 +4,8 @@ mod common;
 
 use common::state;
 use oss_server::db::LifecycleRuleRow;
-use oss_server::lifecycle::{sweep_once, sweep_once_at};
-use xl_store::store::VersioningMode;
+use oss_server::lifecycle::{SweepLimits, sweep_once, sweep_once_at, sweep_once_at_with};
+use xl_store::store::{UploadListRequest, VersioningMode};
 
 fn rule(prefix: &str, days: i64) -> LifecycleRuleRow {
     LifecycleRuleRow {
@@ -384,6 +384,7 @@ fn blank_spec() -> LifecycleRuleSpec {
         transitions: vec![],
         noncurrent_expiration: None,
         noncurrent_transitions: vec![],
+        abort_mpu_days: None,
         enabled: true,
     }
 }
@@ -672,4 +673,242 @@ async fn corrupt_config_json_fails_closed() {
         "{jobs:?}"
     );
     assert!(st.store.get_object("cbk", "keep.txt").await.is_ok());
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// 4.10：当前版本阶段按页预算截停 → 持久化 key 游标，下轮从游标后继续直至扫完清零。
+#[tokio::test]
+async fn current_expiry_cursor_resumes_across_sweeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("bkt").await.unwrap();
+    st.db.insert_bucket("bkt", None).await.unwrap();
+    for i in 0..5 {
+        st.store
+            .put_object(
+                "bkt",
+                &format!("old/{i}"),
+                bytes::Bytes::from_static(b"x"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    st.db
+        .set_lifecycle_rules("bkt", &[rule("old/", 0)], 1)
+        .await
+        .unwrap();
+    let limits = SweepLimits {
+        max_pages: 2,
+        page_size: 1,
+    };
+    let now = now_secs();
+    sweep_once_at_with(&st, now, limits).await;
+    // 遗留规则无 rule_id → 游标键 legacy:<prefix>；2 页各 1 个对象，游标停在 old/1。
+    assert_eq!(
+        st.db
+            .lifecycle_cursor_get("bkt", "legacy:old/", "current")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old/1")
+    );
+    assert!(matches!(
+        st.store.get_object("bkt", "old/0").await,
+        Err(xl_store::error::Error::NoSuchKey(_))
+    ));
+    assert!(st.store.get_object("bkt", "old/2").await.is_ok());
+
+    let mut sweeps = 0;
+    while st
+        .db
+        .lifecycle_cursor_get("bkt", "legacy:old/", "current")
+        .await
+        .unwrap()
+        .is_some()
+    {
+        sweep_once_at_with(&st, now, limits).await;
+        sweeps += 1;
+        assert!(sweeps < 10, "游标应随每轮推进并最终清零");
+    }
+    assert_eq!(
+        sweeps, 2,
+        "剩余 3 个对象按每轮 2 页继续，最后一轮扫完清游标"
+    );
+    for i in 0..5 {
+        assert!(
+            matches!(
+                st.store.get_object("bkt", &format!("old/{i}")).await,
+                Err(xl_store::error::Error::NoSuchKey(_))
+            ),
+            "old/{i} 应已过期"
+        );
+    }
+}
+
+/// 4.10：版本阶段在 key 边界截停——续扫重读整链，noncurrent 排名不因跨轮截断而错乱。
+#[tokio::test]
+async fn noncurrent_cursor_resumes_without_losing_chain_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    versioned_bucket(&st, "nbk").await;
+    for k in ["a.txt", "b.txt", "c.txt"] {
+        put_version(&st, "nbk", k, b"v0").await;
+        put_version(&st, "nbk", k, b"v1").await;
+    }
+    let mut spec = blank_spec();
+    spec.rule_id = Some("nc-rule".into());
+    spec.noncurrent_expiration = Some(NoncurrentExpiration {
+        days: 1,
+        newer: None,
+    });
+    st.lifecycle.put_rules("nbk", &[spec]).await.unwrap();
+
+    // 每页 2 条版本、每轮 2 页：一轮最多完整处理约一个 key。
+    let limits = SweepLimits {
+        max_pages: 2,
+        page_size: 2,
+    };
+    let future = now_secs() + 2 * 86_400;
+    let mut sweeps = 0;
+    loop {
+        sweep_once_at_with(&st, future, limits).await;
+        sweeps += 1;
+        let cur = st
+            .db
+            .lifecycle_cursor_get("nbk", "nc-rule", "noncurrent")
+            .await
+            .unwrap();
+        if cur.is_none() {
+            break;
+        }
+        assert!(sweeps < 10, "游标未推进（停在 {cur:?}）");
+    }
+    assert!(sweeps > 1, "应经过多轮续扫");
+    let vl = st
+        .store
+        .list_object_versions("nbk", "", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(vl.entries.len(), 3, "每个 key 只剩当前版本：{vl:?}");
+    assert!(vl.entries.iter().all(|e| !e.is_marker));
+}
+
+/// 3.10：AbortIncompleteMultipartUpload 按前缀 + 创建天数中止，域外不动。
+#[tokio::test]
+async fn abort_incomplete_mpu_respects_prefix_and_days() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("mpb").await.unwrap();
+    st.db.insert_bucket("mpb", None).await.unwrap();
+    let doomed = st
+        .store
+        .create_multipart_upload("mpb", "up/doomed.bin", None, Default::default())
+        .await
+        .unwrap();
+    let kept = st
+        .store
+        .create_multipart_upload("mpb", "keep/live.bin", None, Default::default())
+        .await
+        .unwrap();
+    let mut spec = blank_spec();
+    spec.filter.prefix = "up/".into();
+    spec.abort_mpu_days = Some(1);
+    st.lifecycle.put_rules("mpb", &[spec]).await.unwrap();
+    let ids = |st: &AppState| {
+        let st = st.clone();
+        async move {
+            st.store
+                .list_multipart_uploads("mpb", &UploadListRequest::default())
+                .await
+                .unwrap()
+                .uploads
+                .into_iter()
+                .map(|u| u.upload_id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // 未到期：两个都保留
+    sweep_once(&st).await;
+    let alive = ids(&st).await;
+    assert!(
+        alive.contains(&doomed) && alive.contains(&kept),
+        "{alive:?}"
+    );
+
+    // 模拟时间前进 1 天 + 1 秒：仅前缀内到期
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sweep_once_at(&st, now + 86_401).await;
+    let alive = ids(&st).await;
+    assert!(!alive.contains(&doomed), "到期 MPU 应被中止");
+    assert!(alive.contains(&kept), "前缀域外不得中止");
+    let jobs = st.db.list_jobs(10).await.unwrap();
+    assert_eq!(jobs[0]["state"], "done", "{jobs:?}");
+    assert_eq!(jobs[0]["deleted"], 1, "{jobs:?}");
+}
+
+/// 3.10：MPU 列表跨轮续扫（每轮 1 页 × 1 条），游标保存/清理且不重复计数。
+#[tokio::test]
+async fn abort_mpu_cursor_resumes_across_sweeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("mpg").await.unwrap();
+    st.db.insert_bucket("mpg", None).await.unwrap();
+    for i in 0..3 {
+        st.store
+            .create_multipart_upload("mpg", &format!("up/m{i}"), None, Default::default())
+            .await
+            .unwrap();
+    }
+    let mut spec = blank_spec();
+    spec.filter.prefix = "up/".into();
+    spec.abort_mpu_days = Some(1);
+    st.lifecycle.put_rules("mpg", &[spec]).await.unwrap();
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 86_401;
+    let limits = SweepLimits {
+        max_pages: 1,
+        page_size: 1,
+    };
+    let mut sweeps = 0;
+    loop {
+        sweeps += 1;
+        sweep_once_at_with(&st, future, limits).await;
+        let left = st
+            .store
+            .list_multipart_uploads("mpg", &UploadListRequest::default())
+            .await
+            .unwrap()
+            .uploads
+            .len();
+        if left == 0 {
+            break;
+        }
+        assert!(sweeps < 6, "游标未推进：仍有 {left} 个 MPU");
+    }
+    assert!(
+        sweeps >= 3,
+        "3 个 MPU 每轮 1 页应跨至少 3 轮，实际 {sweeps}"
+    );
+    // 完成轮已清游标。
+    assert!(
+        st.db
+            .lifecycle_cursor_get("mpg", "rule-1", "abort-mpu")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

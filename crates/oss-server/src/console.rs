@@ -1532,6 +1532,7 @@ fn console_rule_json(r: &xl_s3::lifecycle::LifecycleRuleSpec) -> serde_json::Val
         "transitions": transitions,
         "noncurrent_version_expiration": noncurrent_expiration,
         "noncurrent_version_transitions": noncurrent_transitions,
+        "abort_mpu_days": r.abort_mpu_days,
     })
 }
 
@@ -1620,6 +1621,9 @@ struct LifecycleRuleIn {
     noncurrent_version_expiration: Option<NoncurrentExpirationIn>,
     #[serde(default)]
     noncurrent_version_transitions: Option<Vec<NoncurrentTransitionIn>>,
+    /// 3.10：未完成分段上传的保留天数。
+    #[serde(default)]
+    abort_mpu_days: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1693,6 +1697,7 @@ fn console_spec(r: LifecycleRuleIn) -> Result<xl_s3::lifecycle::LifecycleRuleSpe
         transitions,
         noncurrent_version_expiration,
         noncurrent_version_transitions,
+        abort_mpu_days,
     } = r;
     let filter = build_filter(filter, &prefix)?;
     // 旧前端只发 expire_days；两个字段都给时以 expiration_days 为准。
@@ -1777,6 +1782,7 @@ fn console_spec(r: LifecycleRuleIn) -> Result<xl_s3::lifecycle::LifecycleRuleSpe
                 tier: t.tier,
             })
             .collect(),
+        abort_mpu_days,
         enabled,
     })
 }

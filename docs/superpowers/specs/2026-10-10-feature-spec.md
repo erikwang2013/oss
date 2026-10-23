@@ -487,8 +487,9 @@ SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥
 `PutBucketLifecycleConfiguration` / `GetBucketLifecycleConfiguration` / `DeleteBucketLifecycle`
 —— 最多 1000 条规则，每条：`ID`、`Status`、`Filter`（Prefix / Tag / ObjectSize* / And 互斥）、
 `Expiration`（Days | Date | ExpiredObjectDeleteMarker）、`Transition`（Days | Date，可多条）、
-`NoncurrentVersionExpiration`（含 `NewerNoncurrentVersions`）、`NoncurrentVersionTransition`。
-`AbortIncompleteMultipartUpload` 仍 501（需存储层 MPU 索引）。
+`NoncurrentVersionExpiration`（含 `NewerNoncurrentVersions`）、`NoncurrentVersionTransition`、
+`AbortIncompleteMultipartUpload`（`DaysAfterInitiation`，按前缀 + 创建时刻中止未完成分段上传；
+MPU 无标签/大小可判定，带此类过滤器的规则整条拒绝）。
 
 ### 9.2 行为
 
@@ -508,8 +509,11 @@ SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥
 
 - 规则**最小粒度是对象**，不是版本（`NoncurrentVersion*` 除外）。
 - 到期删除**不是精确时刻**：扫描周期默认 60s（不是每日）。
-- `AbortIncompleteMultipartUpload` 仍 501（需 MPU 索引）；Filter 的 tag/size/And 与
-  Date/EODM/多转换已支持。
+- 每阶段扫描位置按 `(bucket, rule_id, stage)` 持久化：单轮页预算（100 页 × 1000 条）用尽后
+  在下个键边界续扫，避免大全桶尾部长期饿死；规则/配置变更会使旧游标失效。版本阶段续扫时
+  重读在途键的完整版本链以保证 noncurrent 排名正确。
+- `AbortIncompleteMultipartUpload` 不产生对象事件/复制（不是已存在对象），仅计数；中止遇到
+  `NoSuchUpload` 视为已达成。Filter 的 tag/size/And 与 Date/EODM/多转换已支持。
 
 ---
 
@@ -694,7 +698,7 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 | tier 后端 | 说明 | 状态 |
 |---|---|---|
 | 远端 S3 兼容端点 | `[[tiers]]` 静态配置（`id/endpoint/bucket/access_key/secret_key/region`），http/https；全内存搬运，单对象 `OSS_TIER_MAX_BYTES`（默认 1 GiB） | 已落地 |
-| 本地冷盘池 | `kind="local"` + `path`；同目录临时文件 + fsync + rename，MD5 校验，路径段拒绝绝对路径/`..`/NUL；适用不同 EC 参数/更慢介质 | 已落地（2026-10-23） |
+| 本地冷盘池 | `kind="local"` + `path`；同目录临时文件 + fsync + rename，MD5 校验，路径段拒绝绝对路径/`..`/NUL；**openat2 `RESOLVE_BENEATH\|RESOLVE_NO_SYMLINKS`**（拒绝根内符号链接逃逸；内核无 openat2 时 fail-closed 拒绝访问）；适用不同 EC 参数/更慢介质 | 已落地（2026-10-23） |
 
 **不模拟磁带** —— 那不在对象存储范围内，MinIO 的 ILM tiering 也是同一模型。
 
@@ -713,8 +717,12 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 
 远端 GC/对账：`POST /api/v1/tiers/gc`（仅管理员，默认 `dry_run=true`）——先列远端再全量扫
 本地 live `TierRef`；`missing_live` 只报告不删；只删 `<tier_id>/` 前缀内、年龄 ≥
-`grace_days`（默认 7）、每轮 ≤ `max_deletes`（默认 1000）；任一 list/扫描失败整轮中止。
-无自动定时 GC，须管理员显式触发。远端删除仍 best-effort，失败留孤儿待下轮。
+`max(grace_days, min_grace)` 的对象（`grace_days` 默认 7；`min_grace` 由
+`OSS_TIER_GC_MIN_GRACE_SECS` 配置，默认 3600s、最低 60s——`grace_days=0` 也不会退化成
+「新对象立刻可删」）、每轮 ≤ `max_deletes`（默认 1000）。live 扫描上限
+`OSS_TIER_GC_MAX_LIVE_SCAN`（默认 1,000,000 条，超限整轮失败）；真实删除前再取一次 live
+快照，期间新增的引用会被保留。任一 list/扫描失败整轮中止。无自动定时 GC，须管理员显式触发。
+远端删除仍 best-effort，失败留孤儿待下轮。
 落地：S3 `Put/Get/DeleteBucketLifecycleConfiguration` 与控制台 lifecycle 共用校验，tier 在写入
 时解析并持久化；sweep 由 `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）周期执行 +
 `POST /api/v1/tiers/sweep` 强制；按对象去重、仅当前非加密非分层版本、单次 ≤10000 对象。
@@ -725,7 +733,8 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 ## 15. Inventory —— `M8`
 
 > **落地状态（2026-10-23 更新）**：S5 已落地——S3 与控制台配置、Daily/Weekly 调度、force-run、
-> manifest + `data/*.csv.gz` 或 `data/*.parquet`、Hive `symlink.txt`。
+> manifest + `data/*.csv.gz` 或 `data/*.parquet`、Hive `symlink.txt`；控制台可选的**增量模式**
+> （非 AWS 标准，默认关闭）按水位只输出上次扫描后变化的条目，manifest 记录水位。
 
 **配置**：`PutBucketInventoryConfiguration` —— 源桶、目标桶+前缀、频率（`Daily`/`Weekly`）、输出格式（`CSV` / `Parquet`）、是否含版本、可选字段列表、可选 Filter（前缀）。
 
@@ -747,9 +756,13 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 `POST .../{id}/run`（force-run → 202 `{"run_key","job_id"}`）。调度 worker
 `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 关闭），同槽唯一去重，停机只补最近一槽。
 
-**边界**：Hive 仅写 `hive/dt=.../symlink.txt`（不含 Athena 建表/分区自动发现）；不做 S3 Inventory
-的跨账号投递；全量扫描、CSV/Parquet 单数据文件（数据文件 ≤5 GiB，CSV 可 gzip）、不做增量；
-`IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持。
+**边界**：Hive 仅写 `hive/dt=.../symlink.txt`（`dt` 取 run 入队时刻，任务重试不会产生第二个
+分区；不含 Athena 建表/分区自动发现）；不做 S3 Inventory 的跨账号投递；全量扫描默认，
+CSV/Parquet 单数据文件（数据文件 ≤5 GiB，CSV 可 gzip）。控制台配置 `incremental=true` 时开启
+**水位增量**：首轮全量，之后只输出 `LastModified ≥ 上轮扫描开始时刻` 的对象/版本，manifest
+`incremental.previousCursor/cursor` 记录水位，水位随配置变更失效；无版本控制桶的删除没有墓碑，
+不会出现在增量清单里（需要完整快照时关掉增量）。`IsMultipartUploaded`/
+`IntelligentTieringAccessTier` 不支持。
 
 ---
 
@@ -791,6 +804,8 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 
 **落地限额**：`OSS_JOB_MAX_INFLIGHT_PER_USER`（100）/`OSS_JOB_MAX_INFLIGHT_GLOBAL`（1000）；
 创建期逐行授权并去重；作业终态 `done`/`error`/`cancelled`（有失败即 `error`）。
+进程崩溃遗留的 `running` 行：启动时与每轮领取前回收「无任何任务行且创建超过
+`OSS_JOB_STALE_SECS`（默认 21600s）」的作业，标 `error` 并写原因。
 
 **边界**：不做作业优先级抢占（队列按优先级排序即可）；不做跨账号清单；InvokeLambda 支持 HTTP
 变换器，构建开启 `olap-wasm` 时也支持 WASM（默认关闭、fail-closed）。

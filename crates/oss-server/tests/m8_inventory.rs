@@ -11,8 +11,8 @@ use xl_store::store::VersioningMode;
 use bytes::Bytes;
 use common::state;
 use oss_server::db::PermissionRow;
-use oss_server::inventory::{daily_key, due_runs, enqueue_run, weekly_key};
-use oss_server::jobs::{JobEnv, worker_once};
+use oss_server::inventory::{InventoryPayload, daily_key, due_runs, enqueue_run, weekly_key};
+use oss_server::jobs::{JobEnv, TaskExecutor as _, worker_once};
 use oss_server::state::AppState;
 use reqwest::StatusCode as HttpStatus;
 use s3s::dto::*;
@@ -133,6 +133,27 @@ async fn run_once(st: &AppState) {
         .await
         .unwrap();
     assert!(got, "worker 应领到 inventory 任务");
+}
+
+/// 目标桶里某前缀下的全部对象键（升序）。
+async fn keys_under(st: &AppState, bucket: &str, prefix: &str) -> Vec<String> {
+    let mut keys: Vec<String> = st
+        .store
+        .list_objects(
+            bucket,
+            &xl_store::store::ListRequest {
+                prefix: Some(prefix.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    keys.sort();
+    keys
 }
 
 async fn run_row(
@@ -1203,4 +1224,125 @@ async fn login(base: &str, user: &str, pw: &str) -> String {
         .await
         .unwrap();
     v["token"].as_str().unwrap().to_string()
+}
+
+/// 4.9：Hive `dt=` 分区取 run 行的 created_at（入队时刻），重试跨分钟/跨天
+/// 也只写一个分区，不会因重试生成第二个 symlink 分区。
+#[tokio::test]
+async fn hive_partition_is_stable_across_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    st.store
+        .put_object("src", "a.txt", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    put(&st, uid, "src", &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap();
+
+    // 入队时刻设为 3 天前：分区必须由它决定，而不是 worker 实际执行时刻。
+    let enqueued = now() - 3 * 86_400;
+    enqueue_run(&st.db, "src", "c1", "manual-hive", Some(uid), enqueued)
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    assert_eq!(run_row(&st, "src", "c1", "manual-hive").await.state, "done");
+
+    let dt = time::OffsetDateTime::from_unix_timestamp(enqueued).unwrap();
+    let expected = format!(
+        "src/c1/manual-hive/hive/dt={:04}-{:02}-{:02}-{:02}-{:02}/symlink.txt",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute()
+    );
+    let hive = keys_under(&st, "dst", "src/c1/manual-hive/hive/").await;
+    assert_eq!(hive, vec![expected.clone()]);
+
+    // 模拟同一 run_key 的重试（实际时刻已跨分钟/跨天）。
+    let payload = InventoryPayload {
+        bucket: "src".into(),
+        config_id: "c1".into(),
+        run_key: "manual-hive".into(),
+    };
+    st.inventory_runner
+        .execute("Inventory", &serde_json::to_string(&payload).unwrap())
+        .await
+        .unwrap();
+    let hive = keys_under(&st, "dst", "src/c1/manual-hive/hive/").await;
+    assert_eq!(hive, vec![expected], "重试不得再写第二个 dt= 分区");
+}
+
+/// 3.6：增量模式按 config 开启；首轮全量、后续只出 last_modified >= 水位 的对象，
+/// manifest 记录上轮/本轮水位；关闭后恢复全量且旧水位作废。
+#[tokio::test]
+async fn incremental_mode_reports_only_new_objects_and_records_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    st.store
+        .put_object("src", "a-old", Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    put(&st, uid, "src", &cfg("c1", "Daily", "dst"))
+        .await
+        .unwrap();
+    st.db
+        .inventory_incremental_set("src", "c1", true, now())
+        .await
+        .unwrap();
+
+    // 首轮无水位：全量快照 + 记录新水位
+    let k1 = "manual-inc-1";
+    enqueue_run(&st.db, "src", "c1", k1, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let (m1, d1) = output(&st, "dst", "src", "c1", k1).await;
+    let rows = gunzip_csv(&d1);
+    assert_eq!(rows.len(), 2, "表头 + 全量对象：{rows:?}");
+    assert_eq!(m1["incremental"]["enabled"], true);
+    assert!(m1["incremental"]["previousCursor"].is_null(), "{m1}");
+    let cursor1 = m1["incremental"]["cursor"].as_str().unwrap().to_string();
+
+    // 跨过水位后再写新对象：第二轮只出增量
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    st.store
+        .put_object("src", "b-new", Bytes::from_static(b"y"), None)
+        .await
+        .unwrap();
+    let k2 = "manual-inc-2";
+    enqueue_run(&st.db, "src", "c1", k2, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let (m2, d2) = output(&st, "dst", "src", "c1", k2).await;
+    let rows = gunzip_csv(&d2);
+    assert_eq!(rows.len(), 2, "仅新增对象：{rows:?}");
+    assert_eq!(rows[1][1], "b-new");
+    assert_eq!(m2["incremental"]["previousCursor"], cursor1.as_str());
+    assert_ne!(m2["incremental"]["cursor"], cursor1.as_str());
+
+    // 关闭增量 → 旧水位作废，下一轮恢复全量（默认行为）
+    st.db
+        .inventory_incremental_set("src", "c1", false, now())
+        .await
+        .unwrap();
+    let k3 = "manual-full-3";
+    enqueue_run(&st.db, "src", "c1", k3, Some(uid), now())
+        .await
+        .unwrap()
+        .unwrap();
+    run_once(&st).await;
+    let (m3, d3) = output(&st, "dst", "src", "c1", k3).await;
+    let rows = gunzip_csv(&d3);
+    assert_eq!(rows.len(), 3, "关闭增量后应全量：{rows:?}");
+    assert!(m3.get("incremental").is_none(), "{m3}");
 }

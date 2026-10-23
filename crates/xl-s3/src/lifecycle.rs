@@ -136,6 +136,8 @@ pub struct LifecycleRuleSpec {
     pub transitions: Vec<TransitionAction>,
     pub noncurrent_expiration: Option<NoncurrentExpiration>,
     pub noncurrent_transitions: Vec<NoncurrentTransition>,
+    /// AbortIncompleteMultipartUpload.DaysAfterInitiation（仅 Prefix 过滤生效）。
+    pub abort_mpu_days: Option<u32>,
     pub enabled: bool,
 }
 
@@ -157,6 +159,7 @@ impl LifecycleRuleSpec {
             || !self.transitions.is_empty()
             || self.noncurrent_expiration.is_some()
             || !self.noncurrent_transitions.is_empty()
+            || self.abort_mpu_days.is_some()
     }
 
     /// 旧列（prefix/expiration_days/单条 transition）能完整表达时返回 None；
@@ -172,7 +175,8 @@ impl LifecycleRuleSpec {
                 .iter()
                 .all(|t| t.days.is_some() && t.date.is_none())
             && self.noncurrent_expiration.is_none()
-            && self.noncurrent_transitions.is_empty();
+            && self.noncurrent_transitions.is_empty()
+            && self.abort_mpu_days.is_none();
         if legacy {
             return Ok(None);
         }
@@ -182,6 +186,7 @@ impl LifecycleRuleSpec {
             transitions: self.transitions.clone(),
             noncurrent_expiration: self.noncurrent_expiration.clone(),
             noncurrent_transitions: self.noncurrent_transitions.clone(),
+            abort_mpu_days: self.abort_mpu_days,
         };
         serde_json::to_string(&blob)
             .map(Some)
@@ -227,6 +232,7 @@ impl LifecycleRuleSpec {
             transitions,
             noncurrent_expiration: None,
             noncurrent_transitions: vec![],
+            abort_mpu_days: None,
             enabled,
         };
         validate_spec(&spec)?;
@@ -247,6 +253,8 @@ struct LifecycleConfigJson {
     noncurrent_expiration: Option<NoncurrentExpiration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     noncurrent_transitions: Vec<NoncurrentTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abort_mpu_days: Option<u32>,
 }
 
 /// 解析 `config_json` 并做安全校验（读路径 fail-closed：坏 JSON/越界 → Err，调用方跳过）。
@@ -264,6 +272,7 @@ pub fn from_config_json(
         transitions: blob.transitions,
         noncurrent_expiration: blob.noncurrent_expiration,
         noncurrent_transitions: blob.noncurrent_transitions,
+        abort_mpu_days: blob.abort_mpu_days,
         enabled,
     };
     validate_spec(&spec)?;
@@ -367,8 +376,22 @@ fn validate_spec(r: &LifecycleRuleSpec) -> Result<(), LifecycleError> {
     }
     if !r.has_action() {
         return Err(LifecycleError::Invalid(
-            "每条规则至少要有 Expiration/Transition/Noncurrent 动作".to_string(),
+            "每条规则至少要有 Expiration/Transition/Noncurrent/AbortIncompleteMultipartUpload 动作"
+                .to_string(),
         ));
+    }
+    if let Some(d) = r.abort_mpu_days {
+        if d == 0 || d > MAX_DAYS {
+            return Err(LifecycleError::InvalidArgument(format!(
+                "AbortIncompleteMultipartUpload.Days 越界（{d} 不在 1..={MAX_DAYS}）"
+            )));
+        }
+        // MPU 记录没有对象标签/大小，无法安全判定这类过滤器是否命中：整条规则 fail closed。
+        if !f.tags.is_empty() || f.size_gt.is_some() || f.size_lt.is_some() {
+            return Err(LifecycleError::Invalid(
+                "AbortIncompleteMultipartUpload 仅支持 Prefix 过滤".to_string(),
+            ));
+        }
     }
     if let Some(ExpirationAction::ExpiredObjectDeleteMarker) = r.expiration
         && !f.tags.is_empty()

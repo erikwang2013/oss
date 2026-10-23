@@ -1,11 +1,9 @@
 //! S3 线格式 ↔ [`LifecycleRuleSpec`]：解析（PUT）与回读（GET）。
-//!
-//! 不支持的字段只剩 `AbortIncompleteMultipartUpload`（需要存储层 MPU 索引，单独项目）。
 
 use s3s::dto::{
-    LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
-    NoncurrentVersionExpiration, NoncurrentVersionTransition, Timestamp, Transition,
-    TransitionStorageClass,
+    AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator,
+    LifecycleRuleFilter, NoncurrentVersionExpiration, NoncurrentVersionTransition, Timestamp,
+    Transition, TransitionStorageClass,
 };
 
 use super::{
@@ -230,11 +228,17 @@ pub fn parse_lifecycle_config(
     }
     let mut out = Vec::with_capacity(cfg.rules.len());
     for r in &cfg.rules {
-        if r.abort_incomplete_multipart_upload.is_some() {
-            return Err(LifecycleError::NotImplemented(
-                "AbortIncompleteMultipartUpload".into(),
-            ));
-        }
+        // 3.10：MPU 列表本身可枚举（Store::list_multipart_uploads），按天数直接支持。
+        let abort_mpu_days = r
+            .abort_incomplete_multipart_upload
+            .as_ref()
+            .map(|a| {
+                let days = a.days_after_initiation.ok_or_else(|| {
+                    invalid("AbortIncompleteMultipartUpload 缺 DaysAfterInitiation")
+                })?;
+                u32_of(i64::from(days), "DaysAfterInitiation")
+            })
+            .transpose()?;
         let status = r.status.as_str();
         if status != s3s::dto::ExpirationStatus::ENABLED
             && status != s3s::dto::ExpirationStatus::DISABLED
@@ -260,6 +264,7 @@ pub fn parse_lifecycle_config(
                 .transpose()?
                 .flatten(),
             noncurrent_transitions: parse_noncurrent_transitions(r)?,
+            abort_mpu_days,
             enabled: status == s3s::dto::ExpirationStatus::ENABLED,
         });
     }
@@ -325,7 +330,11 @@ pub fn rules_to_dto(rules: &[LifecycleRuleSpec]) -> Vec<LifecycleRule> {
     rules
         .iter()
         .map(|r| LifecycleRule {
-            abort_incomplete_multipart_upload: None,
+            abort_incomplete_multipart_upload: r.abort_mpu_days.map(|d| {
+                AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(d as i32),
+                }
+            }),
             expiration: r.expiration.as_ref().map(expiration_to_dto),
             filter: Some(filter_to_dto(&r.filter)),
             id: r.rule_id.clone(),
