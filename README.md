@@ -1,9 +1,5 @@
 ![吞吞（OSS 项目宠物）：一只装着三块对象立方体的存储桶，戴着绿色状态灯](docs/assets/mascot.svg)
 
-![吞吞的 12 种彩色动态表情：笑、欢乐、哭、沮丧、惊恐、愤怒、撒娇、卖萌、讨好、敲打、捂脸、吐舌头](docs/assets/mascot-expressions.svg)
-
-单张彩色动态 SVG 见 [`docs/pet-expressions/`](docs/pet-expressions/)（12 种形态，均带动画）。
-
 # oss（吞吞）—— 自研分布式对象存储系统
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg) ![Rust](https://img.shields.io/badge/rust-2024%20edition-dea584.svg) ![Release](https://img.shields.io/github/v/release/erikwang2013/oss) ![S3](https://img.shields.io/badge/S3-compatible-blueviolet.svg)
@@ -1562,6 +1558,8 @@ SVG / PNG）**不是开源资产**，版权归作者所有。未经书面许可�
 ## 项目宠物表情形态 · 吞吞
 
 12 种彩色动态形态：笑 / 欢乐 / 哭 / 沮丧 / 惊恐 / 愤怒 / 撒娇 / 卖萌 / 讨好 / 敲打 / 捂脸 / 吐舌头。每个 SVG 自带表情、情绪特效与整体动效，单张文件见 [`docs/pet-expressions/`](docs/pet-expressions/)。
+
+![吞吞的 12 种彩色动态表情：笑、欢乐、哭、沮丧、惊恐、愤怒、撒娇、卖萌、讨好、敲打、捂脸、吐舌头](docs/assets/mascot-expressions.svg)
 
 | 形态 | 代码 | 形态 | 代码 | 形态 | 代码 |
 | --- | --- | --- | --- | --- | --- |
