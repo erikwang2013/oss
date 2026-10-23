@@ -343,6 +343,7 @@ impl BatchExecutor {
                 etag: &out.etag,
                 size: out.size,
                 is_delete_marker: false,
+                is_version_delete: false,
                 is_replica: false,
             })
             .await;
@@ -360,29 +361,48 @@ impl BatchExecutor {
             .delete_versioned(&p.bucket, &p.key, p.version_id.as_deref(), mode, false)
             .await
             .map_err(|e| e.to_string())?;
-        let refs = match outcome {
-            DeleteOutcome::Version { tier: Some(t), .. } => vec![t],
+        let refs = match &outcome {
+            DeleteOutcome::Version { tier: Some(t), .. } => vec![t.clone()],
             DeleteOutcome::Version { tier: None, .. } => Vec::new(),
-            DeleteOutcome::Object { tiers } => tiers,
-            // I1：与在线 delete_object 同语义——仅缺省删（产生 marker）入复制队列；
-            // 指定版本删除不入队（DeleteMarkerReplication 管的是 marker）。
+            DeleteOutcome::Object { tiers } => tiers.clone(),
+            DeleteOutcome::Marker { .. } => Vec::new(),
+            DeleteOutcome::NotFound => Vec::new(),
+        };
+        match &outcome {
+            // 与在线 delete_object 同语义：缺省删（marker）受 DeleteMarkerReplication 控制，
+            // 指定版本删除按 4.16 定点复制（目标是同 id 版本删除，不造 marker）。
             DeleteOutcome::Marker { version_id } => {
                 self.hooks
                     .repl
                     .on_write(WriteInfo {
                         bucket: &p.bucket,
                         key: &p.key,
-                        version_id: Some(&version_id),
+                        version_id: Some(version_id),
                         etag: "",
                         size: 0,
                         is_delete_marker: true,
+                        is_version_delete: false,
                         is_replica: false,
                     })
                     .await;
-                Vec::new()
             }
-            DeleteOutcome::NotFound => Vec::new(),
-        };
+            DeleteOutcome::Version { version_id, .. } => {
+                self.hooks
+                    .repl
+                    .on_write(WriteInfo {
+                        bucket: &p.bucket,
+                        key: &p.key,
+                        version_id: Some(version_id),
+                        etag: "",
+                        size: 0,
+                        is_delete_marker: false,
+                        is_version_delete: true,
+                        is_replica: false,
+                    })
+                    .await;
+            }
+            _ => {}
+        }
         if !refs.is_empty()
             && let Err(e) = self.hooks.tier_gc.delete(&refs).await
         {

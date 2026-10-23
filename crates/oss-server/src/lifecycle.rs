@@ -982,6 +982,7 @@ async fn settle_delete(
                     etag: "",
                     size: 0,
                     is_delete_marker: true,
+                    is_version_delete: false,
                     is_replica: false,
                 })
                 .await;

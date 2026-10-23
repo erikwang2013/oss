@@ -30,6 +30,7 @@ struct ReplWrite {
     key: String,
     version_id: Option<String>,
     is_delete_marker: bool,
+    is_version_delete: bool,
 }
 
 #[derive(Default)]
@@ -45,6 +46,7 @@ impl ReplicationSink for FakeRepl {
             key: info.key.to_string(),
             version_id: info.version_id.map(str::to_string),
             is_delete_marker: info.is_delete_marker,
+            is_version_delete: info.is_version_delete,
         });
     }
 }
@@ -906,7 +908,7 @@ mod batch_wasm_disabled {
 }
 
 /// I1：Batch Delete 产生 delete marker 时必须入复制队列（与在线 delete_object 同语义）；
-/// 指定版本删除不入队。
+/// 指定版本删除只入站点对队列（4.16；本夹具无站点，故观测量为 0）。
 #[tokio::test]
 async fn delete_marker_is_enqueued_for_replication() {
     let f = fx().await;
@@ -927,10 +929,11 @@ async fn delete_marker_is_enqueued_for_replication() {
             ("src", "marker")
         );
         assert!(writes[0].is_delete_marker);
+        assert!(!writes[0].is_version_delete);
         assert!(writes[0].version_id.is_some(), "marker 版本号必须带上");
     }
 
-    // 指定版本删除 → 与在线路径一致：不入队
+    // 指定版本删除 → M6 规则队列不入队（站点对另有队列，本夹具无站点）
     f.put("src", "ver", b"y").await;
     let vid = f
         .store()
@@ -941,7 +944,12 @@ async fn delete_marker_is_enqueued_for_replication() {
     let mut vd = payload("src", "ver", f.admin);
     vd.version_id = Some(vid.unwrap_or_else(|| "null".into()));
     assert_eq!(f.run(BATCH_DELETE, &vd).await.unwrap(), "Succeeded");
-    assert_eq!(f.repl.writes.lock().unwrap().len(), 1, "指定版本删除不入队");
+    {
+        let writes = f.repl.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2, "指定版本删除也入复制队列（4.16）");
+        assert!(!writes[1].is_delete_marker);
+        assert!(writes[1].is_version_delete, "必须是版本删除而非 marker");
+    }
 }
 
 /// I3：控制面审计失败只 warn，不改变动作结果。

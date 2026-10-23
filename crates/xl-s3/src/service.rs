@@ -1270,28 +1270,38 @@ impl S3 for OssS3 {
         }
         // M9：sync 桶的 REPLICA 摄入必须带匹配 site token + origin id；采用 origin UUID
         // 作本地版本 id（双站同 id），且不再 gate/再复制（防环）。
+        // 4.16：异步站点复制（非 sync 桶）带 origin id 时同样强制同 id（版本删除才能定点映射），
+        // 但必须由 site token 认证——否则任意 REPLICA 客户端可伪造版本 id。
+        let presented = req
+            .headers
+            .get("x-oss-site-token")
+            .and_then(|v| v.to_str().ok());
+        let token_ok = match (self.site_token.as_deref(), presented) {
+            (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
+            _ => false,
+        };
+        let origin_id = req
+            .headers
+            .get("x-oss-origin-version-id")
+            .and_then(|v| v.to_str().ok());
         let mut forced_version_id = None;
         if replica && sync {
-            let presented = req
-                .headers
-                .get("x-oss-site-token")
-                .and_then(|v| v.to_str().ok());
-            let ok = match (self.site_token.as_deref(), presented) {
-                (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
-                _ => false,
-            };
-            if !ok {
+            if !token_ok {
                 return Err(s3s::s3_error!(AccessDenied, "site token required"));
             }
             forced_version_id = Some(
-                req.headers
-                    .get("x-oss-origin-version-id")
-                    .and_then(|v| v.to_str().ok())
+                origin_id
                     .ok_or_else(|| s3s::s3_error!(InvalidRequest, "origin version id required"))?
                     .to_string(),
             );
+        } else if replica && origin_id.is_some() {
+            // 混合版本保护：带同源 id 却无有效令牌 → 明确拒绝（不静默丢弃 id 产生错位版本）。
+            if !token_ok {
+                return Err(s3s::s3_error!(AccessDenied, "site token required"));
+            }
+            forced_version_id = origin_id.map(str::to_string);
         }
-        // M8 S4a：存储类（M6/M7 REPLICA 不携带；token 验证的 sync 副本保留；归档类直写拒）
+        // M8 S4a：存储类（M6 REPLICA 不携带；站点副本——sync 或 token 同 id——保留；归档类直写拒）
         let storage_class = if replica && forced_version_id.is_none() {
             None
         } else {
@@ -1308,8 +1318,8 @@ impl S3 for OssS3 {
             ..
         } = req.input;
         let body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
-        // M8 前置：x-amz-tagging（URL query 串）。M6/M7 REPLICA 显式忽略标签；
-        // token 验证的 sync 副本保留（与本地版本字段一致）。
+        // M8 前置：x-amz-tagging（URL query 串）。M6 REPLICA 显式忽略标签；
+        // 站点副本（sync 或 token 同 id）保留（与本地版本字段一致）。
         let tags = if replica && forced_version_id.is_none() {
             None
         } else {
@@ -1405,6 +1415,7 @@ impl S3 for OssS3 {
             etag: &info.etag,
             size: info.size,
             is_delete_marker: false,
+            is_version_delete: false,
             is_replica: replica,
         })
         .await;
@@ -1669,6 +1680,7 @@ impl S3 for OssS3 {
             etag: &info.etag,
             size: info.size,
             is_delete_marker: false,
+            is_version_delete: false,
             is_replica: false,
         })
         .await;
@@ -2344,10 +2356,68 @@ impl S3 for OssS3 {
         // M5 切片 4（L4）：Governance bypass 头（调用方均经鉴权链——「非匿名」成立）
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         let mode = self.versioning_mode(&bucket).await?;
-        let outcome = self
-            .delete_versioned(&bucket, &key, vid.as_deref(), mode, bypass)
-            .await
-            .map_err(to_s3_error)?;
+        // 4.16：站点对 marker 同 id——REPLICA DELETE 在 site token 认证下可用
+        // `x-oss-origin-version-id` 指定 marker 版本 id（异步站点复制；sync 桶走 M9 内部路由）。
+        let forced_marker = if vid.is_none() && replica {
+            match req
+                .headers
+                .get("x-oss-origin-version-id")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(origin) => {
+                    let presented = req
+                        .headers
+                        .get("x-oss-site-token")
+                        .and_then(|v| v.to_str().ok());
+                    let ok = match (self.site_token.as_deref(), presented) {
+                        (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(s3s::s3_error!(AccessDenied, "site token required"));
+                    }
+                    Some(origin.to_string())
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if forced_marker.is_some() && self.store.sync_mode(&bucket).await.map_err(to_s3_error)? {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "origin marker id is not supported on sync buckets"
+            ));
+        }
+        let outcome = match forced_marker {
+            Some(marker) if mode == VersioningMode::Enabled => {
+                let spec = xl_store::store::DeleteMarkerSpec {
+                    marker_uuid: marker.clone(),
+                    remote_version_id: Some(marker),
+                };
+                self.store
+                    .delete_object_versioned_with_marker(
+                        &bucket,
+                        &key,
+                        None,
+                        mode,
+                        bypass,
+                        Some(spec),
+                    )
+                    .await
+                    .map_err(to_s3_error)?
+            }
+            Some(_) => {
+                return Err(s3s::s3_error!(
+                    InvalidBucketState,
+                    "origin marker id requires versioning Enabled"
+                ));
+            }
+            None => self
+                .delete_versioned(&bucket, &key, vid.as_deref(), mode, bypass)
+                .await
+                .map_err(to_s3_error)?,
+        };
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
         // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
         let mut tier_refs = Vec::new();
@@ -2371,6 +2441,7 @@ impl S3 for OssS3 {
                     etag: "",
                     size: 0,
                     is_delete_marker: true,
+                    is_version_delete: false,
                     is_replica: replica,
                 })
                 .await;
@@ -2387,6 +2458,18 @@ impl S3 for OssS3 {
                     None,
                     event_source,
                 )
+                .await;
+                // 4.16：版本定向删除也要复制——站点对同源版本 id，目标做定点删除（不造 marker）。
+                self.repl_on_write(crate::replication::WriteInfo {
+                    bucket: &bucket,
+                    key: &key,
+                    version_id: Some(&version_id),
+                    etag: "",
+                    size: 0,
+                    is_delete_marker: false,
+                    is_version_delete: true,
+                    is_replica: replica,
+                })
                 .await;
                 (None, Some(version_id))
             }
@@ -2588,6 +2671,7 @@ impl S3 for OssS3 {
                                 etag: "",
                                 size: 0,
                                 is_delete_marker: true,
+                                is_version_delete: false,
                                 is_replica: replica,
                             })
                             .await;
@@ -2604,6 +2688,18 @@ impl S3 for OssS3 {
                                 None,
                                 event_source.clone(),
                             )
+                            .await;
+                            // 4.16：批量版本定向删除同样复制（目标定点删同 id，不造 marker）。
+                            self.repl_on_write(crate::replication::WriteInfo {
+                                bucket: &bucket,
+                                key: &obj.key,
+                                version_id: Some(&version_id),
+                                etag: "",
+                                size: 0,
+                                is_delete_marker: false,
+                                is_version_delete: true,
+                                is_replica: replica,
+                            })
                             .await;
                             (None, None, Some(version_id))
                         }
@@ -4008,6 +4104,7 @@ impl S3 for OssS3 {
             etag: &info.etag,
             size: info.size,
             is_delete_marker: false,
+            is_version_delete: false,
             is_replica: false,
         })
         .await;

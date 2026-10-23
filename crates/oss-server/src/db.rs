@@ -691,6 +691,26 @@ impl Db {
                 return Err(e);
             }
         }
+        // 4.16：repl_outbox 版本定向删除标记（幂等补列；老库升级路径）
+        if !rcols
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "is_version_delete")
+            && let Err(e) = sqlx::query(
+                "ALTER TABLE repl_outbox ADD COLUMN is_version_delete INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await
+        {
+            let again = sqlx::query("SELECT name FROM pragma_table_info('repl_outbox')")
+                .fetch_all(&self.pool)
+                .await?;
+            if !again
+                .iter()
+                .any(|r| r.get::<String, _>("name") == "is_version_delete")
+            {
+                return Err(e);
+            }
+        }
         // M8（S0）：jobs 作业引擎列（老库补列；幂等）
         let jcols = sqlx::query("SELECT name FROM pragma_table_info('jobs')")
             .fetch_all(&self.pool)
@@ -2456,6 +2476,10 @@ mod tests {
         assert!(
             cols.iter()
                 .any(|r| r.get::<String, _>("name") == "target_kind")
+        );
+        assert!(
+            cols.iter()
+                .any(|r| r.get::<String, _>("name") == "is_version_delete")
         );
         assert!(db.site_identity().await.is_ok());
         // 实写一次（触发器纳入后此测试升级为「写一次验证触发器」）

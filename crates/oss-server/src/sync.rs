@@ -443,6 +443,8 @@ impl PutCommitGate for SiteSyncGate {
                 Some(&peer.peer_site_token),
                 Some(req.local_version_id),
                 req.part_sizes, // 4.1：sync MPU 副本同样保留段长表
+                None,           // M9 sync 不加 SSE 头（保持既有远端默认加密口径）
+                None,           // M9 sync 不支持对象锁
             );
             let remote = tokio::time::timeout(self.timeout, call)
                 .await

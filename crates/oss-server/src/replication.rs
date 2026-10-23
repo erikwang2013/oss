@@ -186,8 +186,10 @@ impl ReplicationSink for SqlReplSink {
             }
         }
         let mut matched = false;
-        // M6 桶复制规则（与 M7 站点对相互独立：没有规则也仍可能命中站点）
-        if !is_hard_delete {
+        // M6 桶复制规则（与 M7 站点对相互独立：没有规则也仍可能命中站点）。
+        // 4.16：版本定向删除不投递 M6 远端——远端版本 id 由目标生成，无法定点映射；
+        // 站点对因同源 id（见 sync/异步站点 PUT）可按 id 复制。
+        if !is_hard_delete && !info.is_version_delete {
             match sqlx::query_scalar::<_, String>(
                 "SELECT rules_json FROM replication_rules WHERE bucket = ?",
             )
@@ -201,8 +203,8 @@ impl ReplicationSink for SqlReplSink {
                             matched = true;
                             if let Err(e) = sqlx::query(
                                 "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
-                                 dest_bucket, is_delete_marker, target_kind, state, attempts, next_retry_at, created_at) \
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'remote', 'pending', 0, 0, ?)",
+                                 dest_bucket, is_delete_marker, is_version_delete, target_kind, state, attempts, next_retry_at, created_at) \
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'remote', 'pending', 0, 0, ?)",
                             )
                             .bind(info.bucket)
                             .bind(info.key)
@@ -212,6 +214,7 @@ impl ReplicationSink for SqlReplSink {
                             .bind(&r.remote_id)
                             .bind(&r.dest_bucket)
                             .bind(i64::from(info.is_delete_marker))
+                            .bind(i64::from(info.is_version_delete))
                             .bind(now())
                             .execute(&self.pool)
                             .await
@@ -234,6 +237,7 @@ impl ReplicationSink for SqlReplSink {
         let site_matched = self.enqueue_sites(&info).await;
         // 单调 PENDING：并发 worker 可能已 COMPLETED（P2-2，不降级终态）；无版本号（硬删）跳过
         if (matched || site_matched)
+            && !info.is_version_delete
             && let Some(vid) = info.version_id
             && let Err(e) = self
                 .store
@@ -252,7 +256,12 @@ impl SqlReplSink {
         if !self.site_data_replication {
             return false;
         }
-        if info.is_delete_marker || info.version_id.is_none() {
+        // 版本定向删除必须是真实 UUID 版本（站点 PUT 强制同源 id）；
+        // "null"/空版本无法在目标定点命中，不跨界（fail-closed）。
+        if info.is_version_delete && info.version_id.is_none_or(|v| v.is_empty() || v == "null") {
+            return false;
+        }
+        if info.is_delete_marker || info.version_id.is_none() || info.is_version_delete {
             let v: Option<String> = match sqlx::query_scalar(
                 "SELECT versioning FROM buckets WHERE name = ?",
             )
@@ -288,8 +297,8 @@ impl SqlReplSink {
         for peer in peers {
             if let Err(e) = sqlx::query(
                 "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
-                 dest_bucket, is_delete_marker, target_kind, state, attempts, next_retry_at, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'site', 'pending', 0, 0, ?)",
+                 dest_bucket, is_delete_marker, is_version_delete, target_kind, state, attempts, next_retry_at, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'site', 'pending', 0, 0, ?)",
             )
             .bind(info.bucket)
             .bind(info.key)
@@ -299,6 +308,7 @@ impl SqlReplSink {
             .bind(&peer)
             .bind(info.bucket)
             .bind(i64::from(info.is_delete_marker))
+            .bind(i64::from(info.is_version_delete))
             .bind(now())
             .execute(&self.pool)
             .await
@@ -323,6 +333,8 @@ struct ReplRow {
     remote_id: String,
     dest_bucket: String,
     is_delete_marker: bool,
+    /// 4.16：目标按同源 version_id 定点删除（不造 marker）。
+    is_version_delete: bool,
     target_kind: String,
     attempts: i64,
     claimed_at: Option<i64>,
@@ -384,10 +396,11 @@ fn site_404_retry(e: ReplError, cache_key: &str, op: &str) -> ReplError {
 async fn site_peer(
     pool: &SqlitePool,
     peer_id: &str,
-) -> Result<Option<(String, String, String, String)>, sqlx::Error> {
+) -> Result<Option<(String, String, String, String, String)>, sqlx::Error> {
     use sqlx::Row as _;
     let row = sqlx::query(
-        "SELECT endpoint, s3_access_key, s3_secret_key, region FROM sites WHERE peer_id = ?",
+        "SELECT endpoint, s3_access_key, s3_secret_key, region, peer_site_token \
+         FROM sites WHERE peer_id = ?",
     )
     .bind(peer_id)
     .fetch_optional(pool)
@@ -398,8 +411,23 @@ async fn site_peer(
             r.get("s3_access_key"),
             r.get("s3_secret_key"),
             r.get("region"),
+            r.get("peer_site_token"),
         )
     }))
+}
+
+/// 4.16：同 (bucket,key,version) 更早的出站行仍在途 → 版本删除必须先等待。
+async fn earlier_version_rows(pool: &SqlitePool, r: &ReplRow) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE bucket=? AND key=? AND version_id=? \
+         AND seq < ? AND state IN ('pending','sending')",
+    )
+    .bind(&r.bucket)
+    .bind(&r.key)
+    .bind(&r.version_id)
+    .bind(r.seq)
+    .fetch_one(pool)
+    .await
 }
 
 async fn renew_claim(pool: &SqlitePool, seq: i64, old: Option<i64>) -> Option<i64> {
@@ -489,15 +517,41 @@ async fn send_row(
     r: &ReplRow,
     is_site: bool,
     cache_key: Option<&str>,
+    site_token: Option<&str>,
 ) -> Result<(), ReplError> {
     if let Some(key) = cache_key {
         site_versioning_ready(client, key, &r.dest_bucket).await?;
     }
-    // marker 或硬删（版本列为空）都以 DELETE 表达（P2-5）。
-    if r.is_delete_marker || r.version_id.is_empty() {
+    // 4.16：版本定向删除——标准 S3 `DELETE ?versionId=`（带 REPLICA），目标删同 id
+    // 版本/marker，绝不创建 marker。M6 远端无 id 映射，不应出现（入队侧已跳过）。
+    if r.is_version_delete {
+        if !is_site {
+            return Err(ReplError::permanent(
+                "版本定向删除仅支持站点对（无远端 id 映射）",
+            ));
+        }
         let res = client
-            .delete_object(remote_id, &r.dest_bucket, &r.key)
+            .delete_object_version_s3(remote_id, &r.dest_bucket, &r.key, &r.version_id)
             .await;
+        return match (res, cache_key) {
+            (Err(e), Some(key)) => Err(site_404_retry(e, key, "DELETE version")),
+            (r, _) => r,
+        };
+    }
+    // marker 或硬删（版本列为空）都以 DELETE 表达（P2-5）。
+    // 4.16：站点 marker 带源 marker id 创建（目标随机 id 会让后续 marker 版本删除失效）；
+    // M6 远端仍用普通 DELETE（无 id 映射，记档）。
+    if r.is_delete_marker || r.version_id.is_empty() {
+        let res = if is_site && r.is_delete_marker && !r.version_id.is_empty() {
+            let token = site_token.ok_or_else(|| ReplError::permanent("站点 token 缺失"))?;
+            client
+                .delete_marker_s3(remote_id, &r.dest_bucket, &r.key, &r.version_id, token)
+                .await
+        } else {
+            client
+                .delete_object(remote_id, &r.dest_bucket, &r.key)
+                .await
+        };
         return match (res, cache_key) {
             (Err(e), Some(key)) => Err(site_404_retry(e, key, "DELETE")),
             (r, _) => r,
@@ -513,19 +567,35 @@ async fn send_row(
             }
             other => ReplError::retryable(format!("读源元数据失败：{other}")),
         })?;
-    // SSE-C 源无持久化钥 → 无法在本机解密复制（计划未承诺；永久错记档）
-    if let Some(enc) = &info.encryption
-        && enc.sse_c_key_md5.is_some()
-    {
-        return Err(ReplError::permanent(
-            "SSE-C 源对象不支持复制（客户钥不落盘）",
-        ));
+    // SSE-C 源无持久化钥 → 无法在本机解密复制；SSE-KMS 的 key_id 是站点本地主密钥，
+    // 目标拒绝显式 CMK → 站点复制永久失败，绝不静默降级为明文或换钥。
+    // （M6 远端本就不携带加密元数据，按原有非加密 PUT 复制。）
+    if let Some(enc) = &info.encryption {
+        if enc.sse_c_key_md5.is_some() || enc.key_id == "sse-c" {
+            return Err(ReplError::permanent(
+                "SSE-C 源对象不支持复制（客户钥不落盘）",
+            ));
+        }
+        if is_site && enc.key_id.starts_with('k') {
+            return Err(ReplError::permanent(format!(
+                "SSE-KMS 源对象不支持站点复制（key_id={} 为站点本地主密钥，目标不接受显式 CMK）",
+                enc.key_id
+            )));
+        }
     }
     let (_info, bytes) = store
         .get_object_version(&r.bucket, &r.key, &r.version_id)
         .await
         .map_err(|e| ReplError::retryable(format!("读源对象失败：{e}")))?;
     if is_site {
+        let token = site_token.ok_or_else(|| ReplError::permanent("站点 token 缺失"))?;
+        // 4.17：标签/存储类/校验和/SSE 方案随版本复制；过期 retention 不再下发
+        //（目标按同值 WORM 记录判定，过期即允许删），legal hold 始终保留。
+        let now_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+        let lock = info
+            .lock
+            .as_ref()
+            .filter(|l| l.legal_hold || l.retain_until_nanos.is_some_and(|n| n > now_ns));
         let res = client
             .put_object_with_meta(
                 remote_id,
@@ -535,16 +605,25 @@ async fn send_row(
                 &r.etag,
                 info.content_type.as_deref(),
                 &info.user_metadata,
-                None, // M6/M7 异步复制不透传标签（旧行为）
-                None,
-                None,
+                Some(info.tags.as_slice()).filter(|t| !t.is_empty()),
+                info.storage_class.as_deref(),
+                info.checksum.as_ref(),
                 true,
-                None, // M9：异步站点复制不再带 sync token
-                None,
+                Some(token),                // 站点 token：目标据此接受同源版本 id
+                Some(&r.version_id),        // 4.16：站点对同 id，版本删除才能定点映射
                 info.part_sizes.as_deref(), // 4.1：段长表随副本，partNumber 可用
+                info.encryption.as_ref(),
+                lock,
             )
-            .await
-            .map(|_| ());
+            .await;
+        let res = res.and_then(|vid| match vid.as_deref() {
+            Some(v) if v == r.version_id => Ok(()),
+            Some(v) => Err(ReplError::permanent(format!(
+                "目标未按同源版本 id 落库（期望 {}，实得 {v}；对端版本过旧？）",
+                r.version_id
+            ))),
+            None => Err(ReplError::permanent("目标未返回 version id")),
+        });
         match (res, cache_key) {
             (Err(e), Some(key)) => Err(site_404_retry(e, key, "PUT")),
             (r, _) => r,
@@ -619,6 +698,7 @@ pub async fn settle_version_after_drop(
         remote_id: String::new(),
         dest_bucket: String::new(),
         is_delete_marker: false,
+        is_version_delete: false,
         target_kind: "site".into(),
         attempts: 0,
         claimed_at: None,
@@ -650,7 +730,7 @@ pub async fn process_repl_once(
          WHERE state='pending' AND seq IN (SELECT seq FROM repl_outbox WHERE state='pending' \
                        AND next_retry_at <= ? ORDER BY seq LIMIT ?) \
          RETURNING seq, bucket, key, version_id, etag, remote_id, dest_bucket, \
-         is_delete_marker, target_kind, attempts, claimed_at",
+         is_delete_marker, is_version_delete, target_kind, attempts, claimed_at",
     )
     .bind(now_s)
     .bind(now_s)
@@ -676,6 +756,7 @@ pub async fn process_repl_once(
             remote_id: row.get("remote_id"),
             dest_bucket: row.get("dest_bucket"),
             is_delete_marker: row.get::<i64, _>("is_delete_marker") != 0,
+            is_version_delete: row.get::<i64, _>("is_version_delete") != 0,
             target_kind: row.get("target_kind"),
             attempts: row.get("attempts"),
             claimed_at: row.get("claimed_at"),
@@ -685,13 +766,39 @@ pub async fn process_repl_once(
         };
         let outcome: Result<(), ReplError> = if r.target_kind == "site" {
             match site_peer(pool, &r.remote_id).await {
-                Ok(Some((endpoint, ak, sk, region))) => {
+                Ok(Some((endpoint, ak, sk, region, token))) => {
                     match ReplClient::single(&endpoint, &ak, &sk, &region)
                         .map(|c| c.with_tls(client.tls()))
                     {
                         Ok(c) => {
                             let cache_key = format!("{endpoint}\u{1f}{}", r.dest_bucket);
-                            send_row(store, &c, "site", &r, true, Some(&cache_key)).await
+                            // 4.16：同版本更早的行（PUT）仍在途时先等待——否则删除先到、
+                            // PUT 重投成功会把已删版本在目标复活。
+                            let earlier = if r.is_version_delete {
+                                earlier_version_rows(pool, &r).await
+                            } else {
+                                Ok(0)
+                            };
+                            match earlier {
+                                Ok(0) => {
+                                    send_row(
+                                        store,
+                                        &c,
+                                        "site",
+                                        &r,
+                                        true,
+                                        Some(&cache_key),
+                                        Some(&token),
+                                    )
+                                    .await
+                                }
+                                Ok(_) => Err(ReplError::retryable(
+                                    "同版本更早的复制作业尚未完成（保序等待）",
+                                )),
+                                Err(e) => {
+                                    Err(ReplError::retryable(format!("读同版本出站行失败：{e}")))
+                                }
+                            }
                         }
                         Err(f) => Err(f),
                     }
@@ -705,7 +812,7 @@ pub async fn process_repl_once(
                     .bind(Some(token))
                     .execute(pool)
                     .await;
-                    if !r.version_id.is_empty() {
+                    if !r.version_id.is_empty() && !r.is_version_delete {
                         settle_version_status(pool, store, &r, true).await;
                     }
                     tracing::warn!(seq = r.seq, peer = %r.remote_id, "站点对已解除——丢弃出站行");
@@ -714,7 +821,7 @@ pub async fn process_repl_once(
                 Err(e) => Err(ReplError::retryable(format!("读站点对失败：{e}"))),
             }
         } else {
-            send_row(store, client, &r.remote_id, &r, false, None).await
+            send_row(store, client, &r.remote_id, &r, false, None, None).await
         };
         match outcome {
             Ok(()) => {
@@ -726,7 +833,8 @@ pub async fn process_repl_once(
                 }
                 // P2-1：多规则聚合——仍有在途行则保持 PENDING；有死信则 FAILED；否则 COMPLETED。
                 // P3-5：token 失配时不得写状态（该行可能已被新 worker 接管）。
-                if claimed && !r.version_id.is_empty() {
+                // 版本删除后源版本已不在，不写复制终态（无对象可标）。
+                if claimed && !r.version_id.is_empty() && !r.is_version_delete {
                     settle_version_status(pool, store, &r, false).await;
                 }
             }
@@ -744,6 +852,7 @@ pub async fn process_repl_once(
                 if bury && wrote {
                     tracing::error!(seq = r.seq, error = %f.message, "复制作业进入死信（永久错超限）");
                     if !r.version_id.is_empty()
+                        && !r.is_version_delete
                         && let Err(e) = store
                             .set_replication_status(
                                 &r.bucket,
@@ -805,6 +914,7 @@ mod tests {
             etag: "e",
             size: 1,
             is_delete_marker: marker,
+            is_version_delete: false,
             is_replica: replica,
         }
     }

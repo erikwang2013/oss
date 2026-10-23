@@ -127,6 +127,9 @@ pub struct WriteInfo<'a> {
     pub size: u64,
     /// 删除操作（版本桶 marker，或 console/lifecycle 的整键硬删）→ 目标 DELETE
     pub is_delete_marker: bool,
+    /// 版本定向删除（`DELETE ?versionId=`）→ 目标定点删同名版本，不得造 marker。
+    /// 站点对采用同源版本 id（见 sync 摄入），因此目标按同一 id 定位。
+    pub is_version_delete: bool,
     /// 复制摄入对象（x-amz-replication-status: REPLICA）不再参与复制（防环）
     pub is_replica: bool,
 }
