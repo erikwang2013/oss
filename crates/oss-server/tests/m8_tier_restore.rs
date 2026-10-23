@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use s3s::dto::*;
 use s3s::{S3, S3Request};
 use xl_s3::service::OssS3;
@@ -17,7 +18,9 @@ use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
 use oss_server::router::build_router;
 use oss_server::state::AppState;
-use oss_server::tier::{S3TierBackend, S3TierGc, TierBackend, TierBackends, tier_key};
+use oss_server::tier::{
+    S3TierBackend, S3TierGc, TierBackend, TierBackends, TierByteStream, TierPutResult, tier_key,
+};
 use oss_server::tier_jobs::{M8TaskExecutor, reconcile_restores};
 use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
@@ -37,18 +40,42 @@ impl TierBackend for MockTier {
         "cold"
     }
 
-    async fn put(&self, key: &str, body: Bytes, etag: &str) -> Result<String, String> {
-        self.objs.lock().unwrap().insert(key.to_string(), body);
-        Ok(format!("mock-{etag}"))
+    async fn put(
+        &self,
+        key: &str,
+        mut body: TierByteStream,
+        size: u64,
+    ) -> Result<TierPutResult, String> {
+        let mut buf = Vec::with_capacity(size as usize);
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        if buf.len() as u64 != size {
+            return Err(format!("mock 长度 {} ≠ {size}", buf.len()));
+        }
+        use sha2::Digest as _;
+        let md5 = hex::encode(md5::Md5::digest(&buf));
+        let sha256 = hex::encode(sha2::Sha256::digest(&buf));
+        self.objs
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), Bytes::from(buf));
+        Ok(TierPutResult {
+            etag: format!("mock-{md5}"),
+            md5,
+            sha256,
+        })
     }
 
-    async fn get(&self, key: &str) -> Result<Bytes, String> {
-        self.objs
+    async fn get(&self, key: &str) -> Result<TierByteStream, String> {
+        let b = self
+            .objs
             .lock()
             .unwrap()
             .get(key)
             .cloned()
-            .ok_or_else(|| format!("missing {key}"))
+            .ok_or_else(|| format!("missing {key}"))?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>, String> {
@@ -438,6 +465,7 @@ async fn restore_failure_returns_to_archived() {
 #[tokio::test]
 async fn raw_key_encoded_once_at_repl_client() {
     use base64::Engine as _;
+    use sha2::Digest as _;
 
     type Store = Arc<Mutex<HashMap<String, Bytes>>>;
     async fn handler(
@@ -449,9 +477,28 @@ async fn raw_key_encoded_once_at_repl_client() {
         body: Bytes,
     ) -> axum::response::Response {
         use axum::response::IntoResponse as _;
+        use sha2::Digest as _;
         let path = uri.path().to_string();
         match method {
             axum::http::Method::PUT => {
+                // 流式 PUT 必须带显式 Content-Length，且预计算的 payload hash 与实际
+                // 字节一致（否则 SigV4 在真实 S3 上会 403）。
+                let cl = headers
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok());
+                if cl != Some(body.len()) {
+                    return (axum::http::StatusCode::BAD_REQUEST, "content-length 不符")
+                        .into_response();
+                }
+                let sha = headers
+                    .get("x-amz-content-sha256")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                if sha != hex::encode(sha2::Sha256::digest(&body)) {
+                    return (axum::http::StatusCode::BAD_REQUEST, "payload hash 不符")
+                        .into_response();
+                }
                 let b64 = headers
                     .get("content-md5")
                     .and_then(|v| v.to_str().ok())
@@ -459,6 +506,10 @@ async fn raw_key_encoded_once_at_repl_client() {
                 let md5 = base64::engine::general_purpose::STANDARD
                     .decode(b64)
                     .unwrap();
+                if md5 != md5::Md5::digest(&body).as_slice() {
+                    return (axum::http::StatusCode::BAD_REQUEST, "content-md5 不符")
+                        .into_response();
+                }
                 objs.lock().unwrap().insert(path, body);
                 (
                     axum::http::StatusCode::OK,
@@ -502,13 +553,31 @@ async fn raw_key_encoded_once_at_repl_client() {
     let client = Arc::new(oss_server::repl_client::ReplClient::new_tiers(
         std::slice::from_ref(&target),
     ));
-    let backend = S3TierBackend::new(&target, client);
+    let staging = tempfile::tempdir().unwrap();
+    let backend =
+        S3TierBackend::new(&target, client).with_staging_dir(Some(staging.path().to_path_buf()));
     let raw_key = "cold/bkt/null/dir/a b+c%2F中文.txt";
-    let body = Bytes::from_static(b"encoded");
-    let md5 = hex::encode(md5::Md5::digest(body.as_ref()));
-    let etag = backend.put(raw_key, body.clone(), &md5).await.unwrap();
-    assert_eq!(etag, md5);
-    assert_eq!(backend.get(raw_key).await.unwrap(), body);
+    // 多块源流（非对齐块）：验证增量摘要与暂存文件跨块拼接。
+    let chunks: Vec<Bytes> = vec![
+        Bytes::from_static(b"encoded"),
+        Bytes::from_static(b"-chunk-two-"),
+        Bytes::from(vec![0xA5u8; 4093]),
+    ];
+    let body: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let src = Box::pin(futures::stream::iter(
+        chunks.into_iter().map(Ok::<_, String>).collect::<Vec<_>>(),
+    ));
+    let put = backend.put(raw_key, src, body.len() as u64).await.unwrap();
+    assert_eq!(put.etag, hex::encode(md5::Md5::digest(&body)));
+    assert_eq!(put.md5, hex::encode(md5::Md5::digest(&body)));
+    assert_eq!(put.sha256, hex::encode(sha2::Sha256::digest(&body)));
+    assert_empty_dir(staging.path()).await;
+    let mut stream = backend.get(raw_key).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, body);
     assert_eq!(
         backend.head(raw_key).await.unwrap(),
         Some(body.len() as u64)
@@ -519,4 +588,41 @@ async fn raw_key_encoded_once_at_repl_client() {
         objs.lock().unwrap().contains_key(expected),
         "远端路径应只编码一次：{expected}"
     );
+}
+
+async fn assert_empty_dir(dir: &std::path::Path) {
+    let mut rd = tokio::fs::read_dir(dir).await.unwrap();
+    assert!(
+        rd.next_entry().await.unwrap().is_none(),
+        "暂存目录必须清理干净：{}",
+        dir.display()
+    );
+}
+
+/// spool 阶段失败（源流报错 / 声明长度不符）→ 报错且不留暂存文件；
+/// 这些失败发生在发请求之前，不会打到远端。
+#[tokio::test]
+async fn s3_spool_failures_clean_staging() {
+    let staging = tempfile::tempdir().unwrap();
+    let target = tier_target("http://127.0.0.1:9");
+    let client = Arc::new(oss_server::repl_client::ReplClient::new_tiers(
+        std::slice::from_ref(&target),
+    ));
+    let backend =
+        S3TierBackend::new(&target, client).with_staging_dir(Some(staging.path().to_path_buf()));
+
+    let bad: TierByteStream = Box::pin(futures::stream::iter(vec![
+        Ok(Bytes::from_static(b"partial")),
+        Err("模拟源流失败".to_string()),
+    ]));
+    let err = backend.put("cold/bkt/v/x", bad, 8).await.unwrap_err();
+    assert!(err.contains("模拟源流失败"), "{err}");
+    assert_empty_dir(staging.path()).await;
+
+    // 声明 8 字节、流只给 4 字节：fail closed，不发请求。
+    let short: TierByteStream =
+        Box::pin(futures::stream::iter(vec![Ok(Bytes::from_static(b"half"))]));
+    let err = backend.put("cold/bkt/v/x", short, 8).await.unwrap_err();
+    assert!(err.contains("长度"), "{err}");
+    assert_empty_dir(staging.path()).await;
 }

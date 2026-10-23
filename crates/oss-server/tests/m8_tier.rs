@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use s3s::dto::*;
 use s3s::{S3, S3ErrorCode, S3Request, S3Response};
 use xl_s3::service::OssS3;
@@ -14,7 +15,9 @@ use xl_store::meta::TierPhase;
 use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
 use oss_server::state::AppState;
-use oss_server::tier::{S3TierGc, TierBackend, TierBackends, tier_key};
+use oss_server::tier::{
+    S3TierGc, TierBackend, TierBackends, TierByteStream, TierPutResult, tier_key,
+};
 use oss_server::tier_jobs::{M8TaskExecutor, reap_once};
 
 /// 内存 tier 后端：PUT 返回与源 ETag 不同的远端 ETag（钉「不比较源 ETag」）。
@@ -30,18 +33,42 @@ impl TierBackend for MockTier {
         "cold"
     }
 
-    async fn put(&self, key: &str, body: Bytes, etag: &str) -> Result<String, String> {
-        self.objs.lock().unwrap().insert(key.to_string(), body);
-        Ok(format!("mock-{etag}"))
+    async fn put(
+        &self,
+        key: &str,
+        mut body: TierByteStream,
+        size: u64,
+    ) -> Result<TierPutResult, String> {
+        let mut buf = Vec::with_capacity(size as usize);
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        if buf.len() as u64 != size {
+            return Err(format!("mock 长度 {} ≠ {size}", buf.len()));
+        }
+        use sha2::Digest as _;
+        let md5 = hex::encode(md5::Md5::digest(&buf));
+        let sha256 = hex::encode(sha2::Sha256::digest(&buf));
+        self.objs
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), Bytes::from(buf));
+        Ok(TierPutResult {
+            etag: format!("mock-{md5}"),
+            md5,
+            sha256,
+        })
     }
 
-    async fn get(&self, key: &str) -> Result<Bytes, String> {
-        self.objs
+    async fn get(&self, key: &str) -> Result<TierByteStream, String> {
+        let b = self
+            .objs
             .lock()
             .unwrap()
             .get(key)
             .cloned()
-            .ok_or_else(|| format!("missing {key}"))
+            .ok_or_else(|| format!("missing {key}"))?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>, String> {
