@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, ChecksumRecord, EncryptionRecord, ObjectLockRecord, XlMeta};
 
+mod cmk_rewrap;
 mod drives;
 pub mod ec;
 mod fsck;
@@ -30,6 +31,10 @@ mod rebalance;
 mod tier;
 mod uploads;
 mod version;
+pub use cmk_rewrap::{
+    CmkDeleteReport, CmkRef, CmkRefScan, REFS_REPORT_CAP, REWRAP_MAX_BATCH, RewrapItem,
+    RewrapOptions, RewrapReport,
+};
 pub use rebalance::RebalanceReport;
 pub use tier::ArchiveSpec;
 pub use version::{DeleteMarkerSpec, DeleteOutcome, TierRef, VersionEntry, VersionList};
@@ -601,6 +606,25 @@ impl Store {
                 .writers
                 .lock()
                 .map(|w| w.active.get(bucket).copied().unwrap_or(0))
+                .unwrap_or(0);
+            if active == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 等待**全部桶**在途写者归零（CMK 删除隔离后的写屏障；不改变 deleting）。超时 false。
+    pub async fn wait_writers_idle_all(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let active: usize = self
+                .writers
+                .lock()
+                .map(|w| w.active.values().sum())
                 .unwrap_or(0);
             if active == 0 {
                 return true;
@@ -1743,6 +1767,8 @@ fn now_nanos() -> i64 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_cmk_rewrap;
 #[cfg(test)]
 mod tests_crypto;
 #[cfg(test)]

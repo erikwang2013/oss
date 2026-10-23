@@ -160,7 +160,9 @@ pub fn routes() -> Router<AppState> {
         // M8 S6 缺口 A：加密/KMS 只读状态（管理员）+ 3.16 显式 CMK 管理
         .route("/encryption", get(encryption_status))
         .route("/encryption/cmks", get(list_cmks).post(create_cmk))
+        .route("/encryption/cmks/{name}", delete(delete_cmk))
         .route("/encryption/cmks/{name}/rotate", post(rotate_cmk))
+        .route("/encryption/cmks/{name}/rewrap", post(rewrap_cmk))
         // M4 切片 6：作业记录（管理员）与桶生命周期规则（桶主或管理员）
         .route("/jobs", get(list_jobs))
         // M8 S0：作业详情/控制（admin 或 requested_by）
@@ -492,6 +494,9 @@ fn kms_provider(state: &AppState) -> Option<std::sync::Arc<xl_store::kms::KmsFil
 fn cmk_error(e: xl_store::error::Error) -> Response {
     match e {
         xl_store::error::Error::InvalidArgument(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+        xl_store::error::Error::NoSuchBucket(m) => {
+            (StatusCode::NOT_FOUND, format!("bucket not found: {m}")).into_response()
+        }
         other => {
             tracing::error!(error = %other, "KMS CMK 操作失败");
             internal_error()
@@ -606,6 +611,149 @@ async fn rotate_cmk(
         Ok(version) => {
             audit_cmk(&state, uid, "control:cmk-rotate", &kms, name, version).await;
             Json(serde_json::json!({ "name": name, "current_version": version })).into_response()
+        }
+        Err(e) => cmk_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DeleteCmkQuery {
+    /// 集群离线确认：仅跳过「本机扫描/屏障不覆盖对端」的限制，**不放宽已知引用拒删**。
+    #[serde(default)]
+    force: bool,
+}
+
+/// CMK 删除（管理员/离线）：有引用 → 409 + 引用清单（fail-closed，绝不静默毁数据）。
+/// 无引用 → 原子隔离 → 本机写者归零 → 复扫 → 清除钥材料。审计只记名/版本/数量。
+async fn delete_cmk(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(name): Path<String>,
+    Query(q): Query<DeleteCmkQuery>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(kms) = kms_provider(&state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "未配置 KMS（OSS_KMS_DIR），无法删除 CMK",
+        )
+            .into_response();
+    };
+    let name = match xl_store::kms::parse_cmk_id(&name) {
+        Ok(n) => n,
+        Err(e) => return cmk_error(e),
+    };
+    // 指纹必须在隔离前算（删除后钥已不可读）；只记指纹，不记钥字节。
+    let fp = kms
+        .cmk_fingerprint(name)
+        .unwrap_or_else(|_| "-".to_string());
+    match state.store.delete_cmk(name, q.force).await {
+        Ok(report) => {
+            state
+                .audit(
+                    uid,
+                    if report.deleted {
+                        "control:cmk-delete"
+                    } else {
+                        "control:cmk-delete-refused"
+                    },
+                    None,
+                    None,
+                    Some(&format!(
+                        "cmk={name} versions={:?} force={} refs={} purged={} reason={} fp={fp}",
+                        report.versions,
+                        report.force,
+                        report.references,
+                        report.purged,
+                        report.reason.as_deref().unwrap_or("-"),
+                    )),
+                )
+                .await;
+            let status = if report.deleted {
+                StatusCode::OK
+            } else {
+                // 409：有引用/集群需 force/写者未归零/复扫竞态——调用方须先 rewrap 或离线确认
+                StatusCode::CONFLICT
+            };
+            (status, Json(report)).into_response()
+        }
+        Err(e) => cmk_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RewrapCmkBody {
+    /// 缺省=false（只读预览）；显式 true 才写。
+    #[serde(default)]
+    apply: bool,
+    #[serde(default = "default_rewrap_limit")]
+    limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    bucket: Option<String>,
+}
+
+fn default_rewrap_limit() -> usize {
+    100
+}
+
+/// CMK rewrap（管理员/离线）：把旧版本加密的对象版本重加密到当前版本。默认 dry-run；
+/// `apply=true` 才逐版本原子提交。有界批处理，`next_cursor` 续页。
+async fn rewrap_cmk(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(name): Path<String>,
+    Json(body): Json<RewrapCmkBody>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(kms) = kms_provider(&state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "未配置 KMS（OSS_KMS_DIR），无法 rewrap CMK",
+        )
+            .into_response();
+    };
+    let name = match xl_store::kms::parse_cmk_id(&name) {
+        Ok(n) => n,
+        Err(e) => return cmk_error(e),
+    };
+    let opts = xl_store::store::RewrapOptions {
+        apply: body.apply,
+        limit: body.limit,
+        cursor: body.cursor,
+        bucket: body.bucket,
+    };
+    match state.store.clone().rewrap_cmk(name, &opts).await {
+        Ok(report) => {
+            let fp = kms
+                .cmk_fingerprint(name)
+                .unwrap_or_else(|_| "-".to_string());
+            state
+                .audit(
+                    uid,
+                    "control:cmk-rewrap",
+                    None,
+                    None,
+                    Some(&format!(
+                        "cmk={name} version={} apply={} candidates={} rewrapped={} blocked={} failed={} truncated={} fp={fp}",
+                        report.current_version,
+                        report.apply,
+                        report.candidates,
+                        report.rewrapped,
+                        report.blocked,
+                        report.failed,
+                        report.truncated,
+                    )),
+                )
+                .await;
+            Json(report).into_response()
         }
         Err(e) => cmk_error(e),
     }
