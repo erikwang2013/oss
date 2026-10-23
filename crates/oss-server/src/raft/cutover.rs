@@ -252,17 +252,14 @@ pub async fn cutover(
     opts: &CutoverOptions,
 ) -> Result<CutoverReport, CutoverError> {
     verify_export(export).map_err(CutoverError::Invalid)?;
-    // 与快照安装同一守卫：OSSCTL1 带不了 config_json。放行 cutover 会留下无法建快照的
-    // 基线（成员加入/force-recover/回滚全部失败）。dry-run 同样在这里被拒绝。
-    // shortcut: OSSCTL2 落地前一律拒绝；届时改为要求 level 2 并原子 bump marker。
-    if let Err(e) = data::encode_snapshot(&export.data) {
-        return Err(CutoverError::Invalid(format!(
-            "export contains level-2 lifecycle data (config_json); OSSCTL1 cannot carry \
-             structured lifecycle rules, so the cluster could not build snapshots \
-             (member add/force-recover/rollback would fail). Remove or downgrade those \
-             rules at the source and re-export. [{e}]"
-        )));
-    }
+    // 基线必须可编码为快照（含 config_json → OSSCTL2），否则成员加入/force-recover/
+    // 回滚会在建快照时失败。要求级别随 install 在同一事务写入 marker（dry-run 不写）。
+    data::encode_snapshot(&export.data).map_err(|e| {
+        CutoverError::Invalid(format!(
+            "export cannot be snapshotted as control baseline: {e}"
+        ))
+    })?;
+    let required = data::required_feature_level(&export.data);
     if export.source_role != "voter" {
         return Err(CutoverError::Invalid(
             "witness export cannot be used for cutover".into(),
@@ -348,6 +345,12 @@ pub async fn cutover(
     let installed = data::install_tx(&mut tx, &export.data, &ctx)
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
+    // level-2 基线：marker 与数据同事务激活（只升不降）；启动守卫要求 feature_level=2。
+    if required > super::compat::MIN_FEATURE_LEVEL {
+        super::compat::bump_activation_tx(&mut tx, required)
+            .await
+            .map_err(|e| CutoverError::Db(e.to_string()))?;
+    }
     sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
         .execute(&mut *tx)
         .await

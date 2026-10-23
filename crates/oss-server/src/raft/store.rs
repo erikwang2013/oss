@@ -31,7 +31,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::apply;
-use super::data::{self, ControlData, InstallCtx};
+use super::data::{self, InstallCtx};
 use super::metrics::Metrics;
 use super::{ControlResponse, TypeConfig};
 
@@ -533,7 +533,7 @@ impl SqliteStateMachine {
         )
     }
 
-    /// S7.2：11 张复制表 + applied/membership 同一事务读，编码为带校验和的快照。
+    /// S7.2：11 张复制表 + applied/membership + 激活级别同一事务读，编码为带校验和的快照。
     async fn control_snapshot_bytes(
         &self,
     ) -> Result<
@@ -551,24 +551,33 @@ impl SqliteStateMachine {
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
         let (applied, membership) = read_applied(&mut tx).await?;
         let control = data::read_tx(&mut tx).await.map_err(Self::data_err)?;
+        let level = super::compat::read_activation_conn(&mut tx)
+            .await
+            .map_err(|e| {
+                storage_err(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    std::io::Error::other(e),
+                )
+            })?;
         tx.commit()
             .await
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        let bytes = data::encode_snapshot(&control).map_err(Self::data_err)?;
+        let bytes = data::encode_snapshot_at(&control, level).map_err(Self::data_err)?;
         Ok((applied, membership, bytes))
     }
 
     /// S7.2：单事务安装 11 张复制表；守卫窗口与 raft_applied/快照同事务提交。
     ///
-    /// D6：本版本只有 OSSCTL1（快照不含激活级别），marker 是节点本地且单调不减；
-    /// 安装不重建 `schema_meta`，因此 marker 永不因安装回退。等 OSSCTL2 携带级别时
-    /// 再在此取 `max(marker, snapshot_level)`。
+    /// OSSCTL2 携带 `feature_level`：marker 与数据同事务 `max(marker, snapshot_level)`
+    /// （只升不降）。级别高于本机配置也照装（节点必须先追平 state；R8 启动守卫会
+    /// 要求下次重启前把 `[raft].feature_level` 调到该级别）。
     async fn install_control(
         &self,
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
-        let control: ControlData = data::decode_snapshot(bytes).map_err(Self::data_err)?;
+        let snapshot = data::decode_snapshot(bytes).map_err(Self::data_err)?;
         let _guard = self.snapshot_lock.lock().await;
         let mut tx = self
             .pool
@@ -588,9 +597,21 @@ impl SqliteStateMachine {
             admin_id,
             witness: self.witness,
         };
-        data::install_tx(&mut tx, &control, &ctx)
+        data::install_tx(&mut tx, &snapshot.data, &ctx)
             .await
             .map_err(Self::data_err)?;
+        // 只升不降；OSSCTL1（level 1）不写 marker，保持旧安装足迹不变。
+        if snapshot.feature_level > super::compat::MIN_FEATURE_LEVEL {
+            super::compat::bump_activation_tx(&mut tx, snapshot.feature_level)
+                .await
+                .map_err(|e| {
+                    storage_err(
+                        ErrorSubject::Snapshot(None),
+                        ErrorVerb::Write,
+                        std::io::Error::other(e),
+                    )
+                })?;
+        }
         let meta_json = encode(ErrorSubject::Snapshot(None), ErrorVerb::Write, meta)?;
         let applied_json = encode(
             ErrorSubject::Snapshot(None),
@@ -623,6 +644,8 @@ impl SqliteStateMachine {
         tx.commit()
             .await
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        self.activation
+            .fetch_max(snapshot.feature_level, Ordering::Relaxed);
         if let Some(tx) = &self.install_notify {
             let _ = tx.send(meta.last_log_id.map(|l| l.index).unwrap_or(0));
         }
@@ -821,12 +844,13 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
             ));
         }
         if self.control {
-            if !bytes.starts_with(data::SNAPSHOT_MAGIC) {
+            if !data::is_control_snapshot(&bytes) {
                 return Err(storage_err(
                     ErrorSubject::Snapshot(None),
                     ErrorVerb::Write,
                     std::io::Error::other(
-                        "control state machine requires OSSCTL1 snapshot (legacy KV snapshot rejected)",
+                        "control state machine requires OSSCTL1/OSSCTL2 snapshot \
+                         (legacy KV snapshot rejected)",
                     ),
                 ));
             }
@@ -1190,6 +1214,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1, "校验失败不得改动目标控制表");
+    }
+
+    /// OSSCTL2：带 config_json 的控制快照 build → 全新控制库 install；行不丢，
+    /// 激活 marker 与数据同事务升到快照携带的级别。
+    #[tokio::test]
+    async fn control_snapshot_with_level_two_data_installs_and_bumps_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let url_a = format!("sqlite://{}?mode=rwc", dir.path().join("l2-a.db").display());
+        let url_b = format!("sqlite://{}?mode=rwc", dir.path().join("l2-b.db").display());
+        let db_a = crate::db::Db::connect_raft(&url_a).await.unwrap();
+        db_a.schema_meta_set("raft_feature_level", "2")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(db_a.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date, versioning, object_lock, \
+             replication_mode, deleting) VALUES ('l2-bucket', NULL, 2, 'Enabled', 0, 'sync', 0)",
+        )
+        .execute(db_a.pool())
+        .await
+        .unwrap();
+        let config_json = r#"{"filter":{"prefix":"p/"}}"#;
+        sqlx::query(
+            "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at, \
+             rule_id, expiration_days, config_json) VALUES ('l2-bucket', 'p/', 30, 1, 3, 'r1', 30, ?)",
+        )
+        .bind(config_json)
+        .execute(db_a.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+            .execute(db_a.pool())
+            .await
+            .unwrap();
+
+        let mut sm_a =
+            SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None, 2)
+                .await
+                .unwrap();
+        let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
+            .await
+            .unwrap();
+        let bytes = snap.snapshot.get_ref().clone();
+        assert!(bytes.starts_with(data::SNAPSHOT_MAGIC_V2));
+        let decoded = data::decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.feature_level, 2);
+
+        let db_b = crate::db::Db::connect_raft(&url_b).await.unwrap();
+        let mut sm_b =
+            SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 2)
+                .await
+                .unwrap();
+        RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(bytes)),
+        )
+        .await
+        .unwrap();
+        let config: Option<String> = sqlx::query_scalar(
+            "SELECT config_json FROM lifecycle_rules WHERE bucket = 'l2-bucket'",
+        )
+        .fetch_one(db_b.pool())
+        .await
+        .unwrap();
+        assert_eq!(config.as_deref(), Some(config_json));
+        assert_eq!(
+            db_b.schema_meta("raft_feature_level")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2"),
+            "安装 OSSCTL2 必须激活 marker"
+        );
+        assert_eq!(sm_b.activation_level(), 2);
     }
 
     /// Minor 3：序列化后超限的快照在 build 阶段即拒绝。

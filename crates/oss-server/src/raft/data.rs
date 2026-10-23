@@ -4,13 +4,18 @@
 //! ——管理员用户/AK 是站点本地状态，`buckets.set_id` 是本地物理 set（ruling #5），
 //! 两者都不入库。行序由 `read_tx` 的 `ORDER BY` 固定（checksum/diff 确定性）。
 //!
-//! 快照封套（`encode_snapshot`）：`OSSCTL1\n<sha256(payload) 64 位小写 hex>\n<json>`。
-//! 解码先校验 magic / hex / SHA-256，任何失败都 fail-closed（install 在任何写之前拒绝）。
+//! 快照封套：
+//! - 格式 1（`OSSCTL1`）：`OSSCTL1\n<sha256(payload) 64 位小写 hex>\n<json(ControlData)>`；
+//! - 格式 2（`OSSCTL2`）：`OSSCTL2\n<sha256(payload) 64 位小写 hex>\n<json(SnapshotV2)>`，
+//!   载荷带 `feature_level`，用于装载 `LifecycleRuleRow.config_json`（level-2 数据）。
 //!
-//! 格式 1 已冻结：行结构没有 `deny_unknown_fields`，旧节点会**静默丢弃**未知字段并
-//! 清掉未知表。任何 `ControlData` 增删都必须升到 `OSSCTL2`（随激活标记切换），
-//! 绝不能只往格式 1 里加字段。`LifecycleRuleRow.config_json` 是既成的 level-2 数据：
-//! OSSCTL2 落地前编码器对它 fail-closed（见 [`encode_snapshot`]），其余字段仍用 OSSCTL1。
+//! 编码器按数据内容选格式：含 `config_json`（或调用方传入激活级别 2）→ OSSCTL2，否则
+//! OSSCTL1。解码先校验 magic / hex / SHA-256 / 级别，任何失败都 fail-closed（install 在
+//! 任何写之前拒绝）。OSSCTL1 仍可读；OSSCTL2 的 magic 与格式 1 无公共前缀，旧二进制
+//! 会在解析载荷前整包拒绝——**不存在静默丢弃 config_json 或未知表的路径**。
+//!
+//! 两个格式一经发布即冻结：载荷/行结构全部 `deny_unknown_fields`，未知字段/表直接
+//! 报错而不是被静默丢弃。任何 `ControlData` 增删都必须升到 `OSSCTL3`。
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,17 +24,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 
-/// 快照封套格式版本（magic `OSSCTL1` 即 1）。
-pub const SNAPSHOT_FORMAT: u32 = 1;
+use super::compat::{MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
+
+/// 本二进制可写的最新快照封套版本（1 = OSSCTL1 只读兼容，2 = OSSCTL2）。
+pub const SNAPSHOT_FORMAT: u32 = 2;
 
 const MAGIC: &[u8] = b"OSSCTL1\n";
-/// 快照封套前缀（快照类型判定用：控制面 11 表 vs S5 基座 KV）。
+const MAGIC_V2: &[u8] = b"OSSCTL2\n";
+/// 格式 1 前缀（旧二进制以此判定控制面快照；本二进制校验 V1/V2 两种）。
 pub const SNAPSHOT_MAGIC: &[u8] = MAGIC;
+/// 格式 2 前缀（载荷含 `feature_level`，可携带 level-2 生命周期）。
+pub const SNAPSHOT_MAGIC_V2: &[u8] = MAGIC_V2;
 const HEX_LEN: usize = 64;
 
 /// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
 /// 管理员 id，witness 写哨兵 0）；`User(username)` = 复制用户。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "username")]
 pub enum OwnerRef {
     Admin,
@@ -37,6 +48,7 @@ pub enum OwnerRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserRow {
     pub username: String,
     pub password_hash: String,
@@ -45,6 +57,7 @@ pub struct UserRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessKeyRow {
     pub access_key: String,
     pub secret_key: String,
@@ -58,6 +71,7 @@ pub struct AccessKeyRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionRow {
     pub username: String,
     pub bucket: String,
@@ -67,6 +81,7 @@ pub struct PermissionRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BucketRow {
     pub name: String,
     pub owner: OwnerRef,
@@ -81,6 +96,7 @@ pub struct BucketRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BucketPolicyRow {
     pub bucket: String,
     pub policy_json: String,
@@ -88,6 +104,7 @@ pub struct BucketPolicyRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleRuleRow {
     pub bucket: String,
     pub prefix: String,
@@ -105,6 +122,7 @@ pub struct LifecycleRuleRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventConfigRow {
     pub bucket: String,
     pub config_json: String,
@@ -112,6 +130,7 @@ pub struct EventConfigRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationRuleRow {
     pub bucket: String,
     pub rules_json: String,
@@ -119,6 +138,7 @@ pub struct ReplicationRuleRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessPointRow {
     pub name: String,
     pub bucket: String,
@@ -129,6 +149,7 @@ pub struct AccessPointRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OlapConfigRow {
     pub access_point: String,
     pub kind: String,
@@ -142,6 +163,7 @@ pub struct OlapConfigRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InventoryConfigRow {
     pub bucket: String,
     pub id: String,
@@ -152,6 +174,7 @@ pub struct InventoryConfigRow {
 
 /// 11 张复制表的完整载荷（自然键；无本地自增 id / set_id / 管理员行）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ControlData {
     pub users: Vec<UserRow>,
     pub access_keys: Vec<AccessKeyRow>,
@@ -799,31 +822,80 @@ pub(crate) async fn install_tx(
     Ok(report_of(data))
 }
 
-/// 快照封套编码：`OSSCTL1\n<sha256 hex>\n<json>`。
-///
-/// 临时 fail-closed（OSSCTL2 之前）：格式 1 没有 `config_json` 的合法表示，v1.13.1
-/// 安装时会静默丢弃结构化生命周期。宁可拒绝快照/恢复，也不丢 level-2 数据。
-pub fn encode_snapshot(data: &ControlData) -> Result<Vec<u8>, DataError> {
-    if data.lifecycle_rules.iter().any(|r| r.config_json.is_some()) {
-        return Err(DataError::Format(
-            "level-2 data present; refusing OSSCTL1".into(),
-        ));
-    }
-    let payload = serde_json::to_vec(data)?;
-    let sum = Sha256::digest(&payload);
-    let mut out = Vec::with_capacity(MAGIC.len() + HEX_LEN + 1 + payload.len());
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(hex::encode(sum).as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(&payload);
-    Ok(out)
+/// 解码结果：封套携带的激活级别（OSSCTL1 固定 1）+ 11 表数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSnapshot {
+    pub feature_level: u8,
+    pub data: ControlData,
 }
 
-/// 解码并校验快照封套；magic/hex/checksum 任一不符 → fail-closed（不写任何行）。
-pub fn decode_snapshot(bytes: &[u8]) -> Result<ControlData, DataError> {
-    let rest = bytes
-        .strip_prefix(MAGIC)
-        .ok_or_else(|| DataError::Format("snapshot magic missing".into()))?;
+/// OSSCTL2 载荷。`deny_unknown_fields`：格式 2 已冻结，新增字段必须升 3。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV2<T> {
+    feature_level: u8,
+    data: T,
+}
+
+/// 数据自身要求的最低激活级别：出现 level-2 行（`config_json`）即 2，否则 1。
+pub fn required_feature_level(data: &ControlData) -> u8 {
+    if data.lifecycle_rules.iter().any(|r| r.config_json.is_some()) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 是否为本二进制可安装的控制面快照（OSSCTL1 或 OSSCTL2）。
+/// 旧二进制只认 [`SNAPSHOT_MAGIC`]；V2 与其无公共前缀，故在解析前整包拒绝。
+pub fn is_control_snapshot(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC) || bytes.starts_with(MAGIC_V2)
+}
+
+fn level_ok(level: u8) -> bool {
+    (MIN_FEATURE_LEVEL..=MAX_FEATURE_LEVEL).contains(&level)
+}
+
+fn seal(magic: &[u8], payload: &[u8]) -> Vec<u8> {
+    let sum = Sha256::digest(payload);
+    let mut out = Vec::with_capacity(magic.len() + HEX_LEN + 1 + payload.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(hex::encode(sum).as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 快照封套编码（格式由数据内容决定）：含 `config_json` → OSSCTL2，否则 OSSCTL1。
+pub fn encode_snapshot(data: &ControlData) -> Result<Vec<u8>, DataError> {
+    encode_snapshot_at(data, required_feature_level(data))
+}
+
+/// 以节点激活级别编码：级别 >= 2 或数据含 `config_json` → OSSCTL2。
+///
+/// 级别取 `max(传入级别, 数据要求)`：含 level-2 行时绝不能降级成 OSSCTL1
+/// （旧读者会静默丢弃这些行）。
+pub fn encode_snapshot_at(data: &ControlData, feature_level: u8) -> Result<Vec<u8>, DataError> {
+    if !level_ok(feature_level) {
+        return Err(DataError::Format(format!(
+            "snapshot feature level {feature_level} outside {MIN_FEATURE_LEVEL}..={MAX_FEATURE_LEVEL}"
+        )));
+    }
+    let level = feature_level.max(required_feature_level(data));
+    let (magic, payload) = if level == MIN_FEATURE_LEVEL {
+        (MAGIC, serde_json::to_vec(data)?)
+    } else {
+        let v2 = SnapshotV2 {
+            feature_level: level,
+            data,
+        };
+        (MAGIC_V2, serde_json::to_vec(&v2)?)
+    };
+    Ok(seal(magic, &payload))
+}
+
+/// 校验封套头（长度的固定格式 + SHA-256），返回载荷。
+fn checked_payload(rest: &[u8]) -> Result<&[u8], DataError> {
     let nl = rest
         .iter()
         .position(|b| *b == b'\n')
@@ -843,7 +915,37 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<ControlData, DataError> {
     if Sha256::digest(payload).as_slice() != want.as_slice() {
         return Err(DataError::Checksum);
     }
-    Ok(serde_json::from_slice(payload)?)
+    Ok(payload)
+}
+
+/// 解码并校验快照封套；magic/hex/checksum/级别任一不符 → fail-closed（不写任何行）。
+pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, DataError> {
+    let (feature_level, data) = if let Some(rest) = bytes.strip_prefix(MAGIC_V2) {
+        let v2: SnapshotV2<ControlData> = serde_json::from_slice(checked_payload(rest)?)?;
+        (v2.feature_level, v2.data)
+    } else if let Some(rest) = bytes.strip_prefix(MAGIC) {
+        (
+            MIN_FEATURE_LEVEL,
+            serde_json::from_slice(checked_payload(rest)?)?,
+        )
+    } else {
+        return Err(DataError::Format("snapshot magic missing".into()));
+    };
+    if !level_ok(feature_level) {
+        return Err(DataError::Format(format!(
+            "snapshot feature level {feature_level} outside {MIN_FEATURE_LEVEL}..={MAX_FEATURE_LEVEL}"
+        )));
+    }
+    let required = required_feature_level(&data);
+    if required > feature_level {
+        return Err(DataError::Format(format!(
+            "snapshot declares feature level {feature_level} but carries level-{required} data"
+        )));
+    }
+    Ok(DecodedSnapshot {
+        feature_level,
+        data,
+    })
 }
 
 #[cfg(test)]
@@ -1024,6 +1126,12 @@ mod tests {
         assert_eq!(admins, 1, "本地 admin 不得被快照安装删除");
     }
 
+    fn level_two() -> ControlData {
+        let mut data = sample();
+        data.lifecycle_rules[0].config_json = Some(r#"{"filter":{"prefix":"logs/"}}"#.into());
+        data
+    }
+
     /// 11 张表全行往返：语义相等且再次编码逐字节相同（checksum/ORDER BY 确定性）。
     #[test]
     fn snapshot_round_trip_is_byte_identical() {
@@ -1031,55 +1139,138 @@ mod tests {
         let bytes = encode_snapshot(&data).unwrap();
         assert!(bytes.starts_with(b"OSSCTL1\n"));
         let decoded = decode_snapshot(&bytes).unwrap();
-        assert_eq!(decoded, data);
-        assert_eq!(encode_snapshot(&decoded).unwrap(), bytes);
+        assert_eq!(decoded.feature_level, 1, "无 level-2 数据 → OSSCTL1");
+        assert_eq!(decoded.data, data);
+        assert_eq!(encode_snapshot(&decoded.data).unwrap(), bytes);
     }
 
-    /// 临时 fail-closed：level-2 生命周期数据不得封进 OSSCTL1（v1.13.1 会静默丢弃）。
+    /// OSSCTL2：含 config_json 的快照带 feature_level=2，往返确定且不可降级成 OSSCTL1。
     #[test]
-    fn snapshot_refuses_level_two_lifecycle_data() {
+    fn ossctl2_round_trip_carries_level_two_and_is_deterministic() {
+        let data = level_two();
+        let bytes = encode_snapshot(&data).unwrap();
+        assert!(bytes.starts_with(b"OSSCTL2\n"));
+        let decoded = decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.feature_level, 2);
+        assert_eq!(decoded.data, data);
+        assert_eq!(encode_snapshot(&decoded.data).unwrap(), bytes);
+        // 激活到 2 但当前无 config_json 行：仍用 OSSCTL2 携带级别。
+        let activated = encode_snapshot_at(&sample(), 2).unwrap();
+        assert!(activated.starts_with(b"OSSCTL2\n"));
+        assert_eq!(decode_snapshot(&activated).unwrap().feature_level, 2);
+        // 数据含 config_json 时传 level 1 也必须升到 OSSCTL2（绝不静默丢行）。
         assert!(
-            encode_snapshot(&sample())
+            encode_snapshot_at(&data, 1)
                 .unwrap()
-                .starts_with(b"OSSCTL1\n")
+                .starts_with(b"OSSCTL2\n")
         );
-        let mut data = sample();
-        data.lifecycle_rules[0].config_json = Some(r#"{"filter":{"prefix":"logs/"}}"#.into());
-        let err = encode_snapshot(&data).expect_err("config_json must refuse OSSCTL1");
+    }
+
+    /// 兼容规则：旧二进制只认 `OSSCTL1\n` 前缀，OSSCTL2 与其无公共前缀 →
+    /// 在解析/安装前整包拒绝，不存在“读一半、丢 config_json/未知表”的路径。
+    #[test]
+    fn ossctl2_is_rejected_cleanly_by_ossctl1_readers() {
+        let v2 = encode_snapshot(&level_two()).unwrap();
+        assert!(v2.starts_with(SNAPSHOT_MAGIC_V2));
+        assert!(is_control_snapshot(&v2));
+        // 旧二进制守卫（store::install_snapshot 的 starts_with 与旧 decode 的
+        // strip_prefix）都失配 → Format，不会解析载荷、不会写行。
+        assert!(!v2.starts_with(SNAPSHOT_MAGIC));
+        assert!(v2.strip_prefix(SNAPSHOT_MAGIC).is_none());
+        // 反向：V1 不会被误认为 V2。
+        let v1 = encode_snapshot(&sample()).unwrap();
+        assert!(!v1.starts_with(SNAPSHOT_MAGIC_V2));
+        assert!(is_control_snapshot(&v1));
+    }
+
+    /// 格式冻结：未知字段/未知表必须整包拒绝，绝不静默丢弃（V1/V2 同一规则）。
+    #[test]
+    fn unknown_fields_and_tables_are_rejected_not_dropped() {
+        let payload = serde_json::to_vec(&sample()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        value["lifecycle_rules"][0]["future_field"] = serde_json::json!(1);
+        let bytes = seal(MAGIC, &serde_json::to_vec(&value).unwrap());
+        assert!(matches!(decode_snapshot(&bytes), Err(DataError::Json(_))));
+
+        let mut value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        value["future_table"] = serde_json::json!([]);
+        let bytes = seal(MAGIC, &serde_json::to_vec(&value).unwrap());
+        assert!(matches!(decode_snapshot(&bytes), Err(DataError::Json(_))));
+
+        let clean = sample();
+        let payload = serde_json::to_vec(&SnapshotV2 {
+            feature_level: 2,
+            data: &clean,
+        })
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        value["future"] = serde_json::json!(true);
+        let bytes = seal(MAGIC_V2, &serde_json::to_vec(&value).unwrap());
+        assert!(matches!(decode_snapshot(&bytes), Err(DataError::Json(_))));
+    }
+
+    /// V2 声明的级别必须覆盖数据要求且在二进制支持范围内（校验和被重算也拒绝）。
+    #[test]
+    fn ossctl2_level_mismatch_or_unknown_level_is_rejected() {
+        let clean = sample();
+        let payload = serde_json::to_vec(&SnapshotV2 {
+            feature_level: MAX_FEATURE_LEVEL + 1,
+            data: &clean,
+        })
+        .unwrap();
+        let err = decode_snapshot(&seal(MAGIC_V2, &payload)).unwrap_err();
         assert!(
-            matches!(&err, DataError::Format(m) if m.contains("level-2 data present")),
+            matches!(&err, DataError::Format(m) if m.contains("feature level")),
             "{err}"
         );
+
+        let payload = serde_json::to_vec(&SnapshotV2 {
+            feature_level: 1,
+            data: &level_two(),
+        })
+        .unwrap();
+        let err = decode_snapshot(&seal(MAGIC_V2, &payload)).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("carries level-2 data")),
+            "{err}"
+        );
+
+        assert!(encode_snapshot_at(&clean, MAX_FEATURE_LEVEL + 1).is_err());
     }
 
-    /// 1 字节/头部篡改/截断都拒绝；错误分类可区分 checksum 与格式。
+    /// 1 字节/头部篡改/截断都拒绝；错误分类可区分 checksum 与格式（V1/V2 同规则）。
     #[test]
     fn corrupted_snapshot_is_rejected() {
-        let bytes = encode_snapshot(&sample()).unwrap();
+        for bytes in [
+            encode_snapshot(&sample()).unwrap(),
+            encode_snapshot(&level_two()).unwrap(),
+        ] {
+            let mut bit = bytes.clone();
+            let last = bit.len() - 1;
+            bit[last] ^= 0x01;
+            assert!(matches!(
+                decode_snapshot(&bit),
+                Err(DataError::Checksum) | Err(DataError::Json(_))
+            ));
 
-        let mut bit = bytes.clone();
-        let last = bit.len() - 1;
-        bit[last] ^= 0x01;
-        assert!(matches!(
-            decode_snapshot(&bit),
-            Err(DataError::Checksum) | Err(DataError::Json(_))
-        ));
+            let mut magic = bytes.clone();
+            magic[0] = b'X';
+            assert!(matches!(decode_snapshot(&magic), Err(DataError::Format(_))));
 
-        let mut magic = bytes.clone();
-        magic[0] = b'X';
-        assert!(matches!(decode_snapshot(&magic), Err(DataError::Format(_))));
+            let mut upper = bytes.clone();
+            upper[MAGIC.len()] = b'A';
+            assert!(matches!(decode_snapshot(&upper), Err(DataError::Format(_))));
 
-        let mut upper = bytes.clone();
-        upper[MAGIC.len()] = b'A';
-        assert!(matches!(decode_snapshot(&upper), Err(DataError::Format(_))));
-
-        assert!(matches!(
-            decode_snapshot(&bytes[..bytes.len() - 5]),
-            Err(DataError::Checksum)
-        ));
-        assert!(matches!(
-            decode_snapshot(b"OSSCTL1\n"),
-            Err(DataError::Format(_))
-        ));
+            assert!(matches!(
+                decode_snapshot(&bytes[..bytes.len() - 5]),
+                Err(DataError::Checksum)
+            ));
+        }
+        for truncated in [&b"OSSCTL1\n"[..], &b"OSSCTL2\n"[..]] {
+            assert!(matches!(
+                decode_snapshot(truncated),
+                Err(DataError::Format(_))
+            ));
+        }
     }
 }

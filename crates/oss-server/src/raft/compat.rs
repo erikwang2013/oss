@@ -51,9 +51,18 @@ pub fn parse_feature(value: Option<&str>) -> u8 {
 
 /// 读取本地激活标记（缺省 = 1）；值非法 = 错误（fail-closed，绝不当 1 放行）。
 pub async fn read_activation(pool: &sqlx::SqlitePool) -> Result<u8, String> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("获取连接读取 schema_meta.{META_FEATURE_LEVEL} 失败: {e}"))?;
+    read_activation_conn(&mut conn).await
+}
+
+/// 同 [`read_activation`]，但复用调用方事务/连接（快照 build 与数据同一读快照）。
+pub async fn read_activation_conn(conn: &mut sqlx::SqliteConnection) -> Result<u8, String> {
     let value: Option<String> = sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
         .bind(META_FEATURE_LEVEL)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| format!("读取 schema_meta.{META_FEATURE_LEVEL} 失败: {e}"))?;
     match value {

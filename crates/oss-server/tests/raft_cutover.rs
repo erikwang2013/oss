@@ -167,10 +167,11 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
     assert!(Db::connect(&url).await.is_err());
 }
 
-/// 导出含 level-2 生命周期数据（config_json）时，cutover 必须在写之前拒绝
-/// （dry-run 同样拒绝）；否则目标库会留下无法生成 OSSCTL1 快照的基线。
+/// level-2（config_json）：cutover 写出可生成 OSSCTL2 快照的基线并在同一事务激活
+/// marker=2；force-recover 在 feature_level=2 下接受并回放 config_json。配置不足时
+/// 在写任何行之前拒绝。
 #[tokio::test]
-async fn cutover_refuses_level_two_lifecycle_data() {
+async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "l2-src.db").await;
     seed_admin_and_rows(&src).await;
@@ -200,35 +201,102 @@ async fn cutover_refuses_level_two_lifecycle_data() {
             .any(|r| r.config_json.is_some()),
         "export must carry config_json"
     );
+    assert!(
+        oss_server::raft::data::encode_snapshot(&export.data)
+            .unwrap()
+            .starts_with(oss_server::raft::data::SNAPSHOT_MAGIC_V2),
+        "level-2 export must be snapshot-encodable as OSSCTL2"
+    );
 
+    // dry-run：报告冲突但不写行、不写 marker。
     let dst = db_at(dir.path(), "l2-dst.db").await;
     seed_admin_and_rows(&dst).await;
-    for dry_run in [true, false] {
-        let err = cutover::cutover(
-            &dst,
-            &facts(),
-            &export,
-            &CutoverOptions {
-                dry_run,
-                overwrite: true,
-            },
-        )
+    let report = cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: true,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.dry_run && !report.written);
+    assert!(!report.conflicts.is_empty());
+    assert_eq!(dst.schema_meta("raft_mode").await.unwrap(), None);
+    assert_eq!(dst.schema_meta("raft_feature_level").await.unwrap(), None);
+
+    // 写入：config_json 原样落盘，marker 与数据同事务升到 2。
+    let report = cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.written);
+    let config: Option<String> =
+        sqlx::query_scalar("SELECT config_json FROM lifecycle_rules WHERE bucket = 'b1'")
+            .fetch_one(dst.pool())
+            .await
+            .unwrap();
+    assert_eq!(config.as_deref(), Some(r#"{"filter":{"prefix":"logs/"}}"#));
+    assert_eq!(
+        dst.schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+
+    // force-recover：feature_level=1 在写之前拒绝；=2 接受并留下 OSSCTL2 基线快照。
+    let dst2 = db_at(dir.path(), "l2-recover.db").await;
+    seed_admin_and_rows(&dst2).await;
+    dst2.schema_meta_set("raft_mode", "on").await.unwrap();
+    let raft_db = dir.path().join("l2-raft.db");
+    let settings = raft_settings(7, RaftRole::Voter, raft_db.clone());
+    let err = cutover::force_recover(&dst2, &raft_db, &settings, &export, 7)
         .await
         .unwrap_err();
-        let msg = err.to_string();
-        assert!(matches!(err, CutoverError::Invalid(_)), "{msg}");
-        assert!(
-            msg.contains("config_json") && msg.contains("OSSCTL1"),
-            "error must be actionable: {msg}"
-        );
-    }
+    assert!(err.contains("feature_level = 2"), "{err}");
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_rules")
-        .fetch_one(dst.pool())
+        .fetch_one(dst2.pool())
         .await
         .unwrap();
-    assert_eq!(rows, 0, "refused cutover must not install level-2 rows");
-    assert_eq!(dst.schema_meta("raft_mode").await.unwrap(), None);
-    assert_eq!(dst.schema_meta("raft_cutover").await.unwrap(), None);
+    assert_eq!(rows, 0, "refused recovery must not install level-2 rows");
+    assert_eq!(dst2.schema_meta("raft_feature_level").await.unwrap(), None);
+
+    let mut settings2 = settings.clone();
+    settings2.feature_level = 2;
+    cutover::force_recover(&dst2, &raft_db, &settings2, &export, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        dst2.schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+    let snap_bytes: Vec<u8> = sqlx::query_scalar("SELECT data FROM raft_snapshot WHERE id = 1")
+        .fetch_one(dst2.pool())
+        .await
+        .unwrap();
+    let snapshot = oss_server::raft::data::decode_snapshot(&snap_bytes).unwrap();
+    assert_eq!(snapshot.feature_level, 2);
+    assert!(
+        snapshot
+            .data
+            .lifecycle_rules
+            .iter()
+            .any(|r| r.config_json.is_some()),
+        "recovery base snapshot must keep config_json"
+    );
 }
 
 #[tokio::test]
@@ -390,7 +458,7 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
         .unwrap();
     let snapshot = oss_server::raft::data::decode_snapshot(&snap_bytes).unwrap();
     assert!(
-        snapshot.buckets.iter().any(|b| b.name == "b1"),
+        snapshot.data.buckets.iter().any(|b| b.name == "b1"),
         "base snapshot must contain force-recovered rows"
     );
     let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_log")
