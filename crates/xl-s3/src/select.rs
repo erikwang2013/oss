@@ -1302,6 +1302,23 @@ pub fn parse_json(input: &[u8], lines: bool) -> s3s::S3Result<Vec<(J, i64)>> {
     }
 }
 
+// ---------- BZIP2 输入解压 ----------
+
+/// BZIP2 解压（含多流拼接，同 bzip2 CLI/Python）：预算按**解压后**字节计
+/// （与 GZIP 的 MAX_INFLATED 同口径，防压缩炸弹）。
+pub fn inflate_bzip2(input: &[u8], limit: usize) -> s3s::S3Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    bzip2::read::MultiBzDecoder::new(input)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| bad("BZIP2 decompress failed"))?;
+    if out.len() > limit {
+        return Err(bad(format!("BZIP2 解压后超过 {limit} 字节上限")));
+    }
+    Ok(out)
+}
+
 // ---------- Parquet 解析（行 → JSON 对象，复用 JSON 路径求值） ----------
 
 /// 解压后列字节总预算：Parquet 行组是压缩的，解压爆炸需在读取前拒绝
@@ -2577,5 +2594,30 @@ mod tests {
         assert!(err.to_string().contains("ScanRange"), "{err}");
         let err = parse_parquet(b"not a parquet file").unwrap_err();
         assert!(err.to_string().contains("Parquet"), "{err}");
+    }
+
+    #[test]
+    fn bzip2_inflate_budget_and_malformed() {
+        use std::io::Write as _;
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        enc.write_all(&[b'x'; 64]).unwrap();
+        let bz = enc.finish().unwrap();
+        // 预算按解压后字节：恰好 64 放行，63 拒绝
+        assert_eq!(inflate_bzip2(&bz, 64).unwrap(), vec![b'x'; 64]);
+        assert_eq!(
+            inflate_bzip2(&bz, 63).unwrap_err().code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+        // 多流拼接（pbzip2 形态）按顺序解出全部流
+        let mut joined = bz.clone();
+        joined.extend_from_slice(&bz);
+        assert_eq!(inflate_bzip2(&joined, 128).unwrap().len(), 128);
+        // 非 BZIP2 / 截断流 → 确定性 InvalidRequest（400）
+        for malformed in [&b"not bzip2"[..], &bz[..bz.len() / 2]] {
+            assert_eq!(
+                inflate_bzip2(malformed, 1024).unwrap_err().code(),
+                &s3s::S3ErrorCode::InvalidRequest
+            );
+        }
     }
 }

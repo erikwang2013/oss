@@ -22,9 +22,10 @@ s3s.workspace = true
 tokio.workspace = true
 sqlx = { workspace = true }
 tracing.workspace = true
-# M6 切片 2：S3 Select（SQL AST + GZIP）
+# M6 切片 2：S3 Select（SQL AST + GZIP/BZIP2）
 sqlparser.workspace = true
 flate2.workspace = true
+bzip2.workspace = true
 # S3 Select Parquet 输入：低层 row reader（default-features=false，不拉 Arrow）；
 # json 仅启用 Row::to_json_value（serde_json/base64 本就在依赖树）
 parquet = { workspace = true, features = ["json"] }
