@@ -272,11 +272,14 @@ impl ControlCommand {
     /// Level B：命令进入 raft log 所需的最低 feature 级别。只有新语义命令返回 2；
     /// 既有命令永远 1（旧二进制必须能解析并应用）。
     pub fn min_feature_level(&self) -> u8 {
-        #[cfg(test)]
-        if matches!(self, Self::FeatureProbe { .. }) {
-            return 2;
+        match self {
+            // 结构化生命周期：v1.13.1 的 `ControlCommand`（`deny_unknown_fields`）无法
+            // 解码该变体，混合窗口内提交会让旧副本 fail-stop。
+            Self::BucketSetLifecycleV2 { .. } => 2,
+            #[cfg(test)]
+            Self::FeatureProbe { .. } => 2,
+            _ => super::compat::MIN_FEATURE_LEVEL,
         }
-        super::compat::MIN_FEATURE_LEVEL
     }
 
     /// serde JSON 字节数（与 raft log / RPC 实际编码一致）。

@@ -61,6 +61,54 @@ async fn count(st: &AppState, sql: &'static str, bucket: &str) -> i64 {
         .unwrap()
 }
 
+fn raft_settings(dir: &std::path::Path, feature_level: u8) -> RaftSettings {
+    RaftSettings {
+        node_id: 1,
+        role: oss_server::config::RaftRole::Voter,
+        bootstrap: true,
+        advertise_endpoint: "http://127.0.0.1:1".to_string(),
+        cluster_token: "test-cluster-token".to_string(),
+        db_path: dir.join("raft.db"),
+        election_timeout_ms: 2_000,
+        heartbeat_interval_ms: 200,
+        install_snapshot_timeout_ms: 5_000,
+        max_in_snapshot_log_to_keep: 0,
+        purge_batch_size: 1024,
+        write_timeout_ms: 20_000,
+        snapshot_max_chunk_size: oss_server::raft::SNAPSHOT_CHUNK_MAX,
+        snapshot_max_bytes: 512 * 1024 * 1024,
+        feature_level,
+    }
+}
+
+/// 单节点 + 真实控制库（11 张表），等待选出 leader。
+async fn spawn_raft(
+    dir: &std::path::Path,
+    feature_level: u8,
+) -> (oss_server::raft::RaftHandle, sqlx::SqlitePool) {
+    let url = format!("sqlite://{}?mode=rwc", dir.join("control.db").display());
+    let db = oss_server::db::Db::connect_raft(&url).await.unwrap();
+    let handle = oss_server::raft::spawn_with_control(
+        raft_settings(dir, feature_level),
+        Some(db.pool().clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if handle.raft().metrics().borrow().current_leader.is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader election timed out"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    (handle, db.pool().clone())
+}
+
 #[test]
 fn command_serde_round_trip_every_variant_and_rejects_unknown_fields() {
     let commands = vec![
@@ -204,6 +252,13 @@ fn command_serde_round_trip_every_variant_and_rejects_unknown_fields() {
         let json = serde_json::to_string(cmd).unwrap();
         let back: ControlCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(&back, cmd, "round-trip failed for {json}");
+        // Level B 审计：既有变体必须保持 1（旧二进制可解码），只有 V2 是 2。
+        let want = if matches!(cmd, ControlCommand::BucketSetLifecycleV2 { .. }) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(cmd.min_feature_level(), want, "wrong level for {cmd:?}");
     }
     // 未知字段（变体级）与未知变体都必须拒绝，避免跨版本静默丢字段。
     let unknown_field = r#"{"UserCreate":{"username":"u","password_hash":"h","status":"active","created_at":0,"extra":1}}"#;
@@ -980,42 +1035,7 @@ async fn bucket_delete_cascades_all_dependent_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_applies_control_commands_to_guarded_control_db() {
     let dir = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite://{}?mode=rwc",
-        dir.path().join("control.db").display()
-    );
-    let db = oss_server::db::Db::connect_raft(&url).await.unwrap();
-    let settings = RaftSettings {
-        node_id: 1,
-        role: oss_server::config::RaftRole::Voter,
-        bootstrap: true,
-        advertise_endpoint: "http://127.0.0.1:1".to_string(),
-        cluster_token: "test-cluster-token".to_string(),
-        db_path: dir.path().join("raft.db"),
-        election_timeout_ms: 2_000,
-        heartbeat_interval_ms: 200,
-        install_snapshot_timeout_ms: 5_000,
-        max_in_snapshot_log_to_keep: 0,
-        purge_batch_size: 1024,
-        write_timeout_ms: 20_000,
-        snapshot_max_chunk_size: 4 * 1024 * 1024,
-        snapshot_max_bytes: 512 * 1024 * 1024,
-        feature_level: 1,
-    };
-    let handle = oss_server::raft::spawn_with_control(settings, Some(db.pool().clone()), None)
-        .await
-        .unwrap();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if handle.raft().metrics().borrow().current_leader.is_some() {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "leader election timed out"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    let (handle, pool) = spawn_raft(dir.path(), 1).await;
 
     assert_eq!(
         handle.write(user_create("raft-user")).await.unwrap(),
@@ -1035,14 +1055,79 @@ async fn raft_applies_control_commands_to_guarded_control_db() {
             .await
     );
     let user: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = 'raft-user'")
-        .fetch_one(db.pool())
+        .fetch_one(&pool)
         .await
         .unwrap();
     let bucket: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name = 'raft-bucket'")
-        .fetch_one(db.pool())
+        .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!((user, bucket), (1, 1));
+    handle.shutdown().await;
+}
+
+/// Level B 回归：`BucketSetLifecycleV2` 必须在 append 前按 level 2 门控。
+/// level 1 拒绝（503 路径），level 2 接受并激活 marker——否则混合窗口内 v1.13.1
+/// 副本解码 V2 变体会 fail-stop。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_v2_requires_effective_feature_level_two() {
+    let v2 = || ControlCommand::BucketSetLifecycleV2 {
+        bucket: "b".into(),
+        rules: vec![LifecycleRuleCmdV2 {
+            rule_id: Some("r".into()),
+            prefix: "p/".into(),
+            expire_days: -1,
+            expiration_days: None,
+            transition_days: None,
+            transition_class: None,
+            transition_tier: None,
+            enabled: true,
+            config_json: Some(r#"{"filter":{"prefix":"p/"}}"#.into()),
+        }],
+        updated_at: 1,
+    };
+
+    // level 1：写入被拒，且从未 apply（无 lifecycle 行）。
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, pool) = spawn_raft(dir.path(), 1).await;
+    assert_eq!(
+        handle.write(bucket_create("b", None)).await.unwrap(),
+        ControlResponse::Ok
+    );
+    match handle.write(v2()).await {
+        Err(oss_server::raft::WriteError::FeatureUnavailable {
+            required,
+            effective,
+        }) => assert_eq!((required, effective), (2, 1)),
+        other => panic!("level 1 must reject V2 before append, got {other:?}"),
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_rules WHERE bucket = 'b'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "rejected V2 must not reach apply");
+    handle.shutdown().await;
+
+    // level 2：接受、落盘 config_json，并在同一 apply 事务激活 marker=2。
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, pool) = spawn_raft(dir.path(), 2).await;
+    assert_eq!(
+        handle.write(bucket_create("b", None)).await.unwrap(),
+        ControlResponse::Ok
+    );
+    assert_eq!(handle.write(v2()).await.unwrap(), ControlResponse::Ok);
+    let config: Option<String> =
+        sqlx::query_scalar("SELECT config_json FROM lifecycle_rules WHERE bucket = 'b'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(config.as_deref(), Some(r#"{"filter":{"prefix":"p/"}}"#));
+    let marker: String =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(marker, "2");
     handle.shutdown().await;
 }
 

@@ -1173,6 +1173,11 @@ append/vote/snapshot/status/membership/write/join。
   `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md`：xl-store 259+1 ignored /
   xl-s3 136 / oss-server 140，S3 e2e 38 节；本批未重跑全量 M9 e2e。
   `tests/e2e_stretch.sh` ALL PASS；本次无前端改动，web test/build 沿用发布时结果。
+  **2026-10-23 Level B 热修**：`BucketSetLifecycleV2` 此前漏标 level 2（混合窗口会被
+  v1.13.1 副本解码失败，快照会静默丢结构化规则）；现已 `min_feature_level()=2`（写入门控
+  503 `feature_unavailable`），且快照编码器在 `lifecycle_rules.config_json` 非空时拒绝
+  OSSCTL1（fail-closed，待 OSSCTL2）。回归测试见 `crates/oss-server/tests/raft_commands.rs`
+  与 `crates/oss-server/src/raft/data.rs`。
 
 ### 模式矩阵
 
@@ -1409,16 +1414,24 @@ db_path = "/var/lib/oss/raft.db"
      `schema_meta.raft_feature_level=2`（只升不降）。之后回滚必须换回支持该级别的二进制；
      marker 高于配置或二进制上限时启动直接拒绝。**回滚只在激活前可行**：停集群、换回旧
      二进制、删除 `feature_level` 键（旧 `RaftToml` 拒绝未知键）、启动。
-   - **本版本限制**：发布二进制没有产品级 level-2 命令（仅进程内 `FeatureProbe` 测试覆盖），
-     因此写入 `feature_level=2` 不会产生 level-2 entry、也不会激活；激活路径留待首个
-     level-2 命令落地。`tests/e2e_m9_rolling.sh` 已提供但本批未实跑（缺 v1.13.1 旧二进制）。
+   - **level-2 命令（2026-10-23 热修）**：唯一的产品级 level-2 命令是
+     `BucketSetLifecycleV2`（含 filter/多 Transition/Date/Noncurrent 的结构化生命周期
+     规则）。`feature_level=1` 时这类写入在 append 前被拒绝（503
+     `{"error":"feature_unavailable","required":2,"effective":1}`）；旧列可表达的规则
+     仍走 V1、行为不变。首条结构化规则写入即激活 `schema_meta.raft_feature_level=2`
+     （不归点同下）。`tests/e2e_m9_rolling.sh` 已提供但本批未实跑（缺 v1.13.1 旧二进制）。
+   - **快照 fail-closed（OSSCTL2 之前）**：`lifecycle_rules.config_json` 非空时，控制快照
+     与 `raft-force-recover` 拒绝生成 OSSCTL1（`control data: level-2 data present;
+     refusing OSSCTL1`），避免 v1.13.1 安装时静默丢弃结构化规则（`raft-export` 仍可
+     导出，但恢复会被同一守卫拒绝）。含结构化规则的集群在 OSSCTL2 落地前无法用快照
+     跟随新成员/强制恢复/回退；需要这些操作时先删除结构化规则，或等待 OSSCTL2。
    - **窗口内禁止成员变更**：新 leader 在 add/promote/replace 前预检——现有 voter/learner
      任一 `wire<2`、目标未达标或不可达 → 409 `peer_incompatible`；不可达的旧节点只能被
      移除/替换。console 配对（`/sites`、`/join`）同样要求对端 identity 带 wire 2 且
      feature 不低于本机（旧节点缺省 = 1 → 409）。
    - **不在 Level B 范围内**：M3/M4 数据面（分片 RPC/EC/放置）、TLS 物料、从 < v1.13.1
-     跨大版本、Level C 双向混合写、快照 OSSCTL2（本版本无复制结构变更，快照仍为
-     OSSCTL1）。
+     跨大版本、Level C 双向混合写、快照 OSSCTL2（仍为 OSSCTL1；含 level-2 生命周期
+     数据时编码器 fail-closed 拒绝，见上）。
    - 全流程演练：`tests/e2e_m9_rolling.sh`（需 `OSS_OLD_BIN` = v1.13.1；未提供时 SKIP）。
 
 ### 部署与安全边界
