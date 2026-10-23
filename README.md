@@ -884,7 +884,8 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
   SourceIp 对端来自连接地址；ecat 内置 listener 无 connect_info，反代部署须显式设置
   `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` **最右一跳**（左侧客户端可伪造；反代须
-  **覆盖**而非透传客户端自带的 XFF），重复 XFF 头行 → 视为无对端。**IP 条件无法求值（默认不信任
+  **覆盖**而非透传客户端自带的 XFF；仅单层反代成立，多层反代须在最近一跳覆盖并只信任该层），
+  重复 XFF 头行 → 视为无对端。**IP 条件无法求值（默认不信任
   且无对端）时：Deny 语句命中（fail-closed），Allow 语句不命中**——缺对端绝不会静默放过
   `Deny NotIpAddress`。
 - 支持：Get/Head/Put/DeleteObject、DeleteObjects、ListObjectsV2、ListObjectVersions、MPU

@@ -727,6 +727,7 @@ impl AppState {
 
     /// `load` 预建 AP 缓存与清理实现（控制面写要在 `Store::open` 前注入），
     /// tests 走 [`AppState::new`] 同一装配语义（`None` = Local 门面）。
+    #[allow(clippy::too_many_arguments)] // 装配函数参数即依赖面，拆 struct 只会增加噪音
     async fn new_with(
         cfg: AppConfig,
         db: Arc<Db>,

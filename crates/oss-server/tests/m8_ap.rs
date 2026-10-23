@@ -1053,6 +1053,19 @@ async fn object_ops_through_ap() {
         r.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(),
         "5"
     );
+    // s3s HeadObject 也接受 response-* 覆盖参数，AP 的严格 allowlist 不能误拒。
+    let r = signed(
+        &e,
+        Method::HEAD,
+        "/ap/ops-ap/dir/hello.txt?response-content-type=text%2Fplain",
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
 
     let r = signed(
         &e,

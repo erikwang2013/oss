@@ -784,7 +784,8 @@ fn derive_op(
             }
         },
         Method::HEAD => match key {
-            Some(_) => pick(only(&["versionId", "partNumber", "x-id"]), "HeadObject"),
+            // 与 GET 同形：s3s 的 HeadObject 也解析 response-* 覆盖参数。
+            Some(_) => pick(only(GET_OBJECT_QUERY), "HeadObject"),
             None => pick(only(&["x-id"]), "HeadBucket"),
         },
         Method::PUT => match key {

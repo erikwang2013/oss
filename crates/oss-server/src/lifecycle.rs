@@ -340,12 +340,11 @@ async fn expire_eodm(
         };
         for e in &page.entries {
             if last_key.as_deref() != Some(e.key.as_str()) {
-                if let Some(k) = last_key.take() {
-                    if let Some(m) =
+                if let Some(k) = last_key.take()
+                    && let Some(m) =
                         eodm_group(state, bucket, spec, &k, &group, mode, progress).await
-                    {
-                        return Some(m);
-                    }
+                {
+                    return Some(m);
                 }
                 last_key = Some(e.key.clone());
                 group.clear();
@@ -415,9 +414,7 @@ async fn expire_noncurrent(
     now: i64,
     progress: &mut Progress,
 ) -> Option<String> {
-    let Some(nc) = spec.noncurrent_expiration.as_ref() else {
-        return None;
-    };
+    let nc = spec.noncurrent_expiration.as_ref()?;
     let mut last_key: Option<String> = None;
     let mut group: Vec<VersionEntry> = Vec::new();
     let mut key_marker: Option<String> = None;
@@ -445,13 +442,12 @@ async fn expire_noncurrent(
         };
         for e in &page.entries {
             if last_key.as_deref() != Some(e.key.as_str()) {
-                if let Some(k) = last_key.take() {
-                    if let Some(m) =
+                if let Some(k) = last_key.take()
+                    && let Some(m) =
                         noncurrent_group(state, bucket, spec, nc, &k, &group, mode, now, progress)
                             .await
-                    {
-                        return Some(m);
-                    }
+                {
+                    return Some(m);
                 }
                 last_key = Some(e.key.clone());
                 group.clear();
