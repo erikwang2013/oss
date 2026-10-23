@@ -635,8 +635,10 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 > **落地状态（2026-10-23 更新）**：S1 AP 与 S2 Object Lambda 已落地（HTTP 变换器默认、
 > WASM `olap-wasm` feature 门控）；AP 支持 `<name>-s3alias`（路径首段与 Host 首标签）、
-> DeleteObjects 逐键策略、`IpAddress`/`NotIpAddress` SourceIp 条件与匿名（AP 策略
-> `Principal:"*"` ∩ 桶策略匿名基线）。跨账号 AP 与写变换仍不做。
+> DeleteObjects 逐键策略、`IpAddress`/`NotIpAddress` SourceIp 条件、`StringEquals`
+> `aws:SourceVpc` 来源证明、账户命名空间 v1（账户 = 用户，ARN/Principal 形态）、
+> TTL/负缓存，以及匿名（AP 策略 `Principal:"*"` ∩ 桶策略匿名基线）。真 VPC 端点
+> （PrivateLink）、完整多用户账户模型与写变换仍不做。
 
 ### 13.1 Access Points
 
@@ -655,7 +657,26 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 **控制台 API**：`GET/POST /api/v1/access-points`、`GET/DELETE /api/v1/access-points/{name}`、`PUT .../{name}/policy`
 
-**边界**：不做 VPC endpoint、跨账号访问点。SourceIp 条件基于连接地址；反代部署需显式
+**账户命名空间 v1（2026-10-23）**：AP ARN 的账户段 = **桶主**的 12 位 uid 派生账户
+（admin/无主桶 = 系统账户 `000000000000`）；旧 ARN 账户段保留一版作资源别名。
+`Principal.AWS` 支持 `arn:aws:iam::<12位账户>:root`（同 uid 匹配；LEGACY 主体永不命中；
+`user/<name>` 形态不支持）。**账户 = 用户，不是租户隔离**：无账户管理员/账户内共享/配额，
+既有权限与桶策略语义不变。升级注意：此前被静默忽略的 ARN 主体开始生效（Allow 增权、
+Deny 开始拒绝），旧策略需复查。
+
+**来源 VPC（`StringEquals`）**：`aws:SourceVpc` 是**来源证明**而非 PrivateLink 端点身份。
+`OSS_AP_VPC_ID` 非空 = 进程级静态证明（头不采信）；否则仅 `OSS_AP_TRUSTED_PROXY=1` 时
+采信恰好一条 `x-oss-source-vpc`（`vpc-`/`vpce-` + [a-z0-9-]{1,64}，重复/畸形 → 无证明）。
+条件无法求值时 Deny 命中、Allow 不命中（fail-closed）。
+
+**缓存**：进程本地正缓存 + 未知 AP 负缓存，`OSS_AP_CACHE_TTL_SECS`（默认 30）、
+`OSS_AP_NEGATIVE_CACHE_TTL_SECS`（默认 5）、`OSS_AP_CACHE_MAX_ENTRIES`（默认 10000）；
+非法值启动失败。控制面写/Raft 副作用即时失效；跨节点读己之写受 apply 延迟影响，
+强一致性 non-goal。含 `s3:CreateBucket`/`s3:DeleteBucket`/`s3:ListAllMyBuckets` 精确
+动作的 AP 策略保存/加载即拒（此前接受但不生效）。
+
+**边界**：不做真 VPC 端点（PrivateLink/ENI）、完整多用户账户模型与强跨节点 AP 缓存一致性；
+跨账号仅账户命名空间 v1（既有授权 ∩ AP 策略）。SourceIp 条件基于连接地址；反代部署需显式
 `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For`：`OSS_AP_TRUSTED_PROXY_HOPS`（默认 1 =
 最右一跳，向后兼容）或 `OSS_AP_TRUSTED_PROXY_CIDRS`（从右向左跳过可信代理取首个非可信
 地址）。仅单行 XFF、每项须为合法 IP；重复 IP/重复头行/任一格式非法 → 视为无对端。

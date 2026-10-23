@@ -927,6 +927,11 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
 - 鉴权 = 身份/表三档/桶策略/会话策略 **∩** AP 策略（显式 Deny 优先；AP 有策略但无匹配 → 拒）。
   **升级注意（L3，破坏性）**：AP **无策略 = 默认拒绝**（AWS 对齐；升级前为「不额外限制」），
   建 AP 后须显式下发策略，否则该 AP 所有请求 403。
+  **升级注意（账户命名空间 v1）**：此前被静默忽略的 `Principal.AWS:
+  "arn:aws:iam::<12位>:root"` 在桶策略/AP 策略中**开始生效**——Allow 会新增授权，Deny 会
+  开始拒绝（可能影响既有访问）。升级前请复查已保存策略中的 ARN 主体。另：含
+  `s3:CreateBucket` / `s3:DeleteBucket` / `s3:ListAllMyBuckets` 精确动作的旧 AP 策略在
+  保存/加载时会被拒绝（运行期加载失败 500，fail-closed），请移除这些动作或改用通配。
   匿名（无凭据）经 AP 另需**两道门同时放行**：AP 策略显式 Allow `Principal:"*"`（Deny 优先，
   `*` 只匹配匿名、不复用 AK 规则）**且**桶策略匿名基线放行；交集语义，AP 绝不放宽桶策略。
   匿名仅限数据面白名单（见「桶策略与审计」），控制面/桶级动作/对象锁头一律 403，审计 uid=0。
@@ -939,8 +944,12 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   `Content-Type: multipart/form-data` 的 POST 一律拒（s3s 会将其解析为 PostObject，绕过查询）；
   重写请求后再次推导 op，不一致即 500 fail-closed。正常 Get/Put/Copy/List/MPU/DeleteObjects 不变。
 - AP 策略为严格子集：拒绝未知字段 / 未知条件运算符 / `NotAction` / `NotResource`；
-  `Condition` 仅 `IpAddress`/`NotIpAddress` + `aws:SourceIp`（IPv4/IPv6 CIDR，保存时校验）；
-  Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
+  `Condition` 支持 `IpAddress`/`NotIpAddress` + `aws:SourceIp`（IPv4/IPv6 CIDR）和
+  `StringEquals` + `aws:SourceVpc`（来源 VPC 证明），保存时校验；
+  Principal 仅 `*` / AK / `uid:<n>` / `arn:aws:iam::<12位账户>:root`；非法策略保存 400，
+  运行期加载失败 500（不当作无策略）。**保存时拒绝** AP 无法执行的桶级动作
+  `s3:CreateBucket` / `s3:DeleteBucket` / `s3:ListAllMyBuckets`（精确动作；`s3:*` 等通配
+  仍允许）——此前这些动作被接受但永远不生效。
   SourceIp 对端来自连接地址；ecat 内置 listener 无 connect_info，反代部署须显式设置
   `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For`。信任模型：`OSS_AP_TRUSTED_PROXY_HOPS`
   （默认 1 = 最右一跳，向后兼容）取右起第 N 跳；或 `OSS_AP_TRUSTED_PROXY_CIDRS`（逗号分隔
@@ -948,14 +957,32 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   IP/重复头行/任一项格式非法 → 视为无对端（fail-closed）。反代须**覆盖**而非透传客户端
   自带的 XFF。**IP 条件无法求值（默认不信任且无对端）时：Deny 语句命中（fail-closed），
   Allow 语句不命中**——缺对端绝不会静默放过 `Deny NotIpAddress`。
+- **`aws:SourceVpc` 是来源证明，不是 PrivateLink 端点身份**：设置 `OSS_AP_VPC_ID`
+  （`vpc-`/`vpce-` + [a-z0-9-]{1,64}）时作为进程级静态证明，请求头一律不采信；未设置时
+  仅当 `OSS_AP_TRUSTED_PROXY=1` 才采信**恰好一条** `x-oss-source-vpc` 头（重复/畸形/未
+  信任 → 无证明）。反代必须覆盖客户端自带的同名头。条件无法求值（无证明）时同 IP 条件：
+  Deny 命中、Allow 不命中（fail-closed）。
+- **账户命名空间 v1**：AP ARN 的账户段 = **桶主**的 12 位 uid 派生账户
+  （`arn:aws:s3:<region>:<account>:accesspoint/<name>/...`）；admin 所有/无主桶使用系统账户
+  `000000000000`。旧 AP ARN 的 `000000000000` 账户段保留一版作资源别名，已保存的旧策略
+  继续匹配。Principal 的 `arn:aws:iam::<account>:root` 对**同 uid** 生效；`000000000000`
+  主体永不匹配任何真实用户，`arn:...:user/<name>` 形态不支持。
+  **账户 = 用户，不是租户隔离**：没有账户管理员、账户内共享或配额；既有权限/桶策略语义
+  不变（此为命名空间/ARN 能力，跨账户 AP 仍需既有授权 ∩ AP 策略）。
+- **AP 缓存一致性（4.3/TTL）**：进程本地正缓存 + 未知 AP 负缓存，均可配置并有上限
+  （`OSS_AP_CACHE_TTL_SECS` 默认 30，`OSS_AP_NEGATIVE_CACHE_TTL_SECS` 默认 5，
+  `OSS_AP_CACHE_MAX_ENTRIES` 默认 10000；非法值启动失败）。控制面写/Raft 提交后副作用
+  即时失效；TTL 是兜底。**Raft 集群内跨节点读己之写仍受 apply 延迟影响（可能瞬时 404），
+  强跨节点一致性是 non-goal**；非 Raft 多节点的 AP 控制面本就是节点本地。
 - 支持：Get/Head/Put/DeleteObject、DeleteObjects、ListObjectsV2、ListObjectVersions、MPU
   Create/Complete/Abort/UploadPart/UploadPartCopy、CopyObject、Get/Put/DeleteObjectTagging、
   Get/PutObjectRetention、Get/PutObjectLegalHold、Get/PutBucketVersioning、HeadBucket、
   RestoreObject。桶生命周期配置、桶默认加密、Inventory 配置是控制面 / S3 桶级操作，
   **不经 AP**（`/ap/...` 上无对应形状，调用 501）。
-- 边界：不做跨账号/VPC 端点/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
-  checksum 不转发 trailing headers。AP 无策略 = 拒绝（AWS 对齐，L3 破坏性变更见上）；
-  匿名经 AP 需 AP + 桶策略双门（见上）。
+- 边界：跨账号仅为**账户命名空间 v1**（账户 = 用户，ARN/Principal 形态；非租户隔离、
+  无账户管理员）；不做真 VPC 端点（PrivateLink/ENI）与多节点强一致 AP 缓存；经 AP 的
+  aws-chunked 尾随 checksum 不转发 trailing headers。AP 无策略 = 拒绝（AWS 对齐，L3
+  破坏性变更见上）；匿名经 AP 需 AP + 桶策略双门（见上）。
 
 ### 存储类、分层与 Restore（S4a/S4b）
 
