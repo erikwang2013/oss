@@ -24,6 +24,7 @@ fn spec() -> LifecycleRuleSpec {
         transitions: vec![],
         noncurrent_expiration: None,
         noncurrent_transitions: vec![],
+        abort_mpu_days: None,
         enabled: true,
     }
 }
