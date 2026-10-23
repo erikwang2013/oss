@@ -38,6 +38,7 @@ fn material(
             client_cert: identity.as_ref().map(|(c, _)| c.clone()),
             client_key: identity.map(|(_, k)| k),
         }),
+        ..Default::default()
     })
     .unwrap()
 }

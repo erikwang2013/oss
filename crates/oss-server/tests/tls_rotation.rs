@@ -53,6 +53,7 @@ fn server_tls(dir: &std::path::Path, leaf: (&str, &str), client_ca: Option<&str>
             client_ca,
         }),
         client: None,
+        ..Default::default()
     })
     .unwrap()
 }
@@ -167,6 +168,7 @@ async fn outbound_ca_bundle_trusts_both_old_and_new_ca() {
                 client_cert: None,
                 client_key: None,
             }),
+            ..Default::default()
         })
         .unwrap()
     };

@@ -534,13 +534,24 @@ pub async fn run(
             // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
             crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db));
 
-            let ecat_tls = state.tls.ecat_server();
+            // TLS 主监听器走可热加载实现（每个新连接取配置快照）；明文路径保持
+            // ecat HttpServer 不变（无 [tls] 时行为与旧版一致）。
+            let tls = std::sync::Arc::clone(&state.tls);
+            let reload_secs = state.cfg.tls.reload_interval_secs.unwrap_or(30);
             let router = crate::router::build_router(state)?;
-            let mut server = ecat::transport_http::HttpServer::new(listen_bind).router(router);
-            if let Some(tls) = ecat_tls {
-                server = server.tls(tls);
-            }
-            let mut app = ecat::App::builder().name("oss").server(server).build()?;
+            let mut app = if tls.peer_tls() {
+                let server = crate::tls_server::ReloadableHttpServer::new(
+                    listen_bind,
+                    router,
+                    std::sync::Arc::clone(&tls),
+                );
+                ecat::App::builder().name("oss").server(server).build()?
+            } else {
+                let server = ecat::transport_http::HttpServer::new(listen_bind).router(router);
+                ecat::App::builder().name("oss").server(server).build()?
+            };
+            // SIGHUP 立即触发 + reload_interval_secs 轮询；无 TLS 物料时直接返回。
+            crate::tls_server::spawn_reload_watchers(tls, reload_secs);
             app.run().await?;
             Ok(0)
         }

@@ -44,6 +44,7 @@ fn certs_load_and_all_client_backends_build() {
             client_cert: None,
             client_key: None,
         }),
+        ..Default::default()
     };
     let tls = Tls::load(&cfg).unwrap();
     assert!(tls.peer_tls());

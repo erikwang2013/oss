@@ -30,4 +30,5 @@ pub mod tier_jobs;
 mod tier_sweep;
 pub mod tls;
 pub mod tls_config;
+pub mod tls_server;
 pub mod witness;

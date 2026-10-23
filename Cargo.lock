@@ -2677,6 +2677,7 @@ dependencies = [
  "csv",
  "ecat",
  "ecat-logging",
+ "ecat-metrics",
  "ecat-transport",
  "flate2",
  "futures",

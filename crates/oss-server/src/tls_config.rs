@@ -17,6 +17,10 @@ pub struct TlsToml {
     /// 出站信任：自定义 CA 与可选客户端身份（mTLS）；不开启任何服务端 TLS。
     #[serde(default)]
     pub client: Option<TlsClientToml>,
+    /// 物料热加载轮询间隔（秒）：默认 30；`0` = 关闭轮询、只响应 SIGHUP；最小 1。
+    /// 轮询按文件内容哈希去重，内容不变不重建。
+    #[serde(default)]
+    pub reload_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

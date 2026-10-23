@@ -31,6 +31,7 @@ fn server_tls(
             client_ca: client_ca.map(|p| p.to_path_buf()),
         }),
         client: None,
+        ..Default::default()
     };
     Tls::load(&cfg).unwrap()
 }
