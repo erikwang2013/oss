@@ -1883,3 +1883,37 @@ td {
     -webkit-backdrop-filter: none;
   }
 }
+
+/* 首页首屏：矮视口下压缩 hero，保证 hero + 数据条在一屏内 */
+@media (min-width: 860px) and (max-height: 820px) {
+  .hero {
+    padding: 26px 0 24px;
+  }
+
+  .hero-grid {
+    gap: 30px;
+  }
+
+  .hero-stage {
+    width: min(100%, calc(100svh - 230px));
+    min-height: 320px;
+    justify-self: end;
+  }
+
+  .hero-copy {
+    margin-top: 16px;
+    line-height: 1.6;
+  }
+
+  .hero-actions {
+    margin-top: 20px;
+  }
+
+  .hero-note {
+    margin-top: 14px;
+  }
+
+  h1 {
+    font-size: clamp(2.6rem, 5vw, 4.4rem);
+  }
+}
