@@ -136,6 +136,7 @@ impl Fx {
             self.st.acl(),
             Arc::clone(&self.restore) as Arc<dyn RestoreSink>,
             Arc::clone(&self.st.olap_cache),
+            Arc::clone(&self.st.events) as Arc<dyn xl_s3::events::EventSink>,
             BatchMutationHooks {
                 repl: Arc::clone(&self.repl) as Arc<dyn ReplicationSink>,
                 tier_gc: Arc::clone(&self.gc) as Arc<dyn TierGcSink>,
@@ -156,6 +157,48 @@ impl Fx {
     async fn run(&self, action: &str, p: &BatchActionPayload) -> Result<String, String> {
         let payload = serde_json::to_string(p).unwrap();
         self.exec().execute(action, &payload).await
+    }
+
+    /// 桶通知配置（SqlEventSink 直接读 `event_configs`，不经 S3 路由）。
+    async fn notify(&self, bucket: &str, events: &[&str]) {
+        let cfg = serde_json::json!([{
+            "id": format!("cfg-{bucket}"),
+            "target": format!("t-{bucket}"),
+            "events": events,
+            "prefix": null,
+            "suffix": null,
+        }]);
+        self.st
+            .acl()
+            .set_bucket_notification(bucket, &cfg.to_string())
+            .await
+            .unwrap();
+    }
+
+    async fn clear_outbox(&self) {
+        sqlx::query("DELETE FROM event_outbox")
+            .execute(self.db().pool())
+            .await
+            .unwrap();
+    }
+
+    /// outbox 行：(bucket, target, event JSON)，按写入序（worker 未启动，行不会被消费）。
+    async fn outbox(&self) -> Vec<(String, String, serde_json::Value)> {
+        use sqlx::Row as _;
+        let rows =
+            sqlx::query("SELECT bucket, target_id, event_json FROM event_outbox ORDER BY id")
+                .fetch_all(self.db().pool())
+                .await
+                .unwrap();
+        rows.iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("bucket"),
+                    r.get::<String, _>("target_id"),
+                    serde_json::from_str(r.get("event_json")).unwrap(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -1530,4 +1573,172 @@ async fn batch_delete_on_sync_bucket_refuses_without_remote() {
         f.store().head_object("src", "sync-del").await.is_ok(),
         "sync 删失败时本地对象必须原样"
     );
+}
+
+/// 每动作恰好一条桶通知：Copy→目标桶 CreatedCopy；Delete→RemovedDelete；Restore→RestorePost；
+/// ReplaceTags 无事件类型不发；事件来源标记为 `oss-batch`。
+#[tokio::test]
+async fn batch_actions_emit_bucket_notifications() {
+    let f = fx().await;
+    let all = [
+        "s3:ObjectCreated:Copy",
+        "s3:ObjectRemoved:Delete",
+        "s3:ObjectRestore:Post",
+    ];
+    f.notify("src", &all).await;
+    f.notify("dst", &all).await;
+
+    // Copy：只发目标桶，带新版本/大小/ETag。
+    f.put("src", "a", b"hello").await;
+    let mut cp = payload("src", "a", f.admin);
+    cp.target_bucket = Some("dst".into());
+    cp.target_prefix = Some("copies/".into());
+    assert_eq!(f.run(BATCH_COPY, &cp).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Copy 恰好一条事件");
+    assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("dst", "t-dst"));
+    let ev = &rows[0].2;
+    assert_eq!(ev["eventName"], "s3:ObjectCreated:Copy");
+    assert_eq!(ev["s3"]["bucket"]["name"], "dst");
+    assert_eq!(ev["s3"]["object"]["key"], "copies%2Fa");
+    assert_eq!(ev["s3"]["object"]["versionId"], "null");
+    assert_eq!(ev["s3"]["object"]["size"], 5);
+    let etag = f.store().head_object("dst", "copies/a").await.unwrap().etag;
+    assert_eq!(ev["s3"]["object"]["eTag"], etag.as_str());
+    assert_eq!(ev["source"]["host"], "internal");
+    assert_eq!(ev["source"]["userAgent"], "oss-batch");
+
+    // Delete（非版本桶）：RemovedDelete，无版本号。
+    f.clear_outbox().await;
+    let d = payload("dst", "copies/a", f.admin);
+    assert_eq!(f.run(BATCH_DELETE, &d).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Delete 恰好一条事件");
+    assert_eq!(rows[0].2["eventName"], "s3:ObjectRemoved:Delete");
+    assert_eq!(rows[0].2["s3"]["object"]["versionId"], "null");
+
+    // NotFound：未发生删除 → 不发（与在线 delete_object 一致）。
+    f.clear_outbox().await;
+    let missing = payload("src", "nope", f.admin);
+    assert_eq!(f.run(BATCH_DELETE, &missing).await.unwrap(), "Succeeded");
+    assert!(f.outbox().await.is_empty(), "空删不得发事件");
+
+    // ReplaceTags：S3 无标签事件类型 → 不发。
+    f.put("src", "tag", b"x").await;
+    f.clear_outbox().await;
+    let mut t = payload("src", "tag", f.admin);
+    t.tags = vec![ObjectTag {
+        key: "k".into(),
+        value: "1".into(),
+    }];
+    assert_eq!(f.run(BATCH_TAGS, &t).await.unwrap(), "Succeeded");
+    assert!(f.outbox().await.is_empty(), "ReplaceTags 不发桶通知");
+
+    // Restore：受理发 RestorePost；重复执行（Restoring）幂等且不重发。
+    f.put("src", "arch", b"cold-data").await;
+    let info = f.store().head_object("src", "arch").await.unwrap();
+    f.store()
+        .archive_version(
+            "src",
+            "arch",
+            info.version_id.as_deref().unwrap_or("null"),
+            ArchiveSpec {
+                backend: "cold".into(),
+                key: "tier-key".into(),
+                size: info.size,
+                source_etag: info.etag.clone(),
+                etag: "remote".into(),
+                sha256: "00".into(),
+                class: "GLACIER".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    f.clear_outbox().await;
+    let mut r = payload("src", "arch", f.admin);
+    r.restore_days = Some(1);
+    assert_eq!(f.run(BATCH_RESTORE, &r).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Restore 受理恰好一条事件");
+    assert_eq!(rows[0].2["eventName"], "s3:ObjectRestore:Post");
+    assert_eq!(rows[0].2["s3"]["bucket"]["name"], "src");
+    assert_eq!(rows[0].2["s3"]["object"]["versionId"], "null");
+    assert_eq!(f.run(BATCH_RESTORE, &r).await.unwrap(), "Succeeded");
+    assert_eq!(f.outbox().await.len(), 1, "已在恢复不重发 RestorePost");
+}
+
+/// 版本化桶：无版本删除 → DeleteMarkerCreated（带 marker 版本）；点名删版本 → Delete（带该版本）。
+#[tokio::test]
+async fn batch_delete_events_are_version_aware() {
+    let f = fx().await;
+    f.notify(
+        "src",
+        &[
+            "s3:ObjectRemoved:Delete",
+            "s3:ObjectRemoved:DeleteMarkerCreated",
+        ],
+    )
+    .await;
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'src'")
+        .execute(f.db().pool())
+        .await
+        .unwrap();
+
+    // 无版本号删除 → marker 事件（versionId 非 "null"）。
+    f.put("src", "marker", b"x").await;
+    let d = payload("src", "marker", f.admin);
+    assert_eq!(f.run(BATCH_DELETE, &d).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].2["eventName"],
+        "s3:ObjectRemoved:DeleteMarkerCreated"
+    );
+    let marker_vid = rows[0].2["s3"]["object"]["versionId"].as_str().unwrap();
+    assert_ne!(marker_vid, "null", "marker 事件必须带 marker 版本号");
+
+    // 点名删版本 → RemovedDelete，版本号原样回显。
+    f.clear_outbox().await;
+    f.put("src", "ver", b"y").await;
+    let vid = f
+        .store()
+        .head_object("src", "ver")
+        .await
+        .unwrap()
+        .version_id
+        .unwrap_or_else(|| "null".into());
+    let mut vd = payload("src", "ver", f.admin);
+    vd.version_id = Some(vid.clone());
+    assert_eq!(f.run(BATCH_DELETE, &vd).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].2["eventName"], "s3:ObjectRemoved:Delete");
+    assert_eq!(rows[0].2["s3"]["object"]["versionId"], vid.as_str());
+}
+
+/// 双桶双配置：事件只进对象所在桶的配置，不泄漏到作业创建者/其它桶。
+#[tokio::test]
+async fn batch_events_stay_in_object_bucket() {
+    let f = fx().await;
+    for b in ["src", "dst"] {
+        f.notify(b, &["s3:ObjectCreated:Copy", "s3:ObjectRemoved:Delete"])
+            .await;
+    }
+    f.put("src", "x", b"data").await;
+    let mut cp = payload("src", "x", f.admin);
+    cp.target_bucket = Some("dst".into());
+    assert_eq!(f.run(BATCH_COPY, &cp).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Copy 只对目标桶发");
+    assert_eq!(rows[0].0, "dst");
+    assert_eq!(rows[0].2["s3"]["bucket"]["name"], "dst");
+
+    f.clear_outbox().await;
+    let d = payload("src", "x", f.admin);
+    assert_eq!(f.run(BATCH_DELETE, &d).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Delete 只对对象桶发");
+    assert_eq!(rows[0].0, "src");
+    assert_eq!(rows[0].2["s3"]["bucket"]["name"], "src");
 }
