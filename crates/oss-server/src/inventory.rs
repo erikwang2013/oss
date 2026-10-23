@@ -178,6 +178,21 @@ pub fn spawn_worker(db: Arc<Db>) {
     });
 }
 
+/// 3.6：增量扫描参数。`previous` = 上轮成功扫描开始时刻（nanos，None = 首轮全量）；
+/// `cursor` = 本轮扫描开始时刻，成功后作为新水位。仅输出 `last_modified >= previous`。
+#[derive(Clone, Copy)]
+struct Incremental {
+    previous: Option<i64>,
+    cursor: i64,
+}
+
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 /// 生成器（`TaskExecutor` 的 `Inventory` 动作）。
 pub struct InventoryRunner {
     db: Arc<Db>,
@@ -285,9 +300,11 @@ impl InventoryRunner {
         let data_key = format!("{base}/data/{}.{ext}", uuid::Uuid::new_v4());
         let manifest_key = format!("{base}/manifest.json");
         // Hive 兼容清单与数据/清单同目录树，供 Athena SymlinkTextInputFormat 读取。
+        // 4.9：分区取 run 行的 created_at（入队时刻），任务重试跨分钟也不会写出
+        // 第二个 dt= 分区（run_key 不变，重试命中同一 run 行，分区必须稳定）。
         let hive_key = format!(
             "{base}/hive/dt={}/symlink.txt",
-            hive_partition(crate::db::now())
+            hive_partition(run.created_at)
         );
         // I4：运行期以**实际键**复核 PutObject（融合桶策略，显式 Deny 优先）。
         for key in [&data_key, &manifest_key, &hive_key] {
@@ -314,6 +331,43 @@ impl InventoryRunner {
             let msg = format!("目标桶不存在：{dest}");
             return Err(self.fail(run.id, run.job_id, msg).await);
         }
+        // 3.6：增量模式 per config（默认全量）。水位是「上次扫描开始时刻」：
+        // 本轮输出 last_modified >= 水位 的对象/版本，扫描开始时刻作为新水位。
+        // 增量清单是**非 AWS 扩展**：无版本控制桶的删除无法表现为条目（没有墓碑）。
+        let incremental = self
+            .db
+            .inventory_incremental_get(&p.bucket, &p.config_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let prev_mark = if incremental {
+            match self
+                .db
+                .inventory_cursor_get(&p.bucket, &p.config_id, cfg_row.updated_at)
+                .await
+            {
+                Ok(Some(raw)) => match raw.parse::<i64>() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        // 坏水位退回全量（只会多写、不会漏写），成功后被新水位覆盖。
+                        tracing::warn!(bucket = %p.bucket, config = %p.config_id, error = %e,
+                            "inventory：增量水位损坏，本轮按全量扫描");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    let msg = format!("增量水位读取失败: {e}");
+                    return Err(self.fail(run.id, run.job_id, msg).await);
+                }
+            }
+        } else {
+            None
+        };
+        // 水位必须在开始列举前取：扫描期间及之后的新写会 > 水位，留给下一轮。
+        let inc = incremental.then_some(Incremental {
+            previous: prev_mark,
+            cursor: now_nanos(),
+        });
         let tmp = self.staging_dir.join(format!(
             "inventory-{}-{}.tmp",
             p.config_id,
@@ -330,6 +384,7 @@ impl InventoryRunner {
                 &hive_key,
                 &tmp,
                 run.job_id,
+                inc,
                 &mut scanned,
             )
             .await;
@@ -341,6 +396,26 @@ impl InventoryRunner {
         }
         match result {
             Ok(()) => {
+                // 数据与 manifest 已写成功才推进水位；失败则本节报错（下轮重扫，重复不丢）。
+                if let Some(inc) = inc
+                    && let Err(e) = self
+                        .db
+                        .inventory_cursor_set(
+                            &p.bucket,
+                            &p.config_id,
+                            cfg_row.updated_at,
+                            Some(&inc.cursor.to_string()),
+                            now,
+                        )
+                        .await
+                {
+                    let msg = format!("增量水位写入失败: {e}");
+                    let _ = self
+                        .db
+                        .inventory_run_finish(run.id, "error", Some(&manifest_key), Some(&msg))
+                        .await;
+                    return Err(msg);
+                }
                 self.db
                     .inventory_run_finish(run.id, "done", Some(&manifest_key), None)
                     .await
@@ -368,12 +443,14 @@ impl InventoryRunner {
         hive_key: &str,
         tmp: &Path,
         job_id: Option<i64>,
+        inc: Option<Incremental>,
         scanned: &mut i64,
     ) -> Result<(), String> {
         let columns = csv_columns(cfg);
         let parquet =
             cfg.destination.s3_bucket_destination.format.as_str() == InventoryFormat::PARQUET;
         let filter = filter_prefix(cfg).to_string();
+        let since = inc.and_then(|i| i.previous);
         let size = Arc::new(AtomicU64::new(0));
         let mut sink = DataSink::new(tmp, &columns, parquet, Arc::clone(&size))?;
         if includes_all_versions(cfg) {
@@ -384,12 +461,21 @@ impl InventoryRunner {
                 &mut sink,
                 &size,
                 job_id,
+                since,
                 scanned,
             )
             .await?;
         } else {
-            self.scan_current(source_bucket, &filter, &mut sink, &size, job_id, scanned)
-                .await?;
+            self.scan_current(
+                source_bucket,
+                &filter,
+                &mut sink,
+                &size,
+                job_id,
+                since,
+                scanned,
+            )
+            .await?;
         }
         let (md5, file_size) = sink.finish()?;
         if file_size > MAX_FILE_BYTES {
@@ -467,7 +553,7 @@ impl InventoryRunner {
         } else {
             columns.join(",")
         };
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "sourceBucket": source_bucket,
             "destinationBucket": dest,
             "version": "2016-11-30",
@@ -476,6 +562,14 @@ impl InventoryRunner {
             "fileSchema": file_schema,
             "files": [{"key": data_key, "size": file_size, "md5Checksum": md5}],
         });
+        // 3.6：manifest 必须记录本轮增量游标（上轮水位 + 新水位），便于核对清单覆盖区间。
+        if let Some(inc) = inc {
+            manifest["incremental"] = serde_json::json!({
+                "enabled": true,
+                "previousCursor": inc.previous.map(|v| v.to_string()),
+                "cursor": inc.cursor.to_string(),
+            });
+        }
         let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
         // manifest 改走 stream+meta 入口以携带与 data 文件相同的默认加密。
         self.store
@@ -506,6 +600,7 @@ impl InventoryRunner {
         sink: &mut DataSink,
         size: &AtomicU64,
         job_id: Option<i64>,
+        since: Option<i64>,
         scanned: &mut i64,
     ) -> Result<(), String> {
         let mut token: Option<String> = None;
@@ -524,6 +619,12 @@ impl InventoryRunner {
                 .await
                 .map_err(|e| e.to_string())?;
             for info in &page.objects {
+                // 时间未知（0）不在增量里静默丢弃：宁可多写一条。
+                if since
+                    .is_some_and(|m| info.last_modified_nanos > 0 && info.last_modified_nanos < m)
+                {
+                    continue;
+                }
                 sink.write(&current_fields(bucket, info))?;
             }
             *scanned += page.objects.len() as i64;
@@ -551,6 +652,7 @@ impl InventoryRunner {
         sink: &mut DataSink,
         size: &AtomicU64,
         job_id: Option<i64>,
+        since: Option<i64>,
         scanned: &mut i64,
     ) -> Result<(), String> {
         let need_head = columns.iter().any(|c| {
@@ -578,6 +680,10 @@ impl InventoryRunner {
                 .await
                 .map_err(|e| e.to_string())?;
             for e in &page.entries {
+                // 时间未知（0）不在增量里静默丢弃：宁可多写一条。
+                if since.is_some_and(|m| e.mod_time_nanos > 0 && e.mod_time_nanos < m) {
+                    continue;
+                }
                 // 不足字段按需 head（成本：每个版本一次 meta 读；仅在请求了这些列时发生）。
                 let head = if need_head && !e.is_marker {
                     self.store

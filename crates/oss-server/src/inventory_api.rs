@@ -44,6 +44,9 @@ struct ConfigBody {
     included_object_versions: String,
     #[serde(default)]
     optional_fields: Vec<String>,
+    /// 3.6：增量模式（非 S3 标准；默认 false = 全量快照）。
+    #[serde(default)]
+    incremental: bool,
 }
 
 fn yes() -> bool {
@@ -103,10 +106,11 @@ struct ConfigView {
     filter_prefix: Option<String>,
     included_object_versions: String,
     optional_fields: Vec<String>,
+    incremental: bool,
 }
 
-impl From<&InventoryConfiguration> for ConfigView {
-    fn from(c: &InventoryConfiguration) -> Self {
+impl ConfigView {
+    fn new(c: &InventoryConfiguration, incremental: bool) -> Self {
         let d = &c.destination.s3_bucket_destination;
         Self {
             id: c.id.clone(),
@@ -123,6 +127,7 @@ impl From<&InventoryConfiguration> for ConfigView {
                 .flatten()
                 .map(|f| f.as_str().to_string())
                 .collect(),
+            incremental,
         }
     }
 }
@@ -152,7 +157,18 @@ async fn list(
         return r;
     }
     match state.inventory.list_configs(&bucket).await {
-        Ok(list) => Json(list.iter().map(ConfigView::from).collect::<Vec<_>>()).into_response(),
+        Ok(list) => {
+            let mut views = Vec::with_capacity(list.len());
+            for c in &list {
+                let incremental = state
+                    .db
+                    .inventory_incremental_get(&bucket, &c.id)
+                    .await
+                    .unwrap_or(false);
+                views.push(ConfigView::new(c, incremental));
+            }
+            Json(views).into_response()
+        }
         Err(e) => err(e),
     }
 }
@@ -175,12 +191,27 @@ async fn upsert(
         is_admin,
         ak: String::new(),
     };
+    let incremental = body.incremental;
+    let id = body.id.clone();
     match state
         .inventory
         .put_config(&bucket, &owner, &body.into_config())
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // put_config 会复位增量模式；console 请求随后按请求值重新开启。
+            match state
+                .db
+                .inventory_incremental_set(&bucket, &id, incremental, crate::db::now())
+                .await
+            {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, "inventory 增量模式写入失败");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+                }
+            }
+        }
         Err(e) => err(e),
     }
 }
