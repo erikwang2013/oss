@@ -223,7 +223,10 @@ async fn restore_accepted(req: Request, next: Next) -> Response {
 }
 
 /// 多区间 Range（`bytes=0-1,3-4`）在 s3s 0.17 解析层直接 400；冻结裁决不做
-/// multipart/byteranges —— S3 面剥离该头，GET/HEAD 降级整对象 200。单区间原样透传。
+/// multipart/byteranges —— 未签名的 S3 面剥离该头，GET/HEAD 降级整对象 200。
+/// **Range 已计入 SigV4 SignedHeaders 时不得剥离**：剥离会让验签失败（403
+/// SignatureDoesNotMatch）；保留则验签通过、反序列化按 s3s 语义返回确定性
+/// 400 InvalidArgument。单区间原样透传。
 async fn strip_multirange(mut req: Request, next: Next) -> Response {
     let multi = matches!(*req.method(), Method::GET | Method::HEAD)
         && req
@@ -231,10 +234,35 @@ async fn strip_multirange(mut req: Request, next: Next) -> Response {
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains(','));
-    if multi {
+    if multi && !range_is_signed(req.headers(), req.uri()) {
         req.headers_mut().remove(header::RANGE);
     }
     next.run(req).await
+}
+
+/// Range 是否出现在 SigV4 SignedHeaders（Authorization 头或预签名查询）。
+fn range_is_signed(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> bool {
+    let has_range = |list: &str| {
+        list.split(';')
+            .any(|h| h.trim().eq_ignore_ascii_case("range"))
+    };
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some((_, rest)) = auth.split_once("SignedHeaders=")
+        && has_range(rest.split(',').next().unwrap_or(""))
+    {
+        return true;
+    }
+    uri.query().is_some_and(|q| {
+        q.split('&').any(|kv| {
+            let Some((k, v)) = kv.split_once('=') else {
+                return false;
+            };
+            k.eq_ignore_ascii_case("X-Amz-SignedHeaders")
+                && has_range(&v.replace("%3B", ";").replace("%3b", ";"))
+        })
+    })
 }
 
 /// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
@@ -684,6 +712,48 @@ mod tests {
             "bytes=0-1,3-4",
             "非 GET/HEAD 不剥离"
         );
+
+        // 已签名的 Range：保留（剥离会 403 签名失配；保留后 s3s 返回确定性 400）
+        let auth_range = "AWS4-HMAC-SHA256 Credential=AKIA/20261023/us-east-1/s3/aws4_request, \
+                          SignedHeaders=host;range;x-amz-date, Signature=00";
+        let res = http
+            .get(format!("http://{addr}/b/k"))
+            .header(axum::http::header::AUTHORIZATION, auth_range)
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "bytes=0-1,3-4");
+        // 签名未含 Range → 仍剥离
+        let auth_no_range = "AWS4-HMAC-SHA256 Credential=AKIA/20261023/us-east-1/s3/aws4_request, \
+                             SignedHeaders=host;x-amz-date, Signature=00";
+        let res = http
+            .get(format!("http://{addr}/b/k"))
+            .header(axum::http::header::AUTHORIZATION, auth_no_range)
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "");
+        // 预签名 URL 的 X-Amz-SignedHeaders（%3B 编码）同样参与判定
+        let res = http
+            .get(format!(
+                "http://{addr}/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host%3Brange"
+            ))
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "bytes=0-1,3-4");
+        let res = http
+            .get(format!(
+                "http://{addr}/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host"
+            ))
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "");
     }
 
     /// 标签值转义：坏配置（node id 带引号/反斜杠/换行）不得产出坏样本行。
