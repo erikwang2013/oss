@@ -526,6 +526,9 @@ Principal 的 ARN 形态 / **匿名（无凭据）放行**——`Principal:"*"` 
 （仅管理员；limit 默认 100、钳 1..=1000；`decision` 只认 allow/deny，其它值视为不过滤，最新在前）。
 `tests/e2e_s3.sh` 第 17 节实弹覆盖（Deny 优先 / 校验 400 / 审计查询 / 清策略恢复 / 删桶清策略 /
 批量删逐键授权）。
+**匿名拒绝限流（M1）**：匿名**允许**判定照常全量落行；匿名**拒绝**经进程级令牌桶限流
+（突发 20、每秒补 5），洪水期丢弃不写（每累计 1000 条 warn 一次），防止未认证流量无界撑大
+`audit_log`。匿名请求携带对象锁/治理旁路头一律 403（见「对象锁」）。
 
 ## 多 set（M4）
 
@@ -635,6 +638,10 @@ delete marker（锁定版本天然留存）；生命周期删除同理。
 Legal Hold 开关 API：`put/get-object-legal-hold`（`put` 须点名版本且**桶已开锁**，否则 400；
 `get` 为元数据面读——SSE-C 对象不要求客户钥）。
 响应面：GET / HEAD 回 `x-amz-object-lock-mode` / `-retain-until-date` / `-legal-hold`。
+**策略动作**：`Get/PutObjectLegalHold` 映射 `s3:GetObjectLegalHold` / `s3:PutObjectLegalHold`
+（独立于 `s3:GetObject`/`s3:PutObject`；AP 策略须显式授予）。**匿名边界**：无凭据请求携带任一
+对象锁头（`x-amz-object-lock-mode` / `-retain-until-date` / `-legal-hold`）或
+`x-amz-bypass-governance-retention` 一律 403——匿名策略没有可表达的锁动作，fail-closed。
 
 **保留期**：`Put/GetObjectRetention` 已接线（`versionId` 必填；COMPLIANCE 不可缩短/清除，
 GOVERNANCE 缩短/清除须 `x-amz-bypass-governance-retention`）；控制台对象列表展示 retention / legal-hold 状态。
@@ -861,20 +868,33 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
 - 路由：路径式 `/ap/<name>/<key>`；别名 `<name>-s3alias` 同时支持路径首段与
   Host 首标签（`<name>-s3alias.<endpoint>`）；未知别名 404，不回落桶路由。
   标准 SigV4 签名照常覆盖原始 path/host。桶名保留 `-s3alias` 后缀（建桶即拒）。
+  **升级注意（L4）**：M8 之前创建的 `*-s3alias` 结尾的旧桶会被别名路由遮蔽（路径首段 /
+  Host 首标签被当作 AP 别名 → 404），升级前请改名，勿再经原桶名访问。
 - 鉴权 = 身份/表三档/桶策略/会话策略 **∩** AP 策略（显式 Deny 优先；AP 有策略但无匹配 → 拒）；
   CopyObject 目标轴按 `s3:PutObject`；审计合并为一条。`DeleteObjects` 逐键叠 AP 策略
   （被拒键 `<Error>AccessDenied`，其余键照删；请求体上限 1 MiB / 1000 键）。
+  对象动作只匹配对象 ARN（`arn:aws:s3:::<bucket>/<key>` 与 AP object ARN），桶 ARN 只参与
+  桶级动作（与 `policy.rs` 同口径，L2）。
+- **授权 op = 执行 op（H1）**：`derive_op` 对查询子资源走严格白名单（未知/多子资源 → 501），
+  含 `?legal-hold` → `Get/PutObjectLegalHold`；`x-id` 必须与推导 op 一致（重复/不一致 → 400）；
+  `Content-Type: multipart/form-data` 的 POST 一律拒（s3s 会将其解析为 PostObject，绕过查询）；
+  重写请求后再次推导 op，不一致即 500 fail-closed。正常 Get/Put/Copy/List/MPU/DeleteObjects 不变。
 - AP 策略为严格子集：拒绝未知字段 / 未知条件运算符 / `NotAction` / `NotResource`；
   `Condition` 仅 `IpAddress`/`NotIpAddress` + `aws:SourceIp`（IPv4/IPv6 CIDR，保存时校验）；
   Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
   SourceIp 对端来自连接地址；ecat 内置 listener 无 connect_info，反代部署须显式设置
-  `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` 首段（默认不信任，无对端时条件不匹配）。
+  `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` **最右一跳**（左侧客户端可伪造；反代须
+  **覆盖**而非透传客户端自带的 XFF），重复 XFF 头行 → 视为无对端。**IP 条件无法求值（默认不信任
+  且无对端）时：Deny 语句命中（fail-closed），Allow 语句不命中**——缺对端绝不会静默放过
+  `Deny NotIpAddress`。
 - 支持：Get/Head/Put/DeleteObject、DeleteObjects、ListObjectsV2、ListObjectVersions、MPU
   Create/Complete/Abort/UploadPart/UploadPartCopy、CopyObject、Get/Put/DeleteObjectTagging、
-  Get/PutBucketVersioning、HeadBucket、RestoreObject。桶生命周期配置、桶默认加密、
-  Inventory 配置是控制面 / S3 桶级操作，**不经 AP**（`/ap/...` 上无对应形状，调用 501）。
+  Get/PutObjectRetention、Get/PutObjectLegalHold、Get/PutBucketVersioning、HeadBucket、
+  RestoreObject。桶生命周期配置、桶默认加密、Inventory 配置是控制面 / S3 桶级操作，
+  **不经 AP**（`/ap/...` 上无对应形状，调用 501）。
 - 边界：不做匿名/跨账号/VPC 端点/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
-  checksum 不转发 trailing headers。
+  checksum 不转发 trailing headers。**AP 无策略 = 不额外限制**（身份/桶策略仍生效），
+  与 AWS「访问点无策略即拒绝」不同（L3，记档不改变行为）。
 
 ### 存储类、分层与 Restore（S4a/S4b）
 
@@ -1051,7 +1071,8 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 1. 控制面单节点：AP 缓存、作业引擎、Inventory 调度、tier reaper 均按单进程；多节点共享
    SQLite 不支持，强一致归 M9。
 2. AP 支持 `/ap/<name>` 与 `<name>-s3alias`（路径/Host）；无匿名/跨账号/VPC 端点；不支持
-   ListBuckets/Create/DeleteBucket。
+   ListBuckets/Create/DeleteBucket。**AP 无策略 = 不额外限制**（与 AWS 默认拒绝不同，L3）；
+   旧 `*-s3alias` 桶会被别名路由遮蔽，升级前须改名（L4，见访问点节）。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
 4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
    动作不发桶通知但发复制/清 tier。

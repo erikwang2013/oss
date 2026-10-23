@@ -98,6 +98,8 @@ pub fn s3_action(op: &str) -> Option<&'static str> {
         | "ListParts" => "s3:ListBucket",
         "GetObjectRetention" => "s3:GetObjectRetention",
         "PutObjectRetention" => "s3:PutObjectRetention",
+        "GetObjectLegalHold" => "s3:GetObjectLegalHold",
+        "PutObjectLegalHold" => "s3:PutObjectLegalHold",
         "GetBucketVersioning" => "s3:GetBucketVersioning",
         "PutBucketVersioning" => "s3:PutBucketVersioning",
         "GetBucketLifecycleConfiguration" => "s3:GetLifecycleConfiguration",
@@ -446,6 +448,15 @@ mod tests {
         assert_eq!(
             s3_action("PutObjectRetention"),
             Some("s3:PutObjectRetention")
+        );
+        // H1：法定保留独立动作，绝不复用 Put/GetObject
+        assert_eq!(
+            s3_action("GetObjectLegalHold"),
+            Some("s3:GetObjectLegalHold")
+        );
+        assert_eq!(
+            s3_action("PutObjectLegalHold"),
+            Some("s3:PutObjectLegalHold")
         );
         assert_eq!(s3_action("CopyObject"), None);
         assert_eq!(s3_action("Frobnicate"), None);

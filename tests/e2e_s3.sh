@@ -589,6 +589,18 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/anon-
   "$ENDPOINT/$ANON_BUCKET/pub/up.txt")
 [ "$CODE" = "200" ] || { echo "匿名 PUT 应 200，实际 $CODE"; exit 1; }
 curl -s "$ENDPOINT/$ANON_BUCKET/pub/up.txt" | cmp - "$WORK/anon-put.txt" || { echo "匿名 PUT 往返不符"; exit 1; }
+# L1：匿名不得携带对象锁/治理旁路头（策略虽 Allow PutObject；fail-closed）
+for h in "x-amz-object-lock-mode: GOVERNANCE" \
+         "x-amz-object-lock-retain-until-date: 2030-01-01T00:00:00Z" \
+         "x-amz-object-lock-legal-hold: ON" \
+         "x-amz-bypass-governance-retention: true"; do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$h" --data-binary @"$WORK/anon-put.txt" \
+    "$ENDPOINT/$ANON_BUCKET/pub/lock.txt")
+  [ "$CODE" = "403" ] || { echo "匿名 PUT 带 $h 应 403，实际 $CODE"; exit 1; }
+done
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H 'x-amz-bypass-governance-retention: true' \
+  "$ENDPOINT/$ANON_BUCKET/pub/up.txt")
+[ "$CODE" = "403" ] || { echo "匿名 DELETE 带 bypass 头应 403，实际 $CODE"; exit 1; }
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/$ANON_BUCKET/priv/data.txt")
 [ "$CODE" = "403" ] || { echo "匿名 DELETE 显式 Deny 应 403，实际 $CODE"; exit 1; }
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$ENDPOINT/$ANON_BUCKET/pub/up.txt")
@@ -628,7 +640,7 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/api/v1/buckets/$
   -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"Statement":[]}')
 [ "$CODE" = "204" ] || { echo "清匿名策略应 204，实际 $CODE"; exit 1; }
 aws_s3 rb "s3://$ANON_BUCKET" --force >/dev/null
-echo "   匿名 Principal 段通过（数据面白名单/Deny 优先/控制面 403/批量删逐键/审计 uid=0）"
+echo "   匿名 Principal 段通过（数据面白名单/Deny 优先/控制面 403/批量删逐键/锁头 403/审计 uid=0）"
 
 echo "== 18. M5 安全：SSE 三模式 + 对象锁 + STS 临时凭据（验收 ①②③④）=="
 # 前置（README「加密（M5）」运维口径）：服务须以密钥库启动（OSS_MASTER_KEY_FILE 与/或

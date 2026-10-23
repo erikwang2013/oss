@@ -154,7 +154,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // 层在路由之后挂：同时包住 fallback（S3 面）。
     let app = app.layer(middleware::from_fn(restore_accepted));
     // M8：SourceIp 条件求值的连接对端（最外层，S3 fallback 也覆盖）。ecat 的 serve 不带
-    // connect_info，生产用可信反代注入 XFF；只有显式 `OSS_AP_TRUSTED_PROXY=1` 才信首段。
+    // connect_info，生产用可信反代注入 XFF；只有显式 `OSS_AP_TRUSTED_PROXY=1` 才信
+    // **最右**一跳（可信代理由此追加），且重复 XFF 头行一律拒绝。
     let trust_proxy = std::env::var("OSS_AP_TRUSTED_PROXY")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
@@ -176,17 +177,20 @@ async fn ap_peer(mut req: Request, next: Next, trust_proxy: bool) -> Response {
     next.run(req).await
 }
 
-/// `X-Forwarded-For` 首段（原始客户端；多级代理时由最近的可信代理追加）。
+/// `X-Forwarded-For` **最右**一跳：左侧值客户端可伪造，只有最近的可信代理追加的那段
+/// 可信（前提：反代覆盖而非透传客户端自带 XFF）。重复头行来自不可信链路 → 拒绝。
 fn forwarded_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
-    headers
-        .get("x-forwarded-for")?
-        .to_str()
-        .ok()?
-        .split(',')
+    let mut vals = headers.get_all("x-forwarded-for").iter();
+    let raw = vals.next()?.to_str().ok()?;
+    if vals.next().is_some() {
+        return None;
+    }
+    raw.rsplit(',')
         .next()?
         .trim()
-        .parse()
+        .parse::<IpAddr>()
         .ok()
+        .map(|ip| ip.to_canonical())
 }
 
 async fn raft_status(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -553,20 +557,32 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn forwarded_ip_takes_first_hop_only() {
+    fn forwarded_ip_takes_rightmost_hop_and_rejects_duplicates() {
         let mut h = axum::http::HeaderMap::new();
         assert!(super::forwarded_ip(&h).is_none());
+        // 左侧可伪造，只有最右一跳（可信代理追加）参与判定
+        h.insert("x-forwarded-for", "203.0.113.5 , 10.0.0.1".parse().unwrap());
+        assert_eq!(super::forwarded_ip(&h), Some("10.0.0.1".parse().unwrap()));
+        // 只取最后一个逗号段，且 IPv6/v4-mapped 归一
         h.insert(
             "x-forwarded-for",
-            " 203.0.113.5 , 10.0.0.1".parse().unwrap(),
+            "192.0.2.9, ::ffff:10.2.3.4".parse().unwrap(),
         );
+        assert_eq!(super::forwarded_ip(&h), Some("10.2.3.4".parse().unwrap()));
+        h.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
         assert_eq!(
             super::forwarded_ip(&h),
-            Some("203.0.113.5".parse().unwrap())
+            Some("2001:db8::1".parse().unwrap())
         );
-        h.insert("x-forwarded-for", "::1".parse().unwrap());
-        assert_eq!(super::forwarded_ip(&h), Some("::1".parse().unwrap()));
-        h.insert("x-forwarded-for", "garbage".parse().unwrap());
+        // 尾部空段/垃圾 → 无法定对端（fail-closed）
+        for bad in ["10.0.0.1,", "garbage", "10.0.0.1, garbage"] {
+            h.insert("x-forwarded-for", bad.parse().unwrap());
+            assert!(super::forwarded_ip(&h).is_none(), "{bad}");
+        }
+        // 重复头行：来源不可信 → 拒绝（不得任选其一）
+        let mut h = axum::http::HeaderMap::new();
+        h.append("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        h.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
         assert!(super::forwarded_ip(&h).is_none());
     }
 

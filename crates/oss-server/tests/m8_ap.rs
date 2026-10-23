@@ -2362,19 +2362,27 @@ async fn source_ip_condition_end_to_end() {
     assert_eq!(r.status(), 400);
 }
 
-/// 无连接对端：带 IP 条件的语句一律不匹配（fail-closed）。
+/// 无连接对端（默认不信任反代）：Allow+IpAddress 不匹配；**Deny+NotIpAddress 必须命中**
+/// （H2：缺对端不得静默放过 Deny）。
 #[tokio::test]
 async fn source_ip_absent_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let e = env(dir.path()).await;
     let (uid, ak, sk) = user(&e, "owner", false).await;
     bucket(&e, "ipnb", Some(uid)).await;
-    let policy = serde_json::json!({"Statement":[{
-        "Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:GetObject"],
-        "Resource":"arn:aws:s3:::ipnb/*",
-        "Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}]})
+    let policy = serde_json::json!({"Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:GetObject"],
+         "Resource":"arn:aws:s3:::ipnb/*",
+         "Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:GetObject"],
+         "Resource":"arn:aws:s3:::ipnb/allday*"},
+        {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+         "Resource":"arn:aws:s3:::ipnb/secret*",
+         "Condition":{"NotIpAddress":{"aws:SourceIp":"10.9.0.0/16"}}}
+    ]})
     .to_string();
     direct_ap(&e, "ipn-ap", "ipnb", uid, Some(&policy)).await;
+    // 带 IP 条件的 Allow：无对端 → 拒
     assert_eq!(
         send_status(&e, Method::PUT, "/ap/ipn-ap/k", &[], b"x", &ak, &sk, "s3").await,
         403
@@ -2382,5 +2390,211 @@ async fn source_ip_absent_fails_closed() {
     assert_eq!(
         send_status(&e, Method::GET, "/ap/ipn-ap/k", &[], b"", &ak, &sk, "s3").await,
         403
+    );
+    // 无条件的 Allow 照常放行（对照组：证明只有 IP 条件语句受影响）
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/ap/ipn-ap/allday/o",
+            &[],
+            b"x",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/ipn-ap/allday/o",
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    // Deny+NotIpAddress 无法求值 → 命中 Deny（fail-closed）
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/ipn-ap/secret/x",
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        403
+    );
+}
+
+/// H1：AP 授权 op = 执行 op；legal-hold/retention 按独立策略动作判定（真实 ON/OFF 往返）。
+#[tokio::test]
+async fn ap_op_mismatch_guards_and_object_lock_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "guardb", Some(uid)).await;
+    direct_ap(&e, "guard-ap", "guardb", uid, None).await;
+
+    // 身份是桶主，AP 无策略：以下拒绝全部来自 H1 形状校验（而非授权）
+    let xml = [("content-type", "application/xml")];
+    let multipart = [("content-type", "multipart/form-data; boundary=x")];
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/ap/guard-ap/k?x-id=PutObjectLegalHold",
+            &xml,
+            b"x",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        400,
+        "x-id 与推导 op 不一致"
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::POST,
+            "/ap/guard-ap?delete",
+            &multipart,
+            b"--x--",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        400,
+        "multipart POST 会被内层当 PostObject"
+    );
+    for (m, p) in [
+        (Method::GET, "/ap/guard-ap/k?acl"),
+        (Method::PUT, "/ap/guard-ap/k?acl"),
+        (Method::GET, "/ap/guard-ap?tagging"),
+        (Method::PUT, "/ap/guard-ap/k?tagging&retention"),
+    ] {
+        assert_eq!(
+            send_status(&e, m, p, &[], b"", &ak, &sk, "s3").await,
+            501,
+            "{p}"
+        );
+    }
+    // 正常形状不变（x-id 与推导一致时允许，转发前剥离）
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/ap/guard-ap/k?x-id=PutObject",
+            &[],
+            b"hello",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/guard-ap/k?x-id=GetObject",
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::DELETE,
+            "/ap/guard-ap/k",
+            &[],
+            b"",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        204
+    );
+
+    // 对象锁：版本化 + 开锁桶
+    bucket(&e, "lockb", Some(uid)).await;
+    e.st.acl()
+        .set_bucket_versioning("lockb", "Enabled")
+        .await
+        .unwrap();
+    e.st.acl().enable_bucket_lock("lockb").await.unwrap();
+    let put_only = ap_policy("Allow", "s3:PutObject", "arn:aws:s3:::lockb/*");
+    direct_ap(&e, "lock-ap", "lockb", uid, Some(&put_only)).await;
+    let r = signed(&e, Method::PUT, "/ap/lock-ap/k", &[], b"v", &ak, &sk, "s3").await;
+    assert_eq!(r.status(), 200);
+    let vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let hold_path = format!("/ap/lock-ap/k?legal-hold&versionId={vid}");
+    let hold_on = b"<LegalHold><Status>ON</Status></LegalHold>";
+    // 策略只有 s3:PutObject → 独立动作未授予 → 403
+    assert_eq!(
+        send_status(&e, Method::PUT, &hold_path, &xml, hold_on, &ak, &sk, "s3").await,
+        403
+    );
+    assert_eq!(
+        send_status(&e, Method::GET, &hold_path, &[], b"", &ak, &sk, "s3").await,
+        403
+    );
+    // 授予后 ON → GET → OFF 全链路
+    let full = serde_json::json!({"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},
+        "Action":["s3:PutObject","s3:GetObject","s3:PutObjectLegalHold",
+                  "s3:GetObjectLegalHold","s3:PutObjectRetention","s3:GetObjectRetention"],
+        "Resource":"arn:aws:s3:::lockb/*"}]})
+    .to_string();
+    set_ap_policy(&e, "lock-ap", "lockb", uid, Some(&full)).await;
+    assert_eq!(
+        send_status(&e, Method::PUT, &hold_path, &xml, hold_on, &ak, &sk, "s3").await,
+        200
+    );
+    let r = signed(&e, Method::GET, &hold_path, &[], b"", &ak, &sk, "s3").await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("ON"), "{body}");
+    let hold_off = b"<LegalHold><Status>OFF</Status></LegalHold>";
+    assert_eq!(
+        send_status(&e, Method::PUT, &hold_path, &xml, hold_off, &ak, &sk, "s3").await,
+        200
+    );
+    // Retention：同一 versionId，GOVERNANCE 到 2030
+    let ret_path = format!("/ap/lock-ap/k?retention&versionId={vid}");
+    let ret = b"<Retention><Mode>GOVERNANCE</Mode>\
+        <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>";
+    assert_eq!(
+        send_status(&e, Method::PUT, &ret_path, &xml, ret, &ak, &sk, "s3").await,
+        200
+    );
+    assert_eq!(
+        send_status(&e, Method::GET, &ret_path, &[], b"", &ak, &sk, "s3").await,
+        200
     );
 }
