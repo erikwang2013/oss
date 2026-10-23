@@ -64,6 +64,15 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
     let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);
+    // AP/STS 自定义路由会承载 PutObject/UploadPart 等大请求；s3s 默认 1 MiB
+    // custom_route_max_body_size 会误拒正常大对象。放宽到 AWS 单 PUT 上限；
+    // 底层操作仍受 put_object_max_size 与 oss `max_put_bytes` 约束，AP 批量删
+    // 解析器自带 1 MiB/1000 键上限。
+    let mut s3_config = s3s::config::S3Config::default();
+    s3_config.custom_route_max_body_size = Some(5 * 1024 * 1024 * 1024);
+    s3_builder.set_config(Arc::new(s3s::config::StaticConfigProvider::new(
+        Arc::new(s3_config),
+    )));
     s3_builder.set_auth(
         SigV4Auth::with_mesh(state.db.pool().clone(), state.control_mesh())
             .with_vault(state.vault.clone()) // M5 切片 6：SK 解密/透明重写

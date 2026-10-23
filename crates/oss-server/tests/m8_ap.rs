@@ -61,6 +61,20 @@ async fn env_with_peer(dir: &std::path::Path, peer: Option<std::net::IpAddr>) ->
     }
 }
 
+/// >1 MiB 体经 AP 的回归用：测试默认 max_put_bytes=1 MiB，这里单独放大到 4 MiB。
+async fn env_with_max_put(dir: &std::path::Path, max_put_bytes: usize) -> Env {
+    let st = common::state_with_max_put(dir, max_put_bytes).await;
+    let app = build_router(st.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Env {
+        st,
+        base: format!("http://{addr}"),
+        http: reqwest::Client::new(),
+    }
+}
+
 // ---------- 播种 ----------
 
 async fn user(e: &Env, name: &str, admin: bool) -> (i64, String, String) {
@@ -1285,6 +1299,45 @@ async fn object_ops_through_ap() {
         .await,
         404
     );
+}
+
+/// s3s 默认 `custom_route_max_body_size = 1 MiB` 会误拒经 AP 的正常大对象；
+/// router 已放宽到单 PUT 上限。这里固定 2 MiB PUT/GET 回归。
+#[tokio::test]
+async fn large_put_through_ap_not_capped_at_1mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env_with_max_put(dir.path(), 4 * 1024 * 1024).await;
+    let (owner_id, ak, sk) = user(&e, "owner-large", false).await;
+    bucket(&e, "largeb", Some(owner_id)).await;
+    direct_ap(&e, "large-ap", "largeb", owner_id, None).await;
+    let body = vec![b'x'; 2 * 1024 * 1024];
+    let r = signed(
+        &e,
+        Method::PUT,
+        "/ap/large-ap/big.bin",
+        &[],
+        &body,
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    let status = r.status().as_u16();
+    let err = r.text().await.unwrap();
+    assert_eq!(status, 200, "{err}");
+    let r = signed(
+        &e,
+        Method::GET,
+        "/ap/large-ap/big.bin",
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().len(), 2 * 1024 * 1024);
 }
 
 /// I2：`POST /ap/<name>/<key>?restore` 推导 RestoreObject（AP 策略 s3:RestoreObject），

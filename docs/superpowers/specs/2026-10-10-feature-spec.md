@@ -223,7 +223,7 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **`response-content-*` 查询参数**（覆盖响应头；协议补全计划 Task 2 已落地）：`response-content-type`、`response-content-disposition`（含 `&filename=` 的 RFC 5987 编码）、`response-cache-control` 等。
 
-**Range（M2a 已落地）**：`bytes=0-99`、`bytes=100-`、`bytes=-100`；越界 → `InvalidRange`（416）；**多区间（`bytes=0-9,20-29`）在 s3s 头部解析层即拒 → 400 `InvalidArgument`**（实测，协议补全计划 Task 4 对齐）；响应 `206` + `Content-Range`；内核按 part 序列跨段映射、只读命中段。HEAD 带 Range 不支持（仍回 200 + 全量长度，契约有用例钉住）。EC 重建的按需解码随 M2b。
+**Range（M2a 已落地；多区间/HEAD 补全 2026-10-23）**：`bytes=0-99`、`bytes=100-`、`bytes=-100`；越界 → `InvalidRange`（416）；响应 `206` + `Content-Range`；内核按 part 序列跨段映射、只读命中段。**多区间（`bytes=0-9,20-29`）不返回 `multipart/byteranges`**：S3 fallback 前的中间件剥掉 Range → 200 整对象；若 Range 被计入 SigV4 SignedHeaders，剥离后验签失败 → 403 `SignatureDoesNotMatch`（预签名 URL 不受影响）。**HEAD 支持单区间**：200 + 区间 `Content-Length`/`Content-Range`，越界 416。EC 重建的按需解码随 M2b。
 
 **条件请求（协议补全计划 Task 1 已落地）**：`If-Match` / `If-None-Match`（ETag）/ `If-Modified-Since` / `If-Unmodified-Since` → 不满足时 `412` 或 `304`（`If-None-Match` 命中 → `304 Not Modified`，无 body；RFC 9110 §13.2.2 求值序短路；ETag 按值比较不分强弱）。
 
@@ -249,17 +249,18 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 
 **边界**：源 = 目标（同桶同键、无 REPLACE、无存储类变更）→ `InvalidRequest`（S3 语义）；跨桶复制需要目标桶的写权限（M4 起）。
 
-### 3.6 多段上传 —— `M2a 已落地`（UploadPartCopy / ListMultipartUploads 留 **M4+**——与 README 的 Multipart 边界口径一致，具体批次随 M4 计划排）
+### 3.6 多段上传 —— `M2a 已落地`（UploadPartCopy / ListMultipartUploads / partNumber 于 2026-10-23 补全）
 
 | 操作 | 行为 |
 |---|---|
 | `CreateMultipartUpload` | 返回 `uploadId`；在对象目录下建 `<uploadId>/` 暂存区 |
 | `UploadPart` | 写 `<uploadId>/part.N`；每个 part 独立算 MD5；part 号 1..=10000；返回该 part 的 ETag |
-| `UploadPartCopy` | 从已有对象复制区间作为 part（`x-amz-copy-source-range`）——**M4+** |
-| `CompleteMultipartUpload` | 按 part 号升序拼接；**校验每个 part 的 ETag 与请求里声明的一致**（不一致 → `InvalidPart`）；末段 < 5 MiB 允许，中间段 < 5 MiB → `EntityTooSmall`；乱序 → `InvalidPartOrder` |
+| `UploadPartCopy` | 从已有对象复制区间作为 part（`x-amz-copy-source-range`，支持开放/后缀区间、源 versionId、ETag 条件、SSE-C 规则） |
+| `CompleteMultipartUpload` | 按 part 号升序拼接；**校验每个 part 的 ETag 与请求里声明的一致**（不一致 → `InvalidPart`）；末段 < 5 MiB 允许，中间段 < 5 MiB → `EntityTooSmall`；乱序 → `InvalidPartOrder`；同时记录 `part_sizes` 供 `partNumber` 寻址 |
 | `AbortMultipartUpload` | 删 `<uploadId>/` 全部内容 |
 | `ListParts` | 列举已上传的 part（M2a 不分页：≤10000 全量，`isTruncated=false`） |
-| `ListMultipartUploads` | 列举未完成的上传——**M4+** |
+| `ListMultipartUploads` | 列举未完成的上传；prefix/delimiter/max-uploads 与 key-marker/upload-id-marker 分页；集群经 `ListUploadsLocal` 并集 |
+| `GetObject/HeadObject ?partNumber` | 206/200 + 段 `Content-Range` + `x-amz-mp-parts-count`；旧对象无 `part_sizes` 时仅 part 1 可读，其余 416；`partNumber`+`Range` → 400 `InvalidRequest` |
 
 **多段 ETag 格式**：`<所有 part 的 MD5 拼接后再取 MD5>-<part 数>`（这是 S3 的定义，客户端靠它判断对象是否完整）。**注意**：因此多段上传的对象 ETag **不是**整份 MD5 —— 控制台要如实展示，不要假装它是校验和。
 
@@ -407,7 +408,9 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 `x-amz-bucket-object-lock-enabled` 会一并自动开版本控制），**Enabled 只能开不能关**
 （二次 Put 只许改默认保留规则）；本条原「只能在建桶时或未启用版本控制时开启」表述作废。
 `PutObjectLegalHold` / `GetObjectLegalHold` 已落地（`put` 须点名版本且桶已开锁——未开锁 400；`get` 为元数据面读，SSE-C 对象不要求客户钥，与 AWS 须带数据钥的差异记档）；**`Put/GetObjectRetention`
-未接线**（延后，见 M5 计划定稿记档）。拒绝规则均已落地：点名删版本 / 批量删 / 非版本化覆盖写
+已接线**（`versionId` 必填；COMPLIANCE 不可缩短/清除，GOVERNANCE 缩短/清除须
+`x-amz-bypass-governance-retention`；未开锁桶 400 `InvalidRequest`；无保留期 GET → 404
+`NoSuchObjectLockConfiguration`；控制台对象列表展示 retention/legal-hold 状态）。拒绝规则均已落地：点名删版本 / 批量删 / 非版本化覆盖写
 回收一致判定（到期可删；COMPLIANCE 含管理员一律拒；GOVERNANCE 仅 bypass 头放行；
 Legal Hold ON 一律拒），拒删 = 403 `AccessDenied`。无版本号 DELETE 照打 delete marker
 （锁定版本天然留存）。控制台锁状态展示延后（S3 API 面完整）。
@@ -547,7 +550,7 @@ marker）。**sync 与 stretch 互斥**：
 ### 11.4 边界
 
 - 不做 webhook / AMQP / SNS 目标（**但底层用 `ecat-mq` 的 `MessageQueue` trait 抽象**，加后端只需新 contrib crate）
-- `ObjectAccessed` 事件**默认关闭**（GET 频率极高，打开前先算量）
+- `s3:ObjectAccessed:*` / `:Get` / `:Head` 已实现（仅成功读 200/206 发事件；304/416/错误不发）；通知配置默认不收，开启前先算量（GET 频率极高）；其余 ObjectAccessed 子操作仍 400
 
 ---
 
@@ -588,21 +591,24 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 ## 13. Access Points 与 Object Lambda —— `M8`
 
-> **落地状态（2026-10-20）**：S1 路径式 AP 与 S2 Object Lambda 均已落地（HTTP 变换器默认、
-> WASM `olap-wasm` feature 门控）；`<name>-s3alias` 主机名、匿名/跨账号 AP 与写变换不做。
+> **落地状态（2026-10-23 更新）**：S1 AP 与 S2 Object Lambda 已落地（HTTP 变换器默认、
+> WASM `olap-wasm` feature 门控）；AP 支持 `<name>-s3alias`（路径首段与 Host 首标签）、
+> DeleteObjects 逐键策略与 `IpAddress`/`NotIpAddress` SourceIp 条件。匿名/跨账号 AP 与写变换仍不做。
 
 ### 13.1 Access Points
 
 **机制**：**新建访问点 CRUD 不在 S3 协议里**（`CreateAccessPoint` 属于 S3 Control API，独立服务、独立端点、独立签名）→ 走控制台 API；而**使用**走 `S3Route` 前置层，与标准 S3 请求共用同一条解析路径。
 
-**寻址**：`/ap/<name>/<key>` 路径前缀（可选主机名形式 `<name>-s3alias`，需通配 DNS + 证书）。
+**寻址**：`/ap/<name>/<key>` 路径前缀；`<name>-s3alias` 同时支持路径首段与 Host 首标签
+（需通配 DNS + 证书；未知别名 404 `NoSuchAccessPoint`，不回落桶路由；桶名保留 `-s3alias` 后缀）。
 
 **策略求值**：访问点策略 ∩ 桶策略 ∩ 身份策略，**取交集**（三者都允许才放行）。
 
 **控制台 API**：`GET/POST /api/v1/access-points`、`GET/DELETE /api/v1/access-points/{name}`、`PUT .../{name}/policy`
 
-**边界**：仅路径式 `/ap/<name>/<key>`（无 `<name>-s3alias` 主机别名）；不做网络来源限制
-（VPC endpoint 概念不适用）；不做匿名/跨账号访问点。
+**边界**：不做 VPC endpoint、匿名/跨账号访问点；SourceIp 条件基于连接地址，反代部署需
+`OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` 首段（默认不信任）。DeleteObjects 经 AP
+逐键叠 AP 策略（被拒键 `<Error>AccessDenied`，其余照删；请求体 1 MiB / 1000 键上限）。
 
 ### 13.2 Object Lambda
 
@@ -837,7 +843,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |
 | **M6** | 事件总线 + Kafka 通知（含 `ecat-mq-kafka`）· S3 Select · 桶复制（含 `ecat-data-s3` 扩展）· 事件页 · Select 工作台 |
 | **M7** | 跨站点异步双向复制 · 站点身份与管理 API · 配置/IAM 日志复制 · 站点页 |
-| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）**；非目标：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换、AP 主机别名/匿名/跨账号；M9 另列） |
+| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）；2026-10-23 补 AP 别名/批量删/SourceIp、WASM Batch、Parquet/Hive、tier 本地盘/GC、生命周期全 Filter**；非目标：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换、AP 匿名/跨账号；M9 另列） |
 | **M9** | 控制面 `openraft` 跨站点强一致 · sync 桶 · stretch EC · 站点故障语义 |
 
 **与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 与 `2026-10-10-m1b-frontend-console.md` 回答「M1 前后端怎么写」（逐任务代码与测试）。

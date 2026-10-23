@@ -769,7 +769,12 @@ async fn validate_delete_body(req: &mut S3Request<s3s::Body>) -> S3Result<()> {
         .store_all_limited(AP_DELETE_MAX_BODY)
         .await
         .map_err(|e| {
-            if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some() {
+            // 已缓冲 body → BodySizeLimitExceeded；流式 body → http_body_util::Limited
+            // 的 LengthLimitError（s3s 不 re-export，两者都要映射为 400 EntityTooLarge）。
+            if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some()
+                || e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+            {
                 s3s::s3_error!(EntityTooLarge, "delete request body exceeds 1 MiB")
             } else {
                 tracing::error!(error = %e, "读取 DeleteObjects 请求体失败");

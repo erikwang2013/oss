@@ -5648,6 +5648,7 @@ dependencies = [
  "futures",
  "hex",
  "http",
+ "http-body-util",
  "md-5",
  "reqwest",
  "s3s",

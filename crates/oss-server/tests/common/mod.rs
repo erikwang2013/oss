@@ -27,10 +27,25 @@ pub async fn state_with_tiers(dir: &std::path::Path, tiers: Vec<TierTarget>) -> 
     state_with_targets(dir, None, tiers).await
 }
 
+/// M8 AP 测试用：放大单 PUT 上限以覆盖 >1 MiB 的 AP 自定义路由请求。
+#[allow(dead_code)]
+pub async fn state_with_max_put(dir: &std::path::Path, max_put_bytes: usize) -> AppState {
+    state_with_targets_max(dir, None, vec![], max_put_bytes).await
+}
+
 async fn state_with_targets(
     dir: &std::path::Path,
     site: Option<SiteToml>,
     tiers: Vec<TierTarget>,
+) -> AppState {
+    state_with_targets_max(dir, site, tiers, 1024 * 1024).await
+}
+
+async fn state_with_targets_max(
+    dir: &std::path::Path,
+    site: Option<SiteToml>,
+    tiers: Vec<TierTarget>,
+    max_put_bytes: usize,
 ) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
@@ -40,7 +55,7 @@ async fn state_with_targets(
         staging_dir: dir.join("staging"),
         database_url: "sqlite::memory:".into(),
         jwt_secret: JWT_SECRET.into(),
-        max_put_bytes: 1024 * 1024,
+        max_put_bytes,
         groups: vec![GroupTarget {
             group: "file".into(),
             bucket: "files".into(),

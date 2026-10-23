@@ -79,7 +79,7 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
 管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换 · AP 主机别名/匿名/跨账号 · Inventory 跨账号投递 · Batch 抢占/跨账号清单。
+CMK/多钥轮换 · AP 匿名/跨账号 · Inventory 跨账号投递 · Batch 抢占/跨账号清单。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
 （内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
@@ -172,10 +172,13 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > 已知限制：
 > - `/aetherupload/*` 四条路由**需 JWT**：登录后带 cookie `oss_token` 或 `Authorization: Bearer <token>` 访问
 >   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M4+）。
-> - ListObjects **v1 未实现（501）**；rclone 用 `provider=Other` 时须设 `LIST_VERSION=2`（验收脚本即这么做）。
+> - ListObjects v1 已实现（marker / NextMarker / delimiter / max-keys）；rclone 仍可用 `LIST_VERSION=2`。
 > - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
-> - Multipart 边界：`UploadPartCopy`、`ListMultipartUploads`、GET 的 `partNumber` 参数未实现（M4+）；
->   多区间 Range（`bytes=0-9,20-29`）→ 400 `InvalidArgument`（s3s 解析层拦截）；HEAD 带 Range 不支持。
+> - Multipart：`UploadPartCopy`、`ListMultipartUploads`（含集群 `ListUploadsLocal`）、GET/HEAD `partNumber`
+>   已实现；`partNumber` 与 `Range` 同时出现 → 400 `InvalidRequest`。
+> - Range：HEAD 支持单区间（200 + 区间 `Content-Length`/`Content-Range`，越界 416）；GET 多区间
+>   （`bytes=0-9,20-29`）不返回 `multipart/byteranges`——s3s 解析前剥掉 Range → 200 整对象。
+>   客户端若把 Range 计入 SigV4 SignedHeaders，剥离后会 403 `SignatureDoesNotMatch`；预签名 URL 不受影响。
 > - 对象标签：`Put/Get/DeleteObjectTagging`、PUT 的 `x-amz-tagging`、GET/HEAD 的
 >   `x-amz-tagging-count` 已落地；≤10 条、键 ≤128 / 值 ≤256 Unicode 标量，非法 → 400 `InvalidTag`。
 >   标签按版本存储；复制摄入（`REPLICA`）不落标签。MPU 标签与控制台标签编辑未做（记档）。
@@ -462,8 +465,10 @@ GET / HEAD / DeleteObject 带 `--version-id` 点名版本；`copy-object --copy-
 （旧版本 → 新版本）；无版本号 DELETE = delete marker（GET 404、对象列表隐身、版本列表可见）。`tests/e2e_s3.sh` 第 16 节实弹覆盖。
 
 **v1 边界（诚实记档）**：
-- 版本控制状态**单向**：只能 Off→Enabled；已启用的桶拒绝改回 Off（501，防整链替换丢历史），Suspended 亦 501（未实现）；
-  未开过版本的桶 `get-bucket-versioning` 回 `Off`（AWS 留空）。
+- 版本控制三态：`Off` / `Enabled` / `Suspended`。Off→Enabled、Off/Enabled→Suspended 允许；
+  改回 `Off` 仍拒绝（`NotImplemented`，防整链替换丢历史）；Object Lock 桶与 M9 sync 桶拒绝 Suspended
+  （`InvalidBucketState`）。Suspended 下 PUT/Complete 只替换 null 版本，无版本号 DELETE 追加 null delete marker，
+  `versionId=null` 可点名删除；未开过版本的桶 `get-bucket-versioning` 回 `Off`（AWS 留空）。
 - 所有写响应透出 `x-amz-version-id`（PUT / Complete / Copy / DeleteObject；DeleteObject 另带 `x-amz-delete-marker: true`）；
   GET / HEAD 也回实际版本号。点名 GET / HEAD marker 版本 → 405。
 - 对象列表（ListObjectsV2）只见「链尾非 marker」的键；区间读对历史版本同 S3 语义。
@@ -478,7 +483,9 @@ GET / HEAD / DeleteObject 带 `--version-id` 点名版本；`copy-object --copy-
 控制台 API `PUT /api/v1/buckets/{bucket}/lifecycle`（body `[{prefix, expire_days, enabled}]`，**全量替换**；
 桶主或管理员）配置，`GET` 同路径回读。后台 worker 按 `OSS_LIFECYCLE_INTERVAL_SECS`（默认 60s；显式 `0`
 关 worker）扫描，到期判定 `now - last_modified ≥ expire_days×24h`（**0 = 立即到期**，测试/激进清理用）
-自动删除：版本控制桶 = 打 **delete marker**（不物理删；noncurrent 版本过期未实现，记档），非版本桶 = 整键删除。
+自动删除：版本控制桶默认打 **delete marker**（不物理删）；支持 `NoncurrentVersionExpiration`
+（含 `NewerNoncurrentVersions`）与 `NoncurrentVersionTransition`，按“新版本创建时间”计算并处理非当前版本；
+非版本桶 = 整键删除。
 
 进度：`GET /api/v1/jobs`（admin）看最近作业（scanned / deleted / skipped / state / error，逐规则一条）。
 
@@ -629,8 +636,9 @@ Legal Hold 开关 API：`put/get-object-legal-hold`（`put` 须点名版本且**
 `get` 为元数据面读——SSE-C 对象不要求客户钥）。
 响应面：GET / HEAD 回 `x-amz-object-lock-mode` / `-retain-until-date` / `-legal-hold`。
 
-**边界（记档）**：`Put/GetObjectRetention`（改保留期）未接线（延后）；控制台尚无锁状态展示
-（S3 API 面完整可用）；`buckets` 表锁列跨节点的**行广播**传播，窗口期内非版本化回收路径
+**保留期**：`Put/GetObjectRetention` 已接线（`versionId` 必填；COMPLIANCE 不可缩短/清除，
+GOVERNANCE 缩短/清除须 `x-amz-bypass-governance-retention`）；控制台对象列表展示 retention / legal-hold 状态。
+**边界（记档）**：`buckets` 表锁列跨节点的**行广播**传播，窗口期内非版本化回收路径
 fail-closed 拒删（强一致归 M9，见「已知限制」）。
 
 ## STS 临时凭据（M5）
@@ -698,7 +706,8 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-notification-configura
   连接类错误永不放弃（退避封顶 300s）。Topic 需**预创建**（部署前置；UTOP 不判死）。
 - 无 Kafka 时的调试旁路：`OSS_EVENT_SINK=file:/<dir>`（落文件，测试用）；worker 间隔
   `OSS_EVENT_INTERVAL_SECS`（默认 1；0=关）。
-- 边界：`s3:ObjectAccessed:*` 未实现（配置返回 400）；TLS/SASL 见 TLS 节。
+- 读访问事件：`s3:ObjectAccessed:*` / `:Get` / `:Head` 已实现（仅成功 200/206；304/416/错误不发）；
+  其余 ObjectAccessed 子操作（如 GetTagging）仍 400；TLS/SASL 见 TLS 节。
 
 ## S3 Select（M6）
 
@@ -1048,8 +1057,9 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    动作不发桶通知但发复制/清 tier。
 5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
    `symlink.txt`（不含 Athena 建表/分区自动发现）。
-6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期 Filter 仅 prefix、
-   Expiration/Transition 仅 days，date/tag/size/And/noncurrent/abort → 501；单规则单目标类。
+6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期已支持 tag/size/And Filter、
+   Expiration.Date/ExpiredObjectDeleteMarker、Transition.Date、多转换、noncurrent expiration/transition；
+   仍不支持 AbortIncompleteMultipartUpload（需 MPU 索引，501）。
 7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort；
    GC/对账仅管理员显式触发（默认 dry-run），无自动定时 GC；恢复到期精度约 300s。
 8. 作业状态库内 `done/error`（映射 Completed/Failed）；取消时未执行任务不进报告；
