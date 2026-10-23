@@ -534,6 +534,7 @@ MPU 无标签/大小可判定，带此类过滤器的规则整条拒绝）。
 - 状态流转：`PENDING` → `COMPLETED` | `FAILED`（失败进重试队列，指数退避）
 - 远端过滤出的对象标记为 `REPLICA`，**不参与再复制**（防循环）
 - 删除标记默认**不复制**（`DeleteMarkerReplication: Disabled` 是 S3 的默认值 —— 别搞反）
+- 版本定向删除（`DELETE ?versionId=`）**不投递 M6 远端**（远端版本 id 由目标生成，无映射）；站点对的同 id 语义见 10.2
 - 需要目标桶的写权限与目标桶的版本控制
 
 **限速**：`[[remotes]].max_bytes_per_sec`（字节/秒，≥1024，按远端独立令牌桶；缺省不限速）。
@@ -546,8 +547,18 @@ MPU 无标签/大小可判定，带此类过滤器的规则整条拒绝）。
 > **实现注记（2026-10-18）**：M7 收缩为单节点站点对；控制面冲突实际采用 LWW
 > `(ts, priority, origin_site_id, seq)` —— **ts 优先，priority 只在同秒裁决**，再以 origin 字典序与
 > seq 破同值。上述「按站点优先级裁决」的早期表述以本注记为准。范围收缩与已知边界（非版本桶
-> 删除不跨界、非空桶删除不生效、版本 UUID 两端不同、锁/标签/SSE 不复制、明文 http、同主密钥
-> 约束等）见设计文档 §7.3 与 M7 落地状态。
+> 删除不跨界、非空桶删除不生效、明文 http、同主密钥约束等）见设计文档 §7.3 与 M7 落地状态。
+>
+> **实现注记（2026-10-23，4.16/4.17）**：站点对象写入改由 worker 携带 `x-oss-site-token` +
+> `x-oss-origin-version-id`，目标校验 token 后**强制沿用源版本 UUID**（同 id 同字节幂等、不同字节
+> 409），worker 校验回显；marker 同 id 定点创建。`DELETE ?versionId=` 按同 id 定点删目标版本
+> （带 `x-amz-bypass-governance-retention: true`，目标 404 视为已删），同 (bucket,key,version)
+> 更早出站行未结算前先等待，防止删除被重试 PUT 复活。标签/存储类/checksum/SSE/对象锁随站点 PUT
+> 复制（到期 retention 不下发、legal hold 保留；归档类 GLACIER/DEEP_ARCHIVE 不复制）；仅 SSE-S3
+> 以 AES256 复制、目标用本地主密钥重新封装；SSE-C 与 SSE-KMS 永久失败（fail closed；后者
+> `key_id` 为站点本地主密钥、目标拒绝显式 CMK，不静默换钥/降级明文）。升级前已复制的历史版本
+> 两端 UUID 仍不同，对它们的定向删除在目标按同 id 找不到而幂等成功，可能两端不一致（建议同
+> 版本升级）。M6 远端复制仍不投递版本定向删除、也不携带上述对象元数据。
 
 **同步（M9，按桶 opt-in）**：`replication_mode: sync`。提交 = 本地 staging/tee + 写 intent →
 远端 token PUT 确认**同一 origin version id** → 本地 meta 提交。删除 remote-first；
@@ -613,9 +624,9 @@ marker）。**sync 与 stretch 互斥**：
 |---|---|
 | CSV | 分隔符、引号、转义、表头行、注释字符、记录分隔符可配 |
 | JSON | `Document`（每行一个 JSON 对象）与 `Lines`；需配 `Type` 与可选的 `CompressionType` |
-| Parquet | **后置**（需 arrow 依赖，作为 stretch） |
+| Parquet | 低层 row reader 逐行按列名映射为 JSON 对象（不引入 Arrow）；`CompressionType` 必须 `NONE`，不接受 ScanRange |
 
-**压缩**：`NONE` / `GZIP` / `BZIP2`（`CompressionType` 参数）。**不支持** lz4/zstd（AWS 也不支持）。
+**压缩**：`NONE` / `GZIP` 已实现；`BZIP2` 返回 400（工作区无 bzip2 依赖，后置）；**不支持** lz4/zstd（AWS 也不支持）。
 
 ### 12.3 SQL 子集（AWS 方言，**不是真 SQL**）
 

@@ -175,6 +175,7 @@ impl EventSink for IngestSink {
                         etag: &info.etag,
                         size: info.size,
                         is_delete_marker: false,
+                        is_version_delete: false,
                         is_replica: false,
                     }));
                 }

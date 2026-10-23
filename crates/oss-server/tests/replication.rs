@@ -28,11 +28,13 @@ async fn fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::Temp
           dest_bucket TEXT NOT NULL, is_delete_marker INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', \
           attempts INTEGER NOT NULL DEFAULT 0, claimed_at INTEGER, next_retry_at INTEGER NOT NULL DEFAULT 0, \
           created_at INTEGER NOT NULL DEFAULT 0, last_error TEXT, \
-          target_kind TEXT NOT NULL DEFAULT 'remote');\
+          target_kind TEXT NOT NULL DEFAULT 'remote', \
+          is_version_delete INTEGER NOT NULL DEFAULT 0);\
          CREATE TABLE buckets (name TEXT PRIMARY KEY, versioning TEXT NOT NULL DEFAULT 'Off');\
          CREATE TABLE sites (peer_id TEXT PRIMARY KEY, endpoint TEXT NOT NULL DEFAULT '', \
           s3_access_key TEXT NOT NULL DEFAULT '', s3_secret_key TEXT NOT NULL DEFAULT '', \
-          region TEXT NOT NULL DEFAULT 'us-east-1', last_error TEXT);",
+          region TEXT NOT NULL DEFAULT 'us-east-1', peer_site_token TEXT NOT NULL DEFAULT '', \
+          last_error TEXT);",
     )
     .execute(&pool)
     .await
@@ -117,6 +119,7 @@ async fn enqueue_matrix_and_pending() {
         etag: &etag,
         size: 5,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -135,6 +138,7 @@ async fn enqueue_matrix_and_pending() {
         etag: &etag,
         size: 5,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -145,6 +149,7 @@ async fn enqueue_matrix_and_pending() {
         etag: &etag,
         size: 5,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: true,
     })
     .await;
@@ -155,6 +160,7 @@ async fn enqueue_matrix_and_pending() {
         etag: &etag,
         size: 5,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -171,6 +177,7 @@ async fn enqueue_matrix_and_pending() {
         etag: "",
         size: 0,
         is_delete_marker: true,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -183,6 +190,7 @@ async fn enqueue_matrix_and_pending() {
         etag: "",
         size: 0,
         is_delete_marker: true,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -303,6 +311,7 @@ async fn enqueue_one(pool: &SqlitePool, store: Arc<Store>, key: &str) -> String 
         etag: &etag,
         size: 7,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -356,6 +365,7 @@ async fn bandwidth_limit_paces_large_put() {
         etag: &etag,
         size: body.len() as u64,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -430,6 +440,7 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
         etag: &etag,
         size: 7,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -592,7 +603,7 @@ async fn worker_backlog_unreachable_then_recovers() {
 
 async fn site_fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
     let (pool, store, a, b) = fixture().await;
-    sqlx::query("INSERT INTO sites (peer_id) VALUES ('p1')")
+    sqlx::query("INSERT INTO sites (peer_id, peer_site_token) VALUES ('p1', 'tok-p1')")
         .execute(&pool)
         .await
         .unwrap();
@@ -624,6 +635,7 @@ async fn site_enqueue_matrix() {
                 etag: &etag,
                 size: 1,
                 is_delete_marker: $marker,
+                is_version_delete: false,
                 is_replica: $replica,
             }
         };
@@ -662,13 +674,60 @@ async fn site_enqueue_matrix() {
     .await
     .unwrap();
     assert_eq!(empty, 1);
+    // 4.16：版本定向删除 → 站点一行（is_version_delete=1），M6 远端规则不入队。
+    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
+        .bind(rules_json(None, true))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "k",
+        version_id: Some("v-del"),
+        etag: "",
+        size: 0,
+        is_delete_marker: false,
+        is_version_delete: true,
+        is_replica: false,
+    })
+    .await;
+    assert_eq!(site_count(&pool).await, 4);
+    let row = sqlx::query(
+        "SELECT is_delete_marker, is_version_delete FROM repl_outbox \
+         WHERE target_kind='site' AND version_id='v-del'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<i64, _>("is_delete_marker"), 0);
+    assert_eq!(row.get::<i64, _>("is_version_delete"), 1);
+    let remote: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='remote' AND version_id='v-del'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remote, 0, "版本定向删除无 M6 远端 id 映射，不得入远端队列");
+    // null 版本删除不跨界（站点 PUT 用真实 UUID 同源 id）。
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "k",
+        version_id: Some("null"),
+        etag: "",
+        size: 0,
+        is_delete_marker: false,
+        is_version_delete: true,
+        is_replica: false,
+    })
+    .await;
+    assert_eq!(site_count(&pool).await, 4);
     // Suspended → 删除不入队。
     sqlx::query("UPDATE buckets SET versioning='Suspended' WHERE name='rbk'")
         .execute(&pool)
         .await
         .unwrap();
     sink.on_write(info!(Some("dm-2"), true, false)).await;
-    assert_eq!(site_count(&pool).await, 3);
+    assert_eq!(site_count(&pool).await, 4);
 }
 
 #[derive(Clone, Debug)]
@@ -679,6 +738,16 @@ struct SiteSeen {
     content_type: Option<String>,
     meta_foo: Option<String>,
     part_sizes: Option<String>,
+    origin_version_id: Option<String>,
+    site_token: Option<String>,
+    tags: Option<String>,
+    storage_class: Option<String>,
+    lock_mode: Option<String>,
+    lock_until: Option<String>,
+    lock_hold: Option<String>,
+    bypass: Option<String>,
+    sse: Option<String>,
+    sse_kms: Option<String>,
 }
 
 /// 站点 mock：GET ?versioning 按共享状态回答；PUT 回 etag + version-id
@@ -724,11 +793,23 @@ async fn site_mock(
                             .get("x-amz-meta-foo")
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
-                        let part_sizes = req
-                            .headers()
-                            .get("x-oss-part-sizes")
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_string);
+                        let hdr = |n: &str| {
+                            req.headers()
+                                .get(n)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string)
+                        };
+                        let part_sizes = hdr("x-oss-part-sizes");
+                        let origin_version_id = hdr("x-oss-origin-version-id");
+                        let site_token = hdr("x-oss-site-token");
+                        let tags = hdr("x-amz-tagging");
+                        let storage_class = hdr("x-amz-storage-class");
+                        let lock_mode = hdr("x-amz-object-lock-mode");
+                        let lock_until = hdr("x-amz-object-lock-retain-until-date");
+                        let lock_hold = hdr("x-amz-object-lock-legal-hold");
+                        let bypass = hdr("x-amz-bypass-governance-retention");
+                        let sse = hdr("x-amz-server-side-encryption");
+                        let sse_kms = hdr("x-amz-server-side-encryption-aws-kms-key-id");
                         seen.lock().unwrap().push(SiteSeen {
                             method: method.clone(),
                             uri: uri.clone(),
@@ -736,6 +817,16 @@ async fn site_mock(
                             content_type,
                             meta_foo,
                             part_sizes,
+                            origin_version_id: origin_version_id.clone(),
+                            site_token,
+                            tags,
+                            storage_class,
+                            lock_mode,
+                            lock_until,
+                            lock_hold,
+                            bypass,
+                            sse,
+                            sse_kms,
                         });
                         let mut resp = Response::new(Full::new(Bytes::new()));
                         if method == "GET" {
@@ -752,9 +843,15 @@ async fn site_mock(
                             resp.headers_mut()
                                 .insert("etag", format!("\"{}\"", *etag).parse().unwrap());
                             if !uri.contains("nullver") {
+                                // 4.16：目标按同源版本 id 落库——回显请求头，模拟真实站点。
+                                let vid =
+                                    origin_version_id.unwrap_or_else(|| "v-remote-1".to_string());
                                 resp.headers_mut()
-                                    .insert("x-amz-version-id", "v-remote-1".parse().unwrap());
+                                    .insert("x-amz-version-id", vid.parse().unwrap());
                             }
+                        } else if method == "DELETE" && uri.contains("already-gone") {
+                            // 4.16：目标版本已不存在（404）——幂等已删。
+                            *resp.status_mut() = StatusCode::NOT_FOUND;
                         }
                         Ok::<_, std::convert::Infallible>(resp)
                     }
@@ -812,6 +909,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         etag: &etag,
         size: 7,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -876,6 +974,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         etag: &dm_etag,
         size: 0,
         is_delete_marker: true,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -886,6 +985,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         etag: "",
         size: 0,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -902,6 +1002,14 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
             .all(|d| d.replication.as_deref() == Some("REPLICA")),
         "DELETE 必须带 REPLICA 头"
     );
+    // 4.16：站点 marker 用源 marker id 创建（不带 versionId），后续版本删除才能命中。
+    let dm_del = dels
+        .iter()
+        .find(|d| d.uri.ends_with("/dm"))
+        .expect("marker 行");
+    assert_eq!(dm_del.origin_version_id.as_deref(), Some(dm_vid.as_str()));
+    assert_eq!(dm_del.site_token.as_deref(), Some("tok-p1"));
+    assert!(!dm_del.uri.contains("versionId="));
 
     // 3) PUT 响应 version-id 为 null/缺失 → 可重试，不静默成功。
     let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
@@ -914,6 +1022,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         etag: &etag2,
         size: 1,
         is_delete_marker: false,
+        is_version_delete: false,
         is_replica: false,
     })
     .await;
@@ -944,4 +1053,346 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         err.unwrap_or_default().contains("version-id"),
         "失败原因应指向 version-id"
     );
+}
+
+/// 4.16：站点版本定向删除走标准 `DELETE ?versionId=`（带 REPLICA），绝不 PUT/造 marker。
+#[tokio::test]
+async fn site_version_delete_is_replicated_as_versioned_delete() {
+    let (pool, store, _a, _b) = site_fixture().await;
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
+    sqlx::query(
+        "UPDATE sites SET endpoint=?, s3_access_key='ak', s3_secret_key='sk' \
+         WHERE peer_id='p1'",
+    )
+    .bind(&endpoint)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let vid = "11111111-1111-4111-8111-111111111111";
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "gone",
+        version_id: Some(vid),
+        etag: "",
+        size: 0,
+        is_delete_marker: false,
+        is_version_delete: true,
+        is_replica: false,
+    })
+    .await;
+    let outer = ReplClient::new(&[]);
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|s| s.method != "PUT"),
+        "版本删除绝不能以 PUT 表达（否则目标会复活/造新版本）：{seen:?}"
+    );
+    let dels: Vec<&SiteSeen> = seen.iter().filter(|s| s.method == "DELETE").collect();
+    assert_eq!(dels.len(), 1);
+    assert!(
+        dels[0].uri.contains(&format!("versionId={vid}")),
+        "必须是定点版本删除：{}",
+        dels[0].uri
+    );
+    assert_eq!(dels[0].replication.as_deref(), Some("REPLICA"));
+    assert_eq!(
+        dels[0].bypass.as_deref(),
+        Some("true"),
+        "源端已授权，目标按同值复核"
+    );
+    assert_eq!(site_count(&pool).await, 0, "成功行应删除");
+}
+
+/// 4.16：目标版本已不存在（404）视为已删——幂等成功，不重试、不造 marker。
+#[tokio::test]
+async fn site_version_delete_treats_target_404_as_already_deleted() {
+    let (pool, store, _a, _b) = site_fixture().await;
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
+    sqlx::query("UPDATE sites SET endpoint=? WHERE peer_id='p1'")
+        .bind(&endpoint)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let vid = "33333333-3333-4333-8333-333333333333";
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "already-gone",
+        version_id: Some(vid),
+        etag: "",
+        size: 0,
+        is_delete_marker: false,
+        is_version_delete: true,
+        is_replica: false,
+    })
+    .await;
+    let outer = ReplClient::new(&[]);
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    assert_eq!(site_count(&pool).await, 0, "404 应按已删结算");
+    assert!(
+        seen.lock().unwrap().iter().all(|s| s.method != "PUT"),
+        "删除不得退化成 PUT"
+    );
+}
+
+/// 4.16：同版本更早的 PUT 行仍未完成时，版本删除必须等待（防目标复活）。
+#[tokio::test]
+async fn site_version_delete_waits_for_same_version_put() {
+    let (pool, store, _a, _b) = site_fixture().await;
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
+    sqlx::query("UPDATE sites SET endpoint=? WHERE peer_id='p1'")
+        .bind(&endpoint)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let vid = "22222222-2222-4222-8222-222222222222";
+    let ins = "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
+               dest_bucket, is_delete_marker, is_version_delete, target_kind, state, attempts, \
+               next_retry_at, created_at) \
+               VALUES ('rbk', 'ord', ?, 'e', 0, 'p1', 'rbk', 0, ?, 'site', 'pending', 0, ?, 0)";
+    // 更早的 PUT 行（未到重试时刻）挡住版本删除。
+    sqlx::query(ins)
+        .bind(vid)
+        .bind(0_i64)
+        .bind(9_999_999_999_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(ins)
+        .bind(vid)
+        .bind(1_i64)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let outer = ReplClient::new(&[]);
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (0, 1));
+    assert!(
+        seen.lock().unwrap().iter().all(|s| s.method == "GET"),
+        "等待期间不得发送删除"
+    );
+    let (st, err): (String, Option<String>) =
+        sqlx::query_as("SELECT state, last_error FROM repl_outbox WHERE is_version_delete=1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(st, "pending");
+    let err = err.unwrap_or_default();
+    assert!(err.contains("保序"), "{err}");
+    // 更早行完成（删除）后放行。
+    sqlx::query("DELETE FROM repl_outbox WHERE is_version_delete=0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repl_outbox SET next_retry_at=0 WHERE is_version_delete=1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "DELETE" && s.uri.contains(&format!("versionId={vid}")))
+    );
+}
+
+/// 4.17：站点 PUT 随版本复制标签/存储类/锁，并用同源 id + 站点 token（4.16 前提）。
+#[tokio::test]
+async fn site_put_replicates_tags_storage_class_and_lock() {
+    use std::collections::BTreeMap;
+    use xl_store::meta::{ObjectLockRecord, ObjectTag};
+    let (pool, store, _a, _b) = site_fixture().await;
+    let until = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 + 3_600_000_000_000;
+    let info = store
+        .put_object_stream_with_meta_ext(
+            "rbk",
+            "meta",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"payload"))
+            })),
+            Some("text/plain".into()),
+            BTreeMap::from([("foo".to_string(), "Bar".to_string())]),
+            None,
+            VersioningMode::Enabled,
+            None,
+            Some(ObjectLockRecord {
+                mode: Some("GOVERNANCE".into()),
+                retain_until_nanos: Some(until),
+                legal_hold: true,
+            }),
+            Some(vec![ObjectTag {
+                key: "k1".into(),
+                value: "v1".into(),
+            }]),
+            Some("STANDARD_IA".into()),
+            xl_store::store::PutExt::default(),
+        )
+        .await
+        .unwrap();
+    let vid = info.version_id.clone().unwrap();
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), info.etag.clone()).await;
+    sqlx::query(
+        "UPDATE sites SET endpoint=?, s3_access_key='ak', s3_secret_key='sk' \
+         WHERE peer_id='p1'",
+    )
+    .bind(&endpoint)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "meta",
+        version_id: Some(&vid),
+        etag: &info.etag,
+        size: info.size,
+        is_delete_marker: false,
+        is_version_delete: false,
+        is_replica: false,
+    })
+    .await;
+    let outer = ReplClient::new(&[]);
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    let seen_put = seen.lock().unwrap().clone();
+    let puts: Vec<&SiteSeen> = seen_put.iter().filter(|s| s.method == "PUT").collect();
+    assert_eq!(puts.len(), 1);
+    let p = puts[0];
+    assert_eq!(p.origin_version_id.as_deref(), Some(vid.as_str()));
+    assert_eq!(p.site_token.as_deref(), Some("tok-p1"));
+    assert_eq!(p.tags.as_deref(), Some("k1=v1"));
+    assert_eq!(p.storage_class.as_deref(), Some("STANDARD_IA"));
+    assert_eq!(p.meta_foo.as_deref(), Some("Bar"));
+    assert_eq!(p.lock_mode.as_deref(), Some("GOVERNANCE"));
+    assert_eq!(p.lock_hold.as_deref(), Some("ON"));
+    let got = time::OffsetDateTime::parse(
+        p.lock_until.as_deref().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(got.unix_timestamp_nanos() as i64, until);
+
+    // 随后版本删除：同一目标版本被定点删，且不再发 PUT。
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "meta",
+        version_id: Some(&vid),
+        etag: "",
+        size: 0,
+        is_delete_marker: false,
+        is_version_delete: true,
+        is_replica: false,
+    })
+    .await;
+    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.iter().filter(|s| s.method == "PUT").count(),
+        1,
+        "版本删除不得产生新 PUT"
+    );
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "DELETE" && s.uri.contains(&format!("versionId={vid}")))
+    );
+}
+
+/// 4.17：SSE 方案随复制下传；SSE-C 无法转封装 → 客户端层 fail-closed。
+#[tokio::test]
+async fn put_with_meta_sends_sse_scheme_and_rejects_sse_c() {
+    use std::collections::BTreeMap;
+    use xl_store::meta::EncryptionRecord;
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
+    let c = client(&endpoint);
+    let enc = |key_id: &str| EncryptionRecord {
+        algorithm: "AES256".into(),
+        key_id: key_id.into(),
+        wrapped_dek_hex: String::new(),
+        nonce_seed_hex: String::new(),
+        sse_c_key_md5: None,
+    };
+    let empty = BTreeMap::new();
+    c.put_object_with_meta(
+        "r1",
+        "dst",
+        "s3",
+        Bytes::from_static(b"x"),
+        "e",
+        None,
+        &empty,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        Some(&enc("file")),
+        None,
+    )
+    .await
+    .unwrap();
+    let seen_snapshot = seen.lock().unwrap().clone();
+    let s3 = seen_snapshot
+        .iter()
+        .find(|s| s.uri.ends_with("/s3"))
+        .unwrap();
+    assert_eq!(s3.sse.as_deref(), Some("AES256"));
+    assert_eq!(s3.sse_kms, None);
+    // SSE-KMS：key_id 是站点本地主密钥，目标拒绝显式 CMK → 永久错且不发请求，
+    // 不得静默换钥或降级明文。
+    let before = seen.lock().unwrap().len();
+    let err = c
+        .put_object_with_meta(
+            "r1",
+            "dst",
+            "kms",
+            Bytes::from_static(b"x"),
+            "e",
+            None,
+            &empty,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(&enc("k3")),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, oss_server::repl_client::ErrClass::Permanent);
+    assert_eq!(seen.lock().unwrap().len(), before, "SSE-KMS 不得发请求");
+    // SSE-C：目标无法用客户钥重加密（钥不落盘）→ 永久错且不发请求。
+    let before = seen.lock().unwrap().len();
+    let err = c
+        .put_object_with_meta(
+            "r1",
+            "dst",
+            "ssec",
+            Bytes::from_static(b"x"),
+            "e",
+            None,
+            &empty,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(&enc("sse-c")),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.class, oss_server::repl_client::ErrClass::Permanent);
+    assert_eq!(seen.lock().unwrap().len(), before, "SSE-C 不得发请求");
 }

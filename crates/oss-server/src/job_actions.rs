@@ -382,6 +382,7 @@ impl BatchExecutor {
                 etag: &out.etag,
                 size: out.size,
                 is_delete_marker: false,
+                is_version_delete: false,
                 is_replica: false,
             })
             .await;
@@ -399,21 +400,39 @@ impl BatchExecutor {
             .delete_versioned(&p.bucket, &p.key, p.version_id.as_deref(), mode, false)
             .await
             .map_err(|e| e.to_string())?;
-        let refs = match outcome {
-            // 事件口径与在线 delete_object 完全一致（NotFound = 未发生删除，不发）。
-            DeleteOutcome::Version { version_id, tier } => {
+        let refs = match &outcome {
+            DeleteOutcome::Version { tier: Some(t), .. } => vec![t.clone()],
+            DeleteOutcome::Version { tier: None, .. } => Vec::new(),
+            DeleteOutcome::Object { tiers } => tiers.clone(),
+            DeleteOutcome::Marker { .. } | DeleteOutcome::NotFound => Vec::new(),
+        };
+        match &outcome {
+            DeleteOutcome::Version { version_id, .. } => {
                 self.emit_event(
                     S3EventOp::RemovedDelete,
                     &p.bucket,
                     &p.key,
-                    Some(&version_id),
+                    Some(version_id),
                     None,
                     None,
                 )
                 .await;
-                tier.into_iter().collect()
+                // 4.16：指定版本删除按同 id 定点复制（不造 marker）。
+                self.hooks
+                    .repl
+                    .on_write(WriteInfo {
+                        bucket: &p.bucket,
+                        key: &p.key,
+                        version_id: Some(version_id),
+                        etag: "",
+                        size: 0,
+                        is_delete_marker: false,
+                        is_version_delete: true,
+                        is_replica: false,
+                    })
+                    .await;
             }
-            DeleteOutcome::Object { tiers } => {
+            DeleteOutcome::Object { .. } => {
                 self.emit_event(
                     S3EventOp::RemovedDelete,
                     &p.bucket,
@@ -423,16 +442,13 @@ impl BatchExecutor {
                     None,
                 )
                 .await;
-                tiers
             }
-            // I1：与在线 delete_object 同语义——仅缺省删（产生 marker）入复制队列；
-            // 指定版本删除不入队（DeleteMarkerReplication 管的是 marker）。
             DeleteOutcome::Marker { version_id } => {
                 self.emit_event(
                     S3EventOp::RemovedDeleteMarkerCreated,
                     &p.bucket,
                     &p.key,
-                    Some(&version_id),
+                    Some(version_id),
                     None,
                     None,
                 )
@@ -442,17 +458,17 @@ impl BatchExecutor {
                     .on_write(WriteInfo {
                         bucket: &p.bucket,
                         key: &p.key,
-                        version_id: Some(&version_id),
+                        version_id: Some(version_id),
                         etag: "",
                         size: 0,
                         is_delete_marker: true,
+                        is_version_delete: false,
                         is_replica: false,
                     })
                     .await;
-                Vec::new()
             }
-            DeleteOutcome::NotFound => Vec::new(),
-        };
+            DeleteOutcome::NotFound => {}
+        }
         if !refs.is_empty()
             && let Err(e) = self.hooks.tier_gc.delete(&refs).await
         {

@@ -88,6 +88,8 @@ pub(super) async fn push_version(
             Some(token),
             Some(version_id),
             info.part_sizes.as_deref(), // 4.1：同 id 重推保留段长表
+            None,                       // 加密对象在上方已拒绝重推
+            None,
         )
         .await
     {

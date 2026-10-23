@@ -2784,6 +2784,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8af83d2940bc0510f9aef86d865f56fdc6095f87ab115ac885a80b7c5226d3ba"
 dependencies = [
  "ahash 0.8.12",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "half",
@@ -2792,6 +2793,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "seq-macro",
+ "serde_json",
  "snap",
  "twox-hash",
 ]
@@ -5652,6 +5654,7 @@ dependencies = [
  "http",
  "http-body-util",
  "md-5",
+ "parquet",
  "reqwest",
  "s3s",
  "serde",

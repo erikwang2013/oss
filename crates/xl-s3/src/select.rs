@@ -66,6 +66,8 @@ pub enum InFormat {
     Json {
         lines: bool,
     },
+    /// Parquet：行按列名转 JSON 对象（`s.col` 路径；`_N` 位置列不可用）。
+    Parquet,
 }
 
 #[derive(Debug, Clone)]
@@ -782,6 +784,12 @@ fn evaluate_inner(
             }
             Parsed::Json(parse_json(input, *lines)?)
         }
+        InFormat::Parquet => {
+            if opts.scan.is_some() {
+                return Err(bad("ScanRange 不支持 Parquet 输入"));
+            }
+            Parsed::Json(parse_parquet(input)?)
+        }
     };
     let (csv_header, n_records) = match &parsed {
         Parsed::Csv(p) => (p.header.clone(), p.records.len()),
@@ -1292,6 +1300,37 @@ pub fn parse_json(input: &[u8], lines: bool) -> s3s::S3Result<Vec<(J, i64)>> {
             other => vec![(other, 0)],
         })
     }
+}
+
+// ---------- Parquet 解析（行 → JSON 对象，复用 JSON 路径求值） ----------
+
+/// 解压后列字节总预算：Parquet 行组是压缩的，解压爆炸需在读取前拒绝
+/// （与 GZIP 的 MAX_INFLATED 512MiB 同口径；文件本体仍受 256MiB 输入上限约束）。
+pub const MAX_PARQUET_UNCOMPRESSED: i64 = 512 * 1024 * 1024;
+
+/// Parquet 行 → JSON（列名即键）。ScanRange 无行内字节偏移语义，调用方须先拒绝。
+pub fn parse_parquet(input: &[u8]) -> s3s::S3Result<Vec<(J, i64)>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(Bytes::copy_from_slice(input))
+        .map_err(|e| bad(format!("Parquet 解析失败：{e}")))?;
+    let uncompressed: i64 = reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| rg.total_byte_size())
+        .sum();
+    if uncompressed > MAX_PARQUET_UNCOMPRESSED {
+        return Err(bad("Parquet 解压后超过 512MiB 上限"));
+    }
+    let iter = reader
+        .get_row_iter(None)
+        .map_err(|e| bad(format!("Parquet 行读取失败：{e}")))?;
+    let mut out = Vec::new();
+    for row in iter {
+        let row = row.map_err(|e| bad(format!("Parquet 行解码失败：{e}")))?;
+        out.push((row.to_json_value(), 0));
+    }
+    Ok(out)
 }
 
 // ---------- 表达式求值（三值逻辑） ----------
@@ -2419,5 +2458,124 @@ mod tests {
         // 记录首字节落在区间末尾 → 整条处理（越过 end 不被截断）
         assert_eq!(run(4, 5), "bbbb,2\n");
         assert_eq!(run(100, 200), "");
+    }
+
+    // ---------- Parquet 输入 ----------
+
+    /// 三行 fixture：id 1..3（REQUIRED INT64）、name 可空、score DOUBLE、SNAPPY 压缩。
+    fn parquet_fixture() -> Vec<u8> {
+        use parquet::basic::Compression;
+        use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+        use std::sync::Arc;
+
+        let schema = Arc::new(
+            parse_message_type(
+                "message s3.select {
+                   REQUIRED INT64 id;
+                   OPTIONAL BINARY name (UTF8);
+                   REQUIRED DOUBLE score;
+                 }",
+            )
+            .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let mut w = SerializedFileWriter::new(Vec::new(), schema, props).unwrap();
+        let mut rg = w.next_row_group().unwrap();
+
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<Int64Type>()
+            .write_batch(&[1, 2, 3], None, None)
+            .unwrap();
+        c.close().unwrap();
+
+        let mut c = rg.next_column().unwrap().unwrap();
+        let names = [ByteArray::from("alice"), ByteArray::from("carol")];
+        c.typed::<ByteArrayType>()
+            .write_batch(&names, Some(&[1, 0, 1]), None)
+            .unwrap();
+        c.close().unwrap();
+
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<DoubleType>()
+            .write_batch(&[1.5, 2.5, 3.5], None, None)
+            .unwrap();
+        c.close().unwrap();
+        rg.close().unwrap();
+        w.into_inner().unwrap()
+    }
+
+    fn parquet_eval(sql: &str, out: &OutFormat) -> Vec<SelectEvent> {
+        let plan = parse(sql).unwrap();
+        let data = parquet_fixture();
+        evaluate(
+            &plan,
+            &data,
+            &InFormat::Parquet,
+            out,
+            &EvalOptions {
+                request_progress: false,
+                scanned: None,
+                scan: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parquet_select_json_rows_and_nulls() {
+        let events = parquet_eval(
+            "SELECT s.id, s.name FROM S3Object s WHERE s.id >= 2",
+            &OutFormat::Json { record: b'\n' },
+        );
+        assert_eq!(
+            records_text(&events),
+            "{\"id\":2,\"name\":null}\n{\"id\":3,\"name\":\"carol\"}\n"
+        );
+    }
+
+    #[test]
+    fn parquet_select_csv_aggregate() {
+        let events = parquet_eval(
+            "SELECT sum(s.score) FROM S3Object s",
+            &OutFormat::Csv(CsvOut::default()),
+        );
+        assert_eq!(records_text(&events), "7.5\n");
+        // SELECT *：整行 JSON 对象直出（Parquet 行即 JSON 文档）
+        let events = parquet_eval(
+            "SELECT * FROM S3Object s WHERE s.id = 1",
+            &OutFormat::Json { record: b'\n' },
+        );
+        assert_eq!(
+            records_text(&events),
+            "{\"id\":1,\"name\":\"alice\",\"score\":1.5}\n"
+        );
+    }
+
+    #[test]
+    fn parquet_rejects_scan_range_and_garbage() {
+        let plan = parse("SELECT * FROM S3Object").unwrap();
+        let data = parquet_fixture();
+        let err = evaluate(
+            &plan,
+            &data,
+            &InFormat::Parquet,
+            &OutFormat::Csv(CsvOut::default()),
+            &EvalOptions {
+                request_progress: false,
+                scanned: None,
+                scan: Some((0, 10)),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ScanRange"), "{err}");
+        let err = parse_parquet(b"not a parquet file").unwrap_err();
+        assert!(err.to_string().contains("Parquet"), "{err}");
     }
 }

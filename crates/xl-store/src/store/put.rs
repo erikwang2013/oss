@@ -840,7 +840,7 @@ impl Store {
             }
         }
 
-        // 双站同 id 重投：已存在且字节一致 → 幂等成功（不再远端调用）；不一致 → 400。
+        // 双站同 id 重投：已存在且字节一致 → 幂等成功（不再远端调用）；不一致 → 409。
         if let Some(id) = forced_version_id
             && let Some(v) = replay
         {

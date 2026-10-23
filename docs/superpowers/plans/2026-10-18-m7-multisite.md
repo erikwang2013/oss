@@ -33,12 +33,15 @@
   `[site]` 是 M7 唯一开关（无 `[site]` 的集群节点不挂站点路由、不配对）。
 - **与 M6 的关系**：对象复制复用 `repl_outbox`（`target_kind='site'`），出站沿用 SigV4 + hyper +
   `x-amz-replication-status: REPLICA`；控制面复制走独立 changelog。
-- **版本语义**：版本不可变 → 追加式；版本 UUID 站点本地生成（不保证一致）；验收③按**版本集合 + 每版本
-  ETag/内容**对拍。非版本桶不参与对象站点复制。
-- **删除语义**：对象删除以 marker 传播；**删除入队按源桶 `versioning='Enabled'` 门控**（Suspended/Off 不入队，
-  记档）；版本化桶的整键硬删在对端表现为 marker（历史版本保留）。桶删除：**仅当本端物理桶为空且
-  `store.delete_bucket` 成功**才删行并清理桶级表（lifecycle/event_configs/replication_rules/policies/
-  permissions）；非空 → 不删行、保持现状并记 `last_error`（**不做 tombstone**；记档）。
+- **版本语义**：版本不可变 → 追加式；2026-10-23 起站点出站**沿用源版本 UUID**（worker 带
+  `x-oss-site-token` + `x-oss-origin-version-id`，目标校验后强制采用，worker 校验回显）；升级前已复制的
+  历史版本仍可能两端不一致。验收③按**版本集合 + 每版本 ETag/内容**对拍。非版本桶不参与对象站点复制。
+- **删除语义**：对象删除以 marker 传播，marker 以源 id 在对端定点创建；版本定向删除按同 id 删对端版本
+  （目标 404 幂等；同版本更早出站行未结算前保序等待）。**删除入队按源桶 `versioning='Enabled'` 门控**
+  （Suspended/Off 不入队，记档）；版本化桶的整键硬删在对端表现为 marker（历史版本保留）。桶删除：
+  **仅当本端物理桶为空且 `store.delete_bucket` 成功**才删行并清理桶级表（lifecycle/event_configs/
+  replication_rules/policies/permissions）；非空 → 不删行、保持现状并记 `last_error`（**不做
+  tombstone**；记档）。
 - **控制面冲突（LWW）**：元组 **`(ts, priority, origin_site_id, seq)`**，`ts` 秒级 INTEGER。**ts 优先**
   （较新写胜出；priority 作同秒裁决）——与规格「按站点优先级裁决」的字面差异在切片 3 正式落档。
   - **本地写入钟**：AFTER 触发器插入 changelog（`last_insert_rowid()` 为 seq）后，条件 UPSERT clock
@@ -169,7 +172,9 @@
 - **发送后置（P2）**：PUT 响应 `x-amz-version-id` 缺失/为 "null" → 按可重试处理（versioning 竞态）。
 - **发送前置**：site 数据/marker 行发送前，对目标桶做签名 `GET /{bucket}?versioning`：
   404 或状态非 Enabled → 可重试；结果按 `(peer,bucket)` 缓存 10s（R6）。仅 site 行生效（P8）。
-- metadata 透传：PUT 带 `content-type` + `x-amz-meta-*`；锁/标签/SSE 不复制（记档）。
+- metadata 透传：PUT 带 `content-type`、`x-amz-meta-*`、标签/存储类/checksum/SSE/对象锁（4.17），
+  并带站点 token + 源版本 id；SSE-S3 以 AES256 复制（目标本地重封装）；SSE-C 与 SSE-KMS
+  永久错（fail closed）。
 - 状态聚合沿用 `settle_version_status`；peer 删除属丢行路径。
 - 测试：mock 对端（versioning 探询/REPLICA/ETag/metadata/404/未就绪/连接断开积压→恢复）；混合规则聚合。
 
@@ -193,8 +198,11 @@
 ## 已知边界（在案）
 
 1) 控制面最终一致：LWW ts-first + 本地写门控；**远端未来 ts 会让本地写暂时 409/500 直到钟追上**（上限
-   保护：>now+300s 入 dead）；强一致归 M9；2) 版本 UUID 不一致、版本定向删除不复制、MPU/大对象 ETag 口径；
-3) 锁/标签不复制；SSE 源明文过 http；SSE-C 源不可复制；4) 非空桶删除不生效（保留行与数据，记 last_error）；
+   保护：>now+300s 入 dead）；强一致归 M9；2) **升级前**已复制的历史版本 UUID 两端不同（升级后新版本
+   同 id）；版本定向删除仅站点对支持（M6 远端不投递）；MPU/大对象 ETag 口径；
+3) 标签/存储类/checksum/对象锁随站点 PUT 复制（已到期 retention 不下发）；SSE-C 与 SSE-KMS 源
+   永久错（fail closed；KMS `key_id` 站点本地、目标拒绝显式 CMK）；M6 远端仍不复制这些元数据；
+   4) 非空桶删除不生效（保留行与数据，记 last_error）；
 5) `uid:<id>` Principal 不重映射；6) AK 密文需同主密钥（配对只校验 vault 开关一致，无法校验同一把钥）；
 STS 会话键不复制；7) 管理员行不复制；8) changelog 无裁剪/重配对全量重放；**解配窗口内本地控制面改动
 不被捕获，且对端快照可能在重配对时覆盖这些改动**（上次由对端胜出的实体）——需在重配对后重做；

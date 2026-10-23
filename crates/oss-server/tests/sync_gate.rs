@@ -1402,6 +1402,106 @@ async fn replica_intake_requires_token_and_adopts_origin_id() {
     );
 }
 
+/// 4.16：异步站点 REPLICA 摄入在 site token 认证下同样采用同源版本 id
+/// （版本删除才能定点映射）；无 token 的旧 M6 远端复制保持原样。
+#[tokio::test]
+async fn async_replica_intake_adopts_origin_id_with_token() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let origin = uuid::Uuid::new_v4().to_string();
+    let body = b"async-peer".to_vec();
+    // 带 origin 却无 token → 403（不得静默丢弃 id 产生错位版本）。
+    let untokened = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-origin-version-id", origin.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::PUT, "/asy/a0.txt", &untokened, &body)
+            .await
+            .status(),
+        403
+    );
+    // 正确 token：同 id + 标签/存储类保留（4.17）。
+    let h = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", origin.as_str()),
+        ("x-amz-tagging", "t1=v1"),
+        ("x-amz-storage-class", "STANDARD_IA"),
+    ];
+    let r = signed(&e, Method::PUT, "/asy/a1.txt", &h, &body).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get("x-amz-version-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        origin
+    );
+    let head = signed(&e, Method::HEAD, "/asy/a1.txt", &[], &[]).await;
+    assert_eq!(
+        head.headers().get("x-amz-storage-class").unwrap(),
+        "STANDARD_IA"
+    );
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap(), "1");
+    // 4.16：REPLICA DELETE + origin id → 目标用同 id 造 marker（无 token → 403）。
+    let marker = uuid::Uuid::new_v4().to_string();
+    let bad = [
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-origin-version-id", marker.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::DELETE, "/asy/a1.txt", &bad, &[])
+            .await
+            .status(),
+        403
+    );
+    let mark_h = [
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", marker.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::DELETE, "/asy/a1.txt", &mark_h, &[])
+            .await
+            .status(),
+        204
+    );
+    let marker_path = format!("/asy/a1.txt?versionId={marker}");
+    let head = signed(&e, Method::HEAD, &marker_path, &[], &[]).await;
+    assert_eq!(head.status(), 405, "同 id marker 必须存在");
+    // 再按版本删除该 marker：DELETE ?versionId=<marker> 定点移除，不造新 marker。
+    let del_h = [
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-amz-bypass-governance-retention", "true"),
+    ];
+    assert_eq!(
+        signed(&e, Method::DELETE, &marker_path, &del_h, &[])
+            .await
+            .status(),
+        204
+    );
+    let head = signed(&e, Method::HEAD, &marker_path, &[], &[]).await;
+    assert_eq!(head.status(), 404, "marker 版本删除后必须消失");
+    // 旧 M6 形态（REPLICA 无 token/origin）仍可写，由本机生成版本 id。
+    let legacy = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+    ];
+    let r = signed(&e, Method::PUT, "/asy/a2.txt", &legacy, &body).await;
+    assert_eq!(r.status(), 200);
+    assert_ne!(
+        r.headers()
+            .get("x-amz-version-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        origin
+    );
+}
+
 #[tokio::test]
 async fn sync_write_requires_site_config() {
     let e = env_inner(Mode::Ok, 1 << 20, false).await;

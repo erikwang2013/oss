@@ -426,6 +426,8 @@ impl ReplClient {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .map(|_| ())
@@ -453,6 +455,8 @@ impl ReplClient {
         site_token: Option<&str>,
         origin_version_id: Option<&str>,
         part_sizes: Option<&[u64]>,
+        sse: Option<&xl_store::meta::EncryptionRecord>,
+        lock: Option<&xl_store::meta::ObjectLockRecord>,
     ) -> Result<Option<String>, ReplError> {
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(ct) = content_type {
@@ -472,6 +476,42 @@ impl ReplClient {
                 .collect::<Vec<_>>()
                 .join(",");
             headers.push(("x-oss-part-sizes".into(), v));
+        }
+        // 4.17：SSE-S3 以 AES256 下发，目标用本地主密钥重新封装（key 材料不跨站）。
+        // SSE-C（客户钥不落盘）与 SSE-KMS（key_id 站点本地、目标 400 拒绝显式 CMK）无法
+        // 保持语义 → fail closed，绝不静默降级为明文或换钥。
+        if let Some(enc) = sse {
+            match enc.key_id.as_str() {
+                "file" => {
+                    headers.push(("x-amz-server-side-encryption".into(), "AES256".to_string()))
+                }
+                "sse-c" => {
+                    return Err(ReplError::permanent(
+                        "SSE-C 源对象不支持复制（客户钥不落盘）",
+                    ));
+                }
+                other => {
+                    return Err(ReplError::permanent(format!(
+                        "SSE-KMS 源对象不支持站点复制（key_id={other} 为站点本地主密钥，\
+                         目标不接受显式 CMK）"
+                    )));
+                }
+            }
+        }
+        // 4.17：对象锁随版本复制（目标桶锁配置由控制面同步；未开锁会 400 → 死信 fail-closed）。
+        if let Some(l) = lock {
+            if let (Some(mode), Some(until)) = (&l.mode, l.retain_until_nanos) {
+                let dt = time::OffsetDateTime::from_unix_timestamp_nanos(until as i128)
+                    .map_err(|e| ReplError::permanent(format!("retention 时间非法：{e}")))?;
+                let date = dt
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|e| ReplError::permanent(format!("retention 格式化失败：{e}")))?;
+                headers.push(("x-amz-object-lock-mode".into(), mode.clone()));
+                headers.push(("x-amz-object-lock-retain-until-date".into(), date));
+            }
+            if l.legal_hold {
+                headers.push(("x-amz-object-lock-legal-hold".into(), "ON".into()));
+            }
         }
         if let Some(tags) = tags.filter(|t| !t.is_empty()) {
             let q = tags
@@ -819,6 +859,70 @@ impl ReplClient {
         )
         .await?;
         Ok(())
+    }
+
+    /// 4.16：站点对 marker 同 id 创建——标准 S3 DELETE（无 versionId）+ REPLICA +
+    /// site token + origin id；目标服务在 token 认证下用 origin id 生成 marker。
+    /// 这样源端后续 `DELETE ?versionId=<marker id>` 才能在目标定点命中。
+    pub async fn delete_marker_s3(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        marker_id: &str,
+        site_token: &str,
+    ) -> Result<(), ReplError> {
+        let headers = vec![
+            ("x-oss-site-token".to_string(), site_token.to_string()),
+            ("x-oss-origin-version-id".to_string(), marker_id.to_string()),
+        ];
+        self.send(
+            remote_id,
+            "DELETE",
+            dest_bucket,
+            Some(key),
+            &[],
+            None,
+            &headers,
+            Some("REPLICA"),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 4.16：站点对版本定向删除——标准 S3 `DELETE ?versionId=`，带 REPLICA（目标不再入队）。
+    /// 目标版本不存在 = 已删（幂等；含升级前副本 id 不一致的旧版本，记日志由上层处理）。
+    pub async fn delete_object_version_s3(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(), ReplError> {
+        let vid = pct(version_id);
+        // 源端删除已通过其锁校验（含 governance bypass），目标以同值 WORM 记录复核；
+        // 带 bypass 头保证「源端允许的删除」不会因目标端 governance 二次拦截而死信。
+        let headers = vec![(
+            "x-amz-bypass-governance-retention".to_string(),
+            "true".to_string(),
+        )];
+        match self
+            .send(
+                remote_id,
+                "DELETE",
+                dest_bucket,
+                Some(key),
+                &[("versionId", vid.as_str())],
+                None,
+                &headers,
+                Some("REPLICA"),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.status == Some(404) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// M7 R6：目标桶 versioning 就绪探询（签名 GET `/{bucket}?versioning`）。
