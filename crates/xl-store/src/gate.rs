@@ -29,6 +29,8 @@ pub struct GateRequest<'a> {
     pub storage_class: Option<&'a str>,
     /// 客户端声明的校验和（远端按同值重算校验后落盘）。
     pub checksum: Option<&'a crate::meta::ChecksumRecord>,
+    /// 4.1：MPU 完成的各段明文长度（单段 PUT 为 None）。远端据此保留 partNumber 能力。
+    pub part_sizes: Option<&'a [u64]>,
 }
 
 /// 远端确认回执。`remote_version_id` 必须等于 `local_version_id`（双站同 id）。

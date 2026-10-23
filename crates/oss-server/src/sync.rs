@@ -442,6 +442,7 @@ impl PutCommitGate for SiteSyncGate {
                 true, // require_version：远端 versioning 必须已 Enabled
                 Some(&peer.peer_site_token),
                 Some(req.local_version_id),
+                req.part_sizes, // 4.1：sync MPU 副本同样保留段长表
             );
             let remote = tokio::time::timeout(self.timeout, call)
                 .await

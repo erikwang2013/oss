@@ -89,6 +89,7 @@ impl Store {
             storage_class: v.storage_class.clone(),
             tier_phase: v.tier.as_ref().map(|t| t.phase),
             restore_expires_at: v.tier.as_ref().and_then(|t| t.restore_expires_at),
+            part_sizes: v.part_sizes.clone(),
         })
     }
 

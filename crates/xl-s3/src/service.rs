@@ -457,6 +457,22 @@ fn is_site_conflict(e: &(impl std::fmt::Display + ?Sized)) -> bool {
     e.to_string().contains("site replication conflict")
 }
 
+/// 4.1：`x-oss-part-sizes` = 逗号分隔的各段明文长度（REPLICA 摄入专用）。
+fn parse_part_sizes(h: Option<&http::HeaderValue>) -> S3Result<Option<Vec<u64>>> {
+    let Some(h) = h else { return Ok(None) };
+    let raw = h
+        .to_str()
+        .map_err(|_| s3s::s3_error!(InvalidArgument, "invalid x-oss-part-sizes"))?;
+    raw.split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u64>()
+                .map_err(|_| s3s::s3_error!(InvalidArgument, "invalid x-oss-part-sizes"))
+        })
+        .collect::<S3Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// M8 前置：`x-amz-tagging`（URL query 串）→ 校验后的标签集合。
 fn parse_tagging_header(raw: &str) -> S3Result<Vec<ObjectTag>> {
     let tags: Vec<ObjectTag> = crate::sts::parse_form(raw.as_bytes())
@@ -1221,6 +1237,12 @@ impl S3 for OssS3 {
             .get("x-amz-replication-status")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"));
+        // 4.1：复制摄入可带 MPU 段长表（仅 REPLICA 接受；store 校验总和 == 实际大小）
+        let part_sizes = if replica {
+            parse_part_sizes(req.headers.get("x-oss-part-sizes"))?
+        } else {
+            None
+        };
         // M9：sync 桶写边界（SSE-C 承诺客户端密钥双站可读；跨站对象锁语义未定义）。
         let sync = self
             .store
@@ -1341,6 +1363,7 @@ impl S3 for OssS3 {
                 xl_store::store::PutExt {
                     replica,
                     forced_version_id,
+                    part_sizes,
                 },
             )
             .await;

@@ -18,6 +18,7 @@ struct Seen {
     tee_exists: bool,
     tee_len: u64,
     meta_visible: bool,
+    part_sizes: Option<Vec<u64>>,
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ impl PutCommitGate for MockGate {
             tee_exists: tee.is_some(),
             tee_len: tee.map(|m| m.len()).unwrap_or(0),
             meta_visible,
+            part_sizes: req.part_sizes.map(|s| s.to_vec()),
         });
         if self.fail.load(Ordering::SeqCst) {
             return Err(GateError::Unavailable("remote down".into()));
@@ -201,6 +203,7 @@ async fn replica_skips_gate_and_adopts_origin_id() {
         PutExt {
             replica: true,
             forced_version_id: Some(origin.to_string()),
+            part_sizes: None,
         },
     )
     .await
@@ -237,6 +240,7 @@ async fn forced_id_idempotent_and_conflict() {
     let ext = PutExt {
         replica: true,
         forced_version_id: Some(origin.to_string()),
+        part_sizes: None,
     };
 
     let first = put(&s, "k.txt", b"hello".to_vec(), ext.clone())
@@ -303,6 +307,7 @@ async fn replay_returns_matched_version_not_latest() {
         PutExt {
             replica: true,
             forced_version_id: v1.version_id.clone(),
+            part_sizes: None,
         },
     )
     .await
@@ -393,6 +398,7 @@ async fn multi_drive_replay_keeps_committed_version() {
     let ext = || PutExt {
         replica: true,
         forced_version_id: Some(origin.clone()),
+        part_sizes: None,
     };
     let data = vec![9u8; 300_000];
     let first = put(&s, "k.txt", data.clone(), ext()).await.unwrap();
@@ -469,6 +475,11 @@ async fn mpu_complete_gates_after_tee_before_meta() {
         assert_eq!(seen[0].size, 9);
         assert!(seen[0].tee_exists, "MPU gate 时必须已 tee 出拼接明文");
         assert_eq!(seen[0].tee_len, 9);
+        assert_eq!(
+            seen[0].part_sizes.as_deref(),
+            Some(&[9][..]),
+            "4.1：MPU 段长表须过门"
+        );
         assert!(!seen[0].meta_visible, "MPU gate 必须先于本地 meta 翻转");
     }
     assert_eq!(info.replication_status.as_deref(), Some("COMPLETED"));
@@ -569,4 +580,40 @@ async fn delete_bucket_sync_tombstones_and_is_idempotent() {
         .unwrap();
     let (_, bytes) = s.get_object("alpha", "again").await.unwrap();
     assert_eq!(&bytes[..], b"y");
+}
+
+/// 4.1：摄入端 part_sizes 信任边界——段数/总和与实际大小不符即拒，不落对象。
+#[tokio::test]
+async fn replica_part_sizes_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let ext = |sizes: Vec<u64>| PutExt {
+        replica: true,
+        part_sizes: Some(sizes),
+        ..Default::default()
+    };
+
+    for (key, sizes) in [
+        ("empty", vec![]),
+        ("sum", vec![2, 4]),
+        ("zero-sum", vec![0, 0]),
+        ("many", vec![0; 10_001]),
+        ("overflow", vec![u64::MAX, 5]),
+    ] {
+        let e = put(&s, key, b"hello".to_vec(), ext(sizes)).await;
+        assert!(matches!(e, Err(Error::InvalidArgument(_))), "{key}: {e:?}");
+    }
+
+    put(&s, "ok", b"hello".to_vec(), ext(vec![2, 3]))
+        .await
+        .unwrap();
+    let head = s.head_object("alpha", "ok").await.unwrap();
+    assert_eq!(head.size, 5);
+    let v = s
+        .tier_version("alpha", "ok", &head.version_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.part_sizes.as_deref(), Some(&[2, 3][..]));
 }

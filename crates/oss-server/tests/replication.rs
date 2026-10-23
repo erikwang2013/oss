@@ -678,6 +678,7 @@ struct SiteSeen {
     replication: Option<String>,
     content_type: Option<String>,
     meta_foo: Option<String>,
+    part_sizes: Option<String>,
 }
 
 /// 站点 mock：GET ?versioning 按共享状态回答；PUT 回 etag + version-id
@@ -723,12 +724,18 @@ async fn site_mock(
                             .get("x-amz-meta-foo")
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
+                        let part_sizes = req
+                            .headers()
+                            .get("x-oss-part-sizes")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
                         seen.lock().unwrap().push(SiteSeen {
                             method: method.clone(),
                             uri: uri.clone(),
                             replication,
                             content_type,
                             meta_foo,
+                            part_sizes,
                         });
                         let mut resp = Response::new(Full::new(Bytes::new()));
                         if method == "GET" {
@@ -766,7 +773,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
     use std::collections::BTreeMap;
     let (pool, store, _a, _b) = site_fixture().await;
     let info = store
-        .put_object_stream_with_meta(
+        .put_object_stream_with_meta_ext(
             "rbk",
             "k",
             Box::pin(futures::stream::once(async {
@@ -780,6 +787,10 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
             None,
             None,
             None,
+            xl_store::store::PutExt {
+                part_sizes: Some(vec![3, 4]),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -846,6 +857,8 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
     assert_eq!(puts[0].replication.as_deref(), Some("REPLICA"));
     assert_eq!(puts[0].content_type.as_deref(), Some("text/plain"));
     assert_eq!(puts[0].meta_foo.as_deref(), Some("Bar"));
+    // 4.1：MPU 段长表随站点复制透传（源 7B = 3+4）
+    assert_eq!(puts[0].part_sizes.as_deref(), Some("3,4"));
     let gets: Vec<&SiteSeen> = seen_snapshot.iter().filter(|s| s.method == "GET").collect();
     assert!(
         gets.iter().any(|g| g.uri.contains("versioning=")),

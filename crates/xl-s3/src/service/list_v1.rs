@@ -177,6 +177,7 @@ mod tests {
             storage_class: None,
             tier_phase: None,
             restore_expires_at: None,
+            part_sizes: None,
         });
         r.common_prefixes.push("b/".into());
         assert_eq!(last_output_key(&r).as_deref(), Some("b/"));

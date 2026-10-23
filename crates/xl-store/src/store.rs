@@ -154,6 +154,8 @@ pub struct ObjectInfo {
     pub tier_phase: Option<meta::TierPhase>,
     /// M8 S4a：Restore 到期时刻（unix 秒；None = 未恢复/永久）。
     pub restore_expires_at: Option<i64>,
+    /// 4.1：MPU 段长表（复制/修复透传用；None = 无表/旧对象）。
+    pub part_sizes: Option<Vec<u64>>,
 }
 
 /// M9：写入口可选扩展（既有 11 参签名保持为兼容壳，~50 处调用点不动）。
@@ -163,6 +165,9 @@ pub struct PutExt {
     pub replica: bool,
     /// 双站同 id 摄入：origin UUID 字符串（S3 头原样；store 校验并强制为版本目录/version_id）。
     pub forced_version_id: Option<String>,
+    /// 4.1：REPLICA 摄入的 MPU 段长表（目标端 partNumber 偏移表）。store 校验
+    /// 段数 ≤10000 且总和 == 实际写入大小后落 `Version.part_sizes`。
+    pub part_sizes: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Default)]
