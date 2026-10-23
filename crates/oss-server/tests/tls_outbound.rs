@@ -28,6 +28,7 @@ fn tls_material(dir: &std::path::Path, cert: &str, key: &str, ca_pem: &str) -> A
             client_cert: None,
             client_key: None,
         }),
+        ..Default::default()
     })
     .unwrap()
 }

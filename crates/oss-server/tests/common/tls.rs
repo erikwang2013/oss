@@ -99,8 +99,14 @@ pub async fn start_http(
 }
 
 /// 把 PEM 写入临时目录并返回路径（测试结束后由 TempDir drop 清理）。
+/// 统一 0600：私钥文件权限是启动期硬校验，证书 0600 同样合法。
 pub fn write_pem(dir: &std::path::Path, name: &str, pem: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, pem).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     path
 }

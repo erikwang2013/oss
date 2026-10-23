@@ -56,6 +56,9 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 ecat = { version = "7.0.0", features = ["http", "middleware", "tracing"] }
+# metrics：可热加载的主监听器复用 ecat-transport-http 的 /metrics 合并语义。
+# 直接依赖 ecat-metrics（ecat 的 `metrics` feature 会连带解析数据源可选依赖，锁文件膨胀）。
+ecat-metrics = "7.0.0"
 # TLS：ecat 的 TlsConfig 类型在 ecat-transport 里（ecat 未 re-export）；出站 hyper/reqwest 共用。
 ecat-transport = "7.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

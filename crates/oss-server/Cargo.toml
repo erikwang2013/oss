@@ -23,6 +23,7 @@ aetherupload-rust.workspace = true
 axum.workspace = true
 ecat.workspace = true
 ecat-transport.workspace = true
+ecat-metrics.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true

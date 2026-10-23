@@ -102,6 +102,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
         };
         HttpNetwork {
             client: self.client.clone(),
+            tls: self.tls.clone(),
             token: self.token.clone(),
             target,
             endpoint,
@@ -115,6 +116,10 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
 #[derive(Clone)]
 pub struct HttpNetwork {
     client: reqwest::Client,
+    /// 出站 TLS 物料来源。复制流是长寿命的（leader 任期内复用同一 client），
+    /// 因此不能只在建流时取一次：每次 RPC 都从当前快照取客户端，热加载后新连接
+    /// 即用新 CA/客户端证书。
+    tls: Option<Arc<crate::tls::Tls>>,
     token: Arc<String>,
     target: u64,
     endpoint: String,
@@ -123,13 +128,27 @@ pub struct HttpNetwork {
 }
 
 impl HttpNetwork {
+    /// 当前出站客户端；物料不可用时沿用旧客户端（热加载本身 fail-safe），绝不回退明文。
+    fn current_client(&self) -> reqwest::Client {
+        match &self.tls {
+            Some(tls) => match tls.reqwest_client() {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::error!(error = %e, "Raft 对端 TLS 客户端配置不可用，沿用旧配置");
+                    self.client.clone()
+                }
+            },
+            None => self.client.clone(),
+        }
+    }
+
     async fn post(
         &self,
         path: &str,
         body: Vec<u8>,
         ttl: Duration,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        self.client
+        self.current_client()
             .post(format!("{}{}", self.endpoint, path))
             .header(RPC_TOKEN_HEADER, self.token.as_str())
             .header(RPC_TARGET_HEADER, self.target.to_string())
