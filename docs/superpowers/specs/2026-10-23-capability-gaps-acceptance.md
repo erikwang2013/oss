@@ -144,3 +144,19 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 - **3.1 AP 匿名**：无凭据请求经 AP 需 AP 策略 `Principal:"*"` 与桶策略匿名基线同时放行
   （交集，AP 不放宽桶策略）；仅数据面白名单，控制面/桶级/锁头拒绝，审计 uid=0。
   此条为安全敏感变更，须单独复审。
+- **3.2 账户命名空间 v1**：`account_id_of(uid)` 生成 12 位账户（账户 = 用户）；桶账户取
+  桶主（admin/NULL 桶 = `000000000000`）；AP ARN 账户段 = 桶账户，旧 LEGACY 账户段保留
+  一版作资源别名。桶策略/AP 策略 `Principal` 支持 `arn:aws:iam::<12位>:root`（同 uid），
+  LEGACY 主体永不匹配，`user/<name>` 形态不支持。**非租户隔离**：无账户管理员/共享/配额，
+  既有权限与桶策略语义不变。破坏性升级点：此前静默无效的 ARN 主体开始生效。
+- **3.3 AP SourceVpc 来源证明**：`StringEquals.aws:SourceVpc`（保存时校验规范形态）；
+  `OSS_AP_VPC_ID` 静态证明优先，否则仅 `OSS_AP_TRUSTED_PROXY=1` 采信恰好一条
+  `x-oss-source-vpc`；重复/畸形/未信任 → 无证明。无证明时 Deny 命中、Allow 不命中
+  （fail-closed）。**不是 PrivateLink 端点身份**。
+- **3.4 AP 桶级动作拒绝**：策略保存/加载时拒绝 `s3:CreateBucket`/`s3:DeleteBucket`/
+  `s3:ListAllMyBuckets` 精确动作（通配仍允许）；此前接受但永远不生效。旧策略含这些动作
+  会加载失败（500 fail-closed），需移除或改通配。
+- **3.5 AP 缓存 TTL/负缓存/有界**：`OSS_AP_CACHE_TTL_SECS`（默认 30）、
+  `OSS_AP_NEGATIVE_CACHE_TTL_SECS`（默认 5，0 = 关闭）、`OSS_AP_CACHE_MAX_ENTRIES`
+  （默认 10000）；合法范围外启动失败。未知 AP 负缓存、DB/解析错误不缓存（保持 500）；
+  控制面写即时失效；TTL 兜底。跨节点读己之写受 apply 延迟影响，强一致性 non-goal。

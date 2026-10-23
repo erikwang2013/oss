@@ -40,6 +40,38 @@ pub struct AuthedUser {
 #[derive(Debug, Clone, Copy)]
 pub struct AnonymousAccess;
 
+/// 账户命名空间 v1：uid 派生的 12 位十进制账户 ID（AWS 线上形态）。
+///
+/// **账户 = 用户**——这不是租户隔离：没有账户管理员、共享、配额，也不改变任何既有
+/// 授权语义。`0`/负数/超出 12 位 → `None`（不能匹配任何账户 ARN 主体）。
+pub fn account_id_of(uid: i64) -> Option<String> {
+    (1..=999_999_999_999)
+        .contains(&uid)
+        .then(|| format!("{uid:012}"))
+}
+
+/// 本变更前 AP ARN 的固定账户段；也是 admin/NULL 桶（系统账户）的账户 ID。
+/// 主体匹配**永不**命中它（只有派生 ID 才能匹配），仅作 AP 资源 ARN 的历史别名。
+pub const LEGACY_ACCOUNT: &str = "000000000000";
+
+/// 桶账户 = 桶主的账户；无主/管理员桶归系统账户（LEGACY_ACCOUNT）。
+pub fn bucket_account_id(owner_id: Option<i64>, owner_is_admin: bool) -> String {
+    match owner_id {
+        Some(uid) if !owner_is_admin => {
+            account_id_of(uid).unwrap_or_else(|| LEGACY_ACCOUNT.to_string())
+        }
+        _ => LEGACY_ACCOUNT.to_string(),
+    }
+}
+
+/// `arn:aws:iam::<12位>:root` 是否对应用户 uid（v1：账户 = 用户）。
+/// 匿名/uid=0/越界 uid 恒 false；LEGACY_ACCOUNT 永不匹配任何真实用户。
+pub fn account_arn_matches(arn: &str, uid: i64) -> bool {
+    arn.strip_prefix("arn:aws:iam::")
+        .and_then(|r| r.strip_suffix(":root"))
+        .is_some_and(|acct| account_id_of(uid).as_deref() == Some(acct))
+}
+
 /// 权限动作（与 `permissions` 表三列一一对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

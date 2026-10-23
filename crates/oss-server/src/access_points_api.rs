@@ -134,13 +134,7 @@ async fn create(
         None | Some(serde_json::Value::Null) => None,
         Some(v) => {
             let raw = v.to_string();
-            match AccessPoint::from_row(
-                body.name.clone(),
-                body.bucket.clone(),
-                uid,
-                Some(raw.clone()),
-                &state.ap_region,
-            ) {
+            match xl_s3::ap::parse_ap_policy(&raw) {
                 Ok(_) => Some(raw),
                 Err(e) => return bad(&e),
             }
@@ -199,6 +193,14 @@ async fn create(
             Err(e) => control_failure(e),
         };
     }
+    // 账户命名空间 v1：AP ARN 账户 = **桶主**账户（不是创建者）。
+    let account = match state.db.bucket_account(&body.bucket).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "建 AP 前解析桶账户失败");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
     match state
         .db
         .create_access_point(&body.name, &body.bucket, uid, policy_json.as_deref(), ts)
@@ -223,6 +225,7 @@ async fn create(
                 uid,
                 policy_json,
                 &state.ap_region,
+                &account,
             ) {
                 state.ap_cache.put(ap);
             }
@@ -349,13 +352,7 @@ async fn put_policy(
         None
     } else {
         let raw = policy.to_string();
-        match AccessPoint::from_row(
-            row.name.clone(),
-            row.bucket.clone(),
-            row.owner_id,
-            Some(raw.clone()),
-            &state.ap_region,
-        ) {
+        match xl_s3::ap::parse_ap_policy(&raw) {
             Ok(_) => Some(raw),
             Err(e) => return bad(&e),
         }
@@ -410,12 +407,14 @@ async fn put_policy(
                     }),
                 )
                 .await;
+            let account = row.account();
             if let Ok(ap) = AccessPoint::from_row(
                 row.name,
                 row.bucket,
                 row.owner_id,
                 policy_json,
                 &state.ap_region,
+                &account,
             ) {
                 state.ap_cache.put(ap);
             }
@@ -643,7 +642,15 @@ impl ApSource for DbApSource {
             .await
             .map_err(|e| e.to_string())?;
         row.map(|r| {
-            AccessPoint::from_row(r.name, r.bucket, r.owner_id, r.policy_json, &self.region)
+            let account = r.account();
+            AccessPoint::from_row(
+                r.name,
+                r.bucket,
+                r.owner_id,
+                r.policy_json,
+                &self.region,
+                &account,
+            )
         })
         .transpose()
     }

@@ -3,17 +3,18 @@
 //! 支持的子集（超出范围的值一律解析失败 → console PUT 400，不静默忽略）：
 //! - `Statement[]`：`Effect`（`Allow`/`Deny`，且 `Principal.AWS`/`Action`/`Resource` 均非空
 //!   ——`PolicyDoc::validate` 在 PUT 层拦，拼错单词的 Deny 不会静默空转）、`Principal.AWS`
-//!   （`"*"` | AK | `"uid:<n>"`，字符串或数组）、`Action`（`s3:GetObject` 精确 / `s3:*` /
-//!   `s3:Get*` 前缀通配，字符串或数组）、`Resource`（`arn:aws:s3:::<bucket>` 桶级 /
-//!   `arn:aws:s3:::<bucket>/<prefix>*` 对象级，字符串或数组；**按 op 类别单轴匹配**——
-//!   桶级 op 只见桶 ARN，对象 op 只见对象 ARN，与 AWS 一致）。
+//!   （`"*"` | AK | `"uid:<n>"` | `arn:aws:iam::<12位账户>:root`，字符串或数组）、`Action`
+//!   （`s3:GetObject` 精确 / `s3:*` / `s3:Get*` 前缀通配，字符串或数组）、`Resource`
+//!   （`arn:aws:s3:::<bucket>` 桶级 / `arn:aws:s3:::<bucket>/<prefix>*` 对象级，字符串或
+//!   数组；**按 op 类别单轴匹配**——桶级 op 只见桶 ARN，对象 op 只见对象 ARN，与 AWS 一致）。
 //! - 判定：任一匹配的 **Deny** → 拒（最高优先）；否则任一匹配的 **Allow** → 放行；
 //!   无匹配 → `None`（调用方回落既有 permissions 三档）。
 //! - 匿名（无凭据）：`PolicyRequest.anonymous` 下**仅** `Principal` 恰为 `"*"` 的语句参与
-//!   （`uid:<n>`/具体 AK/空 AK 一律不匹配）；放行面另行由 `access.rs` 限定为数据面对象操作。
+//!   （`uid:<n>`/具体 AK/账户 ARN/空 AK 一律不匹配）；放行面另行由 `access.rs` 限定为数据面对象操作。
 //!
-//! 明确不做（记档）：Conditions / NotAction / NotResource / Principal 的 ARN 形态 /
-//! 跨账户 Principal / 匿名桶级与 AP 操作。
+//! 账户 ARN 主体是**命名空间 v1**（账户 = 用户，`access::account_id_of`），不是租户隔离；
+//! `arn:...:user/<name>` 形态不支持（`PolicyRequest` 无用户名）。其余明确不做（记档）：
+//! Conditions / NotAction / NotResource / 匿名桶级与 AP 操作。
 
 use serde::Deserialize;
 
@@ -137,6 +138,8 @@ fn principal_matches(p: &PrincipalField, r: &PolicyRequest<'_>) -> bool {
         v == "*"
             || v == r.ak
             || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(r.uid)
+            // 账户命名空间 v1：账户 = 用户；LEGACY/uid=0 永不匹配。
+            || crate::access::account_arn_matches(v, r.uid)
     })
 }
 
@@ -411,6 +414,59 @@ mod tests {
             evaluate(&p, &signed_zero, "s3:GetObject"),
             Some(true),
             "签名请求的 uid: 匹配不得因匿名分支改变"
+        );
+    }
+
+    /// 账户 ARN 主体（命名空间 v1，账户 = 用户）：只命中派生出的 12 位同账户 uid；
+    /// LEGACY/非 12 位/`user/` 形态/uid=0/匿名一律不命中。
+    #[test]
+    fn account_root_principal_matches_only_derived_account() {
+        let p = doc(r#"{"Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000007:root"},
+             "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"},
+            {"Effect":"Deny","Principal":{"AWS":["arn:aws:iam::000000000009:root"]},
+             "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*"}
+        ]}"#);
+        // req.uid = 7
+        assert_eq!(
+            evaluate(&p, &req("GetObject", Some("a")), "s3:GetObject"),
+            Some(true)
+        );
+        let mut other = req("GetObject", Some("a"));
+        other.uid = 8;
+        assert_eq!(evaluate(&p, &other, "s3:GetObject"), None);
+        // Deny 对目标账户生效（uid=9）
+        let mut nine = req("GetObject", Some("secret/x"));
+        nine.uid = 9;
+        assert_eq!(evaluate(&p, &nine, "s3:GetObject"), Some(false));
+        // 非派生账户形态不命中：LEGACY、非 12 位、user/ 形态、缺 :root
+        for arn in [
+            "arn:aws:iam::000000000000:root",
+            "arn:aws:iam::7:root",
+            "arn:aws:iam::000000000007:user/erik",
+            "arn:aws:iam::000000000007",
+        ] {
+            let p = doc(&format!(
+                r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{arn}"}},
+                "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}}]}}"#
+            ));
+            assert_eq!(
+                evaluate(&p, &req("GetObject", Some("a")), "s3:GetObject"),
+                None,
+                "账户 ARN {arn} 不得命中"
+            );
+        }
+        // uid 越界（> 12 位）不构成账户；匿名只认 "*"
+        let mut big = req("GetObject", Some("a"));
+        big.uid = 1_000_000_000_000;
+        let big_doc = doc(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1000000000000:root"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#,
+        );
+        assert_eq!(evaluate(&big_doc, &big, "s3:GetObject"), None);
+        assert_eq!(
+            evaluate(&p, &anon_req("GetObject", Some("a")), "s3:GetObject"),
+            None
         );
     }
 

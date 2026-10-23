@@ -48,12 +48,14 @@ impl PostCommit {
                 let aps: Vec<_> = rows
                     .into_iter()
                     .filter_map(|row| {
+                        let account = row.account();
                         match xl_s3::ap::AccessPoint::from_row(
                             row.name,
                             row.bucket,
                             row.owner_id,
                             row.policy_json,
                             &self.region,
+                            &account,
                         ) {
                             Ok(ap) => Some(ap),
                             Err(e) => {
@@ -133,16 +135,20 @@ impl PostCommit {
                 tracing::warn!(bucket = %name, "删桶目录重试耗尽，留待启动对账");
             }
             SideEffect::ApReload(name) => match self.db.get_access_point(&name).await {
-                Ok(Some(row)) => match xl_s3::ap::AccessPoint::from_row(
-                    row.name,
-                    row.bucket,
-                    row.owner_id,
-                    row.policy_json,
-                    &self.region,
-                ) {
-                    Ok(ap) => self.ap_cache.put(ap),
-                    Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新失败"),
-                },
+                Ok(Some(row)) => {
+                    let account = row.account();
+                    match xl_s3::ap::AccessPoint::from_row(
+                        row.name,
+                        row.bucket,
+                        row.owner_id,
+                        row.policy_json,
+                        &self.region,
+                        &account,
+                    ) {
+                        Ok(ap) => self.ap_cache.put(ap),
+                        Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新失败"),
+                    }
+                }
                 Ok(None) => self.ap_cache.remove(&name),
                 Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新回查失败"),
             },

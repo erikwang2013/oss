@@ -124,6 +124,7 @@ async fn direct_ap(e: &Env, name: &str, bucket: &str, owner: i64, policy: Option
             owner,
             policy.map(str::to_string),
             &e.st.ap_region,
+            xl_s3::access::LEGACY_ACCOUNT,
         )
         .unwrap(),
     );
@@ -141,6 +142,7 @@ async fn set_ap_policy(e: &Env, name: &str, bucket: &str, owner: i64, policy: Op
             owner,
             policy.map(str::to_string),
             &e.st.ap_region,
+            xl_s3::access::LEGACY_ACCOUNT,
         )
         .unwrap(),
     );

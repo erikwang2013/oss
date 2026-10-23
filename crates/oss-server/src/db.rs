@@ -176,10 +176,42 @@ fn inventory_run_row(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
 pub struct AccessPointRow {
     pub name: String,
     pub bucket: String,
+    /// AP 创建者 uid（不是账户来源；账户取桶主）。
     pub owner_id: i64,
     pub policy_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 桶主 uid（NULL = 无主桶或本节点无桶行）。
+    pub bucket_owner_id: Option<i64>,
+    /// 桶主是否管理员（管理员桶归系统账户）。
+    pub bucket_owner_is_admin: bool,
+}
+
+impl AccessPointRow {
+    /// 账户命名空间 v1：AP ARN 的账户段 = 桶账户。
+    pub fn account(&self) -> String {
+        xl_s3::access::bucket_account_id(self.bucket_owner_id, self.bucket_owner_is_admin)
+    }
+}
+
+/// AP 行查询：联桶主与管理员标记（账户命名空间 v1）；本节点无桶行 → NULL → 系统账户。
+const AP_ROW_SELECT_BASE: &str = "SELECT ap.name, ap.bucket, ap.owner_id, ap.policy_json, \
+     ap.created_at, ap.updated_at, b.owner_id AS bucket_owner_id, \
+     COALESCE(u.is_admin, 0) AS bucket_owner_is_admin \
+     FROM access_points ap LEFT JOIN buckets b ON b.name = ap.bucket \
+     LEFT JOIN users u ON u.id = b.owner_id";
+
+fn ap_row(r: &sqlx::sqlite::SqliteRow) -> AccessPointRow {
+    AccessPointRow {
+        name: r.get("name"),
+        bucket: r.get("bucket"),
+        owner_id: r.get("owner_id"),
+        policy_json: r.get("policy_json"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        bucket_owner_id: r.get("bucket_owner_id"),
+        bucket_owner_is_admin: r.get::<i64, _>("bucket_owner_is_admin") != 0,
+    }
 }
 
 /// 变换器配置行（M8 S2）。
@@ -877,55 +909,54 @@ impl Db {
     }
 
     pub async fn get_access_point(&self, name: &str) -> Result<Option<AccessPointRow>> {
-        let row = sqlx::query(
-            "SELECT name, bucket, owner_id, policy_json, created_at, updated_at \
-             FROM access_points WHERE name = ?",
-        )
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{AP_ROW_SELECT_BASE} WHERE ap.name = ?"
+        )))
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| AccessPointRow {
-            name: r.get("name"),
-            bucket: r.get("bucket"),
-            owner_id: r.get("owner_id"),
-            policy_json: r.get("policy_json"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        }))
+        Ok(row.map(|r| ap_row(&r)))
     }
 
     /// `bucket=None` → 全部（缓存预加载）；Some → 该桶（级联失效/列举）。
     pub async fn list_access_points(&self, bucket: Option<&str>) -> Result<Vec<AccessPointRow>> {
         let rows = match bucket {
             Some(b) => {
-                sqlx::query(
-                    "SELECT name, bucket, owner_id, policy_json, created_at, updated_at \
-                     FROM access_points WHERE bucket = ? ORDER BY name",
-                )
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "{AP_ROW_SELECT_BASE} WHERE ap.bucket = ? ORDER BY ap.name"
+                )))
                 .bind(b)
                 .fetch_all(&self.pool)
                 .await?
             }
             None => {
-                sqlx::query(
-                    "SELECT name, bucket, owner_id, policy_json, created_at, updated_at \
-                     FROM access_points ORDER BY name",
-                )
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "{AP_ROW_SELECT_BASE} ORDER BY ap.name"
+                )))
                 .fetch_all(&self.pool)
                 .await?
             }
         };
-        Ok(rows
-            .iter()
-            .map(|r| AccessPointRow {
-                name: r.get("name"),
-                bucket: r.get("bucket"),
-                owner_id: r.get("owner_id"),
-                policy_json: r.get("policy_json"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
+        Ok(rows.iter().map(ap_row).collect())
+    }
+
+    /// 账户命名空间 v1：桶主的 12 位账户 ID（NULL/管理员桶 = 系统账户）。
+    /// 本节点无桶行（非 Raft 集群）时同样回落到系统账户。
+    pub async fn bucket_account(&self, bucket: &str) -> Result<String> {
+        let row = sqlx::query(
+            "SELECT b.owner_id AS owner_id, COALESCE(u.is_admin, 0) AS is_admin \
+             FROM buckets b LEFT JOIN users u ON u.id = b.owner_id WHERE b.name = ?",
+        )
+        .bind(bucket)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => xl_s3::access::bucket_account_id(
+                r.get::<Option<i64>, _>("owner_id"),
+                r.get::<i64, _>("is_admin") != 0,
+            ),
+            None => xl_s3::access::LEGACY_ACCOUNT.to_string(),
+        })
     }
 
     /// 更新 AP 策略（None = 清策略）。

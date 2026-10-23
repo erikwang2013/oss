@@ -4,11 +4,17 @@
 //! `<name>-s3alias.<endpoint>`。AP 只做**额外限制**（与身份/桶策略取交集），绝不放松
 //! 既有授权。策略方言 = 现有 `policy` 子集，但解析更严格（未知字段/条件运算符一律拒）。
 //!
-//! 明确不支持（non-goals）：匿名访问点、跨账号、VPC 端点、经 AP 的桶级 Create/Delete/
-//! ListBuckets、AP 缓存一致性。
+//! 账户命名空间 v1：AP ARN 的账户段 = **桶主**的 12 位 uid 派生账户（admin/NULL 桶 =
+//! `LEGACY_ACCOUNT`）；旧 ARN 账户段保留一版作资源别名。账户 = 用户，**不是租户隔离**。
+//! `aws:SourceVpc` 是**来源 VPC 证明**（静态 `OSS_AP_VPC_ID` 或可信反代头），不是
+//! PrivateLink 端点身份。AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是 non-goal。
+//!
+//! 明确不支持（non-goals）：真 VPC 端点（PrivateLink/ENI）、经 AP 的桶级 Create/Delete/
+//! ListBuckets（保存策略时即拒绝这些动作）、多用户账户模型、强跨节点 AP 缓存一致性。
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use s3s::{S3Request, S3Response, S3Result};
 use serde::Deserialize;
@@ -62,7 +68,8 @@ pub struct ApPrincipal {
     pub aws: StringOrVec,
 }
 
-/// 条件块：仅 IP 条件（VPC 端点的窄替代）。未知运算符由 `deny_unknown_fields` 拒绝。
+/// 条件块：IP 条件 + `StringEquals` 的 `aws:SourceVpc`（来源 VPC 证明）。
+/// 未知运算符/条件键由 `deny_unknown_fields` 拒绝。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApCondition {
@@ -70,6 +77,8 @@ pub struct ApCondition {
     pub ip_address: Option<ApIpCondition>,
     #[serde(default, rename = "NotIpAddress")]
     pub not_ip_address: Option<ApIpCondition>,
+    #[serde(default, rename = "StringEquals")]
+    pub string_equals: Option<ApVpcCondition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,9 +88,34 @@ pub struct ApIpCondition {
     pub source_ip: StringOrVec,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApVpcCondition {
+    #[serde(rename = "aws:SourceVpc")]
+    pub source_vpc: StringOrVec,
+}
+
+/// 来源 VPC 证明 ID 的规范形态：`vpc-`/`vpce-` + 1..=64 位小写字母/数字/`-`。
+pub fn valid_vpc_id(raw: &str) -> bool {
+    let Some(rest) = raw
+        .strip_prefix("vpc-")
+        .or_else(|| raw.strip_prefix("vpce-"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 64
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 impl ApCondition {
     fn validate(&self, i: usize) -> Result<(), String> {
-        if self.ip_address.is_none() && self.not_ip_address.is_none() {
+        if self.ip_address.is_none()
+            && self.not_ip_address.is_none()
+            && self.string_equals.is_none()
+        {
             return Err(format!("Statement[{i}].Condition 不能为空"));
         }
         for (op, cond) in [
@@ -92,24 +126,61 @@ impl ApCondition {
                 cond.validate(i, op)?;
             }
         }
+        if let Some(c) = &self.string_equals {
+            c.validate(i)?;
+        }
         Ok(())
     }
 
-    /// 条件是否成立；`None` = 无法求值（缺对端/坏 CIDR）。调用方按语句 Effect 处理：
-    /// Deny 视为命中（fail-closed），Allow 视为不命中。
-    fn matches(&self, ip: Option<IpAddr>) -> Option<bool> {
-        let ip = ip?;
+    /// 条件是否成立；`None` = 无法求值（缺对端/缺 VPC 证明/坏 CIDR）。调用方按语句
+    /// Effect 处理：Deny 视为命中（fail-closed），Allow 视为不命中。
+    fn matches(&self, ip: Option<IpAddr>, vpc: Option<&str>) -> Option<bool> {
         if let Some(c) = &self.ip_address
-            && c.matches(ip) != Some(true)
+            && c.matches(ip?) != Some(true)
         {
             return Some(false);
         }
         if let Some(c) = &self.not_ip_address
-            && c.matches(ip) != Some(false)
+            && c.matches(ip?) != Some(false)
+        {
+            return Some(false);
+        }
+        if let Some(c) = &self.string_equals
+            && c.matches(vpc?) != Some(true)
         {
             return Some(false);
         }
         Some(true)
+    }
+}
+
+impl ApVpcCondition {
+    fn validate(&self, i: usize) -> Result<(), String> {
+        if self.source_vpc.iter().next().is_none() {
+            return Err(format!(
+                "Statement[{i}].Condition.StringEquals.aws:SourceVpc 不能为空"
+            ));
+        }
+        for raw in self.source_vpc.iter() {
+            if !valid_vpc_id(raw) {
+                return Err(format!(
+                    "Statement[{i}].Condition.StringEquals.aws:SourceVpc 非法 VPC ID: {raw}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 列表内任一 ID 相等即成立；空列表/缺证明 → `None`（fail-closed）。
+    fn matches(&self, vpc: &str) -> Option<bool> {
+        let mut any = false;
+        for raw in self.source_vpc.iter() {
+            any = true;
+            if raw == vpc {
+                return Some(true);
+            }
+        }
+        any.then_some(false)
     }
 }
 
@@ -185,6 +256,11 @@ fn prefix_eq(net: &[u8], ip: &[u8], prefix: u8) -> bool {
     net[..full] == ip[..full] && (rem == 0 || (net[full] ^ ip[full]) >> (8 - rem) == 0)
 }
 
+/// AP 路由无法执行的桶级动作：保存时拒绝精确动作（`s3:*` 等通配仍允许），
+/// 避免「已授权但永远不生效」的假安全感。
+const UNSUPPORTED_BUCKET_ACTIONS: &[&str] =
+    &["s3:CreateBucket", "s3:DeleteBucket", "s3:ListAllMyBuckets"];
+
 impl ApPolicy {
     /// serde 形状 + 语义校验（保存 400；运行期解析失败 500）。
     pub fn validate(&self) -> Result<(), String> {
@@ -197,6 +273,13 @@ impl ApPolicy {
             }
             if st.action.iter().next().is_none() {
                 return Err(format!("Statement[{i}].Action 不能为空"));
+            }
+            for act in st.action.iter() {
+                if UNSUPPORTED_BUCKET_ACTIONS.contains(&act) {
+                    return Err(format!(
+                        "Statement[{i}].Action {act} 不适用于访问点：桶级创建/删除/列举无法经 AP 执行"
+                    ));
+                }
             }
             if st.resource.iter().next().is_none() {
                 return Err(format!("Statement[{i}].Resource 不能为空"));
@@ -223,7 +306,10 @@ impl ApPolicy {
             {
                 continue;
             }
-            let cond = st.condition.as_ref().map(|c| c.matches(req.source_ip));
+            let cond = st
+                .condition
+                .as_ref()
+                .map(|c| c.matches(req.source_ip, req.source_vpc));
             match (st.effect.as_str(), cond) {
                 // 条件求值为 false：该语句不命中（Allow/Deny 同）
                 (_, Some(Some(false))) => continue,
@@ -247,7 +333,9 @@ fn principal_matches(p: &ApPrincipal, ak: &str, uid: i64, anonymous: bool) -> bo
         v == "*"
             || (!anonymous
                 && (v == ak
-                    || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(uid)))
+                    || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(uid)
+                    // 账户命名空间 v1：账户 = 用户；LEGACY/uid=0 永不匹配。
+                    || crate::access::account_arn_matches(v, uid)))
     })
 }
 
@@ -261,9 +349,11 @@ pub struct ApEvalRequest<'a> {
     pub resources: Vec<String>,
     /// 连接对端（无则带 `SourceIp` 条件的语句一律不匹配，fail-closed）。
     pub source_ip: Option<IpAddr>,
+    /// 来源 VPC 证明（无则带 `aws:SourceVpc` 条件的语句一律不匹配，fail-closed）。
+    pub source_vpc: Option<&'a str>,
 }
 
-/// AP 上下文（ARN 生成用）。
+/// AP 上下文（ARN 生成用）。`account` = 桶账户（命名空间 v1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApContext {
     pub name: String,
@@ -272,12 +362,17 @@ pub struct ApContext {
 }
 
 impl ApContext {
-    pub fn new(name: &str, region: &str) -> Self {
+    pub fn new(name: &str, region: &str, account: &str) -> Self {
         Self {
             name: name.to_string(),
             region: region.to_string(),
-            account: "000000000000".to_string(),
+            account: account.to_string(),
         }
+    }
+
+    /// 旧版 AP ARN 的账户段别名（一版兼容，已保存的旧策略继续匹配）。
+    pub fn legacy(name: &str, region: &str) -> Self {
+        Self::new(name, region, crate::access::LEGACY_ACCOUNT)
     }
 
     /// 对象级 AP ARN。
@@ -303,13 +398,22 @@ pub struct AccessPoint {
     pub name: String,
     pub bucket: String,
     pub owner_id: i64,
+    /// 账户命名空间 v1：**桶主**的 12 位账户（不是 AP 创建者；admin/NULL 桶 = 系统账户）。
+    pub account: String,
     pub policy: Option<ApPolicy>,
     pub region: String,
 }
 
+/// 解析并校验 AP 策略 JSON（保存 400 / 运行期加载失败 500 共用同一口径）。
+pub fn parse_ap_policy(raw: &str) -> Result<ApPolicy, String> {
+    let doc: ApPolicy = serde_json::from_str(raw).map_err(|e| format!("AP 策略解析失败: {e}"))?;
+    doc.validate()?;
+    Ok(doc)
+}
+
 impl AccessPoint {
     pub fn context(&self) -> ApContext {
-        ApContext::new(&self.name, &self.region)
+        ApContext::new(&self.name, &self.region, &self.account)
     }
 
     /// 从 DB 行构造（策略 JSON 解析失败 → Err，调用方按 fail-closed 处理）。
@@ -319,20 +423,17 @@ impl AccessPoint {
         owner_id: i64,
         policy_json: Option<String>,
         region: &str,
+        account: &str,
     ) -> Result<Self, String> {
         let policy = match policy_json {
-            Some(raw) if !raw.trim().is_empty() => {
-                let doc: ApPolicy =
-                    serde_json::from_str(&raw).map_err(|e| format!("AP 策略解析失败: {e}"))?;
-                doc.validate()?;
-                Some(doc)
-            }
+            Some(raw) if !raw.trim().is_empty() => Some(parse_ap_policy(&raw)?),
             _ => None,
         };
         Ok(Self {
             name,
             bucket,
             owner_id,
+            account: account.to_string(),
             policy,
             region: region.to_string(),
         })
@@ -348,8 +449,11 @@ pub fn ap_decision(
     op: &str,
     key: Option<&str>,
     source_ip: Option<IpAddr>,
+    source_vpc: Option<&str>,
 ) -> Option<bool> {
-    ap_decision_inner(ap, &user.ak, user.uid, false, op, key, source_ip)
+    ap_decision_inner(
+        ap, &user.ak, user.uid, false, op, key, source_ip, source_vpc,
+    )
 }
 
 /// 匿名 AP 判定：只认 `Principal: "*"`（空 AK / `uid:0` 绝不匹配），其余同
@@ -359,10 +463,12 @@ pub fn ap_decision_anonymous(
     op: &str,
     key: Option<&str>,
     source_ip: Option<IpAddr>,
+    source_vpc: Option<&str>,
 ) -> Option<bool> {
-    ap_decision_inner(ap, "", 0, true, op, key, source_ip)
+    ap_decision_inner(ap, "", 0, true, op, key, source_ip, source_vpc)
 }
 
+#[allow(clippy::too_many_arguments)] // 同上：求值输入集合
 fn ap_decision_inner(
     ap: &AccessPoint,
     ak: &str,
@@ -371,6 +477,7 @@ fn ap_decision_inner(
     op: &str,
     key: Option<&str>,
     source_ip: Option<IpAddr>,
+    source_vpc: Option<&str>,
 ) -> Option<bool> {
     let Some(policy) = ap.policy.as_ref() else {
         return Some(false);
@@ -385,9 +492,24 @@ fn ap_decision_inner(
     };
     let ctx = ap.context();
     // 与 policy.rs 同口径：对象动作只匹配对象 ARN，桶动作只匹配桶 ARN。
+    // 桶账户 AP 额外保留旧 `LEGACY_ACCOUNT` ARN 一版作资源别名（旧策略继续匹配）。
+    let legacy = (ap.account != crate::access::LEGACY_ACCOUNT)
+        .then(|| ApContext::legacy(&ap.name, &ap.region));
     let resources = match key {
-        Some(k) => vec![format!("arn:aws:s3:::{}/{k}", ap.bucket), ctx.object_arn(k)],
-        None => vec![format!("arn:aws:s3:::{}", ap.bucket), ctx.bucket_arn()],
+        Some(k) => {
+            let mut v = vec![format!("arn:aws:s3:::{}/{k}", ap.bucket), ctx.object_arn(k)];
+            if let Some(l) = &legacy {
+                v.push(l.object_arn(k));
+            }
+            v
+        }
+        None => {
+            let mut v = vec![format!("arn:aws:s3:::{}", ap.bucket), ctx.bucket_arn()];
+            if let Some(l) = &legacy {
+                v.push(l.bucket_arn());
+            }
+            v
+        }
     };
     let req = ApEvalRequest {
         ak,
@@ -395,14 +517,45 @@ fn ap_decision_inner(
         anonymous,
         resources,
         source_ip,
+        source_vpc,
     };
     Some(policy.evaluate(&req, action) == Some(true))
 }
 
-/// AP 缓存（控制面写路径负责更新；路由读路径 fail-closed）。
-#[derive(Default)]
+/// AP 缓存：进程本地、TTL 有界、带负缓存（控制面写路径即时失效；TTL 是兜底）。
+///
+/// 一致性与限制：Raft 集群里控制面写会经 PostCommit 副作用刷新每个节点的缓存，
+/// 但**跨节点读己之写**仍受 apply 延迟影响（可能瞬时 404）；非 Raft 多节点的 AP
+/// 控制面本就是节点本地。强跨节点一致性是 non-goal（见 README）。
 pub struct ApCache {
-    inner: std::sync::RwLock<std::collections::HashMap<String, AccessPoint>>,
+    inner: std::sync::RwLock<std::collections::HashMap<String, Entry>>,
+    /// 未知 AP 负缓存（名字 → 写入时刻）；DB/解析错误**不**进负缓存。
+    negative: std::sync::RwLock<std::collections::HashMap<String, Instant>>,
+    ttl: Duration,
+    negative_ttl: Duration,
+    max_entries: usize,
+}
+
+struct Entry {
+    ap: AccessPoint,
+    loaded_at: Instant,
+}
+
+const DEFAULT_TTL_SECS: u64 = 30;
+const DEFAULT_NEGATIVE_TTL_SECS: u64 = 5;
+const DEFAULT_MAX_ENTRIES: usize = 10_000;
+const MAX_NEGATIVE_ENTRIES: usize = 10_000;
+const MAX_TTL_SECS: u64 = 86_400;
+const MAX_MAX_ENTRIES: usize = 1_000_000;
+
+impl Default for ApCache {
+    fn default() -> Self {
+        Self::with_config(
+            Duration::from_secs(DEFAULT_TTL_SECS),
+            Duration::from_secs(DEFAULT_NEGATIVE_TTL_SECS),
+            DEFAULT_MAX_ENTRIES,
+        )
+    }
 }
 
 impl ApCache {
@@ -410,13 +563,96 @@ impl ApCache {
         Self::default()
     }
 
+    pub fn with_config(ttl: Duration, negative_ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(std::collections::HashMap::new()),
+            negative: std::sync::RwLock::new(std::collections::HashMap::new()),
+            ttl,
+            negative_ttl,
+            max_entries,
+        }
+    }
+
+    /// 生产装配：`OSS_AP_CACHE_TTL_SECS`（默认 30，0 = 不缓存正条目）、
+    /// `OSS_AP_NEGATIVE_CACHE_TTL_SECS`（默认 5，0 = 关闭负缓存）、
+    /// `OSS_AP_CACHE_MAX_ENTRIES`（默认 10000）。非法值 → 启动失败。
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self::with_config(
+            Duration::from_secs(env_u64(
+                "OSS_AP_CACHE_TTL_SECS",
+                DEFAULT_TTL_SECS,
+                0,
+                MAX_TTL_SECS,
+            )?),
+            Duration::from_secs(env_u64(
+                "OSS_AP_NEGATIVE_CACHE_TTL_SECS",
+                DEFAULT_NEGATIVE_TTL_SECS,
+                0,
+                MAX_TTL_SECS,
+            )?),
+            env_u64(
+                "OSS_AP_CACHE_MAX_ENTRIES",
+                DEFAULT_MAX_ENTRIES as u64,
+                1,
+                MAX_MAX_ENTRIES as u64,
+            )? as usize,
+        ))
+    }
+
     pub fn get(&self, name: &str) -> Option<AccessPoint> {
-        self.inner.read().ok()?.get(name).cloned()
+        let w = self.inner.read().ok()?;
+        let e = w.get(name)?;
+        (e.loaded_at.elapsed() < self.ttl).then(|| e.ap.clone())
+    }
+
+    /// 未知 AP 负缓存命中（load 路径据此跳过 DB 查询）。
+    pub fn negative_hit(&self, name: &str) -> bool {
+        match self.negative.read() {
+            Ok(m) => m
+                .get(name)
+                .is_some_and(|at| at.elapsed() < self.negative_ttl),
+            Err(_) => false,
+        }
     }
 
     pub fn put(&self, ap: AccessPoint) {
+        let name = ap.name.clone();
         if let Ok(mut w) = self.inner.write() {
-            w.insert(ap.name.clone(), ap);
+            if !w.contains_key(&name) && w.len() >= self.max_entries {
+                // 上限优先保可用性：先清过期条目，仍满则本条目不入缓存（直接查 DB）。
+                w.retain(|_, e| e.loaded_at.elapsed() < self.ttl);
+            }
+            if w.contains_key(&name) || w.len() < self.max_entries {
+                w.insert(
+                    name.clone(),
+                    Entry {
+                        ap,
+                        loaded_at: Instant::now(),
+                    },
+                );
+            } else {
+                tracing::warn!(
+                    entries = w.len(),
+                    max = self.max_entries,
+                    "AP 缓存已满，新条目不缓存"
+                );
+            }
+        }
+        if let Ok(mut n) = self.negative.write() {
+            n.remove(&name);
+        }
+    }
+
+    /// 记录未知 AP（短 TTL；有界，满则整体清空后重来）。
+    pub fn put_negative(&self, name: &str) {
+        if self.negative_ttl.is_zero() {
+            return;
+        }
+        if let Ok(mut w) = self.negative.write() {
+            if w.len() >= MAX_NEGATIVE_ENTRIES {
+                w.clear();
+            }
+            w.insert(name.to_string(), Instant::now());
         }
     }
 
@@ -429,14 +665,21 @@ impl ApCache {
     /// 桶删除级联：移除该桶全部 AP。
     pub fn invalidate_bucket(&self, bucket: &str) {
         if let Ok(mut w) = self.inner.write() {
-            w.retain(|_, ap| ap.bucket != bucket);
+            w.retain(|_, e| e.ap.bucket != bucket);
         }
     }
 
     /// 启动预加载/全量刷新。
     pub fn replace_all(&self, items: impl IntoIterator<Item = AccessPoint>) {
+        let now = Instant::now();
         if let Ok(mut w) = self.inner.write() {
-            *w = items.into_iter().map(|a| (a.name.clone(), a)).collect();
+            *w = items
+                .into_iter()
+                .map(|ap| (ap.name.clone(), Entry { ap, loaded_at: now }))
+                .collect();
+        }
+        if let Ok(mut n) = self.negative.write() {
+            n.clear();
         }
     }
 
@@ -447,6 +690,21 @@ impl ApCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+    let raw = match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(default),
+    };
+    let v: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{name} 非法: {}", raw.escape_debug()))?;
+    if !(min..=max).contains(&v) {
+        return Err(format!("{name} 超出范围 {min}..={max}: {v}"));
+    }
+    Ok(v)
 }
 
 /// AP 来源（缓存未命中时的权威查询；oss-server 用 Db 实现）。
@@ -470,12 +728,18 @@ pub struct ApInvocation {
 #[derive(Debug, Clone, Copy)]
 pub struct ApPeer(pub IpAddr);
 
+/// HTTP 层注入的**来源 VPC 证明**（`aws:SourceVpc` 条件求值用）。
+/// 缺省 → 带 VPC 条件的语句不匹配（Allow 不命中、Deny 命中，fail-closed）。
+#[derive(Debug, Clone)]
+pub struct ApVpc(pub String);
+
 /// DeleteObjects 经 AP 的逐键策略上下文：键在请求体里，整体判定必然失真，
 /// 由 `service.rs::delete_objects` 在逐键循环里叠交集（被拒键绝不进入删除路径）。
 #[derive(Debug, Clone)]
 pub struct ApDeletePolicy {
     pub ap: AccessPoint,
     pub source_ip: Option<IpAddr>,
+    pub source_vpc: Option<String>,
 }
 
 /// `/ap/<name>/...` 前置路由：鉴权（身份/桶策略 × AP 策略交集）→ 重写到内层服务。
@@ -523,12 +787,19 @@ impl ApRoute {
         if let Some(ap) = self.cache.get(name) {
             return Ok(ap);
         }
+        // 负缓存只记「确认不存在」；DB/解析错误不缓存（保持 500 fail-closed）。
+        if self.cache.negative_hit(name) {
+            return Err(s3s::s3_error!(NoSuchAccessPoint, "access point not found"));
+        }
         match self.source.lookup(name).await {
             Ok(Some(ap)) => {
                 self.cache.put(ap.clone());
                 Ok(ap)
             }
-            Ok(None) => Err(s3s::s3_error!(NoSuchAccessPoint, "access point not found")),
+            Ok(None) => {
+                self.cache.put_negative(name);
+                Err(s3s::s3_error!(NoSuchAccessPoint, "access point not found"))
+            }
             Err(e) => {
                 tracing::error!(error = %e, ap = name, "AP 查询失败");
                 Err(s3s::s3_error!(InternalError, "internal error"))
@@ -1038,6 +1309,8 @@ impl s3s::route::S3Route for ApRoute {
         let (name, raw_suffix) = parse_ap_target(&req.uri, &req.headers)?;
         let ap = self.load_ap(&name).await?;
         let peer = req.extensions.get::<ApPeer>().map(|p| p.0);
+        // 取 owned：后续 `validate_delete_body(&mut req)` 需要可变借用，不跨借用持有。
+        let source_vpc = req.extensions.get::<ApVpc>().map(|v| v.0.clone());
         // H1：s3s 把任意 multipart/form-data POST 无条件解析为 PostObject（键在表单里，
         // 先于 OIR/子资源路由），AP 不支持该 op。即使带 `?delete` 也仍执行 PostObject，
         // 因此这里必须整类拒绝，而不是按查询推导出的 DeleteObjects 放行。
@@ -1103,8 +1376,8 @@ impl s3s::route::S3Route for ApRoute {
             ap.policy.is_none().then_some(false)
         } else {
             match &user {
-                Some(u) => ap_decision(&ap, u, op, key, peer),
-                None => ap_decision_anonymous(&ap, op, key, peer),
+                Some(u) => ap_decision(&ap, u, op, key, peer, source_vpc.as_deref()),
+                None => ap_decision_anonymous(&ap, op, key, peer, source_vpc.as_deref()),
             }
         };
         let allow = base_allow && ap_policy != Some(false);
@@ -1150,6 +1423,7 @@ impl s3s::route::S3Route for ApRoute {
             req.extensions.insert(ApDeletePolicy {
                 ap: ap.clone(),
                 source_ip: peer,
+                source_vpc,
             });
         }
         match user {
@@ -1395,9 +1669,32 @@ mod tests {
             // 畸形 CIDR 在保存时即拒
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceIp":[]}}}]}"#,
+            // StringEquals 只支持 aws:SourceVpc；空列表/畸形 ID/其他键拒
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpc":[]}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpc":"not-a-vpc"}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpce":"vpce-1"}}}]}"#,
+            // 桶级创建/删除/列举动作经 AP 无法执行：保存即拒（精确动作；s3:* 通配仍允许）
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:CreateBucket","Resource":"arn:x"}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:DeleteBucket"],"Resource":"arn:x"}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:ListAllMyBuckets","Resource":"arn:x"}]}"#,
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+        // 通配与受支持动作不受影响
+        assert!(
+            parse(
+                r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*",
+                "Resource":"arn:aws:s3:::bkt/*"}]}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+                "Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpc":["vpc-abc123","vpce-x"]}}}]}"#
+            )
+            .is_ok()
+        );
     }
 
     /// I2：POST `?restore` 推导为 RestoreObject（其余未知 POST 形状仍 501）。
@@ -1447,6 +1744,7 @@ mod tests {
             anonymous: false,
             resources: vec![format!("arn:aws:s3:::bkt/{key}")],
             source_ip: None,
+            source_vpc: None,
         };
         assert_eq!(p.evaluate(&req("open"), "s3:GetObject"), Some(true));
         assert_eq!(p.evaluate(&req("secret/x"), "s3:GetObject"), Some(false));
@@ -1472,6 +1770,7 @@ mod tests {
                     anonymous: false,
                     resources: vec![format!("arn:aws:s3:::bkt/{key}")],
                     source_ip: ip.parse().ok(),
+                    source_vpc: None,
                 },
                 "s3:GetObject",
             )
@@ -1494,6 +1793,79 @@ mod tests {
             Some(false),
             "缺对端时 Deny+NotIpAddress 必须命中（fail-closed）"
         );
+    }
+
+    /// `StringEquals.aws:SourceVpc`：证明匹配才成立；缺证明 fail-closed（Deny 命中、
+    /// Allow 不命中）；与 IP 条件是 AND。
+    #[test]
+    fn source_vpc_condition_matches_and_fails_closed() {
+        let p = parse(
+            r#"{"Statement":[
+              {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*",
+               "Condition":{"StringEquals":{"aws:SourceVpc":["vpc-abc","vpce-xyz"]}}},
+              {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*",
+               "Condition":{"StringEquals":{"aws:SourceVpc":"vpc-abc"}}}
+            ]}"#,
+        )
+        .unwrap();
+        let eval = |key: &str, vpc: Option<&str>| {
+            p.evaluate(
+                &ApEvalRequest {
+                    ak: "AKIA_X",
+                    uid: 7,
+                    anonymous: false,
+                    resources: vec![format!("arn:aws:s3:::bkt/{key}")],
+                    source_ip: None,
+                    source_vpc: vpc,
+                },
+                "s3:GetObject",
+            )
+        };
+        assert_eq!(eval("open", Some("vpc-abc")), Some(true));
+        assert_eq!(eval("open", Some("vpce-xyz")), Some(true));
+        assert_eq!(
+            eval("open", Some("vpc-other")),
+            None,
+            "不匹配 → Allow 不命中"
+        );
+        assert_eq!(
+            eval("open", None),
+            None,
+            "缺证明 → Allow 不命中（fail-closed）"
+        );
+        assert_eq!(eval("secret/x", Some("vpc-abc")), Some(false), "Deny 命中");
+        assert_eq!(
+            eval("secret/x", Some("vpc-other")),
+            None,
+            "Deny 不命中，但 Allow 的 VPC 条件也不满足 → 无匹配"
+        );
+        // 缺证明时 Deny 条件无法求值 → 命中（fail-closed），绝不静默放过
+        assert_eq!(eval("secret/x", None), Some(false));
+        // IP 与 VPC 条件 AND：缺 IP 时整体无法求值
+        let both = parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+               "Resource":"arn:aws:s3:::bkt/*","Condition":{
+                 "IpAddress":{"aws:SourceIp":"10.0.0.0/8"},
+                 "StringEquals":{"aws:SourceVpc":"vpc-abc"}}}]}"#,
+        )
+        .unwrap();
+        let eval_both = |ip: Option<&str>, vpc: Option<&str>| {
+            both.evaluate(
+                &ApEvalRequest {
+                    ak: "AKIA_X",
+                    uid: 7,
+                    anonymous: false,
+                    resources: vec!["arn:aws:s3:::bkt/k".to_string()],
+                    source_ip: ip.and_then(|i| i.parse().ok()),
+                    source_vpc: vpc,
+                },
+                "s3:GetObject",
+            )
+        };
+        assert_eq!(eval_both(Some("10.1.2.3"), Some("vpc-abc")), Some(true));
+        assert_eq!(eval_both(Some("10.1.2.3"), None), None);
+        assert_eq!(eval_both(None, Some("vpc-abc")), None);
+        assert_eq!(eval_both(Some("192.168.1.1"), Some("vpc-abc")), None);
     }
 
     #[test]
@@ -1651,6 +2023,7 @@ mod tests {
             name: "ap1".into(),
             bucket: "bkt".into(),
             owner_id: 7,
+            account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(policy),
             region: "us-east-1".into(),
         });
@@ -1730,6 +2103,7 @@ mod tests {
                 name: name.into(),
                 bucket: "bkt".into(),
                 owner_id: 7,
+                account: crate::access::LEGACY_ACCOUNT.into(),
                 policy: Some(policy),
                 region: "us-east-1".into(),
             }
@@ -2021,6 +2395,7 @@ mod tests {
             name: "ap1".into(),
             bucket: "bkt".into(),
             owner_id: 7,
+            account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(
                 parse(
                     r#"{"Statement":[
@@ -2038,22 +2413,22 @@ mod tests {
             ak: "AKIA_X".into(),
         };
         assert_eq!(
-            ap_decision(&ap, &u, "GetObject", Some("open"), None),
+            ap_decision(&ap, &u, "GetObject", Some("open"), None, None),
             Some(true)
         );
         assert_eq!(
-            ap_decision(&ap, &u, "GetObject", Some("secret/x"), None),
+            ap_decision(&ap, &u, "GetObject", Some("secret/x"), None, None),
             Some(false)
         );
         // 无匹配 action → 拒（有策略 = 默认收窄）
         assert_eq!(
-            ap_decision(&ap, &u, "PutObject", Some("open"), None),
+            ap_decision(&ap, &u, "PutObject", Some("open"), None, None),
             Some(false)
         );
         // L3：无策略 = 默认拒绝（AWS 语义）
         let no_policy = AccessPoint { policy: None, ..ap };
         assert_eq!(
-            ap_decision(&no_policy, &u, "PutObject", Some("open"), None),
+            ap_decision(&no_policy, &u, "PutObject", Some("open"), None, None),
             Some(false)
         );
     }
@@ -2064,6 +2439,7 @@ mod tests {
             name: "ap1".into(),
             bucket: "bkt".into(),
             owner_id: 7,
+            account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(
                 parse(&format!(
                     r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},
@@ -2074,13 +2450,13 @@ mod tests {
             region: "us-east-1".into(),
         };
         assert_eq!(
-            ap_decision_anonymous(&mk("*"), "GetObject", Some("open"), None),
+            ap_decision_anonymous(&mk("*"), "GetObject", Some("open"), None, None),
             Some(true)
         );
         // 空 AK / uid:0 是匿名哨兵，不能被具体 Principal 放行
         for p in ["", "uid:0", "AKIA_X"] {
             assert_eq!(
-                ap_decision_anonymous(&mk(p), "GetObject", Some("open"), None),
+                ap_decision_anonymous(&mk(p), "GetObject", Some("open"), None, None),
                 Some(false),
                 "principal {p:?} 不得匹配匿名请求"
             );
@@ -2094,6 +2470,7 @@ mod tests {
             name: name.into(),
             bucket: bucket.into(),
             owner_id: 1,
+            account: crate::access::LEGACY_ACCOUNT.into(),
             policy: None,
             region: "us-east-1".into(),
         };
@@ -2111,17 +2488,151 @@ mod tests {
         assert_eq!(c.get("x").unwrap().bucket, "y");
     }
 
+    /// 缓存 TTL/负缓存/上限：过期重新查 DB（此处表现为 get=None）、create 清负缓存、
+    /// 满员保可用性（不缓存新条目）、replace_all 清负缓存。
+    #[test]
+    fn cache_ttl_negative_and_bounds() {
+        let mk = |name: &str, bucket: &str| AccessPoint {
+            name: name.into(),
+            bucket: bucket.into(),
+            owner_id: 1,
+            account: crate::access::LEGACY_ACCOUNT.into(),
+            policy: None,
+            region: "us-east-1".into(),
+        };
+        let fresh = Duration::from_secs(60);
+        let c = ApCache::with_config(fresh, fresh, 10);
+        c.put(mk("a", "b"));
+        assert!(c.get("a").is_some());
+        assert!(!c.negative_hit("a"));
+        // 负缓存：未知 AP 命中；put（创建）后立刻清除
+        c.put_negative("ghost");
+        assert!(c.negative_hit("ghost") && c.get("ghost").is_none());
+        assert!(!c.negative_hit("other"));
+        c.put_negative("new");
+        c.put(mk("new", "b"));
+        assert!(!c.negative_hit("new") && c.get("new").is_some());
+        // replace_all 清负缓存
+        c.put_negative("stale");
+        c.replace_all([mk("x", "y")]);
+        assert!(!c.negative_hit("stale"));
+        assert_eq!(c.len(), 1);
+        // TTL=0 = 不缓存正条目；负 TTL=0 = 关闭负缓存
+        let none = ApCache::with_config(Duration::ZERO, Duration::ZERO, 10);
+        none.put(mk("a", "b"));
+        none.put_negative("ghost");
+        assert!(none.get("a").is_none() && !none.negative_hit("ghost"));
+        // 短 TTL 到点后过期（不等待生产默认 30s）
+        let short = ApCache::with_config(Duration::from_millis(1), Duration::from_millis(1), 10);
+        short.put(mk("a", "b"));
+        short.put_negative("ghost");
+        assert!(short.get("a").is_some() && short.negative_hit("ghost"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(short.get("a").is_none(), "TTL 到期后必须重查");
+        assert!(!short.negative_hit("ghost"), "负缓存 TTL 到期");
+        // 上限：2 个新鲜条目已满 → 第 3 个不缓存（直接查 DB），已有条目仍可用
+        let bound = ApCache::with_config(fresh, fresh, 2);
+        bound.put(mk("a", "b"));
+        bound.put(mk("b", "b"));
+        bound.put(mk("c", "b"));
+        assert_eq!(bound.len(), 2);
+        assert!(bound.get("a").is_some() && bound.get("c").is_none());
+    }
+
     #[test]
     fn arn_shapes() {
-        let c = ApContext::new("ap1", "eu-west-1");
+        let c = ApContext::new("ap1", "eu-west-1", "000000000007");
         assert_eq!(
             c.object_arn("a/b"),
-            "arn:aws:s3:eu-west-1:000000000000:accesspoint/ap1/object/a/b"
+            "arn:aws:s3:eu-west-1:000000000007:accesspoint/ap1/object/a/b"
         );
         assert_eq!(
             c.bucket_arn(),
+            "arn:aws:s3:eu-west-1:000000000007:accesspoint/ap1"
+        );
+        // 旧账户段别名（一版兼容）
+        let l = ApContext::legacy("ap1", "eu-west-1");
+        assert_eq!(
+            l.bucket_arn(),
             "arn:aws:s3:eu-west-1:000000000000:accesspoint/ap1"
         );
+    }
+
+    /// 账户命名空间 v1（AP 侧）：新 ARN 账户 = 桶账户；旧 LEGACY ARN 仍作资源别名；
+    /// Principal 接受 `arn:aws:iam::<account>:root`，LEGACY/其他账户不命中。
+    #[test]
+    fn account_namespace_arns_and_principals() {
+        use crate::access::AuthedUser;
+        let mk = |account: &str, principal: &str, resource: &str| AccessPoint {
+            name: "ap1".into(),
+            bucket: "bkt".into(),
+            owner_id: 7,
+            account: account.into(),
+            policy: Some(
+                parse(&format!(
+                    r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},
+                       "Action":"s3:GetObject","Resource":"{resource}"}}]}}"#
+                ))
+                .unwrap(),
+            ),
+            region: "us-east-1".into(),
+        };
+        let u = AuthedUser {
+            ak: "AKIA_X".into(),
+            uid: 7,
+            is_admin: false,
+        };
+        // 新账户 AP ARN 可匹配
+        assert_eq!(
+            ap_decision(
+                &mk(
+                    "000000000007",
+                    "*",
+                    "arn:aws:s3:us-east-1:000000000007:accesspoint/ap1/object/*"
+                ),
+                &u,
+                "GetObject",
+                Some("k"),
+                None,
+                None
+            ),
+            Some(true)
+        );
+        // 旧 LEGACY ARN 仍是资源别名（已保存的旧策略继续匹配）
+        assert_eq!(
+            ap_decision(
+                &mk(
+                    "000000000007",
+                    "*",
+                    "arn:aws:s3:us-east-1:000000000000:accesspoint/ap1/object/*"
+                ),
+                &u,
+                "GetObject",
+                Some("k"),
+                None,
+                None
+            ),
+            Some(true)
+        );
+        // Principal 账户 ARN：同账户命中，LEGACY/他账户不命中
+        for (principal, want) in [
+            ("arn:aws:iam::000000000007:root", Some(true)),
+            ("arn:aws:iam::000000000000:root", Some(false)),
+            ("arn:aws:iam::000000000008:root", Some(false)),
+        ] {
+            assert_eq!(
+                ap_decision(
+                    &mk("000000000007", principal, "arn:aws:s3:::bkt/*"),
+                    &u,
+                    "GetObject",
+                    Some("k"),
+                    None,
+                    None
+                ),
+                want,
+                "principal {principal}"
+            );
+        }
     }
 
     /// 结构断言：并发槽在读取输入体期间已被持有（缓冲不得发生在闸外）。
