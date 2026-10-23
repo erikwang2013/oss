@@ -46,6 +46,8 @@ rskafka = { version = "0.6", default-features = false, features = ["transport-tl
 sqlparser = "0.53"
 # M6 切片 2：GZIP 输入解压（纯 Rust backend）
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# S3 Select BZIP2 输入解压（默认 libbz2-rs-sys 纯 Rust 后端，无 C 依赖）
+bzip2 = "0.6"
 # M8：Inventory Parquet 输出。default-features=false 避免拉入 Arrow；SNAPPY 压缩。
 parquet = { version = "60", default-features = false, features = ["snap"] }
 # M5 切片 4：对象锁 retain-until 的时间换算（s3s::dto::Timestamp ↔ OffsetDateTime）

@@ -3018,13 +3018,7 @@ impl S3 for OssS3 {
             .map(|c| c.as_str().to_string())
             .unwrap_or_else(|| "NONE".to_string());
         match comp.as_str() {
-            "NONE" | "GZIP" => {}
-            "BZIP2" => {
-                return Err(s3s::s3_error!(
-                    InvalidRequest,
-                    "BZIP2 compression is not supported yet"
-                ));
-            }
+            "NONE" | "GZIP" | "BZIP2" => {}
             other => {
                 return Err(s3s::s3_error!(
                     InvalidRequest,
@@ -3033,10 +3027,12 @@ impl S3 for OssS3 {
                 ));
             }
         }
-        if comp == "GZIP" && request.scan_range.is_some() {
+        // ScanRange 是解压前字节区间语义，压缩流无法按记录偏移取——均 400 拒绝
+        if matches!(comp.as_str(), "GZIP" | "BZIP2") && request.scan_range.is_some() {
             return Err(s3s::s3_error!(
                 InvalidRequest,
-                "ScanRange is not supported for GZIP objects"
+                "ScanRange is not supported for {} objects",
+                comp
             ));
         }
         // Parquet：AWS 只允许 CompressionType NONE（列内压缩由文件自身声明）；
@@ -3176,22 +3172,24 @@ impl S3 for OssS3 {
                 "对象超过 S3 Select 的 256MiB 输入上限"
             ));
         }
-        let input_owned: Vec<u8> = if comp == "GZIP" {
-            use std::io::Read as _;
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(&bytes[..])
-                .take(MAX_INFLATED as u64 + 1)
-                .read_to_end(&mut out)
-                .map_err(|_| s3s::s3_error!(InvalidRequest, "GZIP decompress failed"))?;
-            if out.len() > MAX_INFLATED {
-                return Err(s3s::s3_error!(
-                    InvalidRequest,
-                    "GZIP 解压后超过 512MiB 上限"
-                ));
+        let input_owned: Vec<u8> = match comp.as_str() {
+            "GZIP" => {
+                use std::io::Read as _;
+                let mut out = Vec::new();
+                flate2::read::GzDecoder::new(&bytes[..])
+                    .take(MAX_INFLATED as u64 + 1)
+                    .read_to_end(&mut out)
+                    .map_err(|_| s3s::s3_error!(InvalidRequest, "GZIP decompress failed"))?;
+                if out.len() > MAX_INFLATED {
+                    return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "GZIP 解压后超过 512MiB 上限"
+                    ));
+                }
+                out
             }
-            out
-        } else {
-            bytes.to_vec()
+            "BZIP2" => sel::inflate_bzip2(&bytes, MAX_INFLATED)?,
+            _ => bytes.to_vec(),
         };
 
         // 3) ScanRange：AWS 语义 = 记录首字节落在区间内则整条处理；仅 End = 末尾 N 字节
@@ -3230,7 +3228,7 @@ impl S3 for OssS3 {
             let hi = hi.clamp(0, len - 1);
             if lo <= hi { hi - lo + 1 } else { 0 }
         });
-        let default_scanned = if comp == "GZIP" {
+        let default_scanned = if matches!(comp.as_str(), "GZIP" | "BZIP2") {
             bytes.len() as i64
         } else {
             len

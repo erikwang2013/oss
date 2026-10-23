@@ -1,5 +1,5 @@
 //! M6 切片 2：S3 Select 服务线级测试——handler 全链（事件流序列/Stats/Progress/ScanRange/
-//! GZIP/SSE-C/边界 400）。帧的线上成帧属 s3s（R4 口径），此处钉**事件序列**。
+//! GZIP/BZIP2/SSE-C/边界 400）。帧的线上成帧属 s3s（R4 口径），此处钉**事件序列**。
 
 use std::sync::Arc;
 
@@ -371,6 +371,66 @@ async fn select_scan_range_and_gzip() {
 }
 
 #[tokio::test]
+async fn select_bzip2_csv_roundtrip_and_malformed() {
+    use std::io::Write as _;
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "selz".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    enc.write_all(b"x,1\ny,2\n").unwrap();
+    let bz = enc.finish().unwrap();
+    put_object(&s3, "selz", "d.csv.bz2", &bz).await;
+    let bzip2_req = |expression: &str| {
+        let mut r = sel_request(expression, true, false, false);
+        r.input_serialization.compression_type = Some(CompressionType::from_static("BZIP2"));
+        r
+    };
+    let evs = run_select(
+        &s3,
+        "selz",
+        "d.csv.bz2",
+        bzip2_req("SELECT s._2 FROM S3Object"),
+    )
+    .await;
+    assert_eq!(records(&evs), b"1\n2\n".to_vec());
+    // R4 口径：BytesScanned=压缩后、BytesProcessed=解压后
+    let stats = evs
+        .iter()
+        .find_map(|e| {
+            if let SelectObjectContentEvent::Stats(s) = e {
+                s.details
+                    .as_ref()
+                    .map(|d| (d.bytes_scanned.unwrap(), d.bytes_processed.unwrap()))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(stats.0, bz.len() as i64);
+    assert_eq!(stats.1, 8);
+    // 非 BZIP2 字节 / 截断流 → 确定性 400
+    for (key, body) in [
+        ("bad.bz2", &b"not a bzip2 stream"[..]),
+        ("trunc.bz2", &bz[..bz.len() / 2]),
+    ] {
+        put_object(&s3, "selz", key, body).await;
+        let e = s3
+            .select_object_content(req(select_input(
+                "selz",
+                key,
+                bzip2_req("SELECT * FROM S3Object"),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest, "{key}");
+    }
+}
+
+#[tokio::test]
 async fn select_utf8_comments_and_quoted_newline() {
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {
@@ -534,9 +594,13 @@ async fn select_boundary_errors_400() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest);
-    // BZIP2 → 400（记档延后）
+    // BZIP2 + ScanRange 同 GZIP：压缩流无记录偏移语义 → 400
     let mut r = sel_request("SELECT * FROM S3Object", true, false, false);
     r.input_serialization.compression_type = Some(CompressionType::from_static("BZIP2"));
+    r.scan_range = Some(ScanRange {
+        start: Some(0),
+        end: None,
+    });
     let e = s3
         .select_object_content(req(select_input("sele", "d.csv", r)))
         .await
