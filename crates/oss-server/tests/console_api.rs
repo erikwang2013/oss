@@ -1253,7 +1253,7 @@ async fn object_tags_console_routes() {
     assert_eq!(v, serde_json::json!({"tags": []}));
 }
 
-/// M8 S6 缺口 A：加密/KMS 只读状态——admin 200、非 admin 403、仅三个字段（无钥材料）。
+/// M8 S6 缺口 A：加密/KMS 只读状态——admin 200、非 admin 403、无钥材料（3.16 起含 CMK 快照）。
 #[tokio::test]
 async fn encryption_status_is_admin_read_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -1278,7 +1278,9 @@ async fn encryption_status_is_admin_read_only() {
         .unwrap();
     assert_eq!(
         v,
-        serde_json::json!({"sse_s3": false, "sse_kms": false, "kms_current_key_id": null})
+        serde_json::json!({
+            "sse_s3": false, "sse_kms": false, "kms_current_key_id": null, "cmks": []
+        })
     );
 
     // 接线后：只回布尔与当前主密钥编号（k0），不含任何钥字节
@@ -1300,12 +1302,213 @@ async fn encryption_status_is_admin_read_only() {
         .unwrap();
     assert_eq!(
         v,
-        serde_json::json!({"sse_s3": true, "sse_kms": true, "kms_current_key_id": "k0"})
+        serde_json::json!({
+            "sse_s3": true, "sse_kms": true, "kms_current_key_id": "k0", "cmks": []
+        })
     );
 
     // 非管理员 403
     let r = client.get(&url).bearer_auth(&bob).send().await.unwrap();
     assert_eq!(r.status(), 403);
+}
+
+/// 3.16：命名 CMK 管理 API（admin-only；create/rotate/list；审计只记指纹，绝不回钥字节）。
+#[tokio::test]
+async fn encryption_cmk_admin_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store
+        .init_encryption(
+            Some(dir.path().join("master.key")),
+            Some(dir.path().join("kms")),
+        )
+        .await
+        .unwrap();
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let list_url = format!("{base}/api/v1/encryption/cmks");
+
+    // 初始空表
+    let v: serde_json::Value = client
+        .get(&list_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!({"cmks": []}));
+
+    // 非管理员：读/写/轮换均 403
+    assert_eq!(
+        client
+            .get(&list_url)
+            .bearer_auth(&bob)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .post(&list_url)
+            .bearer_auth(&bob)
+            .json(&serde_json::json!({"name": "tenant-a"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v1/encryption/cmks/tenant-a/rotate"))
+            .bearer_auth(&bob)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+
+    // 非法名（穿越）/重复创建 → 400；不落目录
+    let r = client
+        .post(&list_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"name": "../x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(
+        !dir.path().join("kms/cmk").exists(),
+        "非法名不得落目录（读/写路径不自动创建）"
+    );
+
+    let r = client
+        .post(&list_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"name": "tenant-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"name": "tenant-a", "current_version": 0})
+    );
+    let r = client
+        .post(&list_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"name": "tenant-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "重复创建不得覆盖既有钥");
+
+    // 列表快照（名/版本/时间），且绝不出现钥字节（hex 形态）
+    let raw = client
+        .get(&list_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let key = std::fs::read(dir.path().join("kms/cmk/tenant-a/key-0.bin")).unwrap();
+    let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(!raw.contains(&key_hex), "CMK 列表泄漏钥字节");
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["cmks"][0]["name"], "tenant-a");
+    assert_eq!(v["cmks"][0]["current_version"], 0);
+    assert_eq!(v["cmks"][0]["versions"], serde_json::json!([0]));
+    assert!(v["cmks"][0]["updated_nanos"].as_i64().unwrap() > 0);
+
+    // 状态端点同步暴露 CMK 快照
+    let v: serde_json::Value = client
+        .get(format!("{base}/api/v1/encryption"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["cmks"][0]["name"], "tenant-a");
+
+    // 轮换 → 新版本 1；未知 CMK → 400
+    let r = client
+        .post(format!("{base}/api/v1/encryption/cmks/tenant-a/rotate"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"name": "tenant-a", "current_version": 1})
+    );
+    let r = client
+        .post(format!("{base}/api/v1/encryption/cmks/nope/rotate"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    // 旧版本保留（旧对象仍可解）
+    let v: serde_json::Value = client
+        .get(&list_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["cmks"][0]["versions"], serde_json::json!([0, 1]));
+    assert_eq!(v["cmks"][0]["current_version"], 1);
+
+    // 审计：create + rotate 各一行；detail 仅名/版本/指纹
+    let rows = st
+        .db
+        .list_audit(&oss_server::db::AuditFilter {
+            limit: 10,
+            decision: None,
+            from: None,
+            to: None,
+            uid: None,
+            op: Some("control:cmk-create"),
+            bucket: None,
+            key_prefix: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["detail"].as_str().unwrap().contains("tenant-a"));
+    let rows = st
+        .db
+        .list_audit(&oss_server::db::AuditFilter {
+            limit: 10,
+            decision: None,
+            from: None,
+            to: None,
+            uid: None,
+            op: Some("control:cmk-rotate"),
+            bucket: None,
+            key_prefix: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }
 
 // ---------- M8 S6 缺口 B：通知 CRUD / 死信 / Select 代理 / IAM 预设 ----------
