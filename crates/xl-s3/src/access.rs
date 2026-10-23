@@ -880,7 +880,7 @@ pub(crate) fn acl_err(e: sqlx::Error) -> S3Error {
 }
 
 /// L1：匿名请求携带的对象锁/治理旁路头（返回头名用于审计；值不记录）。
-fn anonymous_lock_header(headers: &HeaderMap) -> Option<&'static str> {
+pub(crate) fn anonymous_lock_header(headers: &HeaderMap) -> Option<&'static str> {
     [
         (
             "x-amz-object-lock-mode",
