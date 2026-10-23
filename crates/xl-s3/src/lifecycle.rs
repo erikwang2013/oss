@@ -291,6 +291,8 @@ pub enum LifecycleError {
     InvalidArgument(String),
     /// 501 NotImplemented（线格式中本实现不支持的字段）。
     NotImplemented(String),
+    /// 503 ServiceUnavailable（控制面不可用/滚动升级未激活；fail-closed，重试幂等）。
+    Unavailable(String),
     Internal(String),
 }
 
@@ -303,6 +305,7 @@ impl std::fmt::Display for LifecycleError {
             | Self::InvalidClass(m)
             | Self::InvalidArgument(m)
             | Self::NotImplemented(m)
+            | Self::Unavailable(m)
             | Self::Internal(m) => write!(f, "{m}"),
         }
     }

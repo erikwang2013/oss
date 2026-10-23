@@ -167,6 +167,70 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
     assert!(Db::connect(&url).await.is_err());
 }
 
+/// 导出含 level-2 生命周期数据（config_json）时，cutover 必须在写之前拒绝
+/// （dry-run 同样拒绝）；否则目标库会留下无法生成 OSSCTL1 快照的基线。
+#[tokio::test]
+async fn cutover_refuses_level_two_lifecycle_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "l2-src.db").await;
+    seed_admin_and_rows(&src).await;
+    sqlx::query(
+        "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at, \
+         rule_id, expiration_days, config_json) VALUES ('b1', 'logs/', 30, 1, 5, 'r1', 30, \
+         '{\"filter\":{\"prefix\":\"logs/\"}}')",
+    )
+    .execute(src.pool())
+    .await
+    .unwrap();
+    let export = cutover::build_export(
+        &src,
+        "site-a".into(),
+        Some(1),
+        "voter",
+        Some("admin".into()),
+        Some(false),
+    )
+    .await
+    .unwrap();
+    assert!(
+        export
+            .data
+            .lifecycle_rules
+            .iter()
+            .any(|r| r.config_json.is_some()),
+        "export must carry config_json"
+    );
+
+    let dst = db_at(dir.path(), "l2-dst.db").await;
+    seed_admin_and_rows(&dst).await;
+    for dry_run in [true, false] {
+        let err = cutover::cutover(
+            &dst,
+            &facts(),
+            &export,
+            &CutoverOptions {
+                dry_run,
+                overwrite: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, CutoverError::Invalid(_)), "{msg}");
+        assert!(
+            msg.contains("config_json") && msg.contains("OSSCTL1"),
+            "error must be actionable: {msg}"
+        );
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_rules")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "refused cutover must not install level-2 rows");
+    assert_eq!(dst.schema_meta("raft_mode").await.unwrap(), None);
+    assert_eq!(dst.schema_meta("raft_cutover").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn force_recover_fresh_log_and_refuses_existing() {
     let dir = tempfile::tempdir().unwrap();

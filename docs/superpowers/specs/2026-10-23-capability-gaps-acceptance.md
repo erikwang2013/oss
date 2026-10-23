@@ -49,7 +49,8 @@ Level B 前向兼容窗口已实现：Raft RPC wire/feature 头、term-stamped p
 `tests/e2e_m9_rolling.sh`。D6 原判「本批无 replicated `ControlData` 变更」不成立：
 `LifecycleRuleRow.config_json` 已进快照。2026-10-23 热修把 `BucketSetLifecycleV2` 标为
 level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`），并让快照编码器
-在存在 `config_json` 时拒绝 OSSCTL1（fail-closed，待 OSSCTL2）。
+在存在 `config_json` 时拒绝 OSSCTL1；`raft-cutover` 复用同一守卫（`--dry-run` 亦拒绝），
+避免安装出无法建快照的基线（fail-closed，待 OSSCTL2）。
 
 ## 2. 明确不做的边界（非目标，fail-closed/记档）
 

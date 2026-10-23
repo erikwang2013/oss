@@ -1190,8 +1190,10 @@ append/vote/snapshot/status/membership/write/join。
   **2026-10-23 Level B 热修**：`BucketSetLifecycleV2` 此前漏标 level 2（混合窗口会被
   v1.13.1 副本解码失败，快照会静默丢结构化规则）；现已 `min_feature_level()=2`（写入门控
   503 `feature_unavailable`），且快照编码器在 `lifecycle_rules.config_json` 非空时拒绝
-  OSSCTL1（fail-closed，待 OSSCTL2）。回归测试见 `crates/oss-server/tests/raft_commands.rs`
-  与 `crates/oss-server/src/raft/data.rs`。
+  OSSCTL1（fail-closed，待 OSSCTL2）；`raft-cutover` 复用同一守卫（dry-run 也拒绝），
+  不会把 level-2 规则装进无快照能力的基线。回归测试见
+  `crates/oss-server/tests/raft_commands.rs`、`tests/raft_cutover.rs` 与
+  `src/raft/data.rs`。
 
 ### 模式矩阵
 
@@ -1434,11 +1436,12 @@ db_path = "/var/lib/oss/raft.db"
      `{"error":"feature_unavailable","required":2,"effective":1}`）；旧列可表达的规则
      仍走 V1、行为不变。首条结构化规则写入即激活 `schema_meta.raft_feature_level=2`
      （不归点同下）。`tests/e2e_m9_rolling.sh` 已提供但本批未实跑（缺 v1.13.1 旧二进制）。
-   - **快照 fail-closed（OSSCTL2 之前）**：`lifecycle_rules.config_json` 非空时，控制快照
-     与 `raft-force-recover` 拒绝生成 OSSCTL1（`control data: level-2 data present;
-     refusing OSSCTL1`），避免 v1.13.1 安装时静默丢弃结构化规则（`raft-export` 仍可
-     导出，但恢复会被同一守卫拒绝）。含结构化规则的集群在 OSSCTL2 落地前无法用快照
-     跟随新成员/强制恢复/回退；需要这些操作时先删除结构化规则，或等待 OSSCTL2。
+   - **快照/切档 fail-closed（OSSCTL2 之前）**：`lifecycle_rules.config_json` 非空时，控制
+     快照、`raft-force-recover` 与 `raft-cutover`（含 `--dry-run`）都拒绝 OSSCTL1
+     （`level-2 data present; refusing OSSCTL1`），避免 v1.13.1 安装时静默丢弃结构化规则
+     （`raft-export` 仍可导出，但恢复/切档会被同一守卫拒绝）。含结构化规则的环境在 OSSCTL2
+     落地前无法用快照跟随新成员/强制恢复/回退，也无法从 M7 切档到 Raft；需要这些操作时
+     先在源端删除或降级结构化规则再导出，或等待 OSSCTL2。
    - **窗口内禁止成员变更**：新 leader 在 add/promote/replace 前预检——现有 voter/learner
      任一 `wire<2`、目标未达标或不可达 → 409 `peer_incompatible`；不可达的旧节点只能被
      移除/替换。console 配对（`/sites`、`/join`）同样要求对端 identity 带 wire 2 且

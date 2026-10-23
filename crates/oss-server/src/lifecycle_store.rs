@@ -13,7 +13,7 @@ use xl_s3::lifecycle::{
 
 use crate::db::{Db, LifecycleRuleRow};
 use crate::raft::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, LifecycleRuleCmdV2};
-use crate::raft::control::ControlPlane;
+use crate::raft::control::{ControlError, ControlPlane};
 
 pub struct SqlLifecycleStore {
     db: Arc<Db>,
@@ -52,6 +52,11 @@ fn control_error(
         Ok(_) => Err(LifecycleError::InvalidArgument(
             "control write rejected".into(),
         )),
+        // 与 ControlError::http_status 一致：控制面暂不可用（含 Level B feature
+        // 未激活）→ 503；set/clear 幂等，可重试。
+        Err(e @ (ControlError::Timeout(_) | ControlError::Unavailable(_))) => {
+            Err(LifecycleError::Unavailable(e.to_string()))
+        }
         Err(e) => Err(LifecycleError::Internal(e.to_string())),
     }
 }

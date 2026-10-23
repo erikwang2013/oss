@@ -252,6 +252,17 @@ pub async fn cutover(
     opts: &CutoverOptions,
 ) -> Result<CutoverReport, CutoverError> {
     verify_export(export).map_err(CutoverError::Invalid)?;
+    // 与快照安装同一守卫：OSSCTL1 带不了 config_json。放行 cutover 会留下无法建快照的
+    // 基线（成员加入/force-recover/回滚全部失败）。dry-run 同样在这里被拒绝。
+    // shortcut: OSSCTL2 落地前一律拒绝；届时改为要求 level 2 并原子 bump marker。
+    if let Err(e) = data::encode_snapshot(&export.data) {
+        return Err(CutoverError::Invalid(format!(
+            "export contains level-2 lifecycle data (config_json); OSSCTL1 cannot carry \
+             structured lifecycle rules, so the cluster could not build snapshots \
+             (member add/force-recover/rollback would fail). Remove or downgrade those \
+             rules at the source and re-export. [{e}]"
+        )));
+    }
     if export.source_role != "voter" {
         return Err(CutoverError::Invalid(
             "witness export cannot be used for cutover".into(),
