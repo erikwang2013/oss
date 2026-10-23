@@ -996,6 +996,92 @@ async fn sse_kms_roundtrip_and_key_id_routing() {
     );
 }
 
+/// 3.16：显式 CMK 写读全链、轮换后旧对象可读、未知/缺钥 fail-closed。
+#[tokio::test]
+async fn sse_kms_explicit_cmk_roundtrip_rotation_and_fail_closed() {
+    let (s, d) = enc_store().await;
+    let kms = s.enc_state().unwrap().kms.as_ref().unwrap().clone();
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let body = payload(200_000);
+    let spec = || Some(EncSpec::SseKmsCmk("tenant-a".into()));
+    let info = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(body.clone()),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Off,
+            spec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rec = info.encryption.as_ref().unwrap();
+    assert_eq!(rec.key_id, "cmk:tenant-a:k0");
+    assert_eq!(
+        rec.kms_key_id.as_deref(),
+        Some("tenant-a"),
+        "用户态 id 入记录"
+    );
+    let (_, got) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(got, body, "显式 CMK 往返");
+
+    // 轮换：旧对象照读，新写走 k1
+    assert_eq!(kms.rotate_cmk("tenant-a").await.unwrap(), 1);
+    let (_, got) = s.get_object("alpha", "k").await.unwrap();
+    assert_eq!(got, body, "轮换后旧版本仍可解");
+    let info2 = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k2",
+            stream_of(payload(100)),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Off,
+            spec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(info2.encryption.unwrap().key_id, "cmk:tenant-a:k1");
+
+    // 未知 CMK：写路径 InvalidArgument（绝不回退默认钥/明文）
+    let e = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k3",
+            stream_of(payload(100)),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Off,
+            Some(EncSpec::SseKmsCmk("ghost".into())),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::InvalidArgument(_)),
+        "未知 CMK 应 InvalidArgument：{e:?}"
+    );
+
+    // 删掉 k0 钥文件：旧对象读 → Crypto（fail-closed，绝不明文兜底）；k1 对象不受影响
+    std::fs::remove_file(layout::sys_dir(d.path(), "kms").join("cmk/tenant-a/key-0.bin")).unwrap();
+    let e = s.get_object("alpha", "k").await.unwrap_err();
+    assert!(matches!(e, Error::Crypto(_)), "缺 CMK 钥应 Crypto：{e:?}");
+    assert!(s.get_object("alpha", "k2").await.is_ok());
+}
+
 #[tokio::test]
 async fn version_chain_keeps_old_encrypted_versions_readable() {
     let (s, _d) = enc_store().await;
@@ -1197,6 +1283,7 @@ async fn decode_rejects_bad_encryption_records() {
             wrapped_dek_hex: wrapped.into(),
             nonce_seed_hex: seed.into(),
             sse_c_key_md5: md5.map(str::to_string),
+            kms_key_id: None,
         });
         m
     };
