@@ -101,7 +101,7 @@ test('设置页：渲染加密/KMS 只读状态', async ({ page }) => {
   await expect(page.getByText('SSE-S3（主密钥文件）')).toBeVisible()
   await expect(page.getByText('SSE-KMS')).toBeVisible()
   await expect(page.getByText('当前 KMS 主密钥')).toBeVisible()
-  await expect(page.getByText(/配置由环境变量驱动/)).toBeVisible()
+  await expect(page.getByText(/环境变量驱动/)).toBeVisible()
 })
 
 test('事件通知：保存目标并回读，死信区块可见', async ({ page }) => {
