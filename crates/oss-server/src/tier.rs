@@ -37,6 +37,17 @@ pub const STAGING_FREE_RESERVE: u64 = 64 << 20;
 static SPACE_RESERVATIONS: LazyLock<Mutex<HashMap<u64, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 创建 0600 的 tier 暂存文件（tier-*.stage / restore-stage）。
+///
+/// 暂存文件在落盘完成前是明文：权限必须从创建瞬间就是 0600，不能依赖 umask。
+pub(crate) async fn create_private_stage_file(
+    path: &Path,
+) -> std::io::Result<tokio::fs::File> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true).mode(0o600);
+    opts.open(path).await
+}
+
 /// 预留登记；Drop 即释放（成功、失败、future 取消统一走这里）。
 pub struct SpaceReservation {
     dev: u64,
@@ -321,7 +332,7 @@ impl S3TierBackend {
             .staging_dir
             .join(format!("tier-{}.stage", uuid::Uuid::new_v4()));
         let guard = StageGuard::new(path.clone()).with_reservation(space);
-        let mut f = tokio::fs::File::create(&path)
+        let mut f = create_private_stage_file(&path)
             .await
             .map_err(|e| format!("tier 暂存文件创建失败：{e}"))?;
         let mut md5 = md5::Md5::new();
@@ -569,6 +580,17 @@ mod tests {
         SPACE_RESERVATIONS.lock().unwrap().insert(dev, 5);
         drop(SpaceReservation { dev, bytes: 9 });
         assert!(!SPACE_RESERVATIONS.lock().unwrap().contains_key(&dev));
+    }
+
+    /// 暂存文件从创建瞬间就是 0600（明文落盘不依赖 umask）。
+    #[tokio::test]
+    async fn private_stage_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("tier-x.stage");
+        drop(create_private_stage_file(&p).await.unwrap());
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode={mode:o}");
     }
 
     /// 只删「旧 + 非活跃 + 普通文件 + tier-*.stage」；新文件、活跃文件、

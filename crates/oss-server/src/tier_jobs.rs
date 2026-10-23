@@ -360,7 +360,7 @@ impl M8TaskExecutor {
         let space = reserve_free_space(dir, t.size, self.restore_free_reserve)?;
         let guard = StageGuard::new(stage.clone()).with_reservation(space);
         let mut body = backend.get(&t.key).await?;
-        let mut f = tokio::fs::File::create(&stage)
+        let mut f = crate::tier::create_private_stage_file(&stage)
             .await
             .map_err(|e| format!("恢复暂存文件创建失败：{e}"))?;
         let mut hasher = sha2::Sha256::new();
