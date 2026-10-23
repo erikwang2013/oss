@@ -877,9 +877,10 @@ impl AppState {
         let repl_client =
             Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes).with_tls(Arc::clone(&tls)));
         // M8 S4b：tier 后端固定于启动配置；规则校验只认这些 id。
-        let tiers = Arc::new(crate::tier::TierBackends::from_config_tls(
+        let tiers = Arc::new(crate::tier::TierBackends::from_config_tls_staging(
             &cfg.tiers,
             Some(Arc::clone(&tls)),
+            Some(cfg.staging_dir.clone()),
         ));
         let lifecycle: Arc<dyn xl_s3::lifecycle::LifecycleStore> = Arc::new(
             crate::lifecycle_store::SqlLifecycleStore::new(Arc::clone(&db), Arc::new(tiers.ids()))

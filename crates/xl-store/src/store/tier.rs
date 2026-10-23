@@ -3,12 +3,17 @@
 //! 全部迁移都在对象锁内重写 meta（提交点）；本地数据文件的写入发生在 meta 之外
 //! （prepare 阶段对读路径不可见），保证「先数据、后 row、再 meta」的恢复顺序。
 
+use std::path::{Path, PathBuf};
+
 use tokio::io::AsyncWriteExt as _;
 
 use super::Store;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, PartRef, TierPhase, TierState};
+
+/// 恢复下载暂存文件名（不以 `part.` 开头：fsck 的 stray 扫描不碰它）。
+const RESTORE_STAGE: &str = "restore-stage";
 
 /// 归档提交参数（避免长参数列表）。
 pub struct ArchiveSpec {
@@ -263,6 +268,82 @@ impl Store {
         }
         drop(f);
         tokio::fs::rename(&tmp, &path).await?;
+        Ok(())
+    }
+
+    /// 恢复下载的暂存路径（版本目录内固定名，一个任务一份；drop/abort 即清理）。
+    pub fn restore_stage_path(&self, bucket: &str, key: &str, uuid: &str) -> Result<PathBuf> {
+        if uuid.is_empty() || uuid.contains(['/', '\\', '\0']) || uuid == "." || uuid == ".." {
+            return Err(Error::InvalidKey(format!("版本 uuid 非法：{uuid:?}")));
+        }
+        let dir = layout::object_dir(self.cfg.root(), bucket, key)?.join(uuid);
+        Ok(dir.join(RESTORE_STAGE))
+    }
+
+    /// 用流式下载好的暂存文件提交恢复副本：校验长度 → fsync → rename（对读路径不可见）。
+    /// 调用方在 Restoring 阶段、持锁前完成下载与 SHA-256 校验。
+    pub async fn restore_prepare_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        staged: &Path,
+    ) -> Result<()> {
+        self.ensure_bucket(bucket).await?;
+        let _guard = self.lock_object(bucket, key).await?;
+        let Some(m) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchKey(key.to_string()));
+        };
+        let v = m
+            .find_version(version_id)
+            .filter(|v| !v.delete_marker())
+            .ok_or_else(|| Error::NoSuchKey(format!("{key}@{version_id}")))?;
+        if v.tier.as_ref().map(|t| t.phase) != Some(TierPhase::Restoring) {
+            return Err(Error::RestoreAlreadyInProgress(format!(
+                "{bucket}/{key}@{version_id}: 不在 Restoring 阶段"
+            )));
+        }
+        let dir = layout::object_dir(self.cfg.root(), bucket, key)?.join(&v.part.uuid);
+        if staged != dir.join(RESTORE_STAGE) {
+            return Err(Error::InvalidArgument(format!(
+                "恢复暂存路径不在版本目录内：{}",
+                staged.display()
+            )));
+        }
+        let len = tokio::fs::metadata(staged)
+            .await
+            .map(|m| m.len())
+            .map_err(|e| {
+                Error::CorruptMeta(format!("{bucket}/{key}@{version_id}: 恢复暂存不可读：{e}"))
+            })?;
+        if len != v.size {
+            return Err(Error::CorruptMeta(format!(
+                "{bucket}/{key}@{version_id}: 恢复数据长度 {len} ≠ {}",
+                v.size
+            )));
+        }
+        let path = dir.join("part.1");
+        let tmp = dir.join("part.1.restore-tmp");
+        if let Err(e) = tokio::fs::rename(staged, &tmp).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        let out = async {
+            let f = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+            if self.cfg.fsync {
+                f.sync_all().await?;
+            }
+            drop(f);
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        if let Err(e) = out {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        if self.cfg.fsync {
+            tokio::fs::File::open(&dir).await?.sync_all().await?;
+        }
         Ok(())
     }
 

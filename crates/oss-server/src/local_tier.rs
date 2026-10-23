@@ -10,18 +10,19 @@
 //! Linux 回退为逐段 `openat(O_NOFOLLOW)`，仍拒绝任何链接组件。
 
 use std::ffi::OsString;
-use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use md5::Digest as _;
 use rustix::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use rustix::fs::ResolveFlags;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::tier::{TierBackend, TierObject};
+use crate::tier::{TierBackend, TierByteStream, TierObject, TierPutResult};
 
 #[cfg(target_os = "linux")]
 fn resolve_flags() -> ResolveFlags {
@@ -130,49 +131,70 @@ fn clean_stale_tmp_at(parent: &OwnedFd, name: &str) {
     }
 }
 
-fn put_blocking(root: &Path, rel: &Path, body: Bytes, etag: &str) -> Result<String, String> {
-    std::fs::create_dir_all(root).map_err(|e| format!("本地 tier 建目录失败：{e}"))?;
-    let (parent, name) = open_parent(root, rel, true)?;
-    let name = name
-        .to_str()
-        .ok_or_else(|| format!("本地 tier 文件名非 UTF-8：{rel:?}"))?;
-    let tmp = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
-    let fd = rustix::fs::openat(
-        &parent,
-        tmp.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o644),
-    )
-    .map_err(|e| io_msg("本地 tier 建临时文件失败", e))?;
-    let mut f = std::fs::File::from(fd);
-    let write = f
-        .write_all(&body)
-        .and_then(|_| f.sync_all())
-        .map_err(|e| format!("本地 tier 写入失败：{e}"));
-    drop(f); // 先关 fd，再 rename
-    if let Err(e) = write {
-        let _ = rustix::fs::unlinkat(&parent, tmp.as_str(), AtFlags::empty());
-        return Err(e);
-    }
-    // MD5 校验在 rename 前：失败只留临时文件（随即 unlink），最终对象不可见。
-    if etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let md5 = hex::encode(md5::Md5::digest(&body));
-        if !md5.eq_ignore_ascii_case(etag) {
-            let _ = rustix::fs::unlinkat(&parent, tmp.as_str(), AtFlags::empty());
-            return Err(format!("本地 tier MD5 不符（期望 {etag}，得到 {md5}）"));
-        }
-    }
-    // rename 替换的是目录项本身（不跟随最终符号链接），父目录 fd 已固定。
-    if let Err(e) = rustix::fs::renameat(&parent, tmp.as_str(), &parent, name) {
-        let _ = rustix::fs::unlinkat(&parent, tmp.as_str(), AtFlags::empty());
-        return Err(format!("本地 tier rename 失败：{e}"));
-    }
-    let _ = rustix::fs::fsync(&parent);
-    clean_stale_tmp_at(&parent, name);
-    Ok(etag.to_string())
+/// 流式 put 的临时文件状态；Drop 时清理未 rename 的临时文件（含 future 取消）。
+struct LocalTmp {
+    parent: OwnedFd,
+    tmp: String,
+    name: String,
+    done: bool,
 }
 
-fn get_blocking(root: &Path, rel: &Path) -> Result<Bytes, String> {
+impl LocalTmp {
+    fn create(root: &Path, rel: &Path) -> Result<(Self, std::fs::File), String> {
+        std::fs::create_dir_all(root).map_err(|e| format!("本地 tier 建目录失败：{e}"))?;
+        let (parent, name) = open_parent(root, rel, true)?;
+        let name = name
+            .to_str()
+            .ok_or_else(|| format!("本地 tier 文件名非 UTF-8：{rel:?}"))?
+            .to_string();
+        let tmp = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
+        let fd = rustix::fs::openat(
+            &parent,
+            tmp.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .map_err(|e| io_msg("本地 tier 建临时文件失败", e))?;
+        Ok((
+            Self {
+                parent,
+                tmp,
+                name,
+                done: false,
+            },
+            std::fs::File::from(fd),
+        ))
+    }
+
+    /// fsync + rename；返回后临时文件成为最终对象。
+    fn commit(mut self, f: std::fs::File) -> Result<(), String> {
+        f.sync_all()
+            .map_err(|e| format!("本地 tier 写入失败：{e}"))?;
+        drop(f); // 先关 fd，再 rename
+        // rename 替换的是目录项本身（不跟随最终符号链接），父目录 fd 已固定。
+        rustix::fs::renameat(
+            &self.parent,
+            self.tmp.as_str(),
+            &self.parent,
+            self.name.as_str(),
+        )
+        .map_err(|e| format!("本地 tier rename 失败：{e}"))?;
+        let _ = rustix::fs::fsync(&self.parent);
+        clean_stale_tmp_at(&self.parent, &self.name);
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Drop for LocalTmp {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = rustix::fs::unlinkat(&self.parent, self.tmp.as_str(), AtFlags::empty());
+        }
+    }
+}
+
+fn open_read(root: &Path, rel: &Path) -> Result<std::fs::File, String> {
     let rootfd = open_root(root)?;
     let fd = open_beneath(&rootfd, rel, OFlags::RDONLY).map_err(|e| {
         if e == Errno::NOENT || e == Errno::NOTDIR {
@@ -181,11 +203,7 @@ fn get_blocking(root: &Path, rel: &Path) -> Result<Bytes, String> {
             io_msg("本地 tier 读取失败", e)
         }
     })?;
-    let mut out = Vec::new();
-    std::fs::File::from(fd)
-        .read_to_end(&mut out)
-        .map_err(|e| format!("本地 tier 读取失败：{e}"))?;
-    Ok(Bytes::from(out))
+    Ok(std::fs::File::from(fd))
 }
 
 fn head_blocking(root: &Path, rel: &Path) -> Result<Option<u64>, String> {
@@ -284,18 +302,65 @@ impl TierBackend for LocalTierBackend {
         &self.id
     }
 
-    async fn put(&self, key: &str, body: Bytes, etag: &str) -> Result<String, String> {
+    async fn put(
+        &self,
+        key: &str,
+        mut body: TierByteStream,
+        size: u64,
+    ) -> Result<TierPutResult, String> {
         let rel = Self::safe_rel(key)?;
         let root = self.root.clone();
-        let etag = etag.to_string();
-        self.blocking(move || put_blocking(&root, &rel, body, &etag))
+        let (tmp, f) = self.blocking(move || LocalTmp::create(&root, &rel)).await?;
+        let mut file = tokio::fs::File::from_std(f);
+        let mut md5 = md5::Md5::new();
+        let mut sha = sha2::Sha256::new();
+        let mut n: u64 = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            n += chunk.len() as u64;
+            if n > size {
+                return Err(format!("本地 tier 写入流超过声明长度 {size} 字节"));
+            }
+            md5.update(&chunk);
+            sha.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("本地 tier 写入失败：{e}"))?;
+        }
+        file.flush()
             .await
+            .map_err(|e| format!("本地 tier 写入失败：{e}"))?;
+        if n != size {
+            return Err(format!("本地 tier 写入长度 {n} ≠ 声明 {size} 字节"));
+        }
+        let md5 = hex::encode(md5.finalize());
+        let sha256 = hex::encode(sha.finalize());
+        let std_file = file.into_std().await;
+        self.blocking(move || tmp.commit(std_file)).await?;
+        Ok(TierPutResult {
+            etag: md5.clone(),
+            md5,
+            sha256,
+        })
     }
 
-    async fn get(&self, key: &str) -> Result<Bytes, String> {
+    async fn get(&self, key: &str) -> Result<TierByteStream, String> {
         let rel = Self::safe_rel(key)?;
         let root = self.root.clone();
-        self.blocking(move || get_blocking(&root, &rel)).await
+        let f = self.blocking(move || open_read(&root, &rel)).await?;
+        let f = tokio::fs::File::from_std(f);
+        let stream = futures::stream::try_unfold(f, |mut f| async move {
+            let mut buf = vec![0u8; 256 * 1024];
+            match f.read(&mut buf).await {
+                Ok(0) => Ok(None),
+                Ok(n) => {
+                    buf.truncate(n);
+                    Ok(Some((Bytes::from(buf), f)))
+                }
+                Err(e) => Err(format!("本地 tier 读取失败：{e}")),
+            }
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>, String> {
@@ -388,6 +453,28 @@ mod tests {
         hex::encode(md5::Md5::digest(body))
     }
 
+    fn stream(body: &'static [u8]) -> TierByteStream {
+        Box::pin(futures::stream::once(async move {
+            Ok(Bytes::from_static(body))
+        }))
+    }
+
+    async fn collect(mut s: TierByteStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(c) = s.next().await {
+            out.extend_from_slice(&c.unwrap());
+        }
+        out
+    }
+
+    async fn put(
+        b: &LocalTierBackend,
+        key: &str,
+        body: &'static [u8],
+    ) -> Result<TierPutResult, String> {
+        b.put(key, stream(body), body.len() as u64).await
+    }
+
     /// M1：便携回退（无 openat2 的内核/非 Linux）同样按段拒绝链接，并打开正常路径。
     #[test]
     fn portable_walk_rejects_symlinks_and_opens_plain_path() {
@@ -433,10 +520,7 @@ mod tests {
             "a\0b",
             "",
         ] {
-            assert!(
-                b.put(key, Bytes::from_static(b"x"), "0").await.is_err(),
-                "{key}"
-            );
+            assert!(b.put(key, stream(b"x"), 1).await.is_err(), "{key}");
             assert!(b.get(key).await.is_err(), "{key}");
             assert!(b.head(key).await.is_err(), "{key}");
             assert!(b.delete(key).await.is_err(), "{key}");
@@ -449,13 +533,10 @@ mod tests {
         let b = backend(d.path());
         let key = "local1/bkt/v1/dir/obj.txt";
         let body = b"cold data";
-        assert_eq!(
-            b.put(key, Bytes::from_static(body), &etag(body))
-                .await
-                .unwrap(),
-            etag(body)
-        );
-        assert_eq!(b.get(key).await.unwrap(), Bytes::from_static(body));
+        let r = put(&b, key, body).await.unwrap();
+        assert_eq!(r.etag, etag(body));
+        assert_eq!(r.md5, etag(body));
+        assert_eq!(collect(b.get(key).await.unwrap()).await, body);
         assert_eq!(b.head(key).await.unwrap(), Some(body.len() as u64));
         // rename 后不残留临时文件
         let parent = d.path().join("local1/bkt/v1/dir");
@@ -476,11 +557,15 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let b = backend(d.path());
         let key = "local1/bkt/v1/obj.txt";
-        let err = b
-            .put(key, Bytes::from_static(b"data"), &"0".repeat(32))
-            .await
-            .unwrap_err();
-        assert!(err.contains("MD5"), "{err}");
+        // 声明 5 字节、流只给 4 字节：fail closed，不落最终对象也不留临时文件。
+        let err = b.put(key, stream(b"data"), 5).await.unwrap_err();
+        assert!(err.contains("长度"), "{err}");
+        assert_eq!(b.head(key).await.unwrap(), None);
+        // 流报错同样清理临时文件。
+        let bad: TierByteStream = Box::pin(futures::stream::once(async {
+            Err("模拟源流失败".to_string())
+        }));
+        assert!(b.put(key, bad, 4).await.is_err());
         assert_eq!(b.head(key).await.unwrap(), None);
         let parent = d.path().join("local1/bkt/v1");
         let mut rd = tokio::fs::read_dir(&parent).await.unwrap();
@@ -497,9 +582,7 @@ mod tests {
         let dir = d.path().join("local1/bkt/v1");
         {
             let b = backend(d.path());
-            b.put(key, Bytes::from_static(body), &etag(body))
-                .await
-                .unwrap();
+            put(&b, key, body).await.unwrap();
             // 模拟崩溃残留（>1h，才会被下一次 put 清理）
             let stale = dir.join(".obj.txt.tmp-stale");
             tokio::fs::write(&stale, b"junk").await.unwrap();
@@ -515,16 +598,14 @@ mod tests {
                 .unwrap();
         }
         let b = backend(d.path());
-        assert_eq!(b.get(key).await.unwrap(), Bytes::from_static(body));
-        b.put(key, Bytes::from_static(b"new"), &etag(b"new"))
-            .await
-            .unwrap();
+        assert_eq!(collect(b.get(key).await.unwrap()).await, body);
+        put(&b, key, b"new").await.unwrap();
         assert!(!dir.join(".obj.txt.tmp-stale").exists());
         assert!(
             dir.join(".obj.txt.tmp-active").exists(),
             "并发写入的临时文件不得被清理"
         );
-        assert_eq!(b.get(key).await.unwrap(), Bytes::from_static(b"new"));
+        assert_eq!(collect(b.get(key).await.unwrap()).await, b"new");
     }
 
     #[tokio::test]
@@ -533,10 +614,7 @@ mod tests {
         let missing = d.path().join("not-there");
         let b = backend(&missing);
         assert!(b.head(".console-healthcheck").await.is_err());
-        let body = b"x";
-        b.put("local1/bkt/v1/k", Bytes::from_static(body), &etag(body))
-            .await
-            .unwrap();
+        put(&b, "local1/bkt/v1/k", b"x").await.unwrap();
         assert_eq!(b.head(".console-healthcheck").await.unwrap(), None);
     }
 
@@ -544,13 +622,8 @@ mod tests {
     async fn list_returns_relative_keys_and_skips_tmp() {
         let d = tempfile::tempdir().unwrap();
         let b = backend(d.path());
-        let body = b"x";
-        b.put("local1/bkt/v1/a", Bytes::from_static(body), &etag(body))
-            .await
-            .unwrap();
-        b.put("local1/bkt/v2/b", Bytes::from_static(body), &etag(body))
-            .await
-            .unwrap();
+        put(&b, "local1/bkt/v1/a", b"x").await.unwrap();
+        put(&b, "local1/bkt/v2/b", b"x").await.unwrap();
         tokio::fs::write(d.path().join("local1/bkt/v1/.a.tmp-x"), b"junk")
             .await
             .unwrap();
@@ -566,10 +639,7 @@ mod tests {
         let root = d.path().join("root-file");
         std::fs::write(&root, b"x").unwrap();
         let b = backend(&root);
-        let err = b
-            .put("local1/bkt/v1/k", Bytes::from_static(b"x"), "0")
-            .await
-            .unwrap_err();
+        let err = b.put("local1/bkt/v1/k", stream(b"x"), 1).await.unwrap_err();
         assert!(err.contains("建目录失败"), "{err}");
     }
 
@@ -583,7 +653,11 @@ mod tests {
         std::fs::create_dir_all(&objdir).unwrap();
         std::os::unix::fs::symlink(&outside, objdir.join("evil.txt")).unwrap();
         let b = backend(d.path());
-        let err = b.get("local1/bkt/v1/evil.txt").await.unwrap_err();
+        let err = b
+            .get("local1/bkt/v1/evil.txt")
+            .await
+            .err()
+            .expect("符号链接必须拒绝");
         assert!(
             err.contains("不允许") || err.contains("符号链接") || err.contains("LOOP"),
             "{err}"
@@ -602,12 +676,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, d.path().join("local1/bkt")).unwrap();
         let b = backend(d.path());
         let key = "local1/bkt/v1/k";
-        let body = b"x";
-        assert!(
-            b.put(key, Bytes::from_static(body), &etag(body))
-                .await
-                .is_err()
-        );
+        assert!(b.put(key, stream(b"x"), 1).await.is_err());
         assert!(b.get(key).await.is_err());
         assert!(b.head(key).await.is_err());
         assert!(b.delete(key).await.is_err());
@@ -627,14 +696,11 @@ mod tests {
         std::fs::create_dir_all(&objdir).unwrap();
         std::os::unix::fs::symlink(&outside, objdir.join("obj")).unwrap();
         let b = backend(d.path());
-        let body = b"new-data";
-        b.put("local1/bkt/v1/obj", Bytes::from_static(body), &etag(body))
-            .await
-            .unwrap();
+        put(&b, "local1/bkt/v1/obj", b"new-data").await.unwrap();
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
         assert_eq!(
-            b.get("local1/bkt/v1/obj").await.unwrap(),
-            Bytes::from_static(body)
+            collect(b.get("local1/bkt/v1/obj").await.unwrap()).await,
+            b"new-data"
         );
     }
 }

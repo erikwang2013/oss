@@ -6,21 +6,25 @@
 //! - 单段源（32 hex ETag）断言响应 ETag；MPU 源 ETag 非 MD5，跳过断言（目标重算）。
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
+use futures::StreamExt as _;
+use http_body_util::{BodyExt as _, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::{Request, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
 };
 use sha2::Digest as _;
+use tokio::io::AsyncReadExt as _;
 
 use crate::config::{RemoteTarget, TierTarget};
-use crate::tier::TierObject;
+use crate::tier::{TierByteStream, TierObject};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrClass {
@@ -229,27 +233,43 @@ impl ReplClient {
         }
     }
 
-    /// tier PUT：`Content-MD5`（签入）并断言响应 ETag == 本地 MD5（远端 ETag 口径）。
-    pub async fn tier_put(
+    /// tier PUT（流式）：发送预落盘的暂存文件；`sha256_hex` 是 SigV4 payload hash，
+    /// 断言响应 ETag == 本地 MD5（远端 ETag 口径）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tier_put_file(
         &self,
         remote_id: &str,
         bucket: &str,
         key: &str,
-        body: Bytes,
+        path: &Path,
+        size: u64,
+        sha256_hex: &str,
         md5_hex: &str,
     ) -> Result<String, ReplError> {
+        let meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| ReplError::retryable(format!("tier 暂存文件不可读：{e}")))?;
+        if meta.len() != size {
+            return Err(ReplError::permanent(format!(
+                "tier 暂存文件长度 {} ≠ 声明 {size} 字节",
+                meta.len()
+            )));
+        }
         let raw = hex::decode(md5_hex).map_err(|_| ReplError::permanent("MD5 非法"))?;
         let md5_b64 =
             base64::engine::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw);
         let headers = vec![("content-md5".to_string(), md5_b64)];
         let resp = self
-            .send(
+            .send_path_impl(
                 remote_id,
                 "PUT",
-                bucket,
-                Some(key),
+                &format!("/{bucket}/{key}"),
                 &[],
-                Some(body),
+                OutBody::File {
+                    path: path.to_path_buf(),
+                    size,
+                    sha256: sha256_hex.to_string(),
+                },
                 &headers,
                 None,
             )
@@ -268,22 +288,21 @@ impl ReplClient {
         Ok(etag)
     }
 
-    /// tier GET：整份读入（恢复作业随后校验 size/SHA-256）。
-    pub async fn tier_get(
+    /// tier GET（流式）：返回响应体块流（恢复作业边写边算 SHA-256）。
+    pub async fn tier_get_stream(
         &self,
         remote_id: &str,
         bucket: &str,
         key: &str,
-    ) -> Result<Bytes, ReplError> {
+    ) -> Result<TierByteStream, ReplError> {
         let resp = self
             .send(remote_id, "GET", bucket, Some(key), &[], None, &[], None)
             .await?;
-        let body = resp
+        let stream = resp
             .into_body()
-            .collect()
-            .await
-            .map_err(|e| ReplError::retryable(format!("读取 tier 响应体失败：{e}")))?;
-        Ok(body.to_bytes())
+            .into_data_stream()
+            .map(|r| r.map_err(|e| format!("读取 tier 响应体失败：{e}")));
+        Ok(Box::pin(stream))
     }
 
     /// tier HEAD：远端无此键 → Ok(None)。
@@ -891,6 +910,30 @@ impl ReplClient {
         headers: &[(String, String)],
         replication_status: Option<&'static str>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, ReplError> {
+        self.send_path_impl(
+            remote_id,
+            method,
+            decoded_path,
+            query,
+            OutBody::Bytes(body.unwrap_or_default()),
+            headers,
+            replication_status,
+        )
+        .await
+    }
+
+    /// `send_path` 的流式/整块共用实现：签名只做一次，body 在最后一段才分派。
+    #[allow(clippy::too_many_arguments)]
+    async fn send_path_impl(
+        &self,
+        remote_id: &str,
+        method: &str,
+        decoded_path: &str,
+        query: &[(&str, &str)],
+        body: OutBody,
+        headers: &[(String, String)],
+        replication_status: Option<&'static str>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, ReplError> {
         let remote = self.remotes.get(remote_id).ok_or_else(|| {
             ReplError::permanent(format!("remote {remote_id:?} 未配置（规则校验应已拦截）"))
         })?;
@@ -906,15 +949,15 @@ impl ReplClient {
             (remote.https, remote.host.clone(), remote.port)
         };
 
-        // 签名
-        let body_bytes = body.unwrap_or_default();
         // M8 缺口 C：按远端独立令牌桶整形（GET/HEAD/DELETE 无 body 不限）
-        if !body_bytes.is_empty()
+        let body_len = body.len();
+        if body_len > 0
             && let Some(l) = &remote.limiter
         {
-            l.acquire(body_bytes.len() as u64).await;
+            l.acquire(body_len).await;
         }
-        let payload_hex = hex::encode(sha2::Sha256::digest(&body_bytes));
+        // 流式文件 body 的 SHA-256 已由调用方边写边算（SigV4 要求预先给出）。
+        let payload_hex = body.sha256_hex();
         let amz = amz_date_now()?;
         let mut signed: Vec<(String, String)> = vec![
             ("host".into(), host.clone()),
@@ -965,14 +1008,46 @@ impl ReplClient {
             req = req.header(k.as_str(), v.as_str());
         }
         req = req.header("authorization", auth);
-        let req = req
-            .body(Full::new(body_bytes))
-            .map_err(|e| ReplError::permanent(format!("请求构造失败：{e}")))?;
 
-        // 连接 + 发送
+        let ctx = SendCtx {
+            https,
+            host,
+            port,
+            server_name: remote.server_name.clone(),
+        };
+        match body {
+            OutBody::Bytes(bytes) => {
+                let req = req
+                    .body(Full::new(bytes))
+                    .map_err(|e| ReplError::permanent(format!("请求构造失败：{e}")))?;
+                self.dispatch(ctx, req).await
+            }
+            OutBody::File { path, size, .. } => {
+                // Content-Length 显式给出：hyper 才能用定长 body（S3 不依赖 chunked）。
+                let body = file_body(path, size).await?;
+                let req = req
+                    .header("content-length", size.to_string())
+                    .body(body)
+                    .map_err(|e| ReplError::permanent(format!("请求构造失败：{e}")))?;
+                self.dispatch(ctx, req).await
+            }
+        }
+    }
+
+    /// 连接 + 发送 + 状态分类（body 类型由调用方决定）。
+    async fn dispatch<B>(
+        &self,
+        ctx: SendCtx,
+        req: Request<B>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, ReplError>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let stream = self
             .tls
-            .connect(https, &host, port, remote.server_name.as_deref())
+            .connect(ctx.https, &ctx.host, ctx.port, ctx.server_name.as_deref())
             .await
             .map_err(ReplError::retryable)?;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -1006,6 +1081,67 @@ impl ReplClient {
         let text = String::from_utf8_lossy(&body);
         Err(classify_status(status, &text))
     }
+}
+
+/// 请求体：整块 Bytes，或已落盘、带预计算哈希的暂存文件（tier 上传）。
+enum OutBody {
+    Bytes(Bytes),
+    File {
+        path: PathBuf,
+        size: u64,
+        sha256: String,
+    },
+}
+
+impl OutBody {
+    fn len(&self) -> u64 {
+        match self {
+            OutBody::Bytes(b) => b.len() as u64,
+            OutBody::File { size, .. } => *size,
+        }
+    }
+
+    fn sha256_hex(&self) -> String {
+        match self {
+            OutBody::Bytes(b) => hex::encode(sha2::Sha256::digest(b)),
+            OutBody::File { sha256, .. } => sha256.clone(),
+        }
+    }
+}
+
+struct SendCtx {
+    https: bool,
+    host: String,
+    port: u16,
+    server_name: Option<String>,
+}
+
+/// 暂存文件 → hyper body 流（256 KiB 块；不整份驻留内存）。
+async fn file_body(
+    path: PathBuf,
+    size: u64,
+) -> Result<
+    StreamBody<impl futures::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + 'static>,
+    ReplError,
+> {
+    let f = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ReplError::retryable(format!("tier 暂存文件不可读：{e}")))?;
+    if f.metadata().await.map(|m| m.len()).unwrap_or(size) != size {
+        return Err(ReplError::permanent("tier 暂存文件长度与声明不符"));
+    }
+    let stream = futures::stream::try_unfold(f, |mut f| async move {
+        let mut buf = vec![0u8; 256 * 1024];
+        match f.read(&mut buf).await {
+            Ok(0) => Ok(None),
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some((Frame::data(Bytes::from(buf)), f)))
+            }
+            Err(e) => Err(e),
+        }
+    });
+    Ok(StreamBody::new(stream))
 }
 
 fn classify_status(status: StatusCode, text: &str) -> ReplError {

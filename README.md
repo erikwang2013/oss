@@ -1176,7 +1176,9 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 - 生命周期规则也可经控制台 `GET/PUT /api/v1/buckets/{b}/lifecycle` 配置
   （`transition_days/transition_class/transition_tier`）；S3 与 console 共用同一校验，PUT 全量替换。
 - Transition 由 `OSS_TIER_SWEEP_INTERVAL_SECS`（默认 3600）周期扫描 + 管理端 force-sweep；
-  按对象去重，仅当前非加密非分层版本，单次 ≤10000 对象；全内存搬运（单对象 ≤`OSS_TIER_MAX_BYTES`，默认 1 GiB）。
+  按对象去重，仅当前非加密非分层版本，单次 ≤10000 对象；流式搬运：源按 8 MiB 窗口读取，
+  出站按 256 KiB 块发送（S3 先落暂存文件预计算 SigV4 payload hash），内存驻留有界；
+  单对象 ≤`OSS_TIER_MAX_BYTES`（默认 1 GiB）。
 - Restore：body XML `<RestoreRequest><Days>n</Days></RestoreRequest>` 或
   `x-amz-restore-request: days=n[,tier=]`，days 1..=36500（缺省 1）；返回
   HTTP 202 + `x-amz-restore: ongoing-request="true"`；HEAD 三态（Archived 无头 / Restoring /
@@ -1185,16 +1187,22 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
   router 层中间件把 POST `?restore` 的 200 改写为 202（错误状态与其它请求原样透传）。
 - 到期回收：reaper `OSS_TIER_REAPER_INTERVAL_SECS`（默认 300），精度约 300s；过期后回到
   Archived（GET 再次 403）。启动时对账 pending/restored 行与 Version。
-- 本地冷盘池（`kind = "local"`）：`put` 写同目录 `.<name>.tmp-<uuid>` + `fsync` + `rename`，
-  校验 MD5（ETag 为 32 位 hex 时）；`head` 在根目录缺失时返回错误（控制台 health 为 false）；
+- 本地冷盘池（`kind = "local"`）：`put` 边收流边写同目录 `.<name>.tmp-<uuid>` 并增量算
+  MD5/SHA-256，`fsync` + `rename` 提交（长度不符/流错误/取消即删除临时文件）；`get` 按
+  256 KiB 块流式读取；`head` 在根目录缺失时返回错误（控制台 health 为 false）；
   启动后可直接读回已落盘对象，并清理同目录崩溃残留；`delete` 自底向上删空目录。
+- 恢复（Restore）流式落盘：先检查版本目录可用空间（所需字节 + 64 MiB 余量，不足即失败并
+  回 Archived），再边写暂存文件 `restore-stage` 边算 SHA-256；长度或 SHA-256 与 meta 不符
+  即删除暂存并回 Archived；校验通过后 `fsync` + `rename` 提交（读路径看不到半成品）。
+  每任务一个暂存文件，失败/取消由 Drop 守卫清理。
 - 远端 GC/对账（`POST /api/v1/tiers/gc`，仅管理员）：先列远端、再全量扫本地版本 meta；
   任一 list/扫描失败整轮中止且不删除；live `TierRef` 永不删除；只删 `<tier_id>/` 前缀内、
   年龄 ≥ `grace_days`（默认 7）的对象；每轮最多 `max_deletes`（默认 1000）；删除失败逐条返回
   并保留待下轮；`missing_live` 只提示 live 引用在远端缺失，不写任何数据。`dry_run` 默认 true。
-- 边界：tier 支持远端 S3 与本地冷盘池；全内存搬运；无自动定时 GC（须管理员显式触发）；
-  远端删除仍 best-effort，失败留孤儿待 GC 重试；SSE 对象不 Transition；归档对象复制/站点
-  复制不可用（先 Restore）。
+- 边界：tier 支持远端 S3 与本地冷盘池；搬运/恢复均为有界内存流式（非全内存）；无自动
+  定时 GC（须管理员显式触发）；远端删除仍 best-effort，失败留孤儿待 GC 重试；SSE 对象不
+  Transition；归档对象复制/站点复制不可用（先 Restore）。Archived GET（含 Range）不直读
+  远端，必须先 Restore——直读不在本项范围。
 
 ### 控制台页面（S6）
 
@@ -1226,7 +1234,8 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    类型、不发），并照旧发复制/清 tier。
 5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
    `symlink.txt`（不含 Athena 建表/分区自动发现）。
-6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期已支持 tag/size/And Filter、
+6. 分层支持远端 S3 与本地冷盘池、有界内存流式搬运（源 8 MiB 窗口 / 出站与恢复 256 KiB
+   块）；Archived GET（含 Range）不直读远端，须先 Restore；S3 生命周期已支持 tag/size/And Filter、
    Expiration.Date/ExpiredObjectDeleteMarker、Transition.Date、多转换、noncurrent expiration/transition；
    仍不支持 AbortIncompleteMultipartUpload（需 MPU 索引，501）。
 7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort；
