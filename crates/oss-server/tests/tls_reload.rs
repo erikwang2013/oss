@@ -309,3 +309,32 @@ async fn outbound_client_config_picks_up_new_ca_after_reload() {
         200
     );
 }
+
+/// 代次只在成功换新物料时递增：内容未变、坏物料都不推进。
+/// 长连接客户端（Kafka）据此判断是否必须丢弃旧连接并重建。
+#[test]
+fn generation_advances_only_on_successful_material_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let (cert_a, key_a) = ca.issue(&["127.0.0.1"], false);
+    let cert = write_pem(dir.path(), "server.crt", &cert_a);
+    let key = write_pem(dir.path(), "server.key", &key_a);
+    let tls = Tls::load(&server_toml(&cert, &key)).unwrap();
+    assert_eq!(tls.generation(), 0);
+
+    // 内容未变：不重建、不推进。
+    assert!(!tls.reload().unwrap());
+    assert_eq!(tls.generation(), 0);
+
+    // 有效新物料：推进一次。
+    let (cert_b, key_b) = ca.issue(&["127.0.0.1"], false);
+    replace_pem(dir.path(), "server.crt", &cert_b);
+    replace_pem(dir.path(), "server.key", &key_b);
+    assert!(tls.reload().unwrap());
+    assert_eq!(tls.generation(), 1);
+
+    // 坏物料：fail closed，代次保持。
+    replace_pem(dir.path(), "server.key", "not a private key");
+    assert!(tls.reload().is_err());
+    assert_eq!(tls.generation(), 1);
+}

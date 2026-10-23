@@ -3,16 +3,20 @@
 //!
 //! 物料支持热加载（SIGHUP / 文件内容轮询）：成功构建的新配置整体替换旧快照，
 //! 任何读取/解析/构建错误都保留旧物料（fail closed）。主监听器每个新连接取一次
-//! 快照（见 [`crate::tls_server`]），出站客户端在下次取用时拿到新配置。
+//! 快照（见 [`crate::tls_server`]），出站客户端在下次取用时拿到新配置；长连接
+//! 组件按 [`Tls::generation`]（Kafka）或 [`Tls::tonic_client_watch`]（mesh gRPC）
+//! 重建客户端，旧连接上的在途请求继续完成。
 //!
 //! rustls 0.23 同时编译 ring 与 aws-lc-rs 时 `builder()` 会 panic；进程启动时
 //! 通过 [`install_provider`] 安装 ring，并在所有自建配置里显式 `builder_with_provider`。
 
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use tokio::sync::watch;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -77,6 +81,15 @@ pub struct Tls {
     loaded: RwLock<Arc<Loaded>>,
     warned_peer_upgrade: AtomicBool,
     last_reload: Mutex<Option<Instant>>,
+    /// 成功热加载的代次（只增；内容未变/加载失败不递增）。长连接客户端（Kafka）
+    /// 据此丢弃旧连接，下次取用时按新物料重建。
+    generation: AtomicU64,
+    /// mesh gRPC 通道热加载信号：值 = 当前 tonic 客户端配置（`None` = 未启用 peer TLS）。
+    /// 只有通过校验的新物料才发送；reload 失败不发送，订阅者继续用旧通道（fail closed）。
+    tonic_client_tx: watch::Sender<Option<tonic::transport::ClientTlsConfig>>,
+    /// `tonic_client`/`tonic_client_watch` 被使用过：reload 必须先成功构建客户端配置
+    /// （CA/身份解析校验）才能替换快照——tonic 配置本身不解析 PEM，不能只靠它兜底。
+    tonic_in_use: AtomicBool,
 }
 
 impl Tls {
@@ -97,12 +110,17 @@ impl Tls {
             },
         };
         let loaded = read_loaded(server.as_ref(), &client)?;
+        let initial_tonic = loaded.server.as_ref().map(|_| tonic_client_from(&loaded));
+        let (tonic_client_tx, _) = watch::channel(initial_tonic);
         Ok(Arc::new(Self {
             server,
             client,
             loaded: RwLock::new(Arc::new(loaded)),
             warned_peer_upgrade: AtomicBool::new(false),
             last_reload: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            tonic_client_tx,
+            tonic_in_use: AtomicBool::new(false),
         }))
     }
 
@@ -189,15 +207,20 @@ impl Tls {
 
     /// mesh gRPC 客户端配置：平台根 + 自定义 CA + 可选 mTLS 身份。
     pub fn tonic_client(&self) -> tonic::transport::ClientTlsConfig {
-        let loaded = self.snapshot();
-        let mut c = tonic::transport::ClientTlsConfig::new().with_native_roots();
-        if let Some(ca) = &loaded.client.ca_pem {
-            c = c.ca_certificate(tonic::transport::Certificate::from_pem(ca));
-        }
-        if let (Some(cert), Some(key)) = (&loaded.client.cert_pem, &loaded.client.key_pem) {
-            c = c.identity(tonic::transport::Identity::from_pem(cert, key));
-        }
-        c
+        self.tonic_in_use.store(true, Ordering::Relaxed);
+        tonic_client_from(&self.snapshot())
+    }
+
+    /// mesh gRPC 通道热加载订阅：初始值为当前配置，之后每次成功 reload 发布新值。
+    /// 订阅者（TonicMesh）在下次 RPC 前重建通道；旧通道上的在途请求继续完成。
+    pub fn tonic_client_watch(&self) -> watch::Receiver<Option<tonic::transport::ClientTlsConfig>> {
+        self.tonic_in_use.store(true, Ordering::Relaxed);
+        self.tonic_client_tx.subscribe()
+    }
+
+    /// 成功热加载的代次（内容未变/失败不递增）。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// 出站 hyper（site_client/repl_client/tier）用的 rustls 配置（无 ALPN）。
@@ -233,7 +256,9 @@ impl Tls {
         }
         // 出站配置此前已被使用过时，新物料必须先构建成功才能替换；
         // 否则坏 CA/坏身份会让后续出站静默失败（而旧配置本来可用）。
-        let client_in_use = prev.client_config.get().is_some() || prev.reqwest.get().is_some();
+        let client_in_use = prev.client_config.get().is_some()
+            || prev.reqwest.get().is_some()
+            || self.tonic_in_use.load(Ordering::Relaxed);
         let fresh = Arc::new(fresh);
         if client_in_use {
             fresh
@@ -248,7 +273,11 @@ impl Tls {
         if let Some(s) = &fresh.server {
             tracing::info!(sha256 = %s.fingerprint, "TLS 服务端证书已热加载");
         }
+        let tonic = fresh.server.as_ref().map(|_| tonic_client_from(&fresh));
         *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+        self.generation.fetch_add(1, Ordering::Release);
+        // 订阅者（mesh gRPC）下次 RPC 前重建通道；发送失败仅表示当前无订阅者。
+        let _ = self.tonic_client_tx.send(tonic);
         Ok(true)
     }
 
@@ -460,6 +489,18 @@ fn build_server_config(
         .map_err(|e| format!("[tls.server] 证书/私钥不匹配：{e}"))?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
+}
+
+/// mesh gRPC 客户端配置（快照 → tonic 配置；仅供热加载信号与兼容访问器复用）。
+fn tonic_client_from(loaded: &Loaded) -> tonic::transport::ClientTlsConfig {
+    let mut c = tonic::transport::ClientTlsConfig::new().with_native_roots();
+    if let Some(ca) = &loaded.client.ca_pem {
+        c = c.ca_certificate(tonic::transport::Certificate::from_pem(ca));
+    }
+    if let (Some(cert), Some(key)) = (&loaded.client.cert_pem, &loaded.client.key_pem) {
+        c = c.identity(tonic::transport::Identity::from_pem(cert, key));
+    }
+    c
 }
 
 /// 出站 rustls 配置：平台根 + `[tls.client].ca_cert` 多证书 bundle + 可选身份。
