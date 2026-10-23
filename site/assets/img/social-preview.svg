@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1280 640" width="1280" height="640"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS —— 自研分布式对象存储 / Self-built Distributed Object Storage</title>
-  <desc>中英双语的社交预览图：左侧为项目吉祥物（装着对象块的存储桶），右侧为项目名、M1–M9 能力（TLS/SASL、版本、加密、锁、多站点、AP/OLAP）与版本号。</desc>
+  <desc>中英双语的社交预览图：左侧为项目吉祥物（装着对象块的存储桶），右侧为项目名、核心能力（TLS/SASL、版本、加密、锁、多站点、AP/OLAP）与版本号。</desc>
   <defs>
     <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#7ba3cc"/>
@@ -71,7 +71,7 @@
   <!-- 文案区 -->
   <text x="530" y="212" font-size="100" font-weight="700" fill="#0f172a" letter-spacing="-2">OSS</text>
   <text x="530" y="272" font-size="40" font-weight="600" fill="#0f172a">自研分布式对象存储系统</text>
-  <text x="530" y="314" font-size="21" fill="#64748b">Self-built, S3-compatible · TLS/SASL · M1–M9</text>
+  <text x="530" y="314" font-size="21" fill="#64748b">Self-built, S3-compatible · TLS/CMK · Strong consistency</text>
 
   <line x1="530" y1="352" x2="1220" y2="352" stroke="#e2e8f0"/>
 

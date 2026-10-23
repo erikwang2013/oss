@@ -194,7 +194,7 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
           <p>对端地址仍可写 <code>http://</code>，连接时按 <code>[tls.server]</code> 升级为 https；未启用 TLS 时写 <code>https://</code> 会在启动期拒绝。Kafka 的 SASL/SSL 配置与 mTLS 细节见 <a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README 的 TLS 章节（随发布同步）</a>。</p>
 
           <h2 id="cluster">集群与强一致</h2>
-          <p>单机跑起来后，可以继续加盘、加节点或配置多站点。M9 提供三种控制面模式：</p>
+          <p>单机跑起来后，可以继续加盘、加节点或配置多站点。控制面提供三种模式：</p>
           <div class="table-wrap">
             <table>
               <thead><tr><th>模式</th><th>配置</th><th>适合</th></tr></thead>
@@ -205,8 +205,8 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
               </tbody>
             </table>
           </div>
-          <p>完整的节点拓扑、witness、sync 写语义、cutover 与 force recovery 步骤在 <a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a> 的 M9 章节（随发布同步）。</p>
-          <p>控制面支持 Level B 滚动升级窗口：先保持 <code>[raft].feature_level = 1</code>（默认），逐个替换节点；全部 voter/learner 都升级后再改为 <code>2</code> 并重启。激活后不可回滚到旧版，数据面（M3/M4）仍非滚动。升级步骤与自动拒绝条件见 README 的「升级顺序」（随发布同步）。</p>
+          <p>完整的节点拓扑、witness、sync 写语义、cutover 与 force recovery 步骤在 <a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a> 的强一致章节（随发布同步）。</p>
+          <p>控制面支持滚动升级窗口：先保持 <code>[raft].feature_level = 1</code>（默认），逐个替换节点；全部 voter/learner 都升级后再改为 <code>2</code> 并重启。激活后不可回滚到旧版，数据面（分片、EC、放置）仍非滚动。升级步骤与自动拒绝条件见 README 的「升级顺序」（随发布同步）。</p>
 
           <h2 id="download">下载与版本</h2>
           <p>当前 Release 提供源码归档，没有预编译二进制。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.15.0；可直接下载源码包或按本文构建。</p>

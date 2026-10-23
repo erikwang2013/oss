@@ -140,7 +140,7 @@
             <h2>项目介绍</h2>
             <p class="intro-lede">吞吞（oss）是一块自己养大的对象存储：Rust 2024 编写，S3 兼容，从单盘一直长到跨站点强一致。</p>
             <p>它不是只把文件存进去的薄壳，而是把存储内核、纠删码、集群 mesh、多站点复制、控制面和安全能力放在同一套代码里。你可以只跑一个进程做本地备份，也可以配置 3 个 voter 和 witness，让控制面在站点故障时继续工作。</p>
-            <p>项目从 M1 的单盘切片开始，经过 M2 可用性、M3 分布式、M4 运维与 IAM、M5 安全、M6 数据流、M7 多站点、M8 控制面，走到 M9 的 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、M8 作业/清单/分层/访问点与 Level B 滚动升级；2026-10-24 的 v1.15.0 又完成了 AP/账户、TLS/CMK、tier 流式、M7 复制与生命周期门控等硬化收口。每个里程碑都有可运行的 e2e、验收记录和对应文档。</p>
+            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 又完成了 AP/账户、TLS/CMK、tier 流式、多站点复制与生命周期门控等硬化收口。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
             <p>它适合想理解对象存储内部实现的人，也适合需要一套可自托管、可审计、能继续改的 S3 兼容服务的团队。代码是开放的，边界也写清楚了：能做什么，不能做什么，都在 README 和版本日志里。</p>
           </div>
           <aside class="project-facts" data-reveal aria-label="项目档案">
@@ -197,32 +197,32 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
             <article class="bento-card span-4" data-reveal>
               <h3>数据会流动</h3>
               <p>事件通知接 Kafka（SASL/SSL），S3 Select 做查询，桶复制与多站点复制负责把版本送到另一端；读访问也会发 ObjectAccessed 事件。</p>
-              <button class="image-zoom" type="button" data-image="assets/img/m6-dataflow.svg" data-title="M6 数据流" aria-label="放大 M6 数据流架构图">
-                <img src="assets/img/m6-dataflow.svg" width="560" height="360" alt="M6 数据流架构图，包含事件通知、S3 Select 与桶复制" decoding="async">
+              <button class="image-zoom" type="button" data-image="assets/img/m6-dataflow.svg" data-title="数据流" aria-label="放大数据流架构图">
+                <img src="assets/img/m6-dataflow.svg" width="560" height="360" alt="数据流架构图，包含事件通知、S3 Select 与桶复制" decoding="async">
               </button>
             </article>
             <article class="bento-card span-8" data-reveal>
               <h3>多站点与强一致控制面</h3>
-              <p>sync 桶 remote-first 写与删，stretch 2×6 数据面，3-voter Raft 控制面，witness、11 表快照、cutover 与 force recovery；Level B 支持控制面滚动升级窗口，数据面仍非滚动。图为 M7 站点复制拓扑，M9 在其上叠加 Raft 与 witness。</p>
-              <button class="image-zoom" type="button" data-image="assets/img/m7-sites.svg" data-title="M7 多站点复制" aria-label="放大 M7 多站点复制架构图">
-                <img src="assets/img/m7-sites.svg" width="720" height="360" alt="M7 多站点复制图，两个单节点站点 A/B 的控制面与对象面复制" decoding="async">
+              <p>sync 桶 remote-first 写与删，stretch 2×6 数据面，3-voter Raft 控制面，witness、11 表快照、cutover 与 force recovery；控制面支持滚动升级窗口，数据面仍非滚动。图为多站点复制拓扑，强一致控制面在其上叠加 Raft 与 witness。</p>
+              <button class="image-zoom" type="button" data-image="assets/img/m7-sites.svg" data-title="多站点复制" aria-label="放大 多站点复制架构图">
+                <img src="assets/img/m7-sites.svg" width="720" height="360" alt="多站点复制图，两个单节点站点 A/B 的控制面与对象面复制" decoding="async">
               </button>
             </article>
             <article class="bento-card span-4" data-reveal>
               <h3>控制台与作业</h3>
               <p>访问点（含 -s3alias / DeleteObjects / SourceIp）、Object Lambda 与 Batch（WASM）、Inventory（Parquet/Hive）、分层（本地冷盘 / 远端 GC）与生命周期完整 Filter，以及一个能看见集群状态的 React 控制台。</p>
-              <button class="image-zoom" type="button" data-image="assets/img/m8-control-plane.svg" data-title="控制台与作业" aria-label="放大 M8 控制面架构图">
-                <img src="assets/img/m8-control-plane.svg" width="560" height="360" alt="M8 控制面架构图，包含访问点、作业、清单与恢复" decoding="async">
+              <button class="image-zoom" type="button" data-image="assets/img/m8-control-plane.svg" data-title="控制台与作业" aria-label="放大控制面架构图">
+                <img src="assets/img/m8-control-plane.svg" width="560" height="360" alt="控制面架构图，包含访问点、作业、清单与恢复" decoding="async">
               </button>
             </article>
             <article class="bento-card span-8" data-reveal>
               <h3>v1.15 硬化收口</h3>
-              <p>2026-10-24 完成并随 v1.15.0 发布：AP 匿名/账户命名空间/SourceVpc、TLS 热加载、SSE-KMS 显式 CMK、tier 流式搬运、M7 版本定向删除/元数据复制、Select Parquet、Inventory 增量/跨账户目标与 Level B 生命周期门控。</p>
-              <div class="chip-row"><span>AP</span><span>CMK</span><span>tier 流式</span><span>M7</span><span>Inventory</span></div>
+              <p>2026-10-24 完成并随 v1.15.0 发布：AP 匿名/账户命名空间/SourceVpc、TLS 热加载、SSE-KMS 显式 CMK、tier 流式搬运、多站点版本定向删除/元数据复制、Select Parquet、Inventory 增量/跨账户目标与生命周期门控。</p>
+              <div class="chip-row"><span>AP</span><span>CMK</span><span>tier 流式</span><span>多站点</span><span>Inventory</span></div>
             </article>
             <article class="bento-card tint span-4" data-reveal>
               <h3>发布前四闸</h3>
-              <p>fmt、clippy <code>-D warnings</code>、库测试与 S3 全量 e2e 全绿；v1.15 复跑 M9 sync/stretch/recovery/rolling、M8 长跑与 Playwright 9/9，安全复审 0 Critical。</p>
+              <p>fmt、clippy <code>-D warnings</code>、库测试与 S3 全量 e2e 全绿；v1.15 复跑强一致 sync/stretch/recovery/rolling、控制面长跑与 Playwright 9/9，安全复审 0 Critical。</p>
               <div class="chip-row"><span>fmt</span><span>clippy</span><span>e2e</span><span>security</span></div>
             </article>
           </div>
@@ -237,7 +237,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
           </div>
           <div class="iteration">
             <article class="iteration-row" data-reveal>
-              <span class="iteration-tag">M1-M3</span>
+              <span class="iteration-tag">内核与分布式</span>
               <div>
                 <h3>存储内核与分布式底座</h3>
                 <p>单盘直存、Multipart、Range GET、多盘 EC 8+4、gRPC mesh、跨节点 quorum 与混沌用例。</p>
@@ -245,7 +245,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               <img class="iteration-pet" src="assets/img/pet/knock.svg" data-static="assets/img/pet/static/knock.png" width="360" height="400" alt="" decoding="async">
             </article>
             <article class="iteration-row" data-reveal>
-              <span class="iteration-tag">M4-M5</span>
+              <span class="iteration-tag">运维与安全</span>
               <div>
                 <h3>运维、IAM 与安全</h3>
                 <p>版本控制、生命周期、桶策略、审计、heal/scrub、rebalance、多 set、SSE、对象锁与 STS。</p>
@@ -253,7 +253,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               <img class="iteration-pet" src="assets/img/pet/cute.svg" data-static="assets/img/pet/static/cute.png" width="360" height="400" alt="" decoding="async">
             </article>
             <article class="iteration-row" data-reveal>
-              <span class="iteration-tag">M6-M7</span>
+              <span class="iteration-tag">数据流与多站点</span>
               <div>
                 <h3>数据流与多站点</h3>
                 <p>事件通知 + Kafka、S3 Select、桶复制、站点对、LWW 控制面 changelog、快照出货与对象 outbox。</p>
@@ -261,7 +261,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               <img class="iteration-pet" src="assets/img/pet/joy.svg" data-static="assets/img/pet/static/joy.png" width="360" height="400" alt="" decoding="async">
             </article>
             <article class="iteration-row" data-reveal>
-              <span class="iteration-tag">M8-M9</span>
+              <span class="iteration-tag">控制面与强一致</span>
               <div>
                 <h3>控制面与强一致</h3>
                 <p>访问点、Object Lambda、Batch、Inventory、分层 Restore、sync 桶、stretch 2×6、3-voter Raft 与 witness。</p>
@@ -272,7 +272,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               <span class="iteration-tag">2026-10</span>
               <div>
                 <h3>能力边界清零</h3>
-                <p>补齐 S3 协议细节、全链路 TLS、M8 作业/清单/分层/访问点与 Level B 滚动升级；四闸、全量 e2e 与安全复审收口。</p>
+                <p>补齐 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；四闸、全量 e2e 与安全复审收口。</p>
               </div>
               <img class="iteration-pet" src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
             </article>
@@ -280,7 +280,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               <span class="iteration-tag">2026-10-24</span>
               <div>
                 <h3>v1.15 硬化收口</h3>
-                <p>AP/账户、TLS/CMK、tier 流式、M7 复制、Select Parquet、Inventory 跨账户与 Level B 门控；M9 四组、M8 长跑、S3 全量 e2e 与 Web 9/9 复跑。</p>
+                <p>AP/账户、TLS/CMK、tier 流式、多站点复制、Select Parquet、Inventory 跨账户与生命周期门控；强一致四组、控制面长跑、S3 全量 e2e 与 Web 9/9 复跑。</p>
               </div>
               <img class="iteration-pet" src="assets/img/pet/joy.svg" data-static="assets/img/pet/static/joy.png" width="360" height="400" alt="" decoding="async">
             </article>
@@ -393,12 +393,12 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           <div class="release-list">
             <article class="release-row" data-reveal>
               <time datetime="2026-10-24">2026-10-24</time>
-              <div><strong>v1.15.0</strong><p>硬化收口：AP 匿名/账户、TLS 热加载与 CMK、tier 流式、M7 版本复制、Select Parquet、Inventory 跨账户。</p></div>
+              <div><strong>v1.15.0</strong><p>硬化收口：AP 匿名/账户、TLS 热加载与 CMK、tier 流式、多站点版本复制、Select Parquet、Inventory 跨账户。</p></div>
               <a href="changelog.html#v1-15-0">查看</a>
             </article>
             <article class="release-row" data-reveal>
               <time datetime="2026-10-23">2026-10-23</time>
-              <div><strong>v1.14.0</strong><p>能力边界清零：S3 协议补全、全链路 TLS、M8 边界与 Level B 滚动升级。</p></div>
+              <div><strong>v1.14.0</strong><p>能力边界清零：S3 协议补全、全链路 TLS、控制面边界与滚动升级。</p></div>
               <a href="changelog.html#v1-14-0">查看</a>
             </article>
             <article class="release-row" data-reveal>
@@ -408,17 +408,17 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
             </article>
             <article class="release-row" data-reveal>
               <time datetime="2026-10-22">2026-10-22</time>
-              <div><strong>v1.13.0</strong><p>M9 同步强一致：sync 桶、stretch 2×6、3-voter Raft 控制面与 witness。</p></div>
+              <div><strong>v1.13.0</strong><p>同步强一致：sync 桶、stretch 2×6、3-voter Raft 控制面与 witness。</p></div>
               <a href="changelog.html#v1-13-0">查看</a>
             </article>
             <article class="release-row" data-reveal>
               <time datetime="2026-10-20">2026-10-20</time>
-              <div><strong>v1.12.0</strong><p>M8 控制面：访问点、Object Lambda、Batch、Inventory、分层 Restore 与控制台。</p></div>
+              <div><strong>v1.12.0</strong><p>控制面：访问点、Object Lambda、Batch、Inventory、分层 Restore 与控制台。</p></div>
               <a href="changelog.html#v1-12-0">查看</a>
             </article>
             <article class="release-row" data-reveal>
               <time datetime="2026-10-18">2026-10-18</time>
-              <div><strong>v1.11.0</strong><p>M7 多站点异步复制：站点对、changelog 快照出货与对象 outbox。</p></div>
+              <div><strong>v1.11.0</strong><p>多站点异步复制：站点对、changelog 快照出货与对象 outbox。</p></div>
               <a href="changelog.html#v1-11-0">查看</a>
             </article>
           </div>

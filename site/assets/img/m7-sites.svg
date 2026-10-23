@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
-  <title>M7 多站点异步复制：控制面 changelog + 对象 outbox</title>
+  <title>多站点异步复制：控制面 changelog + 对象 outbox</title>
   <desc>两个单节点站点 A/B 互相配对：控制面写经 SQLite 触发器落 site_changelog，LWW (ts,priority,origin,seq) 门控，ship worker 按 cursor 出货；对象写经 ReplSink 逐 peer 落 repl_outbox(target_kind=site)，worker 先签名探询 GET ?versioning 再 SigV4 PUT REPLICA。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -16,7 +16,7 @@
 
   <rect x="1" y="1" width="958" height="558" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
-  <text x="40" y="44" font-size="20" font-weight="700" fill="#0f172a">OSS · M7 多站点异步复制</text>
+  <text x="40" y="44" font-size="20" font-weight="700" fill="#0f172a">OSS · 多站点异步复制</text>
   <text x="40" y="68" font-size="12" fill="#64748b">单节点站点对：控制面 LWW changelog（ts 优先，同秒 priority 裁决）+ 对象 outbox（逐 peer、版本化、REPLICA 防环）</text>
 
   <!-- A -->
@@ -81,6 +81,6 @@
 
   <!-- bottom -->
   <rect x="40" y="500" width="880" height="40" rx="10" fill="#fffbeb" stroke="#fde68a"/>
-  <text x="56" y="518" font-size="10.5" fill="#92400e">边界：单节点站点对 · http/https（TLS 已接线）· ts-first（priority 仅同秒裁决）· 非空桶删除不生效 · 版本定向删除不复制 · 锁/标签/SSE 不复制 · dead 载荷截断 4KB</text>
-  <text x="56" y="532" font-size="10" fill="#a16207">worker 间隔：OSS_SITE_INTERVAL_SECS / OSS_REPL_INTERVAL_SECS（默认 1s，0=关）；控制面最终一致，强一致归 M9</text>
+  <text x="56" y="518" font-size="10.5" fill="#92400e">边界：单节点站点对 · http/https（TLS 已接线）· ts-first（priority 仅同秒裁决）· 非空桶删除不生效 · 版本定向删除/元数据复制 · SSE-C/KMS 永久死信 · dead 载荷截断 4KB</text>
+  <text x="56" y="532" font-size="10" fill="#a16207">worker 间隔：OSS_SITE_INTERVAL_SECS / OSS_REPL_INTERVAL_SECS（默认 1s，0=关）；控制面最终一致，强一致由 Raft 控制面提供</text>
 </svg>

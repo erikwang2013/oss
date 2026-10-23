@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>使用 oss（吞吞）| S3 操作、控制台与强一致模式</title>
-    <meta name="description" content="oss（吞吞）使用说明：aws-cli、multipart/partNumber/Range、控制台、版本三态、完整生命周期、加密、对象锁与保留期、匿名桶策略、事件复制、M9 强一致与 Level B 滚动升级。">
+    <meta name="description" content="oss（吞吞）使用说明：aws-cli、multipart/partNumber/Range、控制台、版本三态、完整生命周期、加密、对象锁与保留期、匿名桶策略、事件复制、强一致与控制面滚动升级。">
     <meta name="keywords" content="oss 使用,S3 对象存储,aws-cli,版本控制,生命周期,对象锁,保留期,匿名访问,Raft,强一致,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/usage.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="使用 oss（吞吞）">
-    <meta property="og:description" content="从 aws-cli、MPU/partNumber/Range 到 M9 强一致与 Level B 滚动升级，常用操作、保留期/匿名与控制台路径。">
+    <meta property="og:description" content="从 aws-cli、MPU/partNumber/Range 到强一致与控制面滚动升级，常用操作、保留期/匿名与控制台路径。">
     <meta property="og:url" content="https://oss.erik.xyz/usage.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="使用 oss（吞吞）| S3 操作与控制台">
-    <meta name="twitter:description" content="从 aws-cli、MPU/partNumber/Range 到 M9 强一致与 Level B 滚动升级，常用操作、保留期/匿名与控制台路径。">
+    <meta name="twitter:description" content="从 aws-cli、MPU/partNumber/Range 到强一致与控制面滚动升级，常用操作、保留期/匿名与控制台路径。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -84,7 +84,7 @@
           <a href="#security">加密与对象锁</a>
           <a href="#retention-anon">保留期与匿名</a>
           <a href="#dataflow">事件与复制</a>
-          <a href="#m9">M9 强一致</a>
+          <a href="#consistency">强一致</a>
           <a href="#upgrade">滚动升级</a>
           <a href="#ops">运维命令</a>
           <a href="#boundaries">能力边界</a>
@@ -140,7 +140,7 @@ aws --endpoint-url $E s3api get-object --bucket photos --key big.bin \
           </ul>
           <div class="callout">
             <img src="assets/img/pet/cute.svg" data-static="assets/img/pet/static/cute.png" width="360" height="400" alt="" decoding="async">
-            <p>控制台里的桶模式、版本控制、生命周期与访问点操作，最终都会走同一套控制面命令。单机是本地 SQLite，M9 模式经 Raft 提交。</p>
+            <p>控制台里的桶模式、版本控制、生命周期与访问点操作，最终都会走同一套控制面命令。单机是本地 SQLite，强一致模式经 Raft 提交。</p>
           </div>
 
           <h2 id="versioning">版本与生命周期</h2>
@@ -209,13 +209,13 @@ aws --endpoint-url $E s3api get-object-retention \
             <li>复制：每桶规则、PENDING 到 COMPLETED 状态、停机积压追平与 marker 处理。</li>
           </ul>
           <div class="split-visual" style="margin-top:20px">
-            <button class="image-zoom" type="button" data-image="assets/img/m6-dataflow.svg" data-title="M6 数据流" aria-label="放大 M6 数据流图">
-              <img src="assets/img/m6-dataflow.svg" width="900" height="600" alt="M6 数据流图，事件通知、S3 Select 与桶复制" decoding="async">
+            <button class="image-zoom" type="button" data-image="assets/img/m6-dataflow.svg" data-title="数据流" aria-label="放大数据流图">
+              <img src="assets/img/m6-dataflow.svg" width="900" height="600" alt="数据流图，事件通知、S3 Select 与桶复制" decoding="async">
             </button>
           </div>
 
-          <h2 id="m9">M9 强一致</h2>
-          <p>M9 把控制面放到 Raft 上，并把跨站点数据面分成两种模式。两者互斥，按桶或按集群选择。</p>
+          <h2 id="consistency">强一致</h2>
+          <p>强一致模式把控制面放到 Raft 上，并把跨站点数据面分成两种模式。两者互斥，按桶或按集群选择。</p>
           <div class="table-wrap">
             <table>
               <thead><tr><th>模式</th><th>写语义</th><th>适合</th></tr></thead>
@@ -236,15 +236,15 @@ aws --endpoint-url $E s3api get-object-retention \
           </div>
           <div class="callout">
             <img src="assets/img/pet/joy.svg" data-static="assets/img/pet/static/joy.png" width="360" height="400" alt="" decoding="async">
-            <p>M9 的成员变更、witness 部署、cutover 与 force recovery 是运维动作，按 README 的 runbook（随发布同步）执行。不要在运行中的集群手改 <code>raft.db</code>。</p>
+            <p>强一致的成员变更、witness 部署、cutover 与 force recovery 是运维动作，按 README 的 runbook（随发布同步）执行。不要在运行中的集群手改 <code>raft.db</code>。</p>
           </div>
 
-          <h2 id="upgrade">Level B 滚动升级</h2>
+          <h2 id="upgrade">控制面滚动升级</h2>
           <p>控制面可以逐节点替换：保持 <code>[raft].feature_level = 1</code>（默认），先升级所有 voter 与 learner；leader 的生效级别取当前 voter/learner 的最小值。全部节点都升级后，再把 <code>feature_level</code> 改为 <code>2</code> 并重启，激活会写入 <code>schema_meta.raft_feature_level</code>。</p>
           <ul>
             <li>回滚只在激活前可行（停集群、换回旧二进制、删除 <code>feature_level</code> 键后启动）；激活后必须换回支持该级别的二进制。</li>
             <li>成员 add/promote 会预检目标节点的 wire/feature 级别，混合版本时返回 409 并拒绝。</li>
-            <li>数据面（M3/M4 分片、EC、放置）仍非滚动；跨版本 cutover / force-recover 也不在兼容窗口内。</li>
+            <li>数据面（分片、EC、放置）仍非滚动；跨版本 cutover / force-recover 也不在兼容窗口内。</li>
           </ul>
 
           <h2 id="ops">运维命令</h2>
@@ -274,16 +274,16 @@ oss-server rebalance --apply</code></pre>
                 <tr><td>Batch 抢占 / 跨账号通知</td><td>不做；每动作桶通知已支持</td></tr>
                 <tr><td>tier 直读（含 Range）</td><td>不做；归档对象须先 Restore；Transition/Restore 已流式搬运</td></tr>
                 <tr><td>Select BZIP2</td><td>400（不新增 bzip2 依赖）；CSV/JSON/Parquet 可用</td></tr>
-                <tr><td>Level C 双向混合版本 / 数据面滚动</td><td>不做；仅 Level B 控制面窗口</td></tr>
+                <tr><td>任意双向混合版本 / 数据面滚动</td><td>不做；仅控制面滚动升级窗口</td></tr>
                 <tr><td><code>AssumeRoleWithWebIdentity</code></td><td>不做</td></tr>
               </tbody>
             </table>
           </div>
-          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；M3 MPU 会话仍粘节点；直接读 tier 须先 Restore。完整清单见仓库验收记录 §11。</p>
+          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；MPU 会话仍粘节点；直接读 tier 须先 Restore。完整清单见仓库验收记录。</p>
 
           <h2 id="more">继续阅读</h2>
           <ul>
-            <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a>：完整配置、S3 API、M8 控制面与 M9 runbook（随发布同步）。</li>
+            <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a>：完整配置、S3 API、控制面与强一致 runbook（随发布同步）。</li>
             <li><a href="install.html">安装文档</a>：Docker、源码、首次启动与访问密钥。</li>
             <li><a href="changelog.html">版本日志</a>：每个版本的变更与验收记录。</li>
             <li><a href="api.html">API 文档</a>：多语言 apidoc 入口与同域部署路径。</li>

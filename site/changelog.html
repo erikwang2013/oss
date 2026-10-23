@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.15.0，包含 M1 到 M9 的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.15.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -100,12 +100,12 @@
                 <ul>
                   <li><strong>AP / 账户</strong>：AP 匿名（策略与桶策略交集）、账户命名空间 v1、SourceVpc 来源证明、缓存 TTL/负缓存、无策略默认拒绝、旧 <code>*-s3alias</code> 回落、XFF hops/CIDR 信任链。</li>
                   <li><strong>TLS / 加密</strong>：私钥 0600 强制、CA 双信任轮换、主监听器与出站客户端热加载；SSE-KMS 显式 CMK 与命名环轮换（旧版本保留解密）。</li>
-                  <li><strong>数据面 / 作业</strong>：tier 流式搬运与恢复、Batch 每动作桶通知、M7 版本定向删除与元数据复制、Select Parquet、GC 二次快照、生命周期游标、AbortMPU。</li>
+                  <li><strong>数据面 / 作业</strong>：tier 流式搬运与恢复、Batch 每动作桶通知、多站点版本定向删除与元数据复制、Select Parquet、GC 二次快照、生命周期游标、AbortMPU。</li>
                   <li><strong>Inventory</strong>：增量水位（节点本地）与跨账户目标（仅管理员可配置，运行期复核源/目标账户）。</li>
-                  <li><strong>Level B</strong>：<code>BucketSetLifecycleV2</code> 正确标记 feature level 2；快照、cutover 与 force-recover 对 level-2 数据 fail-closed。</li>
-                  <li><strong>验证</strong>：M9 sync/stretch/recovery/rolling 78/59/133/65 PASS；M8 e2e PASS（4433s）；S3 全量 e2e 38 节 RC=0；库测试 268/150/152；Playwright 9/9。</li>
+                  <li><strong>控制面滚动升级</strong>：<code>BucketSetLifecycleV2</code> 正确标记 feature level 2；快照、cutover 与 force-recover 对 level-2 数据 fail-closed。</li>
+                  <li><strong>验证</strong>：强一致 sync/stretch/recovery/rolling 78/59/133/65 PASS；控制面 e2e PASS（4433s）；S3 全量 e2e 38 节 RC=0；库测试 268/150/152；Playwright 9/9。</li>
                 </ul>
-                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.15.0" target="_blank" rel="noopener">GitHub Release</a> · 验收记录：<code>docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md</code> §8–§11；完整配置与边界见 README。</p>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.15.0" target="_blank" rel="noopener">GitHub Release</a> · 验收记录：<code>docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md</code>；完整配置与边界见 README。</p>
               </div>
             </details>
 
@@ -115,8 +115,8 @@
                 <ul>
                   <li><strong>S3</strong>：ListObjects v1；UploadPartCopy；ListMultipartUploads（集群并集）；GET/HEAD <code>partNumber</code>；多区间 Range 降级整对象与 HEAD Range；版本控制三态 / Suspended；noncurrent 生命周期；匿名 Principal；Put/GetObjectRetention 与控制台锁状态；<code>s3:ObjectAccessed:*</code> 事件。</li>
                   <li><strong>TLS</strong>：监听器、witness、Raft/mesh、site/repl/tier 出站与 Kafka SASL/SSL 全链路；未配置 <code>[tls]</code> 时仍为明文。</li>
-                  <li><strong>M8</strong>：Inventory Parquet/Hive；tier 本地冷盘池与远端 GC；生命周期完整 Filter / Date / 多转换与控制台编辑器；Batch/Object Lambda WASM（<code>olap-wasm</code>）；AP DeleteObjects、<code>-s3alias</code> 与 SourceIp。</li>
-                  <li><strong>M9</strong>：Level B 滚动升级兼容窗口（wire/feature 头、<code>feature_level</code> 门控、成员预检、runbook 与 e2e 脚本）；数据面仍非滚动。</li>
+                  <li><strong>控制面</strong>：Inventory Parquet/Hive；tier 本地冷盘池与远端 GC；生命周期完整 Filter / Date / 多转换与控制台编辑器；Batch/Object Lambda WASM（<code>olap-wasm</code>）；AP DeleteObjects、<code>-s3alias</code> 与 SourceIp。</li>
+                  <li><strong>强一致</strong>：控制面滚动升级兼容窗口（wire/feature 头、<code>feature_level</code> 门控、成员预检、runbook 与 e2e 脚本）；数据面仍非滚动。</li>
                   <li><strong>安全</strong>：AP 授权/执行一致性、SourceIp fail-closed、匿名审计限速；验收 0 Critical，2 High 已修复复审。</li>
                 </ul>
                 <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.14.0" target="_blank" rel="noopener">GitHub Release</a> · 验收记录：<code>docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md</code>；完整配置与边界见 README。</p>
@@ -138,20 +138,20 @@
             </details>
 
             <details class="changelog-entry" id="v1-13-0" open>
-              <summary><strong>v1.13.0</strong><time datetime="2026-10-22">2026-10-22</time><span>M9 同步强一致</span></summary>
+              <summary><strong>v1.13.0</strong><time datetime="2026-10-22">2026-10-22</time><span>同步强一致</span></summary>
               <div class="entry-body">
                 <ul>
                   <li>sync 桶：remote-first PUT/MPU/Copy/删除，统一 origin version id，远端失败返回 503。</li>
                   <li>stretch 2×6：两站点各 6 盘，EC 8+4，单站点故障 fail-closed。</li>
                   <li>3-voter Raft 控制面：A/B 数据站点 + C witness，quorum 2，成员变更与 leader 单跳转发。</li>
-                  <li>11 表逻辑快照、M7 到 Raft cutover、raft-export、raft-force-recover、sync-reconcile。</li>
+                  <li>11 表逻辑快照、站点复制到 Raft 的 cutover、raft-export、raft-force-recover、sync-reconcile。</li>
                 </ul>
                 <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.13.0" target="_blank" rel="noopener">GitHub Release</a></p>
               </div>
             </details>
 
             <details class="changelog-entry" id="v1-12-0">
-              <summary><strong>v1.12.0</strong><time datetime="2026-10-20">2026-10-20</time><span>M8 控制面</span></summary>
+              <summary><strong>v1.12.0</strong><time datetime="2026-10-20">2026-10-20</time><span>控制面</span></summary>
               <div class="entry-body">
                 <ul>
                   <li>访问点与 Object Lambda，访问点策略与路由。</li>
@@ -163,7 +163,7 @@
             </details>
 
             <details class="changelog-entry" id="v1-11-0">
-              <summary><strong>v1.11.0</strong><time datetime="2026-10-18">2026-10-18</time><span>M7 多站点异步复制</span></summary>
+              <summary><strong>v1.11.0</strong><time datetime="2026-10-18">2026-10-18</time><span>多站点异步复制</span></summary>
               <div class="entry-body">
                 <ul>
                   <li>站点对、LWW 控制面 changelog、快照出货与对象复制 outbox。</li>
@@ -174,7 +174,7 @@
             </details>
 
             <details class="changelog-entry" id="v1-10-0">
-              <summary><strong>v1.10.0</strong><time datetime="2026-10-18">2026-10-18</time><span>M6 数据流</span></summary>
+              <summary><strong>v1.10.0</strong><time datetime="2026-10-18">2026-10-18</time><span>数据流</span></summary>
               <div class="entry-body">
                 <ul>
                   <li>事件通知与 Kafka 投递、死信与游标状态。</li>
@@ -185,7 +185,7 @@
             </details>
 
             <details class="changelog-entry" id="v1-9-0">
-              <summary><strong>v1.9.0</strong><time datetime="2026-10-17">2026-10-17</time><span>M5 安全与锁定</span></summary>
+              <summary><strong>v1.9.0</strong><time datetime="2026-10-17">2026-10-17</time><span>安全与锁定</span></summary>
               <div class="entry-body">
                 <ul>
                   <li>SSE-S3、SSE-KMS 与密钥库，访问密钥加密落库。</li>
@@ -200,14 +200,14 @@
               <div class="entry-body">
                 <ul>
                   <li>扩展包 C1-C5 与集群修复。</li>
-                  <li>M5 安全切片 0-2：行一致性、密钥库与加密数据面。</li>
+                  <li>安全切片 0-2：行一致性、密钥库与加密数据面。</li>
                 </ul>
                 <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.8.0" target="_blank" rel="noopener">GitHub Release</a></p>
               </div>
             </details>
 
             <details class="changelog-entry" id="v1-7-0">
-              <summary><strong>v1.7.0</strong><time datetime="2026-10-15">2026-10-15</time><span>M4 运维与 IAM</span></summary>
+              <summary><strong>v1.7.0</strong><time datetime="2026-10-15">2026-10-15</time><span>运维与 IAM</span></summary>
               <div class="entry-body">
                 <ul>
                   <li>观测、流式路径、版本控制、heal/scrub、扩容与生命周期。</li>
@@ -222,12 +222,12 @@
               <div class="entry-body">
                 <ul>
                   <li><strong>v1.6.0</strong>：Docker 密钥自动生成落盘，遗留清账。</li>
-                  <li><strong>v1.5.0</strong>：M3 分布式三切片、Docker Compose 与控制台改造。</li>
-                  <li><strong>v1.4.0</strong>：权限体系三面授权，M2b 多盘与 EC 收束。</li>
+                  <li><strong>v1.5.0</strong>：分布式三切片、Docker Compose 与控制台改造。</li>
+                  <li><strong>v1.4.0</strong>：权限体系三面授权，多盘与 EC 收束。</li>
                   <li><strong>v1.3.0</strong>：S3 协议补全，Content-MD5、checksum、Range 与 response-content-*。</li>
                   <li><strong>v1.2.1 / v1.2.0</strong>：依赖升级与 aetherupload 协议迁移。</li>
-                  <li><strong>v1.1.0 到 v1.1.2</strong>：M2a Multipart、Range GET、流式 PUT、元数据与孤儿回收，项目命名吞吞。</li>
-                  <li><strong>v1.0.0</strong>：M1 单盘对象存储内核、S3 CRUD 与 SigV4。</li>
+                  <li><strong>v1.1.0 到 v1.1.2</strong>：Multipart、Range GET、流式 PUT、元数据与孤儿回收，项目命名吞吞。</li>
+                  <li><strong>v1.0.0</strong>：单盘对象存储内核、S3 CRUD 与 SigV4。</li>
                 </ul>
                 <p><a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">全部 Releases</a></p>
               </div>
