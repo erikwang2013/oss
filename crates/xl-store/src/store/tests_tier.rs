@@ -156,6 +156,7 @@ async fn delete_outcome_carries_tier_refs() {
         DeleteOutcome::Version {
             version_id,
             tier: t,
+            ..
         } => {
             assert_eq!(version_id, vid);
             assert_eq!(t.unwrap().key, "cold/alpha/k");

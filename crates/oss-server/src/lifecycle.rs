@@ -1066,6 +1066,7 @@ mod tests {
             lifecycle_event(&DeleteOutcome::Version {
                 version_id: "v1".into(),
                 tier: None,
+                content: None,
             }),
             Some(("s3:LifecycleExpiration:Delete", Some("v1")))
         );

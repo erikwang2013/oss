@@ -384,6 +384,10 @@ pub struct RemoteTarget {
     /// TLS 证书主机名覆写（仅 https；缺省用 endpoint 的 host）。
     #[serde(default)]
     pub server_name: Option<String>,
+    /// 4.19：目标 oss 站点的 `[site].token`（可选）。配置后复制携带同源版本 id 并投递
+    /// 版本定向删除；留空保持旧 M6 语义（目标自生成版本 id，不投递版本删除）。
+    #[serde(default)]
+    pub site_token: Option<String>,
 }
 
 fn default_region() -> String {
@@ -606,6 +610,9 @@ impl AppConfig {
             }
             if r.region.trim().is_empty() {
                 return Err(format!("[[remotes]] {} 的 region 不能为空", r.id));
+            }
+            if r.site_token.as_deref().is_some_and(|t| t.is_empty()) {
+                return Err(format!("[[remotes]] {} 的 site_token 不能为空字符串", r.id));
             }
             // 0 会除零、过小则单对象等待数小时——启动期拒
             if let Some(rate) = r.max_bytes_per_sec
@@ -1142,6 +1149,7 @@ mod tests {
             region: "us-east-1".into(),
             max_bytes_per_sec: None,
             server_name: None,
+            site_token: None,
         };
         let cfg = |remotes| {
             let mut c = base_cfg();
@@ -1193,6 +1201,11 @@ mod tests {
             let err = cfg(vec![e]).remotes_validate().unwrap_err();
             assert!(err.contains("max_bytes_per_sec"), "{err}");
         }
+        // 4.19：site_token 空串启动即拒（拼错/漏值不得静默退回旧语义）。
+        let mut e = mk("r1", "http://h:1");
+        e.site_token = Some(String::new());
+        let err = cfg(vec![e]).remotes_validate().unwrap_err();
+        assert!(err.contains("site_token"), "{err}");
     }
 
     /// M8 缺口 C：Toml 省略 `max_bytes_per_sec` = None（旧配置零改动）。
@@ -1201,9 +1214,13 @@ mod tests {
         let base = "id='r1'\nendpoint='http://h:1'\naccess_key='ak'\nsecret_key='sk'\n";
         let r: RemoteTarget = toml::from_str(base).unwrap();
         assert_eq!(r.max_bytes_per_sec, None);
+        assert_eq!(r.site_token, None, "4.19：旧配置默认无同源 id 语义");
         let with = format!("{base}max_bytes_per_sec = 2048\n");
         let r: RemoteTarget = toml::from_str(&with).unwrap();
         assert_eq!(r.max_bytes_per_sec, Some(2048));
+        let with = format!("{base}site_token = 'tok'\n");
+        let r: RemoteTarget = toml::from_str(&with).unwrap();
+        assert_eq!(r.site_token.as_deref(), Some("tok"));
     }
 
     /// M8 S4b：`[[tiers]]` 校验矩阵（https 启动期拒绝）。

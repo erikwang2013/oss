@@ -110,6 +110,7 @@ pub async fn run_tls(
         region: peer.region.clone(),
         max_bytes_per_sec: None,
         server_name: None,
+        site_token: None,
     }]);
     if let Some(t) = tls {
         client = client.with_tls(t);

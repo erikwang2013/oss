@@ -872,7 +872,15 @@ impl AppState {
         let repl_sink = Arc::new(
             crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
                 // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
-                .with_site_data_replication(cfg.stretch.is_none()),
+                .with_site_data_replication(cfg.stretch.is_none())
+                // 4.19：仅配置 site_token 的远端具备同源 id（版本删除可定点）。
+                .with_versioned_remotes(
+                    cfg.remotes
+                        .iter()
+                        .filter(|r| r.site_token.is_some())
+                        .map(|r| r.id.clone())
+                        .collect(),
+                ),
         );
         let repl_client =
             Arc::new(crate::repl_client::ReplClient::new(&cfg.remotes).with_tls(Arc::clone(&tls)));
