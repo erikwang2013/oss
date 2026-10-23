@@ -17,7 +17,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use s3s::S3Request;
 use s3s::service::S3ServiceBuilder;
-use xl_s3::ap::{AccessPoint, ApCache, ApRoute, ApSource};
+use xl_s3::ap::{AccessPoint, ApCache, ApPolicy, ApRoute, ApSource};
 use xl_s3::olap::{OlapCache, OlapTransform};
 use xl_s3::service::OssS3;
 use xl_store::meta::{TierPhase, TierState};
@@ -293,11 +293,19 @@ async fn put_obj(
 }
 
 fn add_ap(env: &TestEnv, name: &str) {
+    // 4.4 起 AP 无策略默认拒绝；本套用例只测 OLAP 变换，显式放行数据面动作。
+    let policy: ApPolicy = serde_json::from_value(serde_json::json!({"Statement": [{
+        "Effect": "Allow",
+        "Principal": {"AWS": "*"},
+        "Action": "s3:*",
+        "Resource": [format!("arn:aws:s3:::{BUCKET}/*"), format!("arn:aws:s3:::{BUCKET}")],
+    }]}))
+    .unwrap();
     env.ap_cache.put(AccessPoint {
         name: name.into(),
         bucket: BUCKET.into(),
         owner_id: 1,
-        policy: None,
+        policy: Some(policy),
         region: "us-east-1".into(),
     });
 }
