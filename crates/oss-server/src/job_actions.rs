@@ -2,8 +2,10 @@
 //!
 //! 创建期授权/快照在 [`crate::job_actions_api`]；本模块只负责：清单 CSV、单任务载荷、
 //! [`BatchExecutor`]（执行前按**当时的**身份/策略再授权一次，失败留给引擎按重试上限收敛
-//! 为 PermanentFailure，不中断作业）。Batch 不发桶通知；副作用只走 [`BatchMutationHooks`]
-//! （复制入队 + tier 远端回收），与在线写路径同一组 sink。
+//! 为 PermanentFailure，不中断作业）。Batch 动作不经过 S3 service，桶通知按**对象所在桶**
+//! 在此补发（Copy→目标桶 CreatedCopy；Delete→RemovedDelete/DeleteMarkerCreated；
+//! Restore→RestorePost；ReplaceTags/InvokeLambda 无对应 S3 事件类型，不发）；副作用只走
+//! [`BatchMutationHooks`]（复制入队 + tier 远端回收），与在线写路径同一组 sink。
 //!
 //! 动作语义：Copy 只读源（可带 versionId），目标键 = `target.prefix + 原 key`，标签/元数据
 //! 按 Copy 语义复制；ReplaceTags 对清单对象自身整体替换标签；Delete 的 tier refs 交 GC；
@@ -16,6 +18,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use xl_s3::access::{Acl, AuthedUser};
+use xl_s3::events::{EventSink, EventSource, S3EventOp};
 use xl_s3::olap::{OlapCache, OlapInput, acquire_transform_slot};
 use xl_s3::replication::{ReplicationSink, WriteInfo};
 use xl_s3::restore::RestoreSink;
@@ -215,6 +218,7 @@ pub struct BatchExecutor {
     acl: Acl,
     restore: Arc<dyn RestoreSink>,
     olap: Arc<OlapCache>,
+    events: Arc<dyn EventSink>,
     hooks: BatchMutationHooks,
 }
 
@@ -225,6 +229,7 @@ impl BatchExecutor {
         acl: Acl,
         restore: Arc<dyn RestoreSink>,
         olap: Arc<OlapCache>,
+        events: Arc<dyn EventSink>,
         hooks: BatchMutationHooks,
     ) -> Self {
         Self {
@@ -233,8 +238,33 @@ impl BatchExecutor {
             acl,
             restore,
             olap,
+            events,
             hooks,
         }
+    }
+
+    /// 桶通知补发：Batch 不经过 S3 service，事件在这里按对象所在桶（Copy = 目标桶）发出。
+    /// `EventSink` 自带「失败只 warn」语义，绝不改变任务结果（至少一次 outbox）。
+    async fn emit_event(
+        &self,
+        op: S3EventOp,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        size: Option<u64>,
+        etag: Option<&str>,
+    ) {
+        self.events
+            .emit(
+                op,
+                bucket,
+                key,
+                version_id,
+                size,
+                etag,
+                EventSource::internal("oss-batch"),
+            )
+            .await;
     }
 
     async fn versioning_mode(&self, bucket: &str) -> Result<VersioningMode, String> {
@@ -334,6 +364,15 @@ impl BatchExecutor {
             )
             .await
             .map_err(|e| e.to_string())?;
+        self.emit_event(
+            S3EventOp::CreatedCopy,
+            dst_bucket,
+            &dst_key,
+            out.version_id.as_deref(),
+            Some(out.size),
+            Some(&out.etag),
+        )
+        .await;
         self.hooks
             .repl
             .on_write(WriteInfo {
@@ -361,12 +400,43 @@ impl BatchExecutor {
             .await
             .map_err(|e| e.to_string())?;
         let refs = match outcome {
-            DeleteOutcome::Version { tier: Some(t), .. } => vec![t],
-            DeleteOutcome::Version { tier: None, .. } => Vec::new(),
-            DeleteOutcome::Object { tiers } => tiers,
+            // 事件口径与在线 delete_object 完全一致（NotFound = 未发生删除，不发）。
+            DeleteOutcome::Version { version_id, tier } => {
+                self.emit_event(
+                    S3EventOp::RemovedDelete,
+                    &p.bucket,
+                    &p.key,
+                    Some(&version_id),
+                    None,
+                    None,
+                )
+                .await;
+                tier.into_iter().collect()
+            }
+            DeleteOutcome::Object { tiers } => {
+                self.emit_event(
+                    S3EventOp::RemovedDelete,
+                    &p.bucket,
+                    &p.key,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                tiers
+            }
             // I1：与在线 delete_object 同语义——仅缺省删（产生 marker）入复制队列；
             // 指定版本删除不入队（DeleteMarkerReplication 管的是 marker）。
             DeleteOutcome::Marker { version_id } => {
+                self.emit_event(
+                    S3EventOp::RemovedDeleteMarkerCreated,
+                    &p.bucket,
+                    &p.key,
+                    Some(&version_id),
+                    None,
+                    None,
+                )
+                .await;
                 self.hooks
                     .repl
                     .on_write(WriteInfo {
@@ -407,6 +477,7 @@ impl BatchExecutor {
             .set_object_tags(&p.bucket, &p.key, p.version_id.as_deref(), p.tags.clone())
             .await
             .map_err(|e| e.to_string())?;
+        // S3 没有对象标签事件类型：不发桶通知，不发明事件名。
         Ok("Succeeded".into())
     }
 
@@ -443,6 +514,16 @@ impl BatchExecutor {
                         .await;
                     return Err(format!("Restore 入队失败: {e}"));
                 }
+                // 只在受理时发（Restoring/Restored 的幂等分支不发，与在线 409 口径一致）。
+                self.emit_event(
+                    S3EventOp::RestorePost,
+                    &p.bucket,
+                    &p.key,
+                    Some(&version_id),
+                    None,
+                    None,
+                )
+                .await;
                 Ok("Succeeded".into())
             }
         }
@@ -498,7 +579,7 @@ impl BatchExecutor {
             },
             &slot,
         )
-        .await?; // 输出丢弃
+        .await?; // 输出丢弃：不修改对象，不发桶通知
         Ok("Succeeded".into())
     }
 }

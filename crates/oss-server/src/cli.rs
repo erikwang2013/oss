@@ -503,13 +503,15 @@ pub async fn run(
                     std::sync::Arc::clone(&state.events),
                 )),
                 inventory: std::sync::Arc::clone(&state.inventory_runner),
-                // Batch：与在线写路径共用同一组 sink（不发桶通知）
+                // Batch：与在线写路径共用同一组 sink；桶通知由执行器按对象所在桶补发。
                 batch: std::sync::Arc::new(crate::job_actions::BatchExecutor::new(
                     std::sync::Arc::clone(&state.db),
                     std::sync::Arc::clone(&state.store),
                     state.acl(),
                     std::sync::Arc::clone(&state.restore_sink),
                     std::sync::Arc::clone(&state.olap_cache),
+                    std::sync::Arc::clone(&state.events)
+                        as std::sync::Arc<dyn xl_s3::events::EventSink>,
                     crate::job_actions::BatchMutationHooks {
                         repl: state.repl_sink.clone()
                             as std::sync::Arc<dyn xl_s3::replication::ReplicationSink>,
