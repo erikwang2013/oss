@@ -1328,12 +1328,9 @@ impl S3 for OssS3 {
             }
             forced_version_id = origin_id.map(str::to_string);
         }
-        // M8 S4a：存储类（M6 REPLICA 不携带；站点副本——sync 或 token 同 id——保留；归档类直写拒）
-        let storage_class = if replica && forced_version_id.is_none() {
-            None
-        } else {
-            parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?
-        };
+        // M8 S4a：存储类随写保留（4.19：M6 远端复制同样携带；归档类直写拒）。
+        let storage_class =
+            parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?;
         let PutObjectInput {
             bucket,
             key,
@@ -1345,15 +1342,10 @@ impl S3 for OssS3 {
             ..
         } = req.input;
         let body = body.ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing body"))?;
-        // M8 前置：x-amz-tagging（URL query 串）。M6 REPLICA 显式忽略标签；
-        // 站点副本（sync 或 token 同 id）保留（与本地版本字段一致）。
-        let tags = if replica && forced_version_id.is_none() {
-            None
-        } else {
-            match tagging.as_deref() {
-                Some(raw) if !raw.is_empty() => Some(parse_tagging_header(raw)?),
-                _ => None,
-            }
+        // M8 前置：x-amz-tagging（URL query 串）。4.19：M6 远端复制也携带标签（与本地版本一致）。
+        let tags = match tagging.as_deref() {
+            Some(raw) if !raw.is_empty() => Some(parse_tagging_header(raw)?),
+            _ => None,
         };
 
         // 声明长度已知且超限：不读体直接 413
@@ -2388,24 +2380,22 @@ impl S3 for OssS3 {
         // M5 切片 4（L4）：Governance bypass 头（调用方均经鉴权链——「非匿名」成立）
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         let mode = self.versioning_mode(&bucket).await?;
+        let hdr = |n: &str| req.headers.get(n).and_then(|v| v.to_str().ok());
+        // 站点副本 token 认证（marker 同 id 与历史副本按内容删除都要求）。
+        let token_ok = match (self.site_token.as_deref(), hdr("x-oss-site-token")) {
+            (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
+            _ => false,
+        };
+        let origin_id = hdr("x-oss-origin-version-id");
+        // 4.19：源端内容指纹（仅当该内容在源链唯一时随删除下发）。
+        let origin_etag = hdr("x-oss-origin-etag").filter(|e| !e.is_empty());
+        let origin_size = hdr("x-oss-origin-size").and_then(|s| s.parse::<u64>().ok());
         // 4.16：站点对 marker 同 id——REPLICA DELETE 在 site token 认证下可用
         // `x-oss-origin-version-id` 指定 marker 版本 id（异步站点复制；sync 桶走 M9 内部路由）。
         let forced_marker = if vid.is_none() && replica {
-            match req
-                .headers
-                .get("x-oss-origin-version-id")
-                .and_then(|v| v.to_str().ok())
-            {
+            match origin_id {
                 Some(origin) => {
-                    let presented = req
-                        .headers
-                        .get("x-oss-site-token")
-                        .and_then(|v| v.to_str().ok());
-                    let ok = match (self.site_token.as_deref(), presented) {
-                        (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
-                        _ => false,
-                    };
-                    if !ok {
+                    if !token_ok {
                         return Err(s3s::s3_error!(AccessDenied, "site token required"));
                     }
                     Some(origin.to_string())
@@ -2450,9 +2440,54 @@ impl S3 for OssS3 {
                 .await
                 .map_err(to_s3_error)?,
         };
+        // 4.19：混合版本升级前复制的历史异步副本两端 UUID 不同，按源 id 删除会落空（幂等 204
+        // 但目标残留）。仅在 REPLICA + 站点 token 认证、请求带源端「内容唯一」指纹、且本地
+        // id 未命中时，删除未映射（无 remote_version_id）的 REPLICA 历史副本。
+        // 内容指纹由源端在「源链已无同 (etag,size) 版本」时给出——因此命中的目标副本必为
+        // 源端已不存在的版本；多副本一并清。marker（etag 恒空）不参与，仍按同 id 定点。
+        let mut legacy_tiers = Vec::new();
+        if matches!(&outcome, DeleteOutcome::NotFound)
+            && replica
+            && token_ok
+            && origin_id.is_some()
+            && vid.as_deref().is_some_and(|v| !v.is_empty() && v != "null")
+            && let (Some(etag), Some(size)) = (origin_etag, origin_size)
+        {
+            let ids = self
+                .store
+                .find_unmapped_replica_versions(&bucket, &key, etag, size)
+                .await
+                .map_err(to_s3_error)?;
+            for id in ids {
+                match self
+                    .delete_versioned(&bucket, &key, Some(&id), mode, bypass)
+                    .await
+                {
+                    Ok(DeleteOutcome::Version {
+                        version_id, tier, ..
+                    }) => {
+                        legacy_tiers.extend(tier);
+                        self.emit(
+                            S3EventOp::RemovedDelete,
+                            &bucket,
+                            &key,
+                            Some(&version_id),
+                            None,
+                            None,
+                            event_source.clone(),
+                        )
+                        .await;
+                    }
+                    // 竞态：另一路已删 — 幂等。
+                    Ok(DeleteOutcome::NotFound) => {}
+                    Ok(_) => {}
+                    Err(e) => return Err(to_s3_error(e)),
+                }
+            }
+        }
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
         // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
-        let mut tier_refs = Vec::new();
+        let mut tier_refs = legacy_tiers;
         let (dm, vid) = match outcome {
             DeleteOutcome::Marker { version_id } => {
                 self.emit(
@@ -2479,7 +2514,11 @@ impl S3 for OssS3 {
                 .await;
                 (Some(true), Some(version_id))
             }
-            DeleteOutcome::Version { version_id, tier } => {
+            DeleteOutcome::Version {
+                version_id,
+                tier,
+                content,
+            } => {
                 tier_refs.extend(tier);
                 self.emit(
                     S3EventOp::RemovedDelete,
@@ -2492,12 +2531,17 @@ impl S3 for OssS3 {
                 )
                 .await;
                 // 4.16：版本定向删除也要复制——站点对同源版本 id，目标做定点删除（不造 marker）。
+                // 4.19：内容指纹随行（仅当源链中该内容唯一），目标可据此兼容无同源 id 的历史副本。
+                let (etag, size) = match &content {
+                    Some((e, s)) => (e.as_str(), *s),
+                    None => ("", 0),
+                };
                 self.repl_on_write(crate::replication::WriteInfo {
                     bucket: &bucket,
                     key: &key,
                     version_id: Some(&version_id),
-                    etag: "",
-                    size: 0,
+                    etag,
+                    size,
                     is_delete_marker: false,
                     is_version_delete: true,
                     is_replica: replica,
@@ -2709,7 +2753,11 @@ impl S3 for OssS3 {
                             .await;
                             (Some(true), Some(version_id), None)
                         }
-                        DeleteOutcome::Version { version_id, tier } => {
+                        DeleteOutcome::Version {
+                            version_id,
+                            tier,
+                            content,
+                        } => {
                             tier_refs.extend(tier);
                             self.emit(
                                 S3EventOp::RemovedDelete,
@@ -2722,12 +2770,17 @@ impl S3 for OssS3 {
                             )
                             .await;
                             // 4.16：批量版本定向删除同样复制（目标定点删同 id，不造 marker）。
+                            // 4.19：内容指纹语义同单键删除。
+                            let (etag, size) = match &content {
+                                Some((e, s)) => (e.as_str(), *s),
+                                None => ("", 0),
+                            };
                             self.repl_on_write(crate::replication::WriteInfo {
                                 bucket: &bucket,
                                 key: &obj.key,
                                 version_id: Some(&version_id),
-                                etag: "",
-                                size: 0,
+                                etag,
+                                size,
                                 is_delete_marker: false,
                                 is_version_delete: true,
                                 is_replica: replica,

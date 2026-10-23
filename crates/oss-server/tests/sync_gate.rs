@@ -2724,3 +2724,112 @@ async fn async_bucket_delete_stays_local() {
     );
     assert_eq!(delete_intent_rows(&e.st).await, 0);
 }
+
+/// 4.19：混合版本历史副本——升级前复制的异步 REPLICA 两端 UUID 不同。源端版本删除
+/// （源 id 未命中）在 site token + 源链内容唯一指纹下清掉目标未映射副本；已映射的
+/// 同源 id 副本不受影响，无 token 时绝不按内容删。
+#[tokio::test]
+async fn async_version_delete_reconciles_legacy_replica_by_content() {
+    let e = env(Mode::Ok, 1 << 20).await;
+    let body = b"legacy-hist".to_vec();
+    let legacy = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+    ];
+    let r = signed(&e, Method::PUT, "/asy/old.txt", &legacy, &body).await;
+    assert_eq!(r.status(), 200);
+    let target_vid = r
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let etag = r
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let size = body.len().to_string();
+    let src_vid = uuid::Uuid::new_v4().to_string();
+    let path = format!("/asy/old.txt?versionId={src_vid}");
+
+    // 无 token：不得按内容清副本（204 幂等，但目标历史版本保留）。
+    let untokened = [
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-origin-version-id", src_vid.as_str()),
+        ("x-oss-origin-etag", etag.as_str()),
+        ("x-oss-origin-size", size.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::DELETE, &path, &untokened, &[])
+            .await
+            .status(),
+        204
+    );
+    let tpath = format!("/asy/old.txt?versionId={target_vid}");
+    assert_eq!(
+        signed(&e, Method::HEAD, &tpath, &[], &[]).await.status(),
+        200,
+        "无 token 时不得删除历史副本"
+    );
+
+    // token + 内容唯一指纹：源 id 未命中 → 清理未映射的历史副本。
+    let h = [
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", src_vid.as_str()),
+        ("x-oss-origin-etag", etag.as_str()),
+        ("x-oss-origin-size", size.as_str()),
+    ];
+    assert_eq!(
+        signed(&e, Method::DELETE, &path, &h, &[]).await.status(),
+        204
+    );
+    assert_eq!(
+        signed(&e, Method::HEAD, &tpath, &[], &[]).await.status(),
+        404,
+        "历史副本应按内容指纹收敛删除"
+    );
+
+    // 同源 id 副本（remote_version_id 已映射）不参与内容补偿：即使内容指纹一致也保留。
+    let mapped_id = uuid::Uuid::new_v4().to_string();
+    let tokened = [
+        ("content-type", "text/plain"),
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", mapped_id.as_str()),
+    ];
+    let r = signed(&e, Method::PUT, "/asy/mapped.txt", &tokened, &body).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get("x-amz-version-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        mapped_id
+    );
+    let other_src = uuid::Uuid::new_v4().to_string();
+    let h = [
+        ("x-amz-replication-status", "REPLICA"),
+        ("x-oss-site-token", LOCAL_TOKEN),
+        ("x-oss-origin-version-id", other_src.as_str()),
+        ("x-oss-origin-etag", etag.as_str()),
+        ("x-oss-origin-size", size.as_str()),
+    ];
+    let dpath = format!("/asy/mapped.txt?versionId={other_src}");
+    assert_eq!(
+        signed(&e, Method::DELETE, &dpath, &h, &[]).await.status(),
+        204
+    );
+    let mpath = format!("/asy/mapped.txt?versionId={mapped_id}");
+    assert_eq!(
+        signed(&e, Method::HEAD, &mpath, &[], &[]).await.status(),
+        200,
+        "已映射的同源 id 副本不得被内容指纹误删"
+    );
+}

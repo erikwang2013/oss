@@ -67,6 +67,8 @@ struct Remote {
     server_name: Option<String>,
     /// M7 站点对等 remote：地址遵循 `[tls.server]` 模式（http 存储、连接期升级）。
     peer: bool,
+    /// 4.19：`[[remotes]]` 显式配置的对端站点 token——启用同源版本 id 与版本定向删除。
+    site_token: Option<String>,
     access_key: String,
     secret_key: String,
     region: String,
@@ -155,6 +157,7 @@ fn remote_of(
         port: ep.port,
         server_name,
         peer,
+        site_token: None,
         access_key: access_key.to_string(),
         secret_key: secret_key.to_string(),
         region: region.to_string(),
@@ -177,18 +180,17 @@ impl ReplClient {
         let remotes = targets
             .iter()
             .filter_map(|t| {
-                Some((
-                    t.id.clone(),
-                    remote_of(
-                        &t.endpoint,
-                        &t.access_key,
-                        &t.secret_key,
-                        &t.region,
-                        limiter_of(t),
-                        t.server_name.clone(),
-                        false,
-                    )?,
-                ))
+                let mut r = remote_of(
+                    &t.endpoint,
+                    &t.access_key,
+                    &t.secret_key,
+                    &t.region,
+                    limiter_of(t),
+                    t.server_name.clone(),
+                    false,
+                )?;
+                r.site_token = t.site_token.clone();
+                Some((t.id.clone(), r))
             })
             .collect();
         Self {
@@ -403,34 +405,18 @@ impl ReplClient {
         })
     }
 
-    pub async fn put_object(
-        &self,
-        remote_id: &str,
-        dest_bucket: &str,
-        key: &str,
-        body: Bytes,
-        expected_etag: &str,
-    ) -> Result<(), ReplError> {
-        self.put_object_with_meta(
-            remote_id,
-            dest_bucket,
-            key,
-            body,
-            expected_etag,
-            None,
-            &BTreeMap::new(),
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map(|_| ())
+    /// 4.19：`[[remotes]]` 配置的对端站点 token（None = 旧 M6 远端，无同源 id 语义）。
+    pub fn site_token(&self, remote_id: &str) -> Option<&str> {
+        self.remotes
+            .get(remote_id)
+            .and_then(|r| r.site_token.as_deref())
+    }
+
+    /// 目标桶 versioning 探询的缓存键（含端点：换端点后不命中旧缓存）。
+    pub fn target_cache_key(&self, remote_id: &str, bucket: &str) -> Option<String> {
+        self.remotes
+            .get(remote_id)
+            .map(|r| format!("{}\u{1f}{bucket}", r.endpoint))
     }
 
     /// M7 站点 PUT：透传 content-type/user-metadata，并可要求响应带真实 version-id
@@ -891,21 +877,37 @@ impl ReplClient {
     }
 
     /// 4.16：站点对版本定向删除——标准 S3 `DELETE ?versionId=`，带 REPLICA（目标不再入队）。
-    /// 目标版本不存在 = 已删（幂等；含升级前副本 id 不一致的旧版本，记日志由上层处理）。
+    /// 目标版本不存在 = 已删（幂等）。
+    /// 4.19：带站点 token + 源端 id；`content = Some((etag,size))` 表示源链中该内容已唯一，
+    /// 目标可按内容指纹清理升级前复制的历史副本（无同源 id）。
     pub async fn delete_object_version_s3(
         &self,
         remote_id: &str,
         dest_bucket: &str,
         key: &str,
         version_id: &str,
+        site_token: Option<&str>,
+        content: Option<(&str, u64)>,
     ) -> Result<(), ReplError> {
+        let token = site_token.ok_or_else(|| ReplError::permanent("site token required"))?;
         let vid = pct(version_id);
         // 源端删除已通过其锁校验（含 governance bypass），目标以同值 WORM 记录复核；
         // 带 bypass 头保证「源端允许的删除」不会因目标端 governance 二次拦截而死信。
-        let headers = vec![(
-            "x-amz-bypass-governance-retention".to_string(),
-            "true".to_string(),
-        )];
+        let mut headers = vec![
+            (
+                "x-amz-bypass-governance-retention".to_string(),
+                "true".to_string(),
+            ),
+            ("x-oss-site-token".to_string(), token.to_string()),
+            (
+                "x-oss-origin-version-id".to_string(),
+                version_id.to_string(),
+            ),
+        ];
+        if let Some((etag, size)) = content {
+            headers.push(("x-oss-origin-etag".to_string(), etag.to_string()));
+            headers.push(("x-oss-origin-size".to_string(), size.to_string()));
+        }
         match self
             .send(
                 remote_id,
@@ -1394,6 +1396,7 @@ mod tests {
             region: "us-east-1".into(),
             max_bytes_per_sec: max,
             server_name: None,
+            site_token: None,
         }
     }
 

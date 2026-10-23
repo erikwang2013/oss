@@ -286,6 +286,7 @@ fn target(id: &str, endpoint: &str, max: Option<u64>) -> RemoteTarget {
         region: "us-east-1".into(),
         max_bytes_per_sec: max,
         server_name: None,
+        site_token: None,
     }
 }
 
@@ -739,6 +740,8 @@ struct SiteSeen {
     meta_foo: Option<String>,
     part_sizes: Option<String>,
     origin_version_id: Option<String>,
+    origin_etag: Option<String>,
+    origin_size: Option<String>,
     site_token: Option<String>,
     tags: Option<String>,
     storage_class: Option<String>,
@@ -801,6 +804,8 @@ async fn site_mock(
                         };
                         let part_sizes = hdr("x-oss-part-sizes");
                         let origin_version_id = hdr("x-oss-origin-version-id");
+                        let origin_etag = hdr("x-oss-origin-etag");
+                        let origin_size = hdr("x-oss-origin-size");
                         let site_token = hdr("x-oss-site-token");
                         let tags = hdr("x-amz-tagging");
                         let storage_class = hdr("x-amz-storage-class");
@@ -818,6 +823,8 @@ async fn site_mock(
                             meta_foo,
                             part_sizes,
                             origin_version_id: origin_version_id.clone(),
+                            origin_etag,
+                            origin_size,
                             site_token,
                             tags,
                             storage_class,
@@ -1396,4 +1403,246 @@ async fn put_with_meta_sends_sse_scheme_and_rejects_sse_c() {
         .unwrap_err();
     assert_eq!(err.class, oss_server::repl_client::ErrClass::Permanent);
     assert_eq!(seen.lock().unwrap().len(), before, "SSE-C 不得发请求");
+}
+
+// ---------------- 4.19：M6 远端复用 M7 载荷/删除机制 ----------------
+
+fn token_target(id: &str, endpoint: &str) -> RemoteTarget {
+    RemoteTarget {
+        site_token: Some("tok-m6".into()),
+        ..target(id, endpoint, None)
+    }
+}
+
+async fn remote_rows(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM repl_outbox WHERE target_kind='remote'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// 4.19：配置 `site_token` 的 M6 远端——完整元数据 + 同源版本 id（目标按 id 落库）。
+#[tokio::test]
+async fn m6_token_remote_replicates_metadata_and_same_origin_id() {
+    use std::collections::BTreeMap;
+    use xl_store::meta::{ObjectLockRecord, ObjectTag};
+    let (pool, store, _a, _b) = fixture().await;
+    let until = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 + 3_600_000_000_000;
+    let info = store
+        .put_object_stream_with_meta_ext(
+            "rbk",
+            "meta",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"payload"))
+            })),
+            Some("text/plain".into()),
+            BTreeMap::from([("foo".to_string(), "Bar".to_string())]),
+            None,
+            VersioningMode::Enabled,
+            None,
+            Some(ObjectLockRecord {
+                mode: Some("GOVERNANCE".into()),
+                retain_until_nanos: Some(until),
+                legal_hold: true,
+            }),
+            Some(vec![ObjectTag {
+                key: "k1".into(),
+                value: "v1".into(),
+            }]),
+            Some("STANDARD_IA".into()),
+            xl_store::store::PutExt::default(),
+        )
+        .await
+        .unwrap();
+    let vid = info.version_id.clone().unwrap();
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), info.etag.clone()).await;
+    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
+        .bind(rules_json(None, true))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store))
+        .with_versioned_remotes(vec!["r1".into()]);
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "meta",
+        version_id: Some(&vid),
+        etag: &info.etag,
+        size: info.size,
+        is_delete_marker: false,
+        is_version_delete: false,
+        is_replica: false,
+    })
+    .await;
+    let c = ReplClient::new(&[token_target("r1", &endpoint)]);
+    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
+    let seen = seen.lock().unwrap().clone();
+    let puts: Vec<&SiteSeen> = seen.iter().filter(|s| s.method == "PUT").collect();
+    assert_eq!(puts.len(), 1);
+    let p = puts[0];
+    assert_eq!(p.origin_version_id.as_deref(), Some(vid.as_str()));
+    assert_eq!(p.site_token.as_deref(), Some("tok-m6"));
+    assert_eq!(p.replication.as_deref(), Some("REPLICA"));
+    assert_eq!(p.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(p.meta_foo.as_deref(), Some("Bar"));
+    assert_eq!(p.tags.as_deref(), Some("k1=v1"));
+    assert_eq!(p.storage_class.as_deref(), Some("STANDARD_IA"));
+    assert_eq!(p.lock_mode.as_deref(), Some("GOVERNANCE"));
+    assert_eq!(p.lock_hold.as_deref(), Some("ON"));
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "GET" && s.uri.contains("versioning=")),
+        "版本化远端必须先探询目标 versioning"
+    );
+    let h = store
+        .head_object_version("rbk", "meta", &vid)
+        .await
+        .unwrap();
+    assert_eq!(h.replication_status.as_deref(), Some("COMPLETED"));
+}
+
+/// 4.19：M6 版本删除只投递给同源 id 远端（源桶 Enabled），带内容指纹与幂等 404；
+/// 旧 M6 远端（无 token）保持「版本删除不入队」原语义。
+#[tokio::test]
+async fn m6_token_remote_replicates_version_delete_with_fingerprint() {
+    let (pool, store, _a, _b) = fixture().await;
+    sqlx::query("INSERT INTO buckets (name, versioning) VALUES ('rbk', 'Enabled')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
+        .bind(rules_json(None, true))
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 真实删除以取得源端内容指纹。
+    let (vid, _etag) = put_versioned(&store, "gone", b"payload").await;
+    let out = store
+        .delete_object_versioned("rbk", "gone", Some(&vid), VersioningMode::Enabled)
+        .await
+        .unwrap();
+    let (fp_etag, fp_size) = match out {
+        xl_store::store::DeleteOutcome::Version {
+            content: Some(c), ..
+        } => c,
+        other => panic!("unexpected: {other:?}"),
+    };
+    let wi = |key: &'static str, vid: &'static str| WriteInfo {
+        bucket: "rbk",
+        key,
+        version_id: Some(vid),
+        etag: &fp_etag,
+        size: fp_size,
+        is_delete_marker: false,
+        is_version_delete: true,
+        is_replica: false,
+    };
+    // 旧 M6 sink（未配置 versioned remotes）→ 不入队。
+    SqlReplSink::new(pool.clone(), Arc::clone(&store))
+        .on_write(wi("gone", "v-old"))
+        .await;
+    assert_eq!(remote_rows(&pool).await, 0, "无 token 远端不得入队版本删除");
+
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store))
+        .with_versioned_remotes(vec!["r1".into()]);
+    sink.on_write(wi("gone", "v-del")).await;
+    assert_eq!(remote_rows(&pool).await, 1);
+    // 源桶 Suspended → 不入队（与站点路径同口径）。
+    sqlx::query("UPDATE buckets SET versioning='Suspended' WHERE name='rbk'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sink.on_write(wi("gone", "v-del2")).await;
+    assert_eq!(remote_rows(&pool).await, 1);
+    sqlx::query("UPDATE buckets SET versioning='Enabled' WHERE name='rbk'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 目标已无该版本（404）→ 幂等成功。
+    sink.on_write(wi("already-gone", "v-del3")).await;
+    assert_eq!(remote_rows(&pool).await, 2);
+
+    let state = Arc::new(Mutex::new("Enabled".to_string()));
+    let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
+    let c = ReplClient::new(&[token_target("r1", &endpoint)]);
+    assert_eq!(process_repl_once(&pool, &store, &c).await, (2, 0));
+    assert_eq!(remote_rows(&pool).await, 0, "成功行应删除");
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|s| s.method != "PUT"),
+        "版本删除绝不能退化成 PUT：{seen:?}"
+    );
+    let del = seen
+        .iter()
+        .find(|s| s.method == "DELETE" && s.uri.contains("versionId=v-del"))
+        .expect("定点删除");
+    assert_eq!(del.origin_version_id.as_deref(), Some("v-del"));
+    assert_eq!(del.site_token.as_deref(), Some("tok-m6"));
+    assert_eq!(del.origin_etag.as_deref(), Some(fp_etag.as_str()));
+    assert_eq!(
+        del.origin_size.as_deref(),
+        Some(fp_size.to_string().as_str())
+    );
+    assert_eq!(del.bypass.as_deref(), Some("true"));
+    assert_eq!(del.replication.as_deref(), Some("REPLICA"));
+}
+
+/// 4.19：SSE-KMS 源不得以明文/换钥复制——永久错、不发任何目标请求。
+#[tokio::test]
+async fn m6_worker_dead_letters_sse_kms_without_request() {
+    let (pool, store, _a, datadir) = fixture().await;
+    let sys = xl_store::layout::sys_dir(datadir.path(), "");
+    store
+        .init_encryption(None, Some(sys.join("kms")))
+        .await
+        .unwrap();
+    let info = store
+        .put_object_stream_with_meta_ext(
+            "rbk",
+            "kms",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"payload"))
+            })),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            Some(xl_store::crypto::EncSpec::SseKms),
+            None,
+            None,
+            None,
+            xl_store::store::PutExt::default(),
+        )
+        .await
+        .unwrap();
+    let vid = info.version_id.clone().unwrap();
+    let (endpoint, seen, _h) = mock_server(StatusCode::OK, Some(info.etag.clone())).await;
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
+        .bind(rules_json(None, true))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sink.on_write(WriteInfo {
+        bucket: "rbk",
+        key: "kms",
+        version_id: Some(&vid),
+        etag: &info.etag,
+        size: info.size,
+        is_delete_marker: false,
+        is_version_delete: false,
+        is_replica: false,
+    })
+    .await;
+    sqlx::query("UPDATE repl_outbox SET attempts=10")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let c = client(&endpoint);
+    assert_eq!(process_repl_once(&pool, &store, &c).await, (0, 1));
+    let rows = outbox_rows(&pool).await;
+    assert_eq!(rows[0].0, "dead", "SSE-KMS 必须是永久死信：{rows:?}");
+    assert!(rows[0].3.as_deref().unwrap_or("").contains("SSE-KMS"));
+    assert!(seen.lock().unwrap().is_empty(), "不得向目标发任何请求");
 }
