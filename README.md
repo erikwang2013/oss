@@ -822,11 +822,17 @@ aws --endpoint-url http://127.0.0.1:9000 s3api select-object-content \
   `count(*)/sum/min/max/avg`（不支持 GROUP BY；聚合须独占投影）。CSV 列 `s._1`；JSON 路径 `s.a.b`。
 - 输入：CSV 分隔符/引号/转义/记录分隔符/注释（缺省 `#`）/表头可配；`AllowQuotedRecordDelimiter`
   缺省 false。ScanRange 按「记录首字节落在区间内则整条处理」；仅给 End = 扫描末尾 N 字节；
-  GZIP 与 ScanRange 互斥；JSON DOCUMENT 不支持 ScanRange。
+  GZIP 与 ScanRange 互斥；JSON DOCUMENT 不支持 ScanRange。Parquet 逐行按列名映射为 JSON
+  对象（`s.col` / `s.a.b`；`SELECT *` 输出整行对象；`_N` 位置列不可用）；文件内部压缩由
+  parquet 库解码（SNAPPY/未压缩），请求的 `CompressionType` 必须 `NONE` 且不接受
+  ScanRange（违反 → 400）。
 - 输出：Records ≤256KiB 分片 + Progress（约 1MiB 节奏，`--request-progress`）+ Stats + End；
   Stats 三计数独立（`BytesScanned` 原始/压缩后、`BytesProcessed` 送入求值器、`BytesReturned` 输出）。
-- 上限/边界（记档）：对象 ≤256MiB、GZIP 解压 ≤512MiB（全量缓冲，无并发预算）；BZIP2 返回 400
-  （后置）；Parquet 未支持；CRLF 保留 `\r`；空 CSV 字段进 sum/avg 报 400；LIKE 模式 ≤4096 字节。
+- 上限/边界（记档）：对象 ≤256MiB、GZIP/Parquet 解压 ≤512MiB（全量缓冲，无并发预算；Parquet 以
+  行组 `total_byte_size` 合计计，页头与元数据不一致的恶意文件不受该预算约束——parquet 库按
+  页头预分配，已认证用户可造成瞬时内存压力，与既有全量缓冲/无并发预算同风险面）；BZIP2
+  返回 400（工作区无 bzip2 依赖，后置）；Parquet 的 `BytesScanned` 记压缩后文件字节；CRLF
+  保留 `\r`；空 CSV 字段进 sum/avg 报 400；LIKE 模式 ≤4096 字节。
 
 ## 桶复制（M6）
 
@@ -860,8 +866,9 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-replication --bucket s
   目标恢复后自动追平。间隔 `OSS_REPL_INTERVAL_SECS`（默认 1；0=关）。
 - 限速按远端独立令牌桶（`[[remotes]].max_bytes_per_sec`）；缺省不限速，旧配置零改动。
 - 边界（记档）：目标桶/主题需**预创建**；SSE-C 源对象不可复制（客户钥不落盘）；版本定向删除
-  与 `Priority` 不生效（不同目的地都会复制）；MPU 源 ETag 目标重算（不做 ETag 断言）；
-  单对象整读入内存（≤16 并发）；`Role` 不参与鉴权。
+  不投递 M6 远端（远端版本 id 由目标生成，无映射；站点对见 M7 节）；`Priority` 不生效
+  （不同目的地都会复制）；MPU 源 ETag 目标重算（不做 ETag 断言）；单对象整读入内存
+  （≤16 并发）；`Role` 不参与鉴权。
 
 ## 多站点复制（M7）
 
@@ -893,12 +900,24 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   已知时钟会被 BEFORE 门控拒绝（409/500 直到追上）。**管理员行不复制**、STS 会话键不复制。
 - **配对快照**：`POST /sites` 在单事务内写 `sites` + cursor + 五类实体快照，快照同事务入本地
   时钟；只快照「本地时钟无行或 origin=本站」的实体，避免同时配对互相回显。
-- **对象**：复用 `repl_outbox`（`target_kind='site'`），每个 peer 一行；仅版本化数据写与
-  marker 入队，删除要求源桶 versioning=Enabled。worker 发送前签名 `GET /{bucket}?versioning`
-  （10s 缓存；404/非 Enabled → 可重试），PUT 透传 content-type 与 `x-amz-meta-*`、要求目标返回
-  真实 version-id（`null` → 重试）。同版本多目标聚合 PENDING→COMPLETED/FAILED。
-- **边界（记档）**：对端地址 http/https 均可（peer TLS 见 TLS 节）；单节点站点对；版本 UUID 两端不一致、版本定向删除
-  不复制；非空桶删除不生效（保留行与数据，记死信）；锁/标签/SSE 不复制，SSE-C 源永久错；
+- **对象**：复用 `repl_outbox`（`target_kind='site'`），每个 peer 一行；版本化数据写、marker 与
+  版本定向删除均入队，删除要求源桶 versioning=Enabled。worker 发送前签名 `GET /{bucket}?versioning`
+  （10s 缓存；404/非 Enabled → 可重试），PUT 透传 content-type、`x-amz-meta-*`、标签/存储类/
+  checksum/SSE/对象锁，并带 `x-oss-site-token` + `x-oss-origin-version-id`；目标校验 token 后
+  **强制沿用源版本 UUID**（同 id 同字节幂等、不同字节 409），worker 校验回显 id（`null` → 重试）。
+  marker 同样以源 id 在目标定点创建（sync 桶拒绝源 marker id）。版本定向删除按同 id 定点删目标
+  版本（`x-amz-bypass-governance-retention: true`；目标 404 视为已删），若同 (bucket,key,version)
+  的更早出站行仍未结算则先等待，避免删除被重试 PUT 复活。同版本多目标聚合
+  PENDING→COMPLETED/FAILED。
+- **边界（记档）**：对端地址 http/https 均可（peer TLS 见 TLS 节）；单节点站点对；混跑旧版本时，
+  升级前已复制的异步版本两端 UUID 不同，对这些历史版本的定向删除在目标按同 id 找不到，按「已删」
+  幂等成功，两端可能不一致——站点对建议同版本升级或接受该窗口；非空桶删除不生效（保留行与数据，
+  记死信）；标签/存储类/checksum/对象锁随站点 PUT 复制（已到期 retention 不再下发、legal hold
+  保留；归档类 GLACIER/DEEP_ARCHIVE 不复制——归档态不可读、目标直写拒绝）；仅 SSE-S3 以 AES256
+  复制、目标用本地主密钥重新封装；SSE-C 与 SSE-KMS 源永久错（死信，不发出请求——SSE-C 客户钥
+  不落盘；SSE-KMS `key_id` 为站点本地主密钥、key 材料不跨站，目标拒绝显式 CMK，绝不静默换钥或
+  降级明文）；
+  M6 远端复制仍不携带以上对象元数据、且不投递版本定向删除；
   AK 密文需两端同主密钥（配对只校验 vault 开关一致，不校验同一把钥）；控制面最终一致（无强一致，
   归 M9）；端点/凭据明文存储；`priority` 仅在**同秒**裁决（新 ts 的低优先级仍胜旧 ts 的高优先级——
   与早期规格「按优先级裁决」有偏差）；解配期间的本地控制面改动不被捕获，且对端快照可能在重配对时
@@ -1034,7 +1053,8 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   `InvalidObjectState`（HEAD 仍可读元数据）；fsck 不报缺片。
 - 删除归档版本时 `DeleteOutcome` 带回 `TierRef`，`TierGcSink` 清远端（真实 tier 后端与
   Transition/Restore 在 S4b）。
-- 边界：存储类/标签不随 M6/M7 复制传播；归档对象需在同版本二进制内读取。
+- 边界：存储类/标签不随 **M6 远端**复制传播（M7 站点对自 4.17 起随 PUT 复制，见 M7 节）；
+  归档对象需先 Restore 本地化，**不支持直接读 tier**（归档态 GET → 403 `InvalidObjectState`）。
 
 ### Object Lambda（S2，只读变换）
 

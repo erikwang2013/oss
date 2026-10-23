@@ -160,3 +160,16 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
   `OSS_AP_NEGATIVE_CACHE_TTL_SECS`（默认 5，0 = 关闭）、`OSS_AP_CACHE_MAX_ENTRIES`
   （默认 10000）；合法范围外启动失败。未知 AP 负缓存、DB/解析错误不缓存（保持 500）；
   控制面写即时失效；TTL 兜底。跨节点读己之写受 apply 延迟影响，强一致性 non-goal。
+
+## 9. 2026-10-23 第二批：Select Parquet 与 M7 版本/元数据复制
+
+| 能力 | 落点 | 状态与边界 |
+|---|---|---|
+| 4.18 S3 Select Parquet | `xl-s3/select.rs`、`service.rs` | 已完成：低层 row reader 逐行按列名转 JSON 对象，复用既有 SQL 子集（`s.col`/`s.a.b`，`SELECT *` 整行对象，`_N` 不可用）；请求 `CompressionType` 必须 `NONE`，不接受 ScanRange（400）；行组 `total_byte_size` 合计 ≤512MiB；文件内部仅 NONE/SNAPPY（parquet `snap` feature）；BZIP2 仍 400（工作区无 bzip2 依赖，不新增） |
+| 4.16 M7 版本定向删除复制 | `oss-server/repl_client.rs`、`replication.rs`、`xl-s3/service.rs`、`db.rs`、`job_actions.rs` | 已完成：站点 PUT 强制沿用源 UUID（token 认证；同 id 同字节幂等、异体 409）；marker 同 id 创建；`DELETE ?versionId=` 带 REPLICA + bypass，目标 404 视为已删；同版本更早出站行未结算前等待（防复活）；M6 远端不投递版本删除；`repl_outbox.is_version_delete` 幂等补列 |
+| 4.17 M7 元数据复制 | `repl_client.rs`、`replication.rs` | 已完成：标签/存储类/checksum/content-type/用户元数据/对象锁随版本下发（到期 retention 不下发、legal hold 保留）；仅 SSE-S3 以 AES256 复制、目标本地重封装；**SSE-C 与 SSE-KMS 永久死信且不发请求**（不静默换钥/降级明文）；归档类 GLACIER/DEEP_ARCHIVE 不复制 |
+| 4.13 M3 MPU 粘节点 | — | **阻塞/设计，未完成**：upload_id 为纯 UUID 且暂存区节点本地，`MeshTransport` 无 MPU 转发 RPC，`OssS3` 无 mesh/路由句柄；安全实现需 upload_id→节点持久目录 + 流式转发 RPC + 失败语义，超出本 lane 最小改动。维持 README/M3 C8「MPU 会话粘节点」边界；测试不可行（无路由层可测） |
+
+**边界（记档）**：混合版本升级前已复制的历史异步版本两端 UUID 不同，其定向删除在目标按同 id
+找不到而幂等成功，可能短暂不一致（建议同版本升级）；M6 远端仍不携带对象元数据、不投递版本删除；
+直接读 tier 仍不在范围——归档对象需 Restore 本地化（§14.2 直读 403 `InvalidObjectState`）。
