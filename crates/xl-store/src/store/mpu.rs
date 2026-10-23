@@ -66,6 +66,23 @@ struct PartMeta {
     size: u64,
 }
 
+/// 3.16：`mpu.meta.sse_kind` → `EncSpec`。旧形态 "sse-s3"/"sse-kms" 不变；显式 CMK 编码为
+/// `sse-kms:<name>`（名白名单与对象 key_id 同规）。非法值 → CorruptMeta（complete 前拒绝）。
+fn sse_spec_from_kind(kind: &str) -> Result<crypto::EncSpec> {
+    match kind {
+        "sse-s3" => Ok(crypto::EncSpec::SseS3),
+        "sse-kms" => Ok(crypto::EncSpec::SseKms),
+        k => match k.strip_prefix("sse-kms:") {
+            Some(name) if crate::kms::validate_cmk_name(name).is_ok() => {
+                Ok(crypto::EncSpec::SseKmsCmk(name.to_string()))
+            }
+            _ => Err(Error::CorruptMeta(format!(
+                "mpu.meta sse_kind 非法：{kind:?}"
+            ))),
+        },
+    }
+}
+
 /// `ListParts` 的单项（内核形态；s3s 翻译在 xl-s3 层）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MpuPartInfo {
@@ -127,6 +144,11 @@ impl Store {
             meta::validate_tags(t).map_err(Error::InvalidArgument)?;
         }
         let tags = tags.filter(|t| !t.is_empty());
+        // 3.16：服务端加密意图（sse_kind）落盘前校验形态；非法 → 400（含 sse-kms:<bad>）
+        if let Some(kind) = sse_kind {
+            sse_spec_from_kind(kind)
+                .map_err(|_| Error::InvalidArgument(format!("非法 SSE 模式：{kind:?}")))?;
+        }
         // M8 S4a：存储类归一/白名单；归档类在服务层已拒（store 兜底）
         let storage_class = meta::normalize_storage_class(storage_class.as_deref());
         if let Some(sc) = &storage_class
@@ -388,30 +410,28 @@ impl Store {
         let effective_enc: Option<crypto::EncSpec> =
             match (encryption.as_ref(), mpu.sse_kind.as_deref()) {
                 (None, None) => None,
-                (None, Some("sse-s3")) => Some(crypto::EncSpec::SseS3),
-                (None, Some("sse-kms")) => Some(crypto::EncSpec::SseKms),
-                (None, Some(other)) => {
-                    return Err(Error::CorruptMeta(format!(
-                        "mpu.meta sse_kind 非法：{other:?}"
-                    )));
-                }
+                // create 记录的服务端模式即 complete 的落地规格；旧 kind 语义不变
+                (None, Some(kind)) => Some(sse_spec_from_kind(kind)?),
                 (Some(crypto::EncSpec::SseC(_)), None) => encryption.clone(),
                 (Some(crypto::EncSpec::SseC(_)), Some(_)) => {
                     return Err(Error::InvalidArgument(
                         "create 已带 SSE-S3/KMS 头，complete 不得携带 SSE-C".into(),
                     ));
                 }
-                (Some(crypto::EncSpec::SseS3), Some("sse-s3"))
-                | (Some(crypto::EncSpec::SseKms), Some("sse-kms")) => encryption.clone(),
-                (Some(crypto::EncSpec::SseS3 | crypto::EncSpec::SseKms), None) => {
+                (Some(_), None) => {
                     return Err(Error::InvalidArgument(
                         "create 未声明 SSE-S3/KMS，complete 不应携带该模式".into(),
                     ));
                 }
-                (Some(crypto::EncSpec::SseS3 | crypto::EncSpec::SseKms), Some(_)) => {
-                    return Err(Error::InvalidArgument(
-                        "create 与 complete 的 SSE 模式不一致".into(),
-                    ));
+                // 3.16：显式 CMK 参与一致性核对（名/ARN 归一后必须同名，防张冠李戴）
+                (Some(spec), Some(kind)) => {
+                    if sse_spec_from_kind(kind)? == *spec {
+                        encryption.clone()
+                    } else {
+                        return Err(Error::InvalidArgument(
+                            "create 与 complete 的 SSE 模式不一致".into(),
+                        ));
+                    }
                 }
             };
 

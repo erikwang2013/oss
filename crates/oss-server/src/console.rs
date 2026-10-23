@@ -157,8 +157,10 @@ pub fn routes() -> Router<AppState> {
         .route("/groups", get(list_groups))
         // 集群状态（管理员；单机优雅降级为 mode:"single"）
         .route("/cluster/status", get(cluster_status))
-        // M8 S6 缺口 A：加密/KMS 只读状态（管理员；无变更端点）
+        // M8 S6 缺口 A：加密/KMS 只读状态（管理员）+ 3.16 显式 CMK 管理
         .route("/encryption", get(encryption_status))
+        .route("/encryption/cmks", get(list_cmks).post(create_cmk))
+        .route("/encryption/cmks/{name}/rotate", post(rotate_cmk))
         // M4 切片 6：作业记录（管理员）与桶生命周期规则（桶主或管理员）
         .route("/jobs", get(list_jobs))
         // M8 S0：作业详情/控制（admin 或 requested_by）
@@ -434,7 +436,7 @@ async fn cluster_status(
 }
 
 /// M8 S6 缺口 A：加密/KMS 只读状态（管理员）。配置仍只在 env（OSS_MASTER_KEY_FILE /
-/// OSS_KMS_DIR）；此处只回布尔与当前主密钥编号，**绝不回密钥材料**，也无变更端点。
+/// OSS_KMS_DIR）；此处只回布尔、主密钥编号与 3.16 命名 CMK 快照，**绝不回密钥材料**。
 async fn encryption_status(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -451,12 +453,162 @@ async fn encryption_status(
         ),
         None => (false, false, None),
     };
+    let cmks = match es.and_then(|e| e.kms.as_ref()) {
+        Some(k) => match k.list_cmks() {
+            Ok(list) => list.iter().map(cmk_json).collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::error!(error = %e, "列出 KMS CMK 失败");
+                return internal_error();
+            }
+        },
+        None => Vec::new(),
+    };
     Json(serde_json::json!({
         "sse_s3": sse_s3,
         "sse_kms": sse_kms,
         "kms_current_key_id": kms_current_key_id,
+        "cmks": cmks,
     }))
     .into_response()
+}
+
+/// 3.16：CMK 只读快照（名/当前版本/全部版本/当前钥 mtime；无钥字节）。
+fn cmk_json(c: &xl_store::kms::CmkInfo) -> serde_json::Value {
+    serde_json::json!({
+        "name": c.name,
+        "current_version": c.current,
+        "versions": c.versions,
+        "updated_nanos": c.updated_nanos,
+    })
+}
+
+/// 3.16：KMS provider（未配置 OSS_KMS_DIR → None；显式 CMK 面据此 400/空表）。
+fn kms_provider(state: &AppState) -> Option<std::sync::Arc<xl_store::kms::KmsFileProvider>> {
+    state.store.enc_state().and_then(|es| es.kms.clone())
+}
+
+/// 3.16：CMK 管理错误 → HTTP。名非法/已存在/不存在 = 客户端可纠正（400，带原因）；
+/// 其余（IO/权限/损坏）= 500（不回内部细节）。
+fn cmk_error(e: xl_store::error::Error) -> Response {
+    match e {
+        xl_store::error::Error::InvalidArgument(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+        other => {
+            tracing::error!(error = %other, "KMS CMK 操作失败");
+            internal_error()
+        }
+    }
+}
+
+/// 3.16：CMK 管理审计（只记名/版本/指纹，**绝不记钥字节**）。
+async fn audit_cmk(
+    state: &AppState,
+    uid: i64,
+    op: &str,
+    kms: &xl_store::kms::KmsFileProvider,
+    name: &str,
+    version: u32,
+) {
+    let fp = kms.cmk_fingerprint(name).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, cmk = name, "CMK 指纹计算失败（审计降级）");
+        "-".to_string()
+    });
+    state
+        .audit(
+            uid,
+            op,
+            None,
+            None,
+            Some(&format!("cmk={name} version={version} fp={fp}")),
+        )
+        .await;
+}
+
+/// 3.16：命名 CMK 列表（管理员；未配置 KMS → 空表，与 encryption_status.sse_kms 一致）。
+async fn list_cmks(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    if let Err(r) = admin_of(&state, &payload).await {
+        return r;
+    }
+    let Some(kms) = kms_provider(&state) else {
+        return Json(serde_json::json!({ "cmks": [] })).into_response();
+    };
+    match kms.list_cmks() {
+        Ok(list) => Json(serde_json::json!({
+            "cmks": list.iter().map(cmk_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "列出 KMS CMK 失败");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateCmkBody {
+    name: String,
+}
+
+/// 3.16：新建命名 CMK（管理员；生成 key-0，0600）。名非法/已存在 → 400，绝不覆盖。
+async fn create_cmk(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Json(body): Json<CreateCmkBody>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(kms) = kms_provider(&state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "未配置 KMS（OSS_KMS_DIR），无法创建 CMK",
+        )
+            .into_response();
+    };
+    let name = match xl_store::kms::parse_cmk_id(&body.name) {
+        Ok(n) => n,
+        Err(e) => return cmk_error(e),
+    };
+    match kms.create_cmk(name).await {
+        Ok(version) => {
+            audit_cmk(&state, uid, "control:cmk-create", &kms, name, version).await;
+            Json(serde_json::json!({ "name": name, "current_version": version })).into_response()
+        }
+        Err(e) => cmk_error(e),
+    }
+}
+
+/// 3.16：轮换命名 CMK（管理员）——新写入走新版本；旧版本保留，旧对象仍可读。
+async fn rotate_cmk(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(name): Path<String>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(kms) = kms_provider(&state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "未配置 KMS（OSS_KMS_DIR），无法轮换 CMK",
+        )
+            .into_response();
+    };
+    let name = match xl_store::kms::parse_cmk_id(&name) {
+        Ok(n) => n,
+        Err(e) => return cmk_error(e),
+    };
+    match kms.rotate_cmk(name).await {
+        Ok(version) => {
+            audit_cmk(&state, uid, "control:cmk-rotate", &kms, name, version).await;
+            Json(serde_json::json!({ "name": name, "current_version": version })).into_response()
+        }
+        Err(e) => cmk_error(e),
+    }
 }
 
 /// 上传分组（oss.toml 的 `[[groups]]`），供上传面板的分组下拉使用。
@@ -1902,7 +2054,7 @@ async fn get_bucket_encryption(
     }
 }
 
-/// Task 6a：设置桶默认加密（桶主/管理员）。仅 AES256 / aws:kms；0 行 → 500。
+/// Task 6a：设置桶默认加密（桶主/管理员）。AES256 / aws:kms / aws:kms:<cmk>；0 行 → 500。
 async fn put_bucket_encryption(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -1912,16 +2064,42 @@ async fn put_bucket_encryption(
     if let Err(r) = require_owner_or_admin(&state, &payload, &bucket).await {
         return r;
     }
-    if !matches!(body.algorithm.as_str(), "AES256" | "aws:kms") {
-        return (StatusCode::BAD_REQUEST, "algorithm 须为 AES256 或 aws:kms").into_response();
-    }
+    // 3.16：AES256 / aws:kms / aws:kms:<name>；显式 CMK 须存在（S3 面同一 fail-closed 口径）
+    let algorithm = match body.algorithm.as_str() {
+        "AES256" | "aws:kms" => body.algorithm.clone(),
+        v if v.starts_with("aws:kms:") => {
+            let raw = v["aws:kms:".len()..].trim();
+            let name = match xl_store::kms::parse_cmk_id(raw) {
+                Ok(n) => n,
+                Err(e) => return cmk_error(e),
+            };
+            let Some(kms) = kms_provider(&state) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "未配置 KMS（OSS_KMS_DIR），无法引用 CMK",
+                )
+                    .into_response();
+            };
+            if let Err(e) = kms.ensure_cmk(name) {
+                return cmk_error(e);
+            }
+            format!("aws:kms:{raw}")
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "algorithm 须为 AES256、aws:kms 或 aws:kms:<cmk>",
+            )
+                .into_response();
+        }
+    };
     if state.control.is_raft() {
         return control_write_status(
             state
                 .control
                 .write(crate::raft::ControlCommand::BucketSetDefaultEncryption {
                     bucket,
-                    algorithm: body.algorithm,
+                    algorithm,
                 })
                 .await,
             "加密配置写入冲突",
@@ -1929,7 +2107,7 @@ async fn put_bucket_encryption(
     }
     match state
         .acl()
-        .set_bucket_default_encryption(&bucket, &body.algorithm)
+        .set_bucket_default_encryption(&bucket, &algorithm)
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

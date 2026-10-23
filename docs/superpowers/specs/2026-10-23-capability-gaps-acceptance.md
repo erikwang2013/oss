@@ -165,3 +165,37 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
   `DeleteMarkerCreated`；Restore→`s3:ObjectRestore:Post`；NotFound、ReplaceTags、
   InvokeLambda 不发）。事件源 `source.userAgent="oss-batch"`；不跨桶/跨账号投递；
   发射失败不影响任务结果（outbox 至少一次）。
+
+
+## 9. 2026-10-23 后续能力：SSE-KMS 显式 CMK（3.16，v1.14.1 候选）
+
+- **线级**：`x-amz-server-side-encryption-aws-kms-key-id` 接受裸名或
+  `arn:…:key/<name>`，须与 `aws:kms` 同现；名 `[a-z0-9-]{1,64}`（首尾字母数字），
+  ARN 归一为规范名。未知/未配置 → 400 `InvalidArgument`（fail-closed，不回退默认钥）；
+  与 SSE-C 互斥；有 CMK 但节点无 KMS provider → 500（部署错误，不降级明文）。
+- **密钥环**：`<OSS_KMS_DIR>/cmk/<name>/key-<n>.bin`，每环独立；创建 `key-0`、轮换追加
+  `key-<n+1>` 且新写用新钥，旧版本保留解密（同 AWS KMS 不重加密旧密文）；文件 0600、
+  32B、规范化命名校验；`cmk/` 根目录逐项校验；**无删除 API**（删有活对象的 CMK = 数据丢失，
+  crypto-shredding 需单独 rewrap 作业）。
+- **记录**：`EncryptionRecord.kms_key_id`（`#[serde(default)]`，旧记录可读）；对象
+  `key_id="cmk:<name>:k<n>"`，用户态字段存规范名；解码校验 canonical key_id、名一致、
+  长度/可打印，异常记录失败关闭。旧二进制遇 `cmk:` key_id、`aws:kms:<name>` 桶默认或
+  `sse-kms:<name>` MPU kind 一律失败关闭（不 promise 滚动兼容）。
+- **桶默认加密**：`aws:kms:<raw id>` 存入既有 TEXT 列；PUT 时要求 CMK 已存在，GET 原样
+  回显配置的 id（名或 ARN）；`AES256` + key id / SSE-C 规则拒绝。
+- **MPU / Copy**：`sse_kind` 扩展 `sse-kms:<name>`，create/complete 严格匹配；CopyObject
+  目标显式 CMK 覆盖桶默认；`sse_out`/CreateMPU/UploadPart 回显 CMK。
+- **控制台**：`GET/POST /api/v1/encryption/cmks` 与 `POST …/{name}/rotate`（admin-only，
+  rotate 返回新版本）；审计 `control:cmk-create` / `control:cmk-rotate` 仅记名/版本/指纹；
+  `/api/v1/encryption` 增加 `cmks`（名、当前版本、版本表、更新时间，无钥字节）；Web 设置页
+  只读展示命名 CMK，桶页保留 `aws:kms:<cmk>` 原值避免误清空。
+- **测试证据**（本地，`CARGO_TARGET_DIR=/tmp/target-cmk`）：
+  `cargo test -p xl-store --lib` 268 passed；`cargo test -p xl-s3 --lib` 139 passed；
+  `--test object_ops` 55 passed；`--test bucket_ops` 9 passed；`--test mpu_ops` 11 passed；
+  `cargo test -p oss-server --test console_api` 30 passed；`cargo fmt --all -- --check`、
+  clippy 与 Web `tsc -p tsconfig.app.json --noEmit` 见提交记录/报告。
+- **提交**：`2c075b7` 命名 CMK 环/信封/记录；`a18ead5` MPU 与存储测试；`9e714ce`
+  S3 接入；`c5b1dd6` S3 线级测试；`86b757a` 控制台 API；`954c616` 前端。
+- **残留风险**：多节点须共享同一 KMS 目录且同步新增/轮换，缺环节点 4xx/5xx fail-closed；
+  CMK 不是授权边界（任何可写对象者可选用已存在 CMK）；无删除与 rewrap/re-encrypt 作业；
+  对象响应回显规范名而桶默认原样回显，ARN 场景两处字符串可能不同（语义同一把钥）。

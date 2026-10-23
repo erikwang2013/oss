@@ -164,12 +164,19 @@ export default function Buckets() {
   )
 }
 
-/** 桶默认加密：GET 读现状；AES256/aws:kms → PUT，none → DELETE（清除）。 */
+/** `aws:kms:<name|arn>` → 展示名（ARN 取 `key/` 后段）。 */
+function cmkDisplayName(stored: string) {
+  const raw = stored.slice('aws:kms:'.length)
+  const i = raw.lastIndexOf('key/')
+  return raw.startsWith('arn:') && i >= 0 ? raw.slice(i + 4) : raw
+}
+
+/** 桶默认加密：GET 读现状；AES256/aws:kms/aws:kms:<cmk> → PUT，none → DELETE（清除）。 */
 function EncryptionModal({ bucket, onClose }: { bucket: string; onClose: () => void }) {
   const { message } = App.useApp()
   const qc = useQueryClient()
   // 未编辑时直接展示服务端值，避免 effect 回填
-  const [draft, setDraft] = useState<'AES256' | 'aws:kms' | 'none'>()
+  const [draft, setDraft] = useState<string>()
 
   const { data, isLoading } = useQuery({
     queryKey: ['bucket-encryption', bucket],
@@ -177,9 +184,12 @@ function EncryptionModal({ bucket, onClose }: { bucket: string; onClose: () => v
       api<BucketEncryption>(`/api/v1/buckets/${encodeURIComponent(bucket)}/encryption`),
   })
 
+  const stored = data?.algorithm ?? null
+  // 3.16：保留既有 `aws:kms:<cmk>`（否则会被误显示为「不加密」，保存即清除）
+  const isCmk = stored?.startsWith('aws:kms:') ?? false
   const algorithm =
     draft ??
-    (data?.algorithm === 'AES256' || data?.algorithm === 'aws:kms' ? data.algorithm : 'none')
+    (stored === 'AES256' || stored === 'aws:kms' || isCmk ? stored! : 'none')
 
   const save = useMutation({
     mutationFn: () =>
@@ -214,7 +224,10 @@ function EncryptionModal({ bucket, onClose }: { bucket: string; onClose: () => v
         options={[
           { value: 'none', label: '不加密（清除配置）' },
           { value: 'AES256', label: 'SSE-S3（AES256）' },
-          { value: 'aws:kms', label: 'SSE-KMS（aws:kms）' },
+          { value: 'aws:kms', label: 'SSE-KMS（默认密钥）' },
+          ...(isCmk && stored
+            ? [{ value: stored, label: `SSE-KMS（CMK: ${cmkDisplayName(stored)}）` }]
+            : []),
         ]}
       />
       <Typography.Text type="secondary" style={{ fontSize: 12 }}>

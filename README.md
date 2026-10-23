@@ -83,7 +83,7 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
 管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换 · AP 跨账号/VPC 端点（AP 匿名已支持，见「访问点」）· Inventory 跨账号投递 ·
+CMK/多钥轮换（3.16 已补：显式 CMK + 命名环轮换，见「加密」）· AP 跨账号/VPC 端点（AP 匿名已支持，见「访问点」）· Inventory 跨账号投递 ·
 Batch 抢占/跨账号清单。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
@@ -672,6 +672,7 @@ C2）。
 |---|---|---|---|
 | SSE-S3 | env `OSS_MASTER_KEY_FILE=<路径>`；头 `x-amz-server-side-encryption: AES256` | 单主密钥文件（缺省 `<data_root>/.oss.sys/master.key`，0600 首启自动生成；**多节点须分发同一把**） | 包装后的 DEK，`key_id="file"` |
 | SSE-KMS | env `OSS_KMS_DIR=<目录>`；头 `aws:kms` | 多钥目录 `key-<n>.bin`（当前钥 = 最大 n） | 包装后的 DEK + `key_id="k<n>"` |
+| SSE-KMS 显式 CMK | 同上 + 头 `x-amz-server-side-encryption-aws-kms-key-id: <name\|arn>`（须与 `aws:kms` 同现） | 命名 CMK 环 `OSS_KMS_DIR/cmk/<name>/key-<n>.bin`（名 `[a-z0-9-]{1,64}`，经管理 API 创建） | 包装后的 DEK + `key_id="cmk:<name>:k<n>"` + `kms_key_id=<规范 CMK 名>` |
 | SSE-C | 头 `x-amz-server-side-encryption-customer-{algorithm,key,key-MD5}`（每次请求带 32B 客户端钥） | 客户端 | **只存 `base64(MD5(key))` 校验值（AWS 同款 24 字符头），密钥绝不落盘** |
 
 - 每对象一把 32B DEK（OsRng 生成）；单元 nonce = 随机种子(8B) ‖ BE32(单元号)，单元号把
@@ -679,13 +680,22 @@ C2）。
 - 响应头：PUT / HEAD / GET 回 `x-amz-server-side-encryption`（SSE-C 另回 customer-key-MD5 等
   校验头），`aws-cli` 的 `sse` 参数直连可用。
 - **口径**：ETag / Content-MD5 / SHA256 全部对**明文**计算（协议语义不变）；分片 CRC32C 对**密文**；
-  SSE-KMS 请求若**显式带 CMK**（`…-aws-kms-key-id`）→ 400 拒绝（多主密钥轮换编排未做，
-  明确拒优于静默忽略）；读/删 SSE-C 对象必须带同一把钥（错钥 → 400，校验值即判据）。
+  SSE-KMS 显式 CMK（`…-aws-kms-key-id`）接受裸名或 `arn:…:key/<name>`，CMK 须已在本节点密钥环
+  （未配置/名非法 → 400 `InvalidArgument`，fail-closed；绝不回退默认钥）；与 SSE-C 互斥；
+  读/删 SSE-C 对象必须带同一把钥（错钥 → 400，校验值即判据）。ARN 只是寻址写法：记录与
+  对象响应回显**规范 CMK 名**；桶默认加密的 GET 则原样回显配置时的 id（名或 ARN）。
 - MPU：SSE 意图在 CreateMultipartUpload 记录（含 SSE-C 校验值），Complete 统一落地；
   SSE-C 的 UploadPart / Complete 须全程带同名钥；读写响应带版本/加密头。
 - **换主密钥不重写数据**（验收 ⑤）：DEK 的包裹体在 `xl.meta`，只要旧 `key_id` 的钥仍在即可解——
   轮换 = 往 `OSS_KMS_DIR` 加入更大的 `key-<n>.bin`（新写用新钥，旧对象照读）；
   单钥文件 provider 直接换文件会让旧 `key_id="file"` 的包裹不可解（**先迁到 KMS 目录再轮换**）。
+- **命名 CMK 与轮换（3.16）**：命名环位于 `OSS_KMS_DIR/cmk/<name>/key-<n>.bin`（每环独立轮换，
+  名即路径白名单）；管理 API 为 `GET/POST /api/v1/encryption/cmks` 与
+  `POST /api/v1/encryption/cmks/{name}/rotate`（admin-only，**无删除**——删除有活对象的 CMK
+  等于数据丢失，crypto-shredding 需单独的 rewrap 作业）。轮换只影响**新写入**，旧版本保留供解密
+  （与 AWS KMS 不重加密旧密文同口径）；审计只记名/版本/指纹，绝不记钥字节。旧二进制读到
+  CMK 对象、CMK 桶默认值或 `sse-kms:<name>` MPU kind 会失败关闭（500，不 promise 滚动兼容）；
+  多节点须共享同一 KMS 目录，缺失 CMK 的节点一律 4xx/5xx，绝不降级明文。
 - **SK 加密存（M5）**：`access_keys.secret_key` 同样信封加密（`enc:v1:` 前缀，AAD 域分隔，
   每行独立 DEK；kms 目录优先、单钥文件兜底）——**两处写点**（控制台建键、STS 签发）与**读侧
   透明迁移**（存量明文行被读到即原地重写为密文）；集群下密文过网、消费端解密（mesh 不出现
@@ -694,7 +704,7 @@ C2）。
   加密只防**只读**泄露（备份/快照/误拷贝）；对数据库有写权限者可写入自选明文 SK 接管任意 AK
   （切片前有 DB 写权本就全权，非新增面）。
 - **边界（记档）**：桶级默认加密（`put-bucket-encryption`）已落地（单条 SSE-S3/SSE-KMS 规则；
-  SSE-C 与显式 CMK 拒绝）；aetherupload 内部摄取不带加密（存入为明文）；
+  `aws:kms:<cmk>` 引用显式 CMK 时须先存在，SSE-C 拒绝）；aetherupload 内部摄取不带加密（存入为明文）；
   未配对应 env 时请求该模式 → 500（fail-closed，不静默落明文）；
   HTTP KMS 未实作（`KeyProvider` trait 已留接入点，文件型 KMS 即多钥目录）。
 - `tests/e2e_s3.sh` 第 18 节（随 M5 收尾落地）实弹覆盖「写入 → head 头断言 → 盘上 grep

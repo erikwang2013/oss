@@ -325,6 +325,12 @@ pub struct EncryptionRecord {
     /// `key_id="sse-c"` 时必在、其余恒无（decode 强制三态一致，见下方校验）。
     #[serde(default)]
     pub sse_c_key_md5: Option<String>,
+    /// 3.16：显式 CMK 的用户态 id（请求头原值：名或 ARN；响应回显用）。
+    /// `key_id="cmk:<name>:k<n>"` 时必在且名与 key_id 一致，其余恒无。
+    /// 旧记录/旧二进制均无此字段（additive：旧解码器忽略未知 map 键；旧二进制遇
+    /// `cmk:` key_id 仍会因形态/长度拒绝——fail-closed，绝不回退默认钥）。
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
 }
 
 /// M5 切片 4：对象锁记录（retention 与 legal hold **相互独立**；meta 无秘密）。
@@ -455,10 +461,24 @@ impl XlMeta {
                         enc.algorithm
                     )));
                 }
+                // key_id 上限 96：容纳 `cmk:<64 字符名>:k<10 位版本>`（旧版 64 上限不动旧记录）。
                 let kid_ok = !enc.key_id.is_empty()
-                    && enc.key_id.len() <= 64
+                    && enc.key_id.len() <= 96
                     && enc.key_id.bytes().all(|b| (0x20..=0x7e).contains(&b));
                 let is_ssec = enc.key_id == "sse-c";
+                // 3.16：cmk key_id ⟺ 用户态 kms_key_id 且名一致；其余形态 ⟺ kms_key_id 无。
+                let cmk_ok = if enc.key_id.starts_with("cmk:") {
+                    match crate::kms::parse_cmk_key_id(&enc.key_id) {
+                        Some((name, _)) => enc.kms_key_id.as_deref().is_some_and(|raw| {
+                            raw.len() <= 256
+                                && raw.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                                && crate::kms::parse_cmk_id(raw).ok() == Some(name)
+                        }),
+                        None => false,
+                    }
+                } else {
+                    enc.kms_key_id.is_none()
+                };
                 let wrapped_ok = if is_ssec {
                     enc.wrapped_dek_hex.is_empty()
                 } else {
@@ -477,9 +497,9 @@ impl XlMeta {
                 };
                 let seed_ok = enc.nonce_seed_hex.len() == 16
                     && enc.nonce_seed_hex.bytes().all(|b| b.is_ascii_hexdigit());
-                if !kid_ok || !wrapped_ok || !seed_ok || !md5_ok {
+                if !kid_ok || !wrapped_ok || !seed_ok || !md5_ok || !cmk_ok {
                     return Err(Error::CorruptMeta(format!(
-                        "加密记录字段非法：key_id={:?} wrapped_len={} seed_len={} sse_c_md5={}",
+                        "加密记录字段非法：key_id={:?} wrapped_len={} seed_len={} sse_c_md5={} kms_key_id={}",
                         enc.key_id,
                         enc.wrapped_dek_hex.len(),
                         enc.nonce_seed_hex.len(),
@@ -488,6 +508,7 @@ impl XlMeta {
                         } else {
                             "-"
                         },
+                        if enc.kms_key_id.is_some() { "set" } else { "-" },
                     )));
                 }
             }
@@ -1181,5 +1202,59 @@ mod parts_tests {
         .encode()
         .unwrap();
         assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
+    }
+
+    /// 3.16：CMK 记录三态一致（`cmk:` key_id ⟺ kms_key_id 且名一致）；旧 `k<n>`/`file`
+    /// 记录无新字段行为不变（additive 字段 + serde default）。
+    #[test]
+    fn decode_validates_cmk_encryption_records() {
+        let rec = |kid: &str, kms: Option<&str>| EncryptionRecord {
+            algorithm: crate::crypto::ALGO.to_string(),
+            key_id: kid.to_string(),
+            wrapped_dek_hex: "00".repeat(60),
+            nonce_seed_hex: "00".repeat(8),
+            sse_c_key_md5: None,
+            kms_key_id: kms.map(str::to_string),
+        };
+        let decode = |r: EncryptionRecord| {
+            let mut v = version(None);
+            v.encryption = Some(r);
+            XlMeta {
+                object_key: "a".into(),
+                versions: vec![v],
+            }
+            .encode()
+            .and_then(|b| XlMeta::decode(&b).map(|_| ()))
+        };
+        // 正例：裸名 / ARN 原值（名一致）；旧形态无新字段
+        assert!(decode(rec("cmk:tenant-a:k0", Some("tenant-a"))).is_ok());
+        assert!(
+            decode(rec(
+                "cmk:tenant-a:k3",
+                Some("arn:aws:kms:us-east-1:000000000000:key/tenant-a")
+            ))
+            .is_ok()
+        );
+        assert!(decode(rec("k0", None)).is_ok());
+        assert!(decode(rec("file", None)).is_ok());
+        // 负例：缺用户态字段 / 名不一致 / 非 CMK 带字段 / 异形 key_id / 非法名
+        for bad in [
+            rec("cmk:tenant-a:k0", None),
+            rec("cmk:tenant-a:k0", Some("tenant-b")),
+            rec(
+                "cmk:tenant-a:k0",
+                Some("arn:aws:kms:us-east-1:000000000000:key/tenant-b"),
+            ),
+            rec("k0", Some("tenant-a")),
+            rec("cmk:tenant-a:k01", Some("tenant-a")),
+            rec("cmk:Tenant:k0", Some("Tenant")),
+            rec("cmk:tenant-a:k0", Some("tenant-a!")),
+        ] {
+            let label = format!("{bad:?}");
+            assert!(
+                matches!(decode(bad), Err(Error::CorruptMeta(_))),
+                "应拒：{label}"
+            );
+        }
     }
 }

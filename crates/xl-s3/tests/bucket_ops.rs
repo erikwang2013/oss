@@ -216,22 +216,34 @@ async fn bucket_encryption_roundtrip_and_invalid_config() {
         "aws:kms"
     );
 
-    // 非法：未知算法 / 显式 CMK / 无默认规则 → 400
-    for bad in [
-        cfg("enc-bkt", "aws:kms:dsse", None),
-        cfg("enc-bkt", "aws:kms", Some("arn:aws:kms:cmk")),
-        req(PutBucketEncryptionInput {
-            bucket: "enc-bkt".into(),
-            checksum_algorithm: None,
-            content_md5: None,
-            expected_bucket_owner: None,
-            server_side_encryption_configuration: ServerSideEncryptionConfiguration {
-                rules: vec![ServerSideEncryptionRule::default()],
-            },
-        }),
+    // 非法：未知算法 / 无默认规则 → InvalidRequest；坏 ARN → InvalidArgument；
+    // 3.16：名合法但本节点无 KMS provider → 500（部署错误，绝不静默落库）
+    let bad_rule = req(PutBucketEncryptionInput {
+        bucket: "enc-bkt".into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        server_side_encryption_configuration: ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule::default()],
+        },
+    });
+    for (bad, code) in [
+        (
+            cfg("enc-bkt", "aws:kms:dsse", None),
+            s3s::S3ErrorCode::InvalidRequest,
+        ),
+        (
+            cfg("enc-bkt", "aws:kms", Some("arn:aws:kms:cmk")),
+            s3s::S3ErrorCode::InvalidArgument,
+        ),
+        (bad_rule, s3s::S3ErrorCode::InvalidRequest),
+        (
+            cfg("enc-bkt", "aws:kms", Some("tenant-a")),
+            s3s::S3ErrorCode::InternalError,
+        ),
     ] {
         let e = s3.put_bucket_encryption(bad).await.unwrap_err();
-        assert_eq!(e.code(), &s3s::S3ErrorCode::InvalidRequest, "{e:?}");
+        assert_eq!(e.code(), &code, "{e:?}");
     }
     // 非法 PUT 未破坏已存配置
     let out = s3.get_bucket_encryption(get()).await.unwrap().output;

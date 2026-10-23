@@ -89,6 +89,31 @@ impl OssS3 {
         Ok(())
     }
 
+    /// 3.16：显式 CMK 必须存在于本节点 KMS 密钥环（客户端选错名 → 400，fail-closed）。
+    /// 未配置 KMS provider = 部署错误 → 500（绝不静默降级到默认钥/明文）。
+    fn ensure_cmk_available(&self, sse: &SseReq) -> S3Result<()> {
+        let Some(xl_store::crypto::EncSpec::SseKmsCmk(name)) = &sse.spec else {
+            return Ok(());
+        };
+        self.ensure_cmk_named(name)
+    }
+
+    fn ensure_cmk_named(&self, name: &str) -> S3Result<()> {
+        let kms = self
+            .store
+            .enc_state()
+            .and_then(|es| es.kms.as_ref())
+            .ok_or_else(|| {
+                tracing::error!(
+                    cmk = name,
+                    "显式 CMK 请求但未配置 KMS provider（OSS_KMS_DIR）"
+                );
+                s3s::s3_error!(InternalError, "internal error")
+            })?;
+        kms.ensure_cmk(name).map_err(to_s3_error)?;
+        Ok(())
+    }
+
     /// 桶版本控制三态（读 DB；查库失败上抛 500——状态不可知时不写数据）。
     async fn versioning_mode(&self, bucket: &str) -> S3Result<VersioningMode> {
         match self.acl.bucket_versioning(bucket).await {
@@ -1223,6 +1248,8 @@ impl S3 for OssS3 {
         // M8 缺口 C：无显式 SSE 时套用桶默认（显式头永远优先）
         self.apply_default_encryption(&req.input.bucket, &mut sse)
             .await?;
+        // 3.16：显式/默认 CMK 都必须在本节点密钥环（未知名 400）
+        self.ensure_cmk_available(&sse)?;
         // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
         let lock_req = parse_put_lock(
             req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
@@ -1441,6 +1468,8 @@ impl S3 for OssS3 {
         // M8 缺口 C：无显式 SSE 时套用桶默认（create 记档，complete 落地）
         self.apply_default_encryption(&req.input.bucket, &mut sse)
             .await?;
+        // 3.16：CMK 在 create 即须存在（AWS 语义；complete 只按 sse_kind 落地）
+        self.ensure_cmk_available(&sse)?;
         // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
         let lock_req = parse_put_lock(
             req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
@@ -1487,6 +1516,9 @@ impl S3 for OssS3 {
             Some(raw) if !raw.is_empty() => Some(parse_tagging_header(raw)?),
             _ => None,
         };
+        // R5 扩展（P2-b）：SSE-S3/KMS 意图持久化，complete 落地；3.16 显式 CMK 编码为
+        // `sse-kms:<name>`（旧二进制按未知 kind 拒绝 = fail-closed）。
+        let sse_kind = sse.sse_kind();
         let upload_id = self
             .store
             .create_multipart_upload_ext(
@@ -1495,8 +1527,8 @@ impl S3 for OssS3 {
                 content_type,
                 metadata.unwrap_or_default().into_iter().collect(),
                 sse.sse_c_md5(),
-                sse.sse_kind(), // R5 扩展（P2-b）：SSE-S3/KMS 意图持久化，complete 落地
-                lock.as_ref(),  // M5 切片 4（L3）：锁意图持久化，complete 落地
+                sse_kind.as_deref(),
+                lock.as_ref(), // M5 切片 4（L3）：锁意图持久化，complete 落地
                 storage_class,
                 tags,
             )
@@ -3210,12 +3242,6 @@ impl S3 for OssS3 {
                 "missing apply_server_side_encryption_by_default"
             ));
         };
-        if default.kms_master_key_id.is_some() {
-            return Err(s3s::s3_error!(
-                InvalidRequest,
-                "file-backed KMS does not support specifying a CMK"
-            ));
-        }
         let algo = match default.sse_algorithm.as_str() {
             a @ ("AES256" | "aws:kms") => a,
             _ => {
@@ -3225,16 +3251,34 @@ impl S3 for OssS3 {
                 ));
             }
         };
+        // 3.16：`kms_master_key_id` 仅在 aws:kms 下合法；值须是已配置的命名 CMK。
+        // 存储编码 `aws:kms:<name>`（沿用 TEXT 列）。
+        let stored = match (default.kms_master_key_id.as_deref(), algo) {
+            (Some(_), "AES256") => {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "kms key id requires aws:kms"
+                ));
+            }
+            (Some(raw), _) => {
+                let raw = raw.trim();
+                let name = xl_store::kms::parse_cmk_id(raw).map_err(to_s3_error)?;
+                self.ensure_cmk_named(name)?;
+                // 原样保留用户态 id（名或 ARN）；响应回显同一形态
+                format!("aws:kms:{raw}")
+            }
+            (None, a) => a.to_string(),
+        };
         if let Some(sink) = &self.bucket_control {
             return sink
-                .set_default_encryption(&bucket, Some(algo.to_string()))
+                .set_default_encryption(&bucket, Some(stored))
                 .await
                 .map(|()| S3Response::new(PutBucketEncryptionOutput {}))
                 .map_err(bucket_control_error);
         }
         let updated = self
             .acl
-            .set_bucket_default_encryption(&bucket, algo)
+            .set_bucket_default_encryption(&bucket, &stored)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, bucket, "写桶默认加密失败");
@@ -3276,16 +3320,28 @@ impl S3 for OssS3 {
             ));
         };
         // 写路径已校验；库内出现非法值属记录损坏 → 500（与 apply 路径同口径）
-        if enc_spec_from_default(&algo).is_none() {
+        let Some(spec) = enc_spec_from_default(&algo) else {
             tracing::error!(bucket, value = %algo, "桶默认加密记录非法");
             return Err(s3s::s3_error!(InternalError, "internal error"));
-        }
+        };
+        let (algorithm, kms_key_id) = match spec {
+            xl_store::crypto::EncSpec::SseS3 => ("AES256", None),
+            xl_store::crypto::EncSpec::SseKms => ("aws:kms", None),
+            // 回显写入时的用户态 id（名或 ARN），与 PutBucketEncryption 入参同形
+            xl_store::crypto::EncSpec::SseKmsCmk(_) => {
+                ("aws:kms", algo.strip_prefix("aws:kms:").map(str::to_string))
+            }
+            xl_store::crypto::EncSpec::SseC(_) => {
+                tracing::error!(bucket, "桶默认加密记录出现 SSE-C");
+                return Err(s3s::s3_error!(InternalError, "internal error"));
+            }
+        };
         Ok(S3Response::new(GetBucketEncryptionOutput {
             server_side_encryption_configuration: Some(ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                        kms_master_key_id: None,
-                        sse_algorithm: ServerSideEncryption::from(algo),
+                        kms_master_key_id: kms_key_id,
+                        sse_algorithm: ServerSideEncryption::from_static(algorithm),
                     }),
                     ..Default::default()
                 }],
@@ -3882,6 +3938,8 @@ impl S3 for OssS3 {
         // M8 缺口 C：目标桶默认加密（仅目标；源钥/源加密不受影响）
         self.apply_default_encryption(&req.input.bucket, &mut dst_sse)
             .await?;
+        // 3.16：目标 CMK（显式或桶默认）须存在于本节点密钥环
+        self.ensure_cmk_available(&dst_sse)?;
         // M5 切片 4（L3）：对象锁头（桶未开锁带锁头 → resolve_lock 400）
         let dst_lock_req = parse_put_lock(
             req.input.object_lock_mode.as_ref().map(|m| m.as_str()),
