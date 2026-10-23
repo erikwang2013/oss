@@ -1,7 +1,7 @@
 {
   "name": "oss（吞吞）",
   "short_name": "oss 吞吞",
-  "description": "Rust 编写的 S3 兼容分布式对象存储，支持 TLS、访问点、生命周期与滚动升级",
+  "description": "Rust 编写的 S3 兼容分布式对象存储，支持 TLS/CMK、访问点、Inventory、生命周期与滚动升级",
   "lang": "zh-CN",
   "start_url": "./",
   "scope": "./",

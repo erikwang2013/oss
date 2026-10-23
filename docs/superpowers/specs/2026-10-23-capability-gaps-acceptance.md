@@ -1,8 +1,9 @@
 # 能力边界清零验收记录（2026-10-23）
 
 - 基线：`v1.13.1`（`a58d64a`）
-- 发布：**v1.14.0**（2026-10-23），tag `v1.14.0`
-- 集成结果：已合并到 `main`（能力代码 `86616eb`；其后为测试、文档、站点与版本号更新）
+- 历史发布：**v1.14.0**（2026-10-23），tag `v1.14.0`
+- 最新发布：**v1.15.0**（2026-10-24），tag `v1.15.0`；包含 §8–§11 与 Inventory 跨账户目标
+- 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成）
 - 状态：实现、集成、聚焦测试与 S3 全量 e2e 完成；已提交、推送并发布
 - 构建环境：主机 `/home` 为 5400rpm 机械盘且被其它会话重压，集成验证统一使用
   `CARGO_TARGET_DIR=/tmp/target-retention`（SSD）；`CARGO_BUILD_JOBS=1`。
@@ -126,11 +127,12 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 
 ## 7. 发布状态
 
-提交、测试、文档与站点已纳入 `main`，并发布 **v1.14.0**（tag 与 GitHub Release）。
+v1.14.0 与后续硬化批次已合并到 `main`；v1.14.0 为 2026-10-23 发布，**v1.15.0
+（2026-10-24）** 为 post-1.14 硬化收口，tag 与 GitHub Release 均按 `vx.y.z` 命名。
 注意：GitHub 仓库当前为 private，站点上的 GitHub/Release/源码包链接对未授权访客不可用；
 公开仓库需单独决定。站点静态文件已纳入版本控制，但尚未部署到 `oss.erik.xyz`。
 
-## 8. 2026-10-23 后续修复（v1.14.1 候选）
+## 8. 2026-10-23 后续修复（随 v1.15.0 发布）
 
 - **4.1 part_sizes**：站点复制、raft 同 id 重推与 sync 写门新增内部签名头 `x-oss-part-sizes`；
   摄入端仅 REPLICA 接受，store 信任边界校验（≤10000 段、总和 == 实际 size）后落
@@ -179,7 +181,7 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
   发射失败不影响任务结果（outbox 至少一次）。
 
 
-## 9. 2026-10-23 后续能力：SSE-KMS 显式 CMK（3.16，v1.14.1 候选）
+## 9. 2026-10-23 后续能力：SSE-KMS 显式 CMK（3.16，随 v1.15.0 发布）
 
 - **线级**：`x-amz-server-side-encryption-aws-kms-key-id` 接受裸名或
   `arn:…:key/<name>`，须与 `aws:kms` 同现；名 `[a-z0-9-]{1,64}`（首尾字母数字），
@@ -228,8 +230,8 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 ## 11. 2026-10-24 post-v1.14 硬化集成与最终闸门
 
 **集成**：`feat/post-1.14-hardening`（基于 `v1.14.0`），合并 §8–§10 各 lane、验证 lane 与
-Inventory 跨账户 WIP；最终 Rust/前端树对应提交 `2bda0bc`（本节提交仅追加文档）。**本批未发布**：
-`main`、tag 与 GitHub Release 仍在 `v1.14.0`；仓库 private、站点未部署（§7）。
+Inventory 跨账户 WIP；闸门证据对应 Rust/前端树 `2bda0bc`（其后仅文档/站点/版本号提交）。
+**已发布 v1.15.0（2026-10-24）**：合并到 `main` 并打 tag/Release；仓库 private、站点未部署（§7）。
 
 ### 11.1 集成树闸门
 

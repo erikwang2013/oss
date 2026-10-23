@@ -620,14 +620,17 @@ S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 T
   router 层中间件把 POST `?restore` 的 200 改写为 202；错误状态与其它请求原样透传。
 - AP 支持 `/ap/<name>/<key>` 与 `<name>-s3alias`（路径首段/Host 首标签）；无 AP 的别名
   回落普通桶路由。支持匿名（AP 策略 `Principal:"*"` ∩ 桶策略匿名基线，数据面白名单）；
-  无跨账号或 VPC 来源限制（SourceIp 条件支持，反代需 `OSS_AP_TRUSTED_PROXY=1`，可用
-  `..._HOPS` / `..._CIDRS` 描述信任链）。AP 无策略 = 拒绝（AWS 对齐）。
+  AP 无跨账号；来源条件支持 SourceIp（反代需 `OSS_AP_TRUSTED_PROXY=1`，可用
+  `..._HOPS` / `..._CIDRS` 描述信任链）与 SourceVpc（`OSS_AP_VPC_ID` 静态证明或可信反代
+  单条头，均为来源证明，不是 PrivateLink 端点身份）。AP 无策略 = 拒绝（AWS 对齐）。
 - S6 补齐先前记档的 M4/M5/M6 控制台缺口页（审计过滤、通知死信、SSE/KMS 只读、Select 代理、
   IAM 预设、桶默认加密、对象标签编辑）+ M8 页面（访问点/作业/分层/清单）；未新增计划外
   后端能力。
 
-**仍不做（非目标）**：`AssumeRoleWithWebIdentity` · SSE-KMS 显式 CMK/多钥轮换 ·
-AP 跨账号/VPC 端点 · Inventory 跨账号投递/增量 · Batch 抢占/跨账号清单。
+**仍不做（非目标）**：`AssumeRoleWithWebIdentity` · AP 跨账号/VPC 端点 · Batch 抢占/跨账号
+清单 · 完整多租户账户体系。
+**后续已补**：SSE-KMS 显式 CMK/命名环轮换（3.16）、Inventory 跨账户目标（3.7，仅管理员可
+配置，运行期复核源/目标账户）、Inventory 增量（3.6，节点本地水位）、AP SourceVpc 来源证明。
 （M9 同步强一致、AP 主机别名、Inventory Parquet/Hive、本地冷盘池 tier、tier GC 已于
 2026-10-23 前落地，见 README 与验收记录。）
 

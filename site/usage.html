@@ -62,7 +62,7 @@
         <a href="usage.html" aria-current="page">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.15.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -267,17 +267,19 @@ oss-server rebalance --apply</code></pre>
             <table>
               <thead><tr><th>边界</th><th>现状</th></tr></thead>
               <tbody>
-                <tr><td>AP 匿名 / 跨账号 / VPC 端点</td><td>不做；AP 匿名请求 403，SourceIp 仅单层反代</td></tr>
-                <tr><td>AP 桶级 Create/Delete/ListBuckets</td><td>不做；走控制面 API</td></tr>
-                <tr><td>Inventory 增量 / 跨账号</td><td>全量扫描、CSV/Parquet</td></tr>
-                <tr><td>AbortIncompleteMultipartUpload</td><td>501（需 MPU 索引）</td></tr>
-                <tr><td>Batch 抢占 / 跨账号通知</td><td>不做</td></tr>
-                <tr><td>tier 流式搬运</td><td>全内存</td></tr>
+                <tr><td>AP 匿名 / SourceVpc</td><td>已支持（策略 <code>Principal:"*"</code> ∩ 桶策略；SourceVpc 为来源证明）</td></tr>
+                <tr><td>AP 跨账号 / VPC 端点</td><td>不做；AP 桶级 Create/Delete/ListBuckets 走控制面 API</td></tr>
+                <tr><td>Inventory 增量 / 跨账户目标</td><td>已支持（增量水位为节点本地；跨账户目标仅管理员可配置）</td></tr>
+                <tr><td>AbortIncompleteMultipartUpload</td><td>已支持（生命周期规则）</td></tr>
+                <tr><td>Batch 抢占 / 跨账号通知</td><td>不做；每动作桶通知已支持</td></tr>
+                <tr><td>tier 直读（含 Range）</td><td>不做；归档对象须先 Restore；Transition/Restore 已流式搬运</td></tr>
+                <tr><td>Select BZIP2</td><td>400（不新增 bzip2 依赖）；CSV/JSON/Parquet 可用</td></tr>
                 <tr><td>Level C 双向混合版本 / 数据面滚动</td><td>不做；仅 Level B 控制面窗口</td></tr>
+                <tr><td><code>AssumeRoleWithWebIdentity</code></td><td>不做</td></tr>
               </tbody>
             </table>
           </div>
-          <p>已知限制：复制/tier 摄入的对象暂不携带分段边界，<code>partNumber</code> 会退化为旧语义；签 Range 的多区间请求可能 403；<code>part_sizes</code> 只在 MPU complete 落盘。完整清单见仓库的验收记录。</p>
+          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；M3 MPU 会话仍粘节点；直接读 tier 须先 Restore。完整清单见仓库验收记录 §11。</p>
 
           <h2 id="more">继续阅读</h2>
           <ul>
@@ -295,7 +297,7 @@ oss-server rebalance --apply</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.15.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

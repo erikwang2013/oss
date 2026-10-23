@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.15.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -135,6 +135,7 @@ npm run dev</code></pre>
 
           <h2 id="first-run">首次启动</h2>
           <p>首次启动会自动创建数据目录、暂存目录与桶目录，并用环境变量或密钥文件初始化管理员。建议把口令放进密钥文件，不要写进 shell 历史。</p>
+          <p>服务端加密需在启动前配置密钥库：<code>OSS_MASTER_KEY_FILE</code> 提供 SSE-S3 主密钥，<code>OSS_KMS_DIR</code> 提供 SSE-KMS/命名 CMK 环（v1.15 起支持显式 CMK 与轮换）。未配置时对应 SSE 写入 fail-closed 返回 500，不会降级明文。</p>
           <ul>
             <li><code>OSS_ADMIN_USER</code>：管理员用户名。</li>
             <li><code>OSS_ADMIN_PASSWORD</code>：管理员口令。</li>
@@ -177,7 +178,7 @@ aws --endpoint-url $E s3 ls s3://demo/</code></pre>
           </div>
 
           <h2 id="tls">TLS 传输</h2>
-          <p>默认仍是明文；配置 <code>[tls.server]</code> 后，S3/控制台监听器、witness、Raft RPC、节点间 gRPC mesh、site/repl/tier 出站与 Kafka 一起启用 TLS——没有半 TLS 模式。证书轮换需要重启。</p>
+          <p>默认仍是明文；配置 <code>[tls.server]</code> 后，S3/控制台监听器、witness、Raft RPC、节点间 gRPC mesh、site/repl/tier 出站与 Kafka 一起启用 TLS——没有半 TLS 模式。v1.15 起私钥强制 0600，主监听器与出站客户端支持 SIGHUP/定时热加载；CA 支持双信任轮换。mesh gRPC 与 Kafka 客户端仍以重启为准。</p>
           <div class="code-card">
             <div class="code-head"><span>oss.toml</span><button class="copy-btn" type="button" data-copy="#code-install-tls">复制</button></div>
             <pre><code id="code-install-tls">[tls.server]
@@ -208,10 +209,10 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
           <p>控制面支持 Level B 滚动升级窗口：先保持 <code>[raft].feature_level = 1</code>（默认），逐个替换节点；全部 voter/learner 都升级后再改为 <code>2</code> 并重启。激活后不可回滚到旧版，数据面（M3/M4）仍非滚动。升级步骤与自动拒绝条件见 README 的「升级顺序」（随发布同步）。</p>
 
           <h2 id="download">下载与版本</h2>
-          <p>当前 Release 提供源码归档，没有预编译二进制。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.14.0；可直接下载源码包或按本文构建。</p>
+          <p>当前 Release 提供源码归档，没有预编译二进制。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.15.0；可直接下载源码包或按本文构建。</p>
           <p>
-            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.14.0" target="_blank" rel="noopener">打开 v1.14.0 Release</a>
-            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.14.0.tar.gz" target="_blank" rel="noopener">下载源码包</a>
+            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.15.0" target="_blank" rel="noopener">打开 v1.15.0 Release</a>
+            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.15.0.tar.gz" target="_blank" rel="noopener">下载源码包</a>
             <a class="btn btn-ghost" href="changelog.html">版本日志</a>
           </p>
         </article>
@@ -223,7 +224,7 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.15.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

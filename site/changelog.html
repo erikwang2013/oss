@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.14.0，包含 M1 到 M9 的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.15.0，包含 M1 到 M9 的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到能力边界清零；oss 的完整版本历史与 v1.14.0 变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到硬化收口；oss 的完整版本历史与 v1.15.0 变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.14.0 能力边界清零；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.15.0 硬化收口；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.14.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.15.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.14.0 的能力边界清零。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.15.0 的硬化收口。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-15-0">v1.15.0</a>
           <a href="#v1-14-0">v1.14.0</a>
           <a href="#v1-13-1">v1.13.1</a>
           <a href="#v1-13-0">v1.13.0</a>
@@ -90,9 +91,24 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.14.0</strong>（2026-10-23）。</p>
+          <p>当前最新发布：<strong>v1.15.0</strong>（2026-10-24）。</p>
 
           <div class="changelog-list">
+            <details class="changelog-entry" id="v1-15-0" open>
+              <summary><strong>v1.15.0</strong><time datetime="2026-10-24">2026-10-24</time><span>硬化收口</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>AP / 账户</strong>：AP 匿名（策略与桶策略交集）、账户命名空间 v1、SourceVpc 来源证明、缓存 TTL/负缓存、无策略默认拒绝、旧 <code>*-s3alias</code> 回落、XFF hops/CIDR 信任链。</li>
+                  <li><strong>TLS / 加密</strong>：私钥 0600 强制、CA 双信任轮换、主监听器与出站客户端热加载；SSE-KMS 显式 CMK 与命名环轮换（旧版本保留解密）。</li>
+                  <li><strong>数据面 / 作业</strong>：tier 流式搬运与恢复、Batch 每动作桶通知、M7 版本定向删除与元数据复制、Select Parquet、GC 二次快照、生命周期游标、AbortMPU。</li>
+                  <li><strong>Inventory</strong>：增量水位（节点本地）与跨账户目标（仅管理员可配置，运行期复核源/目标账户）。</li>
+                  <li><strong>Level B</strong>：<code>BucketSetLifecycleV2</code> 正确标记 feature level 2；快照、cutover 与 force-recover 对 level-2 数据 fail-closed。</li>
+                  <li><strong>验证</strong>：M9 sync/stretch/recovery/rolling 78/59/133/65 PASS；M8 e2e PASS（4433s）；S3 全量 e2e 38 节 RC=0；库测试 268/150/152；Playwright 9/9。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.15.0" target="_blank" rel="noopener">GitHub Release</a> · 验收记录：<code>docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md</code> §8–§11；完整配置与边界见 README。</p>
+              </div>
+            </details>
+
             <details class="changelog-entry" id="v1-14-0" open>
               <summary><strong>v1.14.0</strong><time datetime="2026-10-23">2026-10-23</time><span>能力边界清零</span></summary>
               <div class="entry-body">
@@ -226,7 +242,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.14.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.15.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

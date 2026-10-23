@@ -25,11 +25,12 @@ ObjectAccessed）、全链路 TLS/SASL、M8 边界（AP 别名/DeleteObjects/Sou
 Parquet/Hive、tier 本地盘/GC、生命周期全 Filter、Batch WASM）、M9 Level B 控制面滚动升级；
 并完成安全复审（0 Critical，2 High 已修复）。详见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md`。
 
-**v1.14 后硬化（未发布）**：AP 匿名/账户命名空间 v1/SourceVpc/缓存 TTL/无策略默认拒绝/旧别名回落；
-`part_sizes` 复制透传、签 Range 多区间确定性 400；TLS 私钥 0600、CA 双信任轮换、主监听器与出站热加载；
-SSE-KMS 显式 CMK 与命名环轮换；tier 流式搬运/恢复；Batch 每动作桶通知；M7 版本定向删除/元数据复制；
-Select Parquet；本地 tier 符号链接加固、GC 二次快照、生命周期游标、Inventory 增量/跨账户目标、AbortMPU；以及
-Level B 生命周期命令门控/快照 guard 热修。详见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §8–§11。
+**v1.15.0（2026-10-24）硬化收口**：AP 匿名/账户命名空间 v1/SourceVpc/缓存 TTL/无策略默认拒绝/
+旧别名回落与 XFF 信任链；`part_sizes` 复制透传、签 Range 多区间确定性 400；TLS 私钥 0600、CA
+双信任轮换、主监听器与出站热加载；SSE-KMS 显式 CMK 与命名环轮换；tier 流式搬运/恢复；Batch
+每动作桶通知；M7 版本定向删除/元数据复制；Select Parquet；本地 tier 符号链接加固、GC 二次快照、
+生命周期游标、Inventory 增量/跨账户目标、AbortMPU；以及 Level B 生命周期命令门控/快照 guard
+热修。最终闸门与证据见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §8–§11。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
@@ -130,8 +131,8 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.13.1 发布时 78 PASS / 0 FAIL / 1 SKIP（本批未重跑；stretch 由专用脚本覆盖） |
-| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP；本批未实跑） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.15.0 硬化 lane 实跑 sync 78/0/1、stretch 59/0/1 |
+| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP）；v1.15.0 lane 实跑 65/0/4（4 SKIP 为 v1.13.1 侧无法覆盖的 D6 项） |
 | `tests/e2e_m9_recovery.sh` | M9 灾备验收（真进程 + CLI：M7 export/cutover 字段级冲突与 overwrite、force-recover 后 `bootstrap=false` 重启；witness 运行时/export/force-recover；B′ 替换 + `sync-reconcile --repair` 门） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
@@ -1309,10 +1310,13 @@ append/vote/snapshot/status/membership/write/join。
   164 PASS（lib 112 + raft_access 6 + raft_s71 6 + raft_cutover 4 + sync_gate 36）；
   `cargo fmt --all --check` 与
   `cargo clippy -p oss-server -p xl-s3 --all-targets -- -D warnings` 通过。
-  2026-10-23 能力清理合并的聚焦证据见
-  `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md`：xl-store 259+1 ignored /
-  xl-s3 136 / oss-server 140，S3 e2e 38 节；本批未重跑全量 M9 e2e。
-  `tests/e2e_stretch.sh` ALL PASS；本次无前端改动，web test/build 沿用发布时结果。
+  2026-10-23 能力清理的聚焦证据见
+  `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §3：xl-store 259+1 ignored /
+  xl-s3 136 / oss-server 140，S3 e2e 38 节。
+  **2026-10-24 v1.15.0 硬化 lane**：sync 78/0/1、stretch 59/0/1、recovery 133/0/1、
+  rolling 65/0/4；M8 e2e PASS（4433s，Tier 段按环境 SKIP）；集成树库测试
+  xl-store 268+1 ignored / xl-s3 150 / oss-server 152，S3 全量 e2e 38 节 RC=0，Web
+  `tsc`/`vite build`/Playwright 9/9。逐项证据见验收记录 §11。
   **2026-10-23 Level B 热修**：`BucketSetLifecycleV2` 此前漏标 level 2（混合窗口会被
   v1.13.1 副本解码失败，快照会静默丢结构化规则）；现已 `min_feature_level()=2`（写入门控
   503 `feature_unavailable`），且快照编码器在 `lifecycle_rules.config_json` 非空时拒绝
@@ -1561,7 +1565,9 @@ db_path = "/var/lib/oss/raft.db"
      规则）。`feature_level=1` 时这类写入在 append 前被拒绝（503
      `{"error":"feature_unavailable","required":2,"effective":1}`）；旧列可表达的规则
      仍走 V1、行为不变。首条结构化规则写入即激活 `schema_meta.raft_feature_level=2`
-     （不归点同下）。`tests/e2e_m9_rolling.sh` 已提供但本批未实跑（缺 v1.13.1 旧二进制）。
+     （不归点同下）。`tests/e2e_m9_rolling.sh` 已在 v1.15.0 硬化 lane 实跑：
+     65 PASS / 0 FAIL / 4 SKIP；SKIP 为 v1.13.1 侧无法覆盖的 D6 项（跨版本快照、level-2 503、
+     激活、激活后回滚），不是产品失败。
    - **快照/切档 fail-closed（OSSCTL2 之前）**：`lifecycle_rules.config_json` 非空时，控制
      快照、`raft-force-recover` 与 `raft-cutover`（含 `--dry-run`）都拒绝 OSSCTL1
      （`level-2 data present; refusing OSSCTL1`），避免 v1.13.1 安装时静默丢弃结构化规则

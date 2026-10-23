@@ -778,9 +778,10 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 
 ## 15. Inventory —— `M8`
 
-> **落地状态（2026-10-23 更新）**：S5 已落地——S3 与控制台配置、Daily/Weekly 调度、force-run、
-> manifest + `data/*.csv.gz` 或 `data/*.parquet`、Hive `symlink.txt`；控制台可选的**增量模式**
-> （非 AWS 标准，默认关闭）按水位只输出上次扫描后变化的条目，manifest 记录水位。
+> **落地状态（2026-10-24 更新）**：S5 已落地——S3 与控制台配置、Daily/Weekly 调度、force-run、
+> manifest + `data/*.csv.gz` 或 `data/*.parquet`、Hive `symlink.txt`、**跨账户目标**（仅管理员可
+> 配置，运行期复核源/目标桶账户）；控制台可选的**增量模式**（非 AWS 标准，默认关闭）按水位只输出
+> 上次扫描后变化的条目，manifest 记录水位。
 
 **配置**：`PutBucketInventoryConfiguration` —— 源桶、目标桶+前缀、频率（`Daily`/`Weekly`）、输出格式（`CSV` / `Parquet`）、是否含版本、可选字段列表、可选 Filter（前缀）。
 
@@ -791,7 +792,7 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 <dest-prefix>/<source-bucket>/<config-id>/<run_key>/hive/dt=YYYY-MM-DD-HH-MM/symlink.txt
 ```
 `run_key`：Daily = `YYYY-MM-DD`（UTC），Weekly = `YYYY-Www`，force-run = `manual-<epoch>`。
-`manifest.json` 含 `sourceBucket`、`destinationBucket`、`version`、`creationTimestamp`、`fileFormat`、`fileSchema`、`files[{key,size,md5Checksum}]`；CSV 的 `size`/`md5Checksum` 对应 gzip 后字节数与 MD5（base64），Parquet 对应文件本身（SNAPPY，8192 行/行组；`last_modified_date` 为 TIMESTAMP_MILLIS）。
+`manifest.json` 含 `sourceBucket`、`destinationBucket`、`version`、`creationTimestamp`、`fileFormat`、`fileSchema`、`files[{key,size,md5Checksum}]`，并追加扩展字段 `accountId`（源桶账户）与 `destinationAccountId`（目标桶账户）；CSV 的 `size`/`md5Checksum` 对应 gzip 后字节数与 MD5（base64），Parquet 对应文件本身（SNAPPY，8192 行/行组；`last_modified_date` 为 TIMESTAMP_MILLIS）。
 
 **列**（`fileSchema`）：必含 9 列 `Bucket`、`Key`、`VersionId`、`IsLatest`、`DeleteMarker`、
 `Size`、`LastModifiedDate`、`ETag`、`StorageClass`；可选 6 列按固定顺序追加
@@ -803,8 +804,12 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 关闭），同槽唯一去重，停机只补最近一槽。
 
 **边界**：Hive 仅写 `hive/dt=.../symlink.txt`（`dt` 取 run 入队时刻，任务重试不会产生第二个
-分区；不含 Athena 建表/分区自动发现）；不做 S3 Inventory 的跨账号投递；全量扫描默认，
-CSV/Parquet 单数据文件（数据文件 ≤5 GiB，CSV 可 gzip）。控制台配置 `incremental=true` 时开启
+分区；不含 Athena 建表/分区自动发现）；**跨账户目标**：源/目标桶账户不同的配置仅管理员可创建
+（非管理员 403，即使持目标桶写权限），`destination_account_id` 可选但须为 12 位且等于目标桶
+当前账户；运行期复核记录源账户与目标桶账户，漂移即失败且不写输出，写入仍走配置所有者的
+`PutObject` 检查；目标桶字段接受桶名或 `arn:aws:s3:::<bucket>`（归一为桶名）。账户 = 用户
+命名空间 v1，不是租户隔离。全量扫描默认，CSV/Parquet 单数据文件（数据文件 ≤5 GiB，CSV 可
+gzip）。控制台配置 `incremental=true` 时开启
 **水位增量**：首轮全量，之后只输出 `LastModified ≥ 上轮扫描开始时刻` 的对象/版本，manifest
 `incremental.previousCursor/cursor` 记录水位，水位随配置变更失效；无版本控制桶的删除没有墓碑，
 不会出现在增量清单里（需要完整快照时关掉增量）。增量开关与水位存于节点本地表，**仅支持单节点
@@ -958,7 +963,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |
 | **M6** | 事件总线 + Kafka 通知（含 `ecat-mq-kafka`）· S3 Select · 桶复制（含 `ecat-data-s3` 扩展）· 事件页 · Select 工作台 |
 | **M7** | 跨站点异步双向复制 · 站点身份与管理 API · 配置/IAM 日志复制 · 站点页 |
-| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）；2026-10-23 补 AP 别名/批量删/SourceIp、WASM Batch、Parquet/Hive、tier 本地盘/GC、生命周期全 Filter**；非目标：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换（3.16 已补）、AP 跨账号；M9 另列） |
+| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）；2026-10-23 补 AP 别名/批量删/SourceIp、WASM Batch、Parquet/Hive、tier 本地盘/GC、生命周期全 Filter；2026-10-24 补 Inventory 跨账户目标（3.7）**；非目标：`AssumeRoleWithWebIdentity`、AP 跨账号；SSE-KMS 显式 CMK/多钥轮换 3.16 已补；M9 另列） |
 | **M9** | 控制面 `openraft` 跨站点强一致 · sync 桶 · stretch EC · 站点故障语义 |
 
 **与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 与 `2026-10-10-m1b-frontend-console.md` 回答「M1 前后端怎么写」（逐任务代码与测试）。
