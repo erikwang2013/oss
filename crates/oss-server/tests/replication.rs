@@ -1315,6 +1315,7 @@ async fn put_with_meta_sends_sse_scheme_and_rejects_sse_c() {
         wrapped_dek_hex: String::new(),
         nonce_seed_hex: String::new(),
         sse_c_key_md5: None,
+        kms_key_id: None,
     };
     let empty = BTreeMap::new();
     c.put_object_with_meta(
