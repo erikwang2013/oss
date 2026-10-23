@@ -328,7 +328,8 @@ impl AppState {
         };
         store_cfg.inline_threshold = cfg.ec.inline_threshold;
         // B10：控制面删桶路径的清理实现须在 Store::open 前注入（集群控制面写）。
-        let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
+        // AP 缓存 TTL/负缓存/上限（非法环境变量 → 启动失败，不静默降级）。
+        let ap_cache = Arc::new(xl_s3::ap::ApCache::from_env()?);
         let olap_cache = Arc::new(xl_s3::olap::OlapCache::new());
         let bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink> =
             Arc::new(SqlBucketCleanup::new(
@@ -759,12 +760,14 @@ impl AppState {
         match db.list_access_points(None).await {
             Ok(rows) => {
                 for r in rows {
+                    let account = r.account();
                     match xl_s3::ap::AccessPoint::from_row(
                         r.name,
                         r.bucket,
                         r.owner_id,
                         r.policy_json,
                         &site.region,
+                        &account,
                     ) {
                         Ok(ap) => ap_cache.put(ap),
                         Err(e) => tracing::warn!(error = %e, "AP 预加载跳过非法策略行"),
