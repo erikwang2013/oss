@@ -194,7 +194,12 @@ async fn console_structured_json_roundtrip() {
     let http = reqwest::Client::new();
 
     let at = time::OffsetDateTime::now_utc() + time::Duration::days(2);
-    let date = format!("{:04}-{:02}-{:02}", at.year(), u8::from(at.month()), at.day());
+    let date = format!(
+        "{:04}-{:02}-{:02}",
+        at.year(),
+        u8::from(at.month()),
+        at.day()
+    );
     let resp = http
         .put(format!("{base}/api/v1/buckets/bkt/lifecycle"))
         .bearer_auth(&token)
@@ -250,7 +255,10 @@ async fn console_structured_json_roundtrip() {
         r["noncurrent_version_expiration"]["newer_noncurrent_versions"],
         2
     );
-    assert_eq!(r["noncurrent_version_transitions"][0]["noncurrent_days"], 30);
+    assert_eq!(
+        r["noncurrent_version_transitions"][0]["noncurrent_days"],
+        30
+    );
 
     // S3 GET：组合过滤回读为 And；Date/多条 Transition/Noncurrent 原样可见。
     let out = s3
@@ -272,11 +280,13 @@ async fn console_structured_json_roundtrip() {
     assert_eq!(and.object_size_greater_than, Some(10));
     assert_eq!(and.object_size_less_than, Some(1000));
     assert_eq!(and.tags.as_ref().unwrap().len(), 1);
-    assert!(rules[0]
-        .expiration
-        .as_ref()
-        .and_then(|e| e.date.as_ref())
-        .is_some());
+    assert!(
+        rules[0]
+            .expiration
+            .as_ref()
+            .and_then(|e| e.date.as_ref())
+            .is_some()
+    );
     assert_eq!(rules[0].transitions.as_ref().unwrap().len(), 2);
     assert_eq!(
         rules[0].transitions.as_ref().unwrap()[1]
@@ -295,11 +305,7 @@ async fn console_structured_json_roundtrip() {
         Some(2)
     );
     assert_eq!(
-        rules[0]
-            .noncurrent_version_transitions
-            .as_ref()
-            .unwrap()[0]
-            .noncurrent_days,
+        rules[0].noncurrent_version_transitions.as_ref().unwrap()[0].noncurrent_days,
         Some(30)
     );
 }
