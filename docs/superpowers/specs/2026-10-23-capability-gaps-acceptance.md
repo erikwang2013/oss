@@ -58,7 +58,10 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
   （AP 匿名已于后续批次支持，见 §8）。
 - Inventory 增量/跨账号；Batch 抢占/跨账号/每动作桶通知。
 - Lifecycle `AbortIncompleteMultipartUpload`（需 MPU 索引，继续 501）。
-- Tier 流式搬运（全内存）。
+- ~~Tier 流式搬运（全内存）~~ —— post-1.14 3.11 已实现：Transition 按 8 MiB 窗口读取源、
+  出站 256 KiB 块流式发送（S3 先落暂存文件预计算 SigV4 payload hash）；Restore 流式落盘并
+  校验长度/SHA-256，空间不足或校验失败回 Archived 并清理暂存。Archived GET（含 Range）
+  直读远端仍不在范围，须先 Restore。
 - Level C 任意双向混合版本；M3/M4 数据面、TLS 物料、跨版本 cutover/force-recover 仍非滚动。
 - 匿名控制面/桶级操作、匿名对象锁/保留期头（一律 403）。
 
