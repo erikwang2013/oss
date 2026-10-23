@@ -906,13 +906,15 @@ pub fn spawn_worker(state: AppState) {
     tracing::info!(interval_secs = secs, "lifecycle worker 已启动");
 }
 
-/// C5：审计保留清理 worker——`OSS_AUDIT_RETENTION_DAYS`（默认 0 = 不清理，保持现状）。
-/// 每小时清理一次 `ts < now - days*86400` 的行；清理失败只 warn（保留策略非关键路径）。
+/// 审计保留清理 worker——`OSS_AUDIT_RETENTION_DAYS`（默认 0 = 不清理，保持现状）。
+/// 天数收敛到 1..=36500（0/负/非法 = 关闭，避免 `days*86400` 溢出）；每小时清理一次
+/// `ts < now - days*86400`，单轮最多 [`AUDIT_PURGE_BATCH`] 行（积压多轮收敛，失败只 warn）。
 pub fn spawn_audit_cleanup(state: AppState) {
     let days: i64 = std::env::var("OSS_AUDIT_RETENTION_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .clamp(0, 36_500);
     if days <= 0 {
         tracing::info!("审计保留清理未启用（OSS_AUDIT_RETENTION_DAYS=0）");
         return;
@@ -923,8 +925,12 @@ pub fn spawn_audit_cleanup(state: AppState) {
         loop {
             t.tick().await;
             let cutoff = now_secs() - days * 86_400;
-            match state.db.delete_audit_older_than(cutoff).await {
-                Ok(n) if n > 0 => tracing::info!(deleted = n, "审计保留清理"),
+            match state
+                .db
+                .delete_audit_older_than(cutoff, AUDIT_PURGE_BATCH)
+                .await
+            {
+                Ok(n) if n > 0 => tracing::info!(deleted = n, "审计保留清理（单轮上限）"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "审计保留清理失败"),
             }
@@ -932,6 +938,9 @@ pub fn spawn_audit_cleanup(state: AppState) {
     });
     tracing::info!(days, "审计保留清理 worker 已启动（每小时一次）");
 }
+
+/// 单轮保留清理上限：避免首次启用 / 长期积压时长时间持有 SQLite 写锁。
+const AUDIT_PURGE_BATCH: i64 = 10_000;
 
 #[cfg(test)]
 mod tests {

@@ -366,6 +366,15 @@ async fn count(e: &Env, sql: &'static str) -> i64 {
         .unwrap()
 }
 
+/// 无凭据原始请求（匿名 AP 用例）。
+async fn anon_get(e: &Env, path: &str) -> reqwest::Response {
+    e.http
+        .get(format!("{}{path}", e.base))
+        .send()
+        .await
+        .unwrap()
+}
+
 fn bucket_policy(effect: &str) -> String {
     serde_json::json!({"Version":"2012-10-17","Statement":[{
         "Effect":effect,"Principal":{"AWS":"*"},"Action":"s3:GetObject",
@@ -376,6 +385,15 @@ fn bucket_policy(effect: &str) -> String {
 fn ap_policy(effect: &str, action: &str, resource: &str) -> String {
     serde_json::json!({"Statement":[{
         "Effect":effect,"Principal":{"AWS":"*"},"Action":action,"Resource":resource}]})
+    .to_string()
+}
+
+/// 4.4 起无策略 = 默认拒绝：需要旧「AP 不额外限制」语义的用例显式挂全量 Allow
+/// （对象 ARN + 桶 ARN 两轴）。
+fn ap_allow_all(bucket: &str) -> String {
+    serde_json::json!({"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*",
+        "Resource":[format!("arn:aws:s3:::{bucket}/*"), format!("arn:aws:s3:::{bucket}")]}]})
     .to_string()
 }
 
@@ -523,12 +541,28 @@ async fn console_crud_permissions_and_cache() {
         200
     );
 
-    // 无策略时经 AP 可写
+    // 4.4：无策略时经 AP 默认拒绝（AWS 对齐；升级前为「不额外限制」）
     assert_eq!(
         send_status(
             &e,
             Method::PUT,
             "/ap/owner-ap/pre",
+            &[],
+            b"pre",
+            &owner_ak,
+            &owner_sk,
+            "s3"
+        )
+        .await,
+        403,
+        "AP 无策略必须默认拒绝"
+    );
+    // 直连桶路由播种对象（AP 无策略不放行写）
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/crudb/pre",
             &[],
             b"pre",
             &owner_ak,
@@ -728,19 +762,13 @@ async fn ap_policy_matrix_deny_wins() {
                 set_ap_policy(&e, "mx-ap", "mxb", admin_id, ap).await;
                 let got =
                     send_status(&e, Method::GET, "/ap/mx-ap/obj", &[], b"", ak, sk, "s3").await;
-                // 桶 Allow 提升身份；桶 Deny 压过一切；AP 无策略不额外限制、无匹配/Deny 拒。
+                // 桶 Allow 提升身份；桶 Deny 压过一切；AP 无策略默认拒、无匹配/Deny 拒。
                 let base = match bx {
                     Axis::Deny => false,
                     Axis::Allow => true,
                     Axis::None => identity_allow,
                 };
-                let want = if ax == Axis::Deny {
-                    403
-                } else if base {
-                    200
-                } else {
-                    403
-                };
+                let want = if ax == Axis::Allow && base { 200 } else { 403 };
                 assert_eq!(got, want, "identity={who} bucket={bx:?} ap={ax:?}");
             }
         }
@@ -811,8 +839,9 @@ async fn ap_policy_matrix_deny_wins() {
         "AP 策略无匹配应拒"
     );
 
-    // 桶策略无匹配 → 回落身份表（alice 有读 200，bob 无读 403）
-    set_ap_policy(&e, "mx-ap", "mxb", admin_id, None).await;
+    // 桶策略无匹配 → 回落身份表（alice 有读 200，bob 无读 403）；
+    // AP 侧显式 Allow 全量，隔离出桶策略/身份轴。
+    set_ap_policy(&e, "mx-ap", "mxb", admin_id, Some(&ap_allow_all("mxb"))).await;
     let bucket_put_only = serde_json::json!({"Version":"2012-10-17","Statement":[{
         "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject",
         "Resource":"arn:aws:s3:::mxb/*"}]})
@@ -1006,7 +1035,8 @@ async fn object_ops_through_ap() {
     let e = env(dir.path()).await;
     let (owner_id, ak, sk) = user(&e, "owner", false).await;
     bucket(&e, "opsb", Some(owner_id)).await;
-    direct_ap(&e, "ops-ap", "opsb", owner_id, None).await;
+    let allow_all = ap_allow_all("opsb");
+    direct_ap(&e, "ops-ap", "opsb", owner_id, Some(&allow_all)).await;
 
     let r = signed(
         &e,
@@ -1322,7 +1352,8 @@ async fn large_put_through_ap_not_capped_at_1mib() {
     let e = env_with_max_put(dir.path(), 4 * 1024 * 1024).await;
     let (owner_id, ak, sk) = user(&e, "owner-large", false).await;
     bucket(&e, "largeb", Some(owner_id)).await;
-    direct_ap(&e, "large-ap", "largeb", owner_id, None).await;
+    let allow_all = ap_allow_all("largeb");
+    direct_ap(&e, "large-ap", "largeb", owner_id, Some(&allow_all)).await;
     let body = vec![b'x'; 2 * 1024 * 1024];
     let r = signed(
         &e,
@@ -1361,7 +1392,8 @@ async fn restore_object_through_ap() {
     let e = env(dir.path()).await;
     let (owner_id, ak, sk) = user(&e, "owner", false).await;
     bucket(&e, "coldb", Some(owner_id)).await;
-    direct_ap(&e, "cold-ap", "coldb", owner_id, None).await;
+    let allow_all = ap_allow_all("coldb");
+    direct_ap(&e, "cold-ap", "coldb", owner_id, Some(&allow_all)).await;
 
     assert_eq!(
         send_status(
@@ -1456,7 +1488,8 @@ async fn copy_dual_auth_and_canonical_keys() {
     let (bob_id, bob_ak, bob_sk) = user(&e, "bob", false).await;
     bucket(&e, "dstb", Some(alice_id)).await;
     bucket(&e, "srcb", Some(bob_id)).await;
-    direct_ap(&e, "keys-ap", "dstb", alice_id, None).await;
+    let allow_all = ap_allow_all("dstb");
+    direct_ap(&e, "keys-ap", "dstb", alice_id, Some(&allow_all)).await;
     // alice：目标写 + 源读
     perms(&e, alice_id, &[full("dstb"), read_only("srcb")]).await;
     assert_eq!(
@@ -1750,7 +1783,8 @@ async fn put_emits_event_and_replication_once() {
     }])
     .to_string();
     e.st.repl_store.save_rules("evb", &rules).await.unwrap();
-    direct_ap(&e, "ev-ap", "evb", admin_id, None).await;
+    let allow_all = ap_allow_all("evb");
+    direct_ap(&e, "ev-ap", "evb", admin_id, Some(&allow_all)).await;
 
     assert_eq!(
         send_status(&e, Method::PUT, "/ap/ev-ap/k", &[], b"v", &ak, &sk, "s3").await,
@@ -2041,7 +2075,8 @@ async fn delete_objects_through_ap_versioned_and_bad_bodies() {
         .set_bucket_versioning("verb", "Enabled")
         .await
         .unwrap();
-    direct_ap(&e, "ver-ap", "verb", uid, None).await;
+    let allow_all = ap_allow_all("verb");
+    direct_ap(&e, "ver-ap", "verb", uid, Some(&allow_all)).await;
 
     let mut versions = Vec::new();
     for content in ["one", "two"] {
@@ -2173,14 +2208,15 @@ async fn delete_objects_through_ap_versioned_and_bad_bodies() {
     );
 }
 
-/// 别名：路径首段与 Host 首标签两种形态；未知别名 404 不回落桶；建桶保留后缀。
+/// 别名：路径首段与 Host 首标签两种形态；未知别名回落普通桶路由（L4）；建桶保留后缀。
 #[tokio::test]
 async fn alias_path_and_host_forms() {
     let dir = tempfile::tempdir().unwrap();
     let e = env(dir.path()).await;
     let (uid, ak, sk) = user(&e, "owner", false).await;
     bucket(&e, "aliasb", Some(uid)).await;
-    direct_ap(&e, "alias-ap", "aliasb", uid, None).await;
+    let allow_all = ap_allow_all("aliasb");
+    direct_ap(&e, "alias-ap", "aliasb", uid, Some(&allow_all)).await;
     let alias = "alias-ap-s3alias";
 
     // 路径形式；键含 `/` 原样可用
@@ -2270,19 +2306,18 @@ async fn alias_path_and_host_forms() {
         204
     );
 
-    // 未知别名（路径/Host）→ 404 NoSuchAccessPoint，绝不回落桶路由
+    // 未知别名（路径/Host）→ 无同名 AP 时回落普通桶路由（L4）。桶不存在时由
+    // 身份/桶授权先拒（AccessDenied），关键区别是不得是 AP 的 NoSuchAccessPoint。
     let r = signed(&e, Method::GET, "/nope-s3alias/x", &[], b"", &ak, &sk, "s3").await;
-    assert_eq!(r.status(), 404);
-    assert!(
-        r.text()
-            .await
-            .unwrap()
-            .contains("<Code>NoSuchAccessPoint</Code>")
-    );
+    assert_eq!(r.status(), 403);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
+    assert!(!body.contains("NoSuchAccessPoint"), "{body}");
+    // Host 形式未知别名：Host 不劫持，路径桶正常路由（aliasb 对象可读）
     let r = signed(
         &e,
         Method::GET,
-        "/x",
+        "/aliasb/dir/b.txt",
         &[("host", "nope-s3alias.example.com")],
         b"",
         &ak,
@@ -2290,16 +2325,215 @@ async fn alias_path_and_host_forms() {
         "s3",
     )
     .await;
-    assert_eq!(r.status(), 404);
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "world");
+
+    // 后缀保留：所有新建桶路径共用 validate_bucket
+    assert!(e.st.store.create_bucket("foo-s3alias").await.is_err());
+}
+
+/// L4：无同名 AP 时，M8 之前已存在的 `*-s3alias` 桶仍可经普通桶路由访问；
+/// 同名 AP 与旧桶并存时 AP 优先。
+#[tokio::test]
+async fn legacy_s3alias_bucket_falls_back_and_ap_wins_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "aliasb", Some(uid)).await;
+    let allow_all = ap_allow_all("aliasb");
+    direct_ap(&e, "legacy-ap", "aliasb", uid, Some(&allow_all)).await;
+
+    // 模拟 M8 前遗留桶（绕过新建校验，直接建目录 + 记账行）
+    let legacy = "legacy-s3alias";
+    std::fs::create_dir_all(dir.path().join("data").join(legacy)).unwrap();
+    e.st.db.insert_bucket(legacy, Some(uid)).await.unwrap();
+
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            &format!("/{legacy}/k"),
+            &[],
+            b"old",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200,
+        "旧别名后缀桶应可经普通桶路由写入"
+    );
+    let r = signed(
+        &e,
+        Method::GET,
+        &format!("/{legacy}/k"),
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "old");
+
+    // 同名 AP 与旧桶并存：AP 优先（请求落到 AP 的桶 aliasb）
+    let collision = "legacy-ap-s3alias";
+    std::fs::create_dir_all(dir.path().join("data").join(collision)).unwrap();
+    e.st.db.insert_bucket(collision, Some(uid)).await.unwrap();
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            &format!("/{collision}/apkey"),
+            &[],
+            b"via-ap",
+            &ak,
+            &sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    let r = signed(
+        &e,
+        Method::GET,
+        "/ap/legacy-ap/apkey",
+        &[],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "via-ap");
+    // 旧桶本身没有被写入同名键（别名命中 AP 时不得落入旧桶）
     assert!(
-        r.text()
-            .await
-            .unwrap()
-            .contains("<Code>NoSuchAccessPoint</Code>")
+        e.st.store.head_object(collision, "apkey").await.is_err(),
+        "别名命中 AP 时不得落入旧桶"
+    );
+}
+
+/// 3.1：匿名经 AP——AP 策略 Principal "*" + 数据面白名单，桶策略匿名基线仍须 Allow；
+/// 控制面一律拒，锁头一律拒，审计 uid=0。
+#[tokio::test]
+async fn anonymous_through_access_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "anonb", Some(uid)).await;
+    let get_arn = "arn:aws:s3:::anonb/*";
+    let allow_get = ap_policy("Allow", "s3:GetObject", get_arn);
+    direct_ap(&e, "anon-ap", "anonb", uid, Some(&allow_get)).await;
+    assert_eq!(
+        send_status(&e, Method::PUT, "/anonb/k", &[], b"hello", &ak, &sk, "s3").await,
+        200
     );
 
-    // 后缀保留：所有建桶路径共用 validate_bucket
-    assert!(e.st.store.create_bucket("foo-s3alias").await.is_err());
+    // 无桶策略 → 匿名基线拒（AP 策略不能绕过桶策略）
+    assert_eq!(anon_get(&e, "/ap/anon-ap/k").await.status(), 403);
+    // 控制面（ListV2）即使 AP 策略写全量也拒
+    assert_eq!(anon_get(&e, "/ap/anon-ap?list-type=2").await.status(), 403);
+
+    let bucket_policy = serde_json::json!({"Version":"2012-10-17","Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+        "Resource":"arn:aws:s3:::anonb/*"}]})
+    .to_string();
+    set_bucket_policy(&e, "anonb", Some(&bucket_policy)).await;
+    let r = anon_get(&e, "/ap/anon-ap/k").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "hello");
+    // 未签名多区间 Range：中间件剥离 → 整对象 200（既有语义不变）
+    let r = e
+        .http
+        .get(format!("{}/ap/anon-ap/k", e.base))
+        .header("range", "bytes=0-1,3-4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "hello");
+
+    // 锁/治理旁路头：匿名一律 403（签名路径不受影响）
+    let url = format!("{}/ap/anon-ap/k", e.base);
+    let r = e
+        .http
+        .get(url)
+        .header("x-amz-object-lock-mode", "COMPLIANCE")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // AP 策略无策略/具体 Principal/Deny → 匿名拒（Deny 优先、只认 "*"）
+    set_ap_policy(&e, "anon-ap", "anonb", uid, None).await;
+    assert_eq!(anon_get(&e, "/ap/anon-ap/k").await.status(), 403);
+    let owner_only = ap_policy("Allow", "s3:GetObject", get_arn);
+    let owner_only = owner_only.replace("\"*\"", &format!("\"{ak}\""));
+    set_ap_policy(&e, "anon-ap", "anonb", uid, Some(&owner_only)).await;
+    assert_eq!(anon_get(&e, "/ap/anon-ap/k").await.status(), 403);
+    let deny = ap_policy("Deny", "s3:GetObject", get_arn);
+    set_ap_policy(&e, "anon-ap", "anonb", uid, Some(&deny)).await;
+    assert_eq!(anon_get(&e, "/ap/anon-ap/k").await.status(), 403);
+
+    // 审计 uid=0（匿名哨兵）
+    assert!(
+        count(
+            &e,
+            "SELECT COUNT(*) FROM audit_log WHERE uid = 0 AND op = 'GetObject' AND decision = 'allow'"
+        )
+        .await
+            >= 1
+    );
+}
+
+/// 4.2：Range 计入 SignedHeaders 的多区间请求不再签名失配（403），
+/// 而是验签通过后由 s3s 返回确定性 400 InvalidArgument。
+#[tokio::test]
+async fn signed_multi_range_is_deterministic_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (uid, ak, sk) = user(&e, "owner", false).await;
+    bucket(&e, "rangeb", Some(uid)).await;
+    assert_eq!(
+        send_status(&e, Method::PUT, "/rangeb/k", &[], b"hello", &ak, &sk, "s3").await,
+        200
+    );
+
+    let r = signed(
+        &e,
+        Method::GET,
+        "/rangeb/k",
+        &[("range", "bytes=0-1,3-4")],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "签名多区间应是确定性 400，而非 403 签名失配"
+    );
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+
+    // 单区间签名行为不变
+    let r = signed(
+        &e,
+        Method::GET,
+        "/rangeb/k",
+        &[("range", "bytes=0-1")],
+        b"",
+        &ak,
+        &sk,
+        "s3",
+    )
+    .await;
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.text().await.unwrap(), "he");
 }
 
 /// SourceIp 条件：允许网段放行、NotIpAddress 拒；畸形 CIDR 保存即 400。
@@ -2457,9 +2691,10 @@ async fn ap_op_mismatch_guards_and_object_lock_actions() {
     let e = env(dir.path()).await;
     let (uid, ak, sk) = user(&e, "owner", false).await;
     bucket(&e, "guardb", Some(uid)).await;
-    direct_ap(&e, "guard-ap", "guardb", uid, None).await;
+    let allow_all = ap_allow_all("guardb");
+    direct_ap(&e, "guard-ap", "guardb", uid, Some(&allow_all)).await;
 
-    // 身份是桶主，AP 无策略：以下拒绝全部来自 H1 形状校验（而非授权）
+    // 身份是桶主，AP 全量放行：以下拒绝全部来自 H1 形状校验（而非授权）
     let xml = [("content-type", "application/xml")];
     let multipart = [("content-type", "multipart/form-data; boundary=x")];
     assert_eq!(

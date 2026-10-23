@@ -154,43 +154,108 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // 层在路由之后挂：同时包住 fallback（S3 面）。
     let app = app.layer(middleware::from_fn(restore_accepted));
     // M8：SourceIp 条件求值的连接对端（最外层，S3 fallback 也覆盖）。ecat 的 serve 不带
-    // connect_info，生产用可信反代注入 XFF；只有显式 `OSS_AP_TRUSTED_PROXY=1` 才信
-    // **最右**一跳（可信代理由此追加），且重复 XFF 头行一律拒绝。
+    // connect_info，生产用可信反代注入 XFF；只有显式 `OSS_AP_TRUSTED_PROXY=1` 才信。
+    // 默认单层反代（取最右一跳，向后兼容）；多层用 HOPS 或可信 CIDR 配置，解析失败启动失败。
     let trust_proxy = std::env::var("OSS_AP_TRUSTED_PROXY")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    let trust = if trust_proxy {
+        Some(Arc::new(ProxyTrust::from_env()?))
+    } else {
+        None
+    };
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
-        ap_peer(req, next, trust_proxy)
+        let trust = trust.clone();
+        async move { ap_peer(req, next, trust).await }
     }));
     Ok(app)
 }
 
+/// 可信反代配置（仅 `OSS_AP_TRUSTED_PROXY` 开启时解析）：
+/// - `OSS_AP_TRUSTED_PROXY_HOPS`（默认 1）：前置代理层数，取右起第 HOPS 项为客户端；
+///   单层反代 = 最右一跳（旧行为）。
+/// - `OSS_AP_TRUSTED_PROXY_CIDRS`：逗号分隔可信代理网段；配置后从右向左跳过可信代理，
+///   首个非可信项为客户端（此模式忽略 HOPS）。
+///
+/// 非法网段/0 跳 → 启动失败（配置错误不静默降级）。
+#[derive(Clone)]
+struct ProxyTrust {
+    hops: usize,
+    cidrs: Vec<xl_s3::ap::Cidr>,
+}
+
+impl ProxyTrust {
+    fn from_env() -> Result<Self, String> {
+        let hops = match std::env::var("OSS_AP_TRUSTED_PROXY_HOPS") {
+            Ok(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("OSS_AP_TRUSTED_PROXY_HOPS 非法: {}", v.escape_debug()))?,
+            _ => 1,
+        };
+        if hops == 0 {
+            return Err("OSS_AP_TRUSTED_PROXY_HOPS 必须 >= 1".into());
+        }
+        let cidrs = match std::env::var("OSS_AP_TRUSTED_PROXY_CIDRS") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .map(|raw| {
+                    let raw = raw.trim();
+                    xl_s3::ap::parse_cidr(raw)
+                        .ok_or_else(|| format!("OSS_AP_TRUSTED_PROXY_CIDRS 非法 CIDR: {raw}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Vec::new(),
+        };
+        Ok(Self { hops, cidrs })
+    }
+
+    fn client_ip(&self, headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+        forwarded_ip(headers, self.hops, &self.cidrs)
+    }
+}
+
 /// 连接对端 → `ApPeer` extension（缺失则由 AP 的 SourceIp 条件 fail-closed）。
-async fn ap_peer(mut req: Request, next: Next, trust_proxy: bool) -> Response {
+async fn ap_peer(mut req: Request, next: Next, trust: Option<Arc<ProxyTrust>>) -> Response {
     let ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_canonical())
-        .or_else(|| trust_proxy.then(|| forwarded_ip(req.headers())).flatten());
+        .or_else(|| trust.as_ref().and_then(|t| t.client_ip(req.headers())));
     if let Some(ip) = ip {
         req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
     }
     next.run(req).await
 }
 
-/// `X-Forwarded-For` **最右**一跳：左侧值客户端可伪造，只有最近的可信代理追加的那段
-/// 可信（前提：反代覆盖而非透传客户端自带 XFF）。重复头行来自不可信链路 → 拒绝。
-fn forwarded_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+/// 从 `X-Forwarded-For` 解析客户端地址。左侧值客户端可伪造；只有右侧由可信代理
+/// 追加/校验的部分可信。任意一项畸形或重复、跳数不足 → `None`（fail-closed）。
+fn forwarded_ip(
+    headers: &axum::http::HeaderMap,
+    hops: usize,
+    trusted: &[xl_s3::ap::Cidr],
+) -> Option<IpAddr> {
     let mut vals = headers.get_all("x-forwarded-for").iter();
     let raw = vals.next()?.to_str().ok()?;
     if vals.next().is_some() {
         return None;
     }
-    raw.rsplit(',')
-        .next()?
-        .trim()
-        .parse::<IpAddr>()
-        .ok()
-        .map(|ip| ip.to_canonical())
+    let mut ips: Vec<IpAddr> = Vec::new();
+    for part in raw.split(',') {
+        let ip = part.trim().parse::<IpAddr>().ok()?.to_canonical();
+        // 重复项通常意味着链路被注入/重放，无法可靠归属 → 拒绝
+        if ips.contains(&ip) {
+            return None;
+        }
+        ips.push(ip);
+    }
+    if trusted.is_empty() {
+        return ips.get(ips.len().checked_sub(hops)?).copied();
+    }
+    // CIDR 模式：从右向左跳过可信代理，首个非可信项即客户端；全为可信代理 → 拒绝。
+    ips.iter()
+        .rev()
+        .find(|ip| !trusted.iter().any(|c| c.contains(**ip)))
+        .copied()
 }
 
 async fn raft_status(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -223,7 +288,10 @@ async fn restore_accepted(req: Request, next: Next) -> Response {
 }
 
 /// 多区间 Range（`bytes=0-1,3-4`）在 s3s 0.17 解析层直接 400；冻结裁决不做
-/// multipart/byteranges —— S3 面剥离该头，GET/HEAD 降级整对象 200。单区间原样透传。
+/// multipart/byteranges —— 未签名的 S3 面剥离该头，GET/HEAD 降级整对象 200。
+/// **Range 已计入 SigV4 SignedHeaders 时不得剥离**：剥离会让验签失败（403
+/// SignatureDoesNotMatch）；保留则验签通过、反序列化按 s3s 语义返回确定性
+/// 400 InvalidArgument。单区间原样透传。
 async fn strip_multirange(mut req: Request, next: Next) -> Response {
     let multi = matches!(*req.method(), Method::GET | Method::HEAD)
         && req
@@ -231,10 +299,35 @@ async fn strip_multirange(mut req: Request, next: Next) -> Response {
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains(','));
-    if multi {
+    if multi && !range_is_signed(req.headers(), req.uri()) {
         req.headers_mut().remove(header::RANGE);
     }
     next.run(req).await
+}
+
+/// Range 是否出现在 SigV4 SignedHeaders（Authorization 头或预签名查询）。
+fn range_is_signed(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> bool {
+    let has_range = |list: &str| {
+        list.split(';')
+            .any(|h| h.trim().eq_ignore_ascii_case("range"))
+    };
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some((_, rest)) = auth.split_once("SignedHeaders=")
+        && has_range(rest.split(',').next().unwrap_or(""))
+    {
+        return true;
+    }
+    uri.query().is_some_and(|q| {
+        q.split('&').any(|kv| {
+            let Some((k, v)) = kv.split_once('=') else {
+                return false;
+            };
+            k.eq_ignore_ascii_case("X-Amz-SignedHeaders")
+                && has_range(&v.replace("%3B", ";").replace("%3b", ";"))
+        })
+    })
 }
 
 /// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
@@ -557,33 +650,80 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn forwarded_ip_takes_rightmost_hop_and_rejects_duplicates() {
+    fn forwarded_ip_hops_and_trusted_cidrs_fail_closed() {
         let mut h = axum::http::HeaderMap::new();
-        assert!(super::forwarded_ip(&h).is_none());
-        // 左侧可伪造，只有最右一跳（可信代理追加）参与判定
+        assert!(super::forwarded_ip(&h, 1, &[]).is_none());
+        // 默认单跳：左侧可伪造，只有最右一跳（可信代理追加）参与判定
         h.insert("x-forwarded-for", "203.0.113.5 , 10.0.0.1".parse().unwrap());
-        assert_eq!(super::forwarded_ip(&h), Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(
+            super::forwarded_ip(&h, 1, &[]),
+            Some("10.0.0.1".parse().unwrap())
+        );
         // 只取最后一个逗号段，且 IPv6/v4-mapped 归一
         h.insert(
             "x-forwarded-for",
             "192.0.2.9, ::ffff:10.2.3.4".parse().unwrap(),
         );
-        assert_eq!(super::forwarded_ip(&h), Some("10.2.3.4".parse().unwrap()));
+        assert_eq!(
+            super::forwarded_ip(&h, 1, &[]),
+            Some("10.2.3.4".parse().unwrap())
+        );
         h.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
         assert_eq!(
-            super::forwarded_ip(&h),
+            super::forwarded_ip(&h, 1, &[]),
             Some("2001:db8::1".parse().unwrap())
         );
-        // 尾部空段/垃圾 → 无法定对端（fail-closed）
+        // 任意段畸形 → 无法定对端（不再只看最右一跳）
         for bad in ["10.0.0.1,", "garbage", "10.0.0.1, garbage"] {
             h.insert("x-forwarded-for", bad.parse().unwrap());
-            assert!(super::forwarded_ip(&h).is_none(), "{bad}");
+            assert!(super::forwarded_ip(&h, 1, &[]).is_none(), "{bad}");
         }
-        // 重复头行：来源不可信 → 拒绝（不得任选其一）
+        // 重复项/重复头行：来源不可信 → 拒绝（不得任选其一）
+        h.insert("x-forwarded-for", "10.0.0.1, 10.0.0.1".parse().unwrap());
+        assert!(super::forwarded_ip(&h, 1, &[]).is_none());
         let mut h = axum::http::HeaderMap::new();
         h.append("x-forwarded-for", "10.0.0.1".parse().unwrap());
         h.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
-        assert!(super::forwarded_ip(&h).is_none());
+        assert!(super::forwarded_ip(&h, 1, &[]).is_none());
+
+        // 多层（H=2）：右起第 2 项 = 客户端；跳数不足 → 拒绝
+        h.insert(
+            "x-forwarded-for",
+            "192.0.2.9, garbage, 10.0.0.1".parse().unwrap(),
+        );
+        assert!(super::forwarded_ip(&h, 2, &[]).is_none(), "畸形段仍拒绝");
+        h.insert(
+            "x-forwarded-for",
+            "192.0.2.9, 203.0.113.5, 10.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            super::forwarded_ip(&h, 2, &[]),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        assert!(super::forwarded_ip(&h, 4, &[]).is_none(), "跳数不足");
+
+        // CIDR 模式：从右向左跳过可信代理，首个非可信 = 客户端
+        let cidrs = [
+            xl_s3::ap::parse_cidr("10.0.0.0/8").unwrap(),
+            xl_s3::ap::parse_cidr("2001:db8::/32").unwrap(),
+        ];
+        h.insert(
+            "x-forwarded-for",
+            "203.0.113.5, 10.0.0.1, 2001:db8::1".parse().unwrap(),
+        );
+        assert_eq!(
+            super::forwarded_ip(&h, 1, &cidrs),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        // 全为可信代理 → 无客户端可归属，拒绝
+        h.insert("x-forwarded-for", "10.0.0.1, 10.0.0.2".parse().unwrap());
+        assert!(super::forwarded_ip(&h, 1, &cidrs).is_none());
+        // 客户端不在可信网段：单条即客户端
+        h.insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        assert_eq!(
+            super::forwarded_ip(&h, 1, &cidrs),
+            Some("203.0.113.5".parse().unwrap())
+        );
     }
 
     /// RestoreObject 线上状态修复：仅 POST `?restore` 的 200 → 202 + `x-amz-restore`；
@@ -684,6 +824,48 @@ mod tests {
             "bytes=0-1,3-4",
             "非 GET/HEAD 不剥离"
         );
+
+        // 已签名的 Range：保留（剥离会 403 签名失配；保留后 s3s 返回确定性 400）
+        let auth_range = "AWS4-HMAC-SHA256 Credential=AKIA/20261023/us-east-1/s3/aws4_request, \
+                          SignedHeaders=host;range;x-amz-date, Signature=00";
+        let res = http
+            .get(format!("http://{addr}/b/k"))
+            .header(axum::http::header::AUTHORIZATION, auth_range)
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "bytes=0-1,3-4");
+        // 签名未含 Range → 仍剥离
+        let auth_no_range = "AWS4-HMAC-SHA256 Credential=AKIA/20261023/us-east-1/s3/aws4_request, \
+                             SignedHeaders=host;x-amz-date, Signature=00";
+        let res = http
+            .get(format!("http://{addr}/b/k"))
+            .header(axum::http::header::AUTHORIZATION, auth_no_range)
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "");
+        // 预签名 URL 的 X-Amz-SignedHeaders（%3B 编码）同样参与判定
+        let res = http
+            .get(format!(
+                "http://{addr}/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host%3Brange"
+            ))
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "bytes=0-1,3-4");
+        let res = http
+            .get(format!(
+                "http://{addr}/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host"
+            ))
+            .header(axum::http::header::RANGE, "bytes=0-1,3-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "");
     }
 
     /// 标签值转义：坏配置（node id 带引号/反斜杠/换行）不得产出坏样本行。

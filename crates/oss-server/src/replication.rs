@@ -541,6 +541,7 @@ async fn send_row(
                 true,
                 None, // M9：异步站点复制不再带 sync token
                 None,
+                info.part_sizes.as_deref(), // 4.1：段长表随副本，partNumber 可用
             )
             .await
             .map(|_| ());

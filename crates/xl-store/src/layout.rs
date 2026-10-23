@@ -14,7 +14,18 @@ pub const SYS_DIR: &str = ".oss.sys";
 
 const MAX_KEY_LEN: usize = 1024;
 
+/// 建桶/控制面配置入口的桶名校验：额外保留 AP 别名后缀（新建 `*-s3alias` 一律拒绝）。
 pub fn validate_bucket(name: &str) -> Result<()> {
+    validate_bucket_inner(name, false)
+}
+
+/// 数据面寻址（对象读写、桶存在性/删桶）：允许 M8 之前已存在的 `*-s3alias` 旧桶，
+/// 使其在无同名 AP 时仍可经普通桶路由访问。新建仍由 [`validate_bucket`] 拒绝。
+pub fn validate_bucket_data(name: &str) -> Result<()> {
+    validate_bucket_inner(name, true)
+}
+
+fn validate_bucket_inner(name: &str, allow_alias_suffix: bool) -> Result<()> {
     // 与控制台/aether 上传等非 URL 来源对齐：错误消息会进 S3 响应体，escape_debug
     // 让控制字符不破坏 XML（validate_key 同款）。
     let reject = || Err(Error::InvalidBucketName(name.escape_debug().to_string()));
@@ -38,9 +49,9 @@ pub fn validate_bucket(name: &str) -> Result<()> {
     if looks_like_ipv4 {
         return reject();
     }
-    // 保留 AP 别名后缀（M8）：`/<name>-s3alias/<key>` 优先当别名解析，撞后缀的桶名
-    // 永远不会被路径式寻址到。选择收口于此（所有建桶路径共用），而非只挡 S3 面。
-    let ok_no_alias = !name.ends_with("-s3alias");
+    // 保留 AP 别名后缀（M8）：新建时收口于所有建桶路径；数据面放行旧桶
+    // （路由层仅在 AP 不存在时回落桶路由，L4）。
+    let ok_no_alias = allow_alias_suffix || !name.ends_with("-s3alias");
     if ok_len && ok_chars && ok_edges && ok_no_dotdot && ok_no_xn && ok_no_alias {
         Ok(())
     } else {
@@ -99,7 +110,7 @@ pub fn bucket_dir(root: &Path, bucket: &str) -> PathBuf {
 
 /// 所有对象读写路径都汇合到这里，桶名校验在此收口；S3 入口虽由 s3s 的默认 AwsNameValidation 先拦，但控制台/aether 上传直达内核，不能依赖上游。
 pub fn object_dir(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
-    validate_bucket(bucket)?;
+    validate_bucket_data(bucket)?;
     validate_key(key)?;
     Ok(bucket_dir(root, bucket).join(object_dir_name(key)?))
 }
@@ -195,6 +206,12 @@ mod tests {
         // AP 别名后缀保留（M8）：只拦结尾，其余位置照常
         assert!(validate_bucket("foo-s3alias").is_err());
         assert!(validate_bucket("foo-s3alias-x").is_ok());
+        // L4：数据面放行旧后缀桶（新建仍拒），其余规则不放松
+        assert!(validate_bucket_data("foo-s3alias").is_ok());
+        assert!(validate_bucket_data("foo-s3alias-x").is_ok());
+        for bad in ["ab", "My-Bucket", "a..b", "a_b", ""] {
+            assert!(validate_bucket_data(bad).is_err(), "{bad} 数据面也应拒");
+        }
     }
 
     #[test]

@@ -143,13 +143,15 @@ impl ApIpCondition {
     }
 }
 
-struct Cidr {
+/// 已解析 CIDR（router 的可信代理解析复用同一口径）。
+#[derive(Debug, Clone, Copy)]
+pub struct Cidr {
     net: IpAddr,
     /// 已按 `net` 家族归一（v4-mapped 会变 v4，故上限按归一后的家族算）。
     prefix: u8,
 }
 
-fn parse_cidr(raw: &str) -> Option<Cidr> {
+pub fn parse_cidr(raw: &str) -> Option<Cidr> {
     let raw = raw.trim();
     let (addr, prefix) = match raw.split_once('/') {
         Some((a, p)) => (a, Some(p)),
@@ -168,7 +170,7 @@ fn parse_cidr(raw: &str) -> Option<Cidr> {
 }
 
 impl Cidr {
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.net, ip.to_canonical()) {
             (IpAddr::V4(n), IpAddr::V4(i)) => prefix_eq(&n.octets(), &i.octets(), self.prefix),
             (IpAddr::V6(n), IpAddr::V6(i)) => prefix_eq(&n.octets(), &i.octets(), self.prefix),
@@ -212,7 +214,7 @@ impl ApPolicy {
         let mut allowed = false;
         let mut any = false;
         for st in &self.statement {
-            if !principal_matches(&st.principal, req.ak, req.uid)
+            if !principal_matches(&st.principal, req.ak, req.uid, req.anonymous)
                 || !st.action.iter().any(|p| glob_match(p, action))
                 || !st
                     .resource
@@ -240,11 +242,12 @@ impl ApPolicy {
     }
 }
 
-fn principal_matches(p: &ApPrincipal, ak: &str, uid: i64) -> bool {
+fn principal_matches(p: &ApPrincipal, ak: &str, uid: i64, anonymous: bool) -> bool {
     p.aws.iter().any(|v| {
         v == "*"
-            || v == ak
-            || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(uid)
+            || (!anonymous
+                && (v == ak
+                    || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(uid)))
     })
 }
 
@@ -252,6 +255,8 @@ fn principal_matches(p: &ApPrincipal, ak: &str, uid: i64) -> bool {
 pub struct ApEvalRequest<'a> {
     pub ak: &'a str,
     pub uid: i64,
+    /// 匿名请求只匹配 `Principal: "*"`（空 AK / `uid:0` 不得匹配）。
+    pub anonymous: bool,
     /// AP 对象/桶 ARN 与标准 ARN（两者都参与匹配）
     pub resources: Vec<String>,
     /// 连接对端（无则带 `SourceIp` 条件的语句一律不匹配，fail-closed）。
@@ -335,7 +340,8 @@ impl AccessPoint {
 }
 
 /// AP 策略对单请求的额外限制（与身份/桶策略取交集）：
-/// `None` = 无策略（不额外限制）；`Some(true)` = 放行；`Some(false)` = 拒（含无匹配）。
+/// 无策略 = **默认拒绝**（AWS 语义，L3）；`Some(true)` = 放行；`Some(false)` = 拒。
+/// `None` 仅由调用方对 DeleteObjects 保留——键在请求体里，逐键判定在 service 层。
 pub fn ap_decision(
     ap: &AccessPoint,
     user: &crate::access::AuthedUser,
@@ -343,12 +349,40 @@ pub fn ap_decision(
     key: Option<&str>,
     source_ip: Option<IpAddr>,
 ) -> Option<bool> {
-    let policy = ap.policy.as_ref()?;
-    let action = if crate::access::is_copy(op) {
-        crate::policy::s3_action("PutObject")
+    ap_decision_inner(ap, &user.ak, user.uid, false, op, key, source_ip)
+}
+
+/// 匿名 AP 判定：只认 `Principal: "*"`（空 AK / `uid:0` 绝不匹配），其余同
+/// [`ap_decision`]（Deny 优先、无策略默认拒绝、条件不可求值 fail-closed）。
+pub fn ap_decision_anonymous(
+    ap: &AccessPoint,
+    op: &str,
+    key: Option<&str>,
+    source_ip: Option<IpAddr>,
+) -> Option<bool> {
+    ap_decision_inner(ap, "", 0, true, op, key, source_ip)
+}
+
+fn ap_decision_inner(
+    ap: &AccessPoint,
+    ak: &str,
+    uid: i64,
+    anonymous: bool,
+    op: &str,
+    key: Option<&str>,
+    source_ip: Option<IpAddr>,
+) -> Option<bool> {
+    let Some(policy) = ap.policy.as_ref() else {
+        return Some(false);
+    };
+    // 有策略但动作不在方言词表 → 无法表达授权，fail-closed。
+    let Some(action) = crate::policy::s3_action(if crate::access::is_copy(op) {
+        "PutObject"
     } else {
-        crate::policy::s3_action(op)
-    }?;
+        op
+    }) else {
+        return Some(false);
+    };
     let ctx = ap.context();
     // 与 policy.rs 同口径：对象动作只匹配对象 ARN，桶动作只匹配桶 ARN。
     let resources = match key {
@@ -356,8 +390,9 @@ pub fn ap_decision(
         None => vec![format!("arn:aws:s3:::{}", ap.bucket), ctx.bucket_arn()],
     };
     let req = ApEvalRequest {
-        ak: &user.ak,
-        uid: user.uid,
+        ak,
+        uid,
+        anonymous,
         resources,
         source_ip,
     };
@@ -955,11 +990,16 @@ impl s3s::route::S3Route for ApRoute {
         headers: &http::HeaderMap,
         extensions: &mut http::Extensions,
     ) -> bool {
-        // 别名先于 fallback：未知别名必须 404，绝不能掉进桶路由（桶名已保留该后缀）。
-        if uri.path().starts_with("/ap/")
-            || host_alias(uri, headers).is_some()
-            || path_alias(uri).is_some()
-        {
+        // `/ap/` 前缀恒认领（未知 AP 404，绝不回落桶路由）。
+        // 别名仅在同名 AP 存在时认领：否则旧 `*-s3alias` 桶可继续走普通桶路由（L4）。
+        // 同名 AP 与旧桶并存时 AP 优先（后缀在建桶路径上已保留）。
+        let ap_path = uri.path().starts_with("/ap/");
+        let alias = !ap_path
+            && host_alias(uri, headers)
+                .or_else(|| path_alias(uri))
+                .and_then(|a| strip_alias(&a).ok())
+                .is_some_and(|name| self.cache.get(&name).is_some());
+        if ap_path || alias {
             extensions.insert(ApMatch(true));
             return true;
         }
@@ -979,19 +1019,22 @@ impl s3s::route::S3Route for ApRoute {
                 None => Err(s3s::s3_error!(NotImplemented)),
             };
         }
-        let Some(cred) = req.credentials.as_ref() else {
-            return Err(s3s::s3_error!(AccessDenied, "Authentication required"));
+        // 无凭据 = 匿名 AP 请求（3.1）：AP 策略 Principal "*" + 数据面白名单，
+        // 且仍须通过桶策略匿名基线（AP 绝不放松既有授权）。
+        let user = match req.credentials.as_ref() {
+            Some(cred) => Some(
+                self.acl
+                    .user_of_key(&cred.access_key)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "AP 鉴权查询失败");
+                        s3s::s3_error!(InternalError, "internal error")
+                    })?
+                    .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?,
+            ),
+            None => None,
         };
-        let ak = cred.access_key.clone();
-        let user = self
-            .acl
-            .user_of_key(&ak)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "AP 鉴权查询失败");
-                s3s::s3_error!(InternalError, "internal error")
-            })?
-            .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
+        let uid = user.as_ref().map_or(0, |u| u.uid);
         let (name, raw_suffix) = parse_ap_target(&req.uri, &req.headers)?;
         let ap = self.load_ap(&name).await?;
         let peer = req.extensions.get::<ApPeer>().map(|p| p.0);
@@ -1005,7 +1048,7 @@ impl s3s::route::S3Route for ApRoute {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(is_multipart_form_data)
         {
-            tracing::warn!(uid = user.uid, ap = %name, "AP 拒绝 multipart/form-data POST");
+            tracing::warn!(uid, ap = %name, "AP 拒绝 multipart/form-data POST");
             return Err(s3s::s3_error!(
                 InvalidRequest,
                 "multipart/form-data POST is not supported through access points"
@@ -1025,28 +1068,44 @@ impl s3s::route::S3Route for ApRoute {
         if let Some(declared) = query_value_once(query, "x-id")?
             && declared != op
         {
-            tracing::warn!(uid = user.uid, op, declared, ap = %name, "AP x-id 与推导 op 不一致——拒绝");
+            tracing::warn!(uid, op, declared, ap = %name, "AP x-id 与推导 op 不一致——拒绝");
             return Err(s3s::s3_error!(
                 InvalidRequest,
                 "x-id does not match the request"
             ));
         }
-        let (base_allow, base_detail) = self
-            .acl
-            .check_op(
-                &user,
-                &ak,
-                op,
-                Some(&ap.bucket),
-                key,
-                copy_src.as_ref().map(|(b, k)| (b.as_str(), k.as_str())),
-            )
-            .await?;
+        let (base_allow, base_detail) = match &user {
+            Some(u) => {
+                self.acl
+                    .check_op(
+                        u,
+                        &u.ak,
+                        op,
+                        Some(&ap.bucket),
+                        key,
+                        copy_src.as_ref().map(|(b, k)| (b.as_str(), k.as_str())),
+                    )
+                    .await?
+            }
+            // L1：匿名锁/治理旁路头一律拒（匿名策略无可表达的对应动作）。
+            None => match crate::access::anonymous_lock_header(&req.headers) {
+                Some(h) => (false, Some(format!("anonymous:object-lock-header:{h}"))),
+                None => {
+                    self.acl
+                        .anonymous_decision(op, Some(&ap.bucket), key)
+                        .await?
+                }
+            },
+        };
         // DeleteObjects 的键在请求体里：整体判定必然失真，逐键交集在 service 里做。
+        // 无策略 = 默认拒绝（4.4），DeleteObjects 也不例外。
         let ap_policy = if op == "DeleteObjects" {
-            None
+            ap.policy.is_none().then_some(false)
         } else {
-            ap_decision(&ap, &user, op, key, peer)
+            match &user {
+                Some(u) => ap_decision(&ap, u, op, key, peer),
+                None => ap_decision_anonymous(&ap, op, key, peer),
+            }
         };
         let allow = base_allow && ap_policy != Some(false);
         let mut parts: Vec<String> = Vec::new();
@@ -1059,22 +1118,31 @@ impl s3s::route::S3Route for ApRoute {
             parts.push("ap:per-key".to_string());
         }
         let detail = (!parts.is_empty()).then(|| parts.join(";"));
-        if let Err(e) = self
-            .acl
-            .write_audit(
-                user.uid,
-                op,
-                Some(&ap.bucket),
-                key,
-                if allow { "allow" } else { "deny" },
-                detail.as_deref(),
-            )
-            .await
-        {
+        let audited = if let Some(u) = &user {
+            self.acl
+                .write_audit(
+                    u.uid,
+                    op,
+                    Some(&ap.bucket),
+                    key,
+                    if allow { "allow" } else { "deny" },
+                    detail.as_deref(),
+                )
+                .await
+        } else if allow {
+            self.acl
+                .write_audit(0, op, Some(&ap.bucket), key, "allow", detail.as_deref())
+                .await
+        } else {
+            self.acl
+                .write_anonymous_deny_audit(op, Some(&ap.bucket), key, detail.as_deref())
+                .await
+        };
+        if let Err(e) = audited {
             tracing::warn!(error = %e, "AP 审计落行失败");
         }
         if !allow {
-            tracing::warn!(uid = user.uid, op, ap = %name, "AP 授权拒绝");
+            tracing::warn!(uid, op, ap = %name, "AP 授权拒绝");
             return Err(s3s::s3_error!(AccessDenied, "access denied"));
         }
         if op == "DeleteObjects" {
@@ -1084,7 +1152,14 @@ impl s3s::route::S3Route for ApRoute {
                 source_ip: peer,
             });
         }
-        req.extensions.insert(user);
+        match user {
+            Some(u) => {
+                req.extensions.insert(u);
+            }
+            None => {
+                req.extensions.insert(crate::access::AnonymousAccess);
+            }
+        }
         req.extensions.insert(ApInvocation {
             ap_name: name,
             bucket: ap.bucket,
@@ -1369,6 +1444,7 @@ mod tests {
         let req = |key: &str| ApEvalRequest {
             ak: "AKIA_X",
             uid: 7,
+            anonymous: false,
             resources: vec![format!("arn:aws:s3:::bkt/{key}")],
             source_ip: None,
         };
@@ -1393,6 +1469,7 @@ mod tests {
                 &ApEvalRequest {
                     ak: "AKIA_X",
                     uid: 7,
+                    anonymous: false,
                     resources: vec![format!("arn:aws:s3:::bkt/{key}")],
                     source_ip: ip.parse().ok(),
                 },
@@ -1973,11 +2050,41 @@ mod tests {
             ap_decision(&ap, &u, "PutObject", Some("open"), None),
             Some(false)
         );
+        // L3：无策略 = 默认拒绝（AWS 语义）
         let no_policy = AccessPoint { policy: None, ..ap };
         assert_eq!(
             ap_decision(&no_policy, &u, "PutObject", Some("open"), None),
-            None
+            Some(false)
         );
+    }
+
+    #[test]
+    fn anonymous_ap_decision_only_matches_wildcard_principal() {
+        let mk = |principal: &str| AccessPoint {
+            name: "ap1".into(),
+            bucket: "bkt".into(),
+            owner_id: 7,
+            policy: Some(
+                parse(&format!(
+                    r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},
+                       "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}}]}}"#
+                ))
+                .unwrap(),
+            ),
+            region: "us-east-1".into(),
+        };
+        assert_eq!(
+            ap_decision_anonymous(&mk("*"), "GetObject", Some("open"), None),
+            Some(true)
+        );
+        // 空 AK / uid:0 是匿名哨兵，不能被具体 Principal 放行
+        for p in ["", "uid:0", "AKIA_X"] {
+            assert_eq!(
+                ap_decision_anonymous(&mk(p), "GetObject", Some("open"), None),
+                Some(false),
+                "principal {p:?} 不得匹配匿名请求"
+            );
+        }
     }
 
     #[test]

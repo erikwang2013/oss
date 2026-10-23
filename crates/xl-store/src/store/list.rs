@@ -302,6 +302,7 @@ fn merge_page(
                         storage_class: None,
                         tier_phase: None,
                         restore_expires_at: None,
+                        part_sizes: None,
                     },
                 };
                 result.objects.push(info);

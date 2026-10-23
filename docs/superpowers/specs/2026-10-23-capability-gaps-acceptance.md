@@ -53,7 +53,8 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 
 ## 2. 明确不做的边界（非目标，fail-closed/记档）
 
-- AP 匿名、跨账号、VPC 端点、AP 桶级 Create/Delete/ListBuckets、AP 缓存一致性。
+- AP 跨账号、VPC 端点、AP 桶级 Create/Delete/ListBuckets、AP 缓存一致性
+  （AP 匿名已于后续批次支持，见 §8）。
 - Inventory 增量/跨账号；Batch 抢占/跨账号/每动作桶通知。
 - Lifecycle `AbortIncompleteMultipartUpload`（需 MPU 索引，继续 501）。
 - Tier 流式搬运（全内存）。
@@ -86,18 +87,20 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 - **M1 匿名审计放大**：匿名 deny 审计走进程级令牌桶（20 burst / 5 每秒），allow 不抽样。
 - **L1 匿名锁头**：匿名请求携带对象锁/保留期/bypass 头一律 403。
 - **L2 AP 资源轴**：对象动作只匹配对象 ARN，桶 ARN 只参与桶级动作（破坏性变更已在 README 记档）。
-- **L3/L4**：AP 无策略不额外限制、旧 `*-s3alias` 桶被遮蔽，均记档。
+- **L3/L4**：AP 无策略不额外限制、旧 `*-s3alias` 桶被遮蔽，当时记档；
+  均已在后续批次修复（无策略 → 拒绝；无 AP 别名回落桶路由），见 §8。
 
 ## 5. 已知限制 / 后续项
 
-1. `part_sizes` 只在 MPU complete 落盘；复制/tier 摄入路径未携带，复制对象的 `partNumber`
-   退化为旧语义（part 1 整对象，>1 416）。建议下一批在复制/摄入 meta 中透传。
-2. 签 Range 的 SigV4 客户端（Range 计入 SignedHeaders）多区间请求会 403
-   `SignatureDoesNotMatch`；预签名 URL 不受影响（中间件在验签前剥离）。
-3. AP `X-Forwarded-For` 仅单层反代成立；多层反代需在最近一跳覆盖。
-4. 滚动升级 e2e 脚本已提供但未实跑（缺 v1.13.1 旧二进制）；level-2 产品命令为
+1. ~~`part_sizes` 只在 MPU complete 落盘；复制/tier 摄入路径未携带~~ —— **已在 post-1.14 硬化修复**：
+   站点复制/raft 重推透传，tier 归档/恢复保留。
+2. ~~签 Range 的 SigV4 客户端多区间请求会 403~~ —— **已修复**：改为确定性 400
+   `InvalidArgument`；未签 Range 的请求仍 200 整对象。
+3. ~~AP `X-Forwarded-For` 仅单层反代成立~~ —— **已修复**：支持 hops/CIDR 信任链，
+   非法/重复 XFF fail-closed。
+4. 滚动升级 e2e 已实跑（65 PASS / 0 FAIL / 4 预期 SKIP）；level-2 产品命令为
    `BucketSetLifecycleV2`（结构化生命周期），写入门控/激活由 `tests/raft_commands.rs`
-   与 store 单元测试覆盖。
+   与 store 单元测试覆盖；v1.14.0 的 V2 级别误判已由 post-1.14 热修复修正。
 5. Web `tsc`/`vite` 未运行（worktree 无 `node_modules`）；前端改动为增量、类型一致。
 6. 生命周期破坏性 sweep 的进程内测试覆盖，但未跑独立长时 e2e；AbortIncompleteMultipartUpload 仍 501。
 
@@ -121,3 +124,22 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 提交、测试、文档与站点已纳入 `main`，并发布 **v1.14.0**（tag 与 GitHub Release）。
 注意：GitHub 仓库当前为 private，站点上的 GitHub/Release/源码包链接对未授权访客不可用；
 公开仓库需单独决定。站点静态文件已纳入版本控制，但尚未部署到 `oss.erik.xyz`。
+
+## 8. 2026-10-23 后续修复（v1.14.1 候选）
+
+- **4.1 part_sizes**：站点复制、raft 同 id 重推与 sync 写门新增内部签名头 `x-oss-part-sizes`；
+  摄入端仅 REPLICA 接受，store 信任边界校验（≤10000 段、总和 == 实际 size）后落
+  `Version.part_sizes`；tier 归档/恢复原地保留。异构远端复制/非 MPU 单段 PUT 仍为旧语义。
+- **4.2 签名多区间 Range**：中间件按 `Authorization` SignedHeaders /
+  `X-Amz-SignedHeaders` 识别；Range 签入则保留至验签后由 s3s 返回确定性 400
+  `InvalidArgument`；未签入仍剥离 → 200 整对象。
+- **4.3 AP SourceIp 信任链**：`OSS_AP_TRUSTED_PROXY_HOPS`（默认 1，向后兼容）或
+  `OSS_AP_TRUSTED_PROXY_CIDRS`；重复/格式非法 XFF fail-closed；非法配置启动失败。
+- **4.4 AP 无策略默认拒绝**（破坏性，AWS 对齐）；DeleteObjects 同口径。
+- **4.5 无 AP 的 `*-s3alias` 回落普通桶路由**；与 AP 别名冲突时 AP 优先（AP 缓存未命中
+  时回落，可用性取舍）。
+- **4.6 匿名审计**：`OSS_ANON_DENY_AUDIT_{BURST,PER_SEC,DEDUPE_SECS}` 可配置并钳制；
+  `OSS_AUDIT_RETENTION_DAYS` 钳 0..=36500，清理按批 10000。
+- **3.1 AP 匿名**：无凭据请求经 AP 需 AP 策略 `Principal:"*"` 与桶策略匿名基线同时放行
+  （交集，AP 不放宽桶策略）；仅数据面白名单，控制面/桶级/锁头拒绝，审计 uid=0。
+  此条为安全敏感变更，须单独复审。

@@ -598,6 +598,7 @@ impl Store {
                 tags: mpu.tags.as_deref(),
                 storage_class: mpu.storage_class.as_deref(),
                 checksum: None, // multipart 组合校验和留 M2b
+                part_sizes: Some(part_sizes.as_slice()),
             };
             match self.gate_commit(req).await {
                 Ok(t) => Some(t),
@@ -635,7 +636,7 @@ impl Store {
                 sha256,
             },
             parts: None, // 裁决：新写入不再使用 parts（降为 M2a 旧对象只读兼容位）
-            part_sizes: Some(part_sizes),
+            part_sizes: Some(part_sizes.clone()),
             checksum: None, // multipart 组合校验和留 M2b
             data_layout,
             inline,
@@ -780,6 +781,7 @@ impl Store {
             storage_class: mpu.storage_class.clone(),
             tier_phase: None,
             restore_expires_at: None,
+            part_sizes: Some(part_sizes),
         })
     }
 

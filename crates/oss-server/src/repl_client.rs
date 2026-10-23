@@ -406,6 +406,7 @@ impl ReplClient {
             false,
             None,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -432,6 +433,7 @@ impl ReplClient {
         require_version: bool,
         site_token: Option<&str>,
         origin_version_id: Option<&str>,
+        part_sizes: Option<&[u64]>,
     ) -> Result<Option<String>, ReplError> {
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(ct) = content_type {
@@ -442,6 +444,15 @@ impl ReplClient {
         }
         if let Some(v) = origin_version_id {
             headers.push(("x-oss-origin-version-id".into(), v.to_string()));
+        }
+        // 4.1：MPU 段长表随对象到目标端，partNumber 在副本上仍可定位
+        if let Some(sizes) = part_sizes.filter(|s| !s.is_empty()) {
+            let v = sizes
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            headers.push(("x-oss-part-sizes".into(), v));
         }
         if let Some(tags) = tags.filter(|t| !t.is_empty()) {
             let q = tags

@@ -827,6 +827,19 @@ impl Store {
             }
         };
 
+        // 4.1：复制/修复摄入带 MPU 段长表——信任边界，与 meta 解码同口径校验。
+        if let Some(sizes) = &ext.part_sizes {
+            let sum = sizes.iter().try_fold(0u64, |a, &s| a.checked_add(s));
+            if sizes.is_empty() || sizes.len() > 10_000 || sum != Some(size) {
+                self.discard_staged(bucket, key, &stage_uuid, &tmp, &obj_dir, multi)
+                    .await;
+                return Err(Error::InvalidArgument(format!(
+                    "part_sizes 非法：{} 段，总和 {sum:?} ≠ size {size}",
+                    sizes.len()
+                )));
+            }
+        }
+
         // 双站同 id 重投：已存在且字节一致 → 幂等成功（不再远端调用）；不一致 → 400。
         if let Some(id) = forced_version_id
             && let Some(v) = replay
@@ -862,6 +875,7 @@ impl Store {
                 tags: tags.as_deref(),
                 storage_class: storage_class.as_deref(),
                 checksum: checksum.as_ref(),
+                part_sizes: ext.part_sizes.as_deref(),
             };
             match self.gate_commit(req).await {
                 Ok(t) => Some(t),
@@ -903,7 +917,7 @@ impl Store {
             },
             // 单段 PUT 的 parts 恒 None（多段只出现在 M2a 旧对象的只读兼容位）
             parts: None,
-            part_sizes: None,
+            part_sizes: ext.part_sizes.clone(),
             checksum: checksum.clone(),
             data_layout,
             inline,
@@ -1065,6 +1079,7 @@ impl Store {
             storage_class,
             tier_phase: None,
             restore_expires_at: None,
+            part_sizes: ext.part_sizes,
         })
     }
 

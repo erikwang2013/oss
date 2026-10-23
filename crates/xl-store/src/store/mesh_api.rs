@@ -288,7 +288,7 @@ impl Store {
 
     /// 服务端删桶目录（空检查 + 幂等删除）：任一本地盘上非空 → Err(BucketNotEmpty)。
     pub async fn mesh_delete_bucket(&self, bucket: &str) -> Result<()> {
-        layout::validate_bucket(bucket)?;
+        layout::validate_bucket_data(bucket)?;
         for drive in &self.cfg.drives {
             let dir = layout::bucket_dir(drive, bucket);
             let mut entries = match tokio::fs::read_dir(&dir).await {

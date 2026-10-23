@@ -318,6 +318,61 @@ async fn archive_restore_state_machine() {
     assert_eq!(v.tier.unwrap().phase, TierPhase::Archived);
 }
 
+#[tokio::test]
+async fn archive_restore_preserves_part_sizes() {
+    // 4.1：归档清数据布局但保留段长表；restore 后 partNumber 仍可定位。
+    let (s, _d) = store().await;
+    let data = b"aaabbbbccccc";
+    let info = s
+        .put_object_stream_with_meta_ext(
+            "alpha",
+            "mp",
+            stream_of(data),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            None,
+            None,
+            None,
+            None,
+            PutExt {
+                part_sizes: Some(vec![3, 4, 5]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let vid = info.version_id.clone().unwrap();
+    let spec = ArchiveSpec {
+        backend: "s3".into(),
+        key: "cold/alpha/mp".into(),
+        size: data.len() as u64,
+        source_etag: info.etag.clone(),
+        etag: "remote-etag".into(),
+        sha256: hex::encode(crate::mesh::content_hash(data)),
+        class: "GLACIER".into(),
+    };
+    s.archive_version("alpha", "mp", &vid, spec, 100)
+        .await
+        .unwrap();
+    let v = s.tier_version("alpha", "mp", &vid).await.unwrap().unwrap();
+    assert_eq!(v.part_sizes.as_deref(), Some(&[3, 4, 5][..]));
+
+    s.mark_restore_pending("alpha", "mp", &vid).await.unwrap();
+    s.restore_prepare("alpha", "mp", &vid, data).await.unwrap();
+    s.restore_commit("alpha", "mp", &vid, now_secs() + 1000)
+        .await
+        .unwrap();
+    let (_, got) = s.get_object("alpha", "mp").await.unwrap();
+    assert_eq!(&got[..], data);
+    let v = s.tier_version("alpha", "mp", &vid).await.unwrap().unwrap();
+    assert_eq!(v.part_sizes.as_deref(), Some(&[3, 4, 5][..]));
+    let (span, parts) = v.part_span(2).unwrap();
+    assert_eq!(span, 3..7);
+    assert_eq!(parts, 3);
+}
+
 fn version_dir(s: &Store, key: &str, uuid: &str) -> std::path::PathBuf {
     crate::layout::object_dir(s.cfg.root(), "alpha", key)
         .unwrap()

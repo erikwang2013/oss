@@ -3986,6 +3986,62 @@ async fn replication_status_headers_and_replica_ingest() {
     );
 }
 
+#[tokio::test]
+async fn replica_ingest_carries_part_sizes() {
+    // 4.1：复制目标端凭 x-oss-part-sizes 恢复 partNumber 偏移表。
+    let (s3, _store, _d) = service_enc().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "repbucket".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let put = |key: &str, sizes: &str| {
+        let mut r = req(PutObjectInput {
+            bucket: "repbucket".into(),
+            key: key.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(
+                b"aaabbbbccccc",
+            ))),
+            ..Default::default()
+        });
+        r.headers
+            .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+        r.headers.insert("x-oss-part-sizes", sizes.parse().unwrap());
+        s3.put_object(r)
+    };
+    put("copy", "3,4,5").await.unwrap();
+
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "repbucket".into(),
+            key: "copy".into(),
+            part_number: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(got.status, Some(http::StatusCode::PARTIAL_CONTENT));
+    assert_eq!(got.output.content_range.as_deref(), Some("bytes 3-6/12"));
+    assert_eq!(got.output.parts_count, Some(3));
+    let mut body = got.output.body.unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(buf, b"bbbb");
+
+    // 信任边界：总和 != 实际大小 / 非数字 → 400，且不落对象
+    for (key, sizes) in [("bad-sum", "3,4,6"), ("bad-num", "3,x,5")] {
+        let err = put(key, sizes).await.unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    }
+    assert!(matches!(
+        _store.head_object("repbucket", "bad-sum").await,
+        Err(xl_store::error::Error::NoSuchKey(_))
+    ));
+}
+
 // ---- M8 前置：对象标签（切片 1） ----
 
 async fn versioned(s3: &OssS3, bucket: &str) {

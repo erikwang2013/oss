@@ -154,6 +154,8 @@ pub struct ObjectInfo {
     pub tier_phase: Option<meta::TierPhase>,
     /// M8 S4a：Restore 到期时刻（unix 秒；None = 未恢复/永久）。
     pub restore_expires_at: Option<i64>,
+    /// 4.1：MPU 段长表（复制/修复透传用；None = 无表/旧对象）。
+    pub part_sizes: Option<Vec<u64>>,
 }
 
 /// M9：写入口可选扩展（既有 11 参签名保持为兼容壳，~50 处调用点不动）。
@@ -163,6 +165,9 @@ pub struct PutExt {
     pub replica: bool,
     /// 双站同 id 摄入：origin UUID 字符串（S3 头原样；store 校验并强制为版本目录/version_id）。
     pub forced_version_id: Option<String>,
+    /// 4.1：REPLICA 摄入的 MPU 段长表（目标端 partNumber 偏移表）。store 校验
+    /// 段数 ≤10000 且总和 == 实际写入大小后落 `Version.part_sizes`。
+    pub part_sizes: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -624,7 +629,7 @@ impl Store {
 
     /// 桶是否为空（各在册盘均无对象目录项；桶不存在视为空）。删桶前置。
     pub async fn bucket_is_empty(&self, bucket: &str) -> Result<bool> {
-        layout::validate_bucket(bucket)?;
+        layout::validate_bucket_data(bucket)?;
         for drive in &self.cfg.drives {
             let dir = layout::bucket_dir(drive, bucket);
             let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -733,7 +738,7 @@ impl Store {
     /// 不过滤 `..`/绝对路径就会让删桶、列举跑到盘根之外。
     /// 多盘（M2b-2）：任一在册盘上有桶目录即视为存在（drive0 掉线不误报 NoSuchBucket）。
     async fn ensure_bucket(&self, bucket: &str) -> Result<()> {
-        layout::validate_bucket(bucket)?;
+        layout::validate_bucket_data(bucket)?;
         for drive in &self.cfg.drives {
             if tokio::fs::try_exists(layout::bucket_dir(drive, bucket)).await? {
                 return Ok(());
@@ -792,7 +797,7 @@ impl Store {
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
-        layout::validate_bucket(bucket)?;
+        layout::validate_bucket_data(bucket)?;
         for drive in &self.cfg.drives {
             if tokio::fs::try_exists(layout::bucket_dir(drive, bucket)).await? {
                 return Ok(true);
@@ -863,7 +868,7 @@ impl Store {
     /// 残留 tombstone 由下次删除/重试清掉。桶已不存在 = 幂等成功（不重建目录）。
     /// 仅 sync 流程使用；M7 async 保持 [`Self::delete_bucket`] 语义。
     pub async fn delete_bucket_sync(&self, bucket: &str) -> Result<()> {
-        layout::validate_bucket(bucket)?;
+        layout::validate_bucket_data(bucket)?;
         let _bguard = self.lock_bucket_owned(bucket).await;
         if !self.bucket_exists(bucket).await? {
             return Ok(());
@@ -924,7 +929,7 @@ impl Store {
     pub async fn reconcile_bucket_dirs(&self, rows: &[String]) {
         let known: HashSet<&str> = rows.iter().map(String::as_str).collect();
         for bucket in rows {
-            if let Err(e) = layout::validate_bucket(bucket) {
+            if let Err(e) = layout::validate_bucket_data(bucket) {
                 tracing::warn!(bucket = %bucket, error = %e, "启动对账：桶名非法，跳过");
                 continue;
             }

@@ -97,9 +97,15 @@ pub struct Acl {
 }
 
 /// 匿名拒绝审计的令牌桶：未认证请求可无限灌入，拒绝审计不能线性写 SQLite。
-/// 匿名 **允许** 仍全量审计（审计价值最高）；拒绝最多突发 [`ANON_DENY_BURST`] 条、
+/// 匿名 **允许** 仍全量审计（审计价值最高）；拒绝默认最多突发 [`ANON_DENY_BURST`] 条、
 /// 每秒补 [`ANON_DENY_PER_SEC`] 条，丢弃计数每 1000 条告警一次。
+/// 三个旋钮（均进程级、有界）：`OSS_ANON_DENY_AUDIT_BURST`（1..=10000）、
+/// `OSS_ANON_DENY_AUDIT_PER_SEC`（0..=10000）、`OSS_ANON_DENY_AUDIT_DEDUPE_SECS`
+/// （0 = 关闭；>0 时同 (op,bucket,key) 窗口内只记一次）。非法值回落默认并告警。
 struct AnonDenyLimiter {
+    burst: f64,
+    per_sec: f64,
+    dedupe: Option<std::time::Duration>,
     state: std::sync::Mutex<AnonDenyLimiterState>,
 }
 
@@ -107,33 +113,75 @@ struct AnonDenyLimiterState {
     tokens: f64,
     last: std::time::Instant,
     dropped: u64,
+    /// 去重窗口内的 (op, bucket, key)；超上限整体清空（有界，不做 LRU）。
+    seen: std::collections::HashMap<(String, Option<String>, Option<String>), std::time::Instant>,
 }
 
 const ANON_DENY_BURST: f64 = 20.0;
 const ANON_DENY_PER_SEC: f64 = 5.0;
+const ANON_DEDUPE_MAX_KEYS: usize = 1024;
 
 impl AnonDenyLimiter {
     fn new() -> Self {
+        Self::with_config(
+            env_f64("OSS_ANON_DENY_AUDIT_BURST", ANON_DENY_BURST, 1.0, 10_000.0),
+            env_f64(
+                "OSS_ANON_DENY_AUDIT_PER_SEC",
+                ANON_DENY_PER_SEC,
+                0.0,
+                10_000.0,
+            ),
+            env_f64("OSS_ANON_DENY_AUDIT_DEDUPE_SECS", 0.0, 0.0, 86_400.0),
+        )
+    }
+
+    fn with_config(burst: f64, per_sec: f64, dedupe_secs: f64) -> Self {
+        let dedupe = (dedupe_secs > 0.0).then(|| std::time::Duration::from_secs_f64(dedupe_secs));
         Self {
+            burst,
+            per_sec,
+            dedupe,
             state: std::sync::Mutex::new(AnonDenyLimiterState {
-                tokens: ANON_DENY_BURST,
+                tokens: burst,
                 last: std::time::Instant::now(),
                 dropped: 0,
+                seen: std::collections::HashMap::new(),
             }),
         }
     }
 
     /// true = 落这一行；false = 丢弃。锁中毒按丢弃处理（不写审计是安全侧）。
-    fn try_acquire(&self) -> bool {
+    fn try_acquire(&self, op: &str, bucket: Option<&str>, key: Option<&str>) -> bool {
         let Ok(mut s) = self.state.lock() else {
             return false;
         };
         let now = std::time::Instant::now();
+        let dedupe_key = self.dedupe.map(|_| {
+            (
+                op.to_string(),
+                bucket.map(str::to_string),
+                key.map(str::to_string),
+            )
+        });
+        if let (Some(window), Some(k)) = (self.dedupe, dedupe_key.as_ref())
+            && s.seen
+                .get(k)
+                .is_some_and(|last| now.duration_since(*last) < window)
+        {
+            return false;
+        }
         let elapsed = now.duration_since(s.last).as_secs_f64();
         s.last = now;
-        s.tokens = (s.tokens + elapsed * ANON_DENY_PER_SEC).min(ANON_DENY_BURST);
+        s.tokens = (s.tokens + elapsed * self.per_sec).min(self.burst);
         if s.tokens >= 1.0 {
             s.tokens -= 1.0;
+            // 只有真正落行才登记去重窗口；令牌耗尽丢弃时不登记，避免窗口内永久静默。
+            if let Some(k) = dedupe_key {
+                if s.seen.len() >= ANON_DEDUPE_MAX_KEYS {
+                    s.seen.clear();
+                }
+                s.seen.insert(k, now);
+            }
             return true;
         }
         s.dropped += 1;
@@ -141,6 +189,20 @@ impl AnonDenyLimiter {
             tracing::warn!(dropped = s.dropped, "匿名拒绝审计持续限流，已丢弃累计条数");
         }
         false
+    }
+}
+
+/// 有界数值环境变量：解析失败/非有限/越界 → 默认值 + 告警（限流侧安全默认不阻断）。
+fn env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() && (min..=max).contains(&v) => v,
+            _ => {
+                tracing::warn!(var = name, value = %raw, "匿名审计限流配置非法，使用默认值");
+                default
+            }
+        },
+        Err(_) => default,
     }
 }
 
@@ -319,7 +381,7 @@ impl Acl {
         object_key: Option<&str>,
         detail: Option<&str>,
     ) -> Result<(), sqlx::Error> {
-        if !self.anon_deny.try_acquire() {
+        if !self.anon_deny.try_acquire(op, bucket, object_key) {
             return Ok(());
         }
         self.write_audit(0, op, bucket, object_key, "deny", detail)
@@ -880,7 +942,7 @@ pub(crate) fn acl_err(e: sqlx::Error) -> S3Error {
 }
 
 /// L1：匿名请求携带的对象锁/治理旁路头（返回头名用于审计；值不记录）。
-fn anonymous_lock_header(headers: &HeaderMap) -> Option<&'static str> {
+pub(crate) fn anonymous_lock_header(headers: &HeaderMap) -> Option<&'static str> {
     [
         (
             "x-amz-object-lock-mode",
@@ -1682,11 +1744,39 @@ mod tests {
     /// M1：匿名拒绝审计限流（允许不限；拒绝突发 20 后丢弃）。
     #[test]
     fn anonymous_deny_limiter_burst_then_drop() {
-        let l = AnonDenyLimiter::new();
+        let l = AnonDenyLimiter::with_config(ANON_DENY_BURST, ANON_DENY_PER_SEC, 0.0);
         for _ in 0..ANON_DENY_BURST as usize {
-            assert!(l.try_acquire());
+            assert!(l.try_acquire("GetObject", Some("b"), Some("k")));
         }
-        assert!(!l.try_acquire(), "突发额度耗尽后必须丢弃");
+        assert!(
+            !l.try_acquire("GetObject", Some("b"), Some("k")),
+            "突发额度耗尽后必须丢弃"
+        );
+        // 不同键仍受同一令牌桶约束（去重关闭）
+        assert!(!l.try_acquire("GetObject", Some("b"), Some("k2")));
+    }
+
+    /// 4.6：去重窗口内同 (op,bucket,key) 只记一次；窗口关闭时不去重。
+    #[test]
+    fn anonymous_deny_limiter_dedupe_window() {
+        let l = AnonDenyLimiter::with_config(10.0, 10.0, 60.0);
+        assert!(l.try_acquire("GetObject", Some("b"), Some("k")));
+        assert!(!l.try_acquire("GetObject", Some("b"), Some("k")));
+        assert!(l.try_acquire("GetObject", Some("b"), Some("other")));
+        assert!(l.try_acquire("PutObject", Some("b"), Some("k")));
+
+        let off = AnonDenyLimiter::with_config(10.0, 10.0, 0.0);
+        assert!(off.try_acquire("GetObject", Some("b"), Some("k")));
+        assert!(off.try_acquire("GetObject", Some("b"), Some("k")));
+    }
+
+    /// 4.6：界外/非法配置回落默认值（不改变限流安全默认）。
+    #[test]
+    fn anonymous_deny_limiter_bounds() {
+        assert_eq!(
+            super::env_f64("OSS_TEST_UNSET_VAR_S3H", 5.0, 1.0, 10.0),
+            5.0
+        );
     }
 
     /// M1：写入路径确实经限流（20 条后不再增长；放行 1 个 token 的时钟余量）。

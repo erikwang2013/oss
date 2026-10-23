@@ -4320,12 +4320,17 @@ impl Db {
     }
 
     /// C5：审计保留策略——删除 ts < cutoff 的行，返回删除数（worker 按 OSS_AUDIT_RETENTION_DAYS）。
-    pub async fn delete_audit_older_than(&self, cutoff: i64) -> Result<u64> {
-        let n = sqlx::query("DELETE FROM audit_log WHERE ts < ?")
-            .bind(cutoff)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+    /// 每批最多 `limit` 行（id 子查询圈定），大积压时不让单条 DELETE 长时间占写锁。
+    pub async fn delete_audit_older_than(&self, cutoff: i64, limit: i64) -> Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM audit_log WHERE id IN \
+             (SELECT id FROM audit_log WHERE ts < ? ORDER BY ts LIMIT ?)",
+        )
+        .bind(cutoff)
+        .bind(limit.max(1))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(n)
     }
 
@@ -5160,13 +5165,28 @@ mod bucket_set_tests {
             .await
             .unwrap();
         }
-        let n = db.delete_audit_older_than(now - 100).await.unwrap();
+        let n = db.delete_audit_older_than(now - 100, 10).await.unwrap();
         assert_eq!(n, 1, "只删窗口外旧行");
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
             .fetch_one(db.pool())
             .await
             .unwrap();
         assert_eq!(left, 1);
+
+        // 批次上限：一次最多 limit 行（积压需多轮收敛）
+        for ts in [now - 300, now - 200] {
+            sqlx::query(
+                "INSERT INTO audit_log (ts, uid, op, decision) VALUES (?, 1, 'GetObject', 'deny')",
+            )
+            .bind(ts)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let first = db.delete_audit_older_than(now - 100, 1).await.unwrap();
+        assert_eq!(first, 1, "每批上限 1 行");
+        let rest = db.delete_audit_older_than(now - 100, 10).await.unwrap();
+        assert_eq!(rest, 1, "下一轮清掉剩余旧行");
     }
 }
 
