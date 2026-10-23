@@ -392,6 +392,7 @@ async fn sweep_transitions_enqueues_and_dedupes() {
                 }],
                 noncurrent_expiration: None,
                 noncurrent_transitions: vec![],
+                abort_mpu_days: None,
                 enabled: true,
             }],
         )
@@ -559,6 +560,7 @@ async fn sweep_only_transitions_current_versions() {
                 }],
                 noncurrent_expiration: None,
                 noncurrent_transitions: vec![],
+                abort_mpu_days: None,
                 enabled: true,
             }],
         )
@@ -605,6 +607,7 @@ async fn force_tier_sweep_endpoint() {
                 }],
                 noncurrent_expiration: None,
                 noncurrent_transitions: vec![],
+                abort_mpu_days: None,
                 enabled: true,
             }],
         )
@@ -680,6 +683,7 @@ async fn sweep_enqueues_noncurrent_transition() {
                     class: "STANDARD_IA".into(),
                     tier: None,
                 }],
+                abort_mpu_days: None,
                 enabled: true,
             }],
         )

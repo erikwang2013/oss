@@ -913,6 +913,7 @@ async fn shared_stores_route_control_writes_in_raft() {
         transitions: vec![],
         noncurrent_expiration: None,
         noncurrent_transitions: vec![],
+        abort_mpu_days: None,
         enabled: true,
     };
     let before = applied(&h);

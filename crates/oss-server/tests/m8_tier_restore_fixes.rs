@@ -222,6 +222,7 @@ async fn sse_object_rejected_and_sweep_skips() {
                 }],
                 noncurrent_expiration: None,
                 noncurrent_transitions: vec![],
+                abort_mpu_days: None,
                 enabled: true,
             }],
         )

@@ -30,6 +30,7 @@ fn spec(prefix: &str) -> LifecycleRuleSpec {
         transitions: vec![],
         noncurrent_expiration: None,
         noncurrent_transitions: vec![],
+        abort_mpu_days: None,
         enabled: true,
     }
 }
@@ -335,16 +336,61 @@ fn noncurrent_actions_parse_and_validate() {
 }
 
 #[test]
-fn unsupported_abort_mpu_still_501() {
+fn abort_mpu_parses_validates_and_roundtrips() {
     let cfg = BucketLifecycleConfiguration {
+        rules: vec![LifecycleRule {
+            abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                days_after_initiation: Some(7),
+            }),
+            filter: Some(LifecycleRuleFilter {
+                prefix: Some("up/".into()),
+                ..Default::default()
+            }),
+            ..rule()
+        }],
+    };
+    let mut specs = parse_lifecycle_config(&cfg).unwrap();
+    validate_rules(&mut specs, &[]).unwrap();
+    assert_eq!(specs[0].abort_mpu_days, Some(7));
+    let back = rules_to_dto(&specs);
+    assert_eq!(
+        back[0]
+            .abort_incomplete_multipart_upload
+            .as_ref()
+            .unwrap()
+            .days_after_initiation,
+        Some(7)
+    );
+
+    // 缺 DaysAfterInitiation 拒绝
+    let missing = BucketLifecycleConfiguration {
         rules: vec![LifecycleRule {
             abort_incomplete_multipart_upload: Some(Default::default()),
             ..rule()
         }],
     };
     assert!(matches!(
-        parse_lifecycle_config(&cfg),
-        Err(LifecycleError::NotImplemented(_))
+        parse_lifecycle_config(&missing),
+        Err(LifecycleError::Invalid(_))
+    ));
+
+    // 0 天越界
+    let mut zero = specs.clone();
+    zero[0].abort_mpu_days = Some(0);
+    assert!(matches!(
+        validate_rules(&mut zero, &[]),
+        Err(LifecycleError::InvalidArgument(_))
+    ));
+
+    // MPU 无标签/大小可判定：组合过滤器 fail closed
+    let mut tagged = specs.clone();
+    tagged[0].filter.tags = vec![xl_store::meta::ObjectTag {
+        key: "k".into(),
+        value: "v".into(),
+    }];
+    assert!(matches!(
+        validate_rules(&mut tagged, &[]),
+        Err(LifecycleError::Invalid(_))
     ));
 }
 

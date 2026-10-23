@@ -903,6 +903,7 @@ heartbeat_interval_ms = 100
                 transitions: vec![],
                 noncurrent_expiration: None,
                 noncurrent_transitions: vec![],
+                abort_mpu_days: None,
                 enabled: true,
             }],
         )
