@@ -673,9 +673,10 @@ if aws --endpoint-url "$ENDPOINT" s3api get-object --bucket "$SSE_BUCKET" --key 
 fi
 
 echo "--- 18d. 盘上明文 grep（E2E_DATA_DIR 设定时；含判别力对照）---"
+# 18e/18f 的 put-object 复用该文件；必须在条件块外创建（E2E_DATA_DIR 未设时也要有）。
+printf '%s' "$MARK" > "$WORK/plain18.bin"
 if [ -n "${E2E_DATA_DIR:-}" ]; then
   # 对照：明文键（无 SSE）→ 特征必须在盘上找得到
-  printf '%s' "$MARK" > "$WORK/plain18.bin"
   aws_s3 cp "$WORK/plain18.bin" "s3://$SSE_BUCKET/plain.bin" >/dev/null
   grep -rq "$MARK" "$E2E_DATA_DIR" || { echo "对照失败：明文键的特征在盘上找不到（grep 方法无效）"; exit 1; }
   # 删除明文键后（其目录回收），加密键落盘不得含特征：直接对加密键目录 grep 亦可，
