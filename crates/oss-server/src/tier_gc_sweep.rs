@@ -19,9 +19,36 @@ pub const DEFAULT_MAX_DELETES: usize = 1000;
 const MAX_GRACE_DAYS: u32 = 36_500;
 const MAX_DELETES: usize = 10_000;
 /// 全量版本扫描上限：超过就整轮失败（宁可不 GC，也不能在 live 集不完整时删除）。
+/// 可用 `OSS_TIER_GC_MAX_LIVE_SCAN` 调整；非法/0 回落到默认值。
 const MAX_LIVE_SCAN: usize = 1_000_000;
+/// 4.8：有效 grace 下限。Transition 先 put 远端再写 meta 引用，`grace_days=0`
+/// 会把这段窗口内的新对象当垃圾删掉；强制至少 1h 保护。
+const DEFAULT_MIN_GRACE_SECS: i64 = 3600;
+/// 下限本身再兜底：环境变量配 0/负数也只降到 60s，绝不回到「立刻可删」。
+const MIN_ALLOWED_GRACE_SECS: i64 = 60;
 const MAX_ERRORS: usize = 100;
 const MAX_MISSING_SAMPLES: usize = 10;
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn min_grace_secs_from(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MIN_GRACE_SECS)
+        .max(MIN_ALLOWED_GRACE_SECS)
+}
+
+fn effective_grace_secs(grace_days: u32, min_grace: i64) -> i64 {
+    (i64::from(grace_days) * 86_400).max(min_grace)
+}
+
+fn max_live_scan_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MAX_LIVE_SCAN)
+}
 
 #[derive(Debug, Clone)]
 pub struct GcOptions {
@@ -78,6 +105,8 @@ pub struct TierGcReport {
 pub struct GcResponse {
     pub dry_run: bool,
     pub grace_days: u32,
+    /// 实际生效的 grace（含 4.8 强制下限），秒。
+    pub effective_grace_secs: i64,
     pub max_deletes: usize,
     pub reports: Vec<TierGcReport>,
 }
@@ -100,6 +129,9 @@ pub async fn run_gc(
     opts: &GcOptions,
 ) -> Result<GcResponse, String> {
     validate_opts(opts)?;
+    let min_grace = min_grace_secs_from(env_var("OSS_TIER_GC_MIN_GRACE_SECS").as_deref());
+    let grace_secs = effective_grace_secs(opts.grace_days, min_grace);
+    let scan_cap = max_live_scan_from(env_var("OSS_TIER_GC_MAX_LIVE_SCAN").as_deref());
     let ids: Vec<String> = match &opts.tier {
         Some(id) => {
             if tiers.get(id).is_none() {
@@ -122,31 +154,87 @@ pub async fn run_gc(
     }
 
     // 2) live 集：全量版本扫描；不完整就失败（fail closed）。
-    let live = collect_live(store).await?;
+    let live = collect_live(store, scan_cap).await?;
 
     let now = crate::db::now();
     let mut reports = Vec::with_capacity(ids.len());
+    let mut pending: Vec<(usize, String, Vec<TierObject>)> = Vec::new();
     for id in &ids {
         let objs = listed.remove(id).unwrap_or_default();
-        reports.push(eval_tier(id, objs, live.get(id), tiers, opts, now).await);
+        let (report, candidates) = eval_tier(id, objs, live.get(id), opts, grace_secs, now);
+        if !opts.dry_run && !candidates.is_empty() {
+            pending.push((reports.len(), id.clone(), candidates));
+        }
+        reports.push(report);
+    }
+
+    if !opts.dry_run && !pending.is_empty() {
+        // 4.8：真正删除前再取一次 live 快照，把第一轮快照到删除之间的新引用保下来。
+        let fresh = collect_live(store, scan_cap).await?;
+        for (idx, id, candidates) in pending {
+            let Some(backend) = tiers.get(&id) else {
+                continue;
+            };
+            let report = &mut reports[idx];
+            let (mut candidates, newly_live) = split_newly_live(candidates, fresh.get(&id));
+            report.kept_live += newly_live;
+            report.stale = candidates.len();
+            let take = candidates.len().min(opts.max_deletes);
+            report.would_delete = take;
+            report.truncated = candidates.len() > take;
+            for o in candidates.drain(..take) {
+                match backend.delete(&o.key).await {
+                    Ok(()) => report.deleted += 1,
+                    Err(e) => {
+                        report.failed += 1;
+                        if report.errors.len() < MAX_ERRORS {
+                            report.errors.push(GcError {
+                                key: o.key,
+                                error: e,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(GcResponse {
         dry_run: opts.dry_run,
         grace_days: opts.grace_days,
+        effective_grace_secs: grace_secs,
         max_deletes: opts.max_deletes,
         reports,
     })
 }
 
-async fn eval_tier(
+/// 第二轮 live 快照才出现的候选：保留，并从待删集移除。
+fn split_newly_live(
+    candidates: Vec<TierObject>,
+    fresh: Option<&HashSet<String>>,
+) -> (Vec<TierObject>, usize) {
+    let Some(fresh) = fresh else {
+        return (candidates, 0);
+    };
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(candidates.len());
+    for o in candidates {
+        if fresh.contains(&o.key) {
+            kept += 1;
+        } else {
+            out.push(o);
+        }
+    }
+    (out, kept)
+}
+
+fn eval_tier(
     id: &str,
     objs: Vec<TierObject>,
     live: Option<&HashSet<String>>,
-    tiers: &TierBackends,
     opts: &GcOptions,
+    grace_secs: i64,
     now: i64,
-) -> TierGcReport {
-    let grace_secs = i64::from(opts.grace_days) * 86_400;
+) -> (TierGcReport, Vec<TierObject>) {
     let tier_live = live.cloned().unwrap_or_default();
     let prefix = format!("{id}/");
     let listed_keys: HashSet<&str> = objs
@@ -197,31 +285,14 @@ async fn eval_tier(
     let take = candidates.len().min(opts.max_deletes);
     report.would_delete = take;
     report.truncated = candidates.len() > take;
-    if opts.dry_run {
-        return report;
-    }
-    let Some(backend) = tiers.get(id) else {
-        return report;
-    };
-    for o in candidates.into_iter().take(take) {
-        match backend.delete(&o.key).await {
-            Ok(()) => report.deleted += 1,
-            Err(e) => {
-                report.failed += 1;
-                if report.errors.len() < MAX_ERRORS {
-                    report.errors.push(GcError {
-                        key: o.key,
-                        error: e,
-                    });
-                }
-            }
-        }
-    }
-    report
+    (report, candidates)
 }
 
 /// 全量扫描所有桶的所有版本，收集 (backend → 完整 tier key) 的 live 集。
-async fn collect_live(store: &Store) -> Result<HashMap<String, HashSet<String>>, String> {
+async fn collect_live(
+    store: &Store,
+    scan_cap: usize,
+) -> Result<HashMap<String, HashSet<String>>, String> {
     let mut live: HashMap<String, HashSet<String>> = HashMap::new();
     let mut scanned = 0usize;
     let buckets = store
@@ -250,9 +321,9 @@ async fn collect_live(store: &Store) -> Result<HashMap<String, HashSet<String>>,
             }
             for e in &page.entries {
                 scanned += 1;
-                if scanned > MAX_LIVE_SCAN {
+                if scanned > scan_cap {
                     return Err(format!(
-                        "GC live 扫描超过 {MAX_LIVE_SCAN} 个版本，已中止（未删除任何对象）"
+                        "GC live 扫描超过 {scan_cap} 个版本，已中止（未删除任何对象）"
                     ));
                 }
                 if let (Some(backend), Some(key)) =
@@ -274,4 +345,53 @@ async fn collect_live(store: &Store) -> Result<HashMap<String, HashSet<String>>,
         }
     }
     Ok(live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(key: &str) -> TierObject {
+        TierObject {
+            key: key.into(),
+            last_modified: 1,
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn grace_zero_is_clamped_to_min_grace() {
+        // 4.8：grace_days=0 不得退化成「新对象立刻可删」。
+        assert_eq!(min_grace_secs_from(None), 3600);
+        assert_eq!(min_grace_secs_from(Some("0")), 3600);
+        assert_eq!(min_grace_secs_from(Some("-5")), 3600);
+        assert_eq!(min_grace_secs_from(Some("30")), 60);
+        assert_eq!(min_grace_secs_from(Some("7200")), 7200);
+        assert_eq!(effective_grace_secs(0, 3600), 3600);
+        assert_eq!(effective_grace_secs(7, 3600), 7 * 86_400);
+    }
+
+    #[test]
+    fn live_scan_cap_is_configurable_with_safe_default() {
+        assert_eq!(max_live_scan_from(Some("42")), 42);
+        assert_eq!(max_live_scan_from(Some(" 42 ")), 42);
+        assert_eq!(max_live_scan_from(Some("0")), MAX_LIVE_SCAN);
+        assert_eq!(max_live_scan_from(Some("nope")), MAX_LIVE_SCAN);
+        assert_eq!(max_live_scan_from(None), MAX_LIVE_SCAN);
+    }
+
+    #[test]
+    fn fresh_live_ref_survives_second_snapshot_filter() {
+        let a = obj("cold/bkt/v1/a");
+        let b = obj("cold/bkt/v1/b");
+        let fresh: HashSet<String> = [b.key.clone()].into_iter().collect();
+        let (out, kept) = split_newly_live(vec![a.clone(), b], Some(&fresh));
+        assert_eq!(kept, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, a.key);
+        // 没有第二轮快照（理论上不会发生）时保持原候选。
+        let (out, kept) = split_newly_live(vec![a], None);
+        assert_eq!(kept, 0);
+        assert_eq!(out.len(), 1);
+    }
 }

@@ -274,6 +274,25 @@ async fn delete_failures_are_reported_and_do_not_stop_others() {
     assert!(!mock.has(good));
 }
 
+/// 4.8：grace_days=0 仍强制至少 1h，保护「Transition put 完、meta 引用还没落地」的窗口。
+#[tokio::test]
+async fn grace_zero_keeps_fresh_orphan_but_still_collects_old_one() {
+    let (st, mock, _dir) = setup().await;
+    let fresh = "cold/bkt/fresh-v1/x";
+    let old = "cold/bkt/old-v1/x";
+    mock.add(fresh, now());
+    mock.add(old, now() - 2 * 3600);
+    let mut o = opts(true);
+    o.grace_days = 0;
+
+    let resp = run_gc(&st.store, &st.tiers, &o).await.unwrap();
+    assert_eq!(resp.effective_grace_secs, 3600);
+    let r = &resp.reports[0];
+    assert_eq!(r.kept_grace, 1);
+    assert_eq!(r.stale, 1);
+    assert_eq!(r.would_delete, 1);
+}
+
 #[tokio::test]
 async fn list_failure_aborts_without_deleting() {
     let (st, mock, _dir) = setup().await;
