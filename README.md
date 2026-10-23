@@ -81,8 +81,8 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
 管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
 **不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换 · AP 匿名/跨账号（S3 数据面匿名桶策略已支持，见「桶策略与审计」；AP 入口仍对
-匿名 403）· Inventory 跨账号投递 · Batch 抢占/跨账号清单。
+CMK/多钥轮换 · AP 跨账号/VPC 端点（AP 匿名已支持，见「访问点」）· Inventory 跨账号投递 ·
+Batch 抢占/跨账号清单。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
 （内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
@@ -180,11 +180,14 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
 > - Multipart：`UploadPartCopy`、`ListMultipartUploads`（含集群 `ListUploadsLocal`）、GET/HEAD `partNumber`
 >   已实现；`partNumber` 与 `Range` 同时出现 → 400 `InvalidRequest`。
-> - `partNumber` 依赖 Complete 时落盘的 `part_sizes`；**复制 / 分层摄入的对象不携带该字段**，
->   其 `partNumber` 退化为旧语义（仅 part 1 = 整对象；>1 → 416）。需要按段寻址请用原始 MPU 上传。
+> - `partNumber` 依赖 Complete 时落盘的 `part_sizes`：MPU Complete 落盘；站点复制、raft
+>   同 id 重推与 sync 写门随 `x-oss-part-sizes` 透传；tier 归档/恢复原地保留（restore 后仍可分段读）。
+>   异构远端复制、非 MPU 单段 PUT 无该表时退化为旧语义（仅 part 1 = 整对象；>1 → 416）。
 > - Range：HEAD 支持单区间（200 + 区间 `Content-Length`/`Content-Range`，越界 416）；GET 多区间
 >   （`bytes=0-9,20-29`）不返回 `multipart/byteranges`——s3s 解析前剥掉 Range → 200 整对象。
->   客户端若把 Range 计入 SigV4 SignedHeaders，剥离后会 403 `SignatureDoesNotMatch`；预签名 URL 不受影响。
+>   Range 未计入 SigV4 SignedHeaders 时（普通未签名请求、常规预签名）照旧剥离；计入
+>   SignedHeaders 时保留到验签之后，由 s3s 返回确定性 400 `InvalidArgument`（不再 403
+>   `SignatureDoesNotMatch`）。
 > - 对象标签：`Put/Get/DeleteObjectTagging`、PUT 的 `x-amz-tagging`、GET/HEAD 的
 >   `x-amz-tagging-count` 已落地；≤10 条、键 ≤128 / 值 ≤256 Unicode 标量，非法 → 400 `InvalidTag`。
 >   标签按版本存储；复制摄入（`REPLICA`）不落标签。MPU 标签已落地，控制台可编辑对象标签。
@@ -557,14 +560,18 @@ tag/retention/legal-hold、MPU、CopyObject、控制台 API 等即使策略写 `
 
 审计：S3 面每次授权判定（允许与拒绝都）落一行 SQLite `audit_log`，`detail` 记策略来源
 （`policy:allow` / `policy:deny` / `policy:error`）；**保留期清理（C5）**：`OSS_AUDIT_RETENTION_DAYS`
-（默认 0 = 不清理）开启后每小时清 `ts` 超出保留期的行（best-effort，失败只 warn）。
+（默认 0 = 不清理，钳 0..=36500）开启后每小时按批 10000 条清 `ts` 超出保留期的行
+（best-effort，失败只 warn）。
 （`policy:allow` / `policy:deny` / `policy:error`）；`GET /api/v1/audit?limit=&decision=allow|deny`
 （仅管理员；limit 默认 100、钳 1..=1000；`decision` 只认 allow/deny，其它值视为不过滤，最新在前）。
 `tests/e2e_s3.sh` 第 17 节实弹覆盖（Deny 优先 / 校验 400 / 审计查询 / 清策略恢复 / 删桶清策略 /
 批量删逐键授权）。
 **匿名拒绝限流（M1）**：匿名**允许**判定照常全量落行；匿名**拒绝**经进程级令牌桶限流
-（突发 20、每秒补 5），洪水期丢弃不写（每累计 1000 条 warn 一次），防止未认证流量无界撑大
-`audit_log`。匿名请求携带对象锁/治理旁路头一律 403（见「对象锁」）。
+（`OSS_ANON_DENY_AUDIT_BURST` 默认 20、`OSS_ANON_DENY_AUDIT_PER_SEC` 默认 5；可选
+`OSS_ANON_DENY_AUDIT_DEDUPE_SECS` 默认 0，按 `(op,bucket,key)` 去重）。参数启动时钳制
+（burst 1..=10000、每秒 0..=10000、去重 0..=86400），非法值 warn 后回默认；洪水期丢弃不写
+（每累计 1000 条 warn 一次），防止未认证流量无界撑大 `audit_log`。匿名请求携带对象锁/
+治理旁路头一律 403（见「对象锁」）。
 
 ## 多 set（M4）
 
@@ -909,15 +916,20 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
 ```
 
 - 路由：路径式 `/ap/<name>/<key>`；别名 `<name>-s3alias` 同时支持路径首段与
-  Host 首标签（`<name>-s3alias.<endpoint>`）；未知别名 404，不回落桶路由。
-  标准 SigV4 签名照常覆盖原始 path/host。桶名保留 `-s3alias` 后缀（建桶即拒）。
-  **升级注意（L4）**：M8 之前创建的 `*-s3alias` 结尾的旧桶会被别名路由遮蔽（路径首段 /
-  Host 首标签被当作 AP 别名 → 404），升级前请改名，勿再经原桶名访问。
+  Host 首标签（`<name>-s3alias.<endpoint>`）。别名仅在该 AP 存在时接管；不存在则回落普通
+  桶路由（M8 前创建的 `*-s3alias` 旧桶仍可访问；与 AP 别名冲突时 AP 优先）。
+  未知 `/ap/<name>/` 前缀仍 404。标准 SigV4 签名照常覆盖原始 path/host。
+  桶名保留 `-s3alias` 后缀（建桶即拒）。
   **升级注意（L2，破坏性）**：对象动作的 AP 策略现在只匹配对象 ARN
   （`arn:aws:s3:::<bucket>/<key>` 或 AP object ARN）。旧策略用桶 ARN（不带 `/*`）授予
   `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` 的，升级后会从「放行全部对象」变为
   「全部拒绝」（fail-closed）；升级前请改为对象 ARN。
-- 鉴权 = 身份/表三档/桶策略/会话策略 **∩** AP 策略（显式 Deny 优先；AP 有策略但无匹配 → 拒）；
+- 鉴权 = 身份/表三档/桶策略/会话策略 **∩** AP 策略（显式 Deny 优先；AP 有策略但无匹配 → 拒）。
+  **升级注意（L3，破坏性）**：AP **无策略 = 默认拒绝**（AWS 对齐；升级前为「不额外限制」），
+  建 AP 后须显式下发策略，否则该 AP 所有请求 403。
+  匿名（无凭据）经 AP 另需**两道门同时放行**：AP 策略显式 Allow `Principal:"*"`（Deny 优先，
+  `*` 只匹配匿名、不复用 AK 规则）**且**桶策略匿名基线放行；交集语义，AP 绝不放宽桶策略。
+  匿名仅限数据面白名单（见「桶策略与审计」），控制面/桶级动作/对象锁头一律 403，审计 uid=0。
   CopyObject 目标轴按 `s3:PutObject`；审计合并为一条。`DeleteObjects` 逐键叠 AP 策略
   （被拒键 `<Error>AccessDenied`，其余键照删；请求体上限 1 MiB / 1000 键）。
   对象动作只匹配对象 ARN（`arn:aws:s3:::<bucket>/<key>` 与 AP object ARN），桶 ARN 只参与
@@ -930,19 +942,20 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   `Condition` 仅 `IpAddress`/`NotIpAddress` + `aws:SourceIp`（IPv4/IPv6 CIDR，保存时校验）；
   Principal 仅 `*` / AK / `uid:<n>`；非法策略保存 400，运行期加载失败 500（不当作无策略）。
   SourceIp 对端来自连接地址；ecat 内置 listener 无 connect_info，反代部署须显式设置
-  `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` **最右一跳**（左侧客户端可伪造；反代须
-  **覆盖**而非透传客户端自带的 XFF；仅单层反代成立，多层反代须在最近一跳覆盖并只信任该层），
-  重复 XFF 头行 → 视为无对端。**IP 条件无法求值（默认不信任
-  且无对端）时：Deny 语句命中（fail-closed），Allow 语句不命中**——缺对端绝不会静默放过
-  `Deny NotIpAddress`。
+  `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For`。信任模型：`OSS_AP_TRUSTED_PROXY_HOPS`
+  （默认 1 = 最右一跳，向后兼容）取右起第 N 跳；或 `OSS_AP_TRUSTED_PROXY_CIDRS`（逗号分隔
+  CIDR）从右向左跳过可信代理，取第一个非可信地址。仅单行 XFF、每项必须是合法 IP；重复
+  IP/重复头行/任一项格式非法 → 视为无对端（fail-closed）。反代须**覆盖**而非透传客户端
+  自带的 XFF。**IP 条件无法求值（默认不信任且无对端）时：Deny 语句命中（fail-closed），
+  Allow 语句不命中**——缺对端绝不会静默放过 `Deny NotIpAddress`。
 - 支持：Get/Head/Put/DeleteObject、DeleteObjects、ListObjectsV2、ListObjectVersions、MPU
   Create/Complete/Abort/UploadPart/UploadPartCopy、CopyObject、Get/Put/DeleteObjectTagging、
   Get/PutObjectRetention、Get/PutObjectLegalHold、Get/PutBucketVersioning、HeadBucket、
   RestoreObject。桶生命周期配置、桶默认加密、Inventory 配置是控制面 / S3 桶级操作，
   **不经 AP**（`/ap/...` 上无对应形状，调用 501）。
-- 边界：不做匿名/跨账号/VPC 端点/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
-  checksum 不转发 trailing headers。**AP 无策略 = 不额外限制**（身份/桶策略仍生效），
-  与 AWS「访问点无策略即拒绝」不同（L3，记档不改变行为）。
+- 边界：不做跨账号/VPC 端点/多节点 AP 缓存一致性；经 AP 的 aws-chunked 尾随
+  checksum 不转发 trailing headers。AP 无策略 = 拒绝（AWS 对齐，L3 破坏性变更见上）；
+  匿名经 AP 需 AP + 桶策略双门（见上）。
 
 ### 存储类、分层与 Restore（S4a/S4b）
 
@@ -1121,9 +1134,10 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 1. 控制面单节点：AP 缓存、作业引擎、Inventory 调度、tier reaper 均按单进程；多节点共享
    SQLite 不支持。IAM/桶/策略等 11 张控制表在 `[site]+[raft]` 模式下由 M9 Raft 强一致；
    其余 M8 状态仍单节点。
-2. AP 支持 `/ap/<name>` 与 `<name>-s3alias`（路径/Host）；无匿名/跨账号/VPC 端点；不支持
-   ListBuckets/Create/DeleteBucket。**AP 无策略 = 不额外限制**（与 AWS 默认拒绝不同，L3）；
-   旧 `*-s3alias` 桶会被别名路由遮蔽，升级前须改名（L4，见访问点节）。
+2. AP 支持 `/ap/<name>` 与 `<name>-s3alias`（路径/Host）；匿名经 AP 需 AP 策略
+   `Principal:"*"` 与桶策略匿名基线同时放行；无跨账号/VPC 端点；不支持
+   ListBuckets/Create/DeleteBucket。AP 无策略 = 拒绝（AWS 对齐，L3）；无 AP 的
+   `*-s3alias` 桶回落普通桶路由（L4 已修复，见访问点节）。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
 4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
    动作不发桶通知但发复制/清 tier。
