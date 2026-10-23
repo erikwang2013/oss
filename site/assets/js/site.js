@@ -59,6 +59,11 @@
   });
 
   // Copy buttons
+  const copyStatus = document.createElement("div");
+  copyStatus.className = "sr-only";
+  copyStatus.setAttribute("aria-live", "polite");
+  document.body.append(copyStatus);
+
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy]");
     if (!button) return;
@@ -70,11 +75,13 @@
       await navigator.clipboard.writeText(text);
       const original = button.textContent;
       button.textContent = "已复制";
+      copyStatus.textContent = "已复制到剪贴板";
       setTimeout(() => {
         button.textContent = original;
       }, 1400);
     } catch {
       button.textContent = "复制失败";
+      copyStatus.textContent = "复制失败，请手动选择文本";
       setTimeout(() => {
         button.textContent = "复制";
       }, 1400);
