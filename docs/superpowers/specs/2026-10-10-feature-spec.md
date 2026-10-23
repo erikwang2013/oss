@@ -475,9 +475,14 @@ Legal Hold ON 一律拒），拒删 = 403 `AccessDenied`。无版本号 DELETE �
 分片级重编码天然成立）。§8.1 的「SSE-C 只存 HMAC」落为 **`base64(MD5(key))`**（AWS
 customer-key-MD5 同款）。§8.2 的「读 SSE-C 密钥不匹配 → `AccessDenied`」落为
 **400 `InvalidArgument`**（AWS 对 SSE-C 错钥即 4xx 客户端错，非 403；格式不符/缺头同 400）。
-SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）→ **400 拒绝**（多主密钥轮换编排未做）。
-桶级默认加密（`PutBucketEncryption`）已落地：只接受单条 SSE-S3/SSE-KMS 规则，SSE-C 与显式 CMK
-拒绝；aetherupload 内部摄取不带加密（明文入盘，记档）。
+SSE-KMS 显式带 CMK（`…-aws-kms-key-id`）已落地（post-1.14 3.16）：接受裸名或
+`arn:…:key/<name>`，指向 `<OSS_KMS_DIR>/cmk/<name>/key-<n>.bin` 命名环（名 `[a-z0-9-]{1,64}`，
+路径白名单），对象 `key_id` 形态 `cmk:<name>:k<n>`，记录新增 `kms_key_id`（规范 CMK 名——
+ARN 输入归一为名，对象响应回显用）；
+未配置/名非法 → 400 fail-closed，绝不回退默认钥；管理 API 可创建/轮换（无删除），轮换只影响新写入。
+桶级默认加密（`PutBucketEncryption`）接受单条 SSE-S3/SSE-KMS 规则；显式 CMK 以
+`aws:kms:<name>` 存入 TEXT 列并由 GET 回显；SSE-C 拒绝；aetherupload 内部摄取不带加密
+（明文入盘，记档）。旧二进制遇到 CMK 对象/默认值/MPU kind 一律失败关闭（不 promise 滚动兼容）。
 
 ---
 
@@ -921,7 +926,7 @@ JobTask { job_id, task_id, target(bucket,key[,version]), state, result_code, res
 | **M5** | SSE-S3/KMS/C · 对象锁 · STS · 加密主密钥与 KMS 设置页 |
 | **M6** | 事件总线 + Kafka 通知（含 `ecat-mq-kafka`）· S3 Select · 桶复制（含 `ecat-data-s3` 扩展）· 事件页 · Select 工作台 |
 | **M7** | 跨站点异步双向复制 · 站点身份与管理 API · 配置/IAM 日志复制 · 站点页 |
-| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）；2026-10-23 补 AP 别名/批量删/SourceIp、WASM Batch、Parquet/Hive、tier 本地盘/GC、生命周期全 Filter**；非目标：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换、AP 跨账号；M9 另列） |
+| **M8** | Access Points · Object Lambda · 作业引擎 · Batch Operations · Inventory · 存储分层与 Restore · 作业中心页 · 分层页（**已落地 2026-10-20（S0–S6）；2026-10-23 补 AP 别名/批量删/SourceIp、WASM Batch、Parquet/Hive、tier 本地盘/GC、生命周期全 Filter**；非目标：`AssumeRoleWithWebIdentity`、SSE-KMS 显式 CMK/多钥轮换（3.16 已补）、AP 跨账号；M9 另列） |
 | **M9** | 控制面 `openraft` 跨站点强一致 · sync 桶 · stretch EC · 站点故障语义 |
 
 **与总体设计的分工**：总体设计回答「系统长什么样」（架构、盘布局、数据结构、阶段划分）；本文件回答「每个功能做什么」（行为、接口、边界、错误）；`2026-10-10-m1a-backend-slice.md` 与 `2026-10-10-m1b-frontend-console.md` 回答「M1 前后端怎么写」（逐任务代码与测试）。
