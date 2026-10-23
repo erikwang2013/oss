@@ -870,6 +870,87 @@ async fn overlong_version_chain_is_skipped_without_livelock() {
     assert_eq!(hot.entries.len(), 5);
 }
 
+/// H3：单键链跨页超过页预算时，cap 分支落「key+NUL」排他游标并截停；下轮从该键之后续扫。
+#[tokio::test]
+async fn overlong_version_chain_resume_cursor_skips_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    versioned_bucket(&st, "hcp").await;
+    for body in [
+        &b"v0"[..],
+        &b"v1"[..],
+        &b"v2"[..],
+        &b"v3"[..],
+        &b"v4"[..],
+        &b"v5"[..],
+    ] {
+        put_version(&st, "hcp", "a-hot", body).await;
+    }
+    put_version(&st, "hcp", "z-later", b"old").await;
+    put_version(&st, "hcp", "z-later", b"cur").await;
+    let mut spec = blank_spec();
+    spec.rule_id = Some("h3-page".into());
+    spec.noncurrent_expiration = Some(NoncurrentExpiration {
+        days: 1,
+        newer: None,
+    });
+    st.lifecycle.put_rules("hcp", &[spec]).await.unwrap();
+    // 2 页 × 2 条 < 6 条版本链：第 3 页触发 cap 时页预算已尽，必须落游标截停。
+    let limits = SweepLimits {
+        max_pages: 2,
+        page_size: 2,
+        max_key_versions: 4,
+    };
+    let future = now_secs() + 2 * 86_400;
+
+    sweep_once_at_with(&st, future, limits).await;
+    let hot = st
+        .store
+        .list_object_versions("hcp", "a-hot", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(hot.entries.len(), 6, "超限链应整体跳过：{hot:?}");
+    assert_eq!(
+        st.db
+            .lifecycle_cursor_get("hcp", "h3-page", "noncurrent")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("a-hot\u{0}"),
+        "页预算尽于超限键时必须落排他游标"
+    );
+    let jobs = st.db.list_jobs(10).await.unwrap();
+    assert!(
+        jobs[0]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("单轮页上限"),
+        "{jobs:?}"
+    );
+
+    // 下轮从排他游标续扫：热键不再重扫，后续键照常处理，游标最终清空。
+    sweep_once_at_with(&st, future, limits).await;
+    assert!(
+        st.db
+            .lifecycle_cursor_get("hcp", "h3-page", "noncurrent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let later = st
+        .store
+        .list_object_versions("hcp", "z-later", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(later.entries.len(), 1, "续扫应处理排他游标之后的键");
+    let hot = st
+        .store
+        .list_object_versions("hcp", "a-hot", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(hot.entries.len(), 6);
+}
+
 /// 3.10：AbortIncompleteMultipartUpload 按前缀 + 创建天数中止，域外不动。
 #[tokio::test]
 async fn abort_incomplete_mpu_respects_prefix_and_days() {
