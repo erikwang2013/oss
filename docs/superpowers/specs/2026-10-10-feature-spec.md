@@ -414,6 +414,10 @@ S3Auth 接口只有 AK→SK，无头面；AWS 信任链差异记档）；过期�
 回收一致判定（到期可删；COMPLIANCE 含管理员一律拒；GOVERNANCE 仅 bypass 头放行；
 Legal Hold ON 一律拒），拒删 = 403 `AccessDenied`。无版本号 DELETE 照打 delete marker
 （锁定版本天然留存）。控制台锁状态展示延后（S3 API 面完整）。
+**策略/匿名口径（2026-10-23 安全收口）**：`Get/PutObjectLegalHold` 映射独立动作
+`s3:GetObjectLegalHold`/`s3:PutObjectLegalHold`（不复用 `s3:GetObject`/`s3:PutObject`；AP 同样
+按此判定）。匿名请求携带对象锁头或 `x-amz-bypass-governance-retention` 一律 403——匿名桶策略
+没有可表达的锁动作，fail-closed。
 
 ---
 
@@ -606,9 +610,18 @@ AWS event-stream 帧（prelude + headers + payload + CRC32）：`Records`（分�
 
 **控制台 API**：`GET/POST /api/v1/access-points`、`GET/DELETE /api/v1/access-points/{name}`、`PUT .../{name}/policy`
 
-**边界**：不做 VPC endpoint、匿名/跨账号访问点；SourceIp 条件基于连接地址，反代部署需
-`OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` 首段（默认不信任）。DeleteObjects 经 AP
+**边界**：不做 VPC endpoint、匿名/跨账号访问点。SourceIp 条件基于连接地址；反代部署需显式
+`OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For` **最右一跳**（左侧客户端可伪造；反代须覆盖
+而非透传客户端自带 XFF）；重复 XFF 头行视为无对端。**IP 条件无法求值时 Deny 命中、Allow
+不命中（fail-closed）**——默认不信任反代时不会静默放过 `Deny NotIpAddress`。DeleteObjects 经 AP
 逐键叠 AP 策略（被拒键 `<Error>AccessDenied`，其余照删；请求体 1 MiB / 1000 键上限）。
+
+**授权 op = 执行 op（2026-10-23 安全收口）**：`derive_op` 用严格查询白名单（未知/多子资源
+501），`?legal-hold` 推导 `Get/PutObjectLegalHold`；`x-id` 必须与推导一致（重复/不一致 400）；
+multipart/form-data POST 一律拒（s3s 优先解析为 PostObject）；转发内层前剥离 `x-id` 并重新推导
+比对，不一致 500 fail-closed。对象动作 AP 策略只匹配对象 ARN（桶 ARN 只用于桶级动作）。
+AP 无策略 = 不额外限制（与 AWS 默认拒绝不同，记档不改变行为）；旧 `*-s3alias` 桶会被别名路由
+遮蔽，升级前须改名。
 
 ### 13.2 Object Lambda
 

@@ -95,7 +95,8 @@ impl ApCondition {
         Ok(())
     }
 
-    /// 条件是否成立；`None` = 无法求值（缺对端/坏 CIDR）→ 语句不匹配，fail-closed。
+    /// 条件是否成立；`None` = 无法求值（缺对端/坏 CIDR）。调用方按语句 Effect 处理：
+    /// Deny 视为命中（fail-closed），Allow 视为不命中。
     fn matches(&self, ip: Option<IpAddr>) -> Option<bool> {
         let ip = ip?;
         if let Some(c) = &self.ip_address
@@ -206,6 +207,7 @@ impl ApPolicy {
     }
 
     /// 单动作判定（与桶策略同语义：显式 Deny 优先；Allow 命中 true；无匹配 None）。
+    /// IP 条件无法求值（缺可信对端）时：Deny **命中**（fail-closed），Allow 不命中。
     pub fn evaluate(&self, req: &ApEvalRequest<'_>, action: &str) -> Option<bool> {
         let mut allowed = false;
         let mut any = false;
@@ -216,17 +218,21 @@ impl ApPolicy {
                     .resource
                     .iter()
                     .any(|p| req.resources.iter().any(|r| glob_match(p, r)))
-                || st
-                    .condition
-                    .as_ref()
-                    .is_some_and(|c| c.matches(req.source_ip) != Some(true))
             {
                 continue;
             }
-            any = true;
-            match st.effect.as_str() {
-                "Deny" => return Some(false),
-                "Allow" => allowed = true,
+            let cond = st.condition.as_ref().map(|c| c.matches(req.source_ip));
+            match (st.effect.as_str(), cond) {
+                // 条件求值为 false：该语句不命中（Allow/Deny 同）
+                (_, Some(Some(false))) => continue,
+                // 条件无法求值 ≈ 命中 Deny（fail-closed）；Allow 不命中
+                ("Deny", Some(None)) => return Some(false),
+                (_, Some(None)) => continue,
+                ("Deny", _) => return Some(false),
+                ("Allow", _) => {
+                    any = true;
+                    allowed = true;
+                }
                 _ => {}
             }
         }
@@ -344,18 +350,11 @@ pub fn ap_decision(
         crate::policy::s3_action(op)
     }?;
     let ctx = ap.context();
-    let mut resources = vec![];
-    match key {
-        Some(k) => {
-            resources.push(format!("arn:aws:s3:::{}", ap.bucket)); // 兼容旧方言（对象请求少见）
-            resources.push(format!("arn:aws:s3:::{}/{k}", ap.bucket));
-            resources.push(ctx.object_arn(k));
-        }
-        None => {
-            resources.push(format!("arn:aws:s3:::{}", ap.bucket));
-            resources.push(ctx.bucket_arn());
-        }
-    }
+    // 与 policy.rs 同口径：对象动作只匹配对象 ARN，桶动作只匹配桶 ARN。
+    let resources = match key {
+        Some(k) => vec![format!("arn:aws:s3:::{}/{k}", ap.bucket), ctx.object_arn(k)],
+        None => vec![format!("arn:aws:s3:::{}", ap.bucket), ctx.bucket_arn()],
+    };
     let req = ApEvalRequest {
         ak: &user.ak,
         uid: user.uid,
@@ -619,23 +618,125 @@ fn query_has(query: &str, key: &str) -> bool {
         .any(|p| p == key || p.starts_with(&format!("{key}=")))
 }
 
-fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+/// `x-amz-copy-source` → (源桶, 源键)；仅接受带桶名的形态（CopyObject 语义）。
+fn copy_source_bucket_key(headers: &http::HeaderMap) -> Option<(String, String)> {
+    headers
+        .get(s3s::header::X_AMZ_COPY_SOURCE)
+        .and_then(|v| v.to_str().ok())
+        .map(s3s::dto::CopySource::parse)
+        .and_then(|r| match r {
+            Ok(s3s::dto::CopySource::Bucket { bucket, key, .. }) => {
+                Some((bucket.to_string(), key.to_string()))
+            }
+            _ => None,
+        })
+}
+
+/// 与 s3s `is_multipart_post` 同口径（忽略参数）。
+fn is_multipart_form_data(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("multipart/form-data")
+}
+
+/// 单个查询键的值；同一键出现多次（意图不可判定）→ `InvalidRequest`。
+fn query_value_once<'a>(query: &'a str, key: &str) -> S3Result<Option<&'a str>> {
+    let mut found = None;
+    for part in query.split('&') {
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        if k != key {
+            continue;
+        }
+        if found.is_some() {
+            return Err(s3s::s3_error!(InvalidRequest, "duplicate query parameter"));
+        }
+        found = Some(v);
+    }
+    Ok(found)
+}
+
+/// 查询键白名单：除列出的键外一律拒（X-Amz-* 已剥离；空段容忍）。未列出的子资源
+/// 会被 s3s 内层解析成另一个 op（如 `?acl` → PutObjectAcl），授权 op 必须与执行 op 一致。
+fn only_query_keys(query: &str, allowed: &[&str]) -> bool {
     query
         .split('&')
-        .find_map(|p| p.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+        .all(|p| p.is_empty() || allowed.contains(&p.split('=').next().unwrap_or("")))
 }
 
-/// `GET /{bucket}`（无 list-type）的 v1 ListObjects 参数白名单；未知子资源仍 fail-closed。
-fn is_list_objects_v1(query: &str) -> bool {
-    strip_signed_query(query).split('&').all(|p| {
-        p.is_empty()
-            || matches!(
-                p.split('=').next().unwrap_or(""),
-                "prefix" | "delimiter" | "marker" | "max-keys" | "encoding-type" | "x-id"
-            )
-    })
+fn unsupported_op<T>() -> S3Result<T> {
+    Err(s3s::s3_error!(
+        NotImplemented,
+        "unsupported access point operation"
+    ))
 }
 
+fn pick(ok: bool, op: &'static str) -> S3Result<&'static str> {
+    if ok { Ok(op) } else { unsupported_op() }
+}
+
+const GET_OBJECT_QUERY: &[&str] = &[
+    "versionId",
+    "partNumber",
+    "response-cache-control",
+    "response-content-disposition",
+    "response-content-encoding",
+    "response-content-language",
+    "response-content-type",
+    "response-expires",
+    "x-id",
+];
+const LIST_V1_QUERY: &[&str] = &[
+    "prefix",
+    "delimiter",
+    "marker",
+    "max-keys",
+    "encoding-type",
+    "x-id",
+];
+const LIST_V2_QUERY: &[&str] = &[
+    "list-type",
+    "prefix",
+    "delimiter",
+    "continuation-token",
+    "max-keys",
+    "encoding-type",
+    "fetch-owner",
+    "start-after",
+    "x-id",
+];
+const LIST_VERSIONS_QUERY: &[&str] = &[
+    "versions",
+    "prefix",
+    "delimiter",
+    "key-marker",
+    "version-id-marker",
+    "max-keys",
+    "encoding-type",
+    "x-id",
+];
+const LIST_UPLOADS_QUERY: &[&str] = &[
+    "uploads",
+    "prefix",
+    "delimiter",
+    "key-marker",
+    "upload-id-marker",
+    "max-uploads",
+    "encoding-type",
+    "x-id",
+];
+const LIST_PARTS_QUERY: &[&str] = &[
+    "uploadId",
+    "part-number-marker",
+    "max-parts",
+    "encoding-type",
+    "x-id",
+];
+
+/// 授权用的 op 推导：与 s3s 内层的路由表逐形状对齐，超出白名单的形状一律 501。
+/// 关键点：**单一子资源 + 精确参数集**，避免多子资源时内层优先级选出另一个 op。
 fn derive_op(
     method: &http::Method,
     key: Option<&str>,
@@ -643,100 +744,128 @@ fn derive_op(
     copy_source: bool,
 ) -> S3Result<&'static str> {
     use http::Method;
+    let query = strip_signed_query(query);
+    let query = query.as_str();
+    let has = |k: &str| query_has(query, k);
+    let only = |allowed: &[&str]| only_query_keys(query, allowed);
     match *method {
-        Method::GET => {
-            if query_has(query, "versions") {
-                Ok("ListObjectVersions")
-            } else if query_has(query, "uploads") {
-                Ok("ListMultipartUploads")
-            } else if key.is_some() && query_has(query, "uploadId") {
-                Ok("ListParts")
-            } else if query_has(query, "tagging") {
-                Ok("GetObjectTagging")
-            } else if key.is_some() && query_has(query, "retention") {
-                Ok("GetObjectRetention")
-            } else if query_value(query, "list-type") == Some("2") {
-                Ok("ListObjectsV2")
-            } else if query_has(query, "versioning") {
-                Ok("GetBucketVersioning")
-            } else if key.is_some() {
-                Ok("GetObject")
-            } else if is_list_objects_v1(query) {
-                Ok("ListObjects")
-            } else {
-                Err(s3s::s3_error!(
-                    NotImplemented,
-                    "unsupported access point operation"
-                ))
-            }
-        }
-        Method::HEAD => {
-            if key.is_some() {
-                Ok("HeadObject")
-            } else {
-                Ok("HeadBucket")
-            }
-        }
-        Method::PUT => {
-            if query_has(query, "uploadId") && query_has(query, "partNumber") {
-                if copy_source {
-                    Ok("UploadPartCopy")
+        Method::GET => match key {
+            Some(_) => {
+                if has("uploadId") {
+                    pick(only(LIST_PARTS_QUERY), "ListParts")
+                } else if has("tagging") {
+                    pick(only(&["tagging", "versionId", "x-id"]), "GetObjectTagging")
+                } else if has("retention") {
+                    pick(
+                        only(&["retention", "versionId", "x-id"]),
+                        "GetObjectRetention",
+                    )
+                } else if has("legal-hold") {
+                    pick(
+                        only(&["legal-hold", "versionId", "x-id"]),
+                        "GetObjectLegalHold",
+                    )
                 } else {
-                    Ok("UploadPart")
+                    pick(only(GET_OBJECT_QUERY), "GetObject")
                 }
-            } else if copy_source {
-                Ok("CopyObject")
-            } else if query_has(query, "tagging") {
-                Ok("PutObjectTagging")
-            } else if key.is_some() && query_has(query, "retention") {
-                Ok("PutObjectRetention")
-            } else if query_has(query, "versioning") {
-                Ok("PutBucketVersioning")
-            } else if key.is_some() {
-                Ok("PutObject")
-            } else {
-                Err(s3s::s3_error!(
-                    NotImplemented,
-                    "unsupported access point operation"
-                ))
             }
-        }
-        Method::POST => {
-            if query_has(query, "uploads") {
-                Ok("CreateMultipartUpload")
-            } else if query_has(query, "uploadId") {
-                Ok("CompleteMultipartUpload")
-            } else if query_has(query, "restore") {
-                // S4b：内层 RestoreObject 已启用（restore 查询随 call() 原样转发）
-                Ok("RestoreObject")
-            } else if query_has(query, "delete") {
+            None => {
+                if has("versions") {
+                    pick(only(LIST_VERSIONS_QUERY), "ListObjectVersions")
+                } else if has("uploads") {
+                    pick(only(LIST_UPLOADS_QUERY), "ListMultipartUploads")
+                } else if query_value_once(query, "list-type")? == Some("2") {
+                    pick(only(LIST_V2_QUERY), "ListObjectsV2")
+                } else if has("versioning") {
+                    pick(only(&["versioning", "x-id"]), "GetBucketVersioning")
+                } else {
+                    pick(only(LIST_V1_QUERY), "ListObjects")
+                }
+            }
+        },
+        Method::HEAD => match key {
+            Some(_) => pick(only(&["versionId", "partNumber", "x-id"]), "HeadObject"),
+            None => pick(only(&["x-id"]), "HeadBucket"),
+        },
+        Method::PUT => match key {
+            Some(_) => {
+                if has("uploadId") {
+                    if !has("partNumber") {
+                        unsupported_op()?
+                    }
+                    pick(
+                        only(&["uploadId", "partNumber", "x-id"]),
+                        if copy_source {
+                            "UploadPartCopy"
+                        } else {
+                            "UploadPart"
+                        },
+                    )
+                } else if copy_source {
+                    pick(only(&["x-id"]), "CopyObject")
+                } else if has("tagging") {
+                    pick(only(&["tagging", "versionId", "x-id"]), "PutObjectTagging")
+                } else if has("retention") {
+                    pick(
+                        only(&["retention", "versionId", "x-id"]),
+                        "PutObjectRetention",
+                    )
+                } else if has("legal-hold") {
+                    pick(
+                        only(&["legal-hold", "versionId", "x-id"]),
+                        "PutObjectLegalHold",
+                    )
+                } else {
+                    pick(only(&["x-id"]), "PutObject")
+                }
+            }
+            None => {
+                if has("versioning") {
+                    pick(only(&["versioning", "x-id"]), "PutBucketVersioning")
+                } else {
+                    unsupported_op()
+                }
+            }
+        },
+        Method::POST => match key {
+            Some(_) => {
+                if has("uploads") {
+                    pick(only(&["uploads", "x-id"]), "CreateMultipartUpload")
+                } else if has("uploadId") {
+                    pick(only(&["uploadId", "x-id"]), "CompleteMultipartUpload")
+                } else if has("restore") {
+                    // S4b：内层 RestoreObject 已启用（restore 查询随 call() 原样转发）
+                    pick(only(&["restore", "versionId", "x-id"]), "RestoreObject")
+                } else {
+                    unsupported_op()
+                }
+            }
+            None => {
                 // 键在请求体：逐键授权在 service.rs 里叠 AP 策略（check_access 只校验形状）
-                Ok("DeleteObjects")
-            } else {
-                Err(s3s::s3_error!(
-                    NotImplemented,
-                    "unsupported access point operation"
-                ))
+                if has("delete") {
+                    pick(only(&["delete", "x-id"]), "DeleteObjects")
+                } else {
+                    // s3s 把 POST /{bucket}?uploads 也当未知操作 → 501
+                    unsupported_op()
+                }
             }
-        }
-        Method::DELETE => {
-            if query_has(query, "uploadId") {
-                Ok("AbortMultipartUpload")
-            } else if query_has(query, "tagging") {
-                Ok("DeleteObjectTagging")
-            } else if key.is_some() {
-                Ok("DeleteObject")
-            } else {
-                Err(s3s::s3_error!(
-                    NotImplemented,
-                    "unsupported access point operation"
-                ))
+        },
+        Method::DELETE => match key {
+            Some(_) => {
+                if has("uploadId") {
+                    pick(only(&["uploadId", "x-id"]), "AbortMultipartUpload")
+                } else if has("tagging") {
+                    pick(
+                        only(&["tagging", "versionId", "x-id"]),
+                        "DeleteObjectTagging",
+                    )
+                } else {
+                    pick(only(&["versionId", "x-id"]), "DeleteObject")
+                }
             }
-        }
-        _ => Err(s3s::s3_error!(
-            NotImplemented,
-            "unsupported access point operation"
-        )),
+            None => unsupported_op(),
+        },
+        _ => unsupported_op(),
     }
 }
 
@@ -757,6 +886,15 @@ fn strip_signed_query(query: &str) -> String {
             let k = p.split('=').next().unwrap_or("");
             !SIGNED_QUERY.contains(&k) && !k.starts_with("X-Amz-")
         })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// 去掉指定查询键（值一并丢），保留其余原样顺序。
+fn strip_query_key(query: &str, key: &str) -> String {
+    query
+        .split('&')
+        .filter(|p| p.split('=').next().unwrap_or("") != key)
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -856,28 +994,42 @@ impl s3s::route::S3Route for ApRoute {
         let (name, raw_suffix) = parse_ap_target(&req.uri, &req.headers)?;
         let ap = self.load_ap(&name).await?;
         let peer = req.extensions.get::<ApPeer>().map(|p| p.0);
+        // H1：s3s 把任意 multipart/form-data POST 无条件解析为 PostObject（键在表单里，
+        // 先于 OIR/子资源路由），AP 不支持该 op。即使带 `?delete` 也仍执行 PostObject，
+        // 因此这里必须整类拒绝，而不是按查询推导出的 DeleteObjects 放行。
+        if req.method == http::Method::POST
+            && req
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(is_multipart_form_data)
+        {
+            tracing::warn!(uid = user.uid, ap = %name, "AP 拒绝 multipart/form-data POST");
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "multipart/form-data POST is not supported through access points"
+            ));
+        }
         let canonical = percent_decode_strict(&raw_suffix)?;
         let key: Option<&str> = (!canonical.is_empty()).then_some(canonical.as_str());
         let copy_src: Option<(String, String)> = if req.method == http::Method::PUT {
-            req.headers
-                .get(s3s::header::X_AMZ_COPY_SOURCE)
-                .and_then(|v| v.to_str().ok())
-                .map(s3s::dto::CopySource::parse)
-                .and_then(|r| match r {
-                    Ok(s3s::dto::CopySource::Bucket { bucket, key, .. }) => {
-                        Some((bucket.to_string(), key.to_string()))
-                    }
-                    _ => None,
-                })
+            copy_source_bucket_key(&req.headers)
         } else {
             None
         };
-        let op = derive_op(
-            &req.method,
-            key,
-            req.uri.query().unwrap_or(""),
-            copy_src.is_some(),
-        )?;
+        let query = req.uri.query().unwrap_or("");
+        let op = derive_op(&req.method, key, query, copy_src.is_some())?;
+        // H1：x-id 是 s3s OIR 的权威 op 声明（签名含于 SigV4），可越过查询推导；
+        // 只允许与推导结果一致，否则授权 op 与执行 op 会分叉。
+        if let Some(declared) = query_value_once(query, "x-id")?
+            && declared != op
+        {
+            tracing::warn!(uid = user.uid, op, declared, ap = %name, "AP x-id 与推导 op 不一致——拒绝");
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "x-id does not match the request"
+            ));
+        }
         let (base_allow, base_detail) = self
             .acl
             .check_op(
@@ -990,7 +1142,34 @@ impl s3s::route::S3Route for ApRoute {
         } else {
             format!("/{}/{}", inv.bucket, inv.raw_suffix)
         };
-        let query = strip_signed_query(req.uri.query().unwrap_or(""));
+        // 内层没有 access 层：剥离 x-id 后按内层实际可见的输入再推导一次 op，
+        // 与授权 op 不一致即 fail-closed（防御查询/头解析漂移）。
+        let query = strip_query_key(&strip_signed_query(req.uri.query().unwrap_or("")), "x-id");
+        let copy_src = (req.method == http::Method::PUT)
+            .then(|| copy_source_bucket_key(&req.headers))
+            .flatten();
+        let rederived = derive_op(
+            &req.method,
+            inv.canonical_key.as_deref(),
+            &query,
+            copy_src.is_some(),
+        )
+        .map_err(|_| {
+            tracing::error!(authorized = inv.op, ap = %inv.ap_name, "AP op 重推导失败——fail-closed");
+            s3s::s3_error!(InternalError, "access point operation mismatch")
+        })?;
+        if rederived != inv.op {
+            tracing::error!(
+                authorized = inv.op,
+                executed = rederived,
+                ap = %inv.ap_name,
+                "AP 授权 op 与执行 op 不一致——fail-closed"
+            );
+            return Err(s3s::s3_error!(
+                InternalError,
+                "access point operation mismatch"
+            ));
+        }
         let path_q = if query.is_empty() {
             path
         } else {
@@ -1158,9 +1337,11 @@ mod tests {
             "RestoreObject"
         );
         assert_eq!(
-            derive_op(&Method::POST, None, "uploads", false).unwrap(),
+            derive_op(&Method::POST, Some("k"), "uploads", false).unwrap(),
             "CreateMultipartUpload"
         );
+        // s3s 对 POST /{bucket}?uploads 解析为未知操作 → 501 与内层一致
+        assert!(derive_op(&Method::POST, None, "uploads", false).is_err());
         // 批量删：桶级 POST ?delete（SDK 两种写法）
         assert_eq!(
             derive_op(&Method::POST, None, "delete", false).unwrap(),
@@ -1171,6 +1352,8 @@ mod tests {
             "DeleteObjects"
         );
         assert!(derive_op(&Method::POST, None, "acl", false).is_err());
+        // 对象级 POST ?delete 内层解析不出 DeleteObjects（键在桶级请求体）
+        assert!(derive_op(&Method::POST, Some("k"), "delete", false).is_err());
     }
 
     #[test]
@@ -1228,7 +1411,11 @@ mod tests {
             Some(true),
             "在 NotIpAddress 名单内 → Deny 条件不成立"
         );
-        assert_eq!(eval("secret/x", ""), None, "缺对端时带条件语句一律不匹配");
+        assert_eq!(
+            eval("secret/x", ""),
+            Some(false),
+            "缺对端时 Deny+NotIpAddress 必须命中（fail-closed）"
+        );
     }
 
     #[test]
@@ -1449,6 +1636,178 @@ mod tests {
         ));
     }
 
+    /// H1：AP 授权 op 必须等于内层执行 op（legal-hold/retention/x-id/multipart POST）。
+    #[tokio::test]
+    async fn ap_route_rejects_op_mismatch_and_checks_legal_hold_action() {
+        use s3s::route::S3Route as _;
+        let acl = ap_acl().await;
+        let cache = Arc::new(ApCache::new());
+        let ap = |name: &str, actions: &str| {
+            let policy: ApPolicy = serde_json::from_str(&format!(
+                r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},
+                   "Action":[{actions}],"Resource":"arn:aws:s3:::bkt/*"}}]}}"#
+            ))
+            .unwrap();
+            AccessPoint {
+                name: name.into(),
+                bucket: "bkt".into(),
+                owner_id: 7,
+                policy: Some(policy),
+                region: "us-east-1".into(),
+            }
+        };
+        cache.put(ap("putonly", r#""s3:PutObject","s3:GetObject""#));
+        cache.put(ap(
+            "full",
+            r#""s3:PutObject","s3:GetObject","s3:PutObjectLegalHold",
+               "s3:GetObjectLegalHold","s3:PutObjectRetention","s3:GetObjectRetention""#,
+        ));
+        let inner = Arc::new(s3s::service::S3ServiceBuilder::new(DummyS3).build());
+        struct NoSource;
+        #[async_trait::async_trait]
+        impl ApSource for NoSource {
+            async fn lookup(&self, _n: &str) -> Result<Option<AccessPoint>, String> {
+                Ok(None)
+            }
+        }
+        let route = ApRoute::new(
+            cache,
+            Arc::new(NoSource),
+            acl,
+            Arc::new(crate::olap::OlapCache::new()),
+            inner,
+        );
+        let mk = |method: http::Method, path: &str, headers: http::HeaderMap, body: &str| {
+            let mut r = S3Request {
+                input: s3s::Body::from(body.to_string()),
+                method,
+                uri: path.parse().unwrap(),
+                headers,
+                extensions: http::Extensions::new(),
+                credentials: Some(s3s::auth::Credentials {
+                    access_key: "AKIA_X".into(),
+                    secret_key: "s".into(),
+                }),
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            r.extensions.insert(ApMatch(true));
+            r
+        };
+        let code = |r: S3Result<()>| r.err().map(|e| e.code().clone());
+        use s3s::S3ErrorCode as C;
+
+        // 策略缺少动作 → 拒（直接与经 AP 两条路径都由 classify+s3_action 收口）
+        for (m, q) in [
+            (http::Method::PUT, "legal-hold"),
+            (http::Method::GET, "legal-hold"),
+            (http::Method::PUT, "retention"),
+            (http::Method::GET, "retention"),
+        ] {
+            let path = format!("/ap/putonly/k?{q}");
+            let mut req = mk(m, &path, http::HeaderMap::new(), "");
+            assert_eq!(
+                code(route.check_access(&mut req).await),
+                Some(C::AccessDenied),
+                "{path}"
+            );
+        }
+        // 策略含动作 → 放行且 op 精确
+        let cases = [
+            (
+                http::Method::PUT,
+                "/ap/full/k?legal-hold&x-id=PutObjectLegalHold",
+                "PutObjectLegalHold",
+            ),
+            (
+                http::Method::GET,
+                "/ap/full/k?legal-hold&versionId=v1",
+                "GetObjectLegalHold",
+            ),
+            (
+                http::Method::PUT,
+                "/ap/full/k?retention",
+                "PutObjectRetention",
+            ),
+        ];
+        for (m, path, want) in cases {
+            let mut req = mk(m, path, http::HeaderMap::new(), "");
+            route.check_access(&mut req).await.unwrap();
+            assert_eq!(req.extensions.get::<ApInvocation>().unwrap().op, want);
+        }
+        // x-id 与推导不一致 / 重复 → 400（不再进入策略判定）
+        for path in [
+            "/ap/full/k?x-id=PutObjectLegalHold",
+            "/ap/full/k?legal-hold&x-id=PutObject",
+            "/ap/full/k?x-id=PutObject&x-id=PutObject",
+        ] {
+            let mut req = mk(http::Method::PUT, path, http::HeaderMap::new(), "");
+            assert_eq!(
+                code(route.check_access(&mut req).await),
+                Some(C::InvalidRequest),
+                "{path}"
+            );
+        }
+        // multipart/form-data POST：内层会执行 PostObject → 整类拒绝（含 ?delete）
+        for path in ["/ap/full?delete", "/ap/full/k?uploads"] {
+            let mut h = http::HeaderMap::new();
+            h.insert(
+                http::header::CONTENT_TYPE,
+                "multipart/form-data; boundary=x".parse().unwrap(),
+            );
+            let mut req = mk(http::Method::POST, path, h, "--x--");
+            assert_eq!(
+                code(route.check_access(&mut req).await),
+                Some(C::InvalidRequest),
+                "{path}"
+            );
+        }
+        // 正常 xml DeleteObjects 不变；未知查询形状 501
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::CONTENT_TYPE,
+            "application/xml".parse().unwrap(),
+        );
+        let body = "<Delete><Object><Key>a</Key></Object></Delete>";
+        let mut req = mk(http::Method::POST, "/ap/full?delete", h, body);
+        route.check_access(&mut req).await.unwrap();
+        assert_eq!(
+            req.extensions.get::<ApInvocation>().unwrap().op,
+            "DeleteObjects"
+        );
+        let mut req = mk(
+            http::Method::PUT,
+            "/ap/full/k?tagging&retention",
+            http::HeaderMap::new(),
+            "",
+        );
+        assert_eq!(
+            code(route.check_access(&mut req).await),
+            Some(C::NotImplemented)
+        );
+        // 普通对象读写/复制不变
+        let mut req = mk(
+            http::Method::PUT,
+            "/ap/full/k",
+            http::HeaderMap::new(),
+            "body",
+        );
+        route.check_access(&mut req).await.unwrap();
+        assert_eq!(
+            req.extensions.get::<ApInvocation>().unwrap().op,
+            "PutObject"
+        );
+        let mut h = http::HeaderMap::new();
+        h.insert(s3s::header::X_AMZ_COPY_SOURCE, "/bkt/src".parse().unwrap());
+        let mut req = mk(http::Method::PUT, "/ap/full/k", h, "");
+        route.check_access(&mut req).await.unwrap();
+        assert_eq!(
+            req.extensions.get::<ApInvocation>().unwrap().op,
+            "CopyObject"
+        );
+    }
+
     #[test]
     fn canonical_key_decoding_matrix() {
         assert_eq!(percent_decode_strict("a%2Fb").unwrap(), "a/b");
@@ -1502,9 +1861,47 @@ mod tests {
             derive_op(&Method::PUT, Some("k"), "retention", false).unwrap(),
             "PutObjectRetention"
         );
+        assert_eq!(
+            derive_op(&Method::GET, Some("k"), "legal-hold", false).unwrap(),
+            "GetObjectLegalHold"
+        );
+        assert_eq!(
+            derive_op(&Method::PUT, Some("k"), "legal-hold&versionId=v1", false).unwrap(),
+            "PutObjectLegalHold"
+        );
         assert!(
             derive_op(&Method::GET, None, "acl", false).is_err(),
             "未知桶级子资源仍 fail-closed"
+        );
+        // H1：未列入白名单的子资源即使内层有同名 op 也必须拒（否则授权 op 分叉）
+        for (m, k, q) in [
+            (Method::PUT, Some("k"), "acl"),
+            (Method::GET, Some("k"), "acl"),
+            (Method::GET, Some("k"), "torrent"),
+            (Method::GET, None, "tagging"),
+            (Method::PUT, None, "tagging"),
+            (Method::DELETE, None, "tagging"),
+            // 多子资源：内层按位优先级选 op，无法保证与推导一致
+            (Method::GET, Some("k"), "tagging&retention"),
+            (Method::PUT, Some("k"), "retention&legal-hold"),
+            // 对象级 POST 的 uploadId 分支不能再落回 PutObject 一类的默认臂
+            (Method::PUT, Some("k"), "uploadId=u"),
+        ] {
+            assert!(
+                derive_op(&m, k, q, false).is_err(),
+                "{m} {k:?} ?{q} 必须拒绝"
+            );
+        }
+        // 客户端转发 x-id 属于合法形状（值由 check_access 校验）
+        assert_eq!(
+            derive_op(
+                &Method::GET,
+                Some("k"),
+                "x-id=GetObject&versionId=v1",
+                false
+            )
+            .unwrap(),
+            "GetObject"
         );
         assert_eq!(
             derive_op(&Method::GET, None, "list-type=2", false).unwrap(),
@@ -1523,7 +1920,7 @@ mod tests {
             "AbortMultipartUpload"
         );
         assert_eq!(
-            derive_op(&Method::POST, None, "uploads", false).unwrap(),
+            derive_op(&Method::POST, Some("k"), "uploads", false).unwrap(),
             "CreateMultipartUpload"
         );
         assert_eq!(

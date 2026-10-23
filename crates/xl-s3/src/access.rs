@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt as _;
+use http::HeaderMap;
 use sqlx::{Row, SqlitePool};
 
 use xl_store::mesh::{ControlQuery, ControlRow, MeshTransport};
@@ -91,6 +92,56 @@ pub struct Acl {
     pool: SqlitePool,
     /// 集群控制面扇出（None = 单节点：本地查无即拒，fail-closed 语义不变）
     mesh: Option<ControlMesh>,
+    /// M1：匿名拒绝审计限流器（进程级；Clone 共享同一桶）。
+    anon_deny: Arc<AnonDenyLimiter>,
+}
+
+/// 匿名拒绝审计的令牌桶：未认证请求可无限灌入，拒绝审计不能线性写 SQLite。
+/// 匿名 **允许** 仍全量审计（审计价值最高）；拒绝最多突发 [`ANON_DENY_BURST`] 条、
+/// 每秒补 [`ANON_DENY_PER_SEC`] 条，丢弃计数每 1000 条告警一次。
+struct AnonDenyLimiter {
+    state: std::sync::Mutex<AnonDenyLimiterState>,
+}
+
+struct AnonDenyLimiterState {
+    tokens: f64,
+    last: std::time::Instant,
+    dropped: u64,
+}
+
+const ANON_DENY_BURST: f64 = 20.0;
+const ANON_DENY_PER_SEC: f64 = 5.0;
+
+impl AnonDenyLimiter {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(AnonDenyLimiterState {
+                tokens: ANON_DENY_BURST,
+                last: std::time::Instant::now(),
+                dropped: 0,
+            }),
+        }
+    }
+
+    /// true = 落这一行；false = 丢弃。锁中毒按丢弃处理（不写审计是安全侧）。
+    fn try_acquire(&self) -> bool {
+        let Ok(mut s) = self.state.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(s.last).as_secs_f64();
+        s.last = now;
+        s.tokens = (s.tokens + elapsed * ANON_DENY_PER_SEC).min(ANON_DENY_BURST);
+        if s.tokens >= 1.0 {
+            s.tokens -= 1.0;
+            return true;
+        }
+        s.dropped += 1;
+        if s.dropped % 1000 == 0 {
+            tracing::warn!(dropped = s.dropped, "匿名拒绝审计持续限流，已丢弃累计条数");
+        }
+        false
+    }
 }
 
 fn now() -> i64 {
@@ -102,12 +153,20 @@ fn now() -> i64 {
 
 impl Acl {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool, mesh: None }
+        Self {
+            pool,
+            mesh: None,
+            anon_deny: Arc::new(AnonDenyLimiter::new()),
+        }
     }
 
     /// 集群形态（Task 9）：读路径本地 miss → peers 扇出（写入仍只落本节点；强一致归 M9）。
     pub fn with_mesh(pool: SqlitePool, mesh: Option<ControlMesh>) -> Self {
-        Self { pool, mesh }
+        Self {
+            pool,
+            mesh,
+            anon_deny: Arc::new(AnonDenyLimiter::new()),
+        }
     }
 
     /// 桶版本控制状态（M4 切片 3；`buckets.versioning`）：无行/旧库缺列值 → "Off"（fail-closed 兼容）。
@@ -250,6 +309,21 @@ impl Acl {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 匿名拒绝审计（限流；uid=0 哨兵）。返回 Ok 不代表已落行——洪水期会丢弃。
+    pub async fn write_anonymous_deny_audit(
+        &self,
+        op: &str,
+        bucket: Option<&str>,
+        object_key: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        if !self.anon_deny.try_acquire() {
+            return Ok(());
+        }
+        self.write_audit(0, op, bucket, object_key, "deny", detail)
+            .await
     }
 
     /// 清桶策略（删桶时调用——与生命周期规则同款 S6-1 语义）。
@@ -805,6 +879,31 @@ pub(crate) fn acl_err(e: sqlx::Error) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, "internal error")
 }
 
+/// L1：匿名请求携带的对象锁/治理旁路头（返回头名用于审计；值不记录）。
+fn anonymous_lock_header(headers: &HeaderMap) -> Option<&'static str> {
+    [
+        (
+            "x-amz-object-lock-mode",
+            s3s::header::X_AMZ_OBJECT_LOCK_MODE,
+        ),
+        (
+            "x-amz-object-lock-retain-until-date",
+            s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+        ),
+        (
+            "x-amz-object-lock-legal-hold",
+            s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD,
+        ),
+        (
+            "x-amz-bypass-governance-retention",
+            s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, h)| headers.contains_key(h.clone()))
+    .map(|(name, _)| name)
+}
+
 /// s3s 的授权入口：`check` 在反序列化**前**对每个请求执行（我们已 `set_auth` → 恒走；
 /// per-op 方法默认 Ok 是叠加非替代，无需实现）。判据与三面共用的 [`Acl::can`] 同源；
 /// 匿名走 [`Acl::anonymous_decision`]（仅桶策略 + 数据面白名单），不进入表三档。
@@ -869,18 +968,21 @@ impl Acl {
         bucket: Option<&str>,
         key: Option<&str>,
     ) -> S3Result<()> {
-        let (allow, detail) = self.anonymous_decision(op, bucket, key).await?;
-        if let Err(e) = self
-            .write_audit(
-                0,
-                op,
-                bucket,
-                key,
-                if allow { "allow" } else { "deny" },
-                detail.as_deref(),
-            )
-            .await
-        {
+        // L1：匿名请求不得携带对象锁/治理旁路头。匿名策略没有可表达的对应动作，
+        // 无法判断保留策略是否允许 → fail-closed（写/删都可能改锁语义）。
+        let (allow, detail) = match anonymous_lock_header(cx.headers()) {
+            Some(h) => (false, Some(format!("anonymous:object-lock-header:{h}"))),
+            None => self.anonymous_decision(op, bucket, key).await?,
+        };
+        // M1：允许全量审计；拒绝经进程级令牌桶限流，避免未认证洪水撑爆 SQLite。
+        let audited = if allow {
+            self.write_audit(0, op, bucket, key, "allow", detail.as_deref())
+                .await
+        } else {
+            self.write_anonymous_deny_audit(op, bucket, key, detail.as_deref())
+                .await
+        };
+        if let Err(e) = audited {
             tracing::warn!(error = %e, "审计落行失败");
         }
         if allow {
@@ -1227,6 +1329,7 @@ fn classify(op: &str) -> Option<Gate> {
         | "HeadObject"
         | "GetObjectTagging"
         | "GetObjectRetention"
+        | "GetObjectLegalHold"
         | "ListObjectVersions"
         | "SelectObjectContent" => Gate::Need(Action::Read),
         // 写（Abort 归写——它是写路径的清理；PostObject 的 trait 默认实现委托
@@ -1236,6 +1339,7 @@ fn classify(op: &str) -> Option<Gate> {
         | "PutObjectTagging"
         | "DeleteObjectTagging"
         | "PutObjectRetention"
+        | "PutObjectLegalHold"
         | "CreateMultipartUpload"
         | "UploadPart"
         | "CompleteMultipartUpload"
@@ -1423,7 +1527,10 @@ mod tests {
              CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
               can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
               PRIMARY KEY (user_id, bucket));\
-             CREATE TABLE bucket_policies (bucket TEXT PRIMARY KEY, policy_json TEXT NOT NULL);",
+             CREATE TABLE bucket_policies (bucket TEXT PRIMARY KEY, policy_json TEXT NOT NULL);\
+             CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
+              uid INTEGER NOT NULL, op TEXT NOT NULL, bucket TEXT, object_key TEXT, \
+              decision TEXT NOT NULL, detail TEXT);",
         )
         .execute(&pool)
         .await
@@ -1526,6 +1633,7 @@ mod tests {
             "SelectObjectContent",
             "GetObjectTagging",
             "GetObjectRetention",
+            "GetObjectLegalHold",
             "GetBucketLifecycleConfiguration",
             "GetBucketInventoryConfiguration",
             "ListBucketInventoryConfigurations",
@@ -1543,6 +1651,7 @@ mod tests {
             "PutObjectTagging",
             "DeleteObjectTagging",
             "PutObjectRetention",
+            "PutObjectLegalHold",
             "RestoreObject",
         ] {
             assert_eq!(classify(op), Some(Gate::Need(Action::Write)), "{op}");
@@ -1568,6 +1677,47 @@ mod tests {
         }
         // 未映射 op → fail-closed
         assert_eq!(classify("Frobnicate"), None);
+    }
+
+    /// M1：匿名拒绝审计限流（允许不限；拒绝突发 20 后丢弃）。
+    #[test]
+    fn anonymous_deny_limiter_burst_then_drop() {
+        let l = AnonDenyLimiter::new();
+        for _ in 0..ANON_DENY_BURST as usize {
+            assert!(l.try_acquire());
+        }
+        assert!(!l.try_acquire(), "突发额度耗尽后必须丢弃");
+    }
+
+    /// M1：写入路径确实经限流（20 条后不再增长；放行 1 个 token 的时钟余量）。
+    #[tokio::test]
+    async fn anonymous_deny_audit_writes_are_capped() {
+        let a = acl().await;
+        for _ in 0..30 {
+            a.write_anonymous_deny_audit("GetObject", Some("b"), Some("k"), None)
+                .await
+                .unwrap();
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert!((20..=21).contains(&n), "匿名拒绝审计被限流：{n}");
+    }
+
+    /// L1：匿名请求的对象锁/治理旁路头被识别（大小写不敏感由 HeaderMap 归一）。
+    #[test]
+    fn anonymous_lock_headers_are_rejected() {
+        let mut h = HeaderMap::new();
+        assert_eq!(anonymous_lock_header(&h), None);
+        h.insert("x-amz-object-lock-mode", "GOVERNANCE".parse().unwrap());
+        assert_eq!(anonymous_lock_header(&h), Some("x-amz-object-lock-mode"));
+        h.clear();
+        h.insert("x-amz-bypass-governance-retention", "true".parse().unwrap());
+        assert_eq!(
+            anonymous_lock_header(&h),
+            Some("x-amz-bypass-governance-retention")
+        );
     }
 
     #[tokio::test]

@@ -2487,19 +2487,32 @@ impl S3 for OssS3 {
                 }
             };
             if !allowed {
-                let uid = user.as_ref().map_or(0, |u| u.uid);
-                if let Err(e) = self
-                    .acl
-                    .write_audit(
-                        uid,
-                        "DeleteObjects",
-                        Some(&bucket),
-                        Some(&obj.key),
-                        "deny",
-                        deny_detail,
-                    )
-                    .await
-                {
+                // M1：匿名拒绝走限流审计（键可放大到 1000/请求）；已认证仍全量。
+                let audited = match &user {
+                    Some(u) => {
+                        self.acl
+                            .write_audit(
+                                u.uid,
+                                "DeleteObjects",
+                                Some(&bucket),
+                                Some(&obj.key),
+                                "deny",
+                                deny_detail,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.acl
+                            .write_anonymous_deny_audit(
+                                "DeleteObjects",
+                                Some(&bucket),
+                                Some(&obj.key),
+                                deny_detail,
+                            )
+                            .await
+                    }
+                };
+                if let Err(e) = audited {
                     tracing::warn!(error = %e, "审计落行失败");
                 }
                 errors.push(Error {
