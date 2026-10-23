@@ -283,13 +283,23 @@ impl InventoryRunner {
             );
             return Err(self.fail(run.id, run.job_id, msg).await);
         };
-        let is_admin = self
+        // 运行期复核所有者仍存在且启用：停用/删除用户后配置不得继续产出。
+        let (is_admin, active) = match self
             .db
             .get_user(cfg_row.owner_id)
             .await
             .map_err(|e| e.to_string())?
-            .map(|u| u.1)
-            .unwrap_or(false);
+        {
+            Some((_, is_admin, active)) => (is_admin, active),
+            None => {
+                let msg = format!("配置所有者 {} 不存在，拒绝运行清单", cfg_row.owner_id);
+                return Err(self.fail(run.id, run.job_id, msg).await);
+            }
+        };
+        if !active {
+            let msg = format!("配置所有者 {} 已停用，拒绝运行清单", cfg_row.owner_id);
+            return Err(self.fail(run.id, run.job_id, msg).await);
+        }
         let owner = AuthedUser {
             uid: cfg_row.owner_id,
             is_admin,
@@ -363,6 +373,20 @@ impl InventoryRunner {
         {
             let msg = format!("目标桶不存在：{dest}");
             return Err(self.fail(run.id, run.job_id, msg).await);
+        }
+        // 运行期复核源桶读权限：配置创建后权限被撤销 → 失败关闭，不扫描、不写输出。
+        match self
+            .acl
+            .check_op(&owner, "", "ListObjectsV2", Some(&p.bucket), None, None)
+            .await
+        {
+            Ok((true, _)) => {}
+            Ok((false, detail)) => {
+                let suffix = detail.map(|d| format!("（{d}）")).unwrap_or_default();
+                let msg = format!("配置所有者没有源桶 {} 的 ListBucket 权限{suffix}", p.bucket);
+                return Err(self.fail(run.id, run.job_id, msg).await);
+            }
+            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
         }
         // 3.6：增量模式 per config（默认全量）。水位是「上次扫描开始时刻」：
         // 本轮输出 last_modified >= 水位 的对象/版本，扫描开始时刻作为新水位。

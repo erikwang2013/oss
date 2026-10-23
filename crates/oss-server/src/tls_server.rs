@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::serve::ListenerExt as _;
 use ecat_transport::Server as TransportServer;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -69,9 +70,14 @@ impl TransportServer for ReloadableHttpServer {
             let _ = rx.changed().await;
         };
         let tls_listener = TlsListener::new(listener, Arc::clone(&self.tls));
-        axum::serve(tls_listener, router)
-            .with_graceful_shutdown(shutdown_signal)
-            .await?;
+        // ConnectInfo 注入直连对端地址：AP 转发头信任必须以实际 TCP 对端为准
+        // （tap_io 只为让 axum 的 Connected 实现把对端地址带进请求扩展）。
+        axum::serve(
+            tls_listener.tap_io(|_| {}),
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
         Ok(())
     }
 
