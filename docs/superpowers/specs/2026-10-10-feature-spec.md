@@ -761,8 +761,9 @@ WASM 模块 ≤16 MiB、保存即编译、燃料限额；未以 `olap-wasm` 构�
 CSV/Parquet 单数据文件（数据文件 ≤5 GiB，CSV 可 gzip）。控制台配置 `incremental=true` 时开启
 **水位增量**：首轮全量，之后只输出 `LastModified ≥ 上轮扫描开始时刻` 的对象/版本，manifest
 `incremental.previousCursor/cursor` 记录水位，水位随配置变更失效；无版本控制桶的删除没有墓碑，
-不会出现在增量清单里（需要完整快照时关掉增量）。`IsMultipartUploaded`/
-`IntelligentTieringAccessTier` 不支持。
+不会出现在增量清单里（需要完整快照时关掉增量）。增量开关与水位存于节点本地表，**仅支持单节点
+（非 Raft）部署**：Raft 模式下控制台写入 `incremental=true` 返回 400，读取恒报 `false`。
+`IsMultipartUploaded`/`IntelligentTieringAccessTier` 不支持。
 
 ---
 
