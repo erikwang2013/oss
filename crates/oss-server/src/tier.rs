@@ -3,9 +3,9 @@
 //! 远端 key 口径：`<tier_id>/<bucket>/<version_id>/<raw key>`，raw key 不预编码；
 //! 编码只发生在 [`ReplClient`] 的 canonical path（N3）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use futures::StreamExt as _;
 use md5::Digest as _;
@@ -30,41 +30,215 @@ pub struct TierPutResult {
 /// 上传暂存余量：spool/restore staging 前要求磁盘至少多出这么多空闲字节。
 pub const STAGING_FREE_RESERVE: u64 = 64 << 20;
 
-/// 免费空间检查（fail closed）：`f_bavail × f_frsize ≥ need + reserve`。
-pub fn ensure_free_space(dir: &Path, need: u64, reserve: u64) -> Result<(), String> {
-    let vfs = rustix::fs::statvfs(dir)
-        .map_err(|e| format!("读取 {:?} 剩余空间失败：{e}", dir.display()))?;
-    let avail = vfs.f_bavail.saturating_mul(vfs.f_frsize);
-    let want = need.saturating_add(reserve);
+/// 进程内磁盘预留：key = 文件系统设备号，value = 已登记字节数。
+///
+/// Restore/Transition 先登记再写盘；否则并发作业各自 statvfs 通过后会一起写爆。
+/// 只覆盖本进程（同一数据目录不允许多进程写，与对象锁口径一致）。
+static SPACE_RESERVATIONS: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 预留登记；Drop 即释放（成功、失败、future 取消统一走这里）。
+pub struct SpaceReservation {
+    dev: u64,
+    bytes: u64,
+}
+
+impl Drop for SpaceReservation {
+    fn drop(&mut self) {
+        let mut map = SPACE_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = map.get_mut(&self.dev) {
+            *held = held.saturating_sub(self.bytes);
+            if *held == 0 {
+                map.remove(&self.dev);
+            }
+        }
+    }
+}
+
+fn device_id(dir: &Path) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(dir)
+        .map(|m| m.dev())
+        .map_err(|e| format!("读取 {:?} 设备号失败：{e}", dir.display()))
+}
+
+/// 预留判定（纯函数）：`held` 为同设备已登记量，成功后累加 `need`。
+/// 仍留 `reserve` 空闲余量；`held` 偏大时按已登记量保守拒绝（宁可 fail closed）。
+fn try_reserve(held: &mut u64, avail: u64, need: u64, reserve: u64) -> Result<(), String> {
+    let want = held.saturating_add(need).saturating_add(reserve);
     if avail < want {
         return Err(format!(
-            "磁盘剩余空间不足（{:?}：可用 {avail} 字节 < 需要 {want}）",
-            dir.display()
+            "磁盘剩余空间不足（可用 {avail} 字节 < 需要 {want}）"
         ));
     }
+    *held = held.saturating_add(need);
     Ok(())
 }
 
-/// 暂存文件守卫：任何错误/取消路径（含 future drop）都会删除暂存文件。
+/// 在 `dir` 所在文件系统登记 `need` 字节；检查与登记在同一把锁内，并发不会超卖。
+pub fn reserve_free_space(dir: &Path, need: u64, reserve: u64) -> Result<SpaceReservation, String> {
+    let dev = device_id(dir)?;
+    let vfs = rustix::fs::statvfs(dir)
+        .map_err(|e| format!("读取 {:?} 剩余空间失败：{e}", dir.display()))?;
+    let avail = vfs.f_bavail.saturating_mul(vfs.f_frsize);
+    let mut map = SPACE_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = map.get(&dev).copied().unwrap_or(0);
+    try_reserve(&mut held, avail, need, reserve)
+        .map_err(|e| format!("{e}（{}）", dir.display()))?;
+    map.insert(dev, held);
+    Ok(SpaceReservation { dev, bytes: need })
+}
+
+/// 进程内活跃暂存文件：正在写的 spool 登记在此，sweeper 一律跳过。
+/// （age 阈值之外的第二道保险；扫描持锁，避免「检查后登记」竞态。）
+static ACTIVE_STAGES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 崩溃残留 S3 spool 暂存文件（`tier-*.stage`）的默认保留时长 / 清理周期。
+pub const STAGE_SWEEP_AGE_SECS: u64 = 3600;
+pub const STAGE_SWEEP_INTERVAL_SECS: u64 = 3600;
+/// 安全下界：age 太小会与共享暂存盘的另一进程 spool 打架；周期太小纯耗 IO。
+const STAGE_SWEEP_MIN_AGE_SECS: u64 = 300;
+const STAGE_SWEEP_MAX_AGE_SECS: u64 = 7 * 86_400;
+const STAGE_SWEEP_MIN_INTERVAL_SECS: u64 = 60;
+
+/// 清理 `dir` 下崩溃残留的 `tier-*.stage`（非递归）：只删 mtime 年龄
+/// ≥ `min_age_secs`、不在活跃登记里、且是普通文件的条目；链接/目录不碰。
+/// 返回删除数。目录不存在 = 0。
+pub fn sweep_stale_stages(dir: &Path, min_age_secs: u64) -> Result<usize, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("tier 暂存目录不可读（{}）：{e}", dir.display())),
+    };
+    let active = ACTIVE_STAGES.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for ent in entries {
+        let Ok(ent) = ent else { continue };
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("tier-") || !name.ends_with(".stage") {
+            continue;
+        }
+        let path = ent.path();
+        if active.contains(&path) {
+            continue;
+        }
+        // DirEntry::metadata 不跟随符号链接（lstat 语义）。
+        let Ok(md) = ent.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let old = md
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age.as_secs() >= min_age_secs);
+        if !old {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "tier 暂存文件清理失败")
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+async fn sweep_stages_once(dir: &Path, min_age_secs: u64) {
+    let d = dir.to_path_buf();
+    let r = tokio::task::spawn_blocking(move || sweep_stale_stages(&d, min_age_secs)).await;
+    match r {
+        Ok(Ok(n)) if n > 0 => tracing::info!(n, "tier 暂存清理：删除陈旧 stage 文件"),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "tier 暂存清理失败"),
+        Err(e) => tracing::warn!(error = %e, "tier 暂存清理任务失败"),
+    }
+}
+
+/// 启动即扫一轮，之后按 `OSS_TIER_STAGE_SWEEP_INTERVAL_SECS`（默认 3600，0 = 只扫启动轮）
+/// 周期清理；年龄 `OSS_TIER_STAGE_SWEEP_AGE_SECS` 默认 3600，夹在 300..=7d。
+pub fn spawn_stage_sweeper(dir: PathBuf) {
+    let age = env_secs("OSS_TIER_STAGE_SWEEP_AGE_SECS", STAGE_SWEEP_AGE_SECS)
+        .clamp(STAGE_SWEEP_MIN_AGE_SECS, STAGE_SWEEP_MAX_AGE_SECS);
+    let interval = env_secs(
+        "OSS_TIER_STAGE_SWEEP_INTERVAL_SECS",
+        STAGE_SWEEP_INTERVAL_SECS,
+    );
+    tokio::spawn(async move {
+        sweep_stages_once(&dir, age).await;
+        if interval == 0 {
+            tracing::info!("tier 暂存清理：仅启动轮（OSS_TIER_STAGE_SWEEP_INTERVAL_SECS=0）");
+            return;
+        }
+        let mut t = tokio::time::interval(std::time::Duration::from_secs(
+            interval.max(STAGE_SWEEP_MIN_INTERVAL_SECS),
+        ));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t.tick().await; // 消耗立即触发的首 tick：启动轮已经扫过
+        loop {
+            t.tick().await;
+            sweep_stages_once(&dir, age).await;
+        }
+    });
+}
+
+/// 暂存文件守卫：任何错误/取消路径（含 future drop）都会删除暂存文件；
+/// 附带磁盘预留（若登记过）也在同一生命周期内释放。
 pub struct StageGuard {
     path: Option<PathBuf>,
+    // 只为 Drop 持有；显式下划线避免「字段未读」告警。
+    _space: Option<SpaceReservation>,
 }
 
 impl StageGuard {
     pub fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+        ACTIVE_STAGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
+        Self {
+            path: Some(path),
+            _space: None,
+        }
     }
 
-    /// 暂存文件已被 rename 到最终位置：不再尝试删除。
+    /// 把在写盘前登记的预留交给守卫：成功/失败/取消都由守卫统一释放。
+    pub fn with_reservation(mut self, space: SpaceReservation) -> Self {
+        self._space = Some(space);
+        self
+    }
+
+    /// 暂存文件已被 rename 到最终位置：不再尝试删除（预留照常释放）。
     pub fn disarm(mut self) {
-        self.path = None;
+        if let Some(p) = self.path.take() {
+            ACTIVE_STAGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&p);
+        }
     }
 }
 
 impl Drop for StageGuard {
     fn drop(&mut self) {
         if let Some(p) = self.path.take() {
-            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(&p);
+            ACTIVE_STAGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&p);
         }
     }
 }
@@ -141,11 +315,12 @@ impl S3TierBackend {
         tokio::fs::create_dir_all(&self.staging_dir)
             .await
             .map_err(|e| format!("tier 暂存目录不可用：{e}"))?;
-        ensure_free_space(&self.staging_dir, size, STAGING_FREE_RESERVE)?;
+        // 先登记预留再落盘：并发 spool 不会都通过 statvfs 后一起写爆。
+        let space = reserve_free_space(&self.staging_dir, size, STAGING_FREE_RESERVE)?;
         let path = self
             .staging_dir
             .join(format!("tier-{}.stage", uuid::Uuid::new_v4()));
-        let guard = StageGuard::new(path.clone());
+        let guard = StageGuard::new(path.clone()).with_reservation(space);
         let mut f = tokio::fs::File::create(&path)
             .await
             .map_err(|e| format!("tier 暂存文件创建失败：{e}"))?;
@@ -349,5 +524,98 @@ impl xl_s3::tier_gc::TierGcSink for S3TierGc {
         } else {
             Err(errors.join("; "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn age_file(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// 并发超卖边界：已登记量计入检查，失败不改账；饱和运算不 panic。
+    #[test]
+    fn reservation_refuses_overcommit_and_counts_held() {
+        let mut held = 0u64;
+        try_reserve(&mut held, 1000, 400, 100).unwrap();
+        assert_eq!(held, 400);
+        let err = try_reserve(&mut held, 1000, 501, 100).unwrap_err();
+        assert!(err.contains("磁盘剩余空间不足"), "{err}");
+        assert_eq!(held, 400, "失败不得改变已登记量");
+        // 恰好用满（400+500+100 = 1000）仍允许。
+        try_reserve(&mut held, 1000, 500, 100).unwrap();
+        assert_eq!(held, 900);
+
+        // need+reserve 饱和到 u64::MAX：可用 MAX-1 时必须拒绝，且不改账。
+        let mut h = 0u64;
+        assert!(try_reserve(&mut h, u64::MAX - 1, u64::MAX, 1).is_err());
+        assert_eq!(h, 0);
+    }
+
+    /// 预留随 Drop 释放（成功/失败/取消同一路径），不泄漏设备账。
+    /// 合成设备号避开并行单测的真实设备（local_tier put 也会登记）。
+    #[test]
+    fn reservation_released_on_drop() {
+        let dev = u64::MAX;
+        SPACE_RESERVATIONS.lock().unwrap().insert(dev, 123);
+        drop(SpaceReservation { dev, bytes: 123 });
+        assert!(!SPACE_RESERVATIONS.lock().unwrap().contains_key(&dev));
+        // 超量释放饱和到 0，不 panic、不留账。
+        SPACE_RESERVATIONS.lock().unwrap().insert(dev, 5);
+        drop(SpaceReservation { dev, bytes: 9 });
+        assert!(!SPACE_RESERVATIONS.lock().unwrap().contains_key(&dev));
+    }
+
+    /// 只删「旧 + 非活跃 + 普通文件 + tier-*.stage」；新文件、活跃文件、
+    /// 非匹配名、目录、符号链接一律保留。
+    #[test]
+    fn sweeps_only_old_inactive_stage_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        for name in [
+            "tier-old.stage",
+            "tier-fresh.stage",
+            "tier-active.stage",
+            "other.stage",
+            "tier-x.tmp",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        age_file(&dir.join("tier-old.stage"), 7200);
+        age_file(&dir.join("tier-active.stage"), 7200);
+        age_file(&dir.join("other.stage"), 7200);
+        age_file(&dir.join("tier-x.tmp"), 7200);
+        std::fs::create_dir(dir.join("tier-dir.stage")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-target", dir.join("tier-link.stage")).unwrap();
+
+        // 活跃文件：由 StageGuard 登记（崩溃残留本身不会有 guard）。
+        let guard = StageGuard::new(dir.join("tier-active.stage"));
+        assert_eq!(sweep_stale_stages(dir, 3600).unwrap(), 1);
+        assert!(!dir.join("tier-old.stage").exists());
+        assert!(dir.join("tier-fresh.stage").exists(), "新文件不得删除");
+        assert!(dir.join("tier-active.stage").exists(), "活跃文件不得删除");
+        assert!(dir.join("other.stage").exists(), "非 tier-*.stage 不得删除");
+        assert!(dir.join("tier-x.tmp").exists(), "非 .stage 后缀不得删除");
+        assert!(dir.join("tier-dir.stage").is_dir(), "目录不得删除");
+        assert!(
+            std::fs::symlink_metadata(dir.join("tier-link.stage")).is_ok(),
+            "符号链接不得删除/跟随"
+        );
+
+        // 摘掉活跃登记后，同一文件才可被清理（证明跳过确因活跃）。
+        guard.disarm();
+        assert_eq!(sweep_stale_stages(dir, 3600).unwrap(), 1);
+        assert!(!dir.join("tier-active.stage").exists());
+    }
+
+    #[test]
+    fn sweep_missing_dir_is_noop() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(sweep_stale_stages(&d.path().join("nope"), 0).unwrap(), 0);
     }
 }

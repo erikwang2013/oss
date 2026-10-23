@@ -22,7 +22,9 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::tier::{TierBackend, TierByteStream, TierObject, TierPutResult};
+use crate::tier::{
+    SpaceReservation, TierBackend, TierByteStream, TierObject, TierPutResult, reserve_free_space,
+};
 
 #[cfg(target_os = "linux")]
 fn resolve_flags() -> ResolveFlags {
@@ -137,11 +139,15 @@ struct LocalTmp {
     tmp: String,
     name: String,
     done: bool,
+    // 写盘前登记的磁盘预留；随 Drop 释放（成功/失败/取消同一路径）。
+    _space: SpaceReservation,
 }
 
 impl LocalTmp {
-    fn create(root: &Path, rel: &Path) -> Result<(Self, std::fs::File), String> {
+    fn create(root: &Path, rel: &Path, size: u64) -> Result<(Self, std::fs::File), String> {
         std::fs::create_dir_all(root).map_err(|e| format!("本地 tier 建目录失败：{e}"))?;
+        // Transition 也落盘：并发写同一冷盘池时先登记，避免一起写爆。
+        let space = reserve_free_space(root, size, 0)?;
         let (parent, name) = open_parent(root, rel, true)?;
         let name = name
             .to_str()
@@ -161,6 +167,7 @@ impl LocalTmp {
                 tmp,
                 name,
                 done: false,
+                _space: space,
             },
             std::fs::File::from(fd),
         ))
@@ -310,7 +317,9 @@ impl TierBackend for LocalTierBackend {
     ) -> Result<TierPutResult, String> {
         let rel = Self::safe_rel(key)?;
         let root = self.root.clone();
-        let (tmp, f) = self.blocking(move || LocalTmp::create(&root, &rel)).await?;
+        let (tmp, f) = self
+            .blocking(move || LocalTmp::create(&root, &rel, size))
+            .await?;
         let mut file = tokio::fs::File::from_std(f);
         let mut md5 = md5::Md5::new();
         let mut sha = sha2::Sha256::new();

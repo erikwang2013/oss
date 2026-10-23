@@ -16,7 +16,7 @@ use xl_store::store::Store;
 
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::jobs::TaskExecutor;
-use crate::tier::{StageGuard, TierBackends, TierByteStream, ensure_free_space, tier_key};
+use crate::tier::{StageGuard, TierBackends, TierByteStream, reserve_free_space, tier_key};
 
 /// 过渡/恢复的搬运窗口：内存驻留上限 = 一个窗口（+ 后端自己的 256 KiB 块）。
 pub const TIER_CHUNK: u64 = 8 << 20;
@@ -356,8 +356,9 @@ impl M8TaskExecutor {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| format!("恢复暂存目录创建失败：{e}"))?;
-        ensure_free_space(dir, t.size, self.restore_free_reserve)?;
-        let guard = StageGuard::new(stage.clone());
+        // 预留登记与检查同锁：并发恢复不会都通过检查后一起把数据盘写满。
+        let space = reserve_free_space(dir, t.size, self.restore_free_reserve)?;
+        let guard = StageGuard::new(stage.clone()).with_reservation(space);
         let mut body = backend.get(&t.key).await?;
         let mut f = tokio::fs::File::create(&stage)
             .await

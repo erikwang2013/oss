@@ -533,6 +533,8 @@ pub async fn run(
                 std::sync::Arc::clone(&state.lifecycle),
                 std::sync::Arc::clone(&state.restore_sink),
             );
+            // M8 加固：启动 + 周期清理崩溃残留的 S3 spool 暂存（tier-*.stage）。
+            crate::tier::spawn_stage_sweeper(state.cfg.staging_dir.clone());
             // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
             crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db));
 
