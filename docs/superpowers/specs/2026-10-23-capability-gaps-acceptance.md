@@ -56,7 +56,7 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 
 - AP 跨账号、VPC 端点、AP 桶级 Create/Delete/ListBuckets、AP 缓存一致性
   （AP 匿名已于后续批次支持，见 §8）。
-- Inventory 增量/跨账号；Batch 抢占/跨账号/每动作桶通知。
+- Inventory 增量/跨账号；Batch 抢占/跨账号（每动作桶通知已于后续批次实现，见 §8）。
 - Lifecycle `AbortIncompleteMultipartUpload`（需 MPU 索引，继续 501）。
 - Tier 流式搬运（全内存）。
 - Level C 任意双向混合版本；M3/M4 数据面、TLS 物料、跨版本 cutover/force-recover 仍非滚动。
@@ -144,3 +144,8 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 - **3.1 AP 匿名**：无凭据请求经 AP 需 AP 策略 `Principal:"*"` 与桶策略匿名基线同时放行
   （交集，AP 不放宽桶策略）；仅数据面白名单，控制面/桶级/锁头拒绝，审计 uid=0。
   此条为安全敏感变更，须单独复审。
+- **3.9 Batch 每动作桶通知**：成功动作经 `EventSink` 补发到**对象所在桶**的配置
+  （Copy→目标桶 `s3:ObjectCreated:Copy`；Delete→`s3:ObjectRemoved:Delete` /
+  `DeleteMarkerCreated`；Restore→`s3:ObjectRestore:Post`；NotFound、ReplaceTags、
+  InvokeLambda 不发）。事件源 `source.userAgent="oss-batch"`；不跨桶/跨账号投递；
+  发射失败不影响任务结果（outbox 至少一次）。

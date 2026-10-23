@@ -1009,6 +1009,10 @@ curl -s -X POST $E/api/v1/jobs/1/retry-failed -H "authorization: Bearer $JWT"  #
 - 任务动作：Copy 按 Copy 语义（目标桶/前缀、REPLACE 元数据/标签）；Delete 清 tier refs；
   ReplaceTags 整体替换标签；Restore 走 S4b 恢复；InvokeLambda 支持 HTTP 变换器，
   构建开启 `olap-wasm` 时也支持 WASM（输出丢弃）。
+- 桶通知：成功动作按**对象所在桶**的通知配置发事件（Copy→目标桶 `s3:ObjectCreated:Copy`；
+  Delete→`s3:ObjectRemoved:Delete` / `DeleteMarkerCreated`；Restore→`s3:ObjectRestore:Post`；
+  ReplaceTags/InvokeLambda 无对应 S3 事件类型，不发）；只投递到对象桶配置，不跨桶/跨账号，
+  发射失败不影响任务结果（outbox 至少一次）。
 - 配额：`OSS_JOB_MAX_INFLIGHT_PER_USER`（100）/`OSS_JOB_MAX_INFLIGHT_GLOBAL`（1000）；
   创建期逐行授权（去重），清单/任务上限见错误文案。
 - 报告：`<report_prefix>/<job_id>/results.csv`，固定列
@@ -1142,7 +1146,9 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    `*-s3alias` 桶回落普通桶路由（L4 已修复，见访问点节）。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
 4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
-   动作不发桶通知但发复制/清 tier。
+   动作按**对象所在桶**发桶通知（Copy→目标桶 `CreatedCopy`、Delete→`RemovedDelete`/
+   `DeleteMarkerCreated`、Restore→`RestorePost`；ReplaceTags/InvokeLambda 无对应 S3 事件
+   类型、不发），并照旧发复制/清 tier。
 5. Inventory 全量扫描、CSV/Parquet 单数据文件；不做跨账号/增量；Hive 兼容面仅
    `symlink.txt`（不含 Athena 建表/分区自动发现）。
 6. 分层支持远端 S3 与本地冷盘池、全内存搬运；S3 生命周期已支持 tag/size/And Filter、
