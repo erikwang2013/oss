@@ -743,6 +743,41 @@ impl Acl {
             .or_else(|| account_id_of(uid)))
     }
 
+    /// AP 跨账户：请求者账户 + 有效状态（成员行优先，无成员行回落 uid 派生账户）。
+    /// - 成员行：账户行必须存在且 `status='active'`（缺失/停用 → false，fail-closed）；
+    /// - 无成员行：派生账户实体行存在时按状态，不存在按 legacy 兼容视为有效。
+    ///
+    /// 查询失败由调用方 fail-closed（5xx）。
+    pub async fn account_identity_of_user(
+        &self,
+        uid: i64,
+    ) -> Result<(Option<String>, bool), sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT am.account_id AS account_id, a.status AS status \
+             FROM account_members am LEFT JOIN accounts a ON a.id = am.account_id \
+             WHERE am.uid = ?",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(r) = row {
+            let account: String = r.get("account_id");
+            let status: Option<String> = r.get("status");
+            return Ok((Some(account), status.as_deref() == Some("active")));
+        }
+        let Some(account) = account_id_of(uid) else {
+            return Ok((None, false));
+        };
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
+            .bind(&account)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok((
+            Some(account),
+            status.as_deref().is_none_or(|s| s == "active"),
+        ))
+    }
+
     /// AC-2：账户桶数硬配额（`accounts.bucket_quota`；NULL/负 = 不限）。
     /// 返回 true = 已到上限，拒绝建桶。查询失败由调用方 fail-closed（5xx）。
     /// shortcut: 计数与建桶行不在同一事务（并发建桶可短暂超配额），升级点是建桶 apply 内
@@ -2463,6 +2498,39 @@ mod tests {
             2,
             Some("123456789012")
         ));
+
+        // AP 跨账户用的账户身份快照：成员行优先 + 账户状态
+        assert_eq!(
+            a.account_identity_of_user(2).await.unwrap(),
+            (Some("123456789012".to_string()), true)
+        );
+        sqlx::query("UPDATE accounts SET status = 'disabled' WHERE id = '123456789012'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.account_identity_of_user(2).await.unwrap(),
+            (Some("123456789012".to_string()), false),
+            "停用账户 → active=false"
+        );
+        // 无成员行 → 派生账户；实体行存在则按状态，缺失按 legacy 兼容有效
+        assert_eq!(
+            a.account_identity_of_user(3).await.unwrap(),
+            (Some("000000000003".to_string()), true)
+        );
+        add_account(&a, "000000000003", "disabled", None).await;
+        assert_eq!(
+            a.account_identity_of_user(3).await.unwrap(),
+            (Some("000000000003".to_string()), false),
+            "派生的实体账户停用 → false"
+        );
+        // 成员行存在但账户行缺失 → fail-closed
+        add_user(&a, 4, false).await;
+        add_member(&a, "555555555555", 4, "member").await;
+        assert_eq!(
+            a.account_identity_of_user(4).await.unwrap(),
+            (Some("555555555555".to_string()), false)
+        );
     }
 
     /// AC-2：账户桶数硬配额（NULL/负 = 不限；停用账户 fail-closed 拒建桶）。

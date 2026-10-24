@@ -5,9 +5,11 @@
 //! 既有授权。策略方言 = 现有 `policy` 子集，但解析更严格（未知字段/条件运算符一律拒）。
 //!
 //! 账户命名空间 v1：AP ARN 的账户段 = **桶主**的 12 位 uid 派生账户（admin/NULL 桶 =
-//! `LEGACY_ACCOUNT`）；旧 ARN 账户段保留一版作资源别名。账户 = 用户，**不是租户隔离**。
-//! `aws:SourceVpc` 是**来源 VPC 证明**（静态 `OSS_AP_VPC_ID` 或可信反代头），不是
-//! PrivateLink 端点身份。AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是 non-goal。
+//! `LEGACY_ACCOUNT`）；旧 ARN 账户段保留一版作资源别名。跨账户授权**只经策略 Principal**
+//! （账户根 ARN 解析为账户成员集合），不改资源 ARN 归属。
+//! `aws:SourceVpc`/`aws:SourceVpce` 是**显式配置的来源证明**（静态 `OSS_AP_VPC_ID` /
+//! `OSS_AP_VPCE_ID` 或可信反代头），不是 PrivateLink/ENI 端点身份，两者互不推断。
+//! AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是 non-goal。
 //!
 //! 明确不支持（non-goals）：真 VPC 端点（PrivateLink/ENI）、经 AP 的桶级 Create/Delete/
 //! ListBuckets（保存策略时即拒绝这些动作）、多用户账户模型、强跨节点 AP 缓存一致性。
@@ -68,7 +70,7 @@ pub struct ApPrincipal {
     pub aws: StringOrVec,
 }
 
-/// 条件块：IP 条件 + `StringEquals` 的 `aws:SourceVpc`（来源 VPC 证明）。
+/// 条件块：IP 条件 + `StringEquals` 的 `aws:SourceVpc`/`aws:SourceVpce`（来源证明）。
 /// 未知运算符/条件键由 `deny_unknown_fields` 拒绝。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,7 +80,7 @@ pub struct ApCondition {
     #[serde(default, rename = "NotIpAddress")]
     pub not_ip_address: Option<ApIpCondition>,
     #[serde(default, rename = "StringEquals")]
-    pub string_equals: Option<ApVpcCondition>,
+    pub string_equals: Option<ApStringEqualsCondition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,21 +90,29 @@ pub struct ApIpCondition {
     pub source_ip: StringOrVec,
 }
 
+/// 两个键均为可选：至少出现一个；出现的键必须是合法证明 ID 的非空列表。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ApVpcCondition {
-    #[serde(rename = "aws:SourceVpc")]
-    pub source_vpc: StringOrVec,
+pub struct ApStringEqualsCondition {
+    #[serde(default, rename = "aws:SourceVpc")]
+    pub source_vpc: Option<StringOrVec>,
+    #[serde(default, rename = "aws:SourceVpce")]
+    pub source_vpce: Option<StringOrVec>,
 }
 
-/// 来源 VPC 证明 ID 的规范形态：`vpc-`/`vpce-` + 1..=64 位小写字母/数字/`-`。
+/// `vpc-`/`vpce-` + 1..=64 位小写字母/数字/`-`（`aws:SourceVpc` 兼容两种形态）。
 pub fn valid_vpc_id(raw: &str) -> bool {
-    let Some(rest) = raw
-        .strip_prefix("vpc-")
+    raw.strip_prefix("vpc-")
         .or_else(|| raw.strip_prefix("vpce-"))
-    else {
-        return false;
-    };
+        .is_some_and(valid_id_suffix)
+}
+
+/// `aws:SourceVpce` 只接受端点 ID 形态 `vpce-` + 1..=64 位小写字母/数字/`-`。
+pub fn valid_vpce_id(raw: &str) -> bool {
+    raw.strip_prefix("vpce-").is_some_and(valid_id_suffix)
+}
+
+fn valid_id_suffix(rest: &str) -> bool {
     !rest.is_empty()
         && rest.len() <= 64
         && rest
@@ -132,9 +142,9 @@ impl ApCondition {
         Ok(())
     }
 
-    /// 条件是否成立；`None` = 无法求值（缺对端/缺 VPC 证明/坏 CIDR）。调用方按语句
-    /// Effect 处理：Deny 视为命中（fail-closed），Allow 视为不命中。
-    fn matches(&self, ip: Option<IpAddr>, vpc: Option<&str>) -> Option<bool> {
+    /// 条件是否成立；`None` = 无法求值（缺对端/缺 VPC/VPCE 证明/坏 CIDR）。调用方按
+    /// 语句 Effect 处理：Deny 视为命中（fail-closed），Allow 视为不命中。
+    fn matches(&self, ip: Option<IpAddr>, vpc: Option<&str>, vpce: Option<&str>) -> Option<bool> {
         if let Some(c) = &self.ip_address
             && c.matches(ip?) != Some(true)
         {
@@ -146,7 +156,7 @@ impl ApCondition {
             return Some(false);
         }
         if let Some(c) = &self.string_equals
-            && c.matches(vpc?) != Some(true)
+            && !c.matches(vpc, vpce)?
         {
             return Some(false);
         }
@@ -154,34 +164,62 @@ impl ApCondition {
     }
 }
 
-impl ApVpcCondition {
+impl ApStringEqualsCondition {
     fn validate(&self, i: usize) -> Result<(), String> {
-        if self.source_vpc.iter().next().is_none() {
+        if self.source_vpc.is_none() && self.source_vpce.is_none() {
             return Err(format!(
-                "Statement[{i}].Condition.StringEquals.aws:SourceVpc 不能为空"
+                "Statement[{i}].Condition.StringEquals 不能为空（支持 aws:SourceVpc/aws:SourceVpce）"
             ));
         }
-        for raw in self.source_vpc.iter() {
-            if !valid_vpc_id(raw) {
-                return Err(format!(
-                    "Statement[{i}].Condition.StringEquals.aws:SourceVpc 非法 VPC ID: {raw}"
-                ));
-            }
+        if let Some(v) = &self.source_vpc {
+            validate_ids(i, "aws:SourceVpc", v, valid_vpc_id)?;
+        }
+        if let Some(v) = &self.source_vpce {
+            validate_ids(i, "aws:SourceVpce", v, valid_vpce_id)?;
         }
         Ok(())
     }
 
-    /// 列表内任一 ID 相等即成立；空列表/缺证明 → `None`（fail-closed）。
-    fn matches(&self, vpc: &str) -> Option<bool> {
-        let mut any = false;
-        for raw in self.source_vpc.iter() {
-            any = true;
-            if raw == vpc {
-                return Some(true);
-            }
+    /// 两个键是 AND；任一证明缺失或 ID 不匹配 → 条件不成立/无法求值。
+    fn matches(&self, vpc: Option<&str>, vpce: Option<&str>) -> Option<bool> {
+        if let Some(v) = &self.source_vpc
+            && !ids_match(v, vpc?)
+        {
+            return Some(false);
         }
-        any.then_some(false)
+        if let Some(v) = &self.source_vpce
+            && !ids_match(v, vpce?)
+        {
+            return Some(false);
+        }
+        Some(true)
     }
+}
+
+fn validate_ids(
+    i: usize,
+    key: &str,
+    v: &StringOrVec,
+    valid: fn(&str) -> bool,
+) -> Result<(), String> {
+    if v.iter().next().is_none() {
+        return Err(format!(
+            "Statement[{i}].Condition.StringEquals.{key} 不能为空"
+        ));
+    }
+    for raw in v.iter() {
+        if !valid(raw) {
+            return Err(format!(
+                "Statement[{i}].Condition.StringEquals.{key} 非法 ID: {raw}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 列表内任一 ID 相等即成立（空列表在保存时已拒）。
+fn ids_match(v: &StringOrVec, proof: &str) -> bool {
+    v.iter().any(|raw| raw == proof)
 }
 
 impl ApIpCondition {
@@ -297,7 +335,7 @@ impl ApPolicy {
         let mut allowed = false;
         let mut any = false;
         for st in &self.statement {
-            if !principal_matches(&st.principal, req.ak, req.uid, req.anonymous)
+            if !principal_matches(&st.principal, req.ak, req.uid, req.account, req.anonymous)
                 || !st.action.iter().any(|p| glob_match(p, action))
                 || !st
                     .resource
@@ -309,7 +347,7 @@ impl ApPolicy {
             let cond = st
                 .condition
                 .as_ref()
-                .map(|c| c.matches(req.source_ip, req.source_vpc));
+                .map(|c| c.matches(req.source.ip, req.source.vpc, req.source.vpce));
             match (st.effect.as_str(), cond) {
                 // 条件求值为 false：该语句不命中（Allow/Deny 同）
                 (_, Some(Some(false))) => continue,
@@ -328,29 +366,53 @@ impl ApPolicy {
     }
 }
 
-fn principal_matches(p: &ApPrincipal, ak: &str, uid: i64, anonymous: bool) -> bool {
+fn principal_matches(
+    p: &ApPrincipal,
+    ak: &str,
+    uid: i64,
+    account: ApAccount<'_>,
+    anonymous: bool,
+) -> bool {
     p.aws.iter().any(|v| {
         v == "*"
             || (!anonymous
                 && (v == ak
                     || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(uid)
-                    // 账户命名空间 v1：账户 = 用户；LEGACY/uid=0 永不匹配。
-                    || crate::access::account_arn_matches(v, uid)))
+                    // 账户根 ARN = 请求者**当前账户**的成员集合（成员行优先，无行回落
+                    // uid 派生账户）。跨账户只经此 Principal 成立；LEGACY/uid=0 永不匹配。
+                    || (account.active
+                        && crate::access::account_principal_matches(v, uid, account.id))))
     })
+}
+
+/// 请求者账户快照（AP 账户根 Principal 解析用）。`active=false` 时账户根一律不匹配，
+/// 且 `ap_decision*` 对签名请求直接拒绝（账户停用 fail-closed）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApAccount<'a> {
+    pub id: Option<&'a str>,
+    pub active: bool,
+}
+
+/// 来源证明（SourceIp / SourceVpc / SourceVpce）。缺失的证明使对应条件无法求值。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApSourceProof<'a> {
+    pub ip: Option<IpAddr>,
+    pub vpc: Option<&'a str>,
+    pub vpce: Option<&'a str>,
 }
 
 /// 求值输入（policy 层不依赖 HTTP 类型）。
 pub struct ApEvalRequest<'a> {
     pub ak: &'a str,
     pub uid: i64,
+    /// 请求者当前账户（账户根 Principal 用）；匿名用 `Default`。
+    pub account: ApAccount<'a>,
     /// 匿名请求只匹配 `Principal: "*"`（空 AK / `uid:0` 不得匹配）。
     pub anonymous: bool,
     /// AP 对象/桶 ARN 与标准 ARN（两者都参与匹配）
     pub resources: Vec<String>,
-    /// 连接对端（无则带 `SourceIp` 条件的语句一律不匹配，fail-closed）。
-    pub source_ip: Option<IpAddr>,
-    /// 来源 VPC 证明（无则带 `aws:SourceVpc` 条件的语句一律不匹配，fail-closed）。
-    pub source_vpc: Option<&'a str>,
+    /// 连接对端/来源证明（无则带对应条件的语句不匹配，fail-closed）。
+    pub source: ApSourceProof<'a>,
 }
 
 /// AP 上下文（ARN 生成用）。`account` = 桶账户（命名空间 v1）。
@@ -443,17 +505,16 @@ impl AccessPoint {
 /// AP 策略对单请求的额外限制（与身份/桶策略取交集）：
 /// 无策略 = **默认拒绝**（AWS 语义，L3）；`Some(true)` = 放行；`Some(false)` = 拒。
 /// `None` 仅由调用方对 DeleteObjects 保留——键在请求体里，逐键判定在 service 层。
+#[allow(clippy::too_many_arguments)] // 求值输入集合
 pub fn ap_decision(
     ap: &AccessPoint,
     user: &crate::access::AuthedUser,
+    account: ApAccount<'_>,
     op: &str,
     key: Option<&str>,
-    source_ip: Option<IpAddr>,
-    source_vpc: Option<&str>,
+    source: ApSourceProof<'_>,
 ) -> Option<bool> {
-    ap_decision_inner(
-        ap, &user.ak, user.uid, false, op, key, source_ip, source_vpc,
-    )
+    ap_decision_inner(ap, &user.ak, user.uid, account, false, op, key, source)
 }
 
 /// 匿名 AP 判定：只认 `Principal: "*"`（空 AK / `uid:0` 绝不匹配），其余同
@@ -462,10 +523,9 @@ pub fn ap_decision_anonymous(
     ap: &AccessPoint,
     op: &str,
     key: Option<&str>,
-    source_ip: Option<IpAddr>,
-    source_vpc: Option<&str>,
+    source: ApSourceProof<'_>,
 ) -> Option<bool> {
-    ap_decision_inner(ap, "", 0, true, op, key, source_ip, source_vpc)
+    ap_decision_inner(ap, "", 0, ApAccount::default(), true, op, key, source)
 }
 
 #[allow(clippy::too_many_arguments)] // 同上：求值输入集合
@@ -473,15 +533,19 @@ fn ap_decision_inner(
     ap: &AccessPoint,
     ak: &str,
     uid: i64,
+    account: ApAccount<'_>,
     anonymous: bool,
     op: &str,
     key: Option<&str>,
-    source_ip: Option<IpAddr>,
-    source_vpc: Option<&str>,
+    source: ApSourceProof<'_>,
 ) -> Option<bool> {
     let Some(policy) = ap.policy.as_ref() else {
         return Some(false);
     };
+    // 账户停用 fail-closed：认证层通常已拦截（AK 失效），此处兜底 mesh/合成身份路径。
+    if !anonymous && !account.active {
+        return Some(false);
+    }
     // 有策略但动作不在方言词表 → 无法表达授权，fail-closed。
     let Some(action) = crate::policy::s3_action(if crate::access::is_copy(op) {
         "PutObject"
@@ -514,10 +578,10 @@ fn ap_decision_inner(
     let req = ApEvalRequest {
         ak,
         uid,
+        account,
         anonymous,
         resources,
-        source_ip,
-        source_vpc,
+        source,
     };
     Some(policy.evaluate(&req, action) == Some(true))
 }
@@ -733,13 +797,21 @@ pub struct ApPeer(pub IpAddr);
 #[derive(Debug, Clone)]
 pub struct ApVpc(pub String);
 
+/// HTTP 层注入的**来源 VPC 端点证明**（`aws:SourceVpce` 条件求值用）。
+/// 独立于 `ApVpc`：绝不从 SourceVpc 推断；缺省 → 带 VPCE 条件的语句 fail-closed。
+#[derive(Debug, Clone)]
+pub struct ApVpce(pub String);
+
 /// DeleteObjects 经 AP 的逐键策略上下文：键在请求体里，整体判定必然失真，
 /// 由 `service.rs::delete_objects` 在逐键循环里叠交集（被拒键绝不进入删除路径）。
 #[derive(Debug, Clone)]
 pub struct ApDeletePolicy {
     pub ap: AccessPoint,
+    pub account_id: Option<String>,
+    pub account_active: bool,
     pub source_ip: Option<IpAddr>,
     pub source_vpc: Option<String>,
+    pub source_vpce: Option<String>,
 }
 
 /// `/ap/<name>/...` 前置路由：鉴权（身份/桶策略 × AP 策略交集）→ 重写到内层服务。
@@ -1311,6 +1383,29 @@ impl s3s::route::S3Route for ApRoute {
         let peer = req.extensions.get::<ApPeer>().map(|p| p.0);
         // 取 owned：后续 `validate_delete_body(&mut req)` 需要可变借用，不跨借用持有。
         let source_vpc = req.extensions.get::<ApVpc>().map(|v| v.0.clone());
+        let source_vpce = req.extensions.get::<ApVpce>().map(|v| v.0.clone());
+        // AP 账户根 Principal 解析（成员行优先）与账户状态：签名请求才需要。
+        // 查询失败 fail-closed（500），不得当作「无账户」放行。
+        let (account_id, account_active) = match &user {
+            Some(u) => self
+                .acl
+                .account_identity_of_user(u.uid)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "AP 账户身份查询失败");
+                    s3s::s3_error!(InternalError, "internal error")
+                })?,
+            None => (None, false),
+        };
+        let account = ApAccount {
+            id: account_id.as_deref(),
+            active: account_active,
+        };
+        let proof = ApSourceProof {
+            ip: peer,
+            vpc: source_vpc.as_deref(),
+            vpce: source_vpce.as_deref(),
+        };
         // H1：s3s 把任意 multipart/form-data POST 无条件解析为 PostObject（键在表单里，
         // 先于 OIR/子资源路由），AP 不支持该 op。即使带 `?delete` 也仍执行 PostObject，
         // 因此这里必须整类拒绝，而不是按查询推导出的 DeleteObjects 放行。
@@ -1376,8 +1471,8 @@ impl s3s::route::S3Route for ApRoute {
             ap.policy.is_none().then_some(false)
         } else {
             match &user {
-                Some(u) => ap_decision(&ap, u, op, key, peer, source_vpc.as_deref()),
-                None => ap_decision_anonymous(&ap, op, key, peer, source_vpc.as_deref()),
+                Some(u) => ap_decision(&ap, u, account, op, key, proof),
+                None => ap_decision_anonymous(&ap, op, key, proof),
             }
         };
         let allow = base_allow && ap_policy != Some(false);
@@ -1422,8 +1517,11 @@ impl s3s::route::S3Route for ApRoute {
             validate_delete_body(req).await?;
             req.extensions.insert(ApDeletePolicy {
                 ap: ap.clone(),
+                account_id,
+                account_active,
                 source_ip: peer,
                 source_vpc,
+                source_vpce,
             });
         }
         match user {
@@ -1669,10 +1767,13 @@ mod tests {
             // 畸形 CIDR 在保存时即拒
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"IpAddress":{"aws:SourceIp":[]}}}]}"#,
-            // StringEquals 只支持 aws:SourceVpc；空列表/畸形 ID/其他键拒
+            // StringEquals 只支持 aws:SourceVpc/aws:SourceVpce；空列表/畸形 ID/其他键拒
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{}}}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpc":[]}}}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpc":"not-a-vpc"}}}]}"#,
-            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpce":"vpce-1"}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpce":"vpc-abc"}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpce":[]}}}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpce":"not-a-vpce"}}}]}"#,
             // 桶级创建/删除/列举动作经 AP 无法执行：保存即拒（精确动作；s3:* 通配仍允许）
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:CreateBucket","Resource":"arn:x"}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:DeleteBucket"],"Resource":"arn:x"}]}"#,
@@ -1692,6 +1793,13 @@ mod tests {
             parse(
                 r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
                 "Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpc":["vpc-abc123","vpce-x"]}}}]}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+                "Resource":"arn:x","Condition":{"StringEquals":{"aws:SourceVpce":"vpce-1"}}}]}"#
             )
             .is_ok()
         );
@@ -1741,10 +1849,10 @@ mod tests {
         let req = |key: &str| ApEvalRequest {
             ak: "AKIA_X",
             uid: 7,
+            account: ApAccount::default(),
             anonymous: false,
             resources: vec![format!("arn:aws:s3:::bkt/{key}")],
-            source_ip: None,
-            source_vpc: None,
+            source: ApSourceProof::default(),
         };
         assert_eq!(p.evaluate(&req("open"), "s3:GetObject"), Some(true));
         assert_eq!(p.evaluate(&req("secret/x"), "s3:GetObject"), Some(false));
@@ -1767,10 +1875,13 @@ mod tests {
                 &ApEvalRequest {
                     ak: "AKIA_X",
                     uid: 7,
+                    account: ApAccount::default(),
                     anonymous: false,
                     resources: vec![format!("arn:aws:s3:::bkt/{key}")],
-                    source_ip: ip.parse().ok(),
-                    source_vpc: None,
+                    source: ApSourceProof {
+                        ip: ip.parse().ok(),
+                        ..Default::default()
+                    },
                 },
                 "s3:GetObject",
             )
@@ -1813,10 +1924,13 @@ mod tests {
                 &ApEvalRequest {
                     ak: "AKIA_X",
                     uid: 7,
+                    account: ApAccount::default(),
                     anonymous: false,
                     resources: vec![format!("arn:aws:s3:::bkt/{key}")],
-                    source_ip: None,
-                    source_vpc: vpc,
+                    source: ApSourceProof {
+                        vpc,
+                        ..Default::default()
+                    },
                 },
                 "s3:GetObject",
             )
@@ -1854,10 +1968,14 @@ mod tests {
                 &ApEvalRequest {
                     ak: "AKIA_X",
                     uid: 7,
+                    account: ApAccount::default(),
                     anonymous: false,
                     resources: vec!["arn:aws:s3:::bkt/k".to_string()],
-                    source_ip: ip.and_then(|i| i.parse().ok()),
-                    source_vpc: vpc,
+                    source: ApSourceProof {
+                        ip: ip.and_then(|i| i.parse().ok()),
+                        vpc,
+                        vpce: None,
+                    },
                 },
                 "s3:GetObject",
             )
@@ -1866,6 +1984,100 @@ mod tests {
         assert_eq!(eval_both(Some("10.1.2.3"), None), None);
         assert_eq!(eval_both(None, Some("vpc-abc")), None);
         assert_eq!(eval_both(Some("192.168.1.1"), Some("vpc-abc")), None);
+    }
+
+    /// `StringEquals.aws:SourceVpce`：独立证明（绝不由 SourceVpc 推断）；
+    /// 缺证明 fail-closed（Deny 命中、Allow 不命中）；与 SourceVpc 条件是 AND。
+    #[test]
+    fn source_vpce_condition_matches_and_fails_closed() {
+        let p = parse(
+            r#"{"Statement":[
+              {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*",
+               "Condition":{"StringEquals":{"aws:SourceVpce":["vpce-abc","vpce-def"]}}},
+              {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/secret*",
+               "Condition":{"StringEquals":{"aws:SourceVpce":"vpce-abc"}}}
+            ]}"#,
+        )
+        .unwrap();
+        let eval = |key: &str, vpce: Option<&str>| {
+            p.evaluate(
+                &ApEvalRequest {
+                    ak: "AKIA_X",
+                    uid: 7,
+                    account: ApAccount::default(),
+                    anonymous: false,
+                    resources: vec![format!("arn:aws:s3:::bkt/{key}")],
+                    source: ApSourceProof {
+                        vpce,
+                        ..Default::default()
+                    },
+                },
+                "s3:GetObject",
+            )
+        };
+        assert_eq!(eval("open", Some("vpce-abc")), Some(true));
+        assert_eq!(eval("open", Some("vpce-def")), Some(true));
+        assert_eq!(
+            eval("open", Some("vpce-other")),
+            None,
+            "不匹配 → Allow 不命中"
+        );
+        assert_eq!(
+            eval("open", None),
+            None,
+            "缺证明 → Allow 不命中（fail-closed）"
+        );
+        assert_eq!(eval("secret/x", Some("vpce-abc")), Some(false), "Deny 命中");
+        // 缺证明时 Deny 条件无法求值 → 命中（fail-closed）
+        assert_eq!(eval("secret/x", None), Some(false));
+        // SourceVpc 证明不得充当 SourceVpce 证明
+        let vpc_only = ApSourceProof {
+            vpc: Some("vpce-abc"),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate(
+                &ApEvalRequest {
+                    ak: "AKIA_X",
+                    uid: 7,
+                    account: ApAccount::default(),
+                    anonymous: false,
+                    resources: vec!["arn:aws:s3:::bkt/open".to_string()],
+                    source: vpc_only,
+                },
+                "s3:GetObject",
+            ),
+            None,
+            "SourceVpc 头值即使同形也不得满足 SourceVpce 条件"
+        );
+        // 两键 AND：任一证明缺失 → 整体无法求值
+        let both = parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+               "Resource":"arn:aws:s3:::bkt/*","Condition":{
+                 "StringEquals":{"aws:SourceVpc":"vpc-abc","aws:SourceVpce":"vpce-abc"}}}]}"#,
+        )
+        .unwrap();
+        let eval_both = |vpc: Option<&str>, vpce: Option<&str>| {
+            both.evaluate(
+                &ApEvalRequest {
+                    ak: "AKIA_X",
+                    uid: 7,
+                    account: ApAccount::default(),
+                    anonymous: false,
+                    resources: vec!["arn:aws:s3:::bkt/k".to_string()],
+                    source: ApSourceProof {
+                        vpc,
+                        vpce,
+                        ..Default::default()
+                    },
+                },
+                "s3:GetObject",
+            )
+        };
+        assert_eq!(eval_both(Some("vpc-abc"), Some("vpce-abc")), Some(true));
+        assert_eq!(eval_both(Some("vpc-abc"), None), None);
+        assert_eq!(eval_both(None, Some("vpce-abc")), None);
+        assert_eq!(eval_both(Some("vpc-abc"), Some("vpce-other")), None);
     }
 
     #[test]
@@ -2418,23 +2630,28 @@ mod tests {
             is_admin: false,
             ak: "AKIA_X".into(),
         };
+        let acct = ApAccount {
+            id: Some("000000000007"),
+            active: true,
+        };
+        let none = ApSourceProof::default();
         assert_eq!(
-            ap_decision(&ap, &u, "GetObject", Some("open"), None, None),
+            ap_decision(&ap, &u, acct, "GetObject", Some("open"), none),
             Some(true)
         );
         assert_eq!(
-            ap_decision(&ap, &u, "GetObject", Some("secret/x"), None, None),
+            ap_decision(&ap, &u, acct, "GetObject", Some("secret/x"), none),
             Some(false)
         );
         // 无匹配 action → 拒（有策略 = 默认收窄）
         assert_eq!(
-            ap_decision(&ap, &u, "PutObject", Some("open"), None, None),
+            ap_decision(&ap, &u, acct, "PutObject", Some("open"), none),
             Some(false)
         );
         // L3：无策略 = 默认拒绝（AWS 语义）
         let no_policy = AccessPoint { policy: None, ..ap };
         assert_eq!(
-            ap_decision(&no_policy, &u, "PutObject", Some("open"), None, None),
+            ap_decision(&no_policy, &u, acct, "PutObject", Some("open"), none),
             Some(false)
         );
     }
@@ -2455,14 +2672,15 @@ mod tests {
             ),
             region: "us-east-1".into(),
         };
+        let none = ApSourceProof::default();
         assert_eq!(
-            ap_decision_anonymous(&mk("*"), "GetObject", Some("open"), None, None),
+            ap_decision_anonymous(&mk("*"), "GetObject", Some("open"), none),
             Some(true)
         );
         // 空 AK / uid:0 是匿名哨兵，不能被具体 Principal 放行
         for p in ["", "uid:0", "AKIA_X"] {
             assert_eq!(
-                ap_decision_anonymous(&mk(p), "GetObject", Some("open"), None, None),
+                ap_decision_anonymous(&mk(p), "GetObject", Some("open"), none),
                 Some(false),
                 "principal {p:?} 不得匹配匿名请求"
             );
@@ -2588,6 +2806,11 @@ mod tests {
             uid: 7,
             is_admin: false,
         };
+        let none = ApSourceProof::default();
+        let own = ApAccount {
+            id: Some("000000000007"),
+            active: true,
+        };
         // 新账户 AP ARN 可匹配
         assert_eq!(
             ap_decision(
@@ -2597,10 +2820,10 @@ mod tests {
                     "arn:aws:s3:us-east-1:000000000007:accesspoint/ap1/object/*"
                 ),
                 &u,
+                own,
                 "GetObject",
                 Some("k"),
-                None,
-                None
+                none
             ),
             Some(true)
         );
@@ -2613,10 +2836,10 @@ mod tests {
                     "arn:aws:s3:us-east-1:000000000000:accesspoint/ap1/object/*"
                 ),
                 &u,
+                own,
                 "GetObject",
                 Some("k"),
-                None,
-                None
+                none
             ),
             Some(true)
         );
@@ -2630,15 +2853,88 @@ mod tests {
                 ap_decision(
                     &mk("000000000007", principal, "arn:aws:s3:::bkt/*"),
                     &u,
+                    own,
                     "GetObject",
                     Some("k"),
-                    None,
-                    None
+                    none
                 ),
                 want,
                 "principal {principal}"
             );
         }
+        // 跨账户：AP 属于桶主账户 000000000007，请求者成员关系在 123456789012。
+        // 账户根 Principal 按请求者当前账户（成员行）命中。
+        let cross = ApAccount {
+            id: Some("123456789012"),
+            active: true,
+        };
+        assert_eq!(
+            ap_decision(
+                &mk(
+                    "000000000007",
+                    "arn:aws:iam::123456789012:root",
+                    "arn:aws:s3:::bkt/*"
+                ),
+                &u,
+                cross,
+                "GetObject",
+                Some("k"),
+                none
+            ),
+            Some(true)
+        );
+        // 派生账户不再命中（成员关系优先）
+        assert_eq!(
+            ap_decision(
+                &mk(
+                    "000000000007",
+                    "arn:aws:iam::000000000007:root",
+                    "arn:aws:s3:::bkt/*"
+                ),
+                &u,
+                cross,
+                "GetObject",
+                Some("k"),
+                none
+            ),
+            Some(false)
+        );
+        // 未知账户 Principal 不命中
+        assert_eq!(
+            ap_decision(
+                &mk(
+                    "000000000007",
+                    "arn:aws:iam::999999999999:root",
+                    "arn:aws:s3:::bkt/*"
+                ),
+                &u,
+                cross,
+                "GetObject",
+                Some("k"),
+                none
+            ),
+            Some(false)
+        );
+        // 账户停用 fail-closed：即使 Principal 匹配也拒（认证层之外的兜底）
+        let disabled = ApAccount {
+            id: Some("123456789012"),
+            active: false,
+        };
+        assert_eq!(
+            ap_decision(
+                &mk(
+                    "000000000007",
+                    "arn:aws:iam::123456789012:root",
+                    "arn:aws:s3:::bkt/*"
+                ),
+                &u,
+                disabled,
+                "GetObject",
+                Some("k"),
+                none
+            ),
+            Some(false)
+        );
     }
 
     /// 结构断言：并发槽在读取输入体期间已被持有（缓冲不得发生在闸外）。

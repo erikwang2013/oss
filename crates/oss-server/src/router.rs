@@ -191,13 +191,15 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     } else {
         None
     };
-    // `aws:SourceVpc` 的来源证明：静态部署 ID（优先）或可信反代的单行头；非法配置启动失败。
-    // 头形态的证明同样要求直连对端是可信反代。
-    let vpc = Arc::new(VpcAttest::from_env(trust_proxy)?);
+    // `aws:SourceVpc`/`aws:SourceVpce` 的来源证明：静态部署 ID（优先）或可信反代的
+    // 单行头；非法配置启动失败。两者独立配置，绝不互相推断。
+    let vpc = Arc::new(Attest::vpc(trust_proxy)?);
+    let vpce = Arc::new(Attest::vpce(trust_proxy)?);
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
         let trust = trust.clone();
         let vpc = vpc.clone();
-        async move { ap_peer(req, next, trust, vpc).await }
+        let vpce = vpce.clone();
+        async move { ap_peer(req, next, trust, vpc, vpce).await }
     }));
     Ok(app)
 }
@@ -277,26 +279,55 @@ fn parse_cidr_list(raw: Option<&str>, name: &str) -> Result<Vec<xl_s3::ap::Cidr>
         .collect()
 }
 
-/// `aws:SourceVpc` 的**来源证明**（不是 PrivateLink 端点身份）：
-/// - `OSS_AP_VPC_ID` 非空：进程级静态证明（单 VPC 部署），头一律不采信；
+/// `aws:SourceVpc` / `aws:SourceVpce` 的**来源证明**（不是 PrivateLink/ENI 端点身份）：
+/// - `OSS_AP_VPC_ID` / `OSS_AP_VPCE_ID` 非空：进程级静态证明（单 VPC/端点部署），
+///   对应头一律不采信；
 /// - 否则仅当 `OSS_AP_TRUSTED_PROXY=1` 且直连对端在 `OSS_AP_TRUSTED_PEER_CIDRS`
-///   内时采信恰好一条 `x-oss-source-vpc` 头，形态须为 `vpc-`/`vpce-` +
-///   [a-z0-9-]{1,64}；重复/畸形/未信任/对端不可信 → 无证明（fail-closed）。
+///   内时采信恰好一条同名头（`x-oss-source-vpc` / `x-oss-source-vpce`）；
+///   重复/畸形/未信任/对端不可信 → 无证明（fail-closed）。
 ///
-/// 反代必须**覆盖**客户端自带的同名头；未显式开启信任时该头完全无效。
+/// 两个证明**独立**：VPC 证明绝不推导端点证明。反代必须**覆盖**客户端自带的同名头；
+/// 未显式开启信任时该头完全无效（部署不保证覆盖时，请用静态 ID）。
 #[derive(Clone)]
-struct VpcAttest {
+struct Attest {
     static_id: Option<String>,
     trust_proxy: bool,
+    header: &'static str,
+    valid: fn(&str) -> bool,
 }
 
-impl VpcAttest {
-    fn from_env(trust_proxy: bool) -> Result<Self, String> {
-        let static_id = match std::env::var("OSS_AP_VPC_ID") {
+impl Attest {
+    /// `aws:SourceVpc`（静态 `OSS_AP_VPC_ID` / 头 `x-oss-source-vpc`）。
+    fn vpc(trust_proxy: bool) -> Result<Self, String> {
+        Self::from_env(
+            "OSS_AP_VPC_ID",
+            "x-oss-source-vpc",
+            xl_s3::ap::valid_vpc_id,
+            trust_proxy,
+        )
+    }
+
+    /// `aws:SourceVpce`（静态 `OSS_AP_VPCE_ID` / 头 `x-oss-source-vpce`）。
+    fn vpce(trust_proxy: bool) -> Result<Self, String> {
+        Self::from_env(
+            "OSS_AP_VPCE_ID",
+            "x-oss-source-vpce",
+            xl_s3::ap::valid_vpce_id,
+            trust_proxy,
+        )
+    }
+
+    fn from_env(
+        env: &'static str,
+        header: &'static str,
+        valid: fn(&str) -> bool,
+        trust_proxy: bool,
+    ) -> Result<Self, String> {
+        let static_id = match std::env::var(env) {
             Ok(v) if !v.trim().is_empty() => {
                 let v = v.trim().to_string();
-                if !xl_s3::ap::valid_vpc_id(&v) {
-                    return Err(format!("OSS_AP_VPC_ID 非法: {}", v.escape_debug()));
+                if !valid(&v) {
+                    return Err(format!("{env} 非法: {}", v.escape_debug()));
                 }
                 Some(v)
             }
@@ -305,6 +336,8 @@ impl VpcAttest {
         Ok(Self {
             static_id,
             trust_proxy,
+            header,
+            valid,
         })
     }
 
@@ -317,21 +350,23 @@ impl VpcAttest {
         if !self.trust_proxy || !peer_trusted {
             return None;
         }
-        let mut vals = headers.get_all("x-oss-source-vpc").iter();
+        let mut vals = headers.get_all(self.header).iter();
         let raw = vals.next()?.to_str().ok()?.trim();
-        if vals.next().is_some() || !xl_s3::ap::valid_vpc_id(raw) {
+        if vals.next().is_some() || !(self.valid)(raw) {
             return None;
         }
         Some(raw.to_string())
     }
 }
 
-/// 连接对端/来源 VPC → `ApPeer`/`ApVpc` extension（缺失则由 AP 条件 fail-closed）。
+/// 连接对端/来源 VPC/VPCE → `ApPeer`/`ApVpc`/`ApVpce` extension
+/// （缺失则由 AP 条件 fail-closed）。
 async fn ap_peer(
     mut req: Request,
     next: Next,
     trust: Option<Arc<ProxyTrust>>,
-    vpc: Arc<VpcAttest>,
+    vpc: Arc<Attest>,
+    vpce: Arc<Attest>,
 ) -> Response {
     // ConnectInfo 是唯一可信的直连对端来源；缺失（如 ecat 明文 listener）时转发头不采信。
     let direct = req
@@ -347,6 +382,9 @@ async fn ap_peer(
     }
     if let Some(id) = vpc.value(req.headers(), peer_trusted) {
         req.extensions_mut().insert(xl_s3::ap::ApVpc(id));
+    }
+    if let Some(id) = vpce.value(req.headers(), peer_trusted) {
+        req.extensions_mut().insert(xl_s3::ap::ApVpce(id));
     }
     next.run(req).await
 }
@@ -934,23 +972,24 @@ mod tests {
         );
     }
 
-    /// SourceVpc 来源证明：静态 ID 优先；未信任代理的头完全无效；重复/畸形头 fail-closed。
+    /// SourceVpc/SourceVpce 来源证明：静态 ID 优先；未信任代理的头完全无效；
+    /// 重复/畸形头 fail-closed；两个证明互不推断（VPC 头不能当 VPCE 证明）。
     #[test]
     fn source_vpc_attestation_static_and_proxy_modes() {
-        use super::VpcAttest;
+        use super::Attest;
+        let mk = |static_id: Option<&str>, trust_proxy: bool| Attest {
+            static_id: static_id.map(str::to_string),
+            trust_proxy,
+            header: "x-oss-source-vpc",
+            valid: xl_s3::ap::valid_vpc_id,
+        };
         let mut h = axum::http::HeaderMap::new();
         // 未开启信任：头无效（即使形态合法）
-        let untrusted = VpcAttest {
-            static_id: None,
-            trust_proxy: false,
-        };
+        let untrusted = mk(None, false);
         h.insert("x-oss-source-vpc", "vpc-abc123".parse().unwrap());
         assert!(untrusted.value(&h, true).is_none());
         // 可信反代 + 可信直连对端：恰好一条合法头才成立
-        let trusted = VpcAttest {
-            static_id: None,
-            trust_proxy: true,
-        };
+        let trusted = mk(None, true);
         assert_eq!(trusted.value(&h, true).as_deref(), Some("vpc-abc123"));
         assert!(
             trusted.value(&h, false).is_none(),
@@ -979,10 +1018,7 @@ mod tests {
             assert!(trusted.value(&h, true).is_none(), "{bad}");
         }
         // 静态 ID 优先，且头（含伪造值）一律不采信
-        let fixed = VpcAttest {
-            static_id: Some("vpc-static".into()),
-            trust_proxy: false,
-        };
+        let fixed = mk(Some("vpc-static"), false);
         assert_eq!(fixed.value(&h, false).as_deref(), Some("vpc-static"));
         h.insert("x-oss-source-vpc", "vpc-attacker".parse().unwrap());
         assert_eq!(fixed.value(&h, true).as_deref(), Some("vpc-static"));
@@ -992,6 +1028,40 @@ mod tests {
         assert!(!xl_s3::ap::valid_vpc_id("vpc-"));
         assert!(!xl_s3::ap::valid_vpc_id("vpc-ABC"));
         assert!(!xl_s3::ap::valid_vpc_id(""));
+
+        // SourceVpce：独立证明、独立头；只接受 vpce- 形态
+        let mk_vpce = |static_id: Option<&str>, trust_proxy: bool| Attest {
+            static_id: static_id.map(str::to_string),
+            trust_proxy,
+            header: "x-oss-source-vpce",
+            valid: xl_s3::ap::valid_vpce_id,
+        };
+        let mut hv = axum::http::HeaderMap::new();
+        hv.insert("x-oss-source-vpce", "vpce-0123abc".parse().unwrap());
+        let trusted_vpce = mk_vpce(None, true);
+        assert_eq!(
+            trusted_vpce.value(&hv, true).as_deref(),
+            Some("vpce-0123abc")
+        );
+        assert!(trusted_vpce.value(&hv, false).is_none(), "对端不可信");
+        assert!(
+            trusted_vpce.value(&h, true).is_none(),
+            "x-oss-source-vpc 头不得充当 VPCE 证明"
+        );
+        assert_eq!(
+            mk_vpce(Some("vpce-static"), false)
+                .value(&hv, false)
+                .as_deref(),
+            Some("vpce-static")
+        );
+        // SourceVpce 只收 vpce- 形态（vpc- 前缀/畸形拒）
+        for bad in ["vpc-abc", "vpce-", "VPCE-ABC", "vpce-abc,extra"] {
+            let mut hb = axum::http::HeaderMap::new();
+            hb.insert("x-oss-source-vpce", bad.parse().unwrap());
+            assert!(trusted_vpce.value(&hb, true).is_none(), "{bad}");
+        }
+        assert!(xl_s3::ap::valid_vpce_id("vpce-0123456789abcdef0"));
+        assert!(!xl_s3::ap::valid_vpce_id("vpc-abc"));
     }
 
     /// 转发头仅在直连对端属于 `OSS_AP_TRUSTED_PEER_CIDRS` 时采信：

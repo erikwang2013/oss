@@ -64,7 +64,10 @@ impl Store {
     ///
     /// 生产传输（[`crate::mesh_gate::GatedMesh`]）把版本缓存 TTL 化，热路径不逐请求探测。
     pub async fn ensure_data_plane_compatible(&self) -> Result<()> {
-        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+        // 探测预算刻意短于读快路径阈值：慢/不可达 peer 交给既有 quorum/降级语义，
+        // 只有「快速可达且版本不一致」才在入口 fail-closed；生产每个数据 RPC 仍由
+        // GatedMesh 逐目标校验（带 10s 缓存）。
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return Ok(());
         };
@@ -77,48 +80,19 @@ impl Store {
             .map(|n| n.id.as_str())
             .filter(|id| *id != self_id)
             .collect();
-        let now = std::time::Instant::now();
-        let mut stale = Vec::new();
-        {
-            let cache = self
-                .data_wire_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for peer in &peers {
-                match cache.get(*peer) {
-                    Some((at, v)) if now.duration_since(*at) < CACHE_TTL => {
-                        crate::mesh_gate::check_compatible(peer, *v)?;
-                    }
-                    _ => stale.push(*peer),
-                }
-            }
-        }
-        let probes = stale.iter().map(|peer| {
+        let probes = peers.iter().map(|peer| {
             let transport = &cl.transport;
             async move {
-                let got = tokio::time::timeout(
-                    std::time::Duration::from_millis(800),
-                    transport.data_wire_version(peer),
-                )
-                .await;
+                let got = tokio::time::timeout(PROBE_TIMEOUT, transport.data_wire_version(peer))
+                    .await;
                 match got {
-                    Ok(Ok(v)) => match crate::mesh_gate::check_compatible(peer, v) {
-                        Ok(()) => Ok(Some((peer.to_string(), v))),
-                        Err(e) => Err(e),
-                    },
+                    Ok(Ok(v)) => crate::mesh_gate::check_compatible(peer, v),
                     // 不可达/超时：不伪装成版本不兼容。
-                    Ok(Err(_)) | Err(_) => Ok(None),
+                    Ok(Err(_)) | Err(_) => Ok(()),
                 }
             }
         });
-        let found = futures::future::try_join_all(probes).await?;
-        let mut cache = self
-            .data_wire_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for item in found.into_iter().flatten() {
-            cache.insert(item.0, (now, item.1));
-        }
+        futures::future::try_join_all(probes).await?;
         Ok(())
     }
 }
