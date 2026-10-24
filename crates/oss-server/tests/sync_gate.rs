@@ -1501,6 +1501,12 @@ async fn async_replica_intake_adopts_origin_id_with_token() {
             .unwrap(),
         origin
     );
+    // O-2：未认证的 REPLICA 头按普通写入处理，照常入站点 outbox（不得抑制复制）。
+    assert_eq!(
+        outbox(&e.st, "asy", "a2.txt").await,
+        1,
+        "未认证 REPLICA 必须照常复制"
+    );
 }
 
 #[tokio::test]

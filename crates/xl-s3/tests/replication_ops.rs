@@ -31,6 +31,9 @@ async fn acl() -> xl_s3::access::Acl {
     xl_s3::access::Acl::new(pool)
 }
 
+/// REPLICA 摄入测试用 site token（O-2：仅 token 认证的内部请求可声明 REPLICA）。
+const TEST_SITE_TOKEN: &str = "test-site-token";
+
 async fn service(
     sink: Option<Arc<dyn ReplicationSink>>,
     store: Option<Arc<dyn ReplicationStore>>,
@@ -38,7 +41,9 @@ async fn service(
     let dir = tempfile::tempdir().unwrap();
     let st = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
     (
-        OssS3::new(st, acl().await, 16 * 1024 * 1024).with_replication(sink, store),
+        OssS3::new(st, acl().await, 16 * 1024 * 1024)
+            .with_replication(sink, store)
+            .with_site_token(Some(TEST_SITE_TOKEN.into())),
         dir,
     )
 }
@@ -312,6 +317,8 @@ async fn replication_hooks_put_replica_marker_and_mpu() {
     });
     r.headers
         .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+    r.headers
+        .insert("x-oss-site-token", TEST_SITE_TOKEN.parse().unwrap());
     s3.put_object(r).await.unwrap();
     // MPU complete
     let up = s3
@@ -415,4 +422,90 @@ async fn replication_hooks_put_replica_marker_and_mpu() {
     assert!(got[4].marker, "版本桶删除应触发 marker 钩子");
     assert!(!got[5].marker, "批量前 PUT 是数据提交");
     assert!(got[6].marker, "批量删除应触发 marker 钩子");
+}
+
+/// O-2：普通客户端伪造 `x-amz-replication-status: REPLICA` 不能抑制复制。
+/// 只有 site token 认证的内部请求才被当作副本摄入（并保留 M7 防环语义）。
+#[tokio::test]
+async fn replica_header_requires_site_token() {
+    let sink = Arc::new(MockSink::default());
+    let (s3, _d) = service(Some(sink.clone()), None).await;
+    versioned_bucket(&s3, "sectok").await;
+
+    for (key, token) in [
+        ("spoof", None),
+        ("spoof-wrong", Some("wrong-token")),
+        ("trusted", Some(TEST_SITE_TOKEN)),
+    ] {
+        let mut r = req(PutObjectInput {
+            bucket: "sectok".into(),
+            key: key.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            ..Default::default()
+        });
+        r.headers
+            .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+        if let Some(t) = token {
+            r.headers.insert("x-oss-site-token", t.parse().unwrap());
+        }
+        s3.put_object(r).await.unwrap();
+    }
+    let head = |key: &str| {
+        let s3 = s3.clone();
+        let key = key.to_string();
+        async move {
+            let h = s3
+                .head_object(req(HeadObjectInput {
+                    bucket: "sectok".into(),
+                    key,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .output;
+            h.replication_status.map(|s| s.as_str().to_string())
+        }
+    };
+    assert_eq!(head("spoof").await, None, "未认证 REPLICA 不得落复制状态");
+    assert_eq!(head("spoof-wrong").await, None, "错 token 不得落复制状态");
+    assert_eq!(
+        head("trusted").await.as_deref(),
+        Some("REPLICA"),
+        "受信内部请求的 REPLICA 摄入语义不变"
+    );
+
+    // DELETE：未认证的 REPLICA 头被忽略（删除照常复制/入队）；受信请求维持 M7 防环。
+    for (key, token) in [("spoof-del", None), ("trusted-del", Some(TEST_SITE_TOKEN))] {
+        let mut r = req(DeleteObjectInput {
+            bucket: "sectok".into(),
+            key: key.into(),
+            ..Default::default()
+        });
+        r.headers
+            .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+        if let Some(t) = token {
+            r.headers.insert("x-oss-site-token", t.parse().unwrap());
+        }
+        s3.delete_object(r).await.unwrap();
+    }
+
+    let got = sink.got.lock().unwrap().clone();
+    let keys: Vec<&str> = got.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            "spoof",
+            "spoof-wrong",
+            "trusted",
+            "spoof-del",
+            "trusted-del"
+        ]
+    );
+    assert!(
+        !got[0].replica && !got[1].replica,
+        "伪造 REPLICA 必须照常复制"
+    );
+    assert!(got[2].replica, "受信 REPLICA 摄入仍标记 is_replica");
+    assert!(!got[3].replica, "伪造 REPLICA 删除必须照常复制（防抑制）");
+    assert!(got[4].replica, "受信副本删除保留 M7 防环");
 }

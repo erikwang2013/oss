@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use oss_server::tls::Tls;
 use oss_server::tls_config::{TlsClientToml, TlsServerToml, TlsToml};
-use xl_store::mesh::MeshTransport;
-use xl_store::store::{Store, StoreConfig};
+use xl_store::error::Error as StoreError;
+use xl_store::mesh::{MeshTransport, MpuComplete, MpuEnc, MpuPartUpload};
+use xl_store::store::{ByteStream, Store, StoreConfig, VersioningMode};
 
 use common::tls::{TestCa, free_port, wait_tcp};
 
@@ -182,5 +183,82 @@ async fn mesh_channel_adopts_tls_reload_and_rejects_bad_material() {
     assert!(
         mesh.health("n1").await.is_ok(),
         "坏物料不得破坏已建立的 mesh 通道"
+    );
+}
+
+fn ssec_mpu_complete(upload_id: &str) -> MpuComplete {
+    MpuComplete {
+        bucket: "bucket".into(),
+        key: "k".into(),
+        upload_id: upload_id.into(),
+        parts: vec![(1, "etag".into())],
+        mode: VersioningMode::Off,
+        encryption: Some(MpuEnc::SseC([7u8; 32])),
+        lock: None,
+    }
+}
+
+/// L-3：明文 mesh 上 SSE-C MPU 转发必须 fail-closed——客户密钥/分片不得出网。
+#[tokio::test]
+async fn plaintext_mesh_refuses_ssec_mpu_forwarding() {
+    // 端口 1 不可达即可：拒绝发生在任何 RPC/连接之前。
+    let nodes = vec![("n1".to_string(), "127.0.0.1:1".to_string())];
+    let mesh = xl_client::TonicMesh::new("n1", "mesh-secret", &nodes).unwrap();
+
+    let err = mesh
+        .mpu_complete("n1", ssec_mpu_complete("upload"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Unavailable(_)), "实得：{err:?}");
+    assert!(
+        err.to_string().contains("TLS"),
+        "必须给出明确的 TLS 配置要求：{err}"
+    );
+
+    // 带 SSE-C 校验头的 UploadPart 同样拒绝（不把分片送上明文通道）。
+    let body: ByteStream = Box::pin(futures::stream::empty());
+    let err = mesh
+        .mpu_upload_part(
+            "n1",
+            MpuPartUpload {
+                bucket: "bucket".into(),
+                key: "k".into(),
+                upload_id: "upload".into(),
+                part_number: 1,
+                sse_c_md5: Some("md5".into()),
+                body,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Unavailable(_)), "实得：{err:?}");
+    assert!(err.to_string().contains("TLS"), "实得：{err}");
+}
+
+/// L-3：启用 mesh TLS 后 SSE-C Complete 可跨节点转发（到达属主；语义错误来自属主）。
+#[tokio::test]
+async fn tls_mesh_forwards_ssec_mpu_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let (cert, key) = ca.issue(&["127.0.0.1"], false);
+    let tls = material(dir.path(), &ca.pem, (&cert, &key), None, None);
+    let (addr, _task) = start_mesh(&tls).await;
+    let nodes = vec![("n1".to_string(), addr.to_string())];
+    let mesh =
+        xl_client::TonicMesh::new_with_tls("n1", "mesh-secret", &nodes, Some(tls.tonic_client()))
+            .unwrap();
+
+    let err = mesh
+        .mpu_complete("n1", ssec_mpu_complete("missing-upload"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::NoSuchBucket(_)
+                | StoreError::NoSuchUpload(_)
+                | StoreError::InvalidArgument(_)
+        ),
+        "TLS 下 SSE-C Complete 必须放行到属主（本地 TLS 门不得误拒）：{err:?}"
     );
 }

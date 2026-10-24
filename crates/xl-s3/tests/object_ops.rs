@@ -11,8 +11,14 @@ use xl_store::store::{Store, StoreConfig};
 async fn service() -> (OssS3, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
-    (OssS3::new(store, acl().await, 1024 * 1024), dir)
+    (
+        OssS3::new(store, acl().await, 1024 * 1024).with_site_token(Some(TEST_SITE_TOKEN.into())),
+        dir,
+    )
 }
+
+/// REPLICA 摄入测试用 site token（O-2：仅 token 认证的内部请求可声明 REPLICA）。
+const TEST_SITE_TOKEN: &str = "test-site-token";
 
 /// 最小判权库（这些用例直调 service 方法、不走 s3s 授权链；Acl 只被记账路径用到）。
 async fn acl() -> xl_s3::access::Acl {
@@ -2198,7 +2204,8 @@ async fn service_enc() -> (OssS3, Arc<Store>, tempfile::TempDir) {
         .await
         .unwrap();
     (
-        OssS3::new(store.clone(), acl().await, 16 * 1024 * 1024),
+        OssS3::new(store.clone(), acl().await, 16 * 1024 * 1024)
+            .with_site_token(Some(TEST_SITE_TOKEN.into())),
         store,
         dir,
     )
@@ -4276,7 +4283,7 @@ async fn replication_status_headers_and_replica_ingest() {
         Some("PENDING")
     );
 
-    // REPLICA 摄入：复制源 PUT 带 x-amz-replication-status: REPLICA → 落为 REPLICA
+    // REPLICA 摄入：复制源 PUT 带 x-amz-replication-status: REPLICA + site token → 落为 REPLICA
     let mut r = req(PutObjectInput {
         bucket: "repbucket".into(),
         key: "copy".into(),
@@ -4285,6 +4292,8 @@ async fn replication_status_headers_and_replica_ingest() {
     });
     r.headers
         .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+    r.headers
+        .insert("x-oss-site-token", TEST_SITE_TOKEN.parse().unwrap());
     s3.put_object(r).await.unwrap();
     let head = s3
         .head_object(req(HeadObjectInput {
@@ -4322,6 +4331,8 @@ async fn replica_ingest_carries_part_sizes() {
         });
         r.headers
             .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+        r.headers
+            .insert("x-oss-site-token", TEST_SITE_TOKEN.parse().unwrap());
         r.headers.insert("x-oss-part-sizes", sizes.parse().unwrap());
         s3.put_object(r)
     };
@@ -4973,6 +4984,8 @@ async fn tagging_replica_ingest_drops_tags() {
     });
     r.headers
         .insert("x-amz-replication-status", "REPLICA".parse().unwrap());
+    r.headers
+        .insert("x-oss-site-token", TEST_SITE_TOKEN.parse().unwrap());
     s3.put_object(r).await.unwrap();
     let out = s3
         .get_object_tagging(req(GetObjectTaggingInput {
