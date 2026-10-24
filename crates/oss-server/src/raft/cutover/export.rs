@@ -1,4 +1,9 @@
 //! 控制面导出文件：读取 11 张复制表，生成带校验和的 JSON（只读；不重放 schema/模式）。
+//!
+//! 封套带来源 provenance（`snapshot_format`/`wire_version`/`feature_level`/`source_build`）。
+//! [`verify_export`] 在 cutover（含 dry-run）与 force-recover 动数据之前拒绝本机无法
+//! 解码/无法应用来源导出。LC-0 之前写出的旧导出缺这些字段：载荷仍按冻结的
+//! `ControlData` 完整解码，按「未验证」接受并发警告（不静默放行伪造的显式字段）。
 
 use std::path::Path;
 
@@ -6,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::Db;
+use crate::raft::compat;
 use crate::raft::data::{self, ControlData};
 
 pub const EXPORT_FORMAT: u32 = 1;
@@ -19,6 +25,19 @@ pub struct ExportFile {
     pub source_node_id: Option<u64>,
     pub source_role: String,
     pub version: String,
+    /// 导出时来源节点的激活级别（`schema_meta.raft_feature_level`，缺省 1）；
+    /// 来源数据自身要求的级别更高时取 max（与 `encode_snapshot_at` 一致）。
+    #[serde(default)]
+    pub feature_level: Option<u8>,
+    /// 导出时来源二进制会写出的快照封套号：1=OSSCTL1，2=OSSCTL2。
+    #[serde(default)]
+    pub snapshot_format: Option<u32>,
+    /// 来源控制面 wire 版本（[`compat::WIRE_VERSION`]）。
+    #[serde(default)]
+    pub wire_version: Option<u32>,
+    /// 构建标识（`OSS_BUILD_ID`，无则回落包版本）；纯诊断，不参与闸门。
+    #[serde(default)]
+    pub source_build: Option<String>,
     pub admin_username: Option<String>,
     pub has_vault: Option<bool>,
     pub exported_at: i64,
@@ -40,9 +59,17 @@ pub async fn build_export(
     let data = data::read_tx(&mut tx)
         .await
         .map_err(|e| format!("read control data: {e}"))?;
+    let marker = compat::read_activation_conn(&mut tx).await?;
     tx.commit().await.map_err(|e| format!("commit: {e}"))?;
     let payload = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
     let sha256 = hex::encode(Sha256::digest(&payload));
+    // 来源二进制写快照时取 max(marker, 数据要求)；格式 1/2 已冻结（data.rs）。
+    let feature_level = marker.max(data::required_feature_level(&data));
+    let snapshot_format = if feature_level > compat::MIN_FEATURE_LEVEL {
+        data::SNAPSHOT_FORMAT
+    } else {
+        1
+    };
     Ok(ExportFile {
         format: EXPORT_FORMAT,
         kind: EXPORT_KIND.to_string(),
@@ -50,6 +77,14 @@ pub async fn build_export(
         source_node_id,
         source_role: source_role.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        feature_level: Some(feature_level),
+        snapshot_format: Some(snapshot_format),
+        wire_version: Some(compat::WIRE_VERSION),
+        source_build: Some(
+            option_env!("OSS_BUILD_ID")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_string(),
+        ),
         admin_username,
         has_vault,
         exported_at: crate::db::now(),
@@ -58,7 +93,12 @@ pub async fn build_export(
     })
 }
 
-pub fn verify_export(export: &ExportFile) -> Result<(), String> {
+/// 校验封套、校验和与来源兼容性；返回警告（当前仅缺 provenance 的旧导出）。
+///
+/// 任何显式 provenance 字段都必须通过闸门；缺失字段（LC-0 之前的导出）按未验证
+/// 接受：载荷已由冻结的 `ControlData`（全部 `deny_unknown_fields`）完整解码，
+/// 且数据自身要求的级别仍受本二进制上限约束，不存在静默丢行/丢字段的路径。
+pub fn verify_export(export: &ExportFile) -> Result<Vec<String>, String> {
     if export.format != EXPORT_FORMAT || export.kind != EXPORT_KIND {
         return Err(format!(
             "unsupported export format/kind: {}/{}",
@@ -70,7 +110,68 @@ pub fn verify_export(export: &ExportFile) -> Result<(), String> {
     if want != export.sha256 {
         return Err("export checksum mismatch".into());
     }
-    Ok(())
+    verify_provenance(export)
+}
+
+fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
+    let required = data::required_feature_level(&export.data);
+    if let Some(format) = export.snapshot_format {
+        if !(1..=data::SNAPSHOT_FORMAT_MAX).contains(&format) {
+            return Err(format!(
+                "unsupported source snapshot_format {format}: this binary decodes 1..={}; \
+                 upgrade oss-server before importing",
+                data::SNAPSHOT_FORMAT_MAX
+            ));
+        }
+        // OSSCTL1 没有 feature_level/结构化生命周期，携带 level-2 数据只能是伪造或损坏。
+        if format == 1 && required > compat::MIN_FEATURE_LEVEL {
+            return Err(format!(
+                "source snapshot_format 1 (OSSCTL1) cannot carry level-{required} data"
+            ));
+        }
+    }
+    if let Some(wire) = export.wire_version
+        && !(compat::MIN_COMPAT_WIRE_VERSION..=compat::WIRE_VERSION).contains(&wire)
+    {
+        return Err(format!(
+            "unsupported source wire_version {wire}: this binary reads {}..={}",
+            compat::MIN_COMPAT_WIRE_VERSION,
+            compat::WIRE_VERSION
+        ));
+    }
+    if let Some(level) = export.feature_level {
+        if !(compat::MIN_FEATURE_LEVEL..=compat::MAX_FEATURE_LEVEL).contains(&level) {
+            return Err(format!(
+                "source feature_level {level} outside supported {}..={}: the source cluster \
+                 activated features this binary cannot apply",
+                compat::MIN_FEATURE_LEVEL,
+                compat::MAX_FEATURE_LEVEL
+            ));
+        }
+        if level < required {
+            return Err(format!(
+                "source feature_level {level} is below the level-{required} data in the export"
+            ));
+        }
+    }
+    let mut missing = Vec::new();
+    if export.snapshot_format.is_none() {
+        missing.push("snapshot_format");
+    }
+    if export.wire_version.is_none() {
+        missing.push("wire_version");
+    }
+    if export.feature_level.is_none() {
+        missing.push("feature_level");
+    }
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![format!(
+        "legacy export without provenance ({}): accepting as unverified \
+         (payload decodes fully; data requires level {required})",
+        missing.join(", ")
+    )])
 }
 
 pub fn write_export(path: &Path, export: &ExportFile) -> std::io::Result<()> {
@@ -88,6 +189,8 @@ pub fn read_export(path: &Path) -> Result<ExportFile, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let export: ExportFile =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse export: {e}"))?;
-    verify_export(&export)?;
+    for warning in verify_export(&export)? {
+        eprintln!("warning: {warning}");
+    }
     Ok(export)
 }
