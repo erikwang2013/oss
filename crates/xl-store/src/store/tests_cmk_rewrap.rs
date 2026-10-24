@@ -1,10 +1,43 @@
 //! CMK rewrap / 删除隔离的 store 级测试（单盘；集群面在 console 集成测覆盖到路由/权限）。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::crypto::EncSpec;
 use crate::kms::{KeyProvider as _, KmsFileProvider};
+
+/// 固定配置引用源：模拟 `buckets.default_encryption` 指向某 CMK。
+struct FixedRefs(Vec<CmkBucketRef>);
+
+#[async_trait::async_trait]
+impl CmkConfigRefs for FixedRefs {
+    async fn cmk_config_refs(&self, _cmk: &str) -> crate::error::Result<Vec<CmkBucketRef>> {
+        Ok(self.0.clone())
+    }
+}
+
+/// 前 `misses` 次返回空、之后返回引用：模拟「扫描后、隔离前」落库的桶默认配置。
+struct LateRefs {
+    misses: usize,
+    calls: AtomicUsize,
+    bucket: String,
+}
+
+#[async_trait::async_trait]
+impl CmkConfigRefs for LateRefs {
+    async fn cmk_config_refs(&self, _cmk: &str) -> crate::error::Result<Vec<CmkBucketRef>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if n < self.misses {
+            Vec::new()
+        } else {
+            vec![CmkBucketRef {
+                bucket: self.bucket.clone(),
+                setting: "aws:kms:tenant-a".into(),
+            }]
+        })
+    }
+}
 
 fn payload(n: usize) -> Bytes {
     Bytes::from(
@@ -19,8 +52,14 @@ fn stream_of(b: Bytes) -> ByteStream {
 }
 
 async fn enc_store() -> (Arc<Store>, tempfile::TempDir) {
+    enc_store_with(false).await
+}
+
+async fn enc_store_with(cluster_deployment: bool) -> (Arc<Store>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.cluster_deployment = cluster_deployment;
+    let s = Store::open(cfg).await.unwrap();
     let sys = layout::sys_dir(dir.path(), "");
     s.init_encryption(Some(sys.join("master.key")), Some(sys.join("kms")))
         .await
@@ -233,13 +272,13 @@ async fn delete_cmk_refuses_references_then_purges() {
     .await;
     kms.rotate_cmk("tenant-a").await.unwrap();
 
-    let r = s.delete_cmk("tenant-a", false).await.unwrap();
+    let r = s.delete_cmk("tenant-a", false, None).await.unwrap();
     assert!(!r.deleted);
     assert_eq!(r.reason.as_deref(), Some("references"));
     assert_eq!(r.references, 1);
     assert_eq!(r.refs[0].key_id, "cmk:tenant-a:k0");
     // force 只放宽集群扫描限制，绝不放宽「已知引用」fail-closed
-    let r = s.delete_cmk("tenant-a", true).await.unwrap();
+    let r = s.delete_cmk("tenant-a", true, None).await.unwrap();
     assert!(!r.deleted, "force 不得删除仍有引用的 CMK");
     assert_eq!(r.references, 1);
 
@@ -257,14 +296,14 @@ async fn delete_cmk_refuses_references_then_purges() {
         .await
         .unwrap();
     assert_eq!(rep.rewrapped, 1);
-    let r = s.delete_cmk("tenant-a", false).await.unwrap();
+    let r = s.delete_cmk("tenant-a", false, None).await.unwrap();
     assert!(!r.deleted);
     assert_eq!(r.references, 1);
     assert_eq!(r.refs[0].key_id, "cmk:tenant-a:k1");
 
     // 对象删除 → 引用清零 → 删除成功
     assert!(s.delete_object("alpha", "k").await.unwrap());
-    let r = s.delete_cmk("tenant-a", false).await.unwrap();
+    let r = s.delete_cmk("tenant-a", false, None).await.unwrap();
     assert!(r.deleted, "无引用应删除：{r:?}");
     assert!(r.purged);
     assert_eq!(r.references, 0);
@@ -284,7 +323,7 @@ async fn delete_cmk_refuses_references_then_purges() {
     assert_eq!(kms.create_cmk("tenant-a").await.unwrap(), 0);
     // 未知 CMK / 未知桶：客户端可纠正
     assert!(matches!(
-        s.delete_cmk("ghost", false).await,
+        s.delete_cmk("ghost", false, None).await,
         Err(Error::InvalidArgument(_))
     ));
     assert!(matches!(
@@ -399,4 +438,172 @@ async fn rewrap_batches_with_cursor() {
         )
         .await;
     assert!(matches!(bad, Err(Error::InvalidArgument(_))));
+}
+
+/// 桶默认加密也是引用：删除必须拒（force 不例外），否则新写入会被 strand。
+#[tokio::test]
+async fn delete_cmk_refuses_bucket_default_configs() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let refs = FixedRefs(vec![CmkBucketRef {
+        bucket: "alpha".into(),
+        setting: "aws:kms:tenant-a".into(),
+    }]);
+    for force in [false, true] {
+        let r = s.delete_cmk("tenant-a", force, Some(&refs)).await.unwrap();
+        assert!(!r.deleted, "桶默认仍是引用（force={force}）");
+        assert_eq!(r.reason.as_deref(), Some("bucket_default"));
+        assert_eq!(r.references, 0);
+        assert_eq!(r.bucket_defaults, refs.0);
+        assert!(!r.purged);
+    }
+    // 拒删不得隔离：CMK 仍可用，且没有 .cmk-trash 残骸
+    assert_eq!(kms.ensure_cmk("tenant-a").unwrap(), 0);
+    assert!(s.cmk_trash_list().unwrap().is_empty());
+    // 配置引用清零后才允许删除
+    let r = s
+        .delete_cmk("tenant-a", false, Some(&FixedRefs(Vec::new())))
+        .await
+        .unwrap();
+    assert!(r.deleted, "{r:?}");
+    assert!(r.bucket_defaults.is_empty());
+}
+
+/// 隔离后复扫发现窗口内落库的桶默认配置 → race_detected 并原样恢复 CMK。
+#[tokio::test]
+async fn delete_cmk_restores_on_late_bucket_default_race() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let refs = LateRefs {
+        misses: 1,
+        calls: AtomicUsize::new(0),
+        bucket: "alpha".into(),
+    };
+    let r = s.delete_cmk("tenant-a", false, Some(&refs)).await.unwrap();
+    assert_eq!(refs.calls.load(Ordering::SeqCst), 2, "隔离前/后各复扫一次");
+    assert!(!r.deleted);
+    assert_eq!(r.reason.as_deref(), Some("race_detected"));
+    assert_eq!(r.bucket_defaults.len(), 1);
+    assert_eq!(r.bucket_defaults[0].bucket, "alpha");
+    // 恢复成功：无残骸，CMK 可继续加密新写入并读出
+    assert!(s.cmk_trash_list().unwrap().is_empty());
+    let info = put(&s, "k", payload(2048), VersioningMode::Off, cmk("tenant-a")).await;
+    assert_eq!(info.encryption.as_ref().unwrap().key_id, "cmk:tenant-a:k0");
+    assert_eq!(s.get_object("alpha", "k").await.unwrap().1, payload(2048));
+}
+
+/// `.cmk-trash` 清理：对象/桶默认引用都拒清且保留残骸；restore 安全回滚；
+/// 引用清零后 purge 永久销毁。
+#[tokio::test]
+async fn trash_purge_guards_restore_and_cleanup() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    put(&s, "k", payload(4096), VersioningMode::Off, cmk("tenant-a")).await;
+    // 手工隔离：模拟删除中断/清理失败后的残骸
+    kms.quarantine_cmk("tenant-a").await.unwrap();
+    let trash = s.cmk_trash_list().unwrap();
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].name, "tenant-a");
+    assert_eq!(trash[0].versions, vec![0]);
+    // 仍有对象引用 → 拒清且残骸原样保留
+    let r = s.cmk_trash_purge("tenant-a", false, None).await.unwrap();
+    assert!(!r.deleted);
+    assert_eq!(r.reason.as_deref(), Some("references"));
+    assert_eq!(r.references, 1);
+    assert!(r.purged.is_empty());
+    assert_eq!(s.cmk_trash_list().unwrap().len(), 1);
+    // 对象引用清零、但桶默认仍指向该 CMK → 同样拒清
+    assert!(s.delete_object("alpha", "k").await.unwrap());
+    let refs = FixedRefs(vec![CmkBucketRef {
+        bucket: "alpha".into(),
+        setting: "aws:kms:tenant-a".into(),
+    }]);
+    let r = s
+        .cmk_trash_purge("tenant-a", false, Some(&refs))
+        .await
+        .unwrap();
+    assert!(!r.deleted);
+    assert_eq!(r.reason.as_deref(), Some("bucket_default"));
+    assert_eq!(s.cmk_trash_list().unwrap().len(), 1);
+    // 安全恢复：唯一残骸原样回活动命名空间，可再次加密写入
+    let e = s.cmk_trash_restore("tenant-a").await.unwrap();
+    assert_eq!(e.versions, vec![0]);
+    assert!(s.cmk_trash_list().unwrap().is_empty());
+    put(&s, "k2", payload(16), VersioningMode::Off, cmk("tenant-a")).await;
+    assert_eq!(s.get_object("alpha", "k2").await.unwrap().1, payload(16));
+    // 引用全部清零 → 清理成功，钥材料永久消失（provider 不可再用）
+    assert!(s.delete_object("alpha", "k2").await.unwrap());
+    kms.quarantine_cmk("tenant-a").await.unwrap();
+    let r = s.cmk_trash_purge("tenant-a", false, None).await.unwrap();
+    assert!(r.deleted, "{r:?}");
+    assert_eq!(r.purged.len(), 1);
+    assert_eq!(r.purged[0].versions, vec![0]);
+    assert!(s.cmk_trash_list().unwrap().is_empty());
+    assert!(matches!(
+        kms.wrap_dek_named(&crate::kms::new_dek(), Some("tenant-a"))
+            .await,
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+/// 集群部署（含离线标记 `cluster_deployment`）：离线 rewrap 直接拒绝（无拓扑无法
+/// 安全放置分片）；删除要求显式 force，force 不绕过已知引用且报告带警告。
+#[tokio::test]
+async fn cluster_deployment_requires_force_and_refuses_offline_rewrap() {
+    let (s, _d) = enc_store_with(true).await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    put(&s, "k", payload(2048), VersioningMode::Off, cmk("tenant-a")).await;
+    assert!(matches!(
+        Arc::clone(&s)
+            .rewrap_cmk(
+                "tenant-a",
+                &RewrapOptions {
+                    apply: false,
+                    limit: 10,
+                    cursor: None,
+                    bucket: None,
+                },
+            )
+            .await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(s.delete_object("alpha", "k").await.unwrap());
+    let r = s.delete_cmk("tenant-a", false, None).await.unwrap();
+    assert!(!r.deleted);
+    assert_eq!(r.reason.as_deref(), Some("cluster_requires_force"));
+    let r = s.delete_cmk("tenant-a", true, None).await.unwrap();
+    assert!(r.deleted, "{r:?}");
+    assert!(r.purged);
+    assert!(
+        r.warning.as_deref().unwrap_or("").contains("force"),
+        "{:?}",
+        r.warning
+    );
+}
+
+/// `.cmk-trash` 清理同样受集群 force 闸门约束；无残骸 → no_quarantine（受控拒绝）。
+#[tokio::test]
+async fn trash_purge_cluster_requires_force() {
+    let (s, _d) = enc_store_with(true).await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    kms.quarantine_cmk("tenant-a").await.unwrap();
+    let r = s.cmk_trash_purge("tenant-a", false, None).await.unwrap();
+    assert!(!r.deleted);
+    assert_eq!(r.reason.as_deref(), Some("cluster_requires_force"));
+    assert_eq!(s.cmk_trash_list().unwrap().len(), 1, "拒清不得动残骸");
+    let r = s.cmk_trash_purge("tenant-a", true, None).await.unwrap();
+    assert!(r.deleted, "{r:?}");
+    assert!(s.cmk_trash_list().unwrap().is_empty());
+    let r = s.cmk_trash_purge("tenant-a", true, None).await.unwrap();
+    assert!(!r.deleted);
+    assert_eq!(r.reason.as_deref(), Some("no_quarantine"));
 }

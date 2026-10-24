@@ -1529,6 +1529,7 @@ async fn encryption_cmk_rewrap_and_delete_api() {
     let kms = st.store.enc_state().unwrap().kms.clone().unwrap();
     kms.create_cmk("tenant-a").await.unwrap();
     st.store.create_bucket("alpha").await.unwrap();
+    st.db.insert_bucket("alpha", None).await.unwrap();
     let body = bytes::Bytes::from(vec![7u8; 300_000]);
     let body_stream = body.clone();
     let info = st
@@ -1605,7 +1606,7 @@ async fn encryption_cmk_rewrap_and_delete_api() {
     assert_eq!(v["items"][0]["old_key_id"], "cmk:tenant-a:k0");
     let (_, before) = st.store.get_object("alpha", "k").await.unwrap();
     assert_eq!(before, body);
-    let refs = st.store.cmk_references("tenant-a").await.unwrap();
+    let refs = st.store.cmk_references("tenant-a", None).await.unwrap();
     assert_eq!(
         refs.refs[0].key_id, "cmk:tenant-a:k0",
         "dry-run 不得改 meta"
@@ -1645,8 +1646,38 @@ async fn encryption_cmk_rewrap_and_delete_api() {
         assert_eq!(v["refs"][0]["key_id"], "cmk:tenant-a:k1");
     }
 
-    // 引用清零 → 删除成功；列表空
+    // 对象引用清零，但桶默认加密仍指向该 CMK → 409（否则后续新写入会被 strand）
     assert!(st.store.delete_object("alpha", "k").await.unwrap());
+    let enc_url = format!("{base}/api/v1/buckets/alpha/encryption");
+    let r = client
+        .put(&enc_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"algorithm": "aws:kms:tenant-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let r = client
+        .delete(&cmk_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409, "桶默认加密是引用，必须拒删");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["deleted"], false);
+    assert_eq!(v["references"], 0);
+    assert_eq!(v["reason"], "bucket_default");
+    assert_eq!(v["bucket_defaults"][0]["bucket"], "alpha");
+    assert_eq!(v["bucket_defaults"][0]["setting"], "aws:kms:tenant-a");
+    // 清掉桶默认加密后引用归零 → 删除成功；列表空
+    let r = client
+        .delete(&enc_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
     let r = client
         .delete(&cmk_url)
         .bearer_auth(&admin)

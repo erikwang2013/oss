@@ -1771,6 +1771,25 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
+    /// 全部桶默认加密记录（桶名 + 库内存储值），按桶名排序；CMK 引用守卫用。
+    pub async fn list_bucket_default_encryptions(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT name, default_encryption FROM buckets \
+             WHERE default_encryption IS NOT NULL ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("name"),
+                    r.get::<String, _>("default_encryption"),
+                )
+            })
+            .collect())
+    }
+
     /// 某用户拥有的桶（控制台桶列表能力位计算用）。
     pub async fn owned_buckets(&self, uid: i64) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT name FROM buckets WHERE owner_id = ? ORDER BY name")
@@ -3053,6 +3072,28 @@ fn row_to_lifecycle_rule(r: &sqlx::sqlite::SqliteRow) -> LifecycleRuleRow {
         enabled: r.get::<i64, _>("enabled") != 0,
         updated_at: r.get("updated_at"),
         config_json: r.get("config_json"),
+    }
+}
+
+/// CMK 删除/扫描的桶默认加密引用源（xl-store 不依赖 SQL，经 trait 注入）。
+/// 存值形态 `aws:kms:<名或 ARN>`（S3/控制台写入口径）——按规范名归一后比对。
+#[async_trait::async_trait]
+impl xl_store::store::CmkConfigRefs for Db {
+    async fn cmk_config_refs(
+        &self,
+        cmk: &str,
+    ) -> xl_store::error::Result<Vec<xl_store::store::CmkBucketRef>> {
+        let rows = self.list_bucket_default_encryptions().await.map_err(|e| {
+            xl_store::error::Error::Unavailable(format!("读取桶默认加密配置失败: {e}"))
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(bucket, setting)| {
+                let raw = setting.strip_prefix("aws:kms:")?;
+                (xl_store::kms::parse_cmk_id(raw).ok() == Some(cmk))
+                    .then_some(xl_store::store::CmkBucketRef { bucket, setting })
+            })
+            .collect())
     }
 }
 
