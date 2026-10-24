@@ -40,7 +40,7 @@
   <line x1="240" y1="370" x2="240" y2="382" stroke="#8b5cf6" marker-end="url(#violet)"/>
   <rect x="56" y="384" width="368" height="44" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
   <text x="240" y="401" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">repl_outbox（target_kind='site'）→ worker</text>
-  <text x="240" y="417" font-size="9.5" fill="#64748b" text-anchor="middle">GET ?versioning 预检（10s 缓存）→ SigV4 PUT REPLICA → version-id 校验</text>
+  <text x="240" y="417" font-size="9.5" fill="#64748b" text-anchor="middle">GET ?versioning 预检（10s 缓存）→ SigV4 PUT REPLICA + site token → version-id 校验</text>
   <rect x="56" y="440" width="368" height="28" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-dasharray="4 3"/>
   <text x="240" y="458" font-size="9.5" fill="#64748b" text-anchor="middle">游标/死信/outbox 状态 → GET /api/v1/sites/{id}/status</text>
 
@@ -61,11 +61,11 @@
 
   <text x="536" y="326" font-size="11" font-weight="700" fill="#475569">对象面</text>
   <rect x="536" y="334" width="368" height="36" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
-  <text x="720" y="356" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">S3 接收（PUT REPLICA / DELETE marker）</text>
+  <text x="720" y="356" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">S3 接收（PUT REPLICA + site token / DELETE marker）</text>
   <line x1="720" y1="370" x2="720" y2="382" stroke="#94a3b8" marker-end="url(#a)"/>
   <rect x="536" y="384" width="368" height="44" rx="8" fill="#ffffff" stroke="#dbe3ec"/>
   <text x="720" y="401" font-size="11" font-weight="600" fill="#0f172a" text-anchor="middle">content-type / x-amz-meta-* 透传 · 目标 version-id 非 null</text>
-  <text x="720" y="417" font-size="9.5" fill="#64748b" text-anchor="middle">REPLICA 不再入队（防环）；版本 UUID 两端不同（记档）</text>
+  <text x="720" y="417" font-size="9.5" fill="#64748b" text-anchor="middle">REPLICA 不再入队（防环）；未映射副本由管理员对账；版本 UUID 两端不同（记档）</text>
   <rect x="536" y="440" width="368" height="28" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-dasharray="4 3"/>
   <text x="720" y="458" font-size="9.5" fill="#64748b" text-anchor="middle">配对快照：sites + cursor + 五类实体同一事务（只本地胜者，入钟）</text>
 

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>控制面：访问点 · 作业引擎 · 存储分层</title>
-  <desc>路径式访问点请求经 ApRoute 规范化/策略交集后重写转发到内层 S3，Object Lambda 在 GET 上做 HTTP/WASM 变换；SQLite 承载 AP/OLAP/作业/清单/恢复状态；作业 worker 领取任务并执行 Batch/Transition/Restore/Inventory；存储类与 TierState 落在 Version，归档阶段读路径返回 InvalidObjectState，Restore 后恢复可读，删除时 TierGc 清理远端副本。2026-10-23 增：AP 别名/SourceIp/DeleteObjects、Batch WASM、Inventory Parquet/Hive、tier local+远端 GC、生命周期完整 Filter。</desc>
+  <desc>路径式访问点请求经 ApRoute 规范化/策略交集后重写转发到内层 S3，Object Lambda 在 GET 上做 HTTP/WASM 变换；SQLite 承载 AP/OLAP/作业/清单/恢复状态；作业 worker 领取任务并执行 Batch/Transition/Restore/Inventory；存储类与 TierState 落在 Version，归档阶段读路径返回 InvalidObjectState，Restore 后恢复可读，删除时 TierGc 清理远端副本。2026-10-23 增：AP 别名/SourceIp/DeleteObjects、Batch WASM、Inventory Parquet/Hive、tier local+远端 GC、生命周期完整 Filter。2026-10-24 增：账户 MVP、M8 运行态 fencing、tier 分块哈希与直读。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
@@ -21,8 +21,8 @@
 
   <text x="40" y="44" font-size="20" font-weight="700" fill="#0f172a">OSS · 控制面</text>
   <text x="40" y="68" font-size="12" fill="#64748b">访问点与 Object Lambda · 作业引擎与 Batch · Inventory · 存储分层与 Restore</text>
-  <text x="40" y="88" font-size="11" fill="#059669">已落地：AP（别名/SourceIp/DeleteObjects）· OLAP/Batch WASM · Inventory Parquet/Hive · tier local+GC · 生命周期 Filter · e2e 脚本</text>
-  <text x="40" y="106" font-size="11" fill="#b45309">边界：单节点 SQLite · tier local + 远端 https/GC（默认 dry-run）· WebIdentity 可选 · 强一致另列</text>
+  <text x="40" y="88" font-size="11" fill="#059669">已落地：AP（别名/SourceIp/DeleteObjects）· OLAP/Batch WASM · Inventory Parquet/Hive · tier local+GC · 生命周期 Filter · 账户 MVP · M8 运行态 fencing · e2e 脚本</text>
+  <text x="40" y="106" font-size="11" fill="#b45309">边界：单节点 SQLite · 运行态 fencing 仅本地 · tier local + 远端 https/GC（默认 dry-run）· WebIdentity 可选 · 强一致另列</text>
 
   <!-- 左：请求路径 -->
   <rect x="40" y="124" width="470" height="300" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>

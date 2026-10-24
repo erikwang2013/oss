@@ -7,7 +7,7 @@
   路由、OSSCTL2/LC-0、M6 token 远端、Batch 抢占/跨账户清单、M8 单例任务 leader 门控、tier
   暂存清扫/预留/0600、AP 可信对端 CIDRS。行为与边界以 README 与
   `2026-10-23-capability-gaps-acceptance.md` §12 为准。
-- **v1.17.0 候选补充**：多租户账户 MVP（accounts/account_members/状态/桶配额）、AP 跨账户
+- **v1.17.0（2026-10-24）补充**：多租户账户 MVP（accounts/account_members/状态/桶配额）、AP 跨账户
   账户根授权与 `aws:SourceVpce` 证明、tier 分块哈希与默认关闭的归档 Range 直读、跨进程磁盘
   预留、M7 未映射 REPLICA 对账、OSSCTL2 激活级别导出、WebIdentity JWKS 热加载/
   `email_verified`/按 IP 限速、CMK 离线 CLI/桶默认引用/trash、mesh SSE-C TLS 强制与

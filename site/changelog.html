@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.16.0，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.17.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 backlog 第二轮；oss 的完整版本历史与 v1.16.0 变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.17.0 架构切片；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.16.0 backlog 第二轮；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.17.0 架构切片；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.16.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.17.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.16.0 的 backlog 第二轮。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.17.0 的架构切片。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-17-0">v1.17.0</a>
           <a href="#v1-16-0">v1.16.0</a>
           <a href="#v1-15-0">v1.15.0</a>
           <a href="#v1-14-0">v1.14.0</a>
@@ -92,9 +93,23 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.16.0</strong>（2026-10-24）。</p>
+          <p>当前最新发布：<strong>v1.17.0</strong>（2026-10-24）。</p>
 
           <div class="changelog-list">
+            <details class="changelog-entry" id="v1-17-0" open>
+              <summary><strong>v1.17.0</strong><time datetime="2026-10-24">2026-10-24</time><span>架构切片</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>账户 / 身份</strong>：多租户账户 MVP（accounts/account_members、状态与桶数配额、派生 ARN 回填、停用账户全链 fail-closed；账户写不参与 Raft）；AP 跨账户账户根 principal 与 <code>aws:SourceVpce</code> 来源证明；WebIdentity JWKS 热加载、<code>email_verified</code> 与按 IP 限流。</li>
+                  <li><strong>数据面 / 控制面</strong>：DP-0 数据面 wire 版本握手（混版 503 <code>peer_incompatible</code>，探测预算 100ms）；M8 运行态 fencing epoch；M7 未映射 REPLICA 对账（管理员列出/点名删除，默认 dry-run）；OSSCTL2 导出记录 <code>activation_level</code>。</li>
+                  <li><strong>存储 / 运维</strong>：tier 分块哈希元数据与归档 Range 直读（默认关闭，分块 SHA-256、漂移 fail-closed）；CMK 离线 <code>scan/rewrap/delete/trash</code>；Batch <code>preempted</code> 运行态展示与跨账户通知边界。</li>
+                  <li><strong>安全</strong>：SSE-C MPU 跨节点强制 mesh TLS；<code>x-amz-replication-status: REPLICA</code> 仅在 site token 认证时生效；AP SourceVpce 需显式证明，非 PrivateLink 身份。</li>
+                  <li><strong>验证</strong>：S3 全量 e2e 38 节 RC=0（含 Kafka 三阶段、双实例复制与 §20 标签）；M9 78/59/133/65（rolling 首跑 64/1/4 为高负载轮询超时，重跑 65/0/4）；M8 e2e PASS 4633s（Tier=ran + M6/M7 smoke）；E2E_LONG 100×100MB 通过（含中断重试）；库测试 xl-store 300（1 ignored）/ xl-s3 176 / oss-server 179。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.17.0" target="_blank" rel="noopener">GitHub Release</a> · 验收记录：<code>docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md</code> §13；架构 backlog：<code>docs/superpowers/specs/2026-10-24-architecture-backlog.md</code>。</p>
+              </div>
+            </details>
+
             <details class="changelog-entry" id="v1-16-0" open>
               <summary><strong>v1.16.0</strong><time datetime="2026-10-24">2026-10-24</time><span>backlog 第二轮</span></summary>
               <div class="entry-body">
@@ -258,7 +273,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.16.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.17.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

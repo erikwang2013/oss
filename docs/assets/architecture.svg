@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" width="960" height="800"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS 系统架构</title>
-  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点与 OLAP/作业与 Batch/Inventory/存储分层与 Restore/控制台页面）、M9 Raft 同步强一致与 Level B 滚动升级、TLS/SASL 全链路、AP 别名/SourceIp、Inventory Parquet/Hive、tier local/远端 GC、生命周期完整 Filter。</desc>
+  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点与 OLAP/作业与 Batch/Inventory/存储分层与 Restore/控制台页面）、M9 Raft 同步强一致与 Level B 滚动升级、TLS/SASL 全链路、AP 别名/SourceIp、Inventory Parquet/Hive、tier local/远端 GC、生命周期完整 Filter、账户 MVP、DP-0 数据面握手。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
@@ -11,7 +11,7 @@
   <rect x="1" y="1" width="958" height="798" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
   <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 系统架构</text>
-  <text x="40" y="70" font-size="11.5" fill="#64748b">Rust 2024 · 五 crate 依赖 · EC 8+4 · 版本/加密/锁 · 事件/Select/复制 · M7 多站点 · M8 AP/OLAP/WASM · Batch · Inventory · 分层 · M9 Raft 滚动 · TLS/SASL</text>
+  <text x="40" y="70" font-size="11.5" fill="#64748b">Rust 2024 · 五 crate 依赖 · EC 8+4 · 版本/加密/锁 · 事件/Select/复制 · M7 多站点 · M8 AP/OLAP/WASM · 账户 · DP-0 · Batch · Inventory · 分层 · M9 Raft 滚动 · TLS/SASL</text>
 
   <!-- 客户端 -->
   <rect x="690" y="94" width="250" height="56" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
@@ -36,7 +36,7 @@
   <text x="76" y="262" font-size="13" font-weight="600" fill="#0f172a">/api/v1/*　控制台 API</text>
   <text x="76" y="286" font-size="11" fill="#64748b">JwtLayer（jwt-rust · JWT 12h）· 登录限速（C1）</text>
   <text x="76" y="312" font-size="11" fill="#374151">登录 · 桶管理 · 对象列表/下载/删除</text>
-  <text x="76" y="334" font-size="11" fill="#374151">上传记录 · 访问密钥 · 子账户与授权</text>
+  <text x="76" y="334" font-size="11" fill="#374151">上传记录 · 访问密钥 · 账户/子账户与授权</text>
   <text x="76" y="356" font-size="11" fill="#374151">桶策略 · 生命周期 · 作业/AP/清单（M8）· 审计</text>
   <text x="76" y="378" font-size="11" fill="#374151">集群状态（按 set 分组 · C2）</text>
   <text x="76" y="404" font-size="11" fill="#94a3b8">前端登录后种 cookie oss_token</text>
@@ -82,7 +82,7 @@
   <text x="60" y="584" font-size="13" font-weight="600" fill="#166534">xl-store · 存储内核（不依赖任何框架）</text>
   <text x="60" y="606" font-size="11" fill="#374151">提交协议：tmp → 各盘 rename 数据就位 → xl.meta 两阶段提交（quorum）← 提交点 · 布局校验（__XLDIR__ 展平）</text>
   <text x="60" y="626" font-size="11" fill="#374151">EC 8+4 编解码与多盘分发 · 版本链（版本桶追加 / delete marker）· 对象锁守卫（GOVERNANCE/COMPLIANCE/LegalHold） · 复制状态（M6）</text>
-  <text x="60" y="646" font-size="11" fill="#374151">密钥库 kms.rs（主密钥 wrap DEK）· 块对齐加密 crypto.rs（先加密后 EC）· mesh quorum 读写 · flock 跨进程锁</text>
+  <text x="60" y="646" font-size="11" fill="#374151">密钥库 kms.rs（主密钥 wrap DEK）· 块对齐加密 crypto.rs（先加密后 EC）· mesh quorum 读写（DP-0 wire 握手）· flock 跨进程锁</text>
 
   <!-- KMS 侧块 -->
   <rect x="680" y="560" width="220" height="104" rx="10" fill="#fdf4ff" stroke="#f0abfc"/>

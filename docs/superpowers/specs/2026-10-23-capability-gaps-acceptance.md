@@ -1,11 +1,11 @@
 # 能力边界清零验收记录（2026-10-23）
 
 - 基线：`v1.13.1`（`a58d64a`）
-- 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0**（2026-10-24）
-- 最新发布：**v1.16.0**（2026-10-24），tag `v1.16.0`；包含 §8–§12（backlog 第二轮）
+- 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0**（2026-10-24）· **v1.16.0**（2026-10-24）
+- 最新发布：**v1.17.0**（2026-10-24），tag `v1.17.0`；包含 §13（架构切片）
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
-  v1.16.0 为 §2–§4 backlog 第二轮）
-- 状态：实现、集成、聚焦测试与 S3 全量 e2e 完成；已提交、推送并发布
+  v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片）
+- 状态：实现、集成、聚焦测试、S3 全量 e2e、M8/M9/E2E_LONG 完成；已提交、推送并发布
 - 构建环境：主机 `/home` 为 5400rpm 机械盘且被其它会话重压，集成验证统一使用
   `CARGO_TARGET_DIR=/tmp/target-retention`（SSD）；`CARGO_BUILD_JOBS=1`。
 
@@ -128,10 +128,9 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 
 ## 7. 发布状态
 
-v1.14.0、v1.15.0 与 backlog 第二轮已合并到 `main`；**v1.16.0（2026-10-24）** 为 §2–§4
-收口，tag 与 GitHub Release 均按 `vx.y.z` 命名。
-注意：GitHub 仓库当前为 private，站点上的 GitHub/Release/源码包链接对未授权访客不可用；
-公开仓库需单独决定。站点静态文件已纳入版本控制，但尚未部署到 `oss.erik.xyz`。
+v1.14.0、v1.15.0、backlog 第二轮与 v1.17.0 已合并到 `main`；**v1.17.0（2026-10-24）** 为 §13
+架构切片，tag 与 GitHub Release 均按 `vx.y.z` 命名。
+注意：GitHub 仓库当前为 public；站点静态文件已更新到 v1.17.0，但尚未部署到 `oss.erik.xyz`。
 
 ## 8. 2026-10-23 后续修复（随 v1.15.0 发布）
 
@@ -342,10 +341,10 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 上述设计、MVP 切片、依赖与风险见
 `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
 
-## 13. 2026-10-24 v1.17 候选：§2–§5 继续执行
+## 13. 2026-10-24 v1.17.0：架构切片（§2–§5 继续执行）
 
 **范围**：架构级非目标的最小可行切片、兼容边界、安全/运维残余与验证缺口。基于
-`v1.16.0`，集成分支 `feat/post-1.16-backlog`；本批**未发布**。
+`v1.16.0`，集成分支 `feat/post-1.16-backlog`；已合并并发布 **v1.17.0**。
 
 ### 13.1 已落地
 
@@ -369,8 +368,13 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
   raft_cutover*、raft_commands、m8_batch、jobs_engine、m8_inventory、m8_tier*、
   lifecycle*、tls_*、observability、object_ops/replication_ops/select_ops/olap_ops、
   xl-client —— 全绿（修复两处旧夹具/旧库无账户表回落 + REPLICA 标签语义）。
-- 待在同一集成二进制上复跑：S3 全量 e2e、M8（tier/repl）、M9 四组、E2E_LONG；结果以
-  本轮收尾报告为准。未通过项不作为“已验收”。
+- S3 全量 e2e：38 节全部通过，RC=0（含 Kafka 三阶段、双实例复制与 §20 标签/CopyObject）。
+- M9：sync 78/0/1、stretch 59/0/1、recovery 133/0/1（v1.17.0 集成树复跑）。
+- rolling：65/0/4（v1.17.0 集成树重跑；首跑 64/1/4 为高负载下 60s 轮询超时，非产品失败）。
+- fmt/clippy：`cargo fmt --all --check` 与 clippy `-D warnings` 均为 0；Web `tsc`/`vite build`
+  通过、Vitest 21/21、oxlint 0。Playwright 未跑：本机 9000 端口被 MinIO 占用，配置会复用该服务。
+- M8 e2e：PASS 4633s（Tier=ran + M6/M7 smoke）。
+- E2E_LONG：100×100MB 全部读回校验和一致（含中断重试）。受 `/home` 机械盘被其它会话重压影响，在 `/tmp` SSD 上完成。
 
 ### 13.3 仍未完成（架构级）
 

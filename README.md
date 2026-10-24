@@ -40,12 +40,12 @@ CMK 安全删除与逐版本 rewrap；M3 MPU 跨节点属主路由/流式转发�
 监听器）。验收与仍然阻塞的架构项见验收记录 §12 与
 `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
 
-**v1.17.0 候选（未发布）**：多租户账户 MVP（账户/成员/状态/桶配额）与 AP 跨账户
+**v1.17.0（2026-10-24）架构切片**：多租户账户 MVP（账户/成员/状态/桶配额）与 AP 跨账户
 账户根授权 + `aws:SourceVpce` 证明；tier 分块哈希与默认关闭的归档 Range 直读、跨进程磁盘
 预留；M7 未映射 REPLICA 人工对账与 OSSCTL2 激活级别导出；WebIdentity JWKS 热加载/
 `email_verified`/按 IP 限速；CMK 离线 CLI/桶默认引用/`.cmk-trash`；mesh SSE-C 跨节点强制
 TLS 与 REPLICA 头认证；Batch `preempted` 控制台展示；DP-0 数据面版本握手/混版 fail-closed；
-M8 运行态 fencing epoch。完整证据与仍然阻塞的架构项见验收记录 §13。
+M8 运行态 fencing epoch。证据与仍然阻塞的架构项见验收记录 §13。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
@@ -148,8 +148,8 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.16.0 集成树实跑 sync 78/0/1、stretch 59/0/1、recovery 133/0/1 |
-| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP）；v1.16.0 集成树实跑 65/0/4（4 SKIP 为 v1.13.1 侧无法覆盖的 D6 项） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.16.0 集成树实跑 sync 78/0/1、stretch 59/0/1、recovery 133/0/1；v1.17.0 集成树复跑同值 |
+| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP）；v1.16.0 集成树实跑 65/0/4（4 SKIP 为 v1.13.1 侧无法覆盖的 D6 项）；v1.17.0 集成树复跑 65/0/4（首跑 64/1/4 为高负载下 60s 轮询超时） |
 | `tests/e2e_m9_recovery.sh` | M9 灾备验收（真进程 + CLI：M7 export/cutover 字段级冲突与 overwrite、force-recover 后 `bootstrap=false` 重启；witness 运行时/export/force-recover；B′ 替换 + `sync-reconcile --repair` 门） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
@@ -1383,6 +1383,10 @@ append/vote/snapshot/status/membership/write/join。
   S3 全量 e2e 38 节 RC=0；E2E_LONG 100×100MB 通过；M8 e2e PASS 4742s（Tier=ran + M6/M7
   smoke）；M9 sync/stretch/recovery/rolling 78/59/133/65；fmt 与 clippy 0 warning。逐项证据
   见验收记录 §12。
+  **2026-10-24 v1.17.0 集成树**：库测试 xl-store 300（1 ignored）/ xl-s3 176 / oss-server 179；
+  S3 全量 e2e 38 节 RC=0（含 Kafka 三阶段、双实例复制与 §20 标签）；M9 sync/stretch/recovery/rolling
+  78/59/133/65（rolling 首跑 64/1/4 为高负载轮询超时，重跑通过）；M8 e2e PASS 4633s（Tier=ran + M6/M7 smoke）；E2E_LONG
+  100×100MB 通过（含中断重试）；fmt/clippy 0；Web `tsc`/`vite build` 通过、Vitest 21/21、oxlint 0。
   **2026-10-23 Level B 热修**：`BucketSetLifecycleV2` 此前漏标 level 2（混合窗口会被
   v1.13.1 副本解码失败，快照会静默丢结构化规则）；现已 `min_feature_level()=2`（写入门控
   503 `feature_unavailable`），且快照编码器在 `lifecycle_rules.config_json` 非空时拒绝
