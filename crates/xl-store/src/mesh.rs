@@ -300,7 +300,8 @@ pub trait SetResolver: Send + Sync + std::fmt::Debug {
 //   「流结束前未声明末块」被接收端视为截断（见 proto 的 is_final）。
 // - 传输失败一律 `Error::Unavailable`（S3 面 503），不得伪装成功/NoSuchUpload。
 // - 鉴权在协调者完成（SigV4/ACL/策略），属主只执行已授权动作；集群令牌是节点面
-//   鉴权。SSE-C 的 complete 密钥随请求转发（集群内网、勿公网暴露；建议 mesh TLS）。
+//   鉴权。SSE-C 的 complete 密钥随请求转发，**跨节点时必须 mesh TLS**（L-3）；
+//   `TonicMesh` 在明文通道上对 SSE-C Complete/UploadPart fail-closed。
 
 /// 转发 UploadPart：`body` 为前端节点的原始分片流（流式，不缓冲整段）。
 pub struct MpuPartUpload {
@@ -344,10 +345,10 @@ pub struct MpuComplete {
     pub lock: Option<ObjectLockRecord>,
 }
 
-/// 转发用加密意图。**SSE-C 变体携带原始客户钥**——Debug 已脱敏；仅在集群内网传输。
-/// 安全前提（L-3）：集群部署**必须启用 mesh TLS**；明文 mesh 下 SSE-C 客户钥与 part
-/// 明文会跨节点明文传输。本层不做 fail-closed 拦截（TLS 强制不在本切片范围），运营方
-/// 须把 mesh TLS 当作 SSE-C 多节点部署的硬前提。
+/// 转发用加密意图。**SSE-C 变体携带原始客户钥**——Debug 已脱敏。
+/// L-3：跨节点转发 SSE-C MPU 必须启用 mesh TLS；生产传输 `TonicMesh` 在明文通道上
+/// 对 SSE-C 的 Complete/UploadPart fail-closed。本地属主（upload_id 无远端前缀）不经
+/// 传输层，SSE-C MPU 不受影响。
 #[derive(Clone, PartialEq, Eq)]
 pub enum MpuEnc {
     SseS3,

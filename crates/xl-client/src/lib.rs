@@ -45,6 +45,16 @@ fn rpc_unavailable(node: &str, e: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("MPU 属主 {node} 不可达：{e}"))
 }
 
+/// L-3：SSE-C 的客户密钥（Complete）与分片（UploadPart）不得跨明文 mesh 传输。
+/// 属主是本机时不经此处（本地 SSE-C MPU 不受影响）；跨节点转发要求开启 mesh TLS
+/// （oss-server 配置 `[tls.server]`，即 `peer_tls`），否则 fail-closed。
+fn mesh_tls_required() -> Error {
+    Error::Unavailable(
+        "SSE-C MPU 跨节点转发要求启用 mesh TLS（[tls.server]）：拒绝在明文节点间传输客户密钥/分片"
+            .into(),
+    )
+}
+
 // ---------- MPU 错误线上编码 ----------
 //
 // 语义错误经响应信封（code+payload）回传，避免把 NoSuchUpload/EntityTooSmall 等
@@ -325,7 +335,9 @@ pub struct TonicMesh {
     clients: RwLock<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>>,
     /// MPU 转发专用通道：同一节点/令牌，但请求超时 = [`MPU_FORWARD_TIMEOUT`]
     /// （普通通道的快路径 5s 会把大 part 传输截断）。
-    mpu_clients: RwLock<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>>,
+    /// 第二项 = 这些通道是否走 TLS，与通道同锁替换：SSE-C 转发据此 fail-closed
+    /// （L-3：明文 mesh 不得承载客户密钥/分片）。热加载切换瞬间不会读到错配组合。
+    mpu_clients: RwLock<(MeshClientMap, bool)>,
 }
 
 impl std::fmt::Debug for TonicMesh {
@@ -377,7 +389,8 @@ impl TonicMesh {
         Self::new_with_timeouts_tls(_self_id, secret, nodes, connect, request, None)
     }
 
-    /// 超时可配 + 可选 mesh TLS；`tls = None` 保持旧明文行为。
+    /// 超时可配 + 可选 mesh TLS；`tls = None` 保持旧明文行为，但 SSE-C MPU 跨节点
+    /// 转发会 fail-closed（见 `mesh_tls_required`）。
     pub fn new_with_timeouts_tls(
         _self_id: &str,
         secret: &str,
@@ -387,6 +400,7 @@ impl TonicMesh {
         tls: Option<tonic::transport::ClientTlsConfig>,
     ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
+        let secure = tls.is_some();
         let (clients, mpu_clients) =
             Self::build_clients(&interceptor, nodes, connect, request, tls.as_ref())?;
         Ok(Self {
@@ -396,7 +410,7 @@ impl TonicMesh {
             request,
             tls_watch: None,
             clients: RwLock::new(clients),
-            mpu_clients: RwLock::new(mpu_clients),
+            mpu_clients: RwLock::new((mpu_clients, secure)),
         })
     }
 
@@ -429,6 +443,7 @@ impl TonicMesh {
     ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
         let initial = tls.as_ref().map(|rx| rx.borrow().clone()).unwrap_or(None);
+        let secure = initial.is_some();
         let (clients, mpu_clients) =
             Self::build_clients(&interceptor, nodes, connect, request, initial.as_ref())?;
         Ok(Self {
@@ -438,7 +453,7 @@ impl TonicMesh {
             request,
             tls_watch: tls.map(Mutex::new),
             clients: RwLock::new(clients),
-            mpu_clients: RwLock::new(mpu_clients),
+            mpu_clients: RwLock::new((mpu_clients, secure)),
         })
     }
 
@@ -500,8 +515,9 @@ impl TonicMesh {
         ) {
             Ok((fresh, fresh_mpu)) => {
                 let nodes = fresh.len();
+                let secure = tls.is_some();
                 *self.clients.write().unwrap_or_else(|e| e.into_inner()) = fresh;
-                *self.mpu_clients.write().unwrap_or_else(|e| e.into_inner()) = fresh_mpu;
+                *self.mpu_clients.write().unwrap_or_else(|e| e.into_inner()) = (fresh_mpu, secure);
                 tracing::info!(
                     nodes,
                     tls = tls.is_some(),
@@ -524,14 +540,17 @@ impl TonicMesh {
             .ok_or_else(|| Error::Encode(format!("mesh：未知节点 {node}（不在拓扑表内）")))
     }
 
-    fn mpu_client(&self, node: &str) -> Result<xl_proto::mesh_client::MeshClient<MeshChannel>> {
+    /// 返回 (MPU 通道, 该通道是否 TLS)；两项同锁读取，热加载时不会读到错配组合。
+    fn mpu_client(
+        &self,
+        node: &str,
+    ) -> Result<(xl_proto::mesh_client::MeshClient<MeshChannel>, bool)> {
         self.refresh_tls();
-        self.mpu_clients
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(node)
-            .cloned()
-            .ok_or_else(|| Error::Unavailable(format!("MPU 属主 {node} 不在拓扑表内（无法转发）")))
+        let guard = self.mpu_clients.read().unwrap_or_else(|e| e.into_inner());
+        let client = guard.0.get(node).cloned().ok_or_else(|| {
+            Error::Unavailable(format!("MPU 属主 {node} 不在拓扑表内（无法转发）"))
+        })?;
+        Ok((client, guard.1))
     }
 }
 
@@ -897,7 +916,11 @@ impl MeshTransport for TonicMesh {
 
     async fn mpu_upload_part(&self, node: &str, req: mesh::MpuPartUpload) -> Result<String> {
         // 先取 client 再移动 body（借用在 await 前收口）
-        let mut client = self.mpu_client(node)?.clone();
+        let (mut client, secure) = self.mpu_client(node)?;
+        // L-3：带 SSE-C 校验头的 part 属于 SSE-C MPU，禁止走明文 mesh。
+        if req.sse_c_md5.is_some() && !secure {
+            return Err(mesh_tls_required());
+        }
         let resp = client
             .upload_part(mpu_chunk_stream(req))
             .await
@@ -911,6 +934,12 @@ impl MeshTransport for TonicMesh {
     }
 
     async fn mpu_complete(&self, node: &str, req: mesh::MpuComplete) -> Result<ObjectInfo> {
+        // L-3：SSE-C 原始客户钥只允许走 mesh TLS；明文通道 fail-closed（本地属主不经此处）。
+        let is_ssec = matches!(&req.encryption, Some(mesh::MpuEnc::SseC(_)));
+        let (mut client, secure) = self.mpu_client(node)?;
+        if is_ssec && !secure {
+            return Err(mesh_tls_required());
+        }
         let (enc_kind, enc_cmk, sse_c_key) = match req.encryption {
             None => (0, String::new(), Vec::new()),
             Some(mesh::MpuEnc::SseS3) => (1, String::new(), Vec::new()),
@@ -933,9 +962,7 @@ impl MeshTransport for TonicMesh {
             VersioningMode::Enabled => 1,
             VersioningMode::Suspended => 2,
         };
-        let resp = self
-            .mpu_client(node)?
-            .clone()
+        let resp = client
             .complete_upload(xl_proto::MpuCompleteReq {
                 target: Some(mpu_ref_to_proto(mesh::MpuRef {
                     bucket: req.bucket,
@@ -969,9 +996,8 @@ impl MeshTransport for TonicMesh {
     }
 
     async fn mpu_abort(&self, node: &str, req: mesh::MpuRef) -> Result<()> {
-        let resp = self
-            .mpu_client(node)?
-            .clone()
+        let (mut client, _) = self.mpu_client(node)?;
+        let resp = client
             .abort_upload(mpu_ref_to_proto(req))
             .await
             .map_err(|e| rpc_unavailable(node, e))?
@@ -984,9 +1010,8 @@ impl MeshTransport for TonicMesh {
     }
 
     async fn mpu_list_parts(&self, node: &str, req: mesh::MpuRef) -> Result<Vec<mesh::MpuPartRow>> {
-        let resp = self
-            .mpu_client(node)?
-            .clone()
+        let (mut client, _) = self.mpu_client(node)?;
+        let resp = client
             .list_parts(mpu_ref_to_proto(req))
             .await
             .map_err(|e| rpc_unavailable(node, e))?
@@ -2338,7 +2363,7 @@ mod tests {
         };
 
         // 1) 截断流（无 is_final）→ 信封 Encode；不得提交 part
-        let mut raw = mesh.mpu_client("n1").unwrap().clone();
+        let (mut raw, _) = mesh.mpu_client("n1").unwrap();
         let trunc = vec![xl_proto::MpuPartChunk {
             bucket: "buck".into(),
             key: "k".into(),

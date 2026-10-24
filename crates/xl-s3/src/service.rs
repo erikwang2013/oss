@@ -65,6 +65,28 @@ pub struct OssS3 {
 }
 
 impl OssS3 {
+    /// 站点 token 校验（常量时间；token 来自 `[site].token`/站点身份；
+    /// 本站未启用站点模式或请求未携带 → false）。
+    fn site_token_ok(&self, headers: &http::HeaderMap) -> bool {
+        match (
+            self.site_token.as_deref(),
+            headers
+                .get("x-oss-site-token")
+                .and_then(|v| v.to_str().ok()),
+        ) {
+            (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
+            _ => false,
+        }
+    }
+
+    /// 请求是否声明复制摄入（`x-amz-replication-status: REPLICA`，大小写不敏感）。
+    fn replica_requested(headers: &http::HeaderMap) -> bool {
+        headers
+            .get("x-amz-replication-status")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"))
+    }
+
     /// M8 缺口 C：请求未带任何显式 SSE（含 SSE-C）时套用桶默认加密；显式请求永远优先。
     /// 库内未知值属记录损坏 → 500（不静默降级为明文）。
     async fn apply_default_encryption(&self, bucket: &str, sse: &mut SseReq) -> S3Result<()> {
@@ -1262,13 +1284,15 @@ impl S3 for OssS3 {
         let lock = self.resolve_lock(&req.input.bucket, lock_req).await?;
         // M6 切片 0：事件来源（解构 req.input 前自 headers 取）
         let event_source = EventSource::from_headers(&req.headers);
-        // M6 切片 3：REPLICA 摄入（复制源 PutObject 带 x-amz-replication-status: REPLICA；
-        // 信任复制方凭证——与 AWS 复制目标侧同口径，边界记档）
-        let replica = req
-            .headers
-            .get("x-amz-replication-status")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("REPLICA"));
+        // M6 切片 3：REPLICA 摄入（复制源 PutObject 带 x-amz-replication-status: REPLICA）。
+        // O-2：REPLICA 状态会抑制复制（防环），因此只信 site token 认证的内部请求；
+        // 普通 S3 客户端的同名头按普通写入处理，不能借此抑制复制。
+        let replica_hdr = Self::replica_requested(&req.headers);
+        let token_ok = self.site_token_ok(&req.headers);
+        let replica = replica_hdr && token_ok;
+        if replica_hdr && !token_ok {
+            tracing::warn!(bucket = %req.input.bucket, "忽略未认证的 x-amz-replication-status: REPLICA");
+        }
         // 4.1：复制摄入可带 MPU 段长表（仅 REPLICA 接受；store 校验总和 == 实际大小）
         let part_sizes = if replica {
             parse_part_sizes(req.headers.get("x-oss-part-sizes"))?
@@ -1281,6 +1305,11 @@ impl S3 for OssS3 {
             .sync_mode(&req.input.bucket)
             .await
             .map_err(to_s3_error)?;
+        // O-2/M9：sync 桶上未认证的 REPLICA 仍按原边界 403（不静默降级为普通写入）；
+        // 该检查先于下面的非摄入限制，保持原有错误优先级。
+        if sync && replica_hdr && !token_ok {
+            return Err(s3s::s3_error!(AccessDenied, "site token required"));
+        }
         if sync && !replica {
             if matches!(sse.spec, Some(xl_store::crypto::EncSpec::SseC(_))) {
                 return Err(s3s::s3_error!(
@@ -1299,29 +1328,18 @@ impl S3 for OssS3 {
         // 作本地版本 id（双站同 id），且不再 gate/再复制（防环）。
         // 4.16：异步站点复制（非 sync 桶）带 origin id 时同样强制同 id（版本删除才能定点映射），
         // 但必须由 site token 认证——否则任意 REPLICA 客户端可伪造版本 id。
-        let presented = req
-            .headers
-            .get("x-oss-site-token")
-            .and_then(|v| v.to_str().ok());
-        let token_ok = match (self.site_token.as_deref(), presented) {
-            (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
-            _ => false,
-        };
         let origin_id = req
             .headers
             .get("x-oss-origin-version-id")
             .and_then(|v| v.to_str().ok());
         let mut forced_version_id = None;
         if replica && sync {
-            if !token_ok {
-                return Err(s3s::s3_error!(AccessDenied, "site token required"));
-            }
             forced_version_id = Some(
                 origin_id
                     .ok_or_else(|| s3s::s3_error!(InvalidRequest, "origin version id required"))?
                     .to_string(),
             );
-        } else if replica && origin_id.is_some() {
+        } else if replica_hdr && origin_id.is_some() {
             // 混合版本保护：带同源 id 却无有效令牌 → 明确拒绝（不静默丢弃 id 产生错位版本）。
             if !token_ok {
                 return Err(s3s::s3_error!(AccessDenied, "site token required"));
@@ -2369,11 +2387,14 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let event_source = EventSource::from_headers(&req.headers);
         // P0-2：复制出的 DELETE 不得在目标端再生 marker 回环。
-        let replica = req
-            .headers
-            .get("x-amz-replication-status")
-            .and_then(|v| v.to_str().ok())
-            == Some("REPLICA");
+        // O-2：REPLICA 状态只信 site token 认证的内部请求；普通客户端的同名头被忽略，
+        // 其删除照常进入复制钩子（不能用该头抑制复制）。
+        let replica_hdr = Self::replica_requested(&req.headers);
+        let token_ok = self.site_token_ok(&req.headers);
+        let replica = replica_hdr && token_ok;
+        if replica_hdr && !token_ok {
+            tracing::warn!(bucket = %req.input.bucket, "忽略未认证的 x-amz-replication-status: REPLICA");
+        }
         let bucket = req.input.bucket;
         let key = req.input.key;
         let vid = req.input.version_id.clone();
@@ -2381,15 +2402,11 @@ impl S3 for OssS3 {
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         let mode = self.versioning_mode(&bucket).await?;
         let hdr = |n: &str| req.headers.get(n).and_then(|v| v.to_str().ok());
-        // 站点副本 token 认证（marker 同 id 与历史副本按内容删除都要求）。
-        let token_ok = match (self.site_token.as_deref(), hdr("x-oss-site-token")) {
-            (Some(expected), Some(got)) if !expected.is_empty() => ct_eq(expected, got),
-            _ => false,
-        };
         let origin_id = hdr("x-oss-origin-version-id");
         // 4.16：站点对 marker 同 id——REPLICA DELETE 在 site token 认证下可用
         // `x-oss-origin-version-id` 指定 marker 版本 id（异步站点复制；sync 桶走 M9 内部路由）。
-        let forced_marker = if vid.is_none() && replica {
+        // 未认证却携带 origin id → 明确 403（不静默丢弃 id 产生错位 marker）。
+        let forced_marker = if vid.is_none() && replica_hdr {
             match origin_id {
                 Some(origin) => {
                     if !token_ok {
@@ -2527,11 +2544,13 @@ impl S3 for OssS3 {
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let event_source = EventSource::from_headers(&req.headers);
         // P0-2：批量删除的复制请求同样防回环。
-        let replica = req
-            .headers
-            .get("x-amz-replication-status")
-            .and_then(|v| v.to_str().ok())
-            == Some("REPLICA");
+        // O-2：同单键删除——未认证的 REPLICA 头被忽略，照常进入复制钩子。
+        let replica_hdr = Self::replica_requested(&req.headers);
+        let token_ok = self.site_token_ok(&req.headers);
+        let replica = replica_hdr && token_ok;
+        if replica_hdr && !token_ok {
+            tracing::warn!(bucket = %req.input.bucket, "忽略未认证的 x-amz-replication-status: REPLICA");
+        }
         let bucket = req.input.bucket;
         // §3.4：一次最多 1000 个
         if req.input.delete.objects.len() > 1000 {
