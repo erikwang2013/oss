@@ -308,6 +308,7 @@ impl Interceptor for SecretInterceptor {
 // ---------- 客户端 ----------
 
 type MeshChannel = tonic::codegen::InterceptedService<Channel, TokenInterceptor>;
+type MeshClientMap = HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>;
 
 /// mesh TLS 热加载信号：值为当前 tonic 客户端配置（`None` = 明文）。
 pub type TlsWatch = watch::Receiver<Option<tonic::transport::ClientTlsConfig>>;
@@ -447,10 +448,7 @@ impl TonicMesh {
         connect: Duration,
         request: Duration,
         tls: Option<&tonic::transport::ClientTlsConfig>,
-    ) -> Result<(
-        HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>,
-        HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>,
-    )> {
+    ) -> Result<(MeshClientMap, MeshClientMap)> {
         let scheme = if tls.is_some() { "https" } else { "http" };
         let mut clients = HashMap::with_capacity(nodes.len());
         let mut mpu_clients = HashMap::with_capacity(nodes.len());
