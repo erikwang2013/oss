@@ -133,6 +133,8 @@ impl Store {
 
     /// 集群列举（D4）：本机页 ∪ 各节点 ListLocal 页；远端不可达 warn 跳过（少一路并集）。
     async fn list_objects_cluster(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {
+        // DP-0：远端页传输错会被「少一路并集」吞掉 → 混版下必须先 fail-closed。
+        self.ensure_data_plane_compatible().await?;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let self_id = cl.sets.flat.self_node().id.clone();
 

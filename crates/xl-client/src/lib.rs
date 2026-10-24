@@ -78,6 +78,8 @@ fn err_wire(e: &Error) -> (&'static str, String) {
         Error::Unsupported(s) => ("Unsupported", s.clone()),
         Error::Conflict(s) => ("Conflict", s.clone()),
         Error::BadGateway(s) => ("BadGateway", s.clone()),
+        // DP-0：混版数据面 fail-closed 必须原样过线（S3 503 peer_incompatible）。
+        Error::PeerIncompatible(s) => ("PeerIncompatible", s.clone()),
     }
 }
 
@@ -109,6 +111,7 @@ fn err_from_wire(code: &str, msg: String) -> Error {
         "Unsupported" => Error::Unsupported(msg),
         "Conflict" => Error::Conflict(msg),
         "BadGateway" => Error::BadGateway(msg),
+        "PeerIncompatible" => Error::PeerIncompatible(msg),
         // 未知 code：不猜语义，按内部错误上抛（fail-closed）
         other => Error::Encode(format!("对端错误码 {other}：{msg}")),
     }
@@ -553,6 +556,8 @@ impl MeshTransport for TonicMesh {
                 .map(|s| (s.slot as u16, s.up))
                 .collect(),
             buckets: resp.buckets,
+            // DP-0：旧节点无此字段 → proto 缺省 0，xl-store 侧统一按 1 解读。
+            data_wire_version: resp.data_wire_version,
         })
     }
     // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
@@ -1211,6 +1216,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 })
                 .collect(),
             buckets: h.buckets,
+            data_wire_version: h.data_wire_version,
         }))
     }
 
@@ -1842,6 +1848,8 @@ mod tests {
         assert_eq!(h.node_id, "single"); // 单节点部署的退化 id
         assert_eq!(h.slots, vec![(0, true)]);
         assert_eq!(h.version, env!("CARGO_PKG_VERSION"));
+        // DP-0 握手字段随 Health 往返，且与本版常量一致。
+        assert_eq!(h.data_wire_version, xl_store::mesh_gate::DATA_WIRE_VERSION);
 
         // 错误令牌 → Unauthenticated
         let bad = TonicMesh::new("n1", "wrong", &nodes).unwrap();

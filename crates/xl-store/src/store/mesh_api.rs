@@ -51,7 +51,48 @@ impl Store {
             version: env!("CARGO_PKG_VERSION").to_string(),
             slots,
             buckets: buckets.len() as u64,
+            // DP-0：本版数据面线格式；旧节点缺字段 → 消费方按 1。
+            data_wire_version: crate::mesh_gate::DATA_WIRE_VERSION,
         }
+    }
+
+    /// DP-0 数据面前置握手：并发探测全部对端的数据面版本。
+    ///
+    /// 语义（availability 优先于猜测）：**探测失败/超时 = 不可达**，不在此处拒绝——
+    /// 交给既有 quorum/降级语义；只有「可达且版本不一致」才 fail-closed 返回
+    /// [`Error::PeerIncompatible`]（S3 503 `peer_incompatible`）。单节点/未配集群恒 Ok。
+    ///
+    /// 生产传输（[`crate::mesh_gate::GatedMesh`]）把版本缓存 TTL 化，热路径不逐请求探测。
+    pub async fn ensure_data_plane_compatible(&self) -> Result<()> {
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return Ok(());
+        };
+        let self_id = cl.sets.flat.self_node().id.as_str();
+        let peers: Vec<&str> = cl
+            .sets
+            .flat
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .filter(|id| *id != self_id)
+            .collect();
+        let probes = peers.iter().map(|peer| {
+            let transport = &cl.transport;
+            async move {
+                let got = tokio::time::timeout(
+                    std::time::Duration::from_millis(800),
+                    transport.data_wire_version(peer),
+                )
+                .await;
+                match got {
+                    Ok(Ok(v)) => crate::mesh_gate::check_compatible(peer, v),
+                    // 不可达/超时：不伪装成版本不兼容。
+                    Ok(Err(_)) | Err(_) => Ok(()),
+                }
+            }
+        });
+        futures::future::try_join_all(probes).await?;
+        Ok(())
     }
 }
 

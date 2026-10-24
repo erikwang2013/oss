@@ -196,6 +196,8 @@ impl Store {
         bucket: &str,
         req: &UploadListRequest,
     ) -> Result<UploadListResult> {
+        // DP-0：远端页传输错会被「少一路并集」吞掉 → 混版下必须先 fail-closed。
+        self.ensure_data_plane_compatible().await?;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let self_id = cl.sets.flat.self_node().id.clone();
 

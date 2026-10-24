@@ -192,6 +192,9 @@ pub struct NodeHealth {
     /// (全局槽位, 该盘在册)
     pub slots: Vec<(u16, bool)>,
     pub buckets: u64,
+    /// DP-0 数据面线格式（原样上报；旧节点缺省 0）。判定一律用
+    /// [`NodeHealth::peer_data_wire_version`]（见 `mesh_gate`）。
+    pub data_wire_version: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +452,11 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
         ))
     }
     async fn health(&self, node: &str) -> Result<NodeHealth>;
+    /// DP-0：对端宣告的数据面线格式（缺失/0 → 1）。默认一次 Health 探测；生产实现
+    /// （[`crate::mesh_gate::GatedMesh`]）覆盖为带 TTL 的缓存版本。
+    async fn data_wire_version(&self, node: &str) -> Result<u32> {
+        Ok(self.health(node).await?.peer_data_wire_version())
+    }
     async fn lock(&self, node: &str, req: LockReq) -> Result<LockResp>;
     async fn control_query(&self, node: &str, q: ControlQuery) -> Result<Option<ControlRow>>;
 
