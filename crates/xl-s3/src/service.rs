@@ -2649,15 +2649,24 @@ impl S3 for OssS3 {
         for obj in req.input.delete.objects {
             // AP 拒键先于基线判定；拒键绝不进入 delete_versioned（安全边界）。
             if let Some(p) = ap_delete {
+                let account = crate::ap::ApAccount {
+                    id: p.account_id.as_deref(),
+                    active: p.account_active,
+                };
+                let proof = crate::ap::ApSourceProof {
+                    ip: p.source_ip,
+                    vpc: p.source_vpc.as_deref(),
+                    vpce: p.source_vpce.as_deref(),
+                };
                 let denied = match &user {
                     Some(u) => {
                         crate::ap::ap_decision(
                             &p.ap,
                             u,
+                            account,
                             "DeleteObjects",
                             Some(&obj.key),
-                            p.source_ip,
-                            p.source_vpc.as_deref(),
+                            proof,
                         ) == Some(false)
                     }
                     // 匿名 AP 批量删：逐键只认 Principal "*"，无策略默认拒绝。
@@ -2666,8 +2675,7 @@ impl S3 for OssS3 {
                             &p.ap,
                             "DeleteObjects",
                             Some(&obj.key),
-                            p.source_ip,
-                            p.source_vpc.as_deref(),
+                            proof,
                         ) == Some(false)
                     }
                     None => true, // 防御性 fail-closed

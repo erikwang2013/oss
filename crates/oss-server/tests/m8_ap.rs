@@ -40,17 +40,38 @@ async fn env(dir: &std::path::Path) -> Env {
 /// `peer` = 模拟连接对端（SourceIp 条件）；注入在最外层，等价于真实 listener 的
 /// connect_info（ecat 内置 listener 不提供，生产由 router 的信任反代路径补）。
 async fn env_with_peer(dir: &std::path::Path, peer: Option<std::net::IpAddr>) -> Env {
+    env_with_proofs(dir, peer, None, None).await
+}
+
+/// 注入来源证明扩展（等价于可信反代已解析并覆盖后的 `ApVpc`/`ApVpce`）。
+async fn env_with_proofs(
+    dir: &std::path::Path,
+    peer: Option<std::net::IpAddr>,
+    vpc: Option<&str>,
+    vpce: Option<&str>,
+) -> Env {
     let st = state(dir).await;
     let app = build_router(st.clone()).unwrap();
-    let app = match peer {
-        Some(ip) => app.layer(axum::middleware::from_fn(
-            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
-                req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
+    let vpc = vpc.map(str::to_string);
+    let vpce = vpce.map(str::to_string);
+    let app = app.layer(axum::middleware::from_fn(
+        move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+            let vpc = vpc.clone();
+            let vpce = vpce.clone();
+            async move {
+                if let Some(ip) = peer {
+                    req.extensions_mut().insert(xl_s3::ap::ApPeer(ip));
+                }
+                if let Some(v) = vpc {
+                    req.extensions_mut().insert(xl_s3::ap::ApVpc(v));
+                }
+                if let Some(v) = vpce {
+                    req.extensions_mut().insert(xl_s3::ap::ApVpce(v));
+                }
                 next.run(req).await
-            },
-        )),
-        None => app,
-    };
+            }
+        },
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -387,6 +408,13 @@ fn bucket_policy(effect: &str) -> String {
 fn ap_policy(effect: &str, action: &str, resource: &str) -> String {
     serde_json::json!({"Statement":[{
         "Effect":effect,"Principal":{"AWS":"*"},"Action":action,"Resource":resource}]})
+    .to_string()
+}
+
+/// 指定 Principal 的 Allow 策略（账户根 ARN 主体用例）。
+fn principal_policy(principal: &str, action: &str, resource: &str) -> String {
+    serde_json::json!({"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":principal},"Action":action,"Resource":resource}]})
     .to_string()
 }
 
@@ -2848,4 +2876,261 @@ async fn ap_op_mismatch_guards_and_object_lock_actions() {
         send_status(&e, Method::GET, &ret_path, &[], b"", &ak, &sk, "s3").await,
         200
     );
+}
+
+/// AP 账户根 Principal：跨账户 = 请求方当前账户匹配 AP 策略主体，且桶策略/表权限
+/// 基线同时放行（交集）；停用账户 fail-closed。
+#[tokio::test]
+async fn cross_account_principal_requires_ap_and_bucket_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = env(dir.path()).await;
+    let (owner_uid, owner_ak, owner_sk) = user(&e, "owner", false).await;
+    let (req_uid, req_ak, req_sk) = user(&e, "requester", false).await;
+    bucket(&e, "xacctb", Some(owner_uid)).await;
+    perms(&e, owner_uid, &[full("xacctb")]).await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::PUT,
+            "/xacctb/k",
+            &[],
+            b"v",
+            &owner_ak,
+            &owner_sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+
+    let owner_acct = xl_s3::access::account_id_of(owner_uid).unwrap();
+    let req_acct = xl_s3::access::account_id_of(req_uid).unwrap();
+    assert_ne!(owner_acct, req_acct);
+    let root = |acct: &str| format!("arn:aws:iam::{acct}:root");
+    let obj = "arn:aws:s3:::xacctb/*";
+    let ap_with = |principal: &str| principal_policy(principal, "s3:GetObject", obj);
+
+    // 同账户：桶主账户根 → AP 放行（基线 = 表权限）
+    direct_ap(
+        &e,
+        "xap",
+        "xacctb",
+        owner_uid,
+        Some(&ap_with(&root(&owner_acct))),
+    )
+    .await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &owner_ak,
+            &owner_sk,
+            "s3"
+        )
+        .await,
+        200,
+        "同账户账户根主体应放行"
+    );
+
+    // 桶策略只授请求方账户 → AP 主体仍只有桶主 → 拒
+    let bucket_grant = principal_policy(&root(&req_acct), "s3:GetObject", obj);
+    set_bucket_policy(&e, "xacctb", Some(&bucket_grant)).await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        403,
+        "AP 策略未授请求方账户必须拒"
+    );
+
+    // 双策略都授请求方账户 → 交集放行（无表权限也可）
+    set_ap_policy(
+        &e,
+        "xap",
+        "xacctb",
+        owner_uid,
+        Some(&ap_with(&root(&req_acct))),
+    )
+    .await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        200,
+        "跨账户双授应放行"
+    );
+
+    // 撤桶基线：AP 通配 "*" 不能单独抬升
+    set_bucket_policy(&e, "xacctb", None).await;
+    set_ap_policy(&e, "xap", "xacctb", owner_uid, Some(&ap_with("*"))).await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        403,
+        "AP Principal \"*\" 不得绕过桶基线"
+    );
+
+    // 未知账户根主体（账户不存在）→ 不命中
+    set_bucket_policy(&e, "xacctb", Some(&bucket_grant)).await;
+    set_ap_policy(
+        &e,
+        "xap",
+        "xacctb",
+        owner_uid,
+        Some(&ap_with(&root("999999999999"))),
+    )
+    .await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        403,
+        "未知账户主体必须拒"
+    );
+
+    // LEGACY 系统账户根主体永不匹配
+    set_ap_policy(
+        &e,
+        "xap",
+        "xacctb",
+        owner_uid,
+        Some(&ap_with(&root(xl_s3::access::LEGACY_ACCOUNT))),
+    )
+    .await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        403,
+        "LEGACY 账户主体必须拒"
+    );
+
+    // 恢复双授 → 200；停用请求方账户 → fail-closed
+    set_ap_policy(
+        &e,
+        "xap",
+        "xacctb",
+        owner_uid,
+        Some(&ap_with(&root(&req_acct))),
+    )
+    .await;
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        200
+    );
+    assert!(
+        e.st.db
+            .set_account_status(&req_acct, "disabled")
+            .await
+            .unwrap(),
+        "非管理员账户应可停用"
+    );
+    assert_eq!(
+        send_status(
+            &e,
+            Method::GET,
+            "/ap/xap/k",
+            &[],
+            b"",
+            &req_ak,
+            &req_sk,
+            "s3"
+        )
+        .await,
+        403,
+        "停用账户必须 fail-closed"
+    );
+}
+
+async fn seed_vpce_fixture(e: &Env, vpce: &str) -> (String, String) {
+    let (uid, ak, sk) = user(e, "vpce-owner", false).await;
+    bucket(e, "vpceb", Some(uid)).await;
+    perms(e, uid, &[full("vpceb")]).await;
+    assert_eq!(
+        send_status(e, Method::PUT, "/vpceb/k", &[], b"v", &ak, &sk, "s3").await,
+        200
+    );
+    let policy = serde_json::json!({"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+        "Resource":"arn:aws:s3:::vpceb/*",
+        "Condition":{"StringEquals":{"aws:SourceVpce":vpce}}}]})
+    .to_string();
+    direct_ap(e, "vpce-ap", "vpceb", uid, Some(&policy)).await;
+    (ak, sk)
+}
+
+/// `aws:SourceVpce` 是独立显式证明：缺证明/错证明/仅 SourceVpc 同形值都 fail-closed。
+#[tokio::test]
+async fn source_vpce_requires_explicit_proof() {
+    const VPCE: &str = "vpce-0abc123";
+    let cases: [(&str, Option<&str>, Option<&str>, u16); 4] = [
+        ("matching", None, Some(VPCE), 200),
+        ("missing", None, None, 403),
+        ("wrong", None, Some("vpce-0def456"), 403),
+        ("vpc-only", Some(VPCE), None, 403),
+    ];
+    for (label, vpc, vpce, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let e = env_with_proofs(dir.path(), None, vpc, vpce).await;
+        let (ak, sk) = seed_vpce_fixture(&e, VPCE).await;
+        assert_eq!(
+            send_status(&e, Method::GET, "/ap/vpce-ap/k", &[], b"", &ak, &sk, "s3").await,
+            want,
+            "SourceVpce {label}"
+        );
+    }
 }
