@@ -38,6 +38,16 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
             err.set_status_code(http::StatusCode::BAD_GATEWAY);
             return err;
         }
+        // DP-0：混版数据面 → 503 + 精确 code（s3s 无此变体，Custom + 强制状态码）。
+        // 明确可诊断的 fail-closed，不得退化成 500/QuorumUnmet。
+        StoreError::PeerIncompatible(_) => {
+            let mut err = S3Error::with_message(
+                S3ErrorCode::Custom("peer_incompatible".into()),
+                e.to_string(),
+            );
+            err.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+            return err;
+        }
         // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体。
         // M5：Crypto（wrap 解不开/主密钥缺失）暂同归 500 泛化——对客户端可纠正的形态
         // （SSE-C 错钥 → 4xx）在切片 3 接线时再细分，此处不提前放宽。
@@ -111,6 +121,23 @@ mod tests {
         let err = to_s3_error(StoreError::BadGateway("sync version id mismatch".into()));
         assert_eq!(err.status_code(), Some(http::StatusCode::BAD_GATEWAY));
         assert_eq!(err.message(), Some("bad gateway: sync version id mismatch"));
+    }
+
+    /// DP-0：混版数据面必须是 503 + `peer_incompatible`（运维可诊断，不落 500）。
+    #[test]
+    fn peer_incompatible_maps_to_503_custom_code() {
+        let err = to_s3_error(StoreError::PeerIncompatible(
+            "节点 n2 数据面版本 1 与本机 2 不一致".into(),
+        ));
+        assert_eq!(
+            err.status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(err.code().as_str(), "peer_incompatible");
+        assert!(
+            err.message().unwrap_or_default().contains("数据面版本"),
+            "message 需带对端版本细节"
+        );
     }
 
     #[test]

@@ -71,7 +71,10 @@ message UploadListReq { string bucket=1; string prefix=2; string delimiter=3; st
                         string upload_id_marker=5; uint32 limit=6; }
 message UploadEntry { string key=1; string upload_id=2; int64 initiated_nanos=3; string storage_class=4; }
 message UploadListLocalResp { repeated UploadEntry uploads=1; repeated string prefixes=2; uint32 slots_ok=3; }
-message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4; }
+// DP-0 数据面滚动升级握手：data_wire_version = 本节点支持的数据面线格式。
+// 旧节点无此字段（proto3 缺省 0）→ 消费方一律按 1 处理；本版宣告 2。
+message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4;
+                     uint32 data_wire_version=5; }
 message SlotState { uint32 slot=1; bool up=2; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;
                   string holder=5; uint64 ttl_ms=6; LockOp op=7; }

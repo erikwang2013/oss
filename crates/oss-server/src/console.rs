@@ -391,20 +391,22 @@ async fn cluster_status(
     match state.store.cluster() {
         Some(c) => {
             let peers = crate::router::probe_peers(&state).await;
+            let (data_plane_compatible, incompatible_peers) =
+                crate::router::data_plane_status(&peers);
             let me = c.sets.flat.self_node();
             let mut nodes = vec![serde_json::json!({
                 "id": me.id, "addr": me.addr, "drive_count": me.drive_count, "up": true,
+                "data_wire_version": xl_store::mesh_gate::DATA_WIRE_VERSION,
             })];
             for n in &c.sets.flat.nodes {
                 if n.id == me.id {
                     continue;
                 }
-                let up = peers
-                    .iter()
-                    .find(|(id, _, _)| id == &n.id)
-                    .is_some_and(|(_, up, _)| *up);
+                let probe = peers.iter().find(|p| p.id == n.id);
                 nodes.push(serde_json::json!({
-                    "id": n.id, "addr": n.addr, "drive_count": n.drive_count, "up": up,
+                    "id": n.id, "addr": n.addr, "drive_count": n.drive_count,
+                    "up": probe.is_some_and(|p| p.up),
+                    "data_wire_version": probe.map(|p| p.data_wire_version),
                 }));
             }
             // M4 切片 8：多 set 视图——每 set 独立槽域（R3：跨 set 槽号会重号，必须分组呈现）；
@@ -438,6 +440,11 @@ async fn cluster_status(
                 "sets": sets_view,
                 "nodes": nodes,
                 "quorum_unmet": quorum_unmet,
+                // DP-0：混版时数据面 fail-closed（503 peer_incompatible）；
+                // down 节点不参与版本结论。
+                "data_wire_version": xl_store::mesh_gate::DATA_WIRE_VERSION,
+                "data_plane_compatible": data_plane_compatible,
+                "incompatible_peers": incompatible_peers,
             }))
             .into_response()
         }
@@ -455,6 +462,10 @@ async fn cluster_status(
                     "up": true,
                 }],
                 "quorum_unmet": quorum_unmet,
+                // DP-0：单机 = 自身即全集群，恒兼容。
+                "data_wire_version": xl_store::mesh_gate::DATA_WIRE_VERSION,
+                "data_plane_compatible": true,
+                "incompatible_peers": Vec::<String>::new(),
             }))
             .into_response()
         }

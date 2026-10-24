@@ -67,6 +67,10 @@ pub enum Error {
     /// M9：远端确认与本地预期不符（版本 id 不一致）→ S3 502。
     #[error("bad gateway: {0}")]
     BadGateway(String),
+    /// DP-0 数据面滚动升级：对端数据面线格式与本机不一致 → S3 503 `peer_incompatible`。
+    /// 混版集群必须 fail-closed，不得降级为部分读写。
+    #[error("peer_incompatible: {0}")]
+    PeerIncompatible(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

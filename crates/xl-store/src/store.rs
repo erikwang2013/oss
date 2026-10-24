@@ -1149,6 +1149,8 @@ impl Store {
         key: &str,
         full: bool,
     ) -> Result<Option<XlMeta>> {
+        // DP-0：混版集群在扇出前 fail-closed（集群读吞传输错 → 不清 503 会退化成 500）。
+        self.ensure_data_plane_compatible().await?;
         use futures::StreamExt as _;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let q_s = self.cfg.ec.data as usize + 1;
@@ -1397,6 +1399,9 @@ impl Store {
         m: &XlMeta,
         old: Option<&XlMeta>,
     ) -> Result<usize> {
+        // DP-0：写 prepare 阶段的传输错会被 quorum 计数吞掉（→ QuorumUnmet/500），
+        // 必须在任何本地 .new 落盘前做混版 fail-closed。
+        self.ensure_data_plane_compatible().await?;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let self_id = cl.sets.flat.self_node().id.clone();
         let q_s = self.cfg.ec.data as usize + 1;

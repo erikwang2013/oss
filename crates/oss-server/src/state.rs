@@ -352,12 +352,17 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            let mesh = Arc::new(xl_client::TonicMesh::new_with_tls_watch(
-                &cl.node_id,
-                &cl.secret,
-                &pairs,
-                tls.peer_tls().then(|| tls.tonic_client_watch()),
-            )?);
+            // DP-0：生产传输统一包数据面闸门（混版 RPC 在发出前 fail-closed；
+            // health/锁/控制面直通，保证诊断与鉴权不被连带阻断）。
+            let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
+                Arc::new(xl_store::mesh_gate::GatedMesh::new(Arc::new(
+                    xl_client::TonicMesh::new_with_tls_watch(
+                        &cl.node_id,
+                        &cl.secret,
+                        &pairs,
+                        tls.peer_tls().then(|| tls.tonic_client_watch()),
+                    )?,
+                )));
             // 放置开关：只认 None/"v1"/"v2"——未知值 fail-closed（静默降级为 v1 会让
             // 「以为开了 v2」的运维在 rebalance 里得到空跑报告）
             let placement_v2 = match cl.placement.as_deref() {
@@ -424,14 +429,18 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            let mesh = Arc::new(xl_client::TonicMesh::new_with_timeouts_tls_watch(
-                &st.node_id,
-                &st.mesh_secret,
-                &pairs,
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_millis(st.mesh_timeout_ms),
-                tls.peer_tls().then(|| tls.tonic_client_watch()),
-            )?);
+            // DP-0：同 cluster 分支——stretch 也是数据面 mesh，必须过混版闸门。
+            let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
+                Arc::new(xl_store::mesh_gate::GatedMesh::new(Arc::new(
+                    xl_client::TonicMesh::new_with_timeouts_tls_watch(
+                        &st.node_id,
+                        &st.mesh_secret,
+                        &pairs,
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_millis(st.mesh_timeout_ms),
+                        tls.peer_tls().then(|| tls.tonic_client_watch()),
+                    )?,
+                )));
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
                 sets,
                 transport: mesh,
@@ -442,6 +451,21 @@ impl AppState {
             stretch_first_init = stretch_startup_check(&db, &store_cfg.drives).await?;
         }
         let store = Store::open(store_cfg).await?;
+        // DP-0 启动握手（best-effort，不阻断启动）：不可达节点交给运行期 quorum/降级；
+        // 可达且混版 → warn，数据面在首个请求前即 fail-closed（503 peer_incompatible）。
+        // 运维可见状态见 /health/cluster 与 /api/v1/cluster/status 的 data_plane_compatible。
+        if store.cluster().is_some() {
+            match store.ensure_data_plane_compatible().await {
+                Ok(()) => tracing::info!(
+                    data_wire_version = xl_store::mesh_gate::DATA_WIRE_VERSION,
+                    "数据面能力握手：无可达的混版节点（不可达节点按既有 quorum/降级处理）"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "数据面能力握手失败：混版集群，数据面将 fail-closed（503 peer_incompatible）"
+                ),
+            }
+        }
         if stretch_first_init {
             db.schema_meta_set_if_absent("stretch_initialized", "1")
                 .await

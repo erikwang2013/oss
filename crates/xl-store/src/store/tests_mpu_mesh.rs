@@ -90,6 +90,46 @@ async fn mpu_mesh_forward_upload_list_complete() {
     ));
 }
 
+/// DP-0：属主是旧数据面版本（缺字段 → 按 1）→ 协调节点的 MPU 转发全部明确
+/// `PeerIncompatible`（503），不得落到本地/伪装成功；恢复同版后转发照常。
+#[tokio::test]
+async fn mpu_mesh_mixed_version_forwarding_rejected() {
+    let c = two_node().await;
+    let id = c.stores[0]
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    c.mesh.set_data_wire_version("n1", Some(0)); // 旧节点：health 缺字段
+
+    let err = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"x"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::PeerIncompatible(_)), "{err:?}");
+    assert!(matches!(
+        c.stores[1].list_parts("alpha", "k", &id).await,
+        Err(Error::PeerIncompatible(_))
+    ));
+    assert!(matches!(
+        c.stores[1].abort_multipart_upload("alpha", "k", &id).await,
+        Err(Error::PeerIncompatible(_))
+    ));
+    assert!(matches!(
+        c.stores[1]
+            .complete_multipart_upload("alpha", "k", &id, &[(1, "etag".into())])
+            .await,
+        Err(Error::PeerIncompatible(_))
+    ));
+
+    // 恢复同版 → 转发恢复（不对暂存区做任何本地降级）
+    c.mesh.set_data_wire_version("n1", None);
+    let etag = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"ok"]))
+        .await
+        .unwrap();
+    assert!(!etag.is_empty());
+}
+
 /// 属主宕机：四个转发操作全部确定性 Unavailable（S3 503），不得降级成本地
 /// 成功/NoSuchUpload；恢复后可继续用宕机前已上传的 part 完成。
 #[tokio::test]

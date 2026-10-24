@@ -1165,6 +1165,10 @@ impl Store {
         if max == 0 {
             return Ok(VersionList::default());
         }
+        // DP-0：版本枚举的远端页错误会被「少一路并集（degraded）」吞掉 → 混版先 fail-closed。
+        if self.cfg.cluster.is_some() {
+            self.ensure_data_plane_compatible().await?;
+        }
         // 续点参数成对出现（S3 语义）：只给 version-id-marker 无从定位
         if version_id_marker.is_some() && key_marker.is_none() {
             return Err(Error::InvalidArgument(

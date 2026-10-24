@@ -4,5 +4,6 @@ pub mod gate;
 pub mod kms;
 pub mod layout;
 pub mod mesh;
+pub mod mesh_gate;
 pub mod meta;
 pub mod store;

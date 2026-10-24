@@ -454,10 +454,31 @@ fn range_is_signed(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> bo
     })
 }
 
+/// peer 探测结果。`up=false` 时 `data_wire_version` 无意义（恒 0）。
+pub(crate) struct PeerProbe {
+    pub id: String,
+    pub up: bool,
+    /// 在册槽数
+    pub slots: usize,
+    /// 对端数据面版本（旧节点 health 缺字段 → 按 1 展示）。
+    pub data_wire_version: u32,
+}
+
+/// DP-0 数据面兼容判定：只把「可达且版本不一致」算不兼容；**down 节点不下版本结论**
+/// （交给既有 quorum/降级语义，避免把网络故障伪装成混版）。返回 `(compatible, 不兼容列表)`。
+pub(crate) fn data_plane_status(peers: &[PeerProbe]) -> (bool, Vec<String>) {
+    let bad: Vec<String> = peers
+        .iter()
+        .filter(|p| p.up && p.data_wire_version != xl_store::mesh_gate::DATA_WIRE_VERSION)
+        .map(|p| format!("{}(v{})", p.id, p.data_wire_version))
+        .collect();
+    (bad.is_empty(), bad)
+}
+
 /// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
 /// `/health/cluster`、`/metrics`、`/api/v1/cluster/status` 三处共用一份探测逻辑。
-/// 返回每 peer `(id, up, 在册槽数)`；顺序 = 拓扑顺序（不含本节点；单机为空表）。
-pub(crate) async fn probe_peers(state: &AppState) -> Vec<(String, bool, usize)> {
+/// 顺序 = 拓扑顺序（不含本节点；单机为空表）。
+pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
     let mut out = Vec::new();
     let Some(c) = state.store.cluster() else {
         return out;
@@ -469,17 +490,29 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<(String, bool, usize)> 
         }
         // 单点探测 800ms：就绪探针会被 LB 轮询，要短平快；掉队节点标 down 即可
         match tokio::time::timeout(Duration::from_millis(800), c.transport.health(&n.id)).await {
-            Ok(Ok(h)) if h.node_id == n.id => out.push((
-                n.id.clone(),
-                true,
-                h.slots.iter().filter(|(_, up)| *up).count(),
-            )),
+            Ok(Ok(h)) if h.node_id == n.id => out.push(PeerProbe {
+                id: n.id.clone(),
+                up: true,
+                slots: h.slots.iter().filter(|(_, up)| *up).count(),
+                // 缺字段（旧节点）= 1（保守），与本机判定口径一致。
+                data_wire_version: h.peer_data_wire_version(),
+            }),
             Ok(Ok(h)) => {
                 // 错接线：地址通了但不是声明的节点——按 down 处理并留下显性日志
                 tracing::error!(node = %n.id, reported = %h.node_id, "mesh 节点身份不符（错接线？）");
-                out.push((n.id.clone(), false, 0));
+                out.push(PeerProbe {
+                    id: n.id.clone(),
+                    up: false,
+                    slots: 0,
+                    data_wire_version: 0,
+                });
             }
-            _ => out.push((n.id.clone(), false, 0)),
+            _ => out.push(PeerProbe {
+                id: n.id.clone(),
+                up: false,
+                slots: 0,
+                data_wire_version: 0,
+            }),
         }
     }
     out
@@ -512,13 +545,24 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         "oss_node_up{{node=\"{}\"}} 1\n",
         label_escape(&local.node_id)
     ));
-    for (id, up, _) in probe_peers(&state).await {
+    let peers = probe_peers(&state).await;
+    for p in &peers {
         out.push_str(&format!(
             "oss_node_up{{node=\"{}\"}} {}\n",
-            label_escape(&id),
-            u8::from(up)
+            label_escape(&p.id),
+            u8::from(p.up)
         ));
     }
+    // DP-0：混版数据面 fail-closed 的线上信号（1 = 无可达的不兼容节点）。
+    let (data_plane_compatible, _) = data_plane_status(&peers);
+    out.push_str(
+        "# HELP oss_data_plane_compatible 数据面版本一致性（1 = 无可达的混版节点）\n\
+         # TYPE oss_data_plane_compatible gauge\n",
+    );
+    out.push_str(&format!(
+        "oss_data_plane_compatible {}\n",
+        u8::from(data_plane_compatible)
+    ));
     out.push_str("# HELP oss_drive_count 本机盘数\n# TYPE oss_drive_count gauge\n");
     out.push_str(&format!("oss_drive_count {drive_count}\n"));
     out.push_str(
@@ -678,16 +722,22 @@ async fn cluster_view(state: &AppState) -> (serde_json::Value, bool, String) {
         "id": self_node_id,
         "up": true,
         "slots": up_slots(&local),
+        "data_wire_version": local.peer_data_wire_version(),
     })];
     let peers = probe_peers(state).await;
+    let (data_plane_compatible, incompatible_peers) = data_plane_status(&peers);
     // 单机 = 1（自身即多数）；集群 = 1 + peers
     let expected = 1 + peers.len();
     let mut reachable = 1usize;
-    for (id, up, slots) in &peers {
-        if *up {
+    for p in &peers {
+        if p.up {
             reachable += 1;
         }
-        nodes.push(serde_json::json!({ "id": id, "up": up, "slots": slots }));
+        nodes.push(serde_json::json!({
+            "id": p.id, "up": p.up, "slots": p.slots,
+            // down 节点版本未知 → null（与 /api/v1/cluster/status 口径一致）
+            "data_wire_version": p.up.then_some(p.data_wire_version),
+        }));
     }
     let qn = expected / 2 + 1;
     let slot0_up = local.slots.first().is_some_and(|(_, up)| *up);
@@ -706,6 +756,10 @@ async fn cluster_view(state: &AppState) -> (serde_json::Value, bool, String) {
         "version": local.version,
         "nodes": nodes,
         "quorum_unmet": { "write": unmet_write, "lock": unmet_lock },
+        // DP-0：运维可见的数据面版本/混版状态（down 节点不下版本结论）。
+        "data_wire_version": local.peer_data_wire_version(),
+        "data_plane_compatible": data_plane_compatible,
+        "incompatible_peers": incompatible_peers,
         "ready": ready,
     });
     (view, ready, reason)
@@ -772,6 +826,36 @@ async fn handle_s3_error(err: s3s::HttpError) -> (StatusCode, String) {
 mod tests {
     use super::label_escape;
     use axum::http::StatusCode;
+
+    fn probe(id: &str, up: bool, v: u32) -> super::PeerProbe {
+        super::PeerProbe {
+            id: id.into(),
+            up,
+            slots: 3,
+            data_wire_version: v,
+        }
+    }
+
+    /// DP-0 状态口径：只有「可达且版本不一致」才判混版；down 节点不下版本结论；
+    /// 未来版本同样拒绝（无逐能力协商）。
+    #[test]
+    fn data_plane_status_flags_only_reachable_mismatches() {
+        let (ok, bad) = super::data_plane_status(&[]);
+        assert!(ok);
+        assert!(bad.is_empty());
+        assert!(super::data_plane_status(&[probe("n2", true, 2), probe("n3", true, 2)]).0);
+        // down 节点：版本未知，不算不兼容
+        let (ok, bad) = super::data_plane_status(&[probe("n2", false, 0), probe("n3", false, 1)]);
+        assert!(ok, "{bad:?}");
+        // 可达旧版/未来版：fail-closed 列表带节点与版本
+        let (ok, bad) = super::data_plane_status(&[
+            probe("n2", true, 1),
+            probe("n3", true, 2),
+            probe("n4", true, 3),
+        ]);
+        assert!(!ok);
+        assert_eq!(bad, vec!["n2(v1)".to_string(), "n4(v3)".to_string()]);
+    }
 
     #[test]
     fn forwarded_ip_hops_and_trusted_cidrs_fail_closed() {

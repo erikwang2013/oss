@@ -59,6 +59,8 @@ async fn metrics_exposes_minimal_signal() {
     );
     assert!(body.contains("oss_drive_count 1"), "{body}");
     assert!(body.contains("oss_slot_count 1"), "{body}");
+    // DP-0：单机无可达混版节点 → 兼容为 1
+    assert!(body.contains("oss_data_plane_compatible 1"), "{body}");
     assert!(
         body.lines()
             .any(|l| l.starts_with("oss_node_up{node=") && l.ends_with(" 1")),
@@ -110,4 +112,26 @@ async fn cluster_status_auth_gate_and_single_mode() {
     assert_eq!(v["nodes"][0]["up"], true);
     assert_eq!(v["quorum_unmet"]["write"], 0);
     assert_eq!(v["quorum_unmet"]["lock"], 0);
+    // DP-0：单机 = 自身即全集群；运维可见数据面版本与混版状态。
+    assert_eq!(v["data_wire_version"], 2);
+    assert_eq!(v["data_plane_compatible"], true);
+    assert_eq!(v["incompatible_peers"], serde_json::json!([]));
+}
+
+/// DP-0：公开健康视图同样带数据面握手字段（单机口径）。
+#[tokio::test]
+async fn health_cluster_exposes_data_plane_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    let base = serve(build_router(st).unwrap()).await;
+
+    let resp = reqwest::get(format!("{base}/health/cluster"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["data_wire_version"], 2);
+    assert_eq!(v["data_plane_compatible"], true);
+    assert_eq!(v["incompatible_peers"], serde_json::json!([]));
+    assert_eq!(v["nodes"][0]["data_wire_version"], 2);
 }
