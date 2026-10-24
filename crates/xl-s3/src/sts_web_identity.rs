@@ -4,13 +4,18 @@
 //! - 只接受 RS256 / ES256；`none`、HS*、PS*、EdDSA 一律拒（alg 混淆由白名单 +
 //!   jsonwebtoken 的「验证算法族必须与公钥族一致」双重拦截）。
 //! - `kid` 必填且必须命中本地 JWKS 文件；JWKS 只从本地文件加载（不拉 URL，无 SSRF 面）。
+//!   文件 mtime/长度变化后按 ≤1s 间隔懒加载（每次验签前至多 stat 一次），校验通过才
+//!   整体替换内存 key；新文件非法则保留旧 key 并告警（不 fail-open、不影响在途验证）。
 //! - `iss` / `aud` 精确匹配；`exp` / `nbf` / `iat` 由本模块 + jsonwebtoken 校验（60s 时钟容差）。
 //! - 角色映射 = 精确 RoleArn 字符串 + 精确 claim 值（sub/email），无通配符；
 //!   角色名再映射到现有 `users.username`（active），复用 STS 会话签发。
+//!   `require_email_verified=true` 时 `claim="email"` 的角色还要求 `email_verified=true`。
 //! - token 不超过 16 KiB；JWKS 文件不超过 1 MiB；不记录 token / 凭据。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm};
@@ -28,6 +33,8 @@ pub const DEFAULT_DURATION_SECONDS: i64 = 3_600;
 pub const MAX_DURATION_SECONDS: i64 = 43_200;
 /// 时钟容差（秒）——与 jsonwebtoken 默认一致；仅用于 exp/nbf/iat。
 const LEEWAY_SECONDS: u64 = 60;
+/// JWKS 文件 mtime 检查间隔：每请求至多一次 stat，足以在轮换后 1s 内生效。
+const JWKS_RECHECK: Duration = Duration::from_secs(1);
 
 const MAX_ISSUER_LEN: usize = 512;
 const MAX_AUDIENCE_LEN: usize = 256;
@@ -55,12 +62,15 @@ pub struct WebIdentityToml {
     pub issuer: String,
     #[serde(default)]
     pub audience: String,
-    /// 本地 JWKS 文件（启动期读入内存；轮换 key 需改文件重启）。
+    /// 本地 JWKS 文件（启动期读入内存；mtime/长度变化后 ≤1s 内热加载，无需重启）。
     #[serde(default)]
     pub jwks_file: Option<PathBuf>,
     /// 会话时长上限（900..=43200，默认 3600）；请求超过即拒，缺省值收敛到该上限。
     #[serde(default = "default_max_duration_seconds")]
     pub max_duration_seconds: i64,
+    /// `claim="email"` 的角色是否要求 token 的 `email_verified=true`（默认 false）。
+    #[serde(default)]
+    pub require_email_verified: bool,
     #[serde(default)]
     pub roles: Vec<WebIdentityRoleToml>,
 }
@@ -129,14 +139,85 @@ struct RoleMapping {
     values: Vec<String>,
 }
 
-/// 已校验的 OIDC 配置（内存态；不可变）。
-#[derive(Debug, Clone)]
+/// 已校验的 OIDC 配置（内存态；除 JWKS 热加载外不可变）。
+#[derive(Debug)]
 pub struct WebIdentity {
     issuer: String,
     audience: String,
     max_duration: i64,
+    require_email_verified: bool,
     roles: Vec<RoleMapping>,
+    keys: Mutex<KeyCache>,
+}
+
+/// 已载入 JWKS 的文件签名：mtime + 长度；两者不变则不重读。
+type FileSignature = (SystemTime, u64);
+
+/// JWKS 内存态 + 热加载游标。写锁只在整体替换 `keys` 时持有（原子换 key），
+/// 验证路径持读等价锁最多到 `DecodingKey` 构造完成（无 await）。
+#[derive(Debug)]
+struct KeyCache {
+    path: PathBuf,
     keys: JwkSet,
+    /// 最近一次读过的文件签名（成功或失败）；相同 → 不重读。
+    seen: Option<FileSignature>,
+    /// 上次检查时刻：把 stat 限制为每 `JWKS_RECHECK` 最多一次。
+    last_check: Instant,
+    /// 最近一次失败文案：同一错误只告警一次（坏文件期间不刷日志）。
+    last_error: Option<String>,
+}
+
+impl KeyCache {
+    fn new(path: PathBuf, keys: JwkSet, sig: FileSignature) -> Self {
+        Self {
+            path,
+            keys,
+            seen: Some(sig),
+            last_check: Instant::now(),
+            last_error: None,
+        }
+    }
+
+    fn maybe_reload(&mut self) {
+        if self.last_check.elapsed() < JWKS_RECHECK {
+            return;
+        }
+        self.reload();
+    }
+
+    fn reload(&mut self) {
+        self.last_check = Instant::now();
+        let sig = match file_signature(&self.path) {
+            Ok(sig) => sig,
+            // 文件暂时不可读/被删：保留旧 key（轮换期间的瞬时状态不应中断服务）。
+            Err(e) => return self.fail(e),
+        };
+        if self.seen == Some(sig) {
+            return;
+        }
+        match load_jwks(&self.path) {
+            Ok((keys, sig)) => {
+                let count = keys.keys.len();
+                self.keys = keys;
+                self.seen = Some(sig);
+                self.last_error = None;
+                tracing::info!(path = %self.path.display(), keys = count, "JWKS 已热加载");
+            }
+            Err(e) => {
+                // 记住坏版本签名：文件再变之前不重复读盘；旧 key 继续生效。
+                self.seen = Some(sig);
+                self.fail(e);
+            }
+        }
+    }
+
+    fn fail(&mut self, e: String) {
+        if self.last_error.as_deref() != Some(e.as_str()) {
+            tracing::warn!(path = %self.path.display(), error = %e,
+                "JWKS 热加载失败，保留旧 key");
+            self.last_error = Some(e);
+        }
+    }
 }
 
 /// 验证通过后的会话参数（不含 token / 原始 claims）。
@@ -193,7 +274,7 @@ impl WebIdentity {
         let Some(path) = c.jwks_file.as_ref() else {
             return Err("缺少 jwks_file（仅支持本地文件，不支持 URL）".into());
         };
-        let keys = load_jwks(path)?;
+        let (keys, sig) = load_jwks(path)?;
         if c.roles.is_empty() {
             return Err("roles 不能为空（无映射则无人可换取凭据）".into());
         }
@@ -248,9 +329,18 @@ impl WebIdentity {
             issuer: c.issuer.clone(),
             audience: c.audience.clone(),
             max_duration: c.max_duration_seconds,
+            require_email_verified: c.require_email_verified,
             roles,
-            keys,
+            keys: Mutex::new(KeyCache::new(path.clone(), keys, sig)),
         })
+    }
+
+    /// 测试钩子：跳过 1s 间隔（等价于已到期），走真实的 mtime 检测 + 重载路径。
+    #[cfg(test)]
+    pub(crate) fn reload_for_test(&self) {
+        let mut cache = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        cache.last_check = Instant::now() - JWKS_RECHECK;
+        cache.maybe_reload();
     }
 
     /// 验证 token 并按 RoleArn 映射；任何失败都 fail-closed。
@@ -283,16 +373,21 @@ impl WebIdentity {
             .as_deref()
             .filter(|k| !k.is_empty() && k.len() <= MAX_KID_LEN)
             .ok_or(WebIdentityError::InvalidToken)?;
-        let jwk = self.keys.find(kid).ok_or(WebIdentityError::InvalidToken)?;
-        // JWKS 若声明 alg，必须与 token header 一致（防同一 kid 跨算法复用）。
-        if let Some(declared) = jwk.common.key_algorithm {
-            let declared =
-                Algorithm::try_from(declared).map_err(|_| WebIdentityError::InvalidToken)?;
-            if declared != header.alg {
-                return Err(WebIdentityError::InvalidToken);
+        // 锁只覆盖查找 + DecodingKey 构造：热加载的写入点在两次验签之间整体换 key。
+        let key = {
+            let mut cache = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+            cache.maybe_reload();
+            let jwk = cache.keys.find(kid).ok_or(WebIdentityError::InvalidToken)?;
+            // JWKS 若声明 alg，必须与 token header 一致（防同一 kid 跨算法复用）。
+            if let Some(declared) = jwk.common.key_algorithm {
+                let declared =
+                    Algorithm::try_from(declared).map_err(|_| WebIdentityError::InvalidToken)?;
+                if declared != header.alg {
+                    return Err(WebIdentityError::InvalidToken);
+                }
             }
-        }
-        let key = DecodingKey::from_jwk(jwk).map_err(|_| WebIdentityError::InvalidToken)?;
+            DecodingKey::from_jwk(jwk).map_err(|_| WebIdentityError::InvalidToken)?
+        };
         // 单算法 Validation：jsonwebtoken 要求验证算法族与公钥族一致（RS256↔RSA、
         // ES256↔EC），因此列表里只能放 header 声明的这一个算法。
         let mut validation = Validation::new(header.alg);
@@ -333,6 +428,13 @@ impl WebIdentity {
         if !mapping.values.iter().any(|v| v == claim_value) {
             return Err(WebIdentityError::InvalidToken);
         }
+        // 按 email 授权的角色可选强制 verified；未验证/缺失/非 true 一律拒。
+        if self.require_email_verified
+            && mapping.claim == RoleClaim::Email
+            && !email_verified(&claims)
+        {
+            return Err(WebIdentityError::InvalidToken);
+        }
         Ok(VerifiedWebIdentity {
             subject: subject.to_string(),
             role: mapping.role.clone(),
@@ -369,11 +471,29 @@ fn validate_audience(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 从本地文件读 JWKS：大小上限 → JSON 解析 → 每把 key 白名单校验（kid/算法/曲线/长度）。
-fn load_jwks(path: &std::path::Path) -> Result<JwkSet, String> {
+/// `email_verified` 只认布尔 `true` 或字符串 `"true"`（部分 IdP 用字符串形态）；
+/// 缺失/`false`/其他类型一律视为未验证。
+fn email_verified(claims: &Value) -> bool {
+    match claims.get("email_verified") {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
+}
+
+fn file_signature(path: &std::path::Path) -> Result<FileSignature, String> {
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("读取 jwks_file {} 失败: {e}", path.display()))?;
-    if meta.len() > MAX_JWKS_BYTES {
+    let modified = meta
+        .modified()
+        .map_err(|e| format!("读取 jwks_file {} 的 mtime 失败: {e}", path.display()))?;
+    Ok((modified, meta.len()))
+}
+
+/// 从本地文件读 JWKS：大小上限 → JSON 解析 → 每把 key 白名单校验（kid/算法/曲线/长度）。
+fn load_jwks(path: &std::path::Path) -> Result<(JwkSet, FileSignature), String> {
+    let sig = file_signature(path)?;
+    if sig.1 > MAX_JWKS_BYTES {
         return Err(format!("jwks_file 超过 {MAX_JWKS_BYTES} 字节上限"));
     }
     let bytes =
@@ -391,7 +511,7 @@ fn load_jwks(path: &std::path::Path) -> Result<JwkSet, String> {
             return Err(format!("jwks_file 中 kid 重复：{kid:?}"));
         }
     }
-    Ok(keys)
+    Ok((keys, sig))
 }
 
 fn validate_jwk(jwk: &Jwk) -> Result<(), String> {
@@ -548,6 +668,7 @@ iwDc6O2gSOdmS7sEhNi2sVl/D1MTfgAaGQZaccT8Fuvo3rBQqU5dOORV
             audience: AUDIENCE.into(),
             jwks_file: Some(jwks_file.to_path_buf()),
             max_duration_seconds: max_duration,
+            require_email_verified: false,
             roles: vec![WebIdentityRoleToml {
                 role_arn: "arn:oss:iam::oss:role/ci-bot".into(),
                 claim: "sub".into(),
@@ -809,6 +930,7 @@ mod tests {
                 audience: String::new(),
                 jwks_file: None,
                 max_duration_seconds: 0,
+                require_email_verified: false,
                 roles: vec![],
             }),
         };
@@ -905,5 +1027,149 @@ mod tests {
         let err = wi.verify(&token, ROLE_ARN, None).unwrap_err();
         assert!(!err.to_string().contains(&token));
         assert!(!format!("{err:?}").contains(&token));
+    }
+
+    /// email 映射 + `require_email_verified`：默认不校验；开启后缺失/false 拒，
+    /// 布尔 true 与字符串 "true" 放行；sub 映射不受该开关影响。
+    #[test]
+    fn email_verified_required_only_for_email_roles() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("jwks.json");
+        std::fs::write(&path, serde_json::to_vec(&jwks()).unwrap()).unwrap();
+        let now = now();
+        let email = "dev@example.com";
+        let mk = |require: bool, claim: &str| {
+            let mut c = toml(&path, 3600);
+            c.require_email_verified = require;
+            c.roles[0].claim = claim.into();
+            c.roles[0].values = if claim == "email" {
+                vec![email.into()]
+            } else {
+                vec!["repo:acme/infra:ref:refs/heads/main".into()]
+            };
+            WebIdentity::from_toml(&c).unwrap()
+        };
+
+        let mut c = claims(email, now);
+        c["email"] = json!(email);
+        c["email_verified"] = json!(true);
+
+        // 默认（开关关闭）：email 映射不要求 email_verified。
+        let wi = mk(false, "email");
+        let token = sign(&c, KID_RSA, Algorithm::RS256);
+        assert!(wi.verify(&token, ROLE_ARN, None).is_ok());
+        let mut no_flag = c.clone();
+        no_flag.as_object_mut().unwrap().remove("email_verified");
+        assert!(
+            wi.verify(&sign(&no_flag, KID_RSA, Algorithm::RS256), ROLE_ARN, None)
+                .is_ok()
+        );
+
+        // 开启：true 放行（布尔/字符串两种 IdP 形态）。
+        let wi = mk(true, "email");
+        assert!(wi.verify(&token, ROLE_ARN, None).is_ok());
+        let mut s = c.clone();
+        s["email_verified"] = json!("true");
+        assert!(
+            wi.verify(&sign(&s, KID_RSA, Algorithm::RS256), ROLE_ARN, None)
+                .is_ok()
+        );
+        // 缺失 / false / 字符串 "false" 一律拒。
+        assert_eq!(
+            wi.verify(&sign(&no_flag, KID_RSA, Algorithm::RS256), ROLE_ARN, None),
+            Err(WebIdentityError::InvalidToken)
+        );
+        let mut f = c.clone();
+        f["email_verified"] = json!(false);
+        assert_eq!(
+            wi.verify(&sign(&f, KID_RSA, Algorithm::RS256), ROLE_ARN, None),
+            Err(WebIdentityError::InvalidToken)
+        );
+        let mut fs = c.clone();
+        fs["email_verified"] = json!("false");
+        assert_eq!(
+            wi.verify(&sign(&fs, KID_RSA, Algorithm::RS256), ROLE_ARN, None),
+            Err(WebIdentityError::InvalidToken)
+        );
+
+        // sub 映射的角色：开关开启也不看 email_verified（该 token 无此 claim）。
+        let wi = mk(true, "sub");
+        let sub_token = sign(
+            &claims("repo:acme/infra:ref:refs/heads/main", now),
+            KID_RSA,
+            Algorithm::RS256,
+        );
+        assert!(wi.verify(&sub_token, ROLE_ARN, None).is_ok());
+    }
+
+    /// 热加载：mtime 变化后换 key（旧 key 失效）；坏文件/空 keys 保留旧 key；
+    /// 文件恢复合法后再次生效。mtime 显式设置，避免文件系统时间粒度导致抖动。
+    #[test]
+    fn jwks_hot_reload_swaps_keys_and_keeps_old_on_invalid() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("jwks.json");
+        let write = |keys: Vec<Jwk>, secs: u64| {
+            std::fs::write(&path, serde_json::to_vec(&JwkSet { keys }).unwrap()).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000 + secs)),
+                )
+                .unwrap();
+        };
+
+        let all = jwks();
+        write(vec![all.keys[0].clone()], 0); // 仅 RSA
+        let wi = WebIdentity::from_toml(&toml(&path, 3600)).unwrap();
+        let now = now();
+        let c = claims("repo:acme/infra:ref:refs/heads/main", now);
+        let rsa = sign(&c, KID_RSA, Algorithm::RS256);
+        let ec = sign(&c, KID_EC, Algorithm::ES256);
+        assert!(wi.verify(&rsa, ROLE_ARN, None).is_ok());
+        assert_eq!(
+            wi.verify(&ec, ROLE_ARN, None),
+            Err(WebIdentityError::InvalidToken)
+        );
+
+        // 轮换到仅 EC：新 key 生效，旧 key 立即失效。
+        write(vec![all.keys[1].clone()], 1);
+        wi.reload_for_test();
+        assert!(wi.verify(&ec, ROLE_ARN, None).is_ok());
+        assert_eq!(
+            wi.verify(&rsa, ROLE_ARN, None),
+            Err(WebIdentityError::InvalidToken)
+        );
+
+        // 非法 JSON / 空 keys：保留当前（EC）key，验证不中断。
+        for (secs, bytes) in [
+            (2u64, b"{ not jwks".as_slice()),
+            (3, br#"{"keys":[]}"#.as_slice()),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000 + secs)),
+                )
+                .unwrap();
+            wi.reload_for_test();
+            assert!(
+                wi.verify(&ec, ROLE_ARN, None).is_ok(),
+                "坏文件不得清空旧 key: {secs}"
+            );
+        }
+
+        // 恢复为两把合法 key：RSA 与 EC 都可用。
+        write(all.keys, 4);
+        wi.reload_for_test();
+        assert!(wi.verify(&rsa, ROLE_ARN, None).is_ok());
+        assert!(wi.verify(&ec, ROLE_ARN, None).is_ok());
     }
 }

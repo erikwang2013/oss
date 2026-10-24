@@ -1092,12 +1092,20 @@ mod tests {
              audience = \"oss-test\"\n\
              jwks_file = \"/nonexistent/jwks.json\"\n\
              max_duration_seconds = 3600\n\
+             require_email_verified = true\n\
              [[sts.web_identity.roles]]\n\
              role_arn = \"arn:oss:iam::oss:role/ci-bot\"\n\
              claim = \"sub\"\n\
              values = [\"repo:acme/infra:ref:refs/heads/main\"]\n"
         );
         let c: AppConfig = toml::from_str(&enabled).unwrap();
+        assert!(
+            c.sts
+                .web_identity
+                .as_ref()
+                .is_some_and(|w| w.require_email_verified),
+            "require_email_verified 必须能从 TOML 解析"
+        );
         assert!(
             c.sts_validate().is_err(),
             "启用但 JWKS 不可读必须在启动期失败"
