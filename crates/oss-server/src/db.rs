@@ -3506,13 +3506,13 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// `(该用户, 全局)` 的 inflight 作业数（queued/running/paused）。
+    /// `(该用户, 全局)` 的 inflight 作业数（queued/running/paused/preempted）。
     pub async fn job_inflight_counts(&self, requested_by: Option<i64>) -> Result<(i64, i64)> {
         let user: i64 = match requested_by {
             Some(uid) => {
                 sqlx::query_scalar(
                     "SELECT COUNT(*) FROM jobs WHERE requested_by = ? \
-                     AND state IN ('queued','running','paused')",
+                     AND state IN ('queued','running','paused','preempted')",
                 )
                 .bind(uid)
                 .fetch_one(&self.pool)
@@ -3521,7 +3521,8 @@ impl Db {
             None => 0,
         };
         let global: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running','paused')",
+            "SELECT COUNT(*) FROM jobs \
+             WHERE state IN ('queued','running','paused','preempted')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -3599,6 +3600,96 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 作业当前状态（None = 不存在）。
+    pub async fn job_state(&self, id: i64) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT state FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// 抢占边界回退：把已领取但**尚未执行**的 running 任务放回 queued。
+    /// 不消耗重试次数（attempt 不变）、不改结果列；已执行完的动作仍是 done。
+    /// 只命中 running 行，重复调用幂等（返回是否命中）。
+    pub async fn requeue_task(&self, job_id: i64, task_no: i64, now: i64) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE job_tasks SET state = 'queued', started_at = NULL, deadline_at = NULL, \
+             next_at = ? WHERE job_id = ? AND task_no = ? AND state = 'running'",
+        )
+        .bind(now)
+        .bind(job_id)
+        .bind(task_no)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// 协作式抢占（动作边界，单节点）：高等优先级作业有**就绪**排队任务、且 worker
+    /// 容量已满（running 任务数 ≥ `capacity`）时，把仍有排队任务的低优先级 running
+    /// 作业标记为 `preempted`。只改作业状态——正在执行的动作不被中断，已领取未执行
+    /// 的任务由 worker 在动作边界自行回退（[`Self::requeue_task`]）。返回被抢占数。
+    ///
+    /// 严格大于才抢占：同优先级按 FIFO（next_at/task_no），不互相打断。
+    pub async fn preempt_lower_priority(&self, capacity: usize, now: i64) -> Result<usize> {
+        if capacity == 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let top: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(j.priority) FROM jobs j JOIN job_tasks t ON t.job_id = j.id \
+             WHERE j.state IN ('queued','running') AND t.state = 'queued' AND t.next_at <= ?",
+        )
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        let Some(top) = top else {
+            tx.commit().await?;
+            return Ok(0);
+        };
+        let running: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks WHERE state = 'running'")
+                .fetch_one(&mut *tx)
+                .await?;
+        if running < capacity as i64 {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let n = sqlx::query(
+            "UPDATE jobs SET state = 'preempted', updated_at = ? \
+             WHERE state = 'running' AND priority < ? \
+             AND EXISTS (SELECT 1 FROM job_tasks WHERE job_id = jobs.id AND state = 'queued')",
+        )
+        .bind(now)
+        .bind(top)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(n as usize)
+    }
+
+    /// 释放抢占：高等优先级的**就绪**排队任务已清空（都已领取或完成）后，把
+    /// `preempted` 作业放回 `queued`（下一条领取按正常优先级顺序恢复）。返回释放数。
+    /// 正在运行的高优先级任务不阻塞释放——空闲容量应回到低优先级作业，领取顺序
+    /// 仍保证后续高优先级任务先被取走。
+    pub async fn release_preempted(&self, now: i64) -> Result<usize> {
+        let n = sqlx::query(
+            "UPDATE jobs SET state = 'queued', updated_at = ? \
+             WHERE state = 'preempted' AND NOT EXISTS ( \
+               SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
+               WHERE h.id != jobs.id AND h.priority > jobs.priority \
+                 AND h.state IN ('queued','running') \
+                 AND t.state = 'queued' AND t.next_at <= ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n as usize)
     }
 
     /// 任务终态/重试。成功 → done；失败未达上限 → queued（指数退避）；达上限 → failed。
@@ -3694,11 +3785,12 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
-        // 作业收敛：仍 running 且无未终态任务 → done（无 failed）/error
+        // 作业收敛：仍 running/preempted 且无未终态任务 → done（无 failed）/error。
+        // preempted 也要收敛：被抢占时在途动作完成后可能已无剩余任务。
         sqlx::query(
             "UPDATE jobs SET state = CASE WHEN failed > 0 THEN 'error' ELSE 'done' END, \
              finished_at = ?, updated_at = ? \
-             WHERE id = ? AND state = 'running' AND NOT EXISTS \
+             WHERE id = ? AND state IN ('running','preempted') AND NOT EXISTS \
              (SELECT 1 FROM job_tasks WHERE job_id = ? AND state IN ('queued','running'))",
         )
         .bind(now)
@@ -3891,7 +3983,8 @@ impl Db {
         let mut tx = self.pool.begin().await?;
         let n = match action {
             "pause" => sqlx::query(
-                "UPDATE jobs SET state = 'paused', updated_at = ? WHERE id = ? AND state = 'running'",
+                "UPDATE jobs SET state = 'paused', updated_at = ? \
+                 WHERE id = ? AND state IN ('running','preempted')",
             )
             .bind(now)
             .bind(id)
@@ -3909,7 +4002,7 @@ impl Db {
             "cancel" => {
                 let n = sqlx::query(
                     "UPDATE jobs SET state = 'cancelled', updated_at = ? \
-                     WHERE id = ? AND state IN ('queued','running','paused')",
+                     WHERE id = ? AND state IN ('queued','running','paused','preempted')",
                 )
                 .bind(now)
                 .bind(id)

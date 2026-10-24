@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use xl_store::store::VersioningMode;
 
 use bytes::Bytes;
-use oss_server::db::{Db, JobSpec, NewJobTask};
+use oss_server::db::{Db, JobSpec, NewJobTask, PermissionRow};
 use oss_server::job_actions::{
     BATCH_COPY, BATCH_DELETE, BATCH_INVOKE, BATCH_RESTORE, BATCH_TAGS, BatchActionPayload,
     BatchError, BatchExecutor, BatchMutationHooks, parse_manifest,
@@ -1445,6 +1445,120 @@ async fn creation_validation_permissions_and_quota() {
         create_batch(&f.st, f.admin, true, q).await,
         Err(BatchError::Quota(_))
     ));
+}
+
+/// 清单桶跨账户门（账户 = 用户命名空间 v1）：非管理员只能用**本账户**清单桶，
+/// 即使被授予跨账户读权限也不放行；admin 可用跨账户；同账户但读权限被桶策略
+/// 撤销/缺失时 fail-closed。
+#[tokio::test]
+async fn manifest_cross_account_authorization() {
+    let f = fx().await;
+    let alice = f.db().create_user("alice", "pw", false).await.unwrap();
+    let bob = f.db().create_user("bob", "pw", false).await.unwrap();
+    for (b, owner) in [("alice-b", alice), ("bob-b", bob), ("alice-deny", alice)] {
+        f.store().create_bucket(b).await.unwrap();
+        f.db().insert_bucket(b, Some(owner)).await.unwrap();
+    }
+    f.store()
+        .put_object(
+            "alice-b",
+            "m.csv",
+            Bytes::from_static(b"alice-b,k1\n"),
+            None,
+        )
+        .await
+        .unwrap();
+    f.put("alice-b", "k1", b"x").await;
+    f.store()
+        .put_object("bob-b", "m.csv", Bytes::from_static(b"bob-b,k1\n"), None)
+        .await
+        .unwrap();
+    f.put("bob-b", "k1", b"x").await;
+    f.store()
+        .put_object(
+            "alice-deny",
+            "m.csv",
+            Bytes::from_static(b"alice-deny,k1\n"),
+            None,
+        )
+        .await
+        .unwrap();
+    f.put("alice-deny", "k1", b"x").await;
+
+    // 同账户（自有桶）→ 允许
+    let mut own = BatchCreateRequest {
+        manifest_bucket: "alice-b".into(),
+        manifest_key: "m.csv".into(),
+        ..req("ReplaceTags", "m.csv")
+    };
+    own.tags = tags(&[("batch", "1")]);
+    assert_eq!(
+        create_batch(&f.st, alice, false, own).await.unwrap().total,
+        1
+    );
+
+    // 授予跨账户读+写（旧实现本可通过）→ 新账户门仍拒绝，错误须指明跨账户。
+    f.db()
+        .set_permissions(
+            alice,
+            &[PermissionRow {
+                bucket: "bob-b".into(),
+                read: true,
+                write: true,
+                delete: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let mut cross = BatchCreateRequest {
+        manifest_bucket: "bob-b".into(),
+        manifest_key: "m.csv".into(),
+        ..req("ReplaceTags", "m.csv")
+    };
+    cross.tags = tags(&[("batch", "1")]);
+    match create_batch(&f.st, alice, false, cross).await {
+        Err(BatchError::Denied(m)) => assert!(m.contains("跨账户"), "{m}"),
+        Err(e) => panic!("跨账户清单非管理员必须拒绝: {e:?}"),
+        Ok(c) => panic!("跨账户清单非管理员不得建作业（job {}）", c.job_id),
+    }
+
+    // admin 跨账户 → 允许
+    let mut cross = BatchCreateRequest {
+        manifest_bucket: "bob-b".into(),
+        manifest_key: "m.csv".into(),
+        ..req("ReplaceTags", "m.csv")
+    };
+    cross.tags = tags(&[("batch", "1")]);
+    assert_eq!(
+        create_batch(&f.st, f.admin, true, cross)
+            .await
+            .unwrap()
+            .total,
+        1
+    );
+
+    // 同账户但清单读权限被桶策略显式 Deny（读权限撤销/缺失）→ fail-closed。
+    let deny = serde_json::json!({"Version":"2012-10-17","Statement":[{
+        "Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject",
+        "Resource":"arn:aws:s3:::alice-deny/*"}]})
+    .to_string();
+    f.db()
+        .set_bucket_policy("alice-deny", &deny, 0)
+        .await
+        .unwrap();
+    let mut revoked = BatchCreateRequest {
+        manifest_bucket: "alice-deny".into(),
+        manifest_key: "m.csv".into(),
+        ..req("ReplaceTags", "m.csv")
+    };
+    revoked.tags = tags(&[("batch", "1")]);
+    assert!(
+        matches!(
+            create_batch(&f.st, alice, false, revoked).await,
+            Err(BatchError::Denied(_))
+        ),
+        "读权限被撤销后必须 403"
+    );
 }
 
 #[tokio::test]

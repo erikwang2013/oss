@@ -122,6 +122,29 @@ pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>
             }
         });
     }
+    // 抢占调度：worker 全部在动作中时也要能打标记（worker 循环此时不跑）。
+    if env.workers > 0 {
+        let sched = db.clone();
+        tokio::spawn(async move {
+            let mut t =
+                tokio::time::interval(std::time::Duration::from_secs(env.interval_secs.max(1)));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                t.tick().await;
+                let now = crate::db::now();
+                match sched.preempt_lower_priority(env.workers, now).await {
+                    Ok(n) if n > 0 => tracing::info!(n, "job：抢占低优先级作业"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "job：抢占标记失败"),
+                }
+                match sched.release_preempted(now).await {
+                    Ok(n) if n > 0 => tracing::info!(n, "job：释放被抢占作业"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "job：释放抢占失败"),
+                }
+            }
+        });
+    }
     tracing::info!(workers = env.workers, "job worker 已启动");
 }
 
@@ -141,6 +164,15 @@ pub async fn worker_once(
     db.recover_orphan_jobs(now.saturating_sub(orphan_stale_secs()), now)
         .await
         .map_err(|e| e.to_string())?;
+    // 协作式抢占（动作边界）：容量满 + 高等优先级就绪任务在排队 → 标记低优先级
+    // running 作业；高等优先级就绪队列清空后释放。只改作业状态，正在执行的动作
+    // 不受影响；调度失败只是退化为纯优先级领取，故 warn 不中断。
+    if let Err(e) = db.preempt_lower_priority(env.workers.max(1), now).await {
+        tracing::warn!(error = %e, "job：抢占标记失败");
+    }
+    if let Err(e) = db.release_preempted(now).await {
+        tracing::warn!(error = %e, "job：释放抢占失败");
+    }
     // 领取时动作未知 → DB 截止时间取两类超时的较大值（硬上限）；
     // 领取后立即按动作类型收紧，让非 tier 任务超时后 900s（而非 3600s）即可回收。
     let deadline_secs = env.timeout_secs.max(env.tier_timeout_secs);
@@ -151,6 +183,30 @@ pub async fn worker_once(
     else {
         return Ok(false);
     };
+    // claim 与 execute 之间是安全动作边界：作业若已被抢占，把这条**尚未执行**的任务
+    // 原样放回队列（不消耗重试、无副作用），等释放后按优先级恢复。
+    match db.job_state(task.job_id).await {
+        Ok(Some(state)) if state == "preempted" => {
+            match db.requeue_task(task.job_id, task.task_no, now).await {
+                Ok(true) => tracing::info!(
+                    job_id = task.job_id,
+                    task_no = task.task_no,
+                    "job：抢占边界，任务回退排队（未执行）"
+                ),
+                Ok(false) => tracing::warn!(
+                    job_id = task.job_id,
+                    task_no = task.task_no,
+                    "job：抢占回退未命中（任务状态已变化）"
+                ),
+                Err(e) => tracing::warn!(job_id = task.job_id, task_no = task.task_no, error = %e,
+                    "job：抢占回退失败（任务保持 running，等待超时回收）"),
+            }
+            return Ok(true);
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(job_id = task.job_id, error = %e,
+            "job：查询抢占状态失败（按未抢占继续）"),
+    }
     let timeout = if is_tier_action(&task.action) {
         env.tier_timeout_secs
     } else {
