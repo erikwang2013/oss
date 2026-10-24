@@ -247,6 +247,8 @@ pub struct Store {
     encryption: std::sync::OnceLock<crypto::EncState>,
     /// M9 S3：每桶在途写者计数 + 删桶标志（删桶 quiesce 的进程内屏障）。
     writers: Mutex<WriterState>,
+    /// DP-0：数据面线格式探测缓存（peer → (探测时刻, 版本)）；避免每个读都打 Health。
+    data_wire_cache: Mutex<HashMap<String, (std::time::Instant, u32)>>,
 }
 
 #[derive(Default)]
@@ -483,6 +485,7 @@ impl Store {
             cluster_locks: Arc::new(lock::LockTable::default()),
             encryption: std::sync::OnceLock::new(),
             writers: Mutex::new(WriterState::default()),
+            data_wire_cache: Mutex::new(HashMap::new()),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;
