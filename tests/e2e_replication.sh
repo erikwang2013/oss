@@ -45,6 +45,9 @@ database_url = "sqlite://$W/dst/oss.db?mode=rwc"
 jwt_secret = "dev-only-change-me-0123456789abcdef"
 max_put_bytes = 268435456
 groups = []
+
+[site]
+token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 EOF
 
 start_dst() {
@@ -89,6 +92,7 @@ endpoint = "http://127.0.0.1:$DST_HTTP"
 access_key = "$DST_AK"
 secret_key = "$DST_SK"
 region = "us-east-1"
+site_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 EOF
 
 echo "== 1. 起源实例（127.0.0.1:$SRC_HTTP，remote r1 → 目标）=="
