@@ -923,6 +923,256 @@ pub async fn process_repl_once(
     (sent, failed)
 }
 
+// ---------- M7 遗留未映射 REPLICA 的人工对账 ----------
+
+/// 未映射 REPLICA 版本：升级前复制（两端 UUID 不同、`remote_version_id=None`），删除
+/// 路径已禁止按内容自动清理——他源同内容副本不可区分。只能由管理员点名 version id 删除。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnmappedReplica {
+    pub version_id: String,
+    pub etag: String,
+    pub size: u64,
+    pub status: &'static str,
+    pub is_latest: bool,
+    /// unix 秒（与其它控制面 JSON 同单位）。
+    pub last_modified: i64,
+    /// 旧副本没有记录源站身份；恒为 None（保留字段让调用方显式看到「无来源」）。
+    pub source_hint: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum ReconcileError {
+    Invalid(String),
+    /// 请求的 id 不全是该键当前的未映射 REPLICA 版本：整批拒绝，绝不部分删除。
+    Unknown(Vec<String>),
+    Store(xl_store::error::Error),
+}
+
+impl std::fmt::Display for ReconcileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(m) => write!(f, "invalid: {m}"),
+            Self::Unknown(ids) => write!(f, "refused: not unmapped REPLICA versions: {ids:?}"),
+            Self::Store(e) => write!(f, "store: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReconcileError {}
+
+impl From<xl_store::error::Error> for ReconcileError {
+    fn from(e: xl_store::error::Error) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// 列出某键的未映射 REPLICA 版本（精确键；marker/已映射/其它状态一律不返回）。
+///
+/// 集群键集并集缺项（`degraded`）时拒绝返回半份清单：删除决策必须基于完整视图。
+pub async fn list_unmapped_replicas(
+    store: &Store,
+    bucket: &str,
+    key: &str,
+) -> Result<Vec<UnmappedReplica>, ReconcileError> {
+    const PAGE: usize = 1000;
+    let mut out = Vec::new();
+    let (mut key_marker, mut version_marker) = (None, None);
+    loop {
+        let page = store
+            .list_object_versions(
+                bucket,
+                key,
+                PAGE,
+                key_marker.as_deref(),
+                version_marker.as_deref(),
+            )
+            .await?;
+        if page.degraded {
+            return Err(ReconcileError::Store(xl_store::error::Error::Unavailable(
+                "replica reconcile: peer key listing degraded; refusing partial result".into(),
+            )));
+        }
+        for e in &page.entries {
+            if e.key == key
+                && !e.is_marker
+                && e.replication_status.as_deref() == Some("REPLICA")
+                && e.remote_version_id.is_none()
+            {
+                out.push(UnmappedReplica {
+                    version_id: e.version_id.clone(),
+                    etag: e.etag.clone(),
+                    size: e.size,
+                    status: "REPLICA",
+                    is_latest: e.is_latest,
+                    last_modified: e.mod_time_nanos.div_euclid(1_000_000_000),
+                    source_hint: None,
+                });
+            }
+        }
+        if !page.is_truncated {
+            break;
+        }
+        match (page.entries.last(), page.next_version_id_marker) {
+            // 续页只在目标键内：last 已是更大键 = 本键链枚举完毕。
+            (Some(last), Some(vm)) if last.key == key => {
+                key_marker = Some(key.to_string());
+                version_marker = Some(vm);
+            }
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplicaReconcileFailure {
+    pub version_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplicaReconcileReport {
+    pub dry_run: bool,
+    pub bucket: String,
+    pub key: String,
+    pub would_delete: Vec<UnmappedReplica>,
+    pub deleted: Vec<String>,
+    /// 列表与删除之间已被并发删除（幂等成功，不是错误）。
+    pub already_absent: Vec<String>,
+    pub failed: Vec<ReplicaReconcileFailure>,
+}
+
+/// 点名删除未映射 REPLICA 版本；`apply=false` 只预览。
+///
+/// fail-closed：任一请求 id 不在当前「该键未映射 REPLICA」集合 → 整批拒绝且不删任何
+/// 版本；每个版本删除前再校验一次状态/映射（列表→删除的竞态）；桶非 Enabled 拒绝。
+/// 本函数绝不按内容/前缀/状态自动选择删除目标。
+#[allow(clippy::too_many_arguments)]
+pub async fn delete_unmapped_replicas(
+    db: &crate::db::Db,
+    store: &Store,
+    tier_gc: &dyn xl_s3::tier_gc::TierGcSink,
+    bucket: &str,
+    key: &str,
+    version_ids: &[String],
+    apply: bool,
+) -> Result<ReplicaReconcileReport, ReconcileError> {
+    if version_ids.is_empty() {
+        return Err(ReconcileError::Invalid(
+            "version_ids is empty: name explicit version ids (this tool never deletes by \
+             content or prefix)"
+                .into(),
+        ));
+    }
+    let mut ids: Vec<&str> = Vec::with_capacity(version_ids.len());
+    for id in version_ids {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(ReconcileError::Invalid("empty version id".into()));
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let listed = list_unmapped_replicas(store, bucket, key).await?;
+    let by_id: HashMap<&str, UnmappedReplica> = listed
+        .iter()
+        .map(|v| (v.version_id.as_str(), v.clone()))
+        .collect();
+    let unknown: Vec<String> = ids
+        .iter()
+        .filter(|id| !by_id.contains_key(**id))
+        .map(|id| (*id).to_string())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(ReconcileError::Unknown(unknown));
+    }
+    let would_delete: Vec<UnmappedReplica> = ids
+        .iter()
+        .filter_map(|id| by_id.get(*id).cloned())
+        .collect();
+    let mut report = ReplicaReconcileReport {
+        dry_run: !apply,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        would_delete,
+        deleted: Vec::new(),
+        already_absent: Vec::new(),
+        failed: Vec::new(),
+    };
+    if !apply {
+        return Ok(report);
+    }
+    let mode = xl_store::store::VersioningMode::from_status(
+        &db.get_bucket_versioning(bucket)
+            .await
+            .map_err(|e| ReconcileError::Invalid(format!("read bucket versioning: {e}")))?,
+    );
+    if mode != xl_store::store::VersioningMode::Enabled {
+        return Err(ReconcileError::Invalid(format!(
+            "bucket {bucket} versioning is not Enabled; version-level reconcile requires it"
+        )));
+    }
+    let mut tier_refs = Vec::new();
+    for id in &ids {
+        // 删除前复核（列表→删除之间可能被并发映射/改状态）：不符即拒绝该 id。
+        match store.head_object_version(bucket, key, id).await {
+            Ok(info)
+                if info.remote_version_id.is_none()
+                    && info.replication_status.as_deref() == Some("REPLICA") => {}
+            Ok(_) => {
+                report.failed.push(ReplicaReconcileFailure {
+                    version_id: (*id).to_string(),
+                    error: "no longer an unmapped REPLICA version (mapping or status changed)"
+                        .into(),
+                });
+                continue;
+            }
+            Err(xl_store::error::Error::NoSuchKey(_))
+            | Err(xl_store::error::Error::DeleteMarker(_)) => {
+                report.already_absent.push((*id).to_string());
+                continue;
+            }
+            Err(e) => {
+                report.failed.push(ReplicaReconcileFailure {
+                    version_id: (*id).to_string(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        }
+        match store
+            .delete_object_versioned_ext(bucket, key, Some(*id), mode, false)
+            .await
+        {
+            Ok(xl_store::store::DeleteOutcome::Version { tier, .. }) => {
+                if let Some(t) = tier {
+                    tier_refs.push(t);
+                }
+                report.deleted.push((*id).to_string());
+            }
+            Ok(xl_store::store::DeleteOutcome::NotFound) => {
+                report.already_absent.push((*id).to_string());
+            }
+            Ok(_) => report.failed.push(ReplicaReconcileFailure {
+                version_id: (*id).to_string(),
+                error: "unexpected delete outcome".into(),
+            }),
+            Err(e) => report.failed.push(ReplicaReconcileFailure {
+                version_id: (*id).to_string(),
+                error: e.to_string(),
+            }),
+        }
+    }
+    // tier 远端清理由是 best-effort（与 S3 面同口径：本地删除已完成，不因远端失败回滚）。
+    if !tier_refs.is_empty()
+        && let Err(e) = tier_gc.delete(&tier_refs).await
+    {
+        tracing::warn!(error = %e, bucket, key, "reconcile 删版本后 tier 远端清理失败");
+    }
+    Ok(report)
+}
+
 /// serve 挂载（`OSS_REPL_INTERVAL_SECS` 默认 1s；显式 0 = 关闭）。
 pub fn spawn_repl_worker(pool: SqlitePool, store: Arc<Store>, client: Arc<ReplClient>) {
     let secs: u64 = std::env::var("OSS_REPL_INTERVAL_SECS")

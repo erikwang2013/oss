@@ -102,6 +102,7 @@ async fn export_records_provenance_and_accepts_ossctl1_and_ossctl2() {
     let v1 = export_from(&src).await;
     assert_eq!(v1.snapshot_format, Some(1));
     assert_eq!(v1.feature_level, Some(1));
+    assert_eq!(v1.activation_level, Some(1));
     assert_eq!(v1.wire_version, Some(compat::WIRE_VERSION));
     assert!(v1.source_build.as_deref().is_some_and(|b| !b.is_empty()));
     assert!(
@@ -116,6 +117,11 @@ async fn export_records_provenance_and_accepts_ossctl1_and_ossctl2() {
     let v2 = export_from(&src).await;
     assert_eq!(v2.snapshot_format, Some(2));
     assert_eq!(v2.feature_level, Some(2));
+    assert_eq!(
+        v2.activation_level,
+        Some(2),
+        "activated source must record its marker even without level-2 data"
+    );
     assert!(
         cutover::verify_export(&v2).unwrap().is_empty(),
         "OSSCTL2 export must verify clean on this binary"
@@ -157,6 +163,37 @@ async fn verify_export_rejects_forged_or_unreadable_provenance() {
     bad.feature_level = Some(0);
     let err = cutover::verify_export(&bad).unwrap_err();
     assert!(err.contains("feature_level"), "{err}");
+
+    bad = v1.clone();
+    bad.activation_level = Some(compat::MAX_FEATURE_LEVEL + 1);
+    let err = cutover::verify_export(&bad).unwrap_err();
+    assert!(err.contains("activation_level"), "{err}");
+
+    bad = v1.clone();
+    bad.activation_level = Some(0);
+    let err = cutover::verify_export(&bad).unwrap_err();
+    assert!(err.contains("activation_level"), "{err}");
+
+    // OSSCTL1 不能记录激活级别。
+    bad = v1.clone();
+    bad.activation_level = Some(2);
+    let err = cutover::verify_export(&bad).unwrap_err();
+    assert!(err.contains("cannot record activation_level"), "{err}");
+
+    // 激活级别高于封套级别 = 不一致（来源 marker 不可能超过 max(marker, data)）。
+    bad = v1.clone();
+    bad.snapshot_format = Some(2);
+    bad.feature_level = Some(1);
+    bad.activation_level = Some(2);
+    let err = cutover::verify_export(&bad).unwrap_err();
+    assert!(err.contains("activation_level"), "{err}");
+
+    // activation_level 单独出现（无 feature_level）= 不一致。
+    bad = v1.clone();
+    bad.feature_level = None;
+    bad.activation_level = Some(1);
+    let err = cutover::verify_export(&bad).unwrap_err();
+    assert!(err.contains("without feature_level"), "{err}");
 
     bad = v1.clone();
     bad.wire_version = Some(compat::WIRE_VERSION + 1);
@@ -248,6 +285,122 @@ async fn cutover_and_force_recover_refuse_incompatible_export_before_writing() {
     );
 }
 
+/// 激活过但无 config_json 的集群：导出/割接/force-recover 都必须保持 level 2。
+/// 旧实现只看数据要求 → 恢复成 level 1，下次启动被 R8 启动守卫拒绝。
+#[tokio::test]
+async fn activated_export_without_level_two_data_stays_activated() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "act-src.db").await;
+    seed_admin_and_rows(&src).await;
+    src.schema_meta_set("raft_feature_level", "2")
+        .await
+        .unwrap();
+    let export = export_from(&src).await;
+    assert_eq!(export.activation_level, Some(2));
+    assert_eq!(
+        oss_server::raft::data::required_feature_level(&export.data),
+        1,
+        "fixture must not carry level-2 rows"
+    );
+    assert!(cutover::verify_export(&export).unwrap().is_empty());
+    assert_eq!(cutover::install_activation_level(&export), 2);
+
+    // cutover：无 level-2 行也写 marker=2。
+    let dst = db_at(dir.path(), "act-dst.db").await;
+    seed_admin_and_rows(&dst).await;
+    cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dst.schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+
+    // v1.16 导出形态（有 feature_level、无 activation_level）：回落 feature_level 仍保持 2。
+    let mut value = serde_json::to_value(&export).unwrap();
+    assert!(
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("activation_level")
+            .is_some()
+    );
+    let v116: ExportFile = serde_json::from_value(value).unwrap();
+    assert!(cutover::verify_export(&v116).unwrap().is_empty());
+    assert_eq!(cutover::install_activation_level(&v116), 2);
+    let dst2 = db_at(dir.path(), "act-dst2.db").await;
+    seed_admin_and_rows(&dst2).await;
+    cutover::cutover(
+        &dst2,
+        &facts(),
+        &v116,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dst2.schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+
+    // force-recover：feature_level=1 在写前拒绝；=2 接受并留 OSSCTL2 基线快照。
+    let dst3 = db_at(dir.path(), "act-rec.db").await;
+    seed_admin_and_rows(&dst3).await;
+    dst3.schema_meta_set("raft_mode", "on").await.unwrap();
+    let raft_db = dir.path().join("act-raft.db");
+    let settings = raft_settings(7, RaftRole::Voter, raft_db.clone());
+    let err = cutover::force_recover(&dst3, &raft_db, &settings, &export, 7)
+        .await
+        .unwrap_err();
+    assert!(err.contains("feature_level = 2"), "{err}");
+    assert_eq!(dst3.schema_meta("raft_feature_level").await.unwrap(), None);
+    assert!(
+        !raft_db.exists(),
+        "refused recovery must not create raft.db"
+    );
+
+    let mut settings2 = settings.clone();
+    settings2.feature_level = 2;
+    cutover::force_recover(&dst3, &raft_db, &settings2, &export, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        dst3.schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+    let snap_bytes: Vec<u8> = sqlx::query_scalar("SELECT data FROM raft_snapshot WHERE id = 1")
+        .fetch_one(dst3.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        oss_server::raft::data::decode_snapshot(&snap_bytes)
+            .unwrap()
+            .feature_level,
+        2,
+        "recovered baseline snapshot must stay OSSCTL2"
+    );
+}
+
 #[tokio::test]
 async fn legacy_export_without_provenance_is_accepted_with_warning() {
     let dir = tempfile::tempdir().unwrap();
@@ -261,6 +414,7 @@ async fn legacy_export_without_provenance_is_accepted_with_warning() {
         "snapshot_format",
         "wire_version",
         "feature_level",
+        "activation_level",
         "source_build",
     ] {
         assert!(obj.remove(key).is_some(), "new exports must carry {key}");

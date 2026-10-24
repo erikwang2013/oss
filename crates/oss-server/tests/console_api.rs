@@ -2545,3 +2545,213 @@ async fn tier_force_sweep_is_audited() {
     assert_eq!((actor, decision.as_str()), (uid, "allow"));
     assert_eq!(detail.as_deref(), Some("queued=0"));
 }
+
+/// 造一个版本化对象并返回 version id（REPLICA 状态由调用方按需设置）。
+async fn put_versioned(st: &oss_server::state::AppState, key: &str, body: &'static [u8]) -> String {
+    st.store
+        .put_object_stream_with_meta(
+            "alpha",
+            key,
+            Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from_static(body))
+            })),
+            Some("text/plain".into()),
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .version_id
+        .unwrap()
+}
+
+/// M7 遗留未映射 REPLICA 对账 API：管理员列出/点名删；非管理员 403；
+/// dry-run 缺省；任一 id 不是未映射 REPLICA → 整批 409 不删；只删显式指定的版本。
+#[tokio::test]
+async fn replica_reconcile_is_admin_only_and_requires_explicit_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    let admin_uid = st.db.create_user("erik", "pw", true).await.unwrap();
+    st.db.create_user("bob", "pw", false).await.unwrap();
+    st.store.create_bucket("alpha").await.unwrap();
+    st.db.insert_bucket("alpha", None).await.unwrap();
+    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'alpha'")
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+
+    // legacy：REPLICA + 无 origin 映射；mapped：REPLICA 但已映射；plain：非复制对象。
+    let legacy = put_versioned(&st, "old.bin", b"legacy").await;
+    st.store
+        .set_replication_status("alpha", "old.bin", &legacy, Some("REPLICA"))
+        .await
+        .unwrap();
+    let mapped = put_versioned(&st, "old.bin", b"mapped").await;
+    st.store
+        .set_replication_status("alpha", "old.bin", &mapped, Some("REPLICA"))
+        .await
+        .unwrap();
+    st.store
+        .set_remote_version_id("alpha", "old.bin", &mapped, Some(&mapped))
+        .await
+        .unwrap();
+    let plain = put_versioned(&st, "old.bin", b"plain").await;
+    // marker 即使标记 REPLICA 也不参与（版本链里没有可删的数据版本）。
+    let marker = match st
+        .store
+        .delete_object_versioned("alpha", "old.bin", None, VersioningMode::Enabled)
+        .await
+        .unwrap()
+    {
+        xl_store::store::DeleteOutcome::Marker { version_id } => version_id,
+        other => panic!("expected marker, got {other:?}"),
+    };
+    st.store
+        .set_replication_status("alpha", "old.bin", &marker, Some("REPLICA"))
+        .await
+        .unwrap();
+
+    let base = serve(build_router(st.clone()).unwrap()).await;
+    let admin = login_token(&base).await;
+    let bob = login_as(&base, "bob", "pw").await;
+    let client = reqwest::Client::new();
+    let list_url = format!("{base}/api/v1/buckets/alpha/replica-reconcile?key=old.bin");
+    let post_url = format!("{base}/api/v1/buckets/alpha/replica-reconcile");
+
+    // 非管理员（跨账户）一律 403，不泄漏列表。
+    assert_eq!(
+        client
+            .get(&list_url)
+            .bearer_auth(&bob)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .post(&post_url)
+            .bearer_auth(&bob)
+            .json(&serde_json::json!({"key": "old.bin", "version_ids": [legacy]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+
+    // 列表只含未映射 REPLICA（已映射/普通/marker 全排除）。
+    let rows: serde_json::Value = client
+        .get(&list_url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = rows["unmapped_replicas"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{rows}");
+    assert_eq!(listed[0]["version_id"], legacy);
+    assert_eq!(listed[0]["status"], "REPLICA");
+    assert_eq!(listed[0]["source_hint"], serde_json::Value::Null);
+
+    // dry-run 缺省：回 would_delete，不真删。
+    let dry: serde_json::Value = client
+        .post(&post_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"key": "old.bin", "version_ids": [legacy]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["would_delete"][0]["version_id"], legacy);
+    assert_eq!(dry["deleted"].as_array().unwrap().len(), 0);
+    assert!(
+        st.store
+            .head_object_version("alpha", "old.bin", &legacy)
+            .await
+            .is_ok()
+    );
+
+    // 混入已映射 id：整批 409，一个也不删。
+    let refused = client
+        .post(&post_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({
+            "key": "old.bin", "version_ids": [legacy, mapped], "dry_run": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 409);
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(body["unknown_version_ids"][0], mapped);
+    assert!(
+        st.store
+            .head_object_version("alpha", "old.bin", &legacy)
+            .await
+            .is_ok(),
+        "refused batch must delete nothing"
+    );
+
+    // 显式点名删除：只删 legacy；已映射/普通版本保留。
+    let done: serde_json::Value = client
+        .post(&post_url)
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({
+            "key": "old.bin", "version_ids": [legacy], "dry_run": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["dry_run"], false);
+    assert_eq!(done["deleted"][0], legacy);
+    assert!(
+        st.store
+            .head_object_version("alpha", "old.bin", &legacy)
+            .await
+            .is_err()
+    );
+    assert!(
+        st.store
+            .head_object_version("alpha", "old.bin", &mapped)
+            .await
+            .is_ok()
+    );
+    assert!(
+        st.store
+            .head_object_version("alpha", "old.bin", &plain)
+            .await
+            .is_ok()
+    );
+
+    // 审计：列表 + 删除 + 拒绝均落行，actor 是管理员。
+    for op in [
+        "control:replica-reconcile-list",
+        "control:replica-reconcile-refused",
+        "control:replica-reconcile-delete",
+    ] {
+        let (actor, decision, bucket, object_key): (i64, String, String, String) =
+            sqlx::query_as("SELECT uid, decision, bucket, object_key FROM audit_log WHERE op = ?")
+                .bind(op)
+                .fetch_one(st.db.pool())
+                .await
+                .unwrap_or_else(|e| panic!("{op}: {e}"));
+        assert_eq!(actor, admin_uid, "{op}");
+        assert_eq!(decision, "allow", "{op}");
+        assert_eq!((bucket.as_str(), object_key.as_str()), ("alpha", "old.bin"));
+    }
+}
