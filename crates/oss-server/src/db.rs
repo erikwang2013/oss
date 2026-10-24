@@ -70,6 +70,31 @@ pub struct UserRow {
     pub permissions: Vec<PermissionRow>,
 }
 
+/// 账户行（AC-0；控制台 `/accounts` 直接序列化）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountRow {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub admin_uid: Option<i64>,
+    pub bucket_quota: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub member_count: i64,
+    pub bucket_count: i64,
+}
+
+/// 账户成员行（列表页用；不返回任何凭据）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountMemberRow {
+    pub uid: i64,
+    pub username: String,
+    pub role: String,
+    pub is_admin: bool,
+    pub status: String,
+    pub created_at: i64,
+}
+
 /// 子账户 × 桶 的三档权限（与 `permissions` 表一一对应；序列化给前端用 read/write/delete）。
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct PermissionRow {
@@ -260,6 +285,8 @@ const SCHEMA_M7: &str = include_str!("../migrations/0002_m7_site.sql");
 const SCHEMA_M8: &str = include_str!("../migrations/0003_m8.sql");
 /// M9 S0：控制面契约表 + 11 张复制表的 guard。每次启动重放（IF NOT EXISTS / DROP+CREATE）。
 const SCHEMA_M9: &str = include_str!("../migrations/0004_m9.sql");
+/// AC-0：账户/成员表。每次启动重放（IF NOT EXISTS），回填幂等（marker 只跑一次）。
+const SCHEMA_ACCOUNTS: &str = include_str!("../migrations/0005_accounts.sql");
 
 /// WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
 /// `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
@@ -333,6 +360,9 @@ impl Db {
         // M9：契约表 + guard 重放；列迁移在 M7 表存在后执行。
         sqlx::raw_sql(SCHEMA_M9).execute(&db.pool).await?;
         db.ensure_columns_m9().await?;
+        // AC-0：账户表 + 存量用户回填（marker 幂等；Raft 模式下只在本地派生，见迁移头注）。
+        sqlx::raw_sql(SCHEMA_ACCOUNTS).execute(&db.pool).await?;
+        db.backfill_accounts().await?;
         if seed_site {
             db.site_bootstrap(site_id).await?;
         }
@@ -1354,6 +1384,29 @@ impl Db {
         .execute(&self.pool)
         .await?
         .last_insert_rowid();
+        // AC-0：新用户加入其 uid 派生账户（与回填同语义；之后可被显式迁入其它账户）。
+        if let Some(acct) = xl_s3::access::account_id_of(id) {
+            sqlx::query(
+                "INSERT OR IGNORE INTO accounts (id, name, status, admin_uid, created_at, updated_at) \
+                 VALUES (?, ?, 'active', ?, ?, ?)",
+            )
+            .bind(&acct)
+            .bind(username)
+            .bind(id)
+            .bind(now())
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO account_members (account_id, uid, role, created_at) \
+                 VALUES (?, ?, 'owner', ?)",
+            )
+            .bind(&acct)
+            .bind(id)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(id)
     }
 
@@ -1369,8 +1422,12 @@ impl Db {
         // M4 切片 7：Argon2id 恒时校验（password-hash 的 verify_password 内部恒时）；
         // 旧 M1 格式（sha256 单轮）仍可验证——**登录成功即透明重写升级**（一次迁移）。
         // status='active'：被停用的账号登录直接按「用户名或密码错误」处理（不问不答）。
+        // AC-1：账户停用同样按凭据错误处理（成员行存在但账户行缺失 → 停用，fail-closed）。
         let row = sqlx::query(
-            "SELECT id, password_hash FROM users WHERE username = ? AND status = 'active'",
+            "SELECT id, password_hash FROM users u WHERE username = ? AND status = 'active' \
+             AND NOT EXISTS (SELECT 1 FROM account_members am \
+                LEFT JOIN accounts a ON a.id = am.account_id \
+                WHERE am.uid = u.id AND COALESCE(a.status, 'disabled') <> 'active')",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -1957,6 +2014,367 @@ impl Db {
         Ok(true)
     }
 
+    // ---- AC-0：多租户账户（standalone 模式；Raft 下只读回填结果）----
+
+    /// 启动回填：每个存量用户 → 其 uid 派生账户（role=owner），并保证系统账户存在。
+    /// 只跑一次（`schema_meta.accounts_backfill_v1`）：显式迁出派生账户的用户重启后不被拉回。
+    /// 返回是否实际执行（false = marker 已存在）。
+    pub async fn backfill_accounts(&self) -> Result<bool> {
+        if self.schema_meta("accounts_backfill_v1").await?.is_some() {
+            return Ok(false);
+        }
+        let users = sqlx::query("SELECT id, username FROM users ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        let ts = now();
+        let mut tx = self.pool.begin().await?;
+        // 系统账户：admin/NULL 桶的账户；没有成员，主体匹配永不命中它。
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (id, name, status, created_at, updated_at) \
+             VALUES (?, 'system', 'active', ?, ?)",
+        )
+        .bind(xl_s3::access::LEGACY_ACCOUNT)
+        .bind(ts)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await?;
+        for r in users {
+            let uid: i64 = r.get("id");
+            let username: String = r.get("username");
+            let Some(acct) = xl_s3::access::account_id_of(uid) else {
+                continue; // uid 0/越界：旧语义下也无法匹配任何账户 ARN，保持原状
+            };
+            sqlx::query(
+                "INSERT OR IGNORE INTO accounts \
+                 (id, name, status, admin_uid, created_at, updated_at) \
+                 VALUES (?, ?, 'active', ?, ?, ?)",
+            )
+            .bind(&acct)
+            .bind(&username)
+            .bind(uid)
+            .bind(ts)
+            .bind(ts)
+            .execute(&mut *tx)
+            .await?;
+            // 首次回填时不存在成员行；UNIQUE(uid) 兜底并发/重入。
+            sqlx::query(
+                "INSERT OR IGNORE INTO account_members (account_id, uid, role, created_at) \
+                 VALUES (?, ?, 'owner', ?)",
+            )
+            .bind(&acct)
+            .bind(uid)
+            .bind(ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES ('accounts_backfill_v1', 'done') \
+             ON CONFLICT(key) DO UPDATE SET value = 'done'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。
+    pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("account_id"))
+            .or_else(|| xl_s3::access::account_id_of(uid)))
+    }
+
+    /// 账户状态是否允许该用户继续使用（无成员行 = 派生账户语义 = 有效）。
+    /// 成员行存在但账户行缺失 → false（fail-closed）。
+    pub async fn account_active(&self, uid: i64) -> Result<bool> {
+        let inactive: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM account_members am \
+             LEFT JOIN accounts a ON a.id = am.account_id \
+             WHERE am.uid = ? AND COALESCE(a.status, 'disabled') <> 'active'",
+        )
+        .bind(uid)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(inactive == 0)
+    }
+
+    fn account_row_from(r: &sqlx::sqlite::SqliteRow) -> AccountRow {
+        AccountRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            status: r.get("status"),
+            admin_uid: r.get("admin_uid"),
+            bucket_quota: r.get("bucket_quota"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+            member_count: r.get("member_count"),
+            bucket_count: r.get("bucket_count"),
+        }
+    }
+
+    /// 账户桶数：桶主的**当前**账户（成员行优先，无行 = uid 派生）；管理员桶归系统账户
+    /// 但永不匹配真实账户，故不计入任何用户账户。
+    fn account_bucket_count_sql() -> &'static str {
+        "(SELECT COUNT(*) FROM buckets b JOIN users u ON u.id = b.owner_id \
+          LEFT JOIN account_members bm ON bm.uid = u.id \
+          WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = a.id)"
+    }
+
+    /// 全部账户（管理员视角）或某用户的账户（账户成员视角）。
+    pub async fn list_accounts(&self, member_uid: Option<i64>) -> Result<Vec<AccountRow>> {
+        let sql = format!(
+            "SELECT a.*, \
+             (SELECT COUNT(*) FROM account_members m WHERE m.account_id = a.id) AS member_count, \
+             {} AS bucket_count \
+             FROM accounts a {} ORDER BY a.id",
+            Self::account_bucket_count_sql(),
+            if member_uid.is_some() {
+                "WHERE a.id IN (SELECT account_id FROM account_members WHERE uid = ?)"
+            } else {
+                ""
+            }
+        );
+        // 字面量拼接只来自上面两个常量分支，无用户输入。
+        let q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        let q = match member_uid {
+            Some(uid) => q.bind(uid),
+            None => q,
+        };
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(Self::account_row_from).collect())
+    }
+
+    pub async fn get_account(&self, id: &str) -> Result<Option<AccountRow>> {
+        let sql = format!(
+            "SELECT a.*, \
+             (SELECT COUNT(*) FROM account_members m WHERE m.account_id = a.id) AS member_count, \
+             {} AS bucket_count FROM accounts a WHERE a.id = ?",
+            Self::account_bucket_count_sql()
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(Self::account_row_from))
+    }
+
+    /// 新建账户。id 为 12 位随机数（与派生账户空间重叠概率可忽略，冲突重试）。
+    pub async fn create_account(&self, name: &str, bucket_quota: Option<i64>) -> Result<String> {
+        let ts = now();
+        for _ in 0..8 {
+            // random() 是有符号 64 位：先掩掉符号位再取模，否则 % 保留负号会生成负 id。
+            let id: String = sqlx::query_scalar(
+                "SELECT printf('%012d', 100000000000 + ((random() & 0x7fffffffffffffff) % 900000000000))",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let n = sqlx::query(
+                "INSERT OR IGNORE INTO accounts \
+                 (id, name, status, bucket_quota, created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(name)
+            .bind(bucket_quota)
+            .bind(ts)
+            .bind(ts)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            if n == 1 {
+                return Ok(id);
+            }
+        }
+        Err(sqlx::Error::Protocol(
+            "account id generation collision (retry)".into(),
+        ))
+    }
+
+    pub async fn rename_account(&self, id: &str, name: &str) -> Result<bool> {
+        let n = sqlx::query("UPDATE accounts SET name = ?, updated_at = ? WHERE id = ?")
+            .bind(name)
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// 启停账户。停用是原子条件更新：账户里还有在册全局管理员时拒绝
+    /// （否则该管理员会随账户一起被锁死，且可能锁死最后一个管理员）。
+    pub async fn set_account_status(&self, id: &str, status: &str) -> Result<bool> {
+        let n = if status == "active" {
+            sqlx::query("UPDATE accounts SET status = 'active', updated_at = ? WHERE id = ?")
+                .bind(now())
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ? AND NOT EXISTS (\
+                   SELECT 1 FROM account_members am JOIN users u ON u.id = am.uid \
+                   WHERE am.account_id = accounts.id AND u.is_admin = 1 AND u.status = 'active')",
+            )
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        };
+        Ok(n == 1)
+    }
+
+    pub async fn set_account_quota(&self, id: &str, quota: Option<i64>) -> Result<bool> {
+        let n = sqlx::query("UPDATE accounts SET bucket_quota = ?, updated_at = ? WHERE id = ?")
+            .bind(quota)
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// 删除账户：要求无成员且无桶（LEGACY 系统账户永不可删）。
+    /// 返回 Ok(true)；账户不存在 / 非空不删（由 handler 区分）。
+    pub async fn delete_account(&self, id: &str) -> Result<bool> {
+        if id == xl_s3::access::LEGACY_ACCOUNT {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE account_id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let sql = format!(
+            "SELECT {} FROM accounts a WHERE a.id = ?",
+            Self::account_bucket_count_sql()
+        );
+        let buckets: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if members != 0 || buckets.unwrap_or(0) != 0 {
+            return Ok(false);
+        }
+        let n = sqlx::query("DELETE FROM accounts WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(n == 1)
+    }
+
+    pub async fn list_account_members(&self, id: &str) -> Result<Vec<AccountMemberRow>> {
+        let rows = sqlx::query(
+            "SELECT am.uid AS uid, u.username AS username, am.role AS role, \
+                    u.is_admin AS is_admin, u.status AS status, am.created_at AS created_at \
+             FROM account_members am JOIN users u ON u.id = am.uid \
+             WHERE am.account_id = ? ORDER BY am.uid",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| AccountMemberRow {
+                uid: r.get("uid"),
+                username: r.get("username"),
+                role: r.get("role"),
+                is_admin: r.get::<i64, _>("is_admin") != 0,
+                status: r.get("status"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// 某用户在该账户里的角色（不在账户 → None）。
+    pub async fn member_role(&self, account_id: &str, uid: i64) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT role FROM account_members WHERE account_id = ? AND uid = ?")
+            .bind(account_id)
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("role")))
+    }
+
+    /// 把用户挂到账户（已有成员行则迁入并改角色）。账户/用户不存在 → false。
+    /// 账户 admin_uid 为空且角色为 admin 时顺带补上。
+    pub async fn attach_account_member(
+        &self,
+        account_id: &str,
+        uid: i64,
+        role: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let user: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if user.is_none() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(uid) DO UPDATE SET account_id = excluded.account_id, role = excluded.role",
+        )
+        .bind(account_id)
+        .bind(uid)
+        .bind(role)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        if role == "admin" {
+            sqlx::query("UPDATE accounts SET admin_uid = ? WHERE id = ? AND admin_uid IS NULL")
+                .bind(uid)
+                .bind(account_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// 在账户内建用户（is_admin 恒 0；角色由调用方限定 member）。
+    /// 用户名冲突 → 数据库 unique violation（handler 映射 400）。
+    pub async fn create_user_in_account(
+        &self,
+        account_id: &str,
+        username: &str,
+        password: &str,
+        role: &str,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let ts = now();
+        let uid = sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, 0, ?)",
+        )
+        .bind(username)
+        .bind(crate::db::hash_password(password))
+        .bind(ts)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(account_id)
+        .bind(uid)
+        .bind(role)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(uid)
+    }
+
     /// 某用户的权限行（全量）。
     pub async fn get_permissions(&self, uid: i64) -> Result<Vec<PermissionRow>> {
         let rows = sqlx::query_as::<_, PermissionRow>(
@@ -2124,6 +2542,155 @@ mod tests {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('users','access_keys','buckets','uploads','instant_index','permissions')")
             .fetch_one(db.pool()).await.unwrap();
         assert_eq!(n, 6);
+    }
+
+    /// AC-0：回填把每个存量用户映射到 uid 派生账户；二次执行幂等（marker），
+    /// 且派生账户 ARN 的黄金样本不变。
+    #[tokio::test]
+    async fn accounts_backfill_idempotent_and_preserves_derived_arns() {
+        let db = db().await;
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let sub = db.create_user("sub", "pw", false).await.unwrap();
+        // 抹掉 create_user 的即时挂载与 connect 期 marker，模拟「旧库升级」。
+        sqlx::query("DELETE FROM account_members")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM accounts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_meta WHERE key = 'accounts_backfill_v1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(db.backfill_accounts().await.unwrap());
+        let n_acc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let n_mem: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        // 两个用户账户 + LEGACY 系统账户；每个用户一条成员行（role=owner）。
+        assert_eq!(n_acc, 3);
+        assert_eq!(n_mem, 2);
+
+        // 二次执行：marker 命中 → no-op，行数/内容不变。
+        assert!(!db.backfill_accounts().await.unwrap());
+        let n_acc2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n_acc2, n_acc);
+
+        for (uid, name) in [(admin, "root"), (sub, "sub")] {
+            let derived = xl_s3::access::account_id_of(uid).unwrap();
+            assert_eq!(
+                db.account_id_of_user(uid).await.unwrap(),
+                Some(derived.clone())
+            );
+            assert_eq!(
+                db.member_role(&derived, uid).await.unwrap().as_deref(),
+                Some("owner")
+            );
+            // 迁移前对外暴露的 arn:aws:iam::<id>:root 继续命中（黄金样本）。
+            let arn = format!("arn:aws:iam::{derived}:root");
+            assert!(
+                xl_s3::access::account_arn_matches(&arn, uid),
+                "{name} ARN 漂移"
+            );
+        }
+        // 系统账户存在、无成员，且永不匹配真实用户。
+        assert!(
+            db.get_account(xl_s3::access::LEGACY_ACCOUNT)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.member_role(xl_s3::access::LEGACY_ACCOUNT, sub)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!xl_s3::access::account_arn_matches(
+            &format!("arn:aws:iam::{}:root", xl_s3::access::LEGACY_ACCOUNT),
+            sub
+        ));
+    }
+
+    /// AC-0：新建账户 id 必须是 12 位非负十进制（random() 取模别踩符号位）。
+    #[tokio::test]
+    async fn create_account_generates_12_digit_ids() {
+        let db = db().await;
+        let a = db.create_account("a", None).await.unwrap();
+        let b = db.create_account("b", None).await.unwrap();
+        for id in [&a, &b] {
+            assert_eq!(id.len(), 12, "id={id}");
+            assert!(id.chars().all(|c| c.is_ascii_digit()), "id={id}");
+            assert!(
+                !id.starts_with('0'),
+                "id 应在 100000000000..=999999999999: {id}"
+            );
+        }
+        assert_ne!(a, b);
+    }
+
+    /// AC-1：账户停用 → 登录被拒、account_active=false；恢复后登录恢复。
+    /// 账户内有在册全局管理员时不允许停用（防把最后一个管理员锁死在停用账户里）。
+    #[tokio::test]
+    async fn disabled_account_blocks_login_and_active_admin_account_cannot_disable() {
+        let db = db().await;
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let sub = db.create_user("sub", "pw", false).await.unwrap();
+        let sub_acct = db.account_id_of_user(sub).await.unwrap().unwrap();
+        assert!(db.account_active(sub).await.unwrap());
+        assert!(db.set_account_status(&sub_acct, "disabled").await.unwrap());
+        assert!(!db.account_active(sub).await.unwrap());
+        assert_eq!(db.verify_user("sub", "pw").await.unwrap(), None);
+        // 恢复
+        assert!(db.set_account_status(&sub_acct, "active").await.unwrap());
+        assert_eq!(db.verify_user("sub", "pw").await.unwrap(), Some(sub));
+
+        let admin_acct = db.account_id_of_user(admin).await.unwrap().unwrap();
+        assert!(
+            !db.set_account_status(&admin_acct, "disabled")
+                .await
+                .unwrap(),
+            "含在册全局管理员的账户不能停用"
+        );
+    }
+
+    /// AC-0：迁移用户到新账户后，派生 ARN 不再命中、新账户 ARN 命中；账户删除受成员/桶守卫。
+    #[tokio::test]
+    async fn account_membership_move_changes_arn_mapping_and_delete_is_guarded() {
+        let db = db().await;
+        let sub = db.create_user("sub", "pw", false).await.unwrap();
+        let derived = db.account_id_of_user(sub).await.unwrap().unwrap();
+        let acct = db.create_account("team", Some(2)).await.unwrap();
+        assert!(db.attach_account_member(&acct, sub, "admin").await.unwrap());
+
+        assert_eq!(
+            db.account_id_of_user(sub).await.unwrap(),
+            Some(acct.clone())
+        );
+        assert!(!db.delete_account(&acct).await.unwrap(), "有成员不可删");
+        sqlx::query("DELETE FROM account_members WHERE account_id = ?")
+            .bind(&acct)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // 成员移除后回落派生账户（legacy fallback）
+        assert_eq!(db.account_id_of_user(sub).await.unwrap(), Some(derived));
+        assert!(db.delete_account(&acct).await.unwrap());
+        assert!(
+            !db.delete_account(xl_s3::access::LEGACY_ACCOUNT)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

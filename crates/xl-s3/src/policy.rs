@@ -70,6 +70,8 @@ pub struct PolicyRequest<'a> {
     pub op: &'a str,
     pub ak: &'a str,
     pub uid: i64,
+    /// AC-0：用户当前账户（成员行优先；None = 回落 uid 派生账户的 legacy 路径）。
+    pub account_id: Option<&'a str>,
     pub bucket: &'a str,
     /// 对象键（桶级 op 为 None）
     pub key: Option<&'a str>,
@@ -138,8 +140,9 @@ fn principal_matches(p: &PrincipalField, r: &PolicyRequest<'_>) -> bool {
         v == "*"
             || v == r.ak
             || v.strip_prefix("uid:").and_then(|n| n.parse::<i64>().ok()) == Some(r.uid)
-            // 账户命名空间 v1：账户 = 用户；LEGACY/uid=0 永不匹配。
-            || crate::access::account_arn_matches(v, r.uid)
+            // AC-0：账户根 ARN = 该账户的全部成员（无成员行回落 uid 派生账户）；
+            // LEGACY/uid=0 永不匹配。
+            || crate::access::account_principal_matches(v, r.uid, r.account_id)
     })
 }
 
@@ -282,6 +285,7 @@ mod tests {
             op,
             ak: "AKIA_SUB",
             uid: 7,
+            account_id: None,
             bucket: "bkt",
             key,
             anonymous: false,
@@ -294,6 +298,7 @@ mod tests {
             op,
             ak: "",
             uid: 0,
+            account_id: None,
             bucket: "bkt",
             key,
             anonymous: true,
@@ -468,6 +473,45 @@ mod tests {
             evaluate(&p, &anon_req("GetObject", Some("a")), "s3:GetObject"),
             None
         );
+    }
+
+    /// AC-0：成员挂载后，账户根 ARN 按**成员关系**解析（覆盖 uid 派生账户）；
+    /// 非成员不命中；LEGACY 永不通配。
+    #[test]
+    fn account_root_principal_uses_membership_account() {
+        let p = doc(r#"{"Statement":[{"Effect":"Allow",
+            "Principal":{"AWS":"arn:aws:iam::123456789012:root"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#);
+        let mut member = req("GetObject", Some("a"));
+        member.uid = 7; // 派生账户为 000000000007，但成员关系在 123456789012
+        member.account_id = Some("123456789012");
+        assert_eq!(evaluate(&p, &member, "s3:GetObject"), Some(true));
+
+        // 成员关系优先于派生：uid=7 自己的派生 ARN 不再命中
+        let derived = doc(r#"{"Statement":[{"Effect":"Allow",
+            "Principal":{"AWS":"arn:aws:iam::000000000007:root"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#);
+        assert_eq!(evaluate(&derived, &member, "s3:GetObject"), None);
+
+        // 不同账户成员不命中，包括 uid=12 恰为「派生同号」的情形（account_id 已给出时不回退）
+        for (uid, acct) in [
+            (8_i64, Some("999999999999")),
+            (12, Some("999999999999")),
+            (7, None), // 无成员行 → 派生 000000000007 ≠ 123456789012
+        ] {
+            let mut r = req("GetObject", Some("a"));
+            r.uid = uid;
+            r.account_id = acct;
+            assert_eq!(evaluate(&p, &r, "s3:GetObject"), None, "{uid}/{acct:?}");
+        }
+
+        // LEGACY 主体永不通配
+        let legacy = doc(r#"{"Statement":[{"Effect":"Allow",
+            "Principal":{"AWS":"arn:aws:iam::000000000000:root"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#);
+        let mut sys = req("GetObject", Some("a"));
+        sys.account_id = Some(crate::access::LEGACY_ACCOUNT);
+        assert_eq!(evaluate(&legacy, &sys, "s3:GetObject"), None);
     }
 
     /// 解析拒收：Effect 缺失/占位以外的形状直接失败（PUT 层转 400）。

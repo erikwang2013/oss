@@ -81,7 +81,11 @@ async fn gate(
         return Some(problem(401, "invalid_token", "登录态无效，请重新登录"));
     };
     let (is_admin, active) = match st.app.db.get_user(uid).await {
-        Ok(Some((_, admin, active))) => (admin, active),
+        Ok(Some((_, admin, active))) => {
+            // AC-1：账户停用同样让旧 JWT 立即作废
+            let account_active = st.app.db.account_active(uid).await.unwrap_or(false);
+            (admin, active && account_active)
+        }
         _ => (false, false),
     };
     if !active {

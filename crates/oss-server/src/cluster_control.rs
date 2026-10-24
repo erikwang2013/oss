@@ -65,7 +65,10 @@ impl ControlBackend for SqliteControlBackend {
                      FROM access_keys ak JOIN users u ON u.id = ak.user_id \
                      LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
                      LEFT JOIN users pu ON pu.id = p.user_id \
+                     LEFT JOIN account_members am ON am.uid = u.id \
+                     LEFT JOIN accounts a ON a.id = am.account_id \
                      WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
+                       AND (am.uid IS NULL OR a.status = 'active') \
                        AND (ak.expires_at IS NULL OR ak.expires_at > ?) \
                        AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
                             AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \

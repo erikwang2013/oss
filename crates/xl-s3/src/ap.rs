@@ -1993,6 +1993,12 @@ mod tests {
              CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
               uid INTEGER NOT NULL, op TEXT NOT NULL, bucket TEXT, object_key TEXT, \
               decision TEXT NOT NULL, detail TEXT);\
+             CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+              status TEXT NOT NULL DEFAULT 'active', admin_uid INTEGER, bucket_quota INTEGER, \
+              created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);\
+             CREATE TABLE account_members (account_id TEXT NOT NULL, uid INTEGER NOT NULL UNIQUE, \
+              role TEXT NOT NULL DEFAULT 'member', created_at INTEGER NOT NULL, \
+              PRIMARY KEY (account_id, uid));\
              INSERT INTO users (id,username,password_hash,is_admin) VALUES (7,'u','h',0);\
              INSERT INTO access_keys (access_key,secret_key,user_id) VALUES ('AKIA_X','s',7);\
              INSERT INTO buckets (name,owner_id,creation_date) VALUES ('bkt',7,0);",
