@@ -341,3 +341,44 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 
 上述设计、MVP 切片、依赖与风险见
 `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
+
+## 13. 2026-10-24 v1.17 候选：§2–§5 继续执行
+
+**范围**：架构级非目标的最小可行切片、兼容边界、安全/运维残余与验证缺口。基于
+`v1.16.0`，集成分支 `feat/post-1.16-backlog`；本批**未发布**。
+
+### 13.1 已落地
+
+| 项 | 落点 | 说明 |
+|---|---|---|
+| 多租户账户 MVP | `accounts`/`account_members` 迁移、accounts_api、Acl | 账户/成员/状态/桶数配额；回填保持派生 ARN；停用账户全链 fail-closed；账户写不参与 Raft（503） |
+| AP 跨账户 / SourceVpce | xl-s3/ap.rs、access.rs、m8_ap | 账户根 principal 按成员关系解析；仅 AP 策略 Principal 可跨账户，最终取基线交集；SourceVpce 为显式证明（静态/可信头），非 PrivateLink 身份 |
+| tier 分块哈希 + 直读 | xl-store/meta.rs、store/tier.rs、oss-server/tier_direct.rs、xl-s3/tier_direct.rs | `TierState.chunks` 增量元数据；`OSS_TIER_DIRECT_READ=1` 默认关，归档 GET Range 按块校验 SHA-256；无表/无 Range/漂移 fail-closed；跨进程 `.oss-tier-space` flock 预留 |
+| M7 对账 / OSSCTL2 激活 | replication.rs、console/cli、raft/cutover/export.rs | 管理员列出/点名删除未映射 REPLICA（默认 dry-run，绝不内容匹配）；ExportFile 增加 activation_level，force-recover 保持 level 2 |
+| WebIdentity 加固 | sts_web_identity.rs | JWKS 文件热加载（失败保留旧钥）、`require_email_verified`、按 IP 令牌桶（全局桶保留） |
+| CMK 运维 | kms.rs、store/cmk_rewrap.rs、cli.rs | 离线 `cmk scan/rewrap/delete/trash`；桶默认加密纳入引用；`.cmk-trash` list/purge/restore；集群逐节点口径 |
+| mesh 安全 | xl-client、xl-store、xl-s3 | SSE-C MPU 跨节点强制 mesh TLS；REPLICA 头需 site token 认证，否则按普通请求入复制 |
+| Batch UI/边界 | web jobState/Jobs、job_actions | `preempted` 非终态展示/轮询；跨账户通知安全边界固化 |
+| DP-0 数据面握手 | proto NodeHealth.data_wire_version、mesh_gate、store | 版本 2/legacy 1 严格相等；混版数据面 503 `peer_incompatible`；状态/metrics 暴露；探测预算 100ms 不拖累读快路径 |
+| M8 运行态 fencing | raft/mod.rs、db.rs、jobs/inventory/tier/lifecycle | FencingEpoch(term,leader) 落入运行态表；旧 term 写拒绝/接管重盖章；仍无跨节点运行态复制 |
+
+### 13.2 验证
+
+- 库测试：xl-store 300（1 ignored）、xl-s3 176、oss-server 179；全绿。
+- 聚焦集成批：accounts、m8_ap、permissions、console_api、replication、sync_gate、
+  raft_cutover*、raft_commands、m8_batch、jobs_engine、m8_inventory、m8_tier*、
+  lifecycle*、tls_*、observability、object_ops/replication_ops/select_ops/olap_ops、
+  xl-client —— 全绿（修复两处旧夹具/旧库无账户表回落 + REPLICA 标签语义）。
+- 待在同一集成二进制上复跑：S3 全量 e2e、M8（tier/repl）、M9 四组、E2E_LONG；结果以
+  本轮收尾报告为准。未通过项不作为“已验收”。
+
+### 13.3 仍未完成（架构级）
+
+- Level C 完整双读写窗口（仅 LC-0/OSSCTL2 来源校验）。
+- M3/M4 数据面完整滚动（仅 DP-0 握手；DP-1 读路径矩阵、DP-2 TLS 入站热轮换仍缺）。
+- 完整多租户（账户表未随 Raft 复制；软字节配额；账户管理员 UI 不完整）。
+- M8 多节点运行态复制/fencing 后的跨节点接管（仅本地 fencing epoch）。
+- M3 shrink / 单机→集群。
+- VPC endpoint 的真实 PrivateLink/ENI 身份（SourceVpce 仅为部署证明）。
+- 直接读 tier 的已知限制：分块表无独立签名、ETag 口径不比较、跨进程预留只协调协作进程。
+- Level B 滚动 e2e 的 4 个 v1.13.1 侧 SKIP、M6 无 token 历史远端、M7 升级前删除不回溯。

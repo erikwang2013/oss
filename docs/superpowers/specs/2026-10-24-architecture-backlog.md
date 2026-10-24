@@ -1,8 +1,9 @@
 # 架构级非目标 backlog（Level C / 数据面滚动 / 账户 / M8 多节点 / M3 shrink）
 
-> 状态：**设计 backlog，五项完整目标均未实现**。v1.16.0（2026-10-24）已落地两个部分切片：
-> LC-0 导出/cutover/force-recover 来源校验（§1.3）与 M8 单例后台任务 leader 门控
-> （第 4 项的前置），见验收记录 §12；本文不是发布承诺。
+> 状态：**设计 backlog，五项完整目标均未实现**。v1.16.0（2026-10-24）已落地 LC-0
+> 来源校验与 M8 单例任务 leader 门控；v1.17.0 候选又落地账户 MVP、M8 运行态 fencing epoch、
+> DP-0 数据面版本握手与 AP 跨账户/SourceVpce 证明（均为部分切片，完整 Level C/数据面滚动/
+> 多租户/M8 多节点/shrink 仍未实现）。证据见验收记录 §12–§13；本文不是发布承诺。
 > 基线：v1.15.0（Rust/前端树 `2bda0bc`，2026-10-24）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →

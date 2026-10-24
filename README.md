@@ -40,6 +40,13 @@ CMK 安全删除与逐版本 rewrap；M3 MPU 跨节点属主路由/流式转发�
 监听器）。验收与仍然阻塞的架构项见验收记录 §12 与
 `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
 
+**v1.17.0 候选（未发布）**：多租户账户 MVP（账户/成员/状态/桶配额）与 AP 跨账户
+账户根授权 + `aws:SourceVpce` 证明；tier 分块哈希与默认关闭的归档 Range 直读、跨进程磁盘
+预留；M7 未映射 REPLICA 人工对账与 OSSCTL2 激活级别导出；WebIdentity JWKS 热加载/
+`email_verified`/按 IP 限速；CMK 离线 CLI/桶默认引用/`.cmk-trash`；mesh SSE-C 跨节点强制
+TLS 与 REPLICA 头认证；Batch `preempted` 控制台展示；DP-0 数据面版本握手/混版 fail-closed；
+M8 运行态 fencing epoch。完整证据与仍然阻塞的架构项见验收记录 §13。
+
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
   s3s 的 S3 trait 实现到内核上；`xl-proto` 是节点间 gRPC 协议消息与 service（prost + tonic-build
