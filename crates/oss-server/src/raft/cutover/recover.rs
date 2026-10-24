@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::export::{ExportFile, verify_export};
+use super::export::{ExportFile, install_activation_level, verify_export};
 use crate::config::RaftRole;
 use crate::db::Db;
 use crate::raft::data::{self, InstallCtx};
@@ -52,17 +52,19 @@ pub async fn force_recover(
     {
         return Err("control DB is not in raft mode; run raft-cutover first".into());
     }
-    let required = data::required_feature_level(&export.data);
-    // 恢复后节点会带 level-2 marker；低于数据要求的配置必然被 R8 启动守卫拒绝。
-    // 在写任何行之前失败，避免留下“数据已装、节点起不来”的半恢复库。
-    if required > compat::advertised_feature(settings.feature_level) {
+    // 恢复后节点带来源激活 marker（激活过但无 level-2 数据也保持 2）；低于该级别的
+    // 配置必然被 R8 启动守卫拒绝。在写任何行之前失败，避免留下“数据已装、节点起不来”
+    // 的半恢复库。
+    let activation = install_activation_level(export);
+    if activation > compat::advertised_feature(settings.feature_level) {
         return Err(format!(
-            "export contains level-2 lifecycle data (config_json); set [raft].feature_level = \
-             {required} (current {}) before force recovery",
+            "export requires activation level {activation} (source activation or level-{} \
+             data); set [raft].feature_level = {activation} (current {}) before force recovery",
+            data::required_feature_level(&export.data),
             settings.feature_level
         ));
     }
-    let snapshot_len = data::encode_snapshot(&export.data)
+    let snapshot_len = data::encode_snapshot_at(&export.data, activation)
         .map_err(|e| e.to_string())?
         .len() as u64;
     if snapshot_len > settings.snapshot_max_bytes {
@@ -116,8 +118,8 @@ pub async fn force_recover(
     data::install_tx(&mut tx, &export.data, &InstallCtx { admin_id, witness })
         .await
         .map_err(|e| e.to_string())?;
-    if required > compat::MIN_FEATURE_LEVEL {
-        compat::bump_activation_tx(&mut tx, required)
+    if activation > compat::MIN_FEATURE_LEVEL {
+        compat::bump_activation_tx(&mut tx, activation)
             .await
             .map_err(|e| e.to_string())?;
     }

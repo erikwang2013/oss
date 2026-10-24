@@ -39,6 +39,8 @@ pub const USAGE: &str = "\
                  从导出文件重建 N 的单节点集群（数据站点或 witness 配置；S7.5）
   sync-reconcile [--repair] [--bucket B] [--json]
                  B′ 站点对账（S7.5）
+  replica-reconcile --bucket B --key K [--delete ID[,ID...]] [--apply] [--json]
+                 列出/点名删除未映射 REPLICA 历史版本（M7 升级遗留；默认 dry-run）
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +94,14 @@ pub enum Command {
         bucket: Option<String>,
         json: bool,
     },
+    /// M7 遗留：未映射 REPLICA 版本的人工对账（离线；默认 dry-run）。
+    ReplicaReconcile {
+        bucket: String,
+        key: String,
+        delete: Vec<String>,
+        apply: bool,
+        json: bool,
+    },
 }
 
 /// 取出 `--config <path>` / `--config=<path>`（恰好一次；缺省 `oss.toml`）。
@@ -135,6 +145,7 @@ pub fn needs_full_state(cmd: &Command) -> bool {
             | Command::RaftCutover { .. }
             | Command::RaftForceRecover { .. }
             | Command::SyncReconcile { .. }
+            | Command::ReplicaReconcile { .. }
     )
 }
 
@@ -285,6 +296,34 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
             Ok(Command::SyncReconcile {
                 repair: flags.contains("--repair"),
                 bucket: v.get("--bucket").cloned(),
+                json: flags.contains("--json"),
+            })
+        }
+        ("replica-reconcile", rest) => {
+            let (v, flags) = parse_flags(
+                rest,
+                &["--bucket", "--key", "--delete"],
+                &["--apply", "--json"],
+            )?;
+            let delete: Vec<String> = v
+                .get("--delete")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let apply = flags.contains("--apply");
+            if apply && delete.is_empty() {
+                return Err(USAGE); // --apply 必须点名版本；绝无自动选择
+            }
+            Ok(Command::ReplicaReconcile {
+                bucket: v.get("--bucket").cloned().ok_or(USAGE)?,
+                key: v.get("--key").cloned().ok_or(USAGE)?,
+                delete,
+                apply,
                 json: flags.contains("--json"),
             })
         }
@@ -725,7 +764,8 @@ pub async fn run(
         | Command::RaftExport { .. }
         | Command::RaftCutover { .. }
         | Command::RaftForceRecover { .. }
-        | Command::SyncReconcile { .. } => {
+        | Command::SyncReconcile { .. }
+        | Command::ReplicaReconcile { .. } => {
             Err("内部错误：离线命令不得走 AppState::run（应走 run_offline）".into())
         }
     }
@@ -791,6 +831,13 @@ pub async fn run_offline(
             bucket,
             json,
         } => sync_reconcile_cmd(cfg_path, repair, bucket, json).await,
+        Command::ReplicaReconcile {
+            bucket,
+            key,
+            delete,
+            apply,
+            json,
+        } => replica_reconcile_cmd(cfg_path, bucket, key, delete, apply, json).await,
         other => Err(format!("{other:?} 不是离线命令（内部接线错误）").into()),
     }
 }
@@ -1085,6 +1132,126 @@ async fn sync_reconcile_cmd(
     Ok(if report.has_errors() { 1 } else { 0 })
 }
 
+/// M7 遗留未映射 REPLICA 的人工对账：列出（无 --delete）或点名删除（--apply 才真删）。
+async fn replica_reconcile_cmd(
+    cfg_path: &std::path::Path,
+    bucket: String,
+    key: String,
+    delete: Vec<String>,
+    apply: bool,
+    json: bool,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    // 离线：只做 meta 读与定点版本删，不 AppState::load（会二次打开 raft.db）。
+    let cfg = crate::config::AppConfig::load(cfg_path)?;
+    let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
+    let drives = cfg
+        .data_dirs
+        .clone()
+        .unwrap_or_else(|| vec![cfg.data_dir.clone()]);
+    let mut sc = xl_store::store::StoreConfig::new(&drives[0]);
+    sc.drives = drives;
+    sc.ec = xl_store::store::ec::EcConfig {
+        data: cfg.ec.data,
+        parity: cfg.ec.parity,
+        enabled: cfg.ec.enabled,
+    };
+    sc.inline_threshold = cfg.ec.inline_threshold;
+    sc.sync_max_bytes = cfg.sync.max_object_bytes;
+    sc.gate = None;
+    let store = xl_store::store::Store::open(sc).await?;
+    let tier_gc =
+        crate::tier::S3TierGc::new(Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers)));
+    // 离线 CLI 无 JWT：本机文件系统访问即管理员；审计以 uid=0 哨兵落行。
+    let audit = xl_s3::access::Acl::with_mesh(db.pool().clone(), None);
+    if delete.is_empty() {
+        let rows = crate::replication::list_unmapped_replicas(&store, &bucket, &key)
+            .await
+            .map_err(|e| e.to_string())?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        } else if rows.is_empty() {
+            println!("无未映射 REPLICA 版本（bucket={bucket} key={key}）");
+        } else {
+            for r in &rows {
+                println!(
+                    "{} etag={} size={} latest={} modified={}",
+                    r.version_id, r.etag, r.size, r.is_latest, r.last_modified
+                );
+            }
+        }
+        audit
+            .write_audit(
+                0,
+                "control:replica-reconcile-list",
+                Some(&bucket),
+                Some(&key),
+                "allow",
+                Some(&format!("unmapped={}", rows.len())),
+            )
+            .await
+            .ok();
+        return Ok(0);
+    }
+    match crate::replication::delete_unmapped_replicas(
+        &db, &store, &tier_gc, &bucket, &key, &delete, apply,
+    )
+    .await
+    {
+        Ok(r) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!(
+                    "dry_run={} deleted={} already_absent={} failed={}",
+                    r.dry_run,
+                    r.deleted.len(),
+                    r.already_absent.len(),
+                    r.failed.len()
+                );
+                for f in &r.failed {
+                    eprintln!("{}: {}", f.version_id, f.error);
+                }
+            }
+            audit
+                .write_audit(
+                    0,
+                    if r.dry_run {
+                        "control:replica-reconcile-dry-run"
+                    } else {
+                        "control:replica-reconcile-delete"
+                    },
+                    Some(&bucket),
+                    Some(&key),
+                    "allow",
+                    Some(&format!(
+                        "requested={} deleted={} already_absent={} failed={}",
+                        delete.len(),
+                        r.deleted.len(),
+                        r.already_absent.len(),
+                        r.failed.len()
+                    )),
+                )
+                .await
+                .ok();
+            Ok(if r.failed.is_empty() { 0 } else { 1 })
+        }
+        Err(e) => {
+            audit
+                .write_audit(
+                    0,
+                    "control:replica-reconcile-refused",
+                    Some(&bucket),
+                    Some(&key),
+                    "deny",
+                    Some(&e.to_string()),
+                )
+                .await
+                .ok();
+            Err(e.into())
+        }
+    }
+}
+
 /// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；
 /// 写失败只警告，不掩命令结论。
 fn dump_report(state: &AppState, kind: &str, report: &impl serde::Serialize) {
@@ -1227,6 +1394,47 @@ mod tests {
                 json: false,
             })
         );
+        assert_eq!(
+            parse_args(&args(&[
+                "replica-reconcile",
+                "--bucket",
+                "b",
+                "--key",
+                "k",
+                "--delete",
+                "v1,v2",
+                "--apply",
+            ])),
+            Ok(Command::ReplicaReconcile {
+                bucket: "b".into(),
+                key: "k".into(),
+                delete: vec!["v1".into(), "v2".into()],
+                apply: true,
+                json: false,
+            })
+        );
+        // 列表模式：无 --delete 合法；--apply 却未点名版本 = 用法错误（绝不自动选择）。
+        assert_eq!(
+            parse_args(&args(&["replica-reconcile", "--bucket=b", "--key=k"])),
+            Ok(Command::ReplicaReconcile {
+                bucket: "b".into(),
+                key: "k".into(),
+                delete: vec![],
+                apply: false,
+                json: false,
+            })
+        );
+        assert!(
+            parse_args(&args(&[
+                "replica-reconcile",
+                "--bucket",
+                "b",
+                "--key",
+                "k",
+                "--apply"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1291,6 +1499,13 @@ mod tests {
             Command::SyncReconcile {
                 repair: false,
                 bucket: None,
+                json: false,
+            },
+            Command::ReplicaReconcile {
+                bucket: "b".into(),
+                key: "k".into(),
+                delete: vec![],
+                apply: false,
                 json: false,
             },
         ] {

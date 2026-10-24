@@ -6,7 +6,8 @@ mod export;
 mod recover;
 
 pub use export::{
-    EXPORT_FORMAT, EXPORT_KIND, ExportFile, build_export, read_export, verify_export, write_export,
+    EXPORT_FORMAT, EXPORT_KIND, ExportFile, build_export, install_activation_level, read_export,
+    verify_export, write_export,
 };
 pub use recover::{ForceRecoverReport, force_recover};
 
@@ -252,14 +253,15 @@ pub async fn cutover(
     opts: &CutoverOptions,
 ) -> Result<CutoverReport, CutoverError> {
     verify_export(export).map_err(CutoverError::Invalid)?;
-    // 基线必须可编码为快照（含 config_json → OSSCTL2），否则成员加入/force-recover/
-    // 回滚会在建快照时失败。要求级别随 install 在同一事务写入 marker（dry-run 不写）。
-    data::encode_snapshot(&export.data).map_err(|e| {
+    // 基线必须可编码为快照（激活级别或 config_json → OSSCTL2），否则成员加入/
+    // force-recover/回滚会在建快照时失败。激活级别随 install 在同一事务写入 marker
+    // （dry-run 不写）。来源激活过的集群即使无 level-2 数据也必须保持激活。
+    let activation = install_activation_level(export);
+    data::encode_snapshot_at(&export.data, activation).map_err(|e| {
         CutoverError::Invalid(format!(
             "export cannot be snapshotted as control baseline: {e}"
         ))
     })?;
-    let required = data::required_feature_level(&export.data);
     if export.source_role != "voter" {
         return Err(CutoverError::Invalid(
             "witness export cannot be used for cutover".into(),
@@ -345,9 +347,9 @@ pub async fn cutover(
     let installed = data::install_tx(&mut tx, &export.data, &ctx)
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
-    // level-2 基线：marker 与数据同事务激活（只升不降）；启动守卫要求 feature_level=2。
-    if required > super::compat::MIN_FEATURE_LEVEL {
-        super::compat::bump_activation_tx(&mut tx, required)
+    // 来源激活级别与数据同事务写入（只升不降）；启动守卫要求 feature_level>=该级别。
+    if activation > super::compat::MIN_FEATURE_LEVEL {
+        super::compat::bump_activation_tx(&mut tx, activation)
             .await
             .map_err(|e| CutoverError::Db(e.to_string()))?;
     }

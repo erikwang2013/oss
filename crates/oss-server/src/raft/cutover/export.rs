@@ -1,6 +1,7 @@
 //! 控制面导出文件：读取 11 张复制表，生成带校验和的 JSON（只读；不重放 schema/模式）。
 //!
-//! 封套带来源 provenance（`snapshot_format`/`wire_version`/`feature_level`/`source_build`）。
+//! 封套带来源 provenance（`snapshot_format`/`wire_version`/`feature_level`/
+//! `activation_level`/`source_build`）。
 //! [`verify_export`] 在 cutover（含 dry-run）与 force-recover 动数据之前拒绝本机无法
 //! 解码/无法应用来源导出。LC-0 之前写出的旧导出缺这些字段：载荷仍按冻结的
 //! `ControlData` 完整解码，按「未验证」接受并发警告（不静默放行伪造的显式字段）。
@@ -29,6 +30,10 @@ pub struct ExportFile {
     /// 来源数据自身要求的级别更高时取 max（与 `encode_snapshot_at` 一致）。
     #[serde(default)]
     pub feature_level: Option<u8>,
+    /// 导出时来源节点的激活标记原值（不经数据要求取 max）。v1.16 及更早的封套没有
+    /// 本字段：恢复时回落到 `feature_level`；激活过但无 level-2 数据的集群靠它保持 2。
+    #[serde(default)]
+    pub activation_level: Option<u8>,
     /// 导出时来源二进制会写出的快照封套号：1=OSSCTL1，2=OSSCTL2。
     #[serde(default)]
     pub snapshot_format: Option<u32>,
@@ -78,6 +83,7 @@ pub async fn build_export(
         source_role: source_role.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         feature_level: Some(feature_level),
+        activation_level: Some(marker),
         snapshot_format: Some(snapshot_format),
         wire_version: Some(compat::WIRE_VERSION),
         source_build: Some(
@@ -153,6 +159,42 @@ fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
                 "source feature_level {level} is below the level-{required} data in the export"
             ));
         }
+        // OSSCTL1 封套没有 feature/activation 概念：格式 1 带 level>1 只能是伪造或损坏。
+        if export.snapshot_format == Some(1) && level > compat::MIN_FEATURE_LEVEL {
+            return Err(format!(
+                "source snapshot_format 1 (OSSCTL1) cannot record feature_level {level}"
+            ));
+        }
+    }
+    if let Some(activation) = export.activation_level {
+        if !(compat::MIN_FEATURE_LEVEL..=compat::MAX_FEATURE_LEVEL).contains(&activation) {
+            return Err(format!(
+                "source activation_level {activation} outside supported {}..={}",
+                compat::MIN_FEATURE_LEVEL,
+                compat::MAX_FEATURE_LEVEL
+            ));
+        }
+        // activation < 数据要求是「标记滞后」而非越权：安装级别取 max(activation, required)
+        // （保守升到数据要求），不拒绝——build_export 对这类库仍须产出可自校验的导
+        // 出（来源快照按 max 编码，见 encode_snapshot_at）。
+        if export.snapshot_format == Some(1) && activation > compat::MIN_FEATURE_LEVEL {
+            return Err(format!(
+                "source snapshot_format 1 (OSSCTL1) cannot record activation_level {activation}"
+            ));
+        }
+        // 两个 provenance 字段一起写；单独出现 = 不一致（fail closed，不猜）。
+        let Some(level) = export.feature_level else {
+            return Err(
+                "export carries activation_level without feature_level (inconsistent provenance)"
+                    .into(),
+            );
+        };
+        if activation > level {
+            return Err(format!(
+                "source activation_level {activation} exceeds feature_level {level} \
+                 (inconsistent provenance)"
+            ));
+        }
     }
     let mut missing = Vec::new();
     if export.snapshot_format.is_none() {
@@ -172,6 +214,18 @@ fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
          (payload decodes fully; data requires level {required})",
         missing.join(", ")
     )])
+}
+
+/// 割接/恢复后目标节点必须保持的激活级别：新封套用 `activation_level`（来源 marker
+/// 原值），v1.16 封套回落到 `feature_level`（= max(激活, 数据要求)），LC-0 前的旧导出
+/// 两者都缺 → 数据要求。调用前必须已通过 [`verify_export`]。
+pub fn install_activation_level(export: &ExportFile) -> u8 {
+    let required = data::required_feature_level(&export.data);
+    export
+        .activation_level
+        .or(export.feature_level)
+        .unwrap_or(required)
+        .max(required)
 }
 
 pub fn write_export(path: &Path, export: &ExportFile) -> std::io::Result<()> {

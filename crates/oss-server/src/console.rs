@@ -212,6 +212,11 @@ pub fn routes() -> Router<AppState> {
             "/buckets/{bucket}/objects/{*key}",
             get(get_object).delete(delete_object),
         )
+        // M7 遗留未映射 REPLICA 的人工对账（管理员；只列/点名删，绝不按内容自动清理）
+        .route(
+            "/buckets/{bucket}/replica-reconcile",
+            get(list_replica_reconcile).post(delete_replica_reconcile),
+        )
         // M8 S6 缺口 A：对象标签（链尾版本）
         .route(
             "/buckets/{bucket}/tags/{*key}",
@@ -2916,6 +2921,140 @@ async fn delete_object(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => store_error(e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicaReconcileQuery {
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicaReconcileDeleteBody {
+    key: String,
+    version_ids: Vec<String>,
+    /// 缺省 true：只有显式 `"dry_run": false` 才真删（与 CLI 的 --apply 同口径）。
+    #[serde(default = "replica_reconcile_dry_run_default")]
+    dry_run: bool,
+}
+
+fn replica_reconcile_dry_run_default() -> bool {
+    true
+}
+
+/// `GET /api/v1/buckets/{bucket}/replica-reconcile?key=K`（管理员）：
+/// 列出该键的未映射 REPLICA 版本（升级前复制、无 origin id）。
+async fn list_replica_reconcile(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    Query(q): Query<ReplicaReconcileQuery>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match crate::replication::list_unmapped_replicas(&state.store, &bucket, &q.key).await {
+        Ok(versions) => {
+            state
+                .audit(
+                    uid,
+                    "control:replica-reconcile-list",
+                    Some(&bucket),
+                    Some(&q.key),
+                    Some(&format!("unmapped={}", versions.len())),
+                )
+                .await;
+            Json(serde_json::json!({
+                "bucket": bucket,
+                "key": q.key,
+                "unmapped_replicas": versions,
+            }))
+            .into_response()
+        }
+        Err(e) => replica_reconcile_error(e),
+    }
+}
+
+/// `POST /api/v1/buckets/{bucket}/replica-reconcile`（管理员）：
+/// `{key, version_ids, dry_run=true}`。只删显式点名的未映射 REPLICA 版本；任一 id
+/// 不匹配 → 整批 409 且不删任何版本。
+async fn delete_replica_reconcile(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(bucket): Path<String>,
+    Json(body): Json<ReplicaReconcileDeleteBody>,
+) -> Response {
+    let uid = match admin_of(&state, &payload).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let apply = !body.dry_run;
+    match crate::replication::delete_unmapped_replicas(
+        &state.db,
+        &state.store,
+        state.tier_gc.as_ref(),
+        &bucket,
+        &body.key,
+        &body.version_ids,
+        apply,
+    )
+    .await
+    {
+        Ok(report) => {
+            state
+                .audit(
+                    uid,
+                    if report.dry_run {
+                        "control:replica-reconcile-dry-run"
+                    } else {
+                        "control:replica-reconcile-delete"
+                    },
+                    Some(&bucket),
+                    Some(&body.key),
+                    Some(&format!(
+                        "requested={} deleted={} already_absent={} failed={}",
+                        body.version_ids.len(),
+                        report.deleted.len(),
+                        report.already_absent.len(),
+                        report.failed.len()
+                    )),
+                )
+                .await;
+            Json(report).into_response()
+        }
+        Err(e) => {
+            state
+                .audit(
+                    uid,
+                    "control:replica-reconcile-refused",
+                    Some(&bucket),
+                    Some(&body.key),
+                    Some(&e.to_string()),
+                )
+                .await;
+            replica_reconcile_error(e)
+        }
+    }
+}
+
+fn replica_reconcile_error(e: crate::replication::ReconcileError) -> Response {
+    use crate::replication::ReconcileError as E;
+    match e {
+        E::Invalid(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+        E::Unknown(unknown) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "refused: version ids are not unmapped REPLICA versions of this key",
+                "unknown_version_ids": unknown,
+                "deleted": [],
+            })),
+        )
+            .into_response(),
+        E::Store(e) => {
+            let (code, msg) = store_error(e);
+            (code, msg).into_response()
+        }
     }
 }
 
