@@ -32,6 +32,13 @@ Parquet/Hive、tier 本地盘/GC、生命周期全 Filter、Batch WASM）、M9 L
 生命周期游标、Inventory 增量/跨账户目标、AbortMPU；以及 Level B 生命周期命令门控/快照 guard
 热修。最终闸门与证据见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §8–§11。
 
+**v1.16.0 候选（未发布）**：Select BZIP2；STS `AssumeRoleWithWebIdentity`；CMK 安全删除与
+逐版本 rewrap；M3 MPU 跨节点属主路由/流式转发；OSSCTL2 快照与 LC-0 导出/cutover/force-recover
+来源校验；M6 `site_token` 远端的同源版本/版本删除/元数据与 M7 同源定向删除；TLS mesh gRPC
+客户端与 Kafka 客户端热加载；Batch 协作抢占与跨账户清单；M8 单例任务 leader 门控；tier 暂存
+清扫/磁盘预留/0600；AP 可信对端 CIDRS（纯 HTTP 反代需 TLS 监听器）。完整证据与仍然阻塞的
+架构项见验收记录 §12 与 `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
+
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
   s3s 的 S3 trait 实现到内核上；`xl-proto` 是节点间 gRPC 协议消息与 service（prost + tonic-build
@@ -68,8 +75,9 @@ C3 建桶缺省自动指派负载最小的 set）· 登录限速（C1：账号 1
 多钥 KMS 目录）· 加密数据面（切片 2，先加密后 EC 的 DARE 式块对齐 AES-256-GCM）· S3 面
 SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁 GOVERNANCE / COMPLIANCE / Legal Hold +
 桶级默认保留规则（切片 4）· STS 临时凭据 AssumeRole/GetSessionToken + 会话策略交集（切片 5）·
-`access_keys.secret_key` 信封加密 + 存量透明迁移（切片 6）。**WebIdentity 经成本评估裁剪延后**
-（需出站 TLS 客户端新依赖栈；验收 ①–⑤ 不涉；记档于 M5 计划——用户知悉项）。
+`access_keys.secret_key` 信封加密 + 存量透明迁移（切片 6）· **AssumeRoleWithWebIdentity**
+（OIDC JWKS 本地文件、RS256/ES256、iss/aud/kid/exp 严格校验、RoleArn→claim 值精确映射；
+默认关闭，见「STS」）。
 已实现（M6 数据流）：事件通知（S3 通知配置 + Kafka，至少一次 outbox）· S3 Select（CSV/JSON、
 SQL 白名单、ScanRange、Progress/Stats 帧）· 桶复制（规则 API、9 写入口入队、SigV4 出站、
 PENDING→COMPLETED/FAILED、停机积压追平）。
@@ -89,9 +97,10 @@ PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagg
 `TierState`、Archived/Restoring phase gate → 403 `InvalidObjectState`、远端 S3 与本地冷盘池
 tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
 管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
-**不在 M8**（记档非目标）：跨站点强一致（M9）· `AssumeRoleWithWebIdentity` · SSE-KMS 显式
-CMK/多钥轮换（3.16 已补：显式 CMK + 命名环轮换，见「加密」）· AP 跨账号/VPC 端点（AP 匿名已支持，见「访问点」）· Inventory 跨账号投递
-（3.7 已补：跨账户目标仅管理员可配置，见「Inventory」）· Batch 抢占/跨账号清单。
+**不在 M8**（记档非目标）：跨站点强一致（M9）· AP 跨账号/VPC 端点（AP 匿名已支持，见
+「访问点」）· 完整多租户账户体系。已补：SSE-KMS 显式 CMK/命名环轮换与删除/rewrap（见
+「加密」）· Inventory 跨账户目标（3.7，仅管理员可配置）· Batch 抢占/跨账号清单 ·
+`AssumeRoleWithWebIdentity`（见「STS」）。
 已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
 origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
 （内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
@@ -413,8 +422,10 @@ CA 轮换不依赖同时呈现两张叶证书，而是先让**旧+新 CA 在双�
 - 轮询 `reload_interval_secs`（默认 30s，最小 1s，0=关闭）比较文件**内容哈希**，变化才重建；
   `SIGHUP` 立即触发；1 秒内的重复触发合并（防 SIGHUP 洪水）。
 - 新物料读取/解析/构建失败时保留旧物料并记 error；日志只记证书 SHA-256 指纹，不记私钥。
-- 新连接使用新配置，已建立连接继续用旧配置直到自然结束；mesh gRPC 不在热加载范围，
-  用逐节点滚动重启完成第 2/4 步。
+- 新连接使用新配置，已建立连接继续用旧配置直到自然结束。主监听器、出站 reqwest/rustls、
+  Raft 客户端、**mesh gRPC 客户端通道**与 **Kafka TLS 客户端**均按成功 reload 的代次重建；
+  在途请求持有旧 client 完成。mesh gRPC **服务端监听器**仍取启动快照（ServerTlsConfig
+  无法原地替换），第 2/4 步对入站 mesh 仍需逐节点滚动重启；Kafka SASL 仍是启动期配置。
 
 ## 集群模式（M3）
 
@@ -471,7 +482,12 @@ scrape_configs:
 ```
 
 **已知边界（M3）**：
-- 分块上传（MPU）会话**粘节点**：同一 upload 的后续请求须回到发起节点。
+- 分块上传（MPU）会话**跨节点可路由**：集群 Create 返回
+  `<base64url(node_id)>.<uuid>`，后续 UploadPart/Complete/Abort/ListParts 在任意节点经 mesh
+  流式转发到属主（1 MiB 分块、SSE-C 钥仅内网传输）；属主不可达 → 503，未知属主 → 503。
+  单机/升级前的裸 UUID 与存量 upload 仍是本地属主，滚动升级期间需原节点亲和；混合版本集群
+  没有跨版本 MPU 转发（fail-closed）。Complete 响应丢失后重试得到 `NoSuchUpload` 属标准
+  S3 语义，不会双提交。
 - 节点间锁无写入侧 fencing：租约 TTL 远大于单写操作；兜底是版本 uuid 隔离（交错写最多留孤儿目录，
   由各节点 clean 回收，已提交数据不损坏）。
 - 控制面（账号/权限）**读扇出**：任一节点铸造的 AK 全集群可用；写入仍只落本节点
@@ -698,11 +714,17 @@ C2）。
   单钥文件 provider 直接换文件会让旧 `key_id="file"` 的包裹不可解（**先迁到 KMS 目录再轮换**）。
 - **命名 CMK 与轮换（3.16）**：命名环位于 `OSS_KMS_DIR/cmk/<name>/key-<n>.bin`（每环独立轮换，
   名即路径白名单）；管理 API 为 `GET/POST /api/v1/encryption/cmks` 与
-  `POST /api/v1/encryption/cmks/{name}/rotate`（admin-only，**无删除**——删除有活对象的 CMK
-  等于数据丢失，crypto-shredding 需单独的 rewrap 作业）。轮换只影响**新写入**，旧版本保留供解密
-  （与 AWS KMS 不重加密旧密文同口径）；审计只记名/版本/指纹，绝不记钥字节。旧二进制读到
-  CMK 对象、CMK 桶默认值或 `sse-kms:<name>` MPU kind 会失败关闭（500，不 promise 滚动兼容）；
-  多节点须共享同一 KMS 目录，缺失 CMK 的节点一律 4xx/5xx，绝不降级明文。
+  `POST /api/v1/encryption/cmks/{name}/rotate`（admin-only）。轮换只影响**新写入**，旧版本保留
+  供解密（与 AWS KMS 不重加密旧密文同口径）；审计只记名/版本/指纹，绝不记钥字节。
+- **CMK 删除与 rewrap（v1.16 候选）**：`DELETE /api/v1/encryption/cmks/{name}[?force=true]`
+  先做本地全引用扫描；任何活引用（含 force）→ 409 并返回引用列表；干净路径原子移入
+  `.cmk-trash` → 等待写者静默/复扫 → 清除，超时或竞态则恢复。`POST
+  /api/v1/encryption/cmks/{name}/rewrap` 按版本把旧 CMK 密文重加密到当前版本（默认 dry-run；
+  `apply/limit/cursor/bucket`），保留字节/ETag/version-id/元数据/标签，单次 meta 翻转；锁定/
+  分层/无 SHA-256 的版本显式阻止。**限制**：引用扫描与 rewrap 都是本地节点口径，集群须逐节点
+  执行（或离线 force）；桶默认加密配置不扫描；无 CLI；purge 失败可能残留 `.cmk-trash`。
+  旧二进制读到 CMK 对象、CMK 桶默认值或 `sse-kms:<name>` MPU kind 会失败关闭（500，不 promise
+  滚动兼容）；多节点须共享同一 KMS 目录，缺失 CMK 的节点一律 4xx/5xx，绝不降级明文。
 - **SK 加密存（M5）**：`access_keys.secret_key` 同样信封加密（`enc:v1:` 前缀，AAD 域分隔，
   每行独立 DEK；kms 目录优先、单钥文件兜底）——**两处写点**（控制台建键、STS 签发）与**读侧
   透明迁移**（存量明文行被读到即原地重写为密文）；集群下密文过网、消费端解密（mesh 不出现
@@ -777,8 +799,12 @@ aws --endpoint-url http://127.0.0.1:9000 sts get-session-token --duration-second
   信任链差异）；错误响应用 S3 错误 XML（非 STS `ErrorResponse` 形态，成功路径 aws-cli 直用）；
   GET query 形（`?Action=`）不接；时长越界报 400 `InvalidArgument`（AWS 为 `ValidationError`）；
   会话**只对 S3 面**生效（控制台/aether 走 JWT，无 AK 入口）；过期会话行不自动清理（自然不可用）。
-- **AssumeRoleWithWebIdentity：裁剪延后**（成本评估：JWKS 拉取需出站 TLS 客户端新依赖栈；
-  验收 ①–⑤ 不涉及；记档于 M5 计划，接入点已留——`StsRoute` 动作分发 + `check_access` 匿名覆写）。
+- **AssumeRoleWithWebIdentity**：默认关闭；启用需 `[sts.web_identity]` 的 `issuer`、`audience`、
+  `jwks_file`（只读本地文件，不拉 URL，无 SSRF）、`max_duration_seconds` 与
+  `[[sts.web_identity.roles]]` 映射。JWT 只接受 RS256/ES256，严格校验 kid/iss/aud/exp/nbf/iat、
+  token ≤16 KiB；RoleArn 的 `role/<name>` 必须是已有活跃用户，claim 只支持 `sub`/`email` 且值
+  精确匹配（无通配）。该 Action 免 AK/SK；其余 STS Action 仍强制签名。JWKS 轮换需重启，
+  `email_verified` 未额外校验，匿名端点建议前置限流。
 
 ## 事件通知（M6）
 
@@ -839,16 +865,18 @@ aws --endpoint-url http://127.0.0.1:9000 s3api select-object-content \
   `count(*)/sum/min/max/avg`（不支持 GROUP BY；聚合须独占投影）。CSV 列 `s._1`；JSON 路径 `s.a.b`。
 - 输入：CSV 分隔符/引号/转义/记录分隔符/注释（缺省 `#`）/表头可配；`AllowQuotedRecordDelimiter`
   缺省 false。ScanRange 按「记录首字节落在区间内则整条处理」；仅给 End = 扫描末尾 N 字节；
-  GZIP 与 ScanRange 互斥；JSON DOCUMENT 不支持 ScanRange。Parquet 逐行按列名映射为 JSON
+  GZIP/BZIP2 与 ScanRange 互斥；JSON DOCUMENT 不支持 ScanRange。BZIP2 仅用于 CSV/JSON 输入
+  （多流拼接支持，预算按解压后字节计）。Parquet 逐行按列名映射为 JSON
   对象（`s.col` / `s.a.b`；`SELECT *` 输出整行对象；`_N` 位置列不可用）；文件内部压缩由
   parquet 库解码（SNAPPY/未压缩），请求的 `CompressionType` 必须 `NONE` 且不接受
   ScanRange（违反 → 400）。
 - 输出：Records ≤256KiB 分片 + Progress（约 1MiB 节奏，`--request-progress`）+ Stats + End；
   Stats 三计数独立（`BytesScanned` 原始/压缩后、`BytesProcessed` 送入求值器、`BytesReturned` 输出）。
-- 上限/边界（记档）：对象 ≤256MiB、GZIP/Parquet 解压 ≤512MiB（全量缓冲，无并发预算；Parquet 以
-  行组 `total_byte_size` 合计计，页头与元数据不一致的恶意文件不受该预算约束——parquet 库按
-  页头预分配，已认证用户可造成瞬时内存压力，与既有全量缓冲/无并发预算同风险面）；BZIP2
-  返回 400（工作区无 bzip2 依赖，后置）；Parquet 的 `BytesScanned` 记压缩后文件字节；CRLF
+- 上限/边界（记档）：对象 ≤256MiB、GZIP/BZIP2/Parquet 解压 ≤512MiB（全量缓冲，无并发预算；
+  Parquet 以行组 `total_byte_size` 合计计，页头与元数据不一致的恶意文件不受该预算约束——
+  parquet 库按页头预分配，已认证用户可造成瞬时内存压力，与既有全量缓冲/无并发预算同风险面）；
+  BZIP2 仅接受 CSV/JSON 输入（`CompressionType=BZIP2`，多流拼接；不是输出格式），Parquet 的
+  请求 `CompressionType` 必须 `NONE`；Parquet 的 `BytesScanned` 记压缩后文件字节；CRLF
   保留 `\r`；空 CSV 字段进 sum/avg 报 400；LIKE 模式 ≤4096 字节。
 
 ## 桶复制（M6）
@@ -882,10 +910,15 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-replication --bucket s
   R1 分级重试（连接/408/429/5xx 永不放弃、其余 4xx 永久、>10 次死信）；积压写入 `repl_outbox`，
   目标恢复后自动追平。间隔 `OSS_REPL_INTERVAL_SECS`（默认 1；0=关）。
 - 限速按远端独立令牌桶（`[[remotes]].max_bytes_per_sec`）；缺省不限速，旧配置零改动。
-- 边界（记档）：目标桶/主题需**预创建**；SSE-C 源对象不可复制（客户钥不落盘）；版本定向删除
-  不投递 M6 远端（远端版本 id 由目标生成，无映射；站点对见 M7 节）；`Priority` 不生效
-  （不同目的地都会复制）；MPU 源 ETag 目标重算（不做 ETag 断言）；单对象整读入内存
-  （≤16 并发）；`Role` 不参与鉴权。
+- **M6 载荷/版本删除（v1.16 候选）**：所有 M6 远端现在携带与站点路径一致的 content-type、
+  用户元数据、标签、存储类、checksum、SSE、对象锁与 part-sizes。可选
+  `[[remotes]].site_token`（留空 = 旧语义不变）让远端使用 M7 同源版本 id + `DELETE
+  ?versionId=`（REPLICA/token/origin-id/bypass、目标 404 幂等、同版本保序）与目标 versioning
+  预检；token 远端要求目标桶 versioning=Enabled 且对端支持 origin-id。
+- 边界（记档）：目标桶/主题需**预创建**；SSE-C/SSE-KMS 源对象永久死信（不发出请求，防明文
+  降级）；无 `site_token` 的 M6 远端仍不投递版本定向删除（版本 id 由目标生成）；
+  `Priority` 不生效；MPU 源 ETag 目标重算（不做 ETag 断言）；单对象整读入内存（≤16 并发）；
+  `Role` 不参与鉴权。归档存储类与对象锁在 oss 目标可能被直写规则拒绝（与 M7 同口径，死信）。
 
 ## 多站点复制（M7）
 
@@ -926,15 +959,17 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   版本（`x-amz-bypass-governance-retention: true`；目标 404 视为已删），若同 (bucket,key,version)
   的更早出站行仍未结算则先等待，避免删除被重试 PUT 复活。同版本多目标聚合
   PENDING→COMPLETED/FAILED。
-- **边界（记档）**：对端地址 http/https 均可（peer TLS 见 TLS 节）；单节点站点对；混跑旧版本时，
-  升级前已复制的异步版本两端 UUID 不同，对这些历史版本的定向删除在目标按同 id 找不到，按「已删」
-  幂等成功，两端可能不一致——站点对建议同版本升级或接受该窗口；非空桶删除不生效（保留行与数据，
-  记死信）；标签/存储类/checksum/对象锁随站点 PUT 复制（已到期 retention 不再下发、legal hold
-  保留；归档类 GLACIER/DEEP_ARCHIVE 不复制——归档态不可读、目标直写拒绝）；仅 SSE-S3 以 AES256
-  复制、目标用本地主密钥重新封装；SSE-C 与 SSE-KMS 源永久错（死信，不发出请求——SSE-C 客户钥
-  不落盘；SSE-KMS `key_id` 为站点本地主密钥、key 材料不跨站，目标拒绝显式 CMK，绝不静默换钥或
-  降级明文）；
-  M6 远端复制仍不携带以上对象元数据、且不投递版本定向删除；
+- **混合版本历史副本（v1.16 候选）**：升级前已复制的历史异步版本两端 UUID 不同，且未映射
+  副本没有来源身份。安全评审确认按 `(etag,size)` 自动删除可能误删共享目标上另一来源的
+  同内容副本，因此**不做内容指纹自动删除**；同源 `remote_version_id` 定向删除与 404 幂等
+  不变。未映射 legacy 副本保留，需人工对账/清理；升级前已发生的删除不回溯。
+- **边界（记档）**：对端地址 http/https 均可（peer TLS 见 TLS 节）；单节点站点对；非空桶删除
+  不生效（保留行与数据，记死信）；标签/存储类/checksum/对象锁随站点 PUT 复制（已到期 retention
+  不再下发、legal hold 保留；归档类 GLACIER/DEEP_ARCHIVE 不复制——归档态不可读、目标直写拒绝）；
+  仅 SSE-S3 以 AES256 复制、目标用本地主密钥重新封装；SSE-C 与 SSE-KMS 源永久错（死信，不发出
+  请求——SSE-C 客户钥不落盘；SSE-KMS `key_id` 为站点本地主密钥、key 材料不跨站，目标拒绝显式
+  CMK，绝不静默换钥或降级明文）；
+  M6 远端需配置 `site_token` 才具备同源 id/版本删除/载荷元数据；无 token 的旧远端保持旧语义；
   AK 密文需两端同主密钥（配对只校验 vault 开关一致，不校验同一把钥）；控制面最终一致（无强一致，
   归 M9）；端点/凭据明文存储；`priority` 仅在**同秒**裁决（新 ts 的低优先级仍胜旧 ts 的高优先级——
   与早期规格「按优先级裁决」有偏差）；解配期间的本地控制面改动不被捕获，且对端快照可能在重配对时
@@ -1026,18 +1061,21 @@ aws --endpoint-url $E s3api get-object --bucket ap-one --key k out   # 实际走
   运行期加载失败 500（不当作无策略）。**保存时拒绝** AP 无法执行的桶级动作
   `s3:CreateBucket` / `s3:DeleteBucket` / `s3:ListAllMyBuckets`（精确动作；`s3:*` 等通配
   仍允许）——此前这些动作被接受但永远不生效。
-  SourceIp 对端来自连接地址；ecat 内置 listener 无 connect_info，反代部署须显式设置
-  `OSS_AP_TRUSTED_PROXY=1` 才采信 `X-Forwarded-For`。信任模型：`OSS_AP_TRUSTED_PROXY_HOPS`
-  （默认 1 = 最右一跳，向后兼容）取右起第 N 跳；或 `OSS_AP_TRUSTED_PROXY_CIDRS`（逗号分隔
-  CIDR）从右向左跳过可信代理，取第一个非可信地址。仅单行 XFF、每项必须是合法 IP；重复
-  IP/重复头行/任一项格式非法 → 视为无对端（fail-closed）。反代须**覆盖**而非透传客户端
-  自带的 XFF。**IP 条件无法求值（默认不信任且无对端）时：Deny 语句命中（fail-closed），
-  Allow 语句不命中**——缺对端绝不会静默放过 `Deny NotIpAddress`。
+  SourceIp 对端来自连接地址；反代部署须设置 `OSS_AP_TRUSTED_PROXY=1` 且直连对端必须命中
+  **`OSS_AP_TRUSTED_PEER_CIDRS`**（逗号分隔 CIDR）才采信 `X-Forwarded-For` /
+  `x-oss-source-vpc`；未设置该变量、对端不匹配、无 ConnectInfo 或链格式非法一律不信任
+  （fail-closed）。信任模型：`OSS_AP_TRUSTED_PROXY_HOPS`（默认 1 = 最右一跳）取右起第 N 跳；
+  或 `OSS_AP_TRUSTED_PROXY_CIDRS`（逗号分隔 CIDR）从右向左跳过可信代理，取第一个非可信地址。
+  仅单行 XFF、每项必须是合法 IP；重复 IP/重复头行/任一项格式非法 → 视为无对端。
+  **纯 HTTP ecat listener 不提供 ConnectInfo，无法建立该信任链**；只有 TLS
+  `ReloadableHttpServer` 路径注入 ConnectInfo。反代须**覆盖**而非透传客户端自带的 XFF。
+  **IP 条件无法求值（默认不信任且无对端）时：Deny 语句命中（fail-closed），Allow 语句不命中**
+  ——缺对端绝不会静默放过 `Deny NotIpAddress`。
 - **`aws:SourceVpc` 是来源证明，不是 PrivateLink 端点身份**：设置 `OSS_AP_VPC_ID`
   （`vpc-`/`vpce-` + [a-z0-9-]{1,64}）时作为进程级静态证明，请求头一律不采信；未设置时
-  仅当 `OSS_AP_TRUSTED_PROXY=1` 才采信**恰好一条** `x-oss-source-vpc` 头（重复/畸形/未
-  信任 → 无证明）。反代必须覆盖客户端自带的同名头。条件无法求值（无证明）时同 IP 条件：
-  Deny 命中、Allow 不命中（fail-closed）。
+  仅当 `OSS_AP_TRUSTED_PROXY=1` 且直连对端命中 `OSS_AP_TRUSTED_PEER_CIDRS` 才采信
+  **恰好一条** `x-oss-source-vpc` 头（重复/畸形/未信任 → 无证明）。反代必须覆盖客户端
+  自带的同名头。条件无法求值（无证明）时同 IP 条件：Deny 命中、Allow 不命中（fail-closed）。
 - **账户命名空间 v1**：AP ARN 的账户段 = **桶主**的 12 位 uid 派生账户
   （`arn:aws:s3:<region>:<account>:accesspoint/<name>/...`）；admin 所有/无主桶使用系统账户
   `000000000000`。旧 AP ARN 的 `000000000000` 账户段保留一版作资源别名，已保存的旧策略
@@ -1121,7 +1159,14 @@ curl -s -X POST $E/api/v1/jobs/1/retry-failed -H "authorization: Bearer $JWT"  #
   `taskId,bucket,key,versionId,resultCode,resultString,startTime,endTime`；仅已启动任务入报告；
   `Succeeded`/`PermanentFailure`；时间 `%Y-%m-%dT%H:%M:%SZ`。
 - `retry-failed` 建子作业（`parent_job_id`，仅失败任务），父报告不被改写；无失败项 → 409。
-- 边界：无抢占、无跨账号清单；作业终态 `done`/`error`/`cancelled`（有失败即 `error`）。
+- **抢占**：容量满且**同一提交者**存在严格更高优先级的就绪任务时，低优先级运行中作业标记
+  `preempted`；只在 claim→execute 安全边界生效（在途动作不打断），未执行任务回队且不消耗
+  重试/不重复副作用，高优先级队列清空后回到 `queued`。优先级限定 `-100..=100`（越界 400），
+  跨提交者不抢占（防跨租户 DoS）。单节点协作式，调度粒度默认 2s；`OSS_JOB_WORKERS=0` 关闭。
+- **跨账户清单**：非管理员只能使用与自身派生账户相同的清单桶且需读权限；管理员可跨账户；
+  授权在 HEAD/GET 清单前判定，桶策略显式 Deny 同样约束管理员。
+- 边界：作业终态 `done`/`error`/`cancelled`（有失败即 `error`），运行期另有 `preempted`；
+  控制台作业页暂未展示 `preempted` 样式。
 
 ### Inventory（S5）
 
@@ -1254,25 +1299,33 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 
 ### M8 已知边界（在案）
 
-1. 控制面单节点：AP 缓存、作业引擎、Inventory 调度、tier reaper 均按单进程；多节点共享
-   SQLite 不支持。IAM/桶/策略等 11 张控制表在 `[site]+[raft]` 模式下由 M9 Raft 强一致；
-   其余 M8 状态仍单节点。
+1. 控制面：IAM/桶/策略等 11 张控制表在 `[site]+[raft]` 模式下由 M9 Raft 强一致。作业/
+   Inventory/tier/生命周期等**单例后台任务已做 leader 门控**（仅 leader 领取/调度，切换后新
+   leader 续跑；单机/M7 无门控）；但 `job_tasks`、inventory runs/游标、tier restore、
+   生命周期游标等**运行状态仍是节点本地**，无 fencing epoch/跨节点复制——多节点共享 SQLite
+   仍是错误部署；failover 依赖租约/孤儿回收，按节点本地行恢复。AP 缓存仍是进程内。
 2. AP 支持 `/ap/<name>` 与 `<name>-s3alias`（路径/Host）；匿名经 AP 需 AP 策略
    `Principal:"*"` 与桶策略匿名基线同时放行；无跨账号/VPC 端点；不支持
    ListBuckets/Create/DeleteBucket。AP 无策略 = 拒绝（AWS 对齐，L3）；无 AP 的
    `*-s3alias` 桶回落普通桶路由（L4 已修复，见访问点节）。
 3. Object Lambda 只读 GET；WASM 默认关闭；输出全缓冲；endpoint 由管理员信任（仍有内网 SSRF 拒绝）。
-4. Batch 无抢占/跨账号；InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；
-   动作按**对象所在桶**发桶通知（Copy→目标桶 `CreatedCopy`、Delete→`RemovedDelete`/
-   `DeleteMarkerCreated`、Restore→`RestorePost`；ReplaceTags/InvokeLambda 无对应 S3 事件
-   类型、不发），并照旧发复制/清 tier。
+4. Batch 支持协作式优先级抢占（安全动作边界，不重复副作用）与跨账户清单授权（非管理员
+   限同账户+读权限，管理员可跨账户；清单授权先于 HEAD/GET，桶策略 Deny 仍约束管理员）；
+   InvokeLambda 支持 HTTP（`olap-wasm` 构建另支持 WASM）；动作按**对象所在桶**发桶通知
+   （Copy→目标桶 `CreatedCopy`、Delete→`RemovedDelete`/`DeleteMarkerCreated`、
+   Restore→`RestorePost`；ReplaceTags/InvokeLambda 无对应 S3 事件类型、不发），并照旧发
+   复制/清 tier。控制台暂未展示 `preempted` 状态。
 5. Inventory 默认全量扫描（增量为节点本地 3.6 模式）、CSV/Parquet 单数据文件；
    跨账户目标仅管理员可配置（运行期复核源/目标桶账户）；Hive 兼容面仅
    `symlink.txt`（不含 Athena 建表/分区自动发现）。
 6. 分层支持远端 S3 与本地冷盘池、有界内存流式搬运（源 8 MiB 窗口 / 出站与恢复 256 KiB
-   块）；Archived GET（含 Range）不直读远端，须先 Restore；S3 生命周期已支持 tag/size/And Filter、
-   Expiration.Date/ExpiredObjectDeleteMarker、Transition.Date、多转换、noncurrent expiration/transition；
-   仍不支持 AbortIncompleteMultipartUpload（需 MPU 索引，501）。
+   块）；Archived GET（含 Range）不直读远端，须先 Restore——缺少分块哈希，范围读无法在
+   不取整对象的前提下校验完整性，保留 403 是当前 fail-closed 选择；S3 生命周期已支持
+   tag/size/And Filter、Expiration.Date/ExpiredObjectDeleteMarker、Transition.Date、多转换、
+   noncurrent expiration/transition 与 AbortIncompleteMultipartUpload。tier 暂存文件创建即
+   0600；崩溃残留 `tier-*.stage` 由启动+周期 sweeper 清理（`OSS_TIER_STAGE_SWEEP_AGE_SECS`
+   默认 3600，`..._INTERVAL_SECS` 默认 3600/0=仅启动）；Restore/Transition 使用进程内
+   per-device 预留防并发写爆（多进程共享暂存目录仍要求外部约束）。
 7. 归档对象与同版本二进制绑定；启用 Transition 前须全量升级。tier 远端删除 best-effort；
    GC/对账仅管理员显式触发（默认 dry-run），无自动定时 GC；恢复到期精度约 300s。
 8. 作业状态库内 `done/error`（映射 Completed/Failed）；取消时未执行任务不进报告；
@@ -1302,7 +1355,8 @@ append/vote/snapshot/status/membership/write/join。
   缓存/目录副作用、`/site/changelog` 409、启动模式断言）；S7 3-voter 成员变更/leader 单跳
   转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、M7→Raft
   `raft-cutover`/`raft-export`/`raft-force-recover`、`sync-reconcile [--repair]`、console
-  Raft 集群卡片。M7/Local 路径保持字节不变。
+  Raft 集群卡片。M7/Local 路径保持字节不变。后续补 OSSCTL2（level-2 生命周期数据）与
+  LC-0 导出/cutover/force-recover 来源校验（snapshot_format/wire/feature）。
 - **验收证据（v1.13.1 发布，代码 HEAD `ac007e7`，2026-10-22）**：`M9_STRICT=1 tests/e2e_m9.sh`
   （sync）78 PASS / 0 FAIL / 1 预期 SKIP；`M9_STRICT=1 M9_STRETCH=1 tests/e2e_m9.sh`
   （stretch+Raft 配对/witness）59 PASS / 0 FAIL / 1 预期 SKIP；`tests/e2e_m9_recovery.sh`
@@ -1568,19 +1622,21 @@ db_path = "/var/lib/oss/raft.db"
      （不归点同下）。`tests/e2e_m9_rolling.sh` 已在 v1.15.0 硬化 lane 实跑：
      65 PASS / 0 FAIL / 4 SKIP；SKIP 为 v1.13.1 侧无法覆盖的 D6 项（跨版本快照、level-2 503、
      激活、激活后回滚），不是产品失败。
-   - **快照/切档 fail-closed（OSSCTL2 之前）**：`lifecycle_rules.config_json` 非空时，控制
-     快照、`raft-force-recover` 与 `raft-cutover`（含 `--dry-run`）都拒绝 OSSCTL1
-     （`level-2 data present; refusing OSSCTL1`），避免 v1.13.1 安装时静默丢弃结构化规则
-     （`raft-export` 仍可导出，但恢复/切档会被同一守卫拒绝）。含结构化规则的环境在 OSSCTL2
-     落地前无法用快照跟随新成员/强制恢复/回退，也无法从 M7 切档到 Raft；需要这些操作时
-     先在源端删除或降级结构化规则再导出，或等待 OSSCTL2。
+   - **OSSCTL2 快照与切档（v1.16 候选）**：快照编码器按数据/激活级别选择格式；含
+     `lifecycle_rules.config_json` 或已激活 level 2 时写 OSSCTL2（magic + SHA-256 +
+     feature_level + 数据），否则保持 OSSCTL1。新旧二进制**双读** OSSCTL1/2；旧读者对
+     OSSCTL2 明确拒绝（不静默丢行）。`raft-cutover`（含 dry-run）、`raft-force-recover`、
+     store snapshot install 均接受 OSSCTL2 并在同一事务单调提升
+     `schema_meta.raft_feature_level`。**规则**：全部 voter/learner 升级到支持 OSSCTL2 的
+     二进制后再激活 level 2；OSSCTL2 环境不能回退到只认 OSSCTL1 的 v1.15 及更早版本。
    - **窗口内禁止成员变更**：新 leader 在 add/promote/replace 前预检——现有 voter/learner
      任一 `wire<2`、目标未达标或不可达 → 409 `peer_incompatible`；不可达的旧节点只能被
      移除/替换。console 配对（`/sites`、`/join`）同样要求对端 identity 带 wire 2 且
      feature 不低于本机（旧节点缺省 = 1 → 409）。
    - **不在 Level B 范围内**：M3/M4 数据面（分片 RPC/EC/放置）、TLS 物料、从 < v1.13.1
-     跨大版本、Level C 双向混合写、快照 OSSCTL2（仍为 OSSCTL1；含 level-2 生命周期
-     数据时编码器 fail-closed 拒绝，见上）。
+     跨大版本、Level C 双向混合写。LC-0 已为 export/cutover/force-recover 增加
+     snapshot_format/wire_version/feature_level 来源校验（缺 provenance 的旧导出按未验证
+     接受并警告；显式字段严格拒绝），但完整 Level C 仍需兼容补丁线与双读写窗口。
    - 全流程演练：`tests/e2e_m9_rolling.sh`（需 `OSS_OLD_BIN` = v1.13.1；未提供时 SKIP）。
 
 ### 部署与安全边界

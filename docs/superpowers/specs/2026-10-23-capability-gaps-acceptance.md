@@ -262,17 +262,81 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 ### 11.3 仍阻塞 / 非目标（最终状态）
 
 - **Level C 任意双向混合版本**：旧解码器（v1.13.1）无法识别 Level B 数据，需双解码/双写窗口与
-  回滚矩阵；本批未做。CMK、Level B 支持「同版本升级」，不承诺旧二进制读新数据。
-- **M3/M4 数据面滚动升级**：Level B 仅覆盖控制面命令与快照兼容；数据面、TLS 物料、跨版本
-  cutover/force-recover 仍要求停写升级。
-- **`AssumeRoleWithWebIdentity`**：未实现（仅既有静态 AK/临时凭据面）。
+  回滚矩阵；§12 只做了 LC-0 来源校验，完整 Level C 未做。设计见
+  `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
+- **M3/M4 数据面滚动升级**：Level B 仅覆盖控制面命令与快照兼容；数据面、TLS 物料（mesh 入站）、
+  跨版本 cutover/force-recover 仍要求停写/滚动重启；设计见架构 backlog。
 - **完整多租户账户体系**：账户 = 用户命名空间 v1，无账户管理员/共享/配额/隔离；AP 跨账号与
-  Inventory 目标账户都不是租户边界。
-- **M3 MPU 粘节点**：upload_id 为纯 UUID、暂存区节点本地，缺 upload_id→节点持久目录与转发 RPC。
-- **M3 shrink / 单机→集群**：架构项目，未实现。
-- **M8 多节点控制面**：未实现（单节点）。
-- **Select BZIP2**：确定性 400（工作区无 bzip2 依赖，不新增）。
-- **直接读 tier（含 Range）**：不直读远端，归档对象须先 Restore（§14.2）。
+  Inventory 目标账户都不是租户边界。设计见架构 backlog。
+- **M3 shrink / 单机→集群**：架构项目，未实现；设计见架构 backlog。
+- **M8 多节点控制面**：§12 已做单例后台任务 leader 门控，但作业/清单/恢复/审计运行状态
+  仍为节点本地，无 fencing/复制；完整多节点见架构 backlog。
+- **直接读 tier（含 Range）**：仍不直读远端，归档对象须先 Restore；缺分块哈希，范围读无法
+  在不取整对象时校验完整性。
 - **Inventory**：跨账户目标仅管理员可配置，运行期复核失败即不写输出；增量仍是节点本地水位。
-- **M7 混合版本历史异步版本**：两端 UUID 不同导致定向删除可能短暂不一致（建议同版本升级）；
-  M6 远端仍不携带对象元数据、不投递版本删除。
+- **M7 混合版本历史异步版本**：§12 新增内容指纹兼容删除，但只对升级后新删除生效，升级前
+  已发生的删除不回溯；M6 无 `site_token` 的旧远端仍不携带元数据/版本删除。
+- **已由 §12 补**：`AssumeRoleWithWebIdentity`、Select BZIP2、M3 MPU 跨节点路由、CMK
+  删除/rewrap、OSSCTL2/LC-0、M6 token 远端、TLS mesh/Kafka 热加载、Batch 抢占/跨账户清单、
+  M8 leader 门控、tier 清扫/预留/0600、AP 可信对端 CIDRS。
+
+## 12. 2026-10-24 backlog 第二轮：执行 §2–§4
+
+**范围**：v1.15.0 后剩余验证缺口、显式非目标与技术债。集成分支
+`feat/post-1.15-backlog`（基于 `v1.15.0`），本批**未发布**。
+
+### 12.1 已落地
+
+| 项 | 落点 | 边界/证据 |
+|---|---|---|
+| Select BZIP2 | `xl-s3/select.rs`、`service.rs` | bzip2 0.6（纯 Rust 后端），CSV/JSON 多流解压，512MiB 解压预算；ScanRange 仍 400；Parquet 仍要求 `CompressionType=NONE`；单测+`select_ops` 10 passed |
+| STS WebIdentity | `xl-s3/sts_web_identity.rs`、`sts.rs`、config | 默认关闭；本地 JWKS、RS256/ES256、iss/aud/kid/exp、RoleArn→sub/email 精确映射；匿名 Action 仅此一个；12 个离线测试 |
+| CMK 删除/rewrap | `xl-store/kms.rs`、`store/cmk_rewrap.rs`、console | 删除先全引用扫描，有引用 409；quarantine→静默→复扫→purge，失败恢复；rewrap 逐版本重加密到当前钥，默认 dry-run，保留 ETag/version-id/元数据；本地节点口径 |
+| M3 MPU 跨节点 | `xl-proto`、`xl-client`、`xl-store/store/mpu_route.rs` | Create 返回 `<base64url(node)>.<uuid>`；UploadPart/Complete/Abort/ListParts 由非属主经 mesh 流式转发（1 MiB 块，1h 超时）；属主不可达 503；旧裸 UUID/混合版本仍需原节点亲和 |
+| OSSCTL2 + LC-0 | `raft/data.rs`、`cutover/export.rs`、`cutover.rs` | OSSCTL2 携带 feature_level 与 config_json，旧读者明确拒绝；snapshot install/cutover/force-recover 接受并单调提升级别；export 增 snapshot_format/wire/feature/source_build 校验，缺 provenance 旧导出警告接受、显式字段严格拒绝 |
+| M6 token 远端 / M7 定向删除 | `replication.rs`、`repl_client.rs`、`xl-s3/service.rs` | 可选 `[[remotes]].site_token` 启用同源 id/版本删除/元数据；无 token 保持旧语义；SSE-C/KMS 永久死信；M7 按同源 id 定向删除、404 幂等。安全复审后**移除内容指纹自动删除**：未映射 legacy 副本无来源身份，保留待人工对账（防误删共享目标上另一来源的同内容副本） |
+| TLS mesh/Kafka 热加载 | `xl-client`、`tls*.rs`、events | mesh gRPC 客户端与 Kafka TLS 客户端按成功 reload 代次重建，在途请求持旧 client；mesh 入站监听器仍需重启；Kafka SASL 仍启动期配置 |
+| Batch 抢占/跨账户清单 | `jobs.rs`、`job_actions_api.rs` | 同一提交者的高优先级就绪任务让低优先级运行作业在动作边界 `preempted`，未执行任务回队、不重复副作用；优先级限定 `-100..=100`（越界 400），跨提交者不抢占（安全复审 M-2）；非管理员清单桶限同账户+读，管理员可跨账户，授权先于 HEAD/GET；控制台未展示 `preempted` |
+| M8 leader 门控 | `raft/mod.rs`、`status.rs`、jobs/inventory/tier/lifecycle | Raft 模式仅 leader 跑单例任务；切换下一 tick 生效；未知/失去 leader fail-closed；运行状态仍节点本地（无 fencing/复制） |
+| tier 清扫/预留/0600 | `tier.rs`、`tier_jobs.rs`、`local_tier.rs` | `tier-*.stage` 启动+周期清理（age ≥300s，默认 1h；活跃集合保护）；per-device 进程内预留防并发写爆；暂存文件创建即 0600 |
+| 安全修复 | router/tls_server/inventory/replication/xl-client | AP 转发头要求直连对端命中 `OSS_AP_TRUSTED_PEER_CIDRS`（纯 HTTP listener 无 ConnectInfo，不能信任）；Inventory 运行前复核 owner 活跃与源读权限；M6 SSE-C/KMS 死信；M-1 移除不安全内容指纹删除；M-2 优先级钳制+同提交者抢占；L-1 WebIdentity 匿名端点全局令牌桶（20/s，burst 40，503 SlowDown）；L-2 mesh token 常数时间比较 |
+
+### 12.2 验证
+
+- 集成树 lib 测试：xl-store 282+1 ignored、xl-s3/oss-server 全绿；本轮一次全量跑出现
+  `concurrent_puts_and_deletes_never_observe_torn_state` 一次 `AlreadyExists` 失败，单测连续 5 次
+  通过（高负载并行 flake，已记录待复现）。
+- 聚焦测试：bzip2 `select_ops` 10；CMK `tests_cmk_rewrap` 4 + kms 24 + console 2；WebIdentity
+  12；MPU xl-store 6 + xl-client 7；OSSCTL2/LC-0 raft 相关 41/5/12/4；tier 26 集成用例；
+  replication 19 + m8_batch 18/19；batch jobs_engine 10、m8_batch 19、console_api 30；m8gate
+  raft 45、jobs_engine 11、m8_inventory 23。
+- 安全复审：v1.15.0 面 0 Critical/0 High/1 Medium（可信代理直连伪造）+3 Low；Medium 与
+  tier 0600/Inventory 运行期权限/M6 CMK 明文已修复。本轮新增面独立复审（sec3）
+  0 Critical/0 High/2 Medium/4 Low：M-1 内容指纹误删→移除自动内容删除；M-2 跨租户抢占
+  →优先级钳制+同提交者；L-1 匿名 WebIdentity 限速、L-2 mesh token 常数时间比较已修复；
+  L-3 mesh 明文 SSE-C、L-4 旧裸 UUID MPU 粘节点为已记档残余。报告：
+  `/tmp/security-review-backlog.md`。复审复核：M-1/M-2/L-2 CLOSED，L-1 CPU 放大 CLOSED
+  但保留“单客户端可耗尽全局匿名桶”的 Low 残余；无新增 Critical/High/Medium。
+- `cargo fmt --all --check`、5 crate clippy `--all-targets -- -D warnings`：0 warning。
+- **S3 全量 e2e**：集成树 38 节 RC=0（真实进程 + aws-cli/rclone + redpanda；
+  `OSS_MASTER_KEY_FILE` + `OSS_KMS_DIR`；脚本 md5 `16202c6d7910e354be5aaa74fd5d3b3f`）。
+- **M9 集成树**：sync 78/0/1、stretch 59/0/1、recovery 133/0/1、rolling 65/0/4，全部 exit 0
+  （rolling 使用 v1.13.1 旧二进制；SKIP 为 D6 预期项）。
+- **M8 e2e（集成树）**：PASS，总耗时 4742s；Tier=ran（真实远端 S3 tier），M6/M7 复制 e2e
+  全部通过（E2E_M8_REPL_SMOKE=1）。
+- **E2E_LONG**：`E2E_LONG=1` 100×100MB 并发上传 + 中断重试，全部读回校验和一致
+  （`长跑通过`）；全脚本 38 节继续跑完并打印“S3 验收全部通过”。
+- 未通过项不作为“已验收”。
+
+### 12.3 仍未完成（架构级）
+
+- Level C 完整双向窗口（仅 LC-0 来源校验落地）。
+- M3/M4 数据面滚动升级。
+- 完整多租户账户体系与 AP 跨账号/VPC 端点身份。
+- M8 多节点运行状态复制/fencing（仅 leader 门控）。
+- M3 shrink / 单机→集群。
+- 直接读 tier（缺分块哈希，范围读完整性无法保证）。
+- M6 无 `site_token` 历史远端、M7 升级前已删除副本、marker 指纹缺失等兼容边界。
+
+上述设计、MVP 切片、依赖与风险见
+`docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
