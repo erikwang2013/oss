@@ -5653,6 +5653,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "jsonwebtoken",
  "md-5",
  "parquet",
  "reqwest",

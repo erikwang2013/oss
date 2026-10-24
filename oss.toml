@@ -35,3 +35,16 @@ group = "file"
 bucket = "files"
 max_size = 0
 extensions = []
+
+# STS AssumeRoleWithWebIdentity（默认关闭）。启用后该 Action 无需 AK/SK，凭据是 OIDC
+# token；只映射可信 IdP 的**精确** claim 值。JWKS 只从本地文件读（不拉 URL，无 SSRF）。
+# [sts.web_identity]
+# enabled = false
+# issuer = "https://token.actions.githubusercontent.com"   # 精确匹配 iss；必须 https
+# audience = "oss-prod"                                    # 精确匹配 aud
+# jwks_file = "/etc/oss/oidc-jwks.json"                    # 启动时读入；只允许 RS256/ES256
+# max_duration_seconds = 3600                              # 900..=43200
+# [[sts.web_identity.roles]]
+# role_arn = "arn:oss:iam::oss:role/ci-bot"                # role/<name> 须是已有活跃用户
+# claim = "sub"                                            # 只支持 sub / email，精确匹配
+# values = ["repo:acme/infra:ref:refs/heads/main"]

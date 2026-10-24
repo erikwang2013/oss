@@ -18,5 +18,6 @@ pub mod service;
 pub mod skvault;
 pub mod sse;
 pub mod sts;
+pub mod sts_web_identity;
 pub mod sync_delete;
 pub mod tier_gc;
