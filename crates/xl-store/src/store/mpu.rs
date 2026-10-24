@@ -128,6 +128,10 @@ impl Store {
 
     /// 属主解析：`None` = 本地执行（旧格式或无前缀）；`Some(node)` = 需转发。
     ///
+    /// L-4（记档，非安全边界）：旧格式裸 UUID 只在创建节点本地可解析，其他节点一律
+    /// `NoSuchUpload`。集群升级前必须排空在途 MPU（完成/中止），否则这些暂存区无法经
+    /// 负载均衡端点收尾，只能人工清理。
+    ///
     /// 未知属主（不在拓扑内）→ `Unavailable`（S3 503）：upload_id 指向的节点已不存在，
     /// 既不能本地找到也不能假装 NoSuchUpload（会诱导客户端放弃可恢复的暂存区）。
     pub(in crate::store) fn mpu_remote_owner(&self, upload_id: &str) -> Result<Option<String>> {

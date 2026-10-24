@@ -8,6 +8,9 @@
 //! 父链条件在 auth.rs/user_of_key/cluster_control 三处同口径。WebIdentity 会话无父键
 //! （匿名入口不继承任何调用者权限）。
 
+use std::sync::Mutex;
+use std::time::Instant;
+
 use http::Extensions;
 use http::{HeaderMap, Method, Uri};
 use s3s::route::S3Route;
@@ -31,6 +34,40 @@ const AR_MIN: i64 = 900;
 const AR_MAX: i64 = 43_200;
 const AR_DEFAULT: i64 = 3600;
 
+/// L-1：匿名 AssumeRoleWithWebIdentity 的全局令牌桶——每次 JWT 验签（RSA/ES256）
+/// 远贵于拒绝一个未签名请求，限制放大面。签名 STS 路径不受影响。
+/// 固定阈值（每实例）；集群多节点时总吞吐按实例数放大，运营方仍应在反代叠加限流。
+/// shortcut: 全局桶不分租户/IP，单个攻击者可耗尽配额使合法匿名 STS 短暂 503；
+/// 需要公平性时升级为按对端 IP 分桶。
+const WI_RATE_PER_SEC: f64 = 20.0;
+const WI_BURST: f64 = 40.0;
+
+struct TokenBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            last: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self, rate: f64, burst: f64) -> bool {
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * rate).min(burst);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct StsRoute {
     pool: SqlitePool,
     /// M5 切片 6（T5 校正）：SK 加密库——签发会话的 SK 与 console 同口径封存入库
@@ -38,6 +75,8 @@ pub struct StsRoute {
     vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
     /// AssumeRoleWithWebIdentity 的 OIDC 验证器；`None` = 未启用（该 Action 一律拒绝）。
     web_identity: Option<WebIdentity>,
+    /// L-1：匿名 WebIdentity 验签入口的限流桶（锁中毒按未中毒处理，不让 panic 拖垮 STS）。
+    web_identity_limiter: Mutex<TokenBucket>,
 }
 
 impl StsRoute {
@@ -46,6 +85,7 @@ impl StsRoute {
             pool,
             vault: None,
             web_identity: None,
+            web_identity_limiter: Mutex::new(TokenBucket::new(WI_BURST)),
         }
     }
 
@@ -187,6 +227,18 @@ impl StsRoute {
                 "AssumeRoleWithWebIdentity is not enabled"
             ));
         };
+        // L-1：匿名入口在验签前限流（CPU 放大防护）；仅此 Action，签名路径不变。
+        let allowed = self
+            .web_identity_limiter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allow(WI_RATE_PER_SEC, WI_BURST);
+        if !allowed {
+            return Err(s3s::s3_error!(
+                SlowDown,
+                "AssumeRoleWithWebIdentity rate limit exceeded"
+            ));
+        }
         let token = field(fields, "WebIdentityToken")
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing WebIdentityToken"))?;
         let arn = field(fields, "RoleArn")
@@ -594,6 +646,20 @@ fn request_id() -> String {
 mod tests {
     use super::*;
     use s3s::auth::S3Auth as _;
+
+    /// L-1：桶耗尽后拒绝，按速率补充后恢复。
+    #[test]
+    fn web_identity_token_bucket_limits_and_refills() {
+        let mut b = TokenBucket::new(2.0);
+        assert!(b.allow(0.0, 2.0));
+        assert!(b.allow(0.0, 2.0));
+        assert!(!b.allow(0.0, 2.0), "耗尽后必须拒绝");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // 5ms × 1000/s 补满 burst=2：连续两次放行，随后再次耗尽。
+        assert!(b.allow(1000.0, 2.0), "补充后恢复");
+        assert!(b.allow(0.0, 2.0));
+        assert!(!b.allow(0.0, 2.0));
+    }
 
     /// 最小控制面 schema（同 auth.rs 测试的口径 + kind 列）。
     async fn sts_db() -> SqlitePool {

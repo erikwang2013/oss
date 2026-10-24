@@ -365,8 +365,6 @@ struct ReplRow {
     key: String,
     version_id: String,
     etag: String,
-    /// 4.19：版本删除行的内容指纹字节数（`etag` 为空 = 无指纹）。
-    size: i64,
     remote_id: String,
     dest_bucket: String,
     is_delete_marker: bool,
@@ -567,9 +565,7 @@ async fn send_row(
                 "版本定向删除仅支持同源 id 远端（未配置 site_token）",
             ));
         };
-        // 4.19：源链内容已唯一时附带 (etag,size) 指纹——目标据此清理升级前复制、
-        // 两端 UUID 不同的历史副本；无指纹 = 无法安全定位（目标保持幂等未命中）。
-        let content = (!r.etag.is_empty()).then_some((r.etag.as_str(), r.size as u64));
+        // M-1：只带源 id 定点删除；绝不按内容指纹清理未映射历史副本（无源身份 → 会误删）。
         let res = client
             .delete_object_version_s3(
                 remote_id,
@@ -577,7 +573,6 @@ async fn send_row(
                 &r.key,
                 &r.version_id,
                 Some(token),
-                content,
             )
             .await;
         return match (res, cache_key) {
@@ -742,7 +737,6 @@ pub async fn settle_version_after_drop(
         key: key.to_string(),
         version_id: version_id.to_string(),
         etag: String::new(),
-        size: 0,
         remote_id: String::new(),
         dest_bucket: String::new(),
         is_delete_marker: false,
@@ -777,7 +771,7 @@ pub async fn process_repl_once(
         "UPDATE repl_outbox SET state='sending', claimed_at=? \
          WHERE state='pending' AND seq IN (SELECT seq FROM repl_outbox WHERE state='pending' \
                        AND next_retry_at <= ? ORDER BY seq LIMIT ?) \
-         RETURNING seq, bucket, key, version_id, etag, size, remote_id, dest_bucket, \
+         RETURNING seq, bucket, key, version_id, etag, remote_id, dest_bucket, \
          is_delete_marker, is_version_delete, target_kind, attempts, claimed_at",
     )
     .bind(now_s)
@@ -801,7 +795,6 @@ pub async fn process_repl_once(
             key: row.get("key"),
             version_id: row.get("version_id"),
             etag: row.get("etag"),
-            size: row.get("size"),
             remote_id: row.get("remote_id"),
             dest_bucket: row.get("dest_bucket"),
             is_delete_marker: row.get::<i64, _>("is_delete_marker") != 0,

@@ -478,6 +478,65 @@ async fn no_preemption_for_equal_priority_or_idle_capacity() {
     );
 }
 
+/// M-2：抢占按 `requested_by` 隔离——甲的高优先级就绪作业不得抢占乙的 running 作业；
+/// 同一请求者内的高优先级抢占仍然生效。
+#[tokio::test]
+async fn preemption_is_scoped_to_same_requester() {
+    let (db, _store, _d1, _d2) = setup().await;
+    let mk = |requester: i64, priority: i64, actions: &[&str]| JobSpec {
+        kind: "generic".into(),
+        bucket: "reports".into(),
+        requested_by: Some(requester),
+        priority,
+        tasks: actions
+            .iter()
+            .map(|a| NewJobTask {
+                action: (*a).into(),
+                payload: "{}".into(),
+                dedupe_key: None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    // 乙的低优先级作业占满容量（1 个 running + 1 个 queued）。
+    let bob_low = db.create_job(&mk(8, 1, &["B1", "B2"]), 1000).await.unwrap();
+    assert_eq!(
+        db.claim_task(1000, 900).await.unwrap().unwrap().job_id,
+        bob_low
+    );
+    // 甲的高优先级就绪作业：不得抢占乙。
+    let alice_high = db.create_job(&mk(9, 9, &["A1"]), 1001).await.unwrap();
+    assert_eq!(
+        db.preempt_lower_priority(1, 1001).await.unwrap(),
+        0,
+        "跨请求者不得抢占"
+    );
+    assert_eq!(
+        db.job_get(bob_low).await.unwrap().unwrap()["state"],
+        "running"
+    );
+    assert_eq!(
+        db.job_get(alice_high).await.unwrap().unwrap()["state"],
+        "queued"
+    );
+    // 乙自己的高优先级作业出现 → 同请求者内抢占仍生效。
+    let bob_high = db.create_job(&mk(8, 9, &["B3"]), 1002).await.unwrap();
+    assert_eq!(db.preempt_lower_priority(1, 1002).await.unwrap(), 1);
+    assert_eq!(
+        db.job_get(bob_low).await.unwrap().unwrap()["state"],
+        "preempted"
+    );
+    assert_eq!(
+        db.job_get(bob_high).await.unwrap().unwrap()["state"],
+        "queued"
+    );
+    assert_eq!(
+        db.job_get(alice_high).await.unwrap().unwrap()["state"],
+        "queued",
+        "其他请求者的作业始终不受影响"
+    );
+}
+
 /// 已领取但未执行的任务在抢占边界回退：状态回 queued、attempt 不增（不消耗重试）、
 /// start/deadline 清空；重复回退幂等。
 #[tokio::test]

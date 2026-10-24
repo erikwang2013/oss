@@ -2726,11 +2726,13 @@ async fn async_bucket_delete_stays_local() {
     assert_eq!(delete_intent_rows(&e.st).await, 0);
 }
 
-/// 4.19：混合版本历史副本——升级前复制的异步 REPLICA 两端 UUID 不同。源端版本删除
-/// （源 id 未命中）在 site token + 源链内容唯一指纹下清掉目标未映射副本；已映射的
-/// 同源 id 副本不受影响，无 token 时绝不按内容删。
+/// M-1（安全回归）：升级前复制的异步 REPLICA 两端 UUID 不同，且未映射
+/// （remote_version_id=None）的副本不携带源站/源桶身份。即使 site token 有效且请求
+/// 带内容指纹，源 id 未命中时也绝不按内容删除——共享目标上他源的同内容副本不可区分，
+/// 会误删。请求仍幂等 204，目标历史副本保留（需人工对账）。
+/// 已映射的同源 id 副本仍按 id 定点删除，重复删除幂等 204。
 #[tokio::test]
-async fn async_version_delete_reconciles_legacy_replica_by_content() {
+async fn async_version_delete_never_content_deletes_unmapped_legacy_replica() {
     let e = env(Mode::Ok, 1 << 20).await;
     let body = b"legacy-hist".to_vec();
     let legacy = [
@@ -2757,6 +2759,7 @@ async fn async_version_delete_reconciles_legacy_replica_by_content() {
     let size = body.len().to_string();
     let src_vid = uuid::Uuid::new_v4().to_string();
     let path = format!("/asy/old.txt?versionId={src_vid}");
+    let tpath = format!("/asy/old.txt?versionId={target_vid}");
 
     // 无 token：不得按内容清副本（204 幂等，但目标历史版本保留）。
     let untokened = [
@@ -2771,14 +2774,13 @@ async fn async_version_delete_reconciles_legacy_replica_by_content() {
             .status(),
         204
     );
-    let tpath = format!("/asy/old.txt?versionId={target_vid}");
     assert_eq!(
         signed(&e, Method::HEAD, &tpath, &[], &[]).await.status(),
         200,
         "无 token 时不得删除历史副本"
     );
 
-    // token + 内容唯一指纹：源 id 未命中 → 清理未映射的历史副本。
+    // token + 内容指纹：源 id 未命中 → 204 幂等，但未映射历史副本仍必须保留。
     let h = [
         ("x-amz-replication-status", "REPLICA"),
         ("x-oss-site-token", LOCAL_TOKEN),
@@ -2792,11 +2794,11 @@ async fn async_version_delete_reconciles_legacy_replica_by_content() {
     );
     assert_eq!(
         signed(&e, Method::HEAD, &tpath, &[], &[]).await.status(),
-        404,
-        "历史副本应按内容指纹收敛删除"
+        200,
+        "未映射历史副本不得按内容删除（他源同内容副本不可区分）"
     );
 
-    // 同源 id 副本（remote_version_id 已映射）不参与内容补偿：即使内容指纹一致也保留。
+    // 已映射的同源 id 副本：按 id 定点删除仍生效；重复删除 404 幂等 204。
     let mapped_id = uuid::Uuid::new_v4().to_string();
     let tokened = [
         ("content-type", "text/plain"),
@@ -2814,23 +2816,24 @@ async fn async_version_delete_reconciles_legacy_replica_by_content() {
             .unwrap(),
         mapped_id
     );
-    let other_src = uuid::Uuid::new_v4().to_string();
-    let h = [
+    let mpath = format!("/asy/mapped.txt?versionId={mapped_id}");
+    let del = [
         ("x-amz-replication-status", "REPLICA"),
         ("x-oss-site-token", LOCAL_TOKEN),
-        ("x-oss-origin-version-id", other_src.as_str()),
-        ("x-oss-origin-etag", etag.as_str()),
-        ("x-oss-origin-size", size.as_str()),
+        ("x-oss-origin-version-id", mapped_id.as_str()),
     ];
-    let dpath = format!("/asy/mapped.txt?versionId={other_src}");
     assert_eq!(
-        signed(&e, Method::DELETE, &dpath, &h, &[]).await.status(),
+        signed(&e, Method::DELETE, &mpath, &del, &[]).await.status(),
         204
     );
-    let mpath = format!("/asy/mapped.txt?versionId={mapped_id}");
     assert_eq!(
         signed(&e, Method::HEAD, &mpath, &[], &[]).await.status(),
-        200,
-        "已映射的同源 id 副本不得被内容指纹误删"
+        404,
+        "同源 id 副本必须按 id 定点删除"
+    );
+    assert_eq!(
+        signed(&e, Method::DELETE, &mpath, &del, &[]).await.status(),
+        204,
+        "已删除版本重复删除必须幂等 204"
     );
 }

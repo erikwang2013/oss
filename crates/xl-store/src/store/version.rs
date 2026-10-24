@@ -89,9 +89,6 @@ pub enum DeleteOutcome {
     Version {
         version_id: String,
         tier: Option<TierRef>,
-        /// 混合版本站点兼容删除的内容指纹 `(etag, size)`：仅当链中已无同指纹的版本时给出。
-        /// 源端据此声明「该内容在源链中唯一」，目标才可按内容定位无同源 id 的历史副本。
-        content: Option<(String, u64)>,
     },
     /// 非版本桶：整键删除（M2b 语义）；归档版本带回远端引用
     Object { tiers: Vec<TierRef> },
@@ -381,15 +378,10 @@ impl Store {
         };
         let removed = old.versions[pos].clone();
         let removed_tier = tier_ref(&removed);
-        // 4.19：内容指纹只在链中再无同 (etag,size) 版本时给出（marker 的 etag 恒空 → 不给）。
-        let content = (!removed.delete_marker()
-            && !removed.etag.is_empty()
-            && !old
-                .versions
-                .iter()
-                .enumerate()
-                .any(|(i, v)| i != pos && v.etag == removed.etag && v.size == removed.size))
-        .then(|| (removed.etag.clone(), removed.size));
+        // M-1 安全修正：不再按内容指纹定位/删除目标副本。未映射的 REPLICA 版本
+        // （remote_version_id=None，升级前或未配置 site token 的远端）不带源站/源桶身份；
+        // 同一目标键可能汇入多个源的同内容副本，按 (etag,size) 删除会误删他源活副本。
+        // 这类历史副本只能人工对账（重新复制或按目标版本 id 人工删除），绝不自动内容清理。
         // M5 切片 4（L4）：对象锁守卫——legal hold / COMPLIANCE 未到期一律拒（含 admin）；
         // GOVERNANCE 未到期仅 bypass 放行；到期（until <= now）放行。delete-marker 路径不受锁约束。
         check_lock_delete(&removed, bypass_governance)?;
@@ -400,7 +392,6 @@ impl Store {
             return Ok(DeleteOutcome::Version {
                 version_id: vid,
                 tier: removed_tier,
-                content,
             });
         }
         m.refresh_latest_flags();
@@ -420,35 +411,7 @@ impl Store {
         Ok(DeleteOutcome::Version {
             version_id: vid,
             tier: removed_tier,
-            content,
         })
-    }
-
-    /// 4.19：目标端兼容删除的历史副本定位——未映射（`remote_version_id=None`）的 REPLICA
-    /// 摄入版本，按内容指纹 `(etag,size)` 匹配。只返回版本 id；删除仍走
-    /// [`Self::delete_object_versioned_ext`] 的锁/tier/事件语义。
-    pub async fn find_unmapped_replica_versions(
-        &self,
-        bucket: &str,
-        key: &str,
-        etag: &str,
-        size: u64,
-    ) -> Result<Vec<String>> {
-        self.ensure_bucket(bucket).await?;
-        let Some(m) = self.read_meta(bucket, key).await? else {
-            return Ok(Vec::new());
-        };
-        Ok(m.versions
-            .iter()
-            .filter(|v| {
-                !v.delete_marker()
-                    && v.etag == etag
-                    && v.size == size
-                    && v.remote_version_id.is_none()
-                    && v.replication_status.as_deref() == Some("REPLICA")
-            })
-            .map(|v| v.version_id_str())
-            .collect())
     }
 
     /// 指定版本目录 → 各盘 trash（本地 rename + 远端 RPC；best-effort——meta 已不引用）。

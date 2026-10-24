@@ -345,6 +345,9 @@ pub struct MpuComplete {
 }
 
 /// 转发用加密意图。**SSE-C 变体携带原始客户钥**——Debug 已脱敏；仅在集群内网传输。
+/// 安全前提（L-3）：集群部署**必须启用 mesh TLS**；明文 mesh 下 SSE-C 客户钥与 part
+/// 明文会跨节点明文传输。本层不做 fail-closed 拦截（TLS 强制不在本切片范围），运营方
+/// 须把 mesh TLS 当作 SSE-C 多节点部署的硬前提。
 #[derive(Clone, PartialEq, Eq)]
 pub enum MpuEnc {
     SseS3,
