@@ -457,9 +457,9 @@ impl TonicMesh {
                     .map_err(|e| Error::Encode(format!("节点 {id} 地址非法（{addr}）：{e}")))?
                     .connect_timeout(connect)
                     .timeout(timeout);
-                if let Some(t) = &tls {
+                if let Some(t) = tls {
                     ep = ep
-                        .tls_config(t.clone())
+                        .tls_config((*t).clone())
                         .map_err(|e| Error::Encode(format!("节点 {id} TLS 配置失败：{e}")))?;
                 }
                 Ok(ep)
@@ -496,10 +496,7 @@ impl TonicMesh {
             Ok((fresh, fresh_mpu)) => {
                 let nodes = fresh.len();
                 *self.clients.write().unwrap_or_else(|e| e.into_inner()) = fresh;
-                *self
-                    .mpu_clients
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = fresh_mpu;
+                *self.mpu_clients.write().unwrap_or_else(|e| e.into_inner()) = fresh_mpu;
                 tracing::info!(
                     nodes,
                     tls = tls.is_some(),
@@ -522,10 +519,7 @@ impl TonicMesh {
             .ok_or_else(|| Error::Encode(format!("mesh：未知节点 {node}（不在拓扑表内）")))
     }
 
-    fn mpu_client(
-        &self,
-        node: &str,
-    ) -> Result<xl_proto::mesh_client::MeshClient<MeshChannel>> {
+    fn mpu_client(&self, node: &str) -> Result<xl_proto::mesh_client::MeshClient<MeshChannel>> {
         self.refresh_tls();
         self.mpu_clients
             .read()

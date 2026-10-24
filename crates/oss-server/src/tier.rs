@@ -40,9 +40,7 @@ static SPACE_RESERVATIONS: LazyLock<Mutex<HashMap<u64, u64>>> =
 /// 创建 0600 的 tier 暂存文件（tier-*.stage / restore-stage）。
 ///
 /// 暂存文件在落盘完成前是明文：权限必须从创建瞬间就是 0600，不能依赖 umask。
-pub(crate) async fn create_private_stage_file(
-    path: &Path,
-) -> std::io::Result<tokio::fs::File> {
+pub(crate) async fn create_private_stage_file(path: &Path) -> std::io::Result<tokio::fs::File> {
     let mut opts = tokio::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o600);
     opts.open(path).await
