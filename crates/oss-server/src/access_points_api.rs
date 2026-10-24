@@ -48,7 +48,15 @@ async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Resp
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "invalid token payload").into_response())?;
     match state.db.get_user(uid).await {
-        Ok(Some((_, admin, true))) => Ok((uid, admin)),
+        Ok(Some((_, admin, true))) => match state.db.account_active(uid).await {
+            // AC-1：账户停用 → 旧 JWT 立即作废
+            Ok(true) => Ok((uid, admin)),
+            Ok(false) => Err((StatusCode::UNAUTHORIZED, "用户不存在或已失效").into_response()),
+            Err(e) => {
+                tracing::error!(error = %e, "AP 鉴权查询失败");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+            }
+        },
         Ok(Some(_)) | Ok(None) => {
             Err((StatusCode::UNAUTHORIZED, "用户不存在或已失效").into_response())
         }

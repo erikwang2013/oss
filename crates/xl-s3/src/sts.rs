@@ -668,7 +668,9 @@ mod tests {
             "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active');\
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL, \
-              parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');",
+              parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');\
+             CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active');\
+             CREATE TABLE account_members (account_id TEXT NOT NULL, uid INTEGER NOT NULL UNIQUE);",
         )
         .execute(&pool)
         .await

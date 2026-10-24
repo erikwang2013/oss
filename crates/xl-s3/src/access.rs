@@ -42,8 +42,10 @@ pub struct AnonymousAccess;
 
 /// 账户命名空间 v1：uid 派生的 12 位十进制账户 ID（AWS 线上形态）。
 ///
-/// **账户 = 用户**——这不是租户隔离：没有账户管理员、共享、配额，也不改变任何既有
-/// 授权语义。`0`/负数/超出 12 位 → `None`（不能匹配任何账户 ARN 主体）。
+/// AC-0 起账户成为实体（名称/状态/配额/成员，见 `oss-server` 0005 迁移），但**派生 ID
+/// 仍是存量兼容基线**：无成员行（新用户、Raft 命令建的用户、迁移前用户）按此解析，
+/// 保证既有 `arn:aws:iam::<12位>:root` 主体不漂移。`0`/负数/超出 12 位 → `None`
+/// （不能匹配任何账户 ARN 主体）。
 pub fn account_id_of(uid: i64) -> Option<String> {
     (1..=999_999_999_999)
         .contains(&uid)
@@ -54,7 +56,9 @@ pub fn account_id_of(uid: i64) -> Option<String> {
 /// 主体匹配**永不**命中它（只有派生 ID 才能匹配），仅作 AP 资源 ARN 的历史别名。
 pub const LEGACY_ACCOUNT: &str = "000000000000";
 
-/// 桶账户 = 桶主的账户；无主/管理员桶归系统账户（LEGACY_ACCOUNT）。
+/// 桶账户 = 桶主的**派生**账户；无主/管理员桶归系统账户（LEGACY_ACCOUNT）。
+/// AC-0 有意保持该派生口径（AP 资源 ARN 不变）；成员关系只影响策略主体、状态与配额，
+/// AP 跨账户属于后续切片。
 pub fn bucket_account_id(owner_id: Option<i64>, owner_is_admin: bool) -> String {
     match owner_id {
         Some(uid) if !owner_is_admin => {
@@ -67,9 +71,31 @@ pub fn bucket_account_id(owner_id: Option<i64>, owner_is_admin: bool) -> String 
 /// `arn:aws:iam::<12位>:root` 是否对应用户 uid（v1：账户 = 用户）。
 /// 匿名/uid=0/越界 uid 恒 false；LEGACY_ACCOUNT 永不匹配任何真实用户。
 pub fn account_arn_matches(arn: &str, uid: i64) -> bool {
-    arn.strip_prefix("arn:aws:iam::")
+    account_principal_matches(arn, uid, None)
+}
+
+/// 账户 ARN 主体匹配（AC-0/AC-3 的账户根语义）：
+/// - 用户有成员行（`account_id` = Some）→ 账户根 ARN 映射到该账户的**全部成员**；
+/// - 无成员行 → 沿用 uid 派生账户（存量/新用户的 legacy 兼容路径）。
+///
+/// 匿名、LEGACY 系统账户、uid=0 恒不命中：账户根只表达「账户成员」，不是通配。
+pub fn account_principal_matches(arn: &str, uid: i64, account_id: Option<&str>) -> bool {
+    if uid <= 0 {
+        return false;
+    }
+    let Some(acct) = arn
+        .strip_prefix("arn:aws:iam::")
         .and_then(|r| r.strip_suffix(":root"))
-        .is_some_and(|acct| account_id_of(uid).as_deref() == Some(acct))
+    else {
+        return false;
+    };
+    if acct == LEGACY_ACCOUNT {
+        return false;
+    }
+    match account_id {
+        Some(current) => current == acct,
+        None => account_id_of(uid).as_deref() == Some(acct),
+    }
 }
 
 /// 权限动作（与 `permissions` 表三列一一对应）。
@@ -523,12 +549,14 @@ impl Acl {
         bucket: &str,
         key: &str,
     ) -> Result<(bool, Option<&'static str>), sqlx::Error> {
+        let account_id = self.account_id_of_user(user.uid).await?;
         let decision = match self.bucket_policy(bucket).await? {
             Some(doc) => {
                 let pr = crate::policy::PolicyRequest {
                     op: "DeleteObjects",
                     ak: &user.ak,
                     uid: user.uid,
+                    account_id: account_id.as_deref(),
                     bucket,
                     key: Some(key),
                     anonymous: false,
@@ -550,6 +578,7 @@ impl Acl {
                 op: "DeleteObjects",
                 ak: &user.ak,
                 uid: user.uid,
+                account_id: account_id.as_deref(),
                 bucket,
                 key: Some(key),
                 anonymous: false,
@@ -578,6 +607,7 @@ impl Acl {
             op: "DeleteObjects",
             ak: "",
             uid: 0,
+            account_id: None,
             bucket,
             key: Some(key),
             anonymous: true,
@@ -667,7 +697,10 @@ impl Acl {
              FROM access_keys ak JOIN users u ON u.id = ak.user_id \
              LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
              LEFT JOIN users pu ON pu.id = p.user_id \
+             LEFT JOIN account_members am ON am.uid = u.id \
+             LEFT JOIN accounts a ON a.id = am.account_id \
              WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
+               AND (am.uid IS NULL OR a.status = 'active') \
                AND (ak.expires_at IS NULL OR ak.expires_at > ?) \
                AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
                     AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \
@@ -696,6 +729,74 @@ impl Acl {
             }));
         }
         Ok(None)
+    }
+
+    /// AC-0：用户当前账户（成员行优先，无行回落 uid 派生账户）。
+    /// 策略主体把账户根 ARN 映射到账户成员集合时使用；查询失败由调用方 fail-closed。
+    pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("account_id"))
+            .or_else(|| account_id_of(uid)))
+    }
+
+    /// AC-2：账户桶数硬配额（`accounts.bucket_quota`；NULL/负 = 不限）。
+    /// 返回 true = 已到上限，拒绝建桶。查询失败由调用方 fail-closed（5xx）。
+    /// shortcut: 计数与建桶行不在同一事务（并发建桶可短暂超配额），升级点是建桶 apply 内
+    /// 条件插入；当前 MVP 先堵住控制台/S3 顺序建桶路径。
+    pub async fn bucket_quota_exceeded(&self, uid: i64) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT a.id AS id, a.status AS status, a.bucket_quota AS quota \
+             FROM account_members am JOIN accounts a ON a.id = am.account_id \
+             WHERE am.uid = ?",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+        // 无成员行 → uid 派生账户；该账户行可能不存在（新用户/未回填）→ 无配额。
+        let (acct, status, quota) = match row {
+            Some(r) => (
+                r.get::<String, _>("id"),
+                r.get::<String, _>("status"),
+                r.get::<Option<i64>, _>("quota"),
+            ),
+            None => {
+                let Some(acct) = account_id_of(uid) else {
+                    return Ok(false);
+                };
+                let Some(r) = sqlx::query("SELECT status, bucket_quota FROM accounts WHERE id = ?")
+                    .bind(&acct)
+                    .fetch_optional(&self.pool)
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                (
+                    acct,
+                    r.get::<String, _>("status"),
+                    r.get::<Option<i64>, _>("bucket_quota"),
+                )
+            }
+        };
+        // 账户停用：认证层已拒；此处兜底（fail-closed）。
+        if status != "active" {
+            return Ok(true);
+        }
+        let Some(quota) = quota.filter(|q| *q >= 0) else {
+            return Ok(false);
+        };
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM buckets b JOIN users u ON u.id = b.owner_id \
+             LEFT JOIN account_members bm ON bm.uid = u.id \
+             WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = ?",
+        )
+        .bind(&acct)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n >= quota)
     }
 
     /// M5 切片 5（S8）：AK 的会话策略（`kind='session'` 且 `session_policy` 非空时）。
@@ -1042,6 +1143,7 @@ impl Acl {
             op,
             ak: "",
             uid: 0,
+            account_id: None,
             bucket: b,
             key,
             anonymous: true,
@@ -1101,6 +1203,23 @@ impl Acl {
         copy_src: Option<(&str, &str)>,
     ) -> S3Result<(bool, Option<String>)> {
         let is_admin = user.is_admin;
+        // AC-0：账户根 ARN 主体按「用户当前账户」解析（成员行优先，无行回落派生账户）。
+        // 多一次 PK 查询换取策略主体与账户模型同源；失败 fail-closed。
+        let account_id = self.account_id_of_user(user.uid).await.map_err(acl_err)?;
+        // AC-2：账户桶数硬配额在写边界（CreateBucket）fail-closed；管理员的桶归系统账户，
+        // 不受任何用户账户配额约束。放在 check_op（而非 check）使 S3/AP/作业入口同口径。
+        if op == "CreateBucket"
+            && !is_admin
+            && self
+                .bucket_quota_exceeded(user.uid)
+                .await
+                .map_err(acl_err)?
+        {
+            return Err(s3s::s3_error!(
+                TooManyBuckets,
+                "account bucket quota exceeded"
+            ));
+        }
 
         // DeleteObjects：对象键在请求体里，check 阶段拿不到 → 授权**整体下放 handler 逐键**
         //（service.rs::delete_objects 对每个键跑 policy×表三档，与单键删同口径；AWS 亦逐键
@@ -1159,6 +1278,7 @@ impl Acl {
                         op,
                         ak,
                         uid: user.uid,
+                        account_id: account_id.as_deref(),
                         bucket: b,
                         key,
                         anonymous: false,
@@ -1201,6 +1321,7 @@ impl Acl {
                             op,
                             ak,
                             uid: user.uid,
+                            account_id: account_id.as_deref(),
                             bucket: src_bucket,
                             key: Some(src_key),
                             anonymous: false,
@@ -1239,6 +1360,7 @@ impl Acl {
                 op,
                 ak,
                 uid: user.uid,
+                account_id: account_id.as_deref(),
                 bucket: src_bucket,
                 key: Some(src_key),
                 anonymous: false,
@@ -1249,6 +1371,7 @@ impl Acl {
                         op,
                         ak,
                         uid: user.uid,
+                        account_id: account_id.as_deref(),
                         bucket: b,
                         key,
                         anonymous: false,
@@ -1624,7 +1747,13 @@ mod tests {
              CREATE TABLE bucket_policies (bucket TEXT PRIMARY KEY, policy_json TEXT NOT NULL);\
              CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
               uid INTEGER NOT NULL, op TEXT NOT NULL, bucket TEXT, object_key TEXT, \
-              decision TEXT NOT NULL, detail TEXT);",
+              decision TEXT NOT NULL, detail TEXT);\
+             CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+              status TEXT NOT NULL DEFAULT 'active', admin_uid INTEGER, bucket_quota INTEGER, \
+              created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);\
+             CREATE TABLE account_members (account_id TEXT NOT NULL, uid INTEGER NOT NULL UNIQUE, \
+              role TEXT NOT NULL DEFAULT 'member', created_at INTEGER NOT NULL, \
+              PRIMARY KEY (account_id, uid));",
         )
         .execute(&pool)
         .await
@@ -1661,6 +1790,32 @@ mod tests {
             .execute(&a.pool)
             .await
             .unwrap();
+    }
+
+    async fn add_account(a: &Acl, id: &str, status: &str, quota: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO accounts (id, name, status, bucket_quota, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 0, 0)",
+        )
+        .bind(id)
+        .bind(format!("acct-{id}"))
+        .bind(status)
+        .bind(quota)
+        .execute(&a.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn add_member(a: &Acl, account_id: &str, uid: i64, role: &str) {
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, 0)",
+        )
+        .bind(account_id)
+        .bind(uid)
+        .bind(role)
+        .execute(&a.pool)
+        .await
+        .unwrap();
     }
 
     async fn set_policy(a: &Acl, bucket: &str, json: &str) {
@@ -2251,6 +2406,149 @@ mod tests {
         assert_eq!(a.user_of_key("AK_OK").await.unwrap(), None);
     }
 
+    /// AC-1：账户停用 → AK 在认证面立即失效（与 users.status 同口径）。
+    #[tokio::test]
+    async fn user_of_key_rejects_disabled_account() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_key(&a, "AK_OK", 2, None).await;
+        add_account(&a, "000000000002", "disabled", None).await;
+        add_member(&a, "000000000002", 2, "owner").await;
+        assert_eq!(a.user_of_key("AK_OK").await.unwrap(), None);
+
+        sqlx::query("UPDATE accounts SET status = 'active' WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert!(a.user_of_key("AK_OK").await.unwrap().is_some());
+    }
+
+    /// AC-0：账户根 ARN = 账户成员集合；无成员行回落 uid 派生账户；LEGACY 永不通配。
+    #[tokio::test]
+    async fn account_principal_matching_uses_membership_then_derived_fallback() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_user(&a, 3, false).await;
+        add_account(&a, "123456789012", "active", None).await;
+        add_member(&a, "123456789012", 2, "member").await;
+
+        let team_arn = "arn:aws:iam::123456789012:root";
+        assert_eq!(
+            a.account_id_of_user(2).await.unwrap().as_deref(),
+            Some("123456789012")
+        );
+        assert!(account_principal_matches(team_arn, 2, Some("123456789012")));
+        assert!(!account_principal_matches(
+            team_arn,
+            3,
+            Some("999999999999")
+        ));
+        // 无成员行 → 派生账户（存量用户 ARN 不变）
+        assert!(account_principal_matches(
+            "arn:aws:iam::000000000003:root",
+            3,
+            None
+        ));
+        assert!(!account_principal_matches(team_arn, 3, None));
+        // 系统账户与 uid=0 永不匹配
+        assert!(!account_principal_matches(
+            "arn:aws:iam::000000000000:root",
+            3,
+            Some(LEGACY_ACCOUNT)
+        ));
+        assert!(!account_principal_matches(team_arn, 0, None));
+        // 非 root 形态不命中
+        assert!(!account_principal_matches(
+            "arn:aws:iam::123456789012:user/x",
+            2,
+            Some("123456789012")
+        ));
+    }
+
+    /// AC-2：账户桶数硬配额（NULL/负 = 不限；停用账户 fail-closed 拒建桶）。
+    #[tokio::test]
+    async fn bucket_quota_counts_owned_buckets_and_rejects_at_limit() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_account(&a, "000000000002", "active", Some(1)).await;
+        add_member(&a, "000000000002", 2, "owner").await;
+        assert!(!a.bucket_quota_exceeded(2).await.unwrap(), "尚未建桶");
+        add_bucket(&a, "one", Some(2)).await;
+        assert!(a.bucket_quota_exceeded(2).await.unwrap(), "1/1 已满");
+
+        sqlx::query("UPDATE accounts SET bucket_quota = 2 WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert!(!a.bucket_quota_exceeded(2).await.unwrap());
+        sqlx::query("UPDATE accounts SET bucket_quota = NULL WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert!(!a.bucket_quota_exceeded(2).await.unwrap(), "NULL = 不限");
+
+        sqlx::query("UPDATE accounts SET status = 'disabled' WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert!(
+            a.bucket_quota_exceeded(2).await.unwrap(),
+            "停用账户 fail-closed"
+        );
+    }
+
+    /// AC-2：无成员行的用户按派生账户计数（legacy fallback）。
+    #[tokio::test]
+    async fn bucket_quota_falls_back_to_derived_account() {
+        let a = acl().await;
+        add_user(&a, 4, false).await;
+        add_account(&a, "000000000004", "active", Some(1)).await;
+        add_bucket(&a, "legacy", Some(4)).await;
+        assert!(a.bucket_quota_exceeded(4).await.unwrap());
+    }
+
+    /// AC-2：S3/AP 共用的 `check_op` 在 CreateBucket 上执行配额门（管理员豁免）。
+    #[tokio::test]
+    async fn create_bucket_quota_gate_in_check_op() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_account(&a, "000000000002", "active", Some(0)).await;
+        add_member(&a, "000000000002", 2, "owner").await;
+        let sub = AuthedUser {
+            uid: 2,
+            is_admin: false,
+            ak: "AK2".into(),
+        };
+        let err = a
+            .check_op(&sub, "AK2", "CreateBucket", Some("new"), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(*err.code(), S3ErrorCode::TooManyBuckets);
+
+        // 管理员不受用户账户配额约束
+        let admin = AuthedUser {
+            uid: 2,
+            is_admin: true,
+            ak: "AK2".into(),
+        };
+        let (allow, _) = a
+            .check_op(&admin, "AK2", "CreateBucket", Some("new"), None, None)
+            .await
+            .unwrap();
+        assert!(allow);
+
+        // 取消配额后放行
+        sqlx::query("UPDATE accounts SET bucket_quota = NULL WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        let (allow, _) = a
+            .check_op(&sub, "AK2", "CreateBucket", Some("new"), None, None)
+            .await
+            .unwrap();
+        assert!(allow);
+    }
+
     #[tokio::test]
     async fn record_bucket_owner_is_idempotent_and_preserves_existing() {
         let a = acl().await;
@@ -2455,6 +2753,7 @@ mod session_tests {
                 op,
                 ak,
                 uid: 7,
+                account_id: None,
                 bucket,
                 key,
                 anonymous: false,
@@ -2463,6 +2762,7 @@ mod session_tests {
                 op,
                 ak,
                 uid: 7,
+                account_id: None,
                 bucket: sb,
                 key: Some(sk),
                 anonymous: false,

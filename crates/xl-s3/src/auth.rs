@@ -139,7 +139,10 @@ impl S3Auth for SigV4Auth {
             "SELECT ak.secret_key FROM access_keys ak JOIN users u ON u.id = ak.user_id \
              LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
              LEFT JOIN users pu ON pu.id = p.user_id \
+             LEFT JOIN account_members am ON am.uid = u.id \
+             LEFT JOIN accounts a ON a.id = am.account_id \
              WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
+               AND (am.uid IS NULL OR a.status = 'active') \
                AND (ak.expires_at IS NULL OR ak.expires_at > ?) \
                AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
                     AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \
@@ -218,7 +221,9 @@ mod tests {
             "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, status TEXT NOT NULL DEFAULT 'active');\
              CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
               status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL, \
-              parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');",
+              parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');\
+             CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active');\
+             CREATE TABLE account_members (account_id TEXT NOT NULL, uid INTEGER NOT NULL UNIQUE);",
         )
         .execute(&pool)
         .await
@@ -309,6 +314,32 @@ mod tests {
         let auth = SigV4Auth::new(pool);
         assert_invalid_ak(&auth.get_secret_key("AKIA_OFF").await.unwrap_err());
         assert_invalid_ak(&auth.get_secret_key("AKIA_OLD").await.unwrap_err());
+    }
+
+    /// AC-1：用户所在账户停用 → 其 AK 在 SigV4 认证面失效（与用户停用同口径，不泄露原因）。
+    #[tokio::test]
+    async fn disabled_account_invalidates_access_key() {
+        let pool = oss_test_db().await;
+        insert_user(&pool).await;
+        insert_key(&pool, "AKIA_ACCT", "SK_ACCT", None).await;
+        sqlx::query(
+            "INSERT INTO accounts (id, status) VALUES ('000000000001', 'disabled');\
+             INSERT INTO account_members (account_id, uid) VALUES ('000000000001', 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth = SigV4Auth::new(pool.clone());
+        assert_invalid_ak(&auth.get_secret_key("AKIA_ACCT").await.unwrap_err());
+
+        sqlx::query("UPDATE accounts SET status = 'active' WHERE id = '000000000001'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.get_secret_key("AKIA_ACCT").await.unwrap().expose(),
+            "SK_ACCT"
+        );
     }
 
     #[tokio::test]

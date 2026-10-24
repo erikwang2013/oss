@@ -43,11 +43,11 @@ fn uid_of(payload: &JwtPayload) -> Result<i64, Response> {
 }
 
 /// 403（纯文本——前端 `rawApi` 直接把 resp.text() 当错误消息展示，零解析）。
-fn forbidden(msg: &str) -> Response {
+pub(crate) fn forbidden(msg: &str) -> Response {
     (StatusCode::FORBIDDEN, msg.to_string()).into_response()
 }
 
-fn internal_error() -> Response {
+pub(crate) fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
@@ -96,12 +96,26 @@ fn stale_user() -> Response {
 #[allow(clippy::result_large_err)]
 pub(crate) async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Response> {
     let uid = uid_of(payload)?;
-    match state.db.get_user(uid).await {
-        Ok(Some((_, is_admin, true))) => Ok((uid, is_admin)),
-        Ok(Some((_, _, false))) => Err(stale_user()),
-        Ok(None) => Err(stale_user()),
+    let (username, is_admin, active) = match state.db.get_user(uid).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return Err(stale_user()),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
+            return Err(internal_error());
+        }
+    };
+    // AC-1：账户停用 → 旧 JWT 立即作废（与登录/认证面同口径，fail-closed）
+    if !active {
+        return Err(stale_user());
+    }
+    match state.db.account_active(uid).await {
+        Ok(true) => Ok((uid, is_admin)),
+        Ok(false) => {
+            tracing::warn!(uid, username = %username, "账户已停用——拒绝控制面访问");
+            Err(stale_user())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "查询账户状态失败");
             Err(internal_error())
         }
     }
@@ -174,6 +188,8 @@ pub fn routes() -> Router<AppState> {
         .merge(crate::access_points_api::routes())
         // M8 S5：Inventory 配置（owner/admin）
         .merge(crate::inventory_api::routes())
+        // AC-0/AC-1：账户、成员与配额（Raft 模式下写接口 503）
+        .merge(crate::accounts_api::routes())
         .route(
             "/buckets/{bucket}/lifecycle",
             get(get_lifecycle).put(put_lifecycle),
@@ -339,13 +355,16 @@ async fn me(State(state): State<AppState>, Extension(payload): Extension<JwtPayl
         Ok(u) => u,
         Err(r) => return r,
     };
+    // who() 已含用户/账户启停判定；用户名再查一次（与人手规模相称，避免多一条专用查询）。
+    if let Err(r) = who(&state, &payload).await {
+        return r;
+    }
     match state.db.get_user(uid).await {
         Ok(Some((username, is_admin, true))) => Json(serde_json::json!({
             "id": uid, "username": username, "is_admin": is_admin
         }))
         .into_response(),
-        Ok(Some((_, _, false))) => stale_user(),
-        Ok(None) => stale_user(),
+        Ok(_) => stale_user(),
         Err(e) => {
             tracing::error!(error = %e, "查询用户失败");
             internal_error()
@@ -2489,6 +2508,17 @@ async fn create_bucket(
         Ok(v) => v,
         Err(r) => return r,
     };
+    // AC-2：账户桶数硬配额（管理员桶归系统账户，不受用户账户配额约束）。
+    if !is_admin {
+        match state.acl().bucket_quota_exceeded(uid).await {
+            Ok(false) => {}
+            Ok(true) => return (StatusCode::FORBIDDEN, "账户桶配额已用尽").into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "账户配额查询失败");
+                return internal_error();
+            }
+        }
+    }
     // M9 S0：Raft 控制写通道尚未接线（S6 翻转 RAFT_READY）。
     if state.cfg.raft.is_some() && !crate::raft::RAFT_READY {
         return (
