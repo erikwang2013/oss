@@ -118,6 +118,85 @@ impl std::error::Error for WriteError {}
 /// 基座错误：调用方（S6/S7）负责映射为 HTTP 状态；这里只保证底层错误可上报。
 pub type RaftResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
+/// M8-1：leadership 判定来源。`None` = 无法确定（未选出 leader / 节点已停止），
+/// 调用方必须按非 leader 处理（fail closed）。
+pub trait LeadershipSource: Send + Sync {
+    fn leadership(&self) -> Option<bool>;
+}
+
+impl LeadershipSource for RaftHandle {
+    fn leadership(&self) -> Option<bool> {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        if m.running_state.is_err() {
+            return None;
+        }
+        m.current_leader.map(|leader| leader == m.id)
+    }
+}
+
+/// M8-1：单例后台任务（作业/清单/tier/生命周期调度）的 leader 门控。
+///
+/// 无 `[raft]`（M7/standalone）→ [`LeaderGate::always`]，行为与门控前一致。Raft 模式下
+/// 每轮取一次当前 leader：只有 `current_leader == 本节点` 才放行；无法确定 → 拒绝
+/// （fail closed）。不引入新的共识或租约，也不复制运行态——`job_tasks`/`inventory_*`/
+/// `tier_restores` 等仍是各节点本地表（跨节点持久化见 backlog §4.3 M8-2 / OSSCTL2）；
+/// 本门控只防多节点重复执行，接管依赖各节点已有的 stale/expired 领取回收。
+#[derive(Clone)]
+pub struct LeaderGate {
+    source: Arc<dyn LeadershipSource>,
+}
+
+impl LeaderGate {
+    /// M7/无 Raft：单节点即 leader-equivalent（保持既有调度行为）。
+    pub fn always() -> Self {
+        Self {
+            source: Arc::new(AlwaysLeader),
+        }
+    }
+
+    /// `None` = 无 `[raft]` → always；`Some` = 跟随该节点的 Raft leader 状态。
+    pub fn from_raft(raft: Option<Arc<RaftHandle>>) -> Self {
+        match raft {
+            Some(handle) => Self { source: handle },
+            None => Self::always(),
+        }
+    }
+
+    /// 固定值来源（测试/嵌入）：`Some(true)` = leader，`Some(false)`/`None` = 不执行。
+    pub fn fixed(leader: Option<bool>) -> Self {
+        struct Fixed(Option<bool>);
+        impl LeadershipSource for Fixed {
+            fn leadership(&self) -> Option<bool> {
+                self.0
+            }
+        }
+        Self {
+            source: Arc::new(Fixed(leader)),
+        }
+    }
+
+    /// 当前是否应执行单例工作。unknown → false（fail closed）。
+    pub fn is_leader(&self) -> bool {
+        self.source.leadership() == Some(true)
+    }
+
+    /// 一次性启动工作（对账）：等到本节点成为 leader 再执行；unknown 不会误放行。
+    pub async fn wait_until_leader(&self) {
+        while !self.is_leader() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+struct AlwaysLeader;
+
+impl LeadershipSource for AlwaysLeader {
+    fn leadership(&self) -> Option<bool> {
+        Some(true)
+    }
+}
+
 /// 已启动的 Raft 节点。字段私有，集成方通过访问器取 `Raft`/状态机。
 pub struct RaftHandle {
     raft: Raft<TypeConfig>,
@@ -220,6 +299,12 @@ impl RaftHandle {
             .voter_ids()
             .next()
             .is_some()
+    }
+
+    /// M8-1：本节点当前是否 leader（选举中/无法确定 = false）。只用于单例后台任务
+    /// 去重，**不是**线性一致读写依据。
+    pub fn is_leader(&self) -> bool {
+        <Self as LeadershipSource>::leadership(self) == Some(true)
     }
 
     /// 当前 leader 的 advertise 地址（成员表查不到 = None；S7.1 follower 单跳转发用）。
@@ -848,5 +933,87 @@ mod tests {
         assert_eq!(state.last_purged_log_id, Some(entries[0].log_id));
         assert_eq!(state.last_log_id, Some(entries[0].log_id));
         assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
+    }
+
+    // ---- M8-1：leader 门控（确定性 mock 来源） ----
+
+    /// 0 = unknown，1 = leader，2 = follower。
+    struct MockLeadership(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+    impl LeadershipSource for MockLeadership {
+        fn leadership(&self) -> Option<bool> {
+            match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => None,
+                1 => Some(true),
+                _ => Some(false),
+            }
+        }
+    }
+
+    fn mock_gate(v: u8) -> (LeaderGate, std::sync::Arc<std::sync::atomic::AtomicU8>) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(v));
+        (
+            LeaderGate {
+                source: std::sync::Arc::new(MockLeadership(std::sync::Arc::clone(&flag))),
+            },
+            flag,
+        )
+    }
+
+    #[test]
+    fn leader_gate_single_node_and_unknown() {
+        // 单节点/M7 回归：无 Raft 恒为 leader-equivalent。
+        assert!(LeaderGate::always().is_leader());
+        assert!(LeaderGate::from_raft(None).is_leader());
+        assert!(LeaderGate::fixed(Some(true)).is_leader());
+        assert!(!LeaderGate::fixed(Some(false)).is_leader());
+        // 无法确定 → fail closed。
+        assert!(!LeaderGate::fixed(None).is_leader());
+    }
+
+    #[test]
+    fn leader_gate_follower_skips_and_handoff_flips() {
+        let (gate, flag) = mock_gate(2);
+        assert!(!gate.is_leader(), "follower 不领取");
+        flag.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(gate.is_leader(), "交接后新 leader 开始工作");
+        flag.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(!gate.is_leader(), "旧 leader 停止领取");
+        flag.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(!gate.is_leader(), "unknown fail closed");
+    }
+
+    /// 真实 Raft 单节点：选出 leader 后 `is_leader`/`LeaderGate` 为真（M7 语义之外的
+    /// 单节点 Raft 回归），停止后 fail closed。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raft_handle_leader_gate_single_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = Arc::new(spawn(test_settings(dir.path())).await.unwrap());
+        assert_eq!(wait_leader(&handle).await, 1);
+        assert!(handle.is_leader());
+        assert!(LeaderGate::from_raft(Some(Arc::clone(&handle))).is_leader());
+        handle.shutdown().await;
+        assert!(!handle.is_leader(), "停止后不得继续放行单例任务");
+    }
+
+    #[tokio::test]
+    async fn wait_until_leader_resumes_on_handoff() {
+        let (gate, flag) = mock_gate(2);
+        let waiter = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                gate.wait_until_leader().await;
+                true
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "follower 上不得提前放行");
+        flag.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 }

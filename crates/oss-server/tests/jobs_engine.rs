@@ -3,7 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use oss_server::db::{Db, JobSpec, NewJobTask};
-use oss_server::jobs::{JobEnv, TaskExecutor, worker_once};
+use oss_server::jobs::{JobEnv, TaskExecutor, worker_once, worker_tick};
+use oss_server::raft::LeaderGate;
 use xl_store::store::{Store, StoreConfig};
 
 struct OkExec;
@@ -550,4 +551,74 @@ async fn recover_orphan_jobs_marks_crash_left_running_rows() {
     assert_eq!(db.recover_orphan_jobs(5000, 7000).await.unwrap(), 1);
     let h = db.job_get(hb).await.unwrap().unwrap();
     assert_eq!(h["state"], "error");
+}
+
+/// M8-1：leader 门控——unknown/follower 不领取，交接后新 leader 恢复；单节点恒放行。
+#[tokio::test]
+async fn leader_gate_blocks_follower_claims_and_resumes_on_handoff() {
+    let (db, store, _d1, _d2) = setup().await;
+    let e = env(3, 30);
+    let id = db
+        .create_job(&spec(vec!["Copy"], false), 1000)
+        .await
+        .unwrap();
+
+    // 无法确定 leadership → fail closed。
+    let gate = LeaderGate::fixed(None);
+    assert!(
+        !worker_tick(&db, &store, &OkExec, e, 1000, &gate)
+            .await
+            .unwrap()
+    );
+    assert_ne!(db.job_get(id).await.unwrap().unwrap()["state"], "done");
+
+    // follower → 不领取。
+    let gate = LeaderGate::fixed(Some(false));
+    assert!(
+        !worker_tick(&db, &store, &OkExec, e, 1000, &gate)
+            .await
+            .unwrap()
+    );
+    assert_ne!(db.job_get(id).await.unwrap().unwrap()["state"], "done");
+
+    // 新 leader 接管后执行。
+    let gate = LeaderGate::fixed(Some(true));
+    assert!(
+        worker_tick(&db, &store, &OkExec, e, 1000, &gate)
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.job_get(id).await.unwrap().unwrap()["state"], "done");
+
+    // 交接走开：旧 leader 不再领取新任务；重新拿到 leadership 再跑。
+    let id2 = db
+        .create_job(&spec(vec!["Copy"], false), 1002)
+        .await
+        .unwrap();
+    let gate = LeaderGate::fixed(Some(false));
+    assert!(
+        !worker_tick(&db, &store, &OkExec, e, 1002, &gate)
+            .await
+            .unwrap()
+    );
+    assert_ne!(db.job_get(id2).await.unwrap().unwrap()["state"], "done");
+    let gate = LeaderGate::fixed(Some(true));
+    assert!(
+        worker_tick(&db, &store, &OkExec, e, 1002, &gate)
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.job_get(id2).await.unwrap().unwrap()["state"], "done");
+
+    // 单节点/M7 回归：always 门控照常领取。
+    let id3 = db
+        .create_job(&spec(vec!["Copy"], false), 1003)
+        .await
+        .unwrap();
+    assert!(
+        worker_tick(&db, &store, &OkExec, e, 1003, &LeaderGate::always())
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.job_get(id3).await.unwrap().unwrap()["state"], "done");
 }

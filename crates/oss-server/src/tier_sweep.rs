@@ -1,4 +1,7 @@
 //! M8 S4b：Transition sweep、Restore reaper 与启动对账（executor 见 `tier_jobs`）。
+//!
+//! M8-1：Raft 模式下 sweep/reaper/启动对账只在 leader 跑（[`crate::raft::LeaderGate`]）；
+//! `tier_restores`/作业表仍是节点本地表，门控只防重复执行，不复制运行态（backlog §4.3）。
 
 use std::sync::Arc;
 
@@ -413,15 +416,20 @@ fn env_secs(key: &str, default: u64) -> u64 {
 }
 
 /// 启动时对账一次，并挂 sweep / reaper 周期任务（`0` = 关闭对应周期）。
+/// M8-1：对账与周期任务都只在 leader 执行。
 pub fn spawn(
     db: Arc<Db>,
     store: Arc<Store>,
     lifecycle: Arc<dyn LifecycleStore>,
     sink: Arc<dyn RestoreSink>,
+    gate: crate::raft::LeaderGate,
 ) {
     let reconcile_db = Arc::clone(&db);
     let reconcile_store = Arc::clone(&store);
+    let reconcile_gate = gate.clone();
     tokio::spawn(async move {
+        // 对账也是单例写：等到本节点成为 leader 再做（unknown 一直等）。
+        reconcile_gate.wait_until_leader().await;
         match reconcile_restores(&reconcile_db, &reconcile_store, sink.as_ref()).await {
             Ok(n) if n > 0 => tracing::info!(n, "restore 启动对账完成"),
             Ok(_) => {}
@@ -432,11 +440,15 @@ pub fn spawn(
     if sweep_secs > 0 {
         let db = Arc::clone(&db);
         let store = Arc::clone(&store);
+        let gate = gate.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
+                if !gate.is_leader() {
+                    continue;
+                }
                 match sweep_transitions(&db, &store, lifecycle.as_ref()).await {
                     Ok(n) if n > 0 => tracing::info!(n, "tier sweep：入队 Transition"),
                     Ok(_) => {}
@@ -454,6 +466,9 @@ pub fn spawn(
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
+                if !gate.is_leader() {
+                    continue;
+                }
                 match reap_once(&db, &store).await {
                     Ok(n) if n > 0 => tracing::info!(n, "tier reaper：回收过期恢复"),
                     Ok(_) => {}

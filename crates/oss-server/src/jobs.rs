@@ -1,12 +1,15 @@
 //! M8 S0：作业引擎（job_tasks 领取/重试/超时/报告）。
 //!
 //! 单节点 SQLite：`OSS_JOB_WORKERS` 个 worker 共享同一 WAL，`claim_task` 用
-//! `BEGIN IMMEDIATE` 原子领取；多进程/多节点不支持（落档）。动作执行委托给
-//! [`TaskExecutor`]——S3/S4b/S5 各自提供实现，S0 只有测试 executor。
+//! `BEGIN IMMEDIATE` 原子领取；多进程不支持（落档）。M8-1 起 Raft 模式下只有 leader
+//! 领取执行（[`crate::raft::LeaderGate`]），但 `job_tasks` 等运行态仍是各节点本地表、
+//! 不随 Raft 复制：门控只防重复执行，跨节点接管要等 OSSCTL2（backlog §4.3 M8-2）。
+//! 动作执行委托给 [`TaskExecutor`]——S3/S4b/S5 各自提供实现，S0 只有测试 executor。
 
 use std::sync::Arc;
 
 use crate::db::Db;
+use crate::raft::LeaderGate;
 use xl_store::store::{Store, VersioningMode};
 
 /// 动作执行器。`Ok(code)` = 成功；`Err(msg)` = 可重试失败（由引擎按上限转 PermanentFailure）。
@@ -69,16 +72,41 @@ fn is_tier_action(action: &str) -> bool {
         || action.starts_with("Restore")
 }
 
-/// 启动 worker 池（`OSS_JOB_WORKERS=0` 关闭）。
-pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>) {
+/// 带 leader 门控的一轮领取（worker 循环/测试共用）。follower/unknown 不领取。
+pub async fn worker_tick(
+    db: &Db,
+    store: &Store,
+    exec: &dyn TaskExecutor,
+    env: JobEnv,
+    now: i64,
+    gate: &LeaderGate,
+) -> Result<bool, String> {
+    if !gate.is_leader() {
+        return Ok(false);
+    }
+    worker_once(db, store, exec, env, now).await
+}
+
+/// 启动 worker 池（`OSS_JOB_WORKERS=0` 关闭）。M8-1：只有 leader 领取/执行；
+/// 交接后旧 leader 下一轮即停，新 leader 下一轮接管（在途任务跑完，靠既有过期回收）。
+pub fn spawn_workers(
+    db: Arc<Db>,
+    store: Arc<Store>,
+    exec: Arc<dyn TaskExecutor>,
+    gate: LeaderGate,
+) {
     let env = JobEnv::from_env();
     if env.workers == 0 {
         tracing::info!("job worker 已关闭（OSS_JOB_WORKERS=0）");
         return;
     }
-    let now = crate::db::now();
     let recover = db.clone();
+    let recover_gate = gate.clone();
     tokio::spawn(async move {
+        // 启动回收也是单例写：等到本节点成为 leader 再做（unknown 一直等）；时间在
+        // 拿到 leadership 后再取，避免用进程启动时刻判断过期。
+        recover_gate.wait_until_leader().await;
+        let now = crate::db::now();
         // 崩溃遗留：running 超过 300s 或 deadline 已过 → 按一次失败回收
         match recover
             .recover_stale_tasks(now - 300, env.max_attempts)
@@ -107,6 +135,7 @@ pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>
         let db = db.clone();
         let store = store.clone();
         let exec = exec.clone();
+        let gate = gate.clone();
         tokio::spawn(async move {
             let mut t =
                 tokio::time::interval(std::time::Duration::from_secs(env.interval_secs.max(1)));
@@ -114,7 +143,7 @@ pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>
             loop {
                 t.tick().await;
                 let now = crate::db::now();
-                match worker_once(&db, &store, exec.as_ref(), env, now).await {
+                match worker_tick(&db, &store, exec.as_ref(), env, now, &gate).await {
                     Ok(true) => {} // 立刻尝试下一条
                     Ok(false) => {}
                     Err(e) => tracing::warn!(worker = i, error = %e, "job worker 本轮失败"),
@@ -125,12 +154,16 @@ pub fn spawn_workers(db: Arc<Db>, store: Arc<Store>, exec: Arc<dyn TaskExecutor>
     // 抢占调度：worker 全部在动作中时也要能打标记（worker 循环此时不跑）。
     if env.workers > 0 {
         let sched = db.clone();
+        let sched_gate = gate;
         tokio::spawn(async move {
             let mut t =
                 tokio::time::interval(std::time::Duration::from_secs(env.interval_secs.max(1)));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
+                if !sched_gate.is_leader() {
+                    continue;
+                }
                 let now = crate::db::now();
                 match sched.preempt_lower_priority(env.workers, now).await {
                     Ok(n) if n > 0 => tracing::info!(n, "job：抢占低优先级作业"),

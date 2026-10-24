@@ -464,7 +464,11 @@ pub async fn run(
                 });
             }
 
+            // M8-1：单例后台任务 leader 门控（无 `[raft]` = 恒 true，行为不变；Raft 模式
+            // 下只有当前 leader 领取/执行，交接后各 worker 下一轮自动换手）。
+            let leader = crate::raft::LeaderGate::from_raft(state.raft.clone());
             // M9 S1/S3：sync 写/删 intent 恢复（先跑启动轮，再挂 30s worker）。
+            // intent 表是节点本地恢复队列（本节点发起、本节点重放），不做 leader 门控。
             crate::sync::recover_write_intents(&state).await;
             crate::sync::recover_delete_intents(&state).await;
             if state.site_enabled {
@@ -525,6 +529,7 @@ pub async fn run(
                 std::sync::Arc::clone(&state.db),
                 std::sync::Arc::clone(&state.store),
                 executor,
+                leader.clone(),
             );
             // M8 S4b：restore 启动对账 + Transition sweep / 过期 reaper 周期
             crate::tier_jobs::spawn(
@@ -532,11 +537,12 @@ pub async fn run(
                 std::sync::Arc::clone(&state.store),
                 std::sync::Arc::clone(&state.lifecycle),
                 std::sync::Arc::clone(&state.restore_sink),
+                leader.clone(),
             );
             // M8 加固：启动 + 周期清理崩溃残留的 S3 spool 暂存（tier-*.stage）。
             crate::tier::spawn_stage_sweeper(state.cfg.staging_dir.clone());
             // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
-            crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db));
+            crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db), leader);
 
             // TLS 主监听器走可热加载实现（每个新连接取配置快照）；明文路径保持
             // ecat HttpServer 不变（无 [tls] 时行为与旧版一致）。
