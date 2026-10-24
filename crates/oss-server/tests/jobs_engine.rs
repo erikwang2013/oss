@@ -435,6 +435,81 @@ async fn preemption_orders_priority_and_never_duplicates_completed_actions() {
     assert_eq!(db.job_get(low).await.unwrap().unwrap()["succeeded"], 3);
 }
 
+/// 抢占不是终态：preempted 作业仍占用 inflight 配额、不写报告、failed 不增长；
+/// 释放并跑完才落报告（报告含全部已执行任务，失败计数仍为 0）。
+#[tokio::test]
+async fn preempted_job_stays_inflight_and_writes_no_report_until_released() {
+    let (db, store, _d1, _d2) = setup().await;
+    let mut low_spec = spec_with(1, &[("Low", "L1"), ("Low", "L2")]);
+    low_spec.report_bucket = Some("reports".into());
+    low_spec.report_prefix = Some("out".into());
+    let low = db.create_job(&low_spec, 1000).await.unwrap();
+    let report_key = format!("out/{low}/results.csv");
+
+    // L1 在途（容量 1 满），高优先级作业排队 → 低优先级作业被抢占。
+    assert_eq!(db.claim_task(1000, 900).await.unwrap().unwrap().job_id, low);
+    let high = db
+        .create_job(&spec_with(9, &[("High", "H1")]), 1001)
+        .await
+        .unwrap();
+    assert_eq!(db.preempt_lower_priority(1, 1001).await.unwrap(), 1);
+    let j = db.job_get(low).await.unwrap().unwrap();
+    assert_eq!(j["state"], "preempted");
+    assert_eq!(j["failed"], 0);
+    // 配额口径：preempted 仍是 inflight（不得因让出容量而提前释放配额）。
+    assert_eq!(db.job_inflight_counts(Some(7)).await.unwrap(), (2, 2));
+
+    // 在途动作正常完成（抢占不打断），作业保持 preempted 且没有终态报告。
+    assert_eq!(
+        db.finish_task(low, 1, true, "Succeeded", None, 1002, 3)
+            .await
+            .unwrap(),
+        "done"
+    );
+    assert_eq!(
+        db.job_get(low).await.unwrap().unwrap()["state"],
+        "preempted"
+    );
+    assert!(
+        store.get_object("reports", &report_key).await.is_err(),
+        "preempted 不得落终态报告"
+    );
+
+    // 高优先级先跑完；低优先级仍被阻塞在 preempted，报告依旧不存在。
+    assert!(
+        worker_once(&db, &store, &OkExec, env_workers(1), 1003)
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.job_get(high).await.unwrap().unwrap()["state"], "done");
+    assert_eq!(
+        db.job_get(low).await.unwrap().unwrap()["state"],
+        "preempted"
+    );
+    assert!(store.get_object("reports", &report_key).await.is_err());
+
+    // 就绪队列清空 → 释放并跑完；此时才写报告，且 preempted 期间不计失败。
+    assert!(
+        worker_once(&db, &store, &OkExec, env_workers(1), 1004)
+            .await
+            .unwrap()
+    );
+    let done = db.job_get(low).await.unwrap().unwrap();
+    assert_eq!(done["state"], "done");
+    assert_eq!(done["failed"], 0);
+    assert_eq!(done["succeeded"], 2);
+    let (_, bytes) = store.get_object("reports", &report_key).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.lines().count(), 3, "表头 + 两条已执行任务");
+    assert!(!text.contains("failed"), "抢占不得写失败结果");
+    assert_eq!(db.job_inflight_counts(Some(7)).await.unwrap(), (0, 0));
+    assert!(
+        !worker_once(&db, &store, &OkExec, env_workers(1), 1005)
+            .await
+            .unwrap()
+    );
+}
+
 /// 同优先级不互相抢占；没有更高优先级就绪工作时作业连续执行、不进入 preempted。
 #[tokio::test]
 async fn no_preemption_for_equal_priority_or_idle_capacity() {

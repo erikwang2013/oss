@@ -263,7 +263,8 @@ pub async fn create_batch(
         _ => {}
     }
 
-    // 配额：控制台建作业前挡（queued/running/paused 计数；非原子但足够防呆）。
+    // 配额：控制台建作业前挡（queued/running/paused/preempted 计数——预占仍是 inflight；
+    // 非原子但足够防呆）。
     let (per_user, global) = quota_limits();
     let (u, g) = state
         .db

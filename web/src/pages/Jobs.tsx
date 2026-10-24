@@ -19,16 +19,8 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type JobDetail, type JobSummary } from '../api'
 import { fmtTime } from '../format'
+import { STATE_COLOR, isActiveState, isTerminalState } from '../jobState'
 import PageHeader from '../PageHeader'
-
-const STATE_COLOR: Record<string, string> = {
-  queued: 'blue',
-  running: 'processing',
-  paused: 'orange',
-  done: 'green',
-  error: 'red',
-  cancelled: 'magenta',
-}
 
 const OPERATIONS = ['CopyObject', 'DeleteObject', 'ReplaceTags', 'RestoreObject', 'InvokeLambda']
 
@@ -41,9 +33,8 @@ export default function Jobs() {
   const { data: jobs = [], isLoading, error } = useQuery({
     queryKey: ['jobs'],
     queryFn: () => api<JobSummary[]>('/api/v1/jobs'),
-    // 只有存在活动作业时才轮询（列表兼作进度面板；详情另有 2s 轮询）
-    refetchInterval: (q) =>
-      q.state.data?.some((j) => ['queued', 'running', 'paused'].includes(j.state)) ? 15_000 : false,
+    // 只有存在活动作业时才轮询（preempted 也在活动中；列表兼作进度面板；详情另有 2s 轮询）
+    refetchInterval: (q) => (q.state.data?.some((j) => isActiveState(j.state)) ? 15_000 : false),
   })
 
   // batch 没有 progress 字段：已完成 = succeeded+failed；未开始时不显示 0/N
@@ -51,7 +42,7 @@ export default function Jobs() {
     const total = j.total ?? '—'
     if (j.kind !== 'batch') return `${j.scanned ?? '—'} / ${total}`
     const done = j.progress ?? (j.succeeded ?? 0) + (j.failed ?? 0)
-    return done > 0 || ['done', 'error', 'cancelled'].includes(j.state) ? `${done} / ${total}` : `— / ${total}`
+    return done > 0 || isTerminalState(j.state) ? `${done} / ${total}` : `— / ${total}`
   }
 
   return (
@@ -274,10 +265,7 @@ function JobDrawer({ id, onClose }: { id: number; onClose: () => void }) {
   const { data, isLoading } = useQuery({
     queryKey: ['job', id, offset],
     queryFn: () => api<JobDetail>(`/api/v1/jobs/${id}?offset=${offset}&limit=${TASK_PAGE}`),
-    refetchInterval: (q) => {
-      const s = q.state.data?.job.state
-      return s && ['queued', 'running', 'paused'].includes(s) ? 2000 : false
-    },
+    refetchInterval: (q) => (isActiveState(q.state.data?.job.state) ? 2000 : false),
   })
 
   const act = useMutation({
@@ -305,7 +293,7 @@ function JobDrawer({ id, onClose }: { id: number; onClose: () => void }) {
           <Button size="small" disabled={state !== 'running'} onClick={() => act.mutate('pause')}>暂停</Button>
           <Button size="small" disabled={state !== 'paused'} onClick={() => act.mutate('resume')}>恢复</Button>
           <Popconfirm title="取消该作业？" onConfirm={() => act.mutate('cancel')}>
-            <Button size="small" danger disabled={!state || ['done', 'error', 'cancelled'].includes(state)}>
+            <Button size="small" danger disabled={!state || isTerminalState(state)}>
               取消
             </Button>
           </Popconfirm>

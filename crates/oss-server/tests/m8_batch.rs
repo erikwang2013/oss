@@ -1878,3 +1878,63 @@ async fn batch_events_stay_in_object_bucket() {
     assert_eq!(rows[0].0, "src");
     assert_eq!(rows[0].2["s3"]["bucket"]["name"], "src");
 }
+
+/// 跨账户：管理员可跨账户复制，但通知仍只进**动作发生桶**的配置——源账户桶收不到
+/// Copy 事件，目标账户桶收不到 Delete 事件；事件里的 bucket/ownerIdentity 只描述
+/// 该桶自身，不携带源桶/源账户身份。通知目标没有账户级订阅/转发模型（见模块头注）。
+#[tokio::test]
+async fn batch_cross_account_events_follow_object_bucket_only() {
+    let f = fx().await;
+    let alice = f.db().create_user("alice", "pw", false).await.unwrap();
+    let bob = f.db().create_user("bob", "pw", false).await.unwrap();
+    for (b, owner) in [("alice-b", alice), ("bob-b", bob)] {
+        f.store().create_bucket(b).await.unwrap();
+        f.db().insert_bucket(b, Some(owner)).await.unwrap();
+    }
+    f.put("alice-b", "x", b"data").await;
+    for b in ["alice-b", "bob-b"] {
+        f.notify(b, &["s3:ObjectCreated:Copy", "s3:ObjectRemoved:Delete"])
+            .await;
+    }
+
+    // Copy 跨账户：只写目标桶（bob 账户）的配置，目标桶 owner 是 bob。
+    let mut cp = payload("alice-b", "x", f.admin);
+    cp.target_bucket = Some("bob-b".into());
+    assert_eq!(f.run(BATCH_COPY, &cp).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Copy 只对目标桶发，源账户桶不得收到");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].1.as_str()),
+        ("bob-b", "t-bob-b")
+    );
+    assert_eq!(rows[0].2["s3"]["bucket"]["name"], "bob-b");
+    assert_eq!(
+        rows[0].2["s3"]["bucket"]["ownerIdentity"]["principalId"],
+        bob.to_string()
+    );
+    assert_eq!(
+        rows[0].2["userIdentity"]["principalId"],
+        bob.to_string(),
+        "事件身份取目标桶账户，不带作业提交者/源账户"
+    );
+    assert!(
+        !rows[0].2.to_string().contains("alice-b"),
+        "事件不得携带源桶/源账户信息"
+    );
+
+    // Delete：只进对象所在桶（alice 账户）的配置，目标账户桶不得收到。
+    f.clear_outbox().await;
+    let d = payload("alice-b", "x", f.admin);
+    assert_eq!(f.run(BATCH_DELETE, &d).await.unwrap(), "Succeeded");
+    let rows = f.outbox().await;
+    assert_eq!(rows.len(), 1, "Delete 只对对象桶发");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].1.as_str()),
+        ("alice-b", "t-alice-b")
+    );
+    assert_eq!(
+        rows[0].2["s3"]["bucket"]["ownerIdentity"]["principalId"],
+        alice.to_string()
+    );
+    assert_eq!(rows[0].2["userIdentity"]["principalId"], alice.to_string());
+}
