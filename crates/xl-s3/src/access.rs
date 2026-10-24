@@ -24,6 +24,15 @@ use s3s::dto::CopySource;
 use s3s::header::X_AMZ_COPY_SOURCE;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 
+/// 最小 xl-s3 夹具/未迁移旧库没有账户表：调用方按 uid 派生账户兼容处理。
+fn missing_accounts_table(e: &sqlx::Error) -> bool {
+    e.as_database_error().is_some_and(|d| {
+        let m = d.message();
+        m.contains("no such table")
+            && (m.contains("account_members") || m.contains("accounts"))
+    })
+}
+
 /// 已认证用户身份：`check` 里解析 AK 后塞进请求扩展（s3s 官方机制
 /// `S3AccessContext::extensions_mut`），后续 handler 用 `req.extensions.get::<AuthedUser>()` 读取。
 /// 带 `ak`：handler 级逐键策略复评（DeleteObjects）需要与 check 同源的 Principal 匹配输入；
@@ -710,7 +719,28 @@ impl Acl {
         .bind(now())
         .bind(now())
         .fetch_optional(&self.pool)
-        .await?;
+        .await;
+        // 最小 xl-s3 夹具/未迁移旧库：无账户表时按旧语义（账户状态不参与）认证。
+        let row = match row {
+            Ok(row) => row,
+            Err(e) if missing_accounts_table(&e) => sqlx::query(
+                "SELECT ak.user_id AS user_id, u.is_admin AS is_admin \
+                 FROM access_keys ak JOIN users u ON u.id = ak.user_id \
+                 LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
+                 LEFT JOIN users pu ON pu.id = p.user_id \
+                 WHERE ak.access_key = ? AND ak.status = 'active' AND u.status = 'active' \
+                   AND (ak.expires_at IS NULL OR ak.expires_at > ?) \
+                   AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
+                        AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \
+                        AND pu.status = 'active'))",
+            )
+            .bind(access_key)
+            .bind(now())
+            .bind(now())
+            .fetch_optional(&self.pool)
+            .await?,
+            Err(e) => return Err(e),
+        };
         if let Some(r) = row {
             return Ok(Some(AuthedUser {
                 uid: r.get("user_id"),
@@ -737,10 +767,15 @@ impl Acl {
         let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
             .bind(uid)
             .fetch_optional(&self.pool)
-            .await?;
-        Ok(row
-            .map(|r| r.get::<String, _>("account_id"))
-            .or_else(|| account_id_of(uid)))
+            .await;
+        match row {
+            Ok(row) => Ok(row
+                .map(|r| r.get::<String, _>("account_id"))
+                .or_else(|| account_id_of(uid))),
+            // 最小 xl-s3 夹具/未迁移旧库没有账户表：保持派生账户兼容语义。
+            Err(e) if missing_accounts_table(&e) => Ok(account_id_of(uid)),
+            Err(e) => Err(e),
+        }
     }
 
     /// AP 跨账户：请求者账户 + 有效状态（成员行优先，无成员行回落 uid 派生账户）。
@@ -759,7 +794,14 @@ impl Acl {
         )
         .bind(uid)
         .fetch_optional(&self.pool)
-        .await?;
+        .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(e) if missing_accounts_table(&e) => {
+                return Ok((account_id_of(uid), true));
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(r) = row {
             let account: String = r.get("account_id");
             let status: Option<String> = r.get("status");
@@ -790,7 +832,12 @@ impl Acl {
         )
         .bind(uid)
         .fetch_optional(&self.pool)
-        .await?;
+        .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(e) if missing_accounts_table(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         // 无成员行 → uid 派生账户；该账户行可能不存在（新用户/未回填）→ 无配额。
         let (acct, status, quota) = match row {
             Some(r) => (

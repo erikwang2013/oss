@@ -4998,8 +4998,8 @@ async fn tagging_replica_ingest_keeps_tags_with_token() {
         .output;
     // v1.16 起受信 REPLICA 摄入按 4.19 语义携带标签（站点复制同口径）。
     assert_eq!(out.tag_set.len(), 1, "受信 REPLICA 应保留标签");
-    assert_eq!(out.tag_set[0].key, "a");
-    assert_eq!(out.tag_set[0].value, "1");
+    assert_eq!(out.tag_set[0].key.as_deref(), Some("a"));
+    assert_eq!(out.tag_set[0].value.as_deref(), Some("1"));
 }
 
 #[tokio::test]
