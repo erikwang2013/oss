@@ -1502,10 +1502,11 @@ async fn m6_token_remote_replicates_metadata_and_same_origin_id() {
     assert_eq!(h.replication_status.as_deref(), Some("COMPLETED"));
 }
 
-/// 4.19：M6 版本删除只投递给同源 id 远端（源桶 Enabled），带内容指纹与幂等 404；
+/// M-1：M6 版本删除只投递给同源 id 远端（源桶 Enabled），只按源 id 定点删除 + 幂等 404；
+/// 绝不携带内容指纹（未映射历史副本无源身份，按内容删会误删他源副本）。
 /// 旧 M6 远端（无 token）保持「版本删除不入队」原语义。
 #[tokio::test]
-async fn m6_token_remote_replicates_version_delete_with_fingerprint() {
+async fn m6_token_remote_replicates_version_delete_without_content_fingerprint() {
     let (pool, store, _a, _b) = fixture().await;
     sqlx::query("INSERT INTO buckets (name, versioning) VALUES ('rbk', 'Enabled')")
         .execute(&pool)
@@ -1516,24 +1517,17 @@ async fn m6_token_remote_replicates_version_delete_with_fingerprint() {
         .execute(&pool)
         .await
         .unwrap();
-    // 真实删除以取得源端内容指纹。
     let (vid, _etag) = put_versioned(&store, "gone", b"payload").await;
-    let out = store
+    store
         .delete_object_versioned("rbk", "gone", Some(&vid), VersioningMode::Enabled)
         .await
         .unwrap();
-    let (fp_etag, fp_size) = match out {
-        xl_store::store::DeleteOutcome::Version {
-            content: Some(c), ..
-        } => c,
-        other => panic!("unexpected: {other:?}"),
-    };
     let wi = |key: &'static str, vid: &'static str| WriteInfo {
         bucket: "rbk",
         key,
         version_id: Some(vid),
-        etag: &fp_etag,
-        size: fp_size,
+        etag: "",
+        size: 0,
         is_delete_marker: false,
         is_version_delete: true,
         is_replica: false,
@@ -1579,10 +1573,9 @@ async fn m6_token_remote_replicates_version_delete_with_fingerprint() {
         .expect("定点删除");
     assert_eq!(del.origin_version_id.as_deref(), Some("v-del"));
     assert_eq!(del.site_token.as_deref(), Some("tok-m6"));
-    assert_eq!(del.origin_etag.as_deref(), Some(fp_etag.as_str()));
-    assert_eq!(
-        del.origin_size.as_deref(),
-        Some(fp_size.to_string().as_str())
+    assert!(
+        del.origin_etag.is_none() && del.origin_size.is_none(),
+        "版本删除不得携带内容指纹：{del:?}"
     );
     assert_eq!(del.bypass.as_deref(), Some("true"));
     assert_eq!(del.replication.as_deref(), Some("REPLICA"));

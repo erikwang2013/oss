@@ -269,6 +269,13 @@ impl Interceptor for TokenInterceptor {
     }
 }
 
+/// 常数时间比较集群令牌（长度不等直接 false；不因前缀匹配提前返回——避免计时侧信道
+/// 逐字节猜出共享令牌）。
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// 服务端：校验集群令牌。
 #[derive(Clone)]
 struct SecretInterceptor {
@@ -281,7 +288,7 @@ impl Interceptor for SecretInterceptor {
             .metadata()
             .get(TOKEN_KEY)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == self.secret);
+            .is_some_and(|v| ct_eq(v, &self.secret));
         if ok {
             // 提取 traceparent（debug 级：默认日志级别下不刷屏；抽查用 RUST_LOG=debug）
             if let Some(tp) = req
@@ -911,6 +918,7 @@ impl MeshTransport for TonicMesh {
             Some(mesh::MpuEnc::SseS3) => (1, String::new(), Vec::new()),
             Some(mesh::MpuEnc::SseKms) => (2, String::new(), Vec::new()),
             Some(mesh::MpuEnc::SseKmsCmk(name)) => (3, name, Vec::new()),
+            // L-3：原始客户钥随 Complete 转发；只有 mesh TLS 能防止其明文过网。
             Some(mesh::MpuEnc::SseC(key)) => (4, String::new(), key.to_vec()),
         };
         let (has_lock, lock_mode, lock_until, lock_legal_hold) = match &req.lock {
@@ -2168,8 +2176,22 @@ mod tests {
         assert!(tp.starts_with("00-") && tp.ends_with("-01"), "{tp}");
         assert_eq!(tp.len(), 3 + 32 + 1 + 16 + 3, "W3C 形态：{tp}");
         // 服务端：无令牌 → 拒
-        let mut si = SecretInterceptor { secret: "s".into() };
+        let mut si = SecretInterceptor {
+            secret: "secret".into(),
+        };
         assert!(si.call(Request::new(())).is_err());
+        // L-2：正确令牌放行；错误/前缀/同长度异值一律拒（常量时间比较）。
+        let with_token = |v: &'static str| {
+            let mut r = Request::new(());
+            r.metadata_mut().insert(TOKEN_KEY, v.parse().unwrap());
+            r
+        };
+        assert!(si.call(with_token("secret")).is_ok());
+        assert!(si.call(with_token("secre")).is_err(), "前缀不得放行");
+        assert!(si.call(with_token("secreu")).is_err(), "同长度异值不得放行");
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "ab"));
     }
 
     /// LMU 远端页的真实 gRPC 往返：None ↔ 空串、prefix/delimiter/key_marker、

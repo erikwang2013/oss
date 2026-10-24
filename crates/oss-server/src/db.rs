@@ -3632,23 +3632,14 @@ impl Db {
     /// 作业标记为 `preempted`。只改作业状态——正在执行的动作不被中断，已领取未执行
     /// 的任务由 worker 在动作边界自行回退（[`Self::requeue_task`]）。返回被抢占数。
     ///
+    /// M-2：抢占只在**同一 `requested_by`** 内生效（NULL 与 NULL 视为同一系统账户），
+    /// 一个租户的高优先级作业不能抢占另一个租户的作业。
     /// 严格大于才抢占：同优先级按 FIFO（next_at/task_no），不互相打断。
     pub async fn preempt_lower_priority(&self, capacity: usize, now: i64) -> Result<usize> {
         if capacity == 0 {
             return Ok(0);
         }
         let mut tx = self.pool.begin().await?;
-        let top: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(j.priority) FROM jobs j JOIN job_tasks t ON t.job_id = j.id \
-             WHERE j.state IN ('queued','running') AND t.state = 'queued' AND t.next_at <= ?",
-        )
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-        let Some(top) = top else {
-            tx.commit().await?;
-            return Ok(0);
-        };
         let running: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks WHERE state = 'running'")
                 .fetch_one(&mut *tx)
@@ -3659,11 +3650,17 @@ impl Db {
         }
         let n = sqlx::query(
             "UPDATE jobs SET state = 'preempted', updated_at = ? \
-             WHERE state = 'running' AND priority < ? \
-             AND EXISTS (SELECT 1 FROM job_tasks WHERE job_id = jobs.id AND state = 'queued')",
+             WHERE state = 'running' \
+             AND EXISTS (SELECT 1 FROM job_tasks WHERE job_id = jobs.id AND state = 'queued') \
+             AND EXISTS ( \
+               SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
+               WHERE h.state IN ('queued','running') \
+                 AND h.priority > jobs.priority \
+                 AND h.requested_by IS jobs.requested_by \
+                 AND t.state = 'queued' AND t.next_at <= ?)",
         )
         .bind(now)
-        .bind(top)
+        .bind(now)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -3671,16 +3668,17 @@ impl Db {
         Ok(n as usize)
     }
 
-    /// 释放抢占：高等优先级的**就绪**排队任务已清空（都已领取或完成）后，把
-    /// `preempted` 作业放回 `queued`（下一条领取按正常优先级顺序恢复）。返回释放数。
-    /// 正在运行的高优先级任务不阻塞释放——空闲容量应回到低优先级作业，领取顺序
-    /// 仍保证后续高优先级任务先被取走。
+    /// 释放抢占：同一 `requested_by` 内高等优先级的**就绪**排队任务已清空（都已领取
+    /// 或完成）后，把 `preempted` 作业放回 `queued`（下一条领取按正常优先级顺序恢复）。
+    /// 返回释放数。正在运行的高优先级任务不阻塞释放——空闲容量应回到低优先级作业，
+    /// 领取顺序仍保证后续高优先级任务先被取走。
     pub async fn release_preempted(&self, now: i64) -> Result<usize> {
         let n = sqlx::query(
             "UPDATE jobs SET state = 'queued', updated_at = ? \
              WHERE state = 'preempted' AND NOT EXISTS ( \
                SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
                WHERE h.id != jobs.id AND h.priority > jobs.priority \
+                 AND h.requested_by IS jobs.requested_by \
                  AND h.state IN ('queued','running') \
                  AND t.state = 'queued' AND t.next_at <= ?)",
         )

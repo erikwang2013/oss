@@ -21,6 +21,11 @@ use crate::job_actions::{
 };
 use crate::state::AppState;
 
+/// M-2：`priority` 完全由用户控制。限定小范围，避免用极端值（如 `i64::MAX`）在
+/// 协作式抢占中跨请求者压制其他租户的作业。
+const PRIORITY_MIN: i64 = -100;
+const PRIORITY_MAX: i64 = 100;
+
 /// `POST /api/v1/jobs` 请求体（kind 缺省 = batch）。
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BatchCreateRequest {
@@ -174,6 +179,11 @@ pub async fn create_batch(
 ) -> Result<BatchCreated, BatchError> {
     if req.kind.as_deref().is_some_and(|k| k != "batch") {
         return Err(invalid("POST /jobs 仅支持 kind=batch"));
+    }
+    if !(PRIORITY_MIN..=PRIORITY_MAX).contains(&req.priority) {
+        return Err(invalid(format!(
+            "priority 必须在 {PRIORITY_MIN}..={PRIORITY_MAX}"
+        )));
     }
     let op = BatchOp::parse(&req.operation)
         .ok_or_else(|| invalid(format!("未知 operation: {}", req.operation)))?;

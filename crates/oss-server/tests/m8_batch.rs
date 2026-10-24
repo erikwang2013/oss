@@ -1419,6 +1419,20 @@ async fn creation_validation_permissions_and_quota() {
         Err(BatchError::Invalid(_))
     ));
 
+    // M-2：priority 用户可控 → 限定 -100..=100，越界 400（含极端值）。
+    for p in [i64::MAX, i64::MIN, 101, -101] {
+        let mut r = req("ReplaceTags", "m.csv");
+        r.tags = tags(&[("k", "v")]);
+        r.priority = p;
+        assert!(
+            matches!(
+                create_batch(&f.st, f.admin, true, r).await,
+                Err(BatchError::Invalid(_))
+            ),
+            "priority {p} 必须 400"
+        );
+    }
+
     // 配额：已有 100 个 in-flight 作业 → 429
     for i in 0..100 {
         f.db()

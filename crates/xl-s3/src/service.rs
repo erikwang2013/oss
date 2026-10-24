@@ -2387,9 +2387,6 @@ impl S3 for OssS3 {
             _ => false,
         };
         let origin_id = hdr("x-oss-origin-version-id");
-        // 4.19：源端内容指纹（仅当该内容在源链唯一时随删除下发）。
-        let origin_etag = hdr("x-oss-origin-etag").filter(|e| !e.is_empty());
-        let origin_size = hdr("x-oss-origin-size").and_then(|s| s.parse::<u64>().ok());
         // 4.16：站点对 marker 同 id——REPLICA DELETE 在 site token 认证下可用
         // `x-oss-origin-version-id` 指定 marker 版本 id（异步站点复制；sync 桶走 M9 内部路由）。
         let forced_marker = if vid.is_none() && replica {
@@ -2440,54 +2437,12 @@ impl S3 for OssS3 {
                 .await
                 .map_err(to_s3_error)?,
         };
-        // 4.19：混合版本升级前复制的历史异步副本两端 UUID 不同，按源 id 删除会落空（幂等 204
-        // 但目标残留）。仅在 REPLICA + 站点 token 认证、请求带源端「内容唯一」指纹、且本地
-        // id 未命中时，删除未映射（无 remote_version_id）的 REPLICA 历史副本。
-        // 内容指纹由源端在「源链已无同 (etag,size) 版本」时给出——因此命中的目标副本必为
-        // 源端已不存在的版本；多副本一并清。marker（etag 恒空）不参与，仍按同 id 定点。
-        let mut legacy_tiers = Vec::new();
-        if matches!(&outcome, DeleteOutcome::NotFound)
-            && replica
-            && token_ok
-            && origin_id.is_some()
-            && vid.as_deref().is_some_and(|v| !v.is_empty() && v != "null")
-            && let (Some(etag), Some(size)) = (origin_etag, origin_size)
-        {
-            let ids = self
-                .store
-                .find_unmapped_replica_versions(&bucket, &key, etag, size)
-                .await
-                .map_err(to_s3_error)?;
-            for id in ids {
-                match self
-                    .delete_versioned(&bucket, &key, Some(&id), mode, bypass)
-                    .await
-                {
-                    Ok(DeleteOutcome::Version {
-                        version_id, tier, ..
-                    }) => {
-                        legacy_tiers.extend(tier);
-                        self.emit(
-                            S3EventOp::RemovedDelete,
-                            &bucket,
-                            &key,
-                            Some(&version_id),
-                            None,
-                            None,
-                            event_source.clone(),
-                        )
-                        .await;
-                    }
-                    // 竞态：另一路已删 — 幂等。
-                    Ok(DeleteOutcome::NotFound) => {}
-                    Ok(_) => {}
-                    Err(e) => return Err(to_s3_error(e)),
-                }
-            }
-        }
+        // M-1 安全修正：绝不按内容指纹删除未映射（remote_version_id=None）的历史 REPLICA。
+        // 这类副本不携带源站/源桶身份，共享目标上多个源的同内容副本无法区分，按内容删除
+        // 会误删他源活副本。源 id 未命中时保持幂等 204；历史副本需人工对账后清理。
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
         // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
-        let mut tier_refs = legacy_tiers;
+        let mut tier_refs = Vec::new();
         let (dm, vid) = match outcome {
             DeleteOutcome::Marker { version_id } => {
                 self.emit(
@@ -2514,11 +2469,7 @@ impl S3 for OssS3 {
                 .await;
                 (Some(true), Some(version_id))
             }
-            DeleteOutcome::Version {
-                version_id,
-                tier,
-                content,
-            } => {
+            DeleteOutcome::Version { version_id, tier } => {
                 tier_refs.extend(tier);
                 self.emit(
                     S3EventOp::RemovedDelete,
@@ -2531,17 +2482,13 @@ impl S3 for OssS3 {
                 )
                 .await;
                 // 4.16：版本定向删除也要复制——站点对同源版本 id，目标做定点删除（不造 marker）。
-                // 4.19：内容指纹随行（仅当源链中该内容唯一），目标可据此兼容无同源 id 的历史副本。
-                let (etag, size) = match &content {
-                    Some((e, s)) => (e.as_str(), *s),
-                    None => ("", 0),
-                };
+                // M-1：不再随行内容指纹；未映射历史副本无源身份，禁止按内容自动清理。
                 self.repl_on_write(crate::replication::WriteInfo {
                     bucket: &bucket,
                     key: &key,
                     version_id: Some(&version_id),
-                    etag,
-                    size,
+                    etag: "",
+                    size: 0,
                     is_delete_marker: false,
                     is_version_delete: true,
                     is_replica: replica,
@@ -2753,11 +2700,7 @@ impl S3 for OssS3 {
                             .await;
                             (Some(true), Some(version_id), None)
                         }
-                        DeleteOutcome::Version {
-                            version_id,
-                            tier,
-                            content,
-                        } => {
+                        DeleteOutcome::Version { version_id, tier } => {
                             tier_refs.extend(tier);
                             self.emit(
                                 S3EventOp::RemovedDelete,
@@ -2770,17 +2713,13 @@ impl S3 for OssS3 {
                             )
                             .await;
                             // 4.16：批量版本定向删除同样复制（目标定点删同 id，不造 marker）。
-                            // 4.19：内容指纹语义同单键删除。
-                            let (etag, size) = match &content {
-                                Some((e, s)) => (e.as_str(), *s),
-                                None => ("", 0),
-                            };
+                            // M-1：不随行内容指纹；未映射历史副本无源身份，禁止按内容自动清理。
                             self.repl_on_write(crate::replication::WriteInfo {
                                 bucket: &bucket,
                                 key: &obj.key,
                                 version_id: Some(&version_id),
-                                etag,
-                                size,
+                                etag: "",
+                                size: 0,
                                 is_delete_marker: false,
                                 is_version_delete: true,
                                 is_replica: replica,
