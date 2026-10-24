@@ -24,6 +24,7 @@ mod list;
 mod lock;
 mod mesh_api;
 mod mpu;
+mod mpu_route;
 mod put;
 mod read;
 mod rebalance;
@@ -126,7 +127,8 @@ pub struct BucketInfo {
     pub creation_nanos: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+// M3 MPU 会话粘性：Complete 转发应答经 msgpack 编解码 ObjectInfo（字段面即本结构）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
@@ -1747,6 +1749,8 @@ mod tests;
 mod tests_crypto;
 #[cfg(test)]
 mod tests_lock;
+#[cfg(test)]
+mod tests_mpu_mesh;
 #[cfg(test)]
 mod tests_parts;
 #[cfg(test)]

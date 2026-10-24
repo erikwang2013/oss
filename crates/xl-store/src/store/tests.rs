@@ -2889,6 +2889,48 @@ impl crate::mesh::MeshTransport for InProcessMesh {
     ) -> crate::error::Result<Option<crate::mesh::ControlRow>> {
         self.peer(n).await?.mesh_control_query(q).await
     }
+
+    // M3 MPU 会话粘性：in-process 直调对端本地入口（body 是真实流，不重启网络）。
+    async fn mpu_upload_part(
+        &self,
+        n: &str,
+        r: crate::mesh::MpuPartUpload,
+    ) -> crate::error::Result<String> {
+        self.peer(n)
+            .await
+            .map_err(|e| crate::error::Error::Unavailable(e.to_string()))?
+            .mesh_mpu_upload_part(r)
+            .await
+    }
+    async fn mpu_complete(
+        &self,
+        n: &str,
+        r: crate::mesh::MpuComplete,
+    ) -> crate::error::Result<crate::store::ObjectInfo> {
+        self.peer(n)
+            .await
+            .map_err(|e| crate::error::Error::Unavailable(e.to_string()))?
+            .mesh_mpu_complete(r)
+            .await
+    }
+    async fn mpu_abort(&self, n: &str, r: crate::mesh::MpuRef) -> crate::error::Result<()> {
+        self.peer(n)
+            .await
+            .map_err(|e| crate::error::Error::Unavailable(e.to_string()))?
+            .mesh_mpu_abort(r)
+            .await
+    }
+    async fn mpu_list_parts(
+        &self,
+        n: &str,
+        r: crate::mesh::MpuRef,
+    ) -> crate::error::Result<Vec<crate::mesh::MpuPartRow>> {
+        self.peer(n)
+            .await
+            .map_err(|e| crate::error::Error::Unavailable(e.to_string()))?
+            .mesh_mpu_list_parts(r)
+            .await
+    }
 }
 
 /// 4×3 = 12 槽 in-process 集群（与 e2e 统一）。EC 由槽位数推导：parity 恒 4、data = 槽数 − 4。

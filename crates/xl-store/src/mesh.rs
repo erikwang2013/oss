@@ -9,7 +9,10 @@
 
 use bytes::Bytes;
 
-use crate::error::Result;
+use crate::crypto::{EncSpec, SseCKey};
+use crate::error::{Error, Result};
+use crate::meta::ObjectLockRecord;
+use crate::store::{ByteStream, ObjectInfo, VersioningMode};
 
 /// meta 内容 hash（sha256）——提交协议只计「翻转内容 == 自己写的」的槽位（防伪达成）。
 pub fn content_hash(bytes: &[u8]) -> [u8; 32] {
@@ -286,6 +289,122 @@ pub trait SetResolver: Send + Sync + std::fmt::Debug {
     }
 }
 
+// ---------- M3 MPU 会话粘性：转发 DTO ----------
+//
+// 设计：`create_multipart_upload` 仍留在接收节点（暂存区在其 root 盘），返回的
+// upload_id 内嵌属主节点（见 `store::mpu_route`）。其余 MPU 操作在**协调者**（收到
+// 客户端请求的节点）解析属主并转发；服务端 handler 只执行本地暂存区操作。
+//
+// 转发语义：
+// - UploadPart 流式转发（`body` 为 ByteStream，不整段进内存）；传输层必须保证
+//   「流结束前未声明末块」被接收端视为截断（见 proto 的 is_final）。
+// - 传输失败一律 `Error::Unavailable`（S3 面 503），不得伪装成功/NoSuchUpload。
+// - 鉴权在协调者完成（SigV4/ACL/策略），属主只执行已授权动作；集群令牌是节点面
+//   鉴权。SSE-C 的 complete 密钥随请求转发（集群内网、勿公网暴露；建议 mesh TLS）。
+
+/// 转发 UploadPart：`body` 为前端节点的原始分片流（流式，不缓冲整段）。
+pub struct MpuPartUpload {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub part_number: u16,
+    pub sse_c_md5: Option<String>,
+    pub body: ByteStream,
+}
+
+impl std::fmt::Debug for MpuPartUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MpuPartUpload")
+            .field("bucket", &self.bucket)
+            .field("key", &self.key)
+            .field("upload_id", &self.upload_id)
+            .field("part_number", &self.part_number)
+            .field("sse_c_md5", &self.sse_c_md5)
+            .finish_non_exhaustive()
+    }
+}
+
+/// MPU 引用（Abort / ListParts）。
+#[derive(Clone, Debug)]
+pub struct MpuRef {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+}
+
+/// 转发 CompleteMultipartUpload：版本形态由协调者解析、属主落地。
+#[derive(Clone, Debug)]
+pub struct MpuComplete {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub parts: Vec<(u16, String)>,
+    pub mode: VersioningMode,
+    pub encryption: Option<MpuEnc>,
+    pub lock: Option<ObjectLockRecord>,
+}
+
+/// 转发用加密意图。**SSE-C 变体携带原始客户钥**——Debug 已脱敏；仅在集群内网传输。
+#[derive(Clone, PartialEq, Eq)]
+pub enum MpuEnc {
+    SseS3,
+    SseKms,
+    SseKmsCmk(String),
+    SseC([u8; 32]),
+}
+
+impl std::fmt::Debug for MpuEnc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SseS3 => f.write_str("SseS3"),
+            Self::SseKms => f.write_str("SseKms"),
+            Self::SseKmsCmk(n) => f.debug_tuple("SseKmsCmk").field(n).finish(),
+            Self::SseC(_) => f.write_str("SseC(<redacted>)"),
+        }
+    }
+}
+
+impl MpuEnc {
+    /// 请求侧 spec → 线上形态（密钥字节仅在 xl-store 内可取）。
+    pub fn from_spec(spec: &EncSpec) -> Self {
+        match spec {
+            EncSpec::SseS3 => Self::SseS3,
+            EncSpec::SseKms => Self::SseKms,
+            EncSpec::SseKmsCmk(n) => Self::SseKmsCmk(n.clone()),
+            EncSpec::SseC(k) => Self::SseC(*k.key()),
+        }
+    }
+
+    /// 线上形态 → 属主侧 spec（SSE-C 密钥重建为 `SseCKey`，md5 由密钥重算）。
+    pub fn to_spec(&self) -> EncSpec {
+        match self {
+            Self::SseS3 => EncSpec::SseS3,
+            Self::SseKms => EncSpec::SseKms,
+            Self::SseKmsCmk(n) => EncSpec::SseKmsCmk(n.clone()),
+            Self::SseC(k) => EncSpec::SseC(SseCKey::from_key(*k)),
+        }
+    }
+}
+
+/// ListParts 转发结果行（升序）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MpuPartRow {
+    pub part_number: u16,
+    pub size: u64,
+    pub etag: String,
+}
+
+/// ObjectInfo 线上编码（Complete 应答）：msgpack named，字段面由 xl-store 的 serde
+/// 派生钉住（跨版本转发在旧节点无此 RPC，本就 fail-closed）。
+pub fn encode_object_info(info: &ObjectInfo) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(info).map_err(|e| Error::Encode(format!("ObjectInfo 编码失败: {e}")))
+}
+
+/// 见 [`encode_object_info`]。
+pub fn decode_object_info(bytes: &[u8]) -> Result<ObjectInfo> {
+    rmp_serde::from_slice(bytes).map_err(|e| Error::Encode(format!("ObjectInfo 解码失败: {e}")))
+}
+
 /// 节点间传输。实现必须：幂等（write_shard/delete_version）、超时即错（调用方按
 /// 「缺失/quorum 计数」消化）、不得把对端错误吞成成功。
 #[async_trait::async_trait]
@@ -329,4 +448,30 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
     async fn health(&self, node: &str) -> Result<NodeHealth>;
     async fn lock(&self, node: &str, req: LockReq) -> Result<LockResp>;
     async fn control_query(&self, node: &str, q: ControlQuery) -> Result<Option<ControlRow>>;
+
+    // ---------- M3 MPU 会话粘性转发 ----------
+    // 默认实现 = 显式 Unavailable（fail-closed）：旧替身不必被迫实现，且绝不会把
+    // 「传输不支持」伪装成成功/NoSuchUpload。生产实现（TonicMesh / 测试 InProcessMesh）
+    // 必须覆盖。
+
+    /// 转发 UploadPart（流式；对端只落本地暂存区）。
+    async fn mpu_upload_part(&self, node: &str, req: MpuPartUpload) -> Result<String> {
+        let _ = (node, req);
+        Err(Error::Unavailable("MPU UploadPart 转发未实现".into()))
+    }
+    /// 转发 CompleteMultipartUpload（对端只做本地提交）。
+    async fn mpu_complete(&self, node: &str, req: MpuComplete) -> Result<ObjectInfo> {
+        let _ = (node, req);
+        Err(Error::Unavailable("MPU Complete 转发未实现".into()))
+    }
+    /// 转发 AbortMultipartUpload。
+    async fn mpu_abort(&self, node: &str, req: MpuRef) -> Result<()> {
+        let _ = (node, req);
+        Err(Error::Unavailable("MPU Abort 转发未实现".into()))
+    }
+    /// 转发 ListParts。
+    async fn mpu_list_parts(&self, node: &str, req: MpuRef) -> Result<Vec<MpuPartRow>> {
+        let _ = (node, req);
+        Err(Error::Unavailable("MPU ListParts 转发未实现".into()))
+    }
 }

@@ -560,6 +560,64 @@ impl Store {
         Ok(())
     }
 
+    // ---------- M3 MPU 会话粘性：服务端 handler（只执行本地暂存区操作，不再转发） ----------
+
+    /// 服务端 UploadPart：把转发流交给本地暂存区（流式落盘；失败清理 `.new`）。
+    /// 属主校验在 `upload_part_local → mpu_dir` 内：前缀不是本节点 → NoSuchUpload。
+    pub async fn mesh_mpu_upload_part(&self, r: crate::mesh::MpuPartUpload) -> Result<String> {
+        self.upload_part_local(
+            &r.bucket,
+            &r.key,
+            &r.upload_id,
+            r.part_number,
+            r.body,
+            r.sse_c_md5.as_deref(),
+        )
+        .await
+    }
+
+    /// 服务端 Complete：属主本地提交（版本形态/加密/锁意图由协调者透传）。
+    pub async fn mesh_mpu_complete(
+        &self,
+        r: crate::mesh::MpuComplete,
+    ) -> Result<crate::store::ObjectInfo> {
+        let encryption = r.encryption.map(|e| e.to_spec());
+        self.complete_multipart_upload_versioned_local(
+            &r.bucket,
+            &r.key,
+            &r.upload_id,
+            &r.parts,
+            r.mode,
+            encryption,
+            r.lock,
+        )
+        .await
+    }
+
+    /// 服务端 Abort：只删本节点暂存区（幂等失败面由本地实现决定）。
+    pub async fn mesh_mpu_abort(&self, r: crate::mesh::MpuRef) -> Result<()> {
+        self.abort_multipart_upload_local(&r.bucket, &r.key, &r.upload_id)
+            .await
+    }
+
+    /// 服务端 ListParts：只读本节点暂存区。
+    pub async fn mesh_mpu_list_parts(
+        &self,
+        r: crate::mesh::MpuRef,
+    ) -> Result<Vec<crate::mesh::MpuPartRow>> {
+        let parts = self
+            .list_parts_local(&r.bucket, &r.key, &r.upload_id)
+            .await?;
+        Ok(parts
+            .into_iter()
+            .map(|p| crate::mesh::MpuPartRow {
+                part_number: p.part_number,
+                size: p.size,
+                etag: p.etag,
+            })
+            .collect())
+    }
+
     /// 服务端控制面查询（Task 9）：本地后端执行（未注入 → 显式错误，不静默）。
     pub async fn mesh_control_query(
         &self,

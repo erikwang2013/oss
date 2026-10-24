@@ -17,6 +17,13 @@ service Mesh {
   rpc ListLocal(ListReq) returns (ListLocalResp);
   // ListMultipartUploads 的单节点页（集群并集：与 ListLocal 同一完备性口径）
   rpc ListUploadsLocal(UploadListReq) returns (UploadListLocalResp);
+  // M3 MPU 会话粘性：Create 留在接收节点，其余 MPU 操作按 upload_id 前缀转发给属主。
+  // UploadPart 走客户端流：首块带元数据，后续块带 data；末块 is_final=true，
+  // 接收端未见末块即按截断拒收（绝不提交半截 part）。
+  rpc UploadPart(stream MpuPartChunk) returns (MpuUploadPartResp);
+  rpc CompleteUpload(MpuCompleteReq) returns (MpuOpResp);
+  rpc AbortUpload(MpuRef) returns (MpuOpResp);
+  rpc ListParts(MpuRef) returns (MpuOpResp);
   rpc Health(Empty) returns (NodeHealth);
   rpc Lock(LockReq) returns (LockResp);
   rpc ControlQuery(ControlReq) returns (ControlResp);
@@ -83,4 +90,37 @@ message ControlResp { bool found=1; int64 uid=2; bool is_admin=3; bool active=4;
 message ControlWriteReq {
   // 目前唯一 kind：BUCKET_ROW_SET（a=bucket；has_set=true → set=值；false → 删行）
   uint32 kind=1; string a=2; bool has_set=3; uint32 set=4;
+}
+
+// ---------- M3 MPU 会话粘性转发 ----------
+message MpuRef { string bucket=1; string key=2; string upload_id=3; }
+message MpuPartChunk {
+  // 首块必带元数据（bucket/key/upload_id/part_number；sse_c_md5 空串 = 无 SSE-C）。
+  string bucket=1; string key=2; string upload_id=3; uint32 part_number=4;
+  string sse_c_md5=5; bytes data=6;
+  // 末块标记。接收端在流结束时未见此标记 → 按截断报错并清理 `.new`。
+  bool is_final=7;
+  // 发送端 body 出错：接收端拒收并清理（不得落成半截 part）。
+  bool abort=8; string error=9;
+}
+message MpuUploadPartResp { bool ok=1; string etag=2; string code=3; string msg=4; }
+message MpuPart { uint32 number=1; string etag=2; }
+message MpuCompleteReq {
+  MpuRef target=1;
+  repeated MpuPart parts=2;
+  // 0=Off 1=Enabled 2=Suspended：前端节点按本地控制面解析后透传，属主据此落地。
+  uint32 versioning_mode=3;
+  // 加密意图：0=无 1=SSE-S3 2=SSE-KMS 3=显式 CMK 4=SSE-C（sse_c_key = 原始 32B；
+  // 仅集群内网传输，SSE-C 跨节点场景建议启用 mesh TLS）。
+  uint32 enc_kind=4; string enc_cmk=5; bytes sse_c_key=6;
+  // 对象锁意图（直调 store API 才可能非空；S3 面由 create 记录后自主落地）。
+  bool has_lock=7; string lock_mode=8; int64 lock_until_nanos=9; bool lock_legal_hold=10;
+}
+message MpuPartRow { uint32 number=1; uint64 size=2; string etag=3; }
+message MpuOpResp {
+  bool ok=1; string code=2; string msg=3;
+  // Complete：ObjectInfo 的 msgpack（字段面由 xl-store 的 serde 派生钉住）。
+  bytes info=4;
+  // ListParts：升序段表。
+  repeated MpuPartRow parts=5;
 }
