@@ -28,8 +28,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 fn missing_accounts_table(e: &sqlx::Error) -> bool {
     e.as_database_error().is_some_and(|d| {
         let m = d.message();
-        m.contains("no such table")
-            && (m.contains("account_members") || m.contains("accounts"))
+        m.contains("no such table") && (m.contains("account_members") || m.contains("accounts"))
     })
 }
 
@@ -723,8 +722,9 @@ impl Acl {
         // 最小 xl-s3 夹具/未迁移旧库：无账户表时按旧语义（账户状态不参与）认证。
         let row = match row {
             Ok(row) => row,
-            Err(e) if missing_accounts_table(&e) => sqlx::query(
-                "SELECT ak.user_id AS user_id, u.is_admin AS is_admin \
+            Err(e) if missing_accounts_table(&e) => {
+                sqlx::query(
+                    "SELECT ak.user_id AS user_id, u.is_admin AS is_admin \
                  FROM access_keys ak JOIN users u ON u.id = ak.user_id \
                  LEFT JOIN access_keys p ON p.access_key = ak.parent_ak \
                  LEFT JOIN users pu ON pu.id = p.user_id \
@@ -733,12 +733,13 @@ impl Acl {
                    AND (ak.parent_ak IS NULL OR (p.kind = 'long-term' \
                         AND p.status = 'active' AND (p.expires_at IS NULL OR p.expires_at > ?) \
                         AND pu.status = 'active'))",
-            )
-            .bind(access_key)
-            .bind(now())
-            .bind(now())
-            .fetch_optional(&self.pool)
-            .await?,
+                )
+                .bind(access_key)
+                .bind(now())
+                .bind(now())
+                .fetch_optional(&self.pool)
+                .await?
+            }
             Err(e) => return Err(e),
         };
         if let Some(r) = row {

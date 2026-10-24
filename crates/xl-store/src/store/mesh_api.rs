@@ -83,8 +83,8 @@ impl Store {
         let probes = peers.iter().map(|peer| {
             let transport = &cl.transport;
             async move {
-                let got = tokio::time::timeout(PROBE_TIMEOUT, transport.data_wire_version(peer))
-                    .await;
+                let got =
+                    tokio::time::timeout(PROBE_TIMEOUT, transport.data_wire_version(peer)).await;
                 match got {
                     Ok(Ok(v)) => crate::mesh_gate::check_compatible(peer, v),
                     // 不可达/超时：不伪装成版本不兼容。
