@@ -28,6 +28,8 @@ use super::compat::{MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
 
 /// 本二进制可写的最新快照封套版本（1 = OSSCTL1 只读兼容，2 = OSSCTL2）。
 pub const SNAPSHOT_FORMAT: u32 = 2;
+/// 本二进制可解码的最高快照封套版本；`decode_snapshot` 必须接受 `1..=此值`。
+pub const SNAPSHOT_FORMAT_MAX: u32 = SNAPSHOT_FORMAT;
 
 const MAGIC: &[u8] = b"OSSCTL1\n";
 const MAGIC_V2: &[u8] = b"OSSCTL2\n";
