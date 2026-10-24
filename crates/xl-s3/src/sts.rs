@@ -8,8 +8,10 @@
 //! 父链条件在 auth.rs/user_of_key/cluster_control 三处同口径。WebIdentity 会话无父键
 //! （匿名入口不继承任何调用者权限）。
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use http::Extensions;
 use http::{HeaderMap, Method, Uri};
@@ -37,10 +39,17 @@ const AR_DEFAULT: i64 = 3600;
 /// L-1：匿名 AssumeRoleWithWebIdentity 的全局令牌桶——每次 JWT 验签（RSA/ES256）
 /// 远贵于拒绝一个未签名请求，限制放大面。签名 STS 路径不受影响。
 /// 固定阈值（每实例）；集群多节点时总吞吐按实例数放大，运营方仍应在反代叠加限流。
-/// shortcut: 全局桶不分租户/IP，单个攻击者可耗尽配额使合法匿名 STS 短暂 503；
-/// 需要公平性时升级为按对端 IP 分桶。
 const WI_RATE_PER_SEC: f64 = 20.0;
 const WI_BURST: f64 = 40.0;
+/// 按对端 IP 的分桶：全局桶之上再保证单个客户端不能吃掉全部配额。
+/// 仅当 HTTP 层注入了对端身份（TLS listener 的 `ConnectInfo` → `ApPeer`）时生效；
+/// 明文 ecat listener 无 ConnectInfo → 只有全局桶（运营方须在反代补限流）。
+const WI_IP_RATE_PER_SEC: f64 = 2.0;
+const WI_IP_BURST: f64 = 5.0;
+/// 分桶表上限与空闲回收：超过上限先回收 60s 未活跃的桶，仍满则 fail-closed（503）。
+/// 全局桶 20/s 封顶总增速，表满只可能来自分布式攻击；此时拒绝优于无界内存增长。
+const WI_IP_BUCKETS_MAX: usize = 4096;
+const WI_IP_BUCKET_IDLE: Duration = Duration::from_secs(60);
 
 struct TokenBucket {
     tokens: f64,
@@ -68,6 +77,28 @@ impl TokenBucket {
     }
 }
 
+/// 每个对端 IP 一个令牌桶；`last` 同时充当空闲时间游标（每次 `allow` 刷新）。
+#[derive(Default)]
+struct IpBuckets {
+    buckets: HashMap<IpAddr, TokenBucket>,
+}
+
+impl IpBuckets {
+    fn allow(&mut self, ip: IpAddr) -> bool {
+        if self.buckets.len() >= WI_IP_BUCKETS_MAX && !self.buckets.contains_key(&ip) {
+            self.buckets
+                .retain(|_, b| b.last.elapsed() < WI_IP_BUCKET_IDLE);
+            if self.buckets.len() >= WI_IP_BUCKETS_MAX {
+                return false; // 表满且无可回收：fail-closed
+            }
+        }
+        self.buckets
+            .entry(ip)
+            .or_insert_with(|| TokenBucket::new(WI_IP_BURST))
+            .allow(WI_IP_RATE_PER_SEC, WI_IP_BURST)
+    }
+}
+
 pub struct StsRoute {
     pool: SqlitePool,
     /// M5 切片 6（T5 校正）：SK 加密库——签发会话的 SK 与 console 同口径封存入库
@@ -77,6 +108,8 @@ pub struct StsRoute {
     web_identity: Option<WebIdentity>,
     /// L-1：匿名 WebIdentity 验签入口的限流桶（锁中毒按未中毒处理，不让 panic 拖垮 STS）。
     web_identity_limiter: Mutex<TokenBucket>,
+    /// L-1b：按对端 IP 的子桶（仅有对端身份时生效）。
+    web_identity_ip_limiter: Mutex<IpBuckets>,
 }
 
 impl StsRoute {
@@ -86,6 +119,7 @@ impl StsRoute {
             vault: None,
             web_identity: None,
             web_identity_limiter: Mutex::new(TokenBucket::new(WI_BURST)),
+            web_identity_ip_limiter: Mutex::new(IpBuckets::default()),
         }
     }
 
@@ -220,6 +254,7 @@ impl StsRoute {
     async fn assume_role_with_web_identity(
         &self,
         fields: &[(String, String)],
+        peer: Option<IpAddr>,
     ) -> S3Result<S3Response<Body>> {
         let Some(wi) = self.web_identity.as_ref() else {
             return Err(s3s::s3_error!(
@@ -233,6 +268,14 @@ impl StsRoute {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .allow(WI_RATE_PER_SEC, WI_BURST);
+        // L-1b：有对端身份时再扣单 IP 桶——一个客户端耗尽自己的配额不影响其他 IP。
+        let allowed = allowed
+            && peer.is_none_or(|ip| {
+                self.web_identity_ip_limiter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .allow(ip)
+            });
         if !allowed {
             return Err(s3s::s3_error!(
                 SlowDown,
@@ -353,6 +396,9 @@ impl S3Route for StsRoute {
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let caller_ak = req.credentials.as_ref().map(|c| c.access_key.clone());
+        // 对端身份由 oss-server 的 HTTP 层注入（TLS listener 的 ConnectInfo；显式可信
+        // 反代时换成 XFF 客户端）。明文 listener 无 ConnectInfo → None → 仅全局桶。
+        let peer = req.extensions.get::<crate::ap::ApPeer>().map(|p| p.0);
         let mut body = req.input;
         let bytes = body
             .store_all_limited(MAX_BODY)
@@ -361,7 +407,9 @@ impl S3Route for StsRoute {
         let fields = parse_form(&bytes);
         match field(&fields, "Action").as_deref() {
             // OIDC token 即凭据：无需 AK/SK（是否启用由 assume_role_with_web_identity 判）
-            Some("AssumeRoleWithWebIdentity") => self.assume_role_with_web_identity(&fields).await,
+            Some("AssumeRoleWithWebIdentity") => {
+                self.assume_role_with_web_identity(&fields, peer).await
+            }
             Some("AssumeRole") => {
                 let ak = signed_caller(caller_ak.as_deref())?;
                 self.assume_role(&ak, &fields).await
@@ -659,6 +707,66 @@ mod tests {
         assert!(b.allow(1000.0, 2.0), "补充后恢复");
         assert!(b.allow(0.0, 2.0));
         assert!(!b.allow(0.0, 2.0));
+    }
+
+    /// L-1b：单 IP 耗尽不影响其他 IP；按速率补充后恢复。
+    #[test]
+    fn web_identity_ip_buckets_isolate_and_refill() {
+        let mut b = IpBuckets::default();
+        let a: IpAddr = "192.0.2.10".parse().unwrap();
+        let other: IpAddr = "192.0.2.11".parse().unwrap();
+        for _ in 0..WI_IP_BURST as usize {
+            assert!(b.allow(a));
+        }
+        assert!(!b.allow(a), "单 IP 耗尽后必须拒绝");
+        assert!(b.allow(other), "其他 IP 不受影响");
+        std::thread::sleep(Duration::from_millis(520));
+        assert!(b.allow(a), "按 2/s 补充后恢复");
+    }
+
+    /// L-1b 全路径：同一 IP 超限 → 503 SlowDown；其他 IP / 无对端不受影响。
+    #[tokio::test]
+    async fn web_identity_per_ip_limit_returns_slow_down() {
+        use crate::sts_web_identity::test_support as wi;
+
+        let pool = sts_db().await;
+        let td = tempfile::tempdir().unwrap();
+        let route = StsRoute::new(pool).with_web_identity(Some(wi::web_identity(td.path(), 3600)));
+        let body = "Action=AssumeRoleWithWebIdentity\
+            &RoleArn=arn%3Aoss%3Aiam%3A%3Aoss%3Arole%2Fci-bot&WebIdentityToken=bad";
+        let mk = |peer: Option<IpAddr>| {
+            let mut extensions = http::Extensions::new();
+            if let Some(ip) = peer {
+                extensions.insert(crate::ap::ApPeer(ip));
+            }
+            S3Request::<Body> {
+                input: Body::from(body.to_string()),
+                method: Method::POST,
+                uri: "/".parse().unwrap(),
+                headers: HeaderMap::new(),
+                extensions,
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            }
+        };
+        let ip: IpAddr = "192.0.2.50".parse().unwrap();
+        for _ in 0..WI_IP_BURST as usize {
+            let e = route.call(mk(Some(ip))).await.unwrap_err();
+            assert_ne!(e.code(), &s3s::S3ErrorCode::SlowDown, "配额内不得限流");
+        }
+        let e = route.call(mk(Some(ip))).await.unwrap_err();
+        assert_eq!(e.code(), &s3s::S3ErrorCode::SlowDown, "同一 IP 超限 → 503");
+        // 另一个 IP 有自己的配额（全局桶未耗尽）。
+        let e = route
+            .call(mk(Some("192.0.2.51".parse().unwrap())))
+            .await
+            .unwrap_err();
+        assert_ne!(e.code(), &s3s::S3ErrorCode::SlowDown);
+        // 无对端身份（明文 listener）：退化为全局桶，仍可进入。
+        let e = route.call(mk(None)).await.unwrap_err();
+        assert_ne!(e.code(), &s3s::S3ErrorCode::SlowDown);
     }
 
     /// 最小控制面 schema（同 auth.rs 测试的口径 + kind 列）。
