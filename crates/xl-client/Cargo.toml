@@ -12,6 +12,7 @@ tonic.workspace = true
 tokio.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
+futures.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 

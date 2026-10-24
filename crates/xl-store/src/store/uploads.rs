@@ -145,8 +145,18 @@ impl Store {
                         continue;
                     };
                     match super::mpu::mpu_summary(&ent.path()).await {
-                        Ok(Some((nanos, sc))) => {
-                            by_id.entry(id.to_string()).or_insert((nanos, sc));
+                        Ok(Some(sum)) => {
+                            // M3 MPU 会话粘性：集群创建的暂存区在 mpu.meta 记属主，
+                            // LMU 必须重建**客户端可见**的带前缀 upload_id（目录名仍是 UUID）。
+                            // 旧格式（owner=None）= 裸 UUID（本地属主）。
+                            let id_str = id.to_string();
+                            let upload_id = match sum.owner.as_deref() {
+                                Some(owner) => super::mpu_route::format_upload_id(owner, &id_str),
+                                None => id_str,
+                            };
+                            by_id
+                                .entry(upload_id)
+                                .or_insert((sum.created_nanos, sum.storage_class));
                         }
                         Ok(None) => {}
                         Err(e) => {

@@ -18,6 +18,7 @@ use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, PartRef, Version, XlMeta};
+use crate::store::mpu_route;
 use crate::store::put::TeeGuard;
 use crate::store::{ByteStream, ObjectInfo, Store, VersioningMode, now_nanos};
 
@@ -57,6 +58,18 @@ struct MpuMeta {
     /// 旧 msgpack 无此字段 → None（在途 MPU 跨版本升级仍可 complete）。
     #[serde(default)]
     pub tags: Option<Vec<meta::ObjectTag>>,
+    /// M3 MPU 会话粘性：属主节点 id（None = 单节点/旧格式 = 本地属主）。
+    /// 目录名仍是规范 UUID；本字段只用于 LMU 重建客户端可见的 upload_id（含前缀）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+}
+
+/// LMU 扫描摘要：活暂存区的 `mpu.meta` 投影。
+pub(super) struct MpuSummary {
+    pub created_nanos: i64,
+    pub storage_class: Option<String>,
+    /// `None` = 旧格式（属主 = 本地）
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,12 +105,48 @@ pub struct MpuPartInfo {
 }
 
 impl Store {
-    /// 上传 id → 暂存区目录。`upload_id` 是客户端可控字符串：先 `Uuid::parse_str` 再取
-    /// **规范化字符串**拼路径（不用原始输入），`../`、大小写变体一律收口到同一目录。
+    /// 上传 id → 暂存区目录。`upload_id` 是客户端可控字符串：先拆分属主前缀再
+    /// `Uuid::parse_str` 取**规范化字符串**拼路径（不用原始输入），`../`、大小写变体
+    /// 一律收口到同一目录。
+    ///
+    /// 本地入口只接受「无前缀（旧格式）」或「前缀 = 本节点」；其他前缀 → NoSuchUpload
+    /// （mesh handler 误投/直调也在此收口，绝不去碰别的节点的暂存区）。
     fn mpu_dir(&self, bucket: &str, key: &str, upload_id: &str) -> Result<PathBuf> {
-        let id = uuid::Uuid::parse_str(upload_id)
-            .map_err(|_| Error::NoSuchUpload(upload_id.to_string()))?;
-        Ok(layout::object_dir(self.cfg.root(), bucket, key)?.join(id.to_string()))
+        let (owner, uuid) = mpu_route::split_upload_id(upload_id)?;
+        if let Some(owner) = owner {
+            let self_id = self
+                .cfg
+                .cluster
+                .as_deref()
+                .map(|c| c.sets.flat.self_node().id.as_str());
+            if self_id != Some(owner.as_str()) {
+                return Err(Error::NoSuchUpload(upload_id.to_string()));
+            }
+        }
+        Ok(layout::object_dir(self.cfg.root(), bucket, key)?.join(uuid))
+    }
+
+    /// 属主解析：`None` = 本地执行（旧格式或无前缀）；`Some(node)` = 需转发。
+    ///
+    /// 未知属主（不在拓扑内）→ `Unavailable`（S3 503）：upload_id 指向的节点已不存在，
+    /// 既不能本地找到也不能假装 NoSuchUpload（会诱导客户端放弃可恢复的暂存区）。
+    pub(in crate::store) fn mpu_remote_owner(&self, upload_id: &str) -> Result<Option<String>> {
+        let (owner, _) = mpu_route::split_upload_id(upload_id)?;
+        let Some(owner) = owner else {
+            return Ok(None); // 旧格式：本地属主（滚动升级前的在途 MPU）
+        };
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return Err(Error::NoSuchUpload(upload_id.to_string())); // 单节点不接受前缀
+        };
+        if owner == cl.sets.flat.self_node().id {
+            return Ok(None);
+        }
+        if !cl.sets.flat.nodes.iter().any(|n| n.id == owner) {
+            return Err(Error::Unavailable(format!(
+                "MPU 属主节点 {owner} 不在拓扑内（upload_id {upload_id}）"
+            )));
+        }
+        Ok(Some(owner))
     }
 
     /// 创建 MPU：对象目录下建 `<upload_id>/` 暂存区并写 `mpu.meta`。
@@ -166,8 +215,22 @@ impl Store {
         };
         let _guard = self.lock_object(bucket, key).await?;
 
-        let upload_id = uuid::Uuid::new_v4().to_string();
-        let dir = obj_dir.join(&upload_id);
+        // M3 MPU 会话粘性：目录名恒为规范 UUID；集群模式额外把属主编码进客户端可见的
+        // upload_id（单节点保持裸 UUID，v1.4.0 行为逐字节一致）。
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let (upload_id, owner) = match self.cfg.cluster.as_deref() {
+            Some(cl) => {
+                let node_id = cl.sets.flat.self_node().id.clone();
+                if node_id.is_empty() {
+                    return Err(Error::Encode(
+                        "集群 self_id 为空：无法生成可路由的 MPU upload_id".into(),
+                    ));
+                }
+                (mpu_route::format_upload_id(&node_id, &uuid), Some(node_id))
+            }
+            None => (uuid.clone(), None),
+        };
+        let dir = obj_dir.join(&uuid);
         let meta = MpuMeta {
             content_type,
             user_metadata,
@@ -179,6 +242,7 @@ impl Store {
             lock_legal_hold: lock.is_some_and(|l| l.legal_hold),
             storage_class,
             tags,
+            owner,
         };
         let bytes = rmp_serde::to_vec_named(&meta).map_err(|e| Error::Encode(e.to_string()))?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -207,7 +271,42 @@ impl Store {
 
     /// 上传一个 part（可带 SSE-C 校验；M5 切片 3/R5）：create 记了 md5 则本 part 必带同钥
     /// （md5 一致）；未记则不得携带。分片暂存仍明文（D8），实际加密在 complete 单流。
+    ///
+    /// M3 MPU 会话粘性：非属主节点收到请求时**流式转发**给属主（分段走 mesh 流，
+    /// 不在内存里整段缓冲）；属主执行 [`Self::upload_part_local`]。
     pub async fn upload_part_ext(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u16,
+        body: ByteStream,
+        sse_c_md5: Option<&str>,
+    ) -> Result<String> {
+        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+            let t = self.mesh_transport().ok_or_else(|| {
+                Error::Unavailable("集群传输未注入，无法转发 MPU UploadPart".into())
+            })?;
+            return t
+                .mpu_upload_part(
+                    &node,
+                    crate::mesh::MpuPartUpload {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        upload_id: upload_id.to_string(),
+                        part_number,
+                        sse_c_md5: sse_c_md5.map(str::to_string),
+                        body,
+                    },
+                )
+                .await;
+        }
+        self.upload_part_local(bucket, key, upload_id, part_number, body, sse_c_md5)
+            .await
+    }
+
+    /// UploadPart 的本地执行（**不再转发**；mesh 服务端 handler 与属主路径共用）。
+    pub(in crate::store) async fn upload_part_local(
         &self,
         bucket: &str,
         key: &str,
@@ -322,8 +421,48 @@ impl Store {
 
     /// 版本控制感知的 complete（M4 切片 3 / S3 Suspended）：Enabled 追加版本（保留旧
     /// 目录）；Suspended 替换链中 null 版本；Off 维持单版本 + 回收的 M2b 语义。
+    ///
+    /// M3 MPU 会话粘性：非属主节点转发给属主（版本形态/加密/锁意图随请求透传；
+    /// 提交点只在属主发生，前端节点不重复提交）。
     #[allow(clippy::too_many_arguments)] // 同 create_multipart_upload_ext：线头直通
     pub async fn complete_multipart_upload_versioned(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u16, String)],
+        mode: VersioningMode,
+        encryption: Option<crypto::EncSpec>,
+        lock: Option<meta::ObjectLockRecord>,
+    ) -> Result<ObjectInfo> {
+        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+            let t = self.mesh_transport().ok_or_else(|| {
+                Error::Unavailable("集群传输未注入，无法转发 MPU Complete".into())
+            })?;
+            return t
+                .mpu_complete(
+                    &node,
+                    crate::mesh::MpuComplete {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        upload_id: upload_id.to_string(),
+                        parts: parts.to_vec(),
+                        mode,
+                        encryption: encryption.as_ref().map(crate::mesh::MpuEnc::from_spec),
+                        lock: lock.clone(),
+                    },
+                )
+                .await;
+        }
+        self.complete_multipart_upload_versioned_local(
+            bucket, key, upload_id, parts, mode, encryption, lock,
+        )
+        .await
+    }
+
+    /// Complete 的本地执行（**不再转发**；mesh 服务端 handler 与属主路径共用）。
+    #[allow(clippy::too_many_arguments)] // 同上
+    pub(in crate::store) async fn complete_multipart_upload_versioned_local(
         &self,
         bucket: &str,
         key: &str,
@@ -806,7 +945,36 @@ impl Store {
     }
 
     /// 中止 MPU：删暂存区。`mpu.meta` 为生死门——complete 成功后它已改名，不得再删。
+    ///
+    /// M3 MPU 会话粘性：非属主节点转发给属主（abort 与 complete 在属主侧按对象锁
+    /// 串行，二者竞争只会有先到者生效，另一个得到 NoSuchUpload）。
     pub async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<()> {
+        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+            let t = self
+                .mesh_transport()
+                .ok_or_else(|| Error::Unavailable("集群传输未注入，无法转发 MPU Abort".into()))?;
+            return t
+                .mpu_abort(
+                    &node,
+                    crate::mesh::MpuRef {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        upload_id: upload_id.to_string(),
+                    },
+                )
+                .await;
+        }
+        self.abort_multipart_upload_local(bucket, key, upload_id)
+            .await
+    }
+
+    /// Abort 的本地执行（**不再转发**）。
+    pub(in crate::store) async fn abort_multipart_upload_local(
         &self,
         bucket: &str,
         key: &str,
@@ -824,7 +992,42 @@ impl Store {
     }
 
     /// 列出暂存区里已上传的 parts（升序）。分页不做：≤10000 全量、`is_truncated=false`。
+    ///
+    /// M3 MPU 会话粘性：非属主节点转发给属主。
     pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<MpuPartInfo>> {
+        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+            let t = self.mesh_transport().ok_or_else(|| {
+                Error::Unavailable("集群传输未注入，无法转发 MPU ListParts".into())
+            })?;
+            let rows = t
+                .mpu_list_parts(
+                    &node,
+                    crate::mesh::MpuRef {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        upload_id: upload_id.to_string(),
+                    },
+                )
+                .await?;
+            return Ok(rows
+                .into_iter()
+                .map(|r| MpuPartInfo {
+                    part_number: r.part_number,
+                    size: r.size,
+                    etag: r.etag,
+                })
+                .collect());
+        }
+        self.list_parts_local(bucket, key, upload_id).await
+    }
+
+    /// ListParts 的本地执行（**不再转发**）。
+    pub(in crate::store) async fn list_parts_local(
         &self,
         bucket: &str,
         key: &str,
@@ -865,10 +1068,10 @@ impl Store {
     }
 }
 
-/// LMU 用摘要：读 `<upload_dir>/mpu.meta` → (created_nanos, storage_class)。
+/// LMU 用摘要：读 `<upload_dir>/mpu.meta` → (created_nanos, storage_class, owner)。
 /// 无 mpu.meta（非暂存区 / 已 complete / 已 abort）→ None。解码失败按损坏上抛，
 /// 调用方跳过单个坏目录并告警——一个坏 mpu.meta 不得打挂整桶列举。
-pub(super) async fn mpu_summary(dir: &std::path::Path) -> Result<Option<(i64, Option<String>)>> {
+pub(super) async fn mpu_summary(dir: &std::path::Path) -> Result<Option<MpuSummary>> {
     let bytes = match tokio::fs::read(dir.join(MPU_META_FILE)).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -876,7 +1079,11 @@ pub(super) async fn mpu_summary(dir: &std::path::Path) -> Result<Option<(i64, Op
     };
     let m: MpuMeta = rmp_serde::from_slice(&bytes)
         .map_err(|e| Error::CorruptMeta(format!("mpu.meta 解码失败: {e}")))?;
-    Ok(Some((m.created_nanos, m.storage_class)))
+    Ok(Some(MpuSummary {
+        created_nanos: m.created_nanos,
+        storage_class: m.storage_class,
+        owner: m.owner,
+    }))
 }
 
 /// 按声明顺序把暂存的 `part.N` 拼成 64 KiB 块的 `ByteStream`（complete 装对象用），

@@ -22,16 +22,112 @@ use tonic::{Request, Status};
 
 use xl_store::error::{Error, Result};
 use xl_store::mesh::{self, MeshTransport};
-use xl_store::store::{Store, ec};
+use xl_store::meta::ObjectLockRecord;
+use xl_store::store::{ByteStream, ObjectInfo, Store, VersioningMode, ec};
 
 /// 集群内共享令牌的 metadata 键。
 const TOKEN_KEY: &str = "x-oss-cluster-token";
 /// W3C traceparent（M3 轻量传播：无 OTLP 接入前，客户端注入、服务端记入日志——
 /// 双节点可按同一 trace id 抽查，设计 D:362 的最小兑现）。
 const TRACEPARENT_KEY: &str = "traceparent";
+/// MPU 转发单条 RPC 的超时：普通 mesh RPC 是 5s 快路径口径，但 UploadPart 要走完
+/// 整段数据（最大 5 GiB），必须单独放宽。超时 = 属主侧流被截断 → 半截 part 被清理。
+const MPU_FORWARD_TIMEOUT: Duration = Duration::from_secs(3600);
+/// MPU 转发分块大小（tonic 默认 4 MiB 解码上限内留余量；零拷贝 `Bytes::slice`）。
+const MPU_FORWARD_CHUNK: usize = 1024 * 1024;
 
 fn rpc_err(node: &str, e: Status) -> Error {
     Error::Encode(format!("mesh RPC 失败（node {node}）：{e}"))
+}
+
+/// MPU 转发的传输失败 → `Unavailable`（S3 503；调用方据此确定性失败，绝不降级）。
+fn rpc_unavailable(node: &str, e: impl std::fmt::Display) -> Error {
+    Error::Unavailable(format!("MPU 属主 {node} 不可达：{e}"))
+}
+
+// ---------- MPU 错误线上编码 ----------
+//
+// 语义错误经响应信封（code+payload）回传，避免把 NoSuchUpload/EntityTooSmall 等
+// 客户端可纠正错误压成 gRPC 状态码丢失精度；只有传输层失败走 Unavailable。
+
+fn err_wire(e: &Error) -> (&'static str, String) {
+    match e {
+        Error::NoSuchBucket(s) => ("NoSuchBucket", s.clone()),
+        Error::BucketAlreadyExists(s) => ("BucketAlreadyExists", s.clone()),
+        Error::BucketNotEmpty(s) => ("BucketNotEmpty", s.clone()),
+        Error::NoSuchKey(s) => ("NoSuchKey", s.clone()),
+        Error::InvalidKey(s) => ("InvalidKey", s.clone()),
+        Error::InvalidBucketName(s) => ("InvalidBucketName", s.clone()),
+        Error::CorruptMeta(s) => ("CorruptMeta", s.clone()),
+        Error::NoSuchUpload(s) => ("NoSuchUpload", s.clone()),
+        Error::InvalidPart(s) => ("InvalidPart", s.clone()),
+        Error::InvalidPartRange(s) => ("InvalidPartRange", s.clone()),
+        Error::InvalidPartOrder(s) => ("InvalidPartOrder", s.clone()),
+        Error::EntityTooSmall(s) => ("EntityTooSmall", s.clone()),
+        Error::BadDigest(s) => ("BadDigest", s.clone()),
+        Error::QuorumUnmet(s) => ("QuorumUnmet", s.clone()),
+        Error::Io(e) => ("Io", e.to_string()),
+        Error::Encode(s) => ("Encode", s.clone()),
+        Error::DeleteMarker(s) => ("DeleteMarker", s.clone()),
+        Error::InvalidArgument(s) => ("InvalidArgument", s.clone()),
+        Error::InvalidObjectState(s) => ("InvalidObjectState", s.clone()),
+        Error::RestoreAlreadyInProgress(s) => ("RestoreAlreadyInProgress", s.clone()),
+        Error::Crypto(s) => ("Crypto", s.clone()),
+        Error::ObjectLocked(s) => ("ObjectLocked", s.clone()),
+        Error::Unavailable(s) => ("Unavailable", s.clone()),
+        Error::Unsupported(s) => ("Unsupported", s.clone()),
+        Error::Conflict(s) => ("Conflict", s.clone()),
+        Error::BadGateway(s) => ("BadGateway", s.clone()),
+    }
+}
+
+fn err_from_wire(code: &str, msg: String) -> Error {
+    match code {
+        "NoSuchBucket" => Error::NoSuchBucket(msg),
+        "BucketAlreadyExists" => Error::BucketAlreadyExists(msg),
+        "BucketNotEmpty" => Error::BucketNotEmpty(msg),
+        "NoSuchKey" => Error::NoSuchKey(msg),
+        "InvalidKey" => Error::InvalidKey(msg),
+        "InvalidBucketName" => Error::InvalidBucketName(msg),
+        "CorruptMeta" => Error::CorruptMeta(msg),
+        "NoSuchUpload" => Error::NoSuchUpload(msg),
+        "InvalidPart" => Error::InvalidPart(msg),
+        "InvalidPartRange" => Error::InvalidPartRange(msg),
+        "InvalidPartOrder" => Error::InvalidPartOrder(msg),
+        "EntityTooSmall" => Error::EntityTooSmall(msg),
+        "BadDigest" => Error::BadDigest(msg),
+        "QuorumUnmet" => Error::QuorumUnmet(msg),
+        "Io" => Error::Io(std::io::Error::other(msg)),
+        "Encode" => Error::Encode(msg),
+        "DeleteMarker" => Error::DeleteMarker(msg),
+        "InvalidArgument" => Error::InvalidArgument(msg),
+        "InvalidObjectState" => Error::InvalidObjectState(msg),
+        "RestoreAlreadyInProgress" => Error::RestoreAlreadyInProgress(msg),
+        "Crypto" => Error::Crypto(msg),
+        "ObjectLocked" => Error::ObjectLocked(msg),
+        "Unavailable" => Error::Unavailable(msg),
+        "Unsupported" => Error::Unsupported(msg),
+        "Conflict" => Error::Conflict(msg),
+        "BadGateway" => Error::BadGateway(msg),
+        // 未知 code：不猜语义，按内部错误上抛（fail-closed）
+        other => Error::Encode(format!("对端错误码 {other}：{msg}")),
+    }
+}
+
+fn mpu_ref_to_proto(r: mesh::MpuRef) -> xl_proto::MpuRef {
+    xl_proto::MpuRef {
+        bucket: r.bucket,
+        key: r.key,
+        upload_id: r.upload_id,
+    }
+}
+
+fn mpu_ref_from_proto(r: xl_proto::MpuRef) -> mesh::MpuRef {
+    mesh::MpuRef {
+        bucket: r.bucket,
+        key: r.key,
+        upload_id: r.upload_id,
+    }
 }
 
 /// 对端 `WriteResp{ok:false}` → 显式错误（不得吞成成功）。
@@ -219,6 +315,9 @@ pub struct TonicMesh {
     /// 旧通道上已发出的请求持有自己的 client clone，继续完成（不中断在途 RPC）。
     tls_watch: Option<Mutex<TlsWatch>>,
     clients: RwLock<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>>,
+    /// MPU 转发专用通道：同一节点/令牌，但请求超时 = [`MPU_FORWARD_TIMEOUT`]
+    /// （普通通道的快路径 5s 会把大 part 传输截断）。
+    mpu_clients: RwLock<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>>,
 }
 
 impl std::fmt::Debug for TonicMesh {
@@ -280,7 +379,8 @@ impl TonicMesh {
         tls: Option<tonic::transport::ClientTlsConfig>,
     ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
-        let clients = Self::build_clients(&interceptor, nodes, connect, request, tls.as_ref())?;
+        let (clients, mpu_clients) =
+            Self::build_clients(&interceptor, nodes, connect, request, tls.as_ref())?;
         Ok(Self {
             interceptor,
             nodes: nodes.to_vec(),
@@ -288,6 +388,7 @@ impl TonicMesh {
             request,
             tls_watch: None,
             clients: RwLock::new(clients),
+            mpu_clients: RwLock::new(mpu_clients),
         })
     }
 
@@ -320,7 +421,8 @@ impl TonicMesh {
     ) -> Result<Self> {
         let interceptor = TokenInterceptor::new(secret)?;
         let initial = tls.as_ref().map(|rx| rx.borrow().clone()).unwrap_or(None);
-        let clients = Self::build_clients(&interceptor, nodes, connect, request, initial.as_ref())?;
+        let (clients, mpu_clients) =
+            Self::build_clients(&interceptor, nodes, connect, request, initial.as_ref())?;
         Ok(Self {
             interceptor,
             nodes: nodes.to_vec(),
@@ -328,6 +430,7 @@ impl TonicMesh {
             request,
             tls_watch: tls.map(Mutex::new),
             clients: RwLock::new(clients),
+            mpu_clients: RwLock::new(mpu_clients),
         })
     }
 
@@ -337,30 +440,42 @@ impl TonicMesh {
         connect: Duration,
         request: Duration,
         tls: Option<&tonic::transport::ClientTlsConfig>,
-    ) -> Result<HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>> {
+    ) -> Result<(
+        HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>,
+        HashMap<String, xl_proto::mesh_client::MeshClient<MeshChannel>>,
+    )> {
         let scheme = if tls.is_some() { "https" } else { "http" };
         let mut clients = HashMap::with_capacity(nodes.len());
+        let mut mpu_clients = HashMap::with_capacity(nodes.len());
         for (id, addr) in nodes {
             let host_port = addr
                 .trim_start_matches("http://")
                 .trim_start_matches("https://")
                 .trim_end_matches('/');
-            let mut ep = Endpoint::from_shared(format!("{scheme}://{host_port}"))
-                .map_err(|e| Error::Encode(format!("节点 {id} 地址非法（{addr}）：{e}")))?
-                .connect_timeout(connect)
-                .timeout(request);
-            if let Some(t) = tls {
-                ep = ep
-                    .tls_config(t.clone())
-                    .map_err(|e| Error::Encode(format!("节点 {id} TLS 配置失败：{e}")))?;
-            }
-            let ch = ep.connect_lazy();
+            let endpoint = |timeout: Duration| -> Result<Endpoint> {
+                let mut ep = Endpoint::from_shared(format!("{scheme}://{host_port}"))
+                    .map_err(|e| Error::Encode(format!("节点 {id} 地址非法（{addr}）：{e}")))?
+                    .connect_timeout(connect)
+                    .timeout(timeout);
+                if let Some(t) = &tls {
+                    ep = ep
+                        .tls_config(t.clone())
+                        .map_err(|e| Error::Encode(format!("节点 {id} TLS 配置失败：{e}")))?;
+                }
+                Ok(ep)
+            };
+            let ch = endpoint(request)?.connect_lazy();
             clients.insert(
                 id.clone(),
                 xl_proto::mesh_client::MeshClient::with_interceptor(ch, interceptor.clone()),
             );
+            let mch = endpoint(MPU_FORWARD_TIMEOUT)?.connect_lazy();
+            mpu_clients.insert(
+                id.clone(),
+                xl_proto::mesh_client::MeshClient::with_interceptor(mch, interceptor.clone()),
+            );
         }
-        Ok(clients)
+        Ok((clients, mpu_clients))
     }
 
     /// TLS 物料变化时重建全部通道并整体替换；构建失败保留旧通道（fail closed）。
@@ -378,9 +493,13 @@ impl TonicMesh {
             self.request,
             tls.as_ref(),
         ) {
-            Ok(fresh) => {
+            Ok((fresh, fresh_mpu)) => {
                 let nodes = fresh.len();
                 *self.clients.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+                *self
+                    .mpu_clients
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = fresh_mpu;
                 tracing::info!(
                     nodes,
                     tls = tls.is_some(),
@@ -401,6 +520,19 @@ impl TonicMesh {
             .get(node)
             .cloned()
             .ok_or_else(|| Error::Encode(format!("mesh：未知节点 {node}（不在拓扑表内）")))
+    }
+
+    fn mpu_client(
+        &self,
+        node: &str,
+    ) -> Result<xl_proto::mesh_client::MeshClient<MeshChannel>> {
+        self.refresh_tls();
+        self.mpu_clients
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(node)
+            .cloned()
+            .ok_or_else(|| Error::Unavailable(format!("MPU 属主 {node} 不在拓扑表内（无法转发）")))
     }
 }
 
@@ -761,6 +893,296 @@ impl MeshTransport for TonicMesh {
             session_policy: (!resp.session_policy.is_empty()).then_some(resp.session_policy),
         }))
     }
+
+    // ---------- M3 MPU 会话粘性：流式转发 ----------
+
+    async fn mpu_upload_part(&self, node: &str, req: mesh::MpuPartUpload) -> Result<String> {
+        // 先取 client 再移动 body（借用在 await 前收口）
+        let mut client = self.mpu_client(node)?.clone();
+        let resp = client
+            .upload_part(mpu_chunk_stream(req))
+            .await
+            .map_err(|e| rpc_unavailable(node, e))?
+            .into_inner();
+        if resp.ok {
+            Ok(resp.etag)
+        } else {
+            Err(err_from_wire(&resp.code, resp.msg))
+        }
+    }
+
+    async fn mpu_complete(&self, node: &str, req: mesh::MpuComplete) -> Result<ObjectInfo> {
+        let (enc_kind, enc_cmk, sse_c_key) = match req.encryption {
+            None => (0, String::new(), Vec::new()),
+            Some(mesh::MpuEnc::SseS3) => (1, String::new(), Vec::new()),
+            Some(mesh::MpuEnc::SseKms) => (2, String::new(), Vec::new()),
+            Some(mesh::MpuEnc::SseKmsCmk(name)) => (3, name, Vec::new()),
+            Some(mesh::MpuEnc::SseC(key)) => (4, String::new(), key.to_vec()),
+        };
+        let (has_lock, lock_mode, lock_until, lock_legal_hold) = match &req.lock {
+            None => (false, String::new(), 0, false),
+            Some(l) => (
+                true,
+                l.mode.clone().unwrap_or_default(),
+                l.retain_until_nanos.unwrap_or(0),
+                l.legal_hold,
+            ),
+        };
+        let versioning_mode = match req.mode {
+            VersioningMode::Off => 0,
+            VersioningMode::Enabled => 1,
+            VersioningMode::Suspended => 2,
+        };
+        let resp = self
+            .mpu_client(node)?
+            .clone()
+            .complete_upload(xl_proto::MpuCompleteReq {
+                target: Some(mpu_ref_to_proto(mesh::MpuRef {
+                    bucket: req.bucket,
+                    key: req.key,
+                    upload_id: req.upload_id,
+                })),
+                parts: req
+                    .parts
+                    .iter()
+                    .map(|(n, etag)| xl_proto::MpuPart {
+                        number: *n as u32,
+                        etag: etag.clone(),
+                    })
+                    .collect(),
+                versioning_mode,
+                enc_kind,
+                enc_cmk,
+                sse_c_key,
+                has_lock,
+                lock_mode,
+                lock_until_nanos: lock_until,
+                lock_legal_hold,
+            })
+            .await
+            .map_err(|e| rpc_unavailable(node, e))?
+            .into_inner();
+        if !resp.ok {
+            return Err(err_from_wire(&resp.code, resp.msg));
+        }
+        mesh::decode_object_info(&resp.info)
+    }
+
+    async fn mpu_abort(&self, node: &str, req: mesh::MpuRef) -> Result<()> {
+        let resp = self
+            .mpu_client(node)?
+            .clone()
+            .abort_upload(mpu_ref_to_proto(req))
+            .await
+            .map_err(|e| rpc_unavailable(node, e))?
+            .into_inner();
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(err_from_wire(&resp.code, resp.msg))
+        }
+    }
+
+    async fn mpu_list_parts(&self, node: &str, req: mesh::MpuRef) -> Result<Vec<mesh::MpuPartRow>> {
+        let resp = self
+            .mpu_client(node)?
+            .clone()
+            .list_parts(mpu_ref_to_proto(req))
+            .await
+            .map_err(|e| rpc_unavailable(node, e))?
+            .into_inner();
+        if !resp.ok {
+            return Err(err_from_wire(&resp.code, resp.msg));
+        }
+        Ok(resp
+            .parts
+            .into_iter()
+            .map(|p| mesh::MpuPartRow {
+                part_number: u16::try_from(p.number).unwrap_or(0),
+                size: p.size,
+                etag: p.etag,
+            })
+            .collect())
+    }
+}
+
+/// UploadPart 转发发送流：首块元数据 → 若干 ≤[`MPU_FORWARD_CHUNK`] 数据块 → 末块。
+/// body 出错时发 `abort=true` 并终止（属主据此拒收并清理，绝不会把半截数据当成功）。
+/// 正常情况下最后必发 `is_final=true`；连接中断时属主见不到末块 → 同样拒收。
+fn mpu_chunk_stream(
+    req: mesh::MpuPartUpload,
+) -> impl futures::Stream<Item = xl_proto::MpuPartChunk> + Send + 'static {
+    struct St {
+        meta: Option<(String, String, String, u32, String)>,
+        body: mesh::MpuPartUpload, // 持有原始流（未单独拆字段，省一次装箱）
+        queue: std::collections::VecDeque<bytes::Bytes>,
+        done: bool,
+    }
+    impl St {
+        fn take_meta(&mut self) -> Option<xl_proto::MpuPartChunk> {
+            let (bucket, key, upload_id, part_number, sse) = self.meta.take()?;
+            Some(xl_proto::MpuPartChunk {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                sse_c_md5: sse,
+                ..Default::default()
+            })
+        }
+    }
+    let init = St {
+        meta: Some((
+            req.bucket.clone(),
+            req.key.clone(),
+            req.upload_id.clone(),
+            req.part_number as u32,
+            req.sse_c_md5.clone().unwrap_or_default(),
+        )),
+        body: req,
+        queue: std::collections::VecDeque::new(),
+        done: false,
+    };
+    futures::stream::unfold(init, |mut st| async move {
+        use futures::StreamExt as _;
+        loop {
+            if let Some(m) = st.take_meta() {
+                return Some((m, st));
+            }
+            if let Some(piece) = st.queue.pop_front() {
+                return Some((
+                    xl_proto::MpuPartChunk {
+                        data: piece.to_vec(),
+                        ..Default::default()
+                    },
+                    st,
+                ));
+            }
+            if st.done {
+                return None;
+            }
+            match st.body.body.next().await {
+                Some(Ok(b)) => {
+                    let mut rest = b;
+                    while !rest.is_empty() {
+                        let n = MPU_FORWARD_CHUNK.min(rest.len());
+                        st.queue.push_back(rest.split_to(n));
+                    }
+                }
+                Some(Err(e)) => {
+                    st.done = true;
+                    return Some((
+                        xl_proto::MpuPartChunk {
+                            abort: true,
+                            error: e.to_string(),
+                            ..Default::default()
+                        },
+                        st,
+                    ));
+                }
+                None => {
+                    st.done = true;
+                    return Some((
+                        xl_proto::MpuPartChunk {
+                            is_final: true,
+                            ..Default::default()
+                        },
+                        st,
+                    ));
+                }
+            }
+        }
+    })
+}
+
+fn mpu_part_reject(code: &str, msg: String) -> xl_proto::MpuUploadPartResp {
+    xl_proto::MpuUploadPartResp {
+        ok: false,
+        code: code.into(),
+        msg,
+        ..Default::default()
+    }
+}
+
+fn mpu_op_reject(e: &Error) -> xl_proto::MpuOpResp {
+    let (code, msg) = err_wire(e);
+    xl_proto::MpuOpResp {
+        ok: false,
+        code: code.into(),
+        msg,
+        ..Default::default()
+    }
+}
+
+/// 属主侧：把 gRPC 数据块流适配成 store 的 [`ByteStream`]。
+///
+/// **截断防护**：只有见到 `is_final=true` 后的流结束才算正常收尾；连接断开/发送端
+/// 崩溃导致的提前 EOF 返回 `Err`，`upload_part_local` 据此删除 `part.N.new`，
+/// 绝不会把半截数据改名为正式 part。`abort=true` 同样转成 `Err`。
+fn forwarded_body_stream(
+    stream: tonic::Streaming<xl_proto::MpuPartChunk>,
+    pending: Option<bytes::Bytes>,
+    final_seen: bool,
+) -> ByteStream {
+    struct St {
+        stream: tonic::Streaming<xl_proto::MpuPartChunk>,
+        pending: Option<bytes::Bytes>,
+        final_seen: bool,
+        done: bool,
+    }
+    let init = St {
+        stream,
+        pending,
+        final_seen,
+        done: false,
+    };
+    Box::pin(futures::stream::unfold(init, |mut st| async move {
+        loop {
+            if let Some(b) = st.pending.take()
+                && !b.is_empty()
+            {
+                return Some((Ok(b), st));
+            }
+            if st.done {
+                return None;
+            }
+            match st.stream.message().await {
+                Ok(Some(m)) => {
+                    if m.abort {
+                        st.done = true;
+                        return Some((
+                            Err(Error::Encode(format!(
+                                "对端中止 UploadPart 转发流：{}",
+                                m.error
+                            ))),
+                            st,
+                        ));
+                    }
+                    st.final_seen |= m.is_final;
+                    if m.data.is_empty() {
+                        continue;
+                    }
+                    st.pending = Some(bytes::Bytes::from(m.data));
+                }
+                Ok(None) => {
+                    st.done = true;
+                    if st.final_seen {
+                        return None;
+                    }
+                    return Some((
+                        Err(Error::Encode(
+                            "MPU 转发流截断（缺 is_final）：拒收半截 part".into(),
+                        )),
+                        st,
+                    ));
+                }
+                Err(e) => {
+                    st.done = true;
+                    return Some((Err(Error::Unavailable(format!("MPU 转发流中断：{e}"))), st));
+                }
+            }
+        }
+    }))
 }
 
 // ---------- 服务端 ----------
@@ -1038,6 +1460,224 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             slots_ok: resp.slots_ok,
         }))
     }
+
+    // ---------- M3 MPU 会话粘性：属主侧本地执行 ----------
+    //
+    // 这些 handler 调 `mesh_*`（= `*_local`，不再转发）；若在此再走 Store 的
+    // 转发入口会造成属主→属主回环。首块携带目标元数据，其余块为纯数据；
+    // 数据流必须以 `is_final` 收尾，否则适配器报错 → 属主拒收半截 part。
+
+    async fn upload_part(
+        &self,
+        r: Request<tonic::Streaming<xl_proto::MpuPartChunk>>,
+    ) -> std::result::Result<tonic::Response<xl_proto::MpuUploadPartResp>, Status> {
+        let mut stream = r.into_inner();
+        let first = match stream.message().await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                return Ok(tonic::Response::new(mpu_part_reject(
+                    "InvalidArgument",
+                    "MPU 转发流为空".into(),
+                )));
+            }
+            Err(e) => return Err(Status::unavailable(format!("MPU 转发流读取失败：{e}"))),
+        };
+        if first.abort {
+            return Ok(tonic::Response::new(mpu_part_reject(
+                "Encode",
+                format!("对端中止 UploadPart：{}", first.error),
+            )));
+        }
+        if first.bucket.is_empty() || first.upload_id.is_empty() {
+            return Ok(tonic::Response::new(mpu_part_reject(
+                "InvalidArgument",
+                "MPU 转发首块缺少 bucket/upload_id".into(),
+            )));
+        }
+        let Ok(part_number) = u16::try_from(first.part_number) else {
+            return Ok(tonic::Response::new(mpu_part_reject(
+                "InvalidPartRange",
+                format!("part_number 越界：{}", first.part_number),
+            )));
+        };
+        if part_number == 0 || part_number > 10000 {
+            return Ok(tonic::Response::new(mpu_part_reject(
+                "InvalidPartRange",
+                format!("part_number 越界：{part_number}"),
+            )));
+        }
+        let body = forwarded_body_stream(
+            stream,
+            (!first.data.is_empty()).then(|| bytes::Bytes::from(first.data)),
+            first.is_final,
+        );
+        let req = mesh::MpuPartUpload {
+            bucket: first.bucket,
+            key: first.key,
+            upload_id: first.upload_id,
+            part_number,
+            sse_c_md5: (!first.sse_c_md5.is_empty()).then_some(first.sse_c_md5),
+            body,
+        };
+        match self.store.mesh_mpu_upload_part(req).await {
+            Ok(etag) => Ok(tonic::Response::new(xl_proto::MpuUploadPartResp {
+                ok: true,
+                etag,
+                ..Default::default()
+            })),
+            Err(e) => {
+                let (code, msg) = err_wire(&e);
+                Ok(tonic::Response::new(mpu_part_reject(code, msg)))
+            }
+        }
+    }
+
+    async fn complete_upload(
+        &self,
+        r: Request<xl_proto::MpuCompleteReq>,
+    ) -> std::result::Result<tonic::Response<xl_proto::MpuOpResp>, Status> {
+        let c = r.into_inner();
+        let Some(target) = c.target else {
+            return Ok(tonic::Response::new(mpu_op_reject(
+                &Error::InvalidArgument("缺少 target".into()),
+            )));
+        };
+        if target.bucket.is_empty() || target.upload_id.is_empty() {
+            return Ok(tonic::Response::new(mpu_op_reject(
+                &Error::InvalidArgument("target 缺少 bucket/upload_id".into()),
+            )));
+        }
+        let mode = match c.versioning_mode {
+            0 => VersioningMode::Off,
+            1 => VersioningMode::Enabled,
+            2 => VersioningMode::Suspended,
+            other => {
+                return Ok(tonic::Response::new(mpu_op_reject(
+                    &Error::InvalidArgument(format!("未知 versioning_mode：{other}")),
+                )));
+            }
+        };
+        let encryption = match c.enc_kind {
+            0 => None,
+            1 => Some(mesh::MpuEnc::SseS3),
+            2 => Some(mesh::MpuEnc::SseKms),
+            3 if !c.enc_cmk.is_empty() => Some(mesh::MpuEnc::SseKmsCmk(c.enc_cmk)),
+            3 => {
+                return Ok(tonic::Response::new(mpu_op_reject(
+                    &Error::InvalidArgument("SSE-KMS 缺 cmk".into()),
+                )));
+            }
+            4 => match <[u8; 32]>::try_from(c.sse_c_key.as_slice()) {
+                Ok(key) => Some(mesh::MpuEnc::SseC(key)),
+                Err(_) => {
+                    return Ok(tonic::Response::new(mpu_op_reject(
+                        &Error::InvalidArgument("SSE-C 密钥长度必须为 32 字节".into()),
+                    )));
+                }
+            },
+            other => {
+                return Ok(tonic::Response::new(mpu_op_reject(
+                    &Error::InvalidArgument(format!("未知 enc_kind：{other}")),
+                )));
+            }
+        };
+        let lock = c.has_lock.then(|| ObjectLockRecord {
+            mode: (!c.lock_mode.is_empty()).then_some(c.lock_mode.clone()),
+            retain_until_nanos: (c.lock_until_nanos != 0).then_some(c.lock_until_nanos),
+            legal_hold: c.lock_legal_hold,
+        });
+        let mut parts = Vec::with_capacity(c.parts.len());
+        for p in c.parts {
+            let Ok(n) = u16::try_from(p.number) else {
+                return Ok(tonic::Response::new(mpu_op_reject(
+                    &Error::InvalidPartRange(format!("part number 越界：{}", p.number)),
+                )));
+            };
+            if n == 0 || n > 10000 {
+                return Ok(tonic::Response::new(mpu_op_reject(
+                    &Error::InvalidPartRange(format!("part number 越界：{n}")),
+                )));
+            }
+            if p.etag.is_empty() {
+                return Ok(tonic::Response::new(mpu_op_reject(&Error::InvalidPart(
+                    format!("part {n} 缺 etag"),
+                ))));
+            }
+            parts.push((n, p.etag));
+        }
+        if parts.is_empty() {
+            return Ok(tonic::Response::new(mpu_op_reject(
+                &Error::InvalidArgument("parts 为空".into()),
+            )));
+        }
+        let req = mesh::MpuComplete {
+            bucket: target.bucket,
+            key: target.key,
+            upload_id: target.upload_id,
+            parts,
+            mode,
+            encryption,
+            lock,
+        };
+        match self.store.mesh_mpu_complete(req).await {
+            Ok(info) => match mesh::encode_object_info(&info) {
+                Ok(info) => Ok(tonic::Response::new(xl_proto::MpuOpResp {
+                    ok: true,
+                    info,
+                    ..Default::default()
+                })),
+                Err(e) => Ok(tonic::Response::new(mpu_op_reject(&e))),
+            },
+            Err(e) => Ok(tonic::Response::new(mpu_op_reject(&e))),
+        }
+    }
+
+    async fn abort_upload(
+        &self,
+        r: Request<xl_proto::MpuRef>,
+    ) -> std::result::Result<tonic::Response<xl_proto::MpuOpResp>, Status> {
+        let a = r.into_inner();
+        if a.bucket.is_empty() || a.upload_id.is_empty() {
+            return Ok(tonic::Response::new(mpu_op_reject(
+                &Error::InvalidArgument("缺少 bucket/upload_id".into()),
+            )));
+        }
+        match self.store.mesh_mpu_abort(mpu_ref_from_proto(a)).await {
+            Ok(()) => Ok(tonic::Response::new(xl_proto::MpuOpResp {
+                ok: true,
+                ..Default::default()
+            })),
+            Err(e) => Ok(tonic::Response::new(mpu_op_reject(&e))),
+        }
+    }
+
+    async fn list_parts(
+        &self,
+        r: Request<xl_proto::MpuRef>,
+    ) -> std::result::Result<tonic::Response<xl_proto::MpuOpResp>, Status> {
+        let a = r.into_inner();
+        if a.bucket.is_empty() || a.upload_id.is_empty() {
+            return Ok(tonic::Response::new(mpu_op_reject(
+                &Error::InvalidArgument("缺少 bucket/upload_id".into()),
+            )));
+        }
+        match self.store.mesh_mpu_list_parts(mpu_ref_from_proto(a)).await {
+            Ok(rows) => Ok(tonic::Response::new(xl_proto::MpuOpResp {
+                ok: true,
+                parts: rows
+                    .into_iter()
+                    .map(|p| xl_proto::MpuPartRow {
+                        number: p.part_number as u32,
+                        size: p.size,
+                        etag: p.etag,
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+            Err(e) => Ok(tonic::Response::new(mpu_op_reject(&e))),
+        }
+    }
+
     async fn lock(
         &self,
         r: Request<xl_proto::LockReq>,
@@ -1621,5 +2261,189 @@ mod tests {
             .await
             .unwrap();
         assert!(r.uploads.is_empty() && r.prefixes.is_empty());
+    }
+
+    /// M3 MPU：真实 tonic client-streaming 往返。覆盖 >1 MiB 自动分块、Complete
+    /// 的 msgpack ObjectInfo 回传、缺 `is_final` 的截断流拒收（不留半截 part）、
+    /// 语义错误信封（NoSuchUpload）与属主不可达 → Unavailable。
+    #[tokio::test]
+    async fn mpu_forward_rpcs_streaming_roundtrip() {
+        let tmp: Vec<tempfile::TempDir> =
+            (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
+        let dirs: Vec<std::path::PathBuf> = tmp.iter().map(|d| d.path().to_path_buf()).collect();
+        let addr = free_addr().await;
+        let ec = EcConfig {
+            data: 1,
+            parity: 1,
+            enabled: true,
+        };
+        let node = NodeSpec {
+            id: "n1".into(),
+            addr: addr.to_string(),
+            drive_count: 2,
+        };
+        let pairs = vec![("n1".to_string(), addr.to_string())];
+        let mesh = Arc::new(TonicMesh::new("n1", "tok", &pairs).unwrap());
+        let sets = ClusterSets::single("n1", vec![node], &ec).unwrap();
+        let mut cfg = StoreConfig::new(&dirs[0]);
+        cfg.drives = dirs;
+        cfg.ec = ec;
+        cfg.fsync = false;
+        cfg.cluster = Some(Arc::new(ClusterConfig {
+            sets,
+            transport: mesh.clone(),
+            placement_v2: false,
+            resolver: None,
+            stretch: false,
+        }));
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        store.create_bucket("buck").await.unwrap();
+        let s2 = store.clone();
+        tokio::spawn(async move {
+            let _ = serve(s2, addr, "tok".into()).await;
+        });
+        let mut up = false;
+        for _ in 0..40 {
+            if mesh.health("n1").await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(up, "server 未就绪");
+
+        let upload_id = store
+            .create_multipart_upload("buck", "k", None, Default::default())
+            .await
+            .unwrap();
+        assert!(upload_id.contains('.'), "集群 upload_id 应带属主前缀");
+        let target = || mesh::MpuRef {
+            bucket: "buck".into(),
+            key: "k".into(),
+            upload_id: upload_id.clone(),
+        };
+
+        // 1) 截断流（无 is_final）→ 信封 Encode；不得提交 part
+        let mut raw = mesh.mpu_client("n1").unwrap().clone();
+        let trunc = vec![xl_proto::MpuPartChunk {
+            bucket: "buck".into(),
+            key: "k".into(),
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            data: b"half".to_vec(),
+            ..Default::default()
+        }];
+        let resp = raw
+            .upload_part(futures::stream::iter(trunc))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert_eq!(resp.code, "Encode");
+        assert!(
+            mesh.mpu_list_parts("n1", target())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // 2) 正常流式上传（>2 MiB → 客户端按 1 MiB 分块；属主流式落盘）
+        let payload: Vec<u8> = (0..(2 * 1024 * 1024 + 123_457))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let body: ByteStream = Box::pin(futures::stream::once({
+            let p = payload.clone();
+            async move { Ok(bytes::Bytes::from(p)) }
+        }));
+        let etag = mesh
+            .mpu_upload_part(
+                "n1",
+                mesh::MpuPartUpload {
+                    bucket: "buck".into(),
+                    key: "k".into(),
+                    upload_id: upload_id.clone(),
+                    part_number: 1,
+                    sse_c_md5: None,
+                    body,
+                },
+            )
+            .await
+            .unwrap();
+        let parts = mesh.mpu_list_parts("n1", target()).await.unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].size, payload.len() as u64);
+        assert_eq!(parts[0].etag, etag);
+
+        // 3) Complete 往返：属主提交 + ObjectInfo msgpack 解码
+        let info = mesh
+            .mpu_complete(
+                "n1",
+                mesh::MpuComplete {
+                    bucket: "buck".into(),
+                    key: "k".into(),
+                    upload_id: upload_id.clone(),
+                    parts: vec![(1, etag)],
+                    mode: VersioningMode::Off,
+                    encryption: None,
+                    lock: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.size, payload.len() as u64);
+        let (_, got) = store.get_object("buck", "k").await.unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(&got[..], &payload[..]);
+
+        // 4) Abort 往返；随后 ListParts 收到语义错误 NoSuchUpload 信封（非笼统传输错）
+        let gone = store
+            .create_multipart_upload("buck", "gone", None, Default::default())
+            .await
+            .unwrap();
+        mesh.mpu_abort(
+            "n1",
+            mesh::MpuRef {
+                bucket: "buck".into(),
+                key: "gone".into(),
+                upload_id: gone.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            mesh.mpu_list_parts(
+                "n1",
+                mesh::MpuRef {
+                    bucket: "buck".into(),
+                    key: "gone".into(),
+                    upload_id: gone,
+                }
+            )
+            .await,
+            Err(Error::NoSuchUpload(_))
+        ));
+
+        // 5) 属主不可达（连接被拒）→ Unavailable（S3 503），绝不伪造成功
+        let closed = free_addr().await;
+        let down = TonicMesh::new("n1", "tok", &[("n1".to_string(), closed.to_string())]).unwrap();
+        let body: ByteStream = Box::pin(futures::stream::once(async {
+            Ok(bytes::Bytes::from_static(b"x"))
+        }));
+        let e = down
+            .mpu_upload_part(
+                "n1",
+                mesh::MpuPartUpload {
+                    bucket: "buck".into(),
+                    key: "k".into(),
+                    upload_id,
+                    part_number: 1,
+                    sse_c_md5: None,
+                    body,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::Unavailable(_)), "实得 {e:?}");
     }
 }
