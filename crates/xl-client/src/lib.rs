@@ -459,7 +459,7 @@ impl TonicMesh {
                     .timeout(timeout);
                 if let Some(t) = &tls {
                     ep = ep
-                        .tls_config(t.clone())
+                        .tls_config((**t).clone())
                         .map_err(|e| Error::Encode(format!("节点 {id} TLS 配置失败：{e}")))?;
                 }
                 Ok(ep)
