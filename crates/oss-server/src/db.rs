@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 
+use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
@@ -363,6 +364,8 @@ impl Db {
         // AC-0：账户表 + 存量用户回填（marker 幂等；Raft 模式下只在本地派生，见迁移头注）。
         sqlx::raw_sql(SCHEMA_ACCOUNTS).execute(&db.pool).await?;
         db.backfill_accounts().await?;
+        // M8-1：运行态表 fencing 列依赖 0003 已建表，故放在 M8/M9 重放之后。
+        db.ensure_fence_columns().await?;
         if seed_site {
             db.site_bootstrap(site_id).await?;
         }
@@ -843,6 +846,55 @@ impl Db {
                     .await?;
                 if !again.iter().any(|r| r.get::<String, _>("name") == name) {
                     return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M8-1：运行态本地表补 fencing 列（老库升级；新库也走这里，0003 不新增列）。
+    /// `(fence_term, fence_leader)` = 最近一次被接受的状态转换 token；写入按 term 单调，
+    /// 旧 leader 的迟到写入不覆盖新 term 的状态（no-op）。默认 0,0 = M7/未 fence。
+    async fn ensure_fence_columns(&self) -> Result<()> {
+        for table in [
+            "job_tasks",
+            "inventory_runs",
+            "inventory_cursors",
+            "tier_restores",
+            "lifecycle_cursors",
+        ] {
+            let cols = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            )))
+            .fetch_all(&self.pool)
+            .await?;
+            let has = |n: &str| cols.iter().any(|r| r.get::<String, _>("name") == n);
+            for (name, ddl) in [
+                (
+                    "fence_term",
+                    format!("ALTER TABLE {table} ADD COLUMN fence_term INTEGER NOT NULL DEFAULT 0"),
+                ),
+                (
+                    "fence_leader",
+                    format!(
+                        "ALTER TABLE {table} ADD COLUMN fence_leader INTEGER NOT NULL DEFAULT 0"
+                    ),
+                ),
+            ] {
+                if !has(name)
+                    && let Err(e) = sqlx::query(sqlx::AssertSqlSafe(ddl))
+                        .execute(&self.pool)
+                        .await
+                {
+                    // 并发首开：对方已补列则视同成功。
+                    let again = sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "SELECT name FROM pragma_table_info('{table}')"
+                    )))
+                    .fetch_all(&self.pool)
+                    .await?;
+                    if !again.iter().any(|r| r.get::<String, _>("name") == name) {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -2693,6 +2745,139 @@ mod tests {
         );
     }
 
+    /// M8-1：运行态表的 fencing 列齐全；更高 term 接管后旧 term 的状态转换被拒绝。
+    #[tokio::test]
+    async fn fencing_stamps_runtime_tables_and_rejects_stale_writes() {
+        let db = db().await;
+        for table in [
+            "job_tasks",
+            "inventory_runs",
+            "inventory_cursors",
+            "tier_restores",
+            "lifecycle_cursors",
+        ] {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM pragma_table_info('{table}') \
+                 WHERE name IN ('fence_term','fence_leader')"
+            )))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(n, 2, "{table} 缺 fencing 列");
+        }
+
+        let old = FencingEpoch { term: 5, leader: 1 };
+        let newer = FencingEpoch { term: 6, leader: 2 };
+
+        // 生命周期游标：旧 term 不能覆盖/删除新 term 的游标。
+        db.lifecycle_cursor_set("b", "r", "current", Some("a"), 1, old)
+            .await
+            .unwrap();
+        db.lifecycle_cursor_set(
+            "b",
+            "r",
+            "current",
+            Some("b"),
+            2,
+            FencingEpoch { term: 4, leader: 0 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.lifecycle_cursor_get("b", "r", "current").await.unwrap(),
+            Some("a".to_string())
+        );
+        db.lifecycle_cursor_set("b", "r", "current", Some("c"), 3, newer)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.lifecycle_cursor_get("b", "r", "current").await.unwrap(),
+            Some("c".to_string())
+        );
+        db.lifecycle_cursor_set(
+            "b",
+            "r",
+            "current",
+            None,
+            4,
+            FencingEpoch { term: 4, leader: 0 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.lifecycle_cursor_get("b", "r", "current").await.unwrap(),
+            Some("c".to_string()),
+            "旧 term 不得清游标"
+        );
+
+        // Inventory：旧 term 的收尾被拒，新 term 可收尾。
+        let run = db
+            .inventory_create_run("b", "c", "k", 1, old)
+            .await
+            .unwrap()
+            .unwrap();
+        db.inventory_run_started(run, 2, old).await.unwrap();
+        db.inventory_run_finish(
+            run,
+            "done",
+            Some("m"),
+            None,
+            FencingEpoch { term: 4, leader: 0 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.inventory_run_by_key("b", "c", "k")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        db.inventory_run_finish(run, "done", Some("m2"), None, newer)
+            .await
+            .unwrap();
+        let row = db
+            .inventory_run_by_key("b", "c", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "done");
+        assert_eq!(row.manifest_key.as_deref(), Some("m2"));
+
+        // Tier restore：旧 term 的状态转换与删除都被拒（行留给新 term）。
+        sqlx::query(
+            "INSERT INTO tier_restores \
+             (bucket, key, version_id, expires_at, state, created_at, fence_term, fence_leader) \
+             VALUES ('b', 'k', 'v', 0, 'pending', 1, 5, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.set_restore_state_fenced(
+            "b",
+            "k",
+            "v",
+            "restored",
+            99,
+            FencingEpoch { term: 4, leader: 0 },
+        )
+        .await
+        .unwrap();
+        db.delete_restore_fenced("b", "k", "v", FencingEpoch { term: 4, leader: 0 })
+            .await
+            .unwrap();
+        let r = db.restore_row("b", "k", "v").await.unwrap().unwrap();
+        assert_eq!(r.state, "pending");
+        db.set_restore_state_fenced("b", "k", "v", "restored", 99, newer)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.restore_row("b", "k", "v").await.unwrap().unwrap().state,
+            "restored"
+        );
+    }
+
     #[tokio::test]
     async fn users_permissions_and_uploads_owner() {
         let db = db().await;
@@ -3526,7 +3711,12 @@ mod tests {
             .await
             .unwrap();
         db.claim_task(40_000, 10).await.unwrap().unwrap();
-        assert_eq!(db.recover_expired_tasks(40_100, 3).await.unwrap(), 1);
+        assert_eq!(
+            db.recover_expired_tasks(40_100, 3, FencingEpoch::UNFENCED)
+                .await
+                .unwrap(),
+            1
+        );
         let tasks = db.job_tasks(t, 0, 10).await.unwrap();
         assert_eq!(tasks[0]["state"], "queued");
         assert_eq!(tasks[0]["attempt"], 1);
@@ -3547,7 +3737,12 @@ mod tests {
             .await
             .unwrap();
         db.claim_task(50_000, 3600).await.unwrap().unwrap();
-        assert_eq!(db.recover_stale_tasks(50_100, 3).await.unwrap(), 1);
+        assert_eq!(
+            db.recover_stale_tasks(50_100, 3, FencingEpoch::UNFENCED)
+                .await
+                .unwrap(),
+            1
+        );
         let tasks = db.job_tasks(s, 0, 10).await.unwrap();
         assert_eq!(tasks[0]["state"], "queued");
         assert_eq!(tasks[0]["attempt"], 1);
@@ -3739,6 +3934,8 @@ impl Db {
     }
 
     /// 4.10：持久化/清除扫描游标（`None` → 删除行，表示本阶段已扫完，下轮从头）。
+    /// M8-1：游标写入同样受 fencing 保护——行已被更高 term 接管时旧 leader 的迟到游标
+    /// 写入是 no-op（`fence_term <= token.term` 才接受并重标 token）。
     pub async fn lifecycle_cursor_set(
         &self,
         bucket: &str,
@@ -3746,30 +3943,37 @@ impl Db {
         stage: &str,
         cursor: Option<&str>,
         now: i64,
+        fence: FencingEpoch,
     ) -> Result<()> {
         match cursor {
             Some(c) if !c.is_empty() => {
                 sqlx::query(
-                    "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at) \
-                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, rule_id, stage) DO UPDATE SET \
-                     cursor = excluded.cursor, updated_at = excluded.updated_at",
+                    "INSERT INTO lifecycle_cursors \
+                     (bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(bucket, rule_id, stage) DO UPDATE SET \
+                     cursor = excluded.cursor, updated_at = excluded.updated_at, \
+                     fence_term = excluded.fence_term, fence_leader = excluded.fence_leader \
+                     WHERE lifecycle_cursors.fence_term <= excluded.fence_term",
                 )
                 .bind(bucket)
                 .bind(rule_id)
                 .bind(stage)
                 .bind(c)
                 .bind(now)
+                .bind(fence.term_i64())
+                .bind(fence.leader_i64())
                 .execute(&self.pool)
                 .await?;
             }
             _ => {
                 sqlx::query(
                     "DELETE FROM lifecycle_cursors \
-                     WHERE bucket = ? AND rule_id = ? AND stage = ?",
+                     WHERE bucket = ? AND rule_id = ? AND stage = ? AND fence_term <= ?",
                 )
                 .bind(bucket)
                 .bind(rule_id)
                 .bind(stage)
+                .bind(fence.term_i64())
                 .execute(&self.pool)
                 .await?;
             }
@@ -3977,6 +4181,9 @@ impl Db {
 
     /// M8 S4b：Restore 受理（单事务）——建 kind=restore 单任务作业 + upsert `tier_restores`
     /// `state='pending', expires_at=0`。返回 `(job_id, 是否新建任务)`。
+    /// M8-1：`fence` 是入队者 token。请求路径（API/用户）用 `UNFENCED`，行上的 fence
+    /// 只升不降（`MAX`），避免新请求把已被高 term 接管的行降回 0；执行者的状态转换
+    /// 仍按 `fence_term <= token.term` 门控。
     pub async fn create_restore_job(
         &self,
         spec: &JobSpec,
@@ -3984,6 +4191,7 @@ impl Db {
         key: &str,
         version_id: &str,
         now: i64,
+        fence: FencingEpoch,
     ) -> Result<(i64, bool)> {
         let mut tx = self.pool.begin().await?;
         let id = sqlx::query(
@@ -4025,16 +4233,23 @@ impl Db {
             inserted |= n > 0;
         }
         sqlx::query(
-            "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, created_at) \
-             VALUES (?, ?, ?, 0, ?, 'pending', ?) \
+            "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, created_at, \
+             fence_term, fence_leader) \
+             VALUES (?, ?, ?, 0, ?, 'pending', ?, ?, ?) \
              ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
-             expires_at = 0, job_id = excluded.job_id, state = 'pending', created_at = excluded.created_at",
+             expires_at = 0, job_id = excluded.job_id, state = 'pending', created_at = excluded.created_at, \
+             fence_term = MAX(tier_restores.fence_term, excluded.fence_term), \
+             fence_leader = CASE WHEN excluded.fence_term >= tier_restores.fence_term \
+               THEN excluded.fence_leader ELSE tier_restores.fence_leader END \
+             WHERE tier_restores.fence_term <= excluded.fence_term",
         )
         .bind(bucket)
         .bind(key)
         .bind(version_id)
         .bind(id)
         .bind(now)
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -4071,6 +4286,8 @@ impl Db {
         Ok(row.as_ref().map(row_to_restore))
     }
 
+    /// M8-1：带 fencing token 的恢复状态转换。行已被更高 term 接管 → no-op。
+    /// 单节点/M7 入口：不带 fencing token（见 [`Self::set_restore_state_fenced`]）。
     pub async fn set_restore_state(
         &self,
         bucket: &str,
@@ -4079,27 +4296,69 @@ impl Db {
         state: &str,
         expires_at: i64,
     ) -> Result<()> {
+        self.set_restore_state_fenced(
+            bucket,
+            key,
+            version_id,
+            state,
+            expires_at,
+            FencingEpoch::UNFENCED,
+        )
+        .await
+    }
+
+    /// M8-1：行已被更高 term 接管（`fence_term > token.term`）→ no-op。
+    pub async fn set_restore_state_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        state: &str,
+        expires_at: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
         sqlx::query(
-            "UPDATE tier_restores SET state = ?, expires_at = ? \
-             WHERE bucket = ? AND key = ? AND version_id = ?",
+            "UPDATE tier_restores SET state = ?, expires_at = ?, \
+             fence_term = ?, fence_leader = ? \
+             WHERE bucket = ? AND key = ? AND version_id = ? AND fence_term <= ?",
         )
         .bind(state)
         .bind(expires_at)
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
         .bind(bucket)
         .bind(key)
         .bind(version_id)
+        .bind(fence.term_i64())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    /// 单节点/M7 入口：不带 fencing token（见 [`Self::delete_restore_fenced`]）。
     pub async fn delete_restore(&self, bucket: &str, key: &str, version_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM tier_restores WHERE bucket = ? AND key = ? AND version_id = ?")
-            .bind(bucket)
-            .bind(key)
-            .bind(version_id)
-            .execute(&self.pool)
-            .await?;
+        self.delete_restore_fenced(bucket, key, version_id, FencingEpoch::UNFENCED)
+            .await
+    }
+
+    /// M8-1：行已被更高 term 接管（`fence_term > token.term`）→ 不删除（留给新 leader）。
+    pub async fn delete_restore_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        fence: FencingEpoch,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM tier_restores \
+             WHERE bucket = ? AND key = ? AND version_id = ? AND fence_term <= ?",
+        )
+        .bind(bucket)
+        .bind(key)
+        .bind(version_id)
+        .bind(fence.term_i64())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -4138,7 +4397,20 @@ impl Db {
     }
 
     /// 原子领取一条任务（BEGIN IMMEDIATE）。先提升 queued 作业，再按优先级/时间取一条。
+    /// 单节点/M7 入口：不带 fencing token（见 [`Self::claim_task_fenced`]）。
     pub async fn claim_task(&self, now: i64, timeout_secs: i64) -> Result<Option<ClaimedTask>> {
+        self.claim_task_fenced(now, timeout_secs, FencingEpoch::UNFENCED)
+            .await
+    }
+
+    /// M8-1：带 fencing token 的领取。只领 `fence_term <= token.term` 的排队任务
+    /// （被更高 term 接管过的行不再归旧 leader），并把 token 落到行上作为租约归属。
+    pub async fn claim_task_fenced(
+        &self,
+        now: i64,
+        timeout_secs: i64,
+        fence: FencingEpoch,
+    ) -> Result<Option<ClaimedTask>> {
         let mut conn = self.pool.acquire().await?;
         sqlx::raw_sql("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let out = async {
@@ -4155,9 +4427,11 @@ impl Db {
                 "SELECT t.job_id, t.task_no, t.action, t.payload_json, t.attempt \
                  FROM job_tasks t JOIN jobs j ON j.id = t.job_id \
                  WHERE t.state = 'queued' AND t.next_at <= ? AND j.state = 'running' \
+                   AND t.fence_term <= ? \
                  ORDER BY j.priority DESC, t.next_at, t.task_no LIMIT 1",
             )
             .bind(now)
+            .bind(fence.term_i64())
             .fetch_optional(&mut *conn)
             .await?;
             let Some(r) = row else {
@@ -4165,13 +4439,17 @@ impl Db {
             };
             let (job_id, task_no): (i64, i64) = (r.get("job_id"), r.get("task_no"));
             sqlx::query(
-                "UPDATE job_tasks SET state = 'running', started_at = ?, deadline_at = ? \
-                 WHERE job_id = ? AND task_no = ? AND state = 'queued'",
+                "UPDATE job_tasks SET state = 'running', started_at = ?, deadline_at = ?, \
+                 fence_term = ?, fence_leader = ? \
+                 WHERE job_id = ? AND task_no = ? AND state = 'queued' AND fence_term <= ?",
             )
             .bind(now)
             .bind(now + timeout_secs)
+            .bind(fence.term_i64())
+            .bind(fence.leader_i64())
             .bind(job_id)
             .bind(task_no)
+            .bind(fence.term_i64())
             .execute(&mut *conn)
             .await?;
             Ok(Some(ClaimedTask {
@@ -4191,20 +4469,23 @@ impl Db {
     }
 
     /// 领取后按动作类型收紧截止时间（claim 时动作未知，只能先写两类超时的较大值）。
-    /// 只改 running 行：终态/已重排任务的 deadline 不被拉回。
+    /// 只改 running 行：终态/已重排任务的 deadline 不被拉回。M8-1：只改本 token
+    /// 领取的行（被更高 term 接管后旧 worker 的收尾是 no-op）。
     pub async fn set_task_deadline(
         &self,
         job_id: i64,
         task_no: i64,
         deadline_at: i64,
+        fence: FencingEpoch,
     ) -> Result<()> {
         sqlx::query(
             "UPDATE job_tasks SET deadline_at = ? \
-             WHERE job_id = ? AND task_no = ? AND state = 'running'",
+             WHERE job_id = ? AND task_no = ? AND state = 'running' AND fence_term = ?",
         )
         .bind(deadline_at)
         .bind(job_id)
         .bind(task_no)
+        .bind(fence.term_i64())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4221,14 +4502,22 @@ impl Db {
     /// 抢占边界回退：把已领取但**尚未执行**的 running 任务放回 queued。
     /// 不消耗重试次数（attempt 不变）、不改结果列；已执行完的动作仍是 done。
     /// 只命中 running 行，重复调用幂等（返回是否命中）。
-    pub async fn requeue_task(&self, job_id: i64, task_no: i64, now: i64) -> Result<bool> {
+    pub async fn requeue_task(
+        &self,
+        job_id: i64,
+        task_no: i64,
+        now: i64,
+        fence: FencingEpoch,
+    ) -> Result<bool> {
         let n = sqlx::query(
             "UPDATE job_tasks SET state = 'queued', started_at = NULL, deadline_at = NULL, \
-             next_at = ? WHERE job_id = ? AND task_no = ? AND state = 'running'",
+             next_at = ? WHERE job_id = ? AND task_no = ? AND state = 'running' \
+             AND fence_term = ?",
         )
         .bind(now)
         .bind(job_id)
         .bind(task_no)
+        .bind(fence.term_i64())
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -4300,6 +4589,7 @@ impl Db {
 
     /// 任务终态/重试。成功 → done；失败未达上限 → queued（指数退避）；达上限 → failed。
     /// 返回任务新状态；作业在无 queued/running 任务时收敛为 done/error。
+    /// 单节点/M7 入口：不带 fencing token（见 [`Self::finish_task_fenced`]）。
     #[allow(clippy::too_many_arguments)]
     pub async fn finish_task(
         &self,
@@ -4311,13 +4601,42 @@ impl Db {
         now: i64,
         max_attempts: i64,
     ) -> Result<&'static str> {
+        self.finish_task_fenced(
+            job_id,
+            task_no,
+            ok,
+            code,
+            message,
+            now,
+            max_attempts,
+            FencingEpoch::UNFENCED,
+        )
+        .await
+    }
+
+    /// M8-1：带 fencing token 的收尾。行已被更高 term 接管（`fence_term > token.term`）
+    /// → `Ok("fenced")` 且不做任何写入；调用方的动作结果丢弃，任务留 running 交给
+    /// 新 leader 的过期/接管回收（at-least-once）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_task_fenced(
+        &self,
+        job_id: i64,
+        task_no: i64,
+        ok: bool,
+        code: &str,
+        message: Option<&str>,
+        now: i64,
+        max_attempts: i64,
+        fence: FencingEpoch,
+    ) -> Result<&'static str> {
         let mut tx = self.pool.begin().await?;
-        let row =
-            sqlx::query("SELECT state, attempt FROM job_tasks WHERE job_id = ? AND task_no = ?")
-                .bind(job_id)
-                .bind(task_no)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let row = sqlx::query(
+            "SELECT state, attempt, fence_term FROM job_tasks WHERE job_id = ? AND task_no = ?",
+        )
+        .bind(job_id)
+        .bind(task_no)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(r) = row else {
             tx.commit().await?;
             return Ok("missing");
@@ -4326,18 +4645,24 @@ impl Db {
             tx.commit().await?;
             return Ok("not-running");
         }
+        if r.get::<i64, _>("fence_term") > fence.term_i64() {
+            tx.commit().await?;
+            return Ok("fenced");
+        }
         let attempt: i64 = r.get("attempt");
         if ok {
             // C7：终态清空 dedupe_key（成功后同键可再次入队）。
             sqlx::query(
                 "UPDATE job_tasks SET state = 'done', result_code = ?, result_string = ?, \
-                 finished_at = ?, dedupe_key = NULL WHERE job_id = ? AND task_no = ?",
+                 finished_at = ?, dedupe_key = NULL \
+                 WHERE job_id = ? AND task_no = ? AND fence_term <= ?",
             )
             .bind(code)
             .bind(message)
             .bind(now)
             .bind(job_id)
             .bind(task_no)
+            .bind(fence.term_i64())
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -4356,13 +4681,14 @@ impl Db {
             sqlx::query(
                 "UPDATE job_tasks SET state = 'queued', attempt = attempt + 1, next_at = ?, \
                  result_code = ?, result_string = ?, started_at = NULL, deadline_at = NULL \
-                 WHERE job_id = ? AND task_no = ?",
+                 WHERE job_id = ? AND task_no = ? AND fence_term <= ?",
             )
             .bind(now + backoff)
             .bind(code)
             .bind(message)
             .bind(job_id)
             .bind(task_no)
+            .bind(fence.term_i64())
             .execute(&mut *tx)
             .await?;
             sqlx::query("UPDATE jobs SET updated_at = ? WHERE id = ?")
@@ -4374,12 +4700,13 @@ impl Db {
             sqlx::query(
                 "UPDATE job_tasks SET state = 'failed', attempt = attempt + 1, \
                  result_code = 'PermanentFailure', result_string = ?, finished_at = ?, \
-                 dedupe_key = NULL WHERE job_id = ? AND task_no = ?",
+                 dedupe_key = NULL WHERE job_id = ? AND task_no = ? AND fence_term <= ?",
             )
             .bind(message)
             .bind(now)
             .bind(job_id)
             .bind(task_no)
+            .bind(fence.term_i64())
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -4416,16 +4743,26 @@ impl Db {
     }
 
     /// 超时回收：running 且 deadline 过期 → 按一次失败处理。返回回收条数。
-    pub async fn recover_expired_tasks(&self, now: i64, max_attempts: i64) -> Result<usize> {
+    /// M8-1：接管时把行重标为当前 token，旧 holder 的迟到 finish 因此被拒。
+    pub async fn recover_expired_tasks(
+        &self,
+        now: i64,
+        max_attempts: i64,
+        fence: FencingEpoch,
+    ) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT job_id, task_no FROM job_tasks \
-             WHERE state = 'running' AND deadline_at IS NOT NULL AND deadline_at < ?",
+             WHERE state = 'running' AND deadline_at IS NOT NULL AND deadline_at < ? \
+               AND fence_term <= ?",
         )
         .bind(now)
+        .bind(fence.term_i64())
         .fetch_all(&self.pool)
         .await?;
         for r in &rows {
-            self.finish_task(
+            self.take_over_task(r.get("job_id"), r.get("task_no"), None, now, fence)
+                .await?;
+            self.finish_task_fenced(
                 r.get("job_id"),
                 r.get("task_no"),
                 false,
@@ -4433,10 +4770,42 @@ impl Db {
                 Some("task deadline exceeded"),
                 now,
                 max_attempts,
+                fence,
             )
             .await?;
         }
         Ok(rows.len())
+    }
+
+    /// M8-1：把一条 running 任务重标为当前 token（接管租约）。`started_before` 为 Some 时
+    /// 只接管 `started_at <` 阈值的行（启动崩溃回收）；None = 只看 deadline 已过的行。
+    async fn take_over_task(
+        &self,
+        job_id: i64,
+        task_no: i64,
+        started_before: Option<i64>,
+        now: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
+        let deadline_cond = if started_before.is_some() {
+            "started_at IS NOT NULL AND started_at < ?"
+        } else {
+            "deadline_at IS NOT NULL AND deadline_at < ?"
+        };
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE job_tasks SET fence_term = ?, fence_leader = ? \
+             WHERE job_id = ? AND task_no = ? AND state = 'running' AND {deadline_cond} \
+               AND fence_term <= ?"
+        )))
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
+        .bind(job_id)
+        .bind(task_no)
+        .bind(started_before.unwrap_or(now))
+        .bind(fence.term_i64())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 4.11/M2：回收「state='running' 但没有任何 job_tasks」的作业行。
@@ -4470,23 +4839,35 @@ impl Db {
     }
 
     /// 启动恢复：running 且 `started_at < cutoff`（进程崩溃遗留）按一次失败处理。
-    pub async fn recover_stale_tasks(&self, cutoff: i64, max_attempts: i64) -> Result<usize> {
+    /// M8-1：同样先接管 token 再收尾（旧进程若还活着，其 finish 会被拒）。
+    pub async fn recover_stale_tasks(
+        &self,
+        cutoff: i64,
+        max_attempts: i64,
+        fence: FencingEpoch,
+    ) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT job_id, task_no FROM job_tasks \
-             WHERE state = 'running' AND started_at IS NOT NULL AND started_at < ?",
+             WHERE state = 'running' AND started_at IS NOT NULL AND started_at < ? \
+               AND fence_term <= ?",
         )
         .bind(cutoff)
+        .bind(fence.term_i64())
         .fetch_all(&self.pool)
         .await?;
+        let now = crate::db::now();
         for r in &rows {
-            self.finish_task(
+            self.take_over_task(r.get("job_id"), r.get("task_no"), Some(cutoff), now, fence)
+                .await?;
+            self.finish_task_fenced(
                 r.get("job_id"),
                 r.get("task_no"),
                 false,
                 "Timeout",
                 Some("process restart recovery"),
-                crate::db::now(),
+                now,
                 max_attempts,
+                fence,
             )
             .await?;
         }
@@ -4912,6 +5293,7 @@ impl Db {
     }
 
     /// 3.6：写入/清除增量水位（`None` → 删除，回到全量起点）。
+    /// M8-1：行已被更高 term 接管时旧 leader 的迟到写入是 no-op。
     pub async fn inventory_cursor_set(
         &self,
         bucket: &str,
@@ -4919,74 +5301,113 @@ impl Db {
         config_updated_at: i64,
         cursor: Option<&str>,
         now: i64,
+        fence: FencingEpoch,
     ) -> Result<()> {
         match cursor {
             Some(c) if !c.is_empty() => {
                 sqlx::query(
                     "INSERT INTO inventory_cursors \
-                     (bucket, config_id, cursor, config_updated_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
+                     (bucket, config_id, cursor, config_updated_at, updated_at, fence_term, fence_leader) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
                      cursor = excluded.cursor, \
                      config_updated_at = excluded.config_updated_at, \
-                     updated_at = excluded.updated_at",
+                     updated_at = excluded.updated_at, \
+                     fence_term = excluded.fence_term, fence_leader = excluded.fence_leader \
+                     WHERE inventory_cursors.fence_term <= excluded.fence_term",
                 )
                 .bind(bucket)
                 .bind(config_id)
                 .bind(c)
                 .bind(config_updated_at)
                 .bind(now)
+                .bind(fence.term_i64())
+                .bind(fence.leader_i64())
                 .execute(&self.pool)
                 .await?;
             }
             _ => {
-                sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-                    .bind(bucket)
-                    .bind(config_id)
-                    .execute(&self.pool)
-                    .await?;
+                sqlx::query(
+                    "DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ? \
+                     AND fence_term <= ?",
+                )
+                .bind(bucket)
+                .bind(config_id)
+                .bind(fence.term_i64())
+                .execute(&self.pool)
+                .await?;
             }
         }
         Ok(())
     }
 
     /// 建运行行；`(bucket, config_id, run_key)` 已存在 → None（同槽去重）。
+    /// M8-1：带调度者 token（新行归当前 leader；旧 term 的执行器不能改其状态）。
     pub async fn inventory_create_run(
         &self,
         bucket: &str,
         config_id: &str,
         run_key: &str,
         now: i64,
+        fence: FencingEpoch,
     ) -> Result<Option<i64>> {
         let r = sqlx::query(
             "INSERT OR IGNORE INTO inventory_runs \
-             (bucket, config_id, run_key, started_at, state, created_at) \
-             VALUES (?, ?, ?, 0, 'running', ?)",
+             (bucket, config_id, run_key, started_at, state, created_at, fence_term, fence_leader) \
+             VALUES (?, ?, ?, 0, 'running', ?, ?, ?)",
         )
         .bind(bucket)
         .bind(config_id)
         .bind(run_key)
         .bind(now)
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
         .execute(&self.pool)
         .await?;
         Ok((r.rows_affected() > 0).then(|| r.last_insert_rowid()))
     }
 
-    pub async fn inventory_run_set_job(&self, run_id: i64, job_id: i64) -> Result<()> {
-        sqlx::query("UPDATE inventory_runs SET job_id = ? WHERE id = ?")
-            .bind(job_id)
-            .bind(run_id)
-            .execute(&self.pool)
-            .await?;
+    pub async fn inventory_run_set_job(
+        &self,
+        run_id: i64,
+        job_id: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE inventory_runs SET job_id = ?, fence_term = ?, fence_leader = ? \
+             WHERE id = ? AND fence_term <= ?",
+        )
+        .bind(job_id)
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
+        .bind(run_id)
+        .bind(fence.term_i64())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    /// 执行器开始跑时写实际开始时刻（槽时间只体现在 run_key）。
-    pub async fn inventory_run_started(&self, run_id: i64, now: i64) -> Result<()> {
-        sqlx::query("UPDATE inventory_runs SET started_at = ? WHERE id = ? AND started_at = 0")
-            .bind(now)
-            .bind(run_id)
-            .execute(&self.pool)
-            .await?;
+    /// 执行器开始跑时写实际开始时刻（槽时间只体现在 run_key）。接管旧 term 的行时
+    /// 重标 token，旧执行器的后续转换因此被拒。
+    pub async fn inventory_run_started(
+        &self,
+        run_id: i64,
+        now: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
+        // `started_at` 只在首次执行时写；更高 term 的重试要重标 token，旧执行器的收尾
+        // 才会被 `fence_term <= ?` 拒绝。
+        sqlx::query(
+            "UPDATE inventory_runs SET \
+             started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END, \
+             fence_term = ?, fence_leader = ? WHERE id = ? AND fence_term <= ?",
+        )
+        .bind(now)
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
+        .bind(run_id)
+        .bind(fence.term_i64())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -5008,20 +5429,26 @@ impl Db {
         Ok(row.as_ref().map(inventory_run_row))
     }
 
+    /// M8-1：行已被更高 term 接管 → no-op（旧 leader 的迟到完成不覆盖新状态）。
     pub async fn inventory_run_finish(
         &self,
         run_id: i64,
         state: &str,
         manifest_key: Option<&str>,
         error: Option<&str>,
+        fence: FencingEpoch,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE inventory_runs SET state = ?, manifest_key = ?, error = ? WHERE id = ?",
+            "UPDATE inventory_runs SET state = ?, manifest_key = ?, error = ?, \
+             fence_term = ?, fence_leader = ? WHERE id = ? AND fence_term <= ?",
         )
         .bind(state)
         .bind(manifest_key)
         .bind(error)
+        .bind(fence.term_i64())
+        .bind(fence.leader_i64())
         .bind(run_id)
+        .bind(fence.term_i64())
         .execute(&self.pool)
         .await?;
         Ok(())

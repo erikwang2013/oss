@@ -9,13 +9,24 @@
 use std::sync::Arc;
 
 use crate::db::Db;
-use crate::raft::LeaderGate;
+use crate::raft::{FencingEpoch, LeaderGate};
 use xl_store::store::{Store, VersioningMode};
 
 /// 动作执行器。`Ok(code)` = 成功；`Err(msg)` = 可重试失败（由引擎按上限转 PermanentFailure）。
 #[async_trait::async_trait]
 pub trait TaskExecutor: Send + Sync {
     async fn execute(&self, action: &str, payload: &str) -> Result<String, String>;
+
+    /// M8-1：worker 路径带 fencing token 执行。默认忽略 token（动作不写单例运行态）；
+    /// Inventory/Tier 执行器覆盖它，把 token 传给自己的状态转换。
+    async fn execute_fenced(
+        &self,
+        action: &str,
+        payload: &str,
+        _fence: FencingEpoch,
+    ) -> Result<String, String> {
+        self.execute(action, payload).await
+    }
 }
 
 /// S0 占位执行器：没有注册动作时任务按可重试失败处理（S3/S4b/S5 接入真实实现）。
@@ -81,10 +92,10 @@ pub async fn worker_tick(
     now: i64,
     gate: &LeaderGate,
 ) -> Result<bool, String> {
-    if !gate.is_leader() {
+    let Some(fence) = gate.epoch() else {
         return Ok(false);
-    }
-    worker_once(db, store, exec, env, now).await
+    };
+    worker_once_fenced(db, store, exec, env, now, gate, fence).await
 }
 
 /// 启动 worker 池（`OSS_JOB_WORKERS=0` 关闭）。M8-1：只有 leader 领取/执行；
@@ -105,21 +116,31 @@ pub fn spawn_workers(
     tokio::spawn(async move {
         // 启动回收也是单例写：等到本节点成为 leader 再做（unknown 一直等）；时间在
         // 拿到 leadership 后再取，避免用进程启动时刻判断过期。
-        recover_gate.wait_until_leader().await;
+        let fence = recover_gate.wait_until_leader().await;
         let now = crate::db::now();
-        // 崩溃遗留：running 超过 300s 或 deadline 已过 → 按一次失败回收
+        // 崩溃遗留：running 超过 300s 或 deadline 已过 → 按一次失败回收。
+        // 回收写带 fence：若等 leader 期间又换届，旧 token 的回收被拒绝（留给新 leader）。
         match recover
-            .recover_stale_tasks(now - 300, env.max_attempts)
+            .recover_stale_tasks(now - 300, env.max_attempts, fence)
             .await
         {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收崩溃遗留任务"),
             Err(e) => tracing::warn!(error = %e, "job：启动回收失败"),
             _ => {}
         }
-        match recover.recover_expired_tasks(now, env.max_attempts).await {
+        if !recover_gate.still_current(fence) {
+            return;
+        }
+        match recover
+            .recover_expired_tasks(now, env.max_attempts, fence)
+            .await
+        {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收过期任务"),
             Err(e) => tracing::warn!(error = %e, "job：启动回收失败"),
             _ => {}
+        }
+        if !recover_gate.still_current(fence) {
+            return;
         }
         // 4.11：启动即回收崩溃遗留的「无任务 running」行（留 10s 余量避开刚启动的作业）。
         match recover
@@ -181,7 +202,7 @@ pub fn spawn_workers(
     tracing::info!(workers = env.workers, "job worker 已启动");
 }
 
-/// 处理一条任务（测试直接调用）。返回是否领到任务。
+/// 单节点/M7 入口：不检查 leadership（等价 `LeaderGate::always()`，行为与门控前一致）。
 pub async fn worker_once(
     db: &Db,
     store: &Store,
@@ -189,8 +210,35 @@ pub async fn worker_once(
     env: JobEnv,
     now: i64,
 ) -> Result<bool, String> {
+    worker_once_fenced(
+        db,
+        store,
+        exec,
+        env,
+        now,
+        &LeaderGate::always(),
+        FencingEpoch::UNFENCED,
+    )
+    .await
+}
+
+/// M8-1：处理一条任务（worker 循环/测试共用）。`fence` 是领取时的 leadership token；
+/// 动作执行完后若 token 已变（交接/失去 leadership），收尾被跳过，任务留 running 由
+/// 新 leader 的过期/接管回收（at-least-once），绝不把旧结果写进新 leader 的状态。
+pub async fn worker_once_fenced(
+    db: &Db,
+    store: &Store,
+    exec: &dyn TaskExecutor,
+    env: JobEnv,
+    now: i64,
+    gate: &LeaderGate,
+    fence: FencingEpoch,
+) -> Result<bool, String> {
+    if !gate.still_current(fence) {
+        return Ok(false);
+    }
     // 顺手回收超时任务（不需要每 tick 全表扫；这里与领取同频）
-    db.recover_expired_tasks(now, env.max_attempts)
+    db.recover_expired_tasks(now, env.max_attempts, fence)
         .await
         .map_err(|e| e.to_string())?;
     // 4.11：周期回收「无任务 running」行（超出阈值的崩溃遗留；有局部索引，开销小）。
@@ -210,7 +258,7 @@ pub async fn worker_once(
     // 领取后立即按动作类型收紧，让非 tier 任务超时后 900s（而非 3600s）即可回收。
     let deadline_secs = env.timeout_secs.max(env.tier_timeout_secs);
     let Some(task) = db
-        .claim_task(now, deadline_secs)
+        .claim_task_fenced(now, deadline_secs, fence)
         .await
         .map_err(|e| e.to_string())?
     else {
@@ -220,7 +268,7 @@ pub async fn worker_once(
     // 原样放回队列（不消耗重试、无副作用），等释放后按优先级恢复。
     match db.job_state(task.job_id).await {
         Ok(Some(state)) if state == "preempted" => {
-            match db.requeue_task(task.job_id, task.task_no, now).await {
+            match db.requeue_task(task.job_id, task.task_no, now, fence).await {
                 Ok(true) => tracing::info!(
                     job_id = task.job_id,
                     task_no = task.task_no,
@@ -247,15 +295,34 @@ pub async fn worker_once(
     };
     // 收紧失败不致命：claim 已写下硬上限 deadline，任务仍会被过期回收。
     if let Err(e) = db
-        .set_task_deadline(task.job_id, task.task_no, now + timeout)
+        .set_task_deadline(task.job_id, task.task_no, now + timeout, fence)
         .await
     {
         tracing::warn!(job_id = task.job_id, task_no = task.task_no, error = %e,
             "job：收紧任务 deadline 失败（沿用 claim 硬上限）");
     }
+    // 领取后、执行前再确认一次 leadership：动作尚未发生、无副作用，直接放回队列，
+    // 让新 leader 立即接管（若行已被新 leader 接管，requeue 因 term 不匹配而 no-op）。
+    if !gate.still_current(fence) {
+        match db.requeue_task(task.job_id, task.task_no, now, fence).await {
+            Ok(true) => tracing::info!(
+                job_id = task.job_id,
+                task_no = task.task_no,
+                "job：领取后失去 leadership，任务回退排队（未执行）"
+            ),
+            Ok(false) => tracing::info!(
+                job_id = task.job_id,
+                task_no = task.task_no,
+                "job：领取后失去 leadership，任务已被新 leader 接管"
+            ),
+            Err(e) => tracing::warn!(job_id = task.job_id, task_no = task.task_no, error = %e,
+                "job：失去 leadership 后回退失败（任务保持 running，等待超时回收）"),
+        }
+        return Ok(true);
+    }
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(timeout.max(1) as u64),
-        exec.execute(&task.action, &task.payload_json),
+        exec.execute_fenced(&task.action, &task.payload_json, fence),
     )
     .await;
     let (ok, code, msg) = match outcome {
@@ -267,12 +334,23 @@ pub async fn worker_once(
             Some(format!("task exceeded {timeout}s")),
         ),
     };
+    // 动作完成时 leadership 已变：结果不能写进（可能已被接管的）运行态，报告也不写；
+    // 任务留 running，由新 leader 的过期/接管回收重跑（at-least-once）。
+    if !gate.still_current(fence) {
+        tracing::warn!(
+            job_id = task.job_id,
+            task_no = task.task_no,
+            "job：动作完成前失去 leadership，丢弃本次收尾（等待接管回收）"
+        );
+        return Ok(true);
+    }
     // 多 worker 共享 WAL 时 finish 偶发 SQLITE_BUSY：重试短退避。全部失败则上报错误，
     // 任务留 running 由过期回收兜底——绝不在 finish 未落库时继续领下一条。
+    let mut finish_state = None;
     let mut finish_err = None;
     for attempt in 0..5 {
         match db
-            .finish_task(
+            .finish_task_fenced(
                 task.job_id,
                 task.task_no,
                 ok,
@@ -280,10 +358,12 @@ pub async fn worker_once(
                 msg.as_deref(),
                 crate::db::now(),
                 env.max_attempts,
+                fence,
             )
             .await
         {
-            Ok(_) => {
+            Ok(state) => {
+                finish_state = Some(state);
                 finish_err = None;
                 break;
             }
@@ -302,6 +382,15 @@ pub async fn worker_once(
             "finish_task 未落库（job {} task {}）: {e}",
             task.job_id, task.task_no
         ));
+    }
+    // 收尾时发现行已被更高 term 接管：动作结果作废（新 leader 会重跑），不写报告。
+    if finish_state == Some("fenced") {
+        tracing::warn!(
+            job_id = task.job_id,
+            task_no = task.task_no,
+            "job：收尾被 fencing 拒绝（任务已被接管），丢弃本次动作结果"
+        );
+        return Ok(true);
     }
     maybe_write_report(db, store, task.job_id).await?;
     Ok(true)

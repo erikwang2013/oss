@@ -89,6 +89,10 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         "leader": m.current_leader,
         // M8-1：单例后台任务（作业/清单/tier/生命周期）只在本节点为 leader 时执行。
         "is_leader": is_leader,
+        // M8-1 fencing token：状态转换按 (term, leader) 单调拒绝旧 leader 的写入。
+        // null = 当前不可执行（follower/选举中/已停止）。
+        "fencing_epoch": handle.fencing_epoch().map(|e| json!({"term": e.term, "leader": e.leader})),
+        "fencing_token": handle.fencing_epoch().map(|e| format!("{}-{}", e.term, e.leader)),
         "leader_endpoint": leader_endpoint,
         "term": m.current_term,
         "state": state,

@@ -16,6 +16,7 @@ use xl_store::store::Store;
 
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::jobs::TaskExecutor;
+use crate::raft::{FencingEpoch, LeaderGate};
 use crate::tier::{StageGuard, TierBackends, TierByteStream, reserve_free_space, tier_key};
 
 /// 过渡/恢复的搬运窗口：内存驻留上限 = 一个窗口（+ 后端自己的 256 KiB 块）。
@@ -45,11 +46,17 @@ struct RestorePayload {
 /// Restore 入队：单事务写 `tier_restores`(pending) + 作业。
 pub struct SqlRestoreSink {
     db: Arc<Db>,
+    gate: LeaderGate,
 }
 
 impl SqlRestoreSink {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Db>, gate: LeaderGate) -> Self {
+        Self { db, gate }
+    }
+
+    /// 入队时刻的 token：leader 用当前 epoch；follower/M7 用 UNFENCED（本地行仍可写）。
+    fn fence(&self) -> FencingEpoch {
+        self.gate.epoch().unwrap_or(FencingEpoch::UNFENCED)
     }
 }
 
@@ -83,7 +90,14 @@ impl RestoreSink for SqlRestoreSink {
             ..Default::default()
         };
         self.db
-            .create_restore_job(&spec, bucket, key, version_id, crate::db::now())
+            .create_restore_job(
+                &spec,
+                bucket,
+                key,
+                version_id,
+                crate::db::now(),
+                self.fence(),
+            )
             .await
             .map(|(id, _)| id)
             .map_err(|e| e.to_string())
@@ -96,7 +110,7 @@ impl RestoreSink for SqlRestoreSink {
         version_id: &str,
     ) -> Result<(), String> {
         self.db
-            .delete_restore(bucket, key, version_id)
+            .delete_restore_fenced(bucket, key, version_id, self.fence())
             .await
             .map_err(|e| e.to_string())
     }
@@ -367,7 +381,7 @@ impl M8TaskExecutor {
         }
     }
 
-    async fn restore(&self, p: &RestorePayload) -> Result<String, String> {
+    async fn restore(&self, p: &RestorePayload, fence: FencingEpoch) -> Result<String, String> {
         let Some(v) = self
             .store
             .tier_version(&p.bucket, &p.key, &p.version_id)
@@ -376,14 +390,14 @@ impl M8TaskExecutor {
         else {
             let _ = self
                 .db
-                .delete_restore(&p.bucket, &p.key, &p.version_id)
+                .delete_restore_fenced(&p.bucket, &p.key, &p.version_id, fence)
                 .await;
             return Ok("missing".into());
         };
         let Some(t) = v.tier else {
             let _ = self
                 .db
-                .delete_restore(&p.bucket, &p.key, &p.version_id)
+                .delete_restore_fenced(&p.bucket, &p.key, &p.version_id, fence)
                 .await;
             return Ok("missing".into());
         };
@@ -470,7 +484,7 @@ impl M8TaskExecutor {
         guard.disarm();
         let expires = crate::db::now() + i64::from(p.days) * 86_400;
         self.db
-            .set_restore_state(&p.bucket, &p.key, &p.version_id, "restored", expires)
+            .set_restore_state_fenced(&p.bucket, &p.key, &p.version_id, "restored", expires, fence)
             .await
             .map_err(|e| e.to_string())?;
         if let Err(e) = self
@@ -480,7 +494,7 @@ impl M8TaskExecutor {
         {
             let _ = self
                 .db
-                .set_restore_state(&p.bucket, &p.key, &p.version_id, "pending", 0)
+                .set_restore_state_fenced(&p.bucket, &p.key, &p.version_id, "pending", 0, fence)
                 .await;
             return Err(e.to_string());
         }
@@ -508,7 +522,7 @@ impl TaskExecutor for M8TaskExecutor {
             "RestoreObject" => {
                 let p: RestorePayload =
                     serde_json::from_str(payload).map_err(|e| format!("payload 非法: {e}"))?;
-                match self.restore(&p).await {
+                match self.restore(&p, FencingEpoch::UNFENCED).await {
                     Err(e) => {
                         // 失败回 Archived：重试从干净状态开始；重试耗尽也不会卡在 Restoring。
                         let _ = self
@@ -521,6 +535,31 @@ impl TaskExecutor for M8TaskExecutor {
                 }
             }
             other => Err(format!("未注册的作业动作: {other}")),
+        }
+    }
+
+    /// M8-1：`RestoreObject` 的状态转换带 worker 的 fencing token；`Transition` 只写
+    /// 对象元数据（版本级、可重放），无单例行可写。
+    async fn execute_fenced(
+        &self,
+        action: &str,
+        payload: &str,
+        fence: FencingEpoch,
+    ) -> Result<String, String> {
+        if action != "RestoreObject" {
+            return self.execute(action, payload).await;
+        }
+        let p: RestorePayload =
+            serde_json::from_str(payload).map_err(|e| format!("payload 非法: {e}"))?;
+        match self.restore(&p, fence).await {
+            Err(e) => {
+                let _ = self
+                    .store
+                    .abort_restore(&p.bucket, &p.key, &p.version_id)
+                    .await;
+                Err(e)
+            }
+            ok => ok,
         }
     }
 }

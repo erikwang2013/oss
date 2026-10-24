@@ -18,6 +18,7 @@ use xl_s3::sync_delete::SyncDeleteSink as _;
 use xl_store::store::{ListRequest, UploadListRequest, VersionEntry, VersioningMode};
 
 use crate::db::LifecycleRuleRow;
+use crate::raft::{FencingEpoch, LeaderGate};
 use crate::state::AppState;
 
 /// 删除结果 → 生命周期事件（`None` = 并发空删，**不发事件**）。
@@ -144,6 +145,12 @@ pub async fn sweep_once_at(state: &AppState, now: i64) -> usize {
 
 /// 4.10：可注入页预算的扫描入口（集成测试用小预算验证「截停→续扫」）。
 pub async fn sweep_once_at_with(state: &AppState, now: i64, limits: SweepLimits) -> usize {
+    // M8-1：Raft 模式下只有 leader 扫；本轮固定一个 token，交接后立即停（游标写入也带
+    // token，旧 leader 不会推进新 leader 的进度）。
+    let gate = LeaderGate::from_raft(state.raft.clone());
+    let Some(fence) = gate.epoch() else {
+        return 0;
+    };
     let rules = match state.db.enabled_lifecycle_rules().await {
         Ok(r) => r,
         Err(e) => {
@@ -153,6 +160,10 @@ pub async fn sweep_once_at_with(state: &AppState, now: i64, limits: SweepLimits)
     };
     let mut ran = 0usize;
     for row in rules {
+        if !gate.still_current(fence) {
+            tracing::warn!("lifecycle：leadership 已变更，本轮中止（新 leader 续扫）");
+            break;
+        }
         let spec = match crate::lifecycle_store::spec_from_row(&row) {
             Ok(s) => s,
             Err(e) => {
@@ -171,7 +182,7 @@ pub async fn sweep_once_at_with(state: &AppState, now: i64, limits: SweepLimits)
             continue; // Transition-only 规则归 tier sweep
         }
         ran += 1;
-        run_rule(state, &row.bucket, &spec, kinds, now, limits).await;
+        run_rule(state, &row.bucket, &spec, kinds, now, limits, &gate, fence).await;
     }
     ran
 }
@@ -199,6 +210,7 @@ async fn record_bad_rule(state: &AppState, row: &LifecycleRuleRow, msg: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_rule(
     state: &AppState,
     bucket: &str,
@@ -206,6 +218,8 @@ async fn run_rule(
     kinds: ExpiryKinds,
     now: i64,
     limits: SweepLimits,
+    gate: &LeaderGate,
+    fence: FencingEpoch,
 ) {
     let rule_key = cursor_rule_id(spec);
     let mut progress = Progress::default();
@@ -242,6 +256,8 @@ async fn run_rule(
                 job,
                 &mut progress,
                 limits,
+                gate,
+                fence,
             )
             .await;
         }
@@ -256,6 +272,8 @@ async fn run_rule(
                 job,
                 &mut progress,
                 limits,
+                gate,
+                fence,
             )
             .await;
             err = err.or(e);
@@ -271,6 +289,8 @@ async fn run_rule(
                 job,
                 &mut progress,
                 limits,
+                gate,
+                fence,
             )
             .await;
             err = err.or(e);
@@ -285,6 +305,8 @@ async fn run_rule(
                 job,
                 &mut progress,
                 limits,
+                gate,
+                fence,
             )
             .await;
             err = err.or(e);
@@ -325,10 +347,11 @@ async fn save_cursor(
     rule_id: &str,
     stage: &str,
     cursor: Option<&str>,
+    fence: FencingEpoch,
 ) {
     if let Err(e) = state
         .db
-        .lifecycle_cursor_set(bucket, rule_id, stage, cursor, now_secs())
+        .lifecycle_cursor_set(bucket, rule_id, stage, cursor, now_secs(), fence)
         .await
     {
         tracing::warn!(bucket, rule_id, stage, error = %e, "lifecycle：游标写入失败");
@@ -347,6 +370,8 @@ async fn expire_current(
     job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
+    gate: &LeaderGate,
+    fence: FencingEpoch,
 ) -> Option<String> {
     let date = match &spec.expiration {
         Some(ExpirationAction::Days { days }) => Some(now - i64::from(*days) * 86_400),
@@ -373,9 +398,25 @@ async fn expire_current(
     let mut token: Option<String> = None;
     let mut pages = 0usize;
     loop {
+        if !gate.still_current(fence) {
+            tracing::warn!(
+                bucket,
+                rule_id,
+                "lifecycle：leadership 已变更，中止当前版本扫描"
+            );
+            return None;
+        }
         if pages >= limits.max_pages {
             // 截停点前整页已处理完：记页尾 key（marker 排他，下轮从其后继续）。
-            save_cursor(state, bucket, rule_id, STAGE_CURRENT, cursor.as_deref()).await;
+            save_cursor(
+                state,
+                bucket,
+                rule_id,
+                STAGE_CURRENT,
+                cursor.as_deref(),
+                fence,
+            )
+            .await;
             return Some(format!(
                 "单轮页上限截停（前缀下键过多），下轮续扫（scanned={}）",
                 progress.scanned
@@ -451,7 +492,7 @@ async fn expire_current(
             Some(t) if page.is_truncated => token = Some(t),
             _ => {
                 // 扫完清游标：下轮从头开始，不跳过游标之前新插入的 key。
-                save_cursor(state, bucket, rule_id, STAGE_CURRENT, None).await;
+                save_cursor(state, bucket, rule_id, STAGE_CURRENT, None, fence).await;
                 return None;
             }
         }
@@ -470,6 +511,8 @@ async fn expire_eodm(
     job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
+    gate: &LeaderGate,
+    fence: FencingEpoch,
 ) -> Option<String> {
     let mut last_key: Option<String> = None;
     let mut group: Vec<VersionEntry> = Vec::new();
@@ -489,6 +532,14 @@ async fn expire_eodm(
     let mut pages = 0usize;
     let mut over_cap = 0usize;
     'pages: loop {
+        if !gate.still_current(fence) {
+            tracing::warn!(
+                bucket,
+                rule_id,
+                "lifecycle：leadership 已变更，中止 EODM 扫描"
+            );
+            return None;
+        }
         pages += 1;
         let page = match state
             .store
@@ -517,7 +568,15 @@ async fn expire_eodm(
                     }
                     // 4.10：至少完成一个 key 后才按预算截停，否则会永远停在起点。
                     if pages >= limits.max_pages {
-                        save_cursor(state, bucket, rule_id, STAGE_EODM, Some(e.key.as_str())).await;
+                        save_cursor(
+                            state,
+                            bucket,
+                            rule_id,
+                            STAGE_EODM,
+                            Some(e.key.as_str()),
+                            fence,
+                        )
+                        .await;
                         return Some("单轮页上限截停（版本过多），下轮续扫".into());
                     }
                 }
@@ -535,7 +594,15 @@ async fn expire_eodm(
                 key_marker = Some(past_key(&e.key));
                 vid_marker = None;
                 if pages >= limits.max_pages {
-                    save_cursor(state, bucket, rule_id, STAGE_EODM, key_marker.as_deref()).await;
+                    save_cursor(
+                        state,
+                        bucket,
+                        rule_id,
+                        STAGE_EODM,
+                        key_marker.as_deref(),
+                        fence,
+                    )
+                    .await;
                     return Some("单轮页上限截停（版本过多），下轮续扫".into());
                 }
                 continue 'pages;
@@ -548,7 +615,7 @@ async fn expire_eodm(
         key_marker = page.next_key_marker;
         vid_marker = page.next_version_id_marker;
     }
-    save_cursor(state, bucket, rule_id, STAGE_EODM, None).await;
+    save_cursor(state, bucket, rule_id, STAGE_EODM, None, fence).await;
     let group_err = if let Some(k) = last_key {
         eodm_group(state, bucket, spec, &k, &group, mode, progress).await
     } else {
@@ -620,6 +687,8 @@ async fn expire_noncurrent(
     job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
+    gate: &LeaderGate,
+    fence: FencingEpoch,
 ) -> Option<String> {
     let nc = match spec.noncurrent_expiration.as_ref() {
         Some(nc) => nc,
@@ -643,6 +712,14 @@ async fn expire_noncurrent(
     let mut pages = 0usize;
     let mut over_cap = 0usize;
     'pages: loop {
+        if !gate.still_current(fence) {
+            tracing::warn!(
+                bucket,
+                rule_id,
+                "lifecycle：leadership 已变更，中止 noncurrent 扫描"
+            );
+            return None;
+        }
         pages += 1;
         let page = match state
             .store
@@ -677,6 +754,7 @@ async fn expire_noncurrent(
                             rule_id,
                             STAGE_NONCURRENT,
                             Some(e.key.as_str()),
+                            fence,
                         )
                         .await;
                         return Some("单轮页上限截停（版本过多），下轮续扫".into());
@@ -702,6 +780,7 @@ async fn expire_noncurrent(
                         rule_id,
                         STAGE_NONCURRENT,
                         key_marker.as_deref(),
+                        fence,
                     )
                     .await;
                     return Some("单轮页上限截停（版本过多），下轮续扫".into());
@@ -716,7 +795,7 @@ async fn expire_noncurrent(
         key_marker = page.next_key_marker;
         vid_marker = page.next_version_id_marker;
     }
-    save_cursor(state, bucket, rule_id, STAGE_NONCURRENT, None).await;
+    save_cursor(state, bucket, rule_id, STAGE_NONCURRENT, None, fence).await;
     let group_err = if let Some(k) = last_key {
         noncurrent_group(state, bucket, spec, nc, &k, &group, mode, now, progress).await
     } else {
@@ -850,6 +929,8 @@ async fn expire_abort_mpu(
     job: i64,
     progress: &mut Progress,
     limits: SweepLimits,
+    gate: &LeaderGate,
+    fence: FencingEpoch,
 ) -> Option<String> {
     let days = spec.abort_mpu_days?;
     let (mut key_marker, mut upload_id_marker) = match state
@@ -870,6 +951,14 @@ async fn expire_abort_mpu(
     };
     let mut pages = 0usize;
     loop {
+        if !gate.still_current(fence) {
+            tracing::warn!(
+                bucket,
+                rule_id,
+                "lifecycle：leadership 已变更，中止 MPU 扫描"
+            );
+            return None;
+        }
         let page = match state
             .store
             .list_multipart_uploads(
@@ -917,7 +1006,7 @@ async fn expire_abort_mpu(
             }
         }
         if !page.is_truncated {
-            save_cursor(state, bucket, rule_id, STAGE_ABORT_MPU, None).await;
+            save_cursor(state, bucket, rule_id, STAGE_ABORT_MPU, None, fence).await;
             return None;
         }
         pages += 1;
@@ -931,7 +1020,7 @@ async fn expire_abort_mpu(
         };
         if pages >= limits.max_pages.max(1) {
             let raw = serde_json::to_string(&next).unwrap_or_default();
-            save_cursor(state, bucket, rule_id, STAGE_ABORT_MPU, Some(&raw)).await;
+            save_cursor(state, bucket, rule_id, STAGE_ABORT_MPU, Some(&raw), fence).await;
             return Some("单轮页上限截停（MPU 过多），下轮续扫".into());
         }
         key_marker = Some(next.key);

@@ -118,20 +118,43 @@ impl std::error::Error for WriteError {}
 /// 基座错误：调用方（S6/S7）负责映射为 HTTP 状态；这里只保证底层错误可上报。
 pub type RaftResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
+/// M8-1：fencing token = `(term, leader)`。Raft 同一 term 至多一个 leader 且 term 单调
+/// 递增，所以 term 是比较用的安全单位，leader 只为诊断/状态可读。写入方必须持有当前
+/// token 才能落单例运行态（见 [`LeaderGate::epoch`]）；数据库按 term 单调拒绝旧 token。
+/// [`FencingEpoch::UNFENCED`] 只用于 M7/单节点（恒有效），落库为 term 0，任何后续 Raft
+/// term 都能接管。
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct FencingEpoch {
+    pub term: u64,
+    pub leader: u64,
+}
+
+impl FencingEpoch {
+    /// M7/单节点：没有 Raft term，任何写入都有效。
+    pub const UNFENCED: Self = Self { term: 0, leader: 0 };
+
+    /// 落库用（SQLite INTEGER 有符号；Raft term 实际远低于 i64::MAX）。
+    pub fn term_i64(self) -> i64 {
+        i64::try_from(self.term).unwrap_or(i64::MAX)
+    }
+
+    pub fn leader_i64(self) -> i64 {
+        i64::try_from(self.leader).unwrap_or(i64::MAX)
+    }
+}
+
 /// M8-1：leadership 判定来源。`None` = 无法确定（未选出 leader / 节点已停止），
-/// 调用方必须按非 leader 处理（fail closed）。
+/// 调用方必须按非 leader 处理（fail closed）。一次快照同时给出 term 与 leader，
+/// 避免 `is_leader` 与取 epoch 之间的 TOCTOU。
 pub trait LeadershipSource: Send + Sync {
-    fn leadership(&self) -> Option<bool>;
+    fn epoch(&self) -> Option<FencingEpoch>;
 }
 
 impl LeadershipSource for RaftHandle {
-    fn leadership(&self) -> Option<bool> {
-        let m = self.raft.metrics();
-        let m = m.borrow();
-        if m.running_state.is_err() {
-            return None;
-        }
-        m.current_leader.map(|leader| leader == m.id)
+    fn epoch(&self) -> Option<FencingEpoch> {
+        self.fencing_epoch()
     }
 }
 
@@ -139,9 +162,13 @@ impl LeadershipSource for RaftHandle {
 ///
 /// 无 `[raft]`（M7/standalone）→ [`LeaderGate::always`]，行为与门控前一致。Raft 模式下
 /// 每轮取一次当前 leader：只有 `current_leader == 本节点` 才放行；无法确定 → 拒绝
-/// （fail closed）。不引入新的共识或租约，也不复制运行态——`job_tasks`/`inventory_*`/
-/// `tier_restores` 等仍是各节点本地表（跨节点持久化见 backlog §4.3 M8-2 / OSSCTL2）；
-/// 本门控只防多节点重复执行，接管依赖各节点已有的 stale/expired 领取回收。
+/// （fail closed）。放行 token（[`FencingEpoch`] = term + leader）必须随状态转换落库，
+/// 旧 token 的写入按 term 单调被拒（no-op），交接中在途动作的收尾不能覆盖新 leader 的状态。
+///
+/// 不引入新的共识或租约，也不复制运行态——`job_tasks`/`inventory_*`/`tier_restores` 等
+/// 仍是各节点本地表（跨节点持久化见 backlog §4.3 M8-2 / OSSCTL2；本切片**不做**跨节点
+/// 复制，因此 leader 本地库丢失仍会丢在途状态）；本门控只防多节点重复执行，接管依赖
+/// 各节点已有的 stale/expired 领取回收（at-least-once）。
 #[derive(Clone)]
 pub struct LeaderGate {
     source: Arc<dyn LeadershipSource>,
@@ -163,27 +190,52 @@ impl LeaderGate {
         }
     }
 
-    /// 固定值来源（测试/嵌入）：`Some(true)` = leader，`Some(false)`/`None` = 不执行。
+    /// 固定值来源（测试/嵌入）：`Some(true)` = leader（有效 epoch 为 `UNFENCED`），
+    /// `Some(false)`/`None` = 不执行。
     pub fn fixed(leader: Option<bool>) -> Self {
-        struct Fixed(Option<bool>);
+        Self::fixed_epoch(leader.filter(|v| *v).map(|_| FencingEpoch::UNFENCED))
+    }
+
+    /// 固定 epoch 来源（测试/嵌入）：`None` = 不执行；`Some` = 该 token 恒为当前。
+    pub fn fixed_epoch(epoch: Option<FencingEpoch>) -> Self {
+        struct Fixed(Option<FencingEpoch>);
         impl LeadershipSource for Fixed {
-            fn leadership(&self) -> Option<bool> {
+            fn epoch(&self) -> Option<FencingEpoch> {
                 self.0
             }
         }
         Self {
-            source: Arc::new(Fixed(leader)),
+            source: Arc::new(Fixed(epoch)),
         }
+    }
+
+    /// 自定义来源（测试：可切换 epoch 的模拟 Raft）。
+    pub fn from_source(source: Arc<dyn LeadershipSource>) -> Self {
+        Self { source }
+    }
+
+    /// 当前 fencing token；`None` = 无法确定/非 leader（调用方 fail closed）。
+    pub fn epoch(&self) -> Option<FencingEpoch> {
+        self.source.epoch()
     }
 
     /// 当前是否应执行单例工作。unknown → false（fail closed）。
     pub fn is_leader(&self) -> bool {
-        self.source.leadership() == Some(true)
+        self.epoch().is_some()
     }
 
-    /// 一次性启动工作（对账）：等到本节点成为 leader 再执行；unknown 不会误放行。
-    pub async fn wait_until_leader(&self) {
-        while !self.is_leader() {
+    /// 本 worker 拿到的 token 是否仍是当前 token（交接后为 false）。
+    pub fn still_current(&self, epoch: FencingEpoch) -> bool {
+        self.epoch() == Some(epoch)
+    }
+
+    /// 一次性启动工作（对账）：等到本节点成为 leader 再执行，返回当时的 token；
+    /// unknown 不会误放行。调用方写状态时必须带上该 token。
+    pub async fn wait_until_leader(&self) -> FencingEpoch {
+        loop {
+            if let Some(epoch) = self.epoch() {
+                return epoch;
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -192,8 +244,8 @@ impl LeaderGate {
 struct AlwaysLeader;
 
 impl LeadershipSource for AlwaysLeader {
-    fn leadership(&self) -> Option<bool> {
-        Some(true)
+    fn epoch(&self) -> Option<FencingEpoch> {
+        Some(FencingEpoch::UNFENCED)
     }
 }
 
@@ -301,10 +353,23 @@ impl RaftHandle {
             .is_some()
     }
 
-    /// M8-1：本节点当前是否 leader（选举中/无法确定 = false）。只用于单例后台任务
-    /// 去重，**不是**线性一致读写依据。
+    /// M8-1：当前 fencing token（term + 本节点 id）；非 leader/节点停止 = None。
+    /// 只用于单例后台任务去重，**不是**线性一致读写依据。
+    pub fn fencing_epoch(&self) -> Option<FencingEpoch> {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        if m.running_state.is_err() || m.current_leader != Some(m.id) {
+            return None;
+        }
+        Some(FencingEpoch {
+            term: m.current_term,
+            leader: m.id,
+        })
+    }
+
+    /// M8-1：本节点当前是否 leader（选举中/无法确定 = false）。
     pub fn is_leader(&self) -> bool {
-        <Self as LeadershipSource>::leadership(self) == Some(true)
+        self.fencing_epoch().is_some()
     }
 
     /// 当前 leader 的 advertise 地址（成员表查不到 = None；S7.1 follower 单跳转发用）。
@@ -937,43 +1002,60 @@ mod tests {
 
     // ---- M8-1：leader 门控（确定性 mock 来源） ----
 
-    /// 0 = unknown，1 = leader，2 = follower。
-    struct MockLeadership(std::sync::Arc<std::sync::atomic::AtomicU8>);
+    /// 0 = unknown，1 = leader，2 = follower；leader 时 term 取原子值（模拟换届）。
+    struct MockLeadership(
+        std::sync::Arc<std::sync::atomic::AtomicU8>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    );
 
     impl LeadershipSource for MockLeadership {
-        fn leadership(&self) -> Option<bool> {
+        fn epoch(&self) -> Option<FencingEpoch> {
             match self.0.load(std::sync::atomic::Ordering::SeqCst) {
-                0 => None,
-                1 => Some(true),
-                _ => Some(false),
+                1 => Some(FencingEpoch {
+                    term: self.1.load(std::sync::atomic::Ordering::SeqCst),
+                    leader: 1,
+                }),
+                _ => None,
             }
         }
     }
 
-    fn mock_gate(v: u8) -> (LeaderGate, std::sync::Arc<std::sync::atomic::AtomicU8>) {
+    fn mock_gate(
+        v: u8,
+    ) -> (
+        LeaderGate,
+        std::sync::Arc<std::sync::atomic::AtomicU8>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(v));
-        (
-            LeaderGate {
-                source: std::sync::Arc::new(MockLeadership(std::sync::Arc::clone(&flag))),
-            },
-            flag,
-        )
+        let term = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let source = std::sync::Arc::new(MockLeadership(
+            std::sync::Arc::clone(&flag),
+            std::sync::Arc::clone(&term),
+        ));
+        (LeaderGate::from_source(source), flag, term)
     }
 
     #[test]
     fn leader_gate_single_node_and_unknown() {
-        // 单节点/M7 回归：无 Raft 恒为 leader-equivalent。
+        // 单节点/M7 回归：无 Raft 恒为 leader-equivalent，token 恒为 UNFENCED。
         assert!(LeaderGate::always().is_leader());
+        assert_eq!(LeaderGate::always().epoch(), Some(FencingEpoch::UNFENCED));
         assert!(LeaderGate::from_raft(None).is_leader());
         assert!(LeaderGate::fixed(Some(true)).is_leader());
+        assert_eq!(
+            LeaderGate::fixed(Some(true)).epoch(),
+            Some(FencingEpoch::UNFENCED)
+        );
         assert!(!LeaderGate::fixed(Some(false)).is_leader());
+        assert_eq!(LeaderGate::fixed(Some(false)).epoch(), None);
         // 无法确定 → fail closed。
         assert!(!LeaderGate::fixed(None).is_leader());
     }
 
     #[test]
     fn leader_gate_follower_skips_and_handoff_flips() {
-        let (gate, flag) = mock_gate(2);
+        let (gate, flag, _term) = mock_gate(2);
         assert!(!gate.is_leader(), "follower 不领取");
         flag.store(1, std::sync::atomic::Ordering::SeqCst);
         assert!(gate.is_leader(), "交接后新 leader 开始工作");
@@ -981,6 +1063,21 @@ mod tests {
         assert!(!gate.is_leader(), "旧 leader 停止领取");
         flag.store(0, std::sync::atomic::Ordering::SeqCst);
         assert!(!gate.is_leader(), "unknown fail closed");
+    }
+
+    /// M8-1：term 变化 → token 变化，旧 token 不再 current（在途收尾必须被拒）。
+    #[test]
+    fn fencing_epoch_changes_with_term() {
+        let (gate, flag, term) = mock_gate(1);
+        let old = gate.epoch().unwrap();
+        assert!(gate.still_current(old));
+        term.store(2, std::sync::atomic::Ordering::SeqCst);
+        let new = gate.epoch().unwrap();
+        assert_ne!(old, new);
+        assert!(!gate.still_current(old), "旧 term 的 token 已失效");
+        assert!(gate.still_current(new));
+        flag.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(!gate.still_current(new), "失去 leadership 后 token 失效");
     }
 
     /// 真实 Raft 单节点：选出 leader 后 `is_leader`/`LeaderGate` 为真（M7 语义之外的
@@ -991,29 +1088,32 @@ mod tests {
         let handle = Arc::new(spawn(test_settings(dir.path())).await.unwrap());
         assert_eq!(wait_leader(&handle).await, 1);
         assert!(handle.is_leader());
-        assert!(LeaderGate::from_raft(Some(Arc::clone(&handle))).is_leader());
+        let epoch = handle.fencing_epoch().expect("leader 必须有 token");
+        assert_eq!(epoch.leader, 1);
+        assert!(epoch.term >= 1, "单节点 Raft 首个 term 也是 1");
+        let gate = LeaderGate::from_raft(Some(Arc::clone(&handle)));
+        assert!(gate.is_leader());
+        assert_eq!(gate.epoch(), Some(epoch));
         handle.shutdown().await;
         assert!(!handle.is_leader(), "停止后不得继续放行单例任务");
+        assert_eq!(handle.fencing_epoch(), None);
+        assert!(!gate.still_current(epoch), "停止后旧 token 失效");
     }
 
     #[tokio::test]
     async fn wait_until_leader_resumes_on_handoff() {
-        let (gate, flag) = mock_gate(2);
+        let (gate, flag, _term) = mock_gate(2);
         let waiter = {
             let gate = gate.clone();
-            tokio::spawn(async move {
-                gate.wait_until_leader().await;
-                true
-            })
+            tokio::spawn(async move { gate.wait_until_leader().await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiter.is_finished(), "follower 上不得提前放行");
         flag.store(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), waiter)
-                .await
-                .unwrap()
-                .unwrap()
-        );
+        let epoch = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(epoch, FencingEpoch { term: 1, leader: 1 });
     }
 }

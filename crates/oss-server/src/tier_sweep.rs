@@ -11,6 +11,7 @@ use xl_store::meta::{ObjectTag, TierPhase, is_archive_class};
 use xl_store::store::{Store, VersionEntry};
 
 use crate::db::{Db, JobSpec, NewJobTask};
+use crate::raft::FencingEpoch;
 use crate::tier_jobs::TransitionPayload;
 
 fn age_reached(mod_time_nanos: i64, days: u32, now: i64) -> bool {
@@ -260,8 +261,17 @@ pub async fn sweep_transitions_at(
     Ok(queued)
 }
 
-/// 过期回收：以 Version 的 phase/expiry 为准修正/清理 `tier_restores` 行。
+/// 单节点/M7 入口：不带 fencing token（见 [`reap_once_fenced`]）。
 pub async fn reap_once(db: &Db, store: &Store) -> Result<usize, String> {
+    reap_once_fenced(db, store, FencingEpoch::UNFENCED).await
+}
+
+/// 过期回收：以 Version 的 phase/expiry 为准修正/清理 `tier_restores` 行。
+pub async fn reap_once_fenced(
+    db: &Db,
+    store: &Store,
+    fence: FencingEpoch,
+) -> Result<usize, String> {
     let now = crate::db::now();
     let rows = db
         .restore_rows("restored")
@@ -292,18 +302,21 @@ pub async fn reap_once(db: &Db, store: &Store) -> Result<usize, String> {
                         .await
                     {
                         Ok(true) => {
-                            let _ = db.delete_restore(&r.bucket, &r.key, &r.version_id).await;
+                            let _ = db
+                                .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
+                                .await;
                             n += 1;
                         }
                         Ok(false) => {
                             if let Some(e) = version_expiry {
                                 let _ = db
-                                    .set_restore_state(
+                                    .set_restore_state_fenced(
                                         &r.bucket,
                                         &r.key,
                                         &r.version_id,
                                         "restored",
                                         e,
+                                        fence,
                                     )
                                     .await;
                             }
@@ -315,19 +328,28 @@ pub async fn reap_once(db: &Db, store: &Store) -> Result<usize, String> {
                 {
                     // 行过期时刻早于版本：以版本为准修正（不误删）。
                     let _ = db
-                        .set_restore_state(&r.bucket, &r.key, &r.version_id, "restored", e)
+                        .set_restore_state_fenced(
+                            &r.bucket,
+                            &r.key,
+                            &r.version_id,
+                            "restored",
+                            e,
+                            fence,
+                        )
                         .await;
                 }
             }
             Some(TierPhase::Restoring) => {
                 // 恢复进行中：行回到 pending，交给作业/对账。
                 let _ = db
-                    .set_restore_state(&r.bucket, &r.key, &r.version_id, "pending", 0)
+                    .set_restore_state_fenced(&r.bucket, &r.key, &r.version_id, "pending", 0, fence)
                     .await;
             }
             Some(TierPhase::Archived) | None => {
                 // 孤儿行：版本已归档/无 tier/已删除。
-                let _ = db.delete_restore(&r.bucket, &r.key, &r.version_id).await;
+                let _ = db
+                    .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
+                    .await;
                 n += 1;
             }
         }
@@ -335,11 +357,21 @@ pub async fn reap_once(db: &Db, store: &Store) -> Result<usize, String> {
     Ok(n)
 }
 
-/// 启动对账 + 重排恢复。返回处理条数。
+/// 单节点/M7 入口：不带 fencing token（见 [`reconcile_restores_fenced`]）。
 pub async fn reconcile_restores(
     db: &Db,
     store: &Store,
     sink: &dyn RestoreSink,
+) -> Result<usize, String> {
+    reconcile_restores_fenced(db, store, sink, FencingEpoch::UNFENCED).await
+}
+
+/// 启动对账 + 重排恢复。返回处理条数。
+pub async fn reconcile_restores_fenced(
+    db: &Db,
+    store: &Store,
+    sink: &dyn RestoreSink,
+    fence: FencingEpoch,
 ) -> Result<usize, String> {
     let mut n = 0usize;
     // 1) Restoring 版本：按行状态提交/重排/回滚。
@@ -391,7 +423,9 @@ pub async fn reconcile_restores(
             };
             let phase = v.as_ref().and_then(|v| v.tier.as_ref()).map(|t| t.phase);
             if phase.is_none() {
-                let _ = db.delete_restore(&r.bucket, &r.key, &r.version_id).await;
+                let _ = db
+                    .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
+                    .await;
             } else if state == "pending" && phase == Some(TierPhase::Archived) {
                 let active = match r.job_id {
                     Some(j) => db.job_task_active(j).await.unwrap_or(false),
@@ -428,9 +462,14 @@ pub fn spawn(
     let reconcile_store = Arc::clone(&store);
     let reconcile_gate = gate.clone();
     tokio::spawn(async move {
-        // 对账也是单例写：等到本节点成为 leader 再做（unknown 一直等）。
-        reconcile_gate.wait_until_leader().await;
-        match reconcile_restores(&reconcile_db, &reconcile_store, sink.as_ref()).await {
+        // 对账也是单例写：等到本节点成为 leader 再做（unknown 一直等）；写状态带当时的
+        // token，等待期间又换届则放弃（交给新 leader 重新对账）。
+        let fence = reconcile_gate.wait_until_leader().await;
+        if !reconcile_gate.still_current(fence) {
+            return;
+        }
+        match reconcile_restores_fenced(&reconcile_db, &reconcile_store, sink.as_ref(), fence).await
+        {
             Ok(n) if n > 0 => tracing::info!(n, "restore 启动对账完成"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "restore 启动对账失败"),
@@ -466,10 +505,10 @@ pub fn spawn(
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
-                if !gate.is_leader() {
+                let Some(fence) = gate.epoch() else {
                     continue;
-                }
-                match reap_once(&db, &store).await {
+                };
+                match reap_once_fenced(&db, &store, fence).await {
                     Ok(n) if n > 0 => tracing::info!(n, "tier reaper：回收过期恢复"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "tier reaper 失败"),

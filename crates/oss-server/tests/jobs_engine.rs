@@ -1,10 +1,11 @@
 //! M8 S0：作业引擎——领取/执行/收敛/报告/失败上限/超时。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oss_server::db::{Db, JobSpec, NewJobTask};
 use oss_server::jobs::{JobEnv, TaskExecutor, worker_once, worker_tick};
-use oss_server::raft::LeaderGate;
+use oss_server::raft::{FencingEpoch, LeaderGate, LeadershipSource};
 use xl_store::store::{Store, StoreConfig};
 
 struct OkExec;
@@ -171,7 +172,9 @@ async fn set_task_deadline_updates_running_row_only() {
         .unwrap();
     let task = db.claim_task(1000, 3600).await.unwrap().unwrap();
     assert_eq!((task.job_id, task.task_no), (id, 1));
-    db.set_task_deadline(id, 1, 1900).await.unwrap();
+    db.set_task_deadline(id, 1, 1900, FencingEpoch::UNFENCED)
+        .await
+        .unwrap();
     let deadline: i64 =
         sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
             .bind(id)
@@ -183,7 +186,9 @@ async fn set_task_deadline_updates_running_row_only() {
     db.finish_task(id, 1, true, "OK", None, 1001, 3)
         .await
         .unwrap();
-    db.set_task_deadline(id, 1, 9999).await.unwrap();
+    db.set_task_deadline(id, 1, 9999, FencingEpoch::UNFENCED)
+        .await
+        .unwrap();
     let deadline: i64 =
         sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
             .bind(id)
@@ -629,13 +634,19 @@ async fn preempted_claim_requeues_without_consuming_attempt() {
         .await
         .unwrap();
     assert_eq!(db.preempt_lower_priority(1, 1001).await.unwrap(), 1);
-    assert!(db.requeue_task(low, 1, 1001).await.unwrap());
+    assert!(
+        db.requeue_task(low, 1, 1001, FencingEpoch::UNFENCED)
+            .await
+            .unwrap()
+    );
     let tasks = db.job_tasks(low, 0, 10).await.unwrap();
     assert_eq!(tasks[0]["state"], "queued");
     assert_eq!(tasks[0]["attempt"], 0, "未执行不得消耗重试");
     assert!(tasks[0]["started_at"].is_null());
     assert!(
-        !db.requeue_task(low, 1, 1002).await.unwrap(),
+        !db.requeue_task(low, 1, 1002, FencingEpoch::UNFENCED)
+            .await
+            .unwrap(),
         "重复回退幂等"
     );
 }
@@ -755,4 +766,135 @@ async fn leader_gate_blocks_follower_claims_and_resumes_on_handoff() {
             .unwrap()
     );
     assert_eq!(db.job_get(id3).await.unwrap().unwrap()["state"], "done");
+}
+
+/// M8-1：被新 term 接管后，旧 term 的领取/回退/延期/收尾全部无效；新 term 正常收尾。
+#[tokio::test]
+async fn stale_epoch_writes_are_rejected_after_takeover() {
+    let (db, _store, _d1, _d2) = setup().await;
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let id = db.create_job(&spec(vec!["Copy"], false), t0).await.unwrap();
+    let old = FencingEpoch { term: 5, leader: 1 };
+    let new = FencingEpoch { term: 6, leader: 2 };
+    let t = db.claim_task_fenced(t0, 900, old).await.unwrap().unwrap();
+    assert_eq!((t.job_id, t.task_no), (id, 1));
+
+    // 新 leader 在同一运行态库接管过期任务：重新盖 term 并回队（attempt+1）。
+    assert_eq!(db.recover_stale_tasks(t0 + 1, 3, new).await.unwrap(), 1);
+    let tasks = db.job_tasks(id, 0, 10).await.unwrap();
+    assert_eq!(tasks[0]["state"], "queued");
+    assert_eq!(tasks[0]["attempt"], 1);
+
+    // 旧 term：不能回退（term 精确匹配）、不能延期（no-op）、不能再领取（term 单调）。
+    let later = t0 + 10_000;
+    assert!(!db.requeue_task(id, 1, later, old).await.unwrap());
+    db.set_task_deadline(id, 1, later + 900, old).await.unwrap();
+    assert!(
+        db.claim_task_fenced(later, 900, old)
+            .await
+            .unwrap()
+            .is_none(),
+        "旧 term 不得领取已被接管的任务"
+    );
+
+    // 新 term 领取并收尾；旧 term 的完成结果被 fencing 拒绝。
+    let t = db
+        .claim_task_fenced(later, 900, new)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((t.job_id, t.task_no), (id, 1));
+    assert_eq!(
+        db.finish_task_fenced(id, 1, true, "ok", None, later + 1, 3, old)
+            .await
+            .unwrap(),
+        "fenced"
+    );
+    let tasks = db.job_tasks(id, 0, 10).await.unwrap();
+    assert_eq!(tasks[0]["state"], "running", "旧 term 收尾不得改状态");
+    assert_eq!(
+        db.finish_task_fenced(id, 1, true, "ok", None, later + 2, 3, new)
+            .await
+            .unwrap(),
+        "done"
+    );
+    assert_eq!(db.job_get(id).await.unwrap().unwrap()["state"], "done");
+}
+
+struct EpochSource {
+    term: AtomicU64,
+}
+
+impl EpochSource {
+    fn new(term: u64) -> Self {
+        Self {
+            term: AtomicU64::new(term),
+        }
+    }
+}
+
+impl LeadershipSource for EpochSource {
+    fn epoch(&self) -> Option<FencingEpoch> {
+        let term = self.term.load(Ordering::SeqCst);
+        (term > 0).then_some(FencingEpoch { term, leader: 1 })
+    }
+}
+
+/// 动作执行期间换届：旧 leader 的完成结果丢弃（任务留 running），新 leader 接管后重跑。
+struct FlipExec {
+    source: Arc<EpochSource>,
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for FlipExec {
+    async fn execute(&self, action: &str, _payload: &str) -> Result<String, String> {
+        // 模拟交接发生在动作执行中。
+        if self.source.term.load(Ordering::SeqCst) == 1 {
+            self.source.term.store(2, Ordering::SeqCst);
+        }
+        Ok(format!("{action}-ok"))
+    }
+}
+
+/// M8-1：在途动作完成后若 leadership 已变，不写终态、不写报告；新 term 接管并重跑。
+#[tokio::test]
+async fn in_flight_completion_is_dropped_after_handoff() {
+    let (db, store, _d1, _d2) = setup().await;
+    let e = env(3, 30);
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let id = db.create_job(&spec(vec!["Copy"], true), t0).await.unwrap();
+    let source = Arc::new(EpochSource::new(1));
+    let gate = LeaderGate::from_source(source.clone());
+    let exec = FlipExec {
+        source: Arc::clone(&source),
+    };
+
+    assert!(worker_tick(&db, &store, &exec, e, t0, &gate).await.unwrap());
+    let task = &db.job_tasks(id, 0, 10).await.unwrap()[0];
+    assert_eq!(task["state"], "running", "旧 leader 的完成结果必须丢弃");
+    assert_eq!(db.job_get(id).await.unwrap().unwrap()["state"], "running");
+    assert!(
+        !store
+            .get_object("reports", "out/1/results.csv")
+            .await
+            .is_ok(),
+        "交接后的收尾不得写报告"
+    );
+
+    // 新 leader（term 2）接管：startup 回收把旧 term 的 running 行重新盖 term 并回队。
+    let new = FencingEpoch { term: 2, leader: 1 };
+    assert_eq!(db.recover_stale_tasks(t0 + 1, 3, new).await.unwrap(), 1);
+    // 回收用真实时钟写退避 next_at；取足够远的未来时刻再让新 leader 领取。
+    assert!(
+        worker_tick(&db, &store, &exec, e, t0 + 10_000, &gate)
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.job_get(id).await.unwrap().unwrap()["state"], "done");
 }
