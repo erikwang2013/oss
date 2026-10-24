@@ -351,7 +351,7 @@ pub async fn reconcile_restores(
         match row {
             Some(r) if r.state == "restored" => {
                 if let Err(e) = store
-                    .restore_commit(&bucket, &key, &vid, r.expires_at)
+                    .restore_commit(&bucket, &key, &vid, r.expires_at, None)
                     .await
                 {
                     tracing::warn!(error = %e, key, "对账：提交恢复失败，重排");

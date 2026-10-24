@@ -135,6 +135,56 @@ pub struct TierState {
     pub archived_at: i64,
     #[serde(default)]
     pub restore_expires_at: Option<i64>,
+    /// 直读分块哈希（additive、Option：旧对象/旧解码器无此字段 → None = 直读 fail-closed）。
+    /// Transition 与 Restore 落盘时写入；旧二进制重写 meta 会丢该字段，仅降级直读、不丢数据。
+    #[serde(default)]
+    pub chunks: Option<TierChunks>,
+}
+
+/// 归档对象的分块 SHA-256 表（直读 Range 的完整性锚点）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierChunks {
+    /// 分块字节数（`1..=TIER_CHUNK_MAX`；最后一块可短）。
+    pub chunk_size: u64,
+    /// 每块 SHA-256（小写 hex，长度 = ceil(size/chunk_size)）。
+    pub sha256: Vec<String>,
+}
+
+/// 分块上限：直读最多多取 2 个分块的余量，避免损坏 meta 放大单次请求内存。
+pub const TIER_CHUNK_MAX: u64 = 8 << 20;
+/// 分块数量上限（8 MiB 块 ≈ 8 TiB 对象；防损坏 meta 触发超大校验循环）。
+pub const TIER_CHUNK_COUNT_MAX: u64 = 1_000_000;
+
+impl TierChunks {
+    /// 校验分块表与对象长度自洽（解码信任边界 + 直读前置）。
+    pub fn validate(&self, size: u64) -> std::result::Result<(), String> {
+        if self.chunk_size == 0 || self.chunk_size > TIER_CHUNK_MAX {
+            return Err(format!(
+                "分块大小非法：{}（上限 {TIER_CHUNK_MAX}）",
+                self.chunk_size
+            ));
+        }
+        let want = size.div_ceil(self.chunk_size);
+        if want > TIER_CHUNK_COUNT_MAX {
+            return Err(format!("分块数量 {want} 超过上限 {TIER_CHUNK_COUNT_MAX}"));
+        }
+        if self.sha256.len() as u64 != want {
+            return Err(format!(
+                "分块哈希数 {} ≠ ceil({size}/{})= {want}",
+                self.sha256.len(),
+                self.chunk_size
+            ));
+        }
+        if self.sha256.iter().any(|h| {
+            h.len() != 64
+                || !h
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err("分块哈希必须是小写 64 位 hex".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +485,12 @@ impl XlMeta {
                 if t.archived_at < 0 || t.restore_expires_at.is_some_and(|x| x < 0) {
                     return Err(Error::CorruptMeta("分层记录时间戳为负".into()));
                 }
+                // 直读分块表会驱动远端 Range 请求与逐块校验：形态/长度必须自洽（信任边界）。
+                if let Some(c) = &t.chunks
+                    && let Err(e) = c.validate(t.size)
+                {
+                    return Err(Error::CorruptMeta(format!("分块哈希表非法：{e}")));
+                }
             }
             // 内联字节是解码信任边界：超上限一律拒（防手工构造/损坏文件触发超大分配）。
             // M5 切片 2：加密 inline 的落盘态是密文（C = c_len(P)），上限随方案放宽。
@@ -703,6 +759,109 @@ mod tests {
     fn latest_returns_single_version() {
         let m = sample();
         assert_eq!(m.latest().unwrap().size, 11);
+    }
+
+    fn with_tier_chunks(size: u64, chunk_size: u64, n: usize) -> XlMeta {
+        let mut m = sample();
+        m.versions[0].size = size;
+        m.versions[0].tier = Some(TierState {
+            backend: "cold".into(),
+            key: "k".into(),
+            size,
+            etag: "e".into(),
+            sha256: "s".into(),
+            phase: TierPhase::Archived,
+            archived_at: 1,
+            restore_expires_at: None,
+            chunks: Some(TierChunks {
+                chunk_size,
+                sha256: vec!["a".repeat(64); n],
+            }),
+        });
+        m
+    }
+
+    /// 分块表解码信任边界：长度必须 = ceil(size/chunk_size)，哈希必须是 64 位小写 hex；
+    /// 合法表 roundtrip，chunks 为 nil → None（字段整体缺席见下一个测试）。
+    #[test]
+    fn tier_chunks_decode_validation_and_backward_compat() {
+        let ok = with_tier_chunks(10, 4, 3);
+        let back = XlMeta::decode(&ok.encode().unwrap()).unwrap();
+        assert_eq!(back.versions[0].tier.as_ref().unwrap().chunks, {
+            ok.versions[0].tier.as_ref().unwrap().chunks.clone()
+        });
+        // 空对象：0 块合法
+        assert!(XlMeta::decode(&with_tier_chunks(0, 4, 0).encode().unwrap()).is_ok());
+        // 长度/形态不自洽
+        for bad in [
+            with_tier_chunks(10, 4, 2),
+            with_tier_chunks(10, 4, 4),
+            with_tier_chunks(10, 0, 3),
+            with_tier_chunks(10, TIER_CHUNK_MAX + 1, 1),
+        ] {
+            assert!(
+                matches!(
+                    XlMeta::decode(&bad.encode().unwrap()),
+                    Err(Error::CorruptMeta(_))
+                ),
+                "应拒：size={} chunks={:?}",
+                bad.versions[0].size,
+                bad.versions[0].tier.as_ref().unwrap().chunks
+            );
+        }
+        let mut upper = with_tier_chunks(4, 4, 1);
+        upper.versions[0].tier.as_mut().unwrap().chunks = Some(TierChunks {
+            chunk_size: 4,
+            sha256: vec!["A".repeat(64)],
+        });
+        assert!(matches!(
+            XlMeta::decode(&upper.encode().unwrap()),
+            Err(Error::CorruptMeta(_))
+        ));
+        // chunks 显式为 nil → None（直读 fail-closed，其它读路径不变）
+        let mut old = sample();
+        old.versions[0].tier = Some(TierState {
+            backend: "cold".into(),
+            key: "k".into(),
+            size: 11,
+            etag: "e".into(),
+            sha256: "s".into(),
+            phase: TierPhase::Archived,
+            archived_at: 1,
+            restore_expires_at: None,
+            chunks: None,
+        });
+        let back = XlMeta::decode(&old.encode().unwrap()).unwrap();
+        assert!(back.versions[0].tier.as_ref().unwrap().chunks.is_none());
+    }
+
+    /// 真·旧 meta（字段整体缺席，而非显式 nil）也必须解码为 None。
+    #[test]
+    fn tier_state_without_chunks_key_decodes_to_none() {
+        #[derive(serde::Serialize)]
+        struct OldTier {
+            backend: String,
+            key: String,
+            size: u64,
+            etag: String,
+            sha256: String,
+            phase: TierPhase,
+            archived_at: i64,
+            restore_expires_at: Option<i64>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldTier {
+            backend: "cold".into(),
+            key: "k".into(),
+            size: 11,
+            etag: "e".into(),
+            sha256: "s".into(),
+            phase: TierPhase::Archived,
+            archived_at: 1,
+            restore_expires_at: None,
+        })
+        .unwrap();
+        let t: TierState = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(t.chunks.is_none(), "缺席的 chunks 必须默认 None");
     }
 
     #[test]

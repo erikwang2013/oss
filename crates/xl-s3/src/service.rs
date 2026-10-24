@@ -48,6 +48,8 @@ pub struct OssS3 {
     bucket_cleanup: Option<Arc<dyn crate::bucket_cleanup::BucketCleanupSink>>,
     /// M8 S4a：删除归档版本的远端 tier 清理（S4b 注入真实实现；None = 不清理）
     tier_gc: Option<Arc<dyn crate::tier_gc::TierGcSink>>,
+    /// 归档对象 Range 直读（默认关：None = 既有 403 行为）。
+    tier_direct: Option<Arc<dyn crate::tier_direct::TierDirectRead>>,
     /// M8 S4b：生命周期规则读写（None = 501）。
     lifecycle: Option<Arc<dyn crate::lifecycle::LifecycleStore>>,
     /// M8 S4b：Restore 入队（None = 501）。
@@ -157,6 +159,7 @@ impl OssS3 {
             repl_store: None,
             bucket_cleanup: None,
             tier_gc: None,
+            tier_direct: None,
             lifecycle: None,
             restore: None,
             inventory: None,
@@ -223,6 +226,46 @@ impl OssS3 {
     pub fn with_tier_gc(mut self, sink: Option<Arc<dyn crate::tier_gc::TierGcSink>>) -> Self {
         self.tier_gc = sink;
         self
+    }
+
+    /// 归档对象 Range 直读（None = 关闭，保持 403 InvalidObjectState）。
+    pub fn with_tier_direct(
+        mut self,
+        direct: Option<Arc<dyn crate::tier_direct::TierDirectRead>>,
+    ) -> Self {
+        self.tier_direct = direct;
+        self
+    }
+
+    /// 直读归档 Range；不可用 → None（回退既有 403），完整性失败 → 500。
+    async fn tier_direct_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        info: &ObjectInfo,
+        range: std::ops::Range<u64>,
+    ) -> S3Result<Option<Bytes>> {
+        let Some(direct) = &self.tier_direct else {
+            return Ok(None);
+        };
+        match direct
+            .read_range(bucket, key, version_id, info, range)
+            .await
+        {
+            Ok(b) => Ok(Some(b)),
+            Err(crate::tier_direct::TierDirectError::Unavailable(why)) => {
+                tracing::debug!(bucket, key, why, "tier 直读不可用，回退 InvalidObjectState");
+                Ok(None)
+            }
+            Err(crate::tier_direct::TierDirectError::Integrity(why)) => {
+                tracing::error!(bucket, key, error = %why, "tier 直读完整性校验失败");
+                Err(s3s::s3_error!(
+                    InternalError,
+                    "tier object integrity check failed"
+                ))
+            }
+        }
     }
 
     /// M8 S4b：注入生命周期规则存储（console 与 S3 共用同一实例）。
@@ -1865,7 +1908,23 @@ impl S3 for OssS3 {
                     // 越界 → RangeNotSatisfiable → InvalidRange(416)
                     let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
                     let (start, end) = (rr.start, rr.end);
-                    let bytes = if start == 0 && end == info.size {
+                    // 归档对象：先试 Range 直读（仅 Archived；不可用回退既有 403）。
+                    // 用 HEAD 得到的有效版本号（无 versionId 的 GET 也指向当前版本）。
+                    let direct = if info.tier_phase == Some(xl_store::meta::TierPhase::Archived) {
+                        self.tier_direct_range(
+                            &bucket,
+                            &key,
+                            info.version_id.as_deref(),
+                            &info,
+                            start..end,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let bytes = if let Some(b) = direct {
+                        b
+                    } else if start == 0 && end == info.size {
                         // 显式全段 Range：仍回 206（S3 语义），数据走整读
                         match &version_id {
                             Some(v) => {

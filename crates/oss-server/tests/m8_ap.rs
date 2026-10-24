@@ -1439,6 +1439,7 @@ async fn restore_object_through_ap() {
                 etag: "remote".into(),
                 sha256: "00".into(),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             1,
         )

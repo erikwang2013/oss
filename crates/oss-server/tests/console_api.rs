@@ -2503,6 +2503,7 @@ async fn object_list_includes_storage_and_tier_fields() {
                 etag: "remote".into(),
                 sha256: "00".into(),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             1,
         )

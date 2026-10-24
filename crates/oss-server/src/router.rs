@@ -61,6 +61,16 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     ))
     // M9 S6c：仅 Raft 模式注入桶控制面 sink（None = M7 直写路径逐字节不变）。
     .with_bucket_control(state.control.bucket_sink());
+    // 归档对象 Range 直读：默认关（保持 403 InvalidObjectState）；显式开时只走
+    // 有分块哈希且后端支持 Range 的对象，不可用自动回退。
+    let oss_s3 = if std::env::var("OSS_TIER_DIRECT_READ").is_ok_and(|v| v == "1") {
+        oss_s3.with_tier_direct(Some(Arc::new(crate::tier_direct::TierDirectReader::new(
+            Arc::clone(&state.store),
+            Arc::clone(&state.tiers),
+        ))))
+    } else {
+        oss_s3
+    };
     // M8 S1（N1）：内层服务无 auth/access/route，仅供 AP 重写后调用。
     let inner = Arc::new(S3ServiceBuilder::new(oss_s3.clone()).build());
     let mut s3_builder = S3ServiceBuilder::new(oss_s3);

@@ -26,6 +26,7 @@ pub mod site_client;
 pub mod state;
 pub mod sync;
 pub mod tier;
+pub mod tier_direct;
 pub mod tier_gc_sweep;
 pub mod tier_jobs;
 mod tier_sweep;

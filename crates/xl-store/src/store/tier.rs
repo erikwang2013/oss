@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt as _;
 use super::Store;
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::meta::{self, PartRef, TierPhase, TierState};
+use crate::meta::{self, PartRef, TierChunks, TierPhase, TierState};
 
 /// 恢复下载暂存文件名（不以 `part.` 开头：fsck 的 stray 扫描不碰它）。
 const RESTORE_STAGE: &str = "restore-stage";
@@ -27,6 +27,8 @@ pub struct ArchiveSpec {
     pub sha256: String,
     /// 归档存储类（GLACIER / GLACIER_IR / DEEP_ARCHIVE）。
     pub class: String,
+    /// 直读分块哈希（Transition 流上增量计算；None = 不提供直读，保持 403）。
+    pub chunks: Option<TierChunks>,
 }
 
 impl Store {
@@ -162,6 +164,11 @@ impl Store {
                 "{bucket}/{key}@{version_id}: 源对象在归档期间被改写（size/etag 不符）"
             )));
         }
+        // 直读分块表是信任边界：写前自洽（作业流上算出；损坏则拒绝归档，绝不落半套表）。
+        if let Some(c) = &spec.chunks {
+            c.validate(spec.size)
+                .map_err(|e| Error::InvalidArgument(format!("分块哈希表非法：{e}")))?;
+        }
         let uuid = src.part.uuid.clone();
         let mut m = old.clone();
         let v = &mut m.versions[idx];
@@ -175,6 +182,7 @@ impl Store {
             phase: TierPhase::Archived,
             archived_at: now_secs,
             restore_expires_at: None,
+            chunks: spec.chunks,
         });
         // 本地数据不再可读：清数据描述（保留 part 兼容位）。
         v.data_layout = None;
@@ -348,12 +356,15 @@ impl Store {
     }
 
     /// 恢复提交：Restoring → Restored + 到期时刻；本地副本自此可读。
+    /// `chunks`：恢复流上重算的分块哈希（旧对象直读 backfill）；None = 保留已有表
+    /// （启动对账/无数据可算的路径不得清掉原表）。
     pub async fn restore_commit(
         &self,
         bucket: &str,
         key: &str,
         version_id: &str,
         expires_at: i64,
+        chunks: Option<TierChunks>,
     ) -> Result<()> {
         self.mutate_version(bucket, key, version_id, |_old, v| {
             let Some(t) = &mut v.tier else {
@@ -365,6 +376,11 @@ impl Store {
                 return Err(Error::RestoreAlreadyInProgress(format!(
                     "{bucket}/{key}@{version_id}: 不在 Restoring 阶段"
                 )));
+            }
+            if let Some(c) = &chunks {
+                c.validate(t.size)
+                    .map_err(|e| Error::InvalidArgument(format!("分块哈希表非法：{e}")))?;
+                t.chunks = Some(c.clone());
             }
             v.part = PartRef {
                 uuid: v.part.uuid.clone(),

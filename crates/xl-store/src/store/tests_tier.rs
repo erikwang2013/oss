@@ -44,6 +44,7 @@ fn tier(phase: TierPhase) -> TierState {
         phase,
         archived_at: 100,
         restore_expires_at: None,
+        chunks: None,
     }
 }
 
@@ -226,6 +227,7 @@ async fn meta_decode_rejects_bad_tier_and_class() {
         phase: TierPhase::Archived,
         archived_at: 1,
         restore_expires_at: None,
+        chunks: None,
     });
     let bytes = m.encode().unwrap();
     assert!(matches!(xl_meta_decode(&bytes), Err(Error::CorruptMeta(_))));
@@ -251,6 +253,7 @@ async fn archive_restore_state_machine() {
         etag: "remote-etag".into(),
         sha256: sha.clone(),
         class: class.into(),
+        chunks: None,
     };
     s.archive_version("alpha", "k", &vid, spec("GLACIER"), 100)
         .await
@@ -298,7 +301,9 @@ async fn archive_restore_state_machine() {
     ));
 
     let expires = now_secs() + 1000;
-    s.restore_commit("alpha", "k", &vid, expires).await.unwrap();
+    s.restore_commit("alpha", "k", &vid, expires, None)
+        .await
+        .unwrap();
     let (head, got) = s.get_object("alpha", "k").await.unwrap();
     assert_eq!(&got[..], data);
     assert_eq!(head.tier_phase, Some(TierPhase::Restored));
@@ -353,6 +358,7 @@ async fn archive_restore_preserves_part_sizes() {
         etag: "remote-etag".into(),
         sha256: hex::encode(crate::mesh::content_hash(data)),
         class: "GLACIER".into(),
+        chunks: None,
     };
     s.archive_version("alpha", "mp", &vid, spec, 100)
         .await
@@ -362,7 +368,7 @@ async fn archive_restore_preserves_part_sizes() {
 
     s.mark_restore_pending("alpha", "mp", &vid).await.unwrap();
     s.restore_prepare("alpha", "mp", &vid, data).await.unwrap();
-    s.restore_commit("alpha", "mp", &vid, now_secs() + 1000)
+    s.restore_commit("alpha", "mp", &vid, now_secs() + 1000, None)
         .await
         .unwrap();
     let (_, got) = s.get_object("alpha", "mp").await.unwrap();
@@ -403,6 +409,7 @@ fn archive_spec(key: &str, info: &ObjectInfo) -> ArchiveSpec {
         etag: "remote-etag".into(),
         sha256: hex::encode(crate::mesh::content_hash(b"tier-data")),
         class: "GLACIER".into(),
+        chunks: None,
     }
 }
 
@@ -485,6 +492,7 @@ async fn archive_meta_failure_keeps_local() {
                 etag: "remote".into(),
                 sha256: "00".into(),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             100,
         )
