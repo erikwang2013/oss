@@ -32,12 +32,13 @@ Parquet/Hive、tier 本地盘/GC、生命周期全 Filter、Batch WASM）、M9 L
 生命周期游标、Inventory 增量/跨账户目标、AbortMPU；以及 Level B 生命周期命令门控/快照 guard
 热修。最终闸门与证据见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §8–§11。
 
-**v1.16.0 候选（未发布）**：Select BZIP2；STS `AssumeRoleWithWebIdentity`；CMK 安全删除与
-逐版本 rewrap；M3 MPU 跨节点属主路由/流式转发；OSSCTL2 快照与 LC-0 导出/cutover/force-recover
-来源校验；M6 `site_token` 远端的同源版本/版本删除/元数据与 M7 同源定向删除；TLS mesh gRPC
-客户端与 Kafka 客户端热加载；Batch 协作抢占与跨账户清单；M8 单例任务 leader 门控；tier 暂存
-清扫/磁盘预留/0600；AP 可信对端 CIDRS（纯 HTTP 反代需 TLS 监听器）。完整证据与仍然阻塞的
-架构项见验收记录 §12 与 `docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
+**v1.16.0（2026-10-24）backlog 第二轮**：Select BZIP2；STS `AssumeRoleWithWebIdentity`；
+CMK 安全删除与逐版本 rewrap；M3 MPU 跨节点属主路由/流式转发；OSSCTL2 快照与 LC-0
+导出/cutover/force-recover 来源校验；M6 `site_token` 远端的同源版本/版本删除/元数据与 M7
+同源定向删除；TLS mesh gRPC 客户端与 Kafka 客户端热加载；Batch 协作抢占与跨账户清单；M8
+单例任务 leader 门控；tier 暂存清扫/磁盘预留/0600；AP 可信对端 CIDRS（纯 HTTP 反代需 TLS
+监听器）。验收与仍然阻塞的架构项见验收记录 §12 与
+`docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
@@ -140,8 +141,8 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
 | `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
 | `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.15.0 硬化 lane 实跑 sync 78/0/1、stretch 59/0/1 |
-| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP）；v1.15.0 lane 实跑 65/0/4（4 SKIP 为 v1.13.1 侧无法覆盖的 D6 项） |
+| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.16.0 集成树实跑 sync 78/0/1、stretch 59/0/1、recovery 133/0/1 |
+| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP）；v1.16.0 集成树实跑 65/0/4（4 SKIP 为 v1.13.1 侧无法覆盖的 D6 项） |
 | `tests/e2e_m9_recovery.sh` | M9 灾备验收（真进程 + CLI：M7 export/cutover 字段级冲突与 overwrite、force-recover 后 `bootstrap=false` 重启；witness 运行时/export/force-recover；B′ 替换 + `sync-reconcile --repair` 门） |
 | `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
@@ -1371,6 +1372,10 @@ append/vote/snapshot/status/membership/write/join。
   rolling 65/0/4；M8 e2e PASS（4433s，Tier 段按环境 SKIP）；集成树库测试
   xl-store 268+1 ignored / xl-s3 150 / oss-server 152，S3 全量 e2e 38 节 RC=0，Web
   `tsc`/`vite build`/Playwright 9/9。逐项证据见验收记录 §11。
+  **2026-10-24 v1.16.0 集成树**：库测试 xl-store 282+1 ignored / xl-s3 163 / oss-server 168；
+  S3 全量 e2e 38 节 RC=0；E2E_LONG 100×100MB 通过；M8 e2e PASS 4742s（Tier=ran + M6/M7
+  smoke）；M9 sync/stretch/recovery/rolling 78/59/133/65；fmt 与 clippy 0 warning。逐项证据
+  见验收记录 §12。
   **2026-10-23 Level B 热修**：`BucketSetLifecycleV2` 此前漏标 level 2（混合窗口会被
   v1.13.1 副本解码失败，快照会静默丢结构化规则）；现已 `min_feature_level()=2`（写入门控
   503 `feature_unavailable`），且快照编码器在 `lifecycle_rules.config_json` 非空时拒绝
@@ -1619,7 +1624,7 @@ db_path = "/var/lib/oss/raft.db"
      规则）。`feature_level=1` 时这类写入在 append 前被拒绝（503
      `{"error":"feature_unavailable","required":2,"effective":1}`）；旧列可表达的规则
      仍走 V1、行为不变。首条结构化规则写入即激活 `schema_meta.raft_feature_level=2`
-     （不归点同下）。`tests/e2e_m9_rolling.sh` 已在 v1.15.0 硬化 lane 实跑：
+     （不归点同下）。`tests/e2e_m9_rolling.sh` 已在 v1.16.0 集成树实跑：
      65 PASS / 0 FAIL / 4 SKIP；SKIP 为 v1.13.1 侧无法覆盖的 D6 项（跨版本快照、level-2 503、
      激活、激活后回滚），不是产品失败。
    - **OSSCTL2 快照与切档（v1.16 候选）**：快照编码器按数据/激活级别选择格式；含

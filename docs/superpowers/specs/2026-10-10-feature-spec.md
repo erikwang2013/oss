@@ -3,9 +3,9 @@
 - 日期：2026-10-10
 - 定位：**功能层规格**。总体设计见 `2026-10-10-minio-clone-design.md`（架构/盘布局/数据结构）；本文件定义**每个功能的行为、接口、边界与错误**，是实现与验收之间的契约。
 - 阶段标注：`M1`…`M9` 对应总体设计的阶段划分。
-- **2026-10-24 候选补充**：Select BZIP2、STS WebIdentity、CMK 删除/rewrap、MPU 跨节点路由、
-  OSSCTL2/LC-0、M6 token 远端、Batch 抢占/跨账户清单、M8 单例任务 leader 门控、tier 暂存
-  清扫/预留/0600、AP 可信对端 CIDRS。行为与边界以 README 与
+- **v1.16.0（2026-10-24）补充**：Select BZIP2、STS WebIdentity、CMK 删除/rewrap、MPU 跨节点
+  路由、OSSCTL2/LC-0、M6 token 远端、Batch 抢占/跨账户清单、M8 单例任务 leader 门控、tier
+  暂存清扫/预留/0600、AP 可信对端 CIDRS。行为与边界以 README 与
   `2026-10-23-capability-gaps-acceptance.md` §12 为准。
 
 ---

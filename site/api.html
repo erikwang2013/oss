@@ -61,7 +61,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html" aria-current="page">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.15.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.16.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -148,14 +148,16 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
             <li><code>partNumber</code> 与 <code>Range</code> 同时出现 → 400 <code>InvalidRequest</code>；v1.15 起复制与 tier 摄入透传 <code>part_sizes</code>，MPU 分段边界保持可读。</li>
             <li>GET 多区间 <code>bytes=0-9,20-29</code> 不返回 <code>multipart/byteranges</code>：未签入 Range 时剥离并返回 200 整对象；Range 计入 SigV4 SignedHeaders 时返回确定性 400 <code>InvalidArgument</code>。</li>
             <li>匿名 AP 策略 <code>Principal:"*"</code> 与桶策略匿名基线取交集，仅放行数据面对象操作；控制面与对象锁/保留期头一律 403。</li>
-            <li>生命周期支持 <code>AbortIncompleteMultipartUpload</code>；AP 跨账号/VPC 端点与 <code>AssumeRoleWithWebIdentity</code> 仍为非目标。</li>
+            <li>生命周期支持 <code>AbortIncompleteMultipartUpload</code>；STS 支持 <code>AssumeRoleWithWebIdentity</code>（默认关闭，需 OIDC 配置）；AP 跨账号/VPC 端点仍为非目标。</li>
+            <li>Select 支持 CSV/JSON/Parquet 输入与 BZIP2/GZIP（BZIP2 仅 CSV/JSON；ScanRange 与压缩流互斥）。MPU 新 upload_id 可跨节点路由；存量裸 UUID 仍粘原节点。</li>
+            <li>Batch 支持同提交者协作抢占与跨账户清单（管理员）；OSSCTL2 快照携带 level-2 生命周期数据，旧读者明确拒绝。</li>
           </ul>
 
           <h2 id="more">继续阅读</h2>
           <ul>
             <li><a href="install.html">安装文档</a>：Docker、源码构建与首次启动。</li>
             <li><a href="usage.html">使用说明</a>：S3 操作、控制台、版本、加密与强一致。</li>
-            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.15.0。</li>
+            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.16.0。</li>
             <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>：完整协议与运维细节（随发布同步）。</li>
           </ul>
         </article>
@@ -167,7 +169,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.15.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.16.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

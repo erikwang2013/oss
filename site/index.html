@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>oss（吞吞）| Rust 编写的 S3 兼容分布式对象存储</title>
-    <meta name="description" content="oss（吞吞）是 Rust 2024 编写的 S3 兼容对象存储，支持纠删码、多盘、多站点、3-voter Raft 强一致，以及全链路 TLS、SSE-KMS CMK、访问点、Inventory、生命周期与滚动升级。提供安装文档、使用说明、版本日志与源码下载。">
+    <meta name="description" content="oss（吞吞）是 Rust 2024 编写的 S3 兼容对象存储，支持纠删码、多盘、多站点、3-voter Raft 强一致，以及全链路 TLS、SSE-KMS CMK、访问点、Inventory、WebIdentity、MPU 跨节点、生命周期与滚动升级。提供安装文档、使用说明、版本日志与源码下载。">
     <meta name="keywords" content="oss,吞吞,S3,对象存储,Rust,MinIO,纠删码,分布式存储,强一致,Raft,TLS,CMK,访问点,Inventory,对象锁,生命周期,WASM">
     <link rel="canonical" href="https://oss.erik.xyz/">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -25,7 +25,7 @@
     <meta property="og:image:height" content="640">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="oss（吞吞）| S3 兼容分布式对象存储">
-    <meta name="twitter:description" content="Rust 2024 编写，支持纠删码、多站点、3-voter Raft 强一致、全链路 TLS、SSE-KMS CMK 与滚动升级。">
+    <meta name="twitter:description" content="Rust 2024 编写，支持纠删码、多站点、3-voter Raft 强一致、全链路 TLS、SSE-KMS CMK、WebIdentity 与滚动升级。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <script type="application/ld+json">
@@ -36,7 +36,7 @@
         "alternateName": "oss",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Linux, macOS, Docker",
-        "softwareVersion": "1.15.0",
+        "softwareVersion": "1.16.0",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
         "codeRepository": "https://github.com/erikwang2013/oss",
         "downloadUrl": "https://github.com/erikwang2013/oss/releases",
@@ -90,7 +90,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.15.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.16.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -130,7 +130,7 @@
           <div><strong>5 个 crate</strong><span>oss-server · xl-s3 · xl-store · xl-client · xl-proto</span></div>
           <div><strong>EC 8+4</strong><span>多盘分片、quorum 写与读时修复</span></div>
           <div><strong>3 voters</strong><span>A/B 数据站点 + C control witness</span></div>
-          <div><strong>硬化收口</strong><span>2026-10-24 · v1.15.0 已发布</span></div>
+          <div><strong>backlog 第二轮</strong><span>2026-10-24 · v1.16.0 已发布</span></div>
         </div>
       </div>
 
@@ -140,7 +140,7 @@
             <h2>项目介绍</h2>
             <p class="intro-lede">吞吞（oss）是一块自己养大的对象存储：Rust 2024 编写，S3 兼容，从单盘一直长到跨站点强一致。</p>
             <p>它不是只把文件存进去的薄壳，而是把存储内核、纠删码、集群 mesh、多站点复制、控制面和安全能力放在同一套代码里。你可以只跑一个进程做本地备份，也可以配置 3 个 voter 和 witness，让控制面在站点故障时继续工作。</p>
-            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 又完成了 AP/账户、TLS/CMK、tier 流式、多站点复制与生命周期门控等硬化收口。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
+            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 完成 AP/账户、TLS/CMK、tier 流式与多站点复制等硬化收口，v1.16.0 又补上 WebIdentity、MPU 跨节点、OSSCTL2、Batch 抢占与 M8 leader 门控等 backlog。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
             <p>它适合想理解对象存储内部实现的人，也适合需要一套可自托管、可审计、能继续改的 S3 兼容服务的团队。代码是开放的，边界也写清楚了：能做什么，不能做什么，都在 README 和版本日志里。</p>
           </div>
           <aside class="project-facts" data-reveal aria-label="项目档案">
@@ -152,8 +152,8 @@
               <div><dt>对外协议</dt><dd>S3 compatible</dd></div>
               <div><dt>实现语言</dt><dd>Rust 2024</dd></div>
               <div><dt>许可证</dt><dd>Apache-2.0</dd></div>
-              <div><dt>当前版本</dt><dd>v1.15.0（最新发布）</dd></div>
-              <div><dt>最新发布</dt><dd>硬化收口（2026-10-24）</dd></div>
+              <div><dt>当前版本</dt><dd>v1.16.0（最新发布）</dd></div>
+              <div><dt>最新发布</dt><dd>backlog 第二轮（2026-10-24）</dd></div>
               <div><dt>部署形态</dt><dd>单盘 / 多盘 EC / 多站点 / 3-voter Raft · 全链路 TLS</dd></div>
               <div><dt>源码</dt><dd><a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">github.com/erikwang2013/oss</a></dd></div>
             </dl>
@@ -216,13 +216,13 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               </button>
             </article>
             <article class="bento-card span-8" data-reveal>
-              <h3>v1.15 硬化收口</h3>
-              <p>2026-10-24 完成并随 v1.15.0 发布：AP 匿名/账户命名空间/SourceVpc、TLS 热加载、SSE-KMS 显式 CMK、tier 流式搬运、多站点版本定向删除/元数据复制、Select Parquet、Inventory 增量/跨账户目标与生命周期门控。</p>
-              <div class="chip-row"><span>AP</span><span>CMK</span><span>tier 流式</span><span>多站点</span><span>Inventory</span></div>
+              <h3>v1.16 backlog 第二轮</h3>
+              <p>2026-10-24 完成并随 v1.16.0 发布：STS WebIdentity、Select BZIP2、CMK 删除/rewrap、MPU 跨节点路由、OSSCTL2 快照、M6 token 远端、TLS mesh/Kafka 热加载、Batch 抢占/跨账户清单、M8 leader 门控与 tier 清扫/预留。</p>
+              <div class="chip-row"><span>WebIdentity</span><span>BZIP2</span><span>MPU</span><span>OSSCTL2</span><span>Batch</span></div>
             </article>
             <article class="bento-card tint span-4" data-reveal>
               <h3>发布前四闸</h3>
-              <p>fmt、clippy <code>-D warnings</code>、库测试与 S3 全量 e2e 全绿；v1.15 复跑强一致 sync/stretch/recovery/rolling、控制面长跑与 Playwright 9/9，安全复审 0 Critical。</p>
+              <p>fmt 与 clippy <code>-D warnings</code> 0 警告；v1.16 库测试、S3 全量 e2e、E2E_LONG、M8（含 tier/repl）与 M9 四组全绿；独立安全复审 0 Critical/High，2 Medium 已修复复核。</p>
               <div class="chip-row"><span>fmt</span><span>clippy</span><span>e2e</span><span>security</span></div>
             </article>
           </div>
@@ -283,6 +283,14 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
                 <p>AP/账户、TLS/CMK、tier 流式、多站点复制、Select Parquet、Inventory 跨账户与生命周期门控；强一致四组、控制面长跑、S3 全量 e2e 与 Web 9/9 复跑。</p>
               </div>
               <img class="iteration-pet" src="assets/img/pet/joy.svg" data-static="assets/img/pet/static/joy.png" width="360" height="400" alt="" decoding="async">
+            </article>
+            <article class="iteration-row" data-reveal>
+              <span class="iteration-tag">2026-10-24</span>
+              <div>
+                <h3>v1.16 backlog 第二轮</h3>
+                <p>WebIdentity、BZIP2、CMK 删除/rewrap、MPU 跨节点、OSSCTL2/LC-0、M6 token 远端、Batch 抢占/跨账户、M8 leader 门控、tier 清扫/预留；E2E_LONG、M8 tier/repl、M9 四组与安全复审收口。</p>
+              </div>
+              <img class="iteration-pet" src="assets/img/pet/cute.svg" data-static="assets/img/pet/static/cute.png" width="360" height="400" alt="" decoding="async">
             </article>
           </div>
           <p style="margin-top:24px"><a class="btn btn-ghost" href="changelog.html">查看完整版本日志</a></p>
@@ -393,6 +401,11 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           <div class="release-list">
             <article class="release-row" data-reveal>
               <time datetime="2026-10-24">2026-10-24</time>
+              <div><strong>v1.16.0</strong><p>backlog 第二轮：WebIdentity、BZIP2、CMK 删除/rewrap、MPU 跨节点、OSSCTL2、Batch 抢占/跨账户、M8 leader 门控。</p></div>
+              <a href="changelog.html#v1-16-0">查看</a>
+            </article>
+            <article class="release-row" data-reveal>
+              <time datetime="2026-10-24">2026-10-24</time>
               <div><strong>v1.15.0</strong><p>硬化收口：AP 匿名/账户、TLS 热加载与 CMK、tier 流式、多站点版本复制、Select Parquet、Inventory 跨账户。</p></div>
               <a href="changelog.html#v1-15-0">查看</a>
             </article>
@@ -450,12 +463,12 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
         <div class="wrap">
           <div class="download-band" data-reveal>
             <div>
-              <h2>下载 v1.15.0</h2>
+              <h2>下载 v1.16.0</h2>
               <p>Release 提供源码归档。当前没有预编译二进制，推荐用 Docker Compose 或按安装文档从源码构建。</p>
             </div>
             <div class="download-actions">
-              <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.15.0" target="_blank" rel="noopener">打开 Release</a>
-              <a class="btn btn-ghost btn-lg" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.15.0.tar.gz" target="_blank" rel="noopener">源码包</a>
+              <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.16.0" target="_blank" rel="noopener">打开 Release</a>
+              <a class="btn btn-ghost btn-lg" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.16.0.tar.gz" target="_blank" rel="noopener">源码包</a>
               <a class="btn btn-ghost btn-lg" href="install.html">安装文档</a>
             </div>
           </div>
@@ -497,7 +510,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.15.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.16.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
