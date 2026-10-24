@@ -7,6 +7,12 @@
 //! Restore→RestorePost；ReplaceTags/InvokeLambda 无对应 S3 事件类型，不发）；副作用只走
 //! [`BatchMutationHooks`]（复制入队 + tier 远端回收），与在线写路径同一组 sink。
 //!
+//! 跨账户边界：通知目标是**桶级配置**（`event_configs` 按桶名，见
+//! [`crate::events::SqlEventSink`]），没有账户级订阅/转发模型。事件只投递到动作发生桶的
+//! 配置——Copy 进目标桶、其余进对象桶；源账户桶与作业创建者的其它桶都收不到。跨账户
+//! 清单/复制因此不会把事件泄漏到另一账户的桶；AWS 那种「通知目标位于另一账户」需要目标
+//! 侧资源策略，本仓明确不支持（也不模拟），这是刻意的安全边界。
+//!
 //! 动作语义：Copy 只读源（可带 versionId），目标键 = `target.prefix + 原 key`，标签/元数据
 //! 按 Copy 语义复制；ReplaceTags 对清单对象自身整体替换标签；Delete 的 tier refs 交 GC；
 //! Restore 等价 S3 RestoreObject（Restoring/Restored → 幂等成功）；InvokeLambda 支持 HTTP

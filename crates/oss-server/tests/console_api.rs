@@ -775,6 +775,73 @@ async fn jobs_api_ownership_and_actions() {
     assert_eq!(r.status(), 404);
 }
 
+/// 抢占态是运行态：列表/详情原样返回 `preempted`（不映射成 `error`），`failed` 仍为 0、
+/// `finished_at` 为空——控制台据此显示运行态，而不是把它算作终态失败。
+#[tokio::test]
+async fn preempted_job_surfaces_as_runtime_state_not_failure() {
+    use oss_server::db::{JobSpec, NewJobTask};
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    let admin_uid = st.db.create_user("erik", "pw", true).await.unwrap();
+    let id = st
+        .db
+        .create_job(
+            &JobSpec {
+                kind: "batch".into(),
+                bucket: "src".into(),
+                requested_by: Some(admin_uid),
+                tasks: vec![NewJobTask {
+                    action: "Copy".into(),
+                    payload: "{}".into(),
+                    dedupe_key: None,
+                }],
+                ..Default::default()
+            },
+            1000,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET state='preempted', started_at=1001, updated_at=1001 WHERE id=?")
+        .bind(id)
+        .execute(st.db.pool())
+        .await
+        .unwrap();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_token(&base).await;
+    let client = reqwest::Client::new();
+
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/jobs"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let item = list
+        .iter()
+        .find(|j| j["id"] == id)
+        .expect("preempted job in list");
+    assert_eq!(item["state"], "preempted");
+    assert_eq!(item["failed"], 0, "抢占不是失败");
+    assert!(item["finished_at"].is_null(), "抢占不是终态");
+
+    let detail: serde_json::Value = client
+        .get(format!("{base}/api/v1/jobs/{id}"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["job"]["state"], "preempted");
+    assert_eq!(detail["job"]["failed"], 0);
+    assert!(detail["job"]["finished_at"].is_null());
+    assert_eq!(detail["job"]["started_at"], 1001);
+}
+
 /// M8 S1：访问点 CRUD/策略 API（owner/admin、严格策略 400、缓存同步）。
 #[tokio::test]
 async fn access_points_api_crud() {
