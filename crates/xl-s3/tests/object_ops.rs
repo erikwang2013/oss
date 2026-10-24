@@ -4967,7 +4967,7 @@ async fn tagging_invalid_matrix_and_boundaries() {
 }
 
 #[tokio::test]
-async fn tagging_replica_ingest_drops_tags() {
+async fn tagging_replica_ingest_keeps_tags_with_token() {
     let (s3, _d) = service().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "rtag".into(),
@@ -4996,7 +4996,10 @@ async fn tagging_replica_ingest_drops_tags() {
         .await
         .unwrap()
         .output;
-    assert!(out.tag_set.is_empty(), "复制摄入不落标签（标签不跨界）");
+    // v1.16 起受信 REPLICA 摄入按 4.19 语义携带标签（站点复制同口径）。
+    assert_eq!(out.tag_set.len(), 1, "受信 REPLICA 应保留标签");
+    assert_eq!(out.tag_set[0].key, "a");
+    assert_eq!(out.tag_set[0].value, "1");
 }
 
 #[tokio::test]

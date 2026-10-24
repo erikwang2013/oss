@@ -864,6 +864,52 @@ mod tests {
         assert!(t.chunks.is_none(), "缺席的 chunks 必须默认 None");
     }
 
+    /// 反向兼容：真·旧读取器（结构体无 chunks 字段）读新 meta 的未知键必须跳过。
+    #[test]
+    fn old_reader_skips_chunks_field() {
+        #[derive(serde::Deserialize)]
+        struct OldTier {
+            backend: String,
+            key: String,
+            size: u64,
+            etag: String,
+            sha256: String,
+            phase: TierPhase,
+            archived_at: i64,
+            #[serde(default)]
+            restore_expires_at: Option<i64>,
+        }
+        let new = TierState {
+            backend: "cold".into(),
+            key: "k".into(),
+            size: 4,
+            etag: "e".into(),
+            sha256: "s".into(),
+            phase: TierPhase::Archived,
+            archived_at: 1,
+            restore_expires_at: None,
+            chunks: Some(TierChunks {
+                chunk_size: 4,
+                sha256: vec!["a".repeat(64)],
+            }),
+        };
+        let bytes = rmp_serde::to_vec_named(&new).unwrap();
+        let old: OldTier = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            (
+                old.backend.as_str(),
+                old.key.as_str(),
+                old.size,
+                old.etag.as_str(),
+                old.sha256.as_str(),
+                old.phase,
+                old.archived_at,
+                old.restore_expires_at,
+            ),
+            ("cold", "k", 4, "e", "s", TierPhase::Archived, 1, None)
+        );
+    }
+
     #[test]
     fn decode_skips_unknown_fields() {
         // 前向兼容：v1 解码器遇到未来版本新增的字段必须跳过而不是报错
