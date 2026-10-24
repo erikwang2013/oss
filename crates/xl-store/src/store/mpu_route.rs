@@ -99,7 +99,7 @@ mod tests {
             );
         }
         // UUID 右半大小写不敏感（与裸 UUID 旧路径同口径），统一规范化为小写
-        let upper = format!("n1.{}", uuid.to_uppercase());
+        let upper = format_upload_id("n1", &uuid.to_uppercase());
         let (owner, got) = split_upload_id(&upper).unwrap();
         assert_eq!(owner.as_deref(), Some("n1"));
         assert_eq!(got, uuid);

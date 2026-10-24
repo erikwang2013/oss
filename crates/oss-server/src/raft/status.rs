@@ -43,7 +43,8 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         .map(|(id, n)| (id.to_string(), Value::String(n.addr.clone())))
         .collect();
     let state = format!("{:?}", m.state).to_lowercase();
-    let is_leader = m.current_leader == Some(m.id);
+    // 与 [`super::LeaderGate`] 同口径：节点已停止（fatal）不算可执行 leader。
+    let is_leader = m.running_state.is_ok() && m.current_leader == Some(m.id);
     let (lag, stale) = apply_backlog(
         is_leader,
         m.last_log_index,
@@ -86,6 +87,8 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         "bootstrap": handle.settings().bootstrap,
         "initialized": !voters.is_empty(),
         "leader": m.current_leader,
+        // M8-1：单例后台任务（作业/清单/tier/生命周期）只在本节点为 leader 时执行。
+        "is_leader": is_leader,
         "leader_endpoint": leader_endpoint,
         "term": m.current_term,
         "state": state,

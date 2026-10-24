@@ -992,6 +992,7 @@ async fn settle_delete(
 }
 
 /// 后台 worker（serve 路径挂载；显式 `OSS_LIFECYCLE_INTERVAL_SECS=0` 关闭）。
+/// M8-1：Raft 模式下只有 leader 执行（过期删除作用于全集群共享的对象数据）。
 pub fn spawn_worker(state: AppState) {
     let secs: u64 = std::env::var("OSS_LIFECYCLE_INTERVAL_SECS")
         .ok()
@@ -1001,11 +1002,15 @@ pub fn spawn_worker(state: AppState) {
         tracing::info!("lifecycle worker 已关闭（OSS_LIFECYCLE_INTERVAL_SECS=0）");
         return;
     }
+    let gate = crate::raft::LeaderGate::from_raft(state.raft.clone());
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(secs));
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
+            if !gate.is_leader() {
+                continue;
+            }
             sweep_once(&state).await;
         }
     });

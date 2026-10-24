@@ -11,8 +11,11 @@ use xl_store::store::VersioningMode;
 use bytes::Bytes;
 use common::state;
 use oss_server::db::PermissionRow;
-use oss_server::inventory::{InventoryPayload, daily_key, due_runs, enqueue_run, weekly_key};
+use oss_server::inventory::{
+    InventoryPayload, daily_key, due_runs, enqueue_run, schedule_tick, weekly_key,
+};
 use oss_server::jobs::{JobEnv, TaskExecutor as _, worker_once};
+use oss_server::raft::LeaderGate;
 use oss_server::state::AppState;
 use reqwest::StatusCode as HttpStatus;
 use s3s::dto::*;
@@ -1932,5 +1935,45 @@ async fn incremental_watermark_advances_only_after_run_done() {
             .unwrap()
             .is_some(),
         "done 后必须推进水位"
+    );
+}
+
+/// M8-1：inventory 调度门控——follower/unknown 不建运行行，leader 才补槽。
+#[tokio::test]
+async fn schedule_tick_is_leader_gated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, uid) = boot(&dir).await;
+    add_bucket(&st, "src", None).await;
+    add_bucket(&st, "dst", None).await;
+    put(&st, uid, "src", &cfg("d1", "Daily", "dst"))
+        .await
+        .unwrap();
+
+    let t = 1_609_459_200i64;
+    for gate in [LeaderGate::fixed(None), LeaderGate::fixed(Some(false))] {
+        assert_eq!(schedule_tick(&st.db, t, &gate).await.unwrap(), 0);
+        assert!(
+            st.db
+                .inventory_run_by_key("src", "d1", &daily_key(t))
+                .await
+                .unwrap()
+                .is_none(),
+            "非 leader 不得建运行行"
+        );
+    }
+
+    let gate = LeaderGate::fixed(Some(true));
+    assert_eq!(schedule_tick(&st.db, t, &gate).await.unwrap(), 1);
+    assert!(
+        st.db
+            .inventory_run_by_key("src", "d1", &daily_key(t))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        schedule_tick(&st.db, t, &gate).await.unwrap(),
+        0,
+        "同槽去重"
     );
 }

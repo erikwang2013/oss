@@ -2,6 +2,8 @@
 //!
 //! 调度只补当前槽（停机期间的旧槽不补）；同一 `(bucket,config_id,run_key)` 由唯一索引去重。
 //! 扫描按前缀翻页（页大小 1000），输出先写 staging 临时文件（边写边算 MD5/大小）再流式 PUT。
+//! M8-1：Raft 模式下调度只在 leader 跑（[`crate::raft::LeaderGate`]）；`inventory_runs`/
+//! 游标仍是节点本地表，门控只防重复入队，不复制运行态（backlog §4.3 M8-2）。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -159,8 +161,20 @@ pub async fn due_runs(db: &Db, now: i64) -> Result<usize, String> {
     Ok(queued)
 }
 
-/// `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 = 关闭）。
-pub fn spawn_worker(db: Arc<Db>) {
+/// 带 leader 门控的一轮调度（worker 循环/测试共用）。follower/unknown 不入队。
+pub async fn schedule_tick(
+    db: &Db,
+    now: i64,
+    gate: &crate::raft::LeaderGate,
+) -> Result<usize, String> {
+    if !gate.is_leader() {
+        return Ok(0);
+    }
+    due_runs(db, now).await
+}
+
+/// `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 = 关闭）。M8-1：只有 leader 调度。
+pub fn spawn_worker(db: Arc<Db>, gate: crate::raft::LeaderGate) {
     let secs = env_secs("OSS_INVENTORY_INTERVAL_SECS", 60);
     if secs == 0 {
         tracing::info!("inventory worker 已关闭（OSS_INVENTORY_INTERVAL_SECS=0）");
@@ -171,7 +185,7 @@ pub fn spawn_worker(db: Arc<Db>) {
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
-            match due_runs(&db, crate::db::now()).await {
+            match schedule_tick(&db, crate::db::now(), &gate).await {
                 Ok(n) if n > 0 => tracing::info!(n, "inventory：本轮入队"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "inventory 调度失败"),
