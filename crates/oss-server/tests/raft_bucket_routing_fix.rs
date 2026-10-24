@@ -125,6 +125,7 @@ async fn setup() -> H {
         sync: Default::default(),
         stretch: None,
         tls: Default::default(),
+        sts: Default::default(),
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();

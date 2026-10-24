@@ -1,10 +1,12 @@
-//! M5 切片 5：STS 临时凭据——AssumeRole / GetSessionToken（裁决 S1-S9）。
+//! M5 切片 5：STS 临时凭据——AssumeRole / GetSessionToken / AssumeRoleWithWebIdentity。
 //!
-//! 形态：s3s `S3Route` 前置拦截（POST `/` + form-urlencoded）；管线保证签名校验在
-//! `call` 之前（`req.credentials` 已验证），**不覆写 `check_access`**（默认要求凭据 =
-//! STS 须签名，MinIO 同）。响应 XML（`text/xml`）；错误走 s3s 的 S3 错误 XML（STS
-//! `ErrorResponse` 形态差异记档）。会话行落 `access_keys`（kind='session'、parent_ak、
-//! expires_at、session_policy）；父链条件在 auth.rs/user_of_key/cluster_control 三处同口径。
+//! 形态：s3s `S3Route` 前置拦截（POST `/` + form-urlencoded）；签名请求由管线先校验
+//! SigV4。`check_access` 覆写为放行：`AssumeRoleWithWebIdentity` 的凭据是 OIDC token
+//! （无需 AK/SK），其余 Action 在 `call` 内逐条要求签名（未启用 OIDC 时该 Action 拒绝）。
+//! 响应 XML（`text/xml`）；错误走 s3s 的 S3 错误 XML（STS `ErrorResponse` 形态差异记档）。
+//! 会话行落 `access_keys`（kind='session'、parent_ak、expires_at、session_policy）；
+//! 父链条件在 auth.rs/user_of_key/cluster_control 三处同口径。WebIdentity 会话无父键
+//! （匿名入口不继承任何调用者权限）。
 
 use http::Extensions;
 use http::{HeaderMap, Method, Uri};
@@ -12,6 +14,8 @@ use s3s::route::S3Route;
 use s3s::{Body, S3Request, S3Response, S3Result};
 use sqlx::Row as _;
 use sqlx::SqlitePool;
+
+use crate::sts_web_identity::{WebIdentity, WebIdentityError};
 
 /// 请求体上限（STS form 只有字段名值；64 KiB 富余）。
 const MAX_BODY: usize = 64 * 1024;
@@ -32,11 +36,17 @@ pub struct StsRoute {
     /// M5 切片 6（T5 校正）：SK 加密库——签发会话的 SK 与 console 同口径封存入库
     /// （`issue` 是 `access_keys` 的**第二个写点**，切片 6 核查轮补齐）。
     vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
+    /// AssumeRoleWithWebIdentity 的 OIDC 验证器；`None` = 未启用（该 Action 一律拒绝）。
+    web_identity: Option<WebIdentity>,
 }
 
 impl StsRoute {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool, vault: None }
+        Self {
+            pool,
+            vault: None,
+            web_identity: None,
+        }
     }
 
     /// M5 切片 6：接 SK 加密库（builder 风格；router 装配处调用）。
@@ -45,6 +55,12 @@ impl StsRoute {
         vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
     ) -> Self {
         self.vault = vault;
+        self
+    }
+
+    /// 接 OIDC 验证器（builder 风格；`None` 保持功能关闭）。配置在启动期已校验。
+    pub fn with_web_identity(mut self, web_identity: Option<WebIdentity>) -> Self {
+        self.web_identity = web_identity;
         self
     }
 
@@ -86,7 +102,7 @@ impl StsRoute {
             &self.pool,
             self.vault.as_deref(),
             role_uid,
-            caller_ak,
+            Some(caller_ak),
             dur,
             policy.as_deref(),
         )
@@ -129,8 +145,15 @@ impl StsRoute {
             .await?
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
         let dur = duration(fields, "DurationSeconds", GST_DEFAULT, GST_MIN, GST_MAX)?;
-        let (ak, sk, token) =
-            issue(&self.pool, self.vault.as_deref(), uid, caller_ak, dur, None).await?;
+        let (ak, sk, token) = issue(
+            &self.pool,
+            self.vault.as_deref(),
+            uid,
+            Some(caller_ak),
+            dur,
+            None,
+        )
+        .await?;
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <GetSessionTokenResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
@@ -145,6 +168,91 @@ impl StsRoute {
              <ResponseMetadata><RequestId>{rid}</RequestId></ResponseMetadata>\
              </GetSessionTokenResponse>",
             exp = iso8601(now_secs() + dur),
+            rid = request_id(),
+        );
+        Ok(xml_response(body))
+    }
+
+    /// AssumeRoleWithWebIdentity：凭据来自 OIDC token，**不要求 AK/SK 签名**。
+    /// 仅当 `[sts.web_identity] enabled=true` 时开放；token 校验、角色映射、时长全部
+    /// fail-closed（见 `sts_web_identity`）。签发的会话 `parent_ak = NULL`：匿名入口
+    /// 不继承任何调用者父链，权限只来自映射到的本地角色用户。
+    async fn assume_role_with_web_identity(
+        &self,
+        fields: &[(String, String)],
+    ) -> S3Result<S3Response<Body>> {
+        let Some(wi) = self.web_identity.as_ref() else {
+            return Err(s3s::s3_error!(
+                AccessDenied,
+                "AssumeRoleWithWebIdentity is not enabled"
+            ));
+        };
+        let token = field(fields, "WebIdentityToken")
+            .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing WebIdentityToken"))?;
+        let arn = field(fields, "RoleArn")
+            .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing RoleArn"))?;
+        let requested = match field(fields, "DurationSeconds") {
+            Some(raw) => Some(
+                raw.parse::<i64>()
+                    .map_err(|_| s3s::s3_error!(InvalidRequest, "invalid DurationSeconds"))?,
+            ),
+            None => None,
+        };
+        let verified = wi
+            .verify(&token, &arn, requested)
+            .map_err(web_identity_error)?;
+        let role_uid: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
+                .bind(&verified.role)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let Some(role_uid) = role_uid else {
+            // 映射命中但本地角色不存在/停用：拒绝，绝不回退到其他用户。
+            return Err(s3s::s3_error!(
+                AccessDenied,
+                "web identity role not found or disabled"
+            ));
+        };
+        let policy = session_policy(fields)?;
+        let session_name = web_identity_session_name(fields)?;
+        let (ak, sk, session_token) = issue(
+            &self.pool,
+            self.vault.as_deref(),
+            role_uid,
+            None,
+            verified.duration_seconds,
+            policy.as_deref(),
+        )
+        .await?;
+        let expires = now_secs() + verified.duration_seconds;
+        let account = "oss"; // 单租户简化：acct 段不校验，回显固定
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+             <AssumeRoleWithWebIdentityResult>\
+             <SubjectFromWebIdentityToken>{subject}</SubjectFromWebIdentityToken>\
+             <AssumedRoleUser>\
+             <Arn>arn:oss:iam::{account}:assumed-role/{role}/{name}</Arn>\
+             <AssumedRoleId>AROA{role_uid}:{name}</AssumedRoleId>\
+             </AssumedRoleUser>\
+             <Audience>{audience}</Audience>\
+             <Provider>{provider}</Provider>\
+             <Credentials>\
+             <AccessKeyId>{ak}</AccessKeyId>\
+             <SecretAccessKey>{sk}</SecretAccessKey>\
+             <SessionToken>{session_token}</SessionToken>\
+             <Expiration>{exp}</Expiration>\
+             </Credentials>\
+             </AssumeRoleWithWebIdentityResult>\
+             <ResponseMetadata><RequestId>{rid}</RequestId></ResponseMetadata>\
+             </AssumeRoleWithWebIdentityResponse>",
+            subject = xml_escape(&verified.subject),
+            role = xml_escape(&verified.role),
+            name = xml_escape(&session_name),
+            audience = xml_escape(wi.audience()),
+            provider = xml_escape(wi.issuer()),
+            exp = iso8601(expires),
             rid = request_id(),
         );
         Ok(xml_response(body))
@@ -184,11 +292,15 @@ impl S3Route for StsRoute {
                 .is_some_and(|v| v.starts_with("application/x-www-form-urlencoded"))
     }
 
+    /// 放行到 `call`：`AssumeRoleWithWebIdentity` 的凭据是 OIDC token，匿名合法；
+    /// 其余 Action 在 `call` 内按 Action 强制签名（未启用 OIDC 时 WebIdentity 也拒）。
+    /// 带签名的请求仍先经 s3s 管线验签——本覆写不放宽任何签名校验。
+    async fn check_access(&self, _req: &mut S3Request<Body>) -> S3Result<()> {
+        Ok(())
+    }
+
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        let Some(cred) = req.credentials.as_ref() else {
-            return Err(s3s::s3_error!(AccessDenied, "Authentication required"));
-        };
-        let caller_ak = cred.access_key.clone();
+        let caller_ak = req.credentials.as_ref().map(|c| c.access_key.clone());
         let mut body = req.input;
         let bytes = body
             .store_all_limited(MAX_BODY)
@@ -196,12 +308,27 @@ impl S3Route for StsRoute {
             .map_err(|_| s3s::s3_error!(InvalidRequest, "malformed request body"))?;
         let fields = parse_form(&bytes);
         match field(&fields, "Action").as_deref() {
-            Some("AssumeRole") => self.assume_role(&caller_ak, &fields).await,
-            Some("GetSessionToken") => self.get_session_token(&caller_ak, &fields).await,
+            // OIDC token 即凭据：无需 AK/SK（是否启用由 assume_role_with_web_identity 判）
+            Some("AssumeRoleWithWebIdentity") => self.assume_role_with_web_identity(&fields).await,
+            Some("AssumeRole") => {
+                let ak = signed_caller(caller_ak.as_deref())?;
+                self.assume_role(&ak, &fields).await
+            }
+            Some("GetSessionToken") => {
+                let ak = signed_caller(caller_ak.as_deref())?;
+                self.get_session_token(&ak, &fields).await
+            }
             Some(_) => Err(s3s::s3_error!(NotImplemented, "unsupported STS operation")),
             None => Err(s3s::s3_error!(InvalidRequest, "missing Action")),
         }
     }
+}
+
+/// 非 WebIdentity 的 STS Action 必须带（已验签的）AK/SK。
+fn signed_caller(caller_ak: Option<&str>) -> S3Result<String> {
+    caller_ak
+        .map(str::to_string)
+        .ok_or_else(|| s3s::s3_error!(AccessDenied, "Signature is required"))
 }
 
 /// 落一行会话（S1：AK `ASIA`+32hex / SK 32B hex / token 不落库）。
@@ -209,7 +336,7 @@ async fn issue(
     pool: &SqlitePool,
     vault: Option<&crate::skvault::SecretVault>,
     uid: i64,
-    parent_ak: &str,
+    parent_ak: Option<&str>,
     dur_secs: i64,
     session_policy: Option<&str>,
 ) -> S3Result<(String, String, String)> {
@@ -261,7 +388,7 @@ fn field(fields: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-fn parse_role_arn(arn: &str) -> Option<String> {
+pub(crate) fn parse_role_arn(arn: &str) -> Option<String> {
     // arn:partition:service:region:account:resource —— 只约束 service=iam、resource=role/<name>
     let parts: Vec<&str> = arn.split(':').collect();
     if parts.len() != 6 || parts[0] != "arn" || parts[2] != "iam" {
@@ -295,6 +422,40 @@ fn duration(
         ));
     }
     Ok(d)
+}
+
+/// WebIdentity 的 RoleSessionName：AWS 口径 `[\w+=,.@-]{1,64}`，缺省 `web-identity`。
+fn web_identity_session_name(fields: &[(String, String)]) -> S3Result<String> {
+    let Some(name) = field(fields, "RoleSessionName") else {
+        return Ok("web-identity".to_string());
+    };
+    if name.is_empty()
+        || name.len() > 64
+        || !name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'=' | b',' | b'.' | b'@' | b'-' | b'_')
+        })
+    {
+        return Err(s3s::s3_error!(InvalidArgument, "invalid RoleSessionName"));
+    }
+    Ok(name)
+}
+
+/// WebIdentity 验证错误 → S3 错误（文案不含 token/claims；不区分签名与 claim 失败）。
+fn web_identity_error(e: WebIdentityError) -> s3s::S3Error {
+    match e {
+        WebIdentityError::Expired => {
+            s3s::s3_error!(ExpiredToken, "web identity token expired")
+        }
+        WebIdentityError::DurationOutOfRange => {
+            s3s::s3_error!(InvalidArgument, "DurationSeconds out of range")
+        }
+        WebIdentityError::RoleNotMapped => {
+            s3s::s3_error!(AccessDenied, "RoleArn is not mapped for web identity")
+        }
+        WebIdentityError::InvalidToken => {
+            s3s::s3_error!(InvalidToken, "invalid web identity token")
+        }
+    }
 }
 
 fn session_policy(fields: &[(String, String)]) -> S3Result<Option<String>> {
@@ -550,7 +711,9 @@ mod tests {
     #[tokio::test]
     async fn issue_lands_resolvable_session_row() {
         let pool = sts_db().await;
-        let (ak, _sk, token) = issue(&pool, None, 2, "AKIA_SUB", 900, None).await.unwrap();
+        let (ak, _sk, token) = issue(&pool, None, 2, Some("AKIA_SUB"), 900, None)
+            .await
+            .unwrap();
         assert!(ak.starts_with("ASIA"));
         assert_eq!(token.len(), 64);
         let (uid, kind, parent, exp): (i64, String, String, i64) = sqlx::query_as(
@@ -590,7 +753,9 @@ mod tests {
             Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
         ));
         // 会话键不得作为调用者（kind 条件）
-        let (sak, _, _) = issue(&pool, None, 1, "AKIA_ROOT", 900, None).await.unwrap();
+        let (sak, _, _) = issue(&pool, None, 1, Some("AKIA_ROOT"), 900, None)
+            .await
+            .unwrap();
         assert!(matches!(
             route.assume_role(&sak, &f).await,
             Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
@@ -682,7 +847,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        let (ak, sk, _) = issue(&pool, Some(&vault), 2, "AKIA_SUB", 900, None)
+        let (ak, sk, _) = issue(&pool, Some(&vault), 2, Some("AKIA_SUB"), 900, None)
             .await
             .unwrap();
         // 返回值是明文（SDK 只在此刻拿到）；DB 行是封存
@@ -701,5 +866,101 @@ mod tests {
         // 端到端：认证面（带库）解出同一 SK
         let auth = crate::auth::SigV4Auth::new(pool.clone()).with_vault(Some(vault));
         assert_eq!(auth.get_secret_key(&ak).await.unwrap().expose(), sk);
+    }
+
+    /// AssumeRoleWithWebIdentity：未启用 fail-closed；启用后**匿名**可换会话（parent NULL）；
+    /// 其他 STS Action 匿名仍拒；映射角色停用拒。
+    #[tokio::test]
+    async fn web_identity_call_is_anonymous_and_parentless() {
+        use crate::sts_web_identity::test_support as wi;
+        use jsonwebtoken::Algorithm;
+
+        let pool = sts_db().await;
+        sqlx::query("INSERT INTO users (id, username, is_admin) VALUES (3, 'ci-bot', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let verifier = wi::web_identity(td.path(), 3600);
+        let token = wi::sign(
+            &wi::claims("repo:acme/infra:ref:refs/heads/main", wi::now()),
+            wi::KID_RSA,
+            Algorithm::RS256,
+        );
+        let body = format!(
+            "Action=AssumeRoleWithWebIdentity&RoleArn=arn%3Aoss%3Aiam%3A%3Aoss%3Arole%2Fci-bot\
+             &WebIdentityToken={token}"
+        );
+        let mk = |body: &str| S3Request::<Body> {
+            input: Body::from(body.to_string()),
+            method: Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        // 未启用：即使 token 合法也拒（fail-closed）
+        let disabled = StsRoute::new(pool.clone());
+        let e = disabled.call(mk(&body)).await.unwrap_err();
+        assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
+
+        let route = StsRoute::new(pool.clone()).with_web_identity(Some(verifier));
+        // check_access 允许匿名进入 call（WebIdentity 专用；其余 Action 由 call 拒绝）
+        let mut anon = mk(&body);
+        assert!(route.check_access(&mut anon).await.is_ok());
+
+        let resp = route.call(mk(&body)).await.unwrap();
+        let mut out = resp.output;
+        let bytes = out.store_all_limited(MAX_BODY).await.unwrap();
+        let xml = String::from_utf8_lossy(&bytes);
+        assert!(xml.contains("<AssumeRoleWithWebIdentityResult>"), "{xml}");
+        assert!(
+            xml.contains(
+                "<SubjectFromWebIdentityToken>repo:acme/infra:ref:refs/heads/main\
+                 </SubjectFromWebIdentityToken>"
+            ),
+            "{xml}"
+        );
+        assert!(xml.contains("<Audience>oss-test</Audience>"), "{xml}");
+        assert!(
+            xml.contains("<Provider>https://issuer.example</Provider>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<AssumedRoleUser>"), "{xml}");
+        assert!(xml.contains("<Credentials>"), "{xml}");
+        let ak = xml
+            .split("<AccessKeyId>")
+            .nth(1)
+            .and_then(|s| s.split("</AccessKeyId>").next())
+            .unwrap();
+        let (uid, kind, parent): (i64, String, Option<String>) =
+            sqlx::query_as("SELECT user_id, kind, parent_ak FROM access_keys WHERE access_key = ?")
+                .bind(ak)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(uid, 3);
+        assert_eq!(kind, "session");
+        assert_eq!(parent, None, "匿名入口不得挂到任何父键");
+
+        // 其他 Action 未签名仍拒
+        for action in [
+            "Action=AssumeRole&RoleArn=arn%3Aoss%3Aiam%3A%3Aoss%3Arole%2Fci-bot",
+            "Action=GetSessionToken",
+        ] {
+            let e = route.call(mk(action)).await.unwrap_err();
+            assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied, "{action}");
+        }
+        // 映射存在但本地角色停用：拒
+        sqlx::query("UPDATE users SET status = 'disabled' WHERE id = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let e = route.call(mk(&body)).await.unwrap_err();
+        assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 }

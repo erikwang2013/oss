@@ -456,6 +456,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
         },
         stretch: None,
         tls: Default::default(),
+        sts: Default::default(),
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();

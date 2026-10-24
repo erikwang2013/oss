@@ -79,9 +79,18 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
             .with_raft_mode(state.control.is_raft()), // M9 S6b H2：Raft 下禁止 apply 外重封
     );
     s3_builder.set_access(acl.clone());
+    // STS：[sts.web_identity] 缺省关闭；启用时 AppConfig::load 已校验，这里构建验证器
+    // （只读本地 JWKS，无网络）。配置错误 fail-closed：拒绝启动。
+    let web_identity = state
+        .cfg
+        .sts
+        .web_identity()
+        .map_err(|e| format!("[sts.web_identity] 配置非法：{e}"))?;
     // M8 S1（N2）：AP 与 STS 共用一个 route 槽：先 AP，未命中委托 STS。
     let sts: Arc<dyn s3s::route::S3Route> = Arc::new(
-        xl_s3::sts::StsRoute::new(state.db.pool().clone()).with_vault(state.vault.clone()),
+        xl_s3::sts::StsRoute::new(state.db.pool().clone())
+            .with_vault(state.vault.clone())
+            .with_web_identity(web_identity),
     );
     let ap = xl_s3::ap::ApRoute::new(
         Arc::clone(&state.ap_cache),

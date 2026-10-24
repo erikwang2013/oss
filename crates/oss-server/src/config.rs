@@ -55,6 +55,9 @@ pub struct AppConfig {
     /// TLS：`[tls.server]` 存在 = 集群/站点/mesh/Raft 全链路启用；`[tls.client]` 补充出站信任。
     #[serde(default)]
     pub tls: TlsToml,
+    /// STS：`[sts]`（AssumeRoleWithWebIdentity 的 OIDC 联合身份；缺省全关）。
+    #[serde(default)]
+    pub sts: xl_s3::sts_web_identity::StsToml,
 }
 
 /// `[raft]`：3-voter 控制面运行时参数。`advertise_endpoint` 是主 HTTP（Raft RPC 路由），
@@ -512,7 +515,14 @@ impl AppConfig {
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.raft_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.sts_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
+    }
+
+    /// `[sts]`：启用 web_identity 时启动期读入并校验 JWKS（坏配置/坏文件 = 拒绝启动）。
+    pub fn sts_validate(&self) -> Result<(), String> {
+        self.sts.validate()
     }
 
     /// TLS 模式与监听地址 scheme 一致性；证书物料在 AppState::load 读取（witness 在 run 中）。
@@ -1059,7 +1069,45 @@ mod tests {
             sync: Default::default(),
             stretch: None,
             tls: Default::default(),
+            sts: Default::default(),
         }
+    }
+
+    #[test]
+    fn sts_web_identity_default_off_and_bad_config_fails_closed() {
+        let base = "listen = \"127.0.0.1:0\"\n\
+                    data_dir = \"d\"\n\
+                    staging_dir = \"s\"\n\
+                    database_url = \"sqlite::memory:\"\n\
+                    jwt_secret = \"\"\n";
+        // 未配置 [sts]：缺省关闭（现有部署零改动，启动校验通过）
+        let c: AppConfig = toml::from_str(base).unwrap();
+        assert!(c.sts_validate().is_ok(), "缺省 [sts] 必须关闭且可启动");
+
+        // 显式启用但 JWKS 文件不存在：启动期校验必须失败（fail-closed）
+        let enabled = format!(
+            "{base}\n[sts.web_identity]\n\
+             enabled = true\n\
+             issuer = \"https://issuer.example\"\n\
+             audience = \"oss-test\"\n\
+             jwks_file = \"/nonexistent/jwks.json\"\n\
+             max_duration_seconds = 3600\n\
+             [[sts.web_identity.roles]]\n\
+             role_arn = \"arn:oss:iam::oss:role/ci-bot\"\n\
+             claim = \"sub\"\n\
+             values = [\"repo:acme/infra:ref:refs/heads/main\"]\n"
+        );
+        let c: AppConfig = toml::from_str(&enabled).unwrap();
+        assert!(
+            c.sts_validate().is_err(),
+            "启用但 JWKS 不可读必须在启动期失败"
+        );
+        // 拼错的键也必须拒绝（deny_unknown_fields）
+        let typo = enabled.replace("jwks_file", "jwks_url");
+        assert!(
+            toml::from_str::<AppConfig>(&typo).is_err(),
+            "未知键必须拒绝"
+        );
     }
 
     fn cluster_cfg() -> AppConfig {
@@ -1400,6 +1448,7 @@ mod tests {
             sync: Default::default(),
             stretch: None,
             tls: Default::default(),
+            sts: Default::default(),
         };
         // 合法
         assert!(
