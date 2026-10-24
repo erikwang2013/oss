@@ -39,6 +39,18 @@ pub const USAGE: &str = "\
                  从导出文件重建 N 的单节点集群（数据站点或 witness 配置；S7.5）
   sync-reconcile [--repair] [--bucket B] [--json]
                  B′ 站点对账（S7.5）
+  cmk scan --name <cmk> [--json]
+                 本机 CMK 引用扫描（对象版本 + 桶默认加密）；集群须逐节点执行，不做全局汇总
+  cmk rewrap --name <cmk> [--apply] [--limit N] [--cursor C] [--bucket B] [--json]
+                 逐版本重加密到当前版本（默认 dry-run；集群部署离线拒绝——分片放置需在线拓扑）
+  cmk delete --name <cmk> [--force] --yes [--json]
+                 删除本机引用为零的 CMK（--force 仅跳过集群本机屏障，绝不放宽已知引用）
+  cmk trash list [--json]
+                 列出 .cmk-trash 隔离残骸（删除中断/清理失败）
+  cmk trash purge --name <cmk> [--force] --yes [--json]
+                 重试清理：对象/桶默认引用为空才永久销毁隔离钥
+  cmk trash restore --name <cmk> [--json]
+                 安全恢复：隔离钥原样移回活动命名空间（活动目录已存在则拒）
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,7 +104,50 @@ pub enum Command {
         bucket: Option<String>,
         json: bool,
     },
+    /// 3.16 离线 CMK 运维：引用扫描 / rewrap / 删除 / .cmk-trash 清理（逐节点执行）。
+    Cmk(CmkCommand),
 }
+
+/// `cmk` 子命令。全部为离线命令（不经 AppState::load，避免二次打开 raft.db）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum CmkCommand {
+    Scan {
+        name: String,
+        json: bool,
+    },
+    /// 默认 dry-run（`apply=false`）；`limit` 为单页候选上限。
+    Rewrap {
+        name: String,
+        apply: bool,
+        limit: usize,
+        cursor: Option<String>,
+        bucket: Option<String>,
+        json: bool,
+    },
+    /// `yes=false` 时只做参数解析，执行阶段拒绝（破坏性操作需显式确认）。
+    Delete {
+        name: String,
+        force: bool,
+        yes: bool,
+        json: bool,
+    },
+    TrashList {
+        json: bool,
+    },
+    TrashPurge {
+        name: String,
+        force: bool,
+        yes: bool,
+        json: bool,
+    },
+    TrashRestore {
+        name: String,
+        json: bool,
+    },
+}
+
+/// rewrap 单页默认上限（与在线控制台一致）。
+const DEFAULT_REWRAP_LIMIT: usize = 100;
 
 /// 取出 `--config <path>` / `--config=<path>`（恰好一次；缺省 `oss.toml`）。
 /// 其余参数原样返回给 [`parse_args`]。
@@ -135,6 +190,7 @@ pub fn needs_full_state(cmd: &Command) -> bool {
             | Command::RaftCutover { .. }
             | Command::RaftForceRecover { .. }
             | Command::SyncReconcile { .. }
+            | Command::Cmk(_)
     )
 }
 
@@ -287,6 +343,80 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
                 bucket: v.get("--bucket").cloned(),
                 json: flags.contains("--json"),
             })
+        }
+        ("cmk", rest) => Ok(Command::Cmk(parse_cmk_args(rest)?)),
+        _ => Err(USAGE),
+    }
+}
+
+/// `cmk <子命令>` 解析：`scan|rewrap|delete|trash <list|purge|restore>`。
+/// `--yes` 只入参不在此强制（执行阶段报明确原因，而不是笼统的用法错误）。
+fn parse_cmk_args(rest: &[String]) -> Result<CmkCommand, &'static str> {
+    let (sub, rest) = rest.split_first().ok_or(USAGE)?;
+    match sub.as_str() {
+        "scan" => {
+            let (v, flags) = parse_flags(rest, &["--name"], &["--json"])?;
+            Ok(CmkCommand::Scan {
+                name: v.get("--name").cloned().ok_or(USAGE)?,
+                json: flags.contains("--json"),
+            })
+        }
+        "rewrap" => {
+            let (v, flags) = parse_flags(
+                rest,
+                &["--name", "--limit", "--cursor", "--bucket"],
+                &["--apply", "--json"],
+            )?;
+            let limit = match v.get("--limit") {
+                Some(s) => s.parse::<usize>().map_err(|_| USAGE)?,
+                None => DEFAULT_REWRAP_LIMIT,
+            };
+            Ok(CmkCommand::Rewrap {
+                name: v.get("--name").cloned().ok_or(USAGE)?,
+                apply: flags.contains("--apply"),
+                limit,
+                cursor: v.get("--cursor").cloned(),
+                bucket: v.get("--bucket").cloned(),
+                json: flags.contains("--json"),
+            })
+        }
+        "delete" => {
+            let (v, flags) = parse_flags(rest, &["--name"], &["--force", "--yes", "--json"])?;
+            Ok(CmkCommand::Delete {
+                name: v.get("--name").cloned().ok_or(USAGE)?,
+                force: flags.contains("--force"),
+                yes: flags.contains("--yes"),
+                json: flags.contains("--json"),
+            })
+        }
+        "trash" => {
+            let (what, rest) = rest.split_first().ok_or(USAGE)?;
+            match what.as_str() {
+                "list" => {
+                    let (_, flags) = parse_flags(rest, &[], &["--json"])?;
+                    Ok(CmkCommand::TrashList {
+                        json: flags.contains("--json"),
+                    })
+                }
+                "purge" => {
+                    let (v, flags) =
+                        parse_flags(rest, &["--name"], &["--force", "--yes", "--json"])?;
+                    Ok(CmkCommand::TrashPurge {
+                        name: v.get("--name").cloned().ok_or(USAGE)?,
+                        force: flags.contains("--force"),
+                        yes: flags.contains("--yes"),
+                        json: flags.contains("--json"),
+                    })
+                }
+                "restore" => {
+                    let (v, flags) = parse_flags(rest, &["--name"], &["--json"])?;
+                    Ok(CmkCommand::TrashRestore {
+                        name: v.get("--name").cloned().ok_or(USAGE)?,
+                        json: flags.contains("--json"),
+                    })
+                }
+                _ => Err(USAGE),
+            }
         }
         _ => Err(USAGE),
     }
@@ -725,7 +855,8 @@ pub async fn run(
         | Command::RaftExport { .. }
         | Command::RaftCutover { .. }
         | Command::RaftForceRecover { .. }
-        | Command::SyncReconcile { .. } => {
+        | Command::SyncReconcile { .. }
+        | Command::Cmk(_) => {
             Err("内部错误：离线命令不得走 AppState::run（应走 run_offline）".into())
         }
     }
@@ -791,6 +922,7 @@ pub async fn run_offline(
             bucket,
             json,
         } => sync_reconcile_cmd(cfg_path, repair, bucket, json).await,
+        Command::Cmk(cmd) => cmk_cmd(cfg_path, cmd).await,
         other => Err(format!("{other:?} 不是离线命令（内部接线错误）").into()),
     }
 }
@@ -1024,34 +1156,8 @@ async fn sync_reconcile_cmd(
     // 离线：绝不 AppState::load（会二次打开 raft.db 并启动运行时/启动对账）。
     let cfg = crate::config::AppConfig::load(cfg_path)?;
     let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
-    let drives = cfg
-        .data_dirs
-        .clone()
-        .unwrap_or_else(|| vec![cfg.data_dir.clone()]);
-    let mut sc = xl_store::store::StoreConfig::new(&drives[0]);
-    sc.drives = drives;
-    sc.ec = xl_store::store::ec::EcConfig {
-        data: cfg.ec.data,
-        parity: cfg.ec.parity,
-        enabled: cfg.ec.enabled,
-    };
-    sc.inline_threshold = cfg.ec.inline_threshold;
-    sc.sync_max_bytes = cfg.sync.max_object_bytes;
-    // sync-reconcile 是运维修数据路径：不注入写门（只读对象 + 定点映射写）。
-    sc.gate = None;
-    let store = xl_store::store::Store::open(sc).await?;
-    let master_file = std::env::var("OSS_MASTER_KEY_FILE")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let kms_dir = std::env::var("OSS_KMS_DIR").ok().filter(|s| !s.is_empty());
-    if master_file.is_some() || kms_dir.is_some() {
-        store
-            .init_encryption(
-                master_file.map(std::path::PathBuf::from),
-                kms_dir.map(std::path::PathBuf::from),
-            )
-            .await?;
-    }
+    // sync-reconcile 是运维修数据路径：open_local_store 不注入写门/集群拓扑。
+    let store = open_local_store(&cfg).await?;
     let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
     let tls = crate::tls::Tls::load(&cfg.tls)?;
     let report = crate::raft::repair::run_tls(
@@ -1083,6 +1189,280 @@ async fn sync_reconcile_cmd(
         }
     }
     Ok(if report.has_errors() { 1 } else { 0 })
+}
+
+/// 离线命令共用的本地 store 装配（盘/EC/加密参数与 `AppState::load` 同源；不注入写门/拓扑）。
+/// `cluster_deployment` 只保留集群安全口径：离线无拓扑，rewrap 会直接拒绝。
+async fn open_local_store(
+    cfg: &crate::config::AppConfig,
+) -> Result<Arc<xl_store::store::Store>, Box<dyn std::error::Error + Send + Sync>> {
+    let drives = cfg
+        .data_dirs
+        .clone()
+        .unwrap_or_else(|| vec![cfg.data_dir.clone()]);
+    let mut sc = xl_store::store::StoreConfig::new(&drives[0]);
+    sc.drives = drives;
+    sc.ec = xl_store::store::ec::EcConfig {
+        data: cfg.ec.data,
+        parity: cfg.ec.parity,
+        enabled: cfg.ec.enabled,
+    };
+    sc.inline_threshold = cfg.ec.inline_threshold;
+    sc.sync_max_bytes = cfg.sync.max_object_bytes;
+    sc.gate = None;
+    sc.cluster_deployment = cfg.cluster.is_some() || cfg.stretch.is_some();
+    let store = xl_store::store::Store::open(sc).await?;
+    let master_file = std::env::var("OSS_MASTER_KEY_FILE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let kms_dir = std::env::var("OSS_KMS_DIR").ok().filter(|s| !s.is_empty());
+    if master_file.is_some() || kms_dir.is_some() {
+        store
+            .init_encryption(
+                master_file.map(std::path::PathBuf::from),
+                kms_dir.map(std::path::PathBuf::from),
+            )
+            .await?;
+    }
+    Ok(Arc::new(store))
+}
+
+/// `cmk` 离线子命令。只读本机盘 + 本机 KMS 目录 + 本机库副本（桶默认加密）；
+/// 集群部署请逐节点各跑一次——命令不做跨节点汇总，也不假装是全局扫描。
+async fn cmk_cmd(
+    cfg_path: &std::path::Path,
+    cmd: CmkCommand,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let cfg = crate::config::AppConfig::load(cfg_path)?;
+    let cluster = cfg.cluster.is_some() || cfg.stretch.is_some();
+    let store = open_local_store(&cfg).await?;
+    // 桶默认加密在控制面库：仅引用守卫类子命令才离线只读打开（不重放 schema/不切 raft 模式）。
+    let db = if matches!(
+        &cmd,
+        CmkCommand::Scan { .. } | CmkCommand::Delete { .. } | CmkCommand::TrashPurge { .. }
+    ) {
+        Some(crate::db::Db::connect_offline(&cfg.database_url).await?)
+    } else {
+        None
+    };
+    let cfg_refs = db
+        .as_ref()
+        .map(|d| d as &dyn xl_store::store::CmkConfigRefs);
+    match cmd {
+        CmkCommand::Scan { name, json } => {
+            let name = xl_store::kms::parse_cmk_id(&name)?;
+            let scan = store.cmk_references(name, cfg_refs).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&scan)?);
+            } else {
+                println!(
+                    "cmk scan: {name} / 对象版本引用 {} / 桶默认加密引用 {}",
+                    scan.references,
+                    scan.bucket_defaults.len()
+                );
+                for r in &scan.refs {
+                    println!(
+                        "  {}:{}@{} key_id={} size={}",
+                        r.bucket, r.key, r.version_id, r.key_id, r.size
+                    );
+                }
+                for b in &scan.bucket_defaults {
+                    println!("  bucket-default {}: {}", b.bucket, b.setting);
+                }
+                if scan.refs_truncated {
+                    println!("  （对象引用超过报告上限，未全部列出；总数见 references）");
+                }
+                if cluster {
+                    println!(
+                        "  注意：集群部署——本命令只覆盖本机盘与本机库副本；请对每个节点各执行一次，结果需自行汇总"
+                    );
+                }
+            }
+            Ok(0)
+        }
+        CmkCommand::Rewrap {
+            name,
+            apply,
+            limit,
+            cursor,
+            bucket,
+            json,
+        } => {
+            let name = xl_store::kms::parse_cmk_id(&name)?;
+            let report = store
+                .clone()
+                .rewrap_cmk(
+                    name,
+                    &xl_store::store::RewrapOptions {
+                        apply,
+                        limit,
+                        cursor,
+                        bucket,
+                    },
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "cmk rewrap{}: {} 当前版本 k{} / 候选 {} / rewrapped {} / skipped {} / blocked {} / failed {}",
+                    if apply {
+                        "（apply）"
+                    } else {
+                        "（dry-run）"
+                    },
+                    name,
+                    report.current_version,
+                    report.candidates,
+                    report.rewrapped,
+                    report.skipped,
+                    report.blocked,
+                    report.failed
+                );
+                for i in &report.items {
+                    match i.status.as_str() {
+                        "rewrapped" | "preview" => println!(
+                            "  {} {}:{}@{} {} -> {} size={}",
+                            i.status,
+                            i.bucket,
+                            i.key,
+                            i.version_id,
+                            i.old_key_id,
+                            i.new_key_id.clone().unwrap_or_else(|| format!(
+                                "cmk:{}:k{}",
+                                report.cmk, report.current_version
+                            )),
+                            i.size
+                        ),
+                        _ => println!(
+                            "  {} {}:{}@{} {}: {}",
+                            i.status,
+                            i.bucket,
+                            i.key,
+                            i.version_id,
+                            i.old_key_id,
+                            i.error.as_deref().unwrap_or("-")
+                        ),
+                    }
+                }
+                if let Some(c) = &report.next_cursor {
+                    println!("  next_cursor: {c}（续页）");
+                }
+                if cluster {
+                    println!("  注意：集群部署请逐节点执行；本命令不做跨节点汇总");
+                }
+            }
+            // 逐版本失败不中断批次：有失败即非零，便于 cron/监控发现。
+            Ok(if report.failed > 0 { 1 } else { 0 })
+        }
+        CmkCommand::Delete {
+            name,
+            force,
+            yes,
+            json,
+        } => {
+            if !yes {
+                return Err(
+                    "cmk delete 是破坏性操作：需 --yes 确认（建议先跑 cmk scan / 逐节点核对）"
+                        .into(),
+                );
+            }
+            let name = xl_store::kms::parse_cmk_id(&name)?;
+            let report = store.delete_cmk(name, force, cfg_refs).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "cmk delete: {} versions={:?} deleted={} purged={} 对象引用={} 桶默认引用={}",
+                    report.name,
+                    report.versions,
+                    report.deleted,
+                    report.purged,
+                    report.references,
+                    report.bucket_defaults.len()
+                );
+                for r in &report.refs {
+                    println!(
+                        "  ref {}:{}@{} key_id={}",
+                        r.bucket, r.key, r.version_id, r.key_id
+                    );
+                }
+                for b in &report.bucket_defaults {
+                    println!("  bucket-default {}: {}", b.bucket, b.setting);
+                }
+                if let Some(reason) = &report.reason {
+                    println!("  未删除：reason={reason}");
+                }
+                if let Some(w) = &report.warning {
+                    println!("  注意：{w}");
+                }
+                if cluster {
+                    println!("  注意：集群部署——本命令只覆盖本机；删除需 --force 确认全站离线");
+                }
+            }
+            Ok(if report.deleted { 0 } else { 1 })
+        }
+        CmkCommand::TrashList { json } => {
+            let entries = store.cmk_trash_list()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("cmk trash: 无残留");
+            } else {
+                println!("cmk trash: {} 条残留", entries.len());
+                for e in &entries {
+                    println!("  {} id={} versions={:?}", e.name, e.id, e.versions);
+                }
+            }
+            Ok(0)
+        }
+        CmkCommand::TrashPurge {
+            name,
+            force,
+            yes,
+            json,
+        } => {
+            if !yes {
+                return Err(
+                    "cmk trash purge 是破坏性操作：需 --yes 确认（建议先跑 cmk scan）".into(),
+                );
+            }
+            let name = xl_store::kms::parse_cmk_id(&name)?;
+            let report = store.cmk_trash_purge(name, force, cfg_refs).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "cmk trash purge: {} deleted={} purged={} 对象引用={} 桶默认引用={}",
+                    report.name,
+                    report.deleted,
+                    report.purged.len(),
+                    report.references,
+                    report.bucket_defaults.len()
+                );
+                for e in &report.purged {
+                    println!("  purged {} id={} versions={:?}", e.name, e.id, e.versions);
+                }
+                if let Some(reason) = &report.reason {
+                    println!("  未清理：reason={reason}");
+                }
+            }
+            Ok(if report.deleted { 0 } else { 1 })
+        }
+        CmkCommand::TrashRestore { name, json } => {
+            let name = xl_store::kms::parse_cmk_id(&name)?;
+            let e = store.cmk_trash_restore(name).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&e)?);
+            } else {
+                println!(
+                    "cmk trash restore: {} id={} versions={:?}（已移回活动命名空间）",
+                    e.name, e.id, e.versions
+                );
+            }
+            Ok(0)
+        }
+    }
 }
 
 /// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；
@@ -1230,6 +1610,97 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_reads_cmk_commands() {
+        assert_eq!(
+            parse_args(&args(&["cmk", "scan", "--name", "tenant-a"])),
+            Ok(Command::Cmk(CmkCommand::Scan {
+                name: "tenant-a".into(),
+                json: false,
+            }))
+        );
+        // rewrap 默认 dry-run、默认单页 100；显式 --apply 才写
+        assert_eq!(
+            parse_args(&args(&["cmk", "rewrap", "--name=tenant-a"])),
+            Ok(Command::Cmk(CmkCommand::Rewrap {
+                name: "tenant-a".into(),
+                apply: false,
+                limit: DEFAULT_REWRAP_LIMIT,
+                cursor: None,
+                bucket: None,
+                json: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cmk", "rewrap", "--name", "tenant-a", "--apply", "--limit", "7", "--cursor", "c",
+                "--bucket", "b", "--json",
+            ])),
+            Ok(Command::Cmk(CmkCommand::Rewrap {
+                name: "tenant-a".into(),
+                apply: true,
+                limit: 7,
+                cursor: Some("c".into()),
+                bucket: Some("b".into()),
+                json: true,
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cmk", "delete", "--name", "tenant-a", "--force", "--yes"
+            ])),
+            Ok(Command::Cmk(CmkCommand::Delete {
+                name: "tenant-a".into(),
+                force: true,
+                yes: true,
+                json: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["cmk", "trash", "list", "--json"])),
+            Ok(Command::Cmk(CmkCommand::TrashList { json: true }))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cmk", "trash", "purge", "--name", "tenant-a", "--force", "--yes",
+            ])),
+            Ok(Command::Cmk(CmkCommand::TrashPurge {
+                name: "tenant-a".into(),
+                force: true,
+                yes: true,
+                json: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["cmk", "trash", "restore", "--name", "tenant-a"])),
+            Ok(Command::Cmk(CmkCommand::TrashRestore {
+                name: "tenant-a".into(),
+                json: false,
+            }))
+        );
+        // --yes 只入参：执行阶段才拒绝（这里的解析必须成功）
+        assert!(matches!(
+            parse_args(&args(&["cmk", "delete", "--name", "tenant-a"])),
+            Ok(Command::Cmk(CmkCommand::Delete { yes: false, .. }))
+        ));
+        for bad in [
+            &["cmk"][..],
+            &["cmk", "frobnicate"][..],
+            &["cmk", "scan"][..],                     // 缺 --name
+            &["cmk", "scan", "--name"][..],           // 缺值
+            &["cmk", "scan", "--name", "a", "x"][..], // 多余参数
+            &["cmk", "rewrap", "--name", "a", "--limit", "x"][..],
+            &["cmk", "rewrap", "--name", "a", "--apply=1"][..], // 布尔不收值
+            &["cmk", "delete", "--name", "a", "--go"][..],
+            &["cmk", "trash"][..],
+            &["cmk", "trash", "frobnicate"][..],
+            &["cmk", "trash", "purge"][..], // 缺 --name
+            &["cmk", "trash", "restore", "--name", "a", "--force"][..],
+        ] {
+            assert_eq!(parse_args(&args(bad)), Err(USAGE), "应拒绝: {bad:?}");
+        }
+    }
+
+    #[test]
     fn split_config_extracts_exactly_one() {
         use std::path::PathBuf;
         let (p, rest) = split_config(&args(&["witness"])).unwrap();
@@ -1293,6 +1764,11 @@ mod tests {
                 bucket: None,
                 json: false,
             },
+            Command::Cmk(CmkCommand::Scan {
+                name: "a".into(),
+                json: false,
+            }),
+            Command::Cmk(CmkCommand::TrashList { json: false }),
         ] {
             assert!(!needs_full_state(&cmd), "{cmd:?}");
         }

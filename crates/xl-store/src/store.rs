@@ -33,8 +33,8 @@ mod tier;
 mod uploads;
 mod version;
 pub use cmk_rewrap::{
-    CmkDeleteReport, CmkRef, CmkRefScan, REFS_REPORT_CAP, REWRAP_MAX_BATCH, RewrapItem,
-    RewrapOptions, RewrapReport,
+    CmkBucketRef, CmkConfigRefs, CmkDeleteReport, CmkRef, CmkRefScan, CmkTrashPurgeReport,
+    REFS_REPORT_CAP, REWRAP_MAX_BATCH, RewrapItem, RewrapOptions, RewrapReport,
 };
 pub use rebalance::RebalanceReport;
 pub use tier::ArchiveSpec;
@@ -95,6 +95,9 @@ pub struct StoreConfig {
     pub sync_max_bytes: u64,
     /// M9：sync tee 明文暂存目录（None = `<root>/.oss.sys/tee`）。
     pub tee_dir: Option<PathBuf>,
+    /// 离线运维（cmk CLI）：部署带 `[cluster]`/`[stretch]`，但离线命令不装配拓扑/传输。
+    /// 仅保留集群安全口径（本机缺桶容忍、删除要求 force、rewrap 直接拒绝）；在线路径为 false。
+    pub cluster_deployment: bool,
 }
 
 impl StoreConfig {
@@ -112,6 +115,7 @@ impl StoreConfig {
             gate: None,
             sync_max_bytes: 64 * 1024 * 1024,
             tee_dir: None,
+            cluster_deployment: false,
         }
     }
 

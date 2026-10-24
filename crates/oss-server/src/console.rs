@@ -650,7 +650,12 @@ async fn delete_cmk(
     let fp = kms
         .cmk_fingerprint(name)
         .unwrap_or_else(|_| "-".to_string());
-    match state.store.delete_cmk(name, q.force).await {
+    // 桶默认加密也是引用：删除前/隔离后都要经同一 DB 源复扫（见 CmkConfigRefs）。
+    match state
+        .store
+        .delete_cmk(name, q.force, Some(&*state.db))
+        .await
+    {
         Ok(report) => {
             state
                 .audit(
@@ -663,10 +668,11 @@ async fn delete_cmk(
                     None,
                     None,
                     Some(&format!(
-                        "cmk={name} versions={:?} force={} refs={} purged={} reason={} fp={fp}",
+                        "cmk={name} versions={:?} force={} refs={} bucket_defaults={} purged={} reason={} fp={fp}",
                         report.versions,
                         report.force,
                         report.references,
+                        report.bucket_defaults.len(),
                         report.purged,
                         report.reason.as_deref().unwrap_or("-"),
                     )),

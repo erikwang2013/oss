@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead as _, OsRng};
 use aes_gcm::{AeadCore as _, Aes256Gcm, KeyInit as _};
+use serde::Serialize;
 
 use crate::error::{Error, Result};
 
@@ -318,6 +319,24 @@ impl CmkQuarantine {
     }
 }
 
+/// `.cmk-trash` 残留条目（删除中断/清理失败的隔离目录；**绝不含钥字节**）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CmkTrashEntry {
+    pub name: String,
+    /// 隔离实例 id（目录名后缀 UUID；同名多次隔离时供人工区分）。
+    pub id: String,
+    /// 隔离时的版本（升序）。
+    pub versions: Vec<u32>,
+}
+
+/// `<name>.<uuid>`：名白名单不含 '.'，故 rsplit 无歧义；不合规 → None（调用方 fail-closed）。
+fn parse_trash_name(s: &str) -> Option<(String, String)> {
+    let (name, id) = s.rsplit_once('.')?;
+    validate_cmk_name(name).ok()?;
+    uuid::Uuid::parse_str(id).ok()?;
+    Some((name.to_string(), id.to_string()))
+}
+
 /// 列出目录内全部规范 key 版本（空目录 → 空表）。
 fn list_key_versions(dir: &Path) -> Result<Vec<u32>> {
     let mut out = Vec::new();
@@ -565,6 +584,93 @@ impl KmsFileProvider {
                 Ok(false)
             }
         }
+    }
+
+    /// `.cmk-trash` 全部残留（按名/隔离 id 排序；无残骸 = 空表）。
+    /// 目录名不合规 → 拒（fail-closed：不把未知残骸当成「无残留」，也不静默跳过）。
+    pub fn list_trash(&self) -> Result<Vec<CmkTrashEntry>> {
+        let root = self.trash_root();
+        let rd = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in rd {
+            let entry = entry?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            let Some((name, id)) = parse_trash_name(&fname) else {
+                return Err(Error::Crypto(format!(
+                    "KMS 隔离目录名非法：{fname:?}（{}）——需人工处置",
+                    root.display()
+                )));
+            };
+            if !entry.file_type()?.is_dir() {
+                return Err(Error::Crypto(format!(
+                    "KMS 隔离项 {fname:?} 不是目录——需人工处置"
+                )));
+            }
+            let versions = list_key_versions(&root.join(&fname))?;
+            out.push(CmkTrashEntry { name, id, versions });
+        }
+        out.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+        Ok(out)
+    }
+
+    /// 清理指定 CMK 的全部隔离残骸（删除中断后的重试路径）。返回实际删除的条目；
+    /// 空表 = 没有残留。钥材料就此永久消失——调用方必须先完成引用扫描。
+    pub async fn purge_trash(&self, name: &str) -> Result<Vec<CmkTrashEntry>> {
+        validate_cmk_name(name)?;
+        let entries: Vec<CmkTrashEntry> = self
+            .list_trash()?
+            .into_iter()
+            .filter(|e| e.name == name)
+            .collect();
+        for e in &entries {
+            let path = self.trash_root().join(format!("{}.{}", e.name, e.id));
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// 安全恢复：把指定 CMK 的**唯一**隔离残骸原样移回活动命名空间
+    /// （[`Self::restore_cmk`] 的「活动目录已存在 → 拒绝合并」闸门照旧）。
+    /// 无残骸/多条残留/无合规钥 → 拒绝（需人工处置），绝不猜测目标。
+    pub async fn restore_trash(&self, name: &str) -> Result<CmkTrashEntry> {
+        validate_cmk_name(name)?;
+        let mut entries: Vec<CmkTrashEntry> = self
+            .list_trash()?
+            .into_iter()
+            .filter(|e| e.name == name)
+            .collect();
+        if entries.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "KMS CMK {name:?} 没有 .cmk-trash 残留"
+            )));
+        }
+        if entries.len() > 1 {
+            return Err(Error::Crypto(format!(
+                "KMS CMK {name:?} 有 {} 条隔离残留——恢复目标不唯一，需人工处置",
+                entries.len()
+            )));
+        }
+        let e = entries.pop().expect("len == 1");
+        if e.versions.is_empty() {
+            return Err(Error::Crypto(format!(
+                "KMS CMK {name:?} 的隔离目录无合规钥文件——拒绝恢复"
+            )));
+        }
+        let q = CmkQuarantine {
+            name: e.name.clone(),
+            versions: e.versions.clone(),
+            path: self.trash_root().join(format!("{}.{}", e.name, e.id)),
+        };
+        self.restore_cmk(&q).await?;
+        Ok(e)
     }
 
     /// 全部命名 CMK 快照（名/当前版本/版本表/mtime；无 `cmk/` = 空表）。
@@ -1427,6 +1533,70 @@ mod tests {
         let qb = p.quarantine_cmk("tenant-b").await.unwrap();
         std::fs::create_dir_all(dir.join("cmk/tenant-b")).unwrap();
         assert!(matches!(p.restore_cmk(&qb).await, Err(Error::Crypto(_))));
+    }
+
+    /// `.cmk-trash` 清理/恢复：按名清理、恢复目标必须唯一且有钥；非法目录名 fail-closed。
+    #[tokio::test]
+    async fn cmk_trash_list_restore_and_purge() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("kms");
+        let p = KmsFileProvider::open_or_init(&dir).await.unwrap();
+        p.create_cmk("tenant-a").await.unwrap();
+        p.create_cmk("tenant-b").await.unwrap();
+        let trash_root = dir.join(".cmk-trash");
+        // 无残骸：空表；purge 返回空；restore 拒绝（不猜测目标）
+        assert!(p.list_trash().unwrap().is_empty());
+        assert!(p.purge_trash("tenant-a").await.unwrap().is_empty());
+        assert!(matches!(
+            p.restore_trash("tenant-a").await,
+            Err(Error::InvalidArgument(_))
+        ));
+        // 两个不同名的隔离残骸（同名重建在隔离期被禁止）
+        p.quarantine_cmk("tenant-a").await.unwrap();
+        p.quarantine_cmk("tenant-b").await.unwrap();
+        let list = p.list_trash().unwrap();
+        assert_eq!(
+            list.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["tenant-a", "tenant-b"]
+        );
+        assert_eq!(list[0].versions, vec![0]);
+        // 恢复唯一残骸：原样回活动命名空间，条目从 trash 消失
+        let e = p.restore_trash("tenant-a").await.unwrap();
+        assert_eq!(e.name, "tenant-a");
+        assert_eq!(e.versions, vec![0]);
+        assert!(p.list_cmks().unwrap().iter().any(|c| c.name == "tenant-a"));
+        assert_eq!(p.list_trash().unwrap().len(), 1);
+        // 恢复目标不唯一（同名第二条残骸）→ 拒；须人工处置
+        let b = p.list_trash().unwrap().remove(0);
+        let src = trash_root.join(format!("{}.{}", b.name, b.id));
+        let dup = trash_root.join(format!("tenant-b.{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dup).unwrap();
+        std::fs::copy(src.join("key-0.bin"), dup.join("key-0.bin")).unwrap();
+        assert!(matches!(
+            p.restore_trash("tenant-b").await,
+            Err(Error::Crypto(_))
+        ));
+        // purge 只清指定名：tenant-b 的两条残骸全部移除
+        let purged = p.purge_trash("tenant-b").await.unwrap();
+        assert_eq!(purged.len(), 2);
+        assert!(p.list_trash().unwrap().is_empty());
+        // 有目录但无合规钥 → restore 拒绝（不把空目录当可用 CMK）
+        std::fs::create_dir_all(trash_root.join(format!("empty.{}", uuid::Uuid::new_v4())))
+            .unwrap();
+        assert!(matches!(
+            p.restore_trash("empty").await,
+            Err(Error::Crypto(_))
+        ));
+        // 非规范项/非目录 → list fail-closed（不当成「无残留」静默跳过）
+        std::fs::write(trash_root.join("junk"), b"x").unwrap();
+        assert!(matches!(p.list_trash(), Err(Error::Crypto(_))));
+        std::fs::remove_file(trash_root.join("junk")).unwrap();
+        std::fs::write(
+            trash_root.join(format!("tenant-a.{}", uuid::Uuid::new_v4())),
+            b"x",
+        )
+        .unwrap();
+        assert!(matches!(p.list_trash(), Err(Error::Crypto(_))));
     }
 
     /// `cmk/` 根：异名/空目录/非目录项/权限过宽 → 拒启（读路径不修不建）。

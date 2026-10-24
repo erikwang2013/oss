@@ -6,11 +6,15 @@
 //! 元数据、version_id、mod_time 全保留；旧目录在提交点后进 trash。
 //!
 //! 安全边界（写进契约，勿静默放宽）：
-//! - 引用扫描只覆盖**本机盘**（`collect_keys`）；集群面必须逐节点执行，删除在集群下额外要求
-//!   `force`（离线确认），因本机 writer 屏障无法静默对端在途写。
+//! - 引用扫描只覆盖**本机盘**（`collect_keys`）与本机/离线可见的桶默认加密配置；集群面必须
+//!   逐节点执行，删除在集群下额外要求 `force`（离线确认），因本机 writer 屏障无法静默对端
+//!   在途写。**这不是全局分布式扫描**：CLI 不汇总各节点结果，操作员须自行逐节点执行并核对。
+//! - 桶默认加密同样算引用：删除后若新写入仍会套用该 CMK，会立刻产生不可解对象（strand）。
+//!   配置引用由调用方经 [`CmkConfigRefs`] 注入（xl-store 不依赖 SQL）；隔离后复扫关闭竞态。
 //! - 逐版本失败不中断批次（原数据不动，可重跑）；扫描/meta 读取错误 → 整批 fail-closed。
-//! - 删除 = 引用扫描（有引用即拒）→ 原子隔离（此后新 wrap 失败）→ 等本机写者归零 →
-//!   复扫（竞态出现引用则恢复）→ 清理。任一步失败都不会留下「钥没了但引用还在」的静默态。
+//! - 删除 = 引用扫描（对象版本 + 桶默认，有引用即拒）→ 原子隔离（此后新 wrap 失败）→
+//!   等本机写者归零 → 复扫（竞态出现引用则恢复）→ 清理。任一步失败都不会留下
+//!   「钥没了但引用还在」的静默态。删除中断的残骸用 `cmk trash list/restore/purge` 处置。
 //! - 旧版本保持 decrypt-only：本模块绝不删除/改写任何 key 文件（删除走隔离销毁）。
 //! - 审计只记名/版本/数量，绝不记钥字节。
 
@@ -48,6 +52,21 @@ pub struct CmkRef {
     pub size: u64,
 }
 
+/// 桶默认加密配置对 CMK 的引用（非对象版本；`setting` 为库内存储值，如
+/// `aws:kms:tenant-a` 或 `aws:kms:arn:...`，不含秘密）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CmkBucketRef {
+    pub bucket: String,
+    pub setting: String,
+}
+
+/// 删除/扫描的**外部配置引用源**（oss-server 的 `buckets.default_encryption`）。
+/// 在线控制台与离线 CLI 注入同一实现；扫描失败必须上抛（删除 guard fail-closed）。
+#[async_trait::async_trait]
+pub trait CmkConfigRefs: Send + Sync {
+    async fn cmk_config_refs(&self, cmk: &str) -> Result<Vec<CmkBucketRef>>;
+}
+
 /// 引用扫描结果（管理员只读面）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CmkRefScan {
@@ -55,6 +74,8 @@ pub struct CmkRefScan {
     pub references: usize,
     pub refs: Vec<CmkRef>,
     pub refs_truncated: bool,
+    /// 把该 CMK 设为桶默认加密的桶（离线 CLI 用本机库副本填充；空 = 无配置引用）。
+    pub bucket_defaults: Vec<CmkBucketRef>,
 }
 
 /// 删除结果。`deleted=false` 是**受控拒绝**（有引用/集群需 force/写者未归零/复扫竞态），
@@ -70,10 +91,26 @@ pub struct CmkDeleteReport {
     pub references: usize,
     pub refs: Vec<CmkRef>,
     pub refs_truncated: bool,
+    /// 把该 CMK 设为桶默认加密的桶（同样阻止删除——否则新写入会被 strand）。
+    pub bucket_defaults: Vec<CmkBucketRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+
+/// `.cmk-trash` 清理结果。`deleted=false` 是受控拒绝（引用未清/集群需 force/无残骸）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CmkTrashPurgeReport {
+    pub name: String,
+    pub purged: Vec<kms::CmkTrashEntry>,
+    pub deleted: bool,
+    pub references: usize,
+    pub refs: Vec<CmkRef>,
+    pub refs_truncated: bool,
+    pub bucket_defaults: Vec<CmkBucketRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// rewrap 参数。`apply=false` = 只读预览（默认安全态）。
@@ -235,10 +272,16 @@ impl Store {
     }
 
     /// 本机全量引用扫描（删除守卫）。任何 meta 读取错误都上抛（fail-closed）。
-    pub async fn cmk_references(&self, cmk: &str) -> Result<CmkRefScan> {
+    /// `config` 生产调用方必须传入（桶默认加密引用）；None 仅供无 SQL 面的 store 测试。
+    pub async fn cmk_references(
+        &self,
+        cmk: &str,
+        config: Option<&dyn CmkConfigRefs>,
+    ) -> Result<CmkRefScan> {
         let kms = self.cmk_provider()?;
         kms.ensure_cmk(cmk)?; // 未知名 → InvalidArgument(400)，不静默空表
         let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+        let bucket_defaults = self.scan_config_refs(cmk, config).await?;
         let refs: Vec<CmkRef> = scan.candidates.into_iter().map(|c| c.r).collect();
         let refs_truncated = scan.matched > refs.len();
         Ok(CmkRefScan {
@@ -246,11 +289,34 @@ impl Store {
             references: scan.matched,
             refs,
             refs_truncated,
+            bucket_defaults,
         })
     }
 
+    /// 集群安全口径：在线 = 有拓扑；离线 CLI = 仅标记部署形态（无拓扑/传输）。
+    fn cluster_mode(&self) -> bool {
+        self.cfg.cluster.is_some() || self.cfg.cluster_deployment
+    }
+
+    async fn scan_config_refs(
+        &self,
+        cmk: &str,
+        config: Option<&dyn CmkConfigRefs>,
+    ) -> Result<Vec<CmkBucketRef>> {
+        match config {
+            Some(c) => c.cmk_config_refs(cmk).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// 删除命名 CMK（管理员/离线）。流程见模块头注；返回受控拒绝而非 Err。
-    pub async fn delete_cmk(&self, cmk: &str, force: bool) -> Result<CmkDeleteReport> {
+    /// `config` 生产调用方必须传入（桶默认加密引用）；None 仅供无 SQL 面的 store 测试。
+    pub async fn delete_cmk(
+        &self,
+        cmk: &str,
+        force: bool,
+        config: Option<&dyn CmkConfigRefs>,
+    ) -> Result<CmkDeleteReport> {
         let kms = self.cmk_provider()?;
         let versions = kms
             .list_cmks()?
@@ -258,36 +324,61 @@ impl Store {
             .find(|c| c.name == cmk)
             .map(|c| c.versions)
             .ok_or_else(|| Error::InvalidArgument(format!("KMS CMK {cmk:?} 不存在")))?;
-        let base =
-            |deleted: bool, purged: bool, scan: &ScanOut, reason: Option<&str>| CmkDeleteReport {
-                name: cmk.to_string(),
-                versions: versions.clone(),
-                force,
-                deleted,
-                purged,
-                references: scan.matched,
-                refs: scan.candidates.iter().map(|c| c.r.clone()).collect(),
-                refs_truncated: scan.matched > scan.candidates.len(),
-                reason: reason.map(str::to_string),
-                warning: None,
-            };
+        let base = |deleted: bool,
+                    purged: bool,
+                    scan: &ScanOut,
+                    cfg_refs: &[CmkBucketRef],
+                    reason: Option<&str>| CmkDeleteReport {
+            name: cmk.to_string(),
+            versions: versions.clone(),
+            force,
+            deleted,
+            purged,
+            references: scan.matched,
+            refs: scan.candidates.iter().map(|c| c.r.clone()).collect(),
+            refs_truncated: scan.matched > scan.candidates.len(),
+            bucket_defaults: cfg_refs.to_vec(),
+            reason: reason.map(str::to_string),
+            warning: None,
+        };
         let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
-        if scan.matched > 0 {
-            return Ok(base(false, false, &scan, Some("references")));
+        let cfg_refs = self.scan_config_refs(cmk, config).await?;
+        if scan.matched > 0 || !cfg_refs.is_empty() {
+            // force 绝不放宽已知引用；桶默认加密同属引用（否则删除后新写入即不可解）。
+            let reason = if scan.matched > 0 {
+                "references"
+            } else {
+                "bucket_default"
+            };
+            return Ok(base(false, false, &scan, &cfg_refs, Some(reason)));
         }
-        if self.cfg.cluster.is_some() && !force {
-            return Ok(base(false, false, &scan, Some("cluster_requires_force")));
+        if self.cluster_mode() && !force {
+            return Ok(base(
+                false,
+                false,
+                &scan,
+                &cfg_refs,
+                Some("cluster_requires_force"),
+            ));
         }
         let q = kms.quarantine_cmk(cmk).await?;
         if !self.wait_writers_idle_all(DELETE_DRAIN_TIMEOUT).await {
             kms.restore_cmk(&q).await?;
-            return Ok(base(false, false, &scan, Some("writers_busy")));
+            return Ok(base(false, false, &scan, &cfg_refs, Some("writers_busy")));
         }
-        match self.scan_cmk_refs(cmk, None, None, None, None).await {
-            Ok(s) if s.matched == 0 => {}
-            Ok(s) => {
+        // 隔离后复扫：对象版本 + 桶默认。隔离后新的桶默认写入会被 put 路径的
+        // ensure_cmk 拒绝，但窗口内已落库的记录只能在这里看到。
+        let after = async {
+            let s = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+            let c = self.scan_config_refs(cmk, config).await?;
+            Ok::<_, Error>((s, c))
+        }
+        .await;
+        match after {
+            Ok((s, c)) if s.matched == 0 && c.is_empty() => {}
+            Ok((s, c)) => {
                 kms.restore_cmk(&q).await?;
-                return Ok(base(false, false, &s, Some("race_detected")));
+                return Ok(base(false, false, &s, &c, Some("race_detected")));
             }
             Err(e) => {
                 if let Err(re) = kms.restore_cmk(&q).await {
@@ -299,8 +390,8 @@ impl Store {
             }
         }
         let purged = kms.purge_quarantine(&q).await?;
-        let mut report = base(true, purged, &scan, None);
-        if force && self.cfg.cluster.is_some() {
+        let mut report = base(true, purged, &scan, &cfg_refs, None);
+        if force && self.cluster_mode() {
             report.warning = Some(
                 "force 仅跳过本机引用/写者屏障的集群限制：对端节点可能仍引用该 CMK（共享 KMS 目录时）——仅在确认全站离线后使用"
                     .into(),
@@ -314,6 +405,71 @@ impl Store {
         Ok(report)
     }
 
+    /// `.cmk-trash` 残留清单（本机 KMS 目录；无钥字节）。
+    pub fn cmk_trash_list(&self) -> Result<Vec<kms::CmkTrashEntry>> {
+        self.cmk_provider()?.list_trash()
+    }
+
+    /// `.cmk-trash` 清理（删除中断/清理失败后的重试）：对象与桶默认引用都为空才永久销毁。
+    /// 与 `delete_cmk` 同口径——`force` 只放宽集群本机屏障，绝不放宽已知引用。
+    pub async fn cmk_trash_purge(
+        &self,
+        cmk: &str,
+        force: bool,
+        config: Option<&dyn CmkConfigRefs>,
+    ) -> Result<CmkTrashPurgeReport> {
+        let kms = self.cmk_provider()?;
+        let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+        let cfg_refs = self.scan_config_refs(cmk, config).await?;
+        let report = |deleted: bool,
+                      purged: Vec<kms::CmkTrashEntry>,
+                      scan: &ScanOut,
+                      cfg_refs: &[CmkBucketRef],
+                      reason: Option<&str>| CmkTrashPurgeReport {
+            name: cmk.to_string(),
+            purged,
+            deleted,
+            references: scan.matched,
+            refs: scan.candidates.iter().map(|c| c.r.clone()).collect(),
+            refs_truncated: scan.matched > scan.candidates.len(),
+            bucket_defaults: cfg_refs.to_vec(),
+            reason: reason.map(str::to_string),
+        };
+        if scan.matched > 0 || !cfg_refs.is_empty() {
+            let reason = if scan.matched > 0 {
+                "references"
+            } else {
+                "bucket_default"
+            };
+            return Ok(report(false, Vec::new(), &scan, &cfg_refs, Some(reason)));
+        }
+        if self.cluster_mode() && !force {
+            return Ok(report(
+                false,
+                Vec::new(),
+                &scan,
+                &cfg_refs,
+                Some("cluster_requires_force"),
+            ));
+        }
+        let purged = kms.purge_trash(cmk).await?;
+        if purged.is_empty() {
+            return Ok(report(
+                false,
+                purged,
+                &scan,
+                &cfg_refs,
+                Some("no_quarantine"),
+            ));
+        }
+        Ok(report(true, purged, &scan, &cfg_refs, None))
+    }
+
+    /// `.cmk-trash` 安全恢复（purge 的安全方向；活动 CMK 已存在 → 拒绝合并）。
+    pub async fn cmk_trash_restore(&self, cmk: &str) -> Result<kms::CmkTrashEntry> {
+        self.cmk_provider()?.restore_trash(cmk).await
+    }
+
     /// re-wrap：把 `cmk` 旧版本加密的版本重加密到当前版本（逐版本原子提交）。
     pub async fn rewrap_cmk(
         self: Arc<Self>,
@@ -322,6 +478,14 @@ impl Store {
     ) -> Result<RewrapReport> {
         if !self.cfg.ec.enabled {
             return Err(Error::Encode("rewrap 需要 ec.enabled（加密数据面）".into()));
+        }
+        if self.cfg.cluster_deployment {
+            // 离线 store 没有集群拓扑/传输：分片放置会按单机口径算，写出的新版本可能
+            // 落到错误槽位。集群部署请走在线控制台（transport 在位）。
+            return Err(Error::Unsupported(
+                "离线 rewrap 不支持集群部署（[cluster]/[stretch]）：分片放置需在线拓扑；请在服务在线时经控制台执行"
+                    .into(),
+            ));
         }
         if opts.limit == 0 || opts.limit > REWRAP_MAX_BATCH {
             return Err(Error::InvalidArgument(format!(
@@ -430,8 +594,8 @@ impl Store {
             let same_bucket = cursor.is_some_and(|c| b == c.bucket);
             let mut keys = match self.collect_keys(&b).await {
                 Ok(k) => k,
-                // 集群：本机无该桶目录（远端独有桶）→ 本机无对象可扫
-                Err(Error::NoSuchBucket(_)) if self.cfg.cluster.is_some() => continue,
+                // 集群（在线或离线标记）：本机无该桶目录（远端独有桶）→ 本机无对象可扫
+                Err(Error::NoSuchBucket(_)) if self.cluster_mode() => continue,
                 Err(e) => return Err(e),
             };
             keys.sort();
