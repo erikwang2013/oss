@@ -895,7 +895,10 @@ impl AppState {
                 .with_control(Arc::clone(&control)),
         );
         let restore_sink: Arc<dyn xl_s3::restore::RestoreSink> =
-            Arc::new(crate::tier_jobs::SqlRestoreSink::new(Arc::clone(&db)));
+            Arc::new(crate::tier_jobs::SqlRestoreSink::new(
+                Arc::clone(&db),
+                crate::raft::LeaderGate::from_raft(raft.clone()),
+            ));
         let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
             Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
         // M8 S5：Inventory 配置存储与执行器（共用三面判权实例语义）。
@@ -909,6 +912,7 @@ impl AppState {
             Arc::clone(&store),
             inv_acl,
             cfg.staging_dir.clone(),
+            crate::raft::LeaderGate::from_raft(raft.clone()),
         ));
         let admin_username = db.schema_meta("admin_username").await.ok().flatten();
         let vault_probe = match &vault {

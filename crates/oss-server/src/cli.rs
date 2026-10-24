@@ -320,6 +320,30 @@ impl crate::jobs::TaskExecutor for ServeTaskExecutor {
             crate::jobs::TaskExecutor::execute(self.tier.as_ref(), action, payload).await
         }
     }
+
+    /// M8-1：把 worker 的 fencing token 传给实际执行器（只有 Inventory/Restore 写单例状态）。
+    async fn execute_fenced(
+        &self,
+        action: &str,
+        payload: &str,
+        fence: crate::raft::FencingEpoch,
+    ) -> Result<String, String> {
+        if action == "Inventory" {
+            crate::jobs::TaskExecutor::execute_fenced(
+                self.inventory.as_ref(),
+                action,
+                payload,
+                fence,
+            )
+            .await
+        } else if action.starts_with("Batch") {
+            crate::jobs::TaskExecutor::execute_fenced(self.batch.as_ref(), action, payload, fence)
+                .await
+        } else {
+            crate::jobs::TaskExecutor::execute_fenced(self.tier.as_ref(), action, payload, fence)
+                .await
+        }
+    }
 }
 
 /// M3/M9：`host:port`（可带 `http://` 前缀）→ 可绑定地址，并做绑定期检（失败即启动失败，

@@ -31,6 +31,7 @@ use xl_store::store::{ByteStream, ListRequest, ObjectInfo, Store, VersioningMode
 
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::jobs::TaskExecutor;
+use crate::raft::{FencingEpoch, LeaderGate};
 
 /// 单数据文件上限（gzip 后仍超过 5 GiB → error）。
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -79,7 +80,7 @@ fn env_secs(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// 建运行行 + kind=inventory 单任务作业（返回 job id；同槽已存在 → None）。
+/// 单节点/M7 入口：不带 fencing token（见 [`enqueue_run_fenced`]）。
 pub async fn enqueue_run(
     db: &Db,
     bucket: &str,
@@ -88,8 +89,30 @@ pub async fn enqueue_run(
     requested_by: Option<i64>,
     now: i64,
 ) -> Result<Option<i64>, String> {
+    enqueue_run_fenced(
+        db,
+        bucket,
+        config_id,
+        run_key,
+        requested_by,
+        now,
+        FencingEpoch::UNFENCED,
+    )
+    .await
+}
+
+/// 建运行行 + kind=inventory 单任务作业（返回 job id；同槽已存在 → None）。
+pub async fn enqueue_run_fenced(
+    db: &Db,
+    bucket: &str,
+    config_id: &str,
+    run_key: &str,
+    requested_by: Option<i64>,
+    now: i64,
+    fence: FencingEpoch,
+) -> Result<Option<i64>, String> {
     let Some(run_id) = db
-        .inventory_create_run(bucket, config_id, run_key, now)
+        .inventory_create_run(bucket, config_id, run_key, now, fence)
         .await
         .map_err(|e| e.to_string())?
     else {
@@ -115,22 +138,27 @@ pub async fn enqueue_run(
     };
     match db.create_job(&spec, now).await {
         Ok(job_id) => {
-            db.inventory_run_set_job(run_id, job_id)
+            db.inventory_run_set_job(run_id, job_id, fence)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Some(job_id))
         }
         Err(e) => {
             let _ = db
-                .inventory_run_finish(run_id, "error", None, Some(&e.to_string()))
+                .inventory_run_finish(run_id, "error", None, Some(&e.to_string()), fence)
                 .await;
             Err(e.to_string())
         }
     }
 }
 
-/// 本轮到期的配置：只建当前槽；已存在（含重复 tick）→ 去重。
+/// 单节点/M7 入口：不带 fencing token（见 [`due_runs_fenced`]）。
 pub async fn due_runs(db: &Db, now: i64) -> Result<usize, String> {
+    due_runs_fenced(db, now, FencingEpoch::UNFENCED).await
+}
+
+/// 本轮到期的配置：只建当前槽；已存在（含重复 tick）→ 去重。
+pub async fn due_runs_fenced(db: &Db, now: i64, fence: FencingEpoch) -> Result<usize, String> {
     let rows = db
         .inventory_list_all_configs()
         .await
@@ -150,7 +178,17 @@ pub async fn due_runs(db: &Db, now: i64) -> Result<usize, String> {
         let Some(run_key) = slot_key(cfg.schedule.frequency.as_str(), now) else {
             continue;
         };
-        match enqueue_run(db, &row.bucket, &row.id, &run_key, Some(row.owner_id), now).await {
+        match enqueue_run_fenced(
+            db,
+            &row.bucket,
+            &row.id,
+            &run_key,
+            Some(row.owner_id),
+            now,
+            fence,
+        )
+        .await
+        {
             Ok(Some(_)) => queued += 1,
             Ok(None) => {}
             Err(e) => {
@@ -167,10 +205,10 @@ pub async fn schedule_tick(
     now: i64,
     gate: &crate::raft::LeaderGate,
 ) -> Result<usize, String> {
-    if !gate.is_leader() {
+    let Some(fence) = gate.epoch() else {
         return Ok(0);
-    }
-    due_runs(db, now).await
+    };
+    due_runs_fenced(db, now, fence).await
 }
 
 /// `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 = 关闭）。M8-1：只有 leader 调度。
@@ -215,19 +253,33 @@ pub struct InventoryRunner {
     store: Arc<Store>,
     acl: Acl,
     staging_dir: PathBuf,
+    gate: LeaderGate,
 }
 
 impl InventoryRunner {
-    pub fn new(db: Arc<Db>, store: Arc<Store>, acl: Acl, staging_dir: PathBuf) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        store: Arc<Store>,
+        acl: Acl,
+        staging_dir: PathBuf,
+        gate: LeaderGate,
+    ) -> Self {
         Self {
             db,
             store,
             acl,
             staging_dir,
+            gate,
         }
     }
 
-    async fn fail(&self, run_id: i64, job_id: Option<i64>, msg: String) -> String {
+    async fn fail(
+        &self,
+        run_id: i64,
+        job_id: Option<i64>,
+        msg: String,
+        fence: FencingEpoch,
+    ) -> String {
         let now = crate::db::now();
         if let Some(j) = job_id {
             // 引擎在任务收尾时 progress+1；存 -1 让终值为 0。
@@ -235,12 +287,12 @@ impl InventoryRunner {
         }
         let _ = self
             .db
-            .inventory_run_finish(run_id, "error", None, Some(&msg))
+            .inventory_run_finish(run_id, "error", None, Some(&msg), fence)
             .await;
         msg
     }
 
-    async fn run(&self, p: &InventoryPayload) -> Result<String, String> {
+    async fn run(&self, p: &InventoryPayload, fence: FencingEpoch) -> Result<String, String> {
         let Some(run) = self
             .db
             .inventory_run_by_key(&p.bucket, &p.config_id, &p.run_key)
@@ -260,11 +312,11 @@ impl InventoryRunner {
         else {
             // 入队后配置被删：run 行落 error，避免永久停在 running。
             let msg = format!("inventory 配置不存在：{}/{}", p.bucket, p.config_id);
-            return Err(self.fail(run.id, run.job_id, msg).await);
+            return Err(self.fail(run.id, run.job_id, msg, fence).await);
         };
         let now = crate::db::now();
         self.db
-            .inventory_run_started(run.id, now)
+            .inventory_run_started(run.id, now, fence)
             .await
             .map_err(|e| e.to_string())?;
         if let Some(j) = run.job_id {
@@ -275,7 +327,7 @@ impl InventoryRunner {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = format!("config_json 非法：{e}");
-                    return Err(self.fail(run.id, run.job_id, msg).await);
+                    return Err(self.fail(run.id, run.job_id, msg, fence).await);
                 }
             };
         if !cfg.is_enabled {
@@ -284,7 +336,7 @@ impl InventoryRunner {
             }
             let _ = self
                 .db
-                .inventory_run_finish(run.id, "skipped", None, None)
+                .inventory_run_finish(run.id, "skipped", None, None, fence)
                 .await;
             return Ok("skipped".to_string());
         }
@@ -295,7 +347,7 @@ impl InventoryRunner {
                 "目标桶 ARN 非法：{}",
                 cfg.destination.s3_bucket_destination.bucket
             );
-            return Err(self.fail(run.id, run.job_id, msg).await);
+            return Err(self.fail(run.id, run.job_id, msg, fence).await);
         };
         // 运行期复核所有者仍存在且启用：停用/删除用户后配置不得继续产出。
         let (is_admin, active) = match self
@@ -307,12 +359,12 @@ impl InventoryRunner {
             Some((_, is_admin, active)) => (is_admin, active),
             None => {
                 let msg = format!("配置所有者 {} 不存在，拒绝运行清单", cfg_row.owner_id);
-                return Err(self.fail(run.id, run.job_id, msg).await);
+                return Err(self.fail(run.id, run.job_id, msg, fence).await);
             }
         };
         if !active {
             let msg = format!("配置所有者 {} 已停用，拒绝运行清单", cfg_row.owner_id);
-            return Err(self.fail(run.id, run.job_id, msg).await);
+            return Err(self.fail(run.id, run.job_id, msg, fence).await);
         }
         let owner = AuthedUser {
             uid: cfg_row.owner_id,
@@ -322,24 +374,24 @@ impl InventoryRunner {
         // 3.7：配置期记录源桶账户；运行期复核源/目标桶账户，失配 fail-closed（不写输出）。
         let source_account = match self.db.bucket_account(&p.bucket).await {
             Ok(v) => v,
-            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string(), fence).await),
         };
         if let Some(recorded) = recorded_source_account.as_deref()
             && recorded != source_account.as_str()
         {
             let msg =
                 format!("源桶账户已变化（配置 {recorded}，当前 {source_account}），拒绝写出清单");
-            return Err(self.fail(run.id, run.job_id, msg).await);
+            return Err(self.fail(run.id, run.job_id, msg, fence).await);
         }
         let dest_account = match self.db.bucket_account(&dest).await {
             Ok(v) => v,
-            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string(), fence).await),
         };
         if let Some(want) = cfg.destination.s3_bucket_destination.account_id.as_deref()
             && want != dest_account.as_str()
         {
             let msg = format!("目标桶账户校验失败（配置 {want}，当前 {dest_account}）");
-            return Err(self.fail(run.id, run.job_id, msg).await);
+            return Err(self.fail(run.id, run.job_id, msg, fence).await);
         }
         let base = join_key(&[
             cfg.destination
@@ -374,9 +426,9 @@ impl InventoryRunner {
                 Ok((false, detail)) => {
                     let suffix = detail.map(|d| format!("（{d}）")).unwrap_or_default();
                     let msg = format!("配置所有者没有目标桶 {dest} 的 PutObject 权限{suffix}");
-                    return Err(self.fail(run.id, run.job_id, msg).await);
+                    return Err(self.fail(run.id, run.job_id, msg, fence).await);
                 }
-                Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+                Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string(), fence).await),
             }
         }
         if !self
@@ -386,7 +438,7 @@ impl InventoryRunner {
             .map_err(|e| e.to_string())?
         {
             let msg = format!("目标桶不存在：{dest}");
-            return Err(self.fail(run.id, run.job_id, msg).await);
+            return Err(self.fail(run.id, run.job_id, msg, fence).await);
         }
         // 运行期复核源桶读权限：配置创建后权限被撤销 → 失败关闭，不扫描、不写输出。
         match self
@@ -398,9 +450,9 @@ impl InventoryRunner {
             Ok((false, detail)) => {
                 let suffix = detail.map(|d| format!("（{d}）")).unwrap_or_default();
                 let msg = format!("配置所有者没有源桶 {} 的 ListBucket 权限{suffix}", p.bucket);
-                return Err(self.fail(run.id, run.job_id, msg).await);
+                return Err(self.fail(run.id, run.job_id, msg, fence).await);
             }
-            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string()).await),
+            Err(e) => return Err(self.fail(run.id, run.job_id, e.to_string(), fence).await),
         }
         // 3.6：增量模式 per config（默认全量）。水位是「上次扫描开始时刻」：
         // 本轮输出 last_modified >= 水位 的对象/版本，扫描开始时刻作为新水位。
@@ -413,7 +465,7 @@ impl InventoryRunner {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("增量模式读取失败: {e}");
-                return Err(self.fail(run.id, run.job_id, msg).await);
+                return Err(self.fail(run.id, run.job_id, msg, fence).await);
             }
         };
         let prev_mark = if incremental {
@@ -434,7 +486,7 @@ impl InventoryRunner {
                 Ok(None) => None,
                 Err(e) => {
                     let msg = format!("增量水位读取失败: {e}");
-                    return Err(self.fail(run.id, run.job_id, msg).await);
+                    return Err(self.fail(run.id, run.job_id, msg, fence).await);
                 }
             }
         } else {
@@ -477,7 +529,7 @@ impl InventoryRunner {
                 // H1：先把 run 落 done，再推进水位。done 失败时水位不动，任务重试会重放
                 // 同一区间（重复条目安全）；反向顺序在崩溃时会永久漏掉本轮对象。
                 self.db
-                    .inventory_run_finish(run.id, "done", Some(&manifest_key), None)
+                    .inventory_run_finish(run.id, "done", Some(&manifest_key), None, fence)
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(inc) = inc
@@ -489,6 +541,7 @@ impl InventoryRunner {
                             cfg_row.updated_at,
                             Some(&inc.cursor.to_string()),
                             now,
+                            fence,
                         )
                         .await
                 {
@@ -501,7 +554,7 @@ impl InventoryRunner {
             Err(e) => {
                 let _ = self
                     .db
-                    .inventory_run_finish(run.id, "error", None, Some(&e))
+                    .inventory_run_finish(run.id, "error", None, Some(&e), fence)
                     .await;
                 Err(e)
             }
@@ -1370,7 +1423,24 @@ impl TaskExecutor for InventoryRunner {
         }
         let p: InventoryPayload =
             serde_json::from_str(payload).map_err(|e| format!("payload 非法: {e}"))?;
-        self.run(&p).await
+        self.run(&p, FencingEpoch::UNFENCED).await
+    }
+
+    async fn execute_fenced(
+        &self,
+        action: &str,
+        payload: &str,
+        fence: FencingEpoch,
+    ) -> Result<String, String> {
+        if !self.gate.still_current(fence) {
+            return Err("失去 leadership，放弃 inventory 执行".to_string());
+        }
+        if action != "Inventory" {
+            return Err(format!("未注册的作业动作: {action}"));
+        }
+        let p: InventoryPayload =
+            serde_json::from_str(payload).map_err(|e| format!("payload 非法: {e}"))?;
+        self.run(&p, fence).await
     }
 }
 
