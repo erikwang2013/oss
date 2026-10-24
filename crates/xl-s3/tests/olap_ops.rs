@@ -928,6 +928,7 @@ async fn archived_object_403_before_transform() {
         phase: TierPhase::Archived,
         archived_at: 100,
         restore_expires_at: None,
+        chunks: None,
     });
     std::fs::write(&meta_path, md.encode().unwrap()).unwrap();
     add_ap(&env, "ap1");

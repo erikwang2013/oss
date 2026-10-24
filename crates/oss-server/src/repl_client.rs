@@ -307,6 +307,82 @@ impl ReplClient {
         Ok(Box::pin(stream))
     }
 
+    /// tier GET 单段 Range：只取 `[offset, offset+len)`。
+    /// 必须是 206 + 匹配的 Content-Range；后端忽略 Range（200）或长度不符 → fail closed。
+    pub async fn tier_get_range(
+        &self,
+        remote_id: &str,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes, ReplError> {
+        let end = offset
+            .checked_add(len)
+            .filter(|_| len > 0)
+            .ok_or_else(|| ReplError::permanent("tier Range 参数非法"))?
+            - 1;
+        let headers = vec![("range".to_string(), format!("bytes={offset}-{end}"))];
+        let resp = self
+            .send(
+                remote_id,
+                "GET",
+                bucket,
+                Some(key),
+                &[],
+                None,
+                &headers,
+                None,
+            )
+            .await?;
+        if resp.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(ReplError::permanent(format!(
+                "tier 后端忽略 Range（HTTP {}），拒绝直读",
+                resp.status().as_u16()
+            )));
+        }
+        let cr = resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !cr.starts_with(&format!("bytes {offset}-{end}/")) {
+            return Err(ReplError::permanent(format!(
+                "tier Range Content-Range 不符：{cr:?}"
+            )));
+        }
+        if let Some(cl) = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            && cl.parse::<u64>().ok() != Some(len)
+        {
+            return Err(ReplError::permanent(format!(
+                "tier Range Content-Length 不符：{cl}"
+            )));
+        }
+        // 响应体按请求长度封顶：后端撒谎也不能撑爆内存。
+        let mut body = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(1 << 20));
+        let mut incoming = resp.into_body();
+        while let Some(frame) = incoming.frame().await {
+            let f = frame
+                .map_err(|e| ReplError::retryable(format!("读取 tier Range 响应体失败：{e}")))?;
+            if let Some(d) = f.data_ref() {
+                if body.len() as u64 + d.len() as u64 > len {
+                    return Err(ReplError::permanent("tier Range 响应体超过请求长度"));
+                }
+                body.extend_from_slice(d);
+            }
+        }
+        if body.len() as u64 != len {
+            return Err(ReplError::permanent(format!(
+                "tier Range 响应长度 {} ≠ {len}",
+                body.len()
+            )));
+        }
+        Ok(Bytes::from(body))
+    }
+
     /// tier HEAD：远端无此键 → Ok(None)。
     pub async fn tier_head(
         &self,
@@ -1437,6 +1513,82 @@ mod tests {
         // 未配置 limit → 无桶
         let c = ReplClient::new(&[target("r3", None)]);
         assert!(c.remotes["r3"].limiter.is_none());
+    }
+
+    /// 远端响应是信任边界：200（忽略 Range）、Content-Range/Content-Length 不符都必须拒。
+    #[tokio::test]
+    async fn tier_range_requires_honest_206() {
+        use hyper::service::service_fn;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                        let key = req.uri().path().trim_start_matches("/bkt/").to_string();
+                        let range = req
+                            .headers()
+                            .get("range")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        assert_eq!(range, "bytes=2-5", "客户端必须发单段 Range");
+                        let (status, cr, body): (u16, &str, &[u8]) = match key.as_str() {
+                            "ok" => (206, "bytes 2-5/10", b"WXYZ"),
+                            "ignored" => (200, "", b"0123456789"),
+                            "badcr" => (206, "bytes 0-3/10", b"WXYZ"),
+                            "badlen" => (206, "bytes 2-5/10", b"WXY"),
+                            other => panic!("unexpected key {other}"),
+                        };
+                        let mut resp = hyper::Response::new(Full::new(Bytes::from_static(body)));
+                        *resp.status_mut() = StatusCode::from_u16(status).unwrap();
+                        resp.headers_mut().insert(
+                            "content-range",
+                            hyper::header::HeaderValue::from_str(cr).unwrap(),
+                        );
+                        Ok::<_, std::convert::Infallible>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        let mut t = target("r1", None);
+        t.endpoint = format!("http://{addr}");
+        let c = ReplClient::new(&[t]);
+
+        assert_eq!(
+            c.tier_get_range("r1", "bkt", "ok", 2, 4).await.unwrap(),
+            Bytes::from_static(b"WXYZ")
+        );
+        let e = c
+            .tier_get_range("r1", "bkt", "ignored", 2, 4)
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("忽略 Range"), "{e:?}");
+        let e = c
+            .tier_get_range("r1", "bkt", "badcr", 2, 4)
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("Content-Range"), "{e:?}");
+        let e = c
+            .tier_get_range("r1", "bkt", "badlen", 2, 4)
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("Content-Length"), "{e:?}");
+        assert_eq!(
+            c.tier_get_range("r1", "bkt", "ok", 0, 0)
+                .await
+                .unwrap_err()
+                .class,
+            ErrClass::Permanent
+        );
+        srv.abort();
     }
 
     #[test]

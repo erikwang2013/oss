@@ -568,6 +568,7 @@ async fn five_actions_and_hooks() {
                 etag: "remote".into(),
                 sha256: "00".into(),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             1,
         )
@@ -1059,6 +1060,7 @@ async fn archived_and_sse_c_sources_are_rejected() {
                 etag: "r".into(),
                 sha256: "0".into(),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             1,
         )
@@ -1215,6 +1217,7 @@ async fn restored_archive_copy_is_standard_and_readable() {
                 etag: "remote".into(),
                 sha256: hex::encode(sha2::Sha256::digest(data)),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             1,
         )
@@ -1229,7 +1232,7 @@ async fn restored_archive_copy_is_standard_and_readable() {
         .await
         .unwrap();
     f.store()
-        .restore_commit("src", "thaw", &vid, wall_now() + 3600)
+        .restore_commit("src", "thaw", &vid, wall_now() + 3600, None)
         .await
         .unwrap();
     assert_eq!(
@@ -1786,6 +1789,7 @@ async fn batch_actions_emit_bucket_notifications() {
                 etag: "remote".into(),
                 sha256: "00".into(),
                 class: "GLACIER".into(),
+                chunks: None,
             },
             1,
         )

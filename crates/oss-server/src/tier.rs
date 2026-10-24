@@ -4,6 +4,7 @@
 //! 编码只发生在 [`ReplClient`] 的 canonical path（N3）。
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -30,12 +31,10 @@ pub struct TierPutResult {
 /// 上传暂存余量：spool/restore staging 前要求磁盘至少多出这么多空闲字节。
 pub const STAGING_FREE_RESERVE: u64 = 64 << 20;
 
-/// 进程内磁盘预留：key = 文件系统设备号，value = 已登记字节数。
-///
-/// Restore/Transition 先登记再写盘；否则并发作业各自 statvfs 通过后会一起写爆。
-/// 只覆盖本进程（同一数据目录不允许多进程写，与对象锁口径一致）。
-static SPACE_RESERVATIONS: LazyLock<Mutex<HashMap<u64, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 预留锚点目录（同一文件系统上所有进程共享）：占位文件 + flock 锁。
+const RESERVE_DIR: &str = ".oss-tier-space";
+/// 占位文件后缀；长度即可登记字节数（稀疏文件，不真的写数据）。
+const RESERVE_SUFFIX: &str = ".reserve";
 
 /// 创建 0600 的 tier 暂存文件（tier-*.stage / restore-stage）。
 ///
@@ -46,20 +45,18 @@ pub(crate) async fn create_private_stage_file(path: &Path) -> std::io::Result<to
     opts.open(path).await
 }
 
-/// 预留登记；Drop 即释放（成功、失败、future 取消统一走这里）。
+/// 预留登记；占位文件上的 flock 存活到 Drop（崩溃即自动解锁，供他人清扫）。
+#[derive(Debug)]
 pub struct SpaceReservation {
-    dev: u64,
-    bytes: u64,
+    path: Option<PathBuf>,
+    // 持有占位文件的排他锁：Drop 前一直锁住，扫描方据「能否上锁」判断 owner 是否存活。
+    _lock: std::fs::File,
 }
 
 impl Drop for SpaceReservation {
     fn drop(&mut self) {
-        let mut map = SPACE_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(held) = map.get_mut(&self.dev) {
-            *held = held.saturating_sub(self.bytes);
-            if *held == 0 {
-                map.remove(&self.dev);
-            }
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -71,7 +68,98 @@ fn device_id(dir: &Path) -> Result<u64, String> {
         .map_err(|e| format!("读取 {:?} 设备号失败：{e}", dir.display()))
 }
 
-/// 预留判定（纯函数）：`held` 为同设备已登记量，成功后累加 `need`。
+/// 目录所在文件系统的当前可用字节。
+pub fn filesystem_available(dir: &Path) -> Result<u64, String> {
+    let vfs = rustix::fs::statvfs(dir)
+        .map_err(|e| format!("读取 {:?} 剩余空间失败：{e}", dir.display()))?;
+    Ok(vfs.f_bavail.saturating_mul(vfs.f_frsize))
+}
+
+/// 预留锚点 = `dir` 所在文件系统上最高可写的同设备祖先（`<anchor>/.oss-tier-space`）。
+///
+/// 选最高祖先是为了让同一文件系统上不同目录/进程的占位能相加；锚点创建失败即
+/// fail closed（宁可拒绝写入，也不做无法跨进程对账的乐观放行）。
+fn reserve_anchor(dir: &Path) -> Result<PathBuf, String> {
+    let start = std::fs::canonicalize(dir)
+        .map_err(|e| format!("解析 {:?} 的真实路径失败：{e}", dir.display()))?;
+    let dev = device_id(&start)?;
+    let mut chosen: Option<&Path> = None;
+    for a in start.ancestors() {
+        // 只沿同一设备向上；第一个不同设备的祖先就是挂载点之外。
+        if device_id(a).ok() != Some(dev) {
+            break;
+        }
+        if rustix::fs::access(a, rustix::fs::Access::WRITE_OK).is_ok() {
+            chosen = Some(a);
+        }
+    }
+    let base = chosen
+        .ok_or_else(|| format!("{:?} 没有可写的同设备祖先，无法登记磁盘预留", dir.display()))?;
+    let anchor = base.join(RESERVE_DIR);
+    std::fs::create_dir_all(&anchor)
+        .map_err(|e| format!("预留锚点目录不可用（{}）：{e}", anchor.display()))?;
+    // create_dir_all 会跟随已存在的符号链接：锚点必须是真目录，否则账目可被引到别处。
+    let md = std::fs::symlink_metadata(&anchor)
+        .map_err(|e| format!("预留锚点不可用（{}）：{e}", anchor.display()))?;
+    if !md.is_dir() {
+        return Err(format!(
+            "预留锚点不是真目录（{}），拒绝登记磁盘预留",
+            anchor.display()
+        ));
+    }
+    Ok(anchor)
+}
+
+/// 拿锚点排他锁（flock；进程退出自动释放）。
+fn lock_anchor(anchor: &Path) -> Result<std::fs::File, String> {
+    let path = anchor.join("lock");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("磁盘预留锁不可用（{}）：{e}", path.display()))?;
+    rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| format!("磁盘预留锁加锁失败（{}）：{e}", path.display()))?;
+    Ok(f)
+}
+
+/// 汇总锚点内的占位长度；顺带清理 owner 已死（能拿到占位排他锁）的崩溃残留。
+/// 调用方必须持锚点 flock。任何无法判定/打开失败都按「仍持有」保守计入。
+fn held_bytes(anchor: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(anchor) else {
+        return 0;
+    };
+    let mut held = 0u64;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(RESERVE_SUFFIX) {
+            continue;
+        }
+        // DirEntry::metadata 不跟随符号链接；链接/目录一律不计入、不删除。
+        let Ok(md) = ent.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let Ok(f) = std::fs::OpenOptions::new().read(true).open(ent.path()) else {
+            held = held.saturating_add(md.len());
+            continue;
+        };
+        // 活着的预留持有该文件的排他 flock；能上锁 = owner 已退出（崩溃残留）。
+        match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(ent.path());
+            }
+            Err(_) => held = held.saturating_add(md.len()),
+        }
+    }
+    held
+}
+
+/// 预留判定（纯函数）：`held` 为同文件系统已登记量，成功后累加 `need`。
 /// 仍留 `reserve` 空闲余量；`held` 偏大时按已登记量保守拒绝（宁可 fail closed）。
 fn try_reserve(held: &mut u64, avail: u64, need: u64, reserve: u64) -> Result<(), String> {
     let want = held.saturating_add(need).saturating_add(reserve);
@@ -84,18 +172,55 @@ fn try_reserve(held: &mut u64, avail: u64, need: u64, reserve: u64) -> Result<()
     Ok(())
 }
 
-/// 在 `dir` 所在文件系统登记 `need` 字节；检查与登记在同一把锁内，并发不会超卖。
+/// 当前文件系统已登记（跨进程）的预留字节数；诊断/测试用。
+pub fn reserved_bytes(dir: &Path) -> Result<u64, String> {
+    let anchor = reserve_anchor(dir)?;
+    let _lock = lock_anchor(&anchor)?;
+    Ok(held_bytes(&anchor))
+}
+
+/// 在 `dir` 所在文件系统登记 `need` 字节：锚点 flock 串行化「扫描占位 + statvfs + 新建占位」，
+/// 多进程并发不会各自通过检查后一起把盘写满。占位是稀疏文件（长度即账目、排他 flock 即存活标记），
+/// 文件长度与目录都 fsync 后才返回；崩溃残留因锁自动释放而被后继扫描清扫。
 pub fn reserve_free_space(dir: &Path, need: u64, reserve: u64) -> Result<SpaceReservation, String> {
-    let dev = device_id(dir)?;
-    let vfs = rustix::fs::statvfs(dir)
-        .map_err(|e| format!("读取 {:?} 剩余空间失败：{e}", dir.display()))?;
-    let avail = vfs.f_bavail.saturating_mul(vfs.f_frsize);
-    let mut map = SPACE_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut held = map.get(&dev).copied().unwrap_or(0);
+    let anchor = reserve_anchor(dir)?;
+    let _lock = lock_anchor(&anchor)?;
+    // 锁内再取可用空间，缩小「检查后别人写盘」的窗口。
+    let avail = filesystem_available(dir)?;
+    let mut held = held_bytes(&anchor);
     try_reserve(&mut held, avail, need, reserve)
         .map_err(|e| format!("{e}（{}）", dir.display()))?;
-    map.insert(dev, held);
-    Ok(SpaceReservation { dev, bytes: need })
+    let path = anchor.join(format!(
+        "{}-{}{RESERVE_SUFFIX}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let out = (|| -> std::io::Result<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.set_len(need)?;
+        // 排他锁随 SpaceReservation 持有到 Drop；崩溃时内核自动释放，扫描方据此清扫。
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(std::io::Error::from)?;
+        f.sync_all()?;
+        // 目录 fsync：崩溃后占位文件仍可见（否则对账丢失 → 可能超卖）。
+        std::fs::File::open(&anchor)?.sync_all()?;
+        Ok(f)
+    })();
+    let lock = match out {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("磁盘预留占位写入失败（{}）：{e}", path.display()));
+        }
+    };
+    Ok(SpaceReservation {
+        path: Some(path),
+        _lock: lock,
+    })
 }
 
 /// 进程内活跃暂存文件：正在写的 spool 登记在此，sweeper 一律跳过。
@@ -274,6 +399,14 @@ pub trait TierBackend: Send + Sync {
     ) -> Result<TierPutResult, String>;
     /// 流式下载：调用方负责按元数据校验长度与 SHA-256。
     async fn get(&self, key: &str) -> Result<TierByteStream, String>;
+    /// 是否支持按字节范围读取（默认 false：归档直读 fail closed）。
+    fn supports_range(&self) -> bool {
+        false
+    }
+    /// 读取 `[offset, offset+len)`（len > 0）；默认不支持 → 直读回退 403。
+    async fn get_range(&self, _key: &str, _offset: u64, _len: u64) -> Result<bytes::Bytes, String> {
+        Err("tier 后端不支持 Range 读取".to_string())
+    }
     /// 远端大小；键不存在 → None。
     async fn head(&self, key: &str) -> Result<Option<u64>, String>;
     async fn delete(&self, key: &str) -> Result<(), String>;
@@ -389,6 +522,17 @@ impl TierBackend for S3TierBackend {
     async fn get(&self, key: &str) -> Result<TierByteStream, String> {
         self.client
             .tier_get_stream(&self.id, &self.bucket, key)
+            .await
+            .map_err(|e| e.message)
+    }
+
+    fn supports_range(&self) -> bool {
+        true
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<bytes::Bytes, String> {
+        self.client
+            .tier_get_range(&self.id, &self.bucket, key, offset, len)
             .await
             .map_err(|e| e.message)
     }
@@ -566,18 +710,36 @@ mod tests {
         assert_eq!(h, 0);
     }
 
-    /// 预留随 Drop 释放（成功/失败/取消同一路径），不泄漏设备账。
-    /// 合成设备号避开并行单测的真实设备（local_tier put 也会登记）。
+    /// 占位文件登记 bytes 并随 Drop 删除；后续登记能看到已持有量（不会各自放行）。
     #[test]
-    fn reservation_released_on_drop() {
-        let dev = u64::MAX;
-        SPACE_RESERVATIONS.lock().unwrap().insert(dev, 123);
-        drop(SpaceReservation { dev, bytes: 123 });
-        assert!(!SPACE_RESERVATIONS.lock().unwrap().contains_key(&dev));
-        // 超量释放饱和到 0，不 panic、不留账。
-        SPACE_RESERVATIONS.lock().unwrap().insert(dev, 5);
-        drop(SpaceReservation { dev, bytes: 9 });
-        assert!(!SPACE_RESERVATIONS.lock().unwrap().contains_key(&dev));
+    fn reservation_placeholder_counts_until_drop() {
+        let d = tempfile::tempdir().unwrap();
+        let r = reserve_free_space(d.path(), 1, 0).unwrap();
+        let path = r.path.clone().unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1);
+        // held ≥ 1：再要 2×可用量必然超卖（余量波动不足以放行）。
+        let avail = filesystem_available(d.path()).unwrap();
+        let err = reserve_free_space(d.path(), avail.saturating_mul(2).max(1), 0).unwrap_err();
+        assert!(err.contains("磁盘剩余空间不足"), "{err}");
+        drop(r);
+        assert!(!path.exists(), "Drop 必须删除占位");
+    }
+
+    /// 无主占位（无人持有 flock，即崩溃残留）在下次持锁扫描时清扫；活占位保留并计入。
+    #[test]
+    fn unowned_reservation_placeholders_are_swept() {
+        let d = tempfile::tempdir().unwrap();
+        let anchor = reserve_anchor(d.path()).unwrap();
+        let orphan = anchor.join(format!("orphan-{}.reserve", uuid::Uuid::new_v4()));
+        std::fs::write(&orphan, b"x").unwrap();
+        let live = reserve_free_space(d.path(), 1, 0).unwrap();
+        let live_path = live.path.clone().unwrap();
+        assert!(!orphan.exists(), "无主占位应被清扫");
+        assert!(live_path.exists(), "活占位不得被清扫");
+        assert!(reserved_bytes(d.path()).unwrap() >= 1, "活占位必须计入账目");
+        drop(live);
+        assert!(!live_path.exists(), "Drop 必须删除占位");
     }
 
     /// 暂存文件从创建瞬间就是 0600（明文落盘不依赖 umask）。

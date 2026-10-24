@@ -20,4 +20,5 @@ pub mod sse;
 pub mod sts;
 pub mod sts_web_identity;
 pub mod sync_delete;
+pub mod tier_direct;
 pub mod tier_gc;

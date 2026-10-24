@@ -3,7 +3,7 @@
 //! 恢复顺序（C7）：prepare 本地数据（不可见）→ 行 restored/expiry → meta Restored。
 //! 任一步崩溃由 [`reconcile_restores`]（启动）与 [`reap_once`] 按 Version 为准修正。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use sha2::Digest as _;
 use tokio::io::AsyncWriteExt as _;
 use xl_s3::events::{EventSink, EventSource, S3EventOp};
 use xl_s3::restore::RestoreSink;
-use xl_store::meta::{TierPhase, is_archive_class};
+use xl_store::meta::{TierChunks, TierPhase, is_archive_class};
 use xl_store::store::Store;
 
 use crate::db::{Db, JobSpec, NewJobTask};
@@ -103,15 +103,19 @@ impl RestoreSink for SqlRestoreSink {
 }
 
 /// 按 8 MiB 窗口读取指定版本，作为 tier 上传流（内存不随对象大小增长）。
+/// 每个窗口的 SHA-256 记入返回的共享表——上传流与直读分块表来自同一份字节。
 fn version_stream(
     store: Arc<Store>,
     bucket: String,
     key: String,
     version_id: String,
     size: u64,
-) -> TierByteStream {
+) -> (TierByteStream, Arc<Mutex<Vec<String>>>) {
+    let hashes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&hashes);
     let stream = futures::stream::unfold(0u64, move |offset| {
         let store = Arc::clone(&store);
+        let sink = Arc::clone(&sink);
         let (bucket, key, version_id) = (bucket.clone(), key.clone(), version_id.clone());
         async move {
             if offset >= size {
@@ -122,7 +126,12 @@ fn version_stream(
                 .get_object_range_version_ext(&bucket, &key, &version_id, offset..end, None)
                 .await
             {
-                Ok(chunk) if chunk.len() as u64 == end - offset => Some((Ok(chunk), end)),
+                Ok(chunk) if chunk.len() as u64 == end - offset => {
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(hex::encode(sha2::Sha256::digest(&chunk)));
+                    Some((Ok(chunk), end))
+                }
                 Ok(chunk) => Some((
                     Err(format!(
                         "源版本窗口读取长度 {} ≠ {} 字节",
@@ -135,7 +144,52 @@ fn version_stream(
             }
         }
     });
-    Box::pin(stream)
+    (Box::pin(stream), hashes)
+}
+
+/// 按与 Transition 相同的 8 MiB canonical 边界累计 SHA-256（旧对象 Restore 时 backfill）。
+struct ChunkHasher {
+    h: sha2::Sha256,
+    filled: u64,
+    out: Vec<String>,
+}
+
+impl ChunkHasher {
+    fn new() -> Self {
+        Self {
+            h: sha2::Sha256::new(),
+            filled: 0,
+            out: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            let take = ((TIER_CHUNK - self.filled) as usize).min(data.len());
+            self.h.update(&data[..take]);
+            self.filled += take as u64;
+            data = &data[take..];
+            if self.filled == TIER_CHUNK {
+                self.flush();
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        let h = std::mem::replace(&mut self.h, sha2::Sha256::new());
+        self.out.push(hex::encode(h.finalize()));
+        self.filled = 0;
+    }
+
+    fn finish(mut self) -> TierChunks {
+        if self.filled > 0 {
+            self.flush();
+        }
+        TierChunks {
+            chunk_size: TIER_CHUNK,
+            sha256: self.out,
+        }
+    }
 }
 
 /// 作业执行器：`Transition` / `RestoreObject`。
@@ -252,7 +306,7 @@ impl M8TaskExecutor {
                 ));
             }
             let key = tier_key(tier_id, &p.bucket, &p.version_id, &p.key);
-            let body = version_stream(
+            let (body, hashes) = version_stream(
                 Arc::clone(&self.store),
                 p.bucket.clone(),
                 p.key.clone(),
@@ -261,6 +315,13 @@ impl M8TaskExecutor {
             );
             // 后端在流上增量算 MD5/SHA-256；S3 单 PUT 响应 ETag 仍断言等于 MD5。
             let put = backend.put(&key, body, v.size).await?;
+            let chunks = TierChunks {
+                chunk_size: TIER_CHUNK,
+                sha256: hashes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            };
+            chunks
+                .validate(v.size)
+                .map_err(|e| format!("Transition 分块哈希表不自洽：{e}"))?;
             self.store
                 .archive_version(
                     &p.bucket,
@@ -274,6 +335,7 @@ impl M8TaskExecutor {
                         etag: put.etag,
                         sha256: put.sha256,
                         class: p.class.clone(),
+                        chunks: Some(chunks),
                     },
                     crate::db::now(),
                 )
@@ -364,6 +426,7 @@ impl M8TaskExecutor {
             .await
             .map_err(|e| format!("恢复暂存文件创建失败：{e}"))?;
         let mut hasher = sha2::Sha256::new();
+        let mut chunker = ChunkHasher::new();
         let mut n: u64 = 0;
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
@@ -379,6 +442,7 @@ impl M8TaskExecutor {
                 return Err(format!("恢复数据长度超过元数据 {} 字节", t.size));
             }
             hasher.update(&chunk);
+            chunker.update(&chunk);
             f.write_all(&chunk)
                 .await
                 .map_err(|e| format!("恢复暂存写入失败：{e}"))?;
@@ -394,6 +458,11 @@ impl M8TaskExecutor {
         if sha256 != t.sha256 {
             return Err("恢复数据 SHA-256 不符".to_string());
         }
+        // 旧对象无分块表：本次恢复的字节即 Canonical 8 MiB 表，一并 backfill（直读依赖）。
+        let chunks = chunker.finish();
+        chunks
+            .validate(t.size)
+            .map_err(|e| format!("恢复分块哈希表不自洽：{e}"))?;
         self.store
             .restore_prepare_file(&p.bucket, &p.key, &p.version_id, &stage)
             .await
@@ -406,7 +475,7 @@ impl M8TaskExecutor {
             .map_err(|e| e.to_string())?;
         if let Err(e) = self
             .store
-            .restore_commit(&p.bucket, &p.key, &p.version_id, expires)
+            .restore_commit(&p.bucket, &p.key, &p.version_id, expires, Some(chunks))
             .await
         {
             let _ = self

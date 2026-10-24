@@ -213,6 +213,31 @@ fn open_read(root: &Path, rel: &Path) -> Result<std::fs::File, String> {
     Ok(std::fs::File::from(fd))
 }
 
+/// 读 `[offset, offset+len)`；短读/越界一律报错（不返回残缺数据）。
+fn read_range_blocking(root: &Path, rel: &Path, offset: u64, len: u64) -> Result<Bytes, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = open_read(root, rel)?;
+    let size = f
+        .metadata()
+        .map_err(|e| format!("本地 tier 读取失败：{e}"))?
+        .len();
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "本地 tier Range 越界".to_string())?;
+    if len == 0 || end > size {
+        return Err(format!(
+            "本地 tier Range {offset}..{end} 超出对象 {size} 字节"
+        ));
+    }
+    let n = usize::try_from(len).map_err(|_| "本地 tier Range 过长".to_string())?;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("本地 tier 读取失败：{e}"))?;
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("本地 tier 读取失败：{e}"))?;
+    Ok(Bytes::from(buf))
+}
+
 fn head_blocking(root: &Path, rel: &Path) -> Result<Option<u64>, String> {
     let rootfd = open_root(root)?;
     // 用 RDONLY 而非 O_PATH：O_PATH 仅 Linux 有，便携回退/非 Linux 需要可移植 flag。
@@ -370,6 +395,17 @@ impl TierBackend for LocalTierBackend {
             }
         });
         Ok(Box::pin(stream))
+    }
+
+    fn supports_range(&self) -> bool {
+        true
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, String> {
+        let rel = Self::safe_rel(key)?;
+        let root = self.root.clone();
+        self.blocking(move || read_range_blocking(&root, &rel, offset, len))
+            .await
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>, String> {
@@ -559,6 +595,21 @@ mod tests {
         // 空目录已清理，但根目录保留
         assert!(!parent.exists());
         assert!(d.path().is_dir());
+    }
+
+    #[tokio::test]
+    async fn get_range_returns_exact_window_and_rejects_out_of_bounds() {
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(d.path());
+        let key = "local1/bkt/v1/obj.txt";
+        put(&b, key, b"cold data").await.unwrap();
+        assert_eq!(
+            b.get_range(key, 5, 4).await.unwrap(),
+            Bytes::from_static(b"data")
+        );
+        assert!(b.get_range(key, 2, 100).await.is_err(), "不得越界读");
+        assert!(b.get_range(key, 0, 0).await.is_err(), "零长度非法");
+        assert!(b.get_range("local1/bkt/v1/missing", 0, 1).await.is_err());
     }
 
     #[tokio::test]
