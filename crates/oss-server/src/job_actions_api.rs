@@ -138,6 +138,33 @@ async fn check(
     }
 }
 
+/// 清单桶跨账户门（账户 = 用户命名空间 v1）：非管理员只能使用**本账户**的清单桶。
+/// 账户由桶主派生（无主/管理员桶 = 系统账户，见 `xl_s3::access::bucket_account_id`）；
+/// admin 可用跨账户清单。读权限仍由随后的 `GetObject` 判权兜底（缺失/撤销 → 403）。
+async fn check_manifest_account(
+    state: &AppState,
+    uid: i64,
+    is_admin: bool,
+    bucket: &str,
+) -> Result<(), BatchError> {
+    if is_admin {
+        return Ok(());
+    }
+    let account = state
+        .db
+        .bucket_account(bucket)
+        .await
+        .map_err(|e| BatchError::Internal(format!("清单桶归属查询失败: {e}")))?;
+    // uid 无法派生账户（越界/0）→ fail-closed，不得与系统账户同名放行。
+    let own = xl_s3::access::account_id_of(uid);
+    if own.as_deref() != Some(account.as_str()) {
+        return Err(BatchError::Denied(format!(
+            "清单桶 {bucket} 属于账户 {account}，跨账户清单仅管理员可用"
+        )));
+    }
+    Ok(())
+}
+
 /// 校验并快照清单 → 建 `kind=batch` 作业。所有授权在落库前完成。
 pub async fn create_batch(
     state: &AppState,
@@ -244,6 +271,8 @@ pub async fn create_batch(
         is_admin,
         ak: String::new(),
     };
+    // 跨账户清单门必须在读取对象之前判定（避免为无权重账户读内容/探测存在性）。
+    check_manifest_account(state, uid, is_admin, &req.manifest_bucket).await?;
     check(
         state,
         &user,
