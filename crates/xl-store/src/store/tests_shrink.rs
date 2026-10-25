@@ -495,3 +495,38 @@ fn capacity_allows_exact_fit_and_rejects_shortfall_or_missing_drive() {
         .to_string();
     assert!(e.contains("n9") && e.contains("不可达"), "{e}");
 }
+
+/// C1/C2：显式槽表的 GatedMesh 本机能力必须与 Store::local_caps 同源
+/// （SlotMap epoch + 含槽 hash），且 check_peer 接受 epoch 3/4 的同构 peer，
+/// 不能把 epoch 硬编码为 2。
+#[test]
+fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
+    let sets = retired_n4_target(3);
+    let caps = crate::mesh_gate::local_caps(&sets, &ec84(), 1);
+    assert_eq!(caps.topo_epoch, 3);
+    assert_eq!(caps.topo_hash, sets.topology_hash());
+
+    let peer = crate::mesh_gate::PeerCaps {
+        wire_version: 2,
+        topo_epoch: 3,
+        topo_hash: caps.topo_hash.clone(),
+    };
+    assert!(crate::mesh_gate::check_peer("n2", &peer, &caps).is_ok());
+
+    let stale = crate::mesh_gate::PeerCaps {
+        wire_version: 2,
+        topo_epoch: 2,
+        topo_hash: caps.topo_hash.clone(),
+    };
+    assert!(crate::mesh_gate::check_peer("n2", &stale, &caps).is_err());
+
+    let epoch4 = retired_n4_target(4);
+    let caps4 = crate::mesh_gate::local_caps(&epoch4, &ec84(), 1);
+    assert_eq!(caps4.topo_epoch, 4);
+    let peer4 = crate::mesh_gate::PeerCaps {
+        wire_version: 2,
+        topo_epoch: 4,
+        topo_hash: caps4.topo_hash.clone(),
+    };
+    assert!(crate::mesh_gate::check_peer("n2", &peer4, &caps4).is_ok());
+}

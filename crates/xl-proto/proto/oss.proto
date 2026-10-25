@@ -73,9 +73,11 @@ message UploadEntry { string key=1; string upload_id=2; int64 initiated_nanos=3;
 message UploadListLocalResp { repeated UploadEntry uploads=1; repeated string prefixes=2; uint32 slots_ok=3; }
 // DP-0 数据面滚动升级握手：data_wire_version = 本节点支持的数据面线格式。
 // 旧节点无此字段（proto3 缺省 0）→ 消费方一律按 1 处理；本版宣告 2。
-// 拓扑指纹（dproll M1 / shrink topo v4 共用）：topo_epoch=1 为 placement v1，2 为 v2；
-// topo_hash 为 EC 参数 + 每 set 节点表（按 id 排序）的 SHA-256 前 8 字节 hex（16 字符）。
-// 旧节点两字段缺省 0/空串 → 消费方按「未宣告」处理，绝不当成匹配。
+// 拓扑指纹（dproll M1 / shrink topo v4 共用）：positional 拓扑 topo_epoch=1/2
+// （placement v1/v2）；显式槽表（shrink v4+）使用 SlotMap epoch（>=2，逐次 +1）。
+// topo_hash：positional 为 EC 参数 + 每 set 节点表（按 id 排序）；显式槽表为含槽位
+// 目标的 canonical hash。均为 SHA-256 前 8 字节 hex（16 字符）。旧节点两字段缺省
+// 0/空串 → 消费方按「未宣告」处理，绝不当成匹配。
 message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4;
                      uint32 data_wire_version=5;
                      uint64 topo_epoch=6; string topo_hash=7;

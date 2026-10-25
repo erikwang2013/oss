@@ -50,14 +50,24 @@ pub fn slot_map_hash(
 }
 
 /// 本机能力快照（与 [`crate::store::Store::local_caps`] 同源）。
+///
+/// 显式槽表（v3/v4+）必须使用 SlotMap epoch + 含槽位的 `topology_hash`，否则
+/// GatedMesh 与实际 health/Store 指纹不一致，所有跨节点数据 RPC 会被误拒。
 pub fn local_caps(
     sets: &crate::store::ClusterSets,
     ec: &crate::store::ec::EcConfig,
     topo_epoch: u64,
 ) -> LocalCaps {
-    LocalCaps {
-        topo_epoch,
-        topo_hash: slot_map_hash(sets, ec, topo_epoch),
+    if sets.sets.iter().any(|t| t.slot_map().is_some()) {
+        LocalCaps {
+            topo_epoch: sets.topology_epoch(),
+            topo_hash: sets.topology_hash(),
+        }
+    } else {
+        LocalCaps {
+            topo_epoch,
+            topo_hash: slot_map_hash(sets, ec, topo_epoch),
+        }
     }
 }
 
@@ -119,13 +129,13 @@ pub fn check_peer(node: &str, peer: &PeerCaps, local: &LocalCaps) -> Result<Peer
     }
     if local.topo_epoch >= 2
         && (peer.wire_version < 2
-            || peer.topo_epoch != 2
+            || peer.topo_epoch != local.topo_epoch
             || peer.topo_hash.is_empty()
             || peer.topo_hash != local.topo_hash)
     {
         return Err(Error::PeerIncompatible(format!(
-            "placement v2 要求节点 {node} 宣告 wire2/epoch2/相同拓扑指纹（实得 wire={} epoch={} hash={}，本机 hash={}）",
-            peer.wire_version, peer.topo_epoch, peer.topo_hash, local.topo_hash
+            "placement v2+/shrink 要求节点 {node} 宣告 wire2/epoch{}/相同拓扑指纹（实得 wire={} epoch={} hash={}，本机 hash={}）",
+            local.topo_epoch, peer.wire_version, peer.topo_epoch, peer.topo_hash, local.topo_hash
         )));
     }
     if peer.topo_epoch != 0 && peer.topo_epoch != local.topo_epoch {

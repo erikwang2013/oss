@@ -123,12 +123,7 @@ impl Store {
                 topo_hash: String::new(),
             },
             Some(cl) => {
-                if cl.sets.sets.iter().any(|t| t.slot_map().is_some()) {
-                    return TopologyAttestation {
-                        topo_epoch: cl.sets.topology_epoch(),
-                        topo_hash: cl.sets.topology_hash(),
-                    };
-                }
+                // 唯一实现：GatedMesh/health/status 都走同一 helper（显式槽表感知）。
                 let epoch = if cl.placement_v2 { 2 } else { 1 };
                 crate::mesh_gate::local_caps(&cl.sets, &self.cfg.ec, epoch)
             }
