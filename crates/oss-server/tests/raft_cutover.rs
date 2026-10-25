@@ -658,6 +658,10 @@ async fn cutover_refuses_level_two_export_onto_canonical_target() {
     let dst = db_at(dir.path(), "guard-dst.db").await;
     seed_admin_and_rows(&dst).await;
     assert!(dst.accounts_canonical().await.unwrap());
+    let accounts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
 
     let err = cutover::cutover(
         &dst,
@@ -672,4 +676,10 @@ async fn cutover_refuses_level_two_export_onto_canonical_target() {
     .unwrap_err();
     assert!(err.to_string().contains("canonical account rows"), "{err}");
     assert_eq!(dst.schema_meta("raft_mode").await.unwrap(), None);
+    assert!(dst.accounts_canonical().await.unwrap(), "marker 必须保留");
+    let accounts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    assert_eq!(accounts_after, accounts_before, "拒绝不得清空账户行");
 }

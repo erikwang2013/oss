@@ -578,16 +578,25 @@ impl SqliteStateMachine {
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
         let snapshot = data::decode_snapshot(bytes).map_err(Self::data_err)?;
-        // 单向门：本机已激活 level 3 后，level<3 快照不可能携带账户行，整表安装会
-        // 静默清空账户（marker 又不清除），在任何锁/写之前拒绝。
+        // 单向门：本机已激活 level 3（或已规范化账户）后，level<3 快照不可能携带
+        // 账户行，整表安装会静默清空账户（marker 又不清除），在任何锁/写之前拒绝。
+        // marker 与 activation 是独立事实（standalone→raft 直启可 marker 有而激活 1）。
         let local_activation = self.activation.load(Ordering::Relaxed);
-        if local_activation >= super::compat::FEATURE_LEVEL_3
-            && snapshot.feature_level < super::compat::FEATURE_LEVEL_3
-        {
-            return Err(Self::data_err(data::DataError::Format(format!(
-                "node activation level {local_activation} cannot install a level-{} snapshot",
-                snapshot.feature_level
-            ))));
+        if snapshot.feature_level < super::compat::FEATURE_LEVEL_3 {
+            let canonical: Option<String> =
+                sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+                    .bind(crate::db::META_ACCOUNTS_CANONICAL)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
+            if local_activation >= super::compat::FEATURE_LEVEL_3 || canonical.is_some() {
+                return Err(Self::data_err(data::DataError::Format(format!(
+                    "node activation level {local_activation} (canonical accounts: {}) cannot \
+                     install a level-{} snapshot",
+                    canonical.is_some(),
+                    snapshot.feature_level
+                ))));
+            }
         }
         if !snapshot.extensions.is_empty() {
             // Wave 1 消费者落地前 fail-closed：安装只写 data，非空扩展区会被静默丢弃
@@ -1521,5 +1530,62 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err}").contains("feature level 2"), "{err}");
         assert_eq!(sm1.activation_level(), 2);
+    }
+
+    /// 已规范化（marker 存在）但激活级别仍为 1 的节点：level-2 快照必须拒绝，
+    /// 不得清空账户行（直接 standalone→raft 启动的旁路）。
+    #[tokio::test]
+    async fn level2_snapshot_rejected_when_canonical_marker_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let url_a = format!("sqlite://{}?mode=rwc", dir.path().join("m-a.db").display());
+        let url_b = format!("sqlite://{}?mode=rwc", dir.path().join("m-b.db").display());
+        let db_a = crate::db::Db::connect_raft(&url_a).await.unwrap();
+        let mut sm_a =
+            SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None, 2)
+                .await
+                .unwrap();
+        let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
+            .await
+            .unwrap();
+        let level2 = data::encode_snapshot_at(&data::ControlData::default(), 2).unwrap();
+
+        let db_b = crate::db::Db::connect_raft(&url_b).await.unwrap();
+        sqlx::query("INSERT INTO schema_meta (key, value) VALUES (?, 'done')")
+            .bind(crate::db::META_ACCOUNTS_CANONICAL)
+            .execute(db_b.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, name, status, created_at, updated_at) \
+             VALUES ('000000000009', 'keep', 'active', 1, 1)",
+        )
+        .execute(db_b.pool())
+        .await
+        .unwrap();
+        let mut sm_b =
+            SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 1)
+                .await
+                .unwrap();
+        let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(level2)),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("canonical"), "{err}");
+        let accounts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE id = '000000000009'")
+                .fetch_one(db_b.pool())
+                .await
+                .unwrap();
+        assert_eq!(accounts, 1, "拒绝安装不得清空账户行");
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+                .bind(crate::db::META_ACCOUNTS_CANONICAL)
+                .fetch_optional(db_b.pool())
+                .await
+                .unwrap();
+        assert!(marker.is_some(), "marker 必须保留");
     }
 }

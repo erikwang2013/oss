@@ -1622,6 +1622,52 @@ mod tests {
         assert_eq!(required_feature_level(&shown), 3);
     }
 
+    /// 账户 admin/member 指向全局管理员时 read_tx 必须 fail-closed（不得导出为
+    /// 不可安装的快照，也不得静默丢弃管理关系）。
+    #[tokio::test]
+    async fn read_tx_rejects_global_admin_account_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "admin-links.db").await;
+        let admin_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
+             VALUES ('admin', 'h', 1, 'active', 1) RETURNING id",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO schema_meta (key, value) VALUES (?, 'done')")
+            .bind(crate::db::META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, name, status, admin_uid, created_at, updated_at) \
+             VALUES ('000000000010', 'bad-admin', 'active', ?, 1, 1)",
+        )
+        .bind(admin_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        let err = read_tx(&mut tx).await.unwrap_err();
+        assert!(format!("{err}").contains("not exportable"), "{err}");
+
+        sqlx::query("UPDATE accounts SET admin_uid = NULL WHERE id = '000000000010'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) \
+             VALUES ('000000000010', ?, 'member', 1)",
+        )
+        .bind(admin_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let err = read_tx(&mut tx).await.unwrap_err();
+        assert!(format!("{err}").contains("global admin"), "{err}");
+    }
+
     /// 安装 level-3 快照：成员/admin 按 username 映射到本地 id（与来源 uid 无关），
     /// marker 与数据同事务写入，read_tx 以自然键往返一致。
     #[tokio::test]
