@@ -475,6 +475,15 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
     let handle = oss_server::raft::spawn_with_control(settings, Some(dst.pool().clone()), None)
         .await
         .unwrap();
-    assert_eq!(oss_server::raft::membership::view(&handle).voters, vec![3]);
+    // 高负载下 openraft 成员视图可能晚于 spawn 返回更新：有界轮询，最多 2s。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let voters = loop {
+        let voters = oss_server::raft::membership::view(&handle).voters;
+        if voters.as_slice() == [3] || tokio::time::Instant::now() >= deadline {
+            break voters;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(voters, vec![3]);
     handle.shutdown().await;
 }

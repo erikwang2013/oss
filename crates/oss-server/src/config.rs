@@ -1674,14 +1674,16 @@ state_db = "/x/state.db"
         let mut c = m9_cfg();
         c.raft.as_mut().unwrap().snapshot_max_bytes = 1024 * 1024 * 1024 + 1;
         assert!(c.raft_validate().is_err());
-        for bad in [0u8, 3] {
+        for bad in [0u8, crate::raft::compat::MAX_FEATURE_LEVEL + 1] {
             let mut c = m9_cfg();
             c.raft.as_mut().unwrap().feature_level = bad;
             assert!(c.raft_validate().is_err(), "feature_level={bad} 应拒绝");
         }
-        let mut c = m9_cfg();
-        c.raft.as_mut().unwrap().feature_level = 2;
-        assert!(c.raft_validate().is_ok());
+        for good in [2, crate::raft::compat::MAX_FEATURE_LEVEL] {
+            let mut c = m9_cfg();
+            c.raft.as_mut().unwrap().feature_level = good;
+            assert!(c.raft_validate().is_ok(), "feature_level={good} 应接受");
+        }
     }
 
     #[test]
