@@ -40,6 +40,7 @@ fn sample() -> RunState {
             ..JobRow::default()
         }],
         next_job_id: 8,
+        next_run_id: 1,
         ..RunState::default()
     }
 }
@@ -72,6 +73,21 @@ fn snapshot_without_extension_decodes_empty_runstate() {
     let snap = data::encode_snapshot_at(&ControlData::default(), 2).unwrap();
     let (_, rs) = decode_runstate_snapshot(&snap).unwrap();
     assert!(rs.is_empty());
+}
+
+/// 未知扩展命名空间不得被 helper 静默丢弃（生产 install 已 fail-closed，这里也拒绝）。
+#[test]
+fn decode_runstate_snapshot_rejects_unknown_extension() {
+    let mut exts = data::SnapshotExtensions::new();
+    exts.insert(
+        "other.namespace".into(),
+        data::SnapshotExtension {
+            version: 1,
+            payload_b64: "e30=".into(),
+        },
+    );
+    let snap = data::encode_snapshot_with_extensions(&ControlData::default(), 3, exts).unwrap();
+    assert!(decode_runstate_snapshot(&snap).is_err());
 }
 
 /// 真实状态机路径：build 在同一读事务里取运行态，install 与 11 表同事务替换。

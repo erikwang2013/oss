@@ -128,7 +128,7 @@ async fn invalid_runstate_is_rejected_before_any_write() {
     cases.push(("next_job_id", s));
     let mut s = good.clone();
     s.next_job_id = 0;
-    cases.push(("next_job_id", s));
+    cases.push(("non-empty runstate", s));
     let mut s = good.clone();
     s.next_run_id = 42;
     cases.push(("next_run_id", s));
@@ -136,6 +136,11 @@ async fn invalid_runstate_is_rejected_before_any_write() {
     let mut s = good.clone();
     s.next_job_id = -1;
     cases.push(("positive", s));
+
+    // M4：parent_job_id 悬空。
+    let mut s = good.clone();
+    s.jobs[0].parent_job_id = Some(999);
+    cases.push(("parent_job_id", s));
 
     // 清空 jobs 后，三类作业引用分别悬空；各自先清掉更早的悬空表以隔离报错。
     let mut s = good.clone();
@@ -315,9 +320,10 @@ async fn explicit_ids_advance_sqlite_sequence() {
         1,
         "sequence row sanity"
     );
-    let seq: Option<i64> = sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'jobs'")
-        .fetch_optional(db.pool())
-        .await
-        .unwrap();
+    let seq: Option<i64> =
+        sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'jobs'")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
     assert!(seq.is_some_and(|s| s >= 8));
 }

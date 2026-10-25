@@ -118,6 +118,15 @@ pub fn encode_runstate_snapshot(
 /// 解码 OSSCTL3 快照中的运行态；无扩展 = 空运行态（低级别快照不携带本地运行态）。
 pub fn decode_runstate_snapshot(bytes: &[u8]) -> Result<(ControlData, RunState), DataError> {
     let snapshot = decode_snapshot(bytes)?;
+    if let Some(name) = snapshot
+        .extensions
+        .keys()
+        .find(|k| k.as_str() != RUNSTATE_EXTENSION)
+    {
+        return Err(DataError::Format(format!(
+            "runstate snapshot carries unknown extension {name:?}; refusing to drop it"
+        )));
+    }
     let runstate = match snapshot.extensions.get(RUNSTATE_EXTENSION) {
         Some(ext) => from_snapshot_extension(ext, RUNSTATE_EXTENSION_VERSION)?,
         None => RunState::default(),

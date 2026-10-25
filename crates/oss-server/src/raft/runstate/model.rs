@@ -184,6 +184,13 @@ impl RunState {
                 self.next_job_id, self.next_run_id
             )));
         }
+        // 非空运行态必须已初始化：否则 level-3 的 id 分配器会从 0 开始与行冲突。
+        if !self.is_empty() && (self.next_job_id == 0 || self.next_run_id == 0) {
+            return Err(DataError::Format(format!(
+                "non-empty runstate requires seeded next ids (job={}, run={})",
+                self.next_job_id, self.next_run_id
+            )));
+        }
         check_sequence(
             "next_job_id",
             self.next_job_id,
@@ -196,6 +203,16 @@ impl RunState {
         )?;
 
         let job_ids: HashSet<i64> = self.jobs.iter().map(|j| j.id).collect();
+        for j in &self.jobs {
+            if let Some(parent) = j.parent_job_id
+                && !job_ids.contains(&parent)
+            {
+                return Err(DataError::Format(format!(
+                    "runstate jobs {} references missing parent_job_id {parent}",
+                    j.id
+                )));
+            }
+        }
         for t in &self.job_tasks {
             if !job_ids.contains(&t.job_id) {
                 return Err(DataError::Format(format!(
