@@ -95,6 +95,7 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(
         &src,
         "site-a".into(),
@@ -112,6 +113,7 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
 
     let dst = db_at(dir.path(), "dst.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     // 目标已有相同行 → 无冲突，dry-run 不写。
     let report = cutover::cutover(
         &dst,
@@ -229,6 +231,7 @@ async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     // dry-run：报告冲突但不写行、不写 marker。
     let dst = db_at(dir.path(), "l2-dst.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     let report = cutover::cutover(
         &dst,
         &facts(),
@@ -275,6 +278,7 @@ async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     // force-recover：feature_level=1 在写之前拒绝；=2 接受并留下 OSSCTL2 基线快照。
     let dst2 = db_at(dir.path(), "l2-recover.db").await;
     seed_admin_and_rows(&dst2).await;
+    clear_canonical_accounts(&dst2).await;
     dst2.schema_meta_set("raft_mode", "on").await.unwrap();
     let raft_db = dir.path().join("l2-raft.db");
     let settings = raft_settings(7, RaftRole::Voter, raft_db.clone());
@@ -466,6 +470,7 @@ async fn force_recover_fresh_log_and_refuses_existing() {
     .unwrap();
     let dst = db_at(dir.path(), "dst2.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     cutover::cutover(
         &dst,
         &facts(),
@@ -519,6 +524,7 @@ async fn cutover_diff_reports_changed_field() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "src3.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(
         &src,
         "site-a".into(),
@@ -531,6 +537,7 @@ async fn cutover_diff_reports_changed_field() {
     .unwrap();
     let dst = db_at(dir.path(), "dst3.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     sqlx::query("UPDATE buckets SET versioning = 'Suspended' WHERE name = 'b1'")
         .execute(dst.pool())
         .await
@@ -628,4 +635,41 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
         .unwrap();
     assert_eq!(oss_server::raft::membership::view(&handle).voters, vec![3]);
     handle.shutdown().await;
+}
+
+/// level<3 来源不含账户行；已规范化目标上的 cutover 必须在写之前拒绝，
+/// 否则 install_tx 会整表清空账户而 marker 仍保留。
+#[tokio::test]
+async fn cutover_refuses_level_two_export_onto_canonical_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "guard-src.db").await;
+    seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
+    let export = cutover::build_export(
+        &src,
+        "site-a".into(),
+        Some(1),
+        "voter",
+        Some("admin".into()),
+        Some(false),
+    )
+    .await
+    .unwrap();
+    let dst = db_at(dir.path(), "guard-dst.db").await;
+    seed_admin_and_rows(&dst).await;
+    assert!(dst.accounts_canonical().await.unwrap());
+
+    let err = cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("canonical account rows"), "{err}");
+    assert_eq!(dst.schema_meta("raft_mode").await.unwrap(), None);
 }

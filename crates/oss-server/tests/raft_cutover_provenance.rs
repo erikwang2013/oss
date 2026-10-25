@@ -387,6 +387,7 @@ async fn activated_export_without_level_two_data_stays_activated() {
     // cutover：无 level-2 行也写 marker=2。
     let dst = db_at(dir.path(), "act-dst.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     cutover::cutover(
         &dst,
         &facts(),
@@ -420,6 +421,7 @@ async fn activated_export_without_level_two_data_stays_activated() {
     assert_eq!(cutover::install_activation_level(&v116), 2);
     let dst2 = db_at(dir.path(), "act-dst2.db").await;
     seed_admin_and_rows(&dst2).await;
+    clear_canonical_accounts(&dst2).await;
     cutover::cutover(
         &dst2,
         &facts(),
@@ -442,6 +444,7 @@ async fn activated_export_without_level_two_data_stays_activated() {
     // force-recover：feature_level=1 在写前拒绝；=2 接受并留 OSSCTL2 基线快照。
     let dst3 = db_at(dir.path(), "act-rec.db").await;
     seed_admin_and_rows(&dst3).await;
+    clear_canonical_accounts(&dst3).await;
     dst3.schema_meta_set("raft_mode", "on").await.unwrap();
     let raft_db = dir.path().join("act-raft.db");
     let settings = raft_settings(7, RaftRole::Voter, raft_db.clone());
@@ -507,6 +510,7 @@ async fn legacy_export_without_provenance_is_accepted_with_warning() {
     // 未验证但不阻断：dry-run 走完同一校验路径且不写。
     let dst = db_at(dir.path(), "legacy-dst.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     let report = cutover::cutover(
         &dst,
         &facts(),

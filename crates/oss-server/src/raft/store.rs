@@ -578,6 +578,17 @@ impl SqliteStateMachine {
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
         let snapshot = data::decode_snapshot(bytes).map_err(Self::data_err)?;
+        // 单向门：本机已激活 level 3 后，level<3 快照不可能携带账户行，整表安装会
+        // 静默清空账户（marker 又不清除），在任何锁/写之前拒绝。
+        let local_activation = self.activation.load(Ordering::Relaxed);
+        if local_activation >= super::compat::FEATURE_LEVEL_3
+            && snapshot.feature_level < super::compat::FEATURE_LEVEL_3
+        {
+            return Err(Self::data_err(data::DataError::Format(format!(
+                "node activation level {local_activation} cannot install a level-{} snapshot",
+                snapshot.feature_level
+            ))));
+        }
         if !snapshot.extensions.is_empty() {
             // Wave 1 消费者落地前 fail-closed：安装只写 data，非空扩展区会被静默丢弃
             // （数据丢失）——在加锁/写任何行之前拒绝。

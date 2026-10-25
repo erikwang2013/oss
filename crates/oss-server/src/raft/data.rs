@@ -511,19 +511,30 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
     // uid 派生行，复制出去会让其它节点按本地 id 解释（跨节点不可解释）。
     if accounts_canonical(conn).await? {
         for r in sqlx::query(
-            "SELECT a.id, a.name, a.status, a.bucket_quota, a.soft_byte_quota, \
-                    a.created_at, a.updated_at, u.username AS admin_username \
+            "SELECT a.id, a.name, a.status, a.admin_uid, a.bucket_quota, a.soft_byte_quota, \
+                    a.created_at, a.updated_at, u.username AS admin_username, \
+                    u.is_admin AS admin_is_admin \
              FROM accounts a LEFT JOIN users u ON u.id = a.admin_uid ORDER BY a.id",
         )
         .fetch_all(&mut *conn)
         .await
         .map_err(sql)?
         {
+            let admin_uid: Option<i64> = r.get("admin_uid");
+            let admin_username: Option<String> = r.get("admin_username");
+            let admin_is_admin: Option<bool> = r.get("admin_is_admin");
+            if admin_uid.is_some() && (admin_username.is_none() || admin_is_admin == Some(true)) {
+                return Err(DataError::Format(format!(
+                    "account {} admin_uid {} is missing or a global admin (not exportable)",
+                    r.get::<String, _>("id"),
+                    admin_uid.unwrap_or_default()
+                )));
+            }
             data.accounts.push(AccountRow {
                 id: r.get("id"),
                 name: r.get("name"),
                 status: r.get("status"),
-                admin: r.get("admin_username"),
+                admin: admin_username,
                 bucket_quota: r.get("bucket_quota"),
                 soft_byte_quota: r.get("soft_byte_quota"),
                 created_at: r.get("created_at"),
@@ -531,7 +542,7 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
             });
         }
         for r in sqlx::query(
-            "SELECT am.account_id, u.username, am.role, am.created_at \
+            "SELECT am.account_id, u.username, u.is_admin AS is_admin, am.role, am.created_at \
              FROM account_members am JOIN users u ON u.id = am.uid \
              ORDER BY am.account_id, u.username",
         )
@@ -539,6 +550,13 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
         .await
         .map_err(sql)?
         {
+            if r.get::<bool, _>("is_admin") {
+                return Err(DataError::Format(format!(
+                    "account_members {}/{} points at a global admin (not exportable)",
+                    r.get::<String, _>("account_id"),
+                    r.get::<String, _>("username")
+                )));
+            }
             data.account_members.push(AccountMemberRow {
                 account_id: r.get("account_id"),
                 username: r.get("username"),
@@ -584,6 +602,8 @@ pub struct InstallReport {
     pub access_points: usize,
     pub olap_configs: usize,
     pub inventory_configs: usize,
+    pub accounts: usize,
+    pub account_members: usize,
 }
 
 fn report_of(data: &ControlData) -> InstallReport {
@@ -599,6 +619,8 @@ fn report_of(data: &ControlData) -> InstallReport {
         access_points: data.access_points.len(),
         olap_configs: data.olap_configs.len(),
         inventory_configs: data.inventory_configs.len(),
+        accounts: data.accounts.len(),
+        account_members: data.account_members.len(),
     }
 }
 
@@ -1264,7 +1286,15 @@ fn decode_snapshot_with_max(bytes: &[u8], max_format: u32) -> Result<DecodedSnap
             )));
         }
         let v2: SnapshotV2<ControlData> = serde_json::from_slice(checked_payload(rest)?)?;
-        // 格式 2 已冻结，不能借“声明 feature_level=3”夹带 level-3 数据。
+        // 格式 2 已冻结：声明 level 3 一律拒绝（即使载荷恰好没有账户行），与
+        // export 侧 `reject format 2 when feature_level >= 3` 保持同一口径。
+        if v2.feature_level >= FEATURE_LEVEL_3 {
+            return Err(DataError::Format(format!(
+                "snapshot format 2 (OSSCTL2) declares feature level {}; format 3 required",
+                v2.feature_level
+            )));
+        }
+        // 不能借“声明 feature_level=3”夹带 level-3 数据（上面的检查已覆盖，保留兜底）。
         let required = required_feature_level(&v2.data);
         if required >= FEATURE_LEVEL_3 {
             return Err(DataError::Format(format!(
@@ -1802,6 +1832,18 @@ mod tests {
             "{err}"
         );
 
+        // 即使载荷没有账户行，V2 声明 level 3 也必须拒绝（与 export 口径一致）。
+        let payload = serde_json::to_vec(&SnapshotV2 {
+            feature_level: FEATURE_LEVEL_3,
+            data: &clean,
+        })
+        .unwrap();
+        let err = decode_snapshot(&seal(MAGIC_V2, &payload)).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("format 3 required")),
+            "{err}"
+        );
+
         let payload = serde_json::to_vec(&SnapshotV2 {
             feature_level: 1,
             data: &level_two(),
@@ -2057,8 +2099,13 @@ mod tests {
             })
             .unwrap();
             let err = decode_snapshot(&seal(MAGIC_V2, &payload)).unwrap_err();
+            let want = if level >= FEATURE_LEVEL_3 {
+                "format 3 required"
+            } else {
+                "cannot carry level-3 data"
+            };
             assert!(
-                matches!(&err, DataError::Format(m) if m.contains("cannot carry level-3 data")),
+                matches!(&err, DataError::Format(m) if m.contains(want)),
                 "level {level}: {err}"
             );
         }

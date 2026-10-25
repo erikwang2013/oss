@@ -216,6 +216,20 @@ fn diff_control(src: &ControlData, dst: &ControlData) -> Vec<Diff> {
         |r| format!("{}|{}", r.bucket, r.id),
         &mut d,
     );
+    diff_table(
+        "accounts",
+        &src.accounts,
+        &dst.accounts,
+        |r| r.id.clone(),
+        &mut d,
+    );
+    diff_table(
+        "account_members",
+        &src.account_members,
+        &dst.account_members,
+        |r| format!("{}|{}", r.account_id, r.username),
+        &mut d,
+    );
     d
 }
 
@@ -312,6 +326,18 @@ pub async fn cutover(
         )));
     }
     let target = target_control(db).await?;
+    // level<3 来源不含账户行；已规范化的目标被 install_tx 整表替换会静默丢失账户
+    // （marker 又只升不降），故在任何写之前拒绝。
+    if activation < super::compat::FEATURE_LEVEL_3
+        && db
+            .accounts_canonical()
+            .await
+            .map_err(|e| CutoverError::Db(e.to_string()))?
+    {
+        return Err(CutoverError::Invalid(
+            "target has canonical account rows; a level<3 export cannot carry them".into(),
+        ));
+    }
     let conflicts = diff_control(&export.data, &target);
     let mut report = CutoverReport {
         dry_run: opts.dry_run,
@@ -375,6 +401,8 @@ pub async fn cutover(
         ("access_points", installed.access_points),
         ("olap_configs", installed.olap_configs),
         ("inventory_configs", installed.inventory_configs),
+        ("accounts", installed.accounts),
+        ("account_members", installed.account_members),
     ]);
     let marker = serde_json::json!({
         "source_site": export.source_site,
@@ -394,4 +422,34 @@ pub async fn cutover(
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_control_reports_account_rows() {
+        let mut src = data::ControlData::default();
+        src.accounts.push(data::AccountRow {
+            id: "000000000001".into(),
+            name: "acct".into(),
+            status: "active".into(),
+            admin: None,
+            bucket_quota: None,
+            soft_byte_quota: None,
+            created_at: 1,
+            updated_at: 1,
+        });
+        src.account_members.push(data::AccountMemberRow {
+            account_id: "000000000001".into(),
+            username: "alice".into(),
+            role: "member".into(),
+            created_at: 1,
+        });
+        let dst = data::ControlData::default();
+        let d = diff_control(&src, &dst);
+        assert!(d.iter().any(|x| x.table == "accounts"), "{d:?}");
+        assert!(d.iter().any(|x| x.table == "account_members"), "{d:?}");
+    }
 }

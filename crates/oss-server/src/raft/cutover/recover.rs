@@ -56,6 +56,11 @@ pub async fn force_recover(
     // 配置必然被 R8 启动守卫拒绝。在写任何行之前失败，避免留下“数据已装、节点起不来”
     // 的半恢复库。
     let activation = install_activation_level(export);
+    if activation < compat::FEATURE_LEVEL_3
+        && db.accounts_canonical().await.map_err(|e| e.to_string())?
+    {
+        return Err("target has canonical account rows; a level<3 export cannot carry them".into());
+    }
     if activation > compat::advertised_feature(settings.feature_level) {
         return Err(format!(
             "export requires activation level {activation} (source activation or level-{} \
