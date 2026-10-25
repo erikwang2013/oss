@@ -81,6 +81,7 @@ pub fn acquire_shrink_lock(root: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(&dir)?;
     let f = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(dir.join("active.lock"))?;
