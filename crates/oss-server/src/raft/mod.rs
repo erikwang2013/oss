@@ -92,6 +92,11 @@ pub enum WriteError {
         required: u8,
         effective: u8,
     },
+    /// `Ext.type_id` 不在本构建的注册表：leader 在 append 前拒绝（无日志、无 marker）。
+    /// 新类型必须提升 feature level 或先完成 per-peer 类型能力协商。
+    UnregisteredExtType {
+        type_id: String,
+    },
 }
 
 impl std::fmt::Display for WriteError {
@@ -109,6 +114,11 @@ impl std::fmt::Display for WriteError {
             } => write!(
                 f,
                 "raft feature level {required} not active (effective {effective})"
+            ),
+            Self::UnregisteredExtType { type_id } => write!(
+                f,
+                "raft Ext type_id {type_id:?} is not registered (new type requires a new \
+                 feature level or negotiated per-peer capability; nothing was appended)"
             ),
         }
     }
@@ -340,6 +350,16 @@ impl RaftHandle {
                 effective,
             });
         }
+        // level 3 只代表能解码 Ext 容器：未注册的 type_id 必须在 append 前拒绝，
+        // 否则各节点的 apply 结果会静默分叉（旧 level-3 副本 → Invalid）且 marker
+        // 被单向激活。leader 权威判定；follower 转发后由这里兜住。
+        if let ControlCommand::Ext { type_id, .. } = cmd
+            && !command::ext_type_registered(type_id)
+        {
+            return Err(WriteError::UnregisteredExtType {
+                type_id: type_id.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -534,6 +554,28 @@ impl RaftHandle {
                     });
                 }
                 Err(WriteError::NoQuorum)
+            }
+            // leader 的注册表是权威：follower 不本地判定（混合二进制注册表可能不同）。
+            400 => {
+                #[derive(Deserialize)]
+                struct Rejected {
+                    #[serde(default)]
+                    error: String,
+                    #[serde(default)]
+                    type_id: String,
+                }
+                if let Ok(r) = serde_json::from_slice::<Rejected>(&body)
+                    && r.error == "unregistered_ext_type"
+                {
+                    return Err(WriteError::UnregisteredExtType { type_id: r.type_id });
+                }
+                Err(WriteError::Raft(format!(
+                    "leader write HTTP 400: {}",
+                    String::from_utf8_lossy(&body)
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                )))
             }
             other => Err(WriteError::Raft(format!(
                 "leader write HTTP {other}: {}",
@@ -787,6 +829,42 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Level C 命令演进：leader 只接受显式注册的 Ext 类型。`test.noop` 是仅测试
+    /// 构建注册的探针，必须能提交并激活 marker 3（生产注册表为空）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_ext_test_type_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("control.db").display()
+        );
+        let db = crate::db::Db::connect_raft(&url).await.unwrap();
+        let mut settings = test_settings(dir.path());
+        settings.feature_level = 3;
+        let handle = spawn_with_control(settings, Some(db.pool().clone()), None)
+            .await
+            .unwrap();
+        wait_leader(&handle).await;
+        assert_eq!(
+            handle
+                .write(ControlCommand::Ext {
+                    type_id: "test.noop".into(),
+                    payload: serde_json::json!({}),
+                })
+                .await
+                .unwrap(),
+            ControlResponse::Ok
+        );
+        // 首条 level-3 entry 与激活 marker 同事务提交。
+        let marker: String =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(marker, "3");
+        handle.shutdown().await;
     }
 
     /// R8：已激活 marker=2 的库用 feature_level=1 启动必须拒绝（错误里两个值都要在）。
