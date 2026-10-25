@@ -925,7 +925,7 @@ impl AppConfig {
     /// 与 `[cluster]`/`[[groups]]` 互斥。`[sync]` 仅校验上限，无 `[raft]` 时不生效。
     pub fn raft_validate(&self) -> Result<(), String> {
         self.sync_validate()?;
-        if self.maintenance {
+        if self.maintenance && self.raft.is_some() {
             return Err(
                 "maintenance 仅用于 [cluster] shrink；[raft] 模式下会阻断 raft RPC，拒绝启动"
                     .into(),
@@ -1293,6 +1293,9 @@ mod tests {
         assert!(!off.maintenance);
         let on: AppConfig = toml::from_str(&format!("{base}maintenance = true\n")).unwrap();
         assert!(on.maintenance);
+        // 无 [raft] 时必须放行（这是 shrink 的 maintenance 部署形态；raft_validate 被
+        // AppConfig::load 无条件调用，不能在这里误杀 [cluster] shrink）。
+        on.raft_validate().unwrap();
     }
 
     /// maintenance 是 [cluster] shrink 的停写开关；[raft] 的 RPC 是 POST，会被
