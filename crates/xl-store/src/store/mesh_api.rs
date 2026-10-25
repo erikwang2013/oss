@@ -9,12 +9,30 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::mesh::NodeHealth;
+use crate::mesh::{NodeHealth, TopologyAttestation};
 use crate::meta;
 
 use super::Store;
 use super::drives;
 use super::ec;
+
+/// 拓扑指纹 canonical string：`epoch;data;parity;enabled;`，然后每个 set 的
+/// `set_index;` + 该 set 节点按 id 升序的 `id,addr,drive_count;`；SHA-256 前 8 字节 hex。
+///
+/// 跨节点/跨版本约定：任何一端改了这份渲染即指纹全变（升级需显式 epoch 递增）。
+fn topo_fingerprint(sets: &drives::ClusterSets, ec: &ec::EcConfig, epoch: u64) -> String {
+    use sha2::Digest as _;
+    let mut canon = format!("{epoch};{};{};{};", ec.data, ec.parity, ec.enabled);
+    for (i, topo) in sets.sets.iter().enumerate() {
+        canon.push_str(&format!("{i};"));
+        let mut nodes: Vec<&drives::NodeSpec> = topo.nodes.iter().collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        for n in nodes {
+            canon.push_str(&format!("{},{},{};", n.id, n.addr, n.drive_count));
+        }
+    }
+    hex::encode(&sha2::Sha256::digest(canon.as_bytes())[..8])
+}
 
 impl Store {
     /// 本节点健康：拓扑视角的槽位在册状态 + 桶计数（/health/cluster 与 fixture 共用）。
@@ -46,6 +64,7 @@ impl Store {
                 }
             }
         }
+        let caps = self.local_caps();
         NodeHealth {
             node_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -53,6 +72,26 @@ impl Store {
             buckets: buckets.len() as u64,
             // DP-0：本版数据面线格式；旧节点缺字段 → 消费方按 1。
             data_wire_version: crate::mesh_gate::DATA_WIRE_VERSION,
+            topo_epoch: caps.topo_epoch,
+            topo_hash: caps.topo_hash,
+        }
+    }
+
+    /// 本节点拓扑指纹：无集群 → (1, 空串)；placement v1 → 1；v2 → 2。
+    /// hash 覆盖 EC 参数与全部 set 的节点表（按 id 排序），与 [`Store::mesh_health`] 同源。
+    pub fn local_caps(&self) -> TopologyAttestation {
+        match self.cfg.cluster.as_deref() {
+            None => TopologyAttestation {
+                topo_epoch: 1,
+                topo_hash: String::new(),
+            },
+            Some(cl) => {
+                let epoch = if cl.placement_v2 { 2 } else { 1 };
+                TopologyAttestation {
+                    topo_epoch: epoch,
+                    topo_hash: topo_fingerprint(&cl.sets, &self.cfg.ec, epoch),
+                }
+            }
         }
     }
 
@@ -743,5 +782,43 @@ impl Store {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::StoreConfig;
+    use crate::store::tests::Cluster;
+
+    /// 4×3 集群：所有节点宣告同一 topo_hash；placement v1/v2 epoch 与 hash 都不同；
+    /// 单节点（无集群）= epoch 1 + 空 hash，与旧版本健康响应兼容。
+    #[tokio::test]
+    async fn mesh_health_advertises_topo_attestation() {
+        let c = Cluster::new(4, 3).await;
+        let hs = futures::future::join_all(c.stores.iter().map(|s| s.mesh_health())).await;
+        for h in &hs {
+            assert_eq!(h.topo_epoch, 1, "placement v1");
+            assert_eq!(h.topo_hash.len(), 16, "sha256 前 8 字节 hex");
+        }
+        assert!(
+            hs.windows(2).all(|w| w[0].topo_hash == w[1].topo_hash),
+            "同一拓扑必须得到同一指纹"
+        );
+        assert_eq!(c.stores[0].local_caps().topo_hash, hs[0].topo_hash);
+
+        let v2 = Cluster::new_with_placement(4, 3, true).await;
+        let h2 = v2.stores[0].mesh_health().await;
+        assert_eq!(h2.topo_epoch, 2, "placement v2");
+        assert_ne!(h2.topo_hash, hs[0].topo_hash, "epoch 参与指纹");
+        let hs2 = futures::future::join_all(v2.stores.iter().map(|s| s.mesh_health())).await;
+        assert!(hs2.windows(2).all(|w| w[0].topo_hash == w[1].topo_hash));
+
+        let dir = tempfile::tempdir().unwrap();
+        let single = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+        let h = single.mesh_health().await;
+        assert_eq!(h.topo_epoch, 1);
+        assert!(h.topo_hash.is_empty());
+        assert_eq!(single.local_caps().topo_epoch, 1);
     }
 }

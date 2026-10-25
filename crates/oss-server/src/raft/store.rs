@@ -578,6 +578,21 @@ impl SqliteStateMachine {
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
         let snapshot = data::decode_snapshot(bytes).map_err(Self::data_err)?;
+        if !snapshot.extensions.is_empty() {
+            // Wave 1 消费者落地前 fail-closed：安装只写 data，非空扩展区会被静默丢弃
+            // （数据丢失）——在加锁/写任何行之前拒绝。
+            return Err(Self::data_err(data::DataError::Format(format!(
+                "snapshot carries {} opaque extension(s) [{}] but this binary has no \
+                 extension consumers; refusing to install and drop them",
+                snapshot.extensions.len(),
+                snapshot
+                    .extensions
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))));
+        }
         let _guard = self.snapshot_lock.lock().await;
         let mut tx = self
             .pool
@@ -849,7 +864,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     ErrorSubject::Snapshot(None),
                     ErrorVerb::Write,
                     std::io::Error::other(
-                        "control state machine requires OSSCTL1/OSSCTL2 snapshot \
+                        "control state machine requires OSSCTL1/OSSCTL2/OSSCTL3 snapshot \
                          (legacy KV snapshot rejected)",
                     ),
                 ));
@@ -1292,6 +1307,94 @@ mod tests {
             "安装 OSSCTL2 必须激活 marker"
         );
         assert_eq!(sm_b.activation_level(), 2);
+    }
+
+    /// V3 扩展区：Wave 1 消费者落地前 fail-closed（拒绝安装、不写行）；空扩展区仍可安装。
+    #[tokio::test]
+    async fn control_snapshot_with_opaque_extensions_is_rejected_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let url_a = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("ext-a.db").display()
+        );
+        let url_b = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("ext-b.db").display()
+        );
+        let db_a = crate::db::Db::connect_raft(&url_a).await.unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(db_a.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
+             VALUES ('ext-user', 'hash', 0, 'active', 1)",
+        )
+        .execute(db_a.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+            .execute(db_a.pool())
+            .await
+            .unwrap();
+
+        let mut sm_a =
+            SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None, 3)
+                .await
+                .unwrap();
+        let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
+            .await
+            .unwrap();
+        let decoded = data::decode_snapshot(snap.snapshot.get_ref()).unwrap();
+
+        let mut extensions = data::SnapshotExtensions::new();
+        extensions.insert(
+            "m8.runstate".into(),
+            data::SnapshotExtension {
+                version: 1,
+                payload_b64: "b3BhcXVl".into(), // base64("opaque")
+            },
+        );
+        let with_ext = data::encode_snapshot_with_extensions(&decoded.data, 3, extensions).unwrap();
+        assert!(with_ext.starts_with(data::SNAPSHOT_MAGIC_V3));
+
+        let db_b = crate::db::Db::connect_raft(&url_b).await.unwrap();
+        let mut sm_b =
+            SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 3)
+                .await
+                .unwrap();
+        let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(with_ext)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("extension"),
+            "{err}"
+        );
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db_b.pool())
+            .await
+            .unwrap();
+        assert_eq!(users, 0, "拒绝安装不得写任何行");
+
+        // 空扩展区的 V3 不触发闸门：正常安装并保留数据。
+        let no_ext = data::encode_snapshot_at(&decoded.data, 3).unwrap();
+        assert!(no_ext.starts_with(data::SNAPSHOT_MAGIC_V3));
+        RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(no_ext)),
+        )
+        .await
+        .unwrap();
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db_b.pool())
+            .await
+            .unwrap();
+        assert_eq!(users, 1);
     }
 
     /// Minor 3：序列化后超限的快照在 build 阶段即拒绝。

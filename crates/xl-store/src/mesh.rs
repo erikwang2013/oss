@@ -195,6 +195,18 @@ pub struct NodeHealth {
     /// DP-0 数据面线格式（原样上报；旧节点缺省 0）。判定一律用
     /// [`NodeHealth::peer_data_wire_version`]（见 `mesh_gate`）。
     pub data_wire_version: u32,
+    /// 拓扑指纹（dproll M1 / shrink topo v4 共用）：1 = placement v1，2 = v2。
+    /// 旧节点缺省 0 = 未宣告，消费方不得当成匹配。
+    pub topo_epoch: u64,
+    /// 拓扑指纹 hex（16 字符；无集群为空串）。见 [`TopologyAttestation`]。
+    pub topo_hash: String,
+}
+
+/// 本节点拓扑指纹：`topo_epoch` + `topo_hash`（[`NodeHealth`] 字段 6/7 的来源）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyAttestation {
+    pub topo_epoch: u64,
+    pub topo_hash: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
