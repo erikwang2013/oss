@@ -12,6 +12,23 @@ async fn db_at(dir: &Path, name: &str) -> Db {
     Db::connect(&url).await.unwrap()
 }
 
+/// 清掉 standalone backfill 产生的系统账户与 canonical marker，模拟未 canonical 的来源。
+async fn clear_canonical_accounts(db: &Db) {
+    sqlx::query("DELETE FROM account_members")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM accounts")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+        .bind(oss_server::db::META_ACCOUNTS_CANONICAL)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
 async fn seed_admin_and_rows(db: &Db) {
     sqlx::query(
         "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
@@ -78,6 +95,7 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(
         &src,
         "site-a".into(),
@@ -95,6 +113,7 @@ async fn export_checksum_and_cutover_dry_run_conflict_overwrite() {
 
     let dst = db_at(dir.path(), "dst.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     // 目标已有相同行 → 无冲突，dry-run 不写。
     let report = cutover::cutover(
         &dst,
@@ -183,6 +202,7 @@ async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     .execute(src.pool())
     .await
     .unwrap();
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(
         &src,
         "site-a".into(),
@@ -211,6 +231,7 @@ async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     // dry-run：报告冲突但不写行、不写 marker。
     let dst = db_at(dir.path(), "l2-dst.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     let report = cutover::cutover(
         &dst,
         &facts(),
@@ -257,6 +278,7 @@ async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     // force-recover：feature_level=1 在写之前拒绝；=2 接受并留下 OSSCTL2 基线快照。
     let dst2 = db_at(dir.path(), "l2-recover.db").await;
     seed_admin_and_rows(&dst2).await;
+    clear_canonical_accounts(&dst2).await;
     dst2.schema_meta_set("raft_mode", "on").await.unwrap();
     let raft_db = dir.path().join("l2-raft.db");
     let settings = raft_settings(7, RaftRole::Voter, raft_db.clone());
@@ -299,11 +321,143 @@ async fn cutover_and_force_recover_install_level_two_data_via_ossctl2() {
     );
 }
 
+/// level-3 账户数据 cutover：目标按 username 重建成员、写 canonical marker 与激活级别，
+/// 目标再导出的封套号仍为 OSSCTL3。
+#[tokio::test]
+async fn cutover_installs_level_three_accounts_and_marks_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "l3-src.db").await;
+    seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
+    src.schema_meta_set("raft_feature_level", "3")
+        .await
+        .unwrap();
+    src.schema_meta_set(oss_server::db::META_ACCOUNTS_CANONICAL, "done")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts \
+         (id, name, status, bucket_quota, soft_byte_quota, created_at, updated_at) \
+         VALUES ('000000000002', 'alice-acct', 'active', 2, 1024, 4, 5)",
+    )
+    .execute(src.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO account_members (account_id, uid, role, created_at) \
+         VALUES ('000000000002', 2, 'owner', 4)",
+    )
+    .execute(src.pool())
+    .await
+    .unwrap();
+    let export = cutover::build_export(
+        &src,
+        "site-a".into(),
+        Some(1),
+        "voter",
+        Some("admin".into()),
+        Some(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(export.snapshot_format, Some(3));
+    assert_eq!(export.data.accounts.len(), 1);
+
+    let dst = db_at(dir.path(), "l3-dst.db").await;
+    seed_admin_and_rows(&dst).await;
+    // Db::connect 的 standalone backfill 已写 marker；清掉才能证明 install 自己会写。
+    clear_canonical_accounts(&dst).await;
+    assert!(!dst.accounts_canonical().await.unwrap());
+    let report = cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.written);
+    assert_eq!(
+        dst.schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("3")
+    );
+    assert!(
+        dst.accounts_canonical().await.unwrap(),
+        "level-3 cutover 必须写 canonical marker"
+    );
+    let alice_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    let member_uid: i64 =
+        sqlx::query_scalar("SELECT uid FROM account_members WHERE account_id = '000000000002'")
+            .fetch_one(dst.pool())
+            .await
+            .unwrap();
+    assert_eq!(member_uid, alice_uid, "成员按 username 映射到目标本地 id");
+
+    // 目标再导出：canonical + marker=3 → 仍是 OSSCTL3，账户行不丢。
+    let again = cutover::build_export(
+        &dst,
+        "site-b".into(),
+        Some(2),
+        "voter",
+        Some("admin".into()),
+        Some(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.snapshot_format, Some(3));
+    assert_eq!(again.data.accounts.len(), 1);
+    assert_eq!(again.data.account_members.len(), 1);
+
+    // force-recover：level-3 导出写 canonical marker，恢复出的基线快照仍是 OSSCTL3。
+    let dst2 = db_at(dir.path(), "l3-recover.db").await;
+    seed_admin_and_rows(&dst2).await;
+    clear_canonical_accounts(&dst2).await;
+    assert!(!dst2.accounts_canonical().await.unwrap());
+    dst2.schema_meta_set("raft_mode", "on").await.unwrap();
+    let raft_db = dir.path().join("l3-raft.db");
+    let mut settings = raft_settings(9, RaftRole::Voter, raft_db.clone());
+    settings.feature_level = 3;
+    cutover::force_recover(&dst2, &raft_db, &settings, &export, 9)
+        .await
+        .unwrap();
+    assert!(
+        dst2.accounts_canonical().await.unwrap(),
+        "level-3 force-recover 必须写 canonical marker"
+    );
+    let alice_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        .fetch_one(dst2.pool())
+        .await
+        .unwrap();
+    let member_uid: i64 =
+        sqlx::query_scalar("SELECT uid FROM account_members WHERE account_id = '000000000002'")
+            .fetch_one(dst2.pool())
+            .await
+            .unwrap();
+    assert_eq!(member_uid, alice_uid);
+    let snap_bytes: Vec<u8> = sqlx::query_scalar("SELECT data FROM raft_snapshot WHERE id = 1")
+        .fetch_one(dst2.pool())
+        .await
+        .unwrap();
+    let snapshot = oss_server::raft::data::decode_snapshot(&snap_bytes).unwrap();
+    assert_eq!(snapshot.feature_level, 3);
+    assert_eq!(snapshot.data.accounts.len(), 1);
+}
+
 #[tokio::test]
 async fn force_recover_fresh_log_and_refuses_existing() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "src2.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(
         &src,
         "site-a".into(),
@@ -316,6 +470,7 @@ async fn force_recover_fresh_log_and_refuses_existing() {
     .unwrap();
     let dst = db_at(dir.path(), "dst2.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     cutover::cutover(
         &dst,
         &facts(),
@@ -369,6 +524,7 @@ async fn cutover_diff_reports_changed_field() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "src3.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(
         &src,
         "site-a".into(),
@@ -381,6 +537,7 @@ async fn cutover_diff_reports_changed_field() {
     .unwrap();
     let dst = db_at(dir.path(), "dst3.db").await;
     seed_admin_and_rows(&dst).await;
+    clear_canonical_accounts(&dst).await;
     sqlx::query("UPDATE buckets SET versioning = 'Suspended' WHERE name = 'b1'")
         .execute(dst.pool())
         .await
@@ -407,6 +564,7 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
     // M7 库造同形导出，并标记 source_role=witness。
     let src = db_at(dir.path(), "w-src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = cutover::build_export(&src, "witness".into(), Some(3), "witness", None, None)
         .await
         .unwrap();
@@ -486,4 +644,51 @@ async fn witness_force_recover_fresh_state_db_restarts_with_identity_and_members
     };
     assert_eq!(voters, vec![3]);
     handle.shutdown().await;
+}
+
+/// level<3 来源不含账户行；已规范化目标上的 cutover 必须在写之前拒绝，
+/// 否则 install_tx 会整表清空账户而 marker 仍保留。
+#[tokio::test]
+async fn cutover_refuses_level_two_export_onto_canonical_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "guard-src.db").await;
+    seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
+    let export = cutover::build_export(
+        &src,
+        "site-a".into(),
+        Some(1),
+        "voter",
+        Some("admin".into()),
+        Some(false),
+    )
+    .await
+    .unwrap();
+    let dst = db_at(dir.path(), "guard-dst.db").await;
+    seed_admin_and_rows(&dst).await;
+    assert!(dst.accounts_canonical().await.unwrap());
+    let accounts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+
+    let err = cutover::cutover(
+        &dst,
+        &facts(),
+        &export,
+        &CutoverOptions {
+            dry_run: false,
+            overwrite: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("canonical account rows"), "{err}");
+    assert_eq!(dst.schema_meta("raft_mode").await.unwrap(), None);
+    assert!(dst.accounts_canonical().await.unwrap(), "marker 必须保留");
+    let accounts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(dst.pool())
+        .await
+        .unwrap();
+    assert_eq!(accounts_after, accounts_before, "拒绝不得清空账户行");
 }

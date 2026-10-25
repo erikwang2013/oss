@@ -123,6 +123,8 @@ fn level_one() -> ControlData {
             config_json: "{}".into(),
             updated_at: 20,
         }],
+        accounts: Vec::new(),
+        account_members: Vec::new(),
     }
 }
 
