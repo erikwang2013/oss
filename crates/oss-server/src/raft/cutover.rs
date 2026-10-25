@@ -334,6 +334,8 @@ pub async fn cutover(
     let ctx = InstallCtx {
         admin_id,
         witness: false,
+        // 来源 level 3（或数据自身要求 3）才允许冻结账户表语义。
+        canonical: activation >= super::compat::FEATURE_LEVEL_3,
     };
     let mut tx = db
         .pool()

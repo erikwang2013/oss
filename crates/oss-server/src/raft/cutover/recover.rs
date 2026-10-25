@@ -115,7 +115,12 @@ pub async fn force_recover(
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-    data::install_tx(&mut tx, &export.data, &InstallCtx { admin_id, witness })
+    let ctx = InstallCtx {
+        admin_id,
+        witness,
+        canonical: activation >= compat::FEATURE_LEVEL_3,
+    };
+    data::install_tx(&mut tx, &export.data, &ctx)
         .await
         .map_err(|e| e.to_string())?;
     if activation > compat::MIN_FEATURE_LEVEL {

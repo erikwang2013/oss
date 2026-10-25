@@ -1,4 +1,5 @@
-//! M9 S7.2：控制面复制子集（11 张表）的自然键数据模型、快照封套与整表安装。
+//! M9 S7.2：控制面复制子集（11 张表 + level-3 账户两表）的自然键数据模型、
+//! 快照封套与整表安装。
 //!
 //! 快照/导出/cutover/force-recover 共用 [`ControlData`]：只含复制表（ruling #15）
 //! ——管理员用户/AK 是站点本地状态，`buckets.set_id` 是本地物理 set（ruling #5），
@@ -184,7 +185,34 @@ pub struct InventoryConfigRow {
     pub updated_at: i64,
 }
 
+/// 账户行（level 3，AC-2）：`admin` 是账户管理员的**用户名**而非本地 uid
+/// （跨节点 uid 不稳定）；`account_members` 同样以 username 为自然键。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountRow {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub admin: Option<String>,
+    pub bucket_quota: Option<i64>,
+    pub soft_byte_quota: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountMemberRow {
+    pub account_id: String,
+    pub username: String,
+    pub role: String,
+    pub created_at: i64,
+}
+
 /// 11 张复制表的完整载荷（自然键；无本地自增 id / set_id / 管理员行）。
+///
+/// V3 新增账户两表：空表时**不序列化**，V1/V2 载荷保持逐字节冻结
+/// （旧二进制的 `deny_unknown_fields` 不能看到这两个键）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ControlData {
@@ -199,6 +227,10 @@ pub struct ControlData {
     pub access_points: Vec<AccessPointRow>,
     pub olap_configs: Vec<OlapConfigRow>,
     pub inventory_configs: Vec<InventoryConfigRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_members: Vec<AccountMemberRow>,
 }
 
 #[derive(Debug)]
@@ -253,7 +285,8 @@ fn owner_of(
     }
 }
 
-/// 单事务读取 11 张复制表（调用方负责事务；行序 = checksum/自然键确定性来源）。
+/// 单事务读取 11 张复制表（+ canonical marker 之后的 level-3 账户两表；调用方负责
+/// 事务；行序 = checksum/自然键确定性来源）。
 pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, DataError> {
     let mut data = ControlData::default();
 
@@ -474,14 +507,67 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
         });
     }
 
+    // 账户两表只在 canonical marker 之后进入快照：marker 之前它们可能是节点本地的
+    // uid 派生行，复制出去会让其它节点按本地 id 解释（跨节点不可解释）。
+    if accounts_canonical(conn).await? {
+        for r in sqlx::query(
+            "SELECT a.id, a.name, a.status, a.bucket_quota, a.soft_byte_quota, \
+                    a.created_at, a.updated_at, u.username AS admin_username \
+             FROM accounts a LEFT JOIN users u ON u.id = a.admin_uid ORDER BY a.id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql)?
+        {
+            data.accounts.push(AccountRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                status: r.get("status"),
+                admin: r.get("admin_username"),
+                bucket_quota: r.get("bucket_quota"),
+                soft_byte_quota: r.get("soft_byte_quota"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            });
+        }
+        for r in sqlx::query(
+            "SELECT am.account_id, u.username, am.role, am.created_at \
+             FROM account_members am JOIN users u ON u.id = am.uid \
+             ORDER BY am.account_id, u.username",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql)?
+        {
+            data.account_members.push(AccountMemberRow {
+                account_id: r.get("account_id"),
+                username: r.get("username"),
+                role: r.get("role"),
+                created_at: r.get("created_at"),
+            });
+        }
+    }
+
     Ok(data)
 }
 
+/// 账户表是否已规范化（Task 1 的 `schema_meta.accounts_canonical_v1`）。
+async fn accounts_canonical(conn: &mut SqliteConnection) -> Result<bool, DataError> {
+    let row: Option<String> = sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+        .bind(crate::db::META_ACCOUNTS_CANONICAL)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(sql)?;
+    Ok(row.is_some())
+}
+
 /// 安装上下文：数据站点必须有本地管理员（admin 属主 AP/inventory 指过去）；
-/// witness 没有管理员，写哨兵 0（S6a ruling）。
+/// witness 没有管理员，写哨兵 0（S6a ruling）。`canonical` = 快照是 level 3（账户
+/// 表已规范化），安装后写 `accounts_canonical_v1`。
 pub struct InstallCtx {
     pub admin_id: Option<i64>,
     pub witness: bool,
+    pub canonical: bool,
 }
 
 /// 安装结果（插入行数，日志/诊断用）。
@@ -526,6 +612,13 @@ pub(crate) async fn install_tx(
     data: &ControlData,
     ctx: &InstallCtx,
 ) -> Result<InstallReport, DataError> {
+    // 混合版本误用：level<3 安装不可能携带账户行；在任何写之前拒绝。
+    if !ctx.canonical && (!data.accounts.is_empty() || !data.account_members.is_empty()) {
+        return Err(DataError::Format(
+            "snapshot carries level-3 account rows but install is not canonical (feature level < 3)"
+                .into(),
+        ));
+    }
     // 1. AP → olap（olap_configs.access_point 外键）。
     sqlx::query("DELETE FROM olap_configs")
         .execute(&mut *conn)
@@ -547,6 +640,16 @@ pub(crate) async fn install_tx(
     }
     // 3. 权限（引用 users）。
     sqlx::query("DELETE FROM permissions")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    // 3b. 账户成员/账户（FK → users/accounts；须先于删 users）。marker 不在此清除：
+    // 规范化是单向的（低级别安装不得回退 level-3 已冻结的账户语义）。
+    sqlx::query("DELETE FROM account_members")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    sqlx::query("DELETE FROM accounts")
         .execute(&mut *conn)
         .await
         .map_err(sql)?;
@@ -610,6 +713,9 @@ pub(crate) async fn install_tx(
             .copied()
             .ok_or_else(|| DataError::Format(format!("{what} owner {name} not in snapshot")))
     };
+
+    // 7b. 账户两表（level 3）：成员/admin 按 username 映射到本地非管理员 id。
+    replace_accounts_tx(conn, &data.accounts, &data.account_members, ctx.canonical).await?;
 
     // 8. AK（快照只含 long-term parent_ak=NULL；按 username 映射本地 id）。
     for k in &data.access_keys {
@@ -834,6 +940,107 @@ pub(crate) async fn install_tx(
     Ok(report_of(data))
 }
 
+/// 整表替换账户两表（level 3）：`accounts` 必须先于 `account_members`（FK）。
+/// 成员/账户管理员按 username 解析到本地**非管理员**用户 id（跨节点 uid 不稳定，
+/// 且全局管理员永不属于任何账户）。`canonical` 时写规范化 marker（只写不清）。
+/// 本地 `account_usage` 缓存随 accounts 级联清空，由用量采样器重算。
+pub(crate) async fn replace_accounts_tx(
+    conn: &mut SqliteConnection,
+    accounts: &[AccountRow],
+    members: &[AccountMemberRow],
+    canonical: bool,
+) -> Result<(), DataError> {
+    sqlx::query("DELETE FROM account_members")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    sqlx::query("DELETE FROM accounts")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    for a in accounts {
+        if !xl_s3::access::valid_account_id(&a.id) {
+            return Err(DataError::Format(format!(
+                "account id {:?} is not 12 ASCII digits",
+                a.id
+            )));
+        }
+        if !matches!(a.status.as_str(), "active" | "disabled") {
+            return Err(DataError::Format(format!(
+                "account {} status {:?} invalid",
+                a.id, a.status
+            )));
+        }
+        let admin_uid = match &a.admin {
+            None => None,
+            Some(name) => Some(non_admin_uid(conn, name, "account admin").await?),
+        };
+        sqlx::query(
+            "INSERT INTO accounts \
+             (id, name, status, admin_uid, bucket_quota, soft_byte_quota, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&a.id)
+        .bind(&a.name)
+        .bind(&a.status)
+        .bind(admin_uid)
+        .bind(a.bucket_quota)
+        .bind(a.soft_byte_quota)
+        .bind(a.created_at)
+        .bind(a.updated_at)
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    }
+    for m in members {
+        if !matches!(m.role.as_str(), "owner" | "admin" | "member") {
+            return Err(DataError::Format(format!(
+                "account {} member {} role {:?} invalid",
+                m.account_id, m.username, m.role
+            )));
+        }
+        let uid = non_admin_uid(conn, &m.username, "account member").await?;
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&m.account_id)
+        .bind(uid)
+        .bind(&m.role)
+        .bind(m.created_at)
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    }
+    if canonical {
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
+             ON CONFLICT(key) DO UPDATE SET value = 'done'",
+        )
+        .bind(crate::db::META_ACCOUNTS_CANONICAL)
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    }
+    Ok(())
+}
+
+async fn non_admin_uid(
+    conn: &mut SqliteConnection,
+    username: &str,
+    what: &str,
+) -> Result<i64, DataError> {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND is_admin = 0")
+        .bind(username)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(sql)?
+        .ok_or_else(|| {
+            DataError::Format(format!(
+                "{what} {username:?} is not a replicated non-admin user"
+            ))
+        })
+}
+
 /// V3 扩展区条目：名字即命名空间（`[a-z0-9._-]{1,64}`，如 `m8.runstate`），载荷是
 /// 不透明 base64。版本与载荷语义由消费者（各 level-3 功能）解释；封套层只校验形状/体积。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -909,12 +1116,14 @@ fn validate_extensions(exts: &SnapshotExtensions, max_total: usize) -> Result<()
     Ok(())
 }
 
-/// 数据自身要求的最低激活级别：出现 level-2 行（`config_json`）即 2，否则 1。
+/// 数据自身要求的最低激活级别：账户行（V3 独有）→ 3，`config_json` → 2，否则 1。
 pub fn required_feature_level(data: &ControlData) -> u8 {
-    if data.lifecycle_rules.iter().any(|r| r.config_json.is_some()) {
+    if !data.accounts.is_empty() || !data.account_members.is_empty() {
+        FEATURE_LEVEL_3
+    } else if data.lifecycle_rules.iter().any(|r| r.config_json.is_some()) {
         2
     } else {
-        1
+        MIN_FEATURE_LEVEL
     }
 }
 
@@ -1055,6 +1264,13 @@ fn decode_snapshot_with_max(bytes: &[u8], max_format: u32) -> Result<DecodedSnap
             )));
         }
         let v2: SnapshotV2<ControlData> = serde_json::from_slice(checked_payload(rest)?)?;
+        // 格式 2 已冻结，不能借“声明 feature_level=3”夹带 level-3 数据。
+        let required = required_feature_level(&v2.data);
+        if required >= FEATURE_LEVEL_3 {
+            return Err(DataError::Format(format!(
+                "snapshot format 2 (OSSCTL2) cannot carry level-{required} data"
+            )));
+        }
         (v2.feature_level, v2.data, SnapshotExtensions::new())
     } else if let Some(rest) = bytes.strip_prefix(MAGIC) {
         (
@@ -1200,7 +1416,30 @@ mod tests {
                 config_json: "{}".into(),
                 updated_at: 22,
             }],
+            accounts: Vec::new(),
+            account_members: Vec::new(),
         }
+    }
+
+    fn account_sample() -> ControlData {
+        let mut data = sample();
+        data.accounts.push(AccountRow {
+            id: "000000000007".into(),
+            name: "alice-acct".into(),
+            status: "active".into(),
+            admin: Some("bob".into()),
+            bucket_quota: Some(2),
+            soft_byte_quota: Some(1024),
+            created_at: 30,
+            updated_at: 31,
+        });
+        data.account_members.push(AccountMemberRow {
+            account_id: "000000000007".into(),
+            username: "alice".into(),
+            role: "owner".into(),
+            created_at: 30,
+        });
+        data
     }
 
     /// install_tx → read_tx：11 张表经真实 SQL 往返后自然键一致，admin/session 行不入快照。
@@ -1228,6 +1467,7 @@ mod tests {
         let ctx = InstallCtx {
             admin_id: Some(admin_id),
             witness: false,
+            canonical: false,
         };
         install_tx(&mut tx, &sample, &ctx).await.unwrap();
         // 本地历史上传行（FK 指向非 admin 用户）不得让安装失败；owner 置 NULL。
@@ -1259,6 +1499,199 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admins, 1, "本地 admin 不得被快照安装删除");
+    }
+
+    async fn raft_db(dir: &tempfile::TempDir, name: &str) -> crate::db::Db {
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join(name).display());
+        crate::db::Db::connect_raft(&url).await.unwrap()
+    }
+
+    async fn seed_active_admin(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> i64 {
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
+             VALUES ('admin', 'h', 1, 'active', 1) RETURNING id",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+    }
+
+    /// read_tx 受 canonical marker 门控：marker 之前账户行不得进入快照（本地 uid 派生
+    /// id 跨节点不可解释），marker 之后按自然键稳定返回。
+    #[tokio::test]
+    async fn read_tx_gates_accounts_on_canonical_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "gated-accounts.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let uid: i64 = sqlx::query_scalar(
+            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
+             VALUES ('alice', 'h', 0, 'active', 1) RETURNING id",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts \
+             (id, name, status, bucket_quota, soft_byte_quota, created_at, updated_at) \
+             VALUES ('000000000007', 'alice-acct', 'active', 2, 1024, 1, 2)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) \
+             VALUES ('000000000007', ?, 'owner', 1)",
+        )
+        .bind(uid)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let hidden = read_tx(&mut tx).await.unwrap();
+        assert!(hidden.accounts.is_empty(), "marker 之前不得读出账户行");
+        assert!(hidden.account_members.is_empty());
+        assert_eq!(required_feature_level(&hidden), 1, "隐藏账户不得抬高级别");
+
+        sqlx::query("INSERT INTO schema_meta (key, value) VALUES (?, 'done')")
+            .bind(crate::db::META_ACCOUNTS_CANONICAL)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let shown = read_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            shown.accounts,
+            vec![AccountRow {
+                id: "000000000007".into(),
+                name: "alice-acct".into(),
+                status: "active".into(),
+                admin: None,
+                bucket_quota: Some(2),
+                soft_byte_quota: Some(1024),
+                created_at: 1,
+                updated_at: 2,
+            }]
+        );
+        assert_eq!(
+            shown.account_members,
+            vec![AccountMemberRow {
+                account_id: "000000000007".into(),
+                username: "alice".into(),
+                role: "owner".into(),
+                created_at: 1,
+            }]
+        );
+        assert_eq!(required_feature_level(&shown), 3);
+    }
+
+    /// 安装 level-3 快照：成员/admin 按 username 映射到本地 id（与来源 uid 无关），
+    /// marker 与数据同事务写入，read_tx 以自然键往返一致。
+    #[tokio::test]
+    async fn install_accounts_maps_usernames_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "install-accounts.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        let data = account_sample();
+        let ctx = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: true,
+        };
+        install_tx(&mut tx, &data, &ctx).await.unwrap();
+        let alice_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_ne!(
+            format!("{alice_uid:012}"),
+            "000000000007",
+            "本地 uid 与账户 id 无派生关系，映射只能靠 username"
+        );
+        let bob_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'bob'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let (member_uid, admin_uid): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT am.uid, a.admin_uid FROM account_members am \
+             JOIN accounts a ON a.id = am.account_id WHERE am.account_id = '000000000007'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(member_uid, alice_uid);
+        assert_eq!(admin_uid, Some(bob_uid), "账户管理员按 username 映射");
+        let read = read_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(read, data, "账户两表自然键往返一致");
+        assert!(
+            db.accounts_canonical().await.unwrap(),
+            "canonical 安装写 marker"
+        );
+    }
+
+    /// 非 canonical 安装携带账户行 = 混合版本误用：在任何写之前 fail closed。
+    #[tokio::test]
+    async fn install_accounts_requires_canonical_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "install-accounts-gate.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        let ctx = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: false,
+        };
+        let err = install_tx(&mut tx, &account_sample(), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("level-3 account rows"), "{err}");
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(users, 1, "拒绝安装不得写任何行（仅种子 admin）");
+    }
+
+    /// 规范化 marker 只升不降：低级别全量安装清空账户行，但保留 marker。
+    #[tokio::test]
+    async fn lower_level_install_keeps_canonical_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "install-marker-monotonic.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        let canonical = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: true,
+        };
+        install_tx(&mut tx, &account_sample(), &canonical)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = db.pool().begin().await.unwrap();
+        let level_one = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: false,
+        };
+        install_tx(&mut tx, &sample(), &level_one).await.unwrap();
+        let read = read_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            db.accounts_canonical().await.unwrap(),
+            "低级别安装不得删除规范化 marker"
+        );
+        assert!(read.accounts.is_empty(), "level-1 快照没有账户行");
     }
 
     fn level_two() -> ControlData {
@@ -1588,6 +2021,61 @@ mod tests {
         // 未知顶层字段同样拒绝（格式 3 形状已冻结）。
         let payload =
             format!(r#"{{"feature_level":3,"data":{data},"extensions":{{}},"future":true}}"#);
+        assert!(matches!(
+            decode_snapshot(&seal(MAGIC_V3, payload.as_bytes())),
+            Err(DataError::Json(_))
+        ));
+    }
+
+    /// 账户行强制 level 3：即使激活级别为 1 也必须写 OSSCTL3，且逐字节往返。
+    #[test]
+    fn snapshot_v3_round_trip_accounts() {
+        let data = account_sample();
+        assert_eq!(required_feature_level(&data), 3, "账户行要求 level 3");
+        let bytes = encode_snapshot_at(&data, 1).unwrap();
+        assert!(bytes.starts_with(SNAPSHOT_MAGIC_V3));
+        let decoded = decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.feature_level, 3);
+        assert_eq!(decoded.data, data);
+        assert_eq!(encode_snapshot_at(&decoded.data, 1).unwrap(), bytes);
+        // 空账户表不污染旧载荷：仍按激活级别落 V1/V2（逐字节冻结由 fixtures 覆盖）。
+        assert!(
+            encode_snapshot_at(&sample(), 2)
+                .unwrap()
+                .starts_with(SNAPSHOT_MAGIC_V2)
+        );
+    }
+
+    /// 格式 2/1 不能携带账户行；V2 即使声明 feature_level=3 也拒绝（格式已冻结）。
+    #[test]
+    fn level2_envelope_with_accounts_is_rejected() {
+        let data = account_sample();
+        for level in [2u8, 3u8] {
+            let payload = serde_json::to_vec(&SnapshotV2 {
+                feature_level: level,
+                data: &data,
+            })
+            .unwrap();
+            let err = decode_snapshot(&seal(MAGIC_V2, &payload)).unwrap_err();
+            assert!(
+                matches!(&err, DataError::Format(m) if m.contains("cannot carry level-3 data")),
+                "level {level}: {err}"
+            );
+        }
+        let payload = serde_json::to_vec(&data).unwrap();
+        let err = decode_snapshot(&seal(MAGIC, &payload)).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("carries level-3 data")),
+            "{err}"
+        );
+    }
+
+    /// 账户行的未知字段整包拒绝（V3 行结构同样冻结，绝不静默丢弃）。
+    #[test]
+    fn unknown_account_fields_are_rejected_not_dropped() {
+        let mut value = serde_json::to_value(account_sample()).unwrap();
+        value["accounts"][0]["future_field"] = serde_json::json!(1);
+        let payload = format!(r#"{{"feature_level":3,"data":{value},"extensions":{{}}}}"#);
         assert!(matches!(
             decode_snapshot(&seal(MAGIC_V3, payload.as_bytes())),
             Err(DataError::Json(_))

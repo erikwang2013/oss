@@ -14,6 +14,23 @@ async fn db_at(dir: &Path, name: &str) -> Db {
     Db::connect(&url).await.unwrap()
 }
 
+/// 清掉 standalone backfill 产生的系统账户与 canonical marker，模拟未 canonical 的来源。
+async fn clear_canonical_accounts(db: &Db) {
+    sqlx::query("DELETE FROM account_members")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM accounts")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+        .bind(oss_server::db::META_ACCOUNTS_CANONICAL)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
 async fn seed_admin_and_rows(db: &Db) {
     sqlx::query(
         "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
@@ -44,6 +61,29 @@ async fn seed_level_two_rule(db: &Db) {
         "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at, \
          rule_id, expiration_days, config_json) VALUES ('b1', 'logs/', 30, 1, 5, 'r1', 30, \
          '{\"filter\":{\"prefix\":\"logs/\"}}')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+/// level-3 来源：激活 marker=3 + canonical 账户表（alice uid=2）。
+async fn seed_level_three_accounts(db: &Db) {
+    db.schema_meta_set("raft_feature_level", "3").await.unwrap();
+    db.schema_meta_set(oss_server::db::META_ACCOUNTS_CANONICAL, "done")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts \
+         (id, name, status, bucket_quota, soft_byte_quota, created_at, updated_at) \
+         VALUES ('000000000002', 'alice-acct', 'active', 2, 1024, 4, 5)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO account_members (account_id, uid, role, created_at) \
+         VALUES ('000000000002', 2, 'owner', 4)",
     )
     .execute(db.pool())
     .await
@@ -97,6 +137,7 @@ async fn export_records_provenance_and_accepts_ossctl1_and_ossctl2() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "prov-src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
 
     // level-1 数据：来源写 OSSCTL1。
     let v1 = export_from(&src).await;
@@ -131,10 +172,45 @@ async fn export_records_provenance_and_accepts_ossctl1_and_ossctl2() {
     let src2 = db_at(dir.path(), "prov-src2.db").await;
     seed_admin_and_rows(&src2).await;
     seed_level_two_rule(&src2).await;
+    clear_canonical_accounts(&src2).await;
     let v3 = export_from(&src2).await;
     assert_eq!(v3.snapshot_format, Some(2));
     assert_eq!(v3.feature_level, Some(2));
     assert!(cutover::verify_export(&v3).unwrap().is_empty());
+}
+
+/// level-3 账户数据只能以 OSSCTL3 导出；伪造格式 2（无论声明的级别）都拒绝。
+#[tokio::test]
+async fn export_carries_ossctl3_accounts_and_rejects_format_two_forgery() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = db_at(dir.path(), "l3-src.db").await;
+    seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
+    seed_level_three_accounts(&src).await;
+    let export = export_from(&src).await;
+    assert_eq!(export.snapshot_format, Some(3));
+    assert_eq!(export.feature_level, Some(3));
+    assert_eq!(export.activation_level, Some(3));
+    assert_eq!(export.data.accounts.len(), 1);
+    assert_eq!(export.data.account_members.len(), 1);
+    assert!(
+        cutover::verify_export(&export).unwrap().is_empty(),
+        "OSSCTL3 export must verify clean"
+    );
+
+    // 声明 feature_level=3 但封套是格式 2：格式不能携带 level-3 数据。
+    let mut forged = export.clone();
+    forged.snapshot_format = Some(2);
+    let err = cutover::verify_export(&forged).unwrap_err();
+    assert!(err.contains("cannot carry level-3 data"), "{err}");
+
+    // 连级别一起伪造回 level 2：数据自身要求 3，同样拒绝。
+    let mut forged = export;
+    forged.snapshot_format = Some(2);
+    forged.feature_level = Some(2);
+    forged.activation_level = Some(2);
+    let err = cutover::verify_export(&forged).unwrap_err();
+    assert!(err.contains("cannot carry level-3 data"), "{err}");
 }
 
 #[tokio::test]
@@ -142,6 +218,7 @@ async fn verify_export_rejects_forged_or_unreadable_provenance() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "rej-src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let v1 = export_from(&src).await;
 
     let mut bad = v1.clone();
@@ -209,6 +286,7 @@ async fn verify_export_rejects_forged_or_unreadable_provenance() {
     let src2 = db_at(dir.path(), "rej-src2.db").await;
     seed_admin_and_rows(&src2).await;
     seed_level_two_rule(&src2).await;
+    clear_canonical_accounts(&src2).await;
     let v2 = export_from(&src2).await;
 
     let mut forged = v2.clone();
@@ -292,6 +370,7 @@ async fn activated_export_without_level_two_data_stays_activated() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "act-src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     src.schema_meta_set("raft_feature_level", "2")
         .await
         .unwrap();
@@ -406,6 +485,7 @@ async fn legacy_export_without_provenance_is_accepted_with_warning() {
     let dir = tempfile::tempdir().unwrap();
     let src = db_at(dir.path(), "legacy-src.db").await;
     seed_admin_and_rows(&src).await;
+    clear_canonical_accounts(&src).await;
     let export = export_from(&src).await;
 
     let mut value = serde_json::to_value(&export).unwrap();

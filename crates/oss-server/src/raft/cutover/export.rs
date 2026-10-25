@@ -132,6 +132,15 @@ fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
                 "source snapshot_format 1 (OSSCTL1) cannot carry level-{required} data"
             ));
         }
+        // OSSCTL2 已冻结：账户表等 level-3 数据只能走 OSSCTL3。
+        if format == 2
+            && (required >= compat::FEATURE_LEVEL_3
+                || export
+                    .feature_level
+                    .is_some_and(|level| level >= compat::FEATURE_LEVEL_3))
+        {
+            return Err("source snapshot_format 2 (OSSCTL2) cannot carry level-3 data".into());
+        }
         // OSSCTL3 只在 level-3 激活下写出；低级别或缺级别声明格式 3 只能是伪造。
         if format == 3
             && !export

@@ -611,6 +611,7 @@ impl SqliteStateMachine {
         let ctx = InstallCtx {
             admin_id,
             witness: self.witness,
+            canonical: snapshot.feature_level >= super::compat::FEATURE_LEVEL_3,
         };
         data::install_tx(&mut tx, &snapshot.data, &ctx)
             .await
