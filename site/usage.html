@@ -62,7 +62,7 @@
         <a href="usage.html" aria-current="page">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.18.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.19.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -240,11 +240,11 @@ aws --endpoint-url $E s3api get-object-retention \
           </div>
 
           <h2 id="upgrade">控制面滚动升级</h2>
-          <p>控制面可以逐节点替换：保持 <code>[raft].feature_level = 1</code>（默认），先升级所有 voter 与 learner；leader 的生效级别取当前 voter/learner 的最小值。全部节点都升级后，再把 <code>feature_level</code> 改为 <code>2</code> 并重启，激活会写入 <code>schema_meta.raft_feature_level</code>。</p>
+          <p>控制面可以逐节点替换：保持 <code>[raft].feature_level = 1</code>（默认），先升级所有 voter 与 learner；leader 的生效级别取当前 voter/learner 的最小值。全部节点都升级后，再把 <code>feature_level</code> 改为 <code>2</code> 或 <code>3</code>（范围 1..=3）并重启，激活会写入 <code>schema_meta.raft_feature_level</code>。级别 3/OSSCTL3 当前承载账户、运行态扩展与 Ext 容器，生产 Ext registry 为空。</p>
           <ul>
             <li>回滚只在激活前可行（停集群、换回旧二进制、删除 <code>feature_level</code> 键后启动）；激活后必须换回支持该级别的二进制。</li>
             <li>成员 add/promote 会预检目标节点的 wire/feature 级别，混合版本时返回 409 并拒绝。</li>
-            <li>数据面（分片、EC、放置）仍非滚动；跨版本 cutover / force-recover 也不在兼容窗口内。</li>
+            <li>数据面自 v1.19.0 起为 DP-1 混版门控（NodeHealth wire/epoch/hash；ListObjects V1 带 <code>x-oss-degraded: list-marker</code>、LMU 带 <code>mpu-union</code>，ListObjectVersions 与 MPU 转发对旧对端 fail-closed）；真实二进制滚动与 TLS 热轮换仍不做，生产升级仍需维护窗口。</li>
           </ul>
 
           <h2 id="ops">运维命令</h2>
@@ -257,7 +257,8 @@ oss-server fsck --repair    # 最小修复：删孤儿 + 读时修
 oss-server heal             # fsck --repair + 桶目录补建
 oss-server scrub            # 深度巡检，逐块对偶校验
 oss-server rebalance --dry-run
-oss-server rebalance --apply</code></pre>
+oss-server rebalance --apply
+oss-server cluster-shrink plan --to shrink.toml --json  # 缩容只读校验；apply 未交付</code></pre>
           </div>
           <p>巡检与修复不要和在途上传、写入并跑。每节点各自执行，远端孤儿只由该节点自己回收。</p>
 
@@ -271,7 +272,11 @@ oss-server rebalance --apply</code></pre>
                 <tr><td>AP 跨账户 / SourceVpce</td><td>已支持账户根 principal 与 <code>aws:SourceVpce</code> 来源证明；VPC 端点真实 PrivateLink 身份仍不做</td></tr>
                 <tr><td>多租户账户 MVP</td><td>已支持（账户/成员/状态/桶数配额；账户写不参与 Raft；完整租户隔离与管理员 UI 仍不做）</td></tr>
                 <tr><td>M7 未映射 REPLICA 对账</td><td>已支持（管理员列出/点名删除；默认 dry-run，绝不按内容匹配）</td></tr>
-                <tr><td>DP-0 数据面握手</td><td>已支持（wire 版本严格相等；混版 503 <code>peer_incompatible</code>；数据面仍非滚动）</td></tr>
+                <tr><td>DP-1 数据面混版</td><td>已支持门控（NodeHealth wire/epoch/hash；V1 列表 <code>list-marker</code>、LMU <code>mpu-union</code> 降级；ListObjectVersions/MPU 转发 fail-closed；真实二进制滚动仍不做）</td></tr>
+                <tr><td>M3 缩容（shrink）</td><td>仅只读 <code>cluster-shrink plan</code>（全节点 maintenance + 显式 slot 目标）；apply/verify/commit/rollback 未交付</td></tr>
+                <tr><td>Level C / OSSCTL3</td><td>地基（feature level 1..3；OSSCTL3 扩展区；Ext 容器 registry 为空）；生产 Ext 命令与完整双向混写未交付</td></tr>
+                <tr><td>Raft 租户账户</td><td>地基（账户 schema/回填/快照安装）；Raft 账户命令/API 与 canonicalization worker 未交付</td></tr>
+                <tr><td>M8 多节点运行时</td><td>预览（<code>m8.runstate</code> 快照扩展）；schedule lease/worker takeover/多节点未交付</td></tr>
                 <tr><td>Inventory 增量 / 跨账户目标</td><td>已支持（增量水位为节点本地；跨账户目标仅管理员可配置）</td></tr>
                 <tr><td>AbortIncompleteMultipartUpload</td><td>已支持（生命周期规则）</td></tr>
                 <tr><td>Batch 抢占 / 跨账户清单</td><td>已支持（同提交者协作抢占；跨账户清单仅管理员；跨账户通知仍不做）</td></tr>
@@ -280,11 +285,11 @@ oss-server rebalance --apply</code></pre>
                 <tr><td>MPU 跨节点</td><td>已支持（新 upload_id 属主路由/流式转发；存量裸 UUID 仍粘原节点）</td></tr>
                 <tr><td>CMK 删除 / rewrap</td><td>已支持（删除有引用即 409；rewrap 默认 dry-run，本地节点口径）</td></tr>
                 <tr><td><code>AssumeRoleWithWebIdentity</code></td><td>已支持（默认关闭；本地 JWKS，需配置 issuer/audience/roles）</td></tr>
-                <tr><td>任意双向混合版本 / 数据面滚动</td><td>不做；仅控制面滚动升级窗口；OSSCTL2 已支持 level-2 快照</td></tr>
+                <tr><td>任意双向混合版本 / 数据面滚动</td><td>不做；仅控制面滚动升级窗口；OSSCTL2/3 已支持 level-2/3 快照</td></tr>
               </tbody>
             </table>
           </div>
-          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；MPU 存量裸 UUID 仍粘原节点；tier 直读默认关闭且仅支持 Range；未映射 legacy 副本需管理员对账；AP 转发头只在 TLS 监听器 + 可信对端 CIDRS 下采信；DP-0 混版数据面返回 503。完整清单见仓库验收记录。</p>
+          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；MPU 存量裸 UUID 仍粘原节点；tier 直读默认关闭且仅支持 Range；未映射 legacy 副本需管理员对账；AP 转发头只在 TLS 监听器 + 可信对端 CIDRS 下采信；DP-1 混版窗口的 ListObjects V1/LMU 可能重复或缺项（降级头标记），ListObjectVersions 与 MPU 转发对旧对端 fail-closed。完整清单见 README 与版本日志。</p>
 
           <h2 id="more">继续阅读</h2>
           <ul>
@@ -302,7 +307,7 @@ oss-server rebalance --apply</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.18.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.19.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
