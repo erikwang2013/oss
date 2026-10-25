@@ -183,9 +183,17 @@ pub struct ControlPlane {
 /// 门面错误 → HTTP 状态（S6b-d 的 handler 只做映射）：400/404/409/413/500/503。
 #[derive(Debug)]
 pub enum ControlError {
-    TooLarge { bytes: usize, max: usize },
+    TooLarge {
+        bytes: usize,
+        max: usize,
+    },
     Timeout(String),
     Unavailable(String),
+    /// 本节点不是 leader 且转发未完成（M8-0）：带 membership 里的 leader 提示。
+    NotLeader {
+        leader: Option<u64>,
+        endpoint: Option<String>,
+    },
     Internal(String),
 }
 
@@ -193,8 +201,19 @@ impl ControlError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::TooLarge { .. } => 413,
-            Self::Timeout(_) | Self::Unavailable(_) => 503,
+            Self::Timeout(_) | Self::Unavailable(_) | Self::NotLeader { .. } => 503,
             Self::Internal(_) => 500,
+        }
+    }
+
+    /// M8-0：leader 提示 `(endpoint, leader_id)`；仅 endpoint 来自成员表。
+    /// 无 endpoint 时返回 `None`（调用方可回退到 `leader` id）。
+    pub fn leader_hint(&self) -> Option<(&str, Option<u64>)> {
+        match self {
+            Self::NotLeader { leader, endpoint } => {
+                endpoint.as_deref().map(|endpoint| (endpoint, *leader))
+            }
+            _ => None,
         }
     }
 }
@@ -207,6 +226,10 @@ impl std::fmt::Display for ControlError {
             }
             Self::Timeout(m) => write!(f, "raft write timeout: {m}"),
             Self::Unavailable(m) => write!(f, "raft unavailable: {m}"),
+            Self::NotLeader { leader, endpoint } => write!(
+                f,
+                "not leader (leader={leader:?}, endpoint={endpoint:?}); retry on the leader"
+            ),
             Self::Internal(m) => write!(f, "control apply failed: {m}"),
         }
     }
@@ -357,9 +380,14 @@ impl ControlPlane {
                         return Err(ControlError::Timeout(format!("after {d:?}")));
                     }
                     Err(WriteError::ForwardToLeader { leader, endpoint }) => {
-                        return Err(ControlError::Unavailable(format!(
-                            "not leader (leader={leader:?}, endpoint={endpoint:?}); retry on the leader"
-                        )));
+                        // 选举窗口内既无 leader id 也无 endpoint：没有可给的提示，
+                        // 保持既有 Unavailable（可重试）语义，避免伪装成 307 目标。
+                        if leader.is_none() && endpoint.is_none() {
+                            return Err(ControlError::Unavailable(
+                                "no leader known yet; retry".into(),
+                            ));
+                        }
+                        return Err(ControlError::NotLeader { leader, endpoint });
                     }
                     Err(WriteError::NoQuorum) => {
                         return Err(ControlError::Unavailable(
@@ -410,6 +438,10 @@ fn sink_result(
         Err(ControlError::Timeout(m) | ControlError::Unavailable(m)) => {
             tracing::warn!(error = %m, "control write unavailable");
             Err(E::Unavailable)
+        }
+        Err(ControlError::NotLeader { endpoint, .. }) => {
+            tracing::warn!(?endpoint, "control write not on leader");
+            Err(E::NotLeader { endpoint })
         }
         Err(ControlError::Internal(m)) => {
             tracing::error!(error = %m, "control write failed");
@@ -566,6 +598,26 @@ mod tests {
         assert_eq!(ControlError::Unavailable("u".into()).http_status(), 503);
         assert_eq!(ControlError::Internal("i".into()).http_status(), 500);
 
+        // M8-0：NotLeader 是 503 且带成员表 endpoint + leader id 提示。
+        let not_leader = ControlError::NotLeader {
+            leader: Some(2),
+            endpoint: Some("http://10.0.0.2:9000".into()),
+        };
+        assert_eq!(not_leader.http_status(), 503);
+        assert_eq!(
+            not_leader.leader_hint(),
+            Some(("http://10.0.0.2:9000", Some(2)))
+        );
+        assert_eq!(
+            ControlError::NotLeader {
+                leader: Some(2),
+                endpoint: None
+            }
+            .leader_hint(),
+            None
+        );
+        assert_eq!(ControlError::Unavailable("u".into()).leader_hint(), None);
+
         assert_eq!(response_status(ControlResponse::Ok), 200);
         assert_eq!(response_status(ControlResponse::BucketNotEmpty), 409);
         assert_eq!(response_status(ControlResponse::Conflict), 409);
@@ -588,6 +640,16 @@ mod tests {
         assert_eq!(
             sink_result(Err(ControlError::Internal("x".into()))),
             Err(E::Internal)
+        );
+        // M8-0：S3 控制写拿到 leader endpoint 提示（leader id 不跨 crate 传递）。
+        assert_eq!(
+            sink_result(Err(ControlError::NotLeader {
+                leader: Some(2),
+                endpoint: Some("http://10.0.0.2:9000".into()),
+            })),
+            Err(E::NotLeader {
+                endpoint: Some("http://10.0.0.2:9000".into())
+            })
         );
     }
 

@@ -23,7 +23,7 @@ pub struct BucketCreateSpec {
 }
 
 /// 控制写拒绝（handler 映射 HTTP/S3 错误码；不做静默降级）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketControlError {
     NotFound,
     /// 业务冲突（建桶模式冲突/已存在竞态）。
@@ -35,6 +35,11 @@ pub enum BucketControlError {
     TooLarge,
     /// 控制面无主/超时。
     Unavailable,
+    /// M8-0：本节点不是 leader，`endpoint` 为成员表里的 leader（SigV4 不重定向，
+    /// 只给提示，绝不本地写）。
+    NotLeader {
+        endpoint: Option<String>,
+    },
     Internal,
 }
 

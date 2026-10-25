@@ -660,6 +660,16 @@ fn bucket_control_error(e: BucketControlError) -> s3s::S3Error {
         BucketControlError::Unavailable => {
             s3s::s3_error!(ServiceUnavailable, "control plane unavailable")
         }
+        // M8-0：SigV4 钉死 host，S3 面不重定向；503 + leader 提示在消息里。
+        BucketControlError::NotLeader { endpoint } => {
+            let msg = match endpoint {
+                Some(endpoint) => {
+                    format!("control plane not leader; retry on the leader at {endpoint}")
+                }
+                None => "control plane not leader; retry on the Raft leader".to_string(),
+            };
+            s3s::s3_error!(ServiceUnavailable, "{}", msg)
+        }
         BucketControlError::Internal => {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "internal error")
         }
@@ -4425,6 +4435,25 @@ mod tests {
         );
         assert_eq!(
             bucket_control_error(BucketControlError::Unavailable).code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
+        // M8-0：not-leader 是 503，且消息带成员表 leader endpoint（S3 不重定向）。
+        let not_leader = bucket_control_error(BucketControlError::NotLeader {
+            endpoint: Some("http://10.0.0.2:9000".into()),
+        });
+        assert_eq!(not_leader.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(
+            not_leader.status_code(),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert!(
+            not_leader
+                .message()
+                .unwrap_or_default()
+                .contains("http://10.0.0.2:9000")
+        );
+        assert_eq!(
+            bucket_control_error(BucketControlError::NotLeader { endpoint: None }).code(),
             &s3s::S3ErrorCode::ServiceUnavailable
         );
         assert_eq!(

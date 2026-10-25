@@ -6,7 +6,7 @@
 //! permissions 三档（读/写/删）+ 自有桶全权；403 用纯文本（前端 `rawApi` 直接展示 resp.text）。
 
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, head, post, put};
 use axum::{Json, Router};
@@ -51,17 +51,44 @@ pub(crate) fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
+/// M8-0：leader 提示响应头（endpoint 来自成员表，缺失时回退 leader id）。
+const LEADER_HINT_HEADER: &str = "x-oss-leader";
+
+/// M8-0：`NotLeader` 的提示值；其余错误无提示（绝不从 body 反推 URL）。
+fn leader_hint_value(e: &crate::raft::control::ControlError) -> Option<String> {
+    if let Some((endpoint, _)) = e.leader_hint().filter(|(endpoint, _)| !endpoint.is_empty()) {
+        return Some(endpoint.to_string());
+    }
+    match e {
+        crate::raft::control::ControlError::NotLeader {
+            leader,
+            endpoint: None,
+        } => leader.map(|id| id.to_string()),
+        _ => None,
+    }
+}
+
 /// M9 S6b：控制写失败 → HTTP（413/503 带原因；500 不泄漏内部）。
-/// 503 的文本含 raft/forward 提示（3 节点转发与 leader hint 由 S7 接线）。
+/// 503 的文本含 raft/forward 提示；M8-0 的 not-leader 另带 `x-oss-leader`。
 pub(crate) fn control_failure(e: crate::raft::control::ControlError) -> Response {
-    match e.http_status() {
+    let hint = leader_hint_value(&e);
+    let mut resp = match e.http_status() {
         413 => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
         503 => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
         _ => {
             tracing::error!(error = %e, "控制写失败");
             internal_error()
         }
+    };
+    if let Some(hint) = hint {
+        match HeaderValue::from_str(&hint) {
+            Ok(value) => {
+                resp.headers_mut().insert(LEADER_HINT_HEADER, value);
+            }
+            Err(_) => tracing::warn!(hint = %hint, "leader 提示不是合法 header 值"),
+        }
     }
+    resp
 }
 
 /// M9 S6b：apply 业务拒绝 → 与 `raft::control::response_status` 完全一致
@@ -5330,5 +5357,43 @@ mod stretch_identity_tests {
         assert!(m.contains(&"peer_node_id"));
         assert!(m.contains(&"self_addr"));
         assert!(m.contains(&"peer_addr"));
+    }
+}
+
+#[cfg(test)]
+mod leader_hint_tests {
+    use super::*;
+    use crate::raft::control::ControlError;
+
+    /// M8-0：控制写失败时 503 + 成员表 endpoint，绝不重定向/本地写。
+    #[test]
+    fn control_failure_exposes_leader_endpoint() {
+        let r = control_failure(ControlError::NotLeader {
+            leader: Some(2),
+            endpoint: Some("http://10.0.0.2:9000".into()),
+        });
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers()[LEADER_HINT_HEADER].to_str().unwrap(),
+            "http://10.0.0.2:9000"
+        );
+    }
+
+    /// 成员表没有 endpoint 时提示 leader id。
+    #[test]
+    fn control_failure_falls_back_to_leader_id() {
+        let r = control_failure(ControlError::NotLeader {
+            leader: Some(2),
+            endpoint: None,
+        });
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers()[LEADER_HINT_HEADER].to_str().unwrap(), "2");
+    }
+
+    #[test]
+    fn non_leader_errors_have_no_hint_header() {
+        let r = control_failure(ControlError::Unavailable("u".into()));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(r.headers().get(LEADER_HINT_HEADER).is_none());
     }
 }
