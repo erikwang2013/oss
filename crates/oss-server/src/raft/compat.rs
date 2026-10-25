@@ -17,8 +17,13 @@ pub const WIRE_VERSION: u32 = 2;
 pub const MIN_COMPAT_WIRE_VERSION: u32 = 1;
 /// 成员变更要求全集群 wire >= 2（新节点必须先能读懂新格式）。
 pub const MIN_MEMBERSHIP_WIRE_VERSION: u32 = 2;
+/// feature 3：OSSCTL3 可解码 + level-3 命令（Ext/accounts/runstate）可应用。
+pub const FEATURE_LEVEL_3: u8 = 3;
+/// m8 计划使用的 level-3 别名（RunState 命令的 `min_feature_level`）。数值与
+/// [`FEATURE_LEVEL_3`] 相同：level 3 是单一激活门，不会按功能拆成多个级别。
+pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
 /// 本二进制支持的最高 feature level。
-pub const MAX_FEATURE_LEVEL: u8 = 2;
+pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_3;
 /// 缺省/旧节点的 feature level。
 pub const MIN_FEATURE_LEVEL: u8 = 1;
 
