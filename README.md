@@ -8,44 +8,9 @@
 
 **项目中文名：吞吞　英文名：oss　项目宠物：吞吞（TunTun）**——一只把对象块吞进桶里的小家伙。
 
-S3 兼容的自研对象存储（MinIO 的等价实现）。目标形态是分布式 + 纠删码；
-当前完成 **M1（单盘垂直切片）+ M2a（可用性切片：Multipart Upload、Range GET、
-`x-amz-meta-*` 元数据、流式 PUT、孤儿回收）+ M2b（存储切片：单机多盘 + 纠删码 8+4、
-quorum 写、拔盘容忍与读时修、`fsck` 巡检、kill -9 断电一致性用例）+ M3（分布式切片：
-节点间 gRPC mesh、静态槽位拓扑、跨节点 quorum 读写、节点故障容忍与读修复、quorum 租约锁、
-混沌 e2e）+ M4（运维与 IAM：版本控制、生命周期、桶策略、审计、heal/scrub、rebalance、
-多 set）+ M5（安全与锁定：SSE 三模式、对象锁、STS 临时凭据、SK 加密存）+ M6（事件/复制/分层
-与恢复）+ M7（多站点异步复制）+ M8（访问点、Object Lambda、Batch、Inventory、控制台）+ M9
-（同步强一致：sync 桶、stretch 2×6、3-voter Raft 控制面）**——`aws-cli`/`rclone`
-的大文件默认路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器能分块上传，控制台能看见。
+S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**v1.14.0（2026-10-23）能力边界清零**：补齐 S3 协议细节（ListObjects v1、UploadPartCopy、
-ListMultipartUploads/partNumber、多区间/HEAD Range、Suspended、noncurrent、匿名、retention、
-ObjectAccessed）、全链路 TLS/SASL、M8 边界（AP 别名/DeleteObjects/SourceIp、Inventory
-Parquet/Hive、tier 本地盘/GC、生命周期全 Filter、Batch WASM）、M9 Level B 控制面滚动升级；
-并完成安全复审（0 Critical，2 High 已修复）。详见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md`。
-
-**v1.15.0（2026-10-24）硬化收口**：AP 匿名/账户命名空间 v1/SourceVpc/缓存 TTL/无策略默认拒绝/
-旧别名回落与 XFF 信任链；`part_sizes` 复制透传、签 Range 多区间确定性 400；TLS 私钥 0600、CA
-双信任轮换、主监听器与出站热加载；SSE-KMS 显式 CMK 与命名环轮换；tier 流式搬运/恢复；Batch
-每动作桶通知；M7 版本定向删除/元数据复制；Select Parquet；本地 tier 符号链接加固、GC 二次快照、
-生命周期游标、Inventory 增量/跨账户目标、AbortMPU；以及 Level B 生命周期命令门控/快照 guard
-热修。最终闸门与证据见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §8–§11。
-
-**v1.16.0（2026-10-24）backlog 第二轮**：Select BZIP2；STS `AssumeRoleWithWebIdentity`；
-CMK 安全删除与逐版本 rewrap；M3 MPU 跨节点属主路由/流式转发；OSSCTL2 快照与 LC-0
-导出/cutover/force-recover 来源校验；M6 `site_token` 远端的同源版本/版本删除/元数据与 M7
-同源定向删除；TLS mesh gRPC 客户端与 Kafka 客户端热加载；Batch 协作抢占与跨账户清单；M8
-单例任务 leader 门控；tier 暂存清扫/磁盘预留/0600；AP 可信对端 CIDRS（纯 HTTP 反代需 TLS
-监听器）。验收与仍然阻塞的架构项见验收记录 §12 与
-`docs/superpowers/specs/2026-10-24-architecture-backlog.md`。
-
-**v1.17.0（2026-10-24）架构切片**：多租户账户 MVP（账户/成员/状态/桶配额）与 AP 跨账户
-账户根授权 + `aws:SourceVpce` 证明；tier 分块哈希与默认关闭的归档 Range 直读、跨进程磁盘
-预留；M7 未映射 REPLICA 人工对账与 OSSCTL2 激活级别导出；WebIdentity JWKS 热加载/
-`email_verified`/按 IP 限速；CMK 离线 CLI/桶默认引用/`.cmk-trash`；mesh SSE-C 跨节点强制
-TLS 与 REPLICA 头认证；Batch `preempted` 控制台展示；DP-0 数据面版本握手/混版 fail-closed；
-M8 运行态 fencing epoch。证据与仍然阻塞的架构项见验收记录 §13。
+**最新发布：v1.18.0（2026-10-25）。**
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
@@ -55,70 +20,6 @@ M8 运行态 fencing epoch。证据与仍然阻塞的架构项见验收记录 §
 - **两条客户端入口**：`aws-cli` / `rclone` 走 S3 面（SigV4 认证）；
   浏览器控制台（React 19 + antd，M1b）走 `/api/v1` 与 aetherupload 自带脚本（分块 / 断线续传 / 秒传）。
 - **技术栈**：Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 3.0.0 · axum 0.8 · sqlx / SQLite · serde + rmp-serde。
-
-## 当前进度
-
-已实现（M1）：单盘直存内核（无纠删码）· S3 桶/对象 CRUD · ListObjectsV2 · CopyObject ·
-批量删除 · SigV4 认证 · aetherupload 分块上传与原生 ingest · 控制台 API。
-已实现（M2a）：Multipart Upload（五操作）· Range GET（206/416）· `x-amz-meta-*` 元数据往返 ·
-流式 PutObject（不再整份读内存）· 启动自检与 `clean` 按龄续回收（trash/tmp/未引用版本目录）。
-已实现（M2b）：多盘存储（`data_dirs`，每盘一份命名空间镜像）· EC 8+4 分片（quorum 写
-≥ data+1、拔盘重建、读时修）· 小对象内联（< 128 KiB 进 `xl.meta`）· meta 两阶段多盘提交
-（最新副本胜）· `fsck [--repair]` 巡检 · 桶级互斥与 flock 跨进程锁 · 目录 fsync 与
-kill -9 断电用例（SIGABRT 四注入点）。
-已实现（权限体系）：子账户与桶级**读/写/删**三档授权（管理员在控制台「子账户」页创建、
-管理、授权）· 三面统一执行（S3 的 AK/SK、控制台 JWT、aetherupload 上传认证）· 子账户可建
-自有桶（桶主全权）· 上传/下载/删除均按权限门。
-已实现（M3）：分布式切片——节点间 gRPC mesh（`xl-proto`/`xl-client`）· 静态扁平拓扑（全局
-槽位表 + 拓扑指纹）· 跨节点 quorum 读写（提交 quorum + 补偿、读覆盖率快路径）· 节点故障容忍
-（kill -9 / SIGSTOP 混沌 e2e 实证）· 读修复（read-repair + fsck 集群化差集补齐）· 节点间
-quorum 租约锁（节点域 Q_n）· `/health/cluster` 集群健康端点。
-已实现（M4 + 扩展包 C1-C5）：版本控制（版本链 / delete marker / 回滚 / 点名版本读删）·
-生命周期到期自动删（jobs 进度可见）· 桶策略（显式 Deny 优先；CopyObject 源/目标双轴判定；
-批量删逐键授权）· 审计日志与查询（C5 保留期自动清理）· `heal`/`scrub` 独立命令 · rebalance
-追加式扩容（C4 同盘 hardlink 快路径）· 多 set 横向扩容（桶钉 set；C2 控制台 sets 视图；
-C3 建桶缺省自动指派负载最小的 set）· 登录限速（C1：账号 10 分钟 5 败锁定 + 全局 60 秒 120 败
-暂拒，429 + Retry-After）。
-已实现（M5 安全与锁定）：集群控制面行一致性广播（切片 0）· 主密钥密钥库（切片 1，单钥文件 +
-多钥 KMS 目录）· 加密数据面（切片 2，先加密后 EC 的 DARE 式块对齐 AES-256-GCM）· S3 面
-SSE-S3 / SSE-KMS / SSE-C 全链（切片 3）· 对象锁 GOVERNANCE / COMPLIANCE / Legal Hold +
-桶级默认保留规则（切片 4）· STS 临时凭据 AssumeRole/GetSessionToken + 会话策略交集（切片 5）·
-`access_keys.secret_key` 信封加密 + 存量透明迁移（切片 6）· **AssumeRoleWithWebIdentity**
-（OIDC JWKS 本地文件、RS256/ES256、iss/aud/kid/exp 严格校验、RoleArn→claim 值精确映射；
-默认关闭，见「STS」）。
-已实现（M6 数据流）：事件通知（S3 通知配置 + Kafka，至少一次 outbox）· S3 Select（CSV/JSON、
-SQL 白名单、ScanRange、Progress/Stats 帧）· 桶复制（规则 API、9 写入口入队、SigV4 出站、
-PENDING→COMPLETED/FAILED、停机积压追平）。
-已实现（M7 多站点异步复制）：单节点站点对（`[site]` 唯一开关 + 管理 API 配对/ping/status）·
-控制面 changelog（SQLite 触发器捕获、LWW `(ts,priority,origin,seq)` + 本地写门控 + apply 抑制）·
-配对快照（单事务、入钟、只本地胜者）· 对象复制复用 `repl_outbox`（逐 peer 入队、发送前
-`GET ?versioning` 预检、metadata 透传、REPLICA 防环）· 停机积压追平、死信/游标/状态面。
-已实现（M8 完整，2026-10-20）：**S3 缺口（P0）** 对象标签 `Put/Get/DeleteObjectTagging` +
-PUT `x-amz-tagging` + GET/HEAD `x-amz-tagging-count`，CopyObject `metadata/tagging-directive`
-两轴（REPLACE 独立、同键仅 metadata REPLACE 放行）· **访问点与 Object Lambda（S1/S2）**
-（路径式 `/ap/<name>/<key>`、严格 AP 策略与身份/桶策略交集、canonical key、签名剥离与内层
-转发、AP CRUD/策略 API；HTTP 变换器默认、WASM 变换器 `olap-wasm` feature 门控）· **作业引擎
-与 Batch Operations（S0/S3）**（`jobs/job_tasks`、`BEGIN IMMEDIATE` 领取、优先级、指数退避、
-超时回收、失败重试子作业、CSV 报告、1000+1 清单与 retry-failed）· **Inventory（S5）**
-（Daily/Weekly 调度、force-run、manifest.json + `data/*.csv.gz` / `data/*.parquet`、AWS v1
-必含列 + 可选列、Hive `symlink.txt` 清单）· **存储类/分层与 Restore（S4a/S4b）**（`storage_class`/
-`TierState`、Archived/Restoring phase gate → 403 `InvalidObjectState`、远端 S3 与本地冷盘池
-tier 后端、生命周期 Transition、RestoreObject 异步受理、到期回收、`TierGcSink` 删除契约、
-管理员显式触发的远端 GC/对账（默认 dry-run））· **S6 控制台页面与 `tests/e2e_m8.sh`**。
-**不在 M8**（记档非目标）：跨站点强一致（M9）· AP 跨账号/VPC 端点（AP 匿名已支持，见
-「访问点」）· 完整多租户账户体系。已补：SSE-KMS 显式 CMK/命名环轮换与删除/rewrap（见
-「加密」）· Inventory 跨账户目标（3.7，仅管理员可配置）· Batch 抢占/跨账号清单 ·
-`AssumeRoleWithWebIdentity`（见「STS」）。
-已实现（M9 S0–S7，2026-10-21）：模式矩阵/配置守卫与能力开关 · sync 写门（统一
-origin version id、staging 明文 tee 0600、写 intent compensate-only）· sync remote-first 删除
-（内部 token 路由、删桶 quiesce、删除 intent）· stretch 2×6 / EC 8+4 数据面 · Raft 控制面
-（控制写单命令 + apply 后缓存失效、`/site/changelog` 409、启动模式断言、真实
-`/api/v1/raft/status`）· 3-voter 成员变更/leader 单跳转发 · 双边配对与 B′ 替换 · witness
-独立运行时 · 11 表逻辑快照/安装 · M7→Raft cutover · `raft-export/raft-force-recover` ·
-`sync-reconcile [--repair]` · console Raft 集群卡片。`RAFT_READY`/`SYNC_READY`/
-`STRETCH_READY` 均为 true。**S8/S9 验收**：stretch 模式下的配对/加 witness 组合、
-灾备与 11 表并发 diff 均已由 `tests/e2e_m9.sh`（`M9_STRETCH=1`）/
-`tests/e2e_m9_recovery.sh` 覆盖（五个 e2e 与验收证据见下）。
 
 ## 架构
 
@@ -144,14 +45,6 @@ M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Resto
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
 | `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；M8 增作业引擎（`jobs.rs`）、Batch（`job_actions*.rs`）、访问点/OLAP（`access_points_api.rs`）、Inventory（`inventory*.rs`）、分层/恢复（`tier*.rs`）与 0003 迁移 |
 | `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e；M8 增访问点/作业/分层/清单/通知/审计/设置页面 |
-| `tests/e2e_s3.sh` | aws-cli / rclone 端到端验收脚本（20 个主步骤 / 38 节，含 M6 Select/Kafka/复制；+ `E2E_LONG=1` 门控长跑） |
-| `tests/e2e_m8.sh` | M8 控制面验收（AP CRUD、Batch 1000+1、Inventory 强制运行、Transition/Restore 可选段、S3/STS/M4 回归） |
-| `tests/e2e_replication.sh` | 桶复制双实例验收（源/目标真进程：同 ETag、PENDING→COMPLETED、停机积压→追平、marker） |
-| `tests/e2e_sites.sh` | 多站点复制双实例验收（双向配对/快照、建桶立刻写、断连积压、marker、并发同 key、重启不回退） |
-| `tests/e2e_m9.sh` | M9 强一致验收（A/B 数据站点 + witness C 三进程：配对/3-voter、控制面并发写后 **11 张复制表**三端字段级一致、sync remote-first + 断连 503、MPU/Copy/版本删、kill/重启追平）；v1.16.0 集成树实跑 sync 78/0/1、stretch 59/0/1、recovery 133/0/1；v1.17.0 集成树复跑同值 |
-| `tests/e2e_m9_rolling.sh` | M9 Level B 控制面滚动升级演练（逐台换二进制、wire/feature 握手、level 2 门控、回滚；需 `OSS_OLD_BIN`=v1.13.1，未提供时 SKIP）；v1.16.0 集成树实跑 65/0/4（4 SKIP 为 v1.13.1 侧无法覆盖的 D6 项）；v1.17.0 集成树复跑 65/0/4（首跑 64/1/4 为高负载下 60s 轮询超时） |
-| `tests/e2e_m9_recovery.sh` | M9 灾备验收（真进程 + CLI：M7 export/cutover 字段级冲突与 overwrite、force-recover 后 `bootstrap=false` 重启；witness 运行时/export/force-recover；B′ 替换 + `sync-reconcile --repair` 门） |
-| `tests/e2e_stretch.sh` | M9 S4 stretch 2×6 真进程验收（两站点 × 6 盘、EC 8+4、单站故障 fail-closed、恢复、配置负例；不依赖 witness C） |
 
 磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
 `xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。
@@ -177,7 +70,7 @@ EC 写/读（含区间读）已分块流式：内存峰值 ≈ 块缓冲（MiB �
 
 读路径只信 `xl.meta`：无有效 meta 的目录永不被服务；崩溃只会留下不可见的残骸
 （孤儿版本目录 / trash 残留 / 未完成的 multipart 暂存区）。服务启动时自检清 `tmp`/`trash`，
-`oss-server clean <days>` 按 mtime 回收其余残骸（M2a 已落地）。
+`oss-server clean <days>` 按 mtime 回收其余残骸。
 
 ## 跑起来
 
@@ -202,10 +95,10 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 > 已知限制：
 > - `/aetherupload/*` 四条路由**需 JWT**：登录后带 cookie `oss_token` 或 `Authorization: Bearer <token>` 访问
 >   （前端在登录成功时种 cookie，M1b）；缺/坏/过期一律 401。彻底的角色/策略模型仍随部署形态（M4+）。
-> - ListObjects v1 已实现（marker / NextMarker / delimiter / max-keys）；rclone 仍可用 `LIST_VERSION=2`。
+> - ListObjects v1 支持（marker / NextMarker / delimiter / max-keys）；rclone 仍可用 `LIST_VERSION=2`。
 > - 单次 PUT / 单个 part 仍受 `max_put_bytes`（默认 256 MiB）上限；multipart 大对象整体不受该值约束。
 > - Multipart：`UploadPartCopy`、`ListMultipartUploads`（含集群 `ListUploadsLocal`）、GET/HEAD `partNumber`
->   已实现；`partNumber` 与 `Range` 同时出现 → 400 `InvalidRequest`。
+>   支持；`partNumber` 与 `Range` 同时出现 → 400 `InvalidRequest`。
 > - `partNumber` 依赖 Complete 时落盘的 `part_sizes`：MPU Complete 落盘；站点复制、raft
 >   同 id 重推与 sync 写门随 `x-oss-part-sizes` 透传；tier 归档/恢复原地保留（restore 后仍可分段读）。
 >   异构远端复制、非 MPU 单段 PUT 无该表时退化为旧语义（仅 part 1 = 整对象；>1 → 416）。
@@ -215,12 +108,12 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 >   SignedHeaders 时保留到验签之后，由 s3s 返回确定性 400 `InvalidArgument`（不再 403
 >   `SignatureDoesNotMatch`）。
 > - 对象标签：`Put/Get/DeleteObjectTagging`、PUT 的 `x-amz-tagging`、GET/HEAD 的
->   `x-amz-tagging-count` 已落地；≤10 条、键 ≤128 / 值 ≤256 Unicode 标量，非法 → 400 `InvalidTag`。
->   标签按版本存储；复制摄入（`REPLICA`）不落标签。MPU 标签已落地，控制台可编辑对象标签。
+>   支持 `x-amz-tagging-count`；≤10 条、键 ≤128 / 值 ≤256 Unicode 标量，非法 → 400 `InvalidTag`。
+>   标签按版本存储；复制摄入（`REPLICA`）不落标签。MPU 标签受支持，控制台可编辑对象标签。
 > - CopyObject 指令：`x-amz-metadata-directive` / `x-amz-tagging-directive`（COPY/REPLACE，两轴独立）
->   已落地；REPLACE 未提供即清空；同桶同键仅 metadata REPLACE 解锁；COPY 时携带 tagging 头被忽略。
+>   支持；REPLACE 未提供即清空；同桶同键仅 metadata REPLACE 解锁；COPY 时携带 tagging 头被忽略。
 > - **控制台页面**：M5 加密/KMS 只读状态、M6 事件页与 Select 工作台、M4 桶策略编辑与审计查询、
->   对象标签编辑、桶默认加密、通知死信重投均已落地（M8 S6/7a/7b）；详见「控制台页面（S6）」节。
+>   对象标签编辑、桶默认加密、通知死信重投均受支持；详见「控制台页面（S6）」节。
 > - Multipart **part 级** `x-amz-checksum-*` 不校验（静默忽略；组合语义仍未实现，记档）；单段 PUT 的
 >   Content-MD5 / `x-amz-checksum-*` 已在提交点前校验（不符 → `BadDigest`，对象不落盘）。
 > - 控制台「上传记录」是登记历史：对象或暂存文件被删后，记录行仍在（按设计，作审计线索）。
@@ -724,7 +617,7 @@ C2）。
   名即路径白名单）；管理 API 为 `GET/POST /api/v1/encryption/cmks` 与
   `POST /api/v1/encryption/cmks/{name}/rotate`（admin-only）。轮换只影响**新写入**，旧版本保留
   供解密（与 AWS KMS 不重加密旧密文同口径）；审计只记名/版本/指纹，绝不记钥字节。
-- **CMK 删除与 rewrap（v1.16 候选）**：`DELETE /api/v1/encryption/cmks/{name}[?force=true]`
+- **CMK 删除与 rewrap**：`DELETE /api/v1/encryption/cmks/{name}[?force=true]`
   先做本地全引用扫描；任何活引用（含 force）→ 409 并返回引用列表；干净路径原子移入
   `.cmk-trash` → 等待写者静默/复扫 → 清除，超时或竞态则恢复。`POST
   /api/v1/encryption/cmks/{name}/rewrap` 按版本把旧 CMK 密文重加密到当前版本（默认 dry-run；
@@ -740,7 +633,7 @@ C2）。
   环境变量会让既有密文行全部 500（fail-closed）**——变更前先规划。**威胁模型边界（记档）**：
   加密只防**只读**泄露（备份/快照/误拷贝）；对数据库有写权限者可写入自选明文 SK 接管任意 AK
   （切片前有 DB 写权本就全权，非新增面）。
-- **边界（记档）**：桶级默认加密（`put-bucket-encryption`）已落地（单条 SSE-S3/SSE-KMS 规则；
+- **边界（记档）**：桶级默认加密（`put-bucket-encryption`）支持（单条 SSE-S3/SSE-KMS 规则；
   `aws:kms:<cmk>` 引用显式 CMK 时须先存在，SSE-C 拒绝）；aetherupload 内部摄取不带加密（存入为明文）；
   未配对应 env 时请求该模式 → 500（fail-closed，不静默落明文）；
   HTTP KMS 未实作（`KeyProvider` trait 已留接入点，文件型 KMS 即多钥目录）。
@@ -852,7 +745,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-notification-configura
   连接类错误永不放弃（退避封顶 300s）。Topic 需**预创建**（部署前置；UTOP 不判死）。
 - 无 Kafka 时的调试旁路：`OSS_EVENT_SINK=file:/<dir>`（落文件，测试用）；worker 间隔
   `OSS_EVENT_INTERVAL_SECS`（默认 1；0=关）。
-- 读访问事件：`s3:ObjectAccessed:*` / `:Get` / `:Head` 已实现（仅成功 200/206；304/416/错误不发）；
+- 读访问事件：`s3:ObjectAccessed:*` / `:Get` / `:Head` 支持（仅成功 200/206；304/416/错误不发）；
   其余 ObjectAccessed 子操作（如 GetTagging）仍 400；TLS/SASL 见 TLS 节。
 
 ## S3 Select（M6）
@@ -918,7 +811,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-replication --bucket s
   R1 分级重试（连接/408/429/5xx 永不放弃、其余 4xx 永久、>10 次死信）；积压写入 `repl_outbox`，
   目标恢复后自动追平。间隔 `OSS_REPL_INTERVAL_SECS`（默认 1；0=关）。
 - 限速按远端独立令牌桶（`[[remotes]].max_bytes_per_sec`）；缺省不限速，旧配置零改动。
-- **M6 载荷/版本删除（v1.16 候选）**：所有 M6 远端现在携带与站点路径一致的 content-type、
+- **M6 载荷/版本删除**：所有 M6 远端现在携带与站点路径一致的 content-type、
   用户元数据、标签、存储类、checksum、SSE、对象锁与 part-sizes。可选
   `[[remotes]].site_token`（留空 = 旧语义不变）让远端使用 M7 同源版本 id + `DELETE
   ?versionId=`（REPLICA/token/origin-id/bypass、目标 404 幂等、同版本保序）与目标 versioning
@@ -967,7 +860,7 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   版本（`x-amz-bypass-governance-retention: true`；目标 404 视为已删），若同 (bucket,key,version)
   的更早出站行仍未结算则先等待，避免删除被重试 PUT 复活。同版本多目标聚合
   PENDING→COMPLETED/FAILED。
-- **混合版本历史副本（v1.16 候选）**：升级前已复制的历史异步版本两端 UUID 不同，且未映射
+- **混合版本历史副本**：升级前已复制的历史异步版本两端 UUID 不同，且未映射
   副本没有来源身份。安全评审确认按 `(etag,size)` 自动删除可能误删共享目标上另一来源的
   同内容副本，因此**不做内容指纹自动删除**；同源 `remote_version_id` 定向删除与 404 幂等
   不变。未映射 legacy 副本保留，需人工对账/清理；升级前已发生的删除不回溯。
@@ -985,9 +878,9 @@ curl -s $A/api/v1/sites/b/status -H "authorization: Bearer $JWT"   # lag/dead/ou
   由任意已认证写者提供，可被用于抑制复制（M6 既有信任面，M7 的 DELETE 防环依赖同一头）；桶删除时
   若策略/授权行的 LWW 时钟更新，会按 L7 保留，同名桶重建可能继承这些残留行（跨站点并发删/改窗口）。
 
-## M8 控制面（S0–S6 已落地）
+## M8 控制面
 
-以下为 M8 已落地能力与用法；设计偏差与已知边界见本节末与设计文档 §M8。
+以下为 M8 能力与用法；设计偏差与已知边界见本节末与设计文档 §M8。
 控制面状态存于 SQLite `0003_m8.sql`（`access_points`/`olap_configs`/`jobs`/`job_tasks`/
 `inventory_configs`/`inventory_runs`/`tier_restores`），**单节点单进程**语义。
 
@@ -1341,9 +1234,9 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
 9. RestoreObject 的 202 由 router 层中间件补写（s3s 0.17 生成代码丢弃
    `S3Response.status`）；识别口径为 POST + `restore` 查询子资源。
 
-## M9 强一致（S0–S7 已落地）
+## M9 强一致
 
-**能力状态（2026-10-23，main）**：`crates/oss-server/src/raft/mod.rs` 的
+`crates/oss-server/src/raft/mod.rs` 的
 `RAFT_READY=true`、`SYNC_READY=true`、`STRETCH_READY=true` 决定运行时门控（能力位还要求
 对应配置存在）。`GET /api/v1/raft/status` 报真实状态（`enabled/node_id/role/leader/term/
 applied/lag/stale/snapshot/purged/voters/learners/production_ready`，以及 Level B 的
@@ -1355,45 +1248,6 @@ applied/lag/stale/snapshot/purged/voters/learners/production_ready`，以及 Lev
 本机已 apply 状态，**不是**线性一致读；分区/断连时 `lag` 仍可能为 0、
 **`stale=false` 不代表已追上 leader**，不能作为新鲜度保证。`/api/v1/site/raft/*` 提供
 append/vote/snapshot/status/membership/write/join。
-
-- **已落地**：S0 模式矩阵/配置校验/能力开关；S1–S3 sync 数据面（统一 origin version id、
-  写门与写 intent、MPU/Copy 边界、remote-first 删除、内部 token 路由、删桶 quiesce、删除
-  intent 恢复）；S4 stretch 2×6 数据面；S5 openraft 0.9.25 SQLite 日志/状态机/快照/HTTP
-  网络；S6 控制写路由（11 张控制表经 `ControlPlane` 单命令提交、确定性 payload、apply 后
-  缓存/目录副作用、`/site/changelog` 409、启动模式断言）；S7 3-voter 成员变更/leader 单跳
-  转发、双边配对与 B′ 替换、witness 独立运行时、11 表逻辑快照/安装、M7→Raft
-  `raft-cutover`/`raft-export`/`raft-force-recover`、`sync-reconcile [--repair]`、console
-  Raft 集群卡片。M7/Local 路径保持字节不变。后续补 OSSCTL2（level-2 生命周期数据）与
-  LC-0 导出/cutover/force-recover 来源校验（snapshot_format/wire/feature）。
-- **验收证据（v1.13.1 发布，代码 HEAD `ac007e7`，2026-10-22）**：`M9_STRICT=1 tests/e2e_m9.sh`
-  （sync）78 PASS / 0 FAIL / 1 预期 SKIP；`M9_STRICT=1 M9_STRETCH=1 tests/e2e_m9.sh`
-  （stretch+Raft 配对/witness）59 PASS / 0 FAIL / 1 预期 SKIP；`tests/e2e_m9_recovery.sh`
-  133 PASS / 0 FAIL / 1 预期 SKIP；M7 回归 `tests/e2e_sites.sh` PASS。Rust 聚焦测试
-  164 PASS（lib 112 + raft_access 6 + raft_s71 6 + raft_cutover 4 + sync_gate 36）；
-  `cargo fmt --all --check` 与
-  `cargo clippy -p oss-server -p xl-s3 --all-targets -- -D warnings` 通过。
-  2026-10-23 能力清理的聚焦证据见
-  `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §3：xl-store 259+1 ignored /
-  xl-s3 136 / oss-server 140，S3 e2e 38 节。
-  **2026-10-24 v1.15.0 硬化 lane**：sync 78/0/1、stretch 59/0/1、recovery 133/0/1、
-  rolling 65/0/4；M8 e2e PASS（4433s，Tier 段按环境 SKIP）；集成树库测试
-  xl-store 268+1 ignored / xl-s3 150 / oss-server 152，S3 全量 e2e 38 节 RC=0，Web
-  `tsc`/`vite build`/Playwright 9/9。逐项证据见验收记录 §11。
-  **2026-10-24 v1.16.0 集成树**：库测试 xl-store 282+1 ignored / xl-s3 163 / oss-server 168；
-  S3 全量 e2e 38 节 RC=0；E2E_LONG 100×100MB 通过；M8 e2e PASS 4742s（Tier=ran + M6/M7
-  smoke）；M9 sync/stretch/recovery/rolling 78/59/133/65；fmt 与 clippy 0 warning。逐项证据
-  见验收记录 §12。
-  **2026-10-24 v1.17.0 集成树**：库测试 xl-store 300（1 ignored）/ xl-s3 176 / oss-server 179；
-  S3 全量 e2e 38 节 RC=0（含 Kafka 三阶段、双实例复制与 §20 标签）；M9 sync/stretch/recovery/rolling
-  78/59/133/65（rolling 首跑 64/1/4 为高负载轮询超时，重跑通过）；M8 e2e PASS 4633s（Tier=ran + M6/M7 smoke）；E2E_LONG
-  100×100MB 通过（含中断重试）；fmt/clippy 0；Web `tsc`/`vite build` 通过、Vitest 21/21、oxlint 0。
-  **2026-10-23 Level B 热修**：`BucketSetLifecycleV2` 此前漏标 level 2（混合窗口会被
-  v1.13.1 副本解码失败，快照会静默丢结构化规则）；现已 `min_feature_level()=2`（写入门控
-  503 `feature_unavailable`），且快照编码器在 `lifecycle_rules.config_json` 非空时拒绝
-  OSSCTL1（fail-closed，待 OSSCTL2）；`raft-cutover` 复用同一守卫（dry-run 也拒绝），
-  不会把 level-2 规则装进无快照能力的基线。回归测试见
-  `crates/oss-server/tests/raft_commands.rs`、`tests/raft_cutover.rs` 与
-  `src/raft/data.rs`。
 
 ### 模式矩阵
 
@@ -1432,7 +1286,7 @@ A+B、A+C、B+C 均可写。C 只持久化 `raft.db` + 控制面 `state_db`（11
 第 3 voter；成员集以 `metrics().membership_config` 为准，不硬编码 `{A,B,C}`。C 可当选 leader，
 follower 的成员变更/控制写经 `x-oss-raft-forwarded` 单跳转发到 leader。
 
-### sync 写语义（S1–S3 已实现；S6 起能力门开启）
+### sync 写语义
 
 生产配置（A/B 配对为 2 voters；加 witness C 后 3 voters）：
 
@@ -1485,7 +1339,7 @@ timeout_ms = 10000                     # 默认 10s；仅 sync 远端调用 → 
   SSE-S3/KMS 由目标本地决定。默认 64 MiB / 10s 要求约 ≥52 Mbps 上行，WAN 带宽不足时须下调
   `max_object_bytes` 或提高 `timeout_ms`；默认面向小对象/合规桶。
 
-### sync 删除语义（S3 已实现）
+### sync 删除语义
 
 - **唯一入口**：S3 `DeleteObject`/`DeleteObjects`、生命周期 Expiration、Batch Delete、
   控制台对象/桶删除统一经 `SiteSyncDelete`；sync 桶 remote-first（先远端 ack，再本地），
@@ -1630,15 +1484,13 @@ db_path = "/var/lib/oss/raft.db"
      `schema_meta.raft_feature_level=2`（只升不降）。之后回滚必须换回支持该级别的二进制；
      marker 高于配置或二进制上限时启动直接拒绝。**回滚只在激活前可行**：停集群、换回旧
      二进制、删除 `feature_level` 键（旧 `RaftToml` 拒绝未知键）、启动。
-   - **level-2 命令（2026-10-23 热修）**：唯一的产品级 level-2 命令是
+   - **level-2 命令**：唯一的产品级 level-2 命令是
      `BucketSetLifecycleV2`（含 filter/多 Transition/Date/Noncurrent 的结构化生命周期
      规则）。`feature_level=1` 时这类写入在 append 前被拒绝（503
      `{"error":"feature_unavailable","required":2,"effective":1}`）；旧列可表达的规则
      仍走 V1、行为不变。首条结构化规则写入即激活 `schema_meta.raft_feature_level=2`
-     （不归点同下）。`tests/e2e_m9_rolling.sh` 已在 v1.16.0 集成树实跑：
-     65 PASS / 0 FAIL / 4 SKIP；SKIP 为 v1.13.1 侧无法覆盖的 D6 项（跨版本快照、level-2 503、
-     激活、激活后回滚），不是产品失败。
-   - **OSSCTL2 快照与切档（v1.16 候选）**：快照编码器按数据/激活级别选择格式；含
+     （不归点同下）。
+   - **OSSCTL2 快照与切档**：快照编码器按数据/激活级别选择格式；含
      `lifecycle_rules.config_json` 或已激活 level 2 时写 OSSCTL2（magic + SHA-256 +
      feature_level + 数据），否则保持 OSSCTL1。新旧二进制**双读** OSSCTL1/2；旧读者对
      OSSCTL2 明确拒绝（不静默丢行）。`raft-cutover`（含 dry-run）、`raft-force-recover`、
@@ -1664,114 +1516,6 @@ db_path = "/var/lib/oss/raft.db"
   A/B 配对后 2 voters，`raft-add-witness` 加 C 后 3 voters（quorum 2，`production_ready=true`）；
   单节点 bootstrap 仍可用于开发。`tests/e2e_m9.sh`（3 进程）与 `tests/e2e_stretch.sh`
   已在本机通过；上线前仍应在目标网络重跑并保留证据。
-
-## 验收
-
-
-
-覆盖范围：S3 面（aws-cli + rclone 的建桶/增删查列与内容比对）见下方脚本；控制台的登录/上传/秒传/密钥常规路径见
-「控制台（M1b）」的 Playwright e2e；**1 GB 上传与断线续传为人工验证项**（指引同 M1b 段）。
-前置：本机装了 aws-cli 与 rclone。
-
-```bash
-AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 tests/e2e_s3.sh
-# M5 全量（步骤 18）：服务须以密钥库启动（OSS_MASTER_KEY_FILE/OSS_KMS_DIR），可选：
-#   E2E_DATA_DIR=<data_dir>  盘上明文特征 grep（含明文对照键的判别性断言）
-#   E2E_DB=<sqlite 路径>     SK 落库密文前缀（enc:v1:）断言
-```
-
-M6 全量（§19：Select 对当前 ENDPOINT + Kafka（docker redpanda）+ 复制双实例）：
-
-```bash
-cargo build -p oss-server && AK=... SK=... ENDPOINT=... tests/e2e_s3.sh
-tests/e2e_replication.sh        # 仅复制：自动起源/目标两实例（约 1–2 分钟）
-tests/e2e_kafka.sh              # 仅 Kafka 三阶段（redpanda docker；约 1 分钟）
-tests/e2e_sites.sh              # M7 多站点：自动起 A/B 两实例并双向配对（约 2–4 分钟）
-```
-
-M8 测试锚：
-
-```bash
-cargo test -p xl-store --lib            # 标签/storage_class/tier phase/DeleteOutcome tier refs
-cargo test -p xl-s3 --lib               # AP/OLAP/restore/lifecycle/inventory 形校验 + 策略矩阵
-cargo test -p oss-server --lib          # 0003 迁移/补列/AP CRUD/作业状态机/Inventory/tier 调度
-cargo test -p oss-server --test m8_ap --test m8_batch --test m8_tier --test m8_lifecycle_api \
-  --test m8_inventory_parquet --test m8_tier_gc
-cargo test -p oss-server --test jobs_engine --test console_api
-cargo test -p xl-s3 --test lock_ops --test mpu_ops            # Retention / MPU 五操作线级
-cargo test -p oss-server --test raft_handshake --test tls_config_matrix \
-  --test tls_listener --test tls_outbound --test tls_mesh     # Level B 握手 / TLS 矩阵
-cargo test -p xl-s3 --features olap-wasm   # WASM 变换器（需 wasmtime 环境）
-# S3 标签 + Copy 指令在 tests/e2e_s3.sh 步骤 20（已含于全量脚本）
-# 能力清理批（2026-10-23）：xl-store 259+1 ignored / xl-s3 136 / oss-server 140
-```
-
-M8 端到端（控制面；服务已启动，脚本自行播种 AK/桶，退出时清理）：
-
-```bash
-AK=AKIA_TEST_ACCESS_KEY SK=SK_TEST_SECRET_KEY_0001 ENDPOINT=http://127.0.0.1:9000 \
-  ADMIN_USER=erik ADMIN_PASSWORD=changeme tests/e2e_m8.sh
-# 分层段：服务须以 [[tiers]] 启动；可选 TIER_ENDPOINT/TIER_AK/TIER_SK 让脚本自建远端桶，
-# 或 E2E_M8_SKIP_TIER=1 显式跳过（输出 SKIP 行，不静默省段）。
-# 其它旋钮：E2E_M8_PARALLEL(8) / E2E_M8_JOB_TIMEOUT(3600) / E2E_M8_TIER_TIMEOUT(240) /
-#           E2E_M8_M4_TIMEOUT(150) / E2E_M8_REPL_SMOKE=1（追加 e2e_replication/e2e_sites）。
-# 作业吞吐取服务端 OSS_JOB_WORKERS/OSS_JOBS_INTERVAL_SECS。e2e 建议 OSS_JOB_WORKERS=1 +
-# OSS_JOBS_INTERVAL_SECS=1（当前引擎 finish_task 在默认 2 worker + 负载下可能锁冲突，任务
-# 停在 running 直到 deadline；见 task-6b 报告）。干净 1000 任务作业约 17 分钟；含失败重试
-# 的 1001 作业受退避抖动影响可能再多数分钟到十几分钟。脚本跑 1000 与 1000+1 两个作业。
-```
-
-集群验收（M3；4 节点真进程 + 混沌段，覆盖「拔节点/分区/并发写/拉回补齐/控制面扇出」）：
-
-```bash
-cargo build -p oss-server && tests/e2e_m3_cluster.sh   # 端口全自动取空闲；约 8–15 分钟（含 §⑤ 超时预算）
-# 含 §0c：桶行广播接线（建/删桶后各节点即时一致，免重启——M5 切片 0 遗留断言）
-```
-
-M9 强一致端到端（自动起 A/B 数据站点 + witness C，端口/目录全自动，退出清理）：
-
-```bash
-cargo build -p oss-server && tests/e2e_m9.sh              # 默认 sync 模式（估算 3–6 分钟）
-M9_STRETCH=1 tests/e2e_m9.sh                              # Stretch EC 2×6 模式（估算 3–6 分钟）
-OSS_OLD_BIN=/path/to/v1.13.1/oss-server tests/e2e_m9_rolling.sh  # Level B 控制面滚动；缺 OSS_OLD_BIN → SKIP
-bash tests/e2e_m9_recovery.sh                             # 灾备：cutover/force-recover/B′ + repair（需 sqlite3）
-# OSS_BIN=target/debug/oss-server 可指定二进制；M9_STRICT=1 除模式互斥的预期 SKIP 外，
-# 任何 SKIP 升级为 FAIL（功能齐备后 CI 用）；e2e_m9_recovery 另需 aws-cli/curl/python3/sqlite3。
-```
-
-功能门控：脚本读 `GET /api/v1/raft/status` 的 `capabilities.{raft,sync,stretch}` 决定跑哪些段；
-未接线（capabilities=false）以 `SKIP: 原因` 显式跳过并退出 0（不是静默省段）。判定只看
-capabilities：`capabilities.raft=true` 时 `enabled` 必须为 true，否则 FAIL。启动阶段只有 A/B 都以
-未知字段/配置校验错误退出才默认 SKIP（旧配置严格拒绝的构建）；运行期启动失败一律 FAIL。sync 桶与
-stretch 按计划 v3 **互斥**（同一集群不可同时启用），默认跑步骤 1/2/3/5，`M9_STRETCH=1`
-跑 1/2/4/5（步骤 3 显式 SKIP）。独立的 `tests/e2e_stretch.sh` 已落地，直接用真实两站点
-验证 S4 数据面（不依赖 witness C）；`tests/e2e_m9.sh` 的 stretch 段仍按 capability 门控，
-未接线时 SKIP。功能已齐备（三能力位均为 true）；验收请加 `M9_STRICT=1`：除 sync/stretch 模式互斥的预期
-SKIP 外，任何 SKIP 都按 FAIL 处理（`skip_expected` 不计失败）。
-
-## 参考文档
-
-- 设计文档：`docs/superpowers/specs/2026-10-10-minio-clone-design.md`
-- 功能规格：`docs/superpowers/specs/2026-10-10-feature-spec.md`
-- M1 实现计划：`docs/superpowers/plans/2026-10-10-m1a-backend-slice.md`（前端：`…-m1b-frontend-console.md`）
-- M2a 实现计划：`docs/superpowers/plans/2026-10-12-m2a-usability-slice.md`
-- M2b 实现计划（多盘 / EC / 断电一致性）：`docs/superpowers/plans/2026-10-12-m2b-ec-multidisk.md`
-- 子账户与权限体系实施记录：`docs/superpowers/plans/2026-10-13-subaccounts-permissions.md`
-- M3 分布式实现记录：`docs/superpowers/plans/2026-10-13-m3-distributed.md`
-- M4 运维与 IAM 实现记录：`docs/superpowers/plans/2026-10-14-m4-ops-iam.md`
-- M5 安全与锁定实施记录（已发布）：`docs/superpowers/plans/2026-10-16-m5-security-lock.md`
-- M6 数据流实施记录（已发布）：`docs/superpowers/plans/2026-10-17-m6-dataflow.md`
-- M7 多站点实施记录（已发布）：`docs/superpowers/plans/2026-10-18-m7-multisite.md`
-- M8 前置（对象标签 / Copy 指令）：`docs/superpowers/plans/2026-10-19-s3-gaps-tagging-replace.md`
-- M8 控制面计划（v3.1，S0–S6 已实施；含验收锚与残余边界）：
-  `docs/superpowers/plans/2026-10-19-m8-control-plane.md`
-- M8 缺口收口（后端补口：MPU 标签、控制台标签路由、审计过滤、加密/KMS 状态、通知死信、
-  Select 代理、桶默认加密、IAM 预设、复制限速；以及 M4/M5/M6 文档化缺口页）：见 M8 计划
-  「缺口收口与偏差」节、设计文档 §M8 落地状态
-- M8 e2e：`tests/e2e_m8.sh`（前置与旋钮见「M8 测试锚」段）
-- M9 强一致计划（v5；数据面 S0–S4 + Raft S5、控制面 S6、3-voter/配对/快照/cutover S7
-  已实施；S8/S9 验收已完成（证据见下））：
-  `docs/superpowers/plans/2026-10-20-m9-strong-consistency.md`
 
 ---
 
