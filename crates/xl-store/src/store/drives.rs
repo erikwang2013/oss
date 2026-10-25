@@ -307,6 +307,25 @@ impl ClusterTopology {
         }
     }
 
+    /// 槽位 → (node, 该节点物理盘序)。positional 由 bases 反推；越界返回 None。
+    /// shrink plan 用它对比新旧归属（槽号不变，只换解析）。
+    pub fn slot_target(&self, slot: u16) -> Option<SlotTarget> {
+        if slot >= self.slot_count {
+            return None;
+        }
+        match &self.slot_map {
+            Some(m) => m.slots.get(slot as usize).cloned(),
+            None => {
+                let ni = self.node_of_slot(slot);
+                let node = self.nodes.get(ni)?;
+                Some(SlotTarget {
+                    node: node.id.clone(),
+                    drive: slot - self.bases[ni],
+                })
+            }
+        }
+    }
+
     /// 该节点承载的槽数（positional = 其盘数）；节点下标越界返回 0。
     pub fn slot_count_of_node(&self, node_idx: usize) -> u16 {
         match &self.slot_map {

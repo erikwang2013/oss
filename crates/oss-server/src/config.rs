@@ -58,6 +58,9 @@ pub struct AppConfig {
     /// STS：`[sts]`（AssumeRoleWithWebIdentity 的 OIDC 联合身份；缺省全关）。
     #[serde(default)]
     pub sts: xl_s3::sts_web_identity::StsToml,
+    /// M3 shrink：维护模式（非 GET/HEAD/OPTIONS 一律 503、后台 worker 全停）。
+    #[serde(default)]
+    pub maintenance: bool,
 }
 
 /// `[raft]`：3-voter 控制面运行时参数。`advertise_endpoint` 是主 HTTP（Raft RPC 路由），
@@ -433,6 +436,149 @@ pub struct ClusterToml {
     /// M4 切片 5 放置开关：`"v2"` = 展开放置（扩容前全节点同步开启；混版会写失败可诊断）。
     #[serde(default)]
     pub placement: Option<String>,
+    /// M3 shrink 拓扑 v3：显式槽表 epoch（0 = 未配置显式槽表，positional）。
+    #[serde(default)]
+    pub epoch: u64,
+    /// 显式槽表 `[[cluster.slots]]`：同一 set 的条目按文件出现顺序编号 0..n。
+    #[serde(default)]
+    pub slots: Vec<SlotToml>,
+}
+
+/// 显式槽表的一条：槽号由同 set 内的文件顺序决定（不写槽号本身）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotToml {
+    #[serde(default)]
+    pub set: u16,
+    pub node: String,
+    pub drive: u16,
+}
+
+/// 节点按 set 分组（set 缺省 0；set 号须从 0 连续）。配置是信任边界，fail-closed。
+pub(crate) fn sets_nodes_by_set(
+    nodes: &[NodeToml],
+) -> Result<Vec<Vec<xl_store::store::NodeSpec>>, String> {
+    let mut by_set: std::collections::BTreeMap<u16, Vec<xl_store::store::NodeSpec>> =
+        std::collections::BTreeMap::new();
+    for n in nodes {
+        by_set
+            .entry(n.set.unwrap_or(0))
+            .or_default()
+            .push(xl_store::store::NodeSpec {
+                id: n.id.clone(),
+                addr: n.addr.clone(),
+                drive_count: n.drive_count,
+            });
+    }
+    let k = by_set.len() as u16;
+    if by_set.keys().copied().ne(0..k) {
+        return Err(format!(
+            "cluster.nodes 的 set 号必须从 0 连续（现有 {:?}）",
+            by_set.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(by_set.into_values().collect())
+}
+
+/// shrink plan 的目标拓扑文件（`oss-server cluster-shrink plan --to <path>`）。
+/// 允许整份 oss.toml（只取 `[cluster]`/`[ec]`），也允许只含这两节的最小文件。
+#[derive(Debug, Clone, Deserialize)]
+struct ClusterTopoFile {
+    #[serde(default)]
+    cluster: Option<ClusterToml>,
+    #[serde(default)]
+    ec: Option<EcToml>,
+}
+
+/// 读目标配置并构造新 `ClusterSets`（必须显式槽表；node_id 必须与本机一致）。
+/// 只读：不写任何拓扑/数据文件。
+pub fn load_cluster_topo(
+    path: &std::path::Path,
+    self_id: &str,
+    ec: &xl_store::store::ec::EcConfig,
+) -> Result<xl_store::store::ClusterSets, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("读取目标配置 {} 失败: {e}", path.display()))?;
+    let file: ClusterTopoFile = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let cl = file.cluster.ok_or_else(|| {
+        "目标配置缺少 [cluster]（单机→多节点仅支持重新灌入，见 README 集群模式）".to_string()
+    })?;
+    cl.cluster_validate()?;
+    if cl.slots.is_empty() {
+        return Err(
+            "目标配置必须同时配置 [cluster].epoch 与 [[cluster.slots]]（shrink 只接受显式槽表）"
+                .into(),
+        );
+    }
+    if cl.node_id != self_id {
+        return Err(format!(
+            "目标配置 node_id «{}» 与本机 «{self_id}» 不一致（节点须使用各自的配置）",
+            cl.node_id
+        ));
+    }
+    if let Some(t) = file.ec
+        && (t.data != ec.data || t.parity != ec.parity || t.enabled != ec.enabled)
+    {
+        return Err(format!(
+            "目标 [ec] 与当前部署不一致（data/parity/enabled: {}+{}/{} vs {}+{}/{}）；shrink 不改变 EC 几何",
+            t.data, t.parity, t.enabled, ec.data, ec.parity, ec.enabled
+        ));
+    }
+    let sets_nodes = sets_nodes_by_set(&cl.nodes)?;
+    let slot_maps = cl.slot_maps(sets_nodes.len())?;
+    xl_store::store::ClusterSets::with_slot_maps(self_id, sets_nodes, slot_maps, ec)
+        .map_err(|e| e.to_string())
+}
+
+impl ClusterToml {
+    /// `[cluster]` 自身的一致性：epoch 与 slots 必须同时存在（epoch==0 ⇔ slots 为空）。
+    pub fn cluster_validate(&self) -> Result<(), String> {
+        match (self.epoch, self.slots.is_empty()) {
+            (0, true) => Ok(()),
+            (0, false) => {
+                Err("[cluster].slots 已配置但 epoch==0（显式槽表必须同时给 epoch）".into())
+            }
+            (_, false) => Ok(()),
+            (_, true) => Err(format!(
+                "[cluster].epoch={} 但未配置 [[cluster.slots]]",
+                self.epoch
+            )),
+        }
+    }
+
+    /// 逐 set 组装槽表（全 None = positional）。set 号须从 0 连续且每 set 至少一槽。
+    pub fn slot_maps(
+        &self,
+        sets_len: usize,
+    ) -> Result<Vec<Option<xl_store::store::SlotMap>>, String> {
+        if self.slots.is_empty() {
+            return Ok(vec![None; sets_len]);
+        }
+        let mut per: Vec<Vec<xl_store::store::SlotTarget>> = vec![Vec::new(); sets_len];
+        for s in &self.slots {
+            let some = per.get_mut(s.set as usize).ok_or_else(|| {
+                format!(
+                    "[[cluster.slots]] set={} 越界（共 {sets_len} 个 set）",
+                    s.set
+                )
+            })?;
+            some.push(xl_store::store::SlotTarget {
+                node: s.node.clone(),
+                drive: s.drive,
+            });
+        }
+        if let Some(i) = per.iter().position(|v| v.is_empty()) {
+            return Err(format!("set {i} 未配置任何 [[cluster.slots]]"));
+        }
+        Ok(per
+            .into_iter()
+            .map(|slots| {
+                Some(xl_store::store::SlotMap {
+                    epoch: self.epoch,
+                    slots,
+                })
+            })
+            .collect())
+    }
 }
 
 /// 拓扑表中的一个节点。`addr` = 该节点 gRPC 监听地址（HTTP 端口另配）。
@@ -513,6 +659,8 @@ impl AppConfig {
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.site_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.cluster_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.raft_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.sts_validate()
@@ -523,6 +671,14 @@ impl AppConfig {
     /// `[sts]`：启用 web_identity 时启动期读入并校验 JWKS（坏配置/坏文件 = 拒绝启动）。
     pub fn sts_validate(&self) -> Result<(), String> {
         self.sts.validate()
+    }
+
+    /// `[cluster]` 自身形态（epoch/slots 互斥）；节点/槽表结构由 ClusterSets 校验。
+    pub fn cluster_validate(&self) -> Result<(), String> {
+        match self.cluster.as_ref() {
+            Some(c) => c.cluster_validate(),
+            None => Ok(()),
+        }
     }
 
     /// TLS 模式与监听地址 scheme 一致性；证书物料在 AppState::load 读取（witness 在 run 中）。
@@ -1055,6 +1211,7 @@ mod tests {
             data_dir: "d".into(),
             data_dirs: None,
             ec: Default::default(),
+            maintenance: false,
             staging_dir: "s".into(),
             database_url: "sqlite::memory:".into(),
             jwt_secret: String::new(),
@@ -1118,6 +1275,79 @@ mod tests {
         );
     }
 
+    /// maintenance 默认 false（既有部署零改动）；显式 true 可解析。
+    #[test]
+    fn maintenance_defaults_false() {
+        let base = "listen = \"127.0.0.1:0\"\n\
+                    data_dir = \"d\"\n\
+                    staging_dir = \"s\"\n\
+                    database_url = \"sqlite::memory:\"\n\
+                    jwt_secret = \"\"\n";
+        let off: AppConfig = toml::from_str(base).unwrap();
+        assert!(!off.maintenance);
+        let on: AppConfig = toml::from_str(&format!("{base}maintenance = true\n")).unwrap();
+        assert!(on.maintenance);
+    }
+
+    /// shrink 目标文件：显式槽表按文件顺序编号，epoch/node_id 校验 fail-closed。
+    #[test]
+    fn load_cluster_topo_reads_explicit_slot_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("target.toml");
+        let mut network = String::new();
+        let mut slots = String::new();
+        for id in ["n1", "n2", "n3", "n4"] {
+            network.push_str(&format!(
+                "[[cluster.nodes]]\nid=\"{id}\"\naddr=\"{id}:1\"\ndrive_count=3\n"
+            ));
+            for d in 0..3 {
+                slots.push_str(&format!("[[cluster.slots]]\nnode=\"{id}\"\ndrive={d}\n"));
+            }
+        }
+        std::fs::write(
+            &p,
+            format!("[cluster]\nnode_id=\"n1\"\nsecret=\"s\"\nepoch=2\n{network}{slots}"),
+        )
+        .unwrap();
+        let ec = xl_store::store::ec::EcConfig::default();
+        let sets = load_cluster_topo(&p, "n1", &ec).unwrap();
+        assert_eq!(sets.topology_epoch(), 2);
+        let t = &sets.sets[0];
+        assert_eq!(t.slot_count(), 12);
+        assert_eq!(t.slot_target(0).unwrap().node, "n1");
+        let last = t.slot_target(11).unwrap();
+        assert_eq!((last.node.as_str(), last.drive), ("n4", 2));
+        assert!(
+            load_cluster_topo(&p, "n2", &ec)
+                .unwrap_err()
+                .contains("node_id")
+        );
+
+        let no_slots = dir.path().join("no_slots.toml");
+        std::fs::write(
+            &no_slots,
+            "[cluster]\nnode_id=\"n1\"\nsecret=\"s\"\nepoch=2\n",
+        )
+        .unwrap();
+        assert!(
+            load_cluster_topo(&no_slots, "n1", &ec)
+                .unwrap_err()
+                .contains("未配置")
+        );
+
+        let no_epoch = dir.path().join("no_epoch.toml");
+        std::fs::write(
+            &no_epoch,
+            "[cluster]\nnode_id=\"n1\"\nsecret=\"s\"\n[[cluster.slots]]\nnode=\"n1\"\ndrive=0\n",
+        )
+        .unwrap();
+        assert!(
+            load_cluster_topo(&no_epoch, "n1", &ec)
+                .unwrap_err()
+                .contains("epoch==0")
+        );
+    }
+
     fn cluster_cfg() -> AppConfig {
         let mut c = base_cfg();
         c.cluster = Some(ClusterToml {
@@ -1125,6 +1355,8 @@ mod tests {
             secret: String::new(),
             nodes: vec![],
             placement: None,
+            epoch: 0,
+            slots: vec![],
         });
         c
     }
@@ -1442,6 +1674,7 @@ mod tests {
             data_dir: std::path::PathBuf::from("/tmp/x"),
             data_dirs: None,
             ec: Default::default(),
+            maintenance: false,
             staging_dir: std::path::PathBuf::from("/tmp/x"),
             database_url: "sqlite::memory:".into(),
             jwt_secret: "k".repeat(32),
@@ -1643,6 +1876,8 @@ state_db = "/x/state.db"
             secret: String::new(),
             nodes: vec![],
             placement: None,
+            epoch: 0,
+            slots: vec![],
         });
         c.site = Some(Default::default());
         c.raft = Some(raft_toml());
@@ -1701,6 +1936,8 @@ state_db = "/x/state.db"
             secret: String::new(),
             nodes: vec![],
             placement: None,
+            epoch: 0,
+            slots: vec![],
         });
         assert!(c.stretch_validate().unwrap_err().contains("[cluster]"));
         let mut c = m9_cfg();

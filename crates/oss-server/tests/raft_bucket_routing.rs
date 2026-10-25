@@ -113,6 +113,7 @@ async fn setup() -> H {
         data_dir: dir.path().join("data"),
         data_dirs: None,
         ec: Default::default(),
+        maintenance: false,
         staging_dir: dir.path().join("staging"),
         database_url: db_url.clone(),
         jwt_secret: JWT_SECRET.into(),

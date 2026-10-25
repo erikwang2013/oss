@@ -45,6 +45,7 @@ cluster_token = "t"
         data_dir: dir.join("data"),
         data_dirs: None,
         ec: Default::default(),
+        maintenance: false,
         staging_dir: dir.join("staging"),
         database_url: db_url(dir),
         jwt_secret: JWT_SECRET.into(),

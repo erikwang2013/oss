@@ -26,6 +26,9 @@ pub const USAGE: &str = "\
   rebalance [--dry-run|--apply]
                  扩容搬迁（默认 dry-run）：把存量对象迁到展开放置（placement=v2；未开则空跑）；
                  逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
+  cluster-shrink plan --to <target.toml> [--json]
+                 shrink 只读校验（全节点 maintenance）：逐 set 槽数/parity/容量/epoch+hash/
+                 退役节点 MPU 全通过才出计划；报告 .oss.sys/shrink/<old>-<new>-plan.json
   witness        启动 witness 控制面节点（读 --config 的 [raft]；无数据目录/S3 面）
   raft-add-witness --node-id N --endpoint <advertise_url> [--replace OLD]
                  通过本机 advertise_endpoint 的 HTTP 成员路由加 witness（不二次打开 raft.db）
@@ -73,6 +76,11 @@ pub enum Command {
     /// M4 切片 5：扩容后搬迁（dry_run 只报告）
     Rebalance {
         dry_run: bool,
+    },
+    /// M3 shrink T4：只读生成旧→新拓扑迁移计划（校验失败退出非零）。
+    ClusterShrinkPlan {
+        to: std::path::PathBuf,
+        json: bool,
     },
     /// M9 S7.1：witness 控制面节点（独立运行时，不建 AppState）。
     Witness,
@@ -383,6 +391,19 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
                 json: flags.contains("--json"),
             })
         }
+        ("cluster-shrink", rest) => {
+            let (sub, rest) = rest.split_first().ok_or(USAGE)?;
+            match sub.as_str() {
+                "plan" => {
+                    let (v, flags) = parse_flags(rest, &["--to"], &["--json"])?;
+                    Ok(Command::ClusterShrinkPlan {
+                        to: v.get("--to").map(std::path::PathBuf::from).ok_or(USAGE)?,
+                        json: flags.contains("--json"),
+                    })
+                }
+                _ => Err(USAGE),
+            }
+        }
         ("cmk", rest) => Ok(Command::Cmk(parse_cmk_args(rest)?)),
         _ => Err(USAGE),
     }
@@ -546,6 +567,15 @@ pub async fn run(
     cmd: Command,
     state: AppState,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    // shrink 与离线搬运/巡检互斥（spec 5.6）：plan 持 active.lock 期间禁止 fsck/heal/scrub/rebalance。
+    if matches!(
+        &cmd,
+        Command::Fsck { .. } | Command::Heal | Command::Scrub | Command::Rebalance { .. }
+    ) && let Err(e) = check_no_shrink(&state)
+    {
+        eprintln!("Error: {e}");
+        return Ok(1);
+    }
     match cmd {
         Command::Serve => {
             let listen = state.cfg.listen.clone();
@@ -657,85 +687,91 @@ pub async fn run(
                 });
             }
 
-            // M8-1：单例后台任务 leader 门控（无 `[raft]` = 恒 true，行为不变；Raft 模式
-            // 下只有当前 leader 领取/执行，交接后各 worker 下一轮自动换手）。
-            let leader = crate::raft::LeaderGate::from_raft(state.raft.clone());
-            // M9 S1/S3：sync 写/删 intent 恢复（先跑启动轮，再挂 30s worker）。
-            // intent 表是节点本地恢复队列（本节点发起、本节点重放），不做 leader 门控。
-            crate::sync::recover_write_intents(&state).await;
-            crate::sync::recover_delete_intents(&state).await;
-            if state.site_enabled {
-                crate::sync::spawn_intent_worker(state.clone());
-            }
-            // M4 切片 6：生命周期 worker（serve 专属；运维命令不挂）。
-            // 间隔 OSS_LIFECYCLE_INTERVAL_SECS（默认 60；0=关闭）
-            crate::lifecycle::spawn_worker(state.clone());
-            // M6 切片 0：事件 outbox worker（OSS_EVENT_INTERVAL_SECS，0=关）
-            crate::events::spawn_worker(
-                std::sync::Arc::clone(&state.events),
-                state.db.pool().clone(),
-            );
-            // M7：站点控制面 changelog worker（OSS_SITE_INTERVAL_SECS，0=关）
-            // M9 S6a：Raft 模式不挂站点 worker（控制写不经 changelog；S6d 再决定替代）。
-            if state.site_enabled && state.cfg.raft.is_none() {
-                crate::site::spawn_site_worker(
-                    state.db.pool().clone(),
-                    std::sync::Arc::clone(&state.tls),
-                );
-            }
-            // M6 切片 4：复制 outbox worker（OSS_REPL_INTERVAL_SECS，0=关）
-            crate::replication::spawn_repl_worker(
-                state.db.pool().clone(),
-                std::sync::Arc::clone(&state.store),
-                std::sync::Arc::clone(&state.repl_client),
-            );
-            // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
-            crate::lifecycle::spawn_audit_cleanup(state.clone());
-            // M8 S0：通用作业引擎（S4b 的 Transition/Restore + S3 Batch + S5 Inventory；0 关闭）
-            let executor = std::sync::Arc::new(ServeTaskExecutor {
-                tier: std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
-                    std::sync::Arc::clone(&state.db),
-                    std::sync::Arc::clone(&state.store),
-                    std::sync::Arc::clone(&state.tiers),
+            // M3 shrink：maintenance 下不启动任何后台 worker/恢复（写路径必须静止）；
+            // HTTP 仍只读在线，供 mesh 拉取源分片。
+            if state.cfg.maintenance {
+                tracing::info!("maintenance 模式：后台 worker 与 intent 恢复全部暂停");
+            } else {
+                // M8-1：单例后台任务 leader 门控（无 `[raft]` = 恒 true，行为不变；Raft 模式
+                // 下只有当前 leader 领取/执行，交接后各 worker 下一轮自动换手）。
+                let leader = crate::raft::LeaderGate::from_raft(state.raft.clone());
+                // M9 S1/S3：sync 写/删 intent 恢复（先跑启动轮，再挂 30s worker）。
+                // intent 表是节点本地恢复队列（本节点发起、本节点重放），不做 leader 门控。
+                crate::sync::recover_write_intents(&state).await;
+                crate::sync::recover_delete_intents(&state).await;
+                if state.site_enabled {
+                    crate::sync::spawn_intent_worker(state.clone());
+                }
+                // M4 切片 6：生命周期 worker（serve 专属；运维命令不挂）。
+                // 间隔 OSS_LIFECYCLE_INTERVAL_SECS（默认 60；0=关闭）
+                crate::lifecycle::spawn_worker(state.clone());
+                // M6 切片 0：事件 outbox worker（OSS_EVENT_INTERVAL_SECS，0=关）
+                crate::events::spawn_worker(
                     std::sync::Arc::clone(&state.events),
-                )),
-                inventory: std::sync::Arc::clone(&state.inventory_runner),
-                // Batch：与在线写路径共用同一组 sink；桶通知由执行器按对象所在桶补发。
-                batch: std::sync::Arc::new(crate::job_actions::BatchExecutor::new(
+                    state.db.pool().clone(),
+                );
+                // M7：站点控制面 changelog worker（OSS_SITE_INTERVAL_SECS，0=关）
+                // M9 S6a：Raft 模式不挂站点 worker（控制写不经 changelog；S6d 再决定替代）。
+                if state.site_enabled && state.cfg.raft.is_none() {
+                    crate::site::spawn_site_worker(
+                        state.db.pool().clone(),
+                        std::sync::Arc::clone(&state.tls),
+                    );
+                }
+                // M6 切片 4：复制 outbox worker（OSS_REPL_INTERVAL_SECS，0=关）
+                crate::replication::spawn_repl_worker(
+                    state.db.pool().clone(),
+                    std::sync::Arc::clone(&state.store),
+                    std::sync::Arc::clone(&state.repl_client),
+                );
+                // C5：审计保留清理（默认关闭；OSS_AUDIT_RETENTION_DAYS=N 天）
+                crate::lifecycle::spawn_audit_cleanup(state.clone());
+                // M8 S0：通用作业引擎（S4b 的 Transition/Restore + S3 Batch + S5 Inventory；0 关闭）
+                let executor = std::sync::Arc::new(ServeTaskExecutor {
+                    tier: std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
+                        std::sync::Arc::clone(&state.db),
+                        std::sync::Arc::clone(&state.store),
+                        std::sync::Arc::clone(&state.tiers),
+                        std::sync::Arc::clone(&state.events),
+                    )),
+                    inventory: std::sync::Arc::clone(&state.inventory_runner),
+                    // Batch：与在线写路径共用同一组 sink；桶通知由执行器按对象所在桶补发。
+                    batch: std::sync::Arc::new(crate::job_actions::BatchExecutor::new(
+                        std::sync::Arc::clone(&state.db),
+                        std::sync::Arc::clone(&state.store),
+                        state.acl(),
+                        std::sync::Arc::clone(&state.restore_sink),
+                        std::sync::Arc::clone(&state.olap_cache),
+                        std::sync::Arc::clone(&state.events)
+                            as std::sync::Arc<dyn xl_s3::events::EventSink>,
+                        crate::job_actions::BatchMutationHooks {
+                            repl: state.repl_sink.clone()
+                                as std::sync::Arc<dyn xl_s3::replication::ReplicationSink>,
+                            tier_gc: std::sync::Arc::clone(&state.tier_gc),
+                            sync_delete: state.sync_delete.clone()
+                                as std::sync::Arc<dyn xl_s3::sync_delete::SyncDeleteSink>,
+                        },
+                    )),
+                });
+                crate::jobs::spawn_workers(
                     std::sync::Arc::clone(&state.db),
                     std::sync::Arc::clone(&state.store),
-                    state.acl(),
+                    executor,
+                    leader.clone(),
+                );
+                // M8 S4b：restore 启动对账 + Transition sweep / 过期 reaper 周期
+                crate::tier_jobs::spawn(
+                    std::sync::Arc::clone(&state.db),
+                    std::sync::Arc::clone(&state.store),
+                    std::sync::Arc::clone(&state.lifecycle),
                     std::sync::Arc::clone(&state.restore_sink),
-                    std::sync::Arc::clone(&state.olap_cache),
-                    std::sync::Arc::clone(&state.events)
-                        as std::sync::Arc<dyn xl_s3::events::EventSink>,
-                    crate::job_actions::BatchMutationHooks {
-                        repl: state.repl_sink.clone()
-                            as std::sync::Arc<dyn xl_s3::replication::ReplicationSink>,
-                        tier_gc: std::sync::Arc::clone(&state.tier_gc),
-                        sync_delete: state.sync_delete.clone()
-                            as std::sync::Arc<dyn xl_s3::sync_delete::SyncDeleteSink>,
-                    },
-                )),
-            });
-            crate::jobs::spawn_workers(
-                std::sync::Arc::clone(&state.db),
-                std::sync::Arc::clone(&state.store),
-                executor,
-                leader.clone(),
-            );
-            // M8 S4b：restore 启动对账 + Transition sweep / 过期 reaper 周期
-            crate::tier_jobs::spawn(
-                std::sync::Arc::clone(&state.db),
-                std::sync::Arc::clone(&state.store),
-                std::sync::Arc::clone(&state.lifecycle),
-                std::sync::Arc::clone(&state.restore_sink),
-                leader.clone(),
-            );
-            // M8 加固：启动 + 周期清理崩溃残留的 S3 spool 暂存（tier-*.stage）。
-            crate::tier::spawn_stage_sweeper(state.cfg.staging_dir.clone());
-            // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
-            crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db), leader);
+                    leader.clone(),
+                );
+                // M8 加固：启动 + 周期清理崩溃残留的 S3 spool 暂存（tier-*.stage）。
+                crate::tier::spawn_stage_sweeper(state.cfg.staging_dir.clone());
+                // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
+                crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db), leader);
+            }
 
             // TLS 主监听器走可热加载实现（每个新连接取配置快照）；明文路径保持
             // ecat HttpServer 不变（无 [tls] 时行为与旧版一致）。
@@ -875,6 +911,58 @@ pub async fn run(
                     )
                 }
             );
+            Ok(0)
+        }
+        Command::ClusterShrinkPlan { to, json } => {
+            let cl = state
+                .cfg
+                .cluster
+                .as_ref()
+                .ok_or("cluster-shrink plan 需要 [cluster] 拓扑（单机→多节点须重新灌入）")?;
+            let ec = xl_store::store::ec::EcConfig {
+                data: state.cfg.ec.data,
+                parity: state.cfg.ec.parity,
+                enabled: state.cfg.ec.enabled,
+            };
+            let target = crate::config::load_cluster_topo(&to, &cl.node_id, &ec)?;
+            let report = match state.store.shrink_plan(&target).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: cluster-shrink plan 拒绝: {e}");
+                    return Ok(1);
+                }
+            };
+            let text = serde_json::to_string_pretty(&report)?;
+            let dir = xl_store::layout::sys_dir(state.store.root(), "shrink");
+            let path = dir.join(format!(
+                "{}-{}-plan.json",
+                report.plan.old_hash, report.plan.new_hash
+            ));
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("警告: 无法创建报告目录 {}: {e}", dir.display());
+            } else if let Err(e) = std::fs::write(&path, &text) {
+                eprintln!("警告: 计划报告写入失败 {}: {e}", path.display());
+            }
+            if json {
+                println!("{text}");
+                eprintln!("cluster-shrink plan 报告: {}", path.display());
+            } else {
+                println!(
+                    "cluster-shrink plan: epoch {}→{} / 槽数 {:?} / 迁移 {} 槽 / 退役 {:?} / 对象 {}（版本 {}）/ 警告 {}",
+                    report.plan.old_epoch,
+                    report.plan.new_epoch,
+                    report.plan.slot_counts,
+                    report.plan.moves.len(),
+                    report.plan.retired_nodes,
+                    report.plan.objects,
+                    report.plan.versions,
+                    report.warnings.len()
+                );
+                for w in &report.warnings {
+                    println!("  警告: {w}");
+                }
+                println!("cluster-shrink plan 报告: {}", path.display());
+            }
             Ok(0)
         }
         Command::Scrub => {
@@ -1658,6 +1746,17 @@ async fn cmk_cmd(
 
 /// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；
 /// 写失败只警告，不掩命令结论。
+/// shrink 进行中（active.lock 被占）→ 拒绝离线搬运/巡检，避免双方同时动分片。
+fn check_no_shrink(state: &AppState) -> Result<(), String> {
+    if xl_store::store::shrink_lock_busy(state.store.root()) {
+        return Err(
+            "已有 shrink 进行中（.oss.sys/shrink/active.lock）；fsck/heal/scrub/rebalance 须待其结束"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn dump_report(state: &AppState, kind: &str, report: &impl serde::Serialize) {
     let dir = state
         .store
@@ -1716,6 +1815,25 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["fsck", "--repair"])),
             Ok(Command::Fsck { repair: true })
+        );
+        assert_eq!(
+            parse_args(&args(&["cluster-shrink", "plan", "--to", "t.toml"])),
+            Ok(Command::ClusterShrinkPlan {
+                to: "t.toml".into(),
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["cluster-shrink", "plan", "--to=t.toml", "--json"])),
+            Ok(Command::ClusterShrinkPlan {
+                to: "t.toml".into(),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["cluster-shrink", "plan"])),
+            Err(USAGE),
+            "--to 必填"
         );
     }
 

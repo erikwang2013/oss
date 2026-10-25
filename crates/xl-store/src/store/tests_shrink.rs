@@ -221,3 +221,264 @@ fn slot_map_rejects_mixed_and_epoch_mismatch() {
     .to_string();
     assert!(e.contains("与 set 数 2 不一致"), "{e}");
 }
+
+// ---------- T4：cluster-shrink plan（只读校验/报告） ----------
+
+use super::VersioningMode;
+use super::shrink::acquire_shrink_lock;
+use super::tests::Cluster;
+use crate::mesh::{DriveSpace, NodeHealth};
+use bytes::Bytes;
+
+/// 旧拓扑 4×3 positional（槽 0..8 = n1/n2/n3，9..11 = n4）；新拓扑退役 n4，
+/// 槽 9/10/11 改归 n1/n2/n3 的 drive 0——槽数与保留节点盘序都不变。
+fn retired_n4_target(epoch: u64) -> ClusterSets {
+    let mut slots = positional_slots();
+    slots[9] = ("n1", 0);
+    slots[10] = ("n2", 0);
+    slots[11] = ("n3", 0);
+    ClusterSets::with_slot_maps(
+        "n1",
+        vec![vec![n("n1", 3), n("n2", 3), n("n3", 3)]],
+        vec![Some(map(epoch, &slots))],
+        &ec84(),
+    )
+    .unwrap()
+}
+
+fn target_with_slots(nodes: Vec<NodeSpec>, slots: &[(&str, u16)]) -> ClusterSets {
+    ClusterSets::with_slot_maps("n1", vec![nodes], vec![Some(map(2, slots))], &ec84()).unwrap()
+}
+
+#[tokio::test]
+async fn shrink_plan_reports_affected_slots_and_bytes() {
+    let c = Cluster::new_in_maintenance(4, 3).await;
+    let s = &c.stores[0];
+    s.create_bucket("alpha").await.unwrap();
+    // EC 对象（> inline_threshold）：12 片按 identity place 落 12 槽
+    s.put_object("alpha", "ec", Bytes::from(vec![7u8; 300 * 1024]), None)
+        .await
+        .unwrap();
+    // inline 对象：计入 objects/versions，但无分片、不得计入 shards/bytes
+    s.put_object("alpha", "small", Bytes::from_static(b"inline"), None)
+        .await
+        .unwrap();
+    // 3 版本 EC 对象：versions=3，全部版本都影响槽 9–11
+    for _ in 0..3 {
+        s.put_object_stream_with_meta(
+            "alpha",
+            "ver",
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from(vec![9u8; 300 * 1024]))
+            })),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let report = s.shrink_plan(&retired_n4_target(2)).await.unwrap();
+    assert_eq!(report.plan.old_epoch, 1, "positional v1 → epoch 1");
+    assert_eq!(report.plan.new_epoch, 2);
+    assert_eq!(report.plan.old_hash.len(), 16);
+    assert_eq!(report.plan.new_hash.len(), 16);
+    assert_eq!(report.plan.slot_counts, vec![12], "槽数不变量");
+    assert_eq!(report.plan.moves.len(), 3, "{:?}", report.plan.moves);
+    assert!(
+        report.plan.moves.iter().all(|m| m.from_node == "n4"),
+        "{:?}",
+        report.plan.moves
+    );
+    assert_eq!(report.plan.retired_nodes, vec!["n4".to_string()]);
+    assert_eq!(report.plan.objects, 3, "含 inline 对象");
+    assert_eq!(report.plan.versions, 5, "1 EC + 1 inline + 3 版本");
+    assert_eq!(report.plan.namespace_digest.len(), 64);
+    // 只报被迁移的 3 个槽；inline 对象不计 shards，但 objects 按命中槽计 2（ec + ver）
+    assert_eq!(
+        report
+            .slots
+            .iter()
+            .map(|st| (st.set, st.slot, st.objects, st.versions, st.shards))
+            .collect::<Vec<_>>(),
+        vec![(0, 9, 2, 4, 4), (0, 10, 2, 4, 4), (0, 11, 2, 4, 4)]
+    );
+    assert!(report.slots.iter().all(|st| st.bytes > 0));
+    // 12 槽 - 单节点最多 4 槽 = 8 < data+1=9：停一节点后写无余量（只告警不阻断）
+    assert!(
+        report.warnings.iter().any(|w| w.contains("写余量")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+/// 单机（无 [cluster]）→ 只支持重新灌入；shrink 必须拒绝且文案指路 README。
+#[tokio::test]
+async fn shrink_plan_rejects_single_node_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = super::Store::open(super::StoreConfig::new(dir.path()))
+        .await
+        .unwrap();
+    let target = ClusterSets::new("n1", vec![four_nodes()], &ec84()).unwrap();
+    let e = s.shrink_plan(&target).await.unwrap_err().to_string();
+    assert!(e.contains("重新灌入") && e.contains("[cluster]"), "{e}");
+}
+
+#[tokio::test]
+async fn shrink_plan_requires_maintenance() {
+    let c = Cluster::new(4, 3).await;
+    let e = c.stores[0]
+        .shrink_plan(&retired_n4_target(2))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("maintenance=true"), "{e}");
+}
+
+#[tokio::test]
+async fn shrink_plan_rejects_slot_count_change() {
+    let c = Cluster::new_in_maintenance(4, 3).await;
+    let ids = ["n1", "n2", "n3", "n4"];
+    // 16 槽、每节点仍 ≤ parity 4：构造器接受，plan 必须拒绝（槽数变化会让 place 错片）
+    let slots: Vec<(&str, u16)> = (0..16)
+        .map(|i| (ids[i % 4], ((i / 4) % 3) as u16))
+        .collect();
+    let target = target_with_slots(vec![n("n1", 3), n("n2", 3), n("n3", 3), n("n4", 3)], &slots);
+    let e = c.stores[0]
+        .shrink_plan(&target)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("槽数变化 12") && e.contains("16"), "{e}");
+}
+
+#[tokio::test]
+async fn shrink_plan_rejects_drive_count_change() {
+    let c = Cluster::new_in_maintenance(4, 3).await;
+    let ids = ["n1", "n2", "n3"];
+    let slots: Vec<(&str, u16)> = (0..12)
+        .map(|i| (ids[i % 3], ((i / 3) % 2) as u16))
+        .collect();
+    let target = target_with_slots(vec![n("n1", 2), n("n2", 2), n("n3", 2)], &slots);
+    let e = c.stores[0]
+        .shrink_plan(&target)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("盘数变化 3 → 2"), "{e}");
+}
+
+#[test]
+fn shrink_target_parity_violation_rejected_at_build() {
+    // 目标每节点 > parity 的槽表在构造期即拒；plan 内部还有一道防御性复核（不可达分支）。
+    let ids = ["n1", "n2", "n3", "n4"];
+    let mut slots: Vec<(&str, u16)> = (0..12).map(|i| (ids[i % 4], (i / 4) as u16)).collect();
+    slots[3] = ("n1", 1);
+    slots[7] = ("n1", 2); // n1 拿 5 槽 > parity 4
+    let e = err_of(vec![four_nodes()], vec![Some(map(1, &slots))]);
+    assert!(e.contains("n1") && e.contains("超过 parity 4"), "{e}");
+}
+
+#[tokio::test]
+async fn shrink_plan_rejects_inflight_mpu_on_retired_node() {
+    let c = Cluster::new_in_maintenance(4, 3).await;
+    c.stores[0].create_bucket("alpha").await.unwrap();
+    c.stores[3]
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    let e = c.stores[0]
+        .shrink_plan(&retired_n4_target(2))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("未完成 MPU") && e.contains("n4"), "{e}");
+}
+
+#[tokio::test]
+async fn shrink_plan_rejects_active_lock() {
+    let c = Cluster::new_in_maintenance(4, 3).await;
+    let _lock = acquire_shrink_lock(c.stores[0].root()).unwrap();
+    let e = c.stores[0]
+        .shrink_plan(&retired_n4_target(2))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("active.lock"), "{e}");
+}
+
+fn health(node: &str, epoch: u64, hash: &str, maintenance: bool, free: u64) -> NodeHealth {
+    NodeHealth {
+        node_id: node.into(),
+        version: String::new(),
+        slots: vec![],
+        buckets: 0,
+        data_wire_version: 1,
+        topo_epoch: epoch,
+        topo_hash: hash.into(),
+        drives: vec![DriveSpace {
+            set: 0,
+            drive: 0,
+            free_bytes: free,
+        }],
+        maintenance,
+    }
+}
+
+#[test]
+fn peer_health_requires_maintenance_and_matching_fingerprint() {
+    let ok = [health("n1", 2, "h", true, 0), health("n2", 2, "h", true, 0)];
+    super::shrink::validate_peer_health(&ok, 2, "h").unwrap();
+
+    let mut no_maint = ok.clone();
+    no_maint[1].maintenance = false;
+    let e = super::shrink::validate_peer_health(&no_maint, 2, "h")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("n2") && e.contains("maintenance"), "{e}");
+
+    let mut mixed_epoch = ok.clone();
+    mixed_epoch[0].topo_epoch = 1;
+    let e = super::shrink::validate_peer_health(&mixed_epoch, 2, "h")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("epoch") && e.contains("n1"), "{e}");
+
+    let mut mixed_hash = ok.clone();
+    mixed_hash[1].topo_hash = "other".into();
+    let e = super::shrink::validate_peer_health(&mixed_hash, 2, "h")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("hash") && e.contains("n2"), "{e}");
+}
+
+#[test]
+fn capacity_allows_exact_fit_and_rejects_shortfall_or_missing_drive() {
+    let peers = [health("n1", 2, "h", true, 100)];
+    let need = [(0u16, "n1".to_string(), 0u16, 100u64)];
+    super::shrink::validate_capacity(&need, &peers).unwrap();
+
+    let need = [(0u16, "n1".to_string(), 0u16, 101u64)];
+    let e = super::shrink::validate_capacity(&need, &peers)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("101") && e.contains("100"), "{e}");
+
+    let need = [(0u16, "n1".to_string(), 1u16, 1u64)];
+    let e = super::shrink::validate_capacity(&need, &peers)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("盘 1") && e.contains("可用空间"), "{e}");
+
+    let need = [(0u16, "n9".to_string(), 0u16, 0u64)];
+    let e = super::shrink::validate_capacity(&need, &peers)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("n9") && e.contains("不可达"), "{e}");
+}

@@ -53,7 +53,7 @@ mod login_limiter_tests {
 }
 
 mod set_group_tests {
-    use super::*;
+    use crate::config::sets_nodes_by_set;
 
     fn node(id: &str, set: Option<u16>) -> crate::config::NodeToml {
         crate::config::NodeToml {
