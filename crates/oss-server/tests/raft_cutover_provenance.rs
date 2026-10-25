@@ -202,7 +202,11 @@ async fn export_carries_ossctl3_accounts_and_rejects_format_two_forgery() {
     let mut forged = export.clone();
     forged.snapshot_format = Some(2);
     let err = cutover::verify_export(&forged).unwrap_err();
-    assert!(err.contains("cannot carry level-3 data"), "{err}");
+    // M8 合并后 runstate 先于数据格式校验；两者任一拒绝都证明格式 2 不可携带 level-3。
+    assert!(
+        err.contains("cannot carry level-3 data") || err.contains("runstate requires OSSCTL3"),
+        "{err}"
+    );
 
     // 连级别一起伪造回 level 2：数据自身要求 3，同样拒绝。
     let mut forged = export;
@@ -210,7 +214,10 @@ async fn export_carries_ossctl3_accounts_and_rejects_format_two_forgery() {
     forged.feature_level = Some(2);
     forged.activation_level = Some(2);
     let err = cutover::verify_export(&forged).unwrap_err();
-    assert!(err.contains("cannot carry level-3 data"), "{err}");
+    assert!(
+        err.contains("cannot carry level-3 data") || err.contains("runstate requires OSSCTL3"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
