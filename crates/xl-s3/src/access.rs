@@ -64,6 +64,12 @@ pub fn account_id_of(uid: i64) -> Option<String> {
 /// 主体匹配**永不**命中它（只有派生 ID 才能匹配），仅作 AP 资源 ARN 的历史别名。
 pub const LEGACY_ACCOUNT: &str = "000000000000";
 
+/// 账户 ID 的唯一边界校验：恰好 12 位 ASCII 数字。
+/// 新的 DB/API/命令入口用它；`LEGACY_ACCOUNT` 也是合法 12 位数字，语义拒绝由调用方负责。
+pub fn valid_account_id(s: &str) -> bool {
+    s.len() == 12 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// 桶账户 = 桶主的**派生**账户；无主/管理员桶归系统账户（LEGACY_ACCOUNT）。
 /// AC-0 有意保持该派生口径（AP 资源 ARN 不变）；成员关系只影响策略主体、状态与配额，
 /// AP 跨账户属于后续切片。
@@ -1808,6 +1814,21 @@ mod pick_set_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 1：账户 ID 边界 = 恰好 12 位 ASCII 数字（全角/符号/长度偏差均拒绝）。
+    #[test]
+    fn valid_account_id_requires_exactly_12_ascii_digits() {
+        assert!(valid_account_id("000000000000"));
+        assert!(valid_account_id("123456789012"));
+        assert!(!valid_account_id(""));
+        assert!(!valid_account_id("12345678901"), "11 位");
+        assert!(!valid_account_id("1234567890123"), "13 位");
+        assert!(!valid_account_id("12345678901a"));
+        assert!(!valid_account_id(" 12345678901"));
+        assert!(!valid_account_id("-12345678901"));
+        assert!(!valid_account_id("+12345678901"));
+        assert!(!valid_account_id("１２３４５６７８９０１２"), "全角数字");
+    }
 
     /// 最小 schema 的内联建库（列与 oss-server/migrations/0001_init.sql 对齐；
     /// xl-s3 不能反向依赖 oss-server，模式同 auth.rs 的测试 helper）。

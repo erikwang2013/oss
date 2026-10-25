@@ -79,6 +79,8 @@ pub struct AccountRow {
     pub status: String,
     pub admin_uid: Option<i64>,
     pub bucket_quota: Option<i64>,
+    /// 软字节配额（NULL = 不限；只告警不阻写，AC-2）。
+    pub soft_byte_quota: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub member_count: i64,
@@ -288,6 +290,12 @@ const SCHEMA_M8: &str = include_str!("../migrations/0003_m8.sql");
 const SCHEMA_M9: &str = include_str!("../migrations/0004_m9.sql");
 /// AC-0：账户/成员表。每次启动重放（IF NOT EXISTS），回填幂等（marker 只跑一次）。
 const SCHEMA_ACCOUNTS: &str = include_str!("../migrations/0005_accounts.sql");
+/// AC-2：账户用量表。每次启动重放（IF NOT EXISTS）。
+const SCHEMA_TENANCY: &str = include_str!("../migrations/0006_tenancy.sql");
+
+/// 账户表已规范化（v2 回填/重写完成）。standalone 启动时写；Raft 模式由后续
+/// canonicalization worker 在 level-3 写，快照读取以本 marker 为门。
+pub const META_ACCOUNTS_CANONICAL: &str = "accounts_canonical_v1";
 
 /// WAL 走连接选项、不走 URL：sqlx 0.8 的 URL 解析只认 mode/cache/immutable/vfs，
 /// `?journal_mode=WAL` 会直接报 unknown query parameter。选项形式对池内每条新连接生效。
@@ -361,15 +369,23 @@ impl Db {
         // M9：契约表 + guard 重放；列迁移在 M7 表存在后执行。
         sqlx::raw_sql(SCHEMA_M9).execute(&db.pool).await?;
         db.ensure_columns_m9().await?;
-        // AC-0：账户表 + 存量用户回填（marker 幂等；Raft 模式下只在本地派生，见迁移头注）。
+        // AC-0：账户表 + 存量用户回填（marker 幂等）。
         sqlx::raw_sql(SCHEMA_ACCOUNTS).execute(&db.pool).await?;
-        db.backfill_accounts().await?;
+        sqlx::raw_sql(SCHEMA_TENANCY).execute(&db.pool).await?;
+        db.ensure_columns_tenancy().await?;
         // M8-1：运行态表 fencing 列依赖 0003 已建表，故放在 M8/M9 重放之后。
         db.ensure_fence_columns().await?;
         if seed_site {
             db.site_bootstrap(site_id).await?;
         }
         db.prepare_raft_mode(raft).await?;
+        // standalone 启动即回填并规范化（v2 移出全局管理员）；放在模式守卫之后：Raft 库被
+        // 误按 standalone 启动时，不得在报错前写 canonical marker。Raft 模式下账户表由
+        // leader 的 canonicalization worker 写，节点本地不跑回填（否则各节点派生 ID 分叉）。
+        if !raft {
+            db.backfill_accounts().await?;
+            db.backfill_accounts_v2().await?;
+        }
         Ok(db)
     }
 
@@ -984,6 +1000,55 @@ impl Db {
         Ok(())
     }
 
+    /// 多租户补列：`accounts.soft_byte_quota` 与 `audit_log` 的账户审计列。
+    /// 老库升级 + 并发首开容忍（对方已补列视同成功）。
+    async fn ensure_columns_tenancy(&self) -> Result<()> {
+        self.ensure_column(
+            "accounts",
+            "soft_byte_quota",
+            "ALTER TABLE accounts ADD COLUMN soft_byte_quota INTEGER",
+        )
+        .await?;
+        self.ensure_column(
+            "audit_log",
+            "principal_account",
+            "ALTER TABLE audit_log ADD COLUMN principal_account TEXT",
+        )
+        .await?;
+        self.ensure_column(
+            "audit_log",
+            "target_account",
+            "ALTER TABLE audit_log ADD COLUMN target_account TEXT",
+        )
+        .await
+    }
+
+    /// 幂等补列：pragma 探测 → ALTER；并发首开时对方已补列即视为成功。
+    async fn ensure_column(&self, table: &str, name: &str, ddl: &str) -> Result<()> {
+        let cols = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT name FROM pragma_table_info('{table}')"
+        )))
+        .fetch_all(&self.pool)
+        .await?;
+        if cols.iter().any(|r| r.get::<String, _>("name") == name) {
+            return Ok(());
+        }
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(&self.pool)
+            .await
+        {
+            let again = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            )))
+            .fetch_all(&self.pool)
+            .await?;
+            if !again.iter().any(|r| r.get::<String, _>("name") == name) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     // ---------- M8（S1）：访问点 ----------
 
     /// 建 AP（同名冲突由调用方按 409 处理）。
@@ -1436,8 +1501,9 @@ impl Db {
         .execute(&self.pool)
         .await?
         .last_insert_rowid();
-        // AC-0：新用户加入其 uid 派生账户（与回填同语义；之后可被显式迁入其它账户）。
-        if let Some(acct) = xl_s3::access::account_id_of(id) {
+        // AC-0：非管理员新用户加入其 uid 派生账户（与回填同语义；之后可被显式迁入其它账户）。
+        // 全局管理员归系统账户、不是任何账户的成员（AC-2）：不建账户行/成员行。
+        if !is_admin && let Some(acct) = xl_s3::access::account_id_of(id) {
             sqlx::query(
                 "INSERT OR IGNORE INTO accounts (id, name, status, admin_uid, created_at, updated_at) \
                  VALUES (?, ?, 'active', ?, ?, ?)",
@@ -2129,6 +2195,44 @@ impl Db {
         Ok(true)
     }
 
+    /// 账户表是否已规范化（v2 回填/level-3 canonicalize 完成）。
+    pub async fn accounts_canonical(&self) -> Result<bool> {
+        Ok(self.schema_meta(META_ACCOUNTS_CANONICAL).await?.is_some())
+    }
+
+    /// 回填 v2（standalone 升级修正）：v1 把全局管理员也挂进了 uid 派生账户，
+    /// 这里把管理员移出成员表并删除其无成员的派生账户，然后写 canonical marker。
+    /// 单事务、marker 幂等；只跑一次（false = marker 已存在）。
+    pub async fn backfill_accounts_v2(&self) -> Result<bool> {
+        if self.accounts_canonical().await? {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM account_members WHERE uid IN (SELECT id FROM users WHERE is_admin = 1)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        // 只删「某管理员的 uid 派生 ID 且已无成员」的账户；管理员桶归系统账户，
+        // 不引用这些账户，删除不影响桶归属。
+        sqlx::query(
+            "DELETE FROM accounts \
+             WHERE id IN (SELECT printf('%012d', id) FROM users WHERE is_admin = 1) \
+               AND id NOT IN (SELECT account_id FROM account_members)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
+             ON CONFLICT(key) DO UPDATE SET value = 'done'",
+        )
+        .bind(META_ACCOUNTS_CANONICAL)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。
     pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>> {
         let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
@@ -2161,6 +2265,7 @@ impl Db {
             status: r.get("status"),
             admin_uid: r.get("admin_uid"),
             bucket_quota: r.get("bucket_quota"),
+            soft_byte_quota: r.get("soft_byte_quota"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
             member_count: r.get("member_count"),
@@ -2672,6 +2777,143 @@ mod tests {
             &format!("arn:aws:iam::{}:root", xl_s3::access::LEGACY_ACCOUNT),
             sub
         ));
+    }
+
+    /// Task 1：v2 把全局管理员移出 account_members 并删除其无成员的派生账户；
+    /// 非管理员的派生账户/成员保持；marker 幂等。
+    #[tokio::test]
+    async fn backfill_v2_moves_global_admins_to_system_account() {
+        let db = db().await;
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        let admin_acct = xl_s3::access::account_id_of(admin).unwrap();
+        let alice_acct = xl_s3::access::account_id_of(alice).unwrap();
+        // 模拟旧库 v1 状态：v1 也给管理员建派生账户/成员行。
+        sqlx::query("DELETE FROM schema_meta WHERE key = 'accounts_backfill_v1' OR key = ?")
+            .bind(META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.backfill_accounts().await.unwrap());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE uid = ?")
+            .bind(admin)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "旧库 v1 给管理员建成员行");
+
+        assert!(db.backfill_accounts_v2().await.unwrap());
+        assert!(db.accounts_canonical().await.unwrap());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE uid = ?")
+            .bind(admin)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "全局管理员不得拥有账户成员行");
+        assert!(
+            db.get_account(&admin_acct).await.unwrap().is_none(),
+            "全局管理员的派生账户行应删除"
+        );
+        // 非管理员不受影响。
+        assert_eq!(
+            db.account_id_of_user(alice).await.unwrap(),
+            Some(alice_acct.clone())
+        );
+        assert_eq!(
+            db.member_role(&alice_acct, alice).await.unwrap().as_deref(),
+            Some("owner")
+        );
+        assert!(!db.backfill_accounts_v2().await.unwrap(), "marker 幂等");
+    }
+
+    /// Task 1：v2 不动非管理员的派生账户与 ARN；新管理员不再产生 accounts/account_members 行。
+    #[tokio::test]
+    async fn backfill_v2_preserves_derived_arns_and_admin_create_user_rows() {
+        let db = db().await;
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        let derived = xl_s3::access::account_id_of(alice).unwrap();
+        sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES ('b', ?, 0)")
+            .bind(alice)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+            .bind(META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.backfill_accounts_v2().await.unwrap());
+
+        assert!(db.get_account(&derived).await.unwrap().is_some());
+        assert_eq!(
+            db.member_role(&derived, alice).await.unwrap().as_deref(),
+            Some("owner")
+        );
+        let owner: Option<i64> =
+            sqlx::query_scalar("SELECT owner_id FROM buckets WHERE name = 'b'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(owner, Some(alice));
+        assert!(xl_s3::access::account_arn_matches(
+            &format!("arn:aws:iam::{derived}:root"),
+            alice
+        ));
+
+        // 管理员：不建账户行、不建成员行。
+        let root2 = db.create_user("root2", "pw", true).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE uid = ?")
+            .bind(root2)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "新管理员不得拥有成员行");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE id = ?")
+            .bind(xl_s3::access::account_id_of(root2).unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "新管理员不得拥有派生账户行");
+        // 非管理员仍即时挂载派生账户。
+        let bob = db.create_user("bob", "pw", false).await.unwrap();
+        let bob_acct = xl_s3::access::account_id_of(bob).unwrap();
+        assert_eq!(
+            db.account_id_of_user(bob).await.unwrap(),
+            Some(bob_acct.clone())
+        );
+        assert_eq!(
+            db.member_role(&bob_acct, bob).await.unwrap().as_deref(),
+            Some("owner")
+        );
+    }
+
+    /// Task 1：0006 的用量表与 tenancy 补列在 connect 后就位（老库升级同样幂等）。
+    #[tokio::test]
+    async fn tenancy_schema_and_columns_exist() {
+        let db = db().await;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'soft_byte_quota'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "accounts.soft_byte_quota");
+        for col in ["principal_account", "target_account"] {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = '{col}'"
+            )))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "audit_log.{col}");
+        }
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'account_usage'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "account_usage 表");
     }
 
     /// AC-0：新建账户 id 必须是 12 位非负十进制（random() 取模别踩符号位）。
