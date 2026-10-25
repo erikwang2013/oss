@@ -1146,19 +1146,19 @@ async fn lifecycle_v2_requires_effective_feature_level_two() {
 }
 
 /// Level C M1：`Ext` 是命令演进容器，最低 level 3。level 2 必须在 append 前拒绝
-/// （旧副本 `deny_unknown_fields` 解码即 fail-stop）；level 3 接受、业务拒绝照常提交，
-/// 并与首条 level-3 entry 同事务激活 marker。
+/// （旧副本 `deny_unknown_fields` 解码即 fail-stop），且不激活 marker。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ext_requires_effective_feature_three() {
-    let ext = || ControlCommand::Ext {
-        type_id: "future.demo".into(),
-        payload: serde_json::json!({"a": 1}),
-    };
-
     // level 2：append 前拒绝，绝不进入日志/apply，marker 保持未激活。
     let dir = tempfile::tempdir().unwrap();
     let (handle, pool) = spawn_raft(dir.path(), 2).await;
-    match handle.write(ext()).await {
+    match handle
+        .write(ControlCommand::Ext {
+            type_id: "future.demo".into(),
+            payload: serde_json::json!({"a": 1}),
+        })
+        .await
+    {
         Err(oss_server::raft::WriteError::FeatureUnavailable {
             required,
             effective,
@@ -1180,17 +1180,50 @@ async fn ext_requires_effective_feature_three() {
             .unwrap();
     assert_eq!(marker, None, "rejected Ext must not activate level 3");
     handle.shutdown().await;
+}
 
-    // level 3：接受并提交；未知 type_id 是业务拒绝（Invalid），不是静默忽略。
+/// Level C 命令演进：level 3 的 leader 只接受显式注册的 `type_id`。未注册/空/拼错
+/// 一律在 append 前拒绝——不写日志、不激活 marker 3（否则旧 level-3 副本 apply 成
+/// `Invalid`，控制面静默分叉且 marker 单向激活，旧版永远无法回归）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ext_unregistered_type_rejected_before_append() {
+    let last_log_index = |handle: &oss_server::raft::RaftHandle| {
+        let m = handle.raft().metrics();
+        let m = m.borrow();
+        m.last_log_index
+    };
+
     let dir = tempfile::tempdir().unwrap();
     let (handle, pool) = spawn_raft(dir.path(), 3).await;
-    assert_eq!(handle.write(ext()).await.unwrap(), ControlResponse::Invalid);
-    let marker: String =
-        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
-            .fetch_one(&pool)
+    let before = last_log_index(&handle);
+    for type_id in ["future.demo", "", "test.nop"] {
+        match handle
+            .write(ControlCommand::Ext {
+                type_id: type_id.into(),
+                payload: serde_json::json!({"a": 1}),
+            })
             .await
-            .unwrap();
-    assert_eq!(marker, "3");
+        {
+            Err(oss_server::raft::WriteError::UnregisteredExtType { type_id: got }) => {
+                assert_eq!(got, type_id)
+            }
+            other => panic!("unregistered Ext {type_id:?} must be rejected, got {other:?}"),
+        }
+        assert_eq!(
+            last_log_index(&handle),
+            before,
+            "rejected Ext {type_id:?} must not append"
+        );
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            marker, None,
+            "rejected Ext {type_id:?} must not activate level 3"
+        );
+    }
     handle.shutdown().await;
 }
 

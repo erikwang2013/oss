@@ -68,11 +68,12 @@ fn leader_hint_value(e: &crate::raft::control::ControlError) -> Option<String> {
     }
 }
 
-/// M9 S6b：控制写失败 → HTTP（413/503 带原因；500 不泄漏内部）。
+/// M9 S6b：控制写失败 → HTTP（400/413/503 带原因；500 不泄漏内部）。
 /// 503 的文本含 raft/forward 提示；M8-0 的 not-leader 另带 `x-oss-leader`。
 pub(crate) fn control_failure(e: crate::raft::control::ControlError) -> Response {
     let hint = leader_hint_value(&e);
     let mut resp = match e.http_status() {
+        400 => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         413 => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
         503 => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
         _ => {
@@ -5394,6 +5395,14 @@ mod leader_hint_tests {
     fn non_leader_errors_have_no_hint_header() {
         let r = control_failure(ControlError::Unavailable("u".into()));
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(r.headers().get(LEADER_HINT_HEADER).is_none());
+    }
+
+    /// 客户端输入错误（未注册的 Ext type_id）必须是 400，不能伪装成 500/503。
+    #[test]
+    fn invalid_command_maps_to_400_without_hint() {
+        let r = control_failure(ControlError::Invalid("bad Ext type_id".into()));
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         assert!(r.headers().get(LEADER_HINT_HEADER).is_none());
     }
 }

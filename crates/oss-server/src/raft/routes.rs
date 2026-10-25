@@ -361,6 +361,16 @@ async fn write(
             })),
         )
             .into_response(),
+        Err(WriteError::UnregisteredExtType { type_id }) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unregistered_ext_type",
+                "type_id": type_id,
+                "hint": "Ext type_id is not registered by this binary (a new type requires a \
+                         new feature level or negotiated per-peer capability); nothing was appended",
+            })),
+        )
+            .into_response(),
         Err(WriteError::ForwardToLeader { leader, endpoint }) => match (leader, endpoint) {
             (Some(_), Some(endpoint)) => not_leader_409(leader, Some(endpoint)),
             _ => no_leader("control plane has no quorum"),

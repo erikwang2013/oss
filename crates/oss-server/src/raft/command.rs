@@ -5,7 +5,9 @@
 //! 变体名与字段名是跨版本/跨站点协议，改名即破坏重放与快照兼容。
 //!
 //! 滚动升级规则（[`super::compat`]）：**绝不**给已有变体加/改名/删字段——旧节点
-//! `deny_unknown_fields` 会拒绝整条 entry；新复制语义只加新变体并标 level 2。
+//! `deny_unknown_fields` 会拒绝整条 entry；新语义只加新变体，按
+//! [`ControlCommand::min_feature_level`] 标 level 2/3，`Ext.type_id` 还必须满足
+//! [`REGISTERED_EXT_TYPES`] 不变量。
 
 use serde::{Deserialize, Serialize};
 
@@ -222,7 +224,9 @@ pub enum ControlCommand {
     // ---- level 3: command evolution ----
     /// 命令演进容器（level 3）：`type_id` 是提交方注册的稳定类型名，`payload` 为该
     /// 类型的 JSON。旧二进制没有该变体（`deny_unknown_fields`）→ 解码 fail-stop；
-    /// apply 只认识显式注册的 `type_id`，未知类型返回 `Invalid`（绝不静默忽略）。
+    /// leader 在 append 前按 [`REGISTERED_EXT_TYPES`] 拒绝未注册/空/拼错的
+    /// `type_id`（不写日志、不激活 marker）；apply 的未知类型 `Invalid` 仅作兜底。
+    /// 新增类型必须先提升 feature level 或完成 per-peer 类型能力协商。
     /// 尺寸沿用 [`COMMAND_MAX_BYTES`]（24 MiB），payload 无额外豁免。
     Ext {
         type_id: String,
@@ -244,6 +248,31 @@ pub enum ControlCommand {
     FeatureProbe {
         reject: bool,
     },
+}
+
+/// 已注册的生产 `Ext.type_id` 白名单（当前为空：level 3 只代表“能解码 Ext 容器”，
+/// **不**代表认识任何业务类型）。
+///
+/// 不变量：新增一项即协议变更。只有当所有 voter/learner 都已换到能应用该类型的
+/// 二进制时才可注册；否则必须先提升 feature level（新级别）或完成 per-peer 类型
+/// 能力协商。leader 在 append 前按本表 fail-closed 拒绝未注册/空/拼错的 type_id
+/// （不写日志、不激活 marker）；apply 侧未知类型的 `Invalid` 只是兜底。
+pub const REGISTERED_EXT_TYPES: &[&str] = &[];
+
+/// 仅测试构建注册的探针类型（生产注册表必须保持为空）。
+#[cfg(test)]
+const TEST_EXT_TYPES: &[&str] = &["test.noop"];
+
+/// `type_id` 是否已在本构建注册；空串/拼错/未注册一律 false。
+pub(crate) fn ext_type_registered(type_id: &str) -> bool {
+    #[cfg(test)]
+    {
+        TEST_EXT_TYPES.contains(&type_id) || REGISTERED_EXT_TYPES.contains(&type_id)
+    }
+    #[cfg(not(test))]
+    {
+        REGISTERED_EXT_TYPES.contains(&type_id)
+    }
 }
 
 /// 每条 entry 恰好一个响应。业务拒绝走这里（提交后不回滚）；内部错误走 `Err` fail-stop。
@@ -279,8 +308,8 @@ impl std::fmt::Display for SizeError {
 impl std::error::Error for SizeError {}
 
 impl ControlCommand {
-    /// Level B：命令进入 raft log 所需的最低 feature 级别。只有新语义命令返回 2；
-    /// 既有命令永远 1（旧二进制必须能解析并应用）。
+    /// Level B：命令进入 raft log 所需的最低 feature 级别。新语义命令返回其最低
+    /// 级别（2/3）；既有命令永远 1（旧二进制必须能解析并应用）。
     pub fn min_feature_level(&self) -> u8 {
         match self {
             // 结构化生命周期：v1.13.1 的 `ControlCommand`（`deny_unknown_fields`）无法
@@ -308,5 +337,19 @@ impl ControlCommand {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注册表 fail-closed：空串、拼错、未注册都是 false；仅测试类型的探针为 true。
+    #[test]
+    fn ext_registry_rejects_empty_typo_and_unregistered() {
+        assert!(!ext_type_registered(""));
+        assert!(!ext_type_registered("test.nop"));
+        assert!(!ext_type_registered("future.demo"));
+        assert!(ext_type_registered("test.noop"));
     }
 }

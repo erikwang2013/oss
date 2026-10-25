@@ -194,6 +194,8 @@ pub enum ControlError {
         leader: Option<u64>,
         endpoint: Option<String>,
     },
+    /// 客户端输入非法（如未注册的 `Ext.type_id`）：400，不 append、不可重试。
+    Invalid(String),
     Internal(String),
 }
 
@@ -202,6 +204,7 @@ impl ControlError {
         match self {
             Self::TooLarge { .. } => 413,
             Self::Timeout(_) | Self::Unavailable(_) | Self::NotLeader { .. } => 503,
+            Self::Invalid(_) => 400,
             Self::Internal(_) => 500,
         }
     }
@@ -230,6 +233,7 @@ impl std::fmt::Display for ControlError {
                 f,
                 "not leader (leader={leader:?}, endpoint={endpoint:?}); retry on the leader"
             ),
+            Self::Invalid(m) => write!(f, "invalid control command: {m}"),
             Self::Internal(m) => write!(f, "control apply failed: {m}"),
         }
     }
@@ -404,6 +408,11 @@ impl ControlPlane {
                              finish rollout/enable [raft].feature_level"
                         )));
                     }
+                    Err(WriteError::UnregisteredExtType { type_id }) => {
+                        return Err(ControlError::Invalid(format!(
+                            "Ext type_id {type_id:?} is not registered; nothing was appended"
+                        )));
+                    }
                     Err(WriteError::Raft(msg)) => return Err(ControlError::Unavailable(msg)),
                 };
                 if response == ControlResponse::Ok {
@@ -442,6 +451,10 @@ fn sink_result(
         Err(ControlError::NotLeader { endpoint, .. }) => {
             tracing::warn!(?endpoint, "control write not on leader");
             Err(E::NotLeader { endpoint })
+        }
+        Err(ControlError::Invalid(m)) => {
+            tracing::warn!(error = %m, "control write rejected");
+            Err(E::Invalid)
         }
         Err(ControlError::Internal(m)) => {
             tracing::error!(error = %m, "control write failed");
@@ -596,6 +609,7 @@ mod tests {
         );
         assert_eq!(ControlError::Timeout("t".into()).http_status(), 503);
         assert_eq!(ControlError::Unavailable("u".into()).http_status(), 503);
+        assert_eq!(ControlError::Invalid("i".into()).http_status(), 400);
         assert_eq!(ControlError::Internal("i".into()).http_status(), 500);
 
         // M8-0：NotLeader 是 503 且带成员表 endpoint + leader id 提示。

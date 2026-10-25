@@ -736,7 +736,8 @@ pub(crate) async fn apply_command(
             }
         }
         // Level 3 命令容器：apply 只认识显式注册的 type_id；未知类型是业务拒绝，
-        // 绝不能当空操作（静默忽略会让新旧副本的控制面状态分叉）。
+        // 绝不能当空操作（静默忽略会让新旧副本的控制面状态分叉）。leader 已在
+        // append 前按注册表拒绝，这里只是旧日志重放/快照恢复的 fail-closed 兜底。
         ControlCommand::Ext { type_id, .. } => match type_id.as_str() {
             #[cfg(test)]
             "test.noop" => ControlResponse::Ok,
