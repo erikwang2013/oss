@@ -139,7 +139,8 @@ fn export_fixture() -> ExportFile {
     let data = level_two();
     let payload = serde_json::to_vec(&data).unwrap();
     ExportFile {
-        format: cutover::EXPORT_FORMAT,
+        // LC-0 冻结 fixture 是跑的格式 1；新写出走 EXPORT_FORMAT=2。
+        format: cutover::MIN_EXPORT_FORMAT,
         kind: cutover::EXPORT_KIND.to_string(),
         source_site: "site-a".into(),
         source_node_id: Some(1),
@@ -154,6 +155,7 @@ fn export_fixture() -> ExportFile {
         has_vault: Some(false),
         exported_at: 1_700_000_000,
         sha256: hex::encode(Sha256::digest(&payload)),
+        runstate: None,
         data,
     }
 }
@@ -200,7 +202,11 @@ fn export_v2_level2_fixture_verifies_clean() {
     let text = fs::read_to_string(fixture_dir().join("export_v2_level2.json"))
         .expect("export fixture missing");
     let export: ExportFile = serde_json::from_str(&text).unwrap();
-    assert_eq!(export.format, cutover::EXPORT_FORMAT);
+    assert_eq!(
+        export.format,
+        cutover::MIN_EXPORT_FORMAT,
+        "frozen LC-0 fixture predates runstate-bearing format 2"
+    );
     assert_eq!(export.kind, cutover::EXPORT_KIND);
     assert_eq!(export.snapshot_format, Some(2));
     assert_eq!(export.feature_level, Some(2));
