@@ -577,6 +577,9 @@ impl MeshTransport for TonicMesh {
             buckets: resp.buckets,
             // DP-0：旧节点无此字段 → proto 缺省 0，xl-store 侧统一按 1 解读。
             data_wire_version: resp.data_wire_version,
+            // 拓扑指纹：旧节点缺省 0/空串 = 未宣告（消费方不得当匹配）。
+            topo_epoch: resp.topo_epoch,
+            topo_hash: resp.topo_hash,
         })
     }
     // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
@@ -1242,6 +1245,8 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 .collect(),
             buckets: h.buckets,
             data_wire_version: h.data_wire_version,
+            topo_epoch: h.topo_epoch,
+            topo_hash: h.topo_hash,
         }))
     }
 
@@ -1875,6 +1880,9 @@ mod tests {
         assert_eq!(h.version, env!("CARGO_PKG_VERSION"));
         // DP-0 握手字段随 Health 往返，且与本版常量一致。
         assert_eq!(h.data_wire_version, xl_store::mesh_gate::DATA_WIRE_VERSION);
+        // 拓扑指纹：单节点部署 = epoch 1 + 空 hash（字段 6/7 往返）。
+        assert_eq!(h.topo_epoch, 1);
+        assert!(h.topo_hash.is_empty());
 
         // 错误令牌 → Unauthenticated
         let bad = TonicMesh::new("n1", "wrong", &nodes).unwrap();
