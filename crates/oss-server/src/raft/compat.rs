@@ -17,8 +17,12 @@ pub const WIRE_VERSION: u32 = 2;
 pub const MIN_COMPAT_WIRE_VERSION: u32 = 1;
 /// 成员变更要求全集群 wire >= 2（新节点必须先能读懂新格式）。
 pub const MIN_MEMBERSHIP_WIRE_VERSION: u32 = 2;
+/// feature 2：结构化生命周期 + OSSCTL2（已发布；不得重编号）。
+pub const FEATURE_STRUCTURED_LIFECYCLE: u8 = 2;
 /// feature 3：OSSCTL3 可解码 + level-3 命令（Ext/accounts/runstate）可应用。
 pub const FEATURE_LEVEL_3: u8 = 3;
+/// Level C M1 的命令演进容器（`ControlCommand::Ext`）所需级别。
+pub const FEATURE_COMMAND_EXT: u8 = FEATURE_LEVEL_3;
 /// m8 计划使用的 level-3 别名（RunState 命令的 `min_feature_level`）。数值与
 /// [`FEATURE_LEVEL_3`] 相同：level 3 是单一激活门，不会按功能拆成多个级别。
 pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
@@ -31,6 +35,11 @@ pub const WIRE_HEADER: &str = "x-oss-raft-wire-version";
 pub const FEATURE_HEADER: &str = "x-oss-raft-feature-level";
 /// `schema_meta` 中的激活标记（节点本地；缺省 = 1，单调不减）。
 pub const META_FEATURE_LEVEL: &str = "raft_feature_level";
+
+/// 本二进制能否应用某个 feature level（未知更高 level 一律 false）。
+pub fn supports(level: u8) -> bool {
+    level <= MAX_FEATURE_LEVEL
+}
 
 /// 对外宣告的 feature 是**意愿**而非二进制能力（D3）：`min(configured, MAX)`。
 /// 配置 1 的节点即便能解码 level 2 也不得收到 level 2 entry（否则重启会被 R8 拦下）。
@@ -235,6 +244,18 @@ mod tests {
         assert_eq!(advertised_feature(1), 1);
         assert_eq!(advertised_feature(2), 2);
         assert_eq!(advertised_feature(9), MAX_FEATURE_LEVEL);
+    }
+
+    #[test]
+    fn supports_is_bounded_by_binary_max_and_levels_are_fixed() {
+        assert_eq!(MIN_FEATURE_LEVEL, 1);
+        assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
+        assert_eq!(FEATURE_COMMAND_EXT, 3);
+        assert_eq!(FEATURE_COMMAND_EXT, FEATURE_LEVEL_3);
+        assert!(supports(1));
+        assert!(supports(FEATURE_STRUCTURED_LIFECYCLE));
+        assert!(supports(FEATURE_COMMAND_EXT));
+        assert!(!supports(MAX_FEATURE_LEVEL + 1));
     }
 
     fn peers_all(term: u64, voters: &[u64], learners: &[u64], feature: u8) -> PeerVersions {

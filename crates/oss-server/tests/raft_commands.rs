@@ -300,6 +300,20 @@ fn command_size_gate_accepts_16mib_module_and_rejects_over_24mib() {
     }
 }
 
+/// `Ext` 与其他命令共用 24 MiB append 闸（payload 是任意 JSON，不含额外豁免）。
+#[test]
+fn ext_payload_obeys_command_size_gate() {
+    let make = |len: usize| ControlCommand::Ext {
+        type_id: "future.demo".into(),
+        payload: serde_json::Value::String("x".repeat(len)),
+    };
+    make(COMMAND_MAX_BYTES - 1024).check_size().unwrap();
+    match make(COMMAND_MAX_BYTES + 1024).check_size() {
+        Err(SizeError::TooLarge(n)) => assert!(n > COMMAND_MAX_BYTES),
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn owner_mapping_and_permission_bits() {
     let dir = tempfile::tempdir().unwrap();
@@ -1129,6 +1143,84 @@ async fn lifecycle_v2_requires_effective_feature_level_two() {
             .unwrap();
     assert_eq!(marker, "2");
     handle.shutdown().await;
+}
+
+/// Level C M1：`Ext` 是命令演进容器，最低 level 3。level 2 必须在 append 前拒绝
+/// （旧副本 `deny_unknown_fields` 解码即 fail-stop）；level 3 接受、业务拒绝照常提交，
+/// 并与首条 level-3 entry 同事务激活 marker。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ext_requires_effective_feature_three() {
+    let ext = || ControlCommand::Ext {
+        type_id: "future.demo".into(),
+        payload: serde_json::json!({"a": 1}),
+    };
+
+    // level 2：append 前拒绝，绝不进入日志/apply，marker 保持未激活。
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, pool) = spawn_raft(dir.path(), 2).await;
+    match handle.write(ext()).await {
+        Err(oss_server::raft::WriteError::FeatureUnavailable {
+            required,
+            effective,
+        }) => {
+            assert_eq!((required, effective), (3, 2));
+            let msg = oss_server::raft::WriteError::FeatureUnavailable {
+                required,
+                effective,
+            }
+            .to_string();
+            assert!(msg.contains("feature level 3"), "{msg}");
+        }
+        other => panic!("level 2 must reject Ext before append, got {other:?}"),
+    }
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(marker, None, "rejected Ext must not activate level 3");
+    handle.shutdown().await;
+
+    // level 3：接受并提交；未知 type_id 是业务拒绝（Invalid），不是静默忽略。
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, pool) = spawn_raft(dir.path(), 3).await;
+    assert_eq!(handle.write(ext()).await.unwrap(), ControlResponse::Invalid);
+    let marker: String =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(marker, "3");
+    handle.shutdown().await;
+}
+
+/// apply 侧 fail-stop 兜底：即使 level-3 entry 已进日志（旧日志重放/快照恢复），
+/// 配置为 level 2 的状态机也必须拒绝，绝不半应用。
+#[tokio::test]
+async fn ext_entry_fails_stop_on_level_two_state_machine() {
+    use openraft::entry::Entry;
+    use openraft::storage::RaftStateMachine;
+    use openraft::{CommittedLeaderId, EntryPayload, LogId};
+    use oss_server::raft::TypeConfig;
+    use oss_server::raft::store::SqliteStateMachine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("sm.db").display());
+    let db = oss_server::db::Db::connect_raft(&url).await.unwrap();
+    let mut sm = SqliteStateMachine::open_with_pool(db.pool().clone(), 1 << 20, false, None, 2)
+        .await
+        .unwrap();
+    let entry = Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+        payload: EntryPayload::Normal(ControlCommand::Ext {
+            type_id: "future.demo".into(),
+            payload: serde_json::json!({}),
+        }),
+    };
+    let err = RaftStateMachine::<TypeConfig>::apply(&mut sm, [entry])
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("feature level 3"), "{err}");
 }
 
 #[tokio::test]

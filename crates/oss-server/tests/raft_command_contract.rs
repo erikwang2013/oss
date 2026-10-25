@@ -198,6 +198,11 @@ fn all_variants() -> Vec<ControlCommand> {
             bucket: "b1".into(),
             id: "inv1".into(),
         },
+        // Level C M1：命令演进容器（level 3）；type_id 由提交方定义，payload 任意 JSON。
+        ControlCommand::Ext {
+            type_id: "future.demo".into(),
+            payload: serde_json::json!({"k": "v"}),
+        },
     ]
 }
 
@@ -250,19 +255,25 @@ fn control_command_field_set_matches_frozen_fixture() {
     }
 }
 
-/// D4：level-3 词汇表存在，但命令闸门仍关闭（没有任何生产命令要求 level 3）。
+/// Level C M1：level-3 词汇表固定；生产命令集中**只有** `Ext` 要求 level 3，
+/// 其余命令仍为 1/2（旧二进制必须能解析并应用）。
 #[test]
-fn feature_level_three_vocabulary_keeps_command_gate_closed() {
+fn feature_level_three_is_open_only_for_ext() {
     use oss_server::raft::compat::{
-        FEATURE_LEVEL_3, FEATURE_OSSCTL2, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup,
+        FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE,
+        MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup, supports,
     };
     assert_eq!(MIN_FEATURE_LEVEL, 1);
+    assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
     assert_eq!(FEATURE_LEVEL_3, 3);
+    assert_eq!(FEATURE_COMMAND_EXT, FEATURE_LEVEL_3);
     assert_eq!(
         FEATURE_OSSCTL2, FEATURE_LEVEL_3,
         "m8 别名与 level 3 同一个激活门"
     );
     assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_3);
+    assert!(supports(1) && supports(2) && supports(3));
+    assert!(!supports(4), "未知更高 level 一律不支持");
 
     // marker 4 超出本二进制上限：拒绝启动；已激活 3 不能配 2 启动。
     assert!(guard_startup(3, 3).is_ok());
@@ -272,30 +283,74 @@ fn feature_level_three_vocabulary_keeps_command_gate_closed() {
         "配置低于已激活 marker 必须拒绝"
     );
 
-    // 生产命令集最高只要求 2（BucketSetLifecycleV2）；Ext/accounts/runstate 未进命令集。
+    let mut ext = 0;
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
-        assert!(
-            level <= 2,
-            "{cmd:?} 要求 level {level}，但 level-3 命令闸门必须保持关闭"
-        );
+        if matches!(cmd, ControlCommand::Ext { .. }) {
+            ext += 1;
+            assert_eq!(level, FEATURE_COMMAND_EXT);
+        } else {
+            assert!(
+                level <= FEATURE_STRUCTURED_LIFECYCLE,
+                "{cmd:?} 要求 level {level}，但只有 Ext 可以是 level 3"
+            );
+        }
     }
-    let names: Vec<String> = all_variants()
-        .iter()
-        .map(|cmd| {
-            serde_json::to_value(cmd)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .keys()
-                .next()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    assert_eq!(ext, 1, "生产命令集恰好一个 Ext 样本");
+}
+
+/// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，
+/// 变体级 `deny_unknown_fields`；旧命令集/未来变体都解码失败（fail-stop，不静默跳过）。
+#[test]
+fn ext_is_typed_and_unreadable_by_old_decoders() {
+    let ext = ControlCommand::Ext {
+        type_id: "future.module.op".into(),
+        payload: serde_json::json!({"k": "v"}),
+    };
+    let wire = serde_json::to_value(&ext).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({"Ext": {"type_id": "future.module.op", "payload": {"k": "v"}}})
+    );
+    assert_eq!(
+        serde_json::from_value::<ControlCommand>(wire.clone()).unwrap(),
+        ext
+    );
+
+    // 变体级未知字段/缺失字段：新语义只能新 type_id 或新变体，不能偷偷塞字段。
     assert!(
-        !names.iter().any(|name| name == "Ext"),
-        "ControlCommand 不得含 Ext 变体"
+        serde_json::from_value::<ControlCommand>(
+            serde_json::json!({"Ext": {"type_id": "x", "payload": {}, "extra": 1}})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ControlCommand>(serde_json::json!({"Ext": {"type_id": "x"}}))
+            .is_err()
+    );
+
+    // 未来变体：新二进制同样 fail-closed（绝不能把未知命令当空操作）。
+    assert!(
+        serde_json::from_value::<ControlCommand>(serde_json::json!({"FutureVariant": {}})).is_err()
+    );
+
+    // v1.13.1/v1.13.2 的命令集没有 Ext（deny_unknown_fields）→ 解码即失败，
+    // apply 侧 fail-stop，绝不会把未知命令当空操作。
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    enum LegacyCommand {
+        BucketDelete { name: String },
+    }
+    match serde_json::from_value::<LegacyCommand>(
+        serde_json::json!({"BucketDelete": {"name": "b"}}),
+    ) {
+        Ok(LegacyCommand::BucketDelete { name }) => assert_eq!(name, "b"),
+        Err(e) => panic!("旧命令集必须仍能解码既有变体: {e}"),
+    }
+    let legacy = serde_json::from_value::<LegacyCommand>(wire);
+    assert!(
+        legacy.is_err(),
+        "旧二进制必须拒绝 level-3 Ext，得到 {legacy:?}"
     );
 }
 
