@@ -13,7 +13,7 @@ use xl_s3::lifecycle::{
 
 use crate::db::{Db, LifecycleRuleRow};
 use crate::raft::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, LifecycleRuleCmdV2};
-use crate::raft::control::{ControlError, ControlPlane};
+use crate::raft::control::ControlPlane;
 
 pub struct SqlLifecycleStore {
     db: Arc<Db>,
@@ -53,10 +53,8 @@ fn control_error(
             "control write rejected".into(),
         )),
         // 与 ControlError::http_status 一致：控制面暂不可用（含 Level B feature
-        // 未激活）→ 503；set/clear 幂等，可重试。
-        Err(e @ (ControlError::Timeout(_) | ControlError::Unavailable(_))) => {
-            Err(LifecycleError::Unavailable(e.to_string()))
-        }
+        // 未激活、M8-0 not-leader）→ 503；set/clear 幂等，可重试。
+        Err(e) if e.http_status() == 503 => Err(LifecycleError::Unavailable(e.to_string())),
         Err(e) => Err(LifecycleError::Internal(e.to_string())),
     }
 }
@@ -277,5 +275,33 @@ fn lifecycle_cmd_v2(r: &LifecycleRuleRow) -> LifecycleRuleCmdV2 {
         transition_tier: r.transition_tier.clone(),
         enabled: r.enabled,
         config_json: r.config_json.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::control::ControlError;
+
+    /// M8-0：not-leader 与超时/不可用一样是 503 → lifecycle 可重试（不是 500）。
+    #[test]
+    fn control_error_503_maps_to_unavailable() {
+        let not_leader = ControlError::NotLeader {
+            leader: Some(2),
+            endpoint: Some("http://10.0.0.2:9000".into()),
+        };
+        assert!(matches!(
+            control_error(Err(not_leader)),
+            Err(LifecycleError::Unavailable(m)) if m.contains("http://10.0.0.2:9000")
+        ));
+        assert!(matches!(
+            control_error(Err(ControlError::Timeout("t".into()))),
+            Err(LifecycleError::Unavailable(_))
+        ));
+        // 非 503 仍是 Internal（不把真失败伪装成可重试）。
+        assert!(matches!(
+            control_error(Err(ControlError::Internal("i".into()))),
+            Err(LifecycleError::Internal(_))
+        ));
     }
 }
