@@ -111,6 +111,10 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         // ---- Level B 滚动升级握手/诊断（纯增量字段；旧节点无这些键） ----
         "wire_version": compat::WIRE_VERSION,
         "feature_level": handle.advertised_feature(),
+        "feature_max": compat::MAX_FEATURE_LEVEL,
+        "snapshot_format": super::data::SNAPSHOT_FORMAT,
+        // 当前二进制没有只读模式；1.13.2 patch 见到更高 wire peer 时置 true。
+        "read_only": false,
         "activation_level": handle.activation_level(),
         "effective_feature_level": effective.as_ref().map(|e| e.level),
         "compat": {

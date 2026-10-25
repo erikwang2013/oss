@@ -103,6 +103,10 @@
     "name",
     "versioning"
   ],
+  "Ext": [
+    "payload",
+    "type_id"
+  ],
   "InventoryDelete": [
     "bucket",
     "id"

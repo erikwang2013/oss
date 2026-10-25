@@ -19,6 +19,39 @@ fn header(resp: &reqwest::Response, name: &str) -> String {
         .to_string()
 }
 
+/// Level C M1：`/status` 暴露能力上限与快照格式，console/runbook 才能判断
+/// “level 3 = 命令扩展”（而非某项业务已启用）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compat_level_three_status_exposes_feature_max_and_snapshot_format() {
+    use oss_server::raft::compat::{MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
+    use oss_server::raft::data::SNAPSHOT_FORMAT;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = raft_harness::settings(dir.path(), 1, true);
+    settings.feature_level = MAX_FEATURE_LEVEL;
+    let node = raft_harness::spawn_node(settings).await;
+    raft_harness::wait_leader(&node.handle).await;
+
+    let body: serde_json::Value = client()
+        .get(format!("{}/api/v1/site/raft/status", node.base))
+        .header(RPC_TOKEN_HEADER, &node.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["feature_level"], 3);
+    assert_eq!(body["feature_max"], 3);
+    assert_eq!(body["snapshot_format"], SNAPSHOT_FORMAT);
+    assert_eq!(body["effective_feature_level"], 3);
+    // 当前二进制没有只读模式（1.13.2 patch 才会置 true）。
+    assert_eq!(body["read_only"].as_bool(), Some(false));
+    assert_eq!(body["activation_level"], MIN_FEATURE_LEVEL);
+
+    node.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wire_three_is_rejected_except_status_and_responses_advertise_compat() {
     let dir = tempfile::tempdir().unwrap();

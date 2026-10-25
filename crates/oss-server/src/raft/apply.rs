@@ -735,6 +735,13 @@ pub(crate) async fn apply_command(
                 ControlResponse::NotFound
             }
         }
+        // Level 3 命令容器：apply 只认识显式注册的 type_id；未知类型是业务拒绝，
+        // 绝不能当空操作（静默忽略会让新旧副本的控制面状态分叉）。
+        ControlCommand::Ext { type_id, .. } => match type_id.as_str() {
+            #[cfg(test)]
+            "test.noop" => ControlResponse::Ok,
+            _ => ControlResponse::Invalid,
+        },
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
@@ -780,6 +787,34 @@ async fn bucket_exists_for_ap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Level 3 `Ext`：未知 type_id 是业务拒绝；cfg(test) 探针证明容器可提交。
+    #[tokio::test]
+    async fn ext_unknown_type_is_invalid_and_test_probe_is_ok() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut cw = control_tx(&mut conn);
+        let noop = ControlCommand::Ext {
+            type_id: "test.noop".into(),
+            payload: serde_json::json!({}),
+        };
+        assert_eq!(
+            apply_command(&mut cw, &noop).await.unwrap().response,
+            ControlResponse::Ok
+        );
+        let unknown = ControlCommand::Ext {
+            type_id: "future.unknown".into(),
+            payload: serde_json::json!({"k": "v"}),
+        };
+        assert_eq!(
+            apply_command(&mut cw, &unknown).await.unwrap().response,
+            ControlResponse::Invalid
+        );
+    }
 
     /// witness 无本地管理员：AP/inventory owner 用哨兵 0（S7 快照安装同映射）。
     #[tokio::test]

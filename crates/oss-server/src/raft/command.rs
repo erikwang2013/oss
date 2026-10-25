@@ -219,6 +219,16 @@ pub enum ControlCommand {
         id: String,
     },
 
+    // ---- level 3: command evolution ----
+    /// 命令演进容器（level 3）：`type_id` 是提交方注册的稳定类型名，`payload` 为该
+    /// 类型的 JSON。旧二进制没有该变体（`deny_unknown_fields`）→ 解码 fail-stop；
+    /// apply 只认识显式注册的 `type_id`，未知类型返回 `Invalid`（绝不静默忽略）。
+    /// 尺寸沿用 [`COMMAND_MAX_BYTES`]（24 MiB），payload 无额外豁免。
+    Ext {
+        type_id: String,
+        payload: serde_json::Value,
+    },
+
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。
     #[cfg(test)]
     Set {
@@ -275,7 +285,10 @@ impl ControlCommand {
         match self {
             // 结构化生命周期：v1.13.1 的 `ControlCommand`（`deny_unknown_fields`）无法
             // 解码该变体，混合窗口内提交会让旧副本 fail-stop。
-            Self::BucketSetLifecycleV2 { .. } => 2,
+            Self::BucketSetLifecycleV2 { .. } => super::compat::FEATURE_STRUCTURED_LIFECYCLE,
+            // 命令演进容器：旧二进制（最高 level 2）必须先在 leader 入口被拒，
+            // 否则它们会解码失败并在 apply 侧 fail-stop。
+            Self::Ext { .. } => super::compat::FEATURE_COMMAND_EXT,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,
