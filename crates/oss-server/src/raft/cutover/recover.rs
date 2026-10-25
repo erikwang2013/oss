@@ -9,6 +9,7 @@ use super::export::{ExportFile, install_activation_level, verify_export};
 use crate::config::RaftRole;
 use crate::db::Db;
 use crate::raft::data::{self, InstallCtx};
+use crate::raft::runstate;
 use crate::raft::store::SqliteLogStore;
 use crate::raft::{self, RaftHandle, RaftSettings, compat};
 
@@ -64,9 +65,14 @@ pub async fn force_recover(
             settings.feature_level
         ));
     }
-    let snapshot_len = data::encode_snapshot_at(&export.data, activation)
-        .map_err(|e| e.to_string())?
-        .len() as u64;
+    let runstate = export.runstate.clone().unwrap_or_default();
+    let snapshot_len = if activation >= compat::FEATURE_LEVEL_3 {
+        runstate::encode_runstate_snapshot(&export.data, &runstate, activation)
+    } else {
+        data::encode_snapshot_at(&export.data, activation)
+    }
+    .map_err(|e| e.to_string())?
+    .len() as u64;
     if snapshot_len > settings.snapshot_max_bytes {
         return Err(format!(
             "recovery snapshot {snapshot_len} bytes exceeds raft.snapshot_max_bytes {}",
@@ -118,6 +124,11 @@ pub async fn force_recover(
     data::install_tx(&mut tx, &export.data, &InstallCtx { admin_id, witness })
         .await
         .map_err(|e| e.to_string())?;
+    if activation >= compat::FEATURE_LEVEL_3 {
+        runstate::install_runstate_tx(&mut tx, &runstate)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     if activation > compat::MIN_FEATURE_LEVEL {
         compat::bump_activation_tx(&mut tx, activation)
             .await

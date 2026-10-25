@@ -1,5 +1,6 @@
 //! 控制面导出文件：读取 11 张复制表，生成带校验和的 JSON（只读；不重放 schema/模式）。
 //!
+//! 格式 2 起可选携带 level-3 运行态（checksum 覆盖两者）；格式 1 旧文件仍可读。
 //! 封套带来源 provenance（`snapshot_format`/`wire_version`/`feature_level`/
 //! `activation_level`/`source_build`）。
 //! [`verify_export`] 在 cutover（含 dry-run）与 force-recover 动数据之前拒绝本机无法
@@ -14,8 +15,12 @@ use sha2::{Digest, Sha256};
 use crate::db::Db;
 use crate::raft::compat;
 use crate::raft::data::{self, ControlData};
+use crate::raft::runstate::{self, RunState};
 
-pub const EXPORT_FORMAT: u32 = 1;
+/// 本二进制写出的导出格式：2 起可选携带 `runstate`（OSSCTL3 来源）。
+pub const EXPORT_FORMAT: u32 = 2;
+/// 仍接受读取的最旧导出格式（1 = 无运行态）。
+pub const MIN_EXPORT_FORMAT: u32 = 1;
 pub const EXPORT_KIND: &str = "oss-raft-control-export";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +52,9 @@ pub struct ExportFile {
     pub has_vault: Option<bool>,
     pub exported_at: i64,
     pub sha256: String,
+    /// 来源激活 level 3 时的运行态（format 2 起）。低于 3 不导出：那是节点本地状态。
+    #[serde(default)]
+    pub runstate: Option<RunState>,
     pub data: ControlData,
 }
 
@@ -65,8 +73,18 @@ pub async fn build_export(
         .await
         .map_err(|e| format!("read control data: {e}"))?;
     let marker = compat::read_activation_conn(&mut tx).await?;
+    // level 3：运行态必须与 11 表在同一次读事务里取（不能被并发 apply 撕裂）。
+    let runstate = if marker >= compat::FEATURE_LEVEL_3 {
+        Some(
+            runstate::read_runstate_tx(&mut tx)
+                .await
+                .map_err(|e| format!("read runstate: {e}"))?,
+        )
+    } else {
+        None
+    };
     tx.commit().await.map_err(|e| format!("commit: {e}"))?;
-    let payload = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
+    let payload = export_payload(&data, runstate.as_ref())?;
     let sha256 = hex::encode(Sha256::digest(&payload));
     // 来源二进制写快照时取 max(marker, 数据要求)；封套号与实际编码共用 data.rs 选择器。
     let required = data::required_feature_level(&data);
@@ -92,8 +110,25 @@ pub async fn build_export(
         has_vault,
         exported_at: crate::db::now(),
         sha256,
+        runstate,
         data,
     })
+}
+
+#[derive(Serialize)]
+struct ExportPayload<'a> {
+    data: &'a ControlData,
+    runstate: &'a RunState,
+}
+
+/// checksum 载荷：带运行态时两者一起哈希；旧格式（无运行态）保持只哈希 data，
+/// 这样 v1 冻结 fixture 与旧文件的 sha256 不变。
+fn export_payload(data: &ControlData, runstate: Option<&RunState>) -> Result<Vec<u8>, String> {
+    match runstate {
+        Some(runstate) => serde_json::to_vec(&ExportPayload { data, runstate }),
+        None => serde_json::to_vec(data),
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// 校验封套、校验和与来源兼容性；返回警告（当前仅缺 provenance 的旧导出）。
@@ -102,13 +137,18 @@ pub async fn build_export(
 /// 接受：载荷已由冻结的 `ControlData`（全部 `deny_unknown_fields`）完整解码，
 /// 且数据自身要求的级别仍受本二进制上限约束，不存在静默丢行/丢字段的路径。
 pub fn verify_export(export: &ExportFile) -> Result<Vec<String>, String> {
-    if export.format != EXPORT_FORMAT || export.kind != EXPORT_KIND {
+    if !(MIN_EXPORT_FORMAT..=EXPORT_FORMAT).contains(&export.format) || export.kind != EXPORT_KIND {
         return Err(format!(
-            "unsupported export format/kind: {}/{}",
-            export.format, export.kind
+            "unsupported export format/kind: {}/{} (this binary reads format {}..={})",
+            export.format, export.kind, MIN_EXPORT_FORMAT, EXPORT_FORMAT
         ));
     }
-    let payload = serde_json::to_vec(&export.data).map_err(|e| e.to_string())?;
+    if export.format == MIN_EXPORT_FORMAT && export.runstate.is_some() {
+        return Err(format!(
+            "export format {MIN_EXPORT_FORMAT} (pre-runstate) cannot carry runstate"
+        ));
+    }
+    let payload = export_payload(&export.data, export.runstate.as_ref())?;
     let want = hex::encode(Sha256::digest(&payload));
     if want != export.sha256 {
         return Err("export checksum mismatch".into());
@@ -116,7 +156,34 @@ pub fn verify_export(export: &ExportFile) -> Result<Vec<String>, String> {
     verify_provenance(export)
 }
 
+/// 运行态只随 OSSCTL3/level-3 导出；低于 3 或 provenance 不一致一律拒绝。
+fn verify_runstate(export: &ExportFile) -> Result<(), String> {
+    let Some(runstate) = &export.runstate else {
+        return Ok(());
+    };
+    if export.snapshot_format != Some(3) {
+        return Err(format!(
+            "runstate requires OSSCTL3 snapshot_format 3, export declares {:?}",
+            export.snapshot_format
+        ));
+    }
+    match export.feature_level {
+        Some(level) if level >= compat::FEATURE_LEVEL_3 => {}
+        Some(level) => {
+            return Err(format!(
+                "runstate requires feature_level >= {}, export declares {level}",
+                compat::FEATURE_LEVEL_3
+            ));
+        }
+        None => return Err("runstate requires feature_level provenance >= 3".into()),
+    }
+    runstate
+        .validate()
+        .map_err(|e| format!("invalid runstate in export: {e}"))
+}
+
 fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
+    verify_runstate(export)?;
     let required = data::required_feature_level(&export.data);
     if let Some(format) = export.snapshot_format {
         if !(1..=data::SNAPSHOT_FORMAT_MAX).contains(&format) {
@@ -225,7 +292,12 @@ fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
 /// 原值），v1.16 封套回落到 `feature_level`（= max(激活, 数据要求)），LC-0 前的旧导出
 /// 两者都缺 → 数据要求。调用前必须已通过 [`verify_export`]。
 pub fn install_activation_level(export: &ExportFile) -> u8 {
-    let required = data::required_feature_level(&export.data);
+    let required = data::required_feature_level(&export.data).max(
+        export
+            .runstate
+            .as_ref()
+            .map_or(compat::MIN_FEATURE_LEVEL, |r| r.required_feature_level()),
+    );
     export
         .activation_level
         .or(export.feature_level)

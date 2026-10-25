@@ -6,14 +6,15 @@ mod export;
 mod recover;
 
 pub use export::{
-    EXPORT_FORMAT, EXPORT_KIND, ExportFile, build_export, install_activation_level, read_export,
-    verify_export, write_export,
+    EXPORT_FORMAT, EXPORT_KIND, ExportFile, MIN_EXPORT_FORMAT, build_export,
+    install_activation_level, read_export, verify_export, write_export,
 };
 pub use recover::{ForceRecoverReport, force_recover};
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::data::{self, ControlData, InstallCtx};
+use super::runstate;
 use crate::db::Db;
 
 #[derive(Debug, Clone)]
@@ -257,7 +258,13 @@ pub async fn cutover(
     // force-recover/回滚会在建快照时失败。激活级别随 install 在同一事务写入 marker
     // （dry-run 不写）。来源激活过的集群即使无 level-2 数据也必须保持激活。
     let activation = install_activation_level(export);
-    data::encode_snapshot_at(&export.data, activation).map_err(|e| {
+    let runstate = export.runstate.clone().unwrap_or_default();
+    let baseline = if activation >= super::compat::FEATURE_LEVEL_3 {
+        runstate::encode_runstate_snapshot(&export.data, &runstate, activation)
+    } else {
+        data::encode_snapshot_at(&export.data, activation)
+    };
+    baseline.map_err(|e| {
         CutoverError::Invalid(format!(
             "export cannot be snapshotted as control baseline: {e}"
         ))
@@ -347,6 +354,12 @@ pub async fn cutover(
     let installed = data::install_tx(&mut tx, &export.data, &ctx)
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
+    // level 3：运行态九表与控制面同一事务替换（旧格式无运行态 → 空态，不保留目标本地行）。
+    if activation >= super::compat::FEATURE_LEVEL_3 {
+        runstate::install_runstate_tx(&mut tx, &runstate)
+            .await
+            .map_err(|e| CutoverError::Db(e.to_string()))?;
+    }
     // 来源激活级别与数据同事务写入（只升不降）；启动守卫要求 feature_level>=该级别。
     if activation > super::compat::MIN_FEATURE_LEVEL {
         super::compat::bump_activation_tx(&mut tx, activation)

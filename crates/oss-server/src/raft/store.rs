@@ -560,10 +560,25 @@ impl SqliteStateMachine {
                     std::io::Error::other(e),
                 )
             })?;
+        // level 3：运行态与控制面必须在同一读事务内取，避免快照撕裂。
+        // 低于 3：运行态是节点本地状态，不进快照。
+        let runstate = if level >= super::compat::FEATURE_LEVEL_3 {
+            Some(
+                super::runstate::read_runstate_tx(&mut tx)
+                    .await
+                    .map_err(Self::data_err)?,
+            )
+        } else {
+            None
+        };
         tx.commit()
             .await
             .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        let bytes = data::encode_snapshot_at(&control, level).map_err(Self::data_err)?;
+        let bytes = match &runstate {
+            Some(rs) => super::runstate::encode_runstate_snapshot(&control, rs, level),
+            None => data::encode_snapshot_at(&control, level),
+        }
+        .map_err(Self::data_err)?;
         Ok((applied, membership, bytes))
     }
 
@@ -578,20 +593,23 @@ impl SqliteStateMachine {
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
         let snapshot = data::decode_snapshot(bytes).map_err(Self::data_err)?;
-        if !snapshot.extensions.is_empty() {
-            // Wave 1 消费者落地前 fail-closed：安装只写 data，非空扩展区会被静默丢弃
-            // （数据丢失）——在加锁/写任何行之前拒绝。
-            return Err(Self::data_err(data::DataError::Format(format!(
-                "snapshot carries {} opaque extension(s) [{}] but this binary has no \
-                 extension consumers; refusing to install and drop them",
-                snapshot.extensions.len(),
-                snapshot
-                    .extensions
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ))));
+        // 只认识 m8.runstate；未知扩展仍然 fail-closed（丢弃即数据丢失）。
+        let mut runstate = None;
+        for (name, ext) in &snapshot.extensions {
+            if name == super::runstate::RUNSTATE_EXTENSION {
+                runstate = Some(
+                    super::runstate::from_snapshot_extension(
+                        ext,
+                        super::runstate::RUNSTATE_EXTENSION_VERSION,
+                    )
+                    .map_err(Self::data_err)?,
+                );
+            } else {
+                return Err(Self::data_err(data::DataError::Format(format!(
+                    "snapshot carries unsupported extension {name:?}; refusing to install and \
+                     drop it"
+                ))));
+            }
         }
         let _guard = self.snapshot_lock.lock().await;
         let mut tx = self
@@ -615,6 +633,14 @@ impl SqliteStateMachine {
         data::install_tx(&mut tx, &snapshot.data, &ctx)
             .await
             .map_err(Self::data_err)?;
+        // level 3：九表与控制面同一事务替换；无扩展 = 空运行态（本二进制在 level 3
+        // 总是写出扩展）。低于 3：不动节点本地运行态。
+        if snapshot.feature_level >= super::compat::FEATURE_LEVEL_3 {
+            let runstate = runstate.unwrap_or_default();
+            super::runstate::install_runstate_tx(&mut tx, &runstate)
+                .await
+                .map_err(Self::data_err)?;
+        }
         // 只升不降；OSSCTL1（level 1）不写 marker，保持旧安装足迹不变。
         if snapshot.feature_level > super::compat::MIN_FEATURE_LEVEL {
             super::compat::bump_activation_tx(&mut tx, snapshot.feature_level)
@@ -1309,7 +1335,8 @@ mod tests {
         assert_eq!(sm_b.activation_level(), 2);
     }
 
-    /// V3 扩展区：Wave 1 消费者落地前 fail-closed（拒绝安装、不写行）；空扩展区仍可安装。
+    /// V3 扩展区：未知命名空间 fail-closed（拒绝安装、不写行）；`m8.runstate`
+    /// 畸形载荷同样在写行前拒绝；空扩展区仍可安装。
     #[tokio::test]
     async fn control_snapshot_with_opaque_extensions_is_rejected_without_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1349,7 +1376,7 @@ mod tests {
 
         let mut extensions = data::SnapshotExtensions::new();
         extensions.insert(
-            "m8.runstate".into(),
+            "future.opaque".into(),
             data::SnapshotExtension {
                 version: 1,
                 payload_b64: "b3BhcXVl".into(), // base64("opaque")
@@ -1379,6 +1406,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(users, 0, "拒绝安装不得写任何行");
+
+        // 已消费的 m8.runstate：畸形载荷必须解码失败，同样不写行。
+        let mut bad_ext = data::SnapshotExtensions::new();
+        bad_ext.insert(
+            "m8.runstate".into(),
+            data::SnapshotExtension {
+                version: 1,
+                payload_b64: "b3BhcXVl".into(),
+            },
+        );
+        let bad = data::encode_snapshot_with_extensions(&decoded.data, 3, bad_ext).unwrap();
+        let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm_b,
+            &snap.meta,
+            Box::new(Cursor::new(bad)),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("json"), "{err}");
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db_b.pool())
+            .await
+            .unwrap();
+        assert_eq!(users, 0, "畸形运行态不得写任何行");
 
         // 空扩展区的 V3 不触发闸门：正常安装并保留数据。
         let no_ext = data::encode_snapshot_at(&decoded.data, 3).unwrap();

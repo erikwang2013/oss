@@ -5,9 +5,12 @@
 //! `m8.runstate` 版本，`pragma_table_info` 对照测试会先失败。读写实现见
 //! [`super::store`]。
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::raft::compat::{FEATURE_LEVEL_3, MIN_FEATURE_LEVEL};
+use crate::raft::data::DataError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -171,4 +174,67 @@ impl RunState {
             FEATURE_LEVEL_3
         }
     }
+
+    /// 语义校验（安装/导出校验在 DELETE/写行之前调用）：
+    /// 序列号必须高于现存最大 id（0 = 未初始化的空态），作业引用不得悬空。
+    pub fn validate(&self) -> Result<(), DataError> {
+        if self.next_job_id < 0 || self.next_run_id < 0 {
+            return Err(DataError::Format(format!(
+                "runstate next ids must be 0 or positive (job={}, run={})",
+                self.next_job_id, self.next_run_id
+            )));
+        }
+        check_sequence(
+            "next_job_id",
+            self.next_job_id,
+            self.jobs.iter().map(|j| j.id).max(),
+        )?;
+        check_sequence(
+            "next_run_id",
+            self.next_run_id,
+            self.inventory_runs.iter().map(|r| r.id).max(),
+        )?;
+
+        let job_ids: HashSet<i64> = self.jobs.iter().map(|j| j.id).collect();
+        for t in &self.job_tasks {
+            if !job_ids.contains(&t.job_id) {
+                return Err(DataError::Format(format!(
+                    "runstate job_tasks ({}, {}) references missing jobs.id {}",
+                    t.job_id, t.task_no, t.job_id
+                )));
+            }
+        }
+        for r in &self.inventory_runs {
+            if let Some(job_id) = r.job_id
+                && !job_ids.contains(&job_id)
+            {
+                return Err(DataError::Format(format!(
+                    "runstate inventory_runs {} references missing jobs.id {job_id}",
+                    r.id
+                )));
+            }
+        }
+        for t in &self.tier_restores {
+            if let Some(job_id) = t.job_id
+                && !job_ids.contains(&job_id)
+            {
+                return Err(DataError::Format(format!(
+                    "runstate tier_restores {}/{} references missing jobs.id {job_id}",
+                    t.bucket, t.key
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_sequence(name: &str, next: i64, max: Option<i64>) -> Result<(), DataError> {
+    if let Some(max) = max
+        && next <= max
+    {
+        return Err(DataError::Format(format!(
+            "runstate {name} {next} must exceed max existing id {max}"
+        )));
+    }
+    Ok(())
 }

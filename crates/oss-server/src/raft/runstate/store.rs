@@ -228,23 +228,45 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     Ok(state)
 }
 
-/// 连接池便捷入口（快照 install 后的校验/读路径）。
+/// 连接池便捷入口（校验/单次读）。快照或导出构建必须用 [`read_runstate_tx`] 和
+/// 控制面同处一个读事务，避免撕裂读。
 pub async fn read_runstate(pool: &SqlitePool) -> Result<RunState, DataError> {
     let mut conn = pool.acquire().await.map_err(sql)?;
     read_runstate_tx(&mut conn).await
 }
 
-/// 九表整表替换（调用方事务）。先校验序列再删除，任何 SQL 失败由调用方回滚。
+/// 九表整表替换。先做语义校验（不通过则一行不写），再在 savepoint 内删除+插入：
+/// 裸连接（自动提交）中途失败也只回滚本次安装；嵌套在调用方事务里同样安全。
 pub async fn install_runstate_tx(
     conn: &mut SqliteConnection,
     state: &RunState,
 ) -> Result<(), DataError> {
-    if state.next_job_id < 0 || state.next_run_id < 0 {
-        return Err(DataError::Format(format!(
-            "runstate next ids must be 0 or positive (job={}, run={})",
-            state.next_job_id, state.next_run_id
-        )));
+    state.validate()?;
+    sqlx::query("SAVEPOINT install_runstate")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    match write_rows(conn, state).await {
+        Ok(()) => {
+            sqlx::query("RELEASE SAVEPOINT install_runstate")
+                .execute(&mut *conn)
+                .await
+                .map_err(sql)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK TO SAVEPOINT install_runstate")
+                .execute(&mut *conn)
+                .await;
+            let _ = sqlx::query("RELEASE SAVEPOINT install_runstate")
+                .execute(&mut *conn)
+                .await;
+            Err(e)
+        }
     }
+}
+
+async fn write_rows(conn: &mut SqliteConnection, state: &RunState) -> Result<(), DataError> {
     for table in RUNSTATE_TABLES {
         sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
             .execute(&mut *conn)
@@ -252,6 +274,8 @@ pub async fn install_runstate_tx(
             .map_err(sql)?;
     }
 
+    // 显式 id 插入会把 AUTOINCREMENT 的 sqlite_sequence 追平到 max(id)，之后本地
+    // 自增不会再分配到快照里已存在的 id。
     for j in &state.jobs {
         sqlx::query(
             "INSERT INTO jobs (id, kind, bucket, prefix, state, scanned, deleted, skipped, \
