@@ -59,8 +59,9 @@ async fn metrics_exposes_minimal_signal() {
     );
     assert!(body.contains("oss_drive_count 1"), "{body}");
     assert!(body.contains("oss_slot_count 1"), "{body}");
-    // DP-0：单机无可达混版节点 → 兼容为 1
+    // DP-1：单机无可达不兼容/降级节点
     assert!(body.contains("oss_data_plane_compatible 1"), "{body}");
+    assert!(body.contains("oss_data_plane_degraded_peers 0"), "{body}");
     assert!(
         body.lines()
             .any(|l| l.starts_with("oss_node_up{node=") && l.ends_with(" 1")),
@@ -112,9 +113,10 @@ async fn cluster_status_auth_gate_and_single_mode() {
     assert_eq!(v["nodes"][0]["up"], true);
     assert_eq!(v["quorum_unmet"]["write"], 0);
     assert_eq!(v["quorum_unmet"]["lock"], 0);
-    // DP-0：单机 = 自身即全集群；运维可见数据面版本与混版状态。
+    // DP-1：单机 = 自身即全集群；运维可见数据面版本与降级/不兼容状态。
     assert_eq!(v["data_wire_version"], 2);
     assert_eq!(v["data_plane_compatible"], true);
+    assert_eq!(v["degraded_peers"], serde_json::json!([]));
     assert_eq!(v["incompatible_peers"], serde_json::json!([]));
 }
 
@@ -132,6 +134,7 @@ async fn health_cluster_exposes_data_plane_status() {
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["data_wire_version"], 2);
     assert_eq!(v["data_plane_compatible"], true);
+    assert_eq!(v["degraded_peers"], serde_json::json!([]));
     assert_eq!(v["incompatible_peers"], serde_json::json!([]));
     assert_eq!(v["nodes"][0]["data_wire_version"], 2);
 }

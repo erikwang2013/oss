@@ -492,7 +492,7 @@ fn range_is_signed(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> bo
     })
 }
 
-/// peer 探测结果。`up=false` 时 `data_wire_version` 无意义（恒 0）。
+/// peer 探测结果。`up=false` 时版本/指纹字段无意义（恒 0/空）。
 pub(crate) struct PeerProbe {
     pub id: String,
     pub up: bool,
@@ -500,17 +500,48 @@ pub(crate) struct PeerProbe {
     pub slots: usize,
     /// 对端数据面版本（旧节点 health 缺字段 → 按 1 展示）。
     pub data_wire_version: u32,
+    /// 对端拓扑指纹（未宣告 = 0/空）。
+    pub topo_epoch: u64,
+    pub topo_hash: String,
 }
 
-/// DP-0 数据面兼容判定：只把「可达且版本不一致」算不兼容；**down 节点不下版本结论**
-/// （交给既有 quorum/降级语义，避免把网络故障伪装成混版）。返回 `(compatible, 不兼容列表)`。
-pub(crate) fn data_plane_status(peers: &[PeerProbe]) -> (bool, Vec<String>) {
-    let bad: Vec<String> = peers
-        .iter()
-        .filter(|p| p.up && p.data_wire_version != xl_store::mesh_gate::DATA_WIRE_VERSION)
-        .map(|p| format!("{}(v{})", p.id, p.data_wire_version))
-        .collect();
-    (bad.is_empty(), bad)
+/// DP-1 数据面状态（`/health/cluster`、`/api/v1/cluster/status`、`/metrics` 共用）。
+/// `compatible` = 无不可兼容 peer（降级 peer 不算不兼容：混版窗口可服务）。
+pub(crate) struct DataPlaneStatus {
+    pub compatible: bool,
+    /// 可达但只能走降级语义的旧版 peer（`id(v1)`）。
+    pub degraded_peers: Vec<String>,
+    /// 可达且能力不可兼容（未知 wire / 拓扑不一致）。
+    pub incompatible_peers: Vec<String>,
+}
+
+/// DP-1 判定：down 节点不下结论（交给既有 quorum/降级语义）；可达 peer 套用唯一策略
+/// [`xl_store::mesh_gate::check_peer`]——Legacy 计入降级，不兼容计入 fail-closed 列表。
+pub(crate) fn data_plane_status(
+    peers: &[PeerProbe],
+    local: &xl_store::mesh_gate::LocalCaps,
+) -> DataPlaneStatus {
+    let mut degraded = Vec::new();
+    let mut incompatible = Vec::new();
+    for p in peers.iter().filter(|p| p.up) {
+        let caps = xl_store::mesh_gate::PeerCaps {
+            wire_version: p.data_wire_version,
+            topo_epoch: p.topo_epoch,
+            topo_hash: p.topo_hash.clone(),
+        };
+        match xl_store::mesh_gate::check_peer(&p.id, &caps, local) {
+            Ok(xl_store::mesh_gate::PeerClass::Legacy) => {
+                degraded.push(format!("{}(v{})", p.id, p.data_wire_version))
+            }
+            Ok(xl_store::mesh_gate::PeerClass::Current) => {}
+            Err(_) => incompatible.push(format!("{}(v{})", p.id, p.data_wire_version)),
+        }
+    }
+    DataPlaneStatus {
+        compatible: incompatible.is_empty(),
+        degraded_peers: degraded,
+        incompatible_peers: incompatible,
+    }
 }
 
 /// peer 探测（单点 800ms 超时；错接线按 down + 显性日志）。
@@ -534,6 +565,8 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
                 slots: h.slots.iter().filter(|(_, up)| *up).count(),
                 // 缺字段（旧节点）= 1（保守），与本机判定口径一致。
                 data_wire_version: h.peer_data_wire_version(),
+                topo_epoch: h.topo_epoch,
+                topo_hash: h.topo_hash,
             }),
             Ok(Ok(h)) => {
                 // 错接线：地址通了但不是声明的节点——按 down 处理并留下显性日志
@@ -543,6 +576,8 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
                     up: false,
                     slots: 0,
                     data_wire_version: 0,
+                    topo_epoch: 0,
+                    topo_hash: String::new(),
                 });
             }
             _ => out.push(PeerProbe {
@@ -550,6 +585,8 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
                 up: false,
                 slots: 0,
                 data_wire_version: 0,
+                topo_epoch: 0,
+                topo_hash: String::new(),
             }),
         }
     }
@@ -591,15 +628,23 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
             u8::from(p.up)
         ));
     }
-    // DP-0：混版数据面 fail-closed 的线上信号（1 = 无可达的不兼容节点）。
-    let (data_plane_compatible, _) = data_plane_status(&peers);
+    // DP-1：混版窗口的线上信号——不兼容（fail-closed）与降级（可服务但语义受限）分列。
+    let status = data_plane_status(&peers, &state.store.local_caps());
     out.push_str(
-        "# HELP oss_data_plane_compatible 数据面版本一致性（1 = 无可达的混版节点）\n\
+        "# HELP oss_data_plane_compatible 数据面能力兼容（1 = 无可达的不兼容节点）\n\
          # TYPE oss_data_plane_compatible gauge\n",
     );
     out.push_str(&format!(
         "oss_data_plane_compatible {}\n",
-        u8::from(data_plane_compatible)
+        u8::from(status.compatible)
+    ));
+    out.push_str(
+        "# HELP oss_data_plane_degraded_peers 可达但能力降级的旧版 peer 数（混版窗口）\n\
+         # TYPE oss_data_plane_degraded_peers gauge\n",
+    );
+    out.push_str(&format!(
+        "oss_data_plane_degraded_peers {}\n",
+        status.degraded_peers.len()
     ));
     out.push_str("# HELP oss_drive_count 本机盘数\n# TYPE oss_drive_count gauge\n");
     out.push_str(&format!("oss_drive_count {drive_count}\n"));
@@ -763,7 +808,7 @@ async fn cluster_view(state: &AppState) -> (serde_json::Value, bool, String) {
         "data_wire_version": local.peer_data_wire_version(),
     })];
     let peers = probe_peers(state).await;
-    let (data_plane_compatible, incompatible_peers) = data_plane_status(&peers);
+    let status = data_plane_status(&peers, &state.store.local_caps());
     // 单机 = 1（自身即多数）；集群 = 1 + peers
     let expected = 1 + peers.len();
     let mut reachable = 1usize;
@@ -794,10 +839,11 @@ async fn cluster_view(state: &AppState) -> (serde_json::Value, bool, String) {
         "version": local.version,
         "nodes": nodes,
         "quorum_unmet": { "write": unmet_write, "lock": unmet_lock },
-        // DP-0：运维可见的数据面版本/混版状态（down 节点不下版本结论）。
+        // DP-1：运维可见的数据面版本/混版状态（down 节点不下版本结论）。
         "data_wire_version": local.peer_data_wire_version(),
-        "data_plane_compatible": data_plane_compatible,
-        "incompatible_peers": incompatible_peers,
+        "data_plane_compatible": status.compatible,
+        "degraded_peers": status.degraded_peers,
+        "incompatible_peers": status.incompatible_peers,
         "ready": ready,
     });
     (view, ready, reason)
@@ -871,28 +917,57 @@ mod tests {
             up,
             slots: 3,
             data_wire_version: v,
+            topo_epoch: if up { 1 } else { 0 },
+            topo_hash: if up {
+                "aaaaaaaaaaaaaaaa".into()
+            } else {
+                String::new()
+            },
         }
     }
 
-    /// DP-0 状态口径：只有「可达且版本不一致」才判混版；down 节点不下版本结论；
-    /// 未来版本同样拒绝（无逐能力协商）。
+    fn local_v1() -> xl_store::mesh_gate::LocalCaps {
+        xl_store::mesh_gate::LocalCaps {
+            topo_epoch: 1,
+            topo_hash: "aaaaaaaaaaaaaaaa".into(),
+        }
+    }
+
+    /// DP-1 状态口径：可达 legacy = 降级（可服务）；未知 wire / 拓扑不一致 = 不兼容；
+    /// down 节点不下结论。
     #[test]
-    fn data_plane_status_flags_only_reachable_mismatches() {
-        let (ok, bad) = super::data_plane_status(&[]);
-        assert!(ok);
-        assert!(bad.is_empty());
-        assert!(super::data_plane_status(&[probe("n2", true, 2), probe("n3", true, 2)]).0);
-        // down 节点：版本未知，不算不兼容
-        let (ok, bad) = super::data_plane_status(&[probe("n2", false, 0), probe("n3", false, 1)]);
-        assert!(ok, "{bad:?}");
-        // 可达旧版/未来版：fail-closed 列表带节点与版本
-        let (ok, bad) = super::data_plane_status(&[
-            probe("n2", true, 1),
-            probe("n3", true, 2),
-            probe("n4", true, 3),
-        ]);
-        assert!(!ok);
-        assert_eq!(bad, vec!["n2(v1)".to_string(), "n4(v3)".to_string()]);
+    fn data_plane_status_reports_legacy_peers_as_degraded() {
+        let st = super::data_plane_status(&[], &local_v1());
+        assert!(st.compatible);
+        assert!(st.degraded_peers.is_empty());
+        let st =
+            super::data_plane_status(&[probe("n2", true, 2), probe("n3", true, 2)], &local_v1());
+        assert!(st.compatible);
+        assert!(st.degraded_peers.is_empty());
+        // down 节点：版本未知，既不算降级也不算不兼容
+        let st =
+            super::data_plane_status(&[probe("n2", false, 0), probe("n3", false, 1)], &local_v1());
+        assert!(st.compatible);
+        assert!(st.degraded_peers.is_empty());
+        assert!(st.incompatible_peers.is_empty());
+        // 可达旧版 = 降级；未来版 = 不兼容（fail-closed 列表带节点与版本）
+        let st = super::data_plane_status(
+            &[
+                probe("n2", true, 1),
+                probe("n3", true, 2),
+                probe("n4", true, 3),
+            ],
+            &local_v1(),
+        );
+        assert!(!st.compatible);
+        assert_eq!(st.degraded_peers, vec!["n2(v1)".to_string()]);
+        assert_eq!(st.incompatible_peers, vec!["n4(v3)".to_string()]);
+        // 拓扑 fingerprint 不一致 → 不兼容（同 wire 2）
+        let mut drifted = probe("n5", true, 2);
+        drifted.topo_hash = "bbbbbbbbbbbbbbbb".into();
+        let st = super::data_plane_status(&[drifted], &local_v1());
+        assert!(!st.compatible);
+        assert_eq!(st.incompatible_peers, vec!["n5(v2)".to_string()]);
     }
 
     #[test]

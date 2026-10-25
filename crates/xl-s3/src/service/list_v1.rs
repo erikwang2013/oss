@@ -35,6 +35,17 @@ pub(super) fn url_encode(s: &str) -> String {
     out
 }
 
+/// `x-oss-degraded: list-marker`：仅在 V1 marker 页因混版（legacy peer 忽略排他 marker）
+/// 可能重复边界键时出现；同版/V2 token 页不得出现（客户端不应看到无谓降级）。
+fn list_v1_degraded_headers(resp: &mut S3Response<ListObjectsOutput>, degraded: bool) {
+    if degraded {
+        resp.headers.insert(
+            "x-oss-degraded",
+            http::HeaderValue::from_static("list-marker"),
+        );
+    }
+}
+
 /// 最后一个已返回输出的排序键（v1 的 NextMarker 语义：Contents 与 CommonPrefixes 取大者）。
 fn last_output_key(r: &ListResult) -> Option<String> {
     match (r.objects.last(), r.common_prefixes.last()) {
@@ -121,7 +132,7 @@ pub(super) async fn list_objects(
         None
     };
 
-    Ok(S3Response::new(ListObjectsOutput {
+    let mut resp = S3Response::new(ListObjectsOutput {
         name: Some(bucket),
         prefix: prefix.as_deref().map(enc),
         marker: marker.as_deref().map(enc),
@@ -141,7 +152,9 @@ pub(super) async fn list_objects(
         next_marker,
         encoding_type: encode.then(|| EncodingType::from_static(EncodingType::URL)),
         ..Default::default()
-    }))
+    });
+    list_v1_degraded_headers(&mut resp, result.degraded_marker);
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -154,6 +167,16 @@ mod tests {
         assert_eq!(url_encode("a b"), "a%20b");
         assert_eq!(url_encode("dir/中文.txt"), "dir%2F%E4%B8%AD%E6%96%87.txt");
         assert_eq!(url_encode("keep-._~AZaz09"), "keep-._~AZaz09");
+    }
+
+    #[test]
+    fn list_v1_degraded_header_present_iff_degraded() {
+        let mut ok = S3Response::new(ListObjectsOutput::default());
+        list_v1_degraded_headers(&mut ok, false);
+        assert!(ok.headers.get("x-oss-degraded").is_none());
+        let mut deg = S3Response::new(ListObjectsOutput::default());
+        list_v1_degraded_headers(&mut deg, true);
+        assert_eq!(deg.headers.get("x-oss-degraded").unwrap(), "list-marker");
     }
 
     #[test]

@@ -2674,6 +2674,8 @@ pub struct InProcessMesh {
     fail_once: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// DP-0：peer 数据面版本覆盖（模拟混版节点；缺省 = 该节点真实 mesh_health 值）。
     versions: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// DP-1：到达对端的 ListLocal 请求记录（断言「旧版不会收到新语义标志」）。
+    list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
 }
 
 impl std::fmt::Debug for InProcessMesh {
@@ -2690,6 +2692,7 @@ impl InProcessMesh {
             delays: Default::default(),
             fail_once: Default::default(),
             versions: Default::default(),
+            list_requests: Default::default(),
         })
     }
 
@@ -2700,6 +2703,11 @@ impl InProcessMesh {
             Some(v) => m.insert(node.to_string(), v),
             None => m.remove(node),
         };
+    }
+
+    /// DP-1：到各节点的 ListLocal 请求快照（断言旧版收不到新语义标志）。
+    pub fn list_local_requests(&self) -> Vec<(String, crate::mesh::ListLocal)> {
+        self.list_requests.lock().unwrap().clone()
     }
 
     /// 构建后回填（Store↔transport 循环：Store 构造需要 transport，transport 又指回 Store）。
@@ -2869,6 +2877,10 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         n: &str,
         l: crate::mesh::ListLocal,
     ) -> crate::error::Result<crate::mesh::ListLocalResp> {
+        self.list_requests
+            .lock()
+            .unwrap()
+            .push((n.to_string(), l.clone()));
         self.peer(n).await?.mesh_list_local(l).await
     }
     async fn list_uploads_local(
@@ -3017,15 +3029,20 @@ impl Cluster {
             .collect();
 
         let mesh = InProcessMesh::new();
-        // DP-0：生产装配同款闸门；TTL=0 让 `set_data_wire_version` 即时生效。
-        let transport: Arc<dyn crate::mesh::MeshTransport> = Arc::new(
-            crate::mesh_gate::GatedMesh::with_ttl(mesh.clone(), std::time::Duration::ZERO),
-        );
         let mut stores = Vec::new();
         for (i, _id) in ids.iter().enumerate() {
             let dirs = node_dirs[i].clone();
             std::fs::create_dir_all(&dirs[0]).unwrap();
             let sets = drives::ClusterSets::single(&ids[i], specs.clone(), &ec).unwrap();
+            // DP-0/DP-1：生产装配同款闸门（本机能力参与 placement v2 判定）；
+            // TTL=0 让 `set_data_wire_version` 即时生效。
+            let local = crate::mesh_gate::local_caps(&sets, &ec, if placement_v2 { 2 } else { 1 });
+            let transport: Arc<dyn crate::mesh::MeshTransport> =
+                Arc::new(crate::mesh_gate::GatedMesh::with_local(
+                    mesh.clone(),
+                    local,
+                    std::time::Duration::ZERO,
+                ));
             let mut cfg = StoreConfig::new(&dirs[0]);
             cfg.drives = dirs.clone();
             cfg.ec = ec;
@@ -3155,10 +3172,10 @@ async fn cluster_write_distributes_by_slot() {
     assert_eq!(got.to_vec(), body);
 }
 
-/// DP-0：混版集群数据面 fail-closed（旧节点缺字段 → 按 1），同版恢复后行为不变。
-/// 关键：写/读/list 都必须给出清晰的 `PeerIncompatible`（不得退化成 500/quorum 部分写）。
+/// DP-1：placement v1 混版窗口放行 base 数据面（旧节点缺字段 → 按 1），
+/// 语义读路径（V1 marker / 版本列表）显式降级或 fail-closed。
 #[tokio::test]
-async fn cluster_mixed_version_fails_closed_and_recovers() {
+async fn cluster_mixed_v1_window_allows_base_ops() {
     let c = Cluster::new(4, 3).await;
     let s1 = &c.stores[0];
     s1.create_bucket("bkt").await.unwrap();
@@ -3166,41 +3183,64 @@ async fn cluster_mixed_version_fails_closed_and_recovers() {
     s1.put_object("bkt", "k", Bytes::from(body.clone()), None)
         .await
         .unwrap();
-    // 同版读：基线（闸门不改变正常路径）
-    let (_, got) = s1.get_object("bkt", "k").await.unwrap();
-    assert_eq!(got.to_vec(), body);
 
-    // n2 模拟旧节点：data_wire_version 缺字段（0）→ 消费方按 1
+    // n2 模拟 v1.13.x 旧节点：data_wire_version 缺字段（0）→ 消费方按 1
     c.mesh.set_data_wire_version("n2", Some(0));
-    let err = s1
-        .put_object("bkt", "k2", Bytes::from_static(b"x"), None)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::PeerIncompatible(_)), "{err:?}");
-    assert!(err.to_string().contains("数据面版本 1"), "{err}");
-    // 读也被拒（即使既有对象理论上可由本地 3 槽 + 其余 peer 覆盖）
-    assert!(matches!(
-        s1.get_object("bkt", "k").await.unwrap_err(),
-        Error::PeerIncompatible(_)
-    ));
-    // list 的远端页错误会被并集吞掉 → 必须在入口 fail-closed
-    assert!(matches!(
-        s1.list_objects("bkt", &crate::store::ListRequest::default())
-            .await
-            .unwrap_err(),
-        Error::PeerIncompatible(_)
-    ));
-    // 恢复同版 → 行为回归（被拒的写没有留下对象；新写入/读回一致）
-    c.mesh.set_data_wire_version("n2", None);
-    assert!(matches!(
-        s1.head_object("bkt", "k2").await,
-        Err(Error::NoSuchKey(_))
-    ));
-    s1.put_object("bkt", "k3", Bytes::from_static(b"ok"), None)
+    let k2 = vec![7u8; 200 * 1024];
+    s1.put_object("bkt", "k2", Bytes::from(k2.clone()), None)
         .await
         .unwrap();
-    let (_, got) = s1.get_object("bkt", "k3").await.unwrap();
-    assert_eq!(&got[..], b"ok");
+    let (_, got) = s1.get_object("bkt", "k2").await.unwrap();
+    assert_eq!(got.to_vec(), k2);
+    assert_eq!(
+        s1.get_object_range("bkt", "k2", 0..32).await.unwrap().len(),
+        32
+    );
+    assert!(s1.head_object("bkt", "k").await.is_ok());
+    // 版本列表在混版窗口仍 fail-closed（不返回部分并集）
+    let vl = s1
+        .list_object_versions("bkt", "", 100, None, None)
+        .await
+        .unwrap();
+    assert!(vl.degraded);
+    assert!(matches!(
+        vl.require_complete(),
+        Err(Error::PeerIncompatible(_))
+    ));
+    // V1 marker 页带降级标记（legacy peer 收 inclusive marker）
+    let page = s1
+        .list_objects(
+            "bkt",
+            &crate::store::ListRequest {
+                max_keys: Some(1),
+                marker: Some("k".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.degraded_marker);
+
+    // 恢复同版 → 版本列表恢复完整、V1 页不再降级
+    c.mesh.set_data_wire_version("n2", None);
+    assert!(
+        !s1.list_object_versions("bkt", "", 100, None, None)
+            .await
+            .unwrap()
+            .degraded
+    );
+    let page = s1
+        .list_objects(
+            "bkt",
+            &crate::store::ListRequest {
+                max_keys: Some(1),
+                marker: Some("k".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!page.degraded_marker);
 }
 
 /// M4 切片 8 核心验收：2 set（**同 id 跨 set**——直接压 flat_of 组内序→扁平盘映射，洞 1）。

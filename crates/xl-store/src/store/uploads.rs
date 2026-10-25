@@ -191,13 +191,14 @@ impl Store {
     }
 
     /// 集群列举：本机页 ∪ 各节点页；远端不可达 warn 跳过（少一路并集）。
+    ///
+    /// DP-1 混版：legacy peer / 不可达 → `degraded`（S3 回 `x-oss-degraded: mpu-union`）；
+    /// 未知 wire / 拓扑不一致仍 fail-closed。
     async fn list_uploads_cluster(
         &self,
         bucket: &str,
         req: &UploadListRequest,
     ) -> Result<UploadListResult> {
-        // DP-0：远端页传输错会被「少一路并集」吞掉 → 混版下必须先 fail-closed。
-        self.ensure_data_plane_compatible().await?;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let self_id = cl.sets.flat.self_node().id.clone();
 
@@ -236,10 +237,23 @@ impl Store {
             uploads.insert((u.key.clone(), u.upload_id.clone()), u);
         }
         let mut cps = local_cps;
+        let local_caps = self.local_caps();
+        let mut degraded = false;
 
         for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
+            }
+            match cl.transport.peer_caps(&n.id).await {
+                Ok(caps) => {
+                    if crate::mesh_gate::check_peer(&n.id, &caps, &local_caps)?
+                        == crate::mesh_gate::PeerClass::Legacy
+                    {
+                        degraded = true;
+                    }
+                }
+                // 不可达：少一路并集，同样必须显式降级。
+                Err(_) => degraded = true,
             }
             let l = crate::mesh::ListUploadsLocal {
                 bucket: bucket.into(),
@@ -273,12 +287,15 @@ impl Store {
                     }
                 }
                 Err(e) => {
+                    degraded = true;
                     tracing::warn!(node = %n.id, error = %e, "远端 MPU 列举不可达（少一路并集）")
                 }
             }
         }
 
-        Ok(merge_uploads_page(max, uploads.into_values(), cps))
+        let mut result = merge_uploads_page(max, uploads.into_values(), cps);
+        result.degraded = degraded;
+        Ok(result)
     }
 }
 

@@ -465,6 +465,13 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
         ))
     }
     async fn health(&self, node: &str) -> Result<NodeHealth>;
+    /// DP-1：对端完整能力（线格式 + 拓扑指纹）。默认一次 Health 探测；生产实现
+    /// （[`crate::mesh_gate::GatedMesh`]）覆盖为带 TTL 的缓存版本。
+    async fn peer_caps(&self, node: &str) -> Result<crate::mesh_gate::PeerCaps> {
+        Ok(crate::mesh_gate::PeerCaps::from_health(
+            &self.health(node).await?,
+        ))
+    }
     /// DP-0：对端宣告的数据面线格式（缺失/0 → 1）。默认一次 Health 探测；生产实现
     /// （[`crate::mesh_gate::GatedMesh`]）覆盖为带 TTL 的缓存版本。
     async fn data_wire_version(&self, node: &str) -> Result<u32> {

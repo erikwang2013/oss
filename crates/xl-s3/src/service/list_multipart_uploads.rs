@@ -18,6 +18,16 @@ use crate::convert::to_s3_error;
 use super::list_v1::url_encode;
 use super::{OssS3, last_modified};
 
+/// `x-oss-degraded: mpu-union`：并集可能缺项（legacy peer / 不可达）时出现。
+fn mpu_union_degraded_headers(resp: &mut S3Response<ListMultipartUploadsOutput>, degraded: bool) {
+    if degraded {
+        resp.headers.insert(
+            "x-oss-degraded",
+            http::HeaderValue::from_static("mpu-union"),
+        );
+    }
+}
+
 pub(super) async fn list_multipart_uploads(
     s3: &OssS3,
     req: S3Request<ListMultipartUploadsInput>,
@@ -85,7 +95,7 @@ pub(super) async fn list_multipart_uploads(
         })
         .collect();
 
-    Ok(S3Response::new(ListMultipartUploadsOutput {
+    let mut resp = S3Response::new(ListMultipartUploadsOutput {
         bucket: Some(bucket),
         prefix: prefix.as_deref().map(enc),
         delimiter: delimiter.as_deref().map(enc),
@@ -107,5 +117,22 @@ pub(super) async fn list_multipart_uploads(
         ),
         encoding_type: encode.then(|| EncodingType::from_static(EncodingType::URL)),
         ..Default::default()
-    }))
+    });
+    mpu_union_degraded_headers(&mut resp, result.degraded);
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mpu_union_degraded_header_present_iff_degraded() {
+        let mut ok = S3Response::new(ListMultipartUploadsOutput::default());
+        mpu_union_degraded_headers(&mut ok, false);
+        assert!(ok.headers.get("x-oss-degraded").is_none());
+        let mut deg = S3Response::new(ListMultipartUploadsOutput::default());
+        mpu_union_degraded_headers(&mut deg, true);
+        assert_eq!(deg.headers.get("x-oss-degraded").unwrap(), "mpu-union");
+    }
 }

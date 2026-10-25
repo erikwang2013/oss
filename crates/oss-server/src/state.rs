@@ -352,17 +352,6 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            // DP-0：生产传输统一包数据面闸门（混版 RPC 在发出前 fail-closed；
-            // health/锁/控制面直通，保证诊断与鉴权不被连带阻断）。
-            let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
-                Arc::new(xl_store::mesh_gate::GatedMesh::new(Arc::new(
-                    xl_client::TonicMesh::new_with_tls_watch(
-                        &cl.node_id,
-                        &cl.secret,
-                        &pairs,
-                        tls.peer_tls().then(|| tls.tonic_client_watch()),
-                    )?,
-                )));
             // 放置开关：只认 None/"v1"/"v2"——未知值 fail-closed（静默降级为 v1 会让
             // 「以为开了 v2」的运维在 rebalance 里得到空跑报告）
             let placement_v2 = match cl.placement.as_deref() {
@@ -372,6 +361,25 @@ impl AppState {
                     return Err(format!("cluster.placement 非法值 «{other}»（只认 v1/v2）").into());
                 }
             };
+            // DP-0/DP-1：生产传输统一包数据面闸门（混版 RPC 在发出前按操作类判定；
+            // health/锁/控制面直通，保证诊断与鉴权不被连带阻断）。本机能力参与
+            // placement v2 的指纹一致性判定，必须与 Store::local_caps 同源。
+            let local = xl_store::mesh_gate::local_caps(
+                &sets,
+                &store_cfg.ec,
+                if placement_v2 { 2 } else { 1 },
+            );
+            let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
+                Arc::new(xl_store::mesh_gate::GatedMesh::with_local(
+                    Arc::new(xl_client::TonicMesh::new_with_tls_watch(
+                        &cl.node_id,
+                        &cl.secret,
+                        &pairs,
+                        tls.peer_tls().then(|| tls.tonic_client_watch()),
+                    )?),
+                    local,
+                    xl_store::mesh_gate::DEFAULT_TTL,
+                ));
             // M4 切片 8：多 set 注入 SetResolver（单 set 由 Store 侧短路——零新增查询）；
             // 扇出面 = 除本机外的去重节点并集（verifier 口径 b）
             let resolver: Option<Arc<dyn xl_store::mesh::SetResolver>> = (sets.sets.len() > 1)
@@ -429,18 +437,22 @@ impl AppState {
                 .iter()
                 .map(|n| (n.id.clone(), n.addr.clone()))
                 .collect();
-            // DP-0：同 cluster 分支——stretch 也是数据面 mesh，必须过混版闸门。
+            // DP-0/DP-1：同 cluster 分支——stretch 是 placement v2，必须过混版闸门；
+            // 本机能力参与指纹判定。
+            let local = xl_store::mesh_gate::local_caps(&sets, &store_cfg.ec, 2);
             let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
-                Arc::new(xl_store::mesh_gate::GatedMesh::new(Arc::new(
-                    xl_client::TonicMesh::new_with_timeouts_tls_watch(
+                Arc::new(xl_store::mesh_gate::GatedMesh::with_local(
+                    Arc::new(xl_client::TonicMesh::new_with_timeouts_tls_watch(
                         &st.node_id,
                         &st.mesh_secret,
                         &pairs,
                         std::time::Duration::from_secs(1),
                         std::time::Duration::from_millis(st.mesh_timeout_ms),
                         tls.peer_tls().then(|| tls.tonic_client_watch()),
-                    )?,
-                )));
+                    )?),
+                    local,
+                    xl_store::mesh_gate::DEFAULT_TTL,
+                ));
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
                 sets,
                 transport: mesh,
