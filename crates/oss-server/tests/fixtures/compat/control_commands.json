@@ -1,0 +1,151 @@
+{
+  "AccessKeyCreate": [
+    "access_key",
+    "created_at",
+    "kind",
+    "parent_ak",
+    "secret_key",
+    "session_policy",
+    "username"
+  ],
+  "AccessKeyDelete": [
+    "access_key"
+  ],
+  "AccessKeySetStatus": [
+    "access_key",
+    "status"
+  ],
+  "AccessPointDelete": [
+    "name"
+  ],
+  "AccessPointPut": [
+    "bucket",
+    "created_at",
+    "name",
+    "owner",
+    "policy_json",
+    "updated_at"
+  ],
+  "AccessPointSetPolicy": [
+    "name",
+    "policy_json",
+    "updated_at"
+  ],
+  "BucketClearDefaultEncryption": [
+    "bucket"
+  ],
+  "BucketClearLifecycle": [
+    "bucket"
+  ],
+  "BucketClearNotification": [
+    "bucket"
+  ],
+  "BucketClearReplication": [
+    "bucket"
+  ],
+  "BucketCreate": [
+    "created_at",
+    "default_encryption",
+    "name",
+    "object_lock",
+    "object_lock_default_days",
+    "object_lock_default_mode",
+    "owner",
+    "replication_mode",
+    "versioning"
+  ],
+  "BucketDelete": [
+    "name"
+  ],
+  "BucketDeletePolicy": [
+    "bucket"
+  ],
+  "BucketSetDefaultEncryption": [
+    "algorithm",
+    "bucket"
+  ],
+  "BucketSetDeleting": [
+    "deleting",
+    "name"
+  ],
+  "BucketSetLifecycle": [
+    "bucket",
+    "rules",
+    "updated_at"
+  ],
+  "BucketSetLifecycleV2": [
+    "bucket",
+    "rules",
+    "updated_at"
+  ],
+  "BucketSetNotification": [
+    "bucket",
+    "config_json",
+    "updated_at"
+  ],
+  "BucketSetObjectLock": [
+    "default_days",
+    "default_mode",
+    "enabled",
+    "name"
+  ],
+  "BucketSetPolicy": [
+    "bucket",
+    "policy_json",
+    "updated_at"
+  ],
+  "BucketSetReplication": [
+    "bucket",
+    "rules_json",
+    "updated_at"
+  ],
+  "BucketSetVersioning": [
+    "name",
+    "versioning"
+  ],
+  "InventoryDelete": [
+    "bucket",
+    "id"
+  ],
+  "InventoryPut": [
+    "bucket",
+    "config_json",
+    "id",
+    "owner",
+    "updated_at"
+  ],
+  "OlapDelete": [
+    "access_point"
+  ],
+  "OlapPut": [
+    "access_point",
+    "endpoint",
+    "kind",
+    "max_response_bytes",
+    "module",
+    "module_sha256",
+    "timeout_ms",
+    "updated_at"
+  ],
+  "UserCreate": [
+    "created_at",
+    "password_hash",
+    "status",
+    "username"
+  ],
+  "UserDelete": [
+    "username"
+  ],
+  "UserSetPassword": [
+    "password_hash",
+    "username"
+  ],
+  "UserSetPermissions": [
+    "permissions",
+    "username"
+  ],
+  "UserSetStatus": [
+    "status",
+    "username"
+  ]
+}
