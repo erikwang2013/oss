@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.18.0（2026-10-25）。**
+**最新发布：v1.19.0（2026-10-26）。** 本版是 Wave1 地基版：DP-1 数据面混版门控、Raft 能力级别 1..3 与 OSSCTL3、租户 schema/回填、M8 运行态快照、`maintenance` 收容模式与 `cluster-shrink plan` 只读规划。均为可验证的地基/预览：缩容 apply、Raft 租户账户 API、M8 多节点运行时与 Level C 生产 Ext 命令仍未交付，边界见下文。
 
 - **五个 crate 单向依赖 `oss-server → xl-s3 / xl-client → xl-store`（`xl-client → xl-proto`）**：
   `xl-store` 是不依赖任何框架的存储内核（提交协议与 `xl.meta` 格式按最终设计落盘）；`xl-s3` 把
@@ -212,7 +212,7 @@ cd web && npm install && npm run dev
 
 ## 运维命令
 
-`oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub|rebalance [--dry-run|--apply]]`（无参数 = `serve`）。运维命令读当前目录的
+`oss-server [serve|groups|build|clean <days>|fsck [--repair]|heal|scrub|rebalance [--dry-run|--apply]|cluster-shrink plan --to <target.toml> [--json]]`（无参数 = `serve`）。运维命令读当前目录的
 `oss.toml`，并走与服务端相同的启动自举（建目录/连库/开存储；管理员与桶的引导是幂等的）：
 
 ```bash
@@ -237,6 +237,11 @@ oss-server scrub         # 全量深度巡检（只读）：每个 EC 版本逐�
 oss-server rebalance     # 扩容搬迁（默认 dry-run）：存量对象迁到展开放置（placement=v2；
                          #   未开则空跑）；逐对象 copy→锁内翻转→清老片，幂等可重跑；
                          #   报告 `<时间戳>-rebalance[-dry].json`（操作序见「扩容」节）
+oss-server cluster-shrink plan --to <target.toml> [--json]
+                         # 缩容只读校验（全节点 maintenance）：逐 set 槽数/parity/容量/
+                         #   epoch+hash/退役节点 MPU 全通过才出计划；报告
+                         #   `.oss.sys/shrink/<old>-<new>-plan.json`。
+                         #   apply/verify/commit/rollback 未交付（见「缩容规划」节）
 ```
 
 分工：`fsck` = 整片 CRC32C 快检（轻）；`scrub` = 块级深度验证（慢、可定位坏片）。
@@ -348,6 +353,16 @@ drive_count = 3
 启动：各节点在自己的目录放好 `oss.toml`（`data_dirs` 三条 = drive_count 3）后 `oss-server serve`；
 顺序无所谓（滚动启动探活只告警；可达对端 node_id 与配置不符会拒启，防错接线）。
 
+**显式槽位拓扑（v1.19.0，shrink 前置）**：`[cluster]` 可选 `epoch` 与 `[[cluster.slots]]`
+（`{set?, node, drive}`；slot 序号 = 该 set 内的文件顺序，`set` 缺省 0）。`epoch = 0`
+即位置式拓扑；声明后必须从 0 连续、与 `[[cluster.nodes]]` 的 node 顺序/drive_count
+一致，且不能与位置式混用。显式槽位参与拓扑哈希，节点经 NodeHealth 宣告
+`topo_epoch`/`topo_hash`，供混版门控与 shrink 校验。
+
+**收容模式（v1.19.0 预览）**：顶层 `maintenance = true` 时，HTTP 非 GET/HEAD/OPTIONS
+一律 503 XML `ServiceUnavailable` + `Retry-After: 60`，后台 worker 与恢复暂停；与
+`[raft]` 互斥（会阻断 Raft RPC，配置校验拒启）。只用于缩容/维护窗口。
+
 **临界口径（4 节点 × 3 盘 = 12 槽，EC 8+4）**：
 - 停 1 节点（剩 9 槽 = 恰好 Q_s）：**写零余量**（9 片全须成功，客户端重试收敛）、读 9≥8 有余；
   本配置**单节点故障即临界**——要余量用 6×2（12 槽，停 1 余 1）。
@@ -376,6 +391,12 @@ sync 面 `oss_sync_acked_total`、`oss_sync_failed_total`、`oss_sync_write_inte
 stretch 面 `oss_stretch_slots_ok`（未配置 `[stretch]` 时为 0）。控制台「集群」页（管理员菜单：模式 / 槽位 / quorum 未达计数 +
 节点表 + 拓扑指纹，15s 自刷新；单机显示单机模式提示）与 `GET /api/v1/cluster/status`（admin；单机优雅降级 `mode:"single"`）同源。
 
+**节点健康（v1.19.0）**：mesh `NodeHealth` 增 `data_wire_version`、`topo_epoch`、
+`topo_hash`、`drives`（每盘 set/drive/free_bytes）与 `maintenance`；
+`GET /health/cluster` 增 `data_wire_version`/`data_plane_compatible`/`degraded_peers`/
+`incompatible_peers`，每节点带 `data_wire_version`（不可达为 null），可用于判断混版
+窗口与降级状态。
+
 ```yaml
 scrape_configs:
   - job_name: oss
@@ -397,11 +418,15 @@ scrape_configs:
   走 TLS（见 TLS 节）。traceparent 轻量传播（`RUST_LOG=debug` 下可按同一 trace id 在双节点
   日志抽样；完整 OTLP 归 M4）。
 - 命名勿混淆：oss-server 的 aetherupload `staging_dir` ≠ 存储内核的 `.oss.sys/tmp`。
-- **升级**：M9 Raft 控制面支持 Level B 滚动（基线 v1.13.1；步骤见「cutover / force recovery
-  runbook」第 6 条），先 follower/learner、最后 leader，`feature_level` 默认 1。
-  **M3/M4 数据面（分片 RPC/EC/放置）仍不支持滚动**：新旧混跑的写会安全失败（新协调者→旧节点
-  被旧端 CRC 门拒收），跨界读按缺失降级；数据面升级须停写后整栈更换。TLS 物料与从
-  < v1.13.1 跨版本也不在 Level B 范围内。
+- **升级（v1.19.0 / DP-1）**：M9 Raft 控制面支持 Level B 滚动（基线 v1.13.1；步骤见
+  「cutover / force recovery runbook」第 6 条），先 follower/learner、最后 leader，
+  `feature_level` 默认 1。数据面新增**混版门控**：节点经 NodeHealth 宣告
+  `data_wire_version`/`topo_epoch`/`topo_hash`，placement v2 只向同 epoch/hash 的 wire-2
+  对端写入，不兼容对端 fail-closed（不静默降级到 v1）。混版窗口内：ListObjects V1
+  跨旧对端返回 `x-oss-degraded: list-marker`（边界 key 可能重复，marker 前进）；
+  ListObjectVersions 对旧对端 fail-closed；ListMultipartUploads 并集可能缺项并带
+  `x-oss-degraded: mpu-union`；MPU 转发门控拒绝旧属主。**仍不承诺**数据面真实二进制
+  滚动 e2e 与 TLS 物料热轮换，生产升级仍需维护窗口。
 - **EC 区间读语义**（M4 切片 2）：Range 读不再做整片 CRC32C / 对象级 SHA256（改逐块 12×W 对偶校验，坏片可定位自愈）；
   **范围外的损坏不再触发读时修**（整读仍会），批量修复归 `heal`（M4 切片 4）。
 
@@ -431,10 +456,32 @@ scrape_configs:
 
 **单机多盘**：超过 12 盘时自动 v2（无需配置）；旧对象用 `rebalance` 搬迁。
 
-**边界**：不支持缩容（删节点/盘）；**配置回退也不可行**（旧槽位引用 fail-closed 500），只能前滚；
+**边界**：缩容（删节点/盘）仅有**只读规划**（v1.19.0：`maintenance=true` + 显式 slot 目标
+拓扑 + `cluster-shrink plan`；apply/verify/commit/rollback 与 4→3 e2e 未交付）；**配置回退也不可行**
+（旧槽位引用 fail-closed 500），只能前滚；
 同刻只跑一个 rebalance；`rebalance` 与 `fsck`/`heal` **不得并跑**——fsck 的 stray 扫描会把搬迁中
 「已 copy 未 flip」的半成品新片当作残骸删除（对象级自愈可重跑，但白搬一轮）；搬迁残窗与老片清理
 兜底归 `fsck`（stray 分片扫描，跑在 rebalance 停后）。
+
+## 缩容规划（shrink，v1.19.0 预览）
+
+只读规划，不搬数据、不改拓扑：
+
+```bash
+# 目标配置：maintenance = true；[cluster].epoch = 旧 epoch + 1；
+# [[cluster.slots]] 显式列出保留槽位（每 set 槽数少于当前）。
+oss-server cluster-shrink plan --to shrink.toml --json
+```
+
+`plan` 的 fail-closed 校验：全节点 `maintenance=true` 且可达、同 `topo_epoch`/`topo_hash`；
+目标 slot map 的 set 数/slot 数与节点顺序/drive_count 不变、每节点保留槽位 ≤ parity；
+退役节点无未完成 MPU；目标空闲容量 ≥ 待搬字节；`.oss.sys/shrink/active.lock` 互斥。通过后
+写 `.oss.sys/shrink/<old>-<new>-plan.json`（每 set 槽数、搬迁数、退役节点、对象/版本数、
+容量与告警）。告警不阻断：最少 set 槽数 − 单节点最多槽位 < data+1（停一节点后写余量不足）、
+目标盘可用 < 2× 复制量。
+
+**未交付**：`apply`/`verify`/`commit`/`rollback`、`.oss.sys/topo` v4 与 4→3 真实 e2e；
+当前不得把 shrink 当作可执行缩容。
 
 ## 版本控制（M4）
 
@@ -1233,14 +1280,17 @@ aws --endpoint-url $E s3api delete-bucket-lifecycle --bucket b
    CSV 不做公式转义。
 9. RestoreObject 的 202 由 router 层中间件补写（s3s 0.17 生成代码丢弃
    `S3Response.status`）；识别口径为 POST + `restore` 查询子资源。
+10. v1.19.0 增 `m8.runstate` OSSCTL3 扩展：九张运行时表可随快照导出/安装并做语义校验，
+    但 schedule lease、命令生产者、worker takeover 与多节点运行时（Tasks 5–13）未交付；
+    控制面仍是单节点单进程。
 
 ## M9 强一致
 
 `crates/oss-server/src/raft/mod.rs` 的
 `RAFT_READY=true`、`SYNC_READY=true`、`STRETCH_READY=true` 决定运行时门控（能力位还要求
 对应配置存在）。`GET /api/v1/raft/status` 报真实状态（`enabled/node_id/role/leader/term/
-applied/lag/stale/snapshot/purged/voters/learners/production_ready`，以及 Level B 的
-`wire_version` / `feature_level` / `activation_level` / `effective_feature_level` 与
+applied/lag/stale/snapshot/purged/voters/learners/production_ready`，以及
+`wire_version` / `feature_level`（1..=3） / `activation_level` / `effective_feature_level` 与
 `compat.{min_wire_version,min_membership_wire_version,peers,mixed,blocked_reason}`；`voters<3`
 时 `production_ready=false`）。`lag` = `last_log_index - last_applied.index`，即本机已追加、
 尚未 apply 的日志条数（无值按 0；**不是**与 leader 的差距，未收到的日志不计）；
@@ -1300,7 +1350,7 @@ token = "<32–128 位十六进制>"
 node_id = 1
 role = "voter"
 bootstrap = true
-feature_level = 1                      # Level B 滚动升级；缺省 1，范围 1..=2（见 runbook）
+feature_level = 1                      # Level B 滚动升级；缺省 1，范围 1..=3（见 runbook）
 advertise_endpoint = "http://a:9000"   # 主 HTTP；不是 mesh 端口
 cluster_token = "<共享集群令牌>"
 db_path = "/var/lib/oss/raft.db"       # Raft 运行时要求显式路径；当前配置加载未强制（RaftToml.db_path 可选）
@@ -1433,6 +1483,47 @@ db_path = "/var/lib/oss/raft.db"
 - **单盘故障**：EC 8+4 可在站点内重建，但 `Q_s=9` 仍要求至少 9 槽可达；站点恢复后用
   `fsck --repair`/`heal` 通过 mesh 修复缺失分片。
 
+### 能力级别 1..3 与 OSSCTL3（v1.19.0 地基）
+
+`[raft].feature_level` 范围 1..=3（缺省 1）。级别只升不降，激活写入
+`schema_meta.raft_feature_level`；启动时 marker 高于配置或二进制上限直接拒绝。
+
+| 级别 | 快照格式 | 可承载内容 | 状态 |
+|---|---|---|---|
+| 1 | OSSCTL1 | 既有 11 张控制表 | 可用 |
+| 2 | OSSCTL2 | 结构化生命周期 `config_json` | 可用 |
+| 3 | OSSCTL3 | 账户/成员、`m8.runstate` 扩展、`ControlCommand::Ext` | 地基/预览 |
+
+OSSCTL3 = OSSCTL2 + `extensions`（名称 `[a-z0-9._-]{1,64}`，最多 64 个，解码总量 ≤64 MiB）。
+`required_feature_level` 由数据决定：账户行或非空扩展 → 3，`config_json` → 2，否则 1；
+低级别安装拒绝高一级数据。`ControlCommand::Ext` 用 `type_id` + payload，leader 在 append
+前拒绝未注册/空/拼错的 type_id；**生产 registry 为空**，当前没有可用的产品级 Ext 命令；
+命令上限沿用 24 MiB，apply 失败即 fail-stop。OSSCTL3/level 3 环境不能回退到 v1.18
+及更早版本。
+
+### 租户基础（tenancy，v1.19.0 预览）
+
+迁移 0005/0006 引入 `accounts`/`account_members`/`account_usage` 与规范标记
+`schema_meta.accounts_canonical_v1`；OSSCTL3 `ControlData` 增 `accounts`/`account_members`
+（非空才序列化）。安装侧：feature<3 拒绝账户行；带规范标记的库拒绝 level-2 安装（不能借
+降级清标记）；export/cutover/force-recover 校验来源。快照读以 canonical marker 为门：
+标记缺失时账户行不进入快照（避免节点本地派生行被导出后在别处产生分叉）。
+
+非 Raft（standalone）启动自动执行回填 v1 与 v2（v2 把全局 admin 移出成员表并清掉其
+无成员派生账户，桶归 system account），marker 幂等。**未交付**：Raft 账户命令、canonicalization worker、Tasks 4–12 的账户
+API/配额/控制台；`[raft]` 下租户只有读/地基能力，不能管理账户。v1.18 的 standalone 账户
+MVP（`accounts_api.rs`，Raft 下 503）保持原状。
+
+### M8 运行态快照（runstate，v1.19.0 预览）
+
+九张运行时表（jobs/job_tasks/inventory_runs/inventory_cursors/inventory_incremental/
+tier_restores/lifecycle_cursors/schedule_lease/runstate_meta）以 `m8.runstate` OSSCTL3
+扩展导出/安装（base64 JSON envelope，≤64 MiB，拒绝未知字段）。安装前语义校验（next id
+大于 max id、非空表需 seeded、无悬空 parent_job_id/job_task/inventory_run/tier_restore
+引用），并在单 savepoint 内删旧插新；含该扩展的快照要求 feature 3。**未交付**：schedule
+lease、命令生产者、worker takeover 与多节点运行时（Tasks 5–13）；当前仍是单节点单进程
+语义，runstate 只保证导出/安装一致。
+
 ### cutover / force recovery runbook
 
 硬约束：**禁止手改旧 `raft.db`**，新集群绝不写旧 epoch。
@@ -1469,7 +1560,7 @@ db_path = "/var/lib/oss/raft.db"
    加 learner 追平后替换；**B 永久丢失且有 sync 桶** → A+C 仍 quorum 2，复用旧 B 的 site
    UUID/token、新 Raft node_id 部署 B'，`sync-reconcile --repair` 完成前不得标可服务
    （有 sync 桶时 `DELETE /sites` 应 409）；**A+B 同时丢失** → 按上述 force recovery。
-6. **升级顺序（M9 控制面 Level B 滚动；数据面仍非滚动）**：Raft RPC 携带并校验
+6. **升级顺序（M9 控制面 Level B 滚动 + Level C 地基；数据面混版门控）**：Raft RPC 携带并校验
    `x-oss-raft-target-node-id`（防止旧 endpoint 上的新 node_id 误答旧成员请求），
    v1.13.1 起为滚动基线；本版本新增 `x-oss-raft-wire-version` /
    `x-oss-raft-feature-level` 握手（缺失/非法 = 1）。步骤如下：
@@ -1490,21 +1581,30 @@ db_path = "/var/lib/oss/raft.db"
      `{"error":"feature_unavailable","required":2,"effective":1}`）；旧列可表达的规则
      仍走 V1、行为不变。首条结构化规则写入即激活 `schema_meta.raft_feature_level=2`
      （不归点同下）。
-   - **OSSCTL2 快照与切档**：快照编码器按数据/激活级别选择格式；含
+   - **级别 3 / OSSCTL3（v1.19.0 地基）**：`MAX_FEATURE_LEVEL=3`。全部 voter/learner 升级到
+     支持 OSSCTL3 的二进制后，可把 `[raft].feature_level=3` 逐台写入并重启；level-3 数据
+     （账户/成员、`m8.runstate` 扩展、`ControlCommand::Ext`）在 effective<3 时 append/安装
+     前拒绝。生产 Ext registry 为空——level 3 只代表“能解码 Ext 容器”，**没有可用的产品级
+     Ext 命令**。首条 level-3 数据/命令写入即激活 marker=3；OSSCTL3 环境不能回退到 v1.18
+     及更早版本。
+   - **OSSCTL1/2/3 快照与切档**：快照编码器按数据/激活级别选择格式；含
      `lifecycle_rules.config_json` 或已激活 level 2 时写 OSSCTL2（magic + SHA-256 +
-     feature_level + 数据），否则保持 OSSCTL1。新旧二进制**双读** OSSCTL1/2；旧读者对
-     OSSCTL2 明确拒绝（不静默丢行）。`raft-cutover`（含 dry-run）、`raft-force-recover`、
-     store snapshot install 均接受 OSSCTL2 并在同一事务单调提升
-     `schema_meta.raft_feature_level`。**规则**：全部 voter/learner 升级到支持 OSSCTL2 的
-     二进制后再激活 level 2；OSSCTL2 环境不能回退到只认 OSSCTL1 的 v1.15 及更早版本。
+     feature_level + 数据）；含账户行、非空 `extensions`（如 `m8.runstate`）或已激活
+     level 3 时写 OSSCTL3（OSSCTL2 + 不透明扩展区）。新旧二进制双读低级别格式；旧读者对
+     更高级别明确拒绝（不静默丢行）。`raft-cutover`（含 dry-run）、`raft-force-recover`、
+     store snapshot install 均按数据要求在同一事务单调提升
+     `schema_meta.raft_feature_level`。**规则**：全部 voter/learner 升级到对应级别的二进制
+     后再激活；OSSCTL2/3 环境不能回退到只认旧格式的版本。
    - **窗口内禁止成员变更**：新 leader 在 add/promote/replace 前预检——现有 voter/learner
      任一 `wire<2`、目标未达标或不可达 → 409 `peer_incompatible`；不可达的旧节点只能被
      移除/替换。console 配对（`/sites`、`/join`）同样要求对端 identity 带 wire 2 且
      feature 不低于本机（旧节点缺省 = 1 → 409）。
-   - **不在 Level B 范围内**：M3/M4 数据面（分片 RPC/EC/放置）、TLS 物料、从 < v1.13.1
-     跨大版本、Level C 双向混合写。LC-0 已为 export/cutover/force-recover 增加
-     snapshot_format/wire_version/feature_level 来源校验（缺 provenance 的旧导出按未验证
-     接受并警告；显式字段严格拒绝），但完整 Level C 仍需兼容补丁线与双读写窗口。
+   - **不在本次交付范围**：M3/M4 数据面真实二进制滚动 e2e、TLS 物料热轮换、从 < v1.13.1
+     跨大版本；shrink `apply`/`verify`/`commit`/`rollback`、Raft 租户账户命令/API 与
+     canonicalization worker、M8 多节点运行时（Tasks 5–13）、Level C 产品级 Ext 命令。
+     DP-1 已提供混版门控与降级头（见 M3 边界），LC-0 保留 export/cutover/force-recover
+     的 snapshot_format/wire_version/feature_level 来源校验（缺 provenance 的旧导出按未验证
+     接受并警告；显式字段严格拒绝），但完整 Level C 双向混合写仍需后续补丁线。
    - 全流程演练：`tests/e2e_m9_rolling.sh`（需 `OSS_OLD_BIN` = v1.13.1；未提供时 SKIP）。
 
 ### 部署与安全边界
