@@ -292,6 +292,8 @@ const SCHEMA_M9: &str = include_str!("../migrations/0004_m9.sql");
 const SCHEMA_ACCOUNTS: &str = include_str!("../migrations/0005_accounts.sql");
 /// AC-2：账户用量表。每次启动重放（IF NOT EXISTS）。
 const SCHEMA_TENANCY: &str = include_str!("../migrations/0006_tenancy.sql");
+/// M8 多节点：调度租约 + 运行态序列。每次启动重放（IF NOT EXISTS）。
+const SCHEMA_RUNSTATE: &str = include_str!("../migrations/0007_m8_runstate.sql");
 
 /// 账户表已规范化（v2 回填/重写完成）。standalone 启动时写；Raft 模式由后续
 /// canonicalization worker 在 level-3 写，快照读取以本 marker 为门。
@@ -372,6 +374,7 @@ impl Db {
         // AC-0：账户表 + 存量用户回填（marker 幂等）。
         sqlx::raw_sql(SCHEMA_ACCOUNTS).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_TENANCY).execute(&db.pool).await?;
+        sqlx::raw_sql(SCHEMA_RUNSTATE).execute(&db.pool).await?;
         db.ensure_columns_tenancy().await?;
         // M8-1：运行态表 fencing 列依赖 0003 已建表，故放在 M8/M9 重放之后。
         db.ensure_fence_columns().await?;
