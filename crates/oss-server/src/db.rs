@@ -2462,7 +2462,8 @@ impl Db {
         Ok(row.map(|r| r.get("role")))
     }
 
-    /// 把用户挂到账户（已有成员行则迁入并改角色）。账户/用户不存在 → false。
+    /// 把用户挂到账户（已有成员行则迁入并改角色）。账户/用户不存在 → false；
+    /// 全局管理员不是任何账户的成员（AC-2 不变量），恒拒绝 → false。
     /// 账户 admin_uid 为空且角色为 admin 时顺带补上。
     pub async fn attach_account_member(
         &self,
@@ -2471,10 +2472,11 @@ impl Db {
         role: &str,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let user: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
-            .bind(uid)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let user: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM users WHERE id = ? AND is_admin = 0")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?;
         if user.is_none() {
             return Ok(false);
         }
@@ -2826,6 +2828,51 @@ mod tests {
         assert!(!db.backfill_accounts_v2().await.unwrap(), "marker 幂等");
     }
 
+    /// Task 1：管理员派生账户若仍有非管理员成员，v2 必须保留账户与该成员
+    /// （`NOT IN` 子句守住 0005 的 ON DELETE CASCADE）。
+    #[tokio::test]
+    async fn backfill_v2_keeps_admin_derived_account_with_members() {
+        let db = db().await;
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let bob = db.create_user("bob", "pw", false).await.unwrap();
+        let admin_acct = xl_s3::access::account_id_of(admin).unwrap();
+        // 造旧库 v1 状态：管理员也有派生账户 + 成员行。
+        sqlx::query("DELETE FROM schema_meta WHERE key = 'accounts_backfill_v1' OR key = ?")
+            .bind(META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.backfill_accounts().await.unwrap());
+        // 把 bob 挪进管理员派生账户（模拟旧库手工共享）。
+        sqlx::query("UPDATE account_members SET account_id = ?, role = 'member' WHERE uid = ?")
+            .bind(&admin_acct)
+            .bind(bob)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(db.backfill_accounts_v2().await.unwrap());
+        assert!(
+            db.get_account(&admin_acct).await.unwrap().is_some(),
+            "仍有成员的账户不得删除"
+        );
+        assert_eq!(
+            db.member_role(&admin_acct, bob).await.unwrap().as_deref(),
+            Some("member"),
+            "非管理员成员不得随管理员成员行级联删除"
+        );
+        assert_eq!(
+            db.account_id_of_user(bob).await.unwrap(),
+            Some(admin_acct.clone())
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE uid = ?")
+            .bind(admin)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "管理员自身仍须移出成员表");
+    }
+
     /// Task 1：v2 不动非管理员的派生账户与 ARN；新管理员不再产生 accounts/account_members 行。
     #[tokio::test]
     async fn backfill_v2_preserves_derived_arns_and_admin_create_user_rows() {
@@ -2949,13 +2996,34 @@ mod tests {
         assert!(db.set_account_status(&sub_acct, "active").await.unwrap());
         assert_eq!(db.verify_user("sub", "pw").await.unwrap(), Some(sub));
 
-        let admin_acct = db.account_id_of_user(admin).await.unwrap().unwrap();
+        // 防锁死守卫（防御性测试）：正常路径拒绝把全局管理员挂进账户，这里直接构造旧库
+        // 残留状态「管理员是某账户的在册成员」，确认条件更新仍拒绝停用。
+        let acct = db.create_account("legacy-admin", None).await.unwrap();
         assert!(
-            !db.set_account_status(&admin_acct, "disabled")
+            !db.attach_account_member(&acct, admin, "member")
                 .await
                 .unwrap(),
+            "全局管理员不能作为账户成员"
+        );
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, 'owner', 0)",
+        )
+        .bind(&acct)
+        .bind(admin)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            !db.set_account_status(&acct, "disabled").await.unwrap(),
             "含在册全局管理员的账户不能停用"
         );
+        // 移除残留成员行后即可停用：守卫确实是唯一阻断点。
+        sqlx::query("DELETE FROM account_members WHERE account_id = ?")
+            .bind(&acct)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.set_account_status(&acct, "disabled").await.unwrap());
     }
 
     /// AC-0：迁移用户到新账户后，派生 ARN 不再命中、新账户 ARN 命中；账户删除受成员/桶守卫。
