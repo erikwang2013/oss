@@ -41,7 +41,7 @@ pub use tier::ArchiveSpec;
 pub use version::{DeleteMarkerSpec, DeleteOutcome, TierRef, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
-pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec};
+pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec, SlotMap, SlotTarget};
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
@@ -1790,6 +1790,8 @@ mod tests_mpu_mesh;
 mod tests_parts;
 #[cfg(test)]
 mod tests_replication;
+#[cfg(test)]
+mod tests_shrink;
 #[cfg(test)]
 mod tests_sync;
 #[cfg(test)]

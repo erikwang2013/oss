@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sha2::Digest as _;
+
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::mesh::MeshTransport;
@@ -62,6 +64,40 @@ pub struct NodeSpec {
     pub drive_count: u16,
 }
 
+/// 显式槽位目标（拓扑 v3）：槽号 → (节点, 该节点的物理盘序)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotTarget {
+    pub node: String,
+    pub drive: u16,
+}
+
+/// 显式槽位表（拓扑 v3）：epoch + 逐槽目标。**下标即槽号**（`ShardRef.drive`），
+/// 与节点/盘的物理布局解耦——shrink 只换本表，槽数不变 ⇒ `place()` 与全部 meta 不动。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotMap {
+    pub epoch: u64,
+    pub slots: Vec<SlotTarget>,
+}
+
+impl SlotMap {
+    /// 指纹 = sha256(epoch, 槽序 (node, drive)) 前 16 hex；同配置在任何节点上同值。
+    pub fn hash(&self) -> String {
+        let mut h = sha2::Sha256::new();
+        h.update(self.epoch.to_be_bytes());
+        for t in &self.slots {
+            hash_target(&mut h, &t.node, t.drive);
+        }
+        hex::encode(&h.finalize()[..8])
+    }
+}
+
+/// 长度前缀 + node + BE drive：node id 不含空白（build 校验），长度前缀再排除序列歧义。
+fn hash_target(h: &mut sha2::Sha256, node: &str, drive: u16) {
+    h.update((node.len() as u32).to_be_bytes());
+    h.update(node.as_bytes());
+    h.update(drive.to_be_bytes());
+}
+
 /// 全局槽位表：按配置顺序拼接各节点的盘，`slot = 前序节点盘数之和 + 本地盘序`。
 /// **单节点（未配 cluster）不构造本表**——Store 走「槽位 = 本机盘下标」的退化路径，
 /// 与 M2b 逐字节一致（`ShardRef.drive` 语义升级不动 xl.meta 格式）。
@@ -72,23 +108,32 @@ pub struct ClusterTopology {
     /// bases[i] = 节点 i 的首个全局槽位（升序；node_of_slot 二分用）
     bases: Vec<u16>,
     slot_count: u16,
+    /// None = positional（v1/v2 语义，槽号 = 物理盘序）；Some = 拓扑 v3 显式槽表
+    slot_map: Option<SlotMap>,
 }
 
 impl ClusterTopology {
     /// `ec` 提供 data+parity：槽位数不足 `data+parity` 的集群连 EC 8+4 都摆不下（oss.toml 同口径）。
     pub fn new(self_idx: usize, nodes: Vec<NodeSpec>, ec: &super::ec::EcConfig) -> Result<Self> {
-        Self::build(self_idx, nodes, ec, true)
+        Self::build(self_idx, nodes, ec, true, true, None)
     }
 
     /// `check_per_node_parity`：多节点拓扑须逐节点 `drive_count ≤ parity`（防丢节点不可重建）；
     /// **单节点拓扑豁免**（slice 5 规则把合法单节点集群一刀切拒了——xl-client 往返测试自切片 5
     /// 起静默红：单节点丢节点 = 全丢，与单机多盘同语义，无「节点级」可保护项）；
-    /// flat 命名空间拓扑（不承载放置）同样不适用。build 为唯一入口（new/flat 共用）。
+    /// flat 命名空间拓扑（不承载放置）同样不适用。build 为唯一入口（new/flat/显式槽表共用）。
+    ///
+    /// `slot_map`：None = positional（槽数 = Σ drive_count，槽号 = 物理盘序）；Some = 显式槽表
+    /// （槽数 = `slots.len()`，可少于物理盘数——shrink 保留节点的盘比旧槽数少正是此形态）。
+    /// `check_min`：显式槽表下 `flat`（命名空间面，按物理盘计、不承载放置）的盘数可少于
+    /// data+parity，故 flat 构造传 false；放置面（set/stretch）恒 true。
     fn build(
         self_idx: usize,
         nodes: Vec<NodeSpec>,
         ec: &super::ec::EcConfig,
         check_per_node_parity: bool,
+        check_min: bool,
+        slot_map: Option<SlotMap>,
     ) -> Result<Self> {
         if nodes.is_empty() {
             return Err(Error::Encode("集群节点列表为空".into()));
@@ -96,10 +141,14 @@ impl ClusterTopology {
         // M4 切片 5 校验：槽位总数 ≤ 255（`ShardRef.drive: u8` 的硬约束——超了会静默截断）；
         // node id 禁空白（拓扑记录 `node=X` 的解析边界）；drive_count ≤ parity（放置 v2 下
         // 保证「单节点丢失 ≤ parity 片」——>4 盘/节点时单节点可承载 5+ 片，丢节点即不可重建）
-        let total_slots: u32 = nodes.iter().map(|n| n.drive_count as u32).sum();
-        if total_slots > 255 {
+        let total_drives: u32 = nodes.iter().map(|n| n.drive_count as u32).sum();
+        let slot_total = slot_map
+            .as_ref()
+            .map(|m| m.slots.len() as u32)
+            .unwrap_or(total_drives);
+        if slot_total > 255 {
             return Err(Error::Encode(format!(
-                "槽位总数 {total_slots} 超过 255（ShardRef.drive 为 u8）"
+                "槽位总数 {slot_total} 超过 255（ShardRef.drive 为 u8）"
             )));
         }
         for n in &nodes {
@@ -141,18 +190,49 @@ impl ClusterTopology {
                 .ok_or_else(|| Error::Encode("槽位数溢出 u16".into()))?;
         }
         let min = ec.data as u16 + ec.parity as u16;
-        // （total>255 已在前段 u32 求和处校验；此处只需 checked_add 的溢出下不变量）
-        if total < min {
+        // （slot_total>255 已在前段校验；此处只查 ≥ data+parity——显式槽表下物理盘数可更少）
+        if check_min && slot_total < min as u32 {
             return Err(Error::Encode(format!(
-                "槽位数 {total} 不足 EC {}+{}（集群须 ≥ {min}）",
+                "槽位数 {slot_total} 不足 EC {}+{}（集群须 ≥ {min}）",
                 ec.data, ec.parity
             )));
+        }
+        // 显式槽表逐槽校验（positional 的等价约束已在 drive_count ≤ parity / 每盘一槽处完成）
+        if let Some(m) = &slot_map {
+            let mut per_node = vec![0u16; nodes.len()];
+            for (slot, t) in m.slots.iter().enumerate() {
+                let ni = nodes.iter().position(|n| n.id == t.node).ok_or_else(|| {
+                    Error::Encode(format!(
+                        "槽 {slot} 指向未知节点 «{}»（不在该 set 的节点表内）",
+                        t.node
+                    ))
+                })?;
+                if t.drive >= nodes[ni].drive_count {
+                    return Err(Error::Encode(format!(
+                        "槽 {slot} 的盘 {} 越界（节点 «{}» 仅 {} 盘）",
+                        t.drive, t.node, nodes[ni].drive_count
+                    )));
+                }
+                per_node[ni] += 1;
+            }
+            // 多节点：单节点槽数 ≤ parity，否则丢该节点即不可重建（单节点集群豁免）
+            if nodes.len() > 1 {
+                for (i, &c) in per_node.iter().enumerate() {
+                    if c > ec.parity as u16 {
+                        return Err(Error::Encode(format!(
+                            "节点 «{}» 承载 {c} 槽超过 parity {}（多节点集群里单节点槽数须 ≤ parity，丢节点才可重建）",
+                            nodes[i].id, ec.parity
+                        )));
+                    }
+                }
+            }
         }
         Ok(Self {
             self_idx,
             nodes,
             bases,
-            slot_count: total,
+            slot_count: slot_total as u16,
+            slot_map,
         })
     }
 
@@ -160,9 +240,22 @@ impl ClusterTopology {
         self.slot_count
     }
 
-    /// 槽位 → 节点下标（bases 升序 + partition_point）。
+    /// 显式槽表（None = positional 拓扑）。
+    pub fn slot_map(&self) -> Option<&SlotMap> {
+        self.slot_map.as_ref()
+    }
+
+    /// 槽位 → 节点下标。positional 走 bases 二分；显式按槽表 node 解析。
+    /// 越界槽（显式表）返回 `usize::MAX`——调用方须先按 [`Self::slot_count`] 防呆。
     pub fn node_of_slot(&self, slot: u16) -> usize {
-        self.bases.partition_point(|&b| b <= slot) - 1
+        match &self.slot_map {
+            Some(m) => m
+                .slots
+                .get(slot as usize)
+                .and_then(|t| self.nodes.iter().position(|n| n.id == t.node))
+                .unwrap_or(usize::MAX),
+            None => self.bases.partition_point(|&b| b <= slot) - 1,
+        }
     }
 
     /// 槽位归属本节点 → Some(本地盘序)；否则 None（= 远端）。越界也 None。
@@ -170,13 +263,58 @@ impl ClusterTopology {
         if slot >= self.slot_count {
             return None;
         }
-        let node = self.node_of_slot(slot);
-        (node == self.self_idx).then(|| (slot - self.bases[node]) as usize)
+        match &self.slot_map {
+            Some(m) => {
+                let t = &m.slots[slot as usize];
+                match self.self_idx_opt() {
+                    Some(i) if self.nodes[i].id == t.node => Some(t.drive as usize),
+                    _ => None,
+                }
+            }
+            None => {
+                let node = self.node_of_slot(slot);
+                (node == self.self_idx).then(|| (slot - self.bases[node]) as usize)
+            }
+        }
     }
 
-    /// 本节点首槽（仅对 self_idx 有效的拓扑调用；sentinel 占位会 panic——调用前用 self_idx_opt）。
+    /// 本节点首槽（**positional/flat 专用**：显式槽表的槽序不再按节点分段，
+    /// 该语义见 [`Self::slots_on_drive`]；仅对 self_idx 有效的拓扑调用，sentinel 会 panic）。
     pub fn local_slot_base(&self) -> u16 {
         self.bases[self.self_idx]
+    }
+
+    /// 该节点该物理盘承载的槽号（升序）；节点下标越界返回空表。
+    pub fn slots_on_drive(&self, node_idx: usize, drive: u16) -> Vec<u16> {
+        let Some(node) = self.nodes.get(node_idx) else {
+            return Vec::new();
+        };
+        match &self.slot_map {
+            Some(m) => m
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.node == node.id && t.drive == drive)
+                .map(|(slot, _)| slot as u16)
+                .collect(),
+            None => {
+                if drive < node.drive_count {
+                    vec![self.bases[node_idx] + drive]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// 该节点承载的槽数（positional = 其盘数）；节点下标越界返回 0。
+    pub fn slot_count_of_node(&self, node_idx: usize) -> u16 {
+        match &self.slot_map {
+            Some(m) => self.nodes.get(node_idx).map_or(0, |n| {
+                m.slots.iter().filter(|t| t.node == n.id).count() as u16
+            }),
+            None => self.nodes.get(node_idx).map_or(0, |n| n.drive_count),
+        }
     }
 
     /// 本节点在此拓扑中（非 sentinel 占位）。
@@ -227,8 +365,51 @@ impl ClusterSets {
         sets_nodes: Vec<Vec<NodeSpec>>,
         ec: &super::ec::EcConfig,
     ) -> Result<Self> {
+        // positional：无显式槽表，槽号 = 物理盘序（v1/v2 逐字节不变）
+        let slot_maps = vec![None; sets_nodes.len()];
+        Self::with_slot_maps(self_id, sets_nodes, slot_maps, ec)
+    }
+
+    /// 显式槽表构造（拓扑 v3）。`slot_maps` 只允许**全 None（positional）或全 Some**，
+    /// 且条目数 = set 数；显式时 per-set 槽数 = `slots.len()`，槽 → (node, drive) 由表解析。
+    /// 物理拓扑（`flat`/`self_ranges`/`flat_of`）仍按盘序——命名空间/meta 镜像与槽映射无关。
+    ///
+    /// 显式校验：各 set epoch 相同；槽数 ≤255 且 ≥ data+parity；node 在 set 节点表内；
+    /// drive < node.drive_count；多节点时每节点槽数 ≤ parity（单节点豁免）。
+    /// **stretch 不走此入口**（见 `new_stretch`：站点级容灾语义不同）。
+    pub fn with_slot_maps(
+        self_id: &str,
+        sets_nodes: Vec<Vec<NodeSpec>>,
+        slot_maps: Vec<Option<SlotMap>>,
+        ec: &super::ec::EcConfig,
+    ) -> Result<Self> {
         if sets_nodes.is_empty() {
             return Err(Error::Encode("cluster.sets 为空".into()));
+        }
+        if slot_maps.len() != sets_nodes.len() {
+            return Err(Error::Encode(format!(
+                "slot map 数 {} 与 set 数 {} 不一致",
+                slot_maps.len(),
+                sets_nodes.len()
+            )));
+        }
+        let explicit = slot_maps.iter().filter(|m| m.is_some()).count();
+        if explicit != 0 && explicit != slot_maps.len() {
+            return Err(Error::Encode(
+                "slot map 必须全 set 配置或全不配置（不可混用）".into(),
+            ));
+        }
+        let epoch = slot_maps.iter().flatten().next().map(|m| m.epoch);
+        if let Some(epoch) = epoch
+            && let Some(bad) = slot_maps
+                .iter()
+                .flatten()
+                .find(|m| m.epoch != epoch)
+                .map(|m| m.epoch)
+        {
+            return Err(Error::Encode(format!(
+                "各 set 的拓扑 epoch 不一致（{epoch} vs {bad}）"
+            )));
         }
         // addr 一致性（跨 set 同 id）
         let mut addr_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -256,7 +437,10 @@ impl ClusterSets {
                 .iter()
                 .position(|n| n.id == self_id)
                 .unwrap_or(usize::MAX); // 非自属 set：sentinel 占位
-            let topo = ClusterTopology::new(self_idx, nodes.clone(), ec)?;
+            let map = slot_maps[set_i].clone();
+            // positional 仍查逐节点 drive_count ≤ parity（现状）；显式按槽数另查（build 内）
+            let topo =
+                ClusterTopology::build(self_idx, nodes.clone(), ec, map.is_none(), true, map)?;
             if let Some(si) = topo.self_idx_opt() {
                 self_seen = true;
                 self_ranges.push((set_i as u16, offset, nodes[si].drive_count as usize));
@@ -288,8 +472,9 @@ impl ClusterSets {
             .iter()
             .position(|n| n.id == self_id)
             .ok_or_else(|| Error::Encode("flat：本节点缺席（不可达）".into()))?;
-        // flat 不承载放置（命名空间面镜像）→ 不适用逐节点 parity 规则；≤255/≥min 仍在
-        let flat = ClusterTopology::build(self_flat, flat_nodes, ec, false)?;
+        // flat 不承载放置（命名空间面镜像）→ 不适用逐节点 parity 规则；显式槽表下盘数可少于
+        // data+parity（放置面已由各 set 按槽数校验），故仅 positional 查 min
+        let flat = ClusterTopology::build(self_flat, flat_nodes, ec, false, explicit == 0, None)?;
         Ok(Self {
             sets,
             flat,
@@ -338,7 +523,7 @@ impl ClusterSets {
             .iter()
             .position(|n| n.id == self_id)
             .ok_or_else(|| Error::Encode(format!("本节点 «{self_id}» 不在 stretch 节点表内")))?;
-        let topo = ClusterTopology::build(self_idx, nodes, ec, false)?;
+        let topo = ClusterTopology::build(self_idx, nodes, ec, false, true, None)?;
         Ok(Self {
             sets: vec![topo.clone()],
             flat: topo,
@@ -357,6 +542,42 @@ impl ClusterSets {
 
     pub fn set_topo(&self, set: u16) -> Option<&ClusterTopology> {
         self.sets.get(set as usize)
+    }
+
+    /// 拓扑 epoch（显式槽表；positional = 0）。各 set epoch 已在构造时校验一致。
+    pub fn topology_epoch(&self) -> u64 {
+        self.sets
+            .iter()
+            .find_map(|t| t.slot_map())
+            .map_or(0, |m| m.epoch)
+    }
+
+    /// 跨全部 set 的 canonical 拓扑指纹（16 hex）：positional 按各 set (node, drive) 物理序，
+    /// 显式按槽序（含 epoch）；set 序号入哈希避免多 set 拼接歧义。
+    /// **与 [`SlotMap::hash`] 不同**——后者只覆盖单 set。
+    pub fn topology_hash(&self) -> String {
+        let mut h = sha2::Sha256::new();
+        for (i, t) in self.sets.iter().enumerate() {
+            h.update((i as u32).to_be_bytes());
+            match t.slot_map() {
+                Some(m) => {
+                    h.update([1u8]);
+                    h.update(m.epoch.to_be_bytes());
+                    for s in &m.slots {
+                        hash_target(&mut h, &s.node, s.drive);
+                    }
+                }
+                None => {
+                    h.update([0u8]);
+                    for n in &t.nodes {
+                        for d in 0..n.drive_count {
+                            hash_target(&mut h, &n.id, d);
+                        }
+                    }
+                }
+            }
+        }
+        hex::encode(&h.finalize()[..8])
     }
 }
 
