@@ -247,7 +247,7 @@ fn peer_wire_version_normalizes_legacy_and_unknown_fails_closed() {
     }
 }
 
-/// 放置 v2（local epoch ≥ 2）要求 peer 同时宣告 wire2 + epoch2 + 相同非空指纹；
+/// 放置 v2+/显式槽表（local epoch ≥ 2）要求 peer 宣告 wire2 + 相同 epoch + 相同非空指纹；
 /// placement v1 下 epoch/hash 一旦宣告就必须一致。
 #[test]
 fn check_peer_rejects_placement_and_hash_mismatch() {

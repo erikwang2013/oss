@@ -118,7 +118,7 @@ pub enum OpClass {
 
 /// 能力判定（唯一策略出处）：
 /// - wire 窗口 `{1, 2}`，其余（含 0/3+）fail-closed；
-/// - 放置 v2（local epoch ≥ 2）要求 peer 同时宣告 wire 2 + epoch 2 + 相同非空 hash；
+/// - 放置 v2+/显式槽表（local epoch ≥ 2）要求 peer 宣告 wire 2 + 相同 epoch + 相同非空 hash；
 /// - placement v1 下，peer 宣告了 epoch 就必须一致；双方都有 hash 就必须一致。
 pub fn check_peer(node: &str, peer: &PeerCaps, local: &LocalCaps) -> Result<PeerClass> {
     if !(LEGACY_DATA_WIRE_VERSION..=DATA_WIRE_VERSION).contains(&peer.wire_version) {

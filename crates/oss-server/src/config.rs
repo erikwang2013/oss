@@ -537,6 +537,11 @@ impl ClusterToml {
             (0, false) => {
                 Err("[cluster].slots 已配置但 epoch==0（显式槽表必须同时给 epoch）".into())
             }
+            // 显式槽表 >=2：epoch 1 属于 placement-v1 混版窗口，旧节点会按 positional
+            // 路由；必须在一开始就拒绝，不能进入 GatedMesh（R1）。
+            (e, false) if e < 2 => Err(format!(
+                "[cluster].epoch={e} 但显式槽表要求 epoch >= 2（epoch 1 是 placement v1）"
+            )),
             (_, false) => Ok(()),
             (_, true) => Err(format!(
                 "[cluster].epoch={} 但未配置 [[cluster.slots]]",
@@ -1310,6 +1315,25 @@ mod tests {
                 .contains("maintenance 仅用于 [cluster]"),
             "maintenance + raft 必须拒绝"
         );
+    }
+
+    /// 显式槽表 epoch 必须 >=2；epoch 1 属于 placement v1 混版窗口，不得进入槽表模式。
+    #[test]
+    fn explicit_slots_require_epoch_at_least_two() {
+        let c = ClusterToml {
+            node_id: "n1".into(),
+            secret: "s".into(),
+            nodes: vec![],
+            placement: None,
+            epoch: 1,
+            slots: vec![SlotToml {
+                set: 0,
+                node: "n1".into(),
+                drive: 0,
+            }],
+        };
+        let err = c.cluster_validate().unwrap_err();
+        assert!(err.contains("epoch >= 2"), "{err}");
     }
 
     /// shrink 目标文件：显式槽表按文件顺序编号，epoch/node_id 校验 fail-closed。
