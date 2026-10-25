@@ -77,7 +77,7 @@ fn sample_job(id: i64) -> JobRow {
         report_prefix: Some("rp/".into()),
         priority: 2,
         requested_by: Some(3),
-        parent_job_id: Some(4),
+        parent_job_id: None,
         started_at: Some(12),
         finished_at: Some(13),
     }
