@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod network;
 pub mod repair;
 pub mod routes;
+pub mod runstate;
 pub mod status;
 pub mod store;
 
