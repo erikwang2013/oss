@@ -918,6 +918,16 @@ pub fn required_feature_level(data: &ControlData) -> u8 {
     }
 }
 
+/// 给定激活级别与数据要求，返回实际写出的封套格式（1/2/≥3，由 `max` 决定）。
+/// 编码器与导出 provenance 共用本函数，保证记录值与真实字节一致。
+pub fn snapshot_format_for(feature_level: u8, required: u8) -> u32 {
+    match feature_level.max(required) {
+        MIN_FEATURE_LEVEL => 1,
+        FEATURE_LEVEL_3.. => 3,
+        _ => 2,
+    }
+}
+
 /// 是否为本二进制可安装的控制面快照（OSSCTL1 / OSSCTL2 / OSSCTL3）。
 /// 旧二进制只认更早的 magic；各格式与更早格式无公共前缀，故在解析前整包拒绝。
 pub fn is_control_snapshot(bytes: &[u8]) -> bool {
@@ -968,10 +978,11 @@ pub fn encode_snapshot_with_extensions(
         )));
     }
     validate_extensions(&extensions, EXT_MAX_TOTAL_BYTES)?;
-    let level = feature_level.max(required_feature_level(data));
-    let (magic, payload) = match level {
-        MIN_FEATURE_LEVEL => (MAGIC, serde_json::to_vec(data)?),
-        FEATURE_LEVEL_3.. => (
+    let required = required_feature_level(data);
+    let level = feature_level.max(required);
+    let (magic, payload) = match snapshot_format_for(feature_level, required) {
+        1 => (MAGIC, serde_json::to_vec(data)?),
+        3.. => (
             MAGIC_V3,
             serde_json::to_vec(&SnapshotV3 {
                 feature_level: level,
@@ -1254,6 +1265,16 @@ mod tests {
         let mut data = sample();
         data.lifecycle_rules[0].config_json = Some(r#"{"filter":{"prefix":"logs/"}}"#.into());
         data
+    }
+
+    /// 导出 provenance 与编码器共用格式选择：max(激活, 数据要求) 1→1、2→2、≥3→3。
+    #[test]
+    fn snapshot_format_selector_follows_max_level() {
+        assert_eq!(snapshot_format_for(1, 1), 1);
+        assert_eq!(snapshot_format_for(2, 1), 2);
+        assert_eq!(snapshot_format_for(1, 2), 2);
+        assert_eq!(snapshot_format_for(3, 1), 3);
+        assert_eq!(snapshot_format_for(2, 3), 3);
     }
 
     /// 11 张表全行往返：语义相等且再次编码逐字节相同（checksum/ORDER BY 确定性）。

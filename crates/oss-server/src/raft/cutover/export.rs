@@ -34,7 +34,7 @@ pub struct ExportFile {
     /// 本字段：恢复时回落到 `feature_level`；激活过但无 level-2 数据的集群靠它保持 2。
     #[serde(default)]
     pub activation_level: Option<u8>,
-    /// 导出时来源二进制会写出的快照封套号：1=OSSCTL1，2=OSSCTL2。
+    /// 导出时来源二进制会写出的快照封套号：1=OSSCTL1，2=OSSCTL2，3=OSSCTL3。
     #[serde(default)]
     pub snapshot_format: Option<u32>,
     /// 来源控制面 wire 版本（[`compat::WIRE_VERSION`]）。
@@ -68,13 +68,10 @@ pub async fn build_export(
     tx.commit().await.map_err(|e| format!("commit: {e}"))?;
     let payload = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
     let sha256 = hex::encode(Sha256::digest(&payload));
-    // 来源二进制写快照时取 max(marker, 数据要求)；格式 1/2 已冻结（data.rs）。
-    let feature_level = marker.max(data::required_feature_level(&data));
-    let snapshot_format = if feature_level > compat::MIN_FEATURE_LEVEL {
-        data::SNAPSHOT_FORMAT
-    } else {
-        1
-    };
+    // 来源二进制写快照时取 max(marker, 数据要求)；封套号与实际编码共用 data.rs 选择器。
+    let required = data::required_feature_level(&data);
+    let feature_level = marker.max(required);
+    let snapshot_format = data::snapshot_format_for(feature_level, required);
     Ok(ExportFile {
         format: EXPORT_FORMAT,
         kind: EXPORT_KIND.to_string(),
@@ -134,6 +131,14 @@ fn verify_provenance(export: &ExportFile) -> Result<Vec<String>, String> {
             return Err(format!(
                 "source snapshot_format 1 (OSSCTL1) cannot carry level-{required} data"
             ));
+        }
+        // OSSCTL3 只在 level-3 激活下写出；低级别或缺级别声明格式 3 只能是伪造。
+        if format == 3
+            && !export
+                .feature_level
+                .is_some_and(|level| level >= compat::FEATURE_LEVEL_3)
+        {
+            return Err("source snapshot_format 3 (OSSCTL3) requires feature_level >= 3".into());
         }
     }
     if let Some(wire) = export.wire_version
