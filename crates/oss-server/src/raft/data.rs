@@ -6,38 +6,48 @@
 //!
 //! 快照封套：
 //! - 格式 1（`OSSCTL1`）：`OSSCTL1\n<sha256(payload) 64 位小写 hex>\n<json(ControlData)>`；
-//! - 格式 2（`OSSCTL2`）：`OSSCTL2\n<sha256(payload) 64 位小写 hex>\n<json(SnapshotV2)>`，
-//!   载荷带 `feature_level`，用于装载 `LifecycleRuleRow.config_json`（level-2 数据）。
+//! - 格式 2（`OSSCTL2`）：`OSSCTL2\n<sha256...>\n<json(SnapshotV2)>`，载荷带 `feature_level`，
+//!   用于装载 `LifecycleRuleRow.config_json`（level-2 数据）；
+//! - 格式 3（`OSSCTL3`）：`OSSCTL3\n<sha256...>\n<json(SnapshotV3)>`，在格式 2 之上带
+//!   `extensions`（命名、带版本的不透明载荷：`m8.runstate`、tenancy 等 level-3 数据）。
 //!
-//! 编码器按数据内容选格式：含 `config_json`（或调用方传入激活级别 2）→ OSSCTL2，否则
-//! OSSCTL1。解码先校验 magic / hex / SHA-256 / 级别，任何失败都 fail-closed（install 在
-//! 任何写之前拒绝）。OSSCTL1 仍可读；OSSCTL2 的 magic 与格式 1 无公共前缀，旧二进制
-//! 会在解析载荷前整包拒绝——**不存在静默丢弃 config_json 或未知表的路径**。
+//! 编码器按 `max(传入激活级别, 数据要求)` 选格式：1→OSSCTL1，2→OSSCTL2，≥3→OSSCTL3。
+//! 解码先校验 magic / hex / SHA-256 / 级别，任何失败都 fail-closed（install 在任何写之前
+//! 拒绝）。OSSCTL1/V2 仍可读；各格式 magic 两两无公共前缀，旧二进制会在解析载荷前整包
+//! 拒绝——**不存在静默丢弃 config_json、未知表或扩展区的路径**。
 //!
-//! 两个格式一经发布即冻结：载荷/行结构全部 `deny_unknown_fields`，未知字段/表直接
-//! 报错而不是被静默丢弃。任何 `ControlData` 增删都必须升到 `OSSCTL3`。
+//! 1/2 两个格式一经发布即冻结（载荷/行结构全部 `deny_unknown_fields`），任何
+//! `ControlData` 增删都必须升到 `OSSCTL3`；格式 3 的扩展区只由消费者解释。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 
-use super::compat::{MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
+use super::compat::{FEATURE_LEVEL_3, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
 
-/// 本二进制可写的最新快照封套版本（1 = OSSCTL1 只读兼容，2 = OSSCTL2）。
-pub const SNAPSHOT_FORMAT: u32 = 2;
+/// 本二进制可写的最新快照封套版本（1 = OSSCTL1，2 = OSSCTL2，3 = OSSCTL3）。
+pub const SNAPSHOT_FORMAT: u32 = 3;
 /// 本二进制可解码的最高快照封套版本；`decode_snapshot` 必须接受 `1..=此值`。
 pub const SNAPSHOT_FORMAT_MAX: u32 = SNAPSHOT_FORMAT;
 
 const MAGIC: &[u8] = b"OSSCTL1\n";
 const MAGIC_V2: &[u8] = b"OSSCTL2\n";
-/// 格式 1 前缀（旧二进制以此判定控制面快照；本二进制校验 V1/V2 两种）。
+const MAGIC_V3: &[u8] = b"OSSCTL3\n";
+/// 格式 1 前缀（旧二进制以此判定控制面快照；本二进制校验 V1/V2/V3 三种）。
 pub const SNAPSHOT_MAGIC: &[u8] = MAGIC;
 /// 格式 2 前缀（载荷含 `feature_level`，可携带 level-2 生命周期）。
 pub const SNAPSHOT_MAGIC_V2: &[u8] = MAGIC_V2;
+/// 格式 3 前缀（载荷含 `feature_level` + 不透明扩展区）。
+pub const SNAPSHOT_MAGIC_V3: &[u8] = MAGIC_V3;
 const HEX_LEN: usize = 64;
+/// 扩展区解码上限：所有条目解码后字节和（防 JSON/base64 内存放大）。
+const EXT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// 扩展条目数上限（现有命名空间仅 m8.runstate/tenancy 两个；64 留足演进空间）。
+const EXT_MAX_COUNT: usize = 64;
+const EXT_NAME_MAX: usize = 64;
 
 /// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
 /// 管理员 id，witness 写哨兵 0）；`User(username)` = 复制用户。
@@ -824,11 +834,24 @@ pub(crate) async fn install_tx(
     Ok(report_of(data))
 }
 
-/// 解码结果：封套携带的激活级别（OSSCTL1 固定 1）+ 11 表数据。
+/// V3 扩展区条目：名字即命名空间（`[a-z0-9._-]{1,64}`，如 `m8.runstate`），载荷是
+/// 不透明 base64。版本与载荷语义由消费者（各 level-3 功能）解释；封套层只校验形状/体积。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotExtension {
+    pub version: u32,
+    pub payload_b64: String,
+}
+
+pub type SnapshotExtensions = BTreeMap<String, SnapshotExtension>;
+
+/// 解码结果：封套携带的激活级别（OSSCTL1 固定 1）+ 11 表数据 + V3 扩展区。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedSnapshot {
     pub feature_level: u8,
     pub data: ControlData,
+    /// V1/V2 恒空；V3 原样保留（未知命名空间/版本不丢，交消费者决定）。
+    pub extensions: SnapshotExtensions,
 }
 
 /// OSSCTL2 载荷。`deny_unknown_fields`：格式 2 已冻结，新增字段必须升 3。
@@ -837,6 +860,53 @@ pub struct DecodedSnapshot {
 struct SnapshotV2<T> {
     feature_level: u8,
     data: T,
+}
+
+/// OSSCTL3 载荷：格式 2 + 扩展区。`deny_unknown_fields` 同样冻结形状。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV3<T> {
+    feature_level: u8,
+    data: T,
+    #[serde(default)]
+    extensions: SnapshotExtensions,
+}
+
+fn ext_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= EXT_NAME_MAX
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+}
+
+/// 扩展区形状校验（编码/解码同口径）：命名、条目数、base64 可解与解码后总字节上限。
+fn validate_extensions(exts: &SnapshotExtensions, max_total: usize) -> Result<(), DataError> {
+    if exts.len() > EXT_MAX_COUNT {
+        return Err(DataError::Format(format!(
+            "snapshot extensions count {} exceeds cap {EXT_MAX_COUNT}",
+            exts.len()
+        )));
+    }
+    let mut total = 0usize;
+    for (name, ext) in exts {
+        if !ext_name_ok(name) {
+            return Err(DataError::Format(format!(
+                "snapshot extension name {name:?} invalid (want [a-z0-9._-]{{1..={EXT_NAME_MAX}}})"
+            )));
+        }
+        let len = base64::engine::general_purpose::STANDARD
+            .decode(&ext.payload_b64)
+            .map_err(|e| DataError::Format(format!("snapshot extension {name} base64: {e}")))?
+            .len();
+        total = total.saturating_add(len);
+        if total > max_total {
+            return Err(DataError::Format(format!(
+                "snapshot extensions decode to {total} bytes, exceeding cap {max_total}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 数据自身要求的最低激活级别：出现 level-2 行（`config_json`）即 2，否则 1。
@@ -848,10 +918,10 @@ pub fn required_feature_level(data: &ControlData) -> u8 {
     }
 }
 
-/// 是否为本二进制可安装的控制面快照（OSSCTL1 或 OSSCTL2）。
-/// 旧二进制只认 [`SNAPSHOT_MAGIC`]；V2 与其无公共前缀，故在解析前整包拒绝。
+/// 是否为本二进制可安装的控制面快照（OSSCTL1 / OSSCTL2 / OSSCTL3）。
+/// 旧二进制只认更早的 magic；各格式与更早格式无公共前缀，故在解析前整包拒绝。
 pub fn is_control_snapshot(bytes: &[u8]) -> bool {
-    bytes.starts_with(MAGIC) || bytes.starts_with(MAGIC_V2)
+    bytes.starts_with(MAGIC) || bytes.starts_with(MAGIC_V2) || bytes.starts_with(MAGIC_V3)
 }
 
 fn level_ok(level: u8) -> bool {
@@ -873,25 +943,49 @@ pub fn encode_snapshot(data: &ControlData) -> Result<Vec<u8>, DataError> {
     encode_snapshot_at(data, required_feature_level(data))
 }
 
-/// 以节点激活级别编码：级别 >= 2 或数据含 `config_json` → OSSCTL2。
+/// 以节点激活级别编码：1→OSSCTL1，2→OSSCTL2，`max(级别, 数据要求)` ≥3→OSSCTL3。
 ///
 /// 级别取 `max(传入级别, 数据要求)`：含 level-2 行时绝不能降级成 OSSCTL1
 /// （旧读者会静默丢弃这些行）。
 pub fn encode_snapshot_at(data: &ControlData, feature_level: u8) -> Result<Vec<u8>, DataError> {
+    encode_snapshot_with_extensions(data, feature_level, SnapshotExtensions::new())
+}
+
+/// 带扩展区的编码：非空扩展区要求 `feature_level >= 3`（V3）；扩展区只做形状/体积校验。
+pub fn encode_snapshot_with_extensions(
+    data: &ControlData,
+    feature_level: u8,
+    extensions: SnapshotExtensions,
+) -> Result<Vec<u8>, DataError> {
     if !level_ok(feature_level) {
         return Err(DataError::Format(format!(
             "snapshot feature level {feature_level} outside {MIN_FEATURE_LEVEL}..={MAX_FEATURE_LEVEL}"
         )));
     }
+    if !extensions.is_empty() && feature_level < FEATURE_LEVEL_3 {
+        return Err(DataError::Format(format!(
+            "snapshot extensions require feature level {FEATURE_LEVEL_3} (got {feature_level})"
+        )));
+    }
+    validate_extensions(&extensions, EXT_MAX_TOTAL_BYTES)?;
     let level = feature_level.max(required_feature_level(data));
-    let (magic, payload) = if level == MIN_FEATURE_LEVEL {
-        (MAGIC, serde_json::to_vec(data)?)
-    } else {
-        let v2 = SnapshotV2 {
-            feature_level: level,
-            data,
-        };
-        (MAGIC_V2, serde_json::to_vec(&v2)?)
+    let (magic, payload) = match level {
+        MIN_FEATURE_LEVEL => (MAGIC, serde_json::to_vec(data)?),
+        FEATURE_LEVEL_3.. => (
+            MAGIC_V3,
+            serde_json::to_vec(&SnapshotV3 {
+                feature_level: level,
+                data,
+                extensions,
+            })?,
+        ),
+        _ => {
+            let v2 = SnapshotV2 {
+                feature_level: level,
+                data,
+            };
+            (MAGIC_V2, serde_json::to_vec(&v2)?)
+        }
     };
     Ok(seal(magic, &payload))
 }
@@ -922,13 +1016,40 @@ fn checked_payload(rest: &[u8]) -> Result<&[u8], DataError> {
 
 /// 解码并校验快照封套；magic/hex/checksum/级别任一不符 → fail-closed（不写任何行）。
 pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, DataError> {
-    let (feature_level, data) = if let Some(rest) = bytes.strip_prefix(MAGIC_V2) {
+    decode_snapshot_with_max(bytes, SNAPSHOT_FORMAT_MAX)
+}
+
+/// 同 [`decode_snapshot`]，但封套上限由调用方给定（旧二进制等价于 `max=2`/`1`）。
+/// 高于上限的 magic 必须在解析载荷前整体拒绝。
+fn decode_snapshot_with_max(bytes: &[u8], max_format: u32) -> Result<DecodedSnapshot, DataError> {
+    let (feature_level, data, extensions) = if let Some(rest) = bytes.strip_prefix(MAGIC_V3) {
+        if max_format < 3 {
+            return Err(DataError::Format(format!(
+                "snapshot format 3 (OSSCTL3) exceeds decoder max {max_format}"
+            )));
+        }
+        let v3: SnapshotV3<ControlData> = serde_json::from_slice(checked_payload(rest)?)?;
+        if v3.feature_level < FEATURE_LEVEL_3 {
+            return Err(DataError::Format(format!(
+                "snapshot OSSCTL3 declares feature level {} but format 3 requires {FEATURE_LEVEL_3}",
+                v3.feature_level
+            )));
+        }
+        validate_extensions(&v3.extensions, EXT_MAX_TOTAL_BYTES)?;
+        (v3.feature_level, v3.data, v3.extensions)
+    } else if let Some(rest) = bytes.strip_prefix(MAGIC_V2) {
+        if max_format < 2 {
+            return Err(DataError::Format(format!(
+                "snapshot format 2 (OSSCTL2) exceeds decoder max {max_format}"
+            )));
+        }
         let v2: SnapshotV2<ControlData> = serde_json::from_slice(checked_payload(rest)?)?;
-        (v2.feature_level, v2.data)
+        (v2.feature_level, v2.data, SnapshotExtensions::new())
     } else if let Some(rest) = bytes.strip_prefix(MAGIC) {
         (
             MIN_FEATURE_LEVEL,
             serde_json::from_slice(checked_payload(rest)?)?,
+            SnapshotExtensions::new(),
         )
     } else {
         return Err(DataError::Format("snapshot magic missing".into()));
@@ -947,6 +1068,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, DataError> {
     Ok(DecodedSnapshot {
         feature_level,
         data,
+        extensions,
     })
 }
 
@@ -1246,6 +1368,7 @@ mod tests {
         for bytes in [
             encode_snapshot(&sample()).unwrap(),
             encode_snapshot(&level_two()).unwrap(),
+            encode_snapshot_at(&sample(), 3).unwrap(),
         ] {
             let mut bit = bytes.clone();
             let last = bit.len() - 1;
@@ -1268,11 +1391,201 @@ mod tests {
                 Err(DataError::Checksum)
             ));
         }
-        for truncated in [&b"OSSCTL1\n"[..], &b"OSSCTL2\n"[..]] {
+        for truncated in [&b"OSSCTL1\n"[..], &b"OSSCTL2\n"[..], &b"OSSCTL3\n"[..]] {
             assert!(matches!(
                 decode_snapshot(truncated),
                 Err(DataError::Format(_))
             ));
         }
+    }
+
+    /// `_name` 仅用于调用点可读性（载荷不依赖名字）。
+    fn ext(_name: &str, version: u32, payload: &[u8]) -> SnapshotExtension {
+        use base64::Engine as _;
+        SnapshotExtension {
+            version,
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(payload),
+        }
+    }
+
+    fn two_extensions() -> SnapshotExtensions {
+        let mut exts = SnapshotExtensions::new();
+        exts.insert("m8.runstate".into(), ext("m8.runstate", 1, b"runstate-v1"));
+        exts.insert("tenancy".into(), ext("tenancy", 2, b"accounts-v2"));
+        exts
+    }
+
+    /// OSSCTL3：level 3 封套 + 两个不透明扩展区，往返后逐项保留；空扩展区也可。
+    #[test]
+    fn ossctl3_round_trip_preserves_opaque_extensions() {
+        let exts = two_extensions();
+        let bytes = encode_snapshot_with_extensions(&sample(), 3, exts.clone()).unwrap();
+        assert!(bytes.starts_with(SNAPSHOT_MAGIC_V3));
+        let decoded = decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.feature_level, 3);
+        assert_eq!(decoded.data, sample());
+        assert_eq!(decoded.extensions, exts);
+        assert!(is_control_snapshot(&bytes));
+        // 激活到 3 但无扩展区：仍是 V3（旧读者整包拒绝，而不是当 V2 装）。
+        let empty = encode_snapshot_at(&sample(), 3).unwrap();
+        assert!(empty.starts_with(SNAPSHOT_MAGIC_V3));
+        assert!(decode_snapshot(&empty).unwrap().extensions.is_empty());
+        // V1/V2 解码扩展区恒空。
+        assert!(
+            decode_snapshot(&encode_snapshot(&sample()).unwrap())
+                .unwrap()
+                .extensions
+                .is_empty()
+        );
+        assert!(
+            decode_snapshot(&encode_snapshot_at(&sample(), 2).unwrap())
+                .unwrap()
+                .extensions
+                .is_empty()
+        );
+    }
+
+    /// 扩展区只在 feature 3 开放：level 2 + 非空扩展区拒绝；空扩展区按 max 规则落 V2。
+    /// 手写 V3 封套（checksum 重算）声明 level<3 也必须拒绝。
+    #[test]
+    fn ossctl3_requires_feature_level_three() {
+        let err = encode_snapshot_with_extensions(&sample(), 2, two_extensions()).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("feature level 3")),
+            "{err}"
+        );
+        let v2 = encode_snapshot_with_extensions(&sample(), 2, SnapshotExtensions::new()).unwrap();
+        assert!(v2.starts_with(SNAPSHOT_MAGIC_V2));
+
+        let payload = serde_json::to_vec(&SnapshotV3 {
+            feature_level: 2,
+            data: &sample(),
+            extensions: two_extensions(),
+        })
+        .unwrap();
+        let err = decode_snapshot(&seal(MAGIC_V3, &payload)).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("requires 3")),
+            "{err}"
+        );
+    }
+
+    /// 名字非法、条目超限、解码后字节超限、base64 非法都 fail-closed（编码与解码同口径）。
+    #[test]
+    fn ossctl3_rejects_invalid_extension_shapes_and_oversize() {
+        for bad in ["Upper", "", "a/b", "has space"] {
+            let mut exts = SnapshotExtensions::new();
+            exts.insert(bad.into(), ext(bad, 1, b"x"));
+            let err = encode_snapshot_with_extensions(&sample(), 3, exts).unwrap_err();
+            assert!(
+                matches!(&err, DataError::Format(m) if m.contains("name")),
+                "{bad}: {err}"
+            );
+        }
+        let long = "a".repeat(EXT_NAME_MAX + 1);
+        let mut exts = SnapshotExtensions::new();
+        exts.insert(long.clone(), ext(&long, 1, b"x"));
+        assert!(encode_snapshot_with_extensions(&sample(), 3, exts).is_err());
+
+        // 体积上限：同一校验函数用小 cap 覆盖边界，生产 cap 恒定 64 MiB。
+        let mut exts = SnapshotExtensions::new();
+        exts.insert("tenancy".into(), ext("tenancy", 1, b"hello"));
+        let err = validate_extensions(&exts, 4).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("cap 4")),
+            "{err}"
+        );
+        validate_extensions(&exts, 5).unwrap();
+        assert_eq!(EXT_MAX_TOTAL_BYTES, 64 * 1024 * 1024, "扩展区总量上限");
+
+        // 解码侧同样拒绝：非法名字 / 非法 base64 / 超条目数。
+        let mut exts = SnapshotExtensions::new();
+        exts.insert("Bad".into(), ext("Bad", 1, b"x"));
+        let payload = serde_json::to_vec(&SnapshotV3 {
+            feature_level: 3,
+            data: &sample(),
+            extensions: exts,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_snapshot(&seal(MAGIC_V3, &payload)),
+            Err(DataError::Format(_))
+        ));
+
+        let mut exts = SnapshotExtensions::new();
+        exts.insert(
+            "tenancy".into(),
+            SnapshotExtension {
+                version: 1,
+                payload_b64: "not base64!!".into(),
+            },
+        );
+        let payload = serde_json::to_vec(&SnapshotV3 {
+            feature_level: 3,
+            data: &sample(),
+            extensions: exts,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_snapshot(&seal(MAGIC_V3, &payload)),
+            Err(DataError::Format(_))
+        ));
+
+        let mut exts = SnapshotExtensions::new();
+        for i in 0..=EXT_MAX_COUNT {
+            exts.insert(format!("e{i}"), ext("e", 1, b""));
+        }
+        let err = encode_snapshot_with_extensions(&sample(), 3, exts).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("count")),
+            "{err}"
+        );
+    }
+
+    /// 格式 3 的 checksum/magic 篡改 fail-closed；重复顶层字段由 serde 拒绝。
+    #[test]
+    fn ossctl3_checksum_tamper_and_duplicate_fields_are_rejected() {
+        let bytes = encode_snapshot_with_extensions(&sample(), 3, two_extensions()).unwrap();
+        let mut bit = bytes.clone();
+        let last = bit.len() - 1;
+        bit[last] ^= 0x01;
+        assert!(matches!(
+            decode_snapshot(&bit),
+            Err(DataError::Checksum) | Err(DataError::Json(_))
+        ));
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        assert!(matches!(decode_snapshot(&magic), Err(DataError::Format(_))));
+
+        let data = serde_json::to_string(&sample()).unwrap();
+        let payload =
+            format!(r#"{{"feature_level":3,"feature_level":3,"data":{data},"extensions":{{}}}}"#);
+        assert!(matches!(
+            decode_snapshot(&seal(MAGIC_V3, payload.as_bytes())),
+            Err(DataError::Json(_))
+        ));
+        // 未知顶层字段同样拒绝（格式 3 形状已冻结）。
+        let payload =
+            format!(r#"{{"feature_level":3,"data":{data},"extensions":{{}},"future":true}}"#);
+        assert!(matches!(
+            decode_snapshot(&seal(MAGIC_V3, payload.as_bytes())),
+            Err(DataError::Json(_))
+        ));
+    }
+
+    /// 旧（V2 为上限）读者看到 OSSCTL3 在解析 JSON 前整包拒绝；V1/V2 仍按其上限解码。
+    #[test]
+    fn v2_max_reader_rejects_ossctl3() {
+        assert_eq!(SNAPSHOT_FORMAT, 3);
+        assert_eq!(SNAPSHOT_FORMAT_MAX, 3);
+        let v3 = encode_snapshot_with_extensions(&sample(), 3, two_extensions()).unwrap();
+        let err = decode_snapshot_with_max(&v3, 2).unwrap_err();
+        assert!(
+            matches!(&err, DataError::Format(m) if m.contains("format 3")),
+            "{err}"
+        );
+        let v2 = encode_snapshot_at(&sample(), 2).unwrap();
+        assert_eq!(decode_snapshot_with_max(&v2, 2).unwrap().feature_level, 2);
+        assert!(decode_snapshot_with_max(&v2, 1).is_err());
     }
 }
