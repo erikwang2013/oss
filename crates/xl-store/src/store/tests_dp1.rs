@@ -43,10 +43,10 @@ async fn put_keys(c: &Cluster, keys: &[&str]) {
     }
 }
 
-/// Task 3：V1 marker 页在 legacy peer 上改发包含式 marker——边界键重复（不丢键），
-/// 并置 degraded_marker；无 marker 首页不标降级。
+/// Task 3 + 评审修复：legacy peer 的包含式边界不得进入并集——V1 marker 必前进
+/// （不重复、不丢键）；降级仍由 degraded_marker 暴露；无 marker 首页不标降级。
 #[tokio::test]
-async fn v1_list_marker_with_legacy_peer_degrades_and_repeats_boundary() {
+async fn v1_list_marker_with_legacy_peer_degrades_and_advances() {
     let c = Cluster::new(4, 3).await;
     put_keys(&c, &["a", "b", "c"]).await;
     let s = &c.stores[0];
@@ -77,11 +77,125 @@ async fn v1_list_marker_with_legacy_peer_degrades_and_repeats_boundary() {
         .await
         .unwrap();
     assert!(page.degraded_marker);
-    assert!(
-        page.objects.iter().any(|o| o.key == "b"),
-        "legacy inclusive marker repeats boundary: {:?}",
-        page.objects.iter().map(|o| &o.key).collect::<Vec<_>>()
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c"],
+        "legacy 包含式边界必须被丢弃，marker 才会前进"
     );
+}
+
+/// 评审修复 Important 1：V1 + max-keys=1 在 legacy peer 在场时必须前进。
+/// 模拟 AWS V1 客户端：无 delimiter 时用最后一个 Contents 键当下一页 marker。
+#[tokio::test]
+async fn v1_max_keys_one_with_legacy_peer_advances_marker() {
+    let c = Cluster::new(4, 3).await;
+    put_keys(&c, &["a", "b", "c"]).await;
+    let s = &c.stores[0];
+    c.mesh.set_data_wire_version("n2", Some(0));
+
+    let mut marker: Option<String> = None;
+    let mut got = Vec::new();
+    let mut degraded_flags = Vec::new();
+    for _ in 0..10 {
+        let page = s
+            .list_objects(
+                "bkt",
+                &ListRequest {
+                    max_keys: Some(1),
+                    marker: marker.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        degraded_flags.push(page.degraded_marker);
+        got.extend(page.objects.iter().map(|o| o.key.clone()));
+        if !page.is_truncated {
+            break;
+        }
+        marker = page.objects.last().map(|o| o.key.clone());
+        assert!(marker.is_some(), "截断页必须给出可续页的最后一键");
+    }
+    assert_eq!(got, vec!["a", "b", "c"], "不丢键、不重复边界");
+    assert_eq!(degraded_flags, vec![false, true, true]);
+}
+
+/// 评审修复 Important 2（路径一）：第一次能力探测失败、第二次探测才发现旧版时，
+/// 不得把整路当「不可达」静默丢掉——GatedMesh 会按旧版降级转发，store 必须置
+/// degraded_marker 并过滤包含式边界。若二次探测直接返回 PeerIncompatible，
+/// list_objects_cluster 的专用分支会原样上抛（由 mesh_gate 测试覆盖）。
+#[tokio::test]
+async fn list_probe_failure_then_legacy_degrades_not_dropped() {
+    let c = Cluster::new(4, 3).await;
+    put_keys(&c, &["a", "b", "c"]).await;
+    let s = &c.stores[0];
+    c.mesh.set_data_wire_version("n2", Some(0));
+    c.mesh.fail_once("n2", "health"); // 只挡第一次探测：第二次命中 legacy
+
+    let page = s
+        .list_objects(
+            "bkt",
+            &ListRequest {
+                max_keys: Some(1),
+                marker: Some("a".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.degraded_marker);
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b"],
+        "边界 a 不得重复"
+    );
+    assert!(
+        c.mesh
+            .list_local_requests()
+            .iter()
+            .any(|(n, r)| n == "n2" && !r.marker_exclusive),
+        "该路必须参与并集（按旧版降级转发），不得被静默丢弃"
+    );
+}
+
+/// 评审修复 Important 2（路径二）：两次探测都失败、旧端忽略 marker_exclusive 时，
+/// 仍要过滤包含式边界并置降级标记（不静默给出重复/缺项页）。
+#[tokio::test]
+async fn list_probe_failure_marks_degraded_and_advances_marker() {
+    let c = Cluster::new(4, 3).await;
+    put_keys(&c, &["a", "b", "c"]).await;
+    let s = &c.stores[0];
+    c.mesh.set_data_wire_version("n2", Some(0));
+    c.mesh.fail_once("n2", "health"); // store 侧探测
+    c.mesh.fail_once("n2", "health"); // GatedMesh 第二次探测
+
+    let page = s
+        .list_objects(
+            "bkt",
+            &ListRequest {
+                max_keys: Some(1),
+                marker: Some("b".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.degraded_marker);
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c"],
+        "旧端忽略排他标志时，边界键也不得重复"
+    );
+    assert!(!page.is_truncated);
 }
 
 /// Task 4：任一 peer 为 legacy → degraded；用户可见版本列表必须 fail closed。

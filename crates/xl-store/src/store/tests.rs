@@ -2676,6 +2676,8 @@ pub struct InProcessMesh {
     versions: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// DP-1：到达对端的 ListLocal 请求记录（断言「旧版不会收到新语义标志」）。
     list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
+    /// 测试诊断：health 探测调用序列（注入失败记为 FAIL）。
+    health_log: std::sync::Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for InProcessMesh {
@@ -2693,6 +2695,7 @@ impl InProcessMesh {
             fail_once: Default::default(),
             versions: Default::default(),
             list_requests: Default::default(),
+            health_log: Default::default(),
         })
     }
 
@@ -2708,6 +2711,12 @@ impl InProcessMesh {
     /// DP-1：到各节点的 ListLocal 请求快照（断言旧版收不到新语义标志）。
     pub fn list_local_requests(&self) -> Vec<(String, crate::mesh::ListLocal)> {
         self.list_requests.lock().unwrap().clone()
+    }
+
+    /// 测试诊断：health 探测调用序列。
+    #[allow(dead_code)] // 测试诊断用；保留以便失败时打印探测序列
+    pub fn health_log(&self) -> Vec<String> {
+        self.health_log.lock().unwrap().clone()
     }
 
     /// 构建后回填（Store↔transport 循环：Store 构造需要 transport，transport 又指回 Store）。
@@ -2781,7 +2790,17 @@ impl InProcessMesh {
 #[async_trait::async_trait]
 impl crate::mesh::MeshTransport for InProcessMesh {
     async fn health(&self, node: &str) -> crate::error::Result<crate::mesh::NodeHealth> {
+        if self.take_fail(node, "health") {
+            self.health_log.lock().unwrap().push(format!("{node}:FAIL"));
+            return Err(crate::error::Error::Encode(format!(
+                "in-process 注入：{node} health 探针失败"
+            )));
+        }
         let version = self.versions.lock().unwrap().get(node).copied();
+        self.health_log
+            .lock()
+            .unwrap()
+            .push(format!("{node}:v={version:?}"));
         let mut h = self.peer(node).await?.mesh_health().await;
         if let Some(v) = version {
             h.data_wire_version = v;
@@ -2875,12 +2894,17 @@ impl crate::mesh::MeshTransport for InProcessMesh {
     async fn list_local(
         &self,
         n: &str,
-        l: crate::mesh::ListLocal,
+        mut l: crate::mesh::ListLocal,
     ) -> crate::error::Result<crate::mesh::ListLocalResp> {
         self.list_requests
             .lock()
             .unwrap()
             .push((n.to_string(), l.clone()));
+        // 版本覆盖 < 2 的节点模拟旧端：不认识的语义标志按 proto3 缺省忽略。
+        if self.versions.lock().unwrap().get(n).is_some_and(|v| *v < 2) {
+            l.marker_exclusive = false;
+            l.include_deleted = false;
+        }
         self.peer(n).await?.mesh_list_local(l).await
     }
     async fn list_uploads_local(
