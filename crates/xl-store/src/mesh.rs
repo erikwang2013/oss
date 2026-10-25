@@ -185,6 +185,14 @@ pub struct ListUploadsLocalResp {
     pub slots_ok: u32,
 }
 
+/// 单盘可用空间（shrink plan 的容量校验输入）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriveSpace {
+    pub set: u16,
+    pub drive: u16,
+    pub free_bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct NodeHealth {
     pub node_id: String,
@@ -200,6 +208,10 @@ pub struct NodeHealth {
     pub topo_epoch: u64,
     /// 拓扑指纹 hex（16 字符；无集群为空串）。见 [`TopologyAttestation`]。
     pub topo_hash: String,
+    /// 逐物理盘可用空间（shrink plan 容量校验；旧节点为空表 = 无法确认容量）。
+    pub drives: Vec<DriveSpace>,
+    /// maintenance 模式：非 GET/HEAD/OPTIONS 503、后台 worker 全停。
+    pub maintenance: bool,
 }
 
 /// 本节点拓扑指纹：`topo_epoch` + `topo_hash`（[`NodeHealth`] 字段 6/7 的来源）。

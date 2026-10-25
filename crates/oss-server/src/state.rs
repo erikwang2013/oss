@@ -327,6 +327,7 @@ impl AppState {
             enabled: cfg.ec.enabled,
         };
         store_cfg.inline_threshold = cfg.ec.inline_threshold;
+        store_cfg.maintenance = cfg.maintenance;
         // B10：控制面删桶路径的清理实现须在 Store::open 前注入（集群控制面写）。
         // AP 缓存 TTL/负缓存/上限（非法环境变量 → 启动失败，不静默降级）。
         let ap_cache = Arc::new(xl_s3::ap::ApCache::from_env()?);
@@ -343,8 +344,15 @@ impl AppState {
         // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
         // ClusterTopology::new 与 Store::open（self 一致性）。
         if let Some(cl) = cfg.cluster.as_ref() {
-            let sets_nodes = sets_nodes_by_set(&cl.nodes)?;
-            let sets = xl_store::store::ClusterSets::new(&cl.node_id, sets_nodes, &store_cfg.ec)?;
+            let sets_nodes = crate::config::sets_nodes_by_set(&cl.nodes)?;
+            // 拓扑 v3：显式槽表（epoch + [[cluster.slots]]）；未配置 = positional（旧行为）。
+            let slot_maps = cl.slot_maps(sets_nodes.len())?;
+            let sets = xl_store::store::ClusterSets::with_slot_maps(
+                &cl.node_id,
+                sets_nodes,
+                slot_maps,
+                &store_cfg.ec,
+            )?;
             // 路由表用 flat 去重节点集（同 id 多 set 各出一条时不得重复注册）
             let pairs: Vec<(String, String)> = sets
                 .flat
@@ -1002,33 +1010,6 @@ impl AppState {
             vault_probe,
         }
     }
-}
-
-/// M4 切片 8：节点按 set 分组（`set` 缺省 0；set 号须从 0 连续——缺号会让拓扑数组下标错位）。
-/// 独立成函数以便单测（配置是信任边界，fail-closed）。
-fn sets_nodes_by_set(
-    nodes: &[crate::config::NodeToml],
-) -> Result<Vec<Vec<xl_store::store::NodeSpec>>, String> {
-    let mut by_set: std::collections::BTreeMap<u16, Vec<xl_store::store::NodeSpec>> =
-        std::collections::BTreeMap::new();
-    for n in nodes {
-        by_set
-            .entry(n.set.unwrap_or(0))
-            .or_default()
-            .push(xl_store::store::NodeSpec {
-                id: n.id.clone(),
-                addr: n.addr.clone(),
-                drive_count: n.drive_count,
-            });
-    }
-    let k = by_set.len() as u16;
-    if by_set.keys().copied().ne(0..k) {
-        return Err(format!(
-            "cluster.nodes 的 set 号必须从 0 连续（现有 {:?}）",
-            by_set.keys().collect::<Vec<_>>()
-        ));
-    }
-    Ok(by_set.into_values().collect())
 }
 
 /// M9 S4（P1-7）：`[stretch]` 只允许全新部署——首次启用要求库内无桶/无 sync 桶、

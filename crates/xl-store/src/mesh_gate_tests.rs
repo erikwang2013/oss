@@ -116,6 +116,8 @@ impl MeshTransport for FakeMesh {
             data_wire_version: self.version,
             topo_epoch: self.topo_epoch,
             topo_hash: self.topo_hash.clone(),
+            drives: vec![],
+            maintenance: false,
         })
     }
     async fn lock(&self, _: &str, _: LockReq) -> Result<LockResp> {
@@ -219,6 +221,8 @@ fn peer_wire_version_normalizes_legacy_and_unknown_fails_closed() {
         data_wire_version: v,
         topo_epoch: 1,
         topo_hash: String::new(),
+        drives: vec![],
+        maintenance: false,
     };
     assert_eq!(h(0).peer_data_wire_version(), 1);
     assert_eq!(h(1).peer_data_wire_version(), 1);

@@ -580,6 +580,16 @@ impl MeshTransport for TonicMesh {
             // 拓扑指纹：旧节点缺省 0/空串 = 未宣告（消费方不得当匹配）。
             topo_epoch: resp.topo_epoch,
             topo_hash: resp.topo_hash,
+            drives: resp
+                .drives
+                .into_iter()
+                .map(|d| mesh::DriveSpace {
+                    set: d.set as u16,
+                    drive: d.drive as u16,
+                    free_bytes: d.free_bytes,
+                })
+                .collect(),
+            maintenance: resp.maintenance,
         })
     }
     // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
@@ -1247,6 +1257,16 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             data_wire_version: h.data_wire_version,
             topo_epoch: h.topo_epoch,
             topo_hash: h.topo_hash,
+            drives: h
+                .drives
+                .into_iter()
+                .map(|d| xl_proto::DriveSpace {
+                    set: d.set as u32,
+                    drive: d.drive as u32,
+                    free_bytes: d.free_bytes,
+                })
+                .collect(),
+            maintenance: h.maintenance,
         }))
     }
 

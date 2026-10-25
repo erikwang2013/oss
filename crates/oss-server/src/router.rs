@@ -201,7 +201,34 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
         let vpce = vpce.clone();
         async move { ap_peer(req, next, trust, vpc, vpce).await }
     }));
+    // M3 shrink：维护模式停写。最外层包裹（含 S3 fallback 与控制台写请求）；
+    // GET/HEAD/OPTIONS 保持在线，源节点只读供 mesh 拉取。gRPC mesh 不经过本 Router。
+    let app = if state.cfg.maintenance {
+        app.layer(middleware::from_fn(maintenance_gate))
+    } else {
+        app
+    };
     Ok(app)
+}
+
+/// maintenance：非只读方法一律 503（S3 错误 XML + Retry-After）。
+async fn maintenance_gate(req: Request, next: Next) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
+    let mut resp = Response::new(axum::body::Body::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>ServiceUnavailable</Code>\
+         <Message>maintenance in progress</Message></Error>",
+    ));
+    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    resp
 }
 
 /// 可信反代配置（仅 `OSS_AP_TRUSTED_PROXY` 开启时解析）：

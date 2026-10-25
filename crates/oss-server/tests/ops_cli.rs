@@ -122,3 +122,23 @@ fn set_mtime(path: &Path, when: SystemTime) {
 
     assert!(ok, "touch 失败");
 }
+
+/// shrink 持锁期间离线巡检/搬运入口必须拒绝（spec 5.6 互斥），返回码 1。
+#[tokio::test]
+async fn offline_commands_refuse_when_shrink_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    let _lock = xl_store::store::acquire_shrink_lock(st.store.root()).unwrap();
+    assert_eq!(
+        cli::run(Command::Fsck { repair: false }, st.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        cli::run(Command::Rebalance { dry_run: true }, st)
+            .await
+            .unwrap(),
+        1
+    );
+}

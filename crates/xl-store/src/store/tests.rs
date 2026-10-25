@@ -3006,6 +3006,20 @@ impl Cluster {
         drives_per_node: usize,
         placement_v2: bool,
     ) -> Cluster {
+        Self::new_full(nodes, drives_per_node, placement_v2, false).await
+    }
+
+    /// shrink plan 测试：全节点 maintenance=true（Store 层写路径不受影响，维护门在 HTTP 面）。
+    pub async fn new_in_maintenance(nodes: usize, drives_per_node: usize) -> Cluster {
+        Self::new_full(nodes, drives_per_node, false, true).await
+    }
+
+    async fn new_full(
+        nodes: usize,
+        drives_per_node: usize,
+        placement_v2: bool,
+        maintenance: bool,
+    ) -> Cluster {
         let mut tmpdirs = Vec::new();
         let mut node_dirs = Vec::new();
         for _ in 0..nodes {
@@ -3017,18 +3031,19 @@ impl Cluster {
             }
             node_dirs.push(dirs);
         }
-        Self::open_over(node_dirs, tmpdirs, placement_v2).await
+        Self::open_over(node_dirs, tmpdirs, placement_v2, maintenance).await
     }
 
     /// 在同一组盘上重开（扩容/换放置旗测试）：`dirs` 的保活由调用方（原 Cluster）负责。
     pub async fn reopen_over(dirs: Vec<Vec<std::path::PathBuf>>, placement_v2: bool) -> Cluster {
-        Self::open_over(dirs, Vec::new(), placement_v2).await
+        Self::open_over(dirs, Vec::new(), placement_v2, false).await
     }
 
     async fn open_over(
         node_dirs: Vec<Vec<std::path::PathBuf>>,
         tmpdirs: Vec<tempfile::TempDir>,
         placement_v2: bool,
+        maintenance: bool,
     ) -> Cluster {
         let nodes = node_dirs.len();
         let drives_per_node = node_dirs[0].len();
@@ -3071,6 +3086,7 @@ impl Cluster {
             cfg.drives = dirs.clone();
             cfg.ec = ec;
             cfg.fsync = false; // 测试提速（既有测试同款）
+            cfg.maintenance = maintenance;
             // 集群锁参数注小值（Task 8）：TTL 400ms、3 次重试、5–10ms 抖动——速度与语义两全
             cfg.cluster_lock_ttl_ms = 400;
             cfg.cluster_lock_retries = 3;

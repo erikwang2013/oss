@@ -78,8 +78,11 @@ message UploadListLocalResp { repeated UploadEntry uploads=1; repeated string pr
 // 旧节点两字段缺省 0/空串 → 消费方按「未宣告」处理，绝不当成匹配。
 message NodeHealth { string node_id=1; string version=2; repeated SlotState slots=3; uint64 buckets=4;
                      uint32 data_wire_version=5;
-                     uint64 topo_epoch=6; string topo_hash=7; }
+                     uint64 topo_epoch=6; string topo_hash=7;
+                     // shrink plan 容量校验：逐物理盘可用空间；maintenance = 停写维护模式。
+                     repeated DriveSpace drives=8; bool maintenance=9; }
 message SlotState { uint32 slot=1; bool up=2; }
+message DriveSpace { uint32 set=1; uint32 drive=2; uint64 free_bytes=3; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;
                   string holder=5; uint64 ttl_ms=6; LockOp op=7; }
 enum LockOp { ACQUIRE=0; RENEW=1; RELEASE=2; }

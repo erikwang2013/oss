@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::mesh::{NodeHealth, TopologyAttestation};
+use crate::mesh::{DriveSpace, NodeHealth, TopologyAttestation};
 use crate::meta;
 
 use super::Store;
@@ -78,11 +78,44 @@ impl Store {
             data_wire_version: crate::mesh_gate::DATA_WIRE_VERSION,
             topo_epoch: caps.topo_epoch,
             topo_hash: caps.topo_hash,
+            drives: self.drive_spaces(),
+            maintenance: self.cfg.maintenance,
         }
     }
 
-    /// 本节点拓扑指纹：无集群 → (1, 空串)；placement v1 → 1；v2 → 2。
-    /// hash 覆盖 EC 参数与全部 set 的节点表（按 id 排序），与 [`Store::mesh_health`] 同源。
+    /// 逐物理盘可用空间 + (set, 盘序)。集群按 `self_ranges` 分段；单机 set=0。
+    /// statvfs 失败按 0 计（shrink 容量校验因此 fail-closed）。
+    fn drive_spaces(&self) -> Vec<DriveSpace> {
+        self.cfg
+            .drives
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (set, ord) = match self.cfg.cluster.as_deref() {
+                    Some(cl) => cl
+                        .sets
+                        .self_ranges
+                        .iter()
+                        .find(|(_, off, len)| (i >= *off) && (i < off + len))
+                        .map(|(s, off, _)| (*s, (i - off) as u16))
+                        .unwrap_or((0, i as u16)),
+                    None => (0, i as u16),
+                };
+                let free_bytes = rustix::fs::statvfs(p)
+                    .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
+                    .unwrap_or(0);
+                DriveSpace {
+                    set,
+                    drive: ord,
+                    free_bytes,
+                }
+            })
+            .collect()
+    }
+
+    /// 本节点拓扑指纹：无集群 → (1, 空串)；positional 时 placement v1 → 1、v2 → 2；
+    /// 显式槽表（v3+）→ SlotMap epoch + `ClusterSets::topology_hash`（含槽表）。
+    /// positional hash 覆盖 EC 参数与全部 set 的节点表（按 id 排序），与 [`Store::mesh_health`] 同源。
     pub fn local_caps(&self) -> TopologyAttestation {
         match self.cfg.cluster.as_deref() {
             None => TopologyAttestation {
@@ -90,6 +123,12 @@ impl Store {
                 topo_hash: String::new(),
             },
             Some(cl) => {
+                if cl.sets.sets.iter().any(|t| t.slot_map().is_some()) {
+                    return TopologyAttestation {
+                        topo_epoch: cl.sets.topology_epoch(),
+                        topo_hash: cl.sets.topology_hash(),
+                    };
+                }
                 let epoch = if cl.placement_v2 { 2 } else { 1 };
                 crate::mesh_gate::local_caps(&cl.sets, &self.cfg.ec, epoch)
             }
@@ -827,5 +866,20 @@ mod tests {
         assert_eq!(h.topo_epoch, 1);
         assert!(h.topo_hash.is_empty());
         assert_eq!(single.local_caps().topo_epoch, 1);
+    }
+
+    /// T3：逐盘容量 + maintenance 随 health 上报（集群按 self_ranges 映射 set/盘序）。
+    #[tokio::test]
+    async fn mesh_health_advertises_drive_free_bytes_and_maintenance() {
+        let c = Cluster::new_in_maintenance(4, 3).await;
+        let hs = futures::future::join_all(c.stores.iter().map(|s| s.mesh_health())).await;
+        for h in &hs {
+            assert!(h.maintenance);
+            assert_eq!(h.drives.len(), 3, "每节点 3 盘");
+            let mut ords: Vec<u16> = h.drives.iter().map(|d| d.drive).collect();
+            ords.sort_unstable();
+            assert_eq!(ords, vec![0, 1, 2]);
+            assert!(h.drives.iter().all(|d| d.set == 0 && d.free_bytes > 0));
+        }
     }
 }
