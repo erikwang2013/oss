@@ -608,15 +608,16 @@ async fn account_manager_is_confined_and_cannot_escalate() {
         403
     );
 
-    // 全局管理员是账户成员时，账户管理员也不可停用（admin 挂到 A）
-    client
+    // 全局管理员不是账户成员：挂载被拒（404），对非成员停用同样是 404。
+    let attach_admin = client
         .post(format!("{base}/api/v1/accounts/{a}/members"))
         .bearer_auth(&admin)
         .json(&serde_json::json!({ "uid": 1, "role": "member" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(set_member_active(&base, &mgr, &a, 1, false).await, 403);
+    assert_eq!(attach_admin.status(), 404);
+    assert_eq!(set_member_active(&base, &mgr, &a, 1, false).await, 404);
 
     // 不存在的成员 → 404
     assert_eq!(
