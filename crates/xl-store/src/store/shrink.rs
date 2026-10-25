@@ -35,7 +35,13 @@ pub struct SlotMove {
 pub struct ShrinkPlan {
     pub old_epoch: u64,
     pub new_epoch: u64,
+    /// 旧拓扑的本地 canonical 指纹（`ClusterSets::topology_hash`，含槽位/物理序）。
+    /// apply/verify 用它与本地旧拓扑比较；**不要**用它与 peer health 的 wire hash 比较。
     pub old_hash: String,
+    /// 旧拓扑的 NodeHealth wire 指纹（`TopologyAttestation.topo_hash`），apply 阶段
+    /// 用于校验 peer health 一致；positional 与显式槽表使用不同渲染，故单独存放。
+    pub old_wire_hash: String,
+    /// 新拓扑的本地 canonical 指纹（`ClusterSets::topology_hash`）。
     pub new_hash: String,
     /// 新拓扑逐 set 槽数（必须与旧拓扑逐 set 相等）。
     pub slot_counts: Vec<u16>,
@@ -374,7 +380,8 @@ impl Store {
             plan: ShrinkPlan {
                 old_epoch: caps.topo_epoch,
                 new_epoch,
-                old_hash: caps.topo_hash,
+                old_hash: old.topology_hash(),
+                old_wire_hash: caps.topo_hash,
                 new_hash: new.topology_hash(),
                 slot_counts,
                 moves,

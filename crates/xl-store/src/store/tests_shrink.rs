@@ -289,6 +289,19 @@ async fn shrink_plan_reports_affected_slots_and_bytes() {
     assert_eq!(report.plan.new_epoch, 2);
     assert_eq!(report.plan.old_hash.len(), 16);
     assert_eq!(report.plan.new_hash.len(), 16);
+    // 旧拓扑是 positional：本地 canonical hash 与 wire hash 是两种渲染，必须分开存放，
+    // 否则 T5 apply 的「本地旧拓扑 == old_hash」与「peer health == old_hash」不能同时成立。
+    assert_eq!(
+        report.plan.old_hash,
+        s.cluster().unwrap().sets.topology_hash(),
+        "old_hash 必须是本地 ClusterSets 指纹"
+    );
+    assert_eq!(
+        report.plan.old_wire_hash,
+        s.local_caps().topo_hash,
+        "old_wire_hash 必须是 NodeHealth wire 指纹"
+    );
+    assert_ne!(report.plan.old_hash, report.plan.old_wire_hash);
     assert_eq!(report.plan.slot_counts, vec![12], "槽数不变量");
     assert_eq!(report.plan.moves.len(), 3, "{:?}", report.plan.moves);
     assert!(

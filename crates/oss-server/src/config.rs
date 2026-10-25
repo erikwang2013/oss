@@ -925,6 +925,12 @@ impl AppConfig {
     /// 与 `[cluster]`/`[[groups]]` 互斥。`[sync]` 仅校验上限，无 `[raft]` 时不生效。
     pub fn raft_validate(&self) -> Result<(), String> {
         self.sync_validate()?;
+        if self.maintenance {
+            return Err(
+                "maintenance 仅用于 [cluster] shrink；[raft] 模式下会阻断 raft RPC，拒绝启动"
+                    .into(),
+            );
+        }
         if let Some(r) = &self.raft {
             if r.role == RaftRole::Witness {
                 return Err("witness 必须使用 witness 子命令（serve 不接受 role=witness）".into());
@@ -1287,6 +1293,20 @@ mod tests {
         assert!(!off.maintenance);
         let on: AppConfig = toml::from_str(&format!("{base}maintenance = true\n")).unwrap();
         assert!(on.maintenance);
+    }
+
+    /// maintenance 是 [cluster] shrink 的停写开关；[raft] 的 RPC 是 POST，会被
+    /// middleware 一并拦截，故组合 fail-closed（而非静默丢失 raft 复制）。
+    #[test]
+    fn maintenance_rejects_raft_mode() {
+        let mut c = m9_cfg();
+        c.maintenance = true;
+        assert!(
+            c.raft_validate()
+                .unwrap_err()
+                .contains("maintenance 仅用于 [cluster]"),
+            "maintenance + raft 必须拒绝"
+        );
     }
 
     /// shrink 目标文件：显式槽表按文件顺序编号，epoch/node_id 校验 fail-closed。
