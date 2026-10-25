@@ -5,17 +5,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::*;
-use crate::mesh::{ListLocalResp, MetaAck, MetaSnapshot};
+use crate::mesh::{ListLocalResp, ListUploadsLocalResp, MetaAck, MetaSnapshot};
 
-/// 只覆盖测试用到的面：health 返回可配版本，数据面 RPC 计数。
+/// 只覆盖测试用到的面：health 返回可配版本/拓扑，数据面 RPC 计数。
 #[derive(Debug, Default)]
 struct FakeMesh {
     version: u32,
+    topo_epoch: u64,
+    topo_hash: String,
     /// true = health 探测失败（模拟不可达），数据面仍可被调用以复用既有错误语义。
     health_err: bool,
     health_calls: AtomicUsize,
     writes: AtomicUsize,
     reads: AtomicUsize,
+    list_calls: AtomicUsize,
+    uploads_listed: AtomicUsize,
     mpu_parts: AtomicUsize,
 }
 
@@ -80,8 +84,21 @@ impl MeshTransport for FakeMesh {
         Ok(vec![])
     }
     async fn list_local(&self, _: &str, _: ListLocal) -> Result<ListLocalResp> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         Ok(ListLocalResp {
             entries: vec![],
+            prefixes: vec![],
+            slots_ok: 0,
+        })
+    }
+    async fn list_uploads_local(
+        &self,
+        _: &str,
+        _: ListUploadsLocal,
+    ) -> Result<ListUploadsLocalResp> {
+        self.uploads_listed.fetch_add(1, Ordering::SeqCst);
+        Ok(ListUploadsLocalResp {
+            uploads: vec![],
             prefixes: vec![],
             slots_ok: 0,
         })
@@ -97,8 +114,8 @@ impl MeshTransport for FakeMesh {
             slots: vec![],
             buckets: 0,
             data_wire_version: self.version,
-            topo_epoch: 1,
-            topo_hash: String::new(),
+            topo_epoch: self.topo_epoch,
+            topo_hash: self.topo_hash.clone(),
         })
     }
     async fn lock(&self, _: &str, _: LockReq) -> Result<LockResp> {
@@ -164,9 +181,36 @@ fn mpu_upload() -> MpuPartUpload {
     }
 }
 
-/// 旧节点（含缺字段 = 0）一律按 1；本版 = 2。
+fn list_local() -> ListLocal {
+    ListLocal {
+        bucket: "b".into(),
+        prefix: String::new(),
+        delimiter: None,
+        marker: None,
+        marker_exclusive: false,
+        limit: 10,
+        include_deleted: false,
+    }
+}
+
+fn caps(wire: u32, epoch: u64, hash: &str) -> PeerCaps {
+    PeerCaps {
+        wire_version: wire,
+        topo_epoch: epoch,
+        topo_hash: hash.into(),
+    }
+}
+
+fn local(epoch: u64, hash: &str) -> LocalCaps {
+    LocalCaps {
+        topo_epoch: epoch,
+        topo_hash: hash.into(),
+    }
+}
+
+/// 旧节点（含缺字段 = 0）一律按 1；未知/未来 wire fail-closed。
 #[test]
-fn legacy_or_missing_version_is_one() {
+fn peer_wire_version_normalizes_legacy_and_unknown_fails_closed() {
     let h = |v| NodeHealth {
         node_id: "n1".into(),
         version: "x".into(),
@@ -180,43 +224,79 @@ fn legacy_or_missing_version_is_one() {
     assert_eq!(h(1).peer_data_wire_version(), 1);
     assert_eq!(h(2).peer_data_wire_version(), 2);
     assert_eq!(DATA_WIRE_VERSION, 2);
-    assert!(check_compatible("n1", 2).is_ok());
-    for bad in [0, 1, 3] {
-        let e = check_compatible("n1", bad).unwrap_err();
+    assert_eq!(PeerCaps::from_health(&h(0)).wire_version, 1);
+
+    let l = local(1, "");
+    assert_eq!(
+        check_peer("n1", &PeerCaps::from_health(&h(1)), &l).unwrap(),
+        PeerClass::Legacy
+    );
+    assert_eq!(
+        check_peer("n1", &PeerCaps::from_health(&h(2)), &l).unwrap(),
+        PeerClass::Current
+    );
+    // check_peer 只看已归一值：0 未归一 = 未知，必须拒绝
+    for bad in [0, 3] {
+        let e = check_peer("n1", &caps(bad, 1, ""), &l).unwrap_err();
         assert!(matches!(e, Error::PeerIncompatible(_)), "{bad}");
         assert!(e.to_string().contains("peer_incompatible"));
     }
 }
 
-/// 混版写/读：在发出任何数据面 RPC 前拒绝。
-#[tokio::test]
-async fn mixed_version_rejects_shard_write_and_read() {
-    let (g, fake) = gate(1);
-    assert!(matches!(
-        g.write_shard("n2", shard_write()).await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert!(matches!(
-        g.read_shard("n2", shard_read()).await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert_eq!(fake.writes.load(Ordering::SeqCst), 0);
-    assert_eq!(fake.reads.load(Ordering::SeqCst), 0);
+/// 放置 v2（local epoch ≥ 2）要求 peer 同时宣告 wire2 + epoch2 + 相同非空指纹；
+/// placement v1 下 epoch/hash 一旦宣告就必须一致。
+#[test]
+fn check_peer_rejects_placement_and_hash_mismatch() {
+    let v1 = local(1, "aaaa");
+    assert_eq!(
+        check_peer("n", &caps(2, 1, "aaaa"), &v1).unwrap(),
+        PeerClass::Current
+    );
+    // 旧节点未宣告拓扑：仍按 legacy 可服务
+    assert_eq!(
+        check_peer("n", &caps(1, 0, ""), &v1).unwrap(),
+        PeerClass::Legacy
+    );
+    // 宣告了就必须一致
+    assert!(check_peer("n", &caps(2, 1, "bbbb"), &v1).is_err());
+    assert!(check_peer("n", &caps(2, 2, "aaaa"), &v1).is_err());
+
+    let v2 = local(2, "aaaa");
+    assert_eq!(
+        check_peer("n", &caps(2, 2, "aaaa"), &v2).unwrap(),
+        PeerClass::Current
+    );
+    assert!(check_peer("n", &caps(1, 2, "aaaa"), &v2).is_err());
+    assert!(check_peer("n", &caps(2, 1, "aaaa"), &v2).is_err());
+    assert!(check_peer("n", &caps(2, 0, ""), &v2).is_err());
+    assert!(check_peer("n", &caps(2, 2, "bbbb"), &v2).is_err());
 }
 
-/// 同版本：行为逐字节保留（转发到内层）。
+/// 混版窗口：base 数据面（分片/meta/LMU）允许旧 peer，逐字节转发。
 #[tokio::test]
-async fn same_version_forwards_data_plane() {
-    let (g, fake) = gate(2);
+async fn mixed_version_allows_base_data_plane() {
+    let (g, fake) = gate(1);
     g.write_shard("n2", shard_write()).await.unwrap();
     g.read_shard("n2", shard_read()).await.unwrap();
-    assert_eq!(g.mpu_upload_part("n2", mpu_upload()).await.unwrap(), "etag");
+    g.list_uploads_local(
+        "n2",
+        ListUploadsLocal {
+            bucket: "b".into(),
+            prefix: String::new(),
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(fake.writes.load(Ordering::SeqCst), 1);
     assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
-    assert_eq!(fake.mpu_parts.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.uploads_listed.load(Ordering::SeqCst), 1);
 }
 
-/// MPU 转发（UploadPart/Abort/ListParts）混版拒绝。
+/// MPU 跨节点转发：旧 peer 在发出任何 RPC 前拒绝。
 #[tokio::test]
 async fn mpu_forwarding_rejected_on_mixed_version() {
     let (g, fake) = gate(1);
@@ -237,7 +317,91 @@ async fn mpu_forwarding_rejected_on_mixed_version() {
         g.mpu_list_parts("n2", r).await,
         Err(Error::PeerIncompatible(_))
     ));
+    assert!(matches!(
+        g.mpu_complete(
+            "n2",
+            MpuComplete {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: "n1.u".into(),
+                parts: vec![],
+                mode: crate::store::VersioningMode::Off,
+                encryption: None,
+                lock: None,
+            }
+        )
+        .await,
+        Err(Error::PeerIncompatible(_))
+    ));
     assert_eq!(fake.mpu_parts.load(Ordering::SeqCst), 0);
+}
+
+/// 带语义标志的 ListLocal 只发往现版 peer（旧版会忽略 → 静默缺项/重复边界键）。
+#[tokio::test]
+async fn list_local_semantic_flags_require_current_peer() {
+    let (g, fake) = gate(1);
+    g.list_local("n2", list_local()).await.unwrap();
+    for flags in [(true, false), (false, true)] {
+        let l = ListLocal {
+            marker_exclusive: flags.0,
+            include_deleted: flags.1,
+            ..list_local()
+        };
+        assert!(matches!(
+            g.list_local("n2", l).await,
+            Err(Error::PeerIncompatible(_))
+        ));
+    }
+    assert_eq!(
+        fake.list_calls.load(Ordering::SeqCst),
+        1,
+        "标志不得发往旧 peer"
+    );
+
+    let (g2, fake2) = gate(2);
+    for flags in [(true, false), (false, true)] {
+        let l = ListLocal {
+            marker_exclusive: flags.0,
+            include_deleted: flags.1,
+            ..list_local()
+        };
+        g2.list_local("n2", l).await.unwrap();
+    }
+    assert_eq!(fake2.list_calls.load(Ordering::SeqCst), 2);
+
+    // 未知 wire：连普通页也 fail-closed（不得当成本版）
+    let (g3, fake3) = gate(3);
+    assert!(matches!(
+        g3.list_local("n2", list_local()).await,
+        Err(Error::PeerIncompatible(_))
+    ));
+    assert_eq!(fake3.list_calls.load(Ordering::SeqCst), 0);
+}
+
+/// placement v2：未宣告 v2 指纹的 peer 一律拒绝，且不发出 RPC。
+#[tokio::test]
+async fn placement_v2_gate_rejects_unattested_peer() {
+    let legacy = Arc::new(FakeMesh {
+        version: 2,
+        topo_epoch: 1,
+        ..Default::default()
+    });
+    let g = GatedMesh::with_local(legacy.clone(), local(2, "aaaa"), Duration::ZERO);
+    assert!(matches!(
+        g.write_shard("n2", shard_write()).await,
+        Err(Error::PeerIncompatible(_))
+    ));
+    assert_eq!(legacy.writes.load(Ordering::SeqCst), 0);
+
+    let current = Arc::new(FakeMesh {
+        version: 2,
+        topo_epoch: 2,
+        topo_hash: "aaaa".into(),
+        ..Default::default()
+    });
+    let g = GatedMesh::with_local(current.clone(), local(2, "aaaa"), Duration::ZERO);
+    g.write_shard("n2", shard_write()).await.unwrap();
+    assert_eq!(current.writes.load(Ordering::SeqCst), 1);
 }
 
 /// health/控制面/锁不被数据面闸门阻断（否则混版下连诊断与鉴权都不可用）。

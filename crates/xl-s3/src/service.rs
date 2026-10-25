@@ -3908,6 +3908,7 @@ impl S3 for OssS3 {
             }
             other => other.map(|m| m as usize),
         };
+        // DP-1：混版/不可达导致的缺项并集 → 503 peer_incompatible（绝不回部分版本列表）。
         let vl = self
             .store
             .list_object_versions(
@@ -3918,6 +3919,8 @@ impl S3 for OssS3 {
                 version_id_marker.as_deref(),
             )
             .await
+            .map_err(to_s3_error)?
+            .require_complete()
             .map_err(to_s3_error)?;
 
         let versions: Vec<ObjectVersion> = vl

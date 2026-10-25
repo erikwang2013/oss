@@ -132,9 +132,12 @@ impl Store {
     }
 
     /// 集群列举（D4）：本机页 ∪ 各节点 ListLocal 页；远端不可达 warn 跳过（少一路并集）。
+    ///
+    /// DP-1 混版：legacy peer 忽略 `marker_exclusive`（V1 排他 marker）——这类请求改发
+    /// 包含式 marker，并在合并前丢弃 <= marker 的输出（不重复边界、marker 必前进），
+    /// 同时置 `degraded_marker` 供 S3 回降级头。未知 wire / 拓扑不一致仍 fail-closed
+    /// （不得静默给出不完整并集）；能力探测失败不得把 PeerIncompatible 吞成「不可达」。
     async fn list_objects_cluster(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {
-        // DP-0：远端页传输错会被「少一路并集」吞掉 → 混版下必须先 fail-closed。
-        self.ensure_data_plane_compatible().await?;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let self_id = cl.sets.flat.self_node().id.clone();
 
@@ -179,23 +182,55 @@ impl Store {
             objs.insert(e.key.clone(), (e, Some(info)));
         }
         let mut cps: Vec<String> = local_cps;
+        let local_caps = self.local_caps();
+        let mut degraded_marker = false;
+        // V1 排他页：远端可能按包含式返回 marker 本身（旧端忽略 marker_exclusive，或
+        // 探测失败被当成现版）。多取一条再过滤 <= marker 的输出，既让 marker 必前进，
+        // 又保住「每源先返回 max+1 个 > marker 输出」的完备性前提（见头注证明）。
+        let remote_limit = limit + usize::from(exclusive);
+        let after = if exclusive {
+            start_after.as_deref()
+        } else {
+            None
+        };
 
         for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
+            }
+            // 探测失败 = 不可达：V1 marker 页可能被旧端按包含式处理 → 显式降级；
+            // 请求仍按现版语义发出（未知不得当旧版），实际 RPC 错误另行处理。
+            let legacy = match cl.transport.peer_caps(&n.id).await {
+                Ok(caps) => matches!(
+                    crate::mesh_gate::check_peer(&n.id, &caps, &local_caps)?,
+                    crate::mesh_gate::PeerClass::Legacy
+                ),
+                Err(_) => {
+                    if exclusive {
+                        degraded_marker = true;
+                    }
+                    false
+                }
+            };
+            if legacy && exclusive {
+                degraded_marker = true;
             }
             let l = crate::mesh::ListLocal {
                 bucket: bucket.into(),
                 prefix: prefix.clone(),
                 delimiter: delimiter.map(|d| d.to_string()),
                 marker: start_after.clone(),
-                marker_exclusive: exclusive,
-                limit,
+                marker_exclusive: exclusive && !legacy,
+                limit: remote_limit,
                 include_deleted: false,
             };
             match cl.transport.list_local(&n.id, l).await {
                 Ok(resp) => {
                     for e in resp.entries {
+                        // 排他 marker 页的并集不得含 <= marker 的输出（重复会让客户端原地打转）。
+                        if after.is_some_and(|m| e.key.as_str() <= m) {
+                            continue;
+                        }
                         match objs.get(&e.key) {
                             Some((cur, _)) if cur.max_mod_time_nanos >= e.max_mod_time_nanos => {}
                             _ => {
@@ -204,18 +239,29 @@ impl Store {
                         }
                     }
                     for cp in resp.prefixes {
+                        if after.is_some_and(|m| cp.as_str() <= m) {
+                            continue;
+                        }
                         if !cps.contains(&cp) {
                             cps.push(cp);
                         }
                     }
                 }
+                // 能力闸门在第二次探测才发现旧版：不得当成「不可达」吞掉整路（静默缺项）。
+                Err(e @ Error::PeerIncompatible(_)) => return Err(e),
                 Err(e) => {
+                    // 丢一路并集：V1 marker 页必须让客户端看到降级（头由 S3 层回）。
+                    if exclusive {
+                        degraded_marker = true;
+                    }
                     tracing::warn!(node = %n.id, error = %e, "远端列举不可达（少一路并集）")
                 }
             }
         }
 
-        Ok(merge_page(max, objs.into_values(), cps))
+        let mut result = merge_page(max, objs.into_values(), cps);
+        result.degraded_marker = degraded_marker;
+        Ok(result)
     }
 
     // 可见性等价于原先在 crate::store 里的私有：store 子树（含 store::tests）可用，子树外不可见。

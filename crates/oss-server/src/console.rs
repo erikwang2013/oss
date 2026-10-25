@@ -418,8 +418,7 @@ async fn cluster_status(
     match state.store.cluster() {
         Some(c) => {
             let peers = crate::router::probe_peers(&state).await;
-            let (data_plane_compatible, incompatible_peers) =
-                crate::router::data_plane_status(&peers);
+            let status = crate::router::data_plane_status(&peers, &state.store.local_caps());
             let me = c.sets.flat.self_node();
             let mut nodes = vec![serde_json::json!({
                 "id": me.id, "addr": me.addr, "drive_count": me.drive_count, "up": true,
@@ -467,11 +466,12 @@ async fn cluster_status(
                 "sets": sets_view,
                 "nodes": nodes,
                 "quorum_unmet": quorum_unmet,
-                // DP-0：混版时数据面 fail-closed（503 peer_incompatible）；
+                // DP-1：legacy peer = 降级可服务；未知 wire/拓扑不一致 = fail-closed；
                 // down 节点不参与版本结论。
                 "data_wire_version": xl_store::mesh_gate::DATA_WIRE_VERSION,
-                "data_plane_compatible": data_plane_compatible,
-                "incompatible_peers": incompatible_peers,
+                "data_plane_compatible": status.compatible,
+                "degraded_peers": status.degraded_peers,
+                "incompatible_peers": status.incompatible_peers,
             }))
             .into_response()
         }
@@ -489,9 +489,10 @@ async fn cluster_status(
                     "up": true,
                 }],
                 "quorum_unmet": quorum_unmet,
-                // DP-0：单机 = 自身即全集群，恒兼容。
+                // DP-1：单机 = 自身即全集群，恒兼容、无降级。
                 "data_wire_version": xl_store::mesh_gate::DATA_WIRE_VERSION,
                 "data_plane_compatible": true,
+                "degraded_peers": Vec::<String>::new(),
                 "incompatible_peers": Vec::<String>::new(),
             }))
             .into_response()

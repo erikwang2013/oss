@@ -20,7 +20,11 @@ use super::ec;
 /// `set_index;` + 该 set 节点按 id 升序的 `id,addr,drive_count;`；SHA-256 前 8 字节 hex。
 ///
 /// 跨节点/跨版本约定：任何一端改了这份渲染即指纹全变（升级需显式 epoch 递增）。
-fn topo_fingerprint(sets: &drives::ClusterSets, ec: &ec::EcConfig, epoch: u64) -> String {
+pub(crate) fn topo_fingerprint(
+    sets: &drives::ClusterSets,
+    ec: &ec::EcConfig,
+    epoch: u64,
+) -> String {
     use sha2::Digest as _;
     let mut canon = format!("{epoch};{};{};{};", ec.data, ec.parity, ec.enabled);
     for (i, topo) in sets.sets.iter().enumerate() {
@@ -87,29 +91,29 @@ impl Store {
             },
             Some(cl) => {
                 let epoch = if cl.placement_v2 { 2 } else { 1 };
-                TopologyAttestation {
-                    topo_epoch: epoch,
-                    topo_hash: topo_fingerprint(&cl.sets, &self.cfg.ec, epoch),
-                }
+                crate::mesh_gate::local_caps(&cl.sets, &self.cfg.ec, epoch)
             }
         }
     }
 
-    /// DP-0 数据面前置握手：并发探测全部对端的数据面版本。
+    /// 数据面前置判定（每个数据面入口/扇出前）：并发探测全部对端能力并套用
+    /// [`crate::mesh_gate::check_peer`] 策略。
     ///
-    /// 语义（availability 优先于猜测）：**探测失败/超时 = 不可达**，不在此处拒绝——
-    /// 交给既有 quorum/降级语义；只有「可达且版本不一致」才 fail-closed 返回
-    /// [`Error::PeerIncompatible`]（S3 503 `peer_incompatible`）。单节点/未配集群恒 Ok。
+    /// 语义：
+    /// - placement v1：可达的 legacy peer 放行（混版窗口），未知 wire / 拓扑不一致 fail-closed；
+    /// - placement v2：**任何** peer 必须现版且指纹一致——探测失败同样拒绝
+    ///   （「无法确认」不得当成兼容，否则 v1/v2 放置会混写）。
     ///
-    /// 生产传输（[`crate::mesh_gate::GatedMesh`]）把版本缓存 TTL 化，热路径不逐请求探测。
+    /// 生产传输（[`crate::mesh_gate::GatedMesh`]）把能力缓存 TTL 化，热路径不逐请求探测。
     pub async fn ensure_data_plane_compatible(&self) -> Result<()> {
         // 探测预算刻意短于读快路径阈值：慢/不可达 peer 交给既有 quorum/降级语义，
-        // 只有「快速可达且版本不一致」才在入口 fail-closed；生产每个数据 RPC 仍由
+        // 只有「快速可达且不兼容」才在入口 fail-closed；生产每个数据 RPC 仍由
         // GatedMesh 逐目标校验（带 10s 缓存）。
         const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return Ok(());
         };
+        let local = self.local_caps();
         let self_id = cl.sets.flat.self_node().id.as_str();
         let peers: Vec<&str> = cl
             .sets
@@ -121,13 +125,16 @@ impl Store {
             .collect();
         let probes = peers.iter().map(|peer| {
             let transport = &cl.transport;
+            let local = &local;
             async move {
-                let got =
-                    tokio::time::timeout(PROBE_TIMEOUT, transport.data_wire_version(peer)).await;
-                match got {
-                    Ok(Ok(v)) => crate::mesh_gate::check_compatible(peer, v),
-                    // 不可达/超时：不伪装成版本不兼容。
-                    Ok(Err(_)) | Err(_) => Ok(()),
+                match tokio::time::timeout(PROBE_TIMEOUT, transport.peer_caps(peer)).await {
+                    Ok(Ok(caps)) => crate::mesh_gate::check_peer(peer, &caps, local).map(|_| ()),
+                    // 不可达/超时：placement v1 交给既有 quorum/降级语义（不伪装成混版）；
+                    // placement v2 无法确认即拒绝（混版窗口只支持 v1）。
+                    Ok(Err(_)) | Err(_) if local.topo_epoch < 2 => Ok(()),
+                    _ => Err(Error::PeerIncompatible(format!(
+                        "placement v2 无法确认节点 {peer} 的能力（不可达/探测超时），拒绝混写"
+                    ))),
                 }
             }
         });

@@ -23,7 +23,7 @@ mod fsck;
 mod gc;
 mod list;
 mod lock;
-mod mesh_api;
+pub(crate) mod mesh_api;
 mod mpu;
 mod mpu_route;
 mod put;
@@ -199,6 +199,9 @@ pub struct ListResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_token: Option<String>,
+    /// DP-1：V1 marker 页在混版窗口中的**语义降级**——legacy peer 忽略排他 marker，
+    /// 边界键会重复出现（不会丢键）。S3 层据此回 `x-oss-degraded: list-marker`。
+    pub degraded_marker: bool,
 }
 
 /// ListMultipartUploads 请求。排序键是 (key, upload_id)：key_marker 排他，
@@ -229,6 +232,8 @@ pub struct UploadListResult {
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
     pub next_upload_id_marker: Option<String>,
+    /// DP-1：并集可能缺项（legacy peer 或不可达）。S3 层回 `x-oss-degraded: mpu-union`。
+    pub degraded: bool,
 }
 
 pub struct Store {
@@ -1782,6 +1787,8 @@ mod tests;
 mod tests_cmk_rewrap;
 #[cfg(test)]
 mod tests_crypto;
+#[cfg(test)]
+mod tests_dp1;
 #[cfg(test)]
 mod tests_lock;
 #[cfg(test)]

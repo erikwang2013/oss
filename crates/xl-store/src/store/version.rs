@@ -154,6 +154,20 @@ pub struct VersionList {
     pub degraded: bool,
 }
 
+impl VersionList {
+    /// DP-1：用户可见的版本列表**绝不返回部分并集**——混版窗口（legacy peer 不支持
+    /// `include_deleted` 语义）或 peer 不可达导致的缺项一律 503 `peer_incompatible`。
+    /// 内部运维调用方（tier 扫描等）仍可自行读 `degraded` 降级处理。
+    pub fn require_complete(self) -> Result<Self> {
+        if self.degraded {
+            return Err(Error::PeerIncompatible(
+                "版本列表在混版窗口中不完整（peer 为旧数据面或不可达），拒绝返回部分结果".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
 impl Store {
     /// 版本感知删除（M4 切片 3 / S3 Suspended）。
     /// - `version_id=None` 且 Enabled：追加真 UUID delete marker——**键不存在也创建**（S3 语义）。
@@ -1165,10 +1179,6 @@ impl Store {
         if max == 0 {
             return Ok(VersionList::default());
         }
-        // DP-0：版本枚举的远端页错误会被「少一路并集（degraded）」吞掉 → 混版先 fail-closed。
-        if self.cfg.cluster.is_some() {
-            self.ensure_data_plane_compatible().await?;
-        }
         // 续点参数成对出现（S3 语义）：只给 version-id-marker 无从定位
         if version_id_marker.is_some() && key_marker.is_none() {
             return Err(Error::InvalidArgument(
@@ -1195,9 +1205,21 @@ impl Store {
         let mut degraded = false;
         if let Some(cl) = self.cfg.cluster.as_deref() {
             let self_id = cl.sets.flat.self_node().id.clone();
+            let local_caps = self.local_caps();
             for n in &cl.sets.flat.nodes {
                 if n.id == self_id {
                     continue;
+                }
+                // 未知 wire / 拓扑不一致 → fail-closed；不可达 → 缺项（degraded）。
+                let wire = match cl.transport.peer_caps(&n.id).await {
+                    Ok(caps) => {
+                        crate::mesh_gate::check_peer(&n.id, &caps, &local_caps)?;
+                        caps.wire_version
+                    }
+                    Err(_) => 0,
+                };
+                if wire < 2 {
+                    degraded = true;
                 }
                 let req = crate::mesh::ListLocal {
                     bucket: bucket.into(),
@@ -1209,7 +1231,8 @@ impl Store {
                     marker_exclusive: false,
                     // +2 同本地：续点键可能产出 0 条，多取一键用于判定截断。
                     limit: max + 2,
-                    include_deleted: true,
+                    // 旧版忽略该标志 → 键集会缺 delete-marker 链尾键，degraded 已置位。
+                    include_deleted: wire >= 2,
                 };
                 match cl.transport.list_local(&n.id, req).await {
                     Ok(page) => keys.extend(page.entries.into_iter().map(|e| e.key)),
