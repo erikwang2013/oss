@@ -1857,6 +1857,8 @@ pub type ServerTlsWatch = watch::Receiver<Option<Arc<rustls::ServerConfig>>>;
 
 /// mesh gRPC 握手超时（与主 HTTP 监听器同口径）。
 const MESH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// mesh gRPC 并发握手上限（与主 HTTP 监听器同口径）：耗尽时断开新连接（fail closed）。
+const MESH_MAX_CONCURRENT_HANDSHAKES: usize = 1024;
 
 /// 同 [`serve`]，但每条新连接从 `tls` 取当前快照做 rustls 握手（ALPN h2）后交给
 /// tonic；成功 reload 后新连接即用新证书/客户端 CA，旧连接保持旧物料。
@@ -1879,6 +1881,9 @@ pub async fn serve_tls_watch(
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let accept =
         tokio::spawn(async move {
+            // 每监听器独立限额；许可随握手任务结束（成功/失败/超时）释放。
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MESH_MAX_CONCURRENT_HANDSHAKES));
+            let mut dropped: u64 = 0;
             loop {
                 let (tcp, _peer) = match listener.accept().await {
                     Ok(pair) => pair,
@@ -1886,6 +1891,12 @@ pub async fn serve_tls_watch(
                         tracing::warn!(error = %e, "mesh TCP accept 失败");
                         continue;
                     }
+                };
+                // 无可用许可直接断开：不排队、不堆积握手任务（fail closed）。
+                let Some(permit) = semaphore.clone().try_acquire_owned().ok() else {
+                    dropped += 1;
+                    tracing::debug!(dropped, "mesh TLS 握手并发已达上限，断开新连接");
+                    continue;
                 };
                 // 每连接取一次快照：reload 失败时 Tls 保留旧快照；取不到（未配置
                 // [tls.server]）时 fail closed，绝不回退明文。
@@ -1895,6 +1906,7 @@ pub async fn serve_tls_watch(
                 };
                 let tx = tx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let acceptor = tokio_rustls::TlsAcceptor::from(config);
                     let result =
                         match tokio::time::timeout(MESH_HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
