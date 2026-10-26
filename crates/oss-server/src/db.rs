@@ -383,13 +383,53 @@ impl Db {
         }
         db.prepare_raft_mode(raft).await?;
         // standalone 启动即回填并规范化（v2 移出全局管理员）；放在模式守卫之后：Raft 库被
-        // 误按 standalone 启动时，不得在报错前写 canonical marker。Raft 模式下账户表由
-        // leader 的 canonicalization worker 写，节点本地不跑回填（否则各节点派生 ID 分叉）。
-        if !raft {
+        // 误按 standalone 启动时，不得在报错前写 canonical marker。Raft 下不跑 uid 派生
+        // 回填（各节点 uid 不同会分叉）：空账户表原子补 canonical marker，已有非 canonical
+        // 行则拒绝启动，交由快照/导出规范化。
+        if raft {
+            db.ensure_raft_accounts_canonical().await?;
+        } else {
             db.backfill_accounts().await?;
             db.backfill_accounts_v2().await?;
         }
         Ok(db)
+    }
+
+    /// Raft 启动守卫：账户两表只能在 canonical marker 之后跨节点解释。
+    /// 全新集群（两表均空）原子写 marker；任一表非空但没有 marker，说明是节点本地
+    /// uid 派生数据，拒绝启动（绝不能跑 standalone v2 回填——各节点 uid 不同会分叉）。
+    async fn ensure_raft_accounts_canonical(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+                .bind(META_ACCOUNTS_CANONICAL)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if marker.is_some() {
+            return Ok(());
+        }
+        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&mut *tx)
+            .await?;
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members")
+            .fetch_one(&mut *tx)
+            .await?;
+        if accounts != 0 || members != 0 {
+            return Err(sqlx::Error::Protocol(format!(
+                "Raft 模式启动失败：缺少 schema_meta.{META_ACCOUNTS_CANONICAL} 但账户表非空 \
+                 (accounts={accounts}, account_members={members})；这些行是节点本地 uid 派生\
+                 数据，跨节点不可解释。请先用 OSSCTL3 快照/导出规范化后再启动"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
+             ON CONFLICT(key) DO UPDATE SET value = 'done'",
+        )
+        .bind(META_ACCOUNTS_CANONICAL)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// 模式切换（无条件调用）：
@@ -2135,7 +2175,7 @@ impl Db {
         Ok(true)
     }
 
-    // ---- AC-0：多租户账户（standalone 模式；Raft 下只读回填结果）----
+    // ---- AC-0：多租户账户（standalone 直写；Raft 经 ControlCommand apply）----
 
     /// 启动回填：每个存量用户 → 其 uid 派生账户（role=owner），并保证系统账户存在。
     /// 只跑一次（`schema_meta.accounts_backfill_v1`）：显式迁出派生账户的用户重启后不被拉回。

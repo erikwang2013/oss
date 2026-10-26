@@ -1556,6 +1556,12 @@ mod tests {
     async fn read_tx_gates_accounts_on_canonical_marker() {
         let dir = tempfile::tempdir().unwrap();
         let db = raft_db(&dir, "gated-accounts.db").await;
+        // 启动守卫会给空账户表写 marker；本测试需要 marker 之前的过渡状态。
+        sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+            .bind(crate::db::META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
         sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
             .execute(&mut *tx)
@@ -1635,11 +1641,14 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        sqlx::query("INSERT INTO schema_meta (key, value) VALUES (?, 'done')")
-            .bind(crate::db::META_ACCOUNTS_CANONICAL)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
+             ON CONFLICT(key) DO UPDATE SET value = 'done'",
+        )
+        .bind(crate::db::META_ACCOUNTS_CANONICAL)
+        .execute(db.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO accounts (id, name, status, admin_uid, created_at, updated_at) \
              VALUES ('000000000010', 'bad-admin', 'active', ?, 1, 1)",
