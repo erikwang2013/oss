@@ -5,7 +5,8 @@
 //! 任何读取/解析/构建错误都保留旧物料（fail closed）。主监听器每个新连接取一次
 //! 快照（见 [`crate::tls_server`]），出站客户端在下次取用时拿到新配置；长连接
 //! 组件按 [`Tls::generation`]（Kafka）或 [`Tls::tonic_client_watch`]（mesh gRPC）
-//! 重建客户端，旧连接上的在途请求继续完成。
+//! 重建客户端，旧连接上的在途请求继续完成；mesh gRPC 入站由
+//! [`Tls::mesh_server_watch`] 每连接取快照。
 //!
 //! rustls 0.23 同时编译 ring 与 aws-lc-rs 时 `builder()` 会 panic；进程启动时
 //! 通过 [`install_provider`] 安装 ring，并在所有自建配置里显式 `builder_with_provider`。
@@ -53,6 +54,8 @@ struct ServerMaterial {
     key_pem: Vec<u8>,
     client_ca_pem: Option<Vec<u8>>,
     config: Arc<ServerConfig>,
+    /// mesh gRPC 入站配置：同证书/客户端 CA 校验器，ALPN 仅 h2（tonic acceptor 口径）。
+    mesh_config: Arc<ServerConfig>,
     /// 叶证书 SHA-256（日志只记指纹，绝不记私钥）。
     fingerprint: String,
 }
@@ -87,6 +90,9 @@ pub struct Tls {
     /// mesh gRPC 通道热加载信号：值 = 当前 tonic 客户端配置（`None` = 未启用 peer TLS）。
     /// 只有通过校验的新物料才发送；reload 失败不发送，订阅者继续用旧通道（fail closed）。
     tonic_client_tx: watch::Sender<Option<tonic::transport::ClientTlsConfig>>,
+    /// mesh gRPC 入站热加载信号：值 = 当前 rustls 服务端配置（`None` = 未启用 peer TLS）。
+    /// 每连接取一次快照；reload 失败不发送，接收方继续用旧快照（fail closed）。
+    mesh_server_tx: watch::Sender<Option<Arc<ServerConfig>>>,
     /// `tonic_client`/`tonic_client_watch` 被使用过：reload 必须先成功构建客户端配置
     /// （CA/身份解析校验）才能替换快照——tonic 配置本身不解析 PEM，不能只靠它兜底。
     tonic_in_use: AtomicBool,
@@ -111,7 +117,9 @@ impl Tls {
         };
         let loaded = read_loaded(server.as_ref(), &client)?;
         let initial_tonic = loaded.server.as_ref().map(|_| tonic_client_from(&loaded));
+        let initial_mesh = loaded.server.as_ref().map(|s| Arc::clone(&s.mesh_config));
         let (tonic_client_tx, _) = watch::channel(initial_tonic);
+        let (mesh_server_tx, _) = watch::channel(initial_mesh);
         Ok(Arc::new(Self {
             server,
             client,
@@ -120,6 +128,7 @@ impl Tls {
             last_reload: Mutex::new(None),
             generation: AtomicU64::new(0),
             tonic_client_tx,
+            mesh_server_tx,
             tonic_in_use: AtomicBool::new(false),
         }))
     }
@@ -218,6 +227,13 @@ impl Tls {
         self.tonic_client_tx.subscribe()
     }
 
+    /// mesh gRPC 入站 TLS 热加载订阅：初始 = 当前配置（未配置 `[tls.server]` 时为 None，
+    /// 明文部署行为不变）。接收方每条新连接取一次快照——成功 reload 后新连接用新证书/
+    /// 客户端 CA 校验器，旧连接继续用旧物料；失败 reload 不发布，订阅者仍用旧快照。
+    pub fn mesh_server_watch(&self) -> watch::Receiver<Option<Arc<ServerConfig>>> {
+        self.mesh_server_tx.subscribe()
+    }
+
     /// 成功热加载的代次（内容未变/失败不递增）。
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -274,10 +290,13 @@ impl Tls {
             tracing::info!(sha256 = %s.fingerprint, "TLS 服务端证书已热加载");
         }
         let tonic = fresh.server.as_ref().map(|_| tonic_client_from(&fresh));
+        let mesh = fresh.server.as_ref().map(|s| Arc::clone(&s.mesh_config));
         *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         self.generation.fetch_add(1, Ordering::Release);
-        // 订阅者（mesh gRPC）下次 RPC 前重建通道；发送失败仅表示当前无订阅者。
+        // 订阅者（mesh gRPC）下次 RPC 前重建通道 / 新连接换新入站配置；
+        // 发送失败仅表示当前无订阅者。
         let _ = self.tonic_client_tx.send(tonic);
+        let _ = self.mesh_server_tx.send(mesh);
         Ok(true)
     }
 
@@ -346,12 +365,14 @@ fn read_loaded(server: Option<&ServerPaths>, client: &ClientPaths) -> Result<Loa
                 ],
             );
             let config = build_server_config(&cert_pem, &key_pem, client_ca_pem.as_deref())?;
+            let mesh_config = mesh_config_from(&config);
             let fingerprint = cert_fingerprint(&cert_pem, "[tls.server].cert")?;
             Some(ServerMaterial {
                 cert_pem,
                 key_pem,
                 client_ca_pem,
                 config,
+                mesh_config,
                 fingerprint,
             })
         }
@@ -489,6 +510,14 @@ fn build_server_config(
         .map_err(|e| format!("[tls.server] 证书/私钥不匹配：{e}"))?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
+}
+
+/// mesh gRPC 入站配置：ALPN 仅 h2（tonic 服务端 acceptor 只推 h2），其余物料
+/// （含 mTLS client-CA 校验器）与 HTTP 监听器共用同一份已校验快照。
+fn mesh_config_from(config: &ServerConfig) -> Arc<ServerConfig> {
+    let mut mesh = config.clone();
+    mesh.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(mesh)
 }
 
 /// mesh gRPC 客户端配置（快照 → tonic 配置；仅供热加载信号与兼容访问器复用）。
