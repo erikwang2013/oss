@@ -198,6 +198,45 @@ fn all_variants() -> Vec<ControlCommand> {
             bucket: "b1".into(),
             id: "inv1".into(),
         },
+        // Level 3 账户/成员命令：自然键 + 预计算值。
+        ControlCommand::AccountCreate {
+            id: "000000000001".into(),
+            name: "acme".into(),
+            bucket_quota: Some(1),
+            created_at: 1,
+        },
+        ControlCommand::AccountUpdate {
+            id: "000000000001".into(),
+            name: Some("acme2".into()),
+            status: Some("disabled".into()),
+            updated_at: 1,
+        },
+        ControlCommand::AccountSetQuota {
+            id: "000000000001".into(),
+            bucket_quota: None,
+            updated_at: 1,
+        },
+        ControlCommand::AccountDelete {
+            id: "000000000001".into(),
+        },
+        ControlCommand::AccountMemberAttach {
+            account_id: "000000000001".into(),
+            username: "alice".into(),
+            role: "member".into(),
+            created_at: 1,
+        },
+        ControlCommand::AccountMemberSetStatus {
+            account_id: "000000000001".into(),
+            username: "alice".into(),
+            active: false,
+        },
+        ControlCommand::AccountUserCreate {
+            account_id: "000000000001".into(),
+            username: "bob".into(),
+            password_hash: "h".into(),
+            role: "member".into(),
+            created_at: 1,
+        },
         // Level C M1：命令演进容器（level 3）；type_id 由提交方定义，payload 任意 JSON。
         ControlCommand::Ext {
             type_id: "future.demo".into(),
@@ -255,10 +294,10 @@ fn control_command_field_set_matches_frozen_fixture() {
     }
 }
 
-/// Level C M1：level-3 词汇表固定；生产命令集中**只有** `Ext` 要求 level 3，
-/// 其余命令仍为 1/2（旧二进制必须能解析并应用）。
+/// Level C M1：level-3 词汇表固定；生产命令集中只有 `Ext` 与账户/成员命令要求
+/// level 3，其余命令仍为 1/2（旧二进制必须能解析并应用）。
 #[test]
-fn feature_level_three_is_open_only_for_ext() {
+fn feature_level_three_is_open_only_for_ext_and_accounts() {
     use oss_server::raft::compat::{
         FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE,
         MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup, supports,
@@ -283,20 +322,32 @@ fn feature_level_three_is_open_only_for_ext() {
         "配置低于已激活 marker 必须拒绝"
     );
 
-    let mut ext = 0;
+    let (mut ext, mut accounts) = (0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
-        if matches!(cmd, ControlCommand::Ext { .. }) {
-            ext += 1;
-            assert_eq!(level, FEATURE_COMMAND_EXT);
-        } else {
-            assert!(
+        match cmd {
+            ControlCommand::Ext { .. } => {
+                ext += 1;
+                assert_eq!(level, FEATURE_COMMAND_EXT);
+            }
+            ControlCommand::AccountCreate { .. }
+            | ControlCommand::AccountUpdate { .. }
+            | ControlCommand::AccountSetQuota { .. }
+            | ControlCommand::AccountDelete { .. }
+            | ControlCommand::AccountMemberAttach { .. }
+            | ControlCommand::AccountMemberSetStatus { .. }
+            | ControlCommand::AccountUserCreate { .. } => {
+                accounts += 1;
+                assert_eq!(level, FEATURE_LEVEL_3);
+            }
+            _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
-                "{cmd:?} 要求 level {level}，但只有 Ext 可以是 level 3"
-            );
+                "{cmd:?} 要求 level {level}，但只有 Ext/账户命令可以是 level 3"
+            ),
         }
     }
     assert_eq!(ext, 1, "生产命令集恰好一个 Ext 样本");
+    assert_eq!(accounts, 7, "生产命令集恰好七个账户命令样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

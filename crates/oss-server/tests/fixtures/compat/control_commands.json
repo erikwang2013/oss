@@ -31,6 +31,44 @@
     "policy_json",
     "updated_at"
   ],
+  "AccountCreate": [
+    "bucket_quota",
+    "created_at",
+    "id",
+    "name"
+  ],
+  "AccountDelete": [
+    "id"
+  ],
+  "AccountMemberAttach": [
+    "account_id",
+    "created_at",
+    "role",
+    "username"
+  ],
+  "AccountMemberSetStatus": [
+    "account_id",
+    "active",
+    "username"
+  ],
+  "AccountSetQuota": [
+    "bucket_quota",
+    "id",
+    "updated_at"
+  ],
+  "AccountUpdate": [
+    "id",
+    "name",
+    "status",
+    "updated_at"
+  ],
+  "AccountUserCreate": [
+    "account_id",
+    "created_at",
+    "password_hash",
+    "role",
+    "username"
+  ],
   "BucketClearDefaultEncryption": [
     "bucket"
   ],

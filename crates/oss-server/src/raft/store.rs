@@ -593,9 +593,10 @@ impl SqliteStateMachine {
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
         let snapshot = data::decode_snapshot(bytes).map_err(Self::data_err)?;
-        // 单向门：本机已激活 level 3（或已规范化账户）后，level<3 快照不可能携带
-        // 账户行，整表安装会静默清空账户（marker 又不清除），在任何锁/写之前拒绝。
-        // marker 与 activation 是独立事实（standalone→raft 直启可 marker 有而激活 1）。
+        // 单向门：本机已激活 level 3（或规范化账户表里已有行）后，level<3 快照不可能
+        // 携带账户行，整表安装会静默清空账户（marker 又不清除），在任何锁/写之前拒绝。
+        // marker 与 activation 是独立事实（standalone→raft 直启可 marker 有而激活 1）；
+        // 空表上的 marker 只是启动规则，允许加入旧级别集群（无行可清）。
         let local_activation = self.activation.load(Ordering::Relaxed);
         if snapshot.feature_level < super::compat::FEATURE_LEVEL_3 {
             let canonical: Option<String> =
@@ -604,10 +605,21 @@ impl SqliteStateMachine {
                     .fetch_optional(&self.pool)
                     .await
                     .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
-            if local_activation >= super::compat::FEATURE_LEVEL_3 || canonical.is_some() {
+            let canonical_rows: i64 = if canonical.is_some() {
+                sqlx::query_scalar(
+                    "SELECT (SELECT COUNT(*) FROM accounts) + \
+                            (SELECT COUNT(*) FROM account_members)",
+                )
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?
+            } else {
+                0
+            };
+            if local_activation >= super::compat::FEATURE_LEVEL_3 || canonical_rows != 0 {
                 return Err(Self::data_err(data::DataError::Format(format!(
-                    "node activation level {local_activation} (canonical accounts: {}) cannot \
-                     install a level-{} snapshot",
+                    "node activation level {local_activation} (canonical accounts: {}, rows: \
+                     {canonical_rows}) cannot install a level-{} snapshot",
                     canonical.is_some(),
                     snapshot.feature_level
                 ))));
@@ -1601,11 +1613,14 @@ mod tests {
         let level2 = data::encode_snapshot_at(&data::ControlData::default(), 2).unwrap();
 
         let db_b = crate::db::Db::connect_raft(&url_b).await.unwrap();
-        sqlx::query("INSERT INTO schema_meta (key, value) VALUES (?, 'done')")
-            .bind(crate::db::META_ACCOUNTS_CANONICAL)
-            .execute(db_b.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
+             ON CONFLICT(key) DO UPDATE SET value = 'done'",
+        )
+        .bind(crate::db::META_ACCOUNTS_CANONICAL)
+        .execute(db_b.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO accounts (id, name, status, created_at, updated_at) \
              VALUES ('000000000009', 'keep', 'active', 1, 1)",

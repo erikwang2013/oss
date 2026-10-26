@@ -221,6 +221,51 @@ pub enum ControlCommand {
         id: String,
     },
 
+    // ---- level 3: accounts / members ----
+    /// 新建账户。`id` 是提交前生成的 12 位十进制；`created_at`/`updated_at` 同值。
+    AccountCreate {
+        id: String,
+        name: String,
+        bucket_quota: Option<i64>,
+        created_at: i64,
+    },
+    /// 重命名和/或启停账户。停用含在册全局管理员的账户是业务拒绝（`Conflict`）。
+    AccountUpdate {
+        id: String,
+        name: Option<String>,
+        status: Option<String>,
+        updated_at: i64,
+    },
+    AccountSetQuota {
+        id: String,
+        bucket_quota: Option<i64>,
+        updated_at: i64,
+    },
+    AccountDelete {
+        id: String,
+    },
+    /// 挂载已有用户（自然键 username；apply 解析为本地 uid）。
+    AccountMemberAttach {
+        account_id: String,
+        username: String,
+        role: String,
+        created_at: i64,
+    },
+    /// 账户内成员启停（自然键 username）。
+    AccountMemberSetStatus {
+        account_id: String,
+        username: String,
+        active: bool,
+    },
+    /// 账户内新建用户（is_admin 恒 0；口令哈希在 append 前算好）。
+    AccountUserCreate {
+        account_id: String,
+        username: String,
+        password_hash: String,
+        role: String,
+        created_at: i64,
+    },
+
     // ---- level 3: command evolution ----
     /// 命令演进容器（level 3）：`type_id` 是提交方注册的稳定类型名，`payload` 为该
     /// 类型的 JSON。旧二进制没有该变体（`deny_unknown_fields`）→ 解码 fail-stop；
@@ -318,6 +363,15 @@ impl ControlCommand {
             // 命令演进容器：旧二进制（最高 level 2）必须先在 leader 入口被拒，
             // 否则它们会解码失败并在 apply 侧 fail-stop。
             Self::Ext { .. } => super::compat::FEATURE_COMMAND_EXT,
+            // 账户/成员命令依赖 OSSCTL3 的快照 canonical 语义，且旧二进制
+            // （`deny_unknown_fields`）无法解码这些变体。
+            Self::AccountCreate { .. }
+            | Self::AccountUpdate { .. }
+            | Self::AccountSetQuota { .. }
+            | Self::AccountDelete { .. }
+            | Self::AccountMemberAttach { .. }
+            | Self::AccountMemberSetStatus { .. }
+            | Self::AccountUserCreate { .. } => super::compat::FEATURE_LEVEL_3,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,
