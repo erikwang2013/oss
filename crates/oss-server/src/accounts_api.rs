@@ -15,6 +15,9 @@ use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
 
+use crate::accounts_support::{
+    bad, new_account_id, require_active_account, require_manager, require_member, valid_name,
+};
 use crate::console::{
     control_failure, control_rejection, control_write_status, forbidden, internal_error, who,
 };
@@ -38,74 +41,6 @@ pub fn routes() -> Router<AppState> {
             "/accounts/{id}/members/{uid}/status",
             put(set_member_status),
         )
-}
-
-fn is_manager(role: Option<&str>) -> bool {
-    matches!(role, Some("owner" | "admin"))
-}
-
-/// 全局管理员或本账户 manager。
-#[allow(clippy::result_large_err)]
-async fn require_manager(
-    state: &AppState,
-    uid: i64,
-    is_admin: bool,
-    account_id: &str,
-) -> Result<(), Response> {
-    if is_admin {
-        return Ok(());
-    }
-    match state.db.member_role(account_id, uid).await {
-        Ok(role) if is_manager(role.as_deref()) => Ok(()),
-        Ok(_) => Err(forbidden("需要账户管理员权限")),
-        Err(e) => {
-            tracing::error!(error = %e, "查询账户角色失败");
-            Err(internal_error())
-        }
-    }
-}
-
-/// 全局管理员或本账户任意成员（只读视角）。
-#[allow(clippy::result_large_err)]
-async fn require_member(
-    state: &AppState,
-    uid: i64,
-    is_admin: bool,
-    account_id: &str,
-) -> Result<(), Response> {
-    if is_admin {
-        return Ok(());
-    }
-    match state.db.member_role(account_id, uid).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(forbidden("无权访问该账户")),
-        Err(e) => {
-            tracing::error!(error = %e, "查询账户角色失败");
-            Err(internal_error())
-        }
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn valid_name(name: &str) -> Result<&str, Response> {
-    let name = name.trim();
-    if name.is_empty() || name.chars().count() > 128 {
-        return Err((StatusCode::BAD_REQUEST, "账户名长度必须为 1..=128").into_response());
-    }
-    Ok(name)
-}
-
-fn bad(msg: &str) -> Response {
-    (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
-}
-
-/// 12 位账户 id：与 `Db::create_account` 同分布；命令只携带算好的值。
-async fn new_account_id(state: &AppState) -> Result<String, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT printf('%012d', 100000000000 + ((random() & 0x7fffffffffffffff) % 900000000000))",
-    )
-    .fetch_one(state.db.pool())
-    .await
 }
 
 async fn list_accounts(
@@ -246,10 +181,14 @@ async fn update_account(
         status: body.status,
         updated_at: crate::db::now(),
     };
-    control_write_status(
-        state.control.write(cmd).await,
-        "账户内仍有在册全局管理员，不能停用",
-    )
+    match state.control.write(cmd).await {
+        Ok(ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(ControlResponse::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        // 旧直写路径：停用条件更新失败且账户存在 = 含在册全局管理员 → 400。
+        Ok(ControlResponse::Conflict) => bad("账户内仍有在册全局管理员，不能停用"),
+        Ok(resp) => control_rejection(resp, "账户更新冲突"),
+        Err(e) => control_failure(e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,6 +299,9 @@ async fn attach_member(
     if body.role != "admin" && body.role != "member" {
         return bad("role 只能是 admin 或 member");
     }
+    if let Err(r) = require_active_account(&state, &id).await {
+        return r;
+    }
     let username = match state.db.get_user(body.uid).await {
         Ok(Some((username, false, _))) => username,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -406,6 +348,17 @@ async fn create_user(
     if body.password.len() < 8 {
         return bad("口令过短（至少 8 位）");
     }
+    if let Err(r) = require_active_account(&state, &id).await {
+        return r;
+    }
+    match state.db.user_exists(username).await {
+        Ok(false) => {}
+        Ok(true) => return bad("用户名已存在"),
+        Err(e) => {
+            tracing::error!(error = %e, "查询用户失败");
+            return internal_error();
+        }
+    }
     // 账户内新建用户恒为 member + 非全局管理员（禁提权）；角色升级由全局管理员挂载接口完成。
     let cmd = ControlCommand::AccountUserCreate {
         account_id: id,
@@ -416,6 +369,8 @@ async fn create_user(
     };
     match state.control.write(cmd).await {
         Ok(ControlResponse::Ok) => {}
+        // 与旧直写路径一致：唯一键冲突是 400，不是 409（apply 竞态同样收敛到这里）。
+        Ok(ControlResponse::Conflict) => return bad("用户名已存在"),
         Ok(resp) => return control_rejection(resp, "用户名已存在"),
         Err(e) => return control_failure(e),
     }
