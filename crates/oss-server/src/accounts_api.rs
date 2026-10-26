@@ -299,7 +299,11 @@ async fn attach_member(
     if body.role != "admin" && body.role != "member" {
         return bad("role 只能是 admin 或 member");
     }
-    if let Err(r) = require_active_account(&state, &id).await {
+    // Raft 下本节点副本可能落后：本地前置检查会在转发前误拒（Leader 上已生效的
+    // 账户/用户）。只做 standalone 的文案兼容；Raft 交给命令走 leader 并返回其权威结果。
+    if !state.control.is_raft()
+        && let Err(r) = require_active_account(&state, &id).await
+    {
         return r;
     }
     let username = match state.db.get_user(body.uid).await {
@@ -348,15 +352,19 @@ async fn create_user(
     if body.password.len() < 8 {
         return bad("口令过短（至少 8 位）");
     }
-    if let Err(r) = require_active_account(&state, &id).await {
-        return r;
-    }
-    match state.db.user_exists(username).await {
-        Ok(false) => {}
-        Ok(true) => return bad("用户名已存在"),
-        Err(e) => {
-            tracing::error!(error = %e, "查询用户失败");
-            return internal_error();
+    // 同 attach_member：Raft 副本滞后时本地预检会误拒；standalone 保留旧文案，
+    // Raft 由 apply 的唯一键/账户状态做权威判定（重复名仍映射 400）。
+    if !state.control.is_raft() {
+        if let Err(r) = require_active_account(&state, &id).await {
+            return r;
+        }
+        match state.db.user_exists(username).await {
+            Ok(false) => {}
+            Ok(true) => return bad("用户名已存在"),
+            Err(e) => {
+                tracing::error!(error = %e, "查询用户失败");
+                return internal_error();
+            }
         }
     }
     // 账户内新建用户恒为 member + 非全局管理员（禁提权）；角色升级由全局管理员挂载接口完成。
