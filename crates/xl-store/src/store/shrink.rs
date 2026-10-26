@@ -30,9 +30,19 @@ pub struct SlotMove {
     pub to_drive: u16,
 }
 
+/// 计划 schema 版本：apply/verify/commit/rollback 只接受本版（旧报告缺字段 = 1）。
+pub const PLAN_SCHEMA: u32 = 1;
+
+fn plan_schema() -> u32 {
+    PLAN_SCHEMA
+}
+
 /// 机器可读计划（apply/verify/commit/rollback 的收据）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShrinkPlan {
+    /// 计划格式版本（向后兼容：缺省 = 1）。apply 等命令不认未来版本。
+    #[serde(default = "plan_schema")]
+    pub schema: u32,
     pub old_epoch: u64,
     pub new_epoch: u64,
     /// 旧拓扑的本地 canonical 指纹（`ClusterSets::topology_hash`，含槽位/物理序）。
@@ -379,6 +389,7 @@ impl Store {
         slots.sort_by_key(|s| (s.set, s.slot));
         let report = ShrinkPlanReport {
             plan: ShrinkPlan {
+                schema: PLAN_SCHEMA,
                 old_epoch: caps.topo_epoch,
                 new_epoch,
                 old_hash: old.topology_hash(),
@@ -399,7 +410,11 @@ impl Store {
     }
 
     /// 旧拓扑全部去重节点的健康（本机走本地实现；退役节点也查，失败即 Err）。
-    async fn collect_healths(&self, cl: &super::drives::ClusterConfig) -> Result<Vec<NodeHealth>> {
+    /// apply/verify/commit/rollback 复用同一口径（全节点可达 + maintenance + 指纹一致）。
+    pub(in crate::store) async fn collect_healths(
+        &self,
+        cl: &super::drives::ClusterConfig,
+    ) -> Result<Vec<NodeHealth>> {
         let me = self.mesh_health().await;
         let mut out = Vec::with_capacity(cl.sets.flat.nodes.len());
         for n in &cl.sets.flat.nodes {

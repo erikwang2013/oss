@@ -4781,13 +4781,77 @@ fn topo_record_parses_v1_and_v2_and_rejects_garbage() {
     );
     // 构造器与解析器互逆（写盘与 console 共用的唯一出处）；set0 恒 v2、set>0 恒 v3
     assert_eq!(
-        super::parse_topo_record(&super::topo_record(0, "n3", 7)),
+        super::parse_topo_record(&super::topo_record(0, "n3", 7, None)),
         Some((0, "n3".to_string(), 7))
     );
     assert_eq!(
-        super::parse_topo_record(&super::topo_record(2, "n3", 7)),
+        super::parse_topo_record(&super::topo_record(2, "n3", 7, None)),
         Some((2, "n3".to_string(), 7))
     );
+}
+
+/// shrink 拓扑 v4：roundtrip + **旧 v1.19 解析器拒收**（set= 存在 ⟺ v3 的不变量）+
+/// 未知更高版本拒收。旧二进制若不拒收 v4，会带着旧槽表启动（D1 的核心防线）。
+#[test]
+fn topo_record_v4_roundtrip_and_old_parser_rejects() {
+    let line = super::topo_record(0, "n1", 0, Some((7, "0123456789abcdef")));
+    assert_eq!(
+        line,
+        "v4 set=0 node=n1 slot=0 epoch=7 hash=0123456789abcdef"
+    );
+    assert!(
+        line.contains("set=0"),
+        "v4 必须显式带 set=0（不写 v2 形态）"
+    );
+    assert_eq!(
+        super::parse_topo_record_v4(&line),
+        Some(super::TopoRecordV4 {
+            set: 0,
+            node: "n1".into(),
+            slot: 0,
+            epoch: 7,
+            hash: "0123456789abcdef".into(),
+        })
+    );
+    // 旧解析器不变量：set= 字段存在但无 v3 版本头 → None。旧二进制因此拒启。
+    assert_eq!(
+        super::parse_topo_record(&line),
+        None,
+        "v1.19 解析器必须拒收 v4（set= 但非 v3）"
+    );
+    // set>0 且显式槽表同样 v4（不是 v3）
+    assert_eq!(
+        super::parse_topo_record_v4(&super::topo_record(
+            2,
+            "n3",
+            9,
+            Some((9, "abcdef0123456789"))
+        ))
+        .unwrap()
+        .set,
+        2
+    );
+    // 未知更高版本：两种解析器都拒收（fail-closed）
+    assert_eq!(
+        super::parse_topo_record("v5 set=0 node=n1 slot=0 epoch=7 hash=0123456789abcdef"),
+        None
+    );
+    assert_eq!(
+        super::parse_topo_record("v5 node=n1 slot=0"),
+        None,
+        "未知版本头不得回落成 v1/v2"
+    );
+    // 畸形 v4：缺字段 / 坏数字 / 坏 hash / 未知段
+    for bad in [
+        "v4 set=0 node=n1 slot=0 epoch=7",
+        "v4 node=n1 slot=0 epoch=7 hash=0123456789abcdef",
+        "v4 set=0 node=n1 slot=0 epoch=x hash=0123456789abcdef",
+        "v4 set=0 node=n1 slot=0 epoch=7 hash=zz",
+        "v4 set=0 node=n1 slot=0 epoch=7 hash=0123456789abcdef extra=1",
+        "v4 v4 set=0 node=n1 slot=0 epoch=7 hash=0123456789abcdef",
+    ] {
+        assert_eq!(super::parse_topo_record_v4(bad), None, "{bad}");
+    }
 }
 
 /// 切片 5（verifier F5-b）：追加式扩容不改变既有节点的槽位基址（H 面的不变量）。
@@ -4815,8 +4879,8 @@ fn appending_nodes_keeps_existing_bases() {
             "节点 {} 的前缀基址在尾部追加下不变",
             i
         );
-        let r4 = super::topo_record(0, &t4.self_node().id, t4.local_slot_base());
-        let r5 = super::topo_record(0, &t5.self_node().id, t5.local_slot_base());
+        let r4 = super::topo_record(0, &t4.self_node().id, t4.local_slot_base(), None);
+        let r5 = super::topo_record(0, &t5.self_node().id, t5.local_slot_base(), None);
         assert_eq!(
             r4, r5,
             "既有盘的 (node,slot) 记录在追加下不变（指纹兼容的根）"

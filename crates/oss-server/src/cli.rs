@@ -29,6 +29,14 @@ pub const USAGE: &str = "\
   cluster-shrink plan --to <target.toml> [--json]
                  shrink 只读校验（全节点 maintenance）：逐 set 槽数/parity/容量/epoch+hash/
                  退役节点 MPU 全通过才出计划；报告 .oss.sys/shrink/<old>-<new>-plan.json
+  cluster-shrink apply --plan <plan.json> --yes [--json]
+                 离线复制本机目标槽分片（全节点 maintenance；CRC 逐片校验、可续跑）
+  cluster-shrink verify --plan <plan.json> [--json]
+                 校验本机目标副本 + fsck + 全读受影响版本；任一失败 exit 1
+  cluster-shrink commit --plan <plan.json> --yes [--json]
+                 apply+verify 后逐盘原子写拓扑 v4（新 epoch/hash）；旧分片保留
+  cluster-shrink rollback --plan <plan.json> --yes [--json]
+                 仅 commit 前：删除本机目标副本；commit 后拒绝
   witness        启动 witness 控制面节点（读 --config 的 [raft]；无数据目录/S3 面）
   raft-add-witness --node-id N --endpoint <advertise_url> [--replace OLD]
                  通过本机 advertise_endpoint 的 HTTP 成员路由加 witness（不二次打开 raft.db）
@@ -80,6 +88,29 @@ pub enum Command {
     /// M3 shrink T4：只读生成旧→新拓扑迁移计划（校验失败退出非零）。
     ClusterShrinkPlan {
         to: std::path::PathBuf,
+        json: bool,
+    },
+    /// M3 shrink T5：离线复制本机目标槽分片（幂等可续跑）。
+    ClusterShrinkApply {
+        plan: std::path::PathBuf,
+        yes: bool,
+        json: bool,
+    },
+    /// M3 shrink T6：校验本机目标副本（失败退出非零）。
+    ClusterShrinkVerify {
+        plan: std::path::PathBuf,
+        json: bool,
+    },
+    /// M3 shrink T7：写拓扑 v4（仅 apply+verify 后）。
+    ClusterShrinkCommit {
+        plan: std::path::PathBuf,
+        yes: bool,
+        json: bool,
+    },
+    /// M3 shrink T7：commit 前删除目标副本。
+    ClusterShrinkRollback {
+        plan: std::path::PathBuf,
+        yes: bool,
         json: bool,
     },
     /// M9 S7.1：witness 控制面节点（独立运行时，不建 AppState）。
@@ -398,6 +429,24 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
                     let (v, flags) = parse_flags(rest, &["--to"], &["--json"])?;
                     Ok(Command::ClusterShrinkPlan {
                         to: v.get("--to").map(std::path::PathBuf::from).ok_or(USAGE)?,
+                        json: flags.contains("--json"),
+                    })
+                }
+                "apply" | "commit" | "rollback" => {
+                    let (v, flags) = parse_flags(rest, &["--plan"], &["--yes", "--json"])?;
+                    let plan = v.get("--plan").map(std::path::PathBuf::from).ok_or(USAGE)?;
+                    let yes = flags.contains("--yes");
+                    let json = flags.contains("--json");
+                    Ok(match sub.as_str() {
+                        "apply" => Command::ClusterShrinkApply { plan, yes, json },
+                        "commit" => Command::ClusterShrinkCommit { plan, yes, json },
+                        _ => Command::ClusterShrinkRollback { plan, yes, json },
+                    })
+                }
+                "verify" => {
+                    let (v, flags) = parse_flags(rest, &["--plan"], &["--json"])?;
+                    Ok(Command::ClusterShrinkVerify {
+                        plan: v.get("--plan").map(std::path::PathBuf::from).ok_or(USAGE)?,
                         json: flags.contains("--json"),
                     })
                 }
@@ -964,6 +1013,119 @@ pub async fn run(
                 println!("cluster-shrink plan 报告: {}", path.display());
             }
             Ok(0)
+        }
+        Command::ClusterShrinkApply { plan, yes, json } => {
+            if !yes {
+                eprintln!("拒绝：cluster-shrink apply 会复制分片，需 --yes 明确确认");
+                return Ok(1);
+            }
+            let report = load_shrink_plan(&plan)?;
+            match state.store.shrink_apply(&report).await {
+                Ok(r) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "cluster-shrink apply: 节点 {} / 本机目标槽 {} / 复制 {} 片 {:.1} MiB（跳过已验收 {}，EC 重建 {}）/ 收据 {}",
+                            r.node_id,
+                            r.local_slots,
+                            r.files_copied,
+                            r.bytes_copied as f64 / 1048576.0,
+                            r.files_skipped,
+                            r.reconstructed,
+                            r.receipt.as_deref().unwrap_or("-")
+                        );
+                    }
+                    Ok(0)
+                }
+                Err(e) => {
+                    eprintln!("Error: cluster-shrink apply 失败: {e}");
+                    Ok(1)
+                }
+            }
+        }
+        Command::ClusterShrinkVerify { plan, json } => {
+            let report = load_shrink_plan(&plan)?;
+            match state.store.shrink_verify(&report).await {
+                Ok(r) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "cluster-shrink verify: 节点 {} / 本机目标槽 {} / 校验 {} 片 / 全读 {} 版本 / 失败 {}",
+                            r.node_id,
+                            r.local_slots,
+                            r.shards_checked,
+                            r.objects_read,
+                            r.failures.len()
+                        );
+                        for f in &r.failures {
+                            eprintln!("  失败: {f}");
+                        }
+                    }
+                    Ok(if r.failures.is_empty() { 0 } else { 1 })
+                }
+                Err(e) => {
+                    eprintln!("Error: cluster-shrink verify 失败: {e}");
+                    Ok(1)
+                }
+            }
+        }
+        Command::ClusterShrinkCommit { plan, yes, json } => {
+            if !yes {
+                eprintln!("拒绝：cluster-shrink commit 会写新拓扑，需 --yes 明确确认");
+                return Ok(1);
+            }
+            let report = load_shrink_plan(&plan)?;
+            match state.store.shrink_commit(&report).await {
+                Ok(r) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "cluster-shrink commit: 节点 {} / epoch {}→{} / 写拓扑盘 {}{}",
+                            r.node_id,
+                            r.old_epoch,
+                            r.new_epoch,
+                            r.topo_written,
+                            if r.already_committed {
+                                "（已提交，幂等重跑）"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    Ok(0)
+                }
+                Err(e) => {
+                    eprintln!("Error: cluster-shrink commit 失败: {e}");
+                    Ok(1)
+                }
+            }
+        }
+        Command::ClusterShrinkRollback { plan, yes, json } => {
+            if !yes {
+                eprintln!("拒绝：cluster-shrink rollback 会删除目标副本，需 --yes 明确确认");
+                return Ok(1);
+            }
+            let report = load_shrink_plan(&plan)?;
+            match state.store.shrink_rollback(&report).await {
+                Ok(r) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "cluster-shrink rollback: 节点 {} / 删除目标副本 {} 片；旧拓扑与旧分片未动",
+                            r.node_id, r.files_removed
+                        );
+                    }
+                    Ok(0)
+                }
+                Err(e) => {
+                    eprintln!("Error: cluster-shrink rollback 拒绝: {e}");
+                    Ok(1)
+                }
+            }
         }
         Command::Scrub => {
             let report = match state.store.scrub().await {
@@ -1744,6 +1906,18 @@ async fn cmk_cmd(
     }
 }
 
+/// 读 `cluster-shrink plan` 报告（apply/verify/commit/rollback 的唯一计划输入）。
+fn load_shrink_plan(path: &std::path::Path) -> Result<xl_store::store::ShrinkPlanReport, String> {
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| format!("读取 plan {} 失败: {e}", path.display()))?;
+    serde_json::from_str(&s).map_err(|e| {
+        format!(
+            "plan {} 解析失败（需 cluster-shrink plan 生成的报告，含 plan+slots）: {e}",
+            path.display()
+        )
+    })
+}
+
 /// 巡检报告落盘（fsck/heal/scrub 共用）：`.oss.sys/fsck/<时间戳>-<kind>.json`；
 /// 写失败只警告，不掩命令结论。
 /// shrink 进行中（active.lock 被占）→ 拒绝离线搬运/巡检，避免双方同时动分片。
@@ -1834,6 +2008,61 @@ mod tests {
             parse_args(&args(&["cluster-shrink", "plan"])),
             Err(USAGE),
             "--to 必填"
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cluster-shrink",
+                "apply",
+                "--plan",
+                "p.json",
+                "--yes"
+            ])),
+            Ok(Command::ClusterShrinkApply {
+                plan: "p.json".into(),
+                yes: true,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cluster-shrink",
+                "verify",
+                "--plan=p.json",
+                "--json"
+            ])),
+            Ok(Command::ClusterShrinkVerify {
+                plan: "p.json".into(),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cluster-shrink",
+                "commit",
+                "--plan",
+                "p.json",
+                "--yes",
+                "--json"
+            ])),
+            Ok(Command::ClusterShrinkCommit {
+                plan: "p.json".into(),
+                yes: true,
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["cluster-shrink", "rollback", "--plan", "p.json"])),
+            Ok(Command::ClusterShrinkRollback {
+                plan: "p.json".into(),
+                yes: false,
+                json: false,
+            }),
+            "--yes 由 run 阶段强制（解析保留 yes=false 以便给出明确拒绝）"
+        );
+        assert_eq!(
+            parse_args(&args(&["cluster-shrink", "apply", "--plan"])),
+            Err(USAGE),
+            "--plan 缺值"
         );
     }
 

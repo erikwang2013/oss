@@ -60,9 +60,9 @@ pub fn encode(payload: &[u8], cfg: EcConfig) -> Result<Vec<Vec<u8>>> {
     Ok(shards)
 }
 
-/// 重建：缺失片（`None` 或长度不符）以 EC 补齐，返回**补齐后的**数据段（前 data 片拼接）。
-/// 尾部补零的截断由调用方按 meta 里的对象长度完成（EC 层不知道原始长度）。
-pub fn reconstruct(shards: &[Option<Vec<u8>>], cfg: EcConfig) -> Result<Vec<u8>> {
+/// 重建全部片：缺失片（`None` 或长度不符）以 EC 补齐，返回**补齐后的 data+parity 片**。
+/// shrink apply 需要把「源片缺失」的字节重建到**目标槽**（不只是数据段），故开放全片结果。
+pub fn reconstruct_shards(shards: &[Option<Vec<u8>>], cfg: EcConfig) -> Result<Vec<Vec<u8>>> {
     let total = (cfg.data + cfg.parity) as usize;
     if shards.len() != total {
         return Err(Error::CorruptMeta(format!(
@@ -92,10 +92,15 @@ pub fn reconstruct(shards: &[Option<Vec<u8>>], cfg: EcConfig) -> Result<Vec<u8>>
     let rs = codec(cfg)?;
     rs.reconstruct(&mut buf)
         .map_err(|e| Error::CorruptMeta(format!("EC 重建失败: {e}")))?;
+    Ok(buf.into_iter().map(|(v, _)| v).collect())
+}
 
-    // 重建会同时修回 parity 片；数据段 = 前 data 片拼接
-    let mut out = Vec::with_capacity(size * cfg.data as usize);
-    for (v, _) in buf.iter().take(cfg.data as usize) {
+/// 重建：缺失片（`None` 或长度不符）以 EC 补齐，返回**补齐后的**数据段（前 data 片拼接）。
+/// 尾部补零的截断由调用方按 meta 里的对象长度完成（EC 层不知道原始长度）。
+pub fn reconstruct(shards: &[Option<Vec<u8>>], cfg: EcConfig) -> Result<Vec<u8>> {
+    let all = reconstruct_shards(shards, cfg)?;
+    let mut out = Vec::with_capacity(all.first().map_or(0, Vec::len) * cfg.data as usize);
+    for v in all.iter().take(cfg.data as usize) {
         out.extend_from_slice(v);
     }
     Ok(out)
