@@ -663,3 +663,85 @@ async fn disabled_account_rejects_manager_writes() {
         401
     );
 }
+
+/// 回归：写路径改走 ControlCommand 后仍保持旧 API 的 400 文案
+/// （重复用户名、停用账户）与缺失账户 404。
+#[tokio::test]
+async fn account_write_rejections_keep_legacy_status_and_message() {
+    let (_dir, base, admin) = serve_with_admin().await;
+    let id = create_account(&base, &admin, "compat", None).await;
+    let client = reqwest::Client::new();
+    let create_user = |username: &str| {
+        client
+            .post(format!("{base}/api/v1/accounts/{id}/users"))
+            .bearer_auth(&admin)
+            .json(&serde_json::json!({ "username": username, "password": "compat-password" }))
+            .send()
+    };
+
+    let first = create_user("dup").await.unwrap();
+    assert_eq!(first.status(), 200);
+    let uid = first.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let dup = create_user("dup").await.unwrap();
+    assert_eq!(dup.status(), 400);
+    assert_eq!(dup.text().await.unwrap(), "用户名已存在");
+
+    let disabled = client
+        .put(format!("{base}/api/v1/accounts/{id}"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "status": "disabled" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), 204);
+
+    // 全局管理员写停用账户：入口保留旧 400 文案（apply 仍是权威）。
+    for (path, body) in [
+        (
+            format!("/api/v1/accounts/{id}/users"),
+            serde_json::json!({ "username": "late", "password": "late-password" }),
+        ),
+        (
+            format!("/api/v1/accounts/{id}/members"),
+            serde_json::json!({ "uid": uid, "role": "member" }),
+        ),
+    ] {
+        let resp = client
+            .post(format!("{base}{path}"))
+            .bearer_auth(&admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{path}");
+        assert_eq!(resp.text().await.unwrap(), "账户已停用", "{path}");
+    }
+
+    // 缺失账户仍 404。
+    for (path, body) in [
+        (
+            "/api/v1/accounts/000000000099/users".to_string(),
+            serde_json::json!({ "username": "ghost", "password": "ghost-password" }),
+        ),
+        (
+            "/api/v1/accounts/000000000099/members".to_string(),
+            serde_json::json!({ "uid": uid, "role": "member" }),
+        ),
+    ] {
+        assert_eq!(
+            client
+                .post(format!("{base}{path}"))
+                .bearer_auth(&admin)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "{path}"
+        );
+    }
+}
