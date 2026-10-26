@@ -3493,6 +3493,10 @@ async fn create_user(
                 }
             }
         }
+        // 旧 API 契约：重名（含 apply 竞态）是 400 + 该文案，不是统一映射的 409。
+        Ok(crate::raft::ControlResponse::Conflict) => {
+            (StatusCode::BAD_REQUEST, "用户名已存在").into_response()
+        }
         Ok(resp) => control_rejection(resp, "用户名已存在"),
         Err(e) => control_failure(e),
     }

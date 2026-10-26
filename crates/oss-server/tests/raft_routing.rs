@@ -179,8 +179,8 @@ async fn raft_user_paths_write_one_command_each_and_map_responses() {
     assert!(hash.starts_with("$argon2"), "口令必须已哈希: {hash}");
     assert_eq!(is_admin, 0);
 
-    // 重名：apply 业务拒绝 Conflict → 409（`response_status` 映射）；命令仍是一条
-    //（拒绝不回滚已提交的 entry）。
+    // 重名：旧 API 契约是 400 + 「用户名已存在」（apply 竞态同样收敛到这里）；
+    // 命令仍是一条（拒绝不回滚已提交的 entry）。
     let before = applied_index(&st).await;
     let resp = client()
         .post(format!("{base}/api/v1/users"))
@@ -189,7 +189,8 @@ async fn raft_user_paths_write_one_command_each_and_map_responses() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.text().await.unwrap(), "用户名已存在");
     assert_eq!(applied_index(&st).await, before + 1, "重名也是一条命令");
 
     // 前置校验失败（口令过短）：400 且**不触达**控制面。
