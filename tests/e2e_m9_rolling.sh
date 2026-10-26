@@ -170,7 +170,8 @@ members_are() { [ "$(status_json "$1" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 print(len(d.get("voters") or d.get("members") or []))')" = "$2" ]; }
-leader_base() { local b; for b in "$A" "$B"; do [ "$(sf "$b" state)" = "leader" ] && { echo "$b"; return 0; }; done; return 1; }
+# effective 只在 leader 上计算；每次重新探测，避免换届后拿旧 URL 轮询 follower 的 null。
+leader_eff() { local b; for b in "$A" "$B"; do [ "$(sf "$b" state)" = leader ] && [ "$(sf "$b" effective_feature_level)" = "$1" ] && return 0; done; return 1; }
 applied_index() { status_json "$1" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -237,11 +238,11 @@ echo "== 7. 逐台启用 feature_level=2；混合窗口内 effective 必须仍�
 kill9 "$C_PID"; mk_witness_cfg c 3 "$C_HTTP" 2; C_BIN="$NEW_BIN"; ck start_c
 kill9 "$B_PID"; mk_cfg b "$B_HTTP" "$REG_B" "$TOK_B" 2 false 2; B_BIN="$NEW_BIN"; ck start_b
 # A 仍为 feature_level=1：leader 的生效级别必须停在 1（D4）。
-L=$(leader_base); ck [ -n "$L" ]; ck [ "$(sf "$L" effective_feature_level)" = 1 ]
+ck poll_pred 90 any_leader
+ck leader_eff 1
 kill9 "$A_PID"; mk_cfg a "$A_HTTP" "$REG_A" "$TOK_A" 1 true 2; A_BIN="$NEW_BIN"; ck start_a
-L=$(leader_base); ck [ -n "$L" ]
-ck poll_pred 60 [ "$(sf "$L" effective_feature_level)" = 2 ]
-ck poll_pred 60 [ "$(sf "$L" activation_level)" = 1 ]
+ck poll_pred 60 leader_eff 2
+ck poll_pred 60 [ "$(sf "$A" activation_level)" = 1 ]
 skip "步骤 7 子项：level-2 写入 503 feature_unavailable——发布二进制无 level-2 产品命令（D6）"
 
 echo "== 8. 激活（level-2 命令） =="
