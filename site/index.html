@@ -457,19 +457,19 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
       <section class="section" id="api">
         <div class="wrap ecosystem">
           <div data-reveal>
-            <h2>API 文档，按语言分开放。</h2>
-            <p>oss 的对外协议是 S3，直接按标准工具接入。生态里的 apidoc 系列把 Go、Rust 项目的注解生成文档，统一由 apidoc-ui 展示。</p>
+            <h2>标准 S3 API，现有工具直接连。</h2>
+            <p>oss 的对外协议是 S3，直接用 aws-cli、rclone 或任意 S3 SDK 接入，不引入私有客户端。</p>
             <ul class="feature-list">
-              <li><span><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>：安装、配置、S3 操作与运维命令（随发布同步）。</span></li>
-              <li><span><a href="api.html">API 文档页</a>：查看多语言文档入口与同域部署路径。</span></li>
-              <li><span>本地静态部署时，可将 apidoc-ui 构建产物放到 <code>/apidoc-ui/</code>。</span></li>
+              <li><span><a href="api.html">API 文档</a>：端点、认证、最小请求与协议边界。</span></li>
+              <li><span><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>：安装、配置、完整 S3 操作与运维命令（随发布同步）。</span></li>
+              <li><span>支持 SigV4、Multipart Upload、Range、版本控制、生命周期、桶策略、对象锁、事件通知、Select、复制与访问点。</span></li>
             </ul>
           </div>
           <div class="eco-list" data-reveal>
-            <div class="eco-row"><b>Go</b><span>apidoc-go 注解式 API 文档</span><a href="https://github.com/erikwang2013/apidoc-go" target="_blank" rel="noopener">GitHub</a></div>
-            <div class="eco-row"><b>Rust</b><span>apidoc-rust proc-macro 文档工具</span><a href="https://github.com/erikwang2013/apidoc-rust" target="_blank" rel="noopener">GitHub</a></div>
-            <div class="eco-row"><b>UI</b><span>apidoc-ui Vue 3 静态文档前端</span><a href="https://github.com/erikwang2013/apidoc-ui" target="_blank" rel="noopener">GitHub</a></div>
-            <div class="eco-row"><b>Local</b><span><code>/apidoc-go/</code> <code>/apidoc-rust/</code> <code>/apidoc-ui/</code></span><a href="api.html">说明</a></div>
+            <div class="eco-row"><b>aws-cli</b><span>官方 CLI，路径风格直接连</span><span>兼容</span></div>
+            <div class="eco-row"><b>rclone</b><span>同步、挂载与断点续传</span><span>兼容</span></div>
+            <div class="eco-row"><b>SDK</b><span>任意 S3 SDK（SigV4）</span><span>兼容</span></div>
+            <div class="eco-row"><b>Console</b><span>浏览器控制台分块上传与管理</span><a href="usage.html">说明</a></div>
           </div>
         </div>
       </section>

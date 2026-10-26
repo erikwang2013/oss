@@ -8,22 +8,22 @@
     <meta name="author" content="艾瑞可 Erik">
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
-    <title>API 文档与多语言生态 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）API 文档入口：S3 兼容 API、README，以及 apidoc-go、apidoc-rust、apidoc-ui 多语言文档工具与同域部署路径。">
-    <meta name="keywords" content="oss API,S3 API,apidoc-go,apidoc-rust,apidoc-ui,API 文档">
+    <title>API 文档 | oss（吞吞）</title>
+    <meta name="description" content="oss（吞吞）API 文档：S3 兼容端点、认证、最小请求示例与协议边界。">
+    <meta name="keywords" content="oss API,S3 API,S3 兼容,API 文档">
     <link rel="canonical" href="https://oss.erik.xyz/api.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
     <link rel="manifest" href="manifest.webmanifest">
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
-    <meta property="og:title" content="API 文档与多语言生态 | oss（吞吞）">
-    <meta property="og:description" content="S3 兼容 API、README 与 apidoc 多语言文档入口。">
+    <meta property="og:title" content="API 文档 | oss（吞吞）">
+    <meta property="og:description" content="S3 兼容端点、认证、最小请求示例与协议边界。">
     <meta property="og:url" content="https://oss.erik.xyz/api.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="API 文档与多语言生态 | oss（吞吞）">
-    <meta name="twitter:description" content="oss（吞吞）API 文档入口：S3 兼容 API、README，以及 apidoc 多语言文档工具。">
+    <meta name="twitter:title" content="API 文档 | oss（吞吞）">
+    <meta name="twitter:description" content="oss（吞吞）API 文档：S3 兼容端点、认证、最小请求与协议边界。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -69,17 +69,15 @@
     <main id="main">
       <div class="doc-hero">
         <div class="wrap">
-          <h1>API 文档与多语言生态</h1>
-          <p>oss 的对外协议是 S3，先把 README 与 S3 操作跑通。生态里的 apidoc 系列负责把 Go、Rust 项目的注解生成接口文档，并用 apidoc-ui 统一展示。</p>
+          <h1>API 文档</h1>
+          <p>oss 的对外协议是标准 S3。用 aws-cli、rclone 或任意 S3 SDK 连接，下面是最小请求、认证方式与协议边界。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="本页目录">
           <a href="#oss-api">oss S3 API</a>
-          <a href="#apidoc">apidoc 生态</a>
-          <a href="#paths">同域部署路径</a>
-          <a href="#ui">apidoc-ui 配置</a>
+          <a href="#boundaries">协议边界</a>
           <a href="#more">继续阅读</a>
         </aside>
 
@@ -97,51 +95,6 @@
 aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
   --bucket photos --key cover.jpg</code></pre>
           </div>
-
-          <h2 id="apidoc">apidoc 生态</h2>
-          <p>apidoc 系列用注解生成接口文档，减少手写文档的漂移。Go 与 Rust 各有一个后端插件，apidoc-ui 是纯静态前端。</p>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>语言 / 组件</th><th>说明</th><th>入口</th></tr></thead>
-              <tbody>
-                <tr><td>Go</td><td>类型化 Doc 声明随路由注册，支持 net/http、Gin、Echo、Chi、Fiber、beego、Kratos、go-zero。</td><td><a href="https://github.com/erikwang2013/apidoc-go" target="_blank" rel="noopener">apidoc-go</a></td></tr>
-                <tr><td>Rust</td><td>proc-macro 在编译期生成文档，linkme 静态收集，兼容 axum、actix-web。</td><td><a href="https://github.com/erikwang2013/apidoc-rust" target="_blank" rel="noopener">apidoc-rust</a></td></tr>
-                <tr><td>UI</td><td>Vue 3 + TypeScript + Vite 的纯静态文档前端，支持在线调试、多应用与 Swagger 导出。</td><td><a href="https://github.com/erikwang2013/apidoc-ui" target="_blank" rel="noopener">apidoc-ui</a></td></tr>
-              </tbody>
-            </table>
-          </div>
-
-          <h2 id="paths">同域部署路径</h2>
-          <p>如果把这些文档和 oss 站点放在同一个域名下，可以使用下面的路径。具体由 Web 服务器的静态目录决定。</p>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>路径</th><th>内容</th><th>部署方式</th></tr></thead>
-              <tbody>
-                <tr><td><code>/apidoc-go/</code></td><td>Go 项目文档服务</td><td>需自行部署 apidoc-go 后端或静态产物</td></tr>
-                <tr><td><code>/apidoc-rust/</code></td><td>Rust 项目文档服务</td><td>需自行部署 apidoc-rust 后端或静态产物</td></tr>
-                <tr><td><code>/apidoc-ui/</code></td><td>apidoc-ui 构建产物</td><td>需自行部署；把 <code>apidoc/</code> 目录整体放到该路径</td></tr>
-              </tbody>
-            </table>
-          </div>
-          <div class="callout">
-            <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
-            <p>apidoc-ui 是纯静态前端，后端地址写在同目录的 <code>config.js</code> 中。修改后刷新即可，不需要重新打包。</p>
-          </div>
-
-          <h2 id="ui">apidoc-ui 配置</h2>
-          <p>把构建产物复制到 <code>/apidoc-ui/</code> 后，确认 <code>index.html</code> 与 <code>config.js</code> 在同一目录，然后按实际后端填写 HOSTS 与 API_PREFIX。</p>
-          <div class="code-card">
-            <div class="code-head"><span>config.js</span><button class="copy-btn" type="button" data-copy="#code-api-config">复制</button></div>
-            <pre><code id="code-api-config">window.apidocFeConfig = {
-  HTTP: {
-    HOSTS: ['https://api.example.com'],
-    API_PREFIX: '/apidoc',
-    TIMEOUT: 30000,
-    WITHCREDENTIALS: false,
-  },
-};</code></pre>
-          </div>
-          <p>多应用通过 URL 参数 <code>?appKey=xxx</code> 切换。替换线上旧文件前先清空旧目录，避免残留的旧哈希资源。</p>
 
           <h2 id="boundaries">协议边界</h2>
           <ul>
