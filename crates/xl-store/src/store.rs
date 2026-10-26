@@ -452,9 +452,10 @@ impl Store {
             // 后旧盘 (node,slot) 不变）；读时兼容 v1（忽略 `slots=` 段）。
             // 切片 8：set==0 恒写 v2（单 set 与多 set 的 set0 段逐字节不变）；set>0 写
             // `v3 set=Z node=X slot=Y`（slot=组内槽）；v3+set=0 = 拒启（写路径永不产出）。
-            // shrink v4：显式槽表写 `v4 set=Z node=X slot=Y epoch=E hash=H`（**set=0 也带 set=**，
-            // 旧解析器对「set= 但非 v3」一律拒收 → 旧二进制不会带着旧槽表启动）。v2/v3
-            // 记录在首次以显式槽表启动时校验三元组后原地升级为 v4。
+            // shrink v4：只有 `cluster-shrink commit` 才原子写 `v4 set=Z node=X slot=Y epoch=E hash=H`
+            // （**set=0 也带 set=**，旧解析器对「set= 但非 v3」一律拒收 → 旧二进制不会带着
+            // 旧槽表启动）。普通启动（含显式槽表配置）只校验 v1/v2/v3 三元组、绝不改写；
+            // 缺记录补写 v1.19 同字节的 v2/v3，commit 前可回退旧二进制。
             // 中间节点/中间 set 加盘会位移其后段 → 记录与现算不符 → 在此拒启（设计 G）。
             if let Some(cl) = cfg.cluster.as_deref() {
                 let topo_path = layout::sys_dir(drive, "topo");
@@ -471,12 +472,6 @@ impl Store {
                     .copied()
                     .ok_or_else(|| Error::Encode("盘下标不在任何 set 段（内部不一致）".into()))?;
                 let cur_slot = (di - off) as u16;
-                let want = topo_record(
-                    cur_set,
-                    &cur_node,
-                    cur_slot,
-                    explicit.then_some((epoch, hash.as_str())),
-                );
                 match tokio::fs::read_to_string(&topo_path).await {
                     Ok(have) => {
                         let have = have.trim();
@@ -495,14 +490,13 @@ impl Store {
                                     )));
                                 }
                             } else if let Some((set, n, s)) = parse_topo_record(have) {
-                                // 旧部署升级：v2/v3 三元组一致 → 原地升级为 v4。
+                                // v1/v2/v3 只校验三元组，不改写：v4 只能由 commit 写。
                                 if !(set == cur_set && n == cur_node && s == cur_slot) {
                                     return Err(Error::Encode(format!(
                                         "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{have}»，当前 set={cur_set} node={cur_node} slot={cur_slot}",
                                         drive.display()
                                     )));
                                 }
-                                write_topo_record(&topo_path, &want).await?;
                             } else {
                                 return Err(Error::Encode(format!(
                                     "拓扑记录无法识别（未知更高版本/人为错改？）：盘 {} 记录 «{have}»，当前 set={cur_set} node={cur_node} slot={cur_slot} epoch={epoch} hash={hash}",
@@ -528,7 +522,9 @@ impl Store {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        write_topo_record(&topo_path, &want).await?;
+                        // 与 v1.19 同字节：显式槽表配置也先写 legacy，commit 才升级 v4。
+                        let legacy = topo_record(cur_set, &cur_node, cur_slot, None);
+                        write_topo_record(&topo_path, &legacy).await?;
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1778,12 +1774,12 @@ impl Store {
     }
 }
 
-/// 拓扑记录的唯一构造器（M4 切片 5；切片 8 加 set；shrink 加 v4）：写盘（`Store::open`、
-/// `cluster-shrink commit`）与控制台展示（`/api/v1/cluster/status` 的 topo_fingerprint）共用
-/// ——两处再漂移即回归（verifier F9）。
-/// **positional：set==0 恒写 v2（逐字节兼容）；set>0 写 v3**（slot = **组内槽**）。
-/// **显式槽表（`explicit = Some((epoch, hash))`）：一律写 v4，set=0 也带 `set=`**——旧解析器
-/// 把「set= 但非 v3」视为人为错改而拒启，旧二进制因此不会带旧槽表启动。
+/// 拓扑记录的唯一构造器（M4 切片 5；切片 8 加 set；shrink 加 v4）：`Store::open` 补缺、
+/// `cluster-shrink commit` 写盘与控制台展示共用——两处再漂移即回归（verifier F9）。
+/// **positional 或 `explicit = None`：set==0 恒写 v2（逐字节兼容）；set>0 写 v3**
+/// （slot = **组内槽**）。**显式槽表（`Some((epoch, hash))`）：写 v4，set=0 也带 `set=`**；
+/// v4 只能由 commit 写——启动补缺必须传 None，否则会把未 commit 的节点伪装成新拓扑。
+/// 旧解析器把「set= 但非 v3」视为人为错改而拒启，旧二进制不会带新槽表启动。
 pub fn topo_record(set: u16, node: &str, slot: u16, explicit: Option<(u64, &str)>) -> String {
     match explicit {
         Some((epoch, hash)) => {
@@ -1959,6 +1955,8 @@ mod tests_sync;
 mod tests_tags;
 #[cfg(test)]
 mod tests_tier;
+#[cfg(test)]
+mod tests_topo_record;
 #[cfg(test)]
 mod tests_uploads;
 #[cfg(test)]
