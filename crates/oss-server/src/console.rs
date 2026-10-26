@@ -439,7 +439,8 @@ async fn cluster_status(
             // M4 切片 8：多 set 视图——每 set 独立槽域（R3：跨 set 槽号会重号，必须分组呈现）；
             // topo_fingerprint = 本节点**首盘**（data_dirs[0] = set0 段首）的记录串，与写盘共用
             // 同一构造器（xl_store::store::topo_record），可直接与盘上文件等值比对；
-            // set0 恒 v2、set>0 恒 v3（切片 8 口径）；切片 5 前的旧盘保留 v1 记录（读侧兼容）
+            // positional：set0 恒 v2、set>0 恒 v3；显式槽表恒 v4（含 epoch/hash 与 set=0）。
+            // 切片 5 前的旧盘保留 v1 记录（读侧兼容）
             let sets_view: Vec<serde_json::Value> = c
                 .sets
                 .sets
@@ -457,8 +458,14 @@ async fn cluster_status(
                 })
                 .collect();
             let (first_set, first_off, _) = c.sets.self_ranges[0];
-            let topo_fingerprint =
-                xl_store::store::topo_record(first_set, &me.id, first_off as u16);
+            let hash = c.sets.topology_hash();
+            let explicit = c.sets.sets.iter().any(|t| t.slot_map().is_some());
+            let topo_fingerprint = xl_store::store::topo_record(
+                first_set,
+                &me.id,
+                first_off as u16,
+                explicit.then_some((c.sets.topology_epoch(), hash.as_str())),
+            );
             Json(serde_json::json!({
                 "mode": "cluster",
                 "node_id": me.id,

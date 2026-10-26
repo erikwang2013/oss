@@ -30,6 +30,8 @@ mod put;
 mod read;
 mod rebalance;
 mod shrink;
+mod shrink_apply;
+mod shrink_apply_util;
 mod tier;
 mod uploads;
 mod version;
@@ -41,6 +43,7 @@ pub use rebalance::RebalanceReport;
 pub use shrink::{
     ShrinkPlan, ShrinkPlanReport, ShrinkSlotStat, SlotMove, acquire_shrink_lock, shrink_lock_busy,
 };
+pub use shrink_apply::{ShrinkActionReport, ShrinkVerifyReport};
 pub use tier::ArchiveSpec;
 pub use version::{DeleteMarkerSpec, DeleteOutcome, TierRef, VersionEntry, VersionList};
 
@@ -449,10 +452,16 @@ impl Store {
             // 后旧盘 (node,slot) 不变）；读时兼容 v1（忽略 `slots=` 段）。
             // 切片 8：set==0 恒写 v2（单 set 与多 set 的 set0 段逐字节不变）；set>0 写
             // `v3 set=Z node=X slot=Y`（slot=组内槽）；v3+set=0 = 拒启（写路径永不产出）。
+            // shrink v4：显式槽表写 `v4 set=Z node=X slot=Y epoch=E hash=H`（**set=0 也带 set=**，
+            // 旧解析器对「set= 但非 v3」一律拒收 → 旧二进制不会带着旧槽表启动）。v2/v3
+            // 记录在首次以显式槽表启动时校验三元组后原地升级为 v4。
             // 中间节点/中间 set 加盘会位移其后段 → 记录与现算不符 → 在此拒启（设计 G）。
             if let Some(cl) = cfg.cluster.as_deref() {
                 let topo_path = layout::sys_dir(drive, "topo");
                 let cur_node = cl.sets.flat.self_node().id.clone();
+                let explicit = cl.sets.sets.iter().any(|t| t.slot_map().is_some());
+                let epoch = cl.sets.topology_epoch();
+                let hash = cl.sets.topology_hash();
                 // 该盘属于哪个 set 段：di 落在 self_ranges 的哪一段
                 let (cur_set, off, _) = cl
                     .sets
@@ -462,25 +471,64 @@ impl Store {
                     .copied()
                     .ok_or_else(|| Error::Encode("盘下标不在任何 set 段（内部不一致）".into()))?;
                 let cur_slot = (di - off) as u16;
-                let want = topo_record(cur_set, &cur_node, cur_slot);
+                let want = topo_record(
+                    cur_set,
+                    &cur_node,
+                    cur_slot,
+                    explicit.then_some((epoch, hash.as_str())),
+                );
                 match tokio::fs::read_to_string(&topo_path).await {
                     Ok(have) => {
-                        let ok = parse_topo_record(have.trim()).is_some_and(|(set, n, s)| {
-                            n == cur_node && s == cur_slot && set == cur_set
-                        });
-                        if !ok {
-                            return Err(Error::Encode(format!(
-                                "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{}»，当前 set={} node={} slot={}",
-                                drive.display(),
-                                have.trim(),
-                                cur_set,
-                                cur_node,
-                                cur_slot
-                            )));
+                        let have = have.trim();
+                        if explicit {
+                            if let Some(r) = parse_topo_record_v4(have) {
+                                if r.set != cur_set
+                                    || r.node != cur_node
+                                    || r.slot != cur_slot
+                                    || r.epoch != epoch
+                                    || r.hash != hash
+                                {
+                                    return Err(Error::Encode(format!(
+                                        "拓扑记录 v4 与配置不符：盘 {} 记录 «{have}»，当前 set={cur_set} node={cur_node} slot={cur_slot} epoch={epoch} hash={hash}。\
+                                         epoch/hash 不符常见于 cluster-shrink commit 后仍用旧配置（请改用新拓扑配置启动；commit 后 rollback 不再允许）",
+                                        drive.display()
+                                    )));
+                                }
+                            } else if let Some((set, n, s)) = parse_topo_record(have) {
+                                // 旧部署升级：v2/v3 三元组一致 → 原地升级为 v4。
+                                if !(set == cur_set && n == cur_node && s == cur_slot) {
+                                    return Err(Error::Encode(format!(
+                                        "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{have}»，当前 set={cur_set} node={cur_node} slot={cur_slot}",
+                                        drive.display()
+                                    )));
+                                }
+                                write_topo_record(&topo_path, &want).await?;
+                            } else {
+                                return Err(Error::Encode(format!(
+                                    "拓扑记录无法识别（未知更高版本/人为错改？）：盘 {} 记录 «{have}»，当前 set={cur_set} node={cur_node} slot={cur_slot} epoch={epoch} hash={hash}",
+                                    drive.display()
+                                )));
+                            }
+                        } else {
+                            if parse_topo_record_v4(have).is_some() {
+                                return Err(Error::Encode(format!(
+                                    "盘 {} 拓扑记录是 v4（显式槽表），但配置未启用显式槽表（[cluster].epoch + [[cluster.slots]]）——配置回退/错配",
+                                    drive.display()
+                                )));
+                            }
+                            let ok = parse_topo_record(have).is_some_and(|(set, n, s)| {
+                                n == cur_node && s == cur_slot && set == cur_set
+                            });
+                            if !ok {
+                                return Err(Error::Encode(format!(
+                                    "拓扑指纹不符（data_dirs 顺序变化/中间节点加盘？）：盘 {} 记录 «{have}»，当前 set={cur_set} node={cur_node} slot={cur_slot}",
+                                    drive.display()
+                                )));
+                            }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        tokio::fs::write(&topo_path, &want).await?;
+                        write_topo_record(&topo_path, &want).await?;
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1730,30 +1778,122 @@ impl Store {
     }
 }
 
-/// 拓扑记录的唯一构造器（M4 切片 5；切片 8 加 set）：写盘（`Store::open`）与控制台展示
-/// （`/api/v1/cluster/status` 的 topo_fingerprint）共用——两处再漂移即回归（verifier F9）。
-/// **set==0 恒写 v2（逐字节兼容）；set>0 写 v3**（slot = **组内槽**）。
-/// 读侧 `parse_topo_record` 兼容 v1/v2（均视为 set 0）。
-pub fn topo_record(set: u16, node: &str, slot: u16) -> String {
-    if set == 0 {
-        format!("v2 node={node} slot={slot}")
-    } else {
-        format!("v3 set={set} node={node} slot={slot}")
+/// 拓扑记录的唯一构造器（M4 切片 5；切片 8 加 set；shrink 加 v4）：写盘（`Store::open`、
+/// `cluster-shrink commit`）与控制台展示（`/api/v1/cluster/status` 的 topo_fingerprint）共用
+/// ——两处再漂移即回归（verifier F9）。
+/// **positional：set==0 恒写 v2（逐字节兼容）；set>0 写 v3**（slot = **组内槽**）。
+/// **显式槽表（`explicit = Some((epoch, hash))`）：一律写 v4，set=0 也带 `set=`**——旧解析器
+/// 把「set= 但非 v3」视为人为错改而拒启，旧二进制因此不会带旧槽表启动。
+pub fn topo_record(set: u16, node: &str, slot: u16, explicit: Option<(u64, &str)>) -> String {
+    match explicit {
+        Some((epoch, hash)) => {
+            format!("v4 set={set} node={node} slot={slot} epoch={epoch} hash={hash}")
+        }
+        None if set == 0 => format!("v2 node={node} slot={slot}"),
+        None => format!("v3 set={set} node={node} slot={slot}"),
     }
+}
+
+/// 原子写拓扑记录（temp + rename + fsync）：commit 逐盘写，崩溃只留完整旧记录或完整新记录。
+pub(in crate::store) async fn write_topo_record(path: &Path, content: &str) -> Result<()> {
+    let tmp = path.with_file_name("topo.tmp");
+    {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        AsyncWriteExt::write_all(&mut f, content.as_bytes()).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    if let Some(dir) = path.parent() {
+        Store::sync_dir(dir).await;
+    }
+    Ok(())
+}
+
+/// 每块本地盘的拓扑记录坐标 `(扁平盘下标, set, 组内槽)`。`Store::open` 的指纹校验与
+/// `cluster-shrink commit` 的写盘共用，防两处对 self_ranges 的解释漂移。
+pub(in crate::store) fn local_topo_entries(
+    sets: &drives::ClusterSets,
+    drives: usize,
+) -> Result<Vec<(usize, u16, u16)>> {
+    let mut out = Vec::with_capacity(drives);
+    for di in 0..drives {
+        let (set, off) = sets
+            .self_ranges
+            .iter()
+            .find(|&&(_, off, len)| di >= off && di < off + len)
+            .map(|&(set, off, _)| (set, off))
+            .ok_or_else(|| Error::Encode("盘下标不在任何 set 段（内部不一致）".into()))?;
+        out.push((di, set, (di - off) as u16));
+    }
+    Ok(out)
+}
+
+/// v4 拓扑记录（显式槽表）：`v4 set=S node=N slot=X epoch=E hash=H`。`hash` 是
+/// `ClusterSets::topology_hash` 的 16 hex canonical 指纹（节点身份无关）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopoRecordV4 {
+    pub set: u16,
+    pub node: String,
+    pub slot: u16,
+    pub epoch: u64,
+    pub hash: String,
+}
+
+/// 严格 v4 解析：恰好五个字段 + 版本头；缺字段/未知段/非数字/坏 hash 一律 None。
+/// 未知更高版本（v5+）同样 None（fail-closed）。
+fn parse_topo_record_v4(s: &str) -> Option<TopoRecordV4> {
+    let mut v4 = false;
+    let (mut set, mut slot, mut epoch) = (None, None, None);
+    let (mut node, mut hash) = (None, None);
+    for part in s.split_whitespace() {
+        if part == "v4" {
+            if v4 {
+                return None;
+            }
+            v4 = true;
+        } else if let Some(v) = part.strip_prefix("set=") {
+            set = Some(v.parse::<u16>().ok()?);
+        } else if let Some(v) = part.strip_prefix("node=") {
+            node = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("slot=") {
+            slot = Some(v.parse::<u16>().ok()?);
+        } else if let Some(v) = part.strip_prefix("epoch=") {
+            epoch = Some(v.parse::<u64>().ok()?);
+        } else {
+            // 未知段（含 v5 版本头）→ 拒收
+            hash = Some(part.strip_prefix("hash=")?.to_string());
+        }
+    }
+    let hash = hash?;
+    if !v4 || hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) || node.is_none() {
+        return None;
+    }
+    Some(TopoRecordV4 {
+        set: set?,
+        node: node?,
+        slot: slot?,
+        epoch: epoch?,
+        hash,
+    })
 }
 
 /// 拓扑记录解析（v1/v2/v3 兼容）：返回 `(set, node, slot)`；v1/v2 均视为 set 0。
 /// v1 形如 `v1 slots=12 node=n1 slot=0`（slots 段被忽略）；v2 = set0；v3 形如
 /// `v3 set=1 node=n1 slot=0`。**`v3` 且 set=0 = 拒启**（写路径永不产出该形态）。
-/// 不把版本前缀当防线（R2）：全等比对按解析出的三元组。
+/// v4（显式槽表）由 [`parse_topo_record_v4`] 处理；本函数对 v4 行返回 None——这正是
+/// v1.19 旧二进制的拒启行为（set= 存在但 v3 缺失），旧二进制不会带旧槽表启动。
+/// 未知版本头（v5+）同样拒收（fail-closed）。
 fn parse_topo_record(s: &str) -> Option<(u16, String, u16)> {
     let mut node = None;
     let mut slot = None;
     let mut set: Option<u16> = None;
-    let mut is_v3 = false;
+    let mut version: Option<u32> = None;
     for part in s.split_whitespace() {
-        if part == "v3" {
-            is_v3 = true;
+        if let Some(v) = part.strip_prefix('v').and_then(|x| x.parse::<u32>().ok()) {
+            // 重复/冲突版本头 → 0（非法，后续拒收）
+            version = Some(if version.is_some() { 0 } else { v });
+            continue;
         }
         if let Some(v) = part.strip_prefix("node=") {
             node = Some(v.to_string());
@@ -1765,6 +1905,11 @@ fn parse_topo_record(s: &str) -> Option<(u16, String, u16)> {
             set = v.parse::<u16>().ok();
         }
     }
+    let is_v3 = match version {
+        Some(1 | 2) => false,
+        Some(3) => true,
+        _ => return None, // 缺版本头 / v4+ / 未知版本
+    };
     // P3-2 不变量：写路径 **set= 字段存在 ⟺ v3**——v1/v2 带 set=（或 v3 缺 set=）都是
     // 人为错改的形态，一律拒收（不再只靠「v3+set0」单点判）。全等比对仍按解析三元组（R2）。
     if set.is_some() != is_v3 {
@@ -1806,6 +1951,8 @@ mod tests_parts;
 mod tests_replication;
 #[cfg(test)]
 mod tests_shrink;
+#[cfg(test)]
+mod tests_shrink_apply;
 #[cfg(test)]
 mod tests_sync;
 #[cfg(test)]
