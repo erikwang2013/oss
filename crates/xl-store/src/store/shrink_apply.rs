@@ -245,6 +245,15 @@ impl Store {
             let r = read_receipt(&work.join(format!("{action}.receipt")))?;
             check_receipt(&r, action, plan, &ctx.self_id)?;
         }
+        // verify 之后仍可能有写入（维护门之外的收尾/竞态）；写 v4 前再核一次命名空间。
+        // 摘要只含 bucket/key：已存在 key 的新版本写入不可见，依赖 maintenance 写门拦截。
+        let digest = self.namespace_digest().await?;
+        if digest != plan.namespace_digest {
+            return Err(Error::Encode(format!(
+                "commit 前命名空间已变化（verify 后发生写入）：plan={} now={digest}；请重新 plan/apply/verify",
+                plan.namespace_digest
+            )));
+        }
         let mut rep = ShrinkActionReport {
             action: "commit".into(),
             node_id: ctx.self_id.clone(),

@@ -12,7 +12,7 @@ use super::shrink::ShrinkPlanReport;
 use super::tests::{Cluster, InProcessMesh};
 use super::{Store, StoreConfig};
 
-fn n(id: &str, dc: u16) -> NodeSpec {
+pub(super) fn n(id: &str, dc: u16) -> NodeSpec {
     NodeSpec {
         id: id.into(),
         addr: format!("127.0.0.1:1910{}", &id[1..]),
@@ -47,25 +47,6 @@ fn target(epoch: u64) -> ClusterSets {
     ClusterSets::with_slot_maps(
         "n1",
         vec![vec![n("n1", 3), n("n2", 3), n("n3", 3)]],
-        vec![Some(SlotMap { epoch, slots })],
-        &ec84(),
-    )
-    .unwrap()
-}
-
-/// 单节点 12 槽全在 0 号盘：只用于拓扑记录格式/启动校验（与集群 fixture 解耦）。
-fn one_node(epoch: u64) -> ClusterSets {
-    let slots = std::iter::repeat_n(
-        SlotTarget {
-            node: "n1".into(),
-            drive: 0,
-        },
-        12,
-    )
-    .collect();
-    ClusterSets::with_slot_maps(
-        "n1",
-        vec![vec![n("n1", 1)]],
         vec![Some(SlotMap { epoch, slots })],
         &ec84(),
     )
@@ -124,7 +105,7 @@ async fn err_of(
 }
 
 /// `Store` 没有 Debug，`Result<Store>::unwrap_err` 不可用。
-fn store_err(r: crate::error::Result<Store>) -> String {
+pub(super) fn store_err(r: crate::error::Result<Store>) -> String {
     match r {
         Ok(_) => panic!("预期打开失败"),
         Err(e) => e.to_string(),
@@ -274,6 +255,22 @@ async fn commit_requires_apply_and_verify_then_writes_v4() {
     assert!(e.contains("commit"), "{e}");
 }
 
+/// P2：verify 后新写 key → commit 拒绝写 v4（命名空间摘要变化）。
+#[tokio::test]
+async fn commit_rejects_namespace_change_after_verify() {
+    let (c, report) = setup().await;
+    apply_all(&c, &report).await;
+    verify_all(&c, &report).await;
+    c.stores[0]
+        .put_object("alpha", "late", Bytes::from_static(b"late"), None)
+        .await
+        .unwrap();
+    let e = err_of(c.stores[0].shrink_commit(&report)).await;
+    assert!(e.contains("命名空间已变化"), "{e}");
+    let topo = std::fs::read_to_string(crate::layout::sys_dir(&c.dirs[0][0], "topo")).unwrap();
+    assert!(topo.starts_with("v2 "), "{topo}");
+}
+
 #[tokio::test]
 async fn apply_rejects_tampered_plan_and_unhealthy_peers() {
     let (c, report) = setup().await;
@@ -317,7 +314,7 @@ async fn apply_rejects_tampered_plan_and_unhealthy_peers() {
 }
 
 /// 打开同一批盘但换拓扑配置（commit 后重启的进程内等价）。
-async fn open_with(
+pub(super) async fn open_with(
     dirs: Vec<PathBuf>,
     id: &str,
     sets: ClusterSets,
@@ -390,110 +387,4 @@ async fn restart_after_commit_requires_new_config() {
     assert!(e.contains("先在所有节点 commit") && e.contains("n1"), "{e}");
     let e = err_of(c.stores[1].shrink_rollback(&report)).await;
     assert!(e.contains("commit 前") && e.contains("n1"), "{e}");
-}
-
-/// 1 盘目录 + 预置 topo 记录（记录格式测试用）。
-async fn record_dir(rec: &str) -> tempfile::TempDir {
-    let d = tempfile::tempdir().unwrap();
-    tokio::fs::create_dir_all(crate::layout::sys_dir(d.path(), ""))
-        .await
-        .unwrap();
-    tokio::fs::write(crate::layout::sys_dir(d.path(), "topo"), rec)
-        .await
-        .unwrap();
-    d
-}
-
-async fn open_record(rec: &str) -> String {
-    let d = record_dir(rec).await;
-    store_err(open_with(vec![d.path().to_path_buf()], "n1", one_node(2), ec84()).await)
-}
-
-/// v4 启动校验：epoch/hash/node/slot 任一不符 → 拒启，错误要能指向 commit/配置。
-#[tokio::test]
-async fn v4_startup_exact_match_rejects_each_field_mismatch() {
-    let good_hash = one_node(2).topology_hash();
-    let cases = [
-        format!("v4 set=0 node=n1 slot=0 epoch=3 hash={good_hash}"),
-        "v4 set=0 node=n1 slot=0 epoch=2 hash=0123456789abcdef".to_string(),
-        format!("v4 set=0 node=n2 slot=0 epoch=2 hash={good_hash}"),
-        format!("v4 set=0 node=n1 slot=1 epoch=2 hash={good_hash}"),
-    ];
-    for (i, rec) in cases.iter().enumerate() {
-        let e = open_record(rec).await;
-        assert!(
-            e.contains("v4 与配置不符") || e.contains("无法识别"),
-            "case {i}: {e}"
-        );
-    }
-    // 未知更高版本 v5 → fail-closed。
-    let e = open_record("v5 set=0 node=n1 slot=0 epoch=2 hash=0123456789abcdef").await;
-    assert!(e.contains("无法识别"), "{e}");
-    // 本机 0 号盘 = slot 0；上面 4 个 case 已覆盖 epoch/hash/node/slot。
-}
-
-#[tokio::test]
-async fn legacy_v2_v3_records_upgrade_to_v4_on_explicit_start() {
-    // v2：显式单 set 的 0 号盘，旧记录三元组一致 → 首启升级 v4。
-    let dir = record_dir("v2 node=n1 slot=0").await;
-    let s = open_with(vec![dir.path().to_path_buf()], "n1", one_node(2), ec84())
-        .await
-        .unwrap();
-    let rec = std::fs::read_to_string(crate::layout::sys_dir(dir.path(), "topo")).unwrap();
-    let h = s.cluster().unwrap().sets.topology_hash();
-    assert_eq!(
-        rec.trim(),
-        format!("v4 set=0 node=n1 slot=0 epoch=2 hash={h}")
-    );
-    drop(s);
-
-    // v3（set>0）：本机只在 set 1，0 号盘写 `v3 set=1 node=n1 slot=0` → 升级 v4 set=1。
-    let ec = EcConfig {
-        data: 2,
-        parity: 1,
-        enabled: true,
-    };
-    let t0 = tempfile::tempdir().unwrap();
-    let t1 = tempfile::tempdir().unwrap();
-    let t2 = tempfile::tempdir().unwrap();
-    let dirs: Vec<PathBuf> = vec![
-        t0.path().to_path_buf(),
-        t1.path().to_path_buf(),
-        t2.path().to_path_buf(),
-    ];
-    tokio::fs::create_dir_all(crate::layout::sys_dir(&dirs[0], ""))
-        .await
-        .unwrap();
-    tokio::fs::write(
-        crate::layout::sys_dir(&dirs[0], "topo"),
-        "v3 set=1 node=n1 slot=0",
-    )
-    .await
-    .unwrap();
-    let m = |node: &str, epoch: u64| SlotMap {
-        epoch,
-        slots: (0..3)
-            .map(|_| SlotTarget {
-                node: node.into(),
-                drive: 0,
-            })
-            .collect(),
-    };
-    let sets = ClusterSets::with_slot_maps(
-        "n1",
-        vec![vec![n("n2", 3)], vec![n("n1", 3)]],
-        vec![Some(m("n2", 2)), Some(m("n1", 2))],
-        &ec,
-    )
-    .unwrap();
-    let s = open_with(dirs.clone(), "n1", sets, ec).await.unwrap();
-    let rec = std::fs::read_to_string(crate::layout::sys_dir(&dirs[0], "topo")).unwrap();
-    assert!(
-        rec.starts_with("v4 set=1 node=n1 slot=0 epoch=2 hash="),
-        "{rec}"
-    );
-    assert_eq!(
-        s.cluster().unwrap().sets.topology_hash(),
-        rec.trim().rsplit("hash=").next().unwrap()
-    );
 }
