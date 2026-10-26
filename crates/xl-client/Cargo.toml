@@ -10,6 +10,8 @@ xl-proto = { path = "../xl-proto" }
 xl-store = { workspace = true }
 tonic.workspace = true
 tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
 futures.workspace = true

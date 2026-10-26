@@ -639,9 +639,10 @@ pub async fn run(
 
                 let store = Arc::clone(&state.store);
                 let secret = cl.secret.clone();
-                let tls = state.tls.tonic_server();
+                // 入站 TLS 每连接热加载（明文部署不订阅，行为不变）。
+                let tls = state.tls.peer_tls().then(|| state.tls.mesh_server_watch());
                 tokio::spawn(async move {
-                    if let Err(e) = xl_client::serve_tls(store, addr, secret, tls).await {
+                    if let Err(e) = xl_client::serve_tls_watch(store, addr, secret, tls).await {
                         // 进程不随 gRPC 退（HTTP 面继续）：对端会将其标 down、quorum 收窄；
                         // 监督/自动重启归 M4 运维面。
                         tracing::error!(error = %e, "mesh gRPC server 退出");
@@ -679,9 +680,9 @@ pub async fn run(
                 }
                 let store = Arc::clone(&state.store);
                 let secret = st.mesh_secret.clone();
-                let tls = state.tls.tonic_server();
+                let tls = state.tls.peer_tls().then(|| state.tls.mesh_server_watch());
                 tokio::spawn(async move {
-                    if let Err(e) = xl_client::serve_tls(store, addr, secret, tls).await {
+                    if let Err(e) = xl_client::serve_tls_watch(store, addr, secret, tls).await {
                         tracing::error!(error = %e, "stretch mesh gRPC server 退出");
                     }
                 });
