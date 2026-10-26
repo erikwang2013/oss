@@ -2278,7 +2278,7 @@ impl Db {
 
     /// 账户桶数：桶主的**当前**账户（成员行优先，无行 = uid 派生）；管理员桶归系统账户
     /// 但永不匹配真实账户，故不计入任何用户账户。
-    fn account_bucket_count_sql() -> &'static str {
+    pub(crate) fn account_bucket_count_sql() -> &'static str {
         "(SELECT COUNT(*) FROM buckets b JOIN users u ON u.id = b.owner_id \
           LEFT JOIN account_members bm ON bm.uid = u.id \
           WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = a.id)"

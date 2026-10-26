@@ -1,11 +1,11 @@
-//! AC-0/AC-1/AC-2：多租户账户控制台 API（standalone 模式）。
+//! AC-0/AC-1/AC-2：多租户账户控制台 API。
 //!
 //! - 全局管理员：账户 CRUD、配额、启停、成员挂载；
 //! - 账户管理员（role=owner/admin）：仅本账户——列成员、建用户（恒为 member）、停用 member；
 //! - 其它成员：只读本账户与成员列表。
 //!
-//! 账户/成员表不参与 Raft 复制（0005 迁移头注），因此**所有写路由在 Raft 模式一律 503**，
-//! 读路由使用启动期回填的本地派生数据。授权失败一律 403（纯文本，与 console 同形）。
+//! 写路由一律经 `ControlPlane`（Raft = 复制命令；standalone = `Local` apply 同一事务），
+//! 读路由使用本地已复制/已回填的 SQLite。授权失败一律 403（纯文本，与 console 同形）。
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -15,7 +15,10 @@ use axum::{Json, Router};
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
 
-use crate::console::{forbidden, internal_error, who};
+use crate::console::{
+    control_failure, control_rejection, control_write_status, forbidden, internal_error, who,
+};
+use crate::raft::{ControlCommand, ControlResponse};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -35,17 +38,6 @@ pub fn routes() -> Router<AppState> {
             "/accounts/{id}/members/{uid}/status",
             put(set_member_status),
         )
-}
-
-/// 账户写接口只在 standalone 落地（Raft 快照不含本表，跨站点写会分叉）。
-fn require_standalone(state: &AppState) -> Option<Response> {
-    state.control.is_raft().then(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "accounts API is not available in raft mode",
-        )
-            .into_response()
-    })
 }
 
 fn is_manager(role: Option<&str>) -> bool {
@@ -107,6 +99,15 @@ fn bad(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
 
+/// 12 位账户 id：与 `Db::create_account` 同分布；命令只携带算好的值。
+async fn new_account_id(state: &AppState) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT printf('%012d', 100000000000 + ((random() & 0x7fffffffffffffff) % 900000000000))",
+    )
+    .fetch_one(state.db.pool())
+    .await
+}
+
 async fn list_accounts(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -136,9 +137,6 @@ async fn create_account(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateAccountBody>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (_, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -153,13 +151,33 @@ async fn create_account(
     if body.bucket_quota.is_some_and(|q| q < 0) {
         return bad("bucket_quota 必须 >= 0 或省略");
     }
-    match state.db.create_account(name, body.bucket_quota).await {
-        Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "创建账户失败");
-            internal_error()
+    let created_at = crate::db::now();
+    // 与 db.rs 相同：id 冲突概率可忽略，最多重试 8 次（命令只带预生成 id）。
+    for _ in 0..8 {
+        let id = match new_account_id(&state).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e, "生成账户 id 失败");
+                return internal_error();
+            }
+        };
+        let cmd = ControlCommand::AccountCreate {
+            id: id.clone(),
+            name: name.to_string(),
+            bucket_quota: body.bucket_quota,
+            created_at,
+        };
+        match state.control.write(cmd).await {
+            Ok(ControlResponse::Ok) => {
+                return Json(serde_json::json!({ "id": id })).into_response();
+            }
+            Ok(ControlResponse::Conflict) => continue,
+            Ok(resp) => return control_rejection(resp, "账户创建冲突"),
+            Err(e) => return control_failure(e),
         }
     }
+    tracing::error!("account id generation collision (retry)");
+    internal_error()
 }
 
 async fn get_account(
@@ -198,9 +216,6 @@ async fn update_account(
     Path(id): Path<String>,
     Json(body): Json<UpdateAccountBody>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (_, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -208,44 +223,33 @@ async fn update_account(
     if !is_admin {
         return forbidden("需要管理员权限");
     }
-    if let Some(name) = &body.name {
-        let name = match valid_name(name) {
-            Ok(n) => n,
+    let name = match &body.name {
+        Some(name) => match valid_name(name) {
+            Ok(n) => Some(n.to_string()),
             Err(r) => return r,
-        };
-        match state.db.rename_account(&id, name).await {
-            Ok(true) => {}
-            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-            Err(e) => {
-                tracing::error!(error = %e, "重命名账户失败");
-                return internal_error();
-            }
-        }
+        },
+        None => None,
+    };
+    if body
+        .status
+        .as_deref()
+        .is_some_and(|s| s != "active" && s != "disabled")
+    {
+        return bad("status 只能是 active 或 disabled");
     }
-    if let Some(status) = &body.status {
-        if status != "active" && status != "disabled" {
-            return bad("status 只能是 active 或 disabled");
-        }
-        match state.db.set_account_status(&id, status).await {
-            Ok(true) => {}
-            // 条件更新失败：不存在，或账户内仍有在册全局管理员（防锁死）
-            Ok(false) => {
-                return match state.db.get_account(&id).await {
-                    Ok(None) => StatusCode::NOT_FOUND.into_response(),
-                    Ok(Some(_)) => bad("账户内仍有在册全局管理员，不能停用"),
-                    Err(e) => {
-                        tracing::error!(error = %e, "查询账户失败");
-                        internal_error()
-                    }
-                };
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "更新账户状态失败");
-                return internal_error();
-            }
-        }
+    if name.is_none() && body.status.is_none() {
+        return StatusCode::NO_CONTENT.into_response();
     }
-    StatusCode::NO_CONTENT.into_response()
+    let cmd = ControlCommand::AccountUpdate {
+        id,
+        name,
+        status: body.status,
+        updated_at: crate::db::now(),
+    };
+    control_write_status(
+        state.control.write(cmd).await,
+        "账户内仍有在册全局管理员，不能停用",
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,9 +265,6 @@ async fn set_quota(
     Path(id): Path<String>,
     Json(body): Json<QuotaBody>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (_, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -274,14 +275,12 @@ async fn set_quota(
     if body.bucket_quota.is_some_and(|q| q < 0) {
         return bad("bucket_quota 必须 >= 0 或 null");
     }
-    match state.db.set_account_quota(&id, body.bucket_quota).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "更新账户配额失败");
-            internal_error()
-        }
-    }
+    let cmd = ControlCommand::AccountSetQuota {
+        id,
+        bucket_quota: body.bucket_quota,
+        updated_at: crate::db::now(),
+    };
+    control_write_status(state.control.write(cmd).await, "配额更新冲突")
 }
 
 async fn delete_account(
@@ -289,9 +288,6 @@ async fn delete_account(
     Extension(payload): Extension<JwtPayload>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (_, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -302,21 +298,13 @@ async fn delete_account(
     if id == xl_s3::access::LEGACY_ACCOUNT {
         return bad("系统账户不可删除");
     }
-    match state.db.delete_account(&id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => match state.db.get_account(&id).await {
-            Ok(None) => StatusCode::NOT_FOUND.into_response(),
-            Ok(Some(_)) => (StatusCode::CONFLICT, "账户仍有成员或桶，不能删除").into_response(),
-            Err(e) => {
-                tracing::error!(error = %e, "查询账户失败");
-                internal_error()
-            }
-        },
-        Err(e) => {
-            tracing::error!(error = %e, "删除账户失败");
-            internal_error()
-        }
-    }
+    control_write_status(
+        state
+            .control
+            .write(ControlCommand::AccountDelete { id })
+            .await,
+        "账户仍有成员或桶，不能删除",
+    )
 }
 
 async fn list_members(
@@ -358,9 +346,6 @@ async fn attach_member(
     Path(id): Path<String>,
     Json(body): Json<AttachMemberBody>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (_, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -375,27 +360,21 @@ async fn attach_member(
     if body.role != "admin" && body.role != "member" {
         return bad("role 只能是 admin 或 member");
     }
-    match state.db.get_account(&id).await {
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Some(a)) if a.status != "active" => return bad("账户已停用"),
-        Ok(Some(_)) => {}
+    let username = match state.db.get_user(body.uid).await {
+        Ok(Some((username, false, _))) => username,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "查询账户失败");
+            tracing::error!(error = %e, "查询用户失败");
             return internal_error();
         }
-    }
-    match state
-        .db
-        .attach_account_member(&id, body.uid, &body.role)
-        .await
-    {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "挂载账户成员失败");
-            internal_error()
-        }
-    }
+    };
+    let cmd = ControlCommand::AccountMemberAttach {
+        account_id: id,
+        username,
+        role: body.role,
+        created_at: crate::db::now(),
+    };
+    control_write_status(state.control.write(cmd).await, "成员挂载冲突")
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,9 +389,6 @@ async fn create_user(
     Path(id): Path<String>,
     Json(body): Json<CreateUserBody>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (uid, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -430,27 +406,32 @@ async fn create_user(
     if body.password.len() < 8 {
         return bad("口令过短（至少 8 位）");
     }
-    match state.db.get_account(&id).await {
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Some(a)) if a.status != "active" => return bad("账户已停用"),
-        Ok(Some(_)) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "查询账户失败");
-            return internal_error();
-        }
-    }
     // 账户内新建用户恒为 member + 非全局管理员（禁提权）；角色升级由全局管理员挂载接口完成。
-    match state
-        .db
-        .create_user_in_account(&id, username, &body.password, "member")
+    let cmd = ControlCommand::AccountUserCreate {
+        account_id: id,
+        username: username.to_string(),
+        password_hash: crate::db::hash_password(&body.password),
+        role: "member".to_string(),
+        created_at: crate::db::now(),
+    };
+    match state.control.write(cmd).await {
+        Ok(ControlResponse::Ok) => {}
+        Ok(resp) => return control_rejection(resp, "用户名已存在"),
+        Err(e) => return control_failure(e),
+    }
+    // 命令只带自然键；apply 后按 username 取本地 uid（follower 已在 client_write 内等 apply）。
+    match sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ?")
+        .bind(username)
+        .fetch_optional(state.db.pool())
         .await
     {
-        Ok(new_uid) => Json(serde_json::json!({ "id": new_uid })).into_response(),
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            bad("用户名已存在").into_response()
+        Ok(Some(new_uid)) => Json(serde_json::json!({ "id": new_uid })).into_response(),
+        Ok(None) => {
+            tracing::error!(username, "账户内用户已建但回读失败");
+            internal_error()
         }
         Err(e) => {
-            tracing::error!(error = %e, "账户内创建用户失败");
+            tracing::error!(error = %e, "回读账户内用户失败");
             internal_error()
         }
     }
@@ -467,9 +448,6 @@ async fn set_member_status(
     Path((id, target)): Path<(String, i64)>,
     Json(body): Json<MemberStatusBody>,
 ) -> Response {
-    if let Some(r) = require_standalone(&state) {
-        return r;
-    }
     let (uid, is_admin) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -485,7 +463,7 @@ async fn set_member_status(
             return internal_error();
         }
     };
-    let (_, target_is_admin, _) = match state.db.get_user(target).await {
+    let (username, target_is_admin, _) = match state.db.get_user(target).await {
         Ok(Some(v)) => v,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -497,18 +475,16 @@ async fn set_member_status(
     if !is_admin && (target == uid || target_is_admin || role != "member") {
         return forbidden("账户管理员只能停用本账户的 member");
     }
-    match state.db.set_user_status(target, body.active).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => {
-            if matches!(state.db.get_user(target).await, Ok(Some(_))) {
-                bad("不能停用最后一个在册管理员").into_response()
-            } else {
-                StatusCode::NOT_FOUND.into_response()
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "更新成员状态失败");
-            internal_error()
-        }
+    let cmd = ControlCommand::AccountMemberSetStatus {
+        account_id: id,
+        username,
+        active: body.active,
+    };
+    match state.control.write(cmd).await {
+        Ok(ControlResponse::Ok) => StatusCode::NO_CONTENT.into_response(),
+        Ok(ControlResponse::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(ControlResponse::Conflict) => bad("不能停用最后一个在册管理员").into_response(),
+        Ok(resp) => control_rejection(resp, "成员状态冲突"),
+        Err(e) => control_failure(e),
     }
 }

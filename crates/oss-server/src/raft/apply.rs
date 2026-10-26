@@ -8,6 +8,8 @@
 use base64::Engine as _;
 use sqlx::SqliteConnection;
 
+mod accounts;
+
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
@@ -244,6 +246,10 @@ pub(crate) async fn apply_command(
     cmd: &ControlCommand,
 ) -> Result<Applied, sqlx::Error> {
     let effects = effects_for(cmd);
+    // Level-3 账户/成员命令有独立的业务约束集合（自然键 + 账户不变量）。
+    if let Some(response) = accounts::apply(cw, cmd).await? {
+        return Ok(Applied { response, effects });
+    }
     let response = match cmd {
         ControlCommand::UserCreate {
             username,
@@ -734,6 +740,16 @@ pub(crate) async fn apply_command(
             } else {
                 ControlResponse::NotFound
             }
+        }
+        // 账户/成员命令已在上面由 `accounts::apply` 处理。
+        ControlCommand::AccountCreate { .. }
+        | ControlCommand::AccountUpdate { .. }
+        | ControlCommand::AccountSetQuota { .. }
+        | ControlCommand::AccountDelete { .. }
+        | ControlCommand::AccountMemberAttach { .. }
+        | ControlCommand::AccountMemberSetStatus { .. }
+        | ControlCommand::AccountUserCreate { .. } => {
+            unreachable!("account commands are handled before the command match")
         }
         // Level 3 命令容器：apply 只认识显式注册的 type_id；未知类型是业务拒绝，
         // 绝不能当空操作（静默忽略会让新旧副本的控制面状态分叉）。leader 已在

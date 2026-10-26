@@ -371,7 +371,7 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
 
 /// M9 S6d：控制写成功 → 204；业务拒绝/门面错误统一走 S6b 的两个映射 helper
 /// （503 保留 `ControlError::to_string()` 的 raft/forward 提示，绝不静默 204）。
-fn control_write_status(
+pub(crate) fn control_write_status(
     r: Result<crate::raft::ControlResponse, crate::raft::control::ControlError>,
     conflict: &'static str,
 ) -> Response {
