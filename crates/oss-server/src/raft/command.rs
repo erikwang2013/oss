@@ -241,6 +241,13 @@ pub enum ControlCommand {
         bucket_quota: Option<i64>,
         updated_at: i64,
     },
+    /// 软字节配额（AC-2）：只告警不阻写；`None` = 取消。独立变体避免给
+    /// `AccountSetQuota` 加字段——旧二进制的 `deny_unknown_fields` 会 fail-stop。
+    AccountSetSoftQuota {
+        id: String,
+        soft_byte_quota: Option<i64>,
+        updated_at: i64,
+    },
     AccountDelete {
         id: String,
     },
@@ -368,6 +375,7 @@ impl ControlCommand {
             Self::AccountCreate { .. }
             | Self::AccountUpdate { .. }
             | Self::AccountSetQuota { .. }
+            | Self::AccountSetSoftQuota { .. }
             | Self::AccountDelete { .. }
             | Self::AccountMemberAttach { .. }
             | Self::AccountMemberSetStatus { .. }

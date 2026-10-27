@@ -184,6 +184,7 @@ impl Store {
         let mut cps: Vec<String> = local_cps;
         let local_caps = self.local_caps();
         let mut degraded_marker = false;
+        let mut incomplete = false;
         // V1 排他页：远端可能按包含式返回 marker 本身（旧端忽略 marker_exclusive，或
         // 探测失败被当成现版）。多取一条再过滤 <= marker 的输出，既让 marker 必前进，
         // 又保住「每源先返回 max+1 个 > marker 输出」的完备性前提（见头注证明）。
@@ -250,7 +251,9 @@ impl Store {
                 // 能力闸门在第二次探测才发现旧版：不得当成「不可达」吞掉整路（静默缺项）。
                 Err(e @ Error::PeerIncompatible(_)) => return Err(e),
                 Err(e) => {
-                    // 丢一路并集：V1 marker 页必须让客户端看到降级（头由 S3 层回）。
+                    // 丢一路并集：V1 marker 页必须让客户端看到降级（头由 S3 层回）；
+                    // 只读聚合还需知道结果是下界（incomplete）。
+                    incomplete = true;
                     if exclusive {
                         degraded_marker = true;
                     }
@@ -261,6 +264,7 @@ impl Store {
 
         let mut result = merge_page(max, objs.into_values(), cps);
         result.degraded_marker = degraded_marker;
+        result.incomplete = incomplete;
         Ok(result)
     }
 

@@ -33,6 +33,7 @@ pub fn routes() -> Router<AppState> {
             get(get_account).put(update_account).delete(delete_account),
         )
         .route("/accounts/{id}/quota", put(set_quota))
+        .route("/accounts/{id}/soft-quota", put(set_soft_quota))
         .route("/accounts/{id}/usage", get(account_usage))
         .route(
             "/accounts/{id}/members",
@@ -222,6 +223,42 @@ async fn set_quota(
         updated_at: crate::db::now(),
     };
     control_write_status(state.control.write(cmd).await, "配额更新冲突")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoftQuotaBody {
+    /// 必填：`null` = 取消；非负整数 = 设置。缺字段反序列化失败，避免空 body 误清配额。
+    soft_byte_quota: serde_json::Value,
+}
+
+async fn set_soft_quota(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<String>,
+    Json(body): Json<SoftQuotaBody>,
+) -> Response {
+    let (_, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !is_admin {
+        return forbidden("需要管理员权限");
+    }
+    let soft_byte_quota = match body.soft_byte_quota {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(q) if q >= 0 => Some(q),
+            _ => return bad("soft_byte_quota 必须 >= 0 或 null"),
+        },
+        _ => return bad("soft_byte_quota 必须 >= 0 或 null"),
+    };
+    let cmd = ControlCommand::AccountSetSoftQuota {
+        id,
+        soft_byte_quota,
+        updated_at: crate::db::now(),
+    };
+    control_write_status(state.control.write(cmd).await, "软配额更新冲突")
 }
 
 async fn delete_account(

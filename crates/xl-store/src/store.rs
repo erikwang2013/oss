@@ -212,6 +212,9 @@ pub struct ListResult {
     /// DP-1：V1 marker 页在混版窗口中的**语义降级**——legacy peer 忽略排他 marker，
     /// 边界键会重复出现（不会丢键）。S3 层据此回 `x-oss-degraded: list-marker`。
     pub degraded_marker: bool,
+    /// 集群列举丢过至少一路 peer（不可达）：结果是**下界**而非完整并集。
+    /// 只读聚合（如账户软配额用量）据此标记不完整，不能把下界当精确值。
+    pub incomplete: bool,
 }
 
 /// ListMultipartUploads 请求。排序键是 (key, upload_id)：key_marker 排他，

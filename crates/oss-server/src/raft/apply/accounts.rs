@@ -193,6 +193,30 @@ pub(super) async fn apply(
                 }
             }
         }
+        ControlCommand::AccountSetSoftQuota {
+            id,
+            soft_byte_quota,
+            updated_at,
+        } => {
+            if soft_byte_quota.is_some_and(|q| q < 0) {
+                ControlResponse::Invalid
+            } else {
+                let n = sqlx::query(
+                    "UPDATE accounts SET soft_byte_quota = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(soft_byte_quota)
+                .bind(updated_at)
+                .bind(id)
+                .execute(&mut *cw.conn)
+                .await?
+                .rows_affected();
+                if n == 1 {
+                    ControlResponse::Ok
+                } else {
+                    ControlResponse::NotFound
+                }
+            }
+        }
         ControlCommand::AccountDelete { id } => {
             if id == LEGACY_ACCOUNT {
                 ControlResponse::Invalid

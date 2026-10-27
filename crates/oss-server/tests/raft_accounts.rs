@@ -45,6 +45,14 @@ fn set_quota(quota: Option<i64>, updated_at: i64) -> ControlCommand {
     }
 }
 
+fn set_soft_quota(quota: Option<i64>, updated_at: i64) -> ControlCommand {
+    ControlCommand::AccountSetSoftQuota {
+        id: ACC.into(),
+        soft_byte_quota: quota,
+        updated_at,
+    }
+}
+
 fn attach(username: &str, role: &str, created_at: i64) -> ControlCommand {
     ControlCommand::AccountMemberAttach {
         account_id: ACC.into(),
@@ -127,6 +135,30 @@ async fn local_control_applies_every_account_command() {
         account_status(st.db.pool(), ACC).await,
         ("acme-renamed".into(), None, 12)
     );
+
+    // 软配额独立变体：只动 soft_byte_quota，不得清掉桶配额（反向亦然）。
+    assert_eq!(
+        write(&st, set_soft_quota(Some(1024), 12)).await,
+        ControlResponse::Ok
+    );
+    let (soft, bucket): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT soft_byte_quota, bucket_quota FROM accounts WHERE id = ?")
+            .bind(ACC)
+            .fetch_one(st.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(soft, Some(1024));
+    assert_eq!(bucket, None);
+    assert_eq!(
+        write(&st, set_soft_quota(None, 12)).await,
+        ControlResponse::Ok
+    );
+    let soft: Option<i64> = sqlx::query_scalar("SELECT soft_byte_quota FROM accounts WHERE id = ?")
+        .bind(ACC)
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(soft, None);
 
     // 挂载已有用户为账户 admin：admin_uid 只在新填入时补齐
     assert_eq!(

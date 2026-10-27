@@ -745,6 +745,7 @@ pub(crate) async fn apply_command(
         ControlCommand::AccountCreate { .. }
         | ControlCommand::AccountUpdate { .. }
         | ControlCommand::AccountSetQuota { .. }
+        | ControlCommand::AccountSetSoftQuota { .. }
         | ControlCommand::AccountDelete { .. }
         | ControlCommand::AccountMemberAttach { .. }
         | ControlCommand::AccountMemberSetStatus { .. }

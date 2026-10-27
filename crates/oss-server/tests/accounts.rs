@@ -834,6 +834,22 @@ fn quota_header(resp: &reqwest::Response) -> Option<String> {
         .map(|v| v.to_str().unwrap().to_string())
 }
 
+/// 设置/清除软配额（`None` = null）。独立路由，不会触碰 bucket_quota。
+async fn set_soft_quota(
+    base: &str,
+    token: &str,
+    id: &str,
+    value: Option<i64>,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .put(format!("{base}/api/v1/accounts/{id}/soft-quota"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "soft_byte_quota": value }))
+        .send()
+        .await
+        .unwrap()
+}
+
 /// 两个桶的当前对象字节求和、配额未超/超限/none 的 `exceeded` 与响应头、
 /// 非成员 403 / 缺失账户 404，以及**超限后真实 S3 PUT 仍成功**（不阻写）。
 #[tokio::test]
@@ -886,6 +902,15 @@ async fn soft_byte_quota_usage_is_advisory_and_never_blocks_put() {
         )
         .await
         .unwrap();
+    // 空桶：计入 bucket_count，但不贡献字节。
+    let resp = client
+        .post(format!("{base}/api/v1/buckets"))
+        .bearer_auth(&erin)
+        .json(&serde_json::json!({ "name": "soft-empty" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "建空桶 soft-empty");
 
     // 未配配额：真实用量照报，exceeded=false，且不带告警头。
     let resp = account_usage(&base, &erin, &id).await;
@@ -894,17 +919,26 @@ async fn soft_byte_quota_usage_is_advisory_and_never_blocks_put() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["account_id"], id.as_str());
     assert_eq!(body["used_bytes"], 15);
-    assert_eq!(body["bucket_count"], 2);
+    assert_eq!(body["bucket_count"], 3);
     assert!(body["soft_byte_quota"].is_null());
     assert_eq!(body["exceeded"], false);
-
-    // 配额 10 < 15：超限。
-    sqlx::query("UPDATE accounts SET soft_byte_quota = ? WHERE id = ?")
-        .bind(10_i64)
-        .bind(&id)
-        .execute(probe.db.pool())
+    // 与 GET /accounts/{id} 的 bucket_count 同口径。
+    let acct: serde_json::Value = client
+        .get(format!("{base}/api/v1/accounts/{id}"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
+    assert_eq!(acct["bucket_count"], 3);
+
+    // 配额 10 < 15：超限（走真实 HTTP 配置路由，不用裸 SQL）。
+    assert_eq!(
+        set_soft_quota(&base, &admin, &id, Some(10)).await.status(),
+        204
+    );
     let resp = account_usage(&base, &erin, &id).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(quota_header(&resp).as_deref(), Some("exceeded"));
@@ -938,27 +972,121 @@ async fn soft_byte_quota_usage_is_advisory_and_never_blocks_put() {
     assert_eq!(body["exceeded"], true);
 
     // 提高配额到 100：未超限，头为 ok。
-    sqlx::query("UPDATE accounts SET soft_byte_quota = ? WHERE id = ?")
-        .bind(100_i64)
-        .bind(&id)
-        .execute(probe.db.pool())
-        .await
-        .unwrap();
+    assert_eq!(
+        set_soft_quota(&base, &admin, &id, Some(100)).await.status(),
+        204
+    );
     let resp = account_usage(&base, &erin, &id).await;
     assert_eq!(quota_header(&resp).as_deref(), Some("ok"));
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["exceeded"], false);
 
-    // 非成员 403；缺失账户 404（管理员与非成员同口径）。
+    // 先鉴权后取账户（与 GET /accounts/{id} 同口径）：非成员 403，不泄露账户存在性；
+    // 只有全局管理员能看到缺失账户的 404。
     create_console_user(&base, &admin, "bob2").await;
     let bob = login_ok(&base, "bob2", "bob2-password").await;
     assert_eq!(account_usage(&base, &bob, &id).await.status(), 403);
-    for token in [&admin, &bob] {
-        assert_eq!(
-            account_usage(&base, token, "000000000099").await.status(),
-            404
-        );
-    }
+    assert_eq!(
+        account_usage(&base, &bob, "000000000099").await.status(),
+        403
+    );
+    assert_eq!(
+        account_usage(&base, &admin, "000000000099").await.status(),
+        404
+    );
+}
+
+/// 软配额配置路由：独立字段、三态（数字/ null / 缺字段拒绝），不误清 bucket_quota；
+/// 非管理员 403、缺失账户 404、负数/字符串 400。
+#[tokio::test]
+async fn soft_quota_route_is_independent_and_validated() {
+    let (_dir, base, admin) = serve_with_admin().await;
+    let client = reqwest::Client::new();
+    let id = create_account(&base, &admin, "independent", Some(3)).await;
+    let get_account = || {
+        let client = client.clone();
+        let base = base.clone();
+        let admin = admin.clone();
+        let id = id.clone();
+        async move {
+            client
+                .get(format!("{base}/api/v1/accounts/{id}"))
+                .bearer_auth(admin)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 只设软配额：桶配额保持 3。
+    assert_eq!(
+        set_soft_quota(&base, &admin, &id, Some(1024))
+            .await
+            .status(),
+        204
+    );
+    let acct = get_account().await;
+    assert_eq!(acct["bucket_quota"], 3);
+    assert_eq!(acct["soft_byte_quota"], 1024);
+
+    // 只改桶配额：软配额保持 1024（反向不误清）。
+    let resp = client
+        .put(format!("{base}/api/v1/accounts/{id}/quota"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "bucket_quota": 5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let acct = get_account().await;
+    assert_eq!(acct["bucket_quota"], 5);
+    assert_eq!(acct["soft_byte_quota"], 1024);
+
+    // null = 取消软配额，桶配额保持 5。
+    assert_eq!(set_soft_quota(&base, &admin, &id, None).await.status(), 204);
+    let acct = get_account().await;
+    assert!(acct["soft_byte_quota"].is_null());
+    assert_eq!(acct["bucket_quota"], 5);
+
+    // 负数/字符串 400；缺字段由 serde 拒绝（不静默清空）。
+    assert_eq!(
+        set_soft_quota(&base, &admin, &id, Some(-1)).await.status(),
+        400
+    );
+    let string_body = client
+        .put(format!("{base}/api/v1/accounts/{id}/soft-quota"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "soft_byte_quota": "1024" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(string_body.status(), 400);
+    let missing_field = client
+        .put(format!("{base}/api/v1/accounts/{id}/soft-quota"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!missing_field.status().is_success(), "缺字段不得静默清空");
+
+    // 非管理员 403；缺失账户（管理员）404。
+    let bob_uid = create_console_user(&base, &admin, "bob3").await;
+    assert!(bob_uid > 0);
+    let bob = login_ok(&base, "bob3", "bob3-password").await;
+    assert_eq!(
+        set_soft_quota(&base, &bob, &id, Some(1)).await.status(),
+        403
+    );
+    assert_eq!(
+        set_soft_quota(&base, &admin, "000000000099", Some(1))
+            .await
+            .status(),
+        404
+    );
 }
 
 /// 分页边界：单桶 >1000 键必须翻页累加（端点固定 max_keys=1000），再跨两个桶求和。

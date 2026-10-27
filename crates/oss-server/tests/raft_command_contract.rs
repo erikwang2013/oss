@@ -216,6 +216,11 @@ fn all_variants() -> Vec<ControlCommand> {
             bucket_quota: None,
             updated_at: 1,
         },
+        ControlCommand::AccountSetSoftQuota {
+            id: "000000000001".into(),
+            soft_byte_quota: Some(1024),
+            updated_at: 1,
+        },
         ControlCommand::AccountDelete {
             id: "000000000001".into(),
         },
@@ -333,6 +338,7 @@ fn feature_level_three_is_open_only_for_ext_and_accounts() {
             ControlCommand::AccountCreate { .. }
             | ControlCommand::AccountUpdate { .. }
             | ControlCommand::AccountSetQuota { .. }
+            | ControlCommand::AccountSetSoftQuota { .. }
             | ControlCommand::AccountDelete { .. }
             | ControlCommand::AccountMemberAttach { .. }
             | ControlCommand::AccountMemberSetStatus { .. }
@@ -347,7 +353,7 @@ fn feature_level_three_is_open_only_for_ext_and_accounts() {
         }
     }
     assert_eq!(ext, 1, "生产命令集恰好一个 Ext 样本");
-    assert_eq!(accounts, 7, "生产命令集恰好七个账户命令样本");
+    assert_eq!(accounts, 8, "生产命令集恰好八个账户命令样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，
