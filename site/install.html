@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.19.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.20.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -206,13 +206,13 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
             </table>
           </div>
           <p>完整的节点拓扑、witness、sync 写语义、cutover 与 force recovery 步骤在 <a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">README</a> 的强一致章节（随发布同步）。</p>
-          <p>控制面支持滚动升级窗口：先保持 <code>[raft].feature_level = 1</code>（默认），逐个替换节点；全部 voter/learner 都升级后再按需改为 <code>2</code> 或 <code>3</code>（范围 1..=3）并重启。激活后不可回滚到旧版。数据面自 v1.19.0 起提供 DP-1 混版门控：节点宣告 wire/epoch/hash，不兼容对端 fail-closed，ListObjects V1 与 ListMultipartUploads 会带降级头；但仍不承诺真实二进制滚动 e2e 与 TLS 物料热轮换，生产升级仍需维护窗口。升级步骤与自动拒绝条件见 README 的「升级顺序」（随发布同步）。</p>
+          <p>控制面支持滚动升级窗口：先保持 <code>[raft].feature_level = 1</code>（默认），逐个替换节点；全部 voter/learner 都升级后再按需改为 <code>2</code> 或 <code>3</code>（范围 1..=3）并重启。激活后不可回滚到旧版。数据面自 v1.19.0 起提供 DP-1 混版门控：节点宣告 wire/epoch/hash，不兼容对端 fail-closed，ListObjects V1 与 ListMultipartUploads 会带降级头。v1.20.0 起补充 mesh gRPC 入站 TLS 物料热轮换（新连接取新配置，旧连接保持旧物料）与真实二进制滚动 e2e（同版本 3 节点、v1.13.1 旧二进制滚动）。生产升级仍建议按 README 的「升级顺序」执行并保留维护窗口；升级步骤与自动拒绝条件以 README 为准（随发布同步）。</p>
 
           <h2 id="download">下载与版本</h2>
-          <p>当前 Release 提供源码归档，没有预编译二进制。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.19.0；可直接下载源码包或按本文构建。</p>
+          <p>当前 Release 提供源码归档，没有预编译二进制。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.20.0；可直接下载源码包或按本文构建。</p>
           <p>
-            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.19.0" target="_blank" rel="noopener">打开 v1.19.0 Release</a>
-            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.19.0.tar.gz" target="_blank" rel="noopener">下载源码包</a>
+            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.20.0" target="_blank" rel="noopener">打开 v1.20.0 Release</a>
+            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.20.0.tar.gz" target="_blank" rel="noopener">下载源码包</a>
             <a class="btn btn-ghost" href="changelog.html">版本日志</a>
           </p>
         </article>
@@ -224,7 +224,7 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.19.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.20.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

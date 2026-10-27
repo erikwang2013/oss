@@ -1,10 +1,13 @@
 # 能力边界清零验收记录（2026-10-23）
 
 - 基线：`v1.13.1`（`a58d64a`）
-- 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0**（2026-10-24）· **v1.16.0**（2026-10-24）
-- 最新发布：**v1.17.0**（2026-10-24），tag `v1.17.0`；包含 §13（架构切片）
+- 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0** / **v1.16.0**（2026-10-24）·
+  **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
+  **v1.19.0**（2026-10-26，Wave1 地基）
+- 最新发布：**v1.20.0**（2026-10-27），tag `v1.20.0`；包含 §14（Wave2 缺口修复）
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
-  v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片）
+  v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
+  v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）
 - 状态：实现、集成、聚焦测试、S3 全量 e2e、M8/M9/E2E_LONG 完成；已提交、推送并发布
 - 构建环境：主机 `/home` 为 5400rpm 机械盘且被其它会话重压，集成验证统一使用
   `CARGO_TARGET_DIR=/tmp/target-retention`（SSD）；`CARGO_BUILD_JOBS=1`。
@@ -386,3 +389,51 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 - VPC endpoint 的真实 PrivateLink/ENI 身份（SourceVpce 仅为部署证明）。
 - 直接读 tier 的已知限制：分块表无独立签名、ETag 口径不比较、跨进程预留只协调协作进程。
 - Level B 滚动 e2e 的 4 个 v1.13.1 侧 SKIP、M6 无 token 历史远端、M7 升级前删除不回溯。
+
+## 14. 2026-10-27 v1.20.0：Wave2 缺口修复
+
+三条工作流（独立 worktree + 独立评审）已合并到本地 `main` 并发布 v1.20.0：
+① DP-2 mesh 入站 TLS 热轮换 + 真实滚动 e2e；② 账户/成员写路径改走 Raft 命令；
+③ 缩容 topology v4 + 离线 apply/verify/commit/rollback。
+
+### 14.1 交付
+
+| 项 | 范围 | 说明 |
+|---|---|---|
+| DP-2 mesh 入站 TLS 热轮换 | `crates/oss-server/src/tls.rs`、`crates/xl-client/src/lib.rs` | `Tls::mesh_server_watch()` + `serve_tls_watch`：每个入站连接取当前 rustls 配置（ALPN h2，`MESH_MAX_CONCURRENT_HANDSHAKES=1024`）；mTLS client-CA 对新连接生效，旧连接保持旧物料直到自然关闭；测试 `tls_mesh_inbound` 3 项 |
+| 真实滚动 e2e | `tests/e2e_dproll.sh`（新增）、`tests/e2e_m9_rolling.sh` | 同版本 3 节点（A/B 数据 + C witness；PUT/GET/List V1/V2/MPU/版本删除；逐节点 TERM 重启；读不断、sync 写 503 fail-closed）→ 最终树 **116 PASS / 0 FAIL**；v1.13.1 旧二进制（`/tmp/oss-old-target/debug/oss-server`）→ **64 PASS / 0 FAIL / 4 文档化 SKIP** |
+| 账户写路径改走 Raft | `raft/command.rs`、`raft/apply/accounts.rs`、`accounts_api.rs`、`accounts_support.rs`、`db.rs` | 7 个 level-3 `ControlCommand`（Create/Update/SetQuota/Delete/MemberAttach/MemberSetStatus/UserCreate），apply 按 username 自然键；写路由统一经 `ControlPlane`（standalone = Local apply 同事务）；follower 503 + leader hint；fresh Raft 原子写 `accounts_canonical_v1`；OSSCTL3 快照携带账户行 |
+| 缩容 topology v4 + apply | `xl-store/src/store.rs`、`store/shrink_apply.rs`、`shrink_apply_util.rs`、`oss-server/src/cli.rs` | `.oss.sys/topo` v4（`set=/node=/slot=/epoch=/hash=`，set 0 也带 `set=` 使 v1.19 parser 拒启 = 回退防线）；**只在 `cluster-shrink commit` 写**，启动只校验 legacy 三元组不改写；apply（CRC32C、EC 重建、可续跑、receipt）/verify（full fsck）/commit（原子写、幂等、commit 前重查 namespace）/rollback（仅 commit 前） |
+
+### 14.2 验证
+
+- 全量：`cargo test -p xl-store -p xl-s3 -p oss-server -p xl-client --no-fail-fast` 所有 target
+  通过；`raft_access` 在高负载下曾一次挂起（kill 后单跑 6/6 通过，判定负载 flake）。
+- 聚焦：TLS 入站 3/3；shrink xl-store 347 passed / 1 ignored；账户/控制台/Raft 组全绿。
+- `cargo clippy -p xl-store -p xl-s3 -p oss-server -p xl-client --all-targets -- -D warnings`
+  RC=0；`cargo fmt --all --check` clean。
+- e2e：`tests/e2e_dproll.sh` 116/0；`tests/e2e_m9_rolling.sh`（v1.13.1 旧二进制）64/0/4。
+- 三条工作流各自独立评审；评审 P1/P2 已修复（见 §14.3）。
+
+### 14.3 评审修复与仍未完成
+
+已修复（评审 → 修复 commit）：
+
+- P1 启动期 eager v2/v3→v4 升级伪造 commit、破坏 v1.19 回退 → `8cacf98` 改为只在 commit 写 v4，
+  启动只校验不改写；`/api/v1/cluster/status` fingerprint 改读磁盘 topo。
+- P2 commit 信任 receipt 而不重查 namespace → commit 前重跑 `namespace_digest()`。
+- P2 账户 API 状态码/文案回归 → `352a9dd`、`91d2f71`（重复用户名 400、停用账户 400、缺失 404、
+  最后一个管理员 400）。
+- P2 Raft 模式下本地前置检查在滞后 follower 上误拒 → `401455a` 用 `!state.control.is_raft()`
+  包裹（残余：`attach_member` 的 uid 查询仍可能在滞后副本上 404，重试可恢复）。
+- P3 `raft_guard` 控制表直写扫描 allowlist 未含 `raft/apply/accounts.rs` → `f61abec`。
+
+仍未完成（架构级，与 §13.3 对照）：
+
+- Level C 完整双读写窗口与补丁线（v1.13.2 / CMK 重包 / 三二进制 e2e 均未合并发布）。
+- M8 多节点运行态复制、schedule lease、worker takeover、consistent read、故障切换。
+- 完整多租户：软字节配额、跨账户共享、AP 真实 PrivateLink 身份（`SourceVpce` 仍是部署证明）。
+- 缩容 4→3 缺 loopback e2e（当前只有 in-process store 级 4→3）；单机→集群仍为重新灌入。
+- 直接读 tier 的已知限制不变（分块表无独立签名、ETag 口径、跨进程预留只协调协作进程）。
+- Level B 滚动 e2e 的 4 个 v1.13.1 侧 SKIP、M6 无 site_token 历史远端、M7 升级前删除不回溯。
+

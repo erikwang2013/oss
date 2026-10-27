@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.19.0（2026-10-26）。** Wave1 地基版：DP-1 数据面混版门控、Raft 能力级别 1..3 与 OSSCTL3、租户 schema/回填、M8 运行态快照、`maintenance` 收容模式与 `cluster-shrink plan` 只读规划。部分能力仍为预览，边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.20.0（2026-10-27）。** Wave2 缺口修复版：mesh gRPC 入站 TLS 物料热轮换、账户/成员写路径改走 Raft 命令（OSSCTL3 快照含账户行）、缩容 topology v4 与离线 `apply/verify/commit/rollback`，以及同版本与 v1.13.1 旧二进制的真实滚动 e2e。缩容 4→3 仍无 loopback e2e，M8 多节点运行时与 Level C 补丁线仍未交付；边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
@@ -23,7 +23,7 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | 数据流 | 事件通知/Kafka、S3 Select、桶复制、多站点复制 |
 | 控制面（M8） | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎、控制台页面 |
 | 强一致（M9） | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..3 |
-| 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan` |
+| 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | 客户端 | `aws-cli` / `rclone`；React 控制台（分块、断线续传、秒传） |
 
 ## 架构

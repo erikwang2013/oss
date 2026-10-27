@@ -10,7 +10,7 @@
 
 An S3-compatible, self-built distributed object storage system (an equivalent implementation of MinIO). It supports multi-drive erasure coding 8+4, inter-node gRPC mesh, versioning, lifecycle, bucket policies and auditing, three SSE modes and object lock, STS temporary credentials, event notifications/Kafka, S3 Select, bucket and multi-site replication, access points/Object Lambda, Batch/Inventory/tiering, sync buckets and a 3-voter Raft control plane. The default `aws-cli`/`rclone` large-file paths (automatic multipart for ≥8 MiB) and resume habits work directly; the browser console supports chunked uploads and management.
 
-**Latest release: v1.19.0 (2026-10-26).** The Wave1 foundations release: DP-1 mixed-version data-plane gating, Raft feature levels 1..3 with OSSCTL3, tenancy schema/backfill, M8 run-state snapshots, `maintenance` containment mode, and the read-only `cluster-shrink plan`. Some capabilities remain previews; see the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for boundaries.
+**Latest release: v1.20.0 (2026-10-27).** The Wave2 gap-fix release: inbound mesh gRPC TLS material hot rotation, account/member writes via Raft commands (OSSCTL3 snapshots carry account rows), shrink topology v4 with offline `apply/verify/commit/rollback`, and real binary rolling e2e against both same-version and v1.13.1 binaries. A 4→3 loopback shrink e2e, M8 multi-node runtime, and the Level C patch line remain undelivered; see the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for boundaries.
 
 ## Features
 
@@ -23,7 +23,7 @@ An S3-compatible, self-built distributed object storage system (an equivalent im
 | Data flow | Event notifications/Kafka, S3 Select, bucket replication, multi-site replication |
 | Control plane (M8) | Access points, Object Lambda, Batch Operations, Inventory, job engine, console pages |
 | Strong consistency (M9) | Sync buckets, stretch 2×6, 3-voter Raft (witness), feature levels 1..3 |
-| Operations | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan` |
+| Operations | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | Clients | `aws-cli` / `rclone`; React console (chunking, resume, instant upload) |
 
 ## Architecture
