@@ -34,6 +34,7 @@ skip() { SKIPS=$((SKIPS+1)); echo "SKIP: $*"; }
 ck() { local m=$*; if "$@"; then pass "$m"; else fail "$m"; fi; }
 ckm() { local m=$1; shift; if "$@"; then pass "$m"; else fail "$m"; fi; }
 finish() {
+  echo "BIN=$BIN sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
   echo "== 结果 =="; echo "PASS=$PASSES FAIL=$FAILS SKIP=$SKIPS"
   [ "$FAILS" -ne 0 ] && exit 1
   echo "PASS: M3 shrink 4→3 loopback e2e（$PASSES 项通过）"
@@ -49,10 +50,11 @@ for i in 0 1 2 3; do HTTPP+=("$(pick)"); GRPCP+=("$(pick)"); PIDS+=(""); done
 N1="http://127.0.0.1:${HTTPP[0]}"; N2="http://127.0.0.1:${HTTPP[1]}"
 N3="http://127.0.0.1:${HTTPP[2]}"; N4="http://127.0.0.1:${HTTPP[3]}"
 
-W=$(mktemp -d)
-JWT_SECRET="shrink-e2e-jwt-0123456789abcdef01234567"
+unset PYTHONOPTIMIZE
+W=$(mktemp -d) || exit 2
+JWT_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
 CLUSTER_TOKEN=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
-ADMIN="shrinkadmin"; APW="shrinkadmin-pw"
+ADMIN="shrinkadmin"; APW=$(python3 -c 'import secrets;print(secrets.token_urlsafe(16))')
 BUCKET="shrink-$RANDOM"
 cleanup() {
   local i p
@@ -165,7 +167,8 @@ EOF
   } > "$d/new.toml"
 }
 
-wait_ready() { local i url; i=$1; url="http://127.0.0.1:${HTTPP[$i]}"; for _ in $(seq 1 90); do
+WAIT_SECS=${WAIT_SECS:-180}
+wait_ready() { local i url; i=$1; url="http://127.0.0.1:${HTTPP[$i]}"; for _ in $(seq 1 "$WAIT_SECS"); do
     kill -0 "${PIDS[$i]}" 2>/dev/null || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "$url/health/live" 2>/dev/null || true)" = 200 ] && return 0
     sleep 1
@@ -185,7 +188,7 @@ stop_node() { # dir-index
   kill -TERM "$p" 2>/dev/null
   for j in $(seq 1 40); do kill -0 "$p" 2>/dev/null || { wait "$p" 2>/dev/null; PIDS[$i]=""; return 0; }; sleep 0.25; done
   kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; PIDS[$i]=""; return 1; }
-stop_all() { local i; for i in 0 1 2 3; do stop_node "$i"; done; }
+stop_all() { local i rc=0; for i in 0 1 2 3; do stop_node "$i" || rc=1; done; return "$rc"; }
 show_log() { local i=$1; echo "---- ${IDS[$i]}/server.log (tail) ----"; tail -15 "$W/${IDS[$i]}/server.log" 2>/dev/null; }
 
 # 运维 CLI：本节点服务已停（commit 例外，见文件头）。
@@ -214,10 +217,12 @@ s3req() { local ep=$1 m=$2 p=$3 out=$4; shift 4
     --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$@" "$ep$p"; }
 count_shards() { find "$W" -type f -path "*/$BUCKET/$1/*/part.*" 2>/dev/null | wc -l; }
 count_node_slot() { find "$W/${IDS[$1]}/d$2" -type f -name "part.*.$3" 2>/dev/null | wc -l; }
+count_node_slot_key() { find "$W/${IDS[$1]}/d$2" -type f -path "*/$BUCKET/$3/*" -name "part.*.$4" 2>/dev/null | wc -l; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
 echo "== 1. 4 节点（old 配置，maintenance=false）建桶写入：EC 300 KiB / inline / 双版本 =="
-for i in 0 1 2 3; do mk_old_cfg "$i" false; mk_old_cfg "$i" true; mk_new_cfg "$i"; done
+for i in 0 1 2 3; do mk_old_cfg "$i" false; mk_old_cfg "$i" true; done
+for i in 0 1 2; do mk_new_cfg "$i"; done
 for i in 0 1 2 3; do start_node "$i" old.toml; done
 ok=1; for i in 0 1 2 3; do wait_ready "$i" || { show_log "$i"; ok=0; }; done
 ckm "4 节点 serve 就绪" [ "$ok" = 1 ]
@@ -249,8 +254,8 @@ ckm "ver.bin 两版本 × 12 分片" [ "$(count_shards ver.bin)" = 24 ]
 ckm "small.txt 无分片（inline）" [ "$(count_shards small.txt)" = 0 ]
 
 echo "== 2. 停全部 → maintenance=true 重启 → 生成 3 节点新配置与 plan =="
-stop_all
-for i in 0 1 2 3; do ckm "${IDS[$i]} TERM 正常退出" [ -z "${PIDS[$i]}" ]; start_node "$i" maint.toml; done
+ckm "4 节点 TERM 正常退出" stop_all
+for i in 0 1 2 3; do start_node "$i" maint.toml; done
 ok=1; for i in 0 1 2 3; do wait_ready "$i" || { show_log "$i"; ok=0; }; done
 ckm "4 节点 maintenance 就绪" [ "$ok" = 1 ]
 stop_node 0
@@ -299,6 +304,7 @@ import json,sys
 r=json.load(open(sys.argv[1]))
 assert r["action"]=="apply" and r["local_slots"]==1, r
 assert r["files_copied"]==3 and r["files_skipped"]==0, r
+assert r["reconstructed"]==0, f"目标分片必须从 n4 真拷，不能靠 EC 重建: {r}"
 assert r["receipt"], r
 PY
     ckm "${IDS[$i]} 目标槽 $sl 的 3 个目标分片存在" [ "$(count_node_slot "$i" 0 "$sl")" = 3 ]
@@ -321,6 +327,7 @@ done
 echo "== 5. commit 前 rollback 演练（n2）：删除 CRC 匹配的目标副本 → 重新 apply+verify =="
 stop_node 1
 BEFORE=$(count_node_slot 1 0 10)
+ckm "rollback 前 n2 目标槽 10 恰有 3 片" [ "$BEFORE" = 3 ]
 cli 1 maint.toml cluster-shrink rollback --plan "$W/plan.json" --yes --json > "$W/rollback.json" 2> "$W/rollback.err"; RC=$?
 ckm "n2 rollback 退出码 0" [ "$RC" = 0 ]
 if [ "$RC" = 0 ]; then
@@ -394,7 +401,7 @@ printf '%s' "$OUT" | grep -q "v4" && pass "旧配置启动错误指向 v4 不匹
 # 保留节点换新配置后，旧配置不可再启动（v4 exact-match 防线）。
 TOK=$(login "$N1"); ckm "新集群 n1 管理员登录" [ -n "$TOK" ]
 
-for i in 0 1; do
+for i in 0 1 2; do
   ep="http://127.0.0.1:${HTTPP[$i]}"
   code=$(s3req "$ep" GET "/$BUCKET/ec.bin" "$W/g.ec.$i")
   if [ "$code" = 200 ] && [ "$(sha "$W/g.ec.$i")" = "$EC_SHA" ]; then pass "n$((i+1)) GET ec.bin 内容一致"; else fail "n$((i+1)) GET ec.bin code=$code"; fi
@@ -411,6 +418,23 @@ code=$(s3req "$N1" GET "/$BUCKET?versions&prefix=ver.bin" "$W/versions.xml")
 if [ "$code" = 200 ] && grep -q "$V1" "$W/versions.xml" && grep -q "$V2" "$W/versions.xml"; then
   pass "版本列表仍含两个 version id"
 else fail "版本列表 code=$code 缺版本 id"; fi
+
+# 新拓扑运行态写路径：新 EC 对象必须经新槽表落盘（槽 9/10/11 各 1 片），
+# 且读回一致——否则读路径可能靠 9 片旧分片 EC 重建掩盖槽解析回归。
+head -c 307200 /dev/urandom > "$W/new.bin"
+code=$(s3req "$N1" PUT "/$BUCKET/new-ec.bin" "$W/p.new" --data-binary "@$W/new.bin")
+ckm "新配置下 PUT new-ec.bin → 200" [ "$code" = 200 ]
+if [ "$code" = 200 ]; then
+  ckm "new-ec.bin 12 分片" [ "$(count_shards new-ec.bin)" = 12 ]
+  for i in 0 1 2; do
+    ckm "new-ec.bin 槽 $((9+i)) 落在 n$((i+1)) d0（1 片）" [ "$(count_node_slot_key "$i" 0 new-ec.bin $((9+i)))" = 1 ]
+  done
+  NEW_SHA=$(sha "$W/new.bin")
+  for i in 0 1 2; do
+    code=$(s3req "http://127.0.0.1:${HTTPP[$i]}" GET "/$BUCKET/new-ec.bin" "$W/g.new.$i")
+    if [ "$code" = 200 ] && [ "$(sha "$W/g.new.$i")" = "$NEW_SHA" ]; then pass "n$((i+1)) 读回 new-ec.bin 一致"; else fail "n$((i+1)) 读回 new-ec.bin code=$code"; fi
+  done
+fi
 
 ckm "cluster/status 报告 v4 拓扑" python3 - "$(curl -s --max-time 10 -H "authorization: Bearer $TOK" "$N1/api/v1/cluster/status")" "$NEW_HASH" <<'PY'
 import json,sys
@@ -433,7 +457,7 @@ assert s["data_plane_compatible"] is False, s
 assert len(s["incompatible_peers"])==3, s["incompatible_peers"]
 PY
   code=$(s3req "$N4" PUT "/$BUCKET/retired.txt" "$W/n4.put" --data-binary "@$W/small.txt")
-  if [ "$code" -ge 400 ]; then pass "n4 写入被拒（HTTP $code，无法加入）"; else fail "n4 写入意外成功 HTTP $code"; fi
+  if [ "$code" = 503 ]; then pass "n4 写入被拒（HTTP 503 peer_incompatible）"; else fail "n4 写入预期 503，实得 HTTP $code"; fi
 else
   pass "n4 旧配置启动被拒（无法加入）"
   grep -Eq "v4|拓扑|incompat" "$W/n4/server.log" && pass "n4 拒绝日志指向拓扑不匹配" || fail "n4 拒绝原因不明"
