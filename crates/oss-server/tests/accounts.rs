@@ -1,12 +1,18 @@
 //! AC-0/AC-1/AC-2 账户控制面集成测试（standalone、in-memory SQLite）。
 //!
 //! 覆盖：管理员专属 CRUD/配额、账户管理员账户内自治与跨账户隔离、停用账户登录/存量 JWT
-//! 失效、桶数配额在建桶入口生效、以及「账户管理员不能挂载已有用户/提权/停用全局管理员」。
+//! 失效、桶数配额在建桶入口生效、软字节配额用量只告警不阻写、以及「账户管理员不能挂载
+//! 已有用户/提权/停用全局管理员」。
 
 mod common;
 
 use common::state;
 use oss_server::router::build_router;
+use reqwest::Method;
+use s3s_sigv4::{
+    AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
+};
+use sha2::{Digest, Sha256};
 
 async fn serve(app: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -744,4 +750,264 @@ async fn account_write_rejections_keep_legacy_status_and_message() {
             "{path}"
         );
     }
+}
+
+// ---------- AC-2：软字节配额用量（只读、只告警） ----------
+
+fn amz_now() -> AmzDate {
+    let t = time::OffsetDateTime::now_utc();
+    let s = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    );
+    AmzDate::parse(&s).unwrap()
+}
+
+/// 最小 SigV4 header 签名 PUT（数据面真实写入口；不引生产签名器）。
+async fn s3_put(base: &str, path: &str, ak: &str, sk: &str, body: &[u8]) -> reqwest::Response {
+    const REGION: &str = "us-east-1";
+    let url = format!("{base}{path}");
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let payload_hex = hex::encode(Sha256::digest(body));
+    let amz = amz_now();
+    let amz_iso = amz.fmt_iso8601().to_string();
+    let amz_date = amz.fmt_date().to_string();
+    let to_sign = [
+        ("host".to_string(), host),
+        ("x-amz-content-sha256".to_string(), payload_hex.clone()),
+        ("x-amz-date".to_string(), amz_iso.clone()),
+    ];
+    let refs: Vec<(&str, &str)> = to_sign
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let canonical = create_canonical_request(
+        Method::PUT.as_str(),
+        path,
+        &[] as &[(&str, &str)],
+        &refs,
+        Payload::SingleChunk(&payload_hex),
+    );
+    let sts = create_string_to_sign(&canonical, &amz, REGION, "s3");
+    let sig = calculate_signature(&sts, sk, &amz, REGION, "s3");
+    let names: Vec<&str> = to_sign.iter().map(|(k, _)| k.as_str()).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={ak}/{amz_date}/{REGION}/s3/aws4_request, \
+         SignedHeaders={}, Signature={sig}",
+        names.join(";")
+    );
+    let req = reqwest::Client::new()
+        .put(&url)
+        .header("x-amz-content-sha256", &payload_hex)
+        .header("x-amz-date", amz_iso)
+        .header("authorization", auth)
+        .body(body.to_vec())
+        .build()
+        .unwrap();
+    reqwest::Client::new().execute(req).await.unwrap()
+}
+
+async fn account_usage(base: &str, token: &str, id: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base}/api/v1/accounts/{id}/usage"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+}
+
+fn quota_header(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("x-oss-account-soft-quota")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+/// 两个桶的当前对象字节求和、配额未超/超限/none 的 `exceeded` 与响应头、
+/// 非成员 403 / 缺失账户 404，以及**超限后真实 S3 PUT 仍成功**（不阻写）。
+#[tokio::test]
+async fn soft_byte_quota_usage_is_advisory_and_never_blocks_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let probe = st.clone();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_ok(&base, "erik", "pw").await;
+    let client = reqwest::Client::new();
+
+    let id = create_account(&base, &admin, "soft", None).await;
+    let erin_uid = account_users(&base, &admin, &id, "erin").await;
+    let erin = login_ok(&base, "erin", "erin-password").await;
+    for name in ["soft-one", "soft-two"] {
+        let resp = client
+            .post(format!("{base}/api/v1/buckets"))
+            .bearer_auth(&erin)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "建桶 {name}");
+    }
+
+    // 两个桶、含嵌套键：3 + 5 + 7 = 15 字节。
+    probe
+        .store
+        .put_object("soft-one", "a.txt", bytes::Bytes::from_static(b"abc"), None)
+        .await
+        .unwrap();
+    probe
+        .store
+        .put_object(
+            "soft-one",
+            "nested/b.bin",
+            bytes::Bytes::from_static(b"12345"),
+            None,
+        )
+        .await
+        .unwrap();
+    probe
+        .store
+        .put_object(
+            "soft-two",
+            "c.bin",
+            bytes::Bytes::from_static(b"1234567"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 未配配额：真实用量照报，exceeded=false，且不带告警头。
+    let resp = account_usage(&base, &erin, &id).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(quota_header(&resp), None, "soft_byte_quota=NULL 不带头");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["account_id"], id.as_str());
+    assert_eq!(body["used_bytes"], 15);
+    assert_eq!(body["bucket_count"], 2);
+    assert!(body["soft_byte_quota"].is_null());
+    assert_eq!(body["exceeded"], false);
+
+    // 配额 10 < 15：超限。
+    sqlx::query("UPDATE accounts SET soft_byte_quota = ? WHERE id = ?")
+        .bind(10_i64)
+        .bind(&id)
+        .execute(probe.db.pool())
+        .await
+        .unwrap();
+    let resp = account_usage(&base, &erin, &id).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(quota_header(&resp).as_deref(), Some("exceeded"));
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["used_bytes"], 15);
+    assert_eq!(body["soft_byte_quota"], 10);
+    assert_eq!(body["exceeded"], true);
+
+    // 超限后真实 S3 PUT 仍成功（软配额只告警，绝不阻写）。
+    probe
+        .db
+        .create_access_key(
+            "AKIDSOFTQUOTA0000001",
+            "sk-soft-quota-00000000001",
+            erin_uid,
+        )
+        .await
+        .unwrap();
+    let put = s3_put(
+        &base,
+        "/soft-one/after-quota.txt",
+        "AKIDSOFTQUOTA0000001",
+        "sk-soft-quota-00000000001",
+        b"xy",
+    )
+    .await;
+    assert_eq!(put.status(), 200, "软配额超限后 PUT 必须成功");
+    let resp = account_usage(&base, &erin, &id).await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["used_bytes"], 17, "超限后写入计入用量");
+    assert_eq!(body["exceeded"], true);
+
+    // 提高配额到 100：未超限，头为 ok。
+    sqlx::query("UPDATE accounts SET soft_byte_quota = ? WHERE id = ?")
+        .bind(100_i64)
+        .bind(&id)
+        .execute(probe.db.pool())
+        .await
+        .unwrap();
+    let resp = account_usage(&base, &erin, &id).await;
+    assert_eq!(quota_header(&resp).as_deref(), Some("ok"));
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["exceeded"], false);
+
+    // 非成员 403；缺失账户 404（管理员与非成员同口径）。
+    create_console_user(&base, &admin, "bob2").await;
+    let bob = login_ok(&base, "bob2", "bob2-password").await;
+    assert_eq!(account_usage(&base, &bob, &id).await.status(), 403);
+    for token in [&admin, &bob] {
+        assert_eq!(
+            account_usage(&base, token, "000000000099").await.status(),
+            404
+        );
+    }
+}
+
+/// 分页边界：单桶 >1000 键必须翻页累加（端点固定 max_keys=1000），再跨两个桶求和。
+#[tokio::test]
+async fn soft_byte_quota_usage_paginates_past_1000_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let probe = st.clone();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_ok(&base, "erik", "pw").await;
+    let client = reqwest::Client::new();
+
+    let id = create_account(&base, &admin, "page", None).await;
+    account_users(&base, &admin, &id, "frank").await;
+    let frank = login_ok(&base, "frank", "frank-password").await;
+    for name in ["page-one", "page-two"] {
+        let resp = client
+            .post(format!("{base}/api/v1/buckets"))
+            .bearer_auth(&frank)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "建桶 {name}");
+    }
+
+    // 1001 个 1 字节对象 → 第一页 1000 + 第二页 1。
+    for i in 0..1001 {
+        probe
+            .store
+            .put_object(
+                "page-one",
+                &format!("k{i:04}"),
+                bytes::Bytes::from_static(b"x"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    probe
+        .store
+        .put_object("page-two", "tail", bytes::Bytes::from_static(b"yy"), None)
+        .await
+        .unwrap();
+
+    let resp = account_usage(&base, &frank, &id).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["used_bytes"], 1003);
+    assert_eq!(body["bucket_count"], 2);
 }
