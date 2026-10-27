@@ -433,7 +433,56 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 - Level C 完整双读写窗口与补丁线（v1.13.2 / CMK 重包 / 三二进制 e2e 均未合并发布）。
 - M8 多节点运行态复制、schedule lease、worker takeover、consistent read、故障切换。
 - 完整多租户：软字节配额、跨账户共享、AP 真实 PrivateLink 身份（`SourceVpce` 仍是部署证明）。
-- 缩容 4→3 缺 loopback e2e（当前只有 in-process store 级 4→3）；单机→集群仍为重新灌入。
+- 缩容 4→3 的 loopback e2e 已由 2026-10-28 的 `tests/e2e_m3_shrink.sh` 补上（86 PASS / 0 FAIL）；单机→集群仍为重新灌入。
 - 直接读 tier 的已知限制不变（分块表无独立签名、ETag 口径、跨进程预留只协调协作进程）。
 - Level B 滚动 e2e 的 4 个 v1.13.1 侧 SKIP、M6 无 site_token 历史远端、M7 升级前删除不回溯。
+
+## 15. 2026-10-28 post-v1.20.0 follow-ups（未发布）
+
+v1.20.0 发布后补齐的两项（均已合并到本地 `main`，未 push、未发布）：
+
+### 15.1 账户软字节配额（AC-2）
+
+- 新增只读端点 `GET /accounts/{id}/usage`：先 `require_member`（非成员 403，不泄露账户
+  存在性；管理员缺失账户 404），返回 `account_id/used_bytes/complete/soft_byte_quota/
+  exceeded/bucket_count`。
+- 新增配置路由 `PUT /accounts/{id}/soft-quota`（全局管理员）：body 必填
+  `{"soft_byte_quota": <非负整数|null>}`，缺字段/负数/字符串 400；`null` = 取消。
+  它与 `PUT /accounts/{id}/quota` 完全独立，设置软配额不会误清 `bucket_quota`，反之亦然。
+  命令为独立 level-3 变体 `ControlCommand::AccountSetSoftQuota`——不能给
+  `AccountSetQuota` 加字段，旧二进制 `deny_unknown_fields` 会 fail-stop。**混版窗口内
+  使用该路由前必须先升级全集群到含此变体的二进制。**
+- 用量 = 账户成员（非全局管理员）名下所有桶的**当前版本对象**字节和；逐桶
+  `Store::list_objects`（`max_keys=1000` + continuation token），集群复用 mesh 合并列举。
+  桶集合与 `Db::account_bucket_count_sql` 共用 `account_buckets_from` SQL 片段，避免口径漂移。
+  集群丢 peer 时 `used_bytes` 只是下界：JSON `complete=false`，响应头回 `partial`（不冒充 ok）。
+- 软配额**只告警不阻写**：配置了 quota 时响应头 `x-oss-account-soft-quota:
+  exceeded|ok|partial`；配额 NULL 或负数（沿用 bucket_quota 的「负数 = 不限」）时无头。
+  超限后 PUT 仍成功（测试锁定）。硬字节配额仍是明确非目标。
+- 测试：`cargo test -p oss-server --test accounts` → 10 passed（含 >1000 键分页、超限后
+  SigV4 PUT=200、独立路由不误清配额、403/404、NULL 配额）；`raft_accounts` 4 passed、
+  `raft_command_contract` 3 passed（新增变体已进冻结 fixture）。
+
+### 15.2 shrink 4→3 loopback e2e
+
+- 新增 `tests/e2e_m3_shrink.sh`（442 行，真实进程）：4 节点×3 盘=12 槽 → 3 节点仍 12 槽
+  （槽 9/10/11 → n1/n2/n3 drive 0），epoch 1→2；maintenance 重启 → plan → 退役 n4 拒绝
+  apply/commit → 逐节点 apply+verify → commit 前 rollback 演练 → 逐节点 commit 写 topo v4 →
+  3 节点新配置读回 EC/inline/双版本 → 旧配置被 v4 拒启 → n4 旧配置无法加入（写 503）。
+- 最终运行：**97 PASS / 0 FAIL / 0 SKIP**（评审后加固：apply `reconstructed==0` 证明分片从
+  退役节点真拷而非 EC 重建；新配置运行态再写一个新 EC 对象并断言槽 9/10/11 按新槽表落盘、
+  n1–n3 读回一致；rollback 前 3 片断言；TERM 优雅退出、随机测试凭据、输出二进制 sha256）；
+  无产品代码修复。
+- 实测语义：commit 必须在各节点 serve 运行中执行（进程内 caps 仍为旧值，peers 健康校验通过）；
+  commit 后旧配置 CLI 在 `Store::open` 被 v4 拒启，因此 CLI 层重跑 commit 不可达（in-process
+  幂等由 store 级测试覆盖）。
+
+### 15.3 v1.20.0 锁文件修复
+
+- v1.20.0 版本 bump 的 `sed` 误把 `Cargo.lock` 中依赖 `either` 的 `1.19.0` 改成不存在的
+  `1.20.0`（checksum 不变），导致从 tag 源码构建时 cargo 解析失败。
+- 已恢复 `either = 1.19.0`，`cargo metadata --locked --offline` 通过；`cargo test` /
+  `clippy` / `fmt` 在新锁上通过。
+- **v1.20.0 tag / GitHub Release 的源码归档仍带坏锁**，不能直接构建；需要发布 v1.20.1
+  或经授权重打 v1.20.0 tag。
 
