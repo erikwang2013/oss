@@ -2316,12 +2316,34 @@ impl Db {
         }
     }
 
-    /// 账户桶数：桶主的**当前**账户（成员行优先，无行 = uid 派生）；管理员桶归系统账户
-    /// 但永不匹配真实账户，故不计入任何用户账户。
-    pub(crate) fn account_bucket_count_sql() -> &'static str {
-        "(SELECT COUNT(*) FROM buckets b JOIN users u ON u.id = b.owner_id \
-          LEFT JOIN account_members bm ON bm.uid = u.id \
-          WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = a.id)"
+    /// 账户桶集合的 FROM/WHERE 片段（桶数统计与用量列举共用，避免口径漂移）。
+    /// 归属 = 桶主的**当前**账户（成员行优先，无行 = uid 派生）；管理员桶归系统账户
+    /// 但永不匹配真实账户，故不计入任何用户账户。`account` 是账户 id 的 SQL 表达式
+    /// （`a.id` 或绑定参数 `?`），只由本模块常量传入。
+    fn account_buckets_from(account: &str) -> String {
+        format!(
+            "FROM buckets b JOIN users u ON u.id = b.owner_id \
+             LEFT JOIN account_members bm ON bm.uid = u.id \
+             WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = {account}"
+        )
+    }
+
+    /// 账户桶数（标量子查询；口径见 `account_buckets_from`）。
+    pub(crate) fn account_bucket_count_sql() -> String {
+        format!("(SELECT COUNT(*) {})", Self::account_buckets_from("a.id"))
+    }
+
+    /// 账户名下桶名（软配额用量端点逐桶列举；口径见 `account_buckets_from`）。
+    pub async fn account_bucket_names(&self, account_id: &str) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT b.name {} ORDER BY b.name",
+            Self::account_buckets_from("?")
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(account_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
     }
 
     /// 全部账户（管理员视角）或某用户的账户（账户成员视角）。

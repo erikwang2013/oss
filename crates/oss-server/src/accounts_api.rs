@@ -18,6 +18,7 @@ use serde::Deserialize;
 use crate::accounts_support::{
     bad, new_account_id, require_active_account, require_manager, require_member, valid_name,
 };
+use crate::accounts_usage::account_usage;
 use crate::console::{
     control_failure, control_rejection, control_write_status, forbidden, internal_error, who,
 };
@@ -32,6 +33,7 @@ pub fn routes() -> Router<AppState> {
             get(get_account).put(update_account).delete(delete_account),
         )
         .route("/accounts/{id}/quota", put(set_quota))
+        .route("/accounts/{id}/usage", get(account_usage))
         .route(
             "/accounts/{id}/members",
             get(list_members).post(attach_member),
