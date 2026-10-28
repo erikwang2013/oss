@@ -5,8 +5,11 @@
 //! 授权（谁能做什么）走三面共用的 `xl_s3::access::Acl`：管理员全量；子账户按
 //! permissions 三档（读/写/删）+ 自有桶全权；403 用纯文本（前端 `rawApi` 直接展示 resp.text）。
 
-use axum::extract::{Extension, Path, Query, State};
+use std::time::Duration;
+
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, head, post, put};
 use axum::{Json, Router};
@@ -108,6 +111,60 @@ pub(crate) fn control_rejection(
             (StatusCode::BAD_REQUEST, "invalid control command").into_response()
         }
         crate::raft::ControlResponse::Ok => internal_error(),
+    }
+}
+
+/// M8-3：控制台响应统一报本机已 apply 的 Raft 日志 index（无 `[raft]` 时 0）。
+const APPLIED_INDEX_HEADER: &str = "x-oss-applied-index";
+/// M8-3：`?consistent=1` 的有界追赶预算；超时 fail-closed 503。
+const CONSISTENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// M8-3 控制台读一致性（backlog §4.3/§4.4）。
+///
+/// 默认仍是**本机弱读**：Raft follower 返回本地已 apply 的副本，可能落后于 leader
+/// （不是线性一致读）。`GET/HEAD ?consistent=1` 先经 `ControlPlane::wait_caught_up`
+/// 有界追赶 leader 请求时刻的 applied index（2s）：成功后才读本地——这是 ReadIndex
+/// 式的追赶，**不承诺**对在途写的线性一致；超时/无 leader 返回 503（fail-closed），
+/// 绝不把陈旧读冒充一致读。仅挂控制台 API，S3 数据面不经过本中间件。
+pub(crate) async fn console_read_consistency(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let consistent = is_consistent_read(&req);
+    if consistent && !state.control.wait_caught_up(CONSISTENT_READ_TIMEOUT).await {
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": 503,
+                "msg": "consistent read unavailable: local replica has not caught up with the leader",
+                "data": null,
+            })),
+        )
+            .into_response();
+        add_applied_index(&mut resp, state.control.applied_index());
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    add_applied_index(&mut resp, state.control.applied_index());
+    resp
+}
+
+/// 只认 `?consistent=1` 的 GET/HEAD；其余请求（含写）保持默认弱读。
+fn is_consistent_read(req: &Request) -> bool {
+    use axum::http::Method;
+    matches!(*req.method(), Method::GET | Method::HEAD)
+        && req.uri().query().is_some_and(|query| {
+            query.split('&').any(|pair| {
+                let mut kv = pair.splitn(2, '=');
+                kv.next() == Some("consistent") && kv.next() == Some("1")
+            })
+        })
+}
+
+fn add_applied_index(resp: &mut Response, applied: u64) {
+    if let Ok(value) = HeaderValue::from_str(&applied.to_string()) {
+        resp.headers_mut().insert(APPLIED_INDEX_HEADER, value);
     }
 }
 
