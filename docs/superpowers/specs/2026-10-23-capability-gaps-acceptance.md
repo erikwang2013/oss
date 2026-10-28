@@ -543,3 +543,20 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 - 无代码变更：v1.21.0 之后 main 仅两个文档提交（清理已删除的 v1.13.2 兼容线引用）。
 - 版本号统一 bump 到 1.21.1；全量测试与闸门沿用 v1.21.0 结果（代码树相同）。
 
+
+## 18. 2026-10-29 post-v1.21.1 硬化波（工作树，未发版）
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| Batch Delete 异步 e2e | `tests/e2e_m9.sh` | 作业必须在当前 Raft leader 创建/轮询（jobs 表节点本地）；sync 模式实跑 **85/0/1**，marker 两端同 id |
+| Level C v1.20.1 窗口 | 验证报告 `/tmp/oss-wave6-levelc.md` | 旧 v1.20.1（64795c9）↔ 当前 v1.21.1：专项 **147/0/0**；滚动 e2e 61/3/4（3 FAIL 为脚本按 v1.13.1 wire=1 的陈旧预期，v1.20.1 wire=2 正确） |
+| follower 权限追赶 | `accounts_support.rs` | `require_manager`/`require_member` 本地 miss 时追上再判；`raft_accounts_follower` 4/4（403→200，真非 manager 仍 403） |
+| tier 测试 flake + 审计 | `m8_tier_stream`、`Store::tier_audit`、CLI `tier-audit` | 100MiB 用例改文件库 6/6；`tier-audit` 只读列出未绑定源摘要，有项 exit 1 |
+| AP 信任链 E2E | `tests/m8_ap_trust.rs`、`build_router_with_trust` | 真实 listener + ConnectInfo：重复/畸形头、非可信 peer、缺 ConnectInfo fail-closed；9/9 |
+| 升级前置检查 | `scripts/upgrade-preflight.sh` | 裸 UUID MPU / M6 无 site_token（`[[remotes]]`）/ M7 未映射 REPLICA；67/67 自检 |
+| 单机→集群重新灌入 | `scripts/single-to-cluster.sh` | rclone 单向、版本化/开锁桶 fail-closed；16/16 自检 + 两个真实端点复制/重跑/--delete |
+| 桶配额并发 | leader append 前判定 + standalone `BEGIN IMMEDIATE` | 不新增 `ControlResponse` 变体，混版不分叉；quota=2 并发恰 2 成功 1×403 |
+| 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level 4 |
+
+**验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server` 全量与 clippy/fmt
+结果见发布前复核记录。
