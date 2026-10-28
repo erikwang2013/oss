@@ -316,6 +316,8 @@ pub(crate) async fn post_raft_membership(
 pub struct RaftPeerStatus {
     pub wire: u32,
     pub feature: u8,
+    /// 对端已 apply 的日志 index（缺失 = 旧节点/未初始化；follower 追赶的读点）。
+    pub applied_index: Option<u64>,
 }
 
 /// 成员/配对预检必须有界：旧节点或坏节点不能把成员变更挂住。
@@ -355,6 +357,12 @@ pub async fn get_raft_status_tls(
         wire_version: u32,
         #[serde(default = "one_u8")]
         feature_level: u8,
+        #[serde(default)]
+        applied: Option<LogIdJson>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LogIdJson {
+        index: u64,
     }
     fn one_u32() -> u32 {
         1
@@ -367,6 +375,7 @@ pub async fn get_raft_status_tls(
     Ok(RaftPeerStatus {
         wire: s.wire_version.max(1),
         feature: s.feature_level.max(1),
+        applied_index: s.applied.map(|l| l.index),
     })
 }
 
