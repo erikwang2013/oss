@@ -307,6 +307,14 @@ impl ControlPlane {
         }
     }
 
+    /// Raft 下等本地状态机追上 leader 已应用点（有界）；Local 恒已一致。
+    pub async fn wait_caught_up(&self, timeout: Duration) -> bool {
+        match &self.inner {
+            Inner::Local(_) => true,
+            Inner::Raft(handle) => handle.wait_caught_up(timeout).await,
+        }
+    }
+
     /// xl-s3 注入用：仅 Raft 模式返回 sink（M7/standalone 保持 `None` 直写路径）。
     pub fn bucket_sink(
         self: &Arc<Self>,

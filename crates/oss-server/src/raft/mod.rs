@@ -606,6 +606,37 @@ impl RaftHandle {
         }
     }
 
+    /// 本地副本是否已追上 leader 的已应用点（有界）。leader 上是一次线性一致读屏障；
+    /// follower 上读 leader `/status` 的 `applied.index` 再等本地 apply（不无限重试）。
+    pub async fn wait_caught_up(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        if self.is_leader() {
+            return tokio::time::timeout_at(deadline, self.raft.ensure_linearizable())
+                .await
+                .is_ok_and(|r| r.is_ok());
+        }
+        let Some(endpoint) = self.leader_endpoint() else {
+            return false;
+        };
+        let probe = tokio::time::timeout_at(
+            deadline,
+            crate::site_client::get_raft_status_tls(
+                &endpoint,
+                &self.settings.cluster_token,
+                self.tls.as_deref(),
+            ),
+        )
+        .await;
+        let Ok(Ok(status)) = probe else {
+            return false;
+        };
+        let Some(index) = status.applied_index else {
+            return false;
+        };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.wait_applied(index, left).await
+    }
+
     /// S6 的 `GET /api/v1/site/raft/status` 数据源。
     pub fn status_json(&self, configured: bool) -> serde_json::Value {
         status::status_json(self, configured)

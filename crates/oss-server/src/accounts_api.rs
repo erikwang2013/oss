@@ -16,7 +16,8 @@ use jwt_rust::JwtPayload;
 use serde::Deserialize;
 
 use crate::accounts_support::{
-    bad, new_account_id, require_active_account, require_manager, require_member, valid_name,
+    attachable_username, bad, new_account_id, require_active_account, require_manager,
+    require_member, valid_name,
 };
 use crate::accounts_usage::account_usage;
 use crate::console::{
@@ -345,13 +346,9 @@ async fn attach_member(
     {
         return r;
     }
-    let username = match state.db.get_user(body.uid).await {
-        Ok(Some((username, false, _))) => username,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "查询用户失败");
-            return internal_error();
-        }
+    let username = match attachable_username(&state, body.uid).await {
+        Ok(username) => username,
+        Err(r) => return r,
     };
     let cmd = ControlCommand::AccountMemberAttach {
         account_id: id,
