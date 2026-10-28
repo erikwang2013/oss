@@ -124,7 +124,11 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
 
     // 控制面：`/api/v1` 整体走 jwt-rust 的 JwtLayer，`/login` 在 except 名单里
     // （名单与 12h 过期都在 AppState::new；nest 会先剥掉 `/api/v1` 前缀，层看到的是 `/login`）。
-    let console = JwtLayer::new(Arc::clone(&state.jwt)).attach(crate::console::routes());
+    // M8-3：读一致性/`x-oss-applied-index` 只包控制台路由（在 JwtLayer 内层，鉴权先失败），
+    // S3 数据面不经过它。
+    let console = JwtLayer::new(Arc::clone(&state.jwt)).attach(crate::console::routes().layer(
+        middleware::from_fn_with_state(state.clone(), crate::console::console_read_consistency),
+    ));
 
     // aetherupload：四条路由（预处理 / 分块 / 展示 / 下载）。
     // 不用 crate 自带的 `integrations::ecat::routes`——它的 handler 读不到身份，

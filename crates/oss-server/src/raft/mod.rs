@@ -587,16 +587,19 @@ impl RaftHandle {
         }
     }
 
+    /// 本机状态机已 apply 的日志 index（无值 = 0）。控制面读一致性/观测用，
+    /// 直接读运行时 metrics，**不解析** `/status` JSON。
+    pub fn applied_index(&self) -> u64 {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        m.last_applied.as_ref().map(|l| l.index).unwrap_or(0)
+    }
+
     /// 等待本节点 apply 到 `index`（follower 转发后的有界读点，S6 使用）。
     pub async fn wait_applied(&self, index: u64, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let applied = {
-                let m = self.raft.metrics();
-                let m = m.borrow();
-                m.last_applied.as_ref().map(|l| l.index).unwrap_or(0)
-            };
-            if applied >= index {
+            if self.applied_index() >= index {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {

@@ -50,9 +50,10 @@ export async function rawApi(path: string, init: RequestInit = {}): Promise<Resp
   return resp
 }
 
-/** 统一的控制台 API 客户端。 */
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const resp = await rawApi(path, init)
+/** 统一的控制台 API 客户端。`consistent=true` 追加 `consistent=1`（M8-3 有界追赶读）。 */
+export async function api<T>(path: string, init: RequestInit = {}, consistent = false): Promise<T> {
+  const url = consistent ? `${path}${path.includes('?') ? '&' : '?'}consistent=1` : path
+  const resp = await rawApi(url, init)
   if (resp.status === 204) return undefined as T
   return (await resp.json()) as T
 }

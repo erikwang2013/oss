@@ -22,9 +22,10 @@ export default function Accounts() {
     queryFn: () => api<Me>('/api/v1/me'),
   })
   const isAdmin = me?.is_admin === true
+  // 写后 invalidate 触发本查询重取：带 consistent=1，避免 follower 上刚写完读到旧列表
   const { data: accounts = [], isLoading, error } = useQuery({
     queryKey: ['accounts'],
-    queryFn: () => api<AccountRow[]>('/api/v1/accounts'),
+    queryFn: () => api<AccountRow[]>('/api/v1/accounts', {}, true),
     enabled: isAdmin,
   })
 

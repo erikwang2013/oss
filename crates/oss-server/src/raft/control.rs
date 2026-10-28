@@ -307,6 +307,14 @@ impl ControlPlane {
         }
     }
 
+    /// 本机已 apply 的日志 index（M8-3 读一致性/响应头）；Local 无 Raft 日志 = 0。
+    pub fn applied_index(&self) -> u64 {
+        match &self.inner {
+            Inner::Local(_) => 0,
+            Inner::Raft(handle) => handle.applied_index(),
+        }
+    }
+
     /// Raft 下等本地状态机追上 leader 已应用点（有界）；Local 恒已一致。
     pub async fn wait_caught_up(&self, timeout: Duration) -> bool {
         match &self.inner {
