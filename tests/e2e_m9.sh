@@ -16,10 +16,15 @@
 #       被拒才 SKIP；其它启动失败（端口/panic/权限）按回归 FAIL。M9_STRICT=1 时除模式互斥的
 #       预期 SKIP 外，跳过升级为 FAIL
 #       （功能齐备后 CI 用）。
-# S3 覆盖补充：步骤 3 已含版本删/marker 同 id/DeleteObjects 503/outbox=0；DeleteBucket
-#       quiesce/非空回滚、生命周期 Expiration remote-first 由 crates/oss-server/tests/sync_gate.rs
-#       进程内覆盖（本脚本不跑，因需在途写者与远端可控状态）。Batch Delete 是异步作业
-#       （POST /api/v1/jobs → worker 执行），状态观测需轮询 jobs 表 → TODO(S9)。
+# S3 覆盖补充：步骤 3 已含版本删/marker 同 id/DeleteObjects 503/outbox=0；Batch Delete
+#       （异步作业：POST /api/v1/jobs kind=batch/operation=DeleteObject → 轮询
+#       GET /api/v1/jobs/{id} 至终态）断言 job=done、1 成功 0 失败，且 sync 桶经远端先删
+#       （A/B 同 id delete marker、两端 HEAD 404）。DeleteBucket quiesce/非空回滚、生命周期
+#       Expiration remote-first 由 crates/oss-server/tests/sync_gate.rs 进程内覆盖
+#       （本脚本不跑，因需在途写者与远端可控状态）。
+# TODO(S9b)：B 断连期间 Batch Delete 的重试→job error 收敛未在本脚本覆盖（需 ~40s
+#       停机窗口）；sink 拒绝且本地对象原样由 m8_batch.rs::batch_delete_on_sync_bucket_refuses_without_remote
+#       覆盖，在线删除的 503 语义由本步骤 SIGSTOP 段覆盖。
 # 前置：`cargo build -p oss-server`；aws-cli；curl；python3。
 # 用法：OSS_BIN=target/debug/oss-server tests/e2e_m9.sh
 #       M9_STRETCH=1 OSS_BIN=target/debug/oss-server tests/e2e_m9.sh   # 2×6 stretch
@@ -274,6 +279,41 @@ for p in sys.argv[1:3]:
     c=sqlite3.connect(f"file:{p}?mode=ro",uri=True)
     n+=c.execute("SELECT count(*) FROM repl_outbox WHERE target_kind=? AND bucket=?",("site",sys.argv[3])).fetchone()[0]
 print(n)' "$W/a/oss.db" "$W/b/oss.db" "$1"; }
+# Batch 作业终态轮询（GET /api/v1/jobs/{id}，详情落文件）；done/error/cancelled 即返回。
+batch_job_wait() { # base token job_id timeout_secs
+  local deadline=$(( $(date +%s) + $4 )) st
+  while :; do
+    curl -s --max-time 10 -o "$W/batch-job.json" "$1/api/v1/jobs/$3" -H "authorization: Bearer $2"
+    st=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["job"]["state"])
+except Exception: print("")' "$W/batch-job.json")
+    case "$st" in done|error|cancelled) return 0 ;; esac
+    [ "$(date +%s)" -ge "$deadline" ] && { echo "  作业 $3 超时（state=${st:-?}）"; return 1; }
+    sleep 2
+  done
+}
+batch_job_ok() { # 详情文件：done/total=1/succeeded=1/failed=0 + 单条 BatchDeleteObject done/Succeeded
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"作业详情不可读: {e}"); sys.exit(1)
+j, tasks = d["job"], d["tasks"]
+bad = []
+for k, exp in (("state", "done"), ("total", 1), ("succeeded", 1), ("failed", 0), ("progress", 1)):
+    if j.get(k) != exp:
+        bad.append(f"job.{k}={j.get(k)}")
+del_tasks = [t for t in tasks if t.get("action") == "BatchDeleteObject"]
+if len(del_tasks) != 1:
+    bad.append(f"BatchDeleteObject 任务数={len(del_tasks)}")
+elif (del_tasks[0].get("state"), del_tasks[0].get("result_code")) != ("done", "Succeeded"):
+    bad.append(f"task state={del_tasks[0].get('state')} code={del_tasks[0].get('result_code')} "
+               f"msg={del_tasks[0].get('result_string')}")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+PY
+}
 shards_at() { find "$1"/d* -type f -name 'part.*' -path "*/$2/$3/*" 2>/dev/null | wc -l | tr -d ' '; }
 meta_at() { find "$1"/d* -type f -name 'xl.meta' -path "*/$2/$3/xl.meta" 2>/dev/null | wc -l | tr -d ' '; }
 # fsck 报告断言（字段见 xl-store FsckReport）。repair 轮允许孤儿/stray（本轮已修），但
@@ -538,6 +578,30 @@ else
   ck retry 60 b_ver_missing "$SB" copy.bin "$VID"
   ck_q aws_a s3api delete-objects --bucket "$SB" --delete '{"Objects":[{"Key":"mpu.bin"}],"Quiet":true}'
   ck retry 60 both_missing "$SB" mpu.bin
+  echo "  -- Batch Delete（POST /api/v1/jobs → worker；轮询 GET /jobs/{id} 至终态） --"
+  # 清单放普通桶 BK_A（步骤 2 已建/本节点可读）；对象选本段已存在、后续不再用的 blocked.bin。
+  printf '%s,%s\n' "$SB" blocked.bin > "$W/batch-del.csv"
+  ck_q aws_a s3api put-object --bucket "$BK_A" --key "batch/manifest-$STAMP.csv" --body "$W/batch-del.csv"
+  code=$(curl -s -o "$W/batch-create.json" -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/jobs" \
+    -H "authorization: Bearer $AT" -H 'content-type: application/json' \
+    -d "{\"kind\":\"batch\",\"manifest_bucket\":\"$BK_A\",\"manifest_key\":\"batch/manifest-$STAMP.csv\",\"operation\":\"DeleteObject\"}")
+  ck [ "$code" = 201 ]
+  JID=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["job_id"])
+except Exception: print("")' "$W/batch-create.json")
+  if [ -n "$JID" ]; then
+    ck batch_job_wait "$A" "$AT" "$JID" 90
+    ck batch_job_ok "$W/batch-job.json"
+  else
+    fail "Batch Delete 建作业响应无 job_id：$(head -c 200 "$W/batch-create.json")"
+  fi
+  ck a_missing "$SB" blocked.bin
+  ck b_missing "$SB" blocked.bin
+  BMK_A=$(aws_a s3api list-object-versions --bucket "$SB" --prefix blocked.bin --query 'DeleteMarkers[0].VersionId' --output text 2>/dev/null)
+  BMK_B=$(aws_b s3api list-object-versions --bucket "$SB" --prefix blocked.bin --query 'DeleteMarkers[0].VersionId' --output text 2>/dev/null)
+  if [ -n "$BMK_A" ] && [ "$BMK_A" != None ] && [ "$BMK_A" = "$BMK_B" ]; then
+    pass "Batch Delete 走 sync 远端先删（marker 同 id 两端一致）"
+  else fail "Batch Delete marker 未两端同 id（A=$BMK_A B=$BMK_B）"; fi
   # P2-6：console 桶删除在非空 sync 桶上 → 409（双站 quiesce 后查空失败并回滚），本地桶仍在
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X DELETE "$A/api/v1/buckets/$SB" -H "authorization: Bearer $AT")
   ck [ "$code" = 409 ]
