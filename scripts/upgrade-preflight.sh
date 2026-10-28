@@ -2,9 +2,11 @@
 # 升级前置检查（只读）：M6 无 site_token / M7 未映射 REPLICA / 存量裸 UUID MPU。
 # 三项兼容边界都不能自动追溯修复；本脚本只检查/演练，不回填、不删除、不联网：
 # 1) M6 无 site_token 历史远端（repl §6.1）：旧远端目标版本 id 由目标生成，源端无映射；
-#    配置 token 只对新复制生效。按内容/ETag 删除不安全。sites 表有 site_token 列时列出
-#    NULL/空；无该列（当前 schema 只有 peer_site_token，M6 token 在 oss.toml
-#    [[remotes]].site_token）报告“无法判定”，绝不当作通过。
+#    token 只对新复制生效，按内容/ETag 删除不安全。token 在 oss.toml [[remotes]].site_token
+#    （[site].token 是本站身份、[stretch].mesh_secret 是 M9 mesh 密钥，均与 M6 无关）。
+#    --config 只列缺/空 token 的远端 id+endpoint（绝不打印 token/密钥）；文件缺失/坏配置
+#    BLOCK。仅给 --control-db 时探测 sites.site_token（当前 schema 无此列，只有
+#    peer_site_token），无列/表报“无法判定”，绝不当作通过。
 # 2) M7 升级前删除不回溯（repl §6.2）：删除事件未记录，目标只剩无来源 REPLICA。人工路径：
 #      oss-server --config <toml> replica-reconcile --bucket B --key K --json
 #    核对 version_id 后显式 --delete ID1,ID2 --apply（绝不按内容/前缀自动选择）。本脚本
@@ -15,23 +17,21 @@
 #    .oss.sys/tmp，那是单段 PUT 暂存），解析 mpu.meta 顶层 owner：缺失/NULL = 旧格式。
 # 本脚本自身只读；不修改/删除数据。退出码：0 无 BLOCK（--strict 下 WARN 也非零）；
 # 1 = BLOCK 或 strict+WARN；2 = 用法错误。
-
 set -uo pipefail
 
 usage() {
 	cat <<'EOF'
 用法: upgrade-preflight.sh --data-dir <path> [--data-dir <path>] [选项]
-
 升级前置只读检查：裸 UUID MPU、M6 site_token、M7 未映射 REPLICA。
 不回填、不删除、不联网写入。完整说明见脚本头部注释。
-
 必填：
   --data-dir <path>            数据盘根目录；可多次或逗号分隔（如 a,b）
                                （对应配置里的 data_dir/data_dirs）
-
 选项：
+  --config <oss.toml>          只读解析 [[remotes]].site_token（绝不打印 token/密钥）。
+                               提供且远端 token 齐全时 M6 为 OK；文件缺失/解析失败 BLOCK。
   --control-db <path>          控制面 SQLite（oss.db / control.db）；只读打开。
-                               不提供则 M6 为“无法判定”（WARN）。
+                               与 --config 均不提供则 M6 为“无法判定”（WARN）。
   --replica-reconcile <cmd>    replica-reconcile 命令前缀，默认 "oss-server replica-reconcile"。
                                按空格拆分，可带 --config 等全局参数；不能含 --delete/--apply。
   --replica-scope <b>/<k>      M7 的精确桶/键，可多次（键可含逗号，不拆分）。
@@ -40,26 +40,19 @@ usage() {
   --json                       以 JSON 输出（不改变退出码语义）
   --strict                     WARN 也非零退出（发布闸门）
   -h, --help                   显示本帮助
-
 状态：BLOCK = 输入/工具/安全问题；WARN = 发现问题或无法判定；OK = 通过。
 退出码：0 = 无 BLOCK（--strict 下 WARN 也非零）；1 = BLOCK 或 strict+WARN；2 = 用法错误。
 示例：
-  scripts/upgrade-preflight.sh --data-dir /data --control-db /data/oss.db
+  scripts/upgrade-preflight.sh --data-dir /data --config /etc/oss/oss.toml
   scripts/upgrade-preflight.sh --data-dir /data1,/data2 --control-db /data1/control.db \
     --replica-scope bucket-a/key1 --replica-scope bucket-b/key2 --json --strict
-  scripts/upgrade-preflight.sh --data-dir /data --control-db /data/oss.db \
-    --replica-reconcile "oss-server --config /etc/oss/oss.toml replica-reconcile"
 EOF
 }
-
-usage_err() {
-	printf '错误: %s\n\n' "$*" >&2
-	usage >&2
-	exit 2
-}
+usage_err() { printf '错误: %s\n\n' "$*" >&2; usage >&2; exit 2; }
 need_arg() { (($# >= 2)) || usage_err "选项 $1 缺少参数"; }
 
 DATA_DIRS=()
+CONFIG=""
 CONTROL_DB=""
 REPL_CMD_STR="oss-server replica-reconcile"
 REPL_SCOPES=()
@@ -67,11 +60,8 @@ JSON=0
 STRICT=0
 
 add_data_dirs() {
-	local val=$1 item
-	local IFS=','
-	for item in $val; do
-		[ -n "$item" ] && DATA_DIRS+=("$item")
-	done
+	local item IFS=','
+	for item in $1; do [ -n "$item" ] && DATA_DIRS+=("$item"); done
 }
 
 while (($#)); do
@@ -79,6 +69,11 @@ while (($#)); do
 	--data-dir)
 		need_arg "$@"
 		add_data_dirs "$2"
+		shift 2
+		;;
+	--config)
+		need_arg "$@"
+		CONFIG=$2
 		shift 2
 		;;
 	--control-db)
@@ -102,7 +97,6 @@ while (($#)); do
 	*) usage_err "未知参数: $1" ;;
 	esac
 done
-
 (( ${#DATA_DIRS[@]} > 0 )) || usage_err "至少提供一个 --data-dir"
 command -v python3 >/dev/null 2>&1 ||
 	{ printf '[BLOCK] python3: 未找到 python3，无法可靠解析 mpu.meta（msgpack）与只读 sqlite\n' >&2; exit 1; }
@@ -123,13 +117,11 @@ add_detail() { printf '%s\n' "$2" >>"$DETAILS/$1"; }
 scan_mpu_meta() { # paths_file
 	python3 - "$1" <<'PY'
 import sys
-
 # 长度前缀宽度：bin/str；array/map 递归；ext 额外加 1 字节类型。
 W = {0xc4: 1, 0xc5: 2, 0xc6: 4, 0xd9: 1, 0xda: 2, 0xdb: 4,
      0xdc: 2, 0xdd: 4, 0xde: 2, 0xdf: 4, 0xc7: 1, 0xc8: 2, 0xc9: 4}
 FIX = {0xcc: 1, 0xcd: 2, 0xce: 4, 0xcf: 8, 0xd0: 1, 0xd1: 2, 0xd2: 4,
        0xd3: 8, 0xca: 4, 0xcb: 8, 0xd4: 2, 0xd5: 3, 0xd6: 5, 0xd7: 9, 0xd8: 17}
-
 
 def skip(b, i):
     if i >= len(b):
@@ -163,7 +155,6 @@ def skip(b, i):
         return j
     return j + n + (1 if c in (0xc7, 0xc8, 0xc9) else 0)
 
-
 def state(path):
     try:
         with open(path, 'rb') as f:
@@ -193,7 +184,6 @@ def state(path):
         return 'CORRUPT'
     return 'OWNED' if owner not in (None, b'\xc0', b'\xa0') else 'LEGACY'
 
-
 for raw in open(sys.argv[1], encoding='utf-8', errors='replace'):
     p = raw.rstrip('\n')
     if p:
@@ -205,10 +195,7 @@ check_bare_uuid_mpu() {
 	local name=bare-uuid-mpu root errs=0 invalid=0
 	local -a scan=()
 	for root in "${DATA_DIRS[@]}"; do
-		if [ ! -d "$root" ]; then
-			invalid=1
-			add_detail "$name" "data-dir 不存在或不是目录: $root"
-		fi
+		[ -d "$root" ] || { invalid=1; add_detail "$name" "data-dir 不存在或不是目录: $root"; }
 	done
 	# 路径非法单独成 BLOCK，避免把“目录不存在”误判成“没有旧 MPU”。
 	if ((invalid)); then
@@ -270,74 +257,92 @@ check_bare_uuid_mpu() {
 }
 
 # ---------------------------------------------------------------- M6 site_token
+# M6 token 在 oss.toml [[remotes]].site_token（不在 sites 表；[site].token 是本站身份、
+# [stretch].mesh_secret 是 M9 mesh 密钥，均与 M6 无关）。--config 给出时以配置为准：只列
+# 缺/空 token 的远端 id+endpoint（绝不输出 token/access_key/secret_key），文件缺失或解析
+# 失败 BLOCK。仅给 --control-db 时保留旧探测，无 sites.site_token 列/表报“无法判定”。
 check_m6_site_token() {
 	local name=m6-site-token
-	if [ -z "$CONTROL_DB" ]; then
-		add_check "$name" WARN "未提供 --control-db，无法判定（M6 token 实际在 oss.toml [[remotes]].site_token）"
+	if [ -z "$CONFIG" ] && [ -z "$CONTROL_DB" ]; then
+		add_check "$name" WARN "未提供 --config/--control-db，无法判定（M6 token 在 oss.toml [[remotes]].site_token）"
 		return
 	fi
-	if [ ! -f "$CONTROL_DB" ]; then
+	if [ -n "$CONTROL_DB" ] && [ ! -f "$CONTROL_DB" ]; then
 		add_detail "$name" "control-db 不存在: $CONTROL_DB"
 		add_check "$name" BLOCK "control-db 不存在或不是文件"
 		return
 	fi
-	local -a rows=()
-	mapfile -t rows < <(python3 - "$CONTROL_DB" <<'PY'
+	local -a lines=()
+	local st=BLOCK summary="M6 检查无结果（python3 需 3.11+ tomllib）" line
+	mapfile -t lines < <(python3 - "$CONFIG" "$CONTROL_DB" <<'PY'
 import sqlite3
 import sys
+import tomllib
 from urllib.parse import quote
 
+def result(status, summary, details=()):
+    for d in details:
+        print('DETAIL\t%s' % d)
+    print('RESULT\t%s\t%s' % (status, summary))
+
+cfg_path, db_path = sys.argv[1], sys.argv[2]
+if cfg_path:
+    try:
+        with open(cfg_path, 'rb') as f:
+            remotes = tomllib.load(f).get('remotes', [])
+        if not isinstance(remotes, list) or not all(isinstance(r, dict) for r in remotes):
+            raise ValueError('remotes 不是 [[remotes]] 表数组')
+    except Exception as e:
+        result('BLOCK', 'oss.toml 缺失或无法解析（fail-closed；见详情）',
+               ['oss.toml 读取/解析失败: %s: %s' % (type(e).__name__, e)])
+        raise SystemExit
+    bad = [r for r in remotes
+           if not isinstance(r.get('site_token'), str) or not r['site_token'].strip()]
+    if bad:
+        label = lambda r, k: r.get(k) if isinstance(r.get(k), str) and r.get(k) else '?'
+        result('WARN', '%d/%d 个 oss.toml 远端缺 site_token；这些远端只有旧 M6 语义（版本定向删除不投递），历史副本需重传/人工' % (len(bad), len(remotes)),
+               ['缺/空 site_token 的远端: id=%s endpoint=%s' % (label(r, 'id'), label(r, 'endpoint')) for r in bad])
+    elif remotes:
+        result('OK', '%d 个 oss.toml 远端的 site_token 均非空' % len(remotes))
+    else:
+        result('OK', 'oss.toml 无 [[remotes]]，无 M6 远端目标')
+    raise SystemExit
 try:
-    con = sqlite3.connect('file:' + quote(sys.argv[1]) + '?mode=ro', uri=True)
+    con = sqlite3.connect('file:' + quote(db_path) + '?mode=ro', uri=True)
     con.execute('PRAGMA query_only = ON')
     try:
         con.execute('SELECT 1 FROM sites LIMIT 1')
     except sqlite3.OperationalError as e:
-        print('STATE\tno_table' if 'no such table' in str(e) else 'STATE\terror\t' + str(e))
-        sys.exit(0)
+        if 'no such table' not in str(e):
+            raise
+        result('WARN', 'sites 表不存在，无法判定（不同版本 schema；不做通过处理）')
+        raise SystemExit
     cols = [r[1] for r in con.execute('PRAGMA table_info(sites)')]
-    print('COLS\t' + ','.join(cols))
-    if 'site_token' not in cols:
-        print('STATE\tno_column')
-        sys.exit(0)
     total = con.execute('SELECT COUNT(*) FROM sites').fetchone()[0]
-    bad = list(con.execute(
-        "SELECT peer_id, name FROM sites "
-        "WHERE site_token IS NULL OR TRIM(site_token) = '' ORDER BY peer_id"))
-    print('TOTAL\t%d' % total)
-    for peer, nm in bad:
-        print('BAD\t%s\t%s' % (peer, nm))
-    print('STATE\tbad_rows' if bad else 'STATE\tok')
+    if 'site_token' not in cols:
+        result('WARN', 'sites 表无 site_token 列（列: %s），无法判定；当前 M6 token 是 oss.toml [[remotes]].site_token，请人工核对' % (','.join(cols) or '无'))
+        raise SystemExit
+    bad = list(con.execute("SELECT peer_id, name FROM sites WHERE site_token IS NULL OR TRIM(site_token) = '' ORDER BY peer_id"))
+    if bad:
+        result('WARN', '%d/%d 个 sites 远端 site_token 为 NULL/空；这些远端仅有旧 M6 语义（版本定向删除不投递），历史副本需重传/人工' % (len(bad), total),
+               ['site_token 为 NULL/空: %s %s' % (peer, nm) for peer, nm in bad])
+    else:
+        result('OK', '%d 个 sites 远端的 site_token 均非空' % total)
 except sqlite3.Error as e:
-    print('STATE\terror\t' + str(e))
+    result('BLOCK', 'control-db 无法只读解析（见详情）', ['读取 control-db 失败: %s' % e])
 PY
 )
-	local state="" total=0 cols="" bad=0 line
-	local -a bad_rows=()
-	for line in "${rows[@]}"; do
+	for line in "${lines[@]}"; do
 		case "$line" in
-		STATE$'\t'*) state=${line#STATE$'\t'} ;;
-		TOTAL$'\t'*) total=${line#TOTAL$'\t'} ;;
-		COLS$'\t'*) cols=${line#COLS$'\t'} ;;
-		BAD$'\t'*) bad=$((bad + 1)); bad_rows+=("${line#BAD$'\t'}") ;;
+		RESULT$'\t'*)
+			line=${line#RESULT$'\t'}
+			st=${line%%$'\t'*}
+			summary=${line#*$'\t'}
+			;;
+		DETAIL$'\t'*) add_detail "$name" "${line#DETAIL$'\t'}" ;;
 		esac
 	done
-	case "$state" in
-	ok) add_check "$name" OK "$total 个 sites 远端的 site_token 均非空" ;;
-	bad_rows)
-		for line in "${bad_rows[@]}"; do
-			add_detail "$name" "site_token 为 NULL/空: ${line//$'\t'/ }"
-		done
-		add_check "$name" WARN "$bad/$total 个 sites 远端 site_token 为 NULL/空；这些远端仅有旧 M6 语义（版本定向删除不投递），历史副本需重传/人工"
-		;;
-	no_table) add_check "$name" WARN "sites 表不存在，无法判定（不同版本 schema；不做通过处理）" ;;
-	no_column) add_check "$name" WARN "sites 表无 site_token 列（列: ${cols:-无}），无法判定；当前 M6 token 是 oss.toml [[remotes]].site_token，请人工核对" ;;
-	error*)
-		add_detail "$name" "读取 control-db 失败: ${state#error$'\t'}"
-		add_check "$name" BLOCK "control-db 无法只读解析（见详情）"
-		;;
-	*) add_check "$name" BLOCK "control-db 检查内部错误（state=${state}）" ;;
-	esac
+	add_check "$name" "$st" "$summary"
 }
 
 # ---------------------------------------------------------------- M7 unmapped REPLICA
@@ -394,7 +399,6 @@ check_m7_unmapped_replica() {
 		mapfile -t ids < <(python3 - "$TMP/repl_out" <<'PY'
 import json
 import sys
-
 try:
     rows = json.load(open(sys.argv[1], encoding='utf-8'))
     assert isinstance(rows, list)
@@ -434,11 +438,9 @@ PY
 		add_check "$name" OK "检查 $determined 个键：未发现未映射 REPLICA"
 	fi
 }
-
 check_bare_uuid_mpu
 check_m6_site_token
 check_m7_unmapped_replica
-
 # ---------------------------------------------------------------- 输出
 block=0
 warn=0
@@ -462,7 +464,6 @@ if ((JSON)); then
 import json
 import os
 import sys
-
 records, details_dir, strict, overall, exit_code = sys.argv[1:6]
 checks = []
 for line in open(records, encoding='utf-8'):
@@ -481,8 +482,8 @@ print(json.dumps({
 }, ensure_ascii=False, indent=2))
 PY
 else
-	printf 'upgrade-preflight: data-dir=%s control-db=%s\n' \
-		"$(IFS=,; printf '%s' "${DATA_DIRS[*]}")" "${CONTROL_DB:-<未提供>}"
+	printf 'upgrade-preflight: data-dir=%s config=%s control-db=%s\n' \
+		"$(IFS=,; printf '%s' "${DATA_DIRS[*]}")" "${CONFIG:-<未提供>}" "${CONTROL_DB:-<未提供>}"
 	while IFS=$'\t' read -r name status summary; do
 		printf '[%s] %s: %s\n' "$status" "$name" "$summary"
 		if [ -f "$DETAILS/$name" ]; then

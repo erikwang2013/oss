@@ -144,6 +144,48 @@ make_db(os.path.join(tmp, 'good.db'), [('p1', 'r1', 'tok')])
 make_db(os.path.join(tmp, 'bad.db'), [('p1', 'r1', None), ('p2', 'r2', ''), ('p3', 'r3', 'tok')])
 make_db(os.path.join(tmp, 'nocol.db'), [], token_col=False)
 make_db(os.path.join(tmp, 'notable.db'), [], table=False)
+
+# oss.toml 夹具：token 与密钥只用假值，断言输出绝不泄露。
+GOOD_TOML = '''
+[[remotes]]
+id = "r1"
+endpoint = "https://peer1:9000"
+access_key = "fixture-access-a"
+secret_key = "fixture-secret-a"
+site_token = "fixture-token-a"
+
+[[remotes]]
+id = "r2"
+endpoint = "https://peer2:9000"
+access_key = "fixture-access-b"
+secret_key = "fixture-secret-b"
+site_token = "fixture-token-b"
+'''
+MISSING_TOML = '''
+[[remotes]]
+id = "r1"
+endpoint = "https://peer1:9000"
+access_key = "fixture-access-a"
+secret_key = "fixture-secret-a"
+site_token = "fixture-token-a"
+
+[[remotes]]
+id = "r2"
+endpoint = "https://peer2:9000"
+access_key = "fixture-access-b"
+secret_key = "fixture-secret-b"
+
+[[remotes]]
+id = "r3"
+endpoint = "https://peer3:9000"
+site_token = "   "
+'''
+with open(os.path.join(tmp, 'config-good.toml'), 'w', encoding='utf-8') as f:
+    f.write(GOOD_TOML)
+with open(os.path.join(tmp, 'config-missing.toml'), 'w', encoding='utf-8') as f:
+    f.write(MISSING_TOML)
+with open(os.path.join(tmp, 'config-syntax.toml'), 'w', encoding='utf-8') as f:
+    f.write('[[remotes]\nid = "r1"\n')
 PY
 
 STUB="$TMP/stub-replica"
@@ -212,11 +254,13 @@ out=$("$MAIN" --data-dir "$TMP/data-a" --control-db "$TMP/notable.db" \
 	--replica-reconcile "$STUB" 2>&1)
 assert_has "no table: WARN" "$out" "[WARN] m6-site-token"
 
-# 6. 不提供 control-db / replica-scope → 两项 WARN（无法判定），不是 OK
+# 6. 不提供 config / control-db / replica-scope → 两项 WARN（无法判定），不是 OK
 out=$("$MAIN" --data-dir "$TMP/data-a" 2>&1)
 rc=$?
 assert_rc "no optional inputs: rc=0" 0 "$rc"
-assert_has "no db: WARN" "$out" "[WARN] m6-site-token"
+assert_has "no config: WARN" "$out" "[WARN] m6-site-token"
+assert_has "no config: mentions --config" "$out" "未提供 --config"
+assert_not_has "no config: not OK" "$out" "[OK] m6-site-token"
 assert_has "no scope: WARN" "$out" "[WARN] m7-unmapped-replica"
 
 # 7. JSON 输出可解析，状态与退出码一致
@@ -258,6 +302,46 @@ assert_has "comma data-dirs: second root scanned" "$out" "44444444-4444-4444-844
 assert_rc "no args: rc=2" 2 "$?"
 "$MAIN" --data-dir "$TMP/data-a" --bogus >/dev/null 2>&1
 assert_rc "unknown arg: rc=2" 2 "$?"
+
+# 12. --config：远端 token 齐全 → M6 OK；配置优先于 sites 无 site_token 列
+out=$("$MAIN" --data-dir "$TMP/data-a" --config "$TMP/config-good.toml" 2>&1)
+rc=$?
+assert_rc "config good: rc=0" 0 "$rc"
+assert_has "config good: m6 OK" "$out" "[OK] m6-site-token"
+assert_has "config good: remote count" "$out" "2 个 oss.toml 远端"
+assert_not_has "config good: no token value" "$out" "fixture-token-a"
+assert_not_has "config good: no second token" "$out" "fixture-token-b"
+assert_not_has "config good: no access_key" "$out" "fixture-access-a"
+assert_not_has "config good: no secret_key" "$out" "fixture-secret-a"
+out=$("$MAIN" --data-dir "$TMP/data-a" --config "$TMP/config-good.toml" \
+	--control-db "$TMP/nocol.db" 2>&1)
+assert_has "config good: beats no-column" "$out" "[OK] m6-site-token"
+assert_not_has "config good: no m6 undetermined" "$out" "[WARN] m6-site-token"
+
+# 13. --config：缺/空 site_token → WARN，只列 id/endpoint，不泄露 token/密钥；strict=1
+out=$("$MAIN" --data-dir "$TMP/data-a" --config "$TMP/config-missing.toml" 2>&1)
+rc=$?
+assert_rc "config missing token: default rc=0" 0 "$rc"
+assert_has "config missing token: WARN" "$out" "[WARN] m6-site-token"
+assert_has "config missing token: count" "$out" "2/3 个 oss.toml 远端"
+assert_has "config missing token: lists r2" "$out" "id=r2 endpoint=https://peer2:9000"
+assert_has "config missing token: lists blank r3" "$out" "id=r3 endpoint=https://peer3:9000"
+assert_not_has "config missing token: no token value" "$out" "fixture-token-a"
+assert_not_has "config missing token: no access_key" "$out" "fixture-access-a"
+assert_not_has "config missing token: no secret_key" "$out" "fixture-secret-a"
+"$MAIN" --data-dir "$TMP/data-a" --config "$TMP/config-missing.toml" --strict >/dev/null 2>&1
+assert_rc "config missing token: strict rc=1" 1 "$?"
+
+# 14. --config 文件缺失 / 解析失败 → BLOCK（fail-closed）
+out=$("$MAIN" --data-dir "$TMP/data-a" --config "$TMP/no-such.toml" 2>&1)
+assert_rc "config missing file: rc=1" 1 "$?"
+assert_has "config missing file: BLOCK" "$out" "[BLOCK] m6-site-token"
+assert_has "config missing file: explains" "$out" "缺失或无法解析"
+out=$("$MAIN" --data-dir "$TMP/data-a" --config "$TMP/config-syntax.toml" 2>&1)
+assert_rc "config bad syntax: rc=1" 1 "$?"
+assert_has "config bad syntax: BLOCK" "$out" "[BLOCK] m6-site-token"
+assert_has "config bad syntax: parse detail" "$out" "读取/解析失败"
+assert_not_has "config bad syntax: no false OK" "$out" "[OK] m6-site-token"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 ((FAIL == 0))
