@@ -36,7 +36,7 @@
         "alternateName": "oss",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Linux, macOS, Docker",
-        "softwareVersion": "1.21.0",
+        "softwareVersion": "1.21.1",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
         "codeRepository": "https://github.com/erikwang2013/oss",
         "downloadUrl": "https://github.com/erikwang2013/oss/releases",
@@ -90,7 +90,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.21.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.21.1</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -130,7 +130,7 @@
           <div><strong>5 个 crate</strong><span>oss-server · xl-s3 · xl-store · xl-client · xl-proto</span></div>
           <div><strong>EC 8+4</strong><span>多盘分片、quorum 写与读时修复</span></div>
           <div><strong>3 voters</strong><span>A/B 数据站点 + C control witness</span></div>
-          <div><strong>v1.21.0 功能版</strong><span>2026-10-28 · 一致读 + 账户 UI + tier/AP 加固</span></div>
+          <div><strong>v1.21.1 文档补丁</strong><span>2026-10-29 · 文档/站点同步</span></div>
         </div>
       </div>
 
@@ -140,7 +140,7 @@
             <h2>项目介绍</h2>
             <p class="intro-lede">吞吞（oss）是一块自己养大的对象存储：Rust 2024 编写，S3 兼容，从单盘一直长到跨站点强一致。</p>
             <p>它不是只把文件存进去的薄壳，而是把存储内核、纠删码、集群 mesh、多站点复制、控制面和安全能力放在同一套代码里。你可以只跑一个进程做本地备份，也可以配置 3 个 voter 和 witness，让控制面在站点故障时继续工作。</p>
-            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 完成 AP/账户、TLS/CMK、tier 流式与多站点复制等硬化收口，v1.16.0 又补上 WebIdentity、MPU 跨节点、OSSCTL2、Batch 抢占与 M8 leader 门控等 backlog，v1.17.0 继续推进账户 MVP、DP-0 数据面握手、M7 对账与 M8 运行态 fencing；2026-10-25 的 v1.18.0 精简 README 并更新英文 README 与站点，无功能变更；2026-10-26 的 v1.19.0 完成 Wave1 地基：DP-1 数据面混版门控、能力级别 1..3 与 OSSCTL3、租户与 M8 运行态快照、维护模式与缩容只读规划；2026-10-27 的 v1.20.0 修复 Wave2 缺口：mesh gRPC 入站 TLS 物料热轮换、账户写路径改走 Raft、缩容 topology v4 与离线 apply/verify/commit/rollback，并补上真实滚动 e2e；2026-10-28 的 v1.20.1 补上账户软字节配额告警、缩容 4→3 真进程 loopback e2e，并修复 v1.20.0 源码归档的 Cargo.lock 错误；同日的 v1.21.0 补上控制台一致读、账户管理员 UI、tier 归档/直读摘要绑定与 AP 端点 registry，并修复 Raft follower 滞后导致的成员操作误 404。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
+            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 完成 AP/账户、TLS/CMK、tier 流式与多站点复制等硬化收口，v1.16.0 又补上 WebIdentity、MPU 跨节点、OSSCTL2、Batch 抢占与 M8 leader 门控等 backlog，v1.17.0 继续推进账户 MVP、DP-0 数据面握手、M7 对账与 M8 运行态 fencing；2026-10-25 的 v1.18.0 精简 README 并更新英文 README 与站点，无功能变更；2026-10-26 的 v1.19.0 完成 Wave1 地基：DP-1 数据面混版门控、能力级别 1..3 与 OSSCTL3、租户与 M8 运行态快照、维护模式与缩容只读规划；2026-10-27 的 v1.20.0 修复 Wave2 缺口：mesh gRPC 入站 TLS 物料热轮换、账户写路径改走 Raft、缩容 topology v4 与离线 apply/verify/commit/rollback，并补上真实滚动 e2e；2026-10-28 的 v1.20.1 补上账户软字节配额告警、缩容 4→3 真进程 loopback e2e，并修复 v1.20.0 源码归档的 Cargo.lock 错误；同日的 v1.21.0 补上控制台一致读、账户管理员 UI、tier 归档/直读摘要绑定与 AP 端点 registry，并修复 Raft follower 滞后导致的成员操作误 404；2026-10-29 的 v1.21.1 同步文档与站点，无代码变更。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
             <p>它适合想理解对象存储内部实现的人，也适合需要一套可自托管、可审计、能继续改的 S3 兼容服务的团队。代码是开放的，边界也写清楚了：能做什么，不能做什么，都在 README 和版本日志里。</p>
           </div>
           <aside class="project-facts" data-reveal aria-label="项目档案">
@@ -152,8 +152,8 @@
               <div><dt>对外协议</dt><dd>S3 compatible</dd></div>
               <div><dt>实现语言</dt><dd>Rust 2024</dd></div>
               <div><dt>许可证</dt><dd>Apache-2.0</dd></div>
-              <div><dt>当前版本</dt><dd>v1.21.0（最新发布）</dd></div>
-              <div><dt>最新发布</dt><dd>一致读 + 账户 UI + tier/AP 加固（2026-10-28）</dd></div>
+              <div><dt>当前版本</dt><dd>v1.21.1（最新发布）</dd></div>
+              <div><dt>最新发布</dt><dd>文档补丁（2026-10-29）</dd></div>
               <div><dt>部署形态</dt><dd>单盘 / 多盘 EC / 多站点 / 3-voter Raft · 全链路 TLS</dd></div>
               <div><dt>源码</dt><dd><a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">github.com/erikwang2013/oss</a></dd></div>
             </dl>
@@ -216,8 +216,8 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               </button>
             </article>
             <article class="bento-card span-8" data-reveal>
-              <h3>v1.21.0 功能版</h3>
-              <p>2026-10-28 发布 v1.21.0：控制台一致读（<code>?consistent=1</code> + <code>x-oss-applied-index</code>）、账户管理员 UI、tier 归档/直读绑定源整对象 SHA-256、AP 静态 VPC 端点 registry（注册断言），并修复 Raft follower 滞后导致的 attach/member-status 误 404。硬字节/对象数配额与 M8 运行态实时复制仍未交付。</p>
+              <h3>v1.21.1 文档补丁</h3>
+              <p>2026-10-29 发布 v1.21.1：无代码变更，同步 v1.21.0 后的文档与站点、清理已删除的旧兼容线引用；功能与边界同 v1.21.0。</p>
               <div class="chip-row"><span>consistent read</span><span>accounts UI</span><span>tier digest</span><span>AP registry</span></div>
             </article>
             <article class="bento-card tint span-4" data-reveal>
@@ -400,6 +400,11 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           </div>
           <div class="release-list">
             <article class="release-row" data-reveal>
+              <time datetime="2026-10-29">2026-10-29</time>
+              <div><strong>v1.21.1</strong><p>文档补丁：同步文档与站点，清理已删除的旧兼容线引用；无代码变更。</p></div>
+              <a href="changelog.html#v1-21-1">查看</a>
+            </article>
+            <article class="release-row" data-reveal>
               <time datetime="2026-10-28">2026-10-28</time>
               <div><strong>v1.21.0</strong><p>功能版：控制台一致读、账户管理员 UI、tier 摘要绑定、AP 端点 registry，修复 Raft follower 滞后误 404。</p></div>
               <a href="changelog.html#v1-21-0">查看</a>
@@ -493,12 +498,12 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
         <div class="wrap">
           <div class="download-band" data-reveal>
             <div>
-              <h2>下载 v1.21.0</h2>
+              <h2>下载 v1.21.1</h2>
               <p>Release 提供源码归档。当前没有预编译二进制，推荐用 Docker Compose 或按安装文档从源码构建。</p>
             </div>
             <div class="download-actions">
-              <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.21.0" target="_blank" rel="noopener">打开 Release</a>
-              <a class="btn btn-ghost btn-lg" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.21.0.tar.gz" target="_blank" rel="noopener">源码包</a>
+              <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.21.1" target="_blank" rel="noopener">打开 Release</a>
+              <a class="btn btn-ghost btn-lg" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.21.1.tar.gz" target="_blank" rel="noopener">源码包</a>
               <a class="btn btn-ghost btn-lg" href="install.html">安装文档</a>
             </div>
           </div>
@@ -540,7 +545,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.21.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.21.1</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
