@@ -98,7 +98,9 @@ fn tier_target(id: &str, kind: TierKind, path: Option<std::path::PathBuf>, ep: &
 
 async fn setup(targets: Vec<TierTarget>) -> (AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let st = common::state_with_tiers(dir.path(), targets).await;
+    // 100MiB 用例在高负载下可跑 >600s（sqlx idle_timeout 默认 600s）：内存库连接被
+    // 回收后库随之销毁，后续访问报 no such table。改用文件库（test.db）规避。
+    let st = common::state_with_tiers_file_db(dir.path(), targets).await;
     st.store.create_bucket("bkt").await.unwrap();
     st.db.insert_bucket("bkt", None).await.unwrap();
     (st, dir)

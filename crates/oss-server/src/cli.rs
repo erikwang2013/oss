@@ -23,6 +23,9 @@ pub const USAGE: &str = "\
   fsck [--repair] 全盘巡检（全版本链：孤儿版本目录、EC 分片缺/坏、tmp/trash 计数）；--repair 执行最小修复（删孤儿 + 逐版本读时修）；报告落 .oss.sys/fsck/<时间戳>-fsck.json
   heal           fsck --repair 全量 + 缺失桶目录补建（集群差集；每节点各自执行）；报告 <时间戳>-heal.json
   scrub          全量深度巡检（只读）：逐块 12×W 对偶校验可定位坏片、历史版本全覆盖；深度失败 exit 1（可重建的坏/缺块不退出非零——口径见 README）；报告 <时间戳>-scrub.json
+  tier-audit [--json]
+                 只读审计已归档版本：列出未绑定源整对象摘要的对象（legacy parts / 空 sha）；
+                 有未绑定项 exit 1，无则 0；绝不回填/改写 meta
   rebalance [--dry-run|--apply]
                  扩容搬迁（默认 dry-run）：把存量对象迁到展开放置（placement=v2；未开则空跑）；
                  逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
@@ -81,6 +84,10 @@ pub enum Command {
     Heal,
     /// M4 切片 4：全量深度巡检（逐块对偶校验，只读不修）
     Scrub,
+    /// C1–C4 补审计：已归档版本未绑定源摘要清单（只读；有未绑定项退出码 1）。
+    TierAudit {
+        json: bool,
+    },
     /// M4 切片 5：扩容后搬迁（dry_run 只报告）
     Rebalance {
         dry_run: bool,
@@ -240,6 +247,7 @@ pub fn needs_full_state(cmd: &Command) -> bool {
             | Command::RaftForceRecover { .. }
             | Command::SyncReconcile { .. }
             | Command::ReplicaReconcile { .. }
+            | Command::TierAudit { .. }
             | Command::Cmk(_)
     )
 }
@@ -334,6 +342,8 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
         ("fsck", [flag]) if flag == "--repair" => Ok(Command::Fsck { repair: true }),
         ("heal", []) => Ok(Command::Heal),
         ("scrub", []) => Ok(Command::Scrub),
+        ("tier-audit", []) => Ok(Command::TierAudit { json: false }),
+        ("tier-audit", [flag]) if flag == "--json" => Ok(Command::TierAudit { json: true }),
         ("rebalance", []) => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--dry-run" => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--apply" => Ok(Command::Rebalance { dry_run: false }),
@@ -1171,6 +1181,7 @@ pub async fn run(
         | Command::RaftForceRecover { .. }
         | Command::SyncReconcile { .. }
         | Command::ReplicaReconcile { .. }
+        | Command::TierAudit { .. }
         | Command::Cmk(_) => {
             Err("内部错误：离线命令不得走 AppState::run（应走 run_offline）".into())
         }
@@ -1244,6 +1255,7 @@ pub async fn run_offline(
             apply,
             json,
         } => replica_reconcile_cmd(cfg_path, bucket, key, delete, apply, json).await,
+        Command::TierAudit { json } => tier_audit_cmd(cfg_path, json).await,
         Command::Cmk(cmd) => cmk_cmd(cfg_path, cmd).await,
         other => Err(format!("{other:?} 不是离线命令（内部接线错误）").into()),
     }
@@ -1587,6 +1599,36 @@ async fn replica_reconcile_cmd(
             Err(e.into())
         }
     }
+}
+
+/// 只读审计：已归档版本的源摘要绑定（C1–C4 的 legacy 例外清单）。
+/// 离线执行（不 `AppState::load`、不二次打开 raft.db）；只读盘上 meta，绝不回填。
+async fn tier_audit_cmd(
+    cfg_path: &std::path::Path,
+    json: bool,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let cfg = crate::config::AppConfig::load(cfg_path)?;
+    let store = open_local_store(&cfg).await?;
+    let report = store.tier_audit().await?;
+    let unbound = report.unbound.len();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "tier-audit: 已归档版本 {} / 未绑定源摘要 {unbound}",
+            report.archived
+        );
+        for e in &report.unbound {
+            println!(
+                "  {}:{}@{} reason={}",
+                e.bucket, e.key, e.version_id, e.reason
+            );
+        }
+        if cfg.cluster.is_some() || cfg.stretch.is_some() {
+            println!("  注意：集群部署请逐节点执行；本命令不做跨节点汇总");
+        }
+    }
+    Ok(if unbound > 0 { 1 } else { 0 })
 }
 
 async fn sync_reconcile_cmd(
@@ -1992,6 +2034,14 @@ mod tests {
             Ok(Command::Fsck { repair: true })
         );
         assert_eq!(
+            parse_args(&args(&["tier-audit"])),
+            Ok(Command::TierAudit { json: false })
+        );
+        assert_eq!(
+            parse_args(&args(&["tier-audit", "--json"])),
+            Ok(Command::TierAudit { json: true })
+        );
+        assert_eq!(
             parse_args(&args(&["cluster-shrink", "plan", "--to", "t.toml"])),
             Ok(Command::ClusterShrinkPlan {
                 to: "t.toml".into(),
@@ -2303,6 +2353,7 @@ mod tests {
                 bucket: None,
                 json: false,
             },
+            Command::TierAudit { json: false },
             Command::Cmk(CmkCommand::Scan {
                 name: "a".into(),
                 json: false,
@@ -2328,6 +2379,7 @@ mod tests {
             &["fsck", "--repair", "x"][..],
             &["heal", "x"][..], // heal/scrub 不收参数
             &["scrub", "--deep"][..],
+            &["tier-audit", "x"][..],   // tier-audit 只认 --json
             &["rebalance", "--go"][..], // rebalance 只认 --dry-run/--apply
             &["rebalance", "x", "y"][..],
             &["/etc/oss.toml"][..], // 旧的「首参=配置路径」不再是合法用法

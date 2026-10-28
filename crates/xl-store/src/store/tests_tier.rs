@@ -572,3 +572,73 @@ async fn archive_skips_digest_binding_for_legacy_versions() {
         .unwrap();
     }
 }
+
+/// 只读审计：已绑定源摘要的归档版本不报；空 sha 与 legacy parts 两类按原因列出。
+#[tokio::test]
+async fn tier_audit_lists_only_unbound_legacy_versions() {
+    let (s, _d) = store().await;
+
+    // 已绑定：put 写入整对象 SHA-256，归档流摘要与之相同 → 不算未绑定。
+    let bound = put(&s, "bound", VersioningMode::Enabled, None).await;
+    let bvid = bound.version_id.clone().unwrap();
+    s.archive_version("alpha", "bound", &bvid, archive_spec("bound", &bound), 100)
+        .await
+        .unwrap();
+
+    // 旧对象无摘要：part.sha256 为空 → 归档跳过绑定。
+    let empty = put(&s, "legacy-sha", VersioningMode::Enabled, None).await;
+    let evid = empty.version_id.clone().unwrap();
+    let mut m = s.read_meta("alpha", "legacy-sha").await.unwrap().unwrap();
+    m.versions.last_mut().unwrap().part.sha256.clear();
+    s.write_meta("alpha", "legacy-sha", &m, None).await.unwrap();
+    s.archive_version(
+        "alpha",
+        "legacy-sha",
+        &evid,
+        archive_spec("legacy-sha", &empty),
+        100,
+    )
+    .await
+    .unwrap();
+
+    // M2a 旧形态：parts=Some → 跳过绑定。归档提交清空 parts，事后只剩首段副本摘要
+    // 与整对象摘要不一致这一条线索。
+    let parts = put(&s, "legacy-parts", VersioningMode::Enabled, None).await;
+    let pvid = parts.version_id.clone().unwrap();
+    let mut m = s.read_meta("alpha", "legacy-parts").await.unwrap().unwrap();
+    let v = m.versions.last_mut().unwrap();
+    v.parts = Some(vec![v.part.clone()]);
+    v.part.sha256 = hex::encode(crate::mesh::content_hash(b"part-one"));
+    s.write_meta("alpha", "legacy-parts", &m, None)
+        .await
+        .unwrap();
+    s.archive_version(
+        "alpha",
+        "legacy-parts",
+        &pvid,
+        archive_spec("legacy-parts", &parts),
+        100,
+    )
+    .await
+    .unwrap();
+
+    let report = s.tier_audit().await.unwrap();
+    assert_eq!(report.archived, 3);
+    assert_eq!(report.unbound.len(), 2, "{report:?}");
+    for (key, vid, reason) in [
+        ("legacy-parts", pvid.as_str(), "legacy-parts"),
+        ("legacy-sha", evid.as_str(), "empty-source-sha"),
+    ] {
+        assert!(
+            report.unbound.iter().any(|e| e.bucket == "alpha"
+                && e.key == key
+                && e.version_id == vid
+                && e.reason == reason),
+            "{key}: {report:?}"
+        );
+    }
+    assert!(
+        report.unbound.iter().all(|e| e.key != "bound"),
+        "已绑定版本不得进清单: {report:?}"
+    );
+}

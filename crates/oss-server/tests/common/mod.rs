@@ -85,6 +85,34 @@ async fn state_with_targets_max(
     max_put_bytes: usize,
     maintenance: bool,
 ) -> AppState {
+    state_with_targets_url(
+        dir,
+        site,
+        tiers,
+        max_put_bytes,
+        maintenance,
+        "sqlite::memory:",
+    )
+    .await
+}
+
+/// 长跑用例专用：文件库。`sqlite::memory:` 是命名共享缓存内存库，sqlx 默认
+/// `idle_timeout=600s` 回收最后一个连接后库即销毁；高负载下单用例 >600s 不碰 DB，
+/// 后续访问报 `no such table`。文件库在连接重建后 schema 仍在（不改生产默认值）。
+#[allow(dead_code)]
+pub async fn state_with_tiers_file_db(dir: &std::path::Path, tiers: Vec<TierTarget>) -> AppState {
+    let url = format!("sqlite://{}?mode=rwc", dir.join("test.db").display());
+    state_with_targets_url(dir, None, tiers, 1024 * 1024, false, &url).await
+}
+
+async fn state_with_targets_url(
+    dir: &std::path::Path,
+    site: Option<SiteToml>,
+    tiers: Vec<TierTarget>,
+    max_put_bytes: usize,
+    maintenance: bool,
+    database_url: &str,
+) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
@@ -92,7 +120,7 @@ async fn state_with_targets_max(
         ec: Default::default(),
         maintenance,
         staging_dir: dir.join("staging"),
-        database_url: "sqlite::memory:".into(),
+        database_url: database_url.into(),
         jwt_secret: JWT_SECRET.into(),
         max_put_bytes,
         groups: vec![GroupTarget {
