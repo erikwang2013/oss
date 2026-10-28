@@ -58,9 +58,69 @@ pub struct AppConfig {
     /// STS：`[sts]`（AssumeRoleWithWebIdentity 的 OIDC 联合身份；缺省全关）。
     #[serde(default)]
     pub sts: xl_s3::sts_web_identity::StsToml,
+    /// AP Slice A：`[ap]` 静态 VPC 端点 registry（**注册断言**，不是真实端点身份）。
+    #[serde(default)]
+    pub ap: ApToml,
     /// M3 shrink：维护模式（非 GET/HEAD/OPTIONS 一律 503、后台 worker 全停）。
     #[serde(default)]
     pub maintenance: bool,
+}
+
+/// `[ap]`：访问点来源端点注册表（Slice A 静态配置；动态 DB/Raft 不在本切片）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApToml {
+    #[serde(default)]
+    pub vpc_endpoints: Vec<ApVpcEndpointToml>,
+}
+
+/// `[[ap.vpc_endpoints]]`：vpce → {vpc, account, state} 的注册行。
+/// 账户存在且 active 需 DB 校验（启动期异步，见 `state::validate_ap_endpoints`）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApVpcEndpointToml {
+    pub vpce_id: String,
+    pub vpc_id: String,
+    pub account_id: String,
+    /// `active` | `disabled`（其它值启动失败）。
+    pub state: String,
+}
+
+impl ApToml {
+    /// 格式/唯一性/state 白名单校验（账户存在性在 DB 就绪后校验）。
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for e in &self.vpc_endpoints {
+            if !xl_s3::ap::valid_vpce_id(&e.vpce_id) {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] vpce_id 非法: {:?}",
+                    e.vpce_id
+                ));
+            }
+            if !xl_s3::ap::valid_vpc_id(&e.vpc_id) {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] {} 的 vpc_id 非法: {:?}",
+                    e.vpce_id, e.vpc_id
+                ));
+            }
+            if e.account_id.trim().is_empty() {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] {} 的 account_id 不能为空",
+                    e.vpce_id
+                ));
+            }
+            if !matches!(e.state.as_str(), "active" | "disabled") {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] {} 的 state 非法: {:?}（active|disabled）",
+                    e.vpce_id, e.state
+                ));
+            }
+            if !seen.insert(&e.vpce_id) {
+                return Err(format!("[[ap.vpc_endpoints]] vpce_id 重复: {}", e.vpce_id));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[raft]`：3-voter 控制面运行时参数。`advertise_endpoint` 是主 HTTP（Raft RPC 路由），
@@ -670,7 +730,14 @@ impl AppConfig {
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.sts_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.ap_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         Ok(cfg)
+    }
+
+    /// `[ap]` 静态 registry 的同步校验（账户存在性由 `AppState::load` 查 DB）。
+    pub fn ap_validate(&self) -> Result<(), String> {
+        self.ap.validate()
     }
 
     /// `[sts]`：启用 web_identity 时启动期读入并校验 JWKS（坏配置/坏文件 = 拒绝启动）。
@@ -1238,6 +1305,7 @@ mod tests {
             stretch: None,
             tls: Default::default(),
             sts: Default::default(),
+            ap: Default::default(),
         }
     }
 
@@ -1283,6 +1351,71 @@ mod tests {
         assert!(
             toml::from_str::<AppConfig>(&typo).is_err(),
             "未知键必须拒绝"
+        );
+    }
+
+    /// `[ap]` Slice A：格式/唯一性/state 白名单 fail-closed；缺省空表零改动。
+    #[test]
+    fn ap_registry_validates_format_uniqueness_and_state() {
+        let base = "listen = \"127.0.0.1:0\"\n\
+                    data_dir = \"d\"\n\
+                    staging_dir = \"s\"\n\
+                    database_url = \"sqlite::memory:\"\n\
+                    jwt_secret = \"\"\n";
+        let c: AppConfig = toml::from_str(base).unwrap();
+        assert!(c.ap.vpc_endpoints.is_empty(), "缺省 [ap] 必须为空");
+        c.ap_validate().unwrap();
+
+        let with =
+            |rows: &str| -> AppConfig { toml::from_str(&format!("{base}\n[ap]\n{rows}")).unwrap() };
+        let row = |vpce: &str, vpc: &str, acct: &str, state: &str| {
+            format!(
+                "[[ap.vpc_endpoints]]\nvpce_id=\"{vpce}\"\nvpc_id=\"{vpc}\"\n\
+                 account_id=\"{acct}\"\nstate=\"{state}\"\n"
+            )
+        };
+        let ok = with(&row("vpce-1", "vpc-1", "000000000000", "active"));
+        assert_eq!(ok.ap.vpc_endpoints.len(), 1);
+        ok.ap_validate().unwrap();
+        with(&row("vpce-1", "vpc-1", "000000000000", "disabled"))
+            .ap_validate()
+            .unwrap();
+
+        // 非法 vpce_id（只收 vpce- 形态）
+        let e = with(&row("vpc-1", "vpc-1", "000000000000", "active"))
+            .ap_validate()
+            .unwrap_err();
+        assert!(e.contains("vpce_id"), "{e}");
+        // 非法 vpc_id
+        let e = with(&row("vpce-1", "nope", "000000000000", "active"))
+            .ap_validate()
+            .unwrap_err();
+        assert!(e.contains("vpc_id"), "{e}");
+        // 空账户
+        let e = with(&row("vpce-1", "vpc-1", " ", "active"))
+            .ap_validate()
+            .unwrap_err();
+        assert!(e.contains("account_id"), "{e}");
+        // state 白名单
+        let e = with(&row("vpce-1", "vpc-1", "000000000000", "pending"))
+            .ap_validate()
+            .unwrap_err();
+        assert!(e.contains("state"), "{e}");
+        // vpce 唯一
+        let dup = format!(
+            "{}{}",
+            row("vpce-1", "vpc-1", "000000000000", "active"),
+            row("vpce-1", "vpc-2", "000000000000", "active")
+        );
+        let e = with(&dup).ap_validate().unwrap_err();
+        assert!(e.contains("重复"), "{e}");
+        // 未知键（deny_unknown_fields）
+        assert!(
+            toml::from_str::<AppConfig>(&format!(
+                "{base}\n[ap]\n[[ap.vpc_endpoints]]\nvpce_id=\"vpce-1\"\n\
+             vpc_id=\"vpc-1\"\naccount_id=\"000000000000\"\nstate=\"active\"\nextra=1\n"
+            ))
+            .is_err()
         );
     }
 
@@ -1737,6 +1870,7 @@ mod tests {
             stretch: None,
             tls: Default::default(),
             sts: Default::default(),
+            ap: Default::default(),
         };
         // 合法
         assert!(
