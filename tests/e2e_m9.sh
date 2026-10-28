@@ -239,6 +239,18 @@ status_json() {
   done
   return 1
 }
+# 当前 Raft leader 的 HTTP base。jobs/job_tasks 是节点本地表，worker 只在 leader
+# 领取；Batch 作业必须在 leader 上创建/轮询，否则会永远 queued（见 step 3）。
+leader_base() {
+  local base st
+  for base in "$A" "$B"; do
+    st=$(status_json "$base" | python3 -c 'import json,sys
+try: print("true" if json.load(sys.stdin).get("is_leader") is True else "false")
+except Exception: print("false")')
+    [ "$st" = true ] && { printf '%s' "$base"; return 0; }
+  done
+  return 1
+}
 cap() { status_json "$A" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print("false"); raise SystemExit
@@ -579,21 +591,28 @@ else
   ck_q aws_a s3api delete-objects --bucket "$SB" --delete '{"Objects":[{"Key":"mpu.bin"}],"Quiet":true}'
   ck retry 60 both_missing "$SB" mpu.bin
   echo "  -- Batch Delete（POST /api/v1/jobs → worker；轮询 GET /jobs/{id} 至终态） --"
-  # 清单放普通桶 BK_A（步骤 2 已建/本节点可读）；对象选本段已存在、后续不再用的 blocked.bin。
-  printf '%s,%s\n' "$SB" blocked.bin > "$W/batch-del.csv"
-  ck_q aws_a s3api put-object --bucket "$BK_A" --key "batch/manifest-$STAMP.csv" --body "$W/batch-del.csv"
-  code=$(curl -s -o "$W/batch-create.json" -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/jobs" \
-    -H "authorization: Bearer $AT" -H 'content-type: application/json' \
-    -d "{\"kind\":\"batch\",\"manifest_bucket\":\"$BK_A\",\"manifest_key\":\"batch/manifest-$STAMP.csv\",\"operation\":\"DeleteObject\"}")
-  ck [ "$code" = 201 ]
-  JID=$(python3 -c 'import json,sys
+  # 清单放普通桶 BK_A；jobs/job_tasks 与对象数据都是节点本地视角——清单必须写到
+  # 当前 Raft leader（worker 只在该节点领取并读清单），否则会 queued 或“清单对象不存在”。
+  LB=$(leader_base) || LB=""
+  if [ -z "$LB" ]; then
+    fail "Batch Delete 无 Raft leader（A/B 均非 leader），无法创建作业"
+  else
+    AWSL=aws_a; [ "$LB" = "$B" ] && AWSL=aws_b
+    printf '%s,%s\n' "$SB" blocked.bin > "$W/batch-del.csv"
+    ck_q "$AWSL" s3api put-object --bucket "$BK_A" --key "batch/manifest-$STAMP.csv" --body "$W/batch-del.csv"
+    code=$(curl -s -o "$W/batch-create.json" -w '%{http_code}' --max-time 10 -X POST "$LB/api/v1/jobs" \
+      -H "authorization: Bearer $AT" -H 'content-type: application/json' \
+      -d "{\"kind\":\"batch\",\"manifest_bucket\":\"$BK_A\",\"manifest_key\":\"batch/manifest-$STAMP.csv\",\"operation\":\"DeleteObject\"}")
+    ck [ "$code" = 201 ]
+    JID=$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1]))["job_id"])
 except Exception: print("")' "$W/batch-create.json")
-  if [ -n "$JID" ]; then
-    ck batch_job_wait "$A" "$AT" "$JID" 90
-    ck batch_job_ok "$W/batch-job.json"
-  else
-    fail "Batch Delete 建作业响应无 job_id：$(head -c 200 "$W/batch-create.json")"
+    if [ -n "$JID" ]; then
+      ck batch_job_wait "$LB" "$AT" "$JID" 120
+      ck batch_job_ok "$W/batch-job.json"
+    else
+      fail "Batch Delete 建作业响应无 job_id：$(head -c 200 "$W/batch-create.json")"
+    fi
   fi
   ck a_missing "$SB" blocked.bin
   ck b_missing "$SB" blocked.bin
