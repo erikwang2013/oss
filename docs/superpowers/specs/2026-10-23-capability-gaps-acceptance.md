@@ -501,8 +501,10 @@ v1.20.1 之后在 main 合入的修复与切片，尚未打 tag/发版；发布�
 | 文档对齐 | `AGENTS.md`、backlog、设计文档 | 状态/证据段与 v1.20.1 代码对齐 |
 
 **main 验证**：七闸在 801abe5 为 1308 passed / 0 failed / 3 ignored；`oss-server` 全量在 2aa05b4
-再跑 65 suites / 0 failed；tier+AP 合并后交叉聚焦测试全绿（9/9、5/5、12/12、27/27、4/4）；
-前端 build/lint 0、Vitest 21/21。合并后 main 的 `oss-server` 全量结果见发布前复核记录。
+再跑 65 suites / 0 failed；tier+AP 合并后交叉聚焦测试全绿（9/9、5/5、12/12、27/27、4/4），
+合并后 main 的 `oss-server` 全量再跑 **65 suites / 0 failed / RC=0**；clippy
+`-p oss-server -p xl-store -p xl-s3 --all-targets -- -D warnings` RC=0、`cargo fmt --all --check`
+RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/1。
 
 ### 16.1 v1.13.2 兼容补丁线（未发布）
 
