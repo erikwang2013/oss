@@ -16,7 +16,7 @@
 > `GET /accounts/{id}/usage`（只告警不阻写，硬字节配额仍为非目标）；M3 shrink 4→3 已补上
 > 真实进程 loopback e2e（86/0/0）。证据见验收记录 §15。其余五项完整目标仍按本文未实现。
 >
-> **2026-10-28 更新（post-v1.20.1，工作树未发版）**：main 已合入 M8-3 控制台一致读
+> **2026-10-28 更新（v1.21.0）**：main 已合入 M8-3 控制台一致读
 > （`?consistent=1` + `x-oss-applied-index`）、账户管理员 UI、滞后 follower 的
 > `attach_member`/`set_member_status` 追赶、e2e_m9 的 S9 三条断言（实跑 64/0/1）；
 > tier 直读/归档绑定源整对象 SHA-256（C1–C4）与 AP 端点静态 registry（注册断言，

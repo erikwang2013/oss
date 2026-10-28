@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.20.1，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.21.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.20.1 补丁；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.21.0 功能版；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.20.1 补丁；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.21.0 功能版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.20.1</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.21.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.20.1 的补丁。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.21.0 的功能版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-21-0">v1.21.0</a>
           <a href="#v1-20-1">v1.20.1</a>
           <a href="#v1-20-0">v1.20.0</a>
           <a href="#v1-19-0">v1.19.0</a>
@@ -97,9 +98,25 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.20.1</strong>（2026-10-28）。</p>
+          <p>当前最新发布：<strong>v1.21.0</strong>（2026-10-28）。</p>
 
           <div class="changelog-list">
+            <details class="changelog-entry" id="v1-21-0" open>
+              <summary><strong>v1.21.0</strong><time datetime="2026-10-28">2026-10-28</time><span>功能版</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>M8-3 控制台一致读</strong>：GET/HEAD 带 <code>?consistent=1</code> 时经有界追赶（2s）再读本地，失败/无 leader 503 fail-closed；控制台响应带 <code>x-oss-applied-index</code>；默认仍是 follower 弱读。</li>
+                  <li><strong>账户管理员 UI</strong>：账户列表/创建/改名/启停/删除、成员、桶数量配额、软字节配额与 usage（<code>web/src/pages/Accounts.tsx</code>）。</li>
+                  <li><strong>tier 归档/直读摘要绑定（C1–C4）</strong>：归档副本绑定源对象已提交的整对象 SHA-256；旧代码可静默归档坏 <code>part.1</code> 的缺口已关闭；legacy <code>parts=Some</code>/空摘要跳过。</li>
+                  <li><strong>AP VPC 端点 registry</strong>：静态 <code>[[ap.vpc_endpoints]]</code>，R1–R7 fail-closed、账户绑定与审计；这是注册断言，不是密码学端点身份。</li>
+                  <li><strong>Raft follower 追赶</strong>：<code>attach_member</code> 与 <code>set_member_status</code> 本地 miss 时等待本地 apply 追上 leader 再重查，修复滞后 follower 误 404。</li>
+                  <li><strong>e2e_m9 S9</strong>：fsck <code>--repair</code> 复检、提交 ≥9 槽、B 第二节点 identity；stretch 实跑 <strong>64 PASS / 0 FAIL / 1 SKIP</strong>。</li>
+                  <li><strong>未交付</strong>：硬字节/对象数配额、M8-2 运行态实时复制、Level C 完整双向混写、真实 PrivateLink 身份、单机→集群工具化。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.21.0" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+
             <details class="changelog-entry" id="v1-20-1" open>
               <summary><strong>v1.20.1</strong><time datetime="2026-10-28">2026-10-28</time><span>补丁</span></summary>
               <div class="entry-body">
@@ -336,7 +353,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.20.1</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.21.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
