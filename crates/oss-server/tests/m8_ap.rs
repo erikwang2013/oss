@@ -11,7 +11,6 @@ mod common;
 
 use std::sync::Arc;
 
-use common::state;
 use oss_server::db::PermissionRow;
 use oss_server::router::build_router;
 use oss_server::state::AppState;
@@ -33,6 +32,42 @@ struct Env {
     http: reqwest::Client,
 }
 
+/// Slice A 测试用可变端点 registry（等价 `[ap.vpc_endpoints]`；允许播种账户后补行）。
+#[derive(Default)]
+struct TestEndpoints {
+    rows: std::sync::RwLock<Vec<xl_s3::ap::ApEndpoint>>,
+}
+
+impl TestEndpoints {
+    fn put(&self, vpce_id: &str, vpc_id: &str, account_id: &str, state: &str) {
+        let mut w = self.rows.write().unwrap();
+        w.retain(|e| e.vpce_id != vpce_id);
+        w.push(xl_s3::ap::ApEndpoint {
+            vpce_id: vpce_id.into(),
+            vpc_id: vpc_id.into(),
+            account_id: account_id.into(),
+            state: state.into(),
+        });
+    }
+
+    fn clear(&self) {
+        self.rows.write().unwrap().clear();
+    }
+}
+
+#[async_trait::async_trait]
+impl xl_s3::ap::ApEndpointSource for TestEndpoints {
+    async fn lookup(&self, vpce: &str) -> Result<Option<xl_s3::ap::ApEndpoint>, String> {
+        Ok(self
+            .rows
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.vpce_id == vpce)
+            .cloned())
+    }
+}
+
 async fn env(dir: &std::path::Path) -> Env {
     env_with_peer(dir, None).await
 }
@@ -50,7 +85,18 @@ async fn env_with_proofs(
     vpc: Option<&str>,
     vpce: Option<&str>,
 ) -> Env {
-    let st = state(dir).await;
+    env_with_registry(dir, peer, vpc, vpce, Arc::new(TestEndpoints::default())).await
+}
+
+/// 同 [`env_with_proofs`]，额外注入可变端点 registry（AppState 构造后、build_router 前）。
+async fn env_with_registry(
+    dir: &std::path::Path,
+    peer: Option<std::net::IpAddr>,
+    vpc: Option<&str>,
+    vpce: Option<&str>,
+    registry: Arc<TestEndpoints>,
+) -> Env {
+    let st = common::state_with_endpoint_source(dir, registry).await;
     let app = build_router(st.clone()).unwrap();
     let vpc = vpc.map(str::to_string);
     let vpce = vpce.map(str::to_string);
@@ -3109,11 +3155,29 @@ async fn seed_vpce_fixture(e: &Env, vpce: &str) -> (String, String) {
         "Resource":"arn:aws:s3:::vpceb/*",
         "Condition":{"StringEquals":{"aws:SourceVpce":vpce}}}]})
     .to_string();
-    direct_ap(e, "vpce-ap", "vpceb", uid, Some(&policy)).await;
+    // 账户绑定对比的是**桶账户**（生产 DbApSource/预加载语义）；`direct_ap` 注入
+    // LEGACY 账户只适用于旧账户模型，这里必须按生产口径建 AP。
+    let account = e.st.db.bucket_account("vpceb").await.unwrap();
+    e.st.db
+        .create_access_point("vpce-ap", "vpceb", uid, Some(policy.as_str()), 0)
+        .await
+        .unwrap();
+    e.st.ap_cache.put(
+        AccessPoint::from_row(
+            "vpce-ap".into(),
+            "vpceb".into(),
+            uid,
+            Some(policy),
+            &e.st.ap_region,
+            &account,
+        )
+        .unwrap(),
+    );
     (ak, sk)
 }
 
-/// `aws:SourceVpce` 是独立显式证明：缺证明/错证明/仅 SourceVpc 同形值都 fail-closed。
+/// `aws:SourceVpce` 是独立显式证明：缺证明/错证明/仅 SourceVpc 同形值都 fail-closed；
+/// 匹配的断言还须命中 active registry（Slice A R2）。
 #[tokio::test]
 async fn source_vpce_requires_explicit_proof() {
     const VPCE: &str = "vpce-0abc123";
@@ -3125,12 +3189,73 @@ async fn source_vpce_requires_explicit_proof() {
     ];
     for (label, vpc, vpce, want) in cases {
         let dir = tempfile::tempdir().unwrap();
-        let e = env_with_proofs(dir.path(), None, vpc, vpce).await;
+        let registry = Arc::new(TestEndpoints::default());
+        let e = env_with_registry(dir.path(), None, vpc, vpce, registry.clone()).await;
         let (ak, sk) = seed_vpce_fixture(&e, VPCE).await;
+        if vpce == Some(VPCE) {
+            let account = e.st.db.bucket_account("vpceb").await.unwrap();
+            registry.put(VPCE, "vpc-0abc123", &account, "active");
+        }
         assert_eq!(
             send_status(&e, Method::GET, "/ap/vpce-ap/k", &[], b"", &ak, &sk, "s3").await,
             want,
             "SourceVpce {label}"
         );
     }
+}
+
+/// Slice A：ApVpce 断言 → registry（active/归属账户）门禁；拒绝均 403 且审计可追溯。
+#[tokio::test]
+async fn source_vpce_registry_binding() {
+    const VPCE: &str = "vpce-0abc123";
+    const VPC: &str = "vpc-0abc123";
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(TestEndpoints::default());
+    let e = env_with_registry(dir.path(), None, None, Some(VPCE), registry.clone()).await;
+    let (ak, sk) = seed_vpce_fixture(&e, VPCE).await;
+    let account = e.st.db.bucket_account("vpceb").await.unwrap();
+    let get = || send_status(&e, Method::GET, "/ap/vpce-ap/k", &[], b"", &ak, &sk, "s3");
+    let last_detail = || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(e.st.db.pool())
+        .await
+        .unwrap()
+    };
+
+    // 未登记：字符串匹配但 registry 无行 → 403。
+    assert_eq!(get().await, 403, "unregistered");
+    let detail = last_detail().await.unwrap();
+    assert!(
+        detail.contains("endpoint:deny:unregistered"),
+        "审计须记录未登记拒绝: {detail}"
+    );
+
+    // 跨账户端点 → 403（策略引用 SourceVpce，R4 强制归属账户）。
+    registry.put(VPCE, VPC, "123456789012", "active");
+    assert_eq!(get().await, 403, "cross-account");
+    let detail = last_detail().await.unwrap();
+    assert!(
+        detail.contains("endpoint=vpce-0abc123/account=123456789012")
+            && detail.contains("endpoint:deny:account-mismatch"),
+        "审计须记录端点/账户与拒绝原因: {detail}"
+    );
+
+    // 停用 → 403。
+    registry.put(VPCE, VPC, &account, "disabled");
+    assert_eq!(get().await, 403, "disabled");
+
+    // 同账户 active → 200，审计带 endpoint/account。
+    registry.put(VPCE, VPC, &account, "active");
+    assert_eq!(get().await, 200, "same-account active");
+    let detail = last_detail().await.unwrap();
+    assert!(
+        detail.contains(&format!("endpoint={VPCE}/account={account}")),
+        "审计须记录端点/账户: {detail}"
+    );
+
+    // 清空 registry 再验一次未登记（防止上一步缓存影响判断）。
+    registry.clear();
+    assert_eq!(get().await, 403, "unregistered after clear");
 }

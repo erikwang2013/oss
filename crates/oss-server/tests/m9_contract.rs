@@ -66,6 +66,7 @@ cluster_token = "t"
         stretch: None,
         tls: Default::default(),
         sts: Default::default(),
+        ap: Default::default(),
     }
 }
 

@@ -1,4 +1,6 @@
 pub mod tls;
+use std::sync::Arc;
+
 use oss_server::config::{AppConfig, GroupTarget, SiteToml, TierTarget};
 use oss_server::db::Db;
 use oss_server::state::AppState;
@@ -37,6 +39,18 @@ pub async fn state_with_max_put(dir: &std::path::Path, max_put_bytes: usize) -> 
 #[allow(dead_code)]
 pub async fn state_in_maintenance(dir: &std::path::Path) -> AppState {
     state_with_targets_max(dir, None, vec![], 1024 * 1024, true).await
+}
+
+/// AP Slice A 测试用：注入可变的端点 registry（构造后、`build_router` 前设置，
+/// 测试可先播种账户再补行；避免并行用例改进程 env）。
+#[allow(dead_code)]
+pub async fn state_with_endpoint_source(
+    dir: &std::path::Path,
+    source: Arc<dyn xl_s3::ap::ApEndpointSource>,
+) -> AppState {
+    let mut st = state(dir).await;
+    st.ap_endpoints = source;
+    st
 }
 
 async fn state_with_targets(
@@ -80,6 +94,7 @@ async fn state_with_targets_max(
         stretch: None,
         tls: Default::default(),
         sts: Default::default(),
+        ap: Default::default(),
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();

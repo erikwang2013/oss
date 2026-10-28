@@ -46,6 +46,9 @@ pub struct AppState {
     pub olap_cache: Arc<xl_s3::olap::OlapCache>,
     /// M8 S1：AP ARN 的 region（取 `[site].region`，缺省 us-east-1）
     pub ap_region: String,
+    /// AP Slice A：来源 VPC 端点注册断言（`[ap.vpc_endpoints]` 静态装配；空 = 无行）。
+    /// 这是**注册断言**，不是密码学端点身份；查询失败在判定层按 500 fail-closed。
+    pub ap_endpoints: Arc<dyn xl_s3::ap::ApEndpointSource>,
     /// M8 S0/B10：所有删桶路径共用的 M8 清理（Db 清表 + AP 缓存失效）。
     pub bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
     /// M8 S4b：生命周期规则存储（S3 协议面 + console 共用）。
@@ -306,6 +309,14 @@ impl AppState {
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
         // S6d：模式与库内触发器/站点状态一致才放行。
         db.assert_mode_guards().await?;
+        // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
+        // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；
+        // 请求级账户绑定在两种模式下都 fail-closed。
+        if cfg.raft.is_none() {
+            validate_ap_endpoints(&db, &cfg.ap)
+                .await
+                .map_err(|e| format!("[ap] 配置校验失败：{e}"))?;
+        }
         let mut store_cfg = StoreConfig::new(&drives[0]);
         // M9 S1：sync 写提交门（必须在 Store::open 前注入——open 克隆配置）。
         let sync_metrics = Arc::new(crate::sync::SyncMetrics::default());
@@ -823,6 +834,17 @@ impl AppState {
         // M8 S2：变换器预加载（须在 AP 之后——缓存条目要按 AP 查桶名做级联失效）
         crate::access_points_api::preload_olap(&db, &ap_cache, &olap_cache).await;
         let ap_region = site.region.clone();
+        // AP Slice A：静态端点 registry（格式/唯一性在 AppConfig::load 已校验；
+        // 账户存在性由 AppState::load 在 DB 就绪后校验）。
+        let ap_endpoints: Arc<dyn xl_s3::ap::ApEndpointSource> =
+            Arc::new(xl_s3::ap::StaticApEndpointSource::new(
+                cfg.ap.vpc_endpoints.iter().map(|e| xl_s3::ap::ApEndpoint {
+                    vpce_id: e.vpce_id.clone(),
+                    vpc_id: e.vpc_id.clone(),
+                    account_id: e.account_id.clone(),
+                    state: e.state.clone(),
+                }),
+            ));
         // except 只有 `/login`：console 路由经 nest 时 axum 的 StripPrefix 会先把
         // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
         // （`/aetherupload/display/login` 之类整段不匹配），照常校验。
@@ -997,6 +1019,7 @@ impl AppState {
             ap_cache,
             olap_cache,
             ap_region,
+            ap_endpoints,
             bucket_cleanup,
             lifecycle,
             tiers,
@@ -1010,6 +1033,36 @@ impl AppState {
             vault_probe,
         }
     }
+}
+
+/// AP Slice A 启动校验：`[ap.vpc_endpoints]` 的 account_id 必须存在且 active。
+/// 格式/唯一性/state 已由 [`AppConfig::load`](crate::config::AppConfig::load) 同步校验；
+/// 这里只补 DB 事实，查询失败/查无/停用都拒绝启动（fail-closed）。
+pub async fn validate_ap_endpoints(db: &Db, ap: &crate::config::ApToml) -> Result<(), String> {
+    for e in &ap.vpc_endpoints {
+        match db.get_account(&e.account_id).await {
+            Ok(Some(a)) if a.status == "active" => {}
+            Ok(Some(a)) => {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] {} 的 account_id {} 状态为 {}（须 active）",
+                    e.vpce_id, e.account_id, a.status
+                ));
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] {} 的 account_id {} 不存在",
+                    e.vpce_id, e.account_id
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "[[ap.vpc_endpoints]] {} 查询账户失败: {err}",
+                    e.vpce_id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// M9 S4（P1-7）：`[stretch]` 只允许全新部署——首次启用要求库内无桶/无 sync 桶、

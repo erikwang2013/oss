@@ -9,6 +9,8 @@
 //! （账户根 ARN 解析为账户成员集合），不改资源 ARN 归属。
 //! `aws:SourceVpc`/`aws:SourceVpce` 是**显式配置的来源证明**（静态 `OSS_AP_VPC_ID` /
 //! `OSS_AP_VPCE_ID` 或可信反代头），不是 PrivateLink/ENI 端点身份，两者互不推断。
+//! Slice A 的端点 registry（`[[ap.vpc_endpoints]]`）同样是**注册断言**：只把可信来源的
+//! vpce 声明收紧为「已登记、active、受账户约束」，不能证明连接真的来自该端点。
 //! AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是 non-goal。
 //!
 //! 明确不支持（non-goals）：真 VPC 端点（PrivateLink/ENI）、经 AP 的桶级 Create/Delete/
@@ -329,6 +331,17 @@ impl ApPolicy {
         Ok(())
     }
 
+    /// 策略是否引用 `aws:SourceVpce`：端点归属账户（R4）只在引用时强制，避免影响
+    /// 不关心端点的 AP。
+    pub fn references_source_vpce(&self) -> bool {
+        self.statement.iter().any(|st| {
+            st.condition
+                .as_ref()
+                .and_then(|c| c.string_equals.as_ref())
+                .is_some_and(|e| e.source_vpce.is_some())
+        })
+    }
+
     /// 单动作判定（与桶策略同语义：显式 Deny 优先；Allow 命中 true；无匹配 None）。
     /// IP 条件无法求值（缺可信对端）时：Deny **命中**（fail-closed），Allow 不命中。
     pub fn evaluate(&self, req: &ApEvalRequest<'_>, action: &str) -> Option<bool> {
@@ -476,6 +489,13 @@ pub fn parse_ap_policy(raw: &str) -> Result<ApPolicy, String> {
 impl AccessPoint {
     pub fn context(&self) -> ApContext {
         ApContext::new(&self.name, &self.region, &self.account)
+    }
+
+    /// 策略是否引用 `aws:SourceVpce`（决定端点归属账户是否参与授权）。
+    pub fn policy_references_source_vpce(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(ApPolicy::references_source_vpce)
     }
 
     /// 从 DB 行构造（策略 JSON 解析失败 → Err，调用方按 fail-closed 处理）。
@@ -802,6 +822,44 @@ pub struct ApVpc(pub String);
 #[derive(Debug, Clone)]
 pub struct ApVpce(pub String);
 
+/// 一个 VPC 端点注册行。Slice A 的 registry 是**注册断言**（配置声明的
+/// vpce → {vpc, account, state}），不是密码学端点身份：它不能证明连接真的来自该
+/// PrivateLink 端点，只把「代理声明」收紧为「已登记、受账户约束、可吊销」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApEndpoint {
+    pub vpce_id: String,
+    pub vpc_id: String,
+    pub account_id: String,
+    /// 仅 `active` 放行；其它值一律 fail-closed。
+    pub state: String,
+}
+
+/// 端点 registry 查询。`Err` = 查询失败（路由按 500 fail-closed，绝不当作「未登记」）。
+#[async_trait::async_trait]
+pub trait ApEndpointSource: Send + Sync {
+    async fn lookup(&self, vpce: &str) -> Result<Option<ApEndpoint>, String>;
+}
+
+/// Slice A 静态 registry（`[ap.vpc_endpoints]` 启动装配；测试注入同一实现）。
+pub struct StaticApEndpointSource {
+    rows: std::collections::HashMap<String, ApEndpoint>,
+}
+
+impl StaticApEndpointSource {
+    pub fn new(items: impl IntoIterator<Item = ApEndpoint>) -> Self {
+        Self {
+            rows: items.into_iter().map(|e| (e.vpce_id.clone(), e)).collect(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApEndpointSource for StaticApEndpointSource {
+    async fn lookup(&self, vpce: &str) -> Result<Option<ApEndpoint>, String> {
+        Ok(self.rows.get(vpce).cloned())
+    }
+}
+
 /// DeleteObjects 经 AP 的逐键策略上下文：键在请求体里，整体判定必然失真，
 /// 由 `service.rs::delete_objects` 在逐键循环里叠交集（被拒键绝不进入删除路径）。
 #[derive(Debug, Clone)]
@@ -818,6 +876,8 @@ pub struct ApDeletePolicy {
 pub struct ApRoute {
     cache: Arc<ApCache>,
     source: Arc<dyn ApSource>,
+    /// Slice A：VPC 端点注册断言（只收断言命中的 active 行；查询失败 500）。
+    endpoints: Arc<dyn ApEndpointSource>,
     acl: crate::access::Acl,
     /// M8 S2 变换器缓存（AP 名 → 编译产物）；miss = 不改写响应体。
     olap: Arc<crate::olap::OlapCache>,
@@ -835,6 +895,7 @@ impl ApRoute {
     pub fn new(
         cache: Arc<ApCache>,
         source: Arc<dyn ApSource>,
+        endpoints: Arc<dyn ApEndpointSource>,
         acl: crate::access::Acl,
         olap: Arc<crate::olap::OlapCache>,
         inner: Arc<s3s::service::S3Service>,
@@ -842,6 +903,7 @@ impl ApRoute {
         Self {
             cache,
             source,
+            endpoints,
             acl,
             olap,
             inner,
@@ -878,6 +940,48 @@ impl ApRoute {
             }
         }
     }
+}
+
+/// `ApVpce` 断言的 registry 门禁结果（R2–R4）。`None` = 无断言，行为不变。
+struct EndpointCheck {
+    vpce: String,
+    /// 命中的注册行（未登记时 None，仍要审计 vpce id）。
+    endpoint: Option<ApEndpoint>,
+    /// Some(reason) = 拒绝。
+    denial: Option<&'static str>,
+}
+
+/// R2：有 `ApVpce` 断言时 registry 必须有 active 行（查无/停用拒绝）；
+/// R3：同时有 `ApVpc` 断言时必须等于 registry.vpc_id（防两证明拼凑）；
+/// R4：策略引用 `aws:SourceVpce` 时 endpoint.account_id 必须等于 AP 桶账户；
+/// R5：registry 查询失败 → 500（不当作「未登记」放行）。
+async fn check_ap_endpoint(
+    endpoints: &dyn ApEndpointSource,
+    ap: &AccessPoint,
+    source_vpc: Option<&str>,
+    source_vpce: Option<&str>,
+) -> S3Result<Option<EndpointCheck>> {
+    let Some(vpce) = source_vpce else {
+        return Ok(None);
+    };
+    let endpoint = endpoints.lookup(vpce).await.map_err(|e| {
+        tracing::error!(error = %e, vpce, "AP 端点 registry 查询失败");
+        s3s::s3_error!(InternalError, "internal error")
+    })?;
+    let denial = match &endpoint {
+        None => Some("unregistered"),
+        Some(e) if e.state != "active" => Some("disabled"),
+        Some(e) if source_vpc.is_some_and(|v| v != e.vpc_id) => Some("vpc-mismatch"),
+        Some(e) if ap.policy_references_source_vpce() && e.account_id != ap.account => {
+            Some("account-mismatch")
+        }
+        Some(_) => None,
+    };
+    Ok(Some(EndpointCheck {
+        vpce: vpce.to_string(),
+        endpoint,
+        denial,
+    }))
 }
 
 fn parse_ap_path(uri: &http::Uri) -> S3Result<(String, String)> {
@@ -1406,6 +1510,14 @@ impl s3s::route::S3Route for ApRoute {
             vpc: source_vpc.as_deref(),
             vpce: source_vpce.as_deref(),
         };
+        // Slice A：端点注册断言门禁（请求级；DeleteObjects 逐键复评不再查 registry）。
+        let endpoint = check_ap_endpoint(
+            self.endpoints.as_ref(),
+            &ap,
+            source_vpc.as_deref(),
+            source_vpce.as_deref(),
+        )
+        .await?;
         // H1：s3s 把任意 multipart/form-data POST 无条件解析为 PostObject（键在表单里，
         // 先于 OIR/子资源路由），AP 不支持该 op。即使带 `?delete` 也仍执行 PostObject，
         // 因此这里必须整类拒绝，而不是按查询推导出的 DeleteObjects 放行。
@@ -1475,7 +1587,8 @@ impl s3s::route::S3Route for ApRoute {
                 None => ap_decision_anonymous(&ap, op, key, proof),
             }
         };
-        let allow = base_allow && ap_policy != Some(false);
+        let endpoint_ok = endpoint.as_ref().is_none_or(|c| c.denial.is_none());
+        let allow = base_allow && ap_policy != Some(false) && endpoint_ok;
         let mut parts: Vec<String> = Vec::new();
         if let Some(d) = base_detail {
             parts.push(d);
@@ -1484,6 +1597,15 @@ impl s3s::route::S3Route for ApRoute {
             parts.push(if v { "ap:allow" } else { "ap:deny" }.to_string());
         } else if op == "DeleteObjects" && ap.policy.is_some() {
             parts.push("ap:per-key".to_string());
+        }
+        if let Some(c) = &endpoint {
+            parts.push(match &c.endpoint {
+                Some(e) => format!("endpoint={}/account={}", c.vpce, e.account_id),
+                None => format!("endpoint={}", c.vpce),
+            });
+            if let Some(reason) = c.denial {
+                parts.push(format!("endpoint:deny:{reason}"));
+            }
         }
         let detail = (!parts.is_empty()).then(|| parts.join(";"));
         let audited = if let Some(u) = &user {
@@ -2183,6 +2305,11 @@ mod tests {
     }
 
     async fn ap_acl() -> crate::access::Acl {
+        ap_acl_pool().await.0
+    }
+
+    /// 同上，额外返回 pool（审计 detail 断言用）。
+    async fn ap_acl_pool() -> (crate::access::Acl, sqlx::SqlitePool) {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT, \
@@ -2218,7 +2345,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        crate::access::Acl::new(pool)
+        (crate::access::Acl::new(pool.clone()), pool)
     }
 
     struct DummyS3;
@@ -2256,6 +2383,7 @@ mod tests {
         let route = ApRoute::new(
             cache,
             Arc::new(NoSource),
+            Arc::new(StaticApEndpointSource::new([])),
             acl,
             Arc::new(crate::olap::OlapCache::new()),
             inner,
@@ -2305,6 +2433,297 @@ mod tests {
         ));
     }
 
+    /// 测试用可变 registry：按用例改行，并可选注入查询错误（R5）。
+    #[derive(Default)]
+    struct TestEndpoints {
+        rows: std::sync::Mutex<Vec<ApEndpoint>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl TestEndpoints {
+        fn replace(&self, rows: Vec<ApEndpoint>) {
+            *self.rows.lock().unwrap() = rows;
+        }
+        fn fail(&self, fail: bool) {
+            self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApEndpointSource for TestEndpoints {
+        async fn lookup(&self, vpce: &str) -> Result<Option<ApEndpoint>, String> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("registry down".into());
+            }
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.vpce_id == vpce)
+                .cloned())
+        }
+    }
+
+    fn endpoint(state: &str, vpc: &str, account: &str) -> ApEndpoint {
+        ApEndpoint {
+            vpce_id: "vpce-abc".into(),
+            vpc_id: vpc.into(),
+            account_id: account.into(),
+            state: state.into(),
+        }
+    }
+
+    fn vpce_route(
+        acl: crate::access::Acl,
+        ap: AccessPoint,
+        endpoints: Arc<dyn ApEndpointSource>,
+    ) -> ApRoute {
+        struct NoSource;
+        #[async_trait::async_trait]
+        impl ApSource for NoSource {
+            async fn lookup(&self, _n: &str) -> Result<Option<AccessPoint>, String> {
+                Ok(None)
+            }
+        }
+        let cache = Arc::new(ApCache::new());
+        cache.put(ap);
+        let inner = Arc::new(s3s::service::S3ServiceBuilder::new(DummyS3).build());
+        ApRoute::new(
+            cache,
+            Arc::new(NoSource),
+            endpoints,
+            acl,
+            Arc::new(crate::olap::OlapCache::new()),
+            inner,
+        )
+    }
+
+    fn vpce_req(
+        method: http::Method,
+        path: &str,
+        body: &str,
+        vpc: Option<&str>,
+        vpce: Option<&str>,
+    ) -> S3Request<s3s::Body> {
+        let mut r = S3Request {
+            input: s3s::Body::from(body.to_string()),
+            method,
+            uri: path.parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "AKIA_X".into(),
+                secret_key: "s".into(),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        r.extensions.insert(ApMatch(true));
+        if let Some(v) = vpc {
+            r.extensions.insert(ApVpc(v.into()));
+        }
+        if let Some(v) = vpce {
+            r.extensions.insert(ApVpce(v.into()));
+        }
+        r
+    }
+
+    async fn last_audit_detail(pool: &sqlx::SqlitePool) -> Option<String> {
+        sqlx::query_scalar("SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn vpce_ap(name: &str, policy: &str) -> AccessPoint {
+        AccessPoint {
+            name: name.into(),
+            bucket: "bkt".into(),
+            owner_id: 7,
+            account: crate::access::LEGACY_ACCOUNT.into(),
+            policy: Some(serde_json::from_str(policy).unwrap()),
+            region: "us-east-1".into(),
+        }
+    }
+
+    /// Slice A：registry 门禁 R1–R7。
+    /// 注意这是**注册断言**校验，不证明连接真来自该 PrivateLink 端点。
+    #[tokio::test]
+    async fn ap_endpoint_registry_gate_fails_closed() {
+        use s3s::S3ErrorCode as C;
+        use s3s::route::S3Route as _;
+        let (acl, pool) = ap_acl_pool().await;
+        let registry = Arc::new(TestEndpoints::default());
+        // 条件放行：策略引用 SourceVpce（R4 生效）。
+        let ap1 = vpce_ap(
+            "ap1",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+               "Action":["s3:GetObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::bkt/*",
+               "Condition":{"StringEquals":{"aws:SourceVpce":"vpce-abc"}}}]}"#,
+        );
+        let route = vpce_route(acl.clone(), ap1.clone(), registry.clone());
+        // 不引用 SourceVpce 的策略：归属账户不参与（R4 不强制）。
+        let plain_ap = vpce_ap(
+            "ap2",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+               "Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}"#,
+        );
+        let plain = vpce_route(acl, plain_ap, registry.clone());
+
+        // R2 正向：active + 账户匹配 → 放行；审计带 endpoint/account。
+        registry.replace(vec![endpoint("active", "vpc-1", "000000000000")]);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap1/k", "", None, Some("vpce-abc"));
+        route.check_access(&mut req).await.unwrap();
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint=vpce-abc/account=000000000000"),
+            "审计 detail 缺端点信息: {detail}"
+        );
+
+        // R2：字符串匹配但未登记 → 拒。
+        registry.replace(vec![]);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap1/k", "", None, Some("vpce-abc"));
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint:deny:unregistered"),
+            "未登记拒绝须可追溯: {detail}"
+        );
+
+        // R2：停用 → 拒。
+        registry.replace(vec![endpoint("disabled", "vpc-1", "000000000000")]);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap1/k", "", None, Some("vpce-abc"));
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+
+        // R3：双证明必须同 VPC（两证明拼凑拒绝）。
+        registry.replace(vec![endpoint("active", "vpc-1", "000000000000")]);
+        let mut req = vpce_req(
+            http::Method::GET,
+            "/ap/ap1/k",
+            "",
+            Some("vpc-2"),
+            Some("vpce-abc"),
+        );
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        // VPC 证明一致 → 放行。
+        let mut req = vpce_req(
+            http::Method::GET,
+            "/ap/ap1/k",
+            "",
+            Some("vpc-1"),
+            Some("vpce-abc"),
+        );
+        route.check_access(&mut req).await.unwrap();
+
+        // R4：策略引用 SourceVpce 时端点账户必须等于 AP 桶账户。
+        registry.replace(vec![endpoint("active", "vpc-1", "123456789012")]);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap1/k", "", None, Some("vpce-abc"));
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        // 策略不引用 SourceVpce：账户不参与（但 active + VPC 仍须成立）。
+        let mut req = vpce_req(http::Method::GET, "/ap/ap2/k", "", None, Some("vpce-abc"));
+        plain.check_access(&mut req).await.unwrap();
+        // R3 与策略无关：不引用 vpce 也拒 VPC 拼凑。
+        let mut req = vpce_req(
+            http::Method::GET,
+            "/ap/ap2/k",
+            "",
+            Some("vpc-2"),
+            Some("vpce-abc"),
+        );
+        assert_eq!(
+            plain.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        // R2 与策略无关：未登记仍拒。
+        registry.replace(vec![]);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap2/k", "", None, Some("vpce-abc"));
+        assert_eq!(
+            plain.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+
+        // R5：查询失败 → 500，不当作「无端点」放行。
+        registry.replace(vec![endpoint("active", "vpc-1", "000000000000")]);
+        registry.fail(true);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap1/k", "", None, Some("vpce-abc"));
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::InternalError
+        );
+        registry.fail(false);
+
+        // R6：无断言 → 行为不变（不查 registry，即使 registry 报错）。
+        registry.fail(true);
+        let mut req = vpce_req(http::Method::GET, "/ap/ap2/k", "", None, None);
+        plain.check_access(&mut req).await.unwrap();
+        registry.fail(false);
+
+        // R7：DeleteObjects 请求级门禁；通过后携带证明供逐键复评（不再查 registry）。
+        registry.replace(vec![endpoint("disabled", "vpc-1", "000000000000")]);
+        let mut req = vpce_req(
+            http::Method::POST,
+            "/ap/ap1/?delete",
+            "<Delete><Object><Key>k</Key></Object></Delete>",
+            None,
+            Some("vpce-abc"),
+        );
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        assert!(req.extensions.get::<ApDeletePolicy>().is_none());
+        registry.replace(vec![endpoint("active", "vpc-1", "000000000000")]);
+        let mut req = vpce_req(
+            http::Method::POST,
+            "/ap/ap1/?delete",
+            "<Delete><Object><Key>k</Key></Object></Delete>",
+            None,
+            Some("vpce-abc"),
+        );
+        route.check_access(&mut req).await.unwrap();
+        let p = req.extensions.get::<ApDeletePolicy>().unwrap();
+        assert_eq!(p.source_vpce.as_deref(), Some("vpce-abc"));
+        // 逐键复评只读请求级证明，不再查 registry（R7）。
+        registry.fail(true);
+        let user = crate::access::AuthedUser {
+            uid: 7,
+            ak: "AKIA_X".into(),
+            is_admin: false,
+        };
+        assert_eq!(
+            ap_decision(
+                &p.ap,
+                &user,
+                ApAccount {
+                    id: Some("000000000007"),
+                    active: true
+                },
+                "DeleteObjects",
+                Some("k"),
+                ApSourceProof {
+                    ip: None,
+                    vpc: p.source_vpc.as_deref(),
+                    vpce: p.source_vpce.as_deref()
+                },
+            ),
+            Some(true)
+        );
+    }
+
     /// H1：AP 授权 op 必须等于内层执行 op（legal-hold/retention/x-id/multipart POST）。
     #[tokio::test]
     async fn ap_route_rejects_op_mismatch_and_checks_legal_hold_action() {
@@ -2343,6 +2762,7 @@ mod tests {
         let route = ApRoute::new(
             cache,
             Arc::new(NoSource),
+            Arc::new(StaticApEndpointSource::new([])),
             acl,
             Arc::new(crate::olap::OlapCache::new()),
             inner,

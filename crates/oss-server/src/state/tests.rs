@@ -176,3 +176,39 @@ mod stretch_startup_tests {
         assert!(e.contains("target_kind='site'"), "{e}");
     }
 }
+
+mod ap_endpoint_registry_tests {
+    use super::*;
+    use crate::config::{ApToml, ApVpcEndpointToml};
+
+    fn ap_toml(account_id: &str) -> ApToml {
+        ApToml {
+            vpc_endpoints: vec![ApVpcEndpointToml {
+                vpce_id: "vpce-abc".into(),
+                vpc_id: "vpc-abc".into(),
+                account_id: account_id.into(),
+                state: "active".into(),
+            }],
+        }
+    }
+
+    /// 启动校验：账户存在且 active 才放行；查无/停用失败；空表零改动。
+    #[tokio::test]
+    async fn validates_account_exists_and_active() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        let id = db.create_account("acct", None).await.unwrap();
+        validate_ap_endpoints(&db, &ap_toml(&id)).await.unwrap();
+        validate_ap_endpoints(&db, &ApToml::default())
+            .await
+            .unwrap();
+
+        let e = validate_ap_endpoints(&db, &ap_toml("999999999999"))
+            .await
+            .unwrap_err();
+        assert!(e.contains("不存在"), "{e}");
+
+        db.set_account_status(&id, "disabled").await.unwrap();
+        let e = validate_ap_endpoints(&db, &ap_toml(&id)).await.unwrap_err();
+        assert!(e.contains("disabled"), "{e}");
+    }
+}

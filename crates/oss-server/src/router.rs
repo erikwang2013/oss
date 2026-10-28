@@ -102,12 +102,14 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
             .with_vault(state.vault.clone())
             .with_web_identity(web_identity),
     );
+    // AP Slice A：静态端点 registry（`[ap.vpc_endpoints]`；空表 = 无断言可放行）。
     let ap = xl_s3::ap::ApRoute::new(
         Arc::clone(&state.ap_cache),
         Arc::new(crate::access_points_api::DbApSource {
             db: Arc::clone(&state.db),
             region: state.ap_region.clone(),
         }),
+        Arc::clone(&state.ap_endpoints),
         acl,
         Arc::clone(&state.olap_cache),
         inner,

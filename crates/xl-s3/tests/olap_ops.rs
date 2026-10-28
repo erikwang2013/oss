@@ -215,6 +215,7 @@ async fn test_env() -> TestEnv {
     let ap_route = Arc::new(ApRoute::new(
         Arc::clone(&ap_cache),
         Arc::new(NoSource),
+        Arc::new(xl_s3::ap::StaticApEndpointSource::new([])),
         acl,
         Arc::clone(&olap),
         inner,
