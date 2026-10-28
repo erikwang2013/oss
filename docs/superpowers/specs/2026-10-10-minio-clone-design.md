@@ -511,9 +511,10 @@ delete marker / 回滚 / 点名版本读删）· 生命周期到期自动删（`
 heal / scrub 独立命令 · rebalance 追加式扩容（C4 同盘 hardlink 快路径）· 多 set 横向扩容
 （桶钉 set；C2 控制台 sets 视图；C3 建桶缺省自动指派最闲 set）· 登录限速（C1）· 审计保留
 清理（C5）——均已落地；验收 ①–④ e2e 实证。分层/转换归 M8，控制面强一致归 M9。
-**M4 规格缺口（2026-10-19 更新）**：对象标签与 CopyObject 两轴 `REPLACE` 已随 M8 前置补齐
-（功能规格 §3.5 / §3.7）；剩余缺口：控制台桶策略编辑与审计查询 UI 未做（后端 API 完整）、
-MPU 标签（Create 记录、Complete 落地）与控制台对象标签编辑已落地（2026-10-20，M8 缺口 7a）。
+**M4 规格缺口（2026-10-19 更新，2026-10-28 复核）**：对象标签与 CopyObject 两轴 `REPLACE`
+已随 M8 前置补齐（功能规格 §3.5 / §3.7）；控制台桶策略编辑与审计查询 UI 已落地
+（`web/src/pages/BucketPolicy.tsx`、`Audit.tsx`）；MPU 标签（Create 记录、Complete 落地）
+与控制台对象标签编辑已落地（2026-10-20，M8 缺口 7a）。
 
 ### M5 安全与锁定（2-3 周）
 
@@ -526,14 +527,15 @@ MPU 标签（Create 记录、Complete 落地）与控制台对象标签编辑已
 4. STS：AssumeRole 拿到临时凭据，`aws-cli` 用它能访问；过期后拒绝；会话策略与用户策略取交集生效
 5. SSE-KMS 换主密钥后旧对象仍可读（DEK 未变）
 
-**M5 落地状态（2026-10-17）**：切片 0 集群行一致性广播 · 切片 1 密钥库（`KeyProvider` trait +
+**M5 落地状态（2026-10-17；切片 7 于 v1.16.0 补记）**：切片 0 集群行一致性广播 · 切片 1 密钥库（`KeyProvider` trait +
 单钥文件 + 多钥 KMS 目录，验收 ⑤）· 切片 2 加密数据面（先加密后 EC、DARE 式块对齐
 AES-256-GCM，验收 ①②数据面侧）· 切片 3 S3 面 SSE 三模式全链 · 切片 4 对象锁（桶级默认保留 +
 对象级 GOVERNANCE/COMPLIANCE/Legal Hold + 删除守卫，验收 ③）· 切片 5 STS（AssumeRole /
 GetSessionToken + 会话策略交集；**AssumeRole 限管理员**——无角色信任策略的最小模型防提权，
-验收 ④）· 切片 6 SK 信封加密存（console 建键 / STS 签发 / 读侧迁移三写点全 vault-aware）——
-**已落地**。**AssumeRoleWithWebIdentity 经成本评估裁剪延后**（JWKS 拉取需出站 TLS 客户端依赖栈；
-验收不涉；接入点已留）——用户知悉项，见 M5 计划。e2e：`tests/e2e_s3.sh` §18（SSE 三模式 +
+验收 ④）· 切片 6 SK 信封加密存（console 建键 / STS 签发 / 读侧迁移三写点全 vault-aware）·
+切片 7 `AssumeRoleWithWebIdentity`（`crates/xl-s3/src/sts_web_identity.rs`：本地 JWKS 文件、
+RS256/ES256 白名单、精确 RoleArn/claim 映射；`[sts.web_identity]` 默认关闭；v1.16.0 落地，
+见功能规格版本补充）——**M5 切片 0–7 全部交付**。e2e：`tests/e2e_s3.sh` §18（SSE 三模式 +
 盘上明文 grep + 对象锁全矩阵 + STS + SK 落库密文）与 `e2e_m3_cluster.sh` §0c（桶行广播接线）。
 实施记录见 `plans/2026-10-16-m5-security-lock.md`。
 
@@ -620,16 +622,20 @@ S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 T
   router 层中间件把 POST `?restore` 的 200 改写为 202；错误状态与其它请求原样透传。
 - AP 支持 `/ap/<name>/<key>` 与 `<name>-s3alias`（路径首段/Host 首标签）；无 AP 的别名
   回落普通桶路由。支持匿名（AP 策略 `Principal:"*"` ∩ 桶策略匿名基线，数据面白名单）；
-  AP 无跨账号；来源条件支持 SourceIp（反代需 `OSS_AP_TRUSTED_PROXY=1`，可用
-  `..._HOPS` / `..._CIDRS` 描述信任链）与 SourceVpc（`OSS_AP_VPC_ID` 静态证明或可信反代
-  单条头，均为来源证明，不是 PrivateLink 端点身份）。AP 无策略 = 拒绝（AWS 对齐）。
+  AP 跨账户只经策略 Principal 的账户根（成员关系解析，2026-10-24 落地；无显式
+  owner_account 字段）；来源条件支持 SourceIp（反代需 `OSS_AP_TRUSTED_PROXY=1`，可用
+  `..._HOPS` / `..._CIDRS` 描述信任链）、SourceVpc（`OSS_AP_VPC_ID` 静态证明或可信反代
+  单条头）与 SourceVpce（显式部署证明）；两者都不是 PrivateLink 端点身份。
+  AP 无策略 = 拒绝（AWS 对齐）。
 - S6 补齐先前记档的 M4/M5/M6 控制台缺口页（审计过滤、通知死信、SSE/KMS 只读、Select 代理、
   IAM 预设、桶默认加密、对象标签编辑）+ M8 页面（访问点/作业/分层/清单）；未新增计划外
   后端能力。
 
-**仍不做（非目标）**：`AssumeRoleWithWebIdentity` · AP 跨账号/VPC 端点 · Batch 抢占/跨账号
-清单 · 完整多租户账户体系。
-**后续已补**：SSE-KMS 显式 CMK/命名环轮换（3.16）、Inventory 跨账户目标（3.7，仅管理员可
+**曾列非目标、后续已补**：`AssumeRoleWithWebIdentity`（v1.16.0）· AP 跨账户（账户根
+Principal 按成员关系解析）· Batch 抢占/跨账户清单 · 多租户账户体系 AC-0..AC-3（完整目标
+仍见 backlog §3）。**仍未交付**：AP 的真实 PrivateLink/VPC 端点身份（SourceVpce 只是部署
+证明）、硬字节/对象数配额、账户 canonicalization worker 与管理员 UI。
+**其余后续已补**：SSE-KMS 显式 CMK/命名环轮换（3.16）、Inventory 跨账户目标（3.7，仅管理员可
 配置，运行期复核源/目标账户）、Inventory 增量（3.6，节点本地水位）、AP SourceVpc 来源证明。
 （M9 同步强一致、AP 主机别名、Inventory Parquet/Hive、本地冷盘池 tier、tier GC 已于
 2026-10-23 前落地，见 README 与验收记录。）
@@ -661,7 +667,9 @@ S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 T
 - stretch+Raft 配对/加 witness 组合由 `M9_STRETCH=1 tests/e2e_m9.sh` 覆盖；
   B′/cutover/repair 见 `tests/e2e_m9_recovery.sh`；11 表并发 diff 见 `tests/e2e_m9.sh`；
   TLS 已于 2026-10-23 接线（README「TLS」节）；Level B 控制面滚动升级同时落地
-  （wire/feature 握手、`feature_level`、成员预检、runbook）；数据面仍非滚动。
+  （wire/feature 握手、`feature_level`、成员预检、runbook）；数据面 DP-0 握手（v1.17.0）、
+  DP-1 混版读矩阵（v1.19.0）与 DP-2 mesh 入站 TLS 热轮换（v1.20.0）已落地，
+  跨版本 MPU 完成仍缺（见 backlog §2）。
 - 规格收窄（③ 2×6）：stretch 不是「sync 支持跨站 EC」；两者互斥。stretch 固定 2 数据
   站点 ×6 盘、EC 8+4、placement v2、inline=0，`Q_s=9`，单站点 6 槽不足，**不承诺站点
   容灾**；禁用 M7 异步站点复制、拒绝 sync 桶、仅允许全新空库。sync 桶要求
