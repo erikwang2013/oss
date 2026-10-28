@@ -300,6 +300,77 @@ async fn attach_member_on_lagging_follower_waits_for_catch_up() {
         .unwrap();
     assert_eq!(missing.status(), 404);
 
+    // §14.3 同类残余：leader 已提交 用户创建 + 成员挂载、follower 本地仍滞后时，
+    // 停用该成员不能凭本地 member/user miss 误 404；追赶后按最新行判定并转发成功。
+    let mut lock = b_db.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    assert_eq!(
+        a.handle
+            .write(ControlCommand::UserCreate {
+                username: "erin".into(),
+                password_hash: oss_server::db::hash_password("erin-password"),
+                status: "active".into(),
+                created_at: 12,
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        a.handle
+            .write(ControlCommand::AccountMemberAttach {
+                account_id: ACC.into(),
+                username: "erin".into(),
+                role: "member".into(),
+                created_at: 13,
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    let erin_uid = admin_uid + 2;
+    assert!(b_db.get_user(erin_uid).await.unwrap().is_none());
+    assert!(b_db.member_role(ACC, erin_uid).await.unwrap().is_none());
+
+    let req = {
+        let http = http.clone();
+        let url = format!("{base}/api/v1/accounts/{ACC}/members/{erin_uid}/status");
+        let tok = token(admin_uid);
+        tokio::spawn(async move {
+            http.put(url)
+                .bearer_auth(tok)
+                .json(&serde_json::json!({ "active": false }))
+                .send()
+                .await
+        })
+    };
+    // 旧代码此刻已凭本地 miss 返回 404；放行 apply 后应追赶成功。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+    drop(lock);
+    let resp = req.await.unwrap().unwrap();
+    assert_eq!(resp.status(), 204, "滞后 follower 的成员停用必须追上后成功");
+    assert_eq!(
+        b_db.get_user(erin_uid).await.unwrap().map(|u| u.2),
+        Some(false),
+        "停用已按 leader 命令 apply 到 follower"
+    );
+
+    // 真正不存在的 uid 停用仍 404。
+    let missing_status = http
+        .put(format!(
+            "{base}/api/v1/accounts/{ACC}/members/999999/status"
+        ))
+        .bearer_auth(token(admin_uid))
+        .json(&serde_json::json!({ "active": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_status.status(), 404);
+
     b.shutdown().await;
     a.shutdown().await;
 }

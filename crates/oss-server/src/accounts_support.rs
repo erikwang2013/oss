@@ -101,6 +101,51 @@ pub(crate) async fn attachable_username(state: &AppState, uid: i64) -> Result<St
     Err(StatusCode::NOT_FOUND.into_response())
 }
 
+/// set_member_status 的目标解析：(role, username, is_admin)。
+/// 与 [`attachable_username`] 同理，Raft 下本地副本可能落后：本地 member/user 任一
+/// miss 时等本地 apply 追上 leader 已应用点后重查一次；standalone 不等待，行为不变。
+/// 两次都缺 → 404；权限判定必须用这里返回的（已追赶的）行。
+#[allow(clippy::result_large_err)]
+pub(crate) async fn member_status_target(
+    state: &AppState,
+    account_id: &str,
+    uid: i64,
+) -> Result<(String, String, bool), Response> {
+    let mut local = local_member_status(state, account_id, uid).await?;
+    if (local.0.is_none() || local.1.is_none())
+        && state.control.is_raft()
+        && state.control.wait_caught_up(USER_LOOKUP_CATCH_UP).await
+    {
+        local = local_member_status(state, account_id, uid).await?;
+    }
+    match local {
+        (Some(role), Some((username, is_admin))) => Ok((role, username, is_admin)),
+        _ => Err(StatusCode::NOT_FOUND.into_response()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn local_member_status(
+    state: &AppState,
+    account_id: &str,
+    uid: i64,
+) -> Result<(Option<String>, Option<(String, bool)>), Response> {
+    let role = state.db.member_role(account_id, uid).await.map_err(|e| {
+        tracing::error!(error = %e, "查询账户成员失败");
+        internal_error()
+    })?;
+    let user = state
+        .db
+        .get_user(uid)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "查询用户失败");
+            internal_error()
+        })?
+        .map(|(username, is_admin, _)| (username, is_admin));
+    Ok((role, user))
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) fn valid_name(name: &str) -> Result<&str, Response> {
     let name = name.trim();

@@ -16,8 +16,8 @@ use jwt_rust::JwtPayload;
 use serde::Deserialize;
 
 use crate::accounts_support::{
-    attachable_username, bad, new_account_id, require_active_account, require_manager,
-    require_member, valid_name,
+    attachable_username, bad, member_status_target, new_account_id, require_active_account,
+    require_manager, require_member, valid_name,
 };
 use crate::accounts_usage::account_usage;
 use crate::console::{
@@ -454,21 +454,10 @@ async fn set_member_status(
     if let Err(r) = require_manager(&state, uid, is_admin, &id).await {
         return r;
     }
-    let role = match state.db.member_role(&id, target).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "查询账户成员失败");
-            return internal_error();
-        }
-    };
-    let (username, target_is_admin, _) = match state.db.get_user(target).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "查询用户失败");
-            return internal_error();
-        }
+    // Raft 下本地副本可能落后（leader 已提交的用户/挂载）：本地 miss 先追赶重查一次。
+    let (role, username, target_is_admin) = match member_status_target(&state, &id, target).await {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     // 账户管理员不能碰全局管理员、同级 manager 或自己（防账户内互锁/越权）。
     if !is_admin && (target == uid || target_is_admin || role != "member") {
