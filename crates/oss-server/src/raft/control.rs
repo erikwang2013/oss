@@ -196,6 +196,8 @@ pub enum ControlError {
     },
     /// 客户端输入非法（如未注册的 `Ext.type_id`）：400，不 append、不可重试。
     Invalid(String),
+    /// 账户桶数硬配额已满（leader append 前拒绝）：403，不 append、不重试。
+    QuotaExceeded,
     Internal(String),
 }
 
@@ -205,6 +207,7 @@ impl ControlError {
             Self::TooLarge { .. } => 413,
             Self::Timeout(_) | Self::Unavailable(_) | Self::NotLeader { .. } => 503,
             Self::Invalid(_) => 400,
+            Self::QuotaExceeded => 403,
             Self::Internal(_) => 500,
         }
     }
@@ -234,6 +237,7 @@ impl std::fmt::Display for ControlError {
                 "not leader (leader={leader:?}, endpoint={endpoint:?}); retry on the leader"
             ),
             Self::Invalid(m) => write!(f, "invalid control command: {m}"),
+            Self::QuotaExceeded => write!(f, "account bucket quota exceeded"),
             Self::Internal(m) => write!(f, "control apply failed: {m}"),
         }
     }
@@ -337,7 +341,20 @@ impl ControlPlane {
             // S6b-d 路由闸：Local 仅供测试/兼容；HTTP handler 不得把 M7
             // 桶生命周期接进来（review I1）。
             Inner::Local(db) => {
-                let mut tx = db.pool().begin().await.map_err(internal)?;
+                // AC-2：BucketCreate 的配额 count+insert 必须原子——先取写锁再读计数，
+                // 并发 Local 写只有一个能越过（Raft 路径的闸在 leader append 前）。
+                let mut tx = db
+                    .pool()
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .map_err(internal)?;
+                if let ControlCommand::BucketCreate { name, owner, .. } = &cmd
+                    && Db::bucket_create_quota_reached_conn(&mut tx, name, owner.as_deref())
+                        .await
+                        .map_err(internal)?
+                {
+                    return Err(ControlError::QuotaExceeded);
+                }
                 let applied = {
                     let mut cw = apply::control_tx(&mut tx);
                     apply::apply_command(&mut cw, &cmd)
@@ -429,6 +446,7 @@ impl ControlPlane {
                             "Ext type_id {type_id:?} is not registered; nothing was appended"
                         )));
                     }
+                    Err(WriteError::QuotaExceeded) => return Err(ControlError::QuotaExceeded),
                     Err(WriteError::Raft(msg)) => return Err(ControlError::Unavailable(msg)),
                 };
                 if response == ControlResponse::Ok {
@@ -472,6 +490,7 @@ fn sink_result(
             tracing::warn!(error = %m, "control write rejected");
             Err(E::Invalid)
         }
+        Err(ControlError::QuotaExceeded) => Err(E::QuotaExceeded),
         Err(ControlError::Internal(m)) => {
             tracing::error!(error = %m, "control write failed");
             Err(E::Internal)
@@ -626,6 +645,7 @@ mod tests {
         assert_eq!(ControlError::Timeout("t".into()).http_status(), 503);
         assert_eq!(ControlError::Unavailable("u".into()).http_status(), 503);
         assert_eq!(ControlError::Invalid("i".into()).http_status(), 400);
+        assert_eq!(ControlError::QuotaExceeded.http_status(), 403);
         assert_eq!(ControlError::Internal("i".into()).http_status(), 500);
 
         // M8-0：NotLeader 是 503 且带成员表 endpoint + leader id 提示。
@@ -670,6 +690,10 @@ mod tests {
         assert_eq!(
             sink_result(Err(ControlError::Internal("x".into()))),
             Err(E::Internal)
+        );
+        assert_eq!(
+            sink_result(Err(ControlError::QuotaExceeded)),
+            Err(E::QuotaExceeded)
         );
         // M8-0：S3 控制写拿到 leader endpoint 提示（leader id 不跨 crate 传递）。
         assert_eq!(

@@ -28,6 +28,8 @@ pub enum BucketControlError {
     NotFound,
     /// 业务冲突（建桶模式冲突/已存在竞态）。
     Conflict,
+    /// 账户桶数硬配额已满（建桶 append 前拒绝；S3 映射 `TooManyBuckets`）。
+    QuotaExceeded,
     /// 桶非空（删除前置拒绝）。
     NotEmpty,
     Invalid,

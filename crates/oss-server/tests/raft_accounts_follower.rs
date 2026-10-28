@@ -13,7 +13,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use oss_server::db::Db;
 use oss_server::raft::control::ControlPlane;
-use oss_server::raft::{ControlCommand, ControlResponse};
+use oss_server::raft::{ControlCommand, ControlResponse, RPC_TOKEN_HEADER};
 
 const ACC: &str = "000000000001";
 
@@ -373,6 +373,230 @@ async fn attach_member_on_lagging_follower_waits_for_catch_up() {
 
     b.shutdown().await;
     a.shutdown().await;
+}
+
+fn bucket_create(name: &str) -> ControlCommand {
+    ControlCommand::BucketCreate {
+        name: name.into(),
+        owner: Some("alice".into()),
+        created_at: 100,
+        replication_mode: "async".into(),
+        versioning: "Off".into(),
+        object_lock: false,
+        object_lock_default_mode: None,
+        object_lock_default_days: None,
+        default_encryption: None,
+    }
+}
+
+/// 2-voter 集群：node 1 leader、node 2 follower（均带真实控制库）。
+async fn two_node_quota_cluster(
+    dir: &std::path::Path,
+) -> (
+    common::raft_harness::TestNode,
+    common::raft_harness::TestNode,
+) {
+    let a_db = connect_raft(dir, "quota-a").await;
+    let mut sa = common::raft_harness::settings(dir, 1, true);
+    sa.feature_level = 3;
+    let a = common::raft_harness::spawn_node_with_pool(sa, Some(a_db.pool().clone())).await;
+    common::raft_harness::wait_leader(&a.handle).await;
+
+    let b_db = connect_raft(dir, "quota-b").await;
+    let mut sb = common::raft_harness::settings(dir, 2, false);
+    sb.feature_level = 3;
+    let b = common::raft_harness::spawn_node_with_pool(sb, Some(b_db.pool().clone())).await;
+    oss_server::raft::membership::promote_voter(&a.handle, 2, b.base.clone())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while b.handle.raft().metrics().borrow().current_leader != Some(1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader 1 not observed on follower"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (a, b)
+}
+
+async fn seed_quota_account(a: &common::raft_harness::TestNode, quota: i64) {
+    for cmd in [
+        ControlCommand::AccountCreate {
+            id: ACC.into(),
+            name: "acme".into(),
+            bucket_quota: Some(quota),
+            created_at: 10,
+        },
+        ControlCommand::UserCreate {
+            username: "alice".into(),
+            password_hash: oss_server::db::hash_password("alice-password"),
+            status: "active".into(),
+            created_at: 11,
+        },
+        ControlCommand::AccountMemberAttach {
+            account_id: ACC.into(),
+            username: "alice".into(),
+            role: "member".into(),
+            created_at: 12,
+        },
+    ] {
+        assert_eq!(
+            a.handle.write(cmd).await.unwrap(),
+            ControlResponse::Ok,
+            "seed command"
+        );
+    }
+}
+
+async fn wait_bucket_count(pool: &sqlx::SqlitePool, want: i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        if got == want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bucket count {got} != {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn post_write(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    cmd: ControlCommand,
+) -> (u16, serde_json::Value) {
+    let resp = http
+        .post(format!("{base}/api/v1/site/raft/write"))
+        .header(RPC_TOKEN_HEADER, token)
+        .json(&cmd)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap())
+}
+
+/// 绕过复制守卫改 follower 本地副本（模拟混版窗口里落后的本地配额列）。
+async fn set_follower_quota(pool: &sqlx::SqlitePool, quota: Option<i64>) {
+    sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE accounts SET bucket_quota = ? WHERE id = ?")
+        .bind(quota)
+        .bind(ACC)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// AC-2 修订：经 follower `/site/raft/write` 转发的并发建桶由 **leader** 在 append 前
+/// 串行判定——quota=N 时 N+1 个恰好 N 成功、1×403；两端桶表一致，无第 N+1 个桶。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_forwarded_bucket_creates_stop_at_leader_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = two_node_quota_cluster(dir.path()).await;
+    seed_quota_account(&a, 2).await;
+    let idx = a.handle.applied_index();
+    assert!(
+        b.handle.wait_applied(idx, Duration::from_secs(10)).await,
+        "follower 追上账户播种"
+    );
+
+    let http = reqwest::Client::new();
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let http = http.clone();
+        let b_base = b.base.clone();
+        let token = b.token.clone();
+        tasks.push(tokio::spawn(async move {
+            post_write(&http, &b_base, &token, bucket_create(&format!("f-{i}"))).await
+        }));
+    }
+    let (mut ok, mut quota) = (0, 0);
+    for t in tasks {
+        match t.await.unwrap() {
+            (200, body) => {
+                assert_eq!(body["response"], "Ok");
+                ok += 1;
+            }
+            (403, body) => {
+                assert_eq!(body["error"], "quota_exceeded");
+                quota += 1;
+            }
+            other => panic!("unexpected write response: {other:?}"),
+        }
+    }
+    assert_eq!((ok, quota), (2, 1), "N+1 并发恰好 N 成功、1 拒绝");
+
+    let a_pool = a.pool.as_ref().unwrap();
+    let b_pool = b.pool.as_ref().unwrap();
+    wait_bucket_count(a_pool, 2).await;
+    wait_bucket_count(b_pool, 2).await;
+    let names = |pool: &sqlx::SqlitePool| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT name FROM buckets ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        names(a_pool).await,
+        names(b_pool).await,
+        "两端状态机桶表必须一致"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// 混版回归：follower 只转发、不用本地副本判配额。follower 本地配额分别改成
+/// 0（会误拒）与 NULL（会误放），都以 leader 的判定为准；apply 不做配额，桶表不分叉。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_stale_local_quota_does_not_decide() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = two_node_quota_cluster(dir.path()).await;
+    seed_quota_account(&a, 1).await;
+    let idx = a.handle.applied_index();
+    assert!(
+        b.handle.wait_applied(idx, Duration::from_secs(10)).await,
+        "follower 追上账户播种"
+    );
+    let a_pool = a.pool.as_ref().unwrap();
+    let b_pool = b.pool.as_ref().unwrap();
+    let http = reqwest::Client::new();
+
+    // follower 本地配额 0（陈旧/落后）→ 若本地判定会 403；leader 有额度，应放行。
+    set_follower_quota(b_pool, Some(0)).await;
+    let (status, body) = post_write(&http, &b.base, &b.token, bucket_create("stale-allow")).await;
+    assert_eq!(status, 200, "leader 有额度必须放行：{body}");
+    wait_bucket_count(a_pool, 1).await;
+    wait_bucket_count(b_pool, 1).await;
+
+    // follower 本地不限（与 leader 的 quota=1 相反）→ 若本地判定会误放；leader 已满应 403。
+    set_follower_quota(b_pool, None).await;
+    let (status, body) = post_write(&http, &b.base, &b.token, bucket_create("stale-deny")).await;
+    assert_eq!(status, 403, "leader 配额已满必须拒绝：{body}");
+    assert_eq!(body["error"], "quota_exceeded");
+    wait_bucket_count(a_pool, 1).await;
+    wait_bucket_count(b_pool, 1).await;
+
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 async fn serve(app: axum::Router) -> String {

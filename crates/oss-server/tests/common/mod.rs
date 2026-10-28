@@ -85,6 +85,33 @@ async fn state_with_targets_max(
     max_put_bytes: usize,
     maintenance: bool,
 ) -> AppState {
+    state_with_db_url(
+        dir,
+        site,
+        tiers,
+        max_put_bytes,
+        maintenance,
+        "sqlite::memory:".into(),
+    )
+    .await
+}
+
+/// AC-2 并发建桶用例：真实文件库（WAL + busy_timeout）。内存 shared-cache 库在并发
+/// `BEGIN IMMEDIATE` 下以 `SQLITE_LOCKED` 立即失败，不能用来验证写锁排队语义。
+#[allow(dead_code)]
+pub async fn state_with_file_db(dir: &std::path::Path) -> AppState {
+    let url = format!("sqlite://{}?mode=rwc", dir.join("control.db").display());
+    state_with_db_url(dir, None, vec![], 1024 * 1024, false, url).await
+}
+
+async fn state_with_db_url(
+    dir: &std::path::Path,
+    site: Option<SiteToml>,
+    tiers: Vec<TierTarget>,
+    max_put_bytes: usize,
+    maintenance: bool,
+    database_url: String,
+) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
@@ -92,7 +119,7 @@ async fn state_with_targets_max(
         ec: Default::default(),
         maintenance,
         staging_dir: dir.join("staging"),
-        database_url: "sqlite::memory:".into(),
+        database_url,
         jwt_secret: JWT_SECRET.into(),
         max_put_bytes,
         groups: vec![GroupTarget {

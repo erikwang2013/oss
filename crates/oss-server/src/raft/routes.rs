@@ -375,6 +375,15 @@ async fn write(
             (Some(_), Some(endpoint)) => not_leader_409(leader, Some(endpoint)),
             _ => no_leader("control plane has no quorum"),
         },
+        // 403 让 follower 的 forward_write 原样转成 WriteError::QuotaExceeded。
+        Err(WriteError::QuotaExceeded) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "quota_exceeded",
+                "hint": "account bucket quota exceeded; nothing was appended",
+            })),
+        )
+            .into_response(),
         Err(WriteError::Raft(e)) => {
             (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
         }

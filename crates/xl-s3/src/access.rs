@@ -32,6 +32,20 @@ fn missing_accounts_table(e: &sqlx::Error) -> bool {
     })
 }
 
+/// 账户桶数计数 SQL（与 oss-server `Db::account_buckets_from` 同口径）：桶主**当前**
+/// 账户（成员行优先，无行 = uid 派生账户）；管理员桶不计入任何用户账户。
+const ACCOUNT_BUCKET_COUNT_SQL: &str = "SELECT COUNT(*) FROM buckets b \
+     JOIN users u ON u.id = b.owner_id \
+     LEFT JOIN account_members bm ON bm.uid = u.id \
+     WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = ?";
+
+/// 建桶行写入结果：配额最终判定（写事务内 count+insert）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketRecordOutcome {
+    Written,
+    QuotaExceeded,
+}
+
 /// 已认证用户身份：`check` 里解析 AK 后塞进请求扩展（s3s 官方机制
 /// `S3AccessContext::extensions_mut`），后续 handler 用 `req.extensions.get::<AuthedUser>()` 读取。
 /// 带 `ak`：handler 级逐键策略复评（DeleteObjects）需要与 check 同源的 Principal 匹配输入；
@@ -829,8 +843,8 @@ impl Acl {
 
     /// AC-2：账户桶数硬配额（`accounts.bucket_quota`；NULL/负 = 不限）。
     /// 返回 true = 已到上限，拒绝建桶。查询失败由调用方 fail-closed（5xx）。
-    /// shortcut: 计数与建桶行不在同一事务（并发建桶可短暂超配额），升级点是建桶 apply 内
-    /// 条件插入；当前 MVP 先堵住控制台/S3 顺序建桶路径。
+    /// 这是快速检查（文案/错误码兼容）；权威判定在 standalone 写事务内、Raft leader
+    /// append 前，并发建桶不会越过 `accounts.bucket_quota`。
     pub async fn bucket_quota_exceeded(&self, uid: i64) -> Result<bool, sqlx::Error> {
         let row = sqlx::query(
             "SELECT a.id AS id, a.status AS status, a.bucket_quota AS quota \
@@ -877,14 +891,56 @@ impl Acl {
         let Some(quota) = quota.filter(|q| *q >= 0) else {
             return Ok(false);
         };
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM buckets b JOIN users u ON u.id = b.owner_id \
-             LEFT JOIN account_members bm ON bm.uid = u.id \
-             WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = ?",
+        let n: i64 = sqlx::query_scalar(ACCOUNT_BUCKET_COUNT_SQL)
+            .bind(&acct)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n >= quota)
+    }
+
+    /// 写事务内配额判定（调用方已持 `BEGIN IMMEDIATE` 写锁）：与
+    /// [`Self::bucket_quota_exceeded`] 同口径（成员行优先，无行回落 uid 派生账户）；
+    /// NULL/负配额、无账户行 = 不限；停用账户 fail-closed。
+    async fn quota_reached_conn(
+        conn: &mut sqlx::SqliteConnection,
+        uid: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let account = match sqlx::query_scalar::<_, String>(
+            "SELECT account_id FROM account_members WHERE uid = ?",
         )
-        .bind(&acct)
-        .fetch_one(&self.pool)
-        .await?;
+        .bind(uid)
+        .fetch_optional(&mut *conn)
+        .await
+        {
+            Ok(row) => row.or_else(|| account_id_of(uid)),
+            Err(e) if missing_accounts_table(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let Some(account) = account else {
+            return Ok(false);
+        };
+        let row = sqlx::query("SELECT status, bucket_quota FROM accounts WHERE id = ?")
+            .bind(&account)
+            .fetch_optional(&mut *conn)
+            .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(e) if missing_accounts_table(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let Some(r) = row else {
+            return Ok(false);
+        };
+        if r.get::<String, _>("status") != "active" {
+            return Ok(true);
+        }
+        let Some(quota) = r.get::<Option<i64>, _>("bucket_quota").filter(|q| *q >= 0) else {
+            return Ok(false);
+        };
+        let n: i64 = sqlx::query_scalar(ACCOUNT_BUCKET_COUNT_SQL)
+            .bind(&account)
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(n >= quota)
     }
 
@@ -1054,20 +1110,30 @@ impl Acl {
         bucket: &str,
         uid: i64,
         set: u16,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<BucketRecordOutcome, sqlx::Error> {
         self.record_bucket_owner_set_mode(bucket, uid, set, "async")
             .await
     }
 
     /// M9：同 [`Self::record_bucket_owner_set`]，并写 `replication_mode`。
     /// ON CONFLICT 全列重置（set 随重建收敛，M5 阻断 1）；creation_date 保持首建。
+    /// **新建行**在 `BEGIN IMMEDIATE` 写锁内 count+insert——并发建桶只有一个能越过账户
+    /// 桶数配额（快速检查在 `check_op`，最终判定在这里）；已存在行是重建收敛，不判配额。
     pub async fn record_bucket_owner_set_mode(
         &self,
         bucket: &str,
         uid: i64,
         set: u16,
         replication_mode: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<BucketRecordOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
+            .bind(bucket)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() && Self::quota_reached_conn(&mut tx, uid).await? {
+            return Ok(BucketRecordOutcome::QuotaExceeded);
+        }
         sqlx::query(
             "INSERT INTO buckets \
              (name, owner_id, creation_date, versioning, set_id, object_lock, \
@@ -1094,9 +1160,10 @@ impl Acl {
         })
         .bind(set as i64)
         .bind(replication_mode)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(BucketRecordOutcome::Written)
     }
 
     /// C3：建桶自动指派——选**当前桶数最少**的 set（并列取小号）；无行数据按 0 计。
@@ -1833,7 +1900,13 @@ mod tests {
     /// 最小 schema 的内联建库（列与 oss-server/migrations/0001_init.sql 对齐；
     /// xl-s3 不能反向依赖 oss-server，模式同 auth.rs 的测试 helper）。
     pub(super) async fn acl() -> Acl {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        acl_with_url("sqlite::memory:").await
+    }
+
+    /// 并发写事务用例用文件库（WAL/busy_timeout）；内存 shared-cache 库在并发
+    /// `BEGIN IMMEDIATE` 下以 `SQLITE_LOCKED` 立即失败，测不出写锁排队语义。
+    async fn acl_with_url(url: &str) -> Acl {
+        let pool = SqlitePool::connect(url).await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER NOT NULL DEFAULT 0, \
               status TEXT NOT NULL DEFAULT 'active');\
@@ -2684,6 +2757,98 @@ mod tests {
             .await
             .unwrap();
         assert!(allow);
+    }
+
+    /// AC-2：建桶行写入在写锁内 count+insert——N+1 个并发建桶恰好 N 个越过配额。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_bucket_records_stop_at_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("acl.db").display());
+        let a = Arc::new(acl_with_url(&url).await);
+        add_user(&a, 2, false).await;
+        add_account(&a, "000000000002", "active", Some(2)).await;
+        add_member(&a, "000000000002", 2, "owner").await;
+        let mut tasks = Vec::new();
+        for i in 0..3 {
+            let a = Arc::clone(&a);
+            tasks.push(tokio::spawn(async move {
+                a.record_bucket_owner_set_mode(&format!("q-{i}"), 2, 0, "async")
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut written = 0;
+        for t in tasks {
+            if t.await.unwrap() == BucketRecordOutcome::Written {
+                written += 1;
+            }
+        }
+        assert_eq!(written, 2, "N+1 并发恰好 N 个成功");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "落库桶数不得超过配额");
+    }
+
+    /// AC-2：无成员行的用户按 uid 派生账户在写事务内同样计数。
+    #[tokio::test]
+    async fn record_bucket_owner_quota_uses_derived_account() {
+        let a = acl().await;
+        add_user(&a, 4, false).await;
+        add_account(&a, "000000000004", "active", Some(1)).await;
+        assert_eq!(
+            a.record_bucket_owner_set_mode("d-1", 4, 0, "async")
+                .await
+                .unwrap(),
+            BucketRecordOutcome::Written
+        );
+        assert_eq!(
+            a.record_bucket_owner_set_mode("d-2", 4, 0, "async")
+                .await
+                .unwrap(),
+            BucketRecordOutcome::QuotaExceeded
+        );
+    }
+
+    /// AC-2：NULL/负配额 = 不限；已存在行是重建收敛，不增加桶数、不判配额。
+    #[tokio::test]
+    async fn record_bucket_owner_quota_null_negative_and_recreate() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_account(&a, "000000000002", "active", None).await;
+        add_member(&a, "000000000002", 2, "owner").await;
+        for i in 0..3 {
+            assert_eq!(
+                a.record_bucket_owner_set_mode(&format!("u-{i}"), 2, 0, "async")
+                    .await
+                    .unwrap(),
+                BucketRecordOutcome::Written,
+                "NULL = 不限"
+            );
+        }
+        sqlx::query("UPDATE accounts SET bucket_quota = -1 WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.record_bucket_owner_set_mode("u-3", 2, 0, "async")
+                .await
+                .unwrap(),
+            BucketRecordOutcome::Written,
+            "负数 = 不限"
+        );
+        sqlx::query("UPDATE accounts SET bucket_quota = 3 WHERE id = '000000000002'")
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.record_bucket_owner_set_mode("u-0", 2, 1, "sync")
+                .await
+                .unwrap(),
+            BucketRecordOutcome::Written,
+            "重建已有桶不增加桶数"
+        );
     }
 
     #[tokio::test]

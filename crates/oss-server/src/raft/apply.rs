@@ -874,4 +874,45 @@ mod tests {
         .unwrap();
         assert_eq!(owner, 0);
     }
+
+    /// AC-2 修订：apply 本身不做配额判定（旧副本行为不变，混版不分叉）；
+    /// 权威闸在 leader append 前（`RaftHandle`），不经过 `ControlResponse`。
+    #[tokio::test]
+    async fn bucket_create_apply_ignores_quota() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.create_user("alice", "pw", false).await.unwrap();
+        // 默认账户 id=000000000001，create_user 已把 alice 挂为成员；只收紧配额。
+        sqlx::query("UPDATE accounts SET bucket_quota = 1 WHERE id = '000000000001'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let cmd = |name: &str| ControlCommand::BucketCreate {
+            name: name.into(),
+            owner: Some("alice".into()),
+            created_at: 1,
+            replication_mode: "async".into(),
+            versioning: "Off".into(),
+            object_lock: false,
+            object_lock_default_mode: None,
+            object_lock_default_days: None,
+            default_encryption: None,
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        {
+            let mut cw = control_tx(&mut tx);
+            for name in ["q-1", "q-2"] {
+                assert_eq!(
+                    apply_command(&mut cw, &cmd(name)).await.unwrap().response,
+                    ControlResponse::Ok,
+                    "apply 不判配额（quota=1 仍落两桶）"
+                );
+            }
+        }
+        tx.commit().await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
 }

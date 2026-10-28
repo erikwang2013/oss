@@ -414,4 +414,30 @@ mod tests {
         assert!(!ext_type_registered("future.demo"));
         assert!(ext_type_registered("test.noop"));
     }
+
+    /// 混版契约：`ControlResponse` 变体集合保持 v1.20/v1.21 一致（增变体会让旧副本
+    /// 解码 apply 响应失败）；配额拒绝改走 `WriteError`/`ControlError`，不进日志响应。
+    #[test]
+    fn control_response_variants_match_released_set() {
+        let variants: Vec<String> = [
+            ControlResponse::Ok,
+            ControlResponse::BucketNotEmpty,
+            ControlResponse::NotFound,
+            ControlResponse::Conflict,
+            ControlResponse::Invalid,
+        ]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect();
+        assert_eq!(
+            variants,
+            [
+                "\"Ok\"",
+                "\"BucketNotEmpty\"",
+                "\"NotFound\"",
+                "\"Conflict\"",
+                "\"Invalid\""
+            ]
+        );
+    }
 }

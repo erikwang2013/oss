@@ -77,6 +77,7 @@ pub(crate) fn control_failure(e: crate::raft::control::ControlError) -> Response
     let hint = leader_hint_value(&e);
     let mut resp = match e.http_status() {
         400 => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        403 => forbidden("账户桶配额已用尽"),
         413 => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
         503 => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
         _ => {
@@ -2797,43 +2798,55 @@ async fn create_bucket(
         return store_error(e).into_response();
     }
     // M5 切片 0：覆盖语义——陈旧行（删桶记账容忍失败残留）随重建收敛 set 与 owner
-    if let Err(e) = state
+    match state
         .db
         .upsert_bucket_owner_set_mode(&body.name, Some(uid), set, replication_mode)
         .await
     {
-        // M7 P2：站点 LWW 门控拒绝时物理桶已建——按**最终行**补偿后返回 409：
-        // 远端 upsert 胜出（行存在）保留物理桶；远端 delete 胜出（无行）才删空目录。
-        if let Some(r) = site_conflict(&e) {
-            let has_row = match sqlx::query_scalar::<_, i64>("SELECT 1 FROM buckets WHERE name = ?")
+        Ok(crate::db::BucketRowOutcome::Written) => {}
+        // AC-2：并发建桶在写锁内输了配额（快速检查已过）→ 回滚物理桶，与快速检查同码。
+        Ok(crate::db::BucketRowOutcome::QuotaExceeded) => {
+            if let Err(re) = state.store.delete_bucket(&body.name).await {
+                tracing::warn!(error = %re, bucket = %body.name, "配额拒绝后回滚物理桶失败");
+            }
+            return (StatusCode::FORBIDDEN, "账户桶配额已用尽").into_response();
+        }
+        Err(e) => {
+            // M7 P2：站点 LWW 门控拒绝时物理桶已建——按**最终行**补偿后返回 409：
+            // 远端 upsert 胜出（行存在）保留物理桶；远端 delete 胜出（无行）才删空目录。
+            if let Some(r) = site_conflict(&e) {
+                let has_row = match sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM buckets WHERE name = ?",
+                )
                 .bind(&body.name)
                 .fetch_optional(state.db.pool())
                 .await
-            {
-                Ok(v) => v.is_some(),
-                Err(re) => {
-                    // 行状态未知：保留刚建的物理桶（宁可孤儿目录，不误删对端数据）。
-                    tracing::warn!(error = %re, bucket = %body.name, "冲突补偿读桶行失败（保留物理桶）");
-                    return r;
-                }
-            };
-            if has_row {
-                if !state.store.bucket_exists(&body.name).await.unwrap_or(false)
-                    && let Err(re) = state.store.create_bucket(&body.name).await
                 {
-                    tracing::warn!(error = %re, bucket = %body.name, "冲突补偿补建物理桶失败");
+                    Ok(v) => v.is_some(),
+                    Err(re) => {
+                        // 行状态未知：保留刚建的物理桶（宁可孤儿目录，不误删对端数据）。
+                        tracing::warn!(error = %re, bucket = %body.name, "冲突补偿读桶行失败（保留物理桶）");
+                        return r;
+                    }
+                };
+                if has_row {
+                    if !state.store.bucket_exists(&body.name).await.unwrap_or(false)
+                        && let Err(re) = state.store.create_bucket(&body.name).await
+                    {
+                        tracing::warn!(error = %re, bucket = %body.name, "冲突补偿补建物理桶失败");
+                    }
+                } else if let Err(re) = state.store.delete_bucket(&body.name).await {
+                    tracing::warn!(error = %re, bucket = %body.name, "冲突回滚物理桶失败");
                 }
-            } else if let Err(re) = state.store.delete_bucket(&body.name).await {
-                tracing::warn!(error = %re, bucket = %body.name, "冲突回滚物理桶失败");
+                return r;
             }
-            return r;
+            // M9：行写失败（含 guard ABORT）不得以 204 静默成功——回滚刚建的物理桶并 5xx。
+            tracing::error!(error = %e, bucket = %body.name, "写入桶行失败");
+            if let Err(re) = state.store.delete_bucket(&body.name).await {
+                tracing::warn!(error = %re, bucket = %body.name, "行写失败回滚物理桶失败");
+            }
+            return internal_error();
         }
-        // M9：行写失败（含 guard ABORT）不得以 204 静默成功——回滚刚建的物理桶并 5xx。
-        tracing::error!(error = %e, bucket = %body.name, "写入桶行失败");
-        if let Err(re) = state.store.delete_bucket(&body.name).await {
-            tracing::warn!(error = %re, bucket = %body.name, "行写失败回滚物理桶失败");
-        }
-        return internal_error();
     }
     // M9：门模式缓存失效（行已写入——新建 sync 桶首次写即生效）。
     state.store.invalidate_gate(&body.name);
