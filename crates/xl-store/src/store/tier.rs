@@ -31,6 +31,25 @@ pub struct ArchiveSpec {
     pub chunks: Option<TierChunks>,
 }
 
+/// 只读审计项：已归档版本未绑定源整对象摘要。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TierAuditEntry {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    /// `empty-source-sha`（旧对象无 SHA-256）或 `legacy-parts`（parts=Some 旧形态）。
+    pub reason: String,
+}
+
+/// [`Store::tier_audit`] 结果。
+#[derive(Debug, Default, serde::Serialize)]
+pub struct TierAuditReport {
+    /// 已归档（带 tier 记录）的版本数。
+    pub archived: usize,
+    /// 未绑定源摘要的版本（全量清单，不截断）。
+    pub unbound: Vec<TierAuditEntry>,
+}
+
 impl Store {
     /// 读某版本的完整 meta 记录（job/reaper 用；delete marker/未知版本 → None）。
     pub async fn tier_version(
@@ -46,6 +65,45 @@ impl Store {
         Ok(m.find_version(version_id)
             .filter(|v| !v.delete_marker())
             .cloned())
+    }
+
+    /// 只读审计：列出已归档版本中未绑定源整对象摘要的对象。**不改写/回填任何 meta。**
+    ///
+    /// C1–C4 对 `parts.is_some()` 或空 `part.sha256` 的旧源跳过摘要绑定。归档提交会清空
+    /// `parts`，事后只能按保留的 `part.sha256` 判定：
+    /// - 空 → `empty-source-sha`（旧对象本就没有摘要）；
+    /// - 与 `tier.sha256` 不同 → `legacy-parts`（parts=Some 旧形态下 `part` 只是首段副本，
+    ///   与归档副本的整对象摘要天然不同；C1 之前的旧归档也落此桶）。
+    pub async fn tier_audit(&self) -> Result<TierAuditReport> {
+        let (keys, _) = self.collect_namespace().await?;
+        let mut report = TierAuditReport::default();
+        for (bucket, key) in keys {
+            let Some(m) = self.read_meta(&bucket, &key).await? else {
+                continue;
+            };
+            for v in m.versions.iter().filter(|v| !v.delete_marker()) {
+                let Some(t) = &v.tier else {
+                    continue;
+                };
+                report.archived += 1;
+                let reason = if v.part.sha256.is_empty() {
+                    Some("empty-source-sha")
+                } else if v.part.sha256 != t.sha256 {
+                    Some("legacy-parts")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    report.unbound.push(TierAuditEntry {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        version_id: v.version_id_str(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// 在对象锁内重写某版本；`f(old_version, new_version)` 返回 Err 时不动 meta。

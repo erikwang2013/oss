@@ -44,7 +44,7 @@ pub use shrink::{
     ShrinkPlan, ShrinkPlanReport, ShrinkSlotStat, SlotMove, acquire_shrink_lock, shrink_lock_busy,
 };
 pub use shrink_apply::{ShrinkActionReport, ShrinkVerifyReport};
-pub use tier::ArchiveSpec;
+pub use tier::{ArchiveSpec, TierAuditEntry, TierAuditReport};
 pub use version::{DeleteMarkerSpec, DeleteOutcome, TierRef, VersionEntry, VersionList};
 
 // M3：集群拓扑类型经 store 面公开（drives 模块本身保持私有）
