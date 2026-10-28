@@ -3,6 +3,7 @@ import { Avatar, Dropdown, Flex, Layout, Menu, Tag, Typography } from 'antd'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   ApiOutlined,
+  BankOutlined,
   BellOutlined,
   ClusterOutlined,
   DatabaseOutlined,
@@ -23,6 +24,7 @@ import Buckets from './pages/Buckets'
 import Objects from './pages/Objects'
 import Keys from './pages/Keys'
 import Users from './pages/Users'
+import Accounts from './pages/Accounts'
 import Cluster from './pages/Cluster'
 import AccessPoints from './pages/AccessPoints'
 import Jobs from './pages/Jobs'
@@ -44,7 +46,7 @@ function Shell() {
   const { data: me } = useQuery({ queryKey: ['me'], queryFn: () => api<Me>('/api/v1/me') })
   // 选中态：按前缀匹配——三分支起手写三元会在新路由上误亮 /buckets
   const selected =
-    ['/access-points', '/events', '/jobs', '/tiers', '/audit', '/settings', '/keys', '/users', '/cluster'].find(
+    ['/access-points', '/events', '/jobs', '/tiers', '/audit', '/settings', '/keys', '/users', '/accounts', '/cluster'].find(
       (p) => loc.pathname.startsWith(p),
     ) ?? '/buckets'
 
@@ -80,9 +82,10 @@ function Shell() {
                 ]
               : []),
             { key: '/keys', icon: <KeyOutlined />, label: <Link to="/keys">访问密钥</Link> },
-            // 子账户管理与集群面板仅管理员可见（后端另有 403 兜底）
+            // 账户/子账户管理与集群面板仅管理员可见（后端另有 403 兜底）
             ...(me?.is_admin
               ? [
+                  { key: '/accounts', icon: <BankOutlined />, label: <Link to="/accounts">账户</Link> },
                   { key: '/users', icon: <TeamOutlined />, label: <Link to="/users">子账户</Link> },
                   { key: '/cluster', icon: <ClusterOutlined />, label: <Link to="/cluster">集群</Link> },
                 ]
@@ -164,6 +167,7 @@ export const router = createBrowserRouter([
       { path: '/settings', element: <Settings /> },
       { path: '/keys', element: <Keys /> },
       { path: '/users', element: <Users /> },
+      { path: '/accounts', element: <Accounts /> },
       { path: '/cluster', element: <Cluster /> },
     ],
   },
