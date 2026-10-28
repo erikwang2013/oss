@@ -486,3 +486,51 @@ v1.20.1 发布后补齐的两项（v1.20.0 tag 保留，v1.20.1 为可用补丁�
 - v1.20.0 tag / GitHub Release 的源码归档仍带坏锁，不能直接构建；v1.20.1 已修复并发布，
   请勿使用 v1.20.0 源码包。
 
+## 16. 2026-10-28 post-v1.20.1 hardening wave（工作树，未发版）
+
+v1.20.1 之后在 main 合入的修复与切片，尚未打 tag/发版；发布以 tag 为准。
+
+| 项 | 落点 | 说明与验证 |
+|---|---|---|
+| M8-3 控制台一致读 | `console.rs`、`router.rs`、`raft/mod.rs`、`raft/control.rs`、`web/src/api.ts`、`pages/Accounts.tsx` | GET/HEAD `?consistent=1` 经 `wait_caught_up(2s)` 追赶后读本地；失败/无 leader 503 fail-closed；控制台响应带 `x-oss-applied-index`；默认仍是 follower 弱读。`m8_read_consistency` 2/2、`console_api` 33/33 |
+| 账户管理员 UI | `web/src/pages/Accounts.tsx`、`AccountModals.tsx`、`accounts.ts`、`App.tsx` | 列表/创建/改名/启停/删除、成员、桶配额、软字节配额、usage；仅管理员菜单。`npm run build`、`oxlint` 0、Vitest 21/21 |
+| 滞后 follower 追赶 | `accounts_api.rs`、`accounts_support.rs` | `attach_member` 与 `set_member_status` 本地 miss 时 `wait_caught_up(2s)` 一次后重查，两次都 miss 才 404；standalone 行为不变。`raft_accounts_follower` 2/2、`accounts` 10/10 |
+| e2e_m9 S9 收尾 | `tests/e2e_m9.sh` | 关闭 TODO：fsck `--repair` + 只读复检、提交 ≥9 槽（盘上 `xl.meta` 口径，修正原 raft applied 误设）、B 为第二节点 identity 互校。`M9_STRETCH=1` 实跑 **64 PASS / 0 FAIL / 1 SKIP，RC=0** |
+| tier 摘要绑定 C1–C4 | `tier_direct.rs`、`tier_jobs.rs`、`store/tier.rs` | 归档/直读绑定源已提交整对象 SHA-256；legacy `parts=Some`/空摘要跳过；旧代码实测可静默归档坏 `part.1`。`m8_tier_direct` 9/9、`m8_tier_restore_fixes` 5/5、xl-store `tests_tier` 12/12；`m8_tier_stream` 5/6（唯一失败为既有 `sqlite::memory:` 600s idle-timeout 高负载 flake，C2 断言已过） |
+| AP 端点 registry Slice A | `xl-s3/ap.rs`、`config.rs`、`state.rs`、`router.rs` | 静态 `[[ap.vpc_endpoints]]`；R1–R7：仅可信代断言、active 命中、SourceVpc 一致、策略引用时账户绑定、查询失败 500、无断言不变、DeleteObjects 继承；审计 detail 记录 endpoint/account/拒绝原因。**是注册断言，不是密码学端点身份**。xl-s3 AP lib 27/27、`m8_ap` 23/23、config/state lib 4/4；HTTP 信任链（ConnectInfo/Attest）未端到端 |
+| 文档对齐 | `AGENTS.md`、backlog、设计文档 | 状态/证据段与 v1.20.1 代码对齐 |
+
+**main 验证**：七闸在 801abe5 为 1308 passed / 0 failed / 3 ignored；`oss-server` 全量在 2aa05b4
+再跑 65 suites / 0 failed；tier+AP 合并后交叉聚焦测试全绿（9/9、5/5、12/12、27/27、4/4）；
+前端 build/lint 0、Vitest 21/21。合并后 main 的 `oss-server` 全量结果见发布前复核记录。
+
+### 16.1 v1.13.2 兼容补丁线（未发布）
+
+- 分支 `release/v1.13.2-stubs`（基于 `v1.13.2-task6-wip` = a39858a，基于 v1.13.1），tip
+  **282b08b**；未合并 main、未 push、未打 tag。
+- 内容：LC-2「识别但拒绝」桩（main 的 9 个 level-3 变体精确解码，apply 一律 `Invalid`，
+  不写表、不 fail-stop、不升激活 marker）；leader 侧 feature 闸（`client_write` 与
+  `/site/raft/write` 转发入口在 append 前拒绝 level-3，堵住「旧 leader 写入、新端执行/旧端
+  拒绝」的状态分叉）；backport main 的 raft_cutover/raft_membership/sync_gate 测试修复；
+  workspace crate 与 web 版本统一到 1.13.2；Cargo.lock 由 cargo 自身刷新。
+- 验证：`patch_contract` 7/7、`patch_feature_gate` 2/2、`level_three_stub` 2/2；
+  全量 `cargo test -p oss-server` **386 passed / 0 failed / 1 ignored**（1 个 fixture 重生成器
+  为设计忽略）；clippy `-D warnings`、fmt、`metadata --locked --offline` 全绿。
+- 结论：可作 **v1.13.2 RC（代码/测试层面）**；发布/签名/tag 未做。Level C 仍未覆盖：
+  三二进制 e2e、真实混版集群（wire 协商/成员预检/跨节点转发）、完整双向混写（生产 Ext
+  零注册，补丁线仅识别拒绝）、CMK rewrap/降级 e2e、OSSCTL1/2/3 真实跨版本快照、回滚矩阵
+  演练、数据面 `xl.meta`/CMK 混版、真实 console 503 端到端。
+
+### 16.2 仍为非目标 / 需另开里程碑
+
+- **硬字节/对象数配额**：无跨节点复制账本与数据面 reservation，正确的 hard 语义不可实现；
+  保持非目标 + 文档（`docs/superpowers/specs/2026-10-24-architecture-backlog.md` §1）。
+- **M8-2 运行态实时复制**：3–4 人周；需把 job/inventory/tier 运行态纳入命令/快照与接管。
+- **真实 PrivateLink 身份**：需 AWS DescribeVpcEndpoints/ENI 关联或 mTLS 证书 plumbing；
+  Slice A 只是注册断言。
+- **tier 分块表独立签名、跨进程预留**：保持非目标（预留是协作 tier 写者的 advisory 约束，
+  不是磁盘配额）。
+- **单机→集群**：文档口径为重新灌入，不工具化。
+- **兼容边界**（M6 无 site_token 历史远端、M7 升级前删除、存量裸 UUID MPU）：无法自动追溯，
+  维持运维处置（排空/显式对账）。
+

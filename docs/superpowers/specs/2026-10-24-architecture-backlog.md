@@ -16,6 +16,14 @@
 > `GET /accounts/{id}/usage`（只告警不阻写，硬字节配额仍为非目标）；M3 shrink 4→3 已补上
 > 真实进程 loopback e2e（86/0/0）。证据见验收记录 §15。其余五项完整目标仍按本文未实现。
 >
+> **2026-10-28 更新（post-v1.20.1，工作树未发版）**：main 已合入 M8-3 控制台一致读
+> （`?consistent=1` + `x-oss-applied-index`）、账户管理员 UI、滞后 follower 的
+> `attach_member`/`set_member_status` 追赶、e2e_m9 的 S9 三条断言（实跑 64/0/1）；
+> tier 直读/归档绑定源整对象 SHA-256（C1–C4）与 AP 端点静态 registry（注册断言，
+> Slice A）也已合入。`release/v1.13.2-stubs` 分支补齐 LC-2「识别但拒绝」桩与 leader 侧
+> feature 闸（未发布）。仍缺：Level C 三二进制 e2e/发布文档、M8-2 运行态实时复制、
+> 硬字节/对象数配额、真实 PrivateLink 身份、单机→集群工具化。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →
@@ -26,10 +34,10 @@
 
 | # | 项目 | 代码现状（诚实结论） | MVP 体量 | 主要依赖 | 风险 |
 |---|---|---|---|---|---|
-| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现（level 2/3 快照）；缺生产 Ext 命令与完整双向混写；旧二进制读不了 level-2/3 数据与 CMK | 6–10 人周 | 兼容补丁版本、生产 Ext 命令、CMK 重包 | 高 |
+| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；`release/v1.13.2-stubs` 已有 LC-2 识别拒绝桩 + leader 闸（未发布）；缺生产 Ext 命令、完整双向混写与三二进制 e2e | 6–10 人周 | 兼容补丁发布、生产 Ext 命令、CMK 重包 | 高 |
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；仍缺跨版本 MPU 完成 | 4–8 人周 | 跨版本 MPU 语义 | 高 |
-| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额已交付（accounts/成员/Raft level-3 写/桶数硬配额）；仍缺硬字节/对象数配额、canonicalization worker、管理员 UI | 5–8 人周 | 跨节点用量聚合 | 中高 |
-| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控与 M8-2a runstate 快照扩展已交付；运行态日志复制/lease takeover/consistent=1 仍缺 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
+| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额 + 管理员 UI 已交付；仍缺硬字节/对象数配额、canonicalization worker | 5–8 人周 | 跨节点用量聚合 | 中高 |
+| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控、M8-2a runstate 快照扩展、M8-3 一致读（`consistent=1`/applied 头）已交付；仍缺运行态日志复制/lease takeover/故障切换 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
 | 5 | M3 shrink / 单机→集群 | 静态拓扑 + 位置式槽位；rebalance 只支持尾部追加；shrink 与单机转集群明确不支持 | 8–12 人周 | 拓扑 v3（显式 slot map） | 极高 |
 
 ---
@@ -65,8 +73,10 @@
 - 升级口径仍写明：**激活 = 不归点**，回滚只能在激活前（README 已精简为概览，升级窗口见
   `site/install.html:209`）；含 Level B 数据的环境只能由能写 OSSCTL2/3 的新二进制快照/切档。
 - **Level C 剩余**：生产 `Ext` 命令零注册（`REGISTERED_EXT_TYPES` 为空，
-  `command.rs:305`），完整「旧端只读 + 新 leader 协调写」的双向混写未做；v1.13.2 补丁线
-  仍是发布决策（§1.2）。CMK rewrap 工具已具备（`oss-server cmk rewrap`，`cli.rs:57,461-473`）。
+  `command.rs:305`），完整「旧端只读 + 新 leader 协调写」的双向混写未做；v1.13.2
+  补丁线已在 `release/v1.13.2-stubs` 分支补齐 LC-2「识别但拒绝」桩与 leader 侧 feature
+  闸（未打 tag/发布，见验收记录 §16），仍缺三二进制 e2e、发布/回滚文档与 CMK 重包发布。
+  CMK rewrap 工具已具备（`oss-server cmk rewrap`，`cli.rs:57,461-473`）。
 
 ### 1.2 关键结论：已发布的 v1.13.1 不能成为 Level C 的一端
 
@@ -257,8 +267,9 @@ Level C 要求「旧二进制读到新数据并继续作为 voter」。但 v1.13
   失败即不写输出（§11.3）；这不是租户边界。
 - **仍缺**：硬字节配额与对象数配额（无跨节点实时用量聚合）；账户表 level-3
   canonicalization worker 未实现——marker `accounts_canonical_v1` 仅由一次性 standalone
-  回填或 fresh Raft 启动写入（`db.rs:299-300,2242-2277`）；管理员账户控制台页面未做
-  （`web/src/pages` 无账户页，后端 `/accounts` API 完整）。
+  回填或 fresh Raft 启动写入（`db.rs:299-300,2242-2277`）。
+- **已交付**：管理员账户控制台页面（`web/src/pages/Accounts.tsx` + `AccountModals.tsx`；
+  列表/创建/改名/启停/删除、成员、桶配额、软字节配额、usage）。
 
 ### 3.2 真正阻塞点
 
@@ -351,8 +362,10 @@ M8-2a 的运行态快照扩展也已落地；M8 的**运行态日志复制/接�
 - 审计仍本地（`state.rs` 的 `audit_log`）；AP 缓存进程本地 + TTL（`ap.rs:9-12`）；
   JWT 无状态、12h 过期（`console.rs`）；登录限流器进程本地——多节点会话天然可跨节点，
   但限流与吊销强度下降。
-- **仍缺**：跨节点 lease/takeover（运行态不随日志复制）、`?consistent=1` 读己之写
-  （全仓无该参数）、故障切换演练（`tests/e2e_m8.sh` 为单节点）。
+- **M8-3 已交付**：`?consistent=1` 有界追赶 + `x-oss-applied-index` 响应头
+  （`console.rs::console_read_consistency`、`tests/m8_read_consistency.rs`）。
+- **仍缺**：跨节点 lease/takeover（运行态不随日志复制）、故障切换演练
+  （`tests/e2e_m8.sh` 为单节点）。
 
 ### 4.2 真正阻塞点
 
