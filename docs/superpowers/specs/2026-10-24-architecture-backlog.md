@@ -20,8 +20,8 @@
 > （`?consistent=1` + `x-oss-applied-index`）、账户管理员 UI、滞后 follower 的
 > `attach_member`/`set_member_status` 追赶、e2e_m9 的 S9 三条断言（实跑 64/0/1）；
 > tier 直读/归档绑定源整对象 SHA-256（C1–C4）与 AP 端点静态 registry（注册断言，
-> Slice A）也已合入。`release/v1.13.2-stubs` 分支补齐 LC-2「识别但拒绝」桩与 leader 侧
-> feature 闸（未发布）。仍缺：Level C 三二进制 e2e/发布文档、M8-2 运行态实时复制、
+> Slice A）也已合入。v1.13.2 旧端曾补齐 LC-2「识别但拒绝」桩与 leader 侧 feature 闸
+> （该分支已于 2026-10-29 删除，不随 v1.21.0 发布）。仍缺：Level C 三二进制 e2e/发布文档、M8-2 运行态实时复制、
 > 硬字节/对象数配额、真实 PrivateLink 身份、单机→集群工具化。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
@@ -34,7 +34,7 @@
 
 | # | 项目 | 代码现状（诚实结论） | MVP 体量 | 主要依赖 | 风险 |
 |---|---|---|---|---|---|
-| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；`release/v1.13.2-stubs` 已有 LC-2 识别拒绝桩 + leader 闸（未发布）；缺生产 Ext 命令、完整双向混写与三二进制 e2e | 6–10 人周 | 兼容补丁发布、生产 Ext 命令、CMK 重包 | 高 |
+| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.13.2 旧端 LC-2 兼容桩曾实现但未保留（分支已删）；缺生产 Ext 命令、完整双向混写与三二进制 e2e | 6–10 人周 | 兼容补丁发布、生产 Ext 命令、CMK 重包 | 高 |
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；仍缺跨版本 MPU 完成 | 4–8 人周 | 跨版本 MPU 语义 | 高 |
 | 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额 + 管理员 UI 已交付；仍缺硬字节/对象数配额、canonicalization worker | 5–8 人周 | 跨节点用量聚合 | 中高 |
 | 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控、M8-2a runstate 快照扩展、M8-3 一致读（`consistent=1`/applied 头）已交付；仍缺运行态日志复制/lease takeover/故障切换 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
@@ -74,8 +74,8 @@
   `site/install.html:209`）；含 Level B 数据的环境只能由能写 OSSCTL2/3 的新二进制快照/切档。
 - **Level C 剩余**：生产 `Ext` 命令零注册（`REGISTERED_EXT_TYPES` 为空，
   `command.rs:305`），完整「旧端只读 + 新 leader 协调写」的双向混写未做；v1.13.2
-  补丁线已在 `release/v1.13.2-stubs` 分支补齐 LC-2「识别但拒绝」桩与 leader 侧 feature
-  闸（未打 tag/发布，见验收记录 §16），仍缺三二进制 e2e、发布/回滚文档与 CMK 重包发布。
+  补丁线曾补齐 LC-2「识别但拒绝」桩与 leader 侧 feature 闸（分支已于 2026-10-29 删除，
+  未打 tag/发布，见验收记录 §16），仍缺三二进制 e2e、发布/回滚文档与 CMK 重包发布。
   CMK rewrap 工具已具备（`oss-server cmk rewrap`，`cli.rs:57,461-473`）。
 
 ### 1.2 关键结论：已发布的 v1.13.1 不能成为 Level C 的一端
