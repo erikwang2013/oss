@@ -161,6 +161,46 @@ export interface UserRow {
   permissions: Permission[]
 }
 
+// ——— 多租户账户（accounts_api.rs / accounts_usage.rs；AC-0/AC-2）———
+
+/** GET /accounts 行；account_buckets_from 口径：非管理员成员名下的桶。 */
+export interface AccountRow {
+  id: string
+  name: string
+  /** "active" / "disabled"（停用即全链路失效） */
+  status: string
+  admin_uid: number | null
+  /** 桶数量配额；null / 负数 = 不限 */
+  bucket_quota: number | null
+  /** 软字节配额（只告警不阻写）；null / 负数 = 不限 */
+  soft_byte_quota: number | null
+  created_at: number
+  updated_at: number
+  member_count: number
+  bucket_count: number
+}
+
+/** GET /accounts/{id}/members 行；不含任何凭据。 */
+export interface AccountMemberRow {
+  uid: number
+  username: string
+  /** owner | admin | member（owner 只出现在回填的派生账户） */
+  role: string
+  is_admin: boolean
+  status: string
+  created_at: number
+}
+
+/** GET /accounts/{id}/usage：当前版本对象字节和；complete=false 时只是下界。 */
+export interface AccountUsage {
+  account_id: string
+  used_bytes: number
+  complete: boolean
+  soft_byte_quota: number | null
+  exceeded: boolean
+  bucket_count: number
+}
+
 // ——— 集群状态（console.rs /cluster/status；M4 观测面）———
 
 export interface ClusterNode {
