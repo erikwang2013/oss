@@ -10,7 +10,7 @@
 
 An S3-compatible, self-built distributed object storage system (an equivalent implementation of MinIO). It supports multi-drive erasure coding 8+4, inter-node gRPC mesh, versioning, lifecycle, bucket policies and auditing, three SSE modes and object lock, STS temporary credentials, event notifications/Kafka, S3 Select, bucket and multi-site replication, access points/Object Lambda, Batch/Inventory/tiering, sync buckets and a 3-voter Raft control plane. The default `aws-cli`/`rclone` large-file paths (automatic multipart for ≥8 MiB) and resume habits work directly; the browser console supports chunked uploads and management.
 
-**Latest release: v1.20.0 (2026-10-27).** The Wave2 gap-fix release: inbound mesh gRPC TLS material hot rotation, account/member writes via Raft commands (OSSCTL3 snapshots carry account rows), shrink topology v4 with offline `apply/verify/commit/rollback`, and real binary rolling e2e against both same-version and v1.13.1 binaries. A 4→3 loopback shrink e2e, M8 multi-node runtime, and the Level C patch line remain undelivered; see the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for boundaries.
+**Latest release: v1.20.1 (2026-10-28).** A patch release: account soft byte quota (read-only usage endpoint + independent config route + level-3 Raft command; advisory only), a real-process 4→3 shrink loopback e2e (97/0), and a fix for the v1.20.0 source archive where `Cargo.lock` mislabeled `either` as 1.20.0, breaking builds. Hard byte quota and object-count quota remain undelivered; see the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for boundaries.
 
 ## Features
 
@@ -19,7 +19,7 @@ An S3-compatible, self-built distributed object storage system (an equivalent im
 | Storage kernel | Multi-drive erasure coding 8+4, inter-node gRPC mesh, quorum commit, `xl.meta` version chain, small-object inlining, multi-drive self-healing |
 | S3 API | Objects/buckets/versions/tags, Multipart, partNumber, Range, Copy directives, chunked upload and resume |
 | Lifecycle | Expiration, noncurrent versions, transition rules, Storage Classes, tiering and Restore |
-| Security | SSE-S3/KMS/C, key vault, object lock and retention, STS, bucket policies and auditing, TLS/mTLS, three-tier sub-account permissions, Argon2id |
+| Security | SSE-S3/KMS/C, key vault, object lock and retention, STS, bucket policies and auditing, TLS/mTLS, three-tier sub-account permissions, Argon2id, account soft byte quota alerts |
 | Data flow | Event notifications/Kafka, S3 Select, bucket replication, multi-site replication |
 | Control plane (M8) | Access points, Object Lambda, Batch Operations, Inventory, job engine, console pages |
 | Strong consistency (M9) | Sync buckets, stretch 2×6, 3-voter Raft (witness), feature levels 1..3 |
