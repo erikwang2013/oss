@@ -10,7 +10,7 @@
 
 An S3-compatible, self-built distributed object storage system (an equivalent implementation of MinIO). It supports multi-drive erasure coding 8+4, inter-node gRPC mesh, versioning, lifecycle, bucket policies and auditing, three SSE modes and object lock, STS temporary credentials, event notifications/Kafka, S3 Select, bucket and multi-site replication, access points/Object Lambda, Batch/Inventory/tiering, sync buckets and a 3-voter Raft control plane. The default `aws-cli`/`rclone` large-file paths (automatic multipart for ≥8 MiB) and resume habits work directly; the browser console supports chunked uploads and management.
 
-**Latest release: v1.21.1 (2026-10-29).** Documentation patch: synchronizes docs/site with v1.21.0 and removes references to the deleted legacy compatibility line; no code changes. Features and boundaries are the same as v1.21.0 (console consistent reads, accounts admin UI, tier archive/direct-read digest binding, static VPC endpoint registry, Raft follower catch-up). Hard byte/object-count quotas, M8 live runtime replication, and full Level C bidirectional mixed-version writes remain undelivered; see the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for boundaries.
+**Latest release: v1.21.1 (2026-10-29).** Console consistent reads (`?consistent=1` + `x-oss-applied-index`), accounts admin UI, tier archive/direct-read binding to the source object's committed SHA-256, and a static VPC endpoint registry; Raft follower lag causing spurious member-operation 404s is fixed. See the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for capability boundaries.
 
 ## Features
 
@@ -21,8 +21,8 @@ An S3-compatible, self-built distributed object storage system (an equivalent im
 | Lifecycle | Expiration, noncurrent versions, transition rules, Storage Classes, tiering and Restore |
 | Security | SSE-S3/KMS/C, key vault, object lock and retention, STS, bucket policies and auditing, TLS/mTLS, three-tier sub-account permissions, Argon2id, account soft byte quota alerts |
 | Data flow | Event notifications/Kafka, S3 Select, bucket replication, multi-site replication |
-| Control plane (M8) | Access points, Object Lambda, Batch Operations, Inventory, job engine, console pages |
-| Strong consistency (M9) | Sync buckets, stretch 2×6, 3-voter Raft (witness), feature levels 1..3 |
+| Control plane | Access points, Object Lambda, Batch Operations, Inventory, job engine, console pages |
+| Strong consistency | Sync buckets, stretch 2×6, 3-voter Raft (witness), feature levels 1..3 |
 | Operations | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | Clients | `aws-cli` / `rclone`; React console (chunking, resume, instant upload) |
 
@@ -30,28 +30,28 @@ An S3-compatible, self-built distributed object storage system (an equivalent im
 
 ![System architecture](docs/assets/architecture.svg)
 
-M6 data flow (event notifications / S3 Select / bucket replication):
+Data flow (event notifications / S3 Select / bucket replication):
 
-![M6 data flow: events / Select / replication](docs/assets/m6-dataflow.svg)
+![Data flow: events / Select / replication](docs/assets/m6-dataflow.svg)
 
-M7 multi-site async replication (control-plane changelog + object outbox):
+Multi-site async replication (control-plane changelog + object outbox):
 
-![M7 multi-site replication](docs/assets/m7-sites.svg)
+![Multi-site replication](docs/assets/m7-sites.svg)
 
-M8 control plane (access points and OLAP / jobs and Batch / Inventory / tiering and Restore / console pages, S0–S6):
+Control plane (access points and OLAP / jobs and Batch / Inventory / tiering and Restore / console pages):
 
-![M8 control plane](docs/assets/m8-control-plane.svg)
+![Control plane](docs/assets/m8-control-plane.svg)
 
 | crate / directory | Responsibility |
 |---|---|
 | `crates/xl-store` | Storage kernel: drive layout and key validation (`__XLDIR__` flattening), `xl.meta` encoding/decoding (version chain / encryption records / lock records / tags / storage_class / tier), commit protocol, EC encode/decode, multi-drive distribution and quorum, object/bucket locks and flock, key vault (`kms.rs`) and block-aligned envelope encryption (`crypto.rs`) |
-| `crates/xl-s3` | s3s `S3` trait implementation: DTO translation, error mapping, SigV4 authentication (AK → SK lookup in SQLite `access_keys`), SSE and object-lock header parsing/response assembly; M8 adds access point routing (`ap.rs`), Object Lambda (`olap.rs`), Restore/lifecycle (`restore.rs`/`lifecycle.rs`), TierGc/bucket-delete cleanup contract |
+| `crates/xl-s3` | s3s `S3` trait implementation: DTO translation, error mapping, SigV4 authentication (AK → SK lookup in SQLite `access_keys`), SSE and object-lock header parsing/response assembly; includes access point routing (`ap.rs`), Object Lambda (`olap.rs`), Restore/lifecycle (`restore.rs`/`lifecycle.rs`), TierGc/bucket-delete cleanup contract |
 | `crates/xl-proto` | Inter-node gRPC protocol: `oss.proto` messages and service definitions (fully generated by prost + tonic-build) |
 | `crates/xl-client` | tonic implementation of the mesh: `TonicMesh` client (lazy connect / timeouts / token interceptor + traceparent injection) and server-side handler (token validation, only operates on this node's local slots) |
-| `crates/oss-server` | ecat + axum assembly: console API (JWT), aetherupload wiring, S3 fallback, ops CLI; M8 adds job engine (`jobs.rs`), Batch (`job_actions*.rs`), access points/OLAP (`access_points_api.rs`), Inventory (`inventory*.rs`), tiering/restore (`tier*.rs`) and the 0003 migration |
-| `web` | Console frontend (M1b): React 19 + antd + Vite, Playwright e2e; M8 adds access point/job/tier/inventory/notification/audit/settings pages |
+| `crates/oss-server` | ecat + axum assembly: console API (JWT), aetherupload wiring, S3 fallback, ops CLI; includes job engine (`jobs.rs`), Batch (`job_actions*.rs`), access points/OLAP (`access_points_api.rs`), Inventory (`inventory*.rs`), tiering/restore (`tier*.rs`) and the 0003 migration |
+| `web` | Console frontend: React 19 + antd + Vite, Playwright e2e; includes access point/job/tier/inventory/notification/audit/settings pages |
 
-Disk layout quick note (M2b multi-drive): each drive holds one **complete namespace** — under `<drive>/<bucket>/<flattened-key>/` are `xl.meta` (this drive's replica) and version directories `<uuid>/part.1.<shard>` (the shards that land on this drive; in single-drive form, all shards). **A commit is always "data in place first → meta flip"**: single drive = rename on the same drive; multi-drive = two-phase meta commit per drive (prepare `xl.meta.new` on all drives ≥ quorum before flipping each to final; reads pick the **newest replica**). Small objects (< 128 KiB) are inlined into `xl.meta` and do not get data files. With encryption enabled (M5), data files hold **ciphertext shards** (encrypt then EC), and the wrapped DEK and `key_id` are recorded inside `xl.meta` (the metadata itself contains no plaintext keys). Scratch areas are under `.oss.sys/{tmp, trash, locks}` on each drive; the `drive-id` drive identity marker prevents using the wrong drive.
+Disk layout quick note (multi-drive): each drive holds one **complete namespace** — under `<drive>/<bucket>/<flattened-key>/` are `xl.meta` (this drive's replica) and version directories `<uuid>/part.1.<shard>` (the shards that land on this drive; in single-drive form, all shards). **A commit is always "data in place first → meta flip"**: single drive = rename on the same drive; multi-drive = two-phase meta commit per drive (prepare `xl.meta.new` on all drives ≥ quorum before flipping each to final; reads pick the **newest replica**). Small objects (< 128 KiB) are inlined into `xl.meta` and do not get data files. With encryption enabled, data files hold **ciphertext shards** (encrypt then EC), and the wrapped DEK and `key_id` are recorded inside `xl.meta` (the metadata itself contains no plaintext keys). Scratch areas are under `.oss.sys/{tmp, trash, locks}` on each drive; the `drive-id` drive identity marker prevents using the wrong drive.
 Control-plane metadata (users/keys/buckets/upload records/instant-upload index) lives in SQLite.
 
 **Tech stack**: Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 3.0.0 · axum 0.8 · sqlx / SQLite · serde + rmp-serde.
@@ -98,7 +98,7 @@ Single node (oss-server + console nginx):
 docker compose up --build        # console http://localhost:8080 · S3/API http://localhost:9000
 ```
 
-M3 cluster (4 nodes × 3 drives = 12 slots; service names are node addresses):
+Cluster (4 nodes × 3 drives = 12 slots; service names are node addresses):
 
 ```bash
 docker compose -f docker-compose.cluster.yml up --build

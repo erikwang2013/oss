@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.21.1（2026-10-29）。** 文档补丁：同步 v1.21.0 之后的文档与站点，清理已删除的旧兼容线引用；无代码变更。功能与边界同 v1.21.0（控制台一致读、账户管理员 UI、tier 归档/直读摘要绑定、AP 静态 VPC 端点 registry、Raft follower 追赶）。硬字节/对象数配额、M8 运行态实时复制与 Level C 完整双向混写仍未交付；边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.21.1（2026-10-29）。** 控制台一致读（`?consistent=1` + `x-oss-applied-index`）、账户管理员 UI、tier 归档/直读绑定源整对象 SHA-256、AP 静态 VPC 端点 registry；Raft follower 滞后时的成员操作已修复。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
@@ -21,8 +21,8 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | 生命周期 | 过期、非当前版本、转换规则，Storage Class、分层归档与 Restore |
 | 安全 | SSE-S3/KMS/C、密钥库、对象锁与保留期、STS、桶策略与审计、TLS/mTLS、子账户三档权限、Argon2id、账户软字节配额告警 |
 | 数据流 | 事件通知/Kafka、S3 Select、桶复制、多站点复制 |
-| 控制面（M8） | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎、控制台页面 |
-| 强一致（M9） | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..3 |
+| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎、控制台页面 |
+| 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..3 |
 | 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | 客户端 | `aws-cli` / `rclone`；React 控制台（分块、断线续传、秒传） |
 
@@ -30,32 +30,32 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 
 ![系统架构](docs/assets/architecture.svg)
 
-M6 数据流（事件通知 / S3 Select / 桶复制）：
+数据流（事件通知 / S3 Select / 桶复制）：
 
-![M6 数据流：事件 / Select / 复制](docs/assets/m6-dataflow.svg)
+![数据流：事件 / Select / 复制](docs/assets/m6-dataflow.svg)
 
-M7 多站点异步复制（控制面 changelog + 对象 outbox）：
+多站点异步复制（控制面 changelog + 对象 outbox）：
 
-![M7 多站点复制](docs/assets/m7-sites.svg)
+![多站点复制](docs/assets/m7-sites.svg)
 
-M8 控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Restore / 控制台页面，S0–S6）：
+控制面（访问点与 OLAP / 作业与 Batch / Inventory / 分层与 Restore / 控制台页面）：
 
-![M8 控制面](docs/assets/m8-control-plane.svg)
+![控制面](docs/assets/m8-control-plane.svg)
 
 | crate / 目录 | 职责 |
 |---|---|
 | `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录 / 标签 / storage_class / tier）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
-| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配；M8 增访问点路由（`ap.rs`）、Object Lambda（`olap.rs`）、Restore/生命周期（`restore.rs`/`lifecycle.rs`）、TierGc/删桶清理契约 |
+| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配；含访问点路由（`ap.rs`）、Object Lambda（`olap.rs`）、Restore/生命周期（`restore.rs`/`lifecycle.rs`）、TierGc/删桶清理契约 |
 | `crates/xl-proto` | 节点间 gRPC 协议：`oss.proto` 消息与 service 定义（prost + tonic-build 全量生成） |
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
-| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；M8 增作业引擎（`jobs.rs`）、Batch（`job_actions*.rs`）、访问点/OLAP（`access_points_api.rs`）、Inventory（`inventory*.rs`）、分层/恢复（`tier*.rs`）与 0003 迁移 |
-| `web` | 控制台前端（M1b）：React 19 + antd + Vite，Playwright e2e；M8 增访问点/作业/分层/清单/通知/审计/设置页面 |
+| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；含作业引擎（`jobs.rs`）、Batch（`job_actions*.rs`）、访问点/OLAP（`access_points_api.rs`）、Inventory（`inventory*.rs`）、分层/恢复（`tier*.rs`）与 0003 迁移 |
+| `web` | 控制台前端：React 19 + antd + Vite，Playwright e2e；含访问点/作业/分层/清单/通知/审计/设置页面 |
 
-磁盘布局速记（M2b 多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
+磁盘布局速记（多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
 `xl.meta`（该盘副本）与版本目录 `<uuid>/part.1.<shard>`（落到本盘的那些分片；单盘形态即全部分片）。
 **提交永远是「数据先到位 → meta 翻转」**：单盘 = 同盘 rename；多盘 = 各盘 meta 两阶段提交
 （全盘 `xl.meta.new` 准备 ≥ quorum 才逐盘转正；读取**最新副本**胜）。小对象（< 128 KiB）内联进
-`xl.meta`、不落数据文件。启用加密（M5）后数据文件存的是**密文分片**（先加密后 EC），
+`xl.meta`、不落数据文件。启用加密后数据文件存的是**密文分片**（先加密后 EC），
 包裹的 DEK 与 `key_id` 记在 `xl.meta` 内（元数据本身不含密钥明文）。临时区在每盘
 `.oss.sys/{tmp, trash, locks}`，盘身份标识 `drive-id` 防插错盘。
 控制面元数据（用户/密钥/桶/上传记录/秒传索引）在 SQLite。
@@ -111,7 +111,7 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 docker compose up --build        # 控制台 http://localhost:8080 · S3/API http://localhost:9000
 ```
 
-M3 集群（4 节点 × 3 盘 = 12 槽；服务名即节点地址）：
+集群（4 节点 × 3 盘 = 12 槽；服务名即节点地址）：
 
 ```bash
 docker compose -f docker-compose.cluster.yml up --build
