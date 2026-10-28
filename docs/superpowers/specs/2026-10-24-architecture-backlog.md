@@ -26,44 +26,47 @@
 
 | # | 项目 | 代码现状（诚实结论） | MVP 体量 | 主要依赖 | 风险 |
 |---|---|---|---|---|---|
-| 1 | Level C 任意双向混合版本 | 只有单向 Level B（控制面 wire 2 / feature 2）；OSSCTL2 不存在；旧二进制读不了 Level B 数据与 CMK | 6–10 人周 | OSSCTL2、兼容补丁版本、CMK 重包 | 高 |
-| 2 | M3/M4 数据面滚动升级 | proto 大体兼容（v1.13.1 已有 slot/set），但无数据面版本握手；mesh TLS 启动期固化；跨版本 cutover 无校验 | 4–8 人周 | 能力握手、TLS 热轮换 | 高 |
-| 3 | 完整多租户账户体系 | 账户 = `account_id_of(uid)` 的 12 位派生号；无 accounts 表/管理员/配额/共享；AP 账户 = 桶主账户 | 5–8 人周 | 无（可并行） | 中高 |
-| 4 | M8 多节点控制面 | 11 张控制表已随 M9 Raft 复制；**作业/清单运行/游标/tier 恢复/审计仍是单节点本地**，调度器无 leader 门控 | 6–9 人周 | OSSCTL2（持久化部分） | 高 |
+| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现（level 2/3 快照）；缺生产 Ext 命令与完整双向混写；旧二进制读不了 level-2/3 数据与 CMK | 6–10 人周 | 兼容补丁版本、生产 Ext 命令、CMK 重包 | 高 |
+| 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；仍缺跨版本 MPU 完成 | 4–8 人周 | 跨版本 MPU 语义 | 高 |
+| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额已交付（accounts/成员/Raft level-3 写/桶数硬配额）；仍缺硬字节/对象数配额、canonicalization worker、管理员 UI | 5–8 人周 | 跨节点用量聚合 | 中高 |
+| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控与 M8-2a runstate 快照扩展已交付；运行态日志复制/lease takeover/consistent=1 仍缺 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
 | 5 | M3 shrink / 单机→集群 | 静态拓扑 + 位置式槽位；rebalance 只支持尾部追加；shrink 与单机转集群明确不支持 | 8–12 人周 | 拓扑 v3（显式 slot map） | 极高 |
 
 ---
 
 ## 1. Level C：任意双向混合版本升级
 
-### 1.1 现状与证据
+### 1.1 现状与证据（2026-10-28 复核）
 
-- 控制面兼容层只定义了 **wire 1↔2、feature 1↔2 的单向窗口**：
-  `crates/oss-server/src/raft/compat.rs:15-23`（`WIRE_VERSION=2`、`MIN_COMPAT_WIRE_VERSION=1`、
-  `MAX_FEATURE_LEVEL=2`）；生效级别取当前 term voter+learner 的 feature 最小值
-  （`compat.rs:157-198`）；激活标记只升不降（`bump_activation_tx`，`compat.rs:86-100`），
-  启动守卫拒绝 marker 高于二进制或配置（`guard_startup`，`compat.rs:68-83`）。
-- 快照只有 **OSSCTL1**：`crates/oss-server/src/raft/data.rs:23-27`（`SNAPSHOT_FORMAT=1`、
-  `MAGIC=b"OSSCTL1\n"`）；`encode_snapshot`（`data.rs:806-812`）在存在
-  `lifecycle_rules.config_json` 时直接拒绝；`install_tx`（`data.rs:489`）按已知 11 张表
-  delete/reinstall，未知表/字段被静默忽略。格式 1 的行结构**没有** `deny_unknown_fields`，
-  旧节点读新行会静默丢字段。
-- 控制命令用 `#[serde(deny_unknown_fields)]`（`crates/oss-server/src/raft/command.rs:16,26,41,58`），
-  且 `min_feature_level()` 只让结构化生命周期返回 2（`command.rs:274-290`）；v1.13.1
-  的旧解码器遇到未知变体/字段会整条拒绝。命令上限 24 MiB（`command.rs:291-299`）。
-- `raft/store.rs` 的 D6 路径只认 OSSCTL1；旧版 KV 快照被拒绝。
-- cutover 导出封套有 `format` 与 `version` 字段（`crates/oss-server/src/raft/cutover/export.rs:16-21,47-52`），
-  但 `verify_export` 只校验 format/kind/checksum（`export.rs:61-66`）——**不校验来源版本、
-  快照格式或 feature level**；`force_recover` 只检查空 raft.db / raft 模式 / 无已应用状态。
+- 控制面兼容层定义 **wire 1↔2、feature 1↔3**：`crates/oss-server/src/raft/compat.rs:15-32`
+  （`WIRE_VERSION=2`、`MIN_COMPAT_WIRE_VERSION=1`、`FEATURE_LEVEL_3=3`、
+  `MAX_FEATURE_LEVEL=3`）；生效级别取当前 term voter+learner 的 feature 最小值
+  （`effective_feature_level`，`compat.rs:182`）；激活标记只升不降
+  （`bump_activation_tx`，`compat.rs:111`），启动守卫拒绝 marker 高于二进制或配置
+  （`guard_startup`，`compat.rs:93`）。这是 Level B 的单向窗口，旧端能力上限不变。
+- 快照封套已实现 **OSSCTL1/2/3**：`SNAPSHOT_FORMAT=3`（`data.rs:33`），编码按
+  `max(激活级别, 数据要求)` 选格式（`data.rs:1196-1230`）。V2 载荷冻结；V3 增命名扩展区
+  （`m8.runstate`、tenancy）。行结构全部 `deny_unknown_fields`，未知表/字段/扩展在任何写
+  之前整包拒绝（`data.rs:18-21,1097-1134`）；`install_tx`（`data.rs:632`）不再静默忽略。
+- 控制命令 `deny_unknown_fields`（`command.rs:18,28,43,60`），`min_feature_level()` 对
+  结构化生命周期返回 2、对 `Ext` 与账户/成员命令返回 3（`command.rs:365-382`）；
+  v1.13.1 旧解码器遇到未知变体/字段仍会整条拒绝。命令上限 24 MiB（`raft/mod.rs:65`）。
+- `raft/store.rs` 的 D6 路径接受 OSSCTL1/2/3（`store.rs:926`），未知扩展 fail-closed；
+  旧版 KV 快照仍被拒绝。
+- LC-0 来源闸门已落地：导出封套带 `snapshot_format`/`wire_version`/`feature_level`/
+  `activation_level`/`source_build`（`cutover/export.rs:27-52`），`verify_export`
+  （`export.rs:139`）在 cutover/force-recover 动数据前校验格式、wire 与级别。
 - 数据面 `xl.meta` 是 `FORMAT_VERSION=1` 的 msgpack，字段只增 `Option` + `#[serde(default)]`
   （`crates/xl-store/src/meta.rs:15,62`）；旧解码器跳过未知字段，所以**新写旧读**在纯元数据
   层面通常可行。但 CMK 是例外：`EncryptionRecord` 的 `key_id` 形如 `cmk:<name>:k<n>`
   （`meta.rs:315-333`、`kms.rs:278-290`），v1.13.1 只认 `file`/`k` 前缀的 key id，CMK 对象
   在旧二进制上 **fail-closed 不可读**；旧二进制重写 `xl.meta`（如定向删版本）还会丢掉它不
   认识的字段（`part_sizes` 丢失只会让 partNumber Range 降级，不丢数据；CMK 则是硬失败）。
-- README 的升级 runbook 已写明：**激活 = 不归点**，回滚只能在激活前（停集群、换旧二进制、
-  删除 `feature_level` 键）；含 Level B 数据的环境在 OSSCTL2 前不能快照/切档
-  （`README.md:1556-1576`）。
+- 升级口径仍写明：**激活 = 不归点**，回滚只能在激活前（README 已精简为概览，升级窗口见
+  `site/install.html:209`）；含 Level B 数据的环境只能由能写 OSSCTL2/3 的新二进制快照/切档。
+- **Level C 剩余**：生产 `Ext` 命令零注册（`REGISTERED_EXT_TYPES` 为空，
+  `command.rs:305`），完整「旧端只读 + 新 leader 协调写」的双向混写未做；v1.13.2 补丁线
+  仍是发布决策（§1.2）。CMK rewrap 工具已具备（`oss-server cmk rewrap`，`cli.rs:57,461-473`）。
 
 ### 1.2 关键结论：已发布的 v1.13.1 不能成为 Level C 的一端
 
@@ -145,28 +148,33 @@ Level C 要求「旧二进制读到新数据并继续作为 voter」。但 v1.13
 
 ## 2. M3/M4 数据面滚动升级
 
-### 2.1 现状与证据
+### 2.1 现状与证据（2026-10-28 复核）
 
-- proto 自 v1.13.1 起的新增很少：`ListUploadsLocal`（`crates/xl-proto/proto/oss.proto:19`）、
-  `ListReq.include_deleted=6` / `marker_exclusive=7`（`oss.proto:55-59`）。v1.13.1 已有
-  `ShardWrite.slot/set`、`ShardRead.slot/set`、`ShardDelete.slot/set`，分片 RPC 主体兼容。
-- 语义差异不是「缺一路」而是「结果不同」：旧节点忽略 `marker_exclusive`，V1 List 续页会
-  变成包含式（可能重复边界键，proto 注释已承认）；忽略 `include_deleted` 会漏 delete marker。
-  MPU 并集对旧节点 `ListUploadsLocal` 的 UNIMPLEMENTED 目前只告警降级
-  （`crates/xl-store/src/store/uploads.rs:261-263`，「少一路并集」）。
-- `xl.meta` 只增 `Option` 字段（`meta.rs:15,62`），新读旧没问题；旧节点重写 meta 会丢未知
-  字段（`part_sizes`、未来的 tier/加密字段）。这不会丢分片，但会让 partNumber Range 或
-  语义字段降级，必须在混跑窗口逐操作验证。
-- **没有数据面版本握手**：`NodeHealth` 只有 `node_id/version/slots/buckets`
-  （`oss.proto:67`），协调者无法按 peer 能力选语义。
-- **mesh TLS 启动期固化**：`TonicMesh::new_with_timeouts_tls` 把 `ClientTlsConfig` 装进
-  不可变 `Endpoint`（`crates/xl-client/src/lib.rs:262-290`）；服务端 `serve_tls` 只在启动时
-  拿一次 `ServerTlsConfig`（`lib.rs:1052-1064`；调用点 `crates/oss-server/src/cli.rs:419,459`、
-  `state.rs:359,427-433`）。HTTP/Raft 的 SIGHUP 热加载**不覆盖 mesh**，所以证书轮换仍要重启。
-- 放置必须统一 v1：README 明确混版窗口开 `placement="v2"` 会降级/失败
-  （`README.md:496-499`）；`placement_v2` 混版 fail-closed。
-- 跨版本 cutover/force-recover 无来源校验（见 §1.1 的 `export.rs:61-66`）。
-- MPU 粘节点（§11.3）：upload_id 是纯 UUID，暂存区节点本地，重启用另一节点无法完成。
+- **DP-0 数据面握手（v1.17.0）**：`NodeHealth` 新增 `data_wire_version=5`、
+  `topo_epoch=6`、`topo_hash=7`、`drives=8`、`maintenance=9`
+  （`crates/xl-proto/proto/oss.proto:81-85`）；`xl-store::mesh_gate` 按操作类放行，
+  未知 wire/拓扑不一致 fail-closed（503 `peer_incompatible`，
+  `crates/oss-server/src/raft/routes.rs:273`、`state.rs:475-485`），状态/metrics 暴露
+  degraded/incompatible peers（`router.rs:529-614,835-870`）。
+- **DP-1 混版读矩阵（v1.19.0）**：V1 排他 marker 对 legacy peer 改发包含式并回
+  `x-oss-degraded: list-marker`（`crates/xl-store/src/store/list.rs:136-224`）；
+  版本列表 `require_complete` 对 legacy/不可达 503；MPU 并集回
+  `x-oss-degraded: mpu-union`（`store/uploads.rs:193-297`）；placement v2 在混版窗口
+  写前 fail-closed。
+- **DP-2 mesh 入站 TLS 热轮换（v1.20.0）**：`Tls::mesh_server_watch()`
+  （`crates/oss-server/src/tls.rs:233`）+ `serve_tls_watch`
+  （`crates/xl-client/src/lib.rs:1866`）每连接取当前 rustls 配置；同版本 3 节点
+  116/0、v1.13.1 旧二进制 64/0/4 的滚动 e2e 已实跑（验收记录 §14）。
+  `tests/e2e_dproll.sh` 覆盖同版本逐节点重启（读不断、sync 写 fail-closed、控制面继续提交）。
+- **DP-3 跨版本 cutover/force-recover 守卫（v1.16.0）**：见 §1.1 的
+  `cutover/export.rs:139`。
+- 旧端基线：v1.13.1 已有 `ShardWrite/Read/Delete.slot/set`，分片 RPC 主体兼容；
+  `ListUploadsLocal`（`oss.proto:19`）与 `ListReq.include_deleted/marker_exclusive`
+  （`oss.proto:55-59`）是后续新增，语义差异由 DP-1 门控。
+- **仍缺**：跨版本 MPU 完成——`upload_id` 是纯 UUID、暂存区节点本地，重启用另一节点
+  无法完成（§2.3 非目标）；跨版本数据面的写窗口仍按 fail-closed/维护窗口执行，
+  `tests/e2e_m9_rolling.sh` 只覆盖控制面双二进制滚动。`xl.meta` 旧节点重写仍会丢
+  未知字段（`part_sizes`、新 tier/加密字段），需按 DP-1 矩阵逐操作验证。
 
 ### 2.2 最小可行切片
 
@@ -225,24 +233,32 @@ Level C 要求「旧二进制读到新数据并继续作为 voter」。但 v1.13
 
 ## 3. 完整多租户账户体系
 
-### 3.1 现状与证据
+### 3.1 现状与证据（2026-10-28 复核）
 
-- 账户是 **uid 的纯函数**：`account_id_of(uid)` 生成 12 位十进制
-  （`crates/xl-s3/src/access.rs:47-53`）；`LEGACY_ACCOUNT="000000000000"`
-  （`access.rs:55`）给无主/管理员桶；`bucket_account_id`（`access.rs:58-64`）。
-- 没有 accounts 表：`crates/oss-server/migrations/0001_init.sql` 只有 users/access_keys/
-  permissions/buckets/...，`0003_m8.sql` 与 `0004_m9.sql` 也没有账户实体。
-- 权限表是用户级（`permissions`），`AuthedUser { uid, is_admin, ak }`（`access.rs:32-45`）；
-  `is_admin` 是全局布尔，没有账户管理员。
-- 策略 principal 支持 `"*"`、AK、`uid:<n>`、`arn:aws:iam::<12>:root`
-  （`crates/xl-s3/src/policy.rs`）；`account_arn_matches` 把 ARN 映射回**单个 uid**
-  （`access.rs:69`），不是账户成员集合。
-- AP 的 `account` = 桶账户（`crates/xl-s3/src/ap.rs:356-370,397-402`）；AP 策略只做交集限制，
-  没有跨账户 AP；AP 缓存进程本地、TTL 有界（`ap.rs:9-12`）。
-- Inventory 跨账户目标仅管理员可配置，运行期复核失败即不写输出（§11.3）；这不是租户边界。
-- `aws:SourceVpc` 只是**来源 VPC 证明**（静态 `OSS_AP_VPC_ID` 或可信反代头），明确不是
-  PrivateLink 端点身份（`ap.rs:9-12`）；没有 `aws:SourceVpce`。
-- 配额：无账户配额；只有批次/速率限制。桶归属由 `buckets.owner_id` 表示。
+- **AC-0/AC-1/AC-2/AC-3 已交付**：`accounts`/`account_members` 于
+  `crates/oss-server/migrations/0005_accounts.sql` 建表（id 仍 12 位、ARN 不变），
+  `account_usage` 于 `0006_tenancy.sql`；`accounts.soft_byte_quota` 由
+  `db.rs:1046-1052` 补列。账户解析先查成员行、无行回落 `account_id_of(uid)`
+  （`db.rs:2280-2290`、`xl-s3/src/access.rs:87-110`）。
+- 账户管理员与生命周期：角色 `owner/admin/member`（`0005`），`require_manager`
+  允许全局管理员或本账户 manager（`accounts_support.rs:9-31`）；停用账户在 AK 认证
+  （`access.rs:706`）与 JWT `who()`（`console.rs:125,139`）全链 fail-closed。
+- 写路径走 Raft：8 个 level-3 命令（`AccountCreate/Update/SetQuota/SetSoftQuota/
+  Delete/MemberAttach/MemberSetStatus/UserCreate`，`raft/command.rs:226-275`），
+  apply 在 `raft/apply/accounts.rs`；OSSCTL3 快照携带账户两表
+  （`raft/data.rs:231-233`）。
+- 配额：桶数硬配额在创建桶时 fail-closed（`access.rs:834-869`、`console.rs:2574`）；
+  软字节配额为只读用量端点 `GET /accounts/{id}/usage` + `PUT /accounts/{id}/soft-quota`
+  （`accounts_api.rs:35-37`、`accounts_usage.rs:98-118`，仅告警不阻写）。
+- 策略 principal：账户根 ARN 按**成员关系**命中全部成员，无成员行回落 uid 派生账户
+  （`access.rs:87-110`）；AP 的 `account` = 桶账户，跨账户只经 AP 策略 Principal
+  （`xl-s3/src/ap.rs:8,338-384`）；`aws:SourceVpce` 是显式部署证明，不是 PrivateLink
+  端点身份（`ap.rs:99-110,800-814`）。Inventory 跨账户目标仅管理员可配置，运行期复核
+  失败即不写输出（§11.3）；这不是租户边界。
+- **仍缺**：硬字节配额与对象数配额（无跨节点实时用量聚合）；账户表 level-3
+  canonicalization worker 未实现——marker `accounts_canonical_v1` 仅由一次性 standalone
+  回填或 fresh Raft 启动写入（`db.rs:299-300,2242-2277`）；管理员账户控制台页面未做
+  （`web/src/pages` 无账户页，后端 `/accounts` API 完整）。
 
 ### 3.2 真正阻塞点
 
@@ -313,25 +329,30 @@ Level C 要求「旧二进制读到新数据并继续作为 voter」。但 v1.13
 
 ## 4. M8 多节点控制面
 
-### 4.1 现状与证据（先纠正一个容易误读的点）
+### 4.1 现状与证据（2026-10-28 复核）
 
-§11.3 写「M8 多节点控制面：未实现（单节点）」。准确说法是：**IAM/桶/策略/AP/OLAP/
-Inventory 配置这 11 张表的控制写已经随 M9 Raft 复制**（`raft/data.rs` 的 `ControlData`；
-`migrations/0004_m9.sql` 的 `schema_meta/raft_applied/...`）；但 M8 的**运行态**仍是单节点：
+§11.3 写「M8 多节点控制面：未实现（单节点）」。准确说法是：**11 张表 + level-3 账户
+两表的控制写已随 M9 Raft 复制**（`raft/data.rs:1-5,231-233`），M8-1 的 leader 门控与
+M8-2a 的运行态快照扩展也已落地；M8 的**运行态日志复制/接管**仍未完成：
 
-- `ControlPlane` 的 Raft 分支只覆盖 11 表命令（`raft/control.rs:167-176,265,292`）；
-  follower 写返回 `Unavailable` + leader 提示，HTTP 不做 307 重定向
-  （`control.rs` 的 `ForwardToLeader` 映射），客户端需自行重试。
-- 作业引擎是节点本地 SQLite，worker 用 `BEGIN IMMEDIATE` 领取，文件头明写
-  「多进程/多节点不支持」（`crates/oss-server/src/jobs.rs:3-4,73`）。
-- Inventory worker 轮询本地 `due_runs`，游标/水位节点本地
-  （`crates/oss-server/src/inventory.rs:131,163,184`；`0003_m8.sql` 的
-  `inventory_runs/inventory_cursors/inventory_incremental`）。
-- tier 恢复回收（`tier_sweep.rs:416`）、生命周期游标、审计（`state.rs:688` 的本地
-  `audit_log`）都是进程本地；AP 缓存是进程本地 + TTL（`ap.rs:9-12`）。
-- JWT 无状态、12h 过期（`console.rs:260-289`）；登录限流器是进程本地；这使多节点会话
-  天然可跨节点，但限流与吊销强度下降。
-- 调度器没有 leader 门控：每个节点都会 `spawn_workers`/`spawn_worker`/`tier_sweep::spawn`。
+- `ControlPlane` 覆盖 11 表命令与 level-3 账户/成员命令（`raft/command.rs:226-275`、
+  `raft/apply/accounts.rs:60-250`）；follower 写返回 `Unavailable` + leader 提示，
+  HTTP 不做 307 重定向（`control.rs` 的 `ForwardToLeader` 映射），客户端需自行重试。
+- **M8-1 leader 门控已落地**：`LeaderGate`（`raft/mod.rs:184-240`）按 `is_leader()`/
+  `still_current()` fencing；jobs 调度（`jobs.rs:185`）、tier sweep（`tier_sweep.rs:488`）、
+  inventory（`inventory.rs:215`）、lifecycle（`lifecycle.rs:1100`）只在 leader 执行。
+- 但运行态仍是节点本地表：`job_tasks`/`inventory_runs`/`inventory_cursors`/
+  `tier_restores`/`lifecycle_cursors` 由本地 worker 直写（`jobs.rs:3-5`、
+  `tier_sweep.rs:3-4`、`inventory.rs:5`），leader 本地库丢失仍会丢在途状态。
+- M8-2a 交付的是**快照扩展**而非日志复制：九张运行态表编码为 OSSCTL3 命名扩展
+  `m8.runstate`（`raft/runstate/mod.rs:1-10`、`migrations/0007_m8_runstate.sql`），
+  随快照安装/导出携带；`schedule_lease` 只有表与镜像，**无 acquire/renew/takeover**
+  （全仓仅 `raft/runstate/store.rs:213,432` 读写该行）。
+- 审计仍本地（`state.rs` 的 `audit_log`）；AP 缓存进程本地 + TTL（`ap.rs:9-12`）；
+  JWT 无状态、12h 过期（`console.rs`）；登录限流器进程本地——多节点会话天然可跨节点，
+  但限流与吊销强度下降。
+- **仍缺**：跨节点 lease/takeover（运行态不随日志复制）、`?consistent=1` 读己之写
+  （全仓无该参数）、故障切换演练（`tests/e2e_m8.sh` 为单节点）。
 
 ### 4.2 真正阻塞点
 
