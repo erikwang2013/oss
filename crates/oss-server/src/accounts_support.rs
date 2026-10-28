@@ -23,13 +23,11 @@ pub(crate) async fn require_manager(
     if is_admin {
         return Ok(());
     }
-    match state.db.member_role(account_id, uid).await {
-        Ok(role) if is_manager(role.as_deref()) => Ok(()),
-        Ok(_) => Err(forbidden("需要账户管理员权限")),
-        Err(e) => {
-            tracing::error!(error = %e, "查询账户角色失败");
-            Err(internal_error())
-        }
+    let role = member_role_caught_up(state, uid, account_id, is_manager).await?;
+    if is_manager(role.as_deref()) {
+        Ok(())
+    } else {
+        Err(forbidden("需要账户管理员权限"))
     }
 }
 
@@ -44,14 +42,44 @@ pub(crate) async fn require_member(
     if is_admin {
         return Ok(());
     }
-    match state.db.member_role(account_id, uid).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(forbidden("无权访问该账户")),
-        Err(e) => {
-            tracing::error!(error = %e, "查询账户角色失败");
-            Err(internal_error())
-        }
+    let role = member_role_caught_up(state, uid, account_id, |r| r.is_some()).await?;
+    if role.is_some() {
+        Ok(())
+    } else {
+        Err(forbidden("无权访问该账户"))
     }
+}
+
+/// Raft 下本地成员行可能落后于 leader 已提交的挂载/改角色：本地 miss 或角色不足时，
+/// 等本地 apply 追上 leader 已应用点后重查一次；standalone 不等待，行为不变。
+/// 权限判定必须用这里返回的（已追赶的）行——追赶后仍不足则调用方照旧拒绝。
+#[allow(clippy::result_large_err)]
+async fn member_role_caught_up(
+    state: &AppState,
+    uid: i64,
+    account_id: &str,
+    sufficient: impl Fn(Option<&str>) -> bool,
+) -> Result<Option<String>, Response> {
+    let mut role = local_member_role(state, account_id, uid).await?;
+    if !sufficient(role.as_deref())
+        && state.control.is_raft()
+        && state.control.wait_caught_up(USER_LOOKUP_CATCH_UP).await
+    {
+        role = local_member_role(state, account_id, uid).await?;
+    }
+    Ok(role)
+}
+
+#[allow(clippy::result_large_err)]
+async fn local_member_role(
+    state: &AppState,
+    account_id: &str,
+    uid: i64,
+) -> Result<Option<String>, Response> {
+    state.db.member_role(account_id, uid).await.map_err(|e| {
+        tracing::error!(error = %e, "查询账户角色失败");
+        internal_error()
+    })
 }
 
 /// 旧直写 API 的账户前置检查：保留 404 / “账户已停用” 的状态与文案。
@@ -69,7 +97,7 @@ pub(crate) async fn require_active_account(state: &AppState, id: &str) -> Result
     }
 }
 
-/// 滞后 follower 的 uid 重查上限：只等一次、有界；超时按本地结果拒绝（可重试）。
+/// 滞后 follower 的本地副本重查上限（用户/成员行）：只等一次、有界；超时按本地结果拒绝（可重试）。
 const USER_LOOKUP_CATCH_UP: Duration = Duration::from_secs(2);
 
 #[allow(clippy::result_large_err)]

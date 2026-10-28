@@ -153,8 +153,10 @@ async fn follower_account_write_is_503_with_leader_hint() {
 /// §14.3 残余：follower 的 users 副本落后（leader 已提交 UserCreate，本地 apply 被
 /// 写锁挡住）时，attach_member 不能凭本地 miss 直接 404；等本地 apply 追上 leader
 /// 已应用点后重试一次并成功。真正不存在的 uid 仍 404。
+/// item 10 残余：成员挂载/角色变更在本地滞后时，require_manager 同样必须追赶后判定
+/// （旧代码会把刚挂载的 manager 误判 403），真正非 manager 追赶后仍 403。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn attach_member_on_lagging_follower_waits_for_catch_up() {
+async fn lagging_follower_catch_up_covers_member_attach_and_role_checks() {
     let dir = tempfile::tempdir().unwrap();
 
     // 真实 2-voter 集群：node 1 为 leader（带真实 advertise/HTTP），node 2 只跟随。
@@ -370,6 +372,93 @@ async fn attach_member_on_lagging_follower_waits_for_catch_up() {
         .await
         .unwrap();
     assert_eq!(missing_status.status(), 404);
+
+    // item 10：leader 已提交成员挂载为 admin（manager）后，follower 本地成员行滞后。
+    // 先把 frank 的用户行追上（who() 只读本地），再只让那条挂载日志卡在写锁后。
+    assert_eq!(
+        a.handle
+            .write(ControlCommand::UserCreate {
+                username: "frank".into(),
+                password_hash: oss_server::db::hash_password("frank-password"),
+                status: "active".into(),
+                created_at: 14,
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    let a_applied = {
+        let m = a.handle.raft().metrics();
+        m.borrow().last_applied.map(|l| l.index).unwrap_or(0)
+    };
+    assert!(
+        b.handle
+            .wait_applied(a_applied, Duration::from_secs(10))
+            .await
+    );
+    let frank_uid = admin_uid + 3;
+    assert_eq!(
+        b_db.get_user(frank_uid).await.unwrap().map(|u| u.0),
+        Some("frank".to_string())
+    );
+
+    let mut lock = b_db.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    assert_eq!(
+        a.handle
+            .write(ControlCommand::AccountMemberAttach {
+                account_id: ACC.into(),
+                username: "frank".into(),
+                role: "admin".into(),
+                created_at: 15,
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    assert!(b_db.member_role(ACC, frank_uid).await.unwrap().is_none());
+
+    let req = {
+        let http = http.clone();
+        let url = format!("{base}/api/v1/accounts/{ACC}/users");
+        let tok = token(frank_uid);
+        tokio::spawn(async move {
+            http.post(url)
+                .bearer_auth(tok)
+                .json(&serde_json::json!({
+                    "username": "grace",
+                    "password": "grace-password"
+                }))
+                .send()
+                .await
+        })
+    };
+    // 旧代码此刻已凭本地缺行返回 403；放行 apply 后应追赶成功。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+    drop(lock);
+    let resp = req.await.unwrap().unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "滞后 follower 的 manager 权限判定必须追上后放行（不能 403）"
+    );
+
+    // 真正非 manager（dave 本地角色仍为 member）：追赶后不让行，保持 403。
+    let denied = http
+        .post(format!("{base}/api/v1/accounts/{ACC}/users"))
+        .bearer_auth(token(target_uid))
+        .json(&serde_json::json!({
+            "username": "heidi",
+            "password": "heidi-password"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403, "追赶后仍非 manager 必须拒绝");
 
     b.shutdown().await;
     a.shutdown().await;
