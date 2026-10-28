@@ -558,5 +558,5 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 | 桶配额并发 | leader append 前判定 + standalone `BEGIN IMMEDIATE` | 不新增 `ControlResponse` 变体，混版不分叉；quota=2 并发恰 2 成功 1×403 |
 | 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level 4 |
 
-**验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server` 全量与 clippy/fmt
-结果见发布前复核记录。
+**验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server` 全量
+**66 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。
