@@ -509,9 +509,8 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 
 ### 16.1 v1.13.2 兼容补丁线（未发布）
 
-- 分支 `release/v1.13.2-stubs`（基于 `v1.13.2-task6-wip` = a39858a，基于 v1.13.1），tip
-  **282b08b**；未合并 main、未打 tag。该分支已于 2026-10-29 按维护决策删除（本地+远端），
-  本段保留为技术记录。
+- 旧线工作基于 v1.13.1（a58d64a）；实现曾达 282b08b，但对应分支与存档 tag 已于
+  2026-10-29 按维护决策全部删除（本地+远端），本段仅保留技术记录，无仍可引用的分支/tag。
 - 内容：LC-2「识别但拒绝」桩（main 的 9 个 level-3 变体精确解码，apply 一律 `Invalid`，
   不写表、不 fail-stop、不升激活 marker）；leader 侧 feature 闸（`client_write` 与
   `/site/raft/write` 转发入口在 append 前拒绝 level-3，堵住「旧 leader 写入、新端执行/旧端
