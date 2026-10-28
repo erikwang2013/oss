@@ -215,6 +215,13 @@ json_get() { python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 print(d.get(sys.argv[1],""))' "$1"; }
+# site/identity 的 stretch.<key>（token 面，JWT except）：stretch 两端互校的观测面。
+ident_get() { # base site_token key
+  curl -s --max-time 5 "$1/api/v1/site/identity" -H "x-oss-site-token: $2" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print((d.get("stretch") or {}).get(sys.argv[1],""))' "$3"
+}
 post_code() { curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$1" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" > "$4"; }
 put_code() { curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X PUT "$1" -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" > "$4"; }
 
@@ -269,6 +276,31 @@ for p in sys.argv[1:3]:
 print(n)' "$W/a/oss.db" "$W/b/oss.db" "$1"; }
 shards_at() { find "$1"/d* -type f -name 'part.*' -path "*/$2/$3/*" 2>/dev/null | wc -l | tr -d ' '; }
 meta_at() { find "$1"/d* -type f -name 'xl.meta' -path "*/$2/$3/xl.meta" 2>/dev/null | wc -l | tr -d ' '; }
+# fsck 报告断言（字段见 xl-store FsckReport）。repair 轮允许孤儿/stray（本轮已修），但
+# repaired 必须 true、坏 meta/不可达必须 0；check 轮（修复后只读复检）必须全清。
+fsck_ok() { # report.json repair|check
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"报告不可读: {e}"); sys.exit(1)
+bad = []
+if sys.argv[2] == "repair" and r.get("repaired") is not True:
+    bad.append("repaired!=true")
+if r.get("corrupt_meta"):
+    bad.append(f"corrupt_meta={r['corrupt_meta']}")
+if r.get("unreachable_nodes"):
+    bad.append(f"unreachable_nodes={r['unreachable_nodes']}")
+if sys.argv[2] == "check":
+    for k in ("missing_shards", "bad_shards", "orphan_dirs", "stray_files",
+              "missing_meta_keys", "missing_bucket_dirs"):
+        if r.get(k):
+            bad.append(f"{k}={r[k]}")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+PY
+}
 
 # 轮询谓词（供 retry 复用）
 a_head() { aws_a s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1; }
@@ -542,14 +574,61 @@ else
   # plan §2.4/§7：stretch 禁止 sync 桶——控制台建 sync 桶必须 400（不是 503/静默放行）
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$A/api/v1/buckets" -H "authorization: Bearer $AT" -H 'content-type: application/json' -d "{\"name\":\"m9sync-$STAMP\",\"replication_mode\":\"sync\"}")
   ck [ "$code" = 400 ]
-  # TODO(S9)：恢复后 fsck --repair 复检（CLI 已存在：oss-server fsck --repair；需决定与在线 A 的
-  #   并发窗口和报告断言）；提交 ≥9（需 S5/S6 把 raft applied 接到 status 后取差）；B 本地为
-  #   第二节点（需 identity/日志断言）。见 plan §S9/§7 验收③；本段其余断言已就绪。
+  # plan §S9/§7 验收③：提交 ≥9（Q_s=data+1=9）。集群写只有翻转 ≥9 槽才返回 2xx
+  # （write_meta_cluster：<Q_s 即补偿回滚并报 QuorumUnmet）。已提交槽的盘上形态是 xl.meta，
+  # xl.meta.new = prepare 未提交；故该 key 两站点 xl.meta 副本数即已翻转槽数，≥9 才通过。
+  # raft applied（/api/v1/raft/status 的 applied.index）只随控制面命令增长（本步仅建桶 1 条），
+  # 不是数据面槽提交口径，故不取 applied 差。
+  CM_A=$((MA + MB))
+  CM_B=$(( $(meta_at "$W/a" "$SBK" b.bin) + $(meta_at "$W/b" "$SBK" b.bin) ))
+  if [ "$CM_A" -ge 9 ] && [ "$CM_B" -ge 9 ]; then
+    pass "提交 ≥9（Q_s=9）：a.bin $CM_A 槽 / b.bin $CM_B 槽已翻转"
+  else
+    fail "提交 <9（a.bin $CM_A / b.bin $CM_B 槽已翻转；成功写要求 ≥9）"
+  fi
+  # 验收③：B 本地为第二节点——规范序按 node_id 升序（A<B ⇒ A=0、B=1）。两端 identity
+  # （/api/v1/site/identity，token 面）必须镜像互报，否则槽序不一致（跨站分片会被归属拒写）。
+  ID_B=$(ident_get "$B" "$TOK_B" node_id); ID_BP=$(ident_get "$B" "$TOK_B" peer_node_id)
+  ID_A=$(ident_get "$A" "$TOK_A" node_id); ID_AP=$(ident_get "$A" "$TOK_A" peer_node_id)
+  if [ "$ID_B" = B ] && [ "$ID_BP" = A ] && [ "$ID_A" = A ] && [ "$ID_AP" = B ]; then
+    pass "B 本地为第二节点（identity 互校 B.node_id=B/peer=A，A 镜像；规范序 A<B）"
+  else
+    fail "stretch identity 不符（B=$ID_B/$ID_BP A=$ID_A/$ID_AP）——B 非第二节点或接线接反"
+  fi
   kill9 "$B_PID"; B_PID=""
   if aws_a s3 cp "s3://$SBK/a.bin" "$W/sa.down" >/dev/null 2>&1; then fail "停 B 后 GET 应非 2xx"
   else pass "停 B 后 GET 非 2xx（6 片 < data=8）"; fi
   if aws_a s3 cp "$W/sa.bin" "s3://$SBK/down.bin" >/dev/null 2>&1; then fail "停 B 后 PUT 应非 2xx"
   else pass "停 B 后 PUT 非 2xx"; fi
+  # 并发窗口裁决：fsck --repair 在 B 停机窗口内跑。fsck 走 AppState::load（cli.rs
+  # needs_full_state）会再次打开 raft.db/oss.db——B serve 在线时同盘双进程不受支持
+  # （cli.rs 明示离线命令须绕开 AppState::load 即为此）；B 停着则单进程持有 B 的盘与
+  # raft.db。A 保持在线：fsck 只经 mesh 读 A（health/键表/read_shard），repair 只写本机
+  # （B）meta、删孤儿，不动 A 的盘；修完 start_b 的读回（下面 a_get_eq）验证未伤数据。
+  FSK_OUT=$(cd "$W/b" && timeout 120 "$BIN" fsck --repair 2>&1); FSK_RC=$?
+  if [ "$FSK_RC" -eq 0 ] && printf '%s' "$FSK_OUT" | grep -q '（已修复）'; then
+    pass "停 B 窗口 fsck --repair 退出 0 且标记已修复"
+  else
+    fail "fsck --repair 未通过（rc=$FSK_RC）：$(printf '%s' "$FSK_OUT" | tail -3)"
+  fi
+  FSK_REPORT=$(printf '%s\n' "$FSK_OUT" | sed -n 's/^fsck 报告: //p' | tail -1)
+  if [ -n "$FSK_REPORT" ] && [ -f "$FSK_REPORT" ]; then
+    if FSK_DETAIL=$(fsck_ok "$FSK_REPORT" repair); then
+      pass "fsck --repair 报告：repaired=true / 0 坏 meta / A 可达"
+    else
+      fail "fsck --repair 报告断言失败：$FSK_DETAIL"
+    fi
+  else
+    fail "fsck --repair 报告缺失（stdout 尾：$(printf '%s' "$FSK_OUT" | tail -2)）"
+  fi
+  # 复检（只读）：修复后不得再有孤儿/stray/缺键/缺片/坏片/不可达
+  FSK2_OUT=$(cd "$W/b" && timeout 120 "$BIN" fsck 2>&1); FSK2_RC=$?
+  FSK2_REPORT=$(printf '%s\n' "$FSK2_OUT" | sed -n 's/^fsck 报告: //p' | tail -1)
+  if [ "$FSK2_RC" -eq 0 ] && FSK2_DETAIL=$(fsck_ok "$FSK2_REPORT" check); then
+    pass "fsck 复检（只读）报告全清：0 孤儿/stray/缺键·片/坏片/不可达"
+  else
+    fail "fsck 复检失败（rc=$FSK2_RC）：${FSK2_DETAIL:-$(printf '%s' "$FSK2_OUT" | tail -3)}"
+  fi
   if start_b; then ck retry 90 a_get_eq "$SBK" a.bin sa.up sa.bin
   else fail "B 重启未就绪"; tail -8 "$W/b/server.log"; fi
 fi
