@@ -2501,7 +2501,7 @@ async fn object_list_includes_storage_and_tier_fields() {
                 size: info.size,
                 source_etag: info.etag.clone(),
                 etag: "remote".into(),
-                sha256: "00".into(),
+                sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"c")),
                 class: "GLACIER".into(),
                 chunks: None,
             },

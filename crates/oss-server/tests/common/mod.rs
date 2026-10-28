@@ -1,5 +1,22 @@
 pub mod tls;
 use oss_server::config::{AppConfig, GroupTarget, SiteToml, TierTarget};
+
+/// 直接改写盘上 xl.meta（`Store::write_meta` 不对外）：模拟 meta 篡改/旧形态对象。
+#[allow(dead_code)]
+pub fn rewrite_meta(
+    data_dir: &std::path::Path,
+    bucket: &str,
+    key: &str,
+    f: impl FnOnce(&mut xl_store::meta::XlMeta),
+) {
+    let path = xl_store::layout::object_dir(data_dir, bucket, key)
+        .unwrap()
+        .join(xl_store::meta::META_FILE);
+    let mut m = xl_store::meta::XlMeta::decode(&std::fs::read(&path).unwrap()).unwrap();
+    f(&mut m);
+    std::fs::write(&path, m.encode().unwrap()).unwrap();
+}
+
 use oss_server::db::Db;
 use oss_server::state::AppState;
 use xl_store::store::{Store, StoreConfig};

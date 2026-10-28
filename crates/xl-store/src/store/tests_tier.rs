@@ -502,3 +502,73 @@ async fn archive_meta_failure_keeps_local() {
     assert_eq!(head.tier_phase, None);
     assert_eq!(&bytes[..], b"tier-data");
 }
+
+/// C3：size/etag 未变但源摘要与 spec.sha256 不符（流读与提交之间源被换/摘要不一致）
+/// → 拒绝归档且本地数据保持可读。
+#[tokio::test]
+async fn archive_rejects_source_digest_mismatch() {
+    let (s, _d) = store().await;
+    let info = put(&s, "digest", VersioningMode::Enabled, None).await;
+    let vid = info.version_id.clone().unwrap();
+    let e = s
+        .archive_version(
+            "alpha",
+            "digest",
+            &vid,
+            ArchiveSpec {
+                backend: "s3".into(),
+                key: "cold/alpha/digest".into(),
+                size: info.size,
+                source_etag: info.etag.clone(),
+                etag: "remote".into(),
+                sha256: hex::encode(crate::mesh::content_hash(b"other")),
+                class: "GLACIER".into(),
+                chunks: None,
+            },
+            100,
+        )
+        .await;
+    assert!(matches!(e, Err(Error::CorruptMeta(_))), "{e:?}");
+    let (head, bytes) = s.get_object("alpha", "digest").await.unwrap();
+    assert_eq!(head.tier_phase, None);
+    assert_eq!(&bytes[..], b"tier-data");
+}
+
+/// C3 legacy 例外：`parts=Some` 或空 `part.sha256` 时跳过摘要绑定，不误伤旧对象。
+#[tokio::test]
+async fn archive_skips_digest_binding_for_legacy_versions() {
+    let (s, _d) = store().await;
+    let wrong = hex::encode(crate::mesh::content_hash(b"other"));
+    for (key, legacy_parts) in [("legacy-parts", true), ("legacy-sha", false)] {
+        let info = put(&s, key, VersioningMode::Enabled, None).await;
+        let vid = info.version_id.clone().unwrap();
+        let mut m = s.read_meta("alpha", key).await.unwrap().unwrap();
+        let v = m.versions.last_mut().unwrap();
+        if legacy_parts {
+            let first = v.part.clone();
+            v.parts = Some(vec![first]);
+            v.part.sha256 = wrong.clone();
+        } else {
+            v.part.sha256.clear();
+        }
+        s.write_meta("alpha", key, &m, None).await.unwrap();
+        s.archive_version(
+            "alpha",
+            key,
+            &vid,
+            ArchiveSpec {
+                backend: "s3".into(),
+                key: format!("cold/alpha/{key}"),
+                size: info.size,
+                source_etag: info.etag.clone(),
+                etag: "remote".into(),
+                sha256: wrong.clone(),
+                class: "GLACIER".into(),
+                chunks: None,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    }
+}

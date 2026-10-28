@@ -62,12 +62,24 @@ impl TierDirectRead for TierDirectReader {
                 t.phase
             )));
         }
-        // 元数据与 HEAD 快照必须描述同一份对象；尺寸漂移不服务（回到 403）。
+        // 元数据与 HEAD 快照必须描述同一份对象；尺寸/源 ETag 漂移不服务（回到 403）。
         // （tier.etag 是远端 PUT ETag，与源 ETag 口径不同，不能拿来比。）
-        if t.size != info.size {
+        if t.size != info.size || t.size != v.size {
             return Err(TierDirectError::Unavailable(
-                "tier 元数据与 HEAD 快照尺寸不一致".into(),
+                "tier 元数据与 HEAD 快照/源版本尺寸不一致".into(),
             ));
+        }
+        if v.etag != info.etag {
+            return Err(TierDirectError::Unavailable(
+                "源 ETag 与 HEAD 快照不一致".into(),
+            ));
+        }
+        // 归档副本必须绑定源已提交的整对象摘要（legacy parts=Some / 空摘要跳过）。
+        if v.parts.is_none() && !v.part.sha256.is_empty() && t.sha256 != v.part.sha256 {
+            return Err(TierDirectError::Integrity(format!(
+                "tier 副本 SHA-256 与源版本摘要不符（tier={}，源={}）",
+                t.sha256, v.part.sha256
+            )));
         }
         let Some(chunks) = t.chunks.as_ref() else {
             return Err(TierDirectError::Unavailable(
