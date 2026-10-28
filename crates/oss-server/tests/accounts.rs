@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::state;
+use common::{state, state_with_file_db};
 use oss_server::router::build_router;
 use reqwest::Method;
 use s3s_sigv4::{
@@ -359,6 +359,64 @@ async fn account_bucket_quota_is_enforced_on_bucket_create() {
         .await
         .unwrap();
     assert_eq!(retry.status(), 204, "提高配额后建桶放行");
+}
+
+/// AC-2：并发建桶的配额最终判定在写锁内——quota=N 时 N+1 个并发恰好 N 个成功。
+/// 用文件库（WAL）而不是内存 shared-cache 库：后者并发 BEGIN IMMEDIATE 会 SQLITE_LOCKED。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_bucket_quota_is_atomic_under_concurrent_creates() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state_with_file_db(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_ok(&base, "erik", "pw").await;
+    let id = create_account(&base, &admin, "race", Some(2)).await;
+    account_users(&base, &admin, &id, "frank").await;
+    let token = login_ok(&base, "frank", "frank-password").await;
+
+    let client = reqwest::Client::new();
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        tasks.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/api/v1/buckets"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "name": format!("race-{i}") }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }));
+    }
+    let mut statuses = Vec::new();
+    for t in tasks {
+        statuses.push(t.await.unwrap());
+    }
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 204).count(),
+        2,
+        "恰好 N 个成功：{statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 403).count(),
+        1,
+        "N+1 个被拒：{statuses:?}"
+    );
+
+    let row: serde_json::Value = client
+        .get(format!("{base}/api/v1/accounts/{id}"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(row["bucket_count"], 2, "落库桶数不得超过配额");
 }
 
 /// AC-1：停用账户 → 登录被拒、存量 JWT 立即失效；重新启用后恢复。

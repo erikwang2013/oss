@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
@@ -1693,20 +1693,30 @@ impl Db {
         name: &str,
         owner_id: Option<i64>,
         set: u16,
-    ) -> Result<()> {
+    ) -> Result<BucketRowOutcome> {
         self.upsert_bucket_owner_set_mode(name, owner_id, set, "async")
             .await
     }
 
     /// M9：同 [`Self::upsert_bucket_owner_set`]，并写 `replication_mode`。
     /// ON CONFLICT 全列重置（set 随重建收敛，M5 阻断 1）；creation_date 保持首建。
+    /// **新建行**在 `BEGIN IMMEDIATE` 写锁内 count+insert——并发建桶只有一个能越过账户
+    /// 桶数配额；已存在行是重建收敛（桶数不变），不做配额判定。
     pub async fn upsert_bucket_owner_set_mode(
         &self,
         name: &str,
         owner_id: Option<i64>,
         set: u16,
         replication_mode: &str,
-    ) -> Result<()> {
+    ) -> Result<BucketRowOutcome> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() && Self::bucket_quota_reached_conn(&mut tx, owner_id).await? {
+            return Ok(BucketRowOutcome::QuotaExceeded);
+        }
         sqlx::query(
             "INSERT INTO buckets \
              (name, owner_id, creation_date, versioning, set_id, object_lock, \
@@ -1733,9 +1743,10 @@ impl Db {
         })
         .bind(set as i64)
         .bind(replication_mode)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(BucketRowOutcome::Written)
     }
 
     /// 桶的复制模式；行不存在 = "async"（读取路径与缺行旧桶同口径）。
@@ -2344,6 +2355,84 @@ impl Db {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(|r| r.get("name")).collect())
+    }
+
+    /// 桶数配额判定（调用方已持写锁，或 leader 已确认本地 applied 追平）：owner 的
+    /// **当前**账户桶数 >= `accounts.bucket_quota` 时返回 true。口径同
+    /// `account_buckets_from`（成员行优先，无行 = uid 派生账户）；NULL/负配额、
+    /// 无账户行 = 不限；停用账户 fail-closed（与 S3 层 `bucket_quota_exceeded` 同判）。
+    async fn bucket_quota_reached_conn(
+        conn: &mut SqliteConnection,
+        owner_id: Option<i64>,
+    ) -> Result<bool> {
+        let Some(uid) = owner_id else {
+            return Ok(false);
+        };
+        let account =
+            sqlx::query_scalar::<_, String>("SELECT account_id FROM account_members WHERE uid = ?")
+                .bind(uid)
+                .fetch_optional(&mut *conn)
+                .await?
+                .or_else(|| xl_s3::access::account_id_of(uid));
+        let Some(account) = account else {
+            return Ok(false);
+        };
+        let Some(r) = sqlx::query("SELECT status, bucket_quota FROM accounts WHERE id = ?")
+            .bind(&account)
+            .fetch_optional(&mut *conn)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if r.get::<String, _>("status") != "active" {
+            return Ok(true);
+        }
+        let Some(quota) = r.get::<Option<i64>, _>("bucket_quota").filter(|q| *q >= 0) else {
+            return Ok(false);
+        };
+        let sql = format!("SELECT COUNT(*) {}", Self::account_buckets_from("?"));
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(&account)
+            .fetch_one(&mut *conn)
+            .await?;
+        Ok(n >= quota)
+    }
+
+    /// 建桶配额最终判定（仅新建行；已存在行是收敛，不增加桶数）。
+    /// `conn` 由调用方保证已持写锁或本地 applied 已追平。
+    pub(crate) async fn bucket_create_quota_reached_conn(
+        conn: &mut SqliteConnection,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if exists.is_some() {
+            return Ok(false);
+        }
+        let Some(owner) = owner else {
+            return Ok(false);
+        };
+        let uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+            .bind(owner)
+            .fetch_optional(&mut *conn)
+            .await?;
+        let Some(uid) = uid else {
+            return Ok(false);
+        };
+        Self::bucket_quota_reached_conn(conn, Some(uid)).await
+    }
+
+    /// [`Self::bucket_create_quota_reached_conn`] 的连接池版本（leader append 前判定）。
+    pub(crate) async fn bucket_create_quota_reached(
+        pool: &SqlitePool,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<bool> {
+        let mut conn = pool.acquire().await?;
+        Self::bucket_create_quota_reached_conn(&mut conn, name, owner).await
     }
 
     /// 全部账户（管理员视角）或某用户的账户（账户成员视角）。
@@ -5978,6 +6067,12 @@ pub(crate) enum CreateBucketOutcome {
     Created,
     Updated,
     ModeConflict,
+}
+
+/// 建桶行写入结果（console 建桶的配额最终判定）。
+pub enum BucketRowOutcome {
+    Written,
+    QuotaExceeded,
 }
 
 impl Db {

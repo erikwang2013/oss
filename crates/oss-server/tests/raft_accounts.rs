@@ -261,6 +261,132 @@ async fn local_control_applies_every_account_command() {
     assert_eq!(gone, 0);
 }
 
+fn bucket_create(name: &str, owner: Option<&str>) -> ControlCommand {
+    ControlCommand::BucketCreate {
+        name: name.into(),
+        owner: owner.map(str::to_string),
+        created_at: 100,
+        replication_mode: "async".into(),
+        versioning: "Off".into(),
+        object_lock: false,
+        object_lock_default_mode: None,
+        object_lock_default_days: None,
+        default_encryption: None,
+    }
+}
+
+/// AC-2：Local 门面建桶的配额判定在写事务内（`BEGIN IMMEDIATE`）——
+/// quota=N 时 N+1 个并发建桶恰好 N 个成功。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bucket_quota_is_atomic_in_local_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    // 文件库（WAL）：内存 shared-cache 库并发 BEGIN IMMEDIATE 会 SQLITE_LOCKED。
+    let st = common::state_with_file_db(dir.path()).await;
+    assert_eq!(write(&st, user_create("alice")).await, ControlResponse::Ok);
+    assert_eq!(
+        write(&st, create_account(ACC, "acme", Some(2))).await,
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        write(&st, attach("alice", "member", 2)).await,
+        ControlResponse::Ok
+    );
+
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let control = Arc::clone(&st.control);
+        tasks.push(tokio::spawn(async move {
+            control
+                .write(bucket_create(&format!("local-{i}"), Some("alice")))
+                .await
+        }));
+    }
+    let (mut ok, mut quota) = (0, 0);
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(ControlResponse::Ok) => ok += 1,
+            Err(oss_server::raft::control::ControlError::QuotaExceeded) => quota += 1,
+            other => panic!("unexpected control result: {other:?}"),
+        }
+    }
+    assert_eq!((ok, quota), (2, 1), "N+1 并发恰好 N 成功、1 拒绝");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+        .fetch_one(st.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "落库桶数不得超过配额");
+}
+
+/// AC-2 修订：leader append 前配额闸（进程内只串行 BucketCreate）——
+/// quota=N 时 N+1 个并发恰好 N 成功；重建已有桶与 NULL 配额不判。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bucket_quota_is_atomic_on_raft_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, pool) = spawn_raft(dir.path(), 3).await;
+    assert_eq!(
+        handle
+            .write(create_account(ACC, "acme", Some(2)))
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        handle.write(user_create("alice")).await.unwrap(),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        handle.write(attach("alice", "member", 2)).await.unwrap(),
+        ControlResponse::Ok
+    );
+
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let handle = Arc::clone(&handle);
+        tasks.push(tokio::spawn(async move {
+            handle
+                .client_write(bucket_create(&format!("r-{i}"), Some("alice")))
+                .await
+        }));
+    }
+    let (mut ok, mut quota) = (0, 0);
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(ControlResponse::Ok) => ok += 1,
+            Err(WriteError::QuotaExceeded) => quota += 1,
+            other => panic!("unexpected write result: {other:?}"),
+        }
+    }
+    assert_eq!((ok, quota), (2, 1), "N+1 并发恰好 N 成功、1 拒绝");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "落库桶数不得超过配额");
+
+    // 重建已有桶不增加桶数：满配额下的收敛仍放行。
+    assert_eq!(
+        handle
+            .write(bucket_create("r-0", Some("alice")))
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    // NULL = 不限，恢复放行。
+    assert_eq!(
+        handle.write(set_quota(None, 20)).await.unwrap(),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        handle
+            .write(bucket_create("r-3", Some("alice")))
+            .await
+            .unwrap(),
+        ControlResponse::Ok,
+        "NULL = 不限"
+    );
+    handle.shutdown().await;
+}
+
 /// 回归：账户停用后 `who()`（经 HTTP 面）与 `account_active` 都拒绝该成员。
 #[tokio::test]
 async fn disabled_account_blocks_who_and_account_active() {

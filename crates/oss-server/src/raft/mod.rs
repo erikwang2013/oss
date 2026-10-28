@@ -97,6 +97,9 @@ pub enum WriteError {
     UnregisteredExtType {
         type_id: String,
     },
+    /// leader append 前的账户桶数硬配额拒绝（无日志写入；follower 转发由 leader 判）。
+    /// 不进 `ControlResponse`，避免混版副本对同一日志产生不同 apply 结果。
+    QuotaExceeded,
 }
 
 impl std::fmt::Display for WriteError {
@@ -120,6 +123,7 @@ impl std::fmt::Display for WriteError {
                 "raft Ext type_id {type_id:?} is not registered (new type requires a new \
                  feature level or negotiated per-peer capability; nothing was appended)"
             ),
+            Self::QuotaExceeded => write!(f, "account bucket quota exceeded"),
         }
     }
 }
@@ -271,6 +275,9 @@ pub struct RaftHandle {
     tls: Option<Arc<crate::tls::Tls>>,
     /// 本节点看到的 peer wire/feature（带 term）；只有 leader 的用于门控。
     peers: Arc<compat::PeerVersions>,
+    /// 只串行化 leader 侧 BucketCreate 的「等 applied → count → append」窗口；
+    /// 其他命令与 follower 转发不加锁。
+    bucket_create_lock: tokio::sync::Mutex<()>,
 }
 
 impl RaftHandle {
@@ -404,6 +411,47 @@ impl RaftHandle {
             .map(|n| n.addr.clone())
     }
 
+    /// leader 侧建桶配额闸：持锁「等本地 applied 追平 last_log_index → count → append」。
+    /// 只对 BucketCreate 生效且只在 `is_leader()` 时执行；follower 跳过，由 leader 判。
+    /// 返回的 guard 必须存活到 append 返回，期间其他本地建桶在锁上排队。
+    async fn bucket_create_guard<'a>(
+        &'a self,
+        cmd: &ControlCommand,
+        timeout: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, WriteError> {
+        let ControlCommand::BucketCreate { name, owner, .. } = cmd else {
+            return Ok(None);
+        };
+        if !self.is_leader() {
+            return Ok(None);
+        }
+        let guard = self.bucket_create_lock.lock().await;
+        if !self.is_leader() {
+            return Ok(None);
+        }
+        // 先等本地 apply，避免漏算此前已 append 的并发建桶。
+        let last = {
+            let m = self.raft.metrics();
+            m.borrow().last_log_index.unwrap_or(0)
+        };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !self.wait_applied(last, left).await {
+            return Err(WriteError::Timeout(timeout));
+        }
+        let reached = crate::db::Db::bucket_create_quota_reached(
+            self.state_machine.pool(),
+            name,
+            owner.as_deref(),
+        )
+        .await
+        .map_err(|e| WriteError::Raft(format!("bucket quota check: {e}")))?;
+        if reached {
+            return Err(WriteError::QuotaExceeded);
+        }
+        Ok(Some(guard))
+    }
+
     /// 本地写（不做 leader 转发）：超时返回错误（写可能已提交），成功后等到 apply
     /// 越过本条日志再返回（`/write` 的 applied_index 才是可等待的下界）。
     pub async fn write(&self, cmd: ControlCommand) -> Result<ControlResponse, WriteError> {
@@ -411,6 +459,7 @@ impl RaftHandle {
         self.check_feature(&cmd, false)?;
         let timeout = Duration::from_millis(self.settings.write_timeout_ms);
         let deadline = tokio::time::Instant::now() + timeout;
+        let _gate = self.bucket_create_guard(&cmd, timeout, deadline).await?;
         match tokio::time::timeout_at(deadline, self.raft.client_write(cmd)).await {
             Err(_) => Err(WriteError::Timeout(timeout)),
             Ok(Ok(resp)) => {
@@ -440,7 +489,11 @@ impl RaftHandle {
         let deadline = tokio::time::Instant::now() + timeout;
         // 命令可能很大（≤24 MiB）：ForwardToLeader 不带数据，转发要留一份副本。
         let forward_copy = cmd.clone();
-        match tokio::time::timeout_at(deadline, self.raft.client_write(cmd)).await {
+        let local = {
+            let _gate = self.bucket_create_guard(&cmd, timeout, deadline).await?;
+            tokio::time::timeout_at(deadline, self.raft.client_write(cmd)).await
+        };
+        match local {
             Err(_) => Err(WriteError::Timeout(timeout)),
             Ok(Ok(resp)) => {
                 let index = resp.log_id.index;
@@ -554,6 +607,26 @@ impl RaftHandle {
                     });
                 }
                 Err(WriteError::NoQuorum)
+            }
+            // leader 的配额判定是权威：follower 只透传，不凭本地副本重判。
+            403 => {
+                #[derive(Deserialize)]
+                struct Quota {
+                    #[serde(default)]
+                    error: String,
+                }
+                if let Ok(q) = serde_json::from_slice::<Quota>(&body)
+                    && q.error == "quota_exceeded"
+                {
+                    return Err(WriteError::QuotaExceeded);
+                }
+                Err(WriteError::Raft(format!(
+                    "leader write HTTP 403: {}",
+                    String::from_utf8_lossy(&body)
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                )))
             }
             // leader 的注册表是权威：follower 不本地判定（混合二进制注册表可能不同）。
             400 => {
@@ -751,6 +824,7 @@ pub async fn spawn_with_control_tls(
         counters,
         tls,
         peers,
+        bucket_create_lock: tokio::sync::Mutex::new(()),
     };
     handle.bootstrap_if_needed(has_logs).await?;
     Ok(handle)

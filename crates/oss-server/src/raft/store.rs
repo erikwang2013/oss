@@ -474,6 +474,11 @@ impl SqliteStateMachine {
         self.activation.load(Ordering::Relaxed)
     }
 
+    /// apply 写入的控制库连接池（leader append 前的只读配额判定用）。
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// 与 [`super::RaftHandle`] 共享的观测计数（apply 失败在此累加）。
     pub fn counters(&self) -> &Arc<Metrics> {
         &self.counters

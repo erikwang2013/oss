@@ -653,6 +653,10 @@ fn bucket_control_error(e: BucketControlError) -> s3s::S3Error {
             )
         }
         BucketControlError::NotEmpty => s3s::s3_error!(BucketNotEmpty, "bucket is not empty"),
+        // 与 S3 层快速检查同码同文案（最终判定在 leader append 前 / standalone 写锁内）。
+        BucketControlError::QuotaExceeded => {
+            s3s::s3_error!(TooManyBuckets, "account bucket quota exceeded")
+        }
         BucketControlError::Invalid => s3s::s3_error!(InvalidRequest, "invalid bucket request"),
         BucketControlError::TooLarge => {
             s3s::s3_error!(EntityTooLarge, "control command exceeds raft limit")
@@ -1129,20 +1133,31 @@ impl S3 for OssS3 {
                     0
                 }
             };
-            if let Err(e) = self
+            match self
                 .acl
                 .record_bucket_owner_set_mode(&bucket, user.uid, set, replication_mode)
                 .await
             {
-                self.rollback_created_bucket(&bucket).await;
-                if is_site_conflict(&e) {
+                Ok(crate::access::BucketRecordOutcome::Written) => {}
+                // AC-2：并发建桶在写锁内输了配额（快速检查已过）→ 回滚物理桶并拒绝。
+                Ok(crate::access::BucketRecordOutcome::QuotaExceeded) => {
+                    self.rollback_created_bucket(&bucket).await;
                     return Err(s3s::s3_error!(
-                        OperationAborted,
-                        "site replication conflict"
+                        TooManyBuckets,
+                        "account bucket quota exceeded"
                     ));
                 }
-                tracing::error!(error = ?e, bucket, "桶归属记账失败");
-                return Err(s3s::s3_error!(InternalError, "internal error"));
+                Err(e) => {
+                    self.rollback_created_bucket(&bucket).await;
+                    if is_site_conflict(&e) {
+                        return Err(s3s::s3_error!(
+                            OperationAborted,
+                            "site replication conflict"
+                        ));
+                    }
+                    tracing::error!(error = ?e, bucket, "桶归属记账失败");
+                    return Err(s3s::s3_error!(InternalError, "internal error"));
+                }
             }
             // M5 切片 0（P4-1）：行变更广播（best-effort；关「别节点陈旧行」窗口）
             self.store.broadcast_bucket_row(&bucket, Some(set)).await;
