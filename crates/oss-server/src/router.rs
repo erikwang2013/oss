@@ -22,6 +22,42 @@ use xl_s3::service::OssS3;
 /// 组装全部路由。`build_runtime` 失败（暂存盘不可写等）向上传播：
 /// serve 与运维命令统一 exit 1 + stderr，不从启动路径 panic。
 pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
+    build_router_with_trust(state, ApTrustConfig::from_env())
+}
+
+/// AP 来源信任链配置（`build_router` 从环境变量填充；集成测试用
+/// [`build_router_with_trust`] 显式注入，避免并行用例修改进程 env）。
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ApTrustConfig {
+    pub trust_proxy: bool,
+    pub static_vpc: Option<String>,
+    pub static_vpce: Option<String>,
+    pub proxy_hops: Option<String>,
+    pub proxy_cidrs: Option<String>,
+    pub peer_cidrs: Option<String>,
+}
+
+impl ApTrustConfig {
+    fn from_env() -> Self {
+        Self {
+            trust_proxy: std::env::var("OSS_AP_TRUSTED_PROXY")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes")),
+            static_vpc: std::env::var("OSS_AP_VPC_ID").ok(),
+            static_vpce: std::env::var("OSS_AP_VPCE_ID").ok(),
+            proxy_hops: std::env::var("OSS_AP_TRUSTED_PROXY_HOPS").ok(),
+            proxy_cidrs: std::env::var("OSS_AP_TRUSTED_PROXY_CIDRS").ok(),
+            peer_cidrs: std::env::var("OSS_AP_TRUSTED_PEER_CIDRS").ok(),
+        }
+    }
+}
+
+/// 同 [`build_router`]，信任链配置由调用方给出（测试 seam；生产默认路径不变）。
+#[doc(hidden)]
+pub fn build_router_with_trust(
+    state: AppState,
+    ap_trust: ApTrustConfig,
+) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     // s3s 0.17 的 builder 是 `&mut self` 风格，不能链式调用
     // 授权门：Acl 同时给 service（ListBuckets 过滤/建桶记账）与 access 层（set_access）
     // Task 9：集群时 Acl/SigV4Auth 接控制面读扇出（本地 miss → peers；写仍本地，M9 收口）
@@ -183,10 +219,13 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     // 转发头仅在直连 TCP 对端落在 `OSS_AP_TRUSTED_PEER_CIDRS` 内时采信；未配置该网段
     // （或传输层不提供 ConnectInfo，如 ecat 明文 HttpServer）→ 一律不采信（fail-closed）。
     // 默认单层反代（取最右一跳，向后兼容）；多层用 HOPS 或可信 CIDR 配置，解析失败启动失败。
-    let trust_proxy = std::env::var("OSS_AP_TRUSTED_PROXY")
-        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    let trust_proxy = ap_trust.trust_proxy;
     let trust = if trust_proxy {
-        let trust = ProxyTrust::from_env()?;
+        let trust = ProxyTrust::parse(
+            ap_trust.proxy_hops.as_deref(),
+            ap_trust.proxy_cidrs.as_deref(),
+            ap_trust.peer_cidrs.as_deref(),
+        )?;
         if trust.peers.is_empty() {
             tracing::warn!(
                 "OSS_AP_TRUSTED_PROXY=1 但未配置 OSS_AP_TRUSTED_PEER_CIDRS：\
@@ -199,8 +238,8 @@ pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error
     };
     // `aws:SourceVpc`/`aws:SourceVpce` 的来源证明：静态部署 ID（优先）或可信反代的
     // 单行头；非法配置启动失败。两者独立配置，绝不互相推断。
-    let vpc = Arc::new(Attest::vpc(trust_proxy)?);
-    let vpce = Arc::new(Attest::vpce(trust_proxy)?);
+    let vpc = Arc::new(Attest::vpc(ap_trust.static_vpc.as_deref(), trust_proxy)?);
+    let vpce = Arc::new(Attest::vpce(ap_trust.static_vpce.as_deref(), trust_proxy)?);
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
         let trust = trust.clone();
         let vpc = vpc.clone();
@@ -255,15 +294,7 @@ struct ProxyTrust {
 }
 
 impl ProxyTrust {
-    fn from_env() -> Result<Self, String> {
-        Self::parse(
-            std::env::var("OSS_AP_TRUSTED_PROXY_HOPS").ok().as_deref(),
-            std::env::var("OSS_AP_TRUSTED_PROXY_CIDRS").ok().as_deref(),
-            std::env::var("OSS_AP_TRUSTED_PEER_CIDRS").ok().as_deref(),
-        )
-    }
-
-    /// 纯解析入口（测试用）：None = 未设置。
+    /// 纯解析入口（配置来自 [`ApTrustConfig`]）：None = 未设置。
     fn parse(hops: Option<&str>, cidrs: Option<&str>, peers: Option<&str>) -> Result<Self, String> {
         let hops = match hops.map(str::trim).filter(|v| !v.is_empty()) {
             Some(v) => v
@@ -331,9 +362,10 @@ struct Attest {
 
 impl Attest {
     /// `aws:SourceVpc`（静态 `OSS_AP_VPC_ID` / 头 `x-oss-source-vpc`）。
-    fn vpc(trust_proxy: bool) -> Result<Self, String> {
-        Self::from_env(
+    fn vpc(static_id: Option<&str>, trust_proxy: bool) -> Result<Self, String> {
+        Self::parse(
             "OSS_AP_VPC_ID",
+            static_id,
             "x-oss-source-vpc",
             xl_s3::ap::valid_vpc_id,
             trust_proxy,
@@ -341,30 +373,31 @@ impl Attest {
     }
 
     /// `aws:SourceVpce`（静态 `OSS_AP_VPCE_ID` / 头 `x-oss-source-vpce`）。
-    fn vpce(trust_proxy: bool) -> Result<Self, String> {
-        Self::from_env(
+    fn vpce(static_id: Option<&str>, trust_proxy: bool) -> Result<Self, String> {
+        Self::parse(
             "OSS_AP_VPCE_ID",
+            static_id,
             "x-oss-source-vpce",
             xl_s3::ap::valid_vpce_id,
             trust_proxy,
         )
     }
 
-    fn from_env(
+    fn parse(
         env: &'static str,
+        static_id: Option<&str>,
         header: &'static str,
         valid: fn(&str) -> bool,
         trust_proxy: bool,
     ) -> Result<Self, String> {
-        let static_id = match std::env::var(env) {
-            Ok(v) if !v.trim().is_empty() => {
-                let v = v.trim().to_string();
-                if !valid(&v) {
+        let static_id = match static_id.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => {
+                if !valid(v) {
                     return Err(format!("{env} 非法: {}", v.escape_debug()));
                 }
-                Some(v)
+                Some(v.to_string())
             }
-            _ => None,
+            None => None,
         };
         Ok(Self {
             static_id,
