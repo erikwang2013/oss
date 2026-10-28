@@ -159,9 +159,14 @@ impl Store {
                 "{bucket}/{key}@{version_id}: SSE 对象不参与 Transition"
             )));
         }
-        if src.size != spec.size || src.etag != spec.source_etag {
+        if src.size != spec.size
+            || src.etag != spec.source_etag
+            || (src.parts.is_none()
+                && !src.part.sha256.is_empty()
+                && src.part.sha256 != spec.sha256)
+        {
             return Err(Error::CorruptMeta(format!(
-                "{bucket}/{key}@{version_id}: 源对象在归档期间被改写（size/etag 不符）"
+                "{bucket}/{key}@{version_id}: 源对象在归档期间被改写（size/etag/sha256 不符）"
             )));
         }
         // 直读分块表是信任边界：写前自洽（作业流上算出；损坏则拒绝归档，绝不落半套表）。

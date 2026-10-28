@@ -9,6 +9,8 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use md5::Digest as _;
 use xl_store::meta::TierPhase;
+use xl_store::store::ec::EcConfig;
+use xl_store::store::{Store, StoreConfig};
 
 use oss_server::config::{TierKind, TierTarget};
 use oss_server::jobs::TaskExecutor as _;
@@ -428,4 +430,125 @@ async fn local_tier_transition_restore_streams() {
     );
     let (_, got) = st.store.get_object("bkt", "local.bin").await.unwrap();
     assert_eq!(got, body);
+}
+
+/// 换成 `ec.enabled=false` 的 Store：对象以 `part.1` 原样落盘（M1 旧形态），
+/// Range 读不做整对象摘要校验——正是 C2 要封的静默源损坏面。
+async fn swap_in_ec_off_store(st: &mut AppState, dir: &std::path::Path) {
+    let cfg = StoreConfig {
+        ec: EcConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..StoreConfig::new(dir.join("ecoff"))
+    };
+    let store = Store::open(cfg).await.unwrap();
+    store.create_bucket("bkt").await.unwrap();
+    st.store = Arc::new(store);
+}
+
+/// C2：非 EC 源 `part.1` 同长度静默损坏 → Transition 拒绝归档（修复前会把坏副本归档，
+/// 之后直读/Restore 都自洽通过，坏摘要还会被 restore_commit「转正」）。
+#[tokio::test]
+async fn transition_rejects_corrupted_source_part_without_ec() {
+    let (mut st, d) = setup(vec![tier_target(
+        "cold",
+        TierKind::S3,
+        None,
+        "http://127.0.0.1:9",
+    )])
+    .await;
+    let _mock = mock_setup(&mut st);
+    swap_in_ec_off_store(&mut st, d.path()).await;
+
+    let data = vec![0x5Au8; 1024];
+    let info = st
+        .store
+        .put_object("bkt", "bad.bin", Bytes::from(data.clone()), None)
+        .await
+        .unwrap();
+    let vid = info.version_id.unwrap();
+    let v = st
+        .store
+        .tier_version("bkt", "bad.bin", &vid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(v.parts.is_none(), "非 MPU 源应为单段形态");
+    assert_eq!(v.part.sha256, hex::encode(sha2::Sha256::digest(&data)));
+
+    let part = st
+        .store
+        .restore_stage_path("bkt", "bad.bin", &v.part.uuid)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("part.1");
+    let mut raw = std::fs::read(&part).unwrap();
+    raw[10] ^= 0xff;
+    std::fs::write(&part, &raw).unwrap();
+
+    let err = executor(&st)
+        .execute(
+            "Transition",
+            &payload("bad.bin", &vid, "GLACIER", Some("cold")),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("SHA-256"), "{err}");
+    assert!(
+        st.store
+            .tier_version("bkt", "bad.bin", &vid)
+            .await
+            .unwrap()
+            .unwrap()
+            .tier
+            .is_none(),
+        "坏副本不得归档"
+    );
+}
+
+/// C2 legacy 例外：`parts=Some` 或空 `part.sha256` 时跳过摘要绑定，不误伤旧对象。
+#[tokio::test]
+async fn transition_skips_digest_binding_for_legacy_source() {
+    let (mut st, d) = setup(vec![tier_target(
+        "cold",
+        TierKind::S3,
+        None,
+        "http://127.0.0.1:9",
+    )])
+    .await;
+    let _mock = mock_setup(&mut st);
+
+    // 旧 M2a 形态：parts=Some（part.sha256 与归档流不符也不得拒绝）。
+    let info = st
+        .store
+        .put_object(
+            "bkt",
+            "legacy-parts.bin",
+            Bytes::from_static(b"legacy"),
+            None,
+        )
+        .await
+        .unwrap();
+    let vid = info.version_id.unwrap();
+    common::rewrite_meta(&d.path().join("data"), "bkt", "legacy-parts.bin", |m| {
+        let v = m.versions.last_mut().unwrap();
+        let first = v.part.clone();
+        v.parts = Some(vec![first]);
+        v.part.sha256 = "00".repeat(32);
+    });
+    assert_eq!(archive(&st, "legacy-parts.bin", &vid).await, "archived");
+
+    // 旧对象无摘要：part.sha256 为空 → 同样跳过。
+    let info = st
+        .store
+        .put_object("bkt", "legacy-sha.bin", Bytes::from_static(b"legacy"), None)
+        .await
+        .unwrap();
+    let vid = info.version_id.unwrap();
+    common::rewrite_meta(&d.path().join("data"), "bkt", "legacy-sha.bin", |m| {
+        m.versions.last_mut().unwrap().part.sha256.clear();
+    });
+    assert_eq!(archive(&st, "legacy-sha.bin", &vid).await, "archived");
 }

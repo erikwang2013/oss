@@ -11,6 +11,7 @@ use futures::StreamExt as _;
 use s3s::dto::*;
 use s3s::{S3, S3ErrorCode, S3Request, S3Response};
 use xl_s3::service::OssS3;
+use xl_s3::tier_direct::{TierDirectError, TierDirectRead as _};
 use xl_store::meta::{TierChunks, TierPhase};
 
 use oss_server::config::{TierKind, TierTarget};
@@ -514,4 +515,125 @@ async fn head_and_conditional_semantics_are_preserved() {
         .unwrap();
     assert_eq!(resp.status, Some(axum::http::StatusCode::PARTIAL_CONTENT));
     assert_eq!(body_of(resp).await, &data[0..=9]);
+}
+
+/// C1：同一 null 版本被同尺寸替换并重新归档后，过期 HEAD 快照不得按新副本直读
+/// （修复前会返回 B 的字节、却沿用 A 的 ETag）。
+#[tokio::test]
+async fn stale_head_after_same_size_replacement_is_unavailable() {
+    let (st, _mock, _d) = setup().await;
+    let a = vec![0xAAu8; 4096];
+    let b = vec![0xBBu8; 4096];
+    let info_a = st
+        .store
+        .put_object("bkt", "cold/obj", Bytes::from(a.clone()), None)
+        .await
+        .unwrap();
+    let vid = info_a.version_id.clone().unwrap();
+    assert_eq!(
+        executor(&st)
+            .execute("Transition", &payload("bkt", "cold/obj", &vid))
+            .await
+            .unwrap(),
+        "archived"
+    );
+
+    // 无版本桶：同尺寸覆盖同一 key 后重新归档（仍是 "null" 版本，tier key 也相同）。
+    let info_b = st
+        .store
+        .put_object("bkt", "cold/obj", Bytes::from(b.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(info_b.version_id.as_deref(), Some(vid.as_str()));
+    assert_ne!(info_a.etag, info_b.etag);
+    assert_eq!(
+        executor(&st)
+            .execute("Transition", &payload("bkt", "cold/obj", &vid))
+            .await
+            .unwrap(),
+        "archived"
+    );
+
+    let reader = TierDirectReader::new(Arc::clone(&st.store), Arc::clone(&st.tiers));
+    let err = reader
+        .read_range("bkt", "cold/obj", Some(&vid), &info_a, 0..16)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TierDirectError::Unavailable(_)), "{err:?}");
+
+    // 与条件请求组合：If-Match 指向旧 ETag → 412；新鲜 GET 服务 B 的字节与 ETag。
+    let s3 = direct_service(&st);
+    let err = s3
+        .get_object(req(GetObjectInput {
+            if_match: Some(ETagCondition::ETag(ETag::Strong(info_a.etag.clone()))),
+            ..ranged(0, 15)
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+    let resp = s3.get_object(req(ranged(0, 15))).await.unwrap();
+    assert_eq!(resp.status, Some(axum::http::StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.output.e_tag, Some(ETag::Strong(info_b.etag.clone())));
+    assert_eq!(body_of(resp).await, &b[0..=15]);
+}
+
+/// C1：meta 中源 ETag 被改写而 HEAD 快照仍旧 → 直读不可用（不返回错配字节）。
+#[tokio::test]
+async fn stale_source_etag_in_meta_is_unavailable() {
+    let (st, _mock, d) = setup().await;
+    let data = pattern(1000);
+    let vid = archive(&st, "cold/obj", &data).await;
+    let info = st.store.head_object("bkt", "cold/obj").await.unwrap();
+    common::rewrite_meta(&d.path().join("data"), "bkt", "cold/obj", |m| {
+        let v = m.versions.iter_mut().find(|v| v.tier.is_some()).unwrap();
+        v.etag = "deadbeef".into();
+    });
+    let reader = TierDirectReader::new(Arc::clone(&st.store), Arc::clone(&st.tiers));
+    let err = reader
+        .read_range("bkt", "cold/obj", Some(&vid), &info, 0..8)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TierDirectError::Unavailable(_)), "{err:?}");
+}
+
+/// C4：tier.sha256 与源 part.sha256 不一致 → 直读 500（不碰远端，不静默回退）。
+#[tokio::test]
+async fn tier_digest_must_match_source_digest() {
+    let (st, mock, d) = setup().await;
+    let data = pattern(1000);
+    archive(&st, "cold/obj", &data).await;
+    common::rewrite_meta(&d.path().join("data"), "bkt", "cold/obj", |m| {
+        let v = m.versions.iter_mut().find(|v| v.tier.is_some()).unwrap();
+        v.tier.as_mut().unwrap().sha256 = "11".repeat(32);
+    });
+
+    let err = direct_service(&st)
+        .get_object(req(ranged(0, 9)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    assert!(
+        mock.range_calls.lock().unwrap().is_empty(),
+        "摘要不符不得读远端"
+    );
+}
+
+/// C4 legacy 例外：`parts=Some` 的旧对象跳过摘要绑定，不误伤。
+#[tokio::test]
+async fn legacy_parts_object_skips_digest_binding() {
+    let (st, _mock, d) = setup().await;
+    let data = pattern(2000);
+    archive(&st, "cold/obj", &data).await;
+    common::rewrite_meta(&d.path().join("data"), "bkt", "cold/obj", |m| {
+        let v = m.versions.iter_mut().find(|v| v.tier.is_some()).unwrap();
+        let first = v.part.clone();
+        v.parts = Some(vec![first]);
+        v.tier.as_mut().unwrap().sha256 = "22".repeat(32);
+    });
+
+    let resp = direct_service(&st)
+        .get_object(req(ranged(100, 199)))
+        .await
+        .unwrap();
+    assert_eq!(body_of(resp).await, &data[100..=199]);
 }

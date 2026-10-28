@@ -1465,7 +1465,7 @@ async fn restore_object_through_ap() {
                 size: info.size,
                 source_etag: info.etag.clone(),
                 etag: "remote".into(),
-                sha256: "00".into(),
+                sha256: hex::encode(sha2::Sha256::digest(b"cold")),
                 class: "GLACIER".into(),
                 chunks: None,
             },

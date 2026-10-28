@@ -329,6 +329,26 @@ impl M8TaskExecutor {
             );
             // 后端在流上增量算 MD5/SHA-256；S3 单 PUT 响应 ETag 仍断言等于 MD5。
             let put = backend.put(&key, body, v.size).await?;
+            // 归档副本必须绑定源已提交的整对象摘要（put 已算好，零额外 IO）。
+            // legacy parts=Some / 空 part.sha256 跳过；MPU 组合 ETag 只比 SHA-256，不比 MD5。
+            if v.parts.is_none() && !v.part.sha256.is_empty() {
+                if put.sha256 != v.part.sha256 {
+                    return Err(format!(
+                        "源版本 SHA-256 与归档流不符：{} ≠ {}",
+                        v.part.sha256, put.sha256
+                    ));
+                }
+                let md5_etag = v.etag.len() == 32
+                    && v.etag
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if md5_etag && put.md5 != v.etag {
+                    return Err(format!(
+                        "源 ETag(MD5) 与归档流不符：{} ≠ {}",
+                        v.etag, put.md5
+                    ));
+                }
+            }
             let chunks = TierChunks {
                 chunk_size: TIER_CHUNK,
                 sha256: hashes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
