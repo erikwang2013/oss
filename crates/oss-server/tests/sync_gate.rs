@@ -2179,7 +2179,20 @@ async fn delete_bucket_waits_for_inflight_writer_and_quiesces_remote() {
         (r, t.elapsed())
     };
     let late_fut = async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 固定 sleep 在负载下会早于 DELETE 调度，绕过 quiesce 直达远端；轮询本地
+        // deleting 标志再发晚写，保证测的是 quiesce 拒绝而不是竞态。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, deleting, _) = e.st.db.bucket_sync_state("syn").await.unwrap();
+            if deleting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "删桶未在 5s 内进入 deleting"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         signed(
             &e,
             Method::PUT,
