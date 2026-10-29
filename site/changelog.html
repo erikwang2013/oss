@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.22.0，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.23.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.22.0 功能版；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.23.0 功能版；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.22.0 功能版；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.23.0 功能版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.22.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.23.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.22.0 的功能版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.23.0 的功能版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-23-0">v1.23.0</a>
           <a href="#v1-22-0">v1.22.0</a>
           <a href="#v1-21-1">v1.21.1</a>
           <a href="#v1-21-0">v1.21.0</a>
@@ -100,9 +101,23 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.22.0</strong>（2026-10-29）。</p>
+          <p>当前最新发布：<strong>v1.23.0</strong>（2026-10-30）。</p>
 
           <div class="changelog-list">
+            <details class="changelog-entry" id="v1-23-0" open>
+              <summary><strong>v1.23.0</strong><time datetime="2026-10-30">2026-10-30</time><span>功能版</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>M8-2 作业运行态复制（feature level 4）</strong>：<code>jobs</code>/<code>job_tasks</code> 与 Restore 受理的 <code>tier_restores</code> 行走 level-4 Raft 命令复制，follower apply；作业引擎与 console/API 的读改写经 JobState 门面，leader 屏障 + 单调闸防回退。全 peer ≥4 才复制；v1.22 及更早节点 advertise 3，leader 生效=3，Job* 在 append 前被拒。启用前需全集群升级、移除/升级旧节点并显式配置 <code>[raft].feature_level=4</code>（单向门，旧节点之后拒绝启动）。</li>
+                  <li><strong>激活守卫</strong>：<code>m8_runstate_activated</code> 只由 level-4 快照安装、cutover/force-recover 显式种子、已 apply 的 level-4 命令置位；配置 4 节点拒绝带运行态行的 level-3 快照；四表非空或 inventory/tier <code>job_id</code> 悬空时启动 fail-closed（含清理/导出重灌指引）。</li>
+                  <li><strong>重试抖动修复</strong>：任务失败退避的抖动原用 Unix 秒 <code>now%1000</code>，实际 0–999 秒；改为 0–9 秒确定性抖动，默认 3 次重试不再拖到半小时。</li>
+                  <li><strong>验证</strong>：LC-4 回滚矩阵 e2e 70/0/0（v1.20.1 旧端）；单机→集群 re-ingest 4 节点×3 盘 e2e 8/8；合并后 oss-server 68 suites/0 failed，clippy/fmt 0。</li>
+                  <li><strong>边界</strong>：inventory/lifecycle 运行态与 lease takeover 未复制；硬字节/对象配额、真实 PrivateLink、AP 动态 registry（需 feature ≥5）仍未交付。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.23.0" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+
             <details class="changelog-entry" id="v1-22-0" open>
               <summary><strong>v1.22.0</strong><time datetime="2026-10-29">2026-10-29</time><span>功能版</span></summary>
               <div class="entry-body">
@@ -381,7 +396,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.22.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.23.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

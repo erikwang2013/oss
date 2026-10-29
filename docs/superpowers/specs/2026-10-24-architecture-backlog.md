@@ -30,7 +30,7 @@
 > re-ingest、桶配额并发修复均落地。硬字节/对象数配额与 M8-2 仍为里程碑（本波不实现）；
 > AP 动态 registry（Slice B）需 feature level ≥5（4 已被 M8-2 jobs 复制占用），暂不排期。
 >
-> **2026-10-29 更新（M8-2 jobs 切片）**：jobs/job_tasks/tier_restores（Restore 受理行）
+> **2026-10-30 更新（v1.23.0，M8-2 jobs 切片）**：jobs/job_tasks/tier_restores（Restore 受理行）
 > 运行态复制已落地，作为 **feature level 4**（`FEATURE_LEVEL_4`/`MAX_FEATURE_LEVEL=4`）。
 > v1.22 及更早二进制 advertise ≤3，混版窗口内 leader 生效级别压回 3、Job* 命令在 append
 > 前被拒（`check_feature`）；启用前必须把全集群升级到含 feature 4 的二进制并移除/升级
