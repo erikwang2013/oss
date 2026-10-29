@@ -89,7 +89,30 @@ pub async fn enqueue_run(
     requested_by: Option<i64>,
     now: i64,
 ) -> Result<Option<i64>, String> {
-    enqueue_run_fenced(
+    enqueue_run_with(
+        &crate::job_state::JobState::local(),
+        db,
+        bucket,
+        config_id,
+        run_key,
+        requested_by,
+        now,
+    )
+    .await
+}
+
+/// 运行态复制版（生产路径）：job 行经 [`crate::job_state::JobState`] 落库。
+pub async fn enqueue_run_with(
+    jobs: &crate::job_state::JobState,
+    db: &Db,
+    bucket: &str,
+    config_id: &str,
+    run_key: &str,
+    requested_by: Option<i64>,
+    now: i64,
+) -> Result<Option<i64>, String> {
+    enqueue_run_fenced_with(
+        jobs,
         db,
         bucket,
         config_id,
@@ -103,6 +126,30 @@ pub async fn enqueue_run(
 
 /// 建运行行 + kind=inventory 单任务作业（返回 job id；同槽已存在 → None）。
 pub async fn enqueue_run_fenced(
+    db: &Db,
+    bucket: &str,
+    config_id: &str,
+    run_key: &str,
+    requested_by: Option<i64>,
+    now: i64,
+    fence: FencingEpoch,
+) -> Result<Option<i64>, String> {
+    enqueue_run_fenced_with(
+        &crate::job_state::JobState::local(),
+        db,
+        bucket,
+        config_id,
+        run_key,
+        requested_by,
+        now,
+        fence,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn enqueue_run_fenced_with(
+    jobs: &crate::job_state::JobState,
     db: &Db,
     bucket: &str,
     config_id: &str,
@@ -136,7 +183,7 @@ pub async fn enqueue_run_fenced(
         }],
         ..Default::default()
     };
-    match db.create_job(&spec, now).await {
+    match jobs.create_job(db, &spec, now).await {
         Ok(job_id) => {
             db.inventory_run_set_job(run_id, job_id, fence)
                 .await
@@ -159,6 +206,16 @@ pub async fn due_runs(db: &Db, now: i64) -> Result<usize, String> {
 
 /// 本轮到期的配置：只建当前槽；已存在（含重复 tick）→ 去重。
 pub async fn due_runs_fenced(db: &Db, now: i64, fence: FencingEpoch) -> Result<usize, String> {
+    due_runs_fenced_with(&crate::job_state::JobState::local(), db, now, fence).await
+}
+
+/// 运行态复制版（生产路径）。
+pub async fn due_runs_fenced_with(
+    jobs: &crate::job_state::JobState,
+    db: &Db,
+    now: i64,
+    fence: FencingEpoch,
+) -> Result<usize, String> {
     let rows = db
         .inventory_list_all_configs()
         .await
@@ -178,7 +235,8 @@ pub async fn due_runs_fenced(db: &Db, now: i64, fence: FencingEpoch) -> Result<u
         let Some(run_key) = slot_key(cfg.schedule.frequency.as_str(), now) else {
             continue;
         };
-        match enqueue_run_fenced(
+        match enqueue_run_fenced_with(
+            jobs,
             db,
             &row.bucket,
             &row.id,
@@ -205,14 +263,27 @@ pub async fn schedule_tick(
     now: i64,
     gate: &crate::raft::LeaderGate,
 ) -> Result<usize, String> {
+    schedule_tick_with(&crate::job_state::JobState::local(), db, now, gate).await
+}
+
+pub async fn schedule_tick_with(
+    jobs: &crate::job_state::JobState,
+    db: &Db,
+    now: i64,
+    gate: &crate::raft::LeaderGate,
+) -> Result<usize, String> {
     let Some(fence) = gate.epoch() else {
         return Ok(0);
     };
-    due_runs_fenced(db, now, fence).await
+    due_runs_fenced_with(jobs, db, now, fence).await
 }
 
 /// `OSS_INVENTORY_INTERVAL_SECS`（默认 60；0 = 关闭）。M8-1：只有 leader 调度。
-pub fn spawn_worker(db: Arc<Db>, gate: crate::raft::LeaderGate) {
+pub fn spawn_worker(
+    db: Arc<Db>,
+    jobs: Arc<crate::job_state::JobState>,
+    gate: crate::raft::LeaderGate,
+) {
     let secs = env_secs("OSS_INVENTORY_INTERVAL_SECS", 60);
     if secs == 0 {
         tracing::info!("inventory worker 已关闭（OSS_INVENTORY_INTERVAL_SECS=0）");
@@ -223,7 +294,7 @@ pub fn spawn_worker(db: Arc<Db>, gate: crate::raft::LeaderGate) {
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
-            match schedule_tick(&db, crate::db::now(), &gate).await {
+            match schedule_tick_with(&jobs, &db, crate::db::now(), &gate).await {
                 Ok(n) if n > 0 => tracing::info!(n, "inventory：本轮入队"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "inventory 调度失败"),

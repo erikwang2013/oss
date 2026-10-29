@@ -191,8 +191,8 @@ pub async fn sweep_once_at_with(state: &AppState, now: i64, limits: SweepLimits)
 async fn record_bad_rule(state: &AppState, row: &LifecycleRuleRow, msg: &str) {
     let now = now_secs();
     let job = match state
-        .db
-        .job_start("lifecycle", &row.bucket, &row.prefix, now)
+        .jobs
+        .job_start(&state.db, "lifecycle", &row.bucket, &row.prefix, now)
         .await
     {
         Ok(id) => id,
@@ -202,8 +202,8 @@ async fn record_bad_rule(state: &AppState, row: &LifecycleRuleRow, msg: &str) {
         }
     };
     if let Err(e) = state
-        .db
-        .job_finish(job, "error", 0, 0, 0, Some(msg), now_secs())
+        .jobs
+        .job_finish(&state.db, job, "error", 0, 0, 0, Some(msg), now_secs())
         .await
     {
         tracing::warn!(error = %e, "lifecycle：job 收尾失败");
@@ -226,8 +226,8 @@ async fn run_rule(
     let mut err: Option<String> = None;
     let started = now_secs();
     let job = match state
-        .db
-        .job_start("lifecycle", bucket, spec.prefix(), started)
+        .jobs
+        .job_start(&state.db, "lifecycle", bucket, spec.prefix(), started)
         .await
     {
         Ok(id) => id,
@@ -317,8 +317,9 @@ async fn run_rule(
         Some(m) => ("error", Some(m.as_str())),
     };
     if let Err(e) = state
-        .db
+        .jobs
         .job_finish(
+            &state.db,
             job,
             st,
             progress.scanned,
@@ -335,7 +336,7 @@ async fn run_rule(
 
 /// M2：长扫描心跳（每页一次），避免周期孤儿回收把仍在跑的 lifecycle 作业误标 error。
 async fn heartbeat(state: &AppState, job: i64) {
-    if let Err(e) = state.db.job_heartbeat(job, now_secs()).await {
+    if let Err(e) = state.jobs.job_heartbeat(&state.db, job, now_secs()).await {
         tracing::warn!(job, error = %e, "lifecycle：作业心跳失败");
     }
 }

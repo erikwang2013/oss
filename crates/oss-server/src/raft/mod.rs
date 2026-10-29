@@ -319,6 +319,29 @@ impl RaftHandle {
         self.state_machine.activation_level()
     }
 
+    /// leader 上当前 term 的生效级别；follower 没有当前 term 的 peer 握手 →
+    /// None（调用方不得把 None 当成 level 3）。与 [`Self::check_feature`] 同一算式。
+    pub fn effective_feature(&self) -> Option<u8> {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        if m.current_leader != Some(m.id) {
+            return None;
+        }
+        let voters: Vec<u64> = m.membership_config.voter_ids().collect();
+        let learners: Vec<u64> = m.membership_config.membership().learner_ids().collect();
+        Some(
+            compat::effective_feature_level(
+                self.settings.feature_level,
+                m.id,
+                &voters,
+                &learners,
+                m.current_term,
+                &self.peers,
+            )
+            .level,
+        )
+    }
+
     /// Level B 门控：生效级别 = min(本机配置, 当前 term 的 voter+learner feature)。
     /// follower 上（`only_if_leader`）不做本地拒绝：它没有当前 term 记录，交给 leader 判。
     fn check_feature(&self, cmd: &ControlCommand, only_if_leader: bool) -> Result<(), WriteError> {

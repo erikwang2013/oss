@@ -65,6 +65,8 @@ pub struct AppState {
     pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
     /// M9 S6：控制写门面（Local = M7/standalone；Raft = `[raft]`）。S6b-d 的路由唯一入口。
     pub control: Arc<crate::raft::control::ControlPlane>,
+    /// M8-2：作业运行态写入门面（Raft 且 feature≥3 时行经复制日志；否则本地直写）。
+    pub jobs: Arc<crate::job_state::JobState>,
     /// M9 S7.1：Raft 句柄（路由/状态共用；无 `[raft]` = None）。
     pub raft: Option<Arc<crate::raft::RaftHandle>>,
     /// M9 S7.4：本地管理员用户名（配对预检/身份 JSON；无管理员 = None）。
@@ -918,6 +920,7 @@ impl AppState {
                 ap_region.clone(),
             ),
         });
+        let jobs = Arc::new(crate::job_state::JobState::new(Some(Arc::clone(&control))));
         // M6 切片 4：复制（规则存储 + 写入钩子 + 出站客户端；worker 在 serve 路径挂载）
         let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
         let repl_store = Arc::new(
@@ -1028,6 +1031,7 @@ impl AppState {
             inventory,
             inventory_runner,
             control,
+            jobs,
             raft,
             admin_username,
             vault_probe,

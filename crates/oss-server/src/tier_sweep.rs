@@ -88,6 +88,24 @@ pub async fn sweep_transitions_at(
     lifecycle: &dyn LifecycleStore,
     now: i64,
 ) -> Result<usize, String> {
+    sweep_transitions_at_with(
+        &crate::job_state::JobState::local(),
+        db,
+        store,
+        lifecycle,
+        now,
+    )
+    .await
+}
+
+/// 运行态复制版（生产路径）。
+pub async fn sweep_transitions_at_with(
+    jobs: &crate::job_state::JobState,
+    db: &Db,
+    store: &Store,
+    lifecycle: &dyn LifecycleStore,
+    now: i64,
+) -> Result<usize, String> {
     let mut examined = 0usize;
     let mut queued = 0usize;
     'buckets: for bucket in db.list_bucket_rows().await.map_err(|e| e.to_string())? {
@@ -243,7 +261,7 @@ pub async fn sweep_transitions_at(
                     }],
                     ..Default::default()
                 };
-                match db.create_job_dedup(&spec, now).await {
+                match jobs.create_job_dedup(db, &spec, now).await {
                     Ok(Some(_)) => queued += 1,
                     Ok(None) => {}
                     Err(err) => {
@@ -456,6 +474,7 @@ pub fn spawn(
     store: Arc<Store>,
     lifecycle: Arc<dyn LifecycleStore>,
     sink: Arc<dyn RestoreSink>,
+    jobs: Arc<crate::job_state::JobState>,
     gate: crate::raft::LeaderGate,
 ) {
     let reconcile_db = Arc::clone(&db);
@@ -479,6 +498,7 @@ pub fn spawn(
     if sweep_secs > 0 {
         let db = Arc::clone(&db);
         let store = Arc::clone(&store);
+        let jobs = Arc::clone(&jobs);
         let gate = gate.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
@@ -488,7 +508,15 @@ pub fn spawn(
                 if !gate.is_leader() {
                     continue;
                 }
-                match sweep_transitions(&db, &store, lifecycle.as_ref()).await {
+                match sweep_transitions_at_with(
+                    &jobs,
+                    &db,
+                    &store,
+                    lifecycle.as_ref(),
+                    crate::db::now(),
+                )
+                .await
+                {
                     Ok(n) if n > 0 => tracing::info!(n, "tier sweep：入队 Transition"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "tier sweep 失败"),

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::db::Db;
+use crate::job_state::JobState;
 use crate::raft::{FencingEpoch, LeaderGate};
 use xl_store::store::{Store, VersioningMode};
 
@@ -92,10 +93,23 @@ pub async fn worker_tick(
     now: i64,
     gate: &LeaderGate,
 ) -> Result<bool, String> {
+    worker_tick_with(&JobState::local(), db, store, exec, env, now, gate).await
+}
+
+/// 运行态写入门面版（生产 worker/复制测试用）。
+pub async fn worker_tick_with(
+    jobs: &JobState,
+    db: &Db,
+    store: &Store,
+    exec: &dyn TaskExecutor,
+    env: JobEnv,
+    now: i64,
+    gate: &LeaderGate,
+) -> Result<bool, String> {
     let Some(fence) = gate.epoch() else {
         return Ok(false);
     };
-    worker_once_fenced(db, store, exec, env, now, gate, fence).await
+    worker_once_fenced(jobs, db, store, exec, env, now, gate, fence).await
 }
 
 /// 启动 worker 池（`OSS_JOB_WORKERS=0` 关闭）。M8-1：只有 leader 领取/执行；
@@ -104,6 +118,7 @@ pub fn spawn_workers(
     db: Arc<Db>,
     store: Arc<Store>,
     exec: Arc<dyn TaskExecutor>,
+    jobs: Arc<JobState>,
     gate: LeaderGate,
 ) {
     let env = JobEnv::from_env();
@@ -112,6 +127,7 @@ pub fn spawn_workers(
         return;
     }
     let recover = db.clone();
+    let recover_jobs = Arc::clone(&jobs);
     let recover_gate = gate.clone();
     tokio::spawn(async move {
         // 启动回收也是单例写：等到本节点成为 leader 再做（unknown 一直等）；时间在
@@ -120,8 +136,8 @@ pub fn spawn_workers(
         let now = crate::db::now();
         // 崩溃遗留：running 超过 300s 或 deadline 已过 → 按一次失败回收。
         // 回收写带 fence：若等 leader 期间又换届，旧 token 的回收被拒绝（留给新 leader）。
-        match recover
-            .recover_stale_tasks(now - 300, env.max_attempts, fence)
+        match recover_jobs
+            .recover_stale_tasks(&recover, now - 300, env.max_attempts, fence)
             .await
         {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收崩溃遗留任务"),
@@ -131,8 +147,8 @@ pub fn spawn_workers(
         if !recover_gate.still_current(fence) {
             return;
         }
-        match recover
-            .recover_expired_tasks(now, env.max_attempts, fence)
+        match recover_jobs
+            .recover_expired_tasks(&recover, now, env.max_attempts, fence)
             .await
         {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收过期任务"),
@@ -143,8 +159,8 @@ pub fn spawn_workers(
             return;
         }
         // 4.11：启动即回收崩溃遗留的「无任务 running」行（留 10s 余量避开刚启动的作业）。
-        match recover
-            .recover_orphan_jobs(now.saturating_sub(10), now)
+        match recover_jobs
+            .recover_orphan_jobs(&recover, now.saturating_sub(10), now)
             .await
         {
             Ok(n) if n > 0 => tracing::warn!(n, "job：启动回收无任务 running 作业"),
@@ -156,6 +172,7 @@ pub fn spawn_workers(
         let db = db.clone();
         let store = store.clone();
         let exec = exec.clone();
+        let jobs = Arc::clone(&jobs);
         let gate = gate.clone();
         tokio::spawn(async move {
             let mut t =
@@ -164,7 +181,7 @@ pub fn spawn_workers(
             loop {
                 t.tick().await;
                 let now = crate::db::now();
-                match worker_tick(&db, &store, exec.as_ref(), env, now, &gate).await {
+                match worker_tick_with(&jobs, &db, &store, exec.as_ref(), env, now, &gate).await {
                     Ok(true) => {} // 立刻尝试下一条
                     Ok(false) => {}
                     Err(e) => tracing::warn!(worker = i, error = %e, "job worker 本轮失败"),
@@ -175,6 +192,7 @@ pub fn spawn_workers(
     // 抢占调度：worker 全部在动作中时也要能打标记（worker 循环此时不跑）。
     if env.workers > 0 {
         let sched = db.clone();
+        let sched_jobs = Arc::clone(&jobs);
         let sched_gate = gate;
         tokio::spawn(async move {
             let mut t =
@@ -186,12 +204,15 @@ pub fn spawn_workers(
                     continue;
                 }
                 let now = crate::db::now();
-                match sched.preempt_lower_priority(env.workers, now).await {
+                match sched_jobs
+                    .preempt_lower_priority(&sched, env.workers, now)
+                    .await
+                {
                     Ok(n) if n > 0 => tracing::info!(n, "job：抢占低优先级作业"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "job：抢占标记失败"),
                 }
-                match sched.release_preempted(now).await {
+                match sched_jobs.release_preempted(&sched, now).await {
                     Ok(n) if n > 0 => tracing::info!(n, "job：释放被抢占作业"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "job：释放抢占失败"),
@@ -210,7 +231,20 @@ pub async fn worker_once(
     env: JobEnv,
     now: i64,
 ) -> Result<bool, String> {
+    worker_once_with(&JobState::local(), db, store, exec, env, now).await
+}
+
+/// 运行态写入门面版（生产 worker/复制测试用）。
+pub async fn worker_once_with(
+    jobs: &JobState,
+    db: &Db,
+    store: &Store,
+    exec: &dyn TaskExecutor,
+    env: JobEnv,
+    now: i64,
+) -> Result<bool, String> {
     worker_once_fenced(
+        jobs,
         db,
         store,
         exec,
@@ -225,7 +259,9 @@ pub async fn worker_once(
 /// M8-1：处理一条任务（worker 循环/测试共用）。`fence` 是领取时的 leadership token；
 /// 动作执行完后若 token 已变（交接/失去 leadership），收尾被跳过，任务留 running 由
 /// 新 leader 的过期/接管回收（at-least-once），绝不把旧结果写进新 leader 的状态。
+#[allow(clippy::too_many_arguments)] // worker 的完整上下文；拆结构体只会多一层搬运。
 pub async fn worker_once_fenced(
+    jobs: &JobState,
     db: &Db,
     store: &Store,
     exec: &dyn TaskExecutor,
@@ -238,37 +274,40 @@ pub async fn worker_once_fenced(
         return Ok(false);
     }
     // 顺手回收超时任务（不需要每 tick 全表扫；这里与领取同频）
-    db.recover_expired_tasks(now, env.max_attempts, fence)
-        .await
-        .map_err(|e| e.to_string())?;
+    jobs.recover_expired_tasks(db, now, env.max_attempts, fence)
+        .await?;
     // 4.11：周期回收「无任务 running」行（超出阈值的崩溃遗留；有局部索引，开销小）。
-    db.recover_orphan_jobs(now.saturating_sub(orphan_stale_secs()), now)
-        .await
-        .map_err(|e| e.to_string())?;
+    jobs.recover_orphan_jobs(db, now.saturating_sub(orphan_stale_secs()), now)
+        .await?;
     // 协作式抢占（动作边界）：容量满 + 高等优先级就绪任务在排队 → 标记低优先级
     // running 作业；高等优先级就绪队列清空后释放。只改作业状态，正在执行的动作
     // 不受影响；调度失败只是退化为纯优先级领取，故 warn 不中断。
-    if let Err(e) = db.preempt_lower_priority(env.workers.max(1), now).await {
+    if let Err(e) = jobs
+        .preempt_lower_priority(db, env.workers.max(1), now)
+        .await
+    {
         tracing::warn!(error = %e, "job：抢占标记失败");
     }
-    if let Err(e) = db.release_preempted(now).await {
+    if let Err(e) = jobs.release_preempted(db, now).await {
         tracing::warn!(error = %e, "job：释放抢占失败");
     }
     // 领取时动作未知 → DB 截止时间取两类超时的较大值（硬上限）；
     // 领取后立即按动作类型收紧，让非 tier 任务超时后 900s（而非 3600s）即可回收。
     let deadline_secs = env.timeout_secs.max(env.tier_timeout_secs);
-    let Some(task) = db
-        .claim_task_fenced(now, deadline_secs, fence)
-        .await
-        .map_err(|e| e.to_string())?
+    let Some(task) = jobs
+        .claim_task_fenced(db, now, deadline_secs, fence)
+        .await?
     else {
         return Ok(false);
     };
     // claim 与 execute 之间是安全动作边界：作业若已被抢占，把这条**尚未执行**的任务
     // 原样放回队列（不消耗重试、无副作用），等释放后按优先级恢复。
-    match db.job_state(task.job_id).await {
+    match jobs.job_state(db, task.job_id).await {
         Ok(Some(state)) if state == "preempted" => {
-            match db.requeue_task(task.job_id, task.task_no, now, fence).await {
+            match jobs
+                .requeue_task(db, task.job_id, task.task_no, now, fence)
+                .await
+            {
                 Ok(true) => tracing::info!(
                     job_id = task.job_id,
                     task_no = task.task_no,
@@ -294,8 +333,8 @@ pub async fn worker_once_fenced(
         env.timeout_secs
     };
     // 收紧失败不致命：claim 已写下硬上限 deadline，任务仍会被过期回收。
-    if let Err(e) = db
-        .set_task_deadline(task.job_id, task.task_no, now + timeout, fence)
+    if let Err(e) = jobs
+        .set_task_deadline(db, task.job_id, task.task_no, now + timeout, fence)
         .await
     {
         tracing::warn!(job_id = task.job_id, task_no = task.task_no, error = %e,
@@ -304,7 +343,10 @@ pub async fn worker_once_fenced(
     // 领取后、执行前再确认一次 leadership：动作尚未发生、无副作用，直接放回队列，
     // 让新 leader 立即接管（若行已被新 leader 接管，requeue 因 term 不匹配而 no-op）。
     if !gate.still_current(fence) {
-        match db.requeue_task(task.job_id, task.task_no, now, fence).await {
+        match jobs
+            .requeue_task(db, task.job_id, task.task_no, now, fence)
+            .await
+        {
             Ok(true) => tracing::info!(
                 job_id = task.job_id,
                 task_no = task.task_no,
@@ -349,8 +391,9 @@ pub async fn worker_once_fenced(
     let mut finish_state = None;
     let mut finish_err = None;
     for attempt in 0..5 {
-        match db
+        match jobs
             .finish_task_fenced(
+                db,
                 task.job_id,
                 task.task_no,
                 ok,
@@ -392,13 +435,18 @@ pub async fn worker_once_fenced(
         );
         return Ok(true);
     }
-    maybe_write_report(db, store, task.job_id).await?;
+    maybe_write_report(jobs, db, store, task.job_id).await?;
     Ok(true)
 }
 
 /// 作业终态且有 `report_prefix` 时写 `<prefix>/<job_id>/results.csv`（幂等覆盖）。
 /// `kind=batch` 用 S3 报告列；其余作业保留引擎通用列。取消后也落一次报告（未执行任务不进报告）。
-async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), String> {
+async fn maybe_write_report(
+    jobs: &JobState,
+    db: &Db,
+    store: &Store,
+    job_id: i64,
+) -> Result<(), String> {
     let Some(job) = db.job_get(job_id).await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
@@ -530,7 +578,7 @@ async fn maybe_write_report(db: &Db, store: &Store, job_id: i64) -> Result<(), S
     .await;
     if let Err(msg) = written {
         tracing::warn!(job_id, error = %msg, "job 报告写入失败");
-        let _ = db.job_set_error(job_id, &msg, crate::db::now()).await;
+        let _ = jobs.job_set_error(db, job_id, &msg, crate::db::now()).await;
     }
     Ok(())
 }
@@ -551,8 +599,8 @@ fn iso8601_secs(t: i64) -> String {
 }
 
 /// 取消等状态变更后立即落一次报告（失败只记日志；下一次任务收敛会重写）。
-pub(crate) async fn write_report_now(db: &Db, store: &Store, job_id: i64) {
-    if let Err(e) = maybe_write_report(db, store, job_id).await {
+pub(crate) async fn write_report_now(jobs: &JobState, db: &Db, store: &Store, job_id: i64) {
+    if let Err(e) = maybe_write_report(jobs, db, store, job_id).await {
         tracing::warn!(job_id, error = %e, "job 报告写入失败");
     }
 }

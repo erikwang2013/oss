@@ -415,8 +415,8 @@ pub async fn create_batch(
         tasks,
     };
     let job_id = state
-        .db
-        .create_job(&spec, crate::db::now())
+        .jobs
+        .create_job(&state.db, &spec, crate::db::now())
         .await
         .map_err(|e| BatchError::Internal(e.to_string()))?;
     state

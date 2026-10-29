@@ -42,6 +42,56 @@ async fn read_meta(conn: &mut SqliteConnection, key: &str) -> Result<i64, DataEr
     )
 }
 
+/// 整行 → [`JobRow`]（`job_state` 的定向查询复用同一映射；列集由查询保证）。
+pub(crate) fn job_row_from(r: &sqlx::sqlite::SqliteRow) -> JobRow {
+    JobRow {
+        id: r.get("id"),
+        kind: r.get("kind"),
+        bucket: r.get("bucket"),
+        prefix: r.get("prefix"),
+        state: r.get("state"),
+        scanned: r.get("scanned"),
+        deleted: r.get("deleted"),
+        skipped: r.get("skipped"),
+        error: r.get("error"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        spec_json: r.get("spec_json"),
+        progress: r.get("progress"),
+        total: r.get("total"),
+        succeeded: r.get("succeeded"),
+        failed: r.get("failed"),
+        report_bucket: r.get("report_bucket"),
+        report_prefix: r.get("report_prefix"),
+        priority: r.get("priority"),
+        requested_by: r.get("requested_by"),
+        parent_job_id: r.get("parent_job_id"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+    }
+}
+
+/// 整行 → [`JobTaskRow`]（同上）。
+pub(crate) fn job_task_row_from(r: &sqlx::sqlite::SqliteRow) -> JobTaskRow {
+    JobTaskRow {
+        job_id: r.get("job_id"),
+        task_no: r.get("task_no"),
+        action: r.get("action"),
+        payload_json: r.get("payload_json"),
+        state: r.get("state"),
+        attempt: r.get("attempt"),
+        next_at: r.get("next_at"),
+        dedupe_key: r.get("dedupe_key"),
+        deadline_at: r.get("deadline_at"),
+        result_code: r.get("result_code"),
+        result_string: r.get("result_string"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }
+}
+
 /// 调用方事务/连接内读取九表（行序 = 主键序，checksum 确定性来源）。
 pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, DataError> {
     let mut state = RunState::default();
@@ -56,31 +106,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.jobs.push(JobRow {
-            id: r.get("id"),
-            kind: r.get("kind"),
-            bucket: r.get("bucket"),
-            prefix: r.get("prefix"),
-            state: r.get("state"),
-            scanned: r.get("scanned"),
-            deleted: r.get("deleted"),
-            skipped: r.get("skipped"),
-            error: r.get("error"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-            spec_json: r.get("spec_json"),
-            progress: r.get("progress"),
-            total: r.get("total"),
-            succeeded: r.get("succeeded"),
-            failed: r.get("failed"),
-            report_bucket: r.get("report_bucket"),
-            report_prefix: r.get("report_prefix"),
-            priority: r.get("priority"),
-            requested_by: r.get("requested_by"),
-            parent_job_id: r.get("parent_job_id"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-        });
+        state.jobs.push(job_row_from(&r));
     }
 
     for r in sqlx::query(
@@ -92,23 +118,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.job_tasks.push(JobTaskRow {
-            job_id: r.get("job_id"),
-            task_no: r.get("task_no"),
-            action: r.get("action"),
-            payload_json: r.get("payload_json"),
-            state: r.get("state"),
-            attempt: r.get("attempt"),
-            next_at: r.get("next_at"),
-            dedupe_key: r.get("dedupe_key"),
-            deadline_at: r.get("deadline_at"),
-            result_code: r.get("result_code"),
-            result_string: r.get("result_string"),
-            started_at: r.get("started_at"),
-            finished_at: r.get("finished_at"),
-            fence_term: r.get("fence_term"),
-            fence_leader: r.get("fence_leader"),
-        });
+        state.job_tasks.push(job_task_row_from(&r));
     }
 
     for r in sqlx::query(
@@ -225,6 +235,23 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
 
     state.next_job_id = read_meta(conn, META_NEXT_JOB_ID).await?;
     state.next_run_id = read_meta(conn, META_NEXT_RUN_ID).await?;
+    // runstate_meta 可能尚未播种（M8-1 本地写入/旧库）：快照与导出的序列号必须
+    // 高于现存行，否则安装侧 `validate` 拒绝非空运行态。按行补齐，格式不变。
+    state.next_job_id = state
+        .next_job_id
+        .max(state.jobs.iter().map(|j| j.id + 1).max().unwrap_or(0));
+    state.next_run_id = state.next_run_id.max(
+        state
+            .inventory_runs
+            .iter()
+            .map(|r| r.id + 1)
+            .max()
+            .unwrap_or(0),
+    );
+    if !state.is_empty() {
+        state.next_job_id = state.next_job_id.max(1);
+        state.next_run_id = state.next_run_id.max(1);
+    }
     Ok(state)
 }
 

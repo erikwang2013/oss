@@ -6,11 +6,14 @@
 //! 构造函数只在本模块（以及 `Local` façade 调用本模块时）出现。
 
 use base64::Engine as _;
+use std::collections::HashSet;
+
 use sqlx::SqliteConnection;
 
 mod accounts;
 
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
+use super::runstate::{JobRow, JobTaskRow};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
@@ -760,6 +763,14 @@ pub(crate) async fn apply_command(
             "test.noop" => ControlResponse::Ok,
             _ => ControlResponse::Invalid,
         },
+        // M8-2：jobs/job_tasks 行复制（确定性 upsert，无时钟/随机）。
+        ControlCommand::JobUpsert { job } => {
+            apply_job_batch(cw, std::slice::from_ref(job), &[]).await?
+        }
+        ControlCommand::JobTaskUpsert { task } => {
+            apply_job_batch(cw, &[], std::slice::from_ref(task)).await?
+        }
+        ControlCommand::JobBatch { jobs, tasks } => apply_job_batch(cw, jobs, tasks).await?,
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
@@ -788,6 +799,159 @@ pub(crate) async fn apply_command(
         }
     };
     Ok(Applied { response, effects })
+}
+
+/// `(kind, created_at)` 是作业行的不可变身份；同 id 不同身份 = id 分配撞车，
+/// 整批拒绝而不是静默覆盖（JobState 的 id 预留在 Raft 往返期间可能与本地
+/// AUTOINCREMENT 插入竞争——见 job_state 模块注释）。
+async fn job_identity(
+    cw: &mut ControlWrite<'_>,
+    id: i64,
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let row = sqlx::query("SELECT kind, created_at FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *cw.conn)
+        .await?;
+    Ok(row.map(|r| {
+        use sqlx::Row;
+        (r.get("kind"), r.get("created_at"))
+    }))
+}
+
+async fn job_exists(cw: &mut ControlWrite<'_>, id: i64) -> Result<bool, sqlx::Error> {
+    let row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *cw.conn)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// 按主键 upsert 作业行。WHERE 是幂等/防回退闸：旧 `updated_at`、计数回退、
+/// 终态改回非终态一律 no-op（旧 term/重复命令不改变已收敛状态）。
+async fn apply_job(cw: &mut ControlWrite<'_>, job: &JobRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, bucket, prefix, state, scanned, deleted, skipped, error, \
+          created_at, updated_at, spec_json, progress, total, succeeded, failed, report_bucket, \
+          report_prefix, priority, requested_by, parent_job_id, started_at, finished_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET \
+          kind = excluded.kind, bucket = excluded.bucket, prefix = excluded.prefix, \
+          state = excluded.state, scanned = excluded.scanned, deleted = excluded.deleted, \
+          skipped = excluded.skipped, error = excluded.error, created_at = excluded.created_at, \
+          updated_at = excluded.updated_at, spec_json = excluded.spec_json, \
+          progress = excluded.progress, total = excluded.total, \
+          succeeded = excluded.succeeded, failed = excluded.failed, \
+          report_bucket = excluded.report_bucket, report_prefix = excluded.report_prefix, \
+          priority = excluded.priority, requested_by = excluded.requested_by, \
+          parent_job_id = excluded.parent_job_id, started_at = excluded.started_at, \
+          finished_at = excluded.finished_at \
+         WHERE jobs.kind = excluded.kind AND jobs.created_at = excluded.created_at \
+           AND excluded.updated_at >= jobs.updated_at \
+           AND excluded.progress >= jobs.progress \
+           AND excluded.succeeded >= jobs.succeeded \
+           AND excluded.failed >= jobs.failed \
+           AND NOT (jobs.state IN ('done','error','cancelled') \
+                    AND excluded.state <> jobs.state)",
+    )
+    .bind(job.id)
+    .bind(&job.kind)
+    .bind(&job.bucket)
+    .bind(&job.prefix)
+    .bind(&job.state)
+    .bind(job.scanned)
+    .bind(job.deleted)
+    .bind(job.skipped)
+    .bind(&job.error)
+    .bind(job.created_at)
+    .bind(job.updated_at)
+    .bind(&job.spec_json)
+    .bind(job.progress)
+    .bind(job.total)
+    .bind(job.succeeded)
+    .bind(job.failed)
+    .bind(&job.report_bucket)
+    .bind(&job.report_prefix)
+    .bind(job.priority)
+    .bind(job.requested_by)
+    .bind(job.parent_job_id)
+    .bind(job.started_at)
+    .bind(job.finished_at)
+    .execute(&mut *cw.conn)
+    .await?;
+    Ok(())
+}
+
+/// 按 `(job_id, task_no)` upsert。`fence_term`/`attempt` 只升不降，终态行不得
+/// 复活；终态行恒清 `dedupe_key`（延迟重放的旧行不能把已释放的去重键塞回去）。
+async fn apply_job_task(cw: &mut ControlWrite<'_>, task: &JobTaskRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, attempt, next_at, \
+          dedupe_key, deadline_at, result_code, result_string, started_at, finished_at, \
+          fence_term, fence_leader) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(job_id, task_no) DO UPDATE SET \
+          action = excluded.action, payload_json = excluded.payload_json, \
+          state = excluded.state, attempt = excluded.attempt, next_at = excluded.next_at, \
+          dedupe_key = CASE WHEN excluded.state IN ('done','failed','cancelled') THEN NULL \
+                            ELSE excluded.dedupe_key END, \
+          deadline_at = excluded.deadline_at, result_code = excluded.result_code, \
+          result_string = excluded.result_string, started_at = excluded.started_at, \
+          finished_at = excluded.finished_at, fence_term = excluded.fence_term, \
+          fence_leader = excluded.fence_leader \
+         WHERE excluded.fence_term >= job_tasks.fence_term \
+           AND excluded.attempt >= job_tasks.attempt \
+           AND NOT (job_tasks.state IN ('done','failed','cancelled') \
+                    AND excluded.state NOT IN ('done','failed','cancelled'))",
+    )
+    .bind(task.job_id)
+    .bind(task.task_no)
+    .bind(&task.action)
+    .bind(&task.payload_json)
+    .bind(&task.state)
+    .bind(task.attempt)
+    .bind(task.next_at)
+    .bind(&task.dedupe_key)
+    .bind(task.deadline_at)
+    .bind(&task.result_code)
+    .bind(&task.result_string)
+    .bind(task.started_at)
+    .bind(task.finished_at)
+    .bind(task.fence_term)
+    .bind(task.fence_leader)
+    .execute(&mut *cw.conn)
+    .await?;
+    Ok(())
+}
+
+/// 一批作业/任务行的事务内 apply。返回 `Ok` 之外只可能是 `Conflict`（身份撞车或
+/// 任务引用缺失）；调用方在任何写入前完成校验，避免半批提交。
+async fn apply_job_batch(
+    cw: &mut ControlWrite<'_>,
+    jobs: &[JobRow],
+    tasks: &[JobTaskRow],
+) -> Result<ControlResponse, sqlx::Error> {
+    let mut batch_ids = HashSet::new();
+    for job in jobs {
+        if let Some((kind, created_at)) = job_identity(cw, job.id).await?
+            && (kind != job.kind || created_at != job.created_at)
+        {
+            return Ok(ControlResponse::Conflict);
+        }
+        batch_ids.insert(job.id);
+    }
+    let referenced: HashSet<i64> = tasks.iter().map(|t| t.job_id).collect();
+    for id in referenced {
+        if !batch_ids.contains(&id) && !job_exists(cw, id).await? {
+            return Ok(ControlResponse::Conflict);
+        }
+    }
+    for job in jobs {
+        apply_job(cw, job).await?;
+    }
+    for task in tasks {
+        apply_job_task(cw, task).await?;
+    }
+    Ok(ControlResponse::Ok)
 }
 
 async fn bucket_exists_for_ap(
