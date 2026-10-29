@@ -560,7 +560,11 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 | 桶配额并发 | leader append 前判定 + standalone `BEGIN IMMEDIATE` | 不新增 `ControlResponse` 变体，混版不分叉；quota=2 并发恰 2 成功 1×403 |
 | 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 完整目标需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level ≥5（4 已用于 M8-2 jobs 复制） |
 | M8-2 jobs/tier_restores 复制切片 | 2026-10-29 后续波：`JobBatch`/`JobUpsert`/`JobTaskUpsert` + `compat.rs` | **feature level 4**（`MAX_FEATURE_LEVEL=4`）：全 peer ≥4 才复制；v1.22 及更早节点 advertise 3 → leader 生效=3，Job* 在 append 被拒。启用前全集群升级/移除旧节点并显式配置 4；**v1.20.1 Level C 窗口（feature ≤3）不包含 feature 4**；快照仍为 OSSCTL3 `m8.runstate` |
-| M8-2 激活边界（round5） | `compat.rs` 启动守卫/标记、`store.rs` 快照安装、`cutover`/`force_recover` 种子、`apply.rs` restore 预检 | `m8_runstate_activated` 只由 level-4 快照安装、cutover/force-recover 显式种子、已 apply 的 level-4 命令置位；level-3 快照（带运行态行）在配置 4 节点安装被拒且撤销标记；空表启动不写标记；四表非空或 inventory/tier `job_id` 悬空 → 配置 4 启动 fail-closed（文案含清理/导出重灌指引，清理后放行）；effective<4 期间 JobState fail-closed。测试：`raft_runstate_snapshot` 11/11、`raft_jobs_activation` 3/3（含悬空引用回归）、`raft_cutover` 7/7、`raft_jobs_replication` 11/11（含 restore 孤儿） |
+| M8-2 激活边界（round5） | `compat.rs` 启动守卫/标记、`store.rs` 快照安装、`cutover`/`force_recover` 种子、`apply.rs` restore 预检 | `m8_runstate_activated` 只由 level-4 快照安装、cutover/force-recover 显式种子、已 apply 的 level-4 命令置位；配置 4 节点拒绝安装带运行态行的 level-3 快照；可接受的 level-3 安装会撤销 marker；空表启动不写标记；四表非空或 inventory/tier `job_id` 悬空 → 配置 4 启动 fail-closed（文案含清理/导出重灌指引，清理后放行）；配置 4 且 effective<4 期间 JobState fail-closed，配置 ≤3 仍本地写（清理后到最后一次 feature-4 重启前需停止提交作业）。测试：`raft_runstate_snapshot` 11/11、`raft_jobs_activation` 3/3（含悬空引用回归）、`raft_cutover` 7/7、`raft_jobs_replication` 11/11（含 restore 孤儿） |
+
+**评审残余（不阻塞）**：cutover/force-recover 以 level-3 种子会写 marker；目标若先以 feature 3
+运行并产生本地作业再升 4，启动守卫会放行（要求目标直接以 feature 4 启动，或重灌）；
+`clear_runstate_activated_tx` 无测试调用点；四表清理会一并要求删除 `job_id` 为 NULL 的行。
 
 **验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server` 全量
-**66 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。
+**68 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。

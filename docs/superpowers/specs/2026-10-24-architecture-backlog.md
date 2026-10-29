@@ -435,8 +435,11 @@ inventory/lifecycle 运行态复制与 lease 接管仍未完成：
   `tier_restores.job_id` 无悬空，否则启动 fail-closed。清理步骤：保持 feature≤3 启动，
   等作业进入终态并备份控制库，然后清空四表（悬空引用随行删除；要保留 inventory/tier
   行只能用导出重灌），再以 feature≥4 重启；或用 `raft-export` 备份后在新集群
-  `raft-cutover`/`force-recover` 重灌（显式种子会写激活标记）。effective<4 期间 JobState
-  拒绝本地写，不会新增非日志行。
+  `raft-cutover`/`force-recover` 重灌（显式种子会写激活标记）。配置 4 且 effective<4
+  期间 JobState 拒绝本地写；配置 ≤3 仍本地写，因此清理后到最后一次 feature-4 重启前
+  必须停止提交作业。**已知窄路径**：cutover/force-recover 以 level-3 种子会写 marker；
+  目标若先以 feature 3 运行并产生本地作业再升 4，启动守卫会放行；要求目标直接以
+  feature 4 启动，或升级前重新清理/重灌（后续修复）。
 - **M8-3 读一致性（1–2 人周）**：默认 follower 本地读（保持现状），响应头带
   `x-oss-applied-index`；`?consistent=1` 走 leader 读（转发）或 ReadIndex。控制台写后跳转
   使用 `consistent=1`。不做 follower 线性一致读的通用承诺。
