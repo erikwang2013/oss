@@ -123,7 +123,106 @@ async fn snapshot_build_and_install_carries_runstate() {
     assert_eq!(
         compat::read_activation(db_b.pool()).await.unwrap(),
         3,
-        "安装 OSSCTL3 必须激活 marker"
+        "安装 OSSCTL3 必须激活 raft marker"
+    );
+    assert_eq!(
+        db_b.schema_meta("m8_runstate_activated").await.unwrap(),
+        None,
+        "普通 level-3 快照携带的是构建者本地行，不得写运行态激活标记"
+    );
+    assert!(
+        compat::guard_runstate_activation(db_b.pool(), 4)
+            .await
+            .is_err(),
+        "level-3 快照装出的 job 行不能作为 feature-4 启动依据"
+    );
+}
+
+/// level-4 快照是日志事实来源：安装后写运行态激活标记，feature-4 启动守卫放行。
+#[tokio::test]
+async fn level_four_snapshot_install_marks_runstate_activated() {
+    let (_dir_a, db_a) = fresh_db().await;
+    db_a.schema_meta_set("raft_feature_level", "4")
+        .await
+        .unwrap();
+    install(&db_a, &sample()).await;
+    let mut sm_a = SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None, 4)
+        .await
+        .unwrap();
+    let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
+        .await
+        .unwrap();
+    let bytes = snap.snapshot.get_ref().clone();
+    assert_eq!(
+        data::decode_snapshot(&bytes).unwrap().feature_level,
+        4,
+        "快照封套必须带 level 4"
+    );
+
+    let (_dir_b, db_b) = fresh_db().await;
+    let mut sm_b = SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 4)
+        .await
+        .unwrap();
+    RaftStateMachine::<TypeConfig>::install_snapshot(
+        &mut sm_b,
+        &snap.meta,
+        Box::new(std::io::Cursor::new(bytes)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_runstate(db_b.pool()).await.unwrap(), sample());
+    assert_eq!(
+        db_b.schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "level-4 快照安装必须写运行态激活标记"
+    );
+    assert!(
+        compat::guard_runstate_activation(db_b.pool(), 4)
+            .await
+            .is_ok()
+    );
+}
+
+/// 配置 feature 4 的节点不得安装带运行态行的 level-3 快照（构建者本地行不是日志事实）。
+#[tokio::test]
+async fn feature_four_node_rejects_level_three_snapshot_with_rows() {
+    let (_dir_a, db_a) = fresh_db().await;
+    db_a.schema_meta_set("raft_feature_level", "3")
+        .await
+        .unwrap();
+    install(&db_a, &sample()).await;
+    let mut sm_a = SqliteStateMachine::open_with_pool(db_a.pool().clone(), 1 << 20, false, None, 3)
+        .await
+        .unwrap();
+    let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm_a)
+        .await
+        .unwrap();
+    let bytes = snap.snapshot.get_ref().clone();
+
+    let (_dir_b, db_b) = fresh_db().await;
+    let mut sm_b = SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 4)
+        .await
+        .unwrap();
+    let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+        &mut sm_b,
+        &snap.meta,
+        Box::new(std::io::Cursor::new(bytes)),
+    )
+    .await
+    .expect_err("feature-4 node must reject a level-3 snapshot carrying runstate rows");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot install a level-3 snapshot"), "{msg}");
+    assert_eq!(
+        read_runstate(db_b.pool()).await.unwrap(),
+        RunState::default(),
+        "rejected install must not leave runstate rows"
+    );
+    assert_eq!(
+        db_b.schema_meta("m8_runstate_activated").await.unwrap(),
+        None
     );
 }
 

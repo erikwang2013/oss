@@ -427,6 +427,16 @@ inventory/lifecycle 运行态复制与 lease 接管仍未完成：
   fail-closed；快照仍为 OSSCTL3 `m8.runstate`。剩余：inventory/lifecycle 运行态与
   lease takeover。启用前置：全集群 feature-4 二进制、移除/升级 v1.22 及更早节点、
   `[raft].feature_level=4` 显式配置并重启。
+  **激活标记语义（round5）**：`m8_runstate_activated` 只由 level-4 事实置位——安装
+  level-4 快照、cutover/force-recover 显式种子、已 apply 的 level-4 命令；level-3 快照
+  （即使带 jobs/tier 行）不是日志事实，安装会撤销标记，且配置 4 的节点拒绝带运行态行
+  的 level-3 快照；空表启动**不提前写**标记（effective 可能仍为 3）。配置 4 且无标记时，
+  `jobs`/`job_tasks`/`inventory_runs`/`tier_restores` 必须全空，且 `inventory_runs.job_id`/
+  `tier_restores.job_id` 无悬空，否则启动 fail-closed。清理步骤：保持 feature≤3 启动，
+  等作业进入终态并备份控制库，然后清空四表（悬空引用随行删除；要保留 inventory/tier
+  行只能用导出重灌），再以 feature≥4 重启；或用 `raft-export` 备份后在新集群
+  `raft-cutover`/`force-recover` 重灌（显式种子会写激活标记）。effective<4 期间 JobState
+  拒绝本地写，不会新增非日志行。
 - **M8-3 读一致性（1–2 人周）**：默认 follower 本地读（保持现状），响应头带
   `x-oss-applied-index`；`?consistent=1` 走 leader 读（转发）或 ReadIndex。控制台写后跳转
   使用 `consistent=1`。不做 follower 线性一致读的通用承诺。

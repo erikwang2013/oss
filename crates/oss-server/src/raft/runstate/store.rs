@@ -1,7 +1,8 @@
 //! 运行态九表整表读写（M8-2a；模型见 [`super::model`]）。
 //!
 //! 读按主键排序（快照 checksum / 往返字节确定）；安装删除九表后按给定顺序插入，
-//! 全程使用调用方事务——失败时由调用方回滚，绝不留下半套表。
+//! 全程使用调用方事务——失败时由调用方回滚，绝不留下半套表。激活标记不由本模块
+//! 写：来源级别决定 `m8_runstate_activated`（见 `compat::mark/clear_runstate_activated_tx`）。
 
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
@@ -484,9 +485,6 @@ async fn write_rows(conn: &mut SqliteConnection, state: &RunState) -> Result<(),
                 .map_err(sql)?;
         }
     }
-    // 安装后的行全部来自日志/快照：重启守卫不再要求空表。
-    crate::raft::compat::mark_runstate_activated_tx(conn)
-        .await
-        .map_err(sql)?;
+    // 激活标记由调用方按来源写/清：普通 level-3 快照不是日志事实。
     Ok(())
 }

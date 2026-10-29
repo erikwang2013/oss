@@ -118,7 +118,8 @@ impl JobState {
                 Some(level) => {
                     return Err(format!(
                         "{op}: raft effective feature {level} < 4; job writes fail closed \
-                         until unreachable or pre-feature-4 members are removed or upgraded"
+                         (no local fallback while [raft].feature_level>=4) until unreachable \
+                         or pre-feature-4 members are removed or upgraded"
                     ));
                 }
                 None => return Err(format!("{op}: raft effective feature unavailable")),

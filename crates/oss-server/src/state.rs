@@ -311,8 +311,9 @@ impl AppState {
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
         // S6d：模式与库内触发器/站点状态一致才放行。
         db.assert_mode_guards().await?;
-        // M8-2 P1-A：feature ≤3 的本地作业行不在日志里，feature-4 激活前必须为空（或
-        // 已安装过 OSSCTL3 快照/cutover）。守卫在 Raft 启动前，拒绝时不会进入 apply。
+        // M8-2 P1-A：本地运行态（含 level-3 快照拷贝）不是日志事实；feature-4 启动前
+        // 必须四表为空/无悬空引用，或已有 level-4 命令/快照/cutover 留下的激活标记。
+        // 守卫在 Raft 启动前，拒绝时不会进入 apply。
         if let Some(settings) = &raft_settings {
             crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
                 .await

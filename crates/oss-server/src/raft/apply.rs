@@ -1190,6 +1190,13 @@ async fn apply_job_batch(
         if !restore_keys.insert(key) {
             return Ok(ControlResponse::Conflict);
         }
+        // 与任务同规则：引用的 job 必须在本批或本地已存在（RunState::validate 不允许悬空）。
+        if let Some(job_id) = restore.job_id
+            && !batch_ids.contains(&job_id)
+            && current_job(cw, job_id).await?.is_none()
+        {
+            return Ok(ControlResponse::Conflict);
+        }
         let cur = current_restore(cw, &restore.bucket, &restore.key, &restore.version_id).await?;
         if restore_row_ok(cur.as_ref(), restore).is_err() {
             return Ok(ControlResponse::Conflict);

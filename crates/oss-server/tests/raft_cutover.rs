@@ -5,7 +5,9 @@ use std::path::Path;
 use oss_server::config::RaftRole;
 use oss_server::db::Db;
 use oss_server::raft::RaftSettings;
+use oss_server::raft::compat;
 use oss_server::raft::cutover::{self, CutoverError, CutoverOptions, TargetFacts};
+use oss_server::raft::runstate::{JobRow, RunState, install_runstate_tx, read_runstate};
 
 async fn db_at(dir: &Path, name: &str) -> Db {
     let url = format!("sqlite://{}?mode=rwc", dir.join(name).display());
@@ -59,6 +61,28 @@ async fn seed_admin_and_rows(db: &Db) {
     .execute(db.pool())
     .await
     .unwrap();
+}
+
+/// 显式种子来源的最小合法运行态（cutover/force_recover 是 level-4 兼容事实）。
+fn sample_runstate() -> RunState {
+    RunState {
+        jobs: vec![JobRow {
+            id: 7,
+            kind: "batch".into(),
+            created_at: 10,
+            updated_at: 11,
+            ..JobRow::default()
+        }],
+        next_job_id: 8,
+        next_run_id: 1,
+        ..RunState::default()
+    }
+}
+
+async fn install_runstate(db: &Db, rs: &RunState) {
+    let mut tx = db.pool().begin().await.unwrap();
+    install_runstate_tx(&mut tx, rs).await.unwrap();
+    tx.commit().await.unwrap();
 }
 
 fn facts() -> TargetFacts {
@@ -335,6 +359,7 @@ async fn cutover_installs_level_three_accounts_and_marks_canonical() {
     src.schema_meta_set(oss_server::db::META_ACCOUNTS_CANONICAL, "done")
         .await
         .unwrap();
+    install_runstate(&src, &sample_runstate()).await;
     sqlx::query(
         "INSERT INTO accounts \
          (id, name, status, bucket_quota, soft_byte_quota, created_at, updated_at) \
@@ -391,6 +416,21 @@ async fn cutover_installs_level_three_accounts_and_marks_canonical() {
         dst.accounts_canonical().await.unwrap(),
         "level-3 cutover 必须写 canonical marker"
     );
+    assert_eq!(
+        dst.schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "cutover 显式种子是 level-4 兼容来源，必须写运行态激活标记"
+    );
+    assert_eq!(read_runstate(dst.pool()).await.unwrap().jobs.len(), 1);
+    assert!(
+        compat::guard_runstate_activation(dst.pool(), 4)
+            .await
+            .is_ok(),
+        "显式种子后配置 feature 4 启动守卫必须放行"
+    );
     let alice_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
         .fetch_one(dst.pool())
         .await
@@ -432,6 +472,19 @@ async fn cutover_installs_level_three_accounts_and_marks_canonical() {
     assert!(
         dst2.accounts_canonical().await.unwrap(),
         "level-3 force-recover 必须写 canonical marker"
+    );
+    assert_eq!(
+        dst2.schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "force-recover 显式种子是 level-4 兼容来源，必须写运行态激活标记"
+    );
+    assert!(
+        compat::guard_runstate_activation(dst2.pool(), 4)
+            .await
+            .is_ok()
     );
     let alice_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
         .fetch_one(dst2.pool())

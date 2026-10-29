@@ -311,6 +311,62 @@ async fn reconcile_crash_windows() {
     );
 }
 
+/// P2-1 分支：DB 行仍 pending、版本事实已是 Restored → 按版本收敛为 restored
+/// 并写入 expiry，不得把已完成的恢复再重排一次。
+#[tokio::test]
+async fn reconcile_pending_row_to_restored_version() {
+    let (st, _mock, _d) = setup().await;
+    let vid = archive(&st, "r2.txt", b"restored-data").await;
+    sqlx::query(
+        "INSERT INTO tier_restores \
+         (bucket, key, version_id, expires_at, job_id, state, created_at) \
+         VALUES ('bkt', 'r2.txt', ?, 0, NULL, 'pending', 1)",
+    )
+    .bind(&vid)
+    .execute(st.db.pool())
+    .await
+    .unwrap();
+    st.store
+        .mark_restore_pending("bkt", "r2.txt", &vid)
+        .await
+        .unwrap();
+    st.store
+        .restore_prepare("bkt", "r2.txt", &vid, b"restored-data")
+        .await
+        .unwrap();
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 7200;
+    st.store
+        .restore_commit("bkt", "r2.txt", &vid, expires, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        st.db
+            .restore_row("bkt", "r2.txt", &vid)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "pending",
+        "版本已 Restored 但 DB 行仍是 pending（follower 滞后的模拟）"
+    );
+
+    reconcile_restores(&st.db, &st.store, st.restore_sink.as_ref())
+        .await
+        .unwrap();
+    let row = st
+        .db
+        .restore_row("bkt", "r2.txt", &vid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "restored");
+    assert_eq!(row.expires_at, expires);
+}
+
 /// 缺省 versionId → 当前版本（版本桶）。
 #[tokio::test]
 async fn restore_without_version_id_targets_latest() {

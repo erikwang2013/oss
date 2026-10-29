@@ -383,8 +383,12 @@ pub async fn cutover(
         .await
         .map_err(|e| CutoverError::Db(e.to_string()))?;
     // level 3：运行态九表与控制面同一事务替换（旧格式无运行态 → 空态，不保留目标本地行）。
+    // cutover 是运维显式选择的种子，可置运行态激活标记（普通 level-3 快照不允许）。
     if activation >= super::compat::FEATURE_LEVEL_3 {
         runstate::install_runstate_tx(&mut tx, &runstate)
+            .await
+            .map_err(|e| CutoverError::Db(e.to_string()))?;
+        super::compat::mark_runstate_activated_tx(&mut tx)
             .await
             .map_err(|e| CutoverError::Db(e.to_string()))?;
     }

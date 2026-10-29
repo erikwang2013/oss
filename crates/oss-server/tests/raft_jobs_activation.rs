@@ -95,8 +95,8 @@ async fn old_local_jobs_block_feature4_activation() {
     let cfg = write_cfg(dir.path(), 4);
     let err = AppState::load(&cfg)
         .await
-        .err()
-        .expect("非空旧本地运行态切 feature 4 必须拒绝启动");
+        .map(|_| ())
+        .expect_err("非空旧本地运行态切 feature 4 必须拒绝启动");
     let msg = err.to_string();
     assert!(msg.contains("m8_runstate_activated"), "{msg}");
     assert!(
@@ -115,14 +115,9 @@ async fn empty_tables_activate_and_feature4_restart_with_rows_succeeds() {
     let cfg = write_cfg(dir.path(), 4);
     let state = AppState::load(&cfg).await.unwrap();
     assert_eq!(
-        state
-            .db
-            .schema_meta("m8_runstate_activated")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("1"),
-        "空表激活必须在启动时写标记"
+        state.db.schema_meta("m8_runstate_activated").await.unwrap(),
+        None,
+        "空表启动不得提前写标记（effective 可能仍是 3）"
     );
     let handle = state.raft.clone().expect("raft handle");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -155,6 +150,16 @@ async fn empty_tables_activate_and_feature4_restart_with_rows_succeeds() {
         Some("4"),
         "首条 Job* 命令 apply 必须把激活 marker 提到 4"
     );
+    assert_eq!(
+        state
+            .db
+            .schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "已 apply 的 level-4 命令必须写运行态激活标记"
+    );
     stop(state).await;
 
     // 重启：jobs 非空但已有激活标记（行全是日志事实）→ 放行。
@@ -173,7 +178,107 @@ async fn empty_tables_activate_and_feature4_restart_with_rows_succeeds() {
     let cfg = write_cfg(dir.path(), 3);
     let err = AppState::load(&cfg)
         .await
-        .err()
-        .expect("marker 4 不能用 feature_level=3 启动");
+        .map(|_| ())
+        .expect_err("marker 4 不能用 feature_level=3 启动");
     assert!(err.to_string().contains("raft_feature_level=4"), "{err}");
+}
+
+/// P2：清掉 jobs/job_tasks 后 inventory_runs/tier_restores 仍引用旧 job → 悬空引用
+/// 必须继续拒绝启动，并给出可执行的清理/重灌文案；清理后放行且不写 marker。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dangling_runstate_refs_block_feature4_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), 2);
+    let state = AppState::load(&cfg).await.unwrap();
+    let spec = JobSpec {
+        kind: "batch".into(),
+        bucket: "src".into(),
+        prefix: "p/".into(),
+        ..JobSpec::default()
+    };
+    let id = state
+        .jobs
+        .create_job(&state.db, &spec, now())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO inventory_runs \
+         (bucket, config_id, run_key, started_at, state, job_id, created_at) \
+         VALUES ('src', 'cfg', 'run-1', 1, 'done', ?, 1)",
+    )
+    .bind(id)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tier_restores \
+         (bucket, key, version_id, expires_at, job_id, state, created_at) \
+         VALUES ('src', 'p/old', 'v1', 0, ?, 'pending', 1)",
+    )
+    .bind(id)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+    stop(state).await;
+
+    let cfg = write_cfg(dir.path(), 4);
+    let err = AppState::load(&cfg)
+        .await
+        .map(|_| ())
+        .expect_err("非空运行态不得以 feature 4 启动")
+        .to_string();
+    assert!(
+        err.contains("jobs=1")
+            && err.contains("inventory_runs=1")
+            && err.contains("tier_restores=1"),
+        "{err}"
+    );
+
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("control.db").display()
+    );
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("DELETE FROM jobs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM job_tasks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let err = AppState::load(&cfg)
+        .await
+        .map(|_| ())
+        .expect_err("jobs 清空但引用悬空仍必须拒绝")
+        .to_string();
+    assert!(
+        err.contains("inventory_runs.job_id=1")
+            && err.contains("tier_restores.job_id=1")
+            && err.contains("清空"),
+        "{err}"
+    );
+
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("DELETE FROM inventory_runs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM tier_restores")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let state = AppState::load(&cfg)
+        .await
+        .expect("四表清空后 feature 4 应可启动");
+    assert_eq!(
+        state.db.schema_meta("m8_runstate_activated").await.unwrap(),
+        None,
+        "清理后启动仍不得提前写 marker"
+    );
+    stop(state).await;
 }

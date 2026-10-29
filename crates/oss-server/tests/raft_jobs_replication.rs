@@ -19,8 +19,8 @@ use oss_server::raft::command::{ControlCommand, ControlResponse};
 use oss_server::raft::control::ControlPlane;
 use oss_server::raft::data::ControlData;
 use oss_server::raft::runstate::{
-    JobRow, JobTaskRow, RunState, decode_runstate_snapshot, encode_runstate_snapshot,
-    install_runstate_tx, read_runstate,
+    JobRow, JobTaskRow, RunState, TierRestoreRow, decode_runstate_snapshot,
+    encode_runstate_snapshot, install_runstate_tx, read_runstate,
 };
 use oss_server::raft::{FencingEpoch, LeaderGate, RaftHandle};
 use oss_server::state::AppState;
@@ -754,6 +754,32 @@ async fn apply_guards_reject_whole_batch_without_partial_writes() {
     assert_eq!(
         submit(&control, Vec::new(), vec![orphan]).await,
         ControlResponse::Conflict
+    );
+    // Restore 行引用不存在的作业：apply 预检同样整批拒绝。
+    let orphan_restore = TierRestoreRow {
+        bucket: "src".into(),
+        key: "p/x".into(),
+        version_id: "v9".into(),
+        expires_at: 0,
+        job_id: Some(999_999),
+        state: "pending".into(),
+        created_at: now(),
+        ..TierRestoreRow::default()
+    };
+    assert_eq!(
+        control
+            .write(ControlCommand::JobBatch {
+                jobs: Vec::new(),
+                tasks: Vec::new(),
+                restores: vec![orphan_restore],
+            })
+            .await
+            .expect("restore batch must reach apply"),
+        ControlResponse::Conflict
+    );
+    assert!(
+        runstate(&leader.db).await.tier_restores.is_empty(),
+        "conflicting restore must not be written"
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
