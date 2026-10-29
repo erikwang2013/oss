@@ -600,10 +600,17 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
     <dialog id="image-dialog" aria-labelledby="image-title">
       <div class="dialog-head">
         <h2 id="image-title">架构图</h2>
-        <button class="dialog-close" type="button" data-close-image>关闭</button>
+        <div class="dialog-tools">
+          <button class="zoom-btn" type="button" data-zoom-out aria-label="缩小">−</button>
+          <button class="zoom-btn" type="button" data-zoom-reset aria-label="重置缩放">1:1</button>
+          <button class="zoom-btn" type="button" data-zoom-in aria-label="放大">＋</button>
+          <button class="dialog-close" type="button" data-close-image>关闭</button>
+        </div>
       </div>
-      <img id="image-large" src="assets/img/architecture.svg" alt="架构图">
-      <p class="dialog-hint">点击背景或按 Esc 关闭。</p>
+      <div class="image-stage" data-image-stage>
+        <img id="image-large" src="assets/img/architecture.svg" alt="架构图">
+      </div>
+      <p class="dialog-hint">滚轮/双指缩放，拖动平移，双击切换 1×/2×；点击背景或按 Esc 关闭。</p>
     </dialog>
 
     <script src="assets/js/site.js" defer></script>

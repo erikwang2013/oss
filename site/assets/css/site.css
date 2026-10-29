@@ -1295,18 +1295,75 @@ dialog::backdrop {
 }
 
 #image-dialog {
-  width: min(94vw, 1120px);
-  max-width: 1120px;
+  width: min(96vw, 1400px);
+  max-width: 1400px;
+  padding: 18px;
+}
+
+.dialog-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.zoom-btn {
+  min-width: 34px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--ink);
+  padding: 5px 9px;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.zoom-btn:hover,
+.zoom-btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 缩放舞台：图片绝对居中，JS 用 transform 缩放/平移；滚轮、双指、拖动、双击。 */
+.image-stage {
+  position: relative;
+  height: min(74vh, 860px);
+  margin-top: 14px;
+  overflow: hidden;
+  border-radius: 12px;
+  background: #f4f7fb;
+  cursor: grab;
+  touch-action: none;
+}
+
+.image-stage.is-dragging {
+  cursor: grabbing;
 }
 
 #image-large {
-  display: block;
-  width: 100%;
-  max-height: 78vh;
-  margin: 18px auto 0;
-  border-radius: 12px;
-  background: #f4f7fb;
-  object-fit: contain;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  transform: translate(-50%, -50%);
+  transform-origin: center;
+  border-radius: 0;
+  background: transparent;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+@media (max-width: 640px) {
+  #image-dialog {
+    width: 96vw;
+    padding: 12px;
+  }
+
+  .image-stage {
+    height: 60vh;
+  }
 }
 
 .dialog-hint {
