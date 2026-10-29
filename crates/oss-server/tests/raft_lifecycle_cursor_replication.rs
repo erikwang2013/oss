@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oss_server::db::Db;
 use oss_server::job_state::JobState;
-use oss_server::raft::command::{ControlCommand, ControlResponse};
+use oss_server::raft::command::{ControlCommand, ControlResponse, LifecycleRuleCmd};
 use oss_server::raft::control::ControlPlane;
 use oss_server::raft::runstate::{LifecycleCursorRow, RunState, read_runstate};
 use oss_server::raft::{FencingEpoch, RaftHandle};
@@ -604,6 +604,81 @@ async fn follower_rejects_upsert_and_forwards_clear() {
         let db = Arc::clone(&node.db);
         wait_until("clear replicated to every voter", || async {
             runstate(&db).await.lifecycle_cursors.is_empty()
+        })
+        .await;
+    }
+}
+
+/// P3-3：真实 sweep 路径（不是直接调门面）在 3-voter feature 5 下写游标，follower 必须
+/// 收到行。把 `save_cursor` 改回 `state.db.lifecycle_cursor_set` 本地直写时本用例失败。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_sweep_writes_cursor_through_facade() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, mut st) = start_cluster(dir.path(), 5).await;
+    let leader = nodes
+        .iter()
+        .find(|n| n.handle.is_leader())
+        .expect("cluster has a leader");
+    let control = control_for(leader, &st);
+    wait_ready(leader).await;
+    create_bucket(&control).await;
+
+    // 让真实 sweep 跑在 leader 的库/raft/门面上；store 只需能列举两个对象。
+    st.db = Arc::clone(&leader.db);
+    st.control = Arc::clone(&control);
+    st.jobs = Arc::new(JobState::new(Some(Arc::clone(&control))));
+    st.raft = Some(Arc::clone(&leader.handle));
+    // 默认 groups 已建 src 目录；只在缺失时补建。
+    if !st.store.bucket_exists("src").await.unwrap() {
+        st.store.create_bucket("src").await.unwrap();
+    }
+    for key in ["a.txt", "b.txt"] {
+        st.store
+            .put_object("src", key, bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        control
+            .write(ControlCommand::BucketSetLifecycle {
+                bucket: "src".into(),
+                rules: vec![LifecycleRuleCmd {
+                    rule_id: None,
+                    prefix: String::new(),
+                    expire_days: 1,
+                    expiration_days: Some(1),
+                    transition_days: None,
+                    transition_class: None,
+                    transition_tier: None,
+                    enabled: true,
+                }],
+                updated_at: 1,
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+
+    // 页预算 1、页大小 1：扫完第一页即截停，必须把页尾 key 写成游标。
+    let limits = oss_server::lifecycle::SweepLimits {
+        max_pages: 1,
+        page_size: 1,
+        max_key_versions: 100,
+    };
+    assert_eq!(
+        oss_server::lifecycle::sweep_once_at_with(&st, now(), limits).await,
+        1
+    );
+
+    for node in &nodes {
+        let db = Arc::clone(&node.db);
+        wait_until("sweep cursor on every voter", || async {
+            runstate(&db).await.lifecycle_cursors.iter().any(|c| {
+                c.bucket == "src"
+                    && c.rule_id == "legacy:"
+                    && c.stage == "current"
+                    && c.cursor == "a.txt"
+            })
         })
         .await;
     }

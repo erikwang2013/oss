@@ -611,20 +611,19 @@ v1.23.0 导出 activation 最多 4，无法以 5 重灌；需保留的数据只�
 | 命令/门控 | `raft/command.rs` `LifecycleCursorUpsert`/`LifecycleCursorClear` | `min_feature_level=5`（与 Inventory* 同级；v1.23.0 及更早无法解码）；只新增变体，`ControlResponse`/OSSCTL3 封套不变；`m8.runstate` 快照本就含 `lifecycle_cursors`，不升扩展版本 |
 | 写入门面 | `job_state/lifecycle.rs`、`lifecycle.rs::save_cursor` | worker 游标写统一走 `JobState` 门面：Raft+advertised≥5 时 leader 读改写经 `ControlPlane::write`；effective<5 fail-closed（不退回本地）；feature≤4 保持节点本地直写；follower 读改写返回 `not leader`，阶段扫完的清除可转发（fence 随命令携带） |
 | apply | `raft/apply/lifecycle.rs` | 单行只读预检：自然键/水位非空、`updated_at` 严格前进、fence 不回退，失败 `Conflict` 零写入；upsert `rows_affected==1`；清除只删 `fence_term <= token` 的行（旧 term 迟到删除 no-op、重复清除幂等） |
-| 引用/幂等 | `job_state/lifecycle.rs` | 桶已删除时 leader 在 append 前拒绝游标写入（不复活孤儿行）；旧 term 写入与同内容同 token 重复写不 append；leader 死亡接管后新 leader 从复制行继续推进 |
-| 测试 | `raft_lifecycle_cursor_replication`、`raft_command_contract` | 3-voter 写/推进/清除收敛；leader 死亡后新 leader 接管；旧 term/重复写 no-op；预检零写 `Conflict`；feature 4 本地写且命令在 append 前被拒；peer advertise 4 混版拒绝；follower upsert fail-closed + clear 转发；24 MiB 上限；契约 fixture 增 2 变体 |
+| 引用/幂等 | `job_state/lifecycle.rs` | 桶已删除时 leader 在 append 前拒绝游标写入（不复活孤儿行）；`rule_id` 不在 apply 复检（配置替换会清游标，游标只是续扫提示）；旧 term 写入与同内容同 token 重复写不 append；leader 死亡接管后新 leader 从复制行继续推进 |
+| feature-5 激活清理 | `raft/compat.rs::guard_inventory_activation` | 首次激活（marker 缺失且 inventory 表已空）清空本地 `lifecycle_cursors`（重扫安全），v1.23.0 遗留行不残留；已激活节点重启保留日志复制行；单测覆盖 |
+| 测试 | `raft_lifecycle_cursor_replication`、`raft_command_contract` | 真实 sweep 在 3-voter feature 5 下写游标、follower 收敛（门面旁路会失败）；3-voter 写/推进/清除收敛；leader 死亡后新 leader 接管；旧 term/重复写 no-op；预检零写 `Conflict`；feature 4 本地写且命令在 append 前被拒；peer advertise 4 混版拒绝；follower upsert fail-closed + clear 转发；24 MiB 上限；契约 fixture 增 2 变体 |
 
 **剩余**：tier restore 后续状态（restored/清理）日志复制与 `schedule_lease`
-acquire/renew/takeover（backlog §4）。**已知残余**：升级到 feature 5 前遗留的节点本地
-`lifecycle_cursors` 行不迁移；若某副本旧行的 `updated_at` 因时钟偏移高于新 leader 的行，
-该副本会对首次 `LifecycleCursorUpsert` 返回 `Conflict`（仅续扫提示不前进，安全），
-该节点成为 leader 后下一次写入以更高 `updated_at` 自愈。游标只是续扫位置，失败/冲突
-最坏导致重复扫描或推迟到期，不影响删除安全。
+acquire/renew/takeover（backlog §4）。游标只是续扫位置，重复扫描/推迟到期不影响删除安全；
+feature-5 首次激活清空本地旧游标后，不再有时钟偏移导致的持续 `Conflict`。
 
-**验证**（本分支，`/tmp/oss-target-m8life`）：`raft_lifecycle_cursor_replication` 7/0；
-`oss-server --lib` 229/0、`m8_lifecycle_api` 8/0、`raft_command_contract` 3/0/1、
-`raft_inventory_replication` 12/0、`raft_jobs_replication` 11/0、`raft_runstate_snapshot`
-14/0；fmt 0；clippy `-D warnings` 0。
+**验证**（本分支，`/tmp/oss-target-m8life`）：`raft_lifecycle_cursor_replication` 8/0
+（含真实 sweep 写游标到 follower；把 `save_cursor` 改回本地直写时该用例失败）；`oss-server
+--lib` 230/0（含激活清理单测）、`m8_lifecycle_api` 8/0、`raft_command_contract` 3/0/1、
+`raft_inventory_replication` 12/0、`raft_runstate_snapshot` 14/0；fmt 0；clippy
+`-D warnings` 0。
 
 **原 v1.23.0 验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server`
 全量 **68 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。

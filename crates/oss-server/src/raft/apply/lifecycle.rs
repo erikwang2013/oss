@@ -2,9 +2,9 @@
 //!
 //! 与 inventory 同语义：先只读预检当前行，不合法 → `Conflict` 且零写入；通过后整行
 //! upsert，且必须恰好影响 1 行。游标语义：水位非空、`updated_at` 严格前进、fence 不
-//! 回退；自然键 `(bucket, rule_id, stage)` 就是主键。桶/规则引用由 leader 在 append
-//! 前校验，这里不读副本本地其他表决定结果。清除是幂等删除，`fence_term` 上限让旧
-//! term 的迟到删除 no-op。
+//! 回退；自然键 `(bucket, rule_id, stage)` 就是主键。桶引用由 leader 在 append 前校验；
+//! `rule_id` 不在 apply 复检（配置替换会清游标，游标只是续扫提示）。这里不读副本本地
+//! 其他表决定结果。清除是幂等删除，`fence_term` 上限让旧 term 的迟到删除 no-op。
 
 use super::{ControlWrite, invariant};
 use crate::raft::command::ControlResponse;

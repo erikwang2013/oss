@@ -457,7 +457,8 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
   门面（`job_state/lifecycle.rs`），leader 读改写、follower 读改写 fail-closed，
   阶段扫完的删除可转发（fence 随命令携带，旧 term 迟到删除 no-op）。apply 预检
   `Conflict` 零写入、`rows_affected==1`、key 非空/水位非空/`updated_at` 严格前进/
-  fence 不回退；桶引用在 leader append 前校验。剩余：tier restore 后续状态与
+  fence 不回退；桶引用在 leader append 前校验（`rule_id` 不复检）。首次 feature-5
+  激活清空本地旧游标（重扫安全），v1.23.0 遗留行不残留。剩余：tier restore 后续状态与
   schedule lease takeover。
   启用前置：feature 4 需全集群 level-4 二进制并移除/升级 v1.22 及更早节点；feature 5
   还需移除/升级 v1.23.0（不能解码 Inventory*/Lifecycle*），再显式配置 `[raft].feature_level=5`。
