@@ -30,7 +30,7 @@
 > re-ingest、桶配额并发修复均落地。硬字节/对象数配额与 M8-2 仍为里程碑（本波不实现）；
 > AP 动态 registry（Slice B）需 feature level ≥6（4=jobs、5=inventory 已占用），暂不排期。
 >
-> **2026-10-30 更新（v1.23.0，M8-2 jobs 切片）**：v1.23.0 发布 jobs/job_tasks/
+> **2026-10-30 更新（v1.24.0，M8-2 feature 4/5）**：v1.23.0 发布 jobs/job_tasks/
 > tier_restores（Restore 受理行）复制，作为 **feature level 4**（`FEATURE_LEVEL_4`）；
 > v1.22 及更早二进制 advertise ≤3，混版窗口内 leader 生效级别压回 3、Job* 在 append 前
 > 被拒（`check_feature`）。**inventory 复制 remediation 后改为 feature level 5**

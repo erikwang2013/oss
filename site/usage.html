@@ -62,7 +62,7 @@
         <a href="usage.html" aria-current="page">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.23.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.24.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -281,7 +281,7 @@ oss-server cluster-shrink rollback --plan plan.json --yes # commit 前回滚</co
                 <tr><td>Level C / OSSCTL3</td><td>地基（feature level 1..3；OSSCTL3 扩展区；Ext 容器 registry 为空）；v1.20.1 ↔ v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不支持；生产 Ext 命令与完整双向混写未交付</td></tr>
                 <tr><td>Raft 租户账户</td><td>账户/成员写路径已改走 Raft 命令（8 个 level-3 <code>ControlCommand</code>，按 username 自然键；OSSCTL3 快照含账户行）；软字节配额已交付（只告警不阻写）；跨账户共享与 canonicalization worker 未交付</td></tr>
                 <tr><td>账户软字节配额</td><td>已支持（<code>GET /accounts/{id}/usage</code> + <code>PUT /accounts/{id}/soft-quota</code>；仅告警不阻写；用量为全量列举，集群丢 peer 时 <code>complete=false</code>/头 <code>partial</code>；硬字节与对象数配额不做）</td></tr>
-                <tr><td>M8 多节点运行时</td><td>jobs/job_tasks 与 Restore 受理行经 level-4 Raft 复制（feature 4，全 peer ≥4；旧节点单向门）；控制台一致读已交付；inventory/lifecycle 运行态、schedule lease/worker takeover 未交付</td></tr>
+                <tr><td>M8 多节点运行时</td><td>jobs/job_tasks 与 Restore 受理行（feature 4）、inventory 三表与 lifecycle 游标（feature 5）经 Raft 复制；全 peer 达标才启用（旧节点单向门）；schedule lease/worker takeover 与 tier restore 后续状态未交付</td></tr>
                 <tr><td>Inventory 增量 / 跨账户目标</td><td>已支持（增量水位为节点本地；跨账户目标仅管理员可配置）</td></tr>
                 <tr><td>AbortIncompleteMultipartUpload</td><td>已支持（生命周期规则）</td></tr>
                 <tr><td>Batch 抢占 / 跨账户清单</td><td>已支持（同提交者协作抢占；跨账户清单仅管理员；跨账户通知仍不做）</td></tr>
@@ -312,7 +312,7 @@ oss-server cluster-shrink rollback --plan plan.json --yes # commit 前回滚</co
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.23.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.24.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
