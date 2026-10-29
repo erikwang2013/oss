@@ -121,7 +121,9 @@ Level C 的一端，窗口从 v1.20.1 起（已实测 v1.20.1 ↔ v1.21.1 147/0/
   与降级前扫描 `raft-downgrade-preflight`（列出所有 CMK 对象/桶默认值/MPU kind）。
   未 rewrap 的对象在旧端一律拒绝服务，不做「尽力读」。
 - **LC-4 回滚矩阵与演练（1 人周）**：把下表固化成 `docs/` + e2e 断言；每个格必须可执行、
-  可观察、有明确报错。
+  可观察、有明确报错。已固化：`tests/e2e_m9_rollback.sh`（真实进程，旧端 = v1.20.1）
+  覆盖 marker 1/2/3/4、导出封套 wire/feature/snapshot_format 拒绝、激活后回滚必须保留
+  `[raft].feature_level=3`，以及显式 CMK 写→轮换→`cmk scan`/`cmk rewrap`→旧/新二进制读回。
 
 ### 1.4 明确非目标
 
@@ -145,19 +147,25 @@ Level C 的一端，窗口从 v1.20.1 起（已实测 v1.20.1 ↔ v1.21.1 147/0/
 
 | 已发生状态 | 旧二进制能否启动 | 允许的回退动作 | 禁止 | 数据风险 |
 |---|---|---|---|---|
-| marker=1，无 Level B 行 | 能（删 `feature_level` 键） | 换旧二进制重启 | 无 | 无 |
-| marker=2，有结构化生命周期行 | **不能**（`guard_startup` 拒绝） | 保持新二进制；或恢复升级前 DB 备份 | 直接换旧二进制 | 恢复备份会丢升级后写入 |
-| 有 CMK 对象/桶默认值 | 能启动但对象 500 | `kms-rewrap` 后再降级；或删除/迁移对象 | 假装可读 | 未 rewrap 对象不可用 |
-| 已写 OSSCTL2 快照 | 不能（补丁线可读） | 只能新二进制；或新集群重灌 | 旧二进制加载 | 快照不可降级 |
+| marker=1，无 Level B 行 | 能（库内无 `schema_meta.raft_feature_level` 行；配置不写 `[raft].feature_level`） | 换旧二进制重启 | 无 | 无 |
+| marker=2，有结构化生命周期行 | **不能**（`guard_startup` 拒绝 marker 高于配置/二进制上限；v1.20.1 需保留 `feature_level≥2`） | 保持新二进制；或恢复升级前 DB 备份 | 直接换旧二进制 | 恢复备份会丢升级后写入 |
+| marker=3 / 已写 OSSCTL3 快照 | **v1.20.1 能**：同库直接启动可读，`raft-force-recover` 可安装 OSSCTL3 导出；窗口外（v1.19 及更早）不能 | 保持 v1.20.1+；或新集群重灌 | 用低于 marker 的 `feature_level` 启动（R8 拒绝）；向窗口外二进制加载 | 快照不可降级到窗口外 |
+| 有 CMK 对象/桶默认值 | v1.20.1 能（自带 CMK 读路径）；pre-CMK 旧端启动后对象 500 | `oss-server cmk rewrap`（当前实现：重加密到同一 CMK 当前版本）后再降级；或删除/迁移对象 | 假装可读 | 未 rewrap 对象在 pre-CMK 端不可用 |
+| 已写 OSSCTL2 快照 | **能**（v1.20.1 可解码/加载；Level B 之前不能） | v1.20.1+ 加载；或新集群重灌 | pre-Level-B 旧二进制加载 | 快照不可降级到 Level B 之前 |
 | 成员变更后 | 不能（wire<2 被 `check_cluster_uniformity` 拒） | 保持新集群 | 旧二进制加入 | 成员表不可回退 |
 
 统一规则：**任何降级都先停写、快照、跑 preflight；preflight 非零退出即中止**。
 
+上表的可执行证据是 `tests/e2e_m9_rollback.sh`（旧端 = tag v1.20.1，新端 = 工作树二进制；
+每格打印 PASS/FAIL，导出拒绝格另断言目标库零改动）。LC-3 的「CMK→legacy provider
+meta-only rewrap」目前**未实现**：`cmk rewrap` 只把旧 CMK 版本加密的版本重加密到该 CMK
+当前版本（数据分片重写，不是只换信封），因此不覆盖 pre-CMK 旧端的读路径。
+
 ### 1.7 测试与粗估
 
 - 单元：OSSCTL2 编解码、旧行缺字段、未知表/扩展区保留、feature 3 门控、rewrap 三态一致。
-- 集成：`tests/e2e_m9_rolling.sh` 扩成三二进制矩阵（v1.13.1 / v1.13.2-compat / 新），
-  覆盖「旧端只读新数据」「补丁端应用新命令桩」「激活后回滚被拒」「CMK preflight 拦截」。
+- 集成：`tests/e2e_m9_rolling.sh`（v1.13.1 历史滚动基线）+ `tests/e2e_m9_rollback.sh`
+  （Level C 窗口 v1.20.1 ↔ 新：回滚矩阵、导出封套闸门、激活后回滚、CMK rewrap 读回）。
 - 故障：旧 follower 落后时新 leader 提交 OSSCTL2 快照；补丁端解码失败必须留在集群而不是退出。
 - 粗估 6–10 人周，风险高（补丁线发布与双解码是主要不确定项）。
 
