@@ -181,6 +181,15 @@
   "JobUpsert": [
     "job"
   ],
+  "LifecycleCursorClear": [
+    "bucket",
+    "fence_term",
+    "rule_id",
+    "stage"
+  ],
+  "LifecycleCursorUpsert": [
+    "cursor"
+  ],
   "OlapDelete": [
     "access_point"
   ],

@@ -31,7 +31,7 @@ pub use model::{
 pub use store::{install_runstate_tx, read_runstate, read_runstate_tx};
 pub(crate) use store::{
     inventory_cursor_row_from, inventory_incremental_row_from, inventory_run_row_from,
-    job_row_from, job_task_row_from,
+    job_row_from, job_task_row_from, lifecycle_cursor_row_from,
 };
 
 /// OSSCTL3 扩展区中的命名空间（`[a-z0-9._-]{1,64}`）。

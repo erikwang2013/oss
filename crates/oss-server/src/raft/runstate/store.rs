@@ -136,6 +136,19 @@ pub(crate) fn inventory_incremental_row_from(
     }
 }
 
+/// 整行 → [`LifecycleCursorRow`]（lifecycle 游标复制与快照读共用）。
+pub(crate) fn lifecycle_cursor_row_from(r: &sqlx::sqlite::SqliteRow) -> LifecycleCursorRow {
+    LifecycleCursorRow {
+        bucket: r.get("bucket"),
+        rule_id: r.get("rule_id"),
+        stage: r.get("stage"),
+        cursor: r.get("cursor"),
+        updated_at: r.get("updated_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }
+}
+
 /// 调用方事务/连接内读取九表（行序 = 主键序，checksum 确定性来源）。
 pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, DataError> {
     let mut state = RunState::default();
@@ -229,15 +242,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.lifecycle_cursors.push(LifecycleCursorRow {
-            bucket: r.get("bucket"),
-            rule_id: r.get("rule_id"),
-            stage: r.get("stage"),
-            cursor: r.get("cursor"),
-            updated_at: r.get("updated_at"),
-            fence_term: r.get("fence_term"),
-            fence_leader: r.get("fence_leader"),
-        });
+        state.lifecycle_cursors.push(lifecycle_cursor_row_from(&r));
     }
 
     state.schedule_lease = sqlx::query(

@@ -351,8 +351,8 @@ async fn save_cursor(
     fence: FencingEpoch,
 ) {
     if let Err(e) = state
-        .db
-        .lifecycle_cursor_set(bucket, rule_id, stage, cursor, now_secs(), fence)
+        .jobs
+        .lifecycle_cursor_set(&state.db, bucket, rule_id, stage, cursor, now_secs(), fence)
         .await
     {
         tracing::warn!(bucket, rule_id, stage, error = %e, "lifecycle：游标写入失败");
