@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # M9 控制面 Level B 滚动升级 e2e（3 节点：A/B 数据站点 + C witness）。
 #
-# 场景（plan §7.2，按本版本可执行性调整）：从 **全旧（v1.13.1）集群** 起步，逐台换新
-# 二进制（先 follower 后 leader）→ 验证跨版本日志同步/选举 → 全部新后启用
-# feature_level=2 → 激活前回滚演练 → 旧二进制读新二进制写过的 DB → 新 leader 拒绝
-# 旧 peer 成员变更。
+# 场景（plan §7.2，按本版本可执行性调整）：从 **全旧集群** 起步（基线 v1.13.1 wire=1；
+# 也支持 v1.20.1 wire=2 旧端），逐台换新二进制（先 follower 后 leader）→ 验证跨版本
+# 日志同步/选举 → 全部新后启用 feature_level=2 → 激活前回滚演练 → 旧二进制读新二进制
+# 写过的 DB → 新 leader 按旧端实际 wire 拒绝（wire<2）或接受（wire≥2）旧 peer 成员变更。
 #
 # 与 plan 原文的差异（必须保留说明）：
 # - 不在全旧集群里“直接 pair 新节点”：R7 要求配对双方 wire>=2，新二进制会拒绝旧
@@ -19,7 +19,9 @@
 #   OSS_OLD_BIN=/path/to/v1.13.1/oss-server OSS_NEW_BIN=target/debug/oss-server \
 #     tests/e2e_m9_rolling.sh
 #   未提供 OSS_OLD_BIN → 整体 SKIP；M9_ROLLING_STRICT=1 时 SKIP 升为 FAIL。
-# 前置：两枚二进制（旧 = tag v1.13.1 / commit a58d64a）、curl、python3、回环端口。
+# 前置：两枚二进制（旧 = tag v1.13.1 / commit a58d64a，或 v1.20.1 wire=2）、curl、
+#       python3、回环端口。旧端 wire 从旧二进制 raft/status 读取；v1.13.1 无该字段时
+#       按基线 wire=1 保守断言（步骤 12 负向）。
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -199,6 +201,15 @@ ck poll_pred 60 leader_is "$A" 1
 ck poll_pred 60 members_are "$A" 2
 ck timeout 20 "$OLD_BIN" raft-add-witness --config "$W/a/oss.toml" --node-id 3 --endpoint "$C"
 ck poll_pred 60 members_are "$A" 3
+# 旧端 wire 从旧二进制自身的 status 读：v1.13.1 无 wire_version 字段（滚动基线 wire=1），
+# v1.20.1 起报 2。步骤 12 的成员变更期望按实际值分支，避免把兼容旧端误判为 FAIL。
+OLD_WIRE=$(sf "$A" wire_version)
+if [ "${OLD_WIRE:-}" -ge 1 ] 2>/dev/null; then
+  echo "  旧端 wire_version=$OLD_WIRE（步骤 12 按实际值断言）"
+else
+  OLD_WIRE=1
+  echo "  旧端未报告 wire_version（v1.13.1 基线）→ 按 wire=1 保守断言"
+fi
 BUCKET="rolling-$RANDOM"
 # 控制台建桶成功返回 204（与 e2e_m9 / e2e_m9_recovery 同口径）。
 ck [ "$(bucket_code "$A" "$AT" "$BUCKET")" = 204 ]
@@ -264,7 +275,7 @@ pass "激活前回滚：旧二进制启动并完成 level-1 写"
 echo "== 10. 激活后回滚 / OSSCTL2 =="
 skip "步骤 10：未激活（步骤 8）+ 本版本无 OSSCTL2（D6），无法演练；R8 启动守卫由单元测试覆盖"
 
-echo "== 12. 负向：新 leader 拒绝把旧 witness 加入集群（409 before add_learner） =="
+echo "== 12. 成员变更兼容门：按旧端 wire=$OLD_WIRE 断言旧 witness 加入结果 =="
 stop_all
 mk_cfg a "$A_HTTP" "$REG_A" "$TOK_A" 1 true
 mk_cfg b "$B_HTTP" "$REG_B" "$TOK_B" 2 false
@@ -275,14 +286,23 @@ ck poll_pred 90 any_leader
 mk_witness_cfg d 4 "$D_HTTP"
 ck start_d
 OUT=$(timeout 30 "$NEW_BIN" raft-add-witness --config "$W/a/oss.toml" --node-id 4 --endpoint "$D" 2>&1); RC=$?
-ck [ "$RC" -ne 0 ]
-if printf '%s' "$OUT" | grep -q peer_incompatible; then
-  pass "raft-add-witness 输出包含 peer_incompatible"
+if [ "$OLD_WIRE" -ge 2 ]; then
+  # 旧端 wire>=2（如 v1.20.1）：R5 兼容门应放行，成员表 3→4；仍拒绝才是回归。
+  if [ "$RC" -ne 0 ]; then echo "  raft-add-witness 输出：$OUT"; fi
+  ck [ "$RC" -eq 0 ]
+  ck poll_pred 30 members_are "$A" 4
+  pass "旧端 wire=$OLD_WIRE（≥2）：新 leader 接受兼容旧 witness，成员表 3→4"
 else
-  fail "raft-add-witness 输出缺少 peer_incompatible: $OUT"
+  # v1.13.1 wire=1 基线：目标 peer 与集群成员均 < MIN_MEMBERSHIP_WIRE_VERSION → 409。
+  ck [ "$RC" -ne 0 ]
+  if printf '%s' "$OUT" | grep -q peer_incompatible; then
+    pass "raft-add-witness 输出包含 peer_incompatible"
+  else
+    fail "raft-add-witness 输出缺少 peer_incompatible: $OUT"
+  fi
+  ck [ "$(status_json "$A" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(len(d.get("voters") or []))')" = 3 ]
+  pass "旧 peer 被 409 拒绝，成员表未变"
 fi
-ck [ "$(status_json "$A" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(len(d.get("voters") or []))')" = 3 ]
-pass "旧 peer 被 409 拒绝，成员表未变"
 
 echo "== 11. DB 往返：新二进制写过的库由旧二进制启动并读取 =="
 stop_all
