@@ -5,8 +5,9 @@
   **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
   **v1.19.0**（2026-10-26，Wave1 地基）
 - 最新发布：**v1.23.0**（2026-10-30），tag `v1.23.0`；包含 §18（M8-2 jobs/Restore 受理行
-  feature-4 复制、桶配额并发、follower 权限追赶、tier-audit、升级 preflight、单机→集群
-  re-ingest、LC-4 回滚矩阵、Level C v1.20.1 窗口验证）与 §16–§17 的 v1.21.x 内容
+  与 inventory 运行态 feature-4 复制、桶配额并发、follower 权限追赶、tier-audit、升级
+  preflight、单机→集群 re-ingest、LC-4 回滚矩阵、Level C v1.20.1 窗口验证）与 §16–§17
+  的 v1.21.x 内容
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
   v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
   v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）
@@ -529,9 +530,9 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 
 - **硬字节/对象数配额**：无跨节点复制账本与数据面 reservation，正确的 hard 语义不可实现；
   保持非目标 + 文档（`docs/superpowers/specs/2026-10-24-architecture-backlog.md` §1）。
-- **M8-2 运行态实时复制**：jobs/job_tasks 与 Restore 受理行已在 feature 4 交付；完整目标
-  仍需 3–4 人周（inventory/lifecycle 运行态与 lease 接管）。启用 feature 4 要求全集群
-  升级并移除/升级 v1.22 及更早节点；v1.20.1 Level C 窗口不含 feature 4。
+- **M8-2 运行态实时复制**：jobs/job_tasks、Restore 受理行与 inventory 运行态已在
+  feature 4 交付；剩余 lifecycle 运行态与 lease 接管约 2–3 人周。启用 feature 4 要求
+  全集群升级并移除/升级 v1.22 及更早节点；v1.20.1 Level C 窗口不含 feature 4。
 - **真实 PrivateLink 身份**：需 AWS DescribeVpcEndpoints/ENI 关联或 mTLS 证书 plumbing；
   Slice A 只是注册断言。
 - **tier 分块表独立签名、跨进程预留**：保持非目标（预留是协作 tier 写者的 advisory 约束，
@@ -561,6 +562,7 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 | 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 完整目标需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level ≥5（4 已用于 M8-2 jobs 复制） |
 | M8-2 jobs/tier_restores 复制切片 | 2026-10-29 后续波：`JobBatch`/`JobUpsert`/`JobTaskUpsert` + `compat.rs` | **feature level 4**（`MAX_FEATURE_LEVEL=4`）：全 peer ≥4 才复制；v1.22 及更早节点 advertise 3 → leader 生效=3，Job* 在 append 被拒。启用前全集群升级/移除旧节点并显式配置 4；**v1.20.1 Level C 窗口（feature ≤3）不包含 feature 4**；快照仍为 OSSCTL3 `m8.runstate` |
 | M8-2 激活边界（round5） | `compat.rs` 启动守卫/标记、`store.rs` 快照安装、`cutover`/`force_recover` 种子、`apply.rs` restore 预检 | `m8_runstate_activated` 只由 level-4 快照安装、cutover/force-recover 显式种子、已 apply 的 level-4 命令置位；配置 4 节点拒绝安装带运行态行的 level-3 快照；可接受的 level-3 安装会撤销 marker；空表启动不写标记；四表非空或 inventory/tier `job_id` 悬空 → 配置 4 启动 fail-closed（文案含清理/导出重灌指引，清理后放行）；配置 4 且 effective<4 期间 JobState fail-closed，配置 ≤3 仍本地写（清理后到最后一次 feature-4 重启前需停止提交作业）。测试：`raft_runstate_snapshot` 11/11、`raft_jobs_activation` 3/3（含悬空引用回归）、`raft_cutover` 7/7、`raft_jobs_replication` 11/11（含 restore 孤儿） |
+| M8-2 inventory 运行态复制切片 | `InventoryBatch`/`InventoryClear`、`job_state/inventory.rs`、`raft/apply/inventory.rs` | **feature level 4**：`inventory_runs`/`inventory_cursors`/`inventory_incremental` 整行日志复制；run 终态冻结、游标/增量水位单调、整批只读预检 Conflict 零写入、`rows_affected==1`；run 引用与 id 分配在 leader append 前完成；worker/API 状态写入走 `JobState` 门面，follower 读改写 fail-closed（删除转发）；feature≤3 保持本地直写，Inventory* 在 append 前被拒。测试：`raft_inventory_replication` 6/6（3-voter 收敛、leader 死亡后同 run 继续、整批零写入、feature 3 本地、follower 拒绝、24 MiB 上限）；`raft_command_contract` 新增 2 变体 fixture |
 
 **评审残余（不阻塞）**：cutover/force-recover 以 level-3 种子会写 marker；目标若先以 feature 3
 运行并产生本地作业再升 4，启动守卫会放行（要求目标直接以 feature 4 启动，或重灌）；

@@ -150,6 +150,15 @@
     "payload",
     "type_id"
   ],
+  "InventoryBatch": [
+    "cursors",
+    "incrementals",
+    "runs"
+  ],
+  "InventoryClear": [
+    "bucket",
+    "config_id"
+  ],
   "InventoryDelete": [
     "bucket",
     "id"

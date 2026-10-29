@@ -30,12 +30,14 @@
 > re-ingest、桶配额并发修复均落地。硬字节/对象数配额与 M8-2 仍为里程碑（本波不实现）；
 > AP 动态 registry（Slice B）需 feature level ≥5（4 已被 M8-2 jobs 复制占用），暂不排期。
 >
-> **2026-10-30 更新（v1.23.0，M8-2 jobs 切片）**：jobs/job_tasks/tier_restores（Restore 受理行）
-> 运行态复制已落地，作为 **feature level 4**（`FEATURE_LEVEL_4`/`MAX_FEATURE_LEVEL=4`）。
-> v1.22 及更早二进制 advertise ≤3，混版窗口内 leader 生效级别压回 3、Job* 命令在 append
-> 前被拒（`check_feature`）；启用前必须把全集群升级到含 feature 4 的二进制并移除/升级
-> v1.22 及更早节点，再显式配置 `[raft].feature_level=4` 并逐节点重启。v1.20.1 Level C
-> 窗口（feature ≤3）不包含 feature 4；快照格式仍是 OSSCTL3（`m8.runstate` 已携带这些表）。
+> **2026-10-30 更新（v1.23.0，M8-2 jobs + inventory 切片）**：jobs/job_tasks/tier_restores
+> （Restore 受理行）与 inventory 运行态（inventory_runs/inventory_cursors/
+> inventory_incremental）复制已落地，作为 **feature level 4**（`FEATURE_LEVEL_4`/
+> `MAX_FEATURE_LEVEL=4`）。v1.22 及更早二进制 advertise ≤3，混版窗口内 leader 生效级别
+> 压回 3、Job*/Inventory* 命令在 append 前被拒（`check_feature`）；启用前必须把全集群
+> 升级到含 feature 4 的二进制并移除/升级 v1.22 及更早节点，再显式配置
+> `[raft].feature_level=4` 并逐节点重启。v1.20.1 Level C 窗口（feature ≤3）不包含
+> feature 4；快照格式仍是 OSSCTL3（`m8.runstate` 已携带这些表）。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
@@ -50,7 +52,7 @@
 | 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.20.1↔v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不再支持；缺生产 Ext 命令、完整双向混写与数据面滚动 | 6–10 人周 | 生产 Ext 命令、CMK 重包、数据面滚动 | 高 |
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；仍缺跨版本 MPU 完成 | 4–8 人周 | 跨版本 MPU 语义 | 高 |
 | 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额 + 管理员 UI 已交付；仍缺硬字节/对象数配额、canonicalization worker | 5–8 人周 | 跨节点用量聚合 | 中高 |
-| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控、M8-2a runstate 快照扩展、M8-3 一致读（`consistent=1`/applied 头）已交付；jobs/job_tasks/tier_restores 运行态复制已在 feature 4 交付；仍缺 inventory/lifecycle 运行态日志复制/lease takeover/故障切换 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
+| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控、M8-2a runstate 快照扩展、M8-3 一致读（`consistent=1`/applied 头）已交付；jobs/job_tasks/tier_restores 与 inventory 运行态复制已在 feature 4 交付；仍缺 lifecycle 运行态日志复制/lease takeover/故障切换 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
 | 5 | M3 shrink / 单机→集群 | 静态拓扑 + 位置式槽位；rebalance 只支持尾部追加；shrink 与单机转集群明确不支持 | 8–12 人周 | 拓扑 v3（显式 slot map） | 极高 |
 
 ---
@@ -374,8 +376,8 @@ meta-only rewrap」目前**未实现**：`cmk rewrap` 只把旧 CMK 版本加密
 
 §11.3 写「M8 多节点控制面：未实现（单节点）」。准确说法是：**11 张表 + level-3 账户
 两表的控制写已随 M9 Raft 复制**（`raft/data.rs:1-5,231-233`），M8-1 的 leader 门控、
-M8-2a 的运行态快照扩展与 M8-2 jobs/tier_restores 运行态复制（feature 4）已落地；
-inventory/lifecycle 运行态复制与 lease 接管仍未完成：
+M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 与 inventory 运行态复制（feature 4）
+已落地；lifecycle 运行态复制与 lease 接管仍未完成：
 
 - `ControlPlane` 覆盖 11 表命令与 level-3 账户/成员命令（`raft/command.rs:226-275`、
   `raft/apply/accounts.rs:60-250`）；follower 写返回 `Unavailable` + leader 提示，
@@ -383,10 +385,11 @@ inventory/lifecycle 运行态复制与 lease 接管仍未完成：
 - **M8-1 leader 门控已落地**：`LeaderGate`（`raft/mod.rs:184-240`）按 `is_leader()`/
   `still_current()` fencing；jobs 调度（`jobs.rs:185`）、tier sweep（`tier_sweep.rs:488`）、
   inventory（`inventory.rs:215`）、lifecycle（`lifecycle.rs:1100`）只在 leader 执行。
-- 运行态部分复制：feature 4 下 `jobs`/`job_tasks` 行与 Restore 受理的 `tier_restores`
-  pending 行经 Job* 命令进日志（`job_state.rs`）；`inventory_runs`/`inventory_cursors`/
-  `lifecycle_cursors` 及 tier restore 的后续状态仍是节点本地表（`tier_sweep.rs`、
-  `inventory.rs`），leader 本地库丢失仍会丢这些在途状态。
+- 运行态部分复制：feature 4 下 `jobs`/`job_tasks` 行、Restore 受理的 `tier_restores`
+  pending 行与 `inventory_runs`/`inventory_cursors`/`inventory_incremental` 分别经
+  Job*/Inventory* 命令进日志（`job_state.rs`）；`lifecycle_cursors` 及 tier restore 的
+  后续状态仍是节点本地表（`tier_sweep.rs`、`lifecycle.rs`），leader 本地库丢失仍会丢
+  这些在途状态。
 - M8-2a 交付的是**快照扩展**而非日志复制：九张运行态表编码为 OSSCTL3 命名扩展
   `m8.runstate`（`raft/runstate/mod.rs:1-10`、`migrations/0007_m8_runstate.sql`），
   随快照安装/导出携带；`schedule_lease` 只有表与镜像，**无 acquire/renew/takeover**
@@ -396,14 +399,14 @@ inventory/lifecycle 运行态复制与 lease 接管仍未完成：
   但限流与吊销强度下降。
 - **M8-3 已交付**：`?consistent=1` 有界追赶 + `x-oss-applied-index` 响应头
   （`console.rs::console_read_consistency`、`tests/m8_read_consistency.rs`）。
-- **仍缺**：inventory/lifecycle 运行态日志复制、跨节点 lease/takeover、故障切换演练
-  （`tests/e2e_m8.sh` 为单节点）。M8-2 的 jobs/tier_restores 切片已在 feature 4 交付；
-  完整运行态复制仍约 3–4 人周。启用 feature 4 前必须全集群升级并移除/升级 v1.22 及
-  更早节点（v1.20.1 Level C 窗口不含 feature 4）。
+- **仍缺**：lifecycle 运行态日志复制、跨节点 lease/takeover、故障切换演练
+  （`tests/e2e_m8.sh` 为单节点）。M8-2 的 jobs/tier_restores 与 inventory 切片已在
+  feature 4 交付；剩余 lifecycle/lease 约 2–3 人周。启用 feature 4 前必须全集群升级并
+  移除/升级 v1.22 及更早节点（v1.20.1 Level C 窗口不含 feature 4）。
 
 ### 4.2 真正阻塞点
 
-1. 作业/清单运行/游标/tier 恢复没有复制，leader 切换会丢在途状态或重复执行。
+1. lifecycle 游标与 tier 恢复的后续状态没有复制，leader 切换会丢在途状态或重复执行。
 2. 调度器无 leader/fencing，多节点会重复跑。
 3. follower 读是本地已应用状态，不是线性一致；控制台写后读可能看不到自己的写。
 4. 审计本地、限流本地、会话吊销粒度不足。
@@ -423,10 +426,13 @@ inventory/lifecycle 运行态复制与 lease 接管仍未完成：
   用新命令变体写；apply 落库，执行仍由 leader 完成。任务负载可能超过 24 MiB 上限，故命令
   只存元数据/结果引用，不存大 payload；输出仍写对象存储。快照安装后重建本地表。
   **已交付切片（feature 4）**：jobs/job_tasks 完整行与 Restore 受理的 tier_restores
-  pending 行经 `JobBatch`/`JobUpsert`/`JobTaskUpsert` 复制，leader 生效级别 <4 时
-  fail-closed；快照仍为 OSSCTL3 `m8.runstate`。剩余：inventory/lifecycle 运行态与
-  lease takeover。启用前置：全集群 feature-4 二进制、移除/升级 v1.22 及更早节点、
-  `[raft].feature_level=4` 显式配置并重启。
+  pending 行经 `JobBatch`/`JobUpsert`/`JobTaskUpsert` 复制；inventory_runs/
+  inventory_cursors/inventory_incremental 经 `InventoryBatch`/`InventoryClear` 复制，
+  worker/API 状态写入统一走 `JobState` 门面（follower 读改写 fail-closed，删除可转发）。
+  leader 生效级别 <4 时全部 fail-closed；run 终态冻结、游标/增量水位单调、整批预检
+  Conflict 零写入，run id 由 leader 在 apply 追平后分配；快照仍为 OSSCTL3 `m8.runstate`。
+  剩余：lifecycle_cursors 运行态与 schedule lease takeover。启用前置：全集群 feature-4
+  二进制、移除/升级 v1.22 及更早节点、`[raft].feature_level=4` 显式配置并重启。
   **激活标记语义（round5）**：`m8_runstate_activated` 只由 level-4 事实置位——安装
   level-4 快照、cutover/force-recover 显式种子、已 apply 的 level-4 命令；level-3 快照
   （即使带 jobs/tier 行）不是日志事实，安装会撤销标记，且配置 4 的节点拒绝带运行态行

@@ -12,7 +12,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::COMMAND_MAX_BYTES;
-use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
+use super::runstate::{
+    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
+    TierRestoreRow,
+};
 
 /// 子账户 × 桶的三档权限（自然键：username + bucket）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +307,18 @@ pub enum ControlCommand {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         restores: Vec<TierRestoreRow>,
     },
+    /// M8-2 下一片：inventory 运行态（runs/cursors/incrementals）同批 upsert。
+    /// 行按主键/自然键整行携带；apply 只做 SQL，leader 在 append 前做身份与引用校验。
+    InventoryBatch {
+        runs: Vec<InventoryRunRow>,
+        cursors: Vec<InventoryCursorRow>,
+        incrementals: Vec<InventoryIncrementalRow>,
+    },
+    /// 关闭增量模式：原子删除该配置的游标与增量开关（幂等，重复 apply 为 no-op）。
+    InventoryClear {
+        bucket: String,
+        config_id: String,
+    },
 
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。
     #[cfg(test)]
@@ -402,9 +417,11 @@ impl ControlCommand {
             | Self::AccountUserCreate { .. } => super::compat::FEATURE_LEVEL_3,
             // M8-2：jobs/job_tasks/tier_restores 行复制。v1.22 及更早二进制的解码器
             // （`deny_unknown_fields`）不认识这些变体，必须用新 level 4 而非 3 门控。
-            Self::JobUpsert { .. } | Self::JobTaskUpsert { .. } | Self::JobBatch { .. } => {
-                super::compat::FEATURE_LEVEL_4
-            }
+            Self::JobUpsert { .. }
+            | Self::JobTaskUpsert { .. }
+            | Self::JobBatch { .. }
+            | Self::InventoryBatch { .. }
+            | Self::InventoryClear { .. } => super::compat::FEATURE_LEVEL_4,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,

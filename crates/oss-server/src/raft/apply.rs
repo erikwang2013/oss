@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use sqlx::{Row, SqliteConnection};
 
 mod accounts;
+pub(crate) mod inventory;
 
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
 use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
@@ -775,6 +776,15 @@ pub(crate) async fn apply_command(
             tasks,
             restores,
         } => apply_job_batch(cw, jobs, tasks, restores).await?,
+        // M8-2：inventory 运行态行复制（同批预检，零写入 Conflict）。
+        ControlCommand::InventoryBatch {
+            runs,
+            cursors,
+            incrementals,
+        } => inventory::apply(cw, runs, cursors, incrementals).await?,
+        ControlCommand::InventoryClear { bucket, config_id } => {
+            inventory::clear(cw, bucket, config_id).await?
+        }
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")

@@ -9,13 +9,14 @@
 //! 读本行 → 合并计数 → 提交下一行之间不能被同进程其他 worker 插入。身份/引用/版本
 //! 校验在 append 前完成；apply 只按日志事实做确定性的整批 upsert。
 //!
-//! 已知限制：job id 仍由 leader 本地分配（`runstate_meta`/`MAX(id)+1`），新 leader
+//! 已知限制：job/run id 仍由 leader 本地分配（`runstate_meta`/`MAX(id)+1`），新 leader
 //! 先等 apply 追平再分配。Restore 受理的 `tier_restores` 行与作业同批进日志（P2-1），
 //! 之后的 restored/删除是 leader 执行侧的本地运行态调整，随 OSSCTL3 快照安装收敛；
-//! 启动守卫要求旧本地运行态为空后才允许激活 feature 4。inventory/lifecycle
-//! 状态表不在本切片。
+//! 启动守卫要求旧本地运行态为空后才允许激活 feature 4。inventory 运行态（runs/
+//! cursors/incrementals）见 [`inventory`] 子模块；lifecycle/lease 不在本切片。
 
 mod admin;
+mod inventory;
 mod worker;
 
 use std::collections::HashSet;

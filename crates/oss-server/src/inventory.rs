@@ -2,8 +2,9 @@
 //!
 //! 调度只补当前槽（停机期间的旧槽不补）；同一 `(bucket,config_id,run_key)` 由唯一索引去重。
 //! 扫描按前缀翻页（页大小 1000），输出先写 staging 临时文件（边写边算 MD5/大小）再流式 PUT。
-//! M8-1：Raft 模式下调度只在 leader 跑（[`crate::raft::LeaderGate`]）；`inventory_runs`/
-//! 游标仍是节点本地表，门控只防重复入队，不复制运行态（backlog §4.3 M8-2）。
+//! M8-1：Raft 模式下调度只在 leader 跑（[`crate::raft::LeaderGate`]）。M8-2：运行态
+//! （runs/游标/增量开关）经 [`crate::job_state::JobState`] 在 feature 4 下复制，
+//! feature<4 保持节点本地。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -159,10 +160,9 @@ pub async fn enqueue_run_fenced_with(
     now: i64,
     fence: FencingEpoch,
 ) -> Result<Option<i64>, String> {
-    let Some(run_id) = db
-        .inventory_create_run(bucket, config_id, run_key, now, fence)
-        .await
-        .map_err(|e| e.to_string())?
+    let Some(run_id) = jobs
+        .inventory_create_run(db, bucket, config_id, run_key, now, fence)
+        .await?
     else {
         return Ok(None);
     };
@@ -186,14 +186,13 @@ pub async fn enqueue_run_fenced_with(
     };
     match jobs.create_job(db, &spec, now).await {
         Ok(job_id) => {
-            db.inventory_run_set_job(run_id, job_id, fence)
-                .await
-                .map_err(|e| e.to_string())?;
+            jobs.inventory_run_set_job(db, run_id, job_id, fence)
+                .await?;
             Ok(Some(job_id))
         }
         Err(e) => {
-            let _ = db
-                .inventory_run_finish(run_id, "error", None, Some(&e.to_string()), fence)
+            let _ = jobs
+                .inventory_run_finish(db, run_id, "error", None, Some(&e.to_string()), fence)
                 .await;
             Err(e.to_string())
         }
@@ -368,8 +367,8 @@ impl InventoryRunner {
         // 引擎在任务收尾时 progress+1；存 -1 让终值为 0。
         self.set_progress(job_id, -1, now).await;
         let _ = self
-            .db
-            .inventory_run_finish(run_id, "error", None, Some(&msg), fence)
+            .jobs
+            .inventory_run_finish(&self.db, run_id, "error", None, Some(&msg), fence)
             .await;
         msg
     }
@@ -397,10 +396,9 @@ impl InventoryRunner {
             return Err(self.fail(run.id, run.job_id, msg, fence).await);
         };
         let now = crate::db::now();
-        self.db
-            .inventory_run_started(run.id, now, fence)
-            .await
-            .map_err(|e| e.to_string())?;
+        self.jobs
+            .inventory_run_started(&self.db, run.id, now, fence)
+            .await?;
         self.set_progress(run.job_id, 0, now).await;
         let (cfg, recorded_source_account): (InventoryConfiguration, Option<String>) =
             match config_from_json(&cfg_row.config_json) {
@@ -413,8 +411,8 @@ impl InventoryRunner {
         if !cfg.is_enabled {
             self.set_progress(run.job_id, -1, now).await;
             let _ = self
-                .db
-                .inventory_run_finish(run.id, "skipped", None, None, fence)
+                .jobs
+                .inventory_run_finish(&self.db, run.id, "skipped", None, None, fence)
                 .await;
             return Ok("skipped".to_string());
         }
@@ -604,14 +602,21 @@ impl InventoryRunner {
             Ok(()) => {
                 // H1：先把 run 落 done，再推进水位。done 失败时水位不动，任务重试会重放
                 // 同一区间（重复条目安全）；反向顺序在崩溃时会永久漏掉本轮对象。
-                self.db
-                    .inventory_run_finish(run.id, "done", Some(&manifest_key), None, fence)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                self.jobs
+                    .inventory_run_finish(
+                        &self.db,
+                        run.id,
+                        "done",
+                        Some(&manifest_key),
+                        None,
+                        fence,
+                    )
+                    .await?;
                 if let Some(inc) = inc
                     && let Err(e) = self
-                        .db
+                        .jobs
                         .inventory_cursor_set(
+                            &self.db,
                             &p.bucket,
                             &p.config_id,
                             cfg_row.updated_at,
@@ -629,8 +634,8 @@ impl InventoryRunner {
             }
             Err(e) => {
                 let _ = self
-                    .db
-                    .inventory_run_finish(run.id, "error", None, Some(&e), fence)
+                    .jobs
+                    .inventory_run_finish(&self.db, run.id, "error", None, Some(&e), fence)
                     .await;
                 Err(e)
             }

@@ -12,7 +12,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use oss_server::raft::runstate::{JobRow, JobTaskRow, TierRestoreRow};
+use oss_server::raft::runstate::{
+    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
+    TierRestoreRow,
+};
 use oss_server::raft::{ControlCommand, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits};
 
 fn fixture_path() -> PathBuf {
@@ -290,6 +293,36 @@ fn all_variants() -> Vec<ControlCommand> {
                 ..TierRestoreRow::default()
             }],
         },
+        // M8-2：inventory 运行态行（level 4）。
+        ControlCommand::InventoryBatch {
+            runs: vec![InventoryRunRow {
+                id: 1,
+                bucket: "b1".into(),
+                config_id: "inv1".into(),
+                run_key: "2026-10-30".into(),
+                state: "running".into(),
+                job_id: Some(3),
+                ..InventoryRunRow::default()
+            }],
+            cursors: vec![InventoryCursorRow {
+                bucket: "b1".into(),
+                config_id: "inv1".into(),
+                cursor: "1760000000000000000".into(),
+                config_updated_at: 1,
+                updated_at: 2,
+                ..InventoryCursorRow::default()
+            }],
+            incrementals: vec![InventoryIncrementalRow {
+                bucket: "b1".into(),
+                config_id: "inv1".into(),
+                enabled: true,
+                updated_at: 2,
+            }],
+        },
+        ControlCommand::InventoryClear {
+            bucket: "b1".into(),
+            config_id: "inv1".into(),
+        },
     ]
 }
 
@@ -374,7 +407,7 @@ fn feature_level_three_is_open_for_ext_accounts_and_four_for_jobs() {
         "配置低于已激活 marker 必须拒绝"
     );
 
-    let (mut ext, mut accounts, mut jobs) = (0, 0, 0);
+    let (mut ext, mut accounts, mut jobs, mut inventory) = (0, 0, 0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
         match cmd {
@@ -399,6 +432,13 @@ fn feature_level_three_is_open_for_ext_accounts_and_four_for_jobs() {
                 jobs += 1;
                 assert_eq!(level, FEATURE_LEVEL_4, "M8-2 作业行命令必须是 level 4");
             }
+            ControlCommand::InventoryBatch { .. } | ControlCommand::InventoryClear { .. } => {
+                inventory += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_4,
+                    "M8-2 inventory 行命令必须是 level 4"
+                );
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
                 "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
@@ -408,6 +448,7 @@ fn feature_level_three_is_open_for_ext_accounts_and_four_for_jobs() {
     assert_eq!(ext, 1, "生产命令集恰好一个 Ext 样本");
     assert_eq!(accounts, 8, "生产命令集恰好八个账户命令样本");
     assert_eq!(jobs, 3, "生产命令集恰好三个 M8-2 作业行样本");
+    assert_eq!(inventory, 2, "生产命令集恰好两个 M8-2 inventory 行样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，
