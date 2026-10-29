@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use oss_server::raft::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 use oss_server::raft::{ControlCommand, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits};
 
 fn fixture_path() -> PathBuf {
@@ -247,6 +248,48 @@ fn all_variants() -> Vec<ControlCommand> {
             type_id: "future.demo".into(),
             payload: serde_json::json!({"k": "v"}),
         },
+        // M8-2：作业运行态完整行（level 4，apply 按主键 upsert）。
+        ControlCommand::JobUpsert {
+            job: JobRow {
+                id: 1,
+                kind: "batch".into(),
+                bucket: "b1".into(),
+                prefix: "p/".into(),
+                state: "queued".into(),
+                ..JobRow::default()
+            },
+        },
+        ControlCommand::JobTaskUpsert {
+            task: JobTaskRow {
+                job_id: 1,
+                task_no: 1,
+                action: "DeleteObject".into(),
+                payload_json: "{}".into(),
+                state: "queued".into(),
+                ..JobTaskRow::default()
+            },
+        },
+        ControlCommand::JobBatch {
+            jobs: vec![JobRow {
+                id: 2,
+                kind: "transition".into(),
+                ..JobRow::default()
+            }],
+            tasks: vec![JobTaskRow {
+                job_id: 2,
+                task_no: 1,
+                ..JobTaskRow::default()
+            }],
+            // P2-1：Restore 受理行与作业同批复制。
+            restores: vec![TierRestoreRow {
+                bucket: "b1".into(),
+                key: "p/obj".into(),
+                version_id: "v1".into(),
+                job_id: Some(2),
+                state: "pending".into(),
+                ..TierRestoreRow::default()
+            }],
+        },
     ]
 }
 
@@ -300,12 +343,13 @@ fn control_command_field_set_matches_frozen_fixture() {
 }
 
 /// Level C M1：level-3 词汇表固定；生产命令集中只有 `Ext` 与账户/成员命令要求
-/// level 3，其余命令仍为 1/2（旧二进制必须能解析并应用）。
+/// level 3，M8-2 作业行命令要求 level 4，其余命令仍为 1/2（旧二进制必须能解析并应用）。
 #[test]
-fn feature_level_three_is_open_only_for_ext_and_accounts() {
+fn feature_level_three_is_open_for_ext_accounts_and_four_for_jobs() {
     use oss_server::raft::compat::{
-        FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE,
-        MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup, supports,
+        FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_LEVEL_4, FEATURE_OSSCTL2,
+        FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup,
+        supports,
     };
     assert_eq!(MIN_FEATURE_LEVEL, 1);
     assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
@@ -313,21 +357,24 @@ fn feature_level_three_is_open_only_for_ext_and_accounts() {
     assert_eq!(FEATURE_COMMAND_EXT, FEATURE_LEVEL_3);
     assert_eq!(
         FEATURE_OSSCTL2, FEATURE_LEVEL_3,
-        "m8 别名与 level 3 同一个激活门"
+        "m8 别名仍是 level 3；作业复制另立 level 4"
     );
-    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_3);
-    assert!(supports(1) && supports(2) && supports(3));
-    assert!(!supports(4), "未知更高 level 一律不支持");
+    assert_eq!(FEATURE_LEVEL_4, 4);
+    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_4);
+    assert!(supports(1) && supports(2) && supports(3) && supports(4));
+    assert!(!supports(5), "未知更高 level 一律不支持");
 
-    // marker 4 超出本二进制上限：拒绝启动；已激活 3 不能配 2 启动。
+    // marker 4 + MAX 4：显式配置 4 才放行；v1.22（MAX 3）必须拒绝 marker 4。
     assert!(guard_startup(3, 3).is_ok());
-    assert!(guard_startup(4, 3).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(4, 4).is_ok());
+    assert!(guard_startup(5, 4).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(4, 3).is_err(), "配置低于 marker 必须拒绝");
     assert!(
         guard_startup(3, 2).is_err(),
         "配置低于已激活 marker 必须拒绝"
     );
 
-    let (mut ext, mut accounts) = (0, 0);
+    let (mut ext, mut accounts, mut jobs) = (0, 0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
         match cmd {
@@ -346,14 +393,21 @@ fn feature_level_three_is_open_only_for_ext_and_accounts() {
                 accounts += 1;
                 assert_eq!(level, FEATURE_LEVEL_3);
             }
+            ControlCommand::JobUpsert { .. }
+            | ControlCommand::JobTaskUpsert { .. }
+            | ControlCommand::JobBatch { .. } => {
+                jobs += 1;
+                assert_eq!(level, FEATURE_LEVEL_4, "M8-2 作业行命令必须是 level 4");
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
-                "{cmd:?} 要求 level {level}，但只有 Ext/账户命令可以是 level 3"
+                "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
             ),
         }
     }
     assert_eq!(ext, 1, "生产命令集恰好一个 Ext 样本");
     assert_eq!(accounts, 8, "生产命令集恰好八个账户命令样本");
+    assert_eq!(jobs, 3, "生产命令集恰好三个 M8-2 作业行样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

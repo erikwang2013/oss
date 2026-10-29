@@ -529,7 +529,9 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 
 - **硬字节/对象数配额**：无跨节点复制账本与数据面 reservation，正确的 hard 语义不可实现；
   保持非目标 + 文档（`docs/superpowers/specs/2026-10-24-architecture-backlog.md` §1）。
-- **M8-2 运行态实时复制**：3–4 人周；需把 job/inventory/tier 运行态纳入命令/快照与接管。
+- **M8-2 运行态实时复制**：jobs/job_tasks 与 Restore 受理行已在 feature 4 交付；完整目标
+  仍需 3–4 人周（inventory/lifecycle 运行态与 lease 接管）。启用 feature 4 要求全集群
+  升级并移除/升级 v1.22 及更早节点；v1.20.1 Level C 窗口不含 feature 4。
 - **真实 PrivateLink 身份**：需 AWS DescribeVpcEndpoints/ENI 关联或 mTLS 证书 plumbing；
   Slice A 只是注册断言。
 - **tier 分块表独立签名、跨进程预留**：保持非目标（预留是协作 tier 写者的 advisory 约束，
@@ -556,7 +558,9 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 | 升级前置检查 | `scripts/upgrade-preflight.sh` | 裸 UUID MPU / M6 无 site_token（`[[remotes]]`）/ M7 未映射 REPLICA；67/67 自检 |
 | 单机→集群重新灌入 | `scripts/single-to-cluster.sh` | rclone 单向、版本化/开锁桶 fail-closed；16/16 自检 + 两个真实端点复制/重跑/--delete |
 | 桶配额并发 | leader append 前判定 + standalone `BEGIN IMMEDIATE` | 不新增 `ControlResponse` 变体，混版不分叉；quota=2 并发恰 2 成功 1×403 |
-| 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level 4 |
+| 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 完整目标需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level ≥5（4 已用于 M8-2 jobs 复制） |
+| M8-2 jobs/tier_restores 复制切片 | 2026-10-29 后续波：`JobBatch`/`JobUpsert`/`JobTaskUpsert` + `compat.rs` | **feature level 4**（`MAX_FEATURE_LEVEL=4`）：全 peer ≥4 才复制；v1.22 及更早节点 advertise 3 → leader 生效=3，Job* 在 append 被拒。启用前全集群升级/移除旧节点并显式配置 4；**v1.20.1 Level C 窗口（feature ≤3）不包含 feature 4**；快照仍为 OSSCTL3 `m8.runstate` |
+| M8-2 激活边界（round5） | `compat.rs` 启动守卫/标记、`store.rs` 快照安装、`cutover`/`force_recover` 种子、`apply.rs` restore 预检 | `m8_runstate_activated` 只由 level-4 快照安装、cutover/force-recover 显式种子、已 apply 的 level-4 命令置位；level-3 快照（带运行态行）在配置 4 节点安装被拒且撤销标记；空表启动不写标记；四表非空或 inventory/tier `job_id` 悬空 → 配置 4 启动 fail-closed（文案含清理/导出重灌指引，清理后放行）；effective<4 期间 JobState fail-closed。测试：`raft_runstate_snapshot` 11/11、`raft_jobs_activation` 3/3（含悬空引用回归）、`raft_cutover` 7/7、`raft_jobs_replication` 11/11（含 restore 孤儿） |
 
 **验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server` 全量
 **66 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。

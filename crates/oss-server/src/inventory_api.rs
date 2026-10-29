@@ -275,7 +275,17 @@ async fn run_now(
     }
     let now = crate::db::now();
     let run_key = format!("manual-{now}");
-    match crate::inventory::enqueue_run(&state.db, &bucket, &id, &run_key, Some(uid), now).await {
+    match crate::inventory::enqueue_run_with(
+        &state.jobs,
+        &state.db,
+        &bucket,
+        &id,
+        &run_key,
+        Some(uid),
+        now,
+    )
+    .await
+    {
         Ok(Some(job_id)) => {
             state
                 .audit(

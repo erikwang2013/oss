@@ -15,6 +15,7 @@ pub mod inventory_api;
 pub mod inventory_store;
 pub mod job_actions;
 pub mod job_actions_api;
+pub mod job_state;
 pub mod jobs;
 pub mod lifecycle;
 pub mod lifecycle_store;

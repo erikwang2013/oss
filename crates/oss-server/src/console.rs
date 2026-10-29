@@ -998,7 +998,7 @@ async fn job_action(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if action == "retry-failed" {
-        return match state.db.job_retry_failed(id, now).await {
+        return match state.jobs.job_retry_failed(&state.db, id, now).await {
             Ok(Some(new_id)) => {
                 state
                     .audit(
@@ -1021,7 +1021,7 @@ async fn job_action(
     if !matches!(action.as_str(), "pause" | "resume" | "cancel") {
         return (StatusCode::BAD_REQUEST, "未知作业操作").into_response();
     }
-    match state.db.job_set_state(id, &action, now).await {
+    match state.jobs.job_set_state(&state.db, id, &action, now).await {
         Ok(true) => {
             state
                 .audit(
@@ -1034,7 +1034,7 @@ async fn job_action(
                 .await;
             // 取消后立即落一次报告（未执行任务被 started_at 过滤；后续运行中任务收尾会重写）。
             if action == "cancel" {
-                crate::jobs::write_report_now(&state.db, &state.store, id).await;
+                crate::jobs::write_report_now(&state.jobs, &state.db, &state.store, id).await;
             }
             StatusCode::NO_CONTENT.into_response()
         }

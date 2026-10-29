@@ -65,6 +65,8 @@ pub struct AppState {
     pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
     /// M9 S6：控制写门面（Local = M7/standalone；Raft = `[raft]`）。S6b-d 的路由唯一入口。
     pub control: Arc<crate::raft::control::ControlPlane>,
+    /// M8-2：作业运行态写入门面（Raft 且 feature≥4 时行经复制日志；否则本地直写）。
+    pub jobs: Arc<crate::job_state::JobState>,
     /// M9 S7.1：Raft 句柄（路由/状态共用；无 `[raft]` = None）。
     pub raft: Option<Arc<crate::raft::RaftHandle>>,
     /// M9 S7.4：本地管理员用户名（配对预检/身份 JSON；无管理员 = None）。
@@ -309,6 +311,14 @@ impl AppState {
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
         // S6d：模式与库内触发器/站点状态一致才放行。
         db.assert_mode_guards().await?;
+        // M8-2 P1-A：本地运行态（含 level-3 快照拷贝）不是日志事实；feature-4 启动前
+        // 必须四表为空/无悬空引用，或已有 level-4 命令/快照/cutover 留下的激活标记。
+        // 守卫在 Raft 启动前，拒绝时不会进入 apply。
+        if let Some(settings) = &raft_settings {
+            crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
+                .await
+                .map_err(|e| format!("[raft] 运行态激活守卫：{e}"))?;
+        }
         // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
         // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；
         // 请求级账户绑定在两种模式下都 fail-closed。
@@ -918,6 +928,7 @@ impl AppState {
                 ap_region.clone(),
             ),
         });
+        let jobs = Arc::new(crate::job_state::JobState::new(Some(Arc::clone(&control))));
         // M6 切片 4：复制（规则存储 + 写入钩子 + 出站客户端；worker 在 serve 路径挂载）
         let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
         let repl_store = Arc::new(
@@ -963,6 +974,7 @@ impl AppState {
         let restore_sink: Arc<dyn xl_s3::restore::RestoreSink> =
             Arc::new(crate::tier_jobs::SqlRestoreSink::new(
                 Arc::clone(&db),
+                Arc::clone(&jobs),
                 crate::raft::LeaderGate::from_raft(raft.clone()),
             ));
         let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
@@ -975,6 +987,7 @@ impl AppState {
         );
         let inventory_runner = Arc::new(crate::inventory::InventoryRunner::new(
             Arc::clone(&db),
+            Arc::clone(&jobs),
             Arc::clone(&store),
             inv_acl,
             cfg.staging_dir.clone(),
@@ -1028,6 +1041,7 @@ impl AppState {
             inventory,
             inventory_runner,
             control,
+            jobs,
             raft,
             admin_username,
             vault_probe,

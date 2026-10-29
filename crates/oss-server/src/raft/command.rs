@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::COMMAND_MAX_BYTES;
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 
 /// 子账户 × 桶的三档权限（自然键：username + bucket）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +286,25 @@ pub enum ControlCommand {
         payload: serde_json::Value,
     },
 
+    // ---- level 4: M8-2 job run-state replication ----
+    /// 作业行按主键 upsert（创建与每次状态转换都提交完整行）。apply 侧只做
+    /// SQL：`updated_at`/计数单调 + 终态不可回退；`kind`/`created_at` 不可变。
+    JobUpsert {
+        job: JobRow,
+    },
+    /// 任务行按 `(job_id, task_no)` upsert；`fence_term` 单调、终态不可复活。
+    JobTaskUpsert {
+        task: JobTaskRow,
+    },
+    /// 一次原子提交多行（建作业 + 任务、领取、收尾）。整批仍受 24 MiB 上限。
+    /// `restores` 与 Restore 建作业同批落日志（P2-1）；空时字段不序列化，旧形态不变。
+    JobBatch {
+        jobs: Vec<JobRow>,
+        tasks: Vec<JobTaskRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restores: Vec<TierRestoreRow>,
+    },
+
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。
     #[cfg(test)]
     Set {
@@ -380,6 +400,11 @@ impl ControlCommand {
             | Self::AccountMemberAttach { .. }
             | Self::AccountMemberSetStatus { .. }
             | Self::AccountUserCreate { .. } => super::compat::FEATURE_LEVEL_3,
+            // M8-2：jobs/job_tasks/tier_restores 行复制。v1.22 及更早二进制的解码器
+            // （`deny_unknown_fields`）不认识这些变体，必须用新 level 4 而非 3 门控。
+            Self::JobUpsert { .. } | Self::JobTaskUpsert { .. } | Self::JobBatch { .. } => {
+                super::compat::FEATURE_LEVEL_4
+            }
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,

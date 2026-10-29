@@ -161,6 +161,17 @@
     "owner",
     "updated_at"
   ],
+  "JobBatch": [
+    "jobs",
+    "restores",
+    "tasks"
+  ],
+  "JobTaskUpsert": [
+    "task"
+  ],
+  "JobUpsert": [
+    "job"
+  ],
   "OlapDelete": [
     "access_point"
   ],

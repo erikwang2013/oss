@@ -152,6 +152,10 @@ pub async fn force_recover(
         runstate::install_runstate_tx(&mut tx, &runstate)
             .await
             .map_err(|e| e.to_string())?;
+        // 显式恢复种子视为 canonical 来源，写运行态激活标记。
+        compat::mark_runstate_activated_tx(&mut tx)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if activation > compat::MIN_FEATURE_LEVEL {
         compat::bump_activation_tx(&mut tx, activation)

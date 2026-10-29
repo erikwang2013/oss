@@ -116,7 +116,8 @@ impl std::fmt::Display for WriteError {
                 effective,
             } => write!(
                 f,
-                "raft feature level {required} not active (effective {effective})"
+                "raft feature level {required} not active (effective {effective}): 需要 feature \
+                 {required}（全集群升级并显式配置 [raft].feature_level={required}）"
             ),
             Self::UnregisteredExtType { type_id } => write!(
                 f,
@@ -180,10 +181,9 @@ impl LeadershipSource for RaftHandle {
 /// （fail closed）。放行 token（[`FencingEpoch`] = term + leader）必须随状态转换落库，
 /// 旧 token 的写入按 term 单调被拒（no-op），交接中在途动作的收尾不能覆盖新 leader 的状态。
 ///
-/// 不引入新的共识或租约，也不复制运行态——`job_tasks`/`inventory_*`/`tier_restores` 等
-/// 仍是各节点本地表（跨节点持久化见 backlog §4.3 M8-2 / OSSCTL2；本切片**不做**跨节点
-/// 复制，因此 leader 本地库丢失仍会丢在途状态）；本门控只防多节点重复执行，接管依赖
-/// 各节点已有的 stale/expired 领取回收（at-least-once）。
+/// 不引入新的共识或租约。M8-2 起 feature-4 的 jobs/job_tasks/tier_restores 受理行经
+/// Raft 日志复制（其余运行态表仍为节点本地，跨节点持久化见 backlog §4.3）；本门控
+/// 只防多节点重复执行，接管依赖各节点已有的 stale/expired 领取回收（at-least-once）。
 #[derive(Clone)]
 pub struct LeaderGate {
     source: Arc<dyn LeadershipSource>,
@@ -317,6 +317,29 @@ impl RaftHandle {
     /// 本节点已提交的激活级别（缺省 1；基座 KV 无标记）。
     pub fn activation_level(&self) -> u8 {
         self.state_machine.activation_level()
+    }
+
+    /// leader 上当前 term 的生效级别；follower 没有当前 term 的 peer 握手 →
+    /// None（调用方不得把 None 当成 level 3）。与 [`Self::check_feature`] 同一算式。
+    pub fn effective_feature(&self) -> Option<u8> {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        if m.current_leader != Some(m.id) {
+            return None;
+        }
+        let voters: Vec<u64> = m.membership_config.voter_ids().collect();
+        let learners: Vec<u64> = m.membership_config.membership().learner_ids().collect();
+        Some(
+            compat::effective_feature_level(
+                self.settings.feature_level,
+                m.id,
+                &voters,
+                &learners,
+                m.current_term,
+                &self.peers,
+            )
+            .level,
+        )
     }
 
     /// Level B 门控：生效级别 = min(本机配置, 当前 term 的 voter+learner feature)。

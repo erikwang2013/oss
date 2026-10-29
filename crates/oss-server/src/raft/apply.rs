@@ -6,11 +6,14 @@
 //! 构造函数只在本模块（以及 `Local` façade 调用本模块时）出现。
 
 use base64::Engine as _;
-use sqlx::SqliteConnection;
+use std::collections::HashSet;
+
+use sqlx::{Row, SqliteConnection};
 
 mod accounts;
 
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
@@ -760,6 +763,18 @@ pub(crate) async fn apply_command(
             "test.noop" => ControlResponse::Ok,
             _ => ControlResponse::Invalid,
         },
+        // M8-2：jobs/job_tasks 行复制（确定性 upsert，无时钟/随机）。
+        ControlCommand::JobUpsert { job } => {
+            apply_job_batch(cw, std::slice::from_ref(job), &[], &[]).await?
+        }
+        ControlCommand::JobTaskUpsert { task } => {
+            apply_job_batch(cw, &[], std::slice::from_ref(task), &[]).await?
+        }
+        ControlCommand::JobBatch {
+            jobs,
+            tasks,
+            restores,
+        } => apply_job_batch(cw, jobs, tasks, restores).await?,
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
@@ -790,6 +805,427 @@ pub(crate) async fn apply_command(
     Ok(Applied { response, effects })
 }
 
+fn task_terminal(state: &str) -> bool {
+    matches!(state, "done" | "failed" | "cancelled")
+}
+
+/// 作业状态机：终态冻结，其余按 worker 白名单（见 `job_state::admin`）。
+fn job_state_ok(from: &str, to: &str) -> bool {
+    from == to
+        || matches!(
+            (from, to),
+            ("queued", "running")
+                | ("queued", "cancelled")
+                | ("running", "paused")
+                | ("running", "preempted")
+                | ("running", "done")
+                | ("running", "error")
+                | ("running", "cancelled")
+                | ("paused", "running")
+                | ("paused", "done")
+                | ("paused", "error")
+                | ("paused", "cancelled")
+                | ("preempted", "queued")
+                | ("preempted", "paused")
+                | ("preempted", "done")
+                | ("preempted", "error")
+                | ("preempted", "cancelled")
+        )
+}
+
+fn task_state_ok(from: &str, to: &str) -> bool {
+    from == to
+        || matches!(
+            (from, to),
+            ("queued", "running")
+                | ("queued", "cancelled")
+                | ("running", "queued")
+                | ("running", "done")
+                | ("running", "failed")
+                | ("running", "cancelled")
+        )
+}
+
+/// 纯函数校验：当前折叠行 + 日志行。日志全序下每个副本在同一 index 看到相同输入，
+/// 判定因此确定；leader 在 append 前做同一套身份/版本校验（P1-2）。
+fn job_row_ok(cur: Option<&JobRow>, next: &JobRow) -> Result<(), String> {
+    let Some(cur) = cur else {
+        return if matches!(next.state.as_str(), "queued" | "running") {
+            Ok(())
+        } else {
+            Err(format!("job {}: new row in state {}", next.id, next.state))
+        };
+    };
+    if cur.kind != next.kind
+        || cur.created_at != next.created_at
+        || cur.bucket != next.bucket
+        || cur.prefix != next.prefix
+        || cur.spec_json != next.spec_json
+    {
+        return Err(format!("job {}: identity changed", next.id));
+    }
+    if next.updated_at <= cur.updated_at {
+        return Err(format!("job {}: stale version", next.id));
+    }
+    if !job_state_ok(&cur.state, &next.state) {
+        return Err(format!(
+            "job {}: illegal state {} -> {}",
+            next.id, cur.state, next.state
+        ));
+    }
+    for (name, old, new) in [
+        ("scanned", cur.scanned, next.scanned),
+        ("deleted", cur.deleted, next.deleted),
+        ("skipped", cur.skipped, next.skipped),
+        ("total", cur.total, next.total),
+        ("succeeded", cur.succeeded, next.succeeded),
+        ("failed", cur.failed, next.failed),
+    ] {
+        if new < old {
+            return Err(format!("job {}: {name} regressed {old} -> {new}", next.id));
+        }
+    }
+    // progress 不设单调闸：inventory 用 scanned-1 抵消引擎的提前 +1。
+    if cur.started_at.is_some() && next.started_at != cur.started_at {
+        return Err(format!("job {}: started_at changed", next.id));
+    }
+    if cur.finished_at.is_some() && next.finished_at != cur.finished_at {
+        return Err(format!("job {}: finished_at changed", next.id));
+    }
+    if cur.error.is_some() && next.error.is_none() {
+        return Err(format!("job {}: error cleared", next.id));
+    }
+    Ok(())
+}
+
+fn task_row_ok(cur: Option<&JobTaskRow>, next: &JobTaskRow) -> Result<(), String> {
+    let Some(cur) = cur else {
+        return if matches!(next.state.as_str(), "queued" | "running") {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {}/{}: new row in state {}",
+                next.job_id, next.task_no, next.state
+            ))
+        };
+    };
+    if task_terminal(&cur.state) {
+        // 终态行是日志事实：重复 apply 必须逐字段幂等，不得复活/改写。
+        return if next.state == cur.state
+            && next.fence_term == cur.fence_term
+            && next.attempt == cur.attempt
+            && next.fence_leader == cur.fence_leader
+            && next.result_code == cur.result_code
+            && next.result_string == cur.result_string
+            && next.action == cur.action
+            && next.payload_json == cur.payload_json
+            && next.next_at == cur.next_at
+            && next.deadline_at == cur.deadline_at
+            && next.started_at == cur.started_at
+            && next.finished_at == cur.finished_at
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {}/{}: terminal row changed",
+                next.job_id, next.task_no
+            ))
+        };
+    }
+    if next.fence_term < cur.fence_term || next.attempt < cur.attempt {
+        return Err(format!(
+            "task {}/{}: fence/attempt regressed",
+            next.job_id, next.task_no
+        ));
+    }
+    if !task_state_ok(&cur.state, &next.state) {
+        return Err(format!(
+            "task {}/{}: illegal state {} -> {}",
+            next.job_id, next.task_no, cur.state, next.state
+        ));
+    }
+    Ok(())
+}
+
+async fn current_job(cw: &mut ControlWrite<'_>, id: i64) -> Result<Option<JobRow>, sqlx::Error> {
+    let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *cw.conn)
+        .await?;
+    Ok(row.as_ref().map(job_row_from))
+}
+
+async fn current_task(
+    cw: &mut ControlWrite<'_>,
+    job_id: i64,
+    task_no: i64,
+) -> Result<Option<JobTaskRow>, sqlx::Error> {
+    let row = sqlx::query("SELECT * FROM job_tasks WHERE job_id = ? AND task_no = ?")
+        .bind(job_id)
+        .bind(task_no)
+        .fetch_optional(&mut *cw.conn)
+        .await?;
+    Ok(row.as_ref().map(job_task_row_from))
+}
+
+/// Restore 行按 `(bucket,key,version_id)` 读取（P2-1：创建行随 JobBatch 复制）。
+async fn current_restore(
+    cw: &mut ControlWrite<'_>,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<TierRestoreRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT bucket, key, version_id, expires_at, job_id, state, created_at, \
+          fence_term, fence_leader FROM tier_restores \
+         WHERE bucket = ? AND key = ? AND version_id = ?",
+    )
+    .bind(bucket)
+    .bind(key)
+    .bind(version_id)
+    .fetch_optional(&mut *cw.conn)
+    .await?;
+    Ok(row.map(|r| TierRestoreRow {
+        bucket: r.get("bucket"),
+        key: r.get("key"),
+        version_id: r.get("version_id"),
+        expires_at: r.get("expires_at"),
+        job_id: r.get("job_id"),
+        state: r.get("state"),
+        created_at: r.get("created_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }))
+}
+
+/// Restore 行只允许已知状态，且 fence 不得回退（行被更高 term 接管后旧日志不得降级）。
+fn restore_row_ok(cur: Option<&TierRestoreRow>, next: &TierRestoreRow) -> Result<(), String> {
+    if !matches!(next.state.as_str(), "pending" | "restored") {
+        return Err(format!(
+            "restore {}/{}/{}: unknown state {}",
+            next.bucket, next.key, next.version_id, next.state
+        ));
+    }
+    if cur.is_some_and(|cur| next.fence_term < cur.fence_term) {
+        return Err(format!(
+            "restore {}/{}/{}: fence regressed",
+            next.bucket, next.key, next.version_id
+        ));
+    }
+    Ok(())
+}
+
+/// 按主键 upsert Restore 行；fence 单调由 [`restore_row_ok`] 预检，WHERE 是防御性兜底。
+async fn apply_restore(cw: &mut ControlWrite<'_>, r: &TierRestoreRow) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, \
+          created_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
+          expires_at = excluded.expires_at, job_id = excluded.job_id, state = excluded.state, \
+          created_at = excluded.created_at, fence_term = excluded.fence_term, \
+          fence_leader = excluded.fence_leader \
+         WHERE tier_restores.fence_term <= excluded.fence_term",
+    )
+    .bind(&r.bucket)
+    .bind(&r.key)
+    .bind(&r.version_id)
+    .bind(r.expires_at)
+    .bind(r.job_id)
+    .bind(&r.state)
+    .bind(r.created_at)
+    .bind(r.fence_term)
+    .bind(r.fence_leader)
+    .execute(&mut *cw.conn)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// 去重键唯一（partial unique index）。同 PK 保留自键；冲突是业务拒绝而非 SQL 错误。
+async fn dedupe_taken(
+    cw: &mut ControlWrite<'_>,
+    key: &str,
+    job_id: i64,
+    task_no: i64,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64, i64)> =
+        sqlx::query_as("SELECT job_id, task_no FROM job_tasks WHERE dedupe_key = ?")
+            .bind(key)
+            .fetch_optional(&mut *cw.conn)
+            .await?;
+    Ok(row.is_some_and(|(j, t)| j != job_id || t != task_no))
+}
+
+/// 按主键 upsert 作业行。防回退判定已由 [`job_row_ok`] 在写入前完成，这里不再
+/// 用 SQL WHERE 静默吞行（避免半批边界）。
+async fn apply_job(cw: &mut ControlWrite<'_>, job: &JobRow) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO jobs (id, kind, bucket, prefix, state, scanned, deleted, skipped, error, \
+          created_at, updated_at, spec_json, progress, total, succeeded, failed, report_bucket, \
+          report_prefix, priority, requested_by, parent_job_id, started_at, finished_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET \
+          kind = excluded.kind, bucket = excluded.bucket, prefix = excluded.prefix, \
+          state = excluded.state, scanned = excluded.scanned, deleted = excluded.deleted, \
+          skipped = excluded.skipped, error = excluded.error, created_at = excluded.created_at, \
+          updated_at = excluded.updated_at, spec_json = excluded.spec_json, \
+          progress = excluded.progress, total = excluded.total, \
+          succeeded = excluded.succeeded, failed = excluded.failed, \
+          report_bucket = excluded.report_bucket, report_prefix = excluded.report_prefix, \
+          priority = excluded.priority, requested_by = excluded.requested_by, \
+          parent_job_id = excluded.parent_job_id, started_at = excluded.started_at, \
+          finished_at = excluded.finished_at",
+    )
+    .bind(job.id)
+    .bind(&job.kind)
+    .bind(&job.bucket)
+    .bind(&job.prefix)
+    .bind(&job.state)
+    .bind(job.scanned)
+    .bind(job.deleted)
+    .bind(job.skipped)
+    .bind(&job.error)
+    .bind(job.created_at)
+    .bind(job.updated_at)
+    .bind(&job.spec_json)
+    .bind(job.progress)
+    .bind(job.total)
+    .bind(job.succeeded)
+    .bind(job.failed)
+    .bind(&job.report_bucket)
+    .bind(&job.report_prefix)
+    .bind(job.priority)
+    .bind(job.requested_by)
+    .bind(job.parent_job_id)
+    .bind(job.started_at)
+    .bind(job.finished_at)
+    .execute(&mut *cw.conn)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// 按 `(job_id, task_no)` upsert。单调/终态判定见 [`task_row_ok`]；终态行恒清
+/// `dedupe_key`（延迟重放的旧行不能把已释放的去重键塞回去）。
+async fn apply_job_task(cw: &mut ControlWrite<'_>, task: &JobTaskRow) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, attempt, next_at, \
+          dedupe_key, deadline_at, result_code, result_string, started_at, finished_at, \
+          fence_term, fence_leader) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(job_id, task_no) DO UPDATE SET \
+          action = excluded.action, payload_json = excluded.payload_json, \
+          state = excluded.state, attempt = excluded.attempt, next_at = excluded.next_at, \
+          dedupe_key = CASE WHEN excluded.state IN ('done','failed','cancelled') THEN NULL \
+                            ELSE excluded.dedupe_key END, \
+          deadline_at = excluded.deadline_at, result_code = excluded.result_code, \
+          result_string = excluded.result_string, started_at = excluded.started_at, \
+          finished_at = excluded.finished_at, fence_term = excluded.fence_term, \
+          fence_leader = excluded.fence_leader",
+    )
+    .bind(task.job_id)
+    .bind(task.task_no)
+    .bind(&task.action)
+    .bind(&task.payload_json)
+    .bind(&task.state)
+    .bind(task.attempt)
+    .bind(task.next_at)
+    .bind(&task.dedupe_key)
+    .bind(task.deadline_at)
+    .bind(&task.result_code)
+    .bind(&task.result_string)
+    .bind(task.started_at)
+    .bind(task.finished_at)
+    .bind(task.fence_term)
+    .bind(task.fence_leader)
+    .execute(&mut *cw.conn)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// 整批语义：先只读校验全部行，任一行不合法 → `Conflict` 且零写入；校验通过后
+/// 每行 upsert 必须恰好影响 1 行（否则内部不变量破坏，fail-stop）。
+async fn apply_job_batch(
+    cw: &mut ControlWrite<'_>,
+    jobs: &[JobRow],
+    tasks: &[JobTaskRow],
+    restores: &[TierRestoreRow],
+) -> Result<ControlResponse, sqlx::Error> {
+    let mut batch_ids = HashSet::new();
+    for job in jobs {
+        if !batch_ids.insert(job.id) {
+            return Ok(ControlResponse::Conflict);
+        }
+        let cur = current_job(cw, job.id).await?;
+        if job_row_ok(cur.as_ref(), job).is_err() {
+            return Ok(ControlResponse::Conflict);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut keys = HashSet::new();
+    for task in tasks {
+        if !seen.insert((task.job_id, task.task_no)) {
+            return Ok(ControlResponse::Conflict);
+        }
+        if !batch_ids.contains(&task.job_id) && current_job(cw, task.job_id).await?.is_none() {
+            return Ok(ControlResponse::Conflict);
+        }
+        let cur = current_task(cw, task.job_id, task.task_no).await?;
+        if task_row_ok(cur.as_ref(), task).is_err() {
+            return Ok(ControlResponse::Conflict);
+        }
+        if !task_terminal(&task.state)
+            && let Some(key) = &task.dedupe_key
+            && (!keys.insert(key.clone())
+                || dedupe_taken(cw, key, task.job_id, task.task_no).await?)
+        {
+            return Ok(ControlResponse::Conflict);
+        }
+    }
+    let mut restore_keys = HashSet::new();
+    for restore in restores {
+        let key = (
+            restore.bucket.clone(),
+            restore.key.clone(),
+            restore.version_id.clone(),
+        );
+        if !restore_keys.insert(key) {
+            return Ok(ControlResponse::Conflict);
+        }
+        // 与任务同规则：引用的 job 必须在本批或本地已存在（RunState::validate 不允许悬空）。
+        if let Some(job_id) = restore.job_id
+            && !batch_ids.contains(&job_id)
+            && current_job(cw, job_id).await?.is_none()
+        {
+            return Ok(ControlResponse::Conflict);
+        }
+        let cur = current_restore(cw, &restore.bucket, &restore.key, &restore.version_id).await?;
+        if restore_row_ok(cur.as_ref(), restore).is_err() {
+            return Ok(ControlResponse::Conflict);
+        }
+    }
+    for job in jobs {
+        if apply_job(cw, job).await? != 1 {
+            return Err(invariant(format!("job {} upsert affected 0 rows", job.id)));
+        }
+    }
+    for task in tasks {
+        if apply_job_task(cw, task).await? != 1 {
+            return Err(invariant(format!(
+                "task {}/{} upsert affected 0 rows",
+                task.job_id, task.task_no
+            )));
+        }
+    }
+    for restore in restores {
+        if apply_restore(cw, restore).await? != 1 {
+            return Err(invariant(format!(
+                "restore {}/{}/{} upsert affected 0 rows",
+                restore.bucket, restore.key, restore.version_id
+            )));
+        }
+    }
+    Ok(ControlResponse::Ok)
+}
+
 async fn bucket_exists_for_ap(
     cw: &mut ControlWrite<'_>,
     access_point: &str,
@@ -805,6 +1241,41 @@ async fn bucket_exists_for_ap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 状态机白名单必须覆盖 worker 的真实转换（含 paused/preempted 收尾），且终态冻结。
+    #[test]
+    fn job_state_allowlist_covers_worker_transitions() {
+        for (from, to) in [
+            ("queued", "running"),
+            ("queued", "cancelled"),
+            ("running", "paused"),
+            ("running", "preempted"),
+            ("running", "done"),
+            ("running", "error"),
+            ("running", "cancelled"),
+            ("paused", "running"),
+            ("paused", "done"),
+            ("paused", "error"),
+            ("paused", "cancelled"),
+            ("preempted", "queued"),
+            ("preempted", "paused"),
+            ("preempted", "done"),
+            ("preempted", "error"),
+            ("preempted", "cancelled"),
+            ("done", "done"),
+        ] {
+            assert!(job_state_ok(from, to), "{from} -> {to}");
+        }
+        for (from, to) in [
+            ("done", "running"),
+            ("error", "queued"),
+            ("cancelled", "running"),
+            ("queued", "done"),
+            ("preempted", "running"),
+        ] {
+            assert!(!job_state_ok(from, to), "{from} -> {to}");
+        }
+    }
 
     /// Level 3 `Ext`：未知 type_id 是业务拒绝；cfg(test) 探针证明容器可提交。
     #[tokio::test]

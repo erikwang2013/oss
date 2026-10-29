@@ -817,6 +817,7 @@ pub async fn run(
                     std::sync::Arc::clone(&state.db),
                     std::sync::Arc::clone(&state.store),
                     executor,
+                    std::sync::Arc::clone(&state.jobs),
                     leader.clone(),
                 );
                 // M8 S4b：restore 启动对账 + Transition sweep / 过期 reaper 周期
@@ -825,12 +826,17 @@ pub async fn run(
                     std::sync::Arc::clone(&state.store),
                     std::sync::Arc::clone(&state.lifecycle),
                     std::sync::Arc::clone(&state.restore_sink),
+                    std::sync::Arc::clone(&state.jobs),
                     leader.clone(),
                 );
                 // M8 加固：启动 + 周期清理崩溃残留的 S3 spool 暂存（tier-*.stage）。
                 crate::tier::spawn_stage_sweeper(state.cfg.staging_dir.clone());
                 // M8 S5：Inventory 调度（OSS_INVENTORY_INTERVAL_SECS，0=关）
-                crate::inventory::spawn_worker(std::sync::Arc::clone(&state.db), leader);
+                crate::inventory::spawn_worker(
+                    std::sync::Arc::clone(&state.db),
+                    std::sync::Arc::clone(&state.jobs),
+                    leader,
+                );
             }
 
             // TLS 主监听器走可热加载实现（每个新连接取配置快照）；明文路径保持

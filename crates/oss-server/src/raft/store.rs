@@ -648,6 +648,25 @@ impl SqliteStateMachine {
                 ))));
             }
         }
+        let runstate = runstate.unwrap_or_default();
+        // level-3 快照只是构建者本地表的拷贝。配置 feature 4 的节点若装上带运行态行的
+        // level-3 快照，就会在无 marker 的情况下持有非日志行；直接拒绝，避免运行期带病
+        // 进入 feature 4。空 level-3 快照仍可装（运行态为空）。
+        if snapshot.feature_level >= super::compat::FEATURE_LEVEL_3
+            && snapshot.feature_level < super::compat::FEATURE_LEVEL_4
+            && self.feature_level >= super::compat::FEATURE_LEVEL_4
+            && (!runstate.jobs.is_empty()
+                || !runstate.job_tasks.is_empty()
+                || !runstate.inventory_runs.is_empty()
+                || !runstate.tier_restores.is_empty())
+        {
+            return Err(Self::data_err(data::DataError::Format(format!(
+                "[raft].feature_level={} cannot install a level-{} snapshot carrying \
+                 non-log jobs/job_tasks/inventory_runs/tier_restores; finish feature-4 \
+                 activation on the source or drain/clear these tables and re-export",
+                self.feature_level, snapshot.feature_level
+            ))));
+        }
         let _guard = self.snapshot_lock.lock().await;
         let mut tx = self
             .pool
@@ -674,10 +693,31 @@ impl SqliteStateMachine {
         // level 3：九表与控制面同一事务替换；无扩展 = 空运行态（本二进制在 level 3
         // 总是写出扩展）。低于 3：不动节点本地运行态。
         if snapshot.feature_level >= super::compat::FEATURE_LEVEL_3 {
-            let runstate = runstate.unwrap_or_default();
             super::runstate::install_runstate_tx(&mut tx, &runstate)
                 .await
                 .map_err(Self::data_err)?;
+            // marker 只认证 level-4 来源；普通 level-3 安装必须撤销旧标记。
+            if snapshot.feature_level >= super::compat::FEATURE_LEVEL_4 {
+                super::compat::mark_runstate_activated_tx(&mut tx)
+                    .await
+                    .map_err(|e| {
+                        storage_err(
+                            ErrorSubject::Snapshot(None),
+                            ErrorVerb::Write,
+                            std::io::Error::other(e),
+                        )
+                    })?;
+            } else {
+                super::compat::clear_runstate_activated_tx(&mut tx)
+                    .await
+                    .map_err(|e| {
+                        storage_err(
+                            ErrorSubject::Snapshot(None),
+                            ErrorVerb::Write,
+                            std::io::Error::other(e),
+                        )
+                    })?;
+            }
         }
         // 只升不降；OSSCTL1（level 1）不写 marker，保持旧安装足迹不变。
         if snapshot.feature_level > super::compat::MIN_FEATURE_LEVEL {
@@ -844,6 +884,15 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                         // R10：与首条 level-2 entry 同事务写激活标记（业务拒绝的响应也写）。
                         if self.control && required > self.activation.load(Ordering::Relaxed) {
                             super::compat::bump_activation_tx(&mut tx, required)
+                                .await
+                                .map_err(|e| {
+                                    storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
+                                })?;
+                        }
+                        // level-4 命令 apply 是运行态“日志事实”的直接证据；与行同事务
+                        // 置 marker（业务拒绝也证明集群已到 4）。
+                        if self.control && required >= super::compat::FEATURE_LEVEL_4 {
+                            super::compat::mark_runstate_activated_tx(&mut tx)
                                 .await
                                 .map_err(|e| {
                                     storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)

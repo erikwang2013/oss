@@ -297,6 +297,22 @@ impl ControlPlane {
         matches!(self.inner, Inner::Raft(_))
     }
 
+    /// Raft 句柄（Local = None）；jobs 运行态复制决策用。
+    pub fn raft_handle(&self) -> Option<&Arc<RaftHandle>> {
+        match &self.inner {
+            Inner::Raft(handle) => Some(handle),
+            Inner::Local(_) => None,
+        }
+    }
+
+    /// 本节点当前是否 leader；Local（单机/测试）恒 true。
+    pub fn is_leader(&self) -> bool {
+        match &self.inner {
+            Inner::Raft(handle) => handle.is_leader(),
+            Inner::Local(_) => true,
+        }
+    }
+
     /// `/api/v1/raft/status`：Raft 下报真实运行状态；M7/Local 保持 S0 骨架。
     /// `configured` = `cfg.raft.is_some()`，未配置 `[raft]` 时能力位全 false。
     /// S7.2：快照安装后的缓存/目录重建入口（state 的 install watcher 调用）。
@@ -437,8 +453,8 @@ impl ControlPlane {
                         effective,
                     }) => {
                         return Err(ControlError::Unavailable(format!(
-                            "raft feature level {required} not active (effective {effective}); \
-                             finish rollout/enable [raft].feature_level"
+                            "raft feature level {required} not active (effective {effective}): \
+                             需要 feature {required}（finish rollout/enable [raft].feature_level）"
                         )));
                     }
                     Err(WriteError::UnregisteredExtType { type_id }) => {

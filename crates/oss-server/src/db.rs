@@ -4495,7 +4495,8 @@ impl Db {
         Ok(id)
     }
 
-    /// 收尾一条作业（done/error + 计数 + 可选错误）。
+    /// 收尾一条作业（done/error + 计数 + 可选错误）。`error=None` 保留已有错误
+    /// （与复制路径一致：错误一旦落库不可被收尾静默清空）。
     #[allow(clippy::too_many_arguments)]
     pub async fn job_finish(
         &self,
@@ -4508,8 +4509,8 @@ impl Db {
         now: i64,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET state = ?, scanned = ?, deleted = ?, skipped = ?, error = ?, \
-             updated_at = ? WHERE id = ?",
+            "UPDATE jobs SET state = ?, scanned = ?, deleted = ?, skipped = ?, \
+             error = COALESCE(?, error), updated_at = ? WHERE id = ?",
         )
         .bind(state)
         .bind(scanned)
@@ -4717,6 +4718,20 @@ impl Db {
             .rows_affected();
             inserted |= n > 0;
         }
+        Self::upsert_restore_row(&mut tx, bucket, key, version_id, id, now, fence).await?;
+        tx.commit().await?;
+        Ok((id, inserted))
+    }
+
+    async fn upsert_restore_row(
+        conn: &mut SqliteConnection,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        job_id: i64,
+        now: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, created_at, \
              fence_term, fence_leader) \
@@ -4731,14 +4746,13 @@ impl Db {
         .bind(bucket)
         .bind(key)
         .bind(version_id)
-        .bind(id)
+        .bind(job_id)
         .bind(now)
         .bind(fence.term_i64())
         .bind(fence.leader_i64())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        tx.commit().await?;
-        Ok((id, inserted))
+        Ok(())
     }
 
     /// 某状态的 Restore 行（reaper/对账）。

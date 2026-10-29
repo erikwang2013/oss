@@ -15,6 +15,7 @@ use xl_store::meta::{TierChunks, TierPhase, is_archive_class};
 use xl_store::store::Store;
 
 use crate::db::{Db, JobSpec, NewJobTask};
+use crate::job_state::JobState;
 use crate::jobs::TaskExecutor;
 use crate::raft::{FencingEpoch, LeaderGate};
 use crate::tier::{StageGuard, TierBackends, TierByteStream, reserve_free_space, tier_key};
@@ -43,15 +44,17 @@ struct RestorePayload {
     days: u32,
 }
 
-/// Restore 入队：单事务写 `tier_restores`(pending) + 作业。
+/// Restore 入队：作业行与 `tier_restores`(pending) 行同批走 `JobState`（feature 4 经复制
+/// 日志按主键 upsert；非复制模式仍为本地直写）。
 pub struct SqlRestoreSink {
     db: Arc<Db>,
+    jobs: Arc<JobState>,
     gate: LeaderGate,
 }
 
 impl SqlRestoreSink {
-    pub fn new(db: Arc<Db>, gate: LeaderGate) -> Self {
-        Self { db, gate }
+    pub fn new(db: Arc<Db>, jobs: Arc<JobState>, gate: LeaderGate) -> Self {
+        Self { db, jobs, gate }
     }
 
     /// 入队时刻的 token：leader 用当前 epoch；follower/M7 用 UNFENCED（本地行仍可写）。
@@ -89,8 +92,9 @@ impl RestoreSink for SqlRestoreSink {
             }],
             ..Default::default()
         };
-        self.db
-            .create_restore_job(
+        self.jobs
+            .create_restore(
+                &self.db,
                 &spec,
                 bucket,
                 key,
@@ -99,8 +103,6 @@ impl RestoreSink for SqlRestoreSink {
                 self.fence(),
             )
             .await
-            .map(|(id, _)| id)
-            .map_err(|e| e.to_string())
     }
 
     async fn forget_restore(
