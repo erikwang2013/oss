@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use oss_server::raft::runstate::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
-    TierRestoreRow,
+    LifecycleCursorRow, TierRestoreRow,
 };
 use oss_server::raft::{ControlCommand, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits};
 
@@ -323,6 +323,23 @@ fn all_variants() -> Vec<ControlCommand> {
             bucket: "b1".into(),
             config_id: "inv1".into(),
         },
+        // M8-2：lifecycle 扫描游标（level 5）。
+        ControlCommand::LifecycleCursorUpsert {
+            cursor: LifecycleCursorRow {
+                bucket: "b1".into(),
+                rule_id: "r1".into(),
+                stage: "current".into(),
+                cursor: "logs/obj".into(),
+                updated_at: 2,
+                ..LifecycleCursorRow::default()
+            },
+        },
+        ControlCommand::LifecycleCursorClear {
+            bucket: "b1".into(),
+            rule_id: "r1".into(),
+            stage: "current".into(),
+            fence_term: 1,
+        },
     ]
 }
 
@@ -442,6 +459,14 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
                     "M8-2 inventory 行命令必须是 level 5（v1.23.0 占用 4）"
                 );
             }
+            ControlCommand::LifecycleCursorUpsert { .. }
+            | ControlCommand::LifecycleCursorClear { .. } => {
+                inventory += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_5,
+                    "lifecycle 游标与 Inventory* 同级（level 5）"
+                );
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
                 "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
@@ -451,7 +476,10 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     assert_eq!(ext, 1, "生产命令集恰好一个 Ext 样本");
     assert_eq!(accounts, 8, "生产命令集恰好八个账户命令样本");
     assert_eq!(jobs, 3, "生产命令集恰好三个 M8-2 作业行样本");
-    assert_eq!(inventory, 2, "生产命令集恰好两个 M8-2 inventory 行样本");
+    assert_eq!(
+        inventory, 4,
+        "生产命令集恰好两个 M8-2 inventory 行样本 + 两个 lifecycle 游标样本"
+    );
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

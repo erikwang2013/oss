@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::COMMAND_MAX_BYTES;
 use super::runstate::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
-    TierRestoreRow,
+    LifecycleCursorRow, TierRestoreRow,
 };
 
 /// 子账户 × 桶的三档权限（自然键：username + bucket）。
@@ -320,6 +320,21 @@ pub enum ControlCommand {
         config_id: String,
     },
 
+    // ---- level 5: lifecycle 扫描游标复制 ----
+    /// 生命周期扫描游标整行 upsert（自然键 bucket+rule_id+stage）。apply 只做 SQL：
+    /// 水位非空、`updated_at` 严格前进、fence 不回退；leader 在 append 前校验桶引用。
+    LifecycleCursorUpsert {
+        cursor: LifecycleCursorRow,
+    },
+    /// 阶段扫完清除游标（幂等）。`fence_term` 是删除上限：旧 term 的迟到删除不得
+    /// 抹掉新 term 已推进的进度。
+    LifecycleCursorClear {
+        bucket: String,
+        rule_id: String,
+        stage: String,
+        fence_term: i64,
+    },
+
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。
     #[cfg(test)]
     Set {
@@ -422,6 +437,10 @@ impl ControlCommand {
             }
             // v1.23.0 已 advertise 4 但不认识 Inventory*；必须用 level 5。
             Self::InventoryBatch { .. } | Self::InventoryClear { .. } => {
+                super::compat::FEATURE_LEVEL_5
+            }
+            // 与 Inventory* 同级别：level-5 二进制之外无人能解码。
+            Self::LifecycleCursorUpsert { .. } | Self::LifecycleCursorClear { .. } => {
                 super::compat::FEATURE_LEVEL_5
             }
             #[cfg(test)]

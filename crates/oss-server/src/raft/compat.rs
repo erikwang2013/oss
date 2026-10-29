@@ -270,7 +270,8 @@ pub async fn guard_runstate_activation(
 }
 
 /// P1-B 激活边界：feature 5（inventory 运行态复制）要求本地三张 inventory 表为空，
-/// 且 `runstate_meta.next_run_id`/自然键与剩余行一致。
+/// 且 `runstate_meta.next_run_id`/自然键与剩余行一致；通过后清空本地 `lifecycle_cursors`
+/// （v1.23.0 的续扫提示，不是日志事实，重扫安全）。
 ///
 /// v1.23.0 在 feature 4 下仍把 inventory 写在各节点本地，而 Job* 已把 jobs 的
 /// level-4 标记置位；因此本守卫使用**独立**的 `META_INVENTORY_ACTIVATED`，绝不能
@@ -336,6 +337,12 @@ pub async fn guard_inventory_activation(
         Some(next) => next > max_run_id,
     };
     if runs == 0 && cursors == 0 && incrementals == 0 && duplicate_keys == 0 && next_ok {
+        // lifecycle 游标是续扫提示而非日志事实；首次激活清掉各副本旧水位（重扫安全），
+        // 否则旧的更高 updated_at 会让复制 apply 对首次 upsert 持续 Conflict。
+        sqlx::query("DELETE FROM lifecycle_cursors")
+            .execute(pool)
+            .await
+            .map_err(|e| format!("清空本地 lifecycle_cursors 失败: {e}"))?;
         return Ok(());
     }
     Err(format!(
@@ -790,6 +797,41 @@ mod tests {
         .unwrap();
         let err = guard_inventory_activation(db.pool(), 5).await.unwrap_err();
         assert!(err.contains("inventory_incremental=1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn first_feature_five_activation_clears_legacy_local_lifecycle_cursors() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at) \
+             VALUES ('b', 'legacy:', 'current', 'k', 9999999999)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(guard_inventory_activation(db.pool(), 5).await.is_ok());
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_cursors")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "首次 feature-5 激活必须清空本地续扫游标");
+        // 已激活后的重启不清日志复制来的游标。
+        sqlx::query(
+            "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at) \
+             VALUES ('b', 'r', 'current', 'k2', 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut conn = db.pool().acquire().await.unwrap();
+        mark_inventory_activated_tx(&mut conn).await.unwrap();
+        drop(conn);
+        assert!(guard_inventory_activation(db.pool(), 5).await.is_ok());
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_cursors")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "已激活节点重启不得清空日志复制的游标");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use sqlx::{Row, SqliteConnection};
 
 mod accounts;
 pub(crate) mod inventory;
+pub(crate) mod lifecycle;
 
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
 use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
@@ -785,6 +786,14 @@ pub(crate) async fn apply_command(
         ControlCommand::InventoryClear { bucket, config_id } => {
             inventory::clear(cw, bucket, config_id).await?
         }
+        // M8-2：lifecycle 扫描游标复制（单行预检，零写入 Conflict）。
+        ControlCommand::LifecycleCursorUpsert { cursor } => lifecycle::apply(cw, cursor).await?,
+        ControlCommand::LifecycleCursorClear {
+            bucket,
+            rule_id,
+            stage,
+            fence_term,
+        } => lifecycle::clear(cw, bucket, rule_id, stage, *fence_term).await?,
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")

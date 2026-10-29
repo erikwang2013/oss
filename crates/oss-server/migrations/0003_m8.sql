@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS tier_restores (
 );
 CREATE INDEX IF NOT EXISTS idx_tier_restores_expiry ON tier_restores(state, expires_at);
 
--- 4.10：生命周期扫描游标（本地表，不进 Raft；配置变更时清空）
+-- 4.10：生命周期扫描游标（v1.23.0 及更早为节点本地表；feature 5 起经 Raft 复制）
 CREATE TABLE IF NOT EXISTS lifecycle_cursors (
   bucket TEXT NOT NULL,
   rule_id TEXT NOT NULL,

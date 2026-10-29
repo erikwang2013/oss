@@ -13,10 +13,12 @@
 //! 先等 apply 追平再分配。Restore 受理的 `tier_restores` 行与作业同批进日志（P2-1），
 //! 之后的 restored/删除是 leader 执行侧的本地运行态调整，随 OSSCTL3 快照安装收敛；
 //! 启动守卫要求旧本地运行态为空后才允许激活 feature 4。inventory 运行态（runs/
-//! cursors/incrementals）见 [`inventory`] 子模块；lifecycle/lease 不在本切片。
+//! cursors/incrementals）见 [`inventory`] 子模块；lifecycle 扫描游标见 [`lifecycle`]
+//! 子模块（同为 feature 5）；schedule lease/takeover 不在本切片。
 
 mod admin;
 mod inventory;
+mod lifecycle;
 mod worker;
 
 use std::collections::HashSet;
@@ -98,6 +100,11 @@ impl JobState {
 
     /// inventory 复制是 level 5：v1.23.0 已 advertise 4 但不认识 Inventory*。
     pub fn inventory_replicated(&self) -> bool {
+        self.replicated_at(compat::FEATURE_LEVEL_5)
+    }
+
+    /// lifecycle 游标与 Inventory* 共用 level 5（同一批 level-5 二进制）。
+    pub fn lifecycle_replicated(&self) -> bool {
         self.replicated_at(compat::FEATURE_LEVEL_5)
     }
 
