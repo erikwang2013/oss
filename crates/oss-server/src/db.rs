@@ -2849,6 +2849,27 @@ mod tests {
         Db::connect("sqlite::memory:").await.unwrap()
     }
 
+    /// 重试退避：base 10*2^attempt 封顶 300，抖动必须在 0..9 秒且确定；不能让
+    /// `now`（Unix 秒）的个位直接变成 0..999 秒。
+    #[test]
+    fn task_retry_backoff_is_bounded_and_deterministic() {
+        let mut seen = std::collections::BTreeSet::new();
+        for attempt in 0..10i64 {
+            let base = 10i64
+                .saturating_mul(2i64.saturating_pow(attempt as u32))
+                .min(300);
+            for i in 0..40i64 {
+                let now = 1_700_000_000 + i;
+                let b = Db::retry_backoff_secs(attempt, now, 42, 7);
+                assert!(b >= base && b <= base + 9, "attempt={attempt} b={b}");
+                assert_eq!(b, Db::retry_backoff_secs(attempt, now, 42, 7));
+                seen.insert(b);
+            }
+        }
+        assert!(seen.len() > 20, "jitter should spread, got {seen:?}");
+        assert!(*seen.iter().max().unwrap() <= 309);
+    }
+
     #[tokio::test]
     async fn init_creates_tables() {
         let db = db().await;
@@ -5078,6 +5099,23 @@ impl Db {
         .await
     }
 
+    /// 任务失败后的重试退避（秒）：`10 * 2^attempt` 封顶 300，再加 0..9s 确定性抖动。
+    /// `now` 是 Unix 秒；旧实现用 `now % 1000`，实际抖动是 0..999 **秒**，默认 3 次
+    /// 重试可能拖到半小时。抖动只依赖 (job_id, task_no, now, attempt)，重放结果一致。
+    pub(crate) fn retry_backoff_secs(attempt: i64, now: i64, job_id: i64, task_no: i64) -> i64 {
+        let base = 10i64
+            .saturating_mul(2i64.saturating_pow(attempt.min(30) as u32))
+            .min(300);
+        let mut h = (job_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (task_no as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (now as u64).wrapping_mul(0x1656_67B1_9E37_79F9)
+            ^ (attempt as u64);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 33;
+        base + (h % 10) as i64
+    }
+
     /// M8-1：带 fencing token 的收尾。行已被更高 term 接管（`fence_term > token.term`）
     /// → `Ok("fenced")` 且不做任何写入；调用方的动作结果丢弃，任务留 running 交给
     /// 新 leader 的过期/接管回收（at-least-once）。
@@ -5138,10 +5176,7 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         } else if attempt + 1 < max_attempts {
-            let backoff = 10i64
-                .saturating_mul(2i64.saturating_pow(attempt.min(30) as u32))
-                .min(300)
-                + (now % 1000).abs();
+            let backoff = Self::retry_backoff_secs(attempt, now, job_id, task_no);
             sqlx::query(
                 "UPDATE job_tasks SET state = 'queued', attempt = attempt + 1, next_at = ?, \
                  result_code = ?, result_string = ?, started_at = NULL, deadline_at = NULL \

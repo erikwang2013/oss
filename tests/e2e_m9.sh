@@ -25,9 +25,9 @@
 # S9b：B kill -9 停机窗口内 Batch Delete 的远端删除不可达 → 任务按默认预算
 #       （OSS_JOB_MAX_ATTEMPTS=3）重试 3 次后 job=error、task PermanentFailure/attempt=3；
 #       远端优先语义下本地对象原样（1 version / 0 marker，不半删），B 重启后两端仍完整。
-#       默认退避 = 10*2^attempt + now%1000，而 now 是 Unix 秒 → 抖动实为 0~999「秒」，
-#       单次等待可达 ~17min；测试在 3 次真实尝试之间把该任务的 next_at 拨到当前以压缩
-#       等待（attempt 上限与进程超时预算不变）。sink 拒绝且本地对象原样另由
+#       退避 = 10*2^attempt + 0..9s 抖动（本轮修复了旧版 now%1000 实为 0~999 秒的缺陷）；
+#       测试仍把 3 次真实尝试之间的 next_at 拨到当前以压缩等待（attempt 上限与进程
+#       超时预算不变）。sink 拒绝且本地对象原样另由
 #       m8_batch.rs::batch_delete_on_sync_bucket_refuses_without_remote 覆盖，在线删除的
 #       503 语义由本步骤 SIGSTOP 段覆盖。
 # 前置：`cargo build -p oss-server`；aws-cli；curl；python3。
