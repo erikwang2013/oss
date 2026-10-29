@@ -22,9 +22,14 @@
 #       （A/B 同 id delete marker、两端 HEAD 404）。DeleteBucket quiesce/非空回滚、生命周期
 #       Expiration remote-first 由 crates/oss-server/tests/sync_gate.rs 进程内覆盖
 #       （本脚本不跑，因需在途写者与远端可控状态）。
-# TODO(S9b)：B 断连期间 Batch Delete 的重试→job error 收敛未在本脚本覆盖（需 ~40s
-#       停机窗口）；sink 拒绝且本地对象原样由 m8_batch.rs::batch_delete_on_sync_bucket_refuses_without_remote
-#       覆盖，在线删除的 503 语义由本步骤 SIGSTOP 段覆盖。
+# S9b：B kill -9 停机窗口内 Batch Delete 的远端删除不可达 → 任务按默认预算
+#       （OSS_JOB_MAX_ATTEMPTS=3）重试 3 次后 job=error、task PermanentFailure/attempt=3；
+#       远端优先语义下本地对象原样（1 version / 0 marker，不半删），B 重启后两端仍完整。
+#       默认退避 = 10*2^attempt + now%1000，而 now 是 Unix 秒 → 抖动实为 0~999「秒」，
+#       单次等待可达 ~17min；测试在 3 次真实尝试之间把该任务的 next_at 拨到当前以压缩
+#       等待（attempt 上限与进程超时预算不变）。sink 拒绝且本地对象原样另由
+#       m8_batch.rs::batch_delete_on_sync_bucket_refuses_without_remote 覆盖，在线删除的
+#       503 语义由本步骤 SIGSTOP 段覆盖。
 # 前置：`cargo build -p oss-server`；aws-cli；curl；python3。
 # 用法：OSS_BIN=target/debug/oss-server tests/e2e_m9.sh
 #       M9_STRETCH=1 OSS_BIN=target/debug/oss-server tests/e2e_m9.sh   # 2×6 stretch
@@ -326,6 +331,70 @@ if bad:
     print("; ".join(bad)); sys.exit(1)
 PY
 }
+# B 断开期间 Batch Delete 的失败收敛：error / 1 failed / 任务 attempt=3（默认预算）
+# 且 result_string 是远端失败（排除清单缺失等前置错误被误当成远端重试）。
+batch_job_failed() { # 详情文件
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"作业详情不可读: {e}"); sys.exit(1)
+j, tasks = d["job"], d["tasks"]
+bad = []
+for k, exp in (("state", "error"), ("total", 1), ("succeeded", 0), ("failed", 1), ("progress", 1)):
+    if j.get(k) != exp:
+        bad.append(f"job.{k}={j.get(k)}")
+del_tasks = [t for t in tasks if t.get("action") == "BatchDeleteObject"]
+if len(del_tasks) != 1:
+    bad.append(f"BatchDeleteObject 任务数={len(del_tasks)}")
+else:
+    t = del_tasks[0]
+    if (t.get("state"), t.get("result_code")) != ("failed", "PermanentFailure"):
+        bad.append(f"task state={t.get('state')} code={t.get('result_code')}")
+    if t.get("attempt") != 3:
+        bad.append(f"task.attempt={t.get('attempt')}（默认 OSS_JOB_MAX_ATTEMPTS=3）")
+    if "remote" not in (t.get("result_string") or "").lower():
+        bad.append(f"result_string 非远端失败: {t.get('result_string')}")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+PY
+}
+# 轮询作业详情，直到唯一任务在指定 attempt 上排队（默认退避会把下次尝试推到 10~1009s 后）。
+batch_task_queued_at() { # base token job_id attempt timeout_secs
+  local deadline=$(( $(date +%s) + $5 )) sa
+  while :; do
+    curl -s --max-time 10 -o "$W/batch-job.json" "$1/api/v1/jobs/$3" -H "authorization: Bearer $2"
+    sa=$(python3 -c 'import json,sys
+try:
+    t=json.load(open(sys.argv[1]))["tasks"][0]
+    print(t.get("state"), t.get("attempt"))
+except Exception:
+    print("")' "$W/batch-job.json")
+    [ "$sa" = "queued $4" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && { echo "  任务未在 ${5}s 内于 attempt=$4 排队（实为 ${sa:-?}）"; return 1; }
+    sleep 1
+  done
+}
+# 退避抖动是 now%1000 秒（now 为 Unix 秒），默认等待可达 ~17min；把排队任务的 next_at
+# 拨到当前只压缩测试等待，不改 attempt 上限/进程超时预算。
+batch_task_retry_now() { # 详情文件 db_path job_id attempt
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sqlite3, sys, time
+d = json.load(open(sys.argv[1]))
+t = d["tasks"][0]
+want = int(sys.argv[4])
+if (d["job"]["id"], t.get("state"), t.get("attempt")) != (int(sys.argv[3]), "queued", want):
+    print(f"状态不符：job={d['job']['id']} task={t.get('state')}/{t.get('attempt')}"); sys.exit(1)
+c = sqlite3.connect(sys.argv[2], timeout=30)
+n = c.execute(
+    "UPDATE job_tasks SET next_at = ? WHERE job_id = ? AND task_no = ? AND state = 'queued' "
+    "AND attempt = ?", (int(time.time()), int(sys.argv[3]), t["task_no"], want)).rowcount
+c.commit()
+if n != 1:
+    print(f"next_at 未更新（rows={n}）"); sys.exit(1)
+PY
+}
 shards_at() { find "$1"/d* -type f -name 'part.*' -path "*/$2/$3/*" 2>/dev/null | wc -l | tr -d ' '; }
 meta_at() { find "$1"/d* -type f -name 'xl.meta' -path "*/$2/$3/xl.meta" 2>/dev/null | wc -l | tr -d ' '; }
 # fsck 报告断言（字段见 xl-store FsckReport）。repair 轮允许孤儿/stray（本轮已修），但
@@ -387,6 +456,15 @@ b_meta_ok() { # bucket key：远端 storage_class/tags
 b_mpu_size() { [ "$(aws_b s3api head-object --bucket "$1" --key "$2" --query ContentLength --output text 2>/dev/null)" = 1048576 ]; }
 b_get_eq() { aws_b s3 cp "s3://$1/$2" "$W/$3" >/dev/null 2>&1 && cmp -s "$W/$4" "$W/$3"; }
 a_get_eq() { aws_a s3 cp "s3://$1/$2" "$W/$3" >/dev/null 2>&1 && cmp -s "$W/$4" "$W/$3"; }
+# sync 删除失败后本地必须原样：恰 1 个 version、0 个 delete marker（无半删/歧义态）。
+# aws_fn 为 aws_a/aws_b；DeleteMarkers 缺失时 JMESPath length 不可靠，用 JSON 判空。
+only_one_version_no_marker() { # aws_fn bucket key
+  "$1" s3api list-object-versions --bucket "$2" --prefix "$3" --output json 2>/dev/null |
+  python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+sys.exit(0 if len(d.get("Versions") or [])==1 and not (d.get("DeleteMarkers") or []) else 1)'
+}
 
 echo "== 1. 启动 A/B（[site]+[raft]，模式 $MODE）→ health → /api/v1/raft/status =="
 mk_cfg a "$A_HTTP" "$REG_A" "$TOK_A" 1 true
@@ -621,6 +699,51 @@ except Exception: print("")' "$W/batch-create.json")
   if [ -n "$BMK_A" ] && [ "$BMK_A" != None ] && [ "$BMK_A" = "$BMK_B" ]; then
     pass "Batch Delete 走 sync 远端先删（marker 同 id 两端一致）"
   else fail "Batch Delete marker 未两端同 id（A=$BMK_A B=$BMK_B）"; fi
+  # S9b：B 停机期间 Batch Delete 的失败收敛。用 kill -9 而非 SIGSTOP——连接立即被拒，
+  # 每次尝试不叠加 sync.timeout_ms/remote HEAD 超时。清单写 A：B 停后 A 是唯一可选
+  # leader，worker 只读本机清单。默认退避抖动按秒（now%1000）可达 ~17min，故三次真实
+  # 尝试之间把 next_at 拨到当前压缩等待。
+  echo "  -- S9b：kill B → Batch Delete 远端失败重试耗尽 → job error，本地不半删 --"
+  printf 'keep-me\n' > "$W/keep.bin"
+  ck_q aws_a s3api put-object --bucket "$SB" --key fail-del.bin --body "$W/keep.bin"
+  ck retry 60 b_head "$SB" fail-del.bin
+  printf '%s,%s\n' "$SB" fail-del.bin > "$W/batch-fail.csv"
+  ck_q aws_a s3api put-object --bucket "$BK_A" --key "batch/manifest-fail-$STAMP.csv" --body "$W/batch-fail.csv"
+  kill9 "$B_PID"; B_PID=""
+  LB=""
+  for _ in $(seq 1 30); do LB=$(leader_base || true); [ -n "$LB" ] && break; sleep 1; done
+  if [ -z "$LB" ]; then
+    fail "B 停机后 A 未当选 Raft leader，无法创建失败收敛作业"
+  else
+    code=$(curl -s -o "$W/batch-fail-job.json" -w '%{http_code}' --max-time 10 -X POST "$LB/api/v1/jobs" \
+      -H "authorization: Bearer $AT" -H 'content-type: application/json' \
+      -d "{\"kind\":\"batch\",\"manifest_bucket\":\"$BK_A\",\"manifest_key\":\"batch/manifest-fail-$STAMP.csv\",\"operation\":\"DeleteObject\"}")
+    ck [ "$code" = 201 ]
+    FJID=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["job_id"])
+except Exception: print("")' "$W/batch-fail-job.json")
+    if [ -n "$FJID" ]; then
+      # 3 次尝试都由真实 worker 执行、B 全程不可达；仅在两次之间把 next_at 拨到当前，
+      # 压缩默认退避的秒级抖动等待（见文件头 S9b 说明）。
+      FDB=$W/a/oss.db; [ "$LB" = "$A" ] || FDB=$W/b/oss.db
+      ck batch_task_queued_at "$LB" "$AT" "$FJID" 1 30
+      ck batch_task_retry_now "$W/batch-job.json" "$FDB" "$FJID" 1
+      ck batch_task_queued_at "$LB" "$AT" "$FJID" 2 30
+      ck batch_task_retry_now "$W/batch-job.json" "$FDB" "$FJID" 2
+      ck batch_job_wait "$LB" "$AT" "$FJID" 60
+      ck batch_job_failed "$W/batch-job.json"
+    else
+      fail "失败收敛作业无 job_id：$(head -c 200 "$W/batch-fail-job.json")"
+    fi
+    ck a_head "$SB" fail-del.bin
+    ck only_one_version_no_marker aws_a "$SB" fail-del.bin
+  fi
+  if start_b; then
+    ck retry 60 b_head "$SB" fail-del.bin
+    ck only_one_version_no_marker aws_b "$SB" fail-del.bin
+  else
+    fail "B 重启未就绪（失败收敛窗口后）"; tail -8 "$W/b/server.log"
+  fi
   # P2-6：console 桶删除在非空 sync 桶上 → 409（双站 quiesce 后查空失败并回滚），本地桶仍在
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X DELETE "$A/api/v1/buckets/$SB" -H "authorization: Bearer $AT")
   ck [ "$code" = 409 ]
