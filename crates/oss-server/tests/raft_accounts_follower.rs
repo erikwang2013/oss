@@ -262,7 +262,11 @@ async fn lagging_follower_catch_up_covers_member_attach_and_role_checks() {
     ));
     let base = serve(oss_server::router::build_router(st).unwrap()).await;
 
-    let http = reqwest::Client::new();
+    // 全量套件高并发下这个用例曾挂死；给客户端设上限，避免无限等待掩盖真实失败。
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
     let req = {
         let http = http.clone();
         let url = format!("{base}/api/v1/accounts/{ACC}/members");
