@@ -93,6 +93,49 @@ pub(crate) fn job_task_row_from(r: &sqlx::sqlite::SqliteRow) -> JobTaskRow {
     }
 }
 
+/// 整行 → [`InventoryRunRow`]（同上）。
+pub(crate) fn inventory_run_row_from(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
+    InventoryRunRow {
+        id: r.get("id"),
+        bucket: r.get("bucket"),
+        config_id: r.get("config_id"),
+        run_key: r.get("run_key"),
+        started_at: r.get("started_at"),
+        state: r.get("state"),
+        job_id: r.get("job_id"),
+        manifest_key: r.get("manifest_key"),
+        error: r.get("error"),
+        created_at: r.get("created_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }
+}
+
+/// 整行 → [`InventoryCursorRow`]（同上）。
+pub(crate) fn inventory_cursor_row_from(r: &sqlx::sqlite::SqliteRow) -> InventoryCursorRow {
+    InventoryCursorRow {
+        bucket: r.get("bucket"),
+        config_id: r.get("config_id"),
+        cursor: r.get("cursor"),
+        config_updated_at: r.get("config_updated_at"),
+        updated_at: r.get("updated_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }
+}
+
+/// 整行 → [`InventoryIncrementalRow`]（`enabled` SQLite 0/1 → bool）。
+pub(crate) fn inventory_incremental_row_from(
+    r: &sqlx::sqlite::SqliteRow,
+) -> InventoryIncrementalRow {
+    InventoryIncrementalRow {
+        bucket: r.get("bucket"),
+        config_id: r.get("config_id"),
+        enabled: r.get::<i64, _>("enabled") != 0,
+        updated_at: r.get("updated_at"),
+    }
+}
+
 /// 调用方事务/连接内读取九表（行序 = 主键序，checksum 确定性来源）。
 pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, DataError> {
     let mut state = RunState::default();
@@ -130,20 +173,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.inventory_runs.push(InventoryRunRow {
-            id: r.get("id"),
-            bucket: r.get("bucket"),
-            config_id: r.get("config_id"),
-            run_key: r.get("run_key"),
-            started_at: r.get("started_at"),
-            state: r.get("state"),
-            job_id: r.get("job_id"),
-            manifest_key: r.get("manifest_key"),
-            error: r.get("error"),
-            created_at: r.get("created_at"),
-            fence_term: r.get("fence_term"),
-            fence_leader: r.get("fence_leader"),
-        });
+        state.inventory_runs.push(inventory_run_row_from(&r));
     }
 
     for r in sqlx::query(
@@ -154,15 +184,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.inventory_cursors.push(InventoryCursorRow {
-            bucket: r.get("bucket"),
-            config_id: r.get("config_id"),
-            cursor: r.get("cursor"),
-            config_updated_at: r.get("config_updated_at"),
-            updated_at: r.get("updated_at"),
-            fence_term: r.get("fence_term"),
-            fence_leader: r.get("fence_leader"),
-        });
+        state.inventory_cursors.push(inventory_cursor_row_from(&r));
     }
 
     for r in sqlx::query(
@@ -173,12 +195,9 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.inventory_incremental.push(InventoryIncrementalRow {
-            bucket: r.get("bucket"),
-            config_id: r.get("config_id"),
-            enabled: r.get::<i64, _>("enabled") != 0,
-            updated_at: r.get("updated_at"),
-        });
+        state
+            .inventory_incremental
+            .push(inventory_incremental_row_from(&r));
     }
 
     for r in sqlx::query(

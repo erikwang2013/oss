@@ -173,16 +173,12 @@ async fn list(
             let source_account = state.db.bucket_account(&bucket).await.ok();
             let mut views = Vec::with_capacity(list.len());
             for c in &list {
-                // M5：增量开关/水位是节点本地表，Raft 多节点下不可用，统一报 false。
-                let incremental = if state.control.is_raft() {
-                    false
-                } else {
-                    state
-                        .db
-                        .inventory_incremental_get(&bucket, &c.id)
-                        .await
-                        .unwrap_or(false)
-                };
+                // feature 5 起开关/水位随 Raft 复制；低级别仍是节点本地行（读本地即可）。
+                let incremental = state
+                    .db
+                    .inventory_incremental_get(&bucket, &c.id)
+                    .await
+                    .unwrap_or(false);
                 views.push(ConfigView::new(c, incremental, source_account.clone()));
             }
             Json(views).into_response()
@@ -210,31 +206,44 @@ async fn upsert(
         ak: String::new(),
     };
     let incremental = body.incremental;
-    // M5：模式/水位是本地表，各节点各写各的会让同一配置交替全量/增量；Raft 下直接拒绝。
-    if incremental && state.control.is_raft() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "incremental 仅支持单节点（非 Raft）部署",
-        )
-            .into_response();
-    }
     let id = body.id.clone();
+    // 复制模式下开关只能由 leader 生成；先预检，避免配置已提交而开关失败（P2-1）。
+    if incremental && let Err(e) = state.jobs.inventory_incremental_preflight().await {
+        let status = if e.contains("not leader") {
+            StatusCode::CONFLICT
+        } else if e.contains("feature") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return (status, e).into_response();
+    }
     match state
         .inventory
         .put_config(&bucket, &owner, &body.into_config())
         .await
     {
+        // InventoryPut apply 已复位游标与开关；incremental=false 无需再写。
+        Ok(()) if !incremental => StatusCode::NO_CONTENT.into_response(),
         Ok(()) => {
-            // put_config 会复位增量模式；console 请求随后按请求值重新开启。
+            // put_config 复位后，console 请求按请求值重新开启。
             match state
-                .db
-                .inventory_incremental_set(&bucket, &id, incremental, crate::db::now())
+                .jobs
+                .inventory_incremental_set(&state.db, &bucket, &id, true, crate::db::now())
                 .await
             {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
                 Err(e) => {
-                    tracing::error!(error = %e, "inventory 增量模式写入失败");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+                    tracing::error!(error = %e, "inventory 增量模式写入失败，回滚开关");
+                    let _ = state
+                        .jobs
+                        .inventory_incremental_set(&state.db, &bucket, &id, false, crate::db::now())
+                        .await;
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "config saved but incremental mode failed; retry the update",
+                    )
+                        .into_response()
                 }
             }
         }

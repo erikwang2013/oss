@@ -318,6 +318,10 @@ impl AppState {
             crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
                 .await
                 .map_err(|e| format!("[raft] 运行态激活守卫：{e}"))?;
+            // v1.23.0 的 feature-4 inventory 行是节点本地行，且有独立的 level-5 marker。
+            crate::raft::compat::guard_inventory_activation(db.pool(), settings.feature_level)
+                .await
+                .map_err(|e| format!("[raft] inventory 激活守卫：{e}"))?;
         }
         // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
         // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；

@@ -5,8 +5,9 @@
   **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
   **v1.19.0**（2026-10-26，Wave1 地基）
 - 最新发布：**v1.23.0**（2026-10-30），tag `v1.23.0`；包含 §18（M8-2 jobs/Restore 受理行
-  feature-4 复制、桶配额并发、follower 权限追赶、tier-audit、升级 preflight、单机→集群
-  re-ingest、LC-4 回滚矩阵、Level C v1.20.1 窗口验证）与 §16–§17 的 v1.21.x 内容
+  与 inventory 运行态 feature-4 复制、桶配额并发、follower 权限追赶、tier-audit、升级
+  preflight、单机→集群 re-ingest、LC-4 回滚矩阵、Level C v1.20.1 窗口验证）与 §16–§17
+  的 v1.21.x 内容
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
   v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
   v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）
@@ -529,9 +530,10 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 
 - **硬字节/对象数配额**：无跨节点复制账本与数据面 reservation，正确的 hard 语义不可实现；
   保持非目标 + 文档（`docs/superpowers/specs/2026-10-24-architecture-backlog.md` §1）。
-- **M8-2 运行态实时复制**：jobs/job_tasks 与 Restore 受理行已在 feature 4 交付；完整目标
-  仍需 3–4 人周（inventory/lifecycle 运行态与 lease 接管）。启用 feature 4 要求全集群
-  升级并移除/升级 v1.22 及更早节点；v1.20.1 Level C 窗口不含 feature 4。
+- **M8-2 运行态实时复制**：jobs/job_tasks 与 Restore 受理行在 feature 4、inventory
+  运行态在 feature 5 交付；剩余 lifecycle 运行态与 lease 接管约 2–3 人周。启用
+  feature 4 要求全集群升级并移除/升级 v1.22 及更早节点；feature 5 还必须移除/升级
+  **v1.23.0**（advertise 4 但不认识 Inventory*）；v1.20.1 Level C 窗口不含 feature 4/5。
 - **真实 PrivateLink 身份**：需 AWS DescribeVpcEndpoints/ENI 关联或 mTLS 证书 plumbing；
   Slice A 只是注册断言。
 - **tier 分块表独立签名、跨进程预留**：保持非目标（预留是协作 tier 写者的 advisory 约束，
@@ -558,13 +560,48 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 | 升级前置检查 | `scripts/upgrade-preflight.sh` | 裸 UUID MPU / M6 无 site_token（`[[remotes]]`）/ M7 未映射 REPLICA；67/67 自检 |
 | 单机→集群重新灌入 | `scripts/single-to-cluster.sh` | rclone 单向、版本化/开锁桶 fail-closed；16/16 自检 + 两个真实端点复制/重跑/--delete |
 | 桶配额并发 | leader append 前判定 + standalone `BEGIN IMMEDIATE` | 不新增 `ControlResponse` 变体，混版不分叉；quota=2 并发恰 2 成功 1×403 |
-| 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 完整目标需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level ≥5（4 已用于 M8-2 jobs 复制） |
+| 硬字节/对象配额、M8-2、真实 PrivateLink | 决策稿 `/tmp/oss-wave6-big3.md` | 本波**不实现**：hard 需复制账本（3–5 人周）；M8-2 完整目标需 3–4 人周；真实身份需 AWS/mTLS；Slice B 需 feature level ≥6（4=jobs、5=inventory 已占用） |
 | M8-2 jobs/tier_restores 复制切片 | 2026-10-29 后续波：`JobBatch`/`JobUpsert`/`JobTaskUpsert` + `compat.rs` | **feature level 4**（`MAX_FEATURE_LEVEL=4`）：全 peer ≥4 才复制；v1.22 及更早节点 advertise 3 → leader 生效=3，Job* 在 append 被拒。启用前全集群升级/移除旧节点并显式配置 4；**v1.20.1 Level C 窗口（feature ≤3）不包含 feature 4**；快照仍为 OSSCTL3 `m8.runstate` |
 | M8-2 激活边界（round5） | `compat.rs` 启动守卫/标记、`store.rs` 快照安装、`cutover`/`force_recover` 种子、`apply.rs` restore 预检 | `m8_runstate_activated` 只由 level-4 快照安装、cutover/force-recover 显式种子、已 apply 的 level-4 命令置位；配置 4 节点拒绝安装带运行态行的 level-3 快照；可接受的 level-3 安装会撤销 marker；空表启动不写标记；四表非空或 inventory/tier `job_id` 悬空 → 配置 4 启动 fail-closed（文案含清理/导出重灌指引，清理后放行）；配置 4 且 effective<4 期间 JobState fail-closed，配置 ≤3 仍本地写（清理后到最后一次 feature-4 重启前需停止提交作业）。测试：`raft_runstate_snapshot` 11/11、`raft_jobs_activation` 3/3（含悬空引用回归）、`raft_cutover` 7/7、`raft_jobs_replication` 11/11（含 restore 孤儿） |
+| M8-2 inventory 运行态复制切片（v1.23.0 原实现，remediation 见 §18.1） | `InventoryBatch`/`InventoryClear`、`job_state/inventory.rs`、`raft/apply/inventory.rs` | **feature level 4**：`inventory_runs`/`inventory_cursors`/`inventory_incremental` 整行日志复制；run 终态冻结、游标/增量水位单调、整批只读预检 Conflict 零写入、`rows_affected==1`；run 引用与 id 分配在 leader append 前完成；worker/API 状态写入走 `JobState` 门面，follower 读改写 fail-closed（删除转发）；feature≤3 保持本地直写，Inventory* 在 append 前被拒。测试：`raft_inventory_replication` 6/6（3-voter 收敛、leader 死亡后同 run 继续、整批零写入、feature 3 本地、follower 拒绝、24 MiB 上限）；`raft_command_contract` 新增 2 变体 fixture |
 
 **评审残余（不阻塞）**：cutover/force-recover 以 level-3 种子会写 marker；目标若先以 feature 3
 运行并产生本地作业再升 4，启动守卫会放行（要求目标直接以 feature 4 启动，或重灌）；
 `clear_runstate_activated_tx` 无测试调用点；四表清理会一并要求删除 `job_id` 为 NULL 的行。
 
-**验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server` 全量
-**68 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。
+### 18.1 2026-10-30 M8-2 inventory remediation（feature 5）
+
+独立评审否决 v1.23.0 的 feature-4 inventory 切片：v1.23.0（及更早）advertise ≤4，
+不认识 `InventoryBatch`/`InventoryClear`，level 4 无法阻止旧解码器收到这些变体。本实验
+分支修正如下（不改已发布 tag）：
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| feature 5 门控 | `compat.rs` `FEATURE_LEVEL_5=5`/`MAX_FEATURE_LEVEL=5`、`command.rs` | Inventory* 的 `min_feature_level=5`，仅当全部 peer advertised ≥5 时复制；v1.23.0/更早节点 advertise ≤4 → effective ≤4，append 前拒绝。3/4 语义不变，Job* 仍为 4 |
+| level-5 独立激活标记 | `compat.rs` `m8_inventory_activated`、`state.rs` 启动守卫、`store.rs` apply/快照、`cutover`/`recover` | 只由 level-5 事实置位：level-5 快照安装、activation≥5 显式种子、已 apply 的 level-5 命令。配置 5 首次激活要求 inventory 三表全空、无重复 `(bucket,config_id,run_key)`、`next_run_id` 大于最大 run id（无行时 max=0），否则 fail-closed 并给出排空/导出重灌指引；不复用/短路 `m8_runstate_activated`（v1.23.0 的 Job* 已置 1） |
+| v1.23.0 升级路径 | `raft_jobs_activation` | feature-4 + runstate marker=1 + 本地 inventory_runs → 配置 5 启动被拒（文案含 `m8_inventory_activated`/`inventory_runs=1`/`feature_level<5`）；清空三表并删除 `next_run_id` 后启动，首条 level-5 apply 置 marker，重启放行；marker 5 不能用配置 4 启动 |
+| 快照矩阵 | `raft_runstate_snapshot` | level-5 快照安装写 inventory marker；配置 5 拒绝带 inventory 行的 level-4 快照；配置 4 拒绝带 inventory_cursors/incremental 的 level-3 快照（P2-3），均零写入 |
+| 桶删除一致性 | `db::delete_bucket_cascade`、`apply`、移除 `control.rs` 本地直删 | 桶删除只经 apply 的同一日志/事务级联删除 inventory_runs（及 tier_restores 等）；follower 转发的删除在各副本一致；同 `run_key` 重建不复用 id（apply 推进 `next_run_id`）；在途 run 不残留；feature 4 各节点本地 inventory 行也由同一 apply 级联清掉 |
+| API/本地写边界 | `inventory_api.rs`、`job_state/inventory.rs` | `put_config + incremental_set` 在 effective<5 时由 `inventory_incremental_preflight` 提前拒绝，避免 config 已存而开关失败；失败回滚 best-effort。配置 3/4 且 effective<4/5 时不再本地直写，incremental 切换明确拒绝 |
+| 其他 P3 | `raft/apply/inventory.rs`、`job_state.rs` | 整批自然键重复在零写入前返回 Conflict；apply 推进 `runstate_meta.next_run_id`；leader 门控统一经 `leader_ready_for`（2s 追赶）。`InventoryClear` 与本地 `cursor_set(None)` 语义差异写入代码注释：前者清 cursor+incremental，后者仅清 cursor，无生产调用方 |
+| config 删除/孤儿行 | `InventoryDelete` apply、`raft_inventory_replication` | config 删除只清 cursor/incremental，历史 run 行保留为孤儿，直到桶删除回收；孤儿行不阻塞新 run，文档化 |
+| 混版/转发测试 | `raft_inventory_replication` | 对端 advertise 4 时 effective=4、Inventory* 被拒且日志无条目；follower 转发桶删除两端一致（feature 4/5）；follower 转发 Clear、拒绝 incremental upsert；旧 term 重放零写入；批内重复自然键零写 Conflict；config 删除孤儿 run 保留到桶删除 |
+
+**v1.23.0 → feature 5 升级步骤**：停止提交 inventory 作业并等 run 进入终态 → 备份控制库
+→ 将全集群（含所有 voter/learner）换到含 level-5 的二进制，确认无 v1.23.0 及更早节点
+→ 处理各节点本地 inventory 行：清空 `inventory_runs`/`inventory_cursors`/
+`inventory_incremental` 并删除 `runstate_meta.next_run_id`（保留数据则先 `raft-export`
+再在新集群 `raft-cutover`/`force-recover` 以 activation 5 重灌）→ 显式配置
+`[raft].feature_level=5` 逐节点重启；守卫失败时按报错中的排空/导出指引处理。
+
+**验证**（本分支，`/tmp/oss-target-m8inv`）：`oss-server --lib` 228/0（含 compat
+守卫单测）；`raft_inventory_replication` 12/0；`raft_jobs_activation` 4/0；
+`raft_runstate_snapshot` 14/0；`raft_command_contract` 3/0（1 ignored）；
+`raft_jobs_replication` 11/0；`raft_handshake` 2/0；`raft_guard` 3/0；
+`raft_runstate` 8/0；`raft_runstate_followups` 6/0；`raft_cutover` 7/0；
+`raft_cutover_provenance` 6/0；`raft_commands` 16/0；`m8_inventory` 23/0；
+`m8_inventory_parquet` 4/0；`jobs_engine` 15/0。fmt/clippy `-D warnings` 0；
+完整 `oss-server` 全量未在本分支运行。
+
+**原 v1.23.0 验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server`
+全量 **68 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。

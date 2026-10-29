@@ -391,6 +391,16 @@ pub async fn cutover(
         super::compat::mark_runstate_activated_tx(&mut tx)
             .await
             .map_err(|e| CutoverError::Db(e.to_string()))?;
+        // inventory 只在来源激活级别 >=5 时才是复制日志事实；3/4 撤销旧 marker。
+        if activation >= super::compat::FEATURE_LEVEL_5 {
+            super::compat::mark_inventory_activated_tx(&mut tx)
+                .await
+                .map_err(|e| CutoverError::Db(e.to_string()))?;
+        } else {
+            super::compat::clear_inventory_activated_tx(&mut tx)
+                .await
+                .map_err(|e| CutoverError::Db(e.to_string()))?;
+        }
     }
     // 来源激活级别与数据同事务写入（只升不降）；启动守卫要求 feature_level>=该级别。
     if activation > super::compat::MIN_FEATURE_LEVEL {

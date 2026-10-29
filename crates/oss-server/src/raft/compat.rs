@@ -26,14 +26,18 @@ pub const FEATURE_LEVEL_3: u8 = 3;
 /// 全集群升级并显式配置 4 后才启用。旧二进制（`deny_unknown_fields`）无法解码 Job*，
 /// 绝不能让它们收到这些 entry。
 pub const FEATURE_LEVEL_4: u8 = 4;
+/// feature 5：M8-2 inventory 运行态复制（Inventory* 命令）。**v1.23.0 已 advertise 4
+/// 但不认识 Inventory***；level 4 挡不住它，因此必须新开 level 5。v1.23.0 及更早
+/// advertise ≤4 → effective ≤4 → Inventory* 在 append 前被拒。
+pub const FEATURE_LEVEL_5: u8 = 5;
 /// Level C M1 的命令演进容器（`ControlCommand::Ext`）所需级别。该级别只表示
 /// “能解码/应用 Ext 容器”，不表示认识任何 `type_id`；注册新类型必须提升 feature
 /// level 或先完成 per-peer 类型能力协商（见 `command::REGISTERED_EXT_TYPES`）。
 pub const FEATURE_COMMAND_EXT: u8 = FEATURE_LEVEL_3;
-/// OSSCTL2/3 命令与快照语义的别名（保持 level 3 不变；M8-2 复制另立 level 4）。
+/// OSSCTL2/3 命令与快照语义的别名（保持 level 3 不变；M8-2 复制另立 level 4/5）。
 pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
 /// 本二进制支持的最高 feature level。
-pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_4;
+pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_5;
 /// 缺省/旧节点的 feature level。
 pub const MIN_FEATURE_LEVEL: u8 = 1;
 
@@ -44,6 +48,10 @@ pub const META_FEATURE_LEVEL: &str = "raft_feature_level";
 /// 运行态激活标记：本机运行态来自 level-4 日志/快照或显式 cutover 种子（节点本地）。
 /// 普通 level-3 快照安装与空表启动**不得**置位；level-3 快照携带的是构建者本地行。
 pub const META_RUNSTATE_ACTIVATED: &str = "m8_runstate_activated";
+/// inventory 运行态激活标记（独立于 jobs 的 level-4 标记）：只由 level-5 事实置位。
+/// v1.23.0 feature-4 的 inventory 行是节点本地行，且 Job* 会置位 level-4 marker，
+/// 因此绝不能复用/短路 `META_RUNSTATE_ACTIVATED`。
+pub const META_INVENTORY_ACTIVATED: &str = "m8_inventory_activated";
 
 /// 本二进制能否应用某个 feature level（未知更高 level 一律 false）。
 pub fn supports(level: u8) -> bool {
@@ -145,6 +153,32 @@ pub async fn clear_runstate_activated_tx(
     Ok(())
 }
 
+/// inventory 运行态激活标记：只由 level-5 快照安装、cutover/force_recover 显式种子或
+/// 已 apply 的 level-5 命令写入。与 `META_RUNSTATE_ACTIVATED` 完全独立。
+pub async fn mark_inventory_activated_tx(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES (?, '1') \
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+    )
+    .bind(META_INVENTORY_ACTIVATED)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// 低于 level-5 的快照/激活级别会整表替换 inventory 运行态；撤销标记。
+pub async fn clear_inventory_activated_tx(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+        .bind(META_INVENTORY_ACTIVATED)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// P1-A 激活边界：feature 4（M8-2 运行态复制）要求本地运行态为空或已有 level-4 事实。
 ///
 /// level 2/3 的 jobs/job_tasks 是各节点本地行，从未进入日志；level-3 快照只是构建者
@@ -175,10 +209,17 @@ pub async fn guard_runstate_activation(
             ));
         }
     }
-    let mut counts = [0i64; 4];
-    for (i, table) in ["jobs", "job_tasks", "inventory_runs", "tier_restores"]
-        .into_iter()
-        .enumerate()
+    let mut counts = [0i64; 6];
+    for (i, table) in [
+        "jobs",
+        "job_tasks",
+        "inventory_runs",
+        "inventory_cursors",
+        "inventory_incremental",
+        "tier_restores",
+    ]
+    .into_iter()
+    .enumerate()
     {
         counts[i] =
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
@@ -186,7 +227,7 @@ pub async fn guard_runstate_activation(
                 .await
                 .map_err(|e| format!("统计 {table} 失败: {e}"))?;
     }
-    let [jobs, tasks, runs, restores] = counts;
+    let [jobs, tasks, runs, cursors, incrementals, restores] = counts;
     let inv_dangling: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inventory_runs WHERE job_id IS NOT NULL \
          AND job_id NOT IN (SELECT id FROM jobs)",
@@ -204,6 +245,8 @@ pub async fn guard_runstate_activation(
     if jobs == 0
         && tasks == 0
         && runs == 0
+        && cursors == 0
+        && incrementals == 0
         && restores == 0
         && inv_dangling == 0
         && tier_dangling == 0
@@ -213,15 +256,102 @@ pub async fn guard_runstate_activation(
     Err(format!(
         "[raft].feature_level={configured} 要求 feature 4 运行态已激活，但未见 \
          schema_meta.{META_RUNSTATE_ACTIVATED} 且本地运行态含非日志行：jobs={jobs}、\
-         job_tasks={tasks}、inventory_runs={runs}、tier_restores={restores}；\
+         job_tasks={tasks}、inventory_runs={runs}、inventory_cursors={cursors}、\
+         inventory_incremental={incrementals}、tier_restores={restores}；\
          悬空引用：inventory_runs.job_id={inv_dangling}、tier_restores.job_id={tier_dangling}。\
          level-2/3 的本地行与 level-3 快照拷贝都不是复制日志事实，直接激活会静默丢作业、\
          产生 ID 冲突，或让快照安装因悬空引用失败。运维步骤：保持 feature_level<4 启动，\
          等待所有作业进入终态并完成/导出；备份控制库后清空 jobs、job_tasks、inventory_runs、\
-         tier_restores（悬空引用随行删除；若要保留 inventory/tier 行，只能改用导出重灌，\
-         本守卫要求四表为空且无悬空引用），确认后以 feature_level>=4 重启；或用 \
-         raft-export 备份后在新集群 raft-cutover/force-recover 重灌（显式种子会写激活\
-         标记）。本二进制不迁移旧本地运行态。"
+         inventory_cursors、inventory_incremental、tier_restores（悬空引用随行删除；若要保留\
+         inventory/tier 行，只能改用导出重灌，本守卫要求六表为空且无悬空引用），确认后以 \
+         feature_level>=4 重启；或用 raft-export 备份后在新集群 raft-cutover/force-recover \
+         重灌（显式种子会写激活标记）。本二进制不迁移旧本地运行态。"
+    ))
+}
+
+/// P1-B 激活边界：feature 5（inventory 运行态复制）要求本地三张 inventory 表为空，
+/// 且 `runstate_meta.next_run_id`/自然键与剩余行一致。
+///
+/// v1.23.0 在 feature 4 下仍把 inventory 写在各节点本地，而 Job* 已把 jobs 的
+/// level-4 标记置位；因此本守卫使用**独立**的 `META_INVENTORY_ACTIVATED`，绝不能
+/// 复用或短路 `META_RUNSTATE_ACTIVATED`。marker 缺失时若有本地行，直接复制会静默
+/// 去重、撞 id/自然键或按副本分叉；必须清空或导出重灌。空表启动不写 marker（effective
+/// 可能仍是 4，需等 level-5 命令/快照或显式 cutover 种子）。
+pub async fn guard_inventory_activation(
+    pool: &sqlx::SqlitePool,
+    configured: u8,
+) -> Result<(), String> {
+    if advertised_feature(configured) < FEATURE_LEVEL_5 {
+        return Ok(());
+    }
+    let activated: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+            .bind(META_INVENTORY_ACTIVATED)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("读取 schema_meta.{META_INVENTORY_ACTIVATED} 失败: {e}"))?;
+    match activated.as_deref() {
+        Some("1") => return Ok(()),
+        None => {}
+        Some(other) => {
+            return Err(format!(
+                "schema_meta.{META_INVENTORY_ACTIVATED}={other:?} 非法（只认 \"1\"）"
+            ));
+        }
+    }
+    let mut counts = [0i64; 3];
+    for (i, table) in [
+        "inventory_runs",
+        "inventory_cursors",
+        "inventory_incremental",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        counts[i] =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("统计 {table} 失败: {e}"))?;
+    }
+    let [runs, cursors, incrementals] = counts;
+    let duplicate_keys: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM inventory_runs \
+         GROUP BY bucket, config_id, run_key HAVING COUNT(*) > 1)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("统计 inventory_runs 重复自然键失败: {e}"))?;
+    let next_run_id: Option<i64> =
+        sqlx::query_scalar("SELECT value FROM runstate_meta WHERE key = 'next_run_id'")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("读取 runstate_meta.next_run_id 失败: {e}"))?;
+    let max_run_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM inventory_runs")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("读取 inventory_runs 最大 id 失败: {e}"))?;
+    let next_ok = match next_run_id {
+        None => max_run_id == 0,
+        Some(next) => next > max_run_id,
+    };
+    if runs == 0 && cursors == 0 && incrementals == 0 && duplicate_keys == 0 && next_ok {
+        return Ok(());
+    }
+    Err(format!(
+        "[raft].feature_level={configured} 要求 feature 5 inventory 运行态已激活，但未见 \
+         schema_meta.{META_INVENTORY_ACTIVATED} 且本地 inventory 表含非日志行/不一致：\
+         inventory_runs={runs}、inventory_cursors={cursors}、\
+         inventory_incremental={incrementals}、重复 (bucket,config_id,run_key)={duplicate_keys}、\
+         next_run_id={next_run_id:?}（须 > MAX(id)={max_run_id}）。v1.23.0 feature-4 的 \
+         inventory 行是各节点本地行，不是复制日志事实；直接以 feature 5 启动会静默去重、\
+         撞 id 或按副本分叉。运维步骤：保持 feature_level<5（或退回 v1.23.0）启动，等待\
+         在途 inventory run 结束；备份控制库后导出 inventory 配置/运行历史并清空 \
+         inventory_runs、inventory_cursors、inventory_incremental，删除 \
+         runstate_meta.next_run_id，确认后以 feature_level>=5 重启并由调度重新入队；\
+         或用 raft-export 备份后在新集群 raft-cutover/force-recover 重灌。\
+         注意 jobs 的 schema_meta.{META_RUNSTATE_ACTIVATED} 不作数：它由 level-4 Job* 置位。\
+         本二进制不迁移旧本地 inventory 运行态。"
     ))
 }
 
@@ -373,12 +503,17 @@ mod tests {
         assert_eq!(FEATURE_LEVEL_3, 3);
         assert_eq!(FEATURE_COMMAND_EXT, 3);
         assert_eq!(FEATURE_COMMAND_EXT, FEATURE_LEVEL_3);
-        assert_eq!(FEATURE_LEVEL_4, 4, "M8-2 复制是新 level，不得复用 3");
-        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_4);
+        assert_eq!(FEATURE_LEVEL_4, 4, "M8-2 jobs 复制是新 level，不得复用 3");
+        assert_eq!(
+            FEATURE_LEVEL_5, 5,
+            "v1.23.0 已 advertise 4 且不认识 Inventory*，必须新开 5"
+        );
+        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_5);
         assert!(supports(1));
         assert!(supports(FEATURE_STRUCTURED_LIFECYCLE));
         assert!(supports(FEATURE_COMMAND_EXT));
         assert!(supports(FEATURE_LEVEL_4));
+        assert!(supports(FEATURE_LEVEL_5));
         assert!(!supports(MAX_FEATURE_LEVEL + 1));
     }
 
@@ -447,10 +582,14 @@ mod tests {
         // feature 4 激活后：本二进制（max 4）显式配置 4 才放行。
         assert!(guard_startup(4, 4).is_ok());
         assert!(guard_startup(4, 3).is_err(), "配置低于 marker 必须拒绝");
-        assert!(guard_startup(5, 4).is_err(), "未知更高 marker 必须拒绝");
-        // v1.22（max 3）遇到 marker 4 必须拒绝启动，而不是降级运行。
+        assert!(guard_startup(5, 5).is_ok());
+        assert!(guard_startup(5, 4).is_err(), "配置低于 marker 必须拒绝");
+        assert!(guard_startup(6, 5).is_err(), "未知更高 marker 必须拒绝");
+        // v1.22（max 3）遇到 marker 4、v1.23.0（max 4）遇到 marker 5 必须拒绝。
         assert!(guard_startup_with_max(4, 4, 3).is_err());
         assert!(guard_startup_with_max(3, 3, 3).is_ok());
+        assert!(guard_startup_with_max(5, 5, 4).is_err());
+        assert!(guard_startup_with_max(4, 4, 4).is_ok());
     }
 
     #[tokio::test]
@@ -533,6 +672,124 @@ mod tests {
             .await
             .unwrap();
         assert!(guard_runstate_activation(db.pool(), 4).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn runstate_activation_guard_counts_inventory_cursors_and_incrementals() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_cursors (bucket, config_id, cursor, config_updated_at, updated_at) \
+             VALUES ('b', 'c', 'x', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let err = guard_runstate_activation(db.pool(), 4).await.unwrap_err();
+        assert!(
+            err.contains("inventory_cursors=1") && err.contains("inventory_incremental=0"),
+            "{err}"
+        );
+        sqlx::query("DELETE FROM inventory_cursors")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
+             VALUES ('b', 'c', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let err = guard_runstate_activation(db.pool(), 4).await.unwrap_err();
+        assert!(err.contains("inventory_incremental=1"), "{err}");
+        sqlx::query("DELETE FROM inventory_incremental")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(guard_runstate_activation(db.pool(), 4).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn inventory_activation_guard_is_independent_of_runstate_marker() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        // feature ≤4：inventory 仍是节点本地，不检查也不落标记。
+        for configured in [1, 2, 3, 4] {
+            assert!(
+                guard_inventory_activation(db.pool(), configured)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                db.schema_meta(META_INVENTORY_ACTIVATED).await.unwrap(),
+                None
+            );
+        }
+        sqlx::query(
+            "INSERT INTO inventory_runs \
+             (bucket, config_id, run_key, started_at, state, created_at) \
+             VALUES ('b', 'c', 'r', 1, 'done', 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // Job* 已置位的 level-4 marker 不能让 v1.23.0 的本地行绕过 level-5 守卫。
+        let mut conn = db.pool().acquire().await.unwrap();
+        mark_runstate_activated_tx(&mut conn).await.unwrap();
+        drop(conn);
+        let err = guard_inventory_activation(db.pool(), 5).await.unwrap_err();
+        assert!(
+            err.contains("inventory_runs=1") && err.contains("导出") && err.contains("next_run_id"),
+            "{err}"
+        );
+        // 显式 level-5 事实写 marker 后放行（重启不误拒）。
+        let mut conn = db.pool().acquire().await.unwrap();
+        mark_inventory_activated_tx(&mut conn).await.unwrap();
+        drop(conn);
+        assert!(guard_inventory_activation(db.pool(), 5).await.is_ok());
+        // marker 独立：撤销 inventory marker 不会碰 runstate marker，反之亦然。
+        let mut conn = db.pool().acquire().await.unwrap();
+        clear_inventory_activated_tx(&mut conn).await.unwrap();
+        drop(conn);
+        assert_eq!(
+            db.schema_meta(META_INVENTORY_ACTIVATED).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            db.schema_meta(META_RUNSTATE_ACTIVATED).await.unwrap(),
+            Some("1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_activation_guard_allows_empty_tables_and_checks_meta() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        assert!(guard_inventory_activation(db.pool(), 5).await.is_ok());
+        assert_eq!(
+            db.schema_meta(META_INVENTORY_ACTIVATED).await.unwrap(),
+            None
+        );
+        // 空表但 next_run_id 落后/非法仍 fail-closed，避免删除后复用 id。
+        sqlx::query("INSERT INTO runstate_meta (key, value) VALUES ('next_run_id', '0')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let err = guard_inventory_activation(db.pool(), 5).await.unwrap_err();
+        assert!(err.contains("next_run_id"), "{err}");
+        sqlx::query("UPDATE runstate_meta SET value = '1' WHERE key = 'next_run_id'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(guard_inventory_activation(db.pool(), 5).await.is_ok());
+        // 只有 cursor/incremental 行也必须拒绝。
+        sqlx::query(
+            "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
+             VALUES ('b', 'c', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let err = guard_inventory_activation(db.pool(), 5).await.unwrap_err();
+        assert!(err.contains("inventory_incremental=1"), "{err}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! 覆盖：扩展随快照编解码、导出同事务读取运行态（level 3 才导出）、
 //! checksum 覆盖运行态、verify_export 拒绝低级别/畸形运行态。
 
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -11,8 +11,8 @@ use oss_server::db::Db;
 use oss_server::raft::cutover::{self, ExportFile};
 use oss_server::raft::data::{self, ControlData};
 use oss_server::raft::runstate::{
-    JobRow, JobTaskRow, RunState, decode_runstate_snapshot, encode_runstate_snapshot,
-    install_runstate_tx, read_runstate,
+    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow, RunState,
+    decode_runstate_snapshot, encode_runstate_snapshot, install_runstate_tx, read_runstate,
 };
 use oss_server::raft::store::SqliteStateMachine;
 use oss_server::raft::{TypeConfig, compat};
@@ -223,6 +223,178 @@ async fn feature_four_node_rejects_level_three_snapshot_with_rows() {
     assert_eq!(
         db_b.schema_meta("m8_runstate_activated").await.unwrap(),
         None
+    );
+}
+
+fn inventory_sample() -> RunState {
+    RunState {
+        inventory_runs: vec![InventoryRunRow {
+            id: 5,
+            bucket: "b".into(),
+            config_id: "c".into(),
+            run_key: "k".into(),
+            started_at: 1,
+            state: "done".into(),
+            created_at: 1,
+            ..InventoryRunRow::default()
+        }],
+        inventory_cursors: vec![InventoryCursorRow {
+            bucket: "b".into(),
+            config_id: "c".into(),
+            cursor: "100".into(),
+            config_updated_at: 1,
+            updated_at: 1,
+            ..InventoryCursorRow::default()
+        }],
+        inventory_incremental: vec![InventoryIncrementalRow {
+            bucket: "b".into(),
+            config_id: "c".into(),
+            enabled: true,
+            updated_at: 1,
+        }],
+        next_job_id: 1,
+        next_run_id: 6,
+        ..RunState::default()
+    }
+}
+
+async fn build_snapshot_at(db: &Db, level: u8) -> (Snapshot<TypeConfig>, Vec<u8>) {
+    let mut sm = SqliteStateMachine::open_with_pool(db.pool().clone(), 1 << 20, false, None, level)
+        .await
+        .unwrap();
+    let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm)
+        .await
+        .unwrap();
+    let bytes = snap.snapshot.get_ref().clone();
+    (snap, bytes)
+}
+
+/// level-5 快照是 inventory 运行态的日志事实来源：安装后写独立 marker，守卫放行。
+#[tokio::test]
+async fn level_five_snapshot_install_marks_inventory_activated() {
+    let (_dir_a, db_a) = fresh_db().await;
+    db_a.schema_meta_set("raft_feature_level", "5")
+        .await
+        .unwrap();
+    install(&db_a, &inventory_sample()).await;
+    let (snap, bytes) = build_snapshot_at(&db_a, 5).await;
+    assert_eq!(data::decode_snapshot(&bytes).unwrap().feature_level, 5);
+
+    let (_dir_b, db_b) = fresh_db().await;
+    let mut sm_b = SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 5)
+        .await
+        .unwrap();
+    RaftStateMachine::<TypeConfig>::install_snapshot(
+        &mut sm_b,
+        &snap.meta,
+        Box::new(std::io::Cursor::new(bytes)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_runstate(db_b.pool()).await.unwrap(),
+        inventory_sample()
+    );
+    assert_eq!(
+        db_b.schema_meta("m8_inventory_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        db_b.schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    assert!(
+        compat::guard_inventory_activation(db_b.pool(), 5)
+            .await
+            .is_ok()
+    );
+}
+
+/// 配置 feature 5 的节点不得安装带 inventory 行的 level-4 快照（v1.23.0 本地行）。
+#[tokio::test]
+async fn feature_five_node_rejects_level_four_snapshot_with_inventory_rows() {
+    let (_dir_a, db_a) = fresh_db().await;
+    db_a.schema_meta_set("raft_feature_level", "4")
+        .await
+        .unwrap();
+    install(&db_a, &inventory_sample()).await;
+    let (snap, bytes) = build_snapshot_at(&db_a, 4).await;
+
+    let (_dir_b, db_b) = fresh_db().await;
+    let mut sm_b = SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 5)
+        .await
+        .unwrap();
+    let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+        &mut sm_b,
+        &snap.meta,
+        Box::new(std::io::Cursor::new(bytes)),
+    )
+    .await
+    .expect_err("feature-5 node must reject a level-4 snapshot carrying inventory rows");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot install a level-4 snapshot") && msg.contains("inventory_runs"),
+        "{msg}"
+    );
+    assert_eq!(
+        read_runstate(db_b.pool()).await.unwrap(),
+        RunState::default(),
+        "rejected install must be zero-write"
+    );
+    assert_eq!(
+        db_b.schema_meta("m8_inventory_activated").await.unwrap(),
+        None
+    );
+}
+
+/// 配置 feature 4 的节点也不得安装只带 cursor/incremental 的 level-3 快照（P2-3）。
+#[tokio::test]
+async fn feature_four_node_rejects_level_three_snapshot_with_inventory_cursors() {
+    let (_dir_a, db_a) = fresh_db().await;
+    db_a.schema_meta_set("raft_feature_level", "3")
+        .await
+        .unwrap();
+    let only_cursor = RunState {
+        inventory_cursors: vec![InventoryCursorRow {
+            bucket: "b".into(),
+            config_id: "c".into(),
+            cursor: "1".into(),
+            config_updated_at: 1,
+            updated_at: 1,
+            ..InventoryCursorRow::default()
+        }],
+        next_job_id: 1,
+        next_run_id: 1,
+        ..RunState::default()
+    };
+    install(&db_a, &only_cursor).await;
+    let (snap, bytes) = build_snapshot_at(&db_a, 3).await;
+
+    let (_dir_b, db_b) = fresh_db().await;
+    let mut sm_b = SqliteStateMachine::open_with_pool(db_b.pool().clone(), 1 << 20, false, None, 4)
+        .await
+        .unwrap();
+    let err = RaftStateMachine::<TypeConfig>::install_snapshot(
+        &mut sm_b,
+        &snap.meta,
+        Box::new(std::io::Cursor::new(bytes)),
+    )
+    .await
+    .expect_err("feature-4 node must reject level-3 cursor/incremental rows");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot install a level-3 snapshot") && msg.contains("inventory_cursors"),
+        "{msg}"
+    );
+    assert_eq!(
+        read_runstate(db_b.pool()).await.unwrap(),
+        RunState::default()
     );
 }
 
