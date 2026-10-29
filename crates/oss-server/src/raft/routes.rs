@@ -355,8 +355,8 @@ async fn write(
                 "effective": effective,
                 "hint": format!(
                     "raft feature level {required} not active (effective {effective}): \
-                     finish binary rollout, set [raft].feature_level={required} on every \
-                     voter/learner, then wait for heartbeats"
+                     需要 feature {required}；upgrade every voter/learner to a feature-{required} \
+                     binary, set [raft].feature_level={required} on each, then wait for heartbeats"
                 ),
             })),
         )

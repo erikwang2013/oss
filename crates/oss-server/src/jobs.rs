@@ -2,8 +2,8 @@
 //!
 //! 单节点 SQLite：`OSS_JOB_WORKERS` 个 worker 共享同一 WAL，`claim_task` 用
 //! `BEGIN IMMEDIATE` 原子领取；多进程不支持（落档）。M8-1 起 Raft 模式下只有 leader
-//! 领取执行（[`crate::raft::LeaderGate`]），但 `job_tasks` 等运行态仍是各节点本地表、
-//! 不随 Raft 复制：门控只防重复执行，跨节点接管要等 OSSCTL2（backlog §4.3 M8-2）。
+//! 领取执行（[`crate::raft::LeaderGate`]）；M8-2 起 feature-4 下作业/任务行随日志复制，
+//! 但跨节点租约与主动接管仍未实现（backlog §4.3）。
 //! 动作执行委托给 [`TaskExecutor`]——S3/S4b/S5 各自提供实现，S0 只有测试 executor。
 
 use std::sync::Arc;

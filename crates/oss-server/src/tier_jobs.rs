@@ -44,7 +44,7 @@ struct RestorePayload {
     days: u32,
 }
 
-/// Restore 入队：作业行与 `tier_restores`(pending) 行同批走 `JobState`（level 3 经复制
+/// Restore 入队：作业行与 `tier_restores`(pending) 行同批走 `JobState`（feature 4 经复制
 /// 日志按主键 upsert；非复制模式仍为本地直写）。
 pub struct SqlRestoreSink {
     db: Arc<Db>,

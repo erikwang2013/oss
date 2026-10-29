@@ -1,9 +1,9 @@
 //! M8-2：jobs/job_tasks 运行态写入门面。
 //!
-//! 复制模式下（Raft 且本机 advertised feature ≥3）所有作业行/任务行写入都以完整行
+//! 复制模式下（Raft 且本机 advertised feature ≥4）所有作业行/任务行写入都以完整行
 //! 经 [`ControlPlane::write`] 提交，apply 按主键 upsert；follower 只 apply，不领取。
-//! leader 生效级别 <3（有不可达成员）时复制写 fail-closed，绝不退回本地直写。
-//! 非 Raft 或 feature<3 保持 M8-1 的本地直写（debug 日志记录降级），行为不变。
+//! leader 生效级别 <4（有不可达/未升级成员）时复制写 fail-closed，绝不退回本地直写。
+//! 非 Raft 或 feature<4 保持 M8-1 的本地直写（debug 日志记录降级），行为不变。
 //!
 //! 读-改-写（领取/收尾/抢占/回收）只允许 leader，并在进程内用一把 mutex 串行化：
 //! 读本行 → 合并计数 → 提交下一行之间不能被同进程其他 worker 插入。身份/引用/版本
@@ -11,8 +11,8 @@
 //!
 //! 已知限制：job id 仍由 leader 本地分配（`runstate_meta`/`MAX(id)+1`），新 leader
 //! 先等 apply 追平再分配。Restore 受理的 `tier_restores` 行与作业同批进日志（P2-1），
-//! 之后的 restored/删除是 leader 执行侧的本地运行态调整，随 level-3 快照安装收敛；
-//! 启动守卫要求 level-2 本地运行态为空后才允许激活 level 3。inventory/lifecycle
+//! 之后的 restored/删除是 leader 执行侧的本地运行态调整，随 OSSCTL3 快照安装收敛；
+//! 启动守卫要求旧本地运行态为空后才允许激活 feature 4。inventory/lifecycle
 //! 状态表不在本切片。
 
 mod admin;
@@ -89,21 +89,21 @@ impl JobState {
         Self::new(None)
     }
 
-    /// Raft 且本机配置 advertised feature≥3 → 必须走复制日志（leader 生效级别不足时
-    /// 写入 fail-closed，绝不退回本地直写）。Local/feature<3 → 保持节点本地。
+    /// Raft 且本机配置 advertised feature≥4 → 必须走复制日志（leader 生效级别不足时
+    /// 写入 fail-closed，绝不退回本地直写）。Local/feature<4 → 保持节点本地。
     pub fn replicated(&self) -> bool {
         self.control
             .as_ref()
             .and_then(|c| c.raft_handle())
-            .is_some_and(|handle| handle.advertised_feature() >= compat::FEATURE_OSSCTL2)
+            .is_some_and(|handle| handle.advertised_feature() >= compat::FEATURE_LEVEL_4)
     }
 
     fn note_local(&self, op: &str) {
         // debug：worker 每 2s 一轮，info 会刷屏；启动时另有一次性 info。
-        tracing::debug!(op, "job 状态写入保持节点本地（raft feature < 3 或未启用）");
+        tracing::debug!(op, "job 状态写入保持节点本地（raft feature < 4 或未启用）");
     }
 
-    /// 复制写只允许 leader 生成完整行（follower 不得读旧行转发）；生效级别 <3 时
+    /// 复制写只允许 leader 生成完整行（follower 不得读旧行转发）；生效级别 <4 时
     /// 返回明确错误而不是本地写。
     fn require_leader(&self, op: &str) -> Result<(), String> {
         let Some(control) = &self.control else {
@@ -114,11 +114,11 @@ impl JobState {
         }
         if let Some(handle) = control.raft_handle() {
             match handle.effective_feature() {
-                Some(level) if level >= compat::FEATURE_OSSCTL2 => {}
+                Some(level) if level >= compat::FEATURE_LEVEL_4 => {}
                 Some(level) => {
                     return Err(format!(
-                        "{op}: raft effective feature {level} < 3; job writes fail closed \
-                         until unreachable members are removed or recover"
+                        "{op}: raft effective feature {level} < 4; job writes fail closed \
+                         until unreachable or pre-feature-4 members are removed or upgraded"
                     ));
                 }
                 None => return Err(format!("{op}: raft effective feature unavailable")),

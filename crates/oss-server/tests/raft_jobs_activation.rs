@@ -1,8 +1,9 @@
-//! M8-2 P1-A：level-2 → level-3 运行态激活边界（启动守卫）。
+//! M8-2 P1-A：feature ≤3 → feature 4 运行态激活边界（启动守卫）。
 //!
-//! level-2 的 jobs/job_tasks 是节点本地行，不在复制日志中；以 feature_level=3 启动
-//! 前必须为空（或已安装 level-3 快照/cutover 留下激活标记），否则拒绝启动并给出
-//! 排空/清空/重灌的运维步骤。真实 `AppState::load`，不再走 apply fail-stop。
+//! feature ≤3 的 jobs/job_tasks 是节点本地行，不在复制日志中；以 feature_level=4
+//! 启动前必须为空（或已安装 OSSCTL3 快照/cutover 留下激活标记），否则拒绝启动并
+//! 给出排空/清空/重灌的运维步骤。真实 `AppState::load`，不再走 apply fail-stop。
+//! feature 3 本身仍是本地作业语义，非空表不得误拒。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -57,9 +58,10 @@ async fn stop(state: AppState) {
     drop(state);
 }
 
-/// level 2 建过本地作业 → 切 feature_level=3 启动必须被拒（文案含计数与运维步骤）。
+/// 旧本地作业（feature 2/3 建过）→ 切 feature_level=4 启动必须被拒（文案含计数与
+/// 运维步骤）；feature 3 启动本身不得误拒。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn level2_local_jobs_block_level3_activation() {
+async fn old_local_jobs_block_feature4_activation() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = write_cfg(dir.path(), 2);
     let state = AppState::load(&cfg).await.unwrap();
@@ -77,26 +79,40 @@ async fn level2_local_jobs_block_level3_activation() {
         .unwrap();
     stop(state).await;
 
+    // feature 3 仍是本地作业语义：非空表重启放行，且不写激活标记。
     let cfg = write_cfg(dir.path(), 3);
+    let state = AppState::load(&cfg)
+        .await
+        .expect("feature 3 遇到旧本地作业行不得误拒");
+    assert!(!state.jobs.replicated(), "feature 3 must stay local");
+    assert_eq!(
+        state.db.schema_meta("m8_runstate_activated").await.unwrap(),
+        None,
+        "feature 3 不启用复制，不得写激活标记"
+    );
+    stop(state).await;
+
+    let cfg = write_cfg(dir.path(), 4);
     let err = AppState::load(&cfg)
         .await
         .err()
-        .expect("非空 level-2 运行态切 level 3 必须拒绝启动");
+        .expect("非空旧本地运行态切 feature 4 必须拒绝启动");
     let msg = err.to_string();
     assert!(msg.contains("m8_runstate_activated"), "{msg}");
     assert!(
         msg.contains("jobs=1") && msg.contains("job_tasks=0"),
         "{msg}"
     );
-    assert!(msg.contains("feature_level=3"), "{msg}");
+    assert!(msg.contains("feature_level=4"), "{msg}");
     assert!(msg.contains("排空") || msg.contains("清空"), "{msg}");
 }
 
-/// 空表首次激活成功并落标记；之后复制行非空的重启不再误拒。
+/// 空表首次激活成功并落标记；之后复制行非空的重启不再误拒；marker 4 不能被
+/// 更低配置（模拟 v1.22 的 max 3）启动。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_tables_activate_and_level3_restart_with_rows_succeeds() {
+async fn empty_tables_activate_and_feature4_restart_with_rows_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = write_cfg(dir.path(), 3);
+    let cfg = write_cfg(dir.path(), 4);
     let state = AppState::load(&cfg).await.unwrap();
     assert_eq!(
         state
@@ -110,10 +126,10 @@ async fn empty_tables_activate_and_level3_restart_with_rows_succeeds() {
     );
     let handle = state.raft.clone().expect("raft handle");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(handle.is_leader() && handle.effective_feature() == Some(3)) {
+    while !(handle.is_leader() && handle.effective_feature() == Some(4)) {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "single-node cluster never became level-3 leader"
+            "single-node cluster never became feature-4 leader"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -128,13 +144,23 @@ async fn empty_tables_activate_and_level3_restart_with_rows_succeeds() {
         .create_job(&state.db, &spec, now())
         .await
         .unwrap();
-    assert!(state.jobs.replicated(), "feature 3 must replicate");
+    assert!(state.jobs.replicated(), "feature 4 must replicate");
+    assert_eq!(
+        state
+            .db
+            .schema_meta("raft_feature_level")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("4"),
+        "首条 Job* 命令 apply 必须把激活 marker 提到 4"
+    );
     stop(state).await;
 
     // 重启：jobs 非空但已有激活标记（行全是日志事实）→ 放行。
     let state = AppState::load(&cfg)
         .await
-        .expect("已激活的 level-3 集群重启不得误拒");
+        .expect("已激活的 feature-4 集群重启不得误拒");
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE id = ?")
         .bind(id)
         .fetch_one(state.db.pool())
@@ -142,4 +168,12 @@ async fn empty_tables_activate_and_level3_restart_with_rows_succeeds() {
         .unwrap();
     assert_eq!(rows, 1, "replicated job row must survive restart");
     stop(state).await;
+
+    // 已激活 marker 4 后，配置 3 启动必须拒绝（v1.22 的 max 3 同理）。
+    let cfg = write_cfg(dir.path(), 3);
+    let err = AppState::load(&cfg)
+        .await
+        .err()
+        .expect("marker 4 不能用 feature_level=3 启动");
+    assert!(err.to_string().contains("raft_feature_level=4"), "{err}");
 }

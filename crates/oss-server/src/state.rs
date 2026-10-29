@@ -65,7 +65,7 @@ pub struct AppState {
     pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
     /// M9 S6：控制写门面（Local = M7/standalone；Raft = `[raft]`）。S6b-d 的路由唯一入口。
     pub control: Arc<crate::raft::control::ControlPlane>,
-    /// M8-2：作业运行态写入门面（Raft 且 feature≥3 时行经复制日志；否则本地直写）。
+    /// M8-2：作业运行态写入门面（Raft 且 feature≥4 时行经复制日志；否则本地直写）。
     pub jobs: Arc<crate::job_state::JobState>,
     /// M9 S7.1：Raft 句柄（路由/状态共用；无 `[raft]` = None）。
     pub raft: Option<Arc<crate::raft::RaftHandle>>,
@@ -311,8 +311,8 @@ impl AppState {
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
         // S6d：模式与库内触发器/站点状态一致才放行。
         db.assert_mode_guards().await?;
-        // M8-2 P1-A：level 2 的本地作业行不在日志里，level-3 激活前必须为空（或已安装
-        // 过 level-3 快照/cutover）。守卫在 Raft 启动前，拒绝时不会进入 apply。
+        // M8-2 P1-A：feature ≤3 的本地作业行不在日志里，feature-4 激活前必须为空（或
+        // 已安装过 OSSCTL3 快照/cutover）。守卫在 Raft 启动前，拒绝时不会进入 apply。
         if let Some(settings) = &raft_settings {
             crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
                 .await

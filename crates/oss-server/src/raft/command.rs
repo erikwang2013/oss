@@ -286,7 +286,7 @@ pub enum ControlCommand {
         payload: serde_json::Value,
     },
 
-    // ---- level 3: M8-2 job run-state replication ----
+    // ---- level 4: M8-2 job run-state replication ----
     /// 作业行按主键 upsert（创建与每次状态转换都提交完整行）。apply 侧只做
     /// SQL：`updated_at`/计数单调 + 终态不可回退；`kind`/`created_at` 不可变。
     JobUpsert {
@@ -400,9 +400,10 @@ impl ControlCommand {
             | Self::AccountMemberAttach { .. }
             | Self::AccountMemberSetStatus { .. }
             | Self::AccountUserCreate { .. } => super::compat::FEATURE_LEVEL_3,
-            // M8-2：jobs/job_tasks 行复制依赖 OSSCTL3 快照；旧二进制也无法解码。
+            // M8-2：jobs/job_tasks/tier_restores 行复制。v1.22 及更早二进制的解码器
+            // （`deny_unknown_fields`）不认识这些变体，必须用新 level 4 而非 3 门控。
             Self::JobUpsert { .. } | Self::JobTaskUpsert { .. } | Self::JobBatch { .. } => {
-                super::compat::FEATURE_OSSCTL2
+                super::compat::FEATURE_LEVEL_4
             }
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,

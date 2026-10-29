@@ -1,9 +1,10 @@
-//! M8-2：jobs/job_tasks 运行态经 Raft 复制的垂直切片（level 3）。
+//! M8-2：jobs/job_tasks 运行态经 Raft 复制的垂直切片（feature 4）。
 //!
 //! 用 3 voter 而不是 2 voter：2 voter 集群在 leader 死亡后无法再凑多数派，无法验证
 //! “新 leader 看到作业行并接着跑”；这是对任务书“2 节点 harness”的有意偏离，已在报告注明。
 //! 覆盖：leader 建/领/收 → follower 收敛；旧 term/重复/回退行被 apply 闸拒绝；
-//! leader 死亡 → 新 leader 用既有 stale 回收接管；feature<3 保持本地直写；
+//! leader 死亡 → 新 leader 用既有 stale 回收接管；feature≤3 保持本地直写且 Job* 不进日志；
+//! 混版旧 peer（advertise 3）把生效级别压回 3、Job* 被拒，移除后恢复；
 //! 命令尺寸上限；写出的行在 `m8.runstate` 快照/安装后一致。
 
 mod common;
@@ -52,10 +53,15 @@ async fn connect(dir: &Path, name: &str) -> Arc<Db> {
 
 /// 3 voter 集群；`st` 只提供 Store/AP 缓存给 `ControlPlane::raft`（作业路径不碰它们）。
 async fn start_cluster(dir: &Path, feature_level: u8) -> (Vec<Node>, AppState) {
+    start_cluster_with(dir, [feature_level; 3]).await
+}
+
+/// 同 [`start_cluster`]，但每节点可用不同 feature level（模拟混版旧 peer）。
+async fn start_cluster_with(dir: &Path, levels: [u8; 3]) -> (Vec<Node>, AppState) {
     let st = common::state(dir).await;
     let db1 = connect(dir, "a").await;
     let mut s1 = common::raft_harness::settings(dir, 1, true);
-    s1.feature_level = feature_level;
+    s1.feature_level = levels[0];
     let n1 = common::raft_harness::spawn_node_with_pool(s1, Some(db1.pool().clone())).await;
     common::raft_harness::wait_leader(&n1.handle).await;
     let mut nodes = vec![Node {
@@ -63,10 +69,10 @@ async fn start_cluster(dir: &Path, feature_level: u8) -> (Vec<Node>, AppState) {
         handle: n1.handle,
         db: db1,
     }];
-    for id in [2u64, 3] {
+    for (i, id) in [2u64, 3].into_iter().enumerate() {
         let db = connect(dir, &format!("n{id}")).await;
         let mut s = common::raft_harness::settings(dir, id, false);
-        s.feature_level = feature_level;
+        s.feature_level = levels[i + 1];
         let n = common::raft_harness::spawn_node_with_pool(s, Some(db.pool().clone())).await;
         oss_server::raft::membership::promote_voter(&nodes[0].handle, id, n.base.clone())
             .await
@@ -94,12 +100,12 @@ fn control_for(node: &Node, st: &AppState) -> Arc<ControlPlane> {
 async fn wait_ready(node: &Node) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if node.handle.is_leader() && node.handle.effective_feature() == Some(3) {
+        if node.handle.is_leader() && node.handle.effective_feature() == Some(4) {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "node {} never became level-3 leader",
+            "node {} never became feature-4 leader",
             node.id
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -125,6 +131,26 @@ async fn runstate(db: &Db) -> RunState {
     read_runstate(db.pool()).await.unwrap()
 }
 
+/// 节点自己的 raft 日志（`raft-<id>.db`，不是控制库）中出现过的 Job* 命令。
+async fn job_log_entries(handle: &RaftHandle) -> Vec<String> {
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&handle.settings().db_path)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    let rows: Vec<String> = sqlx::query_scalar("SELECT entry FROM raft_log ORDER BY idx")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    rows.into_iter()
+        .filter(|e| {
+            ["JobBatch", "JobUpsert", "JobTaskUpsert"]
+                .iter()
+                .any(|name| e.contains(name))
+        })
+        .collect()
+}
+
 fn batch_spec(tasks: usize) -> JobSpec {
     JobSpec {
         kind: "batch".into(),
@@ -146,11 +172,14 @@ fn batch_spec(tasks: usize) -> JobSpec {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_writes_replicate_and_survive_snapshot() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     let leader = &nodes[0];
     wait_ready(leader).await;
     let jobs = JobState::new(Some(control_for(leader, &st)));
-    assert!(jobs.replicated(), "level-3 leader must replicate job rows");
+    assert!(
+        jobs.replicated(),
+        "feature-4 leader must replicate job rows"
+    );
 
     let id = jobs
         .create_job(&leader.db, &batch_spec(2), now())
@@ -343,7 +372,7 @@ async fn leader_writes_replicate_and_survive_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_leader_reclaims_stale_claim_and_finishes_job() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     wait_ready(&nodes[0]).await;
     let old = JobState::new(Some(control_for(&nodes[0], &st)));
     let id = old
@@ -370,18 +399,18 @@ async fn new_leader_reclaims_stale_claim_and_finishes_job() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // P1-6：死 voter 仍在成员表 → 新 term 生效 feature 降为 1，level-3 写必须失败关闭，
+    // P1-6：死 voter 仍在成员表 → 新 term 生效 feature 降为 1，feature-4 写必须失败关闭，
     // 不得退回本地直写（否则 follower 永远收不到该作业）。
     let leader_handle = Arc::clone(&new_leader.handle);
     wait_until("effective feature drops after leader death", || async {
-        leader_handle.effective_feature().is_some_and(|l| l < 3)
+        leader_handle.effective_feature().is_some_and(|l| l < 4)
     })
     .await;
     let jobs = JobState::new(Some(control_for(new_leader, &st)));
     let err = jobs
         .create_job(&new_leader.db, &batch_spec(1), now())
         .await
-        .expect_err("level-3 write must fail closed while a dead voter remains");
+        .expect_err("feature-4 write must fail closed while a dead voter remains");
     assert!(err.contains("effective feature"), "{err}");
     assert!(
         runstate(&new_leader.db)
@@ -479,7 +508,7 @@ async fn new_leader_reclaims_stale_claim_and_finishes_job() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn feature_below_three_keeps_local_job_writes() {
+async fn feature_two_keeps_local_job_writes() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, st) = start_cluster(dir.path(), 2).await;
     common::raft_harness::wait_leader(&nodes[0].handle).await;
@@ -494,9 +523,166 @@ async fn feature_below_three_keeps_local_job_writes() {
     for f in &nodes[1..] {
         assert!(
             runstate(&f.db).await.jobs.iter().all(|j| j.id != id),
-            "feature<3 follower must not receive job rows"
+            "feature<4 follower must not receive job rows"
         );
     }
+}
+
+/// feature 3（v1.22 声明级别）不启用作业复制：JobState 仍本地直写，Job* 命令在
+/// leader 的 `check_feature` 处被拒且不产生日志 entry（旧节点绝不会收到）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn feature_three_keeps_local_job_writes_and_rejects_job_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let leader = &nodes[0];
+    let handle = Arc::clone(&leader.handle);
+    wait_until("feature-3 leader ready", || async {
+        handle.effective_feature() == Some(3)
+    })
+    .await;
+    let jobs = JobState::new(Some(control_for(leader, &st)));
+    assert!(!jobs.replicated(), "feature 3 must not replicate job rows");
+    let id = jobs
+        .create_job(&leader.db, &batch_spec(1), now())
+        .await
+        .unwrap();
+    assert!(runstate(&leader.db).await.jobs.iter().any(|j| j.id == id));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for f in &nodes[1..] {
+        assert!(
+            runstate(&f.db).await.jobs.iter().all(|j| j.id != id),
+            "feature-3 follower must not receive job rows"
+        );
+    }
+    let err = control_for(leader, &st)
+        .write(ControlCommand::JobBatch {
+            jobs: Vec::new(),
+            tasks: Vec::new(),
+            restores: Vec::new(),
+        })
+        .await
+        .expect_err("feature-3 leader must reject Job* before append");
+    assert!(err.to_string().contains("需要 feature 4"), "{err}");
+    assert!(
+        job_log_entries(&leader.handle).await.is_empty(),
+        "rejected/本地 Job* 不得进入 raft_log"
+    );
+}
+
+/// 滚动升级窗口：集群先在 feature 3 组成（v1.22 状态），leader 升级到 4 时旧 peer
+/// 仍 advertise 3 → 生效级别 3，Job* 在 append 前被拒；逐个升级/移除旧 voter 后
+/// 生效级别才回到 4。旧节点绝不能收到 Job*。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_peer_caps_feature_and_blocks_job_replication() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1) v1.22 状态：3 个 feature-3 voter。
+    let (mut nodes, st) = start_cluster_with(dir.path(), [3, 3, 3]).await;
+
+    // 2) 升级 leader：沿用原 raft/控制库，feature_level=4。harness 的旧 HTTP 监听
+    //    无法关闭，重启换端口；leader 出站复制/选举不依赖自身旧地址，语义等价。
+    nodes[0].handle.shutdown().await;
+    let mut s1 = common::raft_harness::settings(dir.path(), 1, true);
+    s1.feature_level = 4;
+    let n1 = common::raft_harness::spawn_node_with_pool(s1, Some(nodes[0].db.pool().clone())).await;
+    nodes[0].handle = n1.handle;
+
+    // 旧 peer 仍在线；立即让升级后的 node1 竞选，确保 leader 是新二进制。
+    let handle1 = Arc::clone(&nodes[0].handle);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if handle1.is_leader() && handle1.effective_feature() == Some(3) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "feature-4 leader with feature-3 peers never converged"
+        );
+        let _ = handle1.raft().trigger().elect().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // 3) 旧 peer 在线：生效级别=3，Job* 必须在 append 前被拒。
+    let leader = &nodes[0];
+    let control = control_for(leader, &st);
+    let err = control
+        .write(ControlCommand::JobBatch {
+            jobs: vec![JobRow {
+                id: 900,
+                ..JobRow::default()
+            }],
+            tasks: Vec::new(),
+            restores: Vec::new(),
+        })
+        .await
+        .expect_err("JobBatch must be rejected while a feature-3 peer is a voter");
+    assert!(err.to_string().contains("需要 feature 4"), "{err}");
+
+    // JobState 同样 fail-closed（不得退回本地直写）。
+    let jobs = JobState::new(Some(Arc::clone(&control)));
+    assert!(jobs.replicated(), "leader itself advertises feature 4");
+    let err = jobs
+        .create_job(&leader.db, &batch_spec(1), now())
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("effective feature 3") && err.contains("< 4"),
+        "{err}"
+    );
+    assert!(
+        job_log_entries(&leader.handle).await.is_empty(),
+        "no Job* entry while capped"
+    );
+    assert!(runstate(&leader.db).await.jobs.is_empty());
+    assert!(
+        runstate(&nodes[2].db).await.jobs.is_empty(),
+        "old peer must never receive job rows"
+    );
+
+    // 4) 升级其余 voter：停掉旧 node2 → 移出成员 → 新库/feature 4 重新入列。
+    nodes[1].handle.shutdown().await;
+    oss_server::raft::membership::apply_local(
+        &leader.handle,
+        &oss_server::raft::membership::MembershipOp::RemoveNode { node_id: 2 },
+    )
+    .await
+    .unwrap();
+    let mut s2 = common::raft_harness::settings(dir.path(), 2, false);
+    s2.db_path = dir.path().join("raft-2-upgraded.db");
+    s2.feature_level = 4;
+    let db2 = connect(dir.path(), "n2-upgraded").await;
+    let n2 = common::raft_harness::spawn_node_with_pool(s2, Some(db2.pool().clone())).await;
+    oss_server::raft::membership::promote_voter(&leader.handle, 2, n2.base.clone())
+        .await
+        .unwrap();
+    nodes[1] = Node {
+        id: 2,
+        handle: n2.handle,
+        db: db2,
+    };
+
+    // 5) 移除最后的 v1.22 节点；生效级别回到 4 后才允许 Job*。
+    let leader = &nodes[0];
+    oss_server::raft::membership::apply_local(
+        &leader.handle,
+        &oss_server::raft::membership::MembershipOp::RemoveNode { node_id: 3 },
+    )
+    .await
+    .unwrap();
+    wait_ready(leader).await;
+    assert_eq!(leader.handle.effective_feature(), Some(4));
+    let id = jobs
+        .create_job(&leader.db, &batch_spec(1), now())
+        .await
+        .unwrap();
+    let db = Arc::clone(&nodes[1].db);
+    wait_until("job row on upgraded follower", || async {
+        runstate(&db).await.jobs.iter().any(|j| j.id == id)
+    })
+    .await;
+    assert!(
+        !job_log_entries(&leader.handle).await.is_empty(),
+        "accepted JobBatch must be logged"
+    );
 }
 
 async fn submit(
@@ -519,7 +705,7 @@ async fn submit(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_guards_reject_whole_batch_without_partial_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     wait_ready(&nodes[0]).await;
     let leader = &nodes[0];
     let control = control_for(leader, &st);
@@ -816,7 +1002,7 @@ async fn apply_guards_reject_whole_batch_without_partial_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inventory_progress_and_restore_use_logged_jobs() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     wait_ready(&nodes[0]).await;
     let leader = &nodes[0];
     let jobs = Arc::new(JobState::new(Some(control_for(leader, &st))));
@@ -888,7 +1074,7 @@ async fn inventory_progress_and_restore_use_logged_jobs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_row_survives_leader_change_before_execution() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     wait_ready(&nodes[0]).await;
     let jobs = Arc::new(JobState::new(Some(control_for(&nodes[0], &st))));
     let sink = SqlRestoreSink::new(
@@ -945,7 +1131,7 @@ async fn restore_row_survives_leader_change_before_execution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_job_writes_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     wait_ready(&nodes[0]).await;
     let leader_jobs = JobState::new(Some(control_for(&nodes[0], &st)));
     let id = leader_jobs
@@ -960,7 +1146,7 @@ async fn follower_job_writes_fail_closed() {
     .await;
     assert!(!follower.handle.is_leader());
     let jobs = JobState::new(Some(control_for(follower, &st)));
-    assert!(jobs.replicated(), "follower is configured level 3");
+    assert!(jobs.replicated(), "follower is configured feature 4");
     let errors = [
         jobs.create_job(&follower.db, &batch_spec(1), now())
             .await
@@ -1008,7 +1194,7 @@ async fn follower_job_writes_fail_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn logical_version_bump_and_bounded_backoff() {
     let dir = tempfile::tempdir().unwrap();
-    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    let (nodes, st) = start_cluster(dir.path(), 4).await;
     wait_ready(&nodes[0]).await;
     let leader = &nodes[0];
     let jobs = JobState::new(Some(control_for(leader, &st)));

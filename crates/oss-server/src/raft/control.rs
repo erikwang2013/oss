@@ -453,8 +453,8 @@ impl ControlPlane {
                         effective,
                     }) => {
                         return Err(ControlError::Unavailable(format!(
-                            "raft feature level {required} not active (effective {effective}); \
-                             finish rollout/enable [raft].feature_level"
+                            "raft feature level {required} not active (effective {effective}): \
+                             需要 feature {required}（finish rollout/enable [raft].feature_level）"
                         )));
                     }
                     Err(WriteError::UnregisteredExtType { type_id }) => {

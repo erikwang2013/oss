@@ -116,7 +116,8 @@ impl std::fmt::Display for WriteError {
                 effective,
             } => write!(
                 f,
-                "raft feature level {required} not active (effective {effective})"
+                "raft feature level {required} not active (effective {effective}): 需要 feature \
+                 {required}（全集群升级并显式配置 [raft].feature_level={required}）"
             ),
             Self::UnregisteredExtType { type_id } => write!(
                 f,
@@ -180,7 +181,7 @@ impl LeadershipSource for RaftHandle {
 /// （fail closed）。放行 token（[`FencingEpoch`] = term + leader）必须随状态转换落库，
 /// 旧 token 的写入按 term 单调被拒（no-op），交接中在途动作的收尾不能覆盖新 leader 的状态。
 ///
-/// 不引入新的共识或租约。M8-2 起 level-3 的 jobs/job_tasks/tier_restores 受理行经
+/// 不引入新的共识或租约。M8-2 起 feature-4 的 jobs/job_tasks/tier_restores 受理行经
 /// Raft 日志复制（其余运行态表仍为节点本地，跨节点持久化见 backlog §4.3）；本门控
 /// 只防多节点重复执行，接管依赖各节点已有的 stale/expired 领取回收（at-least-once）。
 #[derive(Clone)]

@@ -21,15 +21,19 @@ pub const MIN_MEMBERSHIP_WIRE_VERSION: u32 = 2;
 pub const FEATURE_STRUCTURED_LIFECYCLE: u8 = 2;
 /// feature 3：OSSCTL3 可解码 + level-3 命令（Ext/accounts/runstate）可应用。
 pub const FEATURE_LEVEL_3: u8 = 3;
+/// feature 4：M8-2 jobs/job_tasks/tier_restores 运行态复制（Job* 命令）。v1.22 及
+/// 更早二进制 advertise ≤3，因此混版窗口内 leader 的 effective 压回 3、Job* 不 append；
+/// 全集群升级并显式配置 4 后才启用。旧二进制（`deny_unknown_fields`）无法解码 Job*，
+/// 绝不能让它们收到这些 entry。
+pub const FEATURE_LEVEL_4: u8 = 4;
 /// Level C M1 的命令演进容器（`ControlCommand::Ext`）所需级别。该级别只表示
 /// “能解码/应用 Ext 容器”，不表示认识任何 `type_id`；注册新类型必须提升 feature
 /// level 或先完成 per-peer 类型能力协商（见 `command::REGISTERED_EXT_TYPES`）。
 pub const FEATURE_COMMAND_EXT: u8 = FEATURE_LEVEL_3;
-/// m8 计划使用的 level-3 别名（RunState 命令的 `min_feature_level`）。数值与
-/// [`FEATURE_LEVEL_3`] 相同：level 3 是单一激活门，不会按功能拆成多个级别。
+/// OSSCTL2/3 命令与快照语义的别名（保持 level 3 不变；M8-2 复制另立 level 4）。
 pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
 /// 本二进制支持的最高 feature level。
-pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_3;
+pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_4;
 /// 缺省/旧节点的 feature level。
 pub const MIN_FEATURE_LEVEL: u8 = 1;
 
@@ -93,10 +97,15 @@ pub async fn read_activation_conn(conn: &mut sqlx::SqliteConnection) -> Result<u
 
 /// R8 启动守卫：marker 高于二进制最高或高于本机配置 → 拒绝启动（绝不降级运行）。
 pub fn guard_startup(marker: u8, configured: u8) -> Result<(), String> {
-    let advertised = advertised_feature(configured);
-    if marker > MAX_FEATURE_LEVEL {
+    guard_startup_with_max(marker, configured, MAX_FEATURE_LEVEL)
+}
+
+/// 同 [`guard_startup`]，`max` 参数只为单测模拟旧二进制（v1.22 的 MAX=3）。
+fn guard_startup_with_max(marker: u8, configured: u8, max: u8) -> Result<(), String> {
+    let advertised = configured.min(max);
+    if marker > max {
         return Err(format!(
-            "schema_meta.{META_FEATURE_LEVEL}={marker} 高于本二进制最高支持 {MAX_FEATURE_LEVEL}；\
+            "schema_meta.{META_FEATURE_LEVEL}={marker} 高于本二进制最高支持 {max}；\
              集群已激活本二进制无法应用的功能，请换回支持 level {marker} 的二进制"
         ));
     }
@@ -123,17 +132,18 @@ pub async fn mark_runstate_activated_tx(
     Ok(())
 }
 
-/// P1-A 激活边界：level-3 复制要求本地运行态为空（或已标记激活）。
+/// P1-A 激活边界：feature 4（M8-2 运行态复制）要求本地运行态为空（或已标记激活）。
 ///
-/// level 2 的 jobs/job_tasks 是各节点本地行，从未进入日志；直接以 feature 3 启动会让
+/// level 2/3 的 jobs/job_tasks 是各节点本地行，从未进入日志；直接以 feature 4 启动会让
 /// 首次 JobBatch 用本副本历史行判身份/版本、用本机 MAX(id) 分配 id，可能静默丢作业或
 /// 撞 id。因此只有空表（首次激活）或已安装过 level-3 快照/cutover（行已全部是日志事实）
-/// 才放行；空表放行时写入标记，后续重启不再检查行是否为空。
+/// 才放行；空表放行时写入标记，后续重启不再检查行是否为空。feature ≤3 不启用复制，
+/// 不做检查（保持本地作业行为）。
 pub async fn guard_runstate_activation(
     pool: &sqlx::SqlitePool,
     configured: u8,
 ) -> Result<(), String> {
-    if advertised_feature(configured) < FEATURE_OSSCTL2 {
+    if advertised_feature(configured) < FEATURE_LEVEL_4 {
         return Ok(());
     }
     let activated: Option<String> =
@@ -170,12 +180,12 @@ pub async fn guard_runstate_activation(
         return Ok(());
     }
     Err(format!(
-        "[raft].feature_level={configured} 要求 level-3 运行态已激活，但本地 jobs={jobs}、\
-         job_tasks={tasks} 非空且未见 schema_meta.{META_RUNSTATE_ACTIVATED}。level-2 的本地\
-         作业行不在复制日志中，直接激活会静默丢作业或产生 ID 冲突。运维步骤：保持 \
-         feature_level<3 启动，等待所有作业进入终态并完成/导出，备份控制库后清空 \
+        "[raft].feature_level={configured} 要求 feature 4 运行态已激活，但本地 jobs={jobs}、\
+         job_tasks={tasks} 非空且未见 schema_meta.{META_RUNSTATE_ACTIVATED}。level-2/3 的\
+         本地作业行不在复制日志中，直接激活会静默丢作业或产生 ID 冲突。运维步骤：保持 \
+         feature_level<4 启动，等待所有作业进入终态并完成/导出，备份控制库后清空 \
          jobs/job_tasks（或用 raft-export 备份后在新集群 raft-cutover 重灌），确认两表为空\
-         后再以 feature_level>=3 重启。本二进制不迁移 level-2 本地作业行。"
+         后再以 feature_level>=4 重启。本二进制不迁移旧本地作业行。"
     ))
 }
 
@@ -324,11 +334,15 @@ mod tests {
     fn supports_is_bounded_by_binary_max_and_levels_are_fixed() {
         assert_eq!(MIN_FEATURE_LEVEL, 1);
         assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
+        assert_eq!(FEATURE_LEVEL_3, 3);
         assert_eq!(FEATURE_COMMAND_EXT, 3);
         assert_eq!(FEATURE_COMMAND_EXT, FEATURE_LEVEL_3);
+        assert_eq!(FEATURE_LEVEL_4, 4, "M8-2 复制是新 level，不得复用 3");
+        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_4);
         assert!(supports(1));
         assert!(supports(FEATURE_STRUCTURED_LIFECYCLE));
         assert!(supports(FEATURE_COMMAND_EXT));
+        assert!(supports(FEATURE_LEVEL_4));
         assert!(!supports(MAX_FEATURE_LEVEL + 1));
     }
 
@@ -394,6 +408,13 @@ mod tests {
         assert!(guard_startup(2, 1).is_err());
         // 二进制最高 2：marker 3 无从谈起，但必须拒绝而不是截断。
         assert!(guard_startup(3, 2).is_err());
+        // feature 4 激活后：本二进制（max 4）显式配置 4 才放行。
+        assert!(guard_startup(4, 4).is_ok());
+        assert!(guard_startup(4, 3).is_err(), "配置低于 marker 必须拒绝");
+        assert!(guard_startup(5, 4).is_err(), "未知更高 marker 必须拒绝");
+        // v1.22（max 3）遇到 marker 4 必须拒绝启动，而不是降级运行。
+        assert!(guard_startup_with_max(4, 4, 3).is_err());
+        assert!(guard_startup_with_max(3, 3, 3).is_ok());
     }
 
     #[tokio::test]
@@ -418,11 +439,17 @@ mod tests {
     #[tokio::test]
     async fn runstate_activation_guard_allows_empty_tables_and_sets_marker() {
         let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
-        // level 2 不检查，也不落标记。
-        assert!(guard_runstate_activation(db.pool(), 2).await.is_ok());
-        assert_eq!(db.schema_meta(META_RUNSTATE_ACTIVATED).await.unwrap(), None);
-        // 空表 level 3：放行并写激活标记（后续重启不再要求空表）。
-        assert!(guard_runstate_activation(db.pool(), 3).await.is_ok());
+        // feature ≤3 不启用复制，不检查也不落标记（保持本地作业行为）。
+        for configured in [1, 2, 3] {
+            assert!(
+                guard_runstate_activation(db.pool(), configured)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(db.schema_meta(META_RUNSTATE_ACTIVATED).await.unwrap(), None);
+        }
+        // 空表 feature 4：放行并写激活标记（后续重启不再要求空表）。
+        assert!(guard_runstate_activation(db.pool(), 4).await.is_ok());
         assert_eq!(
             db.schema_meta(META_RUNSTATE_ACTIVATED)
                 .await
@@ -433,12 +460,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runstate_activation_guard_rejects_level2_rows_without_marker() {
+    async fn runstate_activation_guard_rejects_old_local_rows_without_marker() {
         let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
         db.create_job(&crate::db::JobSpec::default(), 1)
             .await
             .unwrap();
-        let err = guard_runstate_activation(db.pool(), 3).await.unwrap_err();
+        // feature 3 仍走本地作业路径：非空表不得误拒。
+        assert!(guard_runstate_activation(db.pool(), 3).await.is_ok());
+        assert_eq!(db.schema_meta(META_RUNSTATE_ACTIVATED).await.unwrap(), None);
+        let err = guard_runstate_activation(db.pool(), 4).await.unwrap_err();
         assert!(
             err.contains("jobs=1") && err.contains("feature_level"),
             "{err}"
@@ -447,7 +477,7 @@ mod tests {
         let mut conn = db.pool().acquire().await.unwrap();
         mark_runstate_activated_tx(&mut conn).await.unwrap();
         drop(conn);
-        assert!(guard_runstate_activation(db.pool(), 3).await.is_ok());
+        assert!(guard_runstate_activation(db.pool(), 4).await.is_ok());
     }
 
     #[test]

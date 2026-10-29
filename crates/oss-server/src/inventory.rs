@@ -348,7 +348,7 @@ impl InventoryRunner {
         }
     }
 
-    /// 作业进度写入门面：level 3 经复制日志；失败只告警（作业收尾另行兜底）。
+    /// 作业进度写入门面：feature 4 经复制日志；失败只告警（作业收尾另行兜底）。
     async fn set_progress(&self, job_id: Option<i64>, progress: i64, now: i64) {
         if let Some(j) = job_id
             && let Err(e) = self.jobs.set_progress(&self.db, j, progress, now).await
