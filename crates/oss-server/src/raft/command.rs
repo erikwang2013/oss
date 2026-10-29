@@ -307,7 +307,7 @@ pub enum ControlCommand {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         restores: Vec<TierRestoreRow>,
     },
-    /// M8-2 下一片：inventory 运行态（runs/cursors/incrementals）同批 upsert。
+    /// level 5：inventory 运行态（runs/cursors/incrementals）同批 upsert。
     /// 行按主键/自然键整行携带；apply 只做 SQL，leader 在 append 前做身份与引用校验。
     InventoryBatch {
         runs: Vec<InventoryRunRow>,
@@ -417,11 +417,13 @@ impl ControlCommand {
             | Self::AccountUserCreate { .. } => super::compat::FEATURE_LEVEL_3,
             // M8-2：jobs/job_tasks/tier_restores 行复制。v1.22 及更早二进制的解码器
             // （`deny_unknown_fields`）不认识这些变体，必须用新 level 4 而非 3 门控。
-            Self::JobUpsert { .. }
-            | Self::JobTaskUpsert { .. }
-            | Self::JobBatch { .. }
-            | Self::InventoryBatch { .. }
-            | Self::InventoryClear { .. } => super::compat::FEATURE_LEVEL_4,
+            Self::JobUpsert { .. } | Self::JobTaskUpsert { .. } | Self::JobBatch { .. } => {
+                super::compat::FEATURE_LEVEL_4
+            }
+            // v1.23.0 已 advertise 4 但不认识 Inventory*；必须用 level 5。
+            Self::InventoryBatch { .. } | Self::InventoryClear { .. } => {
+                super::compat::FEATURE_LEVEL_5
+            }
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,

@@ -90,23 +90,39 @@ impl JobState {
         Self::new(None)
     }
 
-    /// Raft 且本机配置 advertised feature≥4 → 必须走复制日志（leader 生效级别不足时
-    /// 写入 fail-closed，绝不退回本地直写）。Local/feature<4 → 保持节点本地。
+    /// Raft 且本机配置 advertised feature≥4 → jobs 必须走复制日志（leader 生效级别
+    /// 不足时写入 fail-closed，绝不退回本地直写）。Local/feature<4 → 保持节点本地。
     pub fn replicated(&self) -> bool {
+        self.replicated_at(compat::FEATURE_LEVEL_4)
+    }
+
+    /// inventory 复制是 level 5：v1.23.0 已 advertise 4 但不认识 Inventory*。
+    pub fn inventory_replicated(&self) -> bool {
+        self.replicated_at(compat::FEATURE_LEVEL_5)
+    }
+
+    fn replicated_at(&self, level: u8) -> bool {
         self.control
             .as_ref()
             .and_then(|c| c.raft_handle())
-            .is_some_and(|handle| handle.advertised_feature() >= compat::FEATURE_LEVEL_4)
+            .is_some_and(|handle| handle.advertised_feature() >= level)
     }
 
     fn note_local(&self, op: &str) {
         // debug：worker 每 2s 一轮，info 会刷屏；启动时另有一次性 info。
-        tracing::debug!(op, "job 状态写入保持节点本地（raft feature < 4 或未启用）");
+        tracing::debug!(
+            op,
+            "job 状态写入保持节点本地（raft feature 未达所需 level 或未启用）"
+        );
     }
 
-    /// 复制写只允许 leader 生成完整行（follower 不得读旧行转发）；生效级别 <4 时
-    /// 返回明确错误而不是本地写。
     fn require_leader(&self, op: &str) -> Result<(), String> {
+        self.require_leader_for(op, compat::FEATURE_LEVEL_4)
+    }
+
+    /// 复制写只允许 leader 生成完整行（follower 不得读旧行转发）；生效级别不足时
+    /// 返回明确错误而不是本地写。
+    fn require_leader_for(&self, op: &str, required: u8) -> Result<(), String> {
         let Some(control) = &self.control else {
             return Ok(());
         };
@@ -115,12 +131,12 @@ impl JobState {
         }
         if let Some(handle) = control.raft_handle() {
             match handle.effective_feature() {
-                Some(level) if level >= compat::FEATURE_LEVEL_4 => {}
+                Some(level) if level >= required => {}
                 Some(level) => {
                     return Err(format!(
-                        "{op}: raft effective feature {level} < 4; job writes fail closed \
-                         (no local fallback while [raft].feature_level>=4) until unreachable \
-                         or pre-feature-4 members are removed or upgraded"
+                        "{op}: raft effective feature {level} < {required}; writes fail closed \
+                         (no local fallback while [raft].feature_level>={required}) until \
+                         unreachable or older members are removed or upgraded"
                     ));
                 }
                 None => return Err(format!("{op}: raft effective feature unavailable")),
@@ -131,7 +147,11 @@ impl JobState {
 
     /// 新 leader 先等本地 apply 追平，再读 id/去重键，避免用滞后状态分配 id（P2-3）。
     async fn leader_ready(&self, op: &str) -> Result<(), String> {
-        self.require_leader(op)?;
+        self.leader_ready_for(op, compat::FEATURE_LEVEL_4).await
+    }
+
+    async fn leader_ready_for(&self, op: &str, required: u8) -> Result<(), String> {
+        self.require_leader_for(op, required)?;
         if let Some(control) = &self.control
             && !control
                 .wait_caught_up(std::time::Duration::from_secs(2))

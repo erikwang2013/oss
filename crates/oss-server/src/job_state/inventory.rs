@@ -1,8 +1,13 @@
 //! Inventory 运行态（runs/cursors/incrementals）的复制写入门面（M8-2 下一片）。
 //!
-//! 与 jobs 相同：Raft 且 advertised feature ≥4 时，leader 在进程内 mutex 下读取已
+//! 与 jobs 相同：Raft 且 advertised feature ≥5 时，leader 在进程内 mutex 下读取已
 //! apply 的行、合并出下一整行，经 [`ControlPlane::write`] 提交；follower 不得读旧行
-//! 转发。feature<4 或非 Raft 保持节点本地直写。
+//! 转发。feature<5 或非 Raft 保持节点本地直写（v1.23.0 不认识 Inventory*，所以
+//! 不能复用 level 4）。
+//!
+//! `InventoryClear` 是“关闭增量并删游标”的幂等命令（无 fence，apply 只删当前行）；
+//! 复制模式下 `cursor_set(None)` 复用它，因此会一并关闭增量开关；本地模式
+//! `cursor_set(None)` 只删游标。当前生产代码没有 `cursor_set(None)` 调用者。
 
 use super::*;
 use crate::raft::apply::inventory::{cursor_row_ok, incremental_row_ok, run_row_ok};
@@ -157,7 +162,7 @@ impl JobState {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<Option<i64>, String> {
-        if !self.replicated() {
+        if !self.inventory_replicated() {
             self.note_local("inventory_create_run");
             return db
                 .inventory_create_run(bucket, config_id, run_key, now, fence)
@@ -165,7 +170,8 @@ impl JobState {
                 .map_err(err);
         }
         let _guard = self.lock.lock().await;
-        self.leader_ready("inventory_create_run").await?;
+        self.leader_ready_for("inventory_create_run", compat::FEATURE_LEVEL_5)
+            .await?;
         if Self::read_run_by_key(db, bucket, config_id, run_key)
             .await?
             .is_some()
@@ -199,7 +205,7 @@ impl JobState {
         job_id: i64,
         fence: FencingEpoch,
     ) -> Result<(), String> {
-        if !self.replicated() {
+        if !self.inventory_replicated() {
             self.note_local("inventory_run_set_job");
             return db
                 .inventory_run_set_job(run_id, job_id, fence)
@@ -207,7 +213,8 @@ impl JobState {
                 .map_err(err);
         }
         let _guard = self.lock.lock().await;
-        self.require_leader("inventory_run_set_job")?;
+        self.leader_ready_for("inventory_run_set_job", compat::FEATURE_LEVEL_5)
+            .await?;
         let Some(mut run) = Self::read_run(db, run_id).await? else {
             return Ok(());
         };
@@ -229,7 +236,7 @@ impl JobState {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<(), String> {
-        if !self.replicated() {
+        if !self.inventory_replicated() {
             self.note_local("inventory_run_started");
             return db
                 .inventory_run_started(run_id, now, fence)
@@ -237,7 +244,8 @@ impl JobState {
                 .map_err(err);
         }
         let _guard = self.lock.lock().await;
-        self.require_leader("inventory_run_started")?;
+        self.leader_ready_for("inventory_run_started", compat::FEATURE_LEVEL_5)
+            .await?;
         let Some(mut run) = Self::read_run(db, run_id).await? else {
             return Ok(());
         };
@@ -266,7 +274,7 @@ impl JobState {
         error: Option<&str>,
         fence: FencingEpoch,
     ) -> Result<(), String> {
-        if !self.replicated() {
+        if !self.inventory_replicated() {
             self.note_local("inventory_run_finish");
             return db
                 .inventory_run_finish(run_id, state, manifest_key, error, fence)
@@ -274,7 +282,8 @@ impl JobState {
                 .map_err(err);
         }
         let _guard = self.lock.lock().await;
-        self.require_leader("inventory_run_finish")?;
+        self.leader_ready_for("inventory_run_finish", compat::FEATURE_LEVEL_5)
+            .await?;
         let Some(mut run) = Self::read_run(db, run_id).await? else {
             return Ok(());
         };
@@ -321,7 +330,7 @@ impl JobState {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<(), String> {
-        if !self.replicated() {
+        if !self.inventory_replicated() {
             self.note_local("inventory_cursor_set");
             return db
                 .inventory_cursor_set(bucket, config_id, config_updated_at, cursor, now, fence)
@@ -333,7 +342,8 @@ impl JobState {
             return self.clear_incremental(bucket, config_id).await;
         };
         let _guard = self.lock.lock().await;
-        self.require_leader("inventory_cursor_set")?;
+        self.leader_ready_for("inventory_cursor_set", compat::FEATURE_LEVEL_5)
+            .await?;
         let cur = Self::read_cursor(db, bucket, config_id).await?;
         let row = InventoryCursorRow {
             bucket: bucket.to_string(),
@@ -349,6 +359,27 @@ impl JobState {
             .await
     }
 
+    /// API 在写配置前预检：Raft 下要求 advertised feature ≥5、leader 且生效级别 ≥5、
+    /// 已追平；否则配置与开关会一边成功一边失败（P2-1）。Raft<5 明确拒绝而非节点本地
+    /// 写（P2-2）。Local（单机/测试）返回 Ok。
+    pub async fn inventory_incremental_preflight(&self) -> Result<(), String> {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        let Some(handle) = control.raft_handle() else {
+            return Ok(());
+        };
+        if !self.inventory_replicated() {
+            return Err(format!(
+                "inventory incremental mode requires [raft].feature_level>=5 \
+                 (advertised {})",
+                handle.advertised_feature()
+            ));
+        }
+        self.leader_ready_for("inventory_incremental_set", compat::FEATURE_LEVEL_5)
+            .await
+    }
+
     /// 增量开关：true 写复制行，false 原子删除开关与水位。
     pub async fn inventory_incremental_set(
         &self,
@@ -358,7 +389,7 @@ impl JobState {
         enabled: bool,
         now: i64,
     ) -> Result<(), String> {
-        if !self.replicated() {
+        if !self.inventory_replicated() {
             self.note_local("inventory_incremental_set");
             return db
                 .inventory_incremental_set(bucket, config_id, enabled, now)
@@ -370,7 +401,8 @@ impl JobState {
             return self.clear_incremental(bucket, config_id).await;
         }
         let _guard = self.lock.lock().await;
-        self.require_leader("inventory_incremental_set")?;
+        self.leader_ready_for("inventory_incremental_set", compat::FEATURE_LEVEL_5)
+            .await?;
         let cur = Self::read_incremental(db, bucket, config_id).await?;
         let row = InventoryIncrementalRow {
             bucket: bucket.to_string(),

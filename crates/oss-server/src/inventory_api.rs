@@ -173,7 +173,7 @@ async fn list(
             let source_account = state.db.bucket_account(&bucket).await.ok();
             let mut views = Vec::with_capacity(list.len());
             for c in &list {
-                // feature 4 起开关/水位随 Raft 复制；低级别仍是节点本地行（读本地即可）。
+                // feature 5 起开关/水位随 Raft 复制；低级别仍是节点本地行（读本地即可）。
                 let incremental = state
                     .db
                     .inventory_incremental_get(&bucket, &c.id)
@@ -207,22 +207,43 @@ async fn upsert(
     };
     let incremental = body.incremental;
     let id = body.id.clone();
+    // 复制模式下开关只能由 leader 生成；先预检，避免配置已提交而开关失败（P2-1）。
+    if incremental && let Err(e) = state.jobs.inventory_incremental_preflight().await {
+        let status = if e.contains("not leader") {
+            StatusCode::CONFLICT
+        } else if e.contains("feature") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return (status, e).into_response();
+    }
     match state
         .inventory
         .put_config(&bucket, &owner, &body.into_config())
         .await
     {
+        // InventoryPut apply 已复位游标与开关；incremental=false 无需再写。
+        Ok(()) if !incremental => StatusCode::NO_CONTENT.into_response(),
         Ok(()) => {
-            // put_config 会复位增量模式；console 请求随后按请求值重新开启。
+            // put_config 复位后，console 请求按请求值重新开启。
             match state
                 .jobs
-                .inventory_incremental_set(&state.db, &bucket, &id, incremental, crate::db::now())
+                .inventory_incremental_set(&state.db, &bucket, &id, true, crate::db::now())
                 .await
             {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
                 Err(e) => {
-                    tracing::error!(error = %e, "inventory 增量模式写入失败");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+                    tracing::error!(error = %e, "inventory 增量模式写入失败，回滚开关");
+                    let _ = state
+                        .jobs
+                        .inventory_incremental_set(&state.db, &bucket, &id, false, crate::db::now())
+                        .await;
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "config saved but incremental mode failed; retry the update",
+                    )
+                        .into_response()
                 }
             }
         }

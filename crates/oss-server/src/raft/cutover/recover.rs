@@ -156,6 +156,16 @@ pub async fn force_recover(
         compat::mark_runstate_activated_tx(&mut tx)
             .await
             .map_err(|e| e.to_string())?;
+        // inventory 只在来源激活级别 >=5 时才是复制日志事实；3/4 撤销旧 marker。
+        if activation >= compat::FEATURE_LEVEL_5 {
+            compat::mark_inventory_activated_tx(&mut tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            compat::clear_inventory_activated_tx(&mut tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if activation > compat::MIN_FEATURE_LEVEL {
         compat::bump_activation_tx(&mut tx, activation)

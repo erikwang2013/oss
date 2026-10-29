@@ -58,6 +58,18 @@ async fn stop(state: AppState) {
     drop(state);
 }
 
+async fn wait_effective(state: &AppState, level: u8) {
+    let handle = state.raft.clone().expect("raft handle");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(handle.is_leader() && handle.effective_feature() == Some(level)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "single-node cluster never became feature-{level} leader"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// 旧本地作业（feature 2/3 建过）→ 切 feature_level=4 启动必须被拒（文案含计数与
 /// 运维步骤）；feature 3 启动本身不得误拒。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -281,4 +293,144 @@ async fn dangling_runstate_refs_block_feature4_activation() {
         "清理后启动仍不得提前写 marker"
     );
     stop(state).await;
+}
+
+/// v1.23.0 实测升级路径：feature 4 + 已由 Job* 置位的 runstate marker + 节点本地
+/// inventory 行。level-5 守卫必须独立判断，不得被 runstate marker 短路。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feature_four_local_inventory_rows_block_feature5_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg4 = write_cfg(dir.path(), 4);
+    let state = AppState::load(&cfg4).await.unwrap();
+    wait_effective(&state, 4).await;
+    let spec = JobSpec {
+        kind: "batch".into(),
+        bucket: "src".into(),
+        prefix: "p/".into(),
+        ..JobSpec::default()
+    };
+    state
+        .jobs
+        .create_job(&state.db, &spec, now())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .db
+            .schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "Job* 已置位 level-4 marker（正是 v1.23.0 的升级现场）"
+    );
+    sqlx::query(
+        "INSERT INTO inventory_runs \
+         (bucket, config_id, run_key, started_at, state, created_at) \
+         VALUES ('src', 'cfg', 'old-local', 1, 'running', 1)",
+    )
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+    stop(state).await;
+
+    let cfg5 = write_cfg(dir.path(), 5);
+    let err = AppState::load(&cfg5)
+        .await
+        .map(|_| ())
+        .expect_err("本地 inventory 行不得被 runstate marker 放行")
+        .to_string();
+    assert!(
+        err.contains("m8_inventory_activated") && err.contains("inventory_runs=1"),
+        "{err}"
+    );
+    assert!(err.contains("m8_runstate_activated"), "{err}");
+    assert!(
+        err.contains("导出") && err.contains("feature_level<5"),
+        "{err}"
+    );
+
+    // 清空三表并按守卫提示删除 next_run_id 后启动；runstate marker 仍为 1 也不影响。
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("control.db").display()
+    );
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    for sql in [
+        "DELETE FROM inventory_runs",
+        "DELETE FROM inventory_cursors",
+        "DELETE FROM inventory_incremental",
+        "DELETE FROM runstate_meta WHERE key = 'next_run_id'",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+
+    let state = AppState::load(&cfg5)
+        .await
+        .expect("inventory 三表清空后 feature 5 应可启动");
+    assert_eq!(
+        state
+            .db
+            .schema_meta("m8_inventory_activated")
+            .await
+            .unwrap(),
+        None,
+        "空表启动不得提前写 inventory marker"
+    );
+    wait_effective(&state, 5).await;
+
+    // 首条 level-5 命令 apply 是日志事实：与行同事务置独立 marker。
+    let fence = state.raft.as_ref().unwrap().fencing_epoch().unwrap();
+    state
+        .jobs
+        .inventory_create_run(&state.db, "src", "cfg", "new", now(), fence)
+        .await
+        .unwrap()
+        .expect("new replicated run");
+    assert_eq!(
+        state
+            .db
+            .schema_meta("m8_inventory_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "已 apply 的 level-5 命令必须写 inventory marker"
+    );
+    assert_eq!(
+        state
+            .db
+            .schema_meta("m8_runstate_activated")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "jobs marker 不受影响"
+    );
+    stop(state).await;
+
+    let state = AppState::load(&cfg5)
+        .await
+        .expect("已激活的 feature-5 集群重启不得误拒");
+    assert_eq!(
+        runstate_rows(&state).await,
+        1,
+        "replicated inventory run must survive restart"
+    );
+    stop(state).await;
+
+    // marker 5 不能用 feature_level=4（v1.23.0 能力）启动。
+    let err = AppState::load(&write_cfg(dir.path(), 4))
+        .await
+        .map(|_| ())
+        .expect_err("marker 5 不能用 feature_level=4 启动");
+    assert!(err.to_string().contains("raft_feature_level=5"), "{err}");
+}
+
+async fn runstate_rows(state: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM inventory_runs")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap()
 }

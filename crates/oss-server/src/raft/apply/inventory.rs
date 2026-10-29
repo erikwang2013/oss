@@ -243,6 +243,15 @@ async fn apply_run(cw: &mut ControlWrite<'_>, run: &InventoryRunRow) -> Result<u
     .bind(run.fence_leader)
     .execute(&mut *cw.conn)
     .await?;
+    // 删除（桶删/迁移）后 MAX(id) 会回落；日志事实内推进 meta，杜绝 id 复用。
+    sqlx::query(
+        "INSERT INTO runstate_meta (key, value) VALUES ('next_run_id', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+         WHERE CAST(runstate_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+    )
+    .bind((run.id + 1).to_string())
+    .execute(&mut *cw.conn)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -296,8 +305,18 @@ pub(crate) async fn apply(
     incrementals: &[InventoryIncrementalRow],
 ) -> Result<ControlResponse, sqlx::Error> {
     let mut run_ids = std::collections::HashSet::new();
+    let mut run_keys = std::collections::HashSet::new();
     for run in runs {
         if !run_ids.insert(run.id) {
+            return Ok(ControlResponse::Conflict);
+        }
+        // 同批不同 id 的相同自然键必须在预检期拒绝，否则 SQL UNIQUE 会触发
+        // rows_affected 不变量 fail-stop，而不是零写 Conflict（P3-2）。
+        if !run_keys.insert((
+            run.bucket.clone(),
+            run.config_id.clone(),
+            run.run_key.clone(),
+        )) {
             return Ok(ControlResponse::Conflict);
         }
         let cur = current_run(cw, run.id).await?;

@@ -1295,22 +1295,6 @@ impl Db {
         Ok(())
     }
 
-    /// M9 S6c（M-1）：Raft 删桶后只清**本地** M8 行。复制表已由 apply 级联清空，
-    /// 且受 `raft_guard_*` 保护不得再直写（会 ABORT）；这里仅补 `inventory_runs`/
-    /// `tier_restores`/扫描游标等本地表。幂等。
-    pub async fn clear_bucket_local_m8(&self, bucket: &str) -> Result<()> {
-        for sql in [
-            "DELETE FROM inventory_runs WHERE bucket = ?",
-            "DELETE FROM inventory_cursors WHERE bucket = ?",
-            "DELETE FROM inventory_incremental WHERE bucket = ?",
-            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
-            "DELETE FROM tier_restores WHERE bucket = ?",
-        ] {
-            sqlx::query(sql).bind(bucket).execute(&self.pool).await?;
-        }
-        Ok(())
-    }
-
     // ---------- M7：站点身份与关系 ----------
 
     pub async fn site_identity(&self) -> Result<SiteIdentity> {
@@ -6355,7 +6339,8 @@ impl Db {
         Ok(CreateBucketOutcome::Created)
     }
 
-    /// 删桶级联：与 `clear_bucket_m8_tx` + console 清理的并集一致（11 表内的从属行）。
+    /// 删桶级联：所有从属行（含 level-4/5 复制的 inventory_runs/tier_restores）都在
+    /// 同一条日志/事务内删除；各副本 apply 同一命令，不得由服务节点本地直删。
     /// 返回桶行是否存在（不存在 → NotFound，但仍清残留从属行，幂等）。
     pub(crate) async fn delete_bucket_cascade(
         cw: &mut ControlWrite<'_>,
@@ -6371,9 +6356,11 @@ impl Db {
         .await?;
         for sql in [
             "DELETE FROM access_points WHERE bucket = ?",
+            "DELETE FROM inventory_runs WHERE bucket = ?",
             "DELETE FROM inventory_configs WHERE bucket = ?",
             "DELETE FROM inventory_cursors WHERE bucket = ?",
             "DELETE FROM inventory_incremental WHERE bucket = ?",
+            "DELETE FROM tier_restores WHERE bucket = ?",
             "DELETE FROM permissions WHERE bucket = ?",
             "DELETE FROM lifecycle_rules WHERE bucket = ?",
             "DELETE FROM lifecycle_cursors WHERE bucket = ?",

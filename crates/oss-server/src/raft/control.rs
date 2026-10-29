@@ -423,10 +423,6 @@ impl ControlPlane {
                         }
                     }
                 }
-                let deleted = match &cmd {
-                    ControlCommand::BucketDelete { name } => Some(name.clone()),
-                    _ => None,
-                };
                 let response = match handle.client_write(cmd).await {
                     Ok(r) => r,
                     Err(WriteError::Timeout(d)) => {
@@ -467,14 +463,6 @@ impl ControlPlane {
                 };
                 if response == ControlResponse::Ok {
                     self.post.run(effects).await;
-                }
-                // M-1：apply 级联只清复制表；inventory_runs/tier_restores 是本站本地行，
-                // 成功或幂等 NotFound 都要清（重建同名桶不得继承旧运行/恢复记录）。
-                if let Some(name) = deleted
-                    && matches!(response, ControlResponse::Ok | ControlResponse::NotFound)
-                    && let Err(e) = self.db.clear_bucket_local_m8(&name).await
-                {
-                    tracing::warn!(error = %e, bucket = %name, "删桶本地 M8 行清理失败");
                 }
                 Ok(response)
             }

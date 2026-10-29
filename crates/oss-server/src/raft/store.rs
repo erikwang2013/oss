@@ -658,12 +658,32 @@ impl SqliteStateMachine {
             && (!runstate.jobs.is_empty()
                 || !runstate.job_tasks.is_empty()
                 || !runstate.inventory_runs.is_empty()
+                || !runstate.inventory_cursors.is_empty()
+                || !runstate.inventory_incremental.is_empty()
                 || !runstate.tier_restores.is_empty())
         {
             return Err(Self::data_err(data::DataError::Format(format!(
                 "[raft].feature_level={} cannot install a level-{} snapshot carrying \
-                 non-log jobs/job_tasks/inventory_runs/tier_restores; finish feature-4 \
-                 activation on the source or drain/clear these tables and re-export",
+                 non-log jobs/job_tasks/inventory_runs/inventory_cursors/\
+                 inventory_incremental/tier_restores; finish feature-4 activation on the \
+                 source or drain/clear these tables and re-export",
+                self.feature_level, snapshot.feature_level
+            ))));
+        }
+        // v1.23.0 的 feature-4 inventory 行是节点本地行，level-4 快照也不可信；配置 5
+        // 只接受 level-5 快照携带的 inventory 运行态。
+        if snapshot.feature_level >= super::compat::FEATURE_LEVEL_3
+            && snapshot.feature_level < super::compat::FEATURE_LEVEL_5
+            && self.feature_level >= super::compat::FEATURE_LEVEL_5
+            && (!runstate.inventory_runs.is_empty()
+                || !runstate.inventory_cursors.is_empty()
+                || !runstate.inventory_incremental.is_empty())
+        {
+            return Err(Self::data_err(data::DataError::Format(format!(
+                "[raft].feature_level={} cannot install a level-{} snapshot carrying \
+                 non-log inventory_runs/inventory_cursors/inventory_incremental; \
+                 finish inventory activation on the source or drain/export and re-export \
+                 at level 5",
                 self.feature_level, snapshot.feature_level
             ))));
         }
@@ -709,6 +729,28 @@ impl SqliteStateMachine {
                     })?;
             } else {
                 super::compat::clear_runstate_activated_tx(&mut tx)
+                    .await
+                    .map_err(|e| {
+                        storage_err(
+                            ErrorSubject::Snapshot(None),
+                            ErrorVerb::Write,
+                            std::io::Error::other(e),
+                        )
+                    })?;
+            }
+            // inventory 有独立的 level-5 marker；level-3/4 快照撤销它。
+            if snapshot.feature_level >= super::compat::FEATURE_LEVEL_5 {
+                super::compat::mark_inventory_activated_tx(&mut tx)
+                    .await
+                    .map_err(|e| {
+                        storage_err(
+                            ErrorSubject::Snapshot(None),
+                            ErrorVerb::Write,
+                            std::io::Error::other(e),
+                        )
+                    })?;
+            } else {
+                super::compat::clear_inventory_activated_tx(&mut tx)
                     .await
                     .map_err(|e| {
                         storage_err(
@@ -893,6 +935,14 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                         // 置 marker（业务拒绝也证明集群已到 4）。
                         if self.control && required >= super::compat::FEATURE_LEVEL_4 {
                             super::compat::mark_runstate_activated_tx(&mut tx)
+                                .await
+                                .map_err(|e| {
+                                    storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
+                                })?;
+                        }
+                        // level-5 命令是 inventory 运行态“日志事实”的证据；独立 marker。
+                        if self.control && required >= super::compat::FEATURE_LEVEL_5 {
+                            super::compat::mark_inventory_activated_tx(&mut tx)
                                 .await
                                 .map_err(|e| {
                                     storage_err(ErrorSubject::Apply(log_id), ErrorVerb::Write, e)
