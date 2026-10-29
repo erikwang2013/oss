@@ -459,18 +459,19 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
   inventory_incremental/tier_restores 必须全空且 `inventory_runs.job_id`/
   `tier_restores.job_id` 无悬空，否则启动 fail-closed。清理步骤：保持 feature≤3 启动，
   等作业进入终态并备份控制库，然后清空上述各表（悬空引用随行删除；要保留
-  inventory/tier 行只能用导出重灌），再以 feature≥4 重启。
+  tier 行可按 level-4 导出重灌，**inventory 行不迁移**），再以 feature≥4 重启。
   **level-5 独立激活标记**：`m8_inventory_activated` 只由 level-5 事实置位——安装
   level-5 快照、activation≥5 的 cutover/force-recover 种子、已 apply 的 level-5 命令；
   不复用也不短路 `m8_runstate_activated`（v1.23.0 的 Job* 已把它置 1）。配置 5 且无该
   标记时，三张 inventory 表必须为空、无重复 `(bucket, config_id, run_key)`、且
   `runstate_meta.next_run_id` 大于现存最大 run id（无行时要求 max=0），否则启动
-  fail-closed 并输出排空/导出重灌步骤；v1.23.0 已有本地 inventory 行的升级必须按此
-  清理或经 `raft-export` → `raft-cutover`/`force-recover` 重灌。配置 4 节点若已有
+  fail-closed 并输出排空步骤；v1.23.0 已有本地 inventory 行的升级必须清理——
+  **旧本地 inventory 历史不迁移**（v1.23.0 导出 activation ≤4，无法以 5 重灌；
+  需保留的数据人工另存/重跑 inventory）。配置 4 节点若已有
   `m8_runstate_activated=1`（v1.23.0 现场），旧守卫会短路，所以 level-5 守卫必须独立
   检查 inventory 行与 next_run_id。**已知窄路径**：cutover/force-recover 以低于 5 的
   种子不会写 inventory 标记；目标若先以 feature 4 运行并产生本地 inventory 行再升 5，
-  由上述独立守卫拒绝，必须清理/重灌后再启动。
+  由上述独立守卫拒绝，必须清理后再启动（旧本地 inventory 历史不迁移）。
 - **M8-3 读一致性（1–2 人周）**：默认 follower 本地读（保持现状），响应头带
   `x-oss-applied-index`；`?consistent=1` 走 leader 读（转发）或 ReadIndex。控制台写后跳转
   使用 `consistent=1`。不做 follower 线性一致读的通用承诺。

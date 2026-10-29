@@ -590,8 +590,9 @@ RC=0；前端 build/lint 0、Vitest 21/21；`M9_STRETCH=1 tests/e2e_m9.sh` 64/0/
 **v1.23.0 → feature 5 升级步骤**：停止提交 inventory 作业并等 run 进入终态 → 备份控制库
 → 将全集群（含所有 voter/learner）换到含 level-5 的二进制，确认无 v1.23.0 及更早节点
 → 处理各节点本地 inventory 行：清空 `inventory_runs`/`inventory_cursors`/
-`inventory_incremental` 并删除 `runstate_meta.next_run_id`（保留数据则先 `raft-export`
-再在新集群 `raft-cutover`/`force-recover` 以 activation 5 重灌）→ 显式配置
+`inventory_incremental` 并删除 `runstate_meta.next_run_id`（**旧本地 inventory 历史不迁移**：
+v1.23.0 导出 activation 最多 4，无法以 5 重灌；需保留的数据只能人工另存/重跑 inventory）
+→ 显式配置
 `[raft].feature_level=5` 逐节点重启；守卫失败时按报错中的排空/导出指引处理。
 
 **验证**（本分支，`/tmp/oss-target-m8inv`）：`oss-server --lib` 228/0（含 compat
