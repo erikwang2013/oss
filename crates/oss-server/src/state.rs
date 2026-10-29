@@ -966,6 +966,7 @@ impl AppState {
         let restore_sink: Arc<dyn xl_s3::restore::RestoreSink> =
             Arc::new(crate::tier_jobs::SqlRestoreSink::new(
                 Arc::clone(&db),
+                Arc::clone(&jobs),
                 crate::raft::LeaderGate::from_raft(raft.clone()),
             ));
         let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
@@ -978,6 +979,7 @@ impl AppState {
         );
         let inventory_runner = Arc::new(crate::inventory::InventoryRunner::new(
             Arc::clone(&db),
+            Arc::clone(&jobs),
             Arc::clone(&store),
             inv_acl,
             cfg.staging_dir.clone(),

@@ -4717,6 +4717,35 @@ impl Db {
             .rows_affected();
             inserted |= n > 0;
         }
+        Self::upsert_restore_row(&mut tx, bucket, key, version_id, id, now, fence).await?;
+        tx.commit().await?;
+        Ok((id, inserted))
+    }
+
+    /// 复制模式下的本地 pending 行补写：作业行已进日志，这里只维护节点本地
+    /// `tier_restores`（幂等；版本级对账会修复缺失）。
+    pub async fn upsert_restore_pending(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        job_id: i64,
+        now: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        Self::upsert_restore_row(&mut conn, bucket, key, version_id, job_id, now, fence).await
+    }
+
+    async fn upsert_restore_row(
+        conn: &mut SqliteConnection,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        job_id: i64,
+        now: i64,
+        fence: FencingEpoch,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, created_at, \
              fence_term, fence_leader) \
@@ -4731,14 +4760,13 @@ impl Db {
         .bind(bucket)
         .bind(key)
         .bind(version_id)
-        .bind(id)
+        .bind(job_id)
         .bind(now)
         .bind(fence.term_i64())
         .bind(fence.leader_i64())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        tx.commit().await?;
-        Ok((id, inserted))
+        Ok(())
     }
 
     /// 某状态的 Restore 行（reaper/对账）。

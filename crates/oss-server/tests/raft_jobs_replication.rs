@@ -14,15 +14,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oss_server::db::{Db, JobSpec, NewJobTask};
 use oss_server::job_state::JobState;
-use oss_server::raft::command::ControlCommand;
+use oss_server::raft::command::{ControlCommand, ControlResponse};
 use oss_server::raft::control::ControlPlane;
 use oss_server::raft::data::ControlData;
 use oss_server::raft::runstate::{
     JobRow, JobTaskRow, RunState, decode_runstate_snapshot, encode_runstate_snapshot,
     install_runstate_tx, read_runstate,
 };
-use oss_server::raft::{FencingEpoch, RaftHandle};
+use oss_server::raft::{FencingEpoch, LeaderGate, RaftHandle};
 use oss_server::state::AppState;
+use oss_server::tier_jobs::SqlRestoreSink;
+use xl_s3::restore::RestoreSink;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -280,21 +282,29 @@ async fn leader_writes_replicate_and_survive_snapshot() {
     stale_task.fence_term = 0;
     stale_task.fence_leader = 0;
     let control = control_for(leader, &st);
-    control
-        .write(ControlCommand::JobBatch {
-            jobs: vec![stale_job],
-            tasks: vec![stale_task],
-        })
-        .await
-        .expect("stale batch applies as a no-op");
-    // 原样重放终态（重复投递）也不得改变任何列。
-    control
-        .write(ControlCommand::JobBatch {
-            jobs: vec![done_job],
-            tasks: done_tasks,
-        })
-        .await
-        .expect("duplicate batch is idempotent");
+    assert_eq!(
+        control
+            .write(ControlCommand::JobBatch {
+                jobs: vec![stale_job],
+                tasks: vec![stale_task],
+            })
+            .await
+            .expect("stale batch reaches apply"),
+        ControlResponse::Conflict,
+        "stale row must be rejected as a whole, not written"
+    );
+    // 原样重放终态（重复投递）同样被版本闸拒绝，但不改变任何列。
+    assert_eq!(
+        control
+            .write(ControlCommand::JobBatch {
+                jobs: vec![done_job],
+                tasks: done_tasks,
+            })
+            .await
+            .expect("duplicate batch reaches apply"),
+        ControlResponse::Conflict,
+        "duplicate version is a no-op rejection"
+    );
     for f in &nodes[1..] {
         let db = Arc::clone(&f.db);
         wait_until("no regression on follower", || async {
@@ -348,12 +358,9 @@ async fn new_leader_reclaims_stale_claim_and_finishes_job() {
 
     nodes[0].handle.shutdown().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let leader_id = loop {
-        let seen = nodes[1].handle.raft().metrics().borrow().current_leader;
-        if let Some(l) = seen
-            && l != 1
-        {
-            break l;
+    let new_leader = loop {
+        if let Some(n) = nodes[1..].iter().find(|n| n.handle.is_leader()) {
+            break n;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -361,12 +368,27 @@ async fn new_leader_reclaims_stale_claim_and_finishes_job() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // 两个存活节点都应有该作业行（新 leader 必须有已提交行）。
-    let new_leader = nodes
-        .iter()
-        .find(|n| n.handle.raft().metrics().borrow().id == leader_id)
-        .expect("new leader in cluster");
-    // 死掉的 voter 没有当前 term 的握手 → 生效 feature=1，level-3 命令被现有门拒绝。
+    // P1-6：死 voter 仍在成员表 → 新 term 生效 feature 降为 1，level-3 写必须失败关闭，
+    // 不得退回本地直写（否则 follower 永远收不到该作业）。
+    let leader_handle = Arc::clone(&new_leader.handle);
+    wait_until("effective feature drops after leader death", || async {
+        leader_handle.effective_feature().is_some_and(|l| l < 3)
+    })
+    .await;
+    let jobs = JobState::new(Some(control_for(new_leader, &st)));
+    let err = jobs
+        .create_job(&new_leader.db, &batch_spec(1), now())
+        .await
+        .expect_err("level-3 write must fail closed while a dead voter remains");
+    assert!(err.contains("effective feature"), "{err}");
+    assert!(
+        runstate(&new_leader.db)
+            .await
+            .jobs
+            .iter()
+            .all(|j| j.id != id + 1),
+        "fail-closed write must not create a local-only job row"
+    );
     // 永久失联必须先移除成员（运维修复步骤）才能继续复制；这是本切片的已知运维约束。
     oss_server::raft::membership::apply_local(
         &new_leader.handle,
@@ -375,7 +397,6 @@ async fn new_leader_reclaims_stale_claim_and_finishes_job() {
     .await
     .unwrap();
     wait_ready(new_leader).await;
-    let jobs = JobState::new(Some(control_for(new_leader, &st)));
     let rs = runstate(&new_leader.db).await;
     assert!(
         rs.jobs.iter().any(|j| j.id == id),
@@ -473,6 +494,442 @@ async fn feature_below_three_keeps_local_job_writes() {
             runstate(&f.db).await.jobs.iter().all(|j| j.id != id),
             "feature<3 follower must not receive job rows"
         );
+    }
+}
+
+async fn submit(
+    control: &ControlPlane,
+    jobs: Vec<JobRow>,
+    tasks: Vec<JobTaskRow>,
+) -> ControlResponse {
+    control
+        .write(ControlCommand::JobBatch { jobs, tasks })
+        .await
+        .expect("job batch must reach apply")
+}
+
+/// P1-2/P1-3：apply 的整批只读校验 —— 任何回退行都返回 Conflict 且零写入；
+/// 重复/回退的日志事实不会半批落库。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_guards_reject_whole_batch_without_partial_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    wait_ready(&nodes[0]).await;
+    let leader = &nodes[0];
+    let control = control_for(leader, &st);
+    let jobs = JobState::new(Some(Arc::clone(&control)));
+    let id = jobs
+        .create_job(&leader.db, &batch_spec(2), now())
+        .await
+        .unwrap();
+
+    // 合法新行 + 非法旧行同批：整批拒绝，合法行也不得写入。
+    let mut bad = runstate(&leader.db).await.jobs[0].clone();
+    bad.updated_at -= 1;
+    let fresh_id = id + 100;
+    let fresh = JobRow {
+        id: fresh_id,
+        kind: "batch".into(),
+        bucket: "src".into(),
+        prefix: "p/".into(),
+        state: "queued".into(),
+        created_at: now(),
+        updated_at: now(),
+        ..JobRow::default()
+    };
+    assert_eq!(
+        submit(&control, vec![fresh, bad], Vec::new()).await,
+        ControlResponse::Conflict
+    );
+    assert!(
+        runstate(&leader.db)
+            .await
+            .jobs
+            .iter()
+            .all(|j| j.id != fresh_id),
+        "conflict must not half-apply the valid row"
+    );
+    // 任务引用不存在的作业：整批拒绝。
+    let orphan = JobTaskRow {
+        job_id: 999_999,
+        task_no: 1,
+        action: "DeleteObject".into(),
+        payload_json: "{}".into(),
+        state: "queued".into(),
+        next_at: now(),
+        ..JobTaskRow::default()
+    };
+    assert_eq!(
+        submit(&control, Vec::new(), vec![orphan]).await,
+        ControlResponse::Conflict
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        runstate(&nodes[1].db)
+            .await
+            .jobs
+            .iter()
+            .all(|j| j.id != fresh_id),
+        "follower must reach the same rejection (no divergence)"
+    );
+
+    let fence = leader.handle.fencing_epoch().unwrap();
+    let t = jobs
+        .claim_task_fenced(&leader.db, now(), 60, fence)
+        .await
+        .unwrap()
+        .expect("task claimed");
+    let cur = runstate(&leader.db).await.jobs[0].clone();
+    assert_eq!(cur.state, "running");
+    let mut state_back = cur.clone();
+    state_back.state = "queued".into();
+    state_back.updated_at += 1;
+    assert_eq!(
+        submit(&control, vec![state_back], Vec::new()).await,
+        ControlResponse::Conflict,
+        "running -> queued must be rejected"
+    );
+    let mut counter_back = cur.clone();
+    counter_back.updated_at += 1;
+    counter_back.scanned = -1;
+    assert_eq!(
+        submit(&control, vec![counter_back], Vec::new()).await,
+        ControlResponse::Conflict,
+        "counter regression must be rejected"
+    );
+    let mut started_clear = cur.clone();
+    started_clear.updated_at += 1;
+    started_clear.started_at = None;
+    assert_eq!(
+        submit(&control, vec![started_clear], Vec::new()).await,
+        ControlResponse::Conflict,
+        "started_at must be immutable once set"
+    );
+    let mut task_back = runstate(&leader.db).await.job_tasks[0].clone();
+    task_back.attempt = -1;
+    assert_eq!(
+        submit(&control, Vec::new(), vec![task_back]).await,
+        ControlResponse::Conflict,
+        "attempt regression must be rejected"
+    );
+
+    jobs.job_set_error(&leader.db, id, "boom", now())
+        .await
+        .unwrap();
+    let cur = runstate(&leader.db).await.jobs[0].clone();
+    let mut error_clear = cur.clone();
+    error_clear.updated_at += 1;
+    error_clear.error = None;
+    assert_eq!(
+        submit(&control, vec![error_clear], Vec::new()).await,
+        ControlResponse::Conflict,
+        "error must not be cleared"
+    );
+
+    assert_eq!(
+        jobs.finish_task_fenced(
+            &leader.db,
+            t.job_id,
+            t.task_no,
+            true,
+            "Succeeded",
+            None,
+            now(),
+            3,
+            fence
+        )
+        .await
+        .unwrap(),
+        "done"
+    );
+    let t2 = jobs
+        .claim_task_fenced(&leader.db, now(), 60, fence)
+        .await
+        .unwrap()
+        .expect("second task");
+    assert_eq!(
+        jobs.finish_task_fenced(
+            &leader.db,
+            t2.job_id,
+            t2.task_no,
+            true,
+            "Succeeded",
+            None,
+            now(),
+            3,
+            fence
+        )
+        .await
+        .unwrap(),
+        "done"
+    );
+    let done = runstate(&leader.db).await.jobs[0].clone();
+    assert_eq!(done.state, "done");
+    let mut revive = done.clone();
+    revive.state = "running".into();
+    revive.updated_at += 1;
+    assert_eq!(
+        submit(&control, vec![revive], Vec::new()).await,
+        ControlResponse::Conflict,
+        "terminal job must not revive"
+    );
+    let mut done_task = runstate(&leader.db)
+        .await
+        .job_tasks
+        .iter()
+        .find(|x| x.task_no == t.task_no)
+        .unwrap()
+        .clone();
+    done_task.state = "cancelled".into();
+    assert_eq!(
+        submit(&control, Vec::new(), vec![done_task]).await,
+        ControlResponse::Conflict,
+        "terminal task must not be rewritten"
+    );
+    let rs = runstate(&leader.db).await;
+    assert!(
+        rs.job_tasks
+            .iter()
+            .filter(|x| x.job_id == id)
+            .all(|x| x.state == "done"),
+        "rejected terminal rewrite must not change rows"
+    );
+
+    // P2：去重键冲突是业务拒绝（Conflict），不是 SQL 唯一约束错误 → 不会 fail-stop。
+    let mut dedupe_spec = batch_spec(1);
+    dedupe_spec.tasks[0].dedupe_key = Some("dup-key".into());
+    let first = jobs
+        .create_job(&leader.db, &dedupe_spec, now())
+        .await
+        .unwrap();
+    let before = runstate(&leader.db).await.jobs.len();
+    let err = jobs
+        .create_job(&leader.db, &dedupe_spec, now())
+        .await
+        .unwrap_err();
+    assert!(err.contains("Conflict"), "{err}");
+    let rs = runstate(&leader.db).await;
+    assert_eq!(
+        rs.jobs.len(),
+        before,
+        "rejected dedupe job must not leave a row"
+    );
+    assert!(rs.jobs.iter().any(|j| j.id == first));
+    let mut dup_batch = batch_spec(2);
+    dup_batch.tasks[0].dedupe_key = Some("dup-batch".into());
+    dup_batch.tasks[1].dedupe_key = Some("dup-batch".into());
+    let err = jobs
+        .create_job(&leader.db, &dup_batch, now())
+        .await
+        .unwrap_err();
+    assert!(err.contains("Conflict"), "{err}");
+}
+
+/// P1-1：inventory 进度与 Restore 作业都经 `JobState` 进复制日志；`tier_restores`
+/// 仍是节点本地行（作业提交后幂等补写）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inventory_progress_and_restore_use_logged_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    wait_ready(&nodes[0]).await;
+    let leader = &nodes[0];
+    let jobs = Arc::new(JobState::new(Some(control_for(leader, &st))));
+    let id = jobs
+        .create_job(&leader.db, &batch_spec(1), now())
+        .await
+        .unwrap();
+    let t = now();
+    jobs.set_progress(&leader.db, id, 5, t).await.unwrap();
+    // scanned-1 的负值补偿：progress 允许回退，其余计数仍单调。
+    jobs.set_progress(&leader.db, id, -1, t + 1).await.unwrap();
+    for f in &nodes[1..] {
+        let db = Arc::clone(&f.db);
+        wait_until("inventory progress on follower", || async {
+            runstate(&db)
+                .await
+                .jobs
+                .iter()
+                .any(|j| j.id == id && j.progress == -1)
+        })
+        .await;
+    }
+
+    let sink = SqlRestoreSink::new(
+        Arc::clone(&leader.db),
+        Arc::clone(&jobs),
+        LeaderGate::from_raft(Some(Arc::clone(&leader.handle))),
+    );
+    let rid = sink
+        .enqueue_restore("src", "p/restore", "v1", 1)
+        .await
+        .unwrap();
+    let rs = runstate(&leader.db).await;
+    let job = rs
+        .jobs
+        .iter()
+        .find(|j| j.id == rid)
+        .expect("restore job row");
+    assert_eq!(job.kind, "restore");
+    assert!(
+        rs.job_tasks
+            .iter()
+            .any(|t| t.job_id == rid && t.action == "RestoreObject")
+    );
+    let pending = leader
+        .db
+        .restore_row("src", "p/restore", "v1")
+        .await
+        .unwrap()
+        .expect("local pending row");
+    assert_eq!(pending.state, "pending");
+    assert_eq!(pending.job_id, Some(rid));
+    for f in &nodes[1..] {
+        let db = Arc::clone(&f.db);
+        wait_until("restore job on follower", || async {
+            runstate(&db).await.jobs.iter().any(|j| j.id == rid)
+        })
+        .await;
+        assert!(
+            db.restore_row("src", "p/restore", "v1")
+                .await
+                .unwrap()
+                .is_none(),
+            "tier_restores stays node-local (not in the raft log)"
+        );
+    }
+}
+
+/// P1-4：follower 的管理写不得读旧行后转发；必须明确拒绝。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_job_writes_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    wait_ready(&nodes[0]).await;
+    let leader_jobs = JobState::new(Some(control_for(&nodes[0], &st)));
+    let id = leader_jobs
+        .create_job(&nodes[0].db, &batch_spec(1), now())
+        .await
+        .unwrap();
+    let follower = &nodes[1];
+    let db = Arc::clone(&follower.db);
+    wait_until("job row on follower", || async {
+        runstate(&db).await.jobs.iter().any(|j| j.id == id)
+    })
+    .await;
+    assert!(!follower.handle.is_leader());
+    let jobs = JobState::new(Some(control_for(follower, &st)));
+    assert!(jobs.replicated(), "follower is configured level 3");
+    let errors = [
+        jobs.create_job(&follower.db, &batch_spec(1), now())
+            .await
+            .unwrap_err(),
+        jobs.job_set_state(&follower.db, id, "cancel", now())
+            .await
+            .unwrap_err(),
+        jobs.job_set_error(&follower.db, id, "x", now())
+            .await
+            .unwrap_err(),
+        jobs.job_heartbeat(&follower.db, id, now())
+            .await
+            .unwrap_err(),
+        jobs.set_progress(&follower.db, id, 7, now())
+            .await
+            .unwrap_err(),
+        jobs.finish_task_fenced(
+            &follower.db,
+            id,
+            1,
+            true,
+            "Succeeded",
+            None,
+            now(),
+            3,
+            FencingEpoch::UNFENCED,
+        )
+        .await
+        .unwrap_err(),
+    ];
+    for err in errors {
+        assert!(err.contains("not leader"), "{err}");
+    }
+    let rs = runstate(&follower.db).await;
+    assert!(
+        rs.jobs
+            .iter()
+            .find(|j| j.id == id)
+            .is_some_and(|j| { j.state == "queued" && j.progress == 0 && j.error.is_none() }),
+        "follower-local row must not be written"
+    );
+}
+
+/// P1-3/P1-5：leader 的逻辑版本推进不依赖墙钟；失败重排使用 `Db::retry_backoff_secs`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logical_version_bump_and_bounded_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    wait_ready(&nodes[0]).await;
+    let leader = &nodes[0];
+    let jobs = JobState::new(Some(control_for(leader, &st)));
+    let id = jobs
+        .create_job(&leader.db, &batch_spec(2), now())
+        .await
+        .unwrap();
+    let fence = leader.handle.fencing_epoch().unwrap();
+    let t = jobs
+        .claim_task_fenced(&leader.db, now(), 60, fence)
+        .await
+        .unwrap()
+        .expect("task claimed");
+
+    let cur = runstate(&leader.db).await.jobs[0].updated_at;
+    // 同一 now 连续心跳：leader 必须把 updated_at 推成 cur+1、cur+2（逻辑版本）。
+    jobs.job_heartbeat(&leader.db, id, cur).await.unwrap();
+    let after1 = runstate(&leader.db).await.jobs[0].updated_at;
+    assert_eq!(after1, cur + 1);
+    jobs.job_heartbeat(&leader.db, id, after1).await.unwrap();
+    let after2 = runstate(&leader.db).await.jobs[0].updated_at;
+    assert_eq!(after2, after1 + 1);
+
+    assert_eq!(
+        jobs.finish_task_fenced(
+            &leader.db,
+            t.job_id,
+            t.task_no,
+            false,
+            "InternalError",
+            None,
+            after2,
+            3,
+            fence
+        )
+        .await
+        .unwrap(),
+        "queued"
+    );
+    let leader_task = runstate(&leader.db)
+        .await
+        .job_tasks
+        .iter()
+        .find(|x| x.job_id == id && x.task_no == t.task_no)
+        .unwrap()
+        .clone();
+    assert_eq!(leader_task.attempt, 1);
+    let backoff = leader_task.next_at - after2;
+    assert!(
+        (10..=19).contains(&backoff),
+        "attempt-0 backoff {backoff} outside [10,19]"
+    );
+    for f in &nodes[1..] {
+        let db = Arc::clone(&f.db);
+        let expected = leader_task.clone();
+        wait_until("retry row on follower", || async {
+            runstate(&db)
+                .await
+                .job_tasks
+                .iter()
+                .any(|x| x.job_id == id && x.task_no == t.task_no && *x == expected)
+        })
+        .await;
     }
 }
 

@@ -31,7 +31,7 @@ impl JobState {
         task.started_at = None;
         task.deadline_at = None;
         task.next_at = now;
-        self.commit(Vec::new(), vec![task]).await?;
+        self.commit(db, Vec::new(), vec![task]).await?;
         Ok(true)
     }
 
@@ -59,7 +59,7 @@ impl JobState {
             return Ok(());
         }
         task.deadline_at = Some(deadline_at);
-        self.commit(Vec::new(), vec![task]).await
+        self.commit(db, Vec::new(), vec![task]).await
     }
 
     pub async fn job_state(&self, db: &Db, id: i64) -> Result<Option<String>, String> {
@@ -152,7 +152,7 @@ impl JobState {
         Ok(rows.len())
     }
 
-    /// 无任务 running 行回收；顺带把 tier/lifecycle 本地作业行带进副本。
+    /// 无任务 running 行回收。
     pub async fn recover_orphan_jobs(
         &self,
         db: &Db,
@@ -181,11 +181,11 @@ impl JobState {
                 job.error = Some("进程崩溃遗留的 running 作业，已自动回收".into());
             }
             job.finished_at = Some(now);
-            job.updated_at = now;
+            bump(&mut job, now);
             jobs.push(job);
         }
         let n = jobs.len();
-        self.commit(jobs, Vec::new()).await?;
+        self.commit(db, jobs, Vec::new()).await?;
         Ok(n)
     }
 
@@ -230,11 +230,11 @@ impl JobState {
         for r in &rows {
             let mut job = job_row_from(r);
             job.state = "preempted".into();
-            job.updated_at = now;
+            bump(&mut job, now);
             jobs.push(job);
         }
         let n = jobs.len();
-        self.commit(jobs, Vec::new()).await?;
+        self.commit(db, jobs, Vec::new()).await?;
         Ok(n)
     }
 
@@ -261,11 +261,11 @@ impl JobState {
         for r in &rows {
             let mut job = job_row_from(r);
             job.state = "queued".into();
-            job.updated_at = now;
+            bump(&mut job, now);
             jobs.push(job);
         }
         let n = jobs.len();
-        self.commit(jobs, Vec::new()).await?;
+        self.commit(db, jobs, Vec::new()).await?;
         Ok(n)
     }
 
@@ -282,6 +282,7 @@ impl JobState {
             return db.job_set_state(id, action, now).await.map_err(err);
         }
         let _guard = self.lock.lock().await;
+        self.require_leader("job_set_state")?;
         let Some(mut job) = Self::read_job(db, id).await? else {
             return Ok(false);
         };
@@ -315,8 +316,8 @@ impl JobState {
             }
             _ => return Ok(false),
         }
-        job.updated_at = now;
-        self.commit(vec![job], tasks).await?;
+        bump(&mut job, now);
+        self.commit(db, vec![job], tasks).await?;
         Ok(true)
     }
 
@@ -326,12 +327,13 @@ impl JobState {
             return db.job_set_error(id, msg, now).await.map_err(err);
         }
         let _guard = self.lock.lock().await;
+        self.require_leader("job_set_error")?;
         let Some(mut job) = Self::read_job(db, id).await? else {
             return Ok(());
         };
         job.error = Some(msg.to_string());
-        job.updated_at = now;
-        self.commit(vec![job], Vec::new()).await
+        bump(&mut job, now);
+        self.commit(db, vec![job], Vec::new()).await
     }
 
     /// 长作业心跳（只续 running 行）。
@@ -341,12 +343,13 @@ impl JobState {
             return db.job_heartbeat(id, now).await.map_err(err);
         }
         let _guard = self.lock.lock().await;
+        self.require_leader("job_heartbeat")?;
         let Some(mut job) = Self::read_job(db, id).await? else {
             return Ok(());
         };
         if job.state == "running" {
-            job.updated_at = now;
-            self.commit(vec![job], Vec::new()).await?;
+            bump(&mut job, now);
+            self.commit(db, vec![job], Vec::new()).await?;
         }
         Ok(())
     }
@@ -365,7 +368,7 @@ impl JobState {
             return db.job_start(kind, bucket, prefix, now).await.map_err(err);
         }
         let _guard = self.lock.lock().await;
-        self.require_leader("job_start")?;
+        self.leader_ready("job_start").await?;
         let id = Self::next_job_id(db).await?;
         let job = JobRow {
             id,
@@ -378,7 +381,7 @@ impl JobState {
             started_at: Some(now),
             ..JobRow::default()
         };
-        self.commit(vec![job], Vec::new()).await?;
+        self.commit(db, vec![job], Vec::new()).await?;
         Ok(id)
     }
 
@@ -412,7 +415,7 @@ impl JobState {
         job.deleted = deleted;
         job.skipped = skipped;
         job.error = error.map(str::to_string);
-        job.updated_at = now;
-        self.commit(vec![job], Vec::new()).await
+        bump(&mut job, now);
+        self.commit(db, vec![job], Vec::new()).await
     }
 }

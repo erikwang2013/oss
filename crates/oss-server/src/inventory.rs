@@ -30,6 +30,7 @@ use xl_store::meta::{ChecksumRecord, EncryptionRecord, ObjectLockRecord};
 use xl_store::store::{ByteStream, ListRequest, ObjectInfo, Store, VersioningMode};
 
 use crate::db::{Db, JobSpec, NewJobTask};
+use crate::job_state::JobState;
 use crate::jobs::TaskExecutor;
 use crate::raft::{FencingEpoch, LeaderGate};
 
@@ -321,6 +322,7 @@ fn now_nanos() -> i64 {
 /// 生成器（`TaskExecutor` 的 `Inventory` 动作）。
 pub struct InventoryRunner {
     db: Arc<Db>,
+    jobs: Arc<JobState>,
     store: Arc<Store>,
     acl: Acl,
     staging_dir: PathBuf,
@@ -330,6 +332,7 @@ pub struct InventoryRunner {
 impl InventoryRunner {
     pub fn new(
         db: Arc<Db>,
+        jobs: Arc<JobState>,
         store: Arc<Store>,
         acl: Acl,
         staging_dir: PathBuf,
@@ -337,10 +340,20 @@ impl InventoryRunner {
     ) -> Self {
         Self {
             db,
+            jobs,
             store,
             acl,
             staging_dir,
             gate,
+        }
+    }
+
+    /// 作业进度写入门面：level 3 经复制日志；失败只告警（作业收尾另行兜底）。
+    async fn set_progress(&self, job_id: Option<i64>, progress: i64, now: i64) {
+        if let Some(j) = job_id
+            && let Err(e) = self.jobs.set_progress(&self.db, j, progress, now).await
+        {
+            tracing::warn!(job = j, error = %e, "inventory 作业进度写入失败");
         }
     }
 
@@ -352,10 +365,8 @@ impl InventoryRunner {
         fence: FencingEpoch,
     ) -> String {
         let now = crate::db::now();
-        if let Some(j) = job_id {
-            // 引擎在任务收尾时 progress+1；存 -1 让终值为 0。
-            let _ = self.db.job_set_progress(j, -1, now).await;
-        }
+        // 引擎在任务收尾时 progress+1；存 -1 让终值为 0。
+        self.set_progress(job_id, -1, now).await;
         let _ = self
             .db
             .inventory_run_finish(run_id, "error", None, Some(&msg), fence)
@@ -390,9 +401,7 @@ impl InventoryRunner {
             .inventory_run_started(run.id, now, fence)
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(j) = run.job_id {
-            let _ = self.db.job_set_progress(j, 0, now).await;
-        }
+        self.set_progress(run.job_id, 0, now).await;
         let (cfg, recorded_source_account): (InventoryConfiguration, Option<String>) =
             match config_from_json(&cfg_row.config_json) {
                 Ok(c) => c,
@@ -402,9 +411,7 @@ impl InventoryRunner {
                 }
             };
         if !cfg.is_enabled {
-            if let Some(j) = run.job_id {
-                let _ = self.db.job_set_progress(j, -1, now).await;
-            }
+            self.set_progress(run.job_id, -1, now).await;
             let _ = self
                 .db
                 .inventory_run_finish(run.id, "skipped", None, None, fence)
@@ -591,10 +598,8 @@ impl InventoryRunner {
             .await;
         let _ = std::fs::remove_file(&tmp);
         let now = crate::db::now();
-        if let Some(j) = run.job_id {
-            // 引擎在任务收尾时 progress+1；存 scanned-1 让终值 = 已扫描数。
-            let _ = self.db.job_set_progress(j, scanned - 1, now).await;
-        }
+        // 引擎在任务收尾时 progress+1；存 scanned-1 让终值 = 已扫描数。
+        self.set_progress(run.job_id, scanned - 1, now).await;
         match result {
             Ok(()) => {
                 // H1：先把 run 落 done，再推进水位。done 失败时水位不动，任务重试会重放
@@ -832,12 +837,7 @@ impl InventoryRunner {
                 sink.write(&current_fields(bucket, info))?;
             }
             *scanned += page.objects.len() as i64;
-            if let Some(j) = job_id {
-                let _ = self
-                    .db
-                    .job_set_progress(j, *scanned, crate::db::now())
-                    .await;
-            }
+            self.set_progress(job_id, *scanned, crate::db::now()).await;
             check_size(size)?;
             if !page.is_truncated {
                 return Ok(());
@@ -900,12 +900,7 @@ impl InventoryRunner {
                 sink.write(&version_fields(bucket, e, head.as_ref()))?;
             }
             *scanned += page.entries.len() as i64;
-            if let Some(j) = job_id {
-                let _ = self
-                    .db
-                    .job_set_progress(j, *scanned, crate::db::now())
-                    .await;
-            }
+            self.set_progress(job_id, *scanned, crate::db::now()).await;
             check_size(size)?;
             if !page.is_truncated {
                 return Ok(());
