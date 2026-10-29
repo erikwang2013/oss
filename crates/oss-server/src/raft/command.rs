@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::COMMAND_MAX_BYTES;
-use super::runstate::{JobRow, JobTaskRow};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 
 /// 子账户 × 桶的三档权限（自然键：username + bucket）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,9 +297,12 @@ pub enum ControlCommand {
         task: JobTaskRow,
     },
     /// 一次原子提交多行（建作业 + 任务、领取、收尾）。整批仍受 24 MiB 上限。
+    /// `restores` 与 Restore 建作业同批落日志（P2-1）；空时字段不序列化，旧形态不变。
     JobBatch {
         jobs: Vec<JobRow>,
         tasks: Vec<JobTaskRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restores: Vec<TierRestoreRow>,
     },
 
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。

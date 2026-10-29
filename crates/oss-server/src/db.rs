@@ -4495,7 +4495,8 @@ impl Db {
         Ok(id)
     }
 
-    /// 收尾一条作业（done/error + 计数 + 可选错误）。
+    /// 收尾一条作业（done/error + 计数 + 可选错误）。`error=None` 保留已有错误
+    /// （与复制路径一致：错误一旦落库不可被收尾静默清空）。
     #[allow(clippy::too_many_arguments)]
     pub async fn job_finish(
         &self,
@@ -4508,8 +4509,8 @@ impl Db {
         now: i64,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET state = ?, scanned = ?, deleted = ?, skipped = ?, error = ?, \
-             updated_at = ? WHERE id = ?",
+            "UPDATE jobs SET state = ?, scanned = ?, deleted = ?, skipped = ?, \
+             error = COALESCE(?, error), updated_at = ? WHERE id = ?",
         )
         .bind(state)
         .bind(scanned)
@@ -4720,21 +4721,6 @@ impl Db {
         Self::upsert_restore_row(&mut tx, bucket, key, version_id, id, now, fence).await?;
         tx.commit().await?;
         Ok((id, inserted))
-    }
-
-    /// 复制模式下的本地 pending 行补写：作业行已进日志，这里只维护节点本地
-    /// `tier_restores`（幂等；版本级对账会修复缺失）。
-    pub async fn upsert_restore_pending(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: &str,
-        job_id: i64,
-        now: i64,
-        fence: FencingEpoch,
-    ) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        Self::upsert_restore_row(&mut conn, bucket, key, version_id, job_id, now, fence).await
     }
 
     async fn upsert_restore_row(

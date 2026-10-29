@@ -287,6 +287,7 @@ async fn leader_writes_replicate_and_survive_snapshot() {
             .write(ControlCommand::JobBatch {
                 jobs: vec![stale_job],
                 tasks: vec![stale_task],
+                restores: Vec::new(),
             })
             .await
             .expect("stale batch reaches apply"),
@@ -299,6 +300,7 @@ async fn leader_writes_replicate_and_survive_snapshot() {
             .write(ControlCommand::JobBatch {
                 jobs: vec![done_job],
                 tasks: done_tasks,
+                restores: Vec::new(),
             })
             .await
             .expect("duplicate batch reaches apply"),
@@ -503,7 +505,11 @@ async fn submit(
     tasks: Vec<JobTaskRow>,
 ) -> ControlResponse {
     control
-        .write(ControlCommand::JobBatch { jobs, tasks })
+        .write(ControlCommand::JobBatch {
+            jobs,
+            tasks,
+            restores: Vec::new(),
+        })
         .await
         .expect("job batch must reach apply")
 }
@@ -605,6 +611,31 @@ async fn apply_guards_reject_whole_batch_without_partial_writes() {
         ControlResponse::Conflict,
         "started_at must be immutable once set"
     );
+    // P3-2：job 身份字段（bucket/prefix/spec_json）冻结；更新版本号也不得改写。
+    let mut identity = cur.clone();
+    identity.updated_at += 1;
+    identity.bucket = "other".into();
+    assert_eq!(
+        submit(&control, vec![identity], Vec::new()).await,
+        ControlResponse::Conflict,
+        "job bucket is identity"
+    );
+    let mut identity = cur.clone();
+    identity.updated_at += 1;
+    identity.prefix = "other/".into();
+    assert_eq!(
+        submit(&control, vec![identity], Vec::new()).await,
+        ControlResponse::Conflict,
+        "job prefix is identity"
+    );
+    let mut identity = cur.clone();
+    identity.updated_at += 1;
+    identity.spec_json = Some("{\"changed\":true}".into());
+    assert_eq!(
+        submit(&control, vec![identity], Vec::new()).await,
+        ControlResponse::Conflict,
+        "job spec_json is identity"
+    );
     let mut task_back = runstate(&leader.db).await.job_tasks[0].clone();
     task_back.attempt = -1;
     assert_eq!(
@@ -686,6 +717,40 @@ async fn apply_guards_reject_whole_batch_without_partial_writes() {
         ControlResponse::Conflict,
         "terminal task must not be rewritten"
     );
+    // P3-1：终态行的 action/payload_json/next_at/deadline_at 一并冻结。
+    let terminal = runstate(&leader.db)
+        .await
+        .job_tasks
+        .iter()
+        .find(|x| x.task_no == t.task_no)
+        .unwrap()
+        .clone();
+    for (why, mutate) in [
+        (
+            "terminal action frozen",
+            (|x: &mut JobTaskRow| x.action = "PutObject".into()) as fn(&mut JobTaskRow),
+        ),
+        (
+            "terminal payload_json frozen",
+            (|x: &mut JobTaskRow| x.payload_json = "{}".into()) as fn(&mut JobTaskRow),
+        ),
+        (
+            "terminal next_at frozen",
+            (|x: &mut JobTaskRow| x.next_at += 1) as fn(&mut JobTaskRow),
+        ),
+        (
+            "terminal deadline_at frozen",
+            (|x: &mut JobTaskRow| x.deadline_at = Some(now())) as fn(&mut JobTaskRow),
+        ),
+    ] {
+        let mut row = terminal.clone();
+        mutate(&mut row);
+        assert_eq!(
+            submit(&control, Vec::new(), vec![row]).await,
+            ControlResponse::Conflict,
+            "{why}"
+        );
+    }
     let rs = runstate(&leader.db).await;
     assert!(
         rs.job_tasks
@@ -723,10 +788,31 @@ async fn apply_guards_reject_whole_batch_without_partial_writes() {
         .await
         .unwrap_err();
     assert!(err.contains("Conflict"), "{err}");
+
+    // P3-3：job_finish(error=None) 保留已落库错误，不得被 error 冻结整批拒绝。
+    let jid = jobs
+        .job_start(&leader.db, "lifecycle", "src", "", now())
+        .await
+        .unwrap();
+    jobs.job_set_error(&leader.db, jid, "keep-me", now())
+        .await
+        .unwrap();
+    jobs.job_finish(&leader.db, jid, "error", 0, 0, 0, None, now() + 1)
+        .await
+        .unwrap();
+    let finished = runstate(&leader.db)
+        .await
+        .jobs
+        .iter()
+        .find(|j| j.id == jid)
+        .cloned()
+        .expect("finished job row");
+    assert_eq!(finished.state, "error");
+    assert_eq!(finished.error.as_deref(), Some("keep-me"));
 }
 
-/// P1-1：inventory 进度与 Restore 作业都经 `JobState` 进复制日志；`tier_restores`
-/// 仍是节点本地行（作业提交后幂等补写）。
+/// P1-1/P2-1：inventory 进度与 Restore 作业都经 `JobState` 进复制日志；Restore 的
+/// `tier_restores` pending 行与作业同批复制到 follower（不再是节点本地补写）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inventory_progress_and_restore_use_logged_jobs() {
     let dir = tempfile::tempdir().unwrap();
@@ -785,18 +871,74 @@ async fn inventory_progress_and_restore_use_logged_jobs() {
     assert_eq!(pending.job_id, Some(rid));
     for f in &nodes[1..] {
         let db = Arc::clone(&f.db);
-        wait_until("restore job on follower", || async {
+        wait_until("restore job + pending row on follower", || async {
             runstate(&db).await.jobs.iter().any(|j| j.id == rid)
+                && db
+                    .restore_row("src", "p/restore", "v1")
+                    .await
+                    .unwrap()
+                    .is_some_and(|r| r.state == "pending" && r.job_id == Some(rid))
         })
         .await;
-        assert!(
-            db.restore_row("src", "p/restore", "v1")
+    }
+}
+
+/// P2-1：入队（pending 行已复制）后、执行前 leader 换届，新 leader 仍能看到该行，
+/// 不会出现“缺行 → 该版本永远不会被恢复”的窗口。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_row_survives_leader_change_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, st) = start_cluster(dir.path(), 3).await;
+    wait_ready(&nodes[0]).await;
+    let jobs = Arc::new(JobState::new(Some(control_for(&nodes[0], &st))));
+    let sink = SqlRestoreSink::new(
+        Arc::clone(&nodes[0].db),
+        Arc::clone(&jobs),
+        LeaderGate::from_raft(Some(Arc::clone(&nodes[0].handle))),
+    );
+    let rid = sink
+        .enqueue_restore("src", "p/failover", "v1", 1)
+        .await
+        .unwrap();
+    // 等副本都拿到 pending 行后再杀 leader（模拟“已入队、尚未执行”）。
+    for f in &nodes[1..] {
+        let db = Arc::clone(&f.db);
+        wait_until("pending row on follower before failover", || async {
+            db.restore_row("src", "p/failover", "v1")
                 .await
                 .unwrap()
-                .is_none(),
-            "tier_restores stays node-local (not in the raft log)"
-        );
+                .is_some_and(|r| r.state == "pending" && r.job_id == Some(rid))
+        })
+        .await;
     }
+    nodes[0].handle.shutdown().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let new_leader = loop {
+        if let Some(n) = nodes[1..].iter().find(|n| n.handle.is_leader()) {
+            break n;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no new leader after shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let row = new_leader
+        .db
+        .restore_row("src", "p/failover", "v1")
+        .await
+        .unwrap()
+        .expect("new leader must already have the replicated pending row");
+    assert_eq!(row.state, "pending");
+    assert_eq!(row.job_id, Some(rid));
+    assert!(
+        runstate(&new_leader.db)
+            .await
+            .jobs
+            .iter()
+            .any(|j| j.id == rid),
+        "restore job row must survive the failover too"
+    );
 }
 
 /// P1-4：follower 的管理写不得读旧行后转发；必须明确拒绝。
@@ -943,6 +1085,7 @@ fn job_batch_respects_command_size_cap() {
             payload_json: "x".repeat(24 * 1024 * 1024 + 1),
             ..JobTaskRow::default()
         }],
+        restores: Vec::new(),
     };
     assert!(big.check_size().is_err(), "超过 24 MiB 必须拒绝 append");
     let small = ControlCommand::JobBatch {
@@ -951,6 +1094,7 @@ fn job_batch_respects_command_size_cap() {
             ..JobRow::default()
         }],
         tasks: Vec::new(),
+        restores: Vec::new(),
     };
     assert!(small.check_size().is_ok());
 }

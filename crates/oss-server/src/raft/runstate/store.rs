@@ -484,5 +484,9 @@ async fn write_rows(conn: &mut SqliteConnection, state: &RunState) -> Result<(),
                 .map_err(sql)?;
         }
     }
+    // 安装后的行全部来自日志/快照：重启守卫不再要求空表。
+    crate::raft::compat::mark_runstate_activated_tx(conn)
+        .await
+        .map_err(sql)?;
     Ok(())
 }

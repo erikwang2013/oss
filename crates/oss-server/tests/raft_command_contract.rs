@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use oss_server::raft::runstate::{JobRow, JobTaskRow};
+use oss_server::raft::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 use oss_server::raft::{ControlCommand, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits};
 
 fn fixture_path() -> PathBuf {
@@ -279,6 +279,15 @@ fn all_variants() -> Vec<ControlCommand> {
                 job_id: 2,
                 task_no: 1,
                 ..JobTaskRow::default()
+            }],
+            // P2-1：Restore 受理行与作业同批复制。
+            restores: vec![TierRestoreRow {
+                bucket: "b1".into(),
+                key: "p/obj".into(),
+                version_id: "v1".into(),
+                job_id: Some(2),
+                state: "pending".into(),
+                ..TierRestoreRow::default()
             }],
         },
     ]

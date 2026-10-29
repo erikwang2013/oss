@@ -37,6 +37,8 @@ pub const WIRE_HEADER: &str = "x-oss-raft-wire-version";
 pub const FEATURE_HEADER: &str = "x-oss-raft-feature-level";
 /// `schema_meta` 中的激活标记（节点本地；缺省 = 1，单调不减）。
 pub const META_FEATURE_LEVEL: &str = "raft_feature_level";
+/// 运行态激活标记：本机 jobs/job_tasks 自激活起全部来自复制日志/快照（节点本地）。
+pub const META_RUNSTATE_ACTIVATED: &str = "m8_runstate_activated";
 
 /// 本二进制能否应用某个 feature level（未知更高 level 一律 false）。
 pub fn supports(level: u8) -> bool {
@@ -105,6 +107,76 @@ pub fn guard_startup(marker: u8, configured: u8) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 运行态激活标记：与 level-3 快照/导出安装同事务写入（安装后的行都是日志事实）。
+pub async fn mark_runstate_activated_tx(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES (?, '1') \
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+    )
+    .bind(META_RUNSTATE_ACTIVATED)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// P1-A 激活边界：level-3 复制要求本地运行态为空（或已标记激活）。
+///
+/// level 2 的 jobs/job_tasks 是各节点本地行，从未进入日志；直接以 feature 3 启动会让
+/// 首次 JobBatch 用本副本历史行判身份/版本、用本机 MAX(id) 分配 id，可能静默丢作业或
+/// 撞 id。因此只有空表（首次激活）或已安装过 level-3 快照/cutover（行已全部是日志事实）
+/// 才放行；空表放行时写入标记，后续重启不再检查行是否为空。
+pub async fn guard_runstate_activation(
+    pool: &sqlx::SqlitePool,
+    configured: u8,
+) -> Result<(), String> {
+    if advertised_feature(configured) < FEATURE_OSSCTL2 {
+        return Ok(());
+    }
+    let activated: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+            .bind(META_RUNSTATE_ACTIVATED)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("读取 schema_meta.{META_RUNSTATE_ACTIVATED} 失败: {e}"))?;
+    match activated.as_deref() {
+        Some("1") => return Ok(()),
+        None => {}
+        Some(other) => {
+            return Err(format!(
+                "schema_meta.{META_RUNSTATE_ACTIVATED}={other:?} 非法（只认 \"1\"）"
+            ));
+        }
+    }
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("统计 jobs 失败: {e}"))?;
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("统计 job_tasks 失败: {e}"))?;
+    if jobs == 0 && tasks == 0 {
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| format!("获取连接写 {META_RUNSTATE_ACTIVATED} 失败: {e}"))?;
+        mark_runstate_activated_tx(&mut conn)
+            .await
+            .map_err(|e| format!("写 schema_meta.{META_RUNSTATE_ACTIVATED} 失败: {e}"))?;
+        return Ok(());
+    }
+    Err(format!(
+        "[raft].feature_level={configured} 要求 level-3 运行态已激活，但本地 jobs={jobs}、\
+         job_tasks={tasks} 非空且未见 schema_meta.{META_RUNSTATE_ACTIVATED}。level-2 的本地\
+         作业行不在复制日志中，直接激活会静默丢作业或产生 ID 冲突。运维步骤：保持 \
+         feature_level<3 启动，等待所有作业进入终态并完成/导出，备份控制库后清空 \
+         jobs/job_tasks（或用 raft-export 备份后在新集群 raft-cutover 重灌），确认两表为空\
+         后再以 feature_level>=3 重启。本二进制不迁移 level-2 本地作业行。"
+    ))
 }
 
 /// apply 事务内更新激活标记：只升不降（R10：与首条 level-2 entry 同事务提交）。
@@ -341,6 +413,41 @@ mod tests {
         bump_activation_tx(&mut conn, 2).await.unwrap();
         drop(conn);
         assert_eq!(read_activation(&pool).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn runstate_activation_guard_allows_empty_tables_and_sets_marker() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        // level 2 不检查，也不落标记。
+        assert!(guard_runstate_activation(db.pool(), 2).await.is_ok());
+        assert_eq!(db.schema_meta(META_RUNSTATE_ACTIVATED).await.unwrap(), None);
+        // 空表 level 3：放行并写激活标记（后续重启不再要求空表）。
+        assert!(guard_runstate_activation(db.pool(), 3).await.is_ok());
+        assert_eq!(
+            db.schema_meta(META_RUNSTATE_ACTIVATED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn runstate_activation_guard_rejects_level2_rows_without_marker() {
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        db.create_job(&crate::db::JobSpec::default(), 1)
+            .await
+            .unwrap();
+        let err = guard_runstate_activation(db.pool(), 3).await.unwrap_err();
+        assert!(
+            err.contains("jobs=1") && err.contains("feature_level"),
+            "{err}"
+        );
+        // 已安装 level-3 快照/cutover（有标记）→ 非空表也放行，避免重启误拒。
+        let mut conn = db.pool().acquire().await.unwrap();
+        mark_runstate_activated_tx(&mut conn).await.unwrap();
+        drop(conn);
+        assert!(guard_runstate_activation(db.pool(), 3).await.is_ok());
     }
 
     #[test]

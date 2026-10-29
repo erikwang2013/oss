@@ -642,6 +642,15 @@ fn now_secs() -> i64 {
 }
 
 /// M9 S6c：控制写拒绝 → s3s 错误（不静默降级）。
+/// Restore 入队失败：follower（not leader）沿用既有 503 可重试语义，其余为 500。
+fn restore_enqueue_error(msg: &str) -> s3s::S3Error {
+    if msg.contains("not leader") {
+        s3s::s3_error!(ServiceUnavailable, "restore enqueue failed: {}", msg)
+    } else {
+        s3s::s3_error!(InternalError, "restore enqueue failed")
+    }
+}
+
 fn bucket_control_error(e: BucketControlError) -> s3s::S3Error {
     match e {
         BucketControlError::NotFound => s3s::s3_error!(NoSuchBucket, "bucket not found"),
@@ -3880,7 +3889,7 @@ impl S3 for OssS3 {
             if let Err(re) = self.store.abort_restore(&bucket, &key, &version_id).await {
                 tracing::warn!(error = %re, bucket, key, "Restore 回滚失败");
             }
-            return Err(s3s::s3_error!(InternalError, "restore enqueue failed"));
+            return Err(restore_enqueue_error(&e));
         }
         self.emit(
             S3EventOp::RestorePost,
@@ -4427,6 +4436,17 @@ fn ct_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_enqueue_error_maps_not_leader_to_503() {
+        let e = restore_enqueue_error("create_restore: not leader; retry on the leader");
+        assert_eq!(e.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(e.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        // 其他入队失败仍是 500，不回显内部错误文案。
+        let e = restore_enqueue_error("disk full");
+        assert_eq!(e.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(e.message(), Some("restore enqueue failed"));
+    }
 
     #[test]
     fn bucket_control_error_mapping_is_specific() {

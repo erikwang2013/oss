@@ -311,6 +311,13 @@ impl AppState {
         db.prepare_raft_mode(cfg.raft.is_some()).await?;
         // S6d：模式与库内触发器/站点状态一致才放行。
         db.assert_mode_guards().await?;
+        // M8-2 P1-A：level 2 的本地作业行不在日志里，level-3 激活前必须为空（或已安装
+        // 过 level-3 快照/cutover）。守卫在 Raft 启动前，拒绝时不会进入 apply。
+        if let Some(settings) = &raft_settings {
+            crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
+                .await
+                .map_err(|e| format!("[raft] 运行态激活守卫：{e}"))?;
+        }
         // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
         // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；
         // 请求级账户绑定在两种模式下都 fail-closed。

@@ -31,7 +31,7 @@ impl JobState {
         task.started_at = None;
         task.deadline_at = None;
         task.next_at = now;
-        self.commit(db, Vec::new(), vec![task]).await?;
+        self.commit(db, Vec::new(), vec![task], Vec::new()).await?;
         Ok(true)
     }
 
@@ -59,7 +59,7 @@ impl JobState {
             return Ok(());
         }
         task.deadline_at = Some(deadline_at);
-        self.commit(db, Vec::new(), vec![task]).await
+        self.commit(db, Vec::new(), vec![task], Vec::new()).await
     }
 
     pub async fn job_state(&self, db: &Db, id: i64) -> Result<Option<String>, String> {
@@ -185,7 +185,7 @@ impl JobState {
             jobs.push(job);
         }
         let n = jobs.len();
-        self.commit(db, jobs, Vec::new()).await?;
+        self.commit(db, jobs, Vec::new(), Vec::new()).await?;
         Ok(n)
     }
 
@@ -234,7 +234,7 @@ impl JobState {
             jobs.push(job);
         }
         let n = jobs.len();
-        self.commit(db, jobs, Vec::new()).await?;
+        self.commit(db, jobs, Vec::new(), Vec::new()).await?;
         Ok(n)
     }
 
@@ -265,7 +265,7 @@ impl JobState {
             jobs.push(job);
         }
         let n = jobs.len();
-        self.commit(db, jobs, Vec::new()).await?;
+        self.commit(db, jobs, Vec::new(), Vec::new()).await?;
         Ok(n)
     }
 
@@ -317,7 +317,7 @@ impl JobState {
             _ => return Ok(false),
         }
         bump(&mut job, now);
-        self.commit(db, vec![job], tasks).await?;
+        self.commit(db, vec![job], tasks, Vec::new()).await?;
         Ok(true)
     }
 
@@ -333,7 +333,7 @@ impl JobState {
         };
         job.error = Some(msg.to_string());
         bump(&mut job, now);
-        self.commit(db, vec![job], Vec::new()).await
+        self.commit(db, vec![job], Vec::new(), Vec::new()).await
     }
 
     /// 长作业心跳（只续 running 行）。
@@ -349,7 +349,7 @@ impl JobState {
         };
         if job.state == "running" {
             bump(&mut job, now);
-            self.commit(db, vec![job], Vec::new()).await?;
+            self.commit(db, vec![job], Vec::new(), Vec::new()).await?;
         }
         Ok(())
     }
@@ -381,7 +381,7 @@ impl JobState {
             started_at: Some(now),
             ..JobRow::default()
         };
-        self.commit(db, vec![job], Vec::new()).await?;
+        self.commit(db, vec![job], Vec::new(), Vec::new()).await?;
         Ok(id)
     }
 
@@ -414,8 +414,11 @@ impl JobState {
         job.scanned = scanned;
         job.deleted = deleted;
         job.skipped = skipped;
-        job.error = error.map(str::to_string);
+        // error=None 保留已落库的错误（apply 禁止清空；收尾不得整批被拒）。
+        if let Some(e) = error {
+            job.error = Some(e.to_string());
+        }
         bump(&mut job, now);
-        self.commit(db, vec![job], Vec::new()).await
+        self.commit(db, vec![job], Vec::new(), Vec::new()).await
     }
 }

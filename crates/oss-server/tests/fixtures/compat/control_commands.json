@@ -163,6 +163,7 @@
   ],
   "JobBatch": [
     "jobs",
+    "restores",
     "tasks"
   ],
   "JobTaskUpsert": [

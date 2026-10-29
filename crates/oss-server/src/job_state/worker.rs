@@ -49,7 +49,7 @@ impl JobState {
         .await
         .map_err(err)?;
         let Some(row) = candidate else {
-            self.commit(db, jobs, Vec::new()).await?;
+            self.commit(db, jobs, Vec::new(), Vec::new()).await?;
             return Ok(None);
         };
         let mut task = job_task_row_from(&row);
@@ -76,7 +76,7 @@ impl JobState {
         task.deadline_at = Some(now + timeout_secs);
         task.fence_term = fence.term_i64();
         task.fence_leader = fence.leader_i64();
-        self.commit(db, vec![job], vec![task]).await?;
+        self.commit(db, vec![job], vec![task], Vec::new()).await?;
         Ok(Some(claimed))
     }
 
@@ -150,7 +150,7 @@ impl JobState {
             job.state = if job.failed > 0 { "error" } else { "done" }.into();
             job.finished_at = Some(now);
         }
-        self.commit(db, vec![job], vec![task]).await?;
+        self.commit(db, vec![job], vec![task], Vec::new()).await?;
         Ok(if ok {
             "done"
         } else if attempt + 1 < max_attempts {

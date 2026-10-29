@@ -1,7 +1,8 @@
 //! M8 S4b：Transition sweep、Restore reaper 与启动对账（executor 见 `tier_jobs`）。
 //!
 //! M8-1：Raft 模式下 sweep/reaper/启动对账只在 leader 跑（[`crate::raft::LeaderGate`]）；
-//! `tier_restores`/作业表仍是节点本地表，门控只防重复执行，不复制运行态（backlog §4.3）。
+//! M8-2：`tier_restores` 的受理行随作业进复制日志（按主键 upsert），执行侧状态转换
+//! 仍是 leader 本地写，follower 靠 level-3 快照安装与对账收敛。
 
 use std::sync::Arc;
 
@@ -440,6 +441,10 @@ pub async fn reconcile_restores_fenced(
                 Err(_) => continue,
             };
             let phase = v.as_ref().and_then(|v| v.tier.as_ref()).map(|t| t.phase);
+            let version_expiry = v
+                .as_ref()
+                .and_then(|v| v.tier.as_ref())
+                .and_then(|t| t.restore_expires_at);
             if phase.is_none() {
                 let _ = db
                     .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
@@ -452,6 +457,21 @@ pub async fn reconcile_restores_fenced(
                 if !active {
                     let _ = sink
                         .enqueue_restore(&r.bucket, &r.key, &r.version_id, 1)
+                        .await;
+                }
+            } else if state == "pending" && phase == Some(TierPhase::Restored) {
+                // P2-1：复制行在 follower 上可能滞后于版本（执行/提交只在 leader），
+                // 按版本事实收敛，避免旧 pending 行在换 leader 后被再次重排。
+                if let Some(e) = version_expiry {
+                    let _ = db
+                        .set_restore_state_fenced(
+                            &r.bucket,
+                            &r.key,
+                            &r.version_id,
+                            "restored",
+                            e,
+                            fence,
+                        )
                         .await;
                 }
             }

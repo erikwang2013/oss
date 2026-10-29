@@ -8,12 +8,12 @@
 use base64::Engine as _;
 use std::collections::HashSet;
 
-use sqlx::SqliteConnection;
+use sqlx::{Row, SqliteConnection};
 
 mod accounts;
 
 use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
-use super::runstate::{JobRow, JobTaskRow, job_row_from, job_task_row_from};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
@@ -765,12 +765,16 @@ pub(crate) async fn apply_command(
         },
         // M8-2：jobs/job_tasks 行复制（确定性 upsert，无时钟/随机）。
         ControlCommand::JobUpsert { job } => {
-            apply_job_batch(cw, std::slice::from_ref(job), &[]).await?
+            apply_job_batch(cw, std::slice::from_ref(job), &[], &[]).await?
         }
         ControlCommand::JobTaskUpsert { task } => {
-            apply_job_batch(cw, &[], std::slice::from_ref(task)).await?
+            apply_job_batch(cw, &[], std::slice::from_ref(task), &[]).await?
         }
-        ControlCommand::JobBatch { jobs, tasks } => apply_job_batch(cw, jobs, tasks).await?,
+        ControlCommand::JobBatch {
+            jobs,
+            tasks,
+            restores,
+        } => apply_job_batch(cw, jobs, tasks, restores).await?,
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
@@ -852,7 +856,12 @@ fn job_row_ok(cur: Option<&JobRow>, next: &JobRow) -> Result<(), String> {
             Err(format!("job {}: new row in state {}", next.id, next.state))
         };
     };
-    if cur.kind != next.kind || cur.created_at != next.created_at {
+    if cur.kind != next.kind
+        || cur.created_at != next.created_at
+        || cur.bucket != next.bucket
+        || cur.prefix != next.prefix
+        || cur.spec_json != next.spec_json
+    {
         return Err(format!("job {}: identity changed", next.id));
     }
     if next.updated_at <= cur.updated_at {
@@ -908,6 +917,10 @@ fn task_row_ok(cur: Option<&JobTaskRow>, next: &JobTaskRow) -> Result<(), String
             && next.fence_leader == cur.fence_leader
             && next.result_code == cur.result_code
             && next.result_string == cur.result_string
+            && next.action == cur.action
+            && next.payload_json == cur.payload_json
+            && next.next_at == cur.next_at
+            && next.deadline_at == cur.deadline_at
             && next.started_at == cur.started_at
             && next.finished_at == cur.finished_at
         {
@@ -953,6 +966,78 @@ async fn current_task(
         .fetch_optional(&mut *cw.conn)
         .await?;
     Ok(row.as_ref().map(job_task_row_from))
+}
+
+/// Restore 行按 `(bucket,key,version_id)` 读取（P2-1：创建行随 JobBatch 复制）。
+async fn current_restore(
+    cw: &mut ControlWrite<'_>,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<TierRestoreRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT bucket, key, version_id, expires_at, job_id, state, created_at, \
+          fence_term, fence_leader FROM tier_restores \
+         WHERE bucket = ? AND key = ? AND version_id = ?",
+    )
+    .bind(bucket)
+    .bind(key)
+    .bind(version_id)
+    .fetch_optional(&mut *cw.conn)
+    .await?;
+    Ok(row.map(|r| TierRestoreRow {
+        bucket: r.get("bucket"),
+        key: r.get("key"),
+        version_id: r.get("version_id"),
+        expires_at: r.get("expires_at"),
+        job_id: r.get("job_id"),
+        state: r.get("state"),
+        created_at: r.get("created_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }))
+}
+
+/// Restore 行只允许已知状态，且 fence 不得回退（行被更高 term 接管后旧日志不得降级）。
+fn restore_row_ok(cur: Option<&TierRestoreRow>, next: &TierRestoreRow) -> Result<(), String> {
+    if !matches!(next.state.as_str(), "pending" | "restored") {
+        return Err(format!(
+            "restore {}/{}/{}: unknown state {}",
+            next.bucket, next.key, next.version_id, next.state
+        ));
+    }
+    if cur.is_some_and(|cur| next.fence_term < cur.fence_term) {
+        return Err(format!(
+            "restore {}/{}/{}: fence regressed",
+            next.bucket, next.key, next.version_id
+        ));
+    }
+    Ok(())
+}
+
+/// 按主键 upsert Restore 行；fence 单调由 [`restore_row_ok`] 预检，WHERE 是防御性兜底。
+async fn apply_restore(cw: &mut ControlWrite<'_>, r: &TierRestoreRow) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, \
+          created_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
+          expires_at = excluded.expires_at, job_id = excluded.job_id, state = excluded.state, \
+          created_at = excluded.created_at, fence_term = excluded.fence_term, \
+          fence_leader = excluded.fence_leader \
+         WHERE tier_restores.fence_term <= excluded.fence_term",
+    )
+    .bind(&r.bucket)
+    .bind(&r.key)
+    .bind(&r.version_id)
+    .bind(r.expires_at)
+    .bind(r.job_id)
+    .bind(&r.state)
+    .bind(r.created_at)
+    .bind(r.fence_term)
+    .bind(r.fence_leader)
+    .execute(&mut *cw.conn)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// 去重键唯一（partial unique index）。同 PK 保留自键；冲突是业务拒绝而非 SQL 错误。
@@ -1062,6 +1147,7 @@ async fn apply_job_batch(
     cw: &mut ControlWrite<'_>,
     jobs: &[JobRow],
     tasks: &[JobTaskRow],
+    restores: &[TierRestoreRow],
 ) -> Result<ControlResponse, sqlx::Error> {
     let mut batch_ids = HashSet::new();
     for job in jobs {
@@ -1094,6 +1180,21 @@ async fn apply_job_batch(
             return Ok(ControlResponse::Conflict);
         }
     }
+    let mut restore_keys = HashSet::new();
+    for restore in restores {
+        let key = (
+            restore.bucket.clone(),
+            restore.key.clone(),
+            restore.version_id.clone(),
+        );
+        if !restore_keys.insert(key) {
+            return Ok(ControlResponse::Conflict);
+        }
+        let cur = current_restore(cw, &restore.bucket, &restore.key, &restore.version_id).await?;
+        if restore_row_ok(cur.as_ref(), restore).is_err() {
+            return Ok(ControlResponse::Conflict);
+        }
+    }
     for job in jobs {
         if apply_job(cw, job).await? != 1 {
             return Err(invariant(format!("job {} upsert affected 0 rows", job.id)));
@@ -1104,6 +1205,14 @@ async fn apply_job_batch(
             return Err(invariant(format!(
                 "task {}/{} upsert affected 0 rows",
                 task.job_id, task.task_no
+            )));
+        }
+    }
+    for restore in restores {
+        if apply_restore(cw, restore).await? != 1 {
+            return Err(invariant(format!(
+                "restore {}/{}/{} upsert affected 0 rows",
+                restore.bucket, restore.key, restore.version_id
             )));
         }
     }

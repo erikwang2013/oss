@@ -10,8 +10,10 @@
 //! 校验在 append 前完成；apply 只按日志事实做确定性的整批 upsert。
 //!
 //! 已知限制：job id 仍由 leader 本地分配（`runstate_meta`/`MAX(id)+1`），新 leader
-//! 先等 apply 追平再分配。`tier_restores` 是节点本地表，Restore 作业提交后幂等补写
-//! pending 行（失败只告警，版本级对账修复）。inventory/lifecycle 状态表不在本切片。
+//! 先等 apply 追平再分配。Restore 受理的 `tier_restores` 行与作业同批进日志（P2-1），
+//! 之后的 restored/删除是 leader 执行侧的本地运行态调整，随 level-3 快照安装收敛；
+//! 启动守卫要求 level-2 本地运行态为空后才允许激活 level 3。inventory/lifecycle
+//! 状态表不在本切片。
 
 mod admin;
 mod worker;
@@ -24,7 +26,7 @@ use tokio::sync::Mutex;
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::raft::command::{ControlCommand, ControlResponse};
 use crate::raft::control::ControlPlane;
-use crate::raft::runstate::{JobRow, JobTaskRow, job_row_from, job_task_row_from};
+use crate::raft::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
 use crate::raft::{FencingEpoch, compat};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -144,8 +146,9 @@ impl JobState {
         db: &Db,
         jobs: Vec<JobRow>,
         tasks: Vec<JobTaskRow>,
+        restores: Vec<TierRestoreRow>,
     ) -> Result<(), String> {
-        if jobs.is_empty() && tasks.is_empty() {
+        if jobs.is_empty() && tasks.is_empty() && restores.is_empty() {
             return Ok(());
         }
         let mut job_ids = HashSet::new();
@@ -165,7 +168,12 @@ impl JobState {
         }
         for job in &jobs {
             if let Some(cur) = Self::read_job(db, job.id).await? {
-                if cur.kind != job.kind || cur.created_at != job.created_at {
+                if cur.kind != job.kind
+                    || cur.created_at != job.created_at
+                    || cur.bucket != job.bucket
+                    || cur.prefix != job.prefix
+                    || cur.spec_json != job.spec_json
+                {
                     return Err(format!("job {} identity conflict", job.id));
                 }
                 if job.updated_at <= cur.updated_at {
@@ -181,11 +189,29 @@ impl JobState {
                 ));
             }
         }
+        let mut restore_keys = HashSet::new();
+        for restore in &restores {
+            let key = (
+                restore.bucket.clone(),
+                restore.key.clone(),
+                restore.version_id.clone(),
+            );
+            if !restore_keys.insert(key) {
+                return Err(format!(
+                    "job batch: duplicate restore {}/{}/{}",
+                    restore.bucket, restore.key, restore.version_id
+                ));
+            }
+        }
         let Some(control) = &self.control else {
             return Err("job state commit without control plane".into());
         };
         match control
-            .write(ControlCommand::JobBatch { jobs, tasks })
+            .write(ControlCommand::JobBatch {
+                jobs,
+                tasks,
+                restores,
+            })
             .await
         {
             Ok(ControlResponse::Ok) => Ok(()),
@@ -240,13 +266,18 @@ impl JobState {
             .enumerate()
             .map(|(i, t)| new_task(id, i as i64 + 1, t, now))
             .collect();
-        self.commit(db, vec![new_job(spec, id, now, tasks.len() as i64)], tasks)
-            .await?;
+        self.commit(
+            db,
+            vec![new_job(spec, id, now, tasks.len() as i64)],
+            tasks,
+            Vec::new(),
+        )
+        .await?;
         Ok(id)
     }
 
-    /// Restore 受理：作业行经复制日志；`tier_restores` 是本地表，作业提交成功后幂等
-    /// 补写 pending 行（失败只告警——作业是权威事实，版本级对账会修复本地行）。
+    /// Restore 受理：作业行与 `tier_restores` pending 行同一 JobBatch 提交，换 leader
+    /// 后新 leader 也能看到该行（不再有“本地补写”窗口）。
     #[allow(clippy::too_many_arguments)]
     pub async fn create_restore(
         &self,
@@ -275,14 +306,24 @@ impl JobState {
             .enumerate()
             .map(|(i, t)| new_task(id, i as i64 + 1, t, now))
             .collect();
-        self.commit(db, vec![new_job(spec, id, now, tasks.len() as i64)], tasks)
-            .await?;
-        if let Err(e) = db
-            .upsert_restore_pending(bucket, key, version_id, id, now, fence)
-            .await
-        {
-            tracing::warn!(error = %e, job = id, "restore：tier_restores pending 行补写失败");
-        }
+        let restore = TierRestoreRow {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+            expires_at: 0,
+            job_id: Some(id),
+            state: "pending".into(),
+            created_at: now,
+            fence_term: fence.term_i64(),
+            fence_leader: fence.leader_i64(),
+        };
+        self.commit(
+            db,
+            vec![new_job(spec, id, now, tasks.len() as i64)],
+            tasks,
+            vec![restore],
+        )
+        .await?;
         Ok(id)
     }
 
@@ -305,7 +346,7 @@ impl JobState {
         };
         job.progress = progress;
         bump(&mut job, now);
-        self.commit(db, vec![job], Vec::new()).await
+        self.commit(db, vec![job], Vec::new(), Vec::new()).await
     }
 
     pub async fn create_job_dedup(
@@ -345,8 +386,13 @@ impl JobState {
         for task in &mut tasks {
             task.job_id = id;
         }
-        self.commit(db, vec![new_job(spec, id, now, tasks.len() as i64)], tasks)
-            .await?;
+        self.commit(
+            db,
+            vec![new_job(spec, id, now, tasks.len() as i64)],
+            tasks,
+            Vec::new(),
+        )
+        .await?;
         Ok(Some(id))
     }
 
@@ -415,7 +461,7 @@ impl JobState {
             updated_at: now,
             ..JobRow::default()
         };
-        self.commit(db, vec![job], tasks).await?;
+        self.commit(db, vec![job], tasks, Vec::new()).await?;
         Ok(Some(new_id))
     }
 }
