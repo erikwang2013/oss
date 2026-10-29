@@ -61,7 +61,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html" aria-current="page">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.21.1</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.22.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -109,6 +109,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
             <li>v1.17：tier 分块哈希与归档 Range 直读（默认关闭）；CMK 离线 scan/rewrap/delete/trash；REPLICA 头需 site token 认证。</li>
             <li>v1.19：DP-1 数据面混版门控与降级头；能力级别 1..3/OSSCTL3（扩展区、Ext 容器，生产 registry 为空）；租户 schema/回填与 M8 运行态快照；<code>maintenance</code> 与 <code>cluster-shrink plan</code> 只读规划。缩容 apply、Raft 租户 API、M8 多节点与生产 Ext 命令未交付。</li>
             <li>v1.20：mesh gRPC 入站 TLS 物料热轮换（新连接取新配置，旧连接保持旧物料）；账户/成员写走 7 个 level-3 Raft 命令（按 username 自然键，OSSCTL3 快照含账户行）；缩容 topology v4 与离线 <code>apply/verify/commit/rollback</code>（v4 只在 commit 写，作回退防线）；滚动 e2e 在同版本 3 节点与 v1.13.1 旧二进制上通过。</li>
+            <li>v1.22.0：桶数量硬配额并发原子（leader append 前/standalone 写锁）；follower 权限追赶；只读 <code>tier-audit</code>；升级 preflight 与单机→集群 re-ingest 脚本；Level C v1.20.1 窗口验证。</li>
             <li>v1.21.1：文档补丁，无代码/API 变更；同步文档与站点并清理已删除的旧兼容线引用。</li>
             <li>v1.21：控制台一致读 <code>?consistent=1</code> + <code>x-oss-applied-index</code>；账户管理员 UI；tier 归档/直读绑定源整对象 SHA-256（C1–C4）；AP 静态 VPC 端点 registry（注册断言）；Raft follower 滞后时 attach/member-status 追赶。硬配额、M8-2 运行态复制与 Level C 完整双向混写仍未交付。</li>
             <li>v1.20.1：账户软字节配额只读用量端点 <code>GET /accounts/{id}/usage</code> 与独立配置路由 <code>PUT /accounts/{id}/soft-quota</code>（只告警不阻写；集群丢 peer 时 <code>complete=false</code>/头 <code>partial</code>）；level-3 <code>AccountSetSoftQuota</code> 命令，混版窗口需先全集群升级；缩容 4→3 真进程 loopback e2e（97/0）；修复 v1.20.0 源码归档的 <code>Cargo.lock</code>。</li>
@@ -118,7 +119,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
           <ul>
             <li><a href="install.html">安装文档</a>：Docker、源码构建与首次启动。</li>
             <li><a href="usage.html">使用说明</a>：S3 操作、控制台、版本、加密与强一致。</li>
-            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.21.1。</li>
+            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.22.0。</li>
             <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>：完整协议与运维细节（随发布同步）。</li>
           </ul>
         </article>
@@ -130,7 +131,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.21.1</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.22.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.21.1（2026-10-29）。** 控制台一致读（`?consistent=1` + `x-oss-applied-index`）、账户管理员 UI、tier 归档/直读绑定源整对象 SHA-256、AP 静态 VPC 端点 registry；Raft follower 滞后时的成员操作已修复。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.22.0（2026-10-29）。** 桶数量硬配额改为 Raft leader append 前/standalone 写锁内原子判定；Raft follower 的权限判定会先追上成员变更，修复滞后副本误 403；新增只读 `oss-server tier-audit`，以及 `scripts/upgrade-preflight.sh`、`scripts/single-to-cluster.sh`。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 

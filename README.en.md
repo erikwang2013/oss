@@ -10,7 +10,7 @@
 
 An S3-compatible, self-built distributed object storage system (an equivalent implementation of MinIO). It supports multi-drive erasure coding 8+4, inter-node gRPC mesh, versioning, lifecycle, bucket policies and auditing, three SSE modes and object lock, STS temporary credentials, event notifications/Kafka, S3 Select, bucket and multi-site replication, access points/Object Lambda, Batch/Inventory/tiering, sync buckets and a 3-voter Raft control plane. The default `aws-cli`/`rclone` large-file paths (automatic multipart for ≥8 MiB) and resume habits work directly; the browser console supports chunked uploads and management.
 
-**Latest release: v1.21.1 (2026-10-29).** Console consistent reads (`?consistent=1` + `x-oss-applied-index`), accounts admin UI, tier archive/direct-read binding to the source object's committed SHA-256, and a static VPC endpoint registry; Raft follower lag causing spurious member-operation 404s is fixed. See the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for capability boundaries.
+**Latest release: v1.22.0 (2026-10-29).** Bucket-count hard quota is now decided atomically (Raft leader before append; standalone under a write lock); Raft followers catch up on membership changes before permission checks, fixing spurious 403s on lagging replicas; adds the read-only `oss-server tier-audit`, `scripts/upgrade-preflight.sh`, and `scripts/single-to-cluster.sh`. See the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for capability boundaries.
 
 ## Features
 
