@@ -79,10 +79,13 @@ pub struct PolicyRequest<'a> {
     pub anonymous: bool,
 }
 
-/// op → `s3:<Action>`（子集；未映射返回 None → 策略不参与，回落既有判定）。
+/// op → `s3:<Action>`（子集；未映射返回 None）。`access::classify` 接受的 op 必须全部
+/// 映射（CopyObject 例外：调用方按目标写/源读双轴拆为 PutObject/GetObject），否则授权
+/// 路径按 fail-closed 拒绝。
 pub fn s3_action(op: &str) -> Option<&'static str> {
     Some(match op {
-        "GetObject" | "HeadObject" | "GetObjectTagging" => "s3:GetObject",
+        // SelectObjectContent 是读对象内容的动作 → s3:GetObject（AWS 语义）
+        "GetObject" | "HeadObject" | "GetObjectTagging" | "SelectObjectContent" => "s3:GetObject",
         "PutObject"
         | "PostObject"
         | "PutObjectTagging"
@@ -115,9 +118,20 @@ pub fn s3_action(op: &str) -> Option<&'static str> {
         }
         "PutBucketInventoryConfiguration" => "s3:PutInventoryConfiguration",
         "DeleteBucketInventoryConfiguration" => "s3:DeleteInventoryConfiguration",
+        // 桶配置（AWS 动作名）：加密 / 通知 / 复制 / 桶策略
+        "GetBucketEncryption" => "s3:GetEncryptionConfiguration",
+        "PutBucketEncryption" | "DeleteBucketEncryption" => "s3:PutEncryptionConfiguration",
+        "GetBucketNotificationConfiguration" => "s3:GetBucketNotification",
+        "PutBucketNotificationConfiguration" => "s3:PutBucketNotification",
+        "GetBucketReplication" => "s3:GetReplicationConfiguration",
+        "PutBucketReplication" | "DeleteBucketReplication" => "s3:PutReplicationConfiguration",
+        "PutBucketPolicy" => "s3:PutBucketPolicy",
+        "DeleteBucketPolicy" => "s3:DeleteBucketPolicy",
         "RestoreObject" => "s3:RestoreObject",
         "DeleteBucket" => "s3:DeleteBucket",
         "CreateBucket" => "s3:CreateBucket",
+        // 无桶 op（账户级）
+        "ListBuckets" => "s3:ListAllMyBuckets",
         // CopyObject 需源读 + 目标写两个动作——在调用方拆开处理，不走此映射
         _ => return None,
     })
@@ -587,6 +601,47 @@ mod tests {
             s3_action("DeleteBucketInventoryConfiguration"),
             Some("s3:DeleteInventoryConfiguration")
         );
+        // 控制面补全：classify 接受的 op 必须有映射（否则策略/会话无法求值）
+        assert_eq!(s3_action("SelectObjectContent"), Some("s3:GetObject"));
+        assert_eq!(
+            s3_action("GetBucketEncryption"),
+            Some("s3:GetEncryptionConfiguration")
+        );
+        assert_eq!(
+            s3_action("PutBucketEncryption"),
+            Some("s3:PutEncryptionConfiguration")
+        );
+        assert_eq!(
+            s3_action("DeleteBucketEncryption"),
+            Some("s3:PutEncryptionConfiguration")
+        );
+        assert_eq!(
+            s3_action("GetBucketNotificationConfiguration"),
+            Some("s3:GetBucketNotification")
+        );
+        assert_eq!(
+            s3_action("PutBucketNotificationConfiguration"),
+            Some("s3:PutBucketNotification")
+        );
+        assert_eq!(
+            s3_action("GetBucketReplication"),
+            Some("s3:GetReplicationConfiguration")
+        );
+        assert_eq!(
+            s3_action("PutBucketReplication"),
+            Some("s3:PutReplicationConfiguration")
+        );
+        assert_eq!(
+            s3_action("DeleteBucketReplication"),
+            Some("s3:PutReplicationConfiguration")
+        );
+        assert_eq!(s3_action("PutBucketPolicy"), Some("s3:PutBucketPolicy"));
+        assert_eq!(
+            s3_action("DeleteBucketPolicy"),
+            Some("s3:DeleteBucketPolicy")
+        );
+        assert_eq!(s3_action("ListBuckets"), Some("s3:ListAllMyBuckets"));
+        assert_eq!(s3_action("CreateBucket"), Some("s3:CreateBucket"));
     }
 
     /// 标签 op 折叠后，s3:GetObject / s3:PutObject 的 Deny 同样压住标签读写。

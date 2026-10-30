@@ -581,6 +581,23 @@ impl BatchExecutor {
             .get(ap)
             .map_err(|e| e.to_string())?
             .ok_or("变换器未加载（配置更新后重试）")?;
+        // 变换器输入上限在读取前检查：大对象不先整份读进内存再拒。
+        let head = match &p.version_id {
+            Some(v) => {
+                self.store
+                    .head_object_version_ext(&p.bucket, &p.key, v, None)
+                    .await
+            }
+            None => self.store.head_object_ext(&p.bucket, &p.key, None).await,
+        }
+        .map_err(|e| e.to_string())?;
+        if head.size > xl_s3::olap::max_input_bytes() as u64 {
+            return Err(format!(
+                "对象 {} 字节超过变换器输入上限 {} 字节",
+                head.size,
+                xl_s3::olap::max_input_bytes()
+            ));
+        }
         let (info, bytes) = match &p.version_id {
             Some(v) => {
                 self.store

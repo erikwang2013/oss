@@ -502,9 +502,15 @@ impl TonicMesh {
     }
 
     /// TLS 物料变化时重建全部通道并整体替换；构建失败保留旧通道（fail closed）。
+    /// 每个 mesh RPC 都会调用；用 try_lock 避免和正在重建的线程串行排队，抢不到就
+    /// 继续用旧通道（下一次 RPC 再检查），重建本身仍然串行。
     fn refresh_tls(&self) {
         let Some(rx) = &self.tls_watch else { return };
-        let mut rx = rx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rx = match rx.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
         if !rx.has_changed().unwrap_or(false) {
             return;
         }

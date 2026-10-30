@@ -1,9 +1,11 @@
 # 架构级非目标 backlog（Level C / 数据面滚动 / 账户 / M8 多节点 / M3 shrink）
 
-> 状态：**设计 backlog，五项完整目标均未实现**。v1.17.0（2026-10-24）已发布，落地账户 MVP、
+> 状态：**设计 backlog**。v1.17.0（2026-10-24）已发布，落地账户 MVP、
 > M8 运行态 fencing epoch、DP-0 数据面版本握手与 AP 跨账户/SourceVpce 证明；v1.16.0 已落地
 > LC-0 来源校验与 M8 单例任务 leader 门控。以上均为部分切片，完整 Level C / 数据面滚动 /
-> 多租户 / M8 多节点 / M3 shrink 仍未实现。证据见验收记录 §12–§13；本文不是发布承诺。
+> 多租户 / M8 多节点仍未实现；**M3 shrink 4→3 已交付**（v1.20.0 离线
+> plan/apply/verify/commit/rollback + §15.2 loopback e2e），单机→集群仍为重新灌入。
+> 证据见验收记录 §12–§15；本文不是发布承诺。
 >
 > **2026-10-27 更新（v1.20.0，验收记录 §14）**：Wave2 已交付三项切片——
 > ② DP-2 mesh gRPC **入站** TLS 物料热轮换 + 真实滚动 e2e（同版本 3 节点 116/0、v1.13.1 旧
@@ -14,7 +16,7 @@
 >
 > **2026-10-28 更新（v1.20.1）**：AC-2 软字节配额已落地只读用量端点
 > `GET /accounts/{id}/usage`（只告警不阻写，硬字节配额仍为非目标）；M3 shrink 4→3 已补上
-> 真实进程 loopback e2e（86/0/0）。证据见验收记录 §15。其余五项完整目标仍按本文未实现。
+> 真实进程 loopback e2e（86/0/0）。证据见验收记录 §15。其余目标仍按本文未实现。
 >
 > **2026-10-28 更新（v1.21.0）**：main 已合入 M8-3 控制台一致读
 > （`?consistent=1` + `x-oss-applied-index`）、账户管理员 UI、滞后 follower 的
@@ -55,7 +57,7 @@
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；仍缺跨版本 MPU 完成 | 4–8 人周 | 跨版本 MPU 语义 | 高 |
 | 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额 + 管理员 UI 已交付；仍缺硬字节/对象数配额、canonicalization worker | 5–8 人周 | 跨节点用量聚合 | 中高 |
 | 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控、M8-2a runstate 快照扩展、M8-3 一致读（`consistent=1`/applied 头）已交付；jobs/job_tasks/tier_restores 在 feature 4、inventory 运行态与 lifecycle 游标在 feature 5 交付；仍缺 tier restore 后续状态/lease takeover/故障切换 | 6–9 人周 | OSSCTL2/3（持久化部分） | 高 |
-| 5 | M3 shrink / 单机→集群 | 静态拓扑 + 位置式槽位；rebalance 只支持尾部追加；shrink 与单机转集群明确不支持 | 8–12 人周 | 拓扑 v3（显式 slot map） | 极高 |
+| 5 | M3 shrink / 单机→集群 | shrink 4→3 已交付：topology v4 + 离线 plan/apply/verify/commit/rollback + loopback e2e（验收 §15.2）；单机→集群仍为重新灌入，不工具化 | 不排期 | 拓扑映射 + 停机全量迁移 | 极高（若工具化） |
 
 ---
 
@@ -526,6 +528,10 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 
 ## 5. M3 shrink / 单机→集群
 
+> **状态（2026-10-30）**：SH-0 拓扑 v4 与 SH-1 离线
+> `cluster-shrink plan/apply/verify/commit/rollback` 已交付（v1.20.0；验收记录 §14.1/§15.2），
+> 本节保留为实现前的设计记录。单机→集群仍按 §5.3 SH-2「重新灌入」处理。
+
 ### 5.1 现状与证据
 
 - 拓扑是**静态配置**：`NodeSpec`/`ClusterTopology`（`crates/xl-store/src/store/drives.rs:59-80`），
@@ -538,8 +544,8 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 - rebalance 只支持**尾部追加**：只搬「链尾向前第一个非 marker 数据版本」，历史版本留老槽，
   inline/旧分片/未完成 MPU 排除，一次一个，幂等（`crates/xl-store/src/store/rebalance.rs:5,18,33,68`）。
 - README 明确：M3 不支持单机原地升级为多节点，数据要重新灌入（`README.md:454`）；
-  扩容只允许尾部加节点 + 全节点 `placement="v2"` + rebalance（`README.md:491-520`）；
-  shrink/回滚不支持。
+  扩容只允许尾部加节点 + 全节点 `placement="v2"` + rebalance（`README.md:491-520`）。
+  **shrink 4→3 已按 §5.3 交付**（v1.20.0，commit 前可回滚）；单机→集群仍未工具化。
 - MPU 粘节点（§11.3）：shrink 前必须完成或中止所有 MPU。
 
 ### 5.2 真正阻塞点
@@ -640,4 +646,4 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 - 不要给 shrink 提供 `--force`：parity/容量不满足时强制只会制造不可恢复的 EC 组。
 - 不要把 `aws:SourceVpc` 当端点身份：它只是来源证明，端点身份必须来自注册表 + 可信代理。
 
-本文只做设计与证据梳理；未修改任何代码或既有文档，五项能力的实现状态以 §11.3 为准。
+本文只做设计与证据梳理；五项能力的最新实现状态以验收记录（§14–§18）及各节状态注记为准。

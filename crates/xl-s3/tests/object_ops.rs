@@ -24,7 +24,9 @@ const TEST_SITE_TOKEN: &str = "test-site-token";
 async fn acl() -> xl_s3::access::Acl {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql(
-        "CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT, replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active');\
+         INSERT INTO users (id, username, is_admin) VALUES (1, 'admin', 1);\
+         CREATE TABLE buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL, versioning TEXT NOT NULL DEFAULT 'Off', set_id INTEGER NOT NULL DEFAULT 0, object_lock INTEGER NOT NULL DEFAULT 0, object_lock_default_mode TEXT, object_lock_default_days INTEGER, default_encryption TEXT, replication_mode TEXT NOT NULL DEFAULT 'async', deleting INTEGER NOT NULL DEFAULT 0);\
          CREATE TABLE permissions (user_id INTEGER NOT NULL, bucket TEXT NOT NULL, \
           can_read INTEGER NOT NULL DEFAULT 0, can_write INTEGER NOT NULL DEFAULT 0, can_delete INTEGER NOT NULL DEFAULT 0, \
           PRIMARY KEY (user_id, bucket));\
@@ -483,6 +485,70 @@ async fn list_objects_v2_prefix_delimiter_and_paging() {
             "docs/2.txt".to_string(),
             "docs/deep/3.txt".to_string(),
         ]
+    );
+}
+
+#[tokio::test]
+async fn list_objects_v2_honors_start_after_and_encoding_type() {
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    for k in ["a.txt", "b b.txt", "c(1).txt"] {
+        s3.put_object(req(PutObjectInput {
+            bucket: "alpha".into(),
+            key: k.into(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"x"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    }
+
+    let out = s3
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "alpha".into(),
+            start_after: Some("a.txt".into()),
+            fetch_owner: Some(true),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let got = out.contents.unwrap();
+    assert_eq!(
+        got.iter().filter_map(|o| o.key.clone()).collect::<Vec<_>>(),
+        ["b b.txt", "c(1).txt"]
+    );
+    assert!(got[0].owner.as_ref().is_some_and(|o| o.id.is_some()));
+    assert_eq!(out.start_after.as_deref(), Some("a.txt"));
+
+    // start-after/prefix/keys 都要按 encoding-type=url 回写
+    let out = s3
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "alpha".into(),
+            start_after: Some("b b.txt".into()),
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(
+        out.contents
+            .unwrap()
+            .into_iter()
+            .filter_map(|o| o.key)
+            .collect::<Vec<_>>(),
+        ["c%281%29.txt"]
+    );
+    assert_eq!(out.start_after.as_deref(), Some("b%20b.txt"));
+    assert_eq!(
+        out.encoding_type.as_ref().map(EncodingType::as_str),
+        Some("url")
     );
 }
 

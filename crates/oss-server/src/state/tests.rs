@@ -35,6 +35,48 @@ mod login_limiter_tests {
         assert!(!l.inner.lock().unwrap().per_user.contains_key("w"));
     }
 
+    /// C1：唯一用户名洪水必须被硬上限兜住，per_user 不得无界增长。
+    #[test]
+    fn per_user_entries_capped() {
+        let l = LoginLimiter::new();
+        for i in 0..USER_ENTRIES_MAX + 64 {
+            l.on_failure(&format!("flood-{i}"));
+        }
+        let st = l.inner.lock().unwrap();
+        assert_eq!(st.per_user.len(), USER_ENTRIES_MAX, "条目数应被硬上限截断");
+    }
+
+    /// C1：插入前淘汰过期窗口——过期条目让位，活跃条目保留。
+    #[test]
+    fn expired_windows_evicted_on_insert() {
+        let l = LoginLimiter::new();
+        let now = limiter_now();
+        {
+            let mut st = l.inner.lock().unwrap();
+            st.per_user.insert(
+                "stale".into(),
+                UserWindow {
+                    fails: 1,
+                    window_start: now - USER_WINDOW_SECS - 1,
+                    locked_until: 0,
+                },
+            );
+            st.per_user.insert(
+                "active".into(),
+                UserWindow {
+                    fails: 1,
+                    window_start: now,
+                    locked_until: 0,
+                },
+            );
+        }
+        l.on_failure("fresh");
+        let st = l.inner.lock().unwrap();
+        assert!(!st.per_user.contains_key("stale"), "过期窗口应被清掉");
+        assert!(st.per_user.contains_key("active"));
+        assert!(st.per_user.contains_key("fresh"));
+    }
+
     /// 全局失败上限：跨账号洪水被整体暂拒；窗口滑动后恢复。
     #[test]
     fn global_flood_ceiling() {

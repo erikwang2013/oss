@@ -4894,3 +4894,30 @@ fn appending_nodes_keeps_existing_bases() {
         "新节点接在末尾"
     );
 }
+
+#[tokio::test]
+async fn collect_keys_filtered_honors_prefix_and_marker() {
+    let (s, _d) = store().await;
+    s.create_bucket("alpha").await.unwrap();
+    for k in ["a.txt", "b.txt", "dir/c.txt", "dir/d.txt", "e.txt"] {
+        s.put_object("alpha", k, bytes::Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    let got = s
+        .collect_keys_filtered("alpha", "", Some("b.txt"), true, true)
+        .await
+        .unwrap();
+    assert_eq!(got, ["dir/c.txt", "dir/d.txt", "e.txt"]);
+    let got = s
+        .collect_keys_filtered("alpha", "dir/", None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(got, ["dir/c.txt", "dir/d.txt"]);
+    // prefix 部分段（"dir"）也要命中 "dir/..."
+    let got = s
+        .collect_keys_filtered("alpha", "dir", None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(got, ["dir/c.txt", "dir/d.txt"]);
+}

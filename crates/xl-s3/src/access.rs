@@ -32,6 +32,12 @@ fn missing_accounts_table(e: &sqlx::Error) -> bool {
     })
 }
 
+/// 最小夹具/旧库没有 users 表：Owner 是可选元数据，退化为不回写而不是 list 失败。
+fn missing_users_table(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .is_some_and(|d| d.message().contains("no such table") && d.message().contains("users"))
+}
+
 /// 账户桶数计数 SQL（与 oss-server `Db::account_buckets_from` 同口径）：桶主**当前**
 /// 账户（成员行优先，无行 = uid 派生账户）；管理员桶不计入任何用户账户。
 const ACCOUNT_BUCKET_COUNT_SQL: &str = "SELECT COUNT(*) FROM buckets b \
@@ -654,7 +660,7 @@ impl Acl {
     /// M5 切片 5（S8）：会话策略交集融合——在表三档 × 桶策略之后叠会话判定：
     /// 会话 Deny → 拒；**无匹配 → 拒**（未 Allow 即拒）；Allow → 保留基线（不能抬升）。
     /// CopyObject 双轴分别求值（dst=`PutObject` 映射 / src=`GetObject`），与桶策略融合同构。
-    /// `s3_action` 未映射 op：会话不约束（词表缺项，同桶策略口径；定稿记档）。
+    /// `s3_action` 未映射 op：无 Allow 可依 → 拒（fail-closed；旧实现静默跳过 = 会话免检）。
     /// 返回 `((allow_dst, allow_src), detail)`；无会话策略 = 原样返回 `((..), None)`。
     /// 抽出独立方法以便单测直钉（S3AccessContext 不可外部构造，check() 本体无法在单测驱动）。
     async fn fuse_session(
@@ -674,9 +680,8 @@ impl Acl {
             crate::policy::s3_action(op)
         };
         let mut denied = false;
-        if let Some(a) = dst_act
-            && crate::policy::evaluate(&sdoc, &pr, a) != Some(true)
-        {
+        // None（无映射）同样落 deny：会话策略是身份上限，词表缺项不得等于免检。
+        if dst_act.and_then(|a| crate::policy::evaluate(&sdoc, &pr, a)) != Some(true) {
             allow_dst = false;
             denied = true;
         }
@@ -1005,6 +1010,48 @@ impl Acl {
             return Ok(row.uid == Some(uid));
         }
         Ok(false)
+    }
+
+    /// ListObjects 的 Owner 回写：桶主 username；管理员桶/无 DB 行回落管理员。
+    /// 返回 `(id, display_name)`，id 用本地 uid 的十进制串（本模型的稳定主体标识）。
+    pub async fn bucket_owner_display(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
+        let row = match sqlx::query(
+            "SELECT b.owner_id AS owner_id, u.username AS username FROM buckets b \
+             LEFT JOIN users u ON u.id = b.owner_id WHERE b.name = ?",
+        )
+        .bind(bucket)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) if missing_users_table(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if let Some(r) = row {
+            let id: Option<i64> = r.get("owner_id");
+            let name: Option<String> = r.get("username");
+            if let (Some(id), Some(name)) = (id, name) {
+                return Ok(Some((id.to_string(), name)));
+            }
+        }
+        let admin = match sqlx::query(
+            "SELECT id, username FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) if missing_users_table(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(admin.map(|r| {
+            let id: i64 = r.get("id");
+            let name: String = r.get("username");
+            (id.to_string(), name)
+        }))
     }
 
     /// 主判权：admin / 桶主 全允许；否则查对应能力位（无行 = 拒）。
@@ -1425,7 +1472,8 @@ impl Acl {
         // 两轴**各自**融合：dst 轴所有 op；src 轴仅 CopyObject 且**始终**评估（与目标桶有无
         // 策略无关——旧实现把 src 评估嵌在 dst 有策略分支内，dst 无策略时 src Deny 被完全
         // 跳过：verifier 阻断 1a）。策略读/解析失败按轴 fail-closed 拒（不静默放行）。
-        // 未映射 op（s3_action None）不参与。匿名请求不进本方法（`check` 已分流，见上）。
+        // 分类内 op 若无 s3_action 映射则 fail-closed（不能把桶策略静默当成不存在）。
+        // 匿名请求不进本方法（`check` 已分流，见上）。
         let (mut saw_deny, mut saw_error, mut saw_allow) = (false, false, false);
         if !delegated && let Some(b) = &bucket {
             match self.bucket_policy(b).await {
@@ -1457,6 +1505,11 @@ impl Acl {
                             }
                             None => {} // 无匹配：回落既有判定
                         }
+                    } else if classify(op).is_some() {
+                        // 分类表内 op 必须有映射（不变量）；缺映射 = 桶策略无法求值 → 拒
+                        tracing::error!(op, bucket = %b, "op 无 s3_action 映射——桶策略 fail-closed");
+                        allow_dst = false;
+                        saw_error = true;
                     }
                 }
                 Ok(None) => {}
@@ -1510,7 +1563,10 @@ impl Acl {
         // **P2-1 复验修复**：CopyObject 的 src 轴必须用**源桶/源键**构造 PolicyRequest 求值
         // （与上面桶策略 src 轴同构）——曾复用 dst 的 pr，会话对源读的收窄可被 copy 绕过。
         let mut session_detail: Option<&'static str> = None;
-        if !delegated && let Some(b) = &bucket {
+        // 会话策略是身份上限：ListBuckets/CreateBucket 无桶也必须过交集（旧实现只在请求
+        // 带桶时融合，会话键因此可列桶/建桶）。无桶路径用通配资源求值。
+        if !delegated && (bucket.is_some() || matches!(op, "ListBuckets" | "CreateBucket")) {
+            let session_bucket = bucket.unwrap_or("*");
             // CopyObject 源解析一次持有（String 落外层作用域，PolicyRequest 借之）
             let src_pr = copy_src.map(|(src_bucket, src_key)| crate::policy::PolicyRequest {
                 op,
@@ -1528,7 +1584,7 @@ impl Acl {
                         ak,
                         uid: user.uid,
                         account_id: account_id.as_deref(),
-                        bucket: b,
+                        bucket: session_bucket,
                         key,
                         anonymous: false,
                     },
@@ -1960,7 +2016,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn add_bucket(a: &Acl, name: &str, owner: Option<i64>) {
+    pub(super) async fn add_bucket(a: &Acl, name: &str, owner: Option<i64>) {
         sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES (?, ?, 0)")
             .bind(name)
             .bind(owner)
@@ -2103,6 +2159,72 @@ mod tests {
         }
         // 未映射 op → fail-closed
         assert_eq!(classify("Frobnicate"), None);
+    }
+
+    /// 覆盖不变量：`classify` 接受的每个 op 都必须有 `s3_action` 映射，否则桶策略/会话
+    /// 策略在 check_op 里无法求值（授权路径 fail-closed）。CopyObject 是唯一例外——目标
+    /// 写/源读双轴由调用方拆成 PutObject/GetObject（见 `is_copy` 分支）。
+    /// 本表是全量清单：给 classify 加分支时必须同步补这里。
+    #[test]
+    fn every_classified_op_has_action_mapping() {
+        const CLASSIFIED: &[&str] = &[
+            "ListBuckets",
+            "CreateBucket",
+            "DeleteBucket",
+            "PutBucketVersioning",
+            "GetBucketVersioning",
+            "PutBucketNotificationConfiguration",
+            "GetBucketNotificationConfiguration",
+            "PutBucketReplication",
+            "GetBucketReplication",
+            "DeleteBucketReplication",
+            "PutBucketLifecycleConfiguration",
+            "DeleteBucketLifecycle",
+            "GetBucketLifecycleConfiguration",
+            "PutBucketEncryption",
+            "DeleteBucketEncryption",
+            "GetBucketEncryption",
+            "PutBucketPolicy",
+            "DeleteBucketPolicy",
+            "PutBucketInventoryConfiguration",
+            "DeleteBucketInventoryConfiguration",
+            "GetBucketInventoryConfiguration",
+            "ListBucketInventoryConfigurations",
+            "RestoreObject",
+            "HeadBucket",
+            "ListObjects",
+            "ListObjectsV2",
+            "ListMultipartUploads",
+            "ListParts",
+            "ListObjectVersions",
+            "GetObject",
+            "HeadObject",
+            "GetObjectTagging",
+            "GetObjectRetention",
+            "GetObjectLegalHold",
+            "SelectObjectContent",
+            "PutObject",
+            "PostObject",
+            "PutObjectTagging",
+            "DeleteObjectTagging",
+            "PutObjectRetention",
+            "PutObjectLegalHold",
+            "CreateMultipartUpload",
+            "UploadPart",
+            "CompleteMultipartUpload",
+            "AbortMultipartUpload",
+            "DeleteObject",
+            "DeleteObjects",
+            "CopyObject",
+            "UploadPartCopy",
+        ];
+        for op in CLASSIFIED {
+            assert!(classify(op).is_some(), "{op} 不在 classify 表中");
+            assert!(
+                *op == "CopyObject" || crate::policy::s3_action(op).is_some(),
+                "classify 接受的 {op} 缺少 s3_action 映射"
+            );
+        }
     }
 
     /// M1：匿名拒绝审计限流（允许不限；拒绝突发 20 后丢弃）。
@@ -2532,6 +2654,52 @@ mod tests {
                 .unwrap()
                 .0
         );
+    }
+
+    /// 桶策略 `Deny s3:*` 必须压住全部 classify 内 op——含此前无 s3_action 映射而
+    /// 被静默跳过策略的 SelectObjectContent / GetBucketEncryption。
+    #[tokio::test]
+    async fn bucket_policy_deny_all_covers_previously_unmapped_ops() {
+        let a = acl().await;
+        add_user(&a, 2, false).await;
+        add_bucket(&a, "b", None).await;
+        grant(&a, 2, "b", true, false, false).await;
+        let u = AuthedUser {
+            uid: 2,
+            is_admin: false,
+            ak: "AK2".into(),
+        };
+        // 基线：表三档读权放行这两个 op（证明随后拒绝来自桶策略）
+        for (op, key) in [
+            ("SelectObjectContent", Some("k")),
+            ("GetBucketEncryption", None),
+        ] {
+            assert!(
+                a.check_op(&u, "AK2", op, Some("b"), key, None)
+                    .await
+                    .unwrap()
+                    .0,
+                "{op} 基线应放行"
+            );
+        }
+        set_policy(
+            &a,
+            "b",
+            r#"{"Statement":[{"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:*",
+                "Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]}]}"#,
+        )
+        .await;
+        for (op, key) in [
+            ("SelectObjectContent", Some("k")),
+            ("GetBucketEncryption", None),
+        ] {
+            let (allow, detail) = a
+                .check_op(&u, "AK2", op, Some("b"), key, None)
+                .await
+                .unwrap();
+            assert!(!allow, "Deny s3:* 必须压住 {op}");
+            assert_eq!(detail.as_deref(), Some("policy:deny"), "{op}");
+        }
     }
 
     #[tokio::test]
@@ -2978,7 +3146,7 @@ mod tests {
 
 #[cfg(test)]
 mod session_tests {
-    use super::tests::{acl, add_key, add_user, mesh_with};
+    use super::tests::{acl, add_bucket, add_key, add_user, mesh_with};
     use super::*;
 
     /// 会话键行（测试装置）：kind='session' + parent + 可选 policy。
@@ -3076,7 +3244,8 @@ mod session_tests {
         .unwrap()
     }
 
-    /// fuse_session 交集矩阵：Allow 保留 / Deny 拒 / 无匹配拒 / CopyObject 双轴 / 未映射 op 不约束 / 非会话无痕。
+    /// fuse_session 交集矩阵：Allow 保留 / Deny 拒 / 无匹配拒 / CopyObject 双轴 /
+    /// 未映射 op fail-closed / 非会话无痕。
     #[tokio::test]
     async fn fuse_session_intersection_matrix() {
         let a = acl().await;
@@ -3156,7 +3325,7 @@ mod session_tests {
         )
         .await;
         assert!(d && !s && det == Some("session:deny"));
-        // 未映射 op（如 PutObjectLockConfiguration）：会话不约束（词表缺项口径）
+        // 未映射 op（如 PutObjectLockConfiguration）：无显式 Allow 可依 → 拒（fail-closed）
         let ((d, s), det) = fuse(
             &a,
             "ASIA_G",
@@ -3168,7 +3337,7 @@ mod session_tests {
             true,
         )
         .await;
-        assert!((d, s, det) == (true, true, Some("session:allow")));
+        assert!((d, s, det) == (false, true, Some("session:deny")));
         // 非会话键：原样返回、无 detail
         let ((d, s), det) = fuse(
             &a,
@@ -3203,6 +3372,61 @@ mod session_tests {
         )
         .await;
         assert!(!d && det == Some("session:deny"));
+    }
+
+    /// 会话交集覆盖无桶/桶主 op：GET_ONLY 会话不得建桶、列桶，也不得以桶主身份改桶加密；
+    /// 显式 Allow `s3:ListAllMyBuckets` / `s3:CreateBucket` 时才放行（交集而非一律拒）。
+    #[tokio::test]
+    async fn session_policy_covers_bucketless_ops_and_owner_config() {
+        let a = acl().await;
+        add_user(&a, 7, false).await;
+        add_key(&a, "AKIA_LONG", 7, None).await;
+        add_session(&a, "ASIA_G", 7, "AKIA_LONG", Some(GET_ONLY)).await;
+        add_bucket(&a, "bkt", Some(7)).await; // 桶主：表三档本应全放
+        let u = AuthedUser {
+            uid: 7,
+            is_admin: false,
+            ak: "ASIA_G".into(),
+        };
+        for (op, bucket) in [
+            ("CreateBucket", Some("newb")),
+            ("CreateBucket", None),
+            ("ListBuckets", None),
+            ("PutBucketEncryption", Some("bkt")),
+        ] {
+            let (allow, detail) = a
+                .check_op(&u, "ASIA_G", op, bucket, None, None)
+                .await
+                .unwrap();
+            assert!(!allow, "GET_ONLY 会话不得放行 {op} ({bucket:?})");
+            assert_eq!(detail.as_deref(), Some("session:deny"), "{op}");
+        }
+        // 显式 Allow（Resource "*" 覆盖无桶通配资源）才放行
+        add_session(
+            &a,
+            "ASIA_ALLOW",
+            7,
+            "AKIA_LONG",
+            Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:ListAllMyBuckets","s3:CreateBucket"],"Resource":"*"}]}"#),
+        )
+        .await;
+        let v = AuthedUser {
+            uid: 7,
+            is_admin: false,
+            ak: "ASIA_ALLOW".into(),
+        };
+        for (op, bucket) in [
+            ("CreateBucket", Some("newb")),
+            ("CreateBucket", None),
+            ("ListBuckets", None),
+        ] {
+            let (allow, detail) = a
+                .check_op(&v, "ASIA_ALLOW", op, bucket, None, None)
+                .await
+                .unwrap();
+            assert!(allow, "显式 Allow 应放行 {op} ({bucket:?})");
+            assert_eq!(detail.as_deref(), Some("session:allow"), "{op}");
+        }
     }
 
     /// 批量删逐键判定叠会话：会话只放 GetObject → 删键被会话拒（防批量删绕过）。

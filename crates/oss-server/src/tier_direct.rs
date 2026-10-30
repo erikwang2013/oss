@@ -89,6 +89,10 @@ impl TierDirectRead for TierDirectReader {
         chunks.validate(t.size).map_err(|e| {
             TierDirectError::Integrity(format!("分块哈希表不自洽（meta 应已拒收）：{e}"))
         })?;
+        // 远端 Range 也会整段读进内存；套用与本地读相同的缓冲上限。
+        self.store
+            .check_buffered_read(range.end - range.start)
+            .map_err(|e| TierDirectError::Unavailable(e.to_string()))?;
         let backend = self
             .tiers
             .get(&t.backend)

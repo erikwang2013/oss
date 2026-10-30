@@ -988,6 +988,22 @@ impl Store {
         range: StdRange<u64>,
         sse_c: Option<&crypto::SseCKey>,
     ) -> Result<Bytes> {
+        Ok(self
+            .get_object_range_version_ext_info(bucket, key, version_id, range, sse_c)
+            .await?
+            .1)
+    }
+
+    /// 同 [`Self::get_object_range_version_ext`]，但同时返回与 body 同一份 meta 的
+    /// `ObjectInfo`（GET 条件/响应头使用）。
+    pub async fn get_object_range_version_ext_info(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        range: StdRange<u64>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, Bytes)> {
         self.ensure_bucket(bucket).await?;
         let m = self
             .read_meta(bucket, key)
@@ -1006,9 +1022,11 @@ impl Store {
                 v.size
             )));
         }
-        self.read_version_data(bucket, key, v, Some(range), sse_c)
+        let bytes = self
+            .read_version_data(bucket, key, v, Some(range), sse_c)
             .await?
-            .ok_or_else(|| Error::NoSuchKey(key.to_string()))
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        Ok((version_info(key, v), bytes))
     }
 
     /// GET/HEAD `?partNumber` 元数据定位（HEAD 用）：一次 meta 读取 →
@@ -1109,6 +1127,11 @@ impl Store {
         sse_c: Option<&crypto::SseCKey>,
     ) -> Result<Option<Bytes>> {
         check_tier_readable(v, bucket, key)?;
+        let buffered_len = match &range {
+            Some(r) => r.end - r.start,
+            None => v.size,
+        };
+        super::read::ensure_buffered_read_allowed(buffered_len)?;
         if let Some(inline) = &v.inline {
             // M5 切片 2：加密 inline 落盘态 = 密文 C = c_len(P)（B4 期望长度落点之一）
             let expected = match &v.encryption {
@@ -1192,13 +1215,8 @@ impl Store {
             // 先按 key_marker 过滤再截断：否则 >max+1 键的桶第二页为空（本地截断早于
             // key_marker 的应用）。key_marker 本身保留（其版本链从 version_id_marker 续）。
             let mut local: Vec<String> = self
-                .collect_keys(bucket)
-                .await?
-                .into_iter()
-                .filter(|k| k.starts_with(prefix))
-                .filter(|k| key_marker.is_none_or(|km| k.as_str() >= km))
-                .collect();
-            local.sort();
+                .collect_keys_filtered(bucket, prefix, key_marker, false, true)
+                .await?;
             local.truncate(max + 2);
             local
         };

@@ -6,6 +6,8 @@
 # 前置：`cargo build -p oss-server`；aws-cli；curl；python3。
 # 用法：OSS_BIN=target/debug/oss-server tests/e2e_sites.sh
 set -uo pipefail
+# 所有 curl 统一超时：e2e 卡住时失败而不是挂死。
+curl() { command curl --max-time 30 "$@"; }
 cd "$(dirname "$0")/.."
 BIN="${OSS_BIN:-$PWD/target/debug/oss-server}"
 [ -x "$BIN" ] || { echo "缺少 oss-server 二进制（先 cargo build -p oss-server，或设 OSS_BIN）"; exit 2; }

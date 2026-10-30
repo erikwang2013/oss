@@ -12,7 +12,8 @@
 #   6. CMK 低成本验证：显式 CMK 写→轮换→cmk scan/rewrap(dry-run/apply)→旧/新二进制读。
 #      v1.20.1 自带 CMK 读路径；未覆盖「pre-CMK 旧端/legacy provider」读路径（见报告）。
 #
-# 每个格打印 PASS/FAIL；缺少旧二进制整体 SKIP（M9_ROLLBACK_STRICT=1 升 FAIL）。
+# 每个格打印 PASS/FAIL；缺少旧二进制默认 FAIL（exit 2）——仅显式 M9_ROLLBACK_STRICT=0
+# 才降级为整体 SKIP（本地便利）。M9_ROLLBACK_STRICT=1 还会把内部 SKIP 升为 FAIL。
 # 用法：
 #   OSS_OLD_BIN=/path/to/v1.20.1/oss-server OSS_NEW_BIN=target/debug/oss-server \
 #     tests/e2e_m9_rollback.sh
@@ -23,7 +24,8 @@ cd "$(dirname "$0")/.."
 
 NEW_BIN="${OSS_NEW_BIN:-${OSS_BIN:-$PWD/target/debug/oss-server}}"
 OLD_BIN="${OSS_OLD_BIN:-}"
-STRICT="${M9_ROLLBACK_STRICT:-0}"
+STRICT="${M9_ROLLBACK_STRICT:-0}"                # 内部 SKIP（CMK 缺 aws-cli）是否升 FAIL
+REQUIRE_OLD_BIN="${M9_ROLLBACK_STRICT:-1}"       # 缺旧二进制默认硬失败（显式 0 才允许 SKIP）
 PASSES=0; FAILS=0; SKIPS=0
 pass() { PASSES=$((PASSES+1)); echo "  PASS: $*"; }
 fail() { FAILS=$((FAILS+1)); echo "FAIL: $*"; }
@@ -37,8 +39,13 @@ finish() {
 }
 if [ ! -x "$NEW_BIN" ]; then echo "缺少新二进制（OSS_NEW_BIN / cargo build -p oss-server）"; exit 2; fi
 if [ ! -x "$OLD_BIN" ]; then
-  skip "缺少 OSS_OLD_BIN（v1.20.1）：Level C 回滚矩阵无法执行；构建 tag v1.20.1 后重跑"
-  finish
+  if [ "$REQUIRE_OLD_BIN" = "0" ]; then
+    skip "缺少 OSS_OLD_BIN（v1.20.1）：Level C 回滚矩阵无法执行；构建 tag v1.20.1 后重跑"
+    finish
+  fi
+  echo "FAIL: 缺少 OSS_OLD_BIN（v1.20.1）：回滚矩阵无法执行（默认严格）；" >&2
+  echo "      本地只想跳过请设 M9_ROLLBACK_STRICT=0，CI 必须提供旧二进制。" >&2
+  exit 2
 fi
 for c in curl python3; do command -v "$c" >/dev/null || { echo "需要 $c"; exit 2; }; done
 NEW_BIN=$(realpath "$NEW_BIN"); OLD_BIN=$(realpath "$OLD_BIN")

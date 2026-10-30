@@ -1,8 +1,9 @@
-listen = "0.0.0.0:9000"
+listen = "127.0.0.1:9000"
 data_dir = "./data"
 staging_dir = "./staging"
 database_url = "sqlite://./oss.db?mode=rwc"
-# jwt-rust 要求 ≥32 字符（256 位）；本值仅限本机开发
+# jwt-rust 要求 ≥32 字符（256 位）。占位值仅限回环本机开发：listen 改为非回环地址时
+# 服务会拒绝启动，必须先换成随机密钥。
 jwt_secret = "dev-only-change-me-0123456789abcdef"
 max_put_bytes = 268435456
 

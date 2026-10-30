@@ -31,8 +31,9 @@ docker run -d --name "$NAME" \
     --kafka-addr PLAINTEXT://0.0.0.0:9092 \
     --advertise-kafka-addr "PLAINTEXT://127.0.0.1:$PORT" >/dev/null
 
-for i in $(seq 1 60); do
-  if python3 - "$PORT" <<'PY'
+wait_broker() {
+  for _ in $(seq 1 60); do
+    if python3 - "$PORT" <<'PY'
 import socket,sys
 s=socket.socket(); s.settimeout(0.5)
 try:
@@ -40,9 +41,16 @@ try:
 except OSError:
     sys.exit(1)
 PY
-  then break; fi
-  sleep 1
-done
+    then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+wait_broker || {
+  echo "FAIL: redpanda 在 60s 内未监听 127.0.0.1:$PORT（容器 $NAME）" >&2
+  docker logs "$NAME" 2>&1 | tail -30 >&2 || true
+  exit 2
+}
 echo "   broker 就绪"
 
 export OSS_KAFKA_E2E_BROKERS="127.0.0.1:$PORT"
@@ -60,18 +68,11 @@ cargo test -p oss-server --test kafka_e2e phase2_broker_down_buffers -- --nocapt
 
 echo "== 阶段 3：起 broker → 全部补投、不丢不重（验收 ②）=="
 docker start "$NAME" >/dev/null
-for i in $(seq 1 60); do
-  if python3 - "$PORT" <<'PY'
-import socket,sys
-s=socket.socket(); s.settimeout(0.5)
-try:
-    s.connect(("127.0.0.1", int(sys.argv[1]))); print("up")
-except OSError:
-    sys.exit(1)
-PY
-  then break; fi
-  sleep 1
-done
+wait_broker || {
+  echo "FAIL: redpanda 恢复后 60s 内未重新监听 127.0.0.1:$PORT" >&2
+  docker logs "$NAME" 2>&1 | tail -30 >&2 || true
+  exit 2
+}
 cargo test -p oss-server --test kafka_e2e phase3_recover_replays_without_dupes -- --nocapture \
   | grep -E "phase3|test result"
 

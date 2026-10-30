@@ -76,10 +76,10 @@ trap cleanup EXIT
 api() {
   local m=$1 p=$2 body=${3:-} out=${4:-$WORK/api.json}
   if [ -n "$body" ]; then
-    curl -sS -o "$out" -w '%{http_code}' -X "$m" "$ENDPOINT/api/v1$p" \
+    curl -sS --max-time 30 -o "$out" -w '%{http_code}' -X "$m" "$ENDPOINT/api/v1$p" \
       -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$body"
   else
-    curl -sS -o "$out" -w '%{http_code}' -X "$m" "$ENDPOINT/api/v1$p" \
+    curl -sS --max-time 30 -o "$out" -w '%{http_code}' -X "$m" "$ENDPOINT/api/v1$p" \
       -H "authorization: Bearer $TOKEN"
   fi
 }

@@ -60,7 +60,7 @@ Control-plane metadata (users/keys/buckets/upload records/instant-upload index) 
 
 ![Request lifecycle](docs/assets/request-flow.svg)
 
-Both entry points (direct S3 upload, browser chunked upload) converge at xl-store's **commit protocol**: stage → rename data into place on the same drive → overwrite `xl.meta` to commit; everything before commit is invisible to clients. EC writes/reads (including range reads) are chunk-streamed: peak memory ≈ the block buffer (MiB level), independent of object size (a 96 MiB object measured VmHWM 107 MiB).
+Both entry points (direct S3 upload, browser chunked upload) converge at xl-store's **commit protocol**: stage → rename data into place on the same drive → overwrite `xl.meta` to commit; everything before commit is invisible to clients. EC writes/range reads are chunk-streamed: peak memory ≈ the block buffer (MiB level), independent of object size (a 96 MiB object measured VmHWM 107 MiB for range reads). **Full-object GET still buffers the whole object**, so memory grows with object size — use Range for large downloads, and do not size capacity on "memory independent of object size" until streaming GET lands. Full-object GET is capped by `OSS_MAX_BUFFERED_GET_BYTES` (default 512 MiB, 0=unlimited); a single list collects at most `OSS_LIST_MAX_KEYS` keys (default 1,000,000, 0=unlimited) — use prefixes for large buckets. Audit logs are retained for 90 days by default (`OSS_AUDIT_RETENTION_DAYS=0` disables cleanup); expired instant-upload index rows are purged hourly. `jobs`/`job_tasks` run-state is carried in the Raft snapshot (`m8.runstate`, hard cap 64 MiB) and has **no automatic retention yet**; a warning fires near the cap, and finished jobs must be pruned in a maintenance window (a feature-level-6 `JobPurge` command is a separate milestone).
 
 ## Object Lifecycle
 
@@ -88,7 +88,7 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
   -d '{"access_key":"AKIA_TEST_ACCESS_KEY","secret_key":"SK_TEST_SECRET_KEY_0001"}'
 ```
 
-> `oss.toml` defaults to `listen = "0.0.0.0:9000"` and a placeholder `jwt_secret` for local development only; before exposing the service, bind to loopback/a controlled address and set a random secret.
+> `oss.toml` defaults to `listen = "127.0.0.1:9000"` (local only) and a placeholder `jwt_secret` for local development only. If you change `listen` to a non-loopback address, the placeholder secret **refuses to start**; set a random `jwt_secret` before exposing the service.
 
 ### Docker
 
@@ -106,7 +106,9 @@ docker compose -f docker-compose.cluster.yml up --build
 ```
 
 - Config: single node `docker/oss.toml`; cluster `docker/cluster/n{1..4}/oss.toml` (static topology, commented in the files).
-- If `jwt_secret` / cluster `secret` / the admin password are unset, they are generated on first start and written to `./docker/secrets/generated.env`; rotate by deleting that file and restarting.
+- If `jwt_secret` / cluster `secret` / the admin password are unset, they are generated on first start and written to `./docker/secrets/generated.env` (mode **0600**, owner `oss`, directory 0700); rotate by deleting that file and restarting. Read it with `docker compose exec oss cat /secrets/generated.env` (cluster: `docker compose -f docker-compose.cluster.yml exec n1 cat /secrets/generated.env`), or `sudo cat docker/secrets/generated.env` on the host.
+- Published ports bind `127.0.0.1` by default (9000 S3/API, 8080 console). To expose externally, remove the `127.0.0.1:` prefix from the compose port mapping and add TLS/reverse proxy plus access control yourself; inter-container traffic still uses the `oss:9000` service name and is unaffected.
+- The console image still runs `nginx:alpine` with its default root master process on :80; making it non-root requires a non-privileged base image/port and matching compose/healthcheck changes (not done here).
 - Data/staging live in named volumes (cleared only by `docker compose down -v`); each cluster node has its own volume.
 
 ### Console

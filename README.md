@@ -68,8 +68,15 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 
 两条入口（S3 直传、浏览器分块上传）在 xl-store 的**提交协议**处汇合：
 暂存 → 同盘 rename 数据就位 → `xl.meta` 覆盖即提交；提交之前的一切对客户端不可见。
-EC 写/读（含区间读）已分块流式：内存峰值 ≈ 块缓冲（MiB 级），与对象大小无关
-（96 MiB 对象实测 VmHWM 107 MiB）。
+EC 写/区间读已分块流式：内存峰值 ≈ 块缓冲（MiB 级），与对象大小无关（96 MiB 对象
+区间读实测 VmHWM 107 MiB）；**全对象 GET 当前仍整体缓冲**，内存随对象大小增长——大对象
+下载请使用 Range，流式 GET 落地前不要按「内存与对象大小无关」规划容量。
+整对象 GET 的缓冲上限由 `OSS_MAX_BUFFERED_GET_BYTES` 控制（默认 512 MiB，0=不限）；
+单次列举最多收集 `OSS_LIST_MAX_KEYS` 个键（默认 100 万，0=不限），大桶请用 prefix 翻页。
+审计日志默认保留 90 天（`OSS_AUDIT_RETENTION_DAYS=0` 关闭）；过期秒传索引每小时清理。
+`jobs`/`job_tasks` 运行态随 Raft 快照进入 `m8.runstate`（硬上限 64 MiB），当前**没有自动
+保留策略**；接近上限会告警，需在停机窗口清理已结束作业（后续 feature level 6 的
+`JobPurge` 命令是独立里程碑）。
 
 ## 对象生命周期
 
@@ -100,8 +107,8 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
   -d '{"access_key":"AKIA_TEST_ACCESS_KEY","secret_key":"SK_TEST_SECRET_KEY_0001"}'
 ```
 
-> `oss.toml` 默认 `listen = "0.0.0.0:9000"` 与占位 `jwt_secret` 仅限本机开发；对外部署前必须改成
-> 回环/受控绑定与随机密钥。
+> `oss.toml` 默认 `listen = "127.0.0.1:9000"`（仅本机）与占位 `jwt_secret`，仅限本机开发；
+> 若把 listen 改成非回环地址，占位密钥会**拒绝启动**——对外部署前必须换成随机 `jwt_secret`。
 
 ### Docker
 
@@ -120,7 +127,15 @@ docker compose -f docker-compose.cluster.yml up --build
 
 - 配置：单机 `docker/oss.toml`；集群 `docker/cluster/n{1..4}/oss.toml`（静态拓扑，注释在文件里）。
 - `jwt_secret` / 集群 `secret` / 管理员口令未填时首次启动自动生成，落盘
-  `./docker/secrets/generated.env`；轮换 = 删除该文件重启。
+  `./docker/secrets/generated.env`（容器内权限 **0600**、属主 `oss`，目录 0700）；轮换 = 删除
+  该文件重启。查看口令：`docker compose exec oss cat /secrets/generated.env`（集群用
+  `docker compose -f docker-compose.cluster.yml exec n1 cat /secrets/generated.env`）；
+  宿主机上仅 root 可读：`sudo cat docker/secrets/generated.env`。
+- 端口默认只绑 `127.0.0.1`（9000 S3/API、8080 控制台）。需要对外暴露时，去掉 compose 端口
+  映射里的 `127.0.0.1:` 前缀，并自行加 TLS/反向代理与访问控制；容器间仍按服务名
+  `oss:9000` 互通，不受宿主绑定影响。
+- 控制台镜像沿用 `nginx:alpine` 默认以 root 主进程监听 :80；如需非 root，需换非特权基础
+  镜像/端口并同步 compose 与 healthcheck（本次未改）。
 - 数据/暂存在具名卷（`docker compose down -v` 才清）；集群每节点独立卷。
 
 ### 控制台

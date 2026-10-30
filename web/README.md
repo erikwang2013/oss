@@ -11,6 +11,8 @@ React 19 + antd 5 + TanStack Query + react-router，Vite 构建。项目总览�
 - `npm run build` — 类型检查（`tsc -b`）+ 产物输出到 `dist/`
 - `npm test` — 单元测试（vitest + jsdom）
 - `npm run e2e` — Playwright 关键路径；webServer 会自动拉起 vite 与后端 `cargo run -p oss-server`
+  （后端使用临时数据目录/DB，不复用已运行的服务）。首次运行前先安装浏览器：
+  `npx playwright install --with-deps chromium`
 - `npm run lint` / `npm run typecheck:e2e` — oxlint 与 e2e 目录类型检查
 
 ## 目录

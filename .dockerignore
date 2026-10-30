@@ -3,6 +3,8 @@ target
 web/node_modules
 web/dist
 web/test-results
+# 明文 JWT / 管理员口令 / 集群密钥绝不能进构建上下文
+docker/secrets/
 .git
 docs
 data

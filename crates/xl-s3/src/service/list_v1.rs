@@ -106,6 +106,16 @@ pub(super) async fn list_objects(
         .map_err(to_s3_error)?;
 
     let enc = |s: &str| if encode { url_encode(s) } else { s.to_string() };
+    // V1 ListObjects 默认返回 Owner（AWS 语义）；本模型对象属主 = 桶主。
+    let owner = s3
+        .acl
+        .bucket_owner_display(&bucket)
+        .await
+        .map_err(crate::access::acl_err)?
+        .map(|(id, name)| Owner {
+            id: Some(id),
+            display_name: Some(name),
+        });
 
     let contents: ObjectList = result
         .objects
@@ -115,6 +125,7 @@ pub(super) async fn list_objects(
             size: Some(o.size as i64),
             e_tag: Some(ETag::Strong(o.etag.clone())),
             last_modified: Some(last_modified(o.last_modified_nanos)),
+            owner: owner.clone(),
             storage_class: Some(ObjectStorageClass::from(
                 o.storage_class
                     .clone()

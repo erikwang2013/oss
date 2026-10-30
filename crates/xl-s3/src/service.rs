@@ -967,8 +967,8 @@ fn apply_checksum_head(out: &mut HeadObjectOutput, rec: &xl_store::meta::Checksu
 /// If-None-Match → If-Modified-Since，任一有决定即短路。
 /// 返回 `Err(NOT_MODIFIED)`（304，调用方回空 body）或 `Err(PRECONDITION_FAILED)`（412）。
 ///
-/// ponytail: 求值基于 head 快照——与随后读盘之间是 TOCTOU 窗（并发覆写时条件可能对着
-/// 旧版本判、数据读到新版本）；无版本控制语义下接受，M4 版本控制落地时改为对版本求值。
+/// ponytail: 早期求值基于 head 快照，**读取后还会用同一次读返回的 info 再求值一次**
+/// （见 `get_object`），并发覆写时以实际 body 版本为准；无版本控制语义下不再返回错版本。
 fn eval_preconditions(
     info: &ObjectInfo,
     if_match: Option<&ETagCondition>,
@@ -1005,6 +1005,34 @@ fn eval_preconditions(
         return Err(StatusCode::NOT_MODIFIED);
     }
     Ok(())
+}
+
+/// 对某份 info 求值 GET 条件；失败返回 304/412。
+fn get_condition_status(
+    info: &ObjectInfo,
+    if_match: Option<&ETagCondition>,
+    if_unmodified_since: Option<&Timestamp>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+) -> Option<StatusCode> {
+    eval_preconditions(
+        info,
+        if_match,
+        if_unmodified_since,
+        if_none_match,
+        if_modified_since,
+    )
+    .err()
+}
+
+fn get_condition_response(status: StatusCode) -> S3Result<S3Response<GetObjectOutput>> {
+    if status == StatusCode::NOT_MODIFIED {
+        return Ok(S3Response::with_status(
+            GetObjectOutput::default(),
+            StatusCode::NOT_MODIFIED,
+        ));
+    }
+    Err(s3s::s3_error!(PreconditionFailed, "precondition failed"))
 }
 
 #[async_trait::async_trait]
@@ -1869,6 +1897,17 @@ impl S3 for OssS3 {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        // 条件头先克隆：后续会部分移动 req.input（key/range/response-*）。
+        let if_match = req.input.if_match.clone();
+        let if_unmodified_since = req.input.if_unmodified_since.clone();
+        let if_none_match = req.input.if_none_match.clone();
+        let if_modified_since = req.input.if_modified_since.clone();
+        let needs_head = if_match.is_some()
+            || if_unmodified_since.is_some()
+            || if_none_match.is_some()
+            || if_modified_since.is_some()
+            || req.input.range.is_some()
+            || req.input.part_number.is_some();
         let bucket = req.input.bucket;
         let key = req.input.key;
         let version_id = req.input.version_id.clone();
@@ -1889,96 +1928,83 @@ impl S3 for OssS3 {
             ));
         }
 
-        // 条件求值需要 info：统一先取一次 head（Range 分支本来也要 size）；条件失败不读盘上数据。
-        // M4：带 versionId 时点读该版本（marker 版本 → 405 DeleteMarker，经 to_s3_error）。
-        let mut info = match &version_id {
-            Some(v) => {
-                self.store
-                    .head_object_version_ext(&bucket, &key, v, sse.key.as_ref())
-                    .await
-            }
-            None => {
-                self.store
-                    .head_object_ext(&bucket, &key, sse.key.as_ref())
-                    .await
-            }
-        }
-        .map_err(to_s3_error)?;
-        // M8 S4b：过期恢复在此兜底回收（GET 仍按 InvalidObjectState 403）。
-        self.cleanup_expired_restore(&bucket, &key, &info).await;
-        if let Err(status) = eval_preconditions(
-            &info,
-            req.input.if_match.as_ref(),
-            req.input.if_unmodified_since.as_ref(),
-            req.input.if_none_match.as_ref(),
-            req.input.if_modified_since.as_ref(),
-        ) {
-            if status == StatusCode::NOT_MODIFIED {
-                // 304 无 body（空 output 即可）
-                return Ok(S3Response::with_status(
-                    GetObjectOutput::default(),
-                    StatusCode::NOT_MODIFIED,
-                ));
-            }
-            return Err(s3s::s3_error!(PreconditionFailed, "precondition failed"));
+        // 有 Range/partNumber/条件头时才先 HEAD 做早期拒绝；普通 GET 只读一次 meta，
+        // 并用同一次读返回的 info 做响应头与条件复核（避免 head→read 的并发覆写窗口）。
+        let head_info: Option<ObjectInfo> = if needs_head {
+            Some(
+                match &version_id {
+                    Some(v) => {
+                        self.store
+                            .head_object_version_ext(&bucket, &key, v, sse.key.as_ref())
+                            .await
+                    }
+                    None => {
+                        self.store
+                            .head_object_ext(&bucket, &key, sse.key.as_ref())
+                            .await
+                    }
+                }
+                .map_err(to_s3_error)?,
+            )
+        } else {
+            None
+        };
+        if let Some(info) = &head_info
+            && let Some(status) = get_condition_status(
+                info,
+                if_match.as_ref(),
+                if_unmodified_since.as_ref(),
+                if_none_match.as_ref(),
+                if_modified_since.as_ref(),
+            )
+        {
+            return get_condition_response(status);
         }
 
         // partNumber → 段区间读（206 + Content-Range + parts_count）；Range → 有界读 +
         // 206/416；无 Range → 整读 + 200。三条路共用同一份响应组装。
         let mut parts_count = None;
-        let (bytes, content_range, status) = if let Some(pn) = part_number {
+        let (bytes, content_range, status, info) = if let Some(pn) = part_number {
             let (part_info, bytes, span, n) = self
                 .store
                 .get_object_part_ext(&bucket, &key, version_id.as_deref(), pn, sse.key.as_ref())
                 .await
                 .map_err(to_s3_error)?;
-            info = part_info;
             parts_count = Some(n as i32);
-            let cr = format!("bytes {}-{}/{}", span.start, span.end - 1, info.size);
-            (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
+            let cr = format!("bytes {}-{}/{}", span.start, span.end - 1, part_info.size);
+            (bytes, Some(cr), StatusCode::PARTIAL_CONTENT, part_info)
         } else {
             match req.input.range {
                 Some(range) => {
+                    let head = head_info
+                        .as_ref()
+                        .ok_or_else(|| s3s::s3_error!(InternalError, "missing range metadata"))?;
                     // 越界 → RangeNotSatisfiable → InvalidRange(416)
-                    let rr = range.check(info.size).map_err(s3s::S3Error::from)?;
+                    let rr = range.check(head.size).map_err(s3s::S3Error::from)?;
                     let (start, end) = (rr.start, rr.end);
                     // 归档对象：先试 Range 直读（仅 Archived；不可用回退既有 403）。
-                    // 用 HEAD 得到的有效版本号（无 versionId 的 GET 也指向当前版本）。
-                    let direct = if info.tier_phase == Some(xl_store::meta::TierPhase::Archived) {
+                    let direct = if head.tier_phase == Some(xl_store::meta::TierPhase::Archived) {
                         self.tier_direct_range(
                             &bucket,
                             &key,
-                            info.version_id.as_deref(),
-                            &info,
+                            head.version_id.as_deref(),
+                            head,
                             start..end,
                         )
                         .await?
                     } else {
                         None
                     };
-                    let bytes = if let Some(b) = direct {
-                        b
-                    } else if start == 0 && end == info.size {
-                        // 显式全段 Range：仍回 206（S3 语义），数据走整读
-                        match &version_id {
-                            Some(v) => {
-                                self.store
-                                    .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
-                                    .await
-                            }
-                            None => {
-                                self.store
-                                    .get_object_ext(&bucket, &key, sse.key.as_ref())
-                                    .await
-                            }
-                        }
-                        .map_err(to_s3_error)?
-                        .1
+                    if let Some(b) = direct {
+                        let cr = format!("bytes {}-{}/{}", start, end - 1, head.size);
+                        (b, Some(cr), StatusCode::PARTIAL_CONTENT, head.clone())
                     } else {
-                        match &version_id {
+                        // 始终用区间读的返回值：显式全段 Range 也走这里，避免 head 的
+                        // 旧 size 与并发改写后的 body 不一致。
+                        let (read_info, bytes) = match &version_id {
                             Some(v) => {
                                 self.store
-                                    .get_object_range_version_ext(
+                                    .get_object_range_version_ext_info(
                                         &bucket,
                                         &key,
                                         v,
@@ -1989,7 +2015,7 @@ impl S3 for OssS3 {
                             }
                             None => {
                                 self.store
-                                    .get_object_range_ext(
+                                    .get_object_range_ext_info(
                                         &bucket,
                                         &key,
                                         start..end,
@@ -1998,14 +2024,14 @@ impl S3 for OssS3 {
                                     .await
                             }
                         }
-                        .map_err(to_s3_error)?
-                    };
-                    // check 保证 end >= 1（start <= last < full_length 且区间非空）
-                    let cr = format!("bytes {}-{}/{}", start, end - 1, info.size);
-                    (bytes, Some(cr), StatusCode::PARTIAL_CONTENT)
+                        .map_err(to_s3_error)?;
+                        // check 保证 end >= 1（start <= last < full_length 且区间非空）
+                        let cr = format!("bytes {}-{}/{}", start, end - 1, read_info.size);
+                        (bytes, Some(cr), StatusCode::PARTIAL_CONTENT, read_info)
+                    }
                 }
                 None => {
-                    let bytes = match &version_id {
+                    let (read_info, bytes) = match &version_id {
                         Some(v) => {
                             self.store
                                 .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
@@ -2017,12 +2043,23 @@ impl S3 for OssS3 {
                                 .await
                         }
                     }
-                    .map_err(to_s3_error)?
-                    .1;
-                    (bytes, None, StatusCode::OK)
+                    .map_err(to_s3_error)?;
+                    (bytes, None, StatusCode::OK, read_info)
                 }
             }
         };
+        // 用实际 body 版本的 info 再校验一次：覆盖 head→read 之间的并发覆写。
+        if let Some(status) = get_condition_status(
+            &info,
+            if_match.as_ref(),
+            if_unmodified_since.as_ref(),
+            if_none_match.as_ref(),
+            if_modified_since.as_ref(),
+        ) {
+            return get_condition_response(status);
+        }
+        // M8 S4b：过期恢复兜底回收（GET 已按实际版本校验；回收失败留给 reaper）。
+        self.cleanup_expired_restore(&bucket, &key, &info).await;
         let len = bytes.len() as i64;
         let restore = restore_header(&info);
         // 读路径补全：成功 200/206 才发（304/416/错误已在上面提前返回）
@@ -4017,8 +4054,26 @@ impl S3 for OssS3 {
             delimiter,
             max_keys,
             continuation_token,
+            start_after,
+            encoding_type,
+            fetch_owner,
             ..
         } = req.input;
+        // V2 的 encoding-type 与 V1 同口径：只支持 url；其余值显式 400。
+        let encode = match encoding_type.as_ref().map(EncodingType::as_str) {
+            None => false,
+            Some(EncodingType::URL) => true,
+            Some(_) => {
+                return Err(s3s::s3_error!(InvalidArgument, "encoding-type must be url"));
+            }
+        };
+        let enc = |s: &str| {
+            if encode {
+                list_v1::url_encode(s)
+            } else {
+                s.to_string()
+            }
+        };
 
         // max-keys < 0：i32 → usize 的 `as` 会回绕成巨值、再被 store 的 .min(1000) 钳成 1000，
         // 非法参数被静默当默认值。报 InvalidRequest，不猜客户端意图。
@@ -4037,24 +4092,43 @@ impl S3 for OssS3 {
             .list_objects(
                 &bucket,
                 &ListRequest {
-                    prefix,
-                    delimiter,
+                    prefix: prefix.clone(),
+                    delimiter: delimiter.clone(),
+                    // V2 的 start-after 与 V1 marker 同为“严格大于”起点；store 的 marker 即排他。
+                    // AWS：continuation-token 存在时 start-after 被忽略。
+                    marker: if continuation_token.is_some() {
+                        None
+                    } else {
+                        start_after.clone()
+                    },
                     max_keys,
-                    continuation_token,
-                    ..Default::default()
+                    continuation_token: continuation_token.clone(),
                 },
             )
             .await
             .map_err(to_s3_error)?;
+        let owner = if fetch_owner == Some(true) {
+            self.acl
+                .bucket_owner_display(&bucket)
+                .await
+                .map_err(crate::access::acl_err)?
+        } else {
+            None
+        };
+        let owner = owner.map(|(id, name)| Owner {
+            id: Some(id),
+            display_name: Some(name),
+        });
 
         let contents: ObjectList = result
             .objects
             .iter()
             .map(|o| Object {
-                key: Some(o.key.clone()),
+                key: Some(enc(&o.key)),
                 size: Some(o.size as i64),
                 e_tag: Some(ETag::Strong(o.etag.clone())),
                 last_modified: Some(last_modified(o.last_modified_nanos)),
+                owner: owner.clone(),
                 storage_class: Some(ObjectStorageClass::from(
                     o.storage_class
                         .clone()
@@ -4066,18 +4140,26 @@ impl S3 for OssS3 {
 
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(bucket),
-            contents: Some(contents),
+            prefix: prefix.as_deref().map(enc),
+            delimiter: delimiter.as_deref().map(enc),
+            max_keys: Some(max_keys.unwrap_or(1000).min(1000) as i32),
             key_count: Some(result.objects.len() as i32),
+            continuation_token,
+            contents: Some(contents),
             common_prefixes: Some(
                 result
                     .common_prefixes
                     .into_iter()
-                    .map(|p| CommonPrefix { prefix: Some(p) })
+                    .map(|p| CommonPrefix {
+                        prefix: Some(enc(&p)),
+                    })
                     .collect(),
             ),
             is_truncated: Some(result.is_truncated),
             next_continuation_token: result.next_token,
-            ..Default::default()
+            encoding_type: encode.then(|| EncodingType::from_static(EncodingType::URL)),
+            start_after: start_after.as_deref().map(enc),
+            request_charged: None,
         }))
     }
 
@@ -4146,6 +4228,28 @@ impl S3 for OssS3 {
             None,
             None,
         )?;
+        // CopyObject 是单请求写：先 HEAD 源校验大小，避免超限对象先整份读进内存再失败。
+        // AWS 单次 CopyObject 上限 5 GiB；本服务另受 max_put_bytes 约束（与 PUT 同口径）。
+        let src_head = match version_id.as_deref() {
+            Some(vid) => {
+                self.store
+                    .head_object_version_ext(bucket, key, vid, src_sse.key.as_ref())
+                    .await
+            }
+            None => {
+                self.store
+                    .head_object_ext(bucket, key, src_sse.key.as_ref())
+                    .await
+            }
+        }
+        .map_err(to_s3_error)?;
+        let copy_limit = (self.max_put_bytes as u64).min(5 * 1024 * 1024 * 1024);
+        if src_head.size > copy_limit {
+            return Err(s3s::s3_error!(
+                EntityTooLarge,
+                "copy source exceeds the configured single-copy limit"
+            ));
+        }
         let mut dst_sse = parse_sse(
             req.input.sse_customer_algorithm.as_deref(),
             req.input.sse_customer_key.as_deref(),

@@ -72,8 +72,10 @@ impl Store {
         include_deleted: bool,
         limit: usize,
     ) -> Result<(Vec<(crate::mesh::ListEntry, ObjectInfo)>, Vec<String>)> {
-        let mut keys = self.collect_keys(bucket).await?;
-        keys.sort();
+        // 先按 prefix/marker 过滤再收集：大桶里按前缀翻页时不再把整桶键集读进内存。
+        let keys = self
+            .collect_keys_filtered(bucket, prefix, start_after, exclusive, true)
+            .await?;
 
         let mut objects: Vec<(crate::mesh::ListEntry, ObjectInfo)> = Vec::new();
         let mut cps: Vec<String> = Vec::new();
@@ -272,6 +274,30 @@ impl Store {
     /// 评审 R3：各盘取并集（drive0 掉线不得让列举报 NoSuchBucket/空）。任一盘读到桶目录即算
     /// 「见过」；全盘 NotFound = 桶被并发删除的窗口 → NoSuchBucket（而不是把裸 IO 错误抛给上层）。
     pub(in crate::store) async fn collect_keys(&self, bucket: &str) -> Result<Vec<String>> {
+        self.collect_keys_filtered(bucket, "", None, false, false)
+            .await
+    }
+
+    /// 带 prefix/marker 预过滤的键集。prefix 先展平成目录名前缀再比较，未命中的目录
+    /// 不进入 BTreeSet——大桶按前缀翻页时内存从 O(整桶) 降到 O(匹配前缀)。
+    /// 根前缀（`""`）仍是 O(整桶)；彻底解决需要命名空间索引（独立架构项）。
+    /// 另有硬上限（`OSS_LIST_MAX_KEYS`，默认 100 万，0=不限）防止单请求 OOM。
+    pub(in crate::store) async fn collect_keys_filtered(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        exclusive: bool,
+        apply_cap: bool,
+    ) -> Result<Vec<String>> {
+        static MAX_KEYS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let max_keys = *MAX_KEYS.get_or_init(|| {
+            std::env::var("OSS_LIST_MAX_KEYS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1_000_000)
+        });
+        let dir_prefix = prefix.replace('/', layout::SEP);
         let mut keys = std::collections::BTreeSet::new();
         let mut seen = false;
         for drive in &self.cfg.drives {
@@ -286,11 +312,25 @@ impl Store {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(&dir_prefix) {
+                    continue;
+                }
                 // 杂物目录（手工塞入、崩溃残留）解出的键非法：跳过并告警，不能让一个目录名
                 // 把整桶列举打挂；真实对象的目录名由 object_dir_name 生成，必过同一套校验。
                 match layout::key_from_dir_name(&name) {
                     Ok(k) => {
+                        if let Some(after) = start_after
+                            && (k.as_str() < after || (exclusive && k.as_str() == after))
+                        {
+                            continue;
+                        }
                         keys.insert(k);
+                        if apply_cap && max_keys != 0 && keys.len() > max_keys {
+                            return Err(Error::InvalidArgument(format!(
+                                "桶 {bucket} 的列举键数超过上限 {max_keys}；请使用 prefix 缩小范围，\
+                                 或调大 OSS_LIST_MAX_KEYS（会占用更多内存）"
+                            )));
+                        }
                     }
                     Err(e) => tracing::warn!(dir = ?name, error = %e, "跳过非法对象目录"),
                 }

@@ -12,6 +12,30 @@ use crate::meta::{self, Version, XlMeta};
 
 use super::{ObjectInfo, Store, drives, ec};
 
+/// 并发覆写时的 meta 重读轮数。固定 2 次在热键连续覆写下会误报 NoSuchKey；
+/// 8 次把窗口压到可忽略，同时避免无限重试。
+const READ_META_RETRY_ROUNDS: usize = 8;
+
+/// 整对象读（非 Range）的缓冲上限。整读路径当前必须把对象/密文物化进内存；超过上限
+/// 直接 400 并提示用 Range，避免一个 GB 级 GET 把进程打崩。`0` = 不限制（高风险）。
+/// 真正的流式 GET 是后续独立项；此上限是止血，不是能力声明。
+pub(in crate::store) fn ensure_buffered_read_allowed(size: u64) -> Result<()> {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("OSS_MAX_BUFFERED_GET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(512 * 1024 * 1024)
+    });
+    if limit != 0 && size > limit {
+        return Err(Error::InvalidArgument(format!(
+            "对象 {size} 字节超过整读缓冲上限 {limit}；请用 Range 分段读取，或调大 \
+             OSS_MAX_BUFFERED_GET_BYTES（会占用等量内存）"
+        )));
+    }
+    Ok(())
+}
+
 /// M5 切片 3（R1/R6）：读面前置校验——SSE-C 记录必带客户钥且 key-MD5 符；非 SSE-C 记录
 /// 不得携带客户钥（否则 400，AWS 语义）。HEAD/GET/版本点名读共用（不解密，仅元数据校验）。
 pub(in crate::store) fn check_read_sse_c(
@@ -126,7 +150,8 @@ impl Store {
     /// 读路径不加锁，meta 与数据文件之间隔着一次 open：覆写者在提交点之后才把老版本目录移进
     /// trash，所以先读到的 meta 可能指向刚被移走的版本目录（数据文件 ENOENT）。此时重读一次
     /// meta 拿新版本再试；两轮都读不到 = 对象确实不在（或被并发删除）→ NoSuchKey。
-    /// ponytail: 固定重试一次；持续覆写风暴下不保证收敛（M2 快照读解决）。
+    /// 并发覆写时重读 meta（有上限，见 `READ_META_RETRY_ROUNDS`）；持续覆写风暴下仍可能
+    /// 返回 NoSuchKey，但窗口远小于旧的固定 2 次。
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectInfo, Bytes)> {
         self.get_object_ext(bucket, key, None).await
     }
@@ -141,7 +166,7 @@ impl Store {
         self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
-        for round in 0..2 {
+        for round in 0..READ_META_RETRY_ROUNDS {
             // 回退一次（Task 6/D1）：快路径集合的数据轮失败 → 全量扇出取最新再试
             let m = if round == 0 {
                 self.read_meta(bucket, key).await?
@@ -158,6 +183,7 @@ impl Store {
             }
             check_tier_readable(v, bucket, key)?;
             check_read_sse_c(v, sse_c)?;
+            ensure_buffered_read_allowed(v.size)?;
             let info = self.load_object_info(bucket, key, &m)?;
 
             // 形态分派：内联 → EC 布局 → 旧 parts/part
@@ -185,7 +211,15 @@ impl Store {
             }
             if let Some(l) = &v.data_layout {
                 match self
-                    .read_ec_range(bucket, key, v, l, None, round > 0, sse_c)
+                    .read_ec_range(
+                        bucket,
+                        key,
+                        v,
+                        l,
+                        None,
+                        round + 1 == READ_META_RETRY_ROUNDS,
+                        sse_c,
+                    )
                     .await?
                 {
                     Some(bytes) => return Ok((info, bytes)),
@@ -246,10 +280,25 @@ impl Store {
         range: std::ops::Range<u64>,
         sse_c: Option<&crypto::SseCKey>,
     ) -> Result<Bytes> {
+        Ok(self
+            .get_object_range_ext_info(bucket, key, range, sse_c)
+            .await?
+            .1)
+    }
+
+    /// 有界读并返回**同一次 meta 读**得到的 `ObjectInfo`：GET 的条件/响应头必须与 body
+    /// 来自同一版本，避免先 HEAD 再读 body 的并发覆写窗口。
+    pub async fn get_object_range_ext_info(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: std::ops::Range<u64>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, Bytes)> {
         self.ensure_bucket(bucket).await?;
         let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
 
-        for round in 0..2 {
+        for round in 0..READ_META_RETRY_ROUNDS {
             // 回退一次（Task 6/D1）：快路径集合的数据轮失败 → 全量扇出取最新再试
             let m = if round == 0 {
                 self.read_meta(bucket, key).await?
@@ -273,6 +322,8 @@ impl Store {
                     v.size
                 )));
             }
+            ensure_buffered_read_allowed(range.end - range.start)?;
+            let info = super::version::version_info(key, v);
 
             // 形态分派（同 get_object；M4 切片 2 起 EC 区间读只取命中块 + 逐块重建）
             if let Some(inline) = &v.inline {
@@ -295,16 +346,25 @@ impl Store {
                         crypto::open_all(&ctx, v.size, &inline.bytes)?
                     }
                 };
-                return Ok(Bytes::copy_from_slice(
-                    &plain[range.start as usize..range.end as usize],
+                return Ok((
+                    info,
+                    Bytes::copy_from_slice(&plain[range.start as usize..range.end as usize]),
                 ));
             }
             if let Some(l) = &v.data_layout {
                 match self
-                    .read_ec_range(bucket, key, v, l, Some(range.clone()), round > 0, sse_c)
+                    .read_ec_range(
+                        bucket,
+                        key,
+                        v,
+                        l,
+                        Some(range.clone()),
+                        round + 1 == READ_META_RETRY_ROUNDS,
+                        sse_c,
+                    )
                     .await?
                 {
-                    Some(bytes) => return Ok(bytes),
+                    Some(bytes) => return Ok((info, bytes)),
                     None => continue,
                 }
             }
@@ -357,7 +417,7 @@ impl Store {
             if missing {
                 continue;
             }
-            return Ok(Bytes::from(buf));
+            return Ok((info, Bytes::from(buf)));
         }
         Err(Error::NoSuchKey(key.to_string()))
     }
@@ -464,12 +524,18 @@ impl Store {
     ) -> Result<Option<Vec<Option<Vec<u8>>>>> {
         let total = l.shards.len();
         let data = l.data as usize;
+        // 12 片并发读：远端分片是 RPC，逐片 await 会把对象读吞吐压成 1/RTT。
+        let reads = l.shards.iter().enumerate().map(|(i, s)| async move {
+            (
+                i,
+                self.read_shard_block(set, bucket, key, v, s, i, t, ss)
+                    .await,
+            )
+        });
+        let results = futures::future::join_all(reads).await;
         let mut chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
-        for (i, s) in l.shards.iter().enumerate() {
-            match self
-                .read_shard_block(set, bucket, key, v, s, i, t, ss)
-                .await?
-            {
+        for (i, res) in results {
+            match res? {
                 Some(b) => {
                     *any_bytes = true;
                     chunks.push(Some(b));

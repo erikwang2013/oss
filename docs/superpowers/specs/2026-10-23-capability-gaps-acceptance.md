@@ -66,7 +66,9 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
   （AP 匿名已于后续批次支持，见 §8）。
 - Inventory 增量（节点本地水位，沿用既有 3.6 实现）；跨账户目标已由 3.7 支持（仅管理员可配置，
   见 §8）；Batch 抢占/跨账号（每动作桶通知已于后续批次实现，见 §8）。
-- Lifecycle `AbortIncompleteMultipartUpload`（需 MPU 索引，继续 501）。
+- ~~Lifecycle `AbortIncompleteMultipartUpload`（需 MPU 索引，继续 501）~~ —— 已实现：
+  `crates/oss-server/src/lifecycle.rs:921`（按前缀 + 创建天数中止未完成 MPU，域外不动）；
+  后续批次已删除该非目标。
 - ~~Tier 流式搬运（全内存）~~ —— post-1.14 3.11 已实现：Transition 按 8 MiB 窗口读取源、
   出站 256 KiB 块流式发送（S3 先落暂存文件预计算 SigV4 payload hash）；Restore 流式落盘并
   校验长度/SHA-256，空间不足或校验失败回 Archived 并清理暂存。Archived GET（含 Range）
@@ -114,8 +116,10 @@ level 2（`feature_level=1` 时 append 前拒绝，503 `feature_unavailable`）�
 4. 滚动升级 e2e 已实跑（65 PASS / 0 FAIL / 4 预期 SKIP）；level-2 产品命令为
    `BucketSetLifecycleV2`（结构化生命周期），写入门控/激活由 `tests/raft_commands.rs`
    与 store 单元测试覆盖；v1.14.0 的 V2 级别误判已由 post-1.14 热修复修正。
-5. Web `tsc`/`vite` 未运行（worktree 无 `node_modules`）；前端改动为增量、类型一致。
-6. 生命周期破坏性 sweep 的进程内测试覆盖，但未跑独立长时 e2e；AbortIncompleteMultipartUpload 仍 501。
+5. ~~Web `tsc`/`vite` 未运行（worktree 无 `node_modules`）~~ —— 已在 §11.1 实跑
+   `tsc -b` / `vite build` / Playwright（9 passed）；本条保留当时环境说明。
+6. 生命周期破坏性 sweep 的进程内测试覆盖；`AbortIncompleteMultipartUpload` 已实现
+   （`crates/oss-server/src/lifecycle.rs:921`），独立长时 e2e 仍未单列。
 
 ## 6. 文档、图片与站点同步（2026-10-23）
 
@@ -274,7 +278,9 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
   跨版本 cutover/force-recover 仍要求停写/滚动重启；设计见架构 backlog。
 - **完整多租户账户体系**：账户 = 用户命名空间 v1，无账户管理员/共享/配额/隔离；AP 跨账号与
   Inventory 目标账户都不是租户边界。设计见架构 backlog。
-- **M3 shrink / 单机→集群**：架构项目，未实现；设计见架构 backlog。
+- **M3 shrink / 单机→集群**：M3 shrink 4→3 已交付（v1.20.0 的
+  `cluster-shrink plan/apply/verify/commit/rollback` + §15.2 loopback e2e）；单机→集群仍为
+  「重新灌入」（`scripts/single-to-cluster.sh`），不工具化。设计见架构 backlog。
 - **M8 多节点控制面**：§12 已做单例后台任务 leader 门控，但作业/清单/恢复/审计运行状态
   仍为节点本地，无 fencing/复制；完整多节点见架构 backlog。
 - **直接读 tier（含 Range）**：仍不直读远端，归档对象须先 Restore；缺分块哈希，范围读无法
@@ -340,7 +346,7 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 - M3/M4 数据面滚动升级。
 - 完整多租户账户体系与 AP 跨账号/VPC 端点身份。
 - M8 多节点运行状态复制/fencing（仅 leader 门控）。
-- M3 shrink / 单机→集群。
+- M3 shrink：v1.20.0 已交付（§14.1/§15.2）；单机→集群仍为重新灌入。
 - 直接读 tier（缺分块哈希，范围读完整性无法保证）。
 - M6 无 `site_token` 历史远端、M7 升级前已删除副本、marker 指纹缺失等兼容边界。
 
@@ -378,7 +384,8 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 - M9：sync 78/0/1、stretch 59/0/1、recovery 133/0/1（v1.17.0 集成树复跑）。
 - rolling：65/0/4（v1.17.0 集成树重跑；首跑 64/1/4 为高负载下 60s 轮询超时，非产品失败）。
 - fmt/clippy：`cargo fmt --all --check` 与 clippy `-D warnings` 均为 0；Web `tsc`/`vite build`
-  通过、Vitest 21/21、oxlint 0。Playwright 未跑：本机 9000 端口被 MinIO 占用，配置会复用该服务。
+  通过、Vitest 21/21、oxlint 0。Playwright 当时未跑：本机 9000 端口被 MinIO 占用，旧配置会复用该服务
+  （现已改为临时数据目录/DB + `reuseExistingServer: false`）。
 - M8 e2e：PASS 4633s（Tier=ran + M6/M7 smoke）。
 - E2E_LONG：100×100MB 全部读回校验和一致（含中断重试）。受 `/home` 机械盘被其它会话重压影响，在 `/tmp` SSD 上完成。
 
@@ -388,7 +395,7 @@ Level B 生命周期级别热修；本批另并入 Inventory 跨账户目标（�
 - M3/M4 数据面完整滚动（仅 DP-0 握手；DP-1 读路径矩阵、DP-2 TLS 入站热轮换仍缺）。
 - 完整多租户（账户表未随 Raft 复制；软字节配额；账户管理员 UI 不完整）。
 - M8 多节点运行态复制/fencing 后的跨节点接管（仅本地 fencing epoch）。
-- M3 shrink / 单机→集群。
+- M3 shrink：v1.20.0 已交付（§14.1/§15.2）；单机→集群仍为重新灌入。
 - VPC endpoint 的真实 PrivateLink/ENI 身份（SourceVpce 仅为部署证明）。
 - 直接读 tier 的已知限制：分块表无独立签名、ETag 口径不比较、跨进程预留只协调协作进程。
 - Level B 滚动 e2e 的 4 个 v1.13.1 侧 SKIP、M6 无 token 历史远端、M7 升级前删除不回溯。

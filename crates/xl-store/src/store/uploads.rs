@@ -74,8 +74,11 @@ impl Store {
         upload_id_marker: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<UploadInfo>, Vec<String>)> {
-        let mut keys = self.collect_keys(bucket).await?;
-        keys.sort();
+        // 收集时必须包含 key_marker 本身：同键的 upload_id 续页还要在循环里继续。
+        // “排他”由下面的 at_marker_key 分支处理，不能在这里提前丢掉 marker 键。
+        let keys = self
+            .collect_keys_filtered(bucket, prefix, key_marker, false, true)
+            .await?;
 
         let mut cp_set: BTreeSet<String> = BTreeSet::new();
         if let Some(d) = delimiter {

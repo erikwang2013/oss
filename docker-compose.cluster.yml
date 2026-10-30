@@ -12,13 +12,20 @@ x-oss-common: &oss-common
     # 密钥没填（oss.toml 留空）就自动生成并落盘；四节点共享同一文件——flock 串行化，
     # 并发首启收敛到同一份（各 node 还有自己的 ./docker/secrets:/secrets 挂载，见下）
     OSS_SECRETS_FILE: /secrets/generated.env
+  # 容器内就绪探针（各节点容器内均监听 :9000）。
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/live"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
   restart: unless-stopped
 
 services:
   n1:
     <<: *oss-common
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
     volumes:
       - n1-data:/data
       - n1-staging:/staging
@@ -32,7 +39,7 @@ services:
   n2:
     <<: *oss-common
     ports:
-      - "9001:9000"
+      - "127.0.0.1:9001:9000"
     volumes:
       - n2-data:/data
       - n2-staging:/staging
@@ -42,7 +49,7 @@ services:
   n3:
     <<: *oss-common
     ports:
-      - "9002:9000"
+      - "127.0.0.1:9002:9000"
     volumes:
       - n3-data:/data
       - n3-staging:/staging
@@ -52,7 +59,7 @@ services:
   n4:
     <<: *oss-common
     ports:
-      - "9003:9000"
+      - "127.0.0.1:9003:9000"
     volumes:
       - n4-data:/data
       - n4-staging:/staging
@@ -64,10 +71,18 @@ services:
       context: .
       dockerfile: docker/Dockerfile.web
     image: oss-console:dev
+    # nginx:alpine 自带 busybox wget；n1 健康后再起。
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     depends_on:
-      - n1
+      n1:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

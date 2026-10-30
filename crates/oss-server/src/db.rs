@@ -294,6 +294,8 @@ const SCHEMA_ACCOUNTS: &str = include_str!("../migrations/0005_accounts.sql");
 const SCHEMA_TENANCY: &str = include_str!("../migrations/0006_tenancy.sql");
 /// M8 多节点：调度租约 + 运行态序列。每次启动重放（IF NOT EXISTS）。
 const SCHEMA_RUNSTATE: &str = include_str!("../migrations/0007_m8_runstate.sql");
+/// 审计/上传/秒传索引（2026-10-30 审计）。每次启动重放（IF NOT EXISTS）。
+const SCHEMA_HOT_INDEXES: &str = include_str!("../migrations/0008_hot_indexes.sql");
 
 /// 账户表已规范化（v2 回填/重写完成）。standalone 启动时写；Raft 模式由后续
 /// canonicalization worker 在 level-3 写，快照读取以本 marker 为门。
@@ -375,6 +377,7 @@ impl Db {
         sqlx::raw_sql(SCHEMA_ACCOUNTS).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_TENANCY).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_RUNSTATE).execute(&db.pool).await?;
+        sqlx::raw_sql(SCHEMA_HOT_INDEXES).execute(&db.pool).await?;
         db.ensure_columns_tenancy().await?;
         // M8-1：运行态表 fencing 列依赖 0003 已建表，故放在 M8/M9 重放之后。
         db.ensure_fence_columns().await?;
@@ -1581,18 +1584,35 @@ impl Db {
             // 用户存在性 oracle 收口（verifier 切片 7 观察 A）：Argon2 让「未命中早退」
             // 与「命中校验」的时延差从 µs 放大到几十 ms、网络可测——未命中路径先对一个
             // 固定 dummy 串跑一次同参数 verify 再返回，两侧时延拉平。
-            crate::db::dummy_verify(password);
+            // 与真实校验共用同一并发闸（C1：同价成本、同一上限）。
+            let password = password.to_owned();
+            crate::db::argon2_offload(move || crate::db::dummy_verify(&password)).await?;
             return Ok(None);
         };
         let stored: String = r.get("password_hash");
         let id: i64 = r.get("id");
-        if !crate::db::verify_password(password, &stored) {
+        let legacy = crate::db::is_legacy_hash(&stored);
+        // Argon2 移出 tokio worker；行查询已在闸外完成，许可在返回前释放（不跨后续 DB I/O）。
+        let password_for_verify = password.to_owned();
+        if !crate::db::argon2_offload(move || {
+            crate::db::verify_password(&password_for_verify, &stored)
+        })
+        .await?
+        {
             return Ok(None);
         }
-        if crate::db::is_legacy_hash(&stored) && !self.raft_mode() {
+        if legacy && !self.raft_mode() {
             // 透明升级（失败只 warn：本次登录已成功，下次再来）。
             // Raft 模式：随机盐会让各站点写出的 hash 不同 → 禁止本地写，只验通过。
-            let upgraded = crate::db::hash_password(password);
+            // 哈希同样走阻塞池 + 并发闸（旧哈希账户登录频率低，但不应占 tokio worker）。
+            let password_for_hash = password.to_owned();
+            let upgraded = match argon2_offload(move || hash_password(&password_for_hash)).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, user = %username, "旧口令哈希升级计算失败");
+                    return Ok(Some(id));
+                }
+            };
             if let Err(e) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
                 .bind(&upgraded)
                 .bind(id)
@@ -1868,6 +1888,20 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// 清过期秒传索引行（有界批；过期行不影响命中，但会无限增长）。
+    pub async fn instant_purge_expired(&self, limit: i64) -> Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM instant_index WHERE k IN \
+             (SELECT k FROM instant_index WHERE expires_at <= ? ORDER BY expires_at LIMIT ?)",
+        )
+        .bind(now())
+        .bind(limit.max(1))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
     }
 
     pub async fn record_upload(
@@ -2746,6 +2780,23 @@ impl Db {
             })
             .collect())
     }
+}
+
+/// 进程级 Argon2 并发闸（C1 DoS）：单次校验约 19 MiB，最多 8 路并行。
+/// 校验一律走阻塞池，未认证登录洪水不再占满 tokio worker。
+static ARGON2_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(8));
+
+/// 在阻塞池执行一次 Argon2 工作（校验/哑校验），并发受 [`ARGON2_PERMITS`] 限制。
+/// JoinError 转成 DB 错误上抛（登录 handler 记日志后回 500，不 panic）。
+async fn argon2_offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    let _permit = ARGON2_PERMITS
+        .acquire()
+        .await
+        .map_err(|e| sqlx::Error::Protocol(format!("Argon2 并发闸不可用: {e}")))?;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(format!("Argon2 阻塞任务失败: {e}")))
 }
 
 /// 口令哈希（M4 切片 7 起）：Argon2id（salt 随机、串内自描述 `$argon2id$...`）。

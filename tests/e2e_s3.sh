@@ -5,6 +5,9 @@
 # E2E_LONG_N / E2E_LONG_MB 调规模（默认 100 × 100 MB，分钟级，人工触发）。
 set -euo pipefail
 
+# 所有 curl 统一超时：e2e 卡住时失败而不是挂死（大对象 PUT/GET 留 60s 余量）。
+curl() { command curl --max-time 60 "$@"; }
+
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
 AK="${AK:-AKIA_TEST_ACCESS_KEY}"
 SK="${SK:-SK_TEST_SECRET_KEY_0001}"

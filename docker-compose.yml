@@ -8,10 +8,18 @@ services:
     environment:
       OSS_ADMIN_USER: erik
       # 密钥没填（oss.toml 留空）就自动生成并落盘 ./docker/secrets/generated.env：
-      # 宿主可直读（cat 看管理员口令），重启复用；删文件=整体轮换。
+      # 0600 / 属主 oss（宿主用 docker compose exec 或 sudo 查看），重启复用；删文件=整体轮换。
       OSS_SECRETS_FILE: /secrets/generated.env
+    # 容器内就绪探针（镜像含 curl）；TLS 部署需按实际监听改 scheme。
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     ports:
-      - "9000:9000"
+      # 默认只绑回环，避免未配置 TLS/鉴权前直接暴露公网；对外见 README「Docker」。
+      - "127.0.0.1:9000:9000"
     volumes:
       - oss-data:/data
       - oss-staging:/staging
@@ -26,10 +34,18 @@ services:
       context: .
       dockerfile: docker/Dockerfile.web
     image: oss-console:dev
+    # nginx:alpine 自带 busybox wget；等 oss 健康后再起，避免反代上游未就绪。
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     depends_on:
-      - oss
+      oss:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

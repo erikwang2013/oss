@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { App, Breadcrumb, Button, Card, Input, Modal, Popconfirm, Space, Table, Tag, Tooltip } from 'antd'
 import { FileOutlined, FolderOutlined, ReloadOutlined } from '@ant-design/icons'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, rawApi, type BucketInfo, type ObjectList, type ObjectTag } from '../api'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { api, mergeObjectPages, rawApi, type BucketInfo, type ObjectList, type ObjectTag } from '../api'
 import { fmtTime, humanSize } from '../format'
 import InventoryModal from '../InventoryModal'
 import PageHeader from '../PageHeader'
@@ -25,6 +25,9 @@ type Row =
       legal_hold?: boolean
     }
 
+// 与后端 list_objects 的单页硬上限一致（max_keys.min(1000)）
+const PAGE_SIZE = 1000
+
 export default function Objects() {
   const { bucket = '' } = useParams()
   const { message } = App.useApp()
@@ -36,12 +39,16 @@ export default function Objects() {
   const [inventoryOpen, setInventoryOpen] = useState(false)
   const [tagsKey, setTagsKey] = useState<string | null>(null)
 
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  // 服务端分页：后端默认上限 1000，不翻页会静默截断；游标 = next_cursor（下页第一个键）
+  const { data, isLoading, isFetching, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
     queryKey: ['objects', bucket, prefix],
-    queryFn: () =>
-      api<ObjectList>(
-        `/api/v1/buckets/${encodeURIComponent(bucket)}/objects?prefix=${encodeURIComponent(prefix)}&delimiter=/`,
-      ),
+    queryFn: ({ pageParam }) => {
+      const q = new URLSearchParams({ prefix, delimiter: '/', limit: String(PAGE_SIZE) })
+      if (pageParam) q.set('cursor', pageParam)
+      return api<ObjectList>(`/api/v1/buckets/${encodeURIComponent(bucket)}/objects?${q}`)
+    },
+    initialPageParam: '',
+    getNextPageParam: (last) => (last.is_truncated && last.next_cursor ? last.next_cursor : undefined),
     enabled: !!bucket,
   })
 
@@ -92,21 +99,24 @@ export default function Objects() {
     )
   }, [bucket, prefix])
 
-  const rows: Row[] = [
-    ...(data?.common_prefixes ?? []).map((p) => ({ kind: 'dir' as const, key: p })),
-    ...(data?.objects ?? []).map((o) => ({
-      kind: 'obj' as const,
-      key: o.key,
-      size: o.size,
-      etag: o.etag,
-      storage_class: o.storage_class,
-      tier_phase: o.tier_phase,
-      restore_expires_at: o.restore_expires_at,
-      lock_mode: o.lock_mode,
-      lock_retain_until: o.lock_retain_until,
-      legal_hold: o.legal_hold,
-    })),
-  ]
+  const rows = useMemo<Row[]>(() => {
+    const merged = mergeObjectPages(data?.pages ?? [])
+    return [
+      ...merged.common_prefixes.map((p) => ({ kind: 'dir' as const, key: p })),
+      ...merged.objects.map((o) => ({
+        kind: 'obj' as const,
+        key: o.key,
+        size: o.size,
+        etag: o.etag,
+        storage_class: o.storage_class,
+        tier_phase: o.tier_phase,
+        restore_expires_at: o.restore_expires_at,
+        lock_mode: o.lock_mode,
+        lock_retain_until: o.lock_retain_until,
+        legal_hold: o.legal_hold,
+      })),
+    ]
+  }, [data])
 
   return (
     <>
@@ -229,6 +239,14 @@ export default function Objects() {
           ]}
         />
       </Card>
+      {hasNextPage && (
+        <div style={{ textAlign: 'center', marginTop: 16 }}>
+          <div style={{ color: '#64748b', marginBottom: 8 }}>
+            已加载 {rows.length} 项，还有更多对象未显示
+          </div>
+          <Button onClick={() => fetchNextPage()} loading={isFetchingNextPage}>加载更多</Button>
+        </div>
+      )}
       <UploadPanel open={uploading} bucket={bucket} onClose={() => setUploading(false)} />
       {inventoryOpen && <InventoryModal bucket={bucket} onClose={() => setInventoryOpen(false)} />}
       {tagsKey && (

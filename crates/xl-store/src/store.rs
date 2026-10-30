@@ -742,6 +742,11 @@ impl Store {
     }
 
     /// quorum 未达计数快照（写/锁分列；`/health/cluster` 的最小信号）。
+    /// 聚合读（整对象/大 Range/远端 tier 直读）的缓冲上限检查；超限返回 400 语义。
+    pub fn check_buffered_read(&self, size: u64) -> Result<()> {
+        read::ensure_buffered_read_allowed(size)
+    }
+
     pub fn quorum_unmet_counts(&self) -> (u64, u64) {
         (
             self.quorum_unmet_write.load(Ordering::Relaxed),
@@ -772,14 +777,15 @@ impl Store {
 
     fn lock_named(&self, id: String) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.locks.lock().unwrap();
-        let lock = locks
+        // 回收无人持有的旧条目，但不要每次取锁都全表扫描（热写路径 O(active)）。
+        // 阈值内只增不减；超过后一次清理把历史键收敛掉。
+        if locks.len() > 4096 {
+            locks.retain(|_, v| Arc::strong_count(v) > 1);
+        }
+        locks
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        // 回收无人持有的旧条目，锁表不随历史写过的键无限增长
-        //（本键刚 clone 出来，count ≥ 2 必留；其余条目只为 map 自己持有时删掉）
-        locks.retain(|_, v| Arc::strong_count(v) > 1);
-        lock
+            .clone()
     }
 
     /// 对象锁的完整形态（**所有写路径的统一入口**）：进程内 tokio 互斥 → 跨进程 flock。

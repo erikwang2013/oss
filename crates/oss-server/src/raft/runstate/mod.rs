@@ -62,6 +62,14 @@ pub fn encode_extension(runstate: &RunState) -> Result<Vec<u8>, DataError> {
         runstate,
     })?;
     check_size(bytes.len())?;
+    // 接近硬上限时提前告警：快照编码失败会让 Raft 日志无法回收（默认无 jobs 保留策略）。
+    if bytes.len() > RUNSTATE_MAX_BYTES * 3 / 4 {
+        tracing::warn!(
+            bytes = bytes.len(),
+            cap = RUNSTATE_MAX_BYTES,
+            "m8.runstate 快照载荷接近 64 MiB；请清理已结束的 jobs/job_tasks"
+        );
+    }
     Ok(bytes)
 }
 

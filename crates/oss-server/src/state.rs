@@ -155,6 +155,8 @@ struct UserWindow {
 const USER_FAILS_MAX: u32 = 5;
 const USER_WINDOW_SECS: i64 = 600;
 const USER_LOCK_SECS: i64 = 600;
+/// per_user 硬上限（C1 DoS：唯一用户名洪水不得无界占内存）。
+const USER_ENTRIES_MAX: usize = 4096;
 const GLOBAL_FAILS_MAX: u32 = 120;
 const GLOBAL_WINDOW_SECS: i64 = 60;
 
@@ -201,6 +203,19 @@ impl LoginLimiter {
         } else {
             st.global.0 = st.global.0.saturating_add(1);
         }
+        // 防内存无界（C1 DoS）：每次记账先清过期窗口；仍满则淘汰最早一条，硬上限 4096。
+        st.per_user
+            .retain(|_, w| w.locked_until > now || now - w.window_start < USER_WINDOW_SECS);
+        if !st.per_user.contains_key(username) && st.per_user.len() >= USER_ENTRIES_MAX {
+            let oldest = st
+                .per_user
+                .iter()
+                .min_by_key(|(_, w)| w.window_start)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                st.per_user.remove(&k);
+            }
+        }
         // 账号窗口
         let w = st
             .per_user
@@ -219,11 +234,6 @@ impl LoginLimiter {
             w.locked_until = now + USER_LOCK_SECS;
             w.fails = 0; // 锁定期间不再累加；解锁后窗口从头计
             w.window_start = now + USER_LOCK_SECS;
-        }
-        // 防内存无界：条目过多时清掉已过期窗口（简陋但足够——ponytail）
-        if st.per_user.len() > 10_000 {
-            st.per_user
-                .retain(|_, w| w.locked_until > now || now - w.window_start < USER_WINDOW_SECS);
         }
     }
 

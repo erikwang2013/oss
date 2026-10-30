@@ -28,6 +28,15 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// 登录请求体上限（C1 DoS）：超限在限速表/Argon2 之前拒绝，避免垃圾键与资源放大。
+const LOGIN_USERNAME_MAX_LEN: usize = 128;
+const LOGIN_PASSWORD_MAX_LEN: usize = 1024;
+
+/// 长度闸（字节）。通用 400，不暴露用户名是否存在。
+fn login_body_too_long(username: &str, password: &str) -> bool {
+    username.len() > LOGIN_USERNAME_MAX_LEN || password.len() > LOGIN_PASSWORD_MAX_LEN
+}
+
 /// 取 JWT 载荷里的用户 id（登录签发时 `sub` = uid 十进制字符串）。
 /// 签名/过期已由 JwtLayer 校验；这里只剩形状兜底（理论上到不了）。
 /// 兜底的 401 与 JwtLayer 用同一 JSON 形态，避免同面两种 401 body。
@@ -367,6 +376,10 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
+    // C1 长度闸：先于限速/Argon2；通用文案，不区分用户是否存在。
+    if login_body_too_long(&body.username, &body.password) {
+        return (StatusCode::BAD_REQUEST, "登录请求不合法").into_response();
+    }
     // C1 登录限速：账号锁定 + 全局失败上限（Argon2 资源放大面）。429 + Retry-After。
     if let Err(wait) = state.login_limiter.check(&body.username) {
         return (
@@ -411,7 +424,7 @@ fn store_error(e: xl_store::error::Error) -> (StatusCode, String) {
     use xl_store::error::Error;
     match &e {
         Error::NoSuchBucket(_) | Error::NoSuchKey(_) => (StatusCode::NOT_FOUND, e.to_string()),
-        Error::InvalidBucketName(_) | Error::InvalidKey(_) => {
+        Error::InvalidBucketName(_) | Error::InvalidKey(_) | Error::InvalidArgument(_) => {
             (StatusCode::BAD_REQUEST, e.to_string())
         }
         // 这几个语义是「客户端可纠正的冲突」，S3 本身也用 409；不落 5xx
@@ -5489,5 +5502,26 @@ mod leader_hint_tests {
         let r = control_failure(ControlError::Invalid("bad Ext type_id".into()));
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         assert!(r.headers().get(LEADER_HINT_HEADER).is_none());
+    }
+}
+
+#[cfg(test)]
+mod login_body_tests {
+    use super::*;
+
+    /// C1：超长用户名/口令在限速与 Argon2 之前被 400 拒绝（边界含等号，按字节计）。
+    #[test]
+    fn login_body_length_caps() {
+        let user = "u".repeat(LOGIN_USERNAME_MAX_LEN);
+        let pass = "p".repeat(LOGIN_PASSWORD_MAX_LEN);
+        assert!(!login_body_too_long(&user, &pass), "等于上限应放行");
+        assert!(
+            login_body_too_long(&format!("{user}u"), &pass),
+            "用户名超 1 字节应拒"
+        );
+        assert!(
+            login_body_too_long(&user, &format!("{pass}p")),
+            "口令超 1 字节应拒"
+        );
     }
 }

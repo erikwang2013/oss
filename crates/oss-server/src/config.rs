@@ -356,6 +356,21 @@ fn listen_host_port(raw: &str) -> Option<(String, u16)> {
     Some((host.to_ascii_lowercase(), port.parse::<u16>().ok()?))
 }
 
+/// 根 `oss.toml` 的开发占位 JWT：仅允许回环监听使用。
+const DEV_JWT_PLACEHOLDER: &str = "dev-only-change-me-0123456789abcdef";
+
+/// 监听地址是否为回环（127.0.0.0/8、::1、localhost）；无法解析按非回环处理。
+fn listen_is_loopback(raw: &str) -> bool {
+    let Some((host, _)) = listen_host_port(raw) else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// tier 存储形态：`s3`（默认，旧行为）或本地冷盘池 `local`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -716,6 +731,8 @@ impl AppConfig {
         let cfg: Self = toml::from_str(&text)?;
         cfg.tls_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
+        cfg.jwt_secret_validate()
+            .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.kafka_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.remotes_validate()
@@ -764,6 +781,17 @@ impl AppConfig {
             return Err(
                 "[listen] 配置了 http:// 但已启用 [tls.server]；监听地址请写 host:port".into(),
             );
+        }
+        Ok(())
+    }
+
+    /// 开发占位 JWT 只允许回环监听；对外监听必须换成随机密钥（不静默替换用户值）。
+    pub fn jwt_secret_validate(&self) -> Result<(), String> {
+        if self.jwt_secret == DEV_JWT_PLACEHOLDER && !listen_is_loopback(&self.listen) {
+            return Err(format!(
+                "jwt_secret 仍是开发占位值，但 listen={} 不是回环地址（127.0.0.0/8 / ::1 / localhost）——拒绝启动；请设置随机 jwt_secret（≥32 字符）或改回回环监听",
+                self.listen
+            ));
         }
         Ok(())
     }
@@ -1129,6 +1157,7 @@ impl AppConfig {
     /// - 空 `jwt_secret` / 空集群 `secret` / 缺管理员口令 → 优先复用 `OSS_SECRETS_FILE`
     ///   已有值，缺失才生成（64 hex = 32 字节）；文件用 flock 串行化——
     ///   集群多节点并发首启共享同一份（后到者阻塞后重读，不会各生成一套）。
+    ///   生成的文件为 0600、父目录收紧到 0700（/tmp 等全员可写目录不动）。
     /// - 未设文件：单机允许进程内生成（warn，重启即换）；**集群一律报错**——
     ///   各节点随机值 mesh 鉴权互不相认，属静默致命。
     /// - 管理员口令：`OSS_ADMIN_PASSWORD` 非空优先；空/缺**且配了文件**才生成（单机裸跑
@@ -1173,14 +1202,37 @@ impl AppConfig {
         if let Some(f) = file {
             if let Some(dir) = f.parent() {
                 let _ = std::fs::create_dir_all(dir);
+                #[cfg(unix)]
+                {
+                    // 0700：目录内是明文 JWT/管理员口令，只允许服务账户进入。
+                    // 不动 /tmp 等全员可写目录——root 下整目录 0700 会破坏宿主。
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let shared =
+                        std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o002 != 0);
+                    if !shared {
+                        let _ =
+                            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+                    }
+                }
             }
-            let fh = std::fs::File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false) // 只复用不截断：已有值要重读；覆盖写发生在取得锁之后
+            let mut opts = std::fs::File::options();
+            opts.read(true).write(true).create(true).truncate(false); // 只复用不截断：已有值要重读；覆盖写发生在取得锁之后
+            #[cfg(unix)]
+            {
+                // 新文件创建即 0600，避免 umask 决定权限的窗口。
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let fh = opts
                 .open(f)
                 .map_err(|e| format!("打开密钥文件 {} 失败: {e}", f.display()))?;
+            #[cfg(unix)]
+            {
+                // 0600：容器内 oss(10001) 落盘；宿主查看走 docker compose exec / sudo
+                //（README「Docker」）。同时修正旧版本遗留的 0644。
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600));
+            }
             // 跨进程串行：并发首启时后到者在锁上阻塞，重读拿到先到者已写入的同一份
             fh.lock()
                 .map_err(|e| format!("锁密钥文件 {} 失败: {e}", f.display()))?;
@@ -1214,14 +1266,6 @@ impl AppConfig {
             (Some(f), true) => {
                 std::fs::write(f, render_secrets(&have))
                     .map_err(|e| format!("写密钥文件 {} 失败: {e}", f.display()))?;
-                #[cfg(unix)]
-                {
-                    // 0644：容器内 oss(10001) 落盘、宿主用户（UID 多半不同）需直读口令——
-                    // 0600 会让「本地保存一份」变成只有 docker exec 才看得到。
-                    // 文件在 gitignore 的宿主目录内，能碰它的用户本就握有 docker（root 等价）。
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644));
-                }
                 drop(lock_file);
             }
             (Some(_), false) => drop(lock_file),
@@ -1552,11 +1596,48 @@ mod tests {
         assert_eq!(r.admin_password.as_deref(), Some("pw"));
     }
 
+    /// 开发占位 JWT：回环监听可用，对外监听拒绝；显式非占位值不受限。
+    #[test]
+    fn jwt_placeholder_only_allowed_on_loopback() {
+        let mut c = base_cfg();
+        c.jwt_secret = DEV_JWT_PLACEHOLDER.into();
+        for listen in [
+            "127.0.0.1:9000",
+            "127.9.9.9:9000",
+            "localhost:9000",
+            "[::1]:9000",
+            "http://127.0.0.1:9000",
+        ] {
+            c.listen = listen.into();
+            assert!(c.jwt_secret_validate().is_ok(), "回环应放行: {listen}");
+        }
+        for listen in [
+            "0.0.0.0:9000",
+            "[::]:9000",
+            "192.168.1.2:9000",
+            "example.com:9000",
+            "bad-listen",
+        ] {
+            c.listen = listen.into();
+            assert!(c.jwt_secret_validate().is_err(), "非回环必须拒绝: {listen}");
+        }
+        // 非占位值（含空值，空值由 resolve_secrets 生成）不受此校验限制。
+        c.listen = "0.0.0.0:9000".into();
+        for secret in ["", "explicit-32-bytes-secret-value-abcdef"] {
+            c.jwt_secret = secret.into();
+            assert!(
+                c.jwt_secret_validate().is_ok(),
+                "非占位值应放行: {secret:?}"
+            );
+        }
+    }
+
     /// 首启生成并落盘；二启（模拟重启/集群另一节点）复用同一份（flock 串行化的同进程面）。
     #[test]
     fn resolve_generates_persists_and_reuses() {
         let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("secrets.env");
+        let secrets_dir = dir.path().join("secrets");
+        let f = secrets_dir.join("secrets.env");
 
         let mut c1 = cluster_cfg();
         let r1 = c1.resolve_secrets_with(Some(&f), None).unwrap();
@@ -1569,8 +1650,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
                 std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
-                0o644,
-                "宿主用户需可直读（权限=0644）"
+                0o600,
+                "明文密钥仅服务账户可读（权限=0600）"
+            );
+            assert_eq!(
+                std::fs::metadata(&secrets_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "父目录仅服务账户可进入（权限=0700）"
             );
         }
         let jwt1 = c1.jwt_secret.clone();

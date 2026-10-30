@@ -94,6 +94,19 @@ export interface ObjectList {
   common_prefixes: string[]
   is_truncated: boolean
   next_token: string | null
+  /** 续页游标（= next_token；游标本身是「下页第一个键」，续页包含该键） */
+  next_cursor: string | null
+}
+
+/** 合并多页列表：续页可能重发边界上的 common prefix，按首次出现去重并保持键序。 */
+export function mergeObjectPages(pages: ObjectList[]): Pick<ObjectList, 'objects' | 'common_prefixes'> {
+  const prefixes = new Map<string, string>()
+  const objects = new Map<string, ObjectEntry>()
+  for (const p of pages) {
+    for (const cp of p.common_prefixes) prefixes.set(cp, cp)
+    for (const o of p.objects) objects.set(o.key, o)
+  }
+  return { common_prefixes: [...prefixes.values()], objects: [...objects.values()] }
 }
 
 export interface GroupInfo {

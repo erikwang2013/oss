@@ -1,5 +1,6 @@
+import { lazy, Suspense } from 'react'
 import { Navigate, Outlet, createBrowserRouter } from 'react-router-dom'
-import { Avatar, Dropdown, Flex, Layout, Menu, Tag, Typography } from 'antd'
+import { Avatar, Dropdown, Flex, Layout, Menu, Spin, Tag, Typography } from 'antd'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   ApiOutlined,
@@ -20,21 +21,25 @@ import { useQuery } from '@tanstack/react-query'
 import { api, getToken, setToken, type Me } from './api'
 import Mascot from './Mascot'
 import Login from './pages/Login'
-import Buckets from './pages/Buckets'
-import Objects from './pages/Objects'
-import Keys from './pages/Keys'
-import Users from './pages/Users'
-import Accounts from './pages/Accounts'
-import Cluster from './pages/Cluster'
-import AccessPoints from './pages/AccessPoints'
-import Jobs from './pages/Jobs'
-import Tiers from './pages/Tiers'
-import BucketPolicy from './pages/BucketPolicy'
-import Lifecycle from './pages/Lifecycle'
-import Audit from './pages/Audit'
-import Settings from './pages/Settings'
-import Events from './pages/Events'
-import SelectWorkbench from './pages/SelectWorkbench'
+// 路由级懒加载：外壳/登录常驻主包，各页面按路由动态 import 拆包
+// oxlint 识别不出 lazy() 的返回值是组件；本文件本就导出 router，整段关闭该 Fast Refresh 规则
+/* oxlint-disable react/only-export-components */
+const Buckets = lazy(() => import('./pages/Buckets'))
+const Objects = lazy(() => import('./pages/Objects'))
+const Keys = lazy(() => import('./pages/Keys'))
+const Users = lazy(() => import('./pages/Users'))
+const Accounts = lazy(() => import('./pages/Accounts'))
+const Cluster = lazy(() => import('./pages/Cluster'))
+const AccessPoints = lazy(() => import('./pages/AccessPoints'))
+const Jobs = lazy(() => import('./pages/Jobs'))
+const Tiers = lazy(() => import('./pages/Tiers'))
+const BucketPolicy = lazy(() => import('./pages/BucketPolicy'))
+const Lifecycle = lazy(() => import('./pages/Lifecycle'))
+const Audit = lazy(() => import('./pages/Audit'))
+const Settings = lazy(() => import('./pages/Settings'))
+const Events = lazy(() => import('./pages/Events'))
+const SelectWorkbench = lazy(() => import('./pages/SelectWorkbench'))
+/* oxlint-enable react/only-export-components */
 
 // Shell/RequireAuth 与 router（本文件导出）同文件：Fast Refresh 对它只会整页刷新，
 // 拆文件只增样板，接受这一取舍
@@ -134,7 +139,10 @@ function Shell() {
         <Layout.Content style={{ padding: 24 }}>
           {/* 内容定宽居中：宽屏下表格不横贯整个视口 */}
           <div style={{ maxWidth: 1160, margin: '0 auto' }}>
-            <Outlet />
+            {/* 懒加载页面共用边界：外壳常驻，切换路由只挂起内容区 */}
+            <Suspense fallback={<Flex justify="center" style={{ padding: 48 }}><Spin /></Flex>}>
+              <Outlet />
+            </Suspense>
           </div>
         </Layout.Content>
       </Layout>
