@@ -69,10 +69,37 @@ async fn put_versioned_owned(store: &Store, key: &str, body: Bytes) -> (String, 
     (info.version_id.unwrap(), info.etag)
 }
 
+async fn put_versioned_tagged(
+    store: &Store,
+    key: &str,
+    tags: Vec<xl_store::meta::ObjectTag>,
+) -> (String, String) {
+    let info = store
+        .put_object_stream_with_meta(
+            "rbk",
+            key,
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"tagged"))
+            })),
+            None,
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            None,
+            None,
+            Some(tags),
+            None,
+        )
+        .await
+        .unwrap();
+    (info.version_id.unwrap(), info.etag)
+}
+
 fn rules_json(prefix: Option<&str>, dm: bool) -> String {
     let r = xl_s3::replication::ReplRule {
         id: "r".into(),
         prefix: prefix.map(str::to_string),
+        tags: Vec::new(),
         remote_id: "r1".into(),
         dest_bucket: "dst".into(),
         delete_marker: dm,
@@ -195,6 +222,74 @@ async fn enqueue_matrix_and_pending() {
     })
     .await;
     assert_eq!(outbox_rows(&pool).await.len(), 2);
+}
+
+/// 标签过滤器参与选择：And { Prefix, Tag } 只复制同时命中的对象。
+#[tokio::test]
+async fn tag_filter_selects_objects() {
+    use xl_store::meta::ObjectTag;
+    let (pool, store, _a, _b) = fixture().await;
+    let rule = xl_s3::replication::ReplRule {
+        id: "r".into(),
+        prefix: Some("logs/".into()),
+        tags: vec![ObjectTag {
+            key: "env".into(),
+            value: "prod".into(),
+        }],
+        remote_id: "r1".into(),
+        dest_bucket: "dst".into(),
+        delete_marker: false,
+        enabled: true,
+    };
+    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
+        .bind(serde_json::to_string(&vec![rule]).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    fn write<'a>(key: &'a str, vid: &'a str, etag: &'a str) -> WriteInfo<'a> {
+        WriteInfo {
+            bucket: "rbk",
+            key,
+            version_id: Some(vid),
+            etag,
+            size: 6,
+            is_delete_marker: false,
+            is_version_delete: false,
+            is_replica: false,
+        }
+    }
+
+    // 前缀 + 标签都命中 → 入队
+    let (vid, etag) = put_versioned_tagged(
+        &store,
+        "logs/a",
+        vec![ObjectTag {
+            key: "env".into(),
+            value: "prod".into(),
+        }],
+    )
+    .await;
+    sink.on_write(write("logs/a", &vid, &etag)).await;
+    assert_eq!(outbox_rows(&pool).await.len(), 1);
+
+    // 前缀命中但无标签 → 不入队
+    let (vid, etag) = put_versioned(&store, "logs/b", b"plain").await;
+    sink.on_write(write("logs/b", &vid, &etag)).await;
+    assert_eq!(outbox_rows(&pool).await.len(), 1);
+
+    // 标签命中但前缀不命中 → 不入队
+    let (vid, etag) = put_versioned_tagged(
+        &store,
+        "data/c",
+        vec![ObjectTag {
+            key: "env".into(),
+            value: "prod".into(),
+        }],
+    )
+    .await;
+    sink.on_write(write("data/c", &vid, &etag)).await;
+    assert_eq!(outbox_rows(&pool).await.len(), 1);
 }
 
 #[derive(Debug, Clone)]
@@ -414,6 +509,7 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
         xl_s3::replication::ReplRule {
             id: "a".into(),
             prefix: None,
+            tags: Vec::new(),
             remote_id: "r1".into(),
             dest_bucket: "dst".into(),
             delete_marker: false,
@@ -422,6 +518,7 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
         xl_s3::replication::ReplRule {
             id: "b".into(),
             prefix: None,
+            tags: Vec::new(),
             remote_id: "r1".into(),
             dest_bucket: "bad".into(),
             delete_marker: false,

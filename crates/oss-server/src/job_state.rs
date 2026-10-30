@@ -11,15 +11,19 @@
 //!
 //! 已知限制：job/run id 仍由 leader 本地分配（`runstate_meta`/`MAX(id)+1`），新 leader
 //! 先等 apply 追平再分配。Restore 受理的 `tier_restores` 行与作业同批进日志（P2-1），
-//! 之后的 restored/删除是 leader 执行侧的本地运行态调整，随 OSSCTL3 快照安装收敛；
-//! 启动守卫要求旧本地运行态为空后才允许激活 feature 4。inventory 运行态（runs/
-//! cursors/incrementals）见 [`inventory`] 子模块；lifecycle 扫描游标见 [`lifecycle`]
-//! 子模块（同为 feature 5）；schedule lease/takeover 不在本切片。
+//! 之后的 restored/清理见 [`restore`] 子模块（feature 7，leader 读改写 + 幂等删除）。
+//! inventory 运行态（runs/cursors/incrementals）见 [`inventory`] 子模块；lifecycle
+//! 扫描游标见 [`lifecycle`] 子模块（同为 feature 5）；调度租约 acquire/renew/takeover
+//! 见 [`lease`] 子模块（feature 7，leader 调度前先取得租约）。
 
 mod admin;
 mod inventory;
+mod lease;
 mod lifecycle;
+mod restore;
 mod worker;
+
+pub use lease::schedule_lease_ttl;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -106,6 +110,16 @@ impl JobState {
     /// lifecycle 游标与 Inventory* 共用 level 5（同一批 level-5 二进制）。
     pub fn lifecycle_replicated(&self) -> bool {
         self.replicated_at(compat::FEATURE_LEVEL_5)
+    }
+
+    /// tier restore 后续状态是 level 7：v1.25.0 已 advertise 6 但不认识这些命令。
+    pub fn restore_replicated(&self) -> bool {
+        self.replicated_at(compat::FEATURE_LEVEL_7)
+    }
+
+    /// 调度租约与 restore 后续状态同属 level 7。
+    pub fn lease_replicated(&self) -> bool {
+        self.replicated_at(compat::FEATURE_LEVEL_7)
     }
 
     fn replicated_at(&self, level: u8) -> bool {

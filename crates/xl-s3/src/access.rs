@@ -331,6 +331,11 @@ impl Acl {
         }
     }
 
+    /// 硬配额记账/采样复用同一控制库连接池（同 crate 服务层）。
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// 集群形态（Task 9）：读路径本地 miss → peers 扇出（写入仍只落本节点；强一致归 M9）。
     pub fn with_mesh(pool: SqlitePool, mesh: Option<ControlMesh>) -> Self {
         Self {

@@ -69,6 +69,32 @@ async fn metrics_exposes_minimal_signal() {
     );
 }
 
+/// 审计队列丢弃计数经 `/metrics` 导出（队列保持 serve-only/best-effort）。
+#[tokio::test]
+async fn metrics_exposes_audit_dropped_counter() {
+    use xl_s3::access::AuditSink as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = state(dir.path()).await;
+    let q = oss_server::audit_queue::AuditQueue::new(1);
+    assert!(q.enqueue(1, "GetObject", Some("b"), Some("k"), "allow", None));
+    assert!(!q.enqueue(1, "GetObject", Some("b"), Some("k"), "allow", None));
+    st.audit = Some(q);
+    let base = serve(build_router(st).unwrap()).await;
+
+    let body = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("# TYPE oss_audit_dropped_total counter"),
+        "{body}"
+    );
+    assert!(body.contains("oss_audit_dropped_total 1"), "{body}");
+}
+
 /// 集群状态：未带 token 401；非管理员 403；管理员单机 = mode:"single" 且形状完整。
 #[tokio::test]
 async fn cluster_status_auth_gate_and_single_mode() {

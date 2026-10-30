@@ -19,6 +19,10 @@ use super::{ByteStream, ObjectInfo, Store, drives, ec};
 /// 8 次把窗口压到可忽略，同时避免无限重试。
 const READ_META_RETRY_ROUNDS: usize = 8;
 
+/// 分片批量读的单次上限：与 mesh 服务端 `MAX_BLOCK_READ` 同值（信任边界收口），
+/// 防止配置放大到服务端拒收或读缓冲无界。
+const MAX_SHARD_READ_BATCH: u64 = 16 * 1024 * 1024;
+
 /// 整份缓冲读的上限：Range/partNumber 与流式读的**回退**路径仍把对象/密文物化进内存；
 /// 超过上限直接 400 并提示用 Range，避免一个 GB 级 GET 把进程打崩。`0` = 不限制（高风险）。
 /// 无 Range 的主路径已流式（[`Store::stream_object_ext`]），不受此上限约束。
@@ -593,6 +597,13 @@ impl Store {
         Err(Error::NoSuchKey(key.to_string()))
     }
 
+    /// 流式读的批量字节目标：配置按块宽向下取整并限制在 [W, 16 MiB]（0 = 单块）。
+    fn shard_read_batch_bytes(&self) -> u64 {
+        let target = (self.cfg.shard_read_batch_bytes as u64)
+            .clamp(ec::CHUNK_W as u64, MAX_SHARD_READ_BATCH);
+        target / ec::CHUNK_W as u64 * ec::CHUNK_W as u64
+    }
+
     /// 单块读取（M4 切片 2 分块路径）：第 i 片第 t 块，长度 = `min(W, ss − t·W)`
     /// （兼容非整块宽的旧对象——整片长度从 meta 的 `shard_size` 取，不假设 W 对齐）。
     /// 位置按拓扑下标解引用：`drives[s.drive] /<bucket>/<展键>/<uuid>/part.<part>.<shard>`。
@@ -614,6 +625,28 @@ impl Store {
             return Ok(None);
         }
         let len = (ss - off).min(ec::CHUNK_W as u64) as usize;
+        self.read_shard_range(set, bucket, key, v, s, i, off, len)
+            .await
+    }
+
+    /// 分片范围读（M4 批量读）：一次本地 `read` / 远端 `read_shard` RPC 读最多 `len` 字节
+    /// （调用方按块宽对齐；= 多个 64 KiB 块）。缺失/短读/对端不可达 ≡ `None`（与单块同语义）；
+    /// 本机 IO 错误 → `Err`。批量只影响 RPC 次数，不影响 CRC/解密/摘要口径。
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::store) async fn read_shard_range(
+        &self,
+        set: u16,
+        bucket: &str,
+        key: &str,
+        v: &Version,
+        s: &meta::ShardRef,
+        i: usize,
+        off: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        self.shard_range_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.shard_target(set, s) {
             Some(drives::ShardTarget::Local { drive, .. }) => {
                 let path = drives::shard_path(drive, bucket, key, &v.part.uuid, s)?;
@@ -632,7 +665,7 @@ impl Store {
                 }
             }
             Some(drives::ShardTarget::Remote { node, .. }) => {
-                // read_shard RPC（offset/length 定位读）：对端不可达/超时 ≡ 该块缺失
+                // read_shard RPC（offset/length 定位读）：对端不可达/超时 ≡ 该范围缺失
                 let Some(tp) = self.mesh_transport() else {
                     return Ok(None);
                 };
@@ -673,6 +706,13 @@ impl Store {
                 Ok(None)
             }
         }
+    }
+
+    /// 测试用：分片范围读调用次数（批量读生效断言）。
+    #[cfg(test)]
+    pub(in crate::store) fn shard_range_read_calls(&self) -> u64 {
+        self.shard_range_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 读齐一块（12 片）并解码：返回补齐后的 12 个块；`Ok(None)` = 本块按轮次语义
@@ -1245,6 +1285,8 @@ async fn ec_producer(
 
 /// EC 流式读：数据片按片序逐块直出；片末 CRC32C、流末明文 SHA-256 终验。
 /// 加密时密文流 C 也按片序排布，故按单元顺序解密（最多缓冲一个单元）。
+/// 每个数据片按 `shard_read_batch_bytes`（默认 1 MiB）一次读多块，减少远端 RPC 次数；
+/// 内存上界 = 一个批量缓冲 + 一个通道块，与对象大小无关。
 #[allow(clippy::too_many_arguments)]
 async fn ec_pump(
     store: &Store,
@@ -1259,7 +1301,8 @@ async fn ec_pump(
 ) -> Result<()> {
     let data = l.data as usize;
     let ss = l.shard_size;
-    let blocks = ss.div_ceil(ec::CHUNK_W as u64);
+    let batch = store.shard_read_batch_bytes();
+    let w = ec::CHUNK_W as u64;
     let payload_len = geo.map_or(v.size, |g| g.cipher_len);
     let mut hasher = Sha256::new();
     let mut pending: Vec<u8> = Vec::new();
@@ -1267,47 +1310,53 @@ async fn ec_pump(
     for s in 0..data {
         let shard = &l.shards[s];
         let mut crc = 0u32;
-        for t in 0..blocks {
-            let Some(chunk) = store
-                .read_shard_block(set, bucket, key, v, shard, s, t, ss)
+        let mut off = 0u64;
+        while off < ss {
+            let len = (ss - off).min(batch) as usize;
+            let Some(buf) = store
+                .read_shard_range(set, bucket, key, v, shard, s, off, len)
                 .await?
             else {
                 // 探测通过后的缺失/短读：只能报错，绝不跳过字节
                 return Err(Error::CorruptMeta(format!(
-                    "流式读分片 {s} 块 {t} 缺失/短读"
+                    "流式读分片 {s} 偏移 {off} 范围读缺失/短读"
                 )));
             };
-            crc = crc32c::crc32c_append(crc, &chunk);
-            let start = s as u64 * ss + t * ec::CHUNK_W as u64;
-            if start >= payload_len {
-                continue; // 末片补零区：只进 CRC，不出流
-            }
-            let take = (payload_len - start).min(chunk.len() as u64) as usize;
-            let part = &chunk[..take];
-            match (enc, geo) {
-                (Some(ctx), Some(g)) => {
-                    pending.extend_from_slice(part);
-                    while unit < g.units {
-                        let need = g.unit_cipher_len(unit) as usize;
-                        if pending.len() < need {
-                            break;
+            let t0 = off / w;
+            for (bi, chunk) in buf.chunks(ec::CHUNK_W).enumerate() {
+                crc = crc32c::crc32c_append(crc, chunk);
+                let start = s as u64 * ss + (t0 + bi as u64) * w;
+                if start >= payload_len {
+                    continue; // 末片补零区：只进 CRC，不出流
+                }
+                let take = (payload_len - start).min(chunk.len() as u64) as usize;
+                let part = &chunk[..take];
+                match (enc, geo) {
+                    (Some(ctx), Some(g)) => {
+                        pending.extend_from_slice(part);
+                        while unit < g.units {
+                            let need = g.unit_cipher_len(unit) as usize;
+                            if pending.len() < need {
+                                break;
+                            }
+                            let ct: Vec<u8> = pending.drain(..need).collect();
+                            let plain = ctx.cipher.open(&ctx.seed, unit as u32, &ct)?;
+                            hasher.update(&plain);
+                            if tx.send(Ok(Bytes::from(plain))).await.is_err() {
+                                return Ok(()); // 客户端断开：停止读盘
+                            }
+                            unit += 1;
                         }
-                        let ct: Vec<u8> = pending.drain(..need).collect();
-                        let plain = ctx.cipher.open(&ctx.seed, unit as u32, &ct)?;
-                        hasher.update(&plain);
-                        if tx.send(Ok(Bytes::from(plain))).await.is_err() {
-                            return Ok(()); // 客户端断开：停止读盘
+                    }
+                    _ => {
+                        hasher.update(part);
+                        if tx.send(Ok(Bytes::from(part.to_vec()))).await.is_err() {
+                            return Ok(());
                         }
-                        unit += 1;
                     }
                 }
-                _ => {
-                    hasher.update(part);
-                    if tx.send(Ok(Bytes::from(part.to_vec()))).await.is_err() {
-                        return Ok(());
-                    }
-                }
             }
+            off += len as u64;
         }
         if crc != shard.crc32c {
             return Err(Error::CorruptMeta(format!(

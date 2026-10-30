@@ -148,7 +148,22 @@ pub async fn sweep_once_at_with(state: &AppState, now: i64, limits: SweepLimits)
     // M8-1：Raft 模式下只有 leader 扫；本轮固定一个 token，交接后立即停（游标写入也带
     // token，旧 leader 不会推进新 leader 的进度）。
     let gate = LeaderGate::from_raft(state.raft.clone());
-    let Some(fence) = gate.epoch() else {
+    let Some(fence) = (match state
+        .jobs
+        .schedule_fence(
+            &state.db,
+            &gate,
+            now,
+            crate::job_state::schedule_lease_ttl(),
+        )
+        .await
+    {
+        Ok(fence) => fence,
+        Err(e) => {
+            tracing::warn!(error = %e, "lifecycle：等待调度租约失败，本轮跳过");
+            return 0;
+        }
+    }) else {
         return 0;
     };
     let rules = match state.db.enabled_lifecycle_rules().await {

@@ -111,10 +111,9 @@ impl RestoreSink for SqlRestoreSink {
         key: &str,
         version_id: &str,
     ) -> Result<(), String> {
-        self.db
-            .delete_restore_fenced(bucket, key, version_id, self.fence())
+        self.jobs
+            .tier_restore_delete(&self.db, bucket, key, version_id, self.fence())
             .await
-            .map_err(|e| e.to_string())
     }
 }
 
@@ -214,6 +213,8 @@ pub struct M8TaskExecutor {
     store: Arc<Store>,
     tiers: Arc<TierBackends>,
     events: Arc<crate::events::SqlEventSink>,
+    /// Restore 后续状态写入门面；测试/单机默认本地直写。
+    jobs: Arc<JobState>,
     max_tier_bytes: u64,
     /// 恢复暂存所需空闲余量（测试可放大以覆盖 fail-closed 分支）。
     restore_free_reserve: u64,
@@ -235,9 +236,16 @@ impl M8TaskExecutor {
             store,
             tiers,
             events,
+            jobs: Arc::new(JobState::local()),
             max_tier_bytes,
             restore_free_reserve: RESTORE_FREE_RESERVE,
         }
+    }
+
+    /// 生产路径：Restore 后续状态经共享 [`JobState`]（feature 7 进复制日志）。
+    pub fn with_jobs(mut self, jobs: Arc<JobState>) -> Self {
+        self.jobs = jobs;
+        self
     }
 
     /// 测试/运维：覆盖单对象上限（默认 `OSS_TIER_MAX_BYTES` 或 1 GiB）。
@@ -411,15 +419,15 @@ impl M8TaskExecutor {
             .map_err(|e| e.to_string())?
         else {
             let _ = self
-                .db
-                .delete_restore_fenced(&p.bucket, &p.key, &p.version_id, fence)
+                .jobs
+                .tier_restore_delete(&self.db, &p.bucket, &p.key, &p.version_id, fence)
                 .await;
             return Ok("missing".into());
         };
         let Some(t) = v.tier else {
             let _ = self
-                .db
-                .delete_restore_fenced(&p.bucket, &p.key, &p.version_id, fence)
+                .jobs
+                .tier_restore_delete(&self.db, &p.bucket, &p.key, &p.version_id, fence)
                 .await;
             return Ok("missing".into());
         };
@@ -505,18 +513,33 @@ impl M8TaskExecutor {
             .map_err(|e| e.to_string())?;
         guard.disarm();
         let expires = crate::db::now() + i64::from(p.days) * 86_400;
-        self.db
-            .set_restore_state_fenced(&p.bucket, &p.key, &p.version_id, "restored", expires, fence)
-            .await
-            .map_err(|e| e.to_string())?;
+        self.jobs
+            .tier_restore_set_state(
+                &self.db,
+                &p.bucket,
+                &p.key,
+                &p.version_id,
+                "restored",
+                expires,
+                fence,
+            )
+            .await?;
         if let Err(e) = self
             .store
             .restore_commit(&p.bucket, &p.key, &p.version_id, expires, Some(chunks))
             .await
         {
             let _ = self
-                .db
-                .set_restore_state_fenced(&p.bucket, &p.key, &p.version_id, "pending", 0, fence)
+                .jobs
+                .tier_restore_set_state(
+                    &self.db,
+                    &p.bucket,
+                    &p.key,
+                    &p.version_id,
+                    "pending",
+                    0,
+                    fence,
+                )
                 .await;
             return Err(e.to_string());
         }

@@ -3,12 +3,14 @@
 //! 只索引**本机**暂存区（集群 LMU 各节点各自一页，见 uploads.rs 头注）。首次列举某桶时
 //! 扫对象目录一次，之后 create/abort/complete 增量维护；构建失败回退逐目录扫描。
 //! 加载期间的钩子记 delta，加载完成时在同一写锁内合并（并发 create/abort 不丢）。
-//! `clean` 删除暂存目录后按 UUID 同步移除索引；与首次加载并发时可能留下陈旧项，
-//! 由下次进程重启/重建纠正（shortcut: 索引无 TTL）。
+//! `clean` 删除暂存目录时按 UUID 同步移除索引；加载期间删除记入 pending，合并扫描结果时
+//! 应用（clean/加载竞态收敛）。索引另有 TTL（`OSS_MPU_INDEX_TTL_SECS`，默认 300s）整桶
+//! 重建，纠正任何漏钩子的陈旧项。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::layout;
@@ -28,10 +30,14 @@ pub(in crate::store) struct UploadEntry {
 struct UploadsData {
     entries: BTreeMap<(String, String), UploadEntry>,
     loaded: bool,
+    /// 上次成功扫描时刻（TTL 重建用；None = 尚未成功加载）。
+    loaded_at: Option<Instant>,
     loading: bool,
     disabled: bool,
     /// 加载期间钩子记下的增量 `((key, upload_id), Some=新增/None=删除)`。
     delta: Vec<((String, String), Option<UploadEntry>)>,
+    /// 加载期间 `clean` 删除的暂存目录 `(key, uuid)`，扫描结果合并后应用。
+    pending_removals: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -40,12 +46,20 @@ pub(in crate::store) struct BucketUploads {
     load_lock: tokio::sync::Mutex<()>,
 }
 
-#[derive(Default)]
 pub(in crate::store) struct MpuIndex {
     buckets: Mutex<HashMap<String, Arc<BucketUploads>>>,
+    /// 索引 TTL：到点整桶重建；0 = 不周期重建（仅靠钩子）。
+    ttl: Duration,
 }
 
 impl MpuIndex {
+    pub(in crate::store) fn new(ttl: Duration) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
     fn entry(&self, bucket: &str) -> Arc<BucketUploads> {
         map_lock(&self.buckets)
             .entry(bucket.to_string())
@@ -61,13 +75,16 @@ impl MpuIndex {
         map_lock(&self.buckets).remove(bucket);
     }
 
-    /// `Some(Some(_))` = 已加载可用；`Some(None)` = 禁用；`None` = 需要构建。
+    /// `Some(Some(_))` = 已加载且未过 TTL；`Some(None)` = 禁用；`None` = 需要构建。
     fn ready(&self, bk: &Arc<BucketUploads>) -> Option<Option<Arc<BucketUploads>>> {
         let d = read_lock(&bk.data);
         if d.disabled {
             return Some(None);
         }
-        if d.loaded {
+        let fresh = d
+            .loaded_at
+            .is_some_and(|t| self.ttl.is_zero() || t.elapsed() < self.ttl);
+        if d.loaded && fresh {
             return Some(Some(bk.clone()));
         }
         None
@@ -93,27 +110,24 @@ impl MpuIndex {
         d.loading = false;
         match scanned {
             Ok(entries) => {
-                d.entries = entries;
-                for (id, entry) in std::mem::take(&mut d.delta) {
-                    match entry {
-                        Some(e) => {
-                            d.entries.insert(id, e);
-                        }
-                        None => {
-                            d.entries.remove(&id);
-                        }
-                    }
-                }
+                merge_scan(&mut d, entries);
                 d.loaded = true;
+                d.loaded_at = Some(Instant::now());
                 Some(bk.clone())
             }
             Err(e) => {
                 d.delta.clear();
+                d.pending_removals.clear();
                 if matches!(e, Error::NoSuchBucket(_)) {
-                    // 本机缺桶目录（集群常态）：不永久禁用，下次列举重试
+                    // 本机缺桶目录（集群常态/已删桶）：丢弃条目，下次列举重试（lazy-heal）
                     drop(d);
                     drop_entry(&self.buckets, bucket, &bk);
                     None
+                } else if d.loaded_at.is_some() {
+                    // 已加载过：旧索引继续服务，按 TTL 节流重试（不把 LMU 打挂）
+                    tracing::warn!(bucket, error = %e, "MPU 索引重建失败，沿用旧索引并按 TTL 重试");
+                    d.loaded_at = Some(Instant::now());
+                    Some(bk.clone())
                 } else {
                     d.disabled = true;
                     tracing::warn!(bucket, error = %e, "MPU 索引构建失败，回退逐目录扫描");
@@ -167,19 +181,59 @@ impl MpuIndex {
     }
 
     /// `clean` 按 mtime 删除暂存目录后的索引钩子（只按目录 UUID 匹配，属主前缀未知）。
-    /// 加载中不处理：扫描与删除并发时可能重新收录，交由下次重启/重建纠正。
+    /// 加载中记入 pending，扫描结果合并时再删（否则扫描与删除并发会把已删目录重新收录）。
     pub(in crate::store) fn remove_dir(&self, bucket: &str, key: &str, uuid: &str) {
         let Some(bk) = self.existing(bucket) else {
             return;
         };
         let mut d = write_lock(&bk.data);
-        if d.disabled || !d.loaded {
+        if d.disabled {
             return;
         }
-        let suffix = format!(".{uuid}");
-        d.entries
-            .retain(|(k, id), _| !(k == key && (id == uuid || id.ends_with(&suffix))));
+        if d.loading {
+            d.pending_removals.push((key.to_string(), uuid.to_string()));
+        } else if d.loaded {
+            remove_uuid(&mut d, key, uuid);
+        }
     }
+
+    /// 测试用：把已加载桶的 TTL 推到过期，避免依赖真实 sleep。
+    #[cfg(test)]
+    pub(in crate::store) fn expire_for_test(&self, bucket: &str) {
+        let Some(bk) = self.existing(bucket) else {
+            return;
+        };
+        let mut d = write_lock(&bk.data);
+        if let Some(t) = d.loaded_at {
+            d.loaded_at = Some(t - self.ttl - Duration::from_secs(1));
+        }
+    }
+}
+
+/// 扫描结果合并：先应用加载期间钩子的 delta，再应用 `clean` 的 pending 删除
+/// （扫描可能读到随后被删的目录，pending 必须最后应用）。
+fn merge_scan(d: &mut UploadsData, entries: BTreeMap<(String, String), UploadEntry>) {
+    d.entries = entries;
+    for (id, entry) in std::mem::take(&mut d.delta) {
+        match entry {
+            Some(e) => {
+                d.entries.insert(id, e);
+            }
+            None => {
+                d.entries.remove(&id);
+            }
+        }
+    }
+    for (key, uuid) in std::mem::take(&mut d.pending_removals) {
+        remove_uuid(d, &key, &uuid);
+    }
+}
+
+/// 按暂存目录 UUID 删除索引项（upload_id 可能带属主前缀）。
+fn remove_uuid(d: &mut UploadsData, key: &str, uuid: &str) {
+    let suffix = format!(".{uuid}");
+    d.entries
+        .retain(|(k, id), _| !(k == key && (id == uuid || id.ends_with(&suffix))));
 }
 
 /// 扫本地各盘的对象目录，收集活暂存区（含 `mpu.meta` 的 UUID 子目录）。
@@ -284,6 +338,12 @@ impl Store {
     pub(in crate::store) fn mpu_index_remove_dir(&self, bucket: &str, key: &str, uuid: &str) {
         self.mpu_index.remove_dir(bucket, key, uuid);
     }
+
+    /// 测试用：强制 MPU 索引 TTL 过期，下一次列举触发重建。
+    #[cfg(test)]
+    pub(in crate::store) fn mpu_index_expire(&self, bucket: &str) {
+        self.mpu_index.expire_for_test(bucket);
+    }
 }
 
 /// `upload_id`（客户端可见形态，可带属主前缀）→ 索引键用的规范可见形态。
@@ -293,4 +353,51 @@ pub(in crate::store) fn visible_upload_id(upload_id: &str) -> Option<String> {
         Some(owner) => format_upload_id(&owner, &uuid),
         None => uuid,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> UploadEntry {
+        UploadEntry {
+            initiated_nanos: 1,
+            storage_class: None,
+        }
+    }
+
+    /// clean 在加载期间删目录：pending 删除必须在扫描结果合并后生效（不重新收录）。
+    #[test]
+    fn clean_during_load_is_applied_after_scan_merge() {
+        let idx = MpuIndex::new(Duration::from_secs(300));
+        let bk = idx.entry("alpha");
+        write_lock(&bk.data).loading = true; // 扫描进行中
+        idx.remove_dir("alpha", "k", "u1");
+        let mut scanned = BTreeMap::new();
+        scanned.insert(("k".into(), "owner.u1".into()), entry());
+        scanned.insert(("k".into(), "u2".into()), entry());
+        let mut d = write_lock(&bk.data);
+        merge_scan(&mut d, scanned);
+        assert_eq!(
+            d.entries.keys().cloned().collect::<Vec<_>>(),
+            vec![("k".to_string(), "u2".to_string())],
+            "clean 期间删除的暂存区不得被加载结果重新收录"
+        );
+        assert!(d.pending_removals.is_empty());
+    }
+
+    /// TTL 到点后 ready() 要求重建；未到点直接可用。
+    #[test]
+    fn ttl_expiry_requires_rebuild() {
+        let idx = MpuIndex::new(Duration::from_secs(300));
+        let bk = idx.entry("alpha");
+        {
+            let mut d = write_lock(&bk.data);
+            d.loaded = true;
+            d.loaded_at = Some(Instant::now());
+        }
+        assert!(idx.ready(&bk).is_some(), "未过 TTL 应直接可用");
+        idx.expire_for_test("alpha");
+        assert!(idx.ready(&bk).is_none(), "过 TTL 必须触发重建");
+    }
 }

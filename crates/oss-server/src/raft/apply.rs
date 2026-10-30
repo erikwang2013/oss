@@ -8,16 +8,20 @@
 use base64::Engine as _;
 use std::collections::HashSet;
 
-use sqlx::{Row, SqliteConnection};
+use sqlx::SqliteConnection;
 
 mod accounts;
 pub(crate) mod inventory;
+pub(crate) mod lease;
 pub(crate) mod lifecycle;
+pub(crate) mod tier_restore;
 
 use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
-use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
+use super::runstate::{
+    JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from, tier_restore_row_from,
+};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
@@ -798,6 +802,17 @@ pub(crate) async fn apply_command(
         } => lifecycle::clear(cw, bucket, rule_id, stage, *fence_term).await?,
         // M8-2 level 6：作业历史保留（只删终态行；见 [`purge_jobs`]）。
         ControlCommand::JobPurge { job_ids } => purge_jobs(cw, job_ids).await?,
+        // level 7：tier restore 后续状态 + 调度租约（确定性、零写入 Conflict）。
+        ControlCommand::TierRestoreUpsert { restore } => tier_restore::apply(cw, restore).await?,
+        ControlCommand::TierRestoreDelete {
+            bucket,
+            key,
+            version_id,
+            fence_term,
+        } => tier_restore::delete(cw, bucket, key, version_id, *fence_term).await?,
+        ControlCommand::ScheduleLeaseAcquire { lease, now } => {
+            lease::apply(cw, lease, *now).await?
+        }
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
@@ -1008,21 +1023,20 @@ async fn current_restore(
     .bind(version_id)
     .fetch_optional(&mut *cw.conn)
     .await?;
-    Ok(row.map(|r| TierRestoreRow {
-        bucket: r.get("bucket"),
-        key: r.get("key"),
-        version_id: r.get("version_id"),
-        expires_at: r.get("expires_at"),
-        job_id: r.get("job_id"),
-        state: r.get("state"),
-        created_at: r.get("created_at"),
-        fence_term: r.get("fence_term"),
-        fence_leader: r.get("fence_leader"),
-    }))
+    Ok(row.as_ref().map(tier_restore_row_from))
 }
 
 /// Restore 行只允许已知状态，且 fence 不得回退（行被更高 term 接管后旧日志不得降级）。
-fn restore_row_ok(cur: Option<&TierRestoreRow>, next: &TierRestoreRow) -> Result<(), String> {
+pub(crate) fn restore_row_ok(
+    cur: Option<&TierRestoreRow>,
+    next: &TierRestoreRow,
+) -> Result<(), String> {
+    if next.bucket.is_empty() || next.key.is_empty() || next.version_id.is_empty() {
+        return Err(format!(
+            "restore {}/{}/{}: empty natural key",
+            next.bucket, next.key, next.version_id
+        ));
+    }
     if !matches!(next.state.as_str(), "pending" | "restored") {
         return Err(format!(
             "restore {}/{}/{}: unknown state {}",

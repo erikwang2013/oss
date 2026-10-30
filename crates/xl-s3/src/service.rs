@@ -16,6 +16,7 @@ use xl_store::error::Error as StoreError;
 use xl_store::meta::{ChecksumRecord, ObjectTag};
 use xl_store::store::{DeleteOutcome, ListRequest, ObjectInfo, Store, VersioningMode};
 
+use crate::account_quota::AccountQuota;
 use crate::bucket_control::{BucketControlError, BucketControlSink, BucketCreateSpec};
 use crate::convert::to_s3_error;
 use crate::events::{EventSink, EventSource, S3EventOp};
@@ -207,6 +208,82 @@ impl OssS3 {
                     .delete_object_versioned_ext(bucket, key, version_id, mode, bypass)
                     .await
             }
+        }
+    }
+
+    /// 桶主账户的硬配额（无配额/无账户/最小夹具 = None）；停用账户 fail-closed。
+    async fn quota_account(&self, bucket: &str) -> S3Result<Option<AccountQuota>> {
+        match crate::account_quota::account_for_bucket(self.acl.pool(), bucket).await {
+            Ok(Some(q)) if q.disabled => Err(s3s::s3_error!(AccessDenied, "account is disabled")),
+            Ok(q) => Ok(q),
+            Err(e) => {
+                tracing::error!(error = %e, bucket, "读取账户硬配额失败");
+                Err(s3s::s3_error!(InternalError, "internal error"))
+            }
+        }
+    }
+
+    /// 当前可见版本大小；不存在/不可读（SSE-C 无钥、meta 损坏）→ None。
+    /// 未知按 0 计入（偏保守），采样器随后校正。
+    async fn quota_current_size(
+        &self,
+        bucket: &str,
+        key: &str,
+        sse_c: Option<&xl_store::crypto::SseCKey>,
+    ) -> Option<u64> {
+        match self.store.head_object_ext(bucket, key, sse_c).await {
+            Ok(info) => Some(info.size),
+            Err(StoreError::NoSuchKey(_)) => None,
+            Err(e) => {
+                tracing::debug!(error = %e, bucket, key, "配额前置 HEAD 失败（按不存在计）");
+                None
+            }
+        }
+    }
+
+    /// 预留失败 = 403（与桶配额同口径，消息区分字节/对象数）。
+    async fn quota_admit(
+        &self,
+        quota: &AccountQuota,
+        delta_bytes: i64,
+        delta_objects: i64,
+    ) -> S3Result<()> {
+        match crate::account_quota::admit(
+            self.acl.pool(),
+            &self.store,
+            quota,
+            delta_bytes,
+            delta_objects,
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(denied)) => Err(s3s::s3_error!(AccessDenied, "{}", denied)),
+            Err(e) => {
+                tracing::error!(error = %e, account = %quota.account, "账户用量预留失败");
+                Err(s3s::s3_error!(InternalError, "internal error"))
+            }
+        }
+    }
+
+    /// 写失败归还 / 写成功校准；记账失败不回滚已提交的数据（采样器收敛），仅告警。
+    async fn quota_adjust(&self, account: &str, bytes: i64, objects: i64) {
+        if let Err(e) = crate::account_quota::adjust(self.acl.pool(), account, bytes, objects).await
+        {
+            tracing::warn!(error = %e, account, "账户用量修正失败（等待采样器）");
+        }
+    }
+
+    /// 删除后释放当前版本（仅无版本号删除且确有旧对象；版本定向删除交给采样器）。
+    async fn quota_release_deleted(
+        &self,
+        quota: Option<&AccountQuota>,
+        version_id: Option<&str>,
+        old_size: Option<u64>,
+        removed: bool,
+    ) {
+        if let (Some(q), Some(size), None, true) = (quota, old_size, version_id, removed) {
+            self.quota_adjust(&q.account, -(size as i64), -1).await;
         }
     }
 
@@ -1522,6 +1599,26 @@ impl S3 for OssS3 {
         };
 
         let mode = self.versioning_mode(&bucket).await?;
+        // AC-3：硬配额在写入前原子预留。声明长度已知时按 `新大小 - 旧大小` 精确预留；
+        // 无 content-length 只能预留对象数、字节在写成功后校准（shortcut：未知长度
+        // 允许并发短暂超额，采样器收敛；升级触发：需要边写边限流记账）。
+        let quota = self.quota_account(&bucket).await?;
+        let old_size = match &quota {
+            Some(_) => {
+                self.quota_current_size(&bucket, &key, sse.key.as_ref())
+                    .await
+            }
+            None => None,
+        };
+        let reserved = match &quota {
+            Some(q) => {
+                let delta_bytes = content_length.unwrap_or(0) - old_size.unwrap_or(0) as i64;
+                let delta_objects = i64::from(old_size.is_none());
+                self.quota_admit(q, delta_bytes, delta_objects).await?;
+                Some((delta_bytes, delta_objects))
+            }
+            None => None,
+        };
         let result = self
             .store
             .put_object_stream_with_meta_ext(
@@ -1545,8 +1642,23 @@ impl S3 for OssS3 {
             .await;
         let info = match result {
             Ok(info) => info,
-            Err(e) => return Err(stream_err_to_s3(e, &exceeded, &body_err)),
+            Err(e) => {
+                if let (Some(q), Some((db, dobj))) = (&quota, reserved) {
+                    self.quota_adjust(&q.account, -db, -dobj).await;
+                }
+                return Err(stream_err_to_s3(e, &exceeded, &body_err));
+            }
         };
+        if let (Some(q), Some((rb, robj))) = (&quota, reserved) {
+            let actual_bytes =
+                i64::try_from(info.size).unwrap_or(i64::MAX) - old_size.unwrap_or(0) as i64;
+            self.quota_adjust(
+                &q.account,
+                actual_bytes - rb,
+                i64::from(old_size.is_none()) - robj,
+            )
+            .await;
+        }
         self.emit(
             S3EventOp::CreatedPut,
             &bucket,
@@ -1815,7 +1927,31 @@ impl S3 for OssS3 {
             pairs.push((pn as u16, etag.value().to_string()));
         }
         let mode = self.versioning_mode(&bucket).await?;
-        let info = self
+        // AC-3：complete 前按所选 parts 总和预留；失败归还。
+        let quota = self.quota_account(&bucket).await?;
+        let reserved = match &quota {
+            Some(q) => {
+                let parts = self
+                    .store
+                    .list_parts(&bucket, &key, &upload_id)
+                    .await
+                    .map_err(to_s3_error)?;
+                let new_size: u64 = pairs
+                    .iter()
+                    .filter_map(|(pn, _)| parts.iter().find(|p| p.part_number == *pn))
+                    .fold(0u64, |acc, p| acc.saturating_add(p.size));
+                let old = self
+                    .quota_current_size(&bucket, &key, sse.key.as_ref())
+                    .await;
+                let delta_bytes =
+                    i64::try_from(new_size).unwrap_or(i64::MAX) - old.unwrap_or(0) as i64;
+                let delta_objects = i64::from(old.is_none());
+                self.quota_admit(q, delta_bytes, delta_objects).await?;
+                Some((q.account.clone(), delta_bytes, delta_objects, old))
+            }
+            None => None,
+        };
+        let info = match self
             .store
             .complete_multipart_upload_versioned(
                 &bucket,
@@ -1827,7 +1963,21 @@ impl S3 for OssS3 {
                 None,
             )
             .await
-            .map_err(to_s3_error)?;
+        {
+            Ok(info) => info,
+            Err(e) => {
+                if let Some((account, rb, robj, _)) = &reserved {
+                    self.quota_adjust(account, -*rb, -*robj).await;
+                }
+                return Err(to_s3_error(e));
+            }
+        };
+        if let Some((account, rb, robj, old)) = &reserved {
+            let actual_bytes =
+                i64::try_from(info.size).unwrap_or(i64::MAX) - old.unwrap_or(0) as i64;
+            self.quota_adjust(account, actual_bytes - rb, i64::from(old.is_none()) - robj)
+                .await;
+        }
         self.emit(
             S3EventOp::CreatedCompleteMultipartUpload,
             &bucket,
@@ -2590,6 +2740,21 @@ impl S3 for OssS3 {
                 "origin marker id is not supported on sync buckets"
             ));
         }
+        // AC-3：无版本号删除才即时释放当前对象；版本定向删除交给采样器。
+        // 删除不被配额记账故障阻塞（fail-open；只影响缓存准确性，采样器收敛）。
+        let version_target = vid.clone();
+        let quota = match self.quota_account(&bucket).await {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(error = %e, bucket, "配额查询失败，删除照常");
+                None
+            }
+        };
+        let old_size = if quota.is_some() && version_target.is_none() {
+            self.quota_current_size(&bucket, &key, None).await
+        } else {
+            None
+        };
         let outcome = match forced_marker {
             Some(marker) if mode == VersioningMode::Enabled => {
                 let spec = xl_store::store::DeleteMarkerSpec {
@@ -2624,6 +2789,7 @@ impl S3 for OssS3 {
         // 会误删他源活副本。源 id 未命中时保持幂等 204；历史副本需人工对账后清理。
         // 原记档「s3s 无 VersionId 字段」不实（verifier 纠错）：DeleteObjectOutput 有
         // version_id 且 s3s 序列化 x-amz-version-id——marker/被删版本都把 id 回给客户端。
+        let mut removed_current = false;
         let mut tier_refs = Vec::new();
         let (dm, vid) = match outcome {
             DeleteOutcome::Marker { version_id } => {
@@ -2649,6 +2815,7 @@ impl S3 for OssS3 {
                     is_replica: replica,
                 })
                 .await;
+                removed_current = true;
                 (Some(true), Some(version_id))
             }
             DeleteOutcome::Version { version_id, tier } => {
@@ -2690,11 +2857,19 @@ impl S3 for OssS3 {
                     event_source,
                 )
                 .await;
+                removed_current = true;
                 (None, None)
             }
             // P2-1：幂等空删（未发生删除）——204 但不发事件
             DeleteOutcome::NotFound => (None, None),
         };
+        self.quota_release_deleted(
+            quota.as_ref(),
+            version_target.as_deref(),
+            old_size,
+            removed_current,
+        )
+        .await;
         self.tier_gc_delete(&tier_refs).await;
         Ok(S3Response::new(DeleteObjectOutput {
             delete_marker: dm,
@@ -2737,6 +2912,15 @@ impl S3 for OssS3 {
             .map(|m| m == "sync")
             .unwrap_or(false);
         let mut remote_failure: Option<StoreError> = None;
+        // AC-3：批量删一次解析账户；逐键仅在无版本号时先取旧大小以便释放。
+        // 配额记账故障不阻塞删除（fail-open；采样器收敛）。
+        let quota = match self.quota_account(&bucket).await {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(error = %e, bucket, "配额查询失败，批量删除照常");
+                None
+            }
+        };
         // M5 切片 4（L4）：Governance bypass 头（请求级，作用于全部键——AWS 语义）
         let bypass = req.input.bypass_governance_retention.unwrap_or(false);
         // 逐键授权（M4 切片 7 / verifier 阻断 1c）：批量删的键在请求体里、check() 阶段不可见，
@@ -2860,11 +3044,18 @@ impl S3 for OssS3 {
                 });
                 continue;
             }
+            let target_version = obj.version_id.clone();
+            let old_size = if quota.is_some() && target_version.is_none() {
+                self.quota_current_size(&bucket, &obj.key, None).await
+            } else {
+                None
+            };
             match self
                 .delete_versioned(&bucket, &obj.key, obj.version_id.as_deref(), mode, bypass)
                 .await
             {
                 Ok(outcome) => {
+                    let mut removed_current = false;
                     let mut tier_refs = Vec::new();
                     let (dm, dmv, vid) = match outcome {
                         DeleteOutcome::Marker { version_id } => {
@@ -2890,6 +3081,7 @@ impl S3 for OssS3 {
                                 is_replica: replica,
                             })
                             .await;
+                            removed_current = true;
                             (Some(true), Some(version_id), None)
                         }
                         DeleteOutcome::Version { version_id, tier } => {
@@ -2931,11 +3123,19 @@ impl S3 for OssS3 {
                                 event_source.clone(),
                             )
                             .await;
+                            removed_current = true;
                             (None, None, None)
                         }
                         // P2-1：幂等空删——进 deleted[]（S3 语义）但不发事件
                         DeleteOutcome::NotFound => (None, None, None),
                     };
+                    self.quota_release_deleted(
+                        quota.as_ref(),
+                        target_version.as_deref(),
+                        old_size,
+                        removed_current,
+                    )
+                    .await;
                     self.tier_gc_delete(&tier_refs).await;
                     deleted.push(DeletedObject {
                         key: Some(obj.key),
@@ -4371,7 +4571,22 @@ impl S3 for OssS3 {
         };
         // 目标桶版本策略随 copy 生效（版本桶 copy 出的是新版本）
         let dst_mode = self.versioning_mode(&req.input.bucket).await?;
-        let info = self
+        // AC-3：目标账户硬配额（源大小已知，写流前预留；失败归还）。
+        let quota = self.quota_account(&req.input.bucket).await?;
+        let reserved = match &quota {
+            Some(q) => {
+                let old = self
+                    .quota_current_size(&req.input.bucket, &req.input.key, dst_sse.key.as_ref())
+                    .await;
+                let delta_bytes =
+                    i64::try_from(src_head.size).unwrap_or(i64::MAX) - old.unwrap_or(0) as i64;
+                let delta_objects = i64::from(old.is_none());
+                self.quota_admit(q, delta_bytes, delta_objects).await?;
+                Some((q.account.clone(), delta_bytes, delta_objects, old))
+            }
+            None => None,
+        };
+        let info = match self
             .store
             .put_object_stream_with_meta(
                 &req.input.bucket,
@@ -4388,7 +4603,21 @@ impl S3 for OssS3 {
                 storage_class,
             )
             .await
-            .map_err(to_s3_error)?;
+        {
+            Ok(info) => info,
+            Err(e) => {
+                if let Some((account, rb, robj, _)) = &reserved {
+                    self.quota_adjust(account, -*rb, -*robj).await;
+                }
+                return Err(to_s3_error(e));
+            }
+        };
+        if let Some((account, rb, robj, old)) = &reserved {
+            let actual_bytes =
+                i64::try_from(info.size).unwrap_or(i64::MAX) - old.unwrap_or(0) as i64;
+            self.quota_adjust(account, actual_bytes - rb, i64::from(old.is_none()) - robj)
+                .await;
+        }
         self.emit(
             S3EventOp::CreatedCopy,
             &req.input.bucket,
@@ -4523,6 +4752,33 @@ impl S3 for OssS3 {
 
 /// 规则 IR → DTO（GetBucketReplication 回读）。
 fn repl_rule_to_dto(r: &crate::replication::ReplRule) -> ReplicationRule {
+    let tag = |t: &ObjectTag| Tag {
+        key: Some(t.key.clone()),
+        value: Some(t.value.clone()).filter(|v| !v.is_empty()),
+    };
+    // Prefix/Tag/And 归一化 IR 还原为合法 S3 形态：单标签用 Tag，多条件用 And
+    // （And 少于两个条件会被 Put 校验拒绝，回读必须可再次提交）。
+    let filter = match (&r.prefix, r.tags.as_slice()) {
+        (None, []) => None,
+        (Some(p), []) => Some(ReplicationRuleFilter {
+            and: None,
+            prefix: Some(p.clone()),
+            tag: None,
+        }),
+        (None, [only]) => Some(ReplicationRuleFilter {
+            and: None,
+            prefix: None,
+            tag: Some(tag(only)),
+        }),
+        (prefix, tags) => Some(ReplicationRuleFilter {
+            and: Some(ReplicationRuleAndOperator {
+                prefix: prefix.as_deref().map(str::to_string),
+                tags: Some(tags.iter().map(&tag).collect()),
+            }),
+            prefix: None,
+            tag: None,
+        }),
+    };
     ReplicationRule {
         delete_marker_replication: Some(DeleteMarkerReplication {
             status: Some(DeleteMarkerReplicationStatus::from_static(
@@ -4543,11 +4799,7 @@ fn repl_rule_to_dto(r: &crate::replication::ReplRule) -> ReplicationRule {
             storage_class: None,
         },
         existing_object_replication: None,
-        filter: r.prefix.as_ref().map(|p| ReplicationRuleFilter {
-            and: None,
-            prefix: Some(p.clone()),
-            tag: None,
-        }),
+        filter,
         id: Some(r.id.clone()),
         prefix: None,
         priority: None,

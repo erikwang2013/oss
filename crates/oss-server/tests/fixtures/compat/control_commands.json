@@ -206,6 +206,19 @@
     "timeout_ms",
     "updated_at"
   ],
+  "ScheduleLeaseAcquire": [
+    "lease",
+    "now"
+  ],
+  "TierRestoreDelete": [
+    "bucket",
+    "fence_term",
+    "key",
+    "version_id"
+  ],
+  "TierRestoreUpsert": [
+    "restore"
+  ],
   "UserCreate": [
     "created_at",
     "password_hash",

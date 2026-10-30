@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::COMMAND_MAX_BYTES;
 use super::runstate::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
-    LifecycleCursorRow, TierRestoreRow,
+    LifecycleCursorRow, ScheduleLeaseRow, TierRestoreRow,
 };
 
 /// 子账户 × 桶的三档权限（自然键：username + bucket）。
@@ -343,6 +343,27 @@ pub enum ControlCommand {
         job_ids: Vec<i64>,
     },
 
+    // ---- level 7: tier restore 后续状态与调度租约 ----
+    /// Restore 行整行 upsert（受理后状态：restored/回滚 pending）。apply 只做 SQL：
+    /// 自然键非空、state ∈ pending/restored、fence 不回退；逐字段相同重复 apply 幂等。
+    TierRestoreUpsert {
+        restore: TierRestoreRow,
+    },
+    /// 清理 Restore 行（幂等）。`fence_term` 是删除上限：旧 term 的迟到删除不得抹掉
+    /// 新 term 已更新的行。
+    TierRestoreDelete {
+        bucket: String,
+        key: String,
+        version_id: String,
+        fence_term: i64,
+    },
+    /// 调度租约 acquire/renew/takeover（单例行）。`now` 是提交方时钟（apply 不取时
+    /// 间）：同 term 同节点只允许延长 expiry；换 term 只有旧租约过期后才能接管。
+    ScheduleLeaseAcquire {
+        lease: ScheduleLeaseRow,
+        now: i64,
+    },
+
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。
     #[cfg(test)]
     Set {
@@ -475,6 +496,10 @@ impl ControlCommand {
             }
             // v1.24.0 及更早 advertise ≤5 且 `deny_unknown_fields` 不认识 JobPurge。
             Self::JobPurge { .. } => super::compat::FEATURE_LEVEL_6,
+            // v1.25.0 及更早 advertise ≤6 且 `deny_unknown_fields` 不认识这些变体。
+            Self::TierRestoreUpsert { .. }
+            | Self::TierRestoreDelete { .. }
+            | Self::ScheduleLeaseAcquire { .. } => super::compat::FEATURE_LEVEL_7,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,

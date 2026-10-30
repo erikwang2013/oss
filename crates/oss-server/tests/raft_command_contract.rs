@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use oss_server::raft::runstate::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
-    LifecycleCursorRow, TierRestoreRow,
+    LifecycleCursorRow, ScheduleLeaseRow, TierRestoreRow,
 };
 use oss_server::raft::{ControlCommand, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits};
 
@@ -344,6 +344,35 @@ fn all_variants() -> Vec<ControlCommand> {
         ControlCommand::JobPurge {
             job_ids: vec![1, 2],
         },
+        // level 7：tier restore 后续状态 + 调度租约。
+        ControlCommand::TierRestoreUpsert {
+            restore: TierRestoreRow {
+                bucket: "b1".into(),
+                key: "p/obj".into(),
+                version_id: "v1".into(),
+                expires_at: 2,
+                job_id: Some(2),
+                state: "restored".into(),
+                created_at: 1,
+                fence_term: 1,
+                fence_leader: 1,
+            },
+        },
+        ControlCommand::TierRestoreDelete {
+            bucket: "b1".into(),
+            key: "p/obj".into(),
+            version_id: "v1".into(),
+            fence_term: 1,
+        },
+        ControlCommand::ScheduleLeaseAcquire {
+            lease: ScheduleLeaseRow {
+                term: 1,
+                node: 1,
+                expires_at: 2,
+                acquired_at: 1,
+            },
+            now: 1,
+        },
     ]
 }
 
@@ -398,13 +427,14 @@ fn control_command_field_set_matches_frozen_fixture() {
 
 /// Level C M1：level-3 词汇表固定；生产命令集中只有 `Ext` 与账户/成员命令要求
 /// level 3，M8-2 作业行命令要求 level 4，inventory 行命令要求 level 5（v1.23.0
-/// 已 advertise 4 但不认识 Inventory*），JobPurge 要求 level 6（v1.24.0 advertise ≤5）。
+/// 已 advertise 4 但不认识 Inventory*），JobPurge 要求 level 6（v1.24.0 advertise ≤5），
+/// tier restore 后续状态与调度租约要求 level 7（v1.25.0 advertise ≤6）。
 #[test]
 fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     use oss_server::raft::compat::{
         FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_LEVEL_4, FEATURE_LEVEL_5, FEATURE_LEVEL_6,
-        FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL,
-        guard_startup, supports,
+        FEATURE_LEVEL_7, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL,
+        MIN_FEATURE_LEVEL, guard_startup, supports,
     };
     assert_eq!(MIN_FEATURE_LEVEL, 1);
     assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
@@ -420,17 +450,31 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         FEATURE_LEVEL_6, 6,
         "v1.24.0 及更早 advertise ≤5，JobPurge 必须用新 level 6"
     );
-    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_6);
-    assert!(supports(1) && supports(2) && supports(3) && supports(4) && supports(5) && supports(6));
-    assert!(!supports(7), "未知更高 level 一律不支持");
+    assert_eq!(
+        FEATURE_LEVEL_7, 7,
+        "v1.25.0 及更早 advertise ≤6，restore 后续状态/租约必须用新 level 7"
+    );
+    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_7);
+    assert!(
+        supports(1)
+            && supports(2)
+            && supports(3)
+            && supports(4)
+            && supports(5)
+            && supports(6)
+            && supports(7)
+    );
+    assert!(!supports(8), "未知更高 level 一律不支持");
 
-    // marker 6 + MAX 6：显式配置 6 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）/
-    // v1.24.0（MAX 5）拒绝。
+    // marker 7 + MAX 7：显式配置 7 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）/
+    // v1.24.0（MAX 5）/v1.25.0（MAX 6）拒绝。
     assert!(guard_startup(3, 3).is_ok());
     assert!(guard_startup(4, 4).is_ok());
     assert!(guard_startup(5, 5).is_ok());
     assert!(guard_startup(6, 6).is_ok());
-    assert!(guard_startup(7, 6).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(7, 7).is_ok());
+    assert!(guard_startup(8, 7).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(7, 6).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(6, 5).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(5, 4).is_err(), "配置低于 marker 必须拒绝");
     assert!(
@@ -438,7 +482,8 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         "配置低于已激活 marker 必须拒绝"
     );
 
-    let (mut ext, mut accounts, mut jobs, mut inventory, mut retention) = (0, 0, 0, 0, 0);
+    let (mut ext, mut accounts, mut jobs, mut inventory, mut retention, mut restore, mut lease) =
+        (0, 0, 0, 0, 0, 0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
         match cmd {
@@ -485,6 +530,20 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
                     "JobPurge 必须用 level 6（v1.24.0 占用 5）"
                 );
             }
+            ControlCommand::TierRestoreUpsert { .. } | ControlCommand::TierRestoreDelete { .. } => {
+                restore += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_7,
+                    "restore 后续状态必须用 level 7（v1.25.0 占用 6）"
+                );
+            }
+            ControlCommand::ScheduleLeaseAcquire { .. } => {
+                lease += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_7,
+                    "调度租约必须用 level 7（v1.25.0 占用 6）"
+                );
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
                 "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
@@ -499,6 +558,8 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         "生产命令集恰好两个 M8-2 inventory 行样本 + 两个 lifecycle 游标样本"
     );
     assert_eq!(retention, 1, "生产命令集恰好一个 JobPurge 样本");
+    assert_eq!(restore, 2, "生产命令集恰好两个 restore 后续状态样本");
+    assert_eq!(lease, 1, "生产命令集恰好一个调度租约样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

@@ -275,6 +275,45 @@ async fn mpu_index_tracks_lifecycle_after_load() {
     assert!(!r.is_truncated);
 }
 
+/// MPU 索引 TTL 到点整桶重建：另一实例（代表外部 create/手工写）新增的 upload 被拾取。
+#[tokio::test]
+async fn mpu_index_ttl_reload_picks_up_external_upload() {
+    let (s1, dir) = store().await;
+    let a = s1
+        .create_multipart_upload("alpha", "a", None, Default::default())
+        .await
+        .unwrap();
+    // 首次列举：索引从盘上暂存区构建
+    let r = s1
+        .list_multipart_uploads("alpha", &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), vec![("a".to_string(), a.clone())]);
+
+    let s2 = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let b = s2
+        .create_multipart_upload("alpha", "b", None, Default::default())
+        .await
+        .unwrap();
+    // TTL 内：advisory 索引看不到外部 create（最终一致窗口）
+    let r = s1
+        .list_multipart_uploads("alpha", &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), vec![("a".to_string(), a.clone())]);
+
+    s1.mpu_index_expire("alpha");
+    let r = s1
+        .list_multipart_uploads("alpha", &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![("a".to_string(), a), ("b".to_string(), b)],
+        "TTL 重建应拾取外部新增 upload"
+    );
+}
+
 /// 索引增量后的 delimiter/分页边界：cp 先于生成键、续页不重复。
 #[tokio::test]
 async fn mpu_index_delimiter_and_page_boundaries_after_incremental_adds() {

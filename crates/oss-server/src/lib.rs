@@ -1,5 +1,6 @@
 pub mod access_points_api;
 pub mod accounts_api;
+mod accounts_canonical;
 mod accounts_support;
 mod accounts_usage;
 pub mod aether;

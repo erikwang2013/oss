@@ -776,6 +776,10 @@ pub async fn run(
                 // M4 切片 6：生命周期 worker（serve 专属；运维命令不挂）。
                 // 间隔 OSS_LIFECYCLE_INTERVAL_SECS（默认 60；0=关闭）
                 crate::lifecycle::spawn_worker(state.clone());
+                // §3：账户规范化（leader 门控；standalone 直写/Raft 走既有命令，无新命令）
+                // + 硬配额用量采样（每节点本地缓存，跨节点有界陈旧）。
+                crate::accounts_canonical::spawn_worker(state.clone(), leader.clone());
+                crate::accounts_usage::spawn_sampler(state.clone());
                 // M6 切片 0：事件 outbox worker（OSS_EVENT_INTERVAL_SECS，0=关）
                 crate::events::spawn_worker(
                     std::sync::Arc::clone(&state.events),
@@ -799,12 +803,15 @@ pub async fn run(
                 crate::lifecycle::spawn_audit_cleanup(state.clone());
                 // M8 S0：通用作业引擎（S4b 的 Transition/Restore + S3 Batch + S5 Inventory；0 关闭）
                 let executor = std::sync::Arc::new(ServeTaskExecutor {
-                    tier: std::sync::Arc::new(crate::tier_jobs::M8TaskExecutor::new(
-                        std::sync::Arc::clone(&state.db),
-                        std::sync::Arc::clone(&state.store),
-                        std::sync::Arc::clone(&state.tiers),
-                        std::sync::Arc::clone(&state.events),
-                    )),
+                    tier: std::sync::Arc::new(
+                        crate::tier_jobs::M8TaskExecutor::new(
+                            std::sync::Arc::clone(&state.db),
+                            std::sync::Arc::clone(&state.store),
+                            std::sync::Arc::clone(&state.tiers),
+                            std::sync::Arc::clone(&state.events),
+                        )
+                        .with_jobs(std::sync::Arc::clone(&state.jobs)),
+                    ),
                     inventory: std::sync::Arc::clone(&state.inventory_runner),
                     // Batch：与在线写路径共用同一组 sink；桶通知由执行器按对象所在桶补发。
                     batch: std::sync::Arc::new(crate::job_actions::BatchExecutor::new(

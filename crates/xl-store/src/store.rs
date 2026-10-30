@@ -116,6 +116,12 @@ pub struct StoreConfig {
     pub key_cache_max_total_keys: usize,
     /// 键缓存 TTL 秒（`OSS_KEY_CACHE_TTL_SECS`，默认 300）；0 = 不周期重建。
     pub key_cache_ttl_secs: u64,
+    /// 在途 MPU 索引 TTL 秒（`OSS_MPU_INDEX_TTL_SECS`，默认 300）；0 = 不周期重建。
+    /// 过期的索引下次列举时整桶重建，纠正 clean/加载竞态留下的陈旧项。
+    pub mpu_index_ttl_secs: u64,
+    /// 流式读的分片批量读目标字节数（`OSS_SHARD_READ_BATCH_BYTES`，默认 1 MiB）。
+    /// 按块宽（64 KiB）向下取整并限制在 [64 KiB, 16 MiB]；0 = 单块（关闭批量）。
+    pub shard_read_batch_bytes: usize,
 }
 
 impl StoreConfig {
@@ -138,6 +144,8 @@ impl StoreConfig {
             key_cache_max_keys: env_num("OSS_KEY_CACHE_MAX_KEYS", 2_000_000),
             key_cache_max_total_keys: env_num("OSS_KEY_CACHE_MAX_TOTAL_KEYS", 2_000_000),
             key_cache_ttl_secs: env_num("OSS_KEY_CACHE_TTL_SECS", 300),
+            mpu_index_ttl_secs: env_num("OSS_MPU_INDEX_TTL_SECS", 300),
+            shard_read_batch_bytes: env_num("OSS_SHARD_READ_BATCH_BYTES", 1024 * 1024),
         }
     }
 
@@ -289,6 +297,15 @@ pub struct Store {
     key_cache: key_cache::KeyCache,
     /// 在途 MPU 索引（LMU 加速；advisory）。
     mpu_index: mpu_index::MpuIndex,
+    /// 测试仪器：已完成的本地分片块写次数（证明本地写与远端 RPC 重叠）。
+    #[cfg(test)]
+    local_shard_writes: AtomicU64,
+    /// 测试仪器：本地分片写前延迟毫秒（模拟慢盘，令本地写在远端 RPC 在途时完成）。
+    #[cfg(test)]
+    local_shard_write_delay_ms: AtomicU64,
+    /// 测试仪器：分片范围读调用次数（证明多块批量读生效）。
+    #[cfg(test)]
+    shard_range_calls: AtomicU64,
 }
 
 #[derive(Default)]
@@ -563,6 +580,7 @@ impl Store {
             cfg.key_cache_max_total_keys,
             Duration::from_secs(cfg.key_cache_ttl_secs),
         );
+        let mpu_ttl = Duration::from_secs(cfg.mpu_index_ttl_secs);
         let store = Self {
             cfg,
             locks: Mutex::new(HashMap::new()),
@@ -572,7 +590,13 @@ impl Store {
             encryption: std::sync::OnceLock::new(),
             writers: Mutex::new(WriterState::default()),
             key_cache,
-            mpu_index: mpu_index::MpuIndex::default(),
+            mpu_index: mpu_index::MpuIndex::new(mpu_ttl),
+            #[cfg(test)]
+            local_shard_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            local_shard_write_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            shard_range_calls: AtomicU64::new(0),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;

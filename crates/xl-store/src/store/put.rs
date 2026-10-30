@@ -343,7 +343,19 @@ impl Store {
         match sink {
             ShardSink::Dead => Err(Error::QuorumUnmet("槽位不在册（跳过）".into())),
             ShardSink::Local { f, dir } => {
+                #[cfg(test)]
+                {
+                    let ms = self
+                        .local_shard_write_delay_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                }
                 f.write_all(chunk).await?;
+                #[cfg(test)]
+                self.local_shard_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if is_final {
                     f.flush().await?;
                     if self.cfg.fsync {
@@ -448,6 +460,8 @@ impl Store {
         let quorum = self.cfg.ec.data as usize + 1;
         // 测试专用断电注入（Task 9）：第 N 片写完最后一块后 abort()（SIGABRT），复现「提交点前猝死」。
         // 仅环境变量在场时生效；生产部署不设此变量 = 每块多一次 Option 比较，零行为影响。
+        // 该注入要求精确的逐片顺序/中止点，因此**保持顺序写路径**（分片并行仅在不设此变量时启用）；
+        // OSS_TEST_ABORT_AFTER_SHARD 仅供测试，生产不得设置。
         let abort_after: Option<usize> = std::env::var("OSS_TEST_ABORT_AFTER_SHARD")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -1180,6 +1194,20 @@ impl Store {
         if let (Some(gate), Some(t)) = (&self.cfg.gate, ticket) {
             gate.committed(t).await;
         }
+    }
+
+    /// 测试用：已完成的本地分片块写次数。
+    #[cfg(test)]
+    pub(in crate::store) fn local_shard_writes_done(&self) -> u64 {
+        self.local_shard_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 测试用：本地分片写前延迟（模拟慢盘）。
+    #[cfg(test)]
+    pub(in crate::store) fn set_local_shard_write_delay_ms(&self, ms: u64) {
+        self.local_shard_write_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

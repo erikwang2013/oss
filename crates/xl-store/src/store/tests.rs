@@ -704,6 +704,37 @@ async fn stream_object_ec_is_byte_identical() {
     assert!(chunks > 1, "流式应分块输出（实际 {chunks} 块）");
 }
 
+/// 流式 GET 的分片批量读：每片一次 1 MiB（上限内）范围读覆盖多块，而非每 64 KiB 一次。
+#[tokio::test]
+async fn stream_object_ec_batches_shard_range_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(dir.path());
+    cfg.shard_read_batch_bytes = 1024 * 1024; // 默认目标：1 MiB
+    let data = cfg.ec.data as usize;
+    let s = Arc::new(Store::open(cfg).await.unwrap());
+    s.create_bucket("alpha").await.unwrap();
+    let body = payload(2 * 1024 * 1024);
+    s.put_object("alpha", "k", body.clone(), None)
+        .await
+        .unwrap();
+    let meta = read_disk_meta(&s, "alpha", "k").await;
+    let layout = meta.latest().unwrap().data_layout.as_ref().unwrap();
+    let blocks = layout.shard_size / ec::CHUNK_W as u64;
+    assert!(blocks > 1, "用例前提：单片跨多块（blocks={blocks}）");
+
+    let (_, mut stream) = s.stream_object_ext("alpha", "k", None, None).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, body, "批量读必须字节一致");
+    assert_eq!(
+        s.shard_range_read_calls(),
+        (2 * data) as u64,
+        "每数据片 1 次探活 + 1 次批量流读；按块读会是 {data} + {data}×{blocks} 次"
+    );
+}
+
 #[tokio::test]
 async fn stream_object_missing_data_shard_falls_back_buffered() {
     // 数据片在首字节前即缺失 → 回退整读（EC 重建救回），字节必须完整
@@ -2747,6 +2778,16 @@ pub struct InProcessMesh {
     list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
     /// 测试诊断：health 探测调用序列（注入失败记为 FAIL）。
     health_log: std::sync::Mutex<Vec<String>>,
+    /// 写并发仪器（分片写并行测试）：并发峰值 + 调用数。
+    write_inflight: std::sync::atomic::AtomicU64,
+    write_max_inflight: std::sync::atomic::AtomicU64,
+    write_calls: std::sync::atomic::AtomicU64,
+    /// 调用方 Store（用于观察本地分片写进度是否与远端 RPC 重叠）。
+    probe: std::sync::Mutex<Option<std::sync::Weak<Store>>>,
+    local_remote_overlap: std::sync::atomic::AtomicBool,
+    /// 读批量仪器（流式 GET 批量 RPC 测试）。
+    read_calls: std::sync::atomic::AtomicU64,
+    read_max_len: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for InProcessMesh {
@@ -2765,7 +2806,57 @@ impl InProcessMesh {
             versions: Default::default(),
             list_requests: Default::default(),
             health_log: Default::default(),
+            write_inflight: Default::default(),
+            write_max_inflight: Default::default(),
+            write_calls: Default::default(),
+            probe: Default::default(),
+            local_remote_overlap: Default::default(),
+            read_calls: Default::default(),
+            read_max_len: Default::default(),
         })
+    }
+
+    /// 并发峰值：同时处于 write_shard 中的 RPC 数（顺序写路径恒为 1）。
+    pub fn write_max_inflight(&self) -> u64 {
+        self.write_max_inflight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn write_calls(&self) -> u64 {
+        self.write_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 已在某次远端 write_shard 在途期间观察到本地分片写推进。
+    pub fn local_remote_overlap(&self) -> bool {
+        self.local_remote_overlap
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 指定调用方节点（观察其本地分片写计数）。
+    pub fn probe_local(&self, node: &str) {
+        *self.probe.lock().unwrap() = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(node)
+            .and_then(|w| w.upgrade())
+            .map(|s| std::sync::Arc::downgrade(&s));
+    }
+
+    pub fn read_calls(&self) -> u64 {
+        self.read_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn read_max_len(&self) -> u64 {
+        self.read_max_len.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn probe_store(&self) -> Option<Arc<Store>> {
+        self.probe
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// DP-0：伪造某 peer 的数据面版本（0 = 旧节点缺字段语义）；`None` 恢复真实值。
@@ -2878,18 +2969,41 @@ impl crate::mesh::MeshTransport for InProcessMesh {
     }
     // 以下 RPC 随所属 Task 落地（5a/5b/6/8/9）；在此之前显式报未实现，不静默成功。
     async fn write_shard(&self, n: &str, w: crate::mesh::ShardWrite) -> crate::error::Result<()> {
-        if self.take_fail(n, "write_shard") {
-            return Err(crate::error::Error::Encode(format!(
+        use std::sync::atomic::Ordering::SeqCst;
+        let inflight = self.write_inflight.fetch_add(1, SeqCst) + 1;
+        self.write_max_inflight.fetch_max(inflight, SeqCst);
+        self.write_calls.fetch_add(1, SeqCst);
+        // 本地分片写进度在 RPC 等待（注入延迟）期间推进 = 本地写与远端写重叠。
+        let before = self
+            .probe_store()
+            .map_or(0, |s| s.local_shard_writes_done());
+        let res = if self.take_fail(n, "write_shard") {
+            Err(crate::error::Error::Encode(format!(
                 "in-process 注入：{n} write_shard 失败"
-            )));
+            )))
+        } else {
+            match self.peer(n).await {
+                Ok(store) => store.mesh_write_shard(w).await,
+                Err(e) => Err(e),
+            }
+        };
+        if self
+            .probe_store()
+            .is_some_and(|s| s.local_shard_writes_done() > before)
+        {
+            self.local_remote_overlap.store(true, SeqCst);
         }
-        self.peer(n).await?.mesh_write_shard(w).await
+        self.write_inflight.fetch_sub(1, SeqCst);
+        res
     }
     async fn read_shard(
         &self,
         n: &str,
         r: crate::mesh::ShardRead,
     ) -> crate::error::Result<Option<Bytes>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.read_calls.fetch_add(1, SeqCst);
+        self.read_max_len.fetch_max(r.length, SeqCst);
         self.peer(n).await?.mesh_read_shard(r).await
     }
     async fn delete_version(
@@ -3279,6 +3393,72 @@ async fn cluster_write_distributes_by_slot() {
     let (info, got) = s1.get_object("bkt", "k").await.unwrap();
     assert_eq!(info.size, body.len() as u64);
     assert_eq!(got.to_vec(), body);
+}
+
+/// 集群流式 GET：远端数据片用一次范围 RPC 读多块（目标 1 MiB），字节一致。
+#[tokio::test]
+async fn cluster_stream_get_batches_remote_shard_reads() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    let body: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    s1.put_object("bkt", "k", Bytes::from(body.clone()), None)
+        .await
+        .unwrap();
+
+    let (_, mut stream) = s1.stream_object_ext("bkt", "k", None, None).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, body, "批量远端读必须字节一致");
+    assert!(
+        c.mesh.read_calls() > 0,
+        "远端数据片应经 in-process 传输读取"
+    );
+    assert!(
+        c.mesh.read_max_len() > ec::CHUNK_W as u64,
+        "远端批量读长度应跨多个块（实得 {} 字节；单块 = {}）",
+        c.mesh.read_max_len(),
+        ec::CHUNK_W
+    );
+}
+
+/// 分片写并行：本地分片写在远端 write_shard（注入延迟）在途期间完成——本地+远端重叠；
+/// 远端写并发峰值 > 1。`OSS_TEST_ABORT_AFTER_SHARD` 顺序路径不在此覆盖（见 put.rs 注记）。
+#[tokio::test]
+async fn cluster_shard_writes_run_in_parallel() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    c.mesh.probe_local("n1");
+    s1.set_local_shard_write_delay_ms(300); // 慢盘：本地写仍在途时远端 RPC 已发出
+    for n in ["n2", "n3", "n4"] {
+        c.mesh.delay(n, std::time::Duration::from_millis(200));
+    }
+    let body = vec![7u8; 200 * 1024]; // 1 块 EC：本地 3 片 + 远端 9 片
+    s1.put_object("bkt", "k", Bytes::from(body.clone()), None)
+        .await
+        .unwrap();
+    assert!(
+        c.mesh.write_calls() >= 9,
+        "远端分片写次数不足（实得 {}）",
+        c.mesh.write_calls()
+    );
+    assert!(
+        c.mesh.write_max_inflight() >= 2,
+        "远端分片写必须并发（峰值 {}）",
+        c.mesh.write_max_inflight()
+    );
+    assert!(
+        c.mesh.local_remote_overlap(),
+        "本地分片写未在远端 RPC 在途期间推进（写路径退化为串行？）"
+    );
+    for n in ["n2", "n3", "n4"] {
+        c.mesh.delay(n, std::time::Duration::ZERO);
+    }
+    let (_, got) = s1.get_object("bkt", "k").await.unwrap();
+    assert_eq!(&got[..], &body[..]);
 }
 
 /// DP-1：placement v1 混版窗口放行 base 数据面（旧节点缺字段 → 按 1），

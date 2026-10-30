@@ -35,6 +35,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/accounts/{id}/quota", put(set_quota))
         .route("/accounts/{id}/soft-quota", put(set_soft_quota))
+        .route(
+            "/accounts/{id}/hard-quota",
+            put(crate::accounts_usage::set_hard_quota),
+        )
         .route("/accounts/{id}/usage", get(account_usage))
         .route(
             "/accounts/{id}/members",

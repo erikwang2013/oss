@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo};
+use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
 
 use crate::events::{backoff_secs, now};
@@ -170,18 +171,15 @@ impl SqlReplSink {
     }
 }
 
-/// 规则是否命中该写事件（enabled + 前缀 + marker 开关）。
-fn rule_matches(r: &ReplRule, info: &WriteInfo<'_>) -> bool {
+/// 规则是否命中该写事件（enabled + Prefix/Tag/And 过滤 + marker 开关）。
+fn rule_matches(r: &ReplRule, info: &WriteInfo<'_>, tags: &[ObjectTag]) -> bool {
     if !r.enabled {
         return false;
     }
     if info.is_delete_marker && !r.delete_marker {
         return false;
     }
-    match &r.prefix {
-        Some(p) => info.key.starts_with(p),
-        None => true,
-    }
+    r.matches_filter(info.key, tags)
 }
 
 #[async_trait]
@@ -229,7 +227,34 @@ impl ReplicationSink for SqlReplSink {
             {
                 Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json) {
                     Ok(rules) => {
-                        for r in rules.iter().filter(|r| rule_matches(r, &info)) {
+                        // 标签条件需要对象标签快照；删除事件没有（marker 无标签、版本已删），
+                        // 标签规则不投递删除。
+                        // shortcut: 标签规则的删除不跨站；需要时在删除前快照标签并随 WriteInfo 传入。
+                        let tags = if rules.iter().any(|r| !r.tags.is_empty())
+                            && !info.is_delete_marker
+                            && !info.is_version_delete
+                            && let Some(vid) = info.version_id
+                        {
+                            match self
+                                .store
+                                .head_object_version(info.bucket, info.key, vid)
+                                .await
+                            {
+                                Ok(i) => i.tags,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        bucket = info.bucket,
+                                        key = info.key,
+                                        "读对象标签失败——标签规则本写不复制"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        for r in rules.iter().filter(|r| rule_matches(r, &info, &tags)) {
                             if info.is_version_delete
                                 && !self.versioned_remotes.iter().any(|id| id == &r.remote_id)
                             {
@@ -1201,6 +1226,7 @@ mod tests {
         ReplRule {
             id: "r".into(),
             prefix: prefix.map(str::to_string),
+            tags: Vec::new(),
             remote_id: "r1".into(),
             dest_bucket: "dst".into(),
             delete_marker: dm,
@@ -1221,33 +1247,64 @@ mod tests {
         }
     }
 
+    fn tag(key: &str, value: &str) -> ObjectTag {
+        ObjectTag {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
     #[test]
     fn rule_matching_matrix() {
         assert!(rule_matches(
             &rule(None, false, true),
-            &info("a", false, false)
+            &info("a", false, false),
+            &[]
         ));
         assert!(rule_matches(
             &rule(Some("logs/"), false, true),
-            &info("logs/x", false, false)
+            &info("logs/x", false, false),
+            &[]
         ));
         assert!(!rule_matches(
             &rule(Some("logs/"), false, true),
-            &info("data/x", false, false)
+            &info("data/x", false, false),
+            &[]
         ));
         // marker：仅 DeleteMarkerReplication=Enabled 的规则命中
         assert!(!rule_matches(
             &rule(None, false, true),
-            &info("a", true, false)
+            &info("a", true, false),
+            &[]
         ));
         assert!(rule_matches(
             &rule(None, true, true),
-            &info("a", true, false)
+            &info("a", true, false),
+            &[]
         ));
         // Disabled 规则永不命中
         assert!(!rule_matches(
             &rule(None, true, false),
-            &info("a", false, false)
+            &info("a", false, false),
+            &[]
+        ));
+        // 标签条件参与选择（Prefix + Tag 同时满足才命中）
+        let mut r = rule(Some("logs/"), false, true);
+        r.tags = vec![tag("env", "prod")];
+        assert!(rule_matches(
+            &r,
+            &info("logs/x", false, false),
+            &[tag("env", "prod")]
+        ));
+        assert!(!rule_matches(
+            &r,
+            &info("logs/x", false, false),
+            &[tag("env", "dev")]
+        ));
+        assert!(!rule_matches(
+            &r,
+            &info("data/x", false, false),
+            &[tag("env", "prod")]
         ));
     }
 }

@@ -1,10 +1,11 @@
 //! M8 S4b：Transition sweep、Restore reaper 与启动对账（executor 见 `tier_jobs`）。
 //!
 //! M8-1：Raft 模式下 sweep/reaper/启动对账只在 leader 跑（[`crate::raft::LeaderGate`]）；
-//! M8-2：`tier_restores` 的受理行随作业进复制日志（按主键 upsert），执行侧状态转换
-//! 仍是 leader 本地写，follower 靠 level-3 快照安装与对账收敛。
+//! feature 7：调度前先取得复制租约（旧 leader 到期后新 leader 才接管），
+//! `tier_restores` 的受理行与后续状态/清理都经复制日志（按主键 upsert/幂等删除）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use xl_s3::lifecycle::{LifecycleFilter, LifecycleRuleSpec, LifecycleStore};
 use xl_s3::restore::RestoreSink;
@@ -291,6 +292,16 @@ pub async fn reap_once_fenced(
     store: &Store,
     fence: FencingEpoch,
 ) -> Result<usize, String> {
+    reap_once_with(&crate::job_state::JobState::local(), db, store, fence).await
+}
+
+/// 复制版（生产路径）：restore 行写入经 [`crate::job_state::JobState`]（feature 7）。
+pub async fn reap_once_with(
+    jobs: &crate::job_state::JobState,
+    db: &Db,
+    store: &Store,
+    fence: FencingEpoch,
+) -> Result<usize, String> {
     let now = crate::db::now();
     let rows = db
         .restore_rows("restored")
@@ -321,15 +332,16 @@ pub async fn reap_once_fenced(
                         .await
                     {
                         Ok(true) => {
-                            let _ = db
-                                .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
+                            let _ = jobs
+                                .tier_restore_delete(db, &r.bucket, &r.key, &r.version_id, fence)
                                 .await;
                             n += 1;
                         }
                         Ok(false) => {
                             if let Some(e) = version_expiry {
-                                let _ = db
-                                    .set_restore_state_fenced(
+                                let _ = jobs
+                                    .tier_restore_set_state(
+                                        db,
                                         &r.bucket,
                                         &r.key,
                                         &r.version_id,
@@ -346,8 +358,9 @@ pub async fn reap_once_fenced(
                     && let Some(e) = version_expiry
                 {
                     // 行过期时刻早于版本：以版本为准修正（不误删）。
-                    let _ = db
-                        .set_restore_state_fenced(
+                    let _ = jobs
+                        .tier_restore_set_state(
+                            db,
                             &r.bucket,
                             &r.key,
                             &r.version_id,
@@ -360,14 +373,22 @@ pub async fn reap_once_fenced(
             }
             Some(TierPhase::Restoring) => {
                 // 恢复进行中：行回到 pending，交给作业/对账。
-                let _ = db
-                    .set_restore_state_fenced(&r.bucket, &r.key, &r.version_id, "pending", 0, fence)
+                let _ = jobs
+                    .tier_restore_set_state(
+                        db,
+                        &r.bucket,
+                        &r.key,
+                        &r.version_id,
+                        "pending",
+                        0,
+                        fence,
+                    )
                     .await;
             }
             Some(TierPhase::Archived) | None => {
                 // 孤儿行：版本已归档/无 tier/已删除。
-                let _ = db
-                    .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
+                let _ = jobs
+                    .tier_restore_delete(db, &r.bucket, &r.key, &r.version_id, fence)
                     .await;
                 n += 1;
             }
@@ -387,6 +408,17 @@ pub async fn reconcile_restores(
 
 /// 启动对账 + 重排恢复。返回处理条数。
 pub async fn reconcile_restores_fenced(
+    db: &Db,
+    store: &Store,
+    sink: &dyn RestoreSink,
+    fence: FencingEpoch,
+) -> Result<usize, String> {
+    reconcile_restores_with(&crate::job_state::JobState::local(), db, store, sink, fence).await
+}
+
+/// 复制版（生产路径）：restore 行写入经 [`crate::job_state::JobState`]（feature 7）。
+pub async fn reconcile_restores_with(
+    jobs: &crate::job_state::JobState,
     db: &Db,
     store: &Store,
     sink: &dyn RestoreSink,
@@ -446,8 +478,8 @@ pub async fn reconcile_restores_fenced(
                 .and_then(|v| v.tier.as_ref())
                 .and_then(|t| t.restore_expires_at);
             if phase.is_none() {
-                let _ = db
-                    .delete_restore_fenced(&r.bucket, &r.key, &r.version_id, fence)
+                let _ = jobs
+                    .tier_restore_delete(db, &r.bucket, &r.key, &r.version_id, fence)
                     .await;
             } else if state == "pending" && phase == Some(TierPhase::Archived) {
                 let active = match r.job_id {
@@ -463,8 +495,9 @@ pub async fn reconcile_restores_fenced(
                 // P2-1：复制行在 follower 上可能滞后于版本（执行/提交只在 leader），
                 // 按版本事实收敛，避免旧 pending 行在换 leader 后被再次重排。
                 if let Some(e) = version_expiry {
-                    let _ = db
-                        .set_restore_state_fenced(
+                    let _ = jobs
+                        .tier_restore_set_state(
+                            db,
                             &r.bucket,
                             &r.key,
                             &r.version_id,
@@ -499,19 +532,50 @@ pub fn spawn(
 ) {
     let reconcile_db = Arc::clone(&db);
     let reconcile_store = Arc::clone(&store);
+    let reconcile_jobs = Arc::clone(&jobs);
     let reconcile_gate = gate.clone();
     tokio::spawn(async move {
-        // 对账也是单例写：等到本节点成为 leader 再做（unknown 一直等）；写状态带当时的
-        // token，等待期间又换届则放弃（交给新 leader 重新对账）。
-        let fence = reconcile_gate.wait_until_leader().await;
-        if !reconcile_gate.still_current(fence) {
-            return;
-        }
-        match reconcile_restores_fenced(&reconcile_db, &reconcile_store, sink.as_ref(), fence).await
-        {
-            Ok(n) if n > 0 => tracing::info!(n, "restore 启动对账完成"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "restore 启动对账失败"),
+        // 对账也是单例写：等到本节点成为 leader 且拿到调度租约（旧 leader 到期）再做；
+        // 等待期间又换届则重等，交给新 leader 重新对账。
+        loop {
+            if !reconcile_gate.is_leader() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            match reconcile_jobs
+                .schedule_fence(
+                    &reconcile_db,
+                    &reconcile_gate,
+                    crate::db::now(),
+                    crate::job_state::schedule_lease_ttl(),
+                )
+                .await
+            {
+                Ok(Some(fence)) => {
+                    if !reconcile_gate.still_current(fence) {
+                        continue;
+                    }
+                    match reconcile_restores_with(
+                        &reconcile_jobs,
+                        &reconcile_db,
+                        &reconcile_store,
+                        sink.as_ref(),
+                        fence,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => tracing::info!(n, "restore 启动对账完成"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "restore 启动对账失败"),
+                    }
+                    return;
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "restore 对账等待调度租约失败");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
     });
     let sweep_secs = env_secs("OSS_TIER_SWEEP_INTERVAL_SECS", 3600);
@@ -525,9 +589,17 @@ pub fn spawn(
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
-                if !gate.is_leader() {
+                let Ok(Some(_)) = jobs
+                    .schedule_fence(
+                        &db,
+                        &gate,
+                        crate::db::now(),
+                        crate::job_state::schedule_lease_ttl(),
+                    )
+                    .await
+                else {
                     continue;
-                }
+                };
                 match sweep_transitions_at_with(
                     &jobs,
                     &db,
@@ -548,15 +620,24 @@ pub fn spawn(
     if reaper_secs > 0 {
         let db = Arc::clone(&db);
         let store = Arc::clone(&store);
+        let jobs = Arc::clone(&jobs);
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(reaper_secs));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
-                let Some(fence) = gate.epoch() else {
+                let Ok(Some(fence)) = jobs
+                    .schedule_fence(
+                        &db,
+                        &gate,
+                        crate::db::now(),
+                        crate::job_state::schedule_lease_ttl(),
+                    )
+                    .await
+                else {
                     continue;
                 };
-                match reap_once_fenced(&db, &store, fence).await {
+                match reap_once_with(&jobs, &db, &store, fence).await {
                     Ok(n) if n > 0 => tracing::info!(n, "tier reaper：回收过期恢复"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "tier reaper 失败"),

@@ -777,6 +777,12 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         "oss_sync_write_intent_recovered_total {}\n",
         state.sync_metrics.write_intent_recovered_total()
     ));
+    let audit_dropped = state.audit.as_ref().map_or(0, |a| a.dropped());
+    out.push_str(
+        "# HELP oss_audit_dropped_total 审计队列满/关闭而丢弃的行数（best-effort）\n\
+         # TYPE oss_audit_dropped_total counter\n",
+    );
+    out.push_str(&format!("oss_audit_dropped_total {audit_dropped}\n"));
     if let Some(handle) = &state.raft {
         let (term, applied, voters, role) = {
             let m = handle.raft().metrics();

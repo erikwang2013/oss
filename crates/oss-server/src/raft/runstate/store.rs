@@ -136,6 +136,31 @@ pub(crate) fn inventory_incremental_row_from(
     }
 }
 
+/// 整行 → [`TierRestoreRow`]（restore 后续状态复制与快照读共用）。
+pub(crate) fn tier_restore_row_from(r: &sqlx::sqlite::SqliteRow) -> TierRestoreRow {
+    TierRestoreRow {
+        bucket: r.get("bucket"),
+        key: r.get("key"),
+        version_id: r.get("version_id"),
+        expires_at: r.get("expires_at"),
+        job_id: r.get("job_id"),
+        state: r.get("state"),
+        created_at: r.get("created_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    }
+}
+
+/// 整行 → [`ScheduleLeaseRow`]（调度租约复制与快照读共用）。
+pub(crate) fn lease_row_from(r: &sqlx::sqlite::SqliteRow) -> ScheduleLeaseRow {
+    ScheduleLeaseRow {
+        term: r.get("term"),
+        node: r.get("node"),
+        expires_at: r.get("expires_at"),
+        acquired_at: r.get("acquired_at"),
+    }
+}
+
 /// 整行 → [`LifecycleCursorRow`]（lifecycle 游标复制与快照读共用）。
 pub(crate) fn lifecycle_cursor_row_from(r: &sqlx::sqlite::SqliteRow) -> LifecycleCursorRow {
     LifecycleCursorRow {
@@ -221,17 +246,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .await
     .map_err(sql)?
     {
-        state.tier_restores.push(TierRestoreRow {
-            bucket: r.get("bucket"),
-            key: r.get("key"),
-            version_id: r.get("version_id"),
-            expires_at: r.get("expires_at"),
-            job_id: r.get("job_id"),
-            state: r.get("state"),
-            created_at: r.get("created_at"),
-            fence_term: r.get("fence_term"),
-            fence_leader: r.get("fence_leader"),
-        });
+        state.tier_restores.push(tier_restore_row_from(&r));
     }
 
     for r in sqlx::query(
@@ -251,12 +266,7 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
     .fetch_optional(&mut *conn)
     .await
     .map_err(sql)?
-    .map(|r| ScheduleLeaseRow {
-        term: r.get("term"),
-        node: r.get("node"),
-        expires_at: r.get("expires_at"),
-        acquired_at: r.get("acquired_at"),
-    });
+    .map(|r| lease_row_from(&r));
 
     state.next_job_id = read_meta(conn, META_NEXT_JOB_ID).await?;
     state.next_run_id = read_meta(conn, META_NEXT_RUN_ID).await?;

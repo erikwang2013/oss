@@ -169,7 +169,10 @@ pub async fn worker_tick_with(
     now: i64,
     gate: &LeaderGate,
 ) -> Result<bool, String> {
-    let Some(fence) = gate.epoch() else {
+    let Some(fence) = jobs
+        .schedule_fence(db, gate, now, crate::job_state::schedule_lease_ttl())
+        .await?
+    else {
         return Ok(false);
     };
     worker_once_fenced(jobs, db, store, exec, env, now, gate, fence).await
@@ -265,10 +268,18 @@ pub fn spawn_workers(
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 t.tick().await;
-                if !sched_gate.is_leader() {
-                    continue;
-                }
                 let now = crate::db::now();
+                let Ok(Some(_)) = sched_jobs
+                    .schedule_fence(
+                        &sched,
+                        &sched_gate,
+                        now,
+                        crate::job_state::schedule_lease_ttl(),
+                    )
+                    .await
+                else {
+                    continue;
+                };
                 match sched_jobs
                     .preempt_lower_priority(&sched, env.workers, now)
                     .await

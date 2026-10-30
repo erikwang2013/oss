@@ -826,8 +826,15 @@ fn amz_now() -> AmzDate {
     AmzDate::parse(&s).unwrap()
 }
 
-/// 最小 SigV4 header 签名 PUT（数据面真实写入口；不引生产签名器）。
-async fn s3_put(base: &str, path: &str, ak: &str, sk: &str, body: &[u8]) -> reqwest::Response {
+/// 最小 SigV4 header 签名请求（数据面真实写/删入口；不引生产签名器）。
+async fn s3_signed(
+    method: Method,
+    base: &str,
+    path: &str,
+    ak: &str,
+    sk: &str,
+    body: &[u8],
+) -> reqwest::Response {
     const REGION: &str = "us-east-1";
     let url = format!("{base}{path}");
     let host = url
@@ -852,7 +859,7 @@ async fn s3_put(base: &str, path: &str, ak: &str, sk: &str, body: &[u8]) -> reqw
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let canonical = create_canonical_request(
-        Method::PUT.as_str(),
+        method.as_str(),
         path,
         &[] as &[(&str, &str)],
         &refs,
@@ -867,7 +874,7 @@ async fn s3_put(base: &str, path: &str, ak: &str, sk: &str, body: &[u8]) -> reqw
         names.join(";")
     );
     let req = reqwest::Client::new()
-        .put(&url)
+        .request(method, &url)
         .header("x-amz-content-sha256", &payload_hex)
         .header("x-amz-date", amz_iso)
         .header("authorization", auth)
@@ -875,6 +882,14 @@ async fn s3_put(base: &str, path: &str, ak: &str, sk: &str, body: &[u8]) -> reqw
         .build()
         .unwrap();
     reqwest::Client::new().execute(req).await.unwrap()
+}
+
+async fn s3_put(base: &str, path: &str, ak: &str, sk: &str, body: &[u8]) -> reqwest::Response {
+    s3_signed(Method::PUT, base, path, ak, sk, body).await
+}
+
+async fn s3_delete(base: &str, path: &str, ak: &str, sk: &str) -> reqwest::Response {
+    s3_signed(Method::DELETE, base, path, ak, sk, b"").await
 }
 
 async fn account_usage(base: &str, token: &str, id: &str) -> reqwest::Response {
@@ -1196,4 +1211,142 @@ async fn soft_byte_quota_usage_paginates_past_1000_keys() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["used_bytes"], 1003);
     assert_eq!(body["bucket_count"], 2);
+}
+
+// ---------- AC-3：账户硬字节/对象数配额（写入预留、删除释放） ----------
+
+async fn set_hard_quota(
+    base: &str,
+    token: &str,
+    id: &str,
+    hard_bytes: Option<i64>,
+    objects: Option<i64>,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .put(format!("{base}/api/v1/accounts/{id}/hard-quota"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "hard_byte_quota": hard_bytes,
+            "object_quota": objects,
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// 字节配额：恰好等于上限放行、超 1 字节 403（区分消息）；删除立即释放可再写。
+/// 对象数配额同理；顺带校验配置路由鉴权、边界校验与缺失账户 404。
+#[tokio::test]
+async fn hard_quota_blocks_writes_and_delete_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let probe = st.clone();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_ok(&base, "erik", "pw").await;
+    let client = reqwest::Client::new();
+
+    let id = create_account(&base, &admin, "hard", None).await;
+    let uid = account_users(&base, &admin, &id, "gina").await;
+    let gina = login_ok(&base, "gina", "gina-password").await;
+    let created = client
+        .post(format!("{base}/api/v1/buckets"))
+        .bearer_auth(&gina)
+        .json(&serde_json::json!({ "name": "hard-one" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 204, "建桶 hard-one");
+
+    let (ak, sk) = ("AKIDHARDQUOTA0000001", "sk-hard-quota-00000000001");
+    probe.db.create_access_key(ak, sk, uid).await.unwrap();
+
+    assert_eq!(
+        set_hard_quota(&base, &admin, &id, Some(10), None)
+            .await
+            .status(),
+        204
+    );
+    // 4 + 6 = 恰好 10 字节：两笔都放行。
+    assert_eq!(
+        s3_put(&base, "/hard-one/first.txt", ak, sk, b"abcd")
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        s3_put(&base, "/hard-one/second.txt", ak, sk, b"123456")
+            .await
+            .status(),
+        200
+    );
+    let over = s3_put(&base, "/hard-one/over.txt", ak, sk, b"x").await;
+    assert_eq!(over.status(), 403, "超出字节配额应 403");
+    let body = over.text().await.unwrap();
+    assert!(body.contains("account byte quota exceeded"), "{body}");
+
+    // 删除释放 4 字节；同键再写 4 字节回到恰好上限。
+    assert_eq!(
+        s3_delete(&base, "/hard-one/first.txt", ak, sk)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        s3_put(&base, "/hard-one/first.txt", ak, sk, b"abcd")
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        s3_put(&base, "/hard-one/over.txt", ak, sk, b"x")
+            .await
+            .status(),
+        403
+    );
+
+    // 改为对象数配额（2 个已满）：第三个 403，删一个后可写。
+    assert_eq!(
+        set_hard_quota(&base, &admin, &id, None, Some(2))
+            .await
+            .status(),
+        204
+    );
+    let over = s3_put(&base, "/hard-one/third.txt", ak, sk, b"x").await;
+    assert_eq!(over.status(), 403, "超出对象数配额应 403");
+    let body = over.text().await.unwrap();
+    assert!(body.contains("account object quota exceeded"), "{body}");
+    assert_eq!(
+        s3_delete(&base, "/hard-one/second.txt", ak, sk)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        s3_put(&base, "/hard-one/third.txt", ak, sk, b"x")
+            .await
+            .status(),
+        200,
+        "删除释放对象数后可写"
+    );
+
+    // 配置路由边界：非管理员 403、负数 400、缺失账户 404。
+    assert_eq!(
+        set_hard_quota(&base, &gina, &id, Some(1), Some(1))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        set_hard_quota(&base, &admin, &id, Some(-1), None)
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(
+        set_hard_quota(&base, &admin, "000000000099", Some(1), None)
+            .await
+            .status(),
+        404
+    );
 }

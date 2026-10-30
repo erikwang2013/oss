@@ -272,7 +272,10 @@ pub async fn schedule_tick_with(
     now: i64,
     gate: &crate::raft::LeaderGate,
 ) -> Result<usize, String> {
-    let Some(fence) = gate.epoch() else {
+    let Some(fence) = jobs
+        .schedule_fence(db, gate, now, crate::job_state::schedule_lease_ttl())
+        .await?
+    else {
         return Ok(0);
     };
     due_runs_fenced_with(jobs, db, now, fence).await

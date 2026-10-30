@@ -81,6 +81,10 @@ pub struct AccountRow {
     pub bucket_quota: Option<i64>,
     /// 软字节配额（NULL = 不限；只告警不阻写，AC-2）。
     pub soft_byte_quota: Option<i64>,
+    /// 硬字节配额（NULL/负数 = 不限；写入原子预留，删除释放）。
+    pub hard_byte_quota: Option<i64>,
+    /// 硬对象数配额（当前版本键数；NULL/负数 = 不限）。
+    pub object_quota: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub member_count: i64,
@@ -296,6 +300,8 @@ const SCHEMA_TENANCY: &str = include_str!("../migrations/0006_tenancy.sql");
 const SCHEMA_RUNSTATE: &str = include_str!("../migrations/0007_m8_runstate.sql");
 /// 审计/上传/秒传索引（2026-10-30 审计）。每次启动重放（IF NOT EXISTS）。
 const SCHEMA_HOT_INDEXES: &str = include_str!("../migrations/0008_hot_indexes.sql");
+/// 作业保留清理索引（`terminal_jobs_before` 的 state+updated_at）。每次启动重放。
+const SCHEMA_JOB_RETENTION_INDEX: &str = include_str!("../migrations/0009_job_retention_index.sql");
 
 /// 账户表已规范化（v2 回填/重写完成）。standalone 启动时写；Raft 模式由后续
 /// canonicalization worker 在 level-3 写，快照读取以本 marker 为门。
@@ -378,6 +384,9 @@ impl Db {
         sqlx::raw_sql(SCHEMA_TENANCY).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_RUNSTATE).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_HOT_INDEXES).execute(&db.pool).await?;
+        sqlx::raw_sql(SCHEMA_JOB_RETENTION_INDEX)
+            .execute(&db.pool)
+            .await?;
         db.ensure_columns_tenancy().await?;
         // M8-1：运行态表 fencing 列依赖 0003 已建表，故放在 M8/M9 重放之后。
         db.ensure_fence_columns().await?;
@@ -1046,13 +1055,25 @@ impl Db {
         Ok(())
     }
 
-    /// 多租户补列：`accounts.soft_byte_quota` 与 `audit_log` 的账户审计列。
+    /// 多租户补列：`accounts` 的软/硬配额列与 `audit_log` 的账户审计列。
     /// 老库升级 + 并发首开容忍（对方已补列视同成功）。
     async fn ensure_columns_tenancy(&self) -> Result<()> {
         self.ensure_column(
             "accounts",
             "soft_byte_quota",
             "ALTER TABLE accounts ADD COLUMN soft_byte_quota INTEGER",
+        )
+        .await?;
+        self.ensure_column(
+            "accounts",
+            "hard_byte_quota",
+            "ALTER TABLE accounts ADD COLUMN hard_byte_quota INTEGER",
+        )
+        .await?;
+        self.ensure_column(
+            "accounts",
+            "object_quota",
+            "ALTER TABLE accounts ADD COLUMN object_quota INTEGER",
         )
         .await?;
         self.ensure_column(
@@ -2305,6 +2326,123 @@ impl Db {
         Ok(true)
     }
 
+    /// 缺少账户成员行的非管理员用户（legacy 派生账户路径；worker 的修复对象）。
+    pub async fn legacy_users_missing_accounts(&self) -> Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT u.id, u.username FROM users u WHERE u.is_admin = 0 \
+             AND NOT EXISTS (SELECT 1 FROM account_members am WHERE am.uid = u.id) \
+             ORDER BY u.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get("id"), r.get("username")))
+            .collect())
+    }
+
+    /// standalone 幂等规范化（serve worker 与启动路径共用）：
+    /// 1. 全局管理员移出成员表、删除其无成员派生账户（同 backfill v2）；
+    /// 2. 为缺失成员行的非管理员补 uid 派生账户 + owner 成员（ARN 不漂移）；
+    /// 3. 无 `accounts_canonical_v1` 时写 marker（仅本事务成功后）。
+    ///
+    /// 单事务：任一用户失败全部回滚，重启/重跑安全；返回本轮新增行数。
+    /// Raft 模式不得调用（账户表经快照复制，由 leader 用既有 AccountCreate/
+    /// AccountMemberAttach 命令修复）。
+    pub async fn canonicalize_legacy_accounts_once(&self) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM account_members WHERE uid IN \
+             (SELECT id FROM users WHERE is_admin = 1)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM accounts \
+             WHERE id IN (SELECT printf('%012d', id) FROM users WHERE is_admin = 1) \
+               AND id NOT IN (SELECT account_id FROM account_members)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let users = sqlx::query(
+            "SELECT u.id, u.username FROM users u WHERE u.is_admin = 0 \
+             AND NOT EXISTS (SELECT 1 FROM account_members am WHERE am.uid = u.id) \
+             ORDER BY u.id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let ts = now();
+        let mut changed = 0usize;
+        for r in users {
+            let uid: i64 = r.get("id");
+            let username: String = r.get("username");
+            let Some(acct) = xl_s3::access::account_id_of(uid) else {
+                continue; // uid 0/越界：旧语义下也无法匹配任何账户 ARN
+            };
+            changed += sqlx::query(
+                "INSERT OR IGNORE INTO accounts \
+                 (id, name, status, admin_uid, created_at, updated_at) \
+                 VALUES (?, ?, 'active', ?, ?, ?)",
+            )
+            .bind(&acct)
+            .bind(&username)
+            .bind(uid)
+            .bind(ts)
+            .bind(ts)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() as usize;
+            changed += sqlx::query(
+                "INSERT OR IGNORE INTO account_members (account_id, uid, role, created_at) \
+                 VALUES (?, ?, 'owner', ?)",
+            )
+            .bind(&acct)
+            .bind(uid)
+            .bind(ts)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() as usize;
+        }
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+                .bind(META_ACCOUNTS_CANONICAL)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if marker.is_none() {
+            sqlx::query(
+                "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
+                 ON CONFLICT(key) DO UPDATE SET value = 'done'",
+            )
+            .bind(META_ACCOUNTS_CANONICAL)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// standalone 设置硬配额（Raft 下无复制命令，路由拒绝；见 accounts_api）。
+    /// 返回 false = 账户不存在。
+    pub async fn set_account_hard_limits(
+        &self,
+        id: &str,
+        hard_byte_quota: Option<i64>,
+        object_quota: Option<i64>,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE accounts SET hard_byte_quota = ?, object_quota = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(hard_byte_quota)
+        .bind(object_quota)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n == 1)
+    }
+
     /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。
     pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>> {
         let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
@@ -2338,6 +2476,8 @@ impl Db {
             admin_uid: r.get("admin_uid"),
             bucket_quota: r.get("bucket_quota"),
             soft_byte_quota: r.get("soft_byte_quota"),
+            hard_byte_quota: r.get("hard_byte_quota"),
+            object_quota: r.get("object_quota"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
             member_count: r.get("member_count"),
@@ -3144,17 +3284,146 @@ mod tests {
         );
     }
 
+    /// 规范化 worker 的单轮事务：管理员移出、legacy 用户补派生账户/owner 成员、
+    /// marker 与 ARN 保持；重复执行不新增行。
+    #[tokio::test]
+    async fn canonicalize_worker_creates_missing_rows_idempotently() {
+        let db = db().await;
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        let bob = db.create_user("bob", "pw", false).await.unwrap();
+        // 模拟旧库/快照带来的「用户有、账户表缺」：清空账户侧并删除 marker。
+        sqlx::query("DELETE FROM account_members")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM accounts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+            .bind(META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // 管理员旧成员行也必须被移出。
+        sqlx::query(
+            "INSERT INTO accounts (id, name, status, created_at, updated_at) \
+             VALUES (?, 'root', 'active', 0, 0)",
+        )
+        .bind(xl_s3::access::account_id_of(admin).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_members (account_id, uid, role, created_at) \
+             VALUES (?, ?, 'owner', 0)",
+        )
+        .bind(xl_s3::access::account_id_of(admin).unwrap())
+        .bind(admin)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let changed = db.canonicalize_legacy_accounts_once().await.unwrap();
+        assert_eq!(changed, 4, "两个用户各新增账户+成员");
+        assert!(db.accounts_canonical().await.unwrap());
+        for (uid, name) in [(alice, "alice"), (bob, "bob")] {
+            let acct = xl_s3::access::account_id_of(uid).unwrap();
+            assert_eq!(
+                db.member_role(&acct, uid).await.unwrap().as_deref(),
+                Some("owner")
+            );
+            assert!(
+                xl_s3::access::account_arn_matches(&format!("arn:aws:iam::{acct}:root"), uid),
+                "{name} ARN 漂移"
+            );
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE uid = ?")
+            .bind(admin)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "管理员成员行必须移除");
+
+        // 重跑：0 新增，行数不变。
+        assert_eq!(db.canonicalize_legacy_accounts_once().await.unwrap(), 0);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// 部分失败：事务回滚（无半套行、marker 不提前写）；修复后重跑成功。
+    #[tokio::test]
+    async fn canonicalize_worker_partial_failure_rolls_back_and_reruns() {
+        let db = db().await;
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        let bob = db.create_user("bob", "pw", false).await.unwrap();
+        sqlx::query("DELETE FROM account_members")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM accounts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+            .bind(META_ACCOUNTS_CANONICAL)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // 第二个用户的成员插入失败（模拟磁盘/约束故障）。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER fail_canonical BEFORE INSERT ON account_members \
+             WHEN NEW.uid = {bob} BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        )))
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db.canonicalize_legacy_accounts_once().await.is_err());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_members")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "失败轮不得留下半套成员行");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "失败轮不得留下半套账户行");
+        assert!(!db.accounts_canonical().await.unwrap(), "marker 不得提前写");
+
+        sqlx::query("DROP TRIGGER fail_canonical")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(db.canonicalize_legacy_accounts_once().await.unwrap(), 4);
+        assert!(db.accounts_canonical().await.unwrap());
+        for uid in [alice, bob] {
+            let acct = xl_s3::access::account_id_of(uid).unwrap();
+            assert_eq!(
+                db.member_role(&acct, uid).await.unwrap().as_deref(),
+                Some("owner")
+            );
+        }
+    }
+
     /// Task 1：0006 的用量表与 tenancy 补列在 connect 后就位（老库升级同样幂等）。
     #[tokio::test]
     async fn tenancy_schema_and_columns_exist() {
         let db = db().await;
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'soft_byte_quota'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(n, 1, "accounts.soft_byte_quota");
+        for col in ["soft_byte_quota", "hard_byte_quota", "object_quota"] {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = '{col}'"
+            )))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "accounts.{col}");
+        }
         for col in ["principal_account", "target_account"] {
             let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = '{col}'"
@@ -7104,6 +7373,26 @@ mod argon2_tests {
                 .await
                 .unwrap();
         assert_eq!(stored, legacy, "Raft 模式不得本地重写旧口令哈希");
+    }
+
+    /// 保留清理查询走 0009 的 `(state, updated_at)` 覆盖索引（不满表扫）。
+    #[tokio::test]
+    async fn terminal_jobs_before_uses_retention_index() {
+        let db = db().await;
+        let rows = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT id FROM jobs WHERE state IN ('done','error','cancelled') \
+             AND updated_at < ? ORDER BY id LIMIT ?",
+        )
+        .bind(500i64)
+        .bind(10i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let plan: Vec<String> = rows.iter().map(|r| r.get::<String, _>("detail")).collect();
+        assert!(
+            plan.iter().any(|d| d.contains("idx_jobs_state_updated_at")),
+            "terminal_jobs_before 未使用保留索引：{plan:?}"
+        );
     }
 
     /// Level 6 独立模式保留：只按 cutoff 选终态行，limit 生效；本地事务先删

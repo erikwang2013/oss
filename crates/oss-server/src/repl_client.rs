@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -73,7 +73,8 @@ struct Remote {
     secret_key: String,
     region: String,
     /// M8 缺口 C：`max_bytes_per_sec` 的令牌桶；None = 不限速（旧行为）。
-    limiter: Option<RateLimiter>,
+    /// Arc：请求体流持有桶，跨请求共享同一份全局配额。
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 /// 令牌桶：容量 = 1 秒的量，空闲后最多攒 1 秒的突发。
@@ -120,7 +121,8 @@ impl RateLimiter {
         }
     }
 
-    /// shortcut: 对象级限速（整份配额等够再发，单对象内不成形）；需要逐块整形时升级为流式发送。
+    /// 取走 `n` 字节配额（不足则等补齐）。流式 body 每块调用一次；桶是远端全局的，
+    /// 并发请求共享同一速率。
     async fn acquire(&self, mut remaining: u64) {
         while remaining > 0 {
             remaining = self.bucket.lock().unwrap().drain(remaining, Instant::now());
@@ -132,12 +134,12 @@ impl RateLimiter {
     }
 }
 
-fn limiter_of(target: &RemoteTarget) -> Option<RateLimiter> {
+fn limiter_of(target: &RemoteTarget) -> Option<Arc<RateLimiter>> {
     target
         .max_bytes_per_sec
         // 启动期 remotes_validate 是唯一闸门（拒 <1024）；程序化构造的 Some(0) 视为不限
         .filter(|&r| r > 0)
-        .map(RateLimiter::new)
+        .map(|r| Arc::new(RateLimiter::new(r)))
 }
 
 fn remote_of(
@@ -145,7 +147,7 @@ fn remote_of(
     access_key: &str,
     secret_key: &str,
     region: &str,
-    limiter: Option<RateLimiter>,
+    limiter: Option<Arc<RateLimiter>>,
     server_name: Option<String>,
     peer: bool,
 ) -> Option<Remote> {
@@ -1126,13 +1128,8 @@ impl ReplClient {
             (remote.https, remote.host.clone(), remote.port)
         };
 
-        // M8 缺口 C：按远端独立令牌桶整形（GET/HEAD/DELETE 无 body 不限）
-        let body_len = body.len();
-        if body_len > 0
-            && let Some(l) = &remote.limiter
-        {
-            l.acquire(body_len).await;
-        }
+        // M8 缺口 C：限速在 body 流里逐块取配额（见 bytes_body/file_body）；
+        // GET/HEAD/DELETE 无 body 不整形。
         // 流式文件 body 的 SHA-256 已由调用方边写边算（SigV4 要求预先给出）。
         let payload_hex = body.sha256_hex();
         let amz = amz_date_now()?;
@@ -1192,16 +1189,27 @@ impl ReplClient {
             port,
             server_name: remote.server_name.clone(),
         };
+        let limiter = remote.limiter.clone();
         match body {
-            OutBody::Bytes(bytes) => {
+            // 无 body 保持 Full（不发 content-length）。
+            OutBody::Bytes(bytes) if bytes.is_empty() => {
                 let req = req
                     .body(Full::new(bytes))
                     .map_err(|e| ReplError::permanent(format!("请求构造失败：{e}")))?;
                 self.dispatch(ctx, req).await
             }
+            OutBody::Bytes(bytes) => {
+                let len = bytes.len();
+                let body = StreamBody::new(bytes_body(bytes, limiter));
+                let req = req
+                    .header("content-length", len.to_string())
+                    .body(body)
+                    .map_err(|e| ReplError::permanent(format!("请求构造失败：{e}")))?;
+                self.dispatch(ctx, req).await
+            }
             OutBody::File { path, size, .. } => {
                 // Content-Length 显式给出：hyper 才能用定长 body（S3 不依赖 chunked）。
-                let body = file_body(path, size).await?;
+                let body = file_body(path, size, limiter).await?;
                 let req = req
                     .header("content-length", size.to_string())
                     .body(body)
@@ -1271,13 +1279,6 @@ enum OutBody {
 }
 
 impl OutBody {
-    fn len(&self) -> u64 {
-        match self {
-            OutBody::Bytes(b) => b.len() as u64,
-            OutBody::File { size, .. } => *size,
-        }
-    }
-
     fn sha256_hex(&self) -> String {
         match self {
             OutBody::Bytes(b) => hex::encode(sha2::Sha256::digest(b)),
@@ -1293,10 +1294,36 @@ struct SendCtx {
     server_name: Option<String>,
 }
 
-/// 暂存文件 → hyper body 流（256 KiB 块；不整份驻留内存）。
+/// 请求体块大小（流式整形/暂存文件共用；不整份驻留内存）。
+const BODY_CHUNK: usize = 256 * 1024;
+
+/// 整块 Bytes → 分块 hyper body：每块发送前从远端令牌桶取配额。
+/// `Bytes::slice` 共享底层缓冲，不复制；桶是跨请求共享的远端全局配额。
+fn bytes_body(
+    bytes: Bytes,
+    limiter: Option<Arc<RateLimiter>>,
+) -> impl futures::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + 'static {
+    futures::stream::unfold((bytes, 0usize), move |(bytes, off)| {
+        let limiter = limiter.clone();
+        async move {
+            let end = (off + BODY_CHUNK).min(bytes.len());
+            if off >= end {
+                return None;
+            }
+            let chunk = bytes.slice(off..end);
+            if let Some(l) = &limiter {
+                l.acquire(chunk.len() as u64).await;
+            }
+            Some((Ok(Frame::data(chunk)), (bytes, end)))
+        }
+    })
+}
+
+/// 暂存文件 → hyper body 流（256 KiB 块，每块先取限速配额；不整份驻留内存）。
 async fn file_body(
     path: PathBuf,
     size: u64,
+    limiter: Option<Arc<RateLimiter>>,
 ) -> Result<
     StreamBody<impl futures::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + 'static>,
     ReplError,
@@ -1307,15 +1334,21 @@ async fn file_body(
     if f.metadata().await.map(|m| m.len()).unwrap_or(size) != size {
         return Err(ReplError::permanent("tier 暂存文件长度与声明不符"));
     }
-    let stream = futures::stream::try_unfold(f, |mut f| async move {
-        let mut buf = vec![0u8; 256 * 1024];
-        match f.read(&mut buf).await {
-            Ok(0) => Ok(None),
-            Ok(n) => {
-                buf.truncate(n);
-                Ok(Some((Frame::data(Bytes::from(buf)), f)))
+    let stream = futures::stream::try_unfold(f, move |mut f| {
+        let limiter = limiter.clone();
+        async move {
+            let mut buf = vec![0u8; BODY_CHUNK];
+            match f.read(&mut buf).await {
+                Ok(0) => Ok(None),
+                Ok(n) => {
+                    if let Some(l) = &limiter {
+                        l.acquire(n as u64).await;
+                    }
+                    buf.truncate(n);
+                    Ok(Some((Frame::data(Bytes::from(buf)), f)))
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
         }
     });
     Ok(StreamBody::new(stream))
@@ -1513,6 +1546,43 @@ mod tests {
         // 未配置 limit → 无桶
         let c = ReplClient::new(&[target("r3", None)]);
         assert!(c.remotes["r3"].limiter.is_none());
+    }
+
+    /// 流式整形：块大小有界、逐块扣全局桶；首块不得等待整对象配额。
+    #[tokio::test]
+    async fn bytes_body_streams_per_chunk() {
+        use http_body_util::BodyExt;
+        // 3 MB > 1 秒配额（1 MB/s）：整对象预等会先睡 ~2 秒；逐块整形首块立即可发。
+        let limiter = Arc::new(RateLimiter::new(1_000_000));
+        let body = Bytes::from(vec![1u8; 3_000_000]);
+        let mut stream = StreamBody::new(Box::pin(bytes_body(
+            body.clone(),
+            Some(Arc::clone(&limiter)),
+        )));
+        let first = tokio::time::timeout(Duration::from_secs(1), BodyExt::frame(&mut stream))
+            .await
+            .expect("首块不得等待整对象配额")
+            .expect("至少一块")
+            .unwrap();
+        assert!(first.data_ref().unwrap().len() <= BODY_CHUNK, "块大小无界");
+        drop(stream);
+
+        // 小体（<1 秒配额）完整读出：内容不变，桶按块扣减。
+        let limiter = Arc::new(RateLimiter::new(1_000_000));
+        let body = Bytes::from(vec![7u8; 300_000]);
+        let got = BodyExt::collect(StreamBody::new(Box::pin(bytes_body(
+            body.clone(),
+            Some(Arc::clone(&limiter)),
+        ))))
+        .await
+        .unwrap()
+        .to_bytes();
+        assert_eq!(got, body);
+        let tokens = limiter.bucket.lock().unwrap().tokens;
+        assert!(
+            (650_000.0..=750_000.0).contains(&tokens),
+            "逐块扣桶异常：{tokens}"
+        );
     }
 
     /// 远端响应是信任边界：200（忽略 Range）、Content-Range/Content-Length 不符都必须拒。

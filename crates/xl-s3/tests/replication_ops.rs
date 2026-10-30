@@ -240,6 +240,57 @@ async fn replication_api_roundtrip_and_errors() {
         "Enabled"
     );
 
+    // Tag / And 过滤器 Put → Get 回读：单标签归一为 Tag，多条件归一为 And（可再次提交）。
+    let tag = Tag {
+        key: Some("env".into()),
+        value: Some("prod".into()),
+    };
+    let mut t = rule("r1/dst", None, false);
+    t.id = Some("tag".into());
+    t.filter = Some(ReplicationRuleFilter {
+        and: None,
+        prefix: None,
+        tag: Some(tag.clone()),
+    });
+    let mut a = rule("r1/dst", None, false);
+    a.id = Some("and".into());
+    a.filter = Some(ReplicationRuleFilter {
+        and: Some(ReplicationRuleAndOperator {
+            prefix: Some("logs/".into()),
+            tags: Some(vec![tag]),
+        }),
+        prefix: None,
+        tag: None,
+    });
+    s3.put_bucket_replication(req(repl_cfg(vec![t, a])))
+        .await
+        .unwrap();
+    let got = s3
+        .get_bucket_replication(req(GetBucketReplicationInput {
+            bucket: "repapi".into(),
+            expected_bucket_owner: None,
+        }))
+        .await
+        .unwrap()
+        .output
+        .replication_configuration
+        .unwrap();
+    assert_eq!(
+        got.rules[0]
+            .filter
+            .as_ref()
+            .unwrap()
+            .tag
+            .as_ref()
+            .unwrap()
+            .key
+            .as_deref(),
+        Some("env")
+    );
+    let and = got.rules[1].filter.as_ref().unwrap().and.as_ref().unwrap();
+    assert_eq!(and.prefix.as_deref(), Some("logs/"));
+    assert_eq!(and.tags.as_ref().unwrap().len(), 1);
+
     // 未知 remote → 400
     let e = s3
         .put_bucket_replication(req(repl_cfg(vec![rule("nope/dst", None, false)])))

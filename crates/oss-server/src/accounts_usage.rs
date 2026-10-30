@@ -4,18 +4,36 @@
 //! 非当前版本与未完成 MPU）。集群模式走 `Store::list_objects` 的既有 mesh 合并列举；
 //! 丢 peer 时结果是下界（`complete=false`，头回 `partial`），不冒充精确值。
 //! 逐桶分页列举，成本 O(对象数/1000)，只读管理端点，不在 S3 热路径上。
+//! 同模块含 AC-3 硬配额配置路由（standalone 直写；Raft 无复制命令 → 501）。
 
 use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use jwt_rust::JwtPayload;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use xl_store::store::ListRequest;
 
-use crate::accounts_support::require_member;
-use crate::console::{internal_error, who};
+use std::time::Duration;
+
+use crate::accounts_support::{bad, require_member};
+use crate::console::{forbidden, internal_error, who};
 use crate::state::AppState;
+
+/// 硬配额用量采样间隔：跨节点缓存的最大陈旧度（另有写入路径 30s 惰性刷新兜底）。
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// serve worker：本节点周期重算配置了硬配额的账户用量（每节点各持本地缓存）。
+pub(crate) fn spawn_sampler(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = xl_s3::account_quota::refresh_all(state.db.pool(), &state.store).await {
+                tracing::warn!(error = %e, "账户硬配额用量采样失败（保留旧缓存）");
+            }
+            tokio::time::sleep(SAMPLE_INTERVAL).await;
+        }
+    });
+}
 
 /// 列举页大小（S3 上限；列举失败即返回 500，不完整的用量不能报 ok）。
 const MAX_KEYS: usize = 1000;
@@ -118,4 +136,63 @@ pub(crate) async fn account_usage(
             .insert("x-oss-account-soft-quota", HeaderValue::from_static(signal));
     }
     resp
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HardQuotaBody {
+    /// 必填：`null` = 取消；非负整数 = 设置（同软配额的三态语义）。
+    hard_byte_quota: serde_json::Value,
+    object_quota: serde_json::Value,
+}
+
+/// `null` → None；非负整数 → Some；其余非法。
+fn optional_limit(v: &serde_json::Value) -> Option<Option<i64>> {
+    match v {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::Number(n) => n.as_i64().filter(|q| *q >= 0).map(Some),
+        _ => None,
+    }
+}
+
+/// 硬字节/对象数配额：standalone 直写。Raft 下需要复制命令（未在本版实现，
+/// 不新增 `raft/command.rs` 变体），明确 501，绝不只改 leader 本地库。
+pub(crate) async fn set_hard_quota(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(id): Path<String>,
+    Json(body): Json<HardQuotaBody>,
+) -> Response {
+    let (_, is_admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !is_admin {
+        return forbidden("需要管理员权限");
+    }
+    let Some(hard_byte_quota) = optional_limit(&body.hard_byte_quota) else {
+        return bad("hard_byte_quota 必须 >= 0 或 null");
+    };
+    let Some(object_quota) = optional_limit(&body.object_quota) else {
+        return bad("object_quota 必须 >= 0 或 null");
+    };
+    if state.control.is_raft() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "Raft 模式硬配额配置需要复制命令（本版未提供；standalone 可用）",
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .set_account_hard_limits(&id, hard_byte_quota, object_quota)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account = %id, "设置硬配额失败");
+            internal_error()
+        }
+    }
 }
