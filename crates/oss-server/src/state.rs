@@ -16,6 +16,9 @@ pub struct AppState {
     pub tls: Arc<crate::tls::Tls>,
     pub db: Arc<Db>,
     pub store: Arc<Store>,
+    /// 审计异步批量写入（仅 serve 路径在 [`crate::cli::run`] 注入；None = 同步直写——
+    /// 测试与离线命令保持原语义）。
+    pub audit: Option<Arc<crate::audit_queue::AuditQueue>>,
     pub ingest: Arc<crate::aether::IngestSink>,
     /// 控制面（`/api/v1`）与上传口（`/aetherupload`）共用的 JWT 门面：
     /// 登录用它签发，路由层用同一实例的 `JwtLayer` 校验（跨面 token 因此天然互通）。
@@ -760,7 +763,12 @@ impl AppState {
 
     /// 三面共用的判权实例（Task 9：集群时自动带读扇出；SQL 唯一事实源在 xl-s3::Acl）。
     pub fn acl(&self) -> xl_s3::access::Acl {
-        xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
+        let acl = xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh());
+        let sink = self
+            .audit
+            .clone()
+            .map(|q| q as Arc<dyn xl_s3::access::AuditSink>);
+        acl.with_audit_sink(sink)
     }
 
     /// M8 S6：控制面写操作审计（best-effort——落行失败只 warn，绝不改变动作结果）。
@@ -1031,6 +1039,7 @@ impl AppState {
             tls,
             db,
             store,
+            audit: None,
             ingest,
             jwt,
             login_limiter,

@@ -5649,6 +5649,85 @@ impl Db {
             .collect())
     }
 
+    /// 作业历史保留（feature 6）：`cutoff` 之前进入终态、按 id 升序的作业 id（最多
+    /// `limit` 条）。只返回终态，调用方无需再筛 queued/running/preempted。
+    pub async fn terminal_jobs_before(&self, cutoff: i64, limit: i64) -> Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE state IN ('done','error','cancelled') \
+             AND updated_at < ? ORDER BY id LIMIT ?",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// 单机保留清理：一个事务内删除终态作业历史，返回删除的 jobs 行数。
+    pub async fn purge_terminal_jobs_local(&self, ids: &[i64]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let (deleted, _) = {
+            let mut cw = crate::raft::apply::control_tx(&mut tx);
+            Self::purge_terminal_jobs_raw(&mut cw, ids).await?
+        };
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// 保留清理的共享 SQL（standalone 事务 / Raft apply 事务）。只删除当前仍为终态的
+    /// jobs 及其 job_tasks；先解除 inventory_runs/tier_restores/`parent_job_id` 的引用，
+    /// 否则 `RunState::validate` 会因悬空引用拒绝之后的快照安装。返回 (删除行数,
+    /// 存在但非终态的 id 数)；非终态行永不删除。
+    pub(crate) async fn purge_terminal_jobs_raw(
+        cw: &mut ControlWrite<'_>,
+        ids: &[i64],
+    ) -> Result<(u64, usize)> {
+        let mut q = Self::id_list_query("SELECT id, state FROM jobs WHERE id IN (", ids);
+        let rows: Vec<(i64, String)> = q.build_query_as().fetch_all(&mut *cw.conn()).await?;
+        let mut terminal: Vec<i64> = rows
+            .iter()
+            .filter(|(_, state)| matches!(state.as_str(), "done" | "error" | "cancelled"))
+            .map(|(id, _)| *id)
+            .collect();
+        terminal.sort_unstable();
+        let non_terminal = rows.len() - terminal.len();
+        if terminal.is_empty() {
+            return Ok((0, non_terminal));
+        }
+        for prefix in [
+            "UPDATE inventory_runs SET job_id = NULL WHERE job_id IN (",
+            "UPDATE tier_restores SET job_id = NULL WHERE job_id IN (",
+            "UPDATE jobs SET parent_job_id = NULL WHERE parent_job_id IN (",
+            "DELETE FROM job_tasks WHERE job_id IN (",
+        ] {
+            Self::id_list_query(prefix, &terminal)
+                .build()
+                .execute(&mut *cw.conn())
+                .await?;
+        }
+        let deleted = Self::id_list_query(
+            "DELETE FROM jobs WHERE state IN ('done','error','cancelled') AND id IN (",
+            &terminal,
+        )
+        .build()
+        .execute(&mut *cw.conn())
+        .await?
+        .rows_affected();
+        Ok((deleted, non_terminal))
+    }
+
+    /// `prefix ?, ?, ... )`：占位符数 = `ids.len()`（调用方保证非空）。
+    fn id_list_query(prefix: &str, ids: &[i64]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+        let mut qb = sqlx::QueryBuilder::new(prefix.to_string());
+        {
+            let mut sep = qb.separated(", ");
+            for id in ids {
+                sep.push_bind(*id);
+            }
+        }
+        qb.push(")");
+        qb
+    }
+
     // ——— M8 S5：Inventory 配置与运行行 ———
 
     pub async fn inventory_config_count(&self, bucket: &str) -> Result<i64> {
@@ -7025,5 +7104,67 @@ mod argon2_tests {
                 .await
                 .unwrap();
         assert_eq!(stored, legacy, "Raft 模式不得本地重写旧口令哈希");
+    }
+
+    /// Level 6 独立模式保留：只按 cutoff 选终态行，limit 生效；本地事务先删
+    /// task 再删 job，非终态行与其 task 永不受影响；重复清理幂等。
+    #[tokio::test]
+    async fn purge_terminal_jobs_local_removes_only_old_terminal_rows() {
+        let db = db().await;
+        for (id, state, updated_at) in [
+            (1, "done", 100),
+            (2, "error", 100),
+            (3, "cancelled", 100),
+            (4, "running", 100),
+            (5, "done", 900),
+            (6, "queued", 100),
+        ] {
+            sqlx::query(
+                "INSERT INTO jobs (id, kind, state, created_at, updated_at) \
+                 VALUES (?, 'lifecycle', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(state)
+            .bind(updated_at)
+            .bind(updated_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state) \
+                 VALUES (?, 1, 'a', '{}', 'done')",
+            )
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.terminal_jobs_before(500, 10).await.unwrap(),
+            vec![1, 2, 3],
+            "只选 cutoff 之前的终态行"
+        );
+        assert_eq!(
+            db.terminal_jobs_before(500, 2).await.unwrap(),
+            vec![1, 2],
+            "LIMIT 生效"
+        );
+        assert_eq!(db.purge_terminal_jobs_local(&[4, 6]).await.unwrap(), 0);
+        let ids = db.terminal_jobs_before(500, 10).await.unwrap();
+        assert_eq!(db.purge_terminal_jobs_local(&ids).await.unwrap(), 3);
+        assert_eq!(db.purge_terminal_jobs_local(&ids).await.unwrap(), 0);
+
+        let jobs: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, vec![4, 5, 6]);
+        let task_jobs: Vec<i64> =
+            sqlx::query_scalar("SELECT DISTINCT job_id FROM job_tasks ORDER BY job_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(task_jobs, vec![4, 5, 6]);
     }
 }

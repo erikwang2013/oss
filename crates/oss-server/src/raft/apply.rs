@@ -14,7 +14,9 @@ mod accounts;
 pub(crate) mod inventory;
 pub(crate) mod lifecycle;
 
-use super::command::{ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits};
+use super::command::{
+    ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
+};
 use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
@@ -794,6 +796,8 @@ pub(crate) async fn apply_command(
             stage,
             fence_term,
         } => lifecycle::clear(cw, bucket, rule_id, stage, *fence_term).await?,
+        // M8-2 level 6：作业历史保留（只删终态行；见 [`purge_jobs`]）。
+        ControlCommand::JobPurge { job_ids } => purge_jobs(cw, job_ids).await?,
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
             sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
@@ -1245,6 +1249,27 @@ async fn apply_job_batch(
     Ok(ControlResponse::Ok)
 }
 
+/// level 6 作业历史保留：只删除当前仍为终态的 jobs 及其 job_tasks，并解除
+/// inventory_runs/tier_restores/`parent_job_id` 引用（保持 `RunState::validate` 无悬空）。
+/// 响应语义（确定，不随副本变化）：
+/// - 至少删除一行，或所有 id 都已不存在 → `Ok`（重复 apply/已清理 = 幂等成功）；
+/// - 一行未删且仍有 id 存在（非终态）→ `Conflict`（零写入，保留 queued/running/preempted）；
+/// - 混合时终态行照删并返回 `Ok`，非终态行保留。
+async fn purge_jobs(
+    cw: &mut ControlWrite<'_>,
+    job_ids: &[i64],
+) -> Result<ControlResponse, sqlx::Error> {
+    if validate_job_purge(job_ids).is_err() {
+        return Ok(ControlResponse::Invalid);
+    }
+    let (deleted, non_terminal) = Db::purge_terminal_jobs_raw(cw, job_ids).await?;
+    Ok(if deleted > 0 || non_terminal == 0 {
+        ControlResponse::Ok
+    } else {
+        ControlResponse::Conflict
+    })
+}
+
 async fn bucket_exists_for_ap(
     cw: &mut ControlWrite<'_>,
     access_point: &str,
@@ -1404,5 +1429,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    async fn apply_committed(db: &Db, cmd: &ControlCommand) -> ControlResponse {
+        let mut tx = db.pool().begin().await.unwrap();
+        let response = {
+            let mut cw = control_tx(&mut tx);
+            apply_command(&mut cw, cmd).await.unwrap().response
+        };
+        tx.commit().await.unwrap();
+        response
+    }
+
+    /// Level 6 JobPurge：复检状态只删终态；清引用防快照校验悬挂；混合批次保留
+    /// 非终态并返回 Ok；二次 apply 幂等；空/重复输入 Invalid。
+    #[tokio::test]
+    async fn job_purge_deletes_only_terminal_jobs_and_is_idempotent() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        for (id, state, parent) in [
+            (1, "done", None),
+            (2, "running", None),
+            (3, "cancelled", None),
+            (4, "running", Some(1)),
+            (5, "error", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO jobs (id, kind, state, created_at, updated_at, parent_job_id) \
+                 VALUES (?, 'lifecycle', ?, 1, 1, ?)",
+            )
+            .bind(id)
+            .bind(state)
+            .bind(parent)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state) \
+                 VALUES (?, 1, 'a', '{}', 'done')",
+            )
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO inventory_runs (bucket, config_id, run_key, started_at, state, job_id, \
+             created_at) VALUES ('b', 'c', 'r', 1, 'done', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tier_restores (bucket, key, version_id, job_id, created_at) \
+             VALUES ('b', 'k', 'v', 3, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let purge = |ids: &[i64]| ControlCommand::JobPurge {
+            job_ids: ids.to_vec(),
+        };
+        assert_eq!(
+            apply_committed(&db, &purge(&[1, 3, 2])).await,
+            ControlResponse::Ok,
+            "混合批次：删终态、保留 running"
+        );
+        let jobs: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, vec![2, 4, 5]);
+        let task_jobs: Vec<i64> =
+            sqlx::query_scalar("SELECT DISTINCT job_id FROM job_tasks ORDER BY job_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(task_jobs, vec![2, 4, 5], "终态作业的 task 一并删除");
+        let parent: Option<i64> = sqlx::query_scalar("SELECT parent_job_id FROM jobs WHERE id = 4")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(parent, None, "被删父作业的引用必须清空");
+        let run_job: Option<i64> =
+            sqlx::query_scalar("SELECT job_id FROM inventory_runs WHERE run_key = 'r'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            run_job, None,
+            "inventory_runs.job_id 悬挂会破坏快照安装校验"
+        );
+        let restore_job: Option<i64> =
+            sqlx::query_scalar("SELECT job_id FROM tier_restores WHERE key = 'k'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            restore_job, None,
+            "tier_restores.job_id 悬挂会破坏快照安装校验"
+        );
+        crate::raft::runstate::read_runstate(db.pool())
+            .await
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        assert_eq!(
+            apply_committed(&db, &purge(&[1, 3])).await,
+            ControlResponse::Ok,
+            "二次 apply 零删除且全部 id 已不存在 → Ok"
+        );
+        assert_eq!(
+            apply_committed(&db, &purge(&[2])).await,
+            ControlResponse::Conflict,
+            "running 作业永不删除"
+        );
+        assert_eq!(
+            apply_committed(&db, &purge(&[])).await,
+            ControlResponse::Invalid
+        );
+        assert_eq!(
+            apply_committed(&db, &purge(&[2, 2])).await,
+            ControlResponse::Invalid
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE id = 2")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

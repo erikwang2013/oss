@@ -21,10 +21,12 @@ mod drives;
 pub mod ec;
 mod fsck;
 mod gc;
+mod key_cache;
 mod list;
 mod lock;
 pub(crate) mod mesh_api;
 mod mpu;
+mod mpu_index;
 mod mpu_route;
 mod put;
 mod read;
@@ -107,6 +109,13 @@ pub struct StoreConfig {
     pub cluster_deployment: bool,
     /// M3 shrink：维护模式（非 GET/HEAD/OPTIONS 503、后台 worker 全停、health 上报）。
     pub maintenance: bool,
+    /// 列举键缓存的单桶键数上限（`OSS_KEY_CACHE_MAX_KEYS`，默认 200 万）；0 = 禁用缓存。
+    /// 超过上限的桶回退逐页扫描（`OSS_LIST_MAX_KEYS` 仍生效）。
+    pub key_cache_max_keys: usize,
+    /// 全进程键缓存总量上限（`OSS_KEY_CACHE_MAX_TOTAL_KEYS`，默认 200 万）；0 = 不限。
+    pub key_cache_max_total_keys: usize,
+    /// 键缓存 TTL 秒（`OSS_KEY_CACHE_TTL_SECS`，默认 300）；0 = 不周期重建。
+    pub key_cache_ttl_secs: u64,
 }
 
 impl StoreConfig {
@@ -126,6 +135,9 @@ impl StoreConfig {
             tee_dir: None,
             cluster_deployment: false,
             maintenance: false,
+            key_cache_max_keys: env_num("OSS_KEY_CACHE_MAX_KEYS", 2_000_000),
+            key_cache_max_total_keys: env_num("OSS_KEY_CACHE_MAX_TOTAL_KEYS", 2_000_000),
+            key_cache_ttl_secs: env_num("OSS_KEY_CACHE_TTL_SECS", 300),
         }
     }
 
@@ -249,6 +261,14 @@ pub struct UploadListResult {
     pub degraded: bool,
 }
 
+/// 环境变量整型默认值（非法/缺失 → `default`）。
+fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 pub struct Store {
     cfg: StoreConfig,
     /// 进程内 per-object 互斥，`bucket/key` → 锁：同键的并发写必须串行，
@@ -265,6 +285,10 @@ pub struct Store {
     encryption: std::sync::OnceLock<crypto::EncState>,
     /// M9 S3：每桶在途写者计数 + 删桶标志（删桶 quiesce 的进程内屏障）。
     writers: Mutex<WriterState>,
+    /// 命名空间键缓存（列举加速；advisory，见 key_cache.rs）。
+    key_cache: key_cache::KeyCache,
+    /// 在途 MPU 索引（LMU 加速；advisory）。
+    mpu_index: mpu_index::MpuIndex,
 }
 
 #[derive(Default)]
@@ -534,6 +558,11 @@ impl Store {
             }
         }
 
+        let key_cache = key_cache::KeyCache::new(
+            cfg.key_cache_max_keys,
+            cfg.key_cache_max_total_keys,
+            Duration::from_secs(cfg.key_cache_ttl_secs),
+        );
         let store = Self {
             cfg,
             locks: Mutex::new(HashMap::new()),
@@ -542,6 +571,8 @@ impl Store {
             cluster_locks: Arc::new(lock::LockTable::default()),
             encryption: std::sync::OnceLock::new(),
             writers: Mutex::new(WriterState::default()),
+            key_cache,
+            mpu_index: mpu_index::MpuIndex::default(),
         };
         // 启动自检：清 tmp/trash 的崩溃残留（对象目录不碰——在途 MPU 暂存区按其 mtime 由 clean 回收）
         store.reap_transient().await?;
@@ -955,6 +986,7 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.invalidate_bucket_caches(bucket);
         Ok(())
     }
 
@@ -1011,6 +1043,7 @@ impl Store {
                 tracing::warn!(path = %dst.display(), error = %e, "sync 桶 tombstone 清理失败（留待重试）");
             }
         }
+        self.invalidate_bucket_caches(bucket);
         Ok(())
     }
 
@@ -1386,6 +1419,7 @@ impl Store {
         if self.cfg.drives.len() == 1 {
             self.write_meta_on(&self.cfg.drives[0], bucket, key, m)
                 .await?;
+            self.note_cached_key(bucket, key);
             return Ok(1);
         }
         let quorum = self.cfg.ec.data as usize + 1;
@@ -1449,6 +1483,10 @@ impl Store {
                 }
                 Err(e) => tracing::warn!(drive = %drive.display(), error = %e, "meta 翻转失败"),
             }
+        }
+        if flipped > 0 {
+            // ≥1 翻转 = 已提交（本机读扫全部副本可见）→ 键缓存增量
+            self.note_cached_key(bucket, key);
         }
         Ok(flipped)
     }
@@ -1711,6 +1749,7 @@ impl Store {
                 }
             }
         }
+        self.forget_cached_key(bucket, key);
         // ①' 集群：远端 meta 删除是可见性提交点的远端分派——**失败即上抛**（评审：
         //     best-effort 吞掉会让对象在部分节点「复活」而删除已报成功；不可达同样上抛=fail-closed）
         if let Some(cl) = self.cfg.cluster.as_deref() {
@@ -1946,6 +1985,8 @@ mod tests_cmk_rewrap;
 mod tests_crypto;
 #[cfg(test)]
 mod tests_dp1;
+#[cfg(test)]
+mod tests_key_cache;
 #[cfg(test)]
 mod tests_lock;
 #[cfg(test)]

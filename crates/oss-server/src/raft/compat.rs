@@ -30,6 +30,10 @@ pub const FEATURE_LEVEL_4: u8 = 4;
 /// 但不认识 Inventory***；level 4 挡不住它，因此必须新开 level 5。v1.23.0 及更早
 /// advertise ≤4 → effective ≤4 → Inventory* 在 append 前被拒。
 pub const FEATURE_LEVEL_5: u8 = 5;
+/// feature 6：作业历史保留（`JobPurge` 命令）。v1.24.0 及更早二进制 advertise ≤5 且
+/// 不认识该变体；level 5 挡不住它们，因此必须新开 level 6。旧节点不参与时 effective
+/// 压回 ≤5，JobPurge 在 append 前被拒。快照格式仍为 OSSCTL3（无新激活标记）。
+pub const FEATURE_LEVEL_6: u8 = 6;
 /// Level C M1 的命令演进容器（`ControlCommand::Ext`）所需级别。该级别只表示
 /// “能解码/应用 Ext 容器”，不表示认识任何 `type_id`；注册新类型必须提升 feature
 /// level 或先完成 per-peer 类型能力协商（见 `command::REGISTERED_EXT_TYPES`）。
@@ -37,7 +41,7 @@ pub const FEATURE_COMMAND_EXT: u8 = FEATURE_LEVEL_3;
 /// OSSCTL2/3 命令与快照语义的别名（保持 level 3 不变；M8-2 复制另立 level 4/5）。
 pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
 /// 本二进制支持的最高 feature level。
-pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_5;
+pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_6;
 /// 缺省/旧节点的 feature level。
 pub const MIN_FEATURE_LEVEL: u8 = 1;
 
@@ -515,13 +519,34 @@ mod tests {
             FEATURE_LEVEL_5, 5,
             "v1.23.0 已 advertise 4 且不认识 Inventory*，必须新开 5"
         );
-        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_5);
+        assert_eq!(
+            FEATURE_LEVEL_6, 6,
+            "v1.24.0 及更早 advertise ≤5 且不认识 JobPurge，必须新开 6"
+        );
+        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_6);
         assert!(supports(1));
         assert!(supports(FEATURE_STRUCTURED_LIFECYCLE));
         assert!(supports(FEATURE_COMMAND_EXT));
         assert!(supports(FEATURE_LEVEL_4));
         assert!(supports(FEATURE_LEVEL_5));
+        assert!(supports(FEATURE_LEVEL_6));
         assert!(!supports(MAX_FEATURE_LEVEL + 1));
+    }
+
+    /// JobPurge 的 append 前闸门：混版集群里只要有一个 level-5 节点，effective 就是 5，
+    /// 低于命令要求的 6（`check_feature` 因此拒绝，不写日志、不激活 marker）。
+    #[test]
+    fn job_purge_gate_rejects_level_five_cluster_before_append() {
+        let p = peers_all(7, &[1, 2], &[], 5);
+        let e = effective_feature_level(FEATURE_LEVEL_6, 1, &[1, 2], &[], 7, &p);
+        assert_eq!(e.level, 5);
+        let purge = super::super::command::ControlCommand::JobPurge { job_ids: vec![1] };
+        assert_eq!(purge.min_feature_level(), FEATURE_LEVEL_6);
+        assert!(
+            e.level < purge.min_feature_level(),
+            "level-5 节点在场时 append 前拒绝 JobPurge"
+        );
+        assert!(e.blocked_reason.unwrap().contains("voter 2"));
     }
 
     fn peers_all(term: u64, voters: &[u64], learners: &[u64], feature: u8) -> PeerVersions {
@@ -591,12 +616,17 @@ mod tests {
         assert!(guard_startup(4, 3).is_err(), "配置低于 marker 必须拒绝");
         assert!(guard_startup(5, 5).is_ok());
         assert!(guard_startup(5, 4).is_err(), "配置低于 marker 必须拒绝");
-        assert!(guard_startup(6, 5).is_err(), "未知更高 marker 必须拒绝");
-        // v1.22（max 3）遇到 marker 4、v1.23.0（max 4）遇到 marker 5 必须拒绝。
+        assert!(guard_startup(6, 6).is_ok());
+        assert!(guard_startup(6, 5).is_err(), "配置低于 marker 必须拒绝");
+        assert!(guard_startup(7, 6).is_err(), "未知更高 marker 必须拒绝");
+        // v1.22（max 3）遇到 marker 4、v1.23.0（max 4）遇到 marker 5、
+        // v1.24.0（max 5）遇到 marker 6 必须拒绝。
         assert!(guard_startup_with_max(4, 4, 3).is_err());
         assert!(guard_startup_with_max(3, 3, 3).is_ok());
         assert!(guard_startup_with_max(5, 5, 4).is_err());
         assert!(guard_startup_with_max(4, 4, 4).is_ok());
+        assert!(guard_startup_with_max(6, 6, 5).is_err());
+        assert!(guard_startup_with_max(5, 5, 5).is_ok());
     }
 
     #[tokio::test]

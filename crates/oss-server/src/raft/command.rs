@@ -335,6 +335,14 @@ pub enum ControlCommand {
         fence_term: i64,
     },
 
+    // ---- level 6: 作业历史保留 ----
+    /// 删除终态作业历史（jobs/job_tasks）。apply 复检状态：只删当前仍为终态的行，
+    /// queued/running/preempted 永不删除；不存在的 id 是幂等 no-op。
+    /// 约束见 [`validate_job_purge`]：非空、≤ [`JOB_PURGE_MAX_IDS`]、无重复。
+    JobPurge {
+        job_ids: Vec<i64>,
+    },
+
     /// S5 基座自测 KV；仅测试构建可见，生产命令集不含随机/本地状态。
     #[cfg(test)]
     Set {
@@ -360,6 +368,28 @@ pub enum ControlCommand {
 /// 能力协商。leader 在 append 前按本表 fail-closed 拒绝未注册/空/拼错的 type_id
 /// （不写日志、不激活 marker）；apply 侧未知类型的 `Invalid` 只是兜底。
 pub const REGISTERED_EXT_TYPES: &[&str] = &[];
+
+/// `JobPurge` 单条命令的 id 上限（保留 worker 每批大小）。leader append 前与 apply
+/// 兜底使用同一判据；超限命令必须整体拒绝，不能截断（截断即不同结果）。
+pub const JOB_PURGE_MAX_IDS: usize = 1000;
+
+/// [`ControlCommand::JobPurge`] 的入口约束：非空、≤ [`JOB_PURGE_MAX_IDS`]、无重复。
+pub fn validate_job_purge(job_ids: &[i64]) -> Result<(), String> {
+    if job_ids.is_empty() {
+        return Err("JobPurge: job_ids must not be empty".into());
+    }
+    if job_ids.len() > JOB_PURGE_MAX_IDS {
+        return Err(format!(
+            "JobPurge: {} job_ids exceeds limit {JOB_PURGE_MAX_IDS}",
+            job_ids.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(job_ids.len());
+    if let Some(id) = job_ids.iter().find(|id| !seen.insert(**id)) {
+        return Err(format!("JobPurge: duplicate job id {id}"));
+    }
+    Ok(())
+}
 
 /// 仅测试构建注册的探针类型（生产注册表必须保持为空）。
 #[cfg(test)]
@@ -443,6 +473,8 @@ impl ControlCommand {
             Self::LifecycleCursorUpsert { .. } | Self::LifecycleCursorClear { .. } => {
                 super::compat::FEATURE_LEVEL_5
             }
+            // v1.24.0 及更早 advertise ≤5 且 `deny_unknown_fields` 不认识 JobPurge。
+            Self::JobPurge { .. } => super::compat::FEATURE_LEVEL_6,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,
@@ -476,6 +508,19 @@ mod tests {
         assert!(!ext_type_registered("test.nop"));
         assert!(!ext_type_registered("future.demo"));
         assert!(ext_type_registered("test.noop"));
+    }
+
+    /// JobPurge 入口约束（leader append 前与 apply 兜底共用）：空/重复/超限整体拒绝。
+    #[test]
+    fn job_purge_input_is_bounded() {
+        assert!(validate_job_purge(&[1, 2]).is_ok());
+        assert!(validate_job_purge(&[]).is_err());
+        assert!(validate_job_purge(&[7, 7]).is_err());
+        let at_limit: Vec<i64> = (0..JOB_PURGE_MAX_IDS as i64).collect();
+        assert!(validate_job_purge(&at_limit).is_ok());
+        let mut over_limit = at_limit;
+        over_limit.push(JOB_PURGE_MAX_IDS as i64);
+        assert!(validate_job_purge(&over_limit).is_err());
     }
 
     /// 混版契约：`ControlResponse` 变体集合保持 v1.20/v1.21 一致（增变体会让旧副本

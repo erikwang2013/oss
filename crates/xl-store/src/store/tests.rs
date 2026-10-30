@@ -672,6 +672,75 @@ async fn zero_byte_object_inlines_even_with_zero_threshold() {
 }
 
 #[tokio::test]
+async fn stream_object_ec_is_byte_identical() {
+    // 无 Range 的全对象读走流式：EC 数据片顺序直出，多块（非整份缓冲）
+    let (s, _d) = store().await;
+    let s = std::sync::Arc::new(s);
+    s.create_bucket("alpha").await.unwrap();
+    let body = payload(300_000);
+    s.put_object("alpha", "k", body.clone(), None)
+        .await
+        .unwrap();
+    assert!(
+        read_disk_meta(&s, "alpha", "k")
+            .await
+            .latest()
+            .unwrap()
+            .data_layout
+            .is_some(),
+        "用例前提：对象必须落 EC 形态"
+    );
+
+    let (info, mut stream) = s.stream_object_ext("alpha", "k", None, None).await.unwrap();
+    assert_eq!(info.size, body.len() as u64);
+    let mut got = Vec::new();
+    let mut chunks = 0usize;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.unwrap();
+        chunks += 1;
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, &body[..]);
+    assert!(chunks > 1, "流式应分块输出（实际 {chunks} 块）");
+}
+
+#[tokio::test]
+async fn stream_object_missing_data_shard_falls_back_buffered() {
+    // 数据片在首字节前即缺失 → 回退整读（EC 重建救回），字节必须完整
+    let (s, d) = store().await;
+    let s = std::sync::Arc::new(s);
+    s.create_bucket("alpha").await.unwrap();
+    let body = payload(300_000);
+    s.put_object("alpha", "k", body.clone(), None)
+        .await
+        .unwrap();
+    let uuid = read_disk_meta(&s, "alpha", "k")
+        .await
+        .latest()
+        .unwrap()
+        .part
+        .uuid
+        .clone();
+    let shard0 = layout::object_dir(d.path(), "alpha", "k")
+        .unwrap()
+        .join(uuid)
+        .join("part.1.0");
+    tokio::fs::remove_file(&shard0).await.unwrap();
+
+    let (info, mut stream) = s.stream_object_ext("alpha", "k", None, None).await.unwrap();
+    assert_eq!(info.size, body.len() as u64);
+    let mut got = Vec::new();
+    let mut chunks = 0usize;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.unwrap();
+        chunks += 1;
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, &body[..]);
+    assert_eq!(chunks, 1, "回退整读应一次性给出（实际 {chunks} 块）");
+}
+
+#[tokio::test]
 async fn all_shards_corrupt_is_reported_as_corruption_not_404() {
     // 评审 F5：12 片全读得到但 CRC 全不符 = 真实损坏，必须走 500 谱系（CorruptMeta），
     // 不得与「全片消失」混同伪装成 404

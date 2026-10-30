@@ -1214,10 +1214,15 @@ impl Store {
         let mut keys: Vec<String> = {
             // 先按 key_marker 过滤再截断：否则 >max+1 键的桶第二页为空（本地截断早于
             // key_marker 的应用）。key_marker 本身保留（其版本链从 version_id_marker 续）。
-            let mut local: Vec<String> = self
-                .collect_keys_filtered(bucket, prefix, key_marker, false, true)
-                .await?;
-            local.truncate(max + 2);
+            // 只需 max+2 个键：缓存按批流式取，不整桶物化。
+            let mut stream = self.page_keys(bucket, prefix, key_marker, false).await?;
+            let mut local = Vec::with_capacity(max + 2);
+            while local.len() < max + 2 {
+                match stream.next() {
+                    Some(k) => local.push(k),
+                    None => break,
+                }
+            }
             local
         };
         let mut degraded = false;

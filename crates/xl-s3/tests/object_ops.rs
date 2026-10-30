@@ -5730,3 +5730,93 @@ async fn storage_class_mpu_create_validation() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn get_object_large_ec_streams_and_range_still_works() {
+    // 无 Range 的全对象 GET 走存储流（EC 数据片顺序直出）；Range/条件语义保持
+    let (s3, _d) = service().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "alpha".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let content: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
+    // > 128KiB 内联阈值 → EC 形态
+    s3.put_object(req(PutObjectInput {
+        bucket: "alpha".into(),
+        key: "big".into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from(content.clone()))),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let out = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "big".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(out.content_length, Some(content.len() as i64));
+    let mut body = out.body.unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, content);
+
+    // Range 仍走有界缓冲，字节与 Content-Range 不变
+    let resp = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "big".into(),
+            range: Some(Range::Int {
+                first: 1000,
+                last: Some(1999),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, Some(http::StatusCode::PARTIAL_CONTENT));
+    assert_eq!(
+        resp.output.content_range,
+        Some(format!("bytes 1000-1999/{}", content.len()))
+    );
+    let mut body = resp.output.body.unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, &content[1000..2000]);
+
+    // 条件头对同一份流式 info 复核：If-None-Match 命中 → 304
+    let etag = s3
+        .head_object(req(HeadObjectInput {
+            bucket: "alpha".into(),
+            key: "big".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .e_tag
+        .unwrap();
+    let not_modified = s3
+        .get_object(req(GetObjectInput {
+            bucket: "alpha".into(),
+            key: "big".into(),
+            if_none_match: Some(ETagCondition::ETag(etag)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(not_modified.status, Some(http::StatusCode::NOT_MODIFIED));
+    assert!(not_modified.output.body.is_none(), "304 不得带 body");
+}

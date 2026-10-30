@@ -15,6 +15,16 @@ use crate::meta::{self, ChecksumRecord, PartRef, Version, XlMeta};
 
 use super::{ByteStream, ObjectInfo, Store, VersioningMode, drives, ec, now_nanos};
 
+/// 多盘/集群落分片的 sink（每块每片一个；Dead = 该片已作废）。
+enum ShardSink {
+    Local {
+        f: tokio::fs::File,
+        dir: std::path::PathBuf,
+    },
+    Remote(String),
+    Dead,
+}
+
 /// 散读一块（M4 切片 2）：段式布局下第 i 片第 t 块的输入 = payload `[i·ss + t·W, +W)`
 /// （越界补零）。单盘/多盘两条分块写路径共用；内存 = data×W。
 async fn gather_block(
@@ -315,6 +325,64 @@ impl Store {
         Ok((size, etag, sha256, data_layout, inline))
     }
 
+    /// 单块写一个分片 sink（本地写 + fsync / 远端分块 RPC）。顺序与并发路径共用。
+    #[allow(clippy::too_many_arguments)]
+    async fn write_stage_shard_chunk(
+        &self,
+        sink: &mut ShardSink,
+        chunk: &[u8],
+        i: usize,
+        is_final: bool,
+        bucket: &str,
+        key: &str,
+        uuid: &str,
+        slots: &[u16],
+        set: u16,
+        t: u64,
+    ) -> Result<()> {
+        match sink {
+            ShardSink::Dead => Err(Error::QuorumUnmet("槽位不在册（跳过）".into())),
+            ShardSink::Local { f, dir } => {
+                f.write_all(chunk).await?;
+                if is_final {
+                    f.flush().await?;
+                    if self.cfg.fsync {
+                        f.sync_all().await?;
+                        // 版本目录 fsync：分片目录项先于 meta 翻转持久（否则断电后 meta 存在而目录项丢失）
+                        Store::sync_dir(dir).await;
+                    }
+                }
+                Ok(())
+            }
+            ShardSink::Remote(node) => match self.mesh_transport() {
+                Some(tp) => {
+                    tp.write_shard(
+                        node,
+                        crate::mesh::ShardWrite {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            uuid: uuid.into(),
+                            part: 1,
+                            shard: i as u32,
+                            crc32c: 0,
+                            data: bytes::Bytes::copy_from_slice(chunk),
+                            chunked: true,
+                            offset: t * ec::CHUNK_W as u64,
+                            chunk_crc32c: ec::crc32c_of(chunk),
+                            is_final,
+                            // M4 切片 5：携带槽位（服务端只校验归属，不重算放置）
+                            slot: slots[i] as u32,
+                            // M4 切片 8：携带 set（服务端按 sets[set] 校验 + flat_of 拼路径）
+                            set: set as u32,
+                        },
+                    )
+                    .await
+                }
+                None => Err(Error::Encode("集群模式未注入 transport".into())),
+            },
+        }
+    }
+
     /// 多盘落盘（M2b-2）：与前段共用 `harvest_body`（仍在 drives[0] 的 tmp 里收全 + 哈希），
     /// 转换阶段**分片直写目标盘的版本目录**——`<drives[i%n]>/<bucket>/<展键>/<uuid>/part.1.<i>`，
     /// 每片 fsync。数据先于 meta 落位，未提交（meta 未翻转）前不可见；无需跨盘 rename。
@@ -377,14 +445,6 @@ impl Store {
         let mut w = ec::ChunkWriter::new(self.cfg.ec)?;
         let mut src = tokio::fs::File::open(&part_path).await?;
 
-        enum Sink {
-            Local {
-                f: tokio::fs::File,
-                dir: std::path::PathBuf,
-            },
-            Remote(String),
-            Dead,
-        }
         let quorum = self.cfg.ec.data as usize + 1;
         // 测试专用断电注入（Task 9）：第 N 片写完最后一块后 abort()（SIGABRT），复现「提交点前猝死」。
         // 仅环境变量在场时生效；生产部署不设此变量 = 每块多一次 Option 比较，零行为影响。
@@ -395,7 +455,7 @@ impl Store {
         let place_hash = Store::placement_hash(bucket, key);
         // M4 切片 8：桶所属 set（多 set 一次解析、全线透传；fail-closed 见 Store::set_of_bucket）
         let set = self.set_of_bucket(bucket).await?;
-        let mut sinks: Vec<Sink> = Vec::with_capacity(total);
+        let mut sinks: Vec<ShardSink> = Vec::with_capacity(total);
         let mut touched: Vec<u16> = Vec::new();
         let mut slots: Vec<u16> = Vec::with_capacity(total);
         // ok[i] = 该片当前仍完整（任一块失败即 false）
@@ -408,7 +468,7 @@ impl Store {
                     // 存活探测（掉线盘的挂载点目录仍在父 fs 上，盲写会填满根盘且误报成功）
                     if !drives::drive_up(drive).await {
                         tracing::warn!(slot, shard = i, "槽位不在册（跳过）");
-                        sinks.push(Sink::Dead);
+                        sinks.push(ShardSink::Dead);
                         false
                     } else {
                         touched.push(slot);
@@ -420,12 +480,12 @@ impl Store {
                         .await;
                         match opened {
                             Ok(f) => {
-                                sinks.push(Sink::Local { f, dir });
+                                sinks.push(ShardSink::Local { f, dir });
                                 true
                             }
                             Err(e) => {
                                 tracing::warn!(slot, shard = i, error = %e, "本地分片文件打开失败（该片作废）");
-                                sinks.push(Sink::Dead);
+                                sinks.push(ShardSink::Dead);
                                 false
                             }
                         }
@@ -436,12 +496,12 @@ impl Store {
                         return Err(Error::Encode("集群模式未注入 transport".into()));
                     }
                     touched.push(slot);
-                    sinks.push(Sink::Remote(node.to_string()));
+                    sinks.push(ShardSink::Remote(node.to_string()));
                     true
                 }
                 None => {
                     tracing::warn!(slot, "槽位越界（跳过）");
-                    sinks.push(Sink::Dead);
+                    sinks.push(ShardSink::Dead);
                     false
                 }
             };
@@ -455,63 +515,58 @@ impl Store {
             };
             let out = w.encode_block(&ins)?;
             let is_final = t + 1 == blocks;
-            for (i, chunk) in out.iter().enumerate() {
-                if !ok[i] {
-                    continue;
-                }
-                let res: Result<()> = match &mut sinks[i] {
-                    Sink::Dead => Err(Error::QuorumUnmet("槽位不在册（跳过）".into())),
-                    Sink::Local { f, dir } => {
-                        async {
-                            f.write_all(chunk).await?;
-                            if is_final {
-                                f.flush().await?;
-                                if self.cfg.fsync {
-                                    f.sync_all().await?;
-                                    // 版本目录 fsync：分片目录项先于 meta 翻转持久（否则断电后 meta 存在而目录项丢失）
-                                    Store::sync_dir(dir).await;
-                                }
-                            }
-                            Ok(())
-                        }
-                        .await
+            if abort_after.is_some() {
+                // 断电注入测试要求精确的逐片顺序/中止点：保留顺序路径。
+                for (i, chunk) in out.iter().enumerate() {
+                    if !ok[i] {
+                        continue;
                     }
-                    Sink::Remote(node) => {
-                        // 远程落块（幂等）：服务端逐块验 CRC 再定位写；失败按 quorum 计数消化
-                        match self.mesh_transport() {
-                            Some(tp) => {
-                                tp.write_shard(
-                                    node,
-                                    crate::mesh::ShardWrite {
-                                        bucket: bucket.into(),
-                                        key: key.into(),
-                                        uuid: uuid.into(),
-                                        part: 1,
-                                        shard: i as u32,
-                                        crc32c: 0,
-                                        data: bytes::Bytes::copy_from_slice(chunk),
-                                        chunked: true,
-                                        offset: t * ec::CHUNK_W as u64,
-                                        chunk_crc32c: ec::crc32c_of(chunk),
-                                        is_final,
-                                        // M4 切片 5：携带槽位（服务端只校验归属，不重算放置）
-                                        slot: slots[i] as u32,
-                                        // M4 切片 8：携带 set（服务端按 sets[set] 校验 + flat_of 拼路径）
-                                        set: set as u32,
-                                    },
+                    let res = self
+                        .write_stage_shard_chunk(
+                            &mut sinks[i],
+                            chunk,
+                            i,
+                            is_final,
+                            bucket,
+                            key,
+                            uuid,
+                            &slots,
+                            set,
+                            t,
+                        )
+                        .await;
+                    if let Err(e) = res {
+                        tracing::warn!(slot = slots[i], shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
+                        ok[i] = false;
+                    }
+                    if abort_after == Some(i) && is_final {
+                        std::process::abort();
+                    }
+                }
+            } else {
+                // 分片写是独立目标（本地盘/远端 RPC），逐片 await 会让集群写吞吐 ≈ 1/RTT。
+                let writes = out.iter().zip(sinks.iter_mut()).enumerate().filter_map(
+                    |(i, (chunk, sink))| {
+                        if !ok[i] {
+                            return None;
+                        }
+                        let slots = slots.clone();
+                        Some(async move {
+                            (
+                                i,
+                                self.write_stage_shard_chunk(
+                                    sink, chunk, i, is_final, bucket, key, uuid, &slots, set, t,
                                 )
-                                .await
-                            }
-                            None => Err(Error::Encode("集群模式未注入 transport".into())),
-                        }
+                                .await,
+                            )
+                        })
+                    },
+                );
+                for (i, res) in futures::future::join_all(writes).await {
+                    if let Err(e) = res {
+                        tracing::warn!(slot = slots[i], shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
+                        ok[i] = false;
                     }
-                };
-                if let Err(e) = res {
-                    tracing::warn!(slot = slots[i], shard = i, block = t, error = %e, "分块落盘失败（该片作废，quorum 计数中）");
-                    ok[i] = false;
-                }
-                if abort_after == Some(i) && is_final {
-                    std::process::abort();
                 }
             }
         }

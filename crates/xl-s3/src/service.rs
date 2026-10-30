@@ -494,6 +494,25 @@ fn last_modified(nanos: i64) -> LastModified {
     LastModified::from(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos.max(0) as u64))
 }
 
+/// GET 响应体：Range/partNumber 仍整块缓冲；无 Range 走存储流（常量内存，无缓冲上限）。
+enum GetBody {
+    Bytes(Bytes),
+    Stream(xl_store::store::ByteStream),
+}
+
+/// xl-store 的流只保证 `Send`；s3s 的 `StreamingBlob` 要求 `Send + Sync`。
+/// 锁只包住一次非阻塞 poll（不跨 poll 持锁），无需 unsafe。
+struct SyncStream(std::sync::Mutex<xl_store::store::ByteStream>);
+
+impl futures::Stream for SyncStream {
+    type Item = Result<Bytes, xl_store::error::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut inner = self.get_mut().0.lock().unwrap_or_else(|e| e.into_inner());
+        inner.as_mut().poll_next(cx)
+    }
+}
+
 /// 流上限包装：累计超限置 `exceeded`、读取出错置 `body_err`——随后由 [`stream_err_to_s3`]
 /// 换成稳定错误码（不把 413 / IncompleteBody 的语义沉进内核错误类型）。
 type LimitedStream =
@@ -1962,9 +1981,9 @@ impl S3 for OssS3 {
         }
 
         // partNumber → 段区间读（206 + Content-Range + parts_count）；Range → 有界读 +
-        // 206/416；无 Range → 整读 + 200。三条路共用同一份响应组装。
+        // 206/416；无 Range → 存储流直出 + 200。三条路共用同一份响应组装。
         let mut parts_count = None;
-        let (bytes, content_range, status, info) = if let Some(pn) = part_number {
+        let (body, content_range, status, info) = if let Some(pn) = part_number {
             let (part_info, bytes, span, n) = self
                 .store
                 .get_object_part_ext(&bucket, &key, version_id.as_deref(), pn, sse.key.as_ref())
@@ -1972,7 +1991,12 @@ impl S3 for OssS3 {
                 .map_err(to_s3_error)?;
             parts_count = Some(n as i32);
             let cr = format!("bytes {}-{}/{}", span.start, span.end - 1, part_info.size);
-            (bytes, Some(cr), StatusCode::PARTIAL_CONTENT, part_info)
+            (
+                GetBody::Bytes(bytes),
+                Some(cr),
+                StatusCode::PARTIAL_CONTENT,
+                part_info,
+            )
         } else {
             match req.input.range {
                 Some(range) => {
@@ -1997,7 +2021,12 @@ impl S3 for OssS3 {
                     };
                     if let Some(b) = direct {
                         let cr = format!("bytes {}-{}/{}", start, end - 1, head.size);
-                        (b, Some(cr), StatusCode::PARTIAL_CONTENT, head.clone())
+                        (
+                            GetBody::Bytes(b),
+                            Some(cr),
+                            StatusCode::PARTIAL_CONTENT,
+                            head.clone(),
+                        )
                     } else {
                         // 始终用区间读的返回值：显式全段 Range 也走这里，避免 head 的
                         // 旧 size 与并发改写后的 body 不一致。
@@ -2027,24 +2056,22 @@ impl S3 for OssS3 {
                         .map_err(to_s3_error)?;
                         // check 保证 end >= 1（start <= last < full_length 且区间非空）
                         let cr = format!("bytes {}-{}/{}", start, end - 1, read_info.size);
-                        (bytes, Some(cr), StatusCode::PARTIAL_CONTENT, read_info)
+                        (
+                            GetBody::Bytes(bytes),
+                            Some(cr),
+                            StatusCode::PARTIAL_CONTENT,
+                            read_info,
+                        )
                     }
                 }
                 None => {
-                    let (read_info, bytes) = match &version_id {
-                        Some(v) => {
-                            self.store
-                                .get_object_version_ext(&bucket, &key, v, sse.key.as_ref())
-                                .await
-                        }
-                        None => {
-                            self.store
-                                .get_object_ext(&bucket, &key, sse.key.as_ref())
-                                .await
-                        }
-                    }
-                    .map_err(to_s3_error)?;
-                    (bytes, None, StatusCode::OK, read_info)
+                    // 无 Range：流式直出（EC 数据片顺序 / 旧 parts 块读），不再整份进内存
+                    let (read_info, stream) = self
+                        .store
+                        .stream_object_ext(&bucket, &key, version_id.as_deref(), sse.key.as_ref())
+                        .await
+                        .map_err(to_s3_error)?;
+                    (GetBody::Stream(stream), None, StatusCode::OK, read_info)
                 }
             }
         };
@@ -2060,7 +2087,15 @@ impl S3 for OssS3 {
         }
         // M8 S4b：过期恢复兜底回收（GET 已按实际版本校验；回收失败留给 reaper）。
         self.cleanup_expired_restore(&bucket, &key, &info).await;
-        let len = bytes.len() as i64;
+        let len = match &body {
+            GetBody::Bytes(b) => b.len() as i64,
+            // 流式 body 的契约：恰 info.size 字节（流中失败报错，不截断）
+            GetBody::Stream(_) => info.size as i64,
+        };
+        let body = match body {
+            GetBody::Bytes(b) => StreamingBlob::from_bytes(b),
+            GetBody::Stream(s) => StreamingBlob::wrap(SyncStream(std::sync::Mutex::new(s))),
+        };
         let restore = restore_header(&info);
         // 读路径补全：成功 200/206 才发（304/416/错误已在上面提前返回）
         self.emit(
@@ -2075,7 +2110,7 @@ impl S3 for OssS3 {
         .await;
 
         let mut out = GetObjectOutput {
-            body: Some(StreamingBlob::from_bytes(bytes)),
+            body: Some(body),
             content_length: Some(len),
             content_type: info.content_type,
             e_tag: Some(ETag::Strong(info.etag)),
@@ -4296,19 +4331,12 @@ impl S3 for OssS3 {
             }
         }
 
-        // 源：点名版本（回滚路径）或最新
-        let (src_info, bytes) = match version_id.as_deref() {
-            Some(vid) => self
-                .store
-                .get_object_version_ext(bucket, key, vid, src_sse.key.as_ref())
-                .await
-                .map_err(to_s3_error)?,
-            None => self
-                .store
-                .get_object_ext(bucket, key, src_sse.key.as_ref())
-                .await
-                .map_err(to_s3_error)?,
-        };
+        // 源：点名版本（回滚路径）或最新；流式读（源与目标同键也安全：提交点在收全之后）
+        let (src_info, src_stream) = self
+            .store
+            .stream_object_ext(bucket, key, version_id.as_deref(), src_sse.key.as_ref())
+            .await
+            .map_err(to_s3_error)?;
         // M8 S4a：目标存储类（未给 = STANDARD；归档类直写拒）
         let storage_class =
             parse_storage_class(req.input.storage_class.as_ref().map(|s| s.as_str()), false)?;
@@ -4348,7 +4376,7 @@ impl S3 for OssS3 {
             .put_object_stream_with_meta(
                 &req.input.bucket,
                 &req.input.key,
-                Box::pin(futures::stream::once(async move { Ok(bytes) })),
+                src_stream,
                 content_type,
                 user_metadata,
                 // M9：Copy 继承源校验和（随门 PUT 透传对端，A/B 元数据一致）

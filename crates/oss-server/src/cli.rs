@@ -624,7 +624,7 @@ async fn bind_addr(
 /// 跑一条命令，返回进程退出码（0 成功 / 1 失败 / serve 正常退出为 0）。
 pub async fn run(
     cmd: Command,
-    state: AppState,
+    mut state: AppState,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     // shrink 与离线搬运/巡检互斥（spec 5.6）：plan 持 active.lock 期间禁止 fsck/heal/scrub/rebalance。
     if matches!(
@@ -654,6 +654,17 @@ pub async fn run(
                 .await
                 .map_err(|e| format!("监听地址 {listen} 绑定失败: {e}"))?;
             drop(probe);
+
+            // 审计批量写 worker（serve 专属；离线命令与测试不经此路径，保持同步直写）。
+            // maintenance 模式照常审计——只读请求也会写审计行。
+            state.audit = Some(crate::audit_queue::AuditQueue::new(
+                crate::audit_queue::QUEUE_CAPACITY,
+            ));
+            if let Some(q) = &state.audit
+                && let Some(rx) = q.take_rx()
+            {
+                crate::audit_queue::spawn_worker(state.db.pool().clone(), rx);
+            }
 
             // M3 集群：起节点间 gRPC（独立端口）。绑定期检同 HTTP——失败即退出，不假活。
             if let Some(cl) = state.cfg.cluster.as_ref() {

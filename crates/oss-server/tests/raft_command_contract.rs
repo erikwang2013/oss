@@ -340,6 +340,10 @@ fn all_variants() -> Vec<ControlCommand> {
             stage: "current".into(),
             fence_term: 1,
         },
+        // level 6：作业历史保留（只删终态 jobs/job_tasks）。
+        ControlCommand::JobPurge {
+            job_ids: vec![1, 2],
+        },
     ]
 }
 
@@ -394,13 +398,13 @@ fn control_command_field_set_matches_frozen_fixture() {
 
 /// Level C M1：level-3 词汇表固定；生产命令集中只有 `Ext` 与账户/成员命令要求
 /// level 3，M8-2 作业行命令要求 level 4，inventory 行命令要求 level 5（v1.23.0
-/// 已 advertise 4 但不认识 Inventory*），其余命令仍为 1/2。
+/// 已 advertise 4 但不认识 Inventory*），JobPurge 要求 level 6（v1.24.0 advertise ≤5）。
 #[test]
 fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     use oss_server::raft::compat::{
-        FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_LEVEL_4, FEATURE_LEVEL_5, FEATURE_OSSCTL2,
-        FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup,
-        supports,
+        FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_LEVEL_4, FEATURE_LEVEL_5, FEATURE_LEVEL_6,
+        FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL,
+        guard_startup, supports,
     };
     assert_eq!(MIN_FEATURE_LEVEL, 1);
     assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
@@ -412,22 +416,29 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     );
     assert_eq!(FEATURE_LEVEL_4, 4);
     assert_eq!(FEATURE_LEVEL_5, 5);
-    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_5);
-    assert!(supports(1) && supports(2) && supports(3) && supports(4) && supports(5));
-    assert!(!supports(6), "未知更高 level 一律不支持");
+    assert_eq!(
+        FEATURE_LEVEL_6, 6,
+        "v1.24.0 及更早 advertise ≤5，JobPurge 必须用新 level 6"
+    );
+    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_6);
+    assert!(supports(1) && supports(2) && supports(3) && supports(4) && supports(5) && supports(6));
+    assert!(!supports(7), "未知更高 level 一律不支持");
 
-    // marker 5 + MAX 5：显式配置 5 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）拒绝。
+    // marker 6 + MAX 6：显式配置 6 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）/
+    // v1.24.0（MAX 5）拒绝。
     assert!(guard_startup(3, 3).is_ok());
     assert!(guard_startup(4, 4).is_ok());
     assert!(guard_startup(5, 5).is_ok());
-    assert!(guard_startup(6, 5).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(6, 6).is_ok());
+    assert!(guard_startup(7, 6).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(6, 5).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(5, 4).is_err(), "配置低于 marker 必须拒绝");
     assert!(
         guard_startup(4, 3).is_err(),
         "配置低于已激活 marker 必须拒绝"
     );
 
-    let (mut ext, mut accounts, mut jobs, mut inventory) = (0, 0, 0, 0);
+    let (mut ext, mut accounts, mut jobs, mut inventory, mut retention) = (0, 0, 0, 0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
         match cmd {
@@ -467,6 +478,13 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
                     "lifecycle 游标与 Inventory* 同级（level 5）"
                 );
             }
+            ControlCommand::JobPurge { .. } => {
+                retention += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_6,
+                    "JobPurge 必须用 level 6（v1.24.0 占用 5）"
+                );
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
                 "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
@@ -480,6 +498,7 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         inventory, 4,
         "生产命令集恰好两个 M8-2 inventory 行样本 + 两个 lifecycle 游标样本"
     );
+    assert_eq!(retention, 1, "生产命令集恰好一个 JobPurge 样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

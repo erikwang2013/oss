@@ -405,6 +405,8 @@ impl Store {
         for drive in &self.cfg.drives {
             tokio::fs::create_dir_all(layout::bucket_dir(drive, bucket)).await?;
         }
+        // 同名桶重建：旧缓存（若存在）不得复用。
+        self.invalidate_bucket_caches(bucket);
         Ok(())
     }
 
@@ -424,6 +426,7 @@ impl Store {
             drop(entries);
             tokio::fs::remove_dir(&dir).await.ok();
         }
+        self.invalidate_bucket_caches(bucket);
         Ok(())
     }
 
@@ -585,6 +588,8 @@ impl Store {
         if self.cfg.fsync {
             Store::sync_dir(&dir).await;
         }
+        // 本槽提交点已过：键缓存增量（本机集群 commit / mesh 服务端 commit / fsck 修复共用）
+        self.note_cached_key(bucket, key);
         Ok((true, hash))
     }
 
@@ -679,6 +684,7 @@ impl Store {
                 let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
             }
         }
+        self.forget_cached_key(&r.bucket, &r.key);
         Ok(())
     }
 

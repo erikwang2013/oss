@@ -84,6 +84,69 @@ fn is_tier_action(action: &str) -> bool {
         || action.starts_with("Restore")
 }
 
+/// 作业历史保留天数（`OSS_JOB_RETENTION_DAYS`，默认 30；0 = 关闭；上限 3650）。
+/// 只清理终态作业；Raft 下需要 feature level 6 且只由 leader 执行。
+fn retention_days() -> i64 {
+    std::env::var("OSS_JOB_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(0, 3650)
+}
+
+/// 每批清理的作业数（= `JobPurge` 单命令上限）；每次运行最多 10 批。
+const RETENTION_BATCH: i64 = 1000;
+const RETENTION_MAX_BATCHES: usize = 10;
+const RETENTION_INTERVAL_SECS: u64 = 3600;
+
+/// 作业历史保留 worker：独立于 `OSS_JOB_WORKERS`（引擎关闭也应回收历史），
+/// 启动即跑一轮，之后每小时；leader-only（follower 永不删除本地历史）。
+fn spawn_retention(db: Arc<Db>, jobs: Arc<JobState>, gate: LeaderGate) {
+    let days = retention_days();
+    if days == 0 {
+        tracing::info!("job 历史保留已关闭（OSS_JOB_RETENTION_DAYS=0）");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(std::time::Duration::from_secs(RETENTION_INTERVAL_SECS));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            t.tick().await;
+            if !gate.is_leader() {
+                continue;
+            }
+            let cutoff = crate::db::now().saturating_sub(days * 86_400);
+            let mut deleted = 0usize;
+            for _ in 0..RETENTION_MAX_BATCHES {
+                match jobs
+                    .purge_terminal_before(&db, cutoff, RETENTION_BATCH)
+                    .await
+                {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        deleted += n;
+                        if n < RETENTION_BATCH as usize {
+                            break;
+                        }
+                    }
+                    // feature <6 是配置门而非错误：每轮至多记一次。
+                    Err(e) if e.contains("feature level 6") => {
+                        tracing::debug!(error = %e, "job：历史保留等待 feature level 6");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "job：历史保留清理失败");
+                        break;
+                    }
+                }
+            }
+            if deleted > 0 {
+                tracing::info!(deleted, days, "job：已清理终态作业历史");
+            }
+        }
+    });
+}
+
 /// 带 leader 门控的一轮领取（worker 循环/测试共用）。follower/unknown 不领取。
 pub async fn worker_tick(
     db: &Db,
@@ -122,6 +185,8 @@ pub fn spawn_workers(
     gate: LeaderGate,
 ) {
     let env = JobEnv::from_env();
+    // 历史保留独立于执行 worker：OSS_JOB_WORKERS=0 时仍按 OSS_JOB_RETENTION_DAYS 回收。
+    spawn_retention(Arc::clone(&db), Arc::clone(&jobs), gate.clone());
     if env.workers == 0 {
         tracing::info!("job worker 已关闭（OSS_JOB_WORKERS=0）");
         return;

@@ -151,6 +151,9 @@ impl Store {
                             .is_some_and(|t| t < due);
                         if stale {
                             tokio::fs::remove_dir_all(sub.path()).await?;
+                            if let Ok(uuid) = uuid::Uuid::parse_str(&sub_name) {
+                                self.mpu_index_remove_dir(&bucket_name, &key, &uuid.to_string());
+                            }
                             removed += 1;
                         }
                     }

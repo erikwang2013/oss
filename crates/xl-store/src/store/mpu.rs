@@ -256,6 +256,14 @@ impl Store {
             let _ = tokio::fs::remove_dir(&obj_dir).await;
             return Err(e.into());
         }
+        // LMU 索引增量（桶未加载 → no-op，首次列举扫盘会看到该暂存区）
+        self.mpu_index_add(
+            bucket,
+            key,
+            &upload_id,
+            meta.created_nanos,
+            meta.storage_class.clone(),
+        );
         Ok(upload_id)
     }
 
@@ -495,6 +503,14 @@ impl Store {
         }
         let mpu: MpuMeta = rmp_serde::from_slice(&tokio::fs::read(dir.join(MPU_META_FILE)).await?)
             .map_err(|e| Error::CorruptMeta(format!("mpu.meta 解码失败: {e}")))?;
+        // 索引键 = LMU 可见形态（属主取自 mpu.meta；客户端可能传裸 UUID 或带前缀）
+        let visible_upload_id = {
+            let (_, uuid_norm) = super::mpu_route::split_upload_id(upload_id)?;
+            match mpu.owner.as_deref() {
+                Some(owner) => super::mpu_route::format_upload_id(owner, &uuid_norm),
+                None => uuid_norm,
+            }
+        };
 
         // R5：SSE-C 一致性（create ↔ complete 双向）——create 记了 md5 则 complete 必带同钥；
         // create 未记则不得携带客户端密钥（AWS 语义：SSE-C 参数须全程一致）。
@@ -914,6 +930,7 @@ impl Store {
         // 若删到一半崩溃，残骸无 meta 引用，由 `reap_stale` 按 mtime 回收
         let _ = tokio::fs::rename(dir.join(MPU_META_FILE), dir.join(MPU_DONE_FILE)).await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
+        self.mpu_index_remove(bucket, key, &visible_upload_id);
 
         // 老版本进回收站（跨盘遍历，与单段 PUT 相同；版本控制桶跳过——旧版本仍被链引用）
         if mode == VersioningMode::Off {
@@ -992,6 +1009,9 @@ impl Store {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
         }
         tokio::fs::remove_dir_all(&dir).await?;
+        if let Some(id) = super::mpu_index::visible_upload_id(upload_id) {
+            self.mpu_index_remove(bucket, key, &id);
+        }
         Ok(())
     }
 

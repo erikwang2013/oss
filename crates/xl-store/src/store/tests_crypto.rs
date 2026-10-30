@@ -1528,3 +1528,50 @@ async fn multi_drive_encrypted_roundtrip_and_leak() {
         assert!(!contains_window(&b, &marker[..16]), "多盘分片 {i} 含明文窗");
     }
 }
+
+#[tokio::test]
+async fn stream_object_encrypted_is_byte_identical() {
+    // 加密对象流式读：按单元解密（常量内存），流内 CRC32C 分片终验 + 明文 SHA256 终验
+    let (s, _d) = store().await;
+    let s = std::sync::Arc::new(s);
+    s.create_bucket("alpha").await.unwrap();
+    let key = crypto::SseCKey::from_key([21u8; 32]);
+    let body = payload(300_000);
+    s.put_object_stream_with_meta(
+        "alpha",
+        "k",
+        stream_of(body.clone()),
+        None,
+        Default::default(),
+        None,
+        VersioningMode::Off,
+        Some(EncSpec::SseC(key.clone())),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        s.read_meta("alpha", "k")
+            .await
+            .unwrap()
+            .unwrap()
+            .latest()
+            .unwrap()
+            .encryption
+            .is_some(),
+        "用例前提：对象必须加密"
+    );
+
+    let (info, mut stream) = s
+        .stream_object_ext("alpha", "k", None, Some(&key))
+        .await
+        .unwrap();
+    assert_eq!(info.size, body.len() as u64);
+    let mut got = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, &body[..]);
+}

@@ -175,6 +175,9 @@
     "restores",
     "tasks"
   ],
+  "JobPurge": [
+    "job_ids"
+  ],
   "JobTaskUpsert": [
     "task"
   ],

@@ -72,14 +72,14 @@ impl Store {
         include_deleted: bool,
         limit: usize,
     ) -> Result<(Vec<(crate::mesh::ListEntry, ObjectInfo)>, Vec<String>)> {
-        // 先按 prefix/marker 过滤再收集：大桶里按前缀翻页时不再把整桶键集读进内存。
-        let keys = self
-            .collect_keys_filtered(bucket, prefix, start_after, exclusive, true)
+        // 键流：缓存可用 → 按批取（内存 O(批)，不整桶物化）；否则回退一次扫描（旧路径）。
+        let mut keys = self
+            .page_keys(bucket, prefix, start_after, exclusive)
             .await?;
 
         let mut objects: Vec<(crate::mesh::ListEntry, ObjectInfo)> = Vec::new();
         let mut cps: Vec<String> = Vec::new();
-        for k in keys {
+        while let Some(k) = keys.next() {
             if !k.starts_with(prefix) {
                 continue;
             }

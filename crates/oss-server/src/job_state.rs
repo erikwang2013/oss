@@ -493,4 +493,64 @@ impl JobState {
         self.commit(db, vec![job], tasks, Vec::new()).await?;
         Ok(Some(new_id))
     }
+
+    /// level 6 作业历史保留：删除 `cutoff` 之前进入终态的作业历史（每次最多 `batch` 条）。
+    ///
+    /// 无控制面（单机/测试）：本地事务删除。Raft：必须是 leader 且生效 feature ≥6，
+    /// 写入经 [`ControlCommand::JobPurge`] 复制，follower 只 apply；feature <6 返回明确
+    /// 错误（worker 跳过），绝不退回本地删除——否则各副本历史分叉。
+    pub async fn purge_terminal_before(
+        &self,
+        db: &Db,
+        cutoff: i64,
+        batch: i64,
+    ) -> Result<usize, String> {
+        let limit = batch.clamp(1, crate::raft::command::JOB_PURGE_MAX_IDS as i64);
+        let Some(control) = &self.control else {
+            return Self::purge_local(db, cutoff, limit).await;
+        };
+        let Some(handle) = control.raft_handle() else {
+            return Self::purge_local(db, cutoff, limit).await;
+        };
+        if !control.is_leader() {
+            return Err("job_purge: not leader; retry on the leader".into());
+        }
+        match handle.effective_feature() {
+            Some(level) if level >= compat::FEATURE_LEVEL_6 => {}
+            Some(level) => {
+                return Err(format!(
+                    "job_purge requires raft feature level 6 (all peers upgraded); \
+                     effective level {level}"
+                ));
+            }
+            None => {
+                return Err(
+                    "job_purge requires raft feature level 6 (all peers upgraded); \
+                            effective level unavailable"
+                        .into(),
+                );
+            }
+        }
+        let ids = db.terminal_jobs_before(cutoff, limit).await.map_err(err)?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let n = ids.len();
+        match control
+            .write(ControlCommand::JobPurge { job_ids: ids })
+            .await
+        {
+            Ok(ControlResponse::Ok) => Ok(n),
+            Ok(other) => Err(format!("job_purge rejected: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn purge_local(db: &Db, cutoff: i64, limit: i64) -> Result<usize, String> {
+        let ids = db.terminal_jobs_before(cutoff, limit).await.map_err(err)?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(db.purge_terminal_jobs_local(&ids).await.map_err(err)? as usize)
+    }
 }

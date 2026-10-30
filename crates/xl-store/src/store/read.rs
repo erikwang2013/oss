@@ -1,24 +1,27 @@
 //! 读路径：HEAD / 整读 / Range 有界读（含并发覆写时的 meta 重读重试）。
 //! M2b 形态分派：`inline` → meta 内嵌字节；`data_layout` → EC 分片重建；否则旧 part 文件。
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, Version, XlMeta};
 
-use super::{ObjectInfo, Store, drives, ec};
+use super::{ByteStream, ObjectInfo, Store, drives, ec};
 
 /// 并发覆写时的 meta 重读轮数。固定 2 次在热键连续覆写下会误报 NoSuchKey；
 /// 8 次把窗口压到可忽略，同时避免无限重试。
 const READ_META_RETRY_ROUNDS: usize = 8;
 
-/// 整对象读（非 Range）的缓冲上限。整读路径当前必须把对象/密文物化进内存；超过上限
-/// 直接 400 并提示用 Range，避免一个 GB 级 GET 把进程打崩。`0` = 不限制（高风险）。
-/// 真正的流式 GET 是后续独立项；此上限是止血，不是能力声明。
+/// 整份缓冲读的上限：Range/partNumber 与流式读的**回退**路径仍把对象/密文物化进内存；
+/// 超过上限直接 400 并提示用 Range，避免一个 GB 级 GET 把进程打崩。`0` = 不限制（高风险）。
+/// 无 Range 的主路径已流式（[`Store::stream_object_ext`]），不受此上限约束。
 pub(in crate::store) fn ensure_buffered_read_allowed(size: u64) -> Result<()> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -258,6 +261,174 @@ impl Store {
         }
         // 两轮 meta → 数据文件都 ENOENT：按 S3 语义报 NoSuchKey，而不是把裸 IO 错误抛给上层
         Err(Error::NoSuchKey(key.to_string()))
+    }
+
+    /// 流式整对象读（S3 GET 无 Range 的主路径）：meta 只读一次；inline 一次给出；
+    /// EC 按**数据分片顺序**直出（常量内存 O(块)），旧 parts 按块读文件。
+    ///
+    /// EC 形态在首字节前探测每个数据片的首块：任一缺失/短读 → `Ok(None)`，调用方回退
+    /// 有上限的整读（EC 重建仍可救回）。探测通过后流中再失败只报错，**绝不跳过字节**。
+    /// 数据片 CRC32C 在片末比对；明文 SHA-256 在流末与 `part.sha256` 比对。
+    /// 加密对象按单元解密（最多缓冲一个单元 W）。
+    ///
+    /// `version_id=None` = 链尾最新；marker 语义与 [`Self::get_object_ext`] 一致。
+    pub async fn stream_object_ext(
+        self: &Arc<Self>,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, ByteStream)> {
+        self.ensure_bucket(bucket).await?;
+        let m = self
+            .read_meta(bucket, key)
+            .await?
+            .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+        let (v, info) = match version_id {
+            Some(vid) => {
+                let v = m
+                    .find_version(vid)
+                    .ok_or_else(|| Error::NoSuchKey(key.to_string()))?;
+                if v.delete_marker() {
+                    return Err(Error::DeleteMarker(format!("{bucket}/{key}@{vid}")));
+                }
+                (v, super::version::version_info(key, v))
+            }
+            None => {
+                if m.latest_is_marker() {
+                    return Err(Error::NoSuchKey(key.to_string()));
+                }
+                let v = m
+                    .latest()
+                    .ok_or_else(|| Error::CorruptMeta(format!("{bucket}/{key}: 无版本")))?;
+                (v, self.load_object_info(bucket, key, &m)?)
+            }
+        };
+        check_tier_readable(v, bucket, key)?;
+        check_read_sse_c(v, sse_c)?;
+
+        // 内联：至多 MAX_INLINE，解密后一次性给出（与整读同口径，不做 SHA 终验）
+        if let Some(inline) = &v.inline {
+            let expected = match &v.encryption {
+                Some(_) => crypto::Geometry::new(v.size)?.cipher_len,
+                None => v.size,
+            };
+            if inline.bytes.len() as u64 != expected {
+                return Err(Error::CorruptMeta(format!(
+                    "{bucket}/{key}: 内联长度 {} ≠ {expected}",
+                    inline.bytes.len()
+                )));
+            }
+            let bytes = match &v.encryption {
+                None => Bytes::from(inline.bytes.clone()),
+                Some(rec) => {
+                    let ctx = crypto::UnitCtx::for_read(rec, self.maybe_enc_state(), sse_c).await?;
+                    Bytes::from(crypto::open_all(&ctx, v.size, &inline.bytes)?)
+                }
+            };
+            return Ok((info, one_shot(bytes)));
+        }
+        if let Some(l) = &v.data_layout {
+            if let Some(stream) = self.ec_stream(bucket, key, v, l, sse_c).await? {
+                return Ok((info, stream));
+            }
+            return self.stream_buffered(bucket, key, version_id, sse_c).await;
+        }
+        // 加密对象不会以旧 parts 形态落盘（写前 fail-closed）——见到即损坏/伪造
+        if v.encryption.is_some() {
+            return Err(Error::CorruptMeta(format!(
+                "{bucket}/{key}: 加密版本出现在旧 parts 形态（写路径不可能产出）"
+            )));
+        }
+        let dir = layout::object_dir(self.cfg.root(), bucket, key)?;
+        let parts = v.effective_parts();
+        let Some(first) = parts.first() else {
+            return Ok((info, one_shot(Bytes::new())));
+        };
+        // 首 part 预打开：版本目录被并发覆写者移走时在首字节前回退整读（带 meta 重读）
+        let first_path = dir.join(&first.uuid).join(format!("part.{}", first.part));
+        let file = match tokio::fs::File::open(&first_path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.stream_buffered(bucket, key, version_id, sse_c).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let (tx, rx) = mpsc::channel(STREAM_CHAN);
+        tokio::spawn(parts_producer(dir, parts, file, tx));
+        Ok((info, channel_stream(rx)))
+    }
+
+    /// EC 流式读的建流：布局/密钥前置校验 + 数据片首块探活。`None` = 回退整读。
+    async fn ec_stream(
+        self: &Arc<Self>,
+        bucket: &str,
+        key: &str,
+        v: &Version,
+        l: &meta::DataLayout,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<Option<ByteStream>> {
+        let cfg = ec::EcConfig {
+            data: l.data,
+            parity: l.parity,
+            ..Default::default()
+        };
+        let data = cfg.data as usize;
+        let ss = l.shard_size;
+        if ss == 0 || l.shards.len() != (cfg.data + cfg.parity) as usize {
+            return Err(Error::CorruptMeta(format!(
+                "EC 布局非法：shard_size={ss} 片数={}（期望 {}）",
+                l.shards.len(),
+                cfg.data + cfg.parity
+            )));
+        }
+        // 加密读上下文：错钥/坏 meta 在首字节前 fail-closed
+        let (enc, geo) = match &v.encryption {
+            Some(rec) => (
+                Some(crypto::UnitCtx::for_read(rec, self.maybe_enc_state(), sse_c).await?),
+                Some(crypto::Geometry::new(v.size)?),
+            ),
+            None => (None, None),
+        };
+        let set = self.set_of_bucket(bucket).await?;
+        // 首块探活（data 片并发）：任一缺失/短读 → 回退整读（EC 重建兜底）
+        let probe = futures::future::join_all(
+            (0..data).map(|i| self.read_shard_block(set, bucket, key, v, &l.shards[i], i, 0, ss)),
+        )
+        .await;
+        for r in probe {
+            if r?.is_none() {
+                return Ok(None);
+            }
+        }
+        let (tx, rx) = mpsc::channel(STREAM_CHAN);
+        tokio::spawn(ec_producer(
+            Arc::clone(self),
+            bucket.to_string(),
+            key.to_string(),
+            v.clone(),
+            l.clone(),
+            set,
+            enc,
+            geo,
+            tx,
+        ));
+        Ok(Some(channel_stream(rx)))
+    }
+
+    /// 回退：有上限的整读（`OSS_MAX_BUFFERED_GET_BYTES` 只在此时生效）。
+    async fn stream_buffered(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        sse_c: Option<&crypto::SseCKey>,
+    ) -> Result<(ObjectInfo, ByteStream)> {
+        let (info, bytes) = match version_id {
+            Some(vid) => self.get_object_version_ext(bucket, key, vid, sse_c).await?,
+            None => self.get_object_ext(bucket, key, sse_c).await?,
+        };
+        Ok((info, one_shot(bytes)))
     }
 
     /// 有界读：`range` 为半开区间 `[start, end)`，须满足 `start <= end <= size`
@@ -976,4 +1147,189 @@ impl Store {
             }
         }
     }
+}
+
+// ---------- 流式读的生产者（mpsc + 后台任务；常量内存，背压 = 停盘） ----------
+
+/// 旧 parts 每次读盘字节数；EC 用块宽 `ec::CHUNK_W`。
+const STREAM_CHUNK: usize = ec::CHUNK_W;
+/// 生产者→消费者的通道深度：1 块预读，内存上界与对象大小无关。
+const STREAM_CHAN: usize = 1;
+
+fn one_shot(bytes: Bytes) -> ByteStream {
+    let chunks: Vec<Result<Bytes>> = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        vec![Ok(bytes)]
+    };
+    Box::pin(futures::stream::iter(chunks))
+}
+
+fn channel_stream(rx: mpsc::Receiver<Result<Bytes>>) -> ByteStream {
+    Box::pin(ChannelStream(rx))
+}
+
+/// mpsc 接收端的 `Stream` 适配（workspace 未依赖 tokio-stream）。
+struct ChannelStream(mpsc::Receiver<Result<Bytes>>);
+
+impl futures::Stream for ChannelStream {
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut().0.poll_recv(cx)
+    }
+}
+
+async fn parts_producer(
+    dir: std::path::PathBuf,
+    parts: Vec<meta::PartRef>,
+    file: tokio::fs::File,
+    tx: mpsc::Sender<Result<Bytes>>,
+) {
+    if let Err(e) = parts_pump(dir, parts, file, &tx).await {
+        let _ = tx.send(Err(e)).await;
+    }
+}
+
+async fn parts_pump(
+    dir: std::path::PathBuf,
+    parts: Vec<meta::PartRef>,
+    mut file: tokio::fs::File,
+    tx: &mpsc::Sender<Result<Bytes>>,
+) -> Result<()> {
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let mut idx = 0usize;
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) => {
+                idx += 1;
+                let Some(p) = parts.get(idx) else {
+                    return Ok(());
+                };
+                file = tokio::fs::File::open(dir.join(&p.uuid).join(format!("part.{}", p.part)))
+                    .await?;
+            }
+            Ok(n) => {
+                if tx
+                    .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                    .await
+                    .is_err()
+                {
+                    return Ok(()); // 客户端断开：停止读盘
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ec_producer(
+    store: Arc<Store>,
+    bucket: String,
+    key: String,
+    v: Version,
+    l: meta::DataLayout,
+    set: u16,
+    enc: Option<crypto::UnitCtx>,
+    geo: Option<crypto::Geometry>,
+    tx: mpsc::Sender<Result<Bytes>>,
+) {
+    if let Err(e) = ec_pump(&store, &bucket, &key, &v, &l, set, enc.as_ref(), geo, &tx).await {
+        let _ = tx.send(Err(e)).await;
+    }
+}
+
+/// EC 流式读：数据片按片序逐块直出；片末 CRC32C、流末明文 SHA-256 终验。
+/// 加密时密文流 C 也按片序排布，故按单元顺序解密（最多缓冲一个单元）。
+#[allow(clippy::too_many_arguments)]
+async fn ec_pump(
+    store: &Store,
+    bucket: &str,
+    key: &str,
+    v: &Version,
+    l: &meta::DataLayout,
+    set: u16,
+    enc: Option<&crypto::UnitCtx>,
+    geo: Option<crypto::Geometry>,
+    tx: &mpsc::Sender<Result<Bytes>>,
+) -> Result<()> {
+    let data = l.data as usize;
+    let ss = l.shard_size;
+    let blocks = ss.div_ceil(ec::CHUNK_W as u64);
+    let payload_len = geo.map_or(v.size, |g| g.cipher_len);
+    let mut hasher = Sha256::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut unit = 0u64;
+    for s in 0..data {
+        let shard = &l.shards[s];
+        let mut crc = 0u32;
+        for t in 0..blocks {
+            let Some(chunk) = store
+                .read_shard_block(set, bucket, key, v, shard, s, t, ss)
+                .await?
+            else {
+                // 探测通过后的缺失/短读：只能报错，绝不跳过字节
+                return Err(Error::CorruptMeta(format!(
+                    "流式读分片 {s} 块 {t} 缺失/短读"
+                )));
+            };
+            crc = crc32c::crc32c_append(crc, &chunk);
+            let start = s as u64 * ss + t * ec::CHUNK_W as u64;
+            if start >= payload_len {
+                continue; // 末片补零区：只进 CRC，不出流
+            }
+            let take = (payload_len - start).min(chunk.len() as u64) as usize;
+            let part = &chunk[..take];
+            match (enc, geo) {
+                (Some(ctx), Some(g)) => {
+                    pending.extend_from_slice(part);
+                    while unit < g.units {
+                        let need = g.unit_cipher_len(unit) as usize;
+                        if pending.len() < need {
+                            break;
+                        }
+                        let ct: Vec<u8> = pending.drain(..need).collect();
+                        let plain = ctx.cipher.open(&ctx.seed, unit as u32, &ct)?;
+                        hasher.update(&plain);
+                        if tx.send(Ok(Bytes::from(plain))).await.is_err() {
+                            return Ok(()); // 客户端断开：停止读盘
+                        }
+                        unit += 1;
+                    }
+                }
+                _ => {
+                    hasher.update(part);
+                    if tx.send(Ok(Bytes::from(part.to_vec()))).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if crc != shard.crc32c {
+            return Err(Error::CorruptMeta(format!(
+                "流式读分片 {s} CRC32C 不符（记录 {:08x}，实读 {crc:08x}）",
+                shard.crc32c
+            )));
+        }
+    }
+    if let (Some(_), Some(g)) = (enc, geo)
+        && (unit != g.units || !pending.is_empty())
+    {
+        return Err(Error::CorruptMeta(format!(
+            "流式解密单元数不符：解出 {unit}/{}（残余密文 {} 字节）",
+            g.units,
+            pending.len()
+        )));
+    }
+    if hex::encode(hasher.finalize()) != v.part.sha256 {
+        return Err(Error::CorruptMeta(format!(
+            "流式读 SHA256 与提交记录不符（对象 {} 字节）",
+            v.size
+        )));
+    }
+    Ok(())
 }

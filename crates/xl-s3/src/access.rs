@@ -179,6 +179,20 @@ impl ControlMesh {
     }
 }
 
+/// 审计接收方（S3 请求路径只入队，不碰 DB）。实现方须自行持有字符串并保证有界；
+/// `false` = 丢弃（队列满/已关闭）——审计 best-effort，调用方不得据此改变判定。
+pub trait AuditSink: Send + Sync {
+    fn enqueue(
+        &self,
+        uid: i64,
+        op: &str,
+        bucket: Option<&str>,
+        object_key: Option<&str>,
+        decision: &str,
+        detail: Option<&str>,
+    ) -> bool;
+}
+
 #[derive(Clone)]
 pub struct Acl {
     pool: SqlitePool,
@@ -186,6 +200,8 @@ pub struct Acl {
     mesh: Option<ControlMesh>,
     /// M1：匿名拒绝审计限流器（进程级；Clone 共享同一桶）。
     anon_deny: Arc<AnonDenyLimiter>,
+    /// 异步审计接收方（None = 同步直写，测试/离线命令语义）。
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 /// 匿名拒绝审计的令牌桶：未认证请求可无限灌入，拒绝审计不能线性写 SQLite。
@@ -311,6 +327,7 @@ impl Acl {
             pool,
             mesh: None,
             anon_deny: Arc::new(AnonDenyLimiter::new()),
+            audit: None,
         }
     }
 
@@ -320,7 +337,14 @@ impl Acl {
             pool,
             mesh,
             anon_deny: Arc::new(AnonDenyLimiter::new()),
+            audit: None,
         }
+    }
+
+    /// 注入异步审计接收方（serve 路径）；None = 保持同步直写。
+    pub fn with_audit_sink(mut self, sink: Option<Arc<dyn AuditSink>>) -> Self {
+        self.audit = sink;
+        self
     }
 
     /// 桶版本控制状态（M4 切片 3；`buckets.versioning`）：无行/旧库缺列值 → "Off"（fail-closed 兼容）。
@@ -436,6 +460,7 @@ impl Acl {
     }
 
     /// 审计落行（判定后；允许与拒绝都记；best-effort 由调用方 warn）。
+    /// 注入 [`AuditSink`] 时只入队（同步、非阻塞）；否则直接写 SQLite（测试/离线命令）。
     pub async fn write_audit(
         &self,
         uid: i64,
@@ -445,6 +470,11 @@ impl Acl {
         decision: &str,
         detail: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        if let Some(sink) = &self.audit {
+            // 丢弃计数与告警由 sink 负责（每次请求 warn 会在过载时洪水式刷日志）。
+            sink.enqueue(uid, op, bucket, object_key, decision, detail);
+            return Ok(());
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -2279,6 +2309,103 @@ mod tests {
             .await
             .unwrap();
         assert!((20..=21).contains(&n), "匿名拒绝审计被限流：{n}");
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct AuditRow {
+        uid: i64,
+        op: String,
+        bucket: Option<String>,
+        key: Option<String>,
+        decision: String,
+        detail: Option<String>,
+    }
+
+    /// 假 sink：记录入队行；`accept=false` 模拟队列满/关闭。
+    struct RecordingSink {
+        rows: std::sync::Mutex<Vec<AuditRow>>,
+        accept: bool,
+    }
+
+    impl AuditSink for RecordingSink {
+        fn enqueue(
+            &self,
+            uid: i64,
+            op: &str,
+            bucket: Option<&str>,
+            object_key: Option<&str>,
+            decision: &str,
+            detail: Option<&str>,
+        ) -> bool {
+            self.rows.lock().unwrap().push(AuditRow {
+                uid,
+                op: op.to_string(),
+                bucket: bucket.map(str::to_string),
+                key: object_key.map(str::to_string),
+                decision: decision.to_string(),
+                detail: detail.map(str::to_string),
+            });
+            self.accept
+        }
+    }
+
+    /// 注入 sink 后允许/拒绝都只入队，不同步落库。
+    #[tokio::test]
+    async fn audit_sink_enqueues_instead_of_sqlite() {
+        let a = acl().await;
+        let sink = Arc::new(RecordingSink {
+            rows: std::sync::Mutex::new(Vec::new()),
+            accept: true,
+        });
+        let a = a.with_audit_sink(Some(sink.clone()));
+        a.write_audit(
+            7,
+            "PutObject",
+            Some("b"),
+            Some("k"),
+            "allow",
+            Some("policy:allow"),
+        )
+        .await
+        .unwrap();
+        a.write_anonymous_deny_audit(
+            "GetObject",
+            Some("b"),
+            Some("k"),
+            Some("anonymous:no-policy"),
+        )
+        .await
+        .unwrap();
+        {
+            let rows = sink.rows.lock().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].uid, 7);
+            assert_eq!(rows[0].op, "PutObject");
+            assert_eq!(rows[0].decision, "allow");
+            assert_eq!(rows[1].uid, 0, "匿名哨兵");
+            assert_eq!(rows[1].decision, "deny");
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "注入 sink 后不应同步写 audit_log");
+    }
+
+    /// sink 拒收（队列满）时 `write_audit` 仍 Ok——审计不得影响判定。
+    #[tokio::test]
+    async fn audit_sink_rejection_does_not_fail_request() {
+        let a = acl().await;
+        let a = a.with_audit_sink(Some(Arc::new(RecordingSink {
+            rows: std::sync::Mutex::new(Vec::new()),
+            accept: false,
+        })));
+        a.write_audit(1, "GetObject", Some("b"), Some("k"), "deny", None)
+            .await
+            .unwrap();
+        a.write_anonymous_deny_audit("GetObject", Some("b"), Some("k"), None)
+            .await
+            .unwrap();
     }
 
     /// L1：匿名请求的对象锁/治理旁路头被识别（大小写不敏感由 HeaderMap 归一）。

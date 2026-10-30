@@ -4,6 +4,7 @@ mod accounts_support;
 mod accounts_usage;
 pub mod aether;
 pub mod aether_gate;
+pub mod audit_queue;
 pub mod cli;
 pub mod cluster_control;
 pub mod config;

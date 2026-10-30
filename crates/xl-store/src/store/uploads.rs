@@ -74,6 +74,17 @@ impl Store {
         upload_id_marker: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<UploadInfo>, Vec<String>)> {
+        // 索引可用 → 直接从在途 upload 表出页；不可用（加载失败/无桶）回退逐目录扫描。
+        if let Some(index) = self.mpu_index_snapshot(bucket).await {
+            return Ok(list_uploads_from_index(
+                &index,
+                prefix,
+                delimiter,
+                key_marker,
+                upload_id_marker,
+                limit,
+            ));
+        }
         // 收集时必须包含 key_marker 本身：同键的 upload_id 续页还要在循环里继续。
         // “排他”由下面的 at_marker_key 分支处理，不能在这里提前丢掉 marker 键。
         let keys = self
@@ -300,6 +311,79 @@ impl Store {
         result.degraded = degraded;
         Ok(result)
     }
+}
+
+/// 从 MPU 索引快照出页：索引按 (key, upload_id) 有序，语义与逐目录扫描一致
+/// （cp 先于生成键、cp <= key_marker 跳过、key/upload 双 marker、delimiter 折叠）。
+/// 与旧扫描的唯一差异：cp 只由**有进行中 upload 的键**生成（AWS LMU 语义；无 upload
+/// 的对象键不再产生空 cp）。
+fn list_uploads_from_index(
+    index: &BTreeMap<(String, String), super::mpu_index::UploadEntry>,
+    prefix: &str,
+    delimiter: Option<&str>,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+    limit: usize,
+) -> (Vec<UploadInfo>, Vec<String>) {
+    let mut cp_set: BTreeSet<String> = BTreeSet::new();
+    if let Some(d) = delimiter {
+        for (k, _) in index.keys() {
+            if !k.starts_with(prefix) {
+                continue;
+            }
+            let rest = &k[prefix.len()..];
+            let Some(pos) = rest.find(d) else { continue };
+            let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
+            if key_marker.is_none_or(|m| cp.as_str() > m) {
+                cp_set.insert(cp);
+            }
+        }
+    }
+    let mut cp_iter = cp_set.into_iter().peekable();
+
+    let mut uploads: Vec<UploadInfo> = Vec::new();
+    let mut cps: Vec<String> = Vec::new();
+    for ((k, upload_id), e) in index {
+        if !k.starts_with(prefix) || key_marker.is_some_and(|m| k.as_str() < m) {
+            continue;
+        }
+        // 排在本键之前的 cp 先输出（见 list_uploads_page_local 头注：cp 必须先于生成键）
+        while cp_iter.peek().is_some_and(|cp| cp.as_str() < k.as_str()) {
+            if uploads.len() + cps.len() >= limit {
+                return (uploads, cps);
+            }
+            cps.push(cp_iter.next().expect("peek 已判 Some"));
+        }
+        // 只给 key_marker：同键 upload 全部跳过（排他）
+        if key_marker.is_some_and(|m| k.as_str() == m) && upload_id_marker.is_none() {
+            continue;
+        }
+        if delimiter.is_some_and(|d| k[prefix.len()..].contains(d)) {
+            continue; // 已折叠进 cp（上面按序发出）
+        }
+        if key_marker.is_some_and(|m| k.as_str() == m)
+            && upload_id_marker.is_some_and(|m| upload_id.as_str() <= m)
+        {
+            continue;
+        }
+        if uploads.len() + cps.len() >= limit {
+            return (uploads, cps);
+        }
+        uploads.push(UploadInfo {
+            key: k.clone(),
+            upload_id: upload_id.clone(),
+            initiated_nanos: e.initiated_nanos,
+            storage_class: e.storage_class.clone(),
+        });
+    }
+    // 尾部 cp：排在所有键之后。
+    for cp in cp_iter {
+        if uploads.len() + cps.len() >= limit {
+            break;
+        }
+        cps.push(cp);
+    }
+    (uploads, cps)
 }
 
 /// 归并两路有序流（upload 按 (key, upload_id)、cp 按 cp 串），取前 `max` 个输出；
