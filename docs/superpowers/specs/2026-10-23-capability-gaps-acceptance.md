@@ -656,3 +656,26 @@ xl-client/xl-proto `clippy --all-targets -D warnings` 通过；`xl-store --lib` 
 `m8_inventory` 23/0、`console_api` 33/0；`raft_jobs_activation` 4/0、
 `raft_runstate_snapshot` 14/0、`raft_cutover_provenance` 6/0、`raft_handshake` 2/0、
 `kill9` 1/0。完整 workspace 聚合跑因宿主 I/O 饱和未完成，发布以分 crate/分套件闸门为准。
+
+## 20. 2026-10-31 v1.26.0：feature 7、硬配额、规范化与数据面优化
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| M8 tier restore 后续状态复制 | `raft/{compat,command,apply/tier_restore}.rs`、`job_state/restore.rs`、`tier_sweep.rs` | feature level 7；`TierRestoreUpsert` 整行、fence 单调、pending/restored、幂等；`TierRestoreDelete` 幂等且受 fence 上限约束；恢复后续状态/清理/回滚经 JobState 门面复制；快照 OSSCTL3 无迁移 |
+| 调度租约 acquire/renew/takeover | `job_state/lease.rs`、`raft/apply/lease.rs`、`jobs.rs`、`inventory.rs`、`lifecycle.rs`、`tier_sweep.rs` | `ScheduleLeaseAcquire` 单行；同 term 同节点只延期、换 term 必须等已提交 expiry；TTL `OSS_SCHEDULE_LEASE_SECS`（默认 30s），剩余 > 半 TTL 不续约；worker tick/preempt、inventory、lifecycle、tier sweep/reaper 全部经 `schedule_fence`；3-voter 测试覆盖续约、无 churn、leader 停机后到期接管 |
+| 硬字节/对象数配额 | `xl-s3/account_quota.rs`、`service.rs`、`oss-server/accounts_usage.rs` | 当前版本用量；写入前单条条件 UPDATE 原子预留、删除释放；30s 惰性/60s 采样（mesh 合并列举）；对端不可达按已知下界拒绝、未知增量 fail-open，DB 错误 fail-closed；Put/Complete/Copy 与 Delete/DeleteObjects 接入；`PUT /accounts/{id}/hard-quota` standalone 生效、Raft 501（待复制命令） |
+| 账户规范化 worker | `accounts_canonical.rs`、`db.rs`、`cli.rs` | serve-only、300s、leader 门控；standalone 单事务 + marker（失败回滚且不写 marker）；Raft leader 复用 `AccountCreate`/`AccountMemberAttach`，不新增命令；角色 admin 为既有命令合法集内的等价替代 |
+| 流式 GET 批量读 | `xl-store/read.rs`、`store.rs` | `read_shard_range` 本地 seek+read / 远端 `read_shard`，默认 1 MiB（`OSS_SHARD_READ_BATCH_BYTES`，上限 16 MiB）；CRC32C、unit 解密、明文 SHA-256 与缺失/短读语义不变；本地+远端批量读与确定性重叠测试 |
+| MPU 索引 TTL / clean 竞态 | `mpu_index.rs` | `OSS_MPU_INDEX_TTL_SECS`（默认 300）整桶重建；加载期 clean 记 pending 并在合并时应用；重建失败沿用旧索引、NoSuchBucket lazy-heal |
+| JobPurge 保留索引 | `migrations/0009_job_retention_index.sql`、`db.rs` | `(state, updated_at)` 索引；`EXPLAIN QUERY PLAN` 测试证明 `terminal_jobs_before` 使用索引 |
+| 审计丢弃指标 | `router.rs`、`tests/observability.rs` | `/metrics` 导出 `oss_audit_dropped_total`（无队列时为 0）；注册/更新测试 |
+| 桶复制过滤与限速 | `xl-s3/replication.rs`、`service.rs`、`oss-server/replication.rs`、`repl_client.rs` | Prefix/Tag/And 解析、校验、选择与回读归一化；Tag 规则写入前读取版本标签；Tag 规则的删除不复制（shortcut）；复制体按 256 KiB 分块令牌桶，跨请求共享远端配额 |
+
+**验证（合并后，本机）**：fmt 通过；五 crate `clippy --all-targets -D warnings` 通过。
+`xl-store --lib` 369/0、`xl-s3 --lib` 194/0、`oss-server --lib` 248/0；复制 35/0、
+账户 12/0、`raft_command_contract` 3/0/1、`raft_restore_lease_replication` 3/0、
+observability 4/0。完整 workspace 聚合跑在本机高负载下多次超时，发布以分套件闸门为准。
+
+**已知限制**：Raft 模式硬配额配置返回 501（执行路径已生效，待复制命令）；follower 发起的
+Restore 清理携带 UNFENCED（term 0），由 leader reaper 收敛；Tag 复制的删除不传播；
+配额未知长度/版本定向删除依赖采样器；MPU/ Copy 配额路径共享预留逻辑但缺少独立集成用例。

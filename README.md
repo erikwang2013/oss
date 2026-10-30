@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.25.0（2026-10-31）。** 性能与安全硬化版：无 Range 的 GET 全链路流式直出（加密对象按 unit 解密，内存与对象大小无关）；列举增加每节点键缓存与在途 MPU 索引；EC 分片写并行；审计改为有界异步批量队列；feature level 6 交付 `JobPurge` 终态作业保留。另含一轮授权、DoS 与运维审计修复（S3 操作授权映射补全、会话/桶策略 fail-closed、登录与 Argon2 限流、列举上限、Docker 密钥权限等）。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.26.0（2026-10-31）。** 控制面与租户硬化版：feature level 7 交付 tier restore 后续状态复制与调度租约 acquire/renew/takeover；账户硬字节/对象数配额与 legacy 账户规范化 worker；流式 GET 远端分片改为批量范围读（默认 1 MiB）；MPU 索引增加 TTL；`JobPurge` 增加保留索引；桶复制支持 `Tag`/`And` 过滤与 256 KiB 分块限速。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
@@ -19,10 +19,10 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | 存储内核 | 多盘纠删码 8+4、跨节点 gRPC mesh、quorum 提交、`xl.meta` 版本链、小对象内联、多盘自愈、全对象 GET 流式直出、分片并行写、列举键缓存 |
 | S3 API | 对象/桶/版本/标签、Multipart、partNumber、Range、Copy 指令、分块上传与断线续传 |
 | 生命周期 | 过期、非当前版本、转换规则，Storage Class、分层归档与 Restore |
-| 安全 | SSE-S3/KMS/C、密钥库、对象锁与保留期、STS、桶策略与审计（异步批量队列）、TLS/mTLS、子账户三档权限、Argon2id、账户软字节配额告警 |
-| 数据流 | 事件通知/Kafka、S3 Select、桶复制、多站点复制 |
-| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、控制台页面 |
-| 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..6 |
+| 安全 | SSE-S3/KMS/C、密钥库、对象锁与保留期、STS、桶策略与审计（异步批量队列）、TLS/mTLS、子账户三档权限、Argon2id、账户软/硬字节与对象数配额 |
+| 数据流 | 事件通知/Kafka、S3 Select、桶复制（Prefix/Tag/And 过滤）、多站点复制 |
+| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、恢复后续状态/调度租约复制（feature 7）、控制台页面 |
+| 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..7 |
 | 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | 客户端 | `aws-cli` / `rclone`；React 控制台（分块、断线续传、秒传） |
 
@@ -70,7 +70,8 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 暂存 → 同盘 rename 数据就位 → `xl.meta` 覆盖即提交；提交之前的一切对客户端不可见。
 EC 写/读均已分块流式：内存峰值 ≈ 块缓冲（MiB 级），与对象大小无关（96 MiB 对象
 区间读实测 VmHWM 107 MiB）。无 Range 的全对象 GET 直接流式输出（加密对象按 unit 解密，
-至多缓存一个 unit）；Range/partNumber 仍有界缓冲，上限由 `OSS_MAX_BUFFERED_GET_BYTES`
+至多缓存一个 unit）；远端 EC 分片按 `OSS_SHARD_READ_BATCH_BYTES`（默认 1 MiB，上限 16 MiB）
+批量范围读取，减少 RPC 次数。Range/partNumber 仍有界缓冲，上限由 `OSS_MAX_BUFFERED_GET_BYTES`
 控制（默认 512 MiB，0=不限），EC 数据盘缺失时的整体重建回退同样受该上限约束。
 单次列举最多收集 `OSS_LIST_MAX_KEYS` 个键（默认 100 万，0=不限），大桶请用 prefix 翻页；
 首次列举后每节点按桶缓存键集（`OSS_KEY_CACHE_MAX_KEYS`/`OSS_KEY_CACHE_MAX_TOTAL_KEYS`
@@ -82,7 +83,9 @@ EC 写/读均已分块流式：内存峰值 ≈ 块缓冲（MiB 级），与对�
 保留 30 天（`OSS_JOB_RETENTION_DAYS` 修改，0 关闭，上限 3650），每小时由 leader 经
 feature level 6 的 `JobPurge` 命令分批清理，`queued`/`running`/`preempted` 永不删除。
 启用 feature 6 前需全集群升级：旧节点 advertise ≤5，effective level 停在 5，`JobPurge`
-在 append 前被拒（单向门，激活后不可回滚）。
+在 append 前被拒（单向门，激活后不可回滚）。feature level 7 的恢复后续状态/调度租约命令
+同样需全集群升级；旧节点 advertise ≤6，effective 停在 6，相关命令在 append 前被拒。
+账户硬配额配置 API 暂仅 standalone 可用（Raft 模式返回 501，配额执行在限额已写入后生效）。
 
 ## 对象生命周期
 

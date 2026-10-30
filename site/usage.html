@@ -62,7 +62,7 @@
         <a href="usage.html" aria-current="page">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.25.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.26.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -279,12 +279,13 @@ oss-server cluster-shrink rollback --plan plan.json --yes # commit 前回滚</co
                 <tr><td>DP-1 数据面混版</td><td>已支持门控（NodeHealth wire/epoch/hash；V1 列表 <code>list-marker</code>、LMU <code>mpu-union</code> 降级；ListObjectVersions/MPU 转发 fail-closed）；DP-2 mesh 入站 TLS 热轮换已交付；滚动 e2e 已在同版本与 v1.13.1 旧二进制上通过</td></tr>
                 <tr><td>M3 缩容（shrink）</td><td><code>plan/apply/verify/commit/rollback</code> 已交付（离线、全节点 maintenance、显式 slot 目标；commit 写 topology v4 作回退防线）；4→3 真进程 loopback e2e 已交付；单机→集群仍为重新灌入</td></tr>
                 <tr><td>Level C / OSSCTL3</td><td>地基（feature level 1..3；OSSCTL3 扩展区；Ext 容器 registry 为空）；v1.20.1 ↔ v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不支持；生产 Ext 命令与完整双向混写未交付</td></tr>
-                <tr><td>Raft 租户账户</td><td>账户/成员写路径已改走 Raft 命令（8 个 level-3 <code>ControlCommand</code>，按 username 自然键；OSSCTL3 快照含账户行）；软字节配额已交付（只告警不阻写）；跨账户共享与 canonicalization worker 未交付</td></tr>
-                <tr><td>账户软字节配额</td><td>已支持（<code>GET /accounts/{id}/usage</code> + <code>PUT /accounts/{id}/soft-quota</code>；仅告警不阻写；用量为全量列举，集群丢 peer 时 <code>complete=false</code>/头 <code>partial</code>；硬字节与对象数配额不做）</td></tr>
-                <tr><td>M8 多节点运行时</td><td>jobs/job_tasks 与 Restore 受理行（feature 4）、inventory 三表与 lifecycle 游标（feature 5）经 Raft 复制，终态作业保留 <code>JobPurge</code>（feature 6，<code>OSS_JOB_RETENTION_DAYS</code> 默认 30）已交付；全 peer 达标才启用（旧节点单向门）；schedule lease/worker takeover 与 tier restore 后续状态未交付</td></tr>
-                <tr><td>全对象 GET 内存</td><td>无 Range GET 流式直出（EC 64 KiB 块、加密按 unit 解密），内存与对象大小无关；Range/partNumber 仍有界缓冲；EC 数据片缺失时的整读重建受 <code>OSS_MAX_BUFFERED_GET_BYTES</code>（默认 512 MiB）限制</td></tr>
-                <tr><td>大桶列举</td><td>每节点键缓存（<code>OSS_KEY_CACHE_MAX_KEYS</code>/<code>OSS_KEY_CACHE_MAX_TOTAL_KEYS</code> 默认各 200 万、TTL 300 秒）与在途 MPU 索引；超限或加载失败回退逐页扫描；单次列举仍受 <code>OSS_LIST_MAX_KEYS</code> 约束，大桶建议使用 prefix</td></tr>
-                <tr><td>审计投递</td><td>有界异步批量队列（4096 行、100 ms/256 行落库）；队列满时丢弃并计数，审计为 best-effort，不阻塞也不改变请求结果</td></tr>
+                <tr><td>Raft 租户账户</td><td>账户/成员写路径已改走 Raft 命令（8 个 level-3 <code>ControlCommand</code>，按 username 自然键；OSSCTL3 快照含账户行）；canonicalization worker 已交付（standalone 单事务 + marker，Raft leader 复用既有命令）</td></tr>
+                <tr><td>账户配额</td><td>软字节配额：<code>GET /accounts/{id}/usage</code> + <code>PUT /accounts/{id}/soft-quota</code>（只告警）；硬字节/对象数：写入预留、删除释放、30s 惰性/60s 采样聚合，对端不可达按已知下界拒绝（未知增量 fail-open）；<code>PUT /accounts/{id}/hard-quota</code> 在 standalone 生效，Raft 模式暂 501；版本定向删除靠采样器收敛</td></tr>
+                <tr><td>M8 多节点运行时</td><td>jobs/job_tasks 与 Restore 受理行（feature 4）、inventory 三表与 lifecycle 游标（feature 5）、终态作业保留 <code>JobPurge</code>（feature 6）、tier restore 后续状态与调度租约 acquire/renew/takeover（feature 7）均已复制；全 peer 达标才启用（旧节点单向门）；follower 发起的 Restore 清理当前无 fencing term、由 leader reaper 收敛</td></tr>
+                <tr><td>全对象 GET 内存</td><td>无 Range GET 流式直出（EC 64 KiB 块、加密按 unit 解密），远端分片按 <code>OSS_SHARD_READ_BATCH_BYTES</code>（默认 1 MiB）批量读；Range/partNumber 仍有界缓冲；EC 数据片缺失时的整读重建受 <code>OSS_MAX_BUFFERED_GET_BYTES</code>（默认 512 MiB）限制</td></tr>
+                <tr><td>大桶列举</td><td>每节点键缓存（<code>OSS_KEY_CACHE_MAX_KEYS</code>/<code>OSS_KEY_CACHE_MAX_TOTAL_KEYS</code> 默认各 200 万、TTL 300 秒）与在途 MPU 索引（<code>OSS_MPU_INDEX_TTL_SECS</code> 默认 300）；超限或加载失败回退逐页扫描；单次列举仍受 <code>OSS_LIST_MAX_KEYS</code> 约束，大桶建议使用 prefix</td></tr>
+                <tr><td>审计投递</td><td>有界异步批量队列（4096 行、100 ms/256 行落库）；队列满时丢弃并计数，<code>/metrics</code> 导出 <code>oss_audit_dropped_total</code>；审计为 best-effort，不阻塞也不改变请求结果</td></tr>
+                <tr><td>桶复制过滤器</td><td>支持 <code>Prefix</code>/<code>Tag</code>/<code>And</code> 并回读归一化；Tag 规则的删除事件不复制（删除时无标签快照，已标 shortcut）；复制体按 256 KiB 分块令牌桶限速，跨请求共享远端配额</td></tr>
                 <tr><td>Inventory 增量 / 跨账户目标</td><td>已支持（增量水位为节点本地；跨账户目标仅管理员可配置）</td></tr>
                 <tr><td>AbortIncompleteMultipartUpload</td><td>已支持（生命周期规则）</td></tr>
                 <tr><td>Batch 抢占 / 跨账户清单</td><td>已支持（同提交者协作抢占；跨账户清单仅管理员；跨账户通知仍不做）</td></tr>
@@ -315,7 +316,7 @@ oss-server cluster-shrink rollback --plan plan.json --yes # commit 前回滚</co
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.25.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.26.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

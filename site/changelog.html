@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.25.0，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.26.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.25.0 硬化版；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.26.0 控制面版；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.25.0 硬化版；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.26.0 控制面版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.25.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.26.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.25.0 的硬化版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.26.0 的控制面版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-26-0">v1.26.0</a>
           <a href="#v1-25-0">v1.25.0</a>
           <a href="#v1-24-0">v1.24.0</a>
           <a href="#v1-23-0">v1.23.0</a>
@@ -103,9 +104,26 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.25.0</strong>（2026-10-31）。</p>
+          <p>当前最新发布：<strong>v1.26.0</strong>（2026-10-31）。</p>
 
           <div class="changelog-list">
+            <details class="changelog-entry" id="v1-26-0" open>
+              <summary><strong>v1.26.0</strong><time datetime="2026-10-31">2026-10-31</time><span>控制面版</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>M8 feature level 7</strong>：tier restore 后续状态（restored/清理/回滚）经 <code>TierRestoreUpsert</code>/<code>TierRestoreDelete</code> 复制，leader 切换不再丢在途 Restore 状态；<code>schedule_lease</code> 增加 acquire/renew/takeover（TTL 默认 30s，<code>OSS_SCHEDULE_LEASE_SECS</code>），调度器/清单/生命周期/tier sweep 统一走租约 fencing。全 peer ≥7 才启用，旧节点单向门；快照仍为 OSSCTL3，无迁移。</li>
+                  <li><strong>账户硬配额</strong>：账户当前版本字节数与对象数上限，写入前原子预留、删除释放；跨节点用量按 30s 惰性/60s 采样聚合，对端不可达时只按已知下界拒绝（未知增量 fail-open），DB 错误 fail-closed。API <code>PUT /accounts/{id}/hard-quota</code>：standalone 直接写，Raft 模式暂返回 501；限额已写入后执行生效。</li>
+                  <li><strong>legacy 账户规范化 worker</strong>：serve 启动后 leader 门控补账户/成员行；standalone 单事务 + marker，Raft 复用 <code>AccountCreate</code>/<code>AccountMemberAttach</code>，不新增命令。</li>
+                  <li><strong>流式 GET 批量读</strong>：远端 EC 分片按 <code>OSS_SHARD_READ_BATCH_BYTES</code>（默认 1 MiB，上限 16 MiB）一次读多块，减少 RPC；CRC32C、unit 解密与明文 SHA-256 不变。</li>
+                  <li><strong>缓存/保留/审计</strong>：MPU 索引增加 TTL（默认 300s）并收敛 clean/加载竞态；<code>0009</code> 为 <code>terminal_jobs_before</code> 增加 <code>(state, updated_at)</code> 索引；<code>/metrics</code> 导出 <code>oss_audit_dropped_total</code>。</li>
+                  <li><strong>桶复制</strong>：支持 <code>Prefix</code>/<code>Tag</code>/<code>And</code> 过滤器并回读归一化；复制体按 256 KiB 分块令牌桶限速，跨请求共享远端配额。Tag 规则不复制删除事件（无标签快照，已标 shortcut）。</li>
+                  <li><strong>验证</strong>：fmt/clippy <code>-D warnings</code> 通过；xl-store 369/0、xl-s3 194/0、oss-server 248/0；复制 35、账户 12、3-voter restore/lease 3、observability 4；完整 workspace 见仓库记录。</li>
+                  <li><strong>仍未交付</strong>：Raft 模式硬配额配置命令、tier restore 的 follower 立即清理（当前由 leader 收敛）、Level C 双向混写、跨版本 MPU、AP 动态 registry、真实 PrivateLink、单机→集群工具化。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.26.0" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+
             <details class="changelog-entry" id="v1-25-0" open>
               <summary><strong>v1.25.0</strong><time datetime="2026-10-31">2026-10-31</time><span>硬化版</span></summary>
               <div class="entry-body">
@@ -430,7 +448,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.25.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.26.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

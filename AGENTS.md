@@ -4,10 +4,11 @@
 
 ## 当前状态
 
-M1–M9 已完成，最新发布 **v1.25.0（2026-10-31）**；M5 安全与锁定全部交付——集群行一致性
+M1–M9 已完成，最新发布 **v1.26.0（2026-10-31）**；M5 安全与锁定全部交付——集群行一致性
 广播 · 密钥库/KMS · 加密数据面 DARE 式 · S3 面 SSE-S3/KMS/C · 对象锁 · STS（含
-`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.25 增加全对象 GET 流式直出、列举键缓存、
-EC 分片并行写、异步审计批量队列与 feature level 6 `JobPurge` 终态作业保留。**以 docs/ 为准**：
+`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.26 交付 feature level 7 的恢复后续状态/
+调度租约复制、账户硬字节/对象数配额与规范化 worker，并补齐流式 GET 批量读、MPU 索引 TTL、
+`JobPurge` 索引与复制 Tag/And 过滤/分块限速。**以 docs/ 为准**：
 
 - `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1；§8 含各阶段落地状态）
 - `docs/superpowers/specs/2026-10-10-feature-spec.md` —— 功能域规格（行为/接口/边界/错误码；M5 域含落地记录）

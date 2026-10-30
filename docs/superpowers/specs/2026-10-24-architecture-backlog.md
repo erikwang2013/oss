@@ -30,7 +30,7 @@
 > 混版已验证（专项 147/0/0，旧端无需补丁；v1.13.1 不再支持）；Batch Delete e2e、AP HTTP
 > 信任链 E2E、follower 权限追赶、tier flake 修复与 `tier-audit`、升级 preflight、单机→集群
 > re-ingest、桶配额并发修复均落地。硬字节/对象数配额与 M8-2 仍为里程碑（本波不实现）；
-> AP 动态 registry（Slice B）需 feature level ≥7（4=jobs、5=inventory、6=JobPurge 已占用），暂不排期。
+> AP 动态 registry（Slice B）需 feature level ≥8（4=jobs、5=inventory、6=JobPurge、7=租约/恢复已占用），暂不排期。
 >
 > **2026-10-30 更新（v1.24.0，M8-2 feature 4/5）**：v1.23.0 发布 jobs/job_tasks/
 > tier_restores（Restore 受理行）复制，作为 **feature level 4**（`FEATURE_LEVEL_4`）；
@@ -50,7 +50,16 @@
 > `JobPurge` 终态作业保留**（`OSS_JOB_RETENTION_DAYS` 默认 30 天，leader 每小时分批，
 > 只删终态并清 runstate 引用，全 peer ≥6 才可用）。同时合入授权/DoS/运维审计修复。
 > 仍缺：tier restore 后续状态与 schedule lease/takeover、硬字节/对象数配额、真实
-> PrivateLink、AP 动态 registry（升到 level 7）、完整数据面滚动升级。
+> PrivateLink、AP 动态 registry（升到 level 8）、完整数据面滚动升级。
+>
+> **2026-10-31 更新（v1.26.0，feature 7 + 租户/数据面）**：**feature level 7 交付
+> tier restore 后续状态复制与调度租约 acquire/renew/takeover**（`TierRestore*`/
+> `ScheduleLeaseAcquire`，3-voter 收敛/接管测试；快照 OSSCTL3 无迁移）；**硬字节/对象数
+> 配额**（写入预留、删除释放、30s/60s 采样；Raft 配置 API 暂 501）与 **legacy 账户
+> 规范化 worker** 交付；流式 GET 远端分片批量读、MPU 索引 TTL、`JobPurge` 保留索引、
+> 审计丢弃指标、复制 Tag/And 过滤与 256 KiB 分块限速落地。仍缺：Raft 硬配额配置命令、
+> follower Restore 清理的即时 fencing、Level C 双向混写/数据面滚动、跨版本 MPU、
+> AP 动态 registry、真实 PrivateLink、单机→集群工具化、Raft 日志/快照增量存储。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
@@ -64,8 +73,8 @@
 |---|---|---|---|---|---|
 | 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.20.1↔v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不再支持；缺生产 Ext 命令、完整双向混写与数据面滚动 | 6–10 人周 | 生产 Ext 命令、CMK 重包、数据面滚动 | 高 |
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；仍缺跨版本 MPU 完成 | 4–8 人周 | 跨版本 MPU 语义 | 高 |
-| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软字节配额 + 管理员 UI 已交付；仍缺硬字节/对象数配额、canonicalization worker | 5–8 人周 | 跨节点用量聚合 | 中高 |
-| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；M8-1 leader 门控、M8-2a runstate 快照扩展、M8-3 一致读（`consistent=1`/applied 头）已交付；jobs/job_tasks/tier_restores 在 feature 4、inventory 运行态与 lifecycle 游标在 feature 5、终态作业保留（`JobPurge`）在 feature 6 交付；仍缺 tier restore 后续状态/lease takeover/故障切换 | 5–8 人周 | OSSCTL2/3（持久化部分） | 高 |
+| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软/硬字节与对象数配额 + 管理员 UI + canonicalization worker 已交付；硬配额跨节点为 30s/60s 有界陈旧，Raft 配置命令仍缺 | 1–2 人周（配置命令/精确聚合） | 复制配额配置、跨节点精确用量 | 中高 |
+| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；feature 4/5/6/7 分别交付 jobs/Restore 受理、inventory/lifecycle 游标、JobPurge、tier restore 后续状态与调度租约；仍缺 follower Restore 清理的即时 fencing 与真实滚动故障切换演练 | 0.5–1 人周 | 既有 feature 7 命令 | 中 |
 | 5 | M3 shrink / 单机→集群 | shrink 4→3 已交付：topology v4 + 离线 plan/apply/verify/commit/rollback + loopback e2e（验收 §15.2）；单机→集群仍为重新灌入，不工具化 | 不排期 | 拓扑映射 + 停机全量迁移 | 极高（若工具化） |
 
 ---
