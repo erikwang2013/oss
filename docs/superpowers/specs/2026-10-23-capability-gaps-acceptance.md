@@ -634,3 +634,25 @@ feature-5 首次激活清空本地旧游标后，不再有时钟偏移导致的�
 
 **原 v1.23.0 验证**：`e2e_m9` stretch 64/0/1、sync 85/0/1；合并后 main 的 `oss-server`
 全量 **68 suites / 0 failed / RC=0**；clippy `-D warnings` 与 fmt 均 0。
+
+## 19. 2026-10-31 v1.25.0：流式 GET、列举加速、写并行、异步审计与 feature 6
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| 全对象 GET 流式直出 | `xl-store/store/read.rs::stream_object_ext`、`xl-s3/service.rs` | 无 Range GET 在 EC 形态按 64 KiB 块、旧 parts 按文件块直出；加密对象按 unit 解密（至多缓存一个 unit）；逐片 CRC32C + 流末明文 SHA-256；首字节前探测数据片，缺失回退受 `OSS_MAX_BUFFERED_GET_BYTES` 约束的整读；开流后缺失/短读报错不跳字节。Range/partNumber 仍有界缓冲。`stream_object_ec_is_byte_identical`、加密等价、缺片回退、`get_object_large_ec_streams_and_range_still_works` 全过 |
+| CopyObject 源流式 | `xl-s3/service.rs` | CopyObject 源读取复用流式路径，源消费完才提交；同键复制安全 |
+| 列举键缓存 | `xl-store/store/key_cache.rs` | 每节点按桶懒加载键集，每批 1024 键；`OSS_KEY_CACHE_MAX_KEYS`/`OSS_KEY_CACHE_MAX_TOTAL_KEYS` 默认各 200 万、`OSS_KEY_CACHE_TTL_SECS` 默认 300；超限/加载失败回退逐页扫描；加载期 delta 合并；put/purge/mesh 提交/删除/fsck/删桶钩子；V1/V2 marker、prefix/delimiter 分页保持 |
+| 在途 MPU 索引 | `xl-store/store/mpu_index.rs` | 首次扫描后 create/abort/complete 增量维护；LMU 的 marker/delimiter/limit 语义不变，CommonPrefixes 仅取有在途 upload 的键（AWS 语义）；`clean` 回收暂存区后按目录 UUID 同步移除索引；`NoSuchBucket` 不永久禁用 |
+| 分片并行写 | `xl-store/store/put.rs` | 同一块编码后的各片写（本地盘 / 远端 RPC）`join_all` 并行；单片失败只作废该片，quorum 计数不变；`OSS_TEST_ABORT_AFTER_SHARD` 断电注入保留逐片顺序路径 |
+| 异步审计队列 | `oss-server/audit_queue.rs`、`xl-s3/access.rs` | 有界 4096，单 worker 每 100 ms 或 256 行批量事务落库，失败重试一次后丢弃；满队列 `try_send` 丢弃并计数（首次/每 1000 条告警）；仅 serve 分支挂 worker，测试与离线命令保持同步直写 |
+| feature 6 JobPurge | `raft/{compat,command,apply}.rs`、`db.rs`、`job_state.rs`、`jobs.rs` | 终态作业保留 `OSS_JOB_RETENTION_DAYS`（默认 30，0 关，上限 3650）；leader 每小时最多 10×1000 批；`JobPurge` 非空/去重/≤1000、min level 6；apply 只删 done/error/cancelled 并同事务清 inventory/tier/parent 引用；幂等；`queued`/`running`/`preempted` 永不删除 |
+| 审计修复 | `xl-s3/{access,policy,service}.rs`、`oss-server/{console,db,state,lifecycle}.rs`、Docker/e2e/web | 补全 Select/加密/通知/复制/策略/ListBuckets 等操作授权映射；未映射操作与无桶会话 fail-closed；CopyObject 预 HEAD 上限；GET 条件与 TOCTOU 同 meta；登录体长度上限与通用 400；Argon2id 信号量卸载；列举 `OSS_LIST_MAX_KEYS`；Docker secret 0700/0600、JWT 占位 fail-closed、compose 健康检查与环回端口；控制台懒路由/无限分页 |
+| 文档与图片 | README / README.en / AGENTS / 本站 changelog、index、install、usage、api / social preview | 版本号统一 1.25.0；新增性能与保留策略说明；社交预览图重渲染 |
+
+**验证（本机，2026-10-31）**：`cargo fmt --all --check` 通过；xl-store/xl-s3/oss-server/
+xl-client/xl-proto `clippy --all-targets -D warnings` 通过；`xl-store --lib` 363/0、
+`xl-s3 --lib` 189/0、`object_ops` 57/0、`oss-server --lib` 240/0、`raft_command_contract`
+3/0/1；`policy_audit` 2/0、`m8_ap` 23/0、`m8_ap_trust` 9/0、`m8_batch` 20/0、
+`m8_inventory` 23/0、`console_api` 33/0；`raft_jobs_activation` 4/0、
+`raft_runstate_snapshot` 14/0、`raft_cutover_provenance` 6/0、`raft_handshake` 2/0、
+`kill9` 1/0。完整 workspace 聚合跑因宿主 I/O 饱和未完成，发布以分 crate/分套件闸门为准。

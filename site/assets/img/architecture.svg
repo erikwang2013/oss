@@ -11,7 +11,7 @@
   <rect x="1" y="1" width="958" height="798" rx="14" fill="#ffffff" stroke="#e5e7eb"/>
 
   <text x="40" y="46" font-size="20" font-weight="700" fill="#0f172a">OSS · 系统架构</text>
-  <text x="40" y="70" font-size="11.5" fill="#64748b">Rust 2024 · 五 crate 依赖 · EC 8+4 · 版本/加密/锁 · 事件/Select/复制 · 多站点 · 账户 · AP/OLAP/WASM · Batch · Inventory · 分层 · DP-0 · Raft 滚动 · TLS/SASL</text>
+  <text x="40" y="70" font-size="11.5" fill="#64748b">Rust 2024 · 五 crate · EC 8+4 · 版本/加密/锁 · 事件/Select/复制 · 多站点 · 账户 · AP/OLAP/WASM · Batch/Inventory · 分层 · DP-0 · Raft · 流式 GET · TLS/SASL</text>
 
   <!-- 客户端 -->
   <rect x="690" y="94" width="250" height="56" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
@@ -64,7 +64,7 @@
   <text x="765" y="363" font-size="10" fill="#64748b" text-anchor="middle">授权：策略 Deny 优先 → 三档权限</text>
   <text x="765" y="376" font-size="10" fill="#64748b" text-anchor="middle">SSE / 对象锁头解析</text>
   <text x="765" y="394" font-size="10" fill="#64748b" text-anchor="middle">AP 别名 / OLAP / 分层</text>
-  <text x="646" y="412" font-size="11" fill="#374151">桶/对象 CRUD · 版本链 · MPU · Range</text>
+  <text x="646" y="412" font-size="11" fill="#374151">桶/对象 CRUD · 版本链 · MPU · Range · 流式 GET</text>
   <text x="646" y="432" font-size="11" fill="#374151">CopyObject（双轴判权）· 批量删逐键</text>
   <text x="646" y="452" font-size="10.5" fill="#94a3b8">对象锁桶须版本控制 Enabled</text>
 

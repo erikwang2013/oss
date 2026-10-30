@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.24.0，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.25.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,滚动升级">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.24.0 功能版；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.25.0 硬化版；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.24.0 功能版；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.25.0 硬化版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.24.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.25.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.24.0 的功能版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.25.0 的硬化版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-25-0">v1.25.0</a>
           <a href="#v1-24-0">v1.24.0</a>
           <a href="#v1-23-0">v1.23.0</a>
           <a href="#v1-22-0">v1.22.0</a>
@@ -102,9 +103,26 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.24.0</strong>（2026-10-30）。</p>
+          <p>当前最新发布：<strong>v1.25.0</strong>（2026-10-31）。</p>
 
           <div class="changelog-list">
+            <details class="changelog-entry" id="v1-25-0" open>
+              <summary><strong>v1.25.0</strong><time datetime="2026-10-31">2026-10-31</time><span>硬化版</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>全对象 GET 流式直出</strong>：无 Range 的 GET 在 EC 形态按 64 KiB 块、旧 parts 按文件块直出；加密对象按 unit 解密（至多缓存一个 unit），内存不再随对象大小增长。逐片 CRC32C 与流末明文 SHA-256 终验；首字节前探测数据片，缺失回退受 <code>OSS_MAX_BUFFERED_GET_BYTES</code> 约束的重建；开流后缺失报错不跳字节。Range/partNumber 仍有界缓冲，CopyObject 源读取同样流式。</li>
+                  <li><strong>列举键缓存与 MPU 索引</strong>：每节点按桶懒加载键集，每批 1024 键；<code>OSS_KEY_CACHE_MAX_KEYS</code>/<code>OSS_KEY_CACHE_MAX_TOTAL_KEYS</code> 默认各 200 万、<code>OSS_KEY_CACHE_TTL_SECS</code> 默认 300；超限回退逐页扫描。在途 MPU 索引按 create/abort/complete 增量维护，<code>clean</code> 回收暂存区后同步失效。</li>
+                  <li><strong>分片并行写</strong>：同一块编码后的本地盘/远端 RPC 分片写并发执行，单片失败只作废该片，quorum 计数不变；断电注入测试保留逐片顺序路径。</li>
+                  <li><strong>异步审计队列</strong>：有界 4096 行，单 worker 每 100 ms 或 256 行批量落库；队列满丢弃并计数（首次/每 1000 条告警），审计不阻塞请求。仅 serve 路径挂 worker，测试/离线命令保持同步直写。</li>
+                  <li><strong>feature level 6 JobPurge</strong>：终态作业按 <code>OSS_JOB_RETENTION_DAYS</code>（默认 30，0 关）由 leader 每小时分批清理；只删 <code>done</code>/<code>error</code>/<code>cancelled</code> 并同事务清 inventory/tier/parent 引用，<code>queued</code>/<code>running</code>/<code>preempted</code> 永不删除。全 peer ≥6 才可用，单向门。</li>
+                  <li><strong>授权、DoS 与运维审计修复</strong>：补全 Select/加密/通知/复制/策略/ListBuckets 等 S3 操作授权映射；未映射操作与无桶会话 fail-closed；CopyObject 预 HEAD 上限；GET 条件与 TOCTOU 同 meta；登录体长度上限与 Argon2id 信号量卸载；列举上限；Docker secret 0700/0600、JWT 占位 fail-closed、compose 健康检查与环回端口；控制台懒路由与无限分页。</li>
+                  <li><strong>验证</strong>：fmt/clippy <code>-D warnings</code> 通过；xl-store 363、xl-s3 189 + object_ops 57、oss-server 240 + 契约/审计/M8/Raft 套件全过；kill9 通过。</li>
+                  <li><strong>仍未交付</strong>：tier restore 后续状态与 schedule lease/takeover、硬字节/对象数配额、真实 PrivateLink、AP 动态 registry（需 feature 7）、完整数据面滚动升级。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.25.0" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+
             <details class="changelog-entry" id="v1-24-0" open>
               <summary><strong>v1.24.0</strong><time datetime="2026-10-30">2026-10-30</time><span>功能版</span></summary>
               <div class="entry-body">
@@ -412,7 +430,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.24.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.25.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
