@@ -64,6 +64,11 @@ pub struct AppConfig {
     /// M3 shrink：维护模式（非 GET/HEAD/OPTIONS 一律 503、后台 worker 全停）。
     #[serde(default)]
     pub maintenance: bool,
+    /// Level C 停写排空：本节点拒绝客户端写（GET/HEAD/OPTIONS、登录与节点间
+    /// Raft RPC 除外），读面保持在线。只约束本进程——旧二进制没有此开关，
+    /// 混版窗口内仍须由 LB/客户端移除其写流量。
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// `[ap]`：访问点来源端点注册表（Slice A 静态配置；动态 DB/Raft 不在本切片）。
@@ -1334,6 +1339,7 @@ mod tests {
             data_dirs: None,
             ec: Default::default(),
             maintenance: false,
+            read_only: false,
             staging_dir: "s".into(),
             database_url: "sqlite::memory:".into(),
             jwt_secret: String::new(),
@@ -1478,6 +1484,24 @@ mod tests {
         // 无 [raft] 时必须放行（这是 shrink 的 maintenance 部署形态；raft_validate 被
         // AppConfig::load 无条件调用，不能在这里误杀 [cluster] shrink）。
         on.raft_validate().unwrap();
+    }
+
+    /// read_only 默认 false（既有部署零改动）；显式 true 可解析，且允许 [raft]
+    /// （手工排空节点仍需接收 raft RPC 才能继续 apply）。
+    #[test]
+    fn read_only_defaults_false() {
+        let base = "listen = \"127.0.0.1:0\"\n\
+                    data_dir = \"d\"\n\
+                    staging_dir = \"s\"\n\
+                    database_url = \"sqlite::memory:\"\n\
+                    jwt_secret = \"\"\n";
+        let off: AppConfig = toml::from_str(base).unwrap();
+        assert!(!off.read_only);
+        let on: AppConfig = toml::from_str(&format!("{base}read_only = true\n")).unwrap();
+        assert!(on.read_only);
+        let mut raft = m9_cfg();
+        raft.read_only = true;
+        raft.raft_validate().unwrap();
     }
 
     /// maintenance 是 [cluster] shrink 的停写开关；[raft] 的 RPC 是 POST，会被
@@ -1945,6 +1969,7 @@ mod tests {
             data_dirs: None,
             ec: Default::default(),
             maintenance: false,
+            read_only: false,
             staging_dir: std::path::PathBuf::from("/tmp/x"),
             database_url: "sqlite::memory:".into(),
             jwt_secret: "k".repeat(32),

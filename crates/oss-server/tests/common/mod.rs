@@ -127,6 +127,7 @@ async fn state_with_db_url(
         data_dirs: None,
         ec: Default::default(),
         maintenance,
+        read_only: false,
         staging_dir: dir.join("staging"),
         database_url,
         jwt_secret: JWT_SECRET.into(),
