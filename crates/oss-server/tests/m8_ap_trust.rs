@@ -16,7 +16,10 @@ use bytes::Bytes;
 use oss_server::router::{ApTrustConfig, build_router_with_trust};
 use oss_server::state::AppState;
 use reqwest::Client;
-use xl_s3::ap::{AccessPoint, ApEndpoint, ApEndpointSource};
+use xl_s3::ap::{
+    AccessPoint, ApEndpoint, ApEndpointContext, ApEndpointIdentity, ApEndpointSource,
+    ApEndpointVerifyError, EndpointIdentityVerifier, TrustedProxyEndpointVerifier,
+};
 
 const VPCE: &str = "vpce-0trust001";
 const VPC: &str = "vpc-0trust001";
@@ -177,6 +180,28 @@ fn trusted(peer_cidrs: &str) -> ApTrustConfig {
         trust_proxy: true,
         peer_cidrs: Some(peer_cidrs.into()),
         ..Default::default()
+    }
+}
+
+fn trusted_verify(peer_cidrs: &str) -> ApTrustConfig {
+    ApTrustConfig {
+        endpoint_verifier: Some(Arc::new(TrustedProxyEndpointVerifier::new(
+            peer_cidrs
+                .split(',')
+                .map(|c| xl_s3::ap::parse_cidr(c).unwrap()),
+        ))),
+        ..trusted(peer_cidrs)
+    }
+}
+
+struct UnavailableVerifier;
+#[async_trait::async_trait]
+impl EndpointIdentityVerifier for UnavailableVerifier {
+    async fn verify(
+        &self,
+        _ctx: &ApEndpointContext,
+    ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError> {
+        Err(ApEndpointVerifyError::Unavailable("test outage".into()))
     }
 }
 
@@ -471,4 +496,150 @@ async fn delete_objects_request_gate_and_audit() {
         .await
         .unwrap();
     assert_eq!(gone.status(), 404, "del 已删除");
+}
+
+/// 验证器启用：可信反代头被验证为端点身份（审计带证据来源），registry 仍放行。
+#[tokio::test]
+async fn verifier_trusted_proxy_accepted_and_evidence_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        trusted_verify("127.0.0.1/32"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+
+    assert_eq!(
+        e.get_status(&[("x-oss-source-vpce", VPCE), ("x-oss-source-vpc", VPC),])
+            .await,
+        200,
+        "可信反代 + active 端点应放行"
+    );
+    let detail = e.last_detail().await.unwrap();
+    assert!(
+        detail.contains(&format!("endpoint={VPCE}/account={}", e.account))
+            && detail.contains("endpoint:evidence=trusted-proxy"),
+        "审计须记录端点/账户/证据来源: {detail}"
+    );
+}
+
+/// 验证器启用：直连客户端伪造头（peer 不在可信网段 / 无 ConnectInfo）→ 403，
+/// 即使 registry 有 active 行也不得放行。
+#[tokio::test]
+async fn verifier_rejects_direct_spoofed_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    // listener 在 127.0.0.1，但只信任 10/8：直连客户端的头必须被验证器拒绝。
+    let e = env(
+        dir.path(),
+        trusted_verify("10.0.0.0/8"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+    assert_eq!(
+        e.get_status(&[("x-oss-source-vpce", VPCE), ("x-oss-source-vpc", VPC),])
+            .await,
+        403
+    );
+    let detail = e.last_detail().await.unwrap();
+    assert!(
+        detail.contains("endpoint:deny:untrusted-source"),
+        "伪造来源拒绝须可追溯: {detail}"
+    );
+
+    // 传输层不提供 ConnectInfo：无可信直连对端 → 同样拒绝。
+    let dir2 = tempfile::tempdir().unwrap();
+    let registry2 = Arc::new(Registry::default());
+    let e2 = env(
+        dir2.path(),
+        trusted_verify("127.0.0.1/32"),
+        registry2.clone(),
+        false,
+    )
+    .await;
+    registry2.put(VPCE, VPC, &e2.account, "active");
+    assert_eq!(
+        e2.get_status(&[("x-oss-source-vpce", VPCE), ("x-oss-source-vpc", VPC),])
+            .await,
+        403
+    );
+    let detail = e2.last_detail().await.unwrap();
+    assert!(
+        detail.contains("endpoint:deny:untrusted-source"),
+        "缺 ConnectInfo 须拒绝: {detail}"
+    );
+}
+
+/// 验证后端不可用 → 500 fail-closed（绝不当作「无端点声明」放行）。
+#[tokio::test]
+async fn verifier_backend_failure_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        ApTrustConfig {
+            endpoint_verifier: Some(Arc::new(UnavailableVerifier)),
+            ..Default::default()
+        },
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+    assert_eq!(
+        e.get_status(&[("x-oss-source-vpce", VPCE), ("x-oss-source-vpc", VPC),])
+            .await,
+        500
+    );
+}
+
+/// 验证器只证明来源；registry 的登记/状态/账户检查仍全部生效。
+#[tokio::test]
+async fn verifier_keeps_registry_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        trusted_verify("127.0.0.1/32"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    let headers = [("x-oss-source-vpce", VPCE), ("x-oss-source-vpc", VPC)];
+    let get = || e.get_status(&headers);
+
+    registry.clear();
+    assert_eq!(get().await, 403, "unregistered");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:unregistered")
+    );
+
+    registry.put(VPCE, VPC, &e.account, "disabled");
+    assert_eq!(get().await, 403, "disabled");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:disabled")
+    );
+
+    registry.put(VPCE, VPC, "123456789012", "active");
+    assert_eq!(get().await, 403, "account-mismatch");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:account-mismatch")
+    );
+
+    registry.put(VPCE, VPC, &e.account, "active");
+    assert_eq!(get().await, 200, "active + 同账户");
 }

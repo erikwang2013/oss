@@ -11,10 +11,14 @@
 //! `OSS_AP_VPCE_ID` 或可信反代头），不是 PrivateLink/ENI 端点身份，两者互不推断。
 //! Slice A 的端点 registry（`[[ap.vpc_endpoints]]`）同样是**注册断言**：只把可信来源的
 //! vpce 声明收紧为「已登记、active、受账户约束」，不能证明连接真的来自该端点。
-//! AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是 non-goal。
+//! 配置 `EndpointIdentityVerifier` 时，来源证明先由验证器按传输层事实收敛为
+//! `ApEndpointIdentity`（可信反代网段；AWS/mTLS 为外部契约），再与 registry 行交叉校验；
+//! 未配置时行为与 Slice A 完全一致。AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是
+//! non-goal。
 //!
-//! 明确不支持（non-goals）：真 VPC 端点（PrivateLink/ENI）、经 AP 的桶级 Create/Delete/
-//! ListBuckets（保存策略时即拒绝这些动作）、多用户账户模型、强跨节点 AP 缓存一致性。
+//! 明确不支持（non-goals）：真 VPC 端点（PrivateLink/ENI）控制面身份、经 AP 的桶级
+//! Create/Delete/ListBuckets（保存策略时即拒绝这些动作）、多用户账户模型、强跨节点 AP
+//! 缓存一致性。
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -822,6 +826,144 @@ pub struct ApVpc(pub String);
 #[derive(Debug, Clone)]
 pub struct ApVpce(pub String);
 
+/// 端点身份证据来源（验证器产出；判定/审计用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApEndpointEvidence {
+    /// 进程级静态配置（`OSS_AP_VPCE_ID`）：部署证明，不依赖连接。
+    StaticConfig,
+    /// 可信反代：直连对端在显式可信网段内，声明头由该反代注入。
+    TrustedProxy,
+    /// 双向 TLS 客户端证书（外部验证器；本仓库尚未把证书下沉到请求，见 trait 契约）。
+    Mtls,
+    /// AWS PrivateLink 控制面 API 核对（外部验证器；本仓库不伪造，见 trait 契约）。
+    AwsApi,
+}
+
+impl ApEndpointEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticConfig => "static",
+            Self::TrustedProxy => "trusted-proxy",
+            Self::Mtls => "mtls",
+            Self::AwsApi => "aws-api",
+        }
+    }
+}
+
+/// 验证后的端点身份（registry 行之前）：`vpce_id` 已证明来源；`vpc_id`/`account_id`
+/// 仅当证据来源能独立给出时有值（可信反代不提供），与 registry 行不一致即拒绝。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApEndpointIdentity {
+    pub vpce_id: String,
+    pub vpc_id: Option<String>,
+    pub account_id: Option<String>,
+    pub evidence: ApEndpointEvidence,
+}
+
+/// 路由器归一后的端点声明（**来源未验证**）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ApEndpointClaim {
+    #[default]
+    Absent,
+    /// 恰好一条、形态合法的头值。
+    Header(String),
+    /// 头存在但重复/畸形 → 验证器必须拒绝（fail-closed）。
+    Malformed,
+}
+
+/// 端点身份验证输入：只含传输层/路由器可给出的事实，不含已采信的头语义。
+#[derive(Debug, Clone, Default)]
+pub struct ApEndpointContext {
+    pub claim: ApEndpointClaim,
+    /// 进程级静态声明（部署配置，不是连接事实）。
+    pub static_vpce: Option<String>,
+    /// 直连 TCP 对端（ConnectInfo）；None = 传输层不提供 → 可信反代不成立。
+    pub direct_peer: Option<IpAddr>,
+}
+
+/// 验证失败：区分「声明被拒」（403）与「验证后端不可用」（500）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApEndpointVerifyError {
+    Denied(&'static str),
+    Unavailable(String),
+}
+
+/// 端点身份验证器：把请求上下文收敛为已证明的端点身份，**先于** registry 查询。
+///
+/// 契约：
+/// - 只依据不可由客户端伪造的传输层事实（直连对端、TLS 客户端证书、静态配置）；
+/// - `Ok(None)` = 无端点声明（不单独构成拒绝，由策略条件决定）；`Ok(Some(_))` = 已验证；
+/// - 声明存在但无法证明来源 → `Denied`（403）；验证后端失败 → `Unavailable`（500）；
+/// - registry 的登记/状态/VPC/账户（R2–R5）检查仍在验证之后执行，验证器绝不放宽它们。
+///
+/// 未实现的外部验证器契约（本仓库不伪造真实身份）：
+/// - AWS PrivateLink：只用 `direct_peer`（ConnectInfo 或可信反代解析出的源地址）调 EC2
+///   `DescribeNetworkInterfaces`（filter `addresses.private-ip-address`）或
+///   `DescribeVpcEndpoints`（filter `vpc-endpoint-id`+`network-interface-ids`）；要求
+///   恰好一个 ENI/端点关联且端点 `State=available`，从响应取 `VpcEndpointId/VpcId/
+///   OwnerId`，evidence=`AwsApi`。API 超时/限流/错误一律 `Unavailable`，结果按源 IP/TTL
+///   缓存且失败不放行；绝不读取客户端端点/账户头。
+/// - mTLS：需传输层把客户端叶证书指纹/身份注入 [`ApEndpointContext`]（当前主监听器
+///   只在握手期可见，未下沉到请求）；在拿到该数据前不实现，避免把「有证书」当成
+///   「是该端点」。
+#[async_trait::async_trait]
+pub trait EndpointIdentityVerifier: Send + Sync {
+    async fn verify(
+        &self,
+        ctx: &ApEndpointContext,
+    ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError>;
+}
+
+/// 可信反代验证器：直连 TCP 对端落在显式可信网段内才采信端点声明头。
+/// 客户端直连（对端不在网段/无 ConnectInfo）→ 拒绝；重复/畸形头 → 拒绝。
+pub struct TrustedProxyEndpointVerifier {
+    trusted_peers: Vec<Cidr>,
+}
+
+impl TrustedProxyEndpointVerifier {
+    pub fn new(trusted_peers: impl IntoIterator<Item = Cidr>) -> Self {
+        Self {
+            trusted_peers: trusted_peers.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EndpointIdentityVerifier for TrustedProxyEndpointVerifier {
+    async fn verify(
+        &self,
+        ctx: &ApEndpointContext,
+    ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError> {
+        // 静态部署证明优先，与 `Attest` 的既有语义一致。
+        if let Some(vpce) = &ctx.static_vpce {
+            return Ok(Some(ApEndpointIdentity {
+                vpce_id: vpce.clone(),
+                vpc_id: None,
+                account_id: None,
+                evidence: ApEndpointEvidence::StaticConfig,
+            }));
+        }
+        match &ctx.claim {
+            ApEndpointClaim::Absent => Ok(None),
+            ApEndpointClaim::Malformed => Err(ApEndpointVerifyError::Denied("malformed-claim")),
+            ApEndpointClaim::Header(vpce) => {
+                if !ctx
+                    .direct_peer
+                    .is_some_and(|ip| self.trusted_peers.iter().any(|c| c.contains(ip)))
+                {
+                    return Err(ApEndpointVerifyError::Denied("untrusted-source"));
+                }
+                Ok(Some(ApEndpointIdentity {
+                    vpce_id: vpce.clone(),
+                    vpc_id: None,
+                    account_id: None,
+                    evidence: ApEndpointEvidence::TrustedProxy,
+                }))
+            }
+        }
+    }
+}
+
 /// 一个 VPC 端点注册行。Slice A 的 registry 是**注册断言**（配置声明的
 /// vpce → {vpc, account, state}），不是密码学端点身份：它不能证明连接真的来自该
 /// PrivateLink 端点，只把「代理声明」收紧为「已登记、受账户约束、可吊销」。
@@ -878,6 +1020,8 @@ pub struct ApRoute {
     source: Arc<dyn ApSource>,
     /// Slice A：VPC 端点注册断言（只收断言命中的 active 行；查询失败 500）。
     endpoints: Arc<dyn ApEndpointSource>,
+    /// 端点身份验证器；None = Slice A 行为（可信头/静态 → registry）。
+    verifier: Option<Arc<dyn EndpointIdentityVerifier>>,
     acl: crate::access::Acl,
     /// M8 S2 变换器缓存（AP 名 → 编译产物）；miss = 不改写响应体。
     olap: Arc<crate::olap::OlapCache>,
@@ -904,6 +1048,7 @@ impl ApRoute {
             cache,
             source,
             endpoints,
+            verifier: None,
             acl,
             olap,
             inner,
@@ -914,6 +1059,12 @@ impl ApRoute {
     /// 包装同一 `set_route` 槽的既有路由（STS）：先 AP，未命中委托。
     pub fn with_fallback(mut self, fallback: Arc<dyn s3s::route::S3Route>) -> Self {
         self.fallback = Some(fallback);
+        self
+    }
+
+    /// 安装端点身份验证器：先证明来源，再查 registry。未安装 = Slice A 行为不变。
+    pub fn with_verifier(mut self, verifier: Arc<dyn EndpointIdentityVerifier>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -947,19 +1098,23 @@ struct EndpointCheck {
     vpce: String,
     /// 命中的注册行（未登记时 None，仍要审计 vpce id）。
     endpoint: Option<ApEndpoint>,
+    /// 验证器给出的证据来源（仅验证路径；None = Slice A）。
+    evidence: Option<ApEndpointEvidence>,
     /// Some(reason) = 拒绝。
     denial: Option<&'static str>,
 }
 
-/// R2：有 `ApVpce` 断言时 registry 必须有 active 行（查无/停用拒绝）；
+/// R2：有端点断言时 registry 必须有 active 行（查无/停用拒绝）；
 /// R3：同时有 `ApVpc` 断言时必须等于 registry.vpc_id（防两证明拼凑）；
 /// R4：策略引用 `aws:SourceVpce` 时 endpoint.account_id 必须等于 AP 桶账户；
-/// R5：registry 查询失败 → 500（不当作「未登记」放行）。
+/// R5：registry 查询失败 → 500（不当作「未登记」放行）；
+/// R6：验证器独立给出的 vpc/account 与 registry 行不一致 → 拒绝（证据与登记分裂）。
 async fn check_ap_endpoint(
     endpoints: &dyn ApEndpointSource,
     ap: &AccessPoint,
     source_vpc: Option<&str>,
     source_vpce: Option<&str>,
+    identity: Option<&ApEndpointIdentity>,
 ) -> S3Result<Option<EndpointCheck>> {
     let Some(vpce) = source_vpce else {
         return Ok(None);
@@ -972,6 +1127,20 @@ async fn check_ap_endpoint(
         None => Some("unregistered"),
         Some(e) if e.state != "active" => Some("disabled"),
         Some(e) if source_vpc.is_some_and(|v| v != e.vpc_id) => Some("vpc-mismatch"),
+        Some(e)
+            if identity
+                .and_then(|i| i.vpc_id.as_deref())
+                .is_some_and(|v| v != e.vpc_id) =>
+        {
+            Some("identity-vpc-mismatch")
+        }
+        Some(e)
+            if identity
+                .and_then(|i| i.account_id.as_deref())
+                .is_some_and(|a| a != e.account_id) =>
+        {
+            Some("identity-account-mismatch")
+        }
         Some(e) if ap.policy_references_source_vpce() && e.account_id != ap.account => {
             Some("account-mismatch")
         }
@@ -980,6 +1149,7 @@ async fn check_ap_endpoint(
     Ok(Some(EndpointCheck {
         vpce: vpce.to_string(),
         endpoint,
+        evidence: identity.map(|i| i.evidence),
         denial,
     }))
 }
@@ -1487,7 +1657,36 @@ impl s3s::route::S3Route for ApRoute {
         let peer = req.extensions.get::<ApPeer>().map(|p| p.0);
         // 取 owned：后续 `validate_delete_body(&mut req)` 需要可变借用，不跨借用持有。
         let source_vpc = req.extensions.get::<ApVpc>().map(|v| v.0.clone());
-        let source_vpce = req.extensions.get::<ApVpce>().map(|v| v.0.clone());
+        // 验证器路径：先证明来源，得到身份（registry 查询仍未发生）；失败按 403/500 收口。
+        // 未配置验证器 = Slice A：只认 `ApVpce` 断言，行为逐字节不变。
+        let (source_vpce, identity, verify_denial) = match &self.verifier {
+            None => (
+                req.extensions.get::<ApVpce>().map(|v| v.0.clone()),
+                None,
+                None,
+            ),
+            Some(verifier) => {
+                let ctx = req.extensions.get::<ApEndpointContext>().ok_or_else(|| {
+                    tracing::error!(ap = %name, "AP 端点身份上下文缺失（验证器已配置）");
+                    s3s::s3_error!(InternalError, "internal error")
+                })?;
+                match verifier.verify(ctx).await {
+                    Ok(identity) => (identity.as_ref().map(|i| i.vpce_id.clone()), identity, None),
+                    Err(ApEndpointVerifyError::Unavailable(e)) => {
+                        tracing::error!(error = %e, ap = %name, "AP 端点身份验证失败");
+                        return Err(s3s::s3_error!(InternalError, "internal error"));
+                    }
+                    Err(ApEndpointVerifyError::Denied(reason)) => {
+                        // 保留合法声明值用于审计；registry 不查（声明本身已不可信）。
+                        let vpce = match &ctx.claim {
+                            ApEndpointClaim::Header(v) => Some(v.clone()),
+                            _ => None,
+                        };
+                        (vpce, None, Some(reason))
+                    }
+                }
+            }
+        };
         // AP 账户根 Principal 解析（成员行优先）与账户状态：签名请求才需要。
         // 查询失败 fail-closed（500），不得当作「无账户」放行。
         let (account_id, account_active) = match &user {
@@ -1510,14 +1709,26 @@ impl s3s::route::S3Route for ApRoute {
             vpc: source_vpc.as_deref(),
             vpce: source_vpce.as_deref(),
         };
-        // Slice A：端点注册断言门禁（请求级；DeleteObjects 逐键复评不再查 registry）。
-        let endpoint = check_ap_endpoint(
-            self.endpoints.as_ref(),
-            &ap,
-            source_vpc.as_deref(),
-            source_vpce.as_deref(),
-        )
-        .await?;
+        // 端点门禁（请求级；DeleteObjects 逐键复评不再查 registry）：
+        // 验证器拒绝的声明不查 registry，直接携带拒绝原因进入统一审计/拒绝路径。
+        let endpoint = match verify_denial {
+            Some(reason) => Some(EndpointCheck {
+                vpce: source_vpce.clone().unwrap_or_default(),
+                endpoint: None,
+                evidence: None,
+                denial: Some(reason),
+            }),
+            None => {
+                check_ap_endpoint(
+                    self.endpoints.as_ref(),
+                    &ap,
+                    source_vpc.as_deref(),
+                    source_vpce.as_deref(),
+                    identity.as_ref(),
+                )
+                .await?
+            }
+        };
         // H1：s3s 把任意 multipart/form-data POST 无条件解析为 PostObject（键在表单里，
         // 先于 OIR/子资源路由），AP 不支持该 op。即使带 `?delete` 也仍执行 PostObject，
         // 因此这里必须整类拒绝，而不是按查询推导出的 DeleteObjects 放行。
@@ -1603,6 +1814,9 @@ impl s3s::route::S3Route for ApRoute {
                 Some(e) => format!("endpoint={}/account={}", c.vpce, e.account_id),
                 None => format!("endpoint={}", c.vpce),
             });
+            if let Some(evidence) = c.evidence {
+                parts.push(format!("endpoint:evidence={}", evidence.as_str()));
+            }
             if let Some(reason) = c.denial {
                 parts.push(format!("endpoint:deny:{reason}"));
             }
@@ -2721,6 +2935,222 @@ mod tests {
                 },
             ),
             Some(true)
+        );
+    }
+
+    /// 端点身份验证器判定矩阵：无 ConnectInfo / 非可信 peer / 重复畸形头一律拒绝；
+    /// 可信 peer 才产出 TrustedProxy 身份；静态部署证明优先且不依赖连接。
+    #[tokio::test]
+    async fn trusted_proxy_verifier_requires_trusted_direct_peer() {
+        let verifier = TrustedProxyEndpointVerifier::new([parse_cidr("10.0.0.0/8").unwrap()]);
+        let ctx = |claim: ApEndpointClaim, peer: Option<&str>, static_vpce: Option<&str>| {
+            ApEndpointContext {
+                claim,
+                static_vpce: static_vpce.map(str::to_string),
+                direct_peer: peer.map(|p| p.parse().unwrap()),
+            }
+        };
+        let header = ApEndpointClaim::Header("vpce-abc".into());
+
+        assert_eq!(
+            verifier.verify(&ctx(header.clone(), None, None)).await,
+            Err(ApEndpointVerifyError::Denied("untrusted-source")),
+            "无 ConnectInfo 不得验证"
+        );
+        assert_eq!(
+            verifier
+                .verify(&ctx(header.clone(), Some("203.0.113.5"), None))
+                .await,
+            Err(ApEndpointVerifyError::Denied("untrusted-source")),
+            "直连客户端伪造头必须拒绝"
+        );
+        let id = verifier
+            .verify(&ctx(header.clone(), Some("10.1.2.3"), None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.vpce_id, "vpce-abc");
+        assert_eq!(id.evidence, ApEndpointEvidence::TrustedProxy);
+        assert_eq!(
+            verifier
+                .verify(&ctx(ApEndpointClaim::Malformed, Some("10.1.2.3"), None))
+                .await,
+            Err(ApEndpointVerifyError::Denied("malformed-claim")),
+            "可信反代的重复/畸形头同样拒绝"
+        );
+        assert_eq!(
+            verifier
+                .verify(&ctx(ApEndpointClaim::Absent, Some("10.1.2.3"), None))
+                .await,
+            Ok(None),
+            "无声明不构成拒绝"
+        );
+        let id = verifier
+            .verify(&ctx(header, None, Some("vpce-static")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.vpce_id, "vpce-static");
+        assert_eq!(id.evidence, ApEndpointEvidence::StaticConfig);
+    }
+
+    struct UnavailableVerifier;
+    #[async_trait::async_trait]
+    impl EndpointIdentityVerifier for UnavailableVerifier {
+        async fn verify(
+            &self,
+            _ctx: &ApEndpointContext,
+        ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError> {
+            Err(ApEndpointVerifyError::Unavailable("verifier down".into()))
+        }
+    }
+
+    struct FixedVerifier(ApEndpointIdentity);
+    #[async_trait::async_trait]
+    impl EndpointIdentityVerifier for FixedVerifier {
+        async fn verify(
+            &self,
+            _ctx: &ApEndpointContext,
+        ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    fn with_ctx(mut req: S3Request<s3s::Body>, ctx: ApEndpointContext) -> S3Request<s3s::Body> {
+        req.extensions.insert(ctx);
+        req
+    }
+
+    fn verifier_ctx(peer: &str) -> ApEndpointContext {
+        ApEndpointContext {
+            claim: ApEndpointClaim::Header("vpce-abc".into()),
+            static_vpce: None,
+            direct_peer: Some(peer.parse().unwrap()),
+        }
+    }
+
+    /// 验证器先于 registry：不可信声明 403 且不查 registry；可信声明后 R2/R4 仍生效；
+    /// 验证后端不可用 500；证据与 registry 分裂拒绝；缺上下文（接线错误）500。
+    #[tokio::test]
+    async fn ap_route_verifier_gates_before_registry() {
+        use s3s::S3ErrorCode as C;
+        use s3s::route::S3Route as _;
+        let (acl, pool) = ap_acl_pool().await;
+        let registry = Arc::new(TestEndpoints::default());
+        let ap1 = vpce_ap(
+            "ap1",
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+               "Action":["s3:GetObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::bkt/*",
+               "Condition":{"StringEquals":{"aws:SourceVpce":"vpce-abc"}}}]}"#,
+        );
+        let trusted = || {
+            Arc::new(TrustedProxyEndpointVerifier::new([parse_cidr(
+                "10.0.0.0/8",
+            )
+            .unwrap()]))
+        };
+        let route = vpce_route(acl.clone(), ap1.clone(), registry.clone()).with_verifier(trusted());
+
+        // 可信 peer + active 行 → 放行；审计带证据来源。
+        registry.replace(vec![endpoint("active", "vpc-1", "000000000000")]);
+        let mut req = with_ctx(
+            vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None),
+            verifier_ctx("10.1.2.3"),
+        );
+        route.check_access(&mut req).await.unwrap();
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint:evidence=trusted-proxy"),
+            "审计缺证据来源: {detail}"
+        );
+
+        // 直连客户端伪造头：403，且声明本身不可信（不因 registry active 而放行）。
+        let mut req = with_ctx(
+            vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None),
+            verifier_ctx("203.0.113.5"),
+        );
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint:deny:untrusted-source"),
+            "伪造来源拒绝须可追溯: {detail}"
+        );
+
+        // registry 状态/账户检查不被验证器放宽。
+        registry.replace(vec![endpoint("disabled", "vpc-1", "000000000000")]);
+        let mut req = with_ctx(
+            vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None),
+            verifier_ctx("10.1.2.3"),
+        );
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint:deny:disabled"),
+            "验证器不得放宽 registry 状态: {detail}"
+        );
+
+        registry.replace(vec![endpoint("active", "vpc-1", "123456789012")]);
+        let mut req = with_ctx(
+            vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None),
+            verifier_ctx("10.1.2.3"),
+        );
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint:deny:account-mismatch"),
+            "验证器不得放宽账户绑定: {detail}"
+        );
+
+        // 验证后端不可用 → 500（不当作「无端点」放行）。
+        let down = vpce_route(acl.clone(), ap1.clone(), registry.clone())
+            .with_verifier(Arc::new(UnavailableVerifier));
+        let mut req = with_ctx(
+            vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None),
+            verifier_ctx("10.1.2.3"),
+        );
+        assert_eq!(
+            down.check_access(&mut req).await.unwrap_err().code(),
+            &C::InternalError
+        );
+
+        // 证据独立给出的 VPC/账户与 registry 行分裂 → 拒绝。
+        let split = vpce_route(acl.clone(), ap1.clone(), registry.clone()).with_verifier(Arc::new(
+            FixedVerifier(ApEndpointIdentity {
+                vpce_id: "vpce-abc".into(),
+                vpc_id: Some("vpc-x".into()),
+                account_id: None,
+                evidence: ApEndpointEvidence::AwsApi,
+            }),
+        ));
+        registry.replace(vec![endpoint("active", "vpc-1", "000000000000")]);
+        let mut req = with_ctx(
+            vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None),
+            verifier_ctx("10.1.2.3"),
+        );
+        assert_eq!(
+            split.check_access(&mut req).await.unwrap_err().code(),
+            &C::AccessDenied
+        );
+        let detail = last_audit_detail(&pool).await.unwrap();
+        assert!(
+            detail.contains("endpoint:deny:identity-vpc-mismatch"),
+            "证据/登记分裂须拒绝: {detail}"
+        );
+
+        // 验证器已配置但请求没有上下文（中间件接线错误）→ 500。
+        let mut req = vpce_req(http::Method::GET, "/ap/ap1/k", "", None, None);
+        assert_eq!(
+            route.check_access(&mut req).await.unwrap_err().code(),
+            &C::InternalError
         );
     }
 

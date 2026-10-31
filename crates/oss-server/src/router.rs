@@ -22,7 +22,7 @@ use xl_s3::service::OssS3;
 /// 组装全部路由。`build_runtime` 失败（暂存盘不可写等）向上传播：
 /// serve 与运维命令统一 exit 1 + stderr，不从启动路径 panic。
 pub fn build_router(state: AppState) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
-    build_router_with_trust(state, ApTrustConfig::from_env())
+    build_router_with_trust(state, ApTrustConfig::from_env()?)
 }
 
 /// AP 来源信任链配置（`build_router` 从环境变量填充；集成测试用
@@ -36,11 +36,42 @@ pub struct ApTrustConfig {
     pub proxy_hops: Option<String>,
     pub proxy_cidrs: Option<String>,
     pub peer_cidrs: Option<String>,
+    /// 端点身份验证器：None = Slice A 行为（可信头/静态 → registry）。
+    /// `OSS_AP_ENDPOINT_VERIFIER=trusted-proxy` 装配可信反代实现。
+    pub endpoint_verifier: Option<Arc<dyn xl_s3::ap::EndpointIdentityVerifier>>,
 }
 
 impl ApTrustConfig {
-    fn from_env() -> Self {
-        Self {
+    /// `OSS_AP_ENDPOINT_VERIFIER` 非法值启动失败（不静默退回 Slice A）。
+    fn from_env() -> Result<Self, String> {
+        let endpoint_verifier: Option<Arc<dyn xl_s3::ap::EndpointIdentityVerifier>> =
+            match std::env::var("OSS_AP_ENDPOINT_VERIFIER") {
+                Ok(v) if v.trim().is_empty() => None,
+                Ok(v) if v.trim().eq_ignore_ascii_case("trusted-proxy") => {
+                    let peers = parse_cidr_list(
+                        std::env::var("OSS_AP_TRUSTED_PEER_CIDRS").ok().as_deref(),
+                        "OSS_AP_TRUSTED_PEER_CIDRS",
+                    )?;
+                    if peers.is_empty() {
+                        tracing::warn!(
+                            "OSS_AP_ENDPOINT_VERIFIER=trusted-proxy 但未配置 \
+                             OSS_AP_TRUSTED_PEER_CIDRS：端点声明一律拒绝（fail-closed）"
+                        );
+                    }
+                    Some(Arc::new(xl_s3::ap::TrustedProxyEndpointVerifier::new(
+                        peers,
+                    )))
+                }
+                Ok(v) => {
+                    return Err(format!(
+                        "OSS_AP_ENDPOINT_VERIFIER 非法: {}（支持 trusted-proxy）",
+                        v.escape_debug()
+                    ));
+                }
+                Err(std::env::VarError::NotPresent) => None,
+                Err(e) => return Err(format!("OSS_AP_ENDPOINT_VERIFIER 读取失败: {e}")),
+            };
+        Ok(Self {
             trust_proxy: std::env::var("OSS_AP_TRUSTED_PROXY")
                 .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes")),
             static_vpc: std::env::var("OSS_AP_VPC_ID").ok(),
@@ -48,7 +79,8 @@ impl ApTrustConfig {
             proxy_hops: std::env::var("OSS_AP_TRUSTED_PROXY_HOPS").ok(),
             proxy_cidrs: std::env::var("OSS_AP_TRUSTED_PROXY_CIDRS").ok(),
             peer_cidrs: std::env::var("OSS_AP_TRUSTED_PEER_CIDRS").ok(),
-        }
+            endpoint_verifier,
+        })
     }
 }
 
@@ -138,8 +170,10 @@ pub fn build_router_with_trust(
             .with_vault(state.vault.clone())
             .with_web_identity(web_identity),
     );
+    // 端点身份验证器（可选）：先证明来源，再查 registry；None = Slice A 行为不变。
+    let endpoint_verifier = ap_trust.endpoint_verifier.clone();
     // AP Slice A：静态端点 registry（`[ap.vpc_endpoints]`；空表 = 无断言可放行）。
-    let ap = xl_s3::ap::ApRoute::new(
+    let mut ap = xl_s3::ap::ApRoute::new(
         Arc::clone(&state.ap_cache),
         Arc::new(crate::access_points_api::DbApSource {
             db: Arc::clone(&state.db),
@@ -151,6 +185,9 @@ pub fn build_router_with_trust(
         inner,
     )
     .with_fallback(sts);
+    if let Some(verifier) = endpoint_verifier.clone() {
+        ap = ap.with_verifier(verifier);
+    }
     s3_builder.set_route(ap);
     let s3 = s3_builder.build();
     // 读路径补全 Task 5：s3s 0.17 的 Range 解析对多区间（`bytes=0-1,3-4`）直接 400；
@@ -240,11 +277,19 @@ pub fn build_router_with_trust(
     // 单行头；非法配置启动失败。两者独立配置，绝不互相推断。
     let vpc = Arc::new(Attest::vpc(ap_trust.static_vpc.as_deref(), trust_proxy)?);
     let vpce = Arc::new(Attest::vpce(ap_trust.static_vpce.as_deref(), trust_proxy)?);
+    // 验证器启用时，路由器只下沉「未验证声明 + 连接事实」，不再采信 VPCE 头；
+    // SourceVpc 证明仍走原有 Attest（独立证明，绝不互相推断）。
+    let verify_ctx = endpoint_verifier.as_ref().map(|_| {
+        Arc::new(EndpointVerifyConfig {
+            static_vpce: vpce.static_id.clone(),
+        })
+    });
     let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
         let trust = trust.clone();
         let vpc = vpc.clone();
         let vpce = vpce.clone();
-        async move { ap_peer(req, next, trust, vpc, vpce).await }
+        let verify_ctx = verify_ctx.clone();
+        async move { ap_peer(req, next, trust, vpc, vpce, verify_ctx).await }
     }));
     // M3 shrink：维护模式停写。最外层包裹（含 S3 fallback 与控制台写请求）；
     // GET/HEAD/OPTIONS 保持在线，源节点只读供 mesh 拉取。gRPC mesh 不经过本 Router。
@@ -416,16 +461,39 @@ impl Attest {
         if !self.trust_proxy || !peer_trusted {
             return None;
         }
-        let mut vals = headers.get_all(self.header).iter();
-        let raw = vals.next()?.to_str().ok()?.trim();
-        if vals.next().is_some() || !(self.valid)(raw) {
-            return None;
-        }
-        Some(raw.to_string())
+        single_header(headers, self.header, self.valid)
+            .ok()
+            .flatten()
     }
 }
 
-/// 连接对端/来源 VPC/VPCE → `ApPeer`/`ApVpc`/`ApVpce` extension
+/// 恰好一条且形态合法的头值；重复/畸形 → `Err(())`，缺失 → `Ok(None)`。
+fn single_header(
+    headers: &axum::http::HeaderMap,
+    name: &str,
+    valid: fn(&str) -> bool,
+) -> Result<Option<String>, ()> {
+    let mut vals = headers.get_all(name).iter();
+    let Some(raw) = vals.next() else {
+        return Ok(None);
+    };
+    if vals.next().is_some() {
+        return Err(());
+    }
+    let raw = raw.to_str().map_err(|_| ())?.trim();
+    if !valid(raw) {
+        return Err(());
+    }
+    Ok(Some(raw.to_string()))
+}
+
+/// 验证器启用时的下沉配置：只携带部署级静态声明；头值仅作未验证声明。
+#[derive(Clone)]
+struct EndpointVerifyConfig {
+    static_vpce: Option<String>,
+}
+
+/// 连接对端/来源 VPC/VPCE → `ApPeer`/`ApVpc`/`ApVpce`/`ApEndpointContext`
 /// （缺失则由 AP 条件 fail-closed）。
 async fn ap_peer(
     mut req: Request,
@@ -433,6 +501,7 @@ async fn ap_peer(
     trust: Option<Arc<ProxyTrust>>,
     vpc: Arc<Attest>,
     vpce: Arc<Attest>,
+    verify: Option<Arc<EndpointVerifyConfig>>,
 ) -> Response {
     // ConnectInfo 是唯一可信的直连对端来源；缺失（如 ecat 明文 listener）时转发头不采信。
     let direct = req
@@ -449,8 +518,26 @@ async fn ap_peer(
     if let Some(id) = vpc.value(req.headers(), peer_trusted) {
         req.extensions_mut().insert(xl_s3::ap::ApVpc(id));
     }
-    if let Some(id) = vpce.value(req.headers(), peer_trusted) {
-        req.extensions_mut().insert(xl_s3::ap::ApVpce(id));
+    match verify {
+        // 验证器路径：声明头不在此处采信，只做形状归一，来源由验证器按连接事实判定。
+        Some(cfg) => {
+            let claim =
+                match single_header(req.headers(), "x-oss-source-vpce", xl_s3::ap::valid_vpce_id) {
+                    Ok(Some(v)) => xl_s3::ap::ApEndpointClaim::Header(v),
+                    Ok(None) => xl_s3::ap::ApEndpointClaim::Absent,
+                    Err(()) => xl_s3::ap::ApEndpointClaim::Malformed,
+                };
+            req.extensions_mut().insert(xl_s3::ap::ApEndpointContext {
+                claim,
+                static_vpce: cfg.static_vpce.clone(),
+                direct_peer: direct,
+            });
+        }
+        None => {
+            if let Some(id) = vpce.value(req.headers(), peer_trusted) {
+                req.extensions_mut().insert(xl_s3::ap::ApVpce(id));
+            }
+        }
     }
     next.run(req).await
 }
