@@ -2031,7 +2031,7 @@ mod tests {
         drop(sm);
 
         let big: Vec<u8> = vec![3; SNAPSHOT_CHUNK_BYTES + 1];
-        let mut sm = SqliteStateMachine::open(&path, 1 << 20).await.unwrap();
+        let sm = SqliteStateMachine::open(&path, 1 << 20).await.unwrap();
         sm.persist_snapshot(&snap_meta(6, "upgraded"), &big)
             .await
             .unwrap();
