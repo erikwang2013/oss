@@ -92,6 +92,22 @@ async fn state_with_targets_max(
         max_put_bytes,
         maintenance,
         "sqlite::memory:".into(),
+        vec![],
+    )
+    .await
+}
+
+/// JWT 轮换测试用：`jwt_secret` 仍为 [`JWT_SECRET`]，另配一组旧密钥。
+#[allow(dead_code)]
+pub async fn state_with_previous_secrets(dir: &std::path::Path, previous: Vec<String>) -> AppState {
+    state_with_db_url(
+        dir,
+        None,
+        vec![],
+        1024 * 1024,
+        false,
+        "sqlite::memory:".into(),
+        previous,
     )
     .await
 }
@@ -101,7 +117,7 @@ async fn state_with_targets_max(
 #[allow(dead_code)]
 pub async fn state_with_file_db(dir: &std::path::Path) -> AppState {
     let url = format!("sqlite://{}?mode=rwc", dir.join("control.db").display());
-    state_with_db_url(dir, None, vec![], 1024 * 1024, false, url).await
+    state_with_db_url(dir, None, vec![], 1024 * 1024, false, url, vec![]).await
 }
 
 /// 长跑用例专用：文件库。`sqlite::memory:` 是命名共享缓存内存库，sqlx 默认
@@ -110,7 +126,7 @@ pub async fn state_with_file_db(dir: &std::path::Path) -> AppState {
 #[allow(dead_code)]
 pub async fn state_with_tiers_file_db(dir: &std::path::Path, tiers: Vec<TierTarget>) -> AppState {
     let url = format!("sqlite://{}?mode=rwc", dir.join("test.db").display());
-    state_with_db_url(dir, None, tiers, 1024 * 1024, false, url).await
+    state_with_db_url(dir, None, tiers, 1024 * 1024, false, url, vec![]).await
 }
 
 async fn state_with_db_url(
@@ -120,6 +136,7 @@ async fn state_with_db_url(
     max_put_bytes: usize,
     maintenance: bool,
     database_url: String,
+    jwt_previous_secrets: Vec<String>,
 ) -> AppState {
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
@@ -131,6 +148,7 @@ async fn state_with_db_url(
         staging_dir: dir.join("staging"),
         database_url,
         jwt_secret: JWT_SECRET.into(),
+        jwt_previous_secrets,
         max_put_bytes,
         groups: vec![GroupTarget {
             group: "file".into(),

@@ -118,6 +118,7 @@ async fn setup() -> H {
         staging_dir: dir.path().join("staging"),
         database_url: db_url.clone(),
         jwt_secret: JWT_SECRET.into(),
+        jwt_previous_secrets: vec![],
         max_put_bytes: 1024 * 1024,
         groups: vec![],
         cluster: None,

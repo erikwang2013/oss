@@ -21,6 +21,7 @@ pub mod job_actions;
 pub mod job_actions_api;
 pub mod job_state;
 pub mod jobs;
+mod jwt_multi;
 pub mod lifecycle;
 pub mod lifecycle_store;
 pub mod local_tier;

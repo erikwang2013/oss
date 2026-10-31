@@ -12,9 +12,9 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
-use jwt_rust::integrations::axum::JwtLayer;
 use s3s::service::S3ServiceBuilder;
 
+use crate::jwt_multi::multi_jwt;
 use crate::state::AppState;
 use crate::tls_server::ApConnInfo;
 use xl_s3::auth::SigV4Auth;
@@ -243,24 +243,28 @@ pub fn build_router_with_trust(
         .fallback_service(HandleError::new(s3, handle_s3_error))
         .layer(middleware::from_fn(strip_multirange));
 
-    // 控制面：`/api/v1` 整体走 jwt-rust 的 JwtLayer，`/login` 在 except 名单里
+    // 控制面：`/api/v1` 整体走多密钥鉴权层（当前 + 轮换期旧密钥），`/login` 在 except 名单里
     // （名单与 12h 过期都在 AppState::new；nest 会先剥掉 `/api/v1` 前缀，层看到的是 `/login`）。
-    // M8-3：读一致性/`x-oss-applied-index` 只包控制台路由（在 JwtLayer 内层，鉴权先失败），
+    // `route_layer` 与 jwt-rust `JwtLayer::attach` 同语义：只包已注册路由，未匹配路径保 404。
+    // M8-3：读一致性/`x-oss-applied-index` 只包控制台路由（在鉴权层内层，鉴权先失败），
     // S3 数据面不经过它。
-    let console = JwtLayer::new(Arc::clone(&state.jwt)).attach(crate::console::routes().layer(
-        middleware::from_fn_with_state(state.clone(), crate::console::console_read_consistency),
-    ));
+    let console = crate::console::routes()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::console::console_read_consistency,
+        ))
+        .route_layer(middleware::from_fn_with_state(state.clone(), multi_jwt));
 
     // aetherupload：四条路由（预处理 / 分块 / 展示 / 下载）。
     // 不用 crate 自带的 `integrations::ecat::routes`——它的 handler 读不到身份，
     // 无法按子账户权限执行「分组 → 桶」的门；改用 `aether_gate`（同一内核，形态逐字对齐）。
     //
     // 鉴权层（规格 §0.1「会话 Cookie/JWT 覆盖层」）：cookie 垫片在最外层把 `oss_token`
-    // 写成 Authorization，再交 JwtLayer 校验（与控制面同一个 JwtAuth 实例 → token 两面通用）。
-    // 层序：后挂的 `.layer` 在更外层，先跑；JwtLayer 把 payload 放进类型化 extension，
+    // 写成 Authorization，再交多密钥鉴权层校验（与控制面同一组 JwtAuth → token 两面通用）。
+    // 层序：后挂的 `.layer` 在更外层，先跑；鉴权层把 payload 放进类型化 extension，
     // aether_gate 的 handler 用 `Extension<JwtPayload>` 取。
     let aether = crate::aether_gate::routes(crate::aether::build_runtime(&state)?, state.clone())
-        .layer(JwtLayer::new(Arc::clone(&state.jwt)))
+        .layer(middleware::from_fn_with_state(state.clone(), multi_jwt))
         .layer(middleware::from_fn(cookie_to_bearer));
 
     let app = Router::new()
