@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use xl_store::crypto::CmkRewrapTarget;
+
 use crate::state::AppState;
 
 /// 默认读当前目录的 `oss.toml`；`--config <path>` 可覆盖（离线/管理命令必须能换库）。
@@ -58,8 +60,9 @@ pub const USAGE: &str = "\
                  列出/点名删除未映射 REPLICA 历史版本（M7 升级遗留；默认 dry-run）
   cmk scan --name <cmk> [--json]
                  本机 CMK 引用扫描（对象版本 + 桶默认加密）；集群须逐节点执行，不做全局汇总
-  cmk rewrap --name <cmk> [--apply] [--limit N] [--cursor C] [--bucket B] [--json]
-                 逐版本重加密到当前版本（默认 dry-run；集群部署离线拒绝——分片放置需在线拓扑）
+  cmk rewrap --name <cmk> [--to-legacy <sse-s3|sse-kms>] [--apply] [--limit N] [--cursor C] [--bucket B] [--json]
+                 逐版本重加密：默认到当前版本；--to-legacy 完整重写为 pre-CMK provider（迁移前
+                 须无在途 MPU、无桶默认引用；默认 dry-run；集群部署离线拒绝）
   cmk delete --name <cmk> [--force] --yes [--json]
                  删除本机引用为零的 CMK（--force 仅跳过集群本机屏障，绝不放宽已知引用）
   cmk trash list [--json]
@@ -181,6 +184,8 @@ pub enum CmkCommand {
         limit: usize,
         cursor: Option<String>,
         bucket: Option<String>,
+        /// None = 同 CMK 当前版本（既有行为）；Some = 降级到 pre-CMK legacy provider。
+        to_legacy: Option<CmkRewrapTarget>,
         json: bool,
     },
     /// `yes=false` 时只做参数解析，执行阶段拒绝（破坏性操作需显式确认）。
@@ -488,12 +493,18 @@ fn parse_cmk_args(rest: &[String]) -> Result<CmkCommand, &'static str> {
         "rewrap" => {
             let (v, flags) = parse_flags(
                 rest,
-                &["--name", "--limit", "--cursor", "--bucket"],
+                &["--name", "--limit", "--cursor", "--bucket", "--to-legacy"],
                 &["--apply", "--json"],
             )?;
             let limit = match v.get("--limit") {
                 Some(s) => s.parse::<usize>().map_err(|_| USAGE)?,
                 None => DEFAULT_REWRAP_LIMIT,
+            };
+            let to_legacy = match v.get("--to-legacy").map(String::as_str) {
+                None => None,
+                Some("sse-s3") => Some(CmkRewrapTarget::LegacySseS3),
+                Some("sse-kms") => Some(CmkRewrapTarget::LegacySseKms),
+                Some(_) => return Err(USAGE),
             };
             Ok(CmkCommand::Rewrap {
                 name: v.get("--name").cloned().ok_or(USAGE)?,
@@ -501,6 +512,7 @@ fn parse_cmk_args(rest: &[String]) -> Result<CmkCommand, &'static str> {
                 limit,
                 cursor: v.get("--cursor").cloned(),
                 bucket: v.get("--bucket").cloned(),
+                to_legacy,
                 json: flags.contains("--json"),
             })
         }
@@ -1757,7 +1769,13 @@ async fn cmk_cmd(
     // 桶默认加密在控制面库：仅引用守卫类子命令才离线只读打开（不重放 schema/不切 raft 模式）。
     let db = if matches!(
         &cmd,
-        CmkCommand::Scan { .. } | CmkCommand::Delete { .. } | CmkCommand::TrashPurge { .. }
+        CmkCommand::Scan { .. }
+            | CmkCommand::Delete { .. }
+            | CmkCommand::TrashPurge { .. }
+            | CmkCommand::Rewrap {
+                to_legacy: Some(_),
+                ..
+            }
     ) {
         Some(crate::db::Db::connect_offline(&cfg.database_url).await?)
     } else {
@@ -1804,12 +1822,14 @@ async fn cmk_cmd(
             limit,
             cursor,
             bucket,
+            to_legacy,
             json,
         } => {
             let name = xl_store::kms::parse_cmk_id(&name)?;
+            let target = to_legacy.unwrap_or(CmkRewrapTarget::CurrentCmk);
             let report = store
                 .clone()
-                .rewrap_cmk(
+                .rewrap_cmk_to(
                     name,
                     &xl_store::store::RewrapOptions {
                         apply,
@@ -1817,19 +1837,22 @@ async fn cmk_cmd(
                         cursor,
                         bucket,
                     },
+                    target,
+                    cfg_refs,
                 )
                 .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "cmk rewrap{}: {} 当前版本 k{} / 候选 {} / rewrapped {} / skipped {} / blocked {} / failed {}",
+                    "cmk rewrap{}: {} target={} 当前版本 k{} / 候选 {} / rewrapped {} / skipped {} / blocked {} / failed {}",
                     if apply {
                         "（apply）"
                     } else {
                         "（dry-run）"
                     },
                     name,
+                    report.target.as_str(),
                     report.current_version,
                     report.candidates,
                     report.rewrapped,
@@ -1846,10 +1869,13 @@ async fn cmk_cmd(
                             i.key,
                             i.version_id,
                             i.old_key_id,
-                            i.new_key_id.clone().unwrap_or_else(|| format!(
-                                "cmk:{}:k{}",
-                                report.cmk, report.current_version
-                            )),
+                            i.new_key_id.clone().unwrap_or_else(|| {
+                                if report.target == CmkRewrapTarget::CurrentCmk {
+                                    format!("cmk:{}:k{}", report.cmk, report.current_version)
+                                } else {
+                                    format!("target:{}", report.target.as_str())
+                                }
+                            }),
                             i.size
                         ),
                         _ => println!(
@@ -2264,6 +2290,7 @@ mod tests {
                 limit: DEFAULT_REWRAP_LIMIT,
                 cursor: None,
                 bucket: None,
+                to_legacy: None,
                 json: false,
             }))
         );
@@ -2278,6 +2305,47 @@ mod tests {
                 limit: 7,
                 cursor: Some("c".into()),
                 bucket: Some("b".into()),
+                to_legacy: None,
+                json: true,
+            }))
+        );
+        // legacy 迁移目标：默认 dry-run，--to-legacy 才切换写入 spec
+        assert_eq!(
+            parse_args(&args(&[
+                "cmk",
+                "rewrap",
+                "--name",
+                "a",
+                "--to-legacy",
+                "sse-s3"
+            ])),
+            Ok(Command::Cmk(CmkCommand::Rewrap {
+                name: "a".into(),
+                apply: false,
+                limit: DEFAULT_REWRAP_LIMIT,
+                cursor: None,
+                bucket: None,
+                to_legacy: Some(CmkRewrapTarget::LegacySseS3),
+                json: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "cmk",
+                "rewrap",
+                "--name",
+                "a",
+                "--to-legacy=sse-kms",
+                "--apply",
+                "--json",
+            ])),
+            Ok(Command::Cmk(CmkCommand::Rewrap {
+                name: "a".into(),
+                apply: true,
+                limit: DEFAULT_REWRAP_LIMIT,
+                cursor: None,
+                bucket: None,
+                to_legacy: Some(CmkRewrapTarget::LegacySseKms),
                 json: true,
             }))
         );
@@ -2327,6 +2395,9 @@ mod tests {
             &["cmk", "scan", "--name", "a", "x"][..], // 多余参数
             &["cmk", "rewrap", "--name", "a", "--limit", "x"][..],
             &["cmk", "rewrap", "--name", "a", "--apply=1"][..], // 布尔不收值
+            &["cmk", "rewrap", "--name", "a", "--to-legacy", "file"][..], // 只认 sse-s3/sse-kms
+            &["cmk", "rewrap", "--name", "a", "--to-legacy", "current-cmk"][..],
+            &["cmk", "rewrap", "--name", "a", "--to-legacy"][..], // 缺值
             &["cmk", "delete", "--name", "a", "--go"][..],
             &["cmk", "trash"][..],
             &["cmk", "trash", "frobnicate"][..],

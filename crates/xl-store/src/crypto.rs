@@ -244,6 +244,46 @@ pub enum EncSpec {
     SseC(SseCKey),
 }
 
+/// CMK rewrap 的写入目标：同一 CMK 的当前版本（既有行为），或降级回 pre-CMK 的 legacy
+/// provider。legacy 目标必须完整重写数据——DARE AAD 绑定 `key_id`，只改 meta 不可解。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum CmkRewrapTarget {
+    /// 目标 = 同一 CMK 的当前版本（新写入继续沿用该 CMK）。
+    #[serde(rename = "current-cmk")]
+    CurrentCmk,
+    /// 目标 = SSE-S3 文件主密钥（`key_id = "file"`）。
+    #[serde(rename = "sse-s3")]
+    LegacySseS3,
+    /// 目标 = 默认 KMS 环当前钥（`key_id = "k<n>"`）。
+    #[serde(rename = "sse-kms")]
+    LegacySseKms,
+}
+
+impl CmkRewrapTarget {
+    /// 是否降级到 pre-CMK provider（否则即既有「同 CMK 当前版本」rewrap）。
+    pub fn is_legacy(self) -> bool {
+        !matches!(self, Self::CurrentCmk)
+    }
+
+    /// 报告/CLI 用的稳定标签。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentCmk => "current-cmk",
+            Self::LegacySseS3 => "sse-s3",
+            Self::LegacySseKms => "sse-kms",
+        }
+    }
+
+    /// 目标写侧 spec（`cmk` 仅 [`Self::CurrentCmk`] 使用）。
+    pub fn spec(self, cmk: &str) -> EncSpec {
+        match self {
+            Self::CurrentCmk => EncSpec::SseKmsCmk(cmk.to_string()),
+            Self::LegacySseS3 => EncSpec::SseS3,
+            Self::LegacySseKms => EncSpec::SseKms,
+        }
+    }
+}
+
 /// 密钥 provider 组合（切片 3 的双 provider 路由面提前落定）：
 /// wrap 按 spec 选路；unwrap 按记录里的 key_id 路由（"file" → 文件、前缀 "k"/"cmk:" → KMS 目录）。
 pub struct EncState {

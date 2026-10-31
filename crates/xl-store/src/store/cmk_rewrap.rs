@@ -18,14 +18,13 @@
 //! - 旧版本保持 decrypt-only：本模块绝不删除/改写任何 key 文件（删除走隔离销毁）。
 //! - 审计只记名/版本/数量，绝不记钥字节。
 //!
-//! **CMK → pre-CMK 二进制的自动降级为何不存在**：DARE AAD 绑定 `key_id`，只改 meta 里的
+//! **CMK → pre-CMK 降级（显式迁移）**：DARE AAD 绑定 `key_id`，只改 meta 里的
 //! key_id/wrapped DEK 在密码学上不可能让旧密文被 legacy key 解开；唯一安全路径是完整重读
-//! 明文、用目标 key 重加密并原子翻 meta（`rewrap_one` 已按此实现，但只在**同一
-//! CMK 的旧版本 → 当前版本**内）。把目标换成 legacy `file`/`k<n>` 需要：选择/轮换无租户
-//! 语义的 legacy key、跨节点逐盘执行并汇总、切换桶默认加密、处理「complete 时才加密」的
-//! 在途 MPU——这些都在本模块边界外，无法证明不弱化隔离或原子完成。故不提供 CMK→legacy
-//! rewrap，也绝不提供明文降级。最小安全替代：逐节点 `cmk references`（本模块已计入在途
-//! MPU）归零 → 以旧二进制可读的加密模式重写入（客户端重传/迁移）→ `cmk delete` → 回退。
+//! 明文、用目标 key 重新加密并原子翻 meta。`rewrap_cmk_to` 的 legacy 目标
+//! （`file` / `k<n>`）把候选扩到该 CMK 的**全部版本**，逐版本用 legacy spec 写新版本；
+//! 原子提交/失败隔离与同 CMK rewrap 一致。迁移前 fail-closed：目标 provider 未配置、
+//! 有在途 MPU（complete 时才按 CMK 加密）、桶默认加密仍指向该 CMK → 拒绝。迁移不产出
+//! 明文、绝不自动删 CMK：引用清零后由操作员显式 `cmk delete`；集群仍须逐节点执行并汇总。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +33,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use serde::Serialize;
 
-use crate::crypto::{self, EncSpec};
+use crate::crypto::{self, CmkRewrapTarget};
 use crate::error::{Error, Result};
 use crate::kms::{self, KmsFileProvider};
 use crate::layout;
@@ -172,7 +171,9 @@ pub struct RewrapItem {
 #[derive(Debug, Clone, Serialize)]
 pub struct RewrapReport {
     pub cmk: String,
-    /// 开始时的当前版本（新写入目标）。
+    /// 写入目标：同 CMK 当前版本，或 legacy `sse-s3`/`sse-kms` 降级。
+    pub target: CmkRewrapTarget,
+    /// 开始时的当前版本（仅同 CMK 目标有意义）。
     pub current_version: u32,
     pub apply: bool,
     pub scanned_objects: usize,
@@ -195,6 +196,17 @@ struct Cursor {
     version_id: String,
 }
 
+/// 版本记录的命中口径。
+#[derive(Debug, Clone, Copy)]
+enum RefMatch {
+    /// 引用守卫：任何提及形态都算（删除/扫描）。
+    Any,
+    /// 同 CMK rewrap：规范 key_id 且版本 < 当前。
+    OlderThan(u32),
+    /// legacy 迁移：该 CMK 的任意版本（目标写 `file`/`k<n>`，重跑自然无候选）。
+    FromCmk,
+}
+
 struct Candidate {
     r: CmkRef,
     /// 预览即可判定的阻塞原因（锁定/分层/缺 sha256）。
@@ -208,7 +220,7 @@ struct ScanOut {
     matched: usize,
     candidates: Vec<Candidate>,
     truncated: bool,
-    /// 在途 MPU 命中（只在引用守卫 `current=None` 时扫描）。
+    /// 在途 MPU 命中（只在引用守卫 `RefMatch::Any` 时扫描）。
     mpu_matched: usize,
     mpu_refs: Vec<CmkMpuRef>,
 }
@@ -310,7 +322,9 @@ impl Store {
     ) -> Result<CmkRefScan> {
         let kms = self.cmk_provider()?;
         kms.ensure_cmk(cmk)?; // 未知名 → InvalidArgument(400)，不静默空表
-        let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+        let scan = self
+            .scan_cmk_refs(cmk, RefMatch::Any, None, None, None)
+            .await?;
         let bucket_defaults = self.scan_config_refs(cmk, config).await?;
         let refs: Vec<CmkRef> = scan.candidates.into_iter().map(|c| c.r).collect();
         let refs_truncated = scan.matched > refs.len();
@@ -375,7 +389,9 @@ impl Store {
             reason: reason.map(str::to_string),
             warning: None,
         };
-        let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+        let scan = self
+            .scan_cmk_refs(cmk, RefMatch::Any, None, None, None)
+            .await?;
         let cfg_refs = self.scan_config_refs(cmk, config).await?;
         if scan.matched > 0 || scan.mpu_matched > 0 || !cfg_refs.is_empty() {
             // force 绝不放宽已知引用；桶默认加密/在途 MPU 同属引用（否则删除后写入即不可解）。
@@ -405,7 +421,9 @@ impl Store {
         // 隔离后复扫：对象版本 + 桶默认。隔离后新的桶默认写入会被 put 路径的
         // ensure_cmk 拒绝，但窗口内已落库的记录只能在这里看到。
         let after = async {
-            let s = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+            let s = self
+                .scan_cmk_refs(cmk, RefMatch::Any, None, None, None)
+                .await?;
             let c = self.scan_config_refs(cmk, config).await?;
             Ok::<_, Error>((s, c))
         }
@@ -455,7 +473,9 @@ impl Store {
         config: Option<&dyn CmkConfigRefs>,
     ) -> Result<CmkTrashPurgeReport> {
         let kms = self.cmk_provider()?;
-        let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
+        let scan = self
+            .scan_cmk_refs(cmk, RefMatch::Any, None, None, None)
+            .await?;
         let cfg_refs = self.scan_config_refs(cmk, config).await?;
         let report = |deleted: bool,
                       purged: Vec<kms::CmkTrashEntry>,
@@ -516,6 +536,19 @@ impl Store {
         cmk: &str,
         opts: &RewrapOptions,
     ) -> Result<RewrapReport> {
+        self.rewrap_cmk_to(cmk, opts, CmkRewrapTarget::CurrentCmk, None)
+            .await
+    }
+
+    /// re-wrap 的通用入口：`target` 选同 CMK 当前版本或 legacy 降级；legacy 迁移额外
+    /// 需要 `config`（桶默认加密引用守卫，生产调用方必须传入）。
+    pub async fn rewrap_cmk_to(
+        self: Arc<Self>,
+        cmk: &str,
+        opts: &RewrapOptions,
+        target: CmkRewrapTarget,
+        config: Option<&dyn CmkConfigRefs>,
+    ) -> Result<RewrapReport> {
         if !self.cfg.ec.enabled {
             return Err(Error::Encode("rewrap 需要 ec.enabled（加密数据面）".into()));
         }
@@ -535,11 +568,42 @@ impl Store {
         }
         let kms = self.cmk_provider()?;
         let current = kms.ensure_cmk(cmk)?;
+        if target.is_legacy() {
+            // 目标 provider 未配置 → 在扫描/写入前 fail-closed（预览也不假装可迁移）。
+            let state = self
+                .maybe_enc_state()
+                .ok_or_else(|| Error::Crypto("未配置加密（init_encryption 未调用）".into()))?;
+            state.provider_for_spec(target.spec(cmk))?;
+            // 在途 MPU 的 complete 仍会用 CMK 加密；桶默认加密会让新写入立刻重新引用 CMK。
+            let refs = self.cmk_references(cmk, config).await?;
+            if refs.mpu_references > 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "CMK {cmk:?} 仍有 {} 个在途 MPU（complete 时会用该 CMK 加密）：先 Complete/Abort 全部 MPU 再迁移",
+                    refs.mpu_references
+                )));
+            }
+            if !refs.bucket_defaults.is_empty() {
+                let buckets: Vec<&str> = refs
+                    .bucket_defaults
+                    .iter()
+                    .map(|b| b.bucket.as_str())
+                    .collect();
+                return Err(Error::InvalidArgument(format!(
+                    "CMK {cmk:?} 仍是桶默认加密（{}）：先把这些桶的默认加密切到目标 provider 再迁移",
+                    buckets.join(", ")
+                )));
+            }
+        }
         let cursor = opts.cursor.as_deref().map(decode_cursor).transpose()?;
+        let mode = if target.is_legacy() {
+            RefMatch::FromCmk
+        } else {
+            RefMatch::OlderThan(current)
+        };
         let scan = self
             .scan_cmk_refs(
                 cmk,
-                Some(current),
+                mode,
                 cursor.as_ref(),
                 opts.bucket.as_deref(),
                 Some(opts.limit),
@@ -547,6 +611,7 @@ impl Store {
             .await?;
         let mut report = RewrapReport {
             cmk: cmk.to_string(),
+            target,
             current_version: current,
             apply: opts.apply,
             scanned_objects: scan.scanned_objects,
@@ -578,7 +643,7 @@ impl Store {
                 item.error = Some(why.clone());
                 report.blocked += 1;
             } else if opts.apply {
-                match Arc::clone(&self).rewrap_one(cmk, &cand.r).await {
+                match Arc::clone(&self).rewrap_one(cmk, target, &cand.r).await {
                     Ok(Some(new_key_id)) => {
                         item.status = "rewrapped".into();
                         item.new_key_id = Some(new_key_id);
@@ -586,8 +651,14 @@ impl Store {
                     }
                     Ok(None) => {
                         item.status = "skipped".into();
-                        item.error =
-                            Some("already at current CMK version (or version gone)".into());
+                        item.error = Some(
+                            if target.is_legacy() {
+                                "already at target (or version gone)"
+                            } else {
+                                "already at current CMK version (or version gone)"
+                            }
+                            .into(),
+                        );
                         report.skipped += 1;
                     }
                     Err(e) => {
@@ -602,11 +673,12 @@ impl Store {
         Ok(report)
     }
 
-    /// 扫描本机桶/键。`current=None` = 引用守卫（全量计数）；`Some` = rewrap 候选（版本 < current）。
+    /// 扫描本机桶/键。`RefMatch::Any` = 引用守卫（全量计数，含在途 MPU）；
+    /// `OlderThan`/`FromCmk` = rewrap 候选（不含 MPU——迁移前已单独守卫）。
     async fn scan_cmk_refs(
         &self,
         cmk: &str,
-        current: Option<u32>,
+        mode: RefMatch,
         cursor: Option<&Cursor>,
         bucket: Option<&str>,
         limit: Option<usize>,
@@ -649,7 +721,7 @@ impl Store {
                 let same_key = cursor.is_some_and(|c| b == c.bucket && k == c.key);
                 // 在途 MPU 必须在 `read_meta` 缺省 continue 之前扫描：只有暂存区、
                 // 尚无 xl.meta 的对象同样算引用（complete 时才加密）。
-                if current.is_none() {
+                if matches!(mode, RefMatch::Any) {
                     self.scan_key_mpus(&b, &k, cmk, &mut out).await?;
                 }
                 let Some(m) = self.read_meta(&b, &k).await? else {
@@ -670,19 +742,28 @@ impl Store {
                         continue;
                     }
                     let Some(rec) = &v.encryption else { continue };
-                    match current {
+                    match mode {
                         // 引用守卫：任何形态提及都算引用
-                        None => {
+                        RefMatch::Any => {
                             if !record_mentions(rec, cmk) {
                                 continue;
                             }
                         }
-                        // rewrap：只认规范 key_id 且版本 < 当前
-                        Some(cur) => {
+                        // 同 CMK rewrap：只认规范 key_id 且版本 < 当前
+                        RefMatch::OlderThan(cur) => {
                             let Some((name, n)) = kms::parse_cmk_key_id(&rec.key_id) else {
                                 continue;
                             };
                             if name != cmk || n >= cur {
+                                continue;
+                            }
+                        }
+                        // legacy 迁移：该 CMK 的任意版本
+                        RefMatch::FromCmk => {
+                            let Some((name, _)) = kms::parse_cmk_key_id(&rec.key_id) else {
+                                continue;
+                            };
+                            if name != cmk {
                                 continue;
                             }
                         }
@@ -760,9 +841,14 @@ impl Store {
         Ok(())
     }
 
-    /// 单版本重加密：读旧明文（旧 CMK 版本解密）→ 目标 CMK 当前版本重加密 → 新版本目录 →
-    /// 单点 meta 翻转 → 旧目录回收。`Ok(None)` = 版本已不在/已被改到当前版本（幂等跳过）。
-    async fn rewrap_one(self: Arc<Self>, cmk: &str, cand: &CmkRef) -> Result<Option<String>> {
+    /// 单版本重加密：读旧明文（旧 CMK 版本解密）→ 目标 spec 重加密 → 新版本目录 →
+    /// 单点 meta 翻转 → 旧目录回收。`Ok(None)` = 版本已不在/已被迁到目标（幂等跳过）。
+    async fn rewrap_one(
+        self: Arc<Self>,
+        cmk: &str,
+        target: CmkRewrapTarget,
+        cand: &CmkRef,
+    ) -> Result<Option<String>> {
         let _guard = self.lock_object(&cand.bucket, &cand.key).await?;
         let Some(old) = self.read_meta(&cand.bucket, &cand.key).await? else {
             return Ok(None);
@@ -796,7 +882,7 @@ impl Store {
                 "版本 key_id 属于 CMK {name:?}，与目标 {cmk:?} 不符"
             )));
         }
-        if n >= cur {
+        if !target.is_legacy() && n >= cur {
             return Ok(None);
         }
         if let Some(why) = block_reason(v) {
@@ -810,8 +896,7 @@ impl Store {
             v.clone(),
         );
         let (new_ctx, new_rec) =
-            crypto::UnitCtx::for_write(EncSpec::SseKmsCmk(cmk.to_string()), self.maybe_enc_state())
-                .await?;
+            crypto::UnitCtx::for_write(target.spec(cmk), self.maybe_enc_state()).await?;
         let new_uuid = uuid::Uuid::new_v4().to_string();
         let tmp = layout::sys_dir(self.cfg.root(), "tmp").join(&new_uuid);
         let multi = self.cfg.cluster.is_some() || self.cfg.multi_drive();
