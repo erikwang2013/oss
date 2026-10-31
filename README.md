@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.28.0（2026-11-01）。** 升级与安全加固版：Raft 日志格式标记（缺失/`1` 为旧格式，`2` 为压缩/分段，未知值 fail-closed）与每次 append 两段有界压缩；M8 follower 发起的 `TierRestoreDelete` 改用 applied 行自身 `fence_term` 收口；AP 新增直连 mTLS 指纹验证（`mtls`）与 AWS PrivateLink API 验证（`aws-api`）；`cmk rewrap --to-legacy sse-s3|sse-kms` 可把 CMK 对象全量重加密回 legacy provider；Level C 新增 `read_only` 只读排空；JWT 支持 `jwt_previous_secrets` 多密钥轮换；补上真实 v1.26.0 蓝绿 e2e、MPU 排空工具与单机→集群双回环 e2e。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.28.0（2026-11-01）。** 升级与安全加固版：Raft 日志格式标记（缺失/`1` 为旧格式，`2` 为压缩/分段，未知值 fail-closed）与每次 append 两段有界压缩；M8 follower 发起的 `TierRestoreDelete` 改用 applied 行自身 `fence_term` 收口；AP 新增直连 mTLS 指纹验证（`mtls`）与 AWS PrivateLink API 验证（`aws-api`）；`cmk rewrap --to-legacy sse-s3|sse-kms` 可把 CMK 对象全量重加密回 legacy provider；Level C 新增 `read_only` 只读排空；JWT 支持 `jwt_previous_secrets` 多密钥轮换；补上真实 v1.26.0 蓝绿 e2e、MPU 排空工具与单机→集群双回环 e2e；账户硬配额新增 opt-in 严格模式（feature 9），Put/Complete/Copy 经 Raft 复制用量账本预留，删除/失败释放或校准，账本随 OSSCTL3 快照，默认仍为本地有界陈旧缓存。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
@@ -21,8 +21,8 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | 生命周期 | 过期、非当前版本、转换规则，Storage Class、分层归档与 Restore |
 | 安全 | SSE-S3/KMS/C、密钥库、对象锁与保留期、STS、桶策略与审计（异步批量队列）、TLS/mTLS、子账户三档权限、Argon2id、账户软/硬字节与对象数配额 |
 | 数据流 | 事件通知/Kafka、S3 Select、桶复制（Prefix/Tag/And 过滤）、多站点复制 |
-| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、恢复后续状态/调度租约复制（feature 7）、硬配额/VPC 端点命令（feature 8）、控制台页面 |
-| 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..8 |
+| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、恢复后续状态/调度租约复制（feature 7）、硬配额/VPC 端点命令（feature 8）、复制用量账本（feature 9）、控制台页面 |
+| 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..9 |
 | 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | 客户端 | `aws-cli` / `rclone`；React 控制台（分块、断线续传、秒传） |
 
@@ -85,7 +85,15 @@ feature level 6 的 `JobPurge` 命令分批清理，`queued`/`running`/`preempte
 启用 feature 6 前需全集群升级：旧节点 advertise ≤5，effective level 停在 5，`JobPurge`
 在 append 前被拒（单向门，激活后不可回滚）。feature level 7 的恢复后续状态/调度租约命令
 同样需全集群升级；旧节点 advertise ≤6，effective 停在 6，相关命令在 append 前被拒。
-账户硬配额配置 API 在 standalone 与 Raft（feature level 8）均可用；Raft 模式需全集群先升级到 level 8，旧节点在 append 前被拒。配额执行在限额写入后生效。
+账户硬配额配置 API 在 standalone 与 Raft（feature level 8）均可用；Raft 模式需全集群先升级到 level 8，旧节点在 append 前被拒。配额执行在限额写入后生效。默认执行仍是各节点本地 `account_usage` 缓存（跨节点有界陈旧；对端不可达时按已知下界拒绝、未知增量 fail-open）；需要不超卖时启用严格模式（feature level 9，见下节）。
+
+## 严格硬配额（feature 9）
+
+`[quota].strict = true`（或 `OSS_ACCOUNT_QUOTA_STRICT=1`）开启 opt-in 严格模式：xl-s3 的 Put/CompleteMultipartUpload/Copy 在写前经 Raft `AccountUsageReserve` 预留，删除与失败路径用 `AccountUsageRelease`/`AccountUsageAdjust` 释放或校准；判定只读复制后的 `account_usage_ledger` 表，各节点看到同一份用量。非严格模式行为不变。
+
+- **启用门槛**：Raft 模式要求 `[raft].feature_level = 9`（当前 `MAX_FEATURE_LEVEL`），且全 peer 生效 level ≥9 后命令才可 append；leader 对低级别节点在 append 前拒绝。OSSCTL3 快照的 `ControlData` 新增 `account_usage_ledger` 行；把 level <9 的快照装到本机已有账本行的库会拒绝安装，避免整表替换静默丢用量。
+- **保守边界**：账本命令非幂等，append 结果不明时写入 fail-closed 且不重试；首次触达某账户时由 leader 本地 `account_usage` 缓存播种（最旧 60s），随后由命令收敛；未知长度 Put 先预留 0 字节、写后校准，并发写可短暂超过配额；版本定向删除与 SSE-C 删除不即时释放，可能持续多记直至人工对账；预留后、数据写前崩溃会留下已计预留。
+- **结果**：总体保守——不会因账本少记而持续超卖，但会多记/阻塞，直到人工对账；未知长度 Put 的并发窗口是唯一短暂超额例外。
 
 ## 对象生命周期
 

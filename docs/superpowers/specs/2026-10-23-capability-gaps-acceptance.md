@@ -6,8 +6,8 @@
   **v1.19.0**（2026-10-26，Wave1 地基）
 - 最新发布：**v1.28.0**（2026-11-01），tag `v1.28.0`；包含 §23（Raft 日志格式标记与
   旧区间有界压缩、CMK→legacy 离线全量迁移、M8 follower restore fencing、AP 直连 mTLS 与
-  AWS PrivateLink API 验证、Level C 只读排空、JWT 多密钥轮换、真实蓝绿/MPU 排空/单机→集群
-  e2e）与 §21–§22 的 v1.27.0 内容
+  AWS PrivateLink API 验证、Level C 只读排空、feature 9 opt-in 复制用量账本（严格硬配额）、
+  JWT 多密钥轮换、真实蓝绿/MPU 排空/单机→集群 e2e）与 §21–§22 的 v1.27.0 内容
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
   v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
   v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）
@@ -711,7 +711,7 @@ CMK 激活为不归点、旧行快照透明读回、生产 Ext 注册表为空�
 
 **已知限制**：日志新格式无 feature-level 门控（旧二进制不可读，只能停写蓝绿）；HS256 共享密钥无 `kid`/轮换，依赖可信网段+短时效；直连 mTLS 需先有证书→端点注册表；`--health-url` 探测超时按“已停止”处理，操作者仍需确认进程状态。
 
-## 23. 2026-11-01 v1.28.0：Raft 日志加固、恢复 fencing、AP 直连身份、CMK 迁移、只读排空与 JWT 轮换
+## 23. 2026-11-01 v1.28.0：Raft 日志加固、恢复 fencing、AP 直连身份、CMK 迁移、只读排空、严格硬配额与 JWT 轮换
 
 | 项 | 落点 | 验证 |
 |---|---|---|
@@ -720,16 +720,17 @@ CMK 激活为不归点、旧行快照透明读回、生产 Ext 注册表为空�
 | M8 follower restore fencing | `job_state/restore.rs`、`raft/apply/tier_restore.rs` | `UNFENCED`（term 0）的 `TierRestoreDelete` 改用 applied 行自身 `fence_term`；行缺失不 append（leader reaper 收敛）；apply 端 `fence_term <= token` 幂等。lib restore **3/0**、`raft_restore_failover` **1/0**、restore/lease **3/0** |
 | AP 直连 mTLS / AWS PrivateLink API | `xl-s3/ap.rs`、`oss-server/{router,ap_aws}.rs`、`tests/{m8_ap_trust,ap_aws}.rs` | `mtls`：`OSS_AP_MTLS_ENDPOINTS=<sha256>=<vpce>[=<vpc>[=<account>]];...`，指纹取自 rustls 握手（`ApConnInfo`），重复/畸形拒绝启动；`aws-api`：SigV4 调 EC2 `DescribeNetworkInterfaces`/`DescribeVpcEndpoints`，源 IP→ENI→endpoint（唯一且 `State=available`），60s TTL 缓存，错误 fail-closed，要求客户端源 IP 保留。xl-s3 ap **37/0**、`m8_ap_trust` **22/0**、`ap_aws` **4/0** |
 | Level C 只读排空 | `oss-server/router.rs`、`tests/read_only.rs` | 顶层 `read_only=true`：写请求 503 + `x-oss-read-only: 1`；GET/HEAD/OPTIONS、精确 `POST /api/v1/login`、健康/指标、Raft RPC 可用；`/health/cluster` 暴露 `read_only`；旧二进制无开关，混版须 LB 摘除。read_only **2/0**、config **1/0** |
+| feature 9 严格硬配额账本 | `oss-server/raft/{command,data,compat,apply/quota,store}.rs`、`xl-s3/{account_quota,service}.rs`、`oss-server/router.rs`、`tests/raft_quota_ledger.rs` | `FEATURE_LEVEL_9`/`MAX_FEATURE_LEVEL=9`；`AccountUsageReserve/Release/Adjust` 在 apply 内原子判定 `account_usage_ledger`（Reserve 超限 `Invalid`→`quota_exceeded`，Release/Adjust 饱和到 0）；OSSCTL3 快照携带账本，level <9 快照装到已有账本行的库会拒绝；`[quota].strict=true`/`OSS_ACCOUNT_QUOTA_STRICT=1` 注入 `ClusterQuota`，Put/Complete/Copy 预留、删除/失败释放/校准；Raft 模式要求 `[raft].feature_level=9`，全 peer 生效 9 才 append。测试：lib `quota` **2/0**、`accounts --test` quota **7/0**、`raft_quota_ledger` **4/0**、snapshot **18/0**、compat **20/0**；xl-s3 lib 通过 |
 | JWT 多密钥轮换 | `oss-server/{config,state}.rs`、`tests/jwt_rotation.rs` | `jwt_previous_secrets` 每项 ≥32 B、去重、异于 `jwt_secret`；多密钥验证共享黑名单/过期；轮换顺序 add→restart→switch→restart→12h 后移除；登录限流与审计仍节点本地。jwt_rotation **4/0**、config **2/0** |
 | 蓝绿 e2e 与 MPU 排空 | `tests/e2e_blue_green.sh`、`scripts/mpu-drain.sh` | 真实 v1.26.0 → 当前二进制同数据目录切换 + 冷备回滚，**22/22 PASS**；`mpu-drain.sh` 列出/中止在途 MPU、绝不删除已提交对象，自检 **43/0**；`upgrade-preflight` **109/0**、`blue-green-preflight` **78/0** |
 | 单机→集群真实 e2e | `tests/e2e_single_to_cluster_real.sh` | 两个回环服务器跑 plan/copy/verify/resume，**6/6 PASS**；仍是离线重新灌入（只迁当前版本），不是原地拓扑转换 |
 | 混合 v1.16 MPU e2e（未执行） | `tests/e2e_mpu_mixed.sh` | 已编写；本环境因宿主 I/O 饱和无法构建 v1.16 二进制，**未执行**，不得记为通过 |
 
-**验证（合并后，本机）**：以上分套件计数随各实现提交合入；`cargo fmt --all --check` 与相关 clippy 已通过。完整 `cargo test --workspace` 未在宿主高负载下聚合运行，发布以分 crate/分套件闸门为准。
+**验证（合并后，本机）**：以上分套件计数随各实现提交合入；feature 9 的 lib `quota` **2/0**、`accounts --test` quota **7/0**、`raft_quota_ledger` **4/0**、snapshot **18/0**、compat **20/0**，xl-s3 lib 通过（未单独计数）；合并后 `oss-server --lib` **279/0**。`cargo fmt --all --check` 与相关 clippy 已通过。完整 `cargo test --workspace` 未在宿主高负载下聚合运行，发布以分 crate/分套件闸门为准。
 
 **已知限制 / 仍未交付**：
 
-- 跨节点硬配额聚合仍是 30s/60s 有界陈旧；精确聚合需要复制用量账本或写路径预留，未交付。
+- 硬配额默认仍是 30s/60s 有界陈旧；feature 9 提供 opt-in 复制账本，但严格模式是保守口径：首次触达按 leader 本地缓存播种（最旧 60s）、未知长度 Put 写后校准可短暂超额、版本定向/SSE-C 删除不释放、预留后崩溃留账、命令非幂等且结果不明 fail-closed 不重试；会多记/阻塞，自动对账与存量精确迁移仍未交付。
 - 集群级登录限流与审计复制仍未做（两者按设计保持节点本地）；JWT 轮换不改变这一点。
 - 真实 AWS PrivateLink 端到端验收未执行：`aws-api` 仅本地 mock 覆盖签名/解析/状态/缓存；上线前需真实 AWS 账号 + 客户端源 IP 保留。
 - 混合 v1.16 MPU e2e 未执行（v1.16 二进制在宿主负载下构建失败），不能据此宣称混合版本 MPU 通过。
