@@ -15,6 +15,12 @@
 #    Complete/Abort 排空，升级后只能在创建节点本地收尾或人工清理
 #    <root>/<bucket>/<flattened-key>/<uuid>/mpu.meta。本脚本按实际暂存布局扫描（不是
 #    .oss.sys/tmp，那是单段 PUT 暂存），解析 mpu.meta 顶层 owner：缺失/NULL = 旧格式。
+# 4) v1.16 数据面下限（/health/cluster 离线快照）：跨版本 MPU 复用 wire>=2 的 UploadPart
+#    流式 RPC，<=v1.15 没有该 RPC。--health-json 读取已保存的 /health/cluster JSON
+#    （不联网）：本地 data_wire_version<2/缺失、data_plane_compatible!=true、任一 up
+#    节点 wire<2/null 均 BLOCK；未提供则 WARN“无法判定”（--strict 下非零）。
+# 5) 在途 MPU 闸门：--require-no-mpu 要求所有活暂存区（含带属主前缀）为 0；滚动升级前
+#    必须 Complete/Abort 排空，否则旧节点离开后无法收尾。默认只把裸 UUID 计 WARN。
 # 本脚本自身只读；不修改/删除数据。退出码：0 无 BLOCK（--strict 下 WARN 也非零）；
 # 1 = BLOCK 或 strict+WARN；2 = 用法错误。
 set -uo pipefail
@@ -22,7 +28,7 @@ set -uo pipefail
 usage() {
 	cat <<'EOF'
 用法: upgrade-preflight.sh --data-dir <path> [--data-dir <path>] [选项]
-升级前置只读检查：裸 UUID MPU、M6 site_token、M7 未映射 REPLICA。
+升级前置只读检查：裸 UUID MPU、v1.16 数据面下限、M6 site_token、M7 未映射 REPLICA。
 不回填、不删除、不联网写入。完整说明见脚本头部注释。
 必填：
   --data-dir <path>            数据盘根目录；可多次或逗号分隔（如 a,b）
@@ -37,6 +43,10 @@ usage() {
   --replica-scope <b>/<k>      M7 的精确桶/键，可多次（键可含逗号，不拆分）。
                                replica-reconcile 只支持精确 (bucket,key)，没有全局列举；
                                不提供则 M7 为“无法判定”（WARN），需升级后人工逐键列出。
+  --health-json <path>         已保存的 /health/cluster JSON 快照（不联网）。校验数据面
+                               下限 v1.16（wire>=2）与兼容性；缺失/坏 JSON BLOCK。
+  --require-no-mpu             任一活 MPU 暂存区（含带属主前缀）即 BLOCK：升级前必须
+                               Complete/Abort 排空（默认仅裸 UUID/损坏计 WARN）。
   --json                       以 JSON 输出（不改变退出码语义）
   --strict                     WARN 也非零退出（发布闸门）
   -h, --help                   显示本帮助
@@ -56,6 +66,8 @@ CONFIG=""
 CONTROL_DB=""
 REPL_CMD_STR="oss-server replica-reconcile"
 REPL_SCOPES=()
+HEALTH_JSON=""
+REQUIRE_NO_MPU=0
 JSON=0
 STRICT=0
 
@@ -91,6 +103,12 @@ while (($#)); do
 		REPL_SCOPES+=("$2")
 		shift 2
 		;;
+	--health-json)
+		need_arg "$@"
+		HEALTH_JSON=$2
+		shift 2
+		;;
+	--require-no-mpu) REQUIRE_NO_MPU=1; shift ;;
 	--json) JSON=1; shift ;;
 	--strict) STRICT=1; shift ;;
 	-h | --help) usage; exit 0 ;;
@@ -223,7 +241,10 @@ check_bare_uuid_mpu() {
 				legacy=$((legacy + 1))
 				add_detail "$name" "裸 UUID 暂存区（升级前需 Complete/Abort）: $path"
 				;;
-			OWNED) owned=$((owned + 1)) ;;
+			OWNED)
+				owned=$((owned + 1))
+				((REQUIRE_NO_MPU)) && add_detail "$name" "在途 MPU 暂存区（--require-no-mpu）: $path"
+				;;
 			CORRUPT)
 				corrupt=$((corrupt + 1))
 				add_detail "$name" "mpu.meta 无法解析，人工核查: $path"
@@ -253,7 +274,92 @@ check_bare_uuid_mpu() {
 			n=$((n + 1))
 		done <"$TMP/find_err"
 	fi
+	if ((REQUIRE_NO_MPU && total > 0)); then
+		status=BLOCK
+		summary+="；--require-no-mpu：$total 个在途 MPU（裸 UUID=$legacy，带属主=$owned）；滚动升级前必须 Complete/Abort 排空，旧节点离开后无法收尾"
+	fi
 	add_check "$name" "$status" "$summary"
+}
+
+# ---------------------------------------------------------------- v1.16 数据面下限
+# 跨版本 MPU 转发走 wire>=2 的 UploadPart 流式 RPC；<=v1.15 无此 RPC。只读已保存的
+# /health/cluster（不联网）：本地下限、兼容位、以及每个 up 节点的 wire 都必须 >=2；
+# down 节点不下结论（与端点自身口径一致）。
+check_data_plane_floor() {
+	local name=data_plane_floor
+	if [ -z "$HEALTH_JSON" ]; then
+		add_check "$name" WARN "未提供 --health-json，无法判定；升级前请保存 /health/cluster"
+		return
+	fi
+	local -a lines=()
+	local st=BLOCK summary="数据面下限检查无结果" line
+	mapfile -t lines < <(python3 - "$HEALTH_JSON" <<'PY'
+import json
+import sys
+
+def result(status, summary, details=()):
+    for d in details:
+        print('DETAIL\t%s' % d)
+    print('RESULT\t%s\t%s' % (status, summary))
+
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        view = json.load(f)
+except Exception as e:
+    result('BLOCK', '/health/cluster JSON 缺失或无法解析（fail-closed；见详情）',
+           ['读取/解析 %s 失败: %s: %s' % (sys.argv[1], type(e).__name__, e)])
+    raise SystemExit
+if not isinstance(view, dict):
+    result('BLOCK', '/health/cluster JSON 顶层不是对象')
+    raise SystemExit
+problems = []
+local = view.get('data_wire_version')
+if isinstance(local, bool) or not isinstance(local, int):
+    problems.append('本地 data_wire_version 缺失或不是整数: %s' % json.dumps(local, ensure_ascii=False))
+elif local < 2:
+    problems.append('本地 data_wire_version=%d < 2（v1.16+ 才有跨版本 MPU RPC）' % local)
+if view.get('data_plane_compatible') is not True:
+    bad = view.get('incompatible_peers')
+    suffix = ''
+    if isinstance(bad, list) and bad:
+        suffix = '；incompatible_peers=%s' % ', '.join(str(x) for x in bad)
+    problems.append('data_plane_compatible 不是 true%s' % suffix)
+nodes = view.get('nodes')
+ups = 0
+if not isinstance(nodes, list):
+    problems.append('nodes 缺失或不是数组')
+else:
+    for i, n in enumerate(nodes):
+        if not isinstance(n, dict):
+            problems.append('nodes[%d] 不是对象' % i)
+            continue
+        if n.get('up') is not True:
+            continue
+        ups += 1
+        nid = n.get('id')
+        label = str(nid) if isinstance(nid, (str, int)) and not isinstance(nid, bool) else 'nodes[%d]' % i
+        v = n.get('data_wire_version')
+        if isinstance(v, bool) or not isinstance(v, int):
+            problems.append('up 节点 %s data_wire_version 缺失/null（需 >=2）' % label)
+        elif v < 2:
+            problems.append('up 节点 %s data_wire_version=%d < 2（<=v1.15 无跨版本 MPU RPC）' % (label, v))
+if problems:
+    result('BLOCK', '数据面低于 v1.16 下限或不兼容（%d 项；见详情）' % len(problems), problems)
+else:
+    result('OK', '本地 data_wire_version=%d，data_plane_compatible=true，%d 个 up 节点均 >=2' % (local, ups))
+PY
+)
+	for line in "${lines[@]}"; do
+		case "$line" in
+		RESULT$'\t'*)
+			line=${line#RESULT$'\t'}
+			st=${line%%$'\t'*}
+			summary=${line#*$'\t'}
+			;;
+		DETAIL$'\t'*) add_detail "$name" "${line#DETAIL$'\t'}" ;;
+		esac
+	done
+	add_check "$name" "$st" "$summary"
 }
 
 # ---------------------------------------------------------------- M6 site_token
@@ -439,6 +545,7 @@ PY
 	fi
 }
 check_bare_uuid_mpu
+check_data_plane_floor
 check_m6_site_token
 check_m7_unmapped_replica
 # ---------------------------------------------------------------- 输出
@@ -482,8 +589,9 @@ print(json.dumps({
 }, ensure_ascii=False, indent=2))
 PY
 else
-	printf 'upgrade-preflight: data-dir=%s config=%s control-db=%s\n' \
-		"$(IFS=,; printf '%s' "${DATA_DIRS[*]}")" "${CONFIG:-<未提供>}" "${CONTROL_DB:-<未提供>}"
+	printf 'upgrade-preflight: data-dir=%s config=%s control-db=%s health-json=%s require-no-mpu=%s\n' \
+		"$(IFS=,; printf '%s' "${DATA_DIRS[*]}")" "${CONFIG:-<未提供>}" "${CONTROL_DB:-<未提供>}" \
+		"${HEALTH_JSON:-<未提供>}" "$REQUIRE_NO_MPU"
 	while IFS=$'\t' read -r name status summary; do
 		printf '[%s] %s: %s\n' "$status" "$name" "$summary"
 		if [ -f "$DETAILS/$name" ]; then
