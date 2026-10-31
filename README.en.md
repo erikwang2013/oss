@@ -10,7 +10,7 @@
 
 An S3-compatible, self-built distributed object storage system (an equivalent implementation of MinIO). It supports multi-drive erasure coding 8+4, inter-node gRPC mesh, versioning, lifecycle, bucket policies and auditing, three SSE modes and object lock, STS temporary credentials, event notifications/Kafka, S3 Select, bucket and multi-site replication, access points/Object Lambda, Batch/Inventory/tiering, sync buckets and a 3-voter Raft control plane. The default `aws-cli`/`rclone` large-file paths (automatic multipart for ≥8 MiB) and resume habits work directly; the browser console supports chunked uploads and management.
 
-**Latest release: v1.26.0 (2026-10-31).** Control-plane and tenant hardening: feature level 7 delivers tier-restore post-state replication and schedule lease acquire/renew/takeover; account hard byte/object quotas and a legacy-account canonicalization worker; streaming GET batches remote shard range reads (1 MiB default); the MPU index gains a TTL; `JobPurge` gains its retention index; bucket replication supports `Tag`/`And` filters and 256 KiB chunked rate shaping. See the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for capability boundaries.
+**Latest release: v1.27.0 (2026-10-31).** Distributed storage and upgrade-safety release: feature level 8 adds Raft commands for account hard-quota config and the dynamic VPC endpoint registry; cross-version MPU gains a bounded wire-1 UploadPart fallback (v1.16+) plus legacy bare-UUID finish and idempotent complete replay; Level C adds Ext type capability negotiation and in-flight MPU CMK references; AP adds attested-proxy endpoint identity; Raft snapshots are chunked above 256 KiB and log entries are compressed/segmented; new stop-the-world blue-green preflight, v1.16 data-plane floor/MPU drain checks, and single-to-cluster tooling. See the [usage docs](https://oss.erik.xyz/usage.html#boundaries) for capability boundaries.
 
 ## Features
 
@@ -21,7 +21,7 @@ An S3-compatible, self-built distributed object storage system (an equivalent im
 | Lifecycle | Expiration, noncurrent versions, transition rules, Storage Classes, tiering and Restore |
 | Security | SSE-S3/KMS/C, key vault, object lock and retention, STS, bucket policies and auditing (async batch queue), TLS/mTLS, three-tier sub-account permissions, Argon2id, account soft/hard byte and object quotas |
 | Data flow | Event notifications/Kafka, S3 Select, bucket replication (Prefix/Tag/And filters), multi-site replication |
-| Control plane | Access points, Object Lambda, Batch Operations, Inventory, job engine with terminal retention (JobPurge), restore post-state/lease replication (feature 7), console pages |
+| Control plane | Access points, Object Lambda, Batch Operations, Inventory, job engine with terminal retention (JobPurge), restore post-state/lease replication (feature 7), hard-quota/VPC endpoint commands (feature 8), console pages |
 | Strong consistency | Sync buckets, stretch 2×6, 3-voter Raft (witness), feature levels 1..8 |
 | Operations | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | Clients | `aws-cli` / `rclone`; React console (chunking, resume, instant upload) |

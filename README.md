@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.26.0（2026-10-31）。** 控制面与租户硬化版：feature level 7 交付 tier restore 后续状态复制与调度租约 acquire/renew/takeover；账户硬字节/对象数配额与 legacy 账户规范化 worker；流式 GET 远端分片改为批量范围读（默认 1 MiB）；MPU 索引增加 TTL；`JobPurge` 增加保留索引；桶复制支持 `Tag`/`And` 过滤与 256 KiB 分块限速。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.27.0（2026-10-31）。** 分布式存储与升级安全版：feature level 8 交付账户硬配额配置与动态 VPC 端点注册表 Raft 命令；跨版本 MPU 支持 wire-1 有界回退（v1.16+），并补齐裸 UUID 收尾与幂等 Complete；Level C 交付 Ext 类型能力协商与在途 MPU 的 CMK 引用；AP 新增 attested-proxy 端点身份；Raft 快照 >256 KiB 分块、日志 entry 压缩与分段；新增停写蓝绿 preflight、v1.16 数据面下限/MPU 排空检查与单机→集群工具化。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
@@ -21,7 +21,7 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | 生命周期 | 过期、非当前版本、转换规则，Storage Class、分层归档与 Restore |
 | 安全 | SSE-S3/KMS/C、密钥库、对象锁与保留期、STS、桶策略与审计（异步批量队列）、TLS/mTLS、子账户三档权限、Argon2id、账户软/硬字节与对象数配额 |
 | 数据流 | 事件通知/Kafka、S3 Select、桶复制（Prefix/Tag/And 过滤）、多站点复制 |
-| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、恢复后续状态/调度租约复制（feature 7）、控制台页面 |
+| 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、恢复后续状态/调度租约复制（feature 7）、硬配额/VPC 端点命令（feature 8）、控制台页面 |
 | 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..8 |
 | 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | 客户端 | `aws-cli` / `rclone`；React 控制台（分块、断线续传、秒传） |
