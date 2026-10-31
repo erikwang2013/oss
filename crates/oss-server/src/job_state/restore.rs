@@ -3,7 +3,10 @@
 //! Raft 且 advertised feature ≥7：leader 在进程内 mutex 下读取已 apply 的整行（含
 //! fence），提交 [`ControlCommand::TierRestoreUpsert`]；apply 按自然键整行 upsert。
 //! follower 不得读旧行转发。清理删除是盲写，`fence_term` 随命令携带，可从任意节点
-//! 转发（apply 只删不高于该 term 的行）。feature<7 或非 Raft 保持本地直写，行为不变。
+//! 转发（apply 只删不高于该 term 的行）。调用方没有当前 epoch（follower 的读路径/作业
+//! 收尾 → `UNFENCED`）时，改用已 apply 行自己的 `fence_term` 作为删除上限：它是允许
+//! 删除该行的最小授权，旧 term 删除对更高 term 的行是 no-op；本地无行则不 append。
+//! feature<7 或非 Raft 保持本地直写，行为不变。
 
 use super::*;
 use crate::raft::apply::restore_row_ok;
@@ -88,6 +91,9 @@ impl JobState {
 
     /// 清理 Restore 行（幂等；`fence_term` 上限让旧 term 迟到删除 no-op）。
     /// 可从 follower 调用：控制面会向 leader 转交一次。
+    ///
+    /// `UNFENCED`（follower 拿不到当前 leader epoch）不落成 term 0 的盲删：改用本地已
+    /// apply 行的 `fence_term`。行不存在 → 不 append（leader 的 reaper/对账收敛）。
     pub async fn tier_restore_delete(
         &self,
         db: &Db,
@@ -106,12 +112,22 @@ impl JobState {
         let Some(control) = &self.control else {
             return Err("tier restore delete without control plane".into());
         };
+        let fence_term = if fence == FencingEpoch::UNFENCED {
+            // 不用 follower 看到的当前 term：同一 term 下新写的 restored 行会被迟到的
+            // 盲删误伤；行自身 term 只允许清掉它及更早的遗留（apply 用同一上限比较）。
+            match Self::read_tier_restore(db, bucket, key, version_id).await? {
+                Some(row) => row.fence_term,
+                None => return Ok(()),
+            }
+        } else {
+            fence.term_i64()
+        };
         match control
             .write(ControlCommand::TierRestoreDelete {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 version_id: version_id.to_string(),
-                fence_term: fence.term_i64(),
+                fence_term,
             })
             .await
         {
