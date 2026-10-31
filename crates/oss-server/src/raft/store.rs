@@ -6,20 +6,28 @@
 //!
 //! 快照 > [`SNAPSHOT_CHUNK_BYTES`] 时按固定大小分块行存储（`raft_snapshot_chunk`，
 //! `raft_snapshot.data` 只留清单头）；小快照与旧库仍按整行 BLOB 读取，格式对调用方透明。
-//! shortcut: 日志仍按每条 entry 一整行 JSON 存储（非分段日志）；大日志/高吞吐前再评估。
+//!
+//! 日志：大 entry 的 JSON 用 zlib 压缩、`z1:` + base64 存入 `raft_log.entry`；旧明文行
+//! （`{` 开头）照常解码。追加事务内把最新连续 >= [`SEGMENT_MIN_ENTRIES`] 行压成一个
+//! `raft_log_segment`（zlib JSON 数组），读时与剩余行合并；purge/truncate 在段内切分，
+//! 所有变更同事务提交，崩溃只会留下旧行或完整段。
 
 // openraft StorageError 体积由第三方类型固定，trait 签名不能改。
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use base64::Engine as _;
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use openraft::entry::RaftPayload;
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -42,6 +50,12 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS raft_log (
     idx   INTEGER PRIMARY KEY,
     entry TEXT NOT NULL
+);
+-- 日志段：压缩 JSON 数组覆盖 [start_idx, end_idx]；这些 idx 不再有 raft_log 行。
+CREATE TABLE IF NOT EXISTS raft_log_segment (
+    start_idx INTEGER PRIMARY KEY,
+    end_idx   INTEGER NOT NULL,
+    data      BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS raft_meta (
     key   TEXT PRIMARY KEY,
@@ -81,6 +95,23 @@ const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 const SNAPSHOT_CHUNK_MAGIC: &[u8; 8] = b"OSSCHNK1";
 /// magic(8) + 块数 u32 LE + 原始总长 u64 LE。
 const SNAPSHOT_CHUNK_HEADER_LEN: usize = 8 + 4 + 8;
+
+/// 明文 JSON 达到该长度才尝试压缩；小 entry 保持明文（运维/集成测试直接读 `entry`）。
+const ENTRY_COMPRESS_MIN_BYTES: usize = 1024;
+/// 压缩 entry 的 magic。明文 Entry JSON 必以 `{` 开头，前缀无歧义。
+const ENTRY_COMPRESS_MAGIC: &str = "z1:";
+/// 解压上限：命令体上限 24 MiB + Entry 外壳余量；超限按损坏 fail-closed。
+const ENTRY_JSON_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 段数据 magic：magic(8) + 原始 JSON 长 u64 LE + zlib 流。
+const SEGMENT_MAGIC: &[u8; 8] = b"OSSLSEG1";
+const SEGMENT_HEADER_LEN: usize = 8 + 8;
+/// 追加事务内，最新连续行达到该行数才压段（同时限制单段行数/解压内存）。
+const SEGMENT_MIN_ENTRIES: usize = 256;
+const SEGMENT_MAX_ENTRIES: usize = 1024;
+/// 单段原始 JSON 上限；解压上限留足余量。
+const SEGMENT_MAX_RAW_BYTES: usize = 16 * 1024 * 1024;
+const SEGMENT_JSON_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 async fn connect(path: &Path) -> Result<SqlitePool, sqlx::Error> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -125,6 +156,393 @@ fn decode<T: DeserializeOwned>(
     s: &str,
 ) -> Result<T, StorageError<u64>> {
     serde_json::from_str(s).map_err(|e| ser_err(subject, verb, e))
+}
+
+fn log_err(verb: ErrorVerb, msg: impl std::fmt::Display) -> StorageError<u64> {
+    storage_err(
+        ErrorSubject::Logs,
+        verb,
+        std::io::Error::other(msg.to_string()),
+    )
+}
+
+fn log_corrupt(msg: impl std::fmt::Display) -> StorageError<u64> {
+    log_err(ErrorVerb::Read, format_args!("corrupt raft log: {msg}"))
+}
+
+/// 序列化 entry；大载荷尝试 zlib+base64，只有确实更小才用压缩形态（`z1:` 前缀）。
+fn encode_entry(entry: &Entry<TypeConfig>) -> Result<String, StorageError<u64>> {
+    let json = encode(ErrorSubject::Log(entry.log_id), ErrorVerb::Write, entry)?;
+    if json.len() < ENTRY_COMPRESS_MIN_BYTES {
+        return Ok(json);
+    }
+    let io_err =
+        |e: std::io::Error| storage_err(ErrorSubject::Log(entry.log_id), ErrorVerb::Write, e);
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(json.as_bytes()).map_err(io_err)?;
+    let compressed = enc.finish().map_err(io_err)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(compressed);
+    if ENTRY_COMPRESS_MAGIC.len() + b64.len() < json.len() {
+        Ok(format!("{ENTRY_COMPRESS_MAGIC}{b64}"))
+    } else {
+        Ok(json)
+    }
+}
+
+/// 解码 entry，并返回原始 JSON 字节数（压段时用于限制内存）。任何损坏都 fail-closed。
+fn decode_entry_with_len(s: &str) -> Result<(Entry<TypeConfig>, usize), StorageError<u64>> {
+    let Some(b64) = s.strip_prefix(ENTRY_COMPRESS_MAGIC) else {
+        // 旧库/小 entry：明文 JSON。
+        return Ok((decode(ErrorSubject::Logs, ErrorVerb::Read, s)?, s.len()));
+    };
+    let corrupt = |what: String| log_corrupt(format!("compressed entry: {what}"));
+    let compressed = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| corrupt(e.to_string()))?;
+    let mut json = Vec::new();
+    ZlibDecoder::new(compressed.as_slice())
+        .take(ENTRY_JSON_MAX_BYTES + 1)
+        .read_to_end(&mut json)
+        .map_err(|e| corrupt(e.to_string()))?;
+    if json.len() as u64 > ENTRY_JSON_MAX_BYTES {
+        return Err(corrupt(format!(
+            "decompressed size exceeds {ENTRY_JSON_MAX_BYTES} bytes"
+        )));
+    }
+    let entry = serde_json::from_slice(&json)
+        .map_err(|e| log_corrupt(format!("compressed entry json: {e}")))?;
+    Ok((entry, json.len()))
+}
+
+fn decode_entry(s: &str) -> Result<Entry<TypeConfig>, StorageError<u64>> {
+    decode_entry_with_len(s).map(|(entry, _)| entry)
+}
+
+/// 段格式：magic(8) + 原始 JSON 长 u64 LE + zlib(JSON 数组)。entry 必须连续。
+fn encode_segment(entries: &[Entry<TypeConfig>]) -> Result<Vec<u8>, StorageError<u64>> {
+    let Some(first) = entries.first() else {
+        return Err(log_err(ErrorVerb::Write, "empty raft log segment"));
+    };
+    let start = first.log_id.index;
+    for (i, entry) in entries.iter().enumerate() {
+        let want = start
+            .checked_add(i as u64)
+            .ok_or_else(|| log_err(ErrorVerb::Write, "raft log segment index overflow"))?;
+        if entry.log_id.index != want {
+            return Err(log_err(
+                ErrorVerb::Write,
+                format!(
+                    "raft log segment entries not contiguous: want {want}, got {}",
+                    entry.log_id.index
+                ),
+            ));
+        }
+    }
+    let json = serde_json::to_vec(entries)
+        .map_err(|e| ser_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    if json.len() as u64 > SEGMENT_JSON_MAX_BYTES {
+        return Err(log_err(
+            ErrorVerb::Write,
+            format!("raft log segment JSON {} exceeds limit", json.len()),
+        ));
+    }
+    let mut out = Vec::with_capacity(SEGMENT_HEADER_LEN + json.len() / 2);
+    out.extend_from_slice(SEGMENT_MAGIC);
+    out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    let mut enc = ZlibEncoder::new(out, Compression::default());
+    enc.write_all(&json)
+        .map_err(|e| log_err(ErrorVerb::Write, e))?;
+    enc.finish().map_err(|e| log_err(ErrorVerb::Write, e))
+}
+
+/// 解码并校验段：magic、声明长度、zlib、数组元素数与索引必须精确匹配 [start,end]。
+fn decode_segment(
+    data: &[u8],
+    start_idx: i64,
+    end_idx: i64,
+) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+    let corrupt = |what: String| log_corrupt(format!("segment [{start_idx},{end_idx}]: {what}"));
+    if data.len() < SEGMENT_HEADER_LEN {
+        return Err(corrupt("truncated header".into()));
+    }
+    if !data.starts_with(SEGMENT_MAGIC.as_slice()) {
+        return Err(corrupt("bad magic".into()));
+    }
+    let raw_len = u64::from_le_bytes(data[8..16].try_into().expect("8 bytes"));
+    if raw_len > SEGMENT_JSON_MAX_BYTES {
+        return Err(corrupt(format!(
+            "declared size {raw_len} exceeds limit {SEGMENT_JSON_MAX_BYTES}"
+        )));
+    }
+    let mut json = Vec::new();
+    ZlibDecoder::new(&data[SEGMENT_HEADER_LEN..])
+        .take(raw_len + 1)
+        .read_to_end(&mut json)
+        .map_err(|e| corrupt(e.to_string()))?;
+    if json.len() as u64 != raw_len {
+        return Err(corrupt(format!(
+            "expected {raw_len} bytes, found {}",
+            json.len()
+        )));
+    }
+    let entries: Vec<Entry<TypeConfig>> =
+        serde_json::from_slice(&json).map_err(|e| corrupt(format!("json: {e}")))?;
+    let (Ok(start), Ok(end)) = (u64::try_from(start_idx), u64::try_from(end_idx)) else {
+        return Err(corrupt("negative range".into()));
+    };
+    if end < start {
+        return Err(corrupt("end before start".into()));
+    }
+    let want = end - start + 1;
+    if entries.len() as u64 != want {
+        return Err(corrupt(format!(
+            "expected {want} entries, found {}",
+            entries.len()
+        )));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        let idx = start + i as u64;
+        if entry.log_id.index != idx {
+            return Err(corrupt(format!(
+                "entry index {} outside [{start_idx},{end_idx}]",
+                entry.log_id.index
+            )));
+        }
+    }
+    Ok(entries)
+}
+
+/// 在调用方事务内写一个段（entries 非空且索引连续）。
+async fn write_segment_tx(
+    tx: &mut SqliteConnection,
+    entries: &[Entry<TypeConfig>],
+) -> Result<(), StorageError<u64>> {
+    let data = encode_segment(entries)?;
+    let start = entries[0].log_id.index as i64;
+    let end = entries[entries.len() - 1].log_id.index as i64;
+    sqlx::query(
+        "INSERT OR REPLACE INTO raft_log_segment (start_idx, end_idx, data) VALUES (?, ?, ?)",
+    )
+    .bind(start)
+    .bind(end)
+    .bind(data)
+    .execute(&mut *tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| log_err(ErrorVerb::Write, e))
+}
+
+/// 删除 idx >= `since` 的日志；落在段内时把段切成保留 [start, since) 的新段。
+async fn truncate_log_tx(tx: &mut SqliteConnection, since: u64) -> Result<(), StorageError<u64>> {
+    let since_i = since as i64;
+    sqlx::query("DELETE FROM raft_log WHERE idx >= ?")
+        .bind(since_i)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| log_err(ErrorVerb::Delete, e))?;
+    let segs = sqlx::query(
+        "SELECT start_idx, end_idx, data FROM raft_log_segment WHERE end_idx >= ? \
+         ORDER BY start_idx",
+    )
+    .bind(since_i)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| log_err(ErrorVerb::Read, e))?;
+    for row in segs {
+        let start: i64 = row.get("start_idx");
+        let end: i64 = row.get("end_idx");
+        let stored: Vec<u8> = row.get("data");
+        let mut entries = decode_segment(&stored, start, end)?;
+        if start >= since_i {
+            sqlx::query("DELETE FROM raft_log_segment WHERE start_idx = ?")
+                .bind(start)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| log_err(ErrorVerb::Delete, e))?;
+        } else {
+            // start < since <= end：保留 [start, since)。
+            entries.truncate((since - start as u64) as usize);
+            write_segment_tx(tx, &entries).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 删除 idx <= `upto` 的日志；落在段内时把剩余 [upto+1, end] 重写为新段。
+async fn purge_log_tx(tx: &mut SqliteConnection, upto: u64) -> Result<(), StorageError<u64>> {
+    let upto_i = upto as i64;
+    sqlx::query("DELETE FROM raft_log WHERE idx <= ?")
+        .bind(upto_i)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| log_err(ErrorVerb::Delete, e))?;
+    let segs = sqlx::query(
+        "SELECT start_idx, end_idx, data FROM raft_log_segment WHERE start_idx <= ? \
+         ORDER BY start_idx",
+    )
+    .bind(upto_i)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| log_err(ErrorVerb::Read, e))?;
+    for row in segs {
+        let start: i64 = row.get("start_idx");
+        let end: i64 = row.get("end_idx");
+        let stored: Vec<u8> = row.get("data");
+        let mut entries = decode_segment(&stored, start, end)?;
+        if end <= upto_i {
+            sqlx::query("DELETE FROM raft_log_segment WHERE start_idx = ?")
+                .bind(start)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| log_err(ErrorVerb::Delete, e))?;
+        } else {
+            // start <= upto < end：保留 (upto, end]。
+            let kept = entries.split_off((upto + 1 - start as u64) as usize);
+            sqlx::query("DELETE FROM raft_log_segment WHERE start_idx = ?")
+                .bind(start)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| log_err(ErrorVerb::Delete, e))?;
+            write_segment_tx(tx, &kept).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 追加覆盖 [start,end] 时，从已有段中挖掉该区间（左右两侧保留为段）。
+/// 正常追加只接在末尾，不会命中；用于重试/覆盖写时避免行与段重叠。
+async fn cut_segments_tx(
+    tx: &mut SqliteConnection,
+    start: u64,
+    end: u64,
+) -> Result<(), StorageError<u64>> {
+    let (start_i, end_i) = (start as i64, end as i64);
+    let segs = sqlx::query(
+        "SELECT start_idx, end_idx, data FROM raft_log_segment \
+         WHERE end_idx >= ? AND start_idx <= ? ORDER BY start_idx",
+    )
+    .bind(start_i)
+    .bind(end_i)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| log_err(ErrorVerb::Read, e))?;
+    for row in segs {
+        let seg_start: i64 = row.get("start_idx");
+        let seg_end: i64 = row.get("end_idx");
+        let stored: Vec<u8> = row.get("data");
+        let entries = decode_segment(&stored, seg_start, seg_end)?;
+        let left_len = entries.partition_point(|e| e.log_id.index < start);
+        let right_from = entries.partition_point(|e| e.log_id.index <= end);
+        sqlx::query("DELETE FROM raft_log_segment WHERE start_idx = ?")
+            .bind(seg_start)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| log_err(ErrorVerb::Delete, e))?;
+        if left_len > 0 {
+            write_segment_tx(tx, &entries[..left_len]).await?;
+        }
+        if right_from < entries.len() {
+            write_segment_tx(tx, &entries[right_from..]).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 追加事务内把最新连续行压段（>= [`SEGMENT_MIN_ENTRIES`] 且原始 JSON 总量有界）。
+/// 段与行不重叠；写段/删行同事务，崩溃只会留下完整旧行或完整新段。
+async fn compact_rows_tx(tx: &mut SqliteConnection) -> Result<(), StorageError<u64>> {
+    let rows = sqlx::query("SELECT idx, entry FROM raft_log ORDER BY idx DESC LIMIT ?")
+        .bind(SEGMENT_MAX_ENTRIES as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| log_err(ErrorVerb::Read, e))?;
+    if rows.len() < SEGMENT_MIN_ENTRIES {
+        return Ok(());
+    }
+    let mut run: Vec<(i64, Entry<TypeConfig>)> = Vec::new();
+    let mut raw_bytes = 0usize;
+    let mut expected: Option<i64> = None;
+    for row in rows {
+        let idx: i64 = row.get("idx");
+        if expected.is_some_and(|prev| idx != prev) {
+            break;
+        }
+        let stored: String = row.get("entry");
+        let (entry, raw_len) = decode_entry_with_len(&stored)?;
+        if entry.log_id.index != idx as u64 {
+            return Err(log_corrupt(format!(
+                "row {idx} holds entry index {}",
+                entry.log_id.index
+            )));
+        }
+        if raw_bytes + raw_len > SEGMENT_MAX_RAW_BYTES {
+            break;
+        }
+        raw_bytes += raw_len;
+        run.push((idx, entry));
+        expected = Some(idx - 1);
+    }
+    if run.len() < SEGMENT_MIN_ENTRIES {
+        return Ok(());
+    }
+    run.reverse();
+    let start = run[0].0;
+    let end = run[run.len() - 1].0;
+    let entries: Vec<Entry<TypeConfig>> = run.into_iter().map(|(_, entry)| entry).collect();
+    let overlap: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM raft_log_segment WHERE end_idx >= ? AND start_idx <= ?",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| log_err(ErrorVerb::Read, e))?;
+    if overlap != 0 {
+        return Err(log_err(
+            ErrorVerb::Write,
+            format!("raft log segment overlaps rows [{start},{end}]"),
+        ));
+    }
+    write_segment_tx(tx, &entries).await?;
+    let deleted = sqlx::query("DELETE FROM raft_log WHERE idx >= ? AND idx <= ?")
+        .bind(start)
+        .bind(end)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| log_err(ErrorVerb::Delete, e))?
+        .rows_affected();
+    if deleted as usize != entries.len() {
+        return Err(log_err(
+            ErrorVerb::Write,
+            format!(
+                "raft log compaction deleted {deleted} rows, expected {}",
+                entries.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 读以 `end_idx` 结尾的段的最后一条 LogId（get_log_state 用）。
+async fn read_segment_last(
+    tx: &mut SqliteConnection,
+    end_idx: i64,
+) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+    let row = sqlx::query("SELECT start_idx, data FROM raft_log_segment WHERE end_idx = ?")
+        .bind(end_idx)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| log_err(ErrorVerb::Read, e))?;
+    let Some(row) = row else {
+        return Err(log_corrupt(format!(
+            "segment ending at {end_idx} disappeared"
+        )));
+    };
+    let start: i64 = row.get("start_idx");
+    let data: Vec<u8> = row.get("data");
+    Ok(decode_segment(&data, start, end_idx)?
+        .last()
+        .map(|e| e.log_id))
 }
 
 /// 在调用方事务内写快照：> 1 块时清旧块、逐块插入，并在 `raft_snapshot.data`
@@ -242,10 +660,46 @@ impl SqliteLogStore {
 
     /// 是否已有任何日志（含未 apply 的成员日志）：`spawn` 据此避免重复 initialize。
     pub async fn has_logs(&self) -> Result<bool, sqlx::Error> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_log")
-            .fetch_one(&self.pool)
-            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM raft_log) + (SELECT COUNT(*) FROM raft_log_segment)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count > 0)
+    }
+
+    /// 追加事务体：写行 + 尝试压段，提交前返回；callback 由 [`Self::append`] 负责。
+    async fn append_entries(&self, entries: &[Entry<TypeConfig>]) -> Result<(), StorageError<u64>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| log_err(ErrorVerb::Write, e))?;
+        // 批次通常是 [first,last] 连续；覆盖已有段时先挖掉这些 idx。
+        if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+            let contiguous = entries
+                .iter()
+                .enumerate()
+                .all(|(i, e)| e.log_id.index == first.log_id.index + i as u64);
+            if contiguous {
+                cut_segments_tx(&mut tx, first.log_id.index, last.log_id.index).await?;
+            } else {
+                for entry in entries {
+                    cut_segments_tx(&mut tx, entry.log_id.index, entry.log_id.index).await?;
+                }
+            }
+        }
+        for entry in entries {
+            let json = encode_entry(entry)?;
+            sqlx::query("INSERT OR REPLACE INTO raft_log (idx, entry) VALUES (?, ?)")
+                .bind(entry.log_id.index as i64)
+                .bind(json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| log_err(ErrorVerb::Write, e))?;
+        }
+        compact_rows_tx(&mut tx).await?;
+        tx.commit().await.map_err(|e| log_err(ErrorVerb::Write, e))
     }
 
     async fn write_meta(&self, key: &str, value: &str) -> Result<(), StorageError<u64>> {
@@ -301,19 +755,67 @@ impl RaftLogReader<TypeConfig> for SqliteLogStore {
             return Ok(Vec::new());
         }
         let end = end.min(i64::MAX as u64);
+        // 行与段必须来自同一读快照，否则并发压段可能同时读出重叠内容。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| log_err(ErrorVerb::Read, e))?;
         let rows =
-            sqlx::query("SELECT entry FROM raft_log WHERE idx >= ? AND idx <= ? ORDER BY idx")
+            sqlx::query("SELECT idx, entry FROM raft_log WHERE idx >= ? AND idx <= ? ORDER BY idx")
                 .bind(start as i64)
                 .bind(end as i64)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await
-                .map_err(|e| storage_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
-        rows.into_iter()
-            .map(|r| {
-                let s: String = r.get("entry");
-                decode(ErrorSubject::Logs, ErrorVerb::Read, &s)
-            })
-            .collect()
+                .map_err(|e| log_err(ErrorVerb::Read, e))?;
+        let segs = sqlx::query(
+            "SELECT start_idx, end_idx, data FROM raft_log_segment \
+             WHERE end_idx >= ? AND start_idx <= ? ORDER BY start_idx",
+        )
+        .bind(start as i64)
+        .bind(end as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| log_err(ErrorVerb::Read, e))?;
+        tx.commit().await.map_err(|e| log_err(ErrorVerb::Read, e))?;
+
+        let mut entries = Vec::new();
+        for row in segs {
+            let seg_start: i64 = row.get("start_idx");
+            let seg_end: i64 = row.get("end_idx");
+            let data: Vec<u8> = row.get("data");
+            entries.extend(
+                decode_segment(&data, seg_start, seg_end)?
+                    .into_iter()
+                    .filter(|e| e.log_id.index >= start && e.log_id.index <= end),
+            );
+        }
+        for row in rows {
+            let idx: i64 = row.get("idx");
+            let stored: String = row.get("entry");
+            let entry = decode_entry(&stored)?;
+            if entry.log_id.index != idx as u64 {
+                return Err(log_corrupt(format!(
+                    "row {idx} holds entry index {}",
+                    entry.log_id.index
+                )));
+            }
+            entries.push(entry);
+        }
+        entries.sort_by_key(|e| e.log_id.index);
+        // 日志必须无洞、无重复；内部空洞说明存储损坏（purge 后的前缀缺口不在此列）。
+        for pair in entries.windows(2) {
+            let (prev, next) = (pair[0].log_id.index, pair[1].log_id.index);
+            if next <= prev {
+                return Err(log_corrupt(format!(
+                    "duplicate/out-of-order entry index {next} after {prev}"
+                )));
+            }
+            if next != prev + 1 {
+                return Err(log_corrupt(format!("index gap between {prev} and {next}")));
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -321,20 +823,51 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
-        let last_purged: Option<LogId<u64>> = self
-            .read_meta::<Option<LogId<u64>>>("last_purged")
-            .await?
-            .flatten();
-        let last = sqlx::query("SELECT entry FROM raft_log ORDER BY idx DESC LIMIT 1")
-            .fetch_optional(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| storage_err(ErrorSubject::Logs, ErrorVerb::Read, e))?
-            .map(|r| {
-                let s: String = r.get("entry");
-                decode::<Entry<TypeConfig>>(ErrorSubject::Logs, ErrorVerb::Read, &s)
-            })
-            .transpose()?
-            .map(|e| e.log_id);
+            .map_err(|e| log_err(ErrorVerb::Read, e))?;
+        let last_purged: Option<LogId<u64>> =
+            sqlx::query("SELECT value FROM raft_meta WHERE key = 'last_purged'")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
+                .map(|r| {
+                    let s: String = r.get("value");
+                    decode(ErrorSubject::Store, ErrorVerb::Read, &s)
+                })
+                .transpose()?
+                .flatten();
+        let row_max: Option<i64> = sqlx::query_scalar("SELECT MAX(idx) FROM raft_log")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| log_err(ErrorVerb::Read, e))?;
+        let seg_max: Option<i64> = sqlx::query_scalar("SELECT MAX(end_idx) FROM raft_log_segment")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| log_err(ErrorVerb::Read, e))?;
+        let last = match (row_max, seg_max) {
+            (Some(r), Some(s)) if s >= r => read_segment_last(&mut tx, s).await?,
+            (Some(r), _) => {
+                let stored: String = sqlx::query_scalar("SELECT entry FROM raft_log WHERE idx = ?")
+                    .bind(r)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| log_err(ErrorVerb::Read, e))?;
+                let entry = decode_entry(&stored)?;
+                if entry.log_id.index != r as u64 {
+                    return Err(log_corrupt(format!(
+                        "row {r} holds entry index {}",
+                        entry.log_id.index
+                    )));
+                }
+                Some(entry.log_id)
+            }
+            (None, Some(s)) => read_segment_last(&mut tx, s).await?,
+            (None, None) => None,
+        };
+        tx.commit().await.map_err(|e| log_err(ErrorVerb::Read, e))?;
         Ok(LogState {
             last_purged_log_id: last_purged,
             last_log_id: last.or(last_purged),
@@ -379,43 +912,7 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
         I::IntoIter: OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let mut result = Ok(());
-        let mut tx = match self.pool.begin().await {
-            Ok(tx) => tx,
-            Err(e) => {
-                callback.log_io_completed(Err(std::io::Error::other(e.to_string())));
-                return Err(storage_err(ErrorSubject::Logs, ErrorVerb::Write, e));
-            }
-        };
-        for entry in &entries {
-            let json = match encode(ErrorSubject::Log(entry.log_id), ErrorVerb::Write, entry) {
-                Ok(json) => json,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
-            if let Err(e) =
-                sqlx::query("INSERT OR REPLACE INTO raft_log (idx, entry) VALUES (?, ?)")
-                    .bind(entry.log_id.index as i64)
-                    .bind(json)
-                    .execute(&mut *tx)
-                    .await
-            {
-                result = Err(storage_err(
-                    ErrorSubject::Log(entry.log_id),
-                    ErrorVerb::Write,
-                    e,
-                ));
-                break;
-            }
-        }
-        if result.is_ok() {
-            result = tx
-                .commit()
-                .await
-                .map_err(|e| storage_err(ErrorSubject::Logs, ErrorVerb::Write, e));
-        }
+        let result = self.append_entries(&entries).await;
         match &result {
             Ok(()) => callback.log_io_completed(Ok(())),
             // 回调只接受 io::Error；SQLite 已回滚，RaftCore 会按存储错误处理。
@@ -425,11 +922,14 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        sqlx::query("DELETE FROM raft_log WHERE idx >= ?")
-            .bind(log_id.index as i64)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map(|_| ())
+            .map_err(|e| storage_err(ErrorSubject::Log(log_id), ErrorVerb::Delete, e))?;
+        truncate_log_tx(&mut tx, log_id.index).await?;
+        tx.commit()
+            .await
             .map_err(|e| storage_err(ErrorSubject::Log(log_id), ErrorVerb::Delete, e))
     }
 
@@ -439,11 +939,7 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
             .begin()
             .await
             .map_err(|e| storage_err(ErrorSubject::Log(log_id), ErrorVerb::Delete, e))?;
-        sqlx::query("DELETE FROM raft_log WHERE idx <= ?")
-            .bind(log_id.index as i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| storage_err(ErrorSubject::Log(log_id), ErrorVerb::Delete, e))?;
+        purge_log_tx(&mut tx, log_id.index).await?;
         let json = encode(ErrorSubject::Log(log_id), ErrorVerb::Write, &Some(log_id))?;
         sqlx::query("INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('last_purged', ?)")
             .bind(json)
@@ -2162,5 +2658,352 @@ mod tests {
         assert_eq!(state.last_purged_log_id, Some(log_id(1)));
         assert_eq!(state.last_log_id, Some(log_id(1)));
         assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
+    }
+
+    fn blank(index: u64) -> Entry<TypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn set_value(index: u64, value: &str) -> Entry<TypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(ControlCommand::Set {
+                key: format!("k{index}"),
+                value: value.into(),
+            }),
+        }
+    }
+
+    fn indices(entries: &[Entry<TypeConfig>]) -> Vec<u64> {
+        entries.iter().map(|e| e.log_id.index).collect()
+    }
+
+    async fn append_range(store: &mut SqliteLogStore, from: u64, to: u64) {
+        let entries: Vec<_> = (from..=to).map(blank).collect();
+        store.append_entries(&entries).await.unwrap();
+    }
+
+    async fn count(pool: &SqlitePool, sql: &'static str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    fn pseudo_random(len: usize) -> String {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(33 + (state % 90) as u8)
+            })
+            .collect()
+    }
+
+    /// 大 entry 压成 `z1:` 往返；小/不可压缩 entry 与旧明文行保持原格式。
+    #[tokio::test]
+    async fn entry_compression_round_trips_and_legacy_rows_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+
+        // 旧版直接写入的明文行。
+        let legacy = blank(1);
+        sqlx::query("INSERT INTO raft_log (idx, entry) VALUES (1, ?)")
+            .bind(serde_json::to_string(&legacy).unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let big = set_value(2, &"x".repeat(4096));
+        let small = blank(3);
+        let incompressible = set_value(4, &pseudo_random(4096));
+        store
+            .append_entries(&[big.clone(), small.clone(), incompressible.clone()])
+            .await
+            .unwrap();
+
+        let raw: Vec<String> = sqlx::query_scalar("SELECT entry FROM raft_log ORDER BY idx")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert!(raw[0].starts_with('{'), "legacy plain row");
+        assert!(
+            raw[1].starts_with(ENTRY_COMPRESS_MAGIC),
+            "large payload must compress: {}",
+            &raw[1][..8.min(raw[1].len())]
+        );
+        assert!(raw[1].len() < serde_json::to_string(&big).unwrap().len());
+        assert!(raw[2].starts_with('{'), "small entry stays plain");
+        assert!(raw[3].starts_with('{'), "incompressible entry stays plain");
+
+        let all = store.try_get_log_entries(..).await.unwrap();
+        assert_eq!(all, vec![legacy, big, small, incompressible]);
+
+        // 压缩格式跨重开可读。
+        drop(store);
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        assert_eq!(store.try_get_log_entries(..).await.unwrap().len(), 4);
+    }
+
+    /// 达到阈值后压段；段/行混合读、开闭区间边界与重开后的 LogState 一致。
+    #[tokio::test]
+    async fn segments_form_after_threshold_and_ranges_merge_across_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+
+        for chunk in 0..16u64 {
+            append_range(&mut store, 1 + chunk * 16, 16 + chunk * 16).await;
+        }
+        assert_eq!(count(&store.pool, "SELECT COUNT(*) FROM raft_log").await, 0);
+        assert_eq!(
+            count(&store.pool, "SELECT COUNT(*) FROM raft_log_segment").await,
+            1
+        );
+        let range: (i64, i64) = sqlx::query_as("SELECT start_idx, end_idx FROM raft_log_segment")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(range, (1, 256));
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(256))
+        );
+
+        append_range(&mut store, 257, 260).await;
+        assert_eq!(count(&store.pool, "SELECT COUNT(*) FROM raft_log").await, 4);
+        assert_eq!(
+            count(&store.pool, "SELECT COUNT(*) FROM raft_log_segment").await,
+            1
+        );
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (1..=260).collect::<Vec<_>>()
+        );
+
+        // 跨段/行边界，四种 Bound 组合。
+        let mid = store
+            .try_get_log_entries((Bound::Excluded(255u64), Bound::Included(258u64)))
+            .await
+            .unwrap();
+        assert_eq!(indices(&mid), vec![256, 257, 258]);
+        let excl_end = store
+            .try_get_log_entries((Bound::Included(256u64), Bound::Excluded(260u64)))
+            .await
+            .unwrap();
+        assert_eq!(indices(&excl_end), vec![256, 257, 258, 259]);
+        let in_segment = store
+            .try_get_log_entries((Bound::Included(1u64), Bound::Included(256u64)))
+            .await
+            .unwrap();
+        assert_eq!(indices(&in_segment), (1..=256).collect::<Vec<_>>());
+        let rows_only = store
+            .try_get_log_entries((Bound::Included(257u64), Bound::Unbounded))
+            .await
+            .unwrap();
+        assert_eq!(indices(&rows_only), vec![257, 258, 259, 260]);
+
+        drop(store);
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(260))
+        );
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (1..=260).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            count(&store.pool, "SELECT COUNT(*) FROM raft_log_segment").await,
+            1,
+            "重开幂等：段不重复创建"
+        );
+    }
+
+    /// 段内 truncate/purge 切分、重开、再追加；清空后 last_purged 语义不变。
+    #[tokio::test]
+    async fn truncate_and_purge_split_segments_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+
+        append_range(&mut store, 1, 300).await;
+        assert_eq!(
+            count(&store.pool, "SELECT COUNT(*) FROM raft_log_segment").await,
+            1
+        );
+        assert_eq!(count(&store.pool, "SELECT COUNT(*) FROM raft_log").await, 0);
+
+        // truncate 落在段内：保留 [1,99]。
+        store.truncate(log_id(100)).await.unwrap();
+        let range: (i64, i64) = sqlx::query_as("SELECT start_idx, end_idx FROM raft_log_segment")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(range, (1, 99));
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (1..=99).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(99))
+        );
+
+        // truncate 后追加走行，与段拼接。
+        append_range(&mut store, 100, 105).await;
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (1..=105).collect::<Vec<_>>()
+        );
+
+        // purge 落在段内：保留 [51,99]；last_purged 与最后 LogId 分离。
+        store.purge(log_id(50)).await.unwrap();
+        let range: (i64, i64) = sqlx::query_as("SELECT start_idx, end_idx FROM raft_log_segment")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(range, (51, 99));
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(50)));
+        assert_eq!(state.last_log_id, Some(log_id(105)));
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (51..=105).collect::<Vec<_>>()
+        );
+
+        drop(store);
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (51..=105).collect::<Vec<_>>()
+        );
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(50)));
+        assert_eq!(state.last_log_id, Some(log_id(105)));
+
+        // purge 覆盖整段：段删除，仅剩行。
+        store.purge(log_id(102)).await.unwrap();
+        assert_eq!(
+            count(&store.pool, "SELECT COUNT(*) FROM raft_log_segment").await,
+            0
+        );
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            vec![103, 104, 105]
+        );
+
+        append_range(&mut store, 106, 107).await;
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            vec![103, 104, 105, 106, 107]
+        );
+
+        // 清空：last_log_id 回落到 last_purged。
+        store.purge(log_id(107)).await.unwrap();
+        assert!(!store.has_logs().await.unwrap());
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(107)));
+        assert_eq!(state.last_log_id, Some(log_id(107)));
+        assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
+    }
+
+    /// 覆盖写落在段内：段切两半，行补洞；读无重复/无洞。
+    #[tokio::test]
+    async fn append_overwriting_inside_segment_splits_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+
+        append_range(&mut store, 1, 256).await;
+        let replacement = set_value(100, "new");
+        store.append_entries(&[replacement.clone()]).await.unwrap();
+
+        let segs: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT start_idx, end_idx FROM raft_log_segment ORDER BY start_idx")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(segs, vec![(1, 99), (101, 256)]);
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (1..=256).collect::<Vec<_>>()
+        );
+        let all = store.try_get_log_entries(..).await.unwrap();
+        assert_eq!(all[99], replacement);
+        assert_eq!(
+            indices(
+                &store
+                    .try_get_log_entries((Bound::Included(99u64), Bound::Included(101u64)))
+                    .await
+                    .unwrap()
+            ),
+            vec![99, 100, 101]
+        );
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(256))
+        );
+
+        drop(store);
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        let all = store.try_get_log_entries(..).await.unwrap();
+        assert_eq!(indices(&all), (1..=256).collect::<Vec<_>>());
+        assert_eq!(all[99], replacement);
+    }
+
+    /// 坏 magic、截断、解码索引与段范围不符：一律 StorageError，绝不返回部分数据。
+    #[tokio::test]
+    async fn corrupt_segments_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        append_range(&mut store, 1, 256).await;
+        let valid: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM raft_log_segment WHERE start_idx = 1")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+
+        sqlx::query("UPDATE raft_log_segment SET data = ? WHERE start_idx = 1")
+            .bind(b"not-a-segment-but-long-enough".as_slice())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let err = store.try_get_log_entries(..).await.unwrap_err();
+        assert!(format!("{err}").contains("bad magic"), "{err}");
+
+        sqlx::query("UPDATE raft_log_segment SET data = ? WHERE start_idx = 1")
+            .bind(&valid[..valid.len() / 2])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let err = store.try_get_log_entries(..).await.unwrap_err();
+        assert!(format!("{err}").contains("corrupt raft log"), "{err}");
+
+        // 元素数与范围一致，但解码索引不在 [start,end]。
+        let wrong: Vec<_> = (3..=258).map(blank).collect();
+        sqlx::query("UPDATE raft_log_segment SET data = ? WHERE start_idx = 1")
+            .bind(encode_segment(&wrong).unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let err = store.try_get_log_entries(..).await.unwrap_err();
+        assert!(format!("{err}").contains("outside"), "{err}");
+        let err = store.get_log_state().await.unwrap_err();
+        assert!(format!("{err}").contains("outside"), "{err}");
+
+        sqlx::query("UPDATE raft_log_segment SET data = ? WHERE start_idx = 1")
+            .bind(valid.as_slice())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            indices(&store.try_get_log_entries(..).await.unwrap()),
+            (1..=256).collect::<Vec<_>>()
+        );
     }
 }
