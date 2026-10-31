@@ -72,6 +72,17 @@
 > 透明读回）；日志条目仍每条一行 JSON，压缩/分段为选定下一片。CMK 激活仍为不归点，
 > `cmk rewrap` 只覆盖同一 CMK 的版本内重加密。
 >
+> **2026-10-31 更新（v1.27 wave-4，存储/身份/运维）**：Raft 日志交付 **压缩 + 分段**
+> （≥1024 B entry 存 `z1:`+base64；append 事务内把连续 ≥256 条压成
+> `raft_log_segment`，读/truncate/purge 透明合并/切分；旧明文行照常读）。这是**单向磁盘
+> 格式**：新二进制写过新日志后旧二进制无法读取，停写蓝绿升级、写后不回退。AP 交付
+> **attested-proxy 端点身份**（可信网段内终止 mTLS/PrivateLink 的代理签 HS256 短期 JWT，
+> 服务端验签+时效+vpce 匹配；evidence=`attested-proxy`），真实 AWS PrivateLink API 与
+> mTLS 证书→端点映射仍需证书/端点注册表。运维交付 **v1.16 数据面下限/MPU 排空 preflight**、
+> `blue-green-preflight.sh` 只读闸门与 `oss-server --version`。仍缺：CMK→legacy 迁移、
+> 任意双向混写、≤v1.15 MPU、真实 PrivateLink/mTLS、日志格式的 feature 门控（当前按
+> 停写蓝绿约束）。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →
@@ -85,7 +96,7 @@
 | 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.20.1↔v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不再支持；Ext 类型协商（`x-oss-raft-ext-types`、leader append 门、成员 preflight）与在途 MPU CMK 引用已交付；生产 `REGISTERED_EXT_TYPES` 仍为空，完整双向混写与数据面滚动仍缺 | 6–10 人周 | 生产 Ext 类型、CMK 迁移、数据面滚动 | 高 |
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；跨版本 MPU 支持 v1.16+（wire-1 有界回退 / wire-2 流式），≤v1.15 无 MPU RPC 不支持；全操作混版写窗口仍缺 | 4–8 人周 | 混版写语义、停写蓝绿 runbook | 高 |
 | 3 | 完整多租户账户体系 | AC-0..AC-3 + 软/硬字节与对象数配额 + 管理员 UI + canonicalization worker 已交付；硬配额跨节点为 30s/60s 有界陈旧；Raft 配置命令与动态 VPC 端点命令已在 feature 8 交付 | 1–2 人周（精确聚合） | 跨节点精确用量 | 中高 |
-| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；feature 4/5/6/7 分别交付 jobs/Restore 受理、inventory/lifecycle 游标、JobPurge、tier restore 后续状态与调度租约；快照 >256 KiB 已分块（旧整行透明读），日志仍每条一行 JSON；仍缺 follower Restore 清理的即时 fencing 与真实滚动故障切换演练 | 0.5–1 人周 | 既有 feature 7 命令 + 快照存储 | 中 |
+| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；feature 4/5/6/7 分别交付 jobs/Restore 受理、inventory/lifecycle 游标、JobPurge、tier restore 后续状态与调度租约；快照 >256 KiB 已分块（旧整行透明读）；日志 ≥1024 B 压缩、连续 ≥256 条分段（旧明文行透明读，新格式单向）；仍缺 follower Restore 清理的即时 fencing 与真实滚动故障切换演练 | 0.5–1 人周 | 既有 feature 7 命令 + 快照存储 | 中 |
 | 5 | M3 shrink / 单机→集群 | shrink 4→3 已交付：topology v4 + 离线 plan/apply/verify/commit/rollback + loopback e2e（验收 §15.2）；单机→集群仍为离线重新灌入（`scripts/single-to-cluster.sh` plan/resume/verify，只迁当前版本，不是拓扑转换），原地转换不工具化 | 不排期 | 停机全量重新灌入 | 极高（若做原地转换） |
 
 ---
@@ -370,8 +381,12 @@ DARE AAD 绑定 `key_id`，meta-only rewrap 不可能让 pre-CMK 二进制读出
   `TrustedProxyEndpointVerifier`（`OSS_AP_ENDPOINT_VERIFIER=trusted-proxy`；直连 TCP
   对端须在 `OSS_AP_TRUSTED_PEER_CIDRS` 内，重复/畸形声明拒绝，Denied=403、
   Unavailable=500），验证后仍执行注册表 registered/state/VPC/account 校验；证据写审计。
-  **AWS PrivateLink/mTLS 端点身份未在本机证明**：注册表仍是部署断言，mTLS/attested-proxy
-  是选定下一片。
+  **2026-10-31 wave-4 交付 `attested-proxy`**：可信网段内终止 mTLS/PrivateLink 的代理签发
+  HS256 短期 JWT（`vpce`/`vpc`/`account`/`iat`/`exp`），服务端验签、要求可信直连 peer、
+  限制时效并核对声明；evidence=`attested-proxy` 入审计，registry 检查不放宽。
+  **真实 AWS PrivateLink API 与 mTLS 证书→vpce 映射仍未实现**：后者需要配置/注册表载体
+  （当前 `ApTrustConfig`/`vpc_endpoints` 没有证书指纹列），只证明「有证书」不等于
+  「是该端点」；不伪造身份。
 - **仍缺**：跨节点实时用量聚合（硬字节/对象数配额已交付，30s/60s 有界陈旧；Raft
   配置命令见 feature 8）。账户规范化 worker 已交付：standalone 单事务 + marker，Raft
   leader 复用 level-3 `AccountCreate`/`AccountMemberAttach` 补 legacy 行
@@ -482,8 +497,11 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 - **Raft 快照存储（2026-10-31 wave-3）**：>256 KiB 的快照按 `SNAPSHOT_CHUNK_BYTES`
   分行写入 `raft_snapshot_chunk`，`raft_snapshot.data` 只保留 `OSSCHNK1` 清单头
   （块数 + 原始总长）；缺块/乱序/截断 fail-closed。旧版整行 BLOB 快照透明读回，并在
-  open 时迁移为分块（`legacy_whole_blob_snapshot_migrates_on_open`）。Raft **日志条目
-  仍是每条一行 JSON**，尚未压缩/分段——这是选定下一片。
+  open 时迁移为分块（`legacy_whole_blob_snapshot_migrates_on_open`）。
+  **2026-10-31 wave-4 日志存储**：≥1024 B entry 压缩为 `z1:`+base64；append 事务内把最新
+  连续 ≥256 行（≤1024 行/16 MiB）压成 `raft_log_segment(start_idx,end_idx,data BLOB)`，
+  读/truncate/purge 透明合并/切分；旧明文行透明读，坏段 fail-closed。新格式对旧二进制
+  不可读，按停写蓝绿升级、写后不回退。
 - 审计仍本地（`state.rs` 的 `audit_log`）；AP 缓存进程本地 + TTL（`ap.rs:9-12`）；
   JWT 无状态、12h 过期（`console.rs`）；登录限流器进程本地——多节点会话天然可跨节点，
   但限流与吊销强度下降。

@@ -696,3 +696,17 @@ Restore 清理携带 UNFENCED（term 0），由 leader reaper 收敛；Tag 复�
 另交付 feature 8（`AccountHardQuotaSet`、`VpcEndpoint*` 复制命令与迁移工具），§20 的
 「Raft 硬配额配置 501」限制对 v1.27 不再适用；该提交的测试未在本次文档整理中重跑。
 CMK 激活为不归点、旧行快照透明读回、生产 Ext 注册表为空等边界见架构 backlog §1/§2/§4。
+
+## 22. 2026-10-31 v1.27 wave-4：Raft 日志压缩/分段、AP attested-proxy 与升级预检（未发布）
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| Raft 日志压缩 + 分段 | `oss-server/raft/store.rs` | ≥1024 B entry 存 `z1:`+base64（仅严格更小）；append 事务内把最新连续 ≥256 行（≤1024 行/16 MiB）压成 `raft_log_segment(start_idx,end_idx,data BLOB)`；读/truncate/purge 透明合并/切分，旧明文行照常读，坏魔法/截断/索引不符 fail-closed。`entry_compression_round_trips_and_legacy_rows_stay_readable`、`segments_form_after_threshold_and_ranges_merge_across_boundaries`、`truncate_and_purge_split_segments_and_reopen`、`append_overwriting_inside_segment_splits_without_duplicates`、`corrupt_segments_fail_closed`（21/0）。写事务先读后写改为 `BEGIN IMMEDIATE`，修复 WAL 下并发 apply 时的 BUSY_SNAPSHOT 误报（`da4806e`）。新格式单向：写过新日志后旧二进制不可读，按停写蓝绿升级、写后不回退 |
+| AP attested-proxy 端点身份 | `xl-s3/ap.rs`、`oss-server/router.rs`、`tests/m8_ap_trust.rs` | 可信网段内终止 mTLS/PrivateLink 的代理签 HS256 短期 JWT（`vpce` 必需，可选 `vpc`/`account`，`iat`/`exp`）；服务端要求可信直连 peer、验签、限制时效并核对声明；evidence=`attested-proxy` 入审计；registry registered/state/VPC/account 检查不放宽。配置 `OSS_AP_ENDPOINT_VERIFIER=attested-proxy`、`OSS_AP_ATTESTATION_SECRET`（≥32 B）、`OSS_AP_TRUSTED_PEER_CIDRS`、`OSS_AP_ATTESTATION_MAX_AGE_SECS`（默认 60）。测试：xl-s3 AP 35/0、`m8_ap_trust` 18/0。真实 AWS PrivateLink API 与 mTLS 证书→端点映射未实现（需证书/端点注册表），不伪造 |
+| v1.16 数据面下限 / MPU 排空 | `scripts/upgrade-preflight.sh`、`scripts/tests/upgrade-preflight.sh` | `--health-json` 校验本地/每个 up 节点 `data_wire_version >= 2`、`data_plane_compatible: true`；缺失/坏 JSON BLOCK；`--require-no-mpu` 把任何活 MPU 暂存区变 BLOCK；自检 109/0 |
+| 停写蓝绿就绪闸门 | `scripts/blue-green-preflight.sh`、`scripts/tests/blue-green-preflight-selfcheck.sh` | 委派 strict preflight、冷备非空、`--health-url` 任意 HTTP 响应（含 503/500）即 BLOCK、`--new-binary --version` ≥ `--min-version`；只读并打印运行手册/回滚边界；自检 78/0 |
+| CLI 版本查询 | `oss-server/cli.rs` | `--version`/`-V`/`version` 离线打印 `oss-server <CARGO_PKG_VERSION>`，不读配置/不建 AppState；多余参数拒绝；实测二进制输出 `oss-server 1.26.0`，`blue-green-preflight.sh --new-binary` 识别为 1.26.0（非 strict 下无 BLOCK，退出 0） |
+
+**验证（合并后，本机）**：fmt 通过；`oss-server --lib` **265/0**（含 `BEGIN IMMEDIATE` 修复；并行默认线程）、`xl-s3 --lib` **202/0**；集成 `m8_ap_trust` 18/0、`raft_cutover` 7/0、`raft_inventory_replication` 12/0、`raft_jobs_replication` 11/0、`raft_lifecycle_cursor_replication` 8/0、`raft_restore_lease_replication` 3/0；脚本自检 109/0 与 78/0。提交：`fee15fe`（日志）、`94f1eb1`（AP）、`31adffe`（预检）、`53607d8`（文档）、`edb1db3`（CLI）；合并 `48e12c6`/`6bc515a`/`67f42d9`/`6d51acb`。完整 workspace 聚合未跑，发布闸门以分套件为准。
+
+**已知限制**：日志新格式无 feature-level 门控（旧二进制不可读，只能停写蓝绿）；HS256 共享密钥无 `kid`/轮换，依赖可信网段+短时效；直连 mTLS 需先有证书→端点注册表；`--health-url` 探测超时按“已停止”处理，操作者仍需确认进程状态。

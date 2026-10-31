@@ -101,7 +101,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
             <li><code>partNumber</code> 与 <code>Range</code> 同时出现 → 400 <code>InvalidRequest</code>；v1.15 起复制与 tier 摄入透传 <code>part_sizes</code>，MPU 分段边界保持可读。</li>
             <li>GET 多区间 <code>bytes=0-9,20-29</code> 不返回 <code>multipart/byteranges</code>：未签入 Range 时剥离并返回 200 整对象；Range 计入 SigV4 SignedHeaders 时返回确定性 400 <code>InvalidArgument</code>。</li>
             <li>匿名 AP 策略 <code>Principal:"*"</code> 与桶策略匿名基线取交集，仅放行数据面对象操作；控制面与对象锁/保留期头一律 403。</li>
-            <li>生命周期支持 <code>AbortIncompleteMultipartUpload</code>；STS 支持 <code>AssumeRoleWithWebIdentity</code>（默认关闭，需 OIDC 配置）；AP 跨账户已支持账户根 principal，VPC 端点真实 PrivateLink 身份仍为非目标。</li>
+            <li>生命周期支持 <code>AbortIncompleteMultipartUpload</code>；STS 支持 <code>AssumeRoleWithWebIdentity</code>（默认关闭，需 OIDC 配置）；AP 跨账户已支持账户根 principal；端点身份支持 <code>trusted-proxy</code> 与 <code>attested-proxy</code>（HS256 短期断言），真实 AWS PrivateLink API 与 mTLS 证书→端点映射仍为非目标（需证书/端点注册表）。</li>
             <li>Select 支持 CSV/JSON/Parquet 输入与 BZIP2/GZIP（BZIP2 仅 CSV/JSON；ScanRange 与压缩流互斥）。MPU 新 upload_id 可跨节点路由；存量裸 UUID 仍粘原节点。</li>
             <li>Batch 支持同提交者协作抢占与跨账户清单（管理员）；OSSCTL2/3 快照分别携带 level-2/3 数据，旧读者明确拒绝。</li>
             <li>v1.17：多租户账户 MVP（账户/成员/状态/桶数配额；账户写不参与 Raft）；AP 跨账户账户根 principal 与 <code>aws:SourceVpce</code> 来源证明。</li>
