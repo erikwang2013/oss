@@ -5,14 +5,14 @@ use std::sync::Arc;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use jwt_rust::JwtPayload;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::console::{control_failure, control_rejection};
+use crate::console::{control_failure, control_rejection, control_write_status};
 use crate::db::Db;
 use crate::raft::{ControlCommand, ControlResponse};
 use crate::state::AppState;
@@ -25,6 +25,12 @@ pub fn routes() -> Router<AppState> {
         .route("/access-points", get(list).post(create))
         .route("/access-points/{name}", get(get_one).delete(delete_one))
         .route("/access-points/{name}/policy", put(put_policy))
+        // AP Slice B：动态 VPC 端点 registry（feature 8；静态配置仍回退）。
+        .route(
+            "/vpc-endpoints",
+            get(list_vpc_endpoints).post(upsert_vpc_endpoint),
+        )
+        .route("/vpc-endpoints/{vpce_id}", delete(delete_vpc_endpoint))
         .route(
             "/access-points/{name}/transform",
             // wasm 模块 ≤16 MiB，base64 后 ~22 MiB；axum Json 默认 2 MiB 不够。
@@ -662,4 +668,108 @@ impl ApSource for DbApSource {
         })
         .transpose()
     }
+}
+
+/// AP Slice B：动态 VPC 端点 upsert 请求（feature 8）。
+#[derive(Deserialize)]
+struct VpcEndpointBody {
+    vpce_id: String,
+    vpc_id: String,
+    account_id: String,
+    state: String,
+}
+
+async fn list_vpc_endpoints(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+) -> Response {
+    let (_, admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !admin {
+        return (StatusCode::FORBIDDEN, "需要管理员权限").into_response();
+    }
+    match state.db.vpc_endpoint_list().await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "vpce_id": r.vpce_id, "vpc_id": r.vpc_id,
+                        "account_id": r.account_id, "state": r.state,
+                        "created_at": r.created_at, "updated_at": r.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "动态 VPC 端点列表失败");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn upsert_vpc_endpoint(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Json(body): Json<VpcEndpointBody>,
+) -> Response {
+    let (_, admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !admin {
+        return (StatusCode::FORBIDDEN, "需要管理员权限").into_response();
+    }
+    if !xl_s3::ap::valid_vpce_id(&body.vpce_id) {
+        return bad("vpce_id 非法");
+    }
+    if !xl_s3::ap::valid_vpc_id(&body.vpc_id) {
+        return bad("vpc_id 非法");
+    }
+    if body.account_id.trim().is_empty() {
+        return bad("account_id 不能为空");
+    }
+    if !matches!(body.state.as_str(), "active" | "disabled") {
+        return bad("state 必须为 active 或 disabled");
+    }
+    let ts = now();
+    control_write_status(
+        state
+            .control
+            .write(ControlCommand::VpcEndpointUpsert {
+                endpoint: crate::raft::data::VpcEndpointRow {
+                    vpce_id: body.vpce_id,
+                    vpc_id: body.vpc_id,
+                    account_id: body.account_id,
+                    state: body.state,
+                    created_at: ts,
+                    updated_at: ts,
+                },
+            })
+            .await,
+        "VPC 端点注册冲突",
+    )
+}
+
+async fn delete_vpc_endpoint(
+    State(state): State<AppState>,
+    Extension(payload): Extension<JwtPayload>,
+    Path(vpce_id): Path<String>,
+) -> Response {
+    let (_, admin) = match who(&state, &payload).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !admin {
+        return (StatusCode::FORBIDDEN, "需要管理员权限").into_response();
+    }
+    control_write_status(
+        state
+            .control
+            .write(ControlCommand::VpcEndpointDelete { vpce_id })
+            .await,
+        "VPC 端点删除冲突",
+    )
 }

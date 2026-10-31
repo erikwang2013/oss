@@ -225,6 +225,25 @@ fn all_variants() -> Vec<ControlCommand> {
             soft_byte_quota: Some(1024),
             updated_at: 1,
         },
+        ControlCommand::AccountHardQuotaSet {
+            id: "000000000001".into(),
+            hard_byte_quota: Some(1024),
+            object_quota: Some(10),
+            updated_at: 1,
+        },
+        ControlCommand::VpcEndpointUpsert {
+            endpoint: oss_server::raft::data::VpcEndpointRow {
+                vpce_id: "vpce-1".into(),
+                vpc_id: "vpc-1".into(),
+                account_id: "000000000001".into(),
+                state: "active".into(),
+                created_at: 1,
+                updated_at: 1,
+            },
+        },
+        ControlCommand::VpcEndpointDelete {
+            vpce_id: "vpce-1".into(),
+        },
         ControlCommand::AccountDelete {
             id: "000000000001".into(),
         },
@@ -433,8 +452,8 @@ fn control_command_field_set_matches_frozen_fixture() {
 fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     use oss_server::raft::compat::{
         FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_LEVEL_4, FEATURE_LEVEL_5, FEATURE_LEVEL_6,
-        FEATURE_LEVEL_7, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL,
-        MIN_FEATURE_LEVEL, guard_startup, supports,
+        FEATURE_LEVEL_7, FEATURE_LEVEL_8, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE,
+        MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup, supports,
     };
     assert_eq!(MIN_FEATURE_LEVEL, 1);
     assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
@@ -454,7 +473,11 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         FEATURE_LEVEL_7, 7,
         "v1.25.0 及更早 advertise ≤6，restore 后续状态/租约必须用新 level 7"
     );
-    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_7);
+    assert_eq!(
+        FEATURE_LEVEL_8, 8,
+        "v1.26.0 及更早 advertise ≤7，硬配额配置必须用新 level 8"
+    );
+    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_8);
     assert!(
         supports(1)
             && supports(2)
@@ -463,17 +486,20 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
             && supports(5)
             && supports(6)
             && supports(7)
+            && supports(8)
     );
-    assert!(!supports(8), "未知更高 level 一律不支持");
+    assert!(!supports(9), "未知更高 level 一律不支持");
 
-    // marker 7 + MAX 7：显式配置 7 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）/
-    // v1.24.0（MAX 5）/v1.25.0（MAX 6）拒绝。
+    // marker 8 + MAX 8：显式配置 8 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）/
+    // v1.24.0（MAX 5）/v1.25.0（MAX 6）/v1.26.0（MAX 7）拒绝。
     assert!(guard_startup(3, 3).is_ok());
     assert!(guard_startup(4, 4).is_ok());
     assert!(guard_startup(5, 5).is_ok());
     assert!(guard_startup(6, 6).is_ok());
     assert!(guard_startup(7, 7).is_ok());
-    assert!(guard_startup(8, 7).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(8, 8).is_ok());
+    assert!(guard_startup(9, 8).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(8, 7).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(7, 6).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(6, 5).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(5, 4).is_err(), "配置低于 marker 必须拒绝");
@@ -482,8 +508,17 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         "配置低于已激活 marker 必须拒绝"
     );
 
-    let (mut ext, mut accounts, mut jobs, mut inventory, mut retention, mut restore, mut lease) =
-        (0, 0, 0, 0, 0, 0, 0);
+    let (
+        mut ext,
+        mut accounts,
+        mut jobs,
+        mut inventory,
+        mut retention,
+        mut restore,
+        mut lease,
+        mut hard_quota,
+        mut vpc,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
         match cmd {
@@ -544,6 +579,20 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
                     "调度租约必须用 level 7（v1.25.0 占用 6）"
                 );
             }
+            ControlCommand::AccountHardQuotaSet { .. } => {
+                hard_quota += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_8,
+                    "硬配额配置必须用 level 8（v1.26.0 占用 7）"
+                );
+            }
+            ControlCommand::VpcEndpointUpsert { .. } | ControlCommand::VpcEndpointDelete { .. } => {
+                vpc += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_8,
+                    "动态 VPC 端点必须用 level 8（v1.26.0 占用 7）"
+                );
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
                 "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
@@ -560,6 +609,8 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     assert_eq!(retention, 1, "生产命令集恰好一个 JobPurge 样本");
     assert_eq!(restore, 2, "生产命令集恰好两个 restore 后续状态样本");
     assert_eq!(lease, 1, "生产命令集恰好一个调度租约样本");
+    assert_eq!(hard_quota, 1, "生产命令集恰好一个硬配额配置样本");
+    assert_eq!(vpc, 2, "生产命令集恰好两个动态 VPC 端点样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

@@ -4,7 +4,7 @@
 //! 非当前版本与未完成 MPU）。集群模式走 `Store::list_objects` 的既有 mesh 合并列举；
 //! 丢 peer 时结果是下界（`complete=false`，头回 `partial`），不冒充精确值。
 //! 逐桶分页列举，成本 O(对象数/1000)，只读管理端点，不在 S3 热路径上。
-//! 同模块含 AC-3 硬配额配置路由（standalone 直写；Raft 无复制命令 → 501）。
+//! 同模块含 AC-3 硬配额配置路由（经 `ControlPlane` 复制；standalone 走 Local apply）。
 
 use axum::Json;
 use axum::extract::{Extension, Path, State};
@@ -17,7 +17,8 @@ use xl_store::store::ListRequest;
 use std::time::Duration;
 
 use crate::accounts_support::{bad, require_member};
-use crate::console::{forbidden, internal_error, who};
+use crate::console::{control_write_status, forbidden, internal_error, who};
+use crate::raft::ControlCommand;
 use crate::state::AppState;
 
 /// 硬配额用量采样间隔：跨节点缓存的最大陈旧度（另有写入路径 30s 惰性刷新兜底）。
@@ -155,8 +156,8 @@ fn optional_limit(v: &serde_json::Value) -> Option<Option<i64>> {
     }
 }
 
-/// 硬字节/对象数配额：standalone 直写。Raft 下需要复制命令（未在本版实现，
-/// 不新增 `raft/command.rs` 变体），明确 501，绝不只改 leader 本地库。
+/// 硬字节/对象数配额：经 `ControlPlane` 写（Raft = level-8 复制命令，standalone =
+/// Local apply）；绝不只改 leader 本地库。
 pub(crate) async fn set_hard_quota(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
@@ -176,23 +177,16 @@ pub(crate) async fn set_hard_quota(
     let Some(object_quota) = optional_limit(&body.object_quota) else {
         return bad("object_quota 必须 >= 0 或 null");
     };
-    if state.control.is_raft() {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "Raft 模式硬配额配置需要复制命令（本版未提供；standalone 可用）",
-        )
-            .into_response();
-    }
-    match state
-        .db
-        .set_account_hard_limits(&id, hard_byte_quota, object_quota)
-        .await
-    {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, account = %id, "设置硬配额失败");
-            internal_error()
-        }
-    }
+    control_write_status(
+        state
+            .control
+            .write(ControlCommand::AccountHardQuotaSet {
+                id,
+                hard_byte_quota,
+                object_quota,
+                updated_at: crate::db::now(),
+            })
+            .await,
+        "硬配额更新冲突",
+    )
 }

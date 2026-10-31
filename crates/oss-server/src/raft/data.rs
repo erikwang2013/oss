@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 
-use super::compat::{FEATURE_LEVEL_3, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
+use super::compat::{FEATURE_LEVEL_3, FEATURE_LEVEL_8, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
 
 /// 本二进制可写的最新快照封套版本（1 = OSSCTL1，2 = OSSCTL2，3 = OSSCTL3）。
 pub const SNAPSHOT_FORMAT: u32 = 3;
@@ -209,6 +209,18 @@ pub struct AccountMemberRow {
     pub created_at: i64,
 }
 
+/// feature 8：动态 VPC 端点注册行（随 ControlData 复制；空表时不序列化）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VpcEndpointRow {
+    pub vpce_id: String,
+    pub vpc_id: String,
+    pub account_id: String,
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// 11 张复制表的完整载荷（自然键；无本地自增 id / set_id / 管理员行）。
 ///
 /// V3 新增账户两表：空表时**不序列化**，V1/V2 载荷保持逐字节冻结
@@ -231,6 +243,8 @@ pub struct ControlData {
     pub accounts: Vec<AccountRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_members: Vec<AccountMemberRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vpc_endpoints: Vec<VpcEndpointRow>,
 }
 
 #[derive(Debug)]
@@ -564,6 +578,23 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
                 created_at: r.get("created_at"),
             });
         }
+        for r in sqlx::query(
+            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
+             FROM vpc_endpoints ORDER BY vpce_id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql)?
+        {
+            data.vpc_endpoints.push(VpcEndpointRow {
+                vpce_id: r.get("vpce_id"),
+                vpc_id: r.get("vpc_id"),
+                account_id: r.get("account_id"),
+                state: r.get("state"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            });
+        }
     }
 
     Ok(data)
@@ -604,6 +635,7 @@ pub struct InstallReport {
     pub inventory_configs: usize,
     pub accounts: usize,
     pub account_members: usize,
+    pub vpc_endpoints: usize,
 }
 
 fn report_of(data: &ControlData) -> InstallReport {
@@ -621,6 +653,7 @@ fn report_of(data: &ControlData) -> InstallReport {
         inventory_configs: data.inventory_configs.len(),
         accounts: data.accounts.len(),
         account_members: data.account_members.len(),
+        vpc_endpoints: data.vpc_endpoints.len(),
     }
 }
 
@@ -639,6 +672,18 @@ pub(crate) async fn install_tx(
         return Err(DataError::Format(
             "snapshot carries level-3 account rows but install is not canonical (feature level < 3)"
                 .into(),
+        ));
+    }
+    if (!ctx.canonical && !data.vpc_endpoints.is_empty())
+        || data.vpc_endpoints.iter().any(|e| {
+            e.vpce_id.trim().is_empty()
+                || e.vpc_id.trim().is_empty()
+                || e.account_id.trim().is_empty()
+                || !matches!(e.state.as_str(), "active" | "disabled")
+        })
+    {
+        return Err(DataError::Format(
+            "snapshot carries invalid level-8 vpc_endpoint rows".into(),
         ));
     }
     // 1. AP → olap（olap_configs.access_point 外键）。
@@ -738,6 +783,28 @@ pub(crate) async fn install_tx(
 
     // 7b. 账户两表（level 3）：成员/admin 按 username 映射到本地非管理员 id。
     replace_accounts_tx(conn, &data.accounts, &data.account_members, ctx.canonical).await?;
+
+    // 7c. 动态 VPC 端点（level 8）：无本地 id，account_id 是稳定字符串。
+    sqlx::query("DELETE FROM vpc_endpoints")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    for e in &data.vpc_endpoints {
+        sqlx::query(
+            "INSERT INTO vpc_endpoints \
+             (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&e.vpce_id)
+        .bind(&e.vpc_id)
+        .bind(&e.account_id)
+        .bind(&e.state)
+        .bind(e.created_at)
+        .bind(e.updated_at)
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    }
 
     // 8. AK（快照只含 long-term parent_ak=NULL；按 username 映射本地 id）。
     for k in &data.access_keys {
@@ -1140,7 +1207,9 @@ fn validate_extensions(exts: &SnapshotExtensions, max_total: usize) -> Result<()
 
 /// 数据自身要求的最低激活级别：账户行（V3 独有）→ 3，`config_json` → 2，否则 1。
 pub fn required_feature_level(data: &ControlData) -> u8 {
-    if !data.accounts.is_empty() || !data.account_members.is_empty() {
+    if !data.vpc_endpoints.is_empty() {
+        FEATURE_LEVEL_8
+    } else if !data.accounts.is_empty() || !data.account_members.is_empty() {
         FEATURE_LEVEL_3
     } else if data.lifecycle_rules.iter().any(|r| r.config_json.is_some()) {
         2
@@ -1448,6 +1517,7 @@ mod tests {
             }],
             accounts: Vec::new(),
             account_members: Vec::new(),
+            vpc_endpoints: Vec::new(),
         }
     }
 
@@ -1685,13 +1755,27 @@ mod tests {
         let db = raft_db(&dir, "install-accounts.db").await;
         let mut tx = db.pool().begin().await.unwrap();
         let admin_id = seed_active_admin(&mut tx).await;
-        let data = account_sample();
+        let mut data = account_sample();
+        data.vpc_endpoints.push(VpcEndpointRow {
+            vpce_id: "vpce-1".into(),
+            vpc_id: "vpc-1".into(),
+            account_id: "000000000007".into(),
+            state: "active".into(),
+            created_at: 1,
+            updated_at: 2,
+        });
         let ctx = InstallCtx {
             admin_id: Some(admin_id),
             witness: false,
             canonical: true,
         };
         install_tx(&mut tx, &data, &ctx).await.unwrap();
+        let (vpce, state): (String, String) =
+            sqlx::query_as("SELECT vpc_id, state FROM vpc_endpoints WHERE vpce_id = 'vpce-1'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!((vpce.as_str(), state.as_str()), ("vpc-1", "active"));
         let alice_uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
             .fetch_one(&mut *tx)
             .await
@@ -2135,6 +2219,24 @@ mod tests {
         assert_eq!(decoded.feature_level, 3);
         assert_eq!(decoded.data, data);
         assert_eq!(encode_snapshot_at(&decoded.data, 1).unwrap(), bytes);
+        // 动态 VPC 端点强制 level 8：OSSCTL3 往返，且空表不污染旧载荷。
+        let mut vpc = account_sample();
+        vpc.vpc_endpoints.push(VpcEndpointRow {
+            vpce_id: "vpce-1".into(),
+            vpc_id: "vpc-1".into(),
+            account_id: "000000000007".into(),
+            state: "active".into(),
+            created_at: 1,
+            updated_at: 2,
+        });
+        assert_eq!(required_feature_level(&vpc), FEATURE_LEVEL_8);
+        let bytes = encode_snapshot_at(&vpc, 1).unwrap();
+        assert!(bytes.starts_with(SNAPSHOT_MAGIC_V3));
+        let decoded = decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.feature_level, FEATURE_LEVEL_8);
+        assert_eq!(decoded.data.vpc_endpoints, vpc.vpc_endpoints);
+        assert_eq!(encode_snapshot_at(&decoded.data, 1).unwrap(), bytes);
+
         // 空账户表不污染旧载荷：仍按激活级别落 V1/V2（逐字节冻结由 fixtures 覆盖）。
         assert!(
             encode_snapshot_at(&sample(), 2)

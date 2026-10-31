@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::COMMAND_MAX_BYTES;
+use super::data::VpcEndpointRow;
 use super::runstate::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
     LifecycleCursorRow, ScheduleLeaseRow, TierRestoreRow,
@@ -251,6 +252,21 @@ pub enum ControlCommand {
         id: String,
         soft_byte_quota: Option<i64>,
         updated_at: i64,
+    },
+    /// 硬字节/对象数配额（AC-3，level 8）：`None` = 取消，负值非法。执行路径在 v1.26
+    /// 已交付；本变体让 Raft 模式可以复制配置。
+    AccountHardQuotaSet {
+        id: String,
+        hard_byte_quota: Option<i64>,
+        object_quota: Option<i64>,
+        updated_at: i64,
+    },
+    /// 动态 VPC 端点注册（feature 8，AP Slice B）：upsert/delete 均幂等。
+    VpcEndpointUpsert {
+        endpoint: VpcEndpointRow,
+    },
+    VpcEndpointDelete {
+        vpce_id: String,
     },
     AccountDelete {
         id: String,
@@ -500,6 +516,10 @@ impl ControlCommand {
             Self::TierRestoreUpsert { .. }
             | Self::TierRestoreDelete { .. }
             | Self::ScheduleLeaseAcquire { .. } => super::compat::FEATURE_LEVEL_7,
+            // v1.26.0 及更早 advertise ≤7 且不认识硬配额配置/动态端点命令。
+            Self::AccountHardQuotaSet { .. }
+            | Self::VpcEndpointUpsert { .. }
+            | Self::VpcEndpointDelete { .. } => super::compat::FEATURE_LEVEL_8,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,

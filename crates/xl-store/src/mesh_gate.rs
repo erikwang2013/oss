@@ -7,7 +7,8 @@
 //! - [`NodeHealth`] 携带 `data_wire_version` + `topo_epoch/topo_hash`；
 //! - [`PeerCapabilities`] = 进程内 TTL 缓存；
 //! - [`GatedMesh`] = 装配层装饰器：按**操作类**判定——base 数据面（分片/meta/桶/
-//!   删除/回收/LMU）允许旧版；MPU 转发与带语义标志的 ListLocal 要求现版。
+//!   删除/回收/LMU）与 MPU 收尾/查询（ListParts/Complete/Abort）允许旧版；MPU
+//!   分片流与带语义标志的 ListLocal 要求现版。
 //!
 //! 读路径的降级/失败语义在 store 层（`degraded_marker` / `VersionList::require_complete`），
 //! 本模块只决定「能不能发给这个 peer」。
@@ -112,8 +113,11 @@ pub enum PeerClass {
 pub enum OpClass {
     /// 分片/meta/桶/删除/回收/LMU：旧版字段兼容（混版窗口允许）。
     Data,
-    /// MPU 跨节点转发：上传暂存区/段语义跨版本不可靠 → 只允许现版。
+    /// MPU 分片流式转发（UploadPart）：暂存段语义跨版本不可靠 → 只允许现版。
     MpuForward,
+    /// MPU 收尾/查询（ListParts/Complete/Abort）：RPC 与暂存格式自 v1.16.0 未变，
+    /// 旧端点按本地语义执行 → 混版窗口允许（更旧节点无 RPC → Unavailable，仍 fail-closed）。
+    MpuFinish,
 }
 
 /// 能力判定（唯一策略出处）：
@@ -257,7 +261,7 @@ impl GatedMesh {
         let class = check_peer(node, &caps, &self.local)?;
         if op == OpClass::MpuForward && class == PeerClass::Legacy {
             return Err(Error::PeerIncompatible(format!(
-                "混版窗口不跨版本转发 MPU：节点 {node} 数据面线格式 {} < {DATA_WIRE_VERSION}",
+                "混版窗口不跨版本转发 MPU 分片流：节点 {node} 数据面线格式 {} < {DATA_WIRE_VERSION}",
                 caps.wire_version
             )));
         }
@@ -355,15 +359,15 @@ impl MeshTransport for GatedMesh {
         self.inner.mpu_upload_part(node, req).await
     }
     async fn mpu_complete(&self, node: &str, req: MpuComplete) -> Result<ObjectInfo> {
-        self.gate(node, OpClass::MpuForward).await?;
+        self.gate(node, OpClass::MpuFinish).await?;
         self.inner.mpu_complete(node, req).await
     }
     async fn mpu_abort(&self, node: &str, req: MpuRef) -> Result<()> {
-        self.gate(node, OpClass::MpuForward).await?;
+        self.gate(node, OpClass::MpuFinish).await?;
         self.inner.mpu_abort(node, req).await
     }
     async fn mpu_list_parts(&self, node: &str, req: MpuRef) -> Result<Vec<MpuPartRow>> {
-        self.gate(node, OpClass::MpuForward).await?;
+        self.gate(node, OpClass::MpuFinish).await?;
         self.inner.mpu_list_parts(node, req).await
     }
 

@@ -300,28 +300,24 @@ async fn mixed_version_allows_base_data_plane() {
     assert_eq!(fake.uploads_listed.load(Ordering::SeqCst), 1);
 }
 
-/// MPU 跨节点转发：旧 peer 在发出任何 RPC 前拒绝。
+/// MPU 分片流对旧 peer 在发出任何 RPC 前拒绝；收尾/查询（ListParts/Complete/Abort）
+/// 自 v1.16.0 起线格式未变 → 放行到旧 peer 执行（这里传输层未实现 → Unavailable）。
 #[tokio::test]
-async fn mpu_forwarding_rejected_on_mixed_version() {
+async fn mpu_streaming_rejected_but_finish_allowed_on_mixed_version() {
     let (g, fake) = gate(1);
     assert!(matches!(
         g.mpu_upload_part("n2", mpu_upload()).await,
         Err(Error::PeerIncompatible(_))
     ));
+    assert_eq!(fake.mpu_parts.load(Ordering::SeqCst), 0);
     let r = MpuRef {
         bucket: "b".into(),
         key: "k".into(),
         upload_id: "n1.u".into(),
     };
-    assert!(matches!(
-        g.mpu_abort("n2", r.clone()).await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert!(matches!(
-        g.mpu_list_parts("n2", r).await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert!(matches!(
+    for e in [
+        g.mpu_abort("n2", r.clone()).await.err().unwrap(),
+        g.mpu_list_parts("n2", r).await.err().unwrap(),
         g.mpu_complete(
             "n2",
             MpuComplete {
@@ -332,12 +328,14 @@ async fn mpu_forwarding_rejected_on_mixed_version() {
                 mode: crate::store::VersioningMode::Off,
                 encryption: None,
                 lock: None,
-            }
+            },
         )
-        .await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert_eq!(fake.mpu_parts.load(Ordering::SeqCst), 0);
+        .await
+        .err()
+        .unwrap(),
+    ] {
+        assert!(matches!(e, Error::Unavailable(_)), "实得 {e:?}");
+    }
 }
 
 /// 带语义标志的 ListLocal 只发往现版 peer（旧版会忽略 → 静默缺项/重复边界键）。

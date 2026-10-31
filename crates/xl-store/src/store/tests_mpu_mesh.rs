@@ -20,7 +20,8 @@ fn owner_of(id: &str) -> Option<String> {
 }
 
 /// Create 在 n1；n2 收 UploadPart/ListParts/Complete 全部转发到属主，
-/// 数据落在 n1 暂存区，提交后 n1 可读。重复 complete/abort → NoSuchUpload。
+/// 数据落在 n1 暂存区，提交后 n1 可读。同 parts 的重复 complete 幂等，迟到 abort
+/// → NoSuchUpload。
 #[tokio::test]
 async fn mpu_mesh_forward_upload_list_complete() {
     let c = two_node().await;
@@ -77,10 +78,18 @@ async fn mpu_mesh_forward_upload_list_complete() {
         "提交后暂存区应清理"
     );
 
-    // 二次提交/迟到 abort：属主暂存区已无 mpu.meta → NoSuchUpload（不重复提交）
+    // 二次提交（网络丢响应的重试）：同一 parts → 幂等回查返回原结果，不重复提交；
+    // 换了 parts 的迟到 complete 与迟到 abort → NoSuchUpload
+    let again = c.stores[1]
+        .complete_multipart_upload("alpha", "k", &id, &[(1, etag.clone())])
+        .await
+        .unwrap();
+    assert_eq!(again.etag, info.etag);
+    assert_eq!(again.version_id, info.version_id);
+    assert_eq!(again.part_sizes, info.part_sizes);
     assert!(matches!(
         c.stores[1]
-            .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
+            .complete_multipart_upload("alpha", "k", &id, &[(1, "00".repeat(16))])
             .await,
         Err(Error::NoSuchUpload(_))
     ));
@@ -90,10 +99,11 @@ async fn mpu_mesh_forward_upload_list_complete() {
     ));
 }
 
-/// DP-0：属主是旧数据面版本（缺字段 → 按 1）→ 协调节点的 MPU 转发全部明确
-/// `PeerIncompatible`（503），不得落到本地/伪装成功；恢复同版后转发照常。
+/// DP-1 跨版本收尾：属主是旧数据面（缺字段 → 1）时分片流仍 fail-closed；但
+/// ListParts/Complete/Abort 的 RPC 与暂存格式自 v1.16.0 未变 → 放行到旧属主执行，
+/// 语义错误原样穿透。恢复同版后分片流照常。
 #[tokio::test]
-async fn mpu_mesh_mixed_version_forwarding_rejected() {
+async fn mpu_mesh_mixed_version_finish_allowed_stream_rejected() {
     let c = two_node().await;
     let id = c.stores[0]
         .create_multipart_upload("alpha", "k", None, Default::default())
@@ -106,28 +116,46 @@ async fn mpu_mesh_mixed_version_forwarding_rejected() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::PeerIncompatible(_)), "{err:?}");
-    assert!(matches!(
-        c.stores[1].list_parts("alpha", "k", &id).await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert!(matches!(
-        c.stores[1].abort_multipart_upload("alpha", "k", &id).await,
-        Err(Error::PeerIncompatible(_))
-    ));
-    assert!(matches!(
+    // 收尾类可达：空暂存区照常列举
+    assert!(
         c.stores[1]
-            .complete_multipart_upload("alpha", "k", &id, &[(1, "etag".into())])
-            .await,
-        Err(Error::PeerIncompatible(_))
-    ));
+            .list_parts("alpha", "k", &id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // complete 的业务校验错误（part 未上传）穿透旧属主，不再是版本拒绝
+    let err = c.stores[1]
+        .complete_multipart_upload("alpha", "k", &id, &[(1, "deadbeef".into())])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidPart(_)), "{err:?}");
 
-    // 恢复同版 → 转发恢复（不对暂存区做任何本地降级）
+    // 恢复同版 → 分片流转发恢复
     c.mesh.set_data_wire_version("n1", None);
     let etag = c.stores[1]
         .upload_part("alpha", "k", &id, 1, stream_of(&[b"ok"]))
         .await
         .unwrap();
-    assert!(!etag.is_empty());
+    c.stores[1]
+        .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
+        .await
+        .unwrap();
+
+    // 旧属主上的 abort 也可达
+    let id2 = c.stores[0]
+        .create_multipart_upload("alpha", "k2", None, Default::default())
+        .await
+        .unwrap();
+    c.mesh.set_data_wire_version("n1", Some(0));
+    c.stores[1]
+        .abort_multipart_upload("alpha", "k2", &id2)
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.stores[1].list_parts("alpha", "k2", &id2).await,
+        Err(Error::NoSuchUpload(_))
+    ));
 }
 
 /// 属主宕机：四个转发操作全部确定性 Unavailable（S3 503），不得降级成本地
@@ -391,6 +419,122 @@ async fn mpu_mesh_error_fidelity_and_no_partial_commit() {
         .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
         .await
         .unwrap();
+}
+
+/// 升级前创建的旧格式 MPU：裸 UUID upload_id + 旧 mpu.meta 字段集 + 旧属主只宣告
+/// wire=1（无 DP-0 握手）。新节点须能定位属主并 ListParts/Complete/Abort；complete
+/// 转发保留 part 元数据，丢响应后的重试幂等；分片流仍 fail-closed。
+///
+/// 属主在本测试里仍实现 MPU mesh RPC（= v1.16.0+ 的旧二进制；v1.15- 无 RPC 的缺口
+/// 见 `mpu_remote_owner` 注释）。
+#[tokio::test]
+async fn mpu_legacy_bare_uuid_cross_version_finish() {
+    // 升级前二进制写出的 mpu.meta：只有当时存在的字段（新增字段靠 serde(default)）
+    #[derive(serde::Serialize)]
+    struct LegacyMpuMeta {
+        content_type: Option<String>,
+        user_metadata: std::collections::BTreeMap<String, String>,
+        created_nanos: i64,
+        sse_c_md5: Option<String>,
+    }
+
+    async fn legacy_stage(c: &super::tests::Cluster, key: &str) -> String {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let dir = layout::object_dir(&c.dirs[0][0], "alpha", key)
+            .unwrap()
+            .join(&uuid);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let legacy = LegacyMpuMeta {
+            content_type: Some("text/plain".into()),
+            user_metadata: Default::default(),
+            created_nanos: 0,
+            sse_c_md5: None,
+        };
+        tokio::fs::write(
+            dir.join("mpu.meta"),
+            rmp_serde::to_vec_named(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+        uuid
+    }
+
+    let c = two_node().await;
+    let uuid = legacy_stage(&c, "k").await;
+    // 旧二进制：health 缺 data_wire_version → wire 1
+    c.mesh.set_data_wire_version("n1", Some(0));
+
+    // 旧属主本地收分片
+    let etag = c.stores[0]
+        .upload_part("alpha", "k", &uuid, 1, stream_of(&[b"legacy-payload"]))
+        .await
+        .unwrap();
+
+    // 新节点：裸 UUID 属主发现（ListParts 探测）+ 跨版本 ListParts
+    let parts = c.stores[1].list_parts("alpha", "k", &uuid).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].etag, etag);
+    // 混版窗口 LMU 仍能列出（裸 UUID 原样，显式 degraded）
+    let lmu = c.stores[1]
+        .list_multipart_uploads("alpha", &Default::default())
+        .await
+        .unwrap();
+    assert!(lmu.uploads.iter().any(|u| u.upload_id == uuid));
+    assert!(lmu.degraded);
+
+    // 分片流仍跨版本拒绝
+    assert!(matches!(
+        c.stores[1]
+            .upload_part("alpha", "k", &uuid, 2, stream_of(&[b"x"]))
+            .await,
+        Err(Error::PeerIncompatible(_))
+    ));
+
+    // 新节点 Complete → 旧属主提交；part 元数据（part_sizes）随转发保留
+    let info = c.stores[1]
+        .complete_multipart_upload("alpha", "k", &uuid, &[(1, etag.clone())])
+        .await
+        .unwrap();
+    assert_eq!(info.size, 14);
+    let expected_etag = {
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(hex::decode(&etag).unwrap());
+        format!("{}-1", hex::encode(h.finalize()))
+    };
+    assert_eq!(info.etag, expected_etag);
+    assert_eq!(info.part_sizes, Some(vec![14]));
+    assert_eq!(info.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(info.version_id.as_deref(), Some("null"));
+    let (_, body) = c.stores[1].get_object("alpha", "k").await.unwrap();
+    assert_eq!(body, Bytes::from_static(b"legacy-payload"));
+
+    // 响应丢失后的重试：幂等返回同一版本（mod_time 不变 = 未重复提交）
+    let again = c.stores[1]
+        .complete_multipart_upload("alpha", "k", &uuid, &[(1, etag)])
+        .await
+        .unwrap();
+    assert_eq!(again.etag, info.etag);
+    assert_eq!(again.version_id, info.version_id);
+    assert_eq!(again.part_sizes, info.part_sizes);
+    assert_eq!(again.last_modified_nanos, info.last_modified_nanos);
+
+    // 旧格式 MPU 也可从新节点 Abort
+    let uuid2 = legacy_stage(&c, "k2").await;
+    c.stores[1]
+        .abort_multipart_upload("alpha", "k2", &uuid2)
+        .await
+        .unwrap();
+    let dir2 = layout::object_dir(&c.dirs[0][0], "alpha", "k2")
+        .unwrap()
+        .join(&uuid2);
+    assert!(!tokio::fs::try_exists(&dir2).await.unwrap());
+    assert!(matches!(
+        c.stores[1]
+            .abort_multipart_upload("alpha", "k2", &uuid2)
+            .await,
+        Err(Error::NoSuchUpload(_))
+    ));
 }
 
 /// 单机回归：非集群 Create 仍是裸 UUID（无前缀），本地 MPU 全流程不变。

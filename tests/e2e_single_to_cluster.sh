@@ -2,9 +2,10 @@
 # 单机 → 集群重新灌入 e2e：真实 4 节点 × 3 盘集群 + 1 个单机源进程。
 #
 # 覆盖 scripts/single-to-cluster.sh 的可验证切片：
-#   * dry-run 零写入（目标桶列表/对象均不变）
+#   * plan/dry-run 零写入（目标桶列表/对象均不变，仍盘点源端对象）
 #   * 真实复制：桶集合、对象字节（cmp）、Content-Type、用户元数据、嵌套前缀、
 #     >8MiB 大对象（源端走 MPU）；目标集群初始为空
+#   * --verify 只读校验对象数/字节/ETag 无漂移（分片 ETag 只记 unverified）
 #   * 重跑幂等（目标快照不变，仍是源端镜像）
 #   * --delete：删除目标桶内源端不存在的对象，保留目标独有桶；源端列表不变
 #   * 负例：源端版本化桶 / 开锁桶 → fail-closed 且目标零写入；源=目标 endpoint 拒绝
@@ -262,9 +263,9 @@ RC=0
 invoke() { # $1=source-endpoint $2=dest-endpoint，其余透传
 	local sep=$1 dep=$2
 	shift 2
-	if bash "$SCRIPT" --source-endpoint "$sep" --dest-endpoint "$dep" \
-		--source-ak "$SRC_AK" --source-sk "$SRC_SK" \
-		--dest-ak "$DST_AK" --dest-sk "$DST_SK" "$@" >"$OUT" 2>&1; then
+	if OSS_SRC_AK="$SRC_AK" OSS_SRC_SK="$SRC_SK" \
+		OSS_DST_AK="$DST_AK" OSS_DST_SK="$DST_SK" \
+		bash "$SCRIPT" --source-endpoint "$sep" --dest-endpoint "$dep" "$@" >"$OUT" 2>&1; then
 		RC=0
 	else
 		RC=$?
@@ -279,11 +280,11 @@ assert_target_unchanged() { # $1=基线快照 $2=说明
 	[ "$now" = "$1" ] || fail "$2：目标端被写入（前后快照不同）"
 }
 
-echo "== 2. dry-run：零写入 =="
+echo "== 2. plan/dry-run：零写入 =="
 run_script --dry-run
 assert_rc 0 "dry-run 应成功"
-assert_out "[dry-run] 目标桶: $SRC_B1" "dry-run 应列出目标桶"
-assert_out "[dry-run] 目标桶: $SRC_B2" "dry-run 应列出第二个桶"
+assert_out "[plan] 目标桶: $SRC_B1" "dry-run 应列出目标桶"
+assert_out "[plan] 目标桶: $SRC_B2" "dry-run 应列出第二个桶"
 assert_target_unchanged "$TGT_SNAP0" "dry-run"
 ok "dry-run 未创建桶/未写对象"
 
@@ -315,6 +316,13 @@ for i in 1 3; do
 	cmp "$W/big.bin" "$W/big.${IDS[$i]}" || fail "从 ${IDS[$i]} 读 big.bin 字节不一致"
 done
 ok "桶/对象/字节/Content-Type/元数据/嵌套前缀/大对象全部一致（n2/n4 读回一致）"
+
+echo "== 3b. --verify：对象数/字节/ETag 无漂移且只读 =="
+run_script --verify
+assert_rc 0 "verify 应无漂移"
+assert_out "结果: OK" "verify 应报告 OK"
+[ "$(snapshot "$DST_EP" "$DST_AK" "$DST_SK")" = "$SRC_SNAP0" ] || fail "verify 修改了目标端"
+ok "verify 只读且未发现漂移"
 
 echo "== 4. 重跑幂等：目标快照不变 =="
 TGT_SNAP1=$(snapshot "$DST_EP" "$DST_AK" "$DST_SK")

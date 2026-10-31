@@ -203,6 +203,18 @@ fn inventory_run_row(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
     }
 }
 
+/// feature 8：动态 VPC 端点注册行（随 ControlData 快照复制；静态配置仍可回退）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpcEndpointRow {
+    pub vpce_id: String,
+    pub vpc_id: String,
+    pub account_id: String,
+    /// `active` 放行；其它值 fail-closed。
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// 访问点行（M8 S1）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccessPointRow {
@@ -302,6 +314,8 @@ const SCHEMA_RUNSTATE: &str = include_str!("../migrations/0007_m8_runstate.sql")
 const SCHEMA_HOT_INDEXES: &str = include_str!("../migrations/0008_hot_indexes.sql");
 /// 作业保留清理索引（`terminal_jobs_before` 的 state+updated_at）。每次启动重放。
 const SCHEMA_JOB_RETENTION_INDEX: &str = include_str!("../migrations/0009_job_retention_index.sql");
+/// 动态 VPC 端点注册表（feature 8）。每次启动重放（IF NOT EXISTS）。
+const SCHEMA_VPC_ENDPOINTS: &str = include_str!("../migrations/0010_vpc_endpoints.sql");
 
 /// 账户表已规范化（v2 回填/重写完成）。standalone 启动时写；Raft 模式由后续
 /// canonicalization worker 在 level-3 写，快照读取以本 marker 为门。
@@ -385,6 +399,9 @@ impl Db {
         sqlx::raw_sql(SCHEMA_RUNSTATE).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_HOT_INDEXES).execute(&db.pool).await?;
         sqlx::raw_sql(SCHEMA_JOB_RETENTION_INDEX)
+            .execute(&db.pool)
+            .await?;
+        sqlx::raw_sql(SCHEMA_VPC_ENDPOINTS)
             .execute(&db.pool)
             .await?;
         db.ensure_columns_tenancy().await?;
@@ -2441,6 +2458,46 @@ impl Db {
         .await?
         .rows_affected();
         Ok(n == 1)
+    }
+
+    /// 动态 VPC 端点注册查询（feature 8）。查无 = `None`，由调用方回退静态配置。
+    pub async fn vpc_endpoint_get(&self, vpce_id: &str) -> Result<Option<VpcEndpointRow>> {
+        let row = sqlx::query(
+            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
+             FROM vpc_endpoints WHERE vpce_id = ?",
+        )
+        .bind(vpce_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| VpcEndpointRow {
+            vpce_id: r.get("vpce_id"),
+            vpc_id: r.get("vpc_id"),
+            account_id: r.get("account_id"),
+            state: r.get("state"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    /// 动态 VPC 端点全量列表（管理 API / 诊断）。
+    pub async fn vpc_endpoint_list(&self) -> Result<Vec<VpcEndpointRow>> {
+        let rows = sqlx::query(
+            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
+             FROM vpc_endpoints ORDER BY vpce_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| VpcEndpointRow {
+                vpce_id: r.get("vpce_id"),
+                vpc_id: r.get("vpc_id"),
+                account_id: r.get("account_id"),
+                state: r.get("state"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 
     /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。

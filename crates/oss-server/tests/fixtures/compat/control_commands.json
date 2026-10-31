@@ -40,6 +40,18 @@
   "AccountDelete": [
     "id"
   ],
+  "AccountHardQuotaSet": [
+    "hard_byte_quota",
+    "id",
+    "object_quota",
+    "updated_at"
+  ],
+  "VpcEndpointDelete": [
+    "vpce_id"
+  ],
+  "VpcEndpointUpsert": [
+    "endpoint"
+  ],
   "AccountMemberAttach": [
     "account_id",
     "created_at",

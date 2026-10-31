@@ -866,10 +866,11 @@ impl AppState {
         // M8 S2：变换器预加载（须在 AP 之后——缓存条目要按 AP 查桶名做级联失效）
         crate::access_points_api::preload_olap(&db, &ap_cache, &olap_cache).await;
         let ap_region = site.region.clone();
-        // AP Slice A：静态端点 registry（格式/唯一性在 AppConfig::load 已校验；
-        // 账户存在性由 AppState::load 在 DB 就绪后校验）。
+        // AP Slice B：动态 registry 优先，静态 `[[ap.vpc_endpoints]]` 回退
+        // （格式/唯一性在 AppConfig::load 已校验；账户存在性由启动校验兜底）。
         let ap_endpoints: Arc<dyn xl_s3::ap::ApEndpointSource> =
-            Arc::new(xl_s3::ap::StaticApEndpointSource::new(
+            Arc::new(crate::ap_endpoints::DbApEndpointSource::new(
+                Arc::clone(&db),
                 cfg.ap.vpc_endpoints.iter().map(|e| xl_s3::ap::ApEndpoint {
                     vpce_id: e.vpce_id.clone(),
                     vpc_id: e.vpc_id.clone(),

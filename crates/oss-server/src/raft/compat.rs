@@ -38,6 +38,9 @@ pub const FEATURE_LEVEL_6: u8 = 6;
 /// v1.25.0 及更早 advertise ≤6 且 `deny_unknown_fields` 不认识这些变体；level 6 挡不住
 /// 它们，因此必须新开 level 7。快照复用 OSSCTL3 `m8.runstate`（两表已在格式 1 内）。
 pub const FEATURE_LEVEL_7: u8 = 7;
+/// feature 8：账户硬配额配置（`AccountHardQuotaSet`）。v1.26.0 及更早 advertise ≤7
+/// 且 `deny_unknown_fields` 不认识该变体；level 7 挡不住它，必须新开 level 8。
+pub const FEATURE_LEVEL_8: u8 = 8;
 /// Level C M1 的命令演进容器（`ControlCommand::Ext`）所需级别。该级别只表示
 /// “能解码/应用 Ext 容器”，不表示认识任何 `type_id`；注册新类型必须提升 feature
 /// level 或先完成 per-peer 类型能力协商（见 `command::REGISTERED_EXT_TYPES`）。
@@ -45,7 +48,7 @@ pub const FEATURE_COMMAND_EXT: u8 = FEATURE_LEVEL_3;
 /// OSSCTL2/3 命令与快照语义的别名（保持 level 3 不变；M8-2 复制另立 level 4/5）。
 pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
 /// 本二进制支持的最高 feature level。
-pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_7;
+pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_8;
 /// 缺省/旧节点的 feature level。
 pub const MIN_FEATURE_LEVEL: u8 = 1;
 
@@ -531,7 +534,11 @@ mod tests {
             FEATURE_LEVEL_7, 7,
             "v1.25.0 及更早 advertise ≤6 且不认识 TierRestore*/ScheduleLeaseAcquire，必须新开 7"
         );
-        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_7);
+        assert_eq!(
+            FEATURE_LEVEL_8, 8,
+            "v1.26.0 及更早 advertise ≤7 且不认识 AccountHardQuotaSet，必须新开 8"
+        );
+        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_8);
         assert!(supports(1));
         assert!(supports(FEATURE_STRUCTURED_LIFECYCLE));
         assert!(supports(FEATURE_COMMAND_EXT));
@@ -539,6 +546,7 @@ mod tests {
         assert!(supports(FEATURE_LEVEL_5));
         assert!(supports(FEATURE_LEVEL_6));
         assert!(supports(FEATURE_LEVEL_7));
+        assert!(supports(FEATURE_LEVEL_8));
         assert!(!supports(MAX_FEATURE_LEVEL + 1));
     }
 
@@ -590,6 +598,19 @@ mod tests {
                 "level-6 节点在场时 append 前拒绝 {cmd:?}"
             );
         }
+
+        // 硬配额配置是 level 8：level-7 集群同样必须在 append 前拒绝。
+        let p7 = peers_all(8, &[1, 2], &[], FEATURE_LEVEL_7);
+        let e7 = effective_feature_level(FEATURE_LEVEL_8, 1, &[1, 2], &[], 8, &p7);
+        assert_eq!(e7.level, FEATURE_LEVEL_7);
+        let quota = ControlCommand::AccountHardQuotaSet {
+            id: "000000000001".into(),
+            hard_byte_quota: Some(1),
+            object_quota: None,
+            updated_at: 1,
+        };
+        assert_eq!(quota.min_feature_level(), FEATURE_LEVEL_8);
+        assert!(e7.level < quota.min_feature_level());
         assert!(e.blocked_reason.unwrap().contains("voter 2"));
     }
 

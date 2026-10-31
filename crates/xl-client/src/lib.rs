@@ -2567,6 +2567,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info.size, payload.len() as u64);
+        // 段长表跨 gRPC/msgpack 往返保留（MPU 收尾转发/幂等回查依赖）
+        assert_eq!(info.part_sizes, Some(vec![payload.len() as u64]));
         let (_, got) = store.get_object("buck", "k").await.unwrap();
         assert_eq!(got.len(), payload.len());
         assert_eq!(&got[..], &payload[..]);

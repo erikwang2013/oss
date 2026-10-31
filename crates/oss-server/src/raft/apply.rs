@@ -757,6 +757,7 @@ pub(crate) async fn apply_command(
         | ControlCommand::AccountUpdate { .. }
         | ControlCommand::AccountSetQuota { .. }
         | ControlCommand::AccountSetSoftQuota { .. }
+        | ControlCommand::AccountHardQuotaSet { .. }
         | ControlCommand::AccountDelete { .. }
         | ControlCommand::AccountMemberAttach { .. }
         | ControlCommand::AccountMemberSetStatus { .. }
@@ -812,6 +813,50 @@ pub(crate) async fn apply_command(
         } => tier_restore::delete(cw, bucket, key, version_id, *fence_term).await?,
         ControlCommand::ScheduleLeaseAcquire { lease, now } => {
             lease::apply(cw, lease, *now).await?
+        }
+        // feature 8：AP 动态 VPC 端点注册（upsert/delete 均幂等）。
+        ControlCommand::VpcEndpointUpsert { endpoint } => {
+            if !xl_s3::ap::valid_vpce_id(&endpoint.vpce_id)
+                || !xl_s3::ap::valid_vpc_id(&endpoint.vpc_id)
+                || endpoint.account_id.trim().is_empty()
+                || !matches!(endpoint.state.as_str(), "active" | "disabled")
+            {
+                ControlResponse::Invalid
+            } else {
+                let status: Option<String> =
+                    sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
+                        .bind(&endpoint.account_id)
+                        .fetch_optional(&mut *cw.conn())
+                        .await?;
+                if status.as_deref() != Some("active") {
+                    ControlResponse::Invalid
+                } else {
+                    sqlx::query(
+                        "INSERT INTO vpc_endpoints \
+                         (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(vpce_id) DO UPDATE SET vpc_id = excluded.vpc_id, \
+                           account_id = excluded.account_id, state = excluded.state, \
+                           updated_at = excluded.updated_at",
+                    )
+                    .bind(&endpoint.vpce_id)
+                    .bind(&endpoint.vpc_id)
+                    .bind(&endpoint.account_id)
+                    .bind(&endpoint.state)
+                    .bind(endpoint.created_at)
+                    .bind(endpoint.updated_at)
+                    .execute(&mut *cw.conn())
+                    .await?;
+                    ControlResponse::Ok
+                }
+            }
+        }
+        ControlCommand::VpcEndpointDelete { vpce_id } => {
+            sqlx::query("DELETE FROM vpc_endpoints WHERE vpce_id = ?")
+                .bind(vpce_id)
+                .execute(&mut *cw.conn())
+                .await?;
+            ControlResponse::Ok
         }
         #[cfg(test)]
         ControlCommand::Set { key, value } => {
@@ -1572,5 +1617,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// feature 8：动态 VPC 端点按自然键幂等 upsert/delete；非法字段与停用/缺失账户
+    /// 在 apply 内零写入拒绝，created_at 在更新时保留。
+    #[tokio::test]
+    async fn vpc_endpoint_upsert_delete_and_validation() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, name, status, created_at, updated_at) \
+             VALUES ('000000000042', 'acme', 'active', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let row = crate::raft::data::VpcEndpointRow {
+            vpce_id: "vpce-1".into(),
+            vpc_id: "vpc-1".into(),
+            account_id: "000000000042".into(),
+            state: "active".into(),
+            created_at: 10,
+            updated_at: 10,
+        };
+        assert_eq!(
+            apply_committed(
+                &db,
+                &ControlCommand::VpcEndpointUpsert {
+                    endpoint: row.clone()
+                }
+            )
+            .await,
+            ControlResponse::Ok
+        );
+        let mut disabled = row.clone();
+        disabled.state = "disabled".into();
+        disabled.updated_at = 11;
+        assert_eq!(
+            apply_committed(
+                &db,
+                &ControlCommand::VpcEndpointUpsert { endpoint: disabled }
+            )
+            .await,
+            ControlResponse::Ok
+        );
+        let (state, created): (String, i64) =
+            sqlx::query_as("SELECT state, created_at FROM vpc_endpoints WHERE vpce_id = 'vpce-1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            (state.as_str(), created),
+            ("disabled", 10),
+            "更新保留 created_at"
+        );
+
+        let mut bad = row.clone();
+        bad.vpce_id = "not-a-vpce".into();
+        assert_eq!(
+            apply_committed(&db, &ControlCommand::VpcEndpointUpsert { endpoint: bad }).await,
+            ControlResponse::Invalid
+        );
+        let mut missing = row.clone();
+        missing.account_id = "000000000099".into();
+        assert_eq!(
+            apply_committed(
+                &db,
+                &ControlCommand::VpcEndpointUpsert { endpoint: missing }
+            )
+            .await,
+            ControlResponse::Invalid
+        );
+
+        assert_eq!(
+            apply_committed(
+                &db,
+                &ControlCommand::VpcEndpointDelete {
+                    vpce_id: "vpce-1".into()
+                }
+            )
+            .await,
+            ControlResponse::Ok
+        );
+        assert_eq!(
+            apply_committed(
+                &db,
+                &ControlCommand::VpcEndpointDelete {
+                    vpce_id: "vpce-1".into()
+                }
+            )
+            .await,
+            ControlResponse::Ok,
+            "重复删除幂等"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vpc_endpoints")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

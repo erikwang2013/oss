@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
+use futures::future::join_all;
 use md5::{Digest as _, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -126,18 +127,29 @@ impl Store {
         Ok(layout::object_dir(self.cfg.root(), bucket, key)?.join(uuid))
     }
 
-    /// 属主解析：`None` = 本地执行（旧格式或无前缀）；`Some(node)` = 需转发。
+    /// 属主解析：`None` = 本地执行；`Some(node)` = 需转发。
     ///
-    /// L-4（记档，非安全边界）：旧格式裸 UUID 只在创建节点本地可解析，其他节点一律
-    /// `NoSuchUpload`。集群升级前必须排空在途 MPU（完成/中止），否则这些暂存区无法经
-    /// 负载均衡端点收尾，只能人工清理。
+    /// 带前缀：按前缀路由；未知属主（不在拓扑内）→ `Unavailable`（S3 503）：upload_id
+    /// 指向的节点已不存在，既不能本地找到也不能假装 NoSuchUpload（会诱导客户端放弃可
+    /// 恢复的暂存区）。
     ///
-    /// 未知属主（不在拓扑内）→ `Unavailable`（S3 503）：upload_id 指向的节点已不存在，
-    /// 既不能本地找到也不能假装 NoSuchUpload（会诱导客户端放弃可恢复的暂存区）。
-    pub(in crate::store) fn mpu_remote_owner(&self, upload_id: &str) -> Result<Option<String>> {
-        let (owner, _) = mpu_route::split_upload_id(upload_id)?;
+    /// 裸 UUID（M3 之前的旧格式，升级前创建的 MPU）：先认本机暂存区；集群里否则用
+    /// ListParts 并发探测各 peer 的**本地**暂存区来定位创建节点。探测保守收口：命中
+    /// 即转发；所有可达 peer 都答 NoSuchUpload/NoSuchBucket 才认本地；任一不可达/报错
+    /// → `Unavailable`（不得把「可能还存在」伪装成 404）。
+    ///
+    /// 跨版本边界：v1.16.0+ 的旧节点实现了 MPU mesh RPC（收尾类经 `MpuFinish` 放行），
+    /// 其裸 UUID 暂存区可被新节点定位并收尾；**v1.16.0 之前**的节点没有该 RPC，探测得
+    /// Unavailable，客户端必须直连属主节点完成/中止（旧节点自身仍可本地收尾）。
+    pub(in crate::store) async fn mpu_remote_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Option<String>> {
+        let (owner, uuid) = mpu_route::split_upload_id(upload_id)?;
         let Some(owner) = owner else {
-            return Ok(None); // 旧格式：本地属主（滚动升级前的在途 MPU）
+            return self.mpu_legacy_owner(bucket, key, upload_id, &uuid).await;
         };
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return Err(Error::NoSuchUpload(upload_id.to_string())); // 单节点不接受前缀
@@ -151,6 +163,71 @@ impl Store {
             )));
         }
         Ok(Some(owner))
+    }
+
+    /// 裸 UUID 属主发现（见 [`Self::mpu_remote_owner`]）。`upload_id` 是规范 UUID。
+    async fn mpu_legacy_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        uuid: &str,
+    ) -> Result<Option<String>> {
+        // 本机暂存区存在 → 本地就是属主（单节点/升级前的创建节点）
+        if tokio::fs::try_exists(self.mpu_dir(bucket, key, uuid)?.join(MPU_META_FILE)).await? {
+            return Ok(None);
+        }
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return Ok(None); // 单节点：本地即唯一属主，最终由本地给出 NoSuchUpload
+        };
+        let self_id = cl.sets.flat.self_node().id.as_str();
+        let probes = cl
+            .sets
+            .flat
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .filter(|id| *id != self_id)
+            .map(|node| {
+                let req = crate::mesh::MpuRef {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    upload_id: upload_id.to_string(),
+                };
+                let transport = &cl.transport;
+                async move {
+                    // shortcut: 探测固定 2s 预算（ListParts 需扫暂存目录）；旧属主在慢盘
+                    // 上常态超时则升级为可配置预算/轻量存在性探测
+                    let r = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        transport.mpu_list_parts(node, req),
+                    )
+                    .await;
+                    let r = match r {
+                        Ok(Ok(_)) => Ok(true), // 该 peer 本地有暂存区 = 属主
+                        Ok(Err(Error::NoSuchUpload(_) | Error::NoSuchBucket(_))) => Ok(false),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(Error::Unavailable(format!(
+                            "MPU 属主探测超时（{upload_id} @ {node}）"
+                        ))),
+                    };
+                    (node, r)
+                }
+            });
+        let mut first_err = None;
+        for (node, r) in join_all(probes).await {
+            match r {
+                Ok(true) => return Ok(Some(node.to_string())),
+                Ok(false) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// 创建 MPU：对象目录下建 `<upload_id>/` 暂存区并写 `mpu.meta`。
@@ -295,7 +372,7 @@ impl Store {
         body: ByteStream,
         sse_c_md5: Option<&str>,
     ) -> Result<String> {
-        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+        if let Some(node) = self.mpu_remote_owner(bucket, key, upload_id).await? {
             let t = self.mesh_transport().ok_or_else(|| {
                 Error::Unavailable("集群传输未注入，无法转发 MPU UploadPart".into())
             })?;
@@ -447,7 +524,7 @@ impl Store {
         encryption: Option<crypto::EncSpec>,
         lock: Option<meta::ObjectLockRecord>,
     ) -> Result<ObjectInfo> {
-        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+        if let Some(node) = self.mpu_remote_owner(bucket, key, upload_id).await? {
             let t = self.mesh_transport().ok_or_else(|| {
                 Error::Unavailable("集群传输未注入，无法转发 MPU Complete".into())
             })?;
@@ -499,7 +576,18 @@ impl Store {
 
         let dir = self.mpu_dir(bucket, key, upload_id)?;
         if !tokio::fs::try_exists(dir.join(MPU_META_FILE)).await? {
-            return Err(Error::NoSuchUpload(upload_id.to_string()));
+            // 已提交（暂存区收尾完成）后的重试：幂等回查，绝不重复提交
+            return self
+                .mpu_complete_replay(
+                    bucket,
+                    key,
+                    upload_id,
+                    parts,
+                    mode,
+                    encryption.as_ref(),
+                    lock.as_ref(),
+                )
+                .await;
         }
         let mpu: MpuMeta = rmp_serde::from_slice(&tokio::fs::read(dir.join(MPU_META_FILE)).await?)
             .map_err(|e| Error::CorruptMeta(format!("mpu.meta 解码失败: {e}")))?;
@@ -608,25 +696,8 @@ impl Store {
         };
         let enc_record = enc_ctx.as_ref().map(|(_, r)| r.clone());
 
-        if parts.is_empty() {
-            return Err(Error::InvalidPart("parts 为空".into()));
-        }
-        if parts.len() > MAX_PARTS as usize {
-            return Err(Error::InvalidPart(format!(
-                "parts 数量 {} 超过 {MAX_PARTS}",
-                parts.len()
-            )));
-        }
-        for w in parts.windows(2) {
-            if w[0].0 >= w[1].0 {
-                return Err(Error::InvalidPartOrder(format!(
-                    "part 号非严格升序: {} -> {}",
-                    w[0].0, w[1].0
-                )));
-            }
-        }
-
-        let mut raw_md5s: Vec<Vec<u8>> = Vec::with_capacity(parts.len());
+        // 声明合法性 + 期望 MPU ETag（逐段 ETag 稍后仍与 sidecar 核对）
+        let mpu_etag = mpu_etag_from_parts(parts)?;
         // 拼装快照（part 号、数据文件、sidecar 记录）：concat 时对每段做字节级核验
         let mut snapshots: Vec<(u16, PathBuf, PartMeta)> = Vec::with_capacity(parts.len());
         for (i, (pn, etag)) in parts.iter().enumerate() {
@@ -655,19 +726,9 @@ impl Store {
                     pm.size
                 )));
             }
-            raw_md5s.push(
-                hex::decode(&pm.etag)
-                    .map_err(|e| Error::CorruptMeta(format!("part.{pn} etag 非法: {e}")))?,
-            );
             snapshots.push((*pn, dir.join(format!("part.{pn}")), pm));
         }
 
-        // multipart ETag = hex(md5(逐段原始 md5 字节拼接)) + "-N"（S3 定义）
-        let mut h = Md5::new();
-        for raw in &raw_md5s {
-            h.update(raw);
-        }
-        let etag = format!("{}-{}", hex::encode(h.finalize()), parts.len());
         // partNumber 读路径的偏移表：暂存 part 文件在 complete 后可回收，边界只此一份
         let part_sizes: Vec<u64> = snapshots.iter().map(|(_, _, pm)| pm.size).collect();
 
@@ -771,7 +832,7 @@ impl Store {
                 local_version_id: &uuid,
                 plaintext,
                 size,
-                etag: &etag,
+                etag: &mpu_etag,
                 content_type: mpu.content_type.as_deref(),
                 user_metadata: &mpu.user_metadata,
                 tags: mpu.tags.as_deref(),
@@ -804,7 +865,7 @@ impl Store {
             },
             mod_time_nanos: now,
             size,
-            etag: etag.clone(),
+            etag: mpu_etag.clone(),
             content_type: mpu.content_type.clone(),
             user_metadata: mpu.user_metadata.clone(),
             // 兼容位：整对象引用（sha256 = 整份 SHA256，读路径 EC 终验用）
@@ -942,7 +1003,7 @@ impl Store {
         Ok(ObjectInfo {
             key: key.to_string(),
             size,
-            etag,
+            etag: mpu_etag,
             content_type: mpu.content_type,
             last_modified_nanos: now,
             user_metadata: mpu.user_metadata,
@@ -965,6 +1026,55 @@ impl Store {
         })
     }
 
+    /// Complete 幂等回查：`mpu.meta` 已消失 = 可能已提交（重试/网络丢响应），用声明
+    /// parts 重算的 MPU ETag 对比已提交的最新版本；ETag、段数、版本形态（null/uuid）、
+    /// SSE-C 钥 md5、锁全部吻合才返回原结果，否则 NoSuchUpload（绝不重复提交）。
+    ///
+    /// shortcut: 只认链尾最新版本；提交后再被覆盖写则返回 NoSuchUpload（客户端读新状态）。
+    /// 若需要「覆盖写后仍按 ETag 返回历史版本」，升级为全链匹配。
+    #[allow(clippy::too_many_arguments)] // 同 complete：线头直通
+    async fn mpu_complete_replay(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u16, String)],
+        mode: VersioningMode,
+        encryption: Option<&crypto::EncSpec>,
+        lock: Option<&meta::ObjectLockRecord>,
+    ) -> Result<ObjectInfo> {
+        // 无法与已提交版本对上的任何形态（含 parts 非法）都回到既有 NoSuchUpload，
+        // 不把「暂存区已消失」的请求伪装成 InvalidPart 等业务错误
+        let Ok(etag) = mpu_etag_from_parts(parts) else {
+            return Err(Error::NoSuchUpload(upload_id.to_string()));
+        };
+        let Some(meta) = self.read_meta(bucket, key).await? else {
+            return Err(Error::NoSuchUpload(upload_id.to_string()));
+        };
+        let matched = meta.latest().filter(|v| {
+            !v.delete_marker()
+                && v.etag == etag
+                && v.part_sizes
+                    .as_ref()
+                    .is_some_and(|s| s.len() == parts.len())
+                && v.version_id.is_nil() == (mode != VersioningMode::Enabled)
+                && match encryption {
+                    Some(crypto::EncSpec::SseC(k)) => v.encryption.as_ref().is_some_and(|e| {
+                        e.key_id == "sse-c" && e.sse_c_key_md5.as_deref() == Some(k.md5_b64())
+                    }),
+                    _ => true,
+                }
+                && match lock {
+                    Some(l) if !l.is_empty() => v.lock.as_ref() == Some(l),
+                    _ => true,
+                }
+        });
+        match matched {
+            Some(v) => Ok(super::version::version_info(key, v)),
+            None => Err(Error::NoSuchUpload(upload_id.to_string())),
+        }
+    }
+
     /// 中止 MPU：删暂存区。`mpu.meta` 为生死门——complete 成功后它已改名，不得再删。
     ///
     /// M3 MPU 会话粘性：非属主节点转发给属主（abort 与 complete 在属主侧按对象锁
@@ -975,7 +1085,7 @@ impl Store {
         key: &str,
         upload_id: &str,
     ) -> Result<()> {
-        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+        if let Some(node) = self.mpu_remote_owner(bucket, key, upload_id).await? {
             let t = self
                 .mesh_transport()
                 .ok_or_else(|| Error::Unavailable("集群传输未注入，无法转发 MPU Abort".into()))?;
@@ -1024,7 +1134,7 @@ impl Store {
         key: &str,
         upload_id: &str,
     ) -> Result<Vec<MpuPartInfo>> {
-        if let Some(node) = self.mpu_remote_owner(upload_id)? {
+        if let Some(node) = self.mpu_remote_owner(bucket, key, upload_id).await? {
             let t = self.mesh_transport().ok_or_else(|| {
                 Error::Unavailable("集群传输未注入，无法转发 MPU ListParts".into())
             })?;
@@ -1090,6 +1200,35 @@ impl Store {
         out.sort_by_key(|p| p.part_number);
         Ok(out)
     }
+}
+
+/// 校验声明的 parts 并计算 S3 multipart ETag = `hex(md5(逐段原始 md5 字节拼接))-N`。
+/// 非空/≤MAX_PARTS/严格升序/ETag 为 hex；正常 complete 与幂等回查共用。
+fn mpu_etag_from_parts(parts: &[(u16, String)]) -> Result<String> {
+    if parts.is_empty() {
+        return Err(Error::InvalidPart("parts 为空".into()));
+    }
+    if parts.len() > MAX_PARTS as usize {
+        return Err(Error::InvalidPart(format!(
+            "parts 数量 {} 超过 {MAX_PARTS}",
+            parts.len()
+        )));
+    }
+    for w in parts.windows(2) {
+        if w[0].0 >= w[1].0 {
+            return Err(Error::InvalidPartOrder(format!(
+                "part 号非严格升序: {} -> {}",
+                w[0].0, w[1].0
+            )));
+        }
+    }
+    let mut h = Md5::new();
+    for (pn, etag) in parts {
+        let raw = hex::decode(etag)
+            .map_err(|e| Error::InvalidPart(format!("part {pn} ETag 非法（{etag}）: {e}")))?;
+        h.update(raw);
+    }
+    Ok(format!("{}-{}", hex::encode(h.finalize()), parts.len()))
 }
 
 /// LMU 用摘要：读 `<upload_dir>/mpu.meta` → (created_nanos, storage_class, owner)。
