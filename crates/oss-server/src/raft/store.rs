@@ -4,7 +4,9 @@
 //! busy_timeout）。S6 把 `apply` 事务扩展到控制库真实表时，可把状态机指向 `control.db`：
 //! `raft_applied` 表结构已与 `0004_m9.sql` 对齐。
 //!
-//! shortcut: 日志与快照按 JSON/BLOB 整条存储（非增量日志段），S7 大快照/高吞吐前再评估。
+//! 快照 > [`SNAPSHOT_CHUNK_BYTES`] 时按固定大小分块行存储（`raft_snapshot_chunk`，
+//! `raft_snapshot.data` 只留清单头）；小快照与旧库仍按整行 BLOB 读取，格式对调用方透明。
+//! shortcut: 日志仍按每条 entry 一整行 JSON 存储（非分段日志）；大日志/高吞吐前再评估。
 
 // openraft StorageError 体积由第三方类型固定，trait 签名不能改。
 #![allow(clippy::result_large_err)]
@@ -59,12 +61,26 @@ CREATE TABLE IF NOT EXISTS raft_snapshot (
     meta TEXT NOT NULL,
     data BLOB NOT NULL
 );
+-- 大快照的固定大小分块（data 列只保留清单头）；旧库无此表/无行时按整行 BLOB 读。
+CREATE TABLE IF NOT EXISTS raft_snapshot_chunk (
+    snapshot_id TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    data        BLOB NOT NULL,
+    PRIMARY KEY (snapshot_id, seq)
+);
 CREATE TABLE IF NOT EXISTS raft_apply_ctx (
     id     INTEGER PRIMARY KEY CHECK (id = 1),
     active INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO raft_apply_ctx (id, active) VALUES (1, 0);
 "#;
+
+/// 快照单块上限：超过它才分块，单行 BLOB 因此有界；不超过时保持旧版整行格式。
+const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
+/// 分块清单 magic。旧二进制读到它会在快照校验处拒绝（fail-closed），不会当空快照。
+const SNAPSHOT_CHUNK_MAGIC: &[u8; 8] = b"OSSCHNK1";
+/// magic(8) + 块数 u32 LE + 原始总长 u64 LE。
+const SNAPSHOT_CHUNK_HEADER_LEN: usize = 8 + 4 + 8;
 
 async fn connect(path: &Path) -> Result<SqlitePool, sqlx::Error> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -109,6 +125,106 @@ fn decode<T: DeserializeOwned>(
     s: &str,
 ) -> Result<T, StorageError<u64>> {
     serde_json::from_str(s).map_err(|e| ser_err(subject, verb, e))
+}
+
+/// 在调用方事务内写快照：> 1 块时清旧块、逐块插入，并在 `raft_snapshot.data`
+/// 留清单头；否则写旧版整行 BLOB。清块与写 meta 同事务，崩溃不会留下半套块。
+async fn write_snapshot_tx(
+    tx: &mut SqliteConnection,
+    meta_json: &str,
+    snapshot_id: &str,
+    bytes: &[u8],
+) -> Result<(), StorageError<u64>> {
+    sqlx::query("DELETE FROM raft_snapshot_chunk")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+    let data = if bytes.len() > SNAPSHOT_CHUNK_BYTES {
+        let count = bytes.len().div_ceil(SNAPSHOT_CHUNK_BYTES);
+        for (seq, chunk) in bytes.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+            sqlx::query(
+                "INSERT INTO raft_snapshot_chunk (snapshot_id, seq, data) VALUES (?, ?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(seq as i64)
+            .bind(chunk)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        }
+        let mut manifest = Vec::with_capacity(SNAPSHOT_CHUNK_HEADER_LEN);
+        manifest.extend_from_slice(SNAPSHOT_CHUNK_MAGIC);
+        manifest.extend_from_slice(&(count as u32).to_le_bytes());
+        manifest.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        manifest
+    } else {
+        bytes.to_vec()
+    };
+    sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
+        .bind(meta_json)
+        .bind(data)
+        .execute(&mut *tx)
+        .await
+        .map(|_| ())
+        .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))
+}
+
+/// 读快照数据：`raft_snapshot.data` 是分块清单时按 `snapshot_id` 拼接并校验块数/
+/// 总长；否则按旧版整行 BLOB 返回。缺块、乱序、截断一律 fail-closed。
+async fn read_snapshot_data(
+    conn: &mut SqliteConnection,
+    snapshot_id: &str,
+    stored: Vec<u8>,
+    max_bytes: u64,
+) -> Result<Vec<u8>, StorageError<u64>> {
+    let Some(rest) = stored.strip_prefix(SNAPSHOT_CHUNK_MAGIC.as_slice()) else {
+        return Ok(stored);
+    };
+    let corrupt = |what: String| {
+        storage_err(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Read,
+            std::io::Error::other(format!("corrupt raft snapshot chunk manifest: {what}")),
+        )
+    };
+    if rest.len() != SNAPSHOT_CHUNK_HEADER_LEN - SNAPSHOT_CHUNK_MAGIC.len() {
+        return Err(corrupt("bad header".into()));
+    }
+    let count = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
+    let total = u64::from_le_bytes(rest[4..12].try_into().expect("8 bytes"));
+    if total > max_bytes {
+        return Err(corrupt(format!(
+            "{total} bytes exceeds limit {max_bytes} (raft.snapshot_max_bytes)"
+        )));
+    }
+    let rows =
+        sqlx::query("SELECT seq, data FROM raft_snapshot_chunk WHERE snapshot_id = ? ORDER BY seq")
+            .bind(snapshot_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
+    if rows.len() != count {
+        return Err(corrupt(format!(
+            "expected {count} chunks, found {}",
+            rows.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(total as usize);
+    for (want, row) in rows.into_iter().enumerate() {
+        let seq: i64 = row.get("seq");
+        if seq != want as i64 {
+            return Err(corrupt("chunk sequence gap".into()));
+        }
+        let chunk: Vec<u8> = row.get("data");
+        out.extend_from_slice(&chunk);
+    }
+    if out.len() as u64 != total {
+        return Err(corrupt(format!(
+            "expected {total} bytes, found {}",
+            out.len()
+        )));
+    }
+    Ok(out)
 }
 
 /// SQLite 日志存储。`Raft::new` 按值消费；克隆共享同一连接池。
@@ -792,12 +908,7 @@ impl SqliteStateMachine {
         .execute(&mut *tx)
         .await
         .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
-        sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
-            .bind(meta_json)
-            .bind(bytes)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        write_snapshot_tx(&mut tx, &meta_json, &meta.snapshot_id, bytes).await?;
         sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
             .execute(&mut *tx)
             .await
@@ -820,9 +931,15 @@ impl SqliteStateMachine {
         bytes: &[u8],
     ) -> Result<(), StorageError<u64>> {
         let _guard = self.snapshot_lock.lock().await;
+        // 比较与写入同一事务：分块清/写不能与并发读看到半套块。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
         let current: Option<String> =
             sqlx::query_scalar("SELECT meta FROM raft_snapshot WHERE id = 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
         if let Some(json) = current {
@@ -833,24 +950,29 @@ impl SqliteStateMachine {
             }
         }
         let meta_json = encode(ErrorSubject::Snapshot(None), ErrorVerb::Write, meta)?;
-        sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
-            .bind(meta_json)
-            .bind(bytes)
-            .execute(&self.pool)
+        write_snapshot_tx(&mut tx, &meta_json, &meta.snapshot_id, bytes).await?;
+        tx.commit()
             .await
-            .map(|_| ())
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))
     }
 
-    /// 已落库快照的字节数（无快照 = 0；查询失败记 0 并告警，不因 gauge 拖垮 /metrics）。
+    /// 已落库快照的字节数（分块快照 = 各块之和，不含清单头；无快照 = 0；
+    /// 查询失败记 0 并告警，不因 gauge 拖垮 /metrics）。
     pub async fn snapshot_bytes(&self) -> u64 {
-        match sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(length(data), 0) FROM raft_snapshot WHERE id = 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(v) => v.unwrap_or(0).max(0) as u64,
+        let query = "SELECT COALESCE((SELECT SUM(length(data)) FROM raft_snapshot_chunk), 0), \
+                     COALESCE((SELECT length(data) FROM raft_snapshot WHERE id = 1), 0)";
+        match sqlx::query(query).fetch_one(&self.pool).await {
+            Ok(row) => {
+                let chunk_bytes: i64 = row.get(0);
+                let whole_row_bytes: i64 = row.get(1);
+                // 有块行时 data 只是清单头；旧库/小快照没有块行，按整行长度计。
+                let bytes = if chunk_bytes > 0 {
+                    chunk_bytes
+                } else {
+                    whole_row_bytes
+                };
+                bytes.max(0) as u64
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "raft snapshot bytes 查询失败；gauge 记 0");
                 0
@@ -1087,12 +1209,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         .execute(&mut *tx)
         .await
         .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
-        sqlx::query("INSERT OR REPLACE INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
-            .bind(meta_json)
-            .bind(&bytes)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
+        write_snapshot_tx(&mut tx, &meta_json, &meta.snapshot_id, &bytes).await?;
         sqlx::query("UPDATE raft_apply_ctx SET active = 0 WHERE id = 1")
             .execute(&mut *tx)
             .await
@@ -1105,8 +1222,14 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+        // meta 行与块行必须来自同一读快照，避免读到替换中的 meta + 旧块。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
         let row = sqlx::query("SELECT meta, data FROM raft_snapshot WHERE id = 1")
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
         let Some(row) = row else {
@@ -1115,7 +1238,12 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         let meta_json: String = row.get("meta");
         let meta: SnapshotMeta<u64, BasicNode> =
             decode(ErrorSubject::Snapshot(None), ErrorVerb::Read, &meta_json)?;
-        let data: Vec<u8> = row.get("data");
+        let stored: Vec<u8> = row.get("data");
+        let data =
+            read_snapshot_data(&mut tx, &meta.snapshot_id, stored, self.max_snapshot_bytes).await?;
+        tx.commit()
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
         Ok(Some(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
@@ -1181,6 +1309,14 @@ mod tests {
 
     fn log_id(index: u64) -> LogId<u64> {
         LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+
+    fn snap_meta(index: u64, id: &str) -> SnapshotMeta<u64, BasicNode> {
+        SnapshotMeta {
+            last_log_id: Some(log_id(index)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: id.to_string(),
+        }
     }
 
     async fn test_machine(dir: &Path) -> (SqliteStateMachine, SqlitePool) {
@@ -1757,5 +1893,274 @@ mod tests {
                 .await
                 .unwrap();
         assert!(marker.is_some(), "marker 必须保留");
+    }
+
+    /// 分块边界：空 / 单块内 / 恰好一块 / 跨块 / 多块都能透明往返；小快照保持
+    /// 旧整行格式（旧二进制与旧库读取路径不变）。
+    #[tokio::test]
+    async fn snapshot_chunk_boundaries_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, pool) = test_machine(dir.path()).await;
+        let cases = [
+            (0usize, 0i64),
+            (1, 0),
+            (SNAPSHOT_CHUNK_BYTES - 1, 0),
+            (SNAPSHOT_CHUNK_BYTES, 0),
+            (SNAPSHOT_CHUNK_BYTES + 1, 2),
+            (SNAPSHOT_CHUNK_BYTES * 2 + 7, 3),
+        ];
+        for (index, (len, want_chunks)) in cases.into_iter().enumerate() {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let id = format!("s{index}");
+            sm.persist_snapshot(&snap_meta(index as u64 + 1, &id), &bytes)
+                .await
+                .unwrap();
+            let snap = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                snap.snapshot.get_ref().as_slice(),
+                bytes.as_slice(),
+                "len {len}"
+            );
+            assert_eq!(snap.meta.snapshot_id, id);
+            let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_snapshot_chunk")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(chunks, want_chunks, "len {len}");
+            assert_eq!(sm.snapshot_bytes().await, len as u64, "len {len}");
+            let stored: Vec<u8> = sqlx::query_scalar("SELECT data FROM raft_snapshot WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if want_chunks > 0 {
+                assert!(stored.starts_with(SNAPSHOT_CHUNK_MAGIC));
+            } else {
+                assert_eq!(stored, bytes, "小快照保持旧整行格式");
+            }
+        }
+    }
+
+    /// 缺块、块内容截断、清单头损坏：读快照必须报错，绝不返回截断/空数据。
+    #[tokio::test]
+    async fn chunked_snapshot_corruption_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, pool) = test_machine(dir.path()).await;
+        let bytes: Vec<u8> = (0..SNAPSHOT_CHUNK_BYTES * 2 + 5)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        sm.persist_snapshot(&snap_meta(1, "a"), &bytes)
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM raft_snapshot_chunk WHERE seq = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("expected 3 chunks"), "{err}");
+
+        sm.persist_snapshot(&snap_meta(2, "b"), &bytes)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE raft_snapshot_chunk SET data = ? WHERE seq = 0")
+            .bind(&bytes[..16])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("expected"), "{err}");
+
+        sm.persist_snapshot(&snap_meta(3, "c"), &bytes)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE raft_snapshot SET data = ? WHERE id = 1")
+            .bind(SNAPSHOT_CHUNK_MAGIC.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("corrupt raft snapshot chunk manifest"),
+            "{err}"
+        );
+    }
+
+    /// 旧库（只有整行 BLOB、无分块表）打开时自动建分块表且旧快照原样可读；
+    /// 再次打开幂等；升级后的写入走分块并可跨重启读回。
+    #[tokio::test]
+    async fn legacy_whole_blob_snapshot_migrates_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(opts).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE raft_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), \
+             meta TEXT NOT NULL, data BLOB NOT NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let meta_json = serde_json::to_string(&snap_meta(5, "legacy")).unwrap();
+        let legacy = b"legacy-whole-blob-snapshot".to_vec();
+        sqlx::query("INSERT INTO raft_snapshot (id, meta, data) VALUES (1, ?, ?)")
+            .bind(&meta_json)
+            .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let mut sm = SqliteStateMachine::open(&path, 1 << 20).await.unwrap();
+        let snap = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.snapshot.get_ref().as_slice(), legacy.as_slice());
+        assert_eq!(sm.snapshot_bytes().await, legacy.len() as u64);
+        drop(sm);
+
+        let big: Vec<u8> = vec![3; SNAPSHOT_CHUNK_BYTES + 1];
+        let mut sm = SqliteStateMachine::open(&path, 1 << 20).await.unwrap();
+        sm.persist_snapshot(&snap_meta(6, "upgraded"), &big)
+            .await
+            .unwrap();
+        drop(sm);
+
+        let mut sm = SqliteStateMachine::open(&path, 1 << 20).await.unwrap();
+        let snap = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.snapshot.get_ref().as_slice(), big.as_slice());
+        assert_eq!(sm.snapshot_bytes().await, big.len() as u64);
+        let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_snapshot_chunk")
+            .fetch_one(&sm.pool)
+            .await
+            .unwrap();
+        assert_eq!(chunks, 2);
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name = 'raft_snapshot_chunk'",
+        )
+        .fetch_one(&sm.pool)
+        .await
+        .unwrap();
+        assert_eq!(table, 1, "迁移必须幂等建表");
+    }
+
+    /// install 路径同样透明分块：大 KE 快照写入分块行，读回与安装后的 KV 一致。
+    #[tokio::test]
+    async fn large_installed_snapshot_is_chunked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, pool) = test_machine(dir.path()).await;
+        let value = "x".repeat(SNAPSHOT_CHUNK_BYTES + 10);
+        let meta = snap_meta(1, "install-big");
+        let data = SnapshotData {
+            applied_log_id: meta.last_log_id,
+            last_membership: meta.last_membership.clone(),
+            kv: BTreeMap::from([("k".to_string(), value.clone())]),
+        };
+        let bytes = serde_json::to_vec(&data).unwrap();
+        assert!(bytes.len() > SNAPSHOT_CHUNK_BYTES);
+        RaftStateMachine::<TypeConfig>::install_snapshot(
+            &mut sm,
+            &meta,
+            Box::new(Cursor::new(bytes.clone())),
+        )
+        .await
+        .unwrap();
+        let snap = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.snapshot.get_ref().as_slice(), bytes.as_slice());
+        assert_eq!(sm.get("k").await.unwrap(), Some(value));
+        let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raft_snapshot_chunk")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(chunks >= 2, "{chunks}");
+    }
+
+    /// 日志读/truncate/purge/重开的持久语义（append 本身由 mod.rs 的 spawn 测试覆盖）。
+    #[tokio::test]
+    async fn log_read_truncate_purge_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        for i in 1..=3u64 {
+            let entry = Entry::<TypeConfig> {
+                log_id: log_id(i),
+                payload: EntryPayload::Blank,
+            };
+            sqlx::query("INSERT INTO raft_log (idx, entry) VALUES (?, ?)")
+                .bind(i as i64)
+                .bind(serde_json::to_string(&entry).unwrap())
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        assert!(store.has_logs().await.unwrap());
+        let all = store.try_get_log_entries(..).await.unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let mid = store
+            .try_get_log_entries((Bound::Excluded(1u64), Bound::Included(3u64)))
+            .await
+            .unwrap();
+        assert_eq!(
+            mid.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(
+            store
+                .try_get_log_entries((Bound::Excluded(3u64), Bound::Included(1u64)))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(3))
+        );
+
+        store.truncate(log_id(2)).await.unwrap();
+        assert_eq!(
+            store
+                .try_get_log_entries(..)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let vote = openraft::Vote::new_committed(4, 1);
+        store.save_vote(&vote).await.unwrap();
+        store.save_committed(Some(log_id(1))).await.unwrap();
+        drop(store);
+
+        let mut store = SqliteLogStore::open(&path).await.unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+        assert_eq!(store.read_committed().await.unwrap(), Some(log_id(1)));
+        store.purge(log_id(1)).await.unwrap();
+        assert!(!store.has_logs().await.unwrap());
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(1)));
+        assert_eq!(state.last_log_id, Some(log_id(1)));
+        assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
     }
 }
