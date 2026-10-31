@@ -344,7 +344,7 @@ async fn snapshot_round_trip_and_reopen_preserve_ledger() {
     let meta = &snap.meta;
     let err = RaftStateMachine::<TypeConfig>::install_snapshot(
         &mut sm_c,
-        &meta,
+        meta,
         Box::new(std::io::Cursor::new(level8)),
     )
     .await

@@ -3602,7 +3602,7 @@ mod tests {
 
         let bad = [
             "".to_string(),
-            format!("{fp_a}"),
+            fp_a.clone(),
             format!("{}={fp_a}", "vpce-abc"),
             format!("{}x=vpce-abc", "ab".repeat(32)),
             format!("{}={fp_a}", "ab".repeat(31)),

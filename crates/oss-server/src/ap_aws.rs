@@ -29,6 +29,9 @@ const DEFAULT_TTL: Duration = Duration::from_secs(60);
 const API_TIMEOUT: Duration = Duration::from_secs(3);
 const EC2_API_VERSION: &str = "2016-11-15";
 
+/// SigV4 签名后的 EC2 Query GET：URL + 需发送的头。
+type SignedRequestParts = (reqwest::Url, Vec<(&'static str, String)>);
+
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
@@ -320,7 +323,7 @@ impl AwsApiEndpointVerifier {
     fn signed_get(
         &self,
         pairs: &[(String, String)],
-    ) -> Result<(reqwest::Url, Vec<(&'static str, String)>), String> {
+    ) -> Result<SignedRequestParts, String> {
         let mut encoded: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| (aws_encode(k), aws_encode(v)))
@@ -618,12 +621,13 @@ mod tests {
                 }
                 "10.0.0.9" => enis("vpc-disabled"),
                 "10.0.0.10" => enis("vpc-two"),
-                "10.0.0.11" => format!(
+                "10.0.0.11" => {
                     "<DescribeNetworkInterfacesResponse><networkInterfaceSet>\
                      <item><networkInterfaceId>eni-1</networkInterfaceId><vpcId>vpc-1</vpcId></item>\
                      <item><networkInterfaceId>eni-2</networkInterfaceId><vpcId>vpc-1</vpcId></item>\
                      </networkInterfaceSet></DescribeNetworkInterfacesResponse>"
-                ),
+                        .to_string()
+                }
                 _ => enis("vpc-1"),
             },
             "DescribeVpcEndpoints" => match value {

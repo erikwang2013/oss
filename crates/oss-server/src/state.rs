@@ -31,7 +31,7 @@ pub struct AppState {
     ///    （窗口内新旧节点会互拒对方签发的 token）；
     /// 3. 新 token 最长有效期 12h（`default_expire`），窗口过后从
     ///    `jwt_previous_secrets` 移除旧密钥。
-    /// 登录限速与审计是节点本地状态（按设计不进 Raft），轮换不改变该边界。
+    ///    登录限速与审计是节点本地状态（按设计不进 Raft），轮换不改变该边界。
     pub jwt_previous: Vec<Arc<JwtAuth>>,
     /// 登录限速（C1）：账号失败锁定 + 全局失败上限（Argon2 ~19MiB/次 的资源放大面封口）。
     pub login_limiter: Arc<LoginLimiter>,
