@@ -5,6 +5,7 @@ mod accounts_support;
 mod accounts_usage;
 pub mod aether;
 pub mod aether_gate;
+pub mod ap_aws;
 mod ap_endpoints;
 pub mod audit_queue;
 pub mod cli;

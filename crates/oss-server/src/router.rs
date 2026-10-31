@@ -16,6 +16,7 @@ use jwt_rust::integrations::axum::JwtLayer;
 use s3s::service::S3ServiceBuilder;
 
 use crate::state::AppState;
+use crate::tls_server::ApConnInfo;
 use xl_s3::auth::SigV4Auth;
 use xl_s3::service::OssS3;
 
@@ -63,6 +64,18 @@ impl ApTrustConfig {
                         peers,
                     )))
                 }
+                Ok(v) if v.trim().eq_ignore_ascii_case("mtls") => {
+                    let raw = std::env::var("OSS_AP_MTLS_ENDPOINTS").map_err(|_| {
+                        "OSS_AP_ENDPOINT_VERIFIER=mtls 需要 OSS_AP_MTLS_ENDPOINTS".to_string()
+                    })?;
+                    Some(Arc::new(xl_s3::ap::MtlsEndpointVerifier::parse(&raw)?))
+                }
+                Ok(v) if v.trim().eq_ignore_ascii_case("aws-api") => {
+                    let config = crate::ap_aws::AwsApiConfig::from_env()?;
+                    Some(Arc::new(crate::ap_aws::AwsApiEndpointVerifier::new(
+                        config,
+                    )?))
+                }
                 Ok(v) if v.trim().eq_ignore_ascii_case("attested-proxy") => {
                     let secret = std::env::var("OSS_AP_ATTESTATION_SECRET").map_err(|_| {
                         "OSS_AP_ENDPOINT_VERIFIER=attested-proxy 需要 \
@@ -97,7 +110,7 @@ impl ApTrustConfig {
                 }
                 Ok(v) => {
                     return Err(format!(
-                        "OSS_AP_ENDPOINT_VERIFIER 非法: {}（支持 trusted-proxy / attested-proxy）",
+                        "OSS_AP_ENDPOINT_VERIFIER 非法: {}（支持 trusted-proxy / attested-proxy / mtls / aws-api）",
                         v.escape_debug()
                     ));
                 }
@@ -536,11 +549,21 @@ async fn ap_peer(
     vpce: Arc<Attest>,
     verify: Option<Arc<EndpointVerifyConfig>>,
 ) -> Response {
-    // ConnectInfo 是唯一可信的直连对端来源；缺失（如 ecat 明文 listener）时转发头不采信。
-    let direct = req
+    // ConnectInfo 是唯一可信的直连对端来源；TLS 监听器额外携带握手期已验证的
+    // 客户端叶证书指纹。缺失（如 ecat 明文 listener）时转发头不采信。
+    let conn = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_canonical());
+        .map(|c| (c.0, None))
+        .or_else(|| {
+            req.extensions()
+                .get::<ConnectInfo<ApConnInfo>>()
+                .map(|c| (c.0.addr, c.0.client_cert_sha256))
+        });
+    let (direct, client_cert_sha256) = match conn {
+        Some((addr, fingerprint)) => (Some(addr.ip().to_canonical()), fingerprint),
+        None => (None, None),
+    };
     let (ip, peer_trusted) = match trust.as_ref() {
         Some(t) => (t.resolve(req.headers(), direct), t.peer_trusted(direct)),
         None => (direct, false),
@@ -574,6 +597,7 @@ async fn ap_peer(
                 attestation,
                 static_vpce: cfg.static_vpce.clone(),
                 direct_peer: direct,
+                client_cert_sha256,
             });
         }
         None => {

@@ -897,6 +897,9 @@ pub struct ApEndpointContext {
     pub static_vpce: Option<String>,
     /// 直连 TCP 对端（ConnectInfo）；None = 传输层不提供 → 可信反代不成立。
     pub direct_peer: Option<IpAddr>,
+    /// rustls 握手期已验证的客户端叶证书 SHA-256（DER 摘要）；None = 未出示/未启 mTLS。
+    /// 只由 TLS 监听器下沉，客户端头/请求体无法伪造。
+    pub client_cert_sha256: Option<[u8; 32]>,
 }
 
 /// 验证失败：区分「声明被拒」（403）与「验证后端不可用」（500）。
@@ -914,18 +917,13 @@ pub enum ApEndpointVerifyError {
 /// - 声明存在但无法证明来源 → `Denied`（403）；验证后端失败 → `Unavailable`（500）；
 /// - registry 的登记/状态/VPC/账户（R2–R5）检查仍在验证之后执行，验证器绝不放宽它们。
 ///
-/// 未实现的外部验证器契约（本仓库不伪造真实身份）：
-/// - AWS PrivateLink：只用 `direct_peer`（ConnectInfo 或可信反代解析出的源地址）调 EC2
-///   `DescribeNetworkInterfaces`（filter `addresses.private-ip-address`）或
-///   `DescribeVpcEndpoints`（filter `vpc-endpoint-id`+`network-interface-ids`）；要求
-///   恰好一个 ENI/端点关联且端点 `State=available`，从响应取 `VpcEndpointId/VpcId/
-///   OwnerId`，evidence=`AwsApi`。API 超时/限流/错误一律 `Unavailable`，结果按源 IP/TTL
-///   缓存且失败不放行；绝不读取客户端端点/账户头。
-/// - mTLS：rustls 只在握手期持有已验证的客户端叶证书。技术上可由
-///   `tls_server.rs` 的自定义 `Connected` 把叶证书 SHA-256 注入请求，但本切片没有
-///   「指纹 → vpce」的配置载体（`[ap.vpc_endpoints]`/`ApTrustConfig` 均无该字段，
-///   config/schema 不在改动范围）；只证明「有证书」不等于「是该端点」，故不实现，
-///   待引入显式证书注册表后再接。attested-proxy 是当前可交付的端点身份路径。
+/// 实现位置：
+/// - mTLS：本模块 [`MtlsEndpointVerifier`]（证书指纹 → 端点登记表），证书 SHA-256 由
+///   oss-server 的 TLS 监听器从 rustls 握手结果下沉到 [`ApEndpointContext`]。
+/// - AWS PrivateLink：oss-server 的 `ap_aws` 模块（EC2 `DescribeNetworkInterfaces` +
+///   `DescribeVpcEndpoints`），只用 `direct_peer` 反查 ENI/端点，要求 `State=available`；
+///   API 超时/限流/错误一律 `Unavailable`，结果按源 IP/TTL 缓存且失败不放行；绝不读取
+///   客户端端点/账户头。真实 AWS 身份需在具备 PrivateLink 的环境做外部验收。
 #[async_trait::async_trait]
 pub trait EndpointIdentityVerifier: Send + Sync {
     async fn verify(
@@ -1112,6 +1110,133 @@ impl EndpointIdentityVerifier for AttestedProxyEndpointVerifier {
             vpc_id: claims.vpc,
             account_id: claims.account,
             evidence: ApEndpointEvidence::AttestedProxy,
+        }))
+    }
+}
+
+/// 证书指纹登记的端点身份（mTLS 叶证书 → vpce/vpc/account）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtlsEndpoint {
+    pub vpce_id: String,
+    pub vpc_id: Option<String>,
+    pub account_id: Option<String>,
+}
+
+/// 直接 mTLS 端点身份验证器：rustls 已验证的客户端叶证书 SHA-256 → 端点登记表。
+///
+/// 配置载体 `OSS_AP_MTLS_ENDPOINTS`（oss-server 解析后调用 [`Self::parse`]）：
+/// `<sha256>=<vpce>[=<vpc>[=<account>]]`，多条以 `;` 分隔；指纹为 64 位 hex
+/// （大小写不敏感、可带 `:` 分隔），重复指纹/非法 ID 一律拒绝启动。
+/// 证书由监听器在握手期验证，客户端头无法伪造；声明头若存在必须与登记 vpce 一致。
+pub struct MtlsEndpointVerifier {
+    endpoints: std::collections::HashMap<[u8; 32], MtlsEndpoint>,
+}
+
+impl MtlsEndpointVerifier {
+    pub fn new(items: impl IntoIterator<Item = ([u8; 32], MtlsEndpoint)>) -> Result<Self, String> {
+        let mut endpoints = std::collections::HashMap::new();
+        for (fingerprint, endpoint) in items {
+            if endpoints.insert(fingerprint, endpoint).is_some() {
+                return Err("OSS_AP_MTLS_ENDPOINTS 指纹重复".into());
+            }
+        }
+        if endpoints.is_empty() {
+            return Err("OSS_AP_MTLS_ENDPOINTS 不能为空".into());
+        }
+        Ok(Self { endpoints })
+    }
+
+    /// 解析 `<fp>=<vpce>[=<vpc>[=<account>]];...`；空条目忽略，其余错误拒绝启动。
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut items = Vec::new();
+        for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let mut fields = entry.split('=').map(str::trim);
+            let (Some(fp), Some(vpce)) = (fields.next(), fields.next()) else {
+                return Err(format!(
+                    "OSS_AP_MTLS_ENDPOINTS 条目须为 <sha256>=<vpce>[=<vpc>[=<account>]]: {entry:?}"
+                ));
+            };
+            let vpc = fields.next().filter(|v| !v.is_empty());
+            let account = fields.next().filter(|v| !v.is_empty());
+            if fields.next().is_some() {
+                return Err(format!("OSS_AP_MTLS_ENDPOINTS 条目字段过多: {entry:?}"));
+            }
+            let fingerprint = parse_sha256_hex(fp)
+                .ok_or_else(|| format!("OSS_AP_MTLS_ENDPOINTS 证书指纹非法: {fp:?}"))?;
+            if !valid_vpce_id(vpce) {
+                return Err(format!("OSS_AP_MTLS_ENDPOINTS vpce 非法: {vpce:?}"));
+            }
+            if vpc.is_some_and(|v| !valid_vpc_id(v)) {
+                return Err(format!("OSS_AP_MTLS_ENDPOINTS vpc 非法: {vpc:?}"));
+            }
+            if account.is_some_and(|a| !crate::access::valid_account_id(a)) {
+                return Err(format!("OSS_AP_MTLS_ENDPOINTS account 非法: {account:?}"));
+            }
+            items.push((
+                fingerprint,
+                MtlsEndpoint {
+                    vpce_id: vpce.to_string(),
+                    vpc_id: vpc.map(str::to_string),
+                    account_id: account.map(str::to_string),
+                },
+            ));
+        }
+        Self::new(items)
+    }
+}
+
+/// 64 位 hex（可带 `:` 分隔、大小写不敏感）→ SHA-256 原始摘要。
+fn parse_sha256_hex(raw: &str) -> Option<[u8; 32]> {
+    let bytes: Vec<u8> = raw.bytes().filter(|b| *b != b':').collect();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+#[async_trait::async_trait]
+impl EndpointIdentityVerifier for MtlsEndpointVerifier {
+    async fn verify(
+        &self,
+        ctx: &ApEndpointContext,
+    ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError> {
+        // 静态部署证明优先，与其它验证器语义一致。
+        if let Some(vpce) = &ctx.static_vpce {
+            return Ok(Some(ApEndpointIdentity {
+                vpce_id: vpce.clone(),
+                vpc_id: None,
+                account_id: None,
+                evidence: ApEndpointEvidence::StaticConfig,
+            }));
+        }
+        if matches!(&ctx.claim, ApEndpointClaim::Malformed) {
+            return Err(ApEndpointVerifyError::Denied("malformed-claim"));
+        }
+        let Some(fingerprint) = ctx.client_cert_sha256 else {
+            return match &ctx.claim {
+                ApEndpointClaim::Absent => Ok(None),
+                _ => Err(ApEndpointVerifyError::Denied("no-client-certificate")),
+            };
+        };
+        let Some(endpoint) = self.endpoints.get(&fingerprint) else {
+            return Err(ApEndpointVerifyError::Denied("unknown-certificate"));
+        };
+        if let ApEndpointClaim::Header(vpce) = &ctx.claim
+            && vpce != &endpoint.vpce_id
+        {
+            return Err(ApEndpointVerifyError::Denied("vpce-mismatch"));
+        }
+        Ok(Some(ApEndpointIdentity {
+            vpce_id: endpoint.vpce_id.clone(),
+            vpc_id: endpoint.vpc_id.clone(),
+            account_id: endpoint.account_id.clone(),
+            evidence: ApEndpointEvidence::Mtls,
         }))
     }
 }
@@ -3101,6 +3226,7 @@ mod tests {
                 attestation: ApEndpointClaim::Absent,
                 static_vpce: static_vpce.map(str::to_string),
                 direct_peer: peer.map(|p| p.parse().unwrap()),
+                client_cert_sha256: None,
             }
         };
         let header = ApEndpointClaim::Header("vpce-abc".into());
@@ -3186,6 +3312,7 @@ mod tests {
             attestation: token.map_or(ApEndpointClaim::Absent, ApEndpointClaim::Header),
             static_vpce: None,
             direct_peer: peer.map(|p| p.parse().unwrap()),
+            client_cert_sha256: None,
         }
     }
 
@@ -3441,6 +3568,131 @@ mod tests {
         assert_eq!(id.evidence, ApEndpointEvidence::StaticConfig);
     }
 
+    fn mtls_ctx(
+        claim: ApEndpointClaim,
+        cert: Option<[u8; 32]>,
+        static_vpce: Option<&str>,
+    ) -> ApEndpointContext {
+        ApEndpointContext {
+            claim,
+            static_vpce: static_vpce.map(str::to_string),
+            client_cert_sha256: cert,
+            ..Default::default()
+        }
+    }
+
+    /// 登记表解析：指纹大小写/`:` 归一；重复、非法 ID、字段数错误拒绝启动。
+    #[test]
+    fn mtls_registry_parses_and_rejects_bad_entries() {
+        let fp_a = "AB:".repeat(32);
+        let raw = format!(
+            "{fp_a}=vpce-abc=vpc-1=000000000007;{}=vpce-def",
+            "cd".repeat(32)
+        );
+        let verifier = MtlsEndpointVerifier::parse(&raw).unwrap();
+        assert_eq!(verifier.endpoints.len(), 2);
+        assert_eq!(
+            verifier.endpoints.get(&[0xab; 32]).unwrap(),
+            &MtlsEndpoint {
+                vpce_id: "vpce-abc".into(),
+                vpc_id: Some("vpc-1".into()),
+                account_id: Some("000000000007".into()),
+            }
+        );
+
+        let bad = [
+            "".to_string(),
+            format!("{fp_a}"),
+            format!("{}={fp_a}", "vpce-abc"),
+            format!("{}x=vpce-abc", "ab".repeat(32)),
+            format!("{}={fp_a}", "ab".repeat(31)),
+            format!("{fp_a}=vpc-abc"),
+            format!("{fp_a}=vpce-abc=bad-vpc"),
+            format!("{fp_a}=vpce-abc=vpc-1=12345"),
+            format!("{fp_a}=vpce-abc=vpc-1=000000000007=extra"),
+            format!("{fp_a}=vpce-abc;{fp_a}=vpce-def"),
+        ];
+        for entry in bad {
+            assert!(
+                MtlsEndpointVerifier::parse(&entry).is_err(),
+                "应拒绝: {entry:?}"
+            );
+        }
+    }
+
+    /// 证书指纹是唯一身份来源：登记指纹放行（声明头可缺省，存在则须一致）；
+    /// 未知证书/无证书+声明/malformed 一律拒绝；静态部署证明优先。
+    #[tokio::test]
+    async fn mtls_verifier_maps_verified_certificate_to_endpoint() {
+        let verifier = MtlsEndpointVerifier::new([(
+            [0xab; 32],
+            MtlsEndpoint {
+                vpce_id: "vpce-abc".into(),
+                vpc_id: Some("vpc-1".into()),
+                account_id: Some("000000000007".into()),
+            },
+        )])
+        .unwrap();
+        let header = ApEndpointClaim::Header("vpce-abc".into());
+
+        for claim in [header.clone(), ApEndpointClaim::Absent] {
+            let id = verifier
+                .verify(&mtls_ctx(claim, Some([0xab; 32]), None))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(id.vpce_id, "vpce-abc");
+            assert_eq!(id.vpc_id.as_deref(), Some("vpc-1"));
+            assert_eq!(id.account_id.as_deref(), Some("000000000007"));
+            assert_eq!(id.evidence, ApEndpointEvidence::Mtls);
+        }
+
+        assert_eq!(
+            verifier
+                .verify(&mtls_ctx(header.clone(), Some([0xcd; 32]), None))
+                .await,
+            Err(ApEndpointVerifyError::Denied("unknown-certificate"))
+        );
+        assert_eq!(
+            verifier.verify(&mtls_ctx(header.clone(), None, None)).await,
+            Err(ApEndpointVerifyError::Denied("no-client-certificate"))
+        );
+        assert_eq!(
+            verifier
+                .verify(&mtls_ctx(ApEndpointClaim::Absent, None, None))
+                .await,
+            Ok(None),
+            "无证书无声明不构成端点身份（也不单独拒绝）"
+        );
+        assert_eq!(
+            verifier
+                .verify(&mtls_ctx(
+                    ApEndpointClaim::Malformed,
+                    Some([0xab; 32]),
+                    None
+                ))
+                .await,
+            Err(ApEndpointVerifyError::Denied("malformed-claim"))
+        );
+        assert_eq!(
+            verifier
+                .verify(&mtls_ctx(
+                    ApEndpointClaim::Header("vpce-other".into()),
+                    Some([0xab; 32]),
+                    None
+                ))
+                .await,
+            Err(ApEndpointVerifyError::Denied("vpce-mismatch"))
+        );
+        let id = verifier
+            .verify(&mtls_ctx(header, Some([0xcd; 32]), Some("vpce-static")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.vpce_id, "vpce-static");
+        assert_eq!(id.evidence, ApEndpointEvidence::StaticConfig);
+    }
+
     /// 启动期密钥/窗口校验：短密钥与 0 窗口拒绝。
     #[test]
     fn attested_proxy_verifier_requires_strong_secret_and_window() {
@@ -3494,6 +3746,7 @@ mod tests {
             attestation: ApEndpointClaim::Absent,
             static_vpce: None,
             direct_peer: Some(peer.parse().unwrap()),
+            client_cert_sha256: None,
         }
     }
 
