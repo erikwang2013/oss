@@ -119,6 +119,9 @@ pub struct StoreConfig {
     /// 在途 MPU 索引 TTL 秒（`OSS_MPU_INDEX_TTL_SECS`，默认 300）；0 = 不周期重建。
     /// 过期的索引下次列举时整桶重建，纠正 clean/加载竞态留下的陈旧项。
     pub mpu_index_ttl_secs: u64,
+    /// wire-1 属主 UploadPart 有界回退的预落盘上限（字节，默认 S3 单段上限 5 GiB）：
+    /// 超限在转发前拒绝，避免为旧属主整段落盘时无界占用暂存盘。
+    pub mpu_forward_max_bytes: u64,
     /// 流式读的分片批量读目标字节数（`OSS_SHARD_READ_BATCH_BYTES`，默认 1 MiB）。
     /// 按块宽（64 KiB）向下取整并限制在 [64 KiB, 16 MiB]；0 = 单块（关闭批量）。
     pub shard_read_batch_bytes: usize,
@@ -145,6 +148,7 @@ impl StoreConfig {
             key_cache_max_total_keys: env_num("OSS_KEY_CACHE_MAX_TOTAL_KEYS", 2_000_000),
             key_cache_ttl_secs: env_num("OSS_KEY_CACHE_TTL_SECS", 300),
             mpu_index_ttl_secs: env_num("OSS_MPU_INDEX_TTL_SECS", 300),
+            mpu_forward_max_bytes: mpu::MAX_PART_BYTES,
             shard_read_batch_bytes: env_num("OSS_SHARD_READ_BATCH_BYTES", 1024 * 1024),
         }
     }

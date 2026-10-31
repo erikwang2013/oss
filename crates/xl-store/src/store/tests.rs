@@ -2788,6 +2788,9 @@ pub struct InProcessMesh {
     /// 读批量仪器（流式 GET 批量 RPC 测试）。
     read_calls: std::sync::atomic::AtomicU64,
     read_max_len: std::sync::atomic::AtomicU64,
+    /// DP：MPU 分片转发路径选择仪器（flow = 流式 / bounded = wire-1 有界回退）。
+    mpu_stream_calls: std::sync::atomic::AtomicU64,
+    mpu_bounded_calls: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for InProcessMesh {
@@ -2813,6 +2816,8 @@ impl InProcessMesh {
             local_remote_overlap: Default::default(),
             read_calls: Default::default(),
             read_max_len: Default::default(),
+            mpu_stream_calls: Default::default(),
+            mpu_bounded_calls: Default::default(),
         })
     }
 
@@ -2849,6 +2854,16 @@ impl InProcessMesh {
 
     pub fn read_max_len(&self) -> u64 {
         self.read_max_len.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// DP：流式 / wire-1 有界回退的 MPU 分片转发次数（断言路径选择）。
+    pub fn mpu_stream_calls(&self) -> u64 {
+        self.mpu_stream_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn mpu_bounded_calls(&self) -> u64 {
+        self.mpu_bounded_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn probe_store(&self) -> Option<Arc<Store>> {
@@ -3132,6 +3147,29 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         n: &str,
         r: crate::mesh::MpuPartUpload,
     ) -> crate::error::Result<String> {
+        self.mpu_stream_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.peer(n)
+            .await
+            .map_err(|e| crate::error::Error::Unavailable(e.to_string()))?
+            .mesh_mpu_upload_part(r)
+            .await
+    }
+    /// wire-1 有界回退：与流式同一 RPC 落地；单独计数供测试断言路径选择，
+    /// 并支持在消费首块后注入中途失败（验证协调者清理预落盘文件）。
+    async fn mpu_upload_part_bounded(
+        &self,
+        n: &str,
+        mut r: crate::mesh::MpuPartUpload,
+    ) -> crate::error::Result<String> {
+        self.mpu_bounded_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.take_fail(n, "mpu_upload_part_bounded") {
+            let _ = futures::StreamExt::next(&mut r.body).await;
+            return Err(crate::error::Error::Unavailable(format!(
+                "in-process 注入：{n} mpu_upload_part_bounded 中途失败"
+            )));
+        }
         self.peer(n)
             .await
             .map_err(|e| crate::error::Error::Unavailable(e.to_string()))?
@@ -3189,12 +3227,21 @@ impl Cluster {
         drives_per_node: usize,
         placement_v2: bool,
     ) -> Cluster {
-        Self::new_full(nodes, drives_per_node, placement_v2, false).await
+        Self::new_full(nodes, drives_per_node, placement_v2, false, None).await
+    }
+
+    /// wire-1 有界回退：注入小上限以验证超限在转发前拒绝。
+    pub async fn new_with_mpu_forward_max(
+        nodes: usize,
+        drives_per_node: usize,
+        max_bytes: u64,
+    ) -> Cluster {
+        Self::new_full(nodes, drives_per_node, false, false, Some(max_bytes)).await
     }
 
     /// shrink plan 测试：全节点 maintenance=true（Store 层写路径不受影响，维护门在 HTTP 面）。
     pub async fn new_in_maintenance(nodes: usize, drives_per_node: usize) -> Cluster {
-        Self::new_full(nodes, drives_per_node, false, true).await
+        Self::new_full(nodes, drives_per_node, false, true, None).await
     }
 
     async fn new_full(
@@ -3202,6 +3249,7 @@ impl Cluster {
         drives_per_node: usize,
         placement_v2: bool,
         maintenance: bool,
+        mpu_forward_max_bytes: Option<u64>,
     ) -> Cluster {
         let mut tmpdirs = Vec::new();
         let mut node_dirs = Vec::new();
@@ -3214,12 +3262,19 @@ impl Cluster {
             }
             node_dirs.push(dirs);
         }
-        Self::open_over(node_dirs, tmpdirs, placement_v2, maintenance).await
+        Self::open_over(
+            node_dirs,
+            tmpdirs,
+            placement_v2,
+            maintenance,
+            mpu_forward_max_bytes,
+        )
+        .await
     }
 
     /// 在同一组盘上重开（扩容/换放置旗测试）：`dirs` 的保活由调用方（原 Cluster）负责。
     pub async fn reopen_over(dirs: Vec<Vec<std::path::PathBuf>>, placement_v2: bool) -> Cluster {
-        Self::open_over(dirs, Vec::new(), placement_v2, false).await
+        Self::open_over(dirs, Vec::new(), placement_v2, false, None).await
     }
 
     async fn open_over(
@@ -3227,6 +3282,7 @@ impl Cluster {
         tmpdirs: Vec<tempfile::TempDir>,
         placement_v2: bool,
         maintenance: bool,
+        mpu_forward_max_bytes: Option<u64>,
     ) -> Cluster {
         let nodes = node_dirs.len();
         let drives_per_node = node_dirs[0].len();
@@ -3270,6 +3326,9 @@ impl Cluster {
             cfg.ec = ec;
             cfg.fsync = false; // 测试提速（既有测试同款）
             cfg.maintenance = maintenance;
+            if let Some(max) = mpu_forward_max_bytes {
+                cfg.mpu_forward_max_bytes = max;
+            }
             // 集群锁参数注小值（Task 8）：TTL 400ms、3 次重试、5–10ms 抖动——速度与语义两全
             cfg.cluster_lock_ttl_ms = 400;
             cfg.cluster_lock_retries = 3;

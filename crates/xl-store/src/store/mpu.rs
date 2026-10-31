@@ -29,6 +29,8 @@ const MPU_META_FILE: &str = "mpu.meta";
 const MPU_DONE_FILE: &str = "mpu.meta.done";
 /// 除末段外的最小 part 大小（S3 规格）。
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+/// 单段上限（S3 规格 5 GiB）：wire-1 有界回退的预落盘默认上限。
+pub(crate) const MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PARTS: u16 = 10_000;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -363,6 +365,11 @@ impl Store {
     ///
     /// M3 MPU 会话粘性：非属主节点收到请求时**流式转发**给属主（分段走 mesh 流，
     /// 不在内存里整段缓冲）；属主执行 [`Self::upload_part_local`]。
+    ///
+    /// DP：属主是 **wire-1**（v1.16.0–v1.16.x，无 DP-0 握手）时流式转发按策略拒绝，
+    /// 改走**有界回退**（预落盘/限长/MD5 核对，见 [`Self::upload_part_forward_bounded`]）
+    /// ——旧端点自 v1.16.0 起的 UploadPart RPC 与暂存格式未变，同一请求可直接接收。
+    /// 探测失败（不可达）不当作旧版：保持流式路径既有的 Unavailable 语义。
     pub async fn upload_part_ext(
         &self,
         bucket: &str,
@@ -376,22 +383,99 @@ impl Store {
             let t = self.mesh_transport().ok_or_else(|| {
                 Error::Unavailable("集群传输未注入，无法转发 MPU UploadPart".into())
             })?;
-            return t
-                .mpu_upload_part(
-                    &node,
-                    crate::mesh::MpuPartUpload {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        upload_id: upload_id.to_string(),
-                        part_number,
-                        sse_c_md5: sse_c_md5.map(str::to_string),
-                        body,
-                    },
-                )
-                .await;
+            let req = |body| crate::mesh::MpuPartUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+                part_number,
+                sse_c_md5: sse_c_md5.map(str::to_string),
+                body,
+            };
+            let legacy = matches!(
+                t.data_wire_version(&node).await,
+                Ok(v) if v < crate::mesh_gate::DATA_WIRE_VERSION
+            );
+            if legacy {
+                return self
+                    .upload_part_forward_bounded(&**t, &node, req(body))
+                    .await;
+            }
+            return t.mpu_upload_part(&node, req(body)).await;
         }
         self.upload_part_local(bucket, key, upload_id, part_number, body, sse_c_md5)
             .await
+    }
+
+    /// wire-1 属主的 UploadPart **有界回退**：常量内存预落盘（上限
+    /// [`crate::store::StoreConfig::mpu_forward_max_bytes`]），核对长度与 MD5 后经
+    /// [`crate::mesh::MeshTransport::mpu_upload_part_bounded`] 转发（同一 UploadPart
+    /// RPC，旧端点自 v1.16.0 起线格式未变）。暂存文件由 [`SpoolGuard`] 在成功/任何
+    /// 错误（含客户端中止与 panic 展开）下删除。
+    ///
+    /// 固有缺口：**v1.15 及更早**没有 MPU mesh RPC（属主发现即 Unavailable），无路可
+    /// 转发；**placement v2+/显式槽表**由 gate 的 `check_peer` 先行拒绝（要求 wire2 +
+    /// 相同拓扑指纹，旧 peer 不可能通过）——本回退对二者都不适用。
+    async fn upload_part_forward_bounded(
+        &self,
+        t: &dyn crate::mesh::MeshTransport,
+        node: &str,
+        req: crate::mesh::MpuPartUpload,
+    ) -> Result<String> {
+        let crate::mesh::MpuPartUpload {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            sse_c_md5,
+            mut body,
+        } = req;
+        let dir = layout::sys_dir(self.cfg.root(), "tmp");
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("mpu-{}.part", uuid::Uuid::new_v4()));
+        let _guard = SpoolGuard(path.clone());
+        let max = self.cfg.mpu_forward_max_bytes;
+
+        let md5 = {
+            let mut file = tokio::fs::File::create(&path).await?;
+            let mut md5 = Md5::new();
+            let mut size = 0u64;
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk?;
+                size += chunk.len() as u64;
+                if size > max {
+                    return Err(Error::InvalidPart(format!(
+                        "part 超过 wire-1 转发上限 {max} 字节（已收 {size}）"
+                    )));
+                }
+                md5.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            // 暂存文件只服务本次转发（客户端未收到应答前崩溃都可重试）：不 fsync，
+            // 随后的读走页缓存；属主侧的 part 落盘仍按 cfg.fsync 同步。
+            hex::encode(md5.finalize())
+        };
+
+        let file = tokio::fs::File::open(&path).await?;
+        let etag = t
+            .mpu_upload_part_bounded(
+                node,
+                crate::mesh::MpuPartUpload {
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    sse_c_md5,
+                    body: spooled_stream(file),
+                },
+            )
+            .await?;
+        // 属主按收到的字节算 ETag：与本地 MD5 不符 = 传输被篡改/截断，拒收。
+        if etag != md5 {
+            return Err(Error::BadDigest(format!(
+                "wire-1 属主 part {part_number} ETag {etag} 与本地 MD5 {md5} 不符"
+            )));
+        }
+        Ok(etag)
     }
 
     /// UploadPart 的本地执行（**不再转发**；mesh 服务端 handler 与属主路径共用）。
@@ -1247,6 +1331,32 @@ pub(super) async fn mpu_summary(dir: &std::path::Path) -> Result<Option<MpuSumma
         storage_class: m.storage_class,
         owner: m.owner,
     }))
+}
+
+/// 有界回退的预落盘文件：Drop 即删（成功、错误、客户端中止、panic 展开都不留残件）。
+/// `Drop` 不能 await——单条 unlink 足够；崩溃残件由启动时的 tmp 清理兜底。
+struct SpoolGuard(PathBuf);
+
+impl Drop for SpoolGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 预落盘 part → [`ByteStream`]（64 KiB 块，常量内存；传输层再按 1 MiB 分帧）。
+fn spooled_stream(file: tokio::fs::File) -> ByteStream {
+    Box::pin(futures::stream::try_unfold(
+        file,
+        |mut file: tokio::fs::File| async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            buf.truncate(n);
+            Ok(Some((Bytes::from(buf), file)))
+        },
+    ))
 }
 
 /// 按声明顺序把暂存的 `part.N` 拼成 64 KiB 块的 `ByteStream`（complete 装对象用），

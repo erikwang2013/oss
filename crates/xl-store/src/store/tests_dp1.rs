@@ -405,9 +405,10 @@ async fn dp1_list_versions_new_to_old() {
     assert!(matches!(e, Error::PeerIncompatible(_)), "{e:?}");
 }
 
-/// DP-1：MPU 转发（协调者 ≠ 属主）在 legacy 属主上 503；本地 MPU 仍可完成。
+/// DP-1：MPU 转发（协调者 ≠ 属主）对 legacy 属主改走有界回退（预落盘后同一
+/// UploadPart RPC）；流式路径仍按 wire-2 闸门拒绝。
 #[tokio::test]
-async fn dp1_mpu_forward_new_to_old_fails_closed() {
+async fn dp1_mpu_forward_new_to_old_bounded() {
     let c = Cluster::new(4, 3).await;
     let s1 = &c.stores[0];
     s1.create_bucket("bkt").await.unwrap();
@@ -416,11 +417,13 @@ async fn dp1_mpu_forward_new_to_old_fails_closed() {
         .await
         .unwrap();
     c.mesh.set_data_wire_version("n2", Some(0));
-    let e = s1
+    let etag = s1
         .upload_part("bkt", "k", &remote, 1, stream_of(b"data"))
         .await
-        .unwrap_err();
-    assert!(matches!(e, Error::PeerIncompatible(_)), "{e:?}");
+        .unwrap();
+    assert_eq!(etag, "8d777f385d3dfec8815d20f7496026dc", "原始字节 MD5");
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1);
+    assert_eq!(c.mesh.mpu_stream_calls(), 0, "流式不得发往 wire-1");
 }
 
 /// DP-1：本地属主 MPU 在混版窗口内正常完成（不跨版本转发）。

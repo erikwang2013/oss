@@ -502,6 +502,12 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
         let _ = (node, req);
         Err(Error::Unavailable("MPU UploadPart 转发未实现".into()))
     }
+    /// UploadPart 的 **wire-1 有界回退**：调用方已把 body 预落盘并校验长度/MD5
+    /// （常量内存），传输层按同一 UploadPart RPC 发送（v1.16.0+ 旧端点线格式未变）。
+    /// 默认委托流式实现——非闸门实现无需覆盖；`GatedMesh` 以独立操作类放行旧 peer。
+    async fn mpu_upload_part_bounded(&self, node: &str, req: MpuPartUpload) -> Result<String> {
+        self.mpu_upload_part(node, req).await
+    }
     /// 转发 CompleteMultipartUpload（对端只做本地提交）。
     async fn mpu_complete(&self, node: &str, req: MpuComplete) -> Result<ObjectInfo> {
         let _ = (node, req);

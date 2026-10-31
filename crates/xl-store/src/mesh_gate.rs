@@ -8,7 +8,8 @@
 //! - [`PeerCapabilities`] = 进程内 TTL 缓存；
 //! - [`GatedMesh`] = 装配层装饰器：按**操作类**判定——base 数据面（分片/meta/桶/
 //!   删除/回收/LMU）与 MPU 收尾/查询（ListParts/Complete/Abort）允许旧版；MPU
-//!   分片流与带语义标志的 ListLocal 要求现版。
+//!   分片流与带语义标志的 ListLocal 要求现版。MPU 分片另有**有界回退**操作类：
+//!   调用方预落盘/限长后经同一 RPC 发给旧属主（v1.16.0+ 线格式未变）。
 //!
 //! 读路径的降级/失败语义在 store 层（`degraded_marker` / `VersionList::require_complete`），
 //! 本模块只决定「能不能发给这个 peer」。
@@ -115,6 +116,9 @@ pub enum OpClass {
     Data,
     /// MPU 分片流式转发（UploadPart）：暂存段语义跨版本不可靠 → 只允许现版。
     MpuForward,
+    /// MPU 分片**有界回退**（wire-1 属主）：调用方已预落盘、限长并核对 MD5，旧端点
+    /// 自 v1.16.0 起的 UploadPart RPC 可接收同一请求 → 混版窗口放行。
+    MpuForwardBounded,
     /// MPU 收尾/查询（ListParts/Complete/Abort）：RPC 与暂存格式自 v1.16.0 未变，
     /// 旧端点按本地语义执行 → 混版窗口允许（更旧节点无 RPC → Unavailable，仍 fail-closed）。
     MpuFinish,
@@ -357,6 +361,10 @@ impl MeshTransport for GatedMesh {
     async fn mpu_upload_part(&self, node: &str, req: MpuPartUpload) -> Result<String> {
         self.gate(node, OpClass::MpuForward).await?;
         self.inner.mpu_upload_part(node, req).await
+    }
+    async fn mpu_upload_part_bounded(&self, node: &str, req: MpuPartUpload) -> Result<String> {
+        self.gate(node, OpClass::MpuForwardBounded).await?;
+        self.inner.mpu_upload_part_bounded(node, req).await
     }
     async fn mpu_complete(&self, node: &str, req: MpuComplete) -> Result<ObjectInfo> {
         self.gate(node, OpClass::MpuFinish).await?;
