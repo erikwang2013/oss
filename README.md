@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.27.0（2026-10-31）。** 分布式存储与升级安全版：feature level 8 交付账户硬配额配置与动态 VPC 端点注册表 Raft 命令；跨版本 MPU 支持 wire-1 有界回退（v1.16+），并补齐裸 UUID 收尾与幂等 Complete；Level C 交付 Ext 类型能力协商与在途 MPU 的 CMK 引用；AP 新增 attested-proxy 端点身份；Raft 快照 >256 KiB 分块、日志 entry 压缩与分段；新增停写蓝绿 preflight、v1.16 数据面下限/MPU 排空检查与单机→集群工具化。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.28.0（2026-11-01）。** 升级与安全加固版：Raft 日志格式标记（缺失/`1` 为旧格式，`2` 为压缩/分段，未知值 fail-closed）与每次 append 两段有界压缩；M8 follower 发起的 `TierRestoreDelete` 改用 applied 行自身 `fence_term` 收口；AP 新增直连 mTLS 指纹验证（`mtls`）与 AWS PrivateLink API 验证（`aws-api`）；`cmk rewrap --to-legacy sse-s3|sse-kms` 可把 CMK 对象全量重加密回 legacy provider；Level C 新增 `read_only` 只读排空；JWT 支持 `jwt_previous_secrets` 多密钥轮换；补上真实 v1.26.0 蓝绿 e2e、MPU 排空工具与单机→集群双回环 e2e。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
@@ -192,13 +192,19 @@ aws --endpoint-url $E s3 rm s3://photos/cover.jpg
 
 `scripts/blue-green-preflight.sh` 把同一流程的检查做成只读闸门：`--data-dir`、`--backup`、`--config`、`--health-json`、`--health-url`、`--new-binary`、`--min-version`、`--strict`、`--json`；它只检查、不修改数据、不停止服务。
 
-**CMK 激活是不归点。** DARE 的 AAD 绑定 `key_id`，只改元数据无法让 pre-CMK 二进制读 CMK 数据；仓库不提供明文/不安全降级。`oss-server cmk rewrap` 只在**同一个 CMK** 内把旧版本重加密到该 CMK 当前版本，不能把目标换成 legacy `file`/`k<n>` key。若已有 CMK 对象或桶默认加密、而必须回到 pre-CMK 二进制：先停写，逐节点跑 `oss-server cmk scan --name <cmk> --json`（`references`、`mpu_references` 与 `bucket_defaults`，含在途 MPU）并 Complete/Abort 所有 MPU、清除桶默认加密，使引用归零；然后要么用 legacy provider 重写对象数据，或迁移到新集群（如 `scripts/single-to-cluster.sh` 的离线重新灌入，只迁当前版本），再 `oss-server cmk delete --name <cmk> --yes`（集群需在全站逐节点核实后加 `--force`）；要么保持新二进制。**绝不能删除 CMK 来「强制」降级**；迁移完成前，回滚只能退回仍能读 CMK 的新二进制。
+**只读排空（Level C）。** 顶层 `read_only = true` 让节点从客户端写路径摘除：写请求返回 503 并带 `x-oss-read-only: 1`；GET/HEAD/OPTIONS、精确匹配的 `POST /api/v1/login`、健康/指标与 Raft RPC 保持可用，`/health/cluster` 暴露 `read_only`。旧二进制没有此开关，混版窗口内必须把旧节点从客户端 LB 移除，不能依赖只读开关约束旧节点。
 
-**跨版本 MPU。** 跨节点 UploadPart 转发支持 v1.16+（wire 1 有界回退）与本版 wire 2 流式；≤v1.15 没有 MPU RPC，无法支持。升级/降级前必须 Complete/Abort/排空所有在途 MPU，并用 `upgrade-preflight.sh --require-no-mpu --health-json` 强制门槛（`data_wire_version >= 2`、`data_plane_compatible: true`）。
+**JWT 密钥轮换。** `jwt_previous_secrets` 接受旧签名密钥数组（每个 ≥32 字节、互不重复且不同于 `jwt_secret`），多密钥验证共享黑名单与过期检查。轮换顺序：把当前密钥加入 `jwt_previous_secrets` → 全部节点重启 → 切换 `jwt_secret` → 全部节点重启 → 12 小时后移除旧密钥。登录限流与审计仍是节点本地，不随轮换复制。
 
-**Raft 日志格式（wave-4）。** 新版本把 ≥1024 B 的日志 entry 压缩为 `z1:`，并把连续 ≥256 条压成 `raft_log_segment`；旧二进制无法读取新格式（fail-closed）。因此新二进制一旦写入新日志格式，就不能回退旧二进制——升级仍按停写蓝绿执行，回滚只在新格式/CMK 写入前成立。
+**升级 e2e。** `tests/e2e_blue_green.sh` 用真实 v1.26.0 → 当前二进制在同一数据目录切换并验证冷备回滚（22/22 PASS）；`tests/e2e_single_to_cluster_real.sh` 用两个回环服务器跑 plan/copy/verify/resume（6/6 PASS）；`scripts/mpu-drain.sh` 自检 43/0。
 
-**访问点端点身份。** `OSS_AP_ENDPOINT_VERIFIER=trusted-proxy` 按可信直连网段 + 声明头断言；`attested-proxy` 进一步要求可信网段内的终止代理用 HS256 JWT 签署 `vpce`/`vpc`/`account`（`x-oss-endpoint-attestation`，默认 60 秒有效），需要 `OSS_AP_ATTESTATION_SECRET`（≥32 字节）与 `OSS_AP_TRUSTED_PEER_CIDRS`。直连客户端无法伪造；验证后仍执行端点注册表 registered/state/VPC/account 检查。真实 AWS PrivateLink API 与 mTLS 证书→端点映射仍未实现（需要证书/端点注册表），不伪造身份。
+**CMK 激活是不归点。** DARE 的 AAD 绑定 `key_id`，只改元数据无法让 pre-CMK 二进制读 CMK 数据；仓库不提供明文/不安全降级。`oss-server cmk rewrap` 默认只在**同一个 CMK** 内把旧版本重加密到该 CMK 当前版本；v1.28.0 起加 `--to-legacy sse-s3|sse-kms --apply` 可把引用该 CMK 的对象**逐版本全量重加密**为 pre-CMK provider（`sse-s3` 的 file key，或 `sse-kms` 默认环当前 `k<n>`），完成后旧 CMK 引用归零，pre-CMK 二进制可读。迁移在扫描/写入前 fail-closed：仍有在途 MPU、桶默认加密指向该 CMK、或目标 provider 未配置都会被拒绝；每个版本独立重加密，单版本失败不影响其他版本；迁移绝不自动删除 CMK。若已有 CMK 对象而必须回到 pre-CMK 二进制：先停写，逐节点跑 `oss-server cmk scan --name <cmk> --json` 核对 `references`/`mpu_references`/`bucket_defaults`，Complete/Abort 所有 MPU 并把桶默认加密切到目标 provider，再执行 `oss-server cmk rewrap --name <cmk> --to-legacy <sse-s3|sse-kms> --apply`；`[cluster]`/`[stretch]` 部署的离线 rewrap 会拒绝（分片放置需在线拓扑），当前不支持在线 legacy 迁移。全部节点引用归零后可 `oss-server cmk delete --name <cmk> --yes`（集群需在全站逐节点核实后加 `--force`），或迁移到新集群（如 `scripts/single-to-cluster.sh` 的离线重新灌入，只迁当前版本）。**绝不能删除 CMK 来「强制」降级**；meta-only 降级仍不可能，迁移完成前回滚只能退回仍能读 CMK 的新二进制。
+
+**跨版本 MPU。** 跨节点 UploadPart 转发支持 v1.16+（wire 1 有界回退）与本版 wire 2 流式；≤v1.15 没有 MPU RPC，无法支持。升级/降级前必须 Complete/Abort/排空所有在途 MPU，并用 `upgrade-preflight.sh --require-no-mpu --health-json` 强制门槛（`data_wire_version >= 2`、`data_plane_compatible: true`）。v1.28.0 提供 `scripts/mpu-drain.sh` 列出/中止在途 MPU（只处理未完成上传，绝不删除已提交对象）。
+
+**Raft 日志格式（v1.27 引入，v1.28 加固）。** 新版本把 ≥1024 B 的日志 entry 压缩为 `z1:`，并把连续 ≥256 条压成 `raft_log_segment`；`raft_meta.raft_log_format` 记录格式（缺失/`1` = 旧格式，`2` = 压缩/分段；更高或无法解析的值 fail-closed）。v1.27 建库但尚无标记的库，open 时若发现 `z1:` 行或分段即补写 `2`；v1.28 起每次 append 在事务内最多做两段有界压缩（最新连续段 + 一段更旧区间），旧区间不会永久停滞。旧二进制无法读取 `2` 格式日志，因此新二进制一旦写入就不能回退——升级仍按停写蓝绿执行，回滚只在新格式/CMK 写入前成立。
+
+**访问点端点身份。** `OSS_AP_ENDPOINT_VERIFIER` 支持四种验证器：`trusted-proxy` 按可信直连网段 + 声明头；`attested-proxy` 要求可信网段内的终止代理用 HS256 JWT 签署 `vpce`/`vpc`/`account`（`x-oss-endpoint-attestation`，默认 60 秒有效），需要 `OSS_AP_ATTESTATION_SECRET`（≥32 字节）与 `OSS_AP_TRUSTED_PEER_CIDRS`；`mtls` 把 rustls 握手已验证的客户端叶证书 SHA-256 直接映射到端点，配置 `OSS_AP_MTLS_ENDPOINTS=<sha256>=<vpce>[=<vpc>[=<account>]];...`；`aws-api` 用 SigV4 调用 EC2 `DescribeNetworkInterfaces`/`DescribeVpcEndpoints`，按直连源 IP 解析 ENI → VPC endpoint（要求 `State=available` 且唯一命中），结果按源 IP + 60 秒 TTL 缓存，API 错误 fail-closed。`aws-api` 需 `AWS_REGION`（或 `AWS_DEFAULT_REGION`）、`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`（可选 `AWS_SESSION_TOKEN`、`OSS_AP_VPC_ID`、`OSS_AP_AWS_ACCOUNT_ID`），并要求 NLB/网关**保留客户端源 IP**；否则映射失败并拒绝。验证后仍执行端点注册表 registered/state/VPC/account 检查。真实 AWS PrivateLink 端到端验收未在本环境执行（测试仅用本地 mock 覆盖签名、解析、状态与缓存），上线前需在真实 AWS 账号验收。
 
 ---
 

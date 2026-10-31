@@ -9,8 +9,8 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.27.0，包含各阶段的功能迭代、修复与验收记录。">
-    <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,停写蓝绿升级">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.28.0，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,停写蓝绿升级,只读排空,JWT 轮换">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.27.0 分布式存储版；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.28.0 升级安全版；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.27.0 分布式存储版；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.28.0 升级安全版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.27.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.28.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.27.0 的分布式存储版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.28.0 的升级安全版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-28-0">v1.28.0</a>
           <a href="#v1-27-0">v1.27.0</a>
           <a href="#v1-26-0">v1.26.0</a>
           <a href="#v1-25-0">v1.25.0</a>
@@ -105,10 +106,27 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.27.0</strong>（2026-10-31）。</p>
+          <p>当前最新发布：<strong>v1.28.0</strong>（2026-11-01）。</p>
 
           <div class="changelog-list">
-            <details class="changelog-entry" id="v1-27-0" open>
+            <details class="changelog-entry" id="v1-28-0" open>
+              <summary><strong>v1.28.0</strong><time datetime="2026-11-01">2026-11-01</time><span>升级安全版</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>Raft 日志加固</strong>：<code>raft_meta.raft_log_format</code> 标记（缺失/1 旧格式，2 压缩/分段；未知值 fail-closed）；v1.27 无标记库在 open 时按 <code>z1:</code>/分段补写 2；append 事务内最多两段有界压缩（最新连续段 + 一段更旧区间）；20k entry soak。</li>
+                  <li><strong>M8 Restore fencing</strong>：follower 发起的 <code>TierRestoreDelete</code> 在 <code>UNFENCED</code> 时改用 applied 行自身 <code>fence_term</code>，不再 term-0 盲删；新增 3-voter 故障切换演练。</li>
+                  <li><strong>AP 端点身份</strong>：新增直连 <code>mtls</code>（<code>OSS_AP_MTLS_ENDPOINTS=&lt;sha256&gt;=&lt;vpce&gt;[=&lt;vpc&gt;[=&lt;account&gt;]];...</code>，指纹取自 rustls 握手）与 <code>aws-api</code>（SigV4 调 EC2 <code>DescribeNetworkInterfaces</code>/<code>DescribeVpcEndpoints</code>，源 IP→ENI→endpoint，60s TTL 缓存，fail-closed，要求客户端源 IP 保留）。真实 AWS 端到端验收未执行。</li>
+                  <li><strong>CMK→legacy 迁移</strong>：<code>oss-server cmk rewrap --name &lt;cmk&gt; --to-legacy sse-s3|sse-kms --apply</code> 逐版本全量重加密回 pre-CMK provider；在途 MPU/桶默认/缺目标 provider 拒绝；不删 CMK；meta-only 降级仍不可能。离线 CLI 仅 standalone，<code>[cluster]</code>/<code>[stretch]</code> 拒绝。</li>
+                  <li><strong>Level C 只读排空</strong>：顶层 <code>read_only = true</code>，写请求 503 + <code>x-oss-read-only: 1</code>；GET/HEAD/OPTIONS、精确 <code>/api/v1/login</code>、健康/指标与 Raft RPC 可用；<code>/health/cluster</code> 暴露 <code>read_only</code>。旧二进制无开关，混版须从 LB 移除。</li>
+                  <li><strong>JWT 轮换</strong>：<code>jwt_previous_secrets</code> 多密钥验证（≥32 B、去重、异于 <code>jwt_secret</code>），共享黑名单/过期；轮换顺序 add→重启→switch→重启→12h 移除。登录限流与审计仍节点本地。</li>
+                  <li><strong>升级与运维</strong>：真实 v1.26.0→当前二进制蓝绿切换/冷备回滚 e2e 22/22；<code>scripts/mpu-drain.sh</code> 列出/中止在途 MPU（不删对象）自检 43/0；双回环单机→集群 plan/copy/verify/resume e2e 6/6；升级预检 109/0、蓝绿预检 78/0。混合 v1.16 MPU e2e 已编写但未执行。</li>
+                  <li><strong>验证</strong>：raft::store 26/0、xl-s3 ap 37/0、m8_ap_trust 22/0、ap_aws 4/0、xl-store cmk 23/0、CLI 18/0、read_only 2/0、config 1/0（只读）/2/0（JWT）、jwt_rotation 4/0、lib restore 3/0、raft_restore_failover 1/0、restore/lease 3/0。</li>
+                  <li><strong>仍未交付</strong>：集群在线 CMK→legacy 迁移、真实 AWS PrivateLink 验收、跨节点精确硬配额聚合（仍 30s/60s 有界陈旧）、集群级登录限流/审计复制、混合 v1.16 MPU e2e 执行、任意双向混写；Raft 日志格式仍无 feature-level 门控。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.28.0" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+            <details class="changelog-entry" id="v1-27-0">
               <summary><strong>v1.27.0</strong><time datetime="2026-10-31">2026-10-31</time><span>分布式存储版</span></summary>
               <div class="entry-body">
                 <ul>
@@ -466,7 +484,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.27.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.28.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
