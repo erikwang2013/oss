@@ -274,13 +274,13 @@ oss-server cluster-shrink rollback --plan plan.json --yes # commit 前回滚</co
               <tbody>
                 <tr><td>AP 匿名 / SourceVpc</td><td>已支持（策略 <code>Principal:"*"</code> ∩ 桶策略；SourceVpc 为来源证明）</td></tr>
                 <tr><td>AP 跨账户 / SourceVpce</td><td>已支持账户根 principal、<code>aws:SourceVpce</code> 来源证明与静态端点 registry（注册断言，端点为 active 且归属账户匹配）；HTTP 信任链 E2E 已覆盖（重复/畸形头、非可信 peer、缺 ConnectInfo fail-closed）；v1.28 新增直连 <code>mtls</code> 证书指纹映射与 <code>aws-api</code> PrivateLink ENI→endpoint 解析（mock 验证），真实 AWS 账号端到端验收仍未执行</td></tr>
-                <tr><td>多租户账户 MVP</td><td>已支持（账户/成员/状态/桶数配额（Raft leader append 前/standalone 写锁内原子）；账户写已走 Raft；软字节配额仅告警；管理员 UI 已交付；硬字节/对象数配额已交付，跨节点为 30s/60s 有界陈旧）</td></tr>
+                <tr><td>多租户账户 MVP</td><td>已支持（账户/成员/状态/桶数配额（Raft leader append 前/standalone 写锁内原子）；账户写已走 Raft；软字节配额仅告警；管理员 UI 已交付；硬字节/对象数配额已交付，默认跨节点为 30s/60s 有界陈旧；feature 9 提供 opt-in 严格账本，Raft 需全 peer level 9）</td></tr>
                 <tr><td>M7 未映射 REPLICA 对账</td><td>已支持（管理员列出/点名删除；默认 dry-run，绝不按内容匹配）</td></tr>
                 <tr><td>DP-1 数据面混版</td><td>已支持门控（NodeHealth wire/epoch/hash；V1 列表 <code>list-marker</code>、LMU <code>mpu-union</code> 降级；ListObjectVersions/MPU 转发 fail-closed）；DP-2 mesh 入站 TLS 热轮换已交付；滚动 e2e 已在同版本与 v1.13.1 旧二进制上通过</td></tr>
                 <tr><td>M3 缩容（shrink）</td><td><code>plan/apply/verify/commit/rollback</code> 已交付（离线、全节点 maintenance、显式 slot 目标；commit 写 topology v4 作回退防线）；4→3 真进程 loopback e2e 已交付；单机→集群仍为重新灌入</td></tr>
-                <tr><td>Level C / OSSCTL3</td><td>feature level 1..8；OSSCTL3 扩展区；生产 Ext 命令 registry 仍为空；v1.20.1 ↔ v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不支持；v1.28 新增顶层 <code>read_only</code> 只读排空（旧节点仍需从 LB 摘除）；生产 Ext 命令与完整双向混写未交付</td></tr>
+                <tr><td>Level C / OSSCTL3</td><td>feature level 1..9；OSSCTL3 扩展区；feature 9 账本 <code>account_usage_ledger</code> 随 OSSCTL3 快照，level &lt;9 快照不会清空已有账本；生产 Ext 命令 registry 仍为空；v1.20.1 ↔ v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不支持；v1.28 新增顶层 <code>read_only</code> 只读排空（旧节点仍需从 LB 摘除）；生产 Ext 命令与完整双向混写未交付</td></tr>
                 <tr><td>Raft 租户账户</td><td>账户/成员写路径已改走 Raft 命令（8 个 level-3 <code>ControlCommand</code>，按 username 自然键；OSSCTL3 快照含账户行）；canonicalization worker 已交付（standalone 单事务 + marker，Raft leader 复用既有命令）</td></tr>
-                <tr><td>账户配额</td><td>软字节配额：<code>GET /accounts/{id}/usage</code> + <code>PUT /accounts/{id}/soft-quota</code>（只告警）；硬字节/对象数：写入预留、删除释放、30s 惰性/60s 采样聚合，对端不可达按已知下界拒绝（未知增量 fail-open）；<code>PUT /accounts/{id}/hard-quota</code> 在 standalone 与 Raft（feature level 8）均生效；跨节点精确聚合未交付；版本定向删除靠采样器收敛</td></tr>
+                <tr><td>账户配额</td><td>软字节配额：<code>GET /accounts/{id}/usage</code> + <code>PUT /accounts/{id}/soft-quota</code>（只告警）；硬字节/对象数默认：写入前本地预留、删除释放、30s 惰性/60s 采样聚合，对端不可达按已知下界拒绝（未知增量 fail-open）；<code>PUT /accounts/{id}/hard-quota</code> 在 standalone 与 Raft（feature level 8）均生效。opt-in 严格模式（feature 9）：<code>[quota].strict=true</code> 或 <code>OSS_ACCOUNT_QUOTA_STRICT=1</code>，Raft 需 <code>[raft].feature_level=9</code> 且全 peer 生效 9；Put/Complete/Copy 经 Raft 账本预留，删除/失败释放或校准，账本随 OSSCTL3 快照。严格模式保守：首次触达播种最旧 60s、未知长度写后校准可短暂超额、版本定向/SSE-C 删除不释放、预留后崩溃留账、命令非幂等且结果不明不重试；会多记/阻塞至人工对账</td></tr>
                 <tr><td>M8 多节点运行时</td><td>jobs/job_tasks 与 Restore 受理行（feature 4）、inventory 三表与 lifecycle 游标（feature 5）、终态作业保留 <code>JobPurge</code>（feature 6）、tier restore 后续状态与调度租约 acquire/renew/takeover（feature 7）均已复制；全 peer 达标才启用（旧节点单向门）；v1.28 follower Restore 清理改用 applied 行自身 <code>fence_term</code>，并新增 3-voter failover 演练；完整滚动故障切换演练仍缺</td></tr>
                 <tr><td>全对象 GET 内存</td><td>无 Range GET 流式直出（EC 64 KiB 块、加密按 unit 解密），远端分片按 <code>OSS_SHARD_READ_BATCH_BYTES</code>（默认 1 MiB）批量读；Range/partNumber 仍有界缓冲；EC 数据片缺失时的整读重建受 <code>OSS_MAX_BUFFERED_GET_BYTES</code>（默认 512 MiB）限制</td></tr>
                 <tr><td>大桶列举</td><td>每节点键缓存（<code>OSS_KEY_CACHE_MAX_KEYS</code>/<code>OSS_KEY_CACHE_MAX_TOTAL_KEYS</code> 默认各 200 万、TTL 300 秒）与在途 MPU 索引（<code>OSS_MPU_INDEX_TTL_SECS</code> 默认 300）；超限或加载失败回退逐页扫描；单次列举仍受 <code>OSS_LIST_MAX_KEYS</code> 约束，大桶建议使用 prefix</td></tr>
@@ -298,7 +298,7 @@ oss-server cluster-shrink rollback --plan plan.json --yes # commit 前回滚</co
               </tbody>
             </table>
           </div>
-          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；MPU 存量裸 UUID 仍粘原节点；tier 直读默认关闭且仅支持 Range；未映射 legacy 副本需管理员对账；AP 转发头只在 TLS 监听器 + 可信对端 CIDRS 下采信；AP <code>mtls</code>/<code>aws-api</code> 仅 mock 验收，真实 AWS PrivateLink 未做；JWT 登录限流与审计仍节点本地；CMK→legacy 在线/集群迁移未做；DP-1 混版窗口的 ListObjects V1/LMU 可能重复或缺项（降级头标记），ListObjectVersions 与 MPU 转发对旧对端 fail-closed。完整清单见 README 与版本日志。</p>
+          <p>已知限制：复制/tier 摄入已透传 <code>part_sizes</code>；签名内的多区间 Range 返回确定性 400 <code>InvalidArgument</code>；MPU 存量裸 UUID 仍粘原节点；tier 直读默认关闭且仅支持 Range；未映射 legacy 副本需管理员对账；AP 转发头只在 TLS 监听器 + 可信对端 CIDRS 下采信；AP <code>mtls</code>/<code>aws-api</code> 仅 mock 验收，真实 AWS PrivateLink 未做；JWT 登录限流与审计仍节点本地；CMK→legacy 在线/集群迁移未做；严格硬配额（feature 9）为 opt-in 且需全 peer level 9，账本会多记/阻塞至人工对账；DP-1 混版窗口的 ListObjects V1/LMU 可能重复或缺项（降级头标记），ListObjectVersions 与 MPU 转发对旧对端 fail-closed。完整清单见 README 与版本日志。</p>
 
           <h2 id="more">继续阅读</h2>
           <ul>

@@ -83,7 +83,7 @@
 > 任意双向混写、≤v1.15 MPU、真实 PrivateLink/mTLS、日志格式的 feature 门控（当前按
 > 停写蓝绿约束）。
 >
-> **2026-11-01 更新（v1.28.0 wave-5，升级/身份/存储加固）**：Raft 日志新增
+> **2026-11-01 更新（v1.28.0 wave-5，升级/身份/存储/配额加固）**：Raft 日志新增
 > `raft_meta.raft_log_format` 标记（缺失/`1`=旧格式、`2`=压缩/分段；更高/不可解析
 > fail-closed；v1.27 无标记库在 open 时按 `z1:`/分段补写 2），append 事务内最多两段
 > 有界压缩（最新连续段 + 一段更旧区间），20k entry soak 通过。M8 follower 发起的
@@ -97,9 +97,14 @@
 > 旧二进制无开关，混版须从 LB 移除）。JWT 新增 `jwt_previous_secrets` 多密钥轮换
 > （≥32 B/去重/异于 `jwt_secret`；登录限流与审计仍节点本地）。运维新增真实 v1.26.0→当前
 > 蓝绿 e2e（22/22 PASS）、`mpu-drain.sh`（自检 43/0）、单机→集群双回环 e2e（6/6 PASS）；
-> 混合 v1.16 MPU e2e 已编写但未执行。仍缺：集群在线 CMK→legacy 迁移、真实 AWS PrivateLink
-> 验收、跨节点精确配额聚合、集群级登录限流/审计、任意双向混写、≤v1.15 MPU、
-> 混合 v1.16 MPU e2e 执行、Raft 日志格式 feature 门控。
+> 混合 v1.16 MPU e2e 已编写但未执行。feature 9 交付 opt-in 严格硬配额：
+> `AccountUsageReserve/Release/Adjust` 复制账户用量账本（`account_usage_ledger`，OSSCTL3
+> 快照携带），`[quota].strict=true` 后 Put/Complete/Copy 预留、删除/失败释放或校准；默认
+> 仍是有界陈旧本地缓存。严格模式为保守口径：首次触达按 leader 本地缓存播种（最旧 60s）、
+> 未知长度 Put 写后校准可短暂超额、版本定向/SSE-C 删除不释放、预留后崩溃留账、命令非幂等
+> 且结果不明 fail-closed 不重试；会多记/阻塞，需人工对账。仍缺：集群在线 CMK→legacy
+> 迁移、真实 AWS PrivateLink 验收、严格配额账本的自动对账/收敛、集群级登录限流/审计、
+> 任意双向混写、≤v1.15 MPU、混合 v1.16 MPU e2e 执行、Raft 日志格式 feature 门控。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
@@ -113,7 +118,7 @@
 |---|---|---|---|---|---|
 | 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.20.1↔v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不再支持；Ext 类型协商（`x-oss-raft-ext-types`、leader append 门、成员 preflight）与在途 MPU CMK 引用已交付；v1.28 新增 `read_only` 只读排空（旧节点仍须 LB 摘除）与离线 `cmk rewrap --to-legacy`（仅 standalone）。生产 `REGISTERED_EXT_TYPES` 仍为空，完整双向混写与数据面滚动仍缺 | 6–10 人周 | 生产 Ext 类型、集群在线 CMK 迁移、数据面滚动 | 高 |
 | 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；跨版本 MPU 支持 v1.16+（wire-1 有界回退 / wire-2 流式），≤v1.15 无 MPU RPC 不支持；全操作混版写窗口仍缺；混合 v1.16 MPU e2e 已编写但未执行 | 4–8 人周 | 混版写语义、停写蓝绿 runbook | 高 |
-| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软/硬字节与对象数配额 + 管理员 UI + canonicalization worker 已交付；硬配额跨节点为 30s/60s 有界陈旧；Raft 配置命令与动态 VPC 端点命令已在 feature 8 交付 | 1–2 人周（精确聚合） | 跨节点精确用量 | 中高 |
+| 3 | 完整多租户账户体系 | AC-0..AC-3 + 软/硬字节与对象数配额 + 管理员 UI + canonicalization worker 已交付；默认硬配额仍为本地 30s/60s 有界陈旧；Raft 配置命令与动态 VPC 端点命令已在 feature 8 交付；feature 9 交付 opt-in 复制用量账本（`[quota].strict=true`、全 peer level 9、OSSCTL3 快照），Put/Complete/Copy 预留、删除/失败释放或校准。严格模式保守：首次触达播种最旧 60s、未知长度写后校准可短暂超额、版本定向/SSE-C 删除不释放、预留后崩溃留账、命令非幂等不重试；会多记/阻塞至人工对账 | 1–2 人周（自动对账/收敛） | 账本自动对账、精确存量迁移 | 中高 |
 | 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；feature 4/5/6/7 分别交付 jobs/Restore 受理、inventory/lifecycle 游标、JobPurge、tier restore 后续状态与调度租约；快照 >256 KiB 已分块（旧整行透明读）；日志 ≥1024 B 压缩、连续 ≥256 条分段；v1.28 增加 `raft_log_format` 标记/旧区间两段有界压缩、follower restore 按 applied 行 `fence_term` 收口与 3-voter failover drill；完整滚动故障切换演练仍缺 | 0.5–1 人周 | 既有 feature 7 命令 + 快照存储 | 中 |
 | 5 | M3 shrink / 单机→集群 | shrink 4→3 已交付：topology v4 + 离线 plan/apply/verify/commit/rollback + loopback e2e（验收 §15.2）；单机→集群仍为离线重新灌入（`scripts/single-to-cluster.sh` plan/resume/verify，只迁当前版本，不是拓扑转换）；v1.28 补双回环 plan/copy/verify/resume e2e（6/6 PASS），原地转换不工具化 | 不排期 | 停机全量重新灌入 | 极高（若做原地转换） |
 
@@ -398,6 +403,13 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
   standalone 在 `BEGIN IMMEDIATE` 写锁内原子判定（并发建桶不会越过配额）；
   软字节配额为只读用量端点 `GET /accounts/{id}/usage` + `PUT /accounts/{id}/soft-quota`
   （`accounts_api.rs:35-37`、`accounts_usage.rs:98-118`，仅告警不阻写）。
+- **feature 9 严格硬配额（2026-11-01 wave-5）**：`AccountUsageReserve/Release/Adjust`
+  三个 level-9 命令在 `raft/apply/quota.rs` 原子增删 `account_usage_ledger`，判定只依赖
+  命令值与同一事务 SQL；`[quota].strict=true`（或 `OSS_ACCOUNT_QUOTA_STRICT=1`）经
+  `router.rs` 注入 xl-s3 `ClusterQuota`，Put/Complete/Copy 写前预留，删除/失败释放或校准。
+  Raft 模式要求全 peer 生效 level 9（`[raft].feature_level=9` + 配置校验）；OSSCTL3 快照
+  携带账本，level <9 快照装到已有账本行的库会拒绝。默认仍走本地 `account_usage` 缓存，
+  严格模式是 opt-in。
 - 策略 principal：账户根 ARN 按**成员关系**命中全部成员，无成员行回落 uid 派生账户
   （`access.rs:87-110`）；AP 的 `account` = 桶账户，跨账户只经 AP 策略 Principal
   （`xl-s3/src/ap.rs:8,338-384`）；`aws:SourceVpce` 是显式部署证明，不是 PrivateLink
@@ -419,9 +431,13 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
   NLB/网关保留客户端源 IP，可选 `OSS_AP_VPC_ID`/`OSS_AP_AWS_ACCOUNT_ID` 交叉校验。
   **真实 AWS PrivateLink 端到端验收仍未执行**：测试只用本地 mock 覆盖签名请求形状、
   响应解析、状态判定与缓存，部署前必须在真实 AWS 账号验收；registry 检查不放宽。
-- **仍缺**：跨节点实时用量聚合（硬字节/对象数配额已交付，30s/60s 有界陈旧；Raft
-  配置命令见 feature 8）。账户规范化 worker 已交付：standalone 单事务 + marker，Raft
-  leader 复用 level-3 `AccountCreate`/`AccountMemberAttach` 补 legacy 行
+- **仍缺**：严格账本的自动对账/收敛与存量精确迁移；默认本地缓存仍是 30s/60s 有界
+  陈旧（feature 9 不改默认）。严格模式的已知边界：首次触达按 leader 本地缓存播种
+  （最旧 60s）；未知长度 Put 先预留 0 字节、写后校准，并发可短暂超额；版本定向与
+  SSE-C 删除不即时释放；预留后、数据写前崩溃留下已计预留；命令非幂等，append 结果
+  不明时 fail-closed 不重试。因此会多记/阻塞，直到人工对账。账户规范化 worker 已交付：
+  standalone 单事务 + marker，Raft leader 复用 level-3 `AccountCreate`/`AccountMemberAttach`
+  补 legacy 行
   （`accounts_canonical.rs`；marker 语义不变）。
 - **已交付**：管理员账户控制台页面（`web/src/pages/Accounts.tsx` + `AccountModals.tsx`；
   列表/创建/改名/启停/删除、成员、桶配额、软字节配额、usage）。
@@ -430,7 +446,8 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
 
 1. 账户无生命周期（创建/停用/删除）、无成员关系，无法表达「一个账户多个用户」。
 2. ARN 已对外暴露且由 uid 派生，**迁移必须保持现有 ARN 不变**，否则存量策略/客户端全断。
-3. 配额需要跨节点用量，当前没有聚合；硬字节配额不能靠各节点本地计数。
+3. 配额需要跨节点用量，默认本地计数有界陈旧；feature 9 的复制账本已提供 opt-in 的
+   跨节点统一判定，剩余是自动对账与存量精确迁移。
 4. 跨账户授权需要账户成员集合与桶策略/身份策略的交集语义；现在 ARN 只能匹配单个 uid。
 5. VPC 端点身份需要端点注册表与可信证明链，不能信任客户端头。
 
@@ -446,10 +463,13 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
   `who()` 路径拒绝（`console.rs:28-86` 的载荷校验处加账户状态）。删除账户要求无桶、无成员。
 - **AC-2 配额（1–2 人周）**：**硬配额先做桶数量**（从复制的 `buckets` 表计数，创建桶时
   fail-closed）；对象数/字节数先做**软配额**（控制台告警 + 响应头），硬字节配额需要
-  跨节点用量聚合，列为后续。**已交付（v1.26 执行路径 + v1.27 feature 8 配置命令）**：
-  硬字节/对象数配额执行路径、30s/60s 有界用量，以及 `PUT /accounts/{id}/hard-quota`
-  的 Raft 复制命令；剩余是跨节点精确用量聚合。账户级限速可复用现有 limiter，
-  但需共享状态，暂不做。
+  跨节点用量聚合，列为后续。**已交付（v1.26 执行路径 + v1.27 feature 8 配置命令 +
+  v1.28 feature 9 严格模式）**：硬字节/对象数配额执行路径、30s/60s 有界本地用量、
+  `PUT /accounts/{id}/hard-quota` 的 Raft 复制命令，以及 opt-in 复制账本
+  （`[quota].strict=true`，全 peer level 9；Put/Complete/Copy 预留、删除/失败释放或
+  校准）。默认仍为本地有界陈旧；严格模式会多记/阻塞至人工对账（首次触达播种最旧
+  60s、未知长度写后校准可短暂超额、版本定向/SSE-C 删除不释放、预留后崩溃留账、命令
+  非幂等不重试）。账户级限速可复用现有 limiter，但需共享状态，暂不做。
 - **AC-3 共享与跨账户策略（1–2 人周）**：桶策略 principal 的账户 ARN 解析为
   「该账户任一成员」；跨账户访问按 S3 语义允许桶策略直接授权（AP 仍做交集限制）。
   增加 `aws:PrincipalAccount` 条件；审计记录 `principal_account`。默认拒绝不变。
@@ -468,7 +488,9 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
 
 - 不做完整 IAM（users/groups/roles/policy 版本、AssumeRole、`AssumeRoleWithWebIdentity`）。
 - 不做账户层级/组织（Organizations）、账单、跨账户复制、每账户独立 KMS。
-- 不做跨节点实时用量聚合（硬字节/对象数配额已按 30s/60s 采样交付）。
+- 默认不做跨节点实时用量聚合：本地 30s/60s 有界采样仍是默认行为。feature 9 提供
+  opt-in 的复制账本（`[quota].strict=true`），但它不是实时聚合，且自动对账/存量精确
+  迁移仍不做。
 - 不做 AP 的桶级 Create/Delete（仍由桶 API 负责）。
 
 ### 3.5 接口
@@ -477,7 +499,10 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
   `account_arn_matches` 改为账户成员匹配（保留 uid 单用户兼容路径）。
 - 控制面：`ControlCommand::{AccountCreate, AccountUpdate, AccountDelete, AccountMemberSet,
   AccountQuotaSet}`（随 OSSCTL2/level 3 或先在 local 模式落地）；`ControlData` 增 accounts/
-  account_members 两表。
+  account_members 两表与 feature 9 的 `account_usage_ledger`。
+- feature 9：`ControlCommand::{AccountUsageReserve, AccountUsageRelease, AccountUsageAdjust}`
+  （min level 9）承载账本增量；`[quota].strict`/`OSS_ACCOUNT_QUOTA_STRICT` 经
+  `xl-s3::account_quota::ClusterQuota` 接入 Put/Complete/Copy 与删除/失败路径。
 - 策略条件：`aws:PrincipalAccount`、`aws:SourceVpce`；AP 结构体加账户字段。
 - 控制台 API：`/accounts`、`/accounts/{id}/members`、`/accounts/{id}/quota`。
 
@@ -494,6 +519,9 @@ legacy provider（不是只换信封，且仍非 meta-only），但仅离线/sta
 - 迁移：从 v1.15 实际 DB（含管理员桶、`owner_id=NULL`）backfill 后 ARN 黄金样本不变。
 - 授权：同账户成员、跨账户桶策略、AP 交集、`aws:PrincipalAccount`、VPC 证明缺失。
 - 配额：桶数上限并发创建只成功 N 个；软配额响应头。
+- 严格配额（feature 9）：账本边界（恰好上限放行、并发只一个成功、释放/校准饱和到 0）；
+  3-voter 复制与快照重开；feature 8 集群在 append 前拒绝；level <9 快照不清空本机账本。
+  测试：`quota` 2/0、`accounts --test` quota 7/0、`raft_quota_ledger` 4/0。
 - 生命周期：停用后旧 JWT/新登录/SigV4、删除有桶账户被拒。
 - 粗估 5–8 人周，风险中高（ARN 兼容与跨账户语义是主要风险）。
 
