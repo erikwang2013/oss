@@ -650,8 +650,9 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
   （`crates/xl-store/src/store.rs:424-460`；`topo_record`/`parse_topo_record` 在 `store.rs:1687-1702`）。
 - rebalance 只支持**尾部追加**：只搬「链尾向前第一个非 marker 数据版本」，历史版本留老槽，
   inline/旧分片/未完成 MPU 排除，一次一个，幂等（`crates/xl-store/src/store/rebalance.rs:5,18,33,68`）。
-- README 明确：M3 不支持单机原地升级为多节点，数据要重新灌入（`README.md:454`）；
-  扩容只允许尾部加节点 + 全节点 `placement="v2"` + rebalance（`README.md:491-520`）。
+- 单机→集群不做原地转换：走 `scripts/single-to-cluster.sh` 离线重新灌入，只迁当前版本
+  （`README.md`「升级与回滚」）；扩容只允许尾部加节点 + 全节点 `placement="v2"` + rebalance
+  （`docs/superpowers/specs/2026-10-10-minio-clone-design.md`「M4 落地状态」：rebalance 追加式扩容）。
   **shrink 4→3 已按 §5.3 交付**（v1.20.0，commit 前可回滚）；单机→集群仍为离线重新灌入，
   不做原地转换（`scripts/single-to-cluster.sh`）。
 - MPU 粘节点（§11.3）：shrink 前必须完成或中止所有 MPU。
