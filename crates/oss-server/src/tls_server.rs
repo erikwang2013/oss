@@ -11,8 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::serve::ListenerExt as _;
+use axum::extract::connect_info::Connected;
+use axum::serve::IncomingStream;
 use ecat_transport::Server as TransportServer;
+use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
@@ -70,11 +72,11 @@ impl TransportServer for ReloadableHttpServer {
             let _ = rx.changed().await;
         };
         let tls_listener = TlsListener::new(listener, Arc::clone(&self.tls));
-        // ConnectInfo 注入直连对端地址：AP 转发头信任必须以实际 TCP 对端为准
-        // （tap_io 只为让 axum 的 Connected 实现把对端地址带进请求扩展）。
+        // ConnectInfo 注入直连对端与已验证的客户端叶证书：AP 端点身份必须以实际
+        // TCP 对端/握手结果为准，不能来自请求头。
         axum::serve(
-            tls_listener.tap_io(|_| {}),
-            router.into_make_service_with_connect_info::<SocketAddr>(),
+            tls_listener,
+            router.into_make_service_with_connect_info::<ApConnInfo>(),
         )
         .with_graceful_shutdown(shutdown_signal)
         .await?;
@@ -95,6 +97,37 @@ impl TransportServer for ReloadableHttpServer {
 }
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
+
+/// 每连接注入 axum 的 `ConnectInfo`：直连对端 + 握手期已验证的客户端叶证书 SHA-256。
+/// 无客户端证书（未启用 mTLS 或客户端未出示）→ `None`；明文监听器不使用本类型。
+#[derive(Clone, Debug)]
+pub struct ApConnInfo {
+    pub addr: SocketAddr,
+    pub client_cert_sha256: Option<[u8; 32]>,
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for ApConnInfo {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        // rustls 只在握手成功后交出 TlsStream；peer_certificates 是已按 client_ca
+        // 验证过的链（叶证书在首位），客户端无法在请求里伪造。
+        let client_cert_sha256 = stream
+            .io()
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| {
+                let digest = Sha256::digest(cert.as_ref());
+                let mut fingerprint = [0u8; 32];
+                fingerprint.copy_from_slice(digest.as_ref());
+                fingerprint
+            });
+        Self {
+            addr: *stream.remote_addr(),
+            client_cert_sha256,
+        }
+    }
+}
 
 /// axum::serve::Listener：TCP 由后台 accept 循环接收，握手在各连接自己的任务中
 /// 异步完成（与 ecat 相同的 DoS 防护）；accept() 只从通道取已握手连接。

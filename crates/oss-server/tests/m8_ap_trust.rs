@@ -14,13 +14,18 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use common::tls::{TestCa, free_port, wait_tcp, write_pem};
 use oss_server::router::{ApTrustConfig, build_router_with_trust};
 use oss_server::state::AppState;
+use oss_server::tls::Tls;
+use oss_server::tls_config::{TlsServerToml, TlsToml};
+use oss_server::tls_server::ReloadableHttpServer;
 use reqwest::Client;
+use sha2::Digest as _;
 use xl_s3::ap::{
     AccessPoint, ApEndpoint, ApEndpointContext, ApEndpointIdentity, ApEndpointSource,
     ApEndpointVerifyError, AttestedProxyEndpointVerifier, EndpointIdentityVerifier,
-    TrustedProxyEndpointVerifier,
+    MtlsEndpointVerifier, TrustedProxyEndpointVerifier,
 };
 
 const VPCE: &str = "vpce-0trust001";
@@ -121,8 +126,8 @@ fn ap_policy() -> String {
     .to_string()
 }
 
-/// 起真实 listener（`connect_info=false` 模拟传输层不提供 `ConnectInfo`）。
-async fn env(dir: &Path, cfg: ApTrustConfig, registry: Arc<Registry>, connect_info: bool) -> Env {
+/// 播种账户/桶/AP；AP 策略由用例决定（mTLS 身份自带 VPCE，不需要可信反代头）。
+async fn seed(dir: &Path, registry: Arc<Registry>, policy: &str) -> (AppState, String) {
     let st = common::state_with_endpoint_source(dir, registry).await;
     let uid = st.db.create_user("owner", "pw", false).await.unwrap();
     st.store.create_bucket(BUCKET).await.unwrap();
@@ -138,9 +143,8 @@ async fn env(dir: &Path, cfg: ApTrustConfig, registry: Arc<Registry>, connect_in
         .set_bucket_policy(BUCKET, &bucket_policy(), 0)
         .await
         .unwrap();
-    let policy = ap_policy();
     st.db
-        .create_access_point(AP, BUCKET, uid, Some(&policy), 0)
+        .create_access_point(AP, BUCKET, uid, Some(policy), 0)
         .await
         .unwrap();
     st.ap_cache.put(
@@ -148,12 +152,18 @@ async fn env(dir: &Path, cfg: ApTrustConfig, registry: Arc<Registry>, connect_in
             AP.into(),
             BUCKET.into(),
             uid,
-            Some(policy),
+            Some(policy.to_string()),
             &st.ap_region,
             &account,
         )
         .unwrap(),
     );
+    (st, account)
+}
+
+/// 起真实 listener（`connect_info=false` 模拟传输层不提供 `ConnectInfo`）。
+async fn env(dir: &Path, cfg: ApTrustConfig, registry: Arc<Registry>, connect_info: bool) -> Env {
+    let (st, account) = seed(dir, registry, &ap_policy()).await;
     let app = build_router_with_trust(st.clone(), cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -253,6 +263,87 @@ fn attested_verify(peer_cidrs: &str) -> ApTrustConfig {
             .unwrap(),
         )),
         ..trusted(peer_cidrs)
+    }
+}
+
+/// mTLS 身份自带 VPCE，不需要来源头；AP 条件只校验端点。
+fn ap_policy_vpce_only() -> String {
+    serde_json::json!({"Statement":[{
+        "Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*",
+        "Resource":format!("arn:aws:s3:::{BUCKET}/*"),
+        "Condition":{"StringEquals":{"aws:SourceVpce":VPCE}}}]})
+    .to_string()
+}
+
+fn cert_fingerprint(pem: &str) -> [u8; 32] {
+    let der = rustls_pemfile::certs(&mut std::io::Cursor::new(pem.as_bytes()))
+        .next()
+        .unwrap()
+        .unwrap();
+    let digest = sha2::Sha256::digest(der.as_ref());
+    let mut fingerprint = [0u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    fingerprint
+}
+
+fn mtls_cfg(fingerprint: [u8; 32], vpc: &str, account: &str) -> ApTrustConfig {
+    let entry = format!("{}={VPCE}={vpc}={account}", hex::encode(fingerprint));
+    ApTrustConfig {
+        endpoint_verifier: Some(Arc::new(MtlsEndpointVerifier::parse(&entry).unwrap())),
+        ..Default::default()
+    }
+}
+
+fn mtls_client(ca_pem: &str, identity: Option<(&str, &str)>) -> Client {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap());
+    if let Some((cert, key)) = identity {
+        builder = builder
+            .identity(reqwest::Identity::from_pem(format!("{cert}{key}").as_bytes()).unwrap());
+    }
+    builder.build().unwrap()
+}
+
+/// mTLS 监听器：要求并验证客户端证书；验证器配置在账户播种后构造。
+async fn env_tls(
+    dir: &Path,
+    ca: &TestCa,
+    registry: Arc<Registry>,
+    cfg: impl FnOnce(&str) -> ApTrustConfig,
+) -> Env {
+    use ecat_transport::Server as _;
+
+    let (st, account) = seed(dir, registry, &ap_policy_vpce_only()).await;
+    let app = build_router_with_trust(st.clone(), cfg(&account)).unwrap();
+    let (cert, key) = ca.issue(&["127.0.0.1"], false);
+    let cert = write_pem(dir, "server.crt", &cert);
+    let key = write_pem(dir, "server.key", &key);
+    let client_ca = write_pem(dir, "client-ca.crt", &ca.pem);
+    let tls = Tls::load(&TlsToml {
+        server: Some(TlsServerToml {
+            cert,
+            key,
+            client_ca: Some(client_ca),
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    let port = free_port();
+    let server = Arc::new(ReloadableHttpServer::new(
+        format!("127.0.0.1:{port}"),
+        app,
+        tls,
+    ));
+    tokio::spawn(async move {
+        let _ = server.start().await;
+    });
+    wait_tcp(port).await;
+    Env {
+        st,
+        account,
+        base: format!("https://127.0.0.1:{port}"),
+        http: Client::new(),
     }
 }
 
@@ -1008,4 +1099,144 @@ async fn attestation_header_ignored_without_verifier() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "Slice A 路径不得读取断言头");
+}
+
+/// mTLS 叶证书指纹 → 端点身份：无任何来源头即放行，审计证据 mtls。
+#[tokio::test]
+async fn mtls_verified_certificate_authorizes_and_audits() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let (cert, key) = ca.issue(&["oss-test-client"], true);
+    let registry = Arc::new(Registry::default());
+    let e = env_tls(dir.path(), &ca, registry.clone(), |account| {
+        mtls_cfg(cert_fingerprint(&cert), VPC, account)
+    })
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+
+    let http = mtls_client(&ca.pem, Some((&cert, &key)));
+    let r = http
+        .get(format!("{}/ap/{AP}/{KEY}", e.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "已登记客户端证书应放行");
+    assert_eq!(r.text().await.unwrap(), "hello");
+    let detail = e.last_detail().await.unwrap();
+    assert!(
+        detail.contains(&format!("endpoint={VPCE}/account={}", e.account)),
+        "审计须记录端点/账户: {detail}"
+    );
+    assert!(
+        detail.contains("endpoint:evidence=mtls"),
+        "审计须带 mtls 证据: {detail}"
+    );
+}
+
+/// 持有同一 CA 签发但未登记的证书 → 403，审计记录 unknown-certificate。
+#[tokio::test]
+async fn mtls_unknown_certificate_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let (registered, _) = ca.issue(&["registered"], true);
+    let (unknown, unknown_key) = ca.issue(&["unknown"], true);
+    let registry = Arc::new(Registry::default());
+    let e = env_tls(dir.path(), &ca, registry.clone(), |account| {
+        mtls_cfg(cert_fingerprint(&registered), VPC, account)
+    })
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+
+    let http = mtls_client(&ca.pem, Some((&unknown, &unknown_key)));
+    let r = http
+        .get(format!("{}/ap/{AP}/{KEY}", e.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "未登记证书必须拒绝");
+    let detail = e.last_detail().await.unwrap();
+    assert!(
+        detail.contains("endpoint:deny:unknown-certificate"),
+        "{detail}"
+    );
+    assert!(!detail.contains("endpoint:evidence="), "{detail}");
+}
+
+/// mTLS 身份仍走 registry R2–R6：停用/未登记/证据与登记行分裂一律拒绝。
+#[tokio::test]
+async fn mtls_identity_still_runs_registry_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let (cert, key) = ca.issue(&["oss-test-client"], true);
+    let registry = Arc::new(Registry::default());
+    let e = env_tls(dir.path(), &ca, registry.clone(), |account| {
+        mtls_cfg(cert_fingerprint(&cert), VPC, account)
+    })
+    .await;
+    let http = mtls_client(&ca.pem, Some((&cert, &key)));
+    let get = || http.get(format!("{}/ap/{AP}/{KEY}", e.base)).send();
+
+    registry.put(VPCE, VPC, &e.account, "active");
+    assert_eq!(get().await.unwrap().status(), 200, "active + 同账户");
+
+    registry.put(VPCE, VPC, &e.account, "disabled");
+    assert_eq!(get().await.unwrap().status(), 403);
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:disabled")
+    );
+
+    registry.put(VPCE, "vpc-0other001", &e.account, "active");
+    assert_eq!(get().await.unwrap().status(), 403);
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:identity-vpc-mismatch")
+    );
+
+    registry.put(VPCE, VPC, "999999999999", "active");
+    assert_eq!(get().await.unwrap().status(), 403);
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:identity-account-mismatch")
+    );
+
+    registry.clear();
+    assert_eq!(get().await.unwrap().status(), 403);
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:unregistered")
+    );
+}
+
+/// 明文监听器没有握手证书：带端点声明 → 403 no-client-certificate；无声明无身份。
+#[tokio::test]
+async fn mtls_missing_certificate_denies_claimed_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        mtls_cfg([0x11; 32], VPC, "111111111111"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+
+    assert_eq!(e.get_status(&[("x-oss-source-vpce", VPCE)]).await, 403);
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:no-client-certificate")
+    );
+    // 无证书也无声明：验证器不产生身份，AP 策略缺 SourceVpce → 拒绝。
+    assert_eq!(e.get_status(&[]).await, 403);
 }
