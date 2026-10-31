@@ -21,6 +21,10 @@ pub struct AppConfig {
     pub staging_dir: PathBuf,
     pub database_url: String,
     pub jwt_secret: String,
+    /// JWT 轮换期的旧签名密钥：只验签，不签发。每项须 ≥32 字节、互不重复且异于
+    /// `jwt_secret`。轮换流程见 [`crate::state::AppState::jwt_previous`]。
+    #[serde(default)]
+    pub jwt_previous_secrets: Vec<String>,
     /// 单个 S3 PutObject 允许的最大字节数（内存上限）。
     /// ponytail: 存储内核自 M4 切片 2 起分块流式，此值更多是**防护上限**（挡异常客户端
     /// 的超大单请求），不再是内存必要约束；要放宽时按业务调整。
@@ -786,12 +790,35 @@ impl AppConfig {
     }
 
     /// 开发占位 JWT 只允许回环监听；对外监听必须换成随机密钥（不静默替换用户值）。
+    /// 显式配置的当前/轮换密钥一律 ≥32 字节且互不重复。
     pub fn jwt_secret_validate(&self) -> Result<(), String> {
         if self.jwt_secret == DEV_JWT_PLACEHOLDER && !listen_is_loopback(&self.listen) {
             return Err(format!(
                 "jwt_secret 仍是开发占位值，但 listen={} 不是回环地址（127.0.0.0/8 / ::1 / localhost）——拒绝启动；请设置随机 jwt_secret（≥32 字符）或改回回环监听",
                 self.listen
             ));
+        }
+        // 空 jwt_secret 由 resolve_secrets 生成，长度校验留给生成值（64 hex）。
+        if !self.jwt_secret.is_empty() && self.jwt_secret.len() < 32 {
+            return Err(format!(
+                "jwt_secret 少于 32 字节（当前 {}）；jwt-rust 要求 256 位密钥",
+                self.jwt_secret.len()
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (i, secret) in self.jwt_previous_secrets.iter().enumerate() {
+            if secret.len() < 32 {
+                return Err(format!(
+                    "jwt_previous_secrets[{i}] 少于 32 字节（当前 {}）；jwt-rust 要求 256 位密钥",
+                    secret.len()
+                ));
+            }
+            if !self.jwt_secret.is_empty() && secret == &self.jwt_secret {
+                return Err(format!("jwt_previous_secrets[{i}] 与 jwt_secret 重复"));
+            }
+            if !seen.insert(secret.as_str()) {
+                return Err(format!("jwt_previous_secrets[{i}] 与前面的项重复"));
+            }
         }
         Ok(())
     }
@@ -1337,6 +1364,7 @@ mod tests {
             staging_dir: "s".into(),
             database_url: "sqlite::memory:".into(),
             jwt_secret: String::new(),
+            jwt_previous_secrets: vec![],
             max_put_bytes: 1024,
             groups: vec![],
             kafka: KafkaToml::default(),
@@ -1630,6 +1658,53 @@ mod tests {
                 "非占位值应放行: {secret:?}"
             );
         }
+    }
+
+    /// 轮换密钥：每项 ≥32 字节、互不重复、异于当前密钥；空列表保持原行为。
+    #[test]
+    fn jwt_previous_secrets_are_validated() {
+        let mut c = base_cfg();
+        c.jwt_secret = "k".repeat(32);
+        assert!(c.jwt_secret_validate().is_ok(), "缺省空列表");
+
+        c.jwt_previous_secrets = vec!["p".repeat(31)];
+        assert!(c.jwt_secret_validate().is_err(), "短于 32 字节");
+
+        c.jwt_previous_secrets = vec!["p".repeat(32)];
+        assert!(c.jwt_secret_validate().is_ok());
+
+        c.jwt_previous_secrets = vec!["p".repeat(32), "p".repeat(32)];
+        assert!(c.jwt_secret_validate().is_err(), "重复项");
+
+        c.jwt_previous_secrets = vec!["k".repeat(32)];
+        assert!(
+            c.jwt_secret_validate().is_err(),
+            "旧密钥不得等于当前签名密钥"
+        );
+
+        c.jwt_secret = "short".into();
+        assert!(c.jwt_secret_validate().is_err(), "当前密钥同样要 ≥32 字节");
+    }
+
+    /// TOML 数组形态；未配置时缺省为空（旧配置零改动）。
+    #[test]
+    fn jwt_previous_secrets_toml_parses() {
+        let base = "listen = \"127.0.0.1:0\"\n\
+                    data_dir = \"d\"\n\
+                    staging_dir = \"s\"\n\
+                    database_url = \"sqlite::memory:\"\n\
+                    jwt_secret = \"0123456789abcdef0123456789abcdef\"\n";
+        let c: AppConfig = toml::from_str(base).unwrap();
+        assert!(c.jwt_previous_secrets.is_empty());
+
+        let c: AppConfig = toml::from_str(&format!(
+            "{base}jwt_previous_secrets = [\"0123456789abcdef0123456789abcde0\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            c.jwt_previous_secrets,
+            vec!["0123456789abcdef0123456789abcde0"]
+        );
     }
 
     /// 首启生成并落盘；二启（模拟重启/集群另一节点）复用同一份（flock 串行化的同进程面）。
@@ -1948,6 +2023,7 @@ mod tests {
             staging_dir: std::path::PathBuf::from("/tmp/x"),
             database_url: "sqlite::memory:".into(),
             jwt_secret: "k".repeat(32),
+            jwt_previous_secrets: vec![],
             max_put_bytes: 1,
             groups: vec![],
             cluster: None,

@@ -49,6 +49,7 @@ cluster_token = "t"
         staging_dir: dir.join("staging"),
         database_url: db_url(dir),
         jwt_secret: JWT_SECRET.into(),
+        jwt_previous_secrets: vec![],
         max_put_bytes: 1024 * 1024,
         groups: vec![GroupTarget {
             group: "file".into(),

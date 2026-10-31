@@ -21,8 +21,18 @@ pub struct AppState {
     pub audit: Option<Arc<crate::audit_queue::AuditQueue>>,
     pub ingest: Arc<crate::aether::IngestSink>,
     /// 控制面（`/api/v1`）与上传口（`/aetherupload`）共用的 JWT 门面：
-    /// 登录用它签发，路由层用同一实例的 `JwtLayer` 校验（跨面 token 因此天然互通）。
+    /// 登录用它签发，路由层用同一实例校验（跨面 token 因此天然互通）。
     pub jwt: Arc<JwtAuth>,
+    /// JWT 轮换期的旧签名密钥（只验签、不签发；与 `jwt` 共用同一黑名单目录）。
+    /// 轮换流程：
+    /// 1. 把旧密钥加入 `jwt_previous_secrets`（`jwt_secret` 保持不变），可逐节点重启
+    ///    ——旧 token 在每个节点都还验得过；
+    /// 2. 全部节点就绪后，把 `jwt_secret` 换成新密钥并重启全部节点；切换须一次完成
+    ///    （窗口内新旧节点会互拒对方签发的 token）；
+    /// 3. 新 token 最长有效期 12h（`default_expire`），窗口过后从
+    ///    `jwt_previous_secrets` 移除旧密钥。
+    /// 登录限速与审计是节点本地状态（按设计不进 Raft），轮换不改变该边界。
+    pub jwt_previous: Vec<Arc<JwtAuth>>,
     /// 登录限速（C1）：账号失败锁定 + 全局失败上限（Argon2 ~19MiB/次 的资源放大面封口）。
     pub login_limiter: Arc<LoginLimiter>,
     /// M5 切片 6：SK 加密库（`OSS_MASTER_KEY_FILE`/`OSS_KMS_DIR` 未配 = None = 明文直存）。
@@ -879,48 +889,59 @@ impl AppState {
                 }),
             ));
         // except 只有 `/login`：console 路由经 nest 时 axum 的 StripPrefix 会先把
-        // `/api/v1` 前缀剥掉，JwtLayer 看到的是 `/login`；aether 面路径不含 `/login` 段
+        // `/api/v1` 前缀剥掉，鉴权层看到的是 `/login`；aether 面路径不含 `/login` 段
         // （`/aetherupload/display/login` 之类整段不匹配），照常校验。
         // secret 短于 32 字节（jwt-rust 的 256 位下限）、黑名单目录不可建，都启动即失败。
         let login_limiter = Arc::new(LoginLimiter::new());
-        let jwt = Arc::new(
-            JwtAuth::from_config(JwtConfig {
-                secret_key: cfg.jwt_secret.clone(),
-                default_expire: 12 * 3600,
-                // 黑名单（M1 无 logout 调用；未来撤销用）落数据盘，不用默认 /tmp：
-                // /tmp 会被 tmpfiles 清理（静默丢撤销记录）、多实例不共享，且预建同名目录
-                // 的 0700 只在本进程创建时设。FileTokenStorage 会递归建目录。
-                // 挂 `.oss.sys/` 下：store 的 list_buckets 跳过 SYS_DIR，直接放 data_dir 根
-                // 会被当成一个桶列出来（撞过测试 `login_then_list_buckets`）。
-                storage: jwt_rust::config::StorageConfig {
-                    path: Some(
-                        cfg.data_dir
-                            .join(xl_store::layout::SYS_DIR)
-                            .join("jwt_blacklist")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    ..Default::default()
-                },
-                middleware: jwt_rust::config::MiddlewareConfig {
-                    // M7：站点控制面通道（token / token 头）两条不走 JWT
-                    except: vec![
-                        "/login".into(),
-                        "/site/identity".into(),
-                        "/site/changelog".into(),
-                        "/site/delete-object".into(),
-                        "/site/delete-bucket".into(),
-                        "/site/head-object".into(),
-                        "/site/bucket-empty".into(),
-                        "/site/bucket-quiesce".into(),
-                        // S7.1：配对入口走集群/站点令牌，不认 JWT（S7.4 实现）。
-                        "/site/raft/join".into(),
-                    ],
-                },
+        // 当前密钥与轮换期旧密钥只差 secret_key，其余（算法/过期/黑名单目录/except）完全相同。
+        let jwt_config = |secret: &str| JwtConfig {
+            secret_key: secret.to_string(),
+            default_expire: 12 * 3600,
+            // 黑名单（M1 无 logout 调用；未来撤销用）落数据盘，不用默认 /tmp：
+            // /tmp 会被 tmpfiles 清理（静默丢撤销记录）、多实例不共享，且预建同名目录
+            // 的 0700 只在本进程创建时设。FileTokenStorage 会递归建目录。
+            // 挂 `.oss.sys/` 下：store 的 list_buckets 跳过 SYS_DIR，直接放 data_dir 根
+            // 会被当成一个桶列出来（撞过测试 `login_then_list_buckets`）。
+            storage: jwt_rust::config::StorageConfig {
+                path: Some(
+                    cfg.data_dir
+                        .join(xl_store::layout::SYS_DIR)
+                        .join("jwt_blacklist")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 ..Default::default()
-            })
-            .unwrap_or_else(|e| panic!("jwt-rust 初始化失败: {e}")),
+            },
+            middleware: jwt_rust::config::MiddlewareConfig {
+                // M7：站点控制面通道（token / token 头）两条不走 JWT
+                except: vec![
+                    "/login".into(),
+                    "/site/identity".into(),
+                    "/site/changelog".into(),
+                    "/site/delete-object".into(),
+                    "/site/delete-bucket".into(),
+                    "/site/head-object".into(),
+                    "/site/bucket-empty".into(),
+                    "/site/bucket-quiesce".into(),
+                    // S7.1：配对入口走集群/站点令牌，不认 JWT（S7.4 实现）。
+                    "/site/raft/join".into(),
+                ],
+            },
+            ..Default::default()
+        };
+        let jwt = Arc::new(
+            JwtAuth::from_config(jwt_config(&cfg.jwt_secret))
+                .unwrap_or_else(|e| panic!("jwt-rust 初始化失败: {e}")),
         );
+        let jwt_previous = cfg
+            .jwt_previous_secrets
+            .iter()
+            .map(|secret| {
+                JwtAuth::from_config(jwt_config(secret))
+                    .map(Arc::new)
+                    .unwrap_or_else(|e| panic!("jwt-rust 初始化失败（jwt_previous_secrets）: {e}"))
+            })
+            .collect();
         // M5 切片 6：SK 库自 Store 的密钥库状态（须在 init_encryption 之后——本函数由
         // 启动路径在 store open+init 完成后调用）。
         let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
@@ -1043,6 +1064,7 @@ impl AppState {
             audit: None,
             ingest,
             jwt,
+            jwt_previous,
             login_limiter,
             vault,
             events,
