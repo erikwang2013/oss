@@ -126,6 +126,7 @@ fn level_one() -> ControlData {
         accounts: Vec::new(),
         account_members: Vec::new(),
         vpc_endpoints: Vec::new(),
+        account_usage_ledger: Vec::new(),
     }
 }
 

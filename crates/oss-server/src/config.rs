@@ -73,6 +73,18 @@ pub struct AppConfig {
     /// 混版窗口内仍须由 LB/客户端移除其写流量。
     #[serde(default)]
     pub read_only: bool,
+    /// 账户硬配额执行模式 `[quota]`（缺省 = 本地有界陈旧缓存，行为不变）。
+    #[serde(default)]
+    pub quota: QuotaToml,
+}
+
+/// `[quota]`：`strict = true` 时硬配额改由复制账本判定（Raft 模式要求
+/// `[raft].feature_level = 9`）。环境变量 `OSS_ACCOUNT_QUOTA_STRICT=1` 等价开启。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaToml {
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// `[ap]`：访问点来源端点注册表（Slice A 静态配置；动态 DB/Raft 不在本切片）。
@@ -737,7 +749,9 @@ impl AppConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
-        let cfg: Self = toml::from_str(&text)?;
+        let mut cfg: Self = toml::from_str(&text)?;
+        cfg.quota.strict |= std::env::var("OSS_ACCOUNT_QUOTA_STRICT")
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
         cfg.tls_validate()
             .map_err(|e| format!("配置校验失败：{e}"))?;
         cfg.jwt_secret_validate()
@@ -1076,6 +1090,14 @@ impl AppConfig {
             if self.cluster.is_some() {
                 return Err("[raft] 与 [cluster] 互斥".into());
             }
+            if self.quota.strict && r.feature_level < crate::raft::compat::FEATURE_LEVEL_9 {
+                return Err(format!(
+                    "[quota].strict 需要 [raft].feature_level = {}（当前 {}）：\
+                     用量账本命令 min level 9，低于它每次写入都会被 append 前拒绝",
+                    crate::raft::compat::FEATURE_LEVEL_9,
+                    r.feature_level
+                ));
+            }
             if !self.groups.is_empty() {
                 return Err("[raft] 与 [[groups]] 互斥（guard 会拒绝分组桶写入）".into());
             }
@@ -1384,6 +1406,7 @@ mod tests {
             tls: Default::default(),
             sts: Default::default(),
             ap: Default::default(),
+            quota: Default::default(),
         }
     }
 
@@ -2062,6 +2085,7 @@ mod tests {
             tls: Default::default(),
             sts: Default::default(),
             ap: Default::default(),
+            quota: Default::default(),
         };
         // 合法
         assert!(

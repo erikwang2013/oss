@@ -261,6 +261,33 @@ pub enum ControlCommand {
         object_quota: Option<i64>,
         updated_at: i64,
     },
+    /// 账户用量账本（feature 9）：原子预留（有符号增量，可因覆写变小而下降）。
+    /// `baseline_*` 仅在账本行尚不存在时用于从本节点 `account_usage` 缓存播种
+    /// （leader 先算好，全副本按同一值 apply）。命令**非幂等**：append 结果不明时
+    /// 调用方不得盲目重试（reserve 重试会多记，release 重试会多扣）。
+    AccountUsageReserve {
+        account: String,
+        bytes: i64,
+        objects: i64,
+        baseline_bytes: i64,
+        baseline_objects: i64,
+    },
+    /// 删除后释放（非负增量，账本饱和到 0）。同样非幂等。
+    AccountUsageRelease {
+        account: String,
+        bytes: i64,
+        objects: i64,
+        baseline_bytes: i64,
+        baseline_objects: i64,
+    },
+    /// 写后校准/失败归还（有符号、无配额闸，账本饱和到 0）。同样非幂等。
+    AccountUsageAdjust {
+        account: String,
+        bytes: i64,
+        objects: i64,
+        baseline_bytes: i64,
+        baseline_objects: i64,
+    },
     /// 动态 VPC 端点注册（feature 8，AP Slice B）：upsert/delete 均幂等。
     VpcEndpointUpsert {
         endpoint: VpcEndpointRow,
@@ -410,6 +437,28 @@ pub const REGISTERED_EXT_TYPES: &[&str] = &[];
 /// 兜底使用同一判据；超限命令必须整体拒绝，不能截断（截断即不同结果）。
 pub const JOB_PURGE_MAX_IDS: usize = 1000;
 
+/// 用量账本单次增量/基线的绝对值上限（1 EiB / 同量级对象数）：正常写路径远低于
+/// 此值；超出即入口拒绝。算术用 saturating，因此上限只防荒谬值，不承担防溢出。
+pub const QUOTA_VALUE_MAX: i64 = 1 << 60;
+
+/// 账本命令的数值闸：`account` 非空且 ≤128 字符；增量绝对值、基线均在
+/// `0..=`[`QUOTA_VALUE_MAX`]。基线必须非负（本地缓存不会为负）。
+pub fn valid_quota_ledger_args(
+    account: &str,
+    bytes: i64,
+    objects: i64,
+    baseline_bytes: i64,
+    baseline_objects: i64,
+) -> bool {
+    let bounded = |v: i64| (-QUOTA_VALUE_MAX..=QUOTA_VALUE_MAX).contains(&v);
+    !account.trim().is_empty()
+        && account.chars().count() <= 128
+        && bounded(bytes)
+        && bounded(objects)
+        && (0..=QUOTA_VALUE_MAX).contains(&baseline_bytes)
+        && (0..=QUOTA_VALUE_MAX).contains(&baseline_objects)
+}
+
 /// [`ControlCommand::JobPurge`] 的入口约束：非空、≤ [`JOB_PURGE_MAX_IDS`]、无重复。
 pub fn validate_job_purge(job_ids: &[i64]) -> Result<(), String> {
     if job_ids.is_empty() {
@@ -535,6 +584,10 @@ impl ControlCommand {
             Self::AccountHardQuotaSet { .. }
             | Self::VpcEndpointUpsert { .. }
             | Self::VpcEndpointDelete { .. } => super::compat::FEATURE_LEVEL_8,
+            // v1.27.0 及更早 advertise ≤8 且不认识用量账本命令/快照字段。
+            Self::AccountUsageReserve { .. }
+            | Self::AccountUsageRelease { .. }
+            | Self::AccountUsageAdjust { .. } => super::compat::FEATURE_LEVEL_9,
             #[cfg(test)]
             Self::FeatureProbe { .. } => 2,
             _ => super::compat::MIN_FEATURE_LEVEL,

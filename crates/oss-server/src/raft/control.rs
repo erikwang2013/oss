@@ -509,6 +509,100 @@ fn sink_result(
     }
 }
 
+/// 账本命令响应 → xl-s3 严格配额错误。`Invalid` 在入口参数校验通过后只剩
+/// “超出硬配额”一种来源（稳定 quota_exceeded）；结果不明一律 `Unavailable`。
+fn ledger_result(
+    r: Result<ControlResponse, ControlError>,
+) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
+    use xl_s3::account_quota::ClusterQuotaError as E;
+    match r {
+        Ok(ControlResponse::Ok) => Ok(()),
+        Ok(ControlResponse::Invalid) => Err(E::Exceeded),
+        Ok(_) => Err(E::Invalid),
+        Err(ControlError::Timeout(m) | ControlError::Unavailable(m)) => {
+            tracing::warn!(error = %m, "quota ledger write result unknown");
+            Err(E::Unavailable)
+        }
+        Err(ControlError::NotLeader { endpoint, .. }) => {
+            tracing::warn!(?endpoint, "quota ledger write not on leader");
+            Err(E::Unavailable)
+        }
+        Err(ControlError::QuotaExceeded) => Err(E::Exceeded),
+        Err(ControlError::TooLarge { .. }) => Err(E::Invalid),
+        Err(ControlError::Invalid(m)) => {
+            tracing::warn!(error = %m, "quota ledger write rejected");
+            Err(E::Invalid)
+        }
+        Err(ControlError::Internal(m)) => {
+            tracing::error!(error = %m, "quota ledger write failed");
+            Err(E::Internal)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl xl_s3::account_quota::ClusterQuota for ControlPlane {
+    async fn reserve(
+        &self,
+        account: &str,
+        bytes: i64,
+        objects: i64,
+    ) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
+        let (baseline_bytes, baseline_objects) =
+            xl_s3::account_quota::usage_baseline(self.db.pool(), account).await;
+        ledger_result(
+            self.write(ControlCommand::AccountUsageReserve {
+                account: account.into(),
+                bytes,
+                objects,
+                baseline_bytes,
+                baseline_objects,
+            })
+            .await,
+        )
+    }
+
+    async fn release(
+        &self,
+        account: &str,
+        bytes: i64,
+        objects: i64,
+    ) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
+        let (baseline_bytes, baseline_objects) =
+            xl_s3::account_quota::usage_baseline(self.db.pool(), account).await;
+        ledger_result(
+            self.write(ControlCommand::AccountUsageRelease {
+                account: account.into(),
+                bytes,
+                objects,
+                baseline_bytes,
+                baseline_objects,
+            })
+            .await,
+        )
+    }
+
+    async fn adjust(
+        &self,
+        account: &str,
+        bytes: i64,
+        objects: i64,
+    ) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
+        let (baseline_bytes, baseline_objects) =
+            xl_s3::account_quota::usage_baseline(self.db.pool(), account).await;
+        ledger_result(
+            self.write(ControlCommand::AccountUsageAdjust {
+                account: account.into(),
+                bytes,
+                objects,
+                baseline_bytes,
+                baseline_objects,
+            })
+            .await,
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl xl_s3::bucket_control::BucketControlSink for ControlPlane {
     async fn create_bucket(

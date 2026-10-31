@@ -231,6 +231,27 @@ fn all_variants() -> Vec<ControlCommand> {
             object_quota: Some(10),
             updated_at: 1,
         },
+        ControlCommand::AccountUsageReserve {
+            account: "000000000001".into(),
+            bytes: 1024,
+            objects: 1,
+            baseline_bytes: 0,
+            baseline_objects: 0,
+        },
+        ControlCommand::AccountUsageRelease {
+            account: "000000000001".into(),
+            bytes: 1024,
+            objects: 1,
+            baseline_bytes: 0,
+            baseline_objects: 0,
+        },
+        ControlCommand::AccountUsageAdjust {
+            account: "000000000001".into(),
+            bytes: -1,
+            objects: -1,
+            baseline_bytes: 0,
+            baseline_objects: 0,
+        },
         ControlCommand::VpcEndpointUpsert {
             endpoint: oss_server::raft::data::VpcEndpointRow {
                 vpce_id: "vpce-1".into(),
@@ -452,8 +473,9 @@ fn control_command_field_set_matches_frozen_fixture() {
 fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     use oss_server::raft::compat::{
         FEATURE_COMMAND_EXT, FEATURE_LEVEL_3, FEATURE_LEVEL_4, FEATURE_LEVEL_5, FEATURE_LEVEL_6,
-        FEATURE_LEVEL_7, FEATURE_LEVEL_8, FEATURE_OSSCTL2, FEATURE_STRUCTURED_LIFECYCLE,
-        MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup, supports,
+        FEATURE_LEVEL_7, FEATURE_LEVEL_8, FEATURE_LEVEL_9, FEATURE_OSSCTL2,
+        FEATURE_STRUCTURED_LIFECYCLE, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL, guard_startup,
+        supports,
     };
     assert_eq!(MIN_FEATURE_LEVEL, 1);
     assert_eq!(FEATURE_STRUCTURED_LIFECYCLE, 2);
@@ -477,7 +499,11 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         FEATURE_LEVEL_8, 8,
         "v1.26.0 及更早 advertise ≤7，硬配额配置必须用新 level 8"
     );
-    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_8);
+    assert_eq!(
+        FEATURE_LEVEL_9, 9,
+        "v1.27.0 及更早 advertise ≤8，用量账本必须用新 level 9"
+    );
+    assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_9);
     assert!(
         supports(1)
             && supports(2)
@@ -487,8 +513,9 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
             && supports(6)
             && supports(7)
             && supports(8)
+            && supports(9)
     );
-    assert!(!supports(9), "未知更高 level 一律不支持");
+    assert!(!supports(10), "未知更高 level 一律不支持");
 
     // marker 8 + MAX 8：显式配置 8 才放行；v1.22（MAX 3）/v1.23.0（MAX 4）/
     // v1.24.0（MAX 5）/v1.25.0（MAX 6）/v1.26.0（MAX 7）拒绝。
@@ -498,7 +525,8 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     assert!(guard_startup(6, 6).is_ok());
     assert!(guard_startup(7, 7).is_ok());
     assert!(guard_startup(8, 8).is_ok());
-    assert!(guard_startup(9, 8).is_err(), "未知更高 marker 必须拒绝");
+    assert!(guard_startup(9, 9).is_ok());
+    assert!(guard_startup(10, 9).is_err(), "未知更高 marker 必须拒绝");
     assert!(guard_startup(8, 7).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(7, 6).is_err(), "配置低于 marker 必须拒绝");
     assert!(guard_startup(6, 5).is_err(), "配置低于 marker 必须拒绝");
@@ -518,7 +546,8 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
         mut lease,
         mut hard_quota,
         mut vpc,
-    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+        mut ledger,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     for cmd in all_variants() {
         let level = cmd.min_feature_level();
         match cmd {
@@ -593,6 +622,15 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
                     "动态 VPC 端点必须用 level 8（v1.26.0 占用 7）"
                 );
             }
+            ControlCommand::AccountUsageReserve { .. }
+            | ControlCommand::AccountUsageRelease { .. }
+            | ControlCommand::AccountUsageAdjust { .. } => {
+                ledger += 1;
+                assert_eq!(
+                    level, FEATURE_LEVEL_9,
+                    "用量账本必须用 level 9（v1.27.0 占用 8）"
+                );
+            }
             _ => assert!(
                 level <= FEATURE_STRUCTURED_LIFECYCLE,
                 "{cmd:?} 要求 level {level}，但只有 Ext/账户/作业行命令可以高于 level 2"
@@ -611,6 +649,7 @@ fn feature_levels_are_open_for_ext_accounts_jobs_and_inventory() {
     assert_eq!(lease, 1, "生产命令集恰好一个调度租约样本");
     assert_eq!(hard_quota, 1, "生产命令集恰好一个硬配额配置样本");
     assert_eq!(vpc, 2, "生产命令集恰好两个动态 VPC 端点样本");
+    assert_eq!(ledger, 3, "生产命令集恰好三个用量账本样本");
 }
 
 /// `Ext` 是显式可选（externally tagged）变体：字段集冻结为 `type_id`+`payload`，

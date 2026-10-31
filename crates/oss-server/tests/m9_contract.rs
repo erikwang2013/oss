@@ -69,6 +69,7 @@ cluster_token = "t"
         tls: Default::default(),
         sts: Default::default(),
         ap: Default::default(),
+        quota: Default::default(),
     }
 }
 

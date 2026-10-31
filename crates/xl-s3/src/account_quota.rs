@@ -59,6 +59,57 @@ impl std::fmt::Display for QuotaDenied {
     }
 }
 
+/// strict 模式：复制账本接口（oss-server `ControlPlane` 实现；xl-s3 不依赖它）。
+///
+/// 命令**非幂等**。实现必须在 append 结果不明（超时/无主/无 quorum）时返回
+/// `Unavailable`，调用方不得重试或反向补偿——预留泄漏是保守的，重复释放会少计。
+#[async_trait::async_trait]
+pub trait ClusterQuota: Send + Sync {
+    async fn reserve(
+        &self,
+        account: &str,
+        bytes: i64,
+        objects: i64,
+    ) -> Result<(), ClusterQuotaError>;
+    async fn release(
+        &self,
+        account: &str,
+        bytes: i64,
+        objects: i64,
+    ) -> Result<(), ClusterQuotaError>;
+    async fn adjust(
+        &self,
+        account: &str,
+        bytes: i64,
+        objects: i64,
+    ) -> Result<(), ClusterQuotaError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterQuotaError {
+    /// 稳定配额拒绝（apply 侧 `Invalid`；严格模式启用后本地配额也由账本判定）。
+    Exceeded,
+    /// append 结果不明/控制面不可用：写入必须失败且不得盲目重试。
+    Unavailable,
+    Invalid,
+    Internal,
+}
+
+/// 单条账本命令的播种基线：本节点 `account_usage` 缓存（有界陈旧，仅首次触达
+/// 账户时由 apply 使用）；缺行/读失败 = (0, 0)，随后由真实写入校准。
+/// shortcut: 首次触达前缓存最旧 60s（采样周期），strict 打开瞬间可能少计/多计
+/// 一批存量；升级触发：需要精确存量迁移时用离线扫描导出账本种子。
+pub async fn usage_baseline(pool: &SqlitePool, account: &str) -> (i64, i64) {
+    match load_usage(pool, account).await {
+        Ok(Some((used, count, _, _))) => (used.max(0), count.max(0)),
+        Ok(None) => (0, 0),
+        Err(e) => {
+            tracing::warn!(error = %e, account, "读取账户用量基线失败（按 0 播种）");
+            (0, 0)
+        }
+    }
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
