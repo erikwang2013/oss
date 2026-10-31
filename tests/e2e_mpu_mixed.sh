@@ -111,7 +111,8 @@ cleanup() {
 trap cleanup EXIT
 
 mk_cfg() { # i
-	local i=$1 d="$W/${IDS[$i]}" n
+	local i=$1
+	local d="$W/${IDS[$i]}" n
 	mkdir -p "$d/d0" "$d/d1" "$d/d2" "$d/staging"
 	cat >"$d/oss.toml" <<EOF
 listen = "127.0.0.1:${HTTPP[$i]}"
@@ -156,7 +157,8 @@ start_i() { # i
 	}
 }
 wait_live_i() { # i
-	local i=$1 p=${HTTPP[$i]} pid=${PIDS[$i]}
+	local i=$1
+	local p=${HTTPP[$i]} pid=${PIDS[$i]}
 	for _ in $(seq 1 180); do
 		kill -0 "$pid" 2>/dev/null || return 1
 		[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$p/health/live" 2>/dev/null || true)" = 200 ] && return 0
@@ -165,7 +167,8 @@ wait_live_i() { # i
 	return 1
 }
 wait_ready_i() { # i
-	local i=$1 p=${HTTPP[$i]} pid=${PIDS[$i]}
+	local i=$1
+	local p=${HTTPP[$i]} pid=${PIDS[$i]}
 	for _ in $(seq 1 180); do
 		kill -0 "$pid" 2>/dev/null || return 1
 		[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$p/health/ready" 2>/dev/null || true)" = 200 ] && return 0
@@ -174,7 +177,8 @@ wait_ready_i() { # i
 	return 1
 }
 stop_i() { # i：TERM 正常退出返回 0（滚动升级必须优雅停）
-	local i=$1 pid=${PIDS[$i]}
+	local i=$1
+	local pid=${PIDS[$i]}
 	[ -z "$pid" ] && return 0
 	kill -TERM "$pid" 2>/dev/null || {
 		wait "$pid" 2>/dev/null

@@ -873,6 +873,7 @@ mod tests {
         cfg.expected_account = Some("123".into());
         assert!(AwsApiEndpointVerifier::new(cfg).is_err());
         assert!(AwsApiEndpointVerifier::new(config("http://h/path".into())).is_err());
+        assert!(AwsApiEndpointVerifier::new(config("http://example.com".into())).is_err());
         assert!(AwsApiEndpointVerifier::new(config("ftp://h".into())).is_err());
     }
 }

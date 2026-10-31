@@ -13,6 +13,9 @@ jobs:
       - name: 检测 workspace 是否就绪
         id: detect
         run: echo "ready=$([ -f Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Install protoc
+        if: steps.detect.outputs.ready == 'true'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: rustfmt
         if: steps.detect.outputs.ready == 'true'
         run: cargo fmt --all --check
