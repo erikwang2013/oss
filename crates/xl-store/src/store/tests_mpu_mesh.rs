@@ -99,11 +99,12 @@ async fn mpu_mesh_forward_upload_list_complete() {
     ));
 }
 
-/// DP-1 跨版本收尾：属主是旧数据面（缺字段 → 1）时分片流仍 fail-closed；但
-/// ListParts/Complete/Abort 的 RPC 与暂存格式自 v1.16.0 未变 → 放行到旧属主执行，
-/// 语义错误原样穿透。恢复同版后分片流照常。
+/// DP-1 跨版本：属主是旧数据面（缺字段 → 1）时分片流式转发按策略拒绝，但 store
+/// 自动改走有界回退（预落盘 + MD5 核对）→ 分片可落地；ListParts/Complete/Abort 的
+/// RPC 与暂存格式自 v1.16.0 未变 → 放行到旧属主执行，语义错误原样穿透。
+/// 恢复同版后流式转发恢复（有界回退不再使用）。
 #[tokio::test]
-async fn mpu_mesh_mixed_version_finish_allowed_stream_rejected() {
+async fn mpu_mesh_mixed_version_bounded_upload_and_finish() {
     let c = two_node().await;
     let id = c.stores[0]
         .create_multipart_upload("alpha", "k", None, Default::default())
@@ -111,32 +112,31 @@ async fn mpu_mesh_mixed_version_finish_allowed_stream_rejected() {
         .unwrap();
     c.mesh.set_data_wire_version("n1", Some(0)); // 旧节点：health 缺字段
 
-    let err = c.stores[1]
+    let etag = c.stores[1]
         .upload_part("alpha", "k", &id, 1, stream_of(&[b"x"]))
         .await
-        .unwrap_err();
-    assert!(matches!(err, Error::PeerIncompatible(_)), "{err:?}");
-    // 收尾类可达：空暂存区照常列举
-    assert!(
-        c.stores[1]
-            .list_parts("alpha", "k", &id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    // complete 的业务校验错误（part 未上传）穿透旧属主，不再是版本拒绝
+        .unwrap();
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1, "wire-1 必须走有界回退");
+    assert_eq!(c.mesh.mpu_stream_calls(), 0);
+    // 收尾类可达：分片已在属主暂存区
+    let parts = c.stores[1].list_parts("alpha", "k", &id).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].etag, etag);
+    // complete 的业务校验错误（ETag 不符）穿透旧属主，不再是版本拒绝
     let err = c.stores[1]
         .complete_multipart_upload("alpha", "k", &id, &[(1, "deadbeef".into())])
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InvalidPart(_)), "{err:?}");
 
-    // 恢复同版 → 分片流转发恢复
+    // 恢复同版 → 流式转发优先恢复（覆盖同号 part）
     c.mesh.set_data_wire_version("n1", None);
     let etag = c.stores[1]
         .upload_part("alpha", "k", &id, 1, stream_of(&[b"ok"]))
         .await
         .unwrap();
+    assert_eq!(c.mesh.mpu_stream_calls(), 1);
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1);
     c.stores[1]
         .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
         .await
@@ -482,13 +482,29 @@ async fn mpu_legacy_bare_uuid_cross_version_finish() {
     assert!(lmu.uploads.iter().any(|u| u.upload_id == uuid));
     assert!(lmu.degraded);
 
-    // 分片流仍跨版本拒绝
-    assert!(matches!(
-        c.stores[1]
-            .upload_part("alpha", "k", &uuid, 2, stream_of(&[b"x"]))
-            .await,
-        Err(Error::PeerIncompatible(_))
-    ));
+    // 分片：新节点经有界回退落到旧属主暂存区（裸 UUID 属主发现 + 同一 RPC），
+    // 字节一致 → ETag 与本地 MD5 相符
+    let etag2 = c.stores[1]
+        .upload_part("alpha", "k", &uuid, 2, stream_of(&[b"wire1"]))
+        .await
+        .unwrap();
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1);
+    assert_eq!(c.mesh.mpu_stream_calls(), 0, "旧属主不得走流式路径");
+    let expected2 = {
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(b"wire1");
+        hex::encode(h.finalize())
+    };
+    assert_eq!(etag2, expected2);
+    assert_eq!(
+        c.stores[0]
+            .list_parts("alpha", "k", &uuid)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // 新节点 Complete → 旧属主提交；part 元数据（part_sizes）随转发保留
     let info = c.stores[1]
@@ -535,6 +551,164 @@ async fn mpu_legacy_bare_uuid_cross_version_finish() {
             .await,
         Err(Error::NoSuchUpload(_))
     ));
+}
+
+/// wire-1 有界回退的预落盘残件（`<tmp>/mpu-*.part`）；空 = 清理到位。
+fn spool_files(drive: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(layout::sys_dir(drive, "tmp")) else {
+        return Vec::new();
+    };
+    rd.filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("mpu-"))
+        })
+        .collect()
+}
+
+/// wire-1 属主：有界回退逐字节转发（分块输入），属主 ETag/大小与本地 MD5 一致；
+/// complete 后对象字节与原分片完全相同；协调者暂存文件不残留。
+#[tokio::test]
+async fn mpu_mesh_wire1_bounded_forward_byte_identical() {
+    const CHUNKS: [&[u8]; 3] = [b"hello ", b"wire-1 ", b"fallback"];
+    let c = two_node().await;
+    let id = c.stores[0]
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    c.mesh.set_data_wire_version("n1", Some(0));
+
+    let etag = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&CHUNKS))
+        .await
+        .unwrap();
+    let expected = {
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        for b in CHUNKS {
+            h.update(b);
+        }
+        hex::encode(h.finalize())
+    };
+    assert_eq!(etag, expected, "ETag 必须是原始分片字节的 MD5");
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1);
+    assert_eq!(c.mesh.mpu_stream_calls(), 0);
+    let parts = c.stores[0].list_parts("alpha", "k", &id).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].size, 21);
+    assert_eq!(parts[0].etag, expected);
+    assert!(spool_files(&c.dirs[1][0]).is_empty(), "预落盘必须清理");
+
+    let info = c.stores[1]
+        .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
+        .await
+        .unwrap();
+    assert_eq!(info.size, 21);
+    let (_, body) = c.stores[0].get_object("alpha", "k").await.unwrap();
+    assert_eq!(body, Bytes::from_static(b"hello wire-1 fallback"));
+}
+
+/// 超有界回退上限：在**发出任何 RPC 前**拒绝，属主无暂存、协调者无残件；
+/// 上限内的同一条路径仍可传。
+#[tokio::test]
+async fn mpu_mesh_wire1_bounded_over_limit_rejected() {
+    let c = super::tests::Cluster::new_with_mpu_forward_max(2, 3, 8).await;
+    c.stores[0].create_bucket("alpha").await.unwrap();
+    let id = c.stores[0]
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    c.mesh.set_data_wire_version("n1", Some(0));
+
+    let err = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"0123456789"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidPart(_)), "{err:?}");
+    assert_eq!(c.mesh.mpu_bounded_calls(), 0, "超限不得发出转发 RPC");
+    assert!(
+        c.stores[0]
+            .list_parts("alpha", "k", &id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(spool_files(&c.dirs[1][0]).is_empty());
+
+    // 恰好等于上限 → 正常转发
+    let etag = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"12345678"]))
+        .await
+        .unwrap();
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1);
+    assert_eq!(
+        c.stores[0].list_parts("alpha", "k", &id).await.unwrap()[0].etag,
+        etag
+    );
+}
+
+/// 转发中途失败：协调者预落盘文件清理、属主无半截 part；随后重试可成功
+/// （失败未污染暂存区，也不留可复用的半截数据）。
+#[tokio::test]
+async fn mpu_mesh_wire1_bounded_mid_forward_failure_cleans_up() {
+    let c = two_node().await;
+    let id = c.stores[0]
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+    c.mesh.set_data_wire_version("n1", Some(0));
+    c.mesh.fail_once("n1", "mpu_upload_part_bounded");
+
+    let err = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"payload"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+    assert_eq!(c.mesh.mpu_bounded_calls(), 1);
+    assert!(
+        c.stores[0]
+            .list_parts("alpha", "k", &id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "属主不得留下半截 part"
+    );
+    assert!(spool_files(&c.dirs[1][0]).is_empty(), "预落盘必须清理");
+
+    let etag = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"payload"]))
+        .await
+        .unwrap();
+    assert_eq!(c.mesh.mpu_bounded_calls(), 2);
+    c.stores[1]
+        .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
+        .await
+        .unwrap();
+    let (_, body) = c.stores[0].get_object("alpha", "k").await.unwrap();
+    assert_eq!(body, Bytes::from_static(b"payload"));
+}
+
+/// 同版（wire 2）仍走流式路径：有界回退不得成为默认路径。
+#[tokio::test]
+async fn mpu_mesh_wire2_streaming_preferred() {
+    let c = two_node().await;
+    let id = c.stores[0]
+        .create_multipart_upload("alpha", "k", None, Default::default())
+        .await
+        .unwrap();
+
+    let etag = c.stores[1]
+        .upload_part("alpha", "k", &id, 1, stream_of(&[b"stream"]))
+        .await
+        .unwrap();
+    assert_eq!(c.mesh.mpu_stream_calls(), 1);
+    assert_eq!(c.mesh.mpu_bounded_calls(), 0);
+    assert!(spool_files(&c.dirs[1][0]).is_empty(), "流式不产生预落盘");
+    c.stores[1]
+        .complete_multipart_upload("alpha", "k", &id, &[(1, etag)])
+        .await
+        .unwrap();
 }
 
 /// 单机回归：非集群 Create 仍是裸 UUID（无前缀），本地 MPU 全流程不变。

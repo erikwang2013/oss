@@ -338,6 +338,30 @@ async fn mpu_streaming_rejected_but_finish_allowed_on_mixed_version() {
     }
 }
 
+/// 有界回退操作类：wire-1 peer 放行（调用方已预落盘/限长/核对 MD5），但**流式**
+/// UploadPart 仍只发往现版；未知 wire（3）连有界回退也 fail-closed。
+#[tokio::test]
+async fn bounded_mpu_forward_allowed_but_streaming_still_gated() {
+    let (g, fake) = gate(1);
+    assert_eq!(
+        g.mpu_upload_part_bounded("n2", mpu_upload()).await.unwrap(),
+        "etag"
+    );
+    assert_eq!(fake.mpu_parts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        g.mpu_upload_part("n2", mpu_upload()).await,
+        Err(Error::PeerIncompatible(_))
+    ));
+    assert_eq!(fake.mpu_parts.load(Ordering::SeqCst), 1, "流式不得发出");
+
+    let (g3, fake3) = gate(3);
+    assert!(matches!(
+        g3.mpu_upload_part_bounded("n2", mpu_upload()).await,
+        Err(Error::PeerIncompatible(_))
+    ));
+    assert_eq!(fake3.mpu_parts.load(Ordering::SeqCst), 0);
+}
+
 /// 带语义标志的 ListLocal 只发往现版 peer（旧版会忽略 → 静默缺项/重复边界键）。
 #[tokio::test]
 async fn list_local_semantic_flags_require_current_peer() {
