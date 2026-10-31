@@ -17,6 +17,7 @@ pub const USAGE: &str = "\
 用法：oss-server [--config <path>] <命令> [选项]
 
   serve          启动服务（默认，无参数时同此）
+  --version, -V  打印版本并退出
   groups         建分组目录（幂等；不建就一定上传失败）
   build          按磁盘现状重建秒传索引
   clean <days>   按 mtime 回收超过 days 天的残骸（暂存盘 _header 与 *.part；数据盘 trash/tmp 孤儿与未引用的版本目录；days 限 1..=36525）
@@ -72,6 +73,8 @@ pub const USAGE: &str = "\
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Serve,
+    /// CLI 版本查询（不读配置/不建 AppState；蓝绿 preflight 用）。
+    Version,
     Groups,
     Build,
     Clean {
@@ -239,7 +242,8 @@ pub fn split_config(args: &[String]) -> Result<(std::path::PathBuf, Vec<String>)
 pub fn needs_full_state(cmd: &Command) -> bool {
     !matches!(
         cmd,
-        Command::Witness
+        Command::Version
+            | Command::Witness
             | Command::RaftAddWitness { .. }
             | Command::RaftRemoveNode { .. }
             | Command::RaftExport { .. }
@@ -331,6 +335,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
 
     match (cmd.as_str(), rest) {
         ("serve", []) => Ok(Command::Serve),
+        ("version" | "--version" | "-V", []) => Ok(Command::Version),
         ("groups", []) => Ok(Command::Groups),
         ("build", []) => Ok(Command::Build),
         // 上限 100 年：远超任何真实用法，同时挡掉按天换算秒时的乘法溢出。
@@ -1197,7 +1202,8 @@ pub async fn run(
             })
         }
         // main 只对 needs_full_state 的命令调用 run；离线命令误入是内部接线错误。
-        Command::Witness
+        Command::Version
+        | Command::Witness
         | Command::RaftAddWitness { .. }
         | Command::RaftRemoveNode { .. }
         | Command::RaftExport { .. }
@@ -1219,6 +1225,10 @@ pub async fn run_offline(
     cfg_path: &std::path::Path,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     match cmd {
+        Command::Version => {
+            println!("oss-server {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         Command::Witness => crate::witness::run(cfg_path).await,
         Command::RaftAddWitness {
             node_id,
@@ -2041,6 +2051,20 @@ mod tests {
         assert_eq!(parse_args(&args(&["serve"])), Ok(Command::Serve));
     }
 
+    /// 蓝绿 preflight 用 `--version`/`-V`：必须不读配置、不建 AppState 直接退出。
+    #[test]
+    fn parse_args_reads_version_without_config() {
+        for flag in ["--version", "-V", "version"] {
+            assert_eq!(parse_args(&args(&[flag])), Ok(Command::Version), "{flag}");
+        }
+        assert_eq!(
+            parse_args(&args(&["--version", "extra"])),
+            Err(USAGE),
+            "多余参数必须拒绝"
+        );
+        assert!(!needs_full_state(&Command::Version));
+    }
+
     #[test]
     fn parse_args_reads_ops_commands() {
         assert_eq!(parse_args(&args(&["groups"])), Ok(Command::Groups));
@@ -2350,6 +2374,7 @@ mod tests {
             assert!(needs_full_state(&cmd), "{cmd:?}");
         }
         for cmd in [
+            Command::Version,
             Command::Witness,
             Command::RaftAddWitness {
                 node_id: 1,
