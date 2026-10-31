@@ -83,6 +83,24 @@
 > 任意双向混写、≤v1.15 MPU、真实 PrivateLink/mTLS、日志格式的 feature 门控（当前按
 > 停写蓝绿约束）。
 >
+> **2026-11-01 更新（v1.28.0 wave-5，升级/身份/存储加固）**：Raft 日志新增
+> `raft_meta.raft_log_format` 标记（缺失/`1`=旧格式、`2`=压缩/分段；更高/不可解析
+> fail-closed；v1.27 无标记库在 open 时按 `z1:`/分段补写 2），append 事务内最多两段
+> 有界压缩（最新连续段 + 一段更旧区间），20k entry soak 通过。M8 follower 发起的
+> `TierRestoreDelete` 不再以 term 0 盲删，改用 applied 行自身 `fence_term`；新增
+> 3-voter 故障切换演练。AP 新增直连 `mtls`（rustls 叶证书 SHA-256→vpce/vpc/account，
+> `OSS_AP_MTLS_ENDPOINTS`）与 `aws-api`（EC2 DescribeNetworkInterfaces/DescribeVpcEndpoints，
+> SigV4、源 IP+TTL 缓存、fail-closed、要求客户端源 IP 保留；真实 AWS 验收仍未执行）。
+> CMK 新增离线 `cmk rewrap --to-legacy sse-s3|sse-kms --apply` 全量重加密（在途 MPU/桶默认/
+> 缺目标 provider 拒绝；不删 CMK；meta-only 仍不可能；`[cluster]`/`[stretch]` 离线拒绝，
+> 无在线路径）。Level C 新增顶层 `read_only` 只读排空（写 503 + `x-oss-read-only: 1`；
+> 旧二进制无开关，混版须从 LB 移除）。JWT 新增 `jwt_previous_secrets` 多密钥轮换
+> （≥32 B/去重/异于 `jwt_secret`；登录限流与审计仍节点本地）。运维新增真实 v1.26.0→当前
+> 蓝绿 e2e（22/22 PASS）、`mpu-drain.sh`（自检 43/0）、单机→集群双回环 e2e（6/6 PASS）；
+> 混合 v1.16 MPU e2e 已编写但未执行。仍缺：集群在线 CMK→legacy 迁移、真实 AWS PrivateLink
+> 验收、跨节点精确配额聚合、集群级登录限流/审计、任意双向混写、≤v1.15 MPU、
+> 混合 v1.16 MPU e2e 执行、Raft 日志格式 feature 门控。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →
@@ -93,11 +111,11 @@
 
 | # | 项目 | 代码现状（诚实结论） | MVP 体量 | 主要依赖 | 风险 |
 |---|---|---|---|---|---|
-| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.20.1↔v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不再支持；Ext 类型协商（`x-oss-raft-ext-types`、leader append 门、成员 preflight）与在途 MPU CMK 引用已交付；生产 `REGISTERED_EXT_TYPES` 仍为空，完整双向混写与数据面滚动仍缺 | 6–10 人周 | 生产 Ext 类型、CMK 迁移、数据面滚动 | 高 |
-| 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；跨版本 MPU 支持 v1.16+（wire-1 有界回退 / wire-2 流式），≤v1.15 无 MPU RPC 不支持；全操作混版写窗口仍缺 | 4–8 人周 | 混版写语义、停写蓝绿 runbook | 高 |
+| 1 | Level C 任意双向混合版本 | Level B 单向窗口仍在；OSSCTL2/3 已实现；v1.20.1↔v1.21.1 控制面混版已验证（147/0/0）；v1.13.1 旧端不再支持；Ext 类型协商（`x-oss-raft-ext-types`、leader append 门、成员 preflight）与在途 MPU CMK 引用已交付；v1.28 新增 `read_only` 只读排空（旧节点仍须 LB 摘除）与离线 `cmk rewrap --to-legacy`（仅 standalone）。生产 `REGISTERED_EXT_TYPES` 仍为空，完整双向混写与数据面滚动仍缺 | 6–10 人周 | 生产 Ext 类型、集群在线 CMK 迁移、数据面滚动 | 高 |
+| 2 | M3/M4 数据面滚动升级 | DP-0/1/2/3 已交付（握手+混版读矩阵、mesh 入站 TLS 热轮换、cutover 来源校验）；跨版本 MPU 支持 v1.16+（wire-1 有界回退 / wire-2 流式），≤v1.15 无 MPU RPC 不支持；全操作混版写窗口仍缺；混合 v1.16 MPU e2e 已编写但未执行 | 4–8 人周 | 混版写语义、停写蓝绿 runbook | 高 |
 | 3 | 完整多租户账户体系 | AC-0..AC-3 + 软/硬字节与对象数配额 + 管理员 UI + canonicalization worker 已交付；硬配额跨节点为 30s/60s 有界陈旧；Raft 配置命令与动态 VPC 端点命令已在 feature 8 交付 | 1–2 人周（精确聚合） | 跨节点精确用量 | 中高 |
-| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；feature 4/5/6/7 分别交付 jobs/Restore 受理、inventory/lifecycle 游标、JobPurge、tier restore 后续状态与调度租约；快照 >256 KiB 已分块（旧整行透明读）；日志 ≥1024 B 压缩、连续 ≥256 条分段（旧明文行透明读，新格式单向）；仍缺 follower Restore 清理的即时 fencing 与真实滚动故障切换演练 | 0.5–1 人周 | 既有 feature 7 命令 + 快照存储 | 中 |
-| 5 | M3 shrink / 单机→集群 | shrink 4→3 已交付：topology v4 + 离线 plan/apply/verify/commit/rollback + loopback e2e（验收 §15.2）；单机→集群仍为离线重新灌入（`scripts/single-to-cluster.sh` plan/resume/verify，只迁当前版本，不是拓扑转换），原地转换不工具化 | 不排期 | 停机全量重新灌入 | 极高（若做原地转换） |
+| 4 | M8 多节点控制面 | 11 表 + 账户两表已随 Raft 复制；feature 4/5/6/7 分别交付 jobs/Restore 受理、inventory/lifecycle 游标、JobPurge、tier restore 后续状态与调度租约；快照 >256 KiB 已分块（旧整行透明读）；日志 ≥1024 B 压缩、连续 ≥256 条分段；v1.28 增加 `raft_log_format` 标记/旧区间两段有界压缩、follower restore 按 applied 行 `fence_term` 收口与 3-voter failover drill；完整滚动故障切换演练仍缺 | 0.5–1 人周 | 既有 feature 7 命令 + 快照存储 | 中 |
+| 5 | M3 shrink / 单机→集群 | shrink 4→3 已交付：topology v4 + 离线 plan/apply/verify/commit/rollback + loopback e2e（验收 §15.2）；单机→集群仍为离线重新灌入（`scripts/single-to-cluster.sh` plan/resume/verify，只迁当前版本，不是拓扑转换）；v1.28 补双回环 plan/copy/verify/resume e2e（6/6 PASS），原地转换不工具化 | 不排期 | 停机全量重新灌入 | 极高（若做原地转换） |
 
 ---
 
@@ -142,14 +160,16 @@
   认识的字段（`part_sizes` 丢失只会让 partNumber Range 降级，不丢数据；CMK 则是硬失败）。
 - 升级口径：**CMK 激活 = 不归点**，回滚只能在激活前；完整步骤与回滚条件见
   README「升级与回滚」。含 Level B 数据的环境只能由能写 OSSCTL2/3 的新二进制快照/切档。
-- **Level C 剩余（2026-10-31 wave-3 复核）**：v1.20.1 ↔ v1.21.1 控制面混版已验证
+- **Level C 剩余（2026-11-01 wave-5 复核）**：v1.20.1 ↔ v1.21.1 控制面混版已验证
   （专项 147/0/0；旧端 v1.20.1 无需补丁；v1.13.1 旧端不再支持）。Ext 类型能力协商
   已交付：节点在握手中宣告 `x-oss-raft-ext-types`，leader 在 append 前按
   `REGISTERED_EXT_TYPES` 与**全体当前 voter/learner** 的宣告集双重校验，成员变更
   preflight 拒绝不宣告已注册类型的节点。但生产 `REGISTERED_EXT_TYPES` 仍为空，
   完整「旧端只读 + 新 leader 协调写」的双向混写未做；数据面滚动、CMK 降级 e2e、
-  回滚矩阵仍缺。`oss-server cmk rewrap` 只做**同一 CMK**的旧版本 → 当前版本重加密，
-  不能指向 legacy `file`/`k<n>`（见 §1.3 LC-3）。
+  回滚矩阵仍缺。v1.28 起 `oss-server cmk rewrap --to-legacy sse-s3|sse-kms` 可把 CMK
+  对象全量重加密回 legacy provider（离线、仅 standalone；`[cluster]`/`[stretch]` 拒绝），
+  但 meta-only 降级仍不可能（见 §1.3 LC-3）；`read_only` 只读排空已交付，旧二进制无此
+  开关，混版窗口仍须由 LB 摘除旧节点。
 - **注意 v1.20.1 Level C 窗口不包含 feature 4/5**：jobs/tier_restores 复制只在
   feature 4、inventory 复制只在 feature 5 启用。启用 4 前必须全集群升级到含 level-4
   的二进制并移除/升级 v1.22 及更早节点；启用 5 前必须移除/升级 **v1.23.0** 及更早
@@ -187,15 +207,20 @@ Level C 的一端，窗口从 v1.20.1 起（已实测 v1.20.1 ↔ v1.21.1 147/0/
   补丁线为每个新变体提供「识别但拒绝执行」的桩（返回 `FeatureUnavailable`），保证旧节点
   不会因为解码失败而退出 Raft。为未来变体保留 `Ext` 变体（payload 带 type id），避免每加
   一个命令就再发一次补丁。
-- **LC-3 CMK 降级：激活是不归点（已定案，无 meta-only 方案）**：DARE 单元 AAD 绑定
-  `key_id`（`crypto.rs`），只改 `EncryptionRecord` 的 `key_id`/`wrapped_dek` 在密码学上
-  无法让 pre-CMK 二进制解开旧密文；不提供明文/不安全降级。`oss-server cmk rewrap` 只把
-  **同一 CMK** 的旧版本重加密到该 CMK 当前版本（重读明文、重新加密、翻 meta），不能指定
-  legacy `file`/`k<n>` 目标。回滚到 pre-CMK 二进制的唯一安全路径：停写 → 逐节点
-  `cmk scan --json`（对象版本 + 在途 MPU + 桶默认引用归零，MPU 先 Complete/Abort）→
-  用 legacy provider 重写对象数据，或把对象迁移到新集群（单机→集群离线重新灌入）→
-  `cmk delete`。在该迁移实现/执行前只能保持新二进制（forward-only）；
-  **绝不删除 CMK「强制」降级**（会留下不可解对象）。
+- **LC-3 CMK 降级：激活是不归点（v1.28 提供显式离线迁移，仍无 meta-only 方案）**：
+  DARE 单元 AAD 绑定 `key_id`（`crypto.rs`），只改 `EncryptionRecord` 的
+  `key_id`/`wrapped_dek` 在密码学上无法让 pre-CMK 二进制解开旧密文；不提供明文/不安全
+  降级。`oss-server cmk rewrap` 默认只把**同一 CMK** 的旧版本重加密到该 CMK 当前版本
+  （重读明文、重新加密、翻 meta）；v1.28 起 `--to-legacy sse-s3|sse-kms --apply` 可把
+  引用该 CMK 的对象版本**全量重加密**为 legacy provider（`sse-s3` file key，或 `sse-kms`
+  默认环当前 `k<n>`）。迁移在扫描/写入前 fail-closed：仍有在途 MPU、桶默认加密指向该
+  CMK、或目标 provider 未配置都拒绝；每个版本独立重加密，绝不自动删除 CMK。
+  `[cluster]`/`[stretch]` 部署的离线 rewrap 会拒绝（分片放置需在线拓扑），当前没有在线
+  legacy 迁移路径。回滚到 pre-CMK 二进制：停写 → 逐节点 `cmk scan --json`（对象版本 +
+  在途 MPU + 桶默认引用；MPU 先 Complete/Abort、桶默认切到目标 provider）→
+  `cmk rewrap --to-legacy ... --apply`，或把对象迁移到新集群（单机→集群离线重新灌入）→
+  引用归零后 `cmk delete`。meta-only 降级仍不可能；未完成迁移前只能保持新二进制
+  （forward-only）；**绝不删除 CMK「强制」降级**（会留下不可解对象）。
 - **LC-4 回滚矩阵与演练（1 人周）**：把下表固化成 `docs/` + e2e 断言；每个格必须可执行、
   可观察、有明确报错。已固化：`tests/e2e_m9_rollback.sh`（真实进程，旧端 = v1.20.1）
   覆盖 marker 1/2/3/4、导出封套 wire/feature/snapshot_format 拒绝、激活后回滚必须保留
@@ -206,7 +231,8 @@ Level C 的一端，窗口从 v1.20.1 起（已实测 v1.20.1 ↔ v1.21.1 147/0/
 
 - 不做 v1.x ↔ v2.x 跨大版本；不自动把 OSSCTL2 降级回 OSSCTL1（只允许空集群/新集群）。
 - 不做「旧二进制写新数据」：Level C 的旧端最多只读；写仍由新 leader 协调。
-- 不做 CMK→legacy 的自动 rewrap，也不做明文/不安全降级；pre-CMK 旧端只能读非 CMK 数据。
+- 不做 CMK→legacy 的自动/隐式 rewrap；v1.28 的 `--to-legacy` 是显式、离线、逐版本操作
+  （仅 standalone），不做明文/不安全降级；pre-CMK 旧端只能读非 CMK 数据。
 - 不做无补丁线的「任意双向」承诺（见 1.2）。
 
 ### 1.5 接口
@@ -230,7 +256,7 @@ Level C 的一端，窗口从 v1.20.1 起（已实测 v1.20.1 ↔ v1.21.1 147/0/
 | marker=1，无 Level B 行 | 能（库内无 `schema_meta.raft_feature_level` 行；配置不写 `[raft].feature_level`） | 换旧二进制重启 | 无 | 无 |
 | marker=2，有结构化生命周期行 | **不能**（`guard_startup` 拒绝 marker 高于配置/二进制上限；v1.20.1 需保留 `feature_level≥2`） | 保持新二进制；或恢复升级前 DB 备份 | 直接换旧二进制 | 恢复备份会丢升级后写入 |
 | marker=3 / 已写 OSSCTL3 快照 | **v1.20.1 能**：同库直接启动可读，`raft-force-recover` 可安装 OSSCTL3 导出；窗口外（v1.19 及更早）不能 | 保持 v1.20.1+；或新集群重灌 | 用低于 marker 的 `feature_level` 启动（R8 拒绝）；向窗口外二进制加载 | 快照不可降级到窗口外 |
-| 有 CMK 对象/桶默认值 | **pre-CMK 旧端不能**：能启动，但 CMK 对象 fail-closed（DARE AAD 绑定 `key_id`） | 保持新二进制（forward-only）；或停写→逐节点 `cmk scan --json` 归零（含在途 MPU）→legacy 重写/迁移到新集群→`cmk delete` | 删除 CMK「强制」降级；meta-only rewrap；明文降级 | 未迁移对象在 pre-CMK 端不可用；误删 CMK 会留下不可解对象 |
+| 有 CMK 对象/桶默认值 | **pre-CMK 旧端不能**：能启动，但 CMK 对象 fail-closed（DARE AAD 绑定 `key_id`） | 保持新二进制（forward-only）；或停写→逐节点 `cmk scan --json` 归零（含在途 MPU）→`cmk rewrap --to-legacy`（仅 standalone）或迁移到新集群→`cmk delete` | 删除 CMK「强制」降级；meta-only rewrap；明文降级；集群离线 `--to-legacy` | 未迁移对象在 pre-CMK 端不可用；误删 CMK 会留下不可解对象 |
 | 已写 OSSCTL2 快照 | **能**（v1.20.1 可解码/加载；Level B 之前不能） | v1.20.1+ 加载；或新集群重灌 | pre-Level-B 旧二进制加载 | 快照不可降级到 Level B 之前 |
 | 成员变更后 | 不能（wire<2 被 `check_cluster_uniformity` 拒） | 保持新集群 | 旧二进制加入 | 成员表不可回退 |
 
@@ -241,8 +267,8 @@ Level C 的一端，窗口从 v1.20.1 起（已实测 v1.20.1 ↔ v1.21.1 147/0/
 上表的可执行证据是 `tests/e2e_m9_rollback.sh`（旧端 = tag v1.20.1，新端 = 工作树二进制；
 每格打印 PASS/FAIL，导出拒绝格另断言目标库零改动）。LC-3 已定案：**CMK 激活是不归点**——
 DARE AAD 绑定 `key_id`，meta-only rewrap 不可能让 pre-CMK 二进制读出 CMK 数据；
-`cmk rewrap` 只在同一 CMK 内做版本升级（重写数据分片，不是只换信封），不覆盖 pre-CMK
-旧端的读路径。回退必须走完整重加密/迁移，见 §1.3。
+`cmk rewrap` 默认在同一 CMK 内做版本升级，v1.28 的 `--to-legacy` 会完整重写数据分片到
+legacy provider（不是只换信封，且仍非 meta-only），但仅离线/standalone。回退见 §1.3。
 
 ### 1.7 测试与粗估
 
@@ -384,9 +410,15 @@ DARE AAD 绑定 `key_id`，meta-only rewrap 不可能让 pre-CMK 二进制读出
   **2026-10-31 wave-4 交付 `attested-proxy`**：可信网段内终止 mTLS/PrivateLink 的代理签发
   HS256 短期 JWT（`vpce`/`vpc`/`account`/`iat`/`exp`），服务端验签、要求可信直连 peer、
   限制时效并核对声明；evidence=`attested-proxy` 入审计，registry 检查不放宽。
-  **真实 AWS PrivateLink API 与 mTLS 证书→vpce 映射仍未实现**：后者需要配置/注册表载体
-  （当前 `ApTrustConfig`/`vpc_endpoints` 没有证书指纹列），只证明「有证书」不等于
-  「是该端点」；不伪造身份。
+  **2026-11-01 wave-5 交付直连 `mtls` 与 `aws-api`**：`mtls` 把 rustls 握手已验证的客户端
+  叶证书 SHA-256 经 `ApConnInfo` 直接映射到端点
+  （`OSS_AP_MTLS_ENDPOINTS=<sha256>=<vpce>[=<vpc>[=<account>]];...`，重复指纹/畸形 ID
+  拒绝启动；客户端头无法伪造）；`aws-api` 用 SigV4 调 EC2
+  `DescribeNetworkInterfaces`/`DescribeVpcEndpoints`，按直连源 IP 解析 ENI→endpoint
+  （唯一命中且 `State=available`），源 IP+60s TTL 缓存，API 错误 fail-closed；要求
+  NLB/网关保留客户端源 IP，可选 `OSS_AP_VPC_ID`/`OSS_AP_AWS_ACCOUNT_ID` 交叉校验。
+  **真实 AWS PrivateLink 端到端验收仍未执行**：测试只用本地 mock 覆盖签名请求形状、
+  响应解析、状态判定与缓存，部署前必须在真实 AWS 账号验收；registry 检查不放宽。
 - **仍缺**：跨节点实时用量聚合（硬字节/对象数配额已交付，30s/60s 有界陈旧；Raft
   配置命令见 feature 8）。账户规范化 worker 已交付：standalone 单事务 + marker，Raft
   leader 复用 level-3 `AccountCreate`/`AccountMemberAttach` 补 legacy 行
@@ -428,8 +460,9 @@ DARE AAD 绑定 `key_id`，meta-only rewrap 不可能让 pre-CMK 二进制读出
   account_id, state)` 注册表；只接受来自**可信反代**（mTLS/固定 CIDR）的
   `x-oss-source-vpce`，并与 `aws:SourceVpc` 一样 fail-closed；新增
   `StringEquals.aws:SourceVpce` 条件；端点归属账户参与授权。客户端直连头一律忽略。
-  **已交付切片（wave-3）**：可插拔 `EndpointIdentityVerifier` + 可信反代验证器；
-  注册表/账户/VPC 校验在验证后执行。mTLS/attested-proxy 仍是下一片。
+  **已交付切片**：wave-3 可插拔 `EndpointIdentityVerifier` + 可信反代验证器；wave-4
+  `attested-proxy`；wave-5 直连 `mtls` 与 AWS API `aws-api`（mock 验证）。注册表/账户/VPC
+  校验在验证后执行。真实 AWS PrivateLink 端到端验收仍是缺口。
 
 ### 3.4 明确非目标
 
@@ -475,7 +508,7 @@ DARE AAD 绑定 `key_id`，meta-only rewrap 不可能让 pre-CMK 二进制读出
 M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）与 inventory 运行态
 复制（feature 5）已落地；lifecycle 游标也在 feature 5 复制（Lifecycle* 命令），终态
 作业历史保留（`JobPurge`）在 feature 6 交付，tier restore 后续状态与调度租约在 feature 7
-交付；剩余的是故障切换演练与 Restore 清理 fencing：
+交付；剩余的是完整故障切换演练（Restore 清理 fencing 已在 v1.28 收口）：
 
 - `ControlPlane` 覆盖 11 表命令与 level-3 账户/成员命令（`raft/command.rs:226-275`、
   `raft/apply/accounts.rs:60-250`）；follower 写返回 `Unavailable` + leader 提示，
@@ -491,6 +524,10 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
   acquire/renew/takeover 也经 `TierRestore*`/`ScheduleLeaseAcquire` 复制
   （`raft/apply/{tier_restore,lease}.rs`、`job_state/{restore,lease}.rs`），leader
   本地库丢失不再丢这部分在途状态。
+- **M8 follower restore fencing（2026-11-01 wave-5）**：follower 发起的
+  `TierRestoreDelete` 在 `UNFENCED`（term 0）时不再盲删，改用本地 applied 行自身的
+  `fence_term` 作为 token；行缺失时不再 append（由 leader reaper 收敛），apply 端按
+  `fence_term <= token` 幂等删除。新增 3-voter `raft_restore_failover` 演练（1/0）。
 - M8-2a 交付的是**快照扩展**而非日志复制：九张运行态表编码为 OSSCTL3 命名扩展
   `m8.runstate`（`raft/runstate/mod.rs:1-10`、`migrations/0007_m8_runstate.sql`），
   随快照安装/导出携带。
@@ -502,13 +539,19 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
   连续 ≥256 行（≤1024 行/16 MiB）压成 `raft_log_segment(start_idx,end_idx,data BLOB)`，
   读/truncate/purge 透明合并/切分；旧明文行透明读，坏段 fail-closed。新格式对旧二进制
   不可读，按停写蓝绿升级、写后不回退。
+  **2026-11-01 wave-5 加固**：`raft_meta.raft_log_format` 标记日志格式（缺失/`1`=旧，
+  `2`=压缩/分段；更高或不可解析 fail-closed）；v1.27 无标记库在 open 时若发现 `z1:` 行
+  或分段即补写 `2`（与数据同一 `BEGIN IMMEDIATE` 事务）。append 内最多两段有界压缩：
+  最新连续 run + 一段更旧 run（各 ≤1024 行/16 MiB），旧区间不会永久停滞；20k entry
+  soak 通过（`raft::store` 26/0）。
 - 审计仍本地（`state.rs` 的 `audit_log`）；AP 缓存进程本地 + TTL（`ap.rs:9-12`）；
   JWT 无状态、12h 过期（`console.rs`）；登录限流器进程本地——多节点会话天然可跨节点，
   但限流与吊销强度下降。
 - **M8-3 已交付**：`?consistent=1` 有界追赶 + `x-oss-applied-index` 响应头
   （`console.rs::console_read_consistency`、`tests/m8_read_consistency.rs`）。
-- **仍缺**：真实滚动故障切换演练（`tests/e2e_m8.sh` 为单节点）与 follower Restore
-  清理的即时 fencing（follower 提交 UNFENCED term 0，依赖 leader reaper 收敛）。
+- **仍缺**：完整滚动故障切换演练（已有 3-voter `raft_restore_failover`；
+  `tests/e2e_m8.sh` 仍为单节点）。follower Restore 清理已在 v1.28 改为按 applied 行
+  自身 `fence_term` 收口，不再提交 term 0。
   M8-2 的 jobs/tier_restores 切片已在 feature 4，
   inventory 与 lifecycle 游标切片在 feature 5 交付，终态作业保留在 feature 6 交付
   （`JobPurge` 只删终态行并清引用），tier restore 后续状态与调度租约在 feature 7 交付。
@@ -519,8 +562,8 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 
 ### 4.2 真正阻塞点
 
-1. follower 发起的 Restore 清理仍携带 UNFENCED（term 0），依赖 leader reaper 收敛；
-   真实滚动故障切换演练仍缺。
+1. follower Restore 清理已改为 applied 行自身 `fence_term`（v1.28），但完整滚动故障
+   切换演练仍缺；`raft_restore_failover` 只覆盖 restore 场景。
 2. 调度器 lease/takeover 已由 feature 7 交付；剩余是 M8-5 故障切换演练。
 3. follower 读是本地已应用状态，不是线性一致；控制台写后读可能看不到自己的写。
 4. 审计本地、限流本地、会话吊销粒度不足。
@@ -566,8 +609,8 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
   同事务只删当前仍为 `done`/`error`/`cancelled` 的 jobs 与其 job_tasks，并清空
   inventory_runs/tier_restores/parent_job_id 引用（避免快照安装悬空）；`queued`/
   `running`/`preempted` 永不删除。leader 每小时按 `OSS_JOB_RETENTION_DAYS`（默认 30，
-  0 关闭）分批清理；effective level <6 时 append 前拒绝。剩余：M8-5 故障切换演练与
-  follower Restore 清理的即时 fencing。
+  0 关闭）分批清理；effective level <6 时 append 前拒绝。剩余：M8-5 完整故障切换
+  演练（follower Restore 清理 fencing 已在 v1.28 收口）。
   启用前置：feature 4 需全集群 level-4 二进制并移除/升级 v1.22 及更早节点；feature 5
   还需移除/升级 v1.23.0（不能解码 Inventory*/Lifecycle*），再显式配置 `[raft].feature_level=5`。
   **激活标记语义**：`m8_runstate_activated` 只由 level-4 事实置位——安装 level-4 快照、
@@ -637,7 +680,9 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 > **状态（2026-10-30）**：SH-0 拓扑 v4 与 SH-1 离线
 > `cluster-shrink plan/apply/verify/commit/rollback` 已交付（v1.20.0；验收记录 §14.1/§15.2），
 > 本节保留为实现前的设计记录。单机→集群仍按 §5.3 SH-2「重新灌入」处理：现有
-> `scripts/single-to-cluster.sh`（离线 plan/resume/verify，只迁当前版本，不是拓扑转换）。
+> `scripts/single-to-cluster.sh`（离线 plan/resume/verify，只迁当前版本，不是拓扑转换）；
+> v1.28 补 `tests/e2e_single_to_cluster_real.sh` 双回环服务器 plan/copy/verify/resume
+> e2e（6/6 PASS），仍不是原地拓扑转换。
 
 ### 5.1 现状与证据
 
@@ -728,8 +773,9 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
 - **DP-0/DP-1 数据面握手与矩阵** → 数据面滚动；**DP-2 TLS 热轮换**可并行；两者都不依赖
   Level C。
 - **LC-1 OSSCTL2** 是共享地基：Level C（LC-2/3/4）与 M8 持久化（M8-2）都依赖它。
-- **Level C** 还依赖「兼容补丁线 v1.13.2」的产品决策与 CMK 重加密/迁移执行（不是
-  meta-only rewrap）；没有补丁线就不要承诺任意双向。
+- **Level C** 还依赖「兼容补丁线 v1.13.2」的产品决策；CMK→legacy 离线迁移已在 v1.28
+  交付（仅 standalone，不是 meta-only rewrap），集群在线迁移仍缺；没有补丁线就不要承诺
+  任意双向。
 - **账户 AC-0/AC-1/AC-2/AC-3** 彼此可并行于其他线；**AP 跨账户 AC-4 依赖账户**；
   **VPC 端点身份 AC-5 依赖账户 + AP**。
 - **M8-0/M8-1** 可先做（防重复、改善体验）；**M8-2 依赖 OSSCTL2**；M8-3/4/5 可在 M8-1 后做。
@@ -745,8 +791,8 @@ M8-2a 的运行态快照扩展、M8-2 jobs/tier_restores 复制（feature 4）�
    需求再排。账户是 AP 跨账户/VPC 的前置，越早做越省返工。
 4. **第 3 阶段（4–6 周）**：LC-1 OSSCTL2；没有它，Level C 与 M8 持久化都只能停在设计。
 5. **第 4 阶段（6–9 周）**：M8-1 → M8-2 → M8-3/4/5；M8-2 必须等 OSSCTL2。
-6. **第 5 阶段（6–10 周）**：Level C 收尾（LC-2/4、CMK 重加密/迁移执行 + 补丁线发布/
-   演练）；建议在 OSSCTL2 稳定一个版本后再做。
+6. **第 5 阶段（6–10 周）**：Level C 收尾（LC-2/4、集群在线 CMK 迁移 + 补丁线发布/
+   演练；离线 CMK→legacy 迁移已在 v1.28 交付）；建议在 OSSCTL2 稳定一个版本后再做。
 7. **最后（8–12 周）**：SH-0/SH-1 shrink；单机→集群保持离线「重新灌入」脚本，
    不工具化原地转换。
 

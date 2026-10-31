@@ -4,11 +4,12 @@
 
 ## 当前状态
 
-M1–M9 已完成，最新发布 **v1.27.0（2026-10-31）**；M5 安全与锁定全部交付——集群行一致性
+M1–M9 已完成，最新发布 **v1.28.0（2026-11-01）**；M5 安全与锁定全部交付——集群行一致性
 广播 · 密钥库/KMS · 加密数据面 DARE 式 · S3 面 SSE-S3/KMS/C · 对象锁 · STS（含
-`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.27 交付 feature level 8 的硬配额配置/
-动态 VPC 端点命令、跨版本 MPU 有界回退、Level C Ext 能力协商、AP attested-proxy、
-Raft 快照分块与日志压缩/分段，以及停写蓝绿 preflight。**以 docs/ 为准**：
+`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.28 交付 Raft 日志格式标记与旧区间有界
+压缩、M8 follower restore 以 applied 行自身 `fence_term` 收口、AP 直连 mTLS 与 AWS
+PrivateLink API 验证、CMK→legacy 全量重加密迁移、Level C 只读排空、JWT 多密钥轮换，以及
+真实 v1.26.0 蓝绿/单机→集群 e2e 与 MPU 排空工具。**以 docs/ 为准**：
 
 - `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1；§8 含各阶段落地状态）
 - `docs/superpowers/specs/2026-10-10-feature-spec.md` —— 功能域规格（行为/接口/边界/错误码；M5 域含落地记录）

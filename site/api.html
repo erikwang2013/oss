@@ -61,7 +61,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html" aria-current="page">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.27.0</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.28.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -101,7 +101,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
             <li><code>partNumber</code> 与 <code>Range</code> 同时出现 → 400 <code>InvalidRequest</code>；v1.15 起复制与 tier 摄入透传 <code>part_sizes</code>，MPU 分段边界保持可读。</li>
             <li>GET 多区间 <code>bytes=0-9,20-29</code> 不返回 <code>multipart/byteranges</code>：未签入 Range 时剥离并返回 200 整对象；Range 计入 SigV4 SignedHeaders 时返回确定性 400 <code>InvalidArgument</code>。</li>
             <li>匿名 AP 策略 <code>Principal:"*"</code> 与桶策略匿名基线取交集，仅放行数据面对象操作；控制面与对象锁/保留期头一律 403。</li>
-            <li>生命周期支持 <code>AbortIncompleteMultipartUpload</code>；STS 支持 <code>AssumeRoleWithWebIdentity</code>（默认关闭，需 OIDC 配置）；AP 跨账户已支持账户根 principal；端点身份支持 <code>trusted-proxy</code> 与 <code>attested-proxy</code>（HS256 短期断言），真实 AWS PrivateLink API 与 mTLS 证书→端点映射仍为非目标（需证书/端点注册表）。</li>
+            <li>生命周期支持 <code>AbortIncompleteMultipartUpload</code>；STS 支持 <code>AssumeRoleWithWebIdentity</code>（默认关闭，需 OIDC 配置）；AP 跨账户已支持账户根 principal；端点身份支持 <code>trusted-proxy</code>、<code>attested-proxy</code>（HS256 短期断言）、直连 <code>mtls</code>（证书 SHA-256→vpce/vpc/account）与 <code>aws-api</code>（EC2 <code>DescribeNetworkInterfaces</code>/<code>DescribeVpcEndpoints</code>，要求客户端源 IP 保留，API 错误 fail-closed）；真实 AWS 账号端到端验收未执行。</li>
             <li>Select 支持 CSV/JSON/Parquet 输入与 BZIP2/GZIP（BZIP2 仅 CSV/JSON；ScanRange 与压缩流互斥）。MPU 新 upload_id 可跨节点路由；存量裸 UUID 仍粘原节点。</li>
             <li>Batch 支持同提交者协作抢占与跨账户清单（管理员）；OSSCTL2/3 快照分别携带 level-2/3 数据，旧读者明确拒绝。</li>
             <li>v1.17：多租户账户 MVP（账户/成员/状态/桶数配额；账户写不参与 Raft）；AP 跨账户账户根 principal 与 <code>aws:SourceVpce</code> 来源证明。</li>
@@ -109,8 +109,9 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
             <li>v1.17：tier 分块哈希与归档 Range 直读（默认关闭）；CMK 离线 scan/rewrap/delete/trash；REPLICA 头需 site token 认证。</li>
             <li>v1.19：DP-1 数据面混版门控与降级头；能力级别 1..3/OSSCTL3（扩展区、Ext 容器，生产 registry 为空）；租户 schema/回填与 M8 运行态快照；<code>maintenance</code> 与 <code>cluster-shrink plan</code> 只读规划。缩容 apply、Raft 租户 API、M8 多节点与生产 Ext 命令未交付。</li>
             <li>v1.20：mesh gRPC 入站 TLS 物料热轮换（新连接取新配置，旧连接保持旧物料）；账户/成员写走 7 个 level-3 Raft 命令（按 username 自然键，OSSCTL3 快照含账户行）；缩容 topology v4 与离线 <code>apply/verify/commit/rollback</code>（v4 只在 commit 写，作回退防线）；滚动 e2e 在同版本 3 节点与 v1.13.1 旧二进制上通过。</li>
+            <li>v1.28.0：Raft 日志 <code>raft_log_format</code> 标记（缺失/1 旧格式，2 压缩/分段；未知值 fail-closed）与每次 append 两段有界压缩；follower <code>TierRestoreDelete</code> 用 applied 行自身 <code>fence_term</code>；AP 直连 <code>mtls</code> 证书指纹与 <code>aws-api</code> PrivateLink ENI 解析（真实 AWS 验收未执行）；<code>cmk rewrap --to-legacy sse-s3|sse-kms</code> 离线全量迁移（仅 standalone，meta-only 仍不可能）；<code>read_only</code> 只读排空；<code>jwt_previous_secrets</code> 轮换；真实蓝绿/MPU/单机→集群 e2e。</li>
             <li>v1.27.0：feature level 8 的账户硬配额配置（<code>AccountHardQuotaSet</code>）与动态 VPC 端点注册表（<code>VpcEndpointUpsert/Delete</code>，全 peer ≥8）；wire-1 有界 UploadPart 回退（v1.16+）与裸 UUID MPU 收尾/幂等 Complete；Ext 类型能力协商与在途 MPU 的 CMK 引用；AP <code>attested-proxy</code> 端点身份；Raft 快照 >256 KiB 分块、日志压缩/分段（新格式单向）；停写蓝绿 preflight、v1.16 下限/MPU 排空检查与 <code>--version</code>。</li>
-            <li>v1.26.0：feature level 7 的 tier restore 后续状态与调度租约复制（<code>TierRestore*</code>/<code>ScheduleLeaseAcquire</code>，全 peer ≥7）；账户硬字节/对象数配额（写入预留、删除释放、采样聚合；Raft 配置暂 501）；legacy 账户规范化 worker；流式 GET 远端分片 1 MiB 批量读；MPU 索引 TTL；<code>JobPurge</code> 保留索引；复制 Tag/And 过滤与 256 KiB 分块限速。</li>
+            <li>v1.26.0：feature level 7 的 tier restore 后续状态与调度租约复制（<code>TierRestore*</code>/<code>ScheduleLeaseAcquire</code>，全 peer ≥7）；账户硬字节/对象数配额（写入预留、删除释放、采样聚合；Raft 配置由 feature 8 交付）；legacy 账户规范化 worker；流式 GET 远端分片 1 MiB 批量读；MPU 索引 TTL；<code>JobPurge</code> 保留索引；复制 Tag/And 过滤与 256 KiB 分块限速。</li>
             <li>v1.25.0：无 Range GET 流式直出（EC 块流、加密按 unit 解密、旧 parts 块读），Range/partNumber 仍有界；列举使用每节点键缓存与在途 MPU 索引；EC 分片并行写；审计改为有界异步批量队列；feature level 6 <code>JobPurge</code> 清理终态作业（<code>OSS_JOB_RETENTION_DAYS</code>）；另含 S3 授权映射补全与 fail-closed 审计修复。</li>
             <li>v1.24.0：M8-2 inventory 三表与 lifecycle 游标经 level-5 Raft 命令复制（独立激活标记；旧本地历史不迁移；feature 5 单向门）；桶删除 apply 级联。</li>
             <li>v1.23.0：M8-2 jobs/job_tasks 与 Restore 受理行经 level-4 Raft 命令复制（feature 4，全 peer ≥4 才启用；旧节点单向门）；重试抖动修复；LC-4 回滚矩阵与 4 节点 re-ingest e2e。</li>
@@ -124,7 +125,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
           <ul>
             <li><a href="install.html">安装文档</a>：Docker、源码构建与首次启动。</li>
             <li><a href="usage.html">使用说明</a>：S3 操作、控制台、版本、加密与强一致。</li>
-            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.27.0。</li>
+            <li><a href="changelog.html">版本日志</a>：从 v1.0.0 到 v1.28.0。</li>
             <li><a href="https://github.com/erikwang2013/oss#readme" target="_blank" rel="noopener">oss README</a>：完整协议与运维细节（随发布同步）。</li>
           </ul>
         </article>
@@ -136,7 +137,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3api head-object \
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.27.0</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.28.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

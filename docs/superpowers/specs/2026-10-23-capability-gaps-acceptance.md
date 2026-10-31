@@ -4,10 +4,10 @@
 - 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0** / **v1.16.0**（2026-10-24）·
   **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
   **v1.19.0**（2026-10-26，Wave1 地基）
-- 最新发布：**v1.24.0**（2026-10-30），tag `v1.24.0`；包含 §18（M8-2 jobs/Restore 受理行
-  feature-4 复制，inventory 三表与 lifecycle 游标 feature-5 复制、桶配额并发、follower
-  权限追赶、tier-audit、升级 preflight、单机→集群 re-ingest、LC-4 回滚矩阵、Level C
-  v1.20.1 窗口验证）与 §16–§17 的 v1.21.x 内容
+- 最新发布：**v1.28.0**（2026-11-01），tag `v1.28.0`；包含 §23（Raft 日志格式标记与
+  旧区间有界压缩、CMK→legacy 离线全量迁移、M8 follower restore fencing、AP 直连 mTLS 与
+  AWS PrivateLink API 验证、Level C 只读排空、JWT 多密钥轮换、真实蓝绿/MPU 排空/单机→集群
+  e2e）与 §21–§22 的 v1.27.0 内容
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
   v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
   v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）
@@ -710,3 +710,29 @@ CMK 激活为不归点、旧行快照透明读回、生产 Ext 注册表为空�
 **验证（合并后，本机）**：fmt 通过；`oss-server --lib` **265/0**（含 `BEGIN IMMEDIATE` 修复；并行默认线程）、`xl-s3 --lib` **202/0**；集成 `m8_ap_trust` 18/0、`raft_cutover` 7/0、`raft_inventory_replication` 12/0、`raft_jobs_replication` 11/0、`raft_lifecycle_cursor_replication` 8/0、`raft_restore_lease_replication` 3/0；脚本自检 109/0 与 78/0。提交：`fee15fe`（日志）、`94f1eb1`（AP）、`31adffe`（预检）、`53607d8`（文档）、`edb1db3`（CLI）；合并 `48e12c6`/`6bc515a`/`67f42d9`/`6d51acb`。完整 workspace 聚合未跑，发布闸门以分套件为准。
 
 **已知限制**：日志新格式无 feature-level 门控（旧二进制不可读，只能停写蓝绿）；HS256 共享密钥无 `kid`/轮换，依赖可信网段+短时效；直连 mTLS 需先有证书→端点注册表；`--health-url` 探测超时按“已停止”处理，操作者仍需确认进程状态。
+
+## 23. 2026-11-01 v1.28.0：Raft 日志加固、恢复 fencing、AP 直连身份、CMK 迁移、只读排空与 JWT 轮换
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| Raft 日志格式标记与旧区间压缩 | `oss-server/raft/store.rs` | `raft_meta.raft_log_format`（缺失/`1` 旧格式，`2` 压缩/分段；更高/不可解析 fail-closed）；v1.27 无标记库 open 时按 `z1:`/分段补写 `2`；append 事务内最多两段有界压缩（最新连续段 + 一段更旧区间）。`raft::store` **26/0**（含 20k entry soak、`log_format_marker_guards_downgrade`、`log_format_marker_write_is_atomic_with_data`、`older_row_runs_compact_over_subsequent_appends`） |
+| CMK→legacy 迁移 | `xl-store/store/cmk_rewrap.rs`、`oss-server/cli.rs` | `oss-server cmk rewrap --name <cmk> --to-legacy sse-s3|sse-kms --apply` 逐版本全量重加密；在途 MPU、桶默认引用、缺失目标 provider 在扫描/写入前拒绝；每版本独立、绝不删除 CMK；`[cluster]`/`[stretch]` 离线拒绝。xl-store cmk **23/0**、CLI **18/0** |
+| M8 follower restore fencing | `job_state/restore.rs`、`raft/apply/tier_restore.rs` | `UNFENCED`（term 0）的 `TierRestoreDelete` 改用 applied 行自身 `fence_term`；行缺失不 append（leader reaper 收敛）；apply 端 `fence_term <= token` 幂等。lib restore **3/0**、`raft_restore_failover` **1/0**、restore/lease **3/0** |
+| AP 直连 mTLS / AWS PrivateLink API | `xl-s3/ap.rs`、`oss-server/{router,ap_aws}.rs`、`tests/{m8_ap_trust,ap_aws}.rs` | `mtls`：`OSS_AP_MTLS_ENDPOINTS=<sha256>=<vpce>[=<vpc>[=<account>]];...`，指纹取自 rustls 握手（`ApConnInfo`），重复/畸形拒绝启动；`aws-api`：SigV4 调 EC2 `DescribeNetworkInterfaces`/`DescribeVpcEndpoints`，源 IP→ENI→endpoint（唯一且 `State=available`），60s TTL 缓存，错误 fail-closed，要求客户端源 IP 保留。xl-s3 ap **37/0**、`m8_ap_trust` **22/0**、`ap_aws` **4/0** |
+| Level C 只读排空 | `oss-server/router.rs`、`tests/read_only.rs` | 顶层 `read_only=true`：写请求 503 + `x-oss-read-only: 1`；GET/HEAD/OPTIONS、精确 `POST /api/v1/login`、健康/指标、Raft RPC 可用；`/health/cluster` 暴露 `read_only`；旧二进制无开关，混版须 LB 摘除。read_only **2/0**、config **1/0** |
+| JWT 多密钥轮换 | `oss-server/{config,state}.rs`、`tests/jwt_rotation.rs` | `jwt_previous_secrets` 每项 ≥32 B、去重、异于 `jwt_secret`；多密钥验证共享黑名单/过期；轮换顺序 add→restart→switch→restart→12h 后移除；登录限流与审计仍节点本地。jwt_rotation **4/0**、config **2/0** |
+| 蓝绿 e2e 与 MPU 排空 | `tests/e2e_blue_green.sh`、`scripts/mpu-drain.sh` | 真实 v1.26.0 → 当前二进制同数据目录切换 + 冷备回滚，**22/22 PASS**；`mpu-drain.sh` 列出/中止在途 MPU、绝不删除已提交对象，自检 **43/0**；`upgrade-preflight` **109/0**、`blue-green-preflight` **78/0** |
+| 单机→集群真实 e2e | `tests/e2e_single_to_cluster_real.sh` | 两个回环服务器跑 plan/copy/verify/resume，**6/6 PASS**；仍是离线重新灌入（只迁当前版本），不是原地拓扑转换 |
+| 混合 v1.16 MPU e2e（未执行） | `tests/e2e_mpu_mixed.sh` | 已编写；本环境因宿主 I/O 饱和无法构建 v1.16 二进制，**未执行**，不得记为通过 |
+
+**验证（合并后，本机）**：以上分套件计数随各实现提交合入；`cargo fmt --all --check` 与相关 clippy 已通过。完整 `cargo test --workspace` 未在宿主高负载下聚合运行，发布以分 crate/分套件闸门为准。
+
+**已知限制 / 仍未交付**：
+
+- 跨节点硬配额聚合仍是 30s/60s 有界陈旧；精确聚合需要复制用量账本或写路径预留，未交付。
+- 集群级登录限流与审计复制仍未做（两者按设计保持节点本地）；JWT 轮换不改变这一点。
+- 真实 AWS PrivateLink 端到端验收未执行：`aws-api` 仅本地 mock 覆盖签名/解析/状态/缓存；上线前需真实 AWS 账号 + 客户端源 IP 保留。
+- 混合 v1.16 MPU e2e 未执行（v1.16 二进制在宿主负载下构建失败），不能据此宣称混合版本 MPU 通过。
+- 任意双向混写（旧二进制安全写新数据）未交付且在不打补丁的前提下不可行；安全运维模型是只读排空 + 从 LB 移除旧节点。
+- 集群在线 CMK→legacy 迁移未交付：`--to-legacy` 是离线 CLI，`[cluster]`/`[stretch]` 配置会拒绝；meta-only 降级仍不可能。
+- Raft 日志格式无 feature-level 门控，仍依赖停写蓝绿；写过格式 `2` 后不可回退旧二进制。
