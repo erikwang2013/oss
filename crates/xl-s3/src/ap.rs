@@ -12,7 +12,8 @@
 //! Slice A 的端点 registry（`[[ap.vpc_endpoints]]`）同样是**注册断言**：只把可信来源的
 //! vpce 声明收紧为「已登记、active、受账户约束」，不能证明连接真的来自该端点。
 //! 配置 `EndpointIdentityVerifier` 时，来源证明先由验证器按传输层事实收敛为
-//! `ApEndpointIdentity`（可信反代网段；AWS/mTLS 为外部契约），再与 registry 行交叉校验；
+//! `ApEndpointIdentity`（可信反代网段，或可信网段内已证明代理签署的短期断言；
+//! AWS/mTLS 为外部契约），再与 registry 行交叉校验；
 //! 未配置时行为与 Slice A 完全一致。AP 缓存是进程本地 + TTL 有界；强跨节点一致性仍是
 //! non-goal。
 //!
@@ -24,6 +25,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use s3s::{S3Request, S3Response, S3Result};
 use serde::Deserialize;
 
@@ -833,6 +835,8 @@ pub enum ApEndpointEvidence {
     StaticConfig,
     /// 可信反代：直连对端在显式可信网段内，声明头由该反代注入。
     TrustedProxy,
+    /// 已证明代理签发的短期端点断言（HS256 JWT）：签名 + 可信 peer + 声明匹配。
+    AttestedProxy,
     /// 双向 TLS 客户端证书（外部验证器；本仓库尚未把证书下沉到请求，见 trait 契约）。
     Mtls,
     /// AWS PrivateLink 控制面 API 核对（外部验证器；本仓库不伪造，见 trait 契约）。
@@ -844,6 +848,7 @@ impl ApEndpointEvidence {
         match self {
             Self::StaticConfig => "static",
             Self::TrustedProxy => "trusted-proxy",
+            Self::AttestedProxy => "attested-proxy",
             Self::Mtls => "mtls",
             Self::AwsApi => "aws-api",
         }
@@ -871,10 +876,23 @@ pub enum ApEndpointClaim {
     Malformed,
 }
 
+/// 紧凑 JWT 形状（三段 base64url、非空、有界长度）：签名/时效由验证器判定。
+/// 只用于把头归一为 `Header`/`Malformed`，本身不赋予任何信任。
+pub fn valid_attestation(raw: &str) -> bool {
+    (16..=4096).contains(&raw.len())
+        && raw.bytes().filter(|b| *b == b'.').count() == 2
+        && raw.split('.').all(|part| !part.is_empty())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// 端点身份验证输入：只含传输层/路由器可给出的事实，不含已采信的头语义。
 #[derive(Debug, Clone, Default)]
 pub struct ApEndpointContext {
     pub claim: ApEndpointClaim,
+    /// `x-oss-endpoint-attestation`（代理签名断言）；与 claim 同样的 fail-closed 归一。
+    pub attestation: ApEndpointClaim,
     /// 进程级静态声明（部署配置，不是连接事实）。
     pub static_vpce: Option<String>,
     /// 直连 TCP 对端（ConnectInfo）；None = 传输层不提供 → 可信反代不成立。
@@ -903,9 +921,11 @@ pub enum ApEndpointVerifyError {
 ///   恰好一个 ENI/端点关联且端点 `State=available`，从响应取 `VpcEndpointId/VpcId/
 ///   OwnerId`，evidence=`AwsApi`。API 超时/限流/错误一律 `Unavailable`，结果按源 IP/TTL
 ///   缓存且失败不放行；绝不读取客户端端点/账户头。
-/// - mTLS：需传输层把客户端叶证书指纹/身份注入 [`ApEndpointContext`]（当前主监听器
-///   只在握手期可见，未下沉到请求）；在拿到该数据前不实现，避免把「有证书」当成
-///   「是该端点」。
+/// - mTLS：rustls 只在握手期持有已验证的客户端叶证书。技术上可由
+///   `tls_server.rs` 的自定义 `Connected` 把叶证书 SHA-256 注入请求，但本切片没有
+///   「指纹 → vpce」的配置载体（`[ap.vpc_endpoints]`/`ApTrustConfig` 均无该字段，
+///   config/schema 不在改动范围）；只证明「有证书」不等于「是该端点」，故不实现，
+///   待引入显式证书注册表后再接。attested-proxy 是当前可交付的端点身份路径。
 #[async_trait::async_trait]
 pub trait EndpointIdentityVerifier: Send + Sync {
     async fn verify(
@@ -961,6 +981,138 @@ impl EndpointIdentityVerifier for TrustedProxyEndpointVerifier {
                 }))
             }
         }
+    }
+}
+
+/// 已证明代理（terminates mTLS/PrivateLink）签发的短期端点断言验证器。
+///
+/// 代理对「连接 → VPC 端点」的映射签署 HS256 紧凑 JWT，claims：`vpce`（必需）、
+/// 可选 `vpc`/`account`、`iat`/`exp`。直连客户端既无密钥也不在可信网段，无法伪造。
+/// 验证顺序：静态部署证明 → 头形状 → 可信直连对端 → 签名/时效 → vpce 与声明一致。
+pub struct AttestedProxyEndpointVerifier {
+    trusted_peers: Vec<Cidr>,
+    key: DecodingKey,
+    max_age_secs: u64,
+}
+
+/// 断言 claims（额外字段忽略；时效由本验证器显式判定）。
+#[derive(Deserialize)]
+struct EndpointAttestationClaims {
+    vpce: String,
+    vpc: Option<String>,
+    account: Option<String>,
+    iat: u64,
+    exp: u64,
+}
+
+impl AttestedProxyEndpointVerifier {
+    /// HS256 共享密钥下限（RFC 7518 §3.2：不短于哈希输出）；不足拒绝启动。
+    pub const MIN_SECRET_BYTES: usize = 32;
+
+    /// `max_age_secs`：签发时效上限，也是 token 总寿命上限（`exp - iat`）。
+    pub fn new(
+        trusted_peers: impl IntoIterator<Item = Cidr>,
+        secret: &[u8],
+        max_age_secs: u64,
+    ) -> Result<Self, String> {
+        if secret.len() < Self::MIN_SECRET_BYTES {
+            return Err(format!(
+                "OSS_AP_ATTESTATION_SECRET 至少 {} 字节（当前 {}）",
+                Self::MIN_SECRET_BYTES,
+                secret.len()
+            ));
+        }
+        if max_age_secs == 0 {
+            return Err("OSS_AP_ATTESTATION_MAX_AGE_SECS 必须 >= 1".into());
+        }
+        Ok(Self {
+            trusted_peers: trusted_peers.into_iter().collect(),
+            key: DecodingKey::from_secret(secret),
+            max_age_secs,
+        })
+    }
+
+    fn decode(&self, token: &str) -> Result<EndpointAttestationClaims, ApEndpointVerifyError> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        // 时效统一在本验证器判定（exp/iat/窗口），避免库默认 leeway 放宽。
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        validation.required_spec_claims.clear();
+        validation.leeway = 0;
+        decode::<EndpointAttestationClaims>(token, &self.key, &validation)
+            .map(|data| data.claims)
+            .map_err(|_| ApEndpointVerifyError::Denied("bad-attestation"))
+    }
+}
+
+#[async_trait::async_trait]
+impl EndpointIdentityVerifier for AttestedProxyEndpointVerifier {
+    async fn verify(
+        &self,
+        ctx: &ApEndpointContext,
+    ) -> Result<Option<ApEndpointIdentity>, ApEndpointVerifyError> {
+        use ApEndpointClaim::{Absent, Header, Malformed};
+        // 静态部署证明优先，与 `Attest` 的既有语义一致。
+        if let Some(vpce) = &ctx.static_vpce {
+            return Ok(Some(ApEndpointIdentity {
+                vpce_id: vpce.clone(),
+                vpc_id: None,
+                account_id: None,
+                evidence: ApEndpointEvidence::StaticConfig,
+            }));
+        }
+        let (vpce, token) = match (&ctx.claim, &ctx.attestation) {
+            (Malformed, _) => return Err(ApEndpointVerifyError::Denied("malformed-claim")),
+            (_, Malformed) => return Err(ApEndpointVerifyError::Denied("malformed-attestation")),
+            (Absent, Absent) => return Ok(None),
+            (Absent, Header(_)) => return Err(ApEndpointVerifyError::Denied("missing-claim")),
+            (Header(_), Absent) => {
+                return Err(ApEndpointVerifyError::Denied("missing-attestation"));
+            }
+            (Header(vpce), Header(token)) => (vpce, token),
+        };
+        // 先验连接来源：非可信对端不消耗签名验证，也绝不采信其断言。
+        if !ctx
+            .direct_peer
+            .is_some_and(|ip| self.trusted_peers.iter().any(|c| c.contains(ip)))
+        {
+            return Err(ApEndpointVerifyError::Denied("untrusted-source"));
+        }
+        let claims = self.decode(token)?;
+        if !valid_vpce_id(&claims.vpce)
+            || claims.vpc.as_deref().is_some_and(|v| !valid_vpc_id(v))
+            || claims
+                .account
+                .as_deref()
+                .is_some_and(|a| !crate::access::valid_account_id(a))
+        {
+            return Err(ApEndpointVerifyError::Denied("invalid-attestation"));
+        }
+        if claims.vpce != *vpce {
+            return Err(ApEndpointVerifyError::Denied("vpce-mismatch"));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if claims.iat > now {
+            return Err(ApEndpointVerifyError::Denied("attestation-not-yet-valid"));
+        }
+        if now - claims.iat > self.max_age_secs {
+            return Err(ApEndpointVerifyError::Denied("stale-attestation"));
+        }
+        if claims.exp <= now {
+            return Err(ApEndpointVerifyError::Denied("expired-attestation"));
+        }
+        if claims.exp.saturating_sub(claims.iat) > self.max_age_secs {
+            return Err(ApEndpointVerifyError::Denied("attestation-window"));
+        }
+        Ok(Some(ApEndpointIdentity {
+            vpce_id: claims.vpce,
+            vpc_id: claims.vpc,
+            account_id: claims.account,
+            evidence: ApEndpointEvidence::AttestedProxy,
+        }))
     }
 }
 
@@ -2946,6 +3098,7 @@ mod tests {
         let ctx = |claim: ApEndpointClaim, peer: Option<&str>, static_vpce: Option<&str>| {
             ApEndpointContext {
                 claim,
+                attestation: ApEndpointClaim::Absent,
                 static_vpce: static_vpce.map(str::to_string),
                 direct_peer: peer.map(|p| p.parse().unwrap()),
             }
@@ -2994,6 +3147,320 @@ mod tests {
         assert_eq!(id.evidence, ApEndpointEvidence::StaticConfig);
     }
 
+    const ATTEST_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    #[derive(Clone, Copy, serde::Serialize)]
+    struct TestAttestation<'a> {
+        vpce: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vpc: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account: Option<&'a str>,
+        iat: u64,
+        exp: u64,
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn attest(claims: &TestAttestation<'_>, secret: &str) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn attested_ctx(
+        claim: ApEndpointClaim,
+        token: Option<String>,
+        peer: Option<&str>,
+    ) -> ApEndpointContext {
+        ApEndpointContext {
+            claim,
+            attestation: token.map_or(ApEndpointClaim::Absent, ApEndpointClaim::Header),
+            static_vpce: None,
+            direct_peer: peer.map(|p| p.parse().unwrap()),
+        }
+    }
+
+    fn attested() -> AttestedProxyEndpointVerifier {
+        AttestedProxyEndpointVerifier::new(
+            [parse_cidr("10.0.0.0/8").unwrap()],
+            ATTEST_SECRET.as_bytes(),
+            60,
+        )
+        .unwrap()
+    }
+
+    /// 合法断言：签名 + 可信 peer + vpce 与声明头一致 → AttestedProxy 身份；
+    /// 可选 vpc/account 原样下沉给 registry 交叉校验。
+    #[tokio::test]
+    async fn attested_proxy_verifier_accepts_valid_token() {
+        let t = now_secs();
+        let claims = TestAttestation {
+            vpce: "vpce-abc",
+            vpc: Some("vpc-1"),
+            account: Some("000000000007"),
+            iat: t - 5,
+            exp: t + 30,
+        };
+        let id = attested()
+            .verify(&attested_ctx(
+                ApEndpointClaim::Header("vpce-abc".into()),
+                Some(attest(&claims, ATTEST_SECRET)),
+                Some("10.1.2.3"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.vpce_id, "vpce-abc");
+        assert_eq!(id.vpc_id.as_deref(), Some("vpc-1"));
+        assert_eq!(id.account_id.as_deref(), Some("000000000007"));
+        assert_eq!(id.evidence, ApEndpointEvidence::AttestedProxy);
+
+        // 可选 claims 缺省 = 证据不提供该字段（registry 仍按行校验）。
+        let minimal = TestAttestation {
+            vpce: "vpce-abc",
+            vpc: None,
+            account: None,
+            iat: t - 1,
+            exp: t + 59,
+        };
+        let id = attested()
+            .verify(&attested_ctx(
+                ApEndpointClaim::Header("vpce-abc".into()),
+                Some(attest(&minimal, ATTEST_SECRET)),
+                Some("10.1.2.3"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.vpc_id, None);
+        assert_eq!(id.account_id, None);
+        assert_eq!(id.evidence, ApEndpointEvidence::AttestedProxy);
+    }
+
+    /// 篡改/换钥/声明不一致/claims 畸形一律拒绝。
+    #[tokio::test]
+    async fn attested_proxy_verifier_rejects_tampered_and_mismatched_tokens() {
+        let t = now_secs();
+        let claims = TestAttestation {
+            vpce: "vpce-abc",
+            vpc: Some("vpc-1"),
+            account: None,
+            iat: t,
+            exp: t + 30,
+        };
+        let good = attest(&claims, ATTEST_SECRET);
+        let verify = |token: String| {
+            let verifier = attested();
+            let ctx = attested_ctx(
+                ApEndpointClaim::Header("vpce-abc".into()),
+                Some(token),
+                Some("10.1.2.3"),
+            );
+            async move { verifier.verify(&ctx).await }
+        };
+
+        // 翻改 payload 任一字节 → 签名失效。
+        let mut bytes = good.clone().into_bytes();
+        let idx = bytes.iter().position(|b| *b == b'.').unwrap() + 3;
+        bytes[idx] = if bytes[idx] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            verify(tampered).await,
+            Err(ApEndpointVerifyError::Denied("bad-attestation"))
+        );
+        // 换钥伪签。
+        let foreign = attest(&claims, "ffffffffffffffffffffffffffffffff");
+        assert_eq!(
+            verify(foreign).await,
+            Err(ApEndpointVerifyError::Denied("bad-attestation"))
+        );
+        // 合法签名但 vpce 与声明头不一致。
+        let other = TestAttestation {
+            vpce: "vpce-other",
+            ..claims
+        };
+        assert_eq!(
+            verify(attest(&other, ATTEST_SECRET)).await,
+            Err(ApEndpointVerifyError::Denied("vpce-mismatch"))
+        );
+        // claims 形态非法（vpc 前缀 / account 长度）。
+        let bad_vpc = TestAttestation {
+            vpc: Some("VPC-BAD"),
+            ..claims
+        };
+        assert_eq!(
+            verify(attest(&bad_vpc, ATTEST_SECRET)).await,
+            Err(ApEndpointVerifyError::Denied("invalid-attestation"))
+        );
+        let bad_account = TestAttestation {
+            account: Some("123"),
+            ..claims
+        };
+        assert_eq!(
+            verify(attest(&bad_account, ATTEST_SECRET)).await,
+            Err(ApEndpointVerifyError::Denied("invalid-attestation"))
+        );
+    }
+
+    /// 时效窗口：过期 / iat 过旧 / iat 在将来 / 总寿命超窗均拒绝；边界内接受。
+    #[tokio::test]
+    async fn attested_proxy_verifier_enforces_age_window() {
+        let t = now_secs();
+        let token = |iat: u64, exp: u64| {
+            attest(
+                &TestAttestation {
+                    vpce: "vpce-abc",
+                    vpc: None,
+                    account: None,
+                    iat,
+                    exp,
+                },
+                ATTEST_SECRET,
+            )
+        };
+        let verify = |token: String| {
+            let verifier = attested();
+            let ctx = attested_ctx(
+                ApEndpointClaim::Header("vpce-abc".into()),
+                Some(token),
+                Some("10.1.2.3"),
+            );
+            async move { verifier.verify(&ctx).await }
+        };
+
+        assert_eq!(
+            verify(token(t - 30, t - 1)).await,
+            Err(ApEndpointVerifyError::Denied("expired-attestation")),
+            "已过期"
+        );
+        assert_eq!(
+            verify(token(t - 61, t + 10)).await,
+            Err(ApEndpointVerifyError::Denied("stale-attestation")),
+            "iat 超出 max_age"
+        );
+        assert_eq!(
+            verify(token(t + 60, t + 120)).await,
+            Err(ApEndpointVerifyError::Denied("attestation-not-yet-valid")),
+            "iat 在将来"
+        );
+        assert_eq!(
+            verify(token(t - 5, t + 56)).await,
+            Err(ApEndpointVerifyError::Denied("attestation-window")),
+            "总寿命超过 max_age（61s）"
+        );
+        // 边界：寿命恰好 60s 且年龄在窗口内 → 接受。
+        assert!(matches!(
+            verify(token(t - 55, t + 5)).await,
+            Ok(Some(ApEndpointIdentity { .. }))
+        ));
+    }
+
+    /// 缺 token / 缺声明 / 畸形头 / 非可信 peer / 无断言 → 各自的收口语义。
+    #[tokio::test]
+    async fn attested_proxy_verifier_fails_closed() {
+        let t = now_secs();
+        let claims = TestAttestation {
+            vpce: "vpce-abc",
+            vpc: None,
+            account: None,
+            iat: t - 1,
+            exp: t + 29,
+        };
+        let good = attest(&claims, ATTEST_SECRET);
+        let v = attested();
+        let header = || ApEndpointClaim::Header("vpce-abc".into());
+
+        assert_eq!(
+            v.verify(&attested_ctx(header(), None, Some("10.1.2.3")))
+                .await,
+            Err(ApEndpointVerifyError::Denied("missing-attestation")),
+            "缺 token 必须拒绝"
+        );
+        assert_eq!(
+            v.verify(&attested_ctx(
+                ApEndpointClaim::Absent,
+                Some(good.clone()),
+                Some("10.1.2.3")
+            ))
+            .await,
+            Err(ApEndpointVerifyError::Denied("missing-claim")),
+            "有 token 无声明头"
+        );
+        assert_eq!(
+            v.verify(&attested_ctx(
+                ApEndpointClaim::Malformed,
+                Some(good.clone()),
+                Some("10.1.2.3")
+            ))
+            .await,
+            Err(ApEndpointVerifyError::Denied("malformed-claim"))
+        );
+        let bad_header = attested_ctx(header(), Some(good.clone()), Some("10.1.2.3"));
+        let bad_header = ApEndpointContext {
+            attestation: ApEndpointClaim::Malformed,
+            ..bad_header
+        };
+        assert_eq!(
+            v.verify(&bad_header).await,
+            Err(ApEndpointVerifyError::Denied("malformed-attestation"))
+        );
+        for peer in [None, Some("203.0.113.5")] {
+            assert_eq!(
+                v.verify(&attested_ctx(header(), Some(good.clone()), peer))
+                    .await,
+                Err(ApEndpointVerifyError::Denied("untrusted-source")),
+                "非可信/缺失对端必须拒绝"
+            );
+        }
+        assert_eq!(
+            v.verify(&attested_ctx(
+                ApEndpointClaim::Absent,
+                None,
+                Some("10.1.2.3")
+            ))
+            .await,
+            Ok(None),
+            "无断言不构成拒绝"
+        );
+        // 静态部署证明优先，与既有验证器一致。
+        let static_ctx = ApEndpointContext {
+            static_vpce: Some("vpce-static".into()),
+            ..attested_ctx(ApEndpointClaim::Absent, None, None)
+        };
+        let id = v.verify(&static_ctx).await.unwrap().unwrap();
+        assert_eq!(id.vpce_id, "vpce-static");
+        assert_eq!(id.evidence, ApEndpointEvidence::StaticConfig);
+    }
+
+    /// 启动期密钥/窗口校验：短密钥与 0 窗口拒绝。
+    #[test]
+    fn attested_proxy_verifier_requires_strong_secret_and_window() {
+        assert!(AttestedProxyEndpointVerifier::new([], b"too-short", 60).is_err());
+        assert_eq!(AttestedProxyEndpointVerifier::MIN_SECRET_BYTES, 32);
+        assert!(AttestedProxyEndpointVerifier::new([], ATTEST_SECRET.as_bytes(), 0).is_err());
+        assert!(AttestedProxyEndpointVerifier::new([], ATTEST_SECRET.as_bytes(), 60).is_ok());
+    }
+
+    /// 头形状归一：必须恰好三段非空 base64url 字符。
+    #[test]
+    fn attestation_header_shape_is_strict() {
+        assert!(valid_attestation(
+            "eyJhbGciOiJIUzI1NiJ9.eyJ2cGNlIjoieCJ9.c2ln"
+        ));
+        assert!(!valid_attestation("eyJhbGciOiJIUzI1NiJ9.eyJ2cGNlIjoieCJ9"));
+        assert!(!valid_attestation("eyJhbGciOiJIUzI1NiJ9..c2ln"));
+        assert!(!valid_attestation("has space.eyJ2cGNlIjoieCJ9.c2ln"));
+    }
+
     struct UnavailableVerifier;
     #[async_trait::async_trait]
     impl EndpointIdentityVerifier for UnavailableVerifier {
@@ -3024,6 +3491,7 @@ mod tests {
     fn verifier_ctx(peer: &str) -> ApEndpointContext {
         ApEndpointContext {
             claim: ApEndpointClaim::Header("vpce-abc".into()),
+            attestation: ApEndpointClaim::Absent,
             static_vpce: None,
             direct_peer: Some(peer.parse().unwrap()),
         }

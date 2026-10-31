@@ -37,7 +37,8 @@ pub struct ApTrustConfig {
     pub proxy_cidrs: Option<String>,
     pub peer_cidrs: Option<String>,
     /// 端点身份验证器：None = Slice A 行为（可信头/静态 → registry）。
-    /// `OSS_AP_ENDPOINT_VERIFIER=trusted-proxy` 装配可信反代实现。
+    /// `trusted-proxy` = 可信直连网段 + 声明头；`attested-proxy` = 可信网段内
+    /// 已证明代理签署的短期 JWT（`x-oss-endpoint-attestation`，HS256）。
     pub endpoint_verifier: Option<Arc<dyn xl_s3::ap::EndpointIdentityVerifier>>,
 }
 
@@ -62,9 +63,41 @@ impl ApTrustConfig {
                         peers,
                     )))
                 }
+                Ok(v) if v.trim().eq_ignore_ascii_case("attested-proxy") => {
+                    let secret = std::env::var("OSS_AP_ATTESTATION_SECRET").map_err(|_| {
+                        "OSS_AP_ENDPOINT_VERIFIER=attested-proxy 需要 \
+                         OSS_AP_ATTESTATION_SECRET"
+                            .to_string()
+                    })?;
+                    let peers = parse_cidr_list(
+                        std::env::var("OSS_AP_TRUSTED_PEER_CIDRS").ok().as_deref(),
+                        "OSS_AP_TRUSTED_PEER_CIDRS",
+                    )?;
+                    if peers.is_empty() {
+                        return Err("OSS_AP_ENDPOINT_VERIFIER=attested-proxy 需要非空 \
+                             OSS_AP_TRUSTED_PEER_CIDRS"
+                            .into());
+                    }
+                    let max_age = match std::env::var("OSS_AP_ATTESTATION_MAX_AGE_SECS") {
+                        Ok(raw) if !raw.trim().is_empty() => {
+                            raw.trim().parse::<u64>().map_err(|_| {
+                                format!(
+                                    "OSS_AP_ATTESTATION_MAX_AGE_SECS 非法: {}",
+                                    raw.escape_debug()
+                                )
+                            })?
+                        }
+                        _ => 60,
+                    };
+                    Some(Arc::new(xl_s3::ap::AttestedProxyEndpointVerifier::new(
+                        peers,
+                        secret.as_bytes(),
+                        max_age,
+                    )?))
+                }
                 Ok(v) => {
                     return Err(format!(
-                        "OSS_AP_ENDPOINT_VERIFIER 非法: {}（支持 trusted-proxy）",
+                        "OSS_AP_ENDPOINT_VERIFIER 非法: {}（支持 trusted-proxy / attested-proxy）",
                         v.escape_debug()
                     ));
                 }
@@ -527,8 +560,18 @@ async fn ap_peer(
                     Ok(None) => xl_s3::ap::ApEndpointClaim::Absent,
                     Err(()) => xl_s3::ap::ApEndpointClaim::Malformed,
                 };
+            let attestation = match single_header(
+                req.headers(),
+                "x-oss-endpoint-attestation",
+                xl_s3::ap::valid_attestation,
+            ) {
+                Ok(Some(v)) => xl_s3::ap::ApEndpointClaim::Header(v),
+                Ok(None) => xl_s3::ap::ApEndpointClaim::Absent,
+                Err(()) => xl_s3::ap::ApEndpointClaim::Malformed,
+            };
             req.extensions_mut().insert(xl_s3::ap::ApEndpointContext {
                 claim,
+                attestation,
                 static_vpce: cfg.static_vpce.clone(),
                 direct_peer: direct,
             });

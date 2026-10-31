@@ -11,6 +11,7 @@ mod common;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use oss_server::router::{ApTrustConfig, build_router_with_trust};
@@ -18,7 +19,8 @@ use oss_server::state::AppState;
 use reqwest::Client;
 use xl_s3::ap::{
     AccessPoint, ApEndpoint, ApEndpointContext, ApEndpointIdentity, ApEndpointSource,
-    ApEndpointVerifyError, EndpointIdentityVerifier, TrustedProxyEndpointVerifier,
+    ApEndpointVerifyError, AttestedProxyEndpointVerifier, EndpointIdentityVerifier,
+    TrustedProxyEndpointVerifier,
 };
 
 const VPCE: &str = "vpce-0trust001";
@@ -191,6 +193,78 @@ fn trusted_verify(peer_cidrs: &str) -> ApTrustConfig {
                 .map(|c| xl_s3::ap::parse_cidr(c).unwrap()),
         ))),
         ..trusted(peer_cidrs)
+    }
+}
+
+const ATTEST_SECRET: &str = "0123456789abcdef0123456789abcdef";
+const ATTEST_HEADER: &str = "x-oss-endpoint-attestation";
+
+#[derive(serde::Serialize)]
+struct AttestClaims<'a> {
+    vpce: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vpc: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<&'a str>,
+    iat: u64,
+    exp: u64,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn attest(claims: &AttestClaims<'_>, secret: &str) -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+fn valid_token(account: &str) -> String {
+    let t = now_secs();
+    attest(
+        &AttestClaims {
+            vpce: VPCE,
+            vpc: Some(VPC),
+            account: Some(account),
+            iat: t - 1,
+            exp: t + 29,
+        },
+        ATTEST_SECRET,
+    )
+}
+
+fn attested_verify(peer_cidrs: &str) -> ApTrustConfig {
+    ApTrustConfig {
+        endpoint_verifier: Some(Arc::new(
+            AttestedProxyEndpointVerifier::new(
+                peer_cidrs
+                    .split(',')
+                    .map(|c| xl_s3::ap::parse_cidr(c).unwrap()),
+                ATTEST_SECRET.as_bytes(),
+                60,
+            )
+            .unwrap(),
+        )),
+        ..trusted(peer_cidrs)
+    }
+}
+
+impl Env {
+    async fn get_attested(&self, token: &str) -> reqwest::Response {
+        self.get()
+            .header("x-oss-source-vpce", VPCE)
+            .header("x-oss-source-vpc", VPC)
+            .header(ATTEST_HEADER, token)
+            .send()
+            .await
+            .unwrap()
     }
 }
 
@@ -642,4 +716,296 @@ async fn verifier_keeps_registry_checks() {
 
     registry.put(VPCE, VPC, &e.account, "active");
     assert_eq!(get().await, 200, "active + 同账户");
+}
+
+/// 已证明代理断言：签名有效 + 可信 peer + 声明一致 → 放行；审计带 attested-proxy 证据。
+#[tokio::test]
+async fn attested_proxy_accepted_and_evidence_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        attested_verify("127.0.0.1/32"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+
+    let r = e.get_attested(&valid_token(&e.account)).await;
+    assert_eq!(r.status(), 200, "代理断言 + active 端点应放行");
+    assert_eq!(r.text().await.unwrap(), "hello");
+    let detail = e.last_detail().await.unwrap();
+    assert!(
+        detail.contains(&format!("endpoint={VPCE}/account={}", e.account))
+            && detail.contains("endpoint:evidence=attested-proxy"),
+        "审计须记录端点/账户/证据来源: {detail}"
+    );
+}
+
+/// 伪造签名 / 过期 / vpce 与声明头不一致 / 缺 token → 403。
+#[tokio::test]
+async fn attested_proxy_rejects_forged_expired_and_mismatched_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        attested_verify("127.0.0.1/32"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+    let t = now_secs();
+
+    let foreign = attest(
+        &AttestClaims {
+            vpce: VPCE,
+            vpc: Some(VPC),
+            account: Some(&e.account),
+            iat: t,
+            exp: t + 30,
+        },
+        "ffffffffffffffffffffffffffffffff",
+    );
+    assert_eq!(
+        e.get_attested(&foreign).await.status(),
+        403,
+        "换钥伪签必须拒绝"
+    );
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:bad-attestation")
+    );
+
+    let expired = attest(
+        &AttestClaims {
+            vpce: VPCE,
+            vpc: Some(VPC),
+            account: Some(&e.account),
+            iat: t - 30,
+            exp: t - 1,
+        },
+        ATTEST_SECRET,
+    );
+    assert_eq!(
+        e.get_attested(&expired).await.status(),
+        403,
+        "过期断言必须拒绝"
+    );
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:expired-attestation")
+    );
+
+    let wrong_vpce = attest(
+        &AttestClaims {
+            vpce: "vpce-attacker",
+            vpc: Some(VPC),
+            account: Some(&e.account),
+            iat: t,
+            exp: t + 30,
+        },
+        ATTEST_SECRET,
+    );
+    assert_eq!(
+        e.get_attested(&wrong_vpce).await.status(),
+        403,
+        "断言 vpce 与声明头不一致必须拒绝"
+    );
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:vpce-mismatch")
+    );
+
+    let missing = e
+        .get()
+        .header("x-oss-source-vpce", VPCE)
+        .header("x-oss-source-vpc", VPC)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 403, "缺断言必须拒绝");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:missing-attestation")
+    );
+}
+
+/// 直连客户端（非可信 peer / 无 ConnectInfo）持有合法 token 也不得放行；畸形/重复头拒绝。
+#[tokio::test]
+async fn attested_proxy_rejects_untrusted_peer_and_malformed_headers() {
+    let token = valid_token("000000000000");
+    // 只信任 10/8，listener 在回环：直连客户端不可信。
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        attested_verify("10.0.0.0/8"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    registry.put(VPCE, VPC, &e.account, "active");
+    assert_eq!(
+        e.get_attested(&token).await.status(),
+        403,
+        "非可信 peer 的 token 必须拒绝"
+    );
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:untrusted-source")
+    );
+
+    // 传输层不提供 ConnectInfo：即使网段命中也不可信。
+    let dir2 = tempfile::tempdir().unwrap();
+    let registry2 = Arc::new(Registry::default());
+    let e2 = env(
+        dir2.path(),
+        attested_verify("127.0.0.1/32"),
+        registry2.clone(),
+        false,
+    )
+    .await;
+    registry2.put(VPCE, VPC, &e2.account, "active");
+    assert_eq!(
+        e2.get_attested(&token).await.status(),
+        403,
+        "缺 ConnectInfo"
+    );
+
+    // 可信 peer 下的畸形 token / 重复 token 头。
+    let dir3 = tempfile::tempdir().unwrap();
+    let registry3 = Arc::new(Registry::default());
+    let e3 = env(
+        dir3.path(),
+        attested_verify("127.0.0.1/32"),
+        registry3.clone(),
+        true,
+    )
+    .await;
+    registry3.put(VPCE, VPC, &e3.account, "active");
+    assert_eq!(
+        e3.get_attested("not-a-jwt").await.status(),
+        403,
+        "畸形 token 必须拒绝"
+    );
+    assert!(
+        e3.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:malformed-attestation")
+    );
+    let dup = e3
+        .get()
+        .header("x-oss-source-vpce", VPCE)
+        .header("x-oss-source-vpc", VPC)
+        .header(ATTEST_HEADER, valid_token(&e3.account))
+        .header(ATTEST_HEADER, valid_token(&e3.account))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), 403, "重复断言头必须 fail-closed");
+}
+
+/// 验证器只证明来源：registry 的登记/状态/VPC/账户检查仍全部生效（R2–R6）。
+#[tokio::test]
+async fn attested_proxy_registry_checks_still_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(
+        dir.path(),
+        attested_verify("127.0.0.1/32"),
+        registry.clone(),
+        true,
+    )
+    .await;
+    let token = valid_token(&e.account);
+    let get = || e.get_attested(&token);
+
+    registry.clear();
+    assert_eq!(get().await.status(), 403, "unregistered");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:unregistered")
+    );
+
+    registry.put(VPCE, VPC, &e.account, "disabled");
+    assert_eq!(get().await.status(), 403, "disabled");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:disabled")
+    );
+
+    // R6：断言自带的 vpc 与 registry 行分裂 → 拒绝。
+    registry.put(VPCE, VPC, &e.account, "active");
+    let split_vpc = {
+        let t = now_secs();
+        attest(
+            &AttestClaims {
+                vpce: VPCE,
+                vpc: Some("vpc-0token"),
+                account: Some(&e.account),
+                iat: t,
+                exp: t + 30,
+            },
+            ATTEST_SECRET,
+        )
+    };
+    assert_eq!(
+        e.get_attested(&split_vpc).await.status(),
+        403,
+        "证据/登记 VPC 分裂"
+    );
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:identity-vpc-mismatch")
+    );
+
+    // R6：断言自带的 account 与 registry 行分裂 → 拒绝。
+    registry.put(VPCE, VPC, "123456789012", "active");
+    assert_eq!(get().await.status(), 403, "证据/登记账户分裂");
+    assert!(
+        e.last_detail()
+            .await
+            .unwrap()
+            .contains("endpoint:deny:identity-account-mismatch")
+    );
+
+    registry.put(VPCE, VPC, &e.account, "active");
+    assert_eq!(get().await.status(), 200, "active + 同账户");
+}
+
+/// 未配置验证器时行为不变：`x-oss-endpoint-attestation` 完全被忽略。
+#[tokio::test]
+async fn attestation_header_ignored_without_verifier() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Registry::default());
+    let e = env(dir.path(), trusted("127.0.0.1/32"), registry.clone(), true).await;
+    registry.put(VPCE, VPC, &e.account, "active");
+    let r = e
+        .get()
+        .header("x-oss-source-vpce", VPCE)
+        .header("x-oss-source-vpc", VPC)
+        .header(ATTEST_HEADER, "not-a-jwt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "Slice A 路径不得读取断言头");
 }
