@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::crypto::EncSpec;
+use crate::crypto::{CmkRewrapTarget, EncSpec};
 use crate::kms::{KeyProvider as _, KmsFileProvider};
 
 /// 固定配置引用源：模拟 `buckets.default_encryption` 指向某 CMK。
@@ -98,6 +98,40 @@ async fn put(
 
 fn cmk(name: &str) -> Option<EncSpec> {
     Some(EncSpec::SseKmsCmk(name.to_string()))
+}
+
+async fn migrate(
+    s: &Arc<Store>,
+    cmk: &str,
+    target: CmkRewrapTarget,
+    apply: bool,
+    config: Option<&dyn CmkConfigRefs>,
+) -> crate::error::Result<RewrapReport> {
+    Arc::clone(s)
+        .rewrap_cmk_to(
+            cmk,
+            &RewrapOptions {
+                apply,
+                limit: 100,
+                cursor: None,
+                bucket: None,
+            },
+            target,
+            config,
+        )
+        .await
+}
+
+/// 只有 KMS 目录（无文件主密钥 provider）：用于「目标 provider 未配置」fail-closed。
+async fn enc_store_kms_only() -> (Arc<Store>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig::new(dir.path());
+    let s = Store::open(cfg).await.unwrap();
+    let sys = layout::sys_dir(dir.path(), "");
+    s.init_encryption(None, Some(sys.join("kms")))
+        .await
+        .unwrap();
+    (Arc::new(s), dir)
 }
 
 /// 预览只读；apply 逐版本重加密（inline + EC 两条形态），版本身份/元数据/字节全保留；
@@ -661,4 +695,259 @@ async fn inflight_mpu_blocks_cmk_delete_until_aborted() {
     );
     let r = s.delete_cmk("tenant-a", true, None).await.unwrap();
     assert!(r.deleted && r.purged, "{r:?}");
+}
+
+/// 显式迁移到 pre-CMK SSE-S3：完整重写（该 CMK 的全部版本都迁），meta key_id → `file`，
+/// legacy 读路径可解，旧 CMK 引用归零后可删除；迁移不自动删 CMK；重跑幂等。
+#[tokio::test]
+async fn migrate_to_legacy_sse_s3_rewrites_and_unblocks_delete() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let big = payload(300_000); // EC 形态
+    let inline = payload(120_000); // 内联形态
+    let v1 = put(
+        &s,
+        "k",
+        big.clone(),
+        VersioningMode::Enabled,
+        cmk("tenant-a"),
+    )
+    .await;
+    let v2 = s
+        .put_object_stream_with_meta(
+            "alpha",
+            "k",
+            stream_of(inline.clone()),
+            Some("text/plain".into()),
+            Default::default(),
+            None,
+            VersioningMode::Enabled,
+            cmk("tenant-a"),
+            None,
+            Some(vec![meta::ObjectTag {
+                key: "env".into(),
+                value: "test".into(),
+            }]),
+            None,
+        )
+        .await
+        .unwrap();
+    kms.rotate_cmk("tenant-a").await.unwrap();
+    put(&s, "plain", payload(1000), VersioningMode::Off, None).await;
+
+    let preview = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseS3, false, None)
+        .await
+        .unwrap();
+    assert_eq!(preview.target, CmkRewrapTarget::LegacySseS3);
+    assert_eq!(preview.candidates, 2, "迁移覆盖该 CMK 的全部版本");
+    assert_eq!(preview.rewrapped, 0);
+    assert!(
+        preview
+            .items
+            .iter()
+            .all(|i| i.status == "preview" && i.new_key_id.is_none())
+    );
+
+    let applied = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseS3, true, None)
+        .await
+        .unwrap();
+    assert_eq!(applied.rewrapped, 2, "{:?}", applied.items);
+    assert_eq!(applied.failed, 0);
+    assert!(
+        applied
+            .items
+            .iter()
+            .all(|i| i.new_key_id.as_deref() == Some("file"))
+    );
+
+    let after = s.read_meta("alpha", "k").await.unwrap().unwrap();
+    for old in [&v1, &v2] {
+        let new = after
+            .find_version(&old.version_id.clone().unwrap())
+            .expect("版本保留");
+        let rec = new.encryption.as_ref().unwrap();
+        assert_eq!(rec.key_id, "file");
+        assert_eq!(rec.kms_key_id, None, "CMK 名段必须消失");
+        assert_eq!(new.etag, old.etag);
+        assert_eq!(new.user_metadata, old.user_metadata);
+        assert_eq!(new.tags.as_deref().unwrap_or(&[]), old.tags.as_slice());
+    }
+    let (_, got1) = s
+        .get_object_version("alpha", "k", &v1.version_id.clone().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(got1, big, "legacy 读路径可解");
+    let (_, got2) = s
+        .get_object_version("alpha", "k", &v2.version_id.clone().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(got2, inline);
+    assert_eq!(
+        s.get_object("alpha", "plain").await.unwrap().1,
+        payload(1000)
+    );
+
+    let scan = s.cmk_references("tenant-a", None).await.unwrap();
+    assert_eq!(scan.references, 0, "旧 CMK 引用归零：{scan:?}");
+    assert_eq!(scan.mpu_references, 0);
+    assert_eq!(kms.ensure_cmk("tenant-a").unwrap(), 1, "迁移绝不自动删 CMK");
+
+    // 重跑：无候选（已全部在目标 provider）
+    let again = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseS3, true, None)
+        .await
+        .unwrap();
+    assert_eq!((again.candidates, again.rewrapped), (0, 0));
+
+    // 引用清零后删除成功；对象仍可经 legacy provider 读出（CMK 已不在）
+    let r = s.delete_cmk("tenant-a", false, None).await.unwrap();
+    assert!(r.deleted && r.purged, "{r:?}");
+    let (_, got) = s
+        .get_object_version("alpha", "k", &v1.version_id.clone().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(got, big);
+}
+
+/// 显式迁移到 pre-CMK SSE-KMS：meta key_id → 默认环当前 `k<n>`，删除 CMK 后仍可读。
+#[tokio::test]
+async fn migrate_to_legacy_sse_kms_rewrites_to_default_ring() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let body = payload(200_000);
+    put(&s, "k", body.clone(), VersioningMode::Off, cmk("tenant-a")).await;
+    let expected = format!("k{}", kms.current_id());
+
+    let rep = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseKms, true, None)
+        .await
+        .unwrap();
+    assert_eq!(rep.target, CmkRewrapTarget::LegacySseKms);
+    assert_eq!(rep.rewrapped, 1, "{:?}", rep.items);
+    assert_eq!(rep.items[0].new_key_id.as_deref(), Some(expected.as_str()));
+    let m = s.read_meta("alpha", "k").await.unwrap().unwrap();
+    let rec = m.versions[0].encryption.as_ref().unwrap();
+    assert_eq!(rec.key_id, expected);
+    assert_eq!(rec.kms_key_id, None);
+    assert_eq!(s.get_object("alpha", "k").await.unwrap().1, body);
+
+    assert_eq!(
+        s.cmk_references("tenant-a", None).await.unwrap().references,
+        0
+    );
+    let r = s.delete_cmk("tenant-a", false, None).await.unwrap();
+    assert!(r.deleted && r.purged, "{r:?}");
+    assert_eq!(s.get_object("alpha", "k").await.unwrap().1, body);
+}
+
+/// 在途 MPU 的 complete 仍会用 CMK 加密 → 迁移 fail-closed；Abort 后才能迁移。
+#[tokio::test]
+async fn migrate_refuses_inflight_mpu() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    put(&s, "k", payload(4096), VersioningMode::Off, cmk("tenant-a")).await;
+    let upload_id = s
+        .create_multipart_upload_ext(
+            "alpha",
+            "k",
+            None,
+            Default::default(),
+            None,
+            Some("sse-kms:tenant-a"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let err = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseS3, true, None)
+        .await
+        .unwrap_err();
+    match &err {
+        Error::InvalidArgument(m) => assert!(m.contains("MPU"), "{m}"),
+        e => panic!("unexpected error: {e:?}"),
+    }
+    // 拒绝时绝不写：对象仍引用 CMK
+    assert_eq!(
+        s.cmk_references("tenant-a", None).await.unwrap().references,
+        1
+    );
+    s.abort_multipart_upload("alpha", "k", &upload_id)
+        .await
+        .unwrap();
+    let rep = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseS3, true, None)
+        .await
+        .unwrap();
+    assert_eq!(rep.rewrapped, 1);
+}
+
+/// 桶默认加密仍指向 CMK → 迁移拒绝（否则新写入会立刻 strand）；切换后可迁移。
+#[tokio::test]
+async fn migrate_refuses_bucket_default_refs() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    put(&s, "k", payload(4096), VersioningMode::Off, cmk("tenant-a")).await;
+    let refs = FixedRefs(vec![CmkBucketRef {
+        bucket: "alpha".into(),
+        setting: "aws:kms:tenant-a".into(),
+    }]);
+    let err = migrate(
+        &s,
+        "tenant-a",
+        CmkRewrapTarget::LegacySseKms,
+        false,
+        Some(&refs),
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        Error::InvalidArgument(m) => assert!(m.contains("桶默认"), "{m}"),
+        e => panic!("unexpected error: {e:?}"),
+    }
+    assert_eq!(
+        s.cmk_references("tenant-a", None).await.unwrap().references,
+        1
+    );
+    let empty = FixedRefs(Vec::new());
+    let rep = migrate(
+        &s,
+        "tenant-a",
+        CmkRewrapTarget::LegacySseKms,
+        true,
+        Some(&empty),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep.rewrapped, 1);
+}
+
+/// 目标 provider 未配置 → 在扫描/写入前 fail-closed；配置齐全的 legacy 目标不受影响。
+#[tokio::test]
+async fn migrate_fails_closed_when_target_provider_missing() {
+    let (s, _d) = enc_store_kms_only().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    put(&s, "k", payload(4096), VersioningMode::Off, cmk("tenant-a")).await;
+    let err = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseS3, true, None)
+        .await
+        .unwrap_err();
+    match &err {
+        Error::Crypto(m) => assert!(m.contains("文件主密钥"), "{m}"),
+        e => panic!("unexpected error: {e:?}"),
+    }
+    // 拒绝时数据未动，仍按 CMK 可读
+    assert_eq!(s.get_object("alpha", "k").await.unwrap().1, payload(4096));
+    // 默认 KMS 环可用 → SSE-KMS 目标可迁移
+    let rep = migrate(&s, "tenant-a", CmkRewrapTarget::LegacySseKms, true, None)
+        .await
+        .unwrap();
+    assert_eq!(rep.rewrapped, 1);
+    assert_eq!(s.get_object("alpha", "k").await.unwrap().1, payload(4096));
 }
