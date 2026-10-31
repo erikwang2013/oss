@@ -59,6 +59,7 @@ PY
 # ---------------------------------------------------------------- fixtures
 
 python3 - "$TMP" <<'PY'
+import json
 import os
 import sqlite3
 import struct
@@ -125,6 +126,41 @@ broken = os.path.join(db_root, 'bucket', 'obj2', '55555555-5555-4555-8555-555555
 os.makedirs(broken)
 with open(os.path.join(broken, 'mpu.meta'), 'wb') as f:
     f.write(b'\x81\xa5owner')  # map{owner: <missing value>}
+
+# data-empty：无 MPU 暂存区，供 --require-no-mpu 的“干净”分支与 health-json 隔离。
+os.makedirs(os.path.join(tmp, 'data-empty'))
+
+
+# /health/cluster 离线快照夹具（字段与 oss-server router::cluster_view 一致）。
+def health(name, local=2, compatible=True, nodes=None):
+    if nodes is None:
+        nodes = [
+            {'id': 'n1', 'up': True, 'data_wire_version': local},
+            {'id': 'n2', 'up': True, 'data_wire_version': 2},
+            {'id': 'n3', 'up': False, 'data_wire_version': None},  # down 节点不下结论
+        ]
+    with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f:
+        json.dump({
+            'node_id': 'n1', 'data_wire_version': local,
+            'data_plane_compatible': compatible, 'degraded_peers': [],
+            'incompatible_peers': [] if compatible else ['n2(v1)'],
+            'nodes': nodes,
+        }, f, ensure_ascii=False)
+
+
+health('health-good.json')
+health('health-local-old.json', local=1)
+health('health-old-peer.json', nodes=[
+    {'id': 'n1', 'up': True, 'data_wire_version': 2},
+    {'id': 'n2', 'up': True, 'data_wire_version': 1},
+])
+health('health-null-peer.json', nodes=[
+    {'id': 'n1', 'up': True, 'data_wire_version': 2},
+    {'id': 'n2', 'up': True, 'data_wire_version': None},
+])
+health('health-incompatible.json', compatible=False)
+with open(os.path.join(tmp, 'health-bad.json'), 'w', encoding='utf-8') as f:
+    f.write('{"data_wire_version": 2,')  # 截断的 JSON
 
 
 def make_db(path, rows, token_col=True, table=True):
@@ -215,7 +251,7 @@ assert_has "clean: mpu OK" "$out" "[OK] bare-uuid-mpu"
 assert_has "clean: m6 OK" "$out" "[OK] m6-site-token"
 assert_has "clean: m7 OK" "$out" "[OK] m7-unmapped-replica"
 out=$("$MAIN" --data-dir "$TMP/data-a" --control-db "$TMP/good.db" \
-	--replica-reconcile "$STUB" --replica-scope b/k --strict 2>&1)
+	--replica-reconcile "$STUB" --replica-scope b/k --health-json "$TMP/health-good.json" --strict 2>&1)
 assert_rc "clean + strict: rc=0" 0 "$?"
 
 # 2. 裸 UUID / token NULL / 未映射 REPLICA → WARN；strict 下非零
@@ -269,6 +305,7 @@ STUB_MODE=rows "$MAIN" --data-dir "$TMP/data-b" --control-db "$TMP/bad.db" \
 rc=$?
 assert_rc "json: rc=0" 0 "$rc"
 assert_has "json: mpu WARN" "$(json_status "$TMP/out.json" bare-uuid-mpu)" "WARN"
+assert_has "json: data plane WARN" "$(json_status "$TMP/out.json" data_plane_floor)" "WARN"
 assert_has "json: m6 WARN" "$(json_status "$TMP/out.json" m6-site-token)" "WARN"
 assert_has "json: m7 WARN" "$(json_status "$TMP/out.json" m7-unmapped-replica)" "WARN"
 python3 - "$TMP/out.json" <<'PY' && ok "json: exit_code/status fields" || bad "json: exit_code/status fields"
@@ -276,7 +313,7 @@ import json
 import sys
 d = json.load(open(sys.argv[1], encoding='utf-8'))
 assert d['status'] == 'WARN' and d['exit_code'] == 0 and d['strict'] is False
-assert [c['name'] for c in d['checks']] == ['bare-uuid-mpu', 'm6-site-token', 'm7-unmapped-replica']
+assert [c['name'] for c in d['checks']] == ['bare-uuid-mpu', 'data_plane_floor', 'm6-site-token', 'm7-unmapped-replica']
 PY
 
 # 8. 含 --delete 的命令模板 → BLOCK（且不执行）
@@ -342,6 +379,85 @@ assert_rc "config bad syntax: rc=1" 1 "$?"
 assert_has "config bad syntax: BLOCK" "$out" "[BLOCK] m6-site-token"
 assert_has "config bad syntax: parse detail" "$out" "读取/解析失败"
 assert_not_has "config bad syntax: no false OK" "$out" "[OK] m6-site-token"
+
+# 15. --health-json：本地与所有 up 节点都 >=2 且兼容 → OK；干净输入 + strict rc=0
+out=$("$MAIN" --data-dir "$TMP/data-empty" --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k --health-json "$TMP/health-good.json" 2>&1)
+rc=$?
+assert_rc "health good: rc=0" 0 "$rc"
+assert_has "health good: OK" "$out" "[OK] data_plane_floor"
+assert_has "health good: local floor" "$out" "本地 data_wire_version=2"
+assert_has "health good: up nodes counted" "$out" "2 个 up 节点均 >=2"
+assert_not_has "health good: not WARN" "$out" "[WARN] data_plane_floor"
+"$MAIN" --data-dir "$TMP/data-empty" --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k --health-json "$TMP/health-good.json" --strict >/dev/null 2>&1
+assert_rc "health good + strict: rc=0" 0 "$?"
+
+# 16. 旧 peer（up 且 wire=1）→ BLOCK，详情点名节点
+out=$("$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/health-old-peer.json" 2>&1)
+assert_rc "health old peer: rc=1" 1 "$?"
+assert_has "health old peer: BLOCK" "$out" "[BLOCK] data_plane_floor"
+assert_has "health old peer: names n2" "$out" "up 节点 n2 data_wire_version=1 < 2"
+"$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/health-old-peer.json" --json >"$TMP/dp.json" 2>&1
+assert_has "health old peer: json BLOCK" "$(json_status "$TMP/dp.json" data_plane_floor)" "BLOCK"
+
+# 17. up 节点 wire=null（down 节点的 null 不下结论）→ BLOCK
+out=$("$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/health-null-peer.json" 2>&1)
+assert_rc "health null peer: rc=1" 1 "$?"
+assert_has "health null peer: BLOCK" "$out" "[BLOCK] data_plane_floor"
+assert_has "health null peer: names null node" "$out" "up 节点 n2 data_wire_version 缺失/null"
+assert_not_has "health null peer: no false OK" "$out" "[OK] data_plane_floor"
+
+# 18. data_plane_compatible != true → BLOCK，详情带 incompatible_peers
+out=$("$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/health-incompatible.json" 2>&1)
+assert_rc "health incompatible: rc=1" 1 "$?"
+assert_has "health incompatible: BLOCK" "$out" "[BLOCK] data_plane_floor"
+assert_has "health incompatible: compat detail" "$out" "data_plane_compatible 不是 true"
+assert_has "health incompatible: peer list" "$out" "n2(v1)"
+
+# 19. 本地 data_wire_version < 2 → BLOCK
+out=$("$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/health-local-old.json" 2>&1)
+assert_rc "health local old: rc=1" 1 "$?"
+assert_has "health local old: BLOCK" "$out" "[BLOCK] data_plane_floor"
+assert_has "health local old: local detail" "$out" "本地 data_wire_version=1 < 2"
+
+# 20. health-json 文件缺失/坏 JSON → BLOCK（fail-closed）
+out=$("$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/no-such-health.json" 2>&1)
+assert_rc "health missing file: rc=1" 1 "$?"
+assert_has "health missing file: BLOCK" "$out" "[BLOCK] data_plane_floor"
+assert_has "health missing file: explains" "$out" "缺失或无法解析"
+out=$("$MAIN" --data-dir "$TMP/data-empty" --health-json "$TMP/health-bad.json" 2>&1)
+assert_rc "health bad json: rc=1" 1 "$?"
+assert_has "health bad json: BLOCK" "$out" "[BLOCK] data_plane_floor"
+assert_has "health bad json: parse detail" "$out" "读取/解析"
+assert_not_has "health bad json: no false OK" "$out" "[OK] data_plane_floor"
+
+# 21. 不提供 --health-json → WARN“无法判定”；strict 下非零
+out=$("$MAIN" --data-dir "$TMP/data-empty" --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k 2>&1)
+assert_rc "no health-json: rc=0" 0 "$?"
+assert_has "no health-json: WARN" "$out" "[WARN] data_plane_floor"
+assert_has "no health-json: explains" "$out" "无法判定；升级前请保存 /health/cluster"
+assert_not_has "no health-json: not OK" "$out" "[OK] data_plane_floor"
+"$MAIN" --data-dir "$TMP/data-empty" --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k --strict >/dev/null 2>&1
+assert_rc "no health-json + strict: rc=1" 1 "$?"
+
+# 22. --require-no-mpu：带属主的活 MPU 也 BLOCK；不加标志保持原语义
+out=$("$MAIN" --data-dir "$TMP/data-a" --require-no-mpu --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k 2>&1)
+assert_rc "require-no-mpu owned: rc=1" 1 "$?"
+assert_has "require-no-mpu owned: BLOCK" "$out" "[BLOCK] bare-uuid-mpu"
+assert_has "require-no-mpu owned: count" "$out" "1 个在途 MPU"
+assert_has "require-no-mpu owned: drain" "$out" "Complete/Abort 排空"
+assert_has "require-no-mpu owned: path listed" "$out" "11111111-1111-4111-8111-111111111111"
+out=$("$MAIN" --data-dir "$TMP/data-a" --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k 2>&1)
+assert_has "owned MPU without flag: not BLOCK" "$out" "[OK] bare-uuid-mpu"
+out=$("$MAIN" --data-dir "$TMP/data-empty" --require-no-mpu --config "$TMP/config-good.toml" \
+	--replica-reconcile "$STUB" --replica-scope b/k 2>&1)
+assert_rc "require-no-mpu empty: rc=0" 0 "$?"
+assert_has "require-no-mpu empty: OK" "$out" "[OK] bare-uuid-mpu"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 ((FAIL == 0))
