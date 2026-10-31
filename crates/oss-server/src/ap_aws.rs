@@ -320,10 +320,7 @@ impl AwsApiEndpointVerifier {
     }
 
     /// SigV4 签名的 EC2 Query GET（service=`ec2`）。返回 URL 与需发送的头。
-    fn signed_get(
-        &self,
-        pairs: &[(String, String)],
-    ) -> Result<SignedRequestParts, String> {
+    fn signed_get(&self, pairs: &[(String, String)]) -> Result<SignedRequestParts, String> {
         let mut encoded: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| (aws_encode(k), aws_encode(v)))
