@@ -251,5 +251,26 @@
   "UserSetStatus": [
     "status",
     "username"
+  ],
+  "AccountUsageReserve": [
+    "account",
+    "baseline_bytes",
+    "baseline_objects",
+    "bytes",
+    "objects"
+  ],
+  "AccountUsageRelease": [
+    "account",
+    "baseline_bytes",
+    "baseline_objects",
+    "bytes",
+    "objects"
+  ],
+  "AccountUsageAdjust": [
+    "account",
+    "baseline_bytes",
+    "baseline_objects",
+    "bytes",
+    "objects"
   ]
 }

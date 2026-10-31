@@ -316,6 +316,9 @@ const SCHEMA_HOT_INDEXES: &str = include_str!("../migrations/0008_hot_indexes.sq
 const SCHEMA_JOB_RETENTION_INDEX: &str = include_str!("../migrations/0009_job_retention_index.sql");
 /// 动态 VPC 端点注册表（feature 8）。每次启动重放（IF NOT EXISTS）。
 const SCHEMA_VPC_ENDPOINTS: &str = include_str!("../migrations/0010_vpc_endpoints.sql");
+/// 复制账户用量账本（feature 9）。每次启动重放（IF NOT EXISTS）。
+const SCHEMA_ACCOUNT_USAGE_LEDGER: &str =
+    include_str!("../migrations/0011_account_usage_ledger.sql");
 
 /// 账户表已规范化（v2 回填/重写完成）。standalone 启动时写；Raft 模式由后续
 /// canonicalization worker 在 level-3 写，快照读取以本 marker 为门。
@@ -402,6 +405,9 @@ impl Db {
             .execute(&db.pool)
             .await?;
         sqlx::raw_sql(SCHEMA_VPC_ENDPOINTS)
+            .execute(&db.pool)
+            .await?;
+        sqlx::raw_sql(SCHEMA_ACCOUNT_USAGE_LEDGER)
             .execute(&db.pool)
             .await?;
         db.ensure_columns_tenancy().await?;

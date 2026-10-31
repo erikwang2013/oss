@@ -127,6 +127,12 @@ pub fn build_router_with_trust(
     // 授权门：Acl 同时给 service（ListBuckets 过滤/建桶记账）与 access 层（set_access）
     // Task 9：集群时 Acl/SigV4Auth 接控制面读扇出（本地 miss → peers；写仍本地，M9 收口）
     let acl = state.acl();
+    // strict：硬配额走复制账本（Local 控制面在 standalone 下同样走账本表）。
+    let cluster_quota = state
+        .cfg
+        .quota
+        .strict
+        .then(|| Arc::clone(&state.control) as Arc<dyn xl_s3::account_quota::ClusterQuota>);
     let oss_s3 = OssS3::new(
         Arc::clone(&state.store),
         acl.clone(),
@@ -161,7 +167,8 @@ pub fn build_router_with_trust(
         Arc::clone(&state.sync_delete) as Arc<dyn xl_s3::sync_delete::SyncDeleteSink>
     ))
     // M9 S6c：仅 Raft 模式注入桶控制面 sink（None = M7 直写路径逐字节不变）。
-    .with_bucket_control(state.control.bucket_sink());
+    .with_bucket_control(state.control.bucket_sink())
+    .with_cluster_quota(cluster_quota);
     // 归档对象 Range 直读：默认关（保持 403 InvalidObjectState）；显式开时只走
     // 有分块哈希且后端支持 Range 的对象，不可用自动回退。
     let oss_s3 = if std::env::var("OSS_TIER_DIRECT_READ").is_ok_and(|v| v == "1") {

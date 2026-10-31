@@ -14,6 +14,7 @@ mod accounts;
 pub(crate) mod inventory;
 pub(crate) mod lease;
 pub(crate) mod lifecycle;
+mod quota;
 pub(crate) mod tier_restore;
 
 use super::command::{
@@ -259,6 +260,10 @@ pub(crate) async fn apply_command(
     let effects = effects_for(cmd);
     // Level-3 账户/成员命令有独立的业务约束集合（自然键 + 账户不变量）。
     if let Some(response) = accounts::apply(cw, cmd).await? {
+        return Ok(Applied { response, effects });
+    }
+    // feature 9：用量账本（无副作用；判定全部在事务内完成）。
+    if let Some(response) = quota::apply(cw, cmd).await? {
         return Ok(Applied { response, effects });
     }
     let response = match cmd {
@@ -761,8 +766,11 @@ pub(crate) async fn apply_command(
         | ControlCommand::AccountDelete { .. }
         | ControlCommand::AccountMemberAttach { .. }
         | ControlCommand::AccountMemberSetStatus { .. }
-        | ControlCommand::AccountUserCreate { .. } => {
-            unreachable!("account commands are handled before the command match")
+        | ControlCommand::AccountUserCreate { .. }
+        | ControlCommand::AccountUsageReserve { .. }
+        | ControlCommand::AccountUsageRelease { .. }
+        | ControlCommand::AccountUsageAdjust { .. } => {
+            unreachable!("account/ledger commands are handled before the command match")
         }
         // Level 3 命令容器：apply 只认识显式注册的 type_id；未知类型是业务拒绝，
         // 绝不能当空操作（静默忽略会让新旧副本的控制面状态分叉）。leader 已在

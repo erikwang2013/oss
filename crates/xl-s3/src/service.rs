@@ -65,6 +65,8 @@ pub struct OssS3 {
     sync_delete: Option<Arc<dyn crate::sync_delete::SyncDeleteSink>>,
     /// M9 S6c：桶控制写通道（仅 `[raft]` 注入；None = M7/standalone 直写路径不变）。
     bucket_control: Option<Arc<dyn BucketControlSink>>,
+    /// 账户硬配额严格模式：复制账本（None = 本地有界陈旧缓存路径不变）。
+    cluster_quota: Option<Arc<dyn crate::account_quota::ClusterQuota>>,
 }
 
 impl OssS3 {
@@ -168,7 +170,17 @@ impl OssS3 {
             site_token: None,
             sync_delete: None,
             bucket_control: None,
+            cluster_quota: None,
         }
+    }
+
+    /// strict 模式注入复制账本（`None` = 本地 `account_usage` 路径逐字节不变）。
+    pub fn with_cluster_quota(
+        mut self,
+        quota: Option<Arc<dyn crate::account_quota::ClusterQuota>>,
+    ) -> Self {
+        self.cluster_quota = quota;
+        self
     }
 
     /// M9 S6c：注入 Raft 控制写通道（`None` = 保持 M7 直写）。
@@ -248,6 +260,19 @@ impl OssS3 {
         delta_bytes: i64,
         delta_objects: i64,
     ) -> S3Result<()> {
+        if let Some(cq) = &self.cluster_quota {
+            return match cq.reserve(&quota.account, delta_bytes, delta_objects).await {
+                Ok(()) => Ok(()),
+                Err(crate::account_quota::ClusterQuotaError::Exceeded) => {
+                    Err(s3s::s3_error!(AccessDenied, "account quota exceeded"))
+                }
+                Err(e) => {
+                    // 结果不明时绝不重试/补偿（命令非幂等）；写入 fail-closed。
+                    tracing::error!(error = ?e, account = %quota.account, "严格配额预留失败");
+                    Err(s3s::s3_error!(InternalError, "internal error"))
+                }
+            };
+        }
         match crate::account_quota::admit(
             self.acl.pool(),
             &self.store,
@@ -268,10 +293,28 @@ impl OssS3 {
 
     /// 写失败归还 / 写成功校准；记账失败不回滚已提交的数据（采样器收敛），仅告警。
     async fn quota_adjust(&self, account: &str, bytes: i64, objects: i64) {
+        if let Some(cq) = &self.cluster_quota {
+            if let Err(e) = cq.adjust(account, bytes, objects).await {
+                // 账本命令非幂等：不重试。失败即留待运维对账（偏保守）。
+                tracing::warn!(error = ?e, account, "严格配额校准失败");
+            }
+            return;
+        }
         if let Err(e) = crate::account_quota::adjust(self.acl.pool(), account, bytes, objects).await
         {
             tracing::warn!(error = %e, account, "账户用量修正失败（等待采样器）");
         }
+    }
+
+    /// 删除/失败归还（非负量；账本饱和到 0）。未知结果只告警，绝不重试。
+    async fn quota_release(&self, account: &str, bytes: i64, objects: i64) {
+        if let Some(cq) = &self.cluster_quota {
+            if let Err(e) = cq.release(account, bytes, objects).await {
+                tracing::warn!(error = ?e, account, "严格配额释放失败");
+            }
+            return;
+        }
+        self.quota_adjust(account, -bytes, -objects).await;
     }
 
     /// 删除后释放当前版本（仅无版本号删除且确有旧对象；版本定向删除交给采样器）。
@@ -283,7 +326,7 @@ impl OssS3 {
         removed: bool,
     ) {
         if let (Some(q), Some(size), None, true) = (quota, old_size, version_id, removed) {
-            self.quota_adjust(&q.account, -(size as i64), -1).await;
+            self.quota_release(&q.account, size as i64, 1).await;
         }
     }
 

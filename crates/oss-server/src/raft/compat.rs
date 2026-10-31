@@ -41,6 +41,9 @@ pub const FEATURE_LEVEL_7: u8 = 7;
 /// feature 8：账户硬配额配置（`AccountHardQuotaSet`）。v1.26.0 及更早 advertise ≤7
 /// 且 `deny_unknown_fields` 不认识该变体；level 7 挡不住它，必须新开 level 8。
 pub const FEATURE_LEVEL_8: u8 = 8;
+/// feature 9：账户用量账本（`AccountUsageReserve/Release/Adjust` + OSSCTL3 快照
+/// `account_usage_ledger`）。v1.27.0 及更早 advertise ≤8 且不认这些变体/快照字段。
+pub const FEATURE_LEVEL_9: u8 = 9;
 /// Level C M1 的命令演进容器（`ControlCommand::Ext`）所需级别。该级别只表示
 /// “能解码/应用 Ext 容器”，不表示认识任何 `type_id`；注册新类型必须提升 feature
 /// level 或先完成 per-peer 类型能力协商（见 `command::REGISTERED_EXT_TYPES`）。
@@ -48,7 +51,7 @@ pub const FEATURE_COMMAND_EXT: u8 = FEATURE_LEVEL_3;
 /// OSSCTL2/3 命令与快照语义的别名（保持 level 3 不变；M8-2 复制另立 level 4/5）。
 pub const FEATURE_OSSCTL2: u8 = FEATURE_LEVEL_3;
 /// 本二进制支持的最高 feature level。
-pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_8;
+pub const MAX_FEATURE_LEVEL: u8 = FEATURE_LEVEL_9;
 /// 缺省/旧节点的 feature level。
 pub const MIN_FEATURE_LEVEL: u8 = 1;
 
@@ -636,7 +639,11 @@ mod tests {
             FEATURE_LEVEL_8, 8,
             "v1.26.0 及更早 advertise ≤7 且不认识 AccountHardQuotaSet，必须新开 8"
         );
-        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_8);
+        assert_eq!(
+            FEATURE_LEVEL_9, 9,
+            "v1.27.0 及更早 advertise ≤8 且不认识账户用量账本命令/快照字段，必须新开 9"
+        );
+        assert_eq!(MAX_FEATURE_LEVEL, FEATURE_LEVEL_9);
         assert!(supports(1));
         assert!(supports(FEATURE_STRUCTURED_LIFECYCLE));
         assert!(supports(FEATURE_COMMAND_EXT));
@@ -645,6 +652,7 @@ mod tests {
         assert!(supports(FEATURE_LEVEL_6));
         assert!(supports(FEATURE_LEVEL_7));
         assert!(supports(FEATURE_LEVEL_8));
+        assert!(supports(FEATURE_LEVEL_9));
         assert!(!supports(MAX_FEATURE_LEVEL + 1));
     }
 

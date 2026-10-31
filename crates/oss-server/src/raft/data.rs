@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 
-use super::compat::{FEATURE_LEVEL_3, FEATURE_LEVEL_8, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL};
+use super::compat::{
+    FEATURE_LEVEL_3, FEATURE_LEVEL_8, FEATURE_LEVEL_9, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL,
+};
 
 /// 本二进制可写的最新快照封套版本（1 = OSSCTL1，2 = OSSCTL2，3 = OSSCTL3）。
 pub const SNAPSHOT_FORMAT: u32 = 3;
@@ -221,6 +223,15 @@ pub struct VpcEndpointRow {
     pub updated_at: i64,
 }
 
+/// feature 9：账户用量账本行（strict 模式的复制执行依据；空表时不序列化）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountUsageLedgerRow {
+    pub account_id: String,
+    pub used_bytes: i64,
+    pub object_count: i64,
+}
+
 /// 11 张复制表的完整载荷（自然键；无本地自增 id / set_id / 管理员行）。
 ///
 /// V3 新增账户两表：空表时**不序列化**，V1/V2 载荷保持逐字节冻结
@@ -245,6 +256,8 @@ pub struct ControlData {
     pub account_members: Vec<AccountMemberRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vpc_endpoints: Vec<VpcEndpointRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_usage_ledger: Vec<AccountUsageLedgerRow>,
 }
 
 #[derive(Debug)]
@@ -595,6 +608,20 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
                 updated_at: r.get("updated_at"),
             });
         }
+        for r in sqlx::query(
+            "SELECT account_id, used_bytes, object_count FROM account_usage_ledger \
+             ORDER BY account_id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql)?
+        {
+            data.account_usage_ledger.push(AccountUsageLedgerRow {
+                account_id: r.get("account_id"),
+                used_bytes: r.get("used_bytes"),
+                object_count: r.get("object_count"),
+            });
+        }
     }
 
     Ok(data)
@@ -636,6 +663,7 @@ pub struct InstallReport {
     pub accounts: usize,
     pub account_members: usize,
     pub vpc_endpoints: usize,
+    pub account_usage_ledger: usize,
 }
 
 fn report_of(data: &ControlData) -> InstallReport {
@@ -654,6 +682,7 @@ fn report_of(data: &ControlData) -> InstallReport {
         accounts: data.accounts.len(),
         account_members: data.account_members.len(),
         vpc_endpoints: data.vpc_endpoints.len(),
+        account_usage_ledger: data.account_usage_ledger.len(),
     }
 }
 
@@ -684,6 +713,15 @@ pub(crate) async fn install_tx(
     {
         return Err(DataError::Format(
             "snapshot carries invalid level-8 vpc_endpoint rows".into(),
+        ));
+    }
+    if data
+        .account_usage_ledger
+        .iter()
+        .any(|r| r.account_id.trim().is_empty() || r.used_bytes < 0 || r.object_count < 0)
+    {
+        return Err(DataError::Format(
+            "snapshot carries invalid level-9 account_usage_ledger rows".into(),
         ));
     }
     // 1. AP → olap（olap_configs.access_point 外键）。
@@ -801,6 +839,24 @@ pub(crate) async fn install_tx(
         .bind(&e.state)
         .bind(e.created_at)
         .bind(e.updated_at)
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    }
+
+    // 7d. 账户用量账本（level 9）：整表替换；行 key 是稳定账户 id。
+    sqlx::query("DELETE FROM account_usage_ledger")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+    for r in &data.account_usage_ledger {
+        sqlx::query(
+            "INSERT INTO account_usage_ledger (account_id, used_bytes, object_count) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(&r.account_id)
+        .bind(r.used_bytes)
+        .bind(r.object_count)
         .execute(&mut *conn)
         .await
         .map_err(sql)?;
@@ -1207,7 +1263,9 @@ fn validate_extensions(exts: &SnapshotExtensions, max_total: usize) -> Result<()
 
 /// 数据自身要求的最低激活级别：账户行（V3 独有）→ 3，`config_json` → 2，否则 1。
 pub fn required_feature_level(data: &ControlData) -> u8 {
-    if !data.vpc_endpoints.is_empty() {
+    if !data.account_usage_ledger.is_empty() {
+        FEATURE_LEVEL_9
+    } else if !data.vpc_endpoints.is_empty() {
         FEATURE_LEVEL_8
     } else if !data.accounts.is_empty() || !data.account_members.is_empty() {
         FEATURE_LEVEL_3
@@ -1518,6 +1576,7 @@ mod tests {
             accounts: Vec::new(),
             account_members: Vec::new(),
             vpc_endpoints: Vec::new(),
+            account_usage_ledger: Vec::new(),
         }
     }
 
@@ -2236,6 +2295,21 @@ mod tests {
         assert_eq!(decoded.feature_level, FEATURE_LEVEL_8);
         assert_eq!(decoded.data.vpc_endpoints, vpc.vpc_endpoints);
         assert_eq!(encode_snapshot_at(&decoded.data, 1).unwrap(), bytes);
+        // 账本行强制 level 9（旧二进制 MAX=8 必须整包拒绝）。
+        let mut ledger = vpc.clone();
+        ledger.account_usage_ledger.push(AccountUsageLedgerRow {
+            account_id: "000000000007".into(),
+            used_bytes: 1024,
+            object_count: 3,
+        });
+        assert_eq!(required_feature_level(&ledger), FEATURE_LEVEL_9);
+        let bytes = encode_snapshot_at(&ledger, 1).unwrap();
+        let decoded = decode_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.feature_level, FEATURE_LEVEL_9);
+        assert_eq!(
+            decoded.data.account_usage_ledger,
+            ledger.account_usage_ledger
+        );
 
         // 空账户表不污染旧载荷：仍按激活级别落 V1/V2（逐字节冻结由 fixtures 覆盖）。
         assert!(

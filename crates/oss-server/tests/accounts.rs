@@ -1350,3 +1350,111 @@ async fn hard_quota_blocks_writes_and_delete_frees() {
         404
     );
 }
+
+/// `[quota].strict`：同一 S3 写/删路径改走复制账本（standalone Local 控制面），
+/// 预留/释放与本地模式同语义；拒绝消息是稳定的 `account quota exceeded`。
+#[tokio::test]
+async fn strict_quota_ledger_blocks_writes_and_delete_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = state(dir.path()).await;
+    let mut cfg = (*st.cfg).clone();
+    cfg.quota.strict = true;
+    st.cfg = std::sync::Arc::new(cfg);
+    st.db.create_user("erik", "pw", true).await.unwrap();
+    let probe = st.clone();
+    let base = serve(build_router(st).unwrap()).await;
+    let admin = login_ok(&base, "erik", "pw").await;
+    let client = reqwest::Client::new();
+
+    let id = create_account(&base, &admin, "strict", None).await;
+    let uid = account_users(&base, &admin, &id, "hank").await;
+    let hank = login_ok(&base, "hank", "hank-password").await;
+    let created = client
+        .post(format!("{base}/api/v1/buckets"))
+        .bearer_auth(&hank)
+        .json(&serde_json::json!({ "name": "strict-one" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 204, "建桶 strict-one");
+
+    let (ak, sk) = ("AKIDSTRICTQUOTA000001", "sk-strict-quota-0000000001");
+    probe.db.create_access_key(ak, sk, uid).await.unwrap();
+    assert_eq!(
+        set_hard_quota(&base, &admin, &id, Some(10), None)
+            .await
+            .status(),
+        204
+    );
+
+    assert_eq!(
+        s3_put(&base, "/strict-one/first.txt", ak, sk, b"abcd")
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        s3_put(&base, "/strict-one/second.txt", ak, sk, b"123456")
+            .await
+            .status(),
+        200
+    );
+    let over = s3_put(&base, "/strict-one/over.txt", ak, sk, b"x").await;
+    assert_eq!(over.status(), 403, "账本边界外应 403");
+    assert!(
+        over.text()
+            .await
+            .unwrap()
+            .contains("account quota exceeded")
+    );
+
+    // 删除释放后同键重写回到恰好上限。
+    assert_eq!(
+        s3_delete(&base, "/strict-one/first.txt", ak, sk)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        s3_put(&base, "/strict-one/first.txt", ak, sk, b"abcd")
+            .await
+            .status(),
+        200
+    );
+
+    // 对象数配额：账本直接判定（无本地采样延迟）。
+    assert_eq!(
+        set_hard_quota(&base, &admin, &id, None, Some(2))
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        s3_put(&base, "/strict-one/third.txt", ak, sk, b"x")
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        s3_delete(&base, "/strict-one/second.txt", ak, sk)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        s3_put(&base, "/strict-one/third.txt", ak, sk, b"x")
+            .await
+            .status(),
+        200,
+        "删除释放对象数后可写"
+    );
+
+    let (used, count): (i64, i64) = sqlx::query_as(
+        "SELECT used_bytes, object_count FROM account_usage_ledger WHERE account_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(probe.db.pool())
+    .await
+    .unwrap();
+    assert_eq!((used, count), (5, 2), "账本 = first(4)+third(1), 2 objects");
+}
