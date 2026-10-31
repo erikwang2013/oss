@@ -679,3 +679,20 @@ observability 4/0。完整 workspace 聚合跑在本机高负载下多次超时�
 **已知限制**：Raft 模式硬配额配置返回 501（执行路径已生效，待复制命令）；follower 发起的
 Restore 清理携带 UNFENCED（term 0），由 leader reaper 收敛；Tag 复制的删除不传播；
 配额未知长度/版本定向删除依赖采样器；MPU/ Copy 配额路径共享预留逻辑但缺少独立集成用例。
+
+## 21. 2026-10-31 v1.27 wave-3：Ext 能力协商、跨版本 MPU、AP 端点身份与分块快照（未发布）
+
+| 项 | 落点 | 验证 |
+|---|---|---|
+| Ext 类型能力协商 | `raft/{compat,command,mod,membership,network,status}.rs` | 握手头 `x-oss-raft-ext-types`；leader 在 append 前按 `REGISTERED_EXT_TYPES` + 全体当前 voter/learner 宣告集拒绝（`UnregisteredExtType`/`ExtTypeUnavailable`）；成员变更 preflight 拒绝缺类型的节点；生产 `REGISTERED_EXT_TYPES` 仍为空，任意双向混写未支持。单测 `registered_ext_test_type_commits`、`ext_type_requires_every_current_member_capability`、`ext_type_gate_requires_every_current_voter_and_learner` |
+| 在途 MPU 的 CMK 引用 | `xl-store/store/cmk_rewrap.rs`、`tests_cmk_rewrap.rs` | `cmk scan --json` 的 `mpu_references`/`mpu_refs` 计入未完成 MPU；删除守卫在引用归零前拒绝（`inflight_mpu_blocks_cmk_delete_until_aborted`）；CLI 人类可读输出仍只汇总对象版本与桶默认引用。`cmk rewrap` 仍只做同一 CMK 的版本内重加密 |
+| wire-1 UploadPart 有界回退 | `xl-store/{mesh_gate,store/mpu}.rs`、`xl-client`、`store/tests_mpu_mesh.rs` | v1.16+ 旧属主走预落盘、限长、MD5 核对后的有界转发；wire-2 流式优先；≤v1.15 无 RPC → `Unavailable`。`mpu_mesh_wire1_bounded_forward_byte_identical`、`..._over_limit_rejected`、`..._mid_forward_failure_cleans_up`、`mpu_mesh_wire2_streaming_preferred` |
+| AP 端点身份验证器 | `xl-s3/ap.rs`、`oss-server/router.rs`、`tests/m8_ap_trust.rs` | `EndpointIdentityVerifier` + `TrustedProxyEndpointVerifier`（`OSS_AP_ENDPOINT_VERIFIER=trusted-proxy`、`OSS_AP_TRUSTED_PEER_CIDRS`）；直连不可信/重复/畸形声明 fail-closed（403），后端故障 500；注册表/账户/VPC 校验在验证后照旧执行，证据写审计。测试覆盖 spoofed/direct、trusted proxy、outage、registry checks。AWS PrivateLink/mTLS 端点身份未在本机证明，mTLS/attested-proxy 是选定下一片 |
+| Raft 分块快照存储 | `oss-server/raft/store.rs` | >256 KiB 分块写 `raft_snapshot_chunk`，`raft_snapshot.data` 只留 `OSSCHNK1` 清单（块数/原始总长）；缺块/乱序/截断 fail-closed；旧整行 BLOB 透明读回并在 open 时迁移。`snapshot_chunk_boundaries_round_trip`、`chunked_snapshot_corruption_fails_closed`、`legacy_whole_blob_snapshot_migrates_on_open`；日志条目仍每条一行 JSON，压缩/分段未做 |
+
+**验证**：以上测试随各实现提交合入（`2991ac1` Ext/CMK MPU、`4677168` wire-1 UploadPart、
+`635e99c` 分块快照、`3923405` AP 验证器；合并 `2b447a4`/`b319c09`/`e9d3d07`/`5f614c6`）；
+本次文档整理未重跑完整闸门，发布闸门待 v1.27 发布波执行。v1.27 基线提交 `cd4c777`
+另交付 feature 8（`AccountHardQuotaSet`、`VpcEndpoint*` 复制命令与迁移工具），§20 的
+「Raft 硬配额配置 501」限制对 v1.27 不再适用；该提交的测试未在本次文档整理中重跑。
+CMK 激活为不归点、旧行快照透明读回、生产 Ext 注册表为空等边界见架构 backlog §1/§2/§4。

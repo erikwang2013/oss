@@ -179,6 +179,23 @@ aws --endpoint-url $E s3 rm s3://photos/cover.jpg
 - 版本控制、生命周期、加密、对象锁、STS、事件通知、复制、强一致与运维命令详见[使用文档](https://oss.erik.xyz/usage.html)。
 - 完整 API 与协议边界见 [API 文档](https://oss.erik.xyz/api.html)。
 
+## 升级与回滚
+
+本版数据面升级按**停写蓝绿**执行，不做滚动升级：新二进制在原数据目录启动，由运维切换流量；旧二进制回退只在没有新格式写入时成立。
+
+1. 升级前跑只读预检：`scripts/upgrade-preflight.sh --data-dir <盘...> --health-json <保存的 /health/cluster> --strict --require-no-mpu`。
+2. 停客户端流量并停旧服务，确认没有写入者。
+3. 冷备每块数据盘与控制库，保留到验收完成。
+4. 用新二进制在原数据目录启动；检查 `/health/ready` 与 `/health/cluster`：`data_plane_compatible: true`，且所有 peer `data_wire_version >= 2`。
+5. 切流；备份继续保留。
+6. 回滚 = 停新二进制、还原冷备、起旧二进制；仅当未发生新格式/CMK 写入时有效，否则按下方 CMK 迁移处理或保持新二进制。
+
+`scripts/blue-green-preflight.sh` 把同一流程的检查做成只读闸门：`--data-dir`、`--backup`、`--config`、`--health-json`、`--health-url`、`--new-binary`、`--min-version`、`--strict`、`--json`；它只检查、不修改数据、不停止服务。
+
+**CMK 激活是不归点。** DARE 的 AAD 绑定 `key_id`，只改元数据无法让 pre-CMK 二进制读 CMK 数据；仓库不提供明文/不安全降级。`oss-server cmk rewrap` 只在**同一个 CMK** 内把旧版本重加密到该 CMK 当前版本，不能把目标换成 legacy `file`/`k<n>` key。若已有 CMK 对象或桶默认加密、而必须回到 pre-CMK 二进制：先停写，逐节点跑 `oss-server cmk scan --name <cmk> --json`（`references`、`mpu_references` 与 `bucket_defaults`，含在途 MPU）并 Complete/Abort 所有 MPU、清除桶默认加密，使引用归零；然后要么用 legacy provider 重写对象数据，或迁移到新集群（如 `scripts/single-to-cluster.sh` 的离线重新灌入，只迁当前版本），再 `oss-server cmk delete --name <cmk> --yes`（集群需在全站逐节点核实后加 `--force`）；要么保持新二进制。**绝不能删除 CMK 来「强制」降级**；迁移完成前，回滚只能退回仍能读 CMK 的新二进制。
+
+**跨版本 MPU。** 跨节点 UploadPart 转发支持 v1.16+（wire 1 有界回退）与本版 wire 2 流式；≤v1.15 没有 MPU RPC，无法支持。升级/降级前必须 Complete/Abort/排空所有在途 MPU，并用 `upgrade-preflight.sh --require-no-mpu --health-json` 强制门槛（`data_wire_version >= 2`、`data_plane_compatible: true`）。
+
 ---
 
 © 2026 erik.xyz · 以 Apache-2.0 许可发布

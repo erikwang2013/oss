@@ -143,6 +143,23 @@ aws --endpoint-url $E s3 rm s3://photos/cover.jpg
 - Versioning, lifecycle, encryption, object lock, STS, event notifications, replication, strong consistency, and ops commands are covered in the [usage docs](https://oss.erik.xyz/usage.html).
 - The full API and protocol boundaries are in the [API docs](https://oss.erik.xyz/api.html).
 
+## Upgrade and Rollback
+
+Data-plane upgrades in this version are **stop-the-world blue-green**, not rolling: start the new binary on the original data directories and cut traffic over; rolling back to the old binary is valid only if no new-format writes occurred.
+
+1. Before upgrading, run the read-only preflight: `scripts/upgrade-preflight.sh --data-dir <dirs...> --health-json <saved /health/cluster> --strict --require-no-mpu`.
+2. Stop client traffic and the old service; confirm there are no writers.
+3. Take a cold backup of every data directory and the control DB; keep it until acceptance.
+4. Start the new binary on the same data directories; check `/health/ready` and `/health/cluster` (`data_plane_compatible: true`, every peer `data_wire_version >= 2`).
+5. Shift traffic; keep the backup.
+6. Rollback = stop the new binary, restore the cold backup, start the old binary — valid only if no new-format/CMK writes occurred; otherwise use the CMK migration below or stay forward.
+
+`scripts/blue-green-preflight.sh` gates the same procedure read-only: `--data-dir`, `--backup`, `--config`, `--health-json`, `--health-url`, `--new-binary`, `--min-version`, `--strict`, `--json`; it never modifies data or stops services.
+
+**Enabling a CMK is a point of no return.** DARE binds `key_id` into the AAD, so a meta-only rewrap cannot make a pre-CMK binary read CMK data; there is no plaintext/unsafe downgrade. `oss-server cmk rewrap` only re-encrypts old versions of the same CMK to that CMK's current version; it cannot target legacy `file`/`k<n>` keys. If CMK objects or bucket defaults exist and a pre-CMK binary must be restored: drain writes, run `oss-server cmk scan --name <cmk> --json` on every node (`references`, `mpu_references`, and `bucket_defaults`, including in-flight MPUs), complete/abort all MPUs, and clear bucket-default encryption until references are zero; then either rewrite object data under a legacy provider or migrate objects to a new cluster (e.g. the offline `scripts/single-to-cluster.sh` re-ingest; current versions only) and `oss-server cmk delete --name <cmk> --yes` (add `--force` in a cluster only after every node has been verified), or stay on the new binary. **Never delete the CMK to "force" a downgrade**; until migration completes, the only rollback target is a new binary that can still read the CMK.
+
+**Cross-version MPU.** Cross-node UploadPart forwarding supports v1.16+ (bounded wire-1 fallback) and wire-2 streaming; ≤v1.15 has no MPU RPC and cannot be supported. Before any upgrade/downgrade, complete/abort/drain all in-flight MPUs and enforce the floor with `upgrade-preflight.sh --require-no-mpu --health-json` (`data_wire_version >= 2`, `data_plane_compatible: true`).
+
 ---
 
 © 2026 erik.xyz · Released under the Apache-2.0 license
