@@ -76,7 +76,12 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         .map(|(id, p)| {
             (
                 id.to_string(),
-                json!({"wire": p.wire, "feature": p.feature, "term": p.term}),
+                json!({
+                    "wire": p.wire,
+                    "feature": p.feature,
+                    "term": p.term,
+                    "ext_types": &p.ext_types,
+                }),
             )
         })
         .collect();
@@ -111,6 +116,8 @@ pub fn status_json(handle: &RaftHandle, configured: bool) -> Value {
         // ---- Level B 滚动升级握手/诊断（纯增量字段；旧节点无这些键） ----
         "wire_version": compat::WIRE_VERSION,
         "feature_level": handle.advertised_feature(),
+        // Level C：本机宣告的 Ext 类型集（旧节点无此键 = 空集）。
+        "ext_types": super::command::advertised_ext_types(),
         "feature_max": compat::MAX_FEATURE_LEVEL,
         "snapshot_format": super::data::SNAPSHOT_FORMAT,
         // 当前二进制没有只读模式；1.13.2 patch 见到更高 wire peer 时置 true。

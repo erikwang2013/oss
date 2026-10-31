@@ -458,6 +458,13 @@ impl ControlPlane {
                             "Ext type_id {type_id:?} is not registered; nothing was appended"
                         )));
                     }
+                    Err(WriteError::ExtTypeUnavailable { type_id, missing }) => {
+                        return Err(ControlError::Unavailable(format!(
+                            "Ext type_id {type_id:?} is not advertised by every current \
+                             voter/learner ({}); upgrade/wait for handshakes; nothing was appended",
+                            missing.join("; ")
+                        )));
+                    }
                     Err(WriteError::QuotaExceeded) => return Err(ControlError::QuotaExceeded),
                     Err(WriteError::Raft(msg)) => return Err(ControlError::Unavailable(msg)),
                 };

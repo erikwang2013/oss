@@ -12,11 +12,20 @@
 //! - 桶默认加密同样算引用：删除后若新写入仍会套用该 CMK，会立刻产生不可解对象（strand）。
 //!   配置引用由调用方经 [`CmkConfigRefs`] 注入（xl-store 不依赖 SQL）；隔离后复扫关闭竞态。
 //! - 逐版本失败不中断批次（原数据不动，可重跑）；扫描/meta 读取错误 → 整批 fail-closed。
-//! - 删除 = 引用扫描（对象版本 + 桶默认，有引用即拒）→ 原子隔离（此后新 wrap 失败）→
+//! - 删除 = 引用扫描（对象版本 + 在途 MPU + 桶默认，有引用即拒）→ 原子隔离（此后新 wrap 失败）→
 //!   等本机写者归零 → 复扫（竞态出现引用则恢复）→ 清理。任一步失败都不会留下
 //!   「钥没了但引用还在」的静默态。删除中断的残骸用 `cmk trash list/restore/purge` 处置。
 //! - 旧版本保持 decrypt-only：本模块绝不删除/改写任何 key 文件（删除走隔离销毁）。
 //! - 审计只记名/版本/数量，绝不记钥字节。
+//!
+//! **CMK → pre-CMK 二进制的自动降级为何不存在**：DARE AAD 绑定 `key_id`，只改 meta 里的
+//! key_id/wrapped DEK 在密码学上不可能让旧密文被 legacy key 解开；唯一安全路径是完整重读
+//! 明文、用目标 key 重加密并原子翻 meta（`rewrap_one` 已按此实现，但只在**同一
+//! CMK 的旧版本 → 当前版本**内）。把目标换成 legacy `file`/`k<n>` 需要：选择/轮换无租户
+//! 语义的 legacy key、跨节点逐盘执行并汇总、切换桶默认加密、处理「complete 时才加密」的
+//! 在途 MPU——这些都在本模块边界外，无法证明不弱化隔离或原子完成。故不提供 CMK→legacy
+//! rewrap，也绝不提供明文降级。最小安全替代：逐节点 `cmk references`（本模块已计入在途
+//! MPU）归零 → 以旧二进制可读的加密模式重写入（客户端重传/迁移）→ `cmk delete` → 回退。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +69,17 @@ pub struct CmkBucketRef {
     pub setting: String,
 }
 
+/// 在途 MPU 暂存区对 CMK 的引用：`complete` 时才按 `sse_kind` 加密，删除 CMK 会让收尾
+/// 失败（或留下不可解对象）。它是**独立于已提交版本的引用**，删除守卫必须计入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CmkMpuRef {
+    pub bucket: String,
+    pub key: String,
+    /// 暂存目录名（本机规范 UUID；集群 upload_id 可能带属主前缀）。
+    pub upload_id: String,
+    pub sse_kind: String,
+}
+
 /// 删除/扫描的**外部配置引用源**（oss-server 的 `buckets.default_encryption`）。
 /// 在线控制台与离线 CLI 注入同一实现；扫描失败必须上抛（删除 guard fail-closed）。
 #[async_trait::async_trait]
@@ -74,6 +94,9 @@ pub struct CmkRefScan {
     pub references: usize,
     pub refs: Vec<CmkRef>,
     pub refs_truncated: bool,
+    /// 在途 MPU（complete 时才加密）的引用数；独立于 `references`。
+    pub mpu_references: usize,
+    pub mpu_refs: Vec<CmkMpuRef>,
     /// 把该 CMK 设为桶默认加密的桶（离线 CLI 用本机库副本填充；空 = 无配置引用）。
     pub bucket_defaults: Vec<CmkBucketRef>,
 }
@@ -91,6 +114,8 @@ pub struct CmkDeleteReport {
     pub references: usize,
     pub refs: Vec<CmkRef>,
     pub refs_truncated: bool,
+    pub mpu_references: usize,
+    pub mpu_refs: Vec<CmkMpuRef>,
     /// 把该 CMK 设为桶默认加密的桶（同样阻止删除——否则新写入会被 strand）。
     pub bucket_defaults: Vec<CmkBucketRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,6 +133,8 @@ pub struct CmkTrashPurgeReport {
     pub references: usize,
     pub refs: Vec<CmkRef>,
     pub refs_truncated: bool,
+    pub mpu_references: usize,
+    pub mpu_refs: Vec<CmkMpuRef>,
     pub bucket_defaults: Vec<CmkBucketRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -181,6 +208,9 @@ struct ScanOut {
     matched: usize,
     candidates: Vec<Candidate>,
     truncated: bool,
+    /// 在途 MPU 命中（只在引用守卫 `current=None` 时扫描）。
+    mpu_matched: usize,
+    mpu_refs: Vec<CmkMpuRef>,
 }
 
 /// 记录是否（以任意形态）引用名为 `cmk` 的 CMK：显式字段、规范 key_id，或畸形 `cmk:` 前缀的
@@ -289,6 +319,8 @@ impl Store {
             references: scan.matched,
             refs,
             refs_truncated,
+            mpu_references: scan.mpu_matched,
+            mpu_refs: scan.mpu_refs,
             bucket_defaults,
         })
     }
@@ -337,16 +369,20 @@ impl Store {
             references: scan.matched,
             refs: scan.candidates.iter().map(|c| c.r.clone()).collect(),
             refs_truncated: scan.matched > scan.candidates.len(),
+            mpu_references: scan.mpu_matched,
+            mpu_refs: scan.mpu_refs.clone(),
             bucket_defaults: cfg_refs.to_vec(),
             reason: reason.map(str::to_string),
             warning: None,
         };
         let scan = self.scan_cmk_refs(cmk, None, None, None, None).await?;
         let cfg_refs = self.scan_config_refs(cmk, config).await?;
-        if scan.matched > 0 || !cfg_refs.is_empty() {
-            // force 绝不放宽已知引用；桶默认加密同属引用（否则删除后新写入即不可解）。
+        if scan.matched > 0 || scan.mpu_matched > 0 || !cfg_refs.is_empty() {
+            // force 绝不放宽已知引用；桶默认加密/在途 MPU 同属引用（否则删除后写入即不可解）。
             let reason = if scan.matched > 0 {
                 "references"
+            } else if scan.mpu_matched > 0 {
+                "mpu_references"
             } else {
                 "bucket_default"
             };
@@ -375,7 +411,7 @@ impl Store {
         }
         .await;
         match after {
-            Ok((s, c)) if s.matched == 0 && c.is_empty() => {}
+            Ok((s, c)) if s.matched == 0 && s.mpu_matched == 0 && c.is_empty() => {}
             Ok((s, c)) => {
                 kms.restore_cmk(&q).await?;
                 return Ok(base(false, false, &s, &c, Some("race_detected")));
@@ -432,12 +468,16 @@ impl Store {
             references: scan.matched,
             refs: scan.candidates.iter().map(|c| c.r.clone()).collect(),
             refs_truncated: scan.matched > scan.candidates.len(),
+            mpu_references: scan.mpu_matched,
+            mpu_refs: scan.mpu_refs.clone(),
             bucket_defaults: cfg_refs.to_vec(),
             reason: reason.map(str::to_string),
         };
-        if scan.matched > 0 || !cfg_refs.is_empty() {
+        if scan.matched > 0 || scan.mpu_matched > 0 || !cfg_refs.is_empty() {
             let reason = if scan.matched > 0 {
                 "references"
+            } else if scan.mpu_matched > 0 {
+                "mpu_references"
             } else {
                 "bucket_default"
             };
@@ -607,6 +647,11 @@ impl Store {
                     continue;
                 }
                 let same_key = cursor.is_some_and(|c| b == c.bucket && k == c.key);
+                // 在途 MPU 必须在 `read_meta` 缺省 continue 之前扫描：只有暂存区、
+                // 尚无 xl.meta 的对象同样算引用（complete 时才加密）。
+                if current.is_none() {
+                    self.scan_key_mpus(&b, &k, cmk, &mut out).await?;
+                }
                 let Some(m) = self.read_meta(&b, &k).await? else {
                     continue;
                 };
@@ -668,6 +713,51 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// 单个对象的在途 MPU 引用（`<object_dir>/<uuid>/mpu.meta` 的 `sse_kind`）。
+    /// 集群下只覆盖本机暂存区（与整个扫描同一本地边界）；`mpu.meta` 损坏 → 整批
+    /// fail-closed（删除守卫绝不因读不出来而放行）。
+    async fn scan_key_mpus(
+        &self,
+        bucket: &str,
+        key: &str,
+        cmk: &str,
+        out: &mut ScanOut,
+    ) -> Result<()> {
+        let obj_dir = layout::object_dir(self.cfg.root(), bucket, key)?;
+        let mut entries = match tokio::fs::read_dir(&obj_dir).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(ent) = entries.next_entry().await? {
+            if !ent.file_type().await?.is_dir() {
+                continue;
+            }
+            let Some(summary) = super::mpu::mpu_summary(&ent.path()).await? else {
+                continue;
+            };
+            let Some(kind) = summary.sse_kind else {
+                continue;
+            };
+            let Some(name) = kind.strip_prefix("sse-kms:") else {
+                continue;
+            };
+            if name != cmk {
+                continue;
+            }
+            out.mpu_matched += 1;
+            if out.mpu_refs.len() < REFS_REPORT_CAP {
+                out.mpu_refs.push(CmkMpuRef {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    upload_id: ent.file_name().to_string_lossy().into_owned(),
+                    sse_kind: kind,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// 单版本重加密：读旧明文（旧 CMK 版本解密）→ 目标 CMK 当前版本重加密 → 新版本目录 →

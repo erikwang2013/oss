@@ -195,6 +195,18 @@ async fn check_target_compat(
             status.feature
         )));
     }
+    // Level C：新 voter/learner 会收到历史 Ext entry/快照；它必须能应用本机注册的每个
+    // 类型，否则 apply 结果分叉。旧节点缺 `ext_types` = 空集；注册表为空时无行为变化。
+    let missing: Vec<&str> = super::command::advertised_ext_types()
+        .into_iter()
+        .filter(|t| !status.ext_types.iter().any(|a| a == t))
+        .collect();
+    if !missing.is_empty() {
+        return Err(MembershipError::Incompatible(format!(
+            "target node {node_id} does not advertise registered Ext type(s) {missing:?}; \
+             it cannot apply existing Ext entries/snapshots (upgrade it first)"
+        )));
+    }
     Ok(())
 }
 

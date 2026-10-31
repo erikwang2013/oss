@@ -148,20 +148,23 @@ impl HttpNetwork {
         body: Vec<u8>,
         ttl: Duration,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        self.current_client()
+        let mut req = self
+            .current_client()
             .post(format!("{}{}", self.endpoint, path))
             .header(RPC_TOKEN_HEADER, self.token.as_str())
             .header(RPC_TARGET_HEADER, self.target.to_string())
             .header(compat::WIRE_HEADER, compat::WIRE_VERSION.to_string())
             .header(compat::FEATURE_HEADER, self.feature.to_string())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .timeout(ttl)
-            .body(body)
-            .send()
-            .await
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        // 注册表是编译期常量；头值非法时省略（对端按「无类型」处理，fail-closed）。
+        let ext = compat::format_ext_types(&super::command::advertised_ext_types());
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&ext) {
+            req = req.header(compat::EXT_TYPES_HEADER, value);
+        }
+        req.timeout(ttl).body(body).send().await
     }
 
-    /// 2xx 响应的握手结果按请求 term 记录；旧节点缺头 = 1（保守）。
+    /// 2xx 响应的握手结果按请求 term 记录；旧节点缺头 = 1 / 空 Ext 集（保守）。
     /// 非 2xx（421/422/500）不是可用记录，不覆盖已知版本。
     fn record_peer(&self, term: u64, resp: &reqwest::Response) {
         if !resp.status().is_success() {
@@ -177,7 +180,13 @@ impl HttpNetwork {
                 .get(compat::FEATURE_HEADER)
                 .and_then(|v| v.to_str().ok()),
         );
-        self.peers.record(self.target, term, wire, feature);
+        let ext_types = compat::parse_ext_types(
+            resp.headers()
+                .get(compat::EXT_TYPES_HEADER)
+                .and_then(|v| v.to_str().ok()),
+        );
+        self.peers
+            .record_ext(self.target, term, wire, feature, ext_types);
     }
 }
 

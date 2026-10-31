@@ -71,6 +71,8 @@ pub(super) struct MpuSummary {
     pub storage_class: Option<String>,
     /// `None` = 旧格式（属主 = 本地）
     pub owner: Option<String>,
+    /// complete 时将采用的 SSE 意图（`sse-kms:<name>` = 命名 CMK）；CMK 引用扫描用。
+    pub sse_kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1246,6 +1248,7 @@ pub(super) async fn mpu_summary(dir: &std::path::Path) -> Result<Option<MpuSumma
         created_nanos: m.created_nanos,
         storage_class: m.storage_class,
         owner: m.owner,
+        sse_kind: m.sse_kind,
     }))
 }
 

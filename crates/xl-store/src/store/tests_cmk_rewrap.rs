@@ -607,3 +607,58 @@ async fn trash_purge_cluster_requires_force() {
     assert!(!r.deleted);
     assert_eq!(r.reason.as_deref(), Some("no_quarantine"));
 }
+
+/// 在途 MPU 的 `sse_kind` 也是 CMK 引用：complete 时才加密，删除 CMK 必须拒绝并报
+/// `mpu_references`；abort 清掉暂存区后引用归零、删除继续。防止「钥没了但 MPU 待完成」
+/// 的 strand（旧实现只看已提交版本的 `xl.meta`，会漏掉它）。
+#[tokio::test]
+async fn inflight_mpu_blocks_cmk_delete_until_aborted() {
+    let (s, _d) = enc_store().await;
+    let kms = kms(&s);
+    kms.create_cmk("tenant-a").await.unwrap();
+    s.create_bucket("alpha").await.unwrap();
+    let upload_id = s
+        .create_multipart_upload_ext(
+            "alpha",
+            "k",
+            None,
+            Default::default(),
+            None,
+            Some("sse-kms:tenant-a"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let scan = s.cmk_references("tenant-a", None).await.unwrap();
+    assert_eq!(scan.mpu_references, 1, "{scan:?}");
+    assert_eq!(scan.mpu_refs[0].key, "k");
+    assert_eq!(scan.mpu_refs[0].upload_id, upload_id);
+    // force 不放宽 MPU 引用（与版本引用同口径）。
+    let r = s.delete_cmk("tenant-a", true, None).await.unwrap();
+    assert!(!r.deleted, "{r:?}");
+    assert_eq!(r.reason.as_deref(), Some("mpu_references"));
+    assert_eq!(r.mpu_references, 1);
+    // 名字精确匹配：别的 CMK 不背锅。
+    kms.create_cmk("tenant-b").await.unwrap();
+    assert_eq!(
+        s.cmk_references("tenant-b", None)
+            .await
+            .unwrap()
+            .mpu_references,
+        0
+    );
+    s.abort_multipart_upload("alpha", "k", &upload_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.cmk_references("tenant-a", None)
+            .await
+            .unwrap()
+            .mpu_references,
+        0
+    );
+    let r = s.delete_cmk("tenant-a", true, None).await.unwrap();
+    assert!(r.deleted && r.purged, "{r:?}");
+}
