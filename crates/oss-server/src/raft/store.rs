@@ -1,7 +1,7 @@
 //! S5 基座存储：`raft.db` 上的 v2 [`RaftLogStorage`] + [`RaftStateMachine`]。
 //!
 //! 日志/投票/成员与应用状态都落在同一 SQLite 文件（WAL + `synchronous=FULL` + 5 s
-//! busy_timeout）。S6 把 `apply` 事务扩展到控制库真实表时，可把状态机指向 `control.db`：
+//! busy_timeout）；写事务先读后写时必须 `BEGIN IMMEDIATE`，否则 WAL 升级会立即 BUSY。S6 把 `apply` 事务扩展到控制库真实表时，可把状态机指向 `control.db`：
 //! `raft_applied` 表结构已与 `0004_m9.sql` 对齐。
 //!
 //! 快照 > [`SNAPSHOT_CHUNK_BYTES`] 时按固定大小分块行存储（`raft_snapshot_chunk`，
@@ -670,9 +670,11 @@ impl SqliteLogStore {
 
     /// 追加事务体：写行 + 尝试压段，提交前返回；callback 由 [`Self::append`] 负责。
     async fn append_entries(&self, entries: &[Entry<TypeConfig>]) -> Result<(), StorageError<u64>> {
+        // 压段前先 SELECT 再写；deferred 事务在 WAL 下升级写会立即 BUSY_SNAPSHOT，
+        // busy_timeout 不生效。IMMEDIATE 先拿写锁，等锁走 busy_timeout。
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| log_err(ErrorVerb::Write, e))?;
         // 批次通常是 [first,last] 连续；覆盖已有段时先挖掉这些 idx。
@@ -1428,9 +1430,10 @@ impl SqliteStateMachine {
     ) -> Result<(), StorageError<u64>> {
         let _guard = self.snapshot_lock.lock().await;
         // 比较与写入同一事务：分块清/写不能与并发读看到半套块。
+        // 先 SELECT 再写 → 用 IMMEDIATE 避免 WAL 读事务升级时立即 BUSY_SNAPSHOT。
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
         let current: Option<String> =
@@ -2920,7 +2923,10 @@ mod tests {
 
         append_range(&mut store, 1, 256).await;
         let replacement = set_value(100, "new");
-        store.append_entries(&[replacement.clone()]).await.unwrap();
+        store
+            .append_entries(std::slice::from_ref(&replacement))
+            .await
+            .unwrap();
 
         let segs: Vec<(i64, i64)> =
             sqlx::query_as("SELECT start_idx, end_idx FROM raft_log_segment ORDER BY start_idx")
