@@ -276,6 +276,14 @@ pub fn build_router_with_trust(
         .merge(aether.with_state(()))
         .fallback_service(s3)
         .with_state(state.clone());
+    // Level C 停写排空：只包客户端面（控制台/上传/S3 fallback/健康与指标）。
+    // 节点间 Raft RPC 是内部复制，必须在 merge 之前挂层、让它结构性留在闸外——
+    // 否则排空节点会拒绝 append/vote，直接退出复制。
+    let app = if state.cfg.read_only {
+        app.layer(middleware::from_fn(read_only_gate))
+    } else {
+        app
+    };
     // S7.1：Raft RPC 路由只在 `[raft]` 下挂载；走集群令牌，不经 console JWT 层。
     let app = match state.raft.clone() {
         Some(handle) => {
@@ -339,11 +347,19 @@ pub fn build_router_with_trust(
     }));
     // M3 shrink：维护模式停写。最外层包裹（含 S3 fallback 与控制台写请求）；
     // GET/HEAD/OPTIONS 保持在线，源节点只读供 mesh 拉取。gRPC mesh 不经过本 Router。
+    // 同配 read_only 时 maintenance 更严且包在更外层，因而生效。
     let app = if state.cfg.maintenance {
         app.layer(middleware::from_fn(maintenance_gate))
     } else {
         app
     };
+    if state.cfg.read_only {
+        tracing::info!(
+            "read_only=true：本节点已从客户端写路径摘除（GET/HEAD/OPTIONS、登录与 \
+             /api/v1/site/raft/* 除外）。旧二进制没有此开关——混版窗口内必须由 LB/客户端\
+             移除其写流量，本进程无法约束旧节点"
+        );
+    }
     Ok(app)
 }
 
@@ -364,6 +380,32 @@ async fn maintenance_gate(req: Request, next: Next) -> Response {
     );
     resp.headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    resp
+}
+
+/// read_only（手工排空）：GET/HEAD/OPTIONS 恒放行；POST 仅放行精确的登录路径
+/// （Raft RPC 在 merge 前挂层，不在本闸内）。其余方法一律 503，先于鉴权/业务逻辑。
+/// 路径用 axum 看到的原样 `uri().path()` 精确比对——编码斜杠/大小写变体不匹配即拒绝
+/// （fail-closed）。旧二进制没有这个开关，混版窗口内仍会本地写；必须由 LB/客户端
+/// 摘掉其写流量。
+async fn read_only_gate(req: Request, next: Next) -> Response {
+    let allowed = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
+        || (*req.method() == Method::POST && req.uri().path() == "/api/v1/login");
+    if allowed {
+        return next.run(req).await;
+    }
+    let mut resp = Response::new(axum::body::Body::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>ServiceUnavailable</Code>\
+         <Message>node is read-only (drained from client write path)</Message></Error>",
+    ));
+    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    resp.headers_mut()
+        .insert("x-oss-read-only", HeaderValue::from_static("1"));
     resp
 }
 
@@ -1070,6 +1112,8 @@ async fn cluster_view(state: &AppState) -> (serde_json::Value, bool, String) {
         "data_plane_compatible": status.compatible,
         "degraded_peers": status.degraded_peers,
         "incompatible_peers": status.incompatible_peers,
+        // Level C：本节点是否处于手工停写排空（运维摘流量的依据）。
+        "read_only": state.cfg.read_only,
         "ready": ready,
     });
     (view, ready, reason)
@@ -1408,6 +1452,51 @@ mod tests {
         assert!(ProxyTrust::parse(None, None, Some("not-a-cidr")).is_err());
         assert!(ProxyTrust::parse(None, Some("garbage"), None).is_err());
         assert!(ProxyTrust::parse(Some("0"), None, None).is_err());
+    }
+
+    /// read_only 层在 Raft RPC merge 之前挂载：之后合入的节点间 RPC 结构性留在闸外，
+    /// 而客户端 fallback（S3）始终在闸内；登录 POST 是唯一放行的客户端写路径。
+    #[tokio::test]
+    async fn read_only_gate_wraps_fallback_but_not_later_merged_routes() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let app = axum::Router::new()
+            .fallback(ok)
+            .layer(axum::middleware::from_fn(super::read_only_gate))
+            .merge(axum::Router::new().route("/node-rpc", axum::routing::post(ok)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+
+        // 后 merge 的节点间 RPC 不在闸内（否则排空节点会退出复制）。
+        let res = http
+            .post(format!("http://{addr}/node-rpc"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        // 客户端面写全拦；登录与读放行。
+        let res = http
+            .post(format!("http://{addr}/bucket/key"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        assert_eq!(res.headers()["x-oss-read-only"], "1");
+        let res = http
+            .post(format!("http://{addr}/api/v1/login"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "登录必须在闸放行后到达处理方");
+        let res = http
+            .get(format!("http://{addr}/bucket/key"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
     }
 
     /// RestoreObject 线上状态修复：仅 POST `?restore` 的 200 → 202 + `x-amz-restore`；

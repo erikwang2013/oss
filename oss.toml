@@ -6,6 +6,10 @@ database_url = "sqlite://./oss.db?mode=rwc"
 # 服务会拒绝启动，必须先换成随机密钥。
 jwt_secret = "dev-only-change-me-0123456789abcdef"
 max_put_bytes = 268435456
+# Level C 停写排空：true = 本节点拒绝客户端写（POST/PUT/PATCH/DELETE → 503），
+# 读/登录/健康/Raft RPC 保持在线，用于把节点从客户端写路径摘除后再下线。
+# 旧二进制没有此开关，混版窗口内仍须由 LB/客户端移除其写流量。
+# read_only = false
 
 # 多盘（M2b）：配了 data_dirs 则忽略 data_dir。EC 8+4 冗余需 ≥ 12 盘；
 # 单盘可运行（分片同盘、无冗余，启动会 warn）。**首启前确认各盘挂载点已挂载**
