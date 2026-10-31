@@ -400,10 +400,10 @@ pub enum ControlCommand {
 /// 已注册的生产 `Ext.type_id` 白名单（当前为空：level 3 只代表“能解码 Ext 容器”，
 /// **不**代表认识任何业务类型）。
 ///
-/// 不变量：新增一项即协议变更。只有当所有 voter/learner 都已换到能应用该类型的
-/// 二进制时才可注册；否则必须先提升 feature level（新级别）或完成 per-peer 类型
-/// 能力协商。leader 在 append 前按本表 fail-closed 拒绝未注册/空/拼错的 type_id
-/// （不写日志、不激活 marker）；apply 侧未知类型的 `Invalid` 只是兜底。
+/// 不变量：新增一项即协议变更。leader 在 append 前按本表与**全体当前成员宣告的**
+/// 类型集双重校验，fail-closed 拒绝未注册/空/拼错/未全员宣告的 type_id（不写日志、
+/// 不激活 marker）；apply 侧未知类型的 `Invalid` 只是兜底（快照/旧日志仍可能带入）。
+/// 本表同时是节点 `x-oss-raft-ext-types` 能力头的来源（见 [`advertised_ext_types`]）。
 pub const REGISTERED_EXT_TYPES: &[&str] = &[];
 
 /// `JobPurge` 单条命令的 id 上限（保留 worker 每批大小）。leader append 前与 apply
@@ -441,6 +441,21 @@ pub(crate) fn ext_type_registered(type_id: &str) -> bool {
     #[cfg(not(test))]
     {
         REGISTERED_EXT_TYPES.contains(&type_id)
+    }
+}
+
+/// 本构建在手握手中宣告的 Ext 类型集（测试构建含 [`TEST_EXT_TYPES`] 探针）。
+/// 只是**能力宣告**；判定仍以 [`ext_type_registered`] 为准。
+pub fn advertised_ext_types() -> Vec<&'static str> {
+    #[cfg(test)]
+    {
+        let mut out = REGISTERED_EXT_TYPES.to_vec();
+        out.extend_from_slice(TEST_EXT_TYPES);
+        out
+    }
+    #[cfg(not(test))]
+    {
+        REGISTERED_EXT_TYPES.to_vec()
     }
 }
 
@@ -545,6 +560,7 @@ impl ControlCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::compat;
 
     /// 注册表 fail-closed：空串、拼错、未注册都是 false；仅测试类型的探针为 true。
     #[test]
@@ -553,6 +569,22 @@ mod tests {
         assert!(!ext_type_registered("test.nop"));
         assert!(!ext_type_registered("future.demo"));
         assert!(ext_type_registered("test.noop"));
+    }
+
+    /// 宣告集必须是合法 HTTP 头值（逗号分隔、可打印 ASCII），且只含已注册类型——
+    /// 否则加入注册表的 typo（空格/换行）会静默破坏全网能力协商。
+    #[test]
+    fn advertised_ext_types_are_registered_and_header_safe() {
+        let advertised = advertised_ext_types();
+        for t in &advertised {
+            assert!(ext_type_registered(t), "{t:?} 未注册");
+            assert!(compat::parse_ext_types(Some(t)).contains(*t), "{t:?}");
+        }
+        let rendered = compat::format_ext_types(&advertised);
+        assert_eq!(
+            compat::parse_ext_types(Some(&rendered)),
+            advertised.into_iter().map(str::to_string).collect()
+        );
     }
 
     /// JobPurge 入口约束（leader append 前与 apply 兜底共用）：空/重复/超限整体拒绝。

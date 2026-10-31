@@ -3,7 +3,7 @@
 mod common;
 
 use common::raft_harness;
-use oss_server::raft::compat::{FEATURE_HEADER, WIRE_HEADER};
+use oss_server::raft::compat::{EXT_TYPES_HEADER, FEATURE_HEADER, WIRE_HEADER};
 use oss_server::raft::{RPC_TARGET_HEADER, RPC_TOKEN_HEADER};
 
 fn client() -> reqwest::Client {
@@ -43,6 +43,8 @@ async fn compat_status_exposes_feature_max_and_snapshot_format() {
         .await
         .unwrap();
     assert_eq!(body["feature_level"], MAX_FEATURE_LEVEL);
+    // 生产注册表为空：能力集必须是空数组（旧节点无此键 = 同一语义）。
+    assert_eq!(body["ext_types"], serde_json::json!([]));
     assert_eq!(body["feature_max"], MAX_FEATURE_LEVEL);
     assert_eq!(body["snapshot_format"], SNAPSHOT_FORMAT);
     assert_eq!(body["effective_feature_level"], MAX_FEATURE_LEVEL);
@@ -71,6 +73,8 @@ async fn wire_three_is_rejected_except_status_and_responses_advertise_compat() {
     assert_eq!(resp.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
     assert_eq!(header(&resp, WIRE_HEADER), "2");
     assert_eq!(header(&resp, FEATURE_HEADER), "1");
+    // 错误分支也宣告 Ext 能力（生产为空 = 空串）。
+    assert_eq!(header(&resp, EXT_TYPES_HEADER), "");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "wire_version_unsupported");
 

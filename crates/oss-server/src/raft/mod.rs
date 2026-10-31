@@ -97,6 +97,12 @@ pub enum WriteError {
     UnregisteredExtType {
         type_id: String,
     },
+    /// Level C：已注册，但并非每个当前 term 的 voter/learner 都宣告支持该类型
+    /// （旧节点不发能力头 = 空集）。leader 在 append 前拒绝；`missing` 点名原因。
+    ExtTypeUnavailable {
+        type_id: String,
+        missing: Vec<String>,
+    },
     /// leader append 前的账户桶数硬配额拒绝（无日志写入；follower 转发由 leader 判）。
     /// 不进 `ControlResponse`，避免混版副本对同一日志产生不同 apply 结果。
     QuotaExceeded,
@@ -123,6 +129,12 @@ impl std::fmt::Display for WriteError {
                 f,
                 "raft Ext type_id {type_id:?} is not registered (new type requires a new \
                  feature level or negotiated per-peer capability; nothing was appended)"
+            ),
+            Self::ExtTypeUnavailable { type_id, missing } => write!(
+                f,
+                "raft Ext type_id {type_id:?} is not advertised by every current voter/learner \
+                 ({}); 先升级全部 voter/learner，等待一次心跳握手后重试；nothing was appended",
+                missing.join("; ")
             ),
             Self::QuotaExceeded => write!(f, "account bucket quota exceeded"),
         }
@@ -383,12 +395,37 @@ impl RaftHandle {
         // level 3 只代表能解码 Ext 容器：未注册的 type_id 必须在 append 前拒绝，
         // 否则各节点的 apply 结果会静默分叉（旧 level-3 副本 → Invalid）且 marker
         // 被单向激活。leader 权威判定；follower 转发后由这里兜住。
-        if let ControlCommand::Ext { type_id, .. } = cmd
-            && !command::ext_type_registered(type_id)
-        {
-            return Err(WriteError::UnregisteredExtType {
-                type_id: type_id.clone(),
-            });
+        if let ControlCommand::Ext { type_id, .. } = cmd {
+            if !command::ext_type_registered(type_id) {
+                return Err(WriteError::UnregisteredExtType {
+                    type_id: type_id.clone(),
+                });
+            }
+            // 仅有 feature level 不够：同 level 的旧二进制认识容器但不认识具体类型。
+            // 只由 leader 判定（follower 转发后由 leader 判，避免用陈旧表误拒）。
+            if is_leader {
+                let (own, voters, learners, term) = {
+                    let m = self.raft.metrics();
+                    let m = m.borrow();
+                    (
+                        m.id,
+                        m.membership_config.voter_ids().collect::<Vec<_>>(),
+                        m.membership_config
+                            .membership()
+                            .learner_ids()
+                            .collect::<Vec<_>>(),
+                        m.current_term,
+                    )
+                };
+                let missing =
+                    compat::ext_type_missing(type_id, own, &voters, &learners, term, &self.peers);
+                if !missing.is_empty() {
+                    return Err(WriteError::ExtTypeUnavailable {
+                        type_id: type_id.clone(),
+                        missing,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -613,21 +650,35 @@ impl RaftHandle {
             }
             503 => {
                 #[derive(Deserialize)]
-                struct FeatureErr {
+                struct UnavailableErr {
                     #[serde(default)]
                     error: String,
                     #[serde(default)]
                     required: u8,
                     #[serde(default)]
                     effective: u8,
+                    #[serde(default)]
+                    type_id: String,
+                    #[serde(default)]
+                    missing: Vec<String>,
                 }
-                if let Ok(f) = serde_json::from_slice::<FeatureErr>(&body)
-                    && f.error == "feature_unavailable"
-                {
-                    return Err(WriteError::FeatureUnavailable {
-                        required: f.required,
-                        effective: f.effective,
-                    });
+                if let Ok(f) = serde_json::from_slice::<UnavailableErr>(&body) {
+                    match f.error.as_str() {
+                        "feature_unavailable" => {
+                            return Err(WriteError::FeatureUnavailable {
+                                required: f.required,
+                                effective: f.effective,
+                            });
+                        }
+                        // leader 的能力表是权威：follower 的本地表可能落后。
+                        "ext_type_unavailable" => {
+                            return Err(WriteError::ExtTypeUnavailable {
+                                type_id: f.type_id,
+                                missing: f.missing,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 Err(WriteError::NoQuorum)
             }
@@ -894,6 +945,7 @@ pub fn status_json(configured: bool) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
@@ -995,6 +1047,72 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(marker, "3");
+        handle.shutdown().await;
+    }
+
+    /// Level C 能力协商：已注册的类型也必须被**每个当前 voter/learner** 显式宣告。
+    /// 旧节点（当前 term 握手但空能力集）必须在 append 前拒绝；全员宣告后才提交。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ext_type_requires_every_current_member_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("control.db").display()
+        );
+        let db = crate::db::Db::connect_raft(&url).await.unwrap();
+        let mut settings = test_settings(dir.path());
+        settings.feature_level = 3;
+        let handle = spawn_with_control(settings, Some(db.pool().clone()), None)
+            .await
+            .unwrap();
+        wait_leader(&handle).await;
+        // 直接加一个不可达 learner（非阻塞）：只验证能力表，不验证复制。
+        handle
+            .raft()
+            .add_learner(2, BasicNode::new("http://127.0.0.1:1"), false)
+            .await
+            .unwrap();
+        let term = {
+            let m = handle.raft().metrics();
+            let m = m.borrow();
+            m.current_term
+        };
+        let cmd = ControlCommand::Ext {
+            type_id: "test.noop".into(),
+            payload: serde_json::json!({}),
+        };
+        let before = {
+            let m = handle.raft().metrics();
+            m.borrow().last_log_index
+        };
+        // 旧节点：当前 term 有握手、但未宣告任何 Ext 类型（缺头 = 空集）。
+        handle
+            .peers()
+            .record(2, term, compat::WIRE_VERSION, compat::MAX_FEATURE_LEVEL);
+        match handle.write(cmd.clone()).await {
+            Err(WriteError::ExtTypeUnavailable { type_id, missing }) => {
+                assert_eq!(type_id, "test.noop");
+                assert!(
+                    missing.iter().any(|m| m.contains("learner 2")),
+                    "{missing:?}"
+                );
+            }
+            other => panic!("expected ExtTypeUnavailable, got {other:?}"),
+        }
+        let after = {
+            let m = handle.raft().metrics();
+            m.borrow().last_log_index
+        };
+        assert_eq!(after, before, "拒绝必须发生在 append 前");
+        // 全员宣告（含 learner）后才能提交。
+        handle.peers().record_ext(
+            2,
+            term,
+            compat::WIRE_VERSION,
+            compat::MAX_FEATURE_LEVEL,
+            BTreeSet::from(["test.noop".to_string()]),
+        );
+        assert_eq!(handle.write(cmd).await.unwrap(), ControlResponse::Ok);
         handle.shutdown().await;
     }
 

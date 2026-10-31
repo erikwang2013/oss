@@ -19,7 +19,7 @@ use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde_json::{Value, json};
 
-use super::command::{ControlCommand, SizeError};
+use super::command::{ControlCommand, SizeError, advertised_ext_types};
 use super::compat;
 use super::membership::{self, MembershipError, MembershipOp};
 use super::{
@@ -114,6 +114,11 @@ async fn advertise_compat(State(ext): State<RaftExt>, req: Request, next: Next) 
     }
     if let Ok(v) = HeaderValue::from_str(&ext.handle.advertised_feature().to_string()) {
         headers.insert(compat::FEATURE_HEADER, v);
+    }
+    // Level C：Ext 类型集（旧节点不认此头 = 空集）。空串也显式发送，语义 = 无类型。
+    let ext_types = compat::format_ext_types(&advertised_ext_types());
+    if let Ok(v) = HeaderValue::from_str(&ext_types) {
+        headers.insert(compat::EXT_TYPES_HEADER, v);
     }
     resp
 }
@@ -368,6 +373,18 @@ async fn write(
                 "type_id": type_id,
                 "hint": "Ext type_id is not registered by this binary (a new type requires a \
                          new feature level or negotiated per-peer capability); nothing was appended",
+            })),
+        )
+            .into_response(),
+        Err(WriteError::ExtTypeUnavailable { type_id, missing }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "ext_type_unavailable",
+                "type_id": type_id,
+                "missing": missing,
+                "hint": "not every current voter/learner advertises this Ext type; \
+                         upgrade every member to a binary that supports it, then wait for one \
+                         heartbeat handshake; nothing was appended",
             })),
         )
             .into_response(),

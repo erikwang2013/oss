@@ -8,7 +8,7 @@
 //! 最小值；未知/掉线/旧 term 一律按 1（保守，宁可晚激活）。旧 term 的记录不能信，
 //! 否则新 leader 可能提交旧 voter 无法解码的 entry。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 /// 本二进制能解码的协议代次；v1.13.1 = 1。
@@ -54,6 +54,13 @@ pub const MIN_FEATURE_LEVEL: u8 = 1;
 
 pub const WIRE_HEADER: &str = "x-oss-raft-wire-version";
 pub const FEATURE_HEADER: &str = "x-oss-raft-feature-level";
+/// Level C `Ext` 类型能力头：逗号分隔的已注册 `type_id` 集合。**旧节点不发/不认该头**，
+/// 缺失 = 空集（绝不把「未知」当支持）；因此新类型只有在全员显式宣告后才可 append。
+pub const EXT_TYPES_HEADER: &str = "x-oss-raft-ext-types";
+/// 单个 `type_id` 的入站上限（注册表条目远小于此；超长条目丢弃，防畸形头撑大内存）。
+pub const EXT_TYPE_ID_MAX: usize = 96;
+/// 能力头最多收录/解析的 `type_id` 数（注册表极小；超出截断只影响协商，不影响已注册类型）。
+pub const EXT_TYPES_MAX: usize = 64;
 /// `schema_meta` 中的激活标记（节点本地；缺省 = 1，单调不减）。
 pub const META_FEATURE_LEVEL: &str = "raft_feature_level";
 /// 运行态激活标记：本机运行态来自 level-4 日志/快照或显式 cutover 种子（节点本地）。
@@ -89,6 +96,35 @@ pub fn parse_feature(value: Option<&str>) -> u8 {
         .and_then(|s| s.trim().parse::<u8>().ok())
         .filter(|v| *v >= MIN_FEATURE_LEVEL)
         .unwrap_or(MIN_FEATURE_LEVEL)
+}
+
+/// 入站 Ext 类型能力头：旧节点缺失 = 空集；空串同样 = 空集（明确宣告「无类型」）。
+/// 逗号分隔、去空白、去重；超长或含非可打印 ASCII 的条目直接丢弃——畸形宣告绝不能
+/// 变成「支持」。
+pub fn parse_ext_types(value: Option<&str>) -> BTreeSet<String> {
+    value
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|t| {
+            !t.is_empty()
+                && t.len() <= EXT_TYPE_ID_MAX
+                && t.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        })
+        .take(EXT_TYPES_MAX)
+        .map(str::to_string)
+        .collect()
+}
+
+/// 渲染出站能力头（逗号分隔）。注册表为空 → 空串（= 无类型，旧节点语义相同）。
+pub fn format_ext_types(types: &[&str]) -> String {
+    types
+        .iter()
+        .filter(|t| !t.is_empty())
+        .take(EXT_TYPES_MAX)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 读取本地激活标记（缺省 = 1）；值非法 = 错误（fail-closed，绝不当 1 放行）。
@@ -391,11 +427,13 @@ pub async fn bump_activation_tx(
 }
 
 /// 某个 peer 最近一次（带 term）的握手结果。`term` 是记录时的 leader term。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ext_types` 为空 = 旧节点/未宣告（绝不推断为「支持任意类型」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerVersion {
     pub wire: u32,
     pub feature: u8,
     pub term: u64,
+    pub ext_types: BTreeSet<String>,
 }
 
 /// 节点本地内存表；不持久化（重启 = 全部未知 = 1，首次心跳自愈）。
@@ -405,7 +443,19 @@ pub struct PeerVersions {
 }
 
 impl PeerVersions {
+    /// 旧语义/旧对端：无 Ext 类型能力（Level C 之前的握手路径）。
     pub fn record(&self, node_id: u64, term: u64, wire: u32, feature: u8) {
+        self.record_ext(node_id, term, wire, feature, BTreeSet::new());
+    }
+
+    pub fn record_ext(
+        &self,
+        node_id: u64,
+        term: u64,
+        wire: u32,
+        feature: u8,
+        ext_types: BTreeSet<String>,
+    ) {
         if let Ok(mut map) = self.inner.lock() {
             map.insert(
                 node_id,
@@ -413,13 +463,14 @@ impl PeerVersions {
                     wire,
                     feature,
                     term,
+                    ext_types,
                 },
             );
         }
     }
 
     pub fn get(&self, node_id: u64) -> Option<PeerVersion> {
-        self.inner.lock().ok()?.get(&node_id).copied()
+        self.inner.lock().ok()?.get(&node_id).cloned()
     }
 
     /// `/status` 诊断用快照（含旧 term 记录，便于排查）。
@@ -486,6 +537,53 @@ pub fn effective_feature_level(
         level,
         blocked_reason: reason,
     }
+}
+
+/// Level C leader 侧 Ext 类型协商：当前 term 的每个 voter/learner 都必须**显式宣告**
+/// 支持 `type_id`（旧节点不发头 = 空集 = 不支持）。本机由注册表另判，不在此表。
+///
+/// 返回缺失节点的人类可读原因（空 = 全员支持）。调用方必须在 append 前拒绝；apply
+/// 的未知类型 fail-closed 仍是最后一道防线（快照/旧 leader 日志仍可能带入）。
+pub fn ext_type_missing(
+    type_id: &str,
+    own: u64,
+    voters: &[u64],
+    learners: &[u64],
+    current_term: u64,
+    peers: &PeerVersions,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (id, kind) in voters
+        .iter()
+        .map(|id| (*id, "voter"))
+        .chain(learners.iter().map(|id| (*id, "learner")))
+    {
+        if id == own {
+            continue;
+        }
+        match peers.get(id) {
+            Some(p) if p.term == current_term && p.ext_types.contains(type_id) => {}
+            Some(p) if p.term == current_term => {
+                let seen = if p.ext_types.is_empty() {
+                    "advertised no ext types".to_string()
+                } else {
+                    format!(
+                        "advertised [{}]",
+                        p.ext_types.iter().cloned().collect::<Vec<_>>().join(",")
+                    )
+                };
+                missing.push(format!("{kind} {id} {seen} (feature {})", p.feature));
+            }
+            Some(p) => missing.push(format!(
+                "{kind} {id} stale term {} (no current-term capability handshake)",
+                p.term
+            )),
+            None => missing.push(format!(
+                "{kind} {id} not heard in term {current_term} (capability unknown)"
+            )),
+        }
+    }
+    missing
 }
 
 #[cfg(test)]
@@ -646,6 +744,69 @@ mod tests {
                 .unwrap()
                 .contains("voter 3 wire 2 feature 1")
         );
+    }
+
+    fn ext(types: &[&str]) -> BTreeSet<String> {
+        types.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ext_type_header_is_parsed_conservatively() {
+        assert!(parse_ext_types(None).is_empty());
+        assert!(parse_ext_types(Some("")).is_empty());
+        assert!(parse_ext_types(Some(" , ")).is_empty());
+        assert_eq!(
+            parse_ext_types(Some("a.b, c-d ,a.b,,")),
+            ext(&["a.b", "c-d"]),
+            "去空白且去重"
+        );
+        // 畸形条目绝不能变成「支持」。
+        assert!(parse_ext_types(Some("ok\u{7f},bad\nname")).is_empty());
+        assert!(parse_ext_types(Some(&"x".repeat(EXT_TYPE_ID_MAX + 1))).is_empty());
+        assert_eq!(format_ext_types(&[]), "");
+        assert_eq!(format_ext_types(&["a", "", "b"]), "a,b");
+        assert_eq!(
+            parse_ext_types(Some(&format_ext_types(&["a.b", "c"]))),
+            ext(&["a.b", "c"])
+        );
+    }
+
+    #[test]
+    fn ext_type_gate_requires_every_current_voter_and_learner() {
+        let p = PeerVersions::default();
+        p.record_ext(1, 7, WIRE_VERSION, 3, ext(&["test.noop"]));
+        p.record_ext(2, 7, WIRE_VERSION, 8, ext(&["test.noop"]));
+        p.record_ext(4, 7, WIRE_VERSION, 8, ext(&["test.noop"]));
+        assert!(
+            ext_type_missing("test.noop", 1, &[1, 2], &[4], 7, &p).is_empty(),
+            "本机记录不参与（由注册表判定）"
+        );
+
+        // 当前 term 有握手但未宣告（旧节点默认空集）→ append 前拒绝并点名。
+        p.record_ext(2, 7, WIRE_VERSION, 8, BTreeSet::new());
+        let m = ext_type_missing("test.noop", 1, &[1, 2], &[4], 7, &p);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(
+            m[0].contains("voter 2") && m[0].contains("no ext types"),
+            "{m:?}"
+        );
+
+        // learner 同样计入，且错误里有它宣告的类型便于排查。
+        p.record_ext(2, 7, WIRE_VERSION, 8, ext(&["test.noop"]));
+        p.record_ext(4, 7, WIRE_VERSION, 8, ext(&["other"]));
+        let m = ext_type_missing("test.noop", 1, &[1, 2], &[4], 7, &p);
+        assert!(
+            m[0].contains("learner 4") && m[0].contains("other"),
+            "{m:?}"
+        );
+
+        // 旧 term 记录不可信；完全没握手的当前成员同样缺失。
+        p.record_ext(4, 6, WIRE_VERSION, 8, ext(&["test.noop"]));
+        let m = ext_type_missing("test.noop", 1, &[1, 2], &[4], 7, &p);
+        assert!(m[0].contains("stale term 6"), "{m:?}");
+        let m = ext_type_missing("test.noop", 1, &[1, 2], &[4], 7, &PeerVersions::default());
+        assert_eq!(m.len(), 2);
+        assert!(m.iter().all(|s| s.contains("not heard")), "{m:?}");
     }
 
     #[test]

@@ -312,10 +312,12 @@ pub(crate) async fn post_raft_membership(
 }
 
 /// Level B 预检：对端 `/status` 的握手字段（缺失/非法 = 1）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RaftPeerStatus {
     pub wire: u32,
     pub feature: u8,
+    /// Level C：对端宣告的 Ext 类型集（缺失 = 旧节点 = 空集）。
+    pub ext_types: Vec<String>,
     /// 对端已 apply 的日志 index（缺失 = 旧节点/未初始化；follower 追赶的读点）。
     pub applied_index: Option<u64>,
 }
@@ -358,6 +360,8 @@ pub async fn get_raft_status_tls(
         #[serde(default = "one_u8")]
         feature_level: u8,
         #[serde(default)]
+        ext_types: Vec<String>,
+        #[serde(default)]
         applied: Option<LogIdJson>,
     }
     #[derive(serde::Deserialize)]
@@ -375,6 +379,7 @@ pub async fn get_raft_status_tls(
     Ok(RaftPeerStatus {
         wire: s.wire_version.max(1),
         feature: s.feature_level.max(1),
+        ext_types: s.ext_types,
         applied_index: s.applied.map(|l| l.index),
     })
 }
