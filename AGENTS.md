@@ -4,12 +4,12 @@
 
 ## 当前状态
 
-M1–M9 已完成，最新发布 **v1.28.0（2026-11-01）**；M5 安全与锁定全部交付——集群行一致性
+M1–M9 已完成，最新发布 **v1.28.1（2026-11-01）**；M5 安全与锁定全部交付——集群行一致性
 广播 · 密钥库/KMS · 加密数据面 DARE 式 · S3 面 SSE-S3/KMS/C · 对象锁 · STS（含
 `AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.28 交付 Raft 日志格式标记与旧区间有界
 压缩、M8 follower restore 以 applied 行自身 `fence_term` 收口、AP 直连 mTLS 与 AWS
 PrivateLink API 验证、CMK→legacy 全量重加密迁移、Level C 只读排空、JWT 多密钥轮换、feature 9
-opt-in 复制用量账本（严格硬配额），以及真实 v1.26.0 蓝绿/单机→集群 e2e 与 MPU 排空工具。
+opt-in 复制用量账本（严格硬配额），以及真实 v1.26.0 蓝绿/单机→集群 e2e 与 MPU 排空工具。v1.28.1 为补丁版：CI 安装 `protobuf-compiler`、最小配额夹具兼容缺 `users` 表、收紧 AWS 端点测试与 mixed-MPU shell 局部变量、裁剪历史计划/SDD 文档；无功能变更。
 **以 docs/ 为准**：
 
 - `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1；§8 含各阶段落地状态）

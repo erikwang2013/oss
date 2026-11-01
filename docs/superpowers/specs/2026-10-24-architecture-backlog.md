@@ -106,6 +106,10 @@
 > 迁移、真实 AWS PrivateLink 验收、严格配额账本的自动对账/收敛、集群级登录限流/审计、
 > 任意双向混写、≤v1.15 MPU、混合 v1.16 MPU e2e 执行、Raft 日志格式 feature 门控。
 >
+> **2026-11-01 v1.28.1 补丁**：CI 安装 `protobuf-compiler`，最小配额夹具兼容缺
+> `users` 表，收紧 AWS 端点测试与 mixed-MPU shell 局部变量，裁剪历史计划/SDD 文档；
+> 无功能、接口或数据格式变更。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →

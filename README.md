@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.28.0（2026-11-01）。** 升级与安全加固版：Raft 日志格式标记（缺失/`1` 为旧格式，`2` 为压缩/分段，未知值 fail-closed）与每次 append 两段有界压缩；M8 follower 发起的 `TierRestoreDelete` 改用 applied 行自身 `fence_term` 收口；AP 新增直连 mTLS 指纹验证（`mtls`）与 AWS PrivateLink API 验证（`aws-api`）；`cmk rewrap --to-legacy sse-s3|sse-kms` 可把 CMK 对象全量重加密回 legacy provider；Level C 新增 `read_only` 只读排空；JWT 支持 `jwt_previous_secrets` 多密钥轮换；补上真实 v1.26.0 蓝绿 e2e、MPU 排空工具与单机→集群双回环 e2e；账户硬配额新增 opt-in 严格模式（feature 9），Put/Complete/Copy 经 Raft 复制用量账本预留，删除/失败释放或校准，账本随 OSSCTL3 快照，默认仍为本地有界陈旧缓存。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.28.1（2026-11-01）。** v1.28 升级与安全加固版：Raft 日志格式标记（缺失/`1` 为旧格式，`2` 为压缩/分段，未知值 fail-closed）与每次 append 两段有界压缩；M8 follower 发起的 `TierRestoreDelete` 改用 applied 行自身 `fence_term` 收口；AP 新增直连 mTLS 指纹验证（`mtls`）与 AWS PrivateLink API 验证（`aws-api`）；`cmk rewrap --to-legacy sse-s3|sse-kms` 可把 CMK 对象全量重加密回 legacy provider；Level C 新增 `read_only` 只读排空；JWT 支持 `jwt_previous_secrets` 多密钥轮换；补上真实 v1.26.0 蓝绿 e2e、MPU 排空工具与单机→集群双回环 e2e；账户硬配额新增 opt-in 严格模式（feature 9），Put/Complete/Copy 经 Raft 复制用量账本预留，删除/失败释放或校准，账本随 OSSCTL3 快照，默认仍为本地有界陈旧缓存。v1.28.1 为补丁版：CI 安装 `protobuf-compiler`、修复最小配额夹具缺 `users` 表、收紧 AWS 端点测试与 mixed-MPU shell 局部变量、删除历史计划/SDD 文档；无功能变更。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
 
 ## 功能
 
