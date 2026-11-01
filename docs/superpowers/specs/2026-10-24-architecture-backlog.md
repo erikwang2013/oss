@@ -112,7 +112,11 @@
 > 成功桶，改为复用实际成功的桶名）。**v1.28.3 补丁**：OLAP 变换对流式请求体超限同时
 > 识别 `BodySizeLimitExceeded` 与 `LengthLimitError`，返回 400 `EntityTooLarge` 而非
 > 500。**v1.28.4 补丁**：仅测试稳定性——等待 apply 后的异步 AP/OLAP 缓存重载，避免
-> 慢盘 CI 的时序失败。均无接口或数据格式变更。
+> 慢盘 CI 的时序失败。**v1.28.5 性能/CI 加固**：DeleteObjects 请求级授权预加载；
+> 对象/版本列表批量并发 meta 读与集群 peer fan-out；健康/指标探测并发；复制积压与
+> 审计过滤索引；aether ingest 信号量限流；sync 直接流式发送 tee（不再整对象进内存）；
+> CI rust-cache、超时/并发闸与 `--locked/--no-fail-fast`；新增 release prepare/check
+> 脚本。无接口或数据格式变更。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。

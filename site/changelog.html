@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.28.4，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.28.5，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,停写蓝绿升级,只读排空,JWT 轮换">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.28.4 补丁版；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.28.5 补丁版；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.28.4 补丁版；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.28.5 补丁版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.28.4</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.28.5</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.28.4 的补丁版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.28.5 的补丁版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-28-5">v1.28.5</a>
           <a href="#v1-28-4">v1.28.4</a>
           <a href="#v1-28-3">v1.28.3</a>
           <a href="#v1-28-2">v1.28.2</a>
@@ -110,10 +111,25 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.28.4</strong>（2026-11-01）。</p>
+          <p>当前最新发布：<strong>v1.28.5</strong>（2026-11-01）。</p>
 
           <div class="changelog-list">
-            <details class="changelog-entry" id="v1-28-4" open>
+            <details class="changelog-entry" id="v1-28-5" open>
+              <summary><strong>v1.28.5</strong><time datetime="2026-11-01">2026-11-01</time><span>性能与 CI 加固版</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>DeleteObjects</strong>：账户、桶策略、会话策略与表三档权限改为请求级预加载，逐 key 只做策略求值，消除 1000 键场景的重复 SQL/JSON 解析。</li>
+                  <li><strong>列表与探测</strong>：对象/版本列表按 32 条批量并发读 xl.meta；集群 peer fan-out 并行；健康/指标探测改为并发，3 peer 不可达时最坏等待从约 2.4s 降到约 800ms。</li>
+                  <li><strong>索引</strong>：新增 0012 迁移，补复制积压版本链、站点目标清理与审计过滤索引；启动重放幂等。</li>
+                  <li><strong>摄取/同步内存</strong>：aether ingest 加 8 permit 限流；sync 直接流式发送已 fsync 的 tee，不再整对象读入内存，SigV4 复用 staging SHA-256。</li>
+                  <li><strong>CI/发布</strong>：rust-cache、45 分钟超时、并发取消、`--locked`/`--no-fail-fast`；新增 release prepare/check 与 57 项自检。</li>
+                  <li><strong>兼容性</strong>：无 API、配置、Wire/OSSCTL 或数据格式变更；索引迁移只增索引。</li>
+                  <li><strong>验证</strong>：xl-store lib 383/0；observability 4/0；aether 7/0；sync_gate 38/0；DeleteObjects 4/0；旧库升级 1/0；clippy/fmt 通过；release 自检 57/0。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.28.5" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+            <details class="changelog-entry" id="v1-28-4">
               <summary><strong>v1.28.4</strong><time datetime="2026-11-01">2026-11-01</time><span>补丁版</span></summary>
               <div class="entry-body">
                 <ul>
@@ -535,7 +551,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.28.4</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.28.5</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
