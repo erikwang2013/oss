@@ -603,7 +603,7 @@ stretch EC）仍归 M9。
 S3（Batch：清单/ReplaceTags/Copy/Delete/Restore/InvokeLambda + CSV 报告 + retry-failed）·
 S4a（存储类/分层元数据前置）· S4b（远端 S3 tier、生命周期 Transition、Restore/reaper/启动
 对账）· S5（Inventory Daily/Weekly + force-run + manifest/CSV.gz）· S6（控制台页面与
-`tests/e2e_m8.sh`）。实施计划：`docs/superpowers/plans/2026-10-19-m8-control-plane.md`。
+`tests/e2e_m8.sh`）。验收与能力边界见 `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md`。
 
 **与设计的偏差（记档）**：
 - Inventory 运行路径用 `<run_key>`（Daily=UTC 日期 `YYYY-MM-DD`、Weekly=`YYYY-Www`、
