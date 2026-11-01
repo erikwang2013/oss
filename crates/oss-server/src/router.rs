@@ -821,19 +821,28 @@ pub(crate) fn data_plane_status(
 /// `/health/cluster`、`/metrics`、`/api/v1/cluster/status` 三处共用一份探测逻辑。
 /// 顺序 = 拓扑顺序（不含本节点；单机为空表）。
 pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
-    let mut out = Vec::new();
     let Some(c) = state.store.cluster() else {
-        return out;
+        return Vec::new();
     };
     let self_node_id = c.sets.flat.self_node().id.clone();
-    for n in &c.sets.flat.nodes {
-        if n.id == self_node_id {
-            continue;
-        }
-        // 单点探测 800ms：就绪探针会被 LB 轮询，要短平快；掉队节点标 down 即可
-        match tokio::time::timeout(Duration::from_millis(800), c.transport.health(&n.id)).await {
-            Ok(Ok(h)) if h.node_id == n.id => out.push(PeerProbe {
-                id: n.id.clone(),
+    let probes = c
+        .sets
+        .flat
+        .nodes
+        .iter()
+        .filter(|n| n.id != self_node_id)
+        .map(|n| async move {
+            let id = n.id.clone();
+            // 单点探测 800ms：就绪探针会被 LB 轮询，要短平快；掉队节点标 down 即可
+            let probe =
+                tokio::time::timeout(Duration::from_millis(800), c.transport.health(&n.id)).await;
+            (id, probe)
+        });
+    let mut out = Vec::new();
+    for (id, probe) in futures::future::join_all(probes).await {
+        match probe {
+            Ok(Ok(h)) if h.node_id == id => out.push(PeerProbe {
+                id,
                 up: true,
                 slots: h.slots.iter().filter(|(_, up)| *up).count(),
                 // 缺字段（旧节点）= 1（保守），与本机判定口径一致。
@@ -843,9 +852,9 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
             }),
             Ok(Ok(h)) => {
                 // 错接线：地址通了但不是声明的节点——按 down 处理并留下显性日志
-                tracing::error!(node = %n.id, reported = %h.node_id, "mesh 节点身份不符（错接线？）");
+                tracing::error!(node = %id, reported = %h.node_id, "mesh 节点身份不符（错接线？）");
                 out.push(PeerProbe {
-                    id: n.id.clone(),
+                    id,
                     up: false,
                     slots: 0,
                     data_wire_version: 0,
@@ -854,7 +863,7 @@ pub(crate) async fn probe_peers(state: &AppState) -> Vec<PeerProbe> {
                 });
             }
             _ => out.push(PeerProbe {
-                id: n.id.clone(),
+                id,
                 up: false,
                 slots: 0,
                 data_wire_version: 0,

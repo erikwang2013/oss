@@ -2977,6 +2977,17 @@ impl S3 for OssS3 {
             .is_some();
         // M8 AP：经访问点的批量删由 ApRoute::check_access 挂上下文，逐键叠 AP 策略交集。
         let ap_delete = req.extensions.get::<crate::ap::ApDeletePolicy>();
+        // 逐键授权只依赖 (user, bucket)：预加载账户/策略/表三档，避免 1000 键 N+1。
+        // 预加载失败时回退逐键查询，保持原有 fail-closed/部分失败语义。
+        let user_delete_auth = match &user {
+            Some(u) => self.acl.delete_batch_auth(u, &bucket).await.ok(),
+            None => None,
+        };
+        let anon_delete_auth = if user.is_none() && anonymous {
+            self.acl.anonymous_delete_batch_auth(&bucket).await.ok()
+        } else {
+            None
+        };
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for obj in req.input.delete.objects {
@@ -3039,8 +3050,14 @@ impl S3 for OssS3 {
                 }
             }
             let decision = match (&user, anonymous) {
-                (Some(u), _) => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
-                (None, true) => self.acl.anonymous_delete_decision(&bucket, &obj.key).await,
+                (Some(u), _) => match &user_delete_auth {
+                    Some(ctx) => Ok(ctx.decision(u, &bucket, &obj.key)),
+                    None => self.acl.key_delete_decision(u, &bucket, &obj.key).await,
+                },
+                (None, true) => match &anon_delete_auth {
+                    Some(ctx) => Ok(ctx.decision(&bucket, &obj.key)),
+                    None => self.acl.anonymous_delete_decision(&bucket, &obj.key).await,
+                },
                 (None, false) => Ok((false, None)), // check 恒塞身份；防御性 fail-closed
             };
             let (allowed, deny_detail) = match decision {

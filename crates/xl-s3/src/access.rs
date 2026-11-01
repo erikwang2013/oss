@@ -68,6 +68,82 @@ pub struct AuthedUser {
 #[derive(Debug, Clone, Copy)]
 pub struct AnonymousAccess;
 
+/// DeleteObjects 的请求级授权上下文；逐 key 只做策略求值，不再查库。
+#[derive(Debug, Clone)]
+pub struct DeleteBatchAuth {
+    account_id: Option<String>,
+    bucket_policy: Option<crate::policy::PolicyDoc>,
+    session_policy: Option<crate::policy::PolicyDoc>,
+    can_delete: bool,
+}
+
+impl DeleteBatchAuth {
+    pub fn decision(
+        &self,
+        user: &AuthedUser,
+        bucket: &str,
+        key: &str,
+    ) -> (bool, Option<&'static str>) {
+        let request = crate::policy::PolicyRequest {
+            op: "DeleteObjects",
+            ak: &user.ak,
+            uid: user.uid,
+            account_id: self.account_id.as_deref(),
+            bucket,
+            key: Some(key),
+            anonymous: false,
+        };
+        let policy = self.bucket_policy.as_ref().and_then(|doc| {
+            crate::policy::s3_action("DeleteObject")
+                .and_then(|a| crate::policy::evaluate(doc, &request, a))
+        });
+        let (allowed, detail) = match policy {
+            Some(true) => (true, None),
+            Some(false) => (false, Some("policy:deny")),
+            None => (self.can_delete, None),
+        };
+        if allowed
+            && let Some(sdoc) = &self.session_policy
+            && crate::policy::s3_action("DeleteObject")
+                .and_then(|a| crate::policy::evaluate(sdoc, &request, a))
+                != Some(true)
+        {
+            return (false, Some("session:deny"));
+        }
+        (allowed, detail)
+    }
+}
+
+/// 匿名 DeleteObjects 的请求级上下文（仅桶策略）。
+#[derive(Debug, Clone)]
+pub struct AnonymousDeleteAuth {
+    policy: Option<crate::policy::PolicyDoc>,
+}
+
+impl AnonymousDeleteAuth {
+    pub fn decision(&self, bucket: &str, key: &str) -> (bool, Option<&'static str>) {
+        let Some(doc) = &self.policy else {
+            return (false, Some("anonymous:no-policy"));
+        };
+        let request = crate::policy::PolicyRequest {
+            op: "DeleteObjects",
+            ak: "",
+            uid: 0,
+            account_id: None,
+            bucket,
+            key: Some(key),
+            anonymous: true,
+        };
+        match crate::policy::s3_action("DeleteObject")
+            .and_then(|a| crate::policy::evaluate(doc, &request, a))
+        {
+            Some(true) => (true, None),
+            Some(false) => (false, Some("policy:deny")),
+            None => (false, Some("anonymous:no-match")),
+        }
+    }
+}
+
 /// 账户命名空间 v1：uid 派生的 12 位十进制账户 ID（AWS 线上形态）。
 ///
 /// AC-0 起账户成为实体（名称/状态/配额/成员，见 `oss-server` 0005 迁移），但**派生 ID
@@ -618,48 +694,37 @@ impl Acl {
         bucket: &str,
         key: &str,
     ) -> Result<(bool, Option<&'static str>), sqlx::Error> {
+        let ctx = self.delete_batch_auth(user, bucket).await?;
+        Ok(ctx.decision(user, bucket, key))
+    }
+
+    /// 预加载 DeleteObjects 请求级授权上下文：账户、桶策略、会话策略与表三档权限
+    /// 都只依赖 `(user, bucket)`，不应在每个 key 上重复查询。
+    pub async fn delete_batch_auth(
+        &self,
+        user: &AuthedUser,
+        bucket: &str,
+    ) -> Result<DeleteBatchAuth, sqlx::Error> {
         let account_id = self.account_id_of_user(user.uid).await?;
-        let decision = match self.bucket_policy(bucket).await? {
-            Some(doc) => {
-                let pr = crate::policy::PolicyRequest {
-                    op: "DeleteObjects",
-                    ak: &user.ak,
-                    uid: user.uid,
-                    account_id: account_id.as_deref(),
-                    bucket,
-                    key: Some(key),
-                    anonymous: false,
-                };
-                crate::policy::s3_action("DeleteObject")
-                    .and_then(|a| crate::policy::evaluate(&doc, &pr, a))
-            }
-            None => None,
-        };
-        let (allowed, detail) = match decision {
-            Some(true) => (true, None),
-            Some(false) => (false, Some("policy:deny")),
-            None => (self.can(user.clone(), Action::Delete, bucket).await?, None),
-        };
-        // M5 切片 5（S8）：会话策略在这里同步叠交集——批量删逐键判定与 check() 的单键
-        // 口径必须同源，否则会话策略可被一条批量删整体绕过。会话 Deny/无匹配 → 拒。
-        if allowed && let Some(sdoc) = self.session_policy_of(&user.ak).await? {
-            let pr = crate::policy::PolicyRequest {
-                op: "DeleteObjects",
-                ak: &user.ak,
-                uid: user.uid,
-                account_id: account_id.as_deref(),
-                bucket,
-                key: Some(key),
-                anonymous: false,
-            };
-            match crate::policy::s3_action("DeleteObject")
-                .and_then(|a| crate::policy::evaluate(&sdoc, &pr, a))
-            {
-                Some(true) => {}
-                _ => return Ok((false, Some("session:deny"))),
-            }
-        }
-        Ok((allowed, detail))
+        let bucket_policy = self.bucket_policy(bucket).await?;
+        let session_policy = self.session_policy_of(&user.ak).await?;
+        let can_delete = self.can(user.clone(), Action::Delete, bucket).await?;
+        Ok(DeleteBatchAuth {
+            account_id,
+            bucket_policy,
+            session_policy,
+            can_delete,
+        })
+    }
+
+    /// 匿名 DeleteObjects 的桶策略预加载（匿名没有账户/表三档）。
+    pub async fn anonymous_delete_batch_auth(
+        &self,
+        bucket: &str,
+    ) -> Result<AnonymousDeleteAuth, sqlx::Error> {
+        Ok(AnonymousDeleteAuth {
+            policy: self.bucket_policy(bucket).await?,
+        })
     }
 
     /// 匿名 DeleteObjects 逐键判定：**仅**桶策略，无表三档回落（匿名不继承任何用户权限）。
@@ -669,27 +734,8 @@ impl Acl {
         bucket: &str,
         key: &str,
     ) -> Result<(bool, Option<&'static str>), sqlx::Error> {
-        let Some(doc) = self.bucket_policy(bucket).await? else {
-            return Ok((false, Some("anonymous:no-policy")));
-        };
-        let pr = crate::policy::PolicyRequest {
-            op: "DeleteObjects",
-            ak: "",
-            uid: 0,
-            account_id: None,
-            bucket,
-            key: Some(key),
-            anonymous: true,
-        };
-        Ok(
-            match crate::policy::s3_action("DeleteObject")
-                .and_then(|a| crate::policy::evaluate(&doc, &pr, a))
-            {
-                Some(true) => (true, None),
-                Some(false) => (false, Some("policy:deny")),
-                None => (false, Some("anonymous:no-match")),
-            },
-        )
+        let ctx = self.anonymous_delete_batch_auth(bucket).await?;
+        Ok(ctx.decision(bucket, key))
     }
 
     /// M5 切片 5（S8）：会话策略交集融合——在表三档 × 桶策略之后叠会话判定：
