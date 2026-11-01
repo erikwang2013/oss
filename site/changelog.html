@@ -119,7 +119,7 @@
                 <ul>
                   <li><strong>测试稳定性</strong>：<code>raft_access</code> 在 apply 后等待 AP/OLAP 异步缓存重载（最多 10s），避免慢盘 CI 在 <code>last_applied</code> 已推进、副作用尚未完成时误判；目标用例连跑 10 次通过。</li>
                   <li><strong>兼容性</strong>：仅测试代码，无功能、配置、Wire/OSSCTL 或数据格式变更；包含 v1.28.3 的 OLAP 修复。</li>
-                  <li><strong>验证</strong>：<code>cargo test -p oss-server --test raft_access ap_and_olap_writes_route_one_command_and_refresh_caches</code> 连跑 10/10；CI 复核。</li>
+                  <li><strong>验证</strong>：<code>cargo test -p oss-server --test raft_access ap_and_olap_writes_route_one_command_and_refresh_caches</code> 连跑 10/10；CI 通过（rust/web）。</li>
                 </ul>
                 <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.28.4" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
               </div>
