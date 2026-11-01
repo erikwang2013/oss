@@ -118,7 +118,7 @@
                 <ul>
                   <li><strong>OLAP 输入上限</strong>：变换读取流式请求体超限时，<code>http_body_util::Limited</code> 返回 <code>LengthLimitError</code>，原先只识别已缓冲 body 的 <code>BodySizeLimitExceeded</code>，导致 500。现两者都映射为 400 <code>EntityTooLarge</code>，与 DeleteObjects 的请求体上限处理一致。</li>
                   <li><strong>兼容性</strong>：无配置、Wire/OSSCTL 或数据格式变更；仅修正错误码，成功路径不变。</li>
-                  <li><strong>验证</strong>：<code>cargo test -p xl-s3 --test olap_ops</code> 19/0；<code>cargo fmt --all --check</code> 通过；CI 复核。</li>
+                  <li><strong>验证</strong>：<code>cargo test -p xl-s3 --test olap_ops</code> 19/0；<code>cargo fmt --all --check</code> 通过；CI 通过（rust/web）。</li>
                 </ul>
                 <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.28.3" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
               </div>
