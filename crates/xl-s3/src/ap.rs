@@ -2295,7 +2295,12 @@ async fn apply_transform(
     })?;
     let limit = crate::olap::max_input_bytes();
     let input = body.store_all_limited(limit).await.map_err(|e| {
-        if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some() {
+        // 已缓冲 body → BodySizeLimitExceeded；流式 body → http_body_util::Limited
+        // 的 LengthLimitError（s3s 不 re-export，两者都要映射为 400 EntityTooLarge）。
+        if e.downcast_ref::<s3s::BodySizeLimitExceeded>().is_some()
+            || e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+        {
             s3s::s3_error!(EntityTooLarge, "object exceeds transform input limit")
         } else {
             tracing::error!(error = %e, "读取待变换对象失败");

@@ -859,7 +859,12 @@ async fn input_limit_is_enforced() {
     unsafe { std::env::set_var("OSS_OLAP_MAX_INPUT_BYTES", "4") };
     let (st, _, body) = send(&env, get("/ap/ap1/hello", &[])).await;
     // 简报允许 400/413；s3s 的 EntityTooLarge 码在协议层固定映射 400。
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     assert!(String::from_utf8_lossy(&body).contains("EntityTooLarge"));
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }
