@@ -163,6 +163,15 @@ async fn wait_applied(st: &AppState, target: u64) {
     assert_eq!(applied_index(st).await, target, "控制命令条数不符");
 }
 
+/// 缓存重载是 apply 后的异步副作用；CI 慢盘上 `last_applied` 可能先于重载完成。
+async fn wait_cache(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(tokio::time::Instant::now() < deadline, "缓存未刷新：{what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn assert_no_write(st: &AppState, before: u64) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(applied_index(st).await, before, "不应追加控制命令");
@@ -247,6 +256,7 @@ async fn ap_and_olap_writes_route_one_command_and_refresh_caches() {
             .await
             .unwrap();
     assert_eq!(owner, Some(alice), "非管理员属主必须映射回本地 id");
+    wait_cache("AP myap", || st.ap_cache.get("myap").is_some()).await;
     let ap = st.ap_cache.get("myap").expect("create 后 AP 缓存应刷新");
     assert_eq!(ap.bucket, "apb");
     assert!(ap.policy.is_some());
@@ -330,10 +340,7 @@ async fn ap_and_olap_writes_route_one_command_and_refresh_caches() {
         .await,
         1
     );
-    assert!(
-        st.olap_cache.get("myap").unwrap().is_some(),
-        "put_transform 后缓存应可见"
-    );
+    wait_cache("OLAP myap", || st.olap_cache.get("myap").unwrap().is_some()).await;
 
     // delete：一条命令；级联删 OLAP，两个缓存都清。
     let before = applied_index(&st).await;
@@ -365,8 +372,11 @@ async fn ap_and_olap_writes_route_one_command_and_refresh_caches() {
         .await,
         0
     );
-    assert!(st.ap_cache.get("myap").is_none());
-    assert!(st.olap_cache.get("myap").unwrap().is_none());
+    wait_cache("AP myap 删除", || st.ap_cache.get("myap").is_none()).await;
+    wait_cache("OLAP myap 删除", || {
+        st.olap_cache.get("myap").unwrap().is_none()
+    })
+    .await;
 
     // 403：非属主非管理员不得建 AP（零命令）。
     write_ok(
