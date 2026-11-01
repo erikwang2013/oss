@@ -29,6 +29,11 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
+/// 同时进行的 ingest 上限。一次 ingest 从打开成品到 fsync 完成全程占住一个执行线程，
+/// 不封顶时同批收尾的大上传会把 tokio 的阻塞池/工作线程占满、拖慢所有请求。
+/// 8 与 Argon2 闸同量级：足够喂满磁盘队列，又给普通请求留出执行线程。
+pub const INGEST_CONCURRENCY: usize = 8;
+
 /// 秒传索引落在已有的 SQLite 上 —— 少一个 Redis 依赖，TTL 语义与 SETEX 一致。
 #[derive(Clone)]
 pub struct SqlInstantStore {
@@ -76,6 +81,8 @@ pub struct IngestSink {
     pub events: Option<Arc<crate::events::SqlEventSink>>,
     /// M6 切片 4（V3②）：内部摄取的复制入队（同一后写派发面）
     pub repl: Option<Arc<crate::replication::SqlReplSink>>,
+    /// ingest 并发闸（上限见 [`INGEST_CONCURRENCY`]）。
+    pub permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl IngestSink {
@@ -125,6 +132,12 @@ impl EventSink for IngestSink {
         // 并清索引防钉死。1.0.4 仍未修（`controller/upload.rs` 逐字节未变，events.rs 仅把该隔离
         // 文档化为「与 PHP 一致」的有意行为），补偿继续有效。
         let result = block_on(async {
+            // 先拿并发配额再碰盘：后续写入 + fsync 全程占着阻塞执行上下文。
+            let _permit = self
+                .permits
+                .acquire()
+                .await
+                .expect("ingest semaphore 不会关闭");
             // 流式进内核：大文件不再整份驻留内存（tokio-util 的 ReaderStream 直接套文件句柄）
             let file = tokio::fs::File::open(&resource.path).await?;
             let size = file.metadata().await?.len();

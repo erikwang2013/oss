@@ -66,6 +66,7 @@ struct Seen {
     tagging: Option<String>,
     storage_class: Option<String>,
     checksum_sha256: Option<String>,
+    content_sha256: Option<String>,
 }
 
 /// M9 S3 mock 对端状态：内部路由只按需回应（不是完整 site 模拟）。
@@ -249,6 +250,7 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                         let tagging = hdr("x-amz-tagging");
                         let storage_class = hdr("x-amz-storage-class");
                         let checksum_sha256 = hdr("x-amz-checksum-sha256");
+                        let content_sha256 = hdr("x-amz-content-sha256");
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         seen.lock().unwrap().push(Seen {
                             method: method.clone(),
@@ -263,6 +265,7 @@ async fn spawn_remote(mode: Mode) -> MockRemote {
                             tagging,
                             storage_class,
                             checksum_sha256,
+                            content_sha256,
                         });
                         let m = *mode.lock().unwrap();
                         let mut resp = Response::new(Full::new(Bytes::new()));
@@ -681,6 +684,11 @@ async fn sync_put_remote_first_success() {
     assert_eq!(seen[0].body, body);
     assert_eq!(seen[0].origin.as_deref(), Some(vid.as_str()));
     assert_eq!(seen[0].token.as_deref(), Some(PEER_TOKEN));
+    // 流式发送的 body 仍是 tee 原文：SigV4 payload hash 必须与线上字节一致。
+    assert_eq!(
+        seen[0].content_sha256.as_deref(),
+        Some(hex::encode(Sha256::digest(&body)).as_str())
+    );
     // 自定义头必须进 SigV4 SignedHeaders（否则可被中间人改写）。
     let auth = seen[0]
         .authorization
@@ -1245,6 +1253,11 @@ async fn sync_mpu_complete_is_remote_first_and_roundtrips() {
     let puts = e.remote.puts();
     assert_eq!(puts.len(), 1, "Complete 只允许一次远端 PUT");
     assert_eq!(puts[0].body, part, "远端收到整对象明文");
+    assert_eq!(
+        puts[0].content_sha256.as_deref(),
+        Some(hex::encode(Sha256::digest(&part)).as_str()),
+        "MPU 的 tee 明文 SHA-256 必须与拼接后的 body 一致"
+    );
     assert_eq!(puts[0].origin.as_deref(), Some(vid.as_str()));
     assert_eq!(puts[0].tagging.as_deref(), Some("mp=1"));
     assert_eq!(puts[0].storage_class.as_deref(), Some("STANDARD_IA"));

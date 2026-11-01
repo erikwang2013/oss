@@ -1055,6 +1055,9 @@ impl AppState {
             cfg: Arc::clone(&cfg),
             events: Some(Arc::clone(&events)),
             repl: Some(Arc::clone(&repl_sink)),
+            permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::aether::INGEST_CONCURRENCY,
+            )),
         });
         Self {
             cfg,

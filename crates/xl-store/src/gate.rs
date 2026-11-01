@@ -22,6 +22,9 @@ pub struct GateRequest<'a> {
     pub local_version_id: &'a str,
     pub plaintext: &'a Path,
     pub size: u64,
+    /// 明文的整份 SHA-256（staging 收流时已算好；SigV4 要求预知 payload hash，
+    /// 门据此可直接流式发送 tee，不必为签名再整份读盘）。
+    pub sha256_hex: &'a str,
     pub etag: &'a str,
     pub content_type: Option<&'a str>,
     pub user_metadata: &'a BTreeMap<String, String>,

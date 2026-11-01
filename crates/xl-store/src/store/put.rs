@@ -938,6 +938,7 @@ impl Store {
                 local_version_id: &uuid,
                 plaintext,
                 size,
+                sha256_hex: &sha256,
                 etag: &etag,
                 content_type: content_type.as_deref(),
                 user_metadata: &user_metadata,

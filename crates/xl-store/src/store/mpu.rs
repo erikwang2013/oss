@@ -918,6 +918,7 @@ impl Store {
                 local_version_id: &uuid,
                 plaintext,
                 size,
+                sha256_hex: &sha256,
                 etag: &mpu_etag,
                 content_type: mpu.content_type.as_deref(),
                 user_metadata: &mpu.user_metadata,

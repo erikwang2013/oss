@@ -3,6 +3,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aetherupload::events::EventSink;
 use aetherupload::instant::KEY_PREFIX;
@@ -116,6 +117,51 @@ async fn ingest_sink_puts_finished_file_into_store() {
     );
 }
 
+/// 并发闸：配额占满时 ingest 必须等待，不得无限并发把阻塞池占满。
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_waits_for_a_free_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path()).await;
+    st.store.create_bucket("files").await.unwrap();
+
+    let sub = "2026-10";
+    let group_dir = st.cfg.staging_dir.join("file").join(sub);
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let body = b"gated upload";
+    let md5 = hex::encode({
+        use md5::Digest as _;
+        let mut h = md5::Md5::new();
+        h.update(body);
+        h.finalize()
+    });
+    let name = format!("{md5}.txt");
+    std::fs::write(group_dir.join(&name), body).unwrap();
+    let resource = Resource::new(&st.cfg.staging_dir, "file", "file", sub, &name);
+    let key = format!("{sub}/{name}");
+
+    let held = st
+        .ingest
+        .permits
+        .acquire_many(oss_server::aether::INGEST_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let sink = Arc::clone(&st.ingest);
+    let res = resource.clone();
+    let task = tokio::spawn(async move { sink.upload_complete(&res) });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        st.store.head_object("files", &key).await.is_err(),
+        "配额占满时 ingest 不得越过闸门"
+    );
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("放行后 ingest 应完成")
+        .unwrap();
+    assert!(st.store.head_object("files", &key).await.is_ok());
+}
+
 /// I-1：ingest 失败（此处用「桶不存在」触发）必须把内容从秒传索引里摘掉 ——
 /// 否则同内容重传会命中秒传、拿到一个根本没进桶的 savedPath。panic 是刻意的
 /// （controller 侧 catch_unwind 吞掉，见 aether.rs 注释）。
@@ -176,6 +222,9 @@ async fn sink_without_bucket_skips_ingest() {
         cfg: Arc::new(cfg),
         events: None,
         repl: None,
+        permits: Arc::new(tokio::sync::Semaphore::new(
+            oss_server::aether::INGEST_CONCURRENCY,
+        )),
     };
 
     let sub = "2026-10";

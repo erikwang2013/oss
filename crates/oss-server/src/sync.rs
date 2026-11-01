@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use sqlx::Row as _;
 use xl_s3::sync_delete::SyncDeleteSink;
 use xl_store::error::Error as StoreError;
@@ -416,23 +415,29 @@ impl PutCommitGate for SiteSyncGate {
             }
             let peer = self.peer().await?;
             let client = self.client(&peer)?;
-            let body = tokio::fs::read(req.plaintext).await.map_err(|e| {
-                GateError::Internal(format!("read tee {}: {e}", req.plaintext.display()))
-            })?;
-            if body.len() as u64 != req.size {
+            // 只核对长度：tee 已 fsync，直接流式发给对端（不再整份读进内存）；
+            // SigV4 的 payload hash 用 staging 已算好的明文 SHA-256。
+            let tee_len = tokio::fs::metadata(req.plaintext)
+                .await
+                .map_err(|e| {
+                    GateError::Internal(format!("read tee {}: {e}", req.plaintext.display()))
+                })?
+                .len();
+            if tee_len != req.size {
                 return Err(GateError::Internal(format!(
-                    "tee size mismatch: {} != {}",
-                    body.len(),
+                    "tee size mismatch: {tee_len} != {}",
                     req.size
                 )));
             }
             // 远端调用之前落 intent：此处返回 Err 时行保留，恢复会删远端可能的同 id 版本。
             self.intent_begin(&req).await?;
-            let call = client.put_object_with_meta(
+            let call = client.put_object_file_with_meta(
                 "site",
                 req.bucket,
                 req.key,
-                Bytes::from(body),
+                req.plaintext,
+                req.size,
+                req.sha256_hex,
                 req.etag,
                 req.content_type,
                 req.user_metadata,

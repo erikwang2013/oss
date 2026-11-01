@@ -522,6 +522,97 @@ impl ReplClient {
         sse: Option<&xl_store::meta::EncryptionRecord>,
         lock: Option<&xl_store::meta::ObjectLockRecord>,
     ) -> Result<Option<String>, ReplError> {
+        self.put_object_body_with_meta(
+            remote_id,
+            dest_bucket,
+            key,
+            OutBody::Bytes(body),
+            expected_etag,
+            content_type,
+            user_metadata,
+            tags,
+            storage_class,
+            checksum,
+            require_version,
+            site_token,
+            origin_version_id,
+            part_sizes,
+            sse,
+            lock,
+        )
+        .await
+    }
+
+    /// sync 提交门：把已 fsync 的 tee 明文流式发给对端，不整份读进内存。
+    /// `sha256_hex` 是 tee 的整份 SHA-256（staging 已算好，SigV4 需要预知 payload hash）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_object_file_with_meta(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        path: &Path,
+        size: u64,
+        sha256_hex: &str,
+        expected_etag: &str,
+        content_type: Option<&str>,
+        user_metadata: &BTreeMap<String, String>,
+        tags: Option<&[xl_store::meta::ObjectTag]>,
+        storage_class: Option<&str>,
+        checksum: Option<&xl_store::meta::ChecksumRecord>,
+        require_version: bool,
+        site_token: Option<&str>,
+        origin_version_id: Option<&str>,
+        part_sizes: Option<&[u64]>,
+        sse: Option<&xl_store::meta::EncryptionRecord>,
+        lock: Option<&xl_store::meta::ObjectLockRecord>,
+    ) -> Result<Option<String>, ReplError> {
+        let body = OutBody::File {
+            path: path.to_path_buf(),
+            size,
+            sha256: sha256_hex.to_string(),
+        };
+        self.put_object_body_with_meta(
+            remote_id,
+            dest_bucket,
+            key,
+            body,
+            expected_etag,
+            content_type,
+            user_metadata,
+            tags,
+            storage_class,
+            checksum,
+            require_version,
+            site_token,
+            origin_version_id,
+            part_sizes,
+            sse,
+            lock,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_object_body_with_meta(
+        &self,
+        remote_id: &str,
+        dest_bucket: &str,
+        key: &str,
+        body: OutBody,
+        expected_etag: &str,
+        content_type: Option<&str>,
+        user_metadata: &BTreeMap<String, String>,
+        tags: Option<&[xl_store::meta::ObjectTag]>,
+        storage_class: Option<&str>,
+        checksum: Option<&xl_store::meta::ChecksumRecord>,
+        require_version: bool,
+        site_token: Option<&str>,
+        origin_version_id: Option<&str>,
+        part_sizes: Option<&[u64]>,
+        sse: Option<&xl_store::meta::EncryptionRecord>,
+        lock: Option<&xl_store::meta::ObjectLockRecord>,
+    ) -> Result<Option<String>, ReplError> {
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(ct) = content_type {
             headers.push(("content-type".into(), ct.to_string()));
@@ -610,14 +701,14 @@ impl ReplClient {
         // P3-8：lowercase 后重名的头只保留一个（SignedHeaders 与线上头必须一致）。
         headers.sort_by(|a, b| a.0.cmp(&b.0));
         headers.dedup_by(|a, b| a.0 == b.0);
+        let decoded_path = format!("/{dest_bucket}/{key}");
         let resp = self
-            .send(
+            .send_path_impl(
                 remote_id,
                 "PUT",
-                dest_bucket,
-                Some(key),
+                &decoded_path,
                 &[],
-                Some(body),
+                body,
                 &headers,
                 Some("REPLICA"),
             )

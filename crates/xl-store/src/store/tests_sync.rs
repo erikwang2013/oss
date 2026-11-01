@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use sha2::Digest as _;
 
 use super::*;
 use crate::gate::{GateError, GateRequest, GateTicket, PutCommitGate};
@@ -15,6 +16,7 @@ struct Seen {
     key: String,
     size: u64,
     etag: String,
+    sha256_hex: String,
     tee_exists: bool,
     tee_len: u64,
     meta_visible: bool,
@@ -64,6 +66,7 @@ impl PutCommitGate for MockGate {
             key: req.key.to_string(),
             size: req.size,
             etag: req.etag.to_string(),
+            sha256_hex: req.sha256_hex.to_string(),
             tee_exists: tee.is_some(),
             tee_len: tee.map(|m| m.len()).unwrap_or(0),
             meta_visible,
@@ -129,6 +132,11 @@ async fn gate_runs_after_staging_before_meta() {
         assert_eq!(seen[0].key, "k.txt");
         assert_eq!(seen[0].size, 5);
         assert_eq!(seen[0].etag, info.etag);
+        assert_eq!(
+            seen[0].sha256_hex,
+            hex::encode(sha2::Sha256::digest(b"hello")),
+            "门拿到的必须是 tee 明文 SHA-256（流式发送不再自己算）"
+        );
         assert!(seen[0].tee_exists, "gate 时必须已 tee 出明文");
         assert_eq!(seen[0].tee_len, 5);
         assert!(!seen[0].meta_visible, "gate 必须先于本地 meta 翻转");
