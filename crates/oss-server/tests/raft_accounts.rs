@@ -343,17 +343,23 @@ async fn bucket_quota_is_atomic_on_raft_leader() {
     for i in 0..3 {
         let handle = Arc::clone(&handle);
         tasks.push(tokio::spawn(async move {
-            handle
-                .client_write(bucket_create(&format!("r-{i}"), Some("alice")))
-                .await
+            let name = format!("r-{i}");
+            let result = handle
+                .client_write(bucket_create(&name, Some("alice")))
+                .await;
+            (name, result)
         }));
     }
     let (mut ok, mut quota) = (0, 0);
+    let mut created = Vec::new();
     for t in tasks {
         match t.await.unwrap() {
-            Ok(ControlResponse::Ok) => ok += 1,
-            Err(WriteError::QuotaExceeded) => quota += 1,
-            other => panic!("unexpected write result: {other:?}"),
+            (name, Ok(ControlResponse::Ok)) => {
+                ok += 1;
+                created.push(name);
+            }
+            (_, Err(WriteError::QuotaExceeded)) => quota += 1,
+            (name, other) => panic!("unexpected write result for {name}: {other:?}"),
         }
     }
     assert_eq!((ok, quota), (2, 1), "N+1 并发恰好 N 成功、1 拒绝");
@@ -363,10 +369,14 @@ async fn bucket_quota_is_atomic_on_raft_leader() {
         .unwrap();
     assert_eq!(n, 2, "落库桶数不得超过配额");
 
-    // 重建已有桶不增加桶数：满配额下的收敛仍放行。
+    // 重建已有桶不增加桶数：并发下 r-0 可能被拒，取实际成功的那个。
+    let existing = created
+        .into_iter()
+        .next()
+        .expect("at least one bucket created");
     assert_eq!(
         handle
-            .write(bucket_create("r-0", Some("alice")))
+            .write(bucket_create(&existing, Some("alice")))
             .await
             .unwrap(),
         ControlResponse::Ok

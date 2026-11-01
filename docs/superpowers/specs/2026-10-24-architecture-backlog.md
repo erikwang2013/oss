@@ -107,8 +107,9 @@
 > 任意双向混写、≤v1.15 MPU、混合 v1.16 MPU e2e 执行、Raft 日志格式 feature 门控。
 >
 > **2026-11-01 v1.28.1 补丁**：CI 安装 `protobuf-compiler`，最小配额夹具兼容缺
-> `users` 表，收紧 AWS 端点测试与 mixed-MPU shell 局部变量，裁剪历史计划/SDD 文档；
-> 无功能、接口或数据格式变更。
+> `users` 表，收紧 AWS 端点测试与 mixed-MPU shell 局部变量，裁剪历史计划/SDD 文档。
+> **v1.28.2 补丁**：修复 v1.28.1 CI 暴露的桶配额并发测试夹具（并发下 r-0 不一定是
+> 成功桶，改为复用实际成功的桶名）；无功能、接口或数据格式变更。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
