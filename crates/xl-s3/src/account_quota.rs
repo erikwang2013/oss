@@ -121,7 +121,8 @@ fn now() -> i64 {
 fn missing_account_schema(e: &sqlx::Error) -> bool {
     e.as_database_error().is_some_and(|d| {
         let m = d.message();
-        m.contains("no such table: accounts")
+        m.contains("no such table: users")
+            || m.contains("no such table: accounts")
             || m.contains("no such table: account_members")
             || m.contains("no such column: hard_byte_quota")
             || m.contains("no such column: object_quota")
