@@ -77,57 +77,88 @@ impl Store {
             .page_keys(bucket, prefix, start_after, exclusive)
             .await?;
 
+        // 对象候选按 key 序分批（上限 META_READ_CONCURRENCY）并发读 meta；cp 不读盘。
+        // 批内结果仍按序消费：分页/去重/delete-marker 判定与逐键串行版一致。
+        enum Cand {
+            Cp(String),
+            Obj(String),
+        }
         let mut objects: Vec<(crate::mesh::ListEntry, ObjectInfo)> = Vec::new();
         let mut cps: Vec<String> = Vec::new();
-        while let Some(k) = keys.next() {
-            if !k.starts_with(prefix) {
-                continue;
-            }
-            if let Some(after) = start_after {
-                // V2 token = 本页「未返回的第一个 key」，恢复时包含该 key 本身；
-                // V1 marker = 严格大于（AWS：start listing after this key）。
-                if k.as_str() < after || (exclusive && k.as_str() == after) {
+        'pages: loop {
+            let mut batch: Vec<Cand> = Vec::with_capacity(super::META_READ_CONCURRENCY);
+            while batch.len() < super::META_READ_CONCURRENCY {
+                let Some(k) = keys.next() else { break };
+                if !k.starts_with(prefix) {
                     continue;
                 }
-            }
-            if let Some(d) = delimiter {
-                let rest = &k[prefix.len()..];
-                if let Some(pos) = rest.find(d) {
-                    let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
-                    // V1：CommonPrefixes 不返回字典序 <= marker 的项（AWS 语义）；这些键
-                    // 已折叠进被过滤的 cp，不能再作为对象返回。
-                    if exclusive && start_after.is_some_and(|m| cp.as_str() <= m) {
+                if let Some(after) = start_after {
+                    // V2 token = 本页「未返回的第一个 key」，恢复时包含该 key 本身；
+                    // V1 marker = 严格大于（AWS：start listing after this key）。
+                    if k.as_str() < after || (exclusive && k.as_str() == after) {
                         continue;
                     }
-                    // 去重检查在容量判断之前：已发过的 cp 不再占位、也不触发截断
-                    if !cps.contains(&cp) {
-                        if objects.len() + cps.len() >= limit {
-                            break;
-                        }
-                        cps.push(cp);
-                    }
-                    continue;
                 }
+                if let Some(d) = delimiter {
+                    let rest = &k[prefix.len()..];
+                    if let Some(pos) = rest.find(d) {
+                        let cp = format!("{prefix}{}", &rest[..pos + d.len()]);
+                        // V1：CommonPrefixes 不返回字典序 <= marker 的项（AWS 语义）；这些键
+                        // 已折叠进被过滤的 cp，不能再作为对象返回。
+                        if exclusive && start_after.is_some_and(|m| cp.as_str() <= m) {
+                            continue;
+                        }
+                        batch.push(Cand::Cp(cp));
+                        continue;
+                    }
+                }
+                batch.push(Cand::Obj(k));
             }
-            if objects.len() + cps.len() >= limit {
+            if batch.is_empty() {
                 break;
             }
-            if let Some(m) = self.read_meta(bucket, &k).await? {
-                // 版本控制：链尾为 delete marker 的键在对象列表不可见（版本列表仍可见）
-                if !include_deleted && m.latest_is_marker() {
-                    continue;
+            let reads = futures::future::join_all(batch.iter().map(|c| async {
+                match c {
+                    Cand::Obj(k) => self.read_meta(bucket, k).await,
+                    Cand::Cp(_) => Ok(None),
                 }
-                let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
-                let info = self.load_object_info(bucket, &k, &m)?;
-                objects.push((
-                    crate::mesh::ListEntry {
-                        key: k.clone(),
-                        size: info.size,
-                        etag: info.etag.clone(),
-                        max_mod_time_nanos: t,
-                    },
-                    info,
-                ));
+            }));
+            let metas = reads.await;
+            for (cand, meta) in batch.into_iter().zip(metas) {
+                match cand {
+                    // 去重检查在容量判断之前：已发过的 cp 不再占位、也不触发截断
+                    Cand::Cp(cp) => {
+                        if !cps.contains(&cp) {
+                            if objects.len() + cps.len() >= limit {
+                                break 'pages;
+                            }
+                            cps.push(cp);
+                        }
+                    }
+                    Cand::Obj(k) => {
+                        if objects.len() + cps.len() >= limit {
+                            break 'pages;
+                        }
+                        if let Some(m) = meta? {
+                            // 版本控制：链尾为 delete marker 的键在对象列表不可见
+                            // （版本列表仍可见）
+                            if !include_deleted && m.latest_is_marker() {
+                                continue;
+                            }
+                            let t = m.latest().map_or(i64::MIN, |v| v.mod_time_nanos);
+                            let info = self.load_object_info(bucket, &k, &m)?;
+                            objects.push((
+                                crate::mesh::ListEntry {
+                                    key: k,
+                                    size: info.size,
+                                    etag: info.etag.clone(),
+                                    max_mod_time_nanos: t,
+                                },
+                                info,
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok((objects, cps))
@@ -197,37 +228,55 @@ impl Store {
             None
         };
 
-        for n in &cl.sets.flat.nodes {
-            if n.id == self_id {
-                continue;
-            }
-            // 探测失败 = 不可达：V1 marker 页可能被旧端按包含式处理 → 显式降级；
-            // 请求仍按现版语义发出（未知不得当旧版），实际 RPC 错误另行处理。
-            let legacy = match cl.transport.peer_caps(&n.id).await {
-                Ok(caps) => matches!(
-                    crate::mesh_gate::check_peer(&n.id, &caps, &local_caps)?,
-                    crate::mesh_gate::PeerClass::Legacy
-                ),
-                Err(_) => {
-                    if exclusive {
-                        degraded_marker = true;
+        // 对端并发扇出（每路内部仍按 caps → ListLocal 顺序）；结果按节点序消费，
+        // 同键并列取舍、降级/incomplete 口径与串行版一致。
+        let peers: Vec<_> = cl
+            .sets
+            .flat
+            .nodes
+            .iter()
+            .filter(|n| n.id != self_id)
+            .collect();
+        let local_caps_ref = &local_caps;
+        let results = futures::future::join_all(peers.iter().map(|n| {
+            let node = n.id.clone();
+            let prefix = prefix.clone();
+            let marker = start_after.clone();
+            let local_caps = local_caps_ref;
+            async move {
+                // 探测失败 = 不可达：V1 marker 页可能被旧端按包含式处理 → 显式降级；
+                // 请求仍按现版语义发出（未知不得当旧版），实际 RPC 错误另行处理。
+                let mut degraded = false;
+                let legacy = match cl.transport.peer_caps(&node).await {
+                    Ok(caps) => matches!(
+                        crate::mesh_gate::check_peer(&node, &caps, local_caps)?,
+                        crate::mesh_gate::PeerClass::Legacy
+                    ),
+                    Err(_) => {
+                        degraded = exclusive;
+                        false
                     }
-                    false
+                };
+                if legacy && exclusive {
+                    degraded = true;
                 }
-            };
-            if legacy && exclusive {
-                degraded_marker = true;
+                let l = crate::mesh::ListLocal {
+                    bucket: bucket.into(),
+                    prefix,
+                    delimiter: delimiter.map(str::to_string),
+                    marker,
+                    marker_exclusive: exclusive && !legacy,
+                    limit: remote_limit,
+                    include_deleted: false,
+                };
+                let res = cl.transport.list_local(&node, l).await;
+                Ok::<_, Error>((degraded, node, res))
             }
-            let l = crate::mesh::ListLocal {
-                bucket: bucket.into(),
-                prefix: prefix.clone(),
-                delimiter: delimiter.map(|d| d.to_string()),
-                marker: start_after.clone(),
-                marker_exclusive: exclusive && !legacy,
-                limit: remote_limit,
-                include_deleted: false,
-            };
-            match cl.transport.list_local(&n.id, l).await {
+        }));
+        for r in results.await {
+            let (deg, node, res) = r?;
+            degraded_marker |= deg;
+            match res {
                 Ok(resp) => {
                     for e in resp.entries {
                         // 排他 marker 页的并集不得含 <= marker 的输出（重复会让客户端原地打转）。
@@ -259,7 +308,7 @@ impl Store {
                     if exclusive {
                         degraded_marker = true;
                     }
-                    tracing::warn!(node = %n.id, error = %e, "远端列举不可达（少一路并集）")
+                    tracing::warn!(node = %node, error = %e, "远端列举不可达（少一路并集）")
                 }
             }
         }

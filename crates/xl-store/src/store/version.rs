@@ -1229,39 +1229,54 @@ impl Store {
         if let Some(cl) = self.cfg.cluster.as_deref() {
             let self_id = cl.sets.flat.self_node().id.clone();
             let local_caps = self.local_caps();
-            for n in &cl.sets.flat.nodes {
-                if n.id == self_id {
-                    continue;
+            // 对端并发扇出；键集随后统一排序去重，degraded 为任一路降级的或。
+            let peers: Vec<_> = cl
+                .sets
+                .flat
+                .nodes
+                .iter()
+                .filter(|n| n.id != self_id)
+                .collect();
+            let local_caps_ref = &local_caps;
+            let results = futures::future::join_all(peers.iter().map(|n| {
+                let node = n.id.clone();
+                let local_caps = local_caps_ref;
+                async move {
+                    // 未知 wire / 拓扑不一致 → fail-closed；不可达 → 缺项（degraded）。
+                    let wire = match cl.transport.peer_caps(&node).await {
+                        Ok(caps) => {
+                            crate::mesh_gate::check_peer(&node, &caps, local_caps)?;
+                            caps.wire_version
+                        }
+                        Err(_) => 0,
+                    };
+                    let req = crate::mesh::ListLocal {
+                        bucket: bucket.into(),
+                        prefix: prefix.into(),
+                        delimiter: None,
+                        // 版本列表：key_marker 是包含的续点；远端不得从头返回（否则 >limit 的
+                        // 续页键整段缺失）。delete-marker 链尾的键也必须出现在版本列表。
+                        marker: key_marker.map(str::to_string),
+                        marker_exclusive: false,
+                        // +2 同本地：续点键可能产出 0 条，多取一键用于判定截断。
+                        limit: max + 2,
+                        // 旧版忽略该标志 → 键集会缺 delete-marker 链尾键，degraded 已置位。
+                        include_deleted: wire >= 2,
+                    };
+                    let res = cl.transport.list_local(&node, req).await;
+                    Ok::<_, Error>((wire, node, res))
                 }
-                // 未知 wire / 拓扑不一致 → fail-closed；不可达 → 缺项（degraded）。
-                let wire = match cl.transport.peer_caps(&n.id).await {
-                    Ok(caps) => {
-                        crate::mesh_gate::check_peer(&n.id, &caps, &local_caps)?;
-                        caps.wire_version
-                    }
-                    Err(_) => 0,
-                };
+            }));
+            for r in results.await {
+                let (wire, node, res) = r?;
                 if wire < 2 {
                     degraded = true;
                 }
-                let req = crate::mesh::ListLocal {
-                    bucket: bucket.into(),
-                    prefix: prefix.into(),
-                    delimiter: None,
-                    // 版本列表：key_marker 是包含的续点；远端不得从头返回（否则 >limit 的
-                    // 续页键整段缺失）。delete-marker 链尾的键也必须出现在版本列表。
-                    marker: key_marker.map(str::to_string),
-                    marker_exclusive: false,
-                    // +2 同本地：续点键可能产出 0 条，多取一键用于判定截断。
-                    limit: max + 2,
-                    // 旧版忽略该标志 → 键集会缺 delete-marker 链尾键，degraded 已置位。
-                    include_deleted: wire >= 2,
-                };
-                match cl.transport.list_local(&n.id, req).await {
+                match res {
                     Ok(page) => keys.extend(page.entries.into_iter().map(|e| e.key)),
                     Err(e) => {
                         degraded = true;
-                        tracing::warn!(node = %n.id, error = %e, "peer 键集拉取失败（少一路并集）")
+                        tracing::warn!(node = %node, error = %e, "peer 键集拉取失败（少一路并集）")
                     }
                 }
             }
@@ -1273,13 +1288,22 @@ impl Store {
             degraded,
             ..VersionList::default()
         };
-        'keys: for k in keys {
+        // 键间并发读 meta（上限 META_READ_CONCURRENCY，结果保序）；页边界之外的预读
+        // 结果不会被消费，其错误也不上抛。
+        use futures::StreamExt as _;
+        let mut metas = futures::stream::iter(keys)
+            .map(|k| async move {
+                let m = self.read_meta(bucket, &k).await;
+                (k, m)
+            })
+            .buffered(super::META_READ_CONCURRENCY);
+        'keys: while let Some((k, m)) = metas.next().await {
             if let Some(km) = key_marker
                 && k.as_str() < km
             {
                 continue;
             }
-            let Some(m) = self.read_meta(bucket, &k).await? else {
+            let Some(m) = m? else {
                 continue; // 并发删除的残影键
             };
             // 键内新→旧；key_marker 命中时按 version_id_marker 断点续（S3：从该版本**之后**继续）。

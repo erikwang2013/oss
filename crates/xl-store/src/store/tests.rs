@@ -2776,6 +2776,9 @@ pub struct InProcessMesh {
     versions: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// DP-1：到达对端的 ListLocal 请求记录（断言「旧版不会收到新语义标志」）。
     list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
+    /// 测试仪器：ListLocal 并发峰值（验证目录列举的 peer 扇出）。
+    list_inflight: std::sync::atomic::AtomicU64,
+    list_max_inflight: std::sync::atomic::AtomicU64,
     /// 测试诊断：health 探测调用序列（注入失败记为 FAIL）。
     health_log: std::sync::Mutex<Vec<String>>,
     /// 写并发仪器（分片写并行测试）：并发峰值 + 调用数。
@@ -2808,6 +2811,8 @@ impl InProcessMesh {
             fail_once: Default::default(),
             versions: Default::default(),
             list_requests: Default::default(),
+            list_inflight: Default::default(),
+            list_max_inflight: Default::default(),
             health_log: Default::default(),
             write_inflight: Default::default(),
             write_max_inflight: Default::default(),
@@ -2886,6 +2891,17 @@ impl InProcessMesh {
     /// DP-1：到各节点的 ListLocal 请求快照（断言旧版收不到新语义标志）。
     pub fn list_local_requests(&self) -> Vec<(String, crate::mesh::ListLocal)> {
         self.list_requests.lock().unwrap().clone()
+    }
+
+    /// 并发峰值：同时处于 list_local 中的 RPC 数（串行扇出恒为 1）。
+    pub fn list_max_inflight(&self) -> u64 {
+        self.list_max_inflight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reset_list_inflight(&self) {
+        self.list_max_inflight
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 测试诊断：health 探测调用序列。
@@ -3103,7 +3119,15 @@ impl crate::mesh::MeshTransport for InProcessMesh {
             l.marker_exclusive = false;
             l.include_deleted = false;
         }
-        self.peer(n).await?.mesh_list_local(l).await
+        use std::sync::atomic::Ordering::SeqCst;
+        let inflight = self.list_inflight.fetch_add(1, SeqCst) + 1;
+        self.list_max_inflight.fetch_max(inflight, SeqCst);
+        let res = match self.peer(n).await {
+            Ok(store) => store.mesh_list_local(l).await,
+            Err(e) => Err(e),
+        };
+        self.list_inflight.fetch_sub(1, SeqCst);
+        res
     }
     async fn list_uploads_local(
         &self,
@@ -4147,6 +4171,56 @@ async fn cluster_list_union_and_pagination() {
     expect.push("missed".into());
     expect.sort();
     assert_eq!(seen, expect, "分页枚举应恰好一次全覆盖");
+}
+
+/// 目录列举的 peer 扇出必须并发：慢节点下并发峰值 >= 2（串行则恒为 1），
+/// 且对象/版本列表的并集排序不变。
+#[tokio::test]
+async fn cluster_list_peer_fanout_is_concurrent() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    s1.create_bucket("bkt").await.unwrap();
+    for k in ["a", "b", "c"] {
+        s1.put_object("bkt", k, Bytes::from_static(b"x"), None)
+            .await
+            .unwrap();
+    }
+    for id in ["n2", "n3", "n4"] {
+        c.mesh.delay(id, std::time::Duration::from_millis(50));
+    }
+
+    let page = s1.list_objects("bkt", &Default::default()).await.unwrap();
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "并发扇出不得改变并集排序"
+    );
+    assert!(
+        c.mesh.list_max_inflight() >= 2,
+        "对象列表的 peer ListLocal 应并发扇出（峰值 {}）",
+        c.mesh.list_max_inflight()
+    );
+
+    c.mesh.reset_list_inflight();
+    let vl = s1
+        .list_object_versions("bkt", "", 100, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        vl.entries
+            .iter()
+            .map(|e| e.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"]
+    );
+    assert!(
+        c.mesh.list_max_inflight() >= 2,
+        "版本列表的 peer ListLocal 应并发扇出（峰值 {}）",
+        c.mesh.list_max_inflight()
+    );
 }
 
 /// 集群版本列表：key-marker 必须传到 peer（否则续页重复/缺失），且链尾为 delete marker

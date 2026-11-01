@@ -198,3 +198,84 @@ async fn list_versions_key_marker_before_limit() {
     uniq.dedup();
     assert_eq!(uniq.len(), N, "分页不得重复");
 }
+
+/// 列举热路径按批并发读 meta（>32 键跨多批）：对象/版本列表的分页顺序、去重与
+/// delete-marker 跳过语义不变。
+#[tokio::test]
+async fn list_batched_meta_reads_keep_order_and_skip_markers() {
+    let (s, _d) = store().await;
+    const N: u32 = 80;
+    for i in 0..N {
+        put(&s, &format!("k{i:03}"), b"v", VersioningMode::Enabled).await;
+    }
+    // 每隔 7 个键加一个链尾 delete marker：对象列表不可见，版本列表仍可见
+    let mut markers = 0u32;
+    for i in (0..N).step_by(7) {
+        let out = s
+            .delete_object_versioned("alpha", &format!("k{i:03}"), None, VersioningMode::Enabled)
+            .await
+            .unwrap();
+        assert!(matches!(out, DeleteOutcome::Marker { .. }));
+        markers += 1;
+    }
+
+    let mut seen = Vec::new();
+    let mut token = None;
+    for _ in 0..N {
+        let page = s
+            .list_objects(
+                "alpha",
+                &ListRequest {
+                    max_keys: Some(3),
+                    continuation_token: token.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        seen.extend(page.objects.iter().map(|o| o.key.clone()));
+        if !page.is_truncated {
+            break;
+        }
+        token = page.next_token.clone();
+    }
+    let expect: Vec<String> = (0..N)
+        .filter(|i| i % 7 != 0)
+        .map(|i| format!("k{i:03}"))
+        .collect();
+    assert_eq!(seen, expect, "对象列表必须升序、无重复、跳过 delete marker");
+
+    let mut versions = Vec::new();
+    let (mut km, mut vm) = (None, None);
+    for _ in 0..N {
+        let p = s
+            .list_object_versions("alpha", "", 5, km.as_deref(), vm.as_deref())
+            .await
+            .unwrap();
+        versions.extend(
+            p.entries
+                .iter()
+                .map(|e| (e.key.clone(), e.version_id.clone(), e.is_marker)),
+        );
+        if !p.is_truncated {
+            break;
+        }
+        km = p.next_key_marker;
+        vm = p.next_version_id_marker;
+    }
+    assert_eq!(versions.len() as u32, N + markers);
+    assert!(
+        versions.windows(2).all(|w| w[0].0 <= w[1].0),
+        "版本列表键序必须升序"
+    );
+    let uniq: std::collections::BTreeSet<_> = versions
+        .iter()
+        .map(|(k, v, _)| (k.clone(), v.clone()))
+        .collect();
+    assert_eq!(uniq.len(), versions.len(), "分页不得重复版本");
+    assert_eq!(
+        versions.iter().filter(|(_, _, m)| *m).count() as u32,
+        markers,
+        "delete marker 在版本列表必须可见"
+    );
+}

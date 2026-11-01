@@ -54,6 +54,10 @@ pub use drives::{ClusterConfig, ClusterSets, ClusterTopology, NodeSpec, SlotMap,
 
 pub type ByteStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
+/// 列举热路径的 meta 读并发上限：每批最多 32 个键并发读盘（每键内部再并发各盘）。
+/// 保序消费由调用方负责——超前的读结果只会被丢弃，不会改变页边界。
+pub(in crate::store) const META_READ_CONCURRENCY: usize = 32;
+
 /// 桶版本控制三态（S3 `VersioningConfiguration.Status`）。store 不查库：S3/作业层从
 /// `buckets.versioning` 读出后显式传入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1219,11 +1223,19 @@ impl Store {
         if self.cfg.cluster.is_some() {
             return self.read_meta_cluster(bucket, key, false).await;
         }
+        // 路径先统一解析（错误口径同串行：首个坏路径即上抛），再并发读各盘；
+        // 结果按盘序处理，秩并列时仍取靠前盘——与逐盘串行版逐字节一致。
+        let paths = self
+            .cfg
+            .drives
+            .iter()
+            .map(|drive| Ok(layout::object_dir(drive, bucket, key)?.join(meta::META_FILE)))
+            .collect::<Result<Vec<_>>>()?;
+        let reads = futures::future::join_all(paths.iter().map(tokio::fs::read));
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
-        for drive in &self.cfg.drives {
-            let path = layout::object_dir(drive, bucket, key)?.join(meta::META_FILE);
-            match tokio::fs::read(&path).await {
+        for (path, read) in paths.iter().zip(reads.await) {
+            match read {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
                         let t = m.rank();
