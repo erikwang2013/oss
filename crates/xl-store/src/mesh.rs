@@ -86,6 +86,10 @@ pub struct MetaWrite {
     pub bucket: String,
     pub key: String,
     pub meta: Bytes,
+    /// Phase 0：`None` = 数据面（不校验，旧行为）；`Some(t)` = 控制对象 fenced commit。
+    pub fence_token: Option<u64>,
+    /// Phase 0：补偿恢复（token 相等允许回滚，仅当前 token 更大时跳过）。
+    pub restore: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +104,8 @@ pub struct SlotAck {
     pub slot: u16,
     pub ok: bool,
     pub hash: [u8; 32],
+    /// Phase 0：本槽因 fence token 过期被拒（未翻转）。
+    pub stale: bool,
 }
 
 /// prepare / commit 的结果：node 侧报告它**全部本地槽**的逐槽结果。

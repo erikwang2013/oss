@@ -4522,6 +4522,8 @@ async fn foreign_new_content_hash_not_counted() {
         bucket: "bkt".into(),
         key: "k".into(),
         meta: Bytes::from(meta_bytes),
+        fence_token: None,
+        restore: false,
     };
     // prepare 到 n2（写 .new = 我们的内容）
     let ack = c.mesh.prepare_meta("n2", mw.clone()).await.unwrap();
@@ -5421,4 +5423,268 @@ async fn collect_keys_filtered_honors_prefix_and_marker() {
         .await
         .unwrap();
     assert_eq!(got, ["dir/c.txt", "dir/d.txt"]);
+}
+
+// ---- Phase 0 Task 3：fenced commit（控制对象单调 token） ----
+
+/// 控制对象形态的最小 meta（versions 空；token 参与提交校验）。
+fn fenced_meta(key: &str, version: u64, token: u64) -> XlMeta {
+    XlMeta {
+        object_key: key.to_string(),
+        versions: Vec::new(),
+        control_version: Some(version),
+        fence_token: Some(token),
+        control_deleted: None,
+    }
+}
+
+async fn disk_token(_s: &Store, drive: &std::path::Path, bucket: &str, key: &str) -> Option<u64> {
+    let path = layout::object_dir_for(drive, bucket, key)
+        .unwrap()
+        .join(meta::META_FILE);
+    let bytes = tokio::fs::read(path).await.unwrap();
+    XlMeta::decode(&bytes).unwrap().fence_token
+}
+
+/// 3 盘单机（无集群）：token 1 prepare 后暂停 → token 2 提交 → token 1 恢复提交必须 Stale；
+/// 补偿恢复（有/无旧版本）都不得覆盖 token 2 的内容。
+#[tokio::test]
+async fn stale_fence_token_cannot_commit_or_restore() {
+    let dirs: Vec<_> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    let s = Store::open(cfg).await.unwrap();
+    let k = "control/a";
+
+    // token 1 的写者先 prepare，然后暂停
+    let m1 = fenced_meta(k, 1, 1);
+    for d in &dirs {
+        s.write_meta_new_on(d.path(), layout::SYS_DIR, k, &m1.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    // token 2 的写者从 prepare 到 commit 全程完成
+    let m2 = fenced_meta(k, 2, 2);
+    assert_eq!(
+        s.write_meta_fenced(layout::SYS_DIR, k, &m2, None, Some(2))
+            .await
+            .unwrap(),
+        12
+    );
+    for d in &dirs {
+        assert_eq!(disk_token(&s, d.path(), layout::SYS_DIR, k).await, Some(2));
+    }
+
+    // token 1 恢复提交：即使 .new 已被 token 2 消费，也必须先按已提交 token 判 Stale
+    for d in &dirs {
+        assert!(
+            matches!(
+                s.commit_meta_on(d.path(), layout::SYS_DIR, k, Some(1))
+                    .await
+                    .unwrap(),
+                crate::store::mesh_api::SlotCommit::Stale
+            ),
+            "盘 {} 必须拒绝过期 token",
+            d.path().display()
+        );
+    }
+    // 补偿恢复必须跳过（绝不覆盖新 token 内容）
+    let old = fenced_meta(k, 0, 0);
+    for d in &dirs {
+        assert!(
+            !s.restore_meta_fenced(d.path(), layout::SYS_DIR, k, Some(&old), 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.restore_meta_fenced(d.path(), layout::SYS_DIR, k, None, 1)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            disk_token(&s, d.path(), layout::SYS_DIR, k).await,
+            Some(2),
+            "更新 token 的内容必须保留"
+        );
+    }
+}
+
+/// abort/清理不得删除更新写者的 `.new`（解码后比较 token；相等才可清）。
+#[tokio::test]
+async fn abort_keeps_newer_meta_new() {
+    let (s, d) = store().await;
+    let k = "control/abort";
+    let m2 = fenced_meta(k, 1, 2);
+    let m3 = fenced_meta(k, 1, 3);
+    for m in [&m2, &m3] {
+        s.write_meta_new_on(d.path(), layout::SYS_DIR, k, &m.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    let new_path = layout::object_dir_for(d.path(), layout::SYS_DIR, k)
+        .unwrap()
+        .join(meta::META_NEW_FILE);
+    let abort = |token: u64| crate::mesh::MetaWrite {
+        bucket: layout::SYS_DIR.into(),
+        key: k.into(),
+        meta: bytes::Bytes::new(),
+        fence_token: Some(token),
+        restore: false,
+    };
+    // token 2 的 abort 必须保留 token 3 的 .new
+    s.mesh_abort_meta(abort(2)).await.unwrap();
+    assert!(
+        tokio::fs::try_exists(&new_path).await.unwrap(),
+        "更新写者的 .new 必须保留"
+    );
+    let nm = XlMeta::decode(&tokio::fs::read(&new_path).await.unwrap()).unwrap();
+    assert_eq!(nm.fence_token, Some(3));
+    // token 3 自己的 abort（相等不算更新）才清
+    s.mesh_abort_meta(abort(3)).await.unwrap();
+    assert!(!tokio::fs::try_exists(&new_path).await.unwrap());
+}
+
+/// 多盘：只有 token 合法的翻转计入；≥1 合法翻转 = 已提交（既有语义保留）。
+#[tokio::test]
+async fn multi_drive_counts_only_token_legal_flips() {
+    let dirs: Vec<_> = (0..12).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut cfg = StoreConfig::new(dirs[0].path());
+    cfg.drives = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+    let s = Store::open(cfg).await.unwrap();
+    let k = "control/partial";
+    // 盘 0 已有更新 token（5）；其余盘无 meta
+    s.write_meta_on(dirs[0].path(), layout::SYS_DIR, k, &fenced_meta(k, 2, 5))
+        .await
+        .unwrap();
+    let m = fenced_meta(k, 1, 3);
+    assert_eq!(
+        s.write_meta_fenced(layout::SYS_DIR, k, &m, None, Some(3))
+            .await
+            .unwrap(),
+        11,
+        "只计 token 合法的其余 11 盘"
+    );
+    assert_eq!(
+        disk_token(&s, dirs[0].path(), layout::SYS_DIR, k).await,
+        Some(5)
+    );
+    assert_eq!(
+        disk_token(&s, dirs[1].path(), layout::SYS_DIR, k).await,
+        Some(3)
+    );
+    assert_eq!(
+        disk_token(&s, dirs[11].path(), layout::SYS_DIR, k).await,
+        Some(3)
+    );
+}
+
+/// `fence_token = None`（数据面）逐字节不变：已有更高 token 也不阻止普通写。
+#[tokio::test]
+async fn unfenced_write_ignores_fence_tokens() {
+    let (s, _d) = store().await;
+    let k = "control/none";
+    assert_eq!(
+        s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 1, 7), None, Some(7))
+            .await
+            .unwrap(),
+        1
+    );
+    let plain = XlMeta {
+        object_key: k.to_string(),
+        versions: Vec::new(),
+        control_version: None,
+        fence_token: None,
+        control_deleted: None,
+    };
+    assert_eq!(
+        s.write_meta(layout::SYS_DIR, k, &plain, None)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        read_disk_meta(&s, layout::SYS_DIR, k).await.fence_token,
+        None
+    );
+}
+
+/// 单盘：过期 token 提交 → `Error::Conflict`（不是 QuorumUnmet/静默成功）。
+#[tokio::test]
+async fn single_drive_stale_fence_token_is_conflict() {
+    let (s, _d) = store().await;
+    let k = "control/conflict";
+    s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 5), None, Some(5))
+        .await
+        .unwrap();
+    match s
+        .write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 3, 4), None, Some(4))
+        .await
+    {
+        Err(Error::Conflict(_)) => {}
+        other => panic!("应为 Conflict，实际：{other:?}"),
+    }
+    assert_eq!(
+        read_disk_meta(&s, layout::SYS_DIR, k).await.fence_token,
+        Some(5)
+    );
+}
+
+/// 服务端 commit 把 Stale 映射为 `SlotAck { ok: false, stale: true }`。
+#[tokio::test]
+async fn mesh_commit_meta_reports_stale_slots() {
+    let (s, _d) = store().await;
+    let k = "control/staleack";
+    s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 1, 3), None, Some(3))
+        .await
+        .unwrap();
+    let ack = s
+        .mesh_commit_meta(crate::mesh::MetaWrite {
+            bucket: layout::SYS_DIR.into(),
+            key: k.into(),
+            meta: bytes::Bytes::new(),
+            fence_token: Some(2),
+            restore: false,
+        })
+        .await
+        .unwrap();
+    assert!(!ack.ok);
+    assert!(ack.slots.iter().all(|s| !s.ok && s.stale), "{ack:?}");
+}
+
+/// 集群：过期 token 的整次写返回 Conflict，已提交的新 token 内容原样保留。
+#[tokio::test]
+async fn cluster_stale_fence_token_is_conflict_and_keeps_newer() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    let k = "control/cluster";
+    let newer = fenced_meta(k, 2, 5);
+    assert!(
+        s1.write_meta_fenced(layout::SYS_DIR, k, &newer, None, Some(5))
+            .await
+            .unwrap()
+            >= 9,
+        "token 5 应达 quorum"
+    );
+    match s1
+        .write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 3, 4), None, Some(4))
+        .await
+    {
+        Err(Error::Conflict(_)) => {}
+        other => panic!("应为 Conflict，实际：{other:?}"),
+    }
+    let cur = s1
+        .read_meta(layout::SYS_DIR, k)
+        .await
+        .unwrap()
+        .expect("新 token 内容必须仍在");
+    assert_eq!(cur.fence_token, Some(5));
+    // 过期写者的 .new 残骸必须被清理（其 token == abort token）
+    for dirs in &c.dirs {
+        for d in dirs {
+            let p = layout::object_dir_for(d, layout::SYS_DIR, k)
+                .unwrap()
+                .join(meta::META_NEW_FILE);
+            assert!(!tokio::fs::try_exists(&p).await.unwrap(), "{}", p.display());
+        }
+    }
 }

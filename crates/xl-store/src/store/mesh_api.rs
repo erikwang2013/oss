@@ -16,6 +16,14 @@ use super::Store;
 use super::drives;
 use super::ec;
 
+/// 单槽提交结果（Phase 0 fenced commit）：`Stale` = 当前已提交 token 更新，本槽未翻转。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::store) enum SlotCommit {
+    Committed { hash: [u8; 32] },
+    Stale,
+    Missing,
+}
+
 /// 拓扑指纹 canonical string：`epoch;data;parity;enabled;`，然后每个 set 的
 /// `set_index;` + 该 set 节点按 id 升序的 `id,addr,drive_count;`；SHA-256 前 8 字节 hex。
 ///
@@ -577,18 +585,61 @@ impl Store {
     }
 
     /// 翻本机某盘槽：**读回 `.new` 算内容 hash** → rename 覆盖 `xl.meta`（该槽提交点）。
-    /// 返回 (是否翻转, 所翻内容 hash)——hash 供写者只计「内容是自己的」的翻转（防伪达成）。
+    /// `fence_token = None` 为数据面旧行为（不校验）；`Some(t)` 先取**当前已提交** `xl.meta`
+    /// 的 token：`>= t` 即过期（restore 模式仅 `> t` 跳过），返回 [`SlotCommit::Stale`] 且不
+    /// rename——过期写者绝不能覆盖/翻转新写。
     pub(in crate::store) async fn commit_meta_on(
         &self,
         drive: &std::path::Path,
         bucket: &str,
         key: &str,
-    ) -> Result<(bool, [u8; 32])> {
+        fence_token: Option<u64>,
+    ) -> Result<SlotCommit> {
+        self.commit_meta_on_checked(drive, bucket, key, fence_token, false)
+            .await
+    }
+
+    /// 补偿恢复的服务端形态：翻已 prepare 的旧内容，当前 token **更大**才跳过（相等 =
+    /// 自己的翻转，允许回滚）。
+    pub(in crate::store) async fn restore_meta_on(
+        &self,
+        drive: &std::path::Path,
+        bucket: &str,
+        key: &str,
+        fence_token: u64,
+    ) -> Result<SlotCommit> {
+        self.commit_meta_on_checked(drive, bucket, key, Some(fence_token), true)
+            .await
+    }
+
+    async fn commit_meta_on_checked(
+        &self,
+        drive: &std::path::Path,
+        bucket: &str,
+        key: &str,
+        fence_token: Option<u64>,
+        restore: bool,
+    ) -> Result<SlotCommit> {
         let dir = layout::object_dir_for(drive, bucket, key)?;
+        if let Some(t) = fence_token {
+            // 先查已提交 token 再看 `.new`：.new 已被新写者消费时同样判 Stale（语义更准）
+            match tokio::fs::read(dir.join(meta::META_FILE)).await {
+                Ok(bytes) => {
+                    let cur = meta::XlMeta::decode(&bytes)?.fence_token.unwrap_or(0);
+                    let stale = if restore { cur > t } else { cur >= t };
+                    if stale {
+                        return Ok(SlotCommit::Stale);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // 解码/IO 失败：无法证明顺序 → fail-closed，不翻
+                Err(e) => return Err(e.into()),
+            }
+        }
         let new_path = dir.join(meta::META_NEW_FILE);
         let bytes = match tokio::fs::read(&new_path).await {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((false, [0u8; 32])),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SlotCommit::Missing),
             Err(e) => return Err(e.into()),
         };
         let hash = crate::mesh::content_hash(&bytes);
@@ -598,7 +649,41 @@ impl Store {
         }
         // 本槽提交点已过：键缓存增量（本机集群 commit / mesh 服务端 commit / fsck 修复共用）
         self.note_cached_key(bucket, key);
-        Ok((true, hash))
+        Ok(SlotCommit::Committed { hash })
+    }
+
+    /// 清 `.new`，但保留更新写者的暂存（token 更大）；解码失败同样保留（无法证明它不比
+    /// 我们新——宁留残骸，绝不删新写）。
+    pub(in crate::store) async fn remove_meta_new_fenced(
+        &self,
+        drive: &std::path::Path,
+        bucket: &str,
+        key: &str,
+        fence_token: u64,
+    ) {
+        let Ok(dir) = layout::object_dir_for(drive, bucket, key) else {
+            return;
+        };
+        let new_path = dir.join(meta::META_NEW_FILE);
+        match tokio::fs::read(&new_path).await {
+            Ok(bytes) => match meta::XlMeta::decode(&bytes) {
+                Ok(nm) if nm.fence_token.unwrap_or(0) > fence_token => tracing::warn!(
+                    path = %new_path.display(),
+                    fence_token,
+                    "`.new` 属于更新写者，清理跳过"
+                ),
+                Ok(_) => {
+                    let _ = tokio::fs::remove_file(&new_path).await;
+                }
+                Err(e) => tracing::warn!(
+                    path = %new_path.display(),
+                    error = %e,
+                    "`.new` 解码失败，清理跳过"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %new_path.display(), error = %e, "`.new` 读取失败"),
+        }
     }
 
     /// 服务端 prepare：本机全部在册盘写 `.new`；逐槽 ack（hash = 内容 hash）。
@@ -622,6 +707,7 @@ impl Store {
                     slot,
                     ok: true,
                     hash: self_hash,
+                    stale: false,
                 }),
                 Err(e) => {
                     tracing::warn!(slot, error = %e, "meta 准备失败");
@@ -629,6 +715,7 @@ impl Store {
                         slot,
                         ok: false,
                         hash: [0u8; 32],
+                        stale: false,
                     });
                 }
             }
@@ -644,6 +731,7 @@ impl Store {
     }
 
     /// 服务端 commit：逐本地槽「读回 `.new` 算 hash → rename」；幂等（无 `.new` → ok=false）。
+    /// fenced 写（`fence_token = Some`）先校验当前已提交 token，过期槽回 `stale = true`。
     pub async fn mesh_commit_meta(
         &self,
         m: crate::mesh::MetaWrite,
@@ -651,14 +739,39 @@ impl Store {
         let mut slots = Vec::new();
         for (d, drive) in self.cfg.drives.iter().enumerate() {
             let slot = self.slot_base() + d as u16;
-            match self.commit_meta_on(drive, &m.bucket, &m.key).await {
-                Ok((ok, hash)) => slots.push(crate::mesh::SlotAck { slot, ok, hash }),
+            let res = match (m.restore, m.fence_token) {
+                (true, Some(t)) => self.restore_meta_on(drive, &m.bucket, &m.key, t).await,
+                _ => {
+                    self.commit_meta_on(drive, &m.bucket, &m.key, m.fence_token)
+                        .await
+                }
+            };
+            match res {
+                Ok(SlotCommit::Committed { hash }) => slots.push(crate::mesh::SlotAck {
+                    slot,
+                    ok: true,
+                    hash,
+                    stale: false,
+                }),
+                Ok(SlotCommit::Stale) => slots.push(crate::mesh::SlotAck {
+                    slot,
+                    ok: false,
+                    hash: [0u8; 32],
+                    stale: true,
+                }),
+                Ok(SlotCommit::Missing) => slots.push(crate::mesh::SlotAck {
+                    slot,
+                    ok: false,
+                    hash: [0u8; 32],
+                    stale: false,
+                }),
                 Err(e) => {
                     tracing::warn!(slot, error = %e, "meta 翻转失败");
                     slots.push(crate::mesh::SlotAck {
                         slot,
                         ok: false,
                         hash: [0u8; 32],
+                        stale: false,
                     });
                 }
             }
@@ -673,11 +786,20 @@ impl Store {
         })
     }
 
-    /// 服务端 abort：清本机全部槽的 `.new` 残骸（幂等）。
+    /// 服务端 abort：清本机全部槽的 `.new` 残骸（幂等）。fenced 写只清 token 不更新的
+    /// 暂存——更新写者的 `.new` 必须保留。
     pub async fn mesh_abort_meta(&self, m: crate::mesh::MetaWrite) -> Result<()> {
         for drive in &self.cfg.drives {
-            if let Ok(dir) = layout::object_dir_for(drive, &m.bucket, &m.key) {
-                let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+            match m.fence_token {
+                Some(t) => {
+                    self.remove_meta_new_fenced(drive, &m.bucket, &m.key, t)
+                        .await
+                }
+                None => {
+                    if let Ok(dir) = layout::object_dir_for(drive, &m.bucket, &m.key) {
+                        let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                    }
+                }
             }
         }
         Ok(())

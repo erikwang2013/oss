@@ -54,8 +54,15 @@ message ShardDelete { string bucket=1; string key=2; string uuid=3; uint32 part=
                       uint32 slot=6; uint32 set=7; }
 message ShardResp  { bool found=1; uint32 crc32c=2; bytes data=3; }
 message VersionDirRef { string bucket=1; string key=2; string uuid=3; }
-message MetaWrite { string bucket=1; string key=2; bytes meta=3; }
-message SlotAck { uint32 slot=1; bool ok=2; bytes hash=3; }
+message MetaWrite { string bucket=1; string key=2; bytes meta=3;
+                    // Phase 0 控制对象 fenced commit：缺省 = 数据面旧行为（不校验）；
+                    // 有值 = 提交前比较当前 xl.meta 的 token，过期则拒翻。
+                    optional uint64 fence_token=4;
+                    // 补偿恢复：token 相等时允许回滚自己的翻转，仅在当前 token 更大时跳过。
+                    bool restore=5; }
+message SlotAck { uint32 slot=1; bool ok=2; bytes hash=3;
+                  // Phase 0：本槽因 fence token 过期被拒（未翻转）。
+                  bool stale=4; }
 message MetaAck { bool ok=1; string msg=2; repeated SlotAck slots=3; uint32 slots_ok=4; }
 message MetaRead  { string bucket=1; string key=2; }
 message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4; }

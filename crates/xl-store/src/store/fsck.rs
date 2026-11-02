@@ -148,7 +148,7 @@ impl Store {
                                     continue;
                                 }
                                 self.write_meta_new_on(drive, &b, &k, &bytes).await?;
-                                let _ = self.commit_meta_on(drive, &b, &k).await?;
+                                let _ = self.commit_meta_on(drive, &b, &k, None).await?;
                             }
                             r.repaired_meta_keys += 1;
                         }

@@ -1463,10 +1463,54 @@ impl Store {
         m: &XlMeta,
         old: Option<&XlMeta>,
     ) -> Result<usize> {
+        self.write_meta_fenced(bucket, key, m, old, None).await
+    }
+
+    /// 带 fence token 的写 meta（Phase 0 控制对象）：`fence_token = None` 为数据面旧行为
+    /// （逐字节不变）；`Some(t)` 在每槽 rename 前校验当前已提交 meta 的 token——过期槽
+    /// 不计入翻转，全部过期返回 `Error::Conflict`（不是 QuorumUnmet）。
+    pub(in crate::store) async fn write_meta_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+        fence_token: Option<u64>,
+    ) -> Result<usize> {
         if self.cfg.cluster.is_some() {
-            return self.write_meta_cluster(bucket, key, m, old).await;
+            return self
+                .write_meta_cluster(bucket, key, m, old, fence_token)
+                .await;
         }
         if self.cfg.drives.len() == 1 {
+            if let Some(t) = fence_token {
+                // M2b-1 的 fenced 形态：唯一一份 meta 就是提交点，无 quorum
+                let drive = &self.cfg.drives[0];
+                let bytes = m.encode()?;
+                self.write_meta_new_on(drive, bucket, key, &bytes).await?;
+                return match self.commit_meta_on(drive, bucket, key, Some(t)).await? {
+                    mesh_api::SlotCommit::Committed { hash }
+                        if hash == crate::mesh::content_hash(&bytes) =>
+                    {
+                        Ok(1)
+                    }
+                    mesh_api::SlotCommit::Committed { .. } => {
+                        tracing::warn!(slot = 0, "meta 翻转内容是他人写入（hash 不符），不计入");
+                        Ok(0)
+                    }
+                    mesh_api::SlotCommit::Stale => {
+                        self.remove_meta_new_fenced(drive, bucket, key, t).await;
+                        Err(Error::Conflict(format!(
+                            "fence token 过期：{bucket}/{key} 已由更新写者提交"
+                        )))
+                    }
+                    mesh_api::SlotCommit::Missing => {
+                        tracing::warn!(slot = 0, "meta 翻转失败（无 .new）");
+                        Ok(0)
+                    }
+                };
+            }
+            // M2b-1：唯一一份 meta 就是提交点（原路径逐字节不变）
             self.write_meta_on(&self.cfg.drives[0], bucket, key, m)
                 .await?;
             self.note_cached_key(bucket, key);
@@ -1474,6 +1518,7 @@ impl Store {
         }
         let quorum = self.cfg.ec.data as usize + 1;
         let bytes = m.encode()?;
+        let self_hash = crate::mesh::content_hash(&bytes);
 
         // 阶段一：准备（掉线盘先探测——挂载点目录仍在父 fs 上，盲写会填满根盘）
         let mut prepared: Vec<&PathBuf> = Vec::new();
@@ -1501,8 +1546,13 @@ impl Store {
         }
         if prepared.len() < quorum {
             for drive in &prepared {
-                if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
-                    let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                match fence_token {
+                    Some(t) => self.remove_meta_new_fenced(drive, bucket, key, t).await,
+                    None => {
+                        if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
+                            let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                        }
+                    }
                 }
             }
             self.bump_quorum_unmet_write();
@@ -1521,22 +1571,61 @@ impl Store {
             std::process::abort();
         }
         let mut flipped = 0usize;
+        let mut stale = false;
         for drive in &prepared {
-            let dir = layout::object_dir_for(drive, bucket, key)?;
-            match tokio::fs::rename(dir.join(meta::META_NEW_FILE), dir.join(meta::META_FILE)).await
-            {
-                Ok(()) => {
-                    flipped += 1;
-                    if flip_abort == Some(flipped) {
-                        std::process::abort();
+            match fence_token {
+                // 数据面：原 rename 语义（含 hash 不参与计数）
+                None => {
+                    let dir = layout::object_dir_for(drive, bucket, key)?;
+                    match tokio::fs::rename(
+                        dir.join(meta::META_NEW_FILE),
+                        dir.join(meta::META_FILE),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            flipped += 1;
+                            if flip_abort == Some(flipped) {
+                                std::process::abort();
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(drive = %drive.display(), error = %e, "meta 翻转失败")
+                        }
                     }
                 }
-                Err(e) => tracing::warn!(drive = %drive.display(), error = %e, "meta 翻转失败"),
+                // 控制面：只计 token 合法且内容是自己的翻转（≥1 = 已提交，语义保留）
+                Some(t) => match self.commit_meta_on(drive, bucket, key, Some(t)).await {
+                    Ok(mesh_api::SlotCommit::Committed { hash }) if hash == self_hash => {
+                        flipped += 1;
+                        if flip_abort == Some(flipped) {
+                            std::process::abort();
+                        }
+                    }
+                    Ok(mesh_api::SlotCommit::Committed { .. }) => {
+                        tracing::warn!(drive = %drive.display(), "meta 翻转内容是他人写入（hash 不符），不计入")
+                    }
+                    Ok(mesh_api::SlotCommit::Stale) => {
+                        stale = true;
+                        tracing::warn!(drive = %drive.display(), fence_token = t, "fence token 过期，槽位不翻转")
+                    }
+                    Ok(mesh_api::SlotCommit::Missing) => {
+                        tracing::warn!(drive = %drive.display(), "meta 翻转失败（无 .new）")
+                    }
+                    Err(e) => {
+                        tracing::warn!(drive = %drive.display(), error = %e, "meta 翻转失败")
+                    }
+                },
             }
         }
         if flipped > 0 {
             // ≥1 翻转 = 已提交（本机读扫全部副本可见）→ 键缓存增量
             self.note_cached_key(bucket, key);
+        }
+        if fence_token.is_some() && flipped == 0 && stale {
+            return Err(Error::Conflict(format!(
+                "fence token 过期：{bucket}/{key} 已由更新写者提交"
+            )));
         }
         Ok(flipped)
     }
@@ -1551,6 +1640,7 @@ impl Store {
         key: &str,
         m: &XlMeta,
         old: Option<&XlMeta>,
+        fence_token: Option<u64>,
     ) -> Result<usize> {
         // DP-0：写 prepare 阶段的传输错会被 quorum 计数吞掉（→ QuorumUnmet/500），
         // 必须在任何本地 .new 落盘前做混版 fail-closed。
@@ -1578,6 +1668,8 @@ impl Store {
             bucket: bucket.into(),
             key: key.into(),
             meta: bytes.clone(),
+            fence_token,
+            restore: false,
         };
         let mut prepared_remote = 0usize;
         for n in &cl.sets.flat.nodes {
@@ -1593,8 +1685,13 @@ impl Store {
         if prepared < q_s {
             // 一盘未翻转：清 .new（best-effort）→ QuorumUnmet，调用方回滚数据目录
             for drive in &self.cfg.drives {
-                if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
-                    let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                match fence_token {
+                    Some(t) => self.remove_meta_new_fenced(drive, bucket, key, t).await,
+                    None => {
+                        if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
+                            let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                        }
+                    }
                 }
             }
             for n in &cl.sets.flat.nodes {
@@ -1611,17 +1708,26 @@ impl Store {
 
         // ---- 阶段二：commit（本机单次；远端每节点至多两次机会——rename 幂等，.new 仍在） ----
         let mut flipped_local: Vec<u16> = Vec::new();
+        let mut stale = false;
         for (d, drive) in self.cfg.drives.iter().enumerate() {
             let slot = base + d as u16;
             if !prepared_local.contains(&slot) {
                 continue;
             }
-            match self.commit_meta_on(drive, bucket, key).await {
-                Ok((true, h)) if h == self_hash => flipped_local.push(slot),
-                Ok((true, _)) => {
+            match self.commit_meta_on(drive, bucket, key, fence_token).await {
+                Ok(mesh_api::SlotCommit::Committed { hash }) if hash == self_hash => {
+                    flipped_local.push(slot)
+                }
+                Ok(mesh_api::SlotCommit::Committed { .. }) => {
                     tracing::warn!(slot, "meta 翻转内容是他人写入（hash 不符），不计入")
                 }
-                Ok((false, _)) => tracing::warn!(slot, "meta 翻转失败（无 .new）"),
+                Ok(mesh_api::SlotCommit::Stale) => {
+                    stale = true;
+                    tracing::warn!(slot, "fence token 过期，槽位不翻转")
+                }
+                Ok(mesh_api::SlotCommit::Missing) => {
+                    tracing::warn!(slot, "meta 翻转失败（无 .new）")
+                }
                 Err(e) => tracing::warn!(slot, error = %e, "meta 翻转失败"),
             }
         }
@@ -1633,6 +1739,7 @@ impl Store {
             for attempt in 0..2 {
                 match cl.transport.commit_meta(&n.id, mw.clone()).await {
                     Ok(ack) => {
+                        stale |= ack.slots.iter().any(|s| s.stale);
                         let mut got = false;
                         for s in ack.slots.iter().filter(|s| s.ok) {
                             if s.hash == self_hash {
@@ -1669,10 +1776,16 @@ impl Store {
 
         // ---- 补偿回滚：**必须做**——已翻 ≥1 时任一 ≥Q_s 读集必含已翻副本，
         // 不补偿会让「已返回失败」的写被读到（评审 P1）
-        // 先清全节点的 .new 残骸（未翻槽位的暂存；翻过的槽位 .new 已被 rename 消费）
+        // 先清全节点的 .new 残骸（未翻槽位的暂存；翻过的槽位 .new 已被 rename 消费）。
+        // fenced 写只清 token 不更新的暂存——更新写者的 .new 必须保留（同 abort 语义）。
         for drive in &self.cfg.drives {
-            if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
-                let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+            match fence_token {
+                Some(t) => self.remove_meta_new_fenced(drive, bucket, key, t).await,
+                None => {
+                    if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
+                        let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
+                    }
+                }
             }
         }
         for n in &cl.sets.flat.nodes {
@@ -1686,13 +1799,20 @@ impl Store {
             let Some(drive) = self.cfg.drives.get(d) else {
                 continue;
             };
-            let restored = match old {
-                Some(om) => self.write_meta_on(drive, bucket, key, om).await,
-                None => {
-                    let dir = layout::object_dir_for(drive, bucket, key)?;
-                    let _ = tokio::fs::remove_file(dir.join(meta::META_FILE)).await;
-                    Ok(())
-                }
+            let restored = match fence_token {
+                // 同 token 回滚；当前已提交 token 更大时跳过（绝不覆盖新写）
+                Some(t) => self
+                    .restore_meta_fenced(drive, bucket, key, old, t)
+                    .await
+                    .map(|_| ()),
+                None => match old {
+                    Some(om) => self.write_meta_on(drive, bucket, key, om).await,
+                    None => {
+                        let dir = layout::object_dir_for(drive, bucket, key)?;
+                        let _ = tokio::fs::remove_file(dir.join(meta::META_FILE)).await;
+                        Ok(())
+                    }
+                },
             };
             if let Err(e) = restored {
                 tracing::error!(slot, error = %e, "meta 补偿恢复失败（留痕待 fsck）");
@@ -1703,39 +1823,159 @@ impl Store {
             let Some(node) = cl.sets.flat.nodes.get(node_idx) else {
                 continue;
             };
-            let restored: Result<()> = match old {
-                Some(om) => {
-                    // 用旧内容重跑 prepare+commit（rename 幂等；已翻槽位被恢复，未翻槽位 no-op）
-                    let ow = crate::mesh::MetaWrite {
-                        bucket: bucket.into(),
-                        key: key.into(),
-                        meta: bytes::Bytes::from(om.encode()?),
-                    };
-                    match cl.transport.prepare_meta(&node.id, ow.clone()).await {
-                        Ok(_) => cl.transport.commit_meta(&node.id, ow).await.map(|_| ()),
-                        Err(e) => Err(e),
-                    }
-                }
-                None => {
-                    cl.transport
-                        .delete_meta(
-                            &node.id,
-                            crate::mesh::MetaRead {
-                                bucket: bucket.into(),
-                                key: key.into(),
-                            },
-                        )
+            let restored: Result<()> = match fence_token {
+                Some(t) => {
+                    self.restore_meta_remote(&node.id, bucket, key, old, t)
                         .await
                 }
+                None => match old {
+                    Some(om) => {
+                        // 用旧内容重跑 prepare+commit（rename 幂等；已翻槽位被恢复，未翻槽位 no-op）
+                        let ow = crate::mesh::MetaWrite {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            meta: bytes::Bytes::from(om.encode()?),
+                            fence_token: None,
+                            restore: false,
+                        };
+                        match cl.transport.prepare_meta(&node.id, ow.clone()).await {
+                            Ok(_) => cl.transport.commit_meta(&node.id, ow).await.map(|_| ()),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => {
+                        cl.transport
+                            .delete_meta(
+                                &node.id,
+                                crate::mesh::MetaRead {
+                                    bucket: bucket.into(),
+                                    key: key.into(),
+                                },
+                            )
+                            .await
+                    }
+                },
             };
             if let Err(e) = restored {
                 tracing::error!(node = %node.id, slot, error = %e, "meta 补偿恢复失败（留痕待 fsck）");
             }
         }
         self.bump_quorum_unmet_write();
+        if fence_token.is_some() && stale {
+            return Err(Error::Conflict(format!(
+                "fence token 过期：{bucket}/{key} 已由更新写者提交（已补偿回滚）"
+            )));
+        }
         Err(Error::QuorumUnmet(format!(
             "meta 集群翻转 {flipped}/{q_s}，已补偿回滚"
         )))
+    }
+
+    /// 补偿恢复（本机槽，Phase 0 fenced）：同 token 回滚旧内容；当前已提交 token **更大**
+    /// 时跳过并 warn（绝不覆盖更新写）。`old = None` = 恢复为「不存在」，同样先比较 token。
+    /// 返回是否真的恢复了。
+    async fn restore_meta_fenced(
+        &self,
+        drive: &Path,
+        bucket: &str,
+        key: &str,
+        old: Option<&XlMeta>,
+        fence_token: u64,
+    ) -> Result<bool> {
+        let dir = layout::object_dir_for(drive, bucket, key)?;
+        let cur = match tokio::fs::read(dir.join(meta::META_FILE)).await {
+            Ok(bytes) => XlMeta::decode(&bytes)?.fence_token.unwrap_or(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        if cur > fence_token {
+            tracing::warn!(
+                drive = %drive.display(),
+                fence_token,
+                current = cur,
+                "补偿恢复跳过：已有更新 token"
+            );
+            return Ok(false);
+        }
+        match old {
+            Some(om) => {
+                // 旧内容 + 本次 token：回滚内容但不回退 fence 高水位
+                let mut m = om.clone();
+                m.fence_token = Some(fence_token);
+                self.write_meta_on(drive, bucket, key, &m).await?;
+            }
+            None => match tokio::fs::remove_file(dir.join(meta::META_FILE)).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        Ok(true)
+    }
+
+    /// 补偿恢复（远端节点，Phase 0 fenced）：旧内容带本次 token 重跑 prepare+restore-commit
+    /// （服务端仅在当前 token 更大时跳过）；`old = None` 先读回该节点 token，更新则跳过删除。
+    /// 调用方应在持有该键 fenced 锁时调用（否则检查-删除之间仍有理论窗口）。
+    async fn restore_meta_remote(
+        &self,
+        node: &str,
+        bucket: &str,
+        key: &str,
+        old: Option<&XlMeta>,
+        fence_token: u64,
+    ) -> Result<()> {
+        let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
+        match old {
+            Some(om) => {
+                let mut m = om.clone();
+                m.fence_token = Some(fence_token);
+                let ow = crate::mesh::MetaWrite {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    meta: bytes::Bytes::from(m.encode()?),
+                    fence_token: Some(fence_token),
+                    restore: true,
+                };
+                match cl.transport.prepare_meta(node, ow.clone()).await {
+                    Ok(_) => cl.transport.commit_meta(node, ow).await.map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            }
+            None => {
+                let snap = cl
+                    .transport
+                    .read_meta(
+                        node,
+                        crate::mesh::MetaRead {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                        },
+                    )
+                    .await?;
+                let cur = match snap.meta {
+                    Some(bytes) => XlMeta::decode(&bytes)?.fence_token.unwrap_or(0),
+                    None => 0,
+                };
+                if cur > fence_token {
+                    tracing::warn!(
+                        node,
+                        fence_token,
+                        current = cur,
+                        "补偿删除跳过：已有更新 token"
+                    );
+                    return Ok(());
+                }
+                cl.transport
+                    .delete_meta(
+                        node,
+                        crate::mesh::MetaRead {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                        },
+                    )
+                    .await
+            }
+        }
     }
 
     /// 清掉各盘对象目录里的 `xl.meta.new` 残骸（评审 R7：翻转全失败/半途遗留的暂存 meta）。

@@ -1,9 +1,10 @@
 //! Phase 0：控制对象（`.oss.sys` 保留命名空间内的 system-object）。
 //!
-//! 单机实现：CAS = 跨进程串行化（`lock_object`：进程内 per-key mutex + `flock`）+ 读旧
-//! meta + `expected_version`/`fence_token` 校验 + 现有 `write_meta` 提交。只要两个 Store
-//! 打开同一 root（同进程或不同进程），同一 key 的读-检-写互斥；`flock` 是本地文件系统上的
-//! advisory 锁，不覆盖网络文件系统/跨机器。集群 fenced commit 在 Task 3/5 接入（当前 Unsupported）。
+//! CAS = 串行化（`lock_object`：进程内 per-key mutex + `flock`，集群再加 quorum 租约锁）+
+//! 读旧 meta + `expected_version`/`fence_token` 校验 + fenced `write_meta` 提交（提交侧再按
+//! 已提交 token 拒绝过期写）。只要两个 Store 打开同一 root（同进程或不同进程），同一 key 的
+//! 读-检-写互斥；`flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
+//! get/list 的集群分支（quorum 读屏障）在 Task 5 接入（当前 Unsupported）。
 
 use md5::Digest as _;
 
@@ -35,7 +36,6 @@ impl Store {
         expected_version: Option<u64>,
         fence_token: u64,
     ) -> Result<u64> {
-        self.ensure_control_single_node()?;
         validate_control_key(key)?;
         if data.len() as u64 > meta::MAX_INLINE {
             return Err(Error::InvalidArgument(format!(
@@ -51,7 +51,8 @@ impl Store {
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
         let version = cur_version + 1;
         let m = control_meta(key, version, fence_token, Some(data), false);
-        self.commit_control_meta(key, &m, old.as_ref()).await?;
+        self.commit_control_meta(key, &m, old.as_ref(), fence_token)
+            .await?;
         Ok(version)
     }
 
@@ -86,7 +87,6 @@ impl Store {
         expected_version: Option<u64>,
         fence_token: u64,
     ) -> Result<bool> {
-        self.ensure_control_single_node()?;
         validate_control_key(key)?;
         let _guard = self.control_lock(key).await?;
         let old = self.read_meta(layout::SYS_DIR, key).await?;
@@ -99,7 +99,8 @@ impl Store {
             return Ok(false);
         }
         let m = control_meta(key, cur_version + 1, fence_token, None, true);
-        self.commit_control_meta(key, &m, Some(&old)).await?;
+        self.commit_control_meta(key, &m, Some(&old), fence_token)
+            .await?;
         Ok(true)
     }
 
@@ -159,9 +160,18 @@ impl Store {
         self.lock_object(layout::SYS_DIR, key).await
     }
 
-    /// 提交控制对象 meta（本地单盘/多盘走现有提交协议；集群已在上游拒绝）。
-    async fn commit_control_meta(&self, key: &str, m: &XlMeta, old: Option<&XlMeta>) -> Result<()> {
-        let flipped = self.write_meta(layout::SYS_DIR, key, m, old).await?;
+    /// 提交控制对象 meta：单盘/多盘/集群统一走 fenced 提交（调用方持有 fence token；
+    /// 持久化 token 发放为 Task 4/5）。过期 token 由提交侧返回 `Error::Conflict`。
+    async fn commit_control_meta(
+        &self,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+        fence_token: u64,
+    ) -> Result<()> {
+        let flipped = self
+            .write_meta_fenced(layout::SYS_DIR, key, m, old, Some(fence_token))
+            .await?;
         if flipped == 0 {
             return Err(Error::QuorumUnmet(format!(
                 "控制对象 {key:?} meta 未提交（0 槽翻转）"

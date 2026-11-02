@@ -169,6 +169,8 @@ fn meta_write_to_proto(m: mesh::MetaWrite) -> xl_proto::MetaWrite {
         bucket: m.bucket,
         key: m.key,
         meta: m.meta.to_vec(),
+        fence_token: m.fence_token,
+        restore: m.restore,
     }
 }
 
@@ -200,6 +202,8 @@ fn meta_write_from_proto(m: xl_proto::MetaWrite) -> mesh::MetaWrite {
         bucket: m.bucket,
         key: m.key,
         meta: m.meta.into(),
+        fence_token: m.fence_token,
+        restore: m.restore,
     }
 }
 
@@ -221,6 +225,7 @@ fn meta_ack_to_proto(a: mesh::MetaAck) -> xl_proto::MetaAck {
                 slot: s.slot as u32,
                 ok: s.ok,
                 hash: s.hash.to_vec(),
+                stale: s.stale,
             })
             .collect(),
         slots_ok: a.slots_ok,
@@ -243,6 +248,7 @@ fn meta_ack_from_proto(a: xl_proto::MetaAck) -> mesh::MetaAck {
                     slot: s.slot as u16,
                     ok: s.ok,
                     hash,
+                    stale: s.stale,
                 }
             })
             .collect(),
@@ -2235,6 +2241,8 @@ mod tests {
             bucket: "buck".into(),
             key: "k".into(),
             meta: meta.clone(),
+            fence_token: None,
+            restore: false,
         };
         let ack = mesh.prepare_meta("n1", mw.clone()).await.unwrap();
         assert!(ack.ok && ack.slots_ok == 2, "{ack:?}");
