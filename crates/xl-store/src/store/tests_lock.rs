@@ -800,3 +800,191 @@ async fn retention_guards_matrix() {
         .unwrap_err();
     assert!(matches!(e, Error::NoSuchBucket(_)), "{e:?}");
 }
+
+// ---------- Phase 0 Task 4：持久化单调 fence token（锁服务） ----------
+
+use super::tests::Cluster;
+use crate::mesh::{LockOp, LockReq};
+
+fn fenced_req(token: u64, op: LockOp, holder: &str) -> LockReq {
+    LockReq {
+        bucket: "bkt".into(),
+        key: "k".into(),
+        epoch_nanos: 1,
+        epoch_node: holder.into(),
+        holder: holder.into(),
+        ttl_ms: 1000,
+        op,
+        fence_token: token,
+    }
+}
+
+/// 同一 key 连续获取 token 严格递增；重建 Store 后仍大于上次；并发获取不重号。
+#[tokio::test]
+async fn fence_token_is_monotonic_across_restart_and_contenders() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let g1 = s.acquire_fenced_cluster_lock("bkt", "k").await.unwrap();
+    assert_eq!(g1.token, 1, "首个 token 从 1 开始");
+    let t1 = g1.token;
+    drop(g1);
+    let g2 = s.acquire_fenced_cluster_lock("bkt", "k").await.unwrap();
+    assert!(g2.token > t1, "连续获取必须递增：{} ≤ {t1}", g2.token);
+    let t2 = g2.token;
+    drop(g2);
+    drop(s);
+    // 重建 Store（同 root）：内存表清空，高水位必须从磁盘恢复。
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let g3 = s.acquire_fenced_cluster_lock("bkt", "k").await.unwrap();
+    assert!(g3.token > t2, "重启后必须仍严格递增：{} ≤ {t2}", g3.token);
+    drop(g3);
+    // 并发获取同一 key：成功者 token 互不相同（互斥失败亦合法，但不得同号）。
+    let (a, b) = tokio::join!(
+        s.acquire_fenced_cluster_lock("bkt", "race"),
+        s.acquire_fenced_cluster_lock("bkt", "race"),
+    );
+    let tokens: Vec<u64> = [a.as_ref().ok(), b.as_ref().ok()]
+        .into_iter()
+        .flatten()
+        .map(|g| g.token)
+        .collect();
+    assert!(!tokens.is_empty(), "并发获取至少一方成功");
+    let uniq: std::collections::HashSet<u64> = tokens.iter().copied().collect();
+    assert_eq!(tokens.len(), uniq.len(), "并发获取不得同号：{tokens:?}");
+}
+
+/// 两个独立 Store 打开同一 root（≈ 两个进程）：flock 串行化高水位读-改-写，
+/// 同一时刻只允许一方持有，token 不得重号。
+#[tokio::test]
+async fn fenced_token_not_duplicated_across_store_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let s1 = std::sync::Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let s2 = std::sync::Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+    let (a, b) = tokio::join!(
+        s1.acquire_fenced_cluster_lock("bkt", "k"),
+        s2.acquire_fenced_cluster_lock("bkt", "k"),
+    );
+    // 两个进程的锁表不共享，互斥由调用方的对象 flock 层保证；本层只管不重号。
+    let tokens: Vec<u64> = [a.as_ref().ok(), b.as_ref().ok()]
+        .into_iter()
+        .flatten()
+        .map(|g| g.token)
+        .collect();
+    assert!(!tokens.is_empty());
+    let uniq: std::collections::HashSet<u64> = tokens.iter().copied().collect();
+    assert_eq!(
+        tokens.len(),
+        uniq.len(),
+        "两个 Store 不得拿到同一 token：{tokens:?}"
+    );
+    let t1 = *tokens.iter().max().unwrap();
+    drop(a);
+    drop(b);
+    // 全部释放后重取：仍严格大于此前任何已发放 token。
+    let g = s1.acquire_fenced_cluster_lock("bkt", "k").await.unwrap();
+    assert!(g.token > t1, "必须递增：{} ≤ {t1}", g.token);
+}
+
+/// 节点拒绝过期提议并回报高水位；相等也拒；无 token 的数据面请求保持旧行为。
+#[tokio::test]
+async fn fenced_lock_rejects_stale_token_with_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let r = s
+        .mesh_lock(fenced_req(5, LockOp::Acquire, "h"))
+        .await
+        .unwrap();
+    assert!(r.granted);
+    assert_eq!(r.last_fence_token, 5);
+    assert!(
+        s.mesh_lock(fenced_req(5, LockOp::Release, "h"))
+            .await
+            .unwrap()
+            .granted
+    );
+
+    let r = s
+        .mesh_lock(fenced_req(4, LockOp::Acquire, "h"))
+        .await
+        .unwrap();
+    assert!(!r.granted, "更小 token 不得授予");
+    assert_eq!(r.last_fence_token, 5, "须回报 last_fence_token 供重试");
+    let r = s
+        .mesh_lock(fenced_req(5, LockOp::Acquire, "h"))
+        .await
+        .unwrap();
+    assert!(!r.granted, "相等 token 不得授予");
+    assert_eq!(r.last_fence_token, 5);
+
+    let r = s
+        .mesh_lock(fenced_req(6, LockOp::Acquire, "h"))
+        .await
+        .unwrap();
+    assert!(r.granted && r.last_fence_token == 6);
+    assert!(
+        s.mesh_lock(fenced_req(6, LockOp::Release, "h"))
+            .await
+            .unwrap()
+            .granted
+    );
+    // 数据面（fence_token = 0）：不做 fence 校验，旧语义逐字保留。
+    let mut legacy = fenced_req(0, LockOp::Acquire, "data");
+    legacy.epoch_nanos = 42;
+    assert!(s.mesh_lock(legacy).await.unwrap().granted);
+}
+
+/// 持久化文件损坏 → CorruptMeta（fail-closed），绝不回退 0 重新发号。
+#[tokio::test]
+async fn corrupt_fence_file_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let path = super::lock::fence_path(dir.path(), "bkt/k");
+    tokio::fs::create_dir_all(path.parent().unwrap())
+        .await
+        .unwrap();
+    for bad in [&b"not-a-number"[..], b"", b"-1", b"18446744073709551616"] {
+        tokio::fs::write(&path, bad).await.unwrap();
+        let e = s
+            .mesh_lock(fenced_req(1, LockOp::Acquire, "h"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::CorruptMeta(_)), "{bad:?} → {e:?}");
+        let e = s.acquire_fenced_cluster_lock("bkt", "k").await.unwrap_err();
+        assert!(matches!(e, Error::CorruptMeta(_)), "{bad:?} → {e:?}");
+    }
+}
+
+/// 集群：活租约不抢占（竞争者拿不到），释放后 token 严格递增；同盘重开后仍递增；
+/// 节点对过期 token 拒绝并回报高水位。
+#[tokio::test]
+async fn fenced_cluster_lock_tokens_unique_and_monotonic() {
+    let c = Cluster::new(4, 3).await;
+    let a = c.stores[0].clone();
+    let b = c.stores[1].clone();
+    let ga = a.acquire_fenced_cluster_lock("bkt", "k").await.unwrap();
+    let ta = ga.token;
+    let err = b.acquire_fenced_cluster_lock("bkt", "k").await.unwrap_err();
+    assert!(
+        matches!(err, Error::QuorumUnmet(_)),
+        "活租约竞争者不得授予（也不得同号）：{err:?}"
+    );
+    drop(ga);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let gb = b.acquire_fenced_cluster_lock("bkt", "k").await.unwrap();
+    assert!(gb.token > ta, "释放后重新获取必须递增：{} ≤ {ta}", gb.token);
+    let tb = gb.token;
+    drop(gb);
+    // 同批盘重开（≈ 节点重启）：高水位从各节点持久化文件恢复。
+    let c2 = Cluster::reopen_over(c.dirs.clone(), false).await;
+    let gc = c2.stores[2]
+        .acquire_fenced_cluster_lock("bkt", "k")
+        .await
+        .unwrap();
+    assert!(gc.token > tb, "重开后必须仍递增：{} ≤ {tb}", gc.token);
+    // 过期提议：拒绝 + 回报高水位。
+    let mut stale = fenced_req(gc.token, LockOp::Acquire, "stale");
+    stale.epoch_nanos = 99;
+    let r = c2.stores[0].mesh_lock(stale).await.unwrap();
+    assert!(!r.granted, "过期 token 不得授予");
+    assert!(r.last_fence_token >= gc.token, "{r:?}");
+}

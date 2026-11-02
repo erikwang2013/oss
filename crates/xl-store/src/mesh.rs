@@ -247,11 +247,15 @@ pub struct LockReq {
     pub holder: String,
     pub ttl_ms: u64,
     pub op: LockOp,
+    /// Phase 0：0 = 数据面旧行为（不校验）；>0 = fenced 控制锁提议的单调 token。
+    pub fence_token: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct LockResp {
     pub granted: bool,
+    /// Phase 0：本节点该键的 fence 高水位（旧节点缺省 0 = 未理解 fenced）。
+    pub last_fence_token: u64,
 }
 
 /// 控制面读扇出白名单（服务端 match 字面量 SQL；安全边界）。

@@ -940,11 +940,14 @@ impl Store {
 
     /// 服务端租约锁（Task 8 / 节点域）：本机锁表按授予规则处理（见 lock.rs 头注）——
     /// 仅空闲/过期可授、活租约不抢占、仅持有者 Renew/Release 有效。
+    /// Phase 0 Task 4：`fence_token > 0` 的授予先持久化高水位（fail-closed），
+    /// 应答携带 `last_fence_token` 供协调者重试。
     pub async fn mesh_lock(&self, req: crate::mesh::LockReq) -> Result<crate::mesh::LockResp> {
         let key = format!("{}/{}", req.bucket, req.key);
-        let ttl = std::time::Duration::from_millis(req.ttl_ms.max(1));
+        let granted = self.apply_lock(&req, true).await?;
         Ok(crate::mesh::LockResp {
-            granted: self.lock_table().apply(&key, &req, ttl),
+            granted,
+            last_fence_token: self.lock_table().last_fence_token(&key),
         })
     }
 

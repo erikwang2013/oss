@@ -95,9 +95,13 @@ message NodeHealth { string node_id=1; string version=2; repeated SlotState slot
 message SlotState { uint32 slot=1; bool up=2; }
 message DriveSpace { uint32 set=1; uint32 drive=2; uint64 free_bytes=3; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;
-                  string holder=5; uint64 ttl_ms=6; LockOp op=7; }
+                  string holder=5; uint64 ttl_ms=6; LockOp op=7;
+                  // Phase 0：0 = 数据面旧行为（不校验）；>0 = fenced 控制锁提议的单调 token。
+                  uint64 fence_token=8; }
 enum LockOp { ACQUIRE=0; RENEW=1; RELEASE=2; }
-message LockResp { bool granted=1; }
+message LockResp { bool granted=1;
+                   // Phase 0：本节点该键的 fence 高水位（旧节点缺省 0 = 未理解 fenced）。
+                   uint64 last_fence_token=2; }
 message ControlReq { ControlKind kind=1; string a=2; string b=3; uint32 c=4; int64 uid=5; }
 enum ControlKind { ACCESS_KEY=0; PERMISSION=1; OWNED_BUCKETS=2; VISIBLE_BUCKETS=3; BUCKET_OWNER=4;
                    // M4 切片 8：桶 → set（a = bucket）；found=false = 无行（set 字段仅在 found=true 有效）

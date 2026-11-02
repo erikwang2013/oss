@@ -4689,6 +4689,7 @@ async fn lock_grant_rules_primitive() {
         holder: holder.into(),
         ttl_ms: 1000,
         op,
+        fence_token: 0,
     };
     let ttl = std::time::Duration::from_millis(1000);
     let zero = std::time::Duration::ZERO;

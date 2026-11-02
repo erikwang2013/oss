@@ -845,12 +845,14 @@ impl MeshTransport for TonicMesh {
                 holder: req.holder,
                 ttl_ms: req.ttl_ms,
                 op: op as i32,
+                fence_token: req.fence_token,
             })
             .await
             .map_err(|e| rpc_err(n, e))?
             .into_inner();
         Ok(mesh::LockResp {
             granted: resp.granted,
+            last_fence_token: resp.last_fence_token,
         })
     }
     async fn control_write(&self, node: &str, w: mesh::ControlWrite) -> Result<()> {
@@ -1769,11 +1771,13 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 holder: l.holder,
                 ttl_ms: l.ttl_ms,
                 op,
+                fence_token: l.fence_token,
             })
             .await
             .map_err(internal)?;
         Ok(tonic::Response::new(xl_proto::LockResp {
             granted: resp.granted,
+            last_fence_token: resp.last_fence_token,
         }))
     }
     async fn control_write(

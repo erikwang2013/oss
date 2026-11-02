@@ -122,7 +122,10 @@ impl MeshTransport for FakeMesh {
         })
     }
     async fn lock(&self, _: &str, _: LockReq) -> Result<LockResp> {
-        Ok(LockResp { granted: true })
+        Ok(LockResp {
+            granted: true,
+            last_fence_token: 0,
+        })
     }
     async fn control_query(&self, _: &str, _: ControlQuery) -> Result<Option<ControlRow>> {
         Ok(None)
@@ -447,6 +450,7 @@ async fn health_and_control_plane_stay_reachable() {
         holder: "h".into(),
         ttl_ms: 1000,
         op: crate::mesh::LockOp::Acquire,
+        fence_token: 0,
     };
     assert!(g.lock("n2", lock).await.unwrap().granted);
     assert!(
