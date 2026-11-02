@@ -121,10 +121,35 @@ pub fn object_dir(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
     Ok(bucket_dir(root, bucket).join(object_dir_name(key)?))
 }
 
+/// `.oss.sys` 下由内核/运维直接占用的子项（目录或文件）。系统对象的展平键落在
+/// `.oss.sys/<flat>`，与这些名字同名会被 `purge_key` 的 `remove_dir_all` 连带删除。
+const RESERVED_SYS_ENTRIES: &[&str] = &[
+    "drive-id",
+    "fsck",
+    "kms",
+    "locks",
+    "master.key",
+    "orphan",
+    "shrink",
+    "tee",
+    "tmp",
+    "topo",
+    "trash",
+];
+
 /// 保留命名空间的内部寻址：跳过桶名校验（[`SYS_DIR`] 必被 [`object_dir`] 拒绝），
-/// 键仍过同一套校验。**S3 数据面入口保持 [`object_dir`]，不得改用它。**
+/// 键仍过同一套校验；首段不得与保留的系统子项同名。
+/// **S3 数据面入口保持 [`object_dir`]，不得改用它。**
 pub fn object_dir_system(root: &Path, key: &str) -> Result<PathBuf> {
     validate_key(key)?;
+    if let Some(first) = key.split('/').next()
+        && RESERVED_SYS_ENTRIES.contains(&first)
+    {
+        return Err(Error::InvalidKey(format!(
+            "{}: 与保留系统子项同名",
+            key.escape_debug()
+        )));
+    }
     Ok(bucket_dir(root, SYS_DIR).join(object_dir_name(key)?))
 }
 
@@ -177,6 +202,36 @@ mod tests {
         // 拼接路径时桶名参数同样收口校验
         assert!(object_dir(Path::new("/tmp/root"), "..", "k").is_err());
         assert!(object_dir(Path::new("/tmp/root"), "../../etc", "k").is_err());
+    }
+
+    #[test]
+    fn object_dir_system_rejects_reserved_sys_entries() {
+        // 系统对象的展平键与 `.oss.sys` 下真实子项同名 → purge_key 会删掉系统目录
+        let root = Path::new("/tmp/root");
+        for key in [
+            "tmp",
+            "trash/x",
+            "locks",
+            "tee/a",
+            "drive-id",
+            "orphan/x",
+            "topo",
+            "shrink/x",
+            "kms",
+            "master.key",
+            "fsck/x",
+        ] {
+            assert!(
+                matches!(object_dir_system(root, key), Err(Error::InvalidKey(_))),
+                "{key} 应与保留系统子项冲突"
+            );
+        }
+        // 非首段的同名段展平后路径不同，不碰撞
+        assert!(object_dir_system(root, "control/tmp").is_ok());
+        assert_eq!(
+            object_dir_system(root, "control/a").unwrap(),
+            root.join(SYS_DIR).join("control__XLDIR__a")
+        );
     }
 
     #[test]

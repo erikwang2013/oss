@@ -96,7 +96,10 @@ async fn system_bucket_is_hidden_from_list_and_delete() {
         .unwrap();
     let buckets = s.list_buckets().await.unwrap();
     assert!(buckets.iter().all(|b| b.name != layout::SYS_DIR));
-    assert!(s.delete_bucket(layout::SYS_DIR).await.is_err());
+    assert!(matches!(
+        s.delete_bucket(layout::SYS_DIR).await,
+        Err(Error::NoSuchBucket(_))
+    ));
     // 内部路径可达保留命名空间；S3 入口仍拒绝
     let p = layout::object_dir_for(s.cfg.root(), layout::SYS_DIR, "control/manifest").unwrap();
     assert_eq!(
@@ -107,6 +110,72 @@ async fn system_bucket_is_hidden_from_list_and_delete() {
             .join("control__XLDIR__manifest")
     );
     assert!(layout::object_dir(s.cfg.root(), layout::SYS_DIR, "control/manifest").is_err());
+}
+
+#[tokio::test]
+async fn system_meta_roundtrips_through_internal_paths() {
+    let (s, d) = store().await;
+    let m = XlMeta {
+        object_key: "control/a".into(),
+        versions: vec![],
+    };
+    // write_meta_on / read_meta 覆盖内部 meta 路由的两个收口（其余提交/补偿路径同源）
+    s.write_meta_on(d.path(), layout::SYS_DIR, "control/a", &m)
+        .await
+        .unwrap();
+    assert_eq!(read_disk_meta(&s, layout::SYS_DIR, "control/a").await, m);
+    assert!(
+        d.path()
+            .join(layout::SYS_DIR)
+            .join("control__XLDIR__a")
+            .join(meta::META_FILE)
+            .is_file()
+    );
+    // 枚举器看不到保留命名空间
+    let (keys, buckets) = s.collect_namespace().await.unwrap();
+    assert!(keys.iter().all(|(b, _)| b != layout::SYS_DIR));
+    assert!(buckets.iter().all(|b| b != layout::SYS_DIR));
+    assert!(
+        !s.mesh_list_buckets()
+            .await
+            .unwrap()
+            .iter()
+            .any(|b| b == layout::SYS_DIR)
+    );
+}
+
+#[tokio::test]
+async fn system_namespace_cannot_be_listed() {
+    let (s, d) = store().await;
+    let m = XlMeta {
+        object_key: "control/a".into(),
+        versions: vec![],
+    };
+    s.write_meta_on(d.path(), layout::SYS_DIR, "control/a", &m)
+        .await
+        .unwrap();
+
+    // 直连键集扫描（mesh ListLocal 的底层）拒绝系统桶
+    let err = s
+        .collect_keys_filtered(layout::SYS_DIR, "", None, false, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NoSuchBucket(_)));
+
+    // 服务端 ListLocal 回空页：控制键不外泄
+    let resp = s
+        .mesh_list_local(crate::mesh::ListLocal {
+            bucket: layout::SYS_DIR.into(),
+            prefix: String::new(),
+            delimiter: None,
+            marker: None,
+            marker_exclusive: false,
+            limit: 1000,
+            include_deleted: false,
+        })
+        .await
+        .unwrap();
+    assert!(resp.entries.is_empty() && resp.prefixes.is_empty());
 }
 
 #[tokio::test]

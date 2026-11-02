@@ -339,6 +339,11 @@ impl Store {
         exclusive: bool,
         apply_cap: bool,
     ) -> Result<Vec<String>> {
+        // 保留命名空间不可列举：它是键集扫描的最终收口（键缓存禁用后的回退、mesh
+        // ListLocal 的底层都经这里），防止控制对象经列举面外泄。
+        if layout::is_system_bucket(bucket) {
+            return Err(Error::NoSuchBucket(bucket.to_string()));
+        }
         static MAX_KEYS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let max_keys = *MAX_KEYS.get_or_init(|| {
             std::env::var("OSS_LIST_MAX_KEYS")
