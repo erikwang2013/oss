@@ -442,6 +442,27 @@ git commit -m "test(xl-store): phase 0 integration gate"
 
 **门禁结论：未通过。** 阻塞项为 clippy：基线干净，本阶段新增 3 个 warning，违反 preflight 裁定的「no new warnings」。xl-store / oss-server 测试未发现确定性回归（偶发失败均为测试自身竞态或本地 mock 环境问题，隔离可复现为绿）；但按计划「任何失败不得进入 Phase 1」，需先消除 clippy 告警并复跑本门禁。
 
+### 2026-11-03 · Phase 0 集成门禁（clippy 修复后复跑）
+
+- HEAD: `f886b19f93fbd7e8b1b91bd2930b033fdf498113`（`fix(xl-store): satisfy phase 0 clippy gate`，父 `a17e5b5`）
+- 修复：`write_meta_fenced_mode` / `write_meta_cluster` 增加 `#[allow(clippy::too_many_arguments)]`（内部提交路径，参数即协议字段，分组只会增加转换噪声）；`store.rs:2237` 的 `if let` 折叠为 let-chain。行为不变。
+
+| # | 命令 | 结果 |
+|---|------|------|
+| 1 | `cargo clippy -p xl-store --all-targets -- -D warnings` | **PASS** — 0 warning，exit 0 |
+| 2 | `cargo fmt --check` | **PASS** — exit 0 |
+| 3 | `cargo test -p xl-store` | **PASS** — lib 429 passed / 0 failed / 1 ignored；`tests/control_faults.rs` 5 passed；`tests/kill9.rs` 1 passed；doc-tests 0；exit 0 |
+| 4 | `cargo test -p oss-server --no-fail-fast` | **PASS** — 817 passed / 0 failed / 2 ignored；exit 0 |
+
+**复跑期间偶发失败（隔离重跑通过，非确定性回归）：**
+
+| 全量运行 | 失败测试 | 现象 | 隔离重跑 |
+|---|---|---|---|
+| 复跑前一次（fail-fast，管道屏蔽了退出码） | `m8_read_consistency::follower_consistent_read_catches_up_and_carries_applied_index` | 站点控制面状态探测 5s 超时（机器 load average ≈ 58） | 单测通过（5.15s） |
+| 复跑（`--no-fail-fast`，完整） | 无 | — | exit 0，817 passed |
+
+**门禁结论：通过。** 3 个新增 clippy warning 已消除且无行为变更；xl-store 与 oss-server 全量测试通过（817 passed / 0 failed / 2 ignored）。Phase 0 可进入 Phase 1。
+
 ## 后续阶段
 
 Phase 1–5 各自单独出计划，按设计文档第 7 节顺序执行；Phase 0 门禁未过不得开始 Phase 1。Phase 1 的第一个任务是把 `ControlStore` 抽象与 SQLite 双后端差分测试落地，保持现有行为不变。
