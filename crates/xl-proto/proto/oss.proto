@@ -65,7 +65,9 @@ message SlotAck { uint32 slot=1; bool ok=2; bytes hash=3;
                   bool stale=4; }
 message MetaAck { bool ok=1; string msg=2; repeated SlotAck slots=3; uint32 slots_ok=4; }
 message MetaRead  { string bucket=1; string key=2; }
-message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4; }
+// best_copies：返回的 meta 在该节点本地恰好相同的槽数（仅 .oss.sys 控制读填充；
+// 数据面为 0）。quorum 确认读用它按内容累计副本数。
+message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4; uint32 best_copies=5; }
 message BucketRef { string bucket=1; }  message BucketsResp { repeated string names=1; }
 message ListReq { string bucket=1; string prefix=2; string delimiter=3; string marker=4; uint32 limit=5;
                   bool include_deleted=6;

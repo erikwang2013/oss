@@ -5912,6 +5912,59 @@ async fn system_object_read_reflects_committed_write_on_follower() {
     assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
 }
 
+/// Task 6 修复：集群 system-object 读必须按**内容相同的副本数**确认版本。
+/// v1 已提交到 6 槽（Q_s=3）；1 槽被种入写者崩溃留下的亚 quorum v2 半翻副本
+/// （epoch/token 更高，max-rank 读会选中它）。quorum 读必须返回 v1。
+/// v2 真正提交后（≥ Q_s 槽）必须胜出，且之后的 CAS 不被半翻版本顶死。
+#[tokio::test]
+async fn system_object_quorum_read_ignores_sub_quorum_partial_copy() {
+    let c = Cluster::new(3, 2).await;
+    let k = "control/quorum-read";
+    let a = &c.stores[0];
+    let b = &c.stores[1];
+    assert_eq!(a.put_system_object(k, b"v1", None, 1).await.unwrap(), 1);
+    // 半翻副本：从已提交 v1 派生，抬 epoch/token（保证 max-rank 更高）
+    let mut partial = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    partial.control_version = Some(2);
+    partial.fence_token = Some(2);
+    partial.versions[0].epoch = Some(2);
+    partial.versions[0].mod_time_nanos += 1;
+    partial.versions[0].inline = Some(crate::meta::InlineData {
+        bytes: b"partial".to_vec(),
+    });
+    a.write_meta_on(&c.dirs[0][0], layout::SYS_DIR, k, &partial)
+        .await
+        .unwrap();
+
+    // follower 读：本机 2 槽 v1 + n1（1 半翻 + 1 v1）+ n3 2 槽 v1
+    let obj = b.get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(
+        (obj.version, obj.fence_token),
+        (1, 1),
+        "亚 quorum 半翻版本不得胜出"
+    );
+    assert_eq!(&obj.data[..], b"v1");
+
+    // 真实提交 v2：CAS 以 quorum 确认的 v1 为基线（不被半翻版本顶死）
+    assert_eq!(b.put_system_object(k, b"v2", Some(1), 2).await.unwrap(), 2);
+    let obj = b.get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v2");
+    assert_eq!(obj.version, 2);
+    assert!(obj.fence_token > 2, "提交 token 必须高于半翻副本：{obj:?}");
+    // 全槽一致：半翻副本已被真实提交覆盖
+    for d in c.dirs.iter().flatten() {
+        let m = disk_meta(d, layout::SYS_DIR, k).await;
+        assert_eq!(m.control_version, Some(2), "{}", d.display());
+        assert_eq!(m.fence_token, Some(obj.fence_token), "{}", d.display());
+        assert_eq!(
+            &m.latest().unwrap().inline.as_ref().unwrap().bytes[..],
+            b"v2",
+            "{}",
+            d.display()
+        );
+    }
+}
+
 /// 停 2 节点：集群写必须 fail-closed（token 下限的 quorum 读覆盖不足 →
 /// CorruptMeta；若读通过则 fenced 锁拿不到 Q_n → QuorumUnmet），且不留下可见写入。
 #[tokio::test]

@@ -1246,7 +1246,7 @@ impl Store {
     /// 副本** → `Err(CorruptMeta)`（fail-closed，不把「盘上有坏 meta」伪装成 404）。
     async fn read_meta(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return self.read_meta_cluster(bucket, key, false).await;
+            return self.read_meta_cluster(bucket, key, false, false).await;
         }
         // 路径先统一解析（错误口径同串行：首个坏路径即上抛），再并发读各盘；
         // 结果按盘序处理，秩并列时仍取靠前盘——与逐盘串行版逐字节一致。
@@ -1306,11 +1306,16 @@ impl Store {
     /// 相交证明：提交 ≥Q_s 与读覆盖 ≥Q_s 在槽位域必相交 → 最新已提交版本必在覆盖内；
     /// 覆盖 ≥Q_s 且无副本 → 缺席可证明（任何已提交副本都落在覆盖交集里）。
     /// `full=false` 快路径提前停；`full=true` 收满全部响应（get_object 的回退一次）。
+    ///
+    /// `quorum=true`（仅 `.oss.sys` 控制对象）：按**内容相同的副本数**确认版本——
+    /// 取副本数 ≥ `Q_s` 的最高版本；亚 quorum 的半翻版本（写者崩溃后 1..k 槽已翻、
+    /// 未达提交阈）永远不可见。max-rank 选举只在数据面/非 quorum 模式使用。
     async fn read_meta_cluster(
         &self,
         bucket: &str,
         key: &str,
         full: bool,
+        quorum: bool,
     ) -> Result<Option<XlMeta>> {
         // DP-0：混版集群在扇出前 fail-closed（集群读吞传输错 → 不清 503 会退化成 500）。
         self.ensure_data_plane_compatible().await?;
@@ -1322,6 +1327,9 @@ impl Store {
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0usize;
+        // quorum 模式：内容 hash → (meta, 已确认副本数)。hash 用规范编码（写路径同源）。
+        let mut groups: std::collections::HashMap<[u8; 32], (XlMeta, usize)> =
+            std::collections::HashMap::new();
 
         // 本机各盘扫描（就地计数：NotFound 也是确定性观察；IO/解码错误不计）
         for drive in &self.cfg.drives {
@@ -1333,9 +1341,17 @@ impl Store {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
                         covered += 1;
-                        let t = m.rank();
-                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                            best = Some((t, m));
+                        if quorum {
+                            let enc = m.encode()?;
+                            groups
+                                .entry(crate::mesh::content_hash(&enc))
+                                .and_modify(|(_, n)| *n += 1)
+                                .or_insert((m, 1));
+                        } else {
+                            let t = m.rank();
+                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                best = Some((t, m));
+                            }
                         }
                     }
                     Ok(m) => {
@@ -1372,12 +1388,21 @@ impl Store {
                 match res {
                     Ok(snap) => {
                         covered += snap.slots_ok as usize;
+                        let remote_copies = snap.best_copies as usize;
                         if let Some(meta_bytes) = snap.meta {
                             match XlMeta::decode(&meta_bytes) {
                                 Ok(m) if m.object_key == key => {
-                                    let t = m.rank();
-                                    if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                                        best = Some((t, m));
+                                    if quorum {
+                                        // 远端已按内容数过本地相同副本；hash 与本地同源
+                                        groups
+                                            .entry(crate::mesh::content_hash(&meta_bytes))
+                                            .and_modify(|(_, n)| *n += remote_copies)
+                                            .or_insert((m, remote_copies));
+                                    } else {
+                                        let t = m.rank();
+                                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                            best = Some((t, m));
+                                        }
                                     }
                                 }
                                 Ok(m) => {
@@ -1405,6 +1430,39 @@ impl Store {
                 "meta 覆盖不足 quorum：{covered}/{q_s}（分区/节点不可达时拒绝读，fail-closed）"
             )));
         }
+        if quorum {
+            if groups.is_empty() {
+                // 覆盖 ≥ Q_s 且无任何副本：缺席落在读写 quorum 的交集里，可证明不存在
+                return Ok(None);
+            }
+            let mut candidates: Vec<(XlMeta, usize)> = groups
+                .into_values()
+                // 只接受副本数 ≥ Q_s 的版本；亚 quorum 半翻版本永远不可见
+                .filter(|(_, n)| *n >= q_s)
+                .collect();
+            let version_key =
+                |m: &XlMeta| (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0));
+            candidates.sort_by_key(|(m, _)| version_key(m));
+            return match candidates.pop() {
+                Some((m, _)) => {
+                    // 同版本不同内容 = 分叉，无法判定哪份是提交版本 → fail-closed
+                    if candidates
+                        .last()
+                        .is_some_and(|(prev, _)| version_key(prev) == version_key(&m))
+                    {
+                        Err(Error::CorruptMeta(format!(
+                            "控制对象 {key:?} 同版本分叉：v{} 有多份不同内容",
+                            m.control_version.unwrap_or(0)
+                        )))
+                    } else {
+                        Ok(Some(m))
+                    }
+                }
+                None => Err(Error::CorruptMeta(format!(
+                    "meta 无 quorum 版本：覆盖 {covered}/{q_s}，存在副本但均未达提交阈"
+                ))),
+            };
+        }
         match best {
             Some((_, m)) => Ok(Some(m)),
             None => match corrupt {
@@ -1414,12 +1472,21 @@ impl Store {
         }
     }
 
+    /// 控制对象专用 quorum 确认读（见 [`Self::read_meta_cluster`] 的 `quorum`）。
+    /// 单机/多盘保持 Task 2 语义（唯一/多盘翻转即提交）。
+    async fn read_meta_quorum_confirmed(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
+        if self.cfg.cluster.is_some() {
+            return self.read_meta_cluster(bucket, key, true, true).await;
+        }
+        self.read_meta(bucket, key).await
+    }
+
     /// 全量扇出版（不提前停）：get_object 在快路径集合的数据轮失败后的**回退一次**——
     /// 防「提前停时恰有掉队者持最新已提交版本」的小窗口（Task 6 末位评审项）。
     /// 单节点退化为普通 read_meta。
     async fn read_meta_full(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return self.read_meta_cluster(bucket, key, true).await;
+            return self.read_meta_cluster(bucket, key, true, false).await;
         }
         self.read_meta(bucket, key).await
     }

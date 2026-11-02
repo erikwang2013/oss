@@ -963,6 +963,9 @@ impl Store {
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0u32;
+        // 控制对象 quorum 确认读：按内容统计「返回的最优副本」在本地有几个相同槽。
+        let with_copies = layout::is_system_bucket(&r.bucket);
+        let mut decoded: Vec<XlMeta> = Vec::new();
         for drive in &self.cfg.drives {
             if !drives::drive_up(drive).await {
                 continue;
@@ -975,7 +978,12 @@ impl Store {
                         // 与 store.rs 的 read_meta 选举同口径（rank = (epoch, 链尾 mod_time)）：
                         // 服务端 RPC 是独立选举点，回拨场景漏改会把低 epoch 旧链当最优返回
                         let t = m.rank();
-                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                        if with_copies {
+                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                best = Some((t, m.clone()));
+                            }
+                            decoded.push(m);
+                        } else if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                             best = Some((t, m));
                         }
                     }
@@ -991,6 +999,15 @@ impl Store {
                 Err(e) => corrupt = Some(e.to_string()),
             }
         }
+        // 相同内容的本地槽数：用解码后的结构相等（编码器对同一结构是确定的）。
+        // `slots_ok` 含 NotFound/其他版本槽，不能当副本数用。
+        let best_copies = if with_copies {
+            best.as_ref()
+                .map(|(_, bm)| decoded.iter().filter(|m| *m == bm).count() as u32)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         match best {
             Some((t, m)) => Ok(crate::mesh::MetaSnapshot {
                 meta: Some(bytes::Bytes::from(m.encode()?)),
@@ -998,6 +1015,7 @@ impl Store {
                 // 此字段只带墙钟分量供诊断，不参与判定
                 mod_time_nanos: t.1,
                 slots_ok: covered,
+                best_copies,
             }),
             None => {
                 if let Some(why) = corrupt {
@@ -1008,6 +1026,7 @@ impl Store {
                     meta: None,
                     mod_time_nanos: i64::MIN,
                     slots_ok: covered,
+                    best_copies: 0,
                 })
             }
         }

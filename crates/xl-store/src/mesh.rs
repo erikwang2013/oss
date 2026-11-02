@@ -126,6 +126,10 @@ pub struct MetaSnapshot {
     pub meta: Option<Bytes>,
     pub mod_time_nanos: i64,
     pub slots_ok: u32,
+    /// `meta` 在该节点本地**内容相同**的槽数（仅 `.oss.sys` 读填充；数据面为 0）。
+    /// 控制对象的 quorum 确认读按内容累计副本数，不能用 `slots_ok`（它含 NotFound
+    /// 与其他版本的槽）。
+    pub best_copies: u32,
 }
 
 /// LIST 并集条目：`max_mod_time_nanos` = 该节点本地各槽副本的每键最大 mod_time。

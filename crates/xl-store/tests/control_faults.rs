@@ -6,7 +6,9 @@
 //!
 //! 场景矩阵（brief Task 6）：
 //! 1. token 1 prepare 后崩溃 → token 2 提交 → token 1 重试必须 Conflict，token 2 内容胜。
-//! 2. token 1 翻 1 槽后崩溃 → 重启读到的永远是完整版本（旧 / token 1）；token 2 提交后胜出。
+//! 2. 单机多盘 `>=1 翻转 = 已提交` 契约：token 1 翻 1 槽后崩 → 重启可见完整 token 1；
+//!    token 2 提交后胜出。集群 quorum 可见性不在本机契约内，见单测
+//!    `system_object_quorum_read_ignores_sub_quorum_partial_copy`（亚 quorum 半翻不可见）。
 //! 3. 过期写者在新 token 之后提交/恢复 → 每槽 `Stale`，新 token 内容原样保留。
 //! 4. 分区 < Q_s → 读 `CorruptMeta`、写 fail-closed，无陈旧成功；恢复后旧值不变。
 //! 5. `inline_threshold = 0`（stretch 强制配置）→ system object 仍内联且可读写。
@@ -86,11 +88,14 @@ async fn control_crash_before_commit_keeps_newer_token() {
     }
 }
 
-/// 场景 2：token 1 翻 1 槽后崩；重启读到的是完整版本（绝不半截）；token 2 提交后胜出。
+/// 场景 2：**单机多盘（非集群）契约：≥1 槽翻转即提交**——token 1 翻 1 槽后崩，
+/// 重启读到的是完整 token 1；token 2 提交后胜出。这里断言的不是 quorum 可见性：
+/// 集群下亚 quorum 半翻版本必须不可见，由单测
+/// `system_object_quorum_read_ignores_sub_quorum_partial_copy` 覆盖。
 #[tokio::test]
-async fn control_crash_mid_commit_then_newer_token_wins() {
+async fn single_node_multi_drive_one_flip_is_committed() {
     const KEY: &str = "control/crash-mid-commit";
-    const TEST: &str = "control_crash_mid_commit_then_newer_token_wins";
+    const TEST: &str = "single_node_multi_drive_one_flip_is_committed";
 
     if std::env::var(CHILD).is_ok() {
         let dirs = dirs_from_env();
@@ -115,7 +120,8 @@ async fn control_crash_mid_commit_then_newer_token_wins() {
     // 崩溃现场：恰 1 槽已提交，其余 11 槽仍是 `.new`
     assert_eq!(slot_counts(&dirs, KEY), (1, N_DRIVES - 1));
 
-    // ---- 段 2：重启读——可见版本必须完整（token 1 全量或不存在），绝不半截 ----
+    // ---- 段 2：单机多盘契约（非 quorum）：≥1 槽翻转即已提交，读到的必须是完整
+    // token 1 版本（盘上无半截字节），不是空/旧版本 ----
     let s = open_store(&dirs, None, false).await;
     let obj = s
         .get_system_object(KEY)
@@ -242,7 +248,19 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
         b"new"
     );
 
-    // 过期写者的 `.new` 残骸由 abort(token 1) 清掉（更新写者的暂存不会被清）
+    // 更新写者（token 2）暂存自己的 `.new`：abort(token 1) 不得清掉它
+    let new_bytes = Bytes::from(std::fs::read(control_dir(&dirs[0], KEY).join("xl.meta")).unwrap());
+    let ack = s
+        .mesh_prepare_meta(MetaWrite {
+            bucket: layout::SYS_DIR.into(),
+            key: KEY.into(),
+            meta: new_bytes.clone(),
+            fence_token: Some(2),
+            restore: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(ack.slots.iter().filter(|x| x.ok).count(), N_DRIVES);
     s.mesh_abort_meta(MetaWrite {
         bucket: layout::SYS_DIR.into(),
         key: KEY.into(),
@@ -252,7 +270,33 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
     })
     .await
     .unwrap();
+    assert_eq!(
+        slot_counts(&dirs, KEY),
+        (N_DRIVES, N_DRIVES),
+        "abort(token 1) 必须保留更新写者的 `.new`"
+    );
+    for d in &dirs {
+        let staged = xl_store::meta::XlMeta::decode(
+            &std::fs::read(control_dir(d, KEY).join("xl.meta.new")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged.fence_token, Some(2), "{}", d.display());
+    }
+    // 更新写者自己的 abort 才清理暂存
+    s.mesh_abort_meta(MetaWrite {
+        bucket: layout::SYS_DIR.into(),
+        key: KEY.into(),
+        meta: Bytes::new(),
+        fence_token: Some(2),
+        restore: false,
+    })
+    .await
+    .unwrap();
     assert_eq!(slot_counts(&dirs, KEY), (N_DRIVES, 0));
+    // 已提交版本不受 abort 影响
+    let obj = s.get_system_object(KEY).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"new");
+    assert_eq!((obj.version, obj.fence_token), (2, 2));
 }
 
 /// 场景 4：分区 < Q_s。摘掉 4 盘后：quorum 读 `CorruptMeta`、写 fail-closed；
@@ -280,10 +324,10 @@ async fn partition_below_quorum_fails_closed_read_and_write() {
             N_DRIVES
         ),
     }
-    // 写：CorruptMeta（token 下限的 quorum 读先失败）或 QuorumUnmet（prepare 不足）
+    // 写：先在 `control_token_floor` 的 quorum 读处失败，只可能是 CorruptMeta
     match s.put_system_object(KEY, b"v2", Some(1), 2).await {
-        Err(Error::CorruptMeta(_) | Error::QuorumUnmet(_)) => {}
-        other => panic!("分区写必须 fail-closed：{other:?}"),
+        Err(Error::CorruptMeta(_)) => {}
+        other => panic!("分区写必须 fail-closed 于 token 下限读：{other:?}"),
     }
     // 分区期间不得留下任何 `.new` 提交意图
     for d in &dirs[..N_DRIVES - 4] {
@@ -312,6 +356,9 @@ async fn partition_below_quorum_fails_closed_read_and_write() {
 
 /// 场景 5：`inline_threshold = 0`（stretch 启动强制值）下，system object 仍内联在
 /// `xl.meta` 里、可读写；普通数据对象则确实走分片（证明阈值生效）。
+///
+/// shortcut: 用 forced `inline_threshold=0` 代理真实 2-site stretch 拓扑，
+/// Phase 5 必须补真实 stretch e2e（跨站点读写 + system object 内联可见性）。
 #[tokio::test]
 async fn control_objects_stay_inline_with_zero_inline_threshold() {
     const KEY: &str = "control/inline";

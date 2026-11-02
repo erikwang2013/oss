@@ -69,6 +69,7 @@ impl MeshTransport for FakeMesh {
             meta: None,
             mod_time_nanos: 0,
             slots_ok: 0,
+            best_copies: 0,
         })
     }
     async fn delete_meta(&self, _: &str, _: MetaRead) -> Result<()> {

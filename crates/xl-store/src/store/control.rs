@@ -6,7 +6,8 @@
 //! 的读-检-写互斥；`flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
 //!
 //! 集群分支：锁 token 由 [`Store::acquire_fenced_cluster_lock`] 持久化发放并作为提交 token
-//! （调用方 token 仍按 Task 2 契约校验单调性）；读走 quorum 覆盖 ≥ `Q_s`，覆盖不足 fail-closed。
+//! （调用方 token 仍按 Task 2 契约校验单调性）；读按**内容相同的副本数**确认版本
+//! （≥ `Q_s` 槽才可见，覆盖不足或版本无 quorum 时 fail-closed）。
 //! 集群枚举不做：Phase 0 的 control manifest 携带键集合，留待 Phase 1。
 
 use md5::Digest as _;
@@ -86,7 +87,11 @@ impl Store {
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
-        let old = self.read_meta_full(layout::SYS_DIR, key).await?;
+        // CAS 只认 quorum 确认的已提交版本：写者崩溃留下的亚 quorum 半翻版本对客户端
+        // 不可见，也不能让它把后续合法 CAS 永久顶成 Conflict。
+        let old = self
+            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
+            .await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
         let commit_token = guard.commit_token(fence_token, cur_fence)?;
@@ -101,11 +106,14 @@ impl Store {
         Ok(version)
     }
 
-    /// 读控制对象（tombstone → None）。集群走 full quorum 读（覆盖 ≥ `Q_s`），
-    /// 覆盖不足 → `CorruptMeta`（fail-closed，不返回可能陈旧的副本）。
+    /// 读控制对象（tombstone → None）。集群走 quorum 确认读：版本须在 ≥ `Q_s` 槽上
+    /// 内容一致（亚 quorum 半翻版本不可见）；覆盖不足 → `CorruptMeta`（fail-closed）。
     pub async fn get_system_object(&self, key: &str) -> Result<Option<SystemObject>> {
         validate_control_key(key)?;
-        let Some(m) = self.read_meta_full(layout::SYS_DIR, key).await? else {
+        let Some(m) = self
+            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
+            .await?
+        else {
             return Ok(None);
         };
         if m.control_deleted == Some(true) {
@@ -138,7 +146,9 @@ impl Store {
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
-        let old = self.read_meta_full(layout::SYS_DIR, key).await?;
+        let old = self
+            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
+            .await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
         let commit_token = guard.commit_token(fence_token, cur_fence)?;
@@ -204,9 +214,10 @@ impl Store {
         Ok(out)
     }
 
-    /// 集群锁发放的 token 下限：quorum 读已提交 meta 的 `fence_token`（无则 0）。
-    /// 高水位可能落后于已提交 meta（单机→集群升级、`.fence` 丢失），没有下限时每次
-    /// 获取只抬 1，写入会以 Conflict 永久楔死；单机无锁发放，直接 0。
+    /// 集群锁发放的 token 下限：**所有已观察副本**（max-rank full 读，含崩溃写者留下
+    /// 的亚 quorum 半翻副本）中最大的 `fence_token`（无则 0）。token 一旦出现在任何槽
+    /// 就不得复用。高水位可能落后于已提交 meta（单机→集群升级、`.fence` 丢失），没有
+    /// 下限时每次获取只抬 1，写入会以 Conflict 永久楔死；单机无锁发放，直接 0。
     async fn control_token_floor(&self, key: &str) -> Result<u64> {
         if self.cfg.cluster.is_none() {
             return Ok(0);
