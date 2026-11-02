@@ -1521,6 +1521,8 @@ impl Store {
         let self_hash = crate::mesh::content_hash(&bytes);
 
         // 阶段一：准备（掉线盘先探测——挂载点目录仍在父 fs 上，盲写会填满根盘）
+        // shortcut: prepare 直接覆盖既有 `.new`（本地/远端同语义）——并发 fenced 写者由
+        // 调用方持有的对象锁串行化；锁语义放宽时须改为按 token 拒绝旧 prepare。
         let mut prepared: Vec<&PathBuf> = Vec::new();
         for drive in &self.cfg.drives {
             if !drives::drive_up(drive).await {
@@ -1622,7 +1624,13 @@ impl Store {
             // ≥1 翻转 = 已提交（本机读扫全部副本可见）→ 键缓存增量
             self.note_cached_key(bucket, key);
         }
-        if fence_token.is_some() && flipped == 0 && stale {
+        if let Some(t) = fence_token
+            && flipped == 0
+            && stale
+        {
+            for drive in &self.cfg.drives {
+                self.remove_meta_new_fenced(drive, bucket, key, t).await;
+            }
             return Err(Error::Conflict(format!(
                 "fence token 过期：{bucket}/{key} 已由更新写者提交"
             )));
@@ -1642,6 +1650,10 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
     ) -> Result<usize> {
+        // 旧版 peer 会静默忽略 `fence_token`（proto3 未知字段）→ 混版集群拒绝 fenced 控制写。
+        if fence_token.is_some() {
+            self.ensure_fenced_meta_compatible().await?;
+        }
         // DP-0：写 prepare 阶段的传输错会被 quorum 计数吞掉（→ QuorumUnmet/500），
         // 必须在任何本地 .new 落盘前做混版 fail-closed。
         self.ensure_data_plane_compatible().await?;
@@ -1860,12 +1872,13 @@ impl Store {
                 tracing::error!(node = %node.id, slot, error = %e, "meta 补偿恢复失败（留痕待 fsck）");
             }
         }
-        self.bump_quorum_unmet_write();
+        // 过期 CAS 是 409 类，不得污染 500 类健康信号
         if fence_token.is_some() && stale {
             return Err(Error::Conflict(format!(
                 "fence token 过期：{bucket}/{key} 已由更新写者提交（已补偿回滚）"
             )));
         }
+        self.bump_quorum_unmet_write();
         Err(Error::QuorumUnmet(format!(
             "meta 集群翻转 {flipped}/{q_s}，已补偿回滚"
         )))
@@ -1874,6 +1887,10 @@ impl Store {
     /// 补偿恢复（本机槽，Phase 0 fenced）：同 token 回滚旧内容；当前已提交 token **更大**
     /// 时跳过并 warn（绝不覆盖更新写）。`old = None` = 恢复为「不存在」，同样先比较 token。
     /// 返回是否真的恢复了。
+    ///
+    /// shortcut: 恢复是 check-then-act（old=Some 的写覆盖与 old=None 的删除都可能在检查后
+    /// 被并发写插入）——依赖调用方持有的 fenced 锁；Task 4/5 在对象锁内串行化恢复或提供
+    /// token 条件写/删后移除该假设。
     async fn restore_meta_fenced(
         &self,
         drive: &Path,
@@ -1915,7 +1932,10 @@ impl Store {
 
     /// 补偿恢复（远端节点，Phase 0 fenced）：旧内容带本次 token 重跑 prepare+restore-commit
     /// （服务端仅在当前 token 更大时跳过）；`old = None` 先读回该节点 token，更新则跳过删除。
-    /// 调用方应在持有该键 fenced 锁时调用（否则检查-删除之间仍有理论窗口）。
+    ///
+    /// shortcut: 恢复是 check-then-act（old=Some 的 prepare 会覆盖既有 `.new`，old=None 的
+    /// 读 token 与删除之间也可能插入并发写）——依赖调用方持有的 fenced 锁；Task 4/5 在对象
+    /// 锁内串行化恢复或提供 token 条件写/删后移除该假设。
     async fn restore_meta_remote(
         &self,
         node: &str,

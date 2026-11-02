@@ -1,10 +1,10 @@
 //! Phase 0：控制对象（`.oss.sys` 保留命名空间内的 system-object）。
 //!
-//! CAS = 串行化（`lock_object`：进程内 per-key mutex + `flock`，集群再加 quorum 租约锁）+
-//! 读旧 meta + `expected_version`/`fence_token` 校验 + fenced `write_meta` 提交（提交侧再按
-//! 已提交 token 拒绝过期写）。只要两个 Store 打开同一 root（同进程或不同进程），同一 key 的
-//! 读-检-写互斥；`flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
-//! get/list 的集群分支（quorum 读屏障）在 Task 5 接入（当前 Unsupported）。
+//! CAS = 串行化（`lock_object`：进程内 per-key mutex + `flock`）+ 读旧 meta +
+//! `expected_version`/`fence_token` 校验 + fenced `write_meta` 提交（提交侧再按已提交 token
+//! 拒绝过期写）。只要两个 Store 打开同一 root（同进程或不同进程），同一 key 的读-检-写互斥；
+//! `flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
+//! put/delete/get/list 的集群分支整体在 Task 5 接入（当前均 Unsupported）。
 
 use md5::Digest as _;
 
@@ -36,6 +36,7 @@ impl Store {
         expected_version: Option<u64>,
         fence_token: u64,
     ) -> Result<u64> {
+        self.ensure_control_single_node()?;
         validate_control_key(key)?;
         if data.len() as u64 > meta::MAX_INLINE {
             return Err(Error::InvalidArgument(format!(
@@ -46,6 +47,10 @@ impl Store {
             )));
         }
         let _guard = self.control_lock(key).await?;
+        // 获取后即时自检（与数据面写入口一致；集群分支在 Task 5 放开后不再是死代码）
+        if _guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
+        }
         let old = self.read_meta(layout::SYS_DIR, key).await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
@@ -87,8 +92,12 @@ impl Store {
         expected_version: Option<u64>,
         fence_token: u64,
     ) -> Result<bool> {
+        self.ensure_control_single_node()?;
         validate_control_key(key)?;
         let _guard = self.control_lock(key).await?;
+        if _guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
+        }
         let old = self.read_meta(layout::SYS_DIR, key).await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
@@ -148,7 +157,7 @@ impl Store {
     fn ensure_control_single_node(&self) -> Result<()> {
         if self.cfg.cluster.is_some() {
             return Err(Error::Unsupported(
-                "cluster fenced commit lands in Task 3".into(),
+                "system-object API 的集群分支在 Task 5 接入（当前单机）".into(),
             ));
         }
         Ok(())
@@ -160,8 +169,9 @@ impl Store {
         self.lock_object(layout::SYS_DIR, key).await
     }
 
-    /// 提交控制对象 meta：单盘/多盘/集群统一走 fenced 提交（调用方持有 fence token；
-    /// 持久化 token 发放为 Task 4/5）。过期 token 由提交侧返回 `Error::Conflict`。
+    /// 提交控制对象 meta：单盘/多盘走 fenced 提交（调用方持有 fence token；持久化 token
+    /// 发放为 Task 4）。当前 put/delete 由 `ensure_control_single_node` 限制为单机，集群
+    /// 分支在 Task 5 放开；过期 token 由提交侧返回 `Error::Conflict`。
     async fn commit_control_meta(
         &self,
         key: &str,

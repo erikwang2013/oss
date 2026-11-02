@@ -183,6 +183,36 @@ impl Store {
         futures::future::try_join_all(probes).await?;
         Ok(())
     }
+
+    /// Phase 0：fenced meta 能力闸门。旧版 peer 会把 `fence_token` 当 proto3 未知字段
+    /// 静默忽略，其无校验的 commit 会被计成合法翻转 → 混版集群必须拒绝 fenced 控制写。
+    /// 探测失败同样 fail-closed（无法确认即拒绝；控制面写频率低，安全优先）。
+    pub(in crate::store) async fn ensure_fenced_meta_compatible(&self) -> Result<()> {
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return Ok(());
+        };
+        let local = self.local_caps();
+        let self_id = cl.sets.flat.self_node().id.as_str();
+        for n in &cl.sets.flat.nodes {
+            if n.id == self_id {
+                continue;
+            }
+            let caps = cl.transport.peer_caps(&n.id).await.map_err(|e| {
+                Error::PeerIncompatible(format!("fenced meta 无法确认节点 {} 的能力：{e}", n.id))
+            })?;
+            if crate::mesh_gate::check_peer(&n.id, &caps, &local)?
+                != crate::mesh_gate::PeerClass::Current
+            {
+                return Err(Error::PeerIncompatible(format!(
+                    "fenced meta 要求全节点现版：节点 {} 数据面线格式 {} < {}",
+                    n.id,
+                    caps.wire_version,
+                    crate::mesh_gate::DATA_WIRE_VERSION
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------- 数据面（Task 5a/5b）：服务端入口——只操作本节点本地槽，绝不再扇出 ----------

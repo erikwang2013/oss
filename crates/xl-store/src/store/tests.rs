@@ -5438,12 +5438,16 @@ fn fenced_meta(key: &str, version: u64, token: u64) -> XlMeta {
     }
 }
 
-async fn disk_token(_s: &Store, drive: &std::path::Path, bucket: &str, key: &str) -> Option<u64> {
+async fn disk_meta(drive: &std::path::Path, bucket: &str, key: &str) -> XlMeta {
     let path = layout::object_dir_for(drive, bucket, key)
         .unwrap()
         .join(meta::META_FILE);
     let bytes = tokio::fs::read(path).await.unwrap();
-    XlMeta::decode(&bytes).unwrap().fence_token
+    XlMeta::decode(&bytes).unwrap()
+}
+
+async fn disk_token(drive: &std::path::Path, bucket: &str, key: &str) -> Option<u64> {
+    disk_meta(drive, bucket, key).await.fence_token
 }
 
 /// 3 盘单机（无集群）：token 1 prepare 后暂停 → token 2 提交 → token 1 恢复提交必须 Stale；
@@ -5472,7 +5476,7 @@ async fn stale_fence_token_cannot_commit_or_restore() {
         12
     );
     for d in &dirs {
-        assert_eq!(disk_token(&s, d.path(), layout::SYS_DIR, k).await, Some(2));
+        assert_eq!(disk_token(d.path(), layout::SYS_DIR, k).await, Some(2));
     }
 
     // token 1 恢复提交：即使 .new 已被 token 2 消费，也必须先按已提交 token 判 Stale
@@ -5502,7 +5506,7 @@ async fn stale_fence_token_cannot_commit_or_restore() {
                 .unwrap()
         );
         assert_eq!(
-            disk_token(&s, d.path(), layout::SYS_DIR, k).await,
+            disk_token(d.path(), layout::SYS_DIR, k).await,
             Some(2),
             "更新 token 的内容必须保留"
         );
@@ -5565,15 +5569,15 @@ async fn multi_drive_counts_only_token_legal_flips() {
         "只计 token 合法的其余 11 盘"
     );
     assert_eq!(
-        disk_token(&s, dirs[0].path(), layout::SYS_DIR, k).await,
+        disk_token(dirs[0].path(), layout::SYS_DIR, k).await,
         Some(5)
     );
     assert_eq!(
-        disk_token(&s, dirs[1].path(), layout::SYS_DIR, k).await,
+        disk_token(dirs[1].path(), layout::SYS_DIR, k).await,
         Some(3)
     );
     assert_eq!(
-        disk_token(&s, dirs[11].path(), layout::SYS_DIR, k).await,
+        disk_token(dirs[11].path(), layout::SYS_DIR, k).await,
         Some(3)
     );
 }
@@ -5651,6 +5655,78 @@ async fn mesh_commit_meta_reports_stale_slots() {
     assert!(ack.slots.iter().all(|s| !s.ok && s.stale), "{ack:?}");
 }
 
+/// 相等 token 的边界：提交侧 `>=` 判 Stale；恢复侧只拒 `>`，允许回滚自己的翻转，
+/// 且回滚不得回退 token 高水位。
+#[tokio::test]
+async fn equal_fence_token_is_stale_for_commit_but_allowed_for_restore() {
+    let (s, d) = store().await;
+    let k = "control/equal";
+    s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 5), None, Some(5))
+        .await
+        .unwrap();
+    // cur == t：提交必须 Stale（即使没有 `.new`，也要先按 token 判，不能落到 Missing）
+    assert!(matches!(
+        s.commit_meta_on(d.path(), layout::SYS_DIR, k, Some(5))
+            .await
+            .unwrap(),
+        crate::store::mesh_api::SlotCommit::Stale
+    ));
+    // cur == t：恢复允许（回滚自己的翻转），内容回旧、token 保持高水位
+    let old = fenced_meta(k, 1, 0);
+    assert!(
+        s.restore_meta_fenced(d.path(), layout::SYS_DIR, k, Some(&old), 5)
+            .await
+            .unwrap()
+    );
+    let m = disk_meta(d.path(), layout::SYS_DIR, k).await;
+    assert_eq!(m.control_version, Some(1), "内容应回滚到旧版本");
+    assert_eq!(m.fence_token, Some(5), "回滚不得回退 fence 高水位");
+}
+
+/// mesh restore-commit：`cur == t` → Committed（服务端 restore 模式）；`cur > t` → stale。
+#[tokio::test]
+async fn mesh_restore_commit_allows_equal_token_and_skips_newer() {
+    let (s, d) = store().await;
+    let k = "control/restore-ack";
+    let old = fenced_meta(k, 1, 0);
+    let restore_req = || crate::mesh::MetaWrite {
+        bucket: layout::SYS_DIR.into(),
+        key: k.into(),
+        meta: bytes::Bytes::from(old.encode().unwrap()),
+        fence_token: Some(5),
+        restore: true,
+    };
+    s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 5), None, Some(5))
+        .await
+        .unwrap();
+    // cur == t：允许恢复提交
+    s.mesh_prepare_meta(restore_req()).await.unwrap();
+    let ack = s.mesh_commit_meta(restore_req()).await.unwrap();
+    assert!(
+        ack.ok && ack.slots.iter().all(|s| s.ok && !s.stale),
+        "{ack:?}"
+    );
+    assert_eq!(
+        disk_meta(d.path(), layout::SYS_DIR, k)
+            .await
+            .control_version,
+        Some(1)
+    );
+    // cur > t：恢复必须 stale 且不覆盖
+    s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 3, 6), None, Some(6))
+        .await
+        .unwrap();
+    s.mesh_prepare_meta(restore_req()).await.unwrap();
+    let ack = s.mesh_commit_meta(restore_req()).await.unwrap();
+    assert!(
+        !ack.ok && ack.slots.iter().all(|s| !s.ok && s.stale),
+        "{ack:?}"
+    );
+    let m = disk_meta(d.path(), layout::SYS_DIR, k).await;
+    assert_eq!(m.control_version, Some(3), "更新写的内容必须保留");
+    assert_eq!(m.fence_token, Some(6));
+}
+
 /// 集群：过期 token 的整次写返回 Conflict，已提交的新 token 内容原样保留。
 #[tokio::test]
 async fn cluster_stale_fence_token_is_conflict_and_keeps_newer() {
@@ -5686,5 +5762,90 @@ async fn cluster_stale_fence_token_is_conflict_and_keeps_newer() {
                 .join(meta::META_NEW_FILE);
             assert!(!tokio::fs::try_exists(&p).await.unwrap(), "{}", p.display());
         }
+    }
+}
+
+/// 混版集群：旧版 peer 会静默忽略 `fence_token` → fenced 写必须 fail-closed，且不得落
+/// 任何 `.new`；数据面 `None` 路径在 placement v1 混版窗口仍可写。
+#[tokio::test]
+async fn fenced_meta_refuses_legacy_peer() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    let k = "control/legacy";
+    c.mesh.set_data_wire_version("n2", Some(1));
+    match s1
+        .write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 1, 1), None, Some(1))
+        .await
+    {
+        Err(Error::PeerIncompatible(_)) => {}
+        other => panic!("混版集群的 fenced 写必须 fail-closed，实际：{other:?}"),
+    }
+    for dirs in &c.dirs {
+        for d in dirs {
+            let p = layout::object_dir_for(d, layout::SYS_DIR, k)
+                .unwrap()
+                .join(meta::META_NEW_FILE);
+            assert!(!tokio::fs::try_exists(&p).await.unwrap(), "{}", p.display());
+        }
+    }
+    assert!(s1.read_meta(layout::SYS_DIR, k).await.unwrap().is_none());
+    assert!(
+        s1.write_meta(layout::SYS_DIR, k, &fenced_meta(k, 1, 1), None)
+            .await
+            .unwrap()
+            >= 9
+    );
+}
+
+/// 集群补偿（部分翻转）：8 槽 token 合法翻转、4 槽 Stale → Conflict 且补偿恢复执行；
+/// 恢复只回滚自己的 token（cur == t），已提交的更新 token 原样保留。
+#[tokio::test]
+async fn cluster_partial_flip_compensation_skips_newer_token() {
+    let c = Cluster::new(4, 3).await;
+    let s1 = &c.stores[0];
+    let k = "control/compensate";
+    // 4 槽已提交 token 5：本机 3 盘 + n2 首盘（其余 8 槽无 meta）
+    let newer = fenced_meta(k, 2, 5);
+    for (node, drives) in c.dirs.iter().enumerate() {
+        let take = match node {
+            0 => 3,
+            1 => 1,
+            _ => 0,
+        };
+        for d in drives.iter().take(take) {
+            s1.write_meta_on(d, layout::SYS_DIR, k, &newer)
+                .await
+                .unwrap();
+        }
+    }
+    // token 4：8 槽合法翻转（< Q_s=9）+ 4 槽 Stale → Conflict + 补偿
+    match s1
+        .write_meta_fenced(
+            layout::SYS_DIR,
+            k,
+            &fenced_meta(k, 1, 4),
+            Some(&fenced_meta(k, 0, 3)),
+            Some(4),
+        )
+        .await
+    {
+        Err(Error::Conflict(_)) => {}
+        other => panic!("应为 Conflict，实际：{other:?}"),
+    }
+    // 更新写者的翻转保留
+    for d in c.dirs[0].iter().chain(std::iter::once(&c.dirs[1][0])) {
+        let m = disk_meta(d, layout::SYS_DIR, k).await;
+        assert_eq!(m.fence_token, Some(5), "{}", d.display());
+        assert_eq!(m.control_version, Some(2), "{}", d.display());
+    }
+    // 曾翻转 token 4 的槽被补偿回旧内容；token 高水位保持 4
+    for d in c.dirs[1][1..]
+        .iter()
+        .chain(c.dirs[2].iter())
+        .chain(c.dirs[3].iter())
+    {
+        let m = disk_meta(d, layout::SYS_DIR, k).await;
+        assert_eq!(m.fence_token, Some(4), "{}", d.display());
+        assert_eq!(m.control_version, Some(0), "{}", d.display());
     }
 }
