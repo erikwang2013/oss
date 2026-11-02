@@ -1,7 +1,9 @@
 //! Phase 0：控制对象（`.oss.sys` 保留命名空间内的 system-object）。
 //!
-//! 单机实现：CAS = 进程内 per-key 互斥 + 读旧 meta + `expected_version`/`fence_token`
-//! 校验 + 现有 `write_meta` 提交。集群 fenced commit 在 Task 3/5 接入（当前 Unsupported）。
+//! 单机实现：CAS = 跨进程串行化（`lock_object`：进程内 per-key mutex + `flock`）+ 读旧
+//! meta + `expected_version`/`fence_token` 校验 + 现有 `write_meta` 提交。只要两个 Store
+//! 打开同一 root（同进程或不同进程），同一 key 的读-检-写互斥；`flock` 是本地文件系统上的
+//! advisory 锁，不覆盖网络文件系统/跨机器。集群 fenced commit 在 Task 3/5 接入（当前 Unsupported）。
 
 use md5::Digest as _;
 
@@ -43,7 +45,7 @@ impl Store {
                 data.len()
             )));
         }
-        let _guard = self.control_lock(key).await;
+        let _guard = self.control_lock(key).await?;
         let old = self.read_meta(layout::SYS_DIR, key).await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
@@ -86,7 +88,7 @@ impl Store {
     ) -> Result<bool> {
         self.ensure_control_single_node()?;
         validate_control_key(key)?;
-        let _guard = self.control_lock(key).await;
+        let _guard = self.control_lock(key).await?;
         let old = self.read_meta(layout::SYS_DIR, key).await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
@@ -110,23 +112,28 @@ impl Store {
                 prefix.escape_debug()
             )));
         }
-        let mut entries = match tokio::fs::read_dir(layout::sys_dir(self.cfg.root(), "")).await {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut out = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if !entry.file_type().await?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(key) = layout::key_from_dir_name(&name) else {
-                continue;
+        // 全盘并集（同 scan_keys 口径）：掉线盘/半翻盘不得让 put 可写的键从列举里消失。
+        let mut names = std::collections::BTreeSet::new();
+        for drive in &self.cfg.drives {
+            let mut entries = match tokio::fs::read_dir(layout::sys_dir(drive, "")).await {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
             };
-            if !key.starts_with(prefix) {
-                continue;
+            while let Some(entry) = entries.next_entry().await? {
+                if !entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Ok(key) = layout::key_from_dir_name(&name)
+                    && key.starts_with(prefix)
+                {
+                    names.insert(key);
+                }
             }
+        }
+        let mut out = Vec::new();
+        for key in names {
             // tombstone 仍占目录：读 meta 过滤（控制对象量级小，逐键读可接受）
             if let Some(m) = self.read_meta(layout::SYS_DIR, &key).await?
                 && m.control_deleted != Some(true)
@@ -134,7 +141,6 @@ impl Store {
                 out.push(key);
             }
         }
-        out.sort();
         Ok(out)
     }
 
@@ -147,10 +153,10 @@ impl Store {
         Ok(())
     }
 
-    /// 单机 CAS 串行化：复用进程内 per-key 锁表（`bucket/key` 与用户键不可能同串——
-    /// 用户桶名不能是 `.oss.sys`）。跨进程/集群 fenced lock 在 Task 5 接入。
-    async fn control_lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        self.lock_for(layout::SYS_DIR, key).lock_owned().await
+    /// CAS 串行化：数据面同款跨进程锁（进程内 mutex + `flock`），不同进程打开同一
+    /// root 的两个 Store 也能互斥。集群子分支在上游已拒绝，故这里只落到本地两层。
+    async fn control_lock(&self, key: &str) -> Result<super::LockGuard> {
+        self.lock_object(layout::SYS_DIR, key).await
     }
 
     /// 提交控制对象 meta（本地单盘/多盘走现有提交协议；集群已在上游拒绝）。
@@ -251,12 +257,20 @@ fn control_meta(
 
 #[cfg(test)]
 mod tests {
+    use crate::error::Error;
     use crate::store::{Store, StoreConfig};
 
     async fn test_store() -> (Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
         (s, dir)
+    }
+
+    fn assert_conflict<T: std::fmt::Debug>(r: crate::error::Result<T>) {
+        match r {
+            Err(Error::Conflict(_)) => {}
+            other => panic!("应为 Conflict，实际：{other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -276,11 +290,7 @@ mod tests {
                 .data[..],
             b"one"
         );
-        assert!(
-            s.put_system_object("control/a", b"two", Some(0), 2)
-                .await
-                .is_err()
-        );
+        assert_conflict(s.put_system_object("control/a", b"two", Some(0), 2).await);
         assert_eq!(
             s.put_system_object("control/a", b"two", Some(1), 2)
                 .await
@@ -299,36 +309,94 @@ mod tests {
     async fn system_object_fence_and_key_validation() {
         let (s, _d) = test_store().await;
         // fence token 必须严格递增（缺失按 0，故首个 token 必须 ≥ 1）
-        assert!(
-            s.put_system_object("control/a", b"x", None, 0)
-                .await
-                .is_err()
-        );
+        assert_conflict(s.put_system_object("control/a", b"x", None, 0).await);
         s.put_system_object("control/a", b"x", None, 2)
             .await
             .unwrap();
-        assert!(
-            s.put_system_object("control/a", b"y", Some(1), 2)
-                .await
-                .is_err()
-        );
+        assert_conflict(s.put_system_object("control/a", b"y", Some(1), 2).await);
         // CAS 版本不匹配
-        assert!(
-            s.put_system_object("control/a", b"y", Some(0), 3)
-                .await
-                .is_err()
-        );
+        assert_conflict(s.put_system_object("control/a", b"y", Some(0), 3).await);
         // 只允许 control/ 前缀
-        assert!(s.put_system_object("other/a", b"x", None, 9).await.is_err());
-        assert!(s.get_system_object("other/a").await.is_err());
-        assert!(s.list_system_objects("other/").await.is_err());
+        assert!(matches!(
+            s.put_system_object("other/a", b"x", None, 9).await,
+            Err(Error::InvalidKey(_))
+        ));
+        assert!(matches!(
+            s.get_system_object("other/a").await,
+            Err(Error::InvalidKey(_))
+        ));
+        assert!(matches!(
+            s.list_system_objects("other/").await,
+            Err(Error::InvalidKey(_))
+        ));
         // 内联上限
         let big = vec![0u8; crate::meta::MAX_INLINE as usize + 1];
-        assert!(
-            s.put_system_object("control/big", &big, None, 1)
-                .await
-                .is_err()
+        assert!(matches!(
+            s.put_system_object("control/big", &big, None, 1).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    /// 同一 expected_version 的并发写者只能有一个成功。两个独立 Store 句柄共用一个
+    /// root（≈ 两个进程各开一个 Store）：per-Store 内存锁不共享，互斥必须由 flock 提供。
+    #[tokio::test]
+    async fn system_object_concurrent_cas_allows_exactly_one_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = std::sync::Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+        let s2 = std::sync::Arc::new(Store::open(StoreConfig::new(dir.path())).await.unwrap());
+        let handles = [s1.clone(), s2.clone()];
+        let results = futures::future::join_all((1..=8u64).map(|token| {
+            let s = handles[(token as usize) % 2].clone();
+            async move { s.put_system_object("control/race", b"x", None, token).await }
+        }))
+        .await;
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "只允许一个写者成功：{results:?}"
         );
+        for r in results.iter().filter(|r| r.is_err()) {
+            assert!(
+                matches!(r, Err(Error::Conflict(_))),
+                "其余必须是 Conflict：{r:?}"
+            );
+        }
+        assert_eq!(
+            s1.get_system_object("control/race")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    /// tombstone 后重建：按 tombstone 的版本 CAS 继续写，数据/版本/token 全部前进。
+    #[tokio::test]
+    async fn system_object_delete_then_put_resurrects() {
+        let (s, _d) = test_store().await;
+        assert_eq!(
+            s.put_system_object("control/r", b"one", None, 1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            s.delete_system_object("control/r", Some(1), 2)
+                .await
+                .unwrap()
+        );
+        assert!(s.get_system_object("control/r").await.unwrap().is_none());
+        // tombstone 占版本 2（delete 只回 bool，版本按契约 +1 推算）
+        assert_eq!(
+            s.put_system_object("control/r", b"two", Some(2), 3)
+                .await
+                .unwrap(),
+            3
+        );
+        let obj = s.get_system_object("control/r").await.unwrap().unwrap();
+        assert_eq!(&obj.data[..], b"two");
+        assert_eq!((obj.version, obj.fence_token, obj.deleted), (3, 3, false));
     }
 
     #[tokio::test]
