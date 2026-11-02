@@ -1832,6 +1832,8 @@ impl Store {
             .await
     }
 
+    // 内部提交路径：参数即协议字段，分组只会增加转换噪声。
+    #[allow(clippy::too_many_arguments)]
     async fn write_meta_fenced_mode(
         &self,
         bucket: &str,
@@ -2056,6 +2058,8 @@ impl Store {
     /// prepare 全可达槽位 ≥ Q_s → commit（失败重试一次）→ **翻转 ≥ Q_s 即已提交**；
     /// 仍不足 → **补偿回滚**（写者持 old：有 → 恢复旧 meta；无 → 删 meta）。
     /// hash 只计「内容是自己的」的翻转（无 fencing 交错写下 .new 可能被他人覆盖）。
+    // 内部提交路径：参数即协议字段，分组只会增加转换噪声。
+    #[allow(clippy::too_many_arguments)]
     async fn write_meta_cluster(
         &self,
         bucket: &str,
@@ -2234,10 +2238,10 @@ impl Store {
             // 控制写按翻转集提交：未入选槽位（含 `preserve`）的 `.new` 不属于本次提交点。
             if flip_set.len() < prepared {
                 for (d, drive) in self.cfg.drives.iter().enumerate() {
-                    if !flip_set.contains(&(base + d as u16)) {
-                        if let Some(t) = fence_token {
-                            self.remove_meta_new_fenced(drive, bucket, key, t).await;
-                        }
+                    if !flip_set.contains(&(base + d as u16))
+                        && let Some(t) = fence_token
+                    {
+                        self.remove_meta_new_fenced(drive, bucket, key, t).await;
                     }
                 }
                 for n in &cl.sets.flat.nodes {
