@@ -1584,6 +1584,10 @@ impl Store {
         let flip_abort: Option<usize> = std::env::var("OSS_TEST_ABORT_META_FLIP_K")
             .ok()
             .and_then(|v| v.parse().ok());
+        // Task 6：控制对象（fenced）提交计数注入；数据面不受影响（只在 Some(t) 分支生效）
+        let control_abort: Option<usize> = std::env::var("OSS_TEST_ABORT_CONTROL_COMMIT_K")
+            .ok()
+            .and_then(|v| v.parse().ok());
         if std::env::var("OSS_TEST_ABORT_META_PREPARE").is_ok() {
             std::process::abort();
         }
@@ -1615,7 +1619,7 @@ impl Store {
                 Some(t) => match self.commit_meta_on(drive, bucket, key, Some(t)).await {
                     Ok(mesh_api::SlotCommit::Committed { hash }) if hash == self_hash => {
                         flipped += 1;
-                        if flip_abort == Some(flipped) {
+                        if flip_abort == Some(flipped) || control_abort == Some(flipped) {
                             std::process::abort();
                         }
                     }
