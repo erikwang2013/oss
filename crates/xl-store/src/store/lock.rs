@@ -259,6 +259,8 @@ async fn write_fence_high(root: &Path, lock_key: &str, token: u64) -> Result<()>
     f.sync_all().await?;
     drop(f);
     tokio::fs::rename(&tmp, &path).await?;
+    // 目录 fsync 失败按致命处理（fail-closed）；与 sync_dir 的「容忍」约定不同——
+    // 高水位丢失可能导致 token 复用。
     tokio::fs::File::open(dir).await?.sync_all().await?;
     Ok(())
 }
@@ -544,6 +546,12 @@ impl Store {
     /// （且授予者回报 `last_fence_token >= proposed`，旧节点不计）后持久化 proposed。
     /// 节点拒绝并回报更高 `last_fence_token` 时以 `max(last)+1` 重试。
     /// 单机（无 cluster 配置）：从同一持久化文件读 +1，本地授予即持久化。
+    ///
+    /// **契约边界**：本层只保证 token 单调、不重号，**不提供**跨进程/跨 Store 的互斥
+    /// （锁表在进程内存；同 root 的并发进程由 `.fence.lock` flock 只串行化发号）。
+    /// 调用方必须先持有 `lock_object`（进程内 mutex + flock）再调用本方法，与数据面写
+    /// 路径同序。单机守卫无续租、`lease_lost()` 恒 false：持锁超过
+    /// `cluster_lock_ttl_ms` 后条目静默过期，因此对象锁是必需的，不能只拿本守卫。
     #[allow(dead_code)] // Phase 0 Task 5 消费；当前仅测试调用
     pub(in crate::store) async fn acquire_fenced_cluster_lock(
         &self,

@@ -853,8 +853,8 @@ async fn fence_token_is_monotonic_across_restart_and_contenders() {
     assert_eq!(tokens.len(), uniq.len(), "并发获取不得同号：{tokens:?}");
 }
 
-/// 两个独立 Store 打开同一 root（≈ 两个进程）：flock 串行化高水位读-改-写，
-/// 同一时刻只允许一方持有，token 不得重号。
+/// 两个独立 Store 打开同一 root（≈ 两个进程）：两边的锁表不共享，跨进程互斥由调用方
+/// 的对象 flock 保证；本层用 `.fence.lock` flock 串行化发号，只保证 token 不重号。
 #[tokio::test]
 async fn fenced_token_not_duplicated_across_store_instances() {
     let dir = tempfile::tempdir().unwrap();
@@ -933,6 +933,25 @@ async fn fenced_lock_rejects_stale_token_with_last() {
     assert!(s.mesh_lock(legacy).await.unwrap().granted);
 }
 
+/// token 感知的迟到 Release/Renew：旧 token 不得解开或续租新锁。
+#[tokio::test]
+async fn fenced_stale_release_and_renew_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(StoreConfig::new(dir.path())).await.unwrap();
+    let req = |token: u64, op: LockOp| fenced_req(token, op, "h");
+    assert!(s.mesh_lock(req(3, LockOp::Acquire)).await.unwrap().granted);
+    // 旧 token 的迟到 Release：拒绝且条目保留（否则新锁会被提前解掉）。
+    assert!(!s.mesh_lock(req(2, LockOp::Release)).await.unwrap().granted);
+    assert_eq!(s.lock_table().holder("bkt/k").as_deref(), Some("h"));
+    // 旧 token 的 Renew：拒绝（旧守卫不得为新锁续命）。
+    assert!(!s.mesh_lock(req(2, LockOp::Renew)).await.unwrap().granted);
+    assert_eq!(s.lock_table().holder("bkt/k").as_deref(), Some("h"));
+    // 当前 token 的 Renew / Release 正常。
+    assert!(s.mesh_lock(req(3, LockOp::Renew)).await.unwrap().granted);
+    assert!(s.mesh_lock(req(3, LockOp::Release)).await.unwrap().granted);
+    assert_eq!(s.lock_table().holder("bkt/k"), None);
+}
+
 /// 持久化文件损坏 → CorruptMeta（fail-closed），绝不回退 0 重新发号。
 #[tokio::test]
 async fn corrupt_fence_file_fails_closed() {
@@ -981,10 +1000,10 @@ async fn fenced_cluster_lock_tokens_unique_and_monotonic() {
         .await
         .unwrap();
     assert!(gc.token > tb, "重开后必须仍递增：{} ≤ {tb}", gc.token);
-    // 过期提议：拒绝 + 回报高水位。
+    // 过期提议：探持有者本节点（必已持久化 gc.token），拒绝 + 回报高水位。
     let mut stale = fenced_req(gc.token, LockOp::Acquire, "stale");
     stale.epoch_nanos = 99;
-    let r = c2.stores[0].mesh_lock(stale).await.unwrap();
+    let r = c2.stores[2].mesh_lock(stale).await.unwrap();
     assert!(!r.granted, "过期 token 不得授予");
-    assert!(r.last_fence_token >= gc.token, "{r:?}");
+    assert_eq!(r.last_fence_token, gc.token, "{r:?}");
 }
