@@ -176,6 +176,20 @@ async fn system_namespace_cannot_be_listed() {
         .await
         .unwrap();
     assert!(resp.entries.is_empty() && resp.prefixes.is_empty());
+
+    // 对称：服务端 LMU 页同样回空，不暴露系统暂存区
+    let resp = s
+        .mesh_list_uploads_local(crate::mesh::ListUploadsLocal {
+            bucket: layout::SYS_DIR.into(),
+            prefix: String::new(),
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            limit: 1000,
+        })
+        .await
+        .unwrap();
+    assert!(resp.uploads.is_empty() && resp.prefixes.is_empty());
 }
 
 #[tokio::test]

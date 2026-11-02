@@ -126,6 +126,7 @@ pub fn object_dir(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
 const RESERVED_SYS_ENTRIES: &[&str] = &[
     "drive-id",
     "fsck",
+    "jwt_blacklist",
     "kms",
     "locks",
     "master.key",
@@ -214,6 +215,7 @@ mod tests {
             "locks",
             "tee/a",
             "drive-id",
+            "jwt_blacklist",
             "orphan/x",
             "topo",
             "shrink/x",

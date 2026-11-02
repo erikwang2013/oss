@@ -484,6 +484,14 @@ impl Store {
         &self,
         l: crate::mesh::ListUploadsLocal,
     ) -> Result<crate::mesh::ListUploadsLocalResp> {
+        // 保留命名空间不可列举（与 ListLocal 对称）：系统暂存区不得经 LMU 面外泄
+        if layout::is_system_bucket(&l.bucket) {
+            return Ok(crate::mesh::ListUploadsLocalResp {
+                uploads: Vec::new(),
+                prefixes: Vec::new(),
+                slots_ok: self.cfg.drives.len() as u32,
+            });
+        }
         let (ups, cps) = match self
             .list_uploads_page_local(
                 &l.bucket,
