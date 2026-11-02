@@ -56,6 +56,10 @@ impl Store {
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
         let version = cur_version + 1;
         let m = control_meta(key, version, fence_token, Some(data), false);
+        // 提交点前复查租约（无 fencing 窗口收窄到两次检查之间；与 put.rs:1058 同款）
+        if _guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
+        }
         self.commit_control_meta(key, &m, old.as_ref(), fence_token)
             .await?;
         Ok(version)
@@ -108,6 +112,9 @@ impl Store {
             return Ok(false);
         }
         let m = control_meta(key, cur_version + 1, fence_token, None, true);
+        if _guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
+        }
         self.commit_control_meta(key, &m, Some(&old), fence_token)
             .await?;
         Ok(true)

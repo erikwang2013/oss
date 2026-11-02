@@ -89,7 +89,9 @@ message NodeHealth { string node_id=1; string version=2; repeated SlotState slot
                      uint32 data_wire_version=5;
                      uint64 topo_epoch=6; string topo_hash=7;
                      // shrink plan 容量校验：逐物理盘可用空间；maintenance = 停写维护模式。
-                     repeated DriveSpace drives=8; bool maintenance=9; }
+                     repeated DriveSpace drives=8; bool maintenance=9;
+                     // Phase 0：本节点理解并执行 fenced meta 提交（旧节点缺省 false）。
+                     bool fenced_meta=10; }
 message SlotState { uint32 slot=1; bool up=2; }
 message DriveSpace { uint32 set=1; uint32 drive=2; uint64 free_bytes=3; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;

@@ -218,6 +218,8 @@ pub struct NodeHealth {
     pub drives: Vec<DriveSpace>,
     /// maintenance 模式：非 GET/HEAD/OPTIONS 503、后台 worker 全停。
     pub maintenance: bool,
+    /// Phase 0：对端理解 `MetaWrite.fence_token`（旧节点缺省 false = 会静默忽略）。
+    pub fenced_meta: bool,
 }
 
 /// 本节点拓扑指纹：`topo_epoch` + `topo_hash`（[`NodeHealth`] 字段 6/7 的来源）。

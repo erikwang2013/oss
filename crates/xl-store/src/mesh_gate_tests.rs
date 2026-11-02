@@ -118,6 +118,7 @@ impl MeshTransport for FakeMesh {
             topo_hash: self.topo_hash.clone(),
             drives: vec![],
             maintenance: false,
+            fenced_meta: true,
         })
     }
     async fn lock(&self, _: &str, _: LockReq) -> Result<LockResp> {
@@ -200,6 +201,7 @@ fn caps(wire: u32, epoch: u64, hash: &str) -> PeerCaps {
         wire_version: wire,
         topo_epoch: epoch,
         topo_hash: hash.into(),
+        fenced_meta: true,
     }
 }
 
@@ -223,6 +225,7 @@ fn peer_wire_version_normalizes_legacy_and_unknown_fails_closed() {
         topo_hash: String::new(),
         drives: vec![],
         maintenance: false,
+        fenced_meta: false,
     };
     assert_eq!(h(0).peer_data_wire_version(), 1);
     assert_eq!(h(1).peer_data_wire_version(), 1);

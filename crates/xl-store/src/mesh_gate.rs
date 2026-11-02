@@ -90,6 +90,8 @@ pub struct PeerCaps {
     pub wire_version: u32,
     pub topo_epoch: u64,
     pub topo_hash: String,
+    /// Phase 0：对端执行 fenced meta 提交；旧节点缺省 false（会静默忽略 token）。
+    pub fenced_meta: bool,
 }
 
 impl PeerCaps {
@@ -98,6 +100,7 @@ impl PeerCaps {
             wire_version: h.peer_data_wire_version(),
             topo_epoch: h.topo_epoch,
             topo_hash: h.topo_hash.clone(),
+            fenced_meta: h.fenced_meta,
         }
     }
 }

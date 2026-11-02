@@ -441,6 +441,7 @@ fn health(node: &str, epoch: u64, hash: &str, maintenance: bool, free: u64) -> N
             free_bytes: free,
         }],
         maintenance,
+        fenced_meta: false,
     }
 }
 
@@ -510,6 +511,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         wire_version: 2,
         topo_epoch: 3,
         topo_hash: caps.topo_hash.clone(),
+        fenced_meta: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &peer, &caps).is_ok());
 
@@ -517,6 +519,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         wire_version: 2,
         topo_epoch: 2,
         topo_hash: caps.topo_hash.clone(),
+        fenced_meta: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &stale, &caps).is_err());
 
@@ -527,6 +530,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         wire_version: 2,
         topo_epoch: 4,
         topo_hash: caps4.topo_hash.clone(),
+        fenced_meta: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &peer4, &caps4).is_ok());
 }

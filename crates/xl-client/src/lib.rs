@@ -602,6 +602,7 @@ impl MeshTransport for TonicMesh {
                 })
                 .collect(),
             maintenance: resp.maintenance,
+            fenced_meta: resp.fenced_meta,
         })
     }
     // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
@@ -1279,6 +1280,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 })
                 .collect(),
             maintenance: h.maintenance,
+            fenced_meta: h.fenced_meta,
         }))
     }
 

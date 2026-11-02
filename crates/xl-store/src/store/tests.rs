@@ -2893,6 +2893,8 @@ pub struct InProcessMesh {
     fail_once: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// DP-0：peer 数据面版本覆盖（模拟混版节点；缺省 = 该节点真实 mesh_health 值）。
     versions: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// Phase 0：peer fenced meta 能力位覆盖（模拟 pre-fix 节点；缺省 = 真实值 true）。
+    fenced_meta: std::sync::Mutex<std::collections::HashMap<String, bool>>,
     /// DP-1：到达对端的 ListLocal 请求记录（断言「旧版不会收到新语义标志」）。
     list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
     /// 测试仪器：ListLocal 并发峰值（验证目录列举的 peer 扇出）。
@@ -2929,6 +2931,7 @@ impl InProcessMesh {
             delays: Default::default(),
             fail_once: Default::default(),
             versions: Default::default(),
+            fenced_meta: Default::default(),
             list_requests: Default::default(),
             list_inflight: Default::default(),
             list_max_inflight: Default::default(),
@@ -3001,6 +3004,15 @@ impl InProcessMesh {
     /// DP-0：伪造某 peer 的数据面版本（0 = 旧节点缺字段语义）；`None` 恢复真实值。
     pub fn set_data_wire_version(&self, node: &str, v: Option<u32>) {
         let mut m = self.versions.lock().unwrap();
+        match v {
+            Some(v) => m.insert(node.to_string(), v),
+            None => m.remove(node),
+        };
+    }
+
+    /// Phase 0：伪造某 peer 的 fenced meta 能力位（模拟 wire 2 但忽略 token 的 pre-fix 节点）。
+    pub fn set_fenced_meta(&self, node: &str, v: Option<bool>) {
+        let mut m = self.fenced_meta.lock().unwrap();
         match v {
             Some(v) => m.insert(node.to_string(), v),
             None => m.remove(node),
@@ -3107,6 +3119,7 @@ impl crate::mesh::MeshTransport for InProcessMesh {
             )));
         }
         let version = self.versions.lock().unwrap().get(node).copied();
+        let fenced = self.fenced_meta.lock().unwrap().get(node).copied();
         self.health_log
             .lock()
             .unwrap()
@@ -3114,6 +3127,9 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         let mut h = self.peer(node).await?.mesh_health().await;
         if let Some(v) = version {
             h.data_wire_version = v;
+        }
+        if let Some(v) = fenced {
+            h.fenced_meta = v;
         }
         Ok(h)
     }
@@ -5765,13 +5781,15 @@ async fn cluster_stale_fence_token_is_conflict_and_keeps_newer() {
     }
 }
 
-/// 混版集群：旧版 peer 会静默忽略 `fence_token` → fenced 写必须 fail-closed，且不得落
-/// 任何 `.new`；数据面 `None` 路径在 placement v1 混版窗口仍可写。
+/// 混版集群：旧版 peer（wire 1）或同 wire 但不执行 token 的 pre-fix peer（fenced_meta=false）
+/// 都会静默忽略 `fence_token` → fenced 写必须 fail-closed 且不落 `.new`；能力位为 true 时
+/// 才放行。数据面 `None` 路径在 placement v1 混版窗口仍可写。
 #[tokio::test]
-async fn fenced_meta_refuses_legacy_peer() {
+async fn fenced_meta_refuses_legacy_or_uncapable_peer() {
     let c = Cluster::new(4, 3).await;
     let s1 = &c.stores[0];
     let k = "control/legacy";
+    // 1) wire 1：旧版 peer
     c.mesh.set_data_wire_version("n2", Some(1));
     match s1
         .write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 1, 1), None, Some(1))
@@ -5779,6 +5797,23 @@ async fn fenced_meta_refuses_legacy_peer() {
     {
         Err(Error::PeerIncompatible(_)) => {}
         other => panic!("混版集群的 fenced 写必须 fail-closed，实际：{other:?}"),
+    }
+    // 数据面 None 不受影响
+    assert!(
+        s1.write_meta(layout::SYS_DIR, k, &fenced_meta(k, 1, 1), None)
+            .await
+            .unwrap()
+            >= 9
+    );
+    // 2) wire 2，但 pre-fix 节点不懂 `fence_token`（能力位 false）→ 同样拒绝
+    c.mesh.set_data_wire_version("n2", None);
+    c.mesh.set_fenced_meta("n2", Some(false));
+    match s1
+        .write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 2), None, Some(2))
+        .await
+    {
+        Err(Error::PeerIncompatible(_)) => {}
+        other => panic!("无 fenced 能力的 peer 必须 fail-closed，实际：{other:?}"),
     }
     for dirs in &c.dirs {
         for d in dirs {
@@ -5788,9 +5823,10 @@ async fn fenced_meta_refuses_legacy_peer() {
             assert!(!tokio::fs::try_exists(&p).await.unwrap(), "{}", p.display());
         }
     }
-    assert!(s1.read_meta(layout::SYS_DIR, k).await.unwrap().is_none());
+    // 3) 能力位为 true → 放行
+    c.mesh.set_fenced_meta("n2", Some(true));
     assert!(
-        s1.write_meta(layout::SYS_DIR, k, &fenced_meta(k, 1, 1), None)
+        s1.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 2), None, Some(2))
             .await
             .unwrap()
             >= 9

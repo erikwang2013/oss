@@ -88,6 +88,8 @@ impl Store {
             topo_hash: caps.topo_hash,
             drives: self.drive_spaces(),
             maintenance: self.cfg.maintenance,
+            // Phase 0：本版理解 `MetaWrite.fence_token`；旧节点缺字段 → false。
+            fenced_meta: true,
         }
     }
 
@@ -186,28 +188,45 @@ impl Store {
 
     /// Phase 0：fenced meta 能力闸门。旧版 peer 会把 `fence_token` 当 proto3 未知字段
     /// 静默忽略，其无校验的 commit 会被计成合法翻转 → 混版集群必须拒绝 fenced 控制写。
-    /// 探测失败同样 fail-closed（无法确认即拒绝；控制面写频率低，安全优先）。
+    /// 探测失败超时同样 fail-closed（无法确认即拒绝；控制面写频率低，安全优先）。
     pub(in crate::store) async fn ensure_fenced_meta_compatible(&self) -> Result<()> {
+        // 并发探测 + 单一总预算：串行会在 (N-1) 个 TonicMesh 超时上阻塞控制面写。
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return Ok(());
         };
         let local = self.local_caps();
         let self_id = cl.sets.flat.self_node().id.as_str();
-        for n in &cl.sets.flat.nodes {
-            if n.id == self_id {
-                continue;
-            }
-            let caps = cl.transport.peer_caps(&n.id).await.map_err(|e| {
-                Error::PeerIncompatible(format!("fenced meta 无法确认节点 {} 的能力：{e}", n.id))
-            })?;
-            if crate::mesh_gate::check_peer(&n.id, &caps, &local)?
+        let probes = cl
+            .sets
+            .flat
+            .nodes
+            .iter()
+            .filter(|n| n.id != self_id)
+            .map(|n| {
+                let transport = &cl.transport;
+                async move {
+                    let caps = transport.peer_caps(&n.id).await.map_err(|e| {
+                        Error::PeerIncompatible(format!(
+                            "fenced meta 无法确认节点 {} 的能力：{e}",
+                            n.id
+                        ))
+                    })?;
+                    Ok::<_, Error>((n.id.as_str(), caps))
+                }
+            });
+        let probed = tokio::time::timeout(PROBE_TIMEOUT, futures::future::try_join_all(probes))
+            .await
+            .map_err(|_| Error::PeerIncompatible("fenced meta 能力探测超时".into()))??;
+        for (node, caps) in probed {
+            // 线格式只保证「新版」；pre-fix 节点同样报 wire 2 但会忽略 token → 必须看能力位。
+            if crate::mesh_gate::check_peer(node, &caps, &local)?
                 != crate::mesh_gate::PeerClass::Current
+                || !caps.fenced_meta
             {
                 return Err(Error::PeerIncompatible(format!(
-                    "fenced meta 要求全节点现版：节点 {} 数据面线格式 {} < {}",
-                    n.id,
-                    caps.wire_version,
-                    crate::mesh_gate::DATA_WIRE_VERSION
+                    "fenced meta 要求全节点现版且支持 token：节点 {node} wire={} fenced_meta={}",
+                    caps.wire_version, caps.fenced_meta
                 )));
             }
         }
