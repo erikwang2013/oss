@@ -370,6 +370,24 @@ impl LockGuard {
     }
 }
 
+/// 控制对象读状态（Phase 0 round 3）：提交证书是唯一可见性判据；未提交/损坏副本只用于
+/// 版本与 token 高水位、以及「无证书时缺席 vs 不可判定」的 fail-closed 判定。
+pub(in crate::store) struct ControlRead {
+    /// 带证书的选举版本（`(fence_token, control_version)` token 优先；token 已置为该读
+    /// 观察到的全局最大 token，供 CAS/锁下限）。
+    pub certified: Option<XlMeta>,
+    /// 选举版本的全部证书槽位（全局槽号）——第一阶段必须保留其中至少一个。
+    pub certified_slots: Vec<u16>,
+    /// 全部副本（含未提交）的最大 control_version：新版本 = 该值 + 1（防未提交版本被复用）。
+    pub max_version: u64,
+    /// 全部副本（含未提交）的最大 fence_token。
+    pub max_token: u64,
+    /// 已解码副本数（含未提交）。
+    pub copies: u32,
+    /// 损坏副本数（解码失败/键不一致/IO 错误）。
+    pub corrupt: u32,
+}
+
 impl Store {
     pub async fn open(cfg: StoreConfig) -> Result<Self> {
         // 信任边界：内联阈值不得超过 meta 解码上限，否则写出的 meta 重启后会被自己拒收
@@ -1246,24 +1264,14 @@ impl Store {
     /// 副本** → `Err(CorruptMeta)`（fail-closed，不把「盘上有坏 meta」伪装成 404）。
     async fn read_meta(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return Ok(self.read_meta_cluster(bucket, key, false, false).await?.0);
+            return self.read_meta_cluster(bucket, key, false).await;
         }
-        self.read_meta_local(bucket, key, false)
-            .await
-            .map(|(m, _)| m)
+        self.read_meta_local(bucket, key).await
     }
 
-    /// 单机/多盘 meta 扫描。`committed_only`（控制对象）只接受带提交证书
-    /// （`control_committed == Some(true)`）的副本、按 `control_version` 选举，并返回
-    /// **全部**副本（含未提交）的最大 fence_token；没有已提交副本 → `(None, max_token)`
-    /// （未提交/损坏都不作为可见版本，CAS 可用 `expected_version=None` 重建，不楔死）。
-    #[allow(clippy::type_complexity)]
-    async fn read_meta_local(
-        &self,
-        bucket: &str,
-        key: &str,
-        committed_only: bool,
-    ) -> Result<(Option<XlMeta>, u64)> {
+    /// 数据面单机/多盘 meta 扫描：`rank()` 最大者胜；一个可用副本都没有但见过损坏
+    /// 副本 → `Err(CorruptMeta)`（fail-closed）。控制对象走 [`Self::read_control`]。
+    async fn read_meta_local(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         // 路径先统一解析（错误口径同串行：首个坏路径即上抛），再并发读各盘；
         // 结果按盘序处理，秩并列时仍取靠前盘——与逐盘串行版逐字节一致。
         let paths = self
@@ -1274,29 +1282,14 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         let reads = futures::future::join_all(paths.iter().map(tokio::fs::read));
         let mut best: Option<((u64, i64), XlMeta)> = None;
-        let mut best_control: Option<((u64, u64), XlMeta)> = None;
-        let mut committed: Vec<XlMeta> = Vec::new();
-        let mut max_token = 0u64;
         let mut corrupt: Option<String> = None;
         for (path, read) in paths.iter().zip(reads.await) {
             match read {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
-                        if committed_only {
-                            max_token = max_token.max(m.fence_token.unwrap_or(0));
-                            if m.control_committed == Some(true) {
-                                let t =
-                                    (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0));
-                                if best_control.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                                    best_control = Some((t, m.clone()));
-                                }
-                                committed.push(m);
-                            }
-                        } else {
-                            let t = m.rank();
-                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                                best = Some((t, m));
-                            }
+                        let t = m.rank();
+                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                            best = Some((t, m));
                         }
                     }
                     Ok(m) => {
@@ -1321,59 +1314,291 @@ impl Store {
                 }
             }
         }
-        if committed_only {
-            let Some(((version, _), mut chosen)) = best_control else {
-                return Ok((None, max_token));
-            };
-            // 同版本（忽略 fence_token——补偿回滚会用旧内容 + 新 token）不同内容 = 分叉
-            let mut seen: Option<[u8; 32]> = None;
-            for m in committed
-                .iter()
-                .filter(|m| m.control_version.unwrap_or(0) == version)
-            {
-                let mut logical = m.clone();
-                logical.fence_token = None;
-                let h = crate::mesh::content_hash(&logical.encode()?);
-                match seen {
-                    Some(prev) if prev != h => {
-                        return Err(Error::CorruptMeta(format!(
-                            "控制对象 {key:?} 同版本分叉：v{version} 有多份不同内容"
-                        )));
-                    }
-                    _ => seen = Some(h),
-                }
-            }
-            chosen.fence_token = Some(max_token);
-            return Ok((Some(chosen), max_token));
-        }
         match best {
-            Some((_, m)) => Ok((Some(m), max_token)),
+            Some((_, m)) => Ok(Some(m)),
             None => match corrupt {
                 Some(why) => Err(Error::CorruptMeta(why)),
-                None => Ok((None, max_token)),
+                None => Ok(None),
             },
         }
     }
 
-    /// 集群 meta 读 = 覆盖率快路径（Task 6 / 计划 D1）：并发问本机各盘 + 全 peer，
+    /// 控制对象读（唯一聚合入口）：只在**带提交证书**的副本中按 `(fence_token,
+    /// control_version)` token 优先选举——更新写者的高 token 不会被旧版本的残余证书遮蔽。
+    /// 返回全部观测值供调用方做 fail-closed/版本推进判定；本身不因「无证书」报错。
+    pub(in crate::store) async fn read_control(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<ControlRead> {
+        if self.cfg.cluster.is_some() {
+            return self.read_control_cluster(bucket, key).await;
+        }
+        self.read_control_local(bucket, key).await
+    }
+
+    /// 控制对象公开读：有证书 → 返回证书版本；无证书但有未提交/损坏副本 →
+    /// `CorruptMeta`（fail-closed，**绝不**把「无法判定」伪装成缺席）；副本为零 → 缺席。
+    /// 集群覆盖 < Q_s 已在 `read_control_cluster` 内 fail-closed。
+    pub(in crate::store) async fn read_control_strict(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<XlMeta>> {
+        let st = self.read_control(bucket, key).await?;
+        if st.certified.is_some() {
+            return Ok(st.certified);
+        }
+        if st.copies > 0 || st.corrupt > 0 {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 无提交证书但存在 {} 份副本（{} 份损坏）：无法判定可见版本",
+                st.copies, st.corrupt
+            )));
+        }
+        Ok(None)
+    }
+
+    /// 单机/多盘控制对象扫描（全盘并集，无覆盖阈值）。槽号 = 盘下标（单机从 0 起）。
+    async fn read_control_local(&self, bucket: &str, key: &str) -> Result<ControlRead> {
+        let paths = self
+            .cfg
+            .drives
+            .iter()
+            .map(|drive| Ok(layout::object_dir_for(drive, bucket, key)?.join(meta::META_FILE)))
+            .collect::<Result<Vec<_>>>()?;
+        let reads = futures::future::join_all(paths.iter().map(tokio::fs::read));
+        let mut certified: Vec<(u16, XlMeta)> = Vec::new();
+        let mut st = ControlRead {
+            certified: None,
+            certified_slots: Vec::new(),
+            max_version: 0,
+            max_token: 0,
+            copies: 0,
+            corrupt: 0,
+        };
+        for (d, (path, read)) in paths.iter().zip(reads.await).enumerate() {
+            match read {
+                Ok(bytes) => match XlMeta::decode(&bytes) {
+                    Ok(m) if m.object_key == key => {
+                        st.copies += 1;
+                        st.max_version = st.max_version.max(m.control_version.unwrap_or(0));
+                        st.max_token = st.max_token.max(m.fence_token.unwrap_or(0));
+                        if m.control_committed == Some(true) {
+                            certified.push((d as u16, m));
+                        }
+                    }
+                    Ok(m) => {
+                        st.corrupt += 1;
+                        tracing::warn!(
+                            path = %path.display(),
+                            "控制对象 meta 键不一致（{:?}），跳过该盘",
+                            m.object_key
+                        );
+                    }
+                    Err(e) => {
+                        st.corrupt += 1;
+                        tracing::warn!(path = %path.display(), error = %e, "控制对象 meta 解码失败，跳过该盘");
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    st.corrupt += 1;
+                    tracing::warn!(path = %path.display(), error = %e, "控制对象 meta 读取失败，跳过该盘");
+                }
+            }
+        }
+        Self::elect_control(key, &certified, Vec::new(), st)
+    }
+
+    /// 集群控制对象读：**全量扇出**（控制读低频；覆盖率提前停会漏掉部分证书/副本，
+    /// Critical B）→ 覆盖 ≥ Q_s → token 优先选举 → 缺席/不可判定判定由调用方做。
+    async fn read_control_cluster(&self, bucket: &str, key: &str) -> Result<ControlRead> {
+        // 混版 / 未理解证书协议的节点会给出错误可见性 → 可达 peer 必须全部支持。
+        self.ensure_control_quorum_compatible().await?;
+        use futures::StreamExt as _;
+        let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
+        let q_s = self.cfg.ec.data as usize + 1;
+        let self_id = cl.sets.flat.self_node().id.clone();
+        let base = self.slot_base();
+
+        let mut certified: Vec<(u16, XlMeta)> = Vec::new();
+        let mut remote_certified: Vec<(Vec<u16>, XlMeta)> = Vec::new();
+        let mut covered = 0usize;
+        let mut st = ControlRead {
+            certified: None,
+            certified_slots: Vec::new(),
+            max_version: 0,
+            max_token: 0,
+            copies: 0,
+            corrupt: 0,
+        };
+
+        // 本机各盘（NotFound 也是确定性观察；IO/解码错误不计覆盖但计损坏）
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
+            if !drives::drive_up(drive).await {
+                continue;
+            }
+            let path = layout::object_dir_for(drive, bucket, key)?.join(meta::META_FILE);
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => match XlMeta::decode(&bytes) {
+                    Ok(m) if m.object_key == key => {
+                        covered += 1;
+                        st.copies += 1;
+                        st.max_version = st.max_version.max(m.control_version.unwrap_or(0));
+                        st.max_token = st.max_token.max(m.fence_token.unwrap_or(0));
+                        if m.control_committed == Some(true) {
+                            certified.push((base + d as u16, m));
+                        }
+                    }
+                    Ok(m) => {
+                        st.corrupt += 1;
+                        tracing::warn!(
+                            drive = %drive.display(),
+                            "控制对象 meta 键不一致（{:?}），跳过该盘",
+                            m.object_key
+                        );
+                    }
+                    Err(e) => {
+                        st.corrupt += 1;
+                        tracing::warn!(drive = %drive.display(), error = %e, "控制对象 meta 解码失败");
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => covered += 1,
+                Err(e) => {
+                    st.corrupt += 1;
+                    tracing::warn!(drive = %drive.display(), error = %e, "控制对象 meta 读取失败");
+                }
+            }
+        }
+
+        // 全量扇出：控制读必须看到每个可达节点的证书/副本（不因本机覆盖够数而提前停）。
+        let mut futs = futures::stream::FuturesUnordered::new();
+        for n in &cl.sets.flat.nodes {
+            if n.id == self_id {
+                continue;
+            }
+            let r = crate::mesh::MetaRead {
+                bucket: bucket.into(),
+                key: key.into(),
+            };
+            let node = n.id.clone();
+            futs.push(async move {
+                let res = cl.transport.read_meta(&node, r).await;
+                (node, res)
+            });
+        }
+        while let Some((node, res)) = futs.next().await {
+            match res {
+                Ok(snap) => {
+                    covered += snap.slots_ok as usize;
+                    st.copies += snap.copies;
+                    st.corrupt += snap.corrupt;
+                    st.max_version = st.max_version.max(snap.max_version);
+                    st.max_token = st.max_token.max(snap.max_token);
+                    if let Some(meta_bytes) = snap.meta {
+                        match XlMeta::decode(&meta_bytes) {
+                            Ok(m) if m.object_key == key => {
+                                remote_certified.push((snap.certified_slots, m))
+                            }
+                            Ok(m) => {
+                                st.corrupt += 1;
+                                tracing::warn!(
+                                    node = %node,
+                                    "远端控制对象键不一致：{:?}",
+                                    m.object_key
+                                );
+                            }
+                            Err(e) => {
+                                st.corrupt += 1;
+                                tracing::warn!(node = %node, error = %e, "远端控制对象解码失败");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(node = %node, error = %e, "远端控制对象读取失败（覆盖不计）")
+                }
+            }
+        }
+
+        if covered < q_s {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 meta 覆盖不足 quorum：{covered}/{q_s}（分区/节点不可达时拒绝读，fail-closed）"
+            )));
+        }
+        Self::elect_control(key, &certified, remote_certified, st)
+    }
+
+    /// 汇总本地 + 远端证书副本：token 优先选举；同版本（忽略 fence_token）分叉 → fail-closed；
+    /// `certified_slots` 收集选举版本的全部证书槽位。
+    fn elect_control(
+        key: &str,
+        local: &[(u16, XlMeta)],
+        remote: Vec<(Vec<u16>, XlMeta)>,
+        mut st: ControlRead,
+    ) -> Result<ControlRead> {
+        let elected = local
+            .iter()
+            .map(|(_, m)| m)
+            .chain(remote.iter().map(|(_, m)| m))
+            .max_by_key(|m| (m.fence_token.unwrap_or(0), m.control_version.unwrap_or(0)))
+            .cloned();
+        let Some(mut chosen) = elected else {
+            return Ok(st);
+        };
+        let version = chosen.control_version.unwrap_or(0);
+        st.certified_slots = local
+            .iter()
+            .filter(|(_, m)| m.control_version.unwrap_or(0) == version)
+            .map(|(slot, _)| *slot)
+            .chain(
+                remote
+                    .iter()
+                    .filter(|(_, m)| m.control_version.unwrap_or(0) == version)
+                    .flat_map(|(slots, _)| slots.iter().copied()),
+            )
+            .collect();
+        st.certified_slots.sort_unstable();
+        st.certified_slots.dedup();
+        // 同版本（忽略 fence_token——补偿回滚会用旧内容 + 新 token）不同内容 = 分叉
+        let mut seen: Option<[u8; 32]> = None;
+        for m in local
+            .iter()
+            .map(|(_, m)| m)
+            .chain(remote.iter().map(|(_, m)| m))
+            .filter(|m| m.control_version.unwrap_or(0) == version)
+        {
+            let mut logical = m.clone();
+            logical.fence_token = None;
+            let h = crate::mesh::content_hash(&logical.encode()?);
+            match seen {
+                Some(prev) if prev != h => {
+                    return Err(Error::CorruptMeta(format!(
+                        "控制对象 {key:?} 同版本分叉：v{version} 有多份不同内容"
+                    )));
+                }
+                _ => seen = Some(h),
+            }
+        }
+        chosen.fence_token = Some(st.max_token);
+        st.certified = Some(chosen);
+        Ok(st)
+    }
+
+    /// 集群数据面 meta 读 = 覆盖率快路径（Task 6 / 计划 D1）：并发问本机各盘 + 全 peer，
     /// **覆盖 ≥ Q_s 即取最新并停**（取消掉队者——SIGSTOP 节点不再拖尾延迟）；
     /// **收完全部仍覆盖 < Q_s → Err(CorruptMeta)**（fail-closed；内联对象的数据也在 meta
     /// 里，覆盖不足时返回旧副本等于破坏 quorum 读语义——验收⑤的 500 口径同此）。
     /// 相交证明：提交 ≥Q_s 与读覆盖 ≥Q_s 在槽位域必相交 → 最新已提交版本必在覆盖内；
     /// 覆盖 ≥Q_s 且无副本 → 缺席可证明（任何已提交副本都落在覆盖交集里）。
     /// `full=false` 快路径提前停；`full=true` 收满全部响应（get_object 的回退一次）。
-    ///
-    /// `quorum=true`（仅控制对象）：只认**提交证书**（`control_committed == Some(true)`）——
-    /// 取 `control_version` 最高的已提交副本；第一阶段半翻（无证书）永不出现。返回
-    /// `(可见 meta, 全部副本含未提交的最大 fence_token)`，后者供 CAS/锁下限使用。
-    /// max-rank 选举只在数据面/非 quorum 模式使用。
+    /// 控制对象不走这里——见 [`Self::read_control_cluster`]（全量扇出 + 证书选举）。
     async fn read_meta_cluster(
         &self,
         bucket: &str,
         key: &str,
         full: bool,
-        quorum: bool,
-    ) -> Result<(Option<XlMeta>, u64)> {
+    ) -> Result<Option<XlMeta>> {
         // DP-0：混版集群在扇出前 fail-closed（集群读吞传输错 → 不清 503 会退化成 500）。
         self.ensure_data_plane_compatible().await?;
         use futures::StreamExt as _;
@@ -1384,9 +1609,6 @@ impl Store {
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0usize;
-        // quorum 模式：只收带提交证书的副本；max_token 覆盖全部副本（含未提交）。
-        let mut committed: Vec<XlMeta> = Vec::new();
-        let mut max_token = 0u64;
 
         // 本机各盘扫描（就地计数：NotFound 也是确定性观察；IO/解码错误不计）
         for drive in &self.cfg.drives {
@@ -1398,16 +1620,9 @@ impl Store {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
                         covered += 1;
-                        if quorum {
-                            max_token = max_token.max(m.fence_token.unwrap_or(0));
-                            if m.control_committed == Some(true) {
-                                committed.push(m);
-                            }
-                        } else {
-                            let t = m.rank();
-                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                                best = Some((t, m));
-                            }
+                        let t = m.rank();
+                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                            best = Some((t, m));
                         }
                     }
                     Ok(m) => {
@@ -1444,20 +1659,12 @@ impl Store {
                 match res {
                     Ok(snap) => {
                         covered += snap.slots_ok as usize;
-                        max_token = max_token.max(snap.max_token);
                         if let Some(meta_bytes) = snap.meta {
                             match XlMeta::decode(&meta_bytes) {
                                 Ok(m) if m.object_key == key => {
-                                    if quorum {
-                                        // 服务端只返回已提交副本；防御性复查证书
-                                        if m.control_committed == Some(true) {
-                                            committed.push(m);
-                                        }
-                                    } else {
-                                        let t = m.rank();
-                                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                                            best = Some((t, m));
-                                        }
+                                    let t = m.rank();
+                                    if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                        best = Some((t, m));
                                     }
                                 }
                                 Ok(m) => {
@@ -1485,64 +1692,13 @@ impl Store {
                 "meta 覆盖不足 quorum：{covered}/{q_s}（分区/节点不可达时拒绝读，fail-closed）"
             )));
         }
-        if quorum {
-            // 提交证书是唯一可见性判据：标记阶段以第一阶段 quorum 成功为前提，因此
-            // 任意一份带证书副本即可见（崩溃留下的第一阶段半翻副本没有证书）。
-            let Some(max_version) = committed
-                .iter()
-                .map(|m| m.control_version.unwrap_or(0))
-                .max()
-            else {
-                // 覆盖 ≥ Q_s 且无已提交副本：未提交/被更新写覆盖 → 缺席（可 CAS 重建）
-                return Ok((None, max_token));
-            };
-            let mut at_version: Vec<XlMeta> = committed
-                .into_iter()
-                .filter(|m| m.control_version.unwrap_or(0) == max_version)
-                .collect();
-            // 同版本（忽略 fence_token——补偿回滚会用旧内容 + 新 token）不同内容 = 分叉
-            let mut seen: Option<[u8; 32]> = None;
-            for m in &at_version {
-                let mut logical = m.clone();
-                logical.fence_token = None;
-                let h = crate::mesh::content_hash(&logical.encode()?);
-                match seen {
-                    Some(prev) if prev != h => {
-                        return Err(Error::CorruptMeta(format!(
-                            "控制对象 {key:?} 同版本分叉：v{max_version} 有多份不同内容"
-                        )));
-                    }
-                    _ => seen = Some(h),
-                }
-            }
-            let Some(mut chosen) = at_version.pop() else {
-                return Ok((None, max_token));
-            };
-            chosen.fence_token = Some(max_token);
-            return Ok((Some(chosen), max_token));
-        }
         match best {
-            Some((_, m)) => Ok((Some(m), max_token)),
+            Some((_, m)) => Ok(Some(m)),
             None => match corrupt {
                 Some(why) => Err(Error::CorruptMeta(why)),
-                None => Ok((None, max_token)),
+                None => Ok(None),
             },
         }
-    }
-
-    /// 控制对象提交确认读（见 [`Self::read_meta_cluster`] 的 `quorum`）：只认提交证书，
-    /// 返回 `(可见 meta, 全部副本含未提交的最大 fence_token)`。未提交副本永不出现；
-    /// 无已提交副本 → `(None, max_token)`（可 CAS 重建，不楔死）。
-    #[allow(clippy::type_complexity)]
-    async fn read_meta_quorum_confirmed(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<(Option<XlMeta>, u64)> {
-        if self.cfg.cluster.is_some() {
-            return self.read_meta_cluster(bucket, key, true, true).await;
-        }
-        self.read_meta_local(bucket, key, true).await
     }
 
     /// 全量扇出版（不提前停）：get_object 在快路径集合的数据轮失败后的**回退一次**——
@@ -1550,7 +1706,7 @@ impl Store {
     /// 单节点退化为普通 read_meta。
     async fn read_meta_full(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return Ok(self.read_meta_cluster(bucket, key, true, false).await?.0);
+            return self.read_meta_cluster(bucket, key, true).await;
         }
         self.read_meta(bucket, key).await
     }
@@ -1623,7 +1779,23 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
     ) -> Result<usize> {
-        self.write_meta_fenced_mode(bucket, key, m, old, fence_token, false)
+        self.write_meta_fenced_mode(bucket, key, m, old, fence_token, false, None)
+            .await
+    }
+
+    /// 控制对象第一阶段写：`preserve` = 必须原样保留的已提交旧槽位（全局槽号）。
+    /// 翻转集 = 可达槽位中排除 `preserve` 后按槽号取前 Q_s（集群）或全部（单机多盘）——
+    /// 第二阶段失败时读仍能回退到这份旧证书副本（Critical A）。
+    pub(in crate::store) async fn write_meta_fenced_preserving(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+        fence_token: u64,
+        preserve: Option<u16>,
+    ) -> Result<usize> {
+        self.write_meta_fenced_mode(bucket, key, m, old, Some(fence_token), false, preserve)
             .await
     }
 
@@ -1637,8 +1809,9 @@ impl Store {
         key: &str,
         m: &XlMeta,
         fence_token: u64,
+        preserve: Option<u16>,
     ) -> Result<usize> {
-        self.write_meta_fenced_mode(bucket, key, m, None, Some(fence_token), true)
+        self.write_meta_fenced_mode(bucket, key, m, None, Some(fence_token), true, preserve)
             .await
     }
 
@@ -1650,10 +1823,11 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
         marker: bool,
+        preserve: Option<u16>,
     ) -> Result<usize> {
         if self.cfg.cluster.is_some() {
             return self
-                .write_meta_cluster(bucket, key, m, old, fence_token, marker)
+                .write_meta_cluster(bucket, key, m, old, fence_token, marker, preserve)
                 .await;
         }
         if self.cfg.drives.len() == 1 {
@@ -1697,8 +1871,8 @@ impl Store {
         // 阶段一：准备（掉线盘先探测——挂载点目录仍在父 fs 上，盲写会填满根盘）
         // shortcut: prepare 直接覆盖既有 `.new`（本地/远端同语义）——并发 fenced 写者由
         // 调用方持有的对象锁串行化；锁语义放宽时须改为按 token 拒绝旧 prepare。
-        let mut prepared: Vec<&PathBuf> = Vec::new();
-        for drive in &self.cfg.drives {
+        let mut prepared: Vec<usize> = Vec::new();
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
             if !drives::drive_up(drive).await {
                 tracing::warn!(drive = %drive.display(), "盘不在册，跳过 meta 准备");
                 continue;
@@ -1716,12 +1890,13 @@ impl Store {
             }
             .await;
             match res {
-                Ok(()) => prepared.push(drive),
+                Ok(()) => prepared.push(d),
                 Err(e) => tracing::warn!(drive = %drive.display(), error = %e, "meta 准备失败"),
             }
         }
         if prepared.len() < quorum {
-            for drive in &prepared {
+            for d in &prepared {
+                let drive = &self.cfg.drives[*d];
                 match fence_token {
                     Some(t) => self.remove_meta_new_fenced(drive, bucket, key, t).await,
                     None => {
@@ -1738,6 +1913,14 @@ impl Store {
             )));
         }
 
+        // 控制对象第一阶段：保留 `preserve` 槽的已提交旧副本，其余全部翻转。数据面
+        // `preserve = None` → 翻转集 = 全部已准备盘（逐字节旧行为）。
+        let flip_set: Vec<usize> = prepared
+            .iter()
+            .copied()
+            .filter(|d| preserve != Some(*d as u16))
+            .collect();
+
         // 阶段二：翻转
         // 测试注入（Task 9 扩展）：准备完成即崩 / 翻到第 k 盘即崩——覆盖两阶段协议的两个核心窗口
         let flip_abort: Option<usize> = std::env::var("OSS_TEST_ABORT_META_FLIP_K")
@@ -1752,7 +1935,8 @@ impl Store {
         }
         let mut flipped = 0usize;
         let mut stale = false;
-        for drive in &prepared {
+        for d in &flip_set {
+            let drive = &self.cfg.drives[*d];
             match fence_token {
                 // 数据面：原 rename 语义（含 hash 不参与计数）
                 None => {
@@ -1813,6 +1997,15 @@ impl Store {
                 "fence token 过期：{bucket}/{key} 已由更新写者提交"
             )));
         }
+        // 保留槽（若已 prepare）与未入选翻转的暂存必须清掉：它们不属于本次提交点。
+        if let Some(t) = fence_token {
+            for d in &prepared {
+                if !flip_set.contains(d) {
+                    self.remove_meta_new_fenced(&self.cfg.drives[*d], bucket, key, t)
+                        .await;
+                }
+            }
+        }
         Ok(flipped)
     }
 
@@ -1828,10 +2021,11 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
         marker: bool,
+        preserve: Option<u16>,
     ) -> Result<usize> {
-        // 旧版 peer 会静默忽略 `fence_token`（proto3 未知字段）→ 混版集群拒绝 fenced 控制写。
+        // 旧版 peer 会静默忽略 `fence_token`/证书语义 → 混版集群拒绝控制写。
         if fence_token.is_some() {
-            self.ensure_fenced_meta_compatible().await?;
+            self.ensure_control_quorum_compatible().await?;
         }
         // DP-0：写 prepare 阶段的传输错会被 quorum 计数吞掉（→ QuorumUnmet/500），
         // 必须在任何本地 .new 落盘前做混版 fail-closed。
@@ -1861,19 +2055,32 @@ impl Store {
             meta: bytes.clone(),
             fence_token,
             restore: false,
+            slots: Vec::new(), // prepare 全部可达槽位；commit 才按翻转集过滤
         };
-        let mut prepared_remote = 0usize;
+        let mut prepared_all: Vec<u16> = prepared_local.clone();
         for n in &cl.sets.flat.nodes {
             if n.id == self_id {
                 continue;
             }
             match cl.transport.prepare_meta(&n.id, mw.clone()).await {
-                Ok(ack) => prepared_remote += ack.slots.iter().filter(|s| s.ok).count(),
+                Ok(ack) => prepared_all.extend(ack.slots.iter().filter(|s| s.ok).map(|s| s.slot)),
                 Err(e) => tracing::warn!(node = %n.id, error = %e, "meta 准备 RPC 失败"),
             }
         }
-        let prepared = prepared_local.len() + prepared_remote;
-        if prepared < q_s {
+        let prepared = prepared_all.len();
+        prepared_all.sort_unstable();
+        // 控制对象：翻转集恰为 Q_s 且排除 `preserve`（保留一份已提交旧副本）；数据面
+        // （`fence_token = None`）翻转集 = 全部已准备槽位，逐字节旧行为。
+        let flip_set: Vec<u16> = match fence_token {
+            Some(_) => prepared_all
+                .iter()
+                .copied()
+                .filter(|s| preserve != Some(*s))
+                .take(q_s)
+                .collect(),
+            None => prepared_all.clone(),
+        };
+        if prepared < q_s || (fence_token.is_some() && flip_set.len() < q_s) {
             // 一盘未翻转：清 .new（best-effort）→ QuorumUnmet，调用方回滚数据目录
             for drive in &self.cfg.drives {
                 match fence_token {
@@ -1893,16 +2100,24 @@ impl Store {
             }
             self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
-                "meta 集群准备 {prepared}/{q_s}，未提交"
+                "meta 集群准备 {prepared}/{q_s}（可翻转 {}），未提交",
+                flip_set.len()
             )));
         }
+        let commit_mw = crate::mesh::MetaWrite {
+            slots: match fence_token {
+                Some(_) => flip_set.clone(),
+                None => Vec::new(),
+            },
+            ..mw.clone()
+        };
 
         // ---- 阶段二：commit（本机单次；远端每节点至多两次机会——rename 幂等，.new 仍在） ----
         let mut flipped_local: Vec<u16> = Vec::new();
         let mut stale = false;
         for (d, drive) in self.cfg.drives.iter().enumerate() {
             let slot = base + d as u16;
-            if !prepared_local.contains(&slot) {
+            if !flip_set.contains(&slot) {
                 continue;
             }
             match self.commit_meta_on(drive, bucket, key, fence_token).await {
@@ -1928,7 +2143,7 @@ impl Store {
                 continue;
             }
             for attempt in 0..2 {
-                match cl.transport.commit_meta(&n.id, mw.clone()).await {
+                match cl.transport.commit_meta(&n.id, commit_mw.clone()).await {
                     Ok(ack) => {
                         stale |= ack.slots.iter().any(|s| s.stale);
                         let mut got = false;
@@ -1961,6 +2176,22 @@ impl Store {
                     prepared,
                     "meta 集群翻转 < 已准备（已提交，M4 heal 补副本）"
                 );
+            }
+            // 控制写按翻转集提交：未入选槽位（含 `preserve`）的 `.new` 不属于本次提交点。
+            if flip_set.len() < prepared {
+                for (d, drive) in self.cfg.drives.iter().enumerate() {
+                    if !flip_set.contains(&(base + d as u16)) {
+                        if let Some(t) = fence_token {
+                            self.remove_meta_new_fenced(drive, bucket, key, t).await;
+                        }
+                    }
+                }
+                for n in &cl.sets.flat.nodes {
+                    if n.id == self_id {
+                        continue;
+                    }
+                    let _ = cl.transport.abort_meta(&n.id, mw.clone()).await;
+                }
             }
             return Ok(flipped);
         }
@@ -2043,6 +2274,7 @@ impl Store {
                             meta: bytes::Bytes::from(om.encode()?),
                             fence_token: None,
                             restore: false,
+                            slots: Vec::new(),
                         };
                         match cl.transport.prepare_meta(&node.id, ow.clone()).await {
                             Ok(_) => cl.transport.commit_meta(&node.id, ow).await.map(|_| ()),
@@ -2149,6 +2381,7 @@ impl Store {
                     meta: bytes::Bytes::from(m.encode()?),
                     fence_token: Some(fence_token),
                     restore: true,
+                    slots: Vec::new(),
                 };
                 match cl.transport.prepare_meta(node, ow.clone()).await {
                     Ok(_) => cl.transport.commit_meta(node, ow).await.map(|_| ()),

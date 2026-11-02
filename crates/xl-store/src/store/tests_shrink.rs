@@ -435,6 +435,7 @@ fn health(node: &str, epoch: u64, hash: &str, maintenance: bool, free: u64) -> N
         data_wire_version: 1,
         topo_epoch: epoch,
         topo_hash: hash.into(),
+        control_quorum: true,
         drives: vec![DriveSpace {
             set: 0,
             drive: 0,
@@ -512,6 +513,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         topo_epoch: 3,
         topo_hash: caps.topo_hash.clone(),
         fenced_meta: true,
+        control_quorum: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &peer, &caps).is_ok());
 
@@ -520,6 +522,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         topo_epoch: 2,
         topo_hash: caps.topo_hash.clone(),
         fenced_meta: true,
+        control_quorum: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &stale, &caps).is_err());
 
@@ -531,6 +534,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         topo_epoch: 4,
         topo_hash: caps4.topo_hash.clone(),
         fenced_meta: true,
+        control_quorum: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &peer4, &caps4).is_ok());
 }

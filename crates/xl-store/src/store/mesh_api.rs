@@ -90,6 +90,8 @@ impl Store {
             maintenance: self.cfg.maintenance,
             // Phase 0：本版理解 `MetaWrite.fence_token`；旧节点缺字段 → false。
             fenced_meta: true,
+            // Phase 0 round 3：本版理解提交证书控制读协议。
+            control_quorum: true,
         }
     }
 
@@ -186,11 +188,14 @@ impl Store {
         Ok(())
     }
 
-    /// Phase 0：fenced meta 能力闸门。旧版 peer 会把 `fence_token` 当 proto3 未知字段
-    /// 静默忽略，其无校验的 commit 会被计成合法翻转 → 混版集群必须拒绝 fenced 控制写。
-    /// 探测失败超时同样 fail-closed（无法确认即拒绝；控制面写频率低，安全优先）。
-    pub(in crate::store) async fn ensure_fenced_meta_compatible(&self) -> Result<()> {
-        // 并发探测 + 单一总预算：串行会在 (N-1) 个 TonicMesh 超时上阻塞控制面写。
+    /// Phase 0 round 3：控制对象证书协议能力闸门（控制读/写都过）。
+    ///
+    /// `fenced_meta` 由 693a7a7 节点已宣告，无法区分证书协议 → 必须看专用
+    /// `control_quorum`。可达 peer 缺位/线格式不兼容 = 混版 → fail-closed；**不可达**
+    /// peer 交给既有 quorum 语义（读覆盖不足 → `CorruptMeta`，写翻不到 Q_s →
+    /// `QuorumUnmet`），不把网络故障伪装成混版，也让分区读能返回 fail-closed 结果。
+    pub(in crate::store) async fn ensure_control_quorum_compatible(&self) -> Result<()> {
+        // 并发探测 + 每 peer 预算：串行会在 (N-1) 个 TonicMesh 超时上阻塞控制面。
         const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         let Some(cl) = self.cfg.cluster.as_deref() else {
             return Ok(());
@@ -205,31 +210,36 @@ impl Store {
             .filter(|n| n.id != self_id)
             .map(|n| {
                 let transport = &cl.transport;
+                let local = &local;
                 async move {
-                    let caps = transport.peer_caps(&n.id).await.map_err(|e| {
-                        Error::PeerIncompatible(format!(
-                            "fenced meta 无法确认节点 {} 的能力：{e}",
-                            n.id
-                        ))
-                    })?;
-                    Ok::<_, Error>((n.id.as_str(), caps))
+                    let caps = match tokio::time::timeout(PROBE_TIMEOUT, transport.peer_caps(&n.id))
+                        .await
+                    {
+                        Ok(Ok(caps)) => caps,
+                        Ok(Err(e)) => {
+                            tracing::warn!(node = %n.id, error = %e, "控制证书能力探测失败（按不可达处理）");
+                            return Ok::<_, Error>(());
+                        }
+                        Err(_) => {
+                            tracing::warn!(node = %n.id, "控制证书能力探测超时（按不可达处理）");
+                            return Ok::<_, Error>(());
+                        }
+                    };
+                    // 线格式只保证「新版」；pre-fix 节点同样报 wire 2 → 必须看专用能力位。
+                    if crate::mesh_gate::check_peer(&n.id, &caps, local)?
+                        != crate::mesh_gate::PeerClass::Current
+                        || !caps.fenced_meta
+                        || !caps.control_quorum
+                    {
+                        return Err(Error::PeerIncompatible(format!(
+                            "控制证书协议要求全节点现版且支持：节点 {} wire={} fenced_meta={} control_quorum={}",
+                            n.id, caps.wire_version, caps.fenced_meta, caps.control_quorum
+                        )));
+                    }
+                    Ok(())
                 }
             });
-        let probed = tokio::time::timeout(PROBE_TIMEOUT, futures::future::try_join_all(probes))
-            .await
-            .map_err(|_| Error::PeerIncompatible("fenced meta 能力探测超时".into()))??;
-        for (node, caps) in probed {
-            // 线格式只保证「新版」；pre-fix 节点同样报 wire 2 但会忽略 token → 必须看能力位。
-            if crate::mesh_gate::check_peer(node, &caps, &local)?
-                != crate::mesh_gate::PeerClass::Current
-                || !caps.fenced_meta
-            {
-                return Err(Error::PeerIncompatible(format!(
-                    "fenced meta 要求全节点现版且支持 token：节点 {node} wire={} fenced_meta={}",
-                    caps.wire_version, caps.fenced_meta
-                )));
-            }
-        }
+        futures::future::try_join_all(probes).await?;
         Ok(())
     }
 }
@@ -814,6 +824,11 @@ impl Store {
         let mut slots = Vec::new();
         for (d, drive) in self.cfg.drives.iter().enumerate() {
             let slot = self.slot_base() + d as u16;
+            // round 3：控制写按协调者选定的翻转集精确提交（保留一份旧证书副本）；
+            // 空表 = 全部槽位（数据面/补偿恢复旧行为）。
+            if !m.slots.is_empty() && !m.slots.contains(&slot) {
+                continue;
+            }
             let res = match (m.restore, m.fence_token) {
                 (true, Some(t)) => self.restore_meta_on(drive, &m.bucket, &m.key, t).await,
                 _ => {
@@ -990,15 +1005,20 @@ impl Store {
         let mut corrupt: Option<String> = None;
         let mut covered = 0u32;
         // 控制对象：只把带提交证书的副本交给协调者——第一阶段数据（未提交）与旧版残缺
-        // 副本永不出现；同时上报**全部**副本（含未提交）的最大 token 供 CAS/锁下限。
+        // 副本永不出现；同时上报**全部**副本（含未提交）的最大 token/version 与计数，
+        // 供 CAS/锁下限、版本推进与「无证书时缺席 vs 不可判定」判定。
         let is_control = layout::is_system_bucket(&r.bucket)
             && r.key.starts_with(super::control::CONTROL_PREFIX);
         let mut max_token = 0u64;
-        let mut decoded: Vec<XlMeta> = Vec::new();
-        for drive in &self.cfg.drives {
+        let mut max_version = 0u64;
+        let mut copies = 0u32;
+        let mut corrupt_n = 0u32;
+        let mut decoded: Vec<(u16, XlMeta)> = Vec::new();
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
             if !drives::drive_up(drive).await {
                 continue;
             }
+            let slot = self.slot_base() + d as u16;
             let path = layout::object_dir_for(drive, &r.bucket, &r.key)?.join(meta::META_FILE);
             match tokio::fs::read(&path).await {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
@@ -1006,7 +1026,9 @@ impl Store {
                         covered += 1;
                         if is_control {
                             max_token = max_token.max(m.fence_token.unwrap_or(0));
-                            decoded.push(m);
+                            max_version = max_version.max(m.control_version.unwrap_or(0));
+                            copies += 1;
+                            decoded.push((slot, m));
                         } else {
                             // 与 store.rs 的 read_meta 选举同口径（rank = (epoch, 链尾 mod_time)）：
                             // 服务端 RPC 是独立选举点，回拨场景漏改会把低 epoch 旧链当最优返回
@@ -1017,40 +1039,71 @@ impl Store {
                         }
                     }
                     Ok(m) => {
+                        if is_control {
+                            corrupt_n += 1;
+                        }
                         corrupt = Some(format!(
                             "键不一致：请求 {:?}，实为 {:?}",
                             r.key, m.object_key
                         ));
                     }
-                    Err(e) => corrupt = Some(e.to_string()),
+                    Err(e) => {
+                        if is_control {
+                            corrupt_n += 1;
+                        }
+                        corrupt = Some(e.to_string());
+                    }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => covered += 1,
-                Err(e) => corrupt = Some(e.to_string()),
+                Err(e) => {
+                    if is_control {
+                        corrupt_n += 1;
+                    }
+                    corrupt = Some(e.to_string());
+                }
             }
         }
         if is_control {
-            // 协调者按全局 control_version 选举；本节点只需要给出自己的最高已提交副本。
-            return Ok(
-                match decoded
-                    .into_iter()
-                    .filter(|m| m.control_committed == Some(true))
-                    .max_by_key(|m| (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0)))
-                {
-                    Some(m) => crate::mesh::MetaSnapshot {
-                        mod_time_nanos: m.rank().1,
-                        meta: Some(bytes::Bytes::from(m.encode()?)),
-                        slots_ok: covered,
-                        max_token,
-                    },
-                    // 本节点无已提交副本：未提交/损坏都不可见，但仍上报覆盖数（缺席可计数）
-                    None => crate::mesh::MetaSnapshot {
-                        meta: None,
-                        mod_time_nanos: i64::MIN,
-                        slots_ok: covered,
-                        max_token,
-                    },
+            // 协调者按全局 (fence_token, control_version) 选举；本节点给出自己的最高
+            // 已提交副本 + 同一版本的证书槽位（第一阶段要保留一份旧证书副本）。
+            let elected = decoded
+                .iter()
+                .filter(|(_, m)| m.control_committed == Some(true))
+                .max_by_key(|(_, m)| (m.fence_token.unwrap_or(0), m.control_version.unwrap_or(0)))
+                .map(|(_, m)| m.clone());
+            let certified_slots = match &elected {
+                Some(e) => decoded
+                    .iter()
+                    .filter(|(_, m)| {
+                        m.control_committed == Some(true) && m.control_version == e.control_version
+                    })
+                    .map(|(slot, _)| *slot)
+                    .collect(),
+                None => Vec::new(),
+            };
+            return Ok(match elected {
+                Some(m) => crate::mesh::MetaSnapshot {
+                    mod_time_nanos: m.rank().1,
+                    meta: Some(bytes::Bytes::from(m.encode()?)),
+                    slots_ok: covered,
+                    certified_slots,
+                    max_version,
+                    max_token,
+                    copies,
+                    corrupt: corrupt_n,
                 },
-            );
+                // 本节点无已提交副本：未提交/损坏都不可见，但仍上报计数（缺席可判定）
+                None => crate::mesh::MetaSnapshot {
+                    meta: None,
+                    mod_time_nanos: i64::MIN,
+                    slots_ok: covered,
+                    certified_slots,
+                    max_version,
+                    max_token,
+                    copies,
+                    corrupt: corrupt_n,
+                },
+            });
         }
         match best {
             Some((t, m)) => Ok(crate::mesh::MetaSnapshot {
@@ -1059,7 +1112,11 @@ impl Store {
                 // 此字段只带墙钟分量供诊断，不参与判定
                 mod_time_nanos: t.1,
                 slots_ok: covered,
+                certified_slots: Vec::new(),
+                max_version: 0,
                 max_token,
+                copies: 0,
+                corrupt: 0,
             }),
             None => {
                 if let Some(why) = corrupt {
@@ -1070,7 +1127,11 @@ impl Store {
                     meta: None,
                     mod_time_nanos: i64::MIN,
                     slots_ok: covered,
+                    certified_slots: Vec::new(),
+                    max_version: 0,
                     max_token,
+                    copies: 0,
+                    corrupt: 0,
                 })
             }
         }

@@ -70,6 +70,10 @@ impl MeshTransport for FakeMesh {
             mod_time_nanos: 0,
             slots_ok: 0,
             max_token: 0,
+            certified_slots: vec![],
+            max_version: 0,
+            copies: 0,
+            corrupt: 0,
         })
     }
     async fn delete_meta(&self, _: &str, _: MetaRead) -> Result<()> {
@@ -120,6 +124,7 @@ impl MeshTransport for FakeMesh {
             drives: vec![],
             maintenance: false,
             fenced_meta: true,
+            control_quorum: true,
         })
     }
     async fn lock(&self, _: &str, _: LockReq) -> Result<LockResp> {
@@ -206,6 +211,7 @@ fn caps(wire: u32, epoch: u64, hash: &str) -> PeerCaps {
         topo_epoch: epoch,
         topo_hash: hash.into(),
         fenced_meta: true,
+        control_quorum: true,
     }
 }
 
@@ -230,6 +236,7 @@ fn peer_wire_version_normalizes_legacy_and_unknown_fails_closed() {
         drives: vec![],
         maintenance: false,
         fenced_meta: false,
+        control_quorum: false,
     };
     assert_eq!(h(0).peer_data_wire_version(), 1);
     assert_eq!(h(1).peer_data_wire_version(), 1);

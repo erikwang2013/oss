@@ -168,6 +168,7 @@ async fn cache_hooks_put_purge_and_mesh_meta() {
         meta: bytes::Bytes::from(meta_bytes),
         fence_token: None,
         restore: false,
+        slots: Vec::new(),
     };
     s.mesh_prepare_meta(mw.clone()).await.unwrap();
     s.mesh_commit_meta(mw).await.unwrap();

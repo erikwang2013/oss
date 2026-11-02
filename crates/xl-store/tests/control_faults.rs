@@ -118,19 +118,19 @@ async fn single_node_multi_drive_phase1_crash_stays_uncommitted() {
     // 崩溃现场：恰 1 槽已提交，其余 11 槽仍是 `.new`
     assert_eq!(slot_counts(&dirs, KEY), (1, N_DRIVES - 1));
 
-    // ---- 段 2：第一阶段数据（未提交）不可见：读必须是缺席，不是 token1 ----
+    // ---- 段 2：第一阶段数据（未提交）不可见：无证书但有副本 → CorruptMeta（不是缺席）----
     let s = open_store(&dirs, None, false).await;
-    assert!(
-        s.get_system_object(KEY).await.unwrap().is_none(),
-        "未提交的第一阶段副本不得被读到"
-    );
+    match s.get_system_object(KEY).await {
+        Err(Error::CorruptMeta(_)) => {}
+        other => panic!("无证书的第一阶段副本必须 fail-closed，不得读成缺席：{other:?}"),
+    }
     // 盘上那一份是完整 meta（可被下一次写覆盖），只是没有证书
     assert_eq!(slot_counts(&dirs, KEY), (1, N_DRIVES - 1));
 
-    // ---- 段 3：token 2 提交（基线 = 缺席；调用方 token 须高于已观察最大值 1）----
+    // ---- 段 3：token 2 提交（版本越过已观察的未提交 v1 → 2；token 须高于已观察最大值 1）----
     assert_eq!(
         s.put_system_object(KEY, b"token2", None, 2).await.unwrap(),
-        1
+        2
     );
     assert_eq!(slot_counts(&dirs, KEY), (N_DRIVES, 0));
 
@@ -139,7 +139,7 @@ async fn single_node_multi_drive_phase1_crash_stays_uncommitted() {
     let s = open_store(&dirs, None, false).await;
     let obj = s.get_system_object(KEY).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"token2");
-    assert_eq!((obj.version, obj.fence_token), (1, 2));
+    assert_eq!((obj.version, obj.fence_token), (2, 2));
     for d in &dirs {
         let m = disk_meta(d, KEY);
         assert_eq!(m.fence_token, Some(2), "{}", d.display());
@@ -178,12 +178,15 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             meta: old_bytes.clone(),
             fence_token: Some(1),
             restore: false,
+            slots: Vec::new(),
         })
         .await
         .unwrap();
     assert_eq!(ack.slots.iter().filter(|x| x.ok).count(), N_DRIVES);
 
-    // commit：每槽必须 Stale，绝无翻转
+    // commit：对 token 2 的槽必须 Stale；槽 0 是保留的 v1/token1 旧证书副本，
+    // 同 token 同内容 = 自己的幂等重试（不改盘），按已提交应答。
+    let old_hash = xl_store::mesh::content_hash(&old_bytes);
     let ack = s
         .mesh_commit_meta(MetaWrite {
             bucket: layout::SYS_DIR.into(),
@@ -191,17 +194,18 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             meta: old_bytes.clone(),
             fence_token: Some(1),
             restore: false,
+            slots: Vec::new(),
         })
         .await
         .unwrap();
-    assert!(!ack.ok, "过期 commit 不得报成功：{ack:?}");
     assert_eq!(ack.slots.len(), N_DRIVES);
+    assert!(ack.slots[0].ok && ack.slots[0].hash == old_hash, "{ack:?}");
     assert!(
-        ack.slots.iter().all(|x| x.stale && !x.ok),
-        "每槽都应 stale：{ack:?}"
+        ack.slots[1..].iter().all(|x| x.stale && !x.ok),
+        "token 2 的槽必须 stale：{ack:?}"
     );
 
-    // 补偿恢复（restore=token 1）：同样 stale——绝不能覆盖已提交的 token 2
+    // 补偿恢复（restore=token 1）：token 2 的槽 stale；槽 0 自恢复（同字节，无变化）
     let ack = s
         .mesh_commit_meta(MetaWrite {
             bucket: layout::SYS_DIR.into(),
@@ -209,16 +213,31 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             meta: old_bytes,
             fence_token: Some(1),
             restore: true,
+            slots: Vec::new(),
         })
         .await
         .unwrap();
-    assert!(!ack.ok && ack.slots.iter().all(|x| x.stale), "{ack:?}");
+    assert!(ack.slots[0].ok, "{ack:?}");
+    assert!(ack.slots[1..].iter().all(|x| x.stale && !x.ok), "{ack:?}");
 
-    // 新 token 内容在全部槽上原样保留
+    // 新 token 内容原样保留；槽 0 是第一阶段保留的旧证书副本（Critical A）
     let obj = s.get_system_object(KEY).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"new");
     assert_eq!((obj.version, obj.fence_token), (2, 2));
-    for d in &dirs {
+    let kept = disk_meta(&dirs[0], KEY);
+    assert_eq!(
+        (kept.control_version, kept.fence_token),
+        (Some(1), Some(1)),
+        "{}：保留槽必须是旧证书副本",
+        dirs[0].display()
+    );
+    assert_eq!(
+        &kept.latest().unwrap().inline.as_ref().unwrap().bytes[..],
+        b"old",
+        "{}",
+        dirs[0].display()
+    );
+    for d in &dirs[1..] {
         let m = disk_meta(d, KEY);
         assert_eq!(m.control_version, Some(2), "{}", d.display());
         assert_eq!(m.fence_token, Some(2), "{}", d.display());
@@ -235,15 +254,16 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
         Err(Error::Conflict(_)) => {}
         other => panic!("过期 token 的 put 必须 Conflict：{other:?}"),
     }
-    // 过期写者的 `.new` 仍在（stale commit 不消费它；由下面的 abort 清理）
-    assert_eq!(slot_counts(&dirs, KEY), (N_DRIVES, N_DRIVES));
+    // token 2 槽上的 `.new` 仍在（stale 不消费）；槽 0 的暂存被自恢复消费
+    assert_eq!(slot_counts(&dirs, KEY), (N_DRIVES, N_DRIVES - 1));
     assert_eq!(
         &s.get_system_object(KEY).await.unwrap().unwrap().data[..],
         b"new"
     );
 
-    // 更新写者（token 2）暂存自己的 `.new`：abort(token 1) 不得清掉它
-    let new_bytes = Bytes::from(std::fs::read(control_dir(&dirs[0], KEY).join("xl.meta")).unwrap());
+    // 更新写者（token 2）暂存自己的 `.new`：abort(token 1) 不得清掉它。
+    // 注意取 v2 槽（槽 0 是保留的旧证书副本）
+    let new_bytes = Bytes::from(std::fs::read(control_dir(&dirs[1], KEY).join("xl.meta")).unwrap());
     let ack = s
         .mesh_prepare_meta(MetaWrite {
             bucket: layout::SYS_DIR.into(),
@@ -251,6 +271,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             meta: new_bytes.clone(),
             fence_token: Some(2),
             restore: false,
+            slots: Vec::new(),
         })
         .await
         .unwrap();
@@ -261,6 +282,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
         meta: Bytes::new(),
         fence_token: Some(1),
         restore: false,
+        slots: Vec::new(),
     })
     .await
     .unwrap();
@@ -283,6 +305,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
         meta: Bytes::new(),
         fence_token: Some(2),
         restore: false,
+        slots: Vec::new(),
     })
     .await
     .unwrap();
@@ -365,9 +388,14 @@ async fn control_objects_stay_inline_with_zero_inline_threshold() {
     assert_eq!(&obj.data[..], data);
     assert_eq!((obj.version, obj.fence_token), (1, 1));
 
-    // 每个槽的 meta 都内联携带完整内容
+    // 控制写恰翻 Q_s 槽；每个已提交槽的 meta 都内联携带完整内容
+    let mut present = 0;
     for d in &dirs {
-        let m = disk_meta(d, KEY);
+        let Ok(bytes) = std::fs::read(control_dir(d, KEY).join("xl.meta")) else {
+            continue;
+        };
+        present += 1;
+        let m = xl_store::meta::XlMeta::decode(&bytes).unwrap();
         let inline = m
             .latest()
             .and_then(|v| v.inline.as_ref())
@@ -376,6 +404,7 @@ async fn control_objects_stay_inline_with_zero_inline_threshold() {
         assert_eq!(m.control_version, Some(1), "{}", d.display());
         assert_eq!(m.fence_token, Some(1), "{}", d.display());
     }
+    assert_eq!(present, Q_S, "集群控制写恰翻 Q_s 槽");
 
     // 阈值 0 确实生效：同一 Store 的普通小对象不内联
     s.create_bucket("bkt").await.unwrap();

@@ -90,6 +90,8 @@ pub struct MetaWrite {
     pub fence_token: Option<u64>,
     /// Phase 0：补偿恢复（token 相等允许回滚，仅当前 token 更大时跳过）。
     pub restore: bool,
+    /// Phase 0 round 3：commit 只翻这些全局槽位（空 = 全部，数据面旧行为）。
+    pub slots: Vec<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,9 +128,17 @@ pub struct MetaSnapshot {
     pub meta: Option<Bytes>,
     pub mod_time_nanos: i64,
     pub slots_ok: u32,
+    /// 控制对象：与 `meta` 同一已提交版本的本地槽位（全局槽号）——第一阶段保留旧证书用。
+    pub certified_slots: Vec<u16>,
+    /// 控制对象：本节点全部副本（含未提交）中的最大 `control_version`；数据面为 0。
+    pub max_version: u64,
     /// 本节点全部已解码副本（含未提交）中的最大 `fence_token`；CAS/锁发放的下限用。
     /// 为 0 = 未观察到 token。数据面不关心。
     pub max_token: u64,
+    /// 控制对象：本节点已解码副本数（含未提交）——无证书时区分「缺席」与「不可判定」。
+    pub copies: u32,
+    /// 控制对象：本节点损坏副本数（解码失败/键不一致/IO 错误）。
+    pub corrupt: u32,
 }
 
 /// LIST 并集条目：`max_mod_time_nanos` = 该节点本地各槽副本的每键最大 mod_time。
@@ -223,6 +233,9 @@ pub struct NodeHealth {
     pub maintenance: bool,
     /// Phase 0：对端理解 `MetaWrite.fence_token`（旧节点缺省 false = 会静默忽略）。
     pub fenced_meta: bool,
+    /// Phase 0 round 3：对端理解提交证书协议（全量扇出 + token 优先选举 + 证书槽上报）。
+    /// `fenced_meta` 由 693a7a7 节点已宣告，无法区分证书协议 → 专用能力位。
+    pub control_quorum: bool,
 }
 
 /// 本节点拓扑指纹：`topo_epoch` + `topo_hash`（[`NodeHealth`] 字段 6/7 的来源）。

@@ -88,26 +88,40 @@ impl Store {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
         // CAS 只认带提交证书的版本：未提交的第一阶段半翻版本对客户端不可见，
-        // 也不能让它把后续合法 CAS 永久顶成 Conflict。
-        let (old, max_token) = self
-            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
-            .await?;
-        let (cur_version, cur_fence) = control_state(old.as_ref());
+        // 也不能让它把后续合法 CAS 永久顶成 Conflict。无证书且存在损坏副本 → fail-closed
+        // （版本/token 高水位不可信）；无证书仅存在未提交副本 → 允许在已观察版本上重建。
+        let st = self.read_control(layout::SYS_DIR, key).await?;
+        if st.certified.is_none() && st.corrupt > 0 {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 无提交证书且存在 {} 份损坏副本：拒绝推进版本",
+                st.corrupt
+            )));
+        }
+        let (cur_version, cur_fence) = control_state(st.certified.as_ref());
         check_cas(
             cur_version,
-            cur_fence.max(max_token),
+            cur_fence.max(st.max_token),
             expected_version,
             fence_token,
         )?;
-        let commit_token = guard.commit_token(fence_token, cur_fence.max(max_token))?;
-        let version = cur_version + 1;
+        let commit_token = guard.commit_token(fence_token, cur_fence.max(st.max_token))?;
+        // 版本推进越过**所有已观察副本**（含未提交半翻）：崩溃写者的版本绝不重用。
+        let version = st.max_version + 1;
+        let preserve = st.certified_slots.first().copied();
         let m = control_meta(key, version, commit_token, Some(data), false);
         // 提交点前复查租约（无 fencing 窗口收窄到两次检查之间；与 put.rs:1058 同款）
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
         }
-        self.commit_control_meta(key, &m, old.as_ref(), commit_token, &guard)
-            .await?;
+        self.commit_control_meta(
+            key,
+            &m,
+            st.certified.as_ref(),
+            commit_token,
+            &guard,
+            preserve,
+        )
+        .await?;
         Ok(version)
     }
 
@@ -115,11 +129,7 @@ impl Store {
     /// 集群覆盖不足 → `CorruptMeta`（fail-closed）；无已提交副本 → 缺席。
     pub async fn get_system_object(&self, key: &str) -> Result<Option<SystemObject>> {
         validate_control_key(key)?;
-        let Some(m) = self
-            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
-            .await?
-            .0
-        else {
+        let Some(m) = self.read_control_strict(layout::SYS_DIR, key).await? else {
             return Ok(None);
         };
         if m.control_deleted == Some(true) {
@@ -152,28 +162,33 @@ impl Store {
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
-        let (old, max_token) = self
-            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
-            .await?;
-        let (cur_version, cur_fence) = control_state(old.as_ref());
+        let st = self.read_control(layout::SYS_DIR, key).await?;
+        if st.certified.is_none() && st.corrupt > 0 {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 无提交证书且存在 {} 份损坏副本：拒绝推进版本",
+                st.corrupt
+            )));
+        }
+        let (cur_version, cur_fence) = control_state(st.certified.as_ref());
         check_cas(
             cur_version,
-            cur_fence.max(max_token),
+            cur_fence.max(st.max_token),
             expected_version,
             fence_token,
         )?;
-        let commit_token = guard.commit_token(fence_token, cur_fence.max(max_token))?;
-        let Some(old) = old else {
+        let commit_token = guard.commit_token(fence_token, cur_fence.max(st.max_token))?;
+        let Some(old) = st.certified else {
             return Ok(false);
         };
         if old.control_deleted == Some(true) {
             return Ok(false);
         }
-        let m = control_meta(key, cur_version + 1, commit_token, None, true);
+        let preserve = st.certified_slots.first().copied();
+        let m = control_meta(key, st.max_version + 1, commit_token, None, true);
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
         }
-        self.commit_control_meta(key, &m, Some(&old), commit_token, &guard)
+        self.commit_control_meta(key, &m, Some(&old), commit_token, &guard, preserve)
             .await?;
         Ok(true)
     }
@@ -216,10 +231,7 @@ impl Store {
         let mut out = Vec::new();
         for key in names {
             // tombstone 仍占目录：读已提交 meta 过滤（未提交副本不得让键消失）
-            if let Some(m) = self
-                .read_meta_quorum_confirmed(layout::SYS_DIR, &key)
-                .await?
-                .0
+            if let Some(m) = self.read_control_strict(layout::SYS_DIR, &key).await?
                 && m.control_deleted != Some(true)
             {
                 out.push(key);
@@ -236,10 +248,7 @@ impl Store {
         if self.cfg.cluster.is_none() {
             return Ok(0);
         }
-        let (_, max_token) = self
-            .read_meta_quorum_confirmed(layout::SYS_DIR, key)
-            .await?;
-        Ok(max_token)
+        Ok(self.read_control(layout::SYS_DIR, key).await?.max_token)
     }
 
     /// CAS 串行化：本机两层（进程内 mutex + `flock`，跨进程互斥）；集群再叠加 fenced
@@ -261,10 +270,10 @@ impl Store {
         })
     }
 
-    /// 两阶段提交控制对象 meta：第一阶段写**未提交**数据（走既有 fenced 写，失败照旧
-    /// 补偿回滚）；第二阶段写同 token 的提交证书（`control_committed = Some(true)`）。
-    /// 只有证书落盘后读才可见——第一阶段崩溃留下的半翻副本永远不可见，补偿把旧内容
-    /// 换成新 token 也不会造成「同一版本两种编码」的分叉楔死。
+    /// 两阶段提交控制对象 meta：第一阶段写**未提交**数据，但保留 `preserve` 槽上的
+    /// 已提交旧副本原样（崩溃/第二阶段零证书时读回退旧版本，而不是缺席——Critical A）；
+    /// 第二阶段写同 token 的提交证书（`control_committed = Some(true)`）。
+    /// 只有证书落盘后读才可见——第一阶段崩溃留下的半翻副本永远不可见。
     /// 第二阶段失败时绝不回滚第一阶段数据（证书是原子性判据；数据残骸由下次写覆盖）。
     async fn commit_control_meta(
         &self,
@@ -273,9 +282,28 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: u64,
         guard: &ControlGuard,
+        preserve: Option<u16>,
     ) -> Result<()> {
+        // 单盘（无集群）：唯一 rename 就是提交点，直接写带证书的 meta——不存在
+        // 「第一阶段覆盖后第二阶段零证书」的丢失窗口，无需两阶段。
+        if self.cfg.cluster.is_none() && self.cfg.drives.len() == 1 {
+            if guard.lease_lost() {
+                return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
+            }
+            let mut marker = m.clone();
+            marker.control_committed = Some(true);
+            let marked = self
+                .write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
+                .await?;
+            if marked == 0 {
+                return Err(Error::QuorumUnmet(format!(
+                    "控制对象 {key:?} 提交标记 0 槽（未提交）"
+                )));
+            }
+            return Ok(());
+        }
         let flipped = self
-            .write_meta_fenced(layout::SYS_DIR, key, m, old, Some(fence_token))
+            .write_meta_fenced_preserving(layout::SYS_DIR, key, m, old, fence_token, preserve)
             .await?;
         if flipped == 0 {
             return Err(Error::QuorumUnmet(format!(
@@ -291,7 +319,7 @@ impl Store {
         let mut marker = m.clone();
         marker.control_committed = Some(true);
         let marked = self
-            .write_meta_marker(layout::SYS_DIR, key, &marker, fence_token)
+            .write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
             .await?;
         if marked == 0 {
             return Err(Error::QuorumUnmet(format!(

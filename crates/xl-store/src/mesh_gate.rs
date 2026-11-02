@@ -92,6 +92,9 @@ pub struct PeerCaps {
     pub topo_hash: String,
     /// Phase 0：对端执行 fenced meta 提交；旧节点缺省 false（会静默忽略 token）。
     pub fenced_meta: bool,
+    /// Phase 0 round 3：对端理解提交证书控制读协议（全量扇出 + token 优先选举）。
+    /// `fenced_meta` 由 693a7a7 节点已宣告 → 证书协议必须另有专用位。
+    pub control_quorum: bool,
 }
 
 impl PeerCaps {
@@ -101,6 +104,7 @@ impl PeerCaps {
             topo_epoch: h.topo_epoch,
             topo_hash: h.topo_hash.clone(),
             fenced_meta: h.fenced_meta,
+            control_quorum: h.control_quorum,
         }
     }
 }

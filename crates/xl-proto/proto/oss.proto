@@ -59,7 +59,10 @@ message MetaWrite { string bucket=1; string key=2; bytes meta=3;
                     // 有值 = 提交前比较当前 xl.meta 的 token，过期则拒翻。
                     optional uint64 fence_token=4;
                     // 补偿恢复：token 相等时允许回滚自己的翻转，仅在当前 token 更大时跳过。
-                    bool restore=5; }
+                    bool restore=5;
+                    // Phase 0 控制对象：commit 只翻这些全局槽位（空 = 全部，数据面旧行为）。
+                    // 第一阶段据此在保留至少一份已提交旧副本的前提下恰好翻转 Q_s 槽。
+                    repeated uint32 slots=6; }
 message SlotAck { uint32 slot=1; bool ok=2; bytes hash=3;
                   // Phase 0：本槽因 fence token 过期被拒（未翻转）。
                   bool stale=4; }
@@ -67,7 +70,17 @@ message MetaAck { bool ok=1; string msg=2; repeated SlotAck slots=3; uint32 slot
 message MetaRead  { string bucket=1; string key=2; }
 // max_token：该节点全部副本（含未提交）中最大的 fence_token；CAS 前置校验与锁 token
 // 下限用（0 = 未观察到）。控制读返回的 meta 只可能是带提交证书的副本。
-message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4; uint64 max_token=5; }
+message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 slots_ok=4;
+                    // Phase 0：保留字段（round 3 起不再复用——旧节点按 best_copies 读取）。
+                    uint32 best_copies=5;
+                    // 控制对象：全部副本（含未提交）的最大 fence_token；CAS/锁下限。
+                    uint64 max_token=6;
+                    // 控制对象：与本节点返回的证书副本同一版本的本地槽位（第一阶段保留旧证书）。
+                    repeated uint32 certified_slots=7;
+                    // 控制对象：全部副本（含未提交）的最大 control_version（防未提交版本被复用）。
+                    uint64 max_version=8;
+                    // 控制对象：本节点已解码副本数 / 损坏副本数（无证书时区分缺席与不可判定）。
+                    uint32 copies=9; uint32 corrupt=10; }
 message BucketRef { string bucket=1; }  message BucketsResp { repeated string names=1; }
 message ListReq { string bucket=1; string prefix=2; string delimiter=3; string marker=4; uint32 limit=5;
                   bool include_deleted=6;
@@ -93,7 +106,10 @@ message NodeHealth { string node_id=1; string version=2; repeated SlotState slot
                      // shrink plan 容量校验：逐物理盘可用空间；maintenance = 停写维护模式。
                      repeated DriveSpace drives=8; bool maintenance=9;
                      // Phase 0：本节点理解并执行 fenced meta 提交（旧节点缺省 false）。
-                     bool fenced_meta=10; }
+                     bool fenced_meta=10;
+                     // Phase 0 round 3：本节点理解提交证书 + 全量扇出 + token 优先选举。
+                     // 专用能力位（fenced_meta 由 693a7a7 节点已宣告，不能区分证书协议）。
+                     bool control_quorum=11; }
 message SlotState { uint32 slot=1; bool up=2; }
 message DriveSpace { uint32 set=1; uint32 drive=2; uint64 free_bytes=3; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;

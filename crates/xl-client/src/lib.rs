@@ -171,6 +171,7 @@ fn meta_write_to_proto(m: mesh::MetaWrite) -> xl_proto::MetaWrite {
         meta: m.meta.to_vec(),
         fence_token: m.fence_token,
         restore: m.restore,
+        slots: m.slots.into_iter().map(u32::from).collect(),
     }
 }
 
@@ -204,6 +205,7 @@ fn meta_write_from_proto(m: xl_proto::MetaWrite) -> mesh::MetaWrite {
         meta: m.meta.into(),
         fence_token: m.fence_token,
         restore: m.restore,
+        slots: m.slots.into_iter().map(|s| s as u16).collect(),
     }
 }
 
@@ -603,6 +605,7 @@ impl MeshTransport for TonicMesh {
                 .collect(),
             maintenance: resp.maintenance,
             fenced_meta: resp.fenced_meta,
+            control_quorum: resp.control_quorum,
         })
     }
     // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
@@ -723,6 +726,10 @@ impl MeshTransport for TonicMesh {
             mod_time_nanos: resp.mod_time_nanos,
             slots_ok: resp.slots_ok,
             max_token: resp.max_token,
+            certified_slots: resp.certified_slots.into_iter().map(|s| s as u16).collect(),
+            max_version: resp.max_version,
+            copies: resp.copies,
+            corrupt: resp.corrupt,
         })
     }
     async fn delete_meta(&self, node: &str, r: mesh::MetaRead) -> Result<()> {
@@ -1284,6 +1291,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
                 .collect(),
             maintenance: h.maintenance,
             fenced_meta: h.fenced_meta,
+            control_quorum: h.control_quorum,
         }))
     }
 
@@ -1427,7 +1435,12 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             meta: snap.meta.map(|b| b.to_vec()).unwrap_or_default(),
             mod_time_nanos: snap.mod_time_nanos,
             slots_ok: snap.slots_ok,
+            best_copies: 0,
             max_token: snap.max_token,
+            certified_slots: snap.certified_slots.iter().map(|&s| s as u32).collect(),
+            max_version: snap.max_version,
+            copies: snap.copies,
+            corrupt: snap.corrupt,
         }))
     }
     async fn delete_meta(
@@ -2251,6 +2264,7 @@ mod tests {
             meta: meta.clone(),
             fence_token: None,
             restore: false,
+            slots: Vec::new(),
         };
         let ack = mesh.prepare_meta("n1", mw.clone()).await.unwrap();
         assert!(ack.ok && ack.slots_ok == 2, "{ack:?}");

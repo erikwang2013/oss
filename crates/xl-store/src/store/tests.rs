@@ -2900,6 +2900,9 @@ pub struct InProcessMesh {
     versions: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// Phase 0：peer fenced meta 能力位覆盖（模拟 pre-fix 节点；缺省 = 真实值 true）。
     fenced_meta: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    /// Phase 0 round 3：peer 证书协议能力位覆盖（模拟 693a7a7 节点：有 fenced_meta
+    /// 但不理解证书协议；缺省 = 真实值 true）。
+    control_quorum: std::sync::Mutex<std::collections::HashMap<String, bool>>,
     /// DP-1：到达对端的 ListLocal 请求记录（断言「旧版不会收到新语义标志」）。
     list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
     /// 测试仪器：ListLocal 并发峰值（验证目录列举的 peer 扇出）。
@@ -2937,6 +2940,7 @@ impl InProcessMesh {
             fail_once: Default::default(),
             versions: Default::default(),
             fenced_meta: Default::default(),
+            control_quorum: Default::default(),
             list_requests: Default::default(),
             list_inflight: Default::default(),
             list_max_inflight: Default::default(),
@@ -3018,6 +3022,16 @@ impl InProcessMesh {
     /// Phase 0：伪造某 peer 的 fenced meta 能力位（模拟 wire 2 但忽略 token 的 pre-fix 节点）。
     pub fn set_fenced_meta(&self, node: &str, v: Option<bool>) {
         let mut m = self.fenced_meta.lock().unwrap();
+        match v {
+            Some(v) => m.insert(node.to_string(), v),
+            None => m.remove(node),
+        };
+    }
+
+    /// Phase 0 round 3：伪造某 peer 的证书协议能力位（模拟 693a7a7 节点：宣告
+    /// `fenced_meta` 但读不到提交证书语义）。
+    pub fn set_control_quorum(&self, node: &str, v: Option<bool>) {
+        let mut m = self.control_quorum.lock().unwrap();
         match v {
             Some(v) => m.insert(node.to_string(), v),
             None => m.remove(node),
@@ -3125,6 +3139,7 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         }
         let version = self.versions.lock().unwrap().get(node).copied();
         let fenced = self.fenced_meta.lock().unwrap().get(node).copied();
+        let control_quorum = self.control_quorum.lock().unwrap().get(node).copied();
         self.health_log
             .lock()
             .unwrap()
@@ -3135,6 +3150,9 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         }
         if let Some(v) = fenced {
             h.fenced_meta = v;
+        }
+        if let Some(v) = control_quorum {
+            h.control_quorum = v;
         }
         Ok(h)
     }
@@ -4545,6 +4563,7 @@ async fn foreign_new_content_hash_not_counted() {
         meta: Bytes::from(meta_bytes),
         fence_token: None,
         restore: false,
+        slots: Vec::new(),
     };
     // prepare 到 n2（写 .new = 我们的内容）
     let ack = c.mesh.prepare_meta("n2", mw.clone()).await.unwrap();
@@ -5470,6 +5489,18 @@ async fn disk_meta(drive: &std::path::Path, bucket: &str, key: &str) -> XlMeta {
     XlMeta::decode(&bytes).unwrap()
 }
 
+/// 槽上可能没有 meta（控制写只翻 Q_s 槽，其余为空）：返回 None 而不是 panic。
+async fn disk_meta_opt(drive: &std::path::Path, bucket: &str, key: &str) -> Option<XlMeta> {
+    let path = layout::object_dir_for(drive, bucket, key)
+        .unwrap()
+        .join(meta::META_FILE);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Some(XlMeta::decode(&bytes).unwrap()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("读取 {} 失败：{e}", path.display()),
+    }
+}
+
 async fn disk_token(drive: &std::path::Path, bucket: &str, key: &str) -> Option<u64> {
     disk_meta(drive, bucket, key).await.fence_token
 }
@@ -5558,6 +5589,7 @@ async fn abort_keeps_newer_meta_new() {
         meta: bytes::Bytes::new(),
         fence_token: Some(token),
         restore: false,
+        slots: Vec::new(),
     };
     // token 2 的 abort 必须保留 token 3 的 .new
     s.mesh_abort_meta(abort(2)).await.unwrap();
@@ -5673,6 +5705,7 @@ async fn mesh_commit_meta_reports_stale_slots() {
             meta: bytes::Bytes::new(),
             fence_token: Some(2),
             restore: false,
+            slots: Vec::new(),
         })
         .await
         .unwrap();
@@ -5720,6 +5753,7 @@ async fn mesh_restore_commit_allows_equal_token_and_skips_newer() {
         meta: bytes::Bytes::from(old.encode().unwrap()),
         fence_token: Some(5),
         restore: true,
+        slots: Vec::new(),
     };
     s.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 5), None, Some(5))
         .await
@@ -5832,8 +5866,18 @@ async fn fenced_meta_refuses_legacy_or_uncapable_peer() {
             assert!(!tokio::fs::try_exists(&p).await.unwrap(), "{}", p.display());
         }
     }
-    // 3) 能力位为 true → 放行
+    // 2b) 693a7a7 节点：宣告 fenced_meta，但不理解证书协议 → 专用位缺位即拒绝
     c.mesh.set_fenced_meta("n2", Some(true));
+    c.mesh.set_control_quorum("n2", Some(false));
+    match s1
+        .write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 2), None, Some(2))
+        .await
+    {
+        Err(Error::PeerIncompatible(_)) => {}
+        other => panic!("无证书协议能力的 peer 必须 fail-closed，实际：{other:?}"),
+    }
+    // 3) 能力位为 true → 放行
+    c.mesh.set_control_quorum("n2", Some(true));
     assert!(
         s1.write_meta_fenced(layout::SYS_DIR, k, &fenced_meta(k, 2, 2), None, Some(2))
             .await
@@ -5842,8 +5886,9 @@ async fn fenced_meta_refuses_legacy_or_uncapable_peer() {
     );
 }
 
-/// 集群补偿（部分翻转）：8 槽 token 合法翻转、4 槽 Stale → Conflict 且补偿恢复执行；
-/// 恢复只回滚自己的 token（cur == t），已提交的更新 token 原样保留。
+/// 集群补偿（部分翻转）：控制写只提交排序后前 Q_s=9 槽（0..8）；其中 5 槽 token
+/// 合法翻转、4 槽 Stale → Conflict 且补偿恢复执行；恢复只回滚自己的 token
+/// （cur == t），已提交的更新 token 原样保留。
 #[tokio::test]
 async fn cluster_partial_flip_compensation_skips_newer_token() {
     let c = Cluster::new(4, 3).await;
@@ -5863,7 +5908,7 @@ async fn cluster_partial_flip_compensation_skips_newer_token() {
                 .unwrap();
         }
     }
-    // token 4：8 槽合法翻转（< Q_s=9）+ 4 槽 Stale → Conflict + 补偿
+    // token 4：翻转集 0..8 中 5 槽合法翻转（< Q_s=9）+ 4 槽 Stale → Conflict + 补偿
     match s1
         .write_meta_fenced(
             layout::SYS_DIR,
@@ -5884,14 +5929,18 @@ async fn cluster_partial_flip_compensation_skips_newer_token() {
         assert_eq!(m.control_version, Some(2), "{}", d.display());
     }
     // 曾翻转 token 4 的槽被补偿回旧内容；token 高水位保持 4
-    for d in c.dirs[1][1..]
-        .iter()
-        .chain(c.dirs[2].iter())
-        .chain(c.dirs[3].iter())
-    {
+    for d in c.dirs[1][1..].iter().chain(c.dirs[2].iter()) {
         let m = disk_meta(d, layout::SYS_DIR, k).await;
         assert_eq!(m.fence_token, Some(4), "{}", d.display());
         assert_eq!(m.control_version, Some(0), "{}", d.display());
+    }
+    // 未入选翻转集的 9..11 槽只清了暂存，从来没有 xl.meta
+    for d in &c.dirs[3] {
+        assert!(
+            disk_meta_opt(d, layout::SYS_DIR, k).await.is_none(),
+            "{}",
+            d.display()
+        );
     }
 }
 
@@ -5955,24 +6004,36 @@ async fn system_object_quorum_read_ignores_sub_quorum_partial_copy() {
     assert_eq!(&obj.data[..], b"v1");
 
     // 真实提交 v2：CAS 以已提交 v1 为基线（不被未提交副本的版本/内容顶死）；
-    // 调用方 token 必须高于已观察最大值 2
-    assert_eq!(b.put_system_object(k, b"v2", Some(1), 3).await.unwrap(), 2);
+    // 调用方 token 必须高于已观察最大值 2；新版本越过**已观察**的未提交 v2 → 3
+    assert_eq!(b.put_system_object(k, b"v2", Some(1), 3).await.unwrap(), 3);
     let obj = b.get_system_object(k).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"v2");
-    assert_eq!(obj.version, 2);
+    assert_eq!(obj.version, 3);
     assert!(obj.fence_token > 2, "提交 token 必须高于半翻副本：{obj:?}");
-    // 全槽一致：半翻副本已被真实提交覆盖
+    // 提交恰 Q_s=3 槽（保留 1 份已提交旧副本）；半翻副本已被真实提交覆盖
+    let (mut new_slots, mut old_slots, mut absent) = (0, 0, 0);
     for d in c.dirs.iter().flatten() {
-        let m = disk_meta(d, layout::SYS_DIR, k).await;
-        assert_eq!(m.control_version, Some(2), "{}", d.display());
-        assert_eq!(m.fence_token, Some(obj.fence_token), "{}", d.display());
-        assert_eq!(
-            &m.latest().unwrap().inline.as_ref().unwrap().bytes[..],
-            b"v2",
-            "{}",
-            d.display()
-        );
+        let Some(m) = disk_meta_opt(d, layout::SYS_DIR, k).await else {
+            absent += 1;
+            continue;
+        };
+        match (m.control_version, m.control_committed) {
+            (Some(3), Some(true)) => {
+                new_slots += 1;
+                assert_eq!(m.fence_token, Some(obj.fence_token), "{}", d.display());
+                assert_eq!(
+                    &m.latest().unwrap().inline.as_ref().unwrap().bytes[..],
+                    b"v2",
+                    "{}",
+                    d.display()
+                );
+            }
+            (Some(1), Some(true)) => old_slots += 1,
+            other => panic!("意外槽状态 {other:?}（{}）", d.display()),
+        }
     }
+    assert_eq!(new_slots, 3, "集群控制写恰翻 Q_s 槽");
+    assert_eq!((old_slots, absent), (1, 2), "保留 1 份旧证书；未入选槽为空");
 }
 
 /// 在 12 槽集群（Q_s=9）上按物理槽号覆盖控制对象 meta。槽号 = 节点序 × 每节点盘数 + 盘序。
@@ -5983,6 +6044,16 @@ async fn overwrite_control_slot(c: &Cluster, slot: usize, key: &str, f: impl FnO
     f(&mut m);
     c.stores[slot / per_node]
         .write_meta_on(dir, layout::SYS_DIR, key, &m)
+        .await
+        .unwrap();
+}
+
+/// 把一份 meta 直接落到物理槽（槽上不必已有 meta，用于构造 fresh 对象的崩溃现场）。
+async fn write_control_slot(c: &Cluster, slot: usize, key: &str, m: &XlMeta) {
+    let per_node = c.dirs[0].len();
+    let dir = &c.dirs[slot / per_node][slot % per_node];
+    c.stores[slot / per_node]
+        .write_meta_on(dir, layout::SYS_DIR, key, m)
         .await
         .unwrap();
 }
@@ -6025,12 +6096,24 @@ async fn system_object_compensation_token_split_heals_at_twelve_slots() {
     assert_eq!(&obj.data[..], b"v2");
     assert_eq!(obj.version, 2);
     assert!(obj.fence_token > 99);
+    let (mut new_slots, mut old_slots, mut absent) = (0, 0, 0);
     for dir in c.dirs.iter().flatten() {
-        let m = disk_meta(dir, layout::SYS_DIR, k).await;
-        assert_eq!(m.control_version, Some(2), "{}", dir.display());
-        assert_eq!(m.fence_token, Some(obj.fence_token), "{}", dir.display());
+        let Some(m) = disk_meta_opt(dir, layout::SYS_DIR, k).await else {
+            absent += 1;
+            continue;
+        };
         assert_eq!(m.control_committed, Some(true), "{}", dir.display());
+        match m.control_version {
+            Some(2) => {
+                new_slots += 1;
+                assert_eq!(m.fence_token, Some(obj.fence_token), "{}", dir.display());
+            }
+            Some(1) => old_slots += 1,
+            other => panic!("意外版本 {other:?}（{}）", dir.display()),
+        }
     }
+    assert_eq!(new_slots, 9, "集群控制写恰翻 Q_s 槽");
+    assert_eq!((old_slots, absent), (1, 2), "保留 1 份旧证书；未入选槽为空");
 }
 
 /// 修复轮 2（12 槽 / Q_s=9）：第一阶段崩溃留下 5 槽 v2 数据（无证书），其余 7 槽仍是
@@ -6063,25 +6146,32 @@ async fn system_object_uncommitted_partial_is_invisible_at_twelve_slots() {
     assert_eq!(&obj.data[..], b"v1", "未提交的 v2 半翻不得胜出");
     assert_eq!((obj.version, obj.fence_token), (1, 2));
 
+    // 新版本越过已观察的未提交 v2 → 3（Critical B：未提交版本绝不复用）
     assert_eq!(
         c.stores[1]
             .put_system_object(k, b"v2", Some(1), 3)
             .await
             .unwrap(),
-        2
+        3
     );
     let obj = c.stores[3].get_system_object(k).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"v2");
-    assert_eq!(obj.version, 2);
+    assert_eq!(obj.version, 3);
+    let (mut new_slots, mut old_slots, mut absent) = (0, 0, 0);
     for dir in c.dirs.iter().flatten() {
-        let m = disk_meta(dir, layout::SYS_DIR, k).await;
-        assert_eq!(
-            (m.control_version, m.control_committed),
-            (Some(2), Some(true)),
-            "{}",
-            dir.display()
-        );
+        let Some(m) = disk_meta_opt(dir, layout::SYS_DIR, k).await else {
+            absent += 1;
+            continue;
+        };
+        assert_eq!(m.control_committed, Some(true), "{}", dir.display());
+        match m.control_version {
+            Some(3) => new_slots += 1,
+            Some(1) => old_slots += 1,
+            other => panic!("意外版本 {other:?}（{}）", dir.display()),
+        }
     }
+    assert_eq!(new_slots, 9, "集群控制写恰翻 Q_s 槽");
+    assert_eq!((old_slots, absent), (1, 2), "保留 1 份旧证书；未入选槽为空");
 }
 
 /// 修复轮 2：提交证书的可见性不要求 ≥ Q_s 份——第二阶段只翻到 1 槽（崩溃/超时）也
@@ -6126,6 +6216,175 @@ async fn system_object_single_commit_certificate_certifies_version() {
     let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"v3");
     assert_eq!(obj.version, 3);
+}
+
+/// Critical A（12 槽 / Q_s=9）：第一阶段翻转 Q_s 槽但保留一份已提交旧副本，随后崩溃
+/// （零证书）→ 读必须回退旧版本，而不是读到半翻数据或缺席。
+#[tokio::test]
+async fn system_object_phase1_crash_keeps_preserved_old_certificate() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/phase1-crash";
+    assert_eq!(
+        c.stores[0]
+            .put_system_object(k, b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let old = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    let mut partial = old.clone();
+    partial.control_version = Some(2);
+    partial.fence_token = Some(2);
+    partial.control_committed = Some(false);
+    partial.versions[0].epoch = Some(2);
+    partial.versions[0].mod_time_nanos += 1;
+    partial.versions[0].inline = Some(crate::meta::InlineData {
+        bytes: b"v2".to_vec(),
+    });
+    // 第一阶段：恰 Q_s 槽翻转，槽 0 原样保留（写完第一阶段即崩）
+    assert_eq!(
+        c.stores[0]
+            .write_meta_fenced_preserving(layout::SYS_DIR, k, &partial, Some(&old), 2, Some(0))
+            .await
+            .unwrap(),
+        9
+    );
+    let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v1", "未提交的新版本不得胜出");
+    assert_eq!(obj.version, 1);
+    let kept = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    assert_eq!(
+        (kept.control_version, kept.control_committed),
+        (Some(1), Some(true)),
+        "保留槽必须仍是旧证书副本"
+    );
+}
+
+/// Critical A（12 槽 / Q_s=9）：delete 第一阶段成功、第二阶段零证书（崩溃）→ 读回旧
+/// 对象；失败的删除绝不与成功删除同为「缺席」。
+#[tokio::test]
+async fn system_object_phase2_zero_certificate_failed_delete_reads_old() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/delete-phase1-crash";
+    c.stores[0]
+        .put_system_object(k, b"v1", None, 1)
+        .await
+        .unwrap();
+    let old = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    let mut tomb = old.clone();
+    tomb.control_version = Some(2);
+    tomb.fence_token = Some(2);
+    tomb.control_committed = Some(false);
+    tomb.control_deleted = Some(true);
+    tomb.versions[0].epoch = Some(2);
+    tomb.versions[0].mod_time_nanos += 1;
+    tomb.versions[0].inline = None;
+    assert_eq!(
+        c.stores[0]
+            .write_meta_fenced_preserving(layout::SYS_DIR, k, &tomb, Some(&old), 2, Some(0))
+            .await
+            .unwrap(),
+        9
+    );
+    // 第二阶段未写任何证书 → 删除未提交，旧对象仍可见
+    let obj = c.stores[1].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v1");
+    assert_eq!(obj.version, 1);
+}
+
+/// Critical B（12 槽 / Q_s=9）：<Q_s 份部分证书所在节点宕机 → 其余槽只有未提交副本，
+/// 读必须 CorruptMeta（不是缺席）；节点回线后部分证书可见。
+#[tokio::test]
+async fn system_object_partial_certificate_node_down_fails_closed() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/partial-cert-down";
+    c.stores[0]
+        .put_system_object(k, b"v1", None, 1)
+        .await
+        .unwrap();
+    // 12 槽全部换成 v2，仅槽 0 带证书（第一阶段全翻 + 第二阶段只标 1 槽即崩）；
+    // 首写只翻 Q_s 槽，其余空槽先补 v1 模板
+    let v1 = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    for slot in 9..12 {
+        write_control_slot(&c, slot, k, &v1).await;
+    }
+    for slot in 0..12 {
+        overwrite_control_slot(&c, slot, k, move |m| {
+            m.control_version = Some(2);
+            m.fence_token = Some(2);
+            m.control_committed = Some(slot == 0);
+            m.versions[0].epoch = Some(2);
+            m.versions[0].mod_time_nanos += 1;
+            m.versions[0].inline = Some(crate::meta::InlineData {
+                bytes: b"v2".to_vec(),
+            });
+        })
+        .await;
+    }
+    c.mesh.down("n1"); // 唯一证书所在节点
+    match c.stores[1].get_system_object(k).await {
+        Err(Error::CorruptMeta(_)) => {}
+        other => panic!("无证书但存在副本必须 fail-closed（不是缺席）：{other:?}"),
+    }
+    c.mesh.up("n1");
+    let obj = c.stores[1].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v2");
+    assert_eq!(obj.version, 2);
+}
+
+/// Critical B（12 槽 / Q_s=9）：先前的部分版本（v2/token 2）所在节点回线后，不得用更高
+/// 版本号遮蔽之后以更高 token 成功提交的 v1——选举 token 优先。
+#[tokio::test]
+async fn system_object_later_higher_token_write_not_masked_by_partial_version() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/token-mask";
+    // n1 三盘 = 早期写者第一阶段 + 部分证书：v2/token 2，仅槽 0 带证书
+    let partial = fenced_meta(k, 2, 2);
+    for slot in 0..3 {
+        let mut m = partial.clone();
+        m.control_committed = Some(slot == 0);
+        write_control_slot(&c, slot, k, &m).await;
+    }
+    c.mesh.down("n1");
+    // 其余 9 槽无任何副本 → 缺席可证明；后续写从版本 1 起，锁高水位把 token 抬到 11
+    let lock_key = format!("{}/{}", layout::SYS_DIR, k);
+    let fp = super::lock::fence_path(&c.dirs[1][0], &lock_key);
+    tokio::fs::create_dir_all(fp.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&fp, b"10").await.unwrap();
+    assert_eq!(
+        c.stores[1]
+            .put_system_object(k, b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    c.mesh.up("n1");
+    let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(
+        &obj.data[..],
+        b"v1",
+        "更高 token 的后续提交不得被旧 v2 遮蔽"
+    );
+    assert_eq!((obj.version, obj.fence_token), (1, 11));
+}
+
+/// MINOR/Critical B（12 槽 / Q_s=9）：只有损坏副本、无任何有效副本 → CorruptMeta，
+/// 绝不读成缺席（覆盖仍由其余确定性槽位满足）。
+#[tokio::test]
+async fn system_object_corrupt_only_copies_fail_closed() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/corrupt-only";
+    let dir = layout::object_dir_for(&c.dirs[2][0], layout::SYS_DIR, k).unwrap();
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(dir.join(meta::META_FILE), b"not-a-meta")
+        .await
+        .unwrap();
+    match c.stores[0].get_system_object(k).await {
+        Err(Error::CorruptMeta(_)) => {}
+        other => panic!("损坏副本必须 fail-closed（不是缺席）：{other:?}"),
+    }
 }
 
 /// 停 2 节点：集群写必须 fail-closed（token 下限的 quorum 读覆盖不足 →
