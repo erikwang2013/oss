@@ -61,7 +61,7 @@ impl Store {
             };
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name != layout::SYS_DIR
+                if !layout::is_system_bucket(&name)
                     && e.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
                 {
                     buckets.insert(name);
@@ -439,7 +439,7 @@ impl Store {
             };
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name != layout::SYS_DIR
+                if !layout::is_system_bucket(&name)
                     && e.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
                 {
                     names.insert(name);
@@ -557,7 +557,7 @@ impl Store {
         key: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let dir = layout::object_dir(drive, bucket, key)?;
+        let dir = layout::object_dir_for(drive, bucket, key)?;
         tokio::fs::create_dir_all(&dir).await?;
         let mut f = tokio::fs::File::create(dir.join(meta::META_NEW_FILE)).await?;
         f.write_all(bytes).await?;
@@ -576,7 +576,7 @@ impl Store {
         bucket: &str,
         key: &str,
     ) -> Result<(bool, [u8; 32])> {
-        let dir = layout::object_dir(drive, bucket, key)?;
+        let dir = layout::object_dir_for(drive, bucket, key)?;
         let new_path = dir.join(meta::META_NEW_FILE);
         let bytes = match tokio::fs::read(&new_path).await {
             Ok(b) => b,
@@ -668,7 +668,7 @@ impl Store {
     /// 服务端 abort：清本机全部槽的 `.new` 残骸（幂等）。
     pub async fn mesh_abort_meta(&self, m: crate::mesh::MetaWrite) -> Result<()> {
         for drive in &self.cfg.drives {
-            if let Ok(dir) = layout::object_dir(drive, &m.bucket, &m.key) {
+            if let Ok(dir) = layout::object_dir_for(drive, &m.bucket, &m.key) {
                 let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
             }
         }
@@ -679,7 +679,7 @@ impl Store {
     /// 与 `.new`（幂等）。meta 删除是可见性提交点——失败必须由调用方上抛，不得吞。
     pub async fn mesh_delete_meta(&self, r: crate::mesh::MetaRead) -> Result<()> {
         for drive in &self.cfg.drives {
-            if let Ok(dir) = layout::object_dir(drive, &r.bucket, &r.key) {
+            if let Ok(dir) = layout::object_dir_for(drive, &r.bucket, &r.key) {
                 let _ = tokio::fs::remove_file(dir.join(meta::META_FILE)).await;
                 let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
             }
@@ -785,7 +785,7 @@ impl Store {
             if !drives::drive_up(drive).await {
                 continue;
             }
-            let path = layout::object_dir(drive, &r.bucket, &r.key)?.join(meta::META_FILE);
+            let path = layout::object_dir_for(drive, &r.bucket, &r.key)?.join(meta::META_FILE);
             match tokio::fs::read(&path).await {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == r.key => {

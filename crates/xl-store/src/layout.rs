@@ -108,11 +108,33 @@ pub fn bucket_dir(root: &Path, bucket: &str) -> PathBuf {
     root.join(bucket)
 }
 
+/// S3 不可见的保留命名空间：[`SYS_DIR`] 以 `.` 开头，`validate_bucket` 永远拒绝，
+/// 因此用户无法寻址；内部路径经 [`object_dir_for`] 可达。
+pub fn is_system_bucket(name: &str) -> bool {
+    name == SYS_DIR
+}
+
 /// 所有对象读写路径都汇合到这里，桶名校验在此收口；S3 入口虽由 s3s 的默认 AwsNameValidation 先拦，但控制台/aether 上传直达内核，不能依赖上游。
 pub fn object_dir(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
     validate_bucket_data(bucket)?;
     validate_key(key)?;
     Ok(bucket_dir(root, bucket).join(object_dir_name(key)?))
+}
+
+/// 保留命名空间的内部寻址：跳过桶名校验（[`SYS_DIR`] 必被 [`object_dir`] 拒绝），
+/// 键仍过同一套校验。**S3 数据面入口保持 [`object_dir`]，不得改用它。**
+pub fn object_dir_system(root: &Path, key: &str) -> Result<PathBuf> {
+    validate_key(key)?;
+    Ok(bucket_dir(root, SYS_DIR).join(object_dir_name(key)?))
+}
+
+/// 内部 meta 路径的统一路由：系统桶走保留命名空间，其余与 [`object_dir`] 逐字节一致。
+pub fn object_dir_for(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+    if is_system_bucket(bucket) {
+        object_dir_system(root, key)
+    } else {
+        object_dir(root, bucket, key)
+    }
 }
 
 pub fn sys_dir(root: &Path, sub: &str) -> PathBuf {

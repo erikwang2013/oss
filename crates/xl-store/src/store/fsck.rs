@@ -615,7 +615,7 @@ impl Store {
                     continue;
                 }
                 let bucket_name = bucket.file_name().to_string_lossy().into_owned();
-                if bucket_name == layout::SYS_DIR {
+                if layout::is_system_bucket(&bucket_name) {
                     continue;
                 }
                 local_buckets.insert(bucket_name.clone());

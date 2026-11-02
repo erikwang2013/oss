@@ -134,7 +134,8 @@ impl KeyCache {
         drives: &[PathBuf],
         bucket: &str,
     ) -> Option<Arc<BucketKeys>> {
-        if self.max_keys == 0 {
+        // 保留命名空间不进缓存：控制对象不是 S3 键，也不得被列举路径复用
+        if self.max_keys == 0 || layout::is_system_bucket(bucket) {
             return None;
         }
         let bk = self.entry(bucket);

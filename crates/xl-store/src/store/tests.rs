@@ -89,6 +89,27 @@ async fn list_buckets_missing_root_is_empty() {
 }
 
 #[tokio::test]
+async fn system_bucket_is_hidden_from_list_and_delete() {
+    let (s, _d) = store().await;
+    tokio::fs::create_dir_all(s.cfg.root().join(layout::SYS_DIR))
+        .await
+        .unwrap();
+    let buckets = s.list_buckets().await.unwrap();
+    assert!(buckets.iter().all(|b| b.name != layout::SYS_DIR));
+    assert!(s.delete_bucket(layout::SYS_DIR).await.is_err());
+    // 内部路径可达保留命名空间；S3 入口仍拒绝
+    let p = layout::object_dir_for(s.cfg.root(), layout::SYS_DIR, "control/manifest").unwrap();
+    assert_eq!(
+        p,
+        s.cfg
+            .root()
+            .join(layout::SYS_DIR)
+            .join("control__XLDIR__manifest")
+    );
+    assert!(layout::object_dir(s.cfg.root(), layout::SYS_DIR, "control/manifest").is_err());
+}
+
+#[tokio::test]
 async fn create_bucket_is_idempotent_error() {
     let (s, _d) = store().await;
     s.create_bucket("alpha").await.unwrap();

@@ -978,6 +978,10 @@ impl Store {
     }
 
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        // 保留命名空间对 S3 不可见：删它等于删它不存在的桶（而非向调用方确认它存在）
+        if layout::is_system_bucket(bucket) {
+            return Err(Error::NoSuchBucket(bucket.to_string()));
+        }
         // 桶级互斥（M2b-2 Task 10 收口）：与「写者的桶窗口」互斥——写者窗口内先落对象目录，
         // 此后本检查见非空必拒；窗口外删除成功 → 迟到的写者 ensure 失败 NoSuchBucket。不复活的证明在测试。
         let _bguard = self.lock_bucket_owned(bucket).await;
@@ -1089,6 +1093,9 @@ impl Store {
     pub async fn reconcile_bucket_dirs(&self, rows: &[String]) {
         let known: HashSet<&str> = rows.iter().map(String::as_str).collect();
         for bucket in rows {
+            if layout::is_system_bucket(bucket) {
+                continue; // 保留命名空间不归控制面对账管
+            }
             if let Err(e) = layout::validate_bucket_data(bucket) {
                 tracing::warn!(bucket = %bucket, error = %e, "启动对账：桶名非法，跳过");
                 continue;
@@ -1121,7 +1128,7 @@ impl Store {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == layout::SYS_DIR || known.contains(name.as_str()) {
+                if layout::is_system_bucket(&name) || known.contains(name.as_str()) {
                     continue;
                 }
                 let src = entry.path();
@@ -1165,7 +1172,7 @@ impl Store {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == layout::SYS_DIR || out.iter().any(|b| b.name == name) {
+                if layout::is_system_bucket(&name) || out.iter().any(|b| b.name == name) {
                     continue;
                 }
                 let nanos = entry
@@ -1193,7 +1200,8 @@ impl Store {
                 match cl.transport.list_bucket_dirs(&n.id).await {
                     Ok(names) => {
                         for name in names {
-                            if name == layout::SYS_DIR || out.iter().any(|b| b.name == name) {
+                            if layout::is_system_bucket(&name) || out.iter().any(|b| b.name == name)
+                            {
                                 continue;
                             }
                             out.push(BucketInfo {
@@ -1229,7 +1237,7 @@ impl Store {
             .cfg
             .drives
             .iter()
-            .map(|drive| Ok(layout::object_dir(drive, bucket, key)?.join(meta::META_FILE)))
+            .map(|drive| Ok(layout::object_dir_for(drive, bucket, key)?.join(meta::META_FILE)))
             .collect::<Result<Vec<_>>>()?;
         let reads = futures::future::join_all(paths.iter().map(tokio::fs::read));
         let mut best: Option<((u64, i64), XlMeta)> = None;
@@ -1303,7 +1311,7 @@ impl Store {
             if !drives::drive_up(drive).await {
                 continue;
             }
-            let path = layout::object_dir(drive, bucket, key)?.join(meta::META_FILE);
+            let path = layout::object_dir_for(drive, bucket, key)?.join(meta::META_FILE);
             match tokio::fs::read(&path).await {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
@@ -1408,7 +1416,7 @@ impl Store {
         key: &str,
         m: &XlMeta,
     ) -> Result<()> {
-        let dir = layout::object_dir(drive, bucket, key)?;
+        let dir = layout::object_dir_for(drive, bucket, key)?;
         // 目录可能不存在：版本控制 delete marker 可在「键从未有过数据目录」时落 meta
         // （put/mpu 都在桶窗口预建目录；marker 路径没有）——与多盘/集群分支对齐
         tokio::fs::create_dir_all(&dir).await?;
@@ -1472,7 +1480,7 @@ impl Store {
                 tracing::warn!(drive = %drive.display(), "盘不在册，跳过 meta 准备");
                 continue;
             }
-            let dir = layout::object_dir(drive, bucket, key)?;
+            let dir = layout::object_dir_for(drive, bucket, key)?;
             let res: Result<()> = async {
                 tokio::fs::create_dir_all(&dir).await?;
                 let mut f = tokio::fs::File::create(dir.join(meta::META_NEW_FILE)).await?;
@@ -1491,7 +1499,7 @@ impl Store {
         }
         if prepared.len() < quorum {
             for drive in &prepared {
-                if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+                if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
                     let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
                 }
             }
@@ -1512,7 +1520,7 @@ impl Store {
         }
         let mut flipped = 0usize;
         for drive in &prepared {
-            let dir = layout::object_dir(drive, bucket, key)?;
+            let dir = layout::object_dir_for(drive, bucket, key)?;
             match tokio::fs::rename(dir.join(meta::META_NEW_FILE), dir.join(meta::META_FILE)).await
             {
                 Ok(()) => {
@@ -1583,7 +1591,7 @@ impl Store {
         if prepared < q_s {
             // 一盘未翻转：清 .new（best-effort）→ QuorumUnmet，调用方回滚数据目录
             for drive in &self.cfg.drives {
-                if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+                if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
                     let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
                 }
             }
@@ -1661,7 +1669,7 @@ impl Store {
         // 不补偿会让「已返回失败」的写被读到（评审 P1）
         // 先清全节点的 .new 残骸（未翻槽位的暂存；翻过的槽位 .new 已被 rename 消费）
         for drive in &self.cfg.drives {
-            if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+            if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
                 let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
             }
         }
@@ -1679,7 +1687,7 @@ impl Store {
             let restored = match old {
                 Some(om) => self.write_meta_on(drive, bucket, key, om).await,
                 None => {
-                    let dir = layout::object_dir(drive, bucket, key)?;
+                    let dir = layout::object_dir_for(drive, bucket, key)?;
                     let _ = tokio::fs::remove_file(dir.join(meta::META_FILE)).await;
                     Ok(())
                 }
@@ -1732,7 +1740,7 @@ impl Store {
     /// best-effort——残骸无害（永不被读为 meta），这里只是顺手收干净。
     pub(in crate::store) async fn clear_meta_new(&self, bucket: &str, key: &str) {
         for drive in &self.cfg.drives {
-            if let Ok(dir) = layout::object_dir(drive, bucket, key) {
+            if let Ok(dir) = layout::object_dir_for(drive, bucket, key) {
                 let _ = tokio::fs::remove_file(dir.join(meta::META_NEW_FILE)).await;
             }
         }
@@ -1780,7 +1788,7 @@ impl Store {
         // 此后一律 NoSuchKey——**不会**再出现「meta 还在、分片被逐个删掉」的中间态
         // （那会让严格轮读报 CorruptMeta，并发删除的裂口由此关闭）。失败即中止（可重试）。
         for drive in &self.cfg.drives {
-            let dir = layout::object_dir(drive, bucket, key)?;
+            let dir = layout::object_dir_for(drive, bucket, key)?;
             for f in [meta::META_FILE, meta::META_NEW_FILE] {
                 match tokio::fs::remove_file(dir.join(f)).await {
                     Ok(()) => {}
@@ -1811,7 +1819,7 @@ impl Store {
         }
         // ② 数据清理：删各盘对象目录（meta 已除，失败只留不可见残骸，由 GC 按 mtime 回收）
         for drive in &self.cfg.drives {
-            let dir = layout::object_dir(drive, bucket, key)?;
+            let dir = layout::object_dir_for(drive, bucket, key)?;
             match tokio::fs::remove_dir_all(&dir).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
