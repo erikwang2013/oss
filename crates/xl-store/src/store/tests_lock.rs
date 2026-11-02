@@ -224,6 +224,7 @@ async fn lock_record_decode_trust_boundary() {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         };
         m.versions[0].part.uuid = "u".into();
         m.versions[0].lock = Some(ObjectLockRecord {

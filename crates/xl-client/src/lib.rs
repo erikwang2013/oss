@@ -722,7 +722,7 @@ impl MeshTransport for TonicMesh {
             meta: resp.found.then(|| bytes::Bytes::from(resp.meta)),
             mod_time_nanos: resp.mod_time_nanos,
             slots_ok: resp.slots_ok,
-            best_copies: resp.best_copies,
+            max_token: resp.max_token,
         })
     }
     async fn delete_meta(&self, node: &str, r: mesh::MetaRead) -> Result<()> {
@@ -1427,7 +1427,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             meta: snap.meta.map(|b| b.to_vec()).unwrap_or_default(),
             mod_time_nanos: snap.mod_time_nanos,
             slots_ok: snap.slots_ok,
-            best_copies: snap.best_copies,
+            max_token: snap.max_token,
         }))
     }
     async fn delete_meta(

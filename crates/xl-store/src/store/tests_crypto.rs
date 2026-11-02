@@ -1278,6 +1278,7 @@ async fn decode_rejects_bad_encryption_records() {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         };
         m.versions[0].part.uuid = "u".into(); // 解码白名单要求 uuid 安全
         m.versions[0].encryption = Some(meta::EncryptionRecord {

@@ -34,6 +34,11 @@ pub struct XlMeta {
     /// Phase 0 控制对象：tombstone（`Some(true)` = 已删除、无数据；get 返回 None）。
     #[serde(default)]
     pub control_deleted: Option<bool>,
+    /// Phase 0 控制对象：提交证书（两阶段提交的第二阶段）。`Some(true)` = 已提交、读可见；
+    /// `Some(false)` = 第一阶段数据（未提交，读不可见）；`None` = 非控制对象。
+    /// 缺省不落盘（`skip_serializing_if`）——普通数据面 meta 编码逐字节不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_committed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -735,6 +740,7 @@ mod tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
     }
 
@@ -995,6 +1001,7 @@ mod tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         };
         assert!(m.latest().is_none());
     }
@@ -1202,6 +1209,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         };
         let back = XlMeta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back.versions[0].part_sizes, Some(vec![5, 6]));
@@ -1217,6 +1225,7 @@ mod parts_tests {
                 control_version: None,
                 fence_token: None,
                 control_deleted: None,
+                control_committed: None,
             };
             let bytes = m.encode().unwrap();
             assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
@@ -1239,6 +1248,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         };
         let bytes = m.encode().unwrap();
         assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
@@ -1273,6 +1283,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
     }
 
@@ -1286,6 +1297,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
         .encode()
         .unwrap();
@@ -1307,6 +1319,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
         .encode()
         .unwrap();
@@ -1323,6 +1336,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
         .encode()
         .unwrap();
@@ -1350,6 +1364,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
         .encode()
         .unwrap();
@@ -1449,6 +1464,7 @@ mod parts_tests {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
         .encode()
         .unwrap();
@@ -1476,6 +1492,7 @@ mod parts_tests {
                 control_version: None,
                 fence_token: None,
                 control_deleted: None,
+                control_committed: None,
             }
             .encode()
             .and_then(|b| XlMeta::decode(&b).map(|_| ()))

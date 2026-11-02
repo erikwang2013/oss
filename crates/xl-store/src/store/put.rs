@@ -1026,6 +1026,7 @@ impl Store {
                 control_version: None,
                 fence_token: None,
                 control_deleted: None,
+                control_committed: None,
             },
         };
         meta.refresh_latest_flags();

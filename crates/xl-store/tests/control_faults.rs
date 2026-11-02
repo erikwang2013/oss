@@ -6,9 +6,8 @@
 //!
 //! 场景矩阵（brief Task 6）：
 //! 1. token 1 prepare 后崩溃 → token 2 提交 → token 1 重试必须 Conflict，token 2 内容胜。
-//! 2. 单机多盘 `>=1 翻转 = 已提交` 契约：token 1 翻 1 槽后崩 → 重启可见完整 token 1；
-//!    token 2 提交后胜出。集群 quorum 可见性不在本机契约内，见单测
-//!    `system_object_quorum_read_ignores_sub_quorum_partial_copy`（亚 quorum 半翻不可见）。
+//! 2. 第一阶段翻 1 槽后崩溃 → 数据无提交证书，重启**不可见**（不是半截内容）；
+//!    token 2 两阶段提交后胜出。提交点 = 第二阶段证书，不是第一次数据翻转。
 //! 3. 过期写者在新 token 之后提交/恢复 → 每槽 `Stale`，新 token 内容原样保留。
 //! 4. 分区 < Q_s → 读 `CorruptMeta`、写 fail-closed，无陈旧成功；恢复后旧值不变。
 //! 5. `inline_threshold = 0`（stretch 强制配置）→ system object 仍内联且可读写。
@@ -88,14 +87,13 @@ async fn control_crash_before_commit_keeps_newer_token() {
     }
 }
 
-/// 场景 2：**单机多盘（非集群）契约：≥1 槽翻转即提交**——token 1 翻 1 槽后崩，
-/// 重启读到的是完整 token 1；token 2 提交后胜出。这里断言的不是 quorum 可见性：
-/// 集群下亚 quorum 半翻版本必须不可见，由单测
-/// `system_object_quorum_read_ignores_sub_quorum_partial_copy` 覆盖。
+/// 场景 2：单机多盘（非集群）第一阶段翻 1 槽后崩——数据副本完整但**没有提交证书**，
+/// 重启后读必须是缺席（未提交不可见），不是半截内容；token 2 两阶段提交后胜出。
+/// 提交点 = 第二阶段证书（`control_committed = Some(true)`），不是第一次数据翻转。
 #[tokio::test]
-async fn single_node_multi_drive_one_flip_is_committed() {
+async fn single_node_multi_drive_phase1_crash_stays_uncommitted() {
     const KEY: &str = "control/crash-mid-commit";
-    const TEST: &str = "single_node_multi_drive_one_flip_is_committed";
+    const TEST: &str = "single_node_multi_drive_phase1_crash_stays_uncommitted";
 
     if std::env::var(CHILD).is_ok() {
         let dirs = dirs_from_env();
@@ -120,23 +118,19 @@ async fn single_node_multi_drive_one_flip_is_committed() {
     // 崩溃现场：恰 1 槽已提交，其余 11 槽仍是 `.new`
     assert_eq!(slot_counts(&dirs, KEY), (1, N_DRIVES - 1));
 
-    // ---- 段 2：单机多盘契约（非 quorum）：≥1 槽翻转即已提交，读到的必须是完整
-    // token 1 版本（盘上无半截字节），不是空/旧版本 ----
+    // ---- 段 2：第一阶段数据（未提交）不可见：读必须是缺席，不是 token1 ----
     let s = open_store(&dirs, None, false).await;
-    let obj = s
-        .get_system_object(KEY)
-        .await
-        .unwrap()
-        .expect("已翻转的槽是完整 token 1 版本，重启后可见");
-    assert_eq!(&obj.data[..], b"token1", "必须是完整写入，不得出现半截内容");
-    assert_eq!((obj.version, obj.fence_token), (1, 1));
+    assert!(
+        s.get_system_object(KEY).await.unwrap().is_none(),
+        "未提交的第一阶段副本不得被读到"
+    );
+    // 盘上那一份是完整 meta（可被下一次写覆盖），只是没有证书
+    assert_eq!(slot_counts(&dirs, KEY), (1, N_DRIVES - 1));
 
-    // ---- 段 3：token 2 提交（对已翻/未翻槽都合法：cur 1 < 2）----
+    // ---- 段 3：token 2 提交（基线 = 缺席；调用方 token 须高于已观察最大值 1）----
     assert_eq!(
-        s.put_system_object(KEY, b"token2", Some(1), 2)
-            .await
-            .unwrap(),
-        2
+        s.put_system_object(KEY, b"token2", None, 2).await.unwrap(),
+        1
     );
     assert_eq!(slot_counts(&dirs, KEY), (N_DRIVES, 0));
 
@@ -145,7 +139,7 @@ async fn single_node_multi_drive_one_flip_is_committed() {
     let s = open_store(&dirs, None, false).await;
     let obj = s.get_system_object(KEY).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"token2");
-    assert_eq!((obj.version, obj.fence_token), (2, 2));
+    assert_eq!((obj.version, obj.fence_token), (1, 2));
     for d in &dirs {
         let m = disk_meta(d, KEY);
         assert_eq!(m.fence_token, Some(2), "{}", d.display());

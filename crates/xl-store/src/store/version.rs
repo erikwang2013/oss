@@ -254,6 +254,7 @@ impl Store {
                     control_version: None,
                     fence_token: None,
                     control_deleted: None,
+                    control_committed: None,
                 });
                 let removed: Vec<Version> = m
                     .versions
@@ -378,6 +379,7 @@ impl Store {
                     control_version: None,
                     fence_token: None,
                     control_deleted: None,
+                    control_committed: None,
                 },
             };
             m.versions.push(marker);

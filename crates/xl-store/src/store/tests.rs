@@ -121,6 +121,7 @@ async fn system_meta_roundtrips_through_internal_paths() {
         control_version: None,
         fence_token: None,
         control_deleted: None,
+        control_committed: None,
     };
     // write_meta_on / read_meta 覆盖内部 meta 路由的两个收口（其余提交/补偿路径同源）
     s.write_meta_on(d.path(), layout::SYS_DIR, "control/a", &m)
@@ -156,6 +157,7 @@ async fn system_namespace_cannot_be_listed() {
         control_version: None,
         fence_token: None,
         control_deleted: None,
+        control_committed: None,
     };
     s.write_meta_on(d.path(), layout::SYS_DIR, "control/a", &m)
         .await
@@ -1181,6 +1183,7 @@ async fn read_meta_rejects_mismatched_object_key() {
         control_version: None,
         fence_token: None,
         control_deleted: None,
+        control_committed: None,
     };
     tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
         .await
@@ -2214,6 +2217,7 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
             control_version: None,
             fence_token: None,
             control_deleted: None,
+            control_committed: None,
         }
     };
     for (i, dir) in dirs.iter().enumerate() {
@@ -2656,6 +2660,7 @@ async fn legacy_parts_form_still_readable() {
         control_version: None,
         fence_token: None,
         control_deleted: None,
+        control_committed: None,
     };
     tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
         .await
@@ -5444,7 +5449,8 @@ async fn collect_keys_filtered_honors_prefix_and_marker() {
 
 // ---- Phase 0 Task 3：fenced commit（控制对象单调 token） ----
 
-/// 控制对象形态的最小 meta（versions 空；token 参与提交校验）。
+/// 控制对象形态的最小 meta（versions 空；token 参与提交校验）。带提交证书——
+/// 这些 helper 代表「已提交的历史版本」。
 fn fenced_meta(key: &str, version: u64, token: u64) -> XlMeta {
     XlMeta {
         object_key: key.to_string(),
@@ -5452,6 +5458,7 @@ fn fenced_meta(key: &str, version: u64, token: u64) -> XlMeta {
         control_version: Some(version),
         fence_token: Some(token),
         control_deleted: None,
+        control_committed: Some(true),
     }
 }
 
@@ -5616,6 +5623,7 @@ async fn unfenced_write_ignores_fence_tokens() {
         control_version: None,
         fence_token: None,
         control_deleted: None,
+        control_committed: None,
     };
     assert_eq!(
         s.write_meta(layout::SYS_DIR, k, &plain, None)
@@ -5912,10 +5920,10 @@ async fn system_object_read_reflects_committed_write_on_follower() {
     assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
 }
 
-/// Task 6 修复：集群 system-object 读必须按**内容相同的副本数**确认版本。
-/// v1 已提交到 6 槽（Q_s=3）；1 槽被种入写者崩溃留下的亚 quorum v2 半翻副本
-/// （epoch/token 更高，max-rank 读会选中它）。quorum 读必须返回 v1。
-/// v2 真正提交后（≥ Q_s 槽）必须胜出，且之后的 CAS 不被半翻版本顶死。
+/// Task 6 修复：集群 system-object 读只认**提交证书**（`control_committed = Some(true)`）。
+/// v1 已提交到 6 槽（Q_s=3）；1 槽被种入写者第一阶段崩溃留下的 v2 数据（无证书，
+/// epoch/token 更高，max-rank 读会选中它）。读必须返回 v1，且 CAS 不被未提交副本顶死。
+/// v2 真正两阶段提交后必须胜出。
 #[tokio::test]
 async fn system_object_quorum_read_ignores_sub_quorum_partial_copy() {
     let c = Cluster::new(3, 2).await;
@@ -5923,10 +5931,11 @@ async fn system_object_quorum_read_ignores_sub_quorum_partial_copy() {
     let a = &c.stores[0];
     let b = &c.stores[1];
     assert_eq!(a.put_system_object(k, b"v1", None, 1).await.unwrap(), 1);
-    // 半翻副本：从已提交 v1 派生，抬 epoch/token（保证 max-rank 更高）
+    // 第一阶段半翻副本：从已提交 v1 派生，抬 epoch/token（max-rank 更高）+ 去掉证书
     let mut partial = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
     partial.control_version = Some(2);
     partial.fence_token = Some(2);
+    partial.control_committed = Some(false);
     partial.versions[0].epoch = Some(2);
     partial.versions[0].mod_time_nanos += 1;
     partial.versions[0].inline = Some(crate::meta::InlineData {
@@ -5936,17 +5945,18 @@ async fn system_object_quorum_read_ignores_sub_quorum_partial_copy() {
         .await
         .unwrap();
 
-    // follower 读：本机 2 槽 v1 + n1（1 半翻 + 1 v1）+ n3 2 槽 v1
+    // follower 读：本机 2 槽 v1 + n1（1 未提交 + 1 v1）+ n3 2 槽 v1
     let obj = b.get_system_object(k).await.unwrap().unwrap();
     assert_eq!(
         (obj.version, obj.fence_token),
-        (1, 1),
-        "亚 quorum 半翻版本不得胜出"
+        (1, 2),
+        "未提交半翻版本不得胜出；token 上报已观察最大值"
     );
     assert_eq!(&obj.data[..], b"v1");
 
-    // 真实提交 v2：CAS 以 quorum 确认的 v1 为基线（不被半翻版本顶死）
-    assert_eq!(b.put_system_object(k, b"v2", Some(1), 2).await.unwrap(), 2);
+    // 真实提交 v2：CAS 以已提交 v1 为基线（不被未提交副本的版本/内容顶死）；
+    // 调用方 token 必须高于已观察最大值 2
+    assert_eq!(b.put_system_object(k, b"v2", Some(1), 3).await.unwrap(), 2);
     let obj = b.get_system_object(k).await.unwrap().unwrap();
     assert_eq!(&obj.data[..], b"v2");
     assert_eq!(obj.version, 2);
@@ -5963,6 +5973,159 @@ async fn system_object_quorum_read_ignores_sub_quorum_partial_copy() {
             d.display()
         );
     }
+}
+
+/// 在 12 槽集群（Q_s=9）上按物理槽号覆盖控制对象 meta。槽号 = 节点序 × 每节点盘数 + 盘序。
+async fn overwrite_control_slot(c: &Cluster, slot: usize, key: &str, f: impl FnOnce(&mut XlMeta)) {
+    let per_node = c.dirs[0].len();
+    let dir = &c.dirs[slot / per_node][slot % per_node];
+    let mut m = disk_meta(dir, layout::SYS_DIR, key).await;
+    f(&mut m);
+    c.stores[slot / per_node]
+        .write_meta_on(dir, layout::SYS_DIR, key, &m)
+        .await
+        .unwrap();
+}
+
+/// 修复轮 2（12 槽 / Q_s=9）：第一阶段失败补偿把旧内容恢复成**新 token**，同一已提交
+/// 版本在槽间出现两种 token 编码（k∈[4,8] 时两组都 < Q_s）。读按逻辑版本（忽略
+/// fence_token）选举，必须返回 v1，绝不因分组计数制造 CorruptMeta 楔死。
+#[tokio::test]
+async fn system_object_compensation_token_split_heals_at_twelve_slots() {
+    let c = Cluster::new(4, 3).await; // 12 槽 → 8+4，Q_s = 9
+    let k = "control/token-split";
+    assert_eq!(
+        c.stores[0]
+            .put_system_object(k, b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    // 补偿回滚现场：5 槽（4..=8）恢复成 v1 内容 + 本次 token 99（证书保留）
+    for slot in 4..=8 {
+        overwrite_control_slot(&c, slot, k, |m| m.fence_token = Some(99)).await;
+    }
+    let obj = c.stores[3].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v1");
+    assert_eq!(
+        (obj.version, obj.fence_token),
+        (1, 99),
+        "同一逻辑版本跨 token 编码不得分叉；token 取已观察最大值"
+    );
+
+    // 后续 put 必须自愈：新 token 覆盖全部 12 槽
+    assert_eq!(
+        c.stores[2]
+            .put_system_object(k, b"v2", Some(1), 100)
+            .await
+            .unwrap(),
+        2
+    );
+    let obj = c.stores[3].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v2");
+    assert_eq!(obj.version, 2);
+    assert!(obj.fence_token > 99);
+    for dir in c.dirs.iter().flatten() {
+        let m = disk_meta(dir, layout::SYS_DIR, k).await;
+        assert_eq!(m.control_version, Some(2), "{}", dir.display());
+        assert_eq!(m.fence_token, Some(obj.fence_token), "{}", dir.display());
+        assert_eq!(m.control_committed, Some(true), "{}", dir.display());
+    }
+}
+
+/// 修复轮 2（12 槽 / Q_s=9）：第一阶段崩溃留下 5 槽 v2 数据（无证书），其余 7 槽仍是
+/// 已提交 v1。两组都 < Q_s，但 v1 有证书 → 读 v1，不是 CorruptMeta；put 自愈。
+#[tokio::test]
+async fn system_object_uncommitted_partial_is_invisible_at_twelve_slots() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/crash-partial";
+    assert_eq!(
+        c.stores[0]
+            .put_system_object(k, b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    for slot in 4..=8 {
+        overwrite_control_slot(&c, slot, k, |m| {
+            m.control_version = Some(2);
+            m.fence_token = Some(2);
+            m.control_committed = Some(false);
+            m.versions[0].epoch = Some(2);
+            m.versions[0].mod_time_nanos += 1;
+            m.versions[0].inline = Some(crate::meta::InlineData {
+                bytes: b"v2".to_vec(),
+            });
+        })
+        .await;
+    }
+    let obj = c.stores[1].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v1", "未提交的 v2 半翻不得胜出");
+    assert_eq!((obj.version, obj.fence_token), (1, 2));
+
+    assert_eq!(
+        c.stores[1]
+            .put_system_object(k, b"v2", Some(1), 3)
+            .await
+            .unwrap(),
+        2
+    );
+    let obj = c.stores[3].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v2");
+    assert_eq!(obj.version, 2);
+    for dir in c.dirs.iter().flatten() {
+        let m = disk_meta(dir, layout::SYS_DIR, k).await;
+        assert_eq!(
+            (m.control_version, m.control_committed),
+            (Some(2), Some(true)),
+            "{}",
+            dir.display()
+        );
+    }
+}
+
+/// 修复轮 2：提交证书的可见性不要求 ≥ Q_s 份——第二阶段只翻到 1 槽（崩溃/超时）也
+/// 证明第一阶段 quorum 已成功，读必须选最高 control_version 的带证书版本。
+#[tokio::test]
+async fn system_object_single_commit_certificate_certifies_version() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/partial-certificate";
+    assert_eq!(
+        c.stores[0]
+            .put_system_object(k, b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    // v2 数据覆盖 9 槽（第一阶段 quorum），但只有槽 4 带证书
+    for slot in 0..=8 {
+        let certified = slot == 4;
+        overwrite_control_slot(&c, slot, k, move |m| {
+            m.control_version = Some(2);
+            m.fence_token = Some(2);
+            m.control_committed = Some(certified);
+            m.versions[0].epoch = Some(2);
+            m.versions[0].mod_time_nanos += 1;
+            m.versions[0].inline = Some(crate::meta::InlineData {
+                bytes: b"v2".to_vec(),
+            });
+        })
+        .await;
+    }
+    let obj = c.stores[3].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v2");
+    assert_eq!((obj.version, obj.fence_token), (2, 2));
+
+    assert_eq!(
+        c.stores[3]
+            .put_system_object(k, b"v3", Some(2), 3)
+            .await
+            .unwrap(),
+        3
+    );
+    let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v3");
+    assert_eq!(obj.version, 3);
 }
 
 /// 停 2 节点：集群写必须 fail-closed（token 下限的 quorum 读覆盖不足 →

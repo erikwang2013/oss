@@ -1246,8 +1246,24 @@ impl Store {
     /// 副本** → `Err(CorruptMeta)`（fail-closed，不把「盘上有坏 meta」伪装成 404）。
     async fn read_meta(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return self.read_meta_cluster(bucket, key, false, false).await;
+            return Ok(self.read_meta_cluster(bucket, key, false, false).await?.0);
         }
+        self.read_meta_local(bucket, key, false)
+            .await
+            .map(|(m, _)| m)
+    }
+
+    /// 单机/多盘 meta 扫描。`committed_only`（控制对象）只接受带提交证书
+    /// （`control_committed == Some(true)`）的副本、按 `control_version` 选举，并返回
+    /// **全部**副本（含未提交）的最大 fence_token；没有已提交副本 → `(None, max_token)`
+    /// （未提交/损坏都不作为可见版本，CAS 可用 `expected_version=None` 重建，不楔死）。
+    #[allow(clippy::type_complexity)]
+    async fn read_meta_local(
+        &self,
+        bucket: &str,
+        key: &str,
+        committed_only: bool,
+    ) -> Result<(Option<XlMeta>, u64)> {
         // 路径先统一解析（错误口径同串行：首个坏路径即上抛），再并发读各盘；
         // 结果按盘序处理，秩并列时仍取靠前盘——与逐盘串行版逐字节一致。
         let paths = self
@@ -1258,14 +1274,29 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         let reads = futures::future::join_all(paths.iter().map(tokio::fs::read));
         let mut best: Option<((u64, i64), XlMeta)> = None;
+        let mut best_control: Option<((u64, u64), XlMeta)> = None;
+        let mut committed: Vec<XlMeta> = Vec::new();
+        let mut max_token = 0u64;
         let mut corrupt: Option<String> = None;
         for (path, read) in paths.iter().zip(reads.await) {
             match read {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
-                        let t = m.rank();
-                        if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                            best = Some((t, m));
+                        if committed_only {
+                            max_token = max_token.max(m.fence_token.unwrap_or(0));
+                            if m.control_committed == Some(true) {
+                                let t =
+                                    (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0));
+                                if best_control.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                    best_control = Some((t, m.clone()));
+                                }
+                                committed.push(m);
+                            }
+                        } else {
+                            let t = m.rank();
+                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                best = Some((t, m));
+                            }
                         }
                     }
                     Ok(m) => {
@@ -1290,11 +1321,36 @@ impl Store {
                 }
             }
         }
+        if committed_only {
+            let Some(((version, _), mut chosen)) = best_control else {
+                return Ok((None, max_token));
+            };
+            // 同版本（忽略 fence_token——补偿回滚会用旧内容 + 新 token）不同内容 = 分叉
+            let mut seen: Option<[u8; 32]> = None;
+            for m in committed
+                .iter()
+                .filter(|m| m.control_version.unwrap_or(0) == version)
+            {
+                let mut logical = m.clone();
+                logical.fence_token = None;
+                let h = crate::mesh::content_hash(&logical.encode()?);
+                match seen {
+                    Some(prev) if prev != h => {
+                        return Err(Error::CorruptMeta(format!(
+                            "控制对象 {key:?} 同版本分叉：v{version} 有多份不同内容"
+                        )));
+                    }
+                    _ => seen = Some(h),
+                }
+            }
+            chosen.fence_token = Some(max_token);
+            return Ok((Some(chosen), max_token));
+        }
         match best {
-            Some((_, m)) => Ok(Some(m)),
+            Some((_, m)) => Ok((Some(m), max_token)),
             None => match corrupt {
                 Some(why) => Err(Error::CorruptMeta(why)),
-                None => Ok(None),
+                None => Ok((None, max_token)),
             },
         }
     }
@@ -1307,16 +1363,17 @@ impl Store {
     /// 覆盖 ≥Q_s 且无副本 → 缺席可证明（任何已提交副本都落在覆盖交集里）。
     /// `full=false` 快路径提前停；`full=true` 收满全部响应（get_object 的回退一次）。
     ///
-    /// `quorum=true`（仅 `.oss.sys` 控制对象）：按**内容相同的副本数**确认版本——
-    /// 取副本数 ≥ `Q_s` 的最高版本；亚 quorum 的半翻版本（写者崩溃后 1..k 槽已翻、
-    /// 未达提交阈）永远不可见。max-rank 选举只在数据面/非 quorum 模式使用。
+    /// `quorum=true`（仅控制对象）：只认**提交证书**（`control_committed == Some(true)`）——
+    /// 取 `control_version` 最高的已提交副本；第一阶段半翻（无证书）永不出现。返回
+    /// `(可见 meta, 全部副本含未提交的最大 fence_token)`，后者供 CAS/锁下限使用。
+    /// max-rank 选举只在数据面/非 quorum 模式使用。
     async fn read_meta_cluster(
         &self,
         bucket: &str,
         key: &str,
         full: bool,
         quorum: bool,
-    ) -> Result<Option<XlMeta>> {
+    ) -> Result<(Option<XlMeta>, u64)> {
         // DP-0：混版集群在扇出前 fail-closed（集群读吞传输错 → 不清 503 会退化成 500）。
         self.ensure_data_plane_compatible().await?;
         use futures::StreamExt as _;
@@ -1327,9 +1384,9 @@ impl Store {
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0usize;
-        // quorum 模式：内容 hash → (meta, 已确认副本数)。hash 用规范编码（写路径同源）。
-        let mut groups: std::collections::HashMap<[u8; 32], (XlMeta, usize)> =
-            std::collections::HashMap::new();
+        // quorum 模式：只收带提交证书的副本；max_token 覆盖全部副本（含未提交）。
+        let mut committed: Vec<XlMeta> = Vec::new();
+        let mut max_token = 0u64;
 
         // 本机各盘扫描（就地计数：NotFound 也是确定性观察；IO/解码错误不计）
         for drive in &self.cfg.drives {
@@ -1342,11 +1399,10 @@ impl Store {
                     Ok(m) if m.object_key == key => {
                         covered += 1;
                         if quorum {
-                            let enc = m.encode()?;
-                            groups
-                                .entry(crate::mesh::content_hash(&enc))
-                                .and_modify(|(_, n)| *n += 1)
-                                .or_insert((m, 1));
+                            max_token = max_token.max(m.fence_token.unwrap_or(0));
+                            if m.control_committed == Some(true) {
+                                committed.push(m);
+                            }
                         } else {
                             let t = m.rank();
                             if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
@@ -1388,16 +1444,15 @@ impl Store {
                 match res {
                     Ok(snap) => {
                         covered += snap.slots_ok as usize;
-                        let remote_copies = snap.best_copies as usize;
+                        max_token = max_token.max(snap.max_token);
                         if let Some(meta_bytes) = snap.meta {
                             match XlMeta::decode(&meta_bytes) {
                                 Ok(m) if m.object_key == key => {
                                     if quorum {
-                                        // 远端已按内容数过本地相同副本；hash 与本地同源
-                                        groups
-                                            .entry(crate::mesh::content_hash(&meta_bytes))
-                                            .and_modify(|(_, n)| *n += remote_copies)
-                                            .or_insert((m, remote_copies));
+                                        // 服务端只返回已提交副本；防御性复查证书
+                                        if m.control_committed == Some(true) {
+                                            committed.push(m);
+                                        }
                                     } else {
                                         let t = m.rank();
                                         if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
@@ -1431,54 +1486,63 @@ impl Store {
             )));
         }
         if quorum {
-            if groups.is_empty() {
-                // 覆盖 ≥ Q_s 且无任何副本：缺席落在读写 quorum 的交集里，可证明不存在
-                return Ok(None);
-            }
-            let mut candidates: Vec<(XlMeta, usize)> = groups
-                .into_values()
-                // 只接受副本数 ≥ Q_s 的版本；亚 quorum 半翻版本永远不可见
-                .filter(|(_, n)| *n >= q_s)
-                .collect();
-            let version_key =
-                |m: &XlMeta| (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0));
-            candidates.sort_by_key(|(m, _)| version_key(m));
-            return match candidates.pop() {
-                Some((m, _)) => {
-                    // 同版本不同内容 = 分叉，无法判定哪份是提交版本 → fail-closed
-                    if candidates
-                        .last()
-                        .is_some_and(|(prev, _)| version_key(prev) == version_key(&m))
-                    {
-                        Err(Error::CorruptMeta(format!(
-                            "控制对象 {key:?} 同版本分叉：v{} 有多份不同内容",
-                            m.control_version.unwrap_or(0)
-                        )))
-                    } else {
-                        Ok(Some(m))
-                    }
-                }
-                None => Err(Error::CorruptMeta(format!(
-                    "meta 无 quorum 版本：覆盖 {covered}/{q_s}，存在副本但均未达提交阈"
-                ))),
+            // 提交证书是唯一可见性判据：标记阶段以第一阶段 quorum 成功为前提，因此
+            // 任意一份带证书副本即可见（崩溃留下的第一阶段半翻副本没有证书）。
+            let Some(max_version) = committed
+                .iter()
+                .map(|m| m.control_version.unwrap_or(0))
+                .max()
+            else {
+                // 覆盖 ≥ Q_s 且无已提交副本：未提交/被更新写覆盖 → 缺席（可 CAS 重建）
+                return Ok((None, max_token));
             };
+            let mut at_version: Vec<XlMeta> = committed
+                .into_iter()
+                .filter(|m| m.control_version.unwrap_or(0) == max_version)
+                .collect();
+            // 同版本（忽略 fence_token——补偿回滚会用旧内容 + 新 token）不同内容 = 分叉
+            let mut seen: Option<[u8; 32]> = None;
+            for m in &at_version {
+                let mut logical = m.clone();
+                logical.fence_token = None;
+                let h = crate::mesh::content_hash(&logical.encode()?);
+                match seen {
+                    Some(prev) if prev != h => {
+                        return Err(Error::CorruptMeta(format!(
+                            "控制对象 {key:?} 同版本分叉：v{max_version} 有多份不同内容"
+                        )));
+                    }
+                    _ => seen = Some(h),
+                }
+            }
+            let Some(mut chosen) = at_version.pop() else {
+                return Ok((None, max_token));
+            };
+            chosen.fence_token = Some(max_token);
+            return Ok((Some(chosen), max_token));
         }
         match best {
-            Some((_, m)) => Ok(Some(m)),
+            Some((_, m)) => Ok((Some(m), max_token)),
             None => match corrupt {
                 Some(why) => Err(Error::CorruptMeta(why)),
-                None => Ok(None),
+                None => Ok((None, max_token)),
             },
         }
     }
 
-    /// 控制对象专用 quorum 确认读（见 [`Self::read_meta_cluster`] 的 `quorum`）。
-    /// 单机/多盘保持 Task 2 语义（唯一/多盘翻转即提交）。
-    async fn read_meta_quorum_confirmed(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
+    /// 控制对象提交确认读（见 [`Self::read_meta_cluster`] 的 `quorum`）：只认提交证书，
+    /// 返回 `(可见 meta, 全部副本含未提交的最大 fence_token)`。未提交副本永不出现；
+    /// 无已提交副本 → `(None, max_token)`（可 CAS 重建，不楔死）。
+    #[allow(clippy::type_complexity)]
+    async fn read_meta_quorum_confirmed(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Option<XlMeta>, u64)> {
         if self.cfg.cluster.is_some() {
             return self.read_meta_cluster(bucket, key, true, true).await;
         }
-        self.read_meta(bucket, key).await
+        self.read_meta_local(bucket, key, true).await
     }
 
     /// 全量扇出版（不提前停）：get_object 在快路径集合的数据轮失败后的**回退一次**——
@@ -1486,7 +1550,7 @@ impl Store {
     /// 单节点退化为普通 read_meta。
     async fn read_meta_full(&self, bucket: &str, key: &str) -> Result<Option<XlMeta>> {
         if self.cfg.cluster.is_some() {
-            return self.read_meta_cluster(bucket, key, true, false).await;
+            return Ok(self.read_meta_cluster(bucket, key, true, false).await?.0);
         }
         self.read_meta(bucket, key).await
     }
@@ -1559,9 +1623,37 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
     ) -> Result<usize> {
+        self.write_meta_fenced_mode(bucket, key, m, old, fence_token, false)
+            .await
+    }
+
+    /// 控制对象提交证书（两阶段提交第二阶段）：同 token 写入 `control_committed = Some(true)`
+    /// 的 meta。提交侧对「当前 token == 本次 token 且当前是该版本第一阶段数据」放行
+    /// （标记沿用数据阶段的 token，不推进高水位）。标记阶段**不做补偿回滚**——证书一旦
+    /// 落盘就是提交点，撤销证书比留下数据残骸更危险。
+    pub(in crate::store) async fn write_meta_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        fence_token: u64,
+    ) -> Result<usize> {
+        self.write_meta_fenced_mode(bucket, key, m, None, Some(fence_token), true)
+            .await
+    }
+
+    async fn write_meta_fenced_mode(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+        fence_token: Option<u64>,
+        marker: bool,
+    ) -> Result<usize> {
         if self.cfg.cluster.is_some() {
             return self
-                .write_meta_cluster(bucket, key, m, old, fence_token)
+                .write_meta_cluster(bucket, key, m, old, fence_token, marker)
                 .await;
         }
         if self.cfg.drives.len() == 1 {
@@ -1735,6 +1827,7 @@ impl Store {
         m: &XlMeta,
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
+        marker: bool,
     ) -> Result<usize> {
         // 旧版 peer 会静默忽略 `fence_token`（proto3 未知字段）→ 混版集群拒绝 fenced 控制写。
         if fence_token.is_some() {
@@ -1872,9 +1965,7 @@ impl Store {
             return Ok(flipped);
         }
 
-        // ---- 补偿回滚：**必须做**——已翻 ≥1 时任一 ≥Q_s 读集必含已翻副本，
-        // 不补偿会让「已返回失败」的写被读到（评审 P1）
-        // 先清全节点的 .new 残骸（未翻槽位的暂存；翻过的槽位 .new 已被 rename 消费）。
+        // 清全节点的 .new 残骸（未翻槽位的暂存；翻过的槽位 .new 已被 rename 消费）。
         // fenced 写只清 token 不更新的暂存——更新写者的 .new 必须保留（同 abort 语义）。
         for drive in &self.cfg.drives {
             match fence_token {
@@ -1892,6 +1983,23 @@ impl Store {
             }
             let _ = cl.transport.abort_meta(&n.id, mw.clone()).await;
         }
+        if marker {
+            // 标记阶段失败：**绝不回滚第一阶段数据**（证书才是提交判据；回滚会制造
+            // 「数据已删、证书已发」或「同一版本两种编码」的分叉）。数据残骸无证书
+            // 不可见，由下一次写覆盖。
+            if fence_token.is_some() && stale {
+                return Err(Error::Conflict(format!(
+                    "fence token 过期：{bucket}/{key} 已由更新写者提交（提交标记未达成）"
+                )));
+            }
+            self.bump_quorum_unmet_write();
+            return Err(Error::QuorumUnmet(format!(
+                "meta 提交标记 {flipped}/{q_s}，第一阶段数据未提交（读不可见）"
+            )));
+        }
+
+        // ---- 补偿回滚：**必须做**——已翻 ≥1 时任一 ≥Q_s 读集必含已翻副本，
+        // 不补偿会让「已返回失败」的写被读到（评审 P1）
         for slot in &flipped_local {
             let d = (slot - base) as usize;
             let Some(drive) = self.cfg.drives.get(d) else {

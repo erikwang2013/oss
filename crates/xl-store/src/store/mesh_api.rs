@@ -670,12 +670,39 @@ impl Store {
         restore: bool,
     ) -> Result<SlotCommit> {
         let dir = layout::object_dir_for(drive, bucket, key)?;
+        let new_path = dir.join(meta::META_NEW_FILE);
+        // 先读 `.new`：提交证书需要识别 pending 内容；NotFound/IO 错误仍留到 token
+        // 检查之后按原口径返回（过期写者优先判 Stale，不因 `.new` 缺失改变错误分类）。
+        let pending = tokio::fs::read(&new_path).await;
         if let Some(t) = fence_token {
             // 先查已提交 token 再看 `.new`：.new 已被新写者消费时同样判 Stale（语义更准）
             match tokio::fs::read(dir.join(meta::META_FILE)).await {
                 Ok(bytes) => {
-                    let cur = meta::XlMeta::decode(&bytes)?.fence_token.unwrap_or(0);
-                    let stale = if restore { cur > t } else { cur >= t };
+                    let cur_meta = meta::XlMeta::decode(&bytes)?;
+                    let cur = cur_meta.fence_token.unwrap_or(0);
+                    let pending_meta = pending
+                        .as_ref()
+                        .ok()
+                        .and_then(|b| meta::XlMeta::decode(b).ok());
+                    let cert = pending_meta.as_ref().filter(|nm| {
+                        nm.control_committed == Some(true)
+                            && nm.control_version == cur_meta.control_version
+                            && cur == t
+                    });
+                    // 已带证书的同一版本：重试视为已提交（hash 由调用方与内容比对）
+                    if !restore && cert.is_some() && cur_meta.control_committed == Some(true) {
+                        return Ok(SlotCommit::Committed {
+                            hash: crate::mesh::content_hash(&bytes),
+                        });
+                    }
+                    // 本写者第一阶段数据（未提交）+ 同 token 证书 = 提交点；相等 token 放行
+                    let cert_flip =
+                        !restore && cert.is_some() && cur_meta.control_committed == Some(false);
+                    let stale = if restore || cert_flip {
+                        cur > t
+                    } else {
+                        cur >= t
+                    };
                     if stale {
                         return Ok(SlotCommit::Stale);
                     }
@@ -685,8 +712,7 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
-        let new_path = dir.join(meta::META_NEW_FILE);
-        let bytes = match tokio::fs::read(&new_path).await {
+        let bytes = match pending {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SlotCommit::Missing),
             Err(e) => return Err(e.into()),
@@ -963,8 +989,11 @@ impl Store {
         let mut best: Option<((u64, i64), XlMeta)> = None;
         let mut corrupt: Option<String> = None;
         let mut covered = 0u32;
-        // 控制对象 quorum 确认读：按内容统计「返回的最优副本」在本地有几个相同槽。
-        let with_copies = layout::is_system_bucket(&r.bucket);
+        // 控制对象：只把带提交证书的副本交给协调者——第一阶段数据（未提交）与旧版残缺
+        // 副本永不出现；同时上报**全部**副本（含未提交）的最大 token 供 CAS/锁下限。
+        let is_control = layout::is_system_bucket(&r.bucket)
+            && r.key.starts_with(super::control::CONTROL_PREFIX);
+        let mut max_token = 0u64;
         let mut decoded: Vec<XlMeta> = Vec::new();
         for drive in &self.cfg.drives {
             if !drives::drive_up(drive).await {
@@ -975,16 +1004,16 @@ impl Store {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == r.key => {
                         covered += 1;
-                        // 与 store.rs 的 read_meta 选举同口径（rank = (epoch, 链尾 mod_time)）：
-                        // 服务端 RPC 是独立选举点，回拨场景漏改会把低 epoch 旧链当最优返回
-                        let t = m.rank();
-                        if with_copies {
-                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                                best = Some((t, m.clone()));
-                            }
+                        if is_control {
+                            max_token = max_token.max(m.fence_token.unwrap_or(0));
                             decoded.push(m);
-                        } else if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                            best = Some((t, m));
+                        } else {
+                            // 与 store.rs 的 read_meta 选举同口径（rank = (epoch, 链尾 mod_time)）：
+                            // 服务端 RPC 是独立选举点，回拨场景漏改会把低 epoch 旧链当最优返回
+                            let t = m.rank();
+                            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                                best = Some((t, m));
+                            }
                         }
                     }
                     Ok(m) => {
@@ -999,15 +1028,30 @@ impl Store {
                 Err(e) => corrupt = Some(e.to_string()),
             }
         }
-        // 相同内容的本地槽数：用解码后的结构相等（编码器对同一结构是确定的）。
-        // `slots_ok` 含 NotFound/其他版本槽，不能当副本数用。
-        let best_copies = if with_copies {
-            best.as_ref()
-                .map(|(_, bm)| decoded.iter().filter(|m| *m == bm).count() as u32)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        if is_control {
+            // 协调者按全局 control_version 选举；本节点只需要给出自己的最高已提交副本。
+            return Ok(
+                match decoded
+                    .into_iter()
+                    .filter(|m| m.control_committed == Some(true))
+                    .max_by_key(|m| (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0)))
+                {
+                    Some(m) => crate::mesh::MetaSnapshot {
+                        mod_time_nanos: m.rank().1,
+                        meta: Some(bytes::Bytes::from(m.encode()?)),
+                        slots_ok: covered,
+                        max_token,
+                    },
+                    // 本节点无已提交副本：未提交/损坏都不可见，但仍上报覆盖数（缺席可计数）
+                    None => crate::mesh::MetaSnapshot {
+                        meta: None,
+                        mod_time_nanos: i64::MIN,
+                        slots_ok: covered,
+                        max_token,
+                    },
+                },
+            );
+        }
         match best {
             Some((t, m)) => Ok(crate::mesh::MetaSnapshot {
                 meta: Some(bytes::Bytes::from(m.encode()?)),
@@ -1015,7 +1059,7 @@ impl Store {
                 // 此字段只带墙钟分量供诊断，不参与判定
                 mod_time_nanos: t.1,
                 slots_ok: covered,
-                best_copies,
+                max_token,
             }),
             None => {
                 if let Some(why) = corrupt {
@@ -1026,7 +1070,7 @@ impl Store {
                     meta: None,
                     mod_time_nanos: i64::MIN,
                     slots_ok: covered,
-                    best_copies: 0,
+                    max_token,
                 })
             }
         }
