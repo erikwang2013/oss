@@ -998,6 +998,9 @@ impl Store {
             _ => XlMeta {
                 object_key: key.to_string(),
                 versions: vec![version],
+                control_version: None,
+                fence_token: None,
+                control_deleted: None,
             },
         };
         meta.refresh_latest_flags();

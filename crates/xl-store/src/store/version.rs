@@ -251,6 +251,9 @@ impl Store {
                 let mut m = old.clone().unwrap_or(XlMeta {
                     object_key: key.to_string(),
                     versions: Vec::new(),
+                    control_version: None,
+                    fence_token: None,
+                    control_deleted: None,
                 });
                 let removed: Vec<Version> = m
                     .versions
@@ -372,6 +375,9 @@ impl Store {
                 None => XlMeta {
                     object_key: key.to_string(),
                     versions: Vec::new(),
+                    control_version: None,
+                    fence_token: None,
+                    control_deleted: None,
                 },
             };
             m.versions.push(marker);

@@ -118,6 +118,9 @@ async fn system_meta_roundtrips_through_internal_paths() {
     let m = XlMeta {
         object_key: "control/a".into(),
         versions: vec![],
+        control_version: None,
+        fence_token: None,
+        control_deleted: None,
     };
     // write_meta_on / read_meta 覆盖内部 meta 路由的两个收口（其余提交/补偿路径同源）
     s.write_meta_on(d.path(), layout::SYS_DIR, "control/a", &m)
@@ -150,6 +153,9 @@ async fn system_namespace_cannot_be_listed() {
     let m = XlMeta {
         object_key: "control/a".into(),
         versions: vec![],
+        control_version: None,
+        fence_token: None,
+        control_deleted: None,
     };
     s.write_meta_on(d.path(), layout::SYS_DIR, "control/a", &m)
         .await
@@ -1172,6 +1178,9 @@ async fn read_meta_rejects_mismatched_object_key() {
     let m = XlMeta {
         object_key: "other".into(),
         versions: vec![],
+        control_version: None,
+        fence_token: None,
+        control_deleted: None,
     };
     tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
         .await
@@ -2202,6 +2211,9 @@ async fn multi_drive_meta_latest_wins_on_torn_replicas() {
                 storage_class: None,
                 tier: None,
             }],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
     };
     for (i, dir) in dirs.iter().enumerate() {
@@ -2641,6 +2653,9 @@ async fn legacy_parts_form_still_readable() {
     let m = XlMeta {
         object_key: "legacy".into(),
         versions: vec![version],
+        control_version: None,
+        fence_token: None,
+        control_deleted: None,
     };
     tokio::fs::write(obj_dir.join(meta::META_FILE), m.encode().unwrap())
         .await

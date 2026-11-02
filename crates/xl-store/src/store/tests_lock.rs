@@ -221,6 +221,9 @@ async fn lock_record_decode_trust_boundary() {
         let mut m = XlMeta {
             object_key: "k".into(),
             versions: vec![meta::Version::default()],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         };
         m.versions[0].part.uuid = "u".into();
         m.versions[0].lock = Some(ObjectLockRecord {

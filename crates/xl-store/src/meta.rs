@@ -23,6 +23,17 @@ pub struct XlMeta {
     pub object_key: String,
     /// M1 恒为一条。M4 起多条（版本控制），解码器与读路径从第一天就按 Vec 处理。
     pub versions: Vec<Version>,
+    /// Phase 0 控制对象（`.oss.sys/control/...`）：CAS 版本号（每次 put/delete +1；
+    /// 缺失 = 0）。普通数据面对象恒 None。
+    #[serde(default)]
+    pub control_version: Option<u64>,
+    /// Phase 0 控制对象：单调 fencing token 高水位（Task 3 提交侧拒绝旧 token；
+    /// 缺失 = 0）。普通数据面对象恒 None。
+    #[serde(default)]
+    pub fence_token: Option<u64>,
+    /// Phase 0 控制对象：tombstone（`Some(true)` = 已删除、无数据；get 返回 None）。
+    #[serde(default)]
+    pub control_deleted: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -721,6 +732,9 @@ mod tests {
                 storage_class: None,
                 tier: None,
             }],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
     }
 
@@ -978,6 +992,9 @@ mod tests {
         let m = XlMeta {
             object_key: "a".into(),
             versions: vec![],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         };
         assert!(m.latest().is_none());
     }
@@ -1072,13 +1089,15 @@ mod tests {
         // **第九次**：M8 前置增 tags 字段——无标签对象写 nil，老解码器跳过；
         // **第十次**：M8 S4a 增 storage_class/tier 字段——普通对象写 nil，老解码器跳过；
         // **第十一次**：M9 S1 增 remote_version_id 字段——非 sync 写 nil，老解码器跳过；
-        // **第十二次**：读路径补全增 part_sizes 字段——旧对象/单段 PUT 写 nil，老解码器跳过）。
+        // **第十二次**：读路径补全增 part_sizes 字段——旧对象/单段 PUT 写 nil，老解码器跳过；
+        // **第十三次**：Phase 0 控制对象增 control_version/fence_token/control_deleted——
+        // 普通对象写 nil，老解码器跳过）。
         // mod_time_nanos 为 uint64（cf）；顶层/嵌套均为字段名 map。
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         println!("{digest}");
         assert_eq!(
             digest,
-            "4ba3d95f8e837693c0cbcdb248c29757be1720b3bda7893837ea3dae10200074"
+            "3ab0308d1fe7a716c0fb45b5cba96cf861e8b211c958994fd318c9f416d0ddb8"
         );
     }
 }
@@ -1180,6 +1199,9 @@ mod parts_tests {
         let m = XlMeta {
             object_key: "a".into(),
             versions: vec![v],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         };
         let back = XlMeta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back.versions[0].part_sizes, Some(vec![5, 6]));
@@ -1192,6 +1214,9 @@ mod parts_tests {
             let m = XlMeta {
                 object_key: "a".into(),
                 versions: vec![v],
+                control_version: None,
+                fence_token: None,
+                control_deleted: None,
             };
             let bytes = m.encode().unwrap();
             assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
@@ -1211,6 +1236,9 @@ mod parts_tests {
         let m = XlMeta {
             object_key: "a".into(),
             versions: vec![v],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         };
         let bytes = m.encode().unwrap();
         assert!(matches!(XlMeta::decode(&bytes), Err(Error::CorruptMeta(_))));
@@ -1242,6 +1270,9 @@ mod parts_tests {
         XlMeta {
             object_key: "a".into(),
             versions: vec![v],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
     }
 
@@ -1252,6 +1283,9 @@ mod parts_tests {
         let bytes = XlMeta {
             object_key: "a".into(),
             versions: vec![m],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
         .encode()
         .unwrap();
@@ -1270,6 +1304,9 @@ mod parts_tests {
         let bytes = XlMeta {
             object_key: "a".into(),
             versions: vec![v],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
         .encode()
         .unwrap();
@@ -1283,6 +1320,9 @@ mod parts_tests {
         let bytes = XlMeta {
             object_key: "a".into(),
             versions: vec![ok],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
         .encode()
         .unwrap();
@@ -1307,6 +1347,9 @@ mod parts_tests {
         let bytes = XlMeta {
             object_key: "a".into(),
             versions: vec![v],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
         .encode()
         .unwrap();
@@ -1403,6 +1446,9 @@ mod parts_tests {
         let bytes = XlMeta {
             object_key: "a".into(),
             versions: vec![v],
+            control_version: None,
+            fence_token: None,
+            control_deleted: None,
         }
         .encode()
         .unwrap();
@@ -1427,6 +1473,9 @@ mod parts_tests {
             XlMeta {
                 object_key: "a".into(),
                 versions: vec![v],
+                control_version: None,
+                fence_token: None,
+                control_deleted: None,
             }
             .encode()
             .and_then(|b| XlMeta::decode(&b).map(|_| ()))

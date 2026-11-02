@@ -17,6 +17,7 @@ use crate::layout;
 use crate::meta::{self, ChecksumRecord, EncryptionRecord, ObjectLockRecord, XlMeta};
 
 mod cmk_rewrap;
+mod control;
 mod drives;
 pub mod ec;
 mod fsck;
@@ -41,6 +42,7 @@ pub use cmk_rewrap::{
     CmkBucketRef, CmkConfigRefs, CmkDeleteReport, CmkRef, CmkRefScan, CmkTrashPurgeReport,
     REFS_REPORT_CAP, REWRAP_MAX_BATCH, RewrapItem, RewrapOptions, RewrapReport,
 };
+pub use control::SystemObject;
 pub use rebalance::RebalanceReport;
 pub use shrink::{
     ShrinkPlan, ShrinkPlanReport, ShrinkSlotStat, SlotMove, acquire_shrink_lock, shrink_lock_busy,
