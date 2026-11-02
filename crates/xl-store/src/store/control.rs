@@ -61,6 +61,9 @@ pub struct SystemObject {
 impl Store {
     /// 写控制对象（CAS）：`expected_version`/`fence_token` 与当前 meta 不符 → `Error::Conflict`。
     /// 返回新版本号（每次成功写入 +1）。
+    ///
+    /// 集群模式下调用方 token 只是 CAS 前置条件：提交/存储的是 fenced 锁发放的 token
+    /// （每次成功获取都推进，失败的 CAS 尝试也会留下空洞，因此会高于调用方 token）。
     pub async fn put_system_object(
         &self,
         key: &str,
@@ -77,7 +80,8 @@ impl Store {
                 data.len()
             )));
         }
-        let guard = self.control_lock(key).await?;
+        let floor = self.control_token_floor(key).await?;
+        let guard = self.control_lock(key, floor).await?;
         // 获取后即时自检（与数据面写入口一致）
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
@@ -129,7 +133,8 @@ impl Store {
         fence_token: u64,
     ) -> Result<bool> {
         validate_control_key(key)?;
-        let guard = self.control_lock(key).await?;
+        let floor = self.control_token_floor(key).await?;
+        let guard = self.control_lock(key, floor).await?;
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
@@ -199,14 +204,25 @@ impl Store {
         Ok(out)
     }
 
+    /// 集群锁发放的 token 下限：quorum 读已提交 meta 的 `fence_token`（无则 0）。
+    /// 高水位可能落后于已提交 meta（单机→集群升级、`.fence` 丢失），没有下限时每次
+    /// 获取只抬 1，写入会以 Conflict 永久楔死；单机无锁发放，直接 0。
+    async fn control_token_floor(&self, key: &str) -> Result<u64> {
+        if self.cfg.cluster.is_none() {
+            return Ok(0);
+        }
+        let old = self.read_meta_full(layout::SYS_DIR, key).await?;
+        Ok(control_state(old.as_ref()).1)
+    }
+
     /// CAS 串行化：本机两层（进程内 mutex + `flock`，跨进程互斥）；集群再叠加 fenced
     /// 集群锁——先本机后集群，与数据面「对象锁 → 集群锁」顺序一致。集群分支不能复用
     /// `lock_object`：它会先取同 key 的数据面租约锁，锁表拒绝同 holder 的 fenced 重入。
-    async fn control_lock(&self, key: &str) -> Result<ControlGuard> {
+    async fn control_lock(&self, key: &str, min_token: u64) -> Result<ControlGuard> {
         let local = self.lock_object_local(layout::SYS_DIR, key).await?;
         let fenced = if self.cfg.cluster.is_some() {
             Some(
-                self.acquire_fenced_cluster_lock(layout::SYS_DIR, key)
+                self.acquire_fenced_cluster_lock(layout::SYS_DIR, key, min_token)
                     .await?,
             )
         } else {

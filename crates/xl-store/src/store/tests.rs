@@ -5912,8 +5912,8 @@ async fn system_object_read_reflects_committed_write_on_follower() {
     assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
 }
 
-/// 停 2 节点：集群写必须 fail-closed（fenced 锁拿不到 Q_n → QuorumUnmet），
-/// 且不留下任何可见写入。
+/// 停 2 节点：集群写必须 fail-closed（token 下限的 quorum 读覆盖不足 →
+/// CorruptMeta；若读通过则 fenced 锁拿不到 Q_n → QuorumUnmet），且不留下可见写入。
 #[tokio::test]
 async fn system_object_cluster_write_fails_closed_below_quorum() {
     let c = Cluster::new(3, 2).await;
@@ -5924,7 +5924,10 @@ async fn system_object_cluster_write_fails_closed_below_quorum() {
         .put_system_object("control/x", b"v", None, 1)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::QuorumUnmet(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::CorruptMeta(_) | Error::QuorumUnmet(_)),
+        "写必须 fail-closed：{err:?}"
+    );
     let err = a.get_system_object("control/x").await.unwrap_err();
     assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
 }
@@ -5989,15 +5992,24 @@ async fn system_object_cluster_delete_tombstone() {
 }
 
 /// 并发写同一 key：fenced 锁串行化，恰一个成功；其余 Conflict/QuorumUnmet，不挂起。
+/// Barrier 让两个写者同时越过起跑线，重叠是确定的而非靠调度碰运气。
 #[tokio::test]
 async fn system_object_cluster_concurrent_writes_serialize() {
     let c = Cluster::new(3, 2).await;
     let a = c.stores[0].clone();
     let b = c.stores[1].clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let (ba, bb) = (barrier.clone(), barrier);
     let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::join!(
-            a.put_system_object("control/race", b"a", None, 1),
-            b.put_system_object("control/race", b"b", None, 1),
+            async move {
+                ba.wait().await;
+                a.put_system_object("control/race", b"a", None, 1).await
+            },
+            async move {
+                bb.wait().await;
+                b.put_system_object("control/race", b"b", None, 1).await
+            },
         )
     })
     .await
@@ -6019,4 +6031,51 @@ async fn system_object_cluster_concurrent_writes_serialize() {
         .unwrap()
         .unwrap();
     assert_eq!(obj.version, 1);
+}
+
+/// 锁高水位可能落后于已提交 meta（单机→集群升级、`.fence` 丢失）：集群写必须以 quorum
+/// 读到的 meta token 为发放下限，否则每次获取只抬 1，会以 Conflict 永久楔死。
+#[tokio::test]
+async fn system_object_cluster_write_recovers_when_lock_high_water_is_stale() {
+    let c = Cluster::new(3, 2).await;
+    let a = &c.stores[0];
+    let b = &c.stores[1];
+    let k = "control/seeded";
+    // 直接写 token 1000 的 meta：不经过锁服务，`.fence` 高水位保持 0。
+    a.write_meta_fenced(
+        layout::SYS_DIR,
+        k,
+        &fenced_meta(k, 0, 1000),
+        None,
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b.get_system_object(k).await.unwrap().unwrap().fence_token,
+        1000
+    );
+    // 下限 1000 → 发放 token > 1000；写入成功，不楔死。
+    assert_eq!(
+        b.put_system_object(k, b"v", Some(0), 1001).await.unwrap(),
+        1
+    );
+    let obj = a.get_system_object(k).await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v");
+    assert!(obj.fence_token > 1000, "{}", obj.fence_token);
+    // 对照：空高水位的新 key 首写仍从 token 1 开始。
+    assert_eq!(
+        a.put_system_object("control/fresh", b"f", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        b.get_system_object("control/fresh")
+            .await
+            .unwrap()
+            .unwrap()
+            .fence_token,
+        1
+    );
 }

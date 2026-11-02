@@ -17,7 +17,7 @@
 //! 完全不变的旧路径；`> 0` 的请求按**持久化高水位**校验：授予条件 = 提议 token 严格大于
 //! 本键已存高水位（高水位在授予时落盘 `<root>/.oss.sys/locks/<sha256(bucket/key)>.fence`，
 //! tmp + fsync + rename + 目录 fsync；重启/释放都不回落）。协调者
-//! [`Store::acquire_fenced_cluster_lock`] 读高水位 → 提议 max+1 → 收满 Q_n 后持久化，
+//! [`Store::acquire_fenced_cluster_lock`] 读高水位 → 提议 max(高水位, 下限)+1 → 收满 Q_n 后持久化，
 //! 过期提议被拒时用响应的 `last_fence_token` 重试。跨进程读-改-写用 flock 串行化
 //! （与数据面 `lock_object` 同款）。解析失败 fail-closed（`CorruptMeta`），绝不回退 0。
 //!
@@ -539,10 +539,12 @@ impl Store {
 
     /// Phase 0 Task 4：获取带持久化单调 fence token 的集群锁。
     ///
-    /// 流程：读本地持久化高水位 → `proposed = max+1` → 广播 Acquire → 收满 Q_n
-    /// （且授予者回报 `last_fence_token >= proposed`，旧节点不计）后持久化 proposed。
+    /// 流程：读本地持久化高水位 → `proposed = max(高水位, min_token)+1` → 广播 Acquire →
+    /// 收满 Q_n（且授予者回报 `last_fence_token >= proposed`，旧节点不计）后持久化 proposed。
     /// 节点拒绝并回报更高 `last_fence_token` 时以 `max(last)+1` 重试。
-    /// 单机（无 cluster 配置）：从同一持久化文件读 +1，本地授予即持久化。
+    /// `min_token` 是调用方已知的已提交下限（控制面传 meta 的 `fence_token`）：高水位可能
+    /// 落后于已提交 meta（单机→集群升级、`.fence` 丢失），没有下限时每次只抬 1，会以
+    /// Conflict 永久楔死。单机（无 cluster 配置）：从同一持久化文件读 +1，本地授予即持久化。
     ///
     /// **契约边界**：本层只保证 token 单调、不重号，**不提供**跨进程/跨 Store 的互斥
     /// （锁表在进程内存；同 root 的并发进程由 `.fence.lock` flock 只串行化发号）。
@@ -554,13 +556,13 @@ impl Store {
         &self,
         bucket: &str,
         key: &str,
+        min_token: u64,
     ) -> Result<FencedLockGuard> {
         let lock_key = format!("{bucket}/{key}");
         let ttl_ms = self.cfg.cluster_lock_ttl_ms;
         let ttl = Duration::from_millis(ttl_ms);
-        let mut proposed = read_fence_high(self.cfg.root(), &lock_key)
-            .await?
-            .saturating_add(1);
+        let high = read_fence_high(self.cfg.root(), &lock_key).await?;
+        let mut proposed = high.max(min_token).saturating_add(1);
 
         let Some(cl) = self.cfg.cluster.as_deref() else {
             // 单机：本地授予即 quorum；持久化成功后才返回（apply_lock persist=true）。
