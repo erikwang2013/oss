@@ -106,8 +106,12 @@ impl Store {
         )?;
         let commit_token = guard.commit_token(fence_token, cur_fence.max(st.max_token))?;
         // 版本推进越过**所有已观察副本**（含未提交半翻）：崩溃写者的版本绝不重用。
-        let version = st.max_version + 1;
-        let preserve = st.certified_slots.first().copied();
+        let version = st
+            .max_version
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptMeta(format!("控制对象 {key:?} 版本号溢出")))?;
+        // 全部证书槽都是候选：写者取首个可准备的槽保留旧副本（节点宕机/盘不可写时换一个）
+        let preserve = st.certified_slots.clone();
         let m = control_meta(key, version, commit_token, Some(data), false);
         // 提交点前复查租约（无 fencing 窗口收窄到两次检查之间；与 put.rs:1058 同款）
         if guard.lease_lost() {
@@ -119,7 +123,7 @@ impl Store {
             st.certified.as_ref(),
             commit_token,
             &guard,
-            preserve,
+            &preserve,
         )
         .await?;
         Ok(version)
@@ -183,12 +187,16 @@ impl Store {
         if old.control_deleted == Some(true) {
             return Ok(false);
         }
-        let preserve = st.certified_slots.first().copied();
-        let m = control_meta(key, st.max_version + 1, commit_token, None, true);
+        let preserve = st.certified_slots.clone();
+        let version = st
+            .max_version
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptMeta(format!("控制对象 {key:?} 版本号溢出")))?;
+        let m = control_meta(key, version, commit_token, None, true);
         if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
         }
-        self.commit_control_meta(key, &m, Some(&old), commit_token, &guard, preserve)
+        self.commit_control_meta(key, &m, Some(&old), commit_token, &guard, &preserve)
             .await?;
         Ok(true)
     }
@@ -282,7 +290,7 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: u64,
         guard: &ControlGuard,
-        preserve: Option<u16>,
+        preserve: &[u16],
     ) -> Result<()> {
         // 单盘（无集群）：唯一 rename 就是提交点，直接写带证书的 meta——不存在
         // 「第一阶段覆盖后第二阶段零证书」的丢失窗口，无需两阶段。

@@ -194,7 +194,10 @@ impl Store {
     /// `control_quorum`。可达 peer 缺位/线格式不兼容 = 混版 → fail-closed；**不可达**
     /// peer 交给既有 quorum 语义（读覆盖不足 → `CorruptMeta`，写翻不到 Q_s →
     /// `QuorumUnmet`），不把网络故障伪装成混版，也让分区读能返回 fail-closed 结果。
-    pub(in crate::store) async fn ensure_control_quorum_compatible(&self) -> Result<()> {
+    pub(in crate::store) async fn ensure_control_quorum_compatible(
+        &self,
+        allow_unreachable: bool,
+    ) -> Result<()> {
         // 并发探测 + 每 peer 预算：串行会在 (N-1) 个 TonicMesh 超时上阻塞控制面。
         const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         let Some(cl) = self.cfg.cluster.as_deref() else {
@@ -217,11 +220,23 @@ impl Store {
                     {
                         Ok(Ok(caps)) => caps,
                         Ok(Err(e)) => {
-                            tracing::warn!(node = %n.id, error = %e, "控制证书能力探测失败（按不可达处理）");
+                            if !allow_unreachable {
+                                return Err(Error::PeerIncompatible(format!(
+                                    "控制写要求全节点可达：节点 {} 能力探测失败（{}）",
+                                    n.id, e
+                                )));
+                            }
+                            tracing::warn!(node = %n.id, error = %e, "控制证书能力探测失败（读按不可达处理）");
                             return Ok::<_, Error>(());
                         }
                         Err(_) => {
-                            tracing::warn!(node = %n.id, "控制证书能力探测超时（按不可达处理）");
+                            if !allow_unreachable {
+                                return Err(Error::PeerIncompatible(format!(
+                                    "控制写要求全节点可达：节点 {} 能力探测超时",
+                                    n.id
+                                )));
+                            }
+                            tracing::warn!(node = %n.id, "控制证书能力探测超时（读按不可达处理）");
                             return Ok::<_, Error>(());
                         }
                     };
@@ -776,6 +791,7 @@ impl Store {
         &self,
         m: crate::mesh::MetaWrite,
     ) -> Result<crate::mesh::MetaAck> {
+        reject_legacy_control_write(&m)?;
         let self_hash = crate::mesh::content_hash(&m.meta);
         let mut slots = Vec::new();
         for (d, drive) in self.cfg.drives.iter().enumerate() {
@@ -821,6 +837,7 @@ impl Store {
         &self,
         m: crate::mesh::MetaWrite,
     ) -> Result<crate::mesh::MetaAck> {
+        reject_legacy_control_write(&m)?;
         let mut slots = Vec::new();
         for (d, drive) in self.cfg.drives.iter().enumerate() {
             let slot = self.slot_base() + d as u16;
@@ -1136,6 +1153,28 @@ impl Store {
             }
         }
     }
+}
+
+/// round 4：旧协调者（无 `control_quorum` 声明）会把空 `slots` 当成「翻全部」，覆盖
+/// preserve 旧证书副本 → 服务端在 prepare/commit 入口拒绝任何控制写。
+/// 数据面（非 `.oss.sys/control/`）不解码 meta，避免给数据面加开销。
+fn reject_legacy_control_write(m: &crate::mesh::MetaWrite) -> Result<()> {
+    if m.control_quorum {
+        return Ok(());
+    }
+    let is_control = m.fence_token.is_some()
+        || (layout::is_system_bucket(&m.bucket)
+            && m.key.starts_with(super::control::CONTROL_PREFIX)
+            && meta::XlMeta::decode(&m.meta)
+                .map(|x| x.control_committed.is_some())
+                .unwrap_or(true));
+    if is_control {
+        return Err(Error::PeerIncompatible(format!(
+            "控制写缺少 control_quorum 能力声明（旧版协调者），拒绝 prepare/commit：{}/{}",
+            m.bucket, m.key
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

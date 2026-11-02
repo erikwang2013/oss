@@ -62,7 +62,10 @@ message MetaWrite { string bucket=1; string key=2; bytes meta=3;
                     bool restore=5;
                     // Phase 0 控制对象：commit 只翻这些全局槽位（空 = 全部，数据面旧行为）。
                     // 第一阶段据此在保留至少一份已提交旧副本的前提下恰好翻转 Q_s 槽。
-                    repeated uint32 slots=6; }
+                    repeated uint32 slots=6;
+                    // Phase 0 round 4：新协调者的控制 prepare/commit 必须声明；旧协调者缺省
+                    // false，服务端拒绝其控制写（防止空 slots 覆盖 preserve 旧证书副本）。
+                    bool control_quorum=7; }
 message SlotAck { uint32 slot=1; bool ok=2; bytes hash=3;
                   // Phase 0：本槽因 fence token 过期被拒（未翻转）。
                   bool stale=4; }

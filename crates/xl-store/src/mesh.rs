@@ -92,6 +92,8 @@ pub struct MetaWrite {
     pub restore: bool,
     /// Phase 0 round 3：commit 只翻这些全局槽位（空 = 全部，数据面旧行为）。
     pub slots: Vec<u16>,
+    /// Phase 0 round 4：控制写（fence_token / 证书）必须声明；服务端拒绝旧协调者。
+    pub control_quorum: bool,
 }
 
 #[derive(Clone, Debug)]

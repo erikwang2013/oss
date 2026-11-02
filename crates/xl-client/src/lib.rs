@@ -172,6 +172,7 @@ fn meta_write_to_proto(m: mesh::MetaWrite) -> xl_proto::MetaWrite {
         fence_token: m.fence_token,
         restore: m.restore,
         slots: m.slots.into_iter().map(u32::from).collect(),
+        control_quorum: m.control_quorum,
     }
 }
 
@@ -206,6 +207,7 @@ fn meta_write_from_proto(m: xl_proto::MetaWrite) -> mesh::MetaWrite {
         fence_token: m.fence_token,
         restore: m.restore,
         slots: m.slots.into_iter().map(|s| s as u16).collect(),
+        control_quorum: m.control_quorum,
     }
 }
 
@@ -2265,6 +2267,7 @@ mod tests {
             fence_token: None,
             restore: false,
             slots: Vec::new(),
+            control_quorum: false,
         };
         let ack = mesh.prepare_meta("n1", mw.clone()).await.unwrap();
         assert!(ack.ok && ack.slots_ok == 2, "{ack:?}");

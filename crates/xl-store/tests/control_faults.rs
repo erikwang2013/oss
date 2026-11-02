@@ -179,6 +179,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             fence_token: Some(1),
             restore: false,
             slots: Vec::new(),
+            control_quorum: true,
         })
         .await
         .unwrap();
@@ -195,6 +196,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             fence_token: Some(1),
             restore: false,
             slots: Vec::new(),
+            control_quorum: true,
         })
         .await
         .unwrap();
@@ -214,6 +216,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             fence_token: Some(1),
             restore: true,
             slots: Vec::new(),
+            control_quorum: true,
         })
         .await
         .unwrap();
@@ -272,6 +275,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
             fence_token: Some(2),
             restore: false,
             slots: Vec::new(),
+            control_quorum: true,
         })
         .await
         .unwrap();
@@ -283,6 +287,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
         fence_token: Some(1),
         restore: false,
         slots: Vec::new(),
+        control_quorum: true,
     })
     .await
     .unwrap();
@@ -306,6 +311,7 @@ async fn stale_commit_and_restore_after_newer_token_are_stale() {
         fence_token: Some(2),
         restore: false,
         slots: Vec::new(),
+        control_quorum: true,
     })
     .await
     .unwrap();

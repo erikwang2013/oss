@@ -1360,6 +1360,14 @@ impl Store {
 
     /// 单机/多盘控制对象扫描（全盘并集，无覆盖阈值）。槽号 = 盘下标（单机从 0 起）。
     async fn read_control_local(&self, bucket: &str, key: &str) -> Result<ControlRead> {
+        // 非集群没有 quorum 覆盖证明，缺席只能建立在「全部盘都在册且都读过」之上。
+        for drive in &self.cfg.drives {
+            if !drives::drive_up(drive).await {
+                return Err(Error::CorruptMeta(format!(
+                    "控制对象 {key:?} 本机盘不在册：无法证明缺席/版本，fail-closed"
+                )));
+            }
+        }
         let paths = self
             .cfg
             .drives
@@ -1413,11 +1421,20 @@ impl Store {
     /// 集群控制对象读：**全量扇出**（控制读低频；覆盖率提前停会漏掉部分证书/副本，
     /// Critical B）→ 覆盖 ≥ Q_s → token 优先选举 → 缺席/不可判定判定由调用方做。
     async fn read_control_cluster(&self, bucket: &str, key: &str) -> Result<ControlRead> {
-        // 混版 / 未理解证书协议的节点会给出错误可见性 → 可达 peer 必须全部支持。
-        self.ensure_control_quorum_compatible().await?;
+        // 混版 / 未理解证书协议的节点会给出错误可见性 → 可达 peer 必须全部支持；
+        // 不可达 peer 在读路径由覆盖率 fail-closed 兜底（写路径要求全可达）。
+        self.ensure_control_quorum_compatible(true).await?;
         use futures::StreamExt as _;
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let q_s = self.cfg.ec.data as usize + 1;
+        let n = cl.sets.flat.slot_count() as usize;
+        // 缺席/唯一证书证明要求任意两个 Q_s 读集相交：2*Q_s > N。不满足时任何「副本为零
+        // → 缺席」都可能是漏读（如 3×2/Q_s=3），控制读必须 fail-closed。
+        if 2 * q_s <= n {
+            return Err(Error::Unsupported(format!(
+                "控制读要求 2*Q_s > N（当前 Q_s={q_s}, N={n}）：拓扑无法证明缺席，fail-closed"
+            )));
+        }
         let self_id = cl.sets.flat.self_node().id.clone();
         let base = self.slot_base();
 
@@ -1779,13 +1796,13 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
     ) -> Result<usize> {
-        self.write_meta_fenced_mode(bucket, key, m, old, fence_token, false, None)
+        self.write_meta_fenced_mode(bucket, key, m, old, fence_token, false, &[])
             .await
     }
 
-    /// 控制对象第一阶段写：`preserve` = 必须原样保留的已提交旧槽位（全局槽号）。
-    /// 翻转集 = 可达槽位中排除 `preserve` 后按槽号取前 Q_s（集群）或全部（单机多盘）——
-    /// 第二阶段失败时读仍能回退到这份旧证书副本（Critical A）。
+    /// 控制对象第一阶段写：`preserve` = 已提交旧证书副本的候选槽位（按优先级）。
+    /// 翻转集 = 可达槽位中排除**首个可准备的候选**后按槽号取前 Q_s（集群）或全部
+    /// （单机多盘）；候选全部不可准备 → fail-closed，绝不覆盖旧值的最后一份副本。
     pub(in crate::store) async fn write_meta_fenced_preserving(
         &self,
         bucket: &str,
@@ -1793,7 +1810,7 @@ impl Store {
         m: &XlMeta,
         old: Option<&XlMeta>,
         fence_token: u64,
-        preserve: Option<u16>,
+        preserve: &[u16],
     ) -> Result<usize> {
         self.write_meta_fenced_mode(bucket, key, m, old, Some(fence_token), false, preserve)
             .await
@@ -1809,7 +1826,7 @@ impl Store {
         key: &str,
         m: &XlMeta,
         fence_token: u64,
-        preserve: Option<u16>,
+        preserve: &[u16],
     ) -> Result<usize> {
         self.write_meta_fenced_mode(bucket, key, m, None, Some(fence_token), true, preserve)
             .await
@@ -1823,7 +1840,7 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
         marker: bool,
-        preserve: Option<u16>,
+        preserve: &[u16],
     ) -> Result<usize> {
         if self.cfg.cluster.is_some() {
             return self
@@ -1834,6 +1851,17 @@ impl Store {
             if let Some(t) = fence_token {
                 // M2b-1 的 fenced 形态：唯一一份 meta 就是提交点，无 quorum
                 let drive = &self.cfg.drives[0];
+                if !drives::drive_up(drive).await {
+                    return Err(Error::QuorumUnmet(format!(
+                        "控制对象 {bucket}/{key} 唯一盘不在册：拒绝提交标记"
+                    )));
+                }
+                // 已提交旧副本候选必然在唯一槽 0；候选不含 0 = 读到的证书不在本盘 → 拒绝覆盖
+                if !preserve.is_empty() && !preserve.contains(&0) {
+                    return Err(Error::CorruptMeta(format!(
+                        "控制对象 {bucket}/{key} 已提交副本不在唯一盘：拒绝覆盖"
+                    )));
+                }
                 let bytes = m.encode()?;
                 self.write_meta_new_on(drive, bucket, key, &bytes).await?;
                 return match self.commit_meta_on(drive, bucket, key, Some(t)).await? {
@@ -1913,12 +1941,27 @@ impl Store {
             )));
         }
 
-        // 控制对象第一阶段：保留 `preserve` 槽的已提交旧副本，其余全部翻转。数据面
-        // `preserve = None` → 翻转集 = 全部已准备盘（逐字节旧行为）。
+        // 控制对象第一阶段：保留首个可准备的已提交旧槽，其余全部翻转。数据面
+        // `preserve` 为空 → 翻转集 = 全部已准备盘（逐字节旧行为）。
+        let preserve_slot = preserve
+            .iter()
+            .copied()
+            .find(|s| prepared.iter().any(|d| *d as u16 == *s));
+        if !preserve.is_empty() && preserve_slot.is_none() {
+            for d in &prepared {
+                if let Some(t) = fence_token {
+                    self.remove_meta_new_fenced(&self.cfg.drives[*d], bucket, key, t)
+                        .await;
+                }
+            }
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {bucket}/{key} 已提交旧副本均不可准备：拒绝覆盖"
+            )));
+        }
         let flip_set: Vec<usize> = prepared
             .iter()
             .copied()
-            .filter(|d| preserve != Some(*d as u16))
+            .filter(|d| Some(*d as u16) != preserve_slot)
             .collect();
 
         // 阶段二：翻转
@@ -2021,11 +2064,12 @@ impl Store {
         old: Option<&XlMeta>,
         fence_token: Option<u64>,
         marker: bool,
-        preserve: Option<u16>,
+        preserve: &[u16],
     ) -> Result<usize> {
         // 旧版 peer 会静默忽略 `fence_token`/证书语义 → 混版集群拒绝控制写。
+        // 写路径对探测失败/超时也 fail-closed（读路径仍允许不可达，由覆盖率兜底）。
         if fence_token.is_some() {
-            self.ensure_control_quorum_compatible().await?;
+            self.ensure_control_quorum_compatible(false).await?;
         }
         // DP-0：写 prepare 阶段的传输错会被 quorum 计数吞掉（→ QuorumUnmet/500），
         // 必须在任何本地 .new 落盘前做混版 fail-closed。
@@ -2056,6 +2100,7 @@ impl Store {
             fence_token,
             restore: false,
             slots: Vec::new(), // prepare 全部可达槽位；commit 才按翻转集过滤
+            control_quorum: fence_token.is_some(),
         };
         let mut prepared_all: Vec<u16> = prepared_local.clone();
         for n in &cl.sets.flat.nodes {
@@ -2069,18 +2114,22 @@ impl Store {
         }
         let prepared = prepared_all.len();
         prepared_all.sort_unstable();
-        // 控制对象：翻转集恰为 Q_s 且排除 `preserve`（保留一份已提交旧副本）；数据面
-        // （`fence_token = None`）翻转集 = 全部已准备槽位，逐字节旧行为。
+        // 控制对象：翻转集恰为 Q_s 且排除首个**可准备**的已提交旧槽（保留一份旧副本）；
+        // 候选全部不可达/未准备 → 在任何翻转前 fail-closed。数据面（`fence_token = None`）
+        // 翻转集 = 全部已准备槽位，逐字节旧行为。
+        let preserve_slot = preserve.iter().copied().find(|s| prepared_all.contains(s));
+        let missing_preserve =
+            fence_token.is_some() && !preserve.is_empty() && preserve_slot.is_none();
         let flip_set: Vec<u16> = match fence_token {
             Some(_) => prepared_all
                 .iter()
                 .copied()
-                .filter(|s| preserve != Some(*s))
+                .filter(|s| Some(*s) != preserve_slot)
                 .take(q_s)
                 .collect(),
             None => prepared_all.clone(),
         };
-        if prepared < q_s || (fence_token.is_some() && flip_set.len() < q_s) {
+        if prepared < q_s || missing_preserve || (fence_token.is_some() && flip_set.len() < q_s) {
             // 一盘未翻转：清 .new（best-effort）→ QuorumUnmet，调用方回滚数据目录
             for drive in &self.cfg.drives {
                 match fence_token {
@@ -2097,6 +2146,11 @@ impl Store {
                     continue;
                 }
                 let _ = cl.transport.abort_meta(&n.id, mw.clone()).await;
+            }
+            if missing_preserve {
+                return Err(Error::CorruptMeta(format!(
+                    "控制对象 {bucket}/{key} 已提交旧副本均不可达/未准备：拒绝覆盖"
+                )));
             }
             self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
@@ -2216,16 +2270,21 @@ impl Store {
         }
         if marker {
             // 标记阶段失败：**绝不回滚第一阶段数据**（证书才是提交判据；回滚会制造
-            // 「数据已删、证书已发」或「同一版本两种编码」的分叉）。数据残骸无证书
-            // 不可见，由下一次写覆盖。
+            // 「数据已删、证书已发」或「同一版本两种编码」的分叉）。未落证书的槽不可见；
+            // 已落 1..<Q_s 份证书时该版本可能已被读到（写者结果不确定）。
+            let visible = if flipped > 0 {
+                "部分证书已落盘（读可能可见，写者结果不确定）"
+            } else {
+                "第一阶段数据未提交（读不可见）"
+            };
             if fence_token.is_some() && stale {
                 return Err(Error::Conflict(format!(
-                    "fence token 过期：{bucket}/{key} 已由更新写者提交（提交标记未达成）"
+                    "fence token 过期：{bucket}/{key} 已由更新写者提交（提交标记未达成：{visible}）"
                 )));
             }
             self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
-                "meta 提交标记 {flipped}/{q_s}，第一阶段数据未提交（读不可见）"
+                "meta 提交标记 {flipped}/{q_s}：{visible}"
             )));
         }
 
@@ -2275,6 +2334,7 @@ impl Store {
                             fence_token: None,
                             restore: false,
                             slots: Vec::new(),
+                            control_quorum: false,
                         };
                         match cl.transport.prepare_meta(&node.id, ow.clone()).await {
                             Ok(_) => cl.transport.commit_meta(&node.id, ow).await.map(|_| ()),
@@ -2382,6 +2442,7 @@ impl Store {
                     fence_token: Some(fence_token),
                     restore: true,
                     slots: Vec::new(),
+                    control_quorum: true,
                 };
                 match cl.transport.prepare_meta(node, ow.clone()).await {
                     Ok(_) => cl.transport.commit_meta(node, ow).await.map(|_| ()),
