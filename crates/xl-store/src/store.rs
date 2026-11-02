@@ -853,13 +853,34 @@ impl Store {
             .clone()
     }
 
-    /// 对象锁的完整形态（**所有写路径的统一入口**）：进程内 tokio 互斥 → 跨进程 flock。
-    /// 顺序恒定（内存锁在前）避免死锁；flock 文件固定锁 drive0 的
-    /// `.oss.sys/locks/<sha256(bucket/key)[..16]>.lock`（锁是互斥信号不是数据，无需每盘一份）。
+    /// 对象锁的完整形态（**所有数据面写路径的统一入口**）：进程内 tokio 互斥 → 跨进程
+    /// flock →（集群）quorum 租约锁。顺序恒定（内存锁在前）避免死锁；flock 文件固定锁
+    /// drive0 的 `.oss.sys/locks/<sha256(bucket/key)[..16]>.lock`（锁是互斥信号不是数据，
+    /// 无需每盘一份）。
+    pub(in crate::store) async fn lock_object(&self, bucket: &str, key: &str) -> Result<LockGuard> {
+        let local = self.lock_object_local(bucket, key).await?;
+        if self.cfg.cluster.is_none() {
+            return Ok(local);
+        }
+        // M3 集群（Task 8）：第三层 quorum 租约锁（顺序恒定防死锁：进程内 → flock → 集群）
+        let cluster = self.acquire_cluster_lock(bucket, key).await?;
+        Ok(LockGuard {
+            _cluster: Some(cluster),
+            ..local
+        })
+    }
+
+    /// 仅本机两层（进程内 tokio 互斥 → 跨进程 flock）。Phase 0 控制面在集群下用本层
+    /// 提供跨进程互斥，再单独取 fenced 集群锁（fenced 租约与数据面租约同 key 同 holder，
+    /// 且锁表拒绝 fenced 重入，故不能再叠加 `acquire_cluster_lock`）。
     ///
     /// `File::lock()` 是阻塞调用：放进 `spawn_blocking`——多任务争用同一把锁时，
     /// 挂起的是阻塞池线程而不是 async 执行器线程（否则工作线程被 parked 可能饿死持锁任务）。
-    pub(in crate::store) async fn lock_object(&self, bucket: &str, key: &str) -> Result<LockGuard> {
+    pub(in crate::store) async fn lock_object_local(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<LockGuard> {
         let mem = self.lock_for(bucket, key).lock_owned().await;
         let id = {
             use sha2::Digest as _;
@@ -873,16 +894,10 @@ impl Store {
         })
         .await
         .map_err(|e| Error::Encode(format!("锁等待任务异常: {e}")))??;
-        // M3 集群（Task 8）：第三层 quorum 租约锁（顺序恒定防死锁：进程内 → flock → 集群）
-        let cluster = if self.cfg.cluster.is_some() {
-            Some(self.acquire_cluster_lock(bucket, key).await?)
-        } else {
-            None
-        };
         Ok(LockGuard {
             _mem: mem,
             _file: file,
-            _cluster: cluster,
+            _cluster: None,
         })
     }
 

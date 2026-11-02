@@ -5886,3 +5886,137 @@ async fn cluster_partial_flip_compensation_skips_newer_token() {
         assert_eq!(m.control_version, Some(0), "{}", d.display());
     }
 }
+
+// ---------- Phase 0 Task 5：集群 system-object 读写与 quorum 读屏障 ----------
+
+/// 节点 A 写入后，节点 B 的 quorum 读必须看到同一版本/数据；覆盖不足 quorum 时读
+/// fail-closed（CorruptMeta），不得返回旧副本。
+#[tokio::test]
+async fn system_object_read_reflects_committed_write_on_follower() {
+    let c = Cluster::new(3, 2).await;
+    let a = &c.stores[0];
+    let b = &c.stores[1];
+    assert_eq!(
+        a.put_system_object("control/x", b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let obj = b.get_system_object("control/x").await.unwrap().unwrap();
+    assert_eq!(&obj.data[..], b"v1");
+    assert_eq!((obj.version, obj.fence_token), (1, 1));
+    // 停 2 节点：本机 2 槽 < Q_s=3 → 覆盖不足，读必须 fail-closed（不是 404/旧值）
+    c.mesh.down("n2");
+    c.mesh.down("n3");
+    let err = a.get_system_object("control/x").await.unwrap_err();
+    assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
+}
+
+/// 停 2 节点：集群写必须 fail-closed（fenced 锁拿不到 Q_n → QuorumUnmet），
+/// 且不留下任何可见写入。
+#[tokio::test]
+async fn system_object_cluster_write_fails_closed_below_quorum() {
+    let c = Cluster::new(3, 2).await;
+    let a = &c.stores[0];
+    c.mesh.down("n2");
+    c.mesh.down("n3");
+    let err = a
+        .put_system_object("control/x", b"v", None, 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::QuorumUnmet(_)), "{err:?}");
+    let err = a.get_system_object("control/x").await.unwrap_err();
+    assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
+}
+
+/// 集群 CAS：expected_version 不符或调用方 token 已过期 → Conflict；
+/// 合法 CAS 在另一节点推进版本。
+#[tokio::test]
+async fn system_object_cluster_cas_conflict_and_stale_token() {
+    let c = Cluster::new(3, 2).await;
+    let a = &c.stores[0];
+    let b = &c.stores[1];
+    a.put_system_object("control/x", b"v1", None, 1)
+        .await
+        .unwrap();
+    let err = b
+        .put_system_object("control/x", b"v2", Some(0), 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "版本不符：{err:?}");
+    let err = b
+        .put_system_object("control/x", b"v2", Some(1), 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "过期 token：{err:?}");
+    assert_eq!(
+        b.put_system_object("control/x", b"v2", Some(1), 2)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        &a.get_system_object("control/x")
+            .await
+            .unwrap()
+            .unwrap()
+            .data[..],
+        b"v2"
+    );
+}
+
+/// 集群 delete 写 tombstone：另一节点读为 None；重复删除幂等 false。
+#[tokio::test]
+async fn system_object_cluster_delete_tombstone() {
+    let c = Cluster::new(3, 2).await;
+    let a = &c.stores[0];
+    let b = &c.stores[1];
+    let d = &c.stores[2];
+    a.put_system_object("control/d", b"v", None, 1)
+        .await
+        .unwrap();
+    assert!(
+        b.delete_system_object("control/d", Some(1), 2)
+            .await
+            .unwrap()
+    );
+    assert!(d.get_system_object("control/d").await.unwrap().is_none());
+    assert!(
+        !b.delete_system_object("control/d", Some(2), 3)
+            .await
+            .unwrap()
+    );
+}
+
+/// 并发写同一 key：fenced 锁串行化，恰一个成功；其余 Conflict/QuorumUnmet，不挂起。
+#[tokio::test]
+async fn system_object_cluster_concurrent_writes_serialize() {
+    let c = Cluster::new(3, 2).await;
+    let a = c.stores[0].clone();
+    let b = c.stores[1].clone();
+    let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            a.put_system_object("control/race", b"a", None, 1),
+            b.put_system_object("control/race", b"b", None, 1),
+        )
+    })
+    .await
+    .expect("并发写挂起（疑似死锁）");
+    assert_eq!(
+        [&ra, &rb].iter().filter(|r| r.is_ok()).count(),
+        1,
+        "只允许一个写者成功：{ra:?} {rb:?}"
+    );
+    for r in [&ra, &rb].iter().filter(|r| r.is_err()) {
+        assert!(
+            matches!(r, Err(Error::Conflict(_)) | Err(Error::QuorumUnmet(_))),
+            "失败写必须是 Conflict/QuorumUnmet：{r:?}"
+        );
+    }
+    let obj = c.stores[2]
+        .get_system_object("control/race")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(obj.version, 1);
+}

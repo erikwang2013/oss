@@ -1,10 +1,13 @@
 //! Phase 0：控制对象（`.oss.sys` 保留命名空间内的 system-object）。
 //!
-//! CAS = 串行化（`lock_object`：进程内 per-key mutex + `flock`）+ 读旧 meta +
-//! `expected_version`/`fence_token` 校验 + fenced `write_meta` 提交（提交侧再按已提交 token
-//! 拒绝过期写）。只要两个 Store 打开同一 root（同进程或不同进程），同一 key 的读-检-写互斥；
-//! `flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
-//! put/delete/get/list 的集群分支整体在 Task 5 接入（当前均 Unsupported）。
+//! CAS = 串行化（本机两层对象锁：进程内 per-key mutex + `flock`；集群再加 fenced 集群锁）+
+//! quorum 读旧 meta + `expected_version`/`fence_token` 校验 + fenced `write_meta` 提交（提交侧
+//! 再按已提交 token 拒绝过期写）。只要两个 Store 打开同一 root（同进程或不同进程），同一 key
+//! 的读-检-写互斥；`flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
+//!
+//! 集群分支：锁 token 由 [`Store::acquire_fenced_cluster_lock`] 持久化发放并作为提交 token
+//! （调用方 token 仍按 Task 2 契约校验单调性）；读走 quorum 覆盖 ≥ `Q_s`，覆盖不足 fail-closed。
+//! 集群枚举不做：Phase 0 的 control manifest 携带键集合，留待 Phase 1。
 
 use md5::Digest as _;
 
@@ -12,7 +15,36 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::meta::{self, InlineData, PartRef, Version, XlMeta};
 
-use super::Store;
+use super::{LockGuard, Store};
+
+/// 控制对象写锁：集群下 fenced 集群锁先声明 → 先 Drop（与获取顺序相反：
+/// 本机 mutex → flock → fenced 集群锁）。
+struct ControlGuard {
+    fenced: Option<super::lock::FencedLockGuard>,
+    _local: LockGuard,
+}
+
+impl ControlGuard {
+    /// 集群租约是否丢失（单机恒 false）——写入口在提交点前检查。
+    fn lease_lost(&self) -> bool {
+        self.fenced.as_ref().is_some_and(|g| g.lease_lost())
+    }
+
+    /// 提交 token：集群 = 持久化锁发放的 token（并校验其严格大于已提交 token）；
+    /// 单机/多盘 = 调用方提供的 token（Task 2 语义逐字节不变）。
+    fn commit_token(&self, caller_token: u64, cur_fence: u64) -> Result<u64> {
+        let Some(g) = &self.fenced else {
+            return Ok(caller_token);
+        };
+        if g.token <= cur_fence {
+            return Err(Error::Conflict(format!(
+                "fence token 已过期：锁发放 {} ≤ 已提交 {cur_fence}",
+                g.token
+            )));
+        }
+        Ok(g.token)
+    }
+}
 
 /// 控制对象键前缀：`object_dir_system` 只拒绝与系统子项同名的首段，`control` 不在其列。
 const CONTROL_PREFIX: &str = "control/";
@@ -36,7 +68,6 @@ impl Store {
         expected_version: Option<u64>,
         fence_token: u64,
     ) -> Result<u64> {
-        self.ensure_control_single_node()?;
         validate_control_key(key)?;
         if data.len() as u64 > meta::MAX_INLINE {
             return Err(Error::InvalidArgument(format!(
@@ -46,30 +77,31 @@ impl Store {
                 data.len()
             )));
         }
-        let _guard = self.control_lock(key).await?;
-        // 获取后即时自检（与数据面写入口一致；集群分支在 Task 5 放开后不再是死代码）
-        if _guard.lease_lost() {
+        let guard = self.control_lock(key).await?;
+        // 获取后即时自检（与数据面写入口一致）
+        if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
-        let old = self.read_meta(layout::SYS_DIR, key).await?;
+        let old = self.read_meta_full(layout::SYS_DIR, key).await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
+        let commit_token = guard.commit_token(fence_token, cur_fence)?;
         let version = cur_version + 1;
-        let m = control_meta(key, version, fence_token, Some(data), false);
+        let m = control_meta(key, version, commit_token, Some(data), false);
         // 提交点前复查租约（无 fencing 窗口收窄到两次检查之间；与 put.rs:1058 同款）
-        if _guard.lease_lost() {
+        if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
         }
-        self.commit_control_meta(key, &m, old.as_ref(), fence_token)
+        self.commit_control_meta(key, &m, old.as_ref(), commit_token)
             .await?;
         Ok(version)
     }
 
-    /// 读控制对象（tombstone → None）。
+    /// 读控制对象（tombstone → None）。集群走 full quorum 读（覆盖 ≥ `Q_s`），
+    /// 覆盖不足 → `CorruptMeta`（fail-closed，不返回可能陈旧的副本）。
     pub async fn get_system_object(&self, key: &str) -> Result<Option<SystemObject>> {
-        self.ensure_control_single_node()?;
         validate_control_key(key)?;
-        let Some(m) = self.read_meta(layout::SYS_DIR, key).await? else {
+        let Some(m) = self.read_meta_full(layout::SYS_DIR, key).await? else {
             return Ok(None);
         };
         if m.control_deleted == Some(true) {
@@ -96,33 +128,39 @@ impl Store {
         expected_version: Option<u64>,
         fence_token: u64,
     ) -> Result<bool> {
-        self.ensure_control_single_node()?;
         validate_control_key(key)?;
-        let _guard = self.control_lock(key).await?;
-        if _guard.lease_lost() {
+        let guard = self.control_lock(key).await?;
+        if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
         }
-        let old = self.read_meta(layout::SYS_DIR, key).await?;
+        let old = self.read_meta_full(layout::SYS_DIR, key).await?;
         let (cur_version, cur_fence) = control_state(old.as_ref());
         check_cas(cur_version, cur_fence, expected_version, fence_token)?;
+        let commit_token = guard.commit_token(fence_token, cur_fence)?;
         let Some(old) = old else {
             return Ok(false);
         };
         if old.control_deleted == Some(true) {
             return Ok(false);
         }
-        let m = control_meta(key, cur_version + 1, fence_token, None, true);
-        if _guard.lease_lost() {
+        let m = control_meta(key, cur_version + 1, commit_token, None, true);
+        if guard.lease_lost() {
             return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
         }
-        self.commit_control_meta(key, &m, Some(&old), fence_token)
+        self.commit_control_meta(key, &m, Some(&old), commit_token)
             .await?;
         Ok(true)
     }
 
     /// 列控制对象键（前缀过滤；tombstone 不出现）。排序保证结果稳定。
     pub async fn list_system_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        self.ensure_control_single_node()?;
+        if self.cfg.cluster.is_some() {
+            // Phase 0 的 control manifest 携带键集合；集群枚举推迟到 Phase 1（不新增 list RPC）。
+            return Err(Error::Unsupported(
+                "集群 system-object 枚举推迟到 Phase 1（Phase 0 由 control manifest 携带键集合）"
+                    .into(),
+            ));
+        }
         if !prefix.starts_with(CONTROL_PREFIX) {
             return Err(Error::InvalidKey(format!(
                 "控制对象前缀必须以 {CONTROL_PREFIX} 开头：{:?}",
@@ -161,24 +199,27 @@ impl Store {
         Ok(out)
     }
 
-    fn ensure_control_single_node(&self) -> Result<()> {
-        if self.cfg.cluster.is_some() {
-            return Err(Error::Unsupported(
-                "system-object API 的集群分支在 Task 5 接入（当前单机）".into(),
-            ));
-        }
-        Ok(())
+    /// CAS 串行化：本机两层（进程内 mutex + `flock`，跨进程互斥）；集群再叠加 fenced
+    /// 集群锁——先本机后集群，与数据面「对象锁 → 集群锁」顺序一致。集群分支不能复用
+    /// `lock_object`：它会先取同 key 的数据面租约锁，锁表拒绝同 holder 的 fenced 重入。
+    async fn control_lock(&self, key: &str) -> Result<ControlGuard> {
+        let local = self.lock_object_local(layout::SYS_DIR, key).await?;
+        let fenced = if self.cfg.cluster.is_some() {
+            Some(
+                self.acquire_fenced_cluster_lock(layout::SYS_DIR, key)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        Ok(ControlGuard {
+            fenced,
+            _local: local,
+        })
     }
 
-    /// CAS 串行化：数据面同款跨进程锁（进程内 mutex + `flock`），不同进程打开同一
-    /// root 的两个 Store 也能互斥。集群子分支在上游已拒绝，故这里只落到本地两层。
-    async fn control_lock(&self, key: &str) -> Result<super::LockGuard> {
-        self.lock_object(layout::SYS_DIR, key).await
-    }
-
-    /// 提交控制对象 meta：单盘/多盘走 fenced 提交（调用方持有 fence token；持久化 token
-    /// 发放为 Task 4）。当前 put/delete 由 `ensure_control_single_node` 限制为单机，集群
-    /// 分支在 Task 5 放开；过期 token 由提交侧返回 `Error::Conflict`。
+    /// 提交控制对象 meta：单盘/多盘/集群统一走 fenced 提交（调用方持有 fence token；
+    /// 集群 token 由 fenced 锁持久化发放）。过期 token 由提交侧返回 `Error::Conflict`。
     async fn commit_control_meta(
         &self,
         key: &str,

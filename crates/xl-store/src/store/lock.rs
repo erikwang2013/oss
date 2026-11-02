@@ -266,7 +266,6 @@ async fn write_fence_high(root: &Path, lock_key: &str, token: u64) -> Result<()>
 }
 
 /// 协调者收满 quorum 后的持久化：持 flock 取 max 再写——绝不下调高水位。
-#[allow(dead_code)] // Phase 0 Task 5 接入控制面写路径；当前仅测试调用
 async fn advance_fence_high(root: &Path, lock_key: &str, token: u64) -> Result<u64> {
     let _flock = lock_fence_file(root, lock_key).await?;
     let cur = read_fence_high(root, lock_key).await?;
@@ -355,7 +354,6 @@ impl Drop for ClusterLockGuard {
 
 /// fenced 锁守卫（Phase 0 Task 4）：`token` = 本次授予的单调 fence token；
 /// 集群下复用 [`ClusterLockGuard`] 的续租/释放，单机下 Drop 释放本机条目。
-#[allow(dead_code)] // Phase 0 Task 5 接入控制面写路径；当前仅测试调用
 pub(in crate::store) struct FencedLockGuard {
     pub token: u64,
     guard: Option<ClusterLockGuard>,
@@ -365,7 +363,6 @@ pub(in crate::store) struct FencedLockGuard {
 
 impl FencedLockGuard {
     /// 租约是否已丢失（单机恒 false）——写入口在提交点前检查。
-    #[allow(dead_code)] // Phase 0 Task 5 接入写入口
     pub(in crate::store) fn lease_lost(&self) -> bool {
         self.guard.as_ref().is_some_and(|g| g.lease_lost())
     }
@@ -549,10 +546,10 @@ impl Store {
     ///
     /// **契约边界**：本层只保证 token 单调、不重号，**不提供**跨进程/跨 Store 的互斥
     /// （锁表在进程内存；同 root 的并发进程由 `.fence.lock` flock 只串行化发号）。
-    /// 调用方必须先持有 `lock_object`（进程内 mutex + flock）再调用本方法，与数据面写
-    /// 路径同序。单机守卫无续租、`lease_lost()` 恒 false：持锁超过
-    /// `cluster_lock_ttl_ms` 后条目静默过期，因此对象锁是必需的，不能只拿本守卫。
-    #[allow(dead_code)] // Phase 0 Task 5 消费；当前仅测试调用
+    /// 调用方必须先持有 `lock_object_local`（进程内 mutex + flock）再调用本方法，与数据面
+    /// 写路径同序（本机锁 → 集群锁）。不能改用 `lock_object`：它会先取同 key 的数据面租约
+    /// 锁，而锁表拒绝同 holder 的 fenced 重入。单机守卫无续租、`lease_lost()` 恒 false：
+    /// 持锁超过 `cluster_lock_ttl_ms` 后条目静默过期，因此对象锁是必需的，不能只拿本守卫。
     pub(in crate::store) async fn acquire_fenced_cluster_lock(
         &self,
         bucket: &str,
