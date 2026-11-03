@@ -1189,16 +1189,14 @@ impl Db {
 
     /// 事务内版本（`&mut SqliteConnection`；调用方负责 commit 与 cache 失效时机）。
     pub async fn clear_bucket_m8_tx(conn: &mut sqlx::SqliteConnection, bucket: &str) -> Result<()> {
-        // olap_configs 无 FK 级联保证时也必须清（先按 access_point 删，再删 AP）
-        sqlx::query(
-            "DELETE FROM olap_configs WHERE access_point IN \
-             (SELECT name FROM access_points WHERE bucket = ?)",
-        )
-        .bind(bucket)
-        .execute(&mut *conn)
-        .await?;
+        // 该桶的 AP 及其 OLAP 行（SQLite 默认无 FK 级联，txn 内显式先 OLAP 后 AP）。
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+            txn.delete_access_points_for_bucket(bucket)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+        }
         for sql in [
-            "DELETE FROM access_points WHERE bucket = ?",
             "DELETE FROM inventory_runs WHERE bucket = ?",
             "DELETE FROM inventory_configs WHERE bucket = ?",
             "DELETE FROM inventory_cursors WHERE bucket = ?",
@@ -4563,6 +4561,34 @@ mod tests {
         );
         assert!(db.delete_access_point("ap1").await.unwrap());
         assert!(!db.delete_access_point("ap1").await.unwrap());
+    }
+
+    /// 桶删除级联只清该桶的 AP/OLAP（characterization pin：迁 txn 后行为不变）。
+    #[tokio::test]
+    async fn clear_bucket_m8_tx_deletes_bucket_ap_olap_only() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let _ = db.create_user("root", "pw", true).await.unwrap();
+        let root: i64 = db.owner_uid(&OwnerRef::Admin).await.unwrap();
+        db.create_access_point("ap-a", "b1", root, None, 1)
+            .await
+            .unwrap();
+        db.create_access_point("ap-b", "b2", root, None, 2)
+            .await
+            .unwrap();
+        db.set_olap_config("ap-a", "http", Some("https://x"), None, None, 5000, 1024, 3)
+            .await
+            .unwrap();
+        db.set_olap_config("ap-b", "http", Some("https://y"), None, None, 5000, 1024, 3)
+            .await
+            .unwrap();
+        let mut conn = db.pool().acquire().await.unwrap();
+        Db::clear_bucket_m8_tx(&mut conn, "b1").await.unwrap();
+        drop(conn);
+        let store = db.control_store();
+        assert!(store.access_point("ap-a").await.unwrap().is_none());
+        assert!(store.olap_config("ap-a").await.unwrap().is_none());
+        assert!(store.access_point("ap-b").await.unwrap().is_some());
+        assert!(store.olap_config("ap-b").await.unwrap().is_some());
     }
 
     #[tokio::test]
