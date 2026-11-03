@@ -247,7 +247,8 @@ impl Store {
     pub async fn recertify_system_object(&self, key: &str) -> Result<bool> {
         if self.cfg.cluster.is_some() {
             return Err(Error::Unsupported(
-                "recertify requires offline single-node mode; stop the cluster and run per node"
+                "cluster legacy control metas are unsupported; recertify requires a genuine \
+                 single-node deployment (one node, all drives local)"
                     .into(),
             ));
         }

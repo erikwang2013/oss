@@ -6897,7 +6897,15 @@ async fn system_object_recertify_rejected_in_cluster_mode() {
         write_control_slot(&c, slot, k, &legacy).await;
     }
     match c.stores[0].recertify_system_object(k).await {
-        Err(Error::Unsupported(msg)) => assert!(msg.contains("offline single-node"), "{msg}"),
+        Err(Error::Unsupported(msg)) => {
+            assert_eq!(
+                msg,
+                "cluster legacy control metas are unsupported; recertify requires a genuine \
+                 single-node deployment (one node, all drives local)"
+            );
+            assert!(!msg.contains("run per node"), "{msg}");
+            assert!(!msg.contains("stop the cluster"), "{msg}");
+        }
         other => panic!("集群模式必须拒绝 recertify：{other:?}"),
     }
     for dir in c.dirs.iter().flatten() {
