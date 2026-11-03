@@ -126,7 +126,7 @@ async fn upsert_delete_and_ordering_match_legacy() {
     let legacy = fresh().await;
     let store_db = fresh().await;
 
-    // 乱序写入；重复 upsert 改状态（created_at 必须保留）。
+    // 乱序写入；重复 upsert 只改 created_at（必须保留原值）。
     let first = row("vpce-b", "vpc-b", "disabled", 20, 21);
     let second = row("vpce-a", "vpc-a", "active", 10, 11);
     let mut reupsert = first.clone();
