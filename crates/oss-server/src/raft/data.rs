@@ -26,7 +26,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
-use xl_store::control_store::ControlTxn;
+use xl_store::control_store::{ControlError, ControlTxn, OlapConfigEntry};
 
 use super::compat::{
     FEATURE_LEVEL_3, FEATURE_LEVEL_8, FEATURE_LEVEL_9, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL,
@@ -148,16 +148,8 @@ pub struct ReplicationRuleRow {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccessPointRow {
-    pub name: String,
-    pub bucket: String,
-    pub owner: OwnerRef,
-    pub policy_json: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
+/// AP 行（自然键属主）；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type AccessPointRow = xl_store::control_store::AccessPointEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,6 +274,14 @@ impl From<serde_json::Error> for DataError {
 
 fn sql(e: sqlx::Error) -> DataError {
     DataError::Format(format!("sql: {e}"))
+}
+
+/// 缝错误 → 快照错误：`Invalid` 原文保留（如 `owner user id {id} missing`）。
+fn control_data_err(e: ControlError) -> DataError {
+    match e {
+        ControlError::Invalid(m) => DataError::Format(m),
+        ControlError::Backend(m) => DataError::Format(format!("control store backend: {m}")),
+    }
 }
 
 fn owner_of(
@@ -455,49 +455,31 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
         });
     }
 
-    for r in sqlx::query(
-        "SELECT a.name, a.bucket, a.owner_id, a.policy_json, a.created_at, a.updated_at, \
-                u.username AS owner_username, u.is_admin AS owner_is_admin \
-         FROM access_points a LEFT JOIN users u ON u.id = a.owner_id ORDER BY a.name",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.access_points.push(AccessPointRow {
-            name: r.get("name"),
-            bucket: r.get("bucket"),
-            owner: owner_of(
-                Some(r.get("owner_id")),
-                r.get("owner_username"),
-                r.get("owner_is_admin"),
-            )?,
-            policy_json: r.get("policy_json"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        });
-    }
+    data.access_points = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.access_points().await.map_err(control_data_err)?
+    };
 
-    for r in sqlx::query(
-        "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
-                max_response_bytes, updated_at FROM olap_configs ORDER BY access_point",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        let module: Option<Vec<u8>> = r.get("module");
-        data.olap_configs.push(OlapConfigRow {
-            access_point: r.get("access_point"),
-            kind: r.get("kind"),
-            endpoint: r.get("endpoint"),
-            module_b64: module.map(|m| base64::engine::general_purpose::STANDARD.encode(m)),
-            module_sha256: r.get("module_sha256"),
-            timeout_ms: r.get("timeout_ms"),
-            max_response_bytes: r.get("max_response_bytes"),
-            updated_at: r.get("updated_at"),
-        });
-    }
+    data.olap_configs = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.olap_configs()
+            .await
+            .map_err(control_data_err)?
+            .into_iter()
+            .map(|e| OlapConfigRow {
+                access_point: e.access_point,
+                kind: e.kind,
+                endpoint: e.endpoint,
+                module_b64: e
+                    .module
+                    .map(|m| base64::engine::general_purpose::STANDARD.encode(m)),
+                module_sha256: e.module_sha256,
+                timeout_ms: e.timeout_ms,
+                max_response_bytes: e.max_response_bytes,
+                updated_at: e.updated_at,
+            })
+            .collect()
+    };
 
     for r in sqlx::query(
         "SELECT i.bucket, i.id, i.owner_id, i.config_json, i.updated_at, \
@@ -699,15 +681,29 @@ pub(crate) async fn install_tx(
             "snapshot carries invalid level-9 account_usage_ledger rows".into(),
         ));
     }
+    // 属主预校验（在任何写之前）：Admin 需本地管理员（witness 除外）；
+    // User 必须随快照到达，否则整包拒绝。
+    for ap in &data.access_points {
+        match &ap.owner {
+            OwnerRef::Admin => {
+                if ctx.admin_id.is_none() && !ctx.witness {
+                    return Err(DataError::NoAdminUser);
+                }
+            }
+            OwnerRef::User(name) => {
+                if !data.users.iter().any(|u| u.username.as_str() == name.as_str()) {
+                    return Err(DataError::Format(format!(
+                        "access point owner {name} not in snapshot"
+                    )));
+                }
+            }
+        }
+    }
     // 1. AP → olap（olap_configs.access_point 外键）。
-    sqlx::query("DELETE FROM olap_configs")
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_access_points(&[])
         .await
-        .map_err(sql)?;
-    sqlx::query("DELETE FROM access_points")
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        .map_err(control_data_err)?;
     // 2. 桶配置行（无外键，先清）。
     for q in [
         "DELETE FROM inventory_configs",
@@ -902,31 +898,11 @@ pub(crate) async fn install_tx(
         .map_err(sql)?;
     }
 
-    // 11. AP / inventory：Admin 属主 = 本地管理员 id（witness 0）。
-    for ap in &data.access_points {
-        let owner_id = match &ap.owner {
-            OwnerRef::Admin => match ctx.admin_id {
-                Some(id) => id,
-                None if ctx.witness => 0,
-                None => return Err(DataError::NoAdminUser),
-            },
-            OwnerRef::User(name) => user_id(name, "access point")?,
-        };
-        sqlx::query(
-            "INSERT INTO access_points \
-             (name, bucket, owner_id, policy_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&ap.name)
-        .bind(&ap.bucket)
-        .bind(owner_id)
-        .bind(&ap.policy_json)
-        .bind(ap.created_at)
-        .bind(ap.updated_at)
-        .execute(&mut *conn)
+    // 11. AP（txn 按自然键解析本地 id）/ inventory：Admin 属主 = 本地管理员 id（witness 0）。
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_access_points(&data.access_points)
         .await
-        .map_err(sql)?;
-    }
+        .map_err(control_data_err)?;
     for inv in &data.inventory_configs {
         let owner_id = match &inv.owner {
             OwnerRef::Admin => match ctx.admin_id {
@@ -1004,33 +980,34 @@ pub(crate) async fn install_tx(
         .await
         .map_err(sql)?;
     }
-    for o in &data.olap_configs {
-        let module = match &o.module_b64 {
-            None => None,
-            Some(b64) => Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .map_err(|e| DataError::Format(format!("olap module base64: {e}")))?,
-            ),
-        };
-        sqlx::query(
-            "INSERT INTO olap_configs \
-             (access_point, kind, endpoint, module, module_sha256, timeout_ms, \
-              max_response_bytes, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&o.access_point)
-        .bind(&o.kind)
-        .bind(&o.endpoint)
-        .bind(module)
-        .bind(&o.module_sha256)
-        .bind(o.timeout_ms)
-        .bind(o.max_response_bytes)
-        .bind(o.updated_at)
-        .execute(&mut *conn)
+    let olap: Vec<OlapConfigEntry> = data
+        .olap_configs
+        .iter()
+        .map(|o| {
+            let module = match &o.module_b64 {
+                None => None,
+                Some(b64) => Some(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| DataError::Format(format!("olap module base64: {e}")))?,
+                ),
+            };
+            Ok(OlapConfigEntry {
+                access_point: o.access_point.clone(),
+                kind: o.kind.clone(),
+                endpoint: o.endpoint.clone(),
+                module,
+                module_sha256: o.module_sha256.clone(),
+                timeout_ms: o.timeout_ms,
+                max_response_bytes: o.max_response_bytes,
+                updated_at: o.updated_at,
+            })
+        })
+        .collect::<Result<Vec<_>, DataError>>()?;
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_olap_configs(&olap)
         .await
-        .map_err(sql)?;
-    }
+        .map_err(control_data_err)?;
 
     // 13. 孤儿 session/STS AK（属主已被替换而残留）。
     sqlx::query(
@@ -1618,6 +1595,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admins, 1, "本地 admin 不得被快照安装删除");
+    }
+
+    /// AP 属主必须在任何写之前按快照/本地口径钉死：Admin → 本地管理员 id；
+    /// User 必须在 data.users；目标库悬空 owner_id 在导出时 fail-closed。
+    #[tokio::test]
+    async fn snapshot_admin_owner_and_dangling_owner_are_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "ap-owner-pin.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        let ctx = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: false,
+        };
+
+        // (a) Admin 属主 → 本地管理员 id。
+        let mut admin_data = sample();
+        admin_data.access_points[0].owner = OwnerRef::Admin;
+        install_tx(&mut tx, &admin_data, &ctx).await.unwrap();
+        let owner: i64 = sqlx::query_scalar("SELECT owner_id FROM access_points WHERE name = 'ap1'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(owner, admin_id);
+
+        // (b) 快照外用户 → 预校验拒绝，且既有行未被删除（fail-closed，在任何写之前）。
+        let mut ghost = sample();
+        ghost.access_points[0].owner = OwnerRef::User("ghost".into());
+        let err = install_tx(&mut tx, &ghost, &ctx).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("access point owner ghost not in snapshot"),
+            "{err}"
+        );
+        let kept: String = sqlx::query_scalar("SELECT name FROM access_points WHERE name = 'ap1'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(kept, "ap1", "预校验失败不得破坏既有行");
+
+        // (c) 目标库悬空 owner_id → read_tx 严格导出拒绝。
+        sqlx::query(
+            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
+             VALUES ('ap-dangling', 'b1', 999, NULL, 1, 1)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let err = read_tx(&mut tx).await.unwrap_err();
+        assert!(format!("{err}").contains("owner user id 999 missing"), "{err}");
+        sqlx::query("DELETE FROM access_points WHERE name = 'ap-dangling'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        // (d) sample() 的用户属主与 OLAP module 字节往返不变。
+        install_tx(&mut tx, &sample(), &ctx).await.unwrap();
+        let read = read_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(read, sample());
+        assert_eq!(read.access_points[0].owner, OwnerRef::User("alice".into()));
+        assert_eq!(read.olap_configs[0].module_b64.as_deref(), Some("aGVsbG8="));
     }
 
     async fn raft_db(dir: &tempfile::TempDir, name: &str) -> crate::db::Db {
