@@ -151,7 +151,6 @@ async fn seed(dir: &Path, registry: Arc<Registry>, policy: &str) -> (AppState, S
         AccessPoint::from_row(
             AP.into(),
             BUCKET.into(),
-            uid,
             Some(policy.to_string()),
             &st.ap_region,
             &account,

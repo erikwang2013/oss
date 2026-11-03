@@ -854,14 +854,19 @@ impl AppState {
         );
         let site_enabled = cfg.site.is_some();
         // M8 S1：AP 缓存预加载（坏策略行跳过并告警；运行期 source 查询会再 fail-closed）
-        match db.list_access_points(None).await {
+        match db.control_store().access_points().await {
             Ok(rows) => {
                 for r in rows {
-                    let account = r.account();
+                    let account = match db.bucket_account(&r.bucket).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(error = %e, ap = %r.name, "AP 预加载解析桶账户失败");
+                            continue;
+                        }
+                    };
                     match xl_s3::ap::AccessPoint::from_row(
                         r.name,
                         r.bucket,
-                        r.owner_id,
                         r.policy_json,
                         &site.region,
                         &account,

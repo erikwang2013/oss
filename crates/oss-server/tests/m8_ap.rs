@@ -188,7 +188,6 @@ async fn direct_ap(e: &Env, name: &str, bucket: &str, owner: i64, policy: Option
         AccessPoint::from_row(
             name.into(),
             bucket.into(),
-            owner,
             policy.map(str::to_string),
             &e.st.ap_region,
             xl_s3::access::LEGACY_ACCOUNT,
@@ -197,7 +196,7 @@ async fn direct_ap(e: &Env, name: &str, bucket: &str, owner: i64, policy: Option
     );
 }
 
-async fn set_ap_policy(e: &Env, name: &str, bucket: &str, owner: i64, policy: Option<&str>) {
+async fn set_ap_policy(e: &Env, name: &str, bucket: &str, _owner: i64, policy: Option<&str>) {
     e.st.db
         .set_access_point_policy(name, policy, 0)
         .await
@@ -206,7 +205,6 @@ async fn set_ap_policy(e: &Env, name: &str, bucket: &str, owner: i64, policy: Op
         AccessPoint::from_row(
             name.into(),
             bucket.into(),
-            owner,
             policy.map(str::to_string),
             &e.st.ap_region,
             xl_s3::access::LEGACY_ACCOUNT,
@@ -527,6 +525,18 @@ async fn console_crud_permissions_and_cache() {
     .unwrap();
     assert_eq!((uid, decision.as_str()), (owner_id, "allow"));
     assert_eq!(detail.as_deref(), Some("policy=none"));
+    let list: serde_json::Value = e
+        .http
+        .get(format!("{}/api/v1/access-points", e.base))
+        .bearer_auth(&owner_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list[0]["owner_id"], owner_id, "owner_id JSON 不变");
+    assert_eq!(list[0]["name"], "owner-ap");
     // 重名 409 / 非法名 400 / 桶不存在 404 / 坏策略 400
     assert_eq!(
         create(
@@ -1968,7 +1978,13 @@ async fn fail_closed_and_bucket_delete_cascade() {
         204
     );
     assert!(
-        e.st.db.get_access_point("cas-ap").await.unwrap().is_none(),
+        e.st
+            .db
+            .control_store()
+            .access_point("cas-ap")
+            .await
+            .unwrap()
+            .is_none(),
         "删桶应级联删除 AP 行"
     );
     assert!(e.st.ap_cache.get("cas-ap").is_none(), "删桶应失效 AP 缓存");
@@ -3166,7 +3182,6 @@ async fn seed_vpce_fixture(e: &Env, vpce: &str) -> (String, String) {
         AccessPoint::from_row(
             "vpce-ap".into(),
             "vpceb".into(),
-            uid,
             Some(policy),
             &e.st.ap_region,
             &account,

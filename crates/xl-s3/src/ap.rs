@@ -478,7 +478,6 @@ impl ApContext {
 pub struct AccessPoint {
     pub name: String,
     pub bucket: String,
-    pub owner_id: i64,
     /// 账户命名空间 v1：**桶主**的 12 位账户（不是 AP 创建者；admin/NULL 桶 = 系统账户）。
     pub account: String,
     pub policy: Option<ApPolicy>,
@@ -508,7 +507,6 @@ impl AccessPoint {
     pub fn from_row(
         name: String,
         bucket: String,
-        owner_id: i64,
         policy_json: Option<String>,
         region: &str,
         account: &str,
@@ -520,7 +518,6 @@ impl AccessPoint {
         Ok(Self {
             name,
             bucket,
-            owner_id,
             account: account.to_string(),
             policy,
             region: region.to_string(),
@@ -2863,7 +2860,6 @@ mod tests {
         cache.put(AccessPoint {
             name: "ap1".into(),
             bucket: "bkt".into(),
-            owner_id: 7,
             account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(policy),
             region: "us-east-1".into(),
@@ -3037,7 +3033,6 @@ mod tests {
         AccessPoint {
             name: name.into(),
             bucket: "bkt".into(),
-            owner_id: 7,
             account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(serde_json::from_str(policy).unwrap()),
             region: "us-east-1".into(),
@@ -3895,7 +3890,6 @@ mod tests {
             AccessPoint {
                 name: name.into(),
                 bucket: "bkt".into(),
-                owner_id: 7,
                 account: crate::access::LEGACY_ACCOUNT.into(),
                 policy: Some(policy),
                 region: "us-east-1".into(),
@@ -4188,7 +4182,6 @@ mod tests {
         let ap = AccessPoint {
             name: "ap1".into(),
             bucket: "bkt".into(),
-            owner_id: 7,
             account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(
                 parse(
@@ -4237,7 +4230,6 @@ mod tests {
         let mk = |principal: &str| AccessPoint {
             name: "ap1".into(),
             bucket: "bkt".into(),
-            owner_id: 7,
             account: crate::access::LEGACY_ACCOUNT.into(),
             policy: Some(
                 parse(&format!(
@@ -4269,7 +4261,6 @@ mod tests {
         let mk = |name: &str, bucket: &str| AccessPoint {
             name: name.into(),
             bucket: bucket.into(),
-            owner_id: 1,
             account: crate::access::LEGACY_ACCOUNT.into(),
             policy: None,
             region: "us-east-1".into(),
@@ -4295,7 +4286,6 @@ mod tests {
         let mk = |name: &str, bucket: &str| AccessPoint {
             name: name.into(),
             bucket: bucket.into(),
-            owner_id: 1,
             account: crate::access::LEGACY_ACCOUNT.into(),
             policy: None,
             region: "us-east-1".into(),
@@ -4366,7 +4356,6 @@ mod tests {
         let mk = |account: &str, principal: &str, resource: &str| AccessPoint {
             name: "ap1".into(),
             bucket: "bkt".into(),
-            owner_id: 7,
             account: account.into(),
             policy: Some(
                 parse(&format!(

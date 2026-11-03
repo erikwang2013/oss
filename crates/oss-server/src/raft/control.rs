@@ -43,28 +43,30 @@ impl PostCommit {
 
     /// S7.2：快照安装提交后，按新控制表重建本节点缓存与桶目录（数据站点）。
     pub async fn after_snapshot_install(&self) {
-        match self.db.list_access_points(None).await {
+        match self.db.control_store().access_points().await {
             Ok(rows) => {
-                let aps: Vec<_> = rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        let account = row.account();
-                        match xl_s3::ap::AccessPoint::from_row(
-                            row.name,
-                            row.bucket,
-                            row.owner_id,
-                            row.policy_json,
-                            &self.region,
-                            &account,
-                        ) {
-                            Ok(ap) => Some(ap),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "快照安装后 AP 行无效（跳过缓存）");
-                                None
-                            }
+                let mut aps = Vec::new();
+                for row in rows {
+                    let account = match self.db.bucket_account(&row.bucket).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(error = %e, ap = %row.name, "快照安装后解析桶账户失败（跳过缓存）");
+                            continue;
                         }
-                    })
-                    .collect();
+                    };
+                    match xl_s3::ap::AccessPoint::from_row(
+                        row.name,
+                        row.bucket,
+                        row.policy_json,
+                        &self.region,
+                        &account,
+                    ) {
+                        Ok(ap) => aps.push(ap),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "快照安装后 AP 行无效（跳过缓存）");
+                        }
+                    }
+                }
                 self.ap_cache.replace_all(aps);
             }
             Err(e) => tracing::warn!(error = %e, "快照安装后读取 AP 失败"),
@@ -134,24 +136,27 @@ impl PostCommit {
                 }
                 tracing::warn!(bucket = %name, "删桶目录重试耗尽，留待启动对账");
             }
-            SideEffect::ApReload(name) => match self.db.get_access_point(&name).await {
-                Ok(Some(row)) => {
-                    let account = row.account();
-                    match xl_s3::ap::AccessPoint::from_row(
-                        row.name,
-                        row.bucket,
-                        row.owner_id,
-                        row.policy_json,
-                        &self.region,
-                        &account,
-                    ) {
-                        Ok(ap) => self.ap_cache.put(ap),
-                        Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新失败"),
-                    }
+            SideEffect::ApReload(name) => {
+                match self.db.control_store().access_point(&name).await {
+                    Ok(Some(row)) => match self.db.bucket_account(&row.bucket).await {
+                        Ok(account) => match xl_s3::ap::AccessPoint::from_row(
+                            row.name,
+                            row.bucket,
+                            row.policy_json,
+                            &self.region,
+                            &account,
+                        ) {
+                            Ok(ap) => self.ap_cache.put(ap),
+                            Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新失败"),
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, ap = %name, "AP 缓存刷新解析桶账户失败")
+                        }
+                    },
+                    Ok(None) => self.ap_cache.remove(&name),
+                    Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新回查失败"),
                 }
-                Ok(None) => self.ap_cache.remove(&name),
-                Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新回查失败"),
-            },
+            }
             SideEffect::ApRemove(name) => self.ap_cache.remove(&name),
             SideEffect::ApInvalidateBucket(bucket) => self.ap_cache.invalidate_bucket(&bucket),
             SideEffect::OlapRemove(name) => self.olap_cache.remove(&name),
@@ -857,5 +862,49 @@ mod tests {
         post.run_one(SideEffect::BucketDirCreate("pcb2".into()))
             .await;
         assert!(store.bucket_exists("pcb2").await.unwrap());
+    }
+
+    /// 快照安装后 AP/OLAP 缓存按新控制表重建（seam 读路径）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_snapshot_install_rebuilds_ap_and_olap_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        // 普通 connect：after_snapshot_install 只读控制表并重建缓存，不依赖 apply ctx。
+        let db = Arc::new(Db::connect("sqlite::memory:").await.unwrap());
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        db.create_access_point("ap1", "b1", alice, None, 1)
+            .await
+            .unwrap();
+        db.set_olap_config(
+            "ap1",
+            "http",
+            Some("https://x"),
+            None,
+            None,
+            5000,
+            1024,
+            2,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(
+            xl_store::store::Store::open(xl_store::store::StoreConfig::new(
+                dir.path().join("data"),
+            ))
+            .await
+            .unwrap(),
+        );
+        let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
+        let olap_cache = Arc::new(xl_s3::olap::OlapCache::new());
+        let post = PostCommit::new(
+            db,
+            Arc::clone(&store),
+            Arc::clone(&ap_cache),
+            Arc::clone(&olap_cache),
+            "us-east-1".into(),
+        );
+        post.after_snapshot_install().await;
+        let ap = ap_cache.get("ap1").expect("AP cache rebuilt");
+        assert_eq!(ap.bucket, "b1");
+        assert!(olap_cache.get("ap1").is_ok(), "OLAP cache rebuilt");
     }
 }

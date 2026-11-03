@@ -204,75 +204,6 @@ fn inventory_run_row(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
     }
 }
 
-/// 访问点行（M8 S1）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct AccessPointRow {
-    pub name: String,
-    pub bucket: String,
-    /// AP 创建者 uid（不是账户来源；账户取桶主）。
-    pub owner_id: i64,
-    pub policy_json: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    /// 桶主 uid（NULL = 无主桶或本节点无桶行）。
-    pub bucket_owner_id: Option<i64>,
-    /// 桶主是否管理员（管理员桶归系统账户）。
-    pub bucket_owner_is_admin: bool,
-}
-
-impl AccessPointRow {
-    /// 账户命名空间 v1：AP ARN 的账户段 = 桶账户。
-    pub fn account(&self) -> String {
-        xl_s3::access::bucket_account_id(self.bucket_owner_id, self.bucket_owner_is_admin)
-    }
-}
-
-/// AP 行查询：联桶主与管理员标记（账户命名空间 v1）；本节点无桶行 → NULL → 系统账户。
-const AP_ROW_SELECT_BASE: &str = "SELECT ap.name, ap.bucket, ap.owner_id, ap.policy_json, \
-     ap.created_at, ap.updated_at, b.owner_id AS bucket_owner_id, \
-     COALESCE(u.is_admin, 0) AS bucket_owner_is_admin \
-     FROM access_points ap LEFT JOIN buckets b ON b.name = ap.bucket \
-     LEFT JOIN users u ON u.id = b.owner_id";
-
-fn ap_row(r: &sqlx::sqlite::SqliteRow) -> AccessPointRow {
-    AccessPointRow {
-        name: r.get("name"),
-        bucket: r.get("bucket"),
-        owner_id: r.get("owner_id"),
-        policy_json: r.get("policy_json"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
-        bucket_owner_id: r.get("bucket_owner_id"),
-        bucket_owner_is_admin: r.get::<i64, _>("bucket_owner_is_admin") != 0,
-    }
-}
-
-/// 变换器配置行（M8 S2）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct OlapConfigRow {
-    pub access_point: String,
-    pub kind: String,
-    pub endpoint: Option<String>,
-    pub module: Option<Vec<u8>>,
-    pub module_sha256: Option<String>,
-    pub timeout_ms: i64,
-    pub max_response_bytes: i64,
-    pub updated_at: i64,
-}
-
-fn olap_row(r: &sqlx::sqlite::SqliteRow) -> OlapConfigRow {
-    OlapConfigRow {
-        access_point: r.get("access_point"),
-        kind: r.get("kind"),
-        endpoint: r.get("endpoint"),
-        module: r.get("module"),
-        module_sha256: r.get("module_sha256"),
-        timeout_ms: r.get("timeout_ms"),
-        max_response_bytes: r.get("max_response_bytes"),
-        updated_at: r.get("updated_at"),
-    }
-}
-
 /// 领取到的任务（worker 执行输入）。
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
@@ -1159,38 +1090,6 @@ impl Db {
         Ok(())
     }
 
-    pub async fn get_access_point(&self, name: &str) -> Result<Option<AccessPointRow>> {
-        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "{AP_ROW_SELECT_BASE} WHERE ap.name = ?"
-        )))
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| ap_row(&r)))
-    }
-
-    /// `bucket=None` → 全部（缓存预加载）；Some → 该桶（级联失效/列举）。
-    pub async fn list_access_points(&self, bucket: Option<&str>) -> Result<Vec<AccessPointRow>> {
-        let rows = match bucket {
-            Some(b) => {
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "{AP_ROW_SELECT_BASE} WHERE ap.bucket = ? ORDER BY ap.name"
-                )))
-                .bind(b)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "{AP_ROW_SELECT_BASE} ORDER BY ap.name"
-                )))
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        Ok(rows.iter().map(ap_row).collect())
-    }
-
     /// 账户命名空间 v1：桶主的 12 位账户 ID（NULL/管理员桶 = 系统账户）。
     /// 本节点无桶行（非 Raft 集群）时同样回落到系统账户。
     pub async fn bucket_account(&self, bucket: &str) -> Result<String> {
@@ -1245,28 +1144,6 @@ impl Db {
     }
 
     // ---------- M8（S2）：Object Lambda 变换器 ----------
-
-    pub async fn get_olap_config(&self, name: &str) -> Result<Option<OlapConfigRow>> {
-        let row = sqlx::query(
-            "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
-             max_response_bytes, updated_at FROM olap_configs WHERE access_point = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| olap_row(&r)))
-    }
-
-    /// 启动预加载用（全部）。
-    pub async fn list_olap_configs(&self) -> Result<Vec<OlapConfigRow>> {
-        let rows = sqlx::query(
-            "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
-             max_response_bytes, updated_at FROM olap_configs ORDER BY access_point",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(olap_row).collect())
-    }
 
     /// 每 AP 至多一条（PK upsert）；保存前已由调用方编译校验。
     #[allow(clippy::too_many_arguments)]
@@ -4590,20 +4467,20 @@ mod tests {
         ))
         .await
         .unwrap();
-        db.create_access_point("ap1", "b1", 7, None, 1)
+        let u7 = db.create_user("u7", "pw", false).await.unwrap();
+        let u8 = db.create_user("u8", "pw", false).await.unwrap();
+        db.create_access_point("ap1", "b1", u7, None, 1)
             .await
             .unwrap();
-        db.create_access_point("ap2", "b2", 8, Some(r#"{"Statement":[]}"#), 2)
+        db.create_access_point("ap2", "b2", u8, Some(r#"{"Statement":[]}"#), 2)
             .await
             .unwrap();
-        let a = db.get_access_point("ap1").await.unwrap().unwrap();
+        let store = db.control_store();
+        let a = store.access_point("ap1").await.unwrap().unwrap();
         assert_eq!(a.bucket, "b1");
-        assert_eq!(a.owner_id, 7);
+        assert_eq!(a.owner, OwnerRef::User("u7".into()));
         assert!(a.policy_json.is_none());
-        assert_eq!(db.list_access_points(None).await.unwrap().len(), 2);
-        let b1 = db.list_access_points(Some("b1")).await.unwrap();
-        assert_eq!(b1.len(), 1);
-        assert_eq!(b1[0].name, "ap1");
+        assert_eq!(store.access_points().await.unwrap().len(), 2);
         // 更新策略 + 清空
         assert!(
             db.set_access_point_policy("ap1", Some(r#"{"Statement":[]}"#), 3)
@@ -4611,7 +4488,8 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            db.get_access_point("ap1")
+            store
+                .access_point("ap1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -4620,7 +4498,8 @@ mod tests {
         );
         db.set_access_point_policy("ap1", None, 4).await.unwrap();
         assert!(
-            db.get_access_point("ap1")
+            store
+                .access_point("ap1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -4628,7 +4507,7 @@ mod tests {
                 .is_none()
         );
         assert!(db.delete_access_point("ap2").await.unwrap());
-        assert!(db.get_access_point("ap2").await.unwrap().is_none());
+        assert!(store.access_point("ap2").await.unwrap().is_none());
         assert!(!db.delete_access_point("missing").await.unwrap());
     }
 

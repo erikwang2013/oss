@@ -65,7 +65,6 @@ async fn seed(st: &AppState, bucket: &str, ap: &str) {
         AccessPoint::from_row(
             ap.into(),
             bucket.into(),
-            0,
             None,
             REGION,
             xl_s3::access::LEGACY_ACCOUNT,
@@ -273,7 +272,8 @@ async fn path_site_apply_commit_failure_keeps_cache() {
     // 事务回滚：AP 行仍在（clear 未提交）。
     assert!(
         st.db
-            .get_access_point("sitefail-ap")
+            .control_store()
+            .access_point("sitefail-ap")
             .await
             .unwrap()
             .is_some()

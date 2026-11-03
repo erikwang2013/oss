@@ -18,6 +18,7 @@ use crate::raft::{ControlCommand, ControlResponse};
 use crate::state::AppState;
 use xl_s3::ap::{AccessPoint, ApSource, valid_ap_name};
 use xl_s3::olap::OlapTransform;
+use xl_store::control_store::OwnerRef;
 
 /// `/api/v1/access-points`（挂 console nest 下；JWT 已由外层 JwtLayer 校验）。
 pub fn routes() -> Router<AppState> {
@@ -48,15 +49,15 @@ fn now() -> i64 {
 }
 
 #[allow(clippy::result_large_err)]
-async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool), Response> {
+async fn who(state: &AppState, payload: &JwtPayload) -> Result<(i64, bool, String), Response> {
     let uid: i64 = payload
         .sub()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "invalid token payload").into_response())?;
     match state.db.get_user(uid).await {
-        Ok(Some((_, admin, true))) => match state.db.account_active(uid).await {
+        Ok(Some((username, admin, true))) => match state.db.account_active(uid).await {
             // AC-1：账户停用 → 旧 JWT 立即作废
-            Ok(true) => Ok((uid, admin)),
+            Ok(true) => Ok((uid, admin, username)),
             Ok(false) => Err((StatusCode::UNAUTHORIZED, "用户不存在或已失效").into_response()),
             Err(e) => {
                 tracing::error!(error = %e, "AP 鉴权查询失败");
@@ -77,9 +78,9 @@ fn bad(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
 
-fn row_json(r: &crate::db::AccessPointRow) -> serde_json::Value {
+fn row_json(r: &xl_store::control_store::AccessPointEntry, owner_id: i64) -> serde_json::Value {
     serde_json::json!({
-        "name": r.name, "bucket": r.bucket, "owner_id": r.owner_id,
+        "name": r.name, "bucket": r.bucket, "owner_id": owner_id,
         // 别名确定性地由名字派生，不落库（改名不存在，删建即换）。
         "alias": format!("{}{}", r.name, xl_s3::ap::ALIAS_SUFFIX),
         "policy": r.policy_json.as_ref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
@@ -91,18 +92,29 @@ async fn list(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
 ) -> Response {
-    let (uid, admin) = match who(&state, &payload).await {
+    let (_, admin, caller_username) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
-    match state.db.list_access_points(None).await {
-        Ok(rows) => Json(
-            rows.iter()
-                .filter(|r| admin || r.owner_id == uid)
-                .map(row_json)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+    match state.db.control_store().access_points().await {
+        Ok(rows) => {
+            let mut out = Vec::new();
+            for r in rows
+                .iter()
+                .filter(|r| admin || matches!(&r.owner, OwnerRef::User(u) if u == &caller_username))
+            {
+                let owner_id = match state.db.owner_uid(&r.owner).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = %e, "AP 属主解析失败");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                            .into_response();
+                    }
+                };
+                out.push(row_json(r, owner_id));
+            }
+            Json(out).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "列 AP 失败");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -123,7 +135,7 @@ async fn create(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<CreateAp>,
 ) -> Response {
-    let (uid, admin) = match who(&state, &payload).await {
+    let (uid, admin, _) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -236,7 +248,6 @@ async fn create(
             if let Ok(ap) = AccessPoint::from_row(
                 body.name.clone(),
                 body.bucket.clone(),
-                uid,
                 policy_json,
                 &state.ap_region,
                 &account,
@@ -264,9 +275,9 @@ async fn owned(
     state: &AppState,
     payload: &JwtPayload,
     name: &str,
-) -> Result<(crate::db::AccessPointRow, i64), Response> {
-    let (uid, admin) = who(state, payload).await?;
-    let Some(row) = (match state.db.get_access_point(name).await {
+) -> Result<(xl_store::control_store::AccessPointEntry, i64), Response> {
+    let (uid, admin, _) = who(state, payload).await?;
+    let Some(row) = (match state.db.control_store().access_point(name).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "查 AP 失败");
@@ -292,7 +303,13 @@ async fn get_one(
     Path(name): Path<String>,
 ) -> Response {
     match owned(&state, &payload, &name).await {
-        Ok((row, _)) => Json(row_json(&row)).into_response(),
+        Ok((row, _)) => match state.db.owner_uid(&row.owner).await {
+            Ok(owner_id) => Json(row_json(&row, owner_id)).into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "AP 属主解析失败");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        },
         Err(r) => r,
     }
 }
@@ -421,11 +438,16 @@ async fn put_policy(
                     }),
                 )
                 .await;
-            let account = row.account();
+            let account = match state.db.bucket_account(&row.bucket).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(error = %e, "AP 策略更新后解析桶账户失败");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+                }
+            };
             if let Ok(ap) = AccessPoint::from_row(
                 row.name,
                 row.bucket,
-                row.owner_id,
                 policy_json,
                 &state.ap_region,
                 &account,
@@ -461,7 +483,7 @@ async fn get_transform(
     if let Err(r) = owned(&state, &payload, &name).await {
         return r;
     }
-    match state.db.get_olap_config(&name).await {
+    match state.db.control_store().olap_config(&name).await {
         Ok(Some(c)) => Json(serde_json::json!({
             "kind": c.kind,
             "endpoint": c.endpoint,
@@ -597,7 +619,8 @@ async fn put_transform(
 
 /// 启动预加载：DB 行 → 编译产物入缓存。坏配置存 broken 占位（GET 500，fail-closed）。
 pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3::olap::OlapCache) {
-    let rows = match db.list_olap_configs().await {
+    let store = db.control_store();
+    let rows = match store.olap_configs().await {
         Ok(rows) => rows,
         Err(e) => {
             // 无法得知哪些 AP 有变换器：保持未加载，AP 请求 500（不得静默直通原文）。
@@ -610,7 +633,7 @@ pub async fn preload_olap(db: &Db, ap_cache: &xl_s3::ap::ApCache, cache: &xl_s3:
         // AP 预加载可能失败/未含此 AP；直接回查 DB 拿桶名，不能因此跳过变换器。
         let bucket = match ap_cache.get(&r.access_point) {
             Some(ap) => ap.bucket,
-            None => match db.get_access_point(&r.access_point).await {
+            None => match store.access_point(&r.access_point).await {
                 Ok(Some(row)) => row.bucket,
                 Ok(None) => {
                     tracing::error!(ap = %r.access_point, "变换器预加载失败：AP 不存在");
@@ -650,23 +673,22 @@ pub struct DbApSource {
 #[async_trait::async_trait]
 impl ApSource for DbApSource {
     async fn lookup(&self, name: &str) -> Result<Option<AccessPoint>, String> {
-        let row = self
+        let Some(row) = self
             .db
-            .get_access_point(name)
+            .control_store()
+            .access_point(name)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let account = self
+            .db
+            .bucket_account(&row.bucket)
             .await
             .map_err(|e| e.to_string())?;
-        row.map(|r| {
-            let account = r.account();
-            AccessPoint::from_row(
-                r.name,
-                r.bucket,
-                r.owner_id,
-                r.policy_json,
-                &self.region,
-                &account,
-            )
-        })
-        .transpose()
+        AccessPoint::from_row(row.name, row.bucket, row.policy_json, &self.region, &account)
+            .map(Some)
     }
 }
 
@@ -683,7 +705,7 @@ async fn list_vpc_endpoints(
     State(state): State<AppState>,
     Extension(payload): Extension<JwtPayload>,
 ) -> Response {
-    let (_, admin) = match who(&state, &payload).await {
+    let (_, admin, _) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -715,7 +737,7 @@ async fn upsert_vpc_endpoint(
     Extension(payload): Extension<JwtPayload>,
     Json(body): Json<VpcEndpointBody>,
 ) -> Response {
-    let (_, admin) = match who(&state, &payload).await {
+    let (_, admin, _) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -758,7 +780,7 @@ async fn delete_vpc_endpoint(
     Extension(payload): Extension<JwtPayload>,
     Path(vpce_id): Path<String>,
 ) -> Response {
-    let (_, admin) = match who(&state, &payload).await {
+    let (_, admin, _) = match who(&state, &payload).await {
         Ok(v) => v,
         Err(r) => return r,
     };

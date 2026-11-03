@@ -240,20 +240,31 @@ pub async fn create_batch(
         (BatchOp::Invoke, Some(ap)) => {
             let Some(row) = state
                 .db
-                .get_access_point(ap)
+                .control_store()
+                .access_point(ap)
                 .await
                 .map_err(|e| BatchError::Internal(e.to_string()))?
             else {
                 return Err(BatchError::NotFound(format!("access point {ap} 不存在")));
             };
-            if !is_admin && row.owner_id != uid {
+            let caller_username = state
+                .db
+                .get_user(uid)
+                .await
+                .map_err(|e| BatchError::Internal(e.to_string()))?
+                .map(|(name, _, _)| name);
+            let owner_ok = matches!(&row.owner,
+                xl_store::control_store::OwnerRef::User(n)
+                    if caller_username.as_deref() == Some(n.as_str()));
+            if !is_admin && !owner_ok {
                 return Err(BatchError::Denied(
                     "transform access point 需 owner/admin".into(),
                 ));
             }
             let cfg = state
                 .db
-                .get_olap_config(ap)
+                .control_store()
+                .olap_config(ap)
                 .await
                 .map_err(|e| BatchError::Internal(e.to_string()))?
                 .ok_or_else(|| invalid("transform access point 未配置变换器"))?;

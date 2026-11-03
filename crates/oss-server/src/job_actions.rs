@@ -289,8 +289,8 @@ impl BatchExecutor {
         bucket: &str,
         key: &str,
         copy_src: Option<(&str, &str)>,
-    ) -> Result<AuthedUser, String> {
-        let Some((_, is_admin, active)) =
+    ) -> Result<(AuthedUser, String), String> {
+        let Some((username, is_admin, active)) =
             self.db.get_user(p.uid).await.map_err(|e| e.to_string())?
         else {
             return Err("创建者账号已不存在".into());
@@ -308,7 +308,7 @@ impl BatchExecutor {
             .check_op(&user, "", op, Some(bucket), Some(key), copy_src)
             .await
         {
-            Ok((true, _)) => Ok(user),
+            Ok((true, _)) => Ok((user, username)),
             Ok((false, detail)) => {
                 Err(detail.unwrap_or_else(|| format!("无权 {op} {bucket}/{key}")))
             }
@@ -552,26 +552,29 @@ impl BatchExecutor {
     }
 
     async fn invoke(&self, p: &BatchActionPayload) -> Result<String, String> {
-        let user = self.author(p, "GetObject", &p.bucket, &p.key, None).await?;
+        let (user, username) = self.author(p, "GetObject", &p.bucket, &p.key, None).await?;
         let ap = p
             .transform_access_point
             .as_deref()
             .ok_or("缺少 transform_access_point")?;
         let Some(row) = self
             .db
-            .get_access_point(ap)
+            .control_store()
+            .access_point(ap)
             .await
             .map_err(|e| e.to_string())?
         else {
             return Err(format!("access point {ap} 不存在"));
         };
-        if !user.is_admin && row.owner_id != user.uid {
+        let owner_ok = matches!(&row.owner, xl_store::control_store::OwnerRef::User(n) if n == &username);
+        if !user.is_admin && !owner_ok {
             return Err("transform access point 需 owner/admin".into());
         }
         // 配置可能在创建后被改成 wasm：执行前复核一次。
         let cfg = self
             .db
-            .get_olap_config(ap)
+            .control_store()
+            .olap_config(ap)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("transform access point 未配置变换器")?;
