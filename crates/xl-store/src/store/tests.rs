@@ -2905,6 +2905,8 @@ pub struct InProcessMesh {
     /// Phase 0 round 3：peer 证书协议能力位覆盖（模拟 693a7a7 节点：有 fenced_meta
     /// 但不理解证书协议；缺省 = 真实值 true）。
     control_quorum: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    /// Phase 3 前置：peer raw 扫描能力位覆盖（旧节点缺省 = 真实值 true）。
+    control_raw: std::sync::Mutex<std::collections::HashMap<String, bool>>,
     /// DP-1：到达对端的 ListLocal 请求记录（断言「旧版不会收到新语义标志」）。
     list_requests: std::sync::Mutex<Vec<(String, crate::mesh::ListLocal)>>,
     /// 测试仪器：ListLocal 并发峰值（验证目录列举的 peer 扇出）。
@@ -2943,6 +2945,7 @@ impl InProcessMesh {
             versions: Default::default(),
             fenced_meta: Default::default(),
             control_quorum: Default::default(),
+            control_raw: Default::default(),
             list_requests: Default::default(),
             list_inflight: Default::default(),
             list_max_inflight: Default::default(),
@@ -3034,6 +3037,15 @@ impl InProcessMesh {
     /// `fenced_meta` 但读不到提交证书语义）。
     pub fn set_control_quorum(&self, node: &str, v: Option<bool>) {
         let mut m = self.control_quorum.lock().unwrap();
+        match v {
+            Some(v) => m.insert(node.to_string(), v),
+            None => m.remove(node),
+        };
+    }
+
+    /// Phase 3 前置：伪造某 peer 的 raw 扫描能力位（模拟不认 `ReadControlRaw` 的旧节点）。
+    pub fn set_control_raw(&self, node: &str, v: Option<bool>) {
+        let mut m = self.control_raw.lock().unwrap();
         match v {
             Some(v) => m.insert(node.to_string(), v),
             None => m.remove(node),
@@ -3142,6 +3154,7 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         let version = self.versions.lock().unwrap().get(node).copied();
         let fenced = self.fenced_meta.lock().unwrap().get(node).copied();
         let control_quorum = self.control_quorum.lock().unwrap().get(node).copied();
+        let control_raw = self.control_raw.lock().unwrap().get(node).copied();
         self.health_log
             .lock()
             .unwrap()
@@ -3155,6 +3168,9 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         }
         if let Some(v) = control_quorum {
             h.control_quorum = v;
+        }
+        if let Some(v) = control_raw {
+            h.control_raw = v;
         }
         Ok(h)
     }
@@ -3252,6 +3268,13 @@ impl crate::mesh::MeshTransport for InProcessMesh {
         r: crate::mesh::MetaRead,
     ) -> crate::error::Result<crate::mesh::MetaSnapshot> {
         self.peer(n).await?.mesh_read_meta(r).await
+    }
+    async fn read_control_raw(
+        &self,
+        n: &str,
+        r: crate::mesh::MetaRead,
+    ) -> crate::error::Result<crate::mesh::ControlRawResp> {
+        self.peer(n).await?.mesh_read_control_raw(r).await
     }
     async fn delete_meta(&self, n: &str, r: crate::mesh::MetaRead) -> crate::error::Result<()> {
         self.peer(n).await?.mesh_delete_meta(r).await

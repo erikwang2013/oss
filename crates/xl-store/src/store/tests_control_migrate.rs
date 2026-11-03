@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::layout;
-use crate::mesh::MetaRead;
+use crate::mesh::{MeshTransport as _, MetaRead};
 use crate::meta::XlMeta;
 
 /// 所有副本原样返回（含 `control_committed=None`），忽略 `.new` 暂存；命名空间外拒绝。
@@ -72,4 +72,45 @@ async fn mesh_read_control_raw_returns_all_copies_ignoring_certificate() {
             "实得：{err:?}"
         );
     }
+}
+
+/// 混版门禁：任一 peer 未宣告 `control_raw` → `PeerIncompatible`（旧节点会静默忽略
+/// 新 RPC，能力位是唯一防线）；恢复真实值后放行。
+#[tokio::test]
+async fn control_raw_gate_rejects_missing_capability() {
+    let c = Cluster::new(4, 3).await;
+    c.mesh.set_control_raw("n2", Some(false));
+    let err = c.stores[0]
+        .ensure_control_raw_compatible()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::PeerIncompatible(_)),
+        "实得：{err:?}"
+    );
+    c.mesh.set_control_raw("n2", None);
+    c.stores[0]
+        .ensure_control_raw_compatible()
+        .await
+        .expect("能力恢复后必须放行");
+}
+
+/// InProcessMesh 传输转发：节点 0 的 transport 读节点 2（n3，槽 6..8）的原始副本。
+#[tokio::test]
+async fn in_process_mesh_forwards_control_raw() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/transport-forward";
+    c.stores[2]
+        .put_system_object(k, b"v1", None, 1)
+        .await
+        .unwrap();
+    let r = MetaRead {
+        bucket: layout::SYS_DIR.into(),
+        key: k.into(),
+    };
+    let resp = c.mesh.read_control_raw("n3", r).await.unwrap();
+    assert_eq!(resp.slots_ok, 3, "n3 的 3 盘全部被观察");
+    let mut slots: Vec<u16> = resp.copies.iter().map(|c| c.slot).collect();
+    slots.sort_unstable();
+    assert_eq!(slots, vec![6, 7, 8]);
 }

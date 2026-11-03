@@ -747,6 +747,29 @@ impl MeshTransport for TonicMesh {
             .into_inner();
         check_write(node, resp)
     }
+    async fn read_control_raw(
+        &self,
+        node: &str,
+        r: mesh::MetaRead,
+    ) -> Result<mesh::ControlRawResp> {
+        let resp = self
+            .client(node)?
+            .read_control_raw(meta_read_to_proto(r))
+            .await
+            .map_err(|e| rpc_err(node, e))?
+            .into_inner();
+        Ok(mesh::ControlRawResp {
+            copies: resp
+                .copies
+                .into_iter()
+                .map(|c| mesh::ControlRawCopy {
+                    slot: c.slot as u16,
+                    meta: bytes::Bytes::from(c.meta),
+                })
+                .collect(),
+            slots_ok: resp.slots_ok,
+        })
+    }
     async fn delete_bucket_dir(&self, node: &str, bucket: &str) -> Result<()> {
         let resp = self
             .client(node)?
@@ -2375,6 +2398,78 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("bucket not empty"), "实得：{e}");
+    }
+
+    /// Phase 3 前置：`ReadControlRaw` 经真实 tonic 往返——每盘原始字节与盘上一致。
+    #[tokio::test]
+    async fn control_raw_roundtrip() {
+        use xl_store::layout;
+        let tmp: Vec<tempfile::TempDir> = (0..4)
+            .map(|_| tempfile::TempDir::new().unwrap())
+            .collect();
+        let dirs: Vec<std::path::PathBuf> = tmp.iter().map(|d| d.path().to_path_buf()).collect();
+        let addr = free_addr().await;
+        let nodes = vec![("n1".to_string(), addr.to_string())];
+        let mesh = Arc::new(TonicMesh::new("n1", "tok", &nodes).unwrap());
+        // 2+2：Q_s = 3，N = 4 ≥ data+2 且 2Q_s > N（控制写/读门槛都成立）。
+        let ec = ec::EcConfig {
+            data: 2,
+            parity: 2,
+            enabled: true,
+        };
+        let topo_nodes = vec![NodeSpec {
+            id: "n1".into(),
+            addr: addr.to_string(),
+            drive_count: 4,
+        }];
+        let sets = ClusterSets::single("n1", topo_nodes, &ec).unwrap();
+        let mut cfg = StoreConfig::new(&dirs[0]);
+        cfg.drives = dirs.clone();
+        cfg.ec = ec;
+        cfg.fsync = false;
+        cfg.cluster = Some(Arc::new(ClusterConfig {
+            placement_v2: false,
+            sets,
+            transport: mesh.clone(),
+            resolver: None,
+            stretch: false,
+        }));
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let s2 = store.clone();
+        tokio::spawn(async move {
+            let _ = serve(s2, addr, "tok".into()).await;
+        });
+        let mut up = false;
+        for _ in 0..40 {
+            if mesh.health("n1").await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(up, "server 未就绪");
+
+        let k = "control/raw-roundtrip";
+        store.put_system_object(k, b"v1", None, 1).await.unwrap();
+        let resp = mesh
+            .read_control_raw(
+                "n1",
+                mesh::MetaRead {
+                    bucket: layout::SYS_DIR.into(),
+                    key: k.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.slots_ok, 4);
+        assert_eq!(resp.copies.len(), 3, "Q_s=3 已认证副本");
+        for cp in &resp.copies {
+            let path = layout::object_dir_for(&dirs[cp.slot as usize], layout::SYS_DIR, k)
+                .unwrap()
+                .join("xl.meta");
+            let disk = std::fs::read(path).unwrap();
+            assert_eq!(&cp.meta[..], &disk[..], "槽 {} 原始字节必须一致", cp.slot);
+        }
     }
 
     /// Task 10：拦截器注入令牌 + traceparent；服务端拦截器拒无令牌请求。

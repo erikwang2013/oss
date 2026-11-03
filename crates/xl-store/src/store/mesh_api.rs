@@ -259,6 +259,55 @@ impl Store {
         futures::future::try_join_all(probes).await?;
         Ok(())
     }
+
+    /// Phase 3 前置：raw 扫描要求全节点现版 + `control_raw`（旧节点会静默忽略新 RPC）。
+    /// 先过既有证书协议门禁（`fenced_meta`/`control_quorum`），再查专用能力位；
+    /// **不可达同样 fail-closed**——扫描必须确定性观察全部槽，不许猜。
+    pub(in crate::store) async fn ensure_control_raw_compatible(&self) -> Result<()> {
+        self.ensure_control_quorum_compatible(false).await?;
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+        let Some(cl) = self.cfg.cluster.as_deref() else {
+            return Ok(());
+        };
+        let self_id = cl.sets.flat.self_node().id.as_str();
+        let probes = cl
+            .sets
+            .flat
+            .nodes
+            .iter()
+            .filter(|n| n.id != self_id)
+            .map(|n| {
+                let transport = &cl.transport;
+                async move {
+                    let caps = match tokio::time::timeout(PROBE_TIMEOUT, transport.peer_caps(&n.id))
+                        .await
+                    {
+                        Ok(Ok(caps)) => caps,
+                        Ok(Err(e)) => {
+                            return Err(Error::PeerIncompatible(format!(
+                                "控制 raw 扫描要求全节点可达：节点 {} 能力探测失败（{e}）",
+                                n.id
+                            )));
+                        }
+                        Err(_) => {
+                            return Err(Error::PeerIncompatible(format!(
+                                "控制 raw 扫描要求全节点可达：节点 {} 能力探测超时",
+                                n.id
+                            )));
+                        }
+                    };
+                    if !caps.control_raw {
+                        return Err(Error::PeerIncompatible(format!(
+                            "控制 raw 扫描要求全节点支持 ReadControlRaw：节点 {} control_raw=false",
+                            n.id
+                        )));
+                    }
+                    Ok(())
+                }
+            });
+        futures::future::try_join_all(probes).await?;
+        Ok(())
+    }
 }
 
 // ---------- 数据面（Task 5a/5b）：服务端入口——只操作本节点本地槽，绝不再扇出 ----------

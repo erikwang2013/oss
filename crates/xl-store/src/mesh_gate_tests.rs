@@ -213,6 +213,7 @@ fn caps(wire: u32, epoch: u64, hash: &str) -> PeerCaps {
         topo_hash: hash.into(),
         fenced_meta: true,
         control_quorum: true,
+        control_raw: true,
     }
 }
 

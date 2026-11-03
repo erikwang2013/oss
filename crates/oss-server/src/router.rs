@@ -804,6 +804,7 @@ pub(crate) fn data_plane_status(
             // 数据面状态面不评估 fenced/控制面能力（闸门在 Store 内）。
             fenced_meta: false,
             control_quorum: false,
+            control_raw: false,
         };
         match xl_store::mesh_gate::check_peer(&p.id, &caps, local) {
             Ok(xl_store::mesh_gate::PeerClass::Legacy) => {

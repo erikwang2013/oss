@@ -515,6 +515,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         topo_hash: caps.topo_hash.clone(),
         fenced_meta: true,
         control_quorum: true,
+        control_raw: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &peer, &caps).is_ok());
 
@@ -524,6 +525,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         topo_hash: caps.topo_hash.clone(),
         fenced_meta: true,
         control_quorum: true,
+        control_raw: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &stale, &caps).is_err());
 
@@ -536,6 +538,7 @@ fn mesh_gate_caps_and_peer_check_follow_explicit_epoch() {
         topo_hash: caps4.topo_hash.clone(),
         fenced_meta: true,
         control_quorum: true,
+        control_raw: true,
     };
     assert!(crate::mesh_gate::check_peer("n2", &peer4, &caps4).is_ok());
 }

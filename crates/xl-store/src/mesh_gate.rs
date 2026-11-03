@@ -22,10 +22,10 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 use crate::mesh::{
-    ControlQuery, ControlRow, ControlWrite, ListLocal, ListLocalResp, ListUploadsLocal,
-    ListUploadsLocalResp, LockReq, LockResp, MeshTransport, MetaAck, MetaRead, MetaSnapshot,
-    MetaWrite, MpuComplete, MpuPartRow, MpuPartUpload, MpuRef, NodeHealth, ShardDelete, ShardRead,
-    ShardWrite, VersionDirRef,
+    ControlQuery, ControlRawResp, ControlRow, ControlWrite, ListLocal, ListLocalResp,
+    ListUploadsLocal, ListUploadsLocalResp, LockReq, LockResp, MeshTransport, MetaAck, MetaRead,
+    MetaSnapshot, MetaWrite, MpuComplete, MpuPartRow, MpuPartUpload, MpuRef, NodeHealth,
+    ShardDelete, ShardRead, ShardWrite, VersionDirRef,
 };
 use crate::store::ObjectInfo;
 
@@ -95,6 +95,8 @@ pub struct PeerCaps {
     /// Phase 0 round 3：对端理解提交证书控制读协议（全量扇出 + token 优先选举）。
     /// `fenced_meta` 由 693a7a7 节点已宣告 → 证书协议必须另有专用位。
     pub control_quorum: bool,
+    /// Phase 3 前置：对端理解 `ReadControlRaw`；旧节点缺省 false（会静默忽略）。
+    pub control_raw: bool,
 }
 
 impl PeerCaps {
@@ -105,6 +107,7 @@ impl PeerCaps {
             topo_hash: h.topo_hash.clone(),
             fenced_meta: h.fenced_meta,
             control_quorum: h.control_quorum,
+            control_raw: h.control_raw,
         }
     }
 }
@@ -410,6 +413,12 @@ impl MeshTransport for GatedMesh {
 
     async fn control_write(&self, node: &str, w: ControlWrite) -> Result<()> {
         self.inner.control_write(node, w).await
+    }
+
+    async fn read_control_raw(&self, node: &str, r: MetaRead) -> Result<ControlRawResp> {
+        // 能力门禁在 Store 显式做（`ensure_control_raw_compatible`）；此处直通，
+        // 避免把控制面读取绑死到数据面操作类。
+        self.inner.read_control_raw(node, r).await
     }
 }
 
