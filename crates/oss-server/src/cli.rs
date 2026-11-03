@@ -32,6 +32,9 @@ pub const USAGE: &str = "\
   rebalance [--dry-run|--apply]
                  扩容搬迁（默认 dry-run）：把存量对象迁到展开放置（placement=v2；未开则空跑）；
                  逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
+  control-recertify --keys-file <path> [--apply] [--json]
+                 集群 legacy 控制对象补证书（默认 dry-run）：逐键全槽扫描，唯一同内容组
+                 ≥Q_s 才写提交证书；--apply 才落盘；任一键失败 exit 1
   cluster-shrink plan --to <target.toml> [--json]
                  shrink 只读校验（全节点 maintenance）：逐 set 槽数/parity/容量/epoch+hash/
                  退役节点 MPU 全通过才出计划；报告 .oss.sys/shrink/<old>-<new>-plan.json
@@ -97,6 +100,12 @@ pub enum Command {
     /// M4 切片 5：扩容后搬迁（dry_run 只报告）
     Rebalance {
         dry_run: bool,
+    },
+    /// Phase 3 前置：集群 legacy 控制对象补证书（默认 dry-run；需要完整 AppState）。
+    ControlRecertify {
+        keys: std::path::PathBuf,
+        apply: bool,
+        json: bool,
     },
     /// M3 shrink T4：只读生成旧→新拓扑迁移计划（校验失败退出非零）。
     ClusterShrinkPlan {
@@ -357,6 +366,17 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
         ("rebalance", []) => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--dry-run" => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--apply" => Ok(Command::Rebalance { dry_run: false }),
+        ("control-recertify", rest) => {
+            let (v, flags) = parse_flags(rest, &["--keys-file"], &["--apply", "--json"])?;
+            Ok(Command::ControlRecertify {
+                keys: v
+                    .get("--keys-file")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(USAGE)?,
+                apply: flags.contains("--apply"),
+                json: flags.contains("--json"),
+            })
+        }
         ("witness", []) => Ok(Command::Witness),
         ("raft-add-witness", rest) => {
             let (v, _) = parse_flags(rest, &["--node-id", "--endpoint", "--replace"], &[])?;
@@ -976,6 +996,9 @@ pub async fn run(
                 }
             );
             Ok(0)
+        }
+        Command::ControlRecertify { keys, apply, json } => {
+            crate::control_recertify::run(&state.store, &keys, apply, json).await
         }
         Command::Rebalance { dry_run } => {
             let report = match state.store.rebalance(dry_run).await {
@@ -2089,6 +2112,49 @@ mod tests {
             "多余参数必须拒绝"
         );
         assert!(!needs_full_state(&Command::Version));
+    }
+
+    #[test]
+    fn parse_args_reads_control_recertify() {
+        let dry = Command::ControlRecertify {
+            keys: "k.txt".into(),
+            apply: false,
+            json: false,
+        };
+        assert!(needs_full_state(&dry), "必须走完整 AppState（GatedMesh）");
+        assert_eq!(
+            parse_args(&args(&["control-recertify", "--keys-file", "k.txt"])),
+            Ok(dry)
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "control-recertify",
+                "--keys-file",
+                "k.txt",
+                "--apply",
+                "--json"
+            ])),
+            Ok(Command::ControlRecertify {
+                keys: "k.txt".into(),
+                apply: true,
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["control-recertify"])),
+            Err(USAGE),
+            "--keys-file 必填"
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "control-recertify",
+                "--keys-file",
+                "k.txt",
+                "--yes"
+            ])),
+            Err(USAGE),
+            "未知 flag 必须拒绝"
+        );
     }
 
     #[test]

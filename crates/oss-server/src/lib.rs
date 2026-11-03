@@ -12,6 +12,7 @@ pub mod cli;
 pub mod cluster_control;
 pub mod config;
 pub mod console;
+pub mod control_recertify;
 pub mod control_store;
 pub mod db;
 pub mod events;
