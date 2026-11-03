@@ -55,13 +55,8 @@ const EXT_NAME_MAX: usize = 64;
 
 /// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
 /// 管理员 id，witness 写哨兵 0）；`User(username)` = 复制用户。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "username")]
-pub enum OwnerRef {
-    Admin,
-    User(String),
-}
+/// 类型已上移到 ControlStore 缝，快照字段顺序/编码不变。
+pub use xl_store::control_store::OwnerRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

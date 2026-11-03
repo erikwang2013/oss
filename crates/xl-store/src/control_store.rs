@@ -2,11 +2,47 @@
 //! 是调用方事务内的写句柄——本模块不 begin/commit/rollback，事务边界与原子性
 //! 只由调用方（Raft apply / 快照安装）持有。
 //!
-//! 第一切片只有 `vpc_endpoints`。`VpcEndpoint` 的字段名与声明顺序必须与
-//! `oss-server/src/raft/data.rs` 的旧 `VpcEndpointRow` 完全一致（已发布快照
+//! 已迁移 `vpc_endpoints` / `access_points` / `olap_configs`。这些类型的字段名与
+//! 声明顺序必须与 `oss-server/src/raft/data.rs` 的旧快照行完全一致（已发布快照
 //! 不可改写）；增删字段必须同步升级快照格式。
 
 use serde::{Deserialize, Serialize};
+
+/// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
+/// 管理员 id，witness 写哨兵 0）；`User(username)` = 复制用户。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "username")]
+pub enum OwnerRef {
+    Admin,
+    User(String),
+}
+
+/// 访问点行（字段顺序与旧 `AccessPointRow` 快照逐字节一致）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessPointEntry {
+    pub name: String,
+    pub bucket: String,
+    pub owner: OwnerRef,
+    pub policy_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// 变换器配置行（`module` 为原始 BLOB；快照层自行 base64）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OlapConfigEntry {
+    pub access_point: String,
+    pub kind: String,
+    pub endpoint: Option<String>,
+    pub module: Option<Vec<u8>>,
+    pub module_sha256: Option<String>,
+    pub timeout_ms: i64,
+    pub max_response_bytes: i64,
+    pub updated_at: i64,
+}
 
 /// feature 8：动态 VPC 端点注册行。
 ///
@@ -135,6 +171,67 @@ mod tests {
         fn store(_: std::sync::Arc<dyn ControlStore>) {}
         fn txn(_: Box<dyn ControlTxn>) {}
         let _ = (store, txn);
+    }
+
+    /// 旧快照 AP 行的字段顺序/名字（与 raft/data.rs 的 `AccessPointRow` 一致）。
+    #[derive(Serialize)]
+    struct LegacyApRow {
+        name: String,
+        bucket: String,
+        owner: OwnerRef,
+        policy_json: Option<String>,
+        created_at: i64,
+        updated_at: i64,
+    }
+
+    #[test]
+    fn owner_ref_json_matches_snapshot_format() {
+        assert_eq!(
+            serde_json::to_string(&OwnerRef::Admin).unwrap(),
+            r#"{"kind":"admin"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OwnerRef::User("alice".into())).unwrap(),
+            r#"{"kind":"user","username":"alice"}"#
+        );
+        assert!(
+            serde_json::from_str::<OwnerRef>(r#"{"kind":"admin","username":"x"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn access_point_entry_rmp_field_order_matches_snapshot() {
+        let row = AccessPointEntry {
+            name: "ap1".into(),
+            bucket: "b1".into(),
+            owner: OwnerRef::User("alice".into()),
+            policy_json: Some(r#"{"Statement":[]}"#.into()),
+            created_at: 1,
+            updated_at: 2,
+        };
+        let bytes = rmp_serde::to_vec_named(&row).unwrap();
+        let legacy = LegacyApRow {
+            name: row.name.clone(),
+            bucket: row.bucket.clone(),
+            owner: row.owner.clone(),
+            policy_json: row.policy_json.clone(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        };
+        assert_eq!(
+            bytes,
+            rmp_serde::to_vec_named(&legacy).unwrap(),
+            "字段名与顺序必须与旧快照行逐字节一致"
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<AccessPointEntry>(&bytes).unwrap(),
+            row
+        );
+        let json = serde_json::to_vec(&row).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AccessPointEntry>(&json).unwrap(),
+            row
+        );
     }
 
     #[test]
