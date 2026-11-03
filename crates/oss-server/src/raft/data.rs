@@ -26,6 +26,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
+use xl_store::control_store::ControlTxn;
 
 use super::compat::{
     FEATURE_LEVEL_3, FEATURE_LEVEL_8, FEATURE_LEVEL_9, MAX_FEATURE_LEVEL, MIN_FEATURE_LEVEL,
@@ -212,16 +213,8 @@ pub struct AccountMemberRow {
 }
 
 /// feature 8：动态 VPC 端点注册行（随 ControlData 复制；空表时不序列化）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VpcEndpointRow {
-    pub vpce_id: String,
-    pub vpc_id: String,
-    pub account_id: String,
-    pub state: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
+/// 类型收敛到 ControlStore 缝，快照字段顺序不变（见 xl-store `VpcEndpoint`）。
+pub type VpcEndpointRow = xl_store::control_store::VpcEndpoint;
 
 /// feature 9：账户用量账本行（strict 模式的复制执行依据；空表时不序列化）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,23 +584,10 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
                 created_at: r.get("created_at"),
             });
         }
-        for r in sqlx::query(
-            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
-             FROM vpc_endpoints ORDER BY vpce_id",
-        )
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(sql)?
-        {
-            data.vpc_endpoints.push(VpcEndpointRow {
-                vpce_id: r.get("vpce_id"),
-                vpc_id: r.get("vpc_id"),
-                account_id: r.get("account_id"),
-                state: r.get("state"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            });
-        }
+        data.vpc_endpoints = crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .vpc_endpoints()
+            .await
+            .map_err(|e| DataError::Format(format!("control store: {e}")))?;
         for r in sqlx::query(
             "SELECT account_id, used_bytes, object_count FROM account_usage_ledger \
              ORDER BY account_id",
@@ -823,26 +803,11 @@ pub(crate) async fn install_tx(
     replace_accounts_tx(conn, &data.accounts, &data.account_members, ctx.canonical).await?;
 
     // 7c. 动态 VPC 端点（level 8）：无本地 id，account_id 是稳定字符串。
-    sqlx::query("DELETE FROM vpc_endpoints")
-        .execute(&mut *conn)
+    // 整表替换；事务边界由调用方持有（store 不 begin/commit）。
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_vpc_endpoints(&data.vpc_endpoints)
         .await
-        .map_err(sql)?;
-    for e in &data.vpc_endpoints {
-        sqlx::query(
-            "INSERT INTO vpc_endpoints \
-             (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&e.vpce_id)
-        .bind(&e.vpc_id)
-        .bind(&e.account_id)
-        .bind(&e.state)
-        .bind(e.created_at)
-        .bind(e.updated_at)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
+        .map_err(|e| DataError::Format(format!("control store: {e}")))?;
 
     // 7d. 账户用量账本（level 9）：整表替换；行 key 是稳定账户 id。
     sqlx::query("DELETE FROM account_usage_ledger")
@@ -1804,6 +1769,69 @@ mod tests {
         .unwrap();
         let err = read_tx(&mut tx).await.unwrap_err();
         assert!(format!("{err}").contains("global admin"), "{err}");
+    }
+
+    /// Task 4：`VpcEndpointRow` 收敛为 ControlStore 类型；导出按 `vpce_id` 升序，
+    /// 安装整表替换（目标独有行被删除），字段往返一致。
+    #[tokio::test]
+    async fn vpc_endpoints_snapshot_round_trip_through_control_txn() {
+        // 类型收敛的编译期断言（别名前 RED）。
+        let _: fn(VpcEndpointRow) -> xl_store::control_store::VpcEndpoint = std::convert::identity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "vpc-roundtrip.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        sqlx::query(
+            "INSERT INTO vpc_endpoints \
+             (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
+             VALUES ('vpce-old', 'vpc-o', '000000000001', 'active', 1, 1)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let data = ControlData {
+            vpc_endpoints: vec![
+                VpcEndpointRow {
+                    vpce_id: "vpce-b".into(),
+                    vpc_id: "vpc-b".into(),
+                    account_id: "000000000002".into(),
+                    state: "disabled".into(),
+                    created_at: 2,
+                    updated_at: 3,
+                },
+                VpcEndpointRow {
+                    vpce_id: "vpce-a".into(),
+                    vpc_id: "vpc-a".into(),
+                    account_id: "000000000001".into(),
+                    state: "active".into(),
+                    created_at: 1,
+                    updated_at: 2,
+                },
+            ],
+            ..ControlData::default()
+        };
+        let ctx = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: true,
+        };
+        install_tx(&mut tx, &data, &ctx).await.unwrap();
+        let read = read_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            read.vpc_endpoints,
+            vec![data.vpc_endpoints[1].clone(), data.vpc_endpoints[0].clone()],
+            "导出按 vpce_id 升序，安装整表替换"
+        );
+        assert_eq!(required_feature_level(&read), 8);
+        let old: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vpc_endpoints WHERE vpce_id = 'vpce-old'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(old, 0, "目标独有行被整表替换删除");
     }
 
     /// 安装 level-3 快照：成员/admin 按 username 映射到本地 id（与来源 uid 无关），
