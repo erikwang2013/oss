@@ -1442,11 +1442,11 @@ impl Db {
     /// `User(name)` → `users.id`；缺失（含无管理员）→ 0。
     pub async fn owner_uid(&self, owner: &OwnerRef) -> Result<i64> {
         let id: Option<i64> = match owner {
-            OwnerRef::Admin => sqlx::query_scalar(
-                "SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1",
-            )
-            .fetch_optional(&self.pool)
-            .await?,
+            OwnerRef::Admin => {
+                sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
             OwnerRef::User(name) => {
                 sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
                     .bind(name)
@@ -1459,10 +1459,7 @@ impl Db {
 
     /// 本地数字 id → 自然键属主（写门面用）：0 → `Admin`；用户存在 → `User`；
     /// 其余 → `RowNotFound`（uid 必须存在，不静默降级）。
-    pub async fn owner_ref(
-        &self,
-        owner_id: i64,
-    ) -> std::result::Result<OwnerRef, sqlx::Error> {
+    pub async fn owner_ref(&self, owner_id: i64) -> std::result::Result<OwnerRef, sqlx::Error> {
         if owner_id == 0 {
             return Ok(OwnerRef::Admin);
         }
@@ -4642,7 +4639,12 @@ mod tests {
             OwnerRef::User("root".into())
         );
         assert_eq!(
-            store.access_point("ap-witness").await.unwrap().unwrap().owner,
+            store
+                .access_point("ap-witness")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner,
             OwnerRef::Admin
         );
         assert_eq!(
@@ -4733,7 +4735,10 @@ mod tests {
             assert_eq!(rows[0].owner, OwnerRef::User("alice".into()));
             assert!(txn.access_point_delete("ap1").await.unwrap());
             assert!(!txn.access_point_delete("ap1").await.unwrap());
-            assert!(txn.olap_configs().await.unwrap().is_empty(), "AP 删除级联 OLAP");
+            assert!(
+                txn.olap_configs().await.unwrap().is_empty(),
+                "AP 删除级联 OLAP"
+            );
             // Admin 属主映射到本节点管理员 id；witness 由 install 测试覆盖。
             assert!(
                 txn.access_point_create(&AccessPointEntry {

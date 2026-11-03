@@ -1978,8 +1978,7 @@ async fn fail_closed_and_bucket_delete_cascade() {
         204
     );
     assert!(
-        e.st
-            .db
+        e.st.db
             .control_store()
             .access_point("cas-ap")
             .await

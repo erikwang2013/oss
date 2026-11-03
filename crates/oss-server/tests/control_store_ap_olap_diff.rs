@@ -43,7 +43,11 @@ async fn runtime_reads_match_legacy_uid_semantics() {
         got.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
         ["ap-admin", "ap-dangling", "ap-user", "ap-zero"]
     );
-    assert_eq!(got[0].owner, OwnerRef::User("root".into()), "管理员也读 User");
+    assert_eq!(
+        got[0].owner,
+        OwnerRef::User("root".into()),
+        "管理员也读 User"
+    );
     assert_eq!(got[1].owner, OwnerRef::Admin, "悬空属主宽松为 Admin");
     assert_eq!(got[2].owner, OwnerRef::User("alice".into()));
     assert_eq!(got[3].owner, OwnerRef::Admin, "owner_id=0 为 Admin");
@@ -195,7 +199,11 @@ async fn snapshot_export_and_install_match_legacy() {
         txn.replace_olap_configs(&olaps).await.unwrap();
     }
     tx.commit().await.unwrap();
-    assert_eq!(raw_aps(&store_db).await, raw_aps(&legacy).await, "AP 全表一致");
+    assert_eq!(
+        raw_aps(&store_db).await,
+        raw_aps(&legacy).await,
+        "AP 全表一致"
+    );
     assert_eq!(
         raw_olaps(&store_db).await,
         raw_olaps(&legacy).await,
@@ -222,8 +230,30 @@ async fn bucket_cascade_matches_legacy() {
         let alice = db.create_user("alice", "pw", false).await.unwrap();
         raw_ap(db, "ap-a", "b1", alice, None, 1).await;
         raw_ap(db, "ap-b", "b2", alice, None, 2).await;
-        raw_olap(db, "ap-a", "http", Some("https://x"), None, None, 5000, 1024, 3).await;
-        raw_olap(db, "ap-b", "http", Some("https://y"), None, None, 5000, 1024, 4).await;
+        raw_olap(
+            db,
+            "ap-a",
+            "http",
+            Some("https://x"),
+            None,
+            None,
+            5000,
+            1024,
+            3,
+        )
+        .await;
+        raw_olap(
+            db,
+            "ap-b",
+            "http",
+            Some("https://y"),
+            None,
+            None,
+            5000,
+            1024,
+            4,
+        )
+        .await;
     }
     sqlx::query(
         "DELETE FROM olap_configs WHERE access_point IN \
@@ -244,7 +274,11 @@ async fn bucket_cascade_matches_legacy() {
         txn.delete_access_points_for_bucket("b1").await.unwrap();
     }
     tx.commit().await.unwrap();
-    assert_eq!(raw_aps(&store_db).await, raw_aps(&legacy).await, "只删 b1 的 AP");
+    assert_eq!(
+        raw_aps(&store_db).await,
+        raw_aps(&legacy).await,
+        "只删 b1 的 AP"
+    );
     assert_eq!(raw_olaps(&store_db).await, raw_olaps(&legacy).await);
     let left = store_db.control_store().access_points().await.unwrap();
     assert_eq!(

@@ -1033,7 +1033,13 @@ async fn access_point_transform_api() {
         .unwrap();
     assert_eq!(r.status(), 204);
     assert!(st.olap_cache.get("ap-one").unwrap().is_some(), "缓存未更新");
-    let row = st.db.control_store().olap_config("ap-one").await.unwrap().unwrap();
+    let row = st
+        .db
+        .control_store()
+        .olap_config("ap-one")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.kind, "http");
     let r = client
         .get(format!("{base}/api/v1/access-points/ap-one/transform"))
@@ -1070,7 +1076,14 @@ async fn access_point_transform_api() {
         .unwrap();
     assert_eq!(r.status(), 204);
     assert!(st.olap_cache.get("ap-one").unwrap().is_none());
-    assert!(st.db.control_store().olap_config("ap-one").await.unwrap().is_none());
+    assert!(
+        st.db
+            .control_store()
+            .olap_config("ap-one")
+            .await
+            .unwrap()
+            .is_none()
+    );
     // 删桶级联：AP/变换器行与两缓存都失效
     let r = client
         .post(format!("{base}/api/v1/access-points"))
@@ -1098,7 +1111,14 @@ async fn access_point_transform_api() {
     assert_eq!(r.status(), 204);
     assert!(st.ap_cache.get("ap-two").is_none());
     assert!(st.olap_cache.get("ap-two").unwrap().is_none());
-    assert!(st.db.control_store().olap_config("ap-two").await.unwrap().is_none());
+    assert!(
+        st.db
+            .control_store()
+            .olap_config("ap-two")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// 预加载失败注入：`olap_configs` 不可读 → 缓存保持“未加载”（AP 请求 fail-closed）；

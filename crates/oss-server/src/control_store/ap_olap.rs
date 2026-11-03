@@ -44,13 +44,11 @@ fn olap_config_from(r: &SqliteRow) -> OlapConfigEntry {
     }
 }
 
-const AP_SELECT: &str =
-    "SELECT a.name, a.bucket, a.owner_id, a.policy_json, a.created_at, a.updated_at, \
+const AP_SELECT: &str = "SELECT a.name, a.bucket, a.owner_id, a.policy_json, a.created_at, a.updated_at, \
      u.username AS owner_username \
      FROM access_points a LEFT JOIN users u ON u.id = a.owner_id";
 
-const OLAP_SELECT: &str =
-    "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
+const OLAP_SELECT: &str = "SELECT access_point, kind, endpoint, module, module_sha256, timeout_ms, \
      max_response_bytes, updated_at FROM olap_configs";
 
 pub(super) async fn access_point(
@@ -105,10 +103,7 @@ pub(super) async fn olap_configs(
 
 /// `Admin` → 首个管理员 id，无管理员 → 0（witness 哨兵）；`User(name)` → users.id，
 /// 缺失且存在管理员 → Invalid，缺失且无管理员 → 0（与 apply::admin_owner_id 等价）。
-async fn resolve_owner(
-    conn: &mut SqliteConnection,
-    owner: &OwnerRef,
-) -> Result<i64, ControlError> {
+async fn resolve_owner(conn: &mut SqliteConnection, owner: &OwnerRef) -> Result<i64, ControlError> {
     let admin: Option<i64> =
         sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
             .fetch_optional(&mut *conn)
@@ -133,8 +128,7 @@ async fn resolve_owner(
     }
 }
 
-const AP_EXPORT_SELECT: &str =
-    "SELECT a.name, a.bucket, a.owner_id, a.policy_json, a.created_at, a.updated_at, \
+const AP_EXPORT_SELECT: &str = "SELECT a.name, a.bucket, a.owner_id, a.policy_json, a.created_at, a.updated_at, \
      u.username AS owner_username, u.is_admin AS owner_is_admin \
      FROM access_points a LEFT JOIN users u ON u.id = a.owner_id";
 

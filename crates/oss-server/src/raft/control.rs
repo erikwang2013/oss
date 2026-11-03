@@ -136,27 +136,25 @@ impl PostCommit {
                 }
                 tracing::warn!(bucket = %name, "删桶目录重试耗尽，留待启动对账");
             }
-            SideEffect::ApReload(name) => {
-                match self.db.control_store().access_point(&name).await {
-                    Ok(Some(row)) => match self.db.bucket_account(&row.bucket).await {
-                        Ok(account) => match xl_s3::ap::AccessPoint::from_row(
-                            row.name,
-                            row.bucket,
-                            row.policy_json,
-                            &self.region,
-                            &account,
-                        ) {
-                            Ok(ap) => self.ap_cache.put(ap),
-                            Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新失败"),
-                        },
-                        Err(e) => {
-                            tracing::warn!(error = %e, ap = %name, "AP 缓存刷新解析桶账户失败")
-                        }
+            SideEffect::ApReload(name) => match self.db.control_store().access_point(&name).await {
+                Ok(Some(row)) => match self.db.bucket_account(&row.bucket).await {
+                    Ok(account) => match xl_s3::ap::AccessPoint::from_row(
+                        row.name,
+                        row.bucket,
+                        row.policy_json,
+                        &self.region,
+                        &account,
+                    ) {
+                        Ok(ap) => self.ap_cache.put(ap),
+                        Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新失败"),
                     },
-                    Ok(None) => self.ap_cache.remove(&name),
-                    Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新回查失败"),
-                }
-            }
+                    Err(e) => {
+                        tracing::warn!(error = %e, ap = %name, "AP 缓存刷新解析桶账户失败")
+                    }
+                },
+                Ok(None) => self.ap_cache.remove(&name),
+                Err(e) => tracing::warn!(error = %e, ap = %name, "AP 缓存刷新回查失败"),
+            },
             SideEffect::ApRemove(name) => self.ap_cache.remove(&name),
             SideEffect::ApInvalidateBucket(bucket) => self.ap_cache.invalidate_bucket(&bucket),
             SideEffect::OlapRemove(name) => self.olap_cache.remove(&name),
@@ -874,18 +872,9 @@ mod tests {
         db.create_access_point("ap1", "b1", alice, None, 1)
             .await
             .unwrap();
-        db.set_olap_config(
-            "ap1",
-            "http",
-            Some("https://x"),
-            None,
-            None,
-            5000,
-            1024,
-            2,
-        )
-        .await
-        .unwrap();
+        db.set_olap_config("ap1", "http", Some("https://x"), None, None, 5000, 1024, 2)
+            .await
+            .unwrap();
         let store = Arc::new(
             xl_store::store::Store::open(xl_store::store::StoreConfig::new(
                 dir.path().join("data"),

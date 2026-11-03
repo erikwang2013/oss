@@ -78,8 +78,10 @@ pub trait ControlStore: Send + Sync {
     async fn access_point(&self, name: &str) -> Result<Option<AccessPointEntry>, ControlError>;
     /// 按 `name` 升序。
     async fn access_points(&self) -> Result<Vec<AccessPointEntry>, ControlError>;
-    async fn olap_config(&self, access_point: &str)
-    -> Result<Option<OlapConfigEntry>, ControlError>;
+    async fn olap_config(
+        &self,
+        access_point: &str,
+    ) -> Result<Option<OlapConfigEntry>, ControlError>;
     /// 按 `access_point` 升序。
     async fn olap_configs(&self) -> Result<Vec<OlapConfigEntry>, ControlError>;
 }
@@ -110,7 +112,10 @@ pub trait ControlTxn: Send {
     /// 严格导出映射（`is_admin=1` → `Admin`；悬空属主 → `Invalid`）。
     async fn access_points(&mut self) -> Result<Vec<AccessPointEntry>, ControlError>;
     /// 整表替换：DELETE olap + AP，再按入参顺序 INSERT。
-    async fn replace_access_points(&mut self, rows: &[AccessPointEntry]) -> Result<(), ControlError>;
+    async fn replace_access_points(
+        &mut self,
+        rows: &[AccessPointEntry],
+    ) -> Result<(), ControlError>;
     async fn olap_config_upsert(&mut self, row: &OlapConfigEntry) -> Result<(), ControlError>;
     async fn olap_config_delete(&mut self, access_point: &str) -> Result<bool, ControlError>;
     async fn olap_configs(&mut self) -> Result<Vec<OlapConfigEntry>, ControlError>;
@@ -224,9 +229,7 @@ mod tests {
             serde_json::to_string(&OwnerRef::User("alice".into())).unwrap(),
             r#"{"kind":"user","username":"alice"}"#
         );
-        assert!(
-            serde_json::from_str::<OwnerRef>(r#"{"kind":"admin","username":"x"}"#).is_err()
-        );
+        assert!(serde_json::from_str::<OwnerRef>(r#"{"kind":"admin","username":"x"}"#).is_err());
     }
 
     #[test]

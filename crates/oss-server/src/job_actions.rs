@@ -566,7 +566,8 @@ impl BatchExecutor {
         else {
             return Err(format!("access point {ap} 不存在"));
         };
-        let owner_ok = matches!(&row.owner, xl_store::control_store::OwnerRef::User(n) if n == &username);
+        let owner_ok =
+            matches!(&row.owner, xl_store::control_store::OwnerRef::User(n) if n == &username);
         if !user.is_admin && !owner_ok {
             return Err("transform access point 需 owner/admin".into());
         }

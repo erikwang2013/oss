@@ -305,7 +305,6 @@ fn add_ap(env: &TestEnv, name: &str) {
     env.ap_cache.put(AccessPoint {
         name: name.into(),
         bucket: BUCKET.into(),
-        owner_id: 1,
         account: xl_s3::access::LEGACY_ACCOUNT.into(),
         policy: Some(policy),
         region: "us-east-1".into(),

@@ -689,8 +689,14 @@ impl ApSource for DbApSource {
             .bucket_account(&row.bucket)
             .await
             .map_err(|e| e.to_string())?;
-        AccessPoint::from_row(row.name, row.bucket, row.policy_json, &self.region, &account)
-            .map(Some)
+        AccessPoint::from_row(
+            row.name,
+            row.bucket,
+            row.policy_json,
+            &self.region,
+            &account,
+        )
+        .map(Some)
     }
 }
 

@@ -200,7 +200,10 @@ impl ControlTxn for SqliteControlTxn<'_> {
         ap_olap::txn_access_points(self).await
     }
 
-    async fn replace_access_points(&mut self, rows: &[AccessPointEntry]) -> Result<(), ControlError> {
+    async fn replace_access_points(
+        &mut self,
+        rows: &[AccessPointEntry],
+    ) -> Result<(), ControlError> {
         ap_olap::txn_replace_access_points(self, rows).await
     }
 

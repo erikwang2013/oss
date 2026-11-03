@@ -691,7 +691,11 @@ pub(crate) async fn install_tx(
                 }
             }
             OwnerRef::User(name) => {
-                if !data.users.iter().any(|u| u.username.as_str() == name.as_str()) {
+                if !data
+                    .users
+                    .iter()
+                    .any(|u| u.username.as_str() == name.as_str())
+                {
                     return Err(DataError::Format(format!(
                         "access point owner {name} not in snapshot"
                     )));
@@ -1615,10 +1619,11 @@ mod tests {
         let mut admin_data = sample();
         admin_data.access_points[0].owner = OwnerRef::Admin;
         install_tx(&mut tx, &admin_data, &ctx).await.unwrap();
-        let owner: i64 = sqlx::query_scalar("SELECT owner_id FROM access_points WHERE name = 'ap1'")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
+        let owner: i64 =
+            sqlx::query_scalar("SELECT owner_id FROM access_points WHERE name = 'ap1'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
         assert_eq!(owner, admin_id);
 
         // (b) 快照外用户 → 预校验拒绝，且既有行未被删除（fail-closed，在任何写之前）。
@@ -1644,7 +1649,10 @@ mod tests {
         .await
         .unwrap();
         let err = read_tx(&mut tx).await.unwrap_err();
-        assert!(format!("{err}").contains("owner user id 999 missing"), "{err}");
+        assert!(
+            format!("{err}").contains("owner user id 999 missing"),
+            "{err}"
+        );
         sqlx::query("DELETE FROM access_points WHERE name = 'ap-dangling'")
             .execute(&mut *tx)
             .await
