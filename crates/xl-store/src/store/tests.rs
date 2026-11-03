@@ -6885,21 +6885,36 @@ async fn system_object_recertify_legacy_meta_is_idempotent_and_refuses_corrupt()
     assert_eq!(kept.control_committed, None, "拒绝路径不得落任何证书");
 }
 
-/// 最终复查 3：recertify 必须拒绝集群模式（在线协调者无法证明全集群同一内容），
-/// 且拒绝路径不得在任何槽写证书。
+/// 最终复查 3：recertify 必须拒绝集群模式。旧版副本 ≥ `Q_s`（9/12 槽）时，无守卫的
+/// 实现足以写出证书；拒绝路径必须在**所有**槽上都不落任何证书。
 #[tokio::test]
 async fn system_object_recertify_rejected_in_cluster_mode() {
     let c = Cluster::new(4, 3).await;
     let k = "control/legacy-cluster";
     let mut legacy = fenced_meta(k, 1, 1);
     legacy.control_committed = None;
-    write_control_slot(&c, 0, k, &legacy).await;
+    for slot in 0..9 {
+        write_control_slot(&c, slot, k, &legacy).await;
+    }
     match c.stores[0].recertify_system_object(k).await {
         Err(Error::Unsupported(msg)) => assert!(msg.contains("offline single-node"), "{msg}"),
         other => panic!("集群模式必须拒绝 recertify：{other:?}"),
     }
-    let kept = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
-    assert_eq!(kept.control_committed, None, "拒绝路径不得落任何证书");
+    for dir in c.dirs.iter().flatten() {
+        let path = layout::object_dir_for(dir, layout::SYS_DIR, k)
+            .unwrap()
+            .join(meta::META_FILE);
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let m = XlMeta::decode(&bytes).unwrap();
+        assert_ne!(
+            m.control_committed,
+            Some(true),
+            "拒绝路径不得落任何证书（{}）",
+            dir.display()
+        );
+    }
 }
 
 /// 最终评审 4：delete 面对无证书残骸必须 `CorruptMeta`，绝不 `Ok(false)` 谎报「不存在」。
