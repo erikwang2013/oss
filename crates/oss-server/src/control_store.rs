@@ -1,6 +1,7 @@
-//! `ControlStore` 的 SQLite 适配器：复用 `Db` 的既有连接池，不新建第二个池。
+//! 控制面的 SQLite 适配器：只读 `SqliteControlStore` 与调用方事务内的写
+//! `SqliteControlTxn` 共用 `Db` 的既有连接池，不新建第二个池。
 //!
-//! 本切片只读；写路径的 `ControlTxn` 适配器由后续任务加入。
+//! 事务由调用方持有；适配器不 begin/commit/rollback。
 
 use sqlx::{Row, SqlitePool};
 use xl_store::control_store::{ControlError, ControlStore, ControlTxn, VpcEndpoint};

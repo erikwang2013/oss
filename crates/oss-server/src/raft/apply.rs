@@ -847,15 +847,9 @@ pub(crate) async fn apply_command(
                 {
                     ControlResponse::Invalid
                 } else {
-                    let row = xl_store::control_store::VpcEndpoint {
-                        vpce_id: endpoint.vpce_id.clone(),
-                        vpc_id: endpoint.vpc_id.clone(),
-                        account_id: endpoint.account_id.clone(),
-                        state: endpoint.state.clone(),
-                        created_at: endpoint.created_at,
-                        updated_at: endpoint.updated_at,
-                    };
-                    txn.vpc_endpoint_upsert(&row).await.map_err(control_err)?;
+                    txn.vpc_endpoint_upsert(endpoint)
+                        .await
+                        .map_err(control_err)?;
                     ControlResponse::Ok
                 }
             }

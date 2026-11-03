@@ -1,11 +1,11 @@
 //! `vpc_endpoints` 切片双后端差分：legacy raw SQL（测试内参考实现，生产方法已删除）
 //! vs `SqliteControlStore` / `SqliteControlTxn`。两个 fresh SQLite 库跑同一操作
-//! 序列，比较完整行、排序、幂等、回滚与快照字节（rmp 字段顺序）。
+//! 序列，比较完整行、排序、幂等、回滚与快照 JSON 字节。
 
 use std::sync::Arc;
 
 use oss_server::db::Db;
-use oss_server::raft::data::{ControlData, VpcEndpointRow, encode_snapshot};
+use oss_server::raft::data::VpcEndpointRow;
 use sqlx::Row;
 use xl_store::control_store::ControlTxn;
 
@@ -95,12 +95,30 @@ async fn adapter_upsert(db: &Db, rows: &[VpcEndpointRow]) {
     tx.commit().await.unwrap();
 }
 
-fn snapshot(rows: Vec<VpcEndpointRow>) -> Vec<u8> {
-    encode_snapshot(&ControlData {
-        vpc_endpoints: rows,
-        ..ControlData::default()
-    })
-    .unwrap()
+/// 旧快照布局的独立参考编码：字段顺序不依赖生产 `Serialize` 实现。
+#[derive(serde::Serialize)]
+struct LegacyVpcRow {
+    vpce_id: String,
+    vpc_id: String,
+    account_id: String,
+    state: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn legacy_snapshot_json(rows: &[VpcEndpointRow]) -> Vec<u8> {
+    let legacy: Vec<LegacyVpcRow> = rows
+        .iter()
+        .map(|r| LegacyVpcRow {
+            vpce_id: r.vpce_id.clone(),
+            vpc_id: r.vpc_id.clone(),
+            account_id: r.account_id.clone(),
+            state: r.state.clone(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+        .collect();
+    serde_json::to_vec(&legacy).unwrap()
 }
 
 #[tokio::test]
@@ -111,10 +129,16 @@ async fn upsert_delete_and_ordering_match_legacy() {
     // 乱序写入；重复 upsert 改状态（created_at 必须保留）。
     let first = row("vpce-b", "vpc-b", "disabled", 20, 21);
     let second = row("vpce-a", "vpc-a", "active", 10, 11);
-    for r in [&first, &second, &first] {
+    let mut reupsert = first.clone();
+    reupsert.created_at = 999;
+    for r in [&first, &second, &reupsert] {
         legacy_upsert(&legacy, r).await;
     }
-    adapter_upsert(&store_db, &[first.clone(), second.clone(), first.clone()]).await;
+    adapter_upsert(
+        &store_db,
+        &[first.clone(), second.clone(), reupsert.clone()],
+    )
+    .await;
 
     let legacy_rows = legacy_list(&legacy).await;
     let store = store_db.control_store();
@@ -128,6 +152,7 @@ async fn upsert_delete_and_ordering_match_legacy() {
         ["vpce-a", "vpce-b"]
     );
     assert_eq!(store_rows[1].created_at, 20, "重复 upsert 保留 created_at");
+    assert_eq!(legacy_rows[1].created_at, 20, "legacy 同样保留 created_at");
     assert_eq!(
         store.vpc_endpoint("vpce-a").await.unwrap(),
         legacy_get(&legacy, "vpce-a").await
@@ -135,7 +160,11 @@ async fn upsert_delete_and_ordering_match_legacy() {
     assert_eq!(store.vpc_endpoint("vpce-missing").await.unwrap(), None);
 
     // 快照字节必须逐字节一致（字段顺序/deny_unknown_fields 不漂移）。
-    assert_eq!(snapshot(store_rows), snapshot(legacy_rows), "快照字节一致");
+    assert_eq!(
+        serde_json::to_vec(&store_rows).unwrap(),
+        legacy_snapshot_json(&legacy_rows),
+        "快照字节一致"
+    );
 
     // delete 幂等：首次 true，再次 false，与 raw SQL 的 rows_affected 一致。
     let mut tx = store_db.pool().begin().await.unwrap();
@@ -205,9 +234,10 @@ async fn replace_and_rollback_match_legacy() {
         legacy_rows,
         "安装后读一致（升序、无独有行）"
     );
-    assert_eq!(snapshot(legacy_rows), {
-        snapshot(store_db.control_store().vpc_endpoints().await.unwrap())
-    });
+    assert_eq!(
+        legacy_snapshot_json(&legacy_rows),
+        serde_json::to_vec(&store_db.control_store().vpc_endpoints().await.unwrap()).unwrap()
+    );
 
     // 回滚：同一事务内写入后不提交，表必须保持为空（适配器不自行 commit）。
     let rolled_back = fresh().await;
@@ -241,4 +271,19 @@ async fn backend_errors_propagate_without_fallback() {
         "{err}"
     );
     assert!(db.control_store().vpc_endpoint("vpce-a").await.is_err());
+}
+
+/// 真实快照是 `encode_snapshot` 内的 serde_json 载荷：字段名/顺序冻结，
+/// 且已发布的旧快照字节必须仍可反序列化。
+#[test]
+fn vpc_endpoint_serde_json_schema_is_frozen() {
+    let endpoint = row("vpce-1", "vpc-1", "active", 1, 2);
+    assert_eq!(
+        serde_json::to_string(&endpoint).unwrap(),
+        r#"{"vpce_id":"vpce-1","vpc_id":"vpc-1","account_id":"000000000001","state":"active","created_at":1,"updated_at":2}"#
+    );
+
+    let frozen_legacy = r#"{"vpce_id":"vpce-9","vpc_id":"vpc-9","account_id":"000000000001","state":"disabled","created_at":3,"updated_at":4}"#;
+    let parsed: VpcEndpointRow = serde_json::from_str(frozen_legacy).unwrap();
+    assert_eq!(parsed, row("vpce-9", "vpc-9", "disabled", 3, 4));
 }
