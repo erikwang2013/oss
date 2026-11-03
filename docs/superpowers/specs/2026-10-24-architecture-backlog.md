@@ -118,6 +118,11 @@
 > CI rust-cache、超时/并发闸与 `--locked/--no-fail-fast`；新增 release prepare/check
 > 脚本。无接口或数据格式变更。
 >
+> **v1.29.0 控制面去数据库化 Phase 0/1**：xl-store `.oss.sys` 保留命名空间、控制对象
+> CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读；oss-server `ControlStore`/
+> `ControlTxn` 缝，`vpc_endpoints` 读写/apply/快照迁移；SQLite 仍为默认后端，
+> 无接口或数据格式变更。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →

@@ -4,12 +4,9 @@
 
 ## 当前状态
 
-M1–M9 已完成，最新发布 **v1.28.5（2026-11-01）**；M5 安全与锁定全部交付——集群行一致性
+M1–M9 已完成，最新发布 **v1.29.0（2026-11-03）**；M5 安全与锁定全部交付——集群行一致性
 广播 · 密钥库/KMS · 加密数据面 DARE 式 · S3 面 SSE-S3/KMS/C · 对象锁 · STS（含
-`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.28 交付 Raft 日志格式标记与旧区间有界
-压缩、M8 follower restore 以 applied 行自身 `fence_term` 收口、AP 直连 mTLS 与 AWS
-PrivateLink API 验证、CMK→legacy 全量重加密迁移、Level C 只读排空、JWT 多密钥轮换、feature 9
-opt-in 复制用量账本（严格硬配额），以及真实 v1.26.0 蓝绿/单机→集群 e2e 与 MPU 排空工具。v1.28.1 为补丁版：CI 安装 `protobuf-compiler`、最小配额夹具兼容缺 `users` 表、收紧 AWS 端点测试与 mixed-MPU shell 局部变量、裁剪历史计划/SDD 文档；v1.28.2 修复其 CI 暴露的桶配额并发测试夹具；v1.28.3 修复 OLAP 变换流式输入超限的错误映射（400 而非 500）；v1.28.4 仅稳定测试（等待异步缓存重载），无功能变更；v1.28.5 做性能与 CI 加固：DeleteObjects 授权预加载、列表批量并发读/peer fan-out、健康探测并发、查询索引、aether ingest 限流、sync 流式 tee，并加入 CI 缓存与发布脚本；无 API/配置/Wire/数据格式变更。
+`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.29 交付控制面去数据库化第一阶段：xl-store 的 `.oss.sys` 系统命名空间、控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读，以及 oss-server 的 `ControlStore`/`ControlTxn` 缝；`vpc_endpoints` 读、Raft apply 与快照导出/安装迁移，legacy raw SQL 双后端差分测试锁定行为；SQLite 仍为默认后端，无 API、配置、Wire/OSSCTL 或数据格式变更。v1.28 系列交付 Raft 日志格式标记与旧区间有界压缩、M8 follower restore fencing、AP 直连 mTLS/AWS PrivateLink API 验证、CMK→legacy 全量迁移、Level C 只读排空、JWT 多密钥轮换、feature 9 opt-in 严格硬配额，以及真实蓝绿/MPU 排空/单机→集群 e2e；v1.28.1–v1.28.5 为 CI/测试稳定与性能加固补丁。
 **以 docs/ 为准**：
 
 - `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1；§8 含各阶段落地状态）

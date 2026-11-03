@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.28.5，包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.29.0，包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,停写蓝绿升级,只读排空,JWT 轮换">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.28.5 补丁版；oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.29.0 控制面基座；oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.28.5 补丁版；oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.29.0 补丁版；oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.28.5</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.29.0</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.28.5 的补丁版。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.29.0 的控制面基座。每个已发布版本都有对应的 tag 与 GitHub Release。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-29-0">v1.29.0</a>
           <a href="#v1-28-5">v1.28.5</a>
           <a href="#v1-28-4">v1.28.4</a>
           <a href="#v1-28-3">v1.28.3</a>
@@ -111,10 +112,25 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.28.5</strong>（2026-11-01）。</p>
+          <p>当前最新发布：<strong>v1.29.0</strong>（2026-11-03）。</p>
 
           <div class="changelog-list">
-            <details class="changelog-entry" id="v1-28-5" open>
+            <details class="changelog-entry" id="v1-29-0" open>
+              <summary><strong>v1.29.0</strong><time datetime="2026-11-03">2026-11-03</time><span>控制面去数据库化 · 第一阶段</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>保留命名空间</strong>：xl-store 复用每盘 <code>.oss.sys</code>；S3 桶名校验永远拒绝点开头，ListBuckets/DeleteBucket/key cache/fsck/heal/scrub/reconcile 全部豁免。</li>
+                  <li><strong>控制对象原语</strong>：<code>control_version</code>/<code>fence_token</code>/<code>control_deleted</code>；CAS + 单调 fencing；两阶段 prepare/commit 与补偿按 token 收口；提交证书与 quorum 读（<code>2·Q_s &gt; N</code>）。</li>
+                  <li><strong>持久化锁 token</strong>：单调计数器落盘（tmp + fsync + rename），重启与竞争下严格递增；解析失败 fail-closed。</li>
+                  <li><strong>ControlStore 缝</strong>：xl-store 的 <code>ControlStore</code>/<code>ControlTxn</code>（事务归调用方，不 begin/commit）；oss-server 的 SQLite 适配器复用既有连接池；<code>vpc_endpoints</code> 读、Raft apply 与快照导出/安装全部迁移。</li>
+                  <li><strong>差分测试</strong>：legacy raw SQL vs 适配器的完整行、排序、幂等删除、<code>created_at</code> 保留、回滚与快照 JSON 字节。</li>
+                  <li><strong>兼容性</strong>：SQLite 仍为默认后端；无 API、配置、Wire/OSSCTL 或数据格式变更；快照字段顺序逐字节不变。</li>
+                  <li><strong>验证</strong>：xl-store 446/0/1；oss-server 824/0/2；clippy 0 warning；fmt 通过。</li>
+                </ul>
+                <p><a href="https://github.com/erikwang2013/oss/releases/tag/v1.29.0" target="_blank" rel="noopener">GitHub Release</a> · README：<code>README.md</code> / <code>README.en.md</code>。</p>
+              </div>
+            </details>
+            <details class="changelog-entry" id="v1-28-5">
               <summary><strong>v1.28.5</strong><time datetime="2026-11-01">2026-11-01</time><span>性能与 CI 加固版</span></summary>
               <div class="entry-body">
                 <ul>
@@ -551,7 +567,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.28.5</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.29.0</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
