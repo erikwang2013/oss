@@ -203,18 +203,6 @@ fn inventory_run_row(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
     }
 }
 
-/// feature 8：动态 VPC 端点注册行（随 ControlData 快照复制；静态配置仍可回退）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VpcEndpointRow {
-    pub vpce_id: String,
-    pub vpc_id: String,
-    pub account_id: String,
-    /// `active` 放行；其它值 fail-closed。
-    pub state: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
 /// 访问点行（M8 S1）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccessPointRow {
@@ -1568,6 +1556,13 @@ impl Db {
         &self.pool
     }
 
+    /// 控制面读句柄：共享本 `Db` 的 pool（只克隆池句柄，不新建连接池）。
+    pub fn control_store(&self) -> std::sync::Arc<dyn xl_store::control_store::ControlStore> {
+        std::sync::Arc::new(crate::control_store::SqliteControlStore::new(
+            self.pool.clone(),
+        ))
+    }
+
     pub async fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<i64> {
         let hash = crate::db::hash_password(password);
         let id = sqlx::query(
@@ -2469,46 +2464,6 @@ impl Db {
         .await?
         .rows_affected();
         Ok(n == 1)
-    }
-
-    /// 动态 VPC 端点注册查询（feature 8）。查无 = `None`，由调用方回退静态配置。
-    pub async fn vpc_endpoint_get(&self, vpce_id: &str) -> Result<Option<VpcEndpointRow>> {
-        let row = sqlx::query(
-            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
-             FROM vpc_endpoints WHERE vpce_id = ?",
-        )
-        .bind(vpce_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| VpcEndpointRow {
-            vpce_id: r.get("vpce_id"),
-            vpc_id: r.get("vpc_id"),
-            account_id: r.get("account_id"),
-            state: r.get("state"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        }))
-    }
-
-    /// 动态 VPC 端点全量列表（管理 API / 诊断）。
-    pub async fn vpc_endpoint_list(&self) -> Result<Vec<VpcEndpointRow>> {
-        let rows = sqlx::query(
-            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
-             FROM vpc_endpoints ORDER BY vpce_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| VpcEndpointRow {
-                vpce_id: r.get("vpce_id"),
-                vpc_id: r.get("vpc_id"),
-                account_id: r.get("account_id"),
-                state: r.get("state"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
     }
 
     /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。

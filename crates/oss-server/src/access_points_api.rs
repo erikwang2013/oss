@@ -690,7 +690,7 @@ async fn list_vpc_endpoints(
     if !admin {
         return (StatusCode::FORBIDDEN, "需要管理员权限").into_response();
     }
-    match state.db.vpc_endpoint_list().await {
+    match state.db.control_store().vpc_endpoints().await {
         Ok(rows) => Json(
             rows.into_iter()
                 .map(|r| {
