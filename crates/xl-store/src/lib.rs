@@ -1,3 +1,4 @@
+pub mod control_store;
 pub mod crypto;
 pub mod error;
 pub mod gate;
