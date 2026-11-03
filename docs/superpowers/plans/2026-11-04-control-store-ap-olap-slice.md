@@ -883,4 +883,12 @@ git commit -m "test(oss-server): differential coverage for AP/OLAP ControlStore 
 
 ## 门禁记录
 
-（执行完成后填写，格式同第一切片：日期、提交范围、各命令通过/失败数、flake 说明。）
+2026-11-04，切片提交 `3484a89..78ed2b0`（Task 1–9 + 门禁修复），门禁在 `/home/wwwroot/project/oss` 执行：
+
+- `cargo test -p xl-store`：448 passed / 0 failed / 1 ignored（6 个测试目标）。
+- `cargo test -p oss-server --no-fail-fast`：834 passed / 2 failed / 2 ignored（77 个测试目标）；两次失败均为 5s 控制面状态探测超时（`站点控制面请求超时（5s）`）：`m8_read_consistency::follower_consistent_read_catches_up_and_carries_applied_index` 与 `raft_lifecycle_cursor_replication::new_leader_continues_from_replicated_cursor`，机器负载 50+ 下的 timing flake（首轮全量另有 `sync_gate::concurrent_delete_bucket_second_is_409` 同类负载时序抖动，复跑通过），隔离重跑分别通过（5.06s / 12.65s）。有效 836 passed / 0 failed / 2 ignored。
+- `cargo clippy -p oss-server -p xl-store -p xl-s3 --all-targets`：exit 0，0 warnings。
+- `cargo fmt --all -- --check`：exit 0。
+- `cargo test -p oss-server --test control_store_ap_olap_diff`：6/6 passed。
+
+结论：切片门禁 PASS；可进入下一切片（lifecycle / inventory / tier）。
