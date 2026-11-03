@@ -2186,6 +2186,15 @@ impl Store {
             ..mw.clone()
         };
 
+        // 测试注入（与单机多盘同款窗口）：prepare 完成、翻转前崩。
+        if std::env::var("OSS_TEST_ABORT_META_PREPARE").is_ok() {
+            std::process::abort();
+        }
+        // Task 6：控制面翻转计数注入（仅 fenced 写；数据面不受影响）。
+        let control_abort: Option<usize> = std::env::var("OSS_TEST_ABORT_CONTROL_COMMIT_K")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         // ---- 阶段二：commit（本机单次；远端每节点至多两次机会——rename 幂等，.new 仍在） ----
         let mut flipped_local: Vec<u16> = Vec::new();
         let mut stale = false;
@@ -2196,7 +2205,10 @@ impl Store {
             }
             match self.commit_meta_on(drive, bucket, key, fence_token).await {
                 Ok(mesh_api::SlotCommit::Committed { hash }) if hash == self_hash => {
-                    flipped_local.push(slot)
+                    flipped_local.push(slot);
+                    if fence_token.is_some() && control_abort == Some(flipped_local.len()) {
+                        std::process::abort();
+                    }
                 }
                 Ok(mesh_api::SlotCommit::Committed { .. }) => {
                     tracing::warn!(slot, "meta 翻转内容是他人写入（hash 不符），不计入")
