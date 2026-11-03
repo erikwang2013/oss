@@ -75,6 +75,13 @@ pub trait ControlStore: Send + Sync {
     async fn vpc_endpoint(&self, vpce_id: &str) -> Result<Option<VpcEndpoint>, ControlError>;
     /// 按 `vpce_id` 升序（导出/校验的确定性来源）。
     async fn vpc_endpoints(&self) -> Result<Vec<VpcEndpoint>, ControlError>;
+    async fn access_point(&self, name: &str) -> Result<Option<AccessPointEntry>, ControlError>;
+    /// 按 `name` 升序。
+    async fn access_points(&self) -> Result<Vec<AccessPointEntry>, ControlError>;
+    async fn olap_config(&self, access_point: &str)
+    -> Result<Option<OlapConfigEntry>, ControlError>;
+    /// 按 `access_point` 升序。
+    async fn olap_configs(&self) -> Result<Vec<OlapConfigEntry>, ControlError>;
 }
 
 /// 调用方事务内的写访问。`&mut self` 表示独占借用，不提供 begin/commit/rollback。

@@ -4,10 +4,14 @@
 //! 事务由调用方持有；适配器不 begin/commit/rollback。
 
 use sqlx::{Row, SqlitePool};
-use xl_store::control_store::{ControlError, ControlStore, ControlTxn, VpcEndpoint};
+use xl_store::control_store::{
+    AccessPointEntry, ControlError, ControlStore, ControlTxn, OlapConfigEntry, VpcEndpoint,
+};
+
+mod ap_olap;
 
 pub struct SqliteControlStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl SqliteControlStore {
@@ -51,12 +55,31 @@ impl ControlStore for SqliteControlStore {
         .map_err(|e| ControlError::Backend(e.to_string()))?;
         Ok(rows.iter().map(endpoint_from).collect())
     }
+
+    async fn access_point(&self, name: &str) -> Result<Option<AccessPointEntry>, ControlError> {
+        ap_olap::access_point(self, name).await
+    }
+
+    async fn access_points(&self) -> Result<Vec<AccessPointEntry>, ControlError> {
+        ap_olap::access_points(self).await
+    }
+
+    async fn olap_config(
+        &self,
+        access_point: &str,
+    ) -> Result<Option<OlapConfigEntry>, ControlError> {
+        ap_olap::olap_config(self, access_point).await
+    }
+
+    async fn olap_configs(&self) -> Result<Vec<OlapConfigEntry>, ControlError> {
+        ap_olap::olap_configs(self).await
+    }
 }
 
 /// 调用方事务内的写句柄。借用现有连接，绝不 begin/commit/rollback——事务边界
 /// 归调用方（Raft apply / 快照安装），这是与 `raft_applied` 原子性的唯一来源。
 pub struct SqliteControlTxn<'a> {
-    conn: &'a mut sqlx::SqliteConnection,
+    pub(crate) conn: &'a mut sqlx::SqliteConnection,
 }
 
 impl<'a> SqliteControlTxn<'a> {

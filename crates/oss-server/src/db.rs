@@ -6,6 +6,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
+use xl_store::control_store::OwnerRef;
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
 
@@ -1561,6 +1562,25 @@ impl Db {
         std::sync::Arc::new(crate::control_store::SqliteControlStore::new(
             self.pool.clone(),
         ))
+    }
+
+    /// 自然键属主 → 本节点数字 id（console JSON 边界用）：`Admin` → 首个管理员；
+    /// `User(name)` → `users.id`；缺失（含无管理员）→ 0。
+    pub async fn owner_uid(&self, owner: &OwnerRef) -> Result<i64> {
+        let id: Option<i64> = match owner {
+            OwnerRef::Admin => sqlx::query_scalar(
+                "SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1",
+            )
+            .fetch_optional(&self.pool)
+            .await?,
+            OwnerRef::User(name) => {
+                sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+                    .bind(name)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+        };
+        Ok(id.unwrap_or(0))
     }
 
     pub async fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<i64> {
@@ -4610,6 +4630,97 @@ mod tests {
         assert!(db.delete_access_point("ap2").await.unwrap());
         assert!(db.get_access_point("ap2").await.unwrap().is_none());
         assert!(!db.delete_access_point("missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn control_store_reads_ap_olap_with_natural_owner() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        db.create_access_point("ap-alice", "b1", alice, None, 1)
+            .await
+            .unwrap();
+        db.create_access_point("ap-root", "b1", admin, None, 2)
+            .await
+            .unwrap();
+        // owner_id=0（witness 哨兵）与悬空 id 只由快照安装产生，直接 raw 插入，
+        // 避免 Task 5 把单机写 API 改成 uid→username 解析后测试口径失真。
+        sqlx::query(
+            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
+             VALUES ('ap-witness', 'b1', 0, NULL, 3, 3)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
+             VALUES ('ap-dangling', 'b1', 999, NULL, 4, 4)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.set_olap_config(
+            "ap-alice",
+            "http",
+            Some("https://x"),
+            None,
+            None,
+            5000,
+            1024,
+            5,
+        )
+        .await
+        .unwrap();
+
+        let store = db.control_store();
+        assert_eq!(
+            store.access_point("ap-alice").await.unwrap().unwrap().owner,
+            OwnerRef::User("alice".into())
+        );
+        // 管理员拥有也读成 User（保持 console JSON/筛选语义），不是 Admin。
+        assert_eq!(
+            store.access_point("ap-root").await.unwrap().unwrap().owner,
+            OwnerRef::User("root".into())
+        );
+        assert_eq!(
+            store.access_point("ap-witness").await.unwrap().unwrap().owner,
+            OwnerRef::Admin
+        );
+        assert_eq!(
+            store
+                .access_point("ap-dangling")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner,
+            OwnerRef::Admin
+        );
+        assert_eq!(
+            store
+                .access_points()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ap-alice", "ap-dangling", "ap-root", "ap-witness"]
+        );
+
+        let cfg = store.olap_config("ap-alice").await.unwrap().unwrap();
+        assert_eq!(cfg.kind, "http");
+        assert_eq!(cfg.endpoint.as_deref(), Some("https://x"));
+        assert_eq!(cfg.module, None);
+        assert_eq!(store.olap_configs().await.unwrap(), vec![cfg]);
+
+        assert_eq!(
+            db.owner_uid(&OwnerRef::User("alice".into())).await.unwrap(),
+            alice
+        );
+        assert_eq!(db.owner_uid(&OwnerRef::Admin).await.unwrap(), admin);
+        assert_eq!(
+            db.owner_uid(&OwnerRef::User("ghost".into())).await.unwrap(),
+            0
+        );
     }
 }
 
