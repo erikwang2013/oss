@@ -51,7 +51,9 @@ pub fn to_s3_error(e: StoreError) -> S3Error {
         // 内部错误：细节（盘上路径、内部文案）只进日志，不进 5xx 响应体。
         // M5：Crypto（wrap 解不开/主密钥缺失）暂同归 500 泛化——对客户端可纠正的形态
         // （SSE-C 错钥 → 4xx）在切片 3 接线时再细分，此处不提前放宽。
-        StoreError::QuorumUnmet(_)
+        // IND：控制面写结果不确定（可能已提交）——调用方须重读核对；API 面同归 500。
+        StoreError::Indeterminate(_)
+        | StoreError::QuorumUnmet(_)
         | StoreError::CorruptMeta(_)
         | StoreError::Encode(_)
         | StoreError::Crypto(_)

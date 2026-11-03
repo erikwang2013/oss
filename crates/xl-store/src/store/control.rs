@@ -6,8 +6,21 @@
 //! 的读-检-写互斥；`flock` 是本地文件系统上的 advisory 锁，不覆盖网络文件系统/跨机器。
 //!
 //! 集群分支：锁 token 由 [`Store::acquire_fenced_cluster_lock`] 持久化发放并作为提交 token
-//! （调用方 token 仍按 Task 2 契约校验单调性）；读按**内容相同的副本数**确认版本
-//! （≥ `Q_s` 槽才可见，覆盖不足或版本无 quorum 时 fail-closed）。
+//! （调用方 token 仍按 Task 2 契约校验单调性）。读**全量扇出**：覆盖 ≥ `Q_s` 槽才允许
+//! 判定（缺席证明另要求 `2*Q_s > N`），可见版本 = 任一**带提交证书**的副本——不要求
+//! 内容相同的副本数达到 `Q_s`（`Q_s` 只约束覆盖与提交翻转数）。覆盖不足/版本分叉/
+//! 无证书但有副本 → fail-closed。
+//!
+//! 写失败契约：第一阶段失败 = 未提交（读不可见）；第二阶段（提交证书）失败但已落
+//! 1..<Q_s 份证书 → [`Error::Indeterminate`]——写**可能已提交**。任何控制写错误都必须
+//! 按 key 重读核对 token/version，绝不假设回滚。
+//!
+//! 键生命周期：control key 是 create-once 命名——创建后只做 CAS 更新，删除写 tombstone
+//! （普通版本：`control_deleted = Some(true)`、数据为空，占用版本号并参与 CAS）；delete
+//! 幂等（不存在/已 tombstone → `Ok(false)`）。tombstone 后重建必须用 put 以更高版本/token
+//! 越过它，旧 token 永久失效。集群控制写要求 `N >= data + 2`（1 个 preserve 槽 +
+//! `Q_s` 个翻转槽；写容错 = `N - data - 2`）。删除后的版本号读接口不可见（get 返回
+//! None），只能按「delete 成功即 +1」推算。
 //! 集群枚举不做：Phase 0 的 control manifest 携带键集合，留待 Phase 1。
 
 use md5::Digest as _;
@@ -65,6 +78,9 @@ impl Store {
     ///
     /// 集群模式下调用方 token 只是 CAS 前置条件：提交/存储的是 fenced 锁发放的 token
     /// （每次成功获取都推进，失败的 CAS 尝试也会留下空洞，因此会高于调用方 token）。
+    ///
+    /// 失败可能已提交：返回 [`Error::Indeterminate`] 时部分证书可能已落盘——调用方
+    /// 必须按 key 重读核对 token/version，绝不假设回滚。
     pub async fn put_system_object(
         &self,
         key: &str,
@@ -153,7 +169,9 @@ impl Store {
     }
 
     /// 删控制对象（CAS 同 put）：写 tombstone 版本。返回是否真的发生了删除
-    /// （不存在/已删除 → false，幂等）。
+    /// （不存在/已删除 → false，幂等；无证书残骸 → `CorruptMeta`，需先 put/recertify 修复）。
+    /// 返回 [`Error::Indeterminate`] 时 tombstone 可能已提交——必须按 key 重读核对，
+    /// 绝不假设回滚。
     pub async fn delete_system_object(
         &self,
         key: &str,
@@ -182,6 +200,15 @@ impl Store {
         )?;
         let commit_token = guard.commit_token(fence_token, cur_fence.max(st.max_token))?;
         let Some(old) = st.certified else {
+            // 无证书副本存在 = 未提交第一阶段残骸或旧版无证书 meta。`Ok(false)` 会谎报
+            // 「不存在/已删除」而 get/list 仍 fail-closed；必须显式要求修复（put 推进
+            // 版本越过残骸，或 recertify 给旧 meta 补证书）。
+            if st.copies > 0 {
+                return Err(Error::CorruptMeta(format!(
+                    "控制对象 {key:?} 无提交证书但存在 {} 份副本（未提交残骸或旧版 meta）：拒绝删除；先用 put 推进版本或 recertify 补证书",
+                    st.copies
+                )));
+            }
             return Ok(false);
         };
         if old.control_deleted == Some(true) {
@@ -198,6 +225,73 @@ impl Store {
         }
         self.commit_control_meta(key, &m, Some(&old), commit_token, &guard, &preserve)
             .await?;
+        Ok(true)
+    }
+
+    /// Phase 1 升级门：给旧版（`control_committed = None`）控制 meta **原地补提交证书**。
+    ///
+    /// 在 fenced 锁内重读后写入：版本/数据不变，只置 `control_committed = Some(true)`，
+    /// token 取锁发放值（严格高于所有已观察 token）。幂等：已有证书或键不存在 →
+    /// `Ok(false)`；`Ok(true)` = 本次新写了证书。损坏副本/非控制形态/新代码第一阶段
+    /// 残骸（`Some(false)`）→ `CorruptMeta`（绝不认证不确定内容；残骸由 put 推进版本覆盖）。
+    pub async fn recertify_system_object(&self, key: &str) -> Result<bool> {
+        validate_control_key(key)?;
+        let floor = self.control_token_floor(key).await?;
+        let guard = self.control_lock(key, floor).await?;
+        if guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
+        }
+        // 锁内重读：certified 已可见 → 无需迁移（幂等）。
+        let st = self.read_control(layout::SYS_DIR, key).await?;
+        if st.certified.is_some() {
+            return Ok(false);
+        }
+        if st.corrupt > 0 {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 存在 {} 份损坏副本：拒绝补证书",
+                st.corrupt
+            )));
+        }
+        if st.copies == 0 {
+            return Ok(false);
+        }
+        // 全量扇出取 rank 最大副本作为待认证内容（与数据面读选举同口径）。
+        let Some(mut raw) = self.read_meta_full(layout::SYS_DIR, key).await? else {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 观察到 {} 份副本但 meta 扫描为空：拒绝补证书",
+                st.copies
+            )));
+        };
+        if raw.control_version.is_none() && raw.fence_token.is_none() {
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 的 meta 不是控制对象形态：拒绝补证书"
+            )));
+        }
+        if let Some(c) = raw.control_committed {
+            // Some(true) 已被 certified 分支覆盖；Some(false) = 新代码第一阶段残骸。
+            return Err(Error::CorruptMeta(format!(
+                "控制对象 {key:?} 带 control_committed={c:?}（非旧版无证书形态）：拒绝补证书；未提交残骸由 put 推进版本覆盖"
+            )));
+        }
+        let caller_token = st
+            .max_token
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptMeta(format!("控制对象 {key:?} fence token 溢出")))?;
+        let commit_token = guard.commit_token(caller_token, st.max_token)?;
+        raw.control_committed = Some(true);
+        raw.fence_token = Some(commit_token);
+        // 提交点前复查租约（与 put/delete 同款）
+        if guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约丢失，补证书中止".into()));
+        }
+        let flipped = self
+            .write_meta_marker(layout::SYS_DIR, key, &raw, commit_token, &[])
+            .await?;
+        if flipped == 0 {
+            return Err(Error::QuorumUnmet(format!(
+                "控制对象 {key:?} 补证书 0 槽（未提交）"
+            )));
+        }
         Ok(true)
     }
 
@@ -282,7 +376,8 @@ impl Store {
     /// 已提交旧副本原样（崩溃/第二阶段零证书时读回退旧版本，而不是缺席——Critical A）；
     /// 第二阶段写同 token 的提交证书（`control_committed = Some(true)`）。
     /// 只有证书落盘后读才可见——第一阶段崩溃留下的半翻副本永远不可见。
-    /// 第二阶段失败时绝不回滚第一阶段数据（证书是原子性判据；数据残骸由下次写覆盖）。
+    /// 第二阶段失败时绝不回滚第一阶段数据（证书是原子性判据；数据残骸由下次写覆盖）；
+    /// 已落部分证书 → `Error::Indeterminate`（可能已提交，调用方须重读核对）。
     async fn commit_control_meta(
         &self,
         key: &str,

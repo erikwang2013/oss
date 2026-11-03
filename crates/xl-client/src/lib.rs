@@ -90,6 +90,8 @@ fn err_wire(e: &Error) -> (&'static str, String) {
         Error::BadGateway(s) => ("BadGateway", s.clone()),
         // DP-0：混版数据面 fail-closed 必须原样过线（S3 503 peer_incompatible）。
         Error::PeerIncompatible(s) => ("PeerIncompatible", s.clone()),
+        // 控制面写结果不确定必须原样过线，调用方据此重读核对。
+        Error::Indeterminate(s) => ("Indeterminate", s.clone()),
     }
 }
 
@@ -122,6 +124,7 @@ fn err_from_wire(code: &str, msg: String) -> Error {
         "Conflict" => Error::Conflict(msg),
         "BadGateway" => Error::BadGateway(msg),
         "PeerIncompatible" => Error::PeerIncompatible(msg),
+        "Indeterminate" => Error::Indeterminate(msg),
         // 未知 code：不猜语义，按内部错误上抛（fail-closed）
         other => Error::Encode(format!("对端错误码 {other}：{msg}")),
     }

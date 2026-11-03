@@ -71,6 +71,10 @@ pub enum Error {
     /// 混版集群必须 fail-closed，不得降级为部分读写。
     #[error("peer_incompatible: {0}")]
     PeerIncompatible(String),
+    /// 控制面写结果不确定：失败前已有证书落盘，写入**可能已提交**（读可能可见）。
+    /// 调用方必须按 key 重读核对 token/version，绝不假设回滚。
+    #[error("indeterminate: {0}")]
+    Indeterminate(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

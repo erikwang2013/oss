@@ -2081,6 +2081,18 @@ impl Store {
         let cl = self.cfg.cluster.as_deref().expect("cluster 分支");
         let self_id = cl.sets.flat.self_node().id.clone();
         let q_s = self.cfg.ec.data as usize + 1;
+        // 控制写拓扑不变量：1 个 preserve 槽 + Q_s 个翻转槽，N < data+2 时后续写必然
+        // 楔死（写容错 = N - data - 2 槽）。数据面不受限（旧行为逐字节不变）。
+        // 读侧另有缺席证明门槛 2*Q_s > N（`read_control_cluster`）。
+        if fence_token.is_some() {
+            let n = cl.sets.flat.slot_count() as usize;
+            let data = self.cfg.ec.data as usize;
+            if n < data + 2 {
+                return Err(Error::Unsupported(format!(
+                    "控制写要求 N >= data+2（当前 N={n}, data={data}）：无 preserve+Q_s 翻转空间，fail-closed"
+                )));
+            }
+        }
         let bytes = bytes::Bytes::from(m.encode()?);
         let self_hash = crate::mesh::content_hash(&bytes);
         let base = self.slot_base();
@@ -2274,21 +2286,27 @@ impl Store {
         }
         if marker {
             // 标记阶段失败：**绝不回滚第一阶段数据**（证书才是提交判据；回滚会制造
-            // 「数据已删、证书已发」或「同一版本两种编码」的分叉）。未落证书的槽不可见；
-            // 已落 1..<Q_s 份证书时该版本可能已被读到（写者结果不确定）。
-            let visible = if flipped > 0 {
-                "部分证书已落盘（读可能可见，写者结果不确定）"
-            } else {
-                "第一阶段数据未提交（读不可见）"
-            };
+            // 「数据已删、证书已发」或「同一版本两种编码」的分叉）。已落 1..<Q_s 份
+            // 证书时该版本可能已被读到——写者结果**不确定**，调用方必须按 key 重读
+            // 核对 token/version，不得假设回滚。
+            if flipped > 0 {
+                let stale_note = if fence_token.is_some() && stale {
+                    "（同时观察到更新写者的 fence token）"
+                } else {
+                    ""
+                };
+                return Err(Error::Indeterminate(format!(
+                    "控制对象 {bucket}/{key} 提交标记 {flipped}/{q_s}：部分证书已落盘，写入可能已提交{stale_note}；须按 key 重读核对"
+                )));
+            }
             if fence_token.is_some() && stale {
                 return Err(Error::Conflict(format!(
-                    "fence token 过期：{bucket}/{key} 已由更新写者提交（提交标记未达成：{visible}）"
+                    "fence token 过期：{bucket}/{key} 已由更新写者提交（提交标记 0/{q_s}，第一阶段数据未提交，读不可见）"
                 )));
             }
             self.bump_quorum_unmet_write();
             return Err(Error::QuorumUnmet(format!(
-                "meta 提交标记 {flipped}/{q_s}：{visible}"
+                "meta 提交标记 0/{q_s}：第一阶段数据未提交（读不可见）"
             )));
         }
 

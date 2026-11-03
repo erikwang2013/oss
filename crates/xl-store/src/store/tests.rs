@@ -6720,3 +6720,197 @@ async fn system_object_cluster_write_recovers_when_lock_high_water_is_stale() {
         1
     );
 }
+
+// ---- 最终整支评审修复波：拓扑不变量 / 不确定写 / 迁移补证书 / 删除残骸 ----
+
+/// 单节点 12 盘集群（指定 EC）：控制写拓扑门槛的边界构造。
+async fn single_node_cluster_with_ec(ec: ec::EcConfig) -> (Arc<Store>, Vec<tempfile::TempDir>) {
+    let tmp: Vec<tempfile::TempDir> = (0..12).map(|_| tempfile::TempDir::new().unwrap()).collect();
+    let dirs: Vec<std::path::PathBuf> = tmp.iter().map(|d| d.path().to_path_buf()).collect();
+    let specs = vec![drives::NodeSpec {
+        id: "n1".into(),
+        addr: "127.0.0.1:1".into(),
+        drive_count: 12,
+    }];
+    let sets = drives::ClusterSets::single("n1", specs, &ec).unwrap();
+    let mut cfg = StoreConfig::new(&dirs[0]);
+    cfg.drives = dirs;
+    cfg.ec = ec;
+    cfg.fsync = false;
+    cfg.cluster_lock_ttl_ms = 400;
+    cfg.cluster_lock_retries = 3;
+    cfg.cluster_lock_backoff_ms = (5, 10);
+    cfg.cluster = Some(Arc::new(drives::ClusterConfig {
+        sets,
+        transport: InProcessMesh::new(),
+        placement_v2: false,
+        resolver: None,
+        stretch: false,
+    }));
+    (Arc::new(Store::open(cfg).await.unwrap()), tmp)
+}
+
+/// 最终评审 1：集群控制写要求 `N >= data+2`（1 个 preserve 槽 + Q_s 个翻转槽），
+/// 否则后续写必然楔死。数据面拓扑本身不受此门槛影响（边界值仅由控制写拒绝）。
+#[tokio::test]
+async fn system_object_control_write_requires_preserve_and_flip_space() {
+    // data=11/parity=1：N=12 < data+2=13 → 控制写 fail-closed
+    let ec = ec::EcConfig {
+        data: 11,
+        parity: 1,
+        enabled: true,
+    };
+    let (s, _t) = single_node_cluster_with_ec(ec).await;
+    match s.put_system_object("control/x", b"v", None, 1).await {
+        Err(Error::Unsupported(msg)) => {
+            assert!(msg.contains("data+2"), "错误必须点明不变量：{msg}")
+        }
+        other => panic!("N < data+2 必须 fail-closed：{other:?}"),
+    }
+    // data=8/parity=4（写容错 2 槽）与 data=10/parity=2（N = data+2 恰好）都必须可写。
+    for ec in [
+        ec::EcConfig {
+            data: 8,
+            parity: 4,
+            enabled: true,
+        },
+        ec::EcConfig {
+            data: 10,
+            parity: 2,
+            enabled: true,
+        },
+    ] {
+        let (s, _t) = single_node_cluster_with_ec(ec).await;
+        assert_eq!(
+            s.put_system_object("control/x", b"v", None, 1)
+                .await
+                .unwrap(),
+            1,
+            "N={} data={} 必须可写",
+            ec.data + ec.parity,
+            ec.data
+        );
+        let obj = s.get_system_object("control/x").await.unwrap().unwrap();
+        assert_eq!(&obj.data[..], b"v");
+    }
+}
+
+/// 最终评审 2：标记阶段已落 1..<Q_s 份证书即失败 → `Indeterminate`（可能已提交）。
+/// 读-after-failed-write 必须能看到该版本——证明「失败 ≠ 回滚」这层契约是真的。
+#[tokio::test]
+async fn system_object_marker_partial_returns_indeterminate_and_read_reveals_write() {
+    let c = Cluster::new(4, 3).await; // 12 槽，Q_s = 9
+    let k = "control/indeterminate";
+    assert_eq!(
+        c.stores[0]
+            .put_system_object(k, b"v1", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    // 标记内容：v2，token 2（= 真实第二写的锁 token），带证书。
+    let mut marker = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    marker.control_version = Some(2);
+    marker.fence_token = Some(2);
+    marker.control_committed = Some(true);
+    marker.versions[0].inline = Some(crate::meta::InlineData {
+        bytes: b"v2".to_vec(),
+    });
+    // 槽 4 预置同 token 的旧版本未提交副本：标记阶段该槽 Stale，其余 8 槽落证书 → 8/9。
+    let mut obstacle = marker.clone();
+    obstacle.control_version = Some(1);
+    obstacle.control_committed = Some(false);
+    write_control_slot(&c, 4, k, &obstacle).await;
+
+    let err = c.stores[0]
+        .write_meta_marker(layout::SYS_DIR, k, &marker, 2, &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Indeterminate(_)), "{err:?}");
+    // 读-after-failed-write：部分证书已落盘，新版本可被读到（不得假设回滚）。
+    let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!((obj.version, &obj.data[..]), (2, &b"v2"[..]));
+    assert_eq!(obj.fence_token, 2);
+}
+
+/// 最终评审 3：旧版无证书 meta 的迁移——fenced 锁内原地补证书（版本/数据不变），
+/// 幂等；损坏副本拒绝补证书。
+#[tokio::test]
+async fn system_object_recertify_legacy_meta_is_idempotent_and_refuses_corrupt() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/legacy";
+    assert_eq!(
+        c.stores[0]
+            .put_system_object(k, b"legacy", None, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    // 旧版形态：同版本/数据/token，但 control_committed = None（升级前落盘）；铺满 12 槽。
+    let mut legacy = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    legacy.control_committed = None;
+    for slot in 0..12 {
+        write_control_slot(&c, slot, k, &legacy).await;
+    }
+    assert!(matches!(
+        c.stores[1].get_system_object(k).await,
+        Err(Error::CorruptMeta(_))
+    ));
+    assert!(
+        c.stores[1].recertify_system_object(k).await.unwrap(),
+        "首次必须新写证书"
+    );
+    let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
+    assert_eq!((obj.version, &obj.data[..]), (1, &b"legacy"[..]));
+    assert!(
+        !c.stores[1].recertify_system_object(k).await.unwrap(),
+        "幂等：已有证书 → false"
+    );
+
+    // 损坏副本：拒绝认证（不得把不确定内容写成已提交）。
+    let k2 = "control/legacy-corrupt";
+    let mut legacy2 = legacy.clone();
+    legacy2.object_key = k2.into();
+    for slot in 0..3 {
+        write_control_slot(&c, slot, k2, &legacy2).await;
+    }
+    let path = layout::object_dir_for(&c.dirs[0][0], layout::SYS_DIR, k2)
+        .unwrap()
+        .join(meta::META_FILE);
+    tokio::fs::write(&path, b"not-an-xl-meta").await.unwrap();
+    assert!(matches!(
+        c.stores[1].recertify_system_object(k2).await,
+        Err(Error::CorruptMeta(_))
+    ));
+    // 槽 0 是损坏副本；检查另一个旧版副本未被写入证书。
+    let kept = disk_meta(&c.dirs[0][1], layout::SYS_DIR, k2).await;
+    assert_eq!(kept.control_committed, None, "拒绝路径不得落任何证书");
+}
+
+/// 最终评审 4：delete 面对无证书残骸必须 `CorruptMeta`，绝不 `Ok(false)` 谎报「不存在」。
+#[tokio::test]
+async fn system_object_delete_refuses_uncertified_residue() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/delete-residue";
+    // 第一阶段崩溃现场：3 槽未提交副本，无任何已提交副本。
+    let mut partial = fenced_meta(k, 1, 1);
+    partial.control_committed = Some(false);
+    for slot in 0..3 {
+        write_control_slot(&c, slot, k, &partial).await;
+    }
+    assert!(matches!(
+        c.stores[1].get_system_object(k).await,
+        Err(Error::CorruptMeta(_))
+    ));
+    let err = c.stores[1]
+        .delete_system_object(k, None, 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::CorruptMeta(_)), "{err:?}");
+    // 残骸原样保留（delete 未写入任何东西）。
+    let kept = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    assert_eq!(
+        (kept.control_version, kept.control_committed),
+        (Some(1), Some(false))
+    );
+}
