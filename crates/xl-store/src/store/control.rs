@@ -228,13 +228,28 @@ impl Store {
         Ok(true)
     }
 
-    /// Phase 1 升级门：给旧版（`control_committed = None`）控制 meta **原地补提交证书**。
+    /// Phase 1 升级门（**离线单节点迁移工具**）：给旧版（`control_committed = None`）
+    /// 控制 meta **原地补提交证书**。
+    ///
+    /// 集群模式一律 `Unsupported`：在线协调者可能读到远端未返回内容的旧副本，无法证明
+    /// 全集群同一内容/版本，认证 rank-max 本地副本可能把次 quorum 的旧版本覆盖到已提交
+    /// 版本上。离线流程：停掉整个集群 → 逐节点以单机 Store（本机盘集）调用本方法 →
+    /// 全部完成后再启动。离线时单机读集是完整的（所有副本都在本机），rank-max 选举与
+    /// 本地 ≥`Q_s` 提交证明成立。
     ///
     /// 在 fenced 锁内重读后写入：版本/数据不变，只置 `control_committed = Some(true)`，
     /// token 取锁发放值（严格高于所有已观察 token）。幂等：已有证书或键不存在 →
     /// `Ok(false)`；`Ok(true)` = 本次新写了证书。损坏副本/非控制形态/新代码第一阶段
     /// 残骸（`Some(false)`）→ `CorruptMeta`（绝不认证不确定内容；残骸由 put 推进版本覆盖）。
+    /// `write_meta_marker` 在部分证书落盘时可返回 [`Error::Indeterminate`]：该版本可能
+    /// 已对读可见，重试幂等（已认证 → `Ok(false)`），不得假设回滚。
     pub async fn recertify_system_object(&self, key: &str) -> Result<bool> {
+        if self.cfg.cluster.is_some() {
+            return Err(Error::Unsupported(
+                "recertify requires offline single-node mode; stop the cluster and run per node"
+                    .into(),
+            ));
+        }
         validate_control_key(key)?;
         let floor = self.control_token_floor(key).await?;
         let guard = self.control_lock(key, floor).await?;

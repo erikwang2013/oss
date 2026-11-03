@@ -2290,6 +2290,10 @@ impl Store {
             // 证书时该版本可能已被读到——写者结果**不确定**，调用方必须按 key 重读
             // 核对 token/version，不得假设回滚。
             if flipped > 0 {
+                // 非 stale 冲突的失败计入 quorum-unmet 健康信号（与 base 一致）
+                if !(fence_token.is_some() && stale) {
+                    self.bump_quorum_unmet_write();
+                }
                 let stale_note = if fence_token.is_some() && stale {
                     "（同时观察到更新写者的 fence token）"
                 } else {

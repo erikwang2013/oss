@@ -6837,33 +6837,29 @@ async fn system_object_marker_partial_returns_indeterminate_and_read_reveals_wri
 /// 幂等；损坏副本拒绝补证书。
 #[tokio::test]
 async fn system_object_recertify_legacy_meta_is_idempotent_and_refuses_corrupt() {
-    let c = Cluster::new(4, 3).await;
+    let (s, dirs) = store_12().await;
     let k = "control/legacy";
-    assert_eq!(
-        c.stores[0]
-            .put_system_object(k, b"legacy", None, 1)
-            .await
-            .unwrap(),
-        1
-    );
-    // 旧版形态：同版本/数据/token，但 control_committed = None（升级前落盘）；铺满 12 槽。
-    let mut legacy = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
+    assert_eq!(s.put_system_object(k, b"legacy", None, 1).await.unwrap(), 1);
+    // 旧版形态：同版本/数据/token，但 control_committed = None（升级前落盘）；铺满 12 盘。
+    let mut legacy = disk_meta(dirs[0].path(), layout::SYS_DIR, k).await;
     legacy.control_committed = None;
-    for slot in 0..12 {
-        write_control_slot(&c, slot, k, &legacy).await;
+    for d in &dirs {
+        s.write_meta_on(d.path(), layout::SYS_DIR, k, &legacy)
+            .await
+            .unwrap();
     }
     assert!(matches!(
-        c.stores[1].get_system_object(k).await,
+        s.get_system_object(k).await,
         Err(Error::CorruptMeta(_))
     ));
     assert!(
-        c.stores[1].recertify_system_object(k).await.unwrap(),
+        s.recertify_system_object(k).await.unwrap(),
         "首次必须新写证书"
     );
-    let obj = c.stores[2].get_system_object(k).await.unwrap().unwrap();
+    let obj = s.get_system_object(k).await.unwrap().unwrap();
     assert_eq!((obj.version, &obj.data[..]), (1, &b"legacy"[..]));
     assert!(
-        !c.stores[1].recertify_system_object(k).await.unwrap(),
+        !s.recertify_system_object(k).await.unwrap(),
         "幂等：已有证书 → false"
     );
 
@@ -6871,19 +6867,38 @@ async fn system_object_recertify_legacy_meta_is_idempotent_and_refuses_corrupt()
     let k2 = "control/legacy-corrupt";
     let mut legacy2 = legacy.clone();
     legacy2.object_key = k2.into();
-    for slot in 0..3 {
-        write_control_slot(&c, slot, k2, &legacy2).await;
+    for d in &dirs[..3] {
+        s.write_meta_on(d.path(), layout::SYS_DIR, k2, &legacy2)
+            .await
+            .unwrap();
     }
-    let path = layout::object_dir_for(&c.dirs[0][0], layout::SYS_DIR, k2)
+    let path = layout::object_dir_for(dirs[0].path(), layout::SYS_DIR, k2)
         .unwrap()
         .join(meta::META_FILE);
     tokio::fs::write(&path, b"not-an-xl-meta").await.unwrap();
     assert!(matches!(
-        c.stores[1].recertify_system_object(k2).await,
+        s.recertify_system_object(k2).await,
         Err(Error::CorruptMeta(_))
     ));
-    // 槽 0 是损坏副本；检查另一个旧版副本未被写入证书。
-    let kept = disk_meta(&c.dirs[0][1], layout::SYS_DIR, k2).await;
+    // 盘 0 是损坏副本；检查另一个旧版副本未被写入证书。
+    let kept = disk_meta(dirs[1].path(), layout::SYS_DIR, k2).await;
+    assert_eq!(kept.control_committed, None, "拒绝路径不得落任何证书");
+}
+
+/// 最终复查 3：recertify 必须拒绝集群模式（在线协调者无法证明全集群同一内容），
+/// 且拒绝路径不得在任何槽写证书。
+#[tokio::test]
+async fn system_object_recertify_rejected_in_cluster_mode() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/legacy-cluster";
+    let mut legacy = fenced_meta(k, 1, 1);
+    legacy.control_committed = None;
+    write_control_slot(&c, 0, k, &legacy).await;
+    match c.stores[0].recertify_system_object(k).await {
+        Err(Error::Unsupported(msg)) => assert!(msg.contains("offline single-node"), "{msg}"),
+        other => panic!("集群模式必须拒绝 recertify：{other:?}"),
+    }
+    let kept = disk_meta(&c.dirs[0][0], layout::SYS_DIR, k).await;
     assert_eq!(kept.control_committed, None, "拒绝路径不得落任何证书");
 }
 
