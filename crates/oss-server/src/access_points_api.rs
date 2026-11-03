@@ -232,7 +232,7 @@ async fn create(
         .create_access_point(&body.name, &body.bucket, uid, policy_json.as_deref(), ts)
         .await
     {
-        Ok(()) => {
+        Ok(true) => {
             state
                 .audit(
                     uid,
@@ -260,6 +260,8 @@ async fn create(
             )
                 .into_response()
         }
+        Ok(false) => (StatusCode::CONFLICT, "AP 已存在").into_response(),
+        // 并发下唯一约束兜底。
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
             (StatusCode::CONFLICT, "AP 已存在").into_response()
         }

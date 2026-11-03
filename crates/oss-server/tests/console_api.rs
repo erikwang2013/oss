@@ -1139,8 +1139,9 @@ async fn transform_preload_failure_keeps_cache_unloaded() {
 async fn transform_preload_resolves_bucket_when_ap_cache_misses() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path()).await;
+    let owner = st.db.create_user("owner", "pw", false).await.unwrap();
     st.db
-        .create_access_point("ap-pre", "preb", 1, None, 0)
+        .create_access_point("ap-pre", "preb", owner, None, 0)
         .await
         .unwrap();
     st.db

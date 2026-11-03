@@ -6,7 +6,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
-use xl_store::control_store::OwnerRef;
+use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
 
@@ -1066,7 +1066,7 @@ impl Db {
 
     // ---------- M8（S1）：访问点 ----------
 
-    /// 建 AP（同名冲突由调用方按 409 处理）。
+    /// 建 AP（同名冲突由调用方按 409 处理）。`false` = 同名已存在（不覆盖）。
     pub async fn create_access_point(
         &self,
         name: &str,
@@ -1074,20 +1074,24 @@ impl Db {
         owner_id: i64,
         policy_json: Option<&str>,
         now: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(name)
-        .bind(bucket)
-        .bind(owner_id)
-        .bind(policy_json)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    ) -> Result<bool> {
+        let owner = self.owner_ref(owner_id).await?;
+        let mut tx = self.pool.begin().await?;
+        let created = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.access_point_create(&AccessPointEntry {
+                name: name.to_string(),
+                bucket: bucket.to_string(),
+                owner,
+                policy_json: policy_json.map(str::to_string),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+        };
+        tx.commit().await?;
+        Ok(created)
     }
 
     /// 账户命名空间 v1：桶主的 12 位账户 ID（NULL/管理员桶 = 系统账户）。
@@ -1116,31 +1120,27 @@ impl Db {
         policy_json: Option<&str>,
         now: i64,
     ) -> Result<bool> {
-        let n =
-            sqlx::query("UPDATE access_points SET policy_json = ?, updated_at = ? WHERE name = ?")
-                .bind(policy_json)
-                .bind(now)
-                .bind(name)
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
-        Ok(n > 0)
+        let mut tx = self.pool.begin().await?;
+        let updated = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.access_point_set_policy(name, policy_json, now)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+        };
+        tx.commit().await?;
+        Ok(updated)
     }
 
     pub async fn delete_access_point(&self, name: &str) -> Result<bool> {
-        // SQLite 默认不启用 FK —— 显式删变换器行，不依赖 ON DELETE CASCADE。
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM olap_configs WHERE access_point = ?")
-            .bind(name)
-            .execute(&mut *tx)
-            .await?;
-        let n = sqlx::query("DELETE FROM access_points WHERE name = ?")
-            .bind(name)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let deleted = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.access_point_delete(name)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+        };
         tx.commit().await?;
-        Ok(n > 0)
+        Ok(deleted)
     }
 
     // ---------- M8（S2）：Object Lambda 变换器 ----------
@@ -1158,24 +1158,23 @@ impl Db {
         max_response_bytes: i64,
         now: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO olap_configs (access_point, kind, endpoint, module, module_sha256, \
-             timeout_ms, max_response_bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(access_point) DO UPDATE SET kind = excluded.kind, \
-             endpoint = excluded.endpoint, module = excluded.module, \
-             module_sha256 = excluded.module_sha256, timeout_ms = excluded.timeout_ms, \
-             max_response_bytes = excluded.max_response_bytes, updated_at = excluded.updated_at",
-        )
-        .bind(name)
-        .bind(kind)
-        .bind(endpoint)
-        .bind(module)
-        .bind(module_sha256)
-        .bind(timeout_ms)
-        .bind(max_response_bytes)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.olap_config_upsert(&OlapConfigEntry {
+                access_point: name.to_string(),
+                kind: kind.to_string(),
+                endpoint: endpoint.map(str::to_string),
+                module: module.map(<[u8]>::to_vec),
+                module_sha256: module_sha256.map(str::to_string),
+                timeout_ms,
+                max_response_bytes,
+                updated_at: now,
+            })
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1458,6 +1457,23 @@ impl Db {
             }
         };
         Ok(id.unwrap_or(0))
+    }
+
+    /// 本地数字 id → 自然键属主（写门面用）：0 → `Admin`；用户存在 → `User`；
+    /// 其余 → `RowNotFound`（uid 必须存在，不静默降级）。
+    pub async fn owner_ref(
+        &self,
+        owner_id: i64,
+    ) -> std::result::Result<OwnerRef, sqlx::Error> {
+        if owner_id == 0 {
+            return Ok(OwnerRef::Admin);
+        }
+        let username: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+                .bind(owner_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        username.map(OwnerRef::User).ok_or(sqlx::Error::RowNotFound)
     }
 
     pub async fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<i64> {
@@ -4509,6 +4525,44 @@ mod tests {
         assert!(db.delete_access_point("ap2").await.unwrap());
         assert!(store.access_point("ap2").await.unwrap().is_none());
         assert!(!db.delete_access_point("missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn standalone_writes_use_control_txn_and_preserve_owner_id() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let _admin = db.create_user("root", "pw", true).await.unwrap();
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        assert!(
+            db.create_access_point("ap1", "b1", alice, None, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.create_access_point("ap1", "b1", alice, None, 2)
+                .await
+                .unwrap()
+        );
+        let stored: i64 = sqlx::query_scalar("SELECT owner_id FROM access_points WHERE name='ap1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, alice, "单机创建仍写创建者本地 id");
+        assert_eq!(
+            db.control_store()
+                .access_point("ap1")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner,
+            OwnerRef::User("alice".into())
+        );
+        assert!(
+            db.set_access_point_policy("ap1", Some(r#"{"Statement":[]}"#), 3)
+                .await
+                .unwrap()
+        );
+        assert!(db.delete_access_point("ap1").await.unwrap());
+        assert!(!db.delete_access_point("ap1").await.unwrap());
     }
 
     #[tokio::test]
