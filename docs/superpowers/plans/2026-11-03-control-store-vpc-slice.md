@@ -299,3 +299,15 @@ Phase 0 的 `recertify_system_object` 只支持**真正的单节点部署**（�
 - [ ] 全量 `cargo test --workspace` + `cargo clippy --all-targets` + `cargo fmt --check`
 
 **通过标准：仓库里没有 SQLite 依赖、没有 SQL、没有迁移目录、没有 .db 文件；控制面只使用对象后端。**
+
+## 门禁记录
+
+2026-11-03，切片提交 `b76c2e8..b1ab94b`（Task 1–5），门禁在 worktree `phase0-control-foundation` 执行：
+
+- `cargo test -p xl-store`：446 passed / 0 failed / 1 ignored（6 个测试目标）。
+- `cargo test -p oss-server --no-fail-fast`：822 passed / 1 failed / 2 ignored；唯一失败 `jobs_engine::worker_timeout_is_failure`（4s 计时断言，机器负载 15–70 下的既有 timing flake），隔离重跑通过（2.23s）。有效 823 passed / 0 failed / 2 ignored。
+- `cargo clippy -p oss-server -p xl-store --all-targets`：exit 0，0 warnings（与 Phase 0 基线一致）。
+- `cargo fmt --all -- --check`：exit 0。
+- `cargo test -p oss-server --test control_store_vpc_diff`：3/3 passed。
+
+结论：切片门禁 PASS；可进入下一个切片（AP/OLAP）。
