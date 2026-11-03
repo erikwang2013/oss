@@ -18,6 +18,7 @@ use crate::meta::{self, ChecksumRecord, EncryptionRecord, ObjectLockRecord, XlMe
 
 mod cmk_rewrap;
 mod control;
+mod control_migrate;
 mod drives;
 pub mod ec;
 mod fsck;
@@ -43,6 +44,9 @@ pub use cmk_rewrap::{
     REFS_REPORT_CAP, REWRAP_MAX_BATCH, RewrapItem, RewrapOptions, RewrapReport,
 };
 pub use control::SystemObject;
+pub use control_migrate::{
+    LegacyContentGroup, LegacyControlCopy, LegacyControlScan, LegacyControlState,
+};
 pub use rebalance::RebalanceReport;
 pub use shrink::{
     ShrinkPlan, ShrinkPlanReport, ShrinkSlotStat, SlotMove, acquire_shrink_lock, shrink_lock_busy,

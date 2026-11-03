@@ -450,7 +450,7 @@ impl Store {
     }
 }
 
-fn validate_control_key(key: &str) -> Result<()> {
+pub(super) fn validate_control_key(key: &str) -> Result<()> {
     layout::validate_key(key)?;
     if !key.starts_with(CONTROL_PREFIX) {
         return Err(Error::InvalidKey(format!(
@@ -488,7 +488,7 @@ fn check_cas(
 }
 
 /// 单版本控制对象 meta：数据内联（数据面读路径不经过它，PartRef 仅满足解码/兼容契约）。
-fn control_meta(
+pub(super) fn control_meta(
     key: &str,
     version: u64,
     fence_token: u64,
