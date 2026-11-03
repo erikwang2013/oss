@@ -3,7 +3,7 @@
 //! 本切片只读；写路径的 `ControlTxn` 适配器由后续任务加入。
 
 use sqlx::{Row, SqlitePool};
-use xl_store::control_store::{ControlError, ControlStore, VpcEndpoint};
+use xl_store::control_store::{ControlError, ControlStore, ControlTxn, VpcEndpoint};
 
 pub struct SqliteControlStore {
     pool: SqlitePool,
@@ -49,5 +49,97 @@ impl ControlStore for SqliteControlStore {
         .await
         .map_err(|e| ControlError::Backend(e.to_string()))?;
         Ok(rows.iter().map(endpoint_from).collect())
+    }
+}
+
+/// 调用方事务内的写句柄。借用现有连接，绝不 begin/commit/rollback——事务边界
+/// 归调用方（Raft apply / 快照安装），这是与 `raft_applied` 原子性的唯一来源。
+pub struct SqliteControlTxn<'a> {
+    conn: &'a mut sqlx::SqliteConnection,
+}
+
+impl<'a> SqliteControlTxn<'a> {
+    pub fn new(conn: &'a mut sqlx::SqliteConnection) -> Self {
+        Self { conn }
+    }
+}
+
+fn backend(e: sqlx::Error) -> ControlError {
+    ControlError::Backend(e.to_string())
+}
+
+#[async_trait::async_trait]
+impl ControlTxn for SqliteControlTxn<'_> {
+    async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError> {
+        sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
+            .bind(account_id)
+            .fetch_optional(&mut *self.conn)
+            .await
+            .map_err(backend)
+    }
+
+    async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError> {
+        sqlx::query(
+            "INSERT INTO vpc_endpoints \
+             (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(vpce_id) DO UPDATE SET vpc_id = excluded.vpc_id, \
+               account_id = excluded.account_id, state = excluded.state, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(&row.vpce_id)
+        .bind(&row.vpc_id)
+        .bind(&row.account_id)
+        .bind(&row.state)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&mut *self.conn)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn vpc_endpoint_delete(&mut self, vpce_id: &str) -> Result<bool, ControlError> {
+        let res = sqlx::query("DELETE FROM vpc_endpoints WHERE vpce_id = ?")
+            .bind(vpce_id)
+            .execute(&mut *self.conn)
+            .await
+            .map_err(backend)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn vpc_endpoints(&mut self) -> Result<Vec<VpcEndpoint>, ControlError> {
+        let rows = sqlx::query(
+            "SELECT vpce_id, vpc_id, account_id, state, created_at, updated_at \
+             FROM vpc_endpoints ORDER BY vpce_id",
+        )
+        .fetch_all(&mut *self.conn)
+        .await
+        .map_err(backend)?;
+        Ok(rows.iter().map(endpoint_from).collect())
+    }
+
+    async fn replace_vpc_endpoints(&mut self, rows: &[VpcEndpoint]) -> Result<(), ControlError> {
+        sqlx::query("DELETE FROM vpc_endpoints")
+            .execute(&mut *self.conn)
+            .await
+            .map_err(backend)?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO vpc_endpoints \
+                 (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.vpce_id)
+            .bind(&row.vpc_id)
+            .bind(&row.account_id)
+            .bind(&row.state)
+            .bind(row.created_at)
+            .bind(row.updated_at)
+            .execute(&mut *self.conn)
+            .await
+            .map_err(backend)?;
+        }
+        Ok(())
     }
 }

@@ -9,6 +9,7 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
+use xl_store::control_store::ControlTxn;
 
 mod accounts;
 pub(crate) mod inventory;
@@ -250,6 +251,11 @@ fn lifecycle_rows_v2(
         .collect();
     rows.sort_by(|a, b| (&a.prefix, &a.rule_id).cmp(&(&b.prefix, &b.rule_id)));
     rows
+}
+
+/// apply 的 fail-stop 语义：`ControlError` 一律视为内部不变量破坏（同旧 SQL `?`）。
+fn control_err(e: xl_store::control_store::ControlError) -> sqlx::Error {
+    sqlx::Error::Protocol(e.to_string())
 }
 
 /// 应用一条命令。业务拒绝 = `Ok(Applied{response})`；内部错误 = `Err`（事务回滚，fail-stop）。
@@ -831,39 +837,34 @@ pub(crate) async fn apply_command(
             {
                 ControlResponse::Invalid
             } else {
-                let status: Option<String> =
-                    sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
-                        .bind(&endpoint.account_id)
-                        .fetch_optional(&mut *cw.conn())
-                        .await?;
-                if status.as_deref() != Some("active") {
+                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                if txn
+                    .account_status(&endpoint.account_id)
+                    .await
+                    .map_err(control_err)?
+                    .as_deref()
+                    != Some("active")
+                {
                     ControlResponse::Invalid
                 } else {
-                    sqlx::query(
-                        "INSERT INTO vpc_endpoints \
-                         (vpce_id, vpc_id, account_id, state, created_at, updated_at) \
-                         VALUES (?, ?, ?, ?, ?, ?) \
-                         ON CONFLICT(vpce_id) DO UPDATE SET vpc_id = excluded.vpc_id, \
-                           account_id = excluded.account_id, state = excluded.state, \
-                           updated_at = excluded.updated_at",
-                    )
-                    .bind(&endpoint.vpce_id)
-                    .bind(&endpoint.vpc_id)
-                    .bind(&endpoint.account_id)
-                    .bind(&endpoint.state)
-                    .bind(endpoint.created_at)
-                    .bind(endpoint.updated_at)
-                    .execute(&mut *cw.conn())
-                    .await?;
+                    let row = xl_store::control_store::VpcEndpoint {
+                        vpce_id: endpoint.vpce_id.clone(),
+                        vpc_id: endpoint.vpc_id.clone(),
+                        account_id: endpoint.account_id.clone(),
+                        state: endpoint.state.clone(),
+                        created_at: endpoint.created_at,
+                        updated_at: endpoint.updated_at,
+                    };
+                    txn.vpc_endpoint_upsert(&row).await.map_err(control_err)?;
                     ControlResponse::Ok
                 }
             }
         }
         ControlCommand::VpcEndpointDelete { vpce_id } => {
-            sqlx::query("DELETE FROM vpc_endpoints WHERE vpce_id = ?")
-                .bind(vpce_id)
-                .execute(&mut *cw.conn())
-                .await?;
+            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+            txn.vpc_endpoint_delete(vpce_id)
+                .await
+                .map_err(control_err)?;
             ControlResponse::Ok
         }
         #[cfg(test)]
@@ -1722,5 +1723,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Task 3：`SqliteControlTxn` 只在调用方事务内执行，不自行 begin/commit。
+    /// upsert 保留 created_at、delete 幂等、读按 `vpce_id` 升序；回滚后无行。
+    #[tokio::test]
+    async fn vpc_apply_upsert_delete_matches_legacy_and_rolls_back() {
+        use crate::control_store::SqliteControlTxn;
+        use xl_store::control_store::{ControlTxn, VpcEndpoint};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, name, status, created_at, updated_at) \
+             VALUES ('000000000042', 'acme', 'active', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let row = crate::raft::data::VpcEndpointRow {
+            vpce_id: "vpce-1".into(),
+            vpc_id: "vpc-1".into(),
+            account_id: "000000000042".into(),
+            state: "active".into(),
+            created_at: 10,
+            updated_at: 10,
+        };
+
+        let mut tx = db.pool().begin().await.unwrap();
+        {
+            let mut cw = control_tx(&mut tx);
+            assert_eq!(
+                apply_command(
+                    &mut cw,
+                    &ControlCommand::VpcEndpointUpsert {
+                        endpoint: row.clone()
+                    }
+                )
+                .await
+                .unwrap()
+                .response,
+                ControlResponse::Ok
+            );
+            let mut txn = SqliteControlTxn::new(cw.conn());
+            assert_eq!(
+                txn.account_status("000000000042").await.unwrap().as_deref(),
+                Some("active")
+            );
+            assert_eq!(txn.account_status("000000000099").await.unwrap(), None);
+
+            let updated = VpcEndpoint {
+                vpce_id: row.vpce_id.clone(),
+                vpc_id: "vpc-2".into(),
+                account_id: row.account_id.clone(),
+                state: "disabled".into(),
+                created_at: 99, // 更新时不得覆盖 created_at
+                updated_at: 11,
+            };
+            txn.vpc_endpoint_upsert(&updated).await.unwrap();
+            let rows = txn.vpc_endpoints().await.unwrap();
+            assert_eq!(
+                rows,
+                vec![VpcEndpoint {
+                    vpce_id: "vpce-1".into(),
+                    vpc_id: "vpc-2".into(),
+                    account_id: "000000000042".into(),
+                    state: "disabled".into(),
+                    created_at: 10,
+                    updated_at: 11,
+                }],
+                "upsert 保留 created_at，其余列取自入参"
+            );
+
+            assert!(txn.vpc_endpoint_delete("vpce-1").await.unwrap());
+            assert!(
+                !txn.vpc_endpoint_delete("vpce-1").await.unwrap(),
+                "delete 幂等：无行返回 false"
+            );
+            assert!(txn.vpc_endpoints().await.unwrap().is_empty());
+        }
+        tx.rollback().await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vpc_endpoints")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "事务适配器不提交：回滚后必须无行");
     }
 }
