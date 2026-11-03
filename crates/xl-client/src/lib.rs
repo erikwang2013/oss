@@ -2404,9 +2404,8 @@ mod tests {
     #[tokio::test]
     async fn control_raw_roundtrip() {
         use xl_store::layout;
-        let tmp: Vec<tempfile::TempDir> = (0..4)
-            .map(|_| tempfile::TempDir::new().unwrap())
-            .collect();
+        let tmp: Vec<tempfile::TempDir> =
+            (0..4).map(|_| tempfile::TempDir::new().unwrap()).collect();
         let dirs: Vec<std::path::PathBuf> = tmp.iter().map(|d| d.path().to_path_buf()).collect();
         let addr = free_addr().await;
         let nodes = vec![("n1".to_string(), addr.to_string())];

@@ -45,7 +45,7 @@ pub use cmk_rewrap::{
 };
 pub use control::SystemObject;
 pub use control_migrate::{
-    LegacyContentGroup, LegacyControlCopy, LegacyControlScan, LegacyControlState,
+    LegacyContentGroup, LegacyControlCopy, LegacyControlScan, LegacyControlState, RecertifyOutcome,
 };
 pub use rebalance::RebalanceReport;
 pub use shrink::{

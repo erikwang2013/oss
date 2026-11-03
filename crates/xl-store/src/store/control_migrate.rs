@@ -24,6 +24,20 @@ pub enum LegacyControlState {
     CompletionNeeded,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecertifyOutcome {
+    Missing,
+    AlreadyCommitted {
+        version: u64,
+        certified: usize,
+    },
+    Certified {
+        version: u64,
+        certified: usize,
+        token: u64,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct LegacyControlCopy {
     pub node: String,
@@ -232,9 +246,7 @@ impl Store {
                     )));
                 }
                 let m = XlMeta::decode(&bytes).map_err(|e| {
-                    Error::CorruptMeta(format!(
-                        "控制对象 {key:?} 槽 {slot} 解码失败：{e}"
-                    ))
+                    Error::CorruptMeta(format!("控制对象 {key:?} 槽 {slot} 解码失败：{e}"))
                 })?;
                 if m.object_key != key {
                     return Err(Error::CorruptMeta(format!(
@@ -309,6 +321,59 @@ impl Store {
             chosen,
             state,
             chosen_meta,
+        })
+    }
+
+    /// 集群补证书：fenced 锁内重扫（权威证据）→ 现有标记阶段写提交证书。
+    /// 绝不调用 `commit_control_meta` 的数据阶段，版本/内容/tombstone 原样保留。
+    /// `Indeterminate` 原样上抛（可能已提交）；重跑走“已有部分证书 + 总副本 ≥ Q_s”
+    /// 的补齐分支收敛。
+    pub async fn recertify_system_object_cluster(&self, key: &str) -> Result<RecertifyOutcome> {
+        control::validate_control_key(key)?;
+        if self.cfg.cluster.is_none() {
+            return Err(Error::Unsupported(
+                "control-recertify 仅支持集群部署；单节点请用 recertify_system_object".into(),
+            ));
+        }
+        let floor = self.control_token_floor(key).await?;
+        let guard = self.control_lock(key, floor).await?;
+        if guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约在获取后即失效".into()));
+        }
+        let scan = self.scan_legacy_control_object(key).await?;
+        let Some(chosen) = scan.chosen else {
+            return Ok(RecertifyOutcome::Missing);
+        };
+        let version = scan.groups[chosen].version;
+        if scan.state == LegacyControlState::AlreadyCommitted {
+            return Ok(RecertifyOutcome::AlreadyCommitted {
+                version,
+                certified: scan.groups[chosen].certified,
+            });
+        }
+        // 锁 token 必须严格大于**所有已观察** token（含未提交残骸的高水位）。
+        let max_token = scan.copies.iter().map(|c| c.token).max().unwrap_or(0);
+        let commit_token = guard.commit_token(0, max_token)?;
+        let mut marker = scan
+            .chosen_meta
+            .expect("Certifiable/CompletionNeeded 必有代表副本");
+        marker.control_committed = Some(true);
+        marker.fence_token = Some(commit_token);
+        if guard.lease_lost() {
+            return Err(Error::QuorumUnmet("集群锁租约丢失，补证书中止".into()));
+        }
+        let flipped = self
+            .write_meta_marker(layout::SYS_DIR, key, &marker, commit_token, &[])
+            .await?;
+        if flipped == 0 {
+            return Err(Error::QuorumUnmet(format!(
+                "控制对象 {key:?} 补证书 0 槽（未提交）"
+            )));
+        }
+        Ok(RecertifyOutcome::Certified {
+            version,
+            certified: flipped,
+            token: commit_token,
         })
     }
 }

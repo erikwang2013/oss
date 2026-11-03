@@ -33,20 +33,20 @@ use super::{LockGuard, Store};
 
 /// 控制对象写锁：集群下 fenced 集群锁先声明 → 先 Drop（与获取顺序相反：
 /// 本机 mutex → flock → fenced 集群锁）。
-struct ControlGuard {
+pub(super) struct ControlGuard {
     fenced: Option<super::lock::FencedLockGuard>,
     _local: LockGuard,
 }
 
 impl ControlGuard {
     /// 集群租约是否丢失（单机恒 false）——写入口在提交点前检查。
-    fn lease_lost(&self) -> bool {
+    pub(super) fn lease_lost(&self) -> bool {
         self.fenced.as_ref().is_some_and(|g| g.lease_lost())
     }
 
     /// 提交 token：集群 = 持久化锁发放的 token（并校验其严格大于已提交 token）；
     /// 单机/多盘 = 调用方提供的 token（Task 2 语义逐字节不变）。
-    fn commit_token(&self, caller_token: u64, cur_fence: u64) -> Result<u64> {
+    pub(super) fn commit_token(&self, caller_token: u64, cur_fence: u64) -> Result<u64> {
         let Some(g) = &self.fenced else {
             return Ok(caller_token);
         };
@@ -235,8 +235,8 @@ impl Store {
     /// 集群模式的旧版无证书 meta **不受支持**（本方法返回 `Unsupported`）：节点只能
     /// 看到自己的槽；标准 12 槽拓扑上单节点 prepare quorum 不满足（工具不可用），而
     /// 本地盘数 ≥ `data+1` 的节点可能把失败写残骸认证后覆盖本机已提交副本。集群迁移
-    /// 需要单独的跨节点 raw-copy 扫描（同一 `(control_version, content)` 组至少 `Q_s`
-    /// 份才可认证，否则 `CorruptMeta`），**尚未实现**。
+    /// 用 `Store::recertify_system_object_cluster`（跨节点 raw-copy 扫描：同一
+    /// `(control_version, content)` 组至少 `Q_s` 份才可认证，否则 `CorruptMeta`）。
     ///
     /// 在 fenced 锁内重读后写入：版本/数据不变，只置 `control_committed = Some(true)`，
     /// token 取锁发放值（严格高于所有已观察 token）。幂等：已有证书或键不存在 →
@@ -363,7 +363,7 @@ impl Store {
     /// 最大的 `fence_token`（无则 0）。token 一旦出现在任何槽就不得复用。高水位可能
     /// 落后于已提交 meta（单机→集群升级、`.fence` 丢失），没有下限时每次获取只抬 1，
     /// 写入会以 Conflict 永久楔死；单机无锁发放，直接 0。
-    async fn control_token_floor(&self, key: &str) -> Result<u64> {
+    pub(super) async fn control_token_floor(&self, key: &str) -> Result<u64> {
         if self.cfg.cluster.is_none() {
             return Ok(0);
         }
@@ -373,7 +373,7 @@ impl Store {
     /// CAS 串行化：本机两层（进程内 mutex + `flock`，跨进程互斥）；集群再叠加 fenced
     /// 集群锁——先本机后集群，与数据面「对象锁 → 集群锁」顺序一致。集群分支不能复用
     /// `lock_object`：它会先取同 key 的数据面租约锁，锁表拒绝同 holder 的 fenced 重入。
-    async fn control_lock(&self, key: &str, min_token: u64) -> Result<ControlGuard> {
+    pub(super) async fn control_lock(&self, key: &str, min_token: u64) -> Result<ControlGuard> {
         let local = self.lock_object_local(layout::SYS_DIR, key).await?;
         let fenced = if self.cfg.cluster.is_some() {
             Some(

@@ -1,6 +1,8 @@
 use super::*;
 #[path = "tests_control_migrate.rs"]
 mod control_migrate;
+#[path = "tests_control_recertify.rs"]
+mod control_recertify;
 // 拆分后 tests 不再经 store.rs 蹭到 Digest trait（md5/sha2 的 new/finalize 需要）
 use md5::Digest as _;
 

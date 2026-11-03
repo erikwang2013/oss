@@ -42,7 +42,12 @@ async fn mesh_read_control_raw_returns_all_copies_ignoring_certificate() {
             .unwrap()
             .join("xl.meta");
         let disk = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(&copy.meta[..], &disk[..], "槽 {} 字节必须与盘上一致", copy.slot);
+        assert_eq!(
+            &copy.meta[..],
+            &disk[..],
+            "槽 {} 字节必须与盘上一致",
+            copy.slot
+        );
     }
     let slot0 = XlMeta::decode(
         &resp
@@ -118,21 +123,21 @@ async fn in_process_mesh_forwards_control_raw() {
 // ---------- Task 3：全槽扫描、规范分组与状态判定（只读） ----------
 
 /// 生产形态的 legacy 控制 meta：已提交前的第一阶段被剥离，只剩 `control_committed=None`。
-fn legacy_meta(key: &str, version: u64, token: u64, data: &[u8]) -> XlMeta {
+pub(super) fn legacy_meta(key: &str, version: u64, token: u64, data: &[u8]) -> XlMeta {
     let mut m = crate::store::control::control_meta(key, version, token, Some(data), false);
     m.control_committed = None;
     m
 }
 
 /// 带提交证书的控制 meta（`Some(true)`）。
-fn certified_meta(key: &str, version: u64, token: u64, data: &[u8]) -> XlMeta {
+pub(super) fn certified_meta(key: &str, version: u64, token: u64, data: &[u8]) -> XlMeta {
     let mut m = crate::store::control::control_meta(key, version, token, Some(data), false);
     m.control_committed = Some(true);
     m
 }
 
 /// 全部槽的 `xl.meta` / `.new` 字节快照（失败路径零写入断言）。
-async fn snapshot(c: &Cluster, key: &str) -> Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+pub(super) async fn snapshot(c: &Cluster, key: &str) -> Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> {
     let mut out = Vec::new();
     for drive in c.dirs.iter().flatten() {
         let dir = layout::object_dir_for(drive, layout::SYS_DIR, key).unwrap();
@@ -161,13 +166,22 @@ fn legacy_scan_groups_ignoring_token_and_certificate() {
     );
     let mut c = a.clone();
     c.versions[0].inline.as_mut().unwrap().bytes = b"v2".to_vec();
-    assert_ne!(canonical_content(&a).unwrap(), canonical_content(&c).unwrap());
+    assert_ne!(
+        canonical_content(&a).unwrap(),
+        canonical_content(&c).unwrap()
+    );
     let mut d = a.clone();
     d.control_version = Some(2);
-    assert_ne!(canonical_content(&a).unwrap(), canonical_content(&d).unwrap());
+    assert_ne!(
+        canonical_content(&a).unwrap(),
+        canonical_content(&d).unwrap()
+    );
     let mut e = a.clone();
     e.control_deleted = Some(true);
-    assert_ne!(canonical_content(&a).unwrap(), canonical_content(&e).unwrap());
+    assert_ne!(
+        canonical_content(&a).unwrap(),
+        canonical_content(&e).unwrap()
+    );
 }
 
 /// 12 槽（Q_s=9）：唯一同内容组恰 9 份 → Certifiable，chosen 指向该组。
@@ -241,13 +255,15 @@ async fn legacy_scan_refuses_phase1_residue_and_non_control() {
     for slot in 0..9 {
         write_control_slot(&c, slot, k2, &plain).await;
     }
-    let err = c.stores[0].scan_legacy_control_object(k2).await.unwrap_err();
+    let err = c.stores[0]
+        .scan_legacy_control_object(k2)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, crate::error::Error::CorruptMeta(_)),
         "实得：{err:?}"
     );
-    let err = c
-        .stores[0]
+    let err = c.stores[0]
         .scan_legacy_control_object("objects/not-control")
         .await
         .unwrap_err();
@@ -342,7 +358,7 @@ async fn legacy_scan_ranks_preserved_old_certificate() {
 /// 纯分类：多个同内容组都达到 Q_s（2Q_s>N 下理论不可达）→ 防御性拒绝。
 #[test]
 fn classify_rejects_multiple_quorum_groups() {
-    use crate::store::control_migrate::{classify, LegacyContentGroup};
+    use crate::store::control_migrate::{LegacyContentGroup, classify};
     let g = |version: u64, byte: u8| LegacyContentGroup {
         version,
         content: [byte; 32],
