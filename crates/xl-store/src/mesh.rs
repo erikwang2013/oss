@@ -102,6 +102,20 @@ pub struct MetaRead {
     pub key: String,
 }
 
+/// 一块盘上真实存在的控制对象 `xl.meta` 原始字节（不解码、不选举、不过滤证书）。
+#[derive(Clone, Debug)]
+pub struct ControlRawCopy {
+    pub slot: u16,
+    pub meta: Bytes,
+}
+
+/// 单节点 raw-copy 扫描结果：`slots_ok` = 确定性观察的本地槽数（命中或 NotFound）。
+#[derive(Clone, Debug, Default)]
+pub struct ControlRawResp {
+    pub copies: Vec<ControlRawCopy>,
+    pub slots_ok: u32,
+}
+
 /// 单槽位 ack：`hash` = 该槽位**实际写入/翻转的内容**的 [`content_hash`]。
 #[derive(Clone, Debug)]
 pub struct SlotAck {
@@ -238,6 +252,8 @@ pub struct NodeHealth {
     /// Phase 0 round 3：对端理解提交证书协议（全量扇出 + token 优先选举 + 证书槽上报）。
     /// `fenced_meta` 由 693a7a7 节点已宣告，无法区分证书协议 → 专用能力位。
     pub control_quorum: bool,
+    /// Phase 3 前置：对端理解 `ReadControlRaw`（旧节点缺省 false = 会静默忽略 → fail-closed）。
+    pub control_raw: bool,
 }
 
 /// 本节点拓扑指纹：`topo_epoch` + `topo_hash`（[`NodeHealth`] 字段 6/7 的来源）。
@@ -487,6 +503,12 @@ pub trait MeshTransport: Send + Sync + std::fmt::Debug {
     async fn commit_meta(&self, node: &str, m: MetaWrite) -> Result<MetaAck>;
     async fn abort_meta(&self, node: &str, m: MetaWrite) -> Result<()>;
     async fn read_meta(&self, node: &str, r: MetaRead) -> Result<MetaSnapshot>;
+    /// Phase 3 前置：只读原始控制副本。默认 `Unsupported`——旧替身不必被迫实现，
+    /// 更不能伪装成空结果（空 = 0 副本，会被误读为缺席）。
+    async fn read_control_raw(&self, node: &str, r: MetaRead) -> Result<ControlRawResp> {
+        let _ = (node, r);
+        Err(Error::Unsupported("read_control_raw 未实现".into()))
+    }
     /// 删除本机 meta（可见性提交点的远端分派；失败必须上抛，不得吞）
     async fn delete_meta(&self, node: &str, r: MetaRead) -> Result<()>;
     async fn ensure_bucket(&self, node: &str, bucket: &str) -> Result<()>;

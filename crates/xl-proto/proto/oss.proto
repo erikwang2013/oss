@@ -10,6 +10,8 @@ service Mesh {
   rpc CommitMeta(MetaWrite) returns (MetaAck);
   rpc AbortMeta(MetaWrite) returns (WriteResp);
   rpc ReadMeta(MetaRead) returns (MetaResp);
+  // Phase 3 前置：只读原始副本（每盘 `xl.meta` 字节，不解码/不选举/不过滤证书）。
+  rpc ReadControlRaw(MetaRead) returns (ControlRawResp);
   rpc DeleteMeta(MetaRead) returns (WriteResp);
   rpc EnsureBucket(BucketRef) returns (WriteResp);
   rpc DeleteBucket(BucketRef) returns (WriteResp);
@@ -84,6 +86,10 @@ message MetaResp  { bool found=1; bytes meta=2; int64 mod_time_nanos=3; uint32 s
                     uint64 max_version=8;
                     // 控制对象：本节点已解码副本数 / 损坏副本数（无证书时区分缺席与不可判定）。
                     uint32 copies=9; uint32 corrupt=10; }
+message ControlRawCopy { uint32 slot=1; bytes meta=2; }
+// 只读 raw 扫描应答：slots_ok = 本节点确定性观察的槽数（命中或 NotFound；盘不在册/
+// 读错误不计）；copies 只含真实存在的 `xl.meta` 字节（忽略 `.new`）。
+message ControlRawResp { repeated ControlRawCopy copies=1; uint32 slots_ok=2; }
 message BucketRef { string bucket=1; }  message BucketsResp { repeated string names=1; }
 message ListReq { string bucket=1; string prefix=2; string delimiter=3; string marker=4; uint32 limit=5;
                   bool include_deleted=6;
@@ -112,7 +118,9 @@ message NodeHealth { string node_id=1; string version=2; repeated SlotState slot
                      bool fenced_meta=10;
                      // Phase 0 round 3：本节点理解提交证书 + 全量扇出 + token 优先选举。
                      // 专用能力位（fenced_meta 由 693a7a7 节点已宣告，不能区分证书协议）。
-                     bool control_quorum=11; }
+                     bool control_quorum=11;
+                     // Phase 3 前置：本节点理解 ReadControlRaw（旧节点缺省 false → fail-closed）。
+                     bool control_raw=12; }
 message SlotState { uint32 slot=1; bool up=2; }
 message DriveSpace { uint32 set=1; uint32 drive=2; uint64 free_bytes=3; }
 message LockReq { string bucket=1; string key=2; int64 epoch_nanos=3; string epoch_node=4;

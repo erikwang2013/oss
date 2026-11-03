@@ -436,6 +436,7 @@ fn health(node: &str, epoch: u64, hash: &str, maintenance: bool, free: u64) -> N
         topo_epoch: epoch,
         topo_hash: hash.into(),
         control_quorum: true,
+        control_raw: true,
         drives: vec![DriveSpace {
             set: 0,
             drive: 0,

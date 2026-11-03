@@ -611,6 +611,7 @@ impl MeshTransport for TonicMesh {
             maintenance: resp.maintenance,
             fenced_meta: resp.fenced_meta,
             control_quorum: resp.control_quorum,
+            control_raw: resp.control_raw,
         })
     }
     // 分片 / meta / 版本目录 / 回收（切片二）；其余 RPC 随所属 Task 落地（6/8/9）。
@@ -1297,6 +1298,7 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             maintenance: h.maintenance,
             fenced_meta: h.fenced_meta,
             control_quorum: h.control_quorum,
+            control_raw: h.control_raw,
         }))
     }
 
@@ -1457,6 +1459,27 @@ impl xl_proto::mesh_server::Mesh for MeshSvc {
             .await
             .map_err(internal)?;
         Ok(tonic::Response::new(write_ok()))
+    }
+    async fn read_control_raw(
+        &self,
+        r: Request<xl_proto::MetaRead>,
+    ) -> std::result::Result<tonic::Response<xl_proto::ControlRawResp>, Status> {
+        let resp = self
+            .store
+            .mesh_read_control_raw(meta_read_from_proto(r.into_inner()))
+            .await
+            .map_err(internal)?;
+        Ok(tonic::Response::new(xl_proto::ControlRawResp {
+            copies: resp
+                .copies
+                .into_iter()
+                .map(|c| xl_proto::ControlRawCopy {
+                    slot: c.slot as u32,
+                    meta: c.meta.to_vec(),
+                })
+                .collect(),
+            slots_ok: resp.slots_ok,
+        }))
     }
     async fn delete_bucket(
         &self,

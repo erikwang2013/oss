@@ -92,6 +92,8 @@ impl Store {
             fenced_meta: true,
             // Phase 0 round 3：本版理解提交证书控制读协议。
             control_quorum: true,
+            // Phase 3 前置：本版理解只读原始控制副本 RPC。
+            control_raw: true,
         }
     }
 
@@ -1152,6 +1154,84 @@ impl Store {
                 })
             }
         }
+    }
+
+    /// Phase 3 前置：只读返回本机每盘控制对象的原始 `xl.meta` 字节。
+    /// 仅 `.oss.sys/control/`；不解码、不选举、不过滤证书；`.new` 永不读取。
+    /// 覆盖率口径：盘不在册不计（摘盘不能被当成「已观察且缺席」）；NotFound 计覆盖；
+    /// 读错误/超过 `MAX_INLINE + 64 KiB` → `CorruptMeta`（fail-closed，绝不截断）。
+    pub async fn mesh_read_control_raw(
+        &self,
+        r: crate::mesh::MetaRead,
+    ) -> Result<crate::mesh::ControlRawResp> {
+        if !layout::is_system_bucket(&r.bucket)
+            || !r.key.starts_with(super::control::CONTROL_PREFIX)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "ReadControlRaw 只接受 {}/{}*，实得 {}/{}",
+                layout::SYS_DIR,
+                super::control::CONTROL_PREFIX,
+                r.bucket,
+                r.key
+            )));
+        }
+        // meta 上限 + 版本链/头开销；先查 stat 再查实读，防超大文件撑爆内存。
+        const MAX_RAW: u64 = meta::MAX_INLINE + 64 * 1024;
+        let base = self.slot_base();
+        let mut copies = Vec::new();
+        let mut slots_ok = 0u32;
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
+            if !drives::drive_up(drive).await {
+                continue;
+            }
+            let path = layout::object_dir_for(drive, &r.bucket, &r.key)?.join(meta::META_FILE);
+            match tokio::fs::metadata(&path).await {
+                Ok(m) if m.len() > MAX_RAW => {
+                    return Err(Error::CorruptMeta(format!(
+                        "原始控制副本超过上限 {MAX_RAW}：{} 字节（{}）",
+                        m.len(),
+                        path.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    slots_ok += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::CorruptMeta(format!(
+                        "读取 {} 失败：{e}",
+                        path.display()
+                    )));
+                }
+            }
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    slots_ok += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::CorruptMeta(format!(
+                        "读取 {} 失败：{e}",
+                        path.display()
+                    )));
+                }
+            };
+            if bytes.len() as u64 > MAX_RAW {
+                return Err(Error::CorruptMeta(format!(
+                    "原始控制副本超过上限 {MAX_RAW}：{} 字节（{}）",
+                    bytes.len(),
+                    path.display()
+                )));
+            }
+            slots_ok += 1;
+            copies.push(crate::mesh::ControlRawCopy {
+                slot: base + d as u16,
+                meta: bytes::Bytes::from(bytes),
+            });
+        }
+        Ok(crate::mesh::ControlRawResp { copies, slots_ok })
     }
 }
 

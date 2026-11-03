@@ -125,6 +125,7 @@ impl MeshTransport for FakeMesh {
             maintenance: false,
             fenced_meta: true,
             control_quorum: true,
+            control_raw: true,
         })
     }
     async fn lock(&self, _: &str, _: LockReq) -> Result<LockResp> {
@@ -237,6 +238,7 @@ fn peer_wire_version_normalizes_legacy_and_unknown_fails_closed() {
         maintenance: false,
         fenced_meta: false,
         control_quorum: false,
+        control_raw: false,
     };
     assert_eq!(h(0).peer_data_wire_version(), 1);
     assert_eq!(h(1).peer_data_wire_version(), 1);
