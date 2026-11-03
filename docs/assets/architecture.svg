@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" width="960" height="800"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <title>OSS 系统架构</title>
-  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点与 OLAP/作业与 Batch/Inventory/存储分层与 Restore/控制台页面）、M9 Raft 同步强一致与 Level B 滚动升级、TLS/SASL 全链路、AP 别名/SourceIp、Inventory Parquet/Hive、tier local/远端 GC、生命周期完整 Filter、账户 MVP、DP-0 数据面握手。</desc>
+  <desc>五个 crate 的单向依赖：oss-server（ecat + axum）→ xl-s3 / xl-client → xl-store（xl-client → xl-proto，节点间 mesh），以及客户端与存储介质。现状：多盘 EC 8+4、集群 mesh、版本控制、DARE 式加密与对象锁、事件/Select/桶复制数据流（M1–M6）、多站点异步复制（M7）、M8 控制面（访问点与 OLAP/作业与 Batch/Inventory/存储分层与 Restore/控制台页面）、M9 Raft 同步强一致与 Level B 滚动升级、TLS/SASL 全链路、AP 别名/SourceIp、Inventory Parquet/Hive、tier local/远端 GC、生命周期完整 Filter、账户 MVP、DP-0 数据面握手。2026-11-03：控制面去数据库化 Phase 0/1——.oss.sys 系统命名空间、控制对象 CAS/单调 fencing、持久化锁 token，以及 ControlStore/ControlTxn 缝（vpc_endpoints 读写/快照迁移，SQLite 仍为默认后端）。</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
@@ -81,7 +81,7 @@
   <rect x="40" y="560" width="620" height="104" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
   <text x="60" y="584" font-size="13" font-weight="600" fill="#166534">xl-store · 存储内核（不依赖任何框架）</text>
   <text x="60" y="606" font-size="11" fill="#374151">提交协议：tmp → 各盘 rename 数据就位 → xl.meta 两阶段提交（quorum）← 提交点 · 布局校验（__XLDIR__ 展平）</text>
-  <text x="60" y="626" font-size="11" fill="#374151">EC 8+4 编解码与多盘分发 · 版本链（版本桶追加 / delete marker）· 对象锁守卫（GOVERNANCE/COMPLIANCE/LegalHold） · 复制状态（M6）</text>
+  <text x="60" y="626" font-size="11" fill="#374151">EC 8+4 编解码与多盘分发 · 版本链· 对象锁守卫（GOVERNANCE/COMPLIANCE/LegalHold） · 复制状态（M6） · .oss.sys 控制对象（CAS + fencing）</text>
   <text x="60" y="646" font-size="11" fill="#374151">密钥库 kms.rs（主密钥 wrap DEK）· 块对齐加密 crypto.rs（先加密后 EC）· mesh quorum 读写（DP-0 wire 握手）· flock 跨进程锁</text>
 
   <!-- KMS 侧块 -->
