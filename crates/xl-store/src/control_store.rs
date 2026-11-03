@@ -95,6 +95,29 @@ pub trait ControlTxn: Send {
     async fn vpc_endpoints(&mut self) -> Result<Vec<VpcEndpoint>, ControlError>;
     /// 整表替换（DELETE all + 按入参顺序 INSERT）。
     async fn replace_vpc_endpoints(&mut self, rows: &[VpcEndpoint]) -> Result<(), ControlError>;
+
+    /// 建 AP；同名已存在 → `Ok(false)`（不覆盖）。
+    async fn access_point_create(&mut self, row: &AccessPointEntry) -> Result<bool, ControlError>;
+    async fn access_point_set_policy(
+        &mut self,
+        name: &str,
+        policy_json: Option<&str>,
+        updated_at: i64,
+    ) -> Result<bool, ControlError>;
+    /// 先删该 AP 的 olap 行，再删 AP；返回是否确有 AP 行被删除。
+    async fn access_point_delete(&mut self, name: &str) -> Result<bool, ControlError>;
+    async fn access_point_exists(&mut self, name: &str) -> Result<bool, ControlError>;
+    /// 严格导出映射（`is_admin=1` → `Admin`；悬空属主 → `Invalid`）。
+    async fn access_points(&mut self) -> Result<Vec<AccessPointEntry>, ControlError>;
+    /// 整表替换：DELETE olap + AP，再按入参顺序 INSERT。
+    async fn replace_access_points(&mut self, rows: &[AccessPointEntry]) -> Result<(), ControlError>;
+    async fn olap_config_upsert(&mut self, row: &OlapConfigEntry) -> Result<(), ControlError>;
+    async fn olap_config_delete(&mut self, access_point: &str) -> Result<bool, ControlError>;
+    async fn olap_configs(&mut self) -> Result<Vec<OlapConfigEntry>, ControlError>;
+    /// 只 DELETE olap_configs，再按入参顺序 INSERT。
+    async fn replace_olap_configs(&mut self, rows: &[OlapConfigEntry]) -> Result<(), ControlError>;
+    /// 删该桶下全部 AP 及其 olap 行（桶删除级联）。
+    async fn delete_access_points_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError>;
 }
 
 #[cfg(test)]

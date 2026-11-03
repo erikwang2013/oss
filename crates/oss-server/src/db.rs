@@ -4601,6 +4601,85 @@ mod tests {
             0
         );
     }
+
+    #[tokio::test]
+    async fn control_txn_ap_olap_writes_and_owner_resolution() {
+        use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry};
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let admin = db.create_user("root", "pw", true).await.unwrap();
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            assert!(
+                txn.access_point_create(&AccessPointEntry {
+                    name: "ap1".into(),
+                    bucket: "b1".into(),
+                    owner: OwnerRef::User("alice".into()),
+                    policy_json: None,
+                    created_at: 1,
+                    updated_at: 2,
+                })
+                .await
+                .unwrap()
+            );
+            assert!(
+                !txn.access_point_create(&AccessPointEntry {
+                    name: "ap1".into(),
+                    bucket: "b1".into(),
+                    owner: OwnerRef::Admin,
+                    policy_json: None,
+                    created_at: 3,
+                    updated_at: 4,
+                })
+                .await
+                .unwrap(),
+                "同名不覆盖"
+            );
+            assert!(txn.access_point_exists("ap1").await.unwrap());
+            txn.olap_config_upsert(&OlapConfigEntry {
+                access_point: "ap1".into(),
+                kind: "http".into(),
+                endpoint: Some("https://x".into()),
+                module: Some(vec![1, 2, 3]),
+                module_sha256: Some("ab".into()),
+                timeout_ms: 5000,
+                max_response_bytes: 1024,
+                updated_at: 5,
+            })
+            .await
+            .unwrap();
+            let rows = txn.access_points().await.unwrap();
+            assert_eq!(rows[0].owner, OwnerRef::User("alice".into()));
+            assert!(txn.access_point_delete("ap1").await.unwrap());
+            assert!(!txn.access_point_delete("ap1").await.unwrap());
+            assert!(txn.olap_configs().await.unwrap().is_empty(), "AP 删除级联 OLAP");
+            // Admin 属主映射到本节点管理员 id；witness 由 install 测试覆盖。
+            assert!(
+                txn.access_point_create(&AccessPointEntry {
+                    name: "ap2".into(),
+                    bucket: "b1".into(),
+                    owner: OwnerRef::Admin,
+                    policy_json: None,
+                    created_at: 6,
+                    updated_at: 6,
+                })
+                .await
+                .unwrap()
+            );
+            let admin_id: i64 =
+                sqlx::query_scalar("SELECT owner_id FROM access_points WHERE name = 'ap2'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(admin_id, admin);
+        }
+        tx.commit().await.unwrap();
+        assert_eq!(
+            alice,
+            db.owner_uid(&OwnerRef::User("alice".into())).await.unwrap()
+        );
+    }
 }
 
 // ——— M4 切片 6：生命周期规则与作业（jobs 表进度） ———
@@ -7007,119 +7086,6 @@ impl Db {
             .execute(&mut *cw.conn())
             .await?;
         Ok(())
-    }
-
-    /// `false` = 同名 AP 已存在（调用方映射 Conflict，不覆盖策略）。
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_access_point_raw(
-        cw: &mut ControlWrite<'_>,
-        name: &str,
-        bucket: &str,
-        owner_id: i64,
-        policy_json: Option<&str>,
-        created_at: i64,
-        updated_at: i64,
-    ) -> Result<bool> {
-        let conn = cw.conn();
-        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM access_points WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&mut *conn)
-            .await?;
-        if exists.is_some() {
-            return Ok(false);
-        }
-        sqlx::query(
-            "INSERT INTO access_points (name, bucket, owner_id, policy_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(name)
-        .bind(bucket)
-        .bind(owner_id)
-        .bind(policy_json)
-        .bind(created_at)
-        .bind(updated_at)
-        .execute(&mut *conn)
-        .await?;
-        Ok(true)
-    }
-
-    pub(crate) async fn set_access_point_policy_raw(
-        cw: &mut ControlWrite<'_>,
-        name: &str,
-        policy_json: Option<&str>,
-        updated_at: i64,
-    ) -> Result<bool> {
-        let n =
-            sqlx::query("UPDATE access_points SET policy_json = ?, updated_at = ? WHERE name = ?")
-                .bind(policy_json)
-                .bind(updated_at)
-                .bind(name)
-                .execute(&mut *cw.conn())
-                .await?
-                .rows_affected();
-        Ok(n > 0)
-    }
-
-    pub(crate) async fn delete_access_point_cascade(
-        cw: &mut ControlWrite<'_>,
-        name: &str,
-    ) -> Result<bool> {
-        let conn = cw.conn();
-        sqlx::query("DELETE FROM olap_configs WHERE access_point = ?")
-            .bind(name)
-            .execute(&mut *conn)
-            .await?;
-        let n = sqlx::query("DELETE FROM access_points WHERE name = ?")
-            .bind(name)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected();
-        Ok(n > 0)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn olap_upsert_raw(
-        cw: &mut ControlWrite<'_>,
-        access_point: &str,
-        kind: &str,
-        endpoint: Option<&str>,
-        module: Option<&[u8]>,
-        module_sha256: Option<&str>,
-        timeout_ms: i64,
-        max_response_bytes: i64,
-        updated_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO olap_configs (access_point, kind, endpoint, module, module_sha256, \
-             timeout_ms, max_response_bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(access_point) DO UPDATE SET kind = excluded.kind, \
-             endpoint = excluded.endpoint, module = excluded.module, \
-             module_sha256 = excluded.module_sha256, timeout_ms = excluded.timeout_ms, \
-             max_response_bytes = excluded.max_response_bytes, updated_at = excluded.updated_at",
-        )
-        .bind(access_point)
-        .bind(kind)
-        .bind(endpoint)
-        .bind(module)
-        .bind(module_sha256)
-        .bind(timeout_ms)
-        .bind(max_response_bytes)
-        .bind(updated_at)
-        .execute(&mut *cw.conn())
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn olap_delete_raw(
-        cw: &mut ControlWrite<'_>,
-        access_point: &str,
-    ) -> Result<bool> {
-        let n = sqlx::query("DELETE FROM olap_configs WHERE access_point = ?")
-            .bind(access_point)
-            .execute(&mut *cw.conn())
-            .await?
-            .rows_affected();
-        Ok(n > 0)
     }
 
     pub(crate) async fn inventory_upsert_raw(

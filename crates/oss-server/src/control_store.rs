@@ -92,6 +92,14 @@ fn backend(e: sqlx::Error) -> ControlError {
     ControlError::Backend(e.to_string())
 }
 
+/// 缝错误 → sqlx 错误（调用方事务内 fail-stop 用）。
+pub(crate) fn to_sqlx(e: ControlError) -> sqlx::Error {
+    match e {
+        ControlError::Invalid(m) => sqlx::Error::Protocol(m),
+        ControlError::Backend(m) => sqlx::Error::Protocol(format!("control store backend: {m}")),
+    }
+}
+
 #[async_trait::async_trait]
 impl ControlTxn for SqliteControlTxn<'_> {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError> {
@@ -165,5 +173,54 @@ impl ControlTxn for SqliteControlTxn<'_> {
             .map_err(backend)?;
         }
         Ok(())
+    }
+
+    async fn access_point_create(&mut self, row: &AccessPointEntry) -> Result<bool, ControlError> {
+        ap_olap::txn_access_point_create(self, row).await
+    }
+
+    async fn access_point_set_policy(
+        &mut self,
+        name: &str,
+        policy_json: Option<&str>,
+        updated_at: i64,
+    ) -> Result<bool, ControlError> {
+        ap_olap::txn_access_point_set_policy(self, name, policy_json, updated_at).await
+    }
+
+    async fn access_point_delete(&mut self, name: &str) -> Result<bool, ControlError> {
+        ap_olap::txn_access_point_delete(self, name).await
+    }
+
+    async fn access_point_exists(&mut self, name: &str) -> Result<bool, ControlError> {
+        ap_olap::txn_access_point_exists(self, name).await
+    }
+
+    async fn access_points(&mut self) -> Result<Vec<AccessPointEntry>, ControlError> {
+        ap_olap::txn_access_points(self).await
+    }
+
+    async fn replace_access_points(&mut self, rows: &[AccessPointEntry]) -> Result<(), ControlError> {
+        ap_olap::txn_replace_access_points(self, rows).await
+    }
+
+    async fn olap_config_upsert(&mut self, row: &OlapConfigEntry) -> Result<(), ControlError> {
+        ap_olap::txn_olap_config_upsert(self, row).await
+    }
+
+    async fn olap_config_delete(&mut self, access_point: &str) -> Result<bool, ControlError> {
+        ap_olap::txn_olap_config_delete(self, access_point).await
+    }
+
+    async fn olap_configs(&mut self) -> Result<Vec<OlapConfigEntry>, ControlError> {
+        ap_olap::txn_olap_configs(self).await
+    }
+
+    async fn replace_olap_configs(&mut self, rows: &[OlapConfigEntry]) -> Result<(), ControlError> {
+        ap_olap::txn_replace_olap_configs(self, rows).await
+    }
+
+    async fn delete_access_points_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
+        ap_olap::txn_delete_access_points_for_bucket(self, bucket).await
     }
 }

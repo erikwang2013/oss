@@ -9,7 +9,7 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
-use xl_store::control_store::ControlTxn;
+use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 mod accounts;
 pub(crate) mod inventory;
@@ -640,18 +640,23 @@ pub(crate) async fn apply_command(
             if name.is_empty() || bucket.is_empty() || !bucket_exists(cw, bucket).await? {
                 ControlResponse::Invalid
             } else {
-                let owner_id = admin_owner_id(cw, owner).await?;
-                if Db::create_access_point_raw(
-                    cw,
-                    name,
-                    bucket,
-                    owner_id,
-                    policy_json.as_deref(),
-                    *created_at,
-                    *updated_at,
-                )
-                .await?
-                {
+                let owner = match owner {
+                    None => OwnerRef::Admin,
+                    Some(name) => OwnerRef::User(name.clone()),
+                };
+                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                let created = txn
+                    .access_point_create(&AccessPointEntry {
+                        name: name.clone(),
+                        bucket: bucket.clone(),
+                        owner,
+                        policy_json: policy_json.clone(),
+                        created_at: *created_at,
+                        updated_at: *updated_at,
+                    })
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                if created {
                     ControlResponse::Ok
                 } else {
                     ControlResponse::Conflict
@@ -659,7 +664,12 @@ pub(crate) async fn apply_command(
             }
         }
         ControlCommand::AccessPointDelete { name } => {
-            if Db::delete_access_point_cascade(cw, name).await? {
+            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+            if txn
+                .access_point_delete(name)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -670,8 +680,11 @@ pub(crate) async fn apply_command(
             policy_json,
             updated_at,
         } => {
-            if Db::set_access_point_policy_raw(cw, name, policy_json.as_deref(), *updated_at)
-                .await?
+            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+            if txn
+                .access_point_set_policy(name, policy_json.as_deref(), *updated_at)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
             {
                 ControlResponse::Ok
             } else {
@@ -709,27 +722,37 @@ pub(crate) async fn apply_command(
                         effects,
                     });
                 }
-                if !bucket_exists_for_ap(cw, access_point).await? {
+                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                if !txn
+                    .access_point_exists(access_point)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?
+                {
                     ControlResponse::NotFound
                 } else {
-                    Db::olap_upsert_raw(
-                        cw,
-                        access_point,
-                        kind,
-                        endpoint.as_deref(),
-                        decoded.as_deref(),
-                        module_sha256.as_deref(),
-                        *timeout_ms,
-                        *max_response_bytes,
-                        *updated_at,
-                    )
-                    .await?;
+                    txn.olap_config_upsert(&OlapConfigEntry {
+                        access_point: access_point.clone(),
+                        kind: kind.clone(),
+                        endpoint: endpoint.clone(),
+                        module: decoded,
+                        module_sha256: module_sha256.clone(),
+                        timeout_ms: *timeout_ms,
+                        max_response_bytes: *max_response_bytes,
+                        updated_at: *updated_at,
+                    })
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                     ControlResponse::Ok
                 }
             }
         }
         ControlCommand::OlapDelete { access_point } => {
-            if Db::olap_delete_raw(cw, access_point).await? {
+            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+            if txn
+                .olap_config_delete(access_point)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -1330,18 +1353,6 @@ async fn purge_jobs(
     } else {
         ControlResponse::Conflict
     })
-}
-
-async fn bucket_exists_for_ap(
-    cw: &mut ControlWrite<'_>,
-    access_point: &str,
-) -> Result<bool, sqlx::Error> {
-    // 变换器只能挂到已存在的 AP（olap_configs.access_point 是外键语义）。
-    let row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM access_points WHERE name = ?")
-        .bind(access_point)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.is_some())
 }
 
 #[cfg(test)]
