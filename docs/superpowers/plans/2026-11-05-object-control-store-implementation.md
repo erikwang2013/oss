@@ -189,14 +189,16 @@ Gate: `cargo test -p oss-server golden_manifest`.
 Depends: A1-A5. Files: `crates/oss-server/src/control_store_obj/mod.rs`, `root_io.rs`, `txn.rs`,
 `change.rs`, `origin.rs`.
 Interfaces: `ObjectControlStore { root: Arc<RootIo> }`, `ObjectControlTxn { pinned: Root, overlay,
-origin }`, `ObjectControlTxn::commit(self) -> Result<CommitStamp>`; `RootIo` wraps
-`Store::{get_local_control,put_local_control}`, implements `NodeIo` plus root CAS and read-back.
-`WriteOrigin` is defined here, constructor-private to apply/install/local façade.
+origin }`, `ObjectControlTxn::commit(self) -> Result<CommitStamp>`,
+`ObjectControlStore::transaction(origin, f) -> Result<T>` (whole-transaction retry on `Conflict`);
+`RootIo` wraps `Store::{get_local_control,put_local_control}`, implements `NodeIo` plus root CAS and
+read-back. `WriteOrigin` is defined here, constructor-private to apply/install/local façade.
 
 RED: empty txn no CAS; one-row txn writes path + root; crash matrix from the design (before nodes,
 after nodes, before root, during root, after root) reopens old/new only; stale token rejected;
-`Conflict` retry then success with a concurrent writer; `Indeterminate` re-read; root read-back
-verification; cache publication callback fired once; overlay scan used by cascade. GREEN: implement
+`Conflict` returned by `commit` and whole-transaction retry then success with a concurrent writer;
+last-admin guard re-evaluated on retry; `Indeterminate` re-read; root read-back verification; cache
+publication callback fired once per successful commit; overlay scan used by cascade. GREEN: implement
 per design §2; no SQL.
 
 Gate: `cargo test -p oss-server control_store_obj::txn`.

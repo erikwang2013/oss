@@ -3,8 +3,9 @@
 //! One immutable copy-on-write B+tree per table; the only mutable object is the
 //! root, whose local-control CAS is the commit point (design §2.2). This module
 //! is storage/transaction plumbing only: domain adapters (B2+) stage rows here
-//! and call [`ObjectControlTxn::commit`]. No begin/rollback is exposed; dropping
-//! a transaction discards its overlay.
+//! and commit. Prefer [`ObjectControlStore::transaction`], which re-runs the
+//! whole closure on a root CAS conflict so guards never replay on a stale root.
+//! No begin/rollback is exposed; dropping a transaction discards its overlay.
 
 mod change;
 mod origin;

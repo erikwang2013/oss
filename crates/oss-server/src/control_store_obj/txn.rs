@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use xl_store::control_state::blob::MAX_BLOB_BYTES;
 use xl_store::control_state::node::{INLINE_MAX, LeafValue};
 use xl_store::control_state::root::{AppliedLog, Mode, Root, RootMeta, TableRoot, encode_root};
@@ -17,7 +18,7 @@ use super::origin::WriteOrigin;
 use super::root_io::{CasOutcome, PinnedRoot, RootIo};
 use super::table::{TableId, known_table_ids};
 
-/// Bounded conflict retries (design §2.2 step 5).
+/// Bounded whole-transaction attempts on root CAS conflict (design §2.2 step 5).
 pub const MAX_COMMIT_ATTEMPTS: usize = 8;
 
 /// Cache publication callback, invoked once after a successful root CAS.
@@ -80,14 +81,13 @@ impl ObjectControlStore {
     /// Start a transaction at the current generation. The origin is mandatory.
     pub async fn begin(self: &Arc<Self>, origin: WriteOrigin) -> Result<ObjectControlTxn> {
         let pinned = self.pin().await?;
-        let base_meta = pinned.root.meta.clone();
+        let meta = pinned.root.meta.clone();
         let applied_target = origin.log_id();
         let mut txn = ObjectControlTxn {
             store: Arc::clone(self),
             origin,
             pinned,
-            base_meta: base_meta.clone(),
-            meta: base_meta,
+            meta,
             applied_target,
             meta_dirty: false,
             trees: BTreeMap::new(),
@@ -96,6 +96,28 @@ impl ObjectControlStore {
         txn.restage();
         Ok(txn)
     }
+
+    /// Run `f` against a freshly pinned transaction and commit it. On a root CAS
+    /// conflict the transaction is discarded and `f` runs again against the new
+    /// root, so every guard inside `f` is computed from the generation it tries
+    /// to commit to (design §2.2 step 5). Gives up after
+    /// [`MAX_COMMIT_ATTEMPTS`] conflicts, returning the last one.
+    pub async fn transaction<T, F>(self: &Arc<Self>, origin: WriteOrigin, mut f: F) -> Result<T>
+    where
+        F: for<'a> FnMut(&'a mut ObjectControlTxn) -> BoxFuture<'a, Result<T>>,
+    {
+        let mut last_conflict = None;
+        for _ in 0..MAX_COMMIT_ATTEMPTS {
+            let mut txn = self.begin(origin.clone()).await?;
+            let value = f(&mut txn).await?;
+            match txn.commit().await {
+                Ok(_) => return Ok(value),
+                Err(e @ Error::Conflict(_)) => last_conflict = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_conflict.expect("the attempt loop is never empty"))
+    }
 }
 
 /// A transaction over one pinned root generation.
@@ -103,12 +125,10 @@ pub struct ObjectControlTxn {
     store: Arc<ObjectControlStore>,
     origin: WriteOrigin,
     pinned: PinnedRoot,
-    /// Root meta as seen at begin; used to replay only this txn's meta changes on retry.
-    base_meta: RootMeta,
     meta: RootMeta,
     applied_target: Option<AppliedLog>,
     meta_dirty: bool,
-    /// All known tables, rebuilt from `pinned` and the overlay on every attempt.
+    /// All known tables, rebuilt from `pinned` and the overlay when the txn starts.
     trees: BTreeMap<u16, TableTree>,
     overlay: Overlay,
 }
@@ -226,7 +246,10 @@ impl ObjectControlTxn {
     }
 
     /// Commit the overlay with one root CAS (design §2.2). Returns the pinned
-    /// generation unchanged when nothing changed.
+    /// generation unchanged when nothing changed. A root CAS conflict is never
+    /// resolved by replaying the overlay: guards computed from the pinned root
+    /// may be stale, so the caller must re-run the whole transaction (see
+    /// [`ObjectControlStore::transaction`]).
     pub async fn commit(mut self) -> Result<CommitStamp> {
         let target = self.origin.log_id().or(self.applied_target);
         if let Some(target) = target {
@@ -243,15 +266,12 @@ impl ObjectControlTxn {
             return Ok(self.noop_stamp());
         }
 
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            self.restage();
-            let (new_root, dirty) = self.prepare().await?;
-            if new_root == self.pinned.root {
-                return Ok(self.noop_stamp());
-            }
-            let bytes = encode_root(&new_root)?;
+        let (new_root, dirty) = self.prepare().await?;
+        if new_root == self.pinned.root {
+            return Ok(self.noop_stamp());
+        }
+        let bytes = encode_root(&new_root)?;
+        for attempt in 1..=MAX_COMMIT_ATTEMPTS {
             let fence = self
                 .store
                 .root
@@ -275,9 +295,11 @@ impl ObjectControlTxn {
                     return Ok(stamp);
                 }
                 Ok(CasOutcome::NotCommitted) => {
-                    if attempts >= MAX_COMMIT_ATTEMPTS {
+                    // The re-read proved the pinned generation is still current,
+                    // so retrying these exact bytes cannot rebuild on a stale base.
+                    if attempt == MAX_COMMIT_ATTEMPTS {
                         return Err(Error::Conflict(format!(
-                            "control root commit contended after {attempts} attempts"
+                            "control root CAS did not land after {attempt} attempts"
                         )));
                     }
                 }
@@ -298,17 +320,14 @@ impl ObjectControlTxn {
                             dirty_tables: Vec::new(),
                         });
                     }
-                    if attempts >= MAX_COMMIT_ATTEMPTS {
-                        return Err(Error::Conflict(format!(
-                            "control root commit contended after {attempts} attempts"
-                        )));
-                    }
-                    self.rebase_meta(&new_pinned.root.meta);
-                    self.pinned = new_pinned;
+                    return Err(Error::Conflict(
+                        "control root generation changed; re-run the transaction".into(),
+                    ));
                 }
                 Err(e) => return Err(e),
             }
         }
+        unreachable!("attempt loop always returns")
     }
 
     fn tree(&self, table: TableId) -> &TableTree {
@@ -396,51 +415,6 @@ impl ObjectControlTxn {
         Ok((root, dirty))
     }
 
-    /// On conflict, keep the new generation's metadata but replay this txn's
-    /// changes; allocators merge monotonically so a retry never regresses them.
-    fn rebase_meta(&mut self, new: &RootMeta) {
-        let base = &self.base_meta;
-        let mine = &self.meta;
-        let mut merged = new.clone();
-        merged.next_uid = merge_counter(merged.next_uid, base.next_uid, mine.next_uid);
-        merged.next_job_id = merge_counter(merged.next_job_id, base.next_job_id, mine.next_job_id);
-        merged.next_run_id = merge_counter(merged.next_run_id, base.next_run_id, mine.next_run_id);
-        if mine.next_site_seq != base.next_site_seq {
-            merged.next_site_seq = merged.next_site_seq.max(mine.next_site_seq);
-        }
-        if mine.applied != base.applied {
-            merged.applied = match (merged.applied, mine.applied) {
-                (Some(current), Some(mine)) => Some(if applied_at_least(Some(current), mine) {
-                    current
-                } else {
-                    mine
-                }),
-                (None, mine) => mine,
-                (current, None) => current,
-            };
-        }
-        if mine.membership_json != base.membership_json {
-            merged.membership_json = mine.membership_json.clone();
-        }
-        if mine.feature_level != base.feature_level {
-            merged.feature_level = mine.feature_level;
-        }
-        if mine.mode != base.mode {
-            merged.mode = mine.mode;
-        }
-        for key in base.markers.keys() {
-            if !mine.markers.contains_key(key) {
-                merged.markers.remove(key);
-            }
-        }
-        for (key, value) in &mine.markers {
-            if base.markers.get(key) != Some(value) {
-                merged.markers.insert(key.clone(), value.clone());
-            }
-        }
-        self.meta = merged;
-    }
-
     fn noop_stamp(&self) -> CommitStamp {
         CommitStamp {
             generation: self.pinned.version,
@@ -448,14 +422,6 @@ impl ObjectControlTxn {
             applied: self.pinned.root.meta.applied,
             dirty_tables: Vec::new(),
         }
-    }
-}
-
-fn merge_counter(current: u64, base: u64, mine: u64) -> u64 {
-    if mine != base {
-        current.max(mine)
-    } else {
-        current
     }
 }
 
