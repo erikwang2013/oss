@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 780" width="960" height="780"
-     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+     font-family="system-ui, -apple-system, 'Noto Sans SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei', sans-serif">
   <title>OSS 请求周期</title>
   <desc>两条入口（S3 直传与浏览器分块上传）汇入同一条 xl-store 提交协议；TLS 可选终结，AP 路径/别名先过策略交集；启用 SSE 时先流式加密再 EC 编码。</desc>
   <defs>

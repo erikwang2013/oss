@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
-     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+     font-family="system-ui, -apple-system, 'Noto Sans SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei', sans-serif">
   <title>数据流：事件通知 / S3 Select / 桶复制</title>
   <desc>三条数据流共享「提交后派发、outbox 至少一次」：事件通知（EventSink → event_outbox → worker → Kafka）、S3 Select（白名单 SQL → 求值 → 事件流帧）、桶复制（ReplSink → repl_outbox → SigV4 PUT → 远端实例）。</desc>
   <defs>

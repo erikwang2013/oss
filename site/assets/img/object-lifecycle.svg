@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
-     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+     font-family="system-ui, -apple-system, 'Noto Sans SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei', sans-serif">
   <title>OSS 对象生命周期</title>
   <desc>对象在磁盘上的状态流转：暂存 → 数据就位 → xl.meta 提交可见；版本链、对象锁/保留期、noncurrent 生命周期与崩溃残留回收。</desc>
   <defs>

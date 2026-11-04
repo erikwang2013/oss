@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560"
-     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+     font-family="system-ui, -apple-system, 'Noto Sans SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei', sans-serif">
   <title>多站点异步复制：控制面 changelog + 对象 outbox</title>
   <desc>两个单节点站点 A/B 互相配对：控制面写经 SQLite 触发器落 site_changelog，LWW (ts,priority,origin,seq) 门控，ship worker 按 cursor 出货；对象写经 ReplSink 逐 peer 落 repl_outbox(target_kind=site)，worker 先签名探询 GET ?versioning 再 SigV4 PUT REPLICA。</desc>
   <defs>
