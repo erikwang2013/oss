@@ -62,6 +62,7 @@ impl JobState {
                 .fetch_optional(db.pool())
                 .await
                 .map_err(err)?;
+        // audit-allow: decision 8 — next_run_id allocator stays raw until jobs slice.
         let max: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM inventory_runs")
             .fetch_one(db.pool())
             .await

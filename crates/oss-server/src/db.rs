@@ -923,6 +923,7 @@ impl Db {
                  config_json TEXT,\
                  PRIMARY KEY (bucket, rule_id)\
              );\
+             -- audit-allow: schema migration (old lifecycle PK rewrite).\n\
              INSERT INTO lifecycle_rules (bucket,prefix,expire_days,enabled,updated_at,rule_id,\
                  expiration_days,transition_days,transition_class,transition_tier,config_json) \
                  SELECT bucket,prefix,expire_days,enabled,updated_at,rule_id,\
@@ -5999,6 +6000,7 @@ impl Db {
         if terminal.is_empty() {
             return Ok((0, non_terminal));
         }
+        // audit-allow: decision 8 — jobs slice owns purge FK nulling for runs/restores.
         for prefix in [
             "UPDATE inventory_runs SET job_id = NULL WHERE job_id IN (",
             "UPDATE tier_restores SET job_id = NULL WHERE job_id IN (",

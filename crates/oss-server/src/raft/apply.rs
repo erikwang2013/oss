@@ -1116,31 +1116,6 @@ pub(crate) fn restore_row_ok(
     Ok(())
 }
 
-/// 按主键 upsert Restore 行；fence 单调由 [`restore_row_ok`] 预检，WHERE 是防御性兜底。
-async fn apply_restore(cw: &mut ControlWrite<'_>, r: &TierRestoreRow) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, \
-          created_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
-          expires_at = excluded.expires_at, job_id = excluded.job_id, state = excluded.state, \
-          created_at = excluded.created_at, fence_term = excluded.fence_term, \
-          fence_leader = excluded.fence_leader \
-         WHERE tier_restores.fence_term <= excluded.fence_term",
-    )
-    .bind(&r.bucket)
-    .bind(&r.key)
-    .bind(&r.version_id)
-    .bind(r.expires_at)
-    .bind(r.job_id)
-    .bind(&r.state)
-    .bind(r.created_at)
-    .bind(r.fence_term)
-    .bind(r.fence_leader)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
-}
-
 /// 去重键唯一（partial unique index）。同 PK 保留自键；冲突是业务拒绝而非 SQL 错误。
 async fn dedupe_taken(
     cw: &mut ControlWrite<'_>,
@@ -1317,7 +1292,11 @@ async fn apply_job_batch(
         }
     }
     for restore in restores {
-        if apply_restore(cw, restore).await? != 1 {
+        let applied = crate::control_store::SqliteControlTxn::new(cw.conn())
+            .tier_restore_upsert(restore)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        if !applied {
             return Err(invariant(format!(
                 "restore {}/{}/{} upsert affected 0 rows",
                 restore.bucket, restore.key, restore.version_id
