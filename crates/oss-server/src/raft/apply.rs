@@ -1814,4 +1814,51 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "事务适配器不提交：回滚后必须无行");
     }
+
+    /// Task 4：同自然键不同 id 的 run 在预检期零写 `Conflict`，不得推进 next_run_id。
+    #[tokio::test]
+    async fn inventory_run_natural_key_conflict_is_zero_write() {
+        use crate::raft::runstate::InventoryRunRow;
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_runs \
+             (id, bucket, config_id, run_key, started_at, state, created_at, fence_term, fence_leader) \
+             VALUES (7, 'b1', 'cfg', 'k', 0, 'running', 1, 0, 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let row = InventoryRunRow {
+            id: 8,
+            bucket: "b1".into(),
+            config_id: "cfg".into(),
+            run_key: "k".into(),
+            state: "running".into(),
+            created_at: 1,
+            ..InventoryRunRow::default()
+        };
+        assert_eq!(
+            apply_committed(
+                &db,
+                &ControlCommand::InventoryBatch {
+                    runs: vec![row],
+                    cursors: vec![],
+                    incrementals: vec![],
+                }
+            )
+            .await,
+            ControlResponse::Conflict
+        );
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, run_key FROM inventory_runs")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![(7, "k".into())], "冲突零写入");
+        let meta: Option<String> =
+            sqlx::query_scalar("SELECT value FROM runstate_meta WHERE key = 'next_run_id'")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(meta, None, "冲突不得推进 next_run_id");
+    }
 }

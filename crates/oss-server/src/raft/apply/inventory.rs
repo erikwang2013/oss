@@ -5,11 +5,10 @@
 //! 校验，这里不读副本本地的 jobs 表决定结果。
 
 use super::{ControlWrite, invariant};
+use crate::control_store::{SqliteControlTxn, to_sqlx};
 use crate::raft::command::ControlResponse;
-use crate::raft::runstate::{
-    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, inventory_cursor_row_from,
-    inventory_incremental_row_from, inventory_run_row_from,
-};
+use xl_store::control_store::inventory::InventoryTxn;
+use crate::raft::runstate::{InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow};
 
 fn run_terminal(state: &str) -> bool {
     matches!(state, "done" | "skipped")
@@ -168,26 +167,21 @@ async fn current_run(
     cw: &mut ControlWrite<'_>,
     id: i64,
 ) -> Result<Option<InventoryRunRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT * FROM inventory_runs WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.as_ref().map(inventory_run_row_from))
+    SqliteControlTxn::new(cw.conn())
+        .inventory_run(id)
+        .await
+        .map_err(to_sqlx)
 }
 
 async fn run_key_taken(
     cw: &mut ControlWrite<'_>,
     run: &InventoryRunRow,
 ) -> Result<bool, sqlx::Error> {
-    let id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM inventory_runs WHERE bucket = ? AND config_id = ? AND run_key = ?",
-    )
-    .bind(&run.bucket)
-    .bind(&run.config_id)
-    .bind(&run.run_key)
-    .fetch_optional(&mut *cw.conn)
-    .await?;
-    Ok(id.is_some_and(|id| id != run.id))
+    let found = SqliteControlTxn::new(cw.conn())
+        .inventory_run_by_key(&run.bucket, &run.config_id, &run.run_key)
+        .await
+        .map_err(to_sqlx)?;
+    Ok(found.is_some_and(|r| r.id != run.id))
 }
 
 async fn current_cursor(
@@ -195,12 +189,10 @@ async fn current_cursor(
     bucket: &str,
     config_id: &str,
 ) -> Result<Option<InventoryCursorRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT * FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-        .bind(bucket)
-        .bind(config_id)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.as_ref().map(inventory_cursor_row_from))
+    SqliteControlTxn::new(cw.conn())
+        .inventory_cursor(bucket, config_id)
+        .await
+        .map_err(to_sqlx)
 }
 
 async fn current_incremental(
@@ -208,41 +200,17 @@ async fn current_incremental(
     bucket: &str,
     config_id: &str,
 ) -> Result<Option<InventoryIncrementalRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT * FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-        .bind(bucket)
-        .bind(config_id)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.as_ref().map(inventory_incremental_row_from))
+    SqliteControlTxn::new(cw.conn())
+        .inventory_incremental(bucket, config_id)
+        .await
+        .map_err(to_sqlx)
 }
 
-async fn apply_run(cw: &mut ControlWrite<'_>, run: &InventoryRunRow) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO inventory_runs (id, bucket, config_id, run_key, started_at, state, \
-          job_id, manifest_key, error, created_at, fence_term, fence_leader) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET \
-          bucket = excluded.bucket, config_id = excluded.config_id, \
-          run_key = excluded.run_key, started_at = excluded.started_at, \
-          state = excluded.state, job_id = excluded.job_id, \
-          manifest_key = excluded.manifest_key, error = excluded.error, \
-          created_at = excluded.created_at, fence_term = excluded.fence_term, \
-          fence_leader = excluded.fence_leader",
-    )
-    .bind(run.id)
-    .bind(&run.bucket)
-    .bind(&run.config_id)
-    .bind(&run.run_key)
-    .bind(run.started_at)
-    .bind(&run.state)
-    .bind(run.job_id)
-    .bind(&run.manifest_key)
-    .bind(&run.error)
-    .bind(run.created_at)
-    .bind(run.fence_term)
-    .bind(run.fence_leader)
-    .execute(&mut *cw.conn)
-    .await?;
+async fn apply_run(cw: &mut ControlWrite<'_>, run: &InventoryRunRow) -> Result<bool, sqlx::Error> {
+    let applied = SqliteControlTxn::new(cw.conn())
+        .inventory_run_upsert(run)
+        .await
+        .map_err(to_sqlx)?;
     // 删除（桶删/迁移）后 MAX(id) 会回落；日志事实内推进 meta，杜绝 id 复用。
     sqlx::query(
         "INSERT INTO runstate_meta (key, value) VALUES ('next_run_id', ?) \
@@ -252,49 +220,27 @@ async fn apply_run(cw: &mut ControlWrite<'_>, run: &InventoryRunRow) -> Result<u
     .bind((run.id + 1).to_string())
     .execute(&mut *cw.conn)
     .await?;
-    Ok(result.rows_affected())
+    Ok(applied)
 }
 
 async fn apply_cursor(
     cw: &mut ControlWrite<'_>,
     cursor: &InventoryCursorRow,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO inventory_cursors (bucket, config_id, cursor, config_updated_at, \
-          updated_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(bucket, config_id) DO UPDATE SET \
-          cursor = excluded.cursor, config_updated_at = excluded.config_updated_at, \
-          updated_at = excluded.updated_at, fence_term = excluded.fence_term, \
-          fence_leader = excluded.fence_leader",
-    )
-    .bind(&cursor.bucket)
-    .bind(&cursor.config_id)
-    .bind(&cursor.cursor)
-    .bind(cursor.config_updated_at)
-    .bind(cursor.updated_at)
-    .bind(cursor.fence_term)
-    .bind(cursor.fence_leader)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+) -> Result<bool, sqlx::Error> {
+    SqliteControlTxn::new(cw.conn())
+        .inventory_cursor_upsert(cursor)
+        .await
+        .map_err(to_sqlx)
 }
 
 async fn apply_incremental(
     cw: &mut ControlWrite<'_>,
     row: &InventoryIncrementalRow,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
-         VALUES (?, ?, ?, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
-          enabled = excluded.enabled, updated_at = excluded.updated_at",
-    )
-    .bind(&row.bucket)
-    .bind(&row.config_id)
-    .bind(row.enabled)
-    .bind(row.updated_at)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+) -> Result<bool, sqlx::Error> {
+    SqliteControlTxn::new(cw.conn())
+        .inventory_incremental_upsert(row)
+        .await
+        .map_err(to_sqlx)
 }
 
 /// 整批只读预检 → 逐行 upsert。预检失败 = 零写入的 `Conflict`。
@@ -348,7 +294,7 @@ pub(crate) async fn apply(
         }
     }
     for run in runs {
-        if apply_run(cw, run).await? != 1 {
+        if !apply_run(cw, run).await? {
             return Err(invariant(format!(
                 "inventory run {} upsert affected 0 rows",
                 run.id
@@ -356,7 +302,7 @@ pub(crate) async fn apply(
         }
     }
     for cursor in cursors {
-        if apply_cursor(cw, cursor).await? != 1 {
+        if !apply_cursor(cw, cursor).await? {
             return Err(invariant(format!(
                 "inventory cursor {}/{} upsert affected 0 rows",
                 cursor.bucket, cursor.config_id
@@ -364,7 +310,7 @@ pub(crate) async fn apply(
         }
     }
     for row in incrementals {
-        if apply_incremental(cw, row).await? != 1 {
+        if !apply_incremental(cw, row).await? {
             return Err(invariant(format!(
                 "inventory incremental {}/{} upsert affected 0 rows",
                 row.bucket, row.config_id
@@ -380,16 +326,10 @@ pub(crate) async fn clear(
     bucket: &str,
     config_id: &str,
 ) -> Result<ControlResponse, sqlx::Error> {
-    sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-        .bind(bucket)
-        .bind(config_id)
-        .execute(&mut *cw.conn)
-        .await?;
-    sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-        .bind(bucket)
-        .bind(config_id)
-        .execute(&mut *cw.conn)
-        .await?;
+    SqliteControlTxn::new(cw.conn())
+        .inventory_clear(bucket, config_id)
+        .await
+        .map_err(to_sqlx)?;
     Ok(ControlResponse::Ok)
 }
 

@@ -5,7 +5,8 @@
 
 use sqlx::{Row, SqlitePool};
 use xl_store::control_store::inventory::{
-    InventoryConfigEntry, InventoryConfigView, InventoryStore, InventoryTxn,
+    InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
+    InventoryRunRow, InventoryStore, InventoryTxn,
 };
 use xl_store::control_store::lifecycle::{
     LifecycleCursorRow, LifecycleRuleEntry, LifecycleStore, LifecycleTxn,
@@ -107,6 +108,36 @@ impl InventoryStore for SqliteControlStore {
 
     async fn inventory_config_count(&self, bucket: &str) -> Result<i64, ControlError> {
         inventory::inventory_config_count(self, bucket).await
+    }
+
+    async fn inventory_run(&self, id: i64) -> Result<Option<InventoryRunRow>, ControlError> {
+        inventory::inventory_run(self, id).await
+    }
+
+    async fn inventory_run_by_key(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+    ) -> Result<Option<InventoryRunRow>, ControlError> {
+        inventory::inventory_run_by_key(self, bucket, config_id, run_key).await
+    }
+
+    async fn inventory_cursor(
+        &self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryCursorRow>, ControlError> {
+        inventory::inventory_cursor(self, bucket, config_id).await
+    }
+
+    async fn inventory_incremental(
+        &self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryIncrementalRow>, ControlError>
+    {
+        inventory::inventory_incremental(self, bucket, config_id).await
     }
 }
 
@@ -320,6 +351,176 @@ impl InventoryTxn for SqliteControlTxn<'_> {
         rows: &[InventoryConfigEntry],
     ) -> Result<(), ControlError> {
         inventory::txn_replace_inventory_configs(self, rows).await
+    }
+
+    async fn inventory_runs(&mut self) -> Result<Vec<InventoryRunRow>, ControlError> {
+        inventory::txn_inventory_runs(self).await
+    }
+
+    async fn replace_inventory_runs(
+        &mut self,
+        rows: &[InventoryRunRow],
+    ) -> Result<(), ControlError> {
+        inventory::txn_replace_inventory_runs(self, rows).await
+    }
+
+    async fn inventory_cursors(&mut self) -> Result<Vec<InventoryCursorRow>, ControlError> {
+        inventory::txn_inventory_cursors(self).await
+    }
+
+    async fn replace_inventory_cursors(
+        &mut self,
+        rows: &[InventoryCursorRow],
+    ) -> Result<(), ControlError> {
+        inventory::txn_replace_inventory_cursors(self, rows).await
+    }
+
+    async fn inventory_incrementals(
+        &mut self,
+    ) -> Result<Vec<InventoryIncrementalRow>, ControlError> {
+        inventory::txn_inventory_incrementals(self).await
+    }
+
+    async fn replace_inventory_incrementals(
+        &mut self,
+        rows: &[InventoryIncrementalRow],
+    ) -> Result<(), ControlError> {
+        inventory::txn_replace_inventory_incrementals(self, rows).await
+    }
+
+    async fn inventory_run(&mut self, id: i64) -> Result<Option<InventoryRunRow>, ControlError> {
+        inventory::txn_inventory_run(self, id).await
+    }
+
+    async fn inventory_run_by_key(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+    ) -> Result<Option<InventoryRunRow>, ControlError> {
+        inventory::txn_inventory_run_by_key(self, bucket, config_id, run_key).await
+    }
+
+    async fn inventory_run_upsert(&mut self, row: &InventoryRunRow) -> Result<bool, ControlError> {
+        inventory::txn_inventory_run_upsert(self, row).await
+    }
+
+    async fn inventory_run_create(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+        created_at: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<Option<i64>, ControlError> {
+        inventory::txn_inventory_run_create(
+            self,
+            bucket,
+            config_id,
+            run_key,
+            created_at,
+            fence_term,
+            fence_leader,
+        )
+        .await
+    }
+
+    async fn inventory_run_set_job(
+        &mut self,
+        run_id: i64,
+        job_id: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_run_set_job(self, run_id, job_id, fence_term, fence_leader).await
+    }
+
+    async fn inventory_run_started(
+        &mut self,
+        run_id: i64,
+        started_at: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_run_started(self, run_id, started_at, fence_term, fence_leader)
+            .await
+    }
+
+    async fn inventory_run_finish(
+        &mut self,
+        run_id: i64,
+        state: &str,
+        manifest_key: Option<&str>,
+        error: Option<&str>,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_run_finish(
+            self,
+            run_id,
+            state,
+            manifest_key,
+            error,
+            fence_term,
+            fence_leader,
+        )
+        .await
+    }
+
+    async fn inventory_cursor(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryCursorRow>, ControlError> {
+        inventory::txn_inventory_cursor(self, bucket, config_id).await
+    }
+
+    async fn inventory_cursor_upsert(
+        &mut self,
+        row: &InventoryCursorRow,
+    ) -> Result<bool, ControlError> {
+        inventory::txn_inventory_cursor_upsert(self, row).await
+    }
+
+    async fn inventory_cursor_delete(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+        fence_term: Option<i64>,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_cursor_delete(self, bucket, config_id, fence_term).await
+    }
+
+    async fn inventory_incremental(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryIncrementalRow>, ControlError> {
+        inventory::txn_inventory_incremental(self, bucket, config_id).await
+    }
+
+    async fn inventory_incremental_upsert(
+        &mut self,
+        row: &InventoryIncrementalRow,
+    ) -> Result<bool, ControlError> {
+        inventory::txn_inventory_incremental_upsert(self, row).await
+    }
+
+    async fn inventory_incremental_delete(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_incremental_delete(self, bucket, config_id).await
+    }
+
+    async fn inventory_clear(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_clear(self, bucket, config_id).await
     }
 }
 

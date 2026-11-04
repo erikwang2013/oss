@@ -88,6 +88,25 @@ pub trait InventoryStore: Send + Sync {
     /// 按 `(bucket, id)` 升序。
     async fn inventory_configs_all(&self) -> Result<Vec<InventoryConfigView>, ControlError>;
     async fn inventory_config_count(&self, bucket: &str) -> Result<i64, ControlError>;
+    /// 按本地自增 id 读运行行（id 是行属性，不是身份键）。
+    async fn inventory_run(&self, id: i64) -> Result<Option<InventoryRunRow>, ControlError>;
+    /// 按自然键 `(bucket, config_id, run_key)` 读运行行。
+    async fn inventory_run_by_key(
+        &self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+    ) -> Result<Option<InventoryRunRow>, ControlError>;
+    async fn inventory_cursor(
+        &self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryCursorRow>, ControlError>;
+    async fn inventory_incremental(
+        &self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryIncrementalRow>, ControlError>;
 }
 
 /// 调用方事务内的 inventory 写访问；本 trait 不 begin/commit/rollback。
@@ -111,6 +130,103 @@ pub trait InventoryTxn: Send {
         &mut self,
         rows: &[InventoryConfigEntry],
     ) -> Result<(), ControlError>;
+    /// 快照导出：按 `id` 升序。
+    async fn inventory_runs(&mut self) -> Result<Vec<InventoryRunRow>, ControlError>;
+    /// 快照安装：DELETE 全表 runs，再按入参顺序 INSERT（显式保留 id）。
+    async fn replace_inventory_runs(
+        &mut self,
+        rows: &[InventoryRunRow],
+    ) -> Result<(), ControlError>;
+    /// 快照导出：按 `(bucket, config_id)` 升序。
+    async fn inventory_cursors(&mut self) -> Result<Vec<InventoryCursorRow>, ControlError>;
+    async fn replace_inventory_cursors(
+        &mut self,
+        rows: &[InventoryCursorRow],
+    ) -> Result<(), ControlError>;
+    async fn inventory_incrementals(&mut self) -> Result<Vec<InventoryIncrementalRow>, ControlError>;
+    async fn replace_inventory_incrementals(
+        &mut self,
+        rows: &[InventoryIncrementalRow],
+    ) -> Result<(), ControlError>;
+    async fn inventory_run(&mut self, id: i64) -> Result<Option<InventoryRunRow>, ControlError>;
+    async fn inventory_run_by_key(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+    ) -> Result<Option<InventoryRunRow>, ControlError>;
+    /// 自然键 upsert；返回是否恰好 1 行。`id` 是行内不可变属性（调用方预检）。
+    async fn inventory_run_upsert(
+        &mut self,
+        row: &InventoryRunRow,
+    ) -> Result<bool, ControlError>;
+    /// `INSERT OR IGNORE`；插入成功返回本地 id。
+    async fn inventory_run_create(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+        run_key: &str,
+        created_at: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<Option<i64>, ControlError>;
+    async fn inventory_run_set_job(
+        &mut self,
+        run_id: i64,
+        job_id: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError>;
+    async fn inventory_run_started(
+        &mut self,
+        run_id: i64,
+        started_at: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError>;
+    async fn inventory_run_finish(
+        &mut self,
+        run_id: i64,
+        state: &str,
+        manifest_key: Option<&str>,
+        error: Option<&str>,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError>;
+    async fn inventory_cursor(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryCursorRow>, ControlError>;
+    /// upsert；fence 回退时 `Ok(false)`（零写）。
+    async fn inventory_cursor_upsert(
+        &mut self,
+        row: &InventoryCursorRow,
+    ) -> Result<bool, ControlError>;
+    /// `fence_term = None` 为单机无 fence 口径；`Some(t)` 仅删 `fence_term <= t`。
+    async fn inventory_cursor_delete(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+        fence_term: Option<i64>,
+    ) -> Result<(), ControlError>;
+    async fn inventory_incremental(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<Option<InventoryIncrementalRow>, ControlError>;
+    async fn inventory_incremental_upsert(
+        &mut self,
+        row: &InventoryIncrementalRow,
+    ) -> Result<bool, ControlError>;
+    async fn inventory_incremental_delete(
+        &mut self,
+        bucket: &str,
+        config_id: &str,
+    ) -> Result<(), ControlError>;
+    /// DELETE cursor + incremental（InventoryClear 语义）。
+    async fn inventory_clear(&mut self, bucket: &str, config_id: &str)
+    -> Result<(), ControlError>;
 }
 
 #[cfg(test)]

@@ -11,10 +11,7 @@
 
 use super::*;
 use crate::raft::apply::inventory::{cursor_row_ok, incremental_row_ok, run_row_ok};
-use crate::raft::runstate::{
-    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, inventory_cursor_row_from,
-    inventory_incremental_row_from, inventory_run_row_from,
-};
+use crate::raft::runstate::{InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow};
 
 fn run_terminal(state: &str) -> bool {
     matches!(state, "done" | "skipped")
@@ -22,12 +19,7 @@ fn run_terminal(state: &str) -> bool {
 
 impl JobState {
     async fn read_run(db: &Db, id: i64) -> Result<Option<InventoryRunRow>, String> {
-        let row = sqlx::query("SELECT * FROM inventory_runs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(db.pool())
-            .await
-            .map_err(err)?;
-        Ok(row.as_ref().map(inventory_run_row_from))
+        db.control_store().inventory_run(id).await.map_err(err)
     }
 
     async fn read_run_by_key(
@@ -36,16 +28,10 @@ impl JobState {
         config_id: &str,
         run_key: &str,
     ) -> Result<Option<InventoryRunRow>, String> {
-        let row = sqlx::query(
-            "SELECT * FROM inventory_runs WHERE bucket = ? AND config_id = ? AND run_key = ?",
-        )
-        .bind(bucket)
-        .bind(config_id)
-        .bind(run_key)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(err)?;
-        Ok(row.as_ref().map(inventory_run_row_from))
+        db.control_store()
+            .inventory_run_by_key(bucket, config_id, run_key)
+            .await
+            .map_err(err)
     }
 
     async fn read_cursor(
@@ -53,13 +39,10 @@ impl JobState {
         bucket: &str,
         config_id: &str,
     ) -> Result<Option<InventoryCursorRow>, String> {
-        let row = sqlx::query("SELECT * FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(config_id)
-            .fetch_optional(db.pool())
+        db.control_store()
+            .inventory_cursor(bucket, config_id)
             .await
-            .map_err(err)?;
-        Ok(row.as_ref().map(inventory_cursor_row_from))
+            .map_err(err)
     }
 
     async fn read_incremental(
@@ -67,14 +50,10 @@ impl JobState {
         bucket: &str,
         config_id: &str,
     ) -> Result<Option<InventoryIncrementalRow>, String> {
-        let row =
-            sqlx::query("SELECT * FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-                .bind(bucket)
-                .bind(config_id)
-                .fetch_optional(db.pool())
-                .await
-                .map_err(err)?;
-        Ok(row.as_ref().map(inventory_incremental_row_from))
+        db.control_store()
+            .inventory_incremental(bucket, config_id)
+            .await
+            .map_err(err)
     }
 
     async fn next_run_id(db: &Db) -> Result<i64, String> {

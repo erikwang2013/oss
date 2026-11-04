@@ -425,3 +425,63 @@ pub async fn raw_inventory_incremental_dump(db: &Db) -> Vec<RawInventoryIncremen
     })
     .collect()
 }
+
+// ---------- inventory runs（id 是行属性，不是身份键） ----------
+
+pub async fn raw_inventory_run(db: &Db, run: &xl_store::control_store::inventory::InventoryRunRow) {
+    sqlx::query(
+        "INSERT INTO inventory_runs (id, bucket, config_id, run_key, started_at, state, \
+         job_id, manifest_key, error, created_at, fence_term, fence_leader) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(run.id)
+    .bind(&run.bucket)
+    .bind(&run.config_id)
+    .bind(&run.run_key)
+    .bind(run.started_at)
+    .bind(&run.state)
+    .bind(run.job_id)
+    .bind(&run.manifest_key)
+    .bind(&run.error)
+    .bind(run.created_at)
+    .bind(run.fence_term)
+    .bind(run.fence_leader)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+pub async fn raw_inventory_run_dump(
+    db: &Db,
+) -> Vec<xl_store::control_store::inventory::InventoryRunRow> {
+    sqlx::query(
+        "SELECT id, bucket, config_id, run_key, started_at, state, job_id, manifest_key, \
+         error, created_at, fence_term, fence_leader FROM inventory_runs ORDER BY id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| xl_store::control_store::inventory::InventoryRunRow {
+        id: r.get("id"),
+        bucket: r.get("bucket"),
+        config_id: r.get("config_id"),
+        run_key: r.get("run_key"),
+        started_at: r.get("started_at"),
+        state: r.get("state"),
+        job_id: r.get("job_id"),
+        manifest_key: r.get("manifest_key"),
+        error: r.get("error"),
+        created_at: r.get("created_at"),
+        fence_term: r.get("fence_term"),
+        fence_leader: r.get("fence_leader"),
+    })
+    .collect()
+}
+
+pub async fn raw_runstate_next_run_id(db: &Db) -> Option<String> {
+    sqlx::query_scalar("SELECT value FROM runstate_meta WHERE key = 'next_run_id'")
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+}

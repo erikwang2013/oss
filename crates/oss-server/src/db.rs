@@ -6,7 +6,10 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
-use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryConfigView, InventoryTxn};
+use xl_store::control_store::inventory::{
+    InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
+    InventoryTxn,
+};
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
@@ -6138,14 +6141,12 @@ impl Db {
 
     /// 3.6：Inventory 增量模式（默认全量；本地表，不进 Raft）。
     pub async fn inventory_incremental_get(&self, bucket: &str, config_id: &str) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT enabled FROM inventory_incremental WHERE bucket = ? AND config_id = ?",
-        )
-        .bind(bucket)
-        .bind(config_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.is_some_and(|r| r.get::<i64, _>("enabled") != 0))
+        Ok(self
+            .control_store()
+            .inventory_incremental(bucket, config_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .is_some_and(|r| r.enabled))
     }
 
     /// 3.6：设置增量模式；关闭时连旧水位一起清掉（重新开启先跑全量）。
@@ -6156,29 +6157,28 @@ impl Db {
         enabled: bool,
         now: i64,
     ) -> Result<()> {
-        if enabled {
-            sqlx::query(
-                "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
-                 VALUES (?, ?, 1, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
-                 enabled = 1, updated_at = excluded.updated_at",
-            )
-            .bind(bucket)
-            .bind(config_id)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-        } else {
-            sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-                .bind(bucket)
-                .bind(config_id)
-                .execute(&self.pool)
-                .await?;
-            sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-                .bind(bucket)
-                .bind(config_id)
-                .execute(&self.pool)
-                .await?;
+        let mut tx = self.pool.begin().await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            if enabled {
+                txn.inventory_incremental_upsert(&InventoryIncrementalRow {
+                    bucket: bucket.to_string(),
+                    config_id: config_id.to_string(),
+                    enabled: true,
+                    updated_at: now,
+                })
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            } else {
+                txn.inventory_incremental_delete(bucket, config_id)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                txn.inventory_cursor_delete(bucket, config_id, None)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+            }
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6189,16 +6189,13 @@ impl Db {
         config_id: &str,
         config_updated_at: i64,
     ) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT cursor FROM inventory_cursors \
-             WHERE bucket = ? AND config_id = ? AND config_updated_at = ?",
-        )
-        .bind(bucket)
-        .bind(config_id)
-        .bind(config_updated_at)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| r.get("cursor")))
+        Ok(self
+            .control_store()
+            .inventory_cursor(bucket, config_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .filter(|r| r.config_updated_at == config_updated_at)
+            .map(|r| r.cursor))
     }
 
     /// 3.6：写入/清除增量水位（`None` → 删除，回到全量起点）。
@@ -6212,40 +6209,31 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
-        match cursor {
-            Some(c) if !c.is_empty() => {
-                sqlx::query(
-                    "INSERT INTO inventory_cursors \
-                     (bucket, config_id, cursor, config_updated_at, updated_at, fence_term, fence_leader) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(bucket, config_id) DO UPDATE SET \
-                     cursor = excluded.cursor, \
-                     config_updated_at = excluded.config_updated_at, \
-                     updated_at = excluded.updated_at, \
-                     fence_term = excluded.fence_term, fence_leader = excluded.fence_leader \
-                     WHERE inventory_cursors.fence_term <= excluded.fence_term",
-                )
-                .bind(bucket)
-                .bind(config_id)
-                .bind(c)
-                .bind(config_updated_at)
-                .bind(now)
-                .bind(fence.term_i64())
-                .bind(fence.leader_i64())
-                .execute(&self.pool)
-                .await?;
-            }
-            _ => {
-                sqlx::query(
-                    "DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ? \
-                     AND fence_term <= ?",
-                )
-                .bind(bucket)
-                .bind(config_id)
-                .bind(fence.term_i64())
-                .execute(&self.pool)
-                .await?;
+        let mut tx = self.pool.begin().await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            match cursor {
+                Some(c) if !c.is_empty() => {
+                    txn.inventory_cursor_upsert(&InventoryCursorRow {
+                        bucket: bucket.to_string(),
+                        config_id: config_id.to_string(),
+                        cursor: c.to_string(),
+                        config_updated_at,
+                        updated_at: now,
+                        fence_term: fence.term_i64(),
+                        fence_leader: fence.leader_i64(),
+                    })
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                }
+                _ => {
+                    txn.inventory_cursor_delete(bucket, config_id, Some(fence.term_i64()))
+                        .await
+                        .map_err(crate::control_store::to_sqlx)?;
+                }
             }
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6259,20 +6247,20 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<Option<i64>> {
-        let r = sqlx::query(
-            "INSERT OR IGNORE INTO inventory_runs \
-             (bucket, config_id, run_key, started_at, state, created_at, fence_term, fence_leader) \
-             VALUES (?, ?, ?, 0, 'running', ?, ?, ?)",
-        )
-        .bind(bucket)
-        .bind(config_id)
-        .bind(run_key)
-        .bind(now)
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .execute(&self.pool)
-        .await?;
-        Ok((r.rows_affected() > 0).then(|| r.last_insert_rowid()))
+        let mut tx = self.pool.begin().await?;
+        let id = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .inventory_run_create(
+                bucket,
+                config_id,
+                run_key,
+                now,
+                fence.term_i64(),
+                fence.leader_i64(),
+            )
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     pub async fn inventory_run_set_job(
@@ -6281,17 +6269,17 @@ impl Db {
         job_id: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE inventory_runs SET job_id = ?, fence_term = ?, fence_leader = ? \
-             WHERE id = ? AND fence_term <= ?",
-        )
-        .bind(job_id)
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .bind(run_id)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .inventory_run_set_job(
+                run_id,
+                job_id,
+                fence.term_i64(),
+                fence.leader_i64(),
+            )
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6305,18 +6293,12 @@ impl Db {
     ) -> Result<()> {
         // `started_at` 只在首次执行时写；更高 term 的重试要重标 token，旧执行器的收尾
         // 才会被 `fence_term <= ?` 拒绝。
-        sqlx::query(
-            "UPDATE inventory_runs SET \
-             started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END, \
-             fence_term = ?, fence_leader = ? WHERE id = ? AND fence_term <= ?",
-        )
-        .bind(now)
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .bind(run_id)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .inventory_run_started(run_id, now, fence.term_i64(), fence.leader_i64())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6326,19 +6308,10 @@ impl Db {
         config_id: &str,
         run_key: &str,
     ) -> Result<Option<InventoryRunRow>> {
-        let row = sqlx::query(
-            "SELECT id, bucket, config_id, run_key, started_at, state, job_id, manifest_key, \
-             error, created_at, fence_term, fence_leader FROM inventory_runs \
-             WHERE bucket = ? AND config_id = ? AND run_key = ?",
-        )
-        .bind(bucket)
-        .bind(config_id)
-        .bind(run_key)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row
-            .as_ref()
-            .map(crate::raft::runstate::inventory_run_row_from))
+        self.control_store()
+            .inventory_run_by_key(bucket, config_id, run_key)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// M8-1：行已被更高 term 接管 → no-op（旧 leader 的迟到完成不覆盖新状态）。
@@ -6350,19 +6323,19 @@ impl Db {
         error: Option<&str>,
         fence: FencingEpoch,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE inventory_runs SET state = ?, manifest_key = ?, error = ?, \
-             fence_term = ?, fence_leader = ? WHERE id = ? AND fence_term <= ?",
-        )
-        .bind(state)
-        .bind(manifest_key)
-        .bind(error)
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .bind(run_id)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .inventory_run_finish(
+                run_id,
+                state,
+                manifest_key,
+                error,
+                fence.term_i64(),
+                fence.leader_i64(),
+            )
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
