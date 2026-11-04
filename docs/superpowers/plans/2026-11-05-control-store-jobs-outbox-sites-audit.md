@@ -171,4 +171,9 @@ pub struct ScheduleLeaseRow { pub term: i64, pub node: i64, pub expires_at: i64,
 
 ## Gate record（完成后填写）
 
-- 待填：commits、focused tests、clippy/fmt、已知残余。
+### A 切片（jobs / job_tasks / schedule_lease / runstate_meta）
+
+- Commits：`1160c08` `refactor(oss-server): route single-node job engine through ControlTxn`；`test(oss-server): audit jobs ControlStore migration`（本提交）。
+- Focused：`cargo test -p oss-server --test control_store_jobs_diff` 3/3；`cargo test -p oss-server --test raft_guard` 3/3；`cargo test -p oss-server --lib` 316/316；`cargo test -p xl-store` 483 passed / 1 ignored（含各 target）。
+- Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
+- 已知残余 / D7：`db.rs::claim_task_fenced` 的 `BEGIN IMMEDIATE` 留在调用方（SQLite 写锁串行化，非适配器事务）；`raft/compat.rs::guard_runstate_activation` 的悬空引用检查为启动期只读并列入源码审计白名单；B（outbox/uploads/sync intents）与 D（site 表）尚未实施，保留任务 B1–B3/D1–D2 描述与 D7 例外。

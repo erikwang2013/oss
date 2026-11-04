@@ -111,6 +111,10 @@ fn source_scan_flags_new_control_table_writers() {
         "access_points",
         "olap_configs",
         "inventory_configs",
+        "jobs",
+        "job_tasks",
+        "schedule_lease",
+        "runstate_meta",
     ];
     // M7 直写路径 / local M3 控制面 / apply 原语所在文件（已人工核对）。
     const ALLOWED: &[&str] = &[
@@ -132,6 +136,11 @@ fn source_scan_flags_new_control_table_writers() {
         "bucket.rs",
         "bucket_write.rs",
         "bucket_snapshot.rs",
+        // ControlStore SQLite 适配器（jobs/runstate 切片）与启动兼容守卫的只读检查。
+        "jobs.rs",
+        "jobs_write.rs",
+        "jobs_snapshot.rs",
+        "compat.rs",
         // level-3 账户命令 apply 子模块（apply 层，经 ControlCommand 进入）。
         "accounts.rs",
         "data.rs",
