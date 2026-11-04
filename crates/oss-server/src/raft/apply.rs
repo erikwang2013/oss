@@ -28,7 +28,7 @@ pub(crate) mod tier_restore;
 use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
-use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 use crate::db::{Db, LifecycleRuleRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
