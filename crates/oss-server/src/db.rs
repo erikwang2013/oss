@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+use crate::control_store::SqliteControlTxn;
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
 use xl_store::control_store::account::AccountTxn;
@@ -15,7 +16,10 @@ use xl_store::control_store::inventory::{
 };
 use xl_store::control_store::jobs::{JobTxn, NewJob as JobInsert, NewTask as JobTaskInsert};
 use xl_store::control_store::lifecycle::LifecycleTxn;
+use xl_store::control_store::repl_outbox::ReplOutboxTxn;
+use xl_store::control_store::sites::{SitePeerRow, SiteTxn};
 use xl_store::control_store::tier::{TierRestoreRow, TierTxn};
+use xl_store::control_store::uploads::{NewUpload, UploadTxn};
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
@@ -36,6 +40,19 @@ pub struct UploadRecord {
     pub etag: String,
     pub original_name: Option<String>,
     pub created_at: i64,
+}
+
+fn upload_record(r: xl_store::control_store::uploads::UploadRow) -> UploadRecord {
+    UploadRecord {
+        saved_path: r.saved_path,
+        bucket: r.bucket,
+        key: r.key,
+        group_name: r.group_name,
+        size: r.size,
+        etag: r.etag,
+        original_name: r.original_name,
+        created_at: r.created_at,
+    }
 }
 
 /// 本站在复制关系中的身份（`site_config` 单行；token 仅供控制面通信用，接口层负责脱敏）。
@@ -552,12 +569,15 @@ impl Db {
         // 身份必须**恰好一行**：触发器 `SELECT id FROM site_config LIMIT 1` 与
         // `site_identity()` 的查询计划可能取到不同行（索引扫描 vs rowid 扫描）。
         // 旧版本缺陷可能留下多行 → 收敛到最早一行；新库用固定 id（36 字符，保持 uuid 形态）。
-        sqlx::query("DELETE FROM site_config WHERE rowid <> (SELECT MIN(rowid) FROM site_config)")
-            .execute(&self.pool)
-            .await?;
-        let existing: Option<String> = sqlx::query_scalar("SELECT id FROM site_config LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await?;
+        let mut conn = self.pool.acquire().await?;
+        let mut txn = SqliteControlTxn::new(&mut conn);
+        txn.site_config_trim()
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        let existing = txn
+            .site_config_id()
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         if let Some(seed) = seed_id {
             // 配置层已校验；DB 也是信任边界（旧库/手改配置）。
             if seed.is_empty()
@@ -583,16 +603,9 @@ impl Db {
             (None, Some(old)) => old.clone(),
             (None, None) => uuid::Uuid::new_v4().to_string(),
         };
-        sqlx::query(
-            "INSERT INTO site_config (id, name, region, priority, site_token, created_at) \
-             SELECT ?, 'site', 'us-east-1', 0, ?, ? \
-             WHERE NOT EXISTS (SELECT 1 FROM site_config)",
-        )
-        .bind(id)
-        .bind(token)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
+        txn.site_config_seed(&id, &token, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         sqlx::query("UPDATE apply_ctx SET active = 0 WHERE id = 1")
             .execute(&self.pool)
             .await?;
@@ -1205,16 +1218,18 @@ impl Db {
     // ---------- M7：站点身份与关系 ----------
 
     pub async fn site_identity(&self) -> Result<SiteIdentity> {
-        let r =
-            sqlx::query("SELECT id, name, region, priority, site_token FROM site_config LIMIT 1")
-                .fetch_one(&self.pool)
-                .await?;
+        let r = self
+            .control_store()
+            .site_identity()
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .ok_or_else(|| sqlx::Error::RowNotFound)?;
         Ok(SiteIdentity {
-            id: r.get("id"),
-            name: r.get("name"),
-            region: r.get("region"),
-            priority: r.get("priority"),
-            token: r.get("site_token"),
+            id: r.id,
+            name: r.name,
+            region: r.region,
+            priority: r.priority,
+            token: r.token,
         })
     }
 
@@ -1226,38 +1241,36 @@ impl Db {
         priority: Option<i64>,
         token: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE site_config SET name = COALESCE(?, name), region = COALESCE(?, region), \
-             priority = COALESCE(?, priority), site_token = COALESCE(?, site_token)",
-        )
-        .bind(name)
-        .bind(region)
-        .bind(priority)
-        .bind(token)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .site_config_apply(name, region, priority, token)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     pub async fn list_sites(&self) -> Result<Vec<SitePeer>> {
-        let rows = sqlx::query("SELECT * FROM sites ORDER BY created_at, peer_id")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(site_peer_from_row).collect())
+        let rows = self
+            .control_store()
+            .sites()
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        Ok(rows.into_iter().map(site_peer).collect())
     }
 
     pub async fn get_site(&self, peer_id: &str) -> Result<Option<SitePeer>> {
-        let r = sqlx::query("SELECT * FROM sites WHERE peer_id = ?")
-            .bind(peer_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(r.as_ref().map(site_peer_from_row))
+        Ok(self
+            .control_store()
+            .site(peer_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(site_peer))
     }
 
     pub async fn count_sites(&self) -> Result<i64> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM sites")
-            .fetch_one(&self.pool)
+        self.control_store()
+            .site_count()
             .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// S7.4：Raft 配对行写入/更新；按 peer_id 或 remote_site_id 采用既有 M7 行，
@@ -1265,86 +1278,28 @@ impl Db {
     pub async fn upsert_pair_peer(&self, p: &SitePeer) -> Result<()> {
         // 注意：UPDATE 不触碰 `reconcile_required`——该门只能由 repair 成功清除
         // （S7.4 review I2：重复/重试配对不得把 B′ 未修复状态打开）。
-        let updated = sqlx::query(
-            "UPDATE sites SET remote_site_id = ?, name = ?, endpoint = ?, region = ?, priority = ?, \
-             s3_access_key = ?, s3_secret_key = ?, peer_site_token = ?, raft_node_id = ? \
-             WHERE peer_id = ? OR remote_site_id = ?",
-        )
-        .bind(&p.remote_site_id)
-        .bind(&p.name)
-        .bind(&p.endpoint)
-        .bind(&p.region)
-        .bind(p.priority)
-        .bind(&p.s3_access_key)
-        .bind(&p.s3_secret_key)
-        .bind(&p.peer_site_token)
-        .bind(p.raft_node_id.map(|v| v as i64))
-        .bind(&p.peer_id)
-        .bind(&p.remote_site_id)
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
-            sqlx::query(
-                "INSERT INTO sites (peer_id, remote_site_id, name, endpoint, region, priority, \
-                 s3_access_key, s3_secret_key, peer_site_token, created_at, raft_node_id, \
-                 reconcile_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&p.peer_id)
-            .bind(&p.remote_site_id)
-            .bind(&p.name)
-            .bind(&p.endpoint)
-            .bind(&p.region)
-            .bind(p.priority)
-            .bind(&p.s3_access_key)
-            .bind(&p.s3_secret_key)
-            .bind(&p.peer_site_token)
-            .bind(p.created_at)
-            .bind(p.raft_node_id.map(|v| v as i64))
-            .bind(if p.reconcile_required { 1i64 } else { 0 })
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .site_pair_upsert(&site_peer_row(p))
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// S7.4 B′：替换站点后、repair 完成前拒绝向该对端服务 sync。
     pub async fn set_site_reconcile_required(&self, peer_id: &str, required: bool) -> Result<()> {
-        sqlx::query("UPDATE sites SET reconcile_required = ? WHERE peer_id = ?")
-            .bind(if required { 1i64 } else { 0 })
-            .bind(peer_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .site_set_reconcile_required(peer_id, required)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     pub async fn insert_site(&self, p: &SitePeer) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO sites (peer_id, remote_site_id, name, endpoint, region, priority, \
-             s3_access_key, s3_secret_key, peer_site_token, created_at, raft_node_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&p.peer_id)
-        .bind(&p.remote_site_id)
-        .bind(&p.name)
-        .bind(&p.endpoint)
-        .bind(&p.region)
-        .bind(p.priority)
-        .bind(&p.s3_access_key)
-        .bind(&p.s3_secret_key)
-        .bind(&p.peer_site_token)
-        .bind(p.created_at)
-        .bind(p.raft_node_id.map(|v| v as i64))
-        .execute(&mut *tx)
-        .await?;
-        // 出货游标从 0 起（首轮全量送达含配对快照）
-        sqlx::query(
-            "INSERT OR IGNORE INTO site_cursors (peer_id, last_seq, updated_at) VALUES (?, 0, ?)",
-        )
-        .bind(&p.peer_id)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
+        SqliteControlTxn::new(&mut tx)
+            .site_insert(&site_peer_row(p), now())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok(())
     }
@@ -1357,38 +1312,22 @@ impl Db {
         &self,
         peer_id: &str,
     ) -> Result<Option<Vec<(String, String, String)>>> {
-        use sqlx::Row as _;
         let mut tx = self.pool.begin().await?;
-        let remote: Option<String> =
-            sqlx::query_scalar("SELECT remote_site_id FROM sites WHERE peer_id = ?")
-                .bind(peer_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let remote = SqliteControlTxn::new(&mut tx)
+            .site_remote_id(peer_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         if remote.is_none() {
             return Ok(None);
         }
-        let rows = sqlx::query(
-            "DELETE FROM repl_outbox WHERE target_kind = 'site' AND remote_id = ? \
-             AND version_id <> '' RETURNING bucket, key, version_id",
-        )
-        .bind(peer_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let affected: Vec<(String, String, String)> = rows
-            .iter()
-            .map(|r| (r.get("bucket"), r.get("key"), r.get("version_id")))
-            .collect();
-        sqlx::query(
-            "DELETE FROM repl_outbox WHERE target_kind = 'site' AND remote_id = ? \
-             AND version_id = ''",
-        )
-        .bind(peer_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM site_cursors WHERE peer_id = ?")
-            .bind(peer_id)
-            .execute(&mut *tx)
-            .await?;
+        let affected = SqliteControlTxn::new(&mut tx)
+            .repl_drop_site(peer_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        SqliteControlTxn::new(&mut tx)
+            .site_cursor_delete(peer_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         // 解配时清掉该 peer 的控制面死信（否则重配对后 status 的 dead 计数失真）。
         if let Some(remote) = &remote {
             sqlx::query("DELETE FROM site_apply_dead WHERE peer_id = ?")
@@ -1396,12 +1335,12 @@ impl Db {
                 .execute(&mut *tx)
                 .await?;
         }
-        let r = sqlx::query("DELETE FROM sites WHERE peer_id = ?")
-            .bind(peer_id)
-            .execute(&mut *tx)
-            .await?;
+        let deleted = SqliteControlTxn::new(&mut tx)
+            .site_delete(peer_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
-        Ok((r.rows_affected() == 1).then_some(affected))
+        Ok((deleted == 1).then_some(affected))
     }
 
     pub async fn update_site_ping(
@@ -1410,13 +1349,11 @@ impl Db {
         ts: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE sites SET last_seen = ?, last_error = ? WHERE peer_id = ?")
-            .bind(ts)
-            .bind(error)
-            .bind(peer_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .site_update_ping(peer_id, ts, error)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -1830,19 +1767,19 @@ impl Db {
         size: i64,
         etag: &str,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO uploads (saved_path, bucket, key, group_name, size, etag, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(saved_path) DO NOTHING",
-        )
-        .bind(saved_path)
-        .bind(bucket)
-        .bind(key)
-        .bind(group)
-        .bind(size)
-        .bind(etag)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .upload_record(&NewUpload {
+                saved_path: saved_path.to_string(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                group_name: group.to_string(),
+                size,
+                etag: etag.to_string(),
+                created_at: now(),
+            })
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(())
     }
 
@@ -1857,39 +1794,21 @@ impl Db {
         owner_id: i64,
         is_admin: bool,
     ) -> Result<bool> {
-        if is_admin {
-            let n = sqlx::query(
-                "UPDATE uploads SET original_name = ?, owner_id = ? WHERE saved_path = ?",
-            )
-            .bind(original_name)
-            .bind(owner_id)
-            .bind(saved_path)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-            return Ok(n == 1);
-        }
-        let n = sqlx::query(
-            "UPDATE uploads SET original_name = ?, owner_id = ? \
-             WHERE saved_path = ? AND (owner_id IS NULL OR owner_id = ?)",
-        )
-        .bind(original_name)
-        .bind(owner_id)
-        .bind(saved_path)
-        .bind(owner_id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .upload_register(saved_path, original_name, owner_id, is_admin)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 记录对应的桶（登记前判权用；记录不存在 → None）。
     pub async fn upload_bucket(&self, saved_path: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT bucket FROM uploads WHERE saved_path = ?")
-            .bind(saved_path)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.get("bucket")))
+        Ok(self
+            .control_store()
+            .upload(saved_path)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|r| r.bucket))
     }
 
     /// 桶版本控制状态（M4 切片 3；aether 上传面按此传 versioned；无行 → "Off"）。
@@ -1965,24 +1884,12 @@ impl Db {
     }
 
     pub async fn list_uploads(&self, limit: i64) -> Result<Vec<UploadRecord>> {
-        let rows =
-            sqlx::query("SELECT * FROM uploads ORDER BY created_at DESC, saved_path LIMIT ?")
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| UploadRecord {
-                saved_path: r.get("saved_path"),
-                bucket: r.get("bucket"),
-                key: r.get("key"),
-                group_name: r.get("group_name"),
-                size: r.get("size"),
-                etag: r.get("etag"),
-                original_name: r.get("original_name"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
+        let rows = self
+            .control_store()
+            .uploads(limit)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        Ok(rows.into_iter().map(upload_record).collect())
     }
 
     // ---- 子账户与权限（M-权限体系）----
@@ -2584,39 +2491,21 @@ impl Db {
     /// 上传归属登记：仅当该记录尚无归属时写入（`AND owner_id IS NULL`）。
     /// 返回是否写入（已归属/记录不存在 → false，调用方 best-effort 忽略）。
     pub async fn set_upload_owner(&self, saved_path: &str, uid: i64) -> Result<bool> {
-        let n = sqlx::query(
-            "UPDATE uploads SET owner_id = ? WHERE saved_path = ? AND owner_id IS NULL",
-        )
-        .bind(uid)
-        .bind(saved_path)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .upload_claim(saved_path, uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 某用户自己的上传记录（子账户视野）。
     pub async fn list_uploads_for(&self, uid: i64, limit: i64) -> Result<Vec<UploadRecord>> {
-        let rows = sqlx::query(
-            "SELECT * FROM uploads WHERE owner_id = ? ORDER BY created_at DESC, saved_path LIMIT ?",
-        )
-        .bind(uid)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| UploadRecord {
-                saved_path: r.get("saved_path"),
-                bucket: r.get("bucket"),
-                key: r.get("key"),
-                group_name: r.get("group_name"),
-                size: r.get("size"),
-                etag: r.get("etag"),
-                original_name: r.get("original_name"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
+        let rows = self
+            .control_store()
+            .uploads_for(uid, limit)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        Ok(rows.into_iter().map(upload_record).collect())
     }
 }
 
@@ -2695,22 +2584,41 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     }
 }
 
-fn site_peer_from_row(r: &sqlx::sqlite::SqliteRow) -> SitePeer {
+fn site_peer(r: SitePeerRow) -> SitePeer {
     SitePeer {
-        peer_id: r.get("peer_id"),
-        remote_site_id: r.get("remote_site_id"),
-        name: r.get("name"),
-        endpoint: r.get("endpoint"),
-        region: r.get("region"),
-        priority: r.get("priority"),
-        s3_access_key: r.get("s3_access_key"),
-        s3_secret_key: r.get("s3_secret_key"),
-        peer_site_token: r.get("peer_site_token"),
-        created_at: r.get("created_at"),
-        last_seen: r.get("last_seen"),
-        last_error: r.get("last_error"),
-        raft_node_id: r.get::<Option<i64>, _>("raft_node_id").map(|v| v as u64),
-        reconcile_required: r.get::<i64, _>("reconcile_required") != 0,
+        peer_id: r.peer_id,
+        remote_site_id: r.remote_site_id,
+        name: r.name,
+        endpoint: r.endpoint,
+        region: r.region,
+        priority: r.priority,
+        s3_access_key: r.s3_access_key,
+        s3_secret_key: r.s3_secret_key,
+        peer_site_token: r.peer_site_token,
+        created_at: r.created_at,
+        last_seen: r.last_seen,
+        last_error: r.last_error,
+        raft_node_id: r.raft_node_id,
+        reconcile_required: r.reconcile_required,
+    }
+}
+
+fn site_peer_row(p: &SitePeer) -> SitePeerRow {
+    SitePeerRow {
+        peer_id: p.peer_id.clone(),
+        remote_site_id: p.remote_site_id.clone(),
+        name: p.name.clone(),
+        endpoint: p.endpoint.clone(),
+        region: p.region.clone(),
+        priority: p.priority,
+        s3_access_key: p.s3_access_key.clone(),
+        s3_secret_key: p.s3_secret_key.clone(),
+        peer_site_token: p.peer_site_token.clone(),
+        created_at: p.created_at,
+        last_seen: p.last_seen,
+        last_error: p.last_error.clone(),
+        raft_node_id: p.raft_node_id,
+        reconcile_required: p.reconcile_required,
     }
 }
 

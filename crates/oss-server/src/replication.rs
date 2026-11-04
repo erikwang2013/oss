@@ -12,11 +12,15 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo};
+use xl_store::control_store::ControlError;
 use xl_store::control_store::bucket::BucketStore;
 use xl_store::control_store::bucket::BucketTxn;
+use xl_store::control_store::repl_outbox::{NewReplOutbox, ReplOutboxStore, ReplOutboxTxn};
+use xl_store::control_store::sites::SiteStore;
 use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
 
+use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 use crate::events::{backoff_secs, now};
 use crate::repl_client::{ErrClass, ReplClient, ReplError};
 
@@ -256,24 +260,28 @@ impl ReplicationSink for SqlReplSink {
                                 continue;
                             }
                             matched = true;
-                            if let Err(e) = sqlx::query(
-                                "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
-                                 dest_bucket, is_delete_marker, is_version_delete, target_kind, state, attempts, next_retry_at, created_at) \
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'remote', 'pending', 0, 0, ?)",
-                            )
-                            .bind(info.bucket)
-                            .bind(info.key)
-                            .bind(info.version_id.unwrap_or(""))
-                            .bind(info.etag)
-                            .bind(info.size as i64)
-                            .bind(&r.remote_id)
-                            .bind(&r.dest_bucket)
-                            .bind(i64::from(info.is_delete_marker))
-                            .bind(i64::from(info.is_version_delete))
-                            .bind(now())
-                            .execute(&self.pool)
-                            .await
-                            {
+                            let new = NewReplOutbox {
+                                bucket: info.bucket.to_string(),
+                                key: info.key.to_string(),
+                                version_id: info.version_id.unwrap_or("").to_string(),
+                                etag: info.etag.to_string(),
+                                size: info.size as i64,
+                                remote_id: r.remote_id.clone(),
+                                dest_bucket: r.dest_bucket.clone(),
+                                is_delete_marker: info.is_delete_marker,
+                                is_version_delete: info.is_version_delete,
+                                target_kind: "remote".into(),
+                                created_at: now(),
+                            };
+                            let enqueued = match self.pool.acquire().await {
+                                Ok(mut conn) => {
+                                    SqliteControlTxn::new(&mut conn).repl_enqueue(&new).await
+                                }
+                                Err(e) => Err(xl_store::control_store::ControlError::Backend(
+                                    e.to_string(),
+                                )),
+                            };
+                            if let Err(e) = enqueued {
                                 tracing::warn!(error = %e, bucket = info.bucket, key = info.key, "复制入队失败");
                             }
                         }
@@ -333,43 +341,45 @@ impl SqlReplSink {
                 return false;
             }
         }
-        let peers: Vec<String> =
-            match sqlx::query_scalar("SELECT peer_id FROM sites ORDER BY peer_id")
-                .fetch_all(&self.pool)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "读站点对失败——本写不复制到站点");
-                    return false;
-                }
-            };
+        let peers: Vec<String> = match SqliteControlStore::new(self.pool.clone())
+            .site_peer_ids()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "读站点对失败——本写不复制到站点");
+                return false;
+            }
+        };
         if peers.is_empty() {
             return false;
         }
         let mut matched = false;
         for peer in peers {
-            if let Err(e) = sqlx::query(
-                "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
-                 dest_bucket, is_delete_marker, is_version_delete, target_kind, state, attempts, next_retry_at, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'site', 'pending', 0, 0, ?)",
-            )
-            .bind(info.bucket)
-            .bind(info.key)
-            .bind(info.version_id.unwrap_or(""))
-            .bind(info.etag)
-            .bind(info.size as i64)
-            .bind(&peer)
-            .bind(info.bucket)
-            .bind(i64::from(info.is_delete_marker))
-            .bind(i64::from(info.is_version_delete))
-            .bind(now())
-            .execute(&self.pool)
-            .await
-            {
-                tracing::warn!(error = %e, bucket = info.bucket, key = info.key, peer = %peer, "站点复制入队失败");
-            } else {
-                matched = true;
+            let new = NewReplOutbox {
+                bucket: info.bucket.to_string(),
+                key: info.key.to_string(),
+                version_id: info.version_id.unwrap_or("").to_string(),
+                etag: info.etag.to_string(),
+                size: info.size as i64,
+                remote_id: peer.clone(),
+                dest_bucket: info.bucket.to_string(),
+                is_delete_marker: info.is_delete_marker,
+                is_version_delete: info.is_version_delete,
+                target_kind: "site".into(),
+                created_at: now(),
+            };
+            let enqueued = match self.pool.acquire().await {
+                Ok(mut conn) => SqliteControlTxn::new(&mut conn).repl_enqueue(&new).await,
+                Err(e) => Err(xl_store::control_store::ControlError::Backend(
+                    e.to_string(),
+                )),
+            };
+            match enqueued {
+                Ok(()) => matched = true,
+                Err(e) => {
+                    tracing::warn!(error = %e, bucket = info.bucket, key = info.key, peer = %peer, "站点复制入队失败");
+                }
             }
         }
         matched
@@ -451,53 +461,43 @@ fn site_404_retry(e: ReplError, cache_key: &str, op: &str) -> ReplError {
 async fn site_peer(
     pool: &SqlitePool,
     peer_id: &str,
-) -> Result<Option<(String, String, String, String, String)>, sqlx::Error> {
-    use sqlx::Row as _;
-    let row = sqlx::query(
-        "SELECT endpoint, s3_access_key, s3_secret_key, region, peer_site_token \
-         FROM sites WHERE peer_id = ?",
-    )
-    .bind(peer_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| {
-        (
-            r.get("endpoint"),
-            r.get("s3_access_key"),
-            r.get("s3_secret_key"),
-            r.get("region"),
-            r.get("peer_site_token"),
-        )
-    }))
+) -> Result<Option<(String, String, String, String, String)>, ControlError> {
+    Ok(SqliteControlStore::new(pool.clone())
+        .site_credentials(peer_id)
+        .await?
+        .map(|c| {
+            (
+                c.endpoint,
+                c.s3_access_key,
+                c.s3_secret_key,
+                c.region,
+                c.peer_site_token,
+            )
+        }))
 }
 
 /// 4.16：同 (bucket,key,version) 更早的出站行仍在途 → 版本删除必须先等待。
-async fn earlier_version_rows(pool: &SqlitePool, r: &ReplRow) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE bucket=? AND key=? AND version_id=? \
-         AND seq < ? AND state IN ('pending','sending')",
-    )
-    .bind(&r.bucket)
-    .bind(&r.key)
-    .bind(&r.version_id)
-    .bind(r.seq)
-    .fetch_one(pool)
-    .await
+async fn earlier_version_rows(pool: &SqlitePool, r: &ReplRow) -> Result<i64, ControlError> {
+    SqliteControlStore::new(pool.clone())
+        .repl_earlier_inflight(&r.bucket, &r.key, &r.version_id, r.seq)
+        .await
 }
 
 async fn renew_claim(pool: &SqlitePool, seq: i64, old: Option<i64>) -> Option<i64> {
     let now_s = now();
-    match sqlx::query(
-        "UPDATE repl_outbox SET claimed_at=? WHERE seq=? AND claimed_at IS ? AND state='sending'",
-    )
-    .bind(now_s)
-    .bind(seq)
-    .bind(old)
-    .execute(pool)
-    .await
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, seq, "复制续租失败（跳过本轮）");
+            return None;
+        }
+    };
+    match SqliteControlTxn::new(&mut conn)
+        .repl_renew(seq, old, now_s)
+        .await
     {
-        Ok(r) if r.rows_affected() == 1 => Some(now_s),
-        Ok(_) => None,
+        Ok(true) => Some(now_s),
+        Ok(false) => None,
         Err(e) => {
             tracing::warn!(error = %e, seq, "复制续租失败（跳过本轮）");
             None
@@ -506,13 +506,18 @@ async fn renew_claim(pool: &SqlitePool, seq: i64, old: Option<i64>) -> Option<i6
 }
 
 async fn finish_ok(pool: &SqlitePool, seq: i64, token: Option<i64>) -> bool {
-    match sqlx::query("DELETE FROM repl_outbox WHERE seq=? AND claimed_at IS ? AND state='sending'")
-        .bind(seq)
-        .bind(token)
-        .execute(pool)
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, seq, "复制完成删行失败");
+            return false;
+        }
+    };
+    match SqliteControlTxn::new(&mut conn)
+        .repl_finish_ok(seq, token)
         .await
     {
-        Ok(r) => r.rows_affected() == 1,
+        Ok(ok) => ok,
         Err(e) => {
             tracing::warn!(error = %e, seq, "复制完成删行失败");
             false
@@ -529,32 +534,28 @@ async fn requeue_or_bury(
     now_s: i64,
 ) -> bool {
     let bury = failure.class == ErrClass::Permanent && attempts > MAX_ATTEMPTS;
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, seq, "复制失败状态回写失败");
+            return false;
+        }
+    };
+    let mut txn = SqliteControlTxn::new(&mut conn);
     let res = if bury {
-        sqlx::query(
-            "UPDATE repl_outbox SET state='dead', attempts=?, claimed_at=NULL, last_error=? \
-             WHERE seq=? AND claimed_at IS ? AND state='sending'",
-        )
-        .bind(attempts)
-        .bind(&failure.message)
-        .bind(seq)
-        .bind(token)
-        .execute(pool)
-        .await
+        txn.repl_bury(seq, token, attempts, &failure.message).await
     } else {
-        sqlx::query(
-            "UPDATE repl_outbox SET state='pending', attempts=?, claimed_at=NULL, \
-             next_retry_at=?, last_error=? WHERE seq=? AND claimed_at IS ? AND state='sending'",
+        txn.repl_retry(
+            seq,
+            token,
+            attempts,
+            now_s + backoff_secs(attempts),
+            &failure.message,
         )
-        .bind(attempts)
-        .bind(now_s + backoff_secs(attempts))
-        .bind(&failure.message)
-        .bind(seq)
-        .bind(token)
-        .execute(pool)
         .await
     };
     match res {
-        Ok(r) => r.rows_affected() == 1,
+        Ok(ok) => ok,
         Err(e) => {
             tracing::warn!(error = %e, seq, "复制失败状态回写失败");
             false
@@ -700,25 +701,12 @@ async fn send_row(
 /// 存在 dead 行则 FAILED；否则 COMPLETED。`dropped=true` 表示解配丢弃了剩余行：
 /// 无剩余行时清除状态（`None`，不再有复制义务），而不是谎报 COMPLETED。
 async fn settle_version_status(pool: &SqlitePool, store: &Store, r: &ReplRow, dropped: bool) {
-    use sqlx::Row as _;
     // 单条聚合：三次独立 COUNT 之间的窗口可能把仍有 pending 行误判为已完成。
-    let counts = sqlx::query(
-        "SELECT COALESCE(SUM(state='pending'),0) AS pending, \
-                COALESCE(SUM(state='sending'),0) AS sending, \
-                COALESCE(SUM(state='dead'),0) AS dead \
-         FROM repl_outbox WHERE bucket=? AND key=? AND version_id=?",
-    )
-    .bind(&r.bucket)
-    .bind(&r.key)
-    .bind(&r.version_id)
-    .fetch_one(pool)
-    .await;
+    let counts = SqliteControlStore::new(pool.clone())
+        .repl_version_counts(&r.bucket, &r.key, &r.version_id)
+        .await;
     let (pending, sending, dead) = match counts {
-        Ok(counts) => (
-            counts.get::<i64, _>("pending"),
-            counts.get::<i64, _>("sending"),
-            counts.get::<i64, _>("dead"),
-        ),
+        Ok(counts) => (counts.pending, counts.sending, counts.dead),
         Err(e) => {
             tracing::warn!(error = %e, "复制终态聚合计数失败（本轮不写状态）");
             return;
@@ -774,31 +762,27 @@ pub async fn process_repl_once(
     client: &ReplClient,
 ) -> (usize, usize) {
     let now_s = now();
-    if let Err(e) = sqlx::query(
-        "UPDATE repl_outbox SET state='pending', claimed_at=NULL, next_retry_at=? \
-         WHERE state='sending' AND claimed_at < ?",
-    )
-    .bind(now_s)
-    .bind(now_s - REPL_LEASE_SECS)
-    .execute(pool)
-    .await
-    {
+    let reclaimed = match pool.acquire().await {
+        Ok(mut conn) => {
+            SqliteControlTxn::new(&mut conn)
+                .repl_reclaim_expired(now_s, REPL_LEASE_SECS)
+                .await
+        }
+        Err(e) => Err(ControlError::Backend(e.to_string())),
+    };
+    if let Err(e) = reclaimed {
         tracing::warn!(error = %e, "repl_outbox 租约回收失败");
         return (0, 0);
     }
-    let rows = match sqlx::query(
-        "UPDATE repl_outbox SET state='sending', claimed_at=? \
-         WHERE state='pending' AND seq IN (SELECT seq FROM repl_outbox WHERE state='pending' \
-                       AND next_retry_at <= ? ORDER BY seq LIMIT ?) \
-         RETURNING seq, bucket, key, version_id, etag, remote_id, dest_bucket, \
-         is_delete_marker, is_version_delete, target_kind, attempts, claimed_at",
-    )
-    .bind(now_s)
-    .bind(now_s)
-    .bind(CLAIM_BATCH)
-    .fetch_all(pool)
-    .await
-    {
+    let rows = match pool.acquire().await {
+        Ok(mut conn) => {
+            SqliteControlTxn::new(&mut conn)
+                .repl_claim(now_s, CLAIM_BATCH)
+                .await
+        }
+        Err(e) => Err(ControlError::Backend(e.to_string())),
+    };
+    let rows = match rows {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "repl_outbox claim 失败");
@@ -807,20 +791,19 @@ pub async fn process_repl_once(
     };
     let (mut sent, mut failed) = (0usize, 0usize);
     for row in rows {
-        use sqlx::Row as _;
         let r = ReplRow {
-            seq: row.get("seq"),
-            bucket: row.get("bucket"),
-            key: row.get("key"),
-            version_id: row.get("version_id"),
-            etag: row.get("etag"),
-            remote_id: row.get("remote_id"),
-            dest_bucket: row.get("dest_bucket"),
-            is_delete_marker: row.get::<i64, _>("is_delete_marker") != 0,
-            is_version_delete: row.get::<i64, _>("is_version_delete") != 0,
-            target_kind: row.get("target_kind"),
-            attempts: row.get("attempts"),
-            claimed_at: row.get("claimed_at"),
+            seq: row.seq,
+            bucket: row.bucket,
+            key: row.key,
+            version_id: row.version_id,
+            etag: row.etag,
+            remote_id: row.remote_id,
+            dest_bucket: row.dest_bucket,
+            is_delete_marker: row.is_delete_marker,
+            is_version_delete: row.is_version_delete,
+            target_kind: row.target_kind,
+            attempts: row.attempts,
+            claimed_at: row.claimed_at,
         };
         let Some(token) = renew_claim(pool, r.seq, r.claimed_at).await else {
             continue;
@@ -858,13 +841,7 @@ pub async fn process_repl_once(
                 }
                 Ok(None) => {
                     // 已解除配对：丢行并结算版本状态（否则只有该 site 行的版本永久 PENDING——P1-3）。
-                    let _ = sqlx::query(
-                        "DELETE FROM repl_outbox WHERE seq=? AND claimed_at IS ? AND state='sending'",
-                    )
-                    .bind(r.seq)
-                    .bind(Some(token))
-                    .execute(pool)
-                    .await;
+                    finish_ok(pool, r.seq, Some(token)).await;
                     if !r.version_id.is_empty() && !r.is_version_delete {
                         settle_version_status(pool, store, &r, true).await;
                     }

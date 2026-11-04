@@ -1,9 +1,13 @@
 //! M9 S7.5：`sync-reconcile [--repair]`——B′ 同 origin id 重推、映射刷新与本地 intent/outbox 清理。
 
 use serde::Serialize;
+use xl_store::control_store::repl_outbox::ReplOutboxTxn;
+use xl_store::control_store::sites::SiteTxn;
+use xl_store::control_store::sync_intents::SyncIntentTxn;
 use xl_store::store::Store;
 
 use crate::config::RemoteTarget;
+use crate::control_store::SqliteControlTxn;
 use crate::db::Db;
 use crate::repl_client::ReplClient;
 
@@ -385,37 +389,32 @@ pub async fn run_tls(
     // `--bucket` 只用于诊断：未验证其余 sync 桶前不得清站点级门/intents。
     if opts.repair && opts.bucket.is_none() && !report.has_errors() {
         let mut tx = db.pool().begin().await.map_err(|e| e.to_string())?;
-        let intents: u64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_write_intents")
-            .fetch_one(&mut *tx)
+        let intents = SqliteControlTxn::new(&mut tx)
+            .sync_write_intent_count()
+            .await
+            .map_err(|e| e.to_string())? as u64;
+        let deletes = SqliteControlTxn::new(&mut tx)
+            .sync_delete_intent_count()
+            .await
+            .map_err(|e| e.to_string())? as u64;
+        let outbox = SqliteControlTxn::new(&mut tx)
+            .repl_site_total(&peer.peer_id)
+            .await
+            .map_err(|e| e.to_string())? as u64;
+        SqliteControlTxn::new(&mut tx)
+            .sync_write_intent_delete_all()
             .await
             .map_err(|e| e.to_string())?;
-        let deletes: u64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_delete_intents")
-            .fetch_one(&mut *tx)
+        SqliteControlTxn::new(&mut tx)
+            .sync_delete_intent_delete_all()
             .await
             .map_err(|e| e.to_string())?;
-        let outbox: u64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM repl_outbox WHERE target_kind = 'site' AND remote_id = ?",
-        )
-        .bind(&peer.peer_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-        sqlx::query("DELETE FROM sync_write_intents")
-            .execute(&mut *tx)
+        SqliteControlTxn::new(&mut tx)
+            .repl_delete_site_all(&peer.peer_id)
             .await
             .map_err(|e| e.to_string())?;
-        sqlx::query("DELETE FROM sync_delete_intents")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        sqlx::query("DELETE FROM repl_outbox WHERE target_kind = 'site' AND remote_id = ?")
-            .bind(&peer.peer_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        sqlx::query("UPDATE sites SET reconcile_required = 0 WHERE peer_id = ?")
-            .bind(&peer.peer_id)
-            .execute(&mut *tx)
+        SqliteControlTxn::new(&mut tx)
+            .site_set_reconcile_required(&peer.peer_id, false)
             .await
             .map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;
