@@ -241,7 +241,7 @@ pub async fn due_runs_fenced_with(
             &row.bucket,
             &row.id,
             &run_key,
-            Some(row.owner_id),
+            Some(row.owner_uid),
             now,
             fence,
         )
@@ -431,22 +431,22 @@ impl InventoryRunner {
         // 运行期复核所有者仍存在且启用：停用/删除用户后配置不得继续产出。
         let (is_admin, active) = match self
             .db
-            .get_user(cfg_row.owner_id)
+            .get_user(cfg_row.owner_uid)
             .await
             .map_err(|e| e.to_string())?
         {
             Some((_, is_admin, active)) => (is_admin, active),
             None => {
-                let msg = format!("配置所有者 {} 不存在，拒绝运行清单", cfg_row.owner_id);
+                let msg = format!("配置所有者 {} 不存在，拒绝运行清单", cfg_row.owner_uid);
                 return Err(self.fail(run.id, run.job_id, msg, fence).await);
             }
         };
         if !active {
-            let msg = format!("配置所有者 {} 已停用，拒绝运行清单", cfg_row.owner_id);
+            let msg = format!("配置所有者 {} 已停用，拒绝运行清单", cfg_row.owner_uid);
             return Err(self.fail(run.id, run.job_id, msg, fence).await);
         }
         let owner = AuthedUser {
-            uid: cfg_row.owner_id,
+            uid: cfg_row.owner_uid,
             is_admin,
             ak: String::new(),
         };

@@ -15,6 +15,7 @@ pub mod tier;
 pub use inventory::InventoryConfigEntry;
 pub use lifecycle::LifecycleRuleEntry;
 
+use inventory::{InventoryStore, InventoryTxn};
 use lifecycle::{LifecycleStore, LifecycleTxn};
 
 /// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
@@ -80,7 +81,7 @@ pub enum ControlError {
 
 /// 只读控制面访问。实现必须复用 `Db` 的既有连接池，不得自建第二个池。
 #[async_trait::async_trait]
-pub trait ControlStore: LifecycleStore + Send + Sync {
+pub trait ControlStore: LifecycleStore + InventoryStore + Send + Sync {
     async fn vpc_endpoint(&self, vpce_id: &str) -> Result<Option<VpcEndpoint>, ControlError>;
     /// 按 `vpce_id` 升序（导出/校验的确定性来源）。
     async fn vpc_endpoints(&self) -> Result<Vec<VpcEndpoint>, ControlError>;
@@ -97,7 +98,7 @@ pub trait ControlStore: LifecycleStore + Send + Sync {
 
 /// 调用方事务内的写访问。`&mut self` 表示独占借用，不提供 begin/commit/rollback。
 #[async_trait::async_trait]
-pub trait ControlTxn: LifecycleTxn + Send {
+pub trait ControlTxn: LifecycleTxn + InventoryTxn + Send {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError>;
     async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError>;
     /// 返回是否确有行被删除。

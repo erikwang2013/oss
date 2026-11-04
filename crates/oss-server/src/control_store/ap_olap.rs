@@ -103,7 +103,10 @@ pub(super) async fn olap_configs(
 
 /// `Admin` → 首个管理员 id，无管理员 → 0（witness 哨兵）；`User(name)` → users.id，
 /// 缺失且存在管理员 → Invalid，缺失且无管理员 → 0（与 apply::admin_owner_id 等价）。
-async fn resolve_owner(conn: &mut SqliteConnection, owner: &OwnerRef) -> Result<i64, ControlError> {
+pub(super) async fn resolve_owner(
+    conn: &mut SqliteConnection,
+    owner: &OwnerRef,
+) -> Result<i64, ControlError> {
     let admin: Option<i64> =
         sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
             .fetch_optional(&mut *conn)

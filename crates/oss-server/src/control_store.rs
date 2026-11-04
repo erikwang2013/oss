@@ -4,6 +4,9 @@
 //! 事务由调用方持有；适配器不 begin/commit/rollback。
 
 use sqlx::{Row, SqlitePool};
+use xl_store::control_store::inventory::{
+    InventoryConfigEntry, InventoryConfigView, InventoryStore, InventoryTxn,
+};
 use xl_store::control_store::lifecycle::{
     LifecycleCursorRow, LifecycleRuleEntry, LifecycleStore, LifecycleTxn,
 };
@@ -12,6 +15,7 @@ use xl_store::control_store::{
 };
 
 mod ap_olap;
+mod inventory;
 mod lifecycle;
 
 pub struct SqliteControlStore {
@@ -77,6 +81,32 @@ impl ControlStore for SqliteControlStore {
 
     async fn olap_configs(&self) -> Result<Vec<OlapConfigEntry>, ControlError> {
         ap_olap::olap_configs(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl InventoryStore for SqliteControlStore {
+    async fn inventory_config(
+        &self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<Option<InventoryConfigView>, ControlError> {
+        inventory::inventory_config(self, bucket, id).await
+    }
+
+    async fn inventory_configs(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<InventoryConfigView>, ControlError> {
+        inventory::inventory_configs(self, bucket).await
+    }
+
+    async fn inventory_configs_all(&self) -> Result<Vec<InventoryConfigView>, ControlError> {
+        inventory::inventory_configs_all(self).await
+    }
+
+    async fn inventory_config_count(&self, bucket: &str) -> Result<i64, ControlError> {
+        inventory::inventory_config_count(self, bucket).await
     }
 }
 
@@ -261,6 +291,35 @@ impl ControlTxn for SqliteControlTxn<'_> {
 
     async fn delete_access_points_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
         ap_olap::txn_delete_access_points_for_bucket(self, bucket).await
+    }
+}
+
+#[async_trait::async_trait]
+impl InventoryTxn for SqliteControlTxn<'_> {
+    async fn inventory_config_upsert(
+        &mut self,
+        row: &InventoryConfigEntry,
+    ) -> Result<(), ControlError> {
+        inventory::txn_inventory_config_upsert(self, row).await
+    }
+
+    async fn inventory_config_delete(
+        &mut self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<bool, ControlError> {
+        inventory::txn_inventory_config_delete(self, bucket, id).await
+    }
+
+    async fn inventory_configs(&mut self) -> Result<Vec<InventoryConfigEntry>, ControlError> {
+        inventory::txn_inventory_configs(self).await
+    }
+
+    async fn replace_inventory_configs(
+        &mut self,
+        rows: &[InventoryConfigEntry],
+    ) -> Result<(), ControlError> {
+        inventory::txn_replace_inventory_configs(self, rows).await
     }
 }
 

@@ -1,6 +1,8 @@
 //! lifecycle/inventory/tier 双后端差分的共享辅助：legacy raw SQL 参考实现
 //! （测试内重新实现，不调用生产读方法）。
 
+#![allow(dead_code)] // 每个差分测试二进制只用到自己域的辅助。
+
 use std::sync::Arc;
 
 use oss_server::db::Db;
@@ -287,4 +289,139 @@ pub async fn raw_cursor_delete(
     .execute(db.pool())
     .await
     .unwrap();
+}
+
+// ---------- inventory_configs / cursors / incrementals ----------
+
+pub async fn raw_inventory_config(
+    db: &Db,
+    bucket: &str,
+    id: &str,
+    owner_id: i64,
+    config_json: &str,
+    updated_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(bucket)
+    .bind(id)
+    .bind(owner_id)
+    .bind(config_json)
+    .bind(updated_at)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+pub type RawInventoryConfig = (String, String, i64, String, i64);
+
+/// 旧导出/调度读口径：`ORDER BY bucket, id`。
+pub async fn raw_inventory_config_dump(db: &Db) -> Vec<RawInventoryConfig> {
+    sqlx::query(
+        "SELECT bucket, id, owner_id, config_json, updated_at \
+         FROM inventory_configs ORDER BY bucket, id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.get("bucket"),
+            r.get("id"),
+            r.get("owner_id"),
+            r.get("config_json"),
+            r.get("updated_at"),
+        )
+    })
+    .collect()
+}
+
+pub async fn raw_inventory_cursor(
+    db: &Db,
+    bucket: &str,
+    config_id: &str,
+    cursor: &str,
+    config_updated_at: i64,
+    updated_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO inventory_cursors (bucket, config_id, cursor, config_updated_at, \
+         updated_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(bucket)
+    .bind(config_id)
+    .bind(cursor)
+    .bind(config_updated_at)
+    .bind(updated_at)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+pub type RawInventoryCursor = (String, String, String, i64, i64);
+
+pub async fn raw_inventory_cursor_dump(db: &Db) -> Vec<RawInventoryCursor> {
+    sqlx::query(
+        "SELECT bucket, config_id, cursor, config_updated_at, updated_at \
+         FROM inventory_cursors ORDER BY bucket, config_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.get("bucket"),
+            r.get("config_id"),
+            r.get("cursor"),
+            r.get("config_updated_at"),
+            r.get("updated_at"),
+        )
+    })
+    .collect()
+}
+
+pub async fn raw_inventory_incremental(
+    db: &Db,
+    bucket: &str,
+    config_id: &str,
+    enabled: bool,
+    updated_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(bucket)
+    .bind(config_id)
+    .bind(i64::from(enabled))
+    .bind(updated_at)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+pub type RawInventoryIncremental = (String, String, i64, i64);
+
+pub async fn raw_inventory_incremental_dump(db: &Db) -> Vec<RawInventoryIncremental> {
+    sqlx::query(
+        "SELECT bucket, config_id, enabled, updated_at \
+         FROM inventory_incremental ORDER BY bucket, config_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.get("bucket"),
+            r.get("config_id"),
+            r.get("enabled"),
+            r.get("updated_at"),
+        )
+    })
+    .collect()
 }

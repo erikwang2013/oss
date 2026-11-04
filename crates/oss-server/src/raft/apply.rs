@@ -9,6 +9,7 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
+use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryTxn};
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
@@ -170,22 +171,6 @@ async fn bucket_owner_id(
     }
     // witness / 本地管理员尚未 bootstrap：管理员属主占位 NULL（启动修复再收敛）。
     Ok(None)
-}
-
-/// AP/inventory owner（NOT NULL）：管理员 → 本地管理员 id；witness/未 bootstrap → 0。
-async fn admin_owner_id(
-    cw: &mut ControlWrite<'_>,
-    owner: &Option<String>,
-) -> Result<i64, sqlx::Error> {
-    let admin = admin_id(cw).await?;
-    match owner {
-        None => Ok(admin.unwrap_or(0)),
-        Some(username) => match uid(cw, username).await? {
-            Some(id) => Ok(id),
-            None if admin.is_some() => Err(invariant(format!("owner user {username} not found"))),
-            None => Ok(0),
-        },
-    }
 }
 
 fn permissions_rows(bits: &[PermissionBits]) -> Vec<PermissionRow> {
@@ -773,14 +758,30 @@ pub(crate) async fn apply_command(
             {
                 ControlResponse::Invalid
             } else {
-                let owner_id = admin_owner_id(cw, owner).await?;
-                Db::inventory_upsert_raw(cw, bucket, id, owner_id, config_json, *updated_at)
-                    .await?;
+                let row = InventoryConfigEntry {
+                    bucket: bucket.clone(),
+                    id: id.clone(),
+                    owner: match owner {
+                        None => OwnerRef::Admin,
+                        Some(username) => OwnerRef::User(username.clone()),
+                    },
+                    config_json: config_json.clone(),
+                    updated_at: *updated_at,
+                };
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .inventory_config_upsert(&row)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             }
         }
         ControlCommand::InventoryDelete { bucket, id } => {
-            if Db::inventory_delete_raw(cw, bucket, id).await? {
+            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+            if txn
+                .inventory_config_delete(bucket, id)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound

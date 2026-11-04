@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::OwnerRef;
+use super::{ControlError, OwnerRef};
 
 /// inventory 配置快照行（自然键 `(bucket, id)`；字段顺序即快照字节顺序）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +69,48 @@ pub struct InventoryIncrementalRow {
     pub config_id: String,
     pub enabled: bool,
     pub updated_at: i64,
+}
+
+/// 只读 inventory 访问（运行期视图带本地外键投影 `owner_uid`）。
+#[async_trait::async_trait]
+pub trait InventoryStore: Send + Sync {
+    /// 运行期口径；`owner_uid` 为本地外键投影，`owner = None` 表示用户行缺失。
+    async fn inventory_config(
+        &self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<Option<InventoryConfigView>, ControlError>;
+    /// 按 `id` 升序。
+    async fn inventory_configs(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<InventoryConfigView>, ControlError>;
+    /// 按 `(bucket, id)` 升序。
+    async fn inventory_configs_all(&self) -> Result<Vec<InventoryConfigView>, ControlError>;
+    async fn inventory_config_count(&self, bucket: &str) -> Result<i64, ControlError>;
+}
+
+/// 调用方事务内的 inventory 写访问；本 trait 不 begin/commit/rollback。
+#[async_trait::async_trait]
+pub trait InventoryTxn: Send {
+    /// 解析属主自然键 → 本地 uid；DELETE 该配置的 cursor + incremental；upsert config。
+    async fn inventory_config_upsert(
+        &mut self,
+        row: &InventoryConfigEntry,
+    ) -> Result<(), ControlError>;
+    /// DELETE cursor + incremental + config；返回是否确有 config 行被删。
+    async fn inventory_config_delete(
+        &mut self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<bool, ControlError>;
+    /// 快照导出（严格口径），按 `(bucket, id)` 升序。
+    async fn inventory_configs(&mut self) -> Result<Vec<InventoryConfigEntry>, ControlError>;
+    /// 快照安装：DELETE 全表 configs，再按入参顺序 INSERT（不碰 cursor/incremental）。
+    async fn replace_inventory_configs(
+        &mut self,
+        rows: &[InventoryConfigEntry],
+    ) -> Result<(), ControlError>;
 }
 
 #[cfg(test)]

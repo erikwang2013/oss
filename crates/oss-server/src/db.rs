@@ -6,6 +6,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
+use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryConfigView, InventoryTxn};
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
@@ -163,16 +164,6 @@ fn row_to_restore(r: &sqlx::sqlite::SqliteRow) -> RestoreRow {
         state: r.get("state"),
         created_at: r.get("created_at"),
     }
-}
-
-/// M8 S5：Inventory 配置行（`config_json` = s3s DTO 的 JSON）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct InventoryConfigRow {
-    pub bucket: String,
-    pub id: String,
-    pub owner_id: i64,
-    pub config_json: String,
-    pub updated_at: i64,
 }
 
 /// M8 S5：Inventory 运行行（`started_at` = 实际开始执行的时刻）。
@@ -6078,75 +6069,39 @@ impl Db {
     // ——— M8 S5：Inventory 配置与运行行 ———
 
     pub async fn inventory_config_count(&self, bucket: &str) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) AS n FROM inventory_configs WHERE bucket = ?")
-            .bind(bucket)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.get("n"))
+        self.control_store()
+            .inventory_config_count(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     pub async fn inventory_get_config(
         &self,
         bucket: &str,
         id: &str,
-    ) -> Result<Option<InventoryConfigRow>> {
-        let row = sqlx::query(
-            "SELECT bucket, id, owner_id, config_json, updated_at FROM inventory_configs \
-             WHERE bucket = ? AND id = ?",
-        )
-        .bind(bucket)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| InventoryConfigRow {
-            bucket: r.get("bucket"),
-            id: r.get("id"),
-            owner_id: r.get("owner_id"),
-            config_json: r.get("config_json"),
-            updated_at: r.get("updated_at"),
-        }))
+    ) -> Result<Option<InventoryConfigView>> {
+        self.control_store()
+            .inventory_config(bucket, id)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
-    pub async fn inventory_list_configs(&self, bucket: &str) -> Result<Vec<InventoryConfigRow>> {
-        let rows = sqlx::query(
-            "SELECT bucket, id, owner_id, config_json, updated_at FROM inventory_configs \
-             WHERE bucket = ? ORDER BY id",
-        )
-        .bind(bucket)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| InventoryConfigRow {
-                bucket: r.get("bucket"),
-                id: r.get("id"),
-                owner_id: r.get("owner_id"),
-                config_json: r.get("config_json"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
+    pub async fn inventory_list_configs(&self, bucket: &str) -> Result<Vec<InventoryConfigView>> {
+        self.control_store()
+            .inventory_configs(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 生成器用：全部桶的配置（ORDER BY bucket, id 保证调度确定性）。
-    pub async fn inventory_list_all_configs(&self) -> Result<Vec<InventoryConfigRow>> {
-        let rows = sqlx::query(
-            "SELECT bucket, id, owner_id, config_json, updated_at FROM inventory_configs \
-             ORDER BY bucket, id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| InventoryConfigRow {
-                bucket: r.get("bucket"),
-                id: r.get("id"),
-                owner_id: r.get("owner_id"),
-                config_json: r.get("config_json"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
+    pub async fn inventory_list_all_configs(&self) -> Result<Vec<InventoryConfigView>> {
+        self.control_store()
+            .inventory_configs_all()
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
+    /// 单机门面保留数字 uid 签名（决策 7）：0 → Admin；uid 必须存在，否则 RowNotFound。
     pub async fn inventory_upsert_config(
         &self,
         bucket: &str,
@@ -6155,50 +6110,30 @@ impl Db {
         config_json: &str,
         now: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, id) DO UPDATE SET \
-             owner_id = excluded.owner_id, config_json = excluded.config_json, \
-             updated_at = excluded.updated_at",
-        )
-        .bind(bucket)
-        .bind(id)
-        .bind(owner_id)
-        .bind(config_json)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        // 3.6：配置变更 → 旧增量水位/模式失效（console 随后按请求重新设置模式）。
-        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let row = InventoryConfigEntry {
+            bucket: bucket.to_string(),
+            id: id.to_string(),
+            owner: self.owner_ref(owner_id).await?,
+            config_json: config_json.to_string(),
+            updated_at: now,
+        };
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .inventory_config_upsert(&row)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn inventory_delete_config(&self, bucket: &str, id: &str) -> Result<bool> {
-        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        let r = sqlx::query("DELETE FROM inventory_configs WHERE bucket = ? AND id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(r.rows_affected() > 0)
+        let mut tx = self.pool.begin().await?;
+        let deleted = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .inventory_config_delete(bucket, id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     /// 3.6：Inventory 增量模式（默认全量；本地表，不进 Raft）。
@@ -7023,63 +6958,6 @@ impl Db {
         Ok(())
     }
 
-    pub(crate) async fn inventory_upsert_raw(
-        cw: &mut ControlWrite<'_>,
-        bucket: &str,
-        id: &str,
-        owner_id: i64,
-        config_json: &str,
-        updated_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(bucket, id) DO UPDATE SET \
-             owner_id = excluded.owner_id, config_json = excluded.config_json, \
-             updated_at = excluded.updated_at",
-        )
-        .bind(bucket)
-        .bind(id)
-        .bind(owner_id)
-        .bind(config_json)
-        .bind(updated_at)
-        .execute(&mut *cw.conn())
-        .await?;
-        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&mut *cw.conn())
-            .await?;
-        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&mut *cw.conn())
-            .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn inventory_delete_raw(
-        cw: &mut ControlWrite<'_>,
-        bucket: &str,
-        id: &str,
-    ) -> Result<bool> {
-        sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&mut *cw.conn())
-            .await?;
-        sqlx::query("DELETE FROM inventory_incremental WHERE bucket = ? AND config_id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&mut *cw.conn())
-            .await?;
-        let n = sqlx::query("DELETE FROM inventory_configs WHERE bucket = ? AND id = ?")
-            .bind(bucket)
-            .bind(id)
-            .execute(&mut *cw.conn())
-            .await?
-            .rows_affected();
-        Ok(n > 0)
-    }
 }
 
 /// 审计查询的过滤条件（`Db::list_audit`）；`key_prefix` 为 object_key 前缀，其余精确匹配。
