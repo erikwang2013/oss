@@ -12,7 +12,12 @@ pub async fn pair() -> (Db, Db) {
     (a, b)
 }
 
-pub async fn legacy_user(conn: &mut SqliteConnection, name: &str, admin: bool, created: i64) -> i64 {
+pub async fn legacy_user(
+    conn: &mut SqliteConnection,
+    name: &str,
+    admin: bool,
+    created: i64,
+) -> i64 {
     sqlx::query(
         "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, 'h', ?, ?)",
     )
@@ -81,14 +86,16 @@ async fn legacy_member(
     role: &str,
     created: i64,
 ) {
-    sqlx::query("INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?)")
-        .bind(account)
-        .bind(uid)
-        .bind(role)
-        .bind(created)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(account)
+    .bind(uid)
+    .bind(role)
+    .bind(created)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
 }
 
 async fn legacy_member_upsert(
@@ -200,11 +207,13 @@ pub async fn run_legacy(conn: &mut SqliteConnection) -> Vec<bool> {
             == 1,
     );
     out.push(
-        sqlx::query("UPDATE accounts SET soft_byte_quota = 100, updated_at = 9 WHERE id = 'acct-x'")
-            .execute(&mut *conn)
-            .await
-            .unwrap()
-            .rows_affected()
+        sqlx::query(
+            "UPDATE accounts SET soft_byte_quota = 100, updated_at = 9 WHERE id = 'acct-x'",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap()
+        .rows_affected()
             == 1,
     );
     out.push(
@@ -299,7 +308,11 @@ pub async fn run_legacy(conn: &mut SqliteConnection) -> Vec<bool> {
         .unwrap();
     out.push(legacy_quota_reached(conn, Some(alice)).await);
 
-    for (id, bytes, count) in [("acct-x", 100, 1), ("acct-x", 200, 3), ("000000000002", 10, 0)] {
+    for (id, bytes, count) in [
+        ("acct-x", 100, 1),
+        ("acct-x", 200, 3),
+        ("000000000002", 10, 0),
+    ] {
         sqlx::query(
             "INSERT INTO account_usage_ledger (account_id, used_bytes, object_count) \
              VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET \
@@ -331,9 +344,18 @@ pub async fn run_seam(conn: &mut SqliteConnection) -> Vec<bool> {
     let mut out = Vec::new();
     let (root, alice, bob) = {
         let mut t = SqliteControlTxn::new(&mut *conn);
-        let root = t.user_create_default_status("root", "h", true, 1).await.unwrap();
-        let alice = t.user_create_default_status("alice", "h", false, 2).await.unwrap();
-        let bob = t.user_create_default_status("bob", "h", false, 3).await.unwrap();
+        let root = t
+            .user_create_default_status("root", "h", true, 1)
+            .await
+            .unwrap();
+        let alice = t
+            .user_create_default_status("alice", "h", false, 2)
+            .await
+            .unwrap();
+        let bob = t
+            .user_create_default_status("bob", "h", false, 3)
+            .await
+            .unwrap();
         (root, alice, bob)
     };
     for (name, owner) in [("ba1", alice), ("ba2", alice), ("ba3", alice), ("bb1", bob)] {
@@ -397,9 +419,17 @@ pub async fn run_seam(conn: &mut SqliteConnection) -> Vec<bool> {
     for uid in [bob, alice] {
         t.account_set_admin_if_unset("acct-x", uid).await.unwrap();
     }
-    out.push(t.account_set_status("acct-x", "disabled", 18).await.unwrap());
+    out.push(
+        t.account_set_status("acct-x", "disabled", 18)
+            .await
+            .unwrap(),
+    );
     t.account_members_delete_admins().await.unwrap();
-    out.push(t.account_set_status("acct-x", "disabled", 19).await.unwrap());
+    out.push(
+        t.account_set_status("acct-x", "disabled", 19)
+            .await
+            .unwrap(),
+    );
     out.push(t.account_set_status("acct-x", "active", 20).await.unwrap());
     t.account_insert_derived_if_absent("000000000001", "root", root, 21, 22)
         .await
@@ -415,7 +445,11 @@ pub async fn run_seam(conn: &mut SqliteConnection) -> Vec<bool> {
             .unwrap();
     }
     out.push(t.bucket_quota_reached(Some(bob)).await.unwrap());
-    out.push(t.account_set_status("acct-x", "disabled", 27).await.unwrap());
+    out.push(
+        t.account_set_status("acct-x", "disabled", 27)
+            .await
+            .unwrap(),
+    );
     out.push(t.bucket_quota_reached(Some(bob)).await.unwrap());
     out.push(t.account_set_status("acct-x", "active", 28).await.unwrap());
     t.account_set_bucket_quota("000000000002", Some(2), 29)
@@ -427,10 +461,15 @@ pub async fn run_seam(conn: &mut SqliteConnection) -> Vec<bool> {
         .unwrap();
     out.push(t.bucket_quota_reached(Some(alice)).await.unwrap());
 
-    for (id, bytes, count) in [("acct-x", 100, 1), ("acct-x", 200, 3), ("000000000002", 10, 0)] {
+    for (id, bytes, count) in [
+        ("acct-x", 100, 1),
+        ("acct-x", 200, 3),
+        ("000000000002", 10, 0),
+    ] {
         t.account_ledger_upsert(id, bytes, count).await.unwrap();
     }
-    drop(t);
+    // 结束对 conn 的借用，再走 raw 准备行。
+    let _ = t;
     sqlx::query("INSERT INTO account_usage (account_id) VALUES ('acct-y')")
         .execute(&mut *conn)
         .await

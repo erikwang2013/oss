@@ -296,7 +296,7 @@ site.rs 的 chunk 级 `apply_ctx`/clock 写入不变。
 
 **Interfaces:**
 - 差分：两个库（`Db::connect_site` 固定站点 id + `insert_site`）；A 库 legacy raw SQL，B 库 seam；比较六表全列（显式列 + ORDER BY）、`site_changelog` 确定性列、`site_entity_clock` 元组。覆盖：建用户/改密/启停用/删用户、建/删/改状态 AK、权限全量替换/site upsert/delete、账户增删改/成员迁移/配额、账本 upsert、`delete_bucket_cascade` 的 permissions 清理、rollback。
-- 审计：`strip_test_modules` 复用 bucket diff 的实现；TABLES 六表；ALLOWED = 六个适配器 + D7 文件（`db.rs`、`site.rs`、`cluster_control.rs`、`state.rs`、`console.rs`）；xl-s3 不在扫描范围；断言删除的 raw helper 名称不存在（`create_user_raw`、`set_password_raw`、`set_permissions_raw`、`create_access_key_raw`、`delete_access_key_raw`、`set_access_key_status_raw`）。
+- 审计：`strip_test_modules` 复用 bucket diff 的实现；TABLES 六表；ALLOWED = 六个适配器 + D7 文件（`db.rs`、`site.rs`、`cluster_control.rs`、`state.rs`、`console.rs`、`data.rs`）；xl-s3 不在扫描范围；断言删除的 raw helper 名称不存在（`create_user_raw`、`set_password_raw`、`set_permissions_raw`、`create_access_key_raw`、`delete_access_key_raw`、`set_access_key_status_raw`）。
 - `raft_guard` 源扫描通过（新文件名加入 ALLOWED）。
 
 - [ ] **Step 1:** 写差分/审计；首跑审计 FAIL（列出残余 raw SQL）。
@@ -308,21 +308,60 @@ site.rs 的 chunk 级 `apply_ctx`/clock 写入不变。
 
 ### Task 8: 切片门禁
 
-- [ ] `cargo test -p xl-store`
-- [ ] `cargo test -p oss-server --lib`
-- [ ] `cargo test -p oss-server --test control_store_iam_diff --test control_store_account_diff --test control_store_iam_snapshot --test raft_guard --test raft_access --test raft_accounts --test raft_accounts_follower --test raft_accounts_canonical --test raft_quota_ledger --test site_sync --test permissions --test console_api --test accounts`
-- [ ] `cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings`
-- [ ] `cargo fmt --all --check`
-- [ ] 偶发超时隔离重跑，记录；不改断言。
-- [ ] commit（若有格式化改动）`chore: IAM/account control-store slice gate fixes`。
+- [x] `cargo test -p xl-store`
+- [x] `cargo test -p oss-server --lib`
+- [x] `cargo test -p oss-server --test control_store_iam_diff --test control_store_account_diff --test control_store_iam_snapshot --test raft_guard --test raft_access --test raft_accounts --test raft_accounts_follower --test raft_accounts_canonical --test raft_quota_ledger --test site_sync --test permissions --test console_api --test accounts`
+- [x] `cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings`
+- [x] `cargo fmt --all --check`
+- [x] 偶发超时隔离重跑，记录；不改断言。
+- [x] commit（若有格式化改动）`chore: IAM/account control-store slice gate fixes`。
 
 ## 自检清单（执行者完成前逐项确认）
 
-- [ ] 六张表的生产 SQL 只出现在六个适配器与 D7 白名单文件。
-- [ ] users/AK/permissions 的 site 触发器列清单与 raft guard 原样触发；无 `INSERT OR REPLACE`。
-- [ ] `UserRow`/`AccessKeyRow`/`PermissionRow`/`AccountRow`/`AccountMemberRow`/`AccountUsageLedgerRow` 字段顺序有字节测试；`ControlData` 字段顺序未动。
-- [ ] 安装顺序与错误文本逐字一致；canonical marker 语义不变。
-- [ ] `owner_ref(0) → Admin`、账户成员优先/派生回落、停用账户 fail-closed 均有测试。
-- [ ] `delete_user`、`delete_bucket_cascade`、账户删除的范围未变。
-- [ ] xl-s3 热路径均有 `shortcut:` 注释。
-- [ ] 无触发器删除/重命名；无新增依赖；新增文件 < 500 行。
+- [x] 六张表的生产 SQL 只出现在六个适配器与 D7 白名单文件。
+- [x] users/AK/permissions 的 site 触发器列清单与 raft guard 原样触发；无 `INSERT OR REPLACE`。
+- [x] `UserRow`/`AccessKeyRow`/`PermissionRow`/`AccountRow`/`AccountMemberRow`/`AccountUsageLedgerRow` 字段顺序有字节测试；`ControlData` 字段顺序未动。
+- [x] 安装顺序与错误文本逐字一致；canonical marker 语义不变。
+- [x] `owner_ref(0) → Admin`、账户成员优先/派生回落、停用账户 fail-closed 均有测试。
+- [x] `delete_user`、`delete_bucket_cascade`、账户删除的范围未变。
+- [x] xl-s3 热路径均有 `shortcut:` 注释。
+- [x] 无触发器删除/重命名；无新增依赖；新增文件 < 500 行。
+
+---
+
+## 门禁记录
+
+2026-11-05，切片提交 `96cab69..7edd260`（Tasks 1–7）加门禁修复提交，在
+`/home/wwwroot/project/oss/.claude/worktrees/agent-ae3c8c34c32aa1fd2` 执行：
+
+- `cargo test -p xl-store`：484 单元 + 10 集成 passed / 0 failed / 1 ignored。
+- `cargo test -p oss-server --lib`：316 passed / 0 failed / 0 ignored。
+- 集成套件（14 个测试二进制）全部通过：`accounts` 13、`console_api` 33、
+  `control_store_iam_diff` 5、`control_store_account_diff` 2、
+  `control_store_iam_snapshot` 2、`permissions` 5、`raft_access` 6、
+  `raft_accounts` 6、`raft_accounts_canonical` 2、`raft_accounts_follower` 4、
+  `raft_guard` 3、`raft_quota_ledger` 4、`raft_routing` 5、`site_sync` 1。
+- `cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings`：exit 0。
+- `cargo fmt --all --check`：exit 0。
+- 结论：切片门禁 PASS。
+
+执行偏差/修复：
+
+1. `Db::create_user` / `Db::create_access_key` 经缝后 sqlx 错误被折叠为
+   `ControlError::Backend` 文本，`is_unique_violation` 失效，重复用户名/AK 由 400
+   变 500。新增 `control_store::is_unique_violation` 同时识别原生 `Database` 与
+   `Protocol("... UNIQUE constraint failed ...")`；console 两条分支改用它，响应
+   仍是原文 `用户名已存在` / `access key 已存在`。
+2. `raft::data::read_tx` 逐字段赋值触发 clippy `field_reassign_with_default`；
+   单表达式 await 不可读，函数级 `#[allow]`。
+3. IAM 审计白名单补 `data.rs`：安装前 `UPDATE uploads ... SELECT id FROM users ...`
+   是多行 SQL，续行匹配 `from users `；该读属 D7 跨域 FK 置空。
+   `control_store_bucket_diff` 白名单补 `apply.rs`：`UserDelete` 级联中的
+   `UPDATE buckets/uploads SET owner_id = NULL`（D7，归桶/上传切片）。
+4. 测试支撑中 `drop(SqliteControlTxn)` 触发 clippy `drop_non_drop`，改为
+   `let _ = t;` 结束借用；行为不变。
+
+已知残余例外（D7）：xl-s3 的 SigV4/ACL/STS/本地用量缓存、`cluster_control.rs`
+mesh AK 查询、`console.rs` 配对 AK 查询、`db.rs`/`site.rs`/`apply.rs` 的
+buckets/uploads 属主置空、`state.rs` 启动守卫计数。`permissions` 的 site
+upsert 为 UPDATE-then-INSERT（见 D2 偏差记录）。

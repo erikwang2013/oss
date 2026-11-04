@@ -195,6 +195,8 @@ fn control_data_err(e: ControlError) -> DataError {
 
 /// 单事务读取 11 张复制表（+ canonical marker 之后的 level-3 账户两表；调用方负责
 /// 事务；行序 = checksum/自然键确定性来源）。
+// 逐字段读取各自 reborrow conn；合成一个 struct 表达式反而不可读。
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, DataError> {
     let mut data = ControlData::default();
 
@@ -205,16 +207,12 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
 
     data.access_keys = {
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.snapshot_access_keys()
-            .await
-            .map_err(control_data_err)?
+        txn.snapshot_access_keys().await.map_err(control_data_err)?
     };
 
     data.permissions = {
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.snapshot_permissions()
-            .await
-            .map_err(control_data_err)?
+        txn.snapshot_permissions().await.map_err(control_data_err)?
     };
 
     data.buckets = {

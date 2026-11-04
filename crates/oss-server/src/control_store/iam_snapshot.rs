@@ -5,9 +5,7 @@
 
 use sqlx::Row;
 use xl_store::control_store::ControlError;
-use xl_store::control_store::iam::{
-    AccessKeyEntry, IamSnapshotTxn, PermissionEntry, UserEntry,
-};
+use xl_store::control_store::iam::{AccessKeyEntry, IamSnapshotTxn, PermissionEntry, UserEntry};
 
 use super::{SqliteControlTxn, backend};
 

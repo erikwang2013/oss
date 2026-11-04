@@ -3458,7 +3458,7 @@ async fn create_access_key(
                 Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response()
             }
             // UNIQUE 冲突说人话；不落 sqlite 原文
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            Err(e) if crate::control_store::is_unique_violation(&e) => {
                 (StatusCode::BAD_REQUEST, "access key 已存在").into_response()
             }
             Err(e) => {
@@ -3535,7 +3535,7 @@ async fn create_user(
     if !state.control.is_raft() {
         return match state.db.create_user(username, &body.password, false).await {
             Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            Err(e) if crate::control_store::is_unique_violation(&e) => {
                 (StatusCode::BAD_REQUEST, "用户名已存在").into_response()
             }
             Err(e) => {

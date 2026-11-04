@@ -314,9 +314,18 @@ pub async fn run_legacy(conn: &mut SqliteConnection) {
 
 pub async fn run_seam(conn: &mut SqliteConnection) {
     let mut t = SqliteControlTxn::new(conn);
-    let _root = t.user_create_default_status("root", "h0", true, 1).await.unwrap();
-    let alice = t.user_create_default_status("alice", "h0", false, 2).await.unwrap();
-    let bob = t.user_create_default_status("bob", "h0", false, 3).await.unwrap();
+    let _root = t
+        .user_create_default_status("root", "h0", true, 1)
+        .await
+        .unwrap();
+    let alice = t
+        .user_create_default_status("alice", "h0", false, 2)
+        .await
+        .unwrap();
+    let bob = t
+        .user_create_default_status("bob", "h0", false, 3)
+        .await
+        .unwrap();
 
     t.user_set_password(alice, "h1").await.unwrap();
     assert!(t.user_set_status(alice, false).await.unwrap());
@@ -341,14 +350,22 @@ pub async fn run_seam(conn: &mut SqliteConnection) {
     )
     .await
     .unwrap();
-    t.permission_upsert(alice, "b1", true, true, true).await.unwrap();
-    t.permission_upsert(alice, "b3", true, false, false).await.unwrap();
+    t.permission_upsert(alice, "b1", true, true, true)
+        .await
+        .unwrap();
+    t.permission_upsert(alice, "b3", true, false, false)
+        .await
+        .unwrap();
     t.permission_delete(alice, "b2").await.unwrap();
 
     t.access_key_create_legacy("AKALICE1", "SK1", alice, 10)
         .await
         .unwrap();
-    assert!(t.access_key_set_status("AKALICE1", "disabled").await.unwrap());
+    assert!(
+        t.access_key_set_status("AKALICE1", "disabled")
+            .await
+            .unwrap()
+    );
     assert!(t.access_key_set_status("AKALICE1", "active").await.unwrap());
     t.access_key_create(&AccessKeyEntry {
         access_key: "AKBOB1".into(),
@@ -383,7 +400,9 @@ pub async fn run_seam(conn: &mut SqliteConnection) {
         .await
         .unwrap();
 
-    t.permission_upsert(bob, "b1", true, false, false).await.unwrap();
+    t.permission_upsert(bob, "b1", true, false, false)
+        .await
+        .unwrap();
     t.access_key_create_legacy("AKBOB3", "SKB3", bob, 50)
         .await
         .unwrap();
@@ -393,4 +412,3 @@ pub async fn run_seam(conn: &mut SqliteConnection) {
     assert!(t.access_key_delete_long_term("AKALICE1").await.unwrap());
     t.permissions_delete_for_bucket("b1").await.unwrap();
 }
-

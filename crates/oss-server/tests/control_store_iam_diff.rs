@@ -181,7 +181,9 @@ async fn rollback_discards_iam_writes() {
     let mut tx = b.pool().begin().await.unwrap();
     {
         let mut t = SqliteControlTxn::new(&mut tx);
-        t.user_create_default_status("root", "h", true, 1).await.unwrap();
+        t.user_create_default_status("root", "h", true, 1)
+            .await
+            .unwrap();
         let uid = t
             .user_create_default_status("alice", "h", false, 2)
             .await
@@ -193,8 +195,12 @@ async fn rollback_discards_iam_writes() {
     let mut tx = b.pool().begin().await.unwrap();
     {
         let mut t = SqliteControlTxn::new(&mut tx);
-        t.user_create_default_status("temp", "h", false, 3).await.unwrap();
-        t.permission_upsert(alice, "b1", true, false, false).await.unwrap();
+        t.user_create_default_status("temp", "h", false, 3)
+            .await
+            .unwrap();
+        t.permission_upsert(alice, "b1", true, false, false)
+            .await
+            .unwrap();
         t.access_key_create_legacy("AKTEMP", "SK", alice, 3)
             .await
             .unwrap();
@@ -350,7 +356,7 @@ fn production_sources_have_no_raw_iam_sql() {
         "cluster_control.rs",
         "state.rs",
         "console.rs",
-        // D7：安装时跨域清空 uploads.owner_id（子查询只读 users）。
+        // D7：安装时跨域清空 uploads.owner_id，子查询只读 users。
         "data.rs",
     ];
     const TABLES: &[&str] = &[

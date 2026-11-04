@@ -89,7 +89,12 @@ fn control_data_json_field_order_is_frozen() {
         "account_usage_ledger",
     ];
     for pair in order.windows(2) {
-        assert!(pos(pair[0]) < pos(pair[1]), "{} 必须在 {} 之前", pair[0], pair[1]);
+        assert!(
+            pos(pair[0]) < pos(pair[1]),
+            "{} 必须在 {} 之前",
+            pair[0],
+            pair[1]
+        );
     }
     // 行内字段顺序同样是快照字节的一部分。
     let rows: [(&str, &[&str]); 6] = [
@@ -152,7 +157,12 @@ fn control_data_json_field_order_is_frozen() {
 fn empty_level3_vectors_stay_omitted_and_round_trip() {
     let empty = ControlData::default();
     let json = serde_json::to_string(&empty).unwrap();
-    for k in ["accounts", "account_members", "vpc_endpoints", "account_usage_ledger"] {
+    for k in [
+        "accounts",
+        "account_members",
+        "vpc_endpoints",
+        "account_usage_ledger",
+    ] {
         assert!(!json.contains(&format!("\"{k}\"")), "空 {k} 不得序列化");
     }
     let data = sample();

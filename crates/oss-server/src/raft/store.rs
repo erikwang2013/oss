@@ -1382,17 +1382,16 @@ impl SqliteStateMachine {
         // 账本是 level-9 数据：低于 9 的快照不携带它，整表安装会清空复制账本。
         // 本机仍有账本行时拒绝，避免回退快照静默丢用量（保守：宁可恢复失败）。
         if snapshot.feature_level < super::compat::FEATURE_LEVEL_9 {
-            let ledger_rows: i64 =
-                crate::control_store::SqliteControlStore::new(self.pool.clone())
-                    .account_ledger_count()
-                    .await
-                    .map_err(|e| {
-                        storage_err(
-                            ErrorSubject::Snapshot(None),
-                            ErrorVerb::Read,
-                            sqlx::Error::Protocol(e.to_string()),
-                        )
-                    })?;
+            let ledger_rows: i64 = crate::control_store::SqliteControlStore::new(self.pool.clone())
+                .account_ledger_count()
+                .await
+                .map_err(|e| {
+                    storage_err(
+                        ErrorSubject::Snapshot(None),
+                        ErrorVerb::Read,
+                        sqlx::Error::Protocol(e.to_string()),
+                    )
+                })?;
             if ledger_rows != 0 {
                 return Err(Self::data_err(data::DataError::Format(format!(
                     "cannot install a level-{} snapshot: local account_usage_ledger has \

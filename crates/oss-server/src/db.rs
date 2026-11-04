@@ -374,11 +374,10 @@ impl Db {
         if marker.is_some() {
             return Ok(());
         }
-        let (accounts, members) =
-            crate::control_store::SqliteControlTxn::new(&mut tx)
-                .account_counts()
-                .await
-                .map_err(crate::control_store::to_sqlx)?;
+        let (accounts, members) = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .account_counts()
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         if accounts != 0 || members != 0 {
             return Err(sqlx::Error::Protocol(format!(
                 "Raft 模式启动失败：缺少 schema_meta.{META_ACCOUNTS_CANONICAL} 但账户表非空 \

@@ -273,6 +273,16 @@ pub(crate) fn to_sqlx(e: ControlError) -> sqlx::Error {
     }
 }
 
+/// 适配器把 sqlx 错误折叠为 `ControlError::Backend` 文本；原生的
+/// `DatabaseError::is_unique_violation` 判定需要同时识别 `Protocol` 文本。
+pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => db.is_unique_violation(),
+        sqlx::Error::Protocol(m) => m.contains("UNIQUE constraint failed"),
+        _ => false,
+    }
+}
+
 /// 桶删除级联：7 张表按固定顺序删除（调用方事务内）。
 pub(crate) async fn delete_lifecycle_inventory_tier_for_bucket(
     txn: &mut SqliteControlTxn<'_>,
