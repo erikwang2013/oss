@@ -34,7 +34,10 @@ pub const USAGE: &str = "\
                  逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
   control-recertify --keys-file <path> [--apply] [--json]
                  集群 legacy 控制对象补证书（默认 dry-run）：逐键全槽扫描，唯一同内容组
-                 ≥Q_s 才写提交证书；--apply 才落盘；任一键失败 exit 1
+                 ≥Q_s 才写提交证书；--apply 才落盘；任一键失败 exit 1。键列表必须覆盖
+                 命名空间全部 control/ 键（漏键 fail-closed，不误认证；补全后重跑即可）；
+                 须全节点先升级（control_raw），并在本机 serve 停止、其余节点在线的维护
+                 窗口执行；Indeterminate = 可能已提交，禁止假设回滚，排除波动后重跑核对
   cluster-shrink plan --to <target.toml> [--json]
                  shrink 只读校验（全节点 maintenance）：逐 set 槽数/parity/容量/epoch+hash/
                  退役节点 MPU 全通过才出计划；报告 .oss.sys/shrink/<old>-<new>-plan.json

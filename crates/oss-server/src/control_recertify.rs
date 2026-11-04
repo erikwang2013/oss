@@ -98,12 +98,12 @@ async fn one(store: &Store, key: &str, apply: bool) -> Result<KeyReport, StoreEr
             }
             RecertifyOutcome::Certified {
                 version,
-                certified,
+                certified: flipped,
                 token,
             } => {
                 r.state = "certified";
                 r.version = Some(version);
-                r.certified = certified;
+                r.certified = flipped;
                 r.token = Some(token);
             }
         }
@@ -111,21 +111,21 @@ async fn one(store: &Store, key: &str, apply: bool) -> Result<KeyReport, StoreEr
     Ok(r)
 }
 
-fn print_human(r: &KeyReport) {
+fn human_line(r: &KeyReport) -> String {
     let version = r.version.map_or_else(|| "-".into(), |v| format!("v{v}"));
     match r.state {
-        "missing" => println!("{}: missing（无副本，no-op）", r.key),
-        "already-committed" => println!(
+        "missing" => format!("{}: missing（无副本，no-op）", r.key),
+        "already-committed" => format!(
             "{}: already-committed {version}（证书 {} 份，no-op）",
             r.key, r.certified
         ),
-        "certified" => println!(
-            "{}: certified {version}（证书 {} 份，token {}）",
+        "certified" => format!(
+            "{}: certified {version}（本次翻转 {} 槽，token {}）",
             r.key,
             r.certified,
             r.token.unwrap_or(0)
         ),
-        state => println!(
+        state => format!(
             "{}: {state} {version}（Q_s={}，副本 {}，证书 {}，组 {}）",
             r.key,
             r.q_s,
@@ -133,6 +133,99 @@ fn print_human(r: &KeyReport) {
             r.certified,
             r.groups.len()
         ),
+    }
+}
+
+struct ExecOutcome {
+    stdout: String,
+    stderr: String,
+    code: i32,
+}
+
+/// 执行并渲染输出；`run` 只负责打印。逐键继续：单键失败计入汇总但不中断后续键。
+async fn execute(store: &Store, keys: &[String], apply: bool, json: bool) -> ExecOutcome {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut entries = Vec::with_capacity(keys.len());
+    let mut failed = 0usize;
+    let mut missing = 0usize;
+    for key in keys {
+        match one(store, key, apply).await {
+            Ok(r) => {
+                missing += usize::from(r.state == "missing");
+                if json {
+                    entries.push(serde_json::json!({
+                        "key": r.key,
+                        "ok": true,
+                        "state": r.state,
+                        "version": r.version,
+                        "q_s": r.q_s,
+                        "copies": r.copies,
+                        "certified": r.certified,
+                        "token": r.token,
+                        "groups": r.groups.iter().map(|g| serde_json::json!({
+                            "version": g.version,
+                            "copies": g.copies,
+                            "certified": g.certified,
+                            "max_token": g.max_token,
+                        })).collect::<Vec<_>>(),
+                    }));
+                } else {
+                    stdout.push_str(&human_line(&r));
+                    stdout.push('\n');
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                let msg = if matches!(e, StoreError::Indeterminate(_)) {
+                    format!("可能已提交（Indeterminate），禁止假设回滚；请重跑同一命令核对：{e}")
+                } else {
+                    e.to_string()
+                };
+                if json {
+                    entries.push(serde_json::json!({
+                        "key": key,
+                        "ok": false,
+                        "error": msg,
+                    }));
+                } else {
+                    stderr.push_str(&format!("Error: {key}: {msg}\n"));
+                }
+            }
+        }
+    }
+    if json {
+        stdout.push_str(&format!(
+            "{}\n",
+            serde_json::json!({
+                "applied": apply,
+                "ok": failed == 0,
+                "missing": missing,
+                "keys": entries,
+            })
+        ));
+    } else {
+        let nothing = if failed == 0 && missing == keys.len() {
+            "；nothing to do"
+        } else {
+            ""
+        };
+        stdout.push_str(&format!(
+            "control-recertify{}: {} 键 / missing {} / 失败 {}{nothing}\n",
+            if apply {
+                "（apply）"
+            } else {
+                "（dry-run）"
+            },
+            keys.len(),
+            missing,
+            failed,
+        ));
+    }
+    ExecOutcome {
+        stdout,
+        stderr,
+        code: if failed == 0 { 0 } else { 1 },
     }
 }
 
@@ -149,91 +242,12 @@ pub async fn run(
             "control-recertify 仅支持集群部署；单节点请用库 API recertify_system_object".into(),
         );
     }
-    let mut entries = Vec::with_capacity(keys.len());
-    let mut failed = 0usize;
-    for key in &keys {
-        match one(store, key, apply).await {
-            Ok(r) => {
-                if !json {
-                    print_human(&r);
-                }
-                entries.push(serde_json::json!({
-                    "key": r.key,
-                    "ok": true,
-                    "state": r.state,
-                    "version": r.version,
-                    "q_s": r.q_s,
-                    "copies": r.copies,
-                    "certified": r.certified,
-                    "token": r.token,
-                    "groups": r.groups.iter().map(|g| serde_json::json!({
-                        "version": g.version,
-                        "copies": g.copies,
-                        "certified": g.certified,
-                        "max_token": g.max_token,
-                    })).collect::<Vec<_>>(),
-                }));
-            }
-            Err(e) => {
-                failed += 1;
-                let msg = if matches!(e, StoreError::Indeterminate(_)) {
-                    format!("可能已提交（Indeterminate），禁止假设回滚；请重跑同一命令核对：{e}")
-                } else {
-                    e.to_string()
-                };
-                if json {
-                    entries.push(serde_json::json!({
-                        "key": key,
-                        "ok": false,
-                        "error": msg,
-                    }));
-                } else {
-                    eprintln!("Error: {key}: {msg}");
-                }
-            }
-        }
-    }
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"applied": apply, "ok": failed == 0, "keys": entries})
-        );
-    } else {
-        println!(
-            "control-recertify{}: {} 键 / 失败 {}",
-            if apply {
-                "（apply）"
-            } else {
-                "（dry-run）"
-            },
-            keys.len(),
-            failed
-        );
-    }
-    Ok(if failed == 0 { 0 } else { 1 })
+    let out = execute(store, &keys, apply, json).await;
+    print!("{}", out.stdout);
+    eprint!("{}", out.stderr);
+    Ok(out.code)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn keys_file_ignores_comments_and_rejects_empty_duplicate_non_control() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("keys.txt");
-        std::fs::write(&p, "# 注释\r\n\r\ncontrol/a\r\ncontrol/b\r\n# tail\r\n").unwrap();
-        assert_eq!(load_keys(&p).unwrap(), vec!["control/a", "control/b"]);
-
-        std::fs::write(&p, "# 只有注释\n\n").unwrap();
-        assert!(load_keys(&p).is_err(), "空列表必须拒绝");
-
-        std::fs::write(&p, "control/a\ncontrol/a\n").unwrap();
-        assert!(load_keys(&p).is_err(), "重复键必须拒绝");
-
-        std::fs::write(&p, "objects/a\n").unwrap();
-        assert!(load_keys(&p).is_err(), "非 control/ 前缀必须拒绝");
-
-        std::fs::write(&p, "control/../a\n").unwrap();
-        assert!(load_keys(&p).is_err(), "非法键必须拒绝");
-    }
-}
+#[path = "control_recertify_tests.rs"]
+mod tests;
