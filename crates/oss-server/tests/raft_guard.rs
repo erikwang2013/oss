@@ -128,6 +128,10 @@ fn source_scan_flags_new_control_table_writers() {
         "lifecycle.rs",
         "inventory.rs",
         "tier.rs",
+        // ControlStore SQLite 适配器（buckets/policies/event/replication 切片）。
+        "bucket.rs",
+        "bucket_write.rs",
+        "bucket_snapshot.rs",
         // level-3 账户命令 apply 子模块（apply 层，经 ControlCommand 进入）。
         "accounts.rs",
         "data.rs",

@@ -1,8 +1,9 @@
 //! 桶 / 桶配置的 SQLite 写实现（调用方事务内；不 begin/commit）。
 //!
 //! SQL 形状逐字复刻旧 `Db::create_bucket_tx` 与各 `*_raw` helper：`buckets`
-//! INSERT 固定 `set_id=0`，UPDATE 不写 `set_id/creation_date`；策略/事件/复制规则
-//! 用 `INSERT ... ON CONFLICT DO UPDATE`（保留 site 触发器语义）。
+//! INSERT 固定 `set_id=0`，UPDATE 不写 `set_id/creation_date`；事件/复制规则用
+//! `INSERT ... ON CONFLICT DO UPDATE`。策略写用 UPDATE-then-INSERT：UPSERT 与
+//! site 触发器组合会误报 UNIQUE（见 `bucket_policy_set`）。
 
 use sqlx::SqliteConnection;
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
@@ -192,17 +193,31 @@ pub(super) async fn bucket_policy_set(
     policy_json: &str,
     updated_at: i64,
 ) -> Result<(), ControlError> {
-    sqlx::query(
-        "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, ?) \
-         ON CONFLICT(bucket) DO UPDATE SET policy_json = excluded.policy_json, \
-         updated_at = excluded.updated_at",
+    // 不能沿用 `INSERT ... ON CONFLICT DO UPDATE`：SQLite 在 UPSERT 触发的
+    // `site_log_policy_upd` 内执行 `INSERT OR IGNORE site_entity_clock` 时会把
+    // PK 冲突误报为 UNIQUE（policy 已存在即失败）。UPDATE-then-INSERT 产生相同
+    // 的 upsert changelog（行在→upd 触发器，行缺→ins 触发器），且仍是单写事务。
+    let res = sqlx::query(
+        "UPDATE bucket_policies SET policy_json = ?, updated_at = ? \
+         WHERE bucket = ?",
     )
-    .bind(bucket)
     .bind(policy_json)
     .bind(updated_at)
+    .bind(bucket)
     .execute(&mut *txn.conn)
     .await
     .map_err(backend)?;
+    if res.rows_affected() == 0 {
+        sqlx::query(
+            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind(bucket)
+        .bind(policy_json)
+        .bind(updated_at)
+        .execute(&mut *txn.conn)
+        .await
+        .map_err(backend)?;
+    }
     Ok(())
 }
 

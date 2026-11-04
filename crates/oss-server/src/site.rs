@@ -51,6 +51,7 @@ fn wins(e: &Entry, clock: Option<(i64, i64, String, i64)>) -> bool {
     }
 }
 
+// shortcut: LWW 时钟直接读写 site_entity_clock；站点同步属 Slice 6（jobs/outbox/sites）。
 async fn get_clock(
     tx: &mut sqlx::SqliteConnection,
     entity: &str,
@@ -167,6 +168,7 @@ pub async fn apply_changelog(state: &AppState, entries: Vec<Entry>) -> Result<Ap
     }
     let pool = state.db.pool().clone();
     let mut tx = pool.begin().await.map_err(|e| bad(e.to_string()))?;
+    // shortcut: apply_ctx 是 site 触发器与 raft apply 共用的本地互斥开关；随 Slice 6 迁移。
     sqlx::query("UPDATE apply_ctx SET active = 1 WHERE id = 1")
         .execute(&mut *tx)
         .await

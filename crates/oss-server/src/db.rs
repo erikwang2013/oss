@@ -6677,20 +6677,18 @@ impl Db {
                 .await
                 .map_err(crate::control_store::to_sqlx)?;
         }
-        for sql in [
-            "DELETE FROM permissions WHERE bucket = ?",
-            "DELETE FROM bucket_policies WHERE bucket = ?",
-            "DELETE FROM event_configs WHERE bucket = ?",
-            "DELETE FROM replication_rules WHERE bucket = ?",
-        ] {
-            sqlx::query(sql).bind(bucket).execute(&mut *conn).await?;
-        }
-        let n = sqlx::query("DELETE FROM buckets WHERE name = ?")
+        // shortcut: permissions 属 Slice 5（IAM/账号），随该切片迁移。
+        sqlx::query("DELETE FROM permissions WHERE bucket = ?")
             .bind(bucket)
             .execute(&mut *conn)
-            .await?
-            .rows_affected();
-        Ok(n > 0)
+            .await?;
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.delete_bucket_configs_for_bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        txn.bucket_delete(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 }
 
@@ -7042,6 +7040,26 @@ mod argon2_tests {
         .execute(db.pool())
         .await
         .unwrap();
+        for sql in [
+            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, '{}', 1)",
+            "INSERT INTO event_configs (bucket, config_json, updated_at) VALUES (?, '[]', 1)",
+            "INSERT INTO replication_rules (bucket, rules_json, updated_at) VALUES (?, '[]', 1)",
+        ] {
+            sqlx::query(sql)
+                .bind(bucket)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
+             VALUES (?, ?, 1, 1, 1)",
+        )
+        .bind(owner)
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.create_access_point(&format!("ap-{bucket}"), bucket, owner, None, 1)
             .await
             .unwrap();
@@ -7100,31 +7118,110 @@ mod argon2_tests {
         assert!(store.olap_config("ap-b2").await.unwrap().is_some());
     }
 
-    /// Task 7：delete_bucket_cascade 同一 7 表范围，桶行最后删除。
+    /// Task 7：delete_bucket_cascade 覆盖 13 张表，桶行最后删除，其他桶原样。
     #[tokio::test]
-    async fn delete_bucket_cascade_uses_same_seven_table_scope() {
+    async fn cascade_deletes_all_13_tables_and_spares_other_bucket() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let root = db.create_user("root", "pw", true).await.unwrap();
-        sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES ('b1', ?, 1)")
-            .bind(root)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        for name in ["b1", "b2"] {
+            sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES (?, ?, 1)")
+                .bind(name)
+                .bind(root)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
         seed_cascade_rows(&db, "b1", root).await;
         seed_cascade_rows(&db, "b2", root).await;
-        sqlx::query("INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, 'b1', 1, 1, 1)")
-            .bind(root)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES ('b1', '{}', 1)",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
 
         let mut tx = db.pool().begin().await.unwrap();
+        {
+            let mut cw = crate::raft::apply::control_tx(&mut tx);
+            assert!(Db::delete_bucket_cascade(&mut cw, "b1").await.unwrap());
+            assert!(!Db::delete_bucket_cascade(&mut cw, "b1").await.unwrap());
+        }
+        tx.commit().await.unwrap();
+
+        for table in [
+            "inventory_runs",
+            "inventory_configs",
+            "inventory_cursors",
+            "inventory_incremental",
+            "tier_restores",
+            "lifecycle_rules",
+            "lifecycle_cursors",
+            "permissions",
+            "bucket_policies",
+            "event_configs",
+            "replication_rules",
+        ] {
+            assert_eq!(count_bucket_rows(&db, table, "b1").await, 0, "{table} b1");
+            assert_eq!(count_bucket_rows(&db, table, "b2").await, 1, "{table} b2");
+        }
+        let store = db.control_store();
+        assert!(store.access_point("ap-b1").await.unwrap().is_none());
+        assert!(store.olap_config("ap-b1").await.unwrap().is_none());
+        assert!(store.access_point("ap-b2").await.unwrap().is_some());
+        assert!(store.olap_config("ap-b2").await.unwrap().is_some());
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM buckets ORDER BY name")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(names, ["b2"]);
+    }
+
+    /// Task 8：现级联与旧 SQL 参考实现的最终状态逐表一致。
+    #[tokio::test]
+    async fn cascade_matches_legacy_reference() {
+        let a = Db::connect("sqlite::memory:").await.unwrap();
+        let b = Db::connect("sqlite::memory:").await.unwrap();
+        for db in [&a, &b] {
+            let root = db.create_user("root", "pw", true).await.unwrap();
+            for name in ["b1", "b2"] {
+                sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES (?, ?, 1)")
+                    .bind(name)
+                    .bind(root)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            seed_cascade_rows(db, "b1", root).await;
+            seed_cascade_rows(db, "b2", root).await;
+        }
+
+        let mut conn = a.pool().acquire().await.unwrap();
+        sqlx::query(
+            "DELETE FROM olap_configs WHERE access_point IN \
+             (SELECT name FROM access_points WHERE bucket = ?)",
+        )
+        .bind("b1")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        for sql in [
+            "DELETE FROM access_points WHERE bucket = ?",
+            "DELETE FROM inventory_runs WHERE bucket = ?",
+            "DELETE FROM inventory_configs WHERE bucket = ?",
+            "DELETE FROM inventory_cursors WHERE bucket = ?",
+            "DELETE FROM inventory_incremental WHERE bucket = ?",
+            "DELETE FROM tier_restores WHERE bucket = ?",
+            "DELETE FROM lifecycle_rules WHERE bucket = ?",
+            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
+            "DELETE FROM permissions WHERE bucket = ?",
+            "DELETE FROM bucket_policies WHERE bucket = ?",
+            "DELETE FROM event_configs WHERE bucket = ?",
+            "DELETE FROM replication_rules WHERE bucket = ?",
+            "DELETE FROM buckets WHERE name = ?",
+        ] {
+            sqlx::query(sql)
+                .bind("b1")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        drop(conn);
+
+        let mut tx = b.pool().begin().await.unwrap();
         {
             let mut cw = crate::raft::apply::control_tx(&mut tx);
             assert!(Db::delete_bucket_cascade(&mut cw, "b1").await.unwrap());
@@ -7141,22 +7238,39 @@ mod argon2_tests {
             "lifecycle_cursors",
             "permissions",
             "bucket_policies",
+            "event_configs",
+            "replication_rules",
         ] {
-            assert_eq!(count_bucket_rows(&db, table, "b1").await, 0, "{table} b1");
+            for bucket in ["b1", "b2"] {
+                assert_eq!(
+                    count_bucket_rows(&a, table, bucket).await,
+                    count_bucket_rows(&b, table, bucket).await,
+                    "{table} {bucket}"
+                );
+            }
         }
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inventory_runs WHERE bucket = 'b2'")
-                .fetch_one(db.pool())
+        for db in [&a, &b] {
+            let names: Vec<String> = sqlx::query_scalar("SELECT name FROM buckets ORDER BY name")
+                .fetch_all(db.pool())
                 .await
-                .unwrap(),
-            1,
-            "其他桶不受影响"
-        );
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name = 'b1'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(n, 0);
+                .unwrap();
+            assert_eq!(names, ["b2"]);
+            for (sql, expect) in [
+                ("SELECT COUNT(*) FROM access_points WHERE bucket = 'b1'", 0),
+                ("SELECT COUNT(*) FROM access_points WHERE bucket = 'b2'", 1),
+                (
+                    "SELECT COUNT(*) FROM olap_configs WHERE access_point = 'ap-b1'",
+                    0,
+                ),
+                (
+                    "SELECT COUNT(*) FROM olap_configs WHERE access_point = 'ap-b2'",
+                    1,
+                ),
+            ] {
+                let n: i64 = sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap();
+                assert_eq!(n, expect, "{sql}");
+            }
+        }
     }
 
     /// Task 7：site 删桶只删 lifecycle_rules（保留 cursors），但走 txn。
