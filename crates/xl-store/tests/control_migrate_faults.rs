@@ -6,11 +6,23 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::*;
 use xl_store::meta::XlMeta;
 use xl_store::store::RecertifyOutcome;
+
+/// 直接写盘上 `xl.meta`（绕过 Store 的两阶段；仅测试构造 legacy 现场）。
+fn write_disk_meta(drive: &Path, key: &str, m: &XlMeta) {
+    let dir = control_dir(drive, key);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("xl.meta"), m.encode().unwrap()).unwrap();
+}
+
+/// 盘上 `xl.meta` 原始字节（缺失 → None；零写入断言用）。
+fn disk_meta_bytes(drive: &Path, key: &str) -> Option<Vec<u8>> {
+    std::fs::read(control_dir(drive, key).join("xl.meta")).ok()
+}
 
 /// 生产形态的 legacy 现场：先用真实两阶段写建立 v1/token1，再把所有副本剥掉证书
 /// 直接写盘（模拟迁移前状态，9 份同内容、无 `Some(false)`）。

@@ -196,15 +196,3 @@ pub fn disk_meta(drive: &Path, key: &str) -> XlMeta {
     let bytes = std::fs::read(control_dir(drive, key).join("xl.meta")).unwrap();
     XlMeta::decode(&bytes).unwrap()
 }
-
-/// 直接写盘上 `xl.meta`（绕过 Store 的两阶段；仅测试构造 legacy 现场）。
-pub fn write_disk_meta(drive: &Path, key: &str, m: &XlMeta) {
-    let dir = control_dir(drive, key);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("xl.meta"), m.encode().unwrap()).unwrap();
-}
-
-/// 盘上 `xl.meta` 原始字节（缺失 → None；零写入断言用）。
-pub fn disk_meta_bytes(drive: &Path, key: &str) -> Option<Vec<u8>> {
-    std::fs::read(control_dir(drive, key).join("xl.meta")).ok()
-}
