@@ -1270,7 +1270,11 @@ async fn put_notifications(
         };
         return control_write_status(state.control.write(cmd).await, "通知配置写入冲突");
     }
-    match state.acl().set_bucket_notification(&bucket, &json).await {
+    match state
+        .db
+        .set_bucket_notification(&bucket, &json, crate::db::now())
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "写通知配置失败");
@@ -1297,7 +1301,7 @@ async fn delete_notifications(
             "通知配置写入冲突",
         );
     }
-    match state.acl().clear_bucket_notification(&bucket).await {
+    match state.db.clear_bucket_notification(&bucket).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "清通知配置失败");
@@ -2405,7 +2409,7 @@ async fn put_bucket_encryption(
         );
     }
     match state
-        .acl()
+        .db
         .set_bucket_default_encryption(&bucket, &algorithm)
         .await
     {
@@ -2439,7 +2443,7 @@ async fn delete_bucket_encryption(
             "加密配置写入冲突",
         );
     }
-    match state.acl().clear_bucket_default_encryption(&bucket).await {
+    match state.db.clear_bucket_default_encryption(&bucket).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = %e, bucket, "清桶默认加密失败");
@@ -2929,7 +2933,7 @@ async fn delete_bucket(
             if let Err(e) = state.acl().clear_bucket_notification(&bucket).await {
                 tracing::warn!(error = %e, bucket = %bucket, "删桶清通知配置失败");
             }
-            if let Err(e) = state.acl().clear_bucket_policy(&bucket).await {
+            if let Err(e) = state.db.clear_bucket_policy(&bucket).await {
                 tracing::warn!(error = ?e, "清理桶策略失败");
             }
             // M5 切片 0（P4-1）：删行广播（best-effort）

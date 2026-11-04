@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo};
 use xl_store::control_store::bucket::BucketStore;
+use xl_store::control_store::bucket::BucketTxn;
 use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
 
@@ -84,17 +85,13 @@ impl ReplicationStore for SqlReplStore {
                     .await,
             );
         }
-        sqlx::query(
-            "INSERT INTO replication_rules (bucket, rules_json, updated_at) VALUES (?, ?, ?) \
-             ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json, \
-             updated_at=excluded.updated_at",
-        )
-        .bind(bucket)
-        .bind(rules_json)
-        .bind(now())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        let ts = now();
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_replication_rules_set(bucket, rules_json, ts)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -108,11 +105,12 @@ impl ReplicationStore for SqlReplStore {
                     .await,
             );
         }
-        sqlx::query("DELETE FROM replication_rules WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_replication_rules_delete(bucket)
             .await
             .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(())
     }
 

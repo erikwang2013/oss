@@ -592,6 +592,7 @@ impl Acl {
     }
 
     /// 清桶策略（删桶时调用——与生命周期规则同款 S6-1 语义）。
+    // shortcut: Acl 只持有 SqlitePool，无法看到 oss-server 适配器；S3 热路径迁移归 Slice 5（IAM/账户）或最终 SQLite 移除。
     pub async fn clear_bucket_policy(&self, bucket: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
             .bind(bucket)

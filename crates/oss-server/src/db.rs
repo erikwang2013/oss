@@ -6,6 +6,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
+use xl_store::control_store::bucket::BucketTxn;
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
     InventoryTxn,
@@ -1703,11 +1704,12 @@ impl Db {
 
     /// M9 S3：删桶 quiesce 标志（S6 起改由 Raft `SetBucketDeleting` 命令承载）。
     pub async fn set_bucket_deleting(&self, name: &str, deleting: bool) -> Result<()> {
-        sqlx::query("UPDATE buckets SET deleting = ? WHERE name = ?")
-            .bind(i64::from(deleting))
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_set_deleting(name, deleting)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1910,21 +1912,24 @@ impl Db {
         bucket: &str,
         algorithm: &str,
     ) -> Result<bool> {
-        let res = sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
-            .bind(algorithm)
-            .bind(bucket)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
+        let mut tx = self.pool.begin().await?;
+        let changed = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_set_default_encryption(bucket, algorithm)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// M8 缺口 C：清桶默认加密（幂等）。
     pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool> {
-        let res = sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
-            .bind(bucket)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
+        let mut tx = self.pool.begin().await?;
+        let changed = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_clear_default_encryption(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// 全部桶默认加密记录（桶名 + 库内存储值），按桶名排序；CMK 引用守卫用。
@@ -6343,25 +6348,50 @@ impl Db {
 
     /// 写桶策略（全量替换）。
     pub async fn set_bucket_policy(&self, bucket: &str, json: &str, now: i64) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, ?) \
-             ON CONFLICT(bucket) DO UPDATE SET policy_json = excluded.policy_json, \
-             updated_at = excluded.updated_at",
-        )
-        .bind(bucket)
-        .bind(json)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_policy_set(bucket, json, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// 清桶策略（删桶时连同清理——桶名可复用，S6-1 同款语义）。
     pub async fn clear_bucket_policy(&self, bucket: &str) -> Result<()> {
-        sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_policy_delete(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 写桶事件通知配置（全量替换）。
+    pub async fn set_bucket_notification(
+        &self,
+        bucket: &str,
+        config_json: &str,
+        now: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_notification_set(bucket, config_json, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 清桶事件通知配置（幂等）。
+    pub async fn clear_bucket_notification(&self, bucket: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .bucket_notification_delete(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -7238,5 +7268,66 @@ mod argon2_tests {
             db.bucket_account("missing").await.unwrap(),
             xl_s3::access::LEGACY_ACCOUNT
         );
+    }
+
+    /// Task 5：单机桶配置写 façade 往返 + 缺桶语义。
+    #[tokio::test]
+    async fn single_node_bucket_config_writes_roundtrip() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.create_user("root", "pw", true).await.unwrap();
+        sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES ('b', NULL, 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        db.set_bucket_policy("b", "{}", 10).await.unwrap();
+        assert_eq!(db.bucket_policy("b").await.unwrap().as_deref(), Some("{}"));
+        db.clear_bucket_policy("b").await.unwrap();
+        assert!(db.bucket_policy("b").await.unwrap().is_none());
+
+        db.set_bucket_notification("b", "[]", 11).await.unwrap();
+        assert_eq!(
+            db.bucket_notification("b").await.unwrap().as_deref(),
+            Some("[]")
+        );
+        db.clear_bucket_notification("b").await.unwrap();
+        assert!(db.bucket_notification("b").await.unwrap().is_none());
+
+        assert!(
+            db.set_bucket_default_encryption("b", "AES256")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_bucket_default_encryption("b")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("AES256")
+        );
+        assert!(db.clear_bucket_default_encryption("b").await.unwrap());
+        assert!(
+            db.get_bucket_default_encryption("b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.set_bucket_deleting("b", true).await.unwrap();
+        assert!(db.bucket_sync_state_row("b").await.unwrap().unwrap().1);
+    }
+
+    /// Task 5：缺桶时删除幂等、加密写入返回 false。
+    #[tokio::test]
+    async fn config_write_missing_bucket_is_idempotent_or_false() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.clear_bucket_policy("missing").await.unwrap();
+        db.clear_bucket_notification("missing").await.unwrap();
+        assert!(
+            !db.set_bucket_default_encryption("missing", "AES256")
+                .await
+                .unwrap()
+        );
+        assert!(!db.clear_bucket_default_encryption("missing").await.unwrap());
     }
 }
