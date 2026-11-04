@@ -14,6 +14,7 @@ pub mod config;
 pub mod console;
 pub mod control_recertify;
 pub mod control_store;
+pub mod control_store_obj;
 pub mod db;
 pub mod events;
 pub mod inventory;

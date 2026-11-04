@@ -73,6 +73,8 @@ default = []
 olap-wasm = ["xl-s3/olap-wasm"]
 
 [dev-dependencies]
+# B1 崩溃矩阵复用 A4 的 FaultIo/FaultRootCas 测试替身。
+xl-store = { workspace = true, features = ["test-fault-io"] }
 # 测试用独立签发器造边界令牌（换 secret 的伪签、绝对 exp 的过期）：jsonwebtoken 只在测试里被引用。
 jsonwebtoken = "11"
 # bytes 只在集成测试里用（put_object 造体）；sqlx 是 [dependencies] 的重复声明，删

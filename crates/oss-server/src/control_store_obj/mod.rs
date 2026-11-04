@@ -1,0 +1,21 @@
+//! Object-backed control store (implementation plan B1).
+//!
+//! One immutable copy-on-write B+tree per table; the only mutable object is the
+//! root, whose local-control CAS is the commit point (design §2.2). This module
+//! is storage/transaction plumbing only: domain adapters (B2+) stage rows here
+//! and call [`ObjectControlTxn::commit`]. No begin/rollback is exposed; dropping
+//! a transaction discards its overlay.
+
+mod change;
+mod origin;
+mod root_io;
+mod table;
+mod txn;
+
+#[cfg(test)]
+mod tests;
+
+pub use origin::WriteOrigin;
+pub use root_io::{PinnedRoot, RootIo};
+pub use table::{KNOWN_TABLES, TableId, known_table_ids};
+pub use txn::{CachePublish, CommitStamp, ObjectControlStore, ObjectControlTxn};
