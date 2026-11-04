@@ -18,7 +18,7 @@
 - 复用 `Db` 既有连接池，不新建第二个池。
 - 不新增依赖；单文件 < 500 行；适配器按读/写/快照拆分；`control_store.rs` 根文件只做 `mod`/`pub use`/supertrait，不新增 SQL。
 - 每个任务 TDD：先写失败测试，再实现，再全绿；每个任务独立提交。
-- 不删除、不重命名任何触发器。INSERT/UPDATE/DELETE 语句形状逐字复刻，让 users/access_keys/permissions 的 site ins/upd/del 与 raft guard 以原方式触发。**不使用 `INSERT OR REPLACE`。** 已有 UPSERT 语句原样保留（site `permissions`/`access_keys` upsert、apply 的 `ON CONFLICT`），不改成 UPDATE-then-INSERT，除非触发器测试证明必须。
+- 不删除、不重命名任何触发器。INSERT/UPDATE/DELETE 语句形状逐字复刻，让 users/access_keys/permissions 的 site ins/upd/del 与 raft guard 以原方式触发。**不使用 `INSERT OR REPLACE`。** 已有 UPSERT 语句原样保留（apply 的 `ON CONFLICT`），除非触发器测试证明必须。**执行偏差：** site `permissions`/`access_keys` upsert 已改为 UPDATE-then-INSERT（见 D2 偏差记录）。
 - 两套口径分开：运行期读宽松（悬空/缺失 → `None`/`0`），严格快照导出（悬空属主 → 精确错误文本）。
 - 不迁移 `xl-s3` 热路径（D7）；不迁移 `buckets`/`uploads` 的非 IAM 列写入（D7 的跨域 FK 置空）。
 - 全量门禁：`cargo test -p xl-store`、`cargo test -p oss-server`、clippy/fmt。既有 5s 探针偶发超时只允许隔离重跑，不得弱化断言。
@@ -59,11 +59,13 @@
 - 建用户（console/Raft 同形）：`INSERT INTO users (username, password_hash, is_admin, status, created_at) VALUES (?, ?, ?, ?, ?)`；旧 `Db::create_user` 用 4 列 + 默认 status：`INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)`。两个形状分别保留（`user_create` 显式 status / `user_create_default_status`）。
 - 用户删除守卫：`UPDATE users SET id = id WHERE id = ? AND (...)`；级联 `DELETE FROM access_keys WHERE user_id = ?`、`DELETE FROM permissions WHERE user_id = ?`、`DELETE FROM users WHERE id = ?`。`UPDATE uploads/buckets SET owner_id = NULL` 留在调用方（D7）。
 - 改密：`UPDATE users SET password_hash = ? WHERE id = ?`；启停用沿用两条原子条件 UPDATE 原文。
-- 权限：全量替换 `DELETE FROM permissions WHERE user_id = ?` + 逐行 `INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, ?, ?, ?, ?)`；site 删除 `DELETE ... WHERE user_id = ? AND bucket = ?`；site upsert 保留 `ON CONFLICT(user_id, bucket) DO UPDATE SET ...`；桶级联 `DELETE FROM permissions WHERE bucket = ?`。
+- 权限：全量替换 `DELETE FROM permissions WHERE user_id = ?` + 逐行 `INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, ?, ?, ?, ?)`；site 删除 `DELETE ... WHERE user_id = ? AND bucket = ?`；site upsert 改为 UPDATE-then-INSERT（见偏差记录）；桶级联 `DELETE FROM permissions WHERE bucket = ?`。
 - AK：建 `INSERT INTO access_keys (access_key, secret_key, user_id, status, kind, parent_ak, session_policy, created_at) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)`（apply 原语）；`Db::create_access_key` 旧形状 `(access_key, secret_key, user_id, created_at)`；安装形状 `(access_key, secret_key, user_id, status, expires_at, created_at, parent_ak, session_policy, kind)`。删除/状态：`DELETE ... WHERE access_key = ?`、`UPDATE access_keys SET status = ? WHERE access_key = ?`。
-- site AK upsert 保留 `ON CONFLICT(access_key) DO UPDATE SET secret_key=..., user_id=..., status=..., expires_at=...` 与 `kind='long-term'` 常量。
+- site AK upsert 改为 UPDATE-then-INSERT：冲突时只更新 `secret_key/user_id/status/expires_at`（不改 `created_at/kind`），插入时带 `kind='long-term'` 常量（见偏差记录）。
 - 账户：`INSERT OR IGNORE INTO accounts (...)`、`UPDATE accounts SET name/status/bucket_quota/soft_byte_quota/hard_byte_quota/object_quota ..., updated_at = ? WHERE id = ?`，停用带 `NOT EXISTS (在册全局管理员)` 子查询原文；删除 `DELETE FROM accounts WHERE id = ?`；成员 `INSERT ... ON CONFLICT(uid) DO UPDATE`、`INSERT OR IGNORE ...`、`UPDATE accounts SET admin_uid = ? WHERE id = ? AND admin_uid IS NULL`。
 - 账本：`INSERT INTO account_usage_ledger (...) VALUES (...) ON CONFLICT(account_id) DO UPDATE ...`。
+
+**执行偏差（UPSERT → UPDATE-then-INSERT）：** `permissions`/`access_keys` 的 site upsert 在 SQLite 3.46 下与 site AFTER UPDATE 触发器组合会误报 `UNIQUE constraint failed: site_entity_clock.entity, site_entity_clock.entity_id`（行已存在且时钟行存在时，`INSERT OR IGNORE` 的 PK 冲突被 UPSERT 上下文当作 UNIQUE 抛出；与 `bucket_policies` 已记录的偏差同源）。两个 site upsert 改为 `UPDATE ... WHERE`，`rows_affected == 0` 时 `INSERT`；行在→upd 触发器、行缺→ins 触发器，changelog 仍是单条 upsert。`tests/control_store_iam_diff.rs::site_triggers_accept_double_upsert_for_permissions_and_access_keys` 锁定二次 upsert 不报错、changelog=2、clock=1、冲突列按旧 UPSERT 语义更新（AK 的 `created_at/kind` 不变）。apply 路径的 `ON CONFLICT` 在 `apply_ctx=1` 下不触发 site 触发器，保持原样。
 
 ### D3. 运行期 / 严格快照两套口径
 

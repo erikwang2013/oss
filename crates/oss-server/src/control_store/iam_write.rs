@@ -235,20 +235,36 @@ impl IamTxn for SqliteControlTxn<'_> {
         write: bool,
         delete: bool,
     ) -> Result<(), ControlError> {
-        sqlx::query(
-            "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, bucket) DO UPDATE SET \
-               can_read=excluded.can_read, can_write=excluded.can_write, \
-               can_delete=excluded.can_delete",
+        // UPSERT 触发的 `site_log_perm_upd` 会把 `site_entity_clock` 的 PK 冲突
+        // 误报为 UNIQUE（行已存在即失败）；UPDATE-then-INSERT 产生同样的
+        // upsert changelog（行在→upd，行缺→ins）。
+        let n = sqlx::query(
+            "UPDATE permissions SET can_read = ?, can_write = ?, can_delete = ? \
+             WHERE user_id = ? AND bucket = ?",
         )
-        .bind(uid)
-        .bind(bucket)
         .bind(read as i64)
         .bind(write as i64)
         .bind(delete as i64)
+        .bind(uid)
+        .bind(bucket)
         .execute(&mut *self.conn)
         .await
-        .map_err(backend)?;
+        .map_err(backend)?
+        .rows_affected();
+        if n == 0 {
+            sqlx::query(
+                "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(uid)
+            .bind(bucket)
+            .bind(read as i64)
+            .bind(write as i64)
+            .bind(delete as i64)
+            .execute(&mut *self.conn)
+            .await
+            .map_err(backend)?;
+        }
         Ok(())
     }
 
@@ -417,21 +433,36 @@ impl IamTxn for SqliteControlTxn<'_> {
         expires_at: Option<i64>,
         created_at: i64,
     ) -> Result<(), ControlError> {
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key, user_id, status, expires_at, \
-             created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'long-term') \
-             ON CONFLICT(access_key) DO UPDATE SET secret_key=excluded.secret_key, \
-               user_id=excluded.user_id, status=excluded.status, expires_at=excluded.expires_at",
+        // 同 `permission_upsert`：UPSERT + site UPDATE 触发器在 SQLite 下误报
+        // UNIQUE；UPDATE-then-INSERT 保持相同 changelog（冲突时不改 created_at/kind）。
+        let n = sqlx::query(
+            "UPDATE access_keys SET secret_key = ?, user_id = ?, status = ?, expires_at = ? \
+             WHERE access_key = ?",
         )
-        .bind(access_key)
         .bind(secret_key)
         .bind(uid)
         .bind(status)
         .bind(expires_at)
-        .bind(created_at)
+        .bind(access_key)
         .execute(&mut *self.conn)
         .await
-        .map_err(backend)?;
+        .map_err(backend)?
+        .rows_affected();
+        if n == 0 {
+            sqlx::query(
+                "INSERT INTO access_keys (access_key, secret_key, user_id, status, expires_at, \
+                 created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'long-term')",
+            )
+            .bind(access_key)
+            .bind(secret_key)
+            .bind(uid)
+            .bind(status)
+            .bind(expires_at)
+            .bind(created_at)
+            .execute(&mut *self.conn)
+            .await
+            .map_err(backend)?;
+        }
         Ok(())
     }
 }
