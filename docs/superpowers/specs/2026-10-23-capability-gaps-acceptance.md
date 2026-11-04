@@ -4,10 +4,13 @@
 - 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0** / **v1.16.0**（2026-10-24）·
   **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
   **v1.19.0**（2026-10-26，Wave1 地基）
-- 最新发布：**v1.29.0**（2026-11-03，控制面去数据库化第一阶段），tag `v1.29.0`；
-  xl-store 新增 `.oss.sys` 系统命名空间、控制对象 CAS/单调 fencing/持久化锁 token/提交证书
-  与 quorum 读；oss-server 引入 `ControlStore`/`ControlTxn` 缝，`vpc_endpoints` 读、apply 与
-  快照迁移，legacy raw SQL 双后端差分测试锁定行为；SQLite 仍为默认后端，无接口或数据格式变更。
+- 最新发布：**v1.30.0**（2026-11-05，控制面读写缝全覆盖），tag `v1.30.0`；
+  在 v1.29 的 `ControlStore`/`ControlTxn` 缝上完成访问点/OLAP、lifecycle/inventory/tier、
+  buckets/bucket_policies/event_configs/replication_rules 的读写、快照与桶删除级联迁移，
+  并加入集群遗留控制对象重认证工具（只读 `ReadControlRaw`、canonical 分组、fenced 标记、
+  CLI dry-run/apply）；自然键身份、快照字段顺序与 site/raft 触发器语义不变，legacy raw SQL
+  双后端差分测试锁定行为；修复策略覆盖写的 SQLite UPSERT 触发器误报。SQLite 仍为默认后端，
+  无接口或数据格式变更。
   此前的 v1.28.1–v1.28.5 为 CI/测试稳定与性能加固补丁（protoc、配额夹具、OLAP 400 映射、
   缓存重载、DeleteObjects 预加载、列表/探测并发、索引、aether 限流、sync 流式 tee、发布脚本）。功能内容仍见 §23（Raft 日志格式
   标记与旧区间有界压缩、CMK→legacy 离线全量迁移、M8 follower restore fencing、AP 直连

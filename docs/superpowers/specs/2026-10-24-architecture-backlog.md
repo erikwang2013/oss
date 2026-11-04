@@ -123,6 +123,11 @@
 > `ControlTxn` 缝，`vpc_endpoints` 读写/apply/快照迁移；SQLite 仍为默认后端，
 > 无接口或数据格式变更。
 >
+> **v1.30.0 控制面读写缝全覆盖**：访问点/OLAP、lifecycle/inventory/tier、
+> buckets/bucket_policies/event_configs/replication_rules 的读写、Raft apply、快照
+> 导出/安装与桶删除级联迁移到同一缝；新增集群遗留控制对象重认证工具；修复策略
+> 覆盖写的 SQLite UPSERT 触发器误报；SQLite 仍为默认后端，无接口或数据格式变更。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →
