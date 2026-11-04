@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::raft::compat::{FEATURE_LEVEL_3, MIN_FEATURE_LEVEL};
 use crate::raft::data::DataError;
 
+pub use xl_store::control_store::inventory::{
+    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow,
+};
+pub use xl_store::control_store::lifecycle::LifecycleCursorRow;
+pub use xl_store::control_store::tier::TierRestoreRow;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct JobRow {
@@ -56,70 +62,6 @@ pub struct JobTaskRow {
     pub result_string: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
-    pub fence_term: i64,
-    pub fence_leader: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct InventoryRunRow {
-    pub id: i64,
-    pub bucket: String,
-    pub config_id: String,
-    pub run_key: String,
-    pub started_at: i64,
-    pub state: String,
-    pub job_id: Option<i64>,
-    pub manifest_key: Option<String>,
-    pub error: Option<String>,
-    pub created_at: i64,
-    pub fence_term: i64,
-    pub fence_leader: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct InventoryCursorRow {
-    pub bucket: String,
-    pub config_id: String,
-    pub cursor: String,
-    pub config_updated_at: i64,
-    pub updated_at: i64,
-    pub fence_term: i64,
-    pub fence_leader: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct InventoryIncrementalRow {
-    pub bucket: String,
-    pub config_id: String,
-    pub enabled: bool,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct TierRestoreRow {
-    pub bucket: String,
-    pub key: String,
-    pub version_id: String,
-    pub expires_at: i64,
-    pub job_id: Option<i64>,
-    pub state: String,
-    pub created_at: i64,
-    pub fence_term: i64,
-    pub fence_leader: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct LifecycleCursorRow {
-    pub bucket: String,
-    pub rule_id: String,
-    pub stage: String,
-    pub cursor: String,
-    pub updated_at: i64,
     pub fence_term: i64,
     pub fence_leader: i64,
 }

@@ -8,6 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod inventory;
+pub mod lifecycle;
+pub mod tier;
+
+pub use inventory::InventoryConfigEntry;
+pub use lifecycle::LifecycleRuleEntry;
+
 /// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
 /// 管理员 id，witness 写哨兵 0）；`User(username)` = 复制用户。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

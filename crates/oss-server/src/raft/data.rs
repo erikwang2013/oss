@@ -114,23 +114,8 @@ pub struct BucketPolicyRow {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LifecycleRuleRow {
-    pub bucket: String,
-    pub prefix: String,
-    pub rule_id: Option<String>,
-    pub expire_days: i64,
-    pub expiration_days: Option<i64>,
-    pub transition_days: Option<i64>,
-    pub transition_class: Option<String>,
-    pub transition_tier: Option<String>,
-    pub enabled: bool,
-    pub updated_at: i64,
-    /// 结构化动作；旧快照无此字段 → None（按旧列还原）。
-    #[serde(default)]
-    pub config_json: Option<String>,
-}
+/// 生命周期规则行（自然键）；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type LifecycleRuleRow = xl_store::control_store::LifecycleRuleEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,15 +150,8 @@ pub struct OlapConfigRow {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InventoryConfigRow {
-    pub bucket: String,
-    pub id: String,
-    pub owner: OwnerRef,
-    pub config_json: String,
-    pub updated_at: i64,
-}
+/// inventory 配置行（自然键属主）；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type InventoryConfigRow = xl_store::control_store::InventoryConfigEntry;
 
 /// 账户行（level 3，AC-2）：`admin` 是账户管理员的**用户名**而非本地 uid
 /// （跨节点 uid 不稳定）；`account_members` 同样以 username 为自然键。

@@ -175,34 +175,8 @@ pub struct InventoryConfigRow {
 }
 
 /// M8 S5：Inventory 运行行（`started_at` = 实际开始执行的时刻）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct InventoryRunRow {
-    pub id: i64,
-    pub bucket: String,
-    pub config_id: String,
-    pub run_key: String,
-    pub started_at: i64,
-    pub state: String,
-    pub job_id: Option<i64>,
-    pub manifest_key: Option<String>,
-    pub error: Option<String>,
-    pub created_at: i64,
-}
-
-fn inventory_run_row(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
-    InventoryRunRow {
-        id: r.get("id"),
-        bucket: r.get("bucket"),
-        config_id: r.get("config_id"),
-        run_key: r.get("run_key"),
-        started_at: r.get("started_at"),
-        state: r.get("state"),
-        job_id: r.get("job_id"),
-        manifest_key: r.get("manifest_key"),
-        error: r.get("error"),
-        created_at: r.get("created_at"),
-    }
-}
+/// 类型收敛到 ControlStore 缝（含 fence 两列）；`id` 是行内不可变属性，不是身份键。
+pub use xl_store::control_store::inventory::InventoryRunRow;
 
 /// 领取到的任务（worker 执行输入）。
 #[derive(Debug, Clone)]
@@ -4771,21 +4745,8 @@ mod tests {
 
 /// 生命周期规则行。M8 S0 扩为全字段（S4b 只做映射，不再改 db.rs）；
 /// `expire_days` 为 M4 旧列（无 Expiration 的新规则写哨兵 -1），`expiration_days` 为新语义。
-#[derive(Debug, Clone, PartialEq)]
-pub struct LifecycleRuleRow {
-    pub bucket: String,
-    pub rule_id: Option<String>,
-    pub prefix: String,
-    pub expire_days: i64,
-    pub expiration_days: Option<i64>,
-    pub transition_days: Option<i64>,
-    pub transition_class: Option<String>,
-    pub transition_tier: Option<String>,
-    pub enabled: bool,
-    pub updated_at: i64,
-    /// 结构化动作（None = 旧列可完整表达/旧 M4 行）。
-    pub config_json: Option<String>,
-}
+/// 类型收敛到 ControlStore 缝，行为字段不变。
+pub use xl_store::control_store::LifecycleRuleEntry as LifecycleRuleRow;
 
 fn row_to_lifecycle_rule(r: &sqlx::sqlite::SqliteRow) -> LifecycleRuleRow {
     LifecycleRuleRow {
@@ -6492,14 +6453,17 @@ impl Db {
     ) -> Result<Option<InventoryRunRow>> {
         let row = sqlx::query(
             "SELECT id, bucket, config_id, run_key, started_at, state, job_id, manifest_key, \
-             error, created_at FROM inventory_runs WHERE bucket = ? AND config_id = ? AND run_key = ?",
+             error, created_at, fence_term, fence_leader FROM inventory_runs \
+             WHERE bucket = ? AND config_id = ? AND run_key = ?",
         )
         .bind(bucket)
         .bind(config_id)
         .bind(run_key)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.as_ref().map(inventory_run_row))
+        Ok(row
+            .as_ref()
+            .map(crate::raft::runstate::inventory_run_row_from))
     }
 
     /// M8-1：行已被更高 term 接管 → no-op（旧 leader 的迟到完成不覆盖新状态）。
