@@ -123,6 +123,11 @@ fn source_scan_flags_new_control_table_writers() {
         "apply.rs",
         // ControlStore SQLite 适配器（AP/OLAP 控制表的唯一写层）。
         "ap_olap.rs",
+        // ControlStore SQLite 适配器（lifecycle/inventory/tier 切片）。
+        "control_store.rs",
+        "lifecycle.rs",
+        "inventory.rs",
+        "tier.rs",
         // level-3 账户命令 apply 子模块（apply 层，经 ControlCommand 进入）。
         "accounts.rs",
         "data.rs",
