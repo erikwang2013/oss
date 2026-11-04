@@ -44,9 +44,15 @@ A node never reads or CASes another node's root.
 The root and nodes use a new **local control-object IO** API over the existing store kernel:
 `get_local_control(key)`, `put_local_control(key, data, expected_version, fence_token)`,
 `delete` not used for nodes. It reuses the Phase 0 single-node/local-drive commit path: per-key process
-mutex + `flock`, drive quorum (`Q_s = data + 1`), commit certificate, tombstones, `Indeterminate`
-semantics. It skips the cluster fanout and fenced cluster lock. `put_system_object` and
+mutex + `flock`, local drive quorum, commit certificate, tombstones, `Indeterminate` semantics. It
+skips the cluster fanout and fenced cluster lock. `put_system_object` and
 `recertify_system_object_cluster` remain for legacy cluster keys only.
+
+Control objects are **not EC-striped**: the full meta is written to every local drive, so the local
+quorum is a majority of the node's registered drives, `W = drives/2 + 1` (integer floor; 1 drive → 1),
+independent of the cluster EC configuration. This matters for the documented 4 nodes × 3 drives =
+12 slots / EC 8+4 topology: cluster `Q_s = data + 1 = 9` is unreachable on one node, while `W = 2`
+is. The data plane and `put_system_object` keep `Q_s = data + 1` unchanged.
 
 Startup takes an exclusive `flock` on the node state directory. Two server processes serving the same
 object root are unsupported (same as two today's servers sharing one `oss.db`); the second fails
@@ -143,10 +149,14 @@ recovery pass that mutates state: readers see generation N or N+1, never a mix.
 - Fencing token = pinned physical version + 1. `put_local_control` rejects a token that is not
   strictly greater than the committed one. A writer paused past a newer commit cannot resurrect its
   base.
-- Read and write require the local drive quorum and committed certificates; insufficient coverage is
-  `CorruptMeta`/`QuorumUnmet`, never a stale or partial answer. There is no cross-node quorum read
-  for live control state: the cluster's consistency authority is Raft, exactly as today. Follower
-  reads may lag by apply distance, as today; the leader acknowledges a write only after apply.
+- Local control read and write use the local majority `W = drives/2 + 1` (full meta on every drive,
+  not EC-striped). A successful write puts committed certificates on ≥ `W` local drives; a read
+  requires ≥ `W` reachable drives (otherwise `QuorumUnmet`) and elects the max `(fence_token,
+  version)` among certified copies. The two quorums intersect (`2W > drives`), so a committed version
+  is never missed. Uncertified/corrupt residues are rejected (`CorruptMeta`), never a stale or
+  partial answer. There is no cross-node quorum read for live control state: the cluster's
+  consistency authority is Raft, exactly as today. Follower reads may lag by apply distance, as
+  today; the leader acknowledges a write only after apply.
 - Snapshot install and apply are exclusive (`&mut self` in the state machine). A local admin/session
   write may interleave between applies; it commits a root with the same `applied` value and is not
   part of the replicated state.

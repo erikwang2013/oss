@@ -451,8 +451,15 @@ impl Store {
             let mut marker = m.clone();
             marker.control_committed = Some(true);
             let marked = if local_only {
-                self.write_meta_marker_local(layout::SYS_DIR, key, &marker, fence_token, preserve)
-                    .await?
+                self.write_meta_marker_local(
+                    layout::SYS_DIR,
+                    key,
+                    &marker,
+                    fence_token,
+                    preserve,
+                    Some(local_control_quorum(self.cfg.drives.len())),
+                )
+                .await?
             } else {
                 self.write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
                     .await?
@@ -464,9 +471,17 @@ impl Store {
             }
             return Ok(());
         }
+        let local_quorum = local_control_quorum(self.cfg.drives.len());
         let flipped = if local_only {
-            self.write_meta_fenced_preserving_local(layout::SYS_DIR, key, m, fence_token, preserve)
-                .await?
+            self.write_meta_fenced_preserving_local(
+                layout::SYS_DIR,
+                key,
+                m,
+                fence_token,
+                preserve,
+                Some(local_quorum),
+            )
+            .await?
         } else {
             self.write_meta_fenced_preserving(layout::SYS_DIR, key, m, old, fence_token, preserve)
                 .await?
@@ -485,8 +500,15 @@ impl Store {
         let mut marker = m.clone();
         marker.control_committed = Some(true);
         let marked = if local_only {
-            self.write_meta_marker_local(layout::SYS_DIR, key, &marker, fence_token, preserve)
-                .await?
+            self.write_meta_marker_local(
+                layout::SYS_DIR,
+                key,
+                &marker,
+                fence_token,
+                preserve,
+                Some(local_quorum),
+            )
+            .await?
         } else {
             self.write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
                 .await?
@@ -494,6 +516,12 @@ impl Store {
         if marked == 0 {
             return Err(Error::QuorumUnmet(format!(
                 "控制对象 {key:?} 提交标记 0 槽（第一阶段数据未提交，读不可见）"
+            )));
+        }
+        // 本地控制必须证书覆盖多数派 W，否则成功的写可能落在任一新 W 读集之外。
+        if local_only && marked < local_quorum {
+            return Err(Error::Indeterminate(format!(
+                "控制对象 {key:?} 提交标记 {marked}/{local_quorum}：部分证书已落盘，写入可能已提交；须按 key 重读核对"
             )));
         }
         Ok(())
@@ -509,6 +537,12 @@ pub(super) fn validate_control_key(key: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// 节点本地控制对象的多数派 quorum：`W = drives/2 + 1`（1 盘 → 1）。
+/// 控制对象不做 EC 条带化（每个盘写完整 meta），与数据面 `Q_s = ec.data + 1` 无关。
+pub(super) fn local_control_quorum(drives: usize) -> usize {
+    drives / 2 + 1
 }
 
 pub(super) fn control_state(old: Option<&XlMeta>) -> (u64, u64) {

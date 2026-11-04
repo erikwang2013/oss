@@ -1340,7 +1340,7 @@ impl Store {
         if self.cfg.cluster.is_some() {
             return self.read_control_cluster(bucket, key).await;
         }
-        self.read_control_local(bucket, key).await
+        self.read_control_local(bucket, key, None).await
     }
 
     /// 控制对象公开读：有证书 → 返回证书版本；无证书但有未提交/损坏副本 →
@@ -1364,22 +1364,44 @@ impl Store {
         Ok(None)
     }
 
-    /// 单机/多盘控制对象扫描（全盘并集，无覆盖阈值）。槽号 = 盘下标（单机从 0 起）。
-    async fn read_control_local(&self, bucket: &str, key: &str) -> Result<ControlRead> {
-        // 非集群没有 quorum 覆盖证明，缺席只能建立在「全部盘都在册且都读过」之上。
-        for drive in &self.cfg.drives {
-            if !drives::drive_up(drive).await {
+    /// 单机/多盘控制对象扫描。槽号 = 盘下标（单机从 0 起）。
+    ///
+    /// `min_coverage`：节点本地控制传入多数派 W——可达盘 < W → `QuorumUnmet`（读写
+    /// quorum 相交），只扫描可达盘；`None` = 数据面原语义（任一盘不在册即 fail-closed）。
+    async fn read_control_local(
+        &self,
+        bucket: &str,
+        key: &str,
+        min_coverage: Option<usize>,
+    ) -> Result<ControlRead> {
+        let mut up = Vec::new();
+        for (d, drive) in self.cfg.drives.iter().enumerate() {
+            if drives::drive_up(drive).await {
+                up.push(d);
+            }
+        }
+        match min_coverage {
+            Some(w) if up.len() < w => {
+                return Err(Error::QuorumUnmet(format!(
+                    "控制对象 {key:?} 本机盘覆盖 {}/{} < local quorum {w}：fail-closed",
+                    up.len(),
+                    self.cfg.drives.len()
+                )));
+            }
+            None if up.len() != self.cfg.drives.len() => {
                 return Err(Error::CorruptMeta(format!(
                     "控制对象 {key:?} 本机盘不在册：无法证明缺席/版本，fail-closed"
                 )));
             }
+            _ => {}
         }
-        let paths = self
-            .cfg
-            .drives
-            .iter()
-            .map(|drive| Ok(layout::object_dir_for(drive, bucket, key)?.join(meta::META_FILE)))
-            .collect::<Result<Vec<_>>>()?;
+        let paths =
+            up.iter()
+                .map(|d| {
+                    Ok(layout::object_dir_for(&self.cfg.drives[*d], bucket, key)?
+                        .join(meta::META_FILE))
+                })
+                .collect::<Result<Vec<_>>>()?;
         let reads = futures::future::join_all(paths.iter().map(tokio::fs::read));
         let mut certified: Vec<(u16, XlMeta)> = Vec::new();
         let mut st = ControlRead {
@@ -1390,7 +1412,7 @@ impl Store {
             copies: 0,
             corrupt: 0,
         };
-        for (d, (path, read)) in paths.iter().zip(reads.await).enumerate() {
+        for ((d, path), read) in up.iter().zip(paths.iter()).zip(reads.await) {
             match read {
                 Ok(bytes) => match XlMeta::decode(&bytes) {
                     Ok(m) if m.object_key == key => {
@@ -1398,7 +1420,7 @@ impl Store {
                         st.max_version = st.max_version.max(m.control_version.unwrap_or(0));
                         st.max_token = st.max_token.max(m.fence_token.unwrap_or(0));
                         if m.control_committed == Some(true) {
-                            certified.push((d as u16, m));
+                            certified.push((*d as u16, m));
                         }
                     }
                     Ok(m) => {
@@ -1839,7 +1861,8 @@ impl Store {
     }
 
     /// 本机控制写第一阶段（**不扇出**）：与 [`Self::write_meta_fenced_preserving`] 的
-    /// 单机/多盘分支逐字节相同，但即使配置了集群也只用本机盘。
+    /// 单机/多盘分支相同，但即使配置了集群也只用本机盘；`quorum` 覆盖本地盘 quorum
+    /// （节点本地控制用多数派 W，数据面仍用 `ec.data + 1`）。
     pub(in crate::store) async fn write_meta_fenced_preserving_local(
         &self,
         bucket: &str,
@@ -1847,8 +1870,9 @@ impl Store {
         m: &XlMeta,
         fence_token: u64,
         preserve: &[u16],
+        quorum: Option<usize>,
     ) -> Result<usize> {
-        self.write_meta_fenced_local_mode(bucket, key, m, Some(fence_token), preserve)
+        self.write_meta_fenced_local_mode(bucket, key, m, Some(fence_token), preserve, quorum)
             .await
     }
 
@@ -1860,8 +1884,9 @@ impl Store {
         m: &XlMeta,
         fence_token: u64,
         preserve: &[u16],
+        quorum: Option<usize>,
     ) -> Result<usize> {
-        self.write_meta_fenced_local_mode(bucket, key, m, Some(fence_token), preserve)
+        self.write_meta_fenced_local_mode(bucket, key, m, Some(fence_token), preserve, quorum)
             .await
     }
 
@@ -1882,11 +1907,12 @@ impl Store {
                 .write_meta_cluster(bucket, key, m, old, fence_token, marker, preserve)
                 .await;
         }
-        self.write_meta_fenced_local_mode(bucket, key, m, fence_token, preserve)
+        self.write_meta_fenced_local_mode(bucket, key, m, fence_token, preserve, None)
             .await
     }
 
-    /// 单机/本地盘提交（原 `write_meta_fenced_mode` 的非集群分支，逐字节提取）。
+    /// 单机/本地盘提交（原 `write_meta_fenced_mode` 的非集群分支）。`quorum` 仅节点
+    /// 本地控制写传入（多数派 W）；`None` = 数据面原语义 `ec.data + 1`。
     async fn write_meta_fenced_local_mode(
         &self,
         bucket: &str,
@@ -1894,6 +1920,7 @@ impl Store {
         m: &XlMeta,
         fence_token: Option<u64>,
         preserve: &[u16],
+        local_quorum: Option<usize>,
     ) -> Result<usize> {
         if self.cfg.drives.len() == 1 {
             if let Some(t) = fence_token {
@@ -1940,7 +1967,7 @@ impl Store {
             self.note_cached_key(bucket, key);
             return Ok(1);
         }
-        let quorum = self.cfg.ec.data as usize + 1;
+        let quorum = local_quorum.unwrap_or(self.cfg.ec.data as usize + 1);
         let bytes = m.encode()?;
         let self_hash = crate::mesh::content_hash(&bytes);
 
@@ -1991,11 +2018,22 @@ impl Store {
 
         // 控制对象第一阶段：保留首个可准备的已提交旧槽，其余全部翻转。数据面
         // `preserve` 为空 → 翻转集 = 全部已准备盘（逐字节旧行为）。
-        let preserve_slot = preserve
-            .iter()
-            .copied()
-            .find(|s| prepared.iter().any(|d| *d as u16 == *s));
-        if !preserve.is_empty() && preserve_slot.is_none() {
+        // 本地控制多数派 quorum：可达盘仅够 W 时没有 preserve 余量（保留旧槽会让新证书
+        // 只有 W-1 份，读写 quorum 不再相交）→ 翻转全部已达 quorum 的准备盘。
+        let preserve_ok = !preserve.is_empty()
+            && match local_quorum {
+                Some(_) => prepared.len() > quorum,
+                None => true,
+            };
+        let preserve_slot = if preserve_ok {
+            preserve
+                .iter()
+                .copied()
+                .find(|s| prepared.iter().any(|d| *d as u16 == *s))
+        } else {
+            None
+        };
+        if preserve_ok && preserve_slot.is_none() {
             for d in &prepared {
                 if let Some(t) = fence_token {
                     self.remove_meta_new_fenced(&self.cfg.drives[*d], bucket, key, t)

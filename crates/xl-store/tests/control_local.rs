@@ -199,8 +199,8 @@ async fn control_local_uncommitted_crash_residue_invisible() {
     assert_eq!((obj.version, &obj.data[..]), (3, &b"v3"[..]));
 }
 
-/// 多盘半翻：部分盘已写下一代数据、但没有提交证书 → 读只能看到已提交的旧代，
-/// 绝不混合两代内容。
+/// 多盘半翻：12 盘 W=7，仅 W-1=6 盘写下一代数据、都没有提交证书 → 读只能看到
+/// 已提交的旧代，绝不混合两代内容。
 #[tokio::test]
 async fn control_local_partial_crash_returns_old_generation() {
     let (_dirs, paths) = temp_drives(12);
@@ -231,25 +231,28 @@ async fn control_local_partial_crash_returns_old_generation() {
     );
 }
 
-/// 本机盘覆盖 < Q_s（12 盘摘掉 5 盘 → 7 < 9）：读写都 fail-closed；恢复盘后旧值原样，
-/// 绝无部分成功。
+/// 本机盘覆盖 < W（12 盘 → W=7；摘掉 6 盘后剩 6 < 7）：读写都 fail-closed；
+/// 恢复盘后旧值原样，绝无部分成功。
 #[tokio::test]
 async fn control_local_insufficient_drive_coverage_fails_closed() {
     let (_dirs, paths) = temp_drives(12);
     let s = open_multi(&paths).await;
     assert_eq!(s.put_local_control(KEY, b"v1", None, 1).await.unwrap(), 1);
 
-    // 保留 drive0（锁文件所在盘），摘掉其余 5 盘 → 7 盘在线 < Q_s=9。
-    for path in paths.iter().skip(1).take(5) {
+    // 保留 drive0（锁文件所在盘），摘掉其余 6 盘 → 6 盘在线 < W=7。
+    for path in paths.iter().skip(1).take(6) {
         std::fs::remove_dir_all(path.join(layout::SYS_DIR)).unwrap();
     }
     assert!(matches!(
         s.get_local_control(KEY).await,
-        Err(Error::CorruptMeta(_))
+        Err(Error::QuorumUnmet(_))
     ));
-    assert!(s.put_local_control(KEY, b"v2", Some(1), 2).await.is_err());
+    assert!(matches!(
+        s.put_local_control(KEY, b"v2", Some(1), 2).await,
+        Err(Error::QuorumUnmet(_))
+    ));
 
-    for path in paths.iter().skip(1).take(5) {
+    for path in paths.iter().skip(1).take(6) {
         std::fs::create_dir_all(path.join(layout::SYS_DIR)).unwrap();
     }
     let obj = s.get_local_control(KEY).await.unwrap().unwrap();
