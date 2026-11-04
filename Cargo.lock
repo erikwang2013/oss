@@ -2707,6 +2707,7 @@ dependencies = [
  "parquet",
  "rcgen",
  "reqwest",
+ "rmp-serde",
  "rskafka",
  "rustix",
  "rustls",

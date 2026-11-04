@@ -26,6 +26,7 @@ pub mod jobs;
 mod jwt_multi;
 pub mod lifecycle;
 pub mod lifecycle_store;
+pub mod local_store;
 pub mod local_tier;
 pub mod raft;
 pub mod repl_client;
