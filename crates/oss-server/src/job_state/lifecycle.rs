@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::raft::apply::lifecycle::cursor_row_ok;
-use crate::raft::runstate::{LifecycleCursorRow, lifecycle_cursor_row_from};
+use crate::raft::runstate::LifecycleCursorRow;
 
 impl JobState {
     async fn read_lifecycle_cursor(
@@ -18,17 +18,10 @@ impl JobState {
         rule_id: &str,
         stage: &str,
     ) -> Result<Option<LifecycleCursorRow>, String> {
-        let row = sqlx::query(
-            "SELECT bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader \
-             FROM lifecycle_cursors WHERE bucket = ? AND rule_id = ? AND stage = ?",
-        )
-        .bind(bucket)
-        .bind(rule_id)
-        .bind(stage)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(err)?;
-        Ok(row.as_ref().map(lifecycle_cursor_row_from))
+        db.control_store()
+            .lifecycle_cursor_row(bucket, rule_id, stage)
+            .await
+            .map_err(err)
     }
 
     /// 引用校验前移 append 前：桶已删除时不复活游标（最坏丢本轮进度，重扫安全）。

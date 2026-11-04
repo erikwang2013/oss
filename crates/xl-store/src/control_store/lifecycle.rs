@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ControlError;
+
 /// 生命周期规则行；字段声明顺序即 `ControlData` 快照顺序（已发布快照不可改写）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +33,74 @@ pub struct LifecycleCursorRow {
     pub updated_at: i64,
     pub fence_term: i64,
     pub fence_leader: i64,
+}
+
+/// 只读 lifecycle 访问（console/engine 共用同一 SQL）。
+#[async_trait::async_trait]
+pub trait LifecycleStore: Send + Sync {
+    /// 按 `(rule_id, prefix)` 升序（NULL `rule_id` 由 SQLite 排最前）。
+    async fn lifecycle_rules(&self, bucket: &str) -> Result<Vec<LifecycleRuleEntry>, ControlError>;
+    /// `enabled = 1`，按 `(bucket, rule_id)` 升序。
+    async fn enabled_lifecycle_rules(&self) -> Result<Vec<LifecycleRuleEntry>, ControlError>;
+    async fn lifecycle_cursor(
+        &self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<String>, ControlError>;
+    /// 整行读（job_state/apply 对账需要 fence 字段）。
+    async fn lifecycle_cursor_row(
+        &self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<LifecycleCursorRow>, ControlError>;
+}
+
+/// 调用方事务内的 lifecycle 写访问；本 trait 不 begin/commit/rollback。
+#[async_trait::async_trait]
+pub trait LifecycleTxn: Send {
+    /// DELETE 本桶 rules + cursors，再按入参顺序 INSERT；行的 `updated_at` 原样写入。
+    async fn replace_lifecycle_rules(
+        &mut self,
+        bucket: &str,
+        rows: &[LifecycleRuleEntry],
+    ) -> Result<(), ControlError>;
+    /// DELETE 全部 rules（快照安装专用；不碰 cursors）。
+    async fn replace_all_lifecycle_rules(
+        &mut self,
+        rows: &[LifecycleRuleEntry],
+    ) -> Result<(), ControlError>;
+    /// DELETE 本桶 rules + cursors（PUT 空列表/清规则）。
+    async fn clear_lifecycle_rules(&mut self, bucket: &str) -> Result<(), ControlError>;
+    /// 只 DELETE rules（site 同步桶删除保持既有范围）。
+    async fn delete_lifecycle_rules_only(&mut self, bucket: &str) -> Result<(), ControlError>;
+    /// 快照导出：按 `(bucket, rule_id, prefix)` 升序。
+    async fn all_lifecycle_rules(&mut self) -> Result<Vec<LifecycleRuleEntry>, ControlError>;
+    async fn lifecycle_cursor(
+        &mut self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<LifecycleCursorRow>, ControlError>;
+    /// 返回是否恰好影响 1 行。
+    async fn lifecycle_cursor_upsert(
+        &mut self,
+        row: &LifecycleCursorRow,
+    ) -> Result<bool, ControlError>;
+    async fn lifecycle_cursor_delete(
+        &mut self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+        fence_term: i64,
+    ) -> Result<(), ControlError>;
+    /// 快照导出：按 `(bucket, rule_id, stage)` 升序。
+    async fn lifecycle_cursors(&mut self) -> Result<Vec<LifecycleCursorRow>, ControlError>;
+    async fn replace_lifecycle_cursors(
+        &mut self,
+        rows: &[LifecycleCursorRow],
+    ) -> Result<(), ControlError>;
 }
 
 #[cfg(test)]

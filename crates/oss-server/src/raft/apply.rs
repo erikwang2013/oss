@@ -9,6 +9,7 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
+use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 mod accounts;
@@ -530,13 +531,11 @@ pub(crate) async fn apply_command(
             updated_at,
         } => {
             if bucket_exists(cw, bucket).await? {
-                Db::set_lifecycle_rules_raw(
-                    cw,
-                    bucket,
-                    &lifecycle_rows(bucket, rules, *updated_at),
-                    *updated_at,
-                )
-                .await?;
+                let rows = lifecycle_rows(bucket, rules, *updated_at);
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .replace_lifecycle_rules(bucket, &rows)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -548,13 +547,11 @@ pub(crate) async fn apply_command(
             updated_at,
         } => {
             if bucket_exists(cw, bucket).await? {
-                Db::set_lifecycle_rules_raw(
-                    cw,
-                    bucket,
-                    &lifecycle_rows_v2(bucket, rules, *updated_at),
-                    *updated_at,
-                )
-                .await?;
+                let rows = lifecycle_rows_v2(bucket, rules, *updated_at);
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .replace_lifecycle_rules(bucket, &rows)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -562,7 +559,10 @@ pub(crate) async fn apply_command(
         }
         ControlCommand::BucketClearLifecycle { bucket } => {
             if bucket_exists(cw, bucket).await? {
-                Db::clear_lifecycle_rules_raw(cw, bucket).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .clear_lifecycle_rules(bucket)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound

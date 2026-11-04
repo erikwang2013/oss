@@ -6,9 +6,11 @@
 //! `rule_id` 不在 apply 复检（配置替换会清游标，游标只是续扫提示）。这里不读副本本地
 //! 其他表决定结果。清除是幂等删除，`fence_term` 上限让旧 term 的迟到删除 no-op。
 
-use super::{ControlWrite, invariant};
+use super::{ControlWrite, control_err, invariant};
+use crate::control_store::SqliteControlTxn;
 use crate::raft::command::ControlResponse;
-use crate::raft::runstate::{LifecycleCursorRow, lifecycle_cursor_row_from};
+use crate::raft::runstate::LifecycleCursorRow;
+use xl_store::control_store::lifecycle::LifecycleTxn;
 
 /// 当前折叠行 + 日志行：自然键不可变（查询键本身）、fence 不回退、`updated_at`
 /// 严格前进；逐字段相同的重复 apply 是 no-op。
@@ -53,39 +55,17 @@ async fn current(
     cw: &mut ControlWrite<'_>,
     cursor: &LifecycleCursorRow,
 ) -> Result<Option<LifecycleCursorRow>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader \
-         FROM lifecycle_cursors WHERE bucket = ? AND rule_id = ? AND stage = ?",
-    )
-    .bind(&cursor.bucket)
-    .bind(&cursor.rule_id)
-    .bind(&cursor.stage)
-    .fetch_optional(&mut *cw.conn)
-    .await?;
-    Ok(row.as_ref().map(lifecycle_cursor_row_from))
+    SqliteControlTxn::new(cw.conn())
+        .lifecycle_cursor(&cursor.bucket, &cursor.rule_id, &cursor.stage)
+        .await
+        .map_err(control_err)
 }
 
-async fn upsert(
-    cw: &mut ControlWrite<'_>,
-    cursor: &LifecycleCursorRow,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at, \
-          fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(bucket, rule_id, stage) DO UPDATE SET \
-          cursor = excluded.cursor, updated_at = excluded.updated_at, \
-          fence_term = excluded.fence_term, fence_leader = excluded.fence_leader",
-    )
-    .bind(&cursor.bucket)
-    .bind(&cursor.rule_id)
-    .bind(&cursor.stage)
-    .bind(&cursor.cursor)
-    .bind(cursor.updated_at)
-    .bind(cursor.fence_term)
-    .bind(cursor.fence_leader)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+async fn upsert(cw: &mut ControlWrite<'_>, cursor: &LifecycleCursorRow) -> Result<bool, sqlx::Error> {
+    SqliteControlTxn::new(cw.conn())
+        .lifecycle_cursor_upsert(cursor)
+        .await
+        .map_err(control_err)
 }
 
 /// 只读预检 → 整行 upsert。预检失败 = 零写入的 `Conflict`。
@@ -97,7 +77,7 @@ pub(crate) async fn apply(
     if cursor_row_ok(cur.as_ref(), cursor).is_err() {
         return Ok(ControlResponse::Conflict);
     }
-    if upsert(cw, cursor).await? != 1 {
+    if !upsert(cw, cursor).await? {
         return Err(invariant(format!(
             "lifecycle cursor {}/{}/{} upsert affected 0 rows",
             cursor.bucket, cursor.rule_id, cursor.stage
@@ -114,16 +94,10 @@ pub(crate) async fn clear(
     stage: &str,
     fence_term: i64,
 ) -> Result<ControlResponse, sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM lifecycle_cursors \
-         WHERE bucket = ? AND rule_id = ? AND stage = ? AND fence_term <= ?",
-    )
-    .bind(bucket)
-    .bind(rule_id)
-    .bind(stage)
-    .bind(fence_term)
-    .execute(&mut *cw.conn)
-    .await?;
+    SqliteControlTxn::new(cw.conn())
+        .lifecycle_cursor_delete(bucket, rule_id, stage, fence_term)
+        .await
+        .map_err(control_err)?;
     Ok(ControlResponse::Ok)
 }
 

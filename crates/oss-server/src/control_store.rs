@@ -4,11 +4,15 @@
 //! 事务由调用方持有；适配器不 begin/commit/rollback。
 
 use sqlx::{Row, SqlitePool};
+use xl_store::control_store::lifecycle::{
+    LifecycleCursorRow, LifecycleRuleEntry, LifecycleStore, LifecycleTxn,
+};
 use xl_store::control_store::{
     AccessPointEntry, ControlError, ControlStore, ControlTxn, OlapConfigEntry, VpcEndpoint,
 };
 
 mod ap_olap;
+mod lifecycle;
 
 pub struct SqliteControlStore {
     pub(crate) pool: SqlitePool,
@@ -73,6 +77,38 @@ impl ControlStore for SqliteControlStore {
 
     async fn olap_configs(&self) -> Result<Vec<OlapConfigEntry>, ControlError> {
         ap_olap::olap_configs(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl LifecycleStore for SqliteControlStore {
+    async fn lifecycle_rules(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<LifecycleRuleEntry>, ControlError> {
+        lifecycle::lifecycle_rules(self, bucket).await
+    }
+
+    async fn enabled_lifecycle_rules(&self) -> Result<Vec<LifecycleRuleEntry>, ControlError> {
+        lifecycle::enabled_lifecycle_rules(self).await
+    }
+
+    async fn lifecycle_cursor(
+        &self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<String>, ControlError> {
+        lifecycle::lifecycle_cursor(self, bucket, rule_id, stage).await
+    }
+
+    async fn lifecycle_cursor_row(
+        &self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<LifecycleCursorRow>, ControlError> {
+        lifecycle::lifecycle_cursor_row(self, bucket, rule_id, stage).await
     }
 }
 
@@ -225,5 +261,72 @@ impl ControlTxn for SqliteControlTxn<'_> {
 
     async fn delete_access_points_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
         ap_olap::txn_delete_access_points_for_bucket(self, bucket).await
+    }
+}
+
+#[async_trait::async_trait]
+impl LifecycleTxn for SqliteControlTxn<'_> {
+    async fn replace_lifecycle_rules(
+        &mut self,
+        bucket: &str,
+        rows: &[LifecycleRuleEntry],
+    ) -> Result<(), ControlError> {
+        lifecycle::txn_replace_lifecycle_rules(self, bucket, rows).await
+    }
+
+    async fn replace_all_lifecycle_rules(
+        &mut self,
+        rows: &[LifecycleRuleEntry],
+    ) -> Result<(), ControlError> {
+        lifecycle::txn_replace_all_lifecycle_rules(self, rows).await
+    }
+
+    async fn clear_lifecycle_rules(&mut self, bucket: &str) -> Result<(), ControlError> {
+        lifecycle::txn_clear_lifecycle_rules(self, bucket).await
+    }
+
+    async fn delete_lifecycle_rules_only(&mut self, bucket: &str) -> Result<(), ControlError> {
+        lifecycle::txn_delete_lifecycle_rules_only(self, bucket).await
+    }
+
+    async fn all_lifecycle_rules(&mut self) -> Result<Vec<LifecycleRuleEntry>, ControlError> {
+        lifecycle::txn_all_lifecycle_rules(self).await
+    }
+
+    async fn lifecycle_cursor(
+        &mut self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+    ) -> Result<Option<LifecycleCursorRow>, ControlError> {
+        lifecycle::txn_lifecycle_cursor(self, bucket, rule_id, stage).await
+    }
+
+    async fn lifecycle_cursor_upsert(
+        &mut self,
+        row: &LifecycleCursorRow,
+    ) -> Result<bool, ControlError> {
+        lifecycle::txn_lifecycle_cursor_upsert(self, row).await
+    }
+
+    async fn lifecycle_cursor_delete(
+        &mut self,
+        bucket: &str,
+        rule_id: &str,
+        stage: &str,
+        fence_term: i64,
+    ) -> Result<(), ControlError> {
+        lifecycle::txn_lifecycle_cursor_delete(self, bucket, rule_id, stage, fence_term).await
+    }
+
+    async fn lifecycle_cursors(&mut self) -> Result<Vec<LifecycleCursorRow>, ControlError> {
+        lifecycle::txn_lifecycle_cursors(self).await
+    }
+
+    async fn replace_lifecycle_cursors(
+        &mut self,
+        rows: &[LifecycleCursorRow],
+    ) -> Result<(), ControlError> {
+        lifecycle::txn_replace_lifecycle_cursors(self, rows).await
     }
 }

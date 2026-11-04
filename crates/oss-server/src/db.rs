@@ -6,6 +6,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
+use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
@@ -4748,22 +4749,6 @@ mod tests {
 /// 类型收敛到 ControlStore 缝，行为字段不变。
 pub use xl_store::control_store::LifecycleRuleEntry as LifecycleRuleRow;
 
-fn row_to_lifecycle_rule(r: &sqlx::sqlite::SqliteRow) -> LifecycleRuleRow {
-    LifecycleRuleRow {
-        bucket: r.get("bucket"),
-        rule_id: r.get("rule_id"),
-        prefix: r.get("prefix"),
-        expire_days: r.get("expire_days"),
-        expiration_days: r.get("expiration_days"),
-        transition_days: r.get("transition_days"),
-        transition_class: r.get("transition_class"),
-        transition_tier: r.get("transition_tier"),
-        enabled: r.get::<i64, _>("enabled") != 0,
-        updated_at: r.get("updated_at"),
-        config_json: r.get("config_json"),
-    }
-}
-
 /// CMK 删除/扫描的桶默认加密引用源（xl-store 不依赖 SQL，经 trait 注入）。
 /// 存值形态 `aws:kms:<名或 ARN>`（S3/控制台写入口径）——按规范名归一后比对。
 #[async_trait::async_trait]
@@ -4789,15 +4774,10 @@ impl xl_store::store::CmkConfigRefs for Db {
 impl Db {
     /// 某桶的全部规则（控制台 GET 用）。
     pub async fn list_lifecycle_rules(&self, bucket: &str) -> Result<Vec<LifecycleRuleRow>> {
-        let rows = sqlx::query(
-            "SELECT bucket, rule_id, prefix, expire_days, expiration_days, transition_days, \
-             transition_class, transition_tier, enabled, updated_at, config_json \
-             FROM lifecycle_rules WHERE bucket = ? ORDER BY rule_id, prefix",
-        )
-        .bind(bucket)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(row_to_lifecycle_rule).collect())
+        self.control_store()
+            .lifecycle_rules(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 全量替换某桶规则（PUT 语义：先删后插，一个事务）。`now` 由调用方给（可测）。
@@ -4807,36 +4787,15 @@ impl Db {
         rules: &[LifecycleRuleRow],
         now: i64,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *tx)
-            .await?;
-        // 4.10：规则整桶替换 → 旧扫描游标作废（prefix/动作变了，续扫位置不再可信）。
-        sqlx::query("DELETE FROM lifecycle_cursors WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *tx)
-            .await?;
-        for r in rules {
-            sqlx::query(
-                "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, expiration_days, \
-                 transition_days, transition_class, transition_tier, enabled, updated_at, config_json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(bucket)
-            .bind(&r.rule_id)
-            .bind(&r.prefix)
-            .bind(r.expire_days)
-            .bind(r.expiration_days)
-            .bind(r.transition_days)
-            .bind(&r.transition_class)
-            .bind(&r.transition_tier)
-            .bind(if r.enabled { 1 } else { 0 })
-            .bind(now)
-            .bind(&r.config_json)
-            .execute(&mut *tx)
-            .await?;
+        let mut rows: Vec<LifecycleRuleRow> = rules.to_vec();
+        for r in &mut rows {
+            r.updated_at = now;
         }
+        let mut tx = self.pool.begin().await?;
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+        txn.replace_lifecycle_rules(bucket, &rows)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok(())
     }
@@ -4848,16 +4807,10 @@ impl Db {
         rule_id: &str,
         stage: &str,
     ) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT cursor FROM lifecycle_cursors \
-             WHERE bucket = ? AND rule_id = ? AND stage = ?",
-        )
-        .bind(bucket)
-        .bind(rule_id)
-        .bind(stage)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| r.get("cursor")))
+        self.control_store()
+            .lifecycle_cursor(bucket, rule_id, stage)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 4.10：持久化/清除扫描游标（`None` → 删除行，表示本阶段已扫完，下轮从头）。
@@ -4872,52 +4825,39 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
         match cursor {
             Some(c) if !c.is_empty() => {
-                sqlx::query(
-                    "INSERT INTO lifecycle_cursors \
-                     (bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(bucket, rule_id, stage) DO UPDATE SET \
-                     cursor = excluded.cursor, updated_at = excluded.updated_at, \
-                     fence_term = excluded.fence_term, fence_leader = excluded.fence_leader \
-                     WHERE lifecycle_cursors.fence_term <= excluded.fence_term",
-                )
-                .bind(bucket)
-                .bind(rule_id)
-                .bind(stage)
-                .bind(c)
-                .bind(now)
-                .bind(fence.term_i64())
-                .bind(fence.leader_i64())
-                .execute(&self.pool)
-                .await?;
+                let row = xl_store::control_store::lifecycle::LifecycleCursorRow {
+                    bucket: bucket.to_string(),
+                    rule_id: rule_id.to_string(),
+                    stage: stage.to_string(),
+                    cursor: c.to_string(),
+                    updated_at: now,
+                    fence_term: fence.term_i64(),
+                    fence_leader: fence.leader_i64(),
+                };
+                txn.lifecycle_cursor_upsert(&row)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
             }
             _ => {
-                sqlx::query(
-                    "DELETE FROM lifecycle_cursors \
-                     WHERE bucket = ? AND rule_id = ? AND stage = ? AND fence_term <= ?",
-                )
-                .bind(bucket)
-                .bind(rule_id)
-                .bind(stage)
-                .bind(fence.term_i64())
-                .execute(&self.pool)
-                .await?;
+                txn.lifecycle_cursor_delete(bucket, rule_id, stage, fence.term_i64())
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
             }
         }
+        tx.commit().await?;
         Ok(())
     }
 
     /// 全部启用规则（worker 扫描用）。
     pub async fn enabled_lifecycle_rules(&self) -> Result<Vec<LifecycleRuleRow>> {
-        let rows = sqlx::query(
-            "SELECT bucket, rule_id, prefix, expire_days, expiration_days, transition_days, \
-             transition_class, transition_tier, enabled, updated_at, config_json \
-             FROM lifecycle_rules WHERE enabled = 1 ORDER BY bucket, rule_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(row_to_lifecycle_rule).collect())
+        self.control_store()
+            .enabled_lifecycle_rules()
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 开一条作业（worker 每次执行一条）。
@@ -6991,60 +6931,6 @@ impl Db {
         bucket: &str,
     ) -> Result<()> {
         sqlx::query("DELETE FROM event_configs WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *cw.conn())
-            .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn set_lifecycle_rules_raw(
-        cw: &mut ControlWrite<'_>,
-        bucket: &str,
-        rules: &[LifecycleRuleRow],
-        updated_at: i64,
-    ) -> Result<()> {
-        let conn = cw.conn();
-        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *conn)
-            .await?;
-        // 4.10：规则整桶替换 → 旧扫描游标作废（prefix/动作变了，续扫位置不再可信）。
-        sqlx::query("DELETE FROM lifecycle_cursors WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *conn)
-            .await?;
-        for r in rules {
-            sqlx::query(
-                "INSERT INTO lifecycle_rules (bucket, rule_id, prefix, expire_days, \
-                 expiration_days, transition_days, transition_class, transition_tier, \
-                 enabled, updated_at, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(bucket)
-            .bind(&r.rule_id)
-            .bind(&r.prefix)
-            .bind(r.expire_days)
-            .bind(r.expiration_days)
-            .bind(r.transition_days)
-            .bind(&r.transition_class)
-            .bind(&r.transition_tier)
-            .bind(i64::from(r.enabled))
-            .bind(updated_at)
-            .bind(&r.config_json)
-            .execute(&mut *conn)
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn clear_lifecycle_rules_raw(
-        cw: &mut ControlWrite<'_>,
-        bucket: &str,
-    ) -> Result<()> {
-        sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *cw.conn())
-            .await?;
-        sqlx::query("DELETE FROM lifecycle_cursors WHERE bucket = ?")
             .bind(bucket)
             .execute(&mut *cw.conn())
             .await?;
