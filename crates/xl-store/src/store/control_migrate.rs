@@ -1,7 +1,7 @@
 //! Phase 3 前置：集群 legacy 控制对象补证书。
 //!
-//! 只读扫描（本 Task）：全槽观察 → 解码 → 规范内容分组 → 状态判定。写入（fenced
-//! 锁 + 现有标记阶段）在 Task 4 追加，绝不新增提交协议。
+//! 只读扫描：全槽观察 → 解码 → 规范内容分组 → 状态判定。写入：fenced 锁内重扫后
+//! 用现有标记阶段写证书，绝不新增提交协议、绝不调用数据阶段。
 //!
 //! 分组口径：`clone` meta → 剥 `fence_token`/`control_committed` → `encode` → sha256；
 //! 组键 `(control_version, hash)`。两阶段提交/补偿回滚只改 token/证书，不改变组；
@@ -29,10 +29,12 @@ pub enum RecertifyOutcome {
     Missing,
     AlreadyCommitted {
         version: u64,
+        /// 盘上已有证书副本数（`>= Q_s` 才返回此态）。
         certified: usize,
     },
     Certified {
         version: u64,
+        /// 本次标记写入成功的槽数（`flipped`，`>= Q_s`），不是盘上证书总数。
         certified: usize,
         token: u64,
     },

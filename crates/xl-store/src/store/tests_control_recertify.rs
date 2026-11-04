@@ -168,6 +168,29 @@ async fn legacy_recertify_never_overwrites_newer_committed() {
     );
 }
 
+/// 12 槽（Q_s=9）：1 份 v2 证书 + 9 份 legacy v1。最高 rank 证书组仅 1 份副本 →
+/// 无法补齐，且绝不改认达到 quorum 的 legacy v1；整键拒绝、零写入。
+#[tokio::test]
+async fn legacy_recertify_refuses_minority_certificate_over_legacy_quorum() {
+    let c = Cluster::new(4, 3).await;
+    let k = "control/recertify-minority-cert";
+    write_control_slot(&c, 0, k, &certified_meta(k, 2, 10, b"v2")).await;
+    let v1 = legacy_meta(k, 1, 5, b"v1");
+    for slot in 1..10 {
+        write_control_slot(&c, slot, k, &v1).await;
+    }
+    let before = snapshot(&c, k).await;
+    let err = c.stores[0]
+        .recertify_system_object_cluster(k)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::CorruptMeta(_)),
+        "实得：{err:?}"
+    );
+    assert_eq!(snapshot(&c, k).await, before, "不可认证路径必须零写入");
+}
+
 /// 同版本两份不同内容（各 < Q_s）→ CorruptMeta，不写。
 #[tokio::test]
 async fn legacy_recertify_refuses_same_version_fork() {

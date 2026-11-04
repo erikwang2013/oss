@@ -355,6 +355,44 @@ async fn legacy_scan_ranks_preserved_old_certificate() {
     assert_eq!(scan.q_s, 4);
 }
 
+/// rank 先比 `max_token` 再比 `version`（与 `elect_control` 同口径）：更高 token 的旧
+/// 版本组胜出，绝不按版本号重新排序。
+#[test]
+fn classify_ranks_max_token_before_version() {
+    use crate::store::LegacyControlState;
+    use crate::store::control_migrate::{LegacyContentGroup, classify};
+    let g = |version: u64, byte: u8, certified: usize, max_token: u64| LegacyContentGroup {
+        version,
+        content: [byte; 32],
+        copies: 9,
+        certified,
+        max_token,
+    };
+    let groups = [g(2, 2, 9, 10), g(1, 1, 9, 100)];
+    let (chosen, state) = classify(&groups, 9).unwrap();
+    assert_eq!(chosen, Some(1), "应选 v1（token 100）而非 v2（token 10）");
+    assert_eq!(state, LegacyControlState::AlreadyCommitted);
+}
+
+/// 纯分类：1 份 v2 证书 + 9 份 legacy v1（12 槽、Q_s=9）→ 证书组仅 1 份副本，无法补齐，
+/// 也绝不改认 legacy 组（已提交状态不得被迁移工具改写）。
+#[test]
+fn classify_refuses_minority_certificate_over_legacy_quorum() {
+    use crate::store::control_migrate::{LegacyContentGroup, classify};
+    let g = |version: u64, byte: u8, copies: usize, certified: usize| LegacyContentGroup {
+        version,
+        content: [byte; 32],
+        copies,
+        certified,
+        max_token: version * 10,
+    };
+    let err = classify(&[g(2, 2, 1, 1), g(1, 1, 9, 0)], 9).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::CorruptMeta(_)),
+        "实得：{err:?}"
+    );
+}
+
 /// 纯分类：多个同内容组都达到 Q_s（2Q_s>N 下理论不可达）→ 防御性拒绝。
 #[test]
 fn classify_rejects_multiple_quorum_groups() {
