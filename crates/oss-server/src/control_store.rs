@@ -11,6 +11,7 @@ use xl_store::control_store::inventory::{
 use xl_store::control_store::lifecycle::{
     LifecycleCursorRow, LifecycleRuleEntry, LifecycleStore, LifecycleTxn,
 };
+use xl_store::control_store::tier::{TierRestoreRow, TierStore, TierTxn};
 use xl_store::control_store::{
     AccessPointEntry, ControlError, ControlStore, ControlTxn, OlapConfigEntry, VpcEndpoint,
 };
@@ -18,6 +19,7 @@ use xl_store::control_store::{
 mod ap_olap;
 mod inventory;
 mod lifecycle;
+mod tier;
 
 pub struct SqliteControlStore {
     pub(crate) pool: SqlitePool,
@@ -170,6 +172,22 @@ impl LifecycleStore for SqliteControlStore {
         stage: &str,
     ) -> Result<Option<LifecycleCursorRow>, ControlError> {
         lifecycle::lifecycle_cursor_row(self, bucket, rule_id, stage).await
+    }
+}
+
+#[async_trait::async_trait]
+impl TierStore for SqliteControlStore {
+    async fn tier_restore(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<TierRestoreRow>, ControlError> {
+        tier::tier_restore(self, bucket, key, version_id).await
+    }
+
+    async fn tier_restores(&self, state: &str) -> Result<Vec<TierRestoreRow>, ControlError> {
+        tier::tier_restores(self, state).await
     }
 }
 
@@ -588,5 +606,68 @@ impl LifecycleTxn for SqliteControlTxn<'_> {
         rows: &[LifecycleCursorRow],
     ) -> Result<(), ControlError> {
         lifecycle::txn_replace_lifecycle_cursors(self, rows).await
+    }
+}
+
+#[async_trait::async_trait]
+impl TierTxn for SqliteControlTxn<'_> {
+    async fn tier_restore(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<TierRestoreRow>, ControlError> {
+        tier::txn_tier_restore(self, bucket, key, version_id).await
+    }
+
+    async fn tier_restores(&mut self) -> Result<Vec<TierRestoreRow>, ControlError> {
+        tier::txn_tier_restores(self).await
+    }
+
+    async fn replace_tier_restores(
+        &mut self,
+        rows: &[TierRestoreRow],
+    ) -> Result<(), ControlError> {
+        tier::txn_replace_tier_restores(self, rows).await
+    }
+
+    async fn tier_restore_upsert(
+        &mut self,
+        row: &TierRestoreRow,
+    ) -> Result<bool, ControlError> {
+        tier::txn_tier_restore_upsert(self, row).await
+    }
+
+    async fn tier_restore_delete(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        fence_term: i64,
+    ) -> Result<(), ControlError> {
+        tier::txn_tier_restore_delete(self, bucket, key, version_id, fence_term).await
+    }
+
+    async fn tier_restore_set_state(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        state: &str,
+        expires_at: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError> {
+        tier::txn_tier_restore_set_state(
+            self,
+            bucket,
+            key,
+            version_id,
+            state,
+            expires_at,
+            fence_term,
+            fence_leader,
+        )
+        .await
     }
 }

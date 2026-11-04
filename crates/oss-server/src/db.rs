@@ -11,6 +11,7 @@ use xl_store::control_store::inventory::{
     InventoryTxn,
 };
 use xl_store::control_store::lifecycle::LifecycleTxn;
+use xl_store::control_store::tier::{TierRestoreRow, TierTxn};
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;
@@ -157,15 +158,15 @@ pub struct RestoreRow {
     pub created_at: i64,
 }
 
-fn row_to_restore(r: &sqlx::sqlite::SqliteRow) -> RestoreRow {
+fn restore_row_of(r: TierRestoreRow) -> RestoreRow {
     RestoreRow {
-        bucket: r.get("bucket"),
-        key: r.get("key"),
-        version_id: r.get("version_id"),
-        expires_at: r.get("expires_at"),
-        job_id: r.get("job_id"),
-        state: r.get("state"),
-        created_at: r.get("created_at"),
+        bucket: r.bucket,
+        key: r.key,
+        version_id: r.version_id,
+        expires_at: r.expires_at,
+        job_id: r.job_id,
+        state: r.state,
+        created_at: r.created_at,
     }
 }
 
@@ -5094,53 +5095,36 @@ impl Db {
             .rows_affected();
             inserted |= n > 0;
         }
-        Self::upsert_restore_row(&mut tx, bucket, key, version_id, id, now, fence).await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.tier_restore_upsert(&TierRestoreRow {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.to_string(),
+                expires_at: 0,
+                job_id: Some(id),
+                state: "pending".into(),
+                created_at: now,
+                fence_term: fence.term_i64(),
+                fence_leader: fence.leader_i64(),
+            })
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        }
         tx.commit().await?;
         Ok((id, inserted))
     }
 
-    async fn upsert_restore_row(
-        conn: &mut SqliteConnection,
-        bucket: &str,
-        key: &str,
-        version_id: &str,
-        job_id: i64,
-        now: i64,
-        fence: FencingEpoch,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, created_at, \
-             fence_term, fence_leader) \
-             VALUES (?, ?, ?, 0, ?, 'pending', ?, ?, ?) \
-             ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
-             expires_at = 0, job_id = excluded.job_id, state = 'pending', created_at = excluded.created_at, \
-             fence_term = MAX(tier_restores.fence_term, excluded.fence_term), \
-             fence_leader = CASE WHEN excluded.fence_term >= tier_restores.fence_term \
-               THEN excluded.fence_leader ELSE tier_restores.fence_leader END \
-             WHERE tier_restores.fence_term <= excluded.fence_term",
-        )
-        .bind(bucket)
-        .bind(key)
-        .bind(version_id)
-        .bind(job_id)
-        .bind(now)
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
-    }
-
     /// 某状态的 Restore 行（reaper/对账）。
     pub async fn restore_rows(&self, state: &str) -> Result<Vec<RestoreRow>> {
-        let rows = sqlx::query(
-            "SELECT bucket, key, version_id, expires_at, job_id, state, created_at \
-             FROM tier_restores WHERE state = ? ORDER BY created_at",
-        )
-        .bind(state)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(row_to_restore).collect())
+        Ok(self
+            .control_store()
+            .tier_restores(state)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .into_iter()
+            .map(restore_row_of)
+            .collect())
     }
 
     pub async fn restore_row(
@@ -5149,16 +5133,12 @@ impl Db {
         key: &str,
         version_id: &str,
     ) -> Result<Option<RestoreRow>> {
-        let row = sqlx::query(
-            "SELECT bucket, key, version_id, expires_at, job_id, state, created_at \
-             FROM tier_restores WHERE bucket = ? AND key = ? AND version_id = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .bind(version_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.as_ref().map(row_to_restore))
+        Ok(self
+            .control_store()
+            .tier_restore(bucket, key, version_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(restore_row_of))
     }
 
     /// M8-1：带 fencing token 的恢复状态转换。行已被更高 term 接管 → no-op。
@@ -5192,21 +5172,20 @@ impl Db {
         expires_at: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE tier_restores SET state = ?, expires_at = ?, \
-             fence_term = ?, fence_leader = ? \
-             WHERE bucket = ? AND key = ? AND version_id = ? AND fence_term <= ?",
-        )
-        .bind(state)
-        .bind(expires_at)
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .bind(bucket)
-        .bind(key)
-        .bind(version_id)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .tier_restore_set_state(
+                bucket,
+                key,
+                version_id,
+                state,
+                expires_at,
+                fence.term_i64(),
+                fence.leader_i64(),
+            )
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5224,16 +5203,12 @@ impl Db {
         version_id: &str,
         fence: FencingEpoch,
     ) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM tier_restores \
-             WHERE bucket = ? AND key = ? AND version_id = ? AND fence_term <= ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .bind(version_id)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .tier_restore_delete(bucket, key, version_id, fence.term_i64())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 

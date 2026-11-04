@@ -98,3 +98,58 @@ mod tests {
         assert!(rmp_serde::from_slice::<super::TierRestoreRow>(&bytes).is_err());
     }
 }
+
+use super::ControlError;
+
+/// 只读 tier restore 访问。
+#[async_trait::async_trait]
+pub trait TierStore: Send + Sync {
+    async fn tier_restore(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<TierRestoreRow>, ControlError>;
+    /// `WHERE state = ?`，按 `created_at` 升序（reaper/对账）。
+    async fn tier_restores(&self, state: &str) -> Result<Vec<TierRestoreRow>, ControlError>;
+}
+
+/// 调用方事务内的 tier restore 写访问；本 trait 不 begin/commit/rollback。
+#[async_trait::async_trait]
+pub trait TierTxn: Send {
+    async fn tier_restore(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<TierRestoreRow>, ControlError>;
+    /// 快照导出：按 `(bucket, key, version_id)` 升序。
+    async fn tier_restores(&mut self) -> Result<Vec<TierRestoreRow>, ControlError>;
+    async fn replace_tier_restores(
+        &mut self,
+        rows: &[TierRestoreRow],
+    ) -> Result<(), ControlError>;
+    /// fence 门控 upsert；返回是否恰好 1 行。
+    async fn tier_restore_upsert(
+        &mut self,
+        row: &TierRestoreRow,
+    ) -> Result<bool, ControlError>;
+    async fn tier_restore_delete(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        fence_term: i64,
+    ) -> Result<(), ControlError>;
+    /// `UPDATE state/expires_at/fence WHERE PK AND fence_term <= ?`。
+    async fn tier_restore_set_state(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        state: &str,
+        expires_at: i64,
+        fence_term: i64,
+        fence_leader: i64,
+    ) -> Result<(), ControlError>;
+}

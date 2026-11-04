@@ -6,31 +6,16 @@
 //! 日志不得降级）；删除是幂等盲写，`fence_term` 上限让旧 term 的迟到删除 no-op。
 
 use super::{ControlWrite, current_restore, invariant, restore_row_ok};
+use crate::control_store::{SqliteControlTxn, to_sqlx};
 use crate::raft::command::ControlResponse;
 use crate::raft::runstate::TierRestoreRow;
+use xl_store::control_store::tier::TierTxn;
 
-async fn upsert(cw: &mut ControlWrite<'_>, r: &TierRestoreRow) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, \
-          created_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(bucket, key, version_id) DO UPDATE SET \
-          expires_at = excluded.expires_at, job_id = excluded.job_id, state = excluded.state, \
-          created_at = excluded.created_at, fence_term = excluded.fence_term, \
-          fence_leader = excluded.fence_leader \
-         WHERE tier_restores.fence_term <= excluded.fence_term",
-    )
-    .bind(&r.bucket)
-    .bind(&r.key)
-    .bind(&r.version_id)
-    .bind(r.expires_at)
-    .bind(r.job_id)
-    .bind(&r.state)
-    .bind(r.created_at)
-    .bind(r.fence_term)
-    .bind(r.fence_leader)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+async fn upsert(cw: &mut ControlWrite<'_>, r: &TierRestoreRow) -> Result<bool, sqlx::Error> {
+    SqliteControlTxn::new(cw.conn())
+        .tier_restore_upsert(r)
+        .await
+        .map_err(to_sqlx)
 }
 
 /// 只读预检 → 整行 upsert。预检失败 = 零写入的 `Conflict`。
@@ -42,7 +27,7 @@ pub(crate) async fn apply(
     if restore_row_ok(cur.as_ref(), restore).is_err() {
         return Ok(ControlResponse::Conflict);
     }
-    if upsert(cw, restore).await? != 1 {
+    if !upsert(cw, restore).await? {
         return Err(invariant(format!(
             "tier restore {}/{}/{} upsert affected 0 rows",
             restore.bucket, restore.key, restore.version_id
@@ -59,16 +44,10 @@ pub(crate) async fn delete(
     version_id: &str,
     fence_term: i64,
 ) -> Result<ControlResponse, sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM tier_restores \
-         WHERE bucket = ? AND key = ? AND version_id = ? AND fence_term <= ?",
-    )
-    .bind(bucket)
-    .bind(key)
-    .bind(version_id)
-    .bind(fence_term)
-    .execute(&mut *cw.conn)
-    .await?;
+    SqliteControlTxn::new(cw.conn())
+        .tier_restore_delete(bucket, key, version_id, fence_term)
+        .await
+        .map_err(to_sqlx)?;
     Ok(ControlResponse::Ok)
 }
 

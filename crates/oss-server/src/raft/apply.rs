@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use sqlx::SqliteConnection;
 use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryTxn};
 use xl_store::control_store::lifecycle::LifecycleTxn;
+use xl_store::control_store::tier::TierTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 mod accounts;
@@ -23,9 +24,7 @@ pub(crate) mod tier_restore;
 use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
-use super::runstate::{
-    JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from, tier_restore_row_from,
-};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
 use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
@@ -1085,17 +1084,10 @@ async fn current_restore(
     key: &str,
     version_id: &str,
 ) -> Result<Option<TierRestoreRow>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT bucket, key, version_id, expires_at, job_id, state, created_at, \
-          fence_term, fence_leader FROM tier_restores \
-         WHERE bucket = ? AND key = ? AND version_id = ?",
-    )
-    .bind(bucket)
-    .bind(key)
-    .bind(version_id)
-    .fetch_optional(&mut *cw.conn)
-    .await?;
-    Ok(row.as_ref().map(tier_restore_row_from))
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .tier_restore(bucket, key, version_id)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// Restore 行只允许已知状态，且 fence 不得回退（行被更高 term 接管后旧日志不得降级）。

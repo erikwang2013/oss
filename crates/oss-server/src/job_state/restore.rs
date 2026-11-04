@@ -10,7 +10,6 @@
 
 use super::*;
 use crate::raft::apply::restore_row_ok;
-use crate::raft::runstate::tier_restore_row_from;
 
 impl JobState {
     async fn read_tier_restore(
@@ -19,18 +18,10 @@ impl JobState {
         key: &str,
         version_id: &str,
     ) -> Result<Option<TierRestoreRow>, String> {
-        let row = sqlx::query(
-            "SELECT bucket, key, version_id, expires_at, job_id, state, created_at, \
-             fence_term, fence_leader FROM tier_restores \
-             WHERE bucket = ? AND key = ? AND version_id = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .bind(version_id)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(err)?;
-        Ok(row.as_ref().map(tier_restore_row_from))
+        db.control_store()
+            .tier_restore(bucket, key, version_id)
+            .await
+            .map_err(err)
     }
 
     async fn commit_tier_restore(&self, restore: TierRestoreRow) -> Result<(), String> {
