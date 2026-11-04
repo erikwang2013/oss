@@ -1068,20 +1068,17 @@ impl Db {
     /// 账户命名空间 v1：桶主的 12 位账户 ID（NULL/管理员桶 = 系统账户）。
     /// 本节点无桶行（非 Raft 集群）时同样回落到系统账户。
     pub async fn bucket_account(&self, bucket: &str) -> Result<String> {
-        let row = sqlx::query(
-            "SELECT b.owner_id AS owner_id, COALESCE(u.is_admin, 0) AS is_admin \
-             FROM buckets b LEFT JOIN users u ON u.id = b.owner_id WHERE b.name = ?",
+        Ok(
+            match self
+                .control_store()
+                .bucket(bucket)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
+                Some(v) => xl_s3::access::bucket_account_id(v.owner_uid, v.owner_is_admin),
+                None => xl_s3::access::LEGACY_ACCOUNT.to_string(),
+            },
         )
-        .bind(bucket)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(match row {
-            Some(r) => xl_s3::access::bucket_account_id(
-                r.get::<Option<i64>, _>("owner_id"),
-                r.get::<i64, _>("is_admin") != 0,
-            ),
-            None => xl_s3::access::LEGACY_ACCOUNT.to_string(),
-        })
     }
 
     /// 更新 AP 策略（None = 清策略）。
@@ -1563,11 +1560,13 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.get("access_key")).collect())
     }
 
+    // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
     pub async fn insert_bucket(&self, name: &str, owner_id: Option<i64>) -> Result<()> {
         self.insert_bucket_set(name, owner_id, 0).await
     }
 
     /// M4 切片 8：带 set 的建桶行（单 set 缺省 0 走上面）。
+    // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
     pub async fn insert_bucket_set(
         &self,
         name: &str,
@@ -1578,6 +1577,7 @@ impl Db {
     }
 
     /// M9 全列建桶行（INSERT OR IGNORE；已存在的权威行不重置）。`set_id` 是本地路由列。
+    // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
     pub async fn insert_bucket_full(
         &self,
         name: &str,
@@ -1619,6 +1619,7 @@ impl Db {
     /// ON CONFLICT 全列重置（set 随重建收敛，M5 阻断 1）；creation_date 保持首建。
     /// **新建行**在 `BEGIN IMMEDIATE` 写锁内 count+insert——并发建桶只有一个能越过账户
     /// 桶数配额；已存在行是重建收敛（桶数不变），不做配额判定。
+    // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
     pub async fn upsert_bucket_owner_set_mode(
         &self,
         name: &str,
@@ -1668,12 +1669,12 @@ impl Db {
 
     /// 桶的复制模式；行不存在 = "async"（读取路径与缺行旧桶同口径）。
     pub async fn bucket_replication_mode(&self, name: &str) -> Result<String> {
-        let row = sqlx::query("SELECT replication_mode FROM buckets WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row
-            .map(|r| r.get::<String, _>("replication_mode"))
+        Ok(self
+            .control_store()
+            .bucket(name)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|v| v.replication_mode)
             .unwrap_or_else(|| "async".into()))
     }
 
@@ -1692,19 +1693,12 @@ impl Db {
         &self,
         name: &str,
     ) -> Result<Option<(String, bool, String)>> {
-        let row = sqlx::query(
-            "SELECT replication_mode, deleting, versioning FROM buckets WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| {
-            (
-                r.get::<String, _>("replication_mode"),
-                r.get::<i64, _>("deleting") != 0,
-                r.get::<String, _>("versioning"),
-            )
-        }))
+        Ok(self
+            .control_store()
+            .bucket(name)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|v| (v.replication_mode, v.deleting, v.versioning)))
     }
 
     /// M9 S3：删桶 quiesce 标志（S6 起改由 Raft `SetBucketDeleting` 命令承载）。
@@ -1721,17 +1715,13 @@ impl Db {
     pub async fn bucket_replication_modes(
         &self,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let rows = sqlx::query("SELECT name, replication_mode FROM buckets")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows
+        Ok(self
+            .control_store()
+            .buckets()
+            .await
+            .map_err(crate::control_store::to_sqlx)?
             .into_iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("name"),
-                    r.get::<String, _>("replication_mode"),
-                )
-            })
+            .map(|v| (v.name, v.replication_mode))
             .collect())
     }
 
@@ -1740,6 +1730,7 @@ impl Db {
     /// 会在下次启动被此处收敛；行不存在则插入（owner NULL，与历史桶回填同权）。
     /// M5 切片 0：权威值须来自 `resolve_bucket_set_authoritative`（数据面本地先行解析对本地
     /// 陈旧行会把旧值原样写回，收敛不成立——verifier 高 2）。
+    // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
     pub async fn upsert_bucket_set(&self, name: &str, set: u16) -> Result<()> {
         sqlx::query(
             "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, NULL, ?, ?) \
@@ -1754,10 +1745,14 @@ impl Db {
     }
 
     pub async fn list_bucket_rows(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT name FROM buckets ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+        Ok(self
+            .control_store()
+            .buckets()
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .into_iter()
+            .map(|v| v.name)
+            .collect())
     }
 
     pub async fn instant_get(&self, k: &str) -> Result<Option<String>> {
@@ -1890,22 +1885,23 @@ impl Db {
 
     /// 桶版本控制状态（M4 切片 3；aether 上传面按此传 versioned；无行 → "Off"）。
     pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<String> {
-        let row = sqlx::query("SELECT versioning FROM buckets WHERE name = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row
-            .map(|r| r.get::<String, _>("versioning"))
+        Ok(self
+            .control_store()
+            .bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|v| v.versioning)
             .unwrap_or_else(|| "Off".to_string()))
     }
 
     /// M8 缺口 C：桶默认加密（"AES256"/"aws:kms"；None = 未配置）。
     pub async fn get_bucket_default_encryption(&self, bucket: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT default_encryption FROM buckets WHERE name = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.and_then(|r| r.get::<Option<String>, _>("default_encryption")))
+        Ok(self
+            .control_store()
+            .bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .and_then(|v| v.default_encryption))
     }
 
     /// M8 缺口 C：写桶默认加密（桶不存在 → 0 行）。
@@ -1933,30 +1929,27 @@ impl Db {
 
     /// 全部桶默认加密记录（桶名 + 库内存储值），按桶名排序；CMK 引用守卫用。
     pub async fn list_bucket_default_encryptions(&self) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query(
-            "SELECT name, default_encryption FROM buckets \
-             WHERE default_encryption IS NOT NULL ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
+        Ok(self
+            .control_store()
+            .buckets()
+            .await
+            .map_err(crate::control_store::to_sqlx)?
             .into_iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("name"),
-                    r.get::<String, _>("default_encryption"),
-                )
-            })
+            .filter_map(|v| v.default_encryption.map(|e| (v.name, e)))
             .collect())
     }
 
     /// 某用户拥有的桶（控制台桶列表能力位计算用）。
     pub async fn owned_buckets(&self, uid: i64) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT name FROM buckets WHERE owner_id = ? ORDER BY name")
-            .bind(uid)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+        Ok(self
+            .control_store()
+            .buckets()
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .into_iter()
+            .filter(|v| v.owner_uid == Some(uid))
+            .map(|v| v.name)
+            .collect())
     }
 
     pub async fn list_uploads(&self, limit: i64) -> Result<Vec<UploadRecord>> {
@@ -2079,6 +2072,7 @@ impl Db {
     /// **防呆原子化**（评审 P2，同 set_user_status）：事务第一条是无副作用的守卫写
     /// （`UPDATE users SET id=id WHERE …`），既取写锁串行化并发删除/停用，又在同一语句里
     /// 完成判定——通过才继续级联；不通过直接返回 false，一个字节都不改。
+    // shortcut: 账户配额 SQL 片段与 IAM 用户级联同属 Slice 5（账户/配额），随该切片迁移。
     pub async fn delete_user(&self, uid: i64) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let gate = sqlx::query(
@@ -2381,6 +2375,7 @@ impl Db {
     /// 归属 = 桶主的**当前**账户（成员行优先，无行 = uid 派生）；管理员桶归系统账户
     /// 但永不匹配真实账户，故不计入任何用户账户。`account` 是账户 id 的 SQL 表达式
     /// （`a.id` 或绑定参数 `?`），只由本模块常量传入。
+    // shortcut: 账户配额 SQL 片段与 IAM 用户级联同属 Slice 5（账户/配额），随该切片迁移。
     fn account_buckets_from(account: &str) -> String {
         format!(
             "FROM buckets b JOIN users u ON u.id = b.owner_id \
@@ -2450,6 +2445,7 @@ impl Db {
 
     /// 建桶配额最终判定（仅新建行；已存在行是收敛，不增加桶数）。
     /// `conn` 由调用方保证已持写锁或本地 applied 已追平。
+    // shortcut: 账户配额 SQL 片段与 IAM 用户级联同属 Slice 5（账户/配额），随该切片迁移。
     pub(crate) async fn bucket_create_quota_reached_conn(
         conn: &mut SqliteConnection,
         name: &str,
@@ -6317,20 +6313,32 @@ impl Db {
     /// 桶 DB 行存在性（控制面写前置校验：防「给不存在桶预置策略，同名桶日后创建即继承」
     /// ——S6-1 同类边角，verifier 非阻断 3）。盘上有、表里无的历史桶由启动回填补齐。
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT 1 FROM buckets WHERE name = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some())
+        Ok(self
+            .control_store()
+            .bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .is_some())
     }
 
     /// 桶策略原文（None = 未配）。
     pub async fn bucket_policy(&self, bucket: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT policy_json FROM bucket_policies WHERE bucket = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.get("policy_json")))
+        Ok(self
+            .control_store()
+            .bucket_policy(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|p| p.policy_json))
+    }
+
+    /// 桶事件通知配置原文（None = 未配）。
+    pub async fn bucket_notification(&self, bucket: &str) -> Result<Option<String>> {
+        Ok(self
+            .control_store()
+            .bucket_notification(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|e| e.config_json))
     }
 
     /// 写桶策略（全量替换）。
@@ -7395,6 +7403,72 @@ mod argon2_tests {
             .unwrap(),
             1,
             "site 删除不扩大游标范围"
+        );
+    }
+
+    /// Task 3：桶读 façade 的属主/配置投影与缺行默认值。
+    #[tokio::test]
+    async fn bucket_read_facades_project_owner_and_configs() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.create_user("root", "pw", true).await.unwrap();
+        let alice = db.create_user("alice", "pw", false).await.unwrap();
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date, versioning, replication_mode) \
+             VALUES ('b1', ?, 1, 'Enabled', 'sync'), ('b2', NULL, 2, 'Off', 'async')",
+        )
+        .bind(alice)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES ('b1', '{}', 5)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO event_configs (bucket, config_json, updated_at) VALUES ('b1', '[]', 6)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO replication_rules (bucket, rules_json, updated_at) VALUES ('b1', '[]', 7)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db.bucket_exists("b1").await.unwrap());
+        assert!(!db.bucket_exists("missing").await.unwrap());
+        assert_eq!(db.bucket_policy("b1").await.unwrap().as_deref(), Some("{}"));
+        assert_eq!(
+            db.bucket_notification("b1").await.unwrap().as_deref(),
+            Some("[]")
+        );
+        assert_eq!(db.owned_buckets(alice).await.unwrap(), vec!["b1"]);
+        assert_eq!(
+            db.bucket_replication_modes()
+                .await
+                .unwrap()
+                .get("b1")
+                .unwrap(),
+            "sync"
+        );
+        assert_eq!(
+            db.bucket_sync_state_row("b1").await.unwrap(),
+            Some(("sync".into(), false, "Enabled".into()))
+        );
+        assert_eq!(db.bucket_sync_state_row("missing").await.unwrap(), None);
+        assert_eq!(db.get_bucket_versioning("missing").await.unwrap(), "Off");
+        assert_eq!(db.list_bucket_rows().await.unwrap(), vec!["b1", "b2"]);
+        assert_eq!(
+            db.bucket_account("b1").await.unwrap(),
+            xl_s3::access::bucket_account_id(Some(alice), false)
+        );
+        assert_eq!(
+            db.bucket_account("missing").await.unwrap(),
+            xl_s3::access::LEGACY_ACCOUNT
         );
     }
 }

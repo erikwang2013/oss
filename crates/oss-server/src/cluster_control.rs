@@ -217,6 +217,7 @@ impl ControlBackend for SqliteControlBackend {
 /// M5 切片 0：数据面 `resolve_bucket_set`（本地先行）与对账 `resolve_bucket_set_authoritative`
 /// （跳过本地短路，对端共识为准）两形态。
 #[derive(Debug)]
+// shortcut: mesh 本地 set 路由；无 ORDER BY 的行序是既有对端编码行为，Slice 6 统一迁移。
 pub struct DbSetResolver {
     pool: sqlx::SqlitePool,
     peers: Vec<String>,

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo};
+use xl_store::control_store::bucket::BucketStore;
 use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
 
@@ -64,10 +65,10 @@ fn control_result(
 #[async_trait]
 impl ReplicationStore for SqlReplStore {
     async fn load_rules(&self, bucket: &str) -> Result<Option<String>, String> {
-        sqlx::query_scalar("SELECT rules_json FROM replication_rules WHERE bucket = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
+        crate::control_store::SqliteControlStore::new(self.pool.clone())
+            .bucket_replication_rules(bucket)
             .await
+            .map(|o| o.map(|e| e.rules_json))
             .map_err(|e| e.to_string())
     }
 
@@ -156,12 +157,11 @@ impl SqlReplSink {
 
     /// 源桶当前是否 versioning=Enabled（版本删除/同源 id 的前提）。
     async fn versioning_enabled(&self, bucket: &str) -> bool {
-        match sqlx::query_scalar::<_, String>("SELECT versioning FROM buckets WHERE name = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
+        match crate::control_store::SqliteControlStore::new(self.pool.clone())
+            .bucket(bucket)
             .await
         {
-            Ok(Some(v)) => v == "Enabled",
+            Ok(Some(v)) => v.versioning == "Enabled",
             Ok(None) => false,
             Err(e) => {
                 tracing::warn!(error = %e, bucket, "读桶 versioning 失败——版本删除不入队");
@@ -218,14 +218,11 @@ impl ReplicationSink for SqlReplSink {
                 || (!self.versioned_remotes.is_empty()
                     && self.versioning_enabled(info.bucket).await));
         if m6_delivery {
-            match sqlx::query_scalar::<_, String>(
-                "SELECT rules_json FROM replication_rules WHERE bucket = ?",
-            )
-            .bind(info.bucket)
-            .fetch_optional(&self.pool)
-            .await
+            match crate::control_store::SqliteControlStore::new(self.pool.clone())
+                .bucket_replication_rules(info.bucket)
+                .await
             {
-                Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json) {
+                Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json.rules_json) {
                     Ok(rules) => {
                         // 标签条件需要对象标签快照；删除事件没有（marker 无标签、版本已删），
                         // 标签规则不投递删除。
@@ -322,14 +319,13 @@ impl SqlReplSink {
             return false;
         }
         if info.is_delete_marker || info.version_id.is_none() || info.is_version_delete {
-            let v: Option<String> = match sqlx::query_scalar(
-                "SELECT versioning FROM buckets WHERE name = ?",
+            let v: Option<String> = match crate::control_store::SqliteControlStore::new(
+                self.pool.clone(),
             )
-            .bind(info.bucket)
-            .fetch_optional(&self.pool)
+            .bucket(info.bucket)
             .await
             {
-                Ok(v) => v,
+                Ok(v) => v.map(|b| b.versioning),
                 Err(e) => {
                     tracing::warn!(error = %e, bucket = info.bucket, "读桶 versioning 失败——站点删除不入队");
                     return false;

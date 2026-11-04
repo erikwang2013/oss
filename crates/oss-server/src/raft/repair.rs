@@ -115,12 +115,15 @@ pub async fn run_tls(
     if let Some(t) = tls {
         client = client.with_tls(t);
     }
-    let mut buckets: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM buckets WHERE replication_mode = 'sync' ORDER BY name",
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(|e| e.to_string())?;
+    let mut buckets: Vec<String> = db
+        .control_store()
+        .buckets()
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|b| b.replication_mode == "sync")
+        .map(|b| b.name)
+        .collect();
     if let Some(only) = &opts.bucket {
         buckets.retain(|b| b == only);
         if buckets.is_empty() {

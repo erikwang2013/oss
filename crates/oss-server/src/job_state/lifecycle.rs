@@ -26,12 +26,7 @@ impl JobState {
 
     /// 引用校验前移 append 前：桶已删除时不复活游标（最坏丢本轮进度，重扫安全）。
     async fn lifecycle_bucket_exists(db: &Db, bucket: &str) -> Result<bool, String> {
-        let hit: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
-            .bind(bucket)
-            .fetch_optional(db.pool())
-            .await
-            .map_err(err)?;
-        Ok(hit.is_some())
+        db.bucket_exists(bucket).await.map_err(err)
     }
 
     async fn commit_lifecycle_cursor(&self, cursor: LifecycleCursorRow) -> Result<(), String> {

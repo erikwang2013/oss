@@ -1197,7 +1197,7 @@ async fn get_notifications(
             return internal_error();
         }
     }
-    match state.acl().bucket_notification(&bucket).await {
+    match state.db.bucket_notification(&bucket).await {
         Ok(Some(json)) => match serde_json::from_str::<Vec<xl_s3::notify::EventTarget>>(&json) {
             Ok(targets) => Json(xl_s3::notify::notification_config_out(&targets)).into_response(),
             Err(e) => {
@@ -2344,7 +2344,7 @@ async fn get_bucket_encryption(
         Ok(false) => return (StatusCode::NOT_FOUND, "NoSuchBucket").into_response(),
         Err(e) => return store_error(e).into_response(),
     }
-    match state.acl().bucket_default_encryption(&bucket).await {
+    match state.db.get_bucket_default_encryption(&bucket).await {
         Ok(algorithm) => Json(serde_json::json!({ "algorithm": algorithm })).into_response(),
         Err(e) => {
             tracing::error!(error = %e, bucket, "读桶默认加密失败");
@@ -2712,12 +2712,8 @@ async fn create_bucket(
         }
     }
     // M9：同名桶重建不允许改变复制模式（陈旧行清理不能静默改写语义）。
-    if let Ok(Some(existing)) =
-        sqlx::query_scalar::<_, String>("SELECT replication_mode FROM buckets WHERE name = ?")
-            .bind(&body.name)
-            .fetch_optional(state.db.pool())
-            .await
-        && existing != replication_mode
+    if let Ok(Some(existing)) = state.db.control_store().bucket(&body.name).await
+        && existing.replication_mode != replication_mode
     {
         return (
             StatusCode::CONFLICT,
@@ -2727,15 +2723,11 @@ async fn create_bucket(
     }
     // M9 S6c：Raft 一条命令建桶（行+物理目录 409 预检；apply 只做 create-or-converge）。
     if state.control.is_raft() {
-        match sqlx::query_scalar::<_, i64>("SELECT 1 FROM buckets WHERE name = ?")
-            .bind(&body.name)
-            .fetch_optional(state.db.pool())
-            .await
-        {
-            Ok(Some(_)) => {
+        match state.db.bucket_exists(&body.name).await {
+            Ok(true) => {
                 return (StatusCode::CONFLICT, "BucketAlreadyExists").into_response();
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(e) => {
                 tracing::error!(error = %e, "读桶行失败");
                 return internal_error();
@@ -2828,14 +2820,8 @@ async fn create_bucket(
             // M7 P2：站点 LWW 门控拒绝时物理桶已建——按**最终行**补偿后返回 409：
             // 远端 upsert 胜出（行存在）保留物理桶；远端 delete 胜出（无行）才删空目录。
             if let Some(r) = site_conflict(&e) {
-                let has_row = match sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM buckets WHERE name = ?",
-                )
-                .bind(&body.name)
-                .fetch_optional(state.db.pool())
-                .await
-                {
-                    Ok(v) => v.is_some(),
+                let has_row = match state.db.bucket_exists(&body.name).await {
+                    Ok(v) => v,
                     Err(re) => {
                         // 行状态未知：保留刚建的物理桶（宁可孤儿目录，不误删对端数据）。
                         tracing::warn!(error = %re, bucket = %body.name, "冲突补偿读桶行失败（保留物理桶）");
@@ -2914,14 +2900,8 @@ async fn delete_bucket(
                 if let Some(r) = site_conflict(&e) {
                     // 按最终行补偿：远端 delete 已胜出（无行）→ 本地删除同样已生效，204；
                     // 行仍在（远端 upsert/权限胜出）→ 恢复空桶并 409。
-                    let has_row = match sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM buckets WHERE name = ?",
-                    )
-                    .bind(&bucket)
-                    .fetch_optional(state.db.pool())
-                    .await
-                    {
-                        Ok(v) => v.is_some(),
+                    let has_row = match state.db.bucket_exists(&bucket).await {
+                        Ok(v) => v,
                         Err(re) => {
                             // 行状态未知：恢复空桶，不让行/物理不一致。
                             tracing::warn!(error = %re, bucket = %bucket, "冲突补偿读桶行失败（恢复空桶）");
@@ -4904,13 +4884,8 @@ async fn delete_site(
     }
     // M9 S7.3：Raft 模式下先做成员移除；任何失败都不得删本地对端行。
     if state.control.is_raft() {
-        let sync_buckets: i64 = match sqlx::query_scalar(
-            "SELECT COUNT(*) FROM buckets WHERE replication_mode = 'sync'",
-        )
-        .fetch_one(state.db.pool())
-        .await
-        {
-            Ok(n) => n,
+        let sync_buckets: i64 = match state.db.bucket_replication_modes().await {
+            Ok(modes) => modes.values().filter(|m| m.as_str() == "sync").count() as i64,
             Err(e) => {
                 tracing::error!(error = %e, "统计 sync 桶失败");
                 return internal_error();

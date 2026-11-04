@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::Row as _;
 use sqlx::SqlitePool;
+use xl_store::control_store::bucket::BucketStore;
 
 use xl_s3::events::{EventSink, EventSource, S3EventOp};
 use xl_s3::notify::EventTarget;
@@ -546,12 +547,12 @@ impl SqlEventSink {
             return;
         }
         let owner_uid: Option<i64> =
-            sqlx::query_scalar("SELECT owner_id FROM buckets WHERE name = ?")
-                .bind(bucket)
-                .fetch_optional(&self.pool)
+            crate::control_store::SqliteControlStore::new(self.pool.clone())
+                .bucket(bucket)
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+                .and_then(|v| v.owner_uid);
         for t in targets {
             // 精确匹配，或 `s3:ObjectAccessed:*` 这类尾星通配（配置层只放行该通配）
             if !t.events.iter().any(|e| {
@@ -600,13 +601,14 @@ impl SqlEventSink {
     }
 
     async fn load_targets(&self, bucket: &str) -> Result<Vec<EventTarget>, sqlx::Error> {
-        let row = sqlx::query("SELECT config_json FROM event_configs WHERE bucket = ?")
-            .bind(bucket)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(r) = row else { return Ok(Vec::new()) };
-        let json: String = r.get("config_json");
-        serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e)))
+        let config = crate::control_store::SqliteControlStore::new(self.pool.clone())
+            .bucket_notification(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        let Some(config) = config else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&config.config_json).map_err(|e| sqlx::Error::Decode(Box::new(e)))
     }
 }
 
