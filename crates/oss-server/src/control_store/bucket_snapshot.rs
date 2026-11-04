@@ -8,6 +8,7 @@ use sqlx::Row;
 use xl_store::control_store::bucket::{
     BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRuleEntry,
 };
+use xl_store::control_store::iam::IamTxn;
 use xl_store::control_store::{ControlError, OwnerRef};
 
 use super::SqliteControlTxn;
@@ -208,12 +209,7 @@ pub(super) async fn bucket_upsert_install(
     let owner_id = match &row.owner {
         OwnerRef::Admin => None,
         OwnerRef::User(name) => {
-            let id: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND is_admin = 0")
-                    .bind(name)
-                    .fetch_optional(&mut *txn.conn)
-                    .await
-                    .map_err(backend)?;
+            let id = txn.user_uid_non_admin(name).await?;
             Some(id.ok_or_else(|| {
                 ControlError::Invalid(format!("bucket owner {name} not in snapshot"))
             })?)

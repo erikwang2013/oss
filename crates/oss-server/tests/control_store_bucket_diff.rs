@@ -607,8 +607,13 @@ fn production_sources_have_no_raw_bucket_sql() {
         "bucket.rs",
         "bucket_write.rs",
         "bucket_snapshot.rs",
+        // 账户适配器的桶计数/桶名查询属 IAM/账户切片。
+        "account.rs",
+        "account_write.rs",
         "db.rs",
         "site.rs",
+        // 跨域 FK 置空（user 删除级联 buckets/uploads），D7，归桶/上传切片。
+        "apply.rs",
         "cluster_control.rs",
         "state.rs",
     ];

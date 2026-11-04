@@ -6,6 +6,7 @@
 
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
+use xl_store::control_store::iam::IamTxn;
 use xl_store::control_store::{AccessPointEntry, ControlError, OlapConfigEntry, OwnerRef};
 
 use super::{SqliteControlStore, SqliteControlTxn};
@@ -107,19 +108,11 @@ pub(super) async fn resolve_owner(
     conn: &mut SqliteConnection,
     owner: &OwnerRef,
 ) -> Result<i64, ControlError> {
-    let admin: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(backend)?;
+    let admin = SqliteControlTxn::new(&mut *conn).admin_id().await?;
     match owner {
         OwnerRef::Admin => Ok(admin.unwrap_or(0)),
         OwnerRef::User(username) => {
-            let id: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                .bind(username)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(backend)?;
+            let id = SqliteControlTxn::new(&mut *conn).user_uid(username).await?;
             match id {
                 Some(id) => Ok(id),
                 None if admin.is_some() => Err(ControlError::Invalid(format!(

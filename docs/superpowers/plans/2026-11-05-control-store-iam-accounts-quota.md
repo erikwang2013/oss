@@ -65,7 +65,7 @@
 - 账户：`INSERT OR IGNORE INTO accounts (...)`、`UPDATE accounts SET name/status/bucket_quota/soft_byte_quota/hard_byte_quota/object_quota ..., updated_at = ? WHERE id = ?`，停用带 `NOT EXISTS (在册全局管理员)` 子查询原文；删除 `DELETE FROM accounts WHERE id = ?`；成员 `INSERT ... ON CONFLICT(uid) DO UPDATE`、`INSERT OR IGNORE ...`、`UPDATE accounts SET admin_uid = ? WHERE id = ? AND admin_uid IS NULL`。
 - 账本：`INSERT INTO account_usage_ledger (...) VALUES (...) ON CONFLICT(account_id) DO UPDATE ...`。
 
-**执行偏差（UPSERT → UPDATE-then-INSERT）：** `permissions`/`access_keys` 的 site upsert 在 SQLite 3.46 下与 site AFTER UPDATE 触发器组合会误报 `UNIQUE constraint failed: site_entity_clock.entity, site_entity_clock.entity_id`（行已存在且时钟行存在时，`INSERT OR IGNORE` 的 PK 冲突被 UPSERT 上下文当作 UNIQUE 抛出；与 `bucket_policies` 已记录的偏差同源）。两个 site upsert 改为 `UPDATE ... WHERE`，`rows_affected == 0` 时 `INSERT`；行在→upd 触发器、行缺→ins 触发器，changelog 仍是单条 upsert。`tests/control_store_iam_diff.rs::site_triggers_accept_double_upsert_for_permissions_and_access_keys` 锁定二次 upsert 不报错、changelog=2、clock=1、冲突列按旧 UPSERT 语义更新（AK 的 `created_at/kind` 不变）。apply 路径的 `ON CONFLICT` 在 `apply_ctx=1` 下不触发 site 触发器，保持原样。
+**执行偏差（UPSERT → UPDATE-then-INSERT）：** `permissions`/`access_keys` 的 site upsert 在 SQLite 3.46 下与 site AFTER UPDATE 触发器组合会误报 `UNIQUE constraint failed: site_entity_clock.entity, site_entity_clock.entity_id`（行已存在且时钟行存在时，`INSERT OR IGNORE` 的 PK 冲突被 UPSERT 上下文当作 UNIQUE 抛出；与 `bucket_policies` 已记录的偏差同源）。两个 site upsert 改为 `UPDATE ... WHERE`，`rows_affected == 0` 时 `INSERT`；行在→upd 触发器、行缺→ins 触发器，changelog 仍是单条 upsert。`tests/control_store_iam_diff.rs::site_triggers_accept_double_upsert_for_permissions_and_access_keys` 锁定二次 upsert 不报错、changelog=2、每个实体一行 clock（共 2）、冲突列按旧 UPSERT 语义更新（AK 的 `created_at/kind` 不变）。apply 路径的 `ON CONFLICT` 在 `apply_ctx=1` 下不触发 site 触发器，保持原样。
 
 ### D3. 运行期 / 严格快照两套口径
 
@@ -108,6 +108,14 @@ site.rs 的 chunk 级 `apply_ctx`/clock 写入不变。
 - `oss-server/src/cluster_control.rs`：mesh `ControlQuery::AccessKey` 鉴权查询（跨节点认证热路径，与 xl-s3 同口径）。
 - `oss-server/src/console.rs`：配对用「首个管理员长时 AK」查询（认证凭据路径）。
 - `oss-server/src/db.rs`：`delete_user`/`delete_user_cascade`/site 删除中的 `UPDATE uploads/buckets SET owner_id = NULL`（users FK 置空，跨域，随桶/上传切片迁移）。
+- `oss-server/src/raft/data.rs`：安装用户前的跨域 FK 置空
+  `UPDATE uploads SET owner_id = NULL WHERE owner_id IN (SELECT id FROM users ...)`
+  （只读 users；uploads 属上传切片）。
+- `oss-server/src/raft/apply.rs`：`UserDelete` 级联中的
+  `UPDATE buckets/uploads SET owner_id = NULL WHERE owner_id = ?`（跨域 FK 置空，
+  与 `db.rs`/`site.rs` 同口径，归桶/上传切片）。
+- 桶/AP 适配器只读的用户查找已改走 `IamTxn::{admin_id,user_uid,user_uid_non_admin}`，
+  不占白名单。
 - `oss-server/src/state.rs`：启动期空库/模式守卫中的计数读（本地运维守卫）。
 - 其余生产文件不得再出现这六张表的 SQL（测试除外）。
 

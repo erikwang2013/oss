@@ -141,6 +141,13 @@ fn source_scan_flags_new_control_table_writers() {
         "jobs_write.rs",
         "jobs_snapshot.rs",
         "compat.rs",
+        // ControlStore SQLite 适配器（IAM / 账户 / 配额切片）。
+        "iam.rs",
+        "iam_write.rs",
+        "iam_snapshot.rs",
+        "account.rs",
+        "account_write.rs",
+        "account_snapshot.rs",
         // level-3 账户命令 apply 子模块（apply 层，经 ControlCommand 进入）。
         "accounts.rs",
         "data.rs",
