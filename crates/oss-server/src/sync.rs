@@ -10,12 +10,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sqlx::Row as _;
 use xl_s3::sync_delete::SyncDeleteSink;
+use xl_store::control_store::sync_intents::{
+    NewSyncDeleteIntent, NewSyncWriteIntent, SyncIntentStore, SyncIntentTxn,
+};
 use xl_store::error::Error as StoreError;
 use xl_store::gate::{GateError, GateRequest, GateTicket, PutCommitGate};
 use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store, VersioningMode};
 
+use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 use crate::db::Db;
 use crate::repl_client::{ReplClient, ReplError};
 use crate::state::AppState;
@@ -27,7 +30,7 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIESCE_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 /// 写 intent 状态：远端调用前 / 远端已确认（本地未提交）。
 const INTENT_PENDING: &str = "remote_pending";
-const INTENT_DONE: &str = "remote_done";
+pub(crate) const INTENT_DONE: &str = "remote_done";
 /// 写 intent 恢复周期（启动时先跑一轮）。
 const INTENT_RECOVER_SECS: u64 = 30;
 /// 恢复每轮最多处理行数 / 连续无进展短路阈值（远端黑洞时避免一轮拖数分钟）。
@@ -179,37 +182,36 @@ impl SiteSyncGate {
             .execute(&mut *conn)
             .await
             .map_err(|e| GateError::Unavailable(format!("intent pragma: {e}")))?;
-        sqlx::query(
-            "INSERT INTO sync_write_intents \
-             (id, bucket, key, local_version_id, remote_version_id, tee_path, commit_json, \
-              state, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(req.local_version_id)
-        .bind(req.bucket)
-        .bind(req.key)
-        .bind(req.local_version_id)
-        .bind(req.local_version_id)
-        .bind(tee_path)
-        .bind(commit_json)
-        .bind(INTENT_PENDING)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| GateError::Unavailable(format!("write intent: {e}")))?;
+        SqliteControlTxn::new(&mut conn)
+            .sync_write_intent_insert(&NewSyncWriteIntent {
+                id: req.local_version_id.to_string(),
+                bucket: req.bucket.to_string(),
+                key: req.key.to_string(),
+                local_version_id: req.local_version_id.to_string(),
+                remote_version_id: req.local_version_id.to_string(),
+                tee_path,
+                commit_json,
+                state: INTENT_PENDING.to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .map_err(|e| GateError::Unavailable(format!("write intent: {e}")))?;
         Ok(())
     }
 
     async fn intent_done(&self, id: &str) {
-        if let Err(e) =
-            sqlx::query("UPDATE sync_write_intents SET state = ?, updated_at = ? WHERE id = ?")
-                .bind(INTENT_DONE)
-                .bind(crate::db::now())
-                .bind(id)
-                .execute(self.db.pool())
-                .await
-        {
+        let done = match self.db.pool().acquire().await {
+            Ok(mut conn) => {
+                SqliteControlTxn::new(&mut conn)
+                    .sync_write_intent_mark_done(id, crate::db::now())
+                    .await
+            }
+            Err(e) => Err(xl_store::control_store::ControlError::Backend(
+                e.to_string(),
+            )),
+        };
+        if let Err(e) = done {
             // 状态只是提示；行仍在，恢复按「本地无 meta → 删远端同 id」处理。
             tracing::warn!(id, error = %e, "sync intent 状态更新失败");
         }
@@ -232,21 +234,25 @@ impl SiteSyncGate {
 /// 清理一条写 intent：先删 tee，再删行（中途崩溃时行仍在，下轮恢复）。
 /// 返回 `true` 仅当 intent 行已删除；tee 删除失败仍算清理成功（行是恢复的依据）。
 async fn clean_intent(db: &Db, id: &str) -> bool {
-    let tee: Option<String> =
-        sqlx::query_scalar("SELECT tee_path FROM sync_write_intents WHERE id = ?")
-            .bind(id)
-            .fetch_optional(db.pool())
-            .await
-            .ok()
-            .flatten();
+    let tee = SqliteControlStore::new(db.pool().clone())
+        .sync_write_intent_tee(id)
+        .await
+        .ok()
+        .flatten();
     if let Some(p) = tee {
         let _ = tokio::fs::remove_file(p).await;
     }
-    match sqlx::query("DELETE FROM sync_write_intents WHERE id = ?")
-        .bind(id)
-        .execute(db.pool())
-        .await
-    {
+    let deleted = match db.pool().acquire().await {
+        Ok(mut conn) => {
+            SqliteControlTxn::new(&mut conn)
+                .sync_write_intent_delete(id)
+                .await
+        }
+        Err(e) => Err(xl_store::control_store::ControlError::Backend(
+            e.to_string(),
+        )),
+    };
+    match deleted {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!(id, error = %e, "sync intent 删除失败（下轮恢复重试）");
@@ -260,8 +266,8 @@ async fn clean_intent(db: &Db, id: &str) -> bool {
 async fn clean_orphan_tees(state: &AppState) {
     let dir = state.store.tee_dir();
     let referenced: std::collections::HashSet<String> =
-        match sqlx::query_scalar::<_, String>("SELECT tee_path FROM sync_write_intents")
-            .fetch_all(state.db.pool())
+        match SqliteControlStore::new(state.db.pool().clone())
+            .sync_write_intent_tees()
             .await
         {
             Ok(v) => v.into_iter().collect(),
@@ -304,18 +310,16 @@ pub async fn recover_write_intents(state: &AppState) {
     // sync.timeout_ms + 提交耗时；60s 裕量覆盖病态 fsync。否则 worker 可能删掉
     // 仍在途、但远端已提交的版本（客户端 200、远端无副本）。
     let cutoff = crate::db::now() - (state.cfg.sync.timeout_ms as i64 / 1000 + 60);
-    let rows =
-        match sqlx::query("SELECT id, bucket, key FROM sync_write_intents WHERE updated_at < ?")
-            .bind(cutoff)
-            .fetch_all(state.db.pool())
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "sync intent 恢复：读取失败");
-                return;
-            }
-        };
+    let rows = match SqliteControlStore::new(state.db.pool().clone())
+        .sync_write_intents_stale(cutoff)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "sync intent 恢复：读取失败");
+            return;
+        }
+    };
     if rows.is_empty() {
         return;
     }
@@ -328,9 +332,9 @@ pub async fn recover_write_intents(state: &AppState) {
     .with_tls(Arc::clone(&state.tls));
     let (mut cleaned, mut kept) = (0usize, 0usize);
     for row in rows {
-        let id: String = row.get("id");
-        let bucket: String = row.get("bucket");
-        let key: String = row.get("key");
+        let id = row.id;
+        let bucket = row.bucket;
+        let key = row.key;
         match state.store.head_object_version(&bucket, &key, &id).await {
             Ok(_) => {
                 if clean_intent(&state.db, &id).await {
@@ -723,47 +727,52 @@ impl SiteSyncDelete {
             .execute(&mut *conn)
             .await
             .map_err(|e| StoreError::Unavailable(format!("intent pragma: {e}")))?;
-        sqlx::query(
-            "INSERT INTO sync_delete_intents \
-             (id, bucket, key, op, local_version_id, remote_version_id, marker_version_id, \
-              state, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(bucket)
-        .bind(key)
-        .bind(op)
-        .bind(local_version_id)
-        .bind(remote_version_id)
-        .bind(marker_version_id)
-        .bind(INTENT_PENDING)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| StoreError::Unavailable(format!("delete intent: {e}")))?;
+        SqliteControlTxn::new(&mut conn)
+            .sync_delete_intent_insert(&NewSyncDeleteIntent {
+                id: id.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                op: op.to_string(),
+                local_version_id: local_version_id.to_string(),
+                remote_version_id: remote_version_id.to_string(),
+                marker_version_id: marker_version_id.to_string(),
+                state: INTENT_PENDING.to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .map_err(|e| StoreError::Unavailable(format!("delete intent: {e}")))?;
         Ok(id)
     }
 
     async fn intent_done(&self, id: &str) {
-        if let Err(e) =
-            sqlx::query("UPDATE sync_delete_intents SET state = ?, updated_at = ? WHERE id = ?")
-                .bind(INTENT_DONE)
-                .bind(crate::db::now())
-                .bind(id)
-                .execute(self.db.pool())
-                .await
-        {
+        let done = match self.db.pool().acquire().await {
+            Ok(mut conn) => {
+                SqliteControlTxn::new(&mut conn)
+                    .sync_delete_intent_mark_done(id, crate::db::now())
+                    .await
+            }
+            Err(e) => Err(xl_store::control_store::ControlError::Backend(
+                e.to_string(),
+            )),
+        };
+        if let Err(e) = done {
             tracing::warn!(id, error = %e, "delete intent 状态更新失败（恢复按 pending 重放）");
         }
     }
 
     async fn intent_clean(&self, id: &str) {
-        if let Err(e) = sqlx::query("DELETE FROM sync_delete_intents WHERE id = ?")
-            .bind(id)
-            .execute(self.db.pool())
-            .await
-        {
+        let deleted = match self.db.pool().acquire().await {
+            Ok(mut conn) => {
+                SqliteControlTxn::new(&mut conn)
+                    .sync_delete_intent_delete(id)
+                    .await
+            }
+            Err(e) => Err(xl_store::control_store::ControlError::Backend(
+                e.to_string(),
+            )),
+        };
+        if let Err(e) = deleted {
             tracing::warn!(id, error = %e, "delete intent 删除失败（下轮恢复重试）");
         }
     }
@@ -1323,14 +1332,9 @@ impl SyncDeleteSink for SiteSyncDelete {
 /// `remote_done` 只补本地；本地失败保留行下一轮重试（不重启也恢复）。
 pub async fn recover_delete_intents(state: &AppState) {
     let cutoff = crate::db::now() - (state.cfg.sync.timeout_ms as i64 / 1000 + 60);
-    let rows = match sqlx::query(
-        "SELECT id, bucket, key, op, local_version_id, remote_version_id, marker_version_id, state \
-         FROM sync_delete_intents WHERE updated_at < ? ORDER BY updated_at LIMIT ?",
-    )
-    .bind(cutoff)
-    .bind(RECOVER_BATCH)
-    .fetch_all(state.db.pool())
-    .await
+    let rows = match SqliteControlStore::new(state.db.pool().clone())
+        .sync_delete_intents_stale(cutoff, RECOVER_BATCH)
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -1345,13 +1349,13 @@ pub async fn recover_delete_intents(state: &AppState) {
     let mut recovered = 0usize;
     let mut consecutive = 0usize;
     for row in rows {
-        let id: String = row.get("id");
-        let bucket: String = row.get("bucket");
-        let key: String = row.get("key");
-        let op: String = row.get("op");
-        let local_vid: Option<String> = row.get("local_version_id");
-        let marker_vid: Option<String> = row.get("marker_version_id");
-        let done = row.get::<String, _>("state") == INTENT_DONE;
+        let id = row.id;
+        let bucket = row.bucket;
+        let key = row.key;
+        let op = row.op;
+        let local_vid = row.local_version_id;
+        let marker_vid = row.marker_version_id;
+        let done = row.state == INTENT_DONE;
         if recover_row(svc, &id, &bucket, &key, &op, local_vid, marker_vid, done).await {
             recovered += 1;
             consecutive = 0;
