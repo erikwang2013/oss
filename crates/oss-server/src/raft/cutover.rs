@@ -13,8 +13,11 @@ pub use recover::{ForceRecoverReport, force_recover};
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use xl_store::control_store::sites::SiteStore;
+
 use super::data::{self, ControlData, InstallCtx};
 use super::runstate;
+use crate::control_store::SqliteControlStore;
 use crate::db::Db;
 
 #[derive(Debug, Clone)]
@@ -250,13 +253,10 @@ async fn target_control(db: &Db) -> Result<ControlData, CutoverError> {
 }
 
 async fn m7_lag_zero(db: &Db) -> Result<bool, CutoverError> {
-    let lag: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sites s LEFT JOIN site_cursors c ON c.peer_id = s.peer_id \
-         WHERE IFNULL((SELECT MAX(seq) FROM site_changelog), 0) > IFNULL(c.last_seq, 0)",
-    )
-    .fetch_one(db.pool())
-    .await
-    .map_err(|e| CutoverError::Db(e.to_string()))?;
+    let lag = SqliteControlStore::new(db.pool().clone())
+        .site_lag_rows()
+        .await
+        .map_err(|e| CutoverError::Db(e.to_string()))?;
     Ok(lag == 0)
 }
 

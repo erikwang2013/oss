@@ -18,8 +18,12 @@ use serde::Deserialize;
 use xl_s3::access::{Action, AuthedUser};
 use xl_s3::events::EventSink as _;
 use xl_s3::sync_delete::SyncDeleteSink as _;
+use xl_store::control_store::event_outbox::{EventOutboxStore, EventOutboxTxn};
+use xl_store::control_store::repl_outbox::ReplOutboxStore;
+use xl_store::control_store::sites::SiteStore;
 use xl_store::store::VersioningMode;
 
+use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -1327,26 +1331,20 @@ async fn list_dead_events(
     if let Err(r) = admin_of(&state, &payload).await {
         return r;
     }
-    use sqlx::Row as _;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let rows = sqlx::query(
-        "SELECT id, bucket, event_json, attempts, last_error, created_at FROM event_outbox \
-         WHERE state='dead' ORDER BY id DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(state.db.pool())
-    .await;
+    let rows = SqliteControlStore::new(state.db.pool().clone())
+        .dead_events(limit)
+        .await;
     match rows {
         Ok(rows) => Json(
             rows.iter()
                 .map(|r| {
-                    let raw: String = r.get("event_json");
                     // event_outbox 无对象键/事件名列——两者都在事件载荷 JSON 里
                     let ev: serde_json::Value =
-                        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                        serde_json::from_str(&r.event_json).unwrap_or(serde_json::Value::Null);
                     serde_json::json!({
-                        "id": r.get::<i64, _>("id"),
-                        "bucket": r.get::<String, _>("bucket"),
+                        "id": r.id,
+                        "bucket": r.bucket,
                         // 载荷里是 AWS URL 编码键（space→+，/→%2F）；展示解码后的原件
                         "object_key": ev.pointer("/s3/object/key").and_then(|v| v.as_str())
                             .map(crate::events::aws_decode_key)
@@ -1354,9 +1352,9 @@ async fn list_dead_events(
                             .unwrap_or(serde_json::Value::Null),
                         "event": ev.pointer("/eventName")
                             .cloned().unwrap_or(serde_json::Value::Null),
-                        "attempts": r.get::<i64, _>("attempts"),
-                        "last_error": r.get::<Option<String>, _>("last_error"),
-                        "created_at": r.get::<i64, _>("created_at"),
+                        "attempts": r.attempts,
+                        "last_error": r.last_error,
+                        "created_at": r.created_at,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1383,17 +1381,19 @@ async fn redeliver_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    match sqlx::query(
-        "UPDATE event_outbox SET state='pending', claimed_at=NULL, next_retry_at=?, attempts=0, \
-         last_error=NULL WHERE id=? AND state='dead'",
-    )
-    .bind(now)
-    .bind(id)
-    .execute(state.db.pool())
-    .await
-    {
-        Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => (StatusCode::NOT_FOUND, "死信事件不存在").into_response(),
+    let redelivered = match state.db.pool().acquire().await {
+        Ok(mut conn) => {
+            SqliteControlTxn::new(&mut conn)
+                .event_redeliver(id, now)
+                .await
+        }
+        Err(e) => Err(xl_store::control_store::ControlError::Backend(
+            e.to_string(),
+        )),
+    };
+    match redelivered {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "死信事件不存在").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "重投死信失败");
             internal_error()
@@ -4824,37 +4824,25 @@ async fn site_status(
         .fetch_one(pool)
         .await
         .unwrap_or(0);
-    let cursor: i64 = sqlx::query_scalar("SELECT last_seq FROM site_cursors WHERE peer_id = ?")
-        .bind(&peer_id)
-        .fetch_optional(pool)
+    let store = SqliteControlStore::new(pool.clone());
+    let cursor: i64 = store
+        .site_cursor(&peer_id)
         .await
         .ok()
         .flatten()
         .unwrap_or(0);
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND remote_id=? \
-         AND state='pending'",
-    )
-    .bind(&peer_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    let sending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND remote_id=? \
-         AND state='sending'",
-    )
-    .bind(&peer_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    let dead_objs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND remote_id=? \
-         AND state='dead'",
-    )
-    .bind(&peer_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    let pending: i64 = store
+        .repl_site_state_count(&peer_id, "pending")
+        .await
+        .unwrap_or(0);
+    let sending: i64 = store
+        .repl_site_state_count(&peer_id, "sending")
+        .await
+        .unwrap_or(0);
+    let dead_objs: i64 = store
+        .repl_site_state_count(&peer_id, "dead")
+        .await
+        .unwrap_or(0);
     let dead_ctrl = crate::site::dead_count(pool, &peer.remote_site_id)
         .await
         .unwrap_or(0);
@@ -5088,17 +5076,17 @@ async fn site_changelog(
     }
     // L8：token 不能脱离“当前配对关系”单独生效——解配后旧 token 立即失效；
     // 每条 origin 必须是当前唯一 peer 的 remote_site_id（禁止伪造归属）。
-    let remote: Option<String> =
-        match sqlx::query_scalar("SELECT remote_site_id FROM sites LIMIT 1")
-            .fetch_optional(state.db.pool())
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = %e, "读站点对失败");
-                return internal_error();
-            }
-        };
+    let remote: Option<String> = match SqliteControlStore::new(state.db.pool().clone())
+        .first_site_remote_id()
+        .await
+        .map_err(crate::control_store::to_sqlx)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "读站点对失败");
+            return internal_error();
+        }
+    };
     let Some(remote) = remote else {
         return (StatusCode::UNAUTHORIZED, "site pair not established").into_response();
     };

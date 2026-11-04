@@ -52,7 +52,8 @@ fn wins(e: &Entry, clock: Option<(i64, i64, String, i64)>) -> bool {
     }
 }
 
-// shortcut: LWW 时钟直接读写 site_entity_clock；站点同步属 Slice 6（jobs/outbox/sites）。
+// shortcut: LWW 时钟直接读写 site_entity_clock；Slice 6 D2 明确保留 site.rs 的 LWW/
+// changelog/apply 触发器路径为原始 SQL，待对象后端具备事务触发器语义时再迁移。
 async fn get_clock(
     tx: &mut sqlx::SqliteConnection,
     entity: &str,
@@ -130,6 +131,7 @@ async fn bury(
         cut -= 1;
     }
     let payload = &payload[..cut];
+    // shortcut: apply_dead 与对端 last_error 属 M7 apply 路径（触发器/时钟语义一并保留）。
     sqlx::query(
         "INSERT OR REPLACE INTO site_apply_dead (peer_id, seq, entity, entity_id, error, \
          payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -646,6 +648,7 @@ async fn snapshot_entry(
     entity_id: &str,
     payload: &serde_json::Value,
 ) -> Result<(), String> {
+    // shortcut: site_changelog 出货写入依赖 raw SQL 的触发器/seq 语义，Slice 6 D2 保留。
     sqlx::query(
         "INSERT INTO site_changelog (origin_site_id, entity, entity_id, op, payload, priority, \
          ts, created_at) VALUES (?, ?, ?, 'upsert', ?, ?, ?, ?)",
