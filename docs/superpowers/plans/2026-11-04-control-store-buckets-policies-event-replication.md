@@ -33,7 +33,7 @@
 
 按风险从高到低，五项都必须在对应任务的测试里钉住：
 
-1. **changelog 触发器漂移**：`buckets` 的 UPDATE 只应在 `versioning/owner_id/object_lock` 实值变化时写 changelog；`bucket_policies` 的 upsert 必须继续走 `INSERT ... ON CONFLICT DO UPDATE`（UPDATE 触发器），绝不能改成 `INSERT OR REPLACE` 或 DELETE+INSERT。测试：Task 7 的 site 触发器断言 + Task 8 差分。
+1. **changelog 触发器漂移**：`buckets` 的 UPDATE 只应在 `versioning/owner_id/object_lock` 实值变化时写 changelog；`bucket_policies` 的 upsert 必须产生一次 upsert changelog（UPDATE 触发器），绝不能改成 `INSERT OR REPLACE` 或 DELETE+INSERT。执行偏差（见门禁记录）：SQLite 3.4x 在 UPSERT 触发的 `site_log_policy_upd` 内执行 `INSERT OR IGNORE site_entity_clock` 会把 PK 冲突误报为 UNIQUE，故策略写改为 UPDATE-then-INSERT；触发器语义由 Task 7/8 测试逐字段锁定。测试：Task 7 的 site 触发器断言 + Task 8 差分。
 2. **级联范围**：`delete_bucket_cascade` 必须仍清 13 张从属表且只清目标桶；`clear_bucket_m8_tx` 范围不变（不新增也不遗漏）。测试：Task 7 `cascade_deletes_all_13_tables_and_spares_other_bucket`、扩展现有 `clear_bucket_m8_tx_deletes_bucket_ap_olap_only`。
 3. **属主投影三口径**：运行期宽松（NULL/0/悬空 → `Admin`，现存用户含管理员 → `User`）、严格快照（`is_admin=1` → `Admin`，悬空 → 报错）、安装（User 缺失 → 快照拒绝）。错误文本必须仍是 `owner user id {id} missing` 与 `bucket owner {name} not in snapshot`。测试：Task 2、Task 6。
 4. **快照顺序与安装语义**：`ControlData` 字段顺序、四张表的 `ORDER BY`、`BucketEntry` 字段顺序、安装时保留目标 `set_id`、目标独有桶先删、`UPDATE buckets SET owner_id = NULL` 的位置。测试：Task 6 字节级 round-trip + Task 8 差分。
@@ -951,10 +951,31 @@ git commit -m "chore: bucket control-store slice gate fixes"
 
 - [ ] 四张表的生产 SQL 只出现在 D7 白名单文件与适配器。
 - [ ] `buckets` 的 INSERT/UPDATE 列清单与旧 `create_bucket_tx` 完全一致（INSERT 含 `set_id` 常量 0；UPDATE 不写 `set_id`/`creation_date`）。
-- [ ] `bucket_policies` 写入仍是 `ON CONFLICT DO UPDATE`，没有任何 `INSERT OR REPLACE`。
+- [x] `bucket_policies` 写入为 UPDATE-then-INSERT（UPSERT 与 site 触发器组合在 SQLite 下误报 UNIQUE，见门禁记录），没有任何 `INSERT OR REPLACE`。
 - [ ] `delete_bucket_cascade` 仍清 13 张从属表且 `buckets` 最后删除，`permissions` 仍 raw，`clear_bucket_m8_tx` 范围未变。
 - [ ] 运行期/严格/安装三套属主口径各有测试，错误文本逐字一致。
 - [ ] `ControlData` 字段顺序、四表 ORDER BY、`BucketEntry` 字段顺序有字节级测试。
 - [ ] 安装保留目标 `set_id`，目标独有桶先删、`owner_id` 置 NULL 的位置未变。
 - [ ] `site.rs`、`xl-s3/src/access.rs`、`db.rs` 本地例外、`cluster_control.rs` 均有 `shortcut:` 注释。
 - [ ] 无触发器被删除/重命名；无新增依赖；所有改动文件 < 500 行。
+
+---
+
+## 门禁记录
+
+2026-11-05，切片提交 `7185f8c..4592186`（Tasks 1–8 + 门禁修复），在 `/home/wwwroot/project/oss` 执行：
+
+- `cargo test -p xl-store`：490 passed / 0 failed / 1 ignored。
+- `cargo test -p oss-server --lib`：316 passed / 0 failed / 0 ignored。
+- 集成套件（80 个测试二进制）：全部通过，其中 3 个负载/时序偶发在隔离复跑确认绿，断言未改：
+  1. `ap_aws::tests::maps_source_ip_and_caches_result`：全量负载下本地 mock HTTP 请求失败；隔离复跑 1/1（0.06s）。
+  2. `m8_ap::alias_path_and_host_forms`：全量负载下返回 403（期望 200）；隔离复跑 1/1（0.87s）。
+  3. `raft_accounts_follower`：全量负载下第 4 个用例 >60s 未完；隔离复跑 4/4（11.49s）。
+  全量串行运行在 `raft_access` 处停止等待（负载下 >20 分钟），其余二进制改为逐个执行；`raft_guard` 3/3 通过（33 个 raft guard + M7 模式断言 + 源扫描）。
+- `cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings`：exit 0。
+- `cargo fmt --all -- --check`：exit 0。
+- 结论：切片门禁 PASS。
+
+执行偏差：`bucket_policy_set` 由 `INSERT ... ON CONFLICT DO UPDATE` 改为 UPDATE-then-INSERT。原因已用最小 SQL 复现：UPSERT 触发 `site_log_policy_upd` 时，SQLite 3.46 对触发器内 `INSERT OR IGNORE INTO site_entity_clock` 的 PK 冲突报 `UNIQUE constraint failed`（策略行已存在即失败）。UPDATE-then-INSERT 仍产生同样的 upsert changelog（行存在 → upd 触发器，行缺失 → ins 触发器），由 `control_store_bucket_cascade` 与 `control_store_bucket_diff` 锁定。
+
+已知残余例外（D7）：`permissions` 级联仍 raw（IAM/账号切片）；`site.rs` 的 LWW 时钟/`apply_ctx` 属站点切片；`db.rs` 的启动回填与 `set_id` 维护 SQL 保留。
