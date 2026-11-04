@@ -57,17 +57,14 @@ impl JobState {
     }
 
     async fn next_run_id(db: &Db) -> Result<i64, String> {
-        let meta: Option<i64> =
-            sqlx::query_scalar("SELECT value FROM runstate_meta WHERE key = 'next_run_id'")
-                .fetch_optional(db.pool())
-                .await
-                .map_err(err)?;
-        // audit-allow: decision 8 — next_run_id allocator stays raw until jobs slice.
-        let max: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM inventory_runs")
-            .fetch_one(db.pool())
+        let store = db.control_store();
+        let meta = store
+            .runstate_meta("next_run_id")
             .await
-            .map_err(err)?;
-        Ok(meta.unwrap_or(0).max(max + 1).max(1))
+            .map_err(err)?
+            .unwrap_or(0);
+        let max = store.max_inventory_run_id().await.map_err(err)?;
+        Ok(meta.max(max + 1).max(1))
     }
 
     /// 提交前校验身份/版本/运行引用；apply 只按日志事实做确定性 upsert。

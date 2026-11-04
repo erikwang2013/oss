@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 use crate::db::{Db, JobSpec, NewJobTask};
 use crate::raft::command::{ControlCommand, ControlResponse};
 use crate::raft::control::ControlPlane;
-use crate::raft::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
+use crate::raft::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 use crate::raft::{FencingEpoch, compat};
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -264,35 +264,25 @@ impl JobState {
     }
 
     async fn read_job(db: &Db, id: i64) -> Result<Option<JobRow>, String> {
-        let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(db.pool())
-            .await
-            .map_err(err)?;
-        Ok(row.as_ref().map(job_row_from))
+        db.control_store().job(id).await.map_err(err)
     }
 
     async fn read_task(db: &Db, job_id: i64, task_no: i64) -> Result<Option<JobTaskRow>, String> {
-        let row = sqlx::query("SELECT * FROM job_tasks WHERE job_id = ? AND task_no = ?")
-            .bind(job_id)
-            .bind(task_no)
-            .fetch_optional(db.pool())
+        db.control_store()
+            .job_task(job_id, task_no)
             .await
-            .map_err(err)?;
-        Ok(row.as_ref().map(job_task_row_from))
+            .map_err(err)
     }
 
     async fn next_job_id(db: &Db) -> Result<i64, String> {
-        let meta: Option<i64> =
-            sqlx::query_scalar("SELECT value FROM runstate_meta WHERE key = 'next_job_id'")
-                .fetch_optional(db.pool())
-                .await
-                .map_err(err)?;
-        let max: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM jobs")
-            .fetch_one(db.pool())
+        let store = db.control_store();
+        let meta = store
+            .runstate_meta("next_job_id")
             .await
-            .map_err(err)?;
-        Ok(meta.unwrap_or(0).max(max + 1).max(1))
+            .map_err(err)?
+            .unwrap_or(0);
+        let max = store.max_job_id().await.map_err(err)?;
+        Ok(meta.max(max + 1).max(1))
     }
 
     pub async fn create_job(&self, db: &Db, spec: &JobSpec, now: i64) -> Result<i64, String> {
@@ -404,13 +394,13 @@ impl JobState {
         }
         let _guard = self.lock.lock().await;
         self.leader_ready("create_job_dedup").await?;
-        let mut seen: HashSet<String> =
-            sqlx::query_scalar("SELECT dedupe_key FROM job_tasks WHERE dedupe_key IS NOT NULL")
-                .fetch_all(db.pool())
-                .await
-                .map_err(err)?
-                .into_iter()
-                .collect();
+        let mut seen: HashSet<String> = db
+            .control_store()
+            .dedupe_keys()
+            .await
+            .map_err(err)?
+            .into_iter()
+            .collect();
         let mut tasks = Vec::new();
         for task in &spec.tasks {
             // 同批重复键也是先到先得（与 INSERT OR IGNORE 一致）。
@@ -455,13 +445,7 @@ impl JobState {
         let Some(parent) = Self::read_job(db, id).await? else {
             return Ok(None);
         };
-        let rows = sqlx::query(
-            "SELECT * FROM job_tasks WHERE job_id = ? AND state = 'failed' ORDER BY task_no",
-        )
-        .bind(id)
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let rows = db.control_store().failed_job_tasks(id).await.map_err(err)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -470,7 +454,7 @@ impl JobState {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                let mut task = job_task_row_from(r);
+                let mut task = r.clone();
                 task.job_id = new_id;
                 task.task_no = i as i64 + 1;
                 task.state = "queued".into();

@@ -25,6 +25,9 @@ mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
 mod inventory;
+mod jobs;
+mod jobs_snapshot;
+mod jobs_write;
 mod lifecycle;
 mod tier;
 

@@ -20,13 +20,7 @@ impl JobState {
         }
         let _guard = self.lock.lock().await;
         self.leader_ready("claim_task").await?;
-        let promoted: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE state = 'queued' AND EXISTS \
-             (SELECT 1 FROM job_tasks t WHERE t.job_id = jobs.id AND t.state IN ('queued','running'))",
-        )
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let promoted = db.control_store().jobs_to_promote().await.map_err(err)?;
         let mut jobs = Vec::new();
         for id in promoted {
             if let Some(mut job) = Self::read_job(db, id).await? {
@@ -37,22 +31,15 @@ impl JobState {
             }
         }
         // 作业提升与任务领取在同一批提交：这里必须接受仍为 queued 的作业（本批会提升）。
-        let candidate = sqlx::query(
-            "SELECT t.* FROM job_tasks t JOIN jobs j ON j.id = t.job_id \
-             WHERE t.state = 'queued' AND t.next_at <= ? AND j.state IN ('queued','running') \
-               AND t.fence_term <= ? \
-             ORDER BY j.priority DESC, t.next_at, t.task_no LIMIT 1",
-        )
-        .bind(now)
-        .bind(fence.term_i64())
-        .fetch_optional(db.pool())
-        .await
-        .map_err(err)?;
-        let Some(row) = candidate else {
+        let candidate = db
+            .control_store()
+            .queued_task_candidate(now, fence.term_i64(), true)
+            .await
+            .map_err(err)?;
+        let Some(mut task) = candidate else {
             self.commit(db, jobs, Vec::new(), Vec::new()).await?;
             return Ok(None);
         };
-        let mut task = job_task_row_from(&row);
         let job = match jobs.iter().position(|j| j.id == task.job_id) {
             Some(i) => jobs.remove(i),
             // 任务与作业同批提交，apply 前引用自洽；作业行仍需逻辑版本前进。
@@ -137,15 +124,11 @@ impl JobState {
         task.fence_leader = fence.leader_i64();
         bump(&mut job, now);
         let task_active = matches!(task.state.as_str(), "queued" | "running");
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM job_tasks WHERE job_id = ? AND task_no <> ? \
-             AND state IN ('queued','running')",
-        )
-        .bind(job_id)
-        .bind(task_no)
-        .fetch_one(db.pool())
-        .await
-        .map_err(err)?;
+        let others = db
+            .control_store()
+            .active_task_count(job_id, Some((job_id, task_no)))
+            .await
+            .map_err(err)?;
         if !task_active && others == 0 && matches!(job.state.as_str(), "running" | "preempted") {
             job.state = if job.failed > 0 { "error" } else { "done" }.into();
             job.finished_at = Some(now);

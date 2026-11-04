@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use sqlx::SqliteConnection;
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry, BucketTxn};
 use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryTxn};
+use xl_store::control_store::jobs::JobTxn;
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::tier::TierTxn;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
@@ -25,7 +26,7 @@ pub(crate) mod tier_restore;
 use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
-use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
 use crate::db::{Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
@@ -1067,12 +1068,15 @@ fn task_row_ok(cur: Option<&JobTaskRow>, next: &JobTaskRow) -> Result<(), String
     Ok(())
 }
 
+fn jobs_tx<'a>(cw: &'a mut ControlWrite<'_>) -> crate::control_store::SqliteControlTxn<'a> {
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+}
+
 async fn current_job(cw: &mut ControlWrite<'_>, id: i64) -> Result<Option<JobRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.as_ref().map(job_row_from))
+    jobs_tx(cw)
+        .job(id)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn current_task(
@@ -1080,12 +1084,10 @@ async fn current_task(
     job_id: i64,
     task_no: i64,
 ) -> Result<Option<JobTaskRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT * FROM job_tasks WHERE job_id = ? AND task_no = ?")
-        .bind(job_id)
-        .bind(task_no)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.as_ref().map(job_task_row_from))
+    jobs_tx(cw)
+        .job_task(job_id, task_no)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// Restore 行按 `(bucket,key,version_id)` 读取（P2-1：创建行随 JobBatch 复制）。
@@ -1134,98 +1136,28 @@ async fn dedupe_taken(
     job_id: i64,
     task_no: i64,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(i64, i64)> =
-        sqlx::query_as("SELECT job_id, task_no FROM job_tasks WHERE dedupe_key = ?")
-            .bind(key)
-            .fetch_optional(&mut *cw.conn)
-            .await?;
-    Ok(row.is_some_and(|(j, t)| j != job_id || t != task_no))
+    jobs_tx(cw)
+        .dedupe_taken(key, job_id, task_no)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 按主键 upsert 作业行。防回退判定已由 [`job_row_ok`] 在写入前完成，这里不再
 /// 用 SQL WHERE 静默吞行（避免半批边界）。
 async fn apply_job(cw: &mut ControlWrite<'_>, job: &JobRow) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO jobs (id, kind, bucket, prefix, state, scanned, deleted, skipped, error, \
-          created_at, updated_at, spec_json, progress, total, succeeded, failed, report_bucket, \
-          report_prefix, priority, requested_by, parent_job_id, started_at, finished_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET \
-          kind = excluded.kind, bucket = excluded.bucket, prefix = excluded.prefix, \
-          state = excluded.state, scanned = excluded.scanned, deleted = excluded.deleted, \
-          skipped = excluded.skipped, error = excluded.error, created_at = excluded.created_at, \
-          updated_at = excluded.updated_at, spec_json = excluded.spec_json, \
-          progress = excluded.progress, total = excluded.total, \
-          succeeded = excluded.succeeded, failed = excluded.failed, \
-          report_bucket = excluded.report_bucket, report_prefix = excluded.report_prefix, \
-          priority = excluded.priority, requested_by = excluded.requested_by, \
-          parent_job_id = excluded.parent_job_id, started_at = excluded.started_at, \
-          finished_at = excluded.finished_at",
-    )
-    .bind(job.id)
-    .bind(&job.kind)
-    .bind(&job.bucket)
-    .bind(&job.prefix)
-    .bind(&job.state)
-    .bind(job.scanned)
-    .bind(job.deleted)
-    .bind(job.skipped)
-    .bind(&job.error)
-    .bind(job.created_at)
-    .bind(job.updated_at)
-    .bind(&job.spec_json)
-    .bind(job.progress)
-    .bind(job.total)
-    .bind(job.succeeded)
-    .bind(job.failed)
-    .bind(&job.report_bucket)
-    .bind(&job.report_prefix)
-    .bind(job.priority)
-    .bind(job.requested_by)
-    .bind(job.parent_job_id)
-    .bind(job.started_at)
-    .bind(job.finished_at)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+    jobs_tx(cw)
+        .job_upsert(job)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 按 `(job_id, task_no)` upsert。单调/终态判定见 [`task_row_ok`]；终态行恒清
 /// `dedupe_key`（延迟重放的旧行不能把已释放的去重键塞回去）。
 async fn apply_job_task(cw: &mut ControlWrite<'_>, task: &JobTaskRow) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, attempt, next_at, \
-          dedupe_key, deadline_at, result_code, result_string, started_at, finished_at, \
-          fence_term, fence_leader) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(job_id, task_no) DO UPDATE SET \
-          action = excluded.action, payload_json = excluded.payload_json, \
-          state = excluded.state, attempt = excluded.attempt, next_at = excluded.next_at, \
-          dedupe_key = CASE WHEN excluded.state IN ('done','failed','cancelled') THEN NULL \
-                            ELSE excluded.dedupe_key END, \
-          deadline_at = excluded.deadline_at, result_code = excluded.result_code, \
-          result_string = excluded.result_string, started_at = excluded.started_at, \
-          finished_at = excluded.finished_at, fence_term = excluded.fence_term, \
-          fence_leader = excluded.fence_leader",
-    )
-    .bind(task.job_id)
-    .bind(task.task_no)
-    .bind(&task.action)
-    .bind(&task.payload_json)
-    .bind(&task.state)
-    .bind(task.attempt)
-    .bind(task.next_at)
-    .bind(&task.dedupe_key)
-    .bind(task.deadline_at)
-    .bind(&task.result_code)
-    .bind(&task.result_string)
-    .bind(task.started_at)
-    .bind(task.finished_at)
-    .bind(task.fence_term)
-    .bind(task.fence_leader)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+    jobs_tx(cw)
+        .job_task_upsert(task)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 整批语义：先只读校验全部行，任一行不合法 → `Conflict` 且零写入；校验通过后
@@ -1330,7 +1262,10 @@ async fn purge_jobs(
     if validate_job_purge(job_ids).is_err() {
         return Ok(ControlResponse::Invalid);
     }
-    let (deleted, non_terminal) = Db::purge_terminal_jobs_raw(cw, job_ids).await?;
+    let (deleted, non_terminal) = jobs_tx(cw)
+        .purge_terminal_jobs(job_ids)
+        .await
+        .map_err(crate::control_store::to_sqlx)?;
     Ok(if deleted > 0 || non_terminal == 0 {
         ControlResponse::Ok
     } else {

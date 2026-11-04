@@ -11,6 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use xl_store::control_store::jobs::JobStore;
+
 /// 本二进制能解码的协议代次；v1.13.1 = 1。
 pub const WIRE_VERSION: u32 = 2;
 /// 可共存的最低 wire（rolling 基线 = v1.13.1）。
@@ -373,11 +375,10 @@ pub async fn guard_inventory_activation(
     .fetch_one(pool)
     .await
     .map_err(|e| format!("统计 inventory_runs 重复自然键失败: {e}"))?;
-    let next_run_id: Option<i64> =
-        sqlx::query_scalar("SELECT value FROM runstate_meta WHERE key = 'next_run_id'")
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("读取 runstate_meta.next_run_id 失败: {e}"))?;
+    let next_run_id = crate::control_store::SqliteControlStore::new(pool.clone())
+        .runstate_meta("next_run_id")
+        .await
+        .map_err(|e| format!("读取 runstate_meta.next_run_id 失败: {e}"))?;
     let max_run_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM inventory_runs")
         .fetch_one(pool)
         .await

@@ -83,15 +83,11 @@ impl JobState {
         }
         let _guard = self.lock.lock().await;
         self.require_leader("recover_expired_tasks")?;
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT job_id, task_no FROM job_tasks WHERE state = 'running' \
-             AND deadline_at IS NOT NULL AND deadline_at < ? AND fence_term <= ?",
-        )
-        .bind(now)
-        .bind(fence.term_i64())
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let rows = db
+            .control_store()
+            .recover_expired_task_ids(now, fence.term_i64())
+            .await
+            .map_err(err)?;
         for (job_id, task_no) in &rows {
             self.finish_locked(
                 db,
@@ -126,15 +122,11 @@ impl JobState {
         let _guard = self.lock.lock().await;
         self.require_leader("recover_stale_tasks")?;
         let now = crate::db::now();
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT job_id, task_no FROM job_tasks WHERE state = 'running' \
-             AND started_at IS NOT NULL AND started_at < ? AND fence_term <= ?",
-        )
-        .bind(cutoff)
-        .bind(fence.term_i64())
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let rows = db
+            .control_store()
+            .recover_stale_task_ids(cutoff, fence.term_i64())
+            .await
+            .map_err(err)?;
         for (job_id, task_no) in &rows {
             self.finish_locked(
                 db,
@@ -165,17 +157,13 @@ impl JobState {
         }
         let _guard = self.lock.lock().await;
         self.require_leader("recover_orphan_jobs")?;
-        let rows = sqlx::query(
-            "SELECT * FROM jobs WHERE state = 'running' AND updated_at <= ? \
-             AND NOT EXISTS (SELECT 1 FROM job_tasks WHERE job_tasks.job_id = jobs.id)",
-        )
-        .bind(cutoff)
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let rows = db
+            .control_store()
+            .orphan_running_jobs(cutoff)
+            .await
+            .map_err(err)?;
         let mut jobs = Vec::new();
-        for r in &rows {
-            let mut job = job_row_from(r);
+        for mut job in rows {
             job.state = "error".into();
             if job.error.is_none() {
                 job.error = Some("进程崩溃遗留的 running 作业，已自动回收".into());
@@ -204,31 +192,17 @@ impl JobState {
         }
         let _guard = self.lock.lock().await;
         self.require_leader("preempt_lower_priority")?;
-        let running: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks WHERE state = 'running'")
-                .fetch_one(db.pool())
-                .await
-                .map_err(err)?;
+        let running = db.control_store().running_task_count().await.map_err(err)?;
         if running < capacity as i64 {
             return Ok(0);
         }
-        let rows = sqlx::query(
-            "SELECT * FROM jobs WHERE state = 'running' \
-             AND EXISTS (SELECT 1 FROM job_tasks WHERE job_id = jobs.id AND state = 'queued') \
-             AND EXISTS ( \
-               SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
-               WHERE h.state IN ('queued','running') \
-                 AND h.priority > jobs.priority \
-                 AND h.requested_by IS jobs.requested_by \
-                 AND t.state = 'queued' AND t.next_at <= ?)",
-        )
-        .bind(now)
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let rows = db
+            .control_store()
+            .preemptable_running_jobs(now)
+            .await
+            .map_err(err)?;
         let mut jobs = Vec::new();
-        for r in &rows {
-            let mut job = job_row_from(r);
+        for mut job in rows {
             job.state = "preempted".into();
             bump(&mut job, now);
             jobs.push(job);
@@ -245,21 +219,13 @@ impl JobState {
         }
         let _guard = self.lock.lock().await;
         self.require_leader("release_preempted")?;
-        let rows = sqlx::query(
-            "SELECT * FROM jobs WHERE state = 'preempted' AND NOT EXISTS ( \
-               SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
-               WHERE h.id != jobs.id AND h.priority > jobs.priority \
-                 AND h.requested_by IS jobs.requested_by \
-                 AND h.state IN ('queued','running') \
-                 AND t.state = 'queued' AND t.next_at <= ?)",
-        )
-        .bind(now)
-        .fetch_all(db.pool())
-        .await
-        .map_err(err)?;
+        let rows = db
+            .control_store()
+            .releasable_preempted_jobs(now)
+            .await
+            .map_err(err)?;
         let mut jobs = Vec::new();
-        for r in &rows {
-            let mut job = job_row_from(r);
+        for mut job in rows {
             job.state = "queued".into();
             bump(&mut job, now);
             jobs.push(job);
@@ -301,14 +267,12 @@ impl JobState {
                 ) =>
             {
                 job.state = "cancelled".into();
-                let rows =
-                    sqlx::query("SELECT * FROM job_tasks WHERE job_id = ? AND state = 'queued'")
-                        .bind(id)
-                        .fetch_all(db.pool())
-                        .await
-                        .map_err(err)?;
-                for r in &rows {
-                    let mut task = job_task_row_from(r);
+                let rows = db
+                    .control_store()
+                    .queued_tasks_for_job(id)
+                    .await
+                    .map_err(err)?;
+                for mut task in rows {
                     task.state = "cancelled".into();
                     task.finished_at = Some(now);
                     tasks.push(task);

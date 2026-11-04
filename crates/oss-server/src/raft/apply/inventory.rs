@@ -9,6 +9,7 @@ use crate::control_store::{SqliteControlTxn, to_sqlx};
 use crate::raft::command::ControlResponse;
 use crate::raft::runstate::{InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow};
 use xl_store::control_store::inventory::InventoryTxn;
+use xl_store::control_store::jobs::JobTxn;
 
 fn run_terminal(state: &str) -> bool {
     matches!(state, "done" | "skipped")
@@ -212,14 +213,10 @@ async fn apply_run(cw: &mut ControlWrite<'_>, run: &InventoryRunRow) -> Result<b
         .await
         .map_err(to_sqlx)?;
     // 删除（桶删/迁移）后 MAX(id) 会回落；日志事实内推进 meta，杜绝 id 复用。
-    sqlx::query(
-        "INSERT INTO runstate_meta (key, value) VALUES ('next_run_id', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
-         WHERE CAST(runstate_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
-    )
-    .bind((run.id + 1).to_string())
-    .execute(&mut *cw.conn)
-    .await?;
+    SqliteControlTxn::new(cw.conn())
+        .runstate_meta_next_run_id(run.id + 1)
+        .await
+        .map_err(to_sqlx)?;
     Ok(applied)
 }
 

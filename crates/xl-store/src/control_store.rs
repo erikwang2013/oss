@@ -111,7 +111,12 @@ pub trait ControlStore:
 /// 调用方事务内的写访问。`&mut self` 表示独占借用，不提供 begin/commit/rollback。
 #[async_trait::async_trait]
 pub trait ControlTxn:
-    BucketTxn + BucketSnapshotTxn + LifecycleTxn + InventoryTxn + TierTxn + JobTxn
+    BucketTxn
+    + BucketSnapshotTxn
+    + LifecycleTxn
+    + InventoryTxn
+    + TierTxn
+    + JobTxn
     + JobSnapshotTxn
     + Send
 {

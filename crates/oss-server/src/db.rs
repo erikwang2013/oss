@@ -11,6 +11,7 @@ use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
     InventoryTxn,
 };
+use xl_store::control_store::jobs::{JobTxn, NewJob as JobInsert, NewTask as JobTaskInsert};
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::tier::{TierRestoreRow, TierTxn};
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
@@ -145,6 +146,38 @@ pub struct JobSpec {
     pub report_prefix: Option<String>,
     pub spec_json: Option<String>,
     pub tasks: Vec<NewJobTask>,
+}
+
+/// `JobSpec` → 缝的整行输入（本地建作业 SQL 已收口到适配器）。
+fn job_insert(spec: &JobSpec, now: i64) -> JobInsert {
+    JobInsert {
+        kind: spec.kind.clone(),
+        bucket: spec.bucket.clone(),
+        prefix: spec.prefix.clone(),
+        state: "queued".into(),
+        total: spec.tasks.len() as i64,
+        priority: spec.priority,
+        requested_by: spec.requested_by,
+        parent_job_id: spec.parent_job_id,
+        report_bucket: spec.report_bucket.clone(),
+        report_prefix: spec.report_prefix.clone(),
+        spec_json: spec.spec_json.clone(),
+        created_at: now,
+        updated_at: now,
+        started_at: None,
+    }
+}
+
+fn new_tasks(spec: &JobSpec, now: i64) -> Vec<JobTaskInsert> {
+    spec.tasks
+        .iter()
+        .map(|t| JobTaskInsert {
+            action: t.action.clone(),
+            payload_json: t.payload.clone(),
+            dedupe_key: t.dedupe_key.clone(),
+            next_at: now,
+        })
+        .collect()
 }
 
 /// M8 S4b：Restore 行（`tier_restores`；reaper/对账的跨 crate 视图）。
@@ -4849,18 +4882,12 @@ impl Db {
 
     /// 开一条作业（worker 每次执行一条）。
     pub async fn job_start(&self, kind: &str, bucket: &str, prefix: &str, now: i64) -> Result<i64> {
-        let id = sqlx::query(
-            "INSERT INTO jobs (kind, bucket, prefix, state, created_at, updated_at) \
-             VALUES (?, ?, ?, 'running', ?, ?)",
-        )
-        .bind(kind)
-        .bind(bucket)
-        .bind(prefix)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?
-        .last_insert_rowid();
+        let mut tx = self.pool.begin().await?;
+        let id = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_start(kind, bucket, prefix, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -4877,58 +4904,47 @@ impl Db {
         error: Option<&str>,
         now: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE jobs SET state = ?, scanned = ?, deleted = ?, skipped = ?, \
-             error = COALESCE(?, error), updated_at = ? WHERE id = ?",
-        )
-        .bind(state)
-        .bind(scanned)
-        .bind(deleted)
-        .bind(skipped)
-        .bind(error)
-        .bind(now)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_finish(id, state, scanned, deleted, skipped, error, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// 最近作业（控制台 GET /jobs；最新在前）。列投影与 `job_get` 同值。
     pub async fn list_jobs(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query(
-            "SELECT id, kind, bucket, prefix, state, scanned, deleted, skipped, error, \
-             priority, total, succeeded, failed, requested_by, report_bucket, report_prefix, \
-             parent_job_id, started_at, finished_at, created_at, updated_at \
-             FROM jobs ORDER BY id DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .control_store()
+            .recent_jobs(limit)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(rows
             .iter()
-            .map(|r| {
+            .map(|j| {
                 serde_json::json!({
-                    "id": r.get::<i64, _>("id"),
-                    "kind": r.get::<String, _>("kind"),
-                    "bucket": r.get::<String, _>("bucket"),
-                    "prefix": r.get::<String, _>("prefix"),
-                    "state": r.get::<String, _>("state"),
-                    "scanned": r.get::<i64, _>("scanned"),
-                    "deleted": r.get::<i64, _>("deleted"),
-                    "skipped": r.get::<i64, _>("skipped"),
-                    "error": r.get::<Option<String>, _>("error"),
-                    "priority": r.get::<i64, _>("priority"),
-                    "total": r.get::<i64, _>("total"),
-                    "succeeded": r.get::<i64, _>("succeeded"),
-                    "failed": r.get::<i64, _>("failed"),
-                    "requested_by": r.get::<Option<i64>, _>("requested_by"),
-                    "report_bucket": r.get::<Option<String>, _>("report_bucket"),
-                    "report_prefix": r.get::<Option<String>, _>("report_prefix"),
-                    "parent_job_id": r.get::<Option<i64>, _>("parent_job_id"),
-                    "started_at": r.get::<Option<i64>, _>("started_at"),
-                    "finished_at": r.get::<Option<i64>, _>("finished_at"),
-                    "created_at": r.get::<i64, _>("created_at"),
-                    "updated_at": r.get::<i64, _>("updated_at"),
+                    "id": j.id,
+                    "kind": j.kind,
+                    "bucket": j.bucket,
+                    "prefix": j.prefix,
+                    "state": j.state,
+                    "scanned": j.scanned,
+                    "deleted": j.deleted,
+                    "skipped": j.skipped,
+                    "error": j.error,
+                    "priority": j.priority,
+                    "total": j.total,
+                    "succeeded": j.succeeded,
+                    "failed": j.failed,
+                    "requested_by": j.requested_by,
+                    "report_bucket": j.report_bucket,
+                    "report_prefix": j.report_prefix,
+                    "parent_job_id": j.parent_job_id,
+                    "started_at": j.started_at,
+                    "finished_at": j.finished_at,
+                    "created_at": j.created_at,
+                    "updated_at": j.updated_at,
                 })
             })
             .collect())
@@ -4939,40 +4955,10 @@ impl Db {
     /// 建作业 + 任务（同一事务）。任务 `task_no` 从 1 起；作业初始 `queued`。
     pub async fn create_job(&self, spec: &JobSpec, now: i64) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
-        let id = sqlx::query(
-            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
-             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&spec.kind)
-        .bind(&spec.bucket)
-        .bind(&spec.prefix)
-        .bind(spec.tasks.len() as i64)
-        .bind(spec.priority)
-        .bind(spec.requested_by)
-        .bind(spec.parent_job_id)
-        .bind(&spec.report_bucket)
-        .bind(&spec.report_prefix)
-        .bind(&spec.spec_json)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-        for (i, t) in spec.tasks.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, next_at, dedupe_key) \
-                 VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-            )
-            .bind(id)
-            .bind(i as i64 + 1)
-            .bind(&t.action)
-            .bind(&t.payload)
-            .bind(now)
-            .bind(&t.dedupe_key)
-            .execute(&mut *tx)
-            .await?;
-        }
+        let id = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_create(&job_insert(spec, now), &new_tasks(spec, now))
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok(id)
     }
@@ -4981,57 +4967,20 @@ impl Db {
     /// 整个事务回滚并返回 None（C7：不产生空作业）。
     pub async fn create_job_dedup(&self, spec: &JobSpec, now: i64) -> Result<Option<i64>> {
         let mut tx = self.pool.begin().await?;
-        let id = sqlx::query(
-            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
-             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&spec.kind)
-        .bind(&spec.bucket)
-        .bind(&spec.prefix)
-        .bind(spec.tasks.len() as i64)
-        .bind(spec.priority)
-        .bind(spec.requested_by)
-        .bind(spec.parent_job_id)
-        .bind(&spec.report_bucket)
-        .bind(&spec.report_prefix)
-        .bind(&spec.spec_json)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-        let mut inserted = 0i64;
-        for (i, t) in spec.tasks.iter().enumerate() {
-            let n = sqlx::query(
-                "INSERT OR IGNORE INTO job_tasks \
-                 (job_id, task_no, action, payload_json, state, next_at, dedupe_key) \
-                 VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-            )
-            .bind(id)
-            .bind(i as i64 + 1)
-            .bind(&t.action)
-            .bind(&t.payload)
-            .bind(now)
-            .bind(&t.dedupe_key)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            inserted += n as i64;
+        let id = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_create_dedup(&job_insert(spec, now), &new_tasks(spec, now))
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        match id {
+            Some(id) => {
+                tx.commit().await?;
+                Ok(Some(id))
+            }
+            None => {
+                tx.rollback().await?;
+                Ok(None)
+            }
         }
-        if inserted == 0 {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-        if inserted != spec.tasks.len() as i64 {
-            sqlx::query("UPDATE jobs SET total = ? WHERE id = ?")
-                .bind(inserted)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(Some(id))
     }
 
     /// M8 S4b：Restore 受理（单事务）——建 kind=restore 单任务作业 + upsert `tier_restores`
@@ -5049,60 +4998,24 @@ impl Db {
         fence: FencingEpoch,
     ) -> Result<(i64, bool)> {
         let mut tx = self.pool.begin().await?;
-        let id = sqlx::query(
-            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
-             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&spec.kind)
-        .bind(&spec.bucket)
-        .bind(&spec.prefix)
-        .bind(spec.tasks.len() as i64)
-        .bind(spec.priority)
-        .bind(spec.requested_by)
-        .bind(spec.parent_job_id)
-        .bind(&spec.report_bucket)
-        .bind(&spec.report_prefix)
-        .bind(&spec.spec_json)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-        let mut inserted = false;
-        for (i, t) in spec.tasks.iter().enumerate() {
-            let n = sqlx::query(
-                "INSERT OR IGNORE INTO job_tasks \
-                 (job_id, task_no, action, payload_json, state, next_at, dedupe_key) \
-                 VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-            )
-            .bind(id)
-            .bind(i as i64 + 1)
-            .bind(&t.action)
-            .bind(&t.payload)
-            .bind(now)
-            .bind(&t.dedupe_key)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            inserted |= n > 0;
-        }
-        {
-            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
-            txn.tier_restore_upsert(&TierRestoreRow {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: version_id.to_string(),
-                expires_at: 0,
-                job_id: Some(id),
-                state: "pending".into(),
-                created_at: now,
-                fence_term: fence.term_i64(),
-                fence_leader: fence.leader_i64(),
-            })
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+        let (id, inserted) = txn
+            .job_create_restore(&job_insert(spec, now), &new_tasks(spec, now))
             .await
             .map_err(crate::control_store::to_sqlx)?;
-        }
+        txn.tier_restore_upsert(&TierRestoreRow {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+            expires_at: 0,
+            job_id: Some(id),
+            state: "pending".into(),
+            created_at: now,
+            fence_term: fence.term_i64(),
+            fence_leader: fence.leader_i64(),
+        })
+        .await
+        .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok((id, inserted))
     }
@@ -5206,36 +5119,20 @@ impl Db {
 
     /// 作业是否仍有 queued/running 任务（启动对账判断是否需要重排）。
     pub async fn job_task_active(&self, job_id: i64) -> Result<bool> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM job_tasks WHERE job_id = ? AND state IN ('queued','running')",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let n = self
+            .control_store()
+            .active_task_count(job_id, None)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(n > 0)
     }
 
     /// `(该用户, 全局)` 的 inflight 作业数（queued/running/paused/preempted）。
     pub async fn job_inflight_counts(&self, requested_by: Option<i64>) -> Result<(i64, i64)> {
-        let user: i64 = match requested_by {
-            Some(uid) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM jobs WHERE requested_by = ? \
-                     AND state IN ('queued','running','paused','preempted')",
-                )
-                .bind(uid)
-                .fetch_one(&self.pool)
-                .await?
-            }
-            None => 0,
-        };
-        let global: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs \
-             WHERE state IN ('queued','running','paused','preempted')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok((user, global))
+        self.control_store()
+            .job_inflight_counts(requested_by)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 原子领取一条任务（BEGIN IMMEDIATE）。先提升 queued 作业，再按优先级/时间取一条。
@@ -5254,52 +5151,19 @@ impl Db {
         fence: FencingEpoch,
     ) -> Result<Option<ClaimedTask>> {
         let mut conn = self.pool.acquire().await?;
+        // 单节点领取仍需 SQLite 写锁串行化；缝只借用调用方事务，不接管 BEGIN/COMMIT。
         sqlx::raw_sql("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let out = async {
-            sqlx::query(
-                "UPDATE jobs SET state = 'running', started_at = COALESCE(started_at, ?), updated_at = ? \
-                 WHERE state = 'queued' AND EXISTS (SELECT 1 FROM job_tasks t \
-                 WHERE t.job_id = jobs.id AND t.state IN ('queued','running'))",
-            )
-            .bind(now)
-            .bind(now)
-            .execute(&mut *conn)
-            .await?;
-            let row = sqlx::query(
-                "SELECT t.job_id, t.task_no, t.action, t.payload_json, t.attempt \
-                 FROM job_tasks t JOIN jobs j ON j.id = t.job_id \
-                 WHERE t.state = 'queued' AND t.next_at <= ? AND j.state = 'running' \
-                   AND t.fence_term <= ? \
-                 ORDER BY j.priority DESC, t.next_at, t.task_no LIMIT 1",
-            )
-            .bind(now)
-            .bind(fence.term_i64())
-            .fetch_optional(&mut *conn)
-            .await?;
-            let Some(r) = row else {
-                return Ok::<Option<ClaimedTask>, sqlx::Error>(None);
-            };
-            let (job_id, task_no): (i64, i64) = (r.get("job_id"), r.get("task_no"));
-            sqlx::query(
-                "UPDATE job_tasks SET state = 'running', started_at = ?, deadline_at = ?, \
-                 fence_term = ?, fence_leader = ? \
-                 WHERE job_id = ? AND task_no = ? AND state = 'queued' AND fence_term <= ?",
-            )
-            .bind(now)
-            .bind(now + timeout_secs)
-            .bind(fence.term_i64())
-            .bind(fence.leader_i64())
-            .bind(job_id)
-            .bind(task_no)
-            .bind(fence.term_i64())
-            .execute(&mut *conn)
-            .await?;
-            Ok(Some(ClaimedTask {
-                job_id,
-                task_no,
-                action: r.get("action"),
-                payload_json: r.get("payload_json"),
-                attempt: r.get("attempt"),
+            let claim = crate::control_store::SqliteControlTxn::new(&mut conn)
+                .job_claim(now, timeout_secs, fence.term_i64(), fence.leader_i64())
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            Ok::<Option<ClaimedTask>, sqlx::Error>(claim.map(|c| ClaimedTask {
+                job_id: c.job_id,
+                task_no: c.task_no,
+                action: c.action,
+                payload_json: c.payload_json,
+                attempt: c.attempt,
             }))
         }
         .await;
@@ -5320,25 +5184,23 @@ impl Db {
         deadline_at: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE job_tasks SET deadline_at = ? \
-             WHERE job_id = ? AND task_no = ? AND state = 'running' AND fence_term = ?",
-        )
-        .bind(deadline_at)
-        .bind(job_id)
-        .bind(task_no)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .task_set_deadline(job_id, task_no, deadline_at, fence.term_i64())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// 作业当前状态（None = 不存在）。
     pub async fn job_state(&self, id: i64) -> Result<Option<String>> {
-        sqlx::query_scalar("SELECT state FROM jobs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
+        Ok(self
+            .control_store()
+            .job(id)
             .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|j| j.state))
     }
 
     /// 抢占边界回退：把已领取但**尚未执行**的 running 任务放回 queued。
@@ -5351,19 +5213,13 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<bool> {
-        let n = sqlx::query(
-            "UPDATE job_tasks SET state = 'queued', started_at = NULL, deadline_at = NULL, \
-             next_at = ? WHERE job_id = ? AND task_no = ? AND state = 'running' \
-             AND fence_term = ?",
-        )
-        .bind(now)
-        .bind(job_id)
-        .bind(task_no)
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(n > 0)
+        let mut tx = self.pool.begin().await?;
+        let hit = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .requeue_task(job_id, task_no, now, fence.term_i64())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(hit)
     }
 
     /// 协作式抢占（动作边界，单节点）：高等优先级作业有**就绪**排队任务、且 worker
@@ -5379,32 +5235,12 @@ impl Db {
             return Ok(0);
         }
         let mut tx = self.pool.begin().await?;
-        let running: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks WHERE state = 'running'")
-                .fetch_one(&mut *tx)
-                .await?;
-        if running < capacity as i64 {
-            tx.commit().await?;
-            return Ok(0);
-        }
-        let n = sqlx::query(
-            "UPDATE jobs SET state = 'preempted', updated_at = ? \
-             WHERE state = 'running' \
-             AND EXISTS (SELECT 1 FROM job_tasks WHERE job_id = jobs.id AND state = 'queued') \
-             AND EXISTS ( \
-               SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
-               WHERE h.state IN ('queued','running') \
-                 AND h.priority > jobs.priority \
-                 AND h.requested_by IS jobs.requested_by \
-                 AND t.state = 'queued' AND t.next_at <= ?)",
-        )
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let n = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .preempt_lower_priority(capacity, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
-        Ok(n as usize)
+        Ok(n)
     }
 
     /// 释放抢占：同一 `requested_by` 内高等优先级的**就绪**排队任务已清空（都已领取
@@ -5412,21 +5248,13 @@ impl Db {
     /// 返回释放数。正在运行的高优先级任务不阻塞释放——空闲容量应回到低优先级作业，
     /// 领取顺序仍保证后续高优先级任务先被取走。
     pub async fn release_preempted(&self, now: i64) -> Result<usize> {
-        let n = sqlx::query(
-            "UPDATE jobs SET state = 'queued', updated_at = ? \
-             WHERE state = 'preempted' AND NOT EXISTS ( \
-               SELECT 1 FROM jobs h JOIN job_tasks t ON t.job_id = h.id \
-               WHERE h.id != jobs.id AND h.priority > jobs.priority \
-                 AND h.requested_by IS jobs.requested_by \
-                 AND h.state IN ('queued','running') \
-                 AND t.state = 'queued' AND t.next_at <= ?)",
-        )
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(n as usize)
+        let mut tx = self.pool.begin().await?;
+        let n = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .release_preempted(now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// 任务终态/重试。成功 → done；失败未达上限 → queued（指数退避）；达上限 → failed。
@@ -5489,113 +5317,21 @@ impl Db {
         fence: FencingEpoch,
     ) -> Result<&'static str> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT state, attempt, fence_term FROM job_tasks WHERE job_id = ? AND task_no = ?",
-        )
-        .bind(job_id)
-        .bind(task_no)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(r) = row else {
-            tx.commit().await?;
-            return Ok("missing");
-        };
-        if r.get::<String, _>("state") != "running" {
-            tx.commit().await?;
-            return Ok("not-running");
-        }
-        if r.get::<i64, _>("fence_term") > fence.term_i64() {
-            tx.commit().await?;
-            return Ok("fenced");
-        }
-        let attempt: i64 = r.get("attempt");
-        if ok {
-            // C7：终态清空 dedupe_key（成功后同键可再次入队）。
-            sqlx::query(
-                "UPDATE job_tasks SET state = 'done', result_code = ?, result_string = ?, \
-                 finished_at = ?, dedupe_key = NULL \
-                 WHERE job_id = ? AND task_no = ? AND fence_term <= ?",
+        let out = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .finish_task(
+                job_id,
+                task_no,
+                ok,
+                code,
+                message,
+                now,
+                max_attempts,
+                fence.term_i64(),
             )
-            .bind(code)
-            .bind(message)
-            .bind(now)
-            .bind(job_id)
-            .bind(task_no)
-            .bind(fence.term_i64())
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE jobs SET succeeded = succeeded + 1, progress = progress + 1, updated_at = ? \
-                 WHERE id = ?",
-            )
-            .bind(now)
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?;
-        } else if attempt + 1 < max_attempts {
-            let backoff = Self::retry_backoff_secs(attempt, now, job_id, task_no);
-            sqlx::query(
-                "UPDATE job_tasks SET state = 'queued', attempt = attempt + 1, next_at = ?, \
-                 result_code = ?, result_string = ?, started_at = NULL, deadline_at = NULL \
-                 WHERE job_id = ? AND task_no = ? AND fence_term <= ?",
-            )
-            .bind(now + backoff)
-            .bind(code)
-            .bind(message)
-            .bind(job_id)
-            .bind(task_no)
-            .bind(fence.term_i64())
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("UPDATE jobs SET updated_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(job_id)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            sqlx::query(
-                "UPDATE job_tasks SET state = 'failed', attempt = attempt + 1, \
-                 result_code = 'PermanentFailure', result_string = ?, finished_at = ?, \
-                 dedupe_key = NULL WHERE job_id = ? AND task_no = ? AND fence_term <= ?",
-            )
-            .bind(message)
-            .bind(now)
-            .bind(job_id)
-            .bind(task_no)
-            .bind(fence.term_i64())
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE jobs SET failed = failed + 1, progress = progress + 1, updated_at = ? \
-                 WHERE id = ?",
-            )
-            .bind(now)
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        // 作业收敛：仍 running/preempted 且无未终态任务 → done（无 failed）/error。
-        // preempted 也要收敛：被抢占时在途动作完成后可能已无剩余任务。
-        sqlx::query(
-            "UPDATE jobs SET state = CASE WHEN failed > 0 THEN 'error' ELSE 'done' END, \
-             finished_at = ?, updated_at = ? \
-             WHERE id = ? AND state IN ('running','preempted') AND NOT EXISTS \
-             (SELECT 1 FROM job_tasks WHERE job_id = ? AND state IN ('queued','running'))",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(job_id)
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await?;
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
-        Ok(if ok {
-            "done"
-        } else if attempt + 1 < max_attempts {
-            "queued"
-        } else {
-            "failed"
-        })
+        Ok(out)
     }
 
     /// 超时回收：running 且 deadline 过期 → 按一次失败处理。返回回收条数。
@@ -5606,21 +5342,17 @@ impl Db {
         max_attempts: i64,
         fence: FencingEpoch,
     ) -> Result<usize> {
-        let rows = sqlx::query(
-            "SELECT job_id, task_no FROM job_tasks \
-             WHERE state = 'running' AND deadline_at IS NOT NULL AND deadline_at < ? \
-               AND fence_term <= ?",
-        )
-        .bind(now)
-        .bind(fence.term_i64())
-        .fetch_all(&self.pool)
-        .await?;
-        for r in &rows {
-            self.take_over_task(r.get("job_id"), r.get("task_no"), None, now, fence)
+        let rows = self
+            .control_store()
+            .recover_expired_task_ids(now, fence.term_i64())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        for (job_id, task_no) in &rows {
+            self.take_over_task(*job_id, *task_no, None, now, fence)
                 .await?;
             self.finish_task_fenced(
-                r.get("job_id"),
-                r.get("task_no"),
+                *job_id,
+                *task_no,
                 false,
                 "Timeout",
                 Some("task deadline exceeded"),
@@ -5643,24 +5375,19 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
-        let deadline_cond = if started_before.is_some() {
-            "started_at IS NOT NULL AND started_at < ?"
-        } else {
-            "deadline_at IS NOT NULL AND deadline_at < ?"
-        };
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE job_tasks SET fence_term = ?, fence_leader = ? \
-             WHERE job_id = ? AND task_no = ? AND state = 'running' AND {deadline_cond} \
-               AND fence_term <= ?"
-        )))
-        .bind(fence.term_i64())
-        .bind(fence.leader_i64())
-        .bind(job_id)
-        .bind(task_no)
-        .bind(started_before.unwrap_or(now))
-        .bind(fence.term_i64())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .take_over_task(
+                job_id,
+                task_no,
+                started_before,
+                now,
+                fence.term_i64(),
+                fence.leader_i64(),
+            )
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5668,29 +5395,23 @@ impl Db {
     /// lifecycle/inventory 等单条作业只写 jobs 行；进程在 job_start 之后崩溃会永久停在
     /// running。`cutoff` 限定 updated_at（长作业靠心跳续命，避免把仍在跑的扫描误标 error）。
     pub async fn recover_orphan_jobs(&self, cutoff: i64, now: i64) -> Result<usize> {
-        let n = sqlx::query(
-            "UPDATE jobs SET state = 'error', \
-             error = COALESCE(error, '进程崩溃遗留的 running 作业，已自动回收'), \
-             finished_at = ?, updated_at = ? \
-             WHERE state = 'running' AND updated_at <= ? \
-             AND NOT EXISTS (SELECT 1 FROM job_tasks WHERE job_tasks.job_id = jobs.id)",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(n as usize)
+        let mut tx = self.pool.begin().await?;
+        let n = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .recover_orphan_jobs(cutoff, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// M2：长作业心跳（只续 running 行），让 orphan 回收按 liveness 而非创建时间判断。
     pub async fn job_heartbeat(&self, job_id: i64, now: i64) -> Result<()> {
-        sqlx::query("UPDATE jobs SET updated_at = ? WHERE id = ? AND state = 'running'")
-            .bind(now)
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_heartbeat(job_id, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5702,22 +5423,18 @@ impl Db {
         max_attempts: i64,
         fence: FencingEpoch,
     ) -> Result<usize> {
-        let rows = sqlx::query(
-            "SELECT job_id, task_no FROM job_tasks \
-             WHERE state = 'running' AND started_at IS NOT NULL AND started_at < ? \
-               AND fence_term <= ?",
-        )
-        .bind(cutoff)
-        .bind(fence.term_i64())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .control_store()
+            .recover_stale_task_ids(cutoff, fence.term_i64())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         let now = crate::db::now();
-        for r in &rows {
-            self.take_over_task(r.get("job_id"), r.get("task_no"), Some(cutoff), now, fence)
+        for (job_id, task_no) in &rows {
+            self.take_over_task(*job_id, *task_no, Some(cutoff), now, fence)
                 .await?;
             self.finish_task_fenced(
-                r.get("job_id"),
-                r.get("task_no"),
+                *job_id,
+                *task_no,
                 false,
                 "Timeout",
                 Some("process restart recovery"),
@@ -5732,58 +5449,56 @@ impl Db {
 
     /// 作业详情（None = 不存在）。
     pub async fn job_get(&self, id: i64) -> Result<Option<serde_json::Value>> {
-        let row = sqlx::query(
-            "SELECT id, kind, bucket, prefix, state, spec_json, progress, total, succeeded, \
-             failed, report_bucket, report_prefix, priority, requested_by, parent_job_id, \
-             error, created_at, started_at, finished_at, updated_at FROM jobs WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| {
+        let row = self
+            .control_store()
+            .job(id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        Ok(row.map(|j| {
             serde_json::json!({
-                "id": r.get::<i64, _>("id"),
-                "kind": r.get::<String, _>("kind"),
-                "bucket": r.get::<String, _>("bucket"),
-                "prefix": r.get::<String, _>("prefix"),
-                "state": r.get::<String, _>("state"),
-                "spec_json": r.get::<Option<String>, _>("spec_json"),
-                "progress": r.get::<i64, _>("progress"),
-                "total": r.get::<i64, _>("total"),
-                "succeeded": r.get::<i64, _>("succeeded"),
-                "failed": r.get::<i64, _>("failed"),
-                "report_bucket": r.get::<Option<String>, _>("report_bucket"),
-                "report_prefix": r.get::<Option<String>, _>("report_prefix"),
-                "priority": r.get::<i64, _>("priority"),
-                "requested_by": r.get::<Option<i64>, _>("requested_by"),
-                "parent_job_id": r.get::<Option<i64>, _>("parent_job_id"),
-                "error": r.get::<Option<String>, _>("error"),
-                "created_at": r.get::<i64, _>("created_at"),
-                "started_at": r.get::<Option<i64>, _>("started_at"),
-                "finished_at": r.get::<Option<i64>, _>("finished_at"),
-                "updated_at": r.get::<i64, _>("updated_at"),
+                "id": j.id,
+                "kind": j.kind,
+                "bucket": j.bucket,
+                "prefix": j.prefix,
+                "state": j.state,
+                "spec_json": j.spec_json,
+                "progress": j.progress,
+                "total": j.total,
+                "succeeded": j.succeeded,
+                "failed": j.failed,
+                "report_bucket": j.report_bucket,
+                "report_prefix": j.report_prefix,
+                "priority": j.priority,
+                "requested_by": j.requested_by,
+                "parent_job_id": j.parent_job_id,
+                "error": j.error,
+                "created_at": j.created_at,
+                "started_at": j.started_at,
+                "finished_at": j.finished_at,
+                "updated_at": j.updated_at,
             })
         }))
     }
 
     /// 作业级错误文案（报告写失败等；不改任务终态）。
     pub async fn job_set_error(&self, id: i64, msg: &str, now: i64) -> Result<()> {
-        sqlx::query("UPDATE jobs SET error = ?, updated_at = ? WHERE id = ?")
-            .bind(msg)
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_set_error(id, msg, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// 作业归属/状态（API 判权用）。
     pub async fn job_owner(&self, id: i64) -> Result<Option<(Option<i64>, String)>> {
-        let row = sqlx::query("SELECT requested_by, state FROM jobs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| (r.get("requested_by"), r.get("state"))))
+        Ok(self
+            .control_store()
+            .job(id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|j| (j.requested_by, j.state)))
     }
 
     /// 任务分页（task_no 升序）。
@@ -5793,29 +5508,24 @@ impl Db {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query(
-            "SELECT task_no, action, state, attempt, next_at, result_code, result_string, \
-             started_at, finished_at FROM job_tasks WHERE job_id = ? \
-             ORDER BY task_no LIMIT ? OFFSET ?",
-        )
-        .bind(id)
-        .bind(limit.clamp(1, 500))
-        .bind(offset.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .control_store()
+            .job_tasks_page(id, offset.max(0), limit.clamp(1, 500))
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(rows
             .iter()
-            .map(|r| {
+            .map(|t| {
                 serde_json::json!({
-                    "task_no": r.get::<i64, _>("task_no"),
-                    "action": r.get::<String, _>("action"),
-                    "state": r.get::<String, _>("state"),
-                    "attempt": r.get::<i64, _>("attempt"),
-                    "next_at": r.get::<i64, _>("next_at"),
-                    "result_code": r.get::<Option<String>, _>("result_code"),
-                    "result_string": r.get::<Option<String>, _>("result_string"),
-                    "started_at": r.get::<Option<i64>, _>("started_at"),
-                    "finished_at": r.get::<Option<i64>, _>("finished_at"),
+                    "task_no": t.task_no,
+                    "action": t.action,
+                    "state": t.state,
+                    "attempt": t.attempt,
+                    "next_at": t.next_at,
+                    "result_code": t.result_code,
+                    "result_string": t.result_string,
+                    "started_at": t.started_at,
+                    "finished_at": t.finished_at,
                 })
             })
             .collect())
@@ -5824,134 +5534,43 @@ impl Db {
     /// 状态操作：`pause`/`resume`/`cancel`。返回是否有行被改（false = 不存在或状态不允许）。
     pub async fn job_set_state(&self, id: i64, action: &str, now: i64) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let n = match action {
-            "pause" => sqlx::query(
-                "UPDATE jobs SET state = 'paused', updated_at = ? \
-                 WHERE id = ? AND state IN ('running','preempted')",
-            )
-            .bind(now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected(),
-            "resume" => sqlx::query(
-                "UPDATE jobs SET state = 'running', updated_at = ? WHERE id = ? AND state = 'paused'",
-            )
-            .bind(now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected(),
-            "cancel" => {
-                let n = sqlx::query(
-                    "UPDATE jobs SET state = 'cancelled', updated_at = ? \
-                     WHERE id = ? AND state IN ('queued','running','paused','preempted')",
-                )
-                .bind(now)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-                if n > 0 {
-                    sqlx::query(
-                        "UPDATE job_tasks SET state = 'cancelled', finished_at = ? \
-                         WHERE job_id = ? AND state = 'queued'",
-                    )
-                    .bind(now)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                n
-            }
-            _ => 0,
-        };
+        let hit = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_set_state(id, action, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
-        Ok(n > 0)
+        Ok(hit)
     }
 
     /// 失败任务重试：建子作业（只含 failed 任务，原 task_no 保留为顺序），返回新 job id。
     pub async fn job_retry_failed(&self, id: i64, now: i64) -> Result<Option<i64>> {
         let mut tx = self.pool.begin().await?;
-        let job = sqlx::query(
-            "SELECT kind, bucket, prefix, priority, requested_by, report_bucket, report_prefix, spec_json \
-             FROM jobs WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(j) = job else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let tasks = sqlx::query(
-            "SELECT action, payload_json FROM job_tasks WHERE job_id = ? AND state = 'failed' \
-             ORDER BY task_no",
-        )
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
-        if tasks.is_empty() {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        let new_id = sqlx::query(
-            "INSERT INTO jobs (kind, bucket, prefix, state, total, priority, requested_by, \
-             parent_job_id, report_bucket, report_prefix, spec_json, created_at, updated_at) \
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(j.get::<String, _>("kind"))
-        .bind(j.get::<String, _>("bucket"))
-        .bind(j.get::<String, _>("prefix"))
-        .bind(tasks.len() as i64)
-        .bind(j.get::<i64, _>("priority"))
-        .bind(j.get::<Option<i64>, _>("requested_by"))
-        .bind(id)
-        .bind(j.get::<Option<String>, _>("report_bucket"))
-        .bind(j.get::<Option<String>, _>("report_prefix"))
-        .bind(j.get::<Option<String>, _>("spec_json"))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-        for (i, t) in tasks.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO job_tasks (job_id, task_no, action, payload_json, state, next_at) \
-                 VALUES (?, ?, ?, ?, 'queued', ?)",
-            )
-            .bind(new_id)
-            .bind(i as i64 + 1)
-            .bind(t.get::<String, _>("action"))
-            .bind(t.get::<String, _>("payload_json"))
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
+        let new_id = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_retry_failed(id, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
-        Ok(Some(new_id))
+        Ok(new_id)
     }
 
     /// 报告行（含 `payload_json`）：S3 Batch 报告需要从载荷回读 bucket/key/versionId。
     /// 与 [`Self::job_tasks`] 分列——控制台分页不暴露内部载荷。
     pub async fn job_report_rows(&self, id: i64) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query(
-            "SELECT task_no, payload_json, result_code, result_string, started_at, finished_at \
-             FROM job_tasks WHERE job_id = ? ORDER BY task_no",
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .control_store()
+            .job_tasks(id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(rows
             .iter()
-            .map(|r| {
+            .map(|t| {
                 serde_json::json!({
-                    "task_no": r.get::<i64, _>("task_no"),
-                    "payload_json": r.get::<String, _>("payload_json"),
-                    "result_code": r.get::<Option<String>, _>("result_code"),
-                    "result_string": r.get::<Option<String>, _>("result_string"),
-                    "started_at": r.get::<Option<i64>, _>("started_at"),
-                    "finished_at": r.get::<Option<i64>, _>("finished_at"),
+                    "task_no": t.task_no,
+                    "payload_json": t.payload_json,
+                    "result_code": t.result_code,
+                    "result_string": t.result_string,
+                    "started_at": t.started_at,
+                    "finished_at": t.finished_at,
                 })
             })
             .collect())
@@ -5960,14 +5579,10 @@ impl Db {
     /// 作业历史保留（feature 6）：`cutoff` 之前进入终态、按 id 升序的作业 id（最多
     /// `limit` 条）。只返回终态，调用方无需再筛 queued/running/preempted。
     pub async fn terminal_jobs_before(&self, cutoff: i64, limit: i64) -> Result<Vec<i64>> {
-        sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE state IN ('done','error','cancelled') \
-             AND updated_at < ? ORDER BY id LIMIT ?",
-        )
-        .bind(cutoff)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
+        self.control_store()
+            .terminal_jobs_before(cutoff, limit)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 单机保留清理：一个事务内删除终态作业历史，返回删除的 jobs 行数。
@@ -5989,52 +5604,10 @@ impl Db {
         cw: &mut ControlWrite<'_>,
         ids: &[i64],
     ) -> Result<(u64, usize)> {
-        let mut q = Self::id_list_query("SELECT id, state FROM jobs WHERE id IN (", ids);
-        let rows: Vec<(i64, String)> = q.build_query_as().fetch_all(&mut *cw.conn()).await?;
-        let mut terminal: Vec<i64> = rows
-            .iter()
-            .filter(|(_, state)| matches!(state.as_str(), "done" | "error" | "cancelled"))
-            .map(|(id, _)| *id)
-            .collect();
-        terminal.sort_unstable();
-        let non_terminal = rows.len() - terminal.len();
-        if terminal.is_empty() {
-            return Ok((0, non_terminal));
-        }
-        // audit-allow: decision 8 — jobs slice owns purge FK nulling for runs/restores.
-        for prefix in [
-            "UPDATE inventory_runs SET job_id = NULL WHERE job_id IN (",
-            "UPDATE tier_restores SET job_id = NULL WHERE job_id IN (",
-            "UPDATE jobs SET parent_job_id = NULL WHERE parent_job_id IN (",
-            "DELETE FROM job_tasks WHERE job_id IN (",
-        ] {
-            Self::id_list_query(prefix, &terminal)
-                .build()
-                .execute(&mut *cw.conn())
-                .await?;
-        }
-        let deleted = Self::id_list_query(
-            "DELETE FROM jobs WHERE state IN ('done','error','cancelled') AND id IN (",
-            &terminal,
-        )
-        .build()
-        .execute(&mut *cw.conn())
-        .await?
-        .rows_affected();
-        Ok((deleted, non_terminal))
-    }
-
-    /// `prefix ?, ?, ... )`：占位符数 = `ids.len()`（调用方保证非空）。
-    fn id_list_query(prefix: &str, ids: &[i64]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
-        let mut qb = sqlx::QueryBuilder::new(prefix.to_string());
-        {
-            let mut sep = qb.separated(", ");
-            for id in ids {
-                sep.push_bind(*id);
-            }
-        }
-        qb.push(")");
-        qb
+        crate::control_store::SqliteControlTxn::new(cw.conn())
+            .purge_terminal_jobs(ids)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     // ——— M8 S5：Inventory 配置与运行行 ———
@@ -6304,12 +5877,12 @@ impl Db {
 
     /// Inventory 作业的 `progress` = 已扫描对象数（任务收尾时引擎会 +1，调用方存 n-1）。
     pub async fn job_set_progress(&self, job_id: i64, progress: i64, now: i64) -> Result<()> {
-        sqlx::query("UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?")
-            .bind(progress)
-            .bind(now)
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .job_set_progress(job_id, progress, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        tx.commit().await?;
         Ok(())
     }
 

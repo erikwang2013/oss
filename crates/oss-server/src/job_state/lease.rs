@@ -9,7 +9,7 @@
 use super::*;
 use crate::raft::LeaderGate;
 use crate::raft::apply::lease::lease_row_ok;
-use crate::raft::runstate::{ScheduleLeaseRow, lease_row_from};
+use crate::raft::runstate::ScheduleLeaseRow;
 
 const LEASE_SECS_DEFAULT: i64 = 30;
 
@@ -24,13 +24,7 @@ pub fn schedule_lease_ttl() -> i64 {
 
 impl JobState {
     async fn read_schedule_lease(db: &Db) -> Result<Option<ScheduleLeaseRow>, String> {
-        let row = sqlx::query(
-            "SELECT term, node, expires_at, acquired_at FROM schedule_lease WHERE singleton = 1",
-        )
-        .fetch_optional(db.pool())
-        .await
-        .map_err(err)?;
-        Ok(row.as_ref().map(lease_row_from))
+        db.control_store().schedule_lease().await.map_err(err)
     }
 
     /// 调度放行 token：`None` = 现在不应调度（非 leader / 等待旧租约过期 / 生效级别不足）。

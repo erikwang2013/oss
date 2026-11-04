@@ -7,7 +7,8 @@
 
 use super::{ControlWrite, invariant};
 use crate::raft::command::ControlResponse;
-use crate::raft::runstate::{ScheduleLeaseRow, lease_row_from};
+use crate::raft::runstate::ScheduleLeaseRow;
+use xl_store::control_store::jobs::JobTxn;
 
 /// 当前行 + 日志行的确定性校验；逐字段相同的重复 apply 是 no-op。
 pub(crate) fn lease_row_ok(
@@ -62,28 +63,17 @@ pub(crate) fn lease_row_ok(
 }
 
 async fn current(cw: &mut ControlWrite<'_>) -> Result<Option<ScheduleLeaseRow>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT term, node, expires_at, acquired_at FROM schedule_lease WHERE singleton = 1",
-    )
-    .fetch_optional(&mut *cw.conn)
-    .await?;
-    Ok(row.as_ref().map(lease_row_from))
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .schedule_lease()
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn upsert(cw: &mut ControlWrite<'_>, lease: &ScheduleLeaseRow) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO schedule_lease (singleton, term, node, expires_at, acquired_at) \
-         VALUES (1, ?, ?, ?, ?) \
-         ON CONFLICT(singleton) DO UPDATE SET term = excluded.term, node = excluded.node, \
-          expires_at = excluded.expires_at, acquired_at = excluded.acquired_at",
-    )
-    .bind(lease.term)
-    .bind(lease.node)
-    .bind(lease.expires_at)
-    .bind(lease.acquired_at)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(result.rows_affected())
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .schedule_lease_upsert(lease)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 只读预检 → 整行 upsert。预检失败 = 零写入的 `Conflict`。

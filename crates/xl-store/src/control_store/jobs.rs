@@ -106,11 +106,8 @@ pub struct JobClaim {
 #[async_trait::async_trait]
 pub trait JobStore: Send + Sync {
     async fn job(&self, id: i64) -> Result<Option<JobRow>, ControlError>;
-    async fn job_task(
-        &self,
-        job_id: i64,
-        task_no: i64,
-    ) -> Result<Option<JobTaskRow>, ControlError>;
+    async fn job_task(&self, job_id: i64, task_no: i64)
+    -> Result<Option<JobTaskRow>, ControlError>;
     /// 整作业任务，`task_no` 升序。
     async fn job_tasks(&self, job_id: i64) -> Result<Vec<JobTaskRow>, ControlError>;
     async fn failed_job_tasks(&self, job_id: i64) -> Result<Vec<JobTaskRow>, ControlError>;
@@ -141,11 +138,8 @@ pub trait JobStore: Send + Sync {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<JobTaskRow>, ControlError>;
-    async fn terminal_jobs_before(
-        &self,
-        cutoff: i64,
-        limit: i64,
-    ) -> Result<Vec<i64>, ControlError>;
+    async fn terminal_jobs_before(&self, cutoff: i64, limit: i64)
+    -> Result<Vec<i64>, ControlError>;
     async fn dedupe_keys(&self) -> Result<Vec<String>, ControlError>;
     async fn dedupe_taken(
         &self,
@@ -154,7 +148,7 @@ pub trait JobStore: Send + Sync {
         task_no: i64,
     ) -> Result<bool, ControlError>;
     async fn schedule_lease(&self) -> Result<Option<ScheduleLeaseRow>, ControlError>;
-    async fn runstate_meta(&self, key: &str) -> Result<Option<String>, ControlError>;
+    async fn runstate_meta(&self, key: &str) -> Result<Option<i64>, ControlError>;
     async fn max_job_id(&self) -> Result<i64, ControlError>;
     /// `next_run_id` 分配器的行上限（决策 8：本切片收口 allocator 的跨域读）。
     async fn max_inventory_run_id(&self) -> Result<i64, ControlError>;
@@ -199,6 +193,7 @@ pub trait JobTxn: Send {
         prefix: &str,
         now: i64,
     ) -> Result<i64, ControlError>;
+    #[allow(clippy::too_many_arguments)]
     async fn job_finish(
         &mut self,
         id: i64,
@@ -216,11 +211,7 @@ pub trait JobTxn: Send {
         now: i64,
     ) -> Result<(), ControlError>;
     /// 建子作业（只含 failed 任务）；无父作业/无失败任务 → `Ok(None)`。
-    async fn job_retry_failed(
-        &mut self,
-        id: i64,
-        now: i64,
-    ) -> Result<Option<i64>, ControlError>;
+    async fn job_retry_failed(&mut self, id: i64, now: i64) -> Result<Option<i64>, ControlError>;
     /// 原子领取一条任务（调用方已 `BEGIN IMMEDIATE`）：提升 queued 作业，再按优先级取任务。
     async fn job_claim(
         &mut self,
@@ -271,15 +262,9 @@ pub trait JobTxn: Send {
         fence_term: i64,
         fence_leader: i64,
     ) -> Result<(), ControlError>;
-    async fn recover_orphan_jobs(&mut self, cutoff: i64, now: i64)
-    -> Result<usize, ControlError>;
+    async fn recover_orphan_jobs(&mut self, cutoff: i64, now: i64) -> Result<usize, ControlError>;
     async fn job_heartbeat(&mut self, id: i64, now: i64) -> Result<(), ControlError>;
-    async fn job_set_error(
-        &mut self,
-        id: i64,
-        msg: &str,
-        now: i64,
-    ) -> Result<(), ControlError>;
+    async fn job_set_error(&mut self, id: i64, msg: &str, now: i64) -> Result<(), ControlError>;
     async fn job_set_state(
         &mut self,
         id: i64,
@@ -304,10 +289,7 @@ pub trait JobTxn: Send {
     ) -> Result<bool, ControlError>;
     /// 删除终态 jobs + tasks，并解除 inventory_runs/tier_restores/parent 引用。
     /// 返回 (删除行数, 存在但非终态的 id 数)。
-    async fn purge_terminal_jobs(
-        &mut self,
-        ids: &[i64],
-    ) -> Result<(u64, usize), ControlError>;
+    async fn purge_terminal_jobs(&mut self, ids: &[i64]) -> Result<(u64, usize), ControlError>;
     async fn schedule_lease_upsert(
         &mut self,
         lease: &ScheduleLeaseRow,
@@ -328,14 +310,12 @@ pub trait JobSnapshotTxn: Send {
     async fn runstate_job_tasks(&mut self) -> Result<Vec<JobTaskRow>, ControlError>;
     async fn insert_jobs(&mut self, rows: &[JobRow]) -> Result<(), ControlError>;
     async fn insert_job_tasks(&mut self, rows: &[JobTaskRow]) -> Result<(), ControlError>;
-    async fn snapshot_schedule_lease(
-        &mut self,
-    ) -> Result<Option<ScheduleLeaseRow>, ControlError>;
+    async fn snapshot_schedule_lease(&mut self) -> Result<Option<ScheduleLeaseRow>, ControlError>;
     async fn insert_schedule_lease(
         &mut self,
         lease: Option<&ScheduleLeaseRow>,
     ) -> Result<(), ControlError>;
-    async fn snapshot_runstate_meta(&mut self, key: &str) -> Result<Option<String>, ControlError>;
+    async fn snapshot_runstate_meta(&mut self, key: &str) -> Result<Option<i64>, ControlError>;
     async fn insert_runstate_meta(&mut self, key: &str, value: i64) -> Result<(), ControlError>;
 }
 
