@@ -17,7 +17,7 @@ pub use bucket::{BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRu
 pub use inventory::InventoryConfigEntry;
 pub use lifecycle::LifecycleRuleEntry;
 
-use bucket::BucketStore;
+use bucket::{BucketStore, BucketTxn};
 use inventory::{InventoryStore, InventoryTxn};
 use lifecycle::{LifecycleStore, LifecycleTxn};
 use tier::{TierStore, TierTxn};
@@ -107,7 +107,7 @@ pub trait ControlStore:
 
 /// 调用方事务内的写访问。`&mut self` 表示独占借用，不提供 begin/commit/rollback。
 #[async_trait::async_trait]
-pub trait ControlTxn: LifecycleTxn + InventoryTxn + TierTxn + Send {
+pub trait ControlTxn: BucketTxn + LifecycleTxn + InventoryTxn + TierTxn + Send {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError>;
     async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError>;
     /// 返回是否确有行被删除。

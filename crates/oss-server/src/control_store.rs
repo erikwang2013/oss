@@ -5,7 +5,8 @@
 
 use sqlx::{Row, SqlitePool};
 use xl_store::control_store::bucket::{
-    BucketPolicyEntry, BucketStore, BucketView, EventConfigEntry, ReplicationRuleEntry,
+    BucketCreateOutcome, BucketEntry, BucketPolicyEntry, BucketStore, BucketTxn, BucketView,
+    EventConfigEntry, ReplicationRuleEntry,
 };
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
@@ -21,6 +22,7 @@ use xl_store::control_store::{
 
 mod ap_olap;
 mod bucket;
+mod bucket_write;
 mod inventory;
 mod lifecycle;
 mod tier;
@@ -733,5 +735,105 @@ impl TierTxn for SqliteControlTxn<'_> {
             fence_leader,
         )
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl BucketTxn for SqliteControlTxn<'_> {
+    async fn bucket_create(
+        &mut self,
+        row: &BucketEntry,
+    ) -> Result<BucketCreateOutcome, ControlError> {
+        bucket_write::bucket_create(self, row).await
+    }
+
+    async fn bucket_delete(&mut self, name: &str) -> Result<bool, ControlError> {
+        bucket_write::bucket_delete(self, name).await
+    }
+
+    async fn bucket_set_deleting(
+        &mut self,
+        name: &str,
+        deleting: bool,
+    ) -> Result<bool, ControlError> {
+        bucket_write::bucket_set_deleting(self, name, deleting).await
+    }
+
+    async fn bucket_set_versioning(
+        &mut self,
+        name: &str,
+        versioning: &str,
+    ) -> Result<bool, ControlError> {
+        bucket_write::bucket_set_versioning(self, name, versioning).await
+    }
+
+    async fn bucket_set_object_lock(
+        &mut self,
+        name: &str,
+        object_lock: bool,
+        default_mode: Option<&str>,
+        default_days: Option<i64>,
+    ) -> Result<bool, ControlError> {
+        bucket_write::bucket_set_object_lock(self, name, object_lock, default_mode, default_days)
+            .await
+    }
+
+    async fn bucket_set_default_encryption(
+        &mut self,
+        name: &str,
+        algorithm: &str,
+    ) -> Result<bool, ControlError> {
+        bucket_write::bucket_set_default_encryption(self, name, algorithm).await
+    }
+
+    async fn bucket_clear_default_encryption(&mut self, name: &str) -> Result<bool, ControlError> {
+        bucket_write::bucket_clear_default_encryption(self, name).await
+    }
+
+    async fn bucket_policy_set(
+        &mut self,
+        bucket: &str,
+        policy_json: &str,
+        updated_at: i64,
+    ) -> Result<(), ControlError> {
+        bucket_write::bucket_policy_set(self, bucket, policy_json, updated_at).await
+    }
+
+    async fn bucket_policy_delete(&mut self, bucket: &str) -> Result<(), ControlError> {
+        bucket_write::bucket_policy_delete(self, bucket).await
+    }
+
+    async fn bucket_notification_set(
+        &mut self,
+        bucket: &str,
+        config_json: &str,
+        updated_at: i64,
+    ) -> Result<(), ControlError> {
+        bucket_write::bucket_notification_set(self, bucket, config_json, updated_at).await
+    }
+
+    async fn bucket_notification_delete(&mut self, bucket: &str) -> Result<(), ControlError> {
+        bucket_write::bucket_notification_delete(self, bucket).await
+    }
+
+    async fn bucket_replication_rules_set(
+        &mut self,
+        bucket: &str,
+        rules_json: &str,
+        updated_at: i64,
+    ) -> Result<(), ControlError> {
+        bucket_write::bucket_replication_rules_set(self, bucket, rules_json, updated_at).await
+    }
+
+    async fn bucket_replication_rules_delete(&mut self, bucket: &str) -> Result<(), ControlError> {
+        bucket_write::bucket_replication_rules_delete(self, bucket).await
+    }
+
+    async fn bucket_exists(&mut self, name: &str) -> Result<bool, ControlError> {
+        bucket_write::bucket_exists(self, name).await
+    }
+
+    async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
+        bucket_write::delete_bucket_configs_for_bucket(self, bucket).await
     }
 }

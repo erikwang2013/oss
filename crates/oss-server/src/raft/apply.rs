@@ -9,6 +9,7 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
+use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry, BucketTxn};
 use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryTxn};
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::tier::TierTxn;
@@ -25,7 +26,7 @@ use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
 use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
-use crate::db::{CreateBucketOutcome, Db, LifecycleRuleRow, PermissionRow};
+use crate::db::{Db, LifecycleRuleRow, PermissionRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
 pub(crate) struct ControlWrite<'a> {
@@ -115,12 +116,6 @@ async fn uid(cw: &mut ControlWrite<'_>, username: &str) -> Result<Option<i64>, s
         .await
 }
 
-async fn admin_id(cw: &mut ControlWrite<'_>) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-        .fetch_optional(&mut *cw.conn)
-        .await
-}
-
 /// M1：管理员用户/AK 是站点本地状态，IAM 命令不得复制它们（S6b 处理器留本地）。
 async fn username_is_admin(cw: &mut ControlWrite<'_>, username: &str) -> Result<bool, sqlx::Error> {
     let row: Option<i64> =
@@ -146,30 +141,10 @@ async fn access_key_owner_is_admin(
 }
 
 async fn bucket_exists(cw: &mut ControlWrite<'_>, bucket: &str) -> Result<bool, sqlx::Error> {
-    let row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
-        .bind(bucket)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(row.is_some())
-}
-
-/// buckets.owner_id：`None`/管理员/无本地管理员（witness）→ NULL；普通 username → 本地 id。
-async fn bucket_owner_id(
-    cw: &mut ControlWrite<'_>,
-    owner: &Option<String>,
-) -> Result<Option<i64>, sqlx::Error> {
-    let Some(username) = owner else {
-        return Ok(None);
-    };
-    if let Some(id) = uid(cw, username).await? {
-        return Ok(Some(id));
-    }
-    if admin_id(cw).await?.is_some() {
-        // 有序命令流里普通用户必已先建；缺失 = 不变量破坏 → fail-stop。
-        return Err(invariant(format!("bucket owner user {username} not found")));
-    }
-    // witness / 本地管理员尚未 bootstrap：管理员属主占位 NULL（启动修复再收敛）。
-    Ok(None)
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .bucket_exists(bucket)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 fn permissions_rows(bits: &[PermissionBits]) -> Vec<PermissionRow> {
@@ -420,23 +395,29 @@ pub(crate) async fn apply_command(
             {
                 ControlResponse::Invalid
             } else {
-                let owner_id = bucket_owner_id(cw, owner).await?;
-                match Db::create_bucket_tx(
-                    cw,
-                    name,
-                    owner_id,
-                    *created_at,
-                    replication_mode,
-                    versioning,
-                    *object_lock,
-                    object_lock_default_mode.as_deref(),
-                    *object_lock_default_days,
-                    default_encryption.as_deref(),
-                )
-                .await?
+                let owner = match owner {
+                    None => OwnerRef::Admin,
+                    Some(name) => OwnerRef::User(name.clone()),
+                };
+                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                match txn
+                    .bucket_create(&BucketEntry {
+                        name: name.clone(),
+                        owner,
+                        creation_date: *created_at,
+                        versioning: versioning.clone(),
+                        object_lock: *object_lock,
+                        default_encryption: default_encryption.clone(),
+                        object_lock_default_mode: object_lock_default_mode.clone(),
+                        object_lock_default_days: *object_lock_default_days,
+                        replication_mode: replication_mode.clone(),
+                        deleting: false,
+                    })
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?
                 {
-                    CreateBucketOutcome::ModeConflict => ControlResponse::Conflict,
-                    CreateBucketOutcome::Created | CreateBucketOutcome::Updated => {
+                    BucketCreateOutcome::ModeConflict => ControlResponse::Conflict,
+                    BucketCreateOutcome::Created | BucketCreateOutcome::Updated => {
                         ControlResponse::Ok
                     }
                 }
@@ -450,7 +431,11 @@ pub(crate) async fn apply_command(
             }
         }
         ControlCommand::BucketSetDeleting { name, deleting } => {
-            if Db::set_bucket_deleting_raw(cw, name, *deleting).await? {
+            if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .bucket_set_deleting(name, *deleting)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -459,7 +444,11 @@ pub(crate) async fn apply_command(
         ControlCommand::BucketSetVersioning { name, versioning } => {
             if !valid_versioning(versioning) {
                 ControlResponse::Invalid
-            } else if Db::set_bucket_versioning_raw(cw, name, versioning).await? {
+            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .bucket_set_versioning(name, versioning)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -473,14 +462,10 @@ pub(crate) async fn apply_command(
         } => {
             if !valid_lock_mode(default_mode.as_deref()) {
                 ControlResponse::Invalid
-            } else if Db::set_bucket_object_lock_raw(
-                cw,
-                name,
-                *enabled,
-                default_mode.as_deref(),
-                *default_days,
-            )
-            .await?
+            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .bucket_set_object_lock(name, *enabled, default_mode.as_deref(), *default_days)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
             {
                 ControlResponse::Ok
             } else {
@@ -495,7 +480,10 @@ pub(crate) async fn apply_command(
             if config_json.is_empty() {
                 ControlResponse::Invalid
             } else if bucket_exists(cw, bucket).await? {
-                Db::set_bucket_notification_raw(cw, bucket, config_json, *updated_at).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .bucket_notification_set(bucket, config_json, *updated_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -503,7 +491,10 @@ pub(crate) async fn apply_command(
         }
         ControlCommand::BucketClearNotification { bucket } => {
             if bucket_exists(cw, bucket).await? {
-                Db::clear_bucket_notification_raw(cw, bucket).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .bucket_notification_delete(bucket)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -560,7 +551,10 @@ pub(crate) async fn apply_command(
             if rules_json.is_empty() {
                 ControlResponse::Invalid
             } else if bucket_exists(cw, bucket).await? {
-                Db::set_replication_rules_raw(cw, bucket, rules_json, *updated_at).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .bucket_replication_rules_set(bucket, rules_json, *updated_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -568,7 +562,10 @@ pub(crate) async fn apply_command(
         }
         ControlCommand::BucketClearReplication { bucket } => {
             if bucket_exists(cw, bucket).await? {
-                Db::clear_replication_rules_raw(cw, bucket).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .bucket_replication_rules_delete(bucket)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -577,14 +574,22 @@ pub(crate) async fn apply_command(
         ControlCommand::BucketSetDefaultEncryption { bucket, algorithm } => {
             if algorithm.is_empty() {
                 ControlResponse::Invalid
-            } else if Db::set_bucket_default_encryption_raw(cw, bucket, algorithm).await? {
+            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .bucket_set_default_encryption(bucket, algorithm)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketClearDefaultEncryption { bucket } => {
-            if Db::clear_bucket_default_encryption_raw(cw, bucket).await? {
+            if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .bucket_clear_default_encryption(bucket)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -598,7 +603,10 @@ pub(crate) async fn apply_command(
             if policy_json.is_empty() {
                 ControlResponse::Invalid
             } else if bucket_exists(cw, bucket).await? {
-                Db::set_bucket_policy_raw(cw, bucket, policy_json, *updated_at).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .bucket_policy_set(bucket, policy_json, *updated_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -606,7 +614,10 @@ pub(crate) async fn apply_command(
         }
         ControlCommand::BucketDeletePolicy { bucket } => {
             if bucket_exists(cw, bucket).await? {
-                Db::delete_bucket_policy_raw(cw, bucket).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .bucket_policy_delete(bucket)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
