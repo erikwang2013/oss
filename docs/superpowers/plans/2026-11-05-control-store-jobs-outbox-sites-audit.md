@@ -177,14 +177,20 @@ pub struct ScheduleLeaseRow { pub term: i64, pub node: i64, pub expires_at: i64,
 
 ### A 切片（jobs / job_tasks / schedule_lease / runstate_meta）
 
-- Commits：`1160c08` `refactor(oss-server): route single-node job engine through ControlTxn`；`test(oss-server): audit jobs ControlStore migration`（本提交）。
+- Commits：`1160c08` `refactor(oss-server): route single-node job engine through ControlTxn`；`af8b3ea` `test(oss-server): audit jobs ControlStore migration`。
 - Focused：`cargo test -p oss-server --test control_store_jobs_diff` 3/3；`cargo test -p oss-server --test raft_guard` 3/3；`cargo test -p oss-server --lib` 316/316；`cargo test -p xl-store` 483 passed / 1 ignored（含各 target）。
 - Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
 - 已知残余 / D7：`db.rs::claim_task_fenced` 的 `BEGIN IMMEDIATE` 留在调用方（SQLite 写锁串行化，非适配器事务）；`raft/compat.rs::guard_runstate_activation` 的悬空引用检查为启动期只读并列入源码审计白名单；B（outbox/uploads/sync intents）与 D（site 表）尚未实施，保留任务 B1–B3/D1–D2 描述与 D7 例外。
 
 ### C 切片（audit_log）
 
-- Commit：`refactor(oss-server): route audit log through ControlStore`（本提交）。
+- Commit：`7e3b18d` `refactor(oss-server): route audit log through ControlStore`。
 - Focused：`cargo test -p oss-server --test control_store_audit_diff` 4/4（批量顺序/过滤差分/purge 差分/源码审计）；异步批量语义由 `audit_queue::worker_writes_batched_rows` 覆盖。
 - Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
 - 语义保持：批量 INSERT 仍逐行同一事务、入参顺序不变；`flush` 失败重试一次后丢弃不变；控制台过滤片段/绑定顺序/JSON 字段不变；purge 单语句自动提交与 `limit.max(1)` 不变。
+
+### 未实施（B / D）
+
+- B1–B3（`event_outbox`、`repl_outbox`、`uploads`、`sync_write_intents`/`sync_delete_intents`）与 D1–D2（M7 `site_*` 表）本轮未实施，相关源码未改动；D7 例外按计划原文保留。
+- 停止点原因：A+C 完成并绿后，剩余工作仍需多轮全量编译/差分验证；本次环境构建排队严重（单次 `cargo test` 编译约 40 分钟，load average 峰值 >50），无法在本次交付内完成并验证 B/D。
+- 交接建议：从 Task B1 开始，复用 A/C 的 adapter/差分测试/源码审计模式；D1/D2 先按 D7 给 `site.rs` 加 `shortcut:` 再评估可迁移读写。
