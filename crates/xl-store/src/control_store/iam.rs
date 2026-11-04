@@ -100,9 +100,15 @@ pub trait IamStore: Send + Sync {
 /// 调用方事务内的 IAM 写；本 trait 不 begin/commit/rollback。
 #[async_trait::async_trait]
 pub trait IamTxn: Send {
-    async fn user_by_username(&self, username: &str) -> Result<Option<UserRef>, ControlError>;
-    async fn user_uid(&self, username: &str) -> Result<Option<i64>, ControlError>;
-    async fn user_is_admin(&self, username: &str) -> Result<bool, ControlError>;
+    async fn user_by_username(&mut self, username: &str) -> Result<Option<UserRef>, ControlError>;
+    async fn user_uid(&mut self, username: &str) -> Result<Option<i64>, ControlError>;
+    /// 只匹配非管理员（`is_admin = 0`）。
+    async fn user_uid_non_admin(&mut self, username: &str) -> Result<Option<i64>, ControlError>;
+    /// 按本地数字 id 判非管理员存在（attach 成员用）。
+    async fn user_non_admin_exists(&mut self, uid: i64) -> Result<bool, ControlError>;
+    async fn user_is_admin(&mut self, username: &str) -> Result<bool, ControlError>;
+    /// 缺成员行的非管理员 `(uid, username)`，`uid` 升序。
+    async fn legacy_users_missing_accounts(&mut self) -> Result<Vec<(i64, String)>, ControlError>;
     /// 显式 status、`is_admin = 0`；返回新 uid。
     async fn user_create(&mut self, row: &UserEntry) -> Result<i64, ControlError>;
     /// 旧 `Db::create_user` 形状（不写 status，取表默认值）；返回新 uid。
@@ -110,12 +116,14 @@ pub trait IamTxn: Send {
         &mut self,
         username: &str,
         password_hash: &str,
+        is_admin: bool,
         created_at: i64,
     ) -> Result<i64, ControlError>;
     /// 删除守卫（取写锁 + 最后在册管理员判定）；false = 拒绝，零写。
     async fn user_delete_guard(&mut self, uid: i64) -> Result<bool, ControlError>;
-    /// 守卫通过后的 IAM 级联：access_keys / permissions / users。
-    async fn user_delete_rows(&mut self, uid: i64) -> Result<(), ControlError>;
+    /// 守卫后的前两级级联：access_keys / permissions（跨域 FK 置空由调用方在中间执行）。
+    async fn user_delete_access_keys_permissions(&mut self, uid: i64) -> Result<(), ControlError>;
+    async fn user_delete(&mut self, uid: i64) -> Result<bool, ControlError>;
     async fn user_set_password(
         &mut self,
         uid: i64,
@@ -124,11 +132,8 @@ pub trait IamTxn: Send {
     /// 启停用（停用走原子最后管理员守卫）。
     async fn user_set_status(&mut self, uid: i64, active: bool) -> Result<bool, ControlError>;
     /// 按值写 status（site 同步；无守卫）。
-    async fn user_set_status_value(
-        &mut self,
-        uid: i64,
-        status: &str,
-    ) -> Result<bool, ControlError>;
+    async fn user_set_status_value(&mut self, uid: i64, status: &str)
+    -> Result<bool, ControlError>;
     /// 全量替换（不跳过全 0 行；调用方按旧语义过滤）。
     async fn permissions_replace(
         &mut self,
@@ -146,7 +151,7 @@ pub trait IamTxn: Send {
     async fn permission_delete(&mut self, uid: i64, bucket: &str) -> Result<(), ControlError>;
     /// 删该桶全部权限（桶删除级联）。
     async fn permissions_delete_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError>;
-    async fn access_key_exists(&self, access_key: &str) -> Result<bool, ControlError>;
+    async fn access_key_exists(&mut self, access_key: &str) -> Result<bool, ControlError>;
     /// apply 原语：status 固定 `active`，属主按 username 解析（缺失 → Invalid）。
     async fn access_key_create(&mut self, row: &AccessKeyEntry) -> Result<(), ControlError>;
     /// 旧 `Db::create_access_key` 形状（4 列，status/kind 取默认值）。
@@ -163,24 +168,19 @@ pub trait IamTxn: Send {
         access_key: &str,
         status: &str,
     ) -> Result<bool, ControlError>;
-    async fn access_key_owner_is_admin(
-        &self,
-        access_key: &str,
-    ) -> Result<bool, ControlError>;
+    async fn access_key_owner_is_admin(&mut self, access_key: &str) -> Result<bool, ControlError>;
     /// site 删除守卫：只看长时键属主是否管理员。
     async fn access_key_long_term_owner_is_admin(
-        &self,
+        &mut self,
         access_key: &str,
     ) -> Result<bool, ControlError>;
     /// `(user_id, kind)`；行不存在 → None。
     async fn access_key_user_and_kind(
-        &self,
-        access_key: &str,
-    ) -> Result<Option<(i64, String)>, ControlError>;
-    async fn access_key_delete_long_term(
         &mut self,
         access_key: &str,
-    ) -> Result<bool, ControlError>;
+    ) -> Result<Option<(i64, String)>, ControlError>;
+    async fn access_key_delete_long_term(&mut self, access_key: &str)
+    -> Result<bool, ControlError>;
     /// site upsert：同 AK 属主/类型冲突由调用方先判定。
     #[allow(clippy::too_many_arguments)]
     async fn access_key_site_upsert(

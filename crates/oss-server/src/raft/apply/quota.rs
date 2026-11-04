@@ -7,6 +7,7 @@
 
 use super::ControlWrite;
 use crate::raft::command::{ControlCommand, ControlResponse, valid_quota_ledger_args};
+use xl_store::control_store::account::AccountTxn;
 
 enum Mode {
     Reserve,
@@ -18,21 +19,20 @@ async fn load_ledger(
     cw: &mut ControlWrite<'_>,
     account: &str,
 ) -> Result<Option<(i64, i64)>, sqlx::Error> {
-    sqlx::query_as("SELECT used_bytes, object_count FROM account_usage_ledger WHERE account_id = ?")
-        .bind(account)
-        .fetch_optional(&mut *cw.conn)
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .account_ledger(account)
         .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn load_limits(
     cw: &mut ControlWrite<'_>,
     account: &str,
 ) -> Result<(Option<i64>, Option<i64>), sqlx::Error> {
-    let row: Option<(Option<i64>, Option<i64>)> =
-        sqlx::query_as("SELECT hard_byte_quota, object_quota FROM accounts WHERE id = ?")
-            .bind(account)
-            .fetch_optional(&mut *cw.conn)
-            .await?;
+    let row = crate::control_store::SqliteControlTxn::new(cw.conn())
+        .account_hard_limits(account)
+        .await
+        .map_err(crate::control_store::to_sqlx)?;
     let (bytes, objects) = row.unwrap_or((None, None));
     Ok((bytes.filter(|q| *q >= 0), objects.filter(|q| *q >= 0)))
 }
@@ -43,17 +43,10 @@ async fn write_ledger(
     bytes: i64,
     objects: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO account_usage_ledger (account_id, used_bytes, object_count) VALUES (?, ?, ?) \
-         ON CONFLICT(account_id) DO UPDATE SET used_bytes = excluded.used_bytes, \
-           object_count = excluded.object_count",
-    )
-    .bind(account)
-    .bind(bytes)
-    .bind(objects)
-    .execute(&mut *cw.conn)
-    .await?;
-    Ok(())
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .account_ledger_upsert(account, bytes, objects)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 账本命令入口；非本组命令返回 `None`。

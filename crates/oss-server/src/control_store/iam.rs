@@ -45,12 +45,11 @@ impl IamStore for SqliteControlStore {
     }
 
     async fn users(&self) -> Result<Vec<UserView>, ControlError> {
-        let rows = sqlx::query(
-            "SELECT id, username, is_admin, status, created_at FROM users ORDER BY id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(backend)?;
+        let rows =
+            sqlx::query("SELECT id, username, is_admin, status, created_at FROM users ORDER BY id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(backend)?;
         Ok(rows.iter().map(user_from).collect())
     }
 
@@ -88,11 +87,12 @@ impl IamStore for SqliteControlStore {
     }
 
     async fn admin_counts(&self) -> Result<(i64, i64), ControlError> {
-        let active: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active'")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(backend)?;
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
         let total: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE is_admin = 1")
             .fetch_one(&self.pool)
             .await

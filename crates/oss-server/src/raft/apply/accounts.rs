@@ -5,9 +5,10 @@
 //! 写进命令；apply 在本地解析 username → uid。
 
 use super::ControlWrite;
-use crate::db::Db;
 use crate::raft::command::{ControlCommand, ControlResponse};
 use xl_s3::access::{LEGACY_ACCOUNT, valid_account_id};
+use xl_store::control_store::account::AccountTxn;
+use xl_store::control_store::iam::IamTxn;
 
 fn valid_account_name(name: &str) -> bool {
     let trimmed = name.trim();
@@ -22,10 +23,10 @@ async fn account_status(
     cw: &mut ControlWrite<'_>,
     id: &str,
 ) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *cw.conn)
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .account_status(id)
         .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 非全局管理员的本地 uid（全局管理员不是任何账户的成员）。
@@ -33,10 +34,10 @@ async fn non_admin_uid(
     cw: &mut ControlWrite<'_>,
     username: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND is_admin = 0")
-        .bind(username)
-        .fetch_optional(&mut *cw.conn)
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .user_uid_non_admin(username)
         .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn member_uid(
@@ -44,26 +45,17 @@ async fn member_uid(
     account_id: &str,
     username: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT u.id FROM account_members am JOIN users u ON u.id = am.uid \
-         WHERE am.account_id = ? AND u.username = ? AND u.is_admin = 0",
-    )
-    .bind(account_id)
-    .bind(username)
-    .fetch_optional(&mut *cw.conn)
-    .await
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .member_uid(account_id, username)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn account_bucket_count(cw: &mut ControlWrite<'_>, id: &str) -> Result<i64, sqlx::Error> {
-    let sql = format!(
-        "SELECT {} FROM accounts a WHERE a.id = ?",
-        Db::account_bucket_count_sql()
-    );
-    let n: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-        .bind(id)
-        .fetch_optional(&mut *cw.conn)
-        .await?;
-    Ok(n.unwrap_or(0))
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .account_bucket_count(id)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// 账户/成员命令的 apply 入口；非本组命令返回 `None`。
@@ -85,20 +77,11 @@ pub(super) async fn apply(
             {
                 ControlResponse::Invalid
             } else {
-                let n = sqlx::query(
-                    "INSERT OR IGNORE INTO accounts \
-                     (id, name, status, bucket_quota, created_at, updated_at) \
-                     VALUES (?, ?, 'active', ?, ?, ?)",
-                )
-                .bind(id)
-                .bind(name)
-                .bind(bucket_quota)
-                .bind(created_at)
-                .bind(created_at)
-                .execute(&mut *cw.conn)
-                .await?
-                .rows_affected();
-                if n == 1 {
+                let inserted = crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .account_insert_if_absent(id, name, *bucket_quota, *created_at, *created_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                if inserted {
                     ControlResponse::Ok
                 } else {
                     ControlResponse::Conflict
@@ -120,44 +103,20 @@ pub(super) async fn apply(
             } else {
                 let mut missing = false;
                 if let Some(name) = name {
-                    let n =
-                        sqlx::query("UPDATE accounts SET name = ?, updated_at = ? WHERE id = ?")
-                            .bind(name)
-                            .bind(updated_at)
-                            .bind(id)
-                            .execute(&mut *cw.conn)
-                            .await?
-                            .rows_affected();
-                    missing = n != 1;
+                    missing = !crate::control_store::SqliteControlTxn::new(cw.conn())
+                        .account_set_name(id, name, *updated_at)
+                        .await
+                        .map_err(crate::control_store::to_sqlx)?;
                 }
                 if missing {
                     ControlResponse::NotFound
                 } else if let Some(status) = status {
-                    let n = if status == "active" {
-                        sqlx::query(
-                            "UPDATE accounts SET status = 'active', updated_at = ? WHERE id = ?",
-                        )
-                        .bind(updated_at)
-                        .bind(id)
-                        .execute(&mut *cw.conn)
-                        .await?
-                        .rows_affected()
-                    } else {
-                        // 同 db.rs：停用是原子条件更新，含在册全局管理员的账户拒绝。
-                        sqlx::query(
-                            "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ? \
-                             AND NOT EXISTS (SELECT 1 FROM account_members am \
-                               JOIN users u ON u.id = am.uid \
-                               WHERE am.account_id = accounts.id \
-                                 AND u.is_admin = 1 AND u.status = 'active')",
-                        )
-                        .bind(updated_at)
-                        .bind(id)
-                        .execute(&mut *cw.conn)
-                        .await?
-                        .rows_affected()
-                    };
-                    if n == 1 {
+                    // 同 db.rs：停用是原子条件更新，含在册全局管理员的账户拒绝。
+                    let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                        .account_set_status(id, status, *updated_at)
+                        .await
+                        .map_err(crate::control_store::to_sqlx)?;
+                    if changed {
                         ControlResponse::Ok
                     } else if account_status(cw, id).await?.is_some() {
                         ControlResponse::Conflict
@@ -177,16 +136,11 @@ pub(super) async fn apply(
             if bucket_quota.is_some_and(|q| q < 0) {
                 ControlResponse::Invalid
             } else {
-                let n = sqlx::query(
-                    "UPDATE accounts SET bucket_quota = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(bucket_quota)
-                .bind(updated_at)
-                .bind(id)
-                .execute(&mut *cw.conn)
-                .await?
-                .rows_affected();
-                if n == 1 {
+                let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .account_set_bucket_quota(id, *bucket_quota, *updated_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                if changed {
                     ControlResponse::Ok
                 } else {
                     ControlResponse::NotFound
@@ -201,16 +155,11 @@ pub(super) async fn apply(
             if soft_byte_quota.is_some_and(|q| q < 0) {
                 ControlResponse::Invalid
             } else {
-                let n = sqlx::query(
-                    "UPDATE accounts SET soft_byte_quota = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(soft_byte_quota)
-                .bind(updated_at)
-                .bind(id)
-                .execute(&mut *cw.conn)
-                .await?
-                .rows_affected();
-                if n == 1 {
+                let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .account_set_soft_quota(id, *soft_byte_quota, *updated_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                if changed {
                     ControlResponse::Ok
                 } else {
                     ControlResponse::NotFound
@@ -226,18 +175,11 @@ pub(super) async fn apply(
             if hard_byte_quota.is_some_and(|q| q < 0) || object_quota.is_some_and(|q| q < 0) {
                 ControlResponse::Invalid
             } else {
-                let n = sqlx::query(
-                    "UPDATE accounts SET hard_byte_quota = ?, object_quota = ?, updated_at = ? \
-                     WHERE id = ?",
-                )
-                .bind(hard_byte_quota)
-                .bind(object_quota)
-                .bind(updated_at)
-                .bind(id)
-                .execute(&mut *cw.conn)
-                .await?
-                .rows_affected();
-                if n == 1 {
+                let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .account_set_hard_limits(id, *hard_byte_quota, *object_quota, *updated_at)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                if changed {
                     ControlResponse::Ok
                 } else {
                     ControlResponse::NotFound
@@ -250,18 +192,17 @@ pub(super) async fn apply(
             } else if account_status(cw, id).await?.is_none() {
                 ControlResponse::NotFound
             } else {
-                let members: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE account_id = ?")
-                        .bind(id)
-                        .fetch_one(&mut *cw.conn)
-                        .await?;
+                let members = crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .account_member_count(id)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 if members != 0 || account_bucket_count(cw, id).await? != 0 {
                     ControlResponse::Conflict
                 } else {
-                    sqlx::query("DELETE FROM accounts WHERE id = ?")
-                        .bind(id)
-                        .execute(&mut *cw.conn)
-                        .await?;
+                    crate::control_store::SqliteControlTxn::new(cw.conn())
+                        .account_delete(id)
+                        .await
+                        .map_err(crate::control_store::to_sqlx)?;
                     ControlResponse::Ok
                 }
             }
@@ -281,27 +222,14 @@ pub(super) async fn apply(
                     Some(_) => match non_admin_uid(cw, username).await? {
                         None => ControlResponse::NotFound,
                         Some(uid) => {
-                            sqlx::query(
-                                "INSERT INTO account_members (account_id, uid, role, created_at) \
-                                 VALUES (?, ?, ?, ?) \
-                                 ON CONFLICT(uid) DO UPDATE SET \
-                                   account_id = excluded.account_id, role = excluded.role",
-                            )
-                            .bind(account_id)
-                            .bind(uid)
-                            .bind(role)
-                            .bind(created_at)
-                            .execute(&mut *cw.conn)
-                            .await?;
+                            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                            txn.account_member_upsert(account_id, uid, role, *created_at)
+                                .await
+                                .map_err(crate::control_store::to_sqlx)?;
                             if role == "admin" {
-                                sqlx::query(
-                                    "UPDATE accounts SET admin_uid = ? \
-                                     WHERE id = ? AND admin_uid IS NULL",
-                                )
-                                .bind(uid)
-                                .bind(account_id)
-                                .execute(&mut *cw.conn)
-                                .await?;
+                                txn.account_set_admin_if_unset(account_id, uid)
+                                    .await
+                                    .map_err(crate::control_store::to_sqlx)?;
                             }
                             ControlResponse::Ok
                         }
@@ -316,7 +244,11 @@ pub(super) async fn apply(
         } => match member_uid(cw, account_id, username).await? {
             None => ControlResponse::NotFound,
             Some(uid) => {
-                if Db::set_user_status_raw(cw, uid, *active).await? {
+                if crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .user_set_status(uid, *active)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?
+                {
                     ControlResponse::Ok
                 } else {
                     // 同 set_user_status：目标是最后一个在册管理员（命令路径本不产生）。
@@ -342,34 +274,27 @@ pub(super) async fn apply(
                     None => ControlResponse::NotFound,
                     Some(s) if s != "active" => ControlResponse::Invalid,
                     Some(_) => {
-                        let exists: Option<i64> =
-                            sqlx::query_scalar("SELECT 1 FROM users WHERE username = ?")
-                                .bind(username)
-                                .fetch_optional(&mut *cw.conn)
-                                .await?;
-                        if exists.is_some() {
+                        let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                        if txn
+                            .user_by_username(username)
+                            .await
+                            .map_err(crate::control_store::to_sqlx)?
+                            .is_some()
+                        {
                             ControlResponse::Conflict
                         } else {
-                            let uid = sqlx::query(
-                                "INSERT INTO users (username, password_hash, is_admin, created_at) \
-                                 VALUES (?, ?, 0, ?)",
-                            )
-                            .bind(username)
-                            .bind(password_hash)
-                            .bind(created_at)
-                            .execute(&mut *cw.conn)
-                            .await?
-                            .last_insert_rowid();
-                            sqlx::query(
-                                "INSERT INTO account_members (account_id, uid, role, created_at) \
-                                 VALUES (?, ?, ?, ?)",
-                            )
-                            .bind(account_id)
-                            .bind(uid)
-                            .bind(role)
-                            .bind(created_at)
-                            .execute(&mut *cw.conn)
-                            .await?;
+                            let uid = txn
+                                .user_create_default_status(
+                                    username,
+                                    password_hash,
+                                    false,
+                                    *created_at,
+                                )
+                                .await
+                                .map_err(crate::control_store::to_sqlx)?;
+                            txn.account_member_insert(account_id, uid, role, *created_at)
+                                .await
+                                .map_err(crate::control_store::to_sqlx)?;
                             ControlResponse::Ok
                         }
                     }

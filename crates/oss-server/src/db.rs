@@ -6,7 +6,9 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
+use xl_store::control_store::account::AccountTxn;
 use xl_store::control_store::bucket::BucketTxn;
+use xl_store::control_store::iam::{IamTxn, PermissionRow as IamPermissionRow};
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
     InventoryTxn,
@@ -1435,7 +1437,10 @@ impl Db {
     pub async fn owner_uid(&self, owner: &OwnerRef) -> Result<i64> {
         let store = self.control_store();
         let id = match owner {
-            OwnerRef::Admin => store.admin_id().await.map_err(crate::control_store::to_sqlx)?,
+            OwnerRef::Admin => store
+                .admin_id()
+                .await
+                .map_err(crate::control_store::to_sqlx)?,
             OwnerRef::User(name) => store
                 .user(name)
                 .await
@@ -1461,39 +1466,22 @@ impl Db {
 
     pub async fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<i64> {
         let hash = crate::db::hash_password(password);
-        let id = sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(username)
-        .bind(hash)
-        .bind(is_admin as i64)
-        .bind(now())
-        .execute(&self.pool)
-        .await?
-        .last_insert_rowid();
+        // 旧形状：三条独立自动提交语句（失败可留部分行，不做跨语句回滚）。
+        let mut conn = self.pool.acquire().await?;
+        let id = crate::control_store::SqliteControlTxn::new(&mut conn)
+            .user_create_default_status(username, &hash, is_admin, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         // AC-0：非管理员新用户加入其 uid 派生账户（与回填同语义；之后可被显式迁入其它账户）。
         // 全局管理员归系统账户、不是任何账户的成员（AC-2）：不建账户行/成员行。
         if !is_admin && let Some(acct) = xl_s3::access::account_id_of(id) {
-            sqlx::query(
-                "INSERT OR IGNORE INTO accounts (id, name, status, admin_uid, created_at, updated_at) \
-                 VALUES (?, ?, 'active', ?, ?, ?)",
-            )
-            .bind(&acct)
-            .bind(username)
-            .bind(id)
-            .bind(now())
-            .bind(now())
-            .execute(&self.pool)
-            .await?;
-            sqlx::query(
-                "INSERT OR IGNORE INTO account_members (account_id, uid, role, created_at) \
-                 VALUES (?, ?, 'owner', ?)",
-            )
-            .bind(&acct)
-            .bind(id)
-            .bind(now())
-            .execute(&self.pool)
-            .await?;
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut conn);
+            txn.account_insert_derived_if_absent(&acct, username, id, now(), now())
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            txn.account_member_insert_if_absent(&acct, id, "owner", now())
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
         }
         Ok(id)
     }
@@ -1527,7 +1515,6 @@ impl Db {
         let stored = r.password_hash;
         let id = r.uid;
         let legacy = crate::db::is_legacy_hash(&stored);
-        // shortcut: 登录透明的旧 hash 重写留在 raw SQL，随 IAM 写适配器（Slice 5 Task 4）迁移。
 
         // Argon2 移出 tokio worker；行查询已在闸外完成，许可在返回前释放（不跨后续 DB I/O）。
         let password_for_verify = password.to_owned();
@@ -1550,12 +1537,15 @@ impl Db {
                     return Ok(Some(id));
                 }
             };
-            if let Err(e) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-                .bind(&upgraded)
-                .bind(id)
-                .execute(&self.pool)
-                .await
-            {
+            let upgrade = async {
+                let mut conn = self.pool.acquire().await?;
+                crate::control_store::SqliteControlTxn::new(&mut conn)
+                    .user_set_password(id, &upgraded)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)
+            }
+            .await;
+            if let Err(e) = upgrade {
                 tracing::warn!(error = %e, user = %username, "旧口令哈希透明升级失败");
             }
         }
@@ -1563,14 +1553,11 @@ impl Db {
     }
 
     pub async fn create_access_key(&self, ak: &str, sk: &str, user_id: i64) -> Result<()> {
-        sqlx::query("INSERT INTO access_keys (access_key, secret_key, user_id, created_at) VALUES (?, ?, ?, ?)")
-            .bind(ak)
-            .bind(sk)
-            .bind(user_id)
-            .bind(now())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .access_key_create_legacy(ak, sk, user_id, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     // SigV4 的 AK → SK 查询归 xl-s3/src/auth.rs（SigV4Auth）；这里不再保留第二份，防 M5 双改。
@@ -2019,26 +2006,11 @@ impl Db {
     /// 非管理员恒可停；管理员仅在「当前在册管理员 > 1」时可停——子查询与写入同语句，
     /// SQLite 写锁串行化下天然防 TOCTOU。启用无锁死风险，走普通 UPDATE。
     pub async fn set_user_status(&self, uid: i64, active: bool) -> Result<bool> {
-        let n = if active {
-            sqlx::query("UPDATE users SET status = 'active' WHERE id = ?")
-                .bind(uid)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-        } else {
-            // 评审 nit①：守卫只对「把**在册**管理员停掉」生效；对已停用者重复停用是幂等
-            // no-op（不触碰计数），否则会误报「不能停用最后一个在册管理员」。
-            sqlx::query(
-                "UPDATE users SET status = 'disabled' WHERE id = ? AND \
-                 (NOT (is_admin = 1 AND status = 'active') \
-                  OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
-            )
-            .bind(uid)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-        };
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .user_set_status(uid, active)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 在册（active）管理员数：保护「不能停用最后一个可用管理员」。
@@ -2084,13 +2056,11 @@ impl Db {
 
     /// 改口令。返回是否有该用户。
     pub async fn set_password(&self, uid: i64, password: &str) -> Result<bool> {
-        let n = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-            .bind(crate::db::hash_password(password))
-            .bind(uid)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .user_set_password(uid, &crate::db::hash_password(password))
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 删除用户（一个事务内处理全部外键：sqlx 默认 FK ON，裸删 users 会报错）：
@@ -2100,29 +2070,22 @@ impl Db {
     /// **防呆原子化**（评审 P2，同 set_user_status）：事务第一条是无副作用的守卫写
     /// （`UPDATE users SET id=id WHERE …`），既取写锁串行化并发删除/停用，又在同一语句里
     /// 完成判定——通过才继续级联；不通过直接返回 false，一个字节都不改。
-    // shortcut: 账户配额 SQL 片段与 IAM 用户级联同属 Slice 5（账户/配额），随该切片迁移。
     pub async fn delete_user(&self, uid: i64) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let gate = sqlx::query(
-            "UPDATE users SET id = id WHERE id = ? AND \
-             (NOT (is_admin = 1 AND status = 'active') \
-              OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
-        )
-        .bind(uid)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if gate == 0 {
+        let gate = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .user_delete_guard(uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        if !gate {
             return Ok(false);
         }
-        sqlx::query("DELETE FROM access_keys WHERE user_id = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM permissions WHERE user_id = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.user_delete_access_keys_permissions(uid)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+        }
+        // shortcut: buckets/uploads 属其它域，所有权清空仍由本域在级联中间执行（D7）。
         sqlx::query("UPDATE buckets SET owner_id = NULL WHERE owner_id = ?")
             .bind(uid)
             .execute(&mut *tx)
@@ -2131,10 +2094,10 @@ impl Db {
             .bind(uid)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .user_delete(uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok(true)
     }
@@ -2148,49 +2111,32 @@ impl Db {
         if self.schema_meta("accounts_backfill_v1").await?.is_some() {
             return Ok(false);
         }
-        let users = sqlx::query("SELECT id, username FROM users ORDER BY id")
-            .fetch_all(&self.pool)
-            .await?;
+        let users = self
+            .control_store()
+            .users()
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         let ts = now();
         let mut tx = self.pool.begin().await?;
-        // 系统账户：admin/NULL 桶的账户；没有成员，主体匹配永不命中它。
-        sqlx::query(
-            "INSERT OR IGNORE INTO accounts (id, name, status, created_at, updated_at) \
-             VALUES (?, 'system', 'active', ?, ?)",
-        )
-        .bind(xl_s3::access::LEGACY_ACCOUNT)
-        .bind(ts)
-        .bind(ts)
-        .execute(&mut *tx)
-        .await?;
-        for r in users {
-            let uid: i64 = r.get("id");
-            let username: String = r.get("username");
-            let Some(acct) = xl_s3::access::account_id_of(uid) else {
-                continue; // uid 0/越界：旧语义下也无法匹配任何账户 ARN，保持原状
-            };
-            sqlx::query(
-                "INSERT OR IGNORE INTO accounts \
-                 (id, name, status, admin_uid, created_at, updated_at) \
-                 VALUES (?, ?, 'active', ?, ?, ?)",
-            )
-            .bind(&acct)
-            .bind(&username)
-            .bind(uid)
-            .bind(ts)
-            .bind(ts)
-            .execute(&mut *tx)
-            .await?;
-            // 首次回填时不存在成员行；UNIQUE(uid) 兜底并发/重入。
-            sqlx::query(
-                "INSERT OR IGNORE INTO account_members (account_id, uid, role, created_at) \
-                 VALUES (?, ?, 'owner', ?)",
-            )
-            .bind(&acct)
-            .bind(uid)
-            .bind(ts)
-            .execute(&mut *tx)
-            .await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            // 系统账户：admin/NULL 桶的账户；没有成员，主体匹配永不命中它。
+            txn.account_system_insert_if_absent(xl_s3::access::LEGACY_ACCOUNT, "system", ts, ts)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            for u in users {
+                let uid = u.uid;
+                let Some(acct) = xl_s3::access::account_id_of(uid) else {
+                    continue; // uid 0/越界：旧语义下也无法匹配任何账户 ARN，保持原状
+                };
+                txn.account_insert_derived_if_absent(&acct, &u.username, uid, ts, ts)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+                // 首次回填时不存在成员行；UNIQUE(uid) 兜底并发/重入。
+                txn.account_member_insert_if_absent(&acct, uid, "owner", ts)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+            }
         }
         sqlx::query(
             "INSERT INTO schema_meta (key, value) VALUES ('accounts_backfill_v1', 'done') \
@@ -2215,20 +2161,17 @@ impl Db {
             return Ok(false);
         }
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM account_members WHERE uid IN (SELECT id FROM users WHERE is_admin = 1)",
-        )
-        .execute(&mut *tx)
-        .await?;
-        // 只删「某管理员的 uid 派生 ID 且已无成员」的账户；管理员桶归系统账户，
-        // 不引用这些账户，删除不影响桶归属。
-        sqlx::query(
-            "DELETE FROM accounts \
-             WHERE id IN (SELECT printf('%012d', id) FROM users WHERE is_admin = 1) \
-               AND id NOT IN (SELECT account_id FROM account_members)",
-        )
-        .execute(&mut *tx)
-        .await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.account_members_delete_admins()
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            // 只删「某管理员的 uid 派生 ID 且已无成员」的账户；管理员桶归系统账户，
+            // 不引用这些账户，删除不影响桶归属。
+            txn.accounts_delete_admin_derived()
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+        }
         sqlx::query(
             "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
              ON CONFLICT(key) DO UPDATE SET value = 'done'",
@@ -2258,57 +2201,33 @@ impl Db {
     /// AccountMemberAttach 命令修复）。
     pub async fn canonicalize_legacy_accounts_once(&self) -> Result<usize> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM account_members WHERE uid IN \
-             (SELECT id FROM users WHERE is_admin = 1)",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "DELETE FROM accounts \
-             WHERE id IN (SELECT printf('%012d', id) FROM users WHERE is_admin = 1) \
-               AND id NOT IN (SELECT account_id FROM account_members)",
-        )
-        .execute(&mut *tx)
-        .await?;
-        let users = sqlx::query(
-            "SELECT u.id, u.username FROM users u WHERE u.is_admin = 0 \
-             AND NOT EXISTS (SELECT 1 FROM account_members am WHERE am.uid = u.id) \
-             ORDER BY u.id",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
         let ts = now();
         let mut changed = 0usize;
-        for r in users {
-            let uid: i64 = r.get("id");
-            let username: String = r.get("username");
-            let Some(acct) = xl_s3::access::account_id_of(uid) else {
-                continue; // uid 0/越界：旧语义下也无法匹配任何账户 ARN
-            };
-            changed += sqlx::query(
-                "INSERT OR IGNORE INTO accounts \
-                 (id, name, status, admin_uid, created_at, updated_at) \
-                 VALUES (?, ?, 'active', ?, ?, ?)",
-            )
-            .bind(&acct)
-            .bind(&username)
-            .bind(uid)
-            .bind(ts)
-            .bind(ts)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() as usize;
-            changed += sqlx::query(
-                "INSERT OR IGNORE INTO account_members (account_id, uid, role, created_at) \
-                 VALUES (?, ?, 'owner', ?)",
-            )
-            .bind(&acct)
-            .bind(uid)
-            .bind(ts)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() as usize;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.account_members_delete_admins()
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            txn.accounts_delete_admin_derived()
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            let users = txn
+                .legacy_users_missing_accounts()
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            for (uid, username) in users {
+                let Some(acct) = xl_s3::access::account_id_of(uid) else {
+                    continue; // uid 0/越界：旧语义下也无法匹配任何账户 ARN
+                };
+                changed += txn
+                    .account_insert_derived_if_absent(&acct, &username, uid, ts, ts)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)? as usize;
+                changed += txn
+                    .account_member_insert_if_absent(&acct, uid, "owner", ts)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)? as usize;
+            }
         }
         let marker: Option<String> =
             sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
@@ -2336,18 +2255,11 @@ impl Db {
         hard_byte_quota: Option<i64>,
         object_quota: Option<i64>,
     ) -> Result<bool> {
-        let n = sqlx::query(
-            "UPDATE accounts SET hard_byte_quota = ?, object_quota = ?, updated_at = ? \
-             WHERE id = ?",
-        )
-        .bind(hard_byte_quota)
-        .bind(object_quota)
-        .bind(now())
-        .bind(id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .account_set_hard_limits(id, hard_byte_quota, object_quota, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。
@@ -2386,24 +2298,6 @@ impl Db {
         }
     }
 
-    /// 账户桶集合的 FROM/WHERE 片段（桶数统计与用量列举共用，避免口径漂移）。
-    /// 归属 = 桶主的**当前**账户（成员行优先，无行 = uid 派生）；管理员桶归系统账户
-    /// 但永不匹配真实账户，故不计入任何用户账户。`account` 是账户 id 的 SQL 表达式
-    /// （`a.id` 或绑定参数 `?`），只由本模块常量传入。
-    // shortcut: 账户配额 SQL 片段与 IAM 用户级联同属 Slice 5（账户/配额），随该切片迁移。
-    fn account_buckets_from(account: &str) -> String {
-        format!(
-            "FROM buckets b JOIN users u ON u.id = b.owner_id \
-             LEFT JOIN account_members bm ON bm.uid = u.id \
-             WHERE u.is_admin = 0 AND COALESCE(bm.account_id, printf('%012d', u.id)) = {account}"
-        )
-    }
-
-    /// 账户桶数（标量子查询；口径见 `account_buckets_from`）。
-    pub(crate) fn account_bucket_count_sql() -> String {
-        format!("(SELECT COUNT(*) {})", Self::account_buckets_from("a.id"))
-    }
-
     /// 账户名下桶名（软配额用量端点逐桶列举；口径见适配器 `account_buckets_from`）。
     pub async fn account_bucket_names(&self, account_id: &str) -> Result<Vec<String>> {
         self.control_store()
@@ -2420,37 +2314,10 @@ impl Db {
         conn: &mut SqliteConnection,
         owner_id: Option<i64>,
     ) -> Result<bool> {
-        let Some(uid) = owner_id else {
-            return Ok(false);
-        };
-        let account =
-            sqlx::query_scalar::<_, String>("SELECT account_id FROM account_members WHERE uid = ?")
-                .bind(uid)
-                .fetch_optional(&mut *conn)
-                .await?
-                .or_else(|| xl_s3::access::account_id_of(uid));
-        let Some(account) = account else {
-            return Ok(false);
-        };
-        let Some(r) = sqlx::query("SELECT status, bucket_quota FROM accounts WHERE id = ?")
-            .bind(&account)
-            .fetch_optional(&mut *conn)
-            .await?
-        else {
-            return Ok(false);
-        };
-        if r.get::<String, _>("status") != "active" {
-            return Ok(true);
-        }
-        let Some(quota) = r.get::<Option<i64>, _>("bucket_quota").filter(|q| *q >= 0) else {
-            return Ok(false);
-        };
-        let sql = format!("SELECT COUNT(*) {}", Self::account_buckets_from("?"));
-        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(&account)
-            .fetch_one(&mut *conn)
-            .await?;
-        Ok(n >= quota)
+        crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .bucket_quota_reached(owner_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 建桶配额最终判定（仅新建行；已存在行是收敛，不增加桶数）。
@@ -2471,10 +2338,10 @@ impl Db {
         let Some(owner) = owner else {
             return Ok(false);
         };
-        let uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-            .bind(owner)
-            .fetch_optional(&mut *conn)
-            .await?;
+        let uid = crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .user_uid(owner)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         let Some(uid) = uid else {
             return Ok(false);
         };
@@ -2515,26 +2382,19 @@ impl Db {
     /// 新建账户。id 为 12 位随机数（与派生账户空间重叠概率可忽略，冲突重试）。
     pub async fn create_account(&self, name: &str, bucket_quota: Option<i64>) -> Result<String> {
         let ts = now();
+        let mut conn = self.pool.acquire().await?;
         for _ in 0..8 {
             // random() 是有符号 64 位：先掩掉符号位再取模，否则 % 保留负号会生成负 id。
             let id: String = sqlx::query_scalar(
                 "SELECT printf('%012d', 100000000000 + ((random() & 0x7fffffffffffffff) % 900000000000))",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?;
-            let n = sqlx::query(
-                "INSERT OR IGNORE INTO accounts \
-                 (id, name, status, bucket_quota, created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?)",
-            )
-            .bind(&id)
-            .bind(name)
-            .bind(bucket_quota)
-            .bind(ts)
-            .bind(ts)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-            if n == 1 {
+            let inserted = crate::control_store::SqliteControlTxn::new(&mut conn)
+                .account_insert_if_absent(&id, name, bucket_quota, ts, ts)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            if inserted {
                 return Ok(id);
             }
         }
@@ -2544,50 +2404,29 @@ impl Db {
     }
 
     pub async fn rename_account(&self, id: &str, name: &str) -> Result<bool> {
-        let n = sqlx::query("UPDATE accounts SET name = ?, updated_at = ? WHERE id = ?")
-            .bind(name)
-            .bind(now())
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .account_set_name(id, name, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 启停账户。停用是原子条件更新：账户里还有在册全局管理员时拒绝
     /// （否则该管理员会随账户一起被锁死，且可能锁死最后一个管理员）。
     pub async fn set_account_status(&self, id: &str, status: &str) -> Result<bool> {
-        let n = if status == "active" {
-            sqlx::query("UPDATE accounts SET status = 'active', updated_at = ? WHERE id = ?")
-                .bind(now())
-                .bind(id)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-        } else {
-            sqlx::query(
-                "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ? AND NOT EXISTS (\
-                   SELECT 1 FROM account_members am JOIN users u ON u.id = am.uid \
-                   WHERE am.account_id = accounts.id AND u.is_admin = 1 AND u.status = 'active')",
-            )
-            .bind(now())
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-        };
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .account_set_status(id, status, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     pub async fn set_account_quota(&self, id: &str, quota: Option<i64>) -> Result<bool> {
-        let n = sqlx::query("UPDATE accounts SET bucket_quota = ?, updated_at = ? WHERE id = ?")
-            .bind(quota)
-            .bind(now())
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(n == 1)
+        let mut conn = self.pool.acquire().await?;
+        crate::control_store::SqliteControlTxn::new(&mut conn)
+            .account_set_bucket_quota(id, quota, now())
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 删除账户：要求无成员且无桶（LEGACY 系统账户永不可删）。
@@ -2597,29 +2436,25 @@ impl Db {
             return Ok(false);
         }
         let mut tx = self.pool.begin().await?;
-        let members: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM account_members WHERE account_id = ?")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let sql = format!(
-            "SELECT {} FROM accounts a WHERE a.id = ?",
-            Self::account_bucket_count_sql()
-        );
-        let buckets: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if members != 0 || buckets.unwrap_or(0) != 0 {
-            return Ok(false);
-        }
-        let n = sqlx::query("DELETE FROM accounts WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let deleted = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            let members = txn
+                .account_member_count(id)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            let buckets = txn
+                .account_bucket_count(id)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            if members != 0 || buckets != 0 {
+                return Ok(false);
+            }
+            txn.account_delete(id)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+        };
         tx.commit().await?;
-        Ok(n == 1)
+        Ok(deleted)
     }
 
     pub async fn list_account_members(&self, id: &str) -> Result<Vec<AccountMemberRow>> {
@@ -2658,30 +2493,23 @@ impl Db {
         role: &str,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let user: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE id = ? AND is_admin = 0")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if user.is_none() {
-            return Ok(false);
-        }
-        sqlx::query(
-            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(uid) DO UPDATE SET account_id = excluded.account_id, role = excluded.role",
-        )
-        .bind(account_id)
-        .bind(uid)
-        .bind(role)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
-        if role == "admin" {
-            sqlx::query("UPDATE accounts SET admin_uid = ? WHERE id = ? AND admin_uid IS NULL")
-                .bind(uid)
-                .bind(account_id)
-                .execute(&mut *tx)
-                .await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            if !txn
+                .user_non_admin_exists(uid)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
+                return Ok(false);
+            }
+            txn.account_member_upsert(account_id, uid, role, now())
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            if role == "admin" {
+                txn.account_set_admin_if_unset(account_id, uid)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
+            }
         }
         tx.commit().await?;
         Ok(true)
@@ -2698,24 +2526,22 @@ impl Db {
     ) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
         let ts = now();
-        let uid = sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, 0, ?)",
-        )
-        .bind(username)
-        .bind(crate::db::hash_password(password))
-        .bind(ts)
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-        sqlx::query(
-            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(account_id)
-        .bind(uid)
-        .bind(role)
-        .bind(ts)
-        .execute(&mut *tx)
-        .await?;
+        let uid = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            let uid = txn
+                .user_create_default_status(
+                    username,
+                    &crate::db::hash_password(password),
+                    false,
+                    ts,
+                )
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            txn.account_member_insert(account_id, uid, role, ts)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            uid
+        };
         tx.commit().await?;
         Ok(uid)
     }
@@ -2739,26 +2565,21 @@ impl Db {
 
     /// 全量替换某用户的权限行（管理员的 PUT 语义）。全 0 行跳过不写（无行 = 无权限，等价且省行）。
     pub async fn set_permissions(&self, uid: i64, rows: &[PermissionRow]) -> Result<()> {
+        let rows: Vec<IamPermissionRow> = rows
+            .iter()
+            .filter(|p| p.read || p.write || p.delete)
+            .map(|p| IamPermissionRow {
+                bucket: p.bucket.clone(),
+                read: p.read,
+                write: p.write,
+                delete: p.delete,
+            })
+            .collect();
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM permissions WHERE user_id = ?")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
-        for p in rows {
-            if !(p.read || p.write || p.delete) {
-                continue;
-            }
-            sqlx::query(
-                "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(uid)
-            .bind(&p.bucket)
-            .bind(p.read as i64)
-            .bind(p.write as i64)
-            .bind(p.delete as i64)
-            .execute(&mut *tx)
-            .await?;
-        }
+        crate::control_store::SqliteControlTxn::new(&mut tx)
+            .permissions_replace(uid, &rows)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok(())
     }
@@ -5985,172 +5806,6 @@ pub enum BucketRowOutcome {
 }
 
 impl Db {
-    pub(crate) async fn create_user_raw(
-        cw: &mut ControlWrite<'_>,
-        username: &str,
-        password_hash: &str,
-        status: &str,
-        created_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
-             VALUES (?, ?, 0, ?, ?)",
-        )
-        .bind(username)
-        .bind(password_hash)
-        .bind(status)
-        .bind(created_at)
-        .execute(&mut *cw.conn())
-        .await?;
-        Ok(())
-    }
-
-    /// 与 [`Db::delete_user`] 完全同 SQL：守卫写取写锁 + 最后管理员判定 + 全量级联。
-    pub(crate) async fn delete_user_cascade(cw: &mut ControlWrite<'_>, uid: i64) -> Result<bool> {
-        let conn = cw.conn();
-        let gate = sqlx::query(
-            "UPDATE users SET id = id WHERE id = ? AND \
-             (NOT (is_admin = 1 AND status = 'active') \
-              OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
-        )
-        .bind(uid)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
-        if gate == 0 {
-            return Ok(false);
-        }
-        for sql in [
-            "DELETE FROM access_keys WHERE user_id = ?",
-            "DELETE FROM permissions WHERE user_id = ?",
-            "UPDATE buckets SET owner_id = NULL WHERE owner_id = ?",
-            "UPDATE uploads SET owner_id = NULL WHERE owner_id = ?",
-            "DELETE FROM users WHERE id = ?",
-        ] {
-            sqlx::query(sql).bind(uid).execute(&mut *conn).await?;
-        }
-        Ok(true)
-    }
-
-    pub(crate) async fn set_password_raw(
-        cw: &mut ControlWrite<'_>,
-        uid: i64,
-        password_hash: &str,
-    ) -> Result<bool> {
-        let n = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-            .bind(password_hash)
-            .bind(uid)
-            .execute(&mut *cw.conn())
-            .await?
-            .rows_affected();
-        Ok(n == 1)
-    }
-
-    /// 与 [`Db::set_user_status`] 同语义（停用走原子最后管理员守卫）。
-    pub(crate) async fn set_user_status_raw(
-        cw: &mut ControlWrite<'_>,
-        uid: i64,
-        active: bool,
-    ) -> Result<bool> {
-        let n = if active {
-            sqlx::query("UPDATE users SET status = 'active' WHERE id = ?")
-                .bind(uid)
-                .execute(&mut *cw.conn())
-                .await?
-                .rows_affected()
-        } else {
-            sqlx::query(
-                "UPDATE users SET status = 'disabled' WHERE id = ? AND \
-                 (NOT (is_admin = 1 AND status = 'active') \
-                  OR (SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active') > 1)",
-            )
-            .bind(uid)
-            .execute(&mut *cw.conn())
-            .await?
-            .rows_affected()
-        };
-        Ok(n == 1)
-    }
-
-    pub(crate) async fn set_permissions_raw(
-        cw: &mut ControlWrite<'_>,
-        uid: i64,
-        rows: &[PermissionRow],
-    ) -> Result<()> {
-        let conn = cw.conn();
-        sqlx::query("DELETE FROM permissions WHERE user_id = ?")
-            .bind(uid)
-            .execute(&mut *conn)
-            .await?;
-        for p in rows {
-            sqlx::query(
-                "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(uid)
-            .bind(&p.bucket)
-            .bind(p.read as i64)
-            .bind(p.write as i64)
-            .bind(p.delete as i64)
-            .execute(&mut *conn)
-            .await?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_access_key_raw(
-        cw: &mut ControlWrite<'_>,
-        access_key: &str,
-        secret_key: &str,
-        user_id: i64,
-        kind: &str,
-        parent_ak: Option<&str>,
-        session_policy: Option<&str>,
-        created_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key, user_id, status, kind, \
-             parent_ak, session_policy, created_at) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)",
-        )
-        .bind(access_key)
-        .bind(secret_key)
-        .bind(user_id)
-        .bind(kind)
-        .bind(parent_ak)
-        .bind(session_policy)
-        .bind(created_at)
-        .execute(&mut *cw.conn())
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn delete_access_key_raw(
-        cw: &mut ControlWrite<'_>,
-        access_key: &str,
-    ) -> Result<bool> {
-        let n = sqlx::query("DELETE FROM access_keys WHERE access_key = ?")
-            .bind(access_key)
-            .execute(&mut *cw.conn())
-            .await?
-            .rows_affected();
-        Ok(n > 0)
-    }
-
-    pub(crate) async fn set_access_key_status_raw(
-        cw: &mut ControlWrite<'_>,
-        access_key: &str,
-        status: &str,
-    ) -> Result<bool> {
-        let n = sqlx::query("UPDATE access_keys SET status = ? WHERE access_key = ?")
-            .bind(status)
-            .bind(access_key)
-            .execute(&mut *cw.conn())
-            .await?
-            .rows_affected();
-        Ok(n > 0)
-    }
-
     /// 全列建桶（S6c 的 `db`/`access`/`console` 共用 writer）：
     /// 行不存在 → INSERT（set_id=0，deleting=0）；同名同模式 → 全列收敛但**不写 set_id**；
     /// 同名不同模式 → `ModeConflict`（无写入）。
@@ -6172,12 +5827,10 @@ impl Db {
                 .await
                 .map_err(crate::control_store::to_sqlx)?;
         }
-        // shortcut: permissions 属 Slice 5（IAM/账号），随该切片迁移。
-        sqlx::query("DELETE FROM permissions WHERE bucket = ?")
-            .bind(bucket)
-            .execute(&mut *conn)
-            .await?;
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.permissions_delete_for_bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         txn.delete_bucket_configs_for_bucket(bucket)
             .await
             .map_err(crate::control_store::to_sqlx)?;

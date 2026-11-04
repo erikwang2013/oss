@@ -9,7 +9,9 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
+use xl_store::control_store::account::AccountTxn;
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry, BucketTxn};
+use xl_store::control_store::iam::IamTxn;
 use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryTxn};
 use xl_store::control_store::jobs::JobTxn;
 use xl_store::control_store::lifecycle::LifecycleTxn;
@@ -26,8 +28,8 @@ pub(crate) mod tier_restore;
 use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
-use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
-use crate::db::{Db, LifecycleRuleRow, PermissionRow};
+use super::runstate::{JobRow, JobTaskRow, TierRestoreRow, job_row_from, job_task_row_from};
+use crate::db::{Db, LifecycleRuleRow};
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
 pub(crate) struct ControlWrite<'a> {
@@ -111,34 +113,28 @@ fn valid_lock_mode(s: Option<&str>) -> bool {
 }
 
 async fn uid(cw: &mut ControlWrite<'_>, username: &str) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-        .bind(username)
-        .fetch_optional(&mut *cw.conn)
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .user_uid(username)
         .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 /// M1：管理员用户/AK 是站点本地状态，IAM 命令不得复制它们（S6b 处理器留本地）。
 async fn username_is_admin(cw: &mut ControlWrite<'_>, username: &str) -> Result<bool, sqlx::Error> {
-    let row: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? AND is_admin = 1")
-            .bind(username)
-            .fetch_optional(&mut *cw.conn)
-            .await?;
-    Ok(row.is_some())
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .user_is_admin(username)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn access_key_owner_is_admin(
     cw: &mut ControlWrite<'_>,
     access_key: &str,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM access_keys a JOIN users u ON u.id = a.user_id \
-         WHERE a.access_key = ? AND u.is_admin = 1",
-    )
-    .bind(access_key)
-    .fetch_optional(&mut *cw.conn)
-    .await?;
-    Ok(row.is_some())
+    crate::control_store::SqliteControlTxn::new(cw.conn())
+        .access_key_owner_is_admin(access_key)
+        .await
+        .map_err(crate::control_store::to_sqlx)
 }
 
 async fn bucket_exists(cw: &mut ControlWrite<'_>, bucket: &str) -> Result<bool, sqlx::Error> {
@@ -148,11 +144,11 @@ async fn bucket_exists(cw: &mut ControlWrite<'_>, bucket: &str) -> Result<bool, 
         .map_err(crate::control_store::to_sqlx)
 }
 
-fn permissions_rows(bits: &[PermissionBits]) -> Vec<PermissionRow> {
-    let mut rows: Vec<PermissionRow> = bits
+fn permissions_rows(bits: &[PermissionBits]) -> Vec<xl_store::control_store::iam::PermissionRow> {
+    let mut rows: Vec<xl_store::control_store::iam::PermissionRow> = bits
         .iter()
         .filter(|p| p.read || p.write || p.delete)
-        .map(|p| PermissionRow {
+        .map(|p| xl_store::control_store::iam::PermissionRow {
             bucket: p.bucket.clone(),
             read: p.read,
             write: p.write,
@@ -245,7 +241,15 @@ pub(crate) async fn apply_command(
             } else if uid(cw, username).await?.is_some() {
                 ControlResponse::Conflict
             } else {
-                Db::create_user_raw(cw, username, password_hash, status, *created_at).await?;
+                crate::control_store::SqliteControlTxn::new(cw.conn())
+                    .user_create(&xl_store::control_store::iam::UserEntry {
+                        username: username.clone(),
+                        password_hash: password_hash.clone(),
+                        status: status.clone(),
+                        created_at: *created_at,
+                    })
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                 ControlResponse::Ok
             }
         }
@@ -256,11 +260,30 @@ pub(crate) async fn apply_command(
                 match uid(cw, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        if Db::delete_user_cascade(cw, id).await? {
-                            ControlResponse::Ok
-                        } else {
+                        let guard = crate::control_store::SqliteControlTxn::new(cw.conn())
+                            .user_delete_guard(id)
+                            .await
+                            .map_err(crate::control_store::to_sqlx)?;
+                        if !guard {
                             // 守卫拒绝：目标是最后一个在册管理员（命令路径本不产生管理员）。
                             ControlResponse::Conflict
+                        } else {
+                            crate::control_store::SqliteControlTxn::new(cw.conn())
+                                .user_delete_access_keys_permissions(id)
+                                .await
+                                .map_err(crate::control_store::to_sqlx)?;
+                            // shortcut: buckets/uploads 属其它域，所有权清空仍在本级联中间执行（D7）。
+                            for sql in [
+                                "UPDATE buckets SET owner_id = NULL WHERE owner_id = ?",
+                                "UPDATE uploads SET owner_id = NULL WHERE owner_id = ?",
+                            ] {
+                                sqlx::query(sql).bind(id).execute(&mut *cw.conn).await?;
+                            }
+                            crate::control_store::SqliteControlTxn::new(cw.conn())
+                                .user_delete(id)
+                                .await
+                                .map_err(crate::control_store::to_sqlx)?;
+                            ControlResponse::Ok
                         }
                     }
                 }
@@ -276,7 +299,11 @@ pub(crate) async fn apply_command(
                 match uid(cw, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        if Db::set_password_raw(cw, id, password_hash).await? {
+                        if crate::control_store::SqliteControlTxn::new(cw.conn())
+                            .user_set_password(id, password_hash)
+                            .await
+                            .map_err(crate::control_store::to_sqlx)?
+                        {
                             ControlResponse::Ok
                         } else {
                             ControlResponse::NotFound
@@ -292,7 +319,11 @@ pub(crate) async fn apply_command(
                 match uid(cw, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        if Db::set_user_status_raw(cw, id, status == "active").await? {
+                        if crate::control_store::SqliteControlTxn::new(cw.conn())
+                            .user_set_status(id, status == "active")
+                            .await
+                            .map_err(crate::control_store::to_sqlx)?
+                        {
                             ControlResponse::Ok
                         } else {
                             ControlResponse::Conflict
@@ -311,7 +342,10 @@ pub(crate) async fn apply_command(
                 match uid(cw, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        Db::set_permissions_raw(cw, id, &permissions_rows(permissions)).await?;
+                        crate::control_store::SqliteControlTxn::new(cw.conn())
+                            .permissions_replace(id, &permissions_rows(permissions))
+                            .await
+                            .map_err(crate::control_store::to_sqlx)?;
                         ControlResponse::Ok
                     }
                 }
@@ -333,29 +367,35 @@ pub(crate) async fn apply_command(
             {
                 ControlResponse::Invalid
             } else {
-                let exists: Option<i64> =
-                    sqlx::query_scalar("SELECT 1 FROM access_keys WHERE access_key = ?")
-                        .bind(access_key)
-                        .fetch_optional(&mut *cw.conn)
-                        .await?;
-                if exists.is_some() {
+                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+                if txn
+                    .access_key_exists(access_key)
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?
+                {
                     ControlResponse::Conflict
                 } else {
                     // 属主缺失（非 witness）是不变量破坏：AK 会永远无法鉴权。
-                    let Some(user_id) = uid(cw, username).await? else {
+                    let Some(_user_id) = txn
+                        .user_uid(username)
+                        .await
+                        .map_err(crate::control_store::to_sqlx)?
+                    else {
                         return Err(invariant(format!("access key owner {username} not found")));
                     };
-                    Db::create_access_key_raw(
-                        cw,
-                        access_key,
-                        secret_key,
-                        user_id,
-                        kind,
-                        parent_ak.as_deref(),
-                        session_policy.as_deref(),
-                        *created_at,
-                    )
-                    .await?;
+                    txn.access_key_create(&xl_store::control_store::iam::AccessKeyEntry {
+                        access_key: access_key.clone(),
+                        secret_key: secret_key.clone(),
+                        username: username.clone(),
+                        status: "active".into(),
+                        expires_at: None,
+                        created_at: *created_at,
+                        parent_ak: parent_ak.clone(),
+                        session_policy: session_policy.clone(),
+                        kind: kind.clone(),
+                    })
+                    .await
+                    .map_err(crate::control_store::to_sqlx)?;
                     ControlResponse::Ok
                 }
             }
@@ -363,7 +403,11 @@ pub(crate) async fn apply_command(
         ControlCommand::AccessKeyDelete { access_key } => {
             if access_key_owner_is_admin(cw, access_key).await? {
                 ControlResponse::Invalid
-            } else if Db::delete_access_key_raw(cw, access_key).await? {
+            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .access_key_delete(access_key)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -372,7 +416,11 @@ pub(crate) async fn apply_command(
         ControlCommand::AccessKeySetStatus { access_key, status } => {
             if !valid_user_status(status) || access_key_owner_is_admin(cw, access_key).await? {
                 ControlResponse::Invalid
-            } else if Db::set_access_key_status_raw(cw, access_key, status).await? {
+            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
+                .access_key_set_status(access_key, status)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+            {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound

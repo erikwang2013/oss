@@ -142,7 +142,6 @@ pub trait ControlTxn:
     + AccountSnapshotTxn
     + Send
 {
-    async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError>;
     async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError>;
     /// 返回是否确有行被删除。
     async fn vpc_endpoint_delete(&mut self, vpce_id: &str) -> Result<bool, ControlError>;

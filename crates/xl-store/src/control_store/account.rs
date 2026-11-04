@@ -94,11 +94,8 @@ pub trait AccountStore: Send + Sync {
         account_id: &str,
         username: &str,
     ) -> Result<Option<i64>, ControlError>;
-    async fn member_role(
-        &self,
-        account_id: &str,
-        uid: i64,
-    ) -> Result<Option<String>, ControlError>;
+    async fn member_role(&self, account_id: &str, uid: i64)
+    -> Result<Option<String>, ControlError>;
     /// `uid` 升序。
     async fn account_members(
         &self,
@@ -116,12 +113,26 @@ pub trait AccountStore: Send + Sync {
 /// 调用方事务内的账户写；本 trait 不 begin/commit/rollback。
 #[async_trait::async_trait]
 pub trait AccountTxn: Send {
+    async fn account_status(&mut self, id: &str) -> Result<Option<String>, ControlError>;
+    /// `(hard_byte_quota, object_quota)`；账户不存在 → None。
+    async fn account_hard_limits(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError>;
     /// `INSERT OR IGNORE`（无 admin_uid）。
     async fn account_insert_if_absent(
         &mut self,
         id: &str,
         name: &str,
         bucket_quota: Option<i64>,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<bool, ControlError>;
+    /// 系统账户 `INSERT OR IGNORE`（id 固定，无 admin_uid/bucket_quota）。
+    async fn account_system_insert_if_absent(
+        &mut self,
+        id: &str,
+        name: &str,
         created_at: i64,
         updated_at: i64,
     ) -> Result<bool, ControlError>;
@@ -169,6 +180,12 @@ pub trait AccountTxn: Send {
     async fn account_delete(&mut self, id: &str) -> Result<bool, ControlError>;
     async fn account_member_count(&mut self, id: &str) -> Result<i64, ControlError>;
     async fn account_bucket_count(&mut self, id: &str) -> Result<i64, ControlError>;
+    /// 账户内按 username 找非管理员成员 uid。
+    async fn member_uid(
+        &mut self,
+        account_id: &str,
+        username: &str,
+    ) -> Result<Option<i64>, ControlError>;
     /// `ON CONFLICT(uid) DO UPDATE`（成员迁移/角色变更）。
     async fn account_member_upsert(
         &mut self,
@@ -204,10 +221,7 @@ pub trait AccountTxn: Send {
     /// 删「管理员 uid 派生且已无成员」的账户。
     async fn accounts_delete_admin_derived(&mut self) -> Result<(), ControlError>;
     /// owner 的当前账户桶数 >= bucket_quota；停用账户 fail-closed。
-    async fn bucket_quota_reached(
-        &mut self,
-        owner_id: Option<i64>,
-    ) -> Result<bool, ControlError>;
+    async fn bucket_quota_reached(&mut self, owner_id: Option<i64>) -> Result<bool, ControlError>;
     async fn account_ledger(
         &mut self,
         account_id: &str,

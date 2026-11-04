@@ -14,7 +14,7 @@ fn backend(e: sqlx::Error) -> ControlError {
 }
 
 /// 账户桶集合的 FROM/WHERE 片段；`account` 是账户 id 的 SQL 表达式。
-fn account_buckets_from(account: &str) -> String {
+pub(super) fn account_buckets_from(account: &str) -> String {
     format!(
         "FROM buckets b JOIN users u ON u.id = b.owner_id \
          LEFT JOIN account_members bm ON bm.uid = u.id \
@@ -22,7 +22,7 @@ fn account_buckets_from(account: &str) -> String {
     )
 }
 
-fn account_bucket_count_sql() -> String {
+pub(super) fn account_bucket_count_sql() -> String {
     format!("(SELECT COUNT(*) {})", account_buckets_from("a.id"))
 }
 

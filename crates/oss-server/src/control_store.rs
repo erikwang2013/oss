@@ -21,6 +21,7 @@ use xl_store::control_store::{
 };
 
 mod account;
+mod account_write;
 mod ap_olap;
 mod audit;
 mod audit_write;
@@ -28,6 +29,7 @@ mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
 mod iam;
+mod iam_write;
 mod inventory;
 mod jobs;
 mod jobs_snapshot;
@@ -294,14 +296,6 @@ pub(crate) async fn delete_lifecycle_inventory_tier_for_bucket(
 
 #[async_trait::async_trait]
 impl ControlTxn for SqliteControlTxn<'_> {
-    async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError> {
-        sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
-            .bind(account_id)
-            .fetch_optional(&mut *self.conn)
-            .await
-            .map_err(backend)
-    }
-
     async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError> {
         sqlx::query(
             "INSERT INTO vpc_endpoints \
