@@ -180,7 +180,7 @@ pub struct ScheduleLeaseRow { pub term: i64, pub node: i64, pub expires_at: i64,
 - Commits：`1160c08` `refactor(oss-server): route single-node job engine through ControlTxn`；`af8b3ea` `test(oss-server): audit jobs ControlStore migration`。
 - Focused：`cargo test -p oss-server --test control_store_jobs_diff` 3/3；`cargo test -p oss-server --test raft_guard` 3/3；`cargo test -p oss-server --lib` 316/316；`cargo test -p xl-store` 483 passed / 1 ignored（含各 target）。
 - Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
-- 已知残余 / D7：`db.rs::claim_task_fenced` 的 `BEGIN IMMEDIATE` 留在调用方（SQLite 写锁串行化，非适配器事务）；`raft/compat.rs::guard_runstate_activation` 的悬空引用检查为启动期只读并列入源码审计白名单；B（outbox/uploads/sync intents）与 D（site 表）尚未实施，保留任务 B1–B3/D1–D2 描述与 D7 例外。
+- 已知残余 / D7：`db.rs::claim_task_fenced` 的 `BEGIN IMMEDIATE` 留在调用方（SQLite 写锁串行化，非适配器事务）；`raft/compat.rs::guard_runstate_activation` 的悬空引用检查为启动期只读并列入源码审计白名单；B/D 切片结果见下节。
 
 ### C 切片（audit_log）
 
@@ -189,8 +189,17 @@ pub struct ScheduleLeaseRow { pub term: i64, pub node: i64, pub expires_at: i64,
 - Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
 - 语义保持：批量 INSERT 仍逐行同一事务、入参顺序不变；`flush` 失败重试一次后丢弃不变；控制台过滤片段/绑定顺序/JSON 字段不变；purge 单语句自动提交与 `limit.max(1)` 不变。
 
-### 未实施（B / D）
+### B 切片（event_outbox / repl_outbox / uploads / sync intents）
 
-- B1–B3（`event_outbox`、`repl_outbox`、`uploads`、`sync_write_intents`/`sync_delete_intents`）与 D1–D2（M7 `site_*` 表）本轮未实施，相关源码未改动；D7 例外按计划原文保留。
-- 停止点原因：A+C 完成并绿后，剩余工作仍需多轮全量编译/差分验证；本次环境构建排队严重（单次 `cargo test` 编译约 40 分钟，load average 峰值 >50），无法在本次交付内完成并验证 B/D。
-- 交接建议：从 Task B1 开始，复用 A/C 的 adapter/差分测试/源码审计模式；D1/D2 先按 D7 给 `site.rs` 加 `shortcut:` 再评估可迁移读写。
+- Commits：`5622300` `feat(xl-store): add outbox, uploads, sync intent, and site control-store traits`；`10a711d` `feat(oss-server): add SQLite adapters for outbox, uploads, sync intents, and sites`；`2e91d1e` `refactor(oss-server): route event outbox through ControlTxn`；`9dc96dd` `refactor(oss-server): route repl outbox and uploads through ControlStore`；`2e590ed` `refactor(oss-server): route sync intents through ControlTxn`。
+- Focused：`cargo test -p oss-server --test control_store_event_outbox_diff` 5/5；`cargo test -p oss-server --test control_store_repl_uploads_diff` 3/3；`cargo test -p oss-server --test control_store_sync_sites_diff` 3/3（含 D1）；`cargo test -p oss-server --test raft_guard` 3/3；`cargo test -p oss-server --lib` 316/316。
+- Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
+- 语义保持：event claim 仍为 `UPDATE…RETURNING` 按 id 顺序，`claimed_at` token 守卫贯穿 renew/finish/retry/bury，回收严格 `claimed_at < now - lease`（边界不回收），attempts>10 bury、redeliver 仅 dead；repl 按 seq claim、300s 租约、`MAX_ATTEMPTS=10`，version 聚合与 earlier-inflight 查询不变，drop-site 先 RETURNING 非空版本再删空版本行，repair 计数与清理同事务；uploads 保持 `ON CONFLICT(saved_path) DO NOTHING`、`owner_id IS NULL` claim 守卫与 register 覆盖语义；sync intents 的插入/状态/tee/恢复扫描及 `INTENT_DONE` 不变，`PRAGMA synchronous = FULL` 仍由调用方在取得的连接上执行。
+- 已知残余：`delete_user` 的 uploads owner 清空保留 raw（IAM 归属，`shortcut:`）；其余 B 表生产直写仅存在于适配器，源码审计 `raft_guard` 覆盖。
+
+### D 切片（sites / site_cursors / site_config）
+
+- Commits：`9dc96dd`（`db.rs`/`raft/repair.rs` 的 site 读写随 B2 提交）；`e15e38f` `refactor(oss-server): route site control tables through SiteStore`（含 D2 `shortcut:` 注释与源码审计白名单）。
+- Focused：`cargo test -p oss-server --test control_store_sync_sites_diff` 3/3；`cargo test -p oss-server --test raft_guard` 3/3；`cargo test -p oss-server --lib` 316/316。
+- 语义保持：三张表无触发器；`site_pair_upsert` 保持 UPDATE-then-INSERT 且 UPDATE 不触碰 `reconcile_required`；`site_insert` 仍 `INSERT OR IGNORE site_cursors (…, 0, now)`；`site_config` 单行 trim/seed/apply 顺序与 `site_lag_rows` 投影不变；repair 的 outbox 计数/清理与 reconcile 门在同一事务。
+- D2 残余：`site.rs` 的 LWW/apply/changelog/apply_dead 保持 raw 并逐处 `shortcut:`；`db.rs::delete_site` 的 `DELETE FROM site_apply_dead` 保留 raw（apply 路径所有权），`raft_guard` 白名单记录原因。
