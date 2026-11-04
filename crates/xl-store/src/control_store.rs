@@ -11,11 +11,16 @@ use serde::{Deserialize, Serialize};
 pub mod account;
 pub mod audit;
 pub mod bucket;
+pub mod event_outbox;
 pub mod iam;
 pub mod inventory;
 pub mod jobs;
 pub mod lifecycle;
+pub mod repl_outbox;
+pub mod sites;
+pub mod sync_intents;
 pub mod tier;
+pub mod uploads;
 
 pub use account::{AccountEntry, AccountMemberEntry, AccountUsageLedgerEntry};
 pub use bucket::{BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRuleEntry};
@@ -27,11 +32,16 @@ pub use lifecycle::LifecycleRuleEntry;
 use account::{AccountSnapshotTxn, AccountStore, AccountTxn};
 use audit::{AuditStore, AuditTxn};
 use bucket::{BucketSnapshotTxn, BucketStore, BucketTxn};
+use event_outbox::{EventOutboxStore, EventOutboxTxn};
 use iam::{IamSnapshotTxn, IamStore, IamTxn};
 use inventory::{InventoryStore, InventoryTxn};
 use jobs::{JobSnapshotTxn, JobStore, JobTxn};
 use lifecycle::{LifecycleStore, LifecycleTxn};
+use repl_outbox::{ReplOutboxStore, ReplOutboxTxn};
+use sites::{SiteStore, SiteTxn};
+use sync_intents::{SyncIntentStore, SyncIntentTxn};
 use tier::{TierStore, TierTxn};
+use uploads::{UploadStore, UploadTxn};
 
 /// 属主自然键：`Admin` = 目标站点本地管理员（buckets → NULL；AP/inventory → 本地
 /// 管理员 id，witness 写哨兵 0）；`User(username)` = 复制用户。
@@ -108,6 +118,11 @@ pub trait ControlStore:
     + AuditStore
     + IamStore
     + AccountStore
+    + EventOutboxStore
+    + ReplOutboxStore
+    + SiteStore
+    + SyncIntentStore
+    + UploadStore
     + Send
     + Sync
 {
@@ -140,6 +155,11 @@ pub trait ControlTxn:
     + IamSnapshotTxn
     + AccountTxn
     + AccountSnapshotTxn
+    + EventOutboxTxn
+    + ReplOutboxTxn
+    + SiteTxn
+    + SyncIntentTxn
+    + UploadTxn
     + Send
 {
     async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError>;
