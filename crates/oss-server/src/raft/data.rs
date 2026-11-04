@@ -26,6 +26,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
+use xl_store::control_store::inventory::InventoryTxn;
+use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{ControlError, ControlTxn, OlapConfigEntry};
 
 use super::compat::{
@@ -383,29 +385,10 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
         });
     }
 
-    for r in sqlx::query(
-        "SELECT bucket, prefix, rule_id, expire_days, expiration_days, transition_days, \
-                transition_class, transition_tier, enabled, updated_at, config_json \
-         FROM lifecycle_rules ORDER BY bucket, rule_id, prefix",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.lifecycle_rules.push(LifecycleRuleRow {
-            bucket: r.get("bucket"),
-            prefix: r.get("prefix"),
-            rule_id: r.get("rule_id"),
-            expire_days: r.get("expire_days"),
-            expiration_days: r.get("expiration_days"),
-            transition_days: r.get("transition_days"),
-            transition_class: r.get("transition_class"),
-            transition_tier: r.get("transition_tier"),
-            enabled: r.get::<i64, _>("enabled") != 0,
-            updated_at: r.get("updated_at"),
-            config_json: r.get("config_json"),
-        });
-    }
+    data.lifecycle_rules = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.all_lifecycle_rules().await.map_err(control_data_err)?
+    };
 
     for r in
         sqlx::query("SELECT bucket, config_json, updated_at FROM event_configs ORDER BY bucket")
@@ -459,28 +442,10 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
             .collect()
     };
 
-    for r in sqlx::query(
-        "SELECT i.bucket, i.id, i.owner_id, i.config_json, i.updated_at, \
-                u.username AS owner_username, u.is_admin AS owner_is_admin \
-         FROM inventory_configs i LEFT JOIN users u ON u.id = i.owner_id \
-         ORDER BY i.bucket, i.id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.inventory_configs.push(InventoryConfigRow {
-            bucket: r.get("bucket"),
-            id: r.get("id"),
-            owner: owner_of(
-                Some(r.get("owner_id")),
-                r.get("owner_username"),
-                r.get("owner_is_admin"),
-            )?,
-            config_json: r.get("config_json"),
-            updated_at: r.get("updated_at"),
-        });
-    }
+    data.inventory_configs = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.inventory_configs().await.map_err(control_data_err)?
+    };
 
     // 账户两表只在 canonical marker 之后进入快照：marker 之前它们可能是节点本地的
     // uid 派生行，复制出去会让其它节点按本地 id 解释（跨节点不可解释）。
@@ -681,6 +646,27 @@ pub(crate) async fn install_tx(
             }
         }
     }
+    // inventory 属主预校验（任何写之前，与 AP 同口径）。
+    for inv in &data.inventory_configs {
+        match &inv.owner {
+            OwnerRef::Admin => {
+                if ctx.admin_id.is_none() && !ctx.witness {
+                    return Err(DataError::NoAdminUser);
+                }
+            }
+            OwnerRef::User(name) => {
+                if !data
+                    .users
+                    .iter()
+                    .any(|u| u.username.as_str() == name.as_str())
+                {
+                    return Err(DataError::Format(format!(
+                        "inventory owner {name} not in snapshot"
+                    )));
+                }
+            }
+        }
+    }
     // 1. AP → olap（olap_configs.access_point 外键）。
     crate::control_store::SqliteControlTxn::new(&mut *conn)
         .replace_access_points(&[])
@@ -688,10 +674,8 @@ pub(crate) async fn install_tx(
         .map_err(control_data_err)?;
     // 2. 桶配置行（无外键，先清）。
     for q in [
-        "DELETE FROM inventory_configs",
         "DELETE FROM event_configs",
         "DELETE FROM replication_rules",
-        "DELETE FROM lifecycle_rules",
         "DELETE FROM bucket_policies",
     ] {
         sqlx::query(q).execute(&mut *conn).await.map_err(sql)?;
@@ -885,28 +869,10 @@ pub(crate) async fn install_tx(
         .replace_access_points(&data.access_points)
         .await
         .map_err(control_data_err)?;
-    for inv in &data.inventory_configs {
-        let owner_id = match &inv.owner {
-            OwnerRef::Admin => match ctx.admin_id {
-                Some(id) => id,
-                None if ctx.witness => 0,
-                None => return Err(DataError::NoAdminUser),
-            },
-            OwnerRef::User(name) => user_id(name, "inventory")?,
-        };
-        sqlx::query(
-            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&inv.bucket)
-        .bind(&inv.id)
-        .bind(owner_id)
-        .bind(&inv.config_json)
-        .bind(inv.updated_at)
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_inventory_configs(&data.inventory_configs)
         .await
-        .map_err(sql)?;
-    }
+        .map_err(control_data_err)?;
 
     // 12. 桶级配置（桶已就位）。
     for p in &data.bucket_policies {
@@ -920,28 +886,10 @@ pub(crate) async fn install_tx(
         .await
         .map_err(sql)?;
     }
-    for l in &data.lifecycle_rules {
-        sqlx::query(
-            "INSERT INTO lifecycle_rules \
-             (bucket, prefix, expire_days, enabled, updated_at, rule_id, expiration_days, \
-              transition_days, transition_class, transition_tier, config_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&l.bucket)
-        .bind(&l.prefix)
-        .bind(l.expire_days)
-        .bind(l.enabled)
-        .bind(l.updated_at)
-        .bind(&l.rule_id)
-        .bind(l.expiration_days)
-        .bind(l.transition_days)
-        .bind(&l.transition_class)
-        .bind(&l.transition_tier)
-        .bind(&l.config_json)
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_all_lifecycle_rules(&data.lifecycle_rules)
         .await
-        .map_err(sql)?;
-    }
+        .map_err(control_data_err)?;
     for e in &data.event_configs {
         sqlx::query("INSERT INTO event_configs (bucket, config_json, updated_at) VALUES (?, ?, ?)")
             .bind(&e.bucket)
@@ -2422,5 +2370,237 @@ mod tests {
         let v2 = encode_snapshot_at(&sample(), 2).unwrap();
         assert_eq!(decode_snapshot_with_max(&v2, 2).unwrap().feature_level, 2);
         assert!(decode_snapshot_with_max(&v2, 1).is_err());
+    }
+    /// Task 6：lifecycle/inventory 安装后读序确定（按旧 SQL ORDER BY），且旧行被替换。
+    #[tokio::test]
+    async fn control_data_lifecycle_inventory_order_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "li-order.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        let data = ControlData {
+            lifecycle_rules: vec![
+                LifecycleRuleRow {
+                    bucket: "b2".into(),
+                    prefix: "p".into(),
+                    rule_id: Some("r1".into()),
+                    expire_days: 1,
+                    expiration_days: None,
+                    transition_days: None,
+                    transition_class: None,
+                    transition_tier: None,
+                    enabled: true,
+                    updated_at: 1,
+                    config_json: None,
+                },
+                LifecycleRuleRow {
+                    bucket: "b1".into(),
+                    prefix: "p".into(),
+                    rule_id: Some("r2".into()),
+                    expire_days: 1,
+                    expiration_days: None,
+                    transition_days: None,
+                    transition_class: None,
+                    transition_tier: None,
+                    enabled: true,
+                    updated_at: 1,
+                    config_json: None,
+                },
+            ],
+            inventory_configs: vec![
+                InventoryConfigRow {
+                    bucket: "b2".into(),
+                    id: "c".into(),
+                    owner: OwnerRef::Admin,
+                    config_json: "{}".into(),
+                    updated_at: 1,
+                },
+                InventoryConfigRow {
+                    bucket: "b1".into(),
+                    id: "c".into(),
+                    owner: OwnerRef::Admin,
+                    config_json: "{}".into(),
+                    updated_at: 1,
+                },
+            ],
+            ..ControlData::default()
+        };
+        let ctx = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: false,
+        };
+        install_tx(&mut tx, &data, &ctx).await.unwrap();
+        let read = read_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            read.lifecycle_rules
+                .iter()
+                .map(|r| r.bucket.as_str())
+                .collect::<Vec<_>>(),
+            ["b1", "b2"],
+            "lifecycle 顺序 (bucket, rule_id, prefix)"
+        );
+        assert_eq!(
+            read.inventory_configs
+                .iter()
+                .map(|r| r.bucket.as_str())
+                .collect::<Vec<_>>(),
+            ["b1", "b2"],
+            "inventory 顺序 (bucket, id)"
+        );
+    }
+
+    /// Task 6：悬空 inventory 属主在任何写之前整包拒绝。
+    #[tokio::test]
+    async fn snapshot_install_rejects_dangling_inventory_owner_before_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "inv-dangling.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let admin_id = seed_active_admin(&mut tx).await;
+        sqlx::query(
+            "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at, rule_id)              VALUES ('b1', 'p', 1, 1, 1, 'r-old')",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at)              VALUES ('b1', 'cfg-old', ?, '{}', 1)",
+        )
+        .bind(admin_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let before_lifecycle: Vec<String> =
+            sqlx::query_scalar("SELECT rule_id FROM lifecycle_rules ORDER BY rule_id")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        let before_inventory: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM inventory_configs ORDER BY id")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+
+        let data = ControlData {
+            inventory_configs: vec![InventoryConfigRow {
+                bucket: "b1".into(),
+                id: "cfg-new".into(),
+                owner: OwnerRef::User("ghost".into()),
+                config_json: "{}".into(),
+                updated_at: 2,
+            }],
+            lifecycle_rules: vec![LifecycleRuleRow {
+                bucket: "b1".into(),
+                prefix: "p".into(),
+                rule_id: Some("r-new".into()),
+                expire_days: 1,
+                expiration_days: None,
+                transition_days: None,
+                transition_class: None,
+                transition_tier: None,
+                enabled: true,
+                updated_at: 2,
+                config_json: None,
+            }],
+            ..ControlData::default()
+        };
+        let ctx = InstallCtx {
+            admin_id: Some(admin_id),
+            witness: false,
+            canonical: false,
+        };
+        let err = install_tx(&mut tx, &data, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("inventory owner ghost not in snapshot"),
+            "{err}"
+        );
+        let after_lifecycle: Vec<String> =
+            sqlx::query_scalar("SELECT rule_id FROM lifecycle_rules ORDER BY rule_id")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        let after_inventory: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM inventory_configs ORDER BY id")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(before_lifecycle, after_lifecycle, "拒绝必须零写");
+        assert_eq!(before_inventory, after_inventory, "拒绝必须零写");
+        tx.rollback().await.unwrap();
+    }
+
+    /// Task 6：RunState 五表往返保持 id/顺序，其余四表仍由原路径负责。
+    #[tokio::test]
+    async fn runstate_five_tables_round_trip_preserves_order_and_ids() {
+        use crate::raft::runstate::{
+            RunState, InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow,
+            LifecycleCursorRow, TierRestoreRow, install_runstate_tx, read_runstate_tx,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "runstate-five.db").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let run = |id: i64| InventoryRunRow {
+            id,
+            bucket: "b1".into(),
+            config_id: "c".into(),
+            run_key: format!("k{id}"),
+            state: "running".into(),
+            created_at: 1,
+            ..InventoryRunRow::default()
+        };
+        let state = RunState {
+            inventory_runs: vec![run(2), run(5), run(9)],
+            inventory_cursors: vec![InventoryCursorRow {
+                bucket: "b1".into(),
+                config_id: "c".into(),
+                cursor: "42".into(),
+                config_updated_at: 1,
+                updated_at: 2,
+                fence_term: 3,
+                fence_leader: 1,
+            }],
+            inventory_incremental: vec![InventoryIncrementalRow {
+                bucket: "b1".into(),
+                config_id: "c".into(),
+                enabled: true,
+                updated_at: 2,
+            }],
+            tier_restores: vec![TierRestoreRow {
+                bucket: "b1".into(),
+                key: "k".into(),
+                version_id: "v".into(),
+                expires_at: 9,
+                job_id: None,
+                state: "restored".into(),
+                created_at: 1,
+                fence_term: 2,
+                fence_leader: 1,
+            }],
+            lifecycle_cursors: vec![LifecycleCursorRow {
+                bucket: "b1".into(),
+                rule_id: "r".into(),
+                stage: "scan".into(),
+                cursor: "7".into(),
+                updated_at: 2,
+                fence_term: 2,
+                fence_leader: 1,
+            }],
+            next_job_id: 1,
+            next_run_id: 10,
+            ..RunState::default()
+        };
+        install_runstate_tx(&mut tx, &state).await.unwrap();
+        let read = read_runstate_tx(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(read, state);
+        assert_eq!(
+            read.inventory_runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [2, 5, 9]
+        );
     }
 }

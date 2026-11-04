@@ -6,30 +6,28 @@
 
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use super::model::{
-    InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
-    LifecycleCursorRow, RunState, ScheduleLeaseRow, TierRestoreRow,
-};
+use super::model::{JobRow, JobTaskRow, RunState, ScheduleLeaseRow};
 use crate::raft::data::DataError;
+use xl_store::control_store::inventory::InventoryTxn;
+use xl_store::control_store::lifecycle::LifecycleTxn;
+use xl_store::control_store::tier::TierTxn;
+use xl_store::control_store::ControlError;
 
 const META_NEXT_JOB_ID: &str = "next_job_id";
 const META_NEXT_RUN_ID: &str = "next_run_id";
 
-/// 九张运行态表（安装前整表清空；顺序即删除顺序）。
-const RUNSTATE_TABLES: [&str; 9] = [
-    "jobs",
-    "job_tasks",
-    "inventory_runs",
-    "inventory_cursors",
-    "inventory_incremental",
-    "tier_restores",
-    "lifecycle_cursors",
-    "schedule_lease",
-    "runstate_meta",
-];
+/// 仍由本模块直写的四张表（安装前整表清空）；其余五张走 ControlTxn。
+const RUNSTATE_RAW_TABLES: [&str; 4] = ["jobs", "job_tasks", "schedule_lease", "runstate_meta"];
 
 fn sql(e: sqlx::Error) -> DataError {
     DataError::Format(format!("runstate sql: {e}"))
+}
+
+fn control_err(e: ControlError) -> DataError {
+    match e {
+        ControlError::Invalid(m) => DataError::Format(m),
+        ControlError::Backend(m) => DataError::Format(format!("control store backend: {m}")),
+    }
 }
 
 async fn read_meta(conn: &mut SqliteConnection, key: &str) -> Result<i64, DataError> {
@@ -93,64 +91,6 @@ pub(crate) fn job_task_row_from(r: &sqlx::sqlite::SqliteRow) -> JobTaskRow {
     }
 }
 
-/// 整行 → [`InventoryRunRow`]（同上）。
-pub(crate) fn inventory_run_row_from(r: &sqlx::sqlite::SqliteRow) -> InventoryRunRow {
-    InventoryRunRow {
-        id: r.get("id"),
-        bucket: r.get("bucket"),
-        config_id: r.get("config_id"),
-        run_key: r.get("run_key"),
-        started_at: r.get("started_at"),
-        state: r.get("state"),
-        job_id: r.get("job_id"),
-        manifest_key: r.get("manifest_key"),
-        error: r.get("error"),
-        created_at: r.get("created_at"),
-        fence_term: r.get("fence_term"),
-        fence_leader: r.get("fence_leader"),
-    }
-}
-
-/// 整行 → [`InventoryCursorRow`]（同上）。
-pub(crate) fn inventory_cursor_row_from(r: &sqlx::sqlite::SqliteRow) -> InventoryCursorRow {
-    InventoryCursorRow {
-        bucket: r.get("bucket"),
-        config_id: r.get("config_id"),
-        cursor: r.get("cursor"),
-        config_updated_at: r.get("config_updated_at"),
-        updated_at: r.get("updated_at"),
-        fence_term: r.get("fence_term"),
-        fence_leader: r.get("fence_leader"),
-    }
-}
-
-/// 整行 → [`InventoryIncrementalRow`]（`enabled` SQLite 0/1 → bool）。
-pub(crate) fn inventory_incremental_row_from(
-    r: &sqlx::sqlite::SqliteRow,
-) -> InventoryIncrementalRow {
-    InventoryIncrementalRow {
-        bucket: r.get("bucket"),
-        config_id: r.get("config_id"),
-        enabled: r.get::<i64, _>("enabled") != 0,
-        updated_at: r.get("updated_at"),
-    }
-}
-
-/// 整行 → [`TierRestoreRow`]（restore 后续状态复制与快照读共用）。
-pub(crate) fn tier_restore_row_from(r: &sqlx::sqlite::SqliteRow) -> TierRestoreRow {
-    TierRestoreRow {
-        bucket: r.get("bucket"),
-        key: r.get("key"),
-        version_id: r.get("version_id"),
-        expires_at: r.get("expires_at"),
-        job_id: r.get("job_id"),
-        state: r.get("state"),
-        created_at: r.get("created_at"),
-        fence_term: r.get("fence_term"),
-        fence_leader: r.get("fence_leader"),
-    }
-}
-
 /// 整行 → [`ScheduleLeaseRow`]（调度租约复制与快照读共用）。
 pub(crate) fn lease_row_from(r: &sqlx::sqlite::SqliteRow) -> ScheduleLeaseRow {
     ScheduleLeaseRow {
@@ -158,19 +98,6 @@ pub(crate) fn lease_row_from(r: &sqlx::sqlite::SqliteRow) -> ScheduleLeaseRow {
         node: r.get("node"),
         expires_at: r.get("expires_at"),
         acquired_at: r.get("acquired_at"),
-    }
-}
-
-/// 整行 → [`LifecycleCursorRow`]（lifecycle 游标复制与快照读共用）。
-pub(crate) fn lifecycle_cursor_row_from(r: &sqlx::sqlite::SqliteRow) -> LifecycleCursorRow {
-    LifecycleCursorRow {
-        bucket: r.get("bucket"),
-        rule_id: r.get("rule_id"),
-        stage: r.get("stage"),
-        cursor: r.get("cursor"),
-        updated_at: r.get("updated_at"),
-        fence_term: r.get("fence_term"),
-        fence_leader: r.get("fence_leader"),
     }
 }
 
@@ -203,61 +130,13 @@ pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, D
         state.job_tasks.push(job_task_row_from(&r));
     }
 
-    for r in sqlx::query(
-        "SELECT id, bucket, config_id, run_key, started_at, state, job_id, manifest_key, \
-                error, created_at, fence_term, fence_leader FROM inventory_runs ORDER BY id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
     {
-        state.inventory_runs.push(inventory_run_row_from(&r));
-    }
-
-    for r in sqlx::query(
-        "SELECT bucket, config_id, cursor, config_updated_at, updated_at, fence_term, \
-                fence_leader FROM inventory_cursors ORDER BY bucket, config_id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        state.inventory_cursors.push(inventory_cursor_row_from(&r));
-    }
-
-    for r in sqlx::query(
-        "SELECT bucket, config_id, enabled, updated_at FROM inventory_incremental \
-         ORDER BY bucket, config_id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        state
-            .inventory_incremental
-            .push(inventory_incremental_row_from(&r));
-    }
-
-    for r in sqlx::query(
-        "SELECT bucket, key, version_id, expires_at, job_id, state, created_at, fence_term, \
-                fence_leader FROM tier_restores ORDER BY bucket, key, version_id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        state.tier_restores.push(tier_restore_row_from(&r));
-    }
-
-    for r in sqlx::query(
-        "SELECT bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader \
-         FROM lifecycle_cursors ORDER BY bucket, rule_id, stage",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        state.lifecycle_cursors.push(lifecycle_cursor_row_from(&r));
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        state.inventory_runs = txn.inventory_runs().await.map_err(control_err)?;
+        state.inventory_cursors = txn.inventory_cursors().await.map_err(control_err)?;
+        state.inventory_incremental = txn.inventory_incrementals().await.map_err(control_err)?;
+        state.tier_restores = txn.tier_restores().await.map_err(control_err)?;
+        state.lifecycle_cursors = txn.lifecycle_cursors().await.map_err(control_err)?;
     }
 
     state.schedule_lease = sqlx::query(
@@ -329,7 +208,7 @@ pub async fn install_runstate_tx(
 }
 
 async fn write_rows(conn: &mut SqliteConnection, state: &RunState) -> Result<(), DataError> {
-    for table in RUNSTATE_TABLES {
+    for table in RUNSTATE_RAW_TABLES {
         sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
             .execute(&mut *conn)
             .await
@@ -401,94 +280,23 @@ async fn write_rows(conn: &mut SqliteConnection, state: &RunState) -> Result<(),
         .map_err(sql)?;
     }
 
-    for run in &state.inventory_runs {
-        sqlx::query(
-            "INSERT INTO inventory_runs (id, bucket, config_id, run_key, started_at, state, \
-              job_id, manifest_key, error, created_at, fence_term, fence_leader) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(run.id)
-        .bind(&run.bucket)
-        .bind(&run.config_id)
-        .bind(&run.run_key)
-        .bind(run.started_at)
-        .bind(&run.state)
-        .bind(run.job_id)
-        .bind(&run.manifest_key)
-        .bind(&run.error)
-        .bind(run.created_at)
-        .bind(run.fence_term)
-        .bind(run.fence_leader)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-
-    for c in &state.inventory_cursors {
-        sqlx::query(
-            "INSERT INTO inventory_cursors (bucket, config_id, cursor, config_updated_at, \
-              updated_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&c.bucket)
-        .bind(&c.config_id)
-        .bind(&c.cursor)
-        .bind(c.config_updated_at)
-        .bind(c.updated_at)
-        .bind(c.fence_term)
-        .bind(c.fence_leader)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-
-    for i in &state.inventory_incremental {
-        sqlx::query(
-            "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(&i.bucket)
-        .bind(&i.config_id)
-        .bind(i.enabled)
-        .bind(i.updated_at)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-
-    for t in &state.tier_restores {
-        sqlx::query(
-            "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, \
-              created_at, fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&t.bucket)
-        .bind(&t.key)
-        .bind(&t.version_id)
-        .bind(t.expires_at)
-        .bind(t.job_id)
-        .bind(&t.state)
-        .bind(t.created_at)
-        .bind(t.fence_term)
-        .bind(t.fence_leader)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-
-    for c in &state.lifecycle_cursors {
-        sqlx::query(
-            "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at, \
-              fence_term, fence_leader) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&c.bucket)
-        .bind(&c.rule_id)
-        .bind(&c.stage)
-        .bind(&c.cursor)
-        .bind(c.updated_at)
-        .bind(c.fence_term)
-        .bind(c.fence_leader)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+    {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.replace_inventory_runs(&state.inventory_runs)
+            .await
+            .map_err(control_err)?;
+        txn.replace_inventory_cursors(&state.inventory_cursors)
+            .await
+            .map_err(control_err)?;
+        txn.replace_inventory_incrementals(&state.inventory_incremental)
+            .await
+            .map_err(control_err)?;
+        txn.replace_tier_restores(&state.tier_restores)
+            .await
+            .map_err(control_err)?;
+        txn.replace_lifecycle_cursors(&state.lifecycle_cursors)
+            .await
+            .map_err(control_err)?;
     }
 
     if let Some(lease) = &state.schedule_lease {
