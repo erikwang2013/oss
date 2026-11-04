@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod account;
 pub mod audit;
 pub mod bucket;
 pub mod iam;
@@ -16,12 +17,14 @@ pub mod jobs;
 pub mod lifecycle;
 pub mod tier;
 
+pub use account::{AccountEntry, AccountMemberEntry, AccountUsageLedgerEntry};
 pub use bucket::{BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRuleEntry};
 pub use iam::{AccessKeyEntry, PermissionEntry, UserEntry};
 pub use inventory::InventoryConfigEntry;
 pub use jobs::{JobRow, JobTaskRow, ScheduleLeaseRow};
 pub use lifecycle::LifecycleRuleEntry;
 
+use account::{AccountSnapshotTxn, AccountStore, AccountTxn};
 use audit::{AuditStore, AuditTxn};
 use bucket::{BucketSnapshotTxn, BucketStore, BucketTxn};
 use iam::{IamSnapshotTxn, IamStore, IamTxn};
@@ -104,6 +107,7 @@ pub trait ControlStore:
     + JobStore
     + AuditStore
     + IamStore
+    + AccountStore
     + Send
     + Sync
 {
@@ -134,6 +138,8 @@ pub trait ControlTxn:
     + AuditTxn
     + IamTxn
     + IamSnapshotTxn
+    + AccountTxn
+    + AccountSnapshotTxn
     + Send
 {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError>;
