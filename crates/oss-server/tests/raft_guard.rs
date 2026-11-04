@@ -107,6 +107,7 @@ fn source_scan_flags_new_control_table_writers() {
         "lifecycle_rules",
         "bucket_policies",
         "event_configs",
+        "event_outbox",
         "replication_rules",
         "access_points",
         "olap_configs",
@@ -115,6 +116,13 @@ fn source_scan_flags_new_control_table_writers() {
         "job_tasks",
         "schedule_lease",
         "runstate_meta",
+        "repl_outbox",
+        "uploads",
+        "sync_write_intents",
+        "sync_delete_intents",
+        "sites",
+        "site_cursors",
+        "site_config",
     ];
     // M7 直写路径 / local M3 控制面 / apply 原语所在文件（已人工核对）。
     const ALLOWED: &[&str] = &[
@@ -148,6 +156,20 @@ fn source_scan_flags_new_control_table_writers() {
         "account.rs",
         "account_write.rs",
         "account_snapshot.rs",
+        // ControlStore SQLite 适配器（event_outbox 切片）。
+        "event_outbox.rs",
+        "event_outbox_write.rs",
+        // ControlStore SQLite 适配器（repl_outbox/uploads/sync_intents/sites 切片）。
+        "repl_outbox.rs",
+        "repl_outbox_write.rs",
+        "uploads.rs",
+        "uploads_write.rs",
+        "sync_intents.rs",
+        "sync_intents_write.rs",
+        "sites.rs",
+        "sites_write.rs",
+        // 内联测试模块仅构造夹具（`state/tests.rs`）。
+        "tests.rs",
         // level-3 账户命令 apply 子模块（apply 层，经 ControlCommand 进入）。
         "accounts.rs",
         "data.rs",

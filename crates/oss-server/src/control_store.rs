@@ -29,6 +29,8 @@ mod audit_write;
 mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
+mod event_outbox;
+mod event_outbox_write;
 mod iam;
 mod iam_snapshot;
 mod iam_write;
@@ -37,7 +39,15 @@ mod jobs;
 mod jobs_snapshot;
 mod jobs_write;
 mod lifecycle;
+mod repl_outbox;
+mod repl_outbox_write;
+mod sites;
+mod sites_write;
+mod sync_intents;
+mod sync_intents_write;
 mod tier;
+mod uploads;
+mod uploads_write;
 
 pub struct SqliteControlStore {
     pub(crate) pool: SqlitePool,
