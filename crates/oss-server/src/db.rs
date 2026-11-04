@@ -2321,17 +2321,16 @@ impl Db {
 
     /// 建桶配额最终判定（仅新建行；已存在行是收敛，不增加桶数）。
     /// `conn` 由调用方保证已持写锁或本地 applied 已追平。
-    // shortcut: 账户配额 SQL 片段与 IAM 用户级联同属 Slice 5（账户/配额），随该切片迁移。
     pub(crate) async fn bucket_create_quota_reached_conn(
         conn: &mut SqliteConnection,
         name: &str,
         owner: Option<&str>,
     ) -> Result<bool> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&mut *conn)
-            .await?;
-        if exists.is_some() {
+        if crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .bucket_exists(name)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+        {
             return Ok(false);
         }
         let Some(owner) = owner else {

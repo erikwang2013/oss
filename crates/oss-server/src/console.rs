@@ -4347,6 +4347,8 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
     };
 
     // 管理员长时 AK（join body 需要与对方同主密钥封装的 SK）。
+    // shortcut: 配对一次性读管理员 AK（含 SELECT 半句形状），保留 raw SQL；
+    // 配对流程整体属 Slice 6（sites），届时随集群路由一起迁移。
     let creds: Option<(String, String)> = sqlx::query_as(
         "SELECT a.access_key, a.secret_key FROM access_keys a JOIN users u ON u.id = a.user_id \
          WHERE u.is_admin = 1 AND a.kind = 'long-term' AND a.parent_ak IS NULL \

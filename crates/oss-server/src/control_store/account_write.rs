@@ -9,6 +9,24 @@ use super::{SqliteControlTxn, backend};
 
 #[async_trait::async_trait]
 impl AccountTxn for SqliteControlTxn<'_> {
+    async fn account_counts(&mut self) -> Result<(i64, i64), ControlError> {
+        let row = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM accounts) AS accounts, \
+                    (SELECT COUNT(*) FROM account_members) AS members",
+        )
+        .fetch_one(&mut *self.conn)
+        .await
+        .map_err(backend)?;
+        Ok((row.get("accounts"), row.get("members")))
+    }
+
+    async fn account_ledger_count(&mut self) -> Result<i64, ControlError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM account_usage_ledger")
+            .fetch_one(&mut *self.conn)
+            .await
+            .map_err(backend)
+    }
+
     async fn account_status(&mut self, id: &str) -> Result<Option<String>, ControlError> {
         sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
             .bind(id)

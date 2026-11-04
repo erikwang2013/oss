@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
+use xl_store::control_store::iam::IamTxn;
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::store::Store;
 
@@ -460,12 +461,11 @@ async fn user_of(
     tx: &mut sqlx::SqliteConnection,
     username: &str,
 ) -> Result<Option<(i64, bool)>, String> {
-    let r = sqlx::query("SELECT id, is_admin FROM users WHERE username = ?")
-        .bind(username)
-        .fetch_optional(&mut *tx)
+    let user = crate::control_store::SqliteControlTxn::new(&mut *tx)
+        .user_by_username(username)
         .await
         .map_err(|e| bad(e.to_string()))?;
-    Ok(r.map(|r| (r.get("id"), r.get::<i64, _>("is_admin") != 0)))
+    Ok(user.map(|u| (u.uid, u.is_admin)))
 }
 
 #[allow(clippy::explicit_auto_deref)]
@@ -485,28 +485,22 @@ async fn apply_permission(
     if e.op == "delete" {
         let bucket = pstr(&e.payload, "bucket")
             .unwrap_or_else(|| e.entity_id.split('\u{1f}').nth(1).unwrap_or("").to_string());
-        sqlx::query("DELETE FROM permissions WHERE user_id = ? AND bucket = ?")
-            .bind(uid)
-            .bind(bucket)
-            .execute(&mut *tx)
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .permission_delete(uid, &bucket)
             .await
             .map_err(|err| bad(err.to_string()))?;
     } else {
         let bucket = pstr(&e.payload, "bucket").unwrap_or_default();
-        sqlx::query(
-            "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, bucket) DO UPDATE SET \
-               can_read=excluded.can_read, can_write=excluded.can_write, \
-               can_delete=excluded.can_delete",
-        )
-        .bind(uid)
-        .bind(bucket)
-        .bind(pi64(&e.payload, "can_read").unwrap_or(0))
-        .bind(pi64(&e.payload, "can_write").unwrap_or(0))
-        .bind(pi64(&e.payload, "can_delete").unwrap_or(0))
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| bad(err.to_string()))?;
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .permission_upsert(
+                uid,
+                &bucket,
+                pi64(&e.payload, "can_read").unwrap_or(0) != 0,
+                pi64(&e.payload, "can_write").unwrap_or(0) != 0,
+                pi64(&e.payload, "can_delete").unwrap_or(0) != 0,
+            )
+            .await
+            .map_err(|err| bad(err.to_string()))?;
     }
     Ok(Ok(()))
 }
@@ -523,12 +517,14 @@ async fn apply_user(
         if admin {
             return Ok(Err("拒绝删除本地管理员".into()));
         }
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .user_delete_access_keys_permissions(uid)
+            .await
+            .map_err(|err| bad(err.to_string()))?;
+        // 跨域 FK 置空（D7）：users 被删前先断开 uploads/buckets 的本地属主。
         for sql in [
-            "DELETE FROM access_keys WHERE user_id = ?",
-            "DELETE FROM permissions WHERE user_id = ?",
             "UPDATE uploads SET owner_id = NULL WHERE owner_id = ?",
             "UPDATE buckets SET owner_id = NULL WHERE owner_id = ?",
-            "DELETE FROM users WHERE id = ?",
         ] {
             sqlx::query(sql)
                 .bind(uid)
@@ -536,41 +532,39 @@ async fn apply_user(
                 .await
                 .map_err(|err| bad(err.to_string()))?;
         }
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .user_delete(uid)
+            .await
+            .map_err(|err| bad(err.to_string()))?;
         return Ok(Ok(()));
     }
     let Some(uid_admin) = user_of(&mut *tx, &e.entity_id).await? else {
         let Some(hash) = pstr(&e.payload, "password_hash") else {
             return Ok(Err("password_hash 缺失".into()));
         };
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
-             VALUES (?, ?, 0, ?, ?)",
-        )
-        .bind(&e.entity_id)
-        .bind(hash)
-        .bind(pstr(&e.payload, "status").unwrap_or_else(|| "active".into()))
-        .bind(pi64(&e.payload, "created_at").unwrap_or(0))
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| bad(err.to_string()))?;
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .user_create(&xl_store::control_store::iam::UserEntry {
+                username: e.entity_id.clone(),
+                password_hash: hash.to_string(),
+                status: pstr(&e.payload, "status").unwrap_or_else(|| "active".into()),
+                created_at: pi64(&e.payload, "created_at").unwrap_or(0),
+            })
+            .await
+            .map_err(|err| bad(err.to_string()))?;
         return Ok(Ok(()));
     };
     if uid_admin.1 {
         return Ok(Err("目标是本地管理员（不覆盖）".into()));
     }
     if let Some(hash) = pstr(&e.payload, "password_hash") {
-        sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-            .bind(hash)
-            .bind(uid_admin.0)
-            .execute(&mut *tx)
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .user_set_password(uid_admin.0, &hash)
             .await
             .map_err(|err| bad(err.to_string()))?;
     }
     if let Some(status) = pstr(&e.payload, "status") {
-        sqlx::query("UPDATE users SET status = ? WHERE id = ?")
-            .bind(status)
-            .bind(uid_admin.0)
-            .execute(&mut *tx)
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .user_set_status_value(uid_admin.0, &status)
             .await
             .map_err(|err| bad(err.to_string()))?;
     }
@@ -584,22 +578,15 @@ async fn apply_access_key(
 ) -> Result<Result<(), String>, String> {
     if e.op == "delete" {
         // L1：本地管理员的 AK 不得被远端删除（与 upsert 的 R11 守卫同口径）。
-        let owner = sqlx::query(
-            "SELECT u.is_admin FROM access_keys k JOIN users u ON u.id = k.user_id \
-             WHERE k.access_key = ? AND k.kind = 'long-term'",
-        )
-        .bind(&e.entity_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| bad(err.to_string()))?;
-        if let Some(r) = owner
-            && r.get::<i64, _>("is_admin") != 0
-        {
+        let admin = crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .access_key_long_term_owner_is_admin(&e.entity_id)
+            .await
+            .map_err(|err| bad(err.to_string()))?;
+        if admin {
             return Ok(Err("目标是本地管理员 AK（删除跳过）".into()));
         }
-        sqlx::query("DELETE FROM access_keys WHERE access_key = ? AND kind = 'long-term'")
-            .bind(&e.entity_id)
-            .execute(&mut *tx)
+        crate::control_store::SqliteControlTxn::new(&mut *tx)
+            .access_key_delete_long_term(&e.entity_id)
             .await
             .map_err(|err| bad(err.to_string()))?;
         return Ok(Ok(()));
@@ -613,34 +600,29 @@ async fn apply_access_key(
     if admin {
         return Ok(Err("目标是本地管理员（AK 跳过）".into()));
     }
-    let existing = sqlx::query("SELECT user_id, kind FROM access_keys WHERE access_key = ?")
-        .bind(&e.entity_id)
-        .fetch_optional(&mut *tx)
+    let existing = crate::control_store::SqliteControlTxn::new(&mut *tx)
+        .access_key_user_and_kind(&e.entity_id)
         .await
         .map_err(|err| bad(err.to_string()))?;
-    if let Some(r) = &existing
-        && (r.get::<i64, _>("user_id") != uid || r.get::<String, _>("kind") != "long-term")
+    if let Some((owner, kind)) = &existing
+        && (*owner != uid || kind != "long-term")
     {
         return Ok(Err("同 AK 属主/类型冲突（不静默改属）".into()));
     }
     let Some(secret) = pstr(&e.payload, "secret_key") else {
         return Ok(Err("secret_key 缺失".into()));
     };
-    sqlx::query(
-        "INSERT INTO access_keys (access_key, secret_key, user_id, status, expires_at, \
-         created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'long-term') \
-         ON CONFLICT(access_key) DO UPDATE SET secret_key=excluded.secret_key, \
-           user_id=excluded.user_id, status=excluded.status, expires_at=excluded.expires_at",
-    )
-    .bind(&e.entity_id)
-    .bind(secret)
-    .bind(uid)
-    .bind(pstr(&e.payload, "status").unwrap_or_else(|| "active".into()))
-    .bind(pi64(&e.payload, "expires_at"))
-    .bind(pi64(&e.payload, "created_at").unwrap_or(0))
-    .execute(&mut *tx)
-    .await
-    .map_err(|err| bad(err.to_string()))?;
+    crate::control_store::SqliteControlTxn::new(&mut *tx)
+        .access_key_site_upsert(
+            &e.entity_id,
+            &secret,
+            uid,
+            &pstr(&e.payload, "status").unwrap_or_else(|| "active".into()),
+            pi64(&e.payload, "expires_at"),
+            pi64(&e.payload, "created_at").unwrap_or(0),
+        )
+        .await
+        .map_err(|err| bad(err.to_string()))?;
     Ok(Ok(()))
 }
 

@@ -31,6 +31,13 @@ impl IamTxn for SqliteControlTxn<'_> {
             .map_err(backend)
     }
 
+    async fn admin_id(&mut self) -> Result<Option<i64>, ControlError> {
+        sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
+            .fetch_optional(&mut *self.conn)
+            .await
+            .map_err(backend)
+    }
+
     async fn user_uid_non_admin(&mut self, username: &str) -> Result<Option<i64>, ControlError> {
         sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND is_admin = 0")
             .bind(username)

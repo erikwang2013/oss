@@ -122,6 +122,8 @@ impl SigV4Auth {
 }
 
 // ponytail: 每请求查一次 AK、无缓存 —— SQLite 读不阻塞、撤销即时生效；量大再加缓存。
+// shortcut: SigV4 热路径只持 SqlitePool，看不到 oss-server 的 ControlStore 适配器；
+// 每请求 AK→SK 查询保留 raw SQL，最终移除 SQLite 或引入后端无关 pool 时再迁移（D7）。
 #[async_trait::async_trait]
 impl S3Auth for SigV4Auth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {

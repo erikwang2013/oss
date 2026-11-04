@@ -432,6 +432,8 @@ fn signed_caller(caller_ak: Option<&str>) -> S3Result<String> {
 }
 
 /// 落一行会话（S1：AK `ASIA`+32hex / SK 32B hex / token 不落库）。
+// shortcut: STS 签发/父链查询只持 SqlitePool，看不到 oss-server 适配器；会话行写入
+// 与 caller_of 保留 raw SQL，最终移除 SQLite 或引入后端无关 pool 时再迁移（D7）。
 async fn issue(
     pool: &SqlitePool,
     vault: Option<&crate::skvault::SecretVault>,
