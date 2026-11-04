@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod audit;
 pub mod bucket;
 pub mod inventory;
 pub mod jobs;
@@ -19,6 +20,7 @@ pub use inventory::InventoryConfigEntry;
 pub use jobs::{JobRow, JobTaskRow, ScheduleLeaseRow};
 pub use lifecycle::LifecycleRuleEntry;
 
+use audit::{AuditStore, AuditTxn};
 use bucket::{BucketSnapshotTxn, BucketStore, BucketTxn};
 use inventory::{InventoryStore, InventoryTxn};
 use jobs::{JobSnapshotTxn, JobStore, JobTxn};
@@ -92,7 +94,7 @@ pub enum ControlError {
 /// 只读控制面访问。实现必须复用 `Db` 的既有连接池，不得自建第二个池。
 #[async_trait::async_trait]
 pub trait ControlStore:
-    BucketStore + LifecycleStore + InventoryStore + TierStore + JobStore + Send + Sync
+    BucketStore + LifecycleStore + InventoryStore + TierStore + JobStore + AuditStore + Send + Sync
 {
     async fn vpc_endpoint(&self, vpce_id: &str) -> Result<Option<VpcEndpoint>, ControlError>;
     /// 按 `vpce_id` 升序（导出/校验的确定性来源）。
@@ -118,6 +120,7 @@ pub trait ControlTxn:
     + TierTxn
     + JobTxn
     + JobSnapshotTxn
+    + AuditTxn
     + Send
 {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError>;

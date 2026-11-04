@@ -162,7 +162,11 @@ pub struct ScheduleLeaseRow { pub term: i64, pub node: i64, pub expires_at: i64,
 
 ## Task C1：audit_log
 
-`xl-store` `AuditEntry` + `AuditTxn::audit_insert_batch`/`AuditStore` 读与 purge；`audit_queue.rs` 批量写入、`db.rs` purge/read 走缝；测试顺序/批量/异步 flush 语义不变。
+- Create `crates/xl-store/src/control_store/audit.rs`：`AuditRecord`/`NewAuditRecord`/`AuditQuery`、`AuditStore::audit_page`、`AuditTxn::{audit_insert_batch,audit_delete_older_than}`（只借用调用方事务）。
+- Create `crates/oss-server/src/control_store/{audit,audit_write}.rs`：动态 WHERE/绑定顺序与 `db.rs::list_audit` 逐字一致；批量插入同事务逐行；purge 保留 id 子查询与 `limit.max(1)`。
+- Modify `audit_queue.rs`（flush 的 `pool.begin()` 仍由调用方持有，失败重试一次不变）、`db.rs`（`list_audit`/`delete_audit_older_than` 走缝，JSON 投影不变）。
+- Create `crates/oss-server/tests/control_store_audit_diff.rs`：批量顺序、8 组过滤差分、purge 差分（含 limit 0）、源码审计；既有 `audit_queue::worker_writes_batched_rows` 覆盖异步批量。
+- 提交：`refactor(oss-server): route audit log through ControlStore`。
 
 ## Task D1–D2：site 表
 
@@ -177,3 +181,10 @@ pub struct ScheduleLeaseRow { pub term: i64, pub node: i64, pub expires_at: i64,
 - Focused：`cargo test -p oss-server --test control_store_jobs_diff` 3/3；`cargo test -p oss-server --test raft_guard` 3/3；`cargo test -p oss-server --lib` 316/316；`cargo test -p xl-store` 483 passed / 1 ignored（含各 target）。
 - Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
 - 已知残余 / D7：`db.rs::claim_task_fenced` 的 `BEGIN IMMEDIATE` 留在调用方（SQLite 写锁串行化，非适配器事务）；`raft/compat.rs::guard_runstate_activation` 的悬空引用检查为启动期只读并列入源码审计白名单；B（outbox/uploads/sync intents）与 D（site 表）尚未实施，保留任务 B1–B3/D1–D2 描述与 D7 例外。
+
+### C 切片（audit_log）
+
+- Commit：`refactor(oss-server): route audit log through ControlStore`（本提交）。
+- Focused：`cargo test -p oss-server --test control_store_audit_diff` 4/4（批量顺序/过滤差分/purge 差分/源码审计）；异步批量语义由 `audit_queue::worker_writes_batched_rows` 覆盖。
+- Gates：`cargo clippy -p xl-store -p oss-server --all-targets -- -D warnings` 绿；`cargo fmt --check` 绿。
+- 语义保持：批量 INSERT 仍逐行同一事务、入参顺序不变；`flush` 失败重试一次后丢弃不变；控制台过滤片段/绑定顺序/JSON 字段不变；purge 单语句自动提交与 `limit.max(1)` 不变。

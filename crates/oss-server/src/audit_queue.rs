@@ -140,22 +140,25 @@ async fn flush(pool: &SqlitePool, batch: &mut Vec<AuditEntry>) {
 }
 
 async fn insert_batch(pool: &SqlitePool, rows: &[AuditEntry]) -> Result<(), sqlx::Error> {
+    use xl_store::control_store::audit::{AuditTxn, NewAuditRecord};
+
+    let records: Vec<NewAuditRecord> = rows
+        .iter()
+        .map(|r| NewAuditRecord {
+            ts: r.ts,
+            uid: r.uid,
+            op: r.op.clone(),
+            bucket: r.bucket.clone(),
+            object_key: r.object_key.clone(),
+            decision: r.decision.clone(),
+            detail: r.detail.clone(),
+        })
+        .collect();
     let mut tx = pool.begin().await?;
-    for r in rows {
-        sqlx::query(
-            "INSERT INTO audit_log (ts, uid, op, bucket, object_key, decision, detail) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(r.ts)
-        .bind(r.uid)
-        .bind(&r.op)
-        .bind(&r.bucket)
-        .bind(&r.object_key)
-        .bind(&r.decision)
-        .bind(&r.detail)
-        .execute(&mut *tx)
-        .await?;
-    }
+    crate::control_store::SqliteControlTxn::new(&mut tx)
+        .audit_insert_batch(&records)
+        .await
+        .map_err(crate::control_store::to_sqlx)?;
     tx.commit().await
 }
 

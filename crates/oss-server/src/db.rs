@@ -5971,79 +5971,47 @@ impl Db {
     /// C5：审计保留策略——删除 ts < cutoff 的行，返回删除数（worker 按 OSS_AUDIT_RETENTION_DAYS）。
     /// 每批最多 `limit` 行（id 子查询圈定），大积压时不让单条 DELETE 长时间占写锁。
     pub async fn delete_audit_older_than(&self, cutoff: i64, limit: i64) -> Result<u64> {
-        let n = sqlx::query(
-            "DELETE FROM audit_log WHERE id IN \
-             (SELECT id FROM audit_log WHERE ts < ? ORDER BY ts LIMIT ?)",
-        )
-        .bind(cutoff)
-        .bind(limit.max(1))
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        use xl_store::control_store::audit::AuditTxn;
+
+        let mut conn = self.pool.acquire().await?;
+        let n = crate::control_store::SqliteControlTxn::new(&mut conn)
+            .audit_delete_older_than(cutoff, limit)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(n)
     }
 
     /// 审计查询（控制台；可选 decision/时间窗/uid/op/bucket/key 前缀过滤；最新在前）。
     /// 动态 WHERE 只拼**固定片段**，用户值一律绑定参数。
     pub async fn list_audit(&self, f: &AuditFilter<'_>) -> Result<Vec<serde_json::Value>> {
-        let mut sql = String::from(
-            "SELECT id, ts, uid, op, bucket, object_key, decision, detail FROM audit_log \
-             WHERE 1=1",
-        );
-        for (present, clause) in [
-            (f.decision.is_some(), " AND decision = ?"),
-            (f.from.is_some(), " AND ts >= ?"),
-            (f.to.is_some(), " AND ts <= ?"),
-            (f.uid.is_some(), " AND uid = ?"),
-            (f.op.is_some(), " AND op = ?"),
-            (f.bucket.is_some(), " AND bucket = ?"),
-        ] {
-            if present {
-                sql.push_str(clause);
-            }
-        }
-        // 前缀按字节字面量匹配：键区分大小写（LIKE 对 ASCII 不区分），无需转义通配符
-        if f.key_prefix.is_some() {
-            sql.push_str(" AND substr(object_key, 1, length(?)) = ?");
-        }
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        use xl_store::control_store::audit::{AuditQuery, AuditStore};
 
-        // 绑定顺序必须与上面的 WHERE 片段顺序一致
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-        if let Some(v) = f.decision {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.from {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.to {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.uid {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.op {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.bucket {
-            q = q.bind(v);
-        }
-        if let Some(v) = f.key_prefix {
-            q = q.bind(v).bind(v);
-        }
-        let rows = q.bind(f.limit).fetch_all(&self.pool).await?;
+        let query = AuditQuery {
+            limit: f.limit,
+            decision: f.decision.map(str::to_owned),
+            from: f.from,
+            to: f.to,
+            uid: f.uid,
+            op: f.op.map(str::to_owned),
+            bucket: f.bucket.map(str::to_owned),
+            key_prefix: f.key_prefix.map(str::to_owned),
+        };
+        let rows = crate::control_store::SqliteControlStore::new(self.pool.clone())
+            .audit_page(&query)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(rows
             .iter()
             .map(|r| {
                 serde_json::json!({
-                    "id": r.get::<i64, _>("id"),
-                    "ts": r.get::<i64, _>("ts"),
-                    "uid": r.get::<i64, _>("uid"),
-                    "op": r.get::<String, _>("op"),
-                    "bucket": r.get::<Option<String>, _>("bucket"),
-                    "object_key": r.get::<Option<String>, _>("object_key"),
-                    "decision": r.get::<String, _>("decision"),
-                    "detail": r.get::<Option<String>, _>("detail"),
+                    "id": r.id,
+                    "ts": r.ts,
+                    "uid": r.uid,
+                    "op": r.op,
+                    "bucket": r.bucket,
+                    "object_key": r.object_key,
+                    "decision": r.decision,
+                    "detail": r.detail,
                 })
             })
             .collect())

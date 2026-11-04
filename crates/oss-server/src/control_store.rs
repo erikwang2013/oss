@@ -21,6 +21,8 @@ use xl_store::control_store::{
 };
 
 mod ap_olap;
+mod audit;
+mod audit_write;
 mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
