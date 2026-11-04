@@ -423,12 +423,8 @@ async fn create_user(
         Err(e) => return control_failure(e),
     }
     // 命令只带自然键；apply 后按 username 取本地 uid（follower 已在 client_write 内等 apply）。
-    match sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ?")
-        .bind(username)
-        .fetch_optional(state.db.pool())
-        .await
-    {
-        Ok(Some(new_uid)) => Json(serde_json::json!({ "id": new_uid })).into_response(),
+    match state.db.control_store().user(username).await {
+        Ok(Some(u)) => Json(serde_json::json!({ "id": u.uid })).into_response(),
         Ok(None) => {
             tracing::error!(username, "账户内用户已建但回读失败");
             internal_error()

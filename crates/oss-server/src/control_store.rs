@@ -20,12 +20,14 @@ use xl_store::control_store::{
     AccessPointEntry, ControlError, ControlStore, ControlTxn, OlapConfigEntry, VpcEndpoint,
 };
 
+mod account;
 mod ap_olap;
 mod audit;
 mod audit_write;
 mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
+mod iam;
 mod inventory;
 mod jobs;
 mod jobs_snapshot;

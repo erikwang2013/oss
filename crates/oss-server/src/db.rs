@@ -1433,18 +1433,14 @@ impl Db {
     /// 自然键属主 → 本节点数字 id（console JSON 边界用）：`Admin` → 首个管理员；
     /// `User(name)` → `users.id`；缺失（含无管理员）→ 0。
     pub async fn owner_uid(&self, owner: &OwnerRef) -> Result<i64> {
-        let id: Option<i64> = match owner {
-            OwnerRef::Admin => {
-                sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-                    .fetch_optional(&self.pool)
-                    .await?
-            }
-            OwnerRef::User(name) => {
-                sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                    .bind(name)
-                    .fetch_optional(&self.pool)
-                    .await?
-            }
+        let store = self.control_store();
+        let id = match owner {
+            OwnerRef::Admin => store.admin_id().await.map_err(crate::control_store::to_sqlx)?,
+            OwnerRef::User(name) => store
+                .user(name)
+                .await
+                .map_err(crate::control_store::to_sqlx)?
+                .map(|u| u.uid),
         };
         Ok(id.unwrap_or(0))
     }
@@ -1455,12 +1451,12 @@ impl Db {
         if owner_id == 0 {
             return Ok(OwnerRef::Admin);
         }
-        let username: Option<String> =
-            sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
-                .bind(owner_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        username.map(OwnerRef::User).ok_or(sqlx::Error::RowNotFound)
+        self.control_store()
+            .user_by_id(owner_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|u| OwnerRef::User(u.username))
+            .ok_or(sqlx::Error::RowNotFound)
     }
 
     pub async fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<i64> {
@@ -1503,11 +1499,10 @@ impl Db {
     }
 
     pub async fn user_exists(&self, username: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT 1 FROM users WHERE username = ?")
-            .bind(username)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some())
+        self.control_store()
+            .user_exists(username)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     pub async fn verify_user(&self, username: &str, password: &str) -> Result<Option<i64>> {
@@ -1515,16 +1510,12 @@ impl Db {
         // 旧 M1 格式（sha256 单轮）仍可验证——**登录成功即透明重写升级**（一次迁移）。
         // status='active'：被停用的账号登录直接按「用户名或密码错误」处理（不问不答）。
         // AC-1：账户停用同样按凭据错误处理（成员行存在但账户行缺失 → 停用，fail-closed）。
-        let row = sqlx::query(
-            "SELECT id, password_hash FROM users u WHERE username = ? AND status = 'active' \
-             AND NOT EXISTS (SELECT 1 FROM account_members am \
-                LEFT JOIN accounts a ON a.id = am.account_id \
-                WHERE am.uid = u.id AND COALESCE(a.status, 'disabled') <> 'active')",
-        )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(r) = row else {
+        let Some(r) = self
+            .control_store()
+            .login_user(username)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+        else {
             // 用户存在性 oracle 收口（verifier 切片 7 观察 A）：Argon2 让「未命中早退」
             // 与「命中校验」的时延差从 µs 放大到几十 ms、网络可测——未命中路径先对一个
             // 固定 dummy 串跑一次同参数 verify 再返回，两侧时延拉平。
@@ -1533,9 +1524,11 @@ impl Db {
             crate::db::argon2_offload(move || crate::db::dummy_verify(&password)).await?;
             return Ok(None);
         };
-        let stored: String = r.get("password_hash");
-        let id: i64 = r.get("id");
+        let stored = r.password_hash;
+        let id = r.uid;
         let legacy = crate::db::is_legacy_hash(&stored);
+        // shortcut: 登录透明的旧 hash 重写留在 raw SQL，随 IAM 写适配器（Slice 5 Task 4）迁移。
+
         // Argon2 移出 tokio worker；行查询已在闸外完成，许可在返回前释放（不跨后续 DB I/O）。
         let password_for_verify = password.to_owned();
         if !crate::db::argon2_offload(move || {
@@ -1584,14 +1577,10 @@ impl Db {
 
     pub async fn list_access_keys(&self, user_id: i64) -> Result<Vec<String>> {
         // M5 切片 5：控制台只列长时键（会话行由 STS 签发、海量短寿，不进「访问密钥」页）
-        let rows = sqlx::query(
-            "SELECT access_key FROM access_keys WHERE user_id = ? AND kind = 'long-term' \
-             ORDER BY created_at, access_key",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.get("access_key")).collect())
+        self.control_store()
+            .access_keys_for_user(user_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
@@ -2015,17 +2004,12 @@ impl Db {
 
     /// 取用户（`/me`、admin 判定、停用拦截用）：(username, is_admin, is_active)。
     pub async fn get_user(&self, uid: i64) -> Result<Option<(String, bool, bool)>> {
-        let row = sqlx::query("SELECT username, is_admin, status FROM users WHERE id = ?")
-            .bind(uid)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| {
-            (
-                r.get::<String, _>("username"),
-                r.get::<i64, _>("is_admin") != 0,
-                r.get::<String, _>("status") == "active",
-            )
-        }))
+        Ok(self
+            .control_store()
+            .user_by_id(uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(|u| (u.username, u.is_admin, u.status == "active")))
     }
 
     /// 启停用用户。返回是否生效（false = 用户不存在，或停用会留下 0 个在册管理员）。
@@ -2059,27 +2043,30 @@ impl Db {
 
     /// 在册（active）管理员数：保护「不能停用最后一个可用管理员」。
     pub async fn count_active_admins(&self) -> Result<i64> {
-        sqlx::query_scalar("SELECT count(*) FROM users WHERE is_admin = 1 AND status = 'active'")
-            .fetch_one(&self.pool)
+        Ok(self
+            .control_store()
+            .admin_counts()
             .await
+            .map_err(crate::control_store::to_sqlx)?
+            .0)
     }
 
     /// 全部用户 + 各自权限行（子账户管理页；数量级 = 人手，两步查询足够）。
     pub async fn list_users(&self) -> Result<Vec<UserRow>> {
-        let users =
-            sqlx::query("SELECT id, username, is_admin, status, created_at FROM users ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?;
+        let users = self
+            .control_store()
+            .users()
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         let mut out = Vec::with_capacity(users.len());
-        for r in users {
-            let id: i64 = r.get("id");
+        for u in users {
             out.push(UserRow {
-                id,
-                username: r.get("username"),
-                is_admin: r.get::<i64, _>("is_admin") != 0,
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                permissions: self.get_permissions(id).await?,
+                id: u.uid,
+                username: u.username,
+                is_admin: u.is_admin,
+                status: u.status,
+                created_at: u.created_at,
+                permissions: self.get_permissions(u.uid).await?,
             });
         }
         Ok(out)
@@ -2087,9 +2074,12 @@ impl Db {
 
     /// 管理员数量（保护「最后一个管理员」不被删）。
     pub async fn count_admins(&self) -> Result<i64> {
-        sqlx::query_scalar("SELECT count(*) FROM users WHERE is_admin = 1")
-            .fetch_one(&self.pool)
+        Ok(self
+            .control_store()
+            .admin_counts()
             .await
+            .map_err(crate::control_store::to_sqlx)?
+            .1)
     }
 
     /// 改口令。返回是否有该用户。
@@ -2252,17 +2242,10 @@ impl Db {
 
     /// 缺少账户成员行的非管理员用户（legacy 派生账户路径；worker 的修复对象）。
     pub async fn legacy_users_missing_accounts(&self) -> Result<Vec<(i64, String)>> {
-        let rows = sqlx::query(
-            "SELECT u.id, u.username FROM users u WHERE u.is_admin = 0 \
-             AND NOT EXISTS (SELECT 1 FROM account_members am WHERE am.uid = u.id) \
-             ORDER BY u.id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get("id"), r.get("username")))
-            .collect())
+        self.control_store()
+            .legacy_users_missing_accounts()
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// standalone 幂等规范化（serve worker 与启动路径共用）：
@@ -2369,43 +2352,37 @@ impl Db {
 
     /// 用户当前账户：成员行优先，无行回落 uid 派生账户（legacy 兼容路径）。
     pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
-            .bind(uid)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row
-            .map(|r| r.get::<String, _>("account_id"))
+        Ok(self
+            .control_store()
+            .account_member_account(uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
             .or_else(|| xl_s3::access::account_id_of(uid)))
     }
 
     /// 账户状态是否允许该用户继续使用（无成员行 = 派生账户语义 = 有效）。
     /// 成员行存在但账户行缺失 → false（fail-closed）。
     pub async fn account_active(&self, uid: i64) -> Result<bool> {
-        let inactive: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM account_members am \
-             LEFT JOIN accounts a ON a.id = am.account_id \
-             WHERE am.uid = ? AND COALESCE(a.status, 'disabled') <> 'active'",
-        )
-        .bind(uid)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(inactive == 0)
+        self.control_store()
+            .account_active(uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
-    fn account_row_from(r: &sqlx::sqlite::SqliteRow) -> AccountRow {
+    fn account_row_from_view(a: xl_store::control_store::account::AccountView) -> AccountRow {
         AccountRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            status: r.get("status"),
-            admin_uid: r.get("admin_uid"),
-            bucket_quota: r.get("bucket_quota"),
-            soft_byte_quota: r.get("soft_byte_quota"),
-            hard_byte_quota: r.get("hard_byte_quota"),
-            object_quota: r.get("object_quota"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-            member_count: r.get("member_count"),
-            bucket_count: r.get("bucket_count"),
+            id: a.id,
+            name: a.name,
+            status: a.status,
+            admin_uid: a.admin_uid,
+            bucket_quota: a.bucket_quota,
+            soft_byte_quota: a.soft_byte_quota,
+            hard_byte_quota: a.hard_byte_quota,
+            object_quota: a.object_quota,
+            created_at: a.created_at,
+            updated_at: a.updated_at,
+            member_count: a.member_count,
+            bucket_count: a.bucket_count,
         }
     }
 
@@ -2427,17 +2404,12 @@ impl Db {
         format!("(SELECT COUNT(*) {})", Self::account_buckets_from("a.id"))
     }
 
-    /// 账户名下桶名（软配额用量端点逐桶列举；口径见 `account_buckets_from`）。
+    /// 账户名下桶名（软配额用量端点逐桶列举；口径见适配器 `account_buckets_from`）。
     pub async fn account_bucket_names(&self, account_id: &str) -> Result<Vec<String>> {
-        let sql = format!(
-            "SELECT b.name {} ORDER BY b.name",
-            Self::account_buckets_from("?")
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(account_id)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+        self.control_store()
+            .account_bucket_names(account_id)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 桶数配额判定（调用方已持写锁，或 leader 已确认本地 applied 追平）：owner 的
@@ -2521,40 +2493,23 @@ impl Db {
 
     /// 全部账户（管理员视角）或某用户的账户（账户成员视角）。
     pub async fn list_accounts(&self, member_uid: Option<i64>) -> Result<Vec<AccountRow>> {
-        let sql = format!(
-            "SELECT a.*, \
-             (SELECT COUNT(*) FROM account_members m WHERE m.account_id = a.id) AS member_count, \
-             {} AS bucket_count \
-             FROM accounts a {} ORDER BY a.id",
-            Self::account_bucket_count_sql(),
-            if member_uid.is_some() {
-                "WHERE a.id IN (SELECT account_id FROM account_members WHERE uid = ?)"
-            } else {
-                ""
-            }
-        );
-        // 字面量拼接只来自上面两个常量分支，无用户输入。
-        let q = sqlx::query(sqlx::AssertSqlSafe(sql));
-        let q = match member_uid {
-            Some(uid) => q.bind(uid),
-            None => q,
-        };
-        let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(Self::account_row_from).collect())
+        Ok(self
+            .control_store()
+            .accounts(member_uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .into_iter()
+            .map(Self::account_row_from_view)
+            .collect())
     }
 
     pub async fn get_account(&self, id: &str) -> Result<Option<AccountRow>> {
-        let sql = format!(
-            "SELECT a.*, \
-             (SELECT COUNT(*) FROM account_members m WHERE m.account_id = a.id) AS member_count, \
-             {} AS bucket_count FROM accounts a WHERE a.id = ?",
-            Self::account_bucket_count_sql()
-        );
-        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.as_ref().map(Self::account_row_from))
+        Ok(self
+            .control_store()
+            .account(id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .map(Self::account_row_from_view))
     }
 
     /// 新建账户。id 为 12 位随机数（与派生账户空间重叠概率可忽略，冲突重试）。
@@ -2668,36 +2623,29 @@ impl Db {
     }
 
     pub async fn list_account_members(&self, id: &str) -> Result<Vec<AccountMemberRow>> {
-        let rows = sqlx::query(
-            "SELECT am.uid AS uid, u.username AS username, am.role AS role, \
-                    u.is_admin AS is_admin, u.status AS status, am.created_at AS created_at \
-             FROM account_members am JOIN users u ON u.id = am.uid \
-             WHERE am.account_id = ? ORDER BY am.uid",
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| AccountMemberRow {
-                uid: r.get("uid"),
-                username: r.get("username"),
-                role: r.get("role"),
-                is_admin: r.get::<i64, _>("is_admin") != 0,
-                status: r.get("status"),
-                created_at: r.get("created_at"),
+        Ok(self
+            .control_store()
+            .account_members(id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .into_iter()
+            .map(|m| AccountMemberRow {
+                uid: m.uid,
+                username: m.username,
+                role: m.role,
+                is_admin: m.is_admin,
+                status: m.status,
+                created_at: m.created_at,
             })
             .collect())
     }
 
     /// 某用户在该账户里的角色（不在账户 → None）。
     pub async fn member_role(&self, account_id: &str, uid: i64) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT role FROM account_members WHERE account_id = ? AND uid = ?")
-            .bind(account_id)
-            .bind(uid)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.get("role")))
+        self.control_store()
+            .member_role(account_id, uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// 把用户挂到账户（已有成员行则迁入并改角色）。账户/用户不存在 → false；
@@ -2774,13 +2722,19 @@ impl Db {
 
     /// 某用户的权限行（全量）。
     pub async fn get_permissions(&self, uid: i64) -> Result<Vec<PermissionRow>> {
-        let rows = sqlx::query_as::<_, PermissionRow>(
-            "SELECT bucket, can_read, can_write, can_delete FROM permissions WHERE user_id = ? ORDER BY bucket",
-        )
-        .bind(uid)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        Ok(self
+            .control_store()
+            .permissions_for_user(uid)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+            .into_iter()
+            .map(|p| PermissionRow {
+                bucket: p.bucket,
+                read: p.read,
+                write: p.write,
+                delete: p.delete,
+            })
+            .collect())
     }
 
     /// 全量替换某用户的权限行（管理员的 PUT 语义）。全 0 行跳过不写（无行 = 无权限，等价且省行）。

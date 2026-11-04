@@ -3554,12 +3554,8 @@ async fn create_user(
     match state.control.write(cmd).await {
         Ok(crate::raft::ControlResponse::Ok) => {
             // 命令不带本地自增 id（跨站点自然键是 username），提交后回查一次。
-            match sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ?")
-                .bind(username)
-                .fetch_optional(state.db.pool())
-                .await
-            {
-                Ok(Some(id)) => Json(serde_json::json!({ "id": id })).into_response(),
+            match state.db.control_store().user(username).await {
+                Ok(Some(u)) => Json(serde_json::json!({ "id": u.uid })).into_response(),
                 Ok(None) => {
                     tracing::error!(user = %username, "建用户已提交但回查不到行");
                     internal_error()

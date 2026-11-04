@@ -78,12 +78,12 @@ async fn run_once(state: &AppState) -> Result<usize, String> {
         }
         // 创建与挂载之间用户可能已被管理员挂到真实账户；挂载命令按 uid upsert，
         // 重查后跳过，避免把成员从真实账户挪到 legacy 派生账户（仅缩小窗口）。
-        let attached: Option<String> =
-            sqlx::query_scalar("SELECT account_id FROM account_members WHERE uid = ?")
-                .bind(uid)
-                .fetch_optional(state.db.pool())
-                .await
-                .map_err(|e| e.to_string())?;
+        let attached = state
+            .db
+            .control_store()
+            .account_member_account(uid)
+            .await
+            .map_err(|e| e.to_string())?;
         if attached.is_some() {
             continue;
         }
