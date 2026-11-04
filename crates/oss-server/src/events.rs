@@ -9,9 +9,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqlx::Row as _;
 use sqlx::SqlitePool;
 use xl_store::control_store::bucket::BucketStore;
+use xl_store::control_store::event_outbox::EventOutboxTxn;
+
+use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 
 use xl_s3::events::{EventSink, EventSource, S3EventOp};
 use xl_s3::notify::EventTarget;
@@ -546,13 +548,12 @@ impl SqlEventSink {
         if targets.is_empty() {
             return;
         }
-        let owner_uid: Option<i64> =
-            crate::control_store::SqliteControlStore::new(self.pool.clone())
-                .bucket(bucket)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|v| v.owner_uid);
+        let owner_uid: Option<i64> = SqliteControlStore::new(self.pool.clone())
+            .bucket(bucket)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.owner_uid);
         for t in targets {
             // 精确匹配，或 `s3:ObjectAccessed:*` 这类尾星通配（配置层只放行该通配）
             if !t.events.iter().any(|e| {
@@ -584,17 +585,17 @@ impl SqlEventSink {
                 &source,
                 owner_uid,
             );
-            if let Err(e) = sqlx::query(
-                "INSERT INTO event_outbox (bucket, target_id, event_json, state, attempts, \
-                 next_retry_at, created_at) VALUES (?, ?, ?, 'pending', 0, 0, ?)",
-            )
-            .bind(bucket)
-            .bind(&t.target)
-            .bind(&payload)
-            .bind(now())
-            .execute(&self.pool)
-            .await
-            {
+            let enqueued = match self.pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .event_enqueue(bucket, &t.target, &payload, now())
+                        .await
+                }
+                Err(e) => Err(xl_store::control_store::ControlError::Backend(
+                    e.to_string(),
+                )),
+            };
+            if let Err(e) = enqueued {
                 tracing::warn!(error = %e, bucket, key, "事件入 outbox 失败（丢弃本条，不影响请求）");
             }
         }
@@ -635,17 +636,19 @@ impl EventSink for SqlEventSink {
 /// 他实例回收（丢失 claim）→ 调用方**跳过发送**（防「回收后旧 sender 仍发」的重复）。
 async fn renew_claim(pool: &SqlitePool, id: i64, old: Option<i64>) -> Option<i64> {
     let now_s = now();
-    match sqlx::query(
-        "UPDATE event_outbox SET claimed_at=? WHERE id=? AND claimed_at IS ? AND state='sending'",
-    )
-    .bind(now_s)
-    .bind(id)
-    .bind(old)
-    .execute(pool)
-    .await
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, id, "事件续租失败（跳过本轮）");
+            return None;
+        }
+    };
+    match SqliteControlTxn::new(&mut conn)
+        .event_renew(id, old, now_s)
+        .await
     {
-        Ok(r) if r.rows_affected() == 1 => Some(now_s),
-        Ok(_) => None,
+        Ok(true) => Some(now_s),
+        Ok(false) => None,
         Err(e) => {
             tracing::warn!(error = %e, id, "事件续租失败（跳过本轮）");
             None
@@ -655,13 +658,18 @@ async fn renew_claim(pool: &SqlitePool, id: i64, old: Option<i64>) -> Option<i64
 
 /// 成功删行（claim token 守卫；stale sender 不得复活已被重投/删除的行）。
 async fn finish_ok(pool: &SqlitePool, id: i64, token: Option<i64>) -> bool {
-    match sqlx::query("DELETE FROM event_outbox WHERE id=? AND claimed_at IS ? AND state='sending'")
-        .bind(id)
-        .bind(token)
-        .execute(pool)
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, id, "事件完成删行失败");
+            return false;
+        }
+    };
+    match SqliteControlTxn::new(&mut conn)
+        .event_finish_ok(id, token)
         .await
     {
-        Ok(r) => r.rows_affected() == 1,
+        Ok(ok) => ok,
         Err(e) => {
             tracing::warn!(error = %e, id, "事件完成删行失败");
             false
@@ -679,32 +687,28 @@ async fn requeue_or_bury(
     now_s: i64,
 ) -> bool {
     let bury = failure.permanent && attempts > MAX_ATTEMPTS;
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, id, "事件失败状态回写失败");
+            return false;
+        }
+    };
+    let mut txn = SqliteControlTxn::new(&mut conn);
     let res = if bury {
-        sqlx::query(
-            "UPDATE event_outbox SET state='dead', attempts=?, claimed_at=NULL, last_error=? \
-             WHERE id=? AND claimed_at IS ? AND state='sending'",
-        )
-        .bind(attempts)
-        .bind(&failure.message)
-        .bind(id)
-        .bind(token)
-        .execute(pool)
-        .await
+        txn.event_bury(id, token, attempts, &failure.message).await
     } else {
-        sqlx::query(
-            "UPDATE event_outbox SET state='pending', attempts=?, claimed_at=NULL, \
-             next_retry_at=?, last_error=? WHERE id=? AND claimed_at IS ? AND state='sending'",
+        txn.event_retry(
+            id,
+            token,
+            attempts,
+            now_s + backoff_secs(attempts),
+            &failure.message,
         )
-        .bind(attempts)
-        .bind(now_s + backoff_secs(attempts))
-        .bind(&failure.message)
-        .bind(id)
-        .bind(token)
-        .execute(pool)
         .await
     };
     match res {
-        Ok(r) => r.rows_affected() == 1,
+        Ok(ok) => ok,
         Err(e) => {
             tracing::warn!(error = %e, id, "事件失败状态回写失败");
             false
@@ -717,31 +721,32 @@ async fn requeue_or_bury(
 pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize, usize) {
     let now_s = now();
     // R2 回收：state='sending' 且租约过期 → 置回 pending（不计 attempts；崩溃自愈）
-    if let Err(e) = sqlx::query(
-        "UPDATE event_outbox SET state='pending', claimed_at=NULL, next_retry_at=? \
-         WHERE state='sending' AND claimed_at < ?",
-    )
-    .bind(now_s)
-    .bind(now_s - EVENT_LEASE_SECS)
-    .execute(pool)
-    .await
-    {
+    let reclaimed = match pool.acquire().await {
+        Ok(mut conn) => {
+            SqliteControlTxn::new(&mut conn)
+                .event_reclaim_expired(now_s, EVENT_LEASE_SECS)
+                .await
+        }
+        Err(e) => Err(xl_store::control_store::ControlError::Backend(
+            e.to_string(),
+        )),
+    };
+    if let Err(e) = reclaimed {
         tracing::warn!(error = %e, "事件 outbox 租约回收失败");
         return (0, 0);
     }
     // claim（原子 UPDATE…RETURNING；ORDER BY id = seq 序，逐条串行投递）
-    let rows = match sqlx::query(
-        "UPDATE event_outbox SET state='sending', claimed_at=? \
-         WHERE id IN (SELECT id FROM event_outbox WHERE state='pending' AND next_retry_at <= ? \
-                      ORDER BY id LIMIT ?) \
-         RETURNING id, target_id, event_json, attempts, claimed_at",
-    )
-    .bind(now_s)
-    .bind(now_s)
-    .bind(CLAIM_BATCH)
-    .fetch_all(pool)
-    .await
-    {
+    let rows = match pool.acquire().await {
+        Ok(mut conn) => {
+            SqliteControlTxn::new(&mut conn)
+                .event_claim(now_s, CLAIM_BATCH)
+                .await
+        }
+        Err(e) => Err(xl_store::control_store::ControlError::Backend(
+            e.to_string(),
+        )),
+    };
+    let rows = match rows {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "事件 outbox claim 失败");
@@ -750,11 +755,11 @@ pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize,
     };
     let (mut sent, mut failed) = (0usize, 0usize);
     for r in rows {
-        let id: i64 = r.get("id");
-        let target: String = r.get("target_id");
-        let payload: String = r.get("event_json");
-        let attempts: i64 = r.get("attempts");
-        let claimed: Option<i64> = r.get("claimed_at");
+        let id = r.id;
+        let target = r.target_id;
+        let payload = r.event_json;
+        let attempts = r.attempts;
+        let claimed = r.claimed_at;
         // P2-2：发送前续租（claim token 轮换）——丢失 claim 则跳过（他实例已接管）
         let Some(token) = renew_claim(pool, id, claimed).await else {
             continue;
@@ -808,6 +813,7 @@ pub fn spawn_worker(sink: Arc<SqlEventSink>, pool: SqlitePool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row as _;
 
     async fn pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
