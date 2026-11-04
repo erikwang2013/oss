@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
+use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::store::Store;
 
 use crate::state::AppState;
@@ -332,9 +333,16 @@ async fn apply_bucket(
     if e.op == "delete" {
         match store.delete_bucket(&e.entity_id).await {
             Ok(()) | Err(xl_store::error::Error::NoSuchBucket(_)) => {
+                {
+                    let mut txn = crate::control_store::SqliteControlTxn::new(&mut *tx);
+                    txn.delete_lifecycle_rules_only(&e.entity_id)
+                        .await
+                        .map_err(|err| {
+                            bad(crate::control_store::to_sqlx(err).to_string())
+                        })?;
+                }
                 for sql in [
                     "DELETE FROM buckets WHERE name = ?",
-                    "DELETE FROM lifecycle_rules WHERE bucket = ?",
                     "DELETE FROM event_configs WHERE bucket = ?",
                     "DELETE FROM replication_rules WHERE bucket = ?",
                 ] {

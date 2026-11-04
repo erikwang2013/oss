@@ -134,6 +134,12 @@ pub trait ControlTxn: LifecycleTxn + InventoryTxn + TierTxn + Send {
     async fn replace_olap_configs(&mut self, rows: &[OlapConfigEntry]) -> Result<(), ControlError>;
     /// 删该桶下全部 AP 及其 olap 行（桶删除级联）。
     async fn delete_access_points_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError>;
+    /// 删该桶的 7 张表：inventory_runs、inventory_configs、inventory_cursors、
+    /// inventory_incremental、tier_restores、lifecycle_rules、lifecycle_cursors。
+    async fn delete_lifecycle_inventory_tier_for_bucket(
+        &mut self,
+        bucket: &str,
+    ) -> Result<(), ControlError>;
 }
 
 #[cfg(test)]

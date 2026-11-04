@@ -215,6 +215,29 @@ pub(crate) fn to_sqlx(e: ControlError) -> sqlx::Error {
     }
 }
 
+/// 桶删除级联：7 张表按固定顺序删除（调用方事务内）。
+pub(crate) async fn delete_lifecycle_inventory_tier_for_bucket(
+    txn: &mut SqliteControlTxn<'_>,
+    bucket: &str,
+) -> Result<(), ControlError> {
+    for sql in [
+        "DELETE FROM inventory_runs WHERE bucket = ?",
+        "DELETE FROM inventory_configs WHERE bucket = ?",
+        "DELETE FROM inventory_cursors WHERE bucket = ?",
+        "DELETE FROM inventory_incremental WHERE bucket = ?",
+        "DELETE FROM tier_restores WHERE bucket = ?",
+        "DELETE FROM lifecycle_rules WHERE bucket = ?",
+        "DELETE FROM lifecycle_cursors WHERE bucket = ?",
+    ] {
+        sqlx::query(sql)
+            .bind(bucket)
+            .execute(&mut *txn.conn)
+            .await
+            .map_err(backend)?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ControlTxn for SqliteControlTxn<'_> {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError> {
@@ -340,6 +363,13 @@ impl ControlTxn for SqliteControlTxn<'_> {
 
     async fn delete_access_points_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
         ap_olap::txn_delete_access_points_for_bucket(self, bucket).await
+    }
+
+    async fn delete_lifecycle_inventory_tier_for_bucket(
+        &mut self,
+        bucket: &str,
+    ) -> Result<(), ControlError> {
+        delete_lifecycle_inventory_tier_for_bucket(self, bucket).await
     }
 }
 

@@ -1160,23 +1160,13 @@ impl Db {
     /// 事务内版本（`&mut SqliteConnection`；调用方负责 commit 与 cache 失效时机）。
     pub async fn clear_bucket_m8_tx(conn: &mut sqlx::SqliteConnection, bucket: &str) -> Result<()> {
         // 该桶的 AP 及其 OLAP 行（SQLite 默认无 FK 级联，txn 内显式先 OLAP 后 AP）。
-        {
-            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-            txn.delete_access_points_for_bucket(bucket)
-                .await
-                .map_err(crate::control_store::to_sqlx)?;
-        }
-        for sql in [
-            "DELETE FROM inventory_runs WHERE bucket = ?",
-            "DELETE FROM inventory_configs WHERE bucket = ?",
-            "DELETE FROM inventory_cursors WHERE bucket = ?",
-            "DELETE FROM inventory_incremental WHERE bucket = ?",
-            "DELETE FROM tier_restores WHERE bucket = ?",
-            "DELETE FROM lifecycle_rules WHERE bucket = ?",
-            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
-        ] {
-            sqlx::query(sql).bind(bucket).execute(&mut *conn).await?;
-        }
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.delete_access_points_for_bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+        txn.delete_lifecycle_inventory_tier_for_bucket(bucket)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
         Ok(())
     }
 
@@ -6710,23 +6700,17 @@ impl Db {
         bucket: &str,
     ) -> Result<bool> {
         let conn = cw.conn();
-        sqlx::query(
-            "DELETE FROM olap_configs WHERE access_point IN \
-             (SELECT name FROM access_points WHERE bucket = ?)",
-        )
-        .bind(bucket)
-        .execute(&mut *conn)
-        .await?;
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+            txn.delete_access_points_for_bucket(bucket)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+            txn.delete_lifecycle_inventory_tier_for_bucket(bucket)
+                .await
+                .map_err(crate::control_store::to_sqlx)?;
+        }
         for sql in [
-            "DELETE FROM access_points WHERE bucket = ?",
-            "DELETE FROM inventory_runs WHERE bucket = ?",
-            "DELETE FROM inventory_configs WHERE bucket = ?",
-            "DELETE FROM inventory_cursors WHERE bucket = ?",
-            "DELETE FROM inventory_incremental WHERE bucket = ?",
-            "DELETE FROM tier_restores WHERE bucket = ?",
             "DELETE FROM permissions WHERE bucket = ?",
-            "DELETE FROM lifecycle_rules WHERE bucket = ?",
-            "DELETE FROM lifecycle_cursors WHERE bucket = ?",
             "DELETE FROM bucket_policies WHERE bucket = ?",
             "DELETE FROM event_configs WHERE bucket = ?",
             "DELETE FROM replication_rules WHERE bucket = ?",
@@ -7195,5 +7179,224 @@ mod argon2_tests {
                 .await
                 .unwrap();
         assert_eq!(task_jobs, vec![4, 5, 6]);
+    }
+
+    async fn seed_cascade_rows(db: &Db, bucket: &str, owner: i64) {
+        sqlx::query(
+            "INSERT INTO inventory_configs (bucket, id, owner_id, config_json, updated_at) \
+             VALUES (?, 'cfg', ?, '{}', 1)",
+        )
+        .bind(bucket)
+        .bind(owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_runs (id, bucket, config_id, run_key, started_at, state, \
+             created_at, fence_term, fence_leader) \
+             VALUES (abs(random()) % 1000000, ?, 'cfg', 'k', 0, 'running', 1, 0, 0)",
+        )
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_cursors (bucket, config_id, cursor, config_updated_at, \
+             updated_at, fence_term, fence_leader) VALUES (?, 'cfg', '1', 1, 1, 0, 0)",
+        )
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO inventory_incremental (bucket, config_id, enabled, updated_at) \
+             VALUES (?, 'cfg', 1, 1)",
+        )
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tier_restores (bucket, key, version_id, expires_at, job_id, state, \
+             created_at, fence_term, fence_leader) VALUES (?, 'k', 'v', 0, NULL, 'restored', 1, 0, 0)",
+        )
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at, rule_id) \
+             VALUES (?, 'p', 1, 1, 1, 'r')",
+        )
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at, \
+             fence_term, fence_leader) VALUES (?, 'r', 'scan', '1', 1, 0, 0)",
+        )
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.create_access_point(&format!("ap-{bucket}"), bucket, owner, None, 1)
+            .await
+            .unwrap();
+        db.set_olap_config(
+            &format!("ap-{bucket}"),
+            "http",
+            Some("https://x"),
+            None,
+            None,
+            5000,
+            1024,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn count_bucket_rows(db: &Db, table: &str, bucket: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE bucket = ?"
+        )))
+        .bind(bucket)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    }
+
+    /// Task 7：clear_bucket_m8_tx 删 b1 的 7 张表 + AP/OLAP，b2 原样。
+    #[tokio::test]
+    async fn cascade_deletes_all_seven_tables_and_spares_other_bucket() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = db.create_user("root", "pw", true).await.unwrap();
+        seed_cascade_rows(&db, "b1", root).await;
+        seed_cascade_rows(&db, "b2", root).await;
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        Db::clear_bucket_m8_tx(&mut conn, "b1").await.unwrap();
+        drop(conn);
+
+        for table in [
+            "inventory_runs",
+            "inventory_configs",
+            "inventory_cursors",
+            "inventory_incremental",
+            "tier_restores",
+            "lifecycle_rules",
+            "lifecycle_cursors",
+        ] {
+            assert_eq!(count_bucket_rows(&db, table, "b1").await, 0, "{table} b1");
+            assert_eq!(count_bucket_rows(&db, table, "b2").await, 1, "{table} b2");
+        }
+        let store = db.control_store();
+        assert!(store.access_point("ap-b1").await.unwrap().is_none());
+        assert!(store.olap_config("ap-b1").await.unwrap().is_none());
+        assert!(store.access_point("ap-b2").await.unwrap().is_some());
+        assert!(store.olap_config("ap-b2").await.unwrap().is_some());
+    }
+
+    /// Task 7：delete_bucket_cascade 同一 7 表范围，桶行最后删除。
+    #[tokio::test]
+    async fn delete_bucket_cascade_uses_same_seven_table_scope() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = db.create_user("root", "pw", true).await.unwrap();
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date) VALUES ('b1', ?, 1)",
+        )
+        .bind(root)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        seed_cascade_rows(&db, "b1", root).await;
+        seed_cascade_rows(&db, "b2", root).await;
+        sqlx::query("INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, 'b1', 1, 1, 1)")
+            .bind(root)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES ('b1', '{}', 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let mut tx = db.pool().begin().await.unwrap();
+        {
+            let mut cw = crate::raft::apply::control_tx(&mut tx);
+            assert!(Db::delete_bucket_cascade(&mut cw, "b1").await.unwrap());
+        }
+        tx.commit().await.unwrap();
+
+        for table in [
+            "inventory_runs",
+            "inventory_configs",
+            "inventory_cursors",
+            "inventory_incremental",
+            "tier_restores",
+            "lifecycle_rules",
+            "lifecycle_cursors",
+            "permissions",
+            "bucket_policies",
+        ] {
+            assert_eq!(count_bucket_rows(&db, table, "b1").await, 0, "{table} b1");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inventory_runs WHERE bucket = 'b2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1,
+            "其他桶不受影响"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name = 'b1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Task 7：site 删桶只删 lifecycle_rules（保留 cursors），但走 txn。
+    #[tokio::test]
+    async fn site_bucket_delete_keeps_scope_but_uses_txn() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at, rule_id) \
+             VALUES ('b1', 'p', 1, 1, 1, 'r')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO lifecycle_cursors (bucket, rule_id, stage, cursor, updated_at, \
+             fence_term, fence_leader) VALUES ('b1', 'r', 'scan', '1', 1, 0, 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
+            txn.delete_lifecycle_rules_only("b1").await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM lifecycle_rules WHERE bucket = 'b1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM lifecycle_cursors WHERE bucket = 'b1'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1,
+            "site 删除不扩大游标范围"
+        );
     }
 }
