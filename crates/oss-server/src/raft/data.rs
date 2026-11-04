@@ -25,8 +25,10 @@ use std::collections::{BTreeMap, HashMap};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqliteConnection};
+use sqlx::SqliteConnection;
+use xl_store::control_store::account::{AccountSnapshotTxn, AccountTxn};
 use xl_store::control_store::bucket::BucketSnapshotTxn;
+use xl_store::control_store::iam::IamSnapshotTxn;
 use xl_store::control_store::inventory::InventoryTxn;
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{ControlError, ControlTxn, OlapConfigEntry};
@@ -61,38 +63,12 @@ const EXT_NAME_MAX: usize = 64;
 /// 类型已上移到 ControlStore 缝，快照字段顺序/编码不变。
 pub use xl_store::control_store::OwnerRef;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UserRow {
-    pub username: String,
-    pub password_hash: String,
-    pub status: String,
-    pub created_at: i64,
-}
+/// 快照行类型收敛到 ControlStore 缝；字段名/顺序与旧行完全一致。
+pub type UserRow = xl_store::control_store::UserEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccessKeyRow {
-    pub access_key: String,
-    pub secret_key: String,
-    pub username: String,
-    pub status: String,
-    pub expires_at: Option<i64>,
-    pub created_at: i64,
-    pub parent_ak: Option<String>,
-    pub session_policy: Option<String>,
-    pub kind: String,
-}
+pub type AccessKeyRow = xl_store::control_store::AccessKeyEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PermissionRow {
-    pub username: String,
-    pub bucket: String,
-    pub can_read: bool,
-    pub can_write: bool,
-    pub can_delete: bool,
-}
+pub type PermissionRow = xl_store::control_store::PermissionEntry;
 
 /// 桶行（自然键属主）；类型收敛到 ControlStore 缝，快照字段顺序不变。
 pub type BucketRow = xl_store::control_store::BucketEntry;
@@ -131,40 +107,18 @@ pub type InventoryConfigRow = xl_store::control_store::InventoryConfigEntry;
 
 /// 账户行（level 3，AC-2）：`admin` 是账户管理员的**用户名**而非本地 uid
 /// （跨节点 uid 不稳定）；`account_members` 同样以 username 为自然键。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccountRow {
-    pub id: String,
-    pub name: String,
-    pub status: String,
-    pub admin: Option<String>,
-    pub bucket_quota: Option<i64>,
-    pub soft_byte_quota: Option<i64>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
+/// 类型收敛到 ControlStore 缝；字段名/顺序不变。
+pub type AccountRow = xl_store::control_store::AccountEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccountMemberRow {
-    pub account_id: String,
-    pub username: String,
-    pub role: String,
-    pub created_at: i64,
-}
+pub type AccountMemberRow = xl_store::control_store::AccountMemberEntry;
 
 /// feature 8：动态 VPC 端点注册行（随 ControlData 复制；空表时不序列化）。
 /// 类型收敛到 ControlStore 缝，快照字段顺序不变（见 xl-store `VpcEndpoint`）。
 pub type VpcEndpointRow = xl_store::control_store::VpcEndpoint;
 
 /// feature 9：账户用量账本行（strict 模式的复制执行依据；空表时不序列化）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccountUsageLedgerRow {
-    pub account_id: String,
-    pub used_bytes: i64,
-    pub object_count: i64,
-}
+/// 类型收敛到 ControlStore 缝；字段名/顺序不变。
+pub type AccountUsageLedgerRow = xl_store::control_store::AccountUsageLedgerEntry;
 
 /// 11 张复制表的完整载荷（自然键；无本地自增 id / set_id / 管理员行）。
 ///
@@ -244,63 +198,24 @@ fn control_data_err(e: ControlError) -> DataError {
 pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, DataError> {
     let mut data = ControlData::default();
 
-    for r in sqlx::query(
-        "SELECT username, password_hash, status, created_at FROM users \
-         WHERE is_admin = 0 ORDER BY username",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.users.push(UserRow {
-            username: r.get("username"),
-            password_hash: r.get("password_hash"),
-            status: r.get("status"),
-            created_at: r.get("created_at"),
-        });
-    }
+    data.users = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.snapshot_users().await.map_err(control_data_err)?
+    };
 
-    for r in sqlx::query(
-        "SELECT a.access_key, a.secret_key, u.username, a.status, a.expires_at, \
-                a.created_at, a.parent_ak, a.session_policy, a.kind \
-         FROM access_keys a JOIN users u ON u.id = a.user_id \
-         WHERE u.is_admin = 0 AND a.kind = 'long-term' AND a.parent_ak IS NULL \
-         ORDER BY a.access_key",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.access_keys.push(AccessKeyRow {
-            access_key: r.get("access_key"),
-            secret_key: r.get("secret_key"),
-            username: r.get("username"),
-            status: r.get("status"),
-            expires_at: r.get("expires_at"),
-            created_at: r.get("created_at"),
-            parent_ak: r.get("parent_ak"),
-            session_policy: r.get("session_policy"),
-            kind: r.get("kind"),
-        });
-    }
+    data.access_keys = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.snapshot_access_keys()
+            .await
+            .map_err(control_data_err)?
+    };
 
-    for r in sqlx::query(
-        "SELECT u.username, p.bucket, p.can_read, p.can_write, p.can_delete \
-         FROM permissions p JOIN users u ON u.id = p.user_id \
-         WHERE u.is_admin = 0 ORDER BY u.username, p.bucket",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.permissions.push(PermissionRow {
-            username: r.get("username"),
-            bucket: r.get("bucket"),
-            can_read: r.get::<i64, _>("can_read") != 0,
-            can_write: r.get::<i64, _>("can_write") != 0,
-            can_delete: r.get::<i64, _>("can_delete") != 0,
-        });
-    }
+    data.permissions = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.snapshot_permissions()
+            .await
+            .map_err(control_data_err)?
+    };
 
     data.buckets = {
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
@@ -361,78 +276,26 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
     // 账户两表只在 canonical marker 之后进入快照：marker 之前它们可能是节点本地的
     // uid 派生行，复制出去会让其它节点按本地 id 解释（跨节点不可解释）。
     if accounts_canonical(conn).await? {
-        for r in sqlx::query(
-            "SELECT a.id, a.name, a.status, a.admin_uid, a.bucket_quota, a.soft_byte_quota, \
-                    a.created_at, a.updated_at, u.username AS admin_username, \
-                    u.is_admin AS admin_is_admin \
-             FROM accounts a LEFT JOIN users u ON u.id = a.admin_uid ORDER BY a.id",
-        )
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(sql)?
-        {
-            let admin_uid: Option<i64> = r.get("admin_uid");
-            let admin_username: Option<String> = r.get("admin_username");
-            let admin_is_admin: Option<bool> = r.get("admin_is_admin");
-            if admin_uid.is_some() && (admin_username.is_none() || admin_is_admin == Some(true)) {
-                return Err(DataError::Format(format!(
-                    "account {} admin_uid {} is missing or a global admin (not exportable)",
-                    r.get::<String, _>("id"),
-                    admin_uid.unwrap_or_default()
-                )));
-            }
-            data.accounts.push(AccountRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                status: r.get("status"),
-                admin: admin_username,
-                bucket_quota: r.get("bucket_quota"),
-                soft_byte_quota: r.get("soft_byte_quota"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            });
-        }
-        for r in sqlx::query(
-            "SELECT am.account_id, u.username, u.is_admin AS is_admin, am.role, am.created_at \
-             FROM account_members am JOIN users u ON u.id = am.uid \
-             ORDER BY am.account_id, u.username",
-        )
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(sql)?
-        {
-            if r.get::<bool, _>("is_admin") {
-                return Err(DataError::Format(format!(
-                    "account_members {}/{} points at a global admin (not exportable)",
-                    r.get::<String, _>("account_id"),
-                    r.get::<String, _>("username")
-                )));
-            }
-            data.account_members.push(AccountMemberRow {
-                account_id: r.get("account_id"),
-                username: r.get("username"),
-                role: r.get("role"),
-                created_at: r.get("created_at"),
-            });
-        }
+        data.accounts = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+            txn.snapshot_accounts().await.map_err(control_data_err)?
+        };
+        data.account_members = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+            txn.snapshot_account_members()
+                .await
+                .map_err(control_data_err)?
+        };
         data.vpc_endpoints = crate::control_store::SqliteControlTxn::new(&mut *conn)
             .vpc_endpoints()
             .await
             .map_err(|e| DataError::Format(format!("control store: {e}")))?;
-        for r in sqlx::query(
-            "SELECT account_id, used_bytes, object_count FROM account_usage_ledger \
-             ORDER BY account_id",
-        )
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(sql)?
-        {
-            data.account_usage_ledger.push(AccountUsageLedgerRow {
-                account_id: r.get("account_id"),
-                used_bytes: r.get("used_bytes"),
-                object_count: r.get("object_count"),
-            });
-        }
+        data.account_usage_ledger = {
+            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+            txn.snapshot_account_usage_ledger()
+                .await
+                .map_err(control_data_err)?
+        };
     }
 
     Ok(data)
@@ -584,20 +447,16 @@ pub(crate) async fn install_tx(
         .await
         .map_err(control_data_err)?;
     // 3. 权限（引用 users）。
-    sqlx::query("DELETE FROM permissions")
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .permissions_clear()
         .await
-        .map_err(sql)?;
+        .map_err(control_data_err)?;
     // 3b. 账户成员/账户（FK → users/accounts；须先于删 users）。marker 不在此清除：
     // 规范化是单向的（低级别安装不得回退 level-3 已冻结的账户语义）。
-    sqlx::query("DELETE FROM account_members")
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_accounts(&[], &[], false)
         .await
-        .map_err(sql)?;
-    sqlx::query("DELETE FROM accounts")
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        .map_err(control_data_err)?;
     // 4. 目标独有桶（引用 users，须先于删 users）；保留桶 owner 先置 NULL。
     let wanted: Vec<String> = data.buckets.iter().map(|b| b.name.clone()).collect();
     crate::control_store::SqliteControlTxn::new(&mut *conn)
@@ -605,13 +464,10 @@ pub(crate) async fn install_tx(
         .await
         .map_err(control_data_err)?;
     // 5. 非管理员属主 AK 全清（long-term + session/STS；管理员本地 AK 保留）。
-    sqlx::query(
-        "DELETE FROM access_keys \
-         WHERE user_id NOT IN (SELECT id FROM users WHERE is_admin = 1)",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(sql)?;
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .access_keys_delete_non_admin()
+        .await
+        .map_err(control_data_err)?;
     // 6. 复制用户（管理员行不动）。`uploads.owner_id` 有 FK 指向 users（本地表），
     // 与 `delete_user` 同口径先置 NULL，否则有历史上传行的库安装会 FK 失败。
     sqlx::query(
@@ -621,26 +477,19 @@ pub(crate) async fn install_tx(
     .execute(&mut *conn)
     .await
     .map_err(sql)?;
-    sqlx::query("DELETE FROM users WHERE is_admin = 0")
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .users_delete_non_admin()
         .await
-        .map_err(sql)?;
+        .map_err(control_data_err)?;
 
     // 7. 插入用户并按 username 重建映射。
     let mut ids: HashMap<&str, i64> = HashMap::with_capacity(data.users.len());
     for u in &data.users {
-        let done = sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
-             VALUES (?, ?, 0, ?, ?)",
-        )
-        .bind(&u.username)
-        .bind(&u.password_hash)
-        .bind(&u.status)
-        .bind(u.created_at)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-        ids.insert(u.username.as_str(), done.last_insert_rowid());
+        let id = crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .user_install(u)
+            .await
+            .map_err(control_data_err)?;
+        ids.insert(u.username.as_str(), id);
     }
     let user_id = |name: &str, what: &str| -> Result<i64, DataError> {
         ids.get(name)
@@ -649,7 +498,10 @@ pub(crate) async fn install_tx(
     };
 
     // 7b. 账户两表（level 3）：成员/admin 按 username 映射到本地非管理员 id。
-    replace_accounts_tx(conn, &data.accounts, &data.account_members, ctx.canonical).await?;
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_accounts(&data.accounts, &data.account_members, ctx.canonical)
+        .await
+        .map_err(control_data_err)?;
 
     // 7c. 动态 VPC 端点（level 8）：无本地 id，account_id 是稳定字符串。
     // 整表替换；事务边界由调用方持有（store 不 begin/commit）。
@@ -659,68 +511,38 @@ pub(crate) async fn install_tx(
         .map_err(|e| DataError::Format(format!("control store: {e}")))?;
 
     // 7d. 账户用量账本（level 9）：整表替换；行 key 是稳定账户 id。
-    sqlx::query("DELETE FROM account_usage_ledger")
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .account_ledger_clear()
         .await
-        .map_err(sql)?;
+        .map_err(control_data_err)?;
     for r in &data.account_usage_ledger {
-        sqlx::query(
-            "INSERT INTO account_usage_ledger (account_id, used_bytes, object_count) \
-             VALUES (?, ?, ?)",
-        )
-        .bind(&r.account_id)
-        .bind(r.used_bytes)
-        .bind(r.object_count)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .account_ledger_upsert(&r.account_id, r.used_bytes, r.object_count)
+            .await
+            .map_err(control_data_err)?;
     }
 
     // 8. AK（快照只含 long-term parent_ak=NULL；按 username 映射本地 id）。
     for k in &data.access_keys {
         let user = user_id(&k.username, "access key")?;
-        sqlx::query(
-            "INSERT INTO access_keys \
-             (access_key, secret_key, user_id, status, expires_at, created_at, \
-              parent_ak, session_policy, kind) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&k.access_key)
-        .bind(&k.secret_key)
-        .bind(user)
-        .bind(&k.status)
-        .bind(k.expires_at)
-        .bind(k.created_at)
-        .bind(&k.parent_ak)
-        .bind(&k.session_policy)
-        .bind(&k.kind)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .access_key_install(k, user)
+            .await
+            .map_err(control_data_err)?;
     }
 
     // 9. 权限（三档位原样）；目标上管理员目标的残留行清掉。
     for p in &data.permissions {
         let user = user_id(&p.username, "permission")?;
-        sqlx::query(
-            "INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(user)
-        .bind(&p.bucket)
-        .bind(p.can_read)
-        .bind(p.can_write)
-        .bind(p.can_delete)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .permission_install(p, user)
+            .await
+            .map_err(control_data_err)?;
     }
-    sqlx::query(
-        "DELETE FROM permissions WHERE user_id IN (SELECT id FROM users WHERE is_admin = 1)",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(sql)?;
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .permissions_delete_admins()
+        .await
+        .map_err(control_data_err)?;
 
     // 10. 桶：保留目标 set_id（UPDATE 列不含 set_id）。
     for b in &data.buckets {
@@ -787,117 +609,12 @@ pub(crate) async fn install_tx(
         .map_err(control_data_err)?;
 
     // 13. 孤儿 session/STS AK（属主已被替换而残留）。
-    sqlx::query(
-        "DELETE FROM access_keys \
-         WHERE (kind = 'session' OR parent_ak IS NOT NULL) \
-           AND user_id NOT IN (SELECT id FROM users)",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(sql)?;
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .access_keys_delete_orphan_sessions()
+        .await
+        .map_err(control_data_err)?;
 
     Ok(report_of(data))
-}
-
-/// 整表替换账户两表（level 3）：`accounts` 必须先于 `account_members`（FK）。
-/// 成员/账户管理员按 username 解析到本地**非管理员**用户 id（跨节点 uid 不稳定，
-/// 且全局管理员永不属于任何账户）。`canonical` 时写规范化 marker（只写不清）。
-/// 本地 `account_usage` 缓存随 accounts 级联清空，由用量采样器重算。
-pub(crate) async fn replace_accounts_tx(
-    conn: &mut SqliteConnection,
-    accounts: &[AccountRow],
-    members: &[AccountMemberRow],
-    canonical: bool,
-) -> Result<(), DataError> {
-    sqlx::query("DELETE FROM account_members")
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    sqlx::query("DELETE FROM accounts")
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    for a in accounts {
-        if !xl_s3::access::valid_account_id(&a.id) {
-            return Err(DataError::Format(format!(
-                "account id {:?} is not 12 ASCII digits",
-                a.id
-            )));
-        }
-        if !matches!(a.status.as_str(), "active" | "disabled") {
-            return Err(DataError::Format(format!(
-                "account {} status {:?} invalid",
-                a.id, a.status
-            )));
-        }
-        let admin_uid = match &a.admin {
-            None => None,
-            Some(name) => Some(non_admin_uid(conn, name, "account admin").await?),
-        };
-        sqlx::query(
-            "INSERT INTO accounts \
-             (id, name, status, admin_uid, bucket_quota, soft_byte_quota, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&a.id)
-        .bind(&a.name)
-        .bind(&a.status)
-        .bind(admin_uid)
-        .bind(a.bucket_quota)
-        .bind(a.soft_byte_quota)
-        .bind(a.created_at)
-        .bind(a.updated_at)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-    for m in members {
-        if !matches!(m.role.as_str(), "owner" | "admin" | "member") {
-            return Err(DataError::Format(format!(
-                "account {} member {} role {:?} invalid",
-                m.account_id, m.username, m.role
-            )));
-        }
-        let uid = non_admin_uid(conn, &m.username, "account member").await?;
-        sqlx::query(
-            "INSERT INTO account_members (account_id, uid, role, created_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&m.account_id)
-        .bind(uid)
-        .bind(&m.role)
-        .bind(m.created_at)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-    if canonical {
-        sqlx::query(
-            "INSERT INTO schema_meta (key, value) VALUES (?, 'done') \
-             ON CONFLICT(key) DO UPDATE SET value = 'done'",
-        )
-        .bind(crate::db::META_ACCOUNTS_CANONICAL)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    }
-    Ok(())
-}
-
-async fn non_admin_uid(
-    conn: &mut SqliteConnection,
-    username: &str,
-    what: &str,
-) -> Result<i64, DataError> {
-    sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND is_admin = 0")
-        .bind(username)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(sql)?
-        .ok_or_else(|| {
-            DataError::Format(format!(
-                "{what} {username:?} is not a replicated non-admin user"
-            ))
-        })
 }
 
 /// V3 扩展区条目：名字即命名空间（`[a-z0-9._-]{1,64}`，如 `m8.runstate`），载荷是

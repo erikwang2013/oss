@@ -359,11 +359,11 @@ pub async fn cutover(
         return Ok(report);
     }
 
-    let admin_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-            .fetch_optional(db.pool())
-            .await
-            .map_err(|e| CutoverError::Db(e.to_string()))?;
+    let admin_id: Option<i64> = db
+        .control_store()
+        .admin_id()
+        .await
+        .map_err(|e| CutoverError::Db(e.to_string()))?;
     let ctx = InstallCtx {
         admin_id,
         witness: false,

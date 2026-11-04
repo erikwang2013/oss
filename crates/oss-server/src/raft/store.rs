@@ -44,6 +44,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Row, SqliteConnection, SqlitePool};
+use xl_store::control_store::account::AccountStore;
+use xl_store::control_store::iam::IamTxn;
 
 use super::apply;
 use super::data::{self, InstallCtx};
@@ -1353,13 +1355,18 @@ impl SqliteStateMachine {
                     .await
                     .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
             let canonical_rows: i64 = if canonical.is_some() {
-                sqlx::query_scalar(
-                    "SELECT (SELECT COUNT(*) FROM accounts) + \
-                            (SELECT COUNT(*) FROM account_members)",
-                )
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?
+                let (accounts, members) =
+                    crate::control_store::SqliteControlStore::new(self.pool.clone())
+                        .account_counts()
+                        .await
+                        .map_err(|e| {
+                            storage_err(
+                                ErrorSubject::Snapshot(None),
+                                ErrorVerb::Read,
+                                sqlx::Error::Protocol(e.to_string()),
+                            )
+                        })?;
+                accounts + members
             } else {
                 0
             };
@@ -1375,10 +1382,17 @@ impl SqliteStateMachine {
         // 账本是 level-9 数据：低于 9 的快照不携带它，整表安装会清空复制账本。
         // 本机仍有账本行时拒绝，避免回退快照静默丢用量（保守：宁可恢复失败）。
         if snapshot.feature_level < super::compat::FEATURE_LEVEL_9 {
-            let ledger_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_usage_ledger")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
+            let ledger_rows: i64 =
+                crate::control_store::SqliteControlStore::new(self.pool.clone())
+                    .account_ledger_count()
+                    .await
+                    .map_err(|e| {
+                        storage_err(
+                            ErrorSubject::Snapshot(None),
+                            ErrorVerb::Read,
+                            sqlx::Error::Protocol(e.to_string()),
+                        )
+                    })?;
             if ledger_rows != 0 {
                 return Err(Self::data_err(data::DataError::Format(format!(
                     "cannot install a level-{} snapshot: local account_usage_ledger has \
@@ -1454,11 +1468,16 @@ impl SqliteStateMachine {
             .execute(&mut *tx)
             .await
             .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Write, e))?;
-        let admin_id: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| storage_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e))?;
+        let admin_id: Option<i64> = crate::control_store::SqliteControlTxn::new(&mut tx)
+            .admin_id()
+            .await
+            .map_err(|e| {
+                storage_err(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    sqlx::Error::Protocol(e.to_string()),
+                )
+            })?;
         let ctx = InstallCtx {
             admin_id,
             witness: self.witness,

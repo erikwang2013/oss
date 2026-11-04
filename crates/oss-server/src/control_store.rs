@@ -21,6 +21,7 @@ use xl_store::control_store::{
 };
 
 mod account;
+mod account_snapshot;
 mod account_write;
 mod ap_olap;
 mod audit;
@@ -29,6 +30,7 @@ mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
 mod iam;
+mod iam_snapshot;
 mod iam_write;
 mod inventory;
 mod jobs;

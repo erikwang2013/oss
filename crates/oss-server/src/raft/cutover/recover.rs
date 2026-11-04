@@ -62,12 +62,12 @@ pub async fn force_recover(
     let canonical_rows: i64 = if activation < compat::FEATURE_LEVEL_3
         && db.accounts_canonical().await.map_err(|e| e.to_string())?
     {
-        sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM accounts) + (SELECT COUNT(*) FROM account_members)",
-        )
-        .fetch_one(db.pool())
-        .await
-        .map_err(|e| e.to_string())?
+        let (accounts, members) = db
+            .control_store()
+            .account_counts()
+            .await
+            .map_err(|e| e.to_string())?;
+        accounts + members
     } else {
         0
     };
@@ -125,11 +125,11 @@ pub async fn force_recover(
     let admin_id: Option<i64> = if witness {
         None
     } else {
-        let id: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1")
-                .fetch_optional(db.pool())
-                .await
-                .map_err(|e| e.to_string())?;
+        let id: Option<i64> = db
+            .control_store()
+            .admin_id()
+            .await
+            .map_err(|e| e.to_string())?;
         if id.is_none() {
             return Err("no local admin user; bootstrap an admin before recovery".into());
         }

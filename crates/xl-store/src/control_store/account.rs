@@ -113,6 +113,9 @@ pub trait AccountStore: Send + Sync {
 /// 调用方事务内的账户写；本 trait 不 begin/commit/rollback。
 #[async_trait::async_trait]
 pub trait AccountTxn: Send {
+    /// `(accounts, account_members)` 行数。
+    async fn account_counts(&mut self) -> Result<(i64, i64), ControlError>;
+    async fn account_ledger_count(&mut self) -> Result<i64, ControlError>;
     async fn account_status(&mut self, id: &str) -> Result<Option<String>, ControlError>;
     /// `(hard_byte_quota, object_quota)`；账户不存在 → None。
     async fn account_hard_limits(

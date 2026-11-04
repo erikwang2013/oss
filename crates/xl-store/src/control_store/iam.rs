@@ -102,6 +102,8 @@ pub trait IamStore: Send + Sync {
 pub trait IamTxn: Send {
     async fn user_by_username(&mut self, username: &str) -> Result<Option<UserRef>, ControlError>;
     async fn user_uid(&mut self, username: &str) -> Result<Option<i64>, ControlError>;
+    /// 首个管理员 id（`id` 升序）；无管理员 → `None`。
+    async fn admin_id(&mut self) -> Result<Option<i64>, ControlError>;
     /// 只匹配非管理员（`is_admin = 0`）。
     async fn user_uid_non_admin(&mut self, username: &str) -> Result<Option<i64>, ControlError>;
     /// 按本地数字 id 判非管理员存在（attach 成员用）。
@@ -208,9 +210,17 @@ pub trait IamSnapshotTxn: Send {
     async fn user_install(&mut self, row: &UserEntry) -> Result<i64, ControlError>;
     /// 清非管理员属主的全部 AK（长时 + session）。
     async fn access_keys_delete_non_admin(&mut self) -> Result<(), ControlError>;
-    async fn access_key_install(&mut self, row: &AccessKeyEntry) -> Result<(), ControlError>;
+    async fn access_key_install(
+        &mut self,
+        row: &AccessKeyEntry,
+        uid: i64,
+    ) -> Result<(), ControlError>;
     async fn permissions_clear(&mut self) -> Result<(), ControlError>;
-    async fn permission_install(&mut self, row: &PermissionEntry) -> Result<(), ControlError>;
+    async fn permission_install(
+        &mut self,
+        row: &PermissionEntry,
+        uid: i64,
+    ) -> Result<(), ControlError>;
     /// 清目标本地管理员名下残留权限行。
     async fn permissions_delete_admins(&mut self) -> Result<(), ControlError>;
     /// 属主已被替换而残留的 session/STS 键。
