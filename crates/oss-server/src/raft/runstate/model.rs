@@ -15,66 +15,9 @@ use crate::raft::data::DataError;
 pub use xl_store::control_store::inventory::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow,
 };
+pub use xl_store::control_store::jobs::{JobRow, JobTaskRow, ScheduleLeaseRow};
 pub use xl_store::control_store::lifecycle::LifecycleCursorRow;
 pub use xl_store::control_store::tier::TierRestoreRow;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct JobRow {
-    pub id: i64,
-    pub kind: String,
-    pub bucket: String,
-    pub prefix: String,
-    pub state: String,
-    pub scanned: i64,
-    pub deleted: i64,
-    pub skipped: i64,
-    pub error: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub spec_json: Option<String>,
-    pub progress: i64,
-    pub total: i64,
-    pub succeeded: i64,
-    pub failed: i64,
-    pub report_bucket: Option<String>,
-    pub report_prefix: Option<String>,
-    pub priority: i64,
-    pub requested_by: Option<i64>,
-    pub parent_job_id: Option<i64>,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct JobTaskRow {
-    pub job_id: i64,
-    pub task_no: i64,
-    pub action: String,
-    pub payload_json: String,
-    pub state: String,
-    pub attempt: i64,
-    pub next_at: i64,
-    pub dedupe_key: Option<String>,
-    pub deadline_at: Option<i64>,
-    pub result_code: Option<String>,
-    pub result_string: Option<String>,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
-    pub fence_term: i64,
-    pub fence_leader: i64,
-}
-
-/// 调度租约（`schedule_lease` 的单例行；`singleton` 由安装代码固定写 1）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ScheduleLeaseRow {
-    pub term: i64,
-    pub node: i64,
-    pub expires_at: i64,
-    pub acquired_at: i64,
-}
 
 /// 九个运行态表的完整载荷。`next_*_id == 0` 表示未初始化（`runstate_meta` 无行）；
 /// `RunStateInit` 播种后恒 ≥1。

@@ -10,15 +10,18 @@ use serde::{Deserialize, Serialize};
 
 pub mod bucket;
 pub mod inventory;
+pub mod jobs;
 pub mod lifecycle;
 pub mod tier;
 
 pub use bucket::{BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRuleEntry};
 pub use inventory::InventoryConfigEntry;
+pub use jobs::{JobRow, JobTaskRow, ScheduleLeaseRow};
 pub use lifecycle::LifecycleRuleEntry;
 
 use bucket::{BucketSnapshotTxn, BucketStore, BucketTxn};
 use inventory::{InventoryStore, InventoryTxn};
+use jobs::{JobSnapshotTxn, JobStore, JobTxn};
 use lifecycle::{LifecycleStore, LifecycleTxn};
 use tier::{TierStore, TierTxn};
 
@@ -89,7 +92,7 @@ pub enum ControlError {
 /// 只读控制面访问。实现必须复用 `Db` 的既有连接池，不得自建第二个池。
 #[async_trait::async_trait]
 pub trait ControlStore:
-    BucketStore + LifecycleStore + InventoryStore + TierStore + Send + Sync
+    BucketStore + LifecycleStore + InventoryStore + TierStore + JobStore + Send + Sync
 {
     async fn vpc_endpoint(&self, vpce_id: &str) -> Result<Option<VpcEndpoint>, ControlError>;
     /// 按 `vpce_id` 升序（导出/校验的确定性来源）。
@@ -108,7 +111,9 @@ pub trait ControlStore:
 /// 调用方事务内的写访问。`&mut self` 表示独占借用，不提供 begin/commit/rollback。
 #[async_trait::async_trait]
 pub trait ControlTxn:
-    BucketTxn + BucketSnapshotTxn + LifecycleTxn + InventoryTxn + TierTxn + Send
+    BucketTxn + BucketSnapshotTxn + LifecycleTxn + InventoryTxn + TierTxn + JobTxn
+    + JobSnapshotTxn
+    + Send
 {
     async fn account_status(&mut self, account_id: &str) -> Result<Option<String>, ControlError>;
     async fn vpc_endpoint_upsert(&mut self, row: &VpcEndpoint) -> Result<(), ControlError>;
