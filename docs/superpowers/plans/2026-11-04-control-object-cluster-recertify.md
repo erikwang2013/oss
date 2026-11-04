@@ -399,12 +399,10 @@ git commit -m "test(xl-store): crash and abort coverage for cluster control rece
 
 ## 门禁记录
 
-（实施完成后填写）
-
-- 日期/提交范围：
-- `cargo test -p xl-store`：
-- `cargo test -p xl-client`：
-- `cargo test -p oss-server`：
-- `cargo clippy -p xl-store -p xl-client -p oss-server --all-targets`：
-- `cargo fmt --all -- --check`：
-- 结论：
+- 日期/提交范围：2026-11-04，实现 `6e47586..2c0581b`（Task 1–6）+ `fbaf303`（Task 7 clippy 告警修复）；以下命令均以 `CARGO_INCREMENTAL=0` 运行。
+- `cargo test -p xl-store`：PASS — 7 suites / 470 passed / 0 failed / 1 ignored（exit 0）
+- `cargo test -p xl-client`：PASS — 2 suites / 8 passed / 0 failed / 0 ignored（exit 0）
+- `cargo test -p oss-server`：PASS — 77 suites / 838 passed / 0 failed / 2 ignored（exit 0）
+- `cargo clippy -p xl-store -p xl-client -p oss-server --all-targets`：PASS — 0 warnings（exit 0）
+- `cargo fmt --all -- --check`：PASS（exit 0）
+- 结论：全部门禁通过（含 Task 6 SIGABRT 故障注入），可进入 Phase 3 控制状态迁移。
