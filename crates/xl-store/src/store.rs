@@ -18,6 +18,7 @@ use crate::meta::{self, ChecksumRecord, EncryptionRecord, ObjectLockRecord, XlMe
 
 mod cmk_rewrap;
 mod control;
+mod control_local;
 mod control_migrate;
 mod drives;
 pub mod ec;
@@ -44,6 +45,7 @@ pub use cmk_rewrap::{
     REFS_REPORT_CAP, REWRAP_MAX_BATCH, RewrapItem, RewrapOptions, RewrapReport,
 };
 pub use control::SystemObject;
+pub use control_local::LocalControlRootGuard;
 pub use control_migrate::{
     LegacyContentGroup, LegacyControlCopy, LegacyControlScan, LegacyControlState, RecertifyOutcome,
 };
@@ -1836,6 +1838,33 @@ impl Store {
             .await
     }
 
+    /// 本机控制写第一阶段（**不扇出**）：与 [`Self::write_meta_fenced_preserving`] 的
+    /// 单机/多盘分支逐字节相同，但即使配置了集群也只用本机盘。
+    pub(in crate::store) async fn write_meta_fenced_preserving_local(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        fence_token: u64,
+        preserve: &[u16],
+    ) -> Result<usize> {
+        self.write_meta_fenced_local_mode(bucket, key, m, Some(fence_token), preserve)
+            .await
+    }
+
+    /// 本机控制写提交证书（**不扇出**）：单机/多盘分支的证书阶段。
+    pub(in crate::store) async fn write_meta_marker_local(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        fence_token: u64,
+        preserve: &[u16],
+    ) -> Result<usize> {
+        self.write_meta_fenced_local_mode(bucket, key, m, Some(fence_token), preserve)
+            .await
+    }
+
     // 内部提交路径：参数即协议字段，分组只会增加转换噪声。
     #[allow(clippy::too_many_arguments)]
     async fn write_meta_fenced_mode(
@@ -1853,6 +1882,19 @@ impl Store {
                 .write_meta_cluster(bucket, key, m, old, fence_token, marker, preserve)
                 .await;
         }
+        self.write_meta_fenced_local_mode(bucket, key, m, fence_token, preserve)
+            .await
+    }
+
+    /// 单机/本地盘提交（原 `write_meta_fenced_mode` 的非集群分支，逐字节提取）。
+    async fn write_meta_fenced_local_mode(
+        &self,
+        bucket: &str,
+        key: &str,
+        m: &XlMeta,
+        fence_token: Option<u64>,
+        preserve: &[u16],
+    ) -> Result<usize> {
         if self.cfg.drives.len() == 1 {
             if let Some(t) = fence_token {
                 // M2b-1 的 fenced 形态：唯一一份 meta 就是提交点，无 quorum

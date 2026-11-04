@@ -389,6 +389,14 @@ impl Store {
         })
     }
 
+    /// 仅本机两层锁（进程内 mutex + flock）：节点本地控制 IO 跳过 fenced 集群锁。
+    pub(super) async fn control_lock_local(&self, key: &str) -> Result<ControlGuard> {
+        Ok(ControlGuard {
+            fenced: None,
+            _local: self.lock_object_local(layout::SYS_DIR, key).await?,
+        })
+    }
+
     /// 两阶段提交控制对象 meta：第一阶段写**未提交**数据，但保留 `preserve` 槽上的
     /// 已提交旧副本原样（崩溃/第二阶段零证书时读回退旧版本，而不是缺席——Critical A）；
     /// 第二阶段写同 token 的提交证书（`control_committed = Some(true)`）。
@@ -404,17 +412,51 @@ impl Store {
         guard: &ControlGuard,
         preserve: &[u16],
     ) -> Result<()> {
-        // 单盘（无集群）：唯一 rename 就是提交点，直接写带证书的 meta——不存在
-        // 「第一阶段覆盖后第二阶段零证书」的丢失窗口，无需两阶段。
-        if self.cfg.cluster.is_none() && self.cfg.drives.len() == 1 {
+        self.commit_control_meta_mode(key, m, old, fence_token, guard, preserve, false)
+            .await
+    }
+
+    /// 节点本地提交：即使配置了集群也只走本机盘（不扇出、不取 fenced 集群锁）。
+    pub(super) async fn commit_control_meta_local(
+        &self,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+        fence_token: u64,
+        guard: &ControlGuard,
+        preserve: &[u16],
+    ) -> Result<()> {
+        self.commit_control_meta_mode(key, m, old, fence_token, guard, preserve, true)
+            .await
+    }
+
+    // 内部提交路径：参数即协议字段，分组只会增加转换噪声。
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_control_meta_mode(
+        &self,
+        key: &str,
+        m: &XlMeta,
+        old: Option<&XlMeta>,
+        fence_token: u64,
+        guard: &ControlGuard,
+        preserve: &[u16],
+        local_only: bool,
+    ) -> Result<()> {
+        // 单盘：唯一 rename 就是提交点，直接写带证书的 meta——不存在「第一阶段覆盖后
+        // 第二阶段零证书」的丢失窗口，无需两阶段。本地控制写即使配置了集群也按单盘捷径。
+        if self.cfg.drives.len() == 1 && (local_only || self.cfg.cluster.is_none()) {
             if guard.lease_lost() {
                 return Err(Error::QuorumUnmet("集群锁租约丢失，写入中止".into()));
             }
             let mut marker = m.clone();
             marker.control_committed = Some(true);
-            let marked = self
-                .write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
-                .await?;
+            let marked = if local_only {
+                self.write_meta_marker_local(layout::SYS_DIR, key, &marker, fence_token, preserve)
+                    .await?
+            } else {
+                self.write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
+                    .await?
+            };
             if marked == 0 {
                 return Err(Error::QuorumUnmet(format!(
                     "控制对象 {key:?} 提交标记 0 槽（未提交）"
@@ -422,9 +464,13 @@ impl Store {
             }
             return Ok(());
         }
-        let flipped = self
-            .write_meta_fenced_preserving(layout::SYS_DIR, key, m, old, fence_token, preserve)
-            .await?;
+        let flipped = if local_only {
+            self.write_meta_fenced_preserving_local(layout::SYS_DIR, key, m, fence_token, preserve)
+                .await?
+        } else {
+            self.write_meta_fenced_preserving(layout::SYS_DIR, key, m, old, fence_token, preserve)
+                .await?
+        };
         if flipped == 0 {
             return Err(Error::QuorumUnmet(format!(
                 "控制对象 {key:?} meta 未提交（0 槽翻转）"
@@ -438,9 +484,13 @@ impl Store {
         }
         let mut marker = m.clone();
         marker.control_committed = Some(true);
-        let marked = self
-            .write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
-            .await?;
+        let marked = if local_only {
+            self.write_meta_marker_local(layout::SYS_DIR, key, &marker, fence_token, preserve)
+                .await?
+        } else {
+            self.write_meta_marker(layout::SYS_DIR, key, &marker, fence_token, preserve)
+                .await?
+        };
         if marked == 0 {
             return Err(Error::QuorumUnmet(format!(
                 "控制对象 {key:?} 提交标记 0 槽（第一阶段数据未提交，读不可见）"
@@ -461,13 +511,13 @@ pub(super) fn validate_control_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn control_state(old: Option<&XlMeta>) -> (u64, u64) {
+pub(super) fn control_state(old: Option<&XlMeta>) -> (u64, u64) {
     old.map_or((0, 0), |m| {
         (m.control_version.unwrap_or(0), m.fence_token.unwrap_or(0))
     })
 }
 
-fn check_cas(
+pub(super) fn check_cas(
     cur_version: u64,
     cur_fence: u64,
     expected_version: Option<u64>,
