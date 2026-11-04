@@ -321,8 +321,11 @@ Implementation rules that preserve trigger behavior:
   permissions, then the bucket. A bulk `UPDATE buckets SET owner_id = NULL` logs one bucket upsert per
   actually changed row. A delete of an admin-target permission logs nothing.
 - Site apply writes `SiteApply` mutations through the same domain methods; the caller's explicit
-  `put_clock` is retained. Peer add snapshot insertion (`sites` + changelog + clock + cursor) is one
-  root transaction.
+  `put_clock` is retained. Peer add first writes the peer cursor file (atomic rename), then commits
+  `sites` + changelog + clock in one root CAS. A crash between leaves an ignorable orphan cursor;
+  the reverse order (paired peer without a cursor) is impossible. Ship-time cursor updates are
+  local-file writes, not root CAS; a lost cursor restarts that peer at seq 0, which is safe because
+  the LWW tuple rejects duplicates (at-least-once).
 
 No SQLite JSON/scalar subqueries remain; all referenced values are resolved from the txn's maps.
 
@@ -335,8 +338,10 @@ predicates, feature gates. Export builds the payload from a pinned root; install
 tree and commits once. `buckets.set_id`, admin users, admin-owned keys, site tables and markers stay
 node-local across install exactly as the current `install_tx` predicates do; install deletes
 non-admin-owned access keys (including session/STS keys of non-admin users) and clears admin-target
-permissions, as today. Golden fixtures captured from the last SQLite build must round-trip
-byte-identically through the object backend.
+permissions, as today. Because `uploads` lives in local files in the object backend, install must
+also clear non-admin `owner_id`s in that local upload store (today's `install_tx` step 6) and
+rebuild the account-usage cache; this is tested in D3. Golden fixtures captured from the last
+SQLite build must round-trip byte-identically through the object backend.
 
 ### 6.2 Offline migration (one-way)
 

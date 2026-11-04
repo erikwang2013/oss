@@ -325,7 +325,9 @@ Replace every raw SQL use of `event_outbox`, `repl_outbox`, `audit_log`, `upload
 semantics unchanged; audit retention; uploads owner uid remains numeric (uids never reused).
 RED: existing worker/queue tests run without SQLite; crash after send before ack redelivers; dead
 letter after attempts; compaction under load; audit query/retention; upload completion/expiry; sync
-intent recovery. GREEN: no SQL; local files are the only store.
+intent recovery; snapshot install clears non-admin upload owners in the local store (today's
+`install_tx` step 6) and rebuilds the account-usage cache. GREEN: no SQL; local files are the only
+store.
 
 Gate: `cargo test -p oss-server local_store` and event/replication/audit suites.
 
