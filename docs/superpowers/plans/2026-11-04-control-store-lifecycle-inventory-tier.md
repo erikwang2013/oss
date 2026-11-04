@@ -941,3 +941,21 @@ git commit -m "chore(oss-server): lifecycle/inventory/tier slice gates"
 - **类型一致性**：`LifecycleRuleEntry`/`InventoryConfigEntry`/`InventoryConfigView`/5 个 runstate 行类型/`TierRestoreRow` 名称在 Task 1 定义，Task 2-8 只引用；`replace_*` / `inventory_*` / `tier_*` 方法名逐任务一致。
 - **Review Focus 对应**：5 条各在 Task 2/4/6/7/8 有具名测试；fence 与身份漂移同时被现有 replication 套件覆盖。
 - **比例**：本计划只写签名、SQL 语义差异与测试断言；实现体由执行者按周边代码风格完成。
+
+---
+
+## 门禁记录
+
+2026-11-04，切片提交 `ec87e5f..c411cde`（Tasks 1–9 + 门禁修复），门禁在 `/home/wwwroot/project/oss` 执行：
+
+- 差分套件（4 个文件）：`control_store_lifecycle_diff` / `control_store_inventory_diff` / `control_store_tier_diff` / `control_store_lifecycle_inventory_tier_diff` 合计 21 passed / 0 failed；其中端到端差分与无 raw-SQL 审计 2/2。
+- `cargo test -p xl-store`：484 passed / 0 failed / 1 ignored。
+- `cargo test -p oss-server --no-fail-fast`：864 passed / 2 failed / 2 ignored（79 suites）。两处失败均已处置：
+  1. `raft_guard::source_scan_flags_new_control_table_writers`：新增 ControlStore 适配器文件未登记 → 已把 `control_store.rs`/`lifecycle.rs`/`inventory.rs`/`tier.rs` 加入 allowlist；复跑 3/3 绿。
+  2. `sync_gate::concurrent_delete_bucket_second_is_409`：负载下 150ms 时序竞争（首删得 409），隔离复跑 1/1 绿（3.37s），断言未改。
+  有效 866 passed / 0 failed / 2 ignored。
+- `cargo clippy -p oss-server -p xl-store -p xl-s3 --all-targets`：exit 0，0 warnings。
+- `cargo fmt --all -- --check`：exit 0。
+- 结论：切片门禁 PASS；可进入下一切片（buckets / policies / event / replication）。
+
+已知残余例外（决策 8）：`runstate_meta.next_run_id` 读写与 `purge_terminal_jobs_raw` 的 run/tier FK 置空仍为 raw，由 jobs 切片收口；`ensure_lifecycle_pk` 旧主键迁移属 schema 迁移，保留 raw。
