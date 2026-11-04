@@ -20,12 +20,13 @@
 //! 1/2 两个格式一经发布即冻结（载荷/行结构全部 `deny_unknown_fields`），任何
 //! `ControlData` 增删都必须升到 `OSSCTL3`；格式 3 的扩展区只由消费者解释。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
+use xl_store::control_store::bucket::BucketSnapshotTxn;
 use xl_store::control_store::inventory::InventoryTxn;
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{ControlError, ControlTxn, OlapConfigEntry};
@@ -93,47 +94,20 @@ pub struct PermissionRow {
     pub can_delete: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BucketRow {
-    pub name: String,
-    pub owner: OwnerRef,
-    pub creation_date: i64,
-    pub versioning: String,
-    pub object_lock: bool,
-    pub default_encryption: Option<String>,
-    pub object_lock_default_mode: Option<String>,
-    pub object_lock_default_days: Option<i64>,
-    pub replication_mode: String,
-    pub deleting: bool,
-}
+/// 桶行（自然键属主）；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type BucketRow = xl_store::control_store::BucketEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BucketPolicyRow {
-    pub bucket: String,
-    pub policy_json: String,
-    pub updated_at: i64,
-}
+/// 桶策略行；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type BucketPolicyRow = xl_store::control_store::BucketPolicyEntry;
 
 /// 生命周期规则行（自然键）；类型收敛到 ControlStore 缝，快照字段顺序不变。
 pub type LifecycleRuleRow = xl_store::control_store::LifecycleRuleEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EventConfigRow {
-    pub bucket: String,
-    pub config_json: String,
-    pub updated_at: i64,
-}
+/// 事件通知行；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type EventConfigRow = xl_store::control_store::EventConfigEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReplicationRuleRow {
-    pub bucket: String,
-    pub rules_json: String,
-    pub updated_at: i64,
-}
+/// 复制规则行；类型收敛到 ControlStore 缝，快照字段顺序不变。
+pub type ReplicationRuleRow = xl_store::control_store::ReplicationRuleEntry;
 
 /// AP 行（自然键属主）；类型收敛到 ControlStore 缝，快照字段顺序不变。
 pub type AccessPointRow = xl_store::control_store::AccessPointEntry;
@@ -265,22 +239,6 @@ fn control_data_err(e: ControlError) -> DataError {
     }
 }
 
-fn owner_of(
-    owner_id: Option<i64>,
-    username: Option<String>,
-    is_admin: Option<i64>,
-) -> Result<OwnerRef, DataError> {
-    match owner_id {
-        None => Ok(OwnerRef::Admin),
-        Some(0) => Ok(OwnerRef::Admin),
-        Some(id) => match (username, is_admin) {
-            (Some(_), Some(1)) => Ok(OwnerRef::Admin),
-            (Some(u), _) => Ok(OwnerRef::User(u)),
-            (None, _) => Err(DataError::MissingUser(id)),
-        },
-    }
-}
-
 /// 单事务读取 11 张复制表（+ canonical marker 之后的 level-3 账户两表；调用方负责
 /// 事务；行序 = checksum/自然键确定性来源）。
 pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, DataError> {
@@ -344,78 +302,30 @@ pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, 
         });
     }
 
-    for r in sqlx::query(
-        "SELECT b.name, b.owner_id, b.creation_date, b.versioning, b.object_lock, \
-                b.default_encryption, b.object_lock_default_mode, b.object_lock_default_days, \
-                b.replication_mode, b.deleting, u.username AS owner_username, \
-                u.is_admin AS owner_is_admin \
-         FROM buckets b LEFT JOIN users u ON u.id = b.owner_id ORDER BY b.name",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(sql)?
-    {
-        data.buckets.push(BucketRow {
-            name: r.get("name"),
-            owner: owner_of(
-                r.get("owner_id"),
-                r.get("owner_username"),
-                r.get("owner_is_admin"),
-            )?,
-            creation_date: r.get("creation_date"),
-            versioning: r.get("versioning"),
-            object_lock: r.get::<i64, _>("object_lock") != 0,
-            default_encryption: r.get("default_encryption"),
-            object_lock_default_mode: r.get("object_lock_default_mode"),
-            object_lock_default_days: r.get("object_lock_default_days"),
-            replication_mode: r.get("replication_mode"),
-            deleting: r.get::<i64, _>("deleting") != 0,
-        });
-    }
+    data.buckets = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.buckets().await.map_err(control_data_err)?
+    };
 
-    for r in
-        sqlx::query("SELECT bucket, policy_json, updated_at FROM bucket_policies ORDER BY bucket")
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql)?
-    {
-        data.bucket_policies.push(BucketPolicyRow {
-            bucket: r.get("bucket"),
-            policy_json: r.get("policy_json"),
-            updated_at: r.get("updated_at"),
-        });
-    }
+    data.bucket_policies = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.bucket_policies().await.map_err(control_data_err)?
+    };
 
     data.lifecycle_rules = {
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
         txn.all_lifecycle_rules().await.map_err(control_data_err)?
     };
 
-    for r in
-        sqlx::query("SELECT bucket, config_json, updated_at FROM event_configs ORDER BY bucket")
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql)?
-    {
-        data.event_configs.push(EventConfigRow {
-            bucket: r.get("bucket"),
-            config_json: r.get("config_json"),
-            updated_at: r.get("updated_at"),
-        });
-    }
+    data.event_configs = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.event_configs().await.map_err(control_data_err)?
+    };
 
-    for r in
-        sqlx::query("SELECT bucket, rules_json, updated_at FROM replication_rules ORDER BY bucket")
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql)?
-    {
-        data.replication_rules.push(ReplicationRuleRow {
-            bucket: r.get("bucket"),
-            rules_json: r.get("rules_json"),
-            updated_at: r.get("updated_at"),
-        });
-    }
+    data.replication_rules = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
+        txn.replication_rules().await.map_err(control_data_err)?
+    };
 
     data.access_points = {
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
@@ -673,14 +583,6 @@ pub(crate) async fn install_tx(
         .replace_access_points(&[])
         .await
         .map_err(control_data_err)?;
-    // 2. 桶配置行（无外键，先清）。
-    for q in [
-        "DELETE FROM event_configs",
-        "DELETE FROM replication_rules",
-        "DELETE FROM bucket_policies",
-    ] {
-        sqlx::query(q).execute(&mut *conn).await.map_err(sql)?;
-    }
     // 3. 权限（引用 users）。
     sqlx::query("DELETE FROM permissions")
         .execute(&mut *conn)
@@ -697,22 +599,11 @@ pub(crate) async fn install_tx(
         .await
         .map_err(sql)?;
     // 4. 目标独有桶（引用 users，须先于删 users）；保留桶 owner 先置 NULL。
-    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM buckets")
-        .fetch_all(&mut *conn)
+    let wanted: Vec<String> = data.buckets.iter().map(|b| b.name.clone()).collect();
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .bucket_install_prepare(&wanted)
         .await
-        .map_err(sql)?;
-    let wanted: HashSet<&str> = data.buckets.iter().map(|b| b.name.as_str()).collect();
-    for name in existing.iter().filter(|n| !wanted.contains(n.as_str())) {
-        sqlx::query("DELETE FROM buckets WHERE name = ?")
-            .bind(name)
-            .execute(&mut *conn)
-            .await
-            .map_err(sql)?;
-    }
-    sqlx::query("UPDATE buckets SET owner_id = NULL")
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        .map_err(control_data_err)?;
     // 5. 非管理员属主 AK 全清（long-term + session/STS；管理员本地 AK 保留）。
     sqlx::query(
         "DELETE FROM access_keys \
@@ -831,38 +722,12 @@ pub(crate) async fn install_tx(
     .await
     .map_err(sql)?;
 
-    // 10. 桶：保留目标 set_id（不在 UPDATE 列里），新桶 DEFAULT 0。
+    // 10. 桶：保留目标 set_id（UPDATE 列不含 set_id）。
     for b in &data.buckets {
-        let owner_id = match &b.owner {
-            OwnerRef::Admin => None,
-            OwnerRef::User(name) => Some(user_id(name, "bucket")?),
-        };
-        sqlx::query(
-            "INSERT INTO buckets \
-             (name, owner_id, creation_date, versioning, object_lock, default_encryption, \
-              object_lock_default_mode, object_lock_default_days, replication_mode, deleting) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(name) DO UPDATE SET \
-              owner_id = excluded.owner_id, creation_date = excluded.creation_date, \
-              versioning = excluded.versioning, object_lock = excluded.object_lock, \
-              default_encryption = excluded.default_encryption, \
-              object_lock_default_mode = excluded.object_lock_default_mode, \
-              object_lock_default_days = excluded.object_lock_default_days, \
-              replication_mode = excluded.replication_mode, deleting = excluded.deleting",
-        )
-        .bind(&b.name)
-        .bind(owner_id)
-        .bind(b.creation_date)
-        .bind(&b.versioning)
-        .bind(b.object_lock)
-        .bind(&b.default_encryption)
-        .bind(&b.object_lock_default_mode)
-        .bind(b.object_lock_default_days)
-        .bind(&b.replication_mode)
-        .bind(b.deleting)
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
+        crate::control_store::SqliteControlTxn::new(&mut *conn)
+            .bucket_upsert_install(b)
+            .await
+            .map_err(control_data_err)?;
     }
 
     // 11. AP（txn 按自然键解析本地 id）/ inventory：Admin 属主 = 本地管理员 id（witness 0）。
@@ -876,42 +741,23 @@ pub(crate) async fn install_tx(
         .map_err(control_data_err)?;
 
     // 12. 桶级配置（桶已就位）。
-    for p in &data.bucket_policies {
-        sqlx::query(
-            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, ?)",
-        )
-        .bind(&p.bucket)
-        .bind(&p.policy_json)
-        .bind(p.updated_at)
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_bucket_policies(&data.bucket_policies)
         .await
-        .map_err(sql)?;
-    }
+        .map_err(control_data_err)?;
     crate::control_store::SqliteControlTxn::new(&mut *conn)
         .replace_all_lifecycle_rules(&data.lifecycle_rules)
         .await
         .map_err(control_data_err)?;
-    for e in &data.event_configs {
-        sqlx::query("INSERT INTO event_configs (bucket, config_json, updated_at) VALUES (?, ?, ?)")
-            .bind(&e.bucket)
-            .bind(&e.config_json)
-            .bind(e.updated_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sql)?;
-    }
-    for r in &data.replication_rules {
-        sqlx::query(
-            "INSERT INTO replication_rules (bucket, rules_json, updated_at) VALUES (?, ?, ?)",
-        )
-        .bind(&r.bucket)
-        .bind(&r.rules_json)
-        .bind(r.updated_at)
-        .execute(&mut *conn)
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_event_configs(&data.event_configs)
         .await
-        .map_err(sql)?;
-    }
-    let olap: Vec<OlapConfigEntry> = data
+        .map_err(control_data_err)?;
+    crate::control_store::SqliteControlTxn::new(&mut *conn)
+        .replace_replication_rules(&data.replication_rules)
+        .await
+        .map_err(control_data_err)?;
+    let olap_entries: Vec<OlapConfigEntry> = data
         .olap_configs
         .iter()
         .map(|o| {
@@ -936,7 +782,7 @@ pub(crate) async fn install_tx(
         })
         .collect::<Result<Vec<_>, DataError>>()?;
     crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_olap_configs(&olap)
+        .replace_olap_configs(&olap_entries)
         .await
         .map_err(control_data_err)?;
 
@@ -2604,5 +2450,58 @@ mod tests {
             read.inventory_runs.iter().map(|r| r.id).collect::<Vec<_>>(),
             [2, 5, 9]
         );
+    }
+
+    /// Task 6：悬空桶属主导出为 `MissingUser`，文本无 `control data:` 前缀。
+    #[tokio::test]
+    async fn read_tx_dangling_bucket_owner_is_missing_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = raft_db(&dir, "bucket-dangling.db").await;
+        let mut conn = db.pool().acquire().await.unwrap();
+        sqlx::query("UPDATE raft_apply_ctx SET active = 1 WHERE id = 1")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO buckets (name, owner_id, creation_date) VALUES ('dangling', 999, 1)",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let err = read_tx(&mut conn).await.unwrap_err();
+        assert!(
+            matches!(err, DataError::MissingUser(999)),
+            "expected MissingUser(999), got {err:?}"
+        );
+        assert_eq!(err.to_string(), "owner user id 999 missing");
+    }
+
+    /// 任务 6：桶行本身只需要最低 feature level。
+    #[test]
+    fn buckets_only_require_feature_level_one() {
+        let data = ControlData {
+            buckets: vec![BucketRow {
+                name: "b".into(),
+                owner: OwnerRef::Admin,
+                creation_date: 1,
+                versioning: "Off".into(),
+                object_lock: false,
+                default_encryption: None,
+                object_lock_default_mode: None,
+                object_lock_default_days: None,
+                replication_mode: "async".into(),
+                deleting: false,
+            }],
+            ..ControlData::default()
+        };
+        assert_eq!(required_feature_level(&data), MIN_FEATURE_LEVEL);
     }
 }

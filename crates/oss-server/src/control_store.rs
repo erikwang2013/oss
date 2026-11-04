@@ -5,8 +5,8 @@
 
 use sqlx::{Row, SqlitePool};
 use xl_store::control_store::bucket::{
-    BucketCreateOutcome, BucketEntry, BucketPolicyEntry, BucketStore, BucketTxn, BucketView,
-    EventConfigEntry, ReplicationRuleEntry,
+    BucketCreateOutcome, BucketEntry, BucketPolicyEntry, BucketSnapshotTxn, BucketStore, BucketTxn,
+    BucketView, EventConfigEntry, ReplicationRuleEntry,
 };
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
@@ -22,6 +22,7 @@ use xl_store::control_store::{
 
 mod ap_olap;
 mod bucket;
+mod bucket_snapshot;
 mod bucket_write;
 mod inventory;
 mod lifecycle;
@@ -835,5 +836,53 @@ impl BucketTxn for SqliteControlTxn<'_> {
 
     async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
         bucket_write::delete_bucket_configs_for_bucket(self, bucket).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BucketSnapshotTxn for SqliteControlTxn<'_> {
+    async fn buckets(&mut self) -> Result<Vec<BucketEntry>, ControlError> {
+        bucket_snapshot::buckets(self).await
+    }
+
+    async fn bucket_policies(&mut self) -> Result<Vec<BucketPolicyEntry>, ControlError> {
+        bucket_snapshot::bucket_policies(self).await
+    }
+
+    async fn replace_bucket_policies(
+        &mut self,
+        rows: &[BucketPolicyEntry],
+    ) -> Result<(), ControlError> {
+        bucket_snapshot::replace_bucket_policies(self, rows).await
+    }
+
+    async fn event_configs(&mut self) -> Result<Vec<EventConfigEntry>, ControlError> {
+        bucket_snapshot::event_configs(self).await
+    }
+
+    async fn replace_event_configs(
+        &mut self,
+        rows: &[EventConfigEntry],
+    ) -> Result<(), ControlError> {
+        bucket_snapshot::replace_event_configs(self, rows).await
+    }
+
+    async fn replication_rules(&mut self) -> Result<Vec<ReplicationRuleEntry>, ControlError> {
+        bucket_snapshot::replication_rules(self).await
+    }
+
+    async fn replace_replication_rules(
+        &mut self,
+        rows: &[ReplicationRuleEntry],
+    ) -> Result<(), ControlError> {
+        bucket_snapshot::replace_replication_rules(self, rows).await
+    }
+
+    async fn bucket_install_prepare(&mut self, wanted: &[String]) -> Result<(), ControlError> {
+        bucket_snapshot::bucket_install_prepare(self, wanted).await
+    }
+
+    async fn bucket_upsert_install(&mut self, row: &BucketEntry) -> Result<(), ControlError> {
+        bucket_snapshot::bucket_upsert_install(self, row).await
     }
 }

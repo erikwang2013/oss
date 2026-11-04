@@ -244,3 +244,49 @@ fn generate_fixtures() {
     )
     .unwrap();
 }
+
+/// 桶行 JSON 字段顺序与旧快照逐字节一致（真实快照用 serde_json）。
+#[test]
+fn bucket_row_serde_json_matches_legacy_field_order() {
+    #[derive(serde::Serialize)]
+    struct LegacyBucket {
+        name: String,
+        owner: OwnerRef,
+        creation_date: i64,
+        versioning: String,
+        object_lock: bool,
+        default_encryption: Option<String>,
+        object_lock_default_mode: Option<String>,
+        object_lock_default_days: Option<i64>,
+        replication_mode: String,
+        deleting: bool,
+    }
+    let row = BucketRow {
+        name: "b1".into(),
+        owner: OwnerRef::User("alice".into()),
+        creation_date: 1,
+        versioning: "Enabled".into(),
+        object_lock: true,
+        default_encryption: Some("AES256".into()),
+        object_lock_default_mode: Some("GOVERNANCE".into()),
+        object_lock_default_days: Some(7),
+        replication_mode: "sync".into(),
+        deleting: false,
+    };
+    let legacy = LegacyBucket {
+        name: row.name.clone(),
+        owner: row.owner.clone(),
+        creation_date: row.creation_date,
+        versioning: row.versioning.clone(),
+        object_lock: row.object_lock,
+        default_encryption: row.default_encryption.clone(),
+        object_lock_default_mode: row.object_lock_default_mode.clone(),
+        object_lock_default_days: row.object_lock_default_days,
+        replication_mode: row.replication_mode.clone(),
+        deleting: row.deleting,
+    };
+    assert_eq!(
+        serde_json::to_vec(&row).unwrap(),
+        serde_json::to_vec(&legacy).unwrap()
+    );
+}
