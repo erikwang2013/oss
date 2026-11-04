@@ -4,6 +4,9 @@
 //! 事务由调用方持有；适配器不 begin/commit/rollback。
 
 use sqlx::{Row, SqlitePool};
+use xl_store::control_store::bucket::{
+    BucketPolicyEntry, BucketStore, BucketView, EventConfigEntry, ReplicationRuleEntry,
+};
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
     InventoryRunRow, InventoryStore, InventoryTxn,
@@ -17,6 +20,7 @@ use xl_store::control_store::{
 };
 
 mod ap_olap;
+mod bucket;
 mod inventory;
 mod lifecycle;
 mod tier;
@@ -84,6 +88,47 @@ impl ControlStore for SqliteControlStore {
 
     async fn olap_configs(&self) -> Result<Vec<OlapConfigEntry>, ControlError> {
         ap_olap::olap_configs(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BucketStore for SqliteControlStore {
+    async fn bucket(&self, name: &str) -> Result<Option<BucketView>, ControlError> {
+        bucket::bucket(self, name).await
+    }
+
+    async fn buckets(&self) -> Result<Vec<BucketView>, ControlError> {
+        bucket::buckets(self).await
+    }
+
+    async fn bucket_policy(&self, bucket: &str) -> Result<Option<BucketPolicyEntry>, ControlError> {
+        bucket::bucket_policy(self, bucket).await
+    }
+
+    async fn bucket_policies(&self) -> Result<Vec<BucketPolicyEntry>, ControlError> {
+        bucket::bucket_policies(self).await
+    }
+
+    async fn bucket_notification(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<EventConfigEntry>, ControlError> {
+        bucket::bucket_notification(self, bucket).await
+    }
+
+    async fn event_configs(&self) -> Result<Vec<EventConfigEntry>, ControlError> {
+        bucket::event_configs(self).await
+    }
+
+    async fn bucket_replication_rules(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<ReplicationRuleEntry>, ControlError> {
+        bucket::bucket_replication_rules(self, bucket).await
+    }
+
+    async fn replication_rules(&self) -> Result<Vec<ReplicationRuleEntry>, ControlError> {
+        bucket::replication_rules(self).await
     }
 }
 
@@ -208,7 +253,9 @@ pub(crate) fn to_sqlx(e: ControlError) -> sqlx::Error {
     match e {
         ControlError::Invalid(m) => sqlx::Error::Protocol(m),
         ControlError::Backend(m) => sqlx::Error::Protocol(format!("control store backend: {m}")),
-        ControlError::MissingOwner(id) => sqlx::Error::Protocol(format!("owner user id {id} missing")),
+        ControlError::MissingOwner(id) => {
+            sqlx::Error::Protocol(format!("owner user id {id} missing"))
+        }
     }
 }
 

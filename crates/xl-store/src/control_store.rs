@@ -17,6 +17,7 @@ pub use bucket::{BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRu
 pub use inventory::InventoryConfigEntry;
 pub use lifecycle::LifecycleRuleEntry;
 
+use bucket::BucketStore;
 use inventory::{InventoryStore, InventoryTxn};
 use lifecycle::{LifecycleStore, LifecycleTxn};
 use tier::{TierStore, TierTxn};
@@ -87,7 +88,9 @@ pub enum ControlError {
 
 /// 只读控制面访问。实现必须复用 `Db` 的既有连接池，不得自建第二个池。
 #[async_trait::async_trait]
-pub trait ControlStore: LifecycleStore + InventoryStore + TierStore + Send + Sync {
+pub trait ControlStore:
+    BucketStore + LifecycleStore + InventoryStore + TierStore + Send + Sync
+{
     async fn vpc_endpoint(&self, vpce_id: &str) -> Result<Option<VpcEndpoint>, ControlError>;
     /// 按 `vpce_id` 升序（导出/校验的确定性来源）。
     async fn vpc_endpoints(&self) -> Result<Vec<VpcEndpoint>, ControlError>;

@@ -101,8 +101,10 @@ pub trait BucketStore: Send + Sync {
 /// 调用方事务内的桶点写；本 trait 不 begin/commit/rollback。
 #[async_trait::async_trait]
 pub trait BucketTxn: Send {
-    async fn bucket_create(&mut self, row: &BucketEntry)
-    -> Result<BucketCreateOutcome, ControlError>;
+    async fn bucket_create(
+        &mut self,
+        row: &BucketEntry,
+    ) -> Result<BucketCreateOutcome, ControlError>;
     async fn bucket_delete(&mut self, name: &str) -> Result<bool, ControlError>;
     async fn bucket_set_deleting(
         &mut self,
@@ -126,10 +128,7 @@ pub trait BucketTxn: Send {
         name: &str,
         algorithm: &str,
     ) -> Result<bool, ControlError>;
-    async fn bucket_clear_default_encryption(
-        &mut self,
-        name: &str,
-    ) -> Result<bool, ControlError>;
+    async fn bucket_clear_default_encryption(&mut self, name: &str) -> Result<bool, ControlError>;
     async fn bucket_policy_set(
         &mut self,
         bucket: &str,
@@ -150,12 +149,10 @@ pub trait BucketTxn: Send {
         rules_json: &str,
         updated_at: i64,
     ) -> Result<(), ControlError>;
-    async fn bucket_replication_rules_delete(&mut self, bucket: &str)
-    -> Result<(), ControlError>;
+    async fn bucket_replication_rules_delete(&mut self, bucket: &str) -> Result<(), ControlError>;
     async fn bucket_exists(&mut self, name: &str) -> Result<bool, ControlError>;
     /// 删该桶的策略/事件/复制规则（桶删除级联）。
-    async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str)
-    -> Result<(), ControlError>;
+    async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError>;
 }
 
 /// 快照导出/安装（调用方事务内）。
@@ -169,8 +166,10 @@ pub trait BucketSnapshotTxn: Send {
         rows: &[BucketPolicyEntry],
     ) -> Result<(), ControlError>;
     async fn event_configs(&mut self) -> Result<Vec<EventConfigEntry>, ControlError>;
-    async fn replace_event_configs(&mut self, rows: &[EventConfigEntry])
-    -> Result<(), ControlError>;
+    async fn replace_event_configs(
+        &mut self,
+        rows: &[EventConfigEntry],
+    ) -> Result<(), ControlError>;
     async fn replication_rules(&mut self) -> Result<Vec<ReplicationRuleEntry>, ControlError>;
     async fn replace_replication_rules(
         &mut self,
