@@ -6238,12 +6238,7 @@ impl Db {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
-            .inventory_run_set_job(
-                run_id,
-                job_id,
-                fence.term_i64(),
-                fence.leader_i64(),
-            )
+            .inventory_run_set_job(run_id, job_id, fence.term_i64(), fence.leader_i64())
             .await
             .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
@@ -6891,7 +6886,6 @@ impl Db {
             .await?;
         Ok(())
     }
-
 }
 
 /// 审计查询的过滤条件（`Db::list_audit`）；`key_prefix` 为 object_key 前缀，其余精确匹配。
@@ -7305,13 +7299,11 @@ mod argon2_tests {
     async fn delete_bucket_cascade_uses_same_seven_table_scope() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let root = db.create_user("root", "pw", true).await.unwrap();
-        sqlx::query(
-            "INSERT INTO buckets (name, owner_id, creation_date) VALUES ('b1', ?, 1)",
-        )
-        .bind(root)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO buckets (name, owner_id, creation_date) VALUES ('b1', ?, 1)")
+            .bind(root)
+            .execute(db.pool())
+            .await
+            .unwrap();
         seed_cascade_rows(&db, "b1", root).await;
         seed_cascade_rows(&db, "b2", root).await;
         sqlx::query("INSERT INTO permissions (user_id, bucket, can_read, can_write, can_delete) VALUES (?, 'b1', 1, 1, 1)")
@@ -7319,10 +7311,12 @@ mod argon2_tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES ('b1', '{}', 1)")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES ('b1', '{}', 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         let mut tx = db.pool().begin().await.unwrap();
         {
@@ -7384,10 +7378,12 @@ mod argon2_tests {
         }
         tx.commit().await.unwrap();
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM lifecycle_rules WHERE bucket = 'b1'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM lifecycle_rules WHERE bucket = 'b1'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
             0
         );
         assert_eq!(

@@ -156,13 +156,7 @@ async fn inventory_config_upsert_is_natural_key_and_clears_cursor_incremental() 
         raw_inventory_config_dump(&db).await,
         vec![
             ("b1".into(), "cfg".into(), alice, r#"{"new":2}"#.into(), 9),
-            (
-                "b1".into(),
-                "other".into(),
-                0,
-                r#"{"keep":1}"#.into(),
-                1
-            ),
+            ("b1".into(), "other".into(), 0, r#"{"keep":1}"#.into(), 1),
             (
                 "b2".into(),
                 "cfg".into(),
@@ -247,7 +241,11 @@ async fn inventory_config_export_is_strict_and_ordered() {
         Err(ControlError::Invalid(m)) => assert_eq!(m, "owner user id 999 missing"),
         other => panic!("悬空属主导出必须严格失败，得到 {other:?}"),
     }
-    assert!(txn.inventory_config_delete("b1", "cfg-dangling").await.unwrap());
+    assert!(
+        txn.inventory_config_delete("b1", "cfg-dangling")
+            .await
+            .unwrap()
+    );
     assert_eq!(
         txn.inventory_configs().await.unwrap(),
         vec![
@@ -273,13 +271,7 @@ async fn inventory_config_export_is_strict_and_ordered() {
     raw_inventory_incremental(&db, "b1", "cfg-alice", true, 3).await;
     let rows = vec![
         entry("b2", "z", OwnerRef::Admin, r#"{"z":1}"#, 7),
-        entry(
-            "b1",
-            "a",
-            OwnerRef::User("alice".into()),
-            r#"{"a":2}"#,
-            8,
-        ),
+        entry("b1", "a", OwnerRef::User("alice".into()), r#"{"a":2}"#, 8),
         entry("b1", "m", OwnerRef::Admin, r#"{"m":1}"#, 9),
     ];
     let mut tx = db.pool().begin().await.unwrap();
@@ -287,10 +279,11 @@ async fn inventory_config_export_is_strict_and_ordered() {
     txn.replace_inventory_configs(&rows).await.unwrap();
     tx.commit().await.unwrap();
 
-    let by_rowid: Vec<String> = sqlx::query_scalar("SELECT id FROM inventory_configs ORDER BY rowid")
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
+    let by_rowid: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM inventory_configs ORDER BY rowid")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
     assert_eq!(by_rowid, vec!["z", "a", "m"], "按入参顺序 INSERT");
     assert_eq!(
         raw_inventory_config_dump(&db).await,
@@ -361,11 +354,7 @@ async fn inventory_apply_put_resolves_admin_and_user_natural_keys() {
 
     // witness（尚无管理员）：Admin 映射哨兵 0。
     let witness = fresh().await;
-    txn_upsert(
-        &witness,
-        &entry("b1", "cfg", OwnerRef::Admin, "{}", 1),
-    )
-    .await;
+    txn_upsert(&witness, &entry("b1", "cfg", OwnerRef::Admin, "{}", 1)).await;
     assert_eq!(
         raw_inventory_config_dump(&witness).await,
         vec![("b1".into(), "cfg".into(), 0, "{}".into(), 1)]
@@ -405,9 +394,7 @@ async fn inventory_apply_put_resolves_admin_and_user_natural_keys() {
 
 // ---------- Task 4: run / cursor / incremental ----------
 
-use xl_store::control_store::inventory::{
-    InventoryCursorRow, InventoryRunRow,
-};
+use xl_store::control_store::inventory::{InventoryCursorRow, InventoryRunRow};
 
 fn run(id: i64, bucket: &str, config_id: &str, run_key: &str) -> InventoryRunRow {
     InventoryRunRow {
@@ -501,7 +488,14 @@ async fn inventory_cursor_upsert_and_delete_keep_fence_semantics() {
         "旧 term 不得覆盖"
     );
     assert!(txn.inventory_cursor_upsert(&cursor(6, "6")).await.unwrap());
-    assert_eq!(txn.inventory_cursor("b1", "cfg").await.unwrap().unwrap().cursor, "6");
+    assert_eq!(
+        txn.inventory_cursor("b1", "cfg")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor,
+        "6"
+    );
     txn.inventory_cursor_delete("b1", "cfg", Some(5))
         .await
         .unwrap();
@@ -518,9 +512,14 @@ async fn inventory_cursor_upsert_and_delete_keep_fence_semantics() {
     raw_inventory_cursor(&db, "b1", "cfg", "7", 1, 3).await;
     let mut tx = db.pool().begin().await.unwrap();
     let mut txn = SqliteControlTxn::new(&mut tx);
-    txn.inventory_cursor_delete("b1", "cfg", None).await.unwrap();
+    txn.inventory_cursor_delete("b1", "cfg", None)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
-    assert!(raw_inventory_cursor_dump(&db).await.is_empty(), "None 无 fence");
+    assert!(
+        raw_inventory_cursor_dump(&db).await.is_empty(),
+        "None 无 fence"
+    );
 }
 
 #[tokio::test]
@@ -549,8 +548,14 @@ async fn inventory_run_create_is_idempotent_per_natural_key() {
     let db = fresh().await;
     let mut tx = db.pool().begin().await.unwrap();
     let mut txn = SqliteControlTxn::new(&mut tx);
-    let first = txn.inventory_run_create("b1", "cfg", "k", 1, 1, 1).await.unwrap();
-    let second = txn.inventory_run_create("b1", "cfg", "k", 2, 1, 1).await.unwrap();
+    let first = txn
+        .inventory_run_create("b1", "cfg", "k", 1, 1, 1)
+        .await
+        .unwrap();
+    let second = txn
+        .inventory_run_create("b1", "cfg", "k", 2, 1, 1)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     assert!(first.is_some());
     assert_eq!(second, None, "同自然键去重");
@@ -576,7 +581,11 @@ async fn db_inventory_executor_facades_preserve_fence_and_started_once() {
         .await
         .unwrap();
 
-    let row = db.inventory_run_by_key("b1", "cfg", "k").await.unwrap().unwrap();
+    let row = db
+        .inventory_run_by_key("b1", "cfg", "k")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.started_at, 20, "started_at 只写一次");
     assert_eq!(row.state, "done", "旧 term 收尾被拒");
@@ -589,13 +598,25 @@ async fn db_inventory_executor_facades_preserve_fence_and_started_once() {
 async fn inventory_incremental_and_cursor_facades_roundtrip() {
     let db = fresh().await;
     assert!(!db.inventory_incremental_get("b1", "cfg").await.unwrap());
-    db.inventory_incremental_set("b1", "cfg", true, 1).await.unwrap();
-    assert!(db.inventory_incremental_get("b1", "cfg").await.unwrap());
-    db.inventory_cursor_set("b1", "cfg", 7, Some("42"), 2, oss_server::raft::FencingEpoch { term: 1, leader: 1 })
+    db.inventory_incremental_set("b1", "cfg", true, 1)
         .await
         .unwrap();
+    assert!(db.inventory_incremental_get("b1", "cfg").await.unwrap());
+    db.inventory_cursor_set(
+        "b1",
+        "cfg",
+        7,
+        Some("42"),
+        2,
+        oss_server::raft::FencingEpoch { term: 1, leader: 1 },
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        db.inventory_cursor_get("b1", "cfg", 7).await.unwrap().as_deref(),
+        db.inventory_cursor_get("b1", "cfg", 7)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("42")
     );
     assert_eq!(
@@ -603,7 +624,12 @@ async fn inventory_incremental_and_cursor_facades_roundtrip() {
         None,
         "配置版本不匹配即回退全量"
     );
-    db.inventory_incremental_set("b1", "cfg", false, 3).await.unwrap();
+    db.inventory_incremental_set("b1", "cfg", false, 3)
+        .await
+        .unwrap();
     assert!(!db.inventory_incremental_get("b1", "cfg").await.unwrap());
-    assert!(raw_inventory_cursor_dump(&db).await.is_empty(), "关闭增量清水位");
+    assert!(
+        raw_inventory_cursor_dump(&db).await.is_empty(),
+        "关闭增量清水位"
+    );
 }

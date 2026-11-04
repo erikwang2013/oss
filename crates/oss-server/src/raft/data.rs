@@ -2512,7 +2512,8 @@ mod tests {
         };
         let err = install_tx(&mut tx, &data, &ctx).await.unwrap_err();
         assert!(
-            err.to_string().contains("inventory owner ghost not in snapshot"),
+            err.to_string()
+                .contains("inventory owner ghost not in snapshot"),
             "{err}"
         );
         let after_lifecycle: Vec<String> =
@@ -2534,8 +2535,8 @@ mod tests {
     #[tokio::test]
     async fn runstate_five_tables_round_trip_preserves_order_and_ids() {
         use crate::raft::runstate::{
-            RunState, InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow,
-            LifecycleCursorRow, TierRestoreRow, install_runstate_tx, read_runstate_tx,
+            InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, LifecycleCursorRow,
+            RunState, TierRestoreRow, install_runstate_tx, read_runstate_tx,
         };
         let dir = tempfile::tempdir().unwrap();
         let db = raft_db(&dir, "runstate-five.db").await;

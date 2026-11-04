@@ -5,8 +5,8 @@
 //! 快照导出口径（`InventoryTxn::inventory_configs`）：严格 fail-closed，悬空属主
 //! 报 `Invalid`。
 
-use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
+use sqlx::sqlite::SqliteRow;
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
     InventoryRunRow,
@@ -664,15 +664,13 @@ pub(super) async fn txn_inventory_cursor_delete(
     fence_term: Option<i64>,
 ) -> Result<(), ControlError> {
     match fence_term {
-        Some(term) => {
-            sqlx::query(
-                "DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ? \
+        Some(term) => sqlx::query(
+            "DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ? \
                  AND fence_term <= ?",
-            )
-            .bind(bucket)
-            .bind(config_id)
-            .bind(term)
-        }
+        )
+        .bind(bucket)
+        .bind(config_id)
+        .bind(term),
         None => sqlx::query("DELETE FROM inventory_cursors WHERE bucket = ? AND config_id = ?")
             .bind(bucket)
             .bind(config_id),

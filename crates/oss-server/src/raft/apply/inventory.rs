@@ -7,8 +7,8 @@
 use super::{ControlWrite, invariant};
 use crate::control_store::{SqliteControlTxn, to_sqlx};
 use crate::raft::command::ControlResponse;
-use xl_store::control_store::inventory::InventoryTxn;
 use crate::raft::runstate::{InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow};
+use xl_store::control_store::inventory::InventoryTxn;
 
 fn run_terminal(state: &str) -> bool {
     matches!(state, "done" | "skipped")

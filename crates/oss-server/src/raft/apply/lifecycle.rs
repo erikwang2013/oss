@@ -61,7 +61,10 @@ async fn current(
         .map_err(control_err)
 }
 
-async fn upsert(cw: &mut ControlWrite<'_>, cursor: &LifecycleCursorRow) -> Result<bool, sqlx::Error> {
+async fn upsert(
+    cw: &mut ControlWrite<'_>,
+    cursor: &LifecycleCursorRow,
+) -> Result<bool, sqlx::Error> {
     SqliteControlTxn::new(cw.conn())
         .lifecycle_cursor_upsert(cursor)
         .await

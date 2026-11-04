@@ -2,8 +2,8 @@
 
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
-use xl_store::control_store::lifecycle::{LifecycleCursorRow, LifecycleRuleEntry};
 use xl_store::control_store::ControlError;
+use xl_store::control_store::lifecycle::{LifecycleCursorRow, LifecycleRuleEntry};
 
 use super::{SqliteControlStore, SqliteControlTxn};
 
@@ -18,8 +18,7 @@ const INSERT_RULE: &str = "INSERT INTO lifecycle_rules (bucket, rule_id, prefix,
      expiration_days, transition_days, transition_class, transition_tier, enabled, updated_at, \
      config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-const CURSOR_COLUMNS: &str =
-    "bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader";
+const CURSOR_COLUMNS: &str = "bucket, rule_id, stage, cursor, updated_at, fence_term, fence_leader";
 
 fn rule_from(r: &SqliteRow) -> LifecycleRuleEntry {
     LifecycleRuleEntry {
@@ -153,7 +152,7 @@ pub(super) async fn txn_replace_lifecycle_rules(
         .await
         .map_err(backend)?;
     for r in rows {
-        insert_rule(&mut txn.conn, bucket, r).await?;
+        insert_rule(txn.conn, bucket, r).await?;
     }
     Ok(())
 }
@@ -167,7 +166,7 @@ pub(super) async fn txn_replace_all_lifecycle_rules(
         .await
         .map_err(backend)?;
     for r in rows {
-        insert_rule(&mut txn.conn, &r.bucket, r).await?;
+        insert_rule(txn.conn, &r.bucket, r).await?;
     }
     Ok(())
 }

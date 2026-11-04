@@ -6,7 +6,7 @@ use std::sync::Arc;
 use oss_server::control_store::SqliteControlTxn;
 use oss_server::db::Db;
 use sqlx::Row;
-use xl_store::control_store::tier::{TierRestoreRow, TierStore, TierTxn};
+use xl_store::control_store::tier::{TierRestoreRow, TierTxn};
 
 async fn fresh() -> Arc<Db> {
     Arc::new(Db::connect("sqlite::memory:").await.unwrap())
@@ -147,7 +147,11 @@ async fn tier_upsert_delete_and_set_state_are_fence_bounded() {
         .await
         .unwrap();
     assert_eq!(
-        txn.tier_restore("b", "k", "v").await.unwrap().unwrap().state,
+        txn.tier_restore("b", "k", "v")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
         "pending",
         "set_state 旧 term no-op"
     );
@@ -191,6 +195,10 @@ async fn pending_reset_keeps_max_fence_and_matches_legacy_sql() {
         txn.tier_restore_upsert(&pending).await.unwrap();
     }
     tx.commit().await.unwrap();
-    assert_eq!(dump(&seam).await, dump(&legacy).await, "pending 重置语义一致");
+    assert_eq!(
+        dump(&seam).await,
+        dump(&legacy).await,
+        "pending 重置语义一致"
+    );
     assert_eq!(dump(&seam).await[0].state, "pending");
 }

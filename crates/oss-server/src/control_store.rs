@@ -137,18 +137,14 @@ impl InventoryStore for SqliteControlStore {
         &self,
         bucket: &str,
         config_id: &str,
-    ) -> Result<Option<InventoryIncrementalRow>, ControlError>
-    {
+    ) -> Result<Option<InventoryIncrementalRow>, ControlError> {
         inventory::inventory_incremental(self, bucket, config_id).await
     }
 }
 
 #[async_trait::async_trait]
 impl LifecycleStore for SqliteControlStore {
-    async fn lifecycle_rules(
-        &self,
-        bucket: &str,
-    ) -> Result<Vec<LifecycleRuleEntry>, ControlError> {
+    async fn lifecycle_rules(&self, bucket: &str) -> Result<Vec<LifecycleRuleEntry>, ControlError> {
         lifecycle::lifecycle_rules(self, bucket).await
     }
 
@@ -563,11 +559,7 @@ impl InventoryTxn for SqliteControlTxn<'_> {
         inventory::txn_inventory_incremental_delete(self, bucket, config_id).await
     }
 
-    async fn inventory_clear(
-        &mut self,
-        bucket: &str,
-        config_id: &str,
-    ) -> Result<(), ControlError> {
+    async fn inventory_clear(&mut self, bucket: &str, config_id: &str) -> Result<(), ControlError> {
         inventory::txn_inventory_clear(self, bucket, config_id).await
     }
 }
@@ -654,17 +646,11 @@ impl TierTxn for SqliteControlTxn<'_> {
         tier::txn_tier_restores(self).await
     }
 
-    async fn replace_tier_restores(
-        &mut self,
-        rows: &[TierRestoreRow],
-    ) -> Result<(), ControlError> {
+    async fn replace_tier_restores(&mut self, rows: &[TierRestoreRow]) -> Result<(), ControlError> {
         tier::txn_replace_tier_restores(self, rows).await
     }
 
-    async fn tier_restore_upsert(
-        &mut self,
-        row: &TierRestoreRow,
-    ) -> Result<bool, ControlError> {
+    async fn tier_restore_upsert(&mut self, row: &TierRestoreRow) -> Result<bool, ControlError> {
         tier::txn_tier_restore_upsert(self, row).await
     }
 

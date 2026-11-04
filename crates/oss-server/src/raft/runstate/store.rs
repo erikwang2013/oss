@@ -8,10 +8,10 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::model::{JobRow, JobTaskRow, RunState, ScheduleLeaseRow};
 use crate::raft::data::DataError;
+use xl_store::control_store::ControlError;
 use xl_store::control_store::inventory::InventoryTxn;
 use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::tier::TierTxn;
-use xl_store::control_store::ControlError;
 
 const META_NEXT_JOB_ID: &str = "next_job_id";
 const META_NEXT_RUN_ID: &str = "next_run_id";

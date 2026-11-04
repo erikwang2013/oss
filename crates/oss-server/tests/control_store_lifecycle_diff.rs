@@ -8,12 +8,7 @@ use helpers::*;
 use oss_server::raft::FencingEpoch;
 use xl_store::control_store::lifecycle::{LifecycleCursorRow, LifecycleRuleEntry, LifecycleTxn};
 
-fn rule(
-    bucket: &str,
-    prefix: &str,
-    rule_id: Option<&str>,
-    updated_at: i64,
-) -> LifecycleRuleEntry {
+fn rule(bucket: &str, prefix: &str, rule_id: Option<&str>, updated_at: i64) -> LifecycleRuleEntry {
     LifecycleRuleEntry {
         bucket: bucket.into(),
         prefix: prefix.into(),
@@ -45,9 +40,7 @@ async fn lifecycle_reads_match_legacy_order_and_null_rule_ids() {
     let got = store.lifecycle_rules("b1").await.unwrap();
     assert_eq!(got, legacy_rules(&ref_db, "b1").await);
     assert_eq!(
-        got.iter()
-            .map(|r| r.rule_id.as_deref())
-            .collect::<Vec<_>>(),
+        got.iter().map(|r| r.rule_id.as_deref()).collect::<Vec<_>>(),
         [None, Some("r1"), Some("r2")],
         "NULL rule_id 排最前，其余按 rule_id 升序"
     );
@@ -61,11 +54,7 @@ async fn lifecycle_reads_match_legacy_order_and_null_rule_ids() {
             .iter()
             .map(|r| (r.bucket.as_str(), r.rule_id.as_deref()))
             .collect::<Vec<_>>(),
-        [
-            ("b1", None),
-            ("b1", Some("r1")),
-            ("b2", Some("r0")),
-        ]
+        [("b1", None), ("b1", Some("r1")), ("b2", Some("r0")),]
     );
 
     assert_eq!(
@@ -83,7 +72,10 @@ async fn lifecycle_reads_match_legacy_order_and_null_rule_ids() {
         legacy_cursor_row(&ref_db, "b1", "r1", "versions").await
     );
     assert_eq!(
-        store.lifecycle_cursor("b1", "missing", "versions").await.unwrap(),
+        store
+            .lifecycle_cursor("b1", "missing", "versions")
+            .await
+            .unwrap(),
         None
     );
 }
@@ -116,21 +108,29 @@ async fn replace_lifecycle_rules_is_bucket_scoped_and_clears_cursors() {
         raw_rule_dump(&ref_db).await,
         "与 legacy 逐行一致"
     );
-    assert_eq!(raw_cursor_dump(&store_db).await, raw_cursor_dump(&ref_db).await);
     assert_eq!(
-        store_db.control_store().lifecycle_rules("b1").await.unwrap(),
+        raw_cursor_dump(&store_db).await,
+        raw_cursor_dump(&ref_db).await
+    );
+    assert_eq!(
+        store_db
+            .control_store()
+            .lifecycle_rules("b1")
+            .await
+            .unwrap(),
         rows,
         "行的 updated_at 原样写入（不是额外参数）"
     );
     assert!(
-        raw_cursor_dump(&store_db)
-            .await
-            .iter()
-            .all(|c| c.0 != "b1"),
+        raw_cursor_dump(&store_db).await.iter().all(|c| c.0 != "b1"),
         "b1 游标被清"
     );
     assert_eq!(
-        store_db.control_store().lifecycle_rules("b2").await.unwrap(),
+        store_db
+            .control_store()
+            .lifecycle_rules("b2")
+            .await
+            .unwrap(),
         legacy_rules(&ref_db, "b2").await
     );
     assert_eq!(
@@ -171,7 +171,10 @@ async fn lifecycle_cursor_upsert_and_delete_are_fence_bounded() {
     }
     tx.commit().await.unwrap();
     assert!(!raw_cursor_upsert(&ref_db, &row).await);
-    assert_eq!(raw_cursor_dump(&store_db).await, raw_cursor_dump(&ref_db).await);
+    assert_eq!(
+        raw_cursor_dump(&store_db).await,
+        raw_cursor_dump(&ref_db).await
+    );
     assert_eq!(
         store_db
             .control_store()
@@ -189,11 +192,17 @@ async fn lifecycle_cursor_upsert_and_delete_are_fence_bounded() {
     let mut tx = store_db.pool().begin().await.unwrap();
     {
         let mut txn = oss_server::control_store::SqliteControlTxn::new(&mut tx);
-        assert!(txn.lifecycle_cursor_upsert(&row).await.unwrap(), "term 5 接受");
+        assert!(
+            txn.lifecycle_cursor_upsert(&row).await.unwrap(),
+            "term 5 接受"
+        );
     }
     tx.commit().await.unwrap();
     assert!(raw_cursor_upsert(&ref_db, &row).await);
-    assert_eq!(raw_cursor_dump(&store_db).await, raw_cursor_dump(&ref_db).await);
+    assert_eq!(
+        raw_cursor_dump(&store_db).await,
+        raw_cursor_dump(&ref_db).await
+    );
 
     let mut tx = store_db.pool().begin().await.unwrap();
     {
@@ -215,7 +224,10 @@ async fn lifecycle_cursor_upsert_and_delete_are_fence_bounded() {
     }
     tx.commit().await.unwrap();
     raw_cursor_delete(&ref_db, "b", "r", "s", 5).await;
-    assert_eq!(raw_cursor_dump(&store_db).await, raw_cursor_dump(&ref_db).await);
+    assert_eq!(
+        raw_cursor_dump(&store_db).await,
+        raw_cursor_dump(&ref_db).await
+    );
     assert!(raw_cursor_dump(&store_db).await.is_empty());
 }
 
@@ -263,7 +275,9 @@ async fn db_lifecycle_facades_preserve_signatures_and_now() {
     .await
     .unwrap();
     assert_eq!(
-        db.lifecycle_cursor_get("b", "r1", "versions").await.unwrap(),
+        db.lifecycle_cursor_get("b", "r1", "versions")
+            .await
+            .unwrap(),
         Some("c1".into())
     );
     db.lifecycle_cursor_set(
@@ -277,7 +291,9 @@ async fn db_lifecycle_facades_preserve_signatures_and_now() {
     .await
     .unwrap();
     assert_eq!(
-        db.lifecycle_cursor_get("b", "r1", "versions").await.unwrap(),
+        db.lifecycle_cursor_get("b", "r1", "versions")
+            .await
+            .unwrap(),
         Some("c1".into())
     );
 
@@ -291,7 +307,12 @@ async fn db_lifecycle_facades_preserve_signatures_and_now() {
     )
     .await
     .unwrap();
-    assert_eq!(db.lifecycle_cursor_get("b", "r1", "versions").await.unwrap(), None);
+    assert_eq!(
+        db.lifecycle_cursor_get("b", "r1", "versions")
+            .await
+            .unwrap(),
+        None
+    );
 
     // 清规则同时清游标（PUT 空列表语义）。
     db.set_lifecycle_rules("b", &[], 103).await.unwrap();

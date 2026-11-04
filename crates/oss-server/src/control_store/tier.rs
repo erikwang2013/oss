@@ -1,9 +1,9 @@
 //! tier restore 的 SQLite 读写实现（调用方事务内；不 begin/commit）。
 
-use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
-use xl_store::control_store::tier::TierRestoreRow;
+use sqlx::sqlite::SqliteRow;
 use xl_store::control_store::ControlError;
+use xl_store::control_store::tier::TierRestoreRow;
 
 use super::{SqliteControlStore, SqliteControlTxn};
 
@@ -168,6 +168,7 @@ pub(super) async fn txn_tier_restore_delete(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // 行字段面即参数面。
 pub(super) async fn txn_tier_restore_set_state(
     txn: &mut SqliteControlTxn<'_>,
     bucket: &str,

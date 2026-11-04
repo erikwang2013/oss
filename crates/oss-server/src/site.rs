@@ -337,9 +337,7 @@ async fn apply_bucket(
                     let mut txn = crate::control_store::SqliteControlTxn::new(&mut *tx);
                     txn.delete_lifecycle_rules_only(&e.entity_id)
                         .await
-                        .map_err(|err| {
-                            bad(crate::control_store::to_sqlx(err).to_string())
-                        })?;
+                        .map_err(|err| bad(crate::control_store::to_sqlx(err).to_string()))?;
                 }
                 for sql in [
                     "DELETE FROM buckets WHERE name = ?",

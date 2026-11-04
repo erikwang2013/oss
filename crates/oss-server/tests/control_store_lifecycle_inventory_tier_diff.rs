@@ -67,29 +67,17 @@ async fn seed_via_seam(db: &Db, bucket: &str, owner: i64) {
     db.inventory_upsert_config(bucket, "cfg", owner, r#"{"destination":"d"}"#, 8)
         .await
         .unwrap();
-    db.inventory_create_run(
-        bucket,
-        "cfg",
-        "k",
-        9,
-        FencingEpoch {
-            term: 2,
-            leader: 1,
-        },
-    )
-    .await
-    .unwrap()
-    .expect("run created");
+    db.inventory_create_run(bucket, "cfg", "k", 9, FencingEpoch { term: 2, leader: 1 })
+        .await
+        .unwrap()
+        .expect("run created");
     db.inventory_cursor_set(
         bucket,
         "cfg",
         8,
         Some("42"),
         10,
-        FencingEpoch {
-            term: 2,
-            leader: 1,
-        },
+        FencingEpoch { term: 2, leader: 1 },
     )
     .await
     .unwrap();

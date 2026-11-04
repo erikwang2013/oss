@@ -271,13 +271,7 @@ pub async fn raw_cursor_upsert(db: &Db, row: &LifecycleCursorRow) -> bool {
     res.rows_affected() == 1
 }
 
-pub async fn raw_cursor_delete(
-    db: &Db,
-    bucket: &str,
-    rule_id: &str,
-    stage: &str,
-    fence_term: i64,
-) {
+pub async fn raw_cursor_delete(db: &Db, bucket: &str, rule_id: &str, stage: &str, fence_term: i64) {
     sqlx::query(
         "DELETE FROM lifecycle_cursors \
          WHERE bucket = ? AND rule_id = ? AND stage = ? AND fence_term <= ?",

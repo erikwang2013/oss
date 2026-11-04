@@ -143,7 +143,9 @@ pub trait InventoryTxn: Send {
         &mut self,
         rows: &[InventoryCursorRow],
     ) -> Result<(), ControlError>;
-    async fn inventory_incrementals(&mut self) -> Result<Vec<InventoryIncrementalRow>, ControlError>;
+    async fn inventory_incrementals(
+        &mut self,
+    ) -> Result<Vec<InventoryIncrementalRow>, ControlError>;
     async fn replace_inventory_incrementals(
         &mut self,
         rows: &[InventoryIncrementalRow],
@@ -156,10 +158,7 @@ pub trait InventoryTxn: Send {
         run_key: &str,
     ) -> Result<Option<InventoryRunRow>, ControlError>;
     /// 自然键 upsert；返回是否恰好 1 行。`id` 是行内不可变属性（调用方预检）。
-    async fn inventory_run_upsert(
-        &mut self,
-        row: &InventoryRunRow,
-    ) -> Result<bool, ControlError>;
+    async fn inventory_run_upsert(&mut self, row: &InventoryRunRow) -> Result<bool, ControlError>;
     /// `INSERT OR IGNORE`；插入成功返回本地 id。
     async fn inventory_run_create(
         &mut self,
@@ -225,8 +224,7 @@ pub trait InventoryTxn: Send {
         config_id: &str,
     ) -> Result<(), ControlError>;
     /// DELETE cursor + incremental（InventoryClear 语义）。
-    async fn inventory_clear(&mut self, bucket: &str, config_id: &str)
-    -> Result<(), ControlError>;
+    async fn inventory_clear(&mut self, bucket: &str, config_id: &str) -> Result<(), ControlError>;
 }
 
 #[cfg(test)]
