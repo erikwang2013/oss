@@ -208,6 +208,7 @@ pub(crate) fn to_sqlx(e: ControlError) -> sqlx::Error {
     match e {
         ControlError::Invalid(m) => sqlx::Error::Protocol(m),
         ControlError::Backend(m) => sqlx::Error::Protocol(format!("control store backend: {m}")),
+        ControlError::MissingOwner(id) => sqlx::Error::Protocol(format!("owner user id {id} missing")),
     }
 }
 

@@ -8,10 +8,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod bucket;
 pub mod inventory;
 pub mod lifecycle;
 pub mod tier;
 
+pub use bucket::{BucketEntry, BucketPolicyEntry, EventConfigEntry, ReplicationRuleEntry};
 pub use inventory::InventoryConfigEntry;
 pub use lifecycle::LifecycleRuleEntry;
 
@@ -78,6 +80,9 @@ pub enum ControlError {
     Backend(String),
     #[error("invalid control data: {0}")]
     Invalid(String),
+    /// 严格快照导出遇到悬空属主：文本与旧 `DataError::MissingUser` 一致（无前缀）。
+    #[error("owner user id {0} missing")]
+    MissingOwner(i64),
 }
 
 /// 只读控制面访问。实现必须复用 `Db` 的既有连接池，不得自建第二个池。

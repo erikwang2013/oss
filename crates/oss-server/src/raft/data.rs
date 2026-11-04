@@ -261,6 +261,7 @@ fn control_data_err(e: ControlError) -> DataError {
     match e {
         ControlError::Invalid(m) => DataError::Format(m),
         ControlError::Backend(m) => DataError::Format(format!("control store backend: {m}")),
+        ControlError::MissingOwner(id) => DataError::MissingUser(id),
     }
 }
 
