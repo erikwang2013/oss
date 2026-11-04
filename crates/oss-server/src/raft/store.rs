@@ -97,7 +97,7 @@ INSERT OR IGNORE INTO raft_apply_ctx (id, active) VALUES (1, 0);
 "#;
 
 /// 快照单块上限：超过它才分块，单行 BLOB 因此有界；不超过时保持旧版整行格式。
-const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
+pub(crate) const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 /// 分块清单 magic。旧二进制读到它会在快照校验处拒绝（fail-closed），不会当空快照。
 const SNAPSHOT_CHUNK_MAGIC: &[u8; 8] = b"OSSCHNK1";
 /// magic(8) + 块数 u32 LE + 原始总长 u64 LE。
@@ -140,7 +140,7 @@ async fn connect(path: &Path) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
-fn storage_err(
+pub(crate) fn storage_err(
     subject: ErrorSubject<u64>,
     verb: ErrorVerb,
     e: impl std::error::Error + 'static,
@@ -170,7 +170,7 @@ fn decode<T: DeserializeOwned>(
     serde_json::from_str(s).map_err(|e| ser_err(subject, verb, e))
 }
 
-fn log_err(verb: ErrorVerb, msg: impl std::fmt::Display) -> StorageError<u64> {
+pub(crate) fn log_err(verb: ErrorVerb, msg: impl std::fmt::Display) -> StorageError<u64> {
     storage_err(
         ErrorSubject::Logs,
         verb,
@@ -178,12 +178,12 @@ fn log_err(verb: ErrorVerb, msg: impl std::fmt::Display) -> StorageError<u64> {
     )
 }
 
-fn log_corrupt(msg: impl std::fmt::Display) -> StorageError<u64> {
+pub(crate) fn log_corrupt(msg: impl std::fmt::Display) -> StorageError<u64> {
     log_err(ErrorVerb::Read, format_args!("corrupt raft log: {msg}"))
 }
 
 /// 序列化 entry；大载荷尝试 zlib+base64，只有确实更小才用压缩形态（`z1:` 前缀）。
-fn encode_entry(entry: &Entry<TypeConfig>) -> Result<String, StorageError<u64>> {
+pub(crate) fn encode_entry(entry: &Entry<TypeConfig>) -> Result<String, StorageError<u64>> {
     let json = encode(ErrorSubject::Log(entry.log_id), ErrorVerb::Write, entry)?;
     if json.len() < ENTRY_COMPRESS_MIN_BYTES {
         return Ok(json);
@@ -202,7 +202,9 @@ fn encode_entry(entry: &Entry<TypeConfig>) -> Result<String, StorageError<u64>> 
 }
 
 /// 解码 entry，并返回原始 JSON 字节数（压段时用于限制内存）。任何损坏都 fail-closed。
-fn decode_entry_with_len(s: &str) -> Result<(Entry<TypeConfig>, usize), StorageError<u64>> {
+pub(crate) fn decode_entry_with_len(
+    s: &str,
+) -> Result<(Entry<TypeConfig>, usize), StorageError<u64>> {
     let Some(b64) = s.strip_prefix(ENTRY_COMPRESS_MAGIC) else {
         // 旧库/小 entry：明文 JSON。
         return Ok((decode(ErrorSubject::Logs, ErrorVerb::Read, s)?, s.len()));
@@ -226,7 +228,7 @@ fn decode_entry_with_len(s: &str) -> Result<(Entry<TypeConfig>, usize), StorageE
     Ok((entry, json.len()))
 }
 
-fn decode_entry(s: &str) -> Result<Entry<TypeConfig>, StorageError<u64>> {
+pub(crate) fn decode_entry(s: &str) -> Result<Entry<TypeConfig>, StorageError<u64>> {
     decode_entry_with_len(s).map(|(entry, _)| entry)
 }
 
@@ -793,7 +795,10 @@ impl SqliteLogStore {
     }
 
     /// 追加事务体：写行 + 尝试压段，提交前返回；callback 由 [`Self::append`] 负责。
-    async fn append_entries(&self, entries: &[Entry<TypeConfig>]) -> Result<(), StorageError<u64>> {
+    pub(crate) async fn append_entries(
+        &self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<(), StorageError<u64>> {
         // 压段前先 SELECT 再写；deferred 事务在 WAL 下升级写会立即 BUSY_SNAPSHOT，
         // busy_timeout 不生效。IMMEDIATE 先拿写锁，等锁走 busy_timeout。
         let mut tx = self
@@ -858,6 +863,16 @@ impl SqliteLogStore {
             decode(ErrorSubject::Store, ErrorVerb::Read, &s)
         })
         .transpose()
+    }
+
+    /// 测试用：读取 `raft_log.data` 的原始字节，作为文件日志字节兼容性 fixture。
+    #[cfg(test)]
+    pub(crate) async fn raw_entry_for_test(&self, index: u64) -> Option<String> {
+        sqlx::query_scalar("SELECT entry FROM raft_log WHERE idx = ?")
+            .bind(index as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .expect("read raw raft_log entry")
     }
 }
 
@@ -1221,6 +1236,18 @@ impl SqliteStateMachine {
     /// apply 写入的控制库连接池（leader append 前的只读配额判定用）。
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// 测试用：按 `seq` 返回当前 SQLite 快照的分块原始字节，作为文件快照 fixture。
+    #[cfg(test)]
+    pub(crate) async fn snapshot_chunks_for_test(&self) -> Vec<Vec<u8>> {
+        sqlx::query("SELECT data FROM raft_snapshot_chunk ORDER BY seq")
+            .fetch_all(&self.pool)
+            .await
+            .expect("read raft_snapshot_chunk")
+            .into_iter()
+            .map(|row| row.get("data"))
+            .collect()
     }
 
     /// 与 [`super::RaftHandle`] 共享的观测计数（apply 失败在此累加）。
