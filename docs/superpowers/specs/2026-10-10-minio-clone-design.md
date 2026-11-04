@@ -236,11 +236,13 @@ struct TierState { state: Hot | Archived | RestorePending | Restored, restore_ex
 
 **对象数据永远不进 SQL。** 这里只有控制面状态。
 
-> **v1.29.0 控制面去数据库化（进行中）**：第一阶段已落地——xl-store 提供 S3 不可见的
-> `.oss.sys` 系统命名空间、控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读；
-> oss-server 引入后端中立的 `ControlStore`/`ControlTxn` 缝，`vpc_endpoints` 的读、apply
-> 与快照导出/安装已迁移，并以 legacy raw SQL 双后端差分测试锁定行为。SQLite 仍为默认
-> 后端；最终切片将删除 sqlx、迁移目录与全部 SQL，控制面只使用对象后端。
+> **v1.30.0 控制面去数据库化（进行中）**：v1.29 落地 xl-store 的 `.oss.sys` 系统命名空间、
+> 控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读，以及 oss-server 的
+> `ControlStore`/`ControlTxn` 缝与 `vpc_endpoints` 迁移；v1.30 把访问点/OLAP、
+> lifecycle/inventory/tier、buckets/bucket_policies/event_configs/replication_rules 的
+> 读写、快照导出/安装与桶删除级联迁到同一缝，并加入集群遗留控制对象重认证工具。
+> legacy raw SQL 双后端差分测试锁定行为。SQLite 仍为默认后端；最终切片将删除 sqlx、
+> 迁移目录与全部 SQL，控制面只使用对象后端。
 
 | 表 | 用途 | 阶段 |
 |---|---|---|
