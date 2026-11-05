@@ -57,6 +57,7 @@ pub(crate) const KIND_CURSOR: u8 = 4;
 pub type Result<T> = io::Result<T>;
 
 /// Root of all node-local operational state.
+#[derive(Clone)]
 pub struct LocalStore {
     root: PathBuf,
 }
@@ -318,17 +319,51 @@ pub(crate) fn atomic_write_without_rename(path: &Path, bytes: &[u8]) -> Result<(
     atomic_write_do(path, bytes, false)
 }
 
-fn atomic_write_do(path: &Path, bytes: &[u8], commit: bool) -> Result<()> {
+/// Creates `path` with `bytes` only if it does not exist yet; returns whether
+/// this call created it. The temp file is fully written and fsynced before the
+/// hard link, so a concurrent reader sees either nothing or a complete record.
+/// Cross-process safe on filesystems that support hard links.
+pub(crate) fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| invalid_input("atomic create path without parent"))?;
+    ensure_dir(dir)?;
+    let tmp = temp_path(dir);
+    if let Err(e) = write_tmp(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let outcome = match fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    };
+    let _ = fs::remove_file(&tmp);
+    match outcome {
+        Ok(true) => {
+            sync_dir(dir)?;
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn temp_path(dir: &Path) -> PathBuf {
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+    dir.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn atomic_write_do(path: &Path, bytes: &[u8], commit: bool) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| invalid_input("atomic write path without parent"))?;
     ensure_dir(dir)?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-    ));
+    let tmp = temp_path(dir);
     if let Err(e) = write_tmp(&tmp, bytes) {
         let _ = fs::remove_file(&tmp);
         return Err(e);

@@ -157,6 +157,83 @@ fn replay_after_reopen_and_manual_dead() {
 }
 
 #[test]
+fn exact_claim_renew_retry_bury_and_revive() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path(), 10);
+    q.append("a", b"1").unwrap();
+
+    let c = q.claim_exact(100, 30, "tok-100").unwrap().unwrap();
+    assert_eq!((c.seq, c.attempts, c.lease_until), (1, 0, 130));
+    assert!(q.claim_exact(100, 30, "tok-100").unwrap().is_none());
+
+    assert!(!q.renew(c.seq, "stale", "tok-110", 110).unwrap());
+    assert!(q.renew(c.seq, "tok-100", "tok-110", 110).unwrap());
+    assert!(!q.retry(c.seq, "tok-100", 1, 200).unwrap());
+    assert!(q.retry(c.seq, "tok-110", 1, 200).unwrap());
+    assert_eq!(q.scan()[0].status, super::QueueStatus::Pending);
+    assert!(q.claim_exact(199, 30, "early").unwrap().is_none());
+    let c = q.claim_exact(200, 30, "tok-200").unwrap().unwrap();
+    assert_eq!(c.attempts, 1);
+    assert!(q.bury(c.seq, "tok-200", 2, "poison").unwrap());
+    let dead = &q.scan()[0];
+    assert_eq!((dead.status, dead.attempts), (super::QueueStatus::Dead, 2));
+    assert_eq!(dead.reason.as_deref(), Some("poison"));
+
+    assert!(q.revive(c.seq, 300).unwrap());
+    let revived = q.claim_exact(300, 30, "tok-300").unwrap().unwrap();
+    assert_eq!(revived.attempts, 0);
+    assert!(q.ack(revived.seq, "tok-300").unwrap());
+}
+
+#[test]
+fn reclaim_expired_preserves_attempts_and_remove_is_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path(), 10);
+    q.append("a", b"1").unwrap();
+    q.append("b", b"2").unwrap();
+    q.claim_exact(100, 30, "tok").unwrap().unwrap();
+    assert_eq!(q.reclaim_expired(129, 30).unwrap(), 0, "lease still fresh");
+    assert_eq!(
+        q.reclaim_expired(130, 30).unwrap(),
+        0,
+        "boundary is exclusive"
+    );
+    assert_eq!(q.reclaim_expired(131, 30).unwrap(), 1);
+    let pending = &q.scan()[0];
+    assert_eq!(
+        (pending.status, pending.attempts),
+        (super::QueueStatus::Pending, 0)
+    );
+    assert!(q.claim_exact(131, 30, "tok-2").unwrap().is_some());
+    assert!(q.remove(2).unwrap(), "force delete ignores tokens");
+    assert!(!q.remove(2).unwrap());
+}
+
+#[test]
+fn compaction_preserves_retry_schedule_and_dead_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path(), 10);
+    q.append("retry", b"1").unwrap();
+    q.append("dead", b"2").unwrap();
+    let c = q.claim_exact(100, 30, "tok").unwrap().unwrap();
+    q.retry(c.seq, "tok", 4, 500).unwrap();
+    let d = q.claim_exact(100, 30, "tok-d").unwrap().unwrap();
+    q.bury(d.seq, "tok-d", 7, "bad").unwrap();
+    q.compact().unwrap();
+    drop(q);
+
+    let q = queue(dir.path(), 10);
+    let entries = q.scan();
+    assert_eq!(entries[0].status, super::QueueStatus::Pending);
+    assert_eq!(entries[0].retry_at, Some(500));
+    assert!(q.claim_exact(499, 30, "x").unwrap().is_none());
+    assert_eq!(q.claim_exact(500, 30, "x").unwrap().unwrap().attempts, 4);
+    assert_eq!(entries[1].status, super::QueueStatus::Dead);
+    assert_eq!(entries[1].attempts, 7);
+    assert_eq!(entries[1].reason.as_deref(), Some("bad"));
+}
+
+#[test]
 fn second_handle_with_different_config_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let q = queue(dir.path(), 10);

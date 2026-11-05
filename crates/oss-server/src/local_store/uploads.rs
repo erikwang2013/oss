@@ -46,6 +46,16 @@ impl UploadStore {
         Ok(())
     }
 
+    /// `INSERT ... ON CONFLICT(saved_path) DO NOTHING`; returns whether the
+    /// record was created by this call.
+    pub fn put_if_absent(&self, record: &UploadRecord) -> Result<bool> {
+        if record.saved_path.is_empty() {
+            return Err(invalid_input("upload saved_path must not be empty"));
+        }
+        let bytes = rmp_serde::to_vec(record).map_err(io::Error::other)?;
+        self.kv.put_if_absent(&record.saved_path, &bytes)
+    }
+
     pub fn get(&self, saved_path: &str) -> Result<Option<UploadRecord>> {
         match self.kv.get(saved_path)? {
             None => Ok(None),
@@ -77,7 +87,8 @@ impl UploadStore {
         Ok(all)
     }
 
-    fn all(&self) -> Result<Vec<UploadRecord>> {
+    /// Every record, including expired ones, in `saved_path` order.
+    pub fn all(&self) -> Result<Vec<UploadRecord>> {
         self.kv
             .scan()?
             .into_iter()

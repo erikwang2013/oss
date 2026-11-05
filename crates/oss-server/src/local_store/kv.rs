@@ -8,8 +8,8 @@ use std::io;
 use std::path::PathBuf;
 
 use super::{
-    KIND_KV, Result, atomic_write, corrupt, decode_frame, encode_frame, ensure_dir, invalid_input,
-    key_file, read_file, sync_dir,
+    KIND_KV, Result, atomic_create_new, atomic_write, corrupt, decode_frame, encode_frame,
+    ensure_dir, invalid_input, key_file, read_file, sync_dir,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +61,17 @@ impl LocalKv {
         payload.extend_from_slice(value);
         atomic_write(&path, &encode_frame(KIND_KV, &payload))?;
         Ok(version)
+    }
+
+    /// Inserts `key` only when no record exists; returns whether this call
+    /// created it. Concurrent callers (including other processes) cannot both
+    /// observe `true`, so this is the KV analogue of `INSERT ... DO NOTHING`.
+    pub fn put_if_absent(&self, key: &str, value: &[u8]) -> Result<bool> {
+        let path = key_file(&self.dir, key, ".rec")?;
+        let mut payload = Vec::with_capacity(8 + value.len());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(value);
+        atomic_create_new(&path, &encode_frame(KIND_KV, &payload))
     }
 
     /// Removes the record; returns whether it existed (missing is not an error).

@@ -13,6 +13,8 @@ use xl_store::control_state::root::{AppliedLog, Mode, Root, RootMeta, TableRoot,
 use xl_store::control_state::tree::TableTree;
 use xl_store::error::{Error, Result};
 
+use crate::local_store::LocalStore;
+
 use super::change::{Overlay, StagedRow};
 use super::origin::WriteOrigin;
 use super::root_io::{CasOutcome, PinnedRoot, RootIo};
@@ -39,6 +41,8 @@ pub struct CommitStamp {
 /// Read handle for a pinned root generation plus its commit gate.
 pub struct ObjectControlStore {
     pub root: Arc<RootIo>,
+    /// Node-local operational state (D4): outboxes, uploads, audit, intents.
+    pub(super) local: Option<Arc<LocalStore>>,
     publisher: Option<CachePublish>,
 }
 
@@ -46,6 +50,7 @@ impl ObjectControlStore {
     pub fn new(root: Arc<RootIo>) -> Self {
         Self {
             root,
+            local: None,
             publisher: None,
         }
     }
@@ -125,6 +130,7 @@ impl ObjectControlStore {
         let applied_target = origin.log_id();
         let mut txn = ObjectControlTxn {
             root: Arc::clone(&self.root),
+            local: self.local.clone(),
             publisher: self.publisher.clone(),
             origin,
             pinned,
@@ -164,6 +170,7 @@ impl ObjectControlStore {
 /// A transaction over one pinned root generation.
 pub struct ObjectControlTxn {
     root: Arc<RootIo>,
+    pub(super) local: Option<Arc<LocalStore>>,
     publisher: Option<CachePublish>,
     origin: WriteOrigin,
     pinned: PinnedRoot,

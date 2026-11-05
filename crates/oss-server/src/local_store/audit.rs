@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::{
-    KIND_AUDIT, Result, encode_frame, ensure_dir, invalid_input, open_private, read_repaired_tail,
-    scan_frames, sync_dir,
+    KIND_AUDIT, Result, atomic_write, encode_frame, ensure_dir, invalid_input, open_private,
+    read_repaired_tail, scan_frames, sync_dir,
 };
 
 const DAY_SECS: i64 = 86_400;
@@ -147,6 +147,79 @@ impl AuditLog {
         if removed > 0 {
             sync_dir(&self.dir)?;
         }
+        Ok(removed)
+    }
+
+    /// Deletes up to `limit` records with `ts < cutoff`, oldest first, rewriting
+    /// the affected day files atomically. Returns the number removed. This is the
+    /// row-level purge behind the `audit_delete_older_than(ts, limit)` trait; the
+    /// whole-file [`AuditLog::retain`] stays available for age-based cleanup.
+    ///
+    /// shortcut: rewrites whole day files on every call; fine while retention keeps
+    /// the audit corpus bounded. A concurrent process appending to the same
+    /// namespace can lose its buffered records (audit assumes one writer per node).
+    pub fn purge(&self, cutoff: i64, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut state = lock(&self.state);
+        flush_state(&mut state, self.fsync)?;
+        // Close the active day file so the rewrite below can replace it.
+        state.writer = None;
+        state.day = None;
+
+        let mut files = day_files(&self.dir)?;
+        files.sort_by_key(|(day, _)| *day);
+        let mut parsed: Vec<Vec<(Option<i64>, Vec<u8>)>> = Vec::with_capacity(files.len());
+        let mut candidates = Vec::new();
+        for (file_index, (_, path)) in files.iter().enumerate() {
+            let bytes = fs::read(path)?;
+            let (frames, _) = scan_frames(&bytes, KIND_AUDIT)?;
+            let mut records = Vec::with_capacity(frames.len());
+            for (record_index, payload) in frames.into_iter().enumerate() {
+                let ts = decode_payload(payload)?.map(|(ts, _)| ts);
+                if let Some(ts) = ts
+                    && ts < cutoff
+                {
+                    candidates.push((ts, file_index, record_index));
+                }
+                records.push((ts, payload.to_vec()));
+            }
+            parsed.push(records);
+        }
+        candidates.sort_by_key(|&(ts, file_index, record_index)| (ts, file_index, record_index));
+        let removed = candidates.len().min(limit);
+        if removed == 0 {
+            return Ok(0);
+        }
+        let mut drop_flags: Vec<Vec<bool>> = parsed.iter().map(|r| vec![false; r.len()]).collect();
+        for &(_, file_index, record_index) in &candidates[..removed] {
+            drop_flags[file_index][record_index] = true;
+        }
+        for (file_index, (_, path)) in files.iter().enumerate() {
+            if !drop_flags[file_index].iter().any(|&drop| drop) {
+                continue;
+            }
+            let mut out = Vec::new();
+            let mut kept = 0usize;
+            for (record_index, (_, payload)) in parsed[file_index].iter().enumerate() {
+                if drop_flags[file_index][record_index] {
+                    continue;
+                }
+                out.extend_from_slice(&encode_frame(KIND_AUDIT, payload));
+                kept += 1;
+            }
+            if kept == 0 {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            } else {
+                atomic_write(path, &out)?;
+            }
+        }
+        sync_dir(&self.dir)?;
         Ok(removed)
     }
 }
@@ -294,5 +367,30 @@ mod tests {
             .map(|r| r.ts / 86_400)
             .collect();
         assert_eq!(days, [18, 20]);
+    }
+
+    #[test]
+    fn row_purge_removes_oldest_up_to_limit_and_keeps_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = audit(dir.path());
+        let day = |d: i64| d * 86_400 + 1;
+        log.append(day(10), b"a").unwrap();
+        log.append(day(10), b"b").unwrap();
+        log.append(day(11), b"c").unwrap();
+        log.append(day(12), b"d").unwrap();
+
+        assert_eq!(log.purge(day(12), 2).unwrap(), 2);
+        let left: Vec<_> = log
+            .scan(0, i64::MAX, |_| true)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.data)
+            .collect();
+        assert_eq!(left, [b"c".to_vec(), b"d".to_vec()]);
+
+        log.append(day(12) + 1, b"e").unwrap();
+        let left = log.scan(0, i64::MAX, |_| true).unwrap();
+        assert_eq!(left.len(), 3);
+        assert_eq!(left[2].data, b"e");
     }
 }

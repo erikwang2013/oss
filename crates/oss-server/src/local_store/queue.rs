@@ -11,16 +11,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use serde::{Deserialize, Serialize};
 
-use super::{
-    KIND_QUEUE, Result, create_new_private, encode_frame, ensure_dir, invalid_input, open_private,
-    read_repaired_tail, sync_dir, validate_name,
-};
+use super::{KIND_QUEUE, Result, encode_frame, ensure_dir, invalid_input, sync_dir, validate_name};
 
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 10;
 
@@ -40,6 +37,11 @@ pub struct QueueEntry {
     pub status: QueueStatus,
     /// Set while `status == Claimed`; unix seconds.
     pub lease_until: Option<i64>,
+    /// While pending: earliest unix second the entry may be claimed again
+    /// (`None` = immediately).
+    pub retry_at: Option<i64>,
+    /// Reason recorded by the last dead-letter transition.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,10 @@ enum Record {
     Claim {
         seq: u64,
         token: String,
+        /// Unix seconds the lease was taken. Defaulted for journals written
+        /// before the outbox adapters needed it.
+        #[serde(default)]
+        claimed_at: i64,
         lease_until: i64,
         attempts: u32,
     },
@@ -75,6 +81,18 @@ enum Record {
     },
     Dead {
         seq: u64,
+        reason: String,
+    },
+    /// Pending with an explicit attempt count and earliest next claim time.
+    Retry {
+        seq: u64,
+        attempts: u32,
+        retry_at: i64,
+    },
+    /// Dead-letter with an explicit attempt count (bury).
+    Bury {
+        seq: u64,
+        attempts: u32,
         reason: String,
     },
 }
@@ -86,7 +104,9 @@ struct Entry {
     attempts: u32,
     status: QueueStatus,
     token: Option<String>,
+    claimed_at: i64,
     lease_until: Option<i64>,
+    retry_at: Option<i64>,
     reason: Option<String>,
 }
 
@@ -132,7 +152,7 @@ impl LocalQueue {
             }
             return Ok(Self { shared });
         }
-        let shared = Arc::new(load(&path, max_attempts)?);
+        let shared = Arc::new(ext::load(&path, max_attempts)?);
         registry.insert(registry_key, Arc::downgrade(&shared));
         Ok(Self { shared })
     }
@@ -161,7 +181,9 @@ impl LocalQueue {
                 attempts: 0,
                 status: QueueStatus::Pending,
                 token: None,
+                claimed_at: 0,
                 lease_until: None,
+                retry_at: None,
                 reason: None,
             },
         );
@@ -205,7 +227,8 @@ impl LocalQueue {
             .entries
             .iter()
             .filter(|(_, e)| {
-                e.status == QueueStatus::Pending
+                (e.status == QueueStatus::Pending
+                    && e.retry_at.is_none_or(|retry_at| retry_at <= now))
                     || (e.status == QueueStatus::Claimed && e.lease_until.is_some_and(|u| u <= now))
             })
             .map(|(seq, _)| *seq)
@@ -220,8 +243,9 @@ impl LocalQueue {
                 let reason = format!("attempts exceeded {max_attempts}");
                 write_record(
                     &mut inner.file,
-                    &Record::Dead {
+                    &Record::Bury {
                         seq,
+                        attempts,
                         reason: reason.clone(),
                     },
                 )?;
@@ -240,6 +264,7 @@ impl LocalQueue {
                 &Record::Claim {
                     seq,
                     token: token.clone(),
+                    claimed_at: now,
                     lease_until,
                     attempts,
                 },
@@ -248,6 +273,7 @@ impl LocalQueue {
             e.attempts = attempts;
             e.status = QueueStatus::Claimed;
             e.token = Some(token.clone());
+            e.claimed_at = now;
             e.lease_until = Some(lease_until);
             return Ok(Some(Claim {
                 seq,
@@ -286,16 +312,23 @@ impl LocalQueue {
         if e.status == QueueStatus::Dead {
             return Ok(false);
         }
+        let attempts = inner
+            .entries
+            .get(&seq)
+            .map(|e| e.attempts)
+            .expect("entry exists");
         write_record(
             &mut inner.file,
-            &Record::Dead {
+            &Record::Bury {
                 seq,
+                attempts,
                 reason: reason.to_string(),
             },
         )?;
         let e = inner.entries.get_mut(&seq).expect("entry exists");
         e.status = QueueStatus::Dead;
         e.token = None;
+        e.claimed_at = 0;
         e.lease_until = None;
         e.reason = Some(reason.to_string());
         Ok(true)
@@ -316,7 +349,7 @@ impl LocalQueue {
             std::process::id(),
             NEXT_TMP.fetch_add(1, Ordering::Relaxed)
         ));
-        let file = match build_compacted(&tmp, inner.next_seq, &inner.entries) {
+        let file = match ext::build_compacted(&tmp, inner.next_seq, &inner.entries) {
             Ok(file) => file,
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
@@ -332,47 +365,6 @@ impl LocalQueue {
     }
 }
 
-fn build_compacted(path: &Path, next_seq: u64, entries: &BTreeMap<u64, Entry>) -> Result<File> {
-    let mut file = create_new_private(path)?;
-    write_record_buffered(&mut file, &Record::Sequence { next_seq })?;
-    for (seq, e) in entries {
-        write_record_buffered(
-            &mut file,
-            &Record::Append {
-                seq: *seq,
-                id: e.id.clone(),
-                payload: e.payload.clone(),
-                attempts: e.attempts,
-            },
-        )?;
-        match e.status {
-            QueueStatus::Pending => {}
-            QueueStatus::Claimed => write_record_buffered(
-                &mut file,
-                &Record::Claim {
-                    seq: *seq,
-                    token: e.token.clone().unwrap_or_default(),
-                    lease_until: e.lease_until.unwrap_or(0),
-                    attempts: e.attempts,
-                },
-            )?,
-            QueueStatus::Dead => write_record_buffered(
-                &mut file,
-                &Record::Dead {
-                    seq: *seq,
-                    reason: e.reason.clone().unwrap_or_default(),
-                },
-            )?,
-        }
-    }
-    file.sync_all()?;
-    // Lock the replacement inode before it becomes visible; the old journal
-    // stays locked until the caller swaps this handle in.
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|err| io::Error::new(io::Error::from(err).kind(), err.to_string()))?;
-    Ok(file)
-}
-
 fn entry(seq: u64, e: &Entry) -> QueueEntry {
     QueueEntry {
         seq,
@@ -381,95 +373,13 @@ fn entry(seq: u64, e: &Entry) -> QueueEntry {
         attempts: e.attempts,
         status: e.status,
         lease_until: e.lease_until,
+        retry_at: e.retry_at,
+        reason: e.reason.clone(),
     }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn load(path: &Path, max_attempts: u32) -> Result<Shared> {
-    let mut file = open_private(path, true, true)?;
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
-        |err| {
-            let err: io::Error = err.into();
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "queue {} is locked by another process: {err}",
-                    path.display()
-                ),
-            )
-        },
-    )?;
-    let bytes = read_repaired_tail(&mut file, KIND_QUEUE)?;
-    sync_dir(path.parent().expect("queue path has parent"))?;
-    let (frames, _) = super::scan_frames(&bytes, KIND_QUEUE)?;
-
-    let mut entries = BTreeMap::new();
-    let mut next_seq = 1u64;
-    for frame in frames {
-        let record: Record = rmp_serde::from_slice(frame)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        match record {
-            Record::Sequence { next_seq: saved } => {
-                next_seq = next_seq.max(saved);
-            }
-            Record::Append {
-                seq,
-                id,
-                payload,
-                attempts,
-            } => {
-                entries.insert(
-                    seq,
-                    Entry {
-                        id,
-                        payload,
-                        attempts,
-                        status: QueueStatus::Pending,
-                        token: None,
-                        lease_until: None,
-                        reason: None,
-                    },
-                );
-                next_seq = next_seq.max(seq.saturating_add(1));
-            }
-            Record::Claim {
-                seq,
-                token,
-                lease_until,
-                attempts,
-            } => {
-                if let Some(e) = entries.get_mut(&seq) {
-                    e.status = QueueStatus::Claimed;
-                    e.token = Some(token);
-                    e.lease_until = Some(lease_until);
-                    e.attempts = attempts;
-                }
-            }
-            Record::Ack { seq } => {
-                entries.remove(&seq);
-            }
-            Record::Dead { seq, reason } => {
-                if let Some(e) = entries.get_mut(&seq) {
-                    e.status = QueueStatus::Dead;
-                    e.token = None;
-                    e.lease_until = None;
-                    e.reason = Some(reason);
-                }
-            }
-        }
-    }
-    Ok(Shared {
-        path: path.to_path_buf(),
-        max_attempts,
-        inner: Mutex::new(Inner {
-            file,
-            entries,
-            next_seq,
-        }),
-    })
 }
 
 fn write_record(file: &mut File, record: &Record) -> Result<()> {
@@ -488,6 +398,9 @@ fn write_record_buffered(file: &mut File, record: &Record) -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "queue_ext.rs"]
+mod ext;
 
 #[cfg(test)]
 #[path = "queue_tests.rs"]

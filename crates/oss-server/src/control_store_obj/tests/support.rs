@@ -10,12 +10,18 @@ use tempfile::TempDir;
 use xl_store::control_state::root::Mode;
 use xl_store::control_store::ControlError;
 use xl_store::control_store::account::{AccountSnapshotTxn, AccountTxn};
+use xl_store::control_store::audit::AuditTxn;
+use xl_store::control_store::event_outbox::EventOutboxTxn;
 use xl_store::control_store::iam::{IamSnapshotTxn, IamTxn};
+use xl_store::control_store::repl_outbox::ReplOutboxTxn;
+use xl_store::control_store::sync_intents::SyncIntentTxn;
+use xl_store::control_store::uploads::UploadTxn;
 use xl_store::store::{Store, StoreConfig};
 
 use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 use crate::control_store_obj::{ObjectControlStore, RootIo, WriteOrigin};
 use crate::db::Db;
+use crate::local_store::LocalStore;
 
 use super::super::account::{scan_accounts, scan_ledger, scan_members};
 use super::super::iam::{scan_access_keys, scan_permissions, scan_users};
@@ -28,6 +34,13 @@ pub(super) trait Iam: IamTxn + IamSnapshotTxn {}
 impl<T: IamTxn + IamSnapshotTxn> Iam for T {}
 pub(super) trait Account: AccountTxn + AccountSnapshotTxn {}
 impl<T: AccountTxn + AccountSnapshotTxn> Account for T {}
+
+/// Bundle of the five node-local operational domains (design D3).
+pub(super) trait Ops:
+    EventOutboxTxn + ReplOutboxTxn + UploadTxn + SyncIntentTxn + AuditTxn
+{
+}
+impl<T: EventOutboxTxn + ReplOutboxTxn + UploadTxn + SyncIntentTxn + AuditTxn> Ops for T {}
 
 pub(super) struct Obj {
     pub(super) _dir: TempDir,
@@ -74,13 +87,12 @@ pub(super) async fn clear_bucket_owner(db: &Db, obj: &Obj, name: &str) {
 /// Copy the local baseline `Db::connect` creates (system account and canonical
 /// marker) into the object store, so parity fixtures start from equal state.
 pub(super) async fn mirror_sqlite_baseline(db: &Db, obj: &Obj) {
-    let system: Option<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, name, created_at, updated_at FROM accounts WHERE id = ?",
-    )
-    .bind(xl_s3::access::LEGACY_ACCOUNT)
-    .fetch_optional(db.pool())
-    .await
-    .unwrap();
+    let system: Option<(String, String, i64, i64)> =
+        sqlx::query_as("SELECT id, name, created_at, updated_at FROM accounts WHERE id = ?")
+            .bind(xl_s3::access::LEGACY_ACCOUNT)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
     if let Some((id, name, created_at, updated_at)) = system {
         let mut txn = obj
             .control
@@ -121,9 +133,10 @@ pub(super) async fn object_store(mode: Mode) -> Obj {
     let mut cfg = StoreConfig::new(dir.path());
     cfg.fsync = false;
     let store = Arc::new(Store::open(cfg).await.unwrap());
-    let control = Arc::new(ObjectControlStore::new(Arc::new(RootIo::new(Arc::clone(
-        &store,
-    )))));
+    let local = LocalStore::open(dir.path().join("local")).unwrap();
+    let control = Arc::new(
+        ObjectControlStore::new(Arc::new(RootIo::new(Arc::clone(&store)))).with_local_store(local),
+    );
     control.bootstrap(mode, 100).await.unwrap();
     Obj {
         _dir: dir,
@@ -206,6 +219,63 @@ pub(super) async fn object_account<R>(
         .await
         .map_err(|e| ControlError::Backend(e.to_string()))?;
     Ok(out)
+}
+
+pub(super) async fn sqlite_ops<R>(
+    db: &Db,
+    f: impl for<'a> FnOnce(&'a mut dyn Ops) -> Boxed<'a, R>,
+) -> Result<R, ControlError> {
+    let mut conn = db.pool().acquire().await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    let out = {
+        let mut txn = SqliteControlTxn::new(&mut tx);
+        f(&mut txn).await
+    };
+    match out {
+        Ok(value) => {
+            tx.commit().await.unwrap();
+            Ok(value)
+        }
+        Err(e) => {
+            tx.rollback().await.unwrap();
+            Err(e)
+        }
+    }
+}
+
+/// Local-domain writes are immediate, so the object transaction is only a
+/// handle carrier here; commit is a no-op over an empty root overlay.
+pub(super) async fn object_ops<R>(
+    control: &Arc<ObjectControlStore>,
+    origin: WriteOrigin,
+    f: impl for<'a> FnOnce(&'a mut dyn Ops) -> Boxed<'a, R>,
+) -> Result<R, ControlError> {
+    let mut txn = control
+        .begin(origin)
+        .await
+        .map_err(|e| ControlError::Backend(e.to_string()))?;
+    match f(&mut txn).await {
+        Ok(value) => {
+            txn.commit()
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string()))?;
+            Ok(value)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub(super) async fn both_ops<T, F>(
+    db: &Db,
+    obj: &Obj,
+    f: F,
+) -> (Result<T, ControlError>, Result<T, ControlError>)
+where
+    F: for<'a> FnOnce(&'a mut dyn Ops) -> Boxed<'a, T> + Copy,
+{
+    let oracle = sqlite_ops(db, f).await;
+    let object = object_ops(&obj.control, WriteOrigin::local("test"), f).await;
+    (oracle, object)
 }
 
 pub(super) fn sqlite_store(db: &Db) -> SqliteControlStore {
