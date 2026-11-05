@@ -91,6 +91,8 @@ async fn config_and_peer_rows_match_sqlite() {
     let p1 = peer("peer-a", "remote-a", 10);
     let p2 = peer("peer-b", "remote-b", 5);
     in_sqlite(&db, |txn| {
+        let p1 = p1.clone();
+        let p2 = p2.clone();
         Box::pin(async move {
             txn.site_config_apply(Some("east"), Some("eu-west-1"), Some(7), Some("tok-2"))
                 .await
@@ -107,6 +109,9 @@ async fn config_and_peer_rows_match_sqlite() {
 
     real.control
         .transaction(local(), |txn| {
+            let identity = identity.clone();
+            let p1 = p1.clone();
+            let p2 = p2.clone();
             Box::pin(async move {
                 txn.site_config_seed(&identity.id, &identity.token, 1)
                     .await
@@ -173,11 +178,13 @@ async fn config_and_peer_rows_match_sqlite() {
     // UPDATE-then-INSERT by remote id: peer_id/created_at/reconcile_required kept.
     let update = peer("peer-x", "remote-a", 99);
     in_sqlite(&db, |txn| {
+        let update = update.clone();
         Box::pin(async move { txn.site_pair_upsert(&update).await.unwrap() })
     })
     .await;
     real.control
         .transaction(local(), |txn| {
+            let update = update.clone();
             Box::pin(async move { txn.site_pair_upsert(&update).await.map_err(se) })
         })
         .await
@@ -194,11 +201,13 @@ async fn config_and_peer_rows_match_sqlite() {
     // Insert path.
     let p3 = peer("peer-c", "remote-c", 20);
     in_sqlite(&db, |txn| {
+        let p3 = p3.clone();
         Box::pin(async move { txn.site_pair_upsert(&p3).await.unwrap() })
     })
     .await;
     real.control
         .transaction(local(), |txn| {
+            let p3 = p3.clone();
             Box::pin(async move { txn.site_pair_upsert(&p3).await.map_err(se) })
         })
         .await
@@ -260,6 +269,7 @@ async fn duplicate_peer_insert_is_rejected_without_committing() {
     let p = peer("peer-a", "remote-a", 1);
     real.control
         .transaction(local(), |txn| {
+            let p = p.clone();
             Box::pin(async move { txn.site_insert(&p, 1).await.map_err(se) })
         })
         .await
@@ -267,6 +277,7 @@ async fn duplicate_peer_insert_is_rejected_without_committing() {
     let err = real
         .control
         .transaction(local(), |txn| {
+            let p = p.clone();
             Box::pin(async move { txn.site_insert(&p, 2).await.map_err(se) })
         })
         .await
@@ -292,6 +303,7 @@ async fn seed_is_idempotent_and_trim_is_a_noop() {
     .await;
     real.control
         .transaction(local(), |txn| {
+            let s_id = s_id.clone();
             Box::pin(async move {
                 txn.site_config_seed(&s_id, "tok", 1).await.map_err(se)?;
                 txn.site_config_seed("ignored", "tok", 1)
@@ -303,18 +315,15 @@ async fn seed_is_idempotent_and_trim_is_a_noop() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        sqlite_store.site_identity().await.unwrap(),
-        SiteStore::site_identity(&*real.control).await.unwrap()
-    );
-    assert_eq!(
-        SiteStore::site_identity(&*real.control)
-            .await
-            .unwrap()
-            .unwrap()
-            .id,
-        s_id
-    );
+    let sql_id = sqlite_store.site_identity().await.unwrap().unwrap();
+    let obj_id = SiteStore::site_identity(&*real.control)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(obj_id.id, s_id);
+    assert_eq!((&obj_id.name, &obj_id.region, obj_id.priority), (&sql_id.name, &sql_id.region, sql_id.priority));
+    assert_eq!(obj_id.token, "tok");
+    assert_eq!(obj_id.id, s_id);
 }
 
 #[tokio::test]

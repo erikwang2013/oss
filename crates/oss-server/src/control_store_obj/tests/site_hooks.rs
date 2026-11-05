@@ -82,6 +82,7 @@ async fn bucket_trigger_cells_match() {
 
     // Gate cells: INSERT / UPDATE / DELETE each reject before any mutation.
     let before = sql_rows(&db).await.len();
+    let obj_before = obj_rows(&real).await.len();
     block(&db, &real, "bucket", "gated-bucket").await;
     let err = sqlx::query(
         "INSERT INTO buckets (name, creation_date, versioning, object_lock) \
@@ -108,7 +109,7 @@ async fn bucket_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 
     block(&db, &real, "bucket", &name).await;
     let err = sqlx::query("UPDATE buckets SET versioning = 'Blocked' WHERE name = ?")
@@ -136,7 +137,7 @@ async fn bucket_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 
     let err = sqlx::query("DELETE FROM buckets WHERE name = ?")
         .bind(&name)
@@ -157,7 +158,7 @@ async fn bucket_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 }
 
 #[tokio::test]
@@ -220,7 +221,38 @@ async fn policy_trigger_cells_match() {
     .unwrap();
     assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 
+    sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
+        .bind(bucket)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    run_hook(&real, |txn| {
+        let changed = changed.clone();
+        Box::pin(async move { txn.site_hook_policy(Some(&changed), None, 2_000).await })
+    })
+    .await
+    .unwrap();
+    assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
+
+    // Recreate the policy so the later gate-update test has a row to touch.
+    sqlx::query(
+        "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, 7)",
+    )
+    .bind(bucket)
+    .bind(&changed.policy_json)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    run_hook(&real, |txn| {
+        let changed = changed.clone();
+        Box::pin(async move { txn.site_hook_policy(None, Some(&changed), 2_001).await })
+    })
+    .await
+    .unwrap();
+    assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
+
     let before = sql_rows(&db).await.len();
+    let obj_before = obj_rows(&real).await.len();
     block(&db, &real, "bucket_policy", "gated-policy").await;
     let err = sqlx::query(
         "INSERT INTO bucket_policies (bucket, policy_json, updated_at) \
@@ -258,10 +290,13 @@ async fn policy_trigger_cells_match() {
         err.to_string().contains("site replication conflict"),
         "{err}"
     );
+    let mut gated = changed.clone();
+    gated.updated_at = 8;
     let obj_err = run_hook(&real, |txn| {
         let changed = changed.clone();
+        let gated = gated.clone();
         Box::pin(async move {
-            txn.site_hook_policy(Some(&changed), Some(&changed), now())
+            txn.site_hook_policy(Some(&changed), Some(&gated), now())
                 .await
         })
     })
@@ -282,6 +317,7 @@ async fn policy_trigger_cells_match() {
         "{err}"
     );
     let obj_err = run_hook(&real, |txn| {
+        let changed = changed.clone();
         Box::pin(async move { txn.site_hook_policy(Some(&changed), None, now()).await })
     })
     .await
@@ -291,17 +327,6 @@ async fn policy_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 
-    sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
-        .bind(bucket)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    run_hook(&real, |txn| {
-        Box::pin(async move { txn.site_hook_policy(Some(&changed), None, 2_000).await })
-    })
-    .await
-    .unwrap();
-    assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 }

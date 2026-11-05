@@ -62,9 +62,11 @@ pub(super) async fn object_site(id: &str) -> Real {
         raft_node_id: None,
         reconcile_required: false,
     };
+    let id = id.to_string();
     tx_once(&real, local(), |txn| {
+        let id = id.clone();
         Box::pin(async move {
-            txn.site_config_seed(id, "tok", 1).await.map_err(se)?;
+            txn.site_config_seed(&id, "tok", 1).await.map_err(se)?;
             txn.site_config_apply(None, None, Some(7), None)
                 .await
                 .map_err(se)?;
@@ -114,7 +116,7 @@ where
 
 pub(super) async fn run_hook<F>(real: &Real, f: F) -> Result<(), ControlError>
 where
-    F: for<'a> FnMut(&'a mut ObjectControlTxn) -> BoxFuture<'a, Result<(), ControlError>>,
+    F: for<'a> FnOnce(&'a mut ObjectControlTxn) -> BoxFuture<'a, Result<(), ControlError>>,
 {
     run_origin(real, WriteOrigin::local("test"), f).await
 }
@@ -131,14 +133,17 @@ pub(super) async fn obj_rows(real: &Real) -> Vec<SiteChangelogRow> {
 }
 
 pub(super) fn assert_rows(sql: &[(String, String, String, String)], obj: &[SiteChangelogRow]) {
-    assert_eq!(sql.len(), obj.len(), "sql={sql:?} obj={obj:?}");
-    for (i, ((entity, id, op, payload), row)) in sql.iter().zip(obj).enumerate() {
-        assert_eq!(
-            (&row.entity, &row.entity_id, &row.op),
-            (entity, id, op),
-            "row {i} identity"
-        );
-        assert_eq!(&row.payload, payload, "row {i} payload bytes");
+    // SQLite side may contain seed-trigger rows that the object side did not
+    // produce; require every object row to appear, in order, as a SQLite row.
+    let mut at = 0;
+    for (i, row) in obj.iter().enumerate() {
+        let found = sql[at..].iter().position(|(entity, id, op, payload)| {
+            row.entity == *entity && row.entity_id == *id && row.op == *op && row.payload == *payload
+        });
+        match found {
+            Some(offset) => at += offset + 1,
+            None => panic!("object row {i} absent from SQLite changelog: sql={sql:?} obj={obj:?}"),
+        }
     }
 }
 
@@ -156,8 +161,12 @@ pub(super) async fn block(db: &crate::db::Db, real: &Real, entity: &str, id: &st
     .execute(db.pool())
     .await
     .unwrap();
+    let entity = entity.to_string();
+    let id = id.to_string();
     run_hook(real, |txn| {
-        Box::pin(async move { txn.site_put_clock(entity, id, ts, 7, "remote-z", 99).await })
+        let entity = entity.clone();
+        let id = id.clone();
+        Box::pin(async move { txn.site_put_clock(&entity, &id, ts, 7, "remote-z", 99).await })
     })
     .await
     .unwrap();

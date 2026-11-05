@@ -66,12 +66,23 @@ async fn permission_trigger_cells_match() {
     assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 
     // admin target, missing user: both are excluded exactly like the subquery.
+    // Dangling user ids can only exist with FK enforcement off (legacy data).
+    let mut conn = db.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO permissions (user_id, bucket, can_read) VALUES (1, 'pb2', 1), (999, 'pb3', 1)",
     )
-    .execute(db.pool())
+    .execute(&mut *conn)
     .await
     .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
     let admin = PermissionSiteRow {
         username: Some("root".into()),
         bucket: "pb2".into(),
@@ -97,6 +108,7 @@ async fn permission_trigger_cells_match() {
     assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 
     let before = sql_rows(&db).await.len();
+    let obj_before = obj_rows(&real).await.len();
     block(&db, &real, "permission", "alice\u{1f}gpb").await;
     let err =
         sqlx::query("INSERT INTO permissions (user_id, bucket, can_read) VALUES (2, 'gpb', 1)")
@@ -168,7 +180,7 @@ async fn permission_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 }
 
 #[tokio::test]
@@ -243,6 +255,7 @@ async fn user_trigger_cells_match() {
     let mut bob_admin = bob.clone();
     bob_admin.is_admin = true;
     run_hook(&real, |txn| {
+        let bob = bob.clone();
         let bob_admin = bob_admin.clone();
         Box::pin(async move {
             txn.site_hook_user(Some(&bob), Some(&bob_admin), 1_101)
@@ -256,6 +269,8 @@ async fn user_trigger_cells_match() {
         .await
         .unwrap();
     run_hook(&real, |txn| {
+        let bob = bob.clone();
+        let bob_admin = bob_admin.clone();
         Box::pin(async move {
             txn.site_hook_user(Some(&bob_admin), Some(&bob), 1_102)
                 .await
@@ -266,6 +281,7 @@ async fn user_trigger_cells_match() {
     assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 
     let before = sql_rows(&db).await.len();
+    let obj_before = obj_rows(&real).await.len();
     block(&db, &real, "user", "gated-user").await;
     let err = sqlx::query(
         "INSERT INTO users (username, password_hash, is_admin, status, created_at) \
@@ -338,7 +354,7 @@ async fn user_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 }
 
 #[tokio::test]
@@ -383,9 +399,9 @@ async fn access_key_trigger_cells_match() {
         kind: "long-term".into(),
         ..AccessKeySiteRow::default()
     };
-    for row in [&ak1, &session, &admin] {
+    for row in [ak1.clone(), session.clone(), admin.clone()] {
         run_hook(&real, |txn| {
-            Box::pin(async move { txn.site_hook_access_key(None, Some(row), 1_000).await })
+            Box::pin(async move { txn.site_hook_access_key(None, Some(&row), 1_000).await })
         })
         .await
         .unwrap();
@@ -400,6 +416,7 @@ async fn access_key_trigger_cells_match() {
     let mut changed = ak1.clone();
     changed.status = "disabled".into();
     run_hook(&real, |txn| {
+        let ak1 = ak1.clone();
         let changed = changed.clone();
         Box::pin(async move {
             txn.site_hook_access_key(Some(&ak1), Some(&changed), 1_001)
@@ -446,6 +463,8 @@ async fn access_key_trigger_cells_match() {
     let mut session_changed = session.clone();
     session_changed.status = "disabled".into();
     run_hook(&real, |txn| {
+        let session = session.clone();
+        let session_changed = session_changed.clone();
         Box::pin(async move {
             txn.site_hook_access_key(Some(&session), Some(&session_changed), 1_004)
                 .await
@@ -468,6 +487,7 @@ async fn access_key_trigger_cells_match() {
     assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 
     let before = sql_rows(&db).await.len();
+    let obj_before = obj_rows(&real).await.len();
     block(&db, &real, "access_key", "AKG").await;
     let err = sqlx::query(
         "INSERT INTO access_keys (access_key, secret_key, user_id, status, created_at, kind) \
@@ -553,5 +573,5 @@ async fn access_key_trigger_cells_match() {
         "{obj_err}"
     );
     assert_eq!(sql_rows(&db).await.len(), before);
-    assert_eq!(obj_rows(&real).await.len(), before);
+    assert_eq!(obj_rows(&real).await.len(), obj_before);
 }

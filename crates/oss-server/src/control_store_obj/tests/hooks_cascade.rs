@@ -117,6 +117,13 @@ async fn user_delete_cascade_matches() {
         ..cb2.clone()
     };
     run_hook(&real, |txn| {
+        let aku = aku.clone();
+        let perm = perm.clone();
+        let cb1 = cb1.clone();
+        let cb1_null = cb1_null.clone();
+        let cb2 = cb2.clone();
+        let cb2_null = cb2_null.clone();
+        let alice = alice.clone();
         Box::pin(async move {
             txn.site_hook_access_key(Some(&aku), None, 2_000).await?;
             txn.site_hook_permission(Some(&perm), None, 2_000).await?;
@@ -393,6 +400,7 @@ async fn local_hooks_stay_inactive_until_paired_and_seeded() {
     };
     real.control
         .transaction(WriteOrigin::local("test"), |txn| {
+            let peer = peer.clone();
             Box::pin(async move {
                 txn.site_insert(&peer, 1)
                     .await
