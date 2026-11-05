@@ -36,6 +36,12 @@ use crate::control_store_obj::{ObjectControlStore, WriteOrigin, bucket_clear_own
 
 mod snapshot;
 #[cfg(test)]
+mod snapshot_crash_tests;
+#[cfg(test)]
+mod snapshot_gate_tests;
+#[cfg(test)]
+mod snapshot_tests;
+#[cfg(test)]
 mod tests;
 
 /// Full applied `LogId` (including its node id) next to [`RootMeta::applied`],

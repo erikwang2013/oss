@@ -62,6 +62,68 @@ pub(crate) enum CasOutcome {
     NotCommitted,
 }
 
+/// Test-only crash point: fail the root put without writing it.
+#[cfg(test)]
+pub(crate) const CRASH_BEFORE_ROOT_CAS: u8 = 1;
+/// Test-only crash point: write the root, then report a failure.
+#[cfg(test)]
+pub(crate) const CRASH_AFTER_ROOT_CAS: u8 = 2;
+
+/// Delegating backend that injects a failure at the root CAS boundary (F3).
+#[cfg(test)]
+pub(crate) struct CrashIo {
+    inner: std::sync::Arc<dyn LocalControlIo>,
+    point: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+#[cfg(test)]
+impl CrashIo {
+    pub(crate) fn root_io(
+        store: std::sync::Arc<Store>,
+    ) -> (RootIo, std::sync::Arc<std::sync::atomic::AtomicU8>) {
+        let point = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let io = Self {
+            inner: store,
+            point: std::sync::Arc::clone(&point),
+        };
+        (RootIo::with_backend(std::sync::Arc::new(io)), point)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl LocalControlIo for CrashIo {
+    async fn get_local_control(&self, key: &str) -> Result<Option<SystemObject>> {
+        self.inner.get_local_control(key).await
+    }
+
+    async fn put_local_control(
+        &self,
+        key: &str,
+        data: &[u8],
+        expected: Option<u64>,
+        fence: u64,
+    ) -> Result<u64> {
+        if key == hash::ROOT_KEY {
+            match self.point.load(Ordering::SeqCst) {
+                CRASH_BEFORE_ROOT_CAS => {
+                    return Err(Error::CorruptMeta("injected crash before root CAS".into()));
+                }
+                CRASH_AFTER_ROOT_CAS => {
+                    self.inner
+                        .put_local_control(key, data, expected, fence)
+                        .await?;
+                    return Err(Error::CorruptMeta("injected crash after root CAS".into()));
+                }
+                _ => {}
+            }
+        }
+        self.inner
+            .put_local_control(key, data, expected, fence)
+            .await
+    }
+}
+
 /// Root CAS plus content-addressed node/blob IO.
 pub struct RootIo {
     backend: std::sync::Arc<dyn LocalControlIo>,

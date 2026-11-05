@@ -55,6 +55,8 @@ pub(crate) use bucket_write::bucket_clear_owner;
 pub(crate) use iam::{AccessKeyRow, PermissionStorageRow, UserRow};
 pub use inventory::BucketDomainCleanup;
 pub use origin::WriteOrigin;
+#[cfg(test)]
+pub(crate) use root_io::{CRASH_AFTER_ROOT_CAS, CRASH_BEFORE_ROOT_CAS, CrashIo};
 pub use root_io::{PinnedRoot, RootIo};
 pub use table::{KNOWN_TABLES, TableId, known_table_ids};
 pub use txn::{CachePublish, CommitStamp, ObjectControlStore, ObjectControlTxn};
